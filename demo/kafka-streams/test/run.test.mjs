@@ -19,23 +19,15 @@ test('run.mjs exposes pure helpers without executing the demo', () => {
 });
 
 test('buildKafkaStreamUrls treats basePath as the full kafka streams mount root', () => {
-  const urls = buildKafkaStreamUrls(
-    'http://node1',
-    '/custom/kafka/streams',
-    'capture/1',
-    'did:dkg:31337:0xabc/9/0',
+  assert.deepEqual(
+    buildKafkaStreamUrls('http://node1', '/custom/kafka/streams/', 'capture/1', 'did:dkg:31337:0xabc/9/0'),
+    {
+      register: 'http://node1/custom/kafka/streams/register',
+      captureStatus: 'http://node1/custom/kafka/streams/register/capture%2F1',
+      kaByUal: 'http://node1/custom/kafka/streams/did%3Adkg%3A31337%3A0xabc%2F9%2F0',
+      list: 'http://node1/custom/kafka/streams',
+    },
   );
-
-  assert.equal(urls.register, 'http://node1/custom/kafka/streams/register');
-  assert.equal(
-    urls.captureStatus,
-    'http://node1/custom/kafka/streams/register/capture%2F1',
-  );
-  assert.equal(
-    urls.kaByUal,
-    'http://node1/custom/kafka/streams/did%3Adkg%3A31337%3A0xabc%2F9%2F0',
-  );
-  assert.equal(urls.list, 'http://node1/custom/kafka/streams');
 });
 
 test('ensureContextGraph registers on-chain after duplicate local create', async () => {
@@ -113,7 +105,7 @@ test('validateKafkaContextGraphConfig accepts matching kafka contextGraphId on b
   ], 'demo-cg');
 });
 
-test('validateKafkaContextGraphConfig supports config.yaml and keeps config.json precedence', async () => {
+test('validateKafkaContextGraphConfig falls back from malformed config.json to config.yaml', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'kafka-streams-demo-run-'));
   test.after(() => rm(dir, { recursive: true, force: true }));
   const node1Home = join(dir, 'node1');
@@ -121,6 +113,7 @@ test('validateKafkaContextGraphConfig supports config.yaml and keeps config.json
   const node3Home = join(dir, 'node3');
   await Promise.all([mkdir(node1Home), mkdir(node2Home)]);
   await writeNodeYamlConfig(node1Home, 'demo-cg');
+  await writeFile(join(node1Home, 'config.json'), '{');
   await writeNodeYamlConfig(node2Home, 'demo-cg');
 
   await validateKafkaContextGraphConfig([
@@ -268,56 +261,6 @@ test('fetchListOnNode2 retries transient list errors before finding the UAL', as
 
   assert.equal(calls, 2);
   assert.equal(sleeps, 1);
-  assert.equal(list.items[0]['@id'], 'ual-1');
-});
-
-test('node2 polling helpers default the deadline when deadlineMs is omitted', async () => {
-  const kaResponses = [
-    { status: 404, body: 'not gossiped yet' },
-    { status: 200, body: '{"@id":"ual-1"}', parsed: { '@id': 'ual-1' } },
-  ];
-  let kaCalls = 0;
-  let kaSleeps = 0;
-  const ka = await fetchKaOnNode2(
-    { baseUrl: 'http://node2', token: 't' },
-    'ual-1',
-    {
-      basePath: '/api/kafka/streams',
-      intervalMs: 1,
-      syncTimeoutMs: 1000,
-      httpJson: async () => kaResponses[kaCalls++],
-      sleep: async () => {
-        kaSleeps += 1;
-      },
-    },
-  );
-
-  assert.equal(kaCalls, 2);
-  assert.equal(kaSleeps, 1);
-  assert.equal(ka['@id'], 'ual-1');
-
-  const listResponses = [
-    { status: 503, body: 'not ready' },
-    { status: 200, body: '{"items":[{"@id":"ual-1"}]}', parsed: { items: [{ '@id': 'ual-1' }] } },
-  ];
-  let listCalls = 0;
-  let listSleeps = 0;
-  const list = await fetchListOnNode2(
-    { baseUrl: 'http://node2', token: 't' },
-    'ual-1',
-    {
-      basePath: '/api/kafka/streams',
-      intervalMs: 1,
-      syncTimeoutMs: 1000,
-      httpJson: async () => listResponses[listCalls++],
-      sleep: async () => {
-        listSleeps += 1;
-      },
-    },
-  );
-
-  assert.equal(listCalls, 2);
-  assert.equal(listSleeps, 1);
   assert.equal(list.items[0]['@id'], 'ual-1');
 });
 

@@ -25,11 +25,12 @@ const FINALIZE_TIMEOUT_MS = 120_000;
 const TRANSIENT_HTTP_STATUSES = new Set([408, 409, 425, 429, 500, 502, 503, 504]);
 
 export function buildKafkaStreamUrls(baseUrl, basePath, captureId, ual) {
+  const root = basePath.replace(/\/+$/, '');
   return {
-    register: `${baseUrl}${basePath}/register`,
-    captureStatus: `${baseUrl}${basePath}/register/${encodeURIComponent(captureId)}`,
-    kaByUal: `${baseUrl}${basePath}/${encodeURIComponent(ual)}`,
-    list: `${baseUrl}${basePath}`,
+    register: `${baseUrl}${root}/register`,
+    captureStatus: `${baseUrl}${root}/register/${encodeURIComponent(captureId)}`,
+    kaByUal: `${baseUrl}${root}/${encodeURIComponent(ual)}`,
+    list: `${baseUrl}${root}`,
   };
 }
 
@@ -38,7 +39,7 @@ export async function validateKafkaContextGraphConfig(nodes, expectedCgId) {
   for (const node of nodes) {
     let cfg;
     try {
-      ({ config: cfg } = await readDkgConfig(node.dkgHome));
+      ({ config: cfg } = await readDkgConfig(node.dkgHome, { tolerateMalformed: true }));
     } catch (err) {
       mismatches.push(`${node.label} config cannot be read: ${err?.message ?? err}`);
       continue;

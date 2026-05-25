@@ -586,6 +586,20 @@ describe('handler — GET /:ual (single)', () => {
     expect(query.mock.calls[0][0]).toContain('<did:dkg:1/0xabc>');
   });
 });
+describe('handler — discovery query failures', () => {
+  it.each([
+    ['list', '/api/kafka/streams'],
+    ['single', '/api/kafka/streams/did:dkg:1/0xabc'],
+  ])('returns 503 QueryFailed when %s query rejects', async (_label, path) => {
+    const { req, res, captured } = mockReqRes('GET', path);
+    const { ctx, query } = mockCtx();
+    query.mockRejectedValueOnce(new Error('query backend down'));
+    const handler = createHandler({ basePath: '/api/kafka/streams', contextGraphId: 'urn:cg:demo' });
+    await handler({ ...ctx, req, res, path });
+    expect(captured.statusCode).toBe(503);
+    expect(captured.body).toMatchObject({ error: 'QueryFailed', message: 'query backend down' });
+  });
+});
 describe('handler — register-to-discovery regression', () => {
   it('publishes KafkaStream KAs to the same public partition discovery queries', async () => {
     const cgId = 'urn:cg:demo';

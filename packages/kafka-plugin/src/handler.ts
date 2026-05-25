@@ -259,13 +259,18 @@ async function handleGetList(ctx: KafkaPluginCtx, opts: CreateHandlerOptions): P
   }
 
   const queryOptions = discoveryQueryOptions(ctx, cgId, subGraphName);
-  const countResult = await ctx.agent.query(countQuery, queryOptions);
-  const total = extractCount(countResult.bindings);
-
-  const pageResult = await ctx.agent.query(listQuery, queryOptions);
+  let countBindings: Array<Record<string, unknown>>;
+  let pageBindings: Array<Record<string, unknown>>;
+  try {
+    countBindings = (await ctx.agent.query(countQuery, queryOptions)).bindings;
+    pageBindings = (await ctx.agent.query(listQuery, queryOptions)).bindings;
+  } catch (err) {
+    return queryFailedResponse(ctx.res, err);
+  }
+  const total = extractCount(countBindings);
 
   const grouped = new Map<string, Array<Record<string, unknown>>>();
-  for (const row of pageResult.bindings) {
+  for (const row of pageBindings) {
     const subject = unwrapBindingValue(row.ual);
     if (!subject) continue;
     const arr = grouped.get(subject) ?? [];
@@ -313,7 +318,12 @@ async function handleGetSingle(
     });
   }
 
-  const result = await ctx.agent.query(sparql, discoveryQueryOptions(ctx, cgId, subGraphName));
+  let result: { bindings: Array<Record<string, unknown>> };
+  try {
+    result = await ctx.agent.query(sparql, discoveryQueryOptions(ctx, cgId, subGraphName));
+  } catch (err) {
+    return queryFailedResponse(ctx.res, err);
+  }
   const triples = result.bindings.map((row) => ({ ...row, ual }));
   const ka = bindingsToKa(triples);
   if (!ka) {
@@ -353,6 +363,13 @@ function extractCount(bindings: Array<Record<string, unknown>>): number {
   if (!raw) return 0;
   const match = String(raw).match(/^"?(-?\d+)/);
   return match ? Number(match[1]) : 0;
+}
+
+function queryFailedResponse(res: ServerResponse, err: unknown): void {
+  return jsonResponse(res, 503, {
+    error: 'QueryFailed',
+    message: err instanceof Error ? err.message : String(err),
+  });
 }
 
 function unwrapBindingValue(v: unknown): string | undefined {

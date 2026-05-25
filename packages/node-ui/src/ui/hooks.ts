@@ -19,7 +19,20 @@ export function useFetch<T>(
         setError(null);
       }
     } catch (err: any) {
-      if (mountedRef.current) setError(err.message);
+      if (mountedRef.current) {
+        if (err?.status === 401) {
+          const hasToken = !!(window as any).__DKG_TOKEN__;
+          const alreadyRetried = sessionStorage.getItem('__dkg_401_reloaded') === '1';
+          if (hasToken && !alreadyRetried) {
+            sessionStorage.setItem('__dkg_401_reloaded', '1');
+            window.location.reload();
+            return;
+          }
+          setError('Authentication expired — please refresh the page.');
+          return;
+        }
+        setError(err.message);
+      }
     } finally {
       if (mountedRef.current) setLoading(false);
     }

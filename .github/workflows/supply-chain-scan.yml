@@ -202,7 +202,7 @@ jobs:
           && (github.event_name != 'pull_request'
               || github.event.pull_request.head.repo.full_name == github.repository)
         continue-on-error: true
-        uses: github/codeql-action/upload-sarif@68bde559dea0fdcac2102bfdf6230c5f70eb485e # v4.35.4
+        uses: github/codeql-action/upload-sarif@7211b7c8077ea37d8641b6271f6a365a22a5fbfa # v4.36.0
         with:
           sarif_file: zizmor.sarif
           category: zizmor
@@ -596,6 +596,30 @@ jobs:
             fi
           fi
 
+          # crytic/slither-action: pinned by commit SHA in
+          # `ci.yml`'s `tornado-static-analysis` lane, with a trailing
+          # `# v<version>` comment marking which release the SHA
+          # corresponds to. Parse the comment for drift comparison.
+          # The SHA itself is the source of truth on the runner; the
+          # comment is the source of truth for THIS freshness check.
+          # Aderyn (@cyfrin/aderyn) and solhint are npm devDeps in
+          # packages/evm-module/package.json — Dependabot's npm
+          # ecosystem covers their drift, so they're intentionally
+          # not duplicated here.
+          if [ -f "${GITHUB_WORKSPACE}/.github/workflows/ci.yml" ]; then
+            SLITHER_PINNED=$(grep -oE 'crytic/slither-action@[a-f0-9]+ # v[0-9.]+' "${GITHUB_WORKSPACE}/.github/workflows/ci.yml" | head -1 | sed -E 's/.*# v//')
+            SLITHER_LATEST=$(gh api repos/crytic/slither-action/releases/latest --jq '.tag_name' | sed 's/^v//')
+            if [ -n "${SLITHER_PINNED}" ] && [ -n "${SLITHER_LATEST}" ]; then
+              if [ "${SLITHER_PINNED}" = "${SLITHER_LATEST}" ]; then
+                report 'crytic/slither-action' "${SLITHER_PINNED}" "${SLITHER_LATEST}" '✓ current'
+              else
+                report 'crytic/slither-action' "${SLITHER_PINNED}" "${SLITHER_LATEST}" '⚠ behind'
+              fi
+            else
+              report 'crytic/slither-action' "${SLITHER_PINNED:-?}" "${SLITHER_LATEST:-?}" '⚠ unable to compare'
+            fi
+          fi
+
           # shellcheck disable=SC2016
           # Backticks in the markdown string below are intentional
           # (code-fence formatting in the GitHub Step Summary), not
@@ -605,6 +629,6 @@ jobs:
             if [ "${STALE}" -eq 0 ]; then
               echo '_All scanners up to date._'
             else
-              echo '_One or more scanners are behind upstream. Open a bump PR — recompute hash pins where applicable (zizmor PyPI wheels in `supply-chain-scan.yml`, actionlint release `checksums.txt`)._'
+              echo '_One or more scanners are behind upstream. Open a bump PR — recompute hash pins where applicable (zizmor PyPI wheels in `supply-chain-scan.yml`, actionlint release `checksums.txt`, slither-action commit SHA in `ci.yml`)._'
             fi
           } >> "$GITHUB_STEP_SUMMARY"

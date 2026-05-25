@@ -9,7 +9,7 @@ import {
   type ProtocolOutboxStore,
 } from '@origintrail-official/dkg-core';
 
-const SCHEMA_VERSION = 13;
+const SCHEMA_VERSION = 14;
 const DEFAULT_RETENTION_DAYS = 90;
 
 export interface DashboardDBOptions {
@@ -475,6 +475,21 @@ export class DashboardDB {
       `);
     }
 
+    if (version < 14) {
+      // Rename legacy "paranet_*" columns to "contextGraph_*" so INSERT
+      // statements using the new names succeed on databases created before
+      // the v10 terminology rename. Column existence is checked via
+      // pragma to avoid errors when the DB was already created at v14+.
+      const snapshotCols = this.db.pragma('table_info(metric_snapshots)') as { name: string }[];
+      if (snapshotCols.some(c => c.name === 'paranet_count')) {
+        this.db.exec(`ALTER TABLE metric_snapshots RENAME COLUMN paranet_count TO contextGraph_count`);
+      }
+      const opsCols = this.db.pragma('table_info(operations)') as { name: string }[];
+      if (opsCols.some(c => c.name === 'paranet_id')) {
+        this.db.exec(`ALTER TABLE operations RENAME COLUMN paranet_id TO contextGraph_id`);
+      }
+    }
+
     this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
 
     const savedRetention = this.db.prepare("SELECT value FROM settings WHERE key = 'retentionDays'").get() as { value: string } | undefined;
@@ -738,6 +753,7 @@ export class DashboardDB {
 
   getOperations(opts: {
     name?: string;
+    names?: string[];
     status?: string;
     operationId?: string;
     from?: number;
@@ -748,7 +764,12 @@ export class DashboardDB {
     const wheres: string[] = [];
     const params: unknown[] = [];
 
-    if (opts.name) { wheres.push('operation_name = ?'); params.push(opts.name); }
+    if (opts.names?.length) {
+      wheres.push(`operation_name IN (${opts.names.map(() => '?').join(',')})`);
+      params.push(...opts.names);
+    } else if (opts.name) {
+      wheres.push('operation_name = ?'); params.push(opts.name);
+    }
     if (opts.status) { wheres.push('status = ?'); params.push(opts.status); }
     if (opts.operationId) { wheres.push('operation_id = ?'); params.push(opts.operationId); }
     if (opts.from) { wheres.push('started_at >= ?'); params.push(opts.from); }
@@ -768,6 +789,7 @@ export class DashboardDB {
 
   getOperationsWithPhases(opts: {
     name?: string;
+    names?: string[];
     status?: string;
     operationId?: string;
     from?: number;

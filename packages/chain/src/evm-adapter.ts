@@ -109,6 +109,11 @@ const ERROR_ABI_CONTRACTS = [
   'Staking', 'StakingStorage', 'StakingV10', 'StakingKPI',
   'ConvictionStakingStorage',
   'DKGStakingConvictionNFT', 'DKGPublishingConvictionNFT',
+  // Post PR #650 split — PCA business errors are declared on the logic
+  // and storage contracts, NOT the slim wrapper. Both must be in this
+  // list so wrapper-bubbled reverts (e.g. NoConvictionAccount, AccountExpired,
+  // UnknownAccount, InvalidAmount, AgentAlreadyRegistered) decode at runtime.
+  'PublishingConviction', 'PublishingConvictionStorage',
   'Hub', 'Token', 'Ask', 'AskStorage',
   'Paymaster', 'ShardingTable', 'ParametersStorage',
   'PublishingConvictionAccount',
@@ -119,6 +124,26 @@ const ADMIN_KEY_PURPOSE = 1;
 const OPERATIONAL_KEY_PURPOSE = 2;
 
 let _errorInterface: Interface | null = null;
+let _pcaLogicInterface: Interface | null = null;
+
+/**
+ * Lazy-cached `ethers.Interface` over the `PublishingConviction` (logic)
+ * contract ABI.
+ *
+ * Post PR #650, all PCA state-change events (`AccountCreated`, `ToppedUp`,
+ * `CostCovered`, `WindowSettled`, `AccountFinalSwept`,
+ * `AgentRegistered`, `AgentDeregistered`) are emitted by the logic contract
+ * — NOT by the `DKGPublishingConvictionNFT` wrapper. Receipt-log parsing
+ * for those events MUST go through this interface; parsing through the
+ * wrapper's interface returns `null` because the wrapper ABI no longer
+ * declares those events. See `DKGPublishingConvictionNFT.sol` NatSpec
+ * "Deliberate breaks in the v2.x → v3.0.0 wrapper bump".
+ */
+function getPcaLogicInterface(): Interface {
+  if (_pcaLogicInterface) return _pcaLogicInterface;
+  _pcaLogicInterface = new Interface(loadAbi('PublishingConviction') as any[]);
+  return _pcaLogicInterface;
+}
 
 function getErrorInterface(): Interface {
   if (_errorInterface) return _errorInterface;
@@ -1205,6 +1230,12 @@ export class EVMChainAdapter implements ChainAdapter {
           for (const log of logs) {
             const parsed = cgStorage.interface.parseLog({ topics: [...log.topics], data: log.data });
             if (parsed) {
+              // OT-RFC-38 / LU-6 Phase B — `nameHash` is the curator-committed
+              // wire id used to derive the SWM gossip topic. Zero indicates
+              // the curator opted out at create time (rare); cores fall back
+              // to the discovery-beacon path in that case.
+              const nameHashRaw = parsed.args.nameHash?.toString() ?? '0x';
+              const nameHash = nameHashRaw === '0x' ? null : nameHashRaw.toLowerCase();
               yield {
                 type: 'ContextGraphCreated',
                 blockNumber: log.blockNumber,
@@ -1212,9 +1243,9 @@ export class EVMChainAdapter implements ChainAdapter {
                   contextGraphId: parsed.args.contextGraphId?.toString() ?? '',
                   creator: parsed.args.owner?.toString() ?? '',
                   owner: parsed.args.owner?.toString() ?? '',
-                  requiredSignatures: Number(parsed.args.requiredSignatures ?? 0),
                   accessPolicy: Number(parsed.args.accessPolicy ?? 0),
                   publishPolicy: Number(parsed.args.publishPolicy ?? 0),
+                  nameHash,
                   txHash: log.transactionHash,
                 },
               };
@@ -1275,8 +1306,8 @@ export class EVMChainAdapter implements ChainAdapter {
   //
   // Thin transitional affordance — reserves a bytes32 name-hash with an
   // optional cleartext metadata reveal. Governance for the context graph
-  // itself (hosting nodes, publish policy, participants, quorum) lives in
-  // `ContextGraphs` / `ContextGraphStorage` — see createOnChainContextGraph.
+  // itself (publish policy, participant agents) lives in `ContextGraphs` /
+  // `ContextGraphStorage` — see createOnChainContextGraph.
   // =====================================================================
 
   async createContextGraph(params: CreateContextGraphParams): Promise<TxResult> {
@@ -1373,16 +1404,24 @@ export class EVMChainAdapter implements ChainAdapter {
       throw new Error('ContextGraphs contract not deployed. Deploy ContextGraphs and ContextGraphStorage first.');
     }
 
-    const hostingNodes = params.participantIdentityIds.map((id) => id);
+    if (params.accessPolicy === undefined || params.publishPolicy === undefined) {
+      throw new Error(
+        'createOnChainContextGraph: `accessPolicy` and `publishPolicy` are required (SPEC_CG_MEMORY_MODEL). ' +
+        'Pass both explicitly — e.g. { accessPolicy: 1, publishPolicy: 0 } for invite-only + curators-only.',
+      );
+    }
     const tx = await this.contracts.contextGraphs.createContextGraph(
-      hostingNodes,
       params.participantAgents ?? [],
-      params.requiredSignatures,
       params.metadataBatchId ?? 0n,
-      params.accessPolicy ?? 0,
-      params.publishPolicy ?? 1,
+      params.accessPolicy,
+      params.publishPolicy,
       params.publishAuthority ?? ethers.ZeroAddress,
       params.publishAuthorityAccountId ?? 0n,
+      // OT-RFC-38 / LU-6 Phase B — opt-in wire-id commitment. Default
+      // `bytes32(0)` opts out; the agent supplies a non-zero hash
+      // (typically `keccak256(bytes(cleartextId))`) to enable cores'
+      // chain-event-driven host-mode auto-subscribe path.
+      params.nameHash ?? ethers.ZeroHash,
     );
     const receipt = await tx.wait();
 
@@ -1415,20 +1454,6 @@ export class EVMChainAdapter implements ChainAdapter {
       success: receipt.status === 1,
       contextGraphId,
     };
-  }
-
-  async getContextGraphParticipants(contextGraphId: bigint): Promise<bigint[] | null> {
-    await this.init();
-    if (!this.contracts.contextGraphStorage) {
-      return null;
-    }
-
-    try {
-      const hostingNodes: bigint[] = await this.contracts.contextGraphStorage.getHostingNodes(contextGraphId);
-      return hostingNodes.map((id) => BigInt(id));
-    } catch {
-      return null;
-    }
   }
 
   async verify(params: VerifyParams): Promise<TxResult> {
@@ -1712,6 +1737,14 @@ export class EVMChainAdapter implements ChainAdapter {
       tokenAmount: params.tokenAmount,
       isImmutable: params.isImmutable,
       merkleLeafCount: params.merkleLeafCount,
+      // RFC-39 Phase A.5 — ciphertext-commitment pair. Defaults to
+      // `bytes32(0)` / 0 (legacy/transitional, picker skips this KC in
+      // the curated draw). Callers that have an LU-11 commitment set
+      // both via `ciphertextChunksRoot` + `ciphertextChunkCount`.
+      ciphertextChunksRoot: params.ciphertextChunksRoot
+        ? ethers.hexlify(params.ciphertextChunksRoot)
+        : ethers.ZeroHash,
+      ciphertextChunkCount: params.ciphertextChunkCount ?? 0,
       publisherNodeIdentityId: params.publisherNodeIdentityId,
       authorAddress: params.author.address,
       authorR: ethers.hexlify(params.author.signature.r),
@@ -2061,6 +2094,14 @@ export class EVMChainAdapter implements ChainAdapter {
       newMerkleLeafCount: params.newMerkleLeafCount,
       mintKnowledgeAssetsAmount: params.mintAmount ?? 0,
       knowledgeAssetsToBurn: burnIds,
+      // Codex PR #630 R1 #2 — RFC-39 Phase A.5 commitment refresh.
+      // Defaults to `bytes32(0)` / 0 (metadata-only update or
+      // public-CG path; KC's existing commitment stays in place).
+      // Callers refreshing curated ciphertext set BOTH non-zero.
+      newCiphertextChunksRoot: params.newCiphertextChunksRoot
+        ? ethers.hexlify(params.newCiphertextChunksRoot)
+        : ethers.ZeroHash,
+      newCiphertextChunkCount: params.newCiphertextChunkCount ?? 0,
       publisherNodeIdentityId: identityId,
       identityIds: ackSigs.map(s => s.identityId),
       r: ackSigs.map(s => ethers.hexlify(s.r)),
@@ -2214,15 +2255,21 @@ export class EVMChainAdapter implements ChainAdapter {
       const tx = await nft.createAccount(committedTRAC);
       const receipt = await tx.wait();
 
+      // Post PR #650 split, `AccountCreated` is emitted by
+      // `PublishingConviction` (logic), NOT by the wrapper. Parse via
+      // the logic ABI so this keeps working once `chain/abi/DKGPublishingConvictionNFT.json`
+      // is refreshed to its post-split slim surface (which no longer
+      // declares any PCA events).
+      const pcaLogic = getPcaLogicInterface();
       let accountId = 0n;
       for (const log of receipt.logs) {
         try {
-          const parsed = nft.interface.parseLog({ topics: [...log.topics], data: log.data });
+          const parsed = pcaLogic.parseLog({ topics: [...log.topics], data: log.data });
           if (parsed?.name === 'AccountCreated') {
             accountId = BigInt(parsed.args.accountId);
             break;
           }
-        } catch { /* not this contract's event */ }
+        } catch { /* not a PublishingConviction event */ }
       }
       if (accountId === 0n) {
         throw new Error('createPublishingConvictionAccount succeeded but no AccountCreated event found');
@@ -2329,8 +2376,31 @@ export class EVMChainAdapter implements ChainAdapter {
 
   async getMinimumRequiredSignatures(): Promise<number> {
     await this.init();
-    if (!this.contracts.parametersStorage) return 3;
+    // FAIL-CLOSED (Codex PR #595 round-5): the agent + publisher
+    // verify paths trust whatever this method returns. A silent
+    // fallback to a hardcoded `3` (or any other value) when
+    // ParametersStorage isn't resolvable would let verify use the
+    // wrong quorum without anyone noticing. Refuse to guess.
+    if (!this.contracts.parametersStorage) {
+      throw new Error(
+        'getMinimumRequiredSignatures: ParametersStorage contract is not resolvable. ' +
+        'Verify cannot enforce ACK quorum without a real chain read — fix the adapter wiring or pass an explicit override.',
+      );
+    }
     return Number(await this.contracts.parametersStorage.minimumRequiredSignatures());
+  }
+
+  async isShardingTableMember(identityId: bigint): Promise<boolean> {
+    if (identityId <= 0n) return false;
+    await this.init();
+    const storage = await this.resolveContract('ShardingTableStorage');
+    if (!storage) {
+      throw new Error(
+        'isShardingTableMember: ShardingTableStorage contract is not resolvable. ' +
+        'Verify path cannot enforce sharding-table eligibility without it.',
+      );
+    }
+    return Boolean(await storage.nodeExists(identityId));
   }
 
   async verifyACKIdentity(recoveredAddress: string, claimedIdentityId: bigint): Promise<boolean> {
@@ -2937,5 +3007,62 @@ export class EVMChainAdapter implements ChainAdapter {
     const cgs = this.requireContextGraphStorage();
     const cgId: bigint = await cgs.kcToContextGraph(kcId);
     return BigInt(cgId);
+  }
+
+  /**
+   * OT-RFC-38 / LU-5: chain-backed access-policy oracle for cores.
+   * `ContextGraphStorage.getAccessPolicy` returns the uint8 enum
+   * (`0`=public, `1`=curated). Unregistered ids return `0` (Solidity
+   * default-zero mapping); callers should treat that as "public /
+   * unknown" — for the encrypted-payload guard, `0` MUST NOT be
+   * interpreted as a positive curation signal.
+   */
+  async getContextGraphAccessPolicy(contextGraphId: bigint): Promise<number> {
+    await this.init();
+    const cgs = this.requireContextGraphStorage();
+    const raw: bigint = BigInt(await cgs.getAccessPolicy(contextGraphId));
+    return Number(raw);
+  }
+
+  /**
+   * OT-RFC-38 / LU-6 Phase B — chain-backed participant-agent
+   * allowlist read. Mirrors {@link getContextGraphAccessPolicy}
+   * (single eth_call, used as the authoritative oracle when the
+   * local store has no answer).
+   *
+   * `ContextGraphStorage.getParticipantAgents` returns the address
+   * array as registered at create time. Empty array for unregistered
+   * ids or CGs that genuinely have no agents (the Solidity getter
+   * just returns the stored mapping; absent ids return zero-length).
+   * Addresses are returned in EIP-55 checksum form to keep callers
+   * consistent with the local-store accessor.
+   */
+  async getContextGraphParticipantAgents(contextGraphId: bigint): Promise<string[]> {
+    await this.init();
+    const cgs = this.requireContextGraphStorage();
+    const raw: string[] = await cgs.getParticipantAgents(contextGraphId);
+    return raw.map((addr: string) => ethers.getAddress(addr));
+  }
+
+  /**
+   * OT-RFC-38 / LU-6 Phase B — read the curator-committed wire id
+   * from `ContextGraphStorage.getNameHash(uint256)`. Returns `null`
+   * for unregistered ids OR for the opt-out path (curator passed
+   * `bytes32(0)` at create time); callers fall back to the discovery
+   * beacon in that case.
+   */
+  async getContextGraphNameHash(contextGraphId: bigint): Promise<string | null> {
+    await this.init();
+    const cgs = this.requireContextGraphStorage();
+    try {
+      const raw: string = await cgs.getNameHash(contextGraphId);
+      if (!raw || raw === ethers.ZeroHash) return null;
+      return raw.toLowerCase();
+    } catch (err) {
+      // Fail-closed: an RPC hiccup shouldn't leak as a positive id.
+      // Caller treats `null` as "no chain-anchored hash" and falls
+      // back to the beacon path or rejects.
+      return null;
+    }
   }
 }

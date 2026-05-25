@@ -255,6 +255,28 @@ export interface DkgConfig {
   listenPort: number;
   nodeRole: 'core' | 'edge';
   /**
+   * Core-Node-specific operator tuning. Today only `allowDegradedRelay`;
+   * future Core-only knobs (e.g. relay-target prioritisation) belong here
+   * rather than at the top level so they stay grouped.
+   */
+  core?: {
+    /**
+     * Gate for the boot-time core-relay sanity check (`core-prereq-check.ts`).
+     *
+     *   - `true` (default): the daemon logs `[CORE-PREREQ] looks degraded`
+     *     with a structured reason if its bound multiaddrs can't serve
+     *     inbound traffic, but boots normally. Backwards-compatible — no
+     *     behaviour change for any existing operator on this PR.
+     *   - `false`: the daemon refuses to boot if the sanity check says
+     *     degraded. Opt-in for operators who want fail-loud semantics
+     *     instead of warn-and-continue.
+     *
+     * Edge nodes ignore this field — the prereq check skips the degraded
+     * verdict for `nodeRole: 'edge'`.
+     */
+    allowDegradedRelay?: boolean;
+  };
+  /**
    * Core Node relay-server capacity tuning. Forwarded into the libp2p
    * relay configuration via `DKGNodeConfig.relayServerCapacity`. Sets
    * the maximum number of simultaneous circuit-relay v2 reservations

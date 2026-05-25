@@ -36,6 +36,8 @@ import { existsSync, readdirSync, readFileSync, openSync, closeSync, writeFileSy
 // OpenClaw config helper (~line 2535) uses a bare `homedir()` — aliased
 // below so both sites coexist without a duplicate-module import.
 import * as osModule from 'node:os';
+import type { NetworkInterfaceInfo } from 'node:os';
+import { checkCoreRelayPrereqs } from './core-prereq-check.js';
 const { homedir } = osModule;
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
@@ -856,6 +858,69 @@ export async function runDaemonInner(
   });
 
   await agent.start();
+
+  // Core-relay capability sanity check. Runs once, post-start, while the boot
+  // banner is still in operator focus. If the node declares itself as a Core
+  // (`nodeRole: "core"`) but its actually-bound multiaddrs can't serve inbound
+  // traffic (all loopback / RFC1918 / CGNAT / IPv6 ULA — beacon-01 was the
+  // canonical Tailscale-only case), surface a structured `[CORE-PREREQ]` log
+  // so the operator sees it before any peer-discovery noise scrolls past.
+  //
+  // Behaviour gated by `config.core.allowDegradedRelay`:
+  //   - `true` (default): warn-only. No backcompat change for any existing op.
+  //   - `false`: refuse to boot via `shutdown(1)` — fail-loud opt-in.
+  //
+  // The check is deliberately scoped to a single post-start pass. A pre-start
+  // pass (classifying the *configured* listenAddresses + host interfaces
+  // before libp2p resolves wildcards) is doable but adds plumbing — and the
+  // post-start data is the authoritative source anyway (libp2p has already
+  // expanded `0.0.0.0` to per-interface bindings here). We leave the pre-start
+  // pass as a future extension; the cost is one extra warning ~50ms earlier.
+  if (role === 'core') {
+    try {
+      const resolvedMultiaddrs = agent.node.libp2p
+        .getMultiaddrs()
+        .map((ma: { toString: () => string }) => ma.toString());
+      const hostInterfaces = Object.values(osModule.networkInterfaces())
+        .flat()
+        .filter((i): i is NetworkInterfaceInfo => i !== undefined);
+      const prereq = checkCoreRelayPrereqs({
+        listenAddresses: resolvedMultiaddrs,
+        hostInterfaces,
+        announceAddresses: config.announceAddresses ?? [],
+        nodeRole: 'core',
+      });
+      if (prereq.looksDegraded) {
+        const allowDegraded = config.core?.allowDegradedRelay !== false;
+        const verb = allowDegraded ? 'WARNING' : 'FATAL';
+        log(
+          `[CORE-PREREQ] ${verb}: this Core node looks degraded as a relay. ` +
+            `reasons: ${prereq.reasons.join('; ')}. ` +
+            `non-routable addresses: ${prereq.nonRoutableAddresses
+              .map((a) => `${a.addr} (${a.class})`)
+              .join(', ')}. ` +
+            (allowDegraded
+              ? `Set core.allowDegradedRelay: false in ~/.dkg/config.json to refuse-to-boot on this state. ` +
+                `See docs/operator/CORE_RELAY_PREREQS.md for the full rationale.`
+              : `Refusing to boot. Set core.allowDegradedRelay: true to downgrade this to a warning.`),
+        );
+        if (!allowDegraded) {
+          await shutdown(1);
+          return;
+        }
+      } else {
+        log(
+          `[CORE-PREREQ] OK: ${prereq.publicListenAddresses.length} ` +
+            `public-class listen address${prereq.publicListenAddresses.length === 1 ? '' : 'es'} bound.`,
+        );
+      }
+    } catch (err) {
+      // The check is defensive — never let a crash inside it block the boot.
+      log(
+        `[CORE-PREREQ] check failed (continuing boot): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
 
   const publisherChainBase = chainBase?.rpcUrl && chainBase?.hubAddress
     ? {

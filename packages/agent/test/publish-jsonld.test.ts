@@ -3,7 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DKGAgent, type DKGAgentConfig } from '../src/index.js';
-import { OxigraphStore } from '@origintrail-official/dkg-storage';
+import { OxigraphStore, SharedMemoryLiteralBlobStore, type TripleStore } from '@origintrail-official/dkg-storage';
 import { TripleStoreAsyncLiftPublisher } from '@origintrail-official/dkg-publisher';
 import { buildAuthorAttestationTypedData } from '@origintrail-official/dkg-core';
 import { createEVMAdapter, getSharedContext, createProvider, takeSnapshot, revertSnapshot, HARDHAT_KEYS } from '../../chain/test/evm-test-context.js';
@@ -23,7 +23,7 @@ afterAll(async () => {
 });
 
 const agents: DKGAgent[] = [];
-const stores: OxigraphStore[] = [];
+const stores: TripleStore[] = [];
 const tempDataDirs: string[] = [];
 
 async function createTempDataDir(prefix: string): Promise<string> {
@@ -33,15 +33,15 @@ async function createTempDataDir(prefix: string): Promise<string> {
 }
 
 async function createAgent(name: string, overrides: Partial<DKGAgentConfig> = {}) {
-  const store = overrides.store instanceof OxigraphStore ? overrides.store : new OxigraphStore();
+  const store = overrides.store ?? new OxigraphStore();
   const agent = await DKGAgent.create({
     name,
     listenPort: 0,
     skills: [],
     chainAdapter: createEVMAdapter(HARDHAT_KEYS.CORE_OP),
-    store,
     nodeRole: 'core',
     ...overrides,
+    store,
   });
   agents.push(agent);
   stores.push(store);
@@ -61,6 +61,17 @@ afterEach(async () => {
 });
 
 describe('publishJsonLd', () => {
+  it('returns the override store used by the agent', async () => {
+    const overrideStore = new SharedMemoryLiteralBlobStore(new OxigraphStore(), {
+      blobDir: await createTempDataDir('dkg-agent-override-store-blobs-'),
+      thresholdBytes: 65_536,
+    });
+
+    const { store } = await createAgent('OverrideStoreBot', { store: overrideStore });
+
+    expect(store).toBe(overrideStore);
+  }, 30_000);
+
   it('bare JSON-LD doc defaults to private quads (with synthetic public anchor)', async () => {
     const { agent, store } = await createAgent('BarePrivateBot');
     await agent.createContextGraph({ id: 'bare-priv', name: 'BP', description: '' });

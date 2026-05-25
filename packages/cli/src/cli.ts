@@ -3892,6 +3892,7 @@ program
   .option('--apply', 'Mutate the filesystem. Without this flag, prints the plan and exits.', false)
   .option('--force', 'Bypass the daemon-alive safety check. Operator must SIGKILL the worker first; in-flight writes may be lost.', false)
   .action(async (opts: ActionOpts) => {
+    const quoteForShell = (value: string) => `'${value.replace(/'/g, "'\\''")}'`;
     const { buildMigrationPlan, applyPlan, renderPlan } = await import('./migrate-to-npm.js');
     const detectedRepoRoot = repoDir();
     const repoRoot = detectedRepoRoot ?? process.cwd();
@@ -3946,7 +3947,13 @@ program
     console.log('     dkg start');
     console.log('  3. (Optional) globally install the npm package so `dkg` no longer depends on this tree:');
     console.log('     npm install -g @origintrail-official/dkg');
-    console.log('     After that, `rm -rf packages node_modules pnpm-lock.yaml` is safe.');
+    console.log(
+      `     After that, this cleanup is safe: rm -rf ${[
+        join(repoRoot, 'packages'),
+        join(repoRoot, 'node_modules'),
+        join(repoRoot, 'pnpm-lock.yaml'),
+      ].map(quoteForShell).join(' ')}`,
+    );
   });
 
 // ─── dkg update ──────────────────────────────────────────────────────

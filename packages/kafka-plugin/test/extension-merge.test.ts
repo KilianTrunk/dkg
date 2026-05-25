@@ -73,6 +73,37 @@ describe('validateExtensionAgainstCore — boot-time collision', () => {
     expect(() => validateExtensionAgainstCore(ext, coreSchema)).not.toThrow();
   });
 
+  it('rejects nullable scalar extension fields because KA merge cannot round-trip null', () => {
+    const ext: KafkaPluginExtension<Record<string, unknown>> = {
+      schema: z.object({
+        externalRef: z.string().nullable(),
+        maybeScore: z.number().nullish(),
+      }),
+      augment: () => ({}),
+    };
+
+    expect(() => validateExtensionAgainstCore(ext, coreSchema)).toThrow(
+      ExtensionSchemaUnsupportedFieldError,
+    );
+    try {
+      validateExtensionAgainstCore(ext, coreSchema);
+    } catch (err) {
+      expect((err as ExtensionSchemaUnsupportedFieldError).unsupportedFields).toEqual(
+        expect.arrayContaining(['externalRef', 'maybeScore']),
+      );
+    }
+  });
+
+  it('rejects literal null extension fields because KA merge cannot round-trip null', () => {
+    const ext: KafkaPluginExtension<Record<string, unknown>> = {
+      schema: z.object({ externalRef: z.literal(null) }),
+      augment: () => ({}),
+    };
+    expect(() => validateExtensionAgainstCore(ext, coreSchema)).toThrow(
+      ExtensionSchemaUnsupportedFieldError,
+    );
+  });
+
   it('rejects transformed fields because scalar input may parse to non-scalar output', () => {
     const ext: KafkaPluginExtension<Record<string, unknown>> = {
       schema: z.object({ externalRef: z.string().transform(() => ({ nested: true })) }),

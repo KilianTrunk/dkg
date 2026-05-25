@@ -188,7 +188,12 @@ export async function pollFinalized(auth, captureId, options = {}) {
 
 function normalizePollOptions(optionsOrDeadline) {
   if (typeof optionsOrDeadline === 'number') return { deadlineMs: optionsOrDeadline };
-  return optionsOrDeadline ?? {};
+  const options = optionsOrDeadline ?? {};
+  const syncTimeoutMs = options.syncTimeoutMs ?? SYNC_TIMEOUT_MS;
+  return {
+    ...options,
+    deadlineMs: options.deadlineMs ?? Date.now() + syncTimeoutMs,
+  };
 }
 
 export async function fetchKaOnNode2(auth, ual, optionsOrDeadline) {

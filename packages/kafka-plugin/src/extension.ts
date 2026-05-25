@@ -52,6 +52,7 @@ export function validateExtensionAgainstCore<TParsed>(
 }
 
 function isSupportedScalarField(schema: ZodTypeAny): boolean {
+  if (hasNullableWrapper(schema)) return false;
   const unwrapped = unwrapScalarWrapper(schema);
   return (
     unwrapped instanceof z.ZodString ||
@@ -59,8 +60,39 @@ function isSupportedScalarField(schema: ZodTypeAny): boolean {
     unwrapped instanceof z.ZodBoolean ||
     unwrapped instanceof z.ZodEnum ||
     unwrapped instanceof z.ZodNativeEnum ||
-    unwrapped instanceof z.ZodLiteral
+    (
+      unwrapped instanceof z.ZodLiteral &&
+      isNonNullScalar((unwrapped as z.ZodLiteral<unknown>)._def.value)
+    )
   );
+}
+
+function isNonNullScalar(value: unknown): boolean {
+  return (
+    typeof value === 'string' ||
+    typeof value === 'number' ||
+    typeof value === 'boolean'
+  );
+}
+
+function hasNullableWrapper(schema: ZodTypeAny): boolean {
+  let current = schema;
+  while (true) {
+    if (current instanceof z.ZodNullable) return true;
+    if (current instanceof z.ZodOptional) {
+      current = current.unwrap();
+      continue;
+    }
+    if (current instanceof z.ZodDefault || current instanceof z.ZodCatch) {
+      current = current._def.innerType;
+      continue;
+    }
+    if (current instanceof z.ZodEffects && current._def.effect.type === 'refinement') {
+      current = current._def.schema;
+      continue;
+    }
+    return false;
+  }
 }
 
 function unwrapScalarWrapper(schema: ZodTypeAny): ZodTypeAny {

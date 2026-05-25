@@ -10,6 +10,7 @@ const RDF_TYPE = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type';
 const KAFKA_STREAM_TYPE = `${DKG_STREAMS}KafkaStream`;
 const XSD = 'http://www.w3.org/2001/XMLSchema#';
 const XSD_NUMERIC = /^(?:decimal|float|double|integer|long|int|short|byte|nonPositiveInteger|negativeInteger|nonNegativeInteger|positiveInteger|unsignedLong|unsignedInt|unsignedShort|unsignedByte)$/;
+const CONTEXT_GRAPH_ID = /^[\w:/.@-]+$/;
 
 const UNSAFE_IRI_CHARS = /[<>"{}|\\^`\s]/;
 
@@ -24,7 +25,7 @@ function dataUri(contextGraphId: string, subGraphName?: string): string {
 }
 
 function assertSafeCgId(cgId: string): void {
-  if (!cgId || UNSAFE_IRI_CHARS.test(cgId)) {
+  if (!cgId || cgId.length > 256 || !CONTEXT_GRAPH_ID.test(cgId)) {
     throw new Error(`Invalid contextGraphId: contains illegal character in "${cgId}"`);
   }
 }

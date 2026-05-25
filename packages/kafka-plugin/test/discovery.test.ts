@@ -87,6 +87,11 @@ ORDER BY DESC(?receivedAt) ?ual ?root ?p ?o`,
       buildListQuery({ contextGraphId: 'urn:cg:demo> } DROP ALL {', limit: 30, offset: 0 }),
     ).toThrow();
   });
+  it('rejects contextGraphId characters that would change the graph IRI', () => {
+    for (const contextGraphId of ['urn:cg:demo?query', 'urn:cg:demo#fragment']) {
+      expect(() => buildListQuery({ contextGraphId, limit: 30, offset: 0 })).toThrow();
+    }
+  });
 });
 describe('discovery — buildCountQuery', () => {
   it('emits the exact SPARQL string counting distinct UALs joined via KA partOf in the meta graph and KafkaStream type in the data graph', () => {

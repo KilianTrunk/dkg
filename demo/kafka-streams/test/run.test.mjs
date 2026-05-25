@@ -249,6 +249,56 @@ test('fetchListOnNode2 retries transient list errors before finding the UAL', as
   assert.equal(list.items[0]['@id'], 'ual-1');
 });
 
+test('node2 polling helpers default the deadline when deadlineMs is omitted', async () => {
+  const kaResponses = [
+    { status: 404, body: 'not gossiped yet' },
+    { status: 200, body: '{"@id":"ual-1"}', parsed: { '@id': 'ual-1' } },
+  ];
+  let kaCalls = 0;
+  let kaSleeps = 0;
+  const ka = await fetchKaOnNode2(
+    { baseUrl: 'http://node2', token: 't' },
+    'ual-1',
+    {
+      basePath: '/api/kafka/streams',
+      intervalMs: 1,
+      syncTimeoutMs: 1000,
+      httpJson: async () => kaResponses[kaCalls++],
+      sleep: async () => {
+        kaSleeps += 1;
+      },
+    },
+  );
+
+  assert.equal(kaCalls, 2);
+  assert.equal(kaSleeps, 1);
+  assert.equal(ka['@id'], 'ual-1');
+
+  const listResponses = [
+    { status: 503, body: 'not ready' },
+    { status: 200, body: '{"items":[{"@id":"ual-1"}]}', parsed: { items: [{ '@id': 'ual-1' }] } },
+  ];
+  let listCalls = 0;
+  let listSleeps = 0;
+  const list = await fetchListOnNode2(
+    { baseUrl: 'http://node2', token: 't' },
+    'ual-1',
+    {
+      basePath: '/api/kafka/streams',
+      intervalMs: 1,
+      syncTimeoutMs: 1000,
+      httpJson: async () => listResponses[listCalls++],
+      sleep: async () => {
+        listSleeps += 1;
+      },
+    },
+  );
+
+  assert.equal(listCalls, 2);
+  assert.equal(listSleeps, 1);
+  assert.equal(list.items[0]['@id'], 'ual-1');
+});
+
 test('fetchKaOnNode2 keeps retrying 404 while waiting for cross-node gossip', async () => {
   const responses = [
     { status: 404, body: 'not gossiped yet' },

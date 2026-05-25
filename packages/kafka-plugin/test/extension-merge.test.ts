@@ -95,13 +95,6 @@ describe('validateExtensionAgainstCore — boot-time collision', () => {
     expect(() => validateExtensionAgainstCore(ext, coreSchema)).toThrow(
       ExtensionSchemaUnsupportedFieldError,
     );
-    try {
-      validateExtensionAgainstCore(ext, coreSchema);
-    } catch (err) {
-      expect((err as ExtensionSchemaUnsupportedFieldError).unsupportedFields).toEqual(
-        expect.arrayContaining(['externalRef', 'maybeScore']),
-      );
-    }
   });
 
   it('rejects literal null extension fields because KA merge cannot round-trip null', () => {

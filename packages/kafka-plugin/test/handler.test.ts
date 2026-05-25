@@ -278,6 +278,23 @@ describe('handler — GET /register/:captureID', () => {
     expect(captured.statusCode).toBe(404);
     expect(captured.body).toMatchObject({ error: 'CaptureNotFound' });
   });
+  it.each([
+    ['another context graph', { contextGraphId: 'urn:cg:other' }, {}],
+    ['another sub-graph', { contextGraphId: 'urn:cg:demo', subGraphName: 'private' }, { subGraphName: 'streams' }],
+  ])('returns 404 CaptureNotFound when capture belongs to %s', async (_label, request, publishOptions) => {
+    const { req, res, captured } = mockReqRes('GET', '/api/kafka/streams/register/cap-other');
+    const { ctx, getStatus } = mockCtx();
+    getStatus.mockResolvedValueOnce({
+      status: 'finalized',
+      request,
+      timestamps: { acceptedAt: 1700000000000 },
+      finalization: { ual: 'did:dkg:1/0xabc' },
+    });
+    const handler = createHandler({ basePath: '/api/kafka/streams', contextGraphId: 'urn:cg:demo', publishOptions });
+    await handler({ ...ctx, req, res, path: '/api/kafka/streams/register/cap-other' });
+    expect(captured.statusCode).toBe(404);
+    expect(captured.body).toMatchObject({ error: 'CaptureNotFound' });
+  });
   it('returns 404 CaptureNotFound when captureID segment is empty', async () => {
     const { req, res, captured } = mockReqRes('GET', '/api/kafka/streams/register/');
     const { ctx } = mockCtx();

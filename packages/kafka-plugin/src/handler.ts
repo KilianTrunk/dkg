@@ -41,7 +41,7 @@ export interface KafkaPluginCtx {
 
 export interface KafkaJobStatus {
   status: string;
-  request?: { contextGraphId?: string };
+  request?: { contextGraphId?: string; subGraphName?: string };
   timestamps: { acceptedAt: number; finalizedAt?: number };
   finalization?: { ual?: string };
   failure?: { message?: string };
@@ -74,7 +74,7 @@ export function createHandler(opts: CreateHandlerOptions) {
     }
     if (ctx.req.method === 'GET' && path.startsWith(registerPathPrefix)) {
       const captureID = decodePathSegment(path.slice(registerPathPrefix.length));
-      return handleGetCapture(ctx, captureID);
+      return handleGetCapture(ctx, opts, captureID);
     }
     if (ctx.req.method === 'GET' && (path === basePath || path === basePathPrefix)) {
       return handleGetList(ctx, opts);
@@ -179,12 +179,28 @@ async function handlePostRegister(
   });
 }
 
-async function handleGetCapture(ctx: KafkaPluginCtx, captureID: string): Promise<void> {
+async function handleGetCapture(
+  ctx: KafkaPluginCtx,
+  opts: CreateHandlerOptions,
+  captureID: string,
+): Promise<void> {
+  const cgId = opts.contextGraphId ?? ctx.config.kafka?.contextGraphId;
+  if (!cgId) {
+    return jsonResponse(ctx.res, 503, {
+      error: 'PluginMisconfigured',
+      message: 'kafka-plugin has no configured contextGraphId',
+    });
+  }
   if (!captureID) {
     return jsonResponse(ctx.res, 404, { error: 'CaptureNotFound' });
   }
   const job = await ctx.publisherControl.getStatus(captureID);
-  if (!job) {
+  const subGraphName = resolvePublishSubGraphName(opts);
+  if (
+    !job ||
+    job.request?.contextGraphId !== cgId ||
+    (job.request?.subGraphName ?? undefined) !== subGraphName
+  ) {
     return jsonResponse(ctx.res, 404, { error: 'CaptureNotFound' });
   }
   return jsonResponse(ctx.res, 200, {

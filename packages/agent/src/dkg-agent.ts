@@ -5535,19 +5535,36 @@ export class DKGAgent {
         // rc.9 PR-8: route through messenger.sendReliable so
         // sender-side idempotency + durable outbox + retry-with-
         // backoff cover this protocol the same way they cover chat.
-        // sendReliable can return queued=true on transient failures;
-        // SWM sender-key send treats that as a hard failure because
-        // the ACK is synchronous-by-contract (epoch setup blocks on
-        // it).
+        //
+        // Delivery semantics (C2 integration-pass relaxation):
+        //   • `delivered=true && ack.accepted=true`  → success.
+        //   • `delivered=true && ack.accepted=false` → HARD failure
+        //     (recipient explicitly rejected the package — bad key,
+        //     bad membership hash, etc; queuing won't help).
+        //   • `delivered=false`                      → SOFT success.
+        //     The setup-package landed in the messenger's durable
+        //     outbox and will be replayed when the recipient comes
+        //     back online. Treating this as a hard failure used to
+        //     block any open-publish-CG write whenever the curator
+        //     was offline mid-batch, breaking the "members keep
+        //     publishing under intermittent curator availability"
+        //     contract C2 exercises. The recipient still gets the
+        //     epoch + chain key eventually; the only cost is that
+        //     they can't decrypt the broadcast that immediately
+        //     follows until the queued setup catches up.
         const sendResult = await this.messenger.sendReliable(
           recipient.peerId,
           PROTOCOL_SWM_SENDER_KEY,
           encodeSwmSenderKeyPackage(pkg),
         );
         if (!sendResult.delivered) {
-          throw new Error(
-            `SWM sender-key send queued (not synchronously deliverable): ${sendResult.error}`,
+          this.log.warn(
+            input.ctx,
+            `SWM sender-key setup for ${recipientAgentAddress} keyId=${recipient.recipientKeyId} ` +
+            `queued (not synchronously deliverable): ${sendResult.error} — recipient will receive on next reconnect`,
           );
+          successByAgent.add(recipientAgentAddress.toLowerCase());
+          continue;
         }
         const ack = decodeSwmSenderKeyPackageAck(sendResult.response);
         if (

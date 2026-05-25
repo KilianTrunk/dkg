@@ -7762,7 +7762,36 @@ export class DKGAgent {
       }
       if (numericId <= 0n) return false;
       const getAccessPolicy = this.chain.getContextGraphAccessPolicy;
-      if (typeof getAccessPolicy !== 'function') return null;
+      if (typeof getAccessPolicy !== 'function') {
+        // Codex PR #637 follow-up: `getContextGraphAccessPolicy` is
+        // an OPTIONAL `ChainAdapter` method, and the prior
+        // `return null` here turned a missing implementation into
+        // UNKNOWN — which the throw at the bottom of
+        // `_resolveEncryptInlinePayload` converted into a hard
+        // "publish access-policy is unknown" failure. That broke
+        // every external / custom adapter that supports V10 publish
+        // but hasn't adopted the access-policy getter yet
+        // (the regression Codex flagged on PRs #637 + #645).
+        //
+        // Local meta already had its shot above (`isPrivateContextGraph`
+        // would have returned `true` for a curated CG the local node
+        // created or joined with policy metadata). If we got here,
+        // either:
+        //   (a) the local node never had local meta for this CG —
+        //       we have no way to know it's curated, so we fall
+        //       through to PUBLIC, restoring v9-era behaviour for
+        //       adapters that pre-date the getter; OR
+        //   (b) the local meta returned `false` (= public). Same
+        //       answer.
+        //
+        // The fail-closed semantic is preserved for the SEPARATE
+        // case "method is implemented but threw" — see the catch
+        // below — because that's an actual policy-lookup failure
+        // (RPC down, contract reverted, etc.) and refusing to choose
+        // plaintext vs encrypted without a verified policy is the
+        // right call there.
+        return false;
+      }
       try {
         const policy = await getAccessPolicy.call(this.chain, numericId);
         if (policy === 0 || policy === 1) {
@@ -8959,10 +8988,27 @@ export class DKGAgent {
         // here so the immediate `reconcileSwmHostModeSubscription()`
         // call below will re-wire the host listener if host mode
         // is still applicable.
+        //
+        // Codex PR #620 follow-up: the in-memory deletes above are
+        // not enough — the persisted `hostModeSubscribed=true` flag
+        // would survive restart and the B3 startup-restore loop
+        // (`initializeSwmHostModeStore`) would re-subscribe a CG
+        // this node has just been told it's no longer authorized
+        // for. Enqueue a persistence=false write here so the
+        // `.meta` reflects the same teardown as the in-memory
+        // maps. If the immediate `reconcileSwmHostModeSubscription`
+        // below decides host mode IS still applicable, it'll
+        // re-engage via `wireSwmHostModeHandler` → enqueue
+        // persistence=true again. The per-CG queue
+        // (`enqueueHostModePersistence`) serialises the pair so the
+        // final on-disk state always matches the final in-memory
+        // intent — no possible interleave where the "false" lands
+        // after a later "true" and re-subscribes on next boot.
         this.gossip.unsubscribe(swmTopic);
         this.sharedMemoryGossipRegistered.delete(contextGraphId);
         this.swmHostModeSubscribed.delete(contextGraphId);
         this.swmHostModeHandlers.delete(contextGraphId);
+        this.enqueueHostModePersistence(contextGraphId, false);
         this.log.warn(ctx, `SWM gossip unsubscribed for "${contextGraphId}": local node is no longer authorized`);
       } else {
         this.log.warn(ctx, `SWM gossip subscription denied for "${contextGraphId}": local node is not authorized`);

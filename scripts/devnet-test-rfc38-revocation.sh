@@ -323,9 +323,17 @@ log "✓ M2 rejected $ROTATION_DENIED post-revoke sender-key broadcast(s) with r
 act "7. Authorization-side rotation: curator must deny M2's sync requests post-revoke"
 # ===========================================================================
 CURATOR_LOG="$DEVNET_DIR/node${CURATOR_NODE}/daemon.log"
+# Belt-and-braces against the bash idiom "cmd | grep -c ... || echo 0" where
+# the `|| echo 0` only fires if the WHOLE pipeline returns non-zero — grep -c
+# returns 0 on no match but with status 1, so the fallback fires AND
+# concatenates with the legit "0" count, yielding "0\n0" which breaks `[ -lt ]`.
+# Force a single integer by collapsing newlines and taking the last numeric
+# token.
 M2_DENIED_BY_CURATOR=$(grep "Private sync auth for \"${CG_ID}\"" "$CURATOR_LOG" 2>/dev/null \
-  | grep "signer=${M2_AGENT}" | grep -c "allowed=false" || echo 0)
-if [ -z "$M2_DENIED_BY_CURATOR" ] || [ "$M2_DENIED_BY_CURATOR" -lt 1 ]; then
+  | grep "signer=${M2_AGENT}" | grep -c "allowed=false" 2>/dev/null || true)
+M2_DENIED_BY_CURATOR=$(printf '%s' "${M2_DENIED_BY_CURATOR:-0}" | tr -d '[:space:]')
+[ -n "$M2_DENIED_BY_CURATOR" ] || M2_DENIED_BY_CURATOR=0
+if [ "$M2_DENIED_BY_CURATOR" -lt 1 ]; then
   warn "AUTH-SIDE OBSERVATION: curator didn't log any post-revoke M2 sync-denials yet. " \
        "M2 may not have re-tried sync against the curator within the test window."
 else

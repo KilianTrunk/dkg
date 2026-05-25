@@ -568,6 +568,88 @@ What this layer **does not** do:
   requires a behaviour-scanning tool (Socket.dev, Phylum, or
   equivalent) and is tracked as a separate follow-up.
 
+### 13. Named-package + file deny-list
+
+Hard-gate scanner that catches the small but high-value subset of
+attacks where the *package name itself* is the IoC — i.e. the attacker
+publishes a brand-new malicious package under a name a developer might
+plausibly install, and the threat is identical across every version.
+
+Sits structurally alongside §12 but covers a different threat class:
+
+| Control                              | Threat class                              | Trigger                                  |
+|--------------------------------------|-------------------------------------------|------------------------------------------|
+| §12 Layer 1 — Dependabot cooldown    | Compromised *version* of a legit package  | Refuses to propose any release < 7 days  |
+| §12 Layer 2 — Advisory gate          | Compromised version with GHSA/OSV entry   | Per-PR DB diff (new vs old version)      |
+| §13 — Named-package + file deny-list | Whole *package* is the IoC, every version | Per-PR scan of lockfile + every pkg.json |
+
+The deny-list lives at `.github/dependency-deny-list.json` and is
+scanned by `scripts/check-dependency-deny-list.mjs` from the
+`dependency-deny-list` job in `supply-chain-scan.yml`. The job runs on
+every PR that touches `pnpm-lock.yaml` or any `package.json`, on every
+push to `main`, and on the same weekly cron as the other supply-chain
+scanners.
+
+**Entry shape** (each one carries provenance so future reviewers can
+audit why it landed):
+
+```jsonc
+{
+  "name": "<exact package name>",
+  "ecosystem": "npm",
+  "campaign": "<short campaign label, e.g. TrapDoor>",
+  "added_at": "<YYYY-MM-DD>",
+  "source_url": "<URL of the IoC publication>"
+}
+```
+
+**Scanner design**, all in vanilla `node:fs` (no `npm install` step —
+the scanner deliberately doesn't pull anything from a registry):
+
+- Lockfile sanity check first. If a known-present package (configured
+  in `scanner_sanity_check.expected_package_in_lockfile`) cannot be
+  found in `pnpm-lock.yaml`, the scanner exits 2 (= scanner broken)
+  instead of 0 (= clean). This closes the silent-no-op failure mode
+  the pnpm-audit step previously had (now fixed) — a future workflow
+  refactor cannot accidentally turn this into a green badge over an
+  unscanned lockfile.
+- Package-name matching uses a word-boundary regex that requires the
+  name to appear at a valid pnpm-lock / package.json token boundary
+  (`@`, `/`, `:`, quote, whitespace). This prevents a future
+  legitimate package whose name *contains* a deny-listed substring
+  from being false-positive flagged.
+- `denied_files[]` covers paths that should never appear in the repo
+  (currently: `.cursorrules`, the legacy Cursor instruction file).
+  Maintained as a separate list so the scanner reports the right kind
+  of error and so adding a new denied path doesn't require touching
+  the package-name matcher.
+
+**Exit codes the workflow gate on**:
+
+| Code | Meaning           | CI behaviour                      |
+|------|-------------------|-----------------------------------|
+| 0    | clean             | green check                       |
+| 1    | denied hit found  | red check, PR cannot pass         |
+| 2    | scanner broken    | red check, requires investigation |
+
+**Maintenance**: when a new IoC is published, add the entry to
+`.github/dependency-deny-list.json` with the campaign + source URL +
+added-on date. Run `node scripts/check-dependency-deny-list.mjs` once
+locally to verify clean before committing. The scanner itself does
+not need bumping for new entries — only the JSON file.
+
+What this layer **does not** do:
+
+- It does not protect against an attacker that re-uses an existing
+  *legitimate* package's name by hijacking the maintainer's npm
+  account (the CanisterWorm pattern). §12 is the right defence there
+  — a hijacked package would publish a new version, which §12's
+  cooldown + advisory gate would catch.
+- It does not protect against an entirely new IoC package that has
+  not been added to the deny-list yet. The list is reactive by
+  design; the cooldown + advisory gate from §12 is the proactive
+  layer that catches the attacks we have not heard about yet.
+
 ---
 
 ## Tier 2 admin steps (require maintainer GitHub UI/API access)

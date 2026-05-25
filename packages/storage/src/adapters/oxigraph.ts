@@ -1,6 +1,6 @@
 import oxigraph from 'oxigraph';
-import { existsSync, readFileSync, mkdirSync } from 'node:fs';
-import { writeFile, mkdir } from 'node:fs/promises';
+import { existsSync, readFileSync, renameSync } from 'node:fs';
+import { mkdir, open, rename } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import type {
   TripleStore,
@@ -34,15 +34,53 @@ export class OxigraphStore implements TripleStore {
     }
   }
 
+  /**
+   * Hydrate the in-memory store from a persisted N-Quads dump on disk.
+   *
+   * On parse failure we deliberately fail loud: the corrupt file is renamed
+   * aside for forensics (so the next daemon start picks up a clean empty
+   * state) and the error is rethrown so the operator sees the failure
+   * immediately rather than discovering empty data later through queries.
+   *
+   * Previously this swallowed all errors and started empty silently — that
+   * was the proximate cause of the WM persistence regression documented in
+   * docs/bugs/wm-persistence-regression.md.
+   */
   private hydrateSync(filePath: string): void {
+    if (!existsSync(filePath)) return;
+    let data: string;
     try {
-      if (!existsSync(filePath)) return;
-      const data = readFileSync(filePath, 'utf-8') as string;
-      if (data.trim()) {
-        this.store.load(data, { format: 'application/n-quads' });
+      data = readFileSync(filePath, 'utf-8') as string;
+    } catch (err) {
+      throw new Error(
+        `OxigraphStore: failed to read persist file ${filePath}: ${(err as Error).message}`,
+      );
+    }
+    if (!data.trim()) return;
+    try {
+      this.store.load(data, { format: 'application/n-quads' });
+    } catch (err) {
+      const ts = new Date().toISOString().replace(/[:.]/g, '-');
+      const corruptPath = `${filePath}.corrupt-${ts}`;
+      try {
+        renameSync(filePath, corruptPath);
+      } catch (renameErr) {
+        // Surface both the original parse error and the rename failure;
+        // operator may need to clean up by hand.
+        throw new Error(
+          `OxigraphStore: failed to parse ${filePath} (${(err as Error).message}); ` +
+            `also failed to move it aside: ${(renameErr as Error).message}`,
+        );
       }
-    } catch {
-      // File missing or corrupt — start empty.
+      // eslint-disable-next-line no-console
+      console.error(
+        `[OxigraphStore] hydrate failed for ${filePath}: ${(err as Error).message}. ` +
+          `Moved corrupt store to ${corruptPath}; restart the daemon to continue with an empty store. ` +
+          `The renamed file is preserved for forensics.`,
+      );
+      throw new Error(
+        `OxigraphStore: store.nq corrupt at ${filePath}, moved to ${corruptPath}: ${(err as Error).message}`,
+      );
     }
   }
 
@@ -57,15 +95,65 @@ export class OxigraphStore implements TripleStore {
     }, 50);
   }
 
+  /**
+   * Dump the in-memory store to disk atomically + durably.
+   *
+   * Sequence:
+   *   1. Write the full N-Quads dump to a sibling tmp file.
+   *   2. fsync the tmp file so the bytes are on stable storage.
+   *   3. Atomic rename(tmp -> persistPath) — POSIX guarantees atomicity, so
+   *      a crash mid-step leaves the old persistPath intact.
+   *   4. fsync the containing directory so the rename itself is durable.
+   *
+   * Previously a single `writeFile(persistPath, dump)` left the store
+   * vulnerable to torn writes on SIGKILL (the file would be partially
+   * rewritten, then hydrateSync would fail-then-swallow on next start).
+   * This is the proximate fix for the catastrophic data-loss mode
+   * documented in docs/bugs/wm-persistence-regression.md.
+   */
   private async flushNow(): Promise<void> {
     if (!this.persistPath || this.flushing) return;
     this.flushing = true;
+    const dir = dirname(this.persistPath);
+    const tmpPath = `${this.persistPath}.tmp`;
     try {
-      await mkdir(dirname(this.persistPath), { recursive: true });
+      await mkdir(dir, { recursive: true });
       const nquads = this.store.dump({ format: 'application/n-quads' });
-      await writeFile(this.persistPath, nquads, 'utf-8');
-    } catch {
-      // Best-effort persistence.
+
+      // 1+2: write to tmp, fsync to commit bytes.
+      const fh = await open(tmpPath, 'w');
+      try {
+        await fh.writeFile(nquads, 'utf-8');
+        await fh.sync();
+      } finally {
+        await fh.close();
+      }
+
+      // 3: atomic rename — POSIX-atomic on the same filesystem.
+      await rename(tmpPath, this.persistPath);
+
+      // 4: fsync the directory so the rename itself survives a power loss.
+      // Best-effort: some filesystems / Node versions don't expose dir-fd
+      // sync; swallow ENOENT/EPERM since the rename itself already
+      // succeeded and the cache will eventually flush.
+      try {
+        const dirFh = await open(dir, 'r');
+        try {
+          await dirFh.sync();
+        } finally {
+          await dirFh.close();
+        }
+      } catch {
+        // Best-effort dir fsync.
+      }
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error(
+        `[OxigraphStore] flushNow failed for ${this.persistPath}: ${(err as Error).message}. ` +
+          `Tmp file (${tmpPath}) may need cleanup.`,
+      );
+      // Persistence is best-effort by design; surface the failure but don't
+      // crash the running daemon — the next flush will retry.
     } finally {
       this.flushing = false;
     }

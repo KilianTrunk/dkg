@@ -13930,6 +13930,14 @@ export class DKGAgent {
       await this.syncVerifyWorker.close();
       this.syncVerifyWorker = undefined;
     }
+    // Flush WM to disk before exit so the debounced 50ms flush in the
+    // Oxigraph adapter can't lose the latest inserts when the process
+    // exits. See docs/bugs/wm-persistence-regression.md.
+    try {
+      await this.store.close();
+    } catch {
+      /* swallow on shutdown */
+    }
     this.started = false;
   }
 

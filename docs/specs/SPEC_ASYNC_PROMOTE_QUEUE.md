@@ -110,9 +110,16 @@ Response: `200 OK`
 }
 ```
 
-`entities` is bounded by the same `ROOT_CHUNK = 1000` budget as the sync
-route (see ADR 0002). Larger root sets must be split client-side, the same
-way they are today.
+`entities` is bounded by the [ADR 0002 importer chunking
+contract](../adr/0002-importer-chunking-contract.md) — typically
+`ROOT_CHUNK ≤ 1000` — for symmetry with the sync route's request-size
+budget. Note that the **sync** `/promote` route does not currently
+enforce a per-call root cap server-side (it accepts `entities: "all"`
+and any explicit array that fits under `MAX_BODY_BYTES`); the async
+route adopts the same lenient acceptance. We deliberately do not raise
+the cap unilaterally for async: if sync grows a hard limit later (which
+the queue saturation behaviour in §4.3 will make easier), async should
+adopt it at the same time so the contracts stay aligned.
 
 ### 3.2 Status
 
@@ -133,23 +140,45 @@ Response: `200 OK`
   "startedAt": "...",
   "finishedAt": "...",
   "entitiesPromoted": 873,
+  "attempts": 2,
+  "nextRetryAt": "2026-05-25T13:05:00.000Z",
   "lastError": { "code": "...", "message": "...", "retryable": true }
 }
 ```
 
-`state` transitions: `queued → running → (succeeded | failed)`. A failed
-job carries `lastError.retryable: true` if the daemon will retry it
-automatically; the operator can manually requeue any failed job via the
-recovery route.
+`state` transitions:
+
+```
+queued → running ⇄ failed_retrying → running → (succeeded | failed)
+                                              ↘
+                                                failed   (terminal)
+```
+
+- `queued` — accepted, not yet claimed by a worker.
+- `running` — claimed by a worker; lease is being held (see §4.3).
+- `failed_retrying` — last attempt failed with a retryable error; the
+  daemon **will** schedule another attempt (`nextRetryAt`) without
+  operator intervention. Polling clients **MUST keep waiting** while a
+  job sits in this state.
+- `succeeded` — terminal; assertion is in SWM.
+- `failed` — terminal; retry budget exhausted (or the daemon classified
+  the error as non-retryable). The only way out is an explicit
+  `recover`.
+
+Splitting `failed_retrying` (transient) from `failed` (terminal) is
+deliberate: importers should not stop polling on a transient error
+just because the daemon happens to log it as a "failure". This is the
+single most common foot-gun in similar APIs we've seen.
 
 ### 3.3 List + filter
 
 ```http
-GET /api/assertion/promote-async?contextGraphId=<cg>&state=running,queued&limit=50
+GET /api/assertion/promote-async?contextGraphId=<cg>&state=running,queued,failed_retrying&limit=50
 ```
 
 Response shape mirrors `/api/publisher/jobs` (the `AsyncLiftPublisher`
-analogue).
+analogue). `state` accepts a comma-separated list, including the
+transient `failed_retrying` value.
 
 ### 3.4 Cancel / requeue
 
@@ -178,41 +207,101 @@ interface PromoteJob {
   finishedAt?: string;
   entitiesPromoted?: number;
   attempts: number;
+  claimedBy?: string;          // worker id of the current lease holder
+  claimToken?: string;         // opaque renew token (see §4.3)
+  claimLeaseExpiresAt?: string; // ISO-8601 — lease wall-clock deadline
+  nextRetryAt?: string;
   lastError?: { code: string; message: string; retryable: boolean };
 }
 ```
 
-Persisted in the daemon's `meta` sub-graph as RDF triples under a
-`urn:dkg:promote-job:<id>` subject, same shape as `LiftJob` lives today.
-The choice to persist via the assertion API (rather than a side-table)
-gives us durability across restarts for free — the same atomic-write
-guarantees that protect WM (#640) protect the queue.
+Persisted in a **dedicated control graph** (`urn:dkg:promote-queue:control-plane`),
+**not** in any project's `meta` sub-graph. This mirrors the existing
+`AsyncLiftPublisher`, which keeps its `LiftJob` records under
+`urn:dkg:publisher:control-plane` (see
+[`async-lift-control-plane.ts`](../../packages/publisher/src/async-lift-control-plane.ts)).
+
+Rationale for the dedicated graph:
+
+- **No circular dependency.** Routing queue bookkeeping through any
+  project's regular assertion-write path would couple the queue's
+  durability to the same code-path it's supposed to recover when
+  promote calls fail. The control graph uses the daemon's lower-level
+  triple-store write API directly.
+- **Control-plane / data-plane separation.** Job state is daemon
+  internals; it should not show up in user `dkg_query` results scoped
+  to a context graph, and it should not gossip to peers.
+- **Free durability either way.** The dedicated graph rides the same
+  atomic-write guarantees that protect WM (#640) — fsync + rename + dir
+  fsync on the persisted store — so persistence is not lost by
+  bypassing the assertion API.
 
 ### 4.2 Worker loop
 
 A single `AsyncPromoteWorker` runs in-process inside the daemon (no
 separate worker thread — promote is not CPU-bound). It:
 
-1. Polls the queue for jobs in `queued` state, ordered by `enqueuedAt`.
-2. For each job, transitions to `running`, calls the existing
-   `assertion.promote(...)` logic internally (the SAME code path the sync
-   route uses — we share implementation, not just shape), and writes
-   `succeeded` or `failed` based on the result.
-3. On `failed`, applies exponential backoff (matches
-   `AsyncLiftPublisher`'s policy) and requeues until
-   `attempts >= maxAttempts` (default 5). Then marks `failed` permanently,
-   requiring an explicit `recover` to retry.
-4. Concurrency: at most N (default 4) running jobs per daemon, matching
+1. Polls the control graph for jobs in `queued` state, ordered by
+   `enqueuedAt`.
+2. **Claims** a job (atomic compare-and-swap on `state: queued → running`,
+   writes `claimedBy`, `claimToken`, `claimLeaseExpiresAt = now + leaseTtlMs`;
+   see §4.3 for the lease model). Calls the existing
+   `assertion.promote(...)` logic internally (the SAME code path the
+   sync route uses — we share implementation, not just shape), and
+   writes `succeeded` or transitions to `failed_retrying`/`failed`
+   based on the result.
+3. While the promote is running, the worker renews its lease every
+   `leaseTtlMs / 2` (default 30s) so a long-running but healthy
+   promote is not reclaimed (see §4.3).
+4. On retryable error, transitions to `failed_retrying`, sets
+   `nextRetryAt = now + backoff(attempts)` (matches
+   `AsyncLiftPublisher`'s exponential backoff policy), and clears the
+   claim so the job becomes eligible for re-pickup at `nextRetryAt`.
+5. On `attempts >= maxAttempts` (default 5) or non-retryable error,
+   transitions to terminal `failed`. Requires explicit `recover` to
+   retry.
+6. Concurrency: at most N (default 4) running jobs per daemon, matching
    the ADR 0002 "max concurrent assertions" guidance. The worker doesn't
-   intra-assertion parallelise (still 1 promote per assertion at a time).
+   intra-assertion parallelise (still 1 promote per assertion at a
+   time).
 
-### 4.3 Failure modes + recovery
+### 4.3 Lease-based reclaim (no fixed timeouts)
 
-- **Daemon crash mid-job**: the job is still `running` in the persisted
-  store. On startup, the worker scans for `running` jobs older than
-  `runningTimeoutMs` (default 60s) and transitions them back to `queued`
-  for a fresh attempt. The same recovery pattern `AsyncLiftPublisher`
-  already implements.
+Naïve "any `running` job older than 60s is reclaimable" timers
+duplicate work: a perfectly healthy promote of a large assertion can
+legitimately spend longer than 60s in subtraction / gossip /
+backpressure, and a second worker firing against the same assertion
+while the first one is still running is exactly the kind of
+double-write we want to avoid.
+
+Instead, the queue uses a **renewable lease** (same pattern as
+`AsyncLiftPublisher`'s `claimToken` + `claimLeaseExpiresAt`):
+
+- When a worker claims a job, it writes `claimToken = <opaque>` and
+  `claimLeaseExpiresAt = now + leaseTtlMs` (default 60s) atomically
+  with the `queued → running` transition.
+- While processing, the worker **renews** the lease every
+  `leaseTtlMs / 2` by extending `claimLeaseExpiresAt`. The renew is a
+  conditional write: it only succeeds if `claimToken` still matches.
+  If the renew fails, the worker abandons the job (some other worker
+  reclaimed it after a perceived stall) without writing `succeeded`.
+- A job is **reclaimable** only when `now > claimLeaseExpiresAt`,
+  i.e. the lease has truly lapsed (worker crashed, daemon crashed, GC
+  pause longer than the lease). Long-but-healthy promotes keep
+  renewing and stay claimed.
+- The "60s reclaim" knob becomes the **lease TTL**, not a fixed
+  job-age timeout. Operators can tune it per workload (longer for
+  slow disks, shorter for tight-SLA imports) without changing the
+  worker logic.
+
+### 4.4 Failure modes + recovery
+
+- **Daemon crash mid-job**: the job's lease expires (because nothing
+  is renewing it). On startup — or on the next scheduling tick of a
+  peer daemon, if/when we support multi-daemon queues — the worker
+  scans for `running` jobs with `claimLeaseExpiresAt < now`, clears
+  the claim atomically, and the job becomes eligible for re-claim.
+  No fixed `runningTimeoutMs`; the lease is the source of truth.
 - **Permanent failure** (e.g. an assertion that was discarded between
   enqueue and run): mark `failed` with `retryable: false`. Surface
   through `GET /api/assertion/promote-async/<jobId>` with a structured
@@ -244,18 +333,18 @@ for (const part of partitions) {
   await markPartitionStatus({ client, importId, partitionKey: part.key, status: 'promote_enqueued', subGraphName: 'meta' });
 }
 
-// Poll outstanding jobs once per minute until they all settle.
+// Poll outstanding jobs once per minute until they all settle on
+// a TERMINAL state (succeeded | failed). `failed_retrying` means the
+// daemon will retry on its own — clients must keep polling.
+const TERMINAL = new Set(['succeeded', 'failed']);
 while (jobs.size > 0) {
   await sleep(60_000);
   for (const [key, jobId] of jobs) {
     const status = await client.request('GET', `/api/assertion/promote-async/${jobId}`);
-    if (status.state === 'succeeded') {
-      await markPartitionStatus({ client, importId, partitionKey: key, status: 'done', subGraphName: 'meta' });
-      jobs.delete(key);
-    } else if (status.state === 'failed') {
-      await markPartitionStatus({ client, importId, partitionKey: key, status: 'failed', subGraphName: 'meta' });
-      jobs.delete(key);
-    }
+    if (!TERMINAL.has(status.state)) continue; // queued | running | failed_retrying
+    const finalStatus = status.state === 'succeeded' ? 'done' : 'failed';
+    await markPartitionStatus({ client, importId, partitionKey: key, status: finalStatus, subGraphName: 'meta' });
+    jobs.delete(key);
   }
 }
 ```

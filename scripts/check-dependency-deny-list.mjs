@@ -78,6 +78,11 @@ function loadDenyList() {
   if (!Array.isArray(parsed.denied_files)) {
     fail(2, `${DENY_LIST_PATH} missing or malformed denied_files[].`);
   }
+  // denied_filenames[] is optional — added in the second hardening pass.
+  // Older deny-list files without it still load cleanly.
+  if (parsed.denied_filenames !== undefined && !Array.isArray(parsed.denied_filenames)) {
+    fail(2, `${DENY_LIST_PATH} denied_filenames must be an array if present.`);
+  }
   if (!Array.isArray(parsed.scanner_sanity_check?.expected_packages_in_lockfile)
       || parsed.scanner_sanity_check.expected_packages_in_lockfile.length === 0) {
     fail(2, `${DENY_LIST_PATH} missing scanner_sanity_check.expected_packages_in_lockfile[] (must contain at least one anchor).`);
@@ -104,6 +109,17 @@ function loadDenyList() {
     if (seenPaths.has(entry.path)) dupes.push(entry.path);
     seenPaths.add(entry.path);
   }
+  const seenFilenames = new Set();
+  for (const entry of (parsed.denied_filenames ?? [])) {
+    if (!entry?.filename) {
+      fail(2, `${DENY_LIST_PATH}: denied_filenames[] entry missing .filename field: ${JSON.stringify(entry)}`);
+    }
+    if (entry.filename.includes('/') || entry.filename.includes('\\')) {
+      fail(2, `${DENY_LIST_PATH}: denied_filenames[] .filename must be a basename only (no path separators): ${entry.filename}`);
+    }
+    if (seenFilenames.has(entry.filename)) dupes.push(entry.filename);
+    seenFilenames.add(entry.filename);
+  }
   if (dupes.length > 0) {
     fail(2, `${DENY_LIST_PATH}: duplicate entries detected (${dupes.join(', ')}); deduplicate before committing.`);
   }
@@ -122,6 +138,8 @@ function loadDenyList() {
  *     pkg-name@<x.y.z: y.y.y          ← overrides / patchedDependencies
  *     '@scope/pkg@x.y.z':             ← scoped, quoted snapshot key
  *     "pkg-name": "^x.y.z"            ← package.json dep
+ *     "pkg-name": "npm:other@x.y.z"   ← npm alias (name in value)
+ *     "pkg-name": "github:user/x"     ← git URL form
  *
  * Strategy: a name-continuation character is any of [a-zA-Z0-9._-].
  * That is the set of chars a valid npm name (outside the `@scope/`
@@ -129,33 +147,49 @@ function loadDenyList() {
  * that set — anything else (`@`, `/`, `:`, quote, space, `(`, `)`, `<`,
  * end-of-line, …) is a valid boundary.
  *
- * Left side: start-of-string OR a non-continuation char.
- * Right side: a NEGATIVE LOOKAHEAD for a continuation char so the regex
- * does not consume the next character (and so the boundary itself can
- * be any non-continuation char, including end-of-string).
+ * Scope semantics: an UNSCOPED deny entry must NOT match the scope
+ * portion of a different, scoped package. For example, deny entry
+ * 'origintrail-official' must not flag '@origintrail-official/dkg' as a
+ * hit — those are different npm identities. We enforce this by adding
+ * '@' to the LEFT boundary-failure class for unscoped entries: if the
+ * candidate match is immediately preceded by `@`, it's the scope of a
+ * scoped package and the unscoped entry must not match it.
+ *
+ * For scoped entries (already starting with `@`), the `@` is part of
+ * the match and the standard boundary rule applies.
  *
  * Properties:
  *   - 'super-commander-pro' does NOT match 'commander' (the `-` adjacent
  *     to `commander` fails the boundary check on both sides).
  *   - 'commander-extras' does NOT match 'commander' (trailing `-`).
- *   - '@types/commander' does NOT match 'commander' alone (the `/`
- *     before `commander` is a valid boundary, but the intent is that
- *     the deny-list entry for that scoped package would itself be
- *     '@types/commander' — listing the unscoped 'commander' SHOULD NOT
- *     match the scoped package's path component, which it does not).
- *     The trailing context is fine; the rule is checked left+right.
- *     If the lockfile contains '@types/commander': the char before
- *     'commander' is `/` (not a continuation char) and the char after
- *     is `'` (not a continuation char), so the regex WOULD match.
- *     This is a known false-positive shape: if a future deny-list
- *     entry is the unscoped name, callers should be aware that the
- *     scanner cannot distinguish a scope-suffix from a top-level name.
- *     None of the current 21 TrapDoor entries collide with anything
+ *   - '@evil/commander' does NOT match 'commander' alone (the `/`
+ *     before `commander` is technically a valid boundary, but in
+ *     practice the lockfile/package.json text is '@evil/commander':,
+ *     so the regex would still find 'commander' there — known false
+ *     positive shape if an unscoped deny entry happens to share a
+ *     name with the second path component of a scoped legit package.
+ *     None of the current 34 deny entries collide with anything
  *     scoped in our tree (verified by the clean-run sanity check).
+ *
+ * Known limitations (documented in SUPPLY_CHAIN_HARDENING.md §13):
+ *   - Tarball references where the version glues directly onto the
+ *     name (e.g. `file:./eth-wallet-sentinel-1.0.0.tgz`) are NOT
+ *     caught — the `-1.0.0` suffix puts a name-continuation char
+ *     adjacent to the name and the regex correctly refuses to match
+ *     a substring of a longer-looking token. This is a narrow vector
+ *     (requires committing the tarball to the repo) and is covered
+ *     in defence-in-depth by §10 (TURBO scope) and §1-3 generally.
  */
 function buildNameMatcher(name) {
   const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  return new RegExp(`(^|[^a-zA-Z0-9._-])${escaped}(?![a-zA-Z0-9._-])`, 'm');
+  const isScoped = name.startsWith('@');
+  // For unscoped deny entries, the `@` on the LEFT would indicate
+  // we are inside a scope name, which is a different identity from
+  // the unscoped name. Add `@` to the failure class in that case.
+  // For scoped entries the `@` is part of the match itself, so the
+  // standard boundary rule applies.
+  const leftClass = isScoped ? 'a-zA-Z0-9._-' : 'a-zA-Z0-9._@-';
+  return new RegExp(`(^|[^${leftClass}])${escaped}(?![a-zA-Z0-9._-])`, 'm');
 }
 
 function scanFileForNames(filePath, deniedNames) {
@@ -170,10 +204,27 @@ function scanFileForNames(filePath, deniedNames) {
   return hits;
 }
 
-function findPackageJsonFiles(dir) {
-  const out = [];
-  // Avoid recursing into node_modules, .git, build outputs, etc.
+/**
+ * Walk the workspace once, collecting two things at the same time:
+ *   - every `package.json` for the name-deny scan
+ *   - every file whose basename appears in `denied_filenames[]`
+ *
+ * Single traversal so the recursive filename check costs nothing
+ * beyond what the existing package.json walk already does.
+ *
+ * NB: dot-prefixed directories are skipped EXCEPT `.github` (we want
+ * to scan that one) — so a `.cursorrules` planted inside `.husky/`,
+ * `.idea/`, etc. would NOT be caught. That's intentional for the
+ * current scope: IDE/editor configs are user-local and not normally
+ * committed; if a future review wants to extend coverage to specific
+ * dot-dirs, add them to the EXTRA_SCAN_DOT_DIRS set.
+ */
+function walkWorkspace(dir, deniedFilenameSet) {
+  const pkgJsons = [];
+  const filenameHits = [];
   const SKIP = new Set(['node_modules', '.git', 'dist', 'build', '.next', '.turbo', '.cache', 'coverage', '.publish-artifacts']);
+  const EXTRA_SCAN_DOT_DIRS = new Set(['.github']);
+
   function walk(d) {
     let entries;
     try {
@@ -183,17 +234,27 @@ function findPackageJsonFiles(dir) {
     }
     for (const e of entries) {
       if (SKIP.has(e.name)) continue;
-      if (e.name.startsWith('.') && e.name !== '.github') continue;
       const full = join(d, e.name);
       if (e.isDirectory()) {
+        // Skip dot-prefixed directories so we don't descend into
+        // `.git`, `.idea`, `.vscode`, `.husky`, etc. — none of those
+        // hold package.json files we care about, and pulling in
+        // editor configs would slow the walk and risk false positives.
+        // EXTRA_SCAN_DOT_DIRS allows opting specific ones back in
+        // (e.g. `.github`).
+        if (e.name.startsWith('.') && !EXTRA_SCAN_DOT_DIRS.has(e.name)) continue;
         walk(full);
-      } else if (e.isFile() && e.name === 'package.json') {
-        out.push(full);
+      } else if (e.isFile()) {
+        // Dot-prefixed FILES are not skipped — we explicitly WANT to
+        // see `.cursorrules` and any other AI-injection persistence
+        // file the deny-list lists.
+        if (e.name === 'package.json') pkgJsons.push(full);
+        if (deniedFilenameSet.has(e.name)) filenameHits.push({ path: relative(dir, full), basename: e.name });
       }
     }
   }
   walk(dir);
-  return out;
+  return { pkgJsons, filenameHits };
 }
 
 function checkLockfileSanity(sanityNames) {
@@ -233,6 +294,13 @@ function main() {
 
   const allHits = [];
 
+  // Single tree walk: gathers package.json files and basename-deny hits
+  // in one pass. `denied_filenames[]` is optional (added in the second
+  // hardening pass); older deny-list files without it Just Work.
+  const deniedFilenames = denyList.denied_filenames ?? [];
+  const deniedFilenameMap = new Map(deniedFilenames.map((d) => [d.filename, d]));
+  const { pkgJsons: pkgJsonFiles, filenameHits } = walkWorkspace(repoRoot, new Set(deniedFilenameMap.keys()));
+
   // 1. Package-name deny-list scan against the lockfile.
   const lockHits = scanFileForNames(join(repoRoot, LOCKFILE_PATH), denyList.denied_package_names);
   for (const hit of lockHits) {
@@ -240,7 +308,6 @@ function main() {
   }
 
   // 2. Same scan against every package.json under the workspace.
-  const pkgJsonFiles = findPackageJsonFiles(repoRoot);
   for (const pkgJson of pkgJsonFiles) {
     const hits = scanFileForNames(pkgJson, denyList.denied_package_names);
     for (const hit of hits) {
@@ -248,7 +315,7 @@ function main() {
     }
   }
 
-  // 3. File-name deny-list.
+  // 3. Exact-path file deny-list.
   for (const denied of denyList.denied_files) {
     const path = join(repoRoot, denied.path);
     if (existsSync(path)) {
@@ -256,17 +323,27 @@ function main() {
     }
   }
 
-  info(`Scanned ${pkgJsonFiles.length} package.json files + 1 lockfile + ${denyList.denied_files.length} denied file paths.`);
+  // 4. Recursive-basename file deny-list. Catches `.cursorrules`
+  // (or any other tagged basename) ANYWHERE in the tree, not just
+  // at the repo root. This is the right scope for AI-injection
+  // persistence files — the TrapDoor advisory explicitly says
+  // "check ANY unexpected `.cursorrules`", not just root.
+  for (const hit of filenameHits) {
+    const denied = deniedFilenameMap.get(hit.basename);
+    allHits.push({ kind: 'denied_filename', file: hit.path, basename: hit.basename, ...denied });
+  }
+
+  info(`Scanned ${pkgJsonFiles.length} package.json files + 1 lockfile + ${denyList.denied_files.length} exact path(s) + ${deniedFilenames.length} basename(s) (recursive).`);
 
   if (allHits.length === 0) {
-    info(`✓ Clean. ${denyList.denied_package_names.length} denied package names and ${denyList.denied_files.length} denied file paths checked; zero matches.`);
+    info(`✓ Clean. ${denyList.denied_package_names.length} package names, ${denyList.denied_files.length} exact path(s), and ${deniedFilenames.length} basename(s) checked; zero matches.`);
     emitSummary([
       '## Dependency deny-list scan',
       '',
       '✓ **Clean.** No denied package names or paths found.',
       '',
-      `**Scanned:** ${pkgJsonFiles.length} \`package.json\` files + \`${LOCKFILE_PATH}\` + ${denyList.denied_files.length} denied paths.`,
-      `**Deny-list entries:** ${denyList.denied_package_names.length} package names, ${denyList.denied_files.length} file paths.`,
+      `**Scanned:** ${pkgJsonFiles.length} \`package.json\` files + \`${LOCKFILE_PATH}\` + ${denyList.denied_files.length} exact path(s) + ${deniedFilenames.length} basename(s) (recursive).`,
+      `**Deny-list entries:** ${denyList.denied_package_names.length} package names, ${denyList.denied_files.length} exact paths, ${deniedFilenames.length} basenames.`,
       `**Lockfile sanity check:** ${found.length}/${sanityAnchors.length} anchor(s) found (${found.join(', ')}) ✓`,
     ]);
     process.exit(0);
@@ -283,7 +360,10 @@ function main() {
     '|------|-------|-------|----------|--------|',
   ];
   for (const hit of allHits) {
-    const label = hit.kind === 'package_name' ? hit.name : hit.path;
+    let label;
+    if (hit.kind === 'package_name') label = hit.name;
+    else if (hit.kind === 'denied_filename') label = hit.basename;
+    else label = hit.path;
     console.error(`  - ${hit.kind}: ${label} (file: ${hit.file}, campaign: ${hit.campaign})`);
     console.error(`::error file=${hit.file},title=Denied ${hit.kind} matched::${label} is on the supply-chain deny-list (campaign: ${hit.campaign}). See ${hit.source_url}`);
     summaryLines.push(`| ${hit.kind} | \`${label}\` | \`${hit.file}\` | ${hit.campaign} | [link](${hit.source_url}) |`);

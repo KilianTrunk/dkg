@@ -25,12 +25,26 @@
     {"name": "wallet-backup-verifier",    "ecosystem": "npm", "campaign": "TrapDoor", "added_at": "2026-05-25", "source_url": "https://socket.dev/blog/trapdoor-crypto-stealer-npm-pypi-crates"},
     {"name": "wallet-security-checker",   "ecosystem": "npm", "campaign": "TrapDoor", "added_at": "2026-05-25", "source_url": "https://socket.dev/blog/trapdoor-crypto-stealer-npm-pypi-crates"},
     {"name": "web3-secrets-detector",     "ecosystem": "npm", "campaign": "TrapDoor", "added_at": "2026-05-25", "source_url": "https://socket.dev/blog/trapdoor-crypto-stealer-npm-pypi-crates"},
-    {"name": "workspace-config-loader",   "ecosystem": "npm", "campaign": "TrapDoor", "added_at": "2026-05-25", "source_url": "https://socket.dev/blog/trapdoor-crypto-stealer-npm-pypi-crates"}
+    {"name": "workspace-config-loader",   "ecosystem": "npm", "campaign": "TrapDoor", "added_at": "2026-05-25", "source_url": "https://socket.dev/blog/trapdoor-crypto-stealer-npm-pypi-crates"},
+    {"name": "cryptowallet-safety",       "ecosystem": "pypi", "campaign": "TrapDoor", "added_at": "2026-05-25", "source_url": "https://socket.dev/blog/trapdoor-crypto-stealer-npm-pypi-crates", "notes": "PyPI IoC. Listed defensively in case of cross-ecosystem republish under the same name on npm."},
+    {"name": "data-pipeline-check",       "ecosystem": "pypi", "campaign": "TrapDoor", "added_at": "2026-05-25", "source_url": "https://socket.dev/blog/trapdoor-crypto-stealer-npm-pypi-crates", "notes": "PyPI IoC."},
+    {"name": "defi-risk-scanner",         "ecosystem": "pypi", "campaign": "TrapDoor", "added_at": "2026-05-25", "source_url": "https://socket.dev/blog/trapdoor-crypto-stealer-npm-pypi-crates", "notes": "PyPI IoC."},
+    {"name": "env-loader-cli",            "ecosystem": "pypi", "campaign": "TrapDoor", "added_at": "2026-05-25", "source_url": "https://socket.dev/blog/trapdoor-crypto-stealer-npm-pypi-crates", "notes": "PyPI IoC."},
+    {"name": "eth-security-auditor",      "ecosystem": "pypi", "campaign": "TrapDoor", "added_at": "2026-05-25", "source_url": "https://socket.dev/blog/trapdoor-crypto-stealer-npm-pypi-crates", "notes": "PyPI IoC — the first detected TrapDoor package per Socket timeline."},
+    {"name": "git-config-sync",           "ecosystem": "pypi", "campaign": "TrapDoor", "added_at": "2026-05-25", "source_url": "https://socket.dev/blog/trapdoor-crypto-stealer-npm-pypi-crates", "notes": "PyPI IoC."},
+    {"name": "solidity-build-guard",      "ecosystem": "pypi", "campaign": "TrapDoor", "added_at": "2026-05-25", "source_url": "https://socket.dev/blog/trapdoor-crypto-stealer-npm-pypi-crates", "notes": "PyPI IoC."},
+    {"name": "move-analyzer-build",       "ecosystem": "crates", "campaign": "TrapDoor", "added_at": "2026-05-25", "source_url": "https://socket.dev/blog/trapdoor-crypto-stealer-npm-pypi-crates", "notes": "Crates.io IoC. Listed defensively in case of cross-ecosystem republish."},
+    {"name": "move-compiler-tools",       "ecosystem": "crates", "campaign": "TrapDoor", "added_at": "2026-05-25", "source_url": "https://socket.dev/blog/trapdoor-crypto-stealer-npm-pypi-crates", "notes": "Crates.io IoC."},
+    {"name": "move-project-builder",      "ecosystem": "crates", "campaign": "TrapDoor", "added_at": "2026-05-25", "source_url": "https://socket.dev/blog/trapdoor-crypto-stealer-npm-pypi-crates", "notes": "Crates.io IoC."},
+    {"name": "sui-framework-helpers",     "ecosystem": "crates", "campaign": "TrapDoor", "added_at": "2026-05-25", "source_url": "https://socket.dev/blog/trapdoor-crypto-stealer-npm-pypi-crates", "notes": "Crates.io IoC."},
+    {"name": "sui-move-build-helper",     "ecosystem": "crates", "campaign": "TrapDoor", "added_at": "2026-05-25", "source_url": "https://socket.dev/blog/trapdoor-crypto-stealer-npm-pypi-crates", "notes": "Crates.io IoC."},
+    {"name": "sui-sdk-build-utils",       "ecosystem": "crates", "campaign": "TrapDoor", "added_at": "2026-05-25", "source_url": "https://socket.dev/blog/trapdoor-crypto-stealer-npm-pypi-crates", "notes": "Crates.io IoC."}
   ],
-  "denied_files": [
+  "denied_files": [],
+  "denied_filenames": [
     {
-      "path": ".cursorrules",
-      "rationale": "Legacy Cursor instruction file format. This repo uses .cursor/rules/*.mdc (Cursor's modern format) and never .cursorrules — so a .cursorrules file appearing in the repo is by itself a strong signal of an AI-injection persistence attempt (per TrapDoor playbook: see source_url). If the team ever wants to adopt .cursorrules legitimately, remove this entry in the same PR that adds the file, so the change is explicit in review.",
+      "filename": ".cursorrules",
+      "rationale": "Legacy Cursor instruction file format. This repo uses .cursor/rules/*.mdc (Cursor's modern format) and never .cursorrules — so a .cursorrules file appearing ANYWHERE in the tree is by itself a strong signal of an AI-injection persistence attempt (per TrapDoor playbook: see source_url). Socket's advisory explicitly recommends checking for unexpected .cursorrules files; we use a recursive basename match rather than only checking the repo root so a sub-directory plant cannot evade detection. If the team ever wants to adopt .cursorrules legitimately, remove this entry in the same PR that adds the file, so the change is explicit in review.",
       "campaign": "TrapDoor",
       "added_at": "2026-05-25",
       "source_url": "https://socket.dev/blog/trapdoor-crypto-stealer-npm-pypi-crates"

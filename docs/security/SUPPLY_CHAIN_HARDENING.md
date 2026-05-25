@@ -586,22 +586,49 @@ Sits structurally alongside §12 but covers a different threat class:
 The deny-list lives at `.github/dependency-deny-list.json` and is
 scanned by `scripts/check-dependency-deny-list.mjs` from the
 `dependency-deny-list` job in `supply-chain-scan.yml`. The job runs on
-every PR that touches `pnpm-lock.yaml` or any `package.json`, on every
-push to `main`, and on the same weekly cron as the other supply-chain
-scanners.
+every PR that touches `pnpm-lock.yaml`, any `package.json`, the
+deny-list JSON, or the scanner script itself, on every push to `main`,
+and on the same weekly cron as the other supply-chain scanners.
 
-**Entry shape** (each one carries provenance so future reviewers can
-audit why it landed):
+**Entry shape — package names** (each one carries provenance so future
+reviewers can audit why it landed):
 
 ```jsonc
 {
   "name": "<exact package name>",
-  "ecosystem": "npm",
+  "ecosystem": "npm" | "pypi" | "crates",
   "campaign": "<short campaign label, e.g. TrapDoor>",
   "added_at": "<YYYY-MM-DD>",
   "source_url": "<URL of the IoC publication>"
 }
 ```
+
+Cross-ecosystem names are listed defensively. The scanner only walks
+the npm surface (`pnpm-lock.yaml` + every `package.json`), but
+attackers regularly cross-publish under the same name to npm + PyPI +
+Crates.io. Listing every IoC name from every ecosystem covered by a
+campaign costs nothing per entry and catches the cross-publish case.
+
+**Entry shape — denied files** (two flavours):
+
+```jsonc
+"denied_files": [
+  { "path": "<exact repo-root-relative path>" }
+],
+"denied_filenames": [
+  { "filename": "<basename only — matched recursively at any depth>" }
+]
+```
+
+`denied_files[]` flags an exact path. `denied_filenames[]` is the
+right shape for AI-injection persistence files (`.cursorrules`,
+…) — the TrapDoor advisory explicitly says to look for these
+"anywhere in your projects", so the scanner walks the whole workspace
+and reports a hit at any depth, not only at the repo root. Dot-prefixed
+directories like `.git`, `.idea`, `.vscode` are skipped during the
+walk to keep it fast and avoid editor-config false positives; the
+dot-prefixed `.github` directory is opted back in via an explicit
+allow-list.
 
 **Scanner design**, all in vanilla `node:fs` (no `npm install` step —
 the scanner deliberately doesn't pull anything from a registry):
@@ -623,11 +650,15 @@ the scanner deliberately doesn't pull anything from a registry):
   where pnpm-lock / package.json can carry a name — pnpm v9
   (`commander@x.y.z:`), pnpm v8 (`/commander@x.y.z:`),
   peer-suffixed snapshots, scoped names, importer dep refs,
-  overrides, patchedDependencies — and prevents a future legitimate
+  overrides, patchedDependencies, npm aliases (`npm:other@x.y.z`),
+  git URL deps (`github:user/x`) — and prevents a future legitimate
   package whose name *contains* a deny-listed substring from being
-  false-positive flagged. Duplicate entries in the deny-list and
-  missing required fields are detected at load time and fail the
-  scanner with exit 2.
+  false-positive flagged. Unscoped deny entries additionally forbid
+  a leading `@` boundary so they do not match the scope portion of
+  an unrelated scoped package (e.g. deny entry `commander` does not
+  flag `@types/commander` — different npm identities). Duplicate
+  entries in the deny-list and missing required fields are detected
+  at load time and fail the scanner with exit 2.
 - `denied_files[]` covers paths that should never appear in the repo
   (currently: `.cursorrules`, the legacy Cursor instruction file).
   Maintained as a separate list so the scanner reports the right kind
@@ -659,10 +690,35 @@ What this layer **does not** do:
   not been added to the deny-list yet. The list is reactive by
   design; the cooldown + advisory gate from §12 is the proactive
   layer that catches the attacks we have not heard about yet.
-
----
-
-## Tier 2 admin steps (require maintainer GitHub UI/API access)
+- It does not catch tarball references where the version glues
+  directly onto the package name in the filename — e.g.
+  `"pkg": "file:./vendored/eth-wallet-sentinel-1.0.0.tgz"`. The
+  token-boundary regex correctly refuses to match a substring of a
+  longer-looking token, and the `-1.0.0` suffix puts a
+  name-continuation char adjacent to the name. This is a narrow
+  vector (requires committing the tarball to the repo, where the
+  binary blob would be visible in review) and is covered in
+  defence-in-depth by §1 (action pinning), §3 (no third-party
+  package execution at install time without an explicit allow-list),
+  and CODEOWNERS routing on `pnpm-lock.yaml` + `package.json`.
+- It is **not enforced as a required status check by default**.
+  A fork PR runs the fork's version of `supply-chain-scan.yml` —
+  so a sophisticated attacker could fork the repo, edit the
+  workflow to delete the `dependency-deny-list` job, add a
+  malicious package, and open a PR. The job simply would not
+  appear in the PR's check list, and without a branch-protection
+  rule requiring `Dependency deny-list (named-package blocklist)`
+  as a required status check, the PR would not be blocked by its
+  absence. Mitigations layered around this gap:
+  - CODEOWNERS already requires code-owner approval for any change
+    under `.github/`, `.github/workflows/`, and `scripts/` (§B). A
+    workflow edit that disables the scanner cannot merge without
+    a security-aware reviewer's approval.
+  - Branch protection can mark `Dependency deny-list (named-package
+    blocklist)` as a required status check via Settings → Rules →
+    Rulesets → `protect-main`. With that toggle on, a PR missing
+    the check would also be blocked. This is the admin step that
+    closes the residual gap.
 
 The following must be applied manually because they live in repo settings,
 not in repo files. A maintainer with admin permission should run through

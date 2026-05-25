@@ -124,10 +124,10 @@ assertions cannot afford to start over on slice 75 because the daemon
 restarted; it needs to know which slices have landed and which haven't.
 
 The canonical pattern is a small RDF manifest assertion that the importer
-maintains as it works (specified separately in
-[`packages/cli/skills/dkg-importer/SKILL.md`](../../packages/cli/skills/dkg-importer/SKILL.md)
-and implemented by `scripts/lib/manifest.mjs` in the same PR series as this
-ADR):
+maintains as it works. A follow-up implementation PR will ship the
+agent-readable importer manual and `scripts/lib/manifest.mjs` helper that
+turn this pattern into reusable code; this ADR only defines the contract the
+future artifacts must follow.
 
 ```
 <urn:dkg:import:my-corpus-2026-01-15>
@@ -150,10 +150,10 @@ partitions, and continues from there.
 
 **Will change** (in PRs that follow this ADR):
 
-- `packages/cli/skills/dkg-importer/SKILL.md` — agent-readable importer manual
+- Future `packages/cli/skills/dkg-importer/SKILL.md` — agent-readable importer manual
   that codifies the contract in §Decision with worked examples (TypeScript
   + Python) and an explicit "what to do on 413" recipe.
-- `scripts/lib/manifest.mjs` — small library that implements the manifest
+- Future `scripts/lib/manifest.mjs` — small library that implements the manifest
   pattern above against the daemon's own assertion API.
 - `packages/cli/src/daemon/routes/status.ts` — `/api/status` gains a
   non-binding `importLimits` block reflecting `MAX_BODY_BYTES`,

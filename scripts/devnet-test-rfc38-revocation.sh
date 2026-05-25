@@ -135,25 +135,65 @@ WRITE_PRE=$(api_call "$CURATOR_NODE" POST /api/shared-memory/write "$PRE_QUADS")
 log "✓ pre-revocation: 3 triples written by curator"
 sleep 3
 
-count_triples() {
-  local node="$1"
-  local resp; resp=$(api_call "$node" POST /api/shared-memory/catchup "$(cat <<EOF
-{ "contextGraphId": "$CG_ID" }
-EOF
-)")
-  local n; n=$(parse_json "$resp" '.entriesApplied' 2>/dev/null || echo "")
-  if [ -z "$n" ]; then n=$(parse_json "$resp" '.appliedTriples' 2>/dev/null || echo "0"); fi
-  local listing; listing=$(api_call "$node" GET "/api/shared-memory/list?contextGraphId=$(printf %s "$CG_ID" | sed 's/\//%2F/g')")
-  local count; count=$(parse_json "$listing" '.triples?.length' 2>/dev/null || echo "")
-  [ -n "$count" ] || count=$(parse_json "$listing" '.quads?.length' 2>/dev/null || echo "0")
-  echo "$count"
+# Codex PR #621 R2: /api/shared-memory/list isn't a daemon route.
+# Use /api/query with SPARQL COUNT against the _shared_memory graph
+# suffix so we're actually measuring local SWM state, not silently
+# collapsing read failures to 0.
+sparql_count() {
+  printf '%s' "$1" | node -e '
+    let d=""; process.stdin.on("data",c=>d+=c);
+    process.stdin.on("end",()=>{
+      try {
+        const j = JSON.parse(d);
+        const b = (j && j.result && j.result.bindings && j.result.bindings[0]) || {};
+        const raw = b.n || b.cnt || b.count || "";
+        const m = String(raw).match(/^"?(-?\d+)"?/);
+        console.log(m ? m[1] : "");
+      } catch { console.log(""); }
+    });
+  '
 }
 
-M1_PRE=$(count_triples "$M1_NODE" || echo "0")
-M2_PRE=$(count_triples "$M2_NODE" || echo "0")
-log "M1 sees $M1_PRE triples pre-revocation; M2 sees $M2_PRE triples"
-[ "$M1_PRE" -ge 3 ] || warn "M1 pre-revocation count=$M1_PRE expected ≥3 — catchup may be slow"
-[ "$M2_PRE" -ge 3 ] || warn "M2 pre-revocation count=$M2_PRE expected ≥3 — catchup may be slow"
+# Trigger catchup (best-effort, can fail), then SPARQL-count what's
+# locally readable. Returns "" if the read failed — callers MUST
+# distinguish that from a real zero count. NEVER collapses errors to 0.
+count_triples() {
+  local node="$1"
+  api_call "$node" POST /api/shared-memory/catchup "$(cat <<EOF
+{ "contextGraphId": "$CG_ID" }
+EOF
+)" >/dev/null 2>&1 || true
+  local q; q=$(api_call "$node" POST /api/query "$(cat <<EOF
+{ "contextGraphId": "$CG_ID", "graphSuffix": "_shared_memory",
+  "sparql": "SELECT (COUNT(*) AS ?n) WHERE { ?s <http://schema.org/name> ?o }" }
+EOF
+)")
+  sparql_count "$q"
+}
+
+# Codex PR #621 R3: pre-revocation precondition must HARD-ASSERT,
+# not just warn. If M2 never decrypts the pre-revocation batch,
+# the post-revocation "<= 3" assertion can false-pass without ever
+# proving key rotation worked. Bounded retry to absorb gossip
+# latency, then fail if either member hasn't caught up.
+wait_for_count_at_least() {
+  local node="$1" who="$2" target="$3"
+  local result=""
+  for _ in $(seq 1 20); do
+    result=$(count_triples "$node")
+    if [ -n "$result" ] && [ "$result" -ge "$target" ] 2>/dev/null; then
+      echo "$result"
+      return 0
+    fi
+    sleep 1
+  done
+  fail "$who never reached ≥$target triples (last count: \"$result\") — pre-revocation handshake/catchup is broken; revocation test can't proceed."
+}
+
+log "Waiting for M1 + M2 to catch up the pre-revocation batch..."
+M1_PRE=$(wait_for_count_at_least "$M1_NODE" "M1" 3)
+M2_PRE=$(wait_for_count_at_least "$M2_NODE" "M2" 3)
+log "✓ M1 sees $M1_PRE triples pre-revocation; M2 sees $M2_PRE triples"
 
 # ===========================================================================
 act "3. Curator revokes M2"
@@ -211,15 +251,23 @@ EOF
 )" >/dev/null 2>&1 || true
 sleep 3
 
-M1_FINAL=$(count_triples "$M1_NODE" || echo "0")
-M2_FINAL=$(count_triples "$M2_NODE" || echo "0")
-CURATOR_FINAL=$(count_triples "$CURATOR_NODE" || echo "0")
+# Codex PR #621 R4: a read failure on M2 must NOT be silently treated
+# as "M2 only sees the first batch". Distinguish read errors (empty
+# string from count_triples) from real zero / low counts, and fail
+# the script if we can't actually measure M2's post-revocation state.
+M1_FINAL=$(count_triples "$M1_NODE")
+M2_FINAL=$(count_triples "$M2_NODE")
+CURATOR_FINAL=$(count_triples "$CURATOR_NODE")
+
+[ -n "$M1_FINAL" ]      || fail "M1 final read failed — can't measure post-revocation state"
+[ -n "$M2_FINAL" ]      || fail "M2 final read failed — can't measure post-revocation state"
+[ -n "$CURATOR_FINAL" ] || fail "Curator final read failed — can't sanity-check the writer's own view"
 
 log "Curator sees:  $CURATOR_FINAL triples"
 log "M1 sees:       $M1_FINAL triples"
 log "M2 sees:       $M2_FINAL triples (must be ≤3 — would prove revocation worked)"
 
-[ "$CURATOR_FINAL" -ge 6 ] || warn "curator final count=$CURATOR_FINAL expected ≥6 (own writes)"
+[ "$CURATOR_FINAL" -ge 6 ] || fail "curator final count=$CURATOR_FINAL expected ≥6 (own writes)"
 [ "$M1_FINAL" -ge 6 ] || fail "REGRESSION: M1 sees $M1_FINAL triples post-revocation, expected 6 (M1 was NOT revoked — must continue receiving)"
 
 if [ "$M2_FINAL" -gt 3 ]; then

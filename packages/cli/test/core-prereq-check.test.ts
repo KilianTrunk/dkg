@@ -227,6 +227,18 @@ describe('checkCoreRelayPrereqs — 7 canonical cases from the plan', () => {
     expect(result.looksDegraded).toBe(false);
     expect(result.nonRoutableAddresses[0].class).toBe('rfc1918');
   });
+
+  it('public announce can rescue an unresolved wildcard pre-start listener', () => {
+    const result = checkCoreRelayPrereqs({
+      listenAddresses: ['/ip4/0.0.0.0/tcp/4001'],
+      hostInterfaces: [],
+      announceAddresses: ['/dnsaddr/relay.origintrail.io'],
+      nodeRole: 'core',
+    });
+
+    expect(result.looksDegraded).toBe(false);
+    expect(result.nonRoutableAddresses[0].class).toBe('wildcardNoPublicInterface');
+  });
 });
 
 describe('checkCoreRelayPrereqs — additional safety cases', () => {

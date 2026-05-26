@@ -387,13 +387,9 @@ function getBoundListenMultiaddrs(libp2p: unknown): string[] {
     if (addrs.length > 0) return Array.from(new Set(addrs));
   }
 
-  // Fallback for libp2p shapes that do not expose transport listeners. This
-  // keeps the check operational, while excluding relay reservations so they
-  // cannot masquerade as direct listener capability.
-  if (typeof node.getMultiaddrs === 'function') {
-    return stringifyMultiaddrList(node.getMultiaddrs())
-      .filter((addr) => !addr.includes('/p2p-circuit'));
-  }
+  // If this libp2p shape does not expose transport listeners, prefer an
+  // indeterminate/degraded result over treating advertised self-addresses as
+  // bound listener evidence.
   return [];
 }
 

@@ -335,7 +335,8 @@ export function checkCoreRelayPrereqs(
     (c) => c.class === 'dns'
       || c.class === 'rfc1918'
       || c.class === 'cgnat'
-      || c.class === 'ulaIpv6',
+      || c.class === 'ulaIpv6'
+      || c.class === 'wildcardNoPublicInterface',
   );
   const announceRescues = announceCanServe && announcePublic;
 

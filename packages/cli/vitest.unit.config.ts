@@ -23,6 +23,7 @@ export default defineConfig({
           // contributors can run it via `pnpm test:unit` in ~2s instead of
           // paying the 2-minute hardhat-boot tax of the default config.
           'test/resolve-standalone-install.test.ts',
+          'test/migrate-to-npm.test.ts',
         ],
     testTimeout: runsDaemonHttpBehavior ? 120_000 : 60_000,
     globalSetup: runsDaemonHttpBehavior ? ['../chain/test/hardhat-global-setup.ts'] : [],

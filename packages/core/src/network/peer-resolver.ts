@@ -82,15 +82,24 @@ export interface AgentDirectoryLookup {
    *     that case.
    *
    * Staleness filtering: the resolver only uses `multiaddrs` when
-   * `lastSeenMs` is present AND within `staleThresholdMs`. When
-   * `lastSeenMs` is missing (older agent profile, manual / partial
-   * agents-CG entry without a heartbeat) the multiaddrs are
+   * `lastSeenMs` is present AND within a two-sided window:
+   *   - lower bound: `now - lastSeenMs <= staleThresholdMs`
+   *     (default 24h) — old profiles drop their direct addresses.
+   *   - upper bound: `lastSeenMs <= now + skewAllowance` (5min) —
+   *     profiles with a future timestamp (clock skew or malicious)
+   *     also drop their direct addresses. Without this gate a
+   *     negative `now - lastSeenMs` trivially passes the lower
+   *     bound, so dead multiaddrs would stay eligible forever
+   *     (Codex PR #700 round 3).
+   *
+   * When `lastSeenMs` is missing (older agent profile, manual /
+   * partial agents-CG entry without a heartbeat) the multiaddrs are
    * ignored — unknown freshness is treated as stale to keep the
-   * phonebook conservative. `relayAddress` is still tried regardless,
-   * because even an old relay address dialled via a circuit usually
-   * still works (the relay itself is more long-lived than a NATed
-   * peer). Codex review of PR #700 round 2 caught the "undefined
-   * treated as fresh" regression.
+   * phonebook conservative (Codex PR #700 round 2).
+   *
+   * `relayAddress` is still tried regardless, because even an old
+   * relay address dialled via a circuit usually still works (the
+   * relay itself is more long-lived than a NATed peer).
    */
   findAgentDialAddresses?(
     peerId: NodeIdentity,
@@ -145,6 +154,17 @@ export interface ResolveOpts {
 
 const DEFAULT_PER_STEP_TIMEOUT_MS = 5_000;
 const DEFAULT_AGENT_DIRECTORY_STALE_THRESHOLD_MS = 24 * 60 * 60 * 1000;
+/**
+ * Maximum acceptable clock-skew between this node and an agent
+ * publishing its `dkg:lastSeen`. Anything more than this far in the
+ * future is treated as malicious / broken and the multiaddrs are
+ * dropped. Bounds the round-3 Codex finding where a future timestamp
+ * (`Date.now() - futureTs < 0`) would silently pass the
+ * "is less-than-or-equal-to threshold" gate and keep dead direct
+ * addresses eligible indefinitely. 5 minutes covers reasonable NTP
+ * drift between independent hosts without admitting attacks.
+ */
+const AGENT_DIRECTORY_CLOCK_SKEW_ALLOWANCE_MS = 5 * 60 * 1000;
 
 const SILENT_LOGGER: PeerResolverLogger = {
   warn: () => undefined,
@@ -340,9 +360,19 @@ export class PeerResolver {
           // window. Missing freshness = treat as stale (fall back to
           // relay only), so a profile without a `dkg:lastSeen`
           // heartbeat doesn't bypass the stale-data guard.
+          //
+          // Round 3: also require `lastSeenMs <= now + skewAllowance`.
+          // Without the upper bound, a future timestamp (clock skew
+          // OR malicious profile) makes `Date.now() - lastSeenMs`
+          // negative, which trivially passes the lower-bound `<=
+          // threshold` check, so a dead direct multiaddr stays
+          // eligible indefinitely and forces repeated bad dials.
+          const now = Date.now();
+          const ls = dial.lastSeenMs;
           const isFresh =
-            dial.lastSeenMs !== undefined &&
-            Date.now() - dial.lastSeenMs <= this.agentDirectoryStaleThresholdMs;
+            ls !== undefined &&
+            ls <= now + AGENT_DIRECTORY_CLOCK_SKEW_ALLOWANCE_MS &&
+            now - ls <= this.agentDirectoryStaleThresholdMs;
           if (isFresh && dial.multiaddrs.length > 0) {
             await primeAndAppend(dial.multiaddrs, 'agents-CG');
           }

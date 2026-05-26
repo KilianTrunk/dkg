@@ -533,6 +533,56 @@ describe('PeerResolver', () => {
     expect(out).not.toContain(bad);
   });
 
+  it('step 4 (phonebook): future lastSeenMs beyond skew allowance is rejected (multiaddrs dropped, relay still used)', async () => {
+    // Codex review of PR #700 round 3: the round-2 freshness check
+    // `Date.now() - lastSeenMs <= threshold` silently accepts ANY
+    // future timestamp because the LHS becomes negative. A skewed
+    // or malicious agents-CG profile could therefore keep dead
+    // direct multiaddrs eligible indefinitely. The round-3 fix
+    // adds a 5-minute upper bound; this test pins it.
+    net.__findPeerImpl = async () => [];
+    const direct = '/ip4/203.0.113.10/tcp/9090/p2p/' + PEER_B;
+    const dir: AgentDirectoryLookup = {
+      findRelayForPeer: async () => null,
+      findAgentDialAddresses: async () => ({
+        multiaddrs: [direct],
+        relayAddress: RELAY_ADDR,
+        lastSeenMs: Date.now() + 60 * 60 * 1000, // 1 hour in the future, way beyond 5min skew
+      }),
+    };
+    const resolver = new PeerResolver({
+      network: net,
+      registry,
+      agentDirectory: dir,
+    });
+    const out = await resolver.resolve(PEER_B);
+    expect(out).not.toContain(direct);
+    expect(out).toContain(`${RELAY_ADDR}/p2p-circuit/p2p/${PEER_B}`);
+  });
+
+  it('step 4 (phonebook): future lastSeenMs within skew allowance is still accepted', async () => {
+    // Symmetric corner of the previous test: a small forward skew
+    // (NTP drift between hosts) must NOT drop a legitimate fresh
+    // profile. 1 minute in the future is well within the 5min
+    // allowance, so multiaddrs should still be primed.
+    net.__findPeerImpl = async () => [];
+    const direct = '/ip4/203.0.113.10/tcp/9090/p2p/' + PEER_B;
+    const dir: AgentDirectoryLookup = {
+      findRelayForPeer: async () => null,
+      findAgentDialAddresses: async () => ({
+        multiaddrs: [direct],
+        lastSeenMs: Date.now() + 60 * 1000, // 1 minute in the future, within 5min skew
+      }),
+    };
+    const resolver = new PeerResolver({
+      network: net,
+      registry,
+      agentDirectory: dir,
+    });
+    const out = await resolver.resolve(PEER_B);
+    expect(out).toContain(direct);
+  });
+
   it('step 4 (phonebook): missing lastSeenMs is treated as stale (multiaddrs dropped, relay still used)', async () => {
     // Codex review of PR #700 round 2: the `DiscoveredAgent.lastSeen`
     // JSDoc says unknown freshness should fall back to relay only.

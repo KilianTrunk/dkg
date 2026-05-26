@@ -1,5 +1,5 @@
 import type { QueryEngine, QueryResult } from '@origintrail-official/dkg-query';
-import { DKG_ONTOLOGY, escapeSparqlLiteral, assertSafeIri } from '@origintrail-official/dkg-core';
+import { DKG_ONTOLOGY, escapeSparqlLiteral, assertSafeIri, sparqlIri } from '@origintrail-official/dkg-core';
 import { AGENT_REGISTRY_CONTEXT_GRAPH } from './profile.js';
 
 const SKILL = 'https://dkg.origintrail.io/skill#';
@@ -152,11 +152,19 @@ export class DiscoveryClient {
     // round-trip; that works but is harder to test deterministically
     // (engine-specific ordering / separator semantics). Two queries
     // keep each result simple.
+    // `FILTER(isIRI(?agent))` constrains the first query at the engine
+    // layer so blank-node subjects (`_:b1`) and other non-IRI bindings
+    // never reach the JS code. The `assertSafeIri` / `sparqlIri` call
+    // below is defense-in-depth — an IRI that survives `isIRI` but
+    // contains a `>` / whitespace / control char would still break
+    // the second query's `<${agentUri}>` interpolation. Codex review
+    // of PR #700 round 3 caught the prior unguarded interpolation.
     const scalar = `
       SELECT ?agent ?name ?framework ?nodeRole ?relayAddress ?lastSeen WHERE {
         ?agent a <${DKG}Agent> ;
                <${SCHEMA}name> ?name ;
                <${DKG}peerId> "${escapeSparqlLiteral(peerId)}" .
+        FILTER(isIRI(?agent))
         OPTIONAL { ?agent <${SKILL}framework> ?framework }
         OPTIONAL { ?agent <${DKG}nodeRole> ?nodeRole }
         OPTIONAL { ?agent <${DKG}relayAddress> ?relayAddress }
@@ -171,9 +179,26 @@ export class DiscoveryClient {
     const row = scalarResult.bindings[0];
     const agentUri = row['agent'];
 
+    // Defense-in-depth: even though `FILTER(isIRI(?agent))` above
+    // already drops blank-node subjects at the engine layer, the IRI
+    // could still contain a character that breaks SPARQL `<...>`
+    // interpolation (`>`, whitespace, control chars). If that happens
+    // we treat the whole entry as not-found rather than returning a
+    // partial profile — letting a malformed `agentUri` propagate to
+    // downstream consumers (who may re-interpolate it into their own
+    // queries) would just relocate the bug. With the engine-side
+    // FILTER in place this branch is "should never happen in
+    // practice"; the guard is purely a hardening fence.
+    let safeAgentIri: string;
+    try {
+      safeAgentIri = assertSafeIri(agentUri);
+    } catch {
+      return null;
+    }
+
     const multiSparql = `
       SELECT ?multiaddr WHERE {
-        <${agentUri}> <${DKG}multiaddr> ?multiaddr .
+        ${sparqlIri(safeAgentIri)} <${DKG}multiaddr> ?multiaddr .
       }
     `;
     const multiResult = await this.engine.query(multiSparql, { contextGraphId: AGENT_REGISTRY_CONTEXT_GRAPH });
@@ -182,7 +207,7 @@ export class DiscoveryClient {
       .filter((s) => s.length > 0);
 
     return {
-      agentUri,
+      agentUri: safeAgentIri,
       name: stripQuotes(row['name']),
       peerId,
       framework: row['framework'] ? stripQuotes(row['framework']) : undefined,

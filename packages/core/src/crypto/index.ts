@@ -22,6 +22,7 @@ export {
 
 export {
   buildV10ProofMaterial,
+  buildV10CiphertextChunksProofMaterial,
   verifyV10ProofMaterial,
   V10ProofRootMismatchError,
   V10ProofLeafCountMismatchError,

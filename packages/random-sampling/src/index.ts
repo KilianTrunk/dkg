@@ -31,6 +31,14 @@ export {
 } from './kc-extractor.js';
 
 export {
+  extractCiphertextChunksFromStore,
+  CiphertextChunksMissingError,
+  CiphertextChunksMalformedError,
+  type ExtractCiphertextChunksInput,
+  type CiphertextChunksExtractionResult,
+} from './ciphertext-chunks-extractor.js';
+
+export {
   type ProofBuilder,
   type ProofBuilderRequest,
   InProcessProofBuilder,

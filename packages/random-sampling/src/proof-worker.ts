@@ -177,6 +177,7 @@ export class WorkerThreadProofBuilder implements ProofBuilder {
           leaves: req.leaves,
           chunkId: req.chunkId,
           expected: req.expected,
+          kind: req.kind ?? 'flat-kc',
         },
         // We don't transfer ArrayBuffers (cheaper structuredClone is
         // fine for v1; transfer adds complexity around lifetime

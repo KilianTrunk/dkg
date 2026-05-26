@@ -980,21 +980,20 @@ describe('@unit RandomSampling', () => {
     });
 
     // -----------------------------------------------------------------------
-    // Test 2 — Edge: only-curated-CG-holds-value scenario.
+    // Test 2 — Edge: only-curated-CG-holds-value scenario, KC uncommitted.
     //
-    // RFC-39 Phase B (deferred): the curated-CG eligibility branch in
-    // `_isCGEligible` is currently a hard skip until the off-chain prover
-    // learns to fetch `getCiphertextChunkCount` + `getCiphertextChunksRoot`
-    // and build proofs against ciphertext chunks. With curated CGs filtered
-    // at the CG-level, the only-curated scenario falls through to
-    // `adjustedTotal == 0` on the first attempt and reverts
-    // `NoEligibleContextGraph` (the pre-RFC-39 behaviour). When the prover
-    // ciphertext path lands and the eligibility filter is removed, this
-    // test should be flipped back to expect `NoEligibleKnowledgeCollection`
-    // — see the corresponding `describe.skip` in
-    // `RandomSampling-curated.test.ts`.
+    // RFC-39 Phase B (PR-B): curated CGs are now CG-level eligible, but the
+    // KC in this test has no `(ciphertextChunksRoot, ciphertextChunkCount)`
+    // commitment. The picker's inner per-KC retry exhausts all MAX_KC_RETRIES
+    // (each candidate is skipped at `getCiphertextChunkCount == 0`), then the
+    // outer CG-retry marks the curated CG exhausted and re-draws; with no
+    // other CGs holding value, the second outer pass hits zero adjustedTotal
+    // and the picker reverts with `NoEligibleKnowledgeCollection` (NOT
+    // `NoEligibleContextGraph` — the first pass had a positive adjusted
+    // total). This is the spec-faithful behaviour: a curated CG with only
+    // pre-LU-11 KCs is functionally the same as a CG with only expired KCs.
     // -----------------------------------------------------------------------
-    it('reverts NoEligibleContextGraph when only curated CGs hold value (Phase B picker skip)', async () => {
+    it('reverts NoEligibleKnowledgeCollection when only an uncommitted curated CG holds value', async () => {
       const curatedCgId = await createCG(CURATED_POLICY);
       const endEpoch = (await Chronos.getCurrentEpoch()) + 5n;
       await createKC(curatedCgId, endEpoch);
@@ -1005,7 +1004,7 @@ describe('@unit RandomSampling', () => {
         RandomSampling.previewChallengeForSeed(testSeed(0), currentEpoch),
       ).to.be.revertedWithCustomError(
         RandomSampling,
-        'NoEligibleContextGraph',
+        'NoEligibleKnowledgeCollection',
       );
     });
 

@@ -80,6 +80,13 @@ export class MockChainAdapter implements ChainAdapter {
     authorAddress: string;
     /** On-chain context graph id (0n when the mock V8 path didn't carry one). */
     cgId: bigint;
+    /**
+     * OT-RFC-38 LU-11 / OT-RFC-39 — ciphertext-chunks commitment for
+     * curated KCs. `bytes32(0)` + 0 when omitted (default for legacy
+     * and public-CG entries; matches Solidity default-zero mapping).
+     */
+    ciphertextChunksRoot: Uint8Array;
+    ciphertextChunkCount: number;
   }>();
   private contextGraphRegistry = new Map<string, Record<string, string>>();
   private events: ChainEvent[] = [];
@@ -350,6 +357,8 @@ export class MockChainAdapter implements ChainAdapter {
       // Legacy V8 path — no attestation, mirror the on-chain `address(0)`.
       authorAddress: ethers.ZeroAddress,
       cgId: 0n,
+      ciphertextChunksRoot: new Uint8Array(32),
+      ciphertextChunkCount: 0,
     });
 
     this.pushEvent('KCCreated', {
@@ -1148,6 +1157,10 @@ export class MockChainAdapter implements ChainAdapter {
       publisherAddress,
       authorAddress: ethers.getAddress(params.author.address),
       cgId: params.contextGraphId,
+      ciphertextChunksRoot: params.ciphertextChunksRoot && params.ciphertextChunksRoot.length === 32
+        ? params.ciphertextChunksRoot
+        : new Uint8Array(32),
+      ciphertextChunkCount: params.ciphertextChunkCount ?? 0,
     });
     // Also store in batches so verify() can find this publish
     this.batches.set(kcId, {
@@ -1345,6 +1358,8 @@ export class MockChainAdapter implements ChainAdapter {
       // the on-chain `address(0)` semantics for un-attested writes.
       authorAddress: ethers.ZeroAddress,
       cgId: input.contextGraphId,
+      ciphertextChunksRoot: new Uint8Array(32),
+      ciphertextChunkCount: 0,
     });
   }
 
@@ -1512,6 +1527,18 @@ export class MockChainAdapter implements ChainAdapter {
     const entry = this.collections.get(kcId);
     if (!entry) throw new Error(`Mock: unknown kcId ${kcId}`);
     return entry.merkleLeafCount;
+  }
+
+  async getLatestCiphertextChunksRoot(kcId: bigint): Promise<Uint8Array> {
+    const entry = this.collections.get(kcId);
+    if (!entry) throw new Error(`Mock: unknown kcId ${kcId}`);
+    return entry.ciphertextChunksRoot;
+  }
+
+  async getCiphertextChunkCount(kcId: bigint): Promise<number> {
+    const entry = this.collections.get(kcId);
+    if (!entry) throw new Error(`Mock: unknown kcId ${kcId}`);
+    return entry.ciphertextChunkCount;
   }
 
   async getLatestMerkleRootPublisher(kcId: bigint): Promise<string> {

@@ -19,6 +19,7 @@
 
 import {
   buildV10ProofMaterial,
+  buildV10CiphertextChunksProofMaterial,
   type V10MerkleCommitment,
   type V10ProofMaterial,
 } from '@origintrail-official/dkg-core';
@@ -27,12 +28,23 @@ export interface ProofBuilderRequest {
   /**
    * Extracted V10 leaves (publictriple-hashes + private sub-roots).
    * Order does not matter — `V10MerkleTree` sorts + dedupes.
+   *
+   * For curated KCs (LU-11 / RFC-39) when `kind: 'ciphertext-chunks'`,
+   * pass the **raw ciphertext chunk bytes** in chunkId order instead;
+   * the builder hashes each chunk and uses the index-preserving
+   * `V10CiphertextChunksMerkleTree`.
    */
   leaves: Uint8Array[];
   /** On-chain `chunkId` from the challenge. */
   chunkId: number;
   /** Commitment we're trying to satisfy (chain-sourced root + leafCount). */
   expected: V10MerkleCommitment;
+  /**
+   * OT-RFC-39 — picks the V10 tree shape:
+   *   - `'flat-kc'` (default): sort+dedupe leaves, public KC path.
+   *   - `'ciphertext-chunks'`: index-preserving curated KC path.
+   */
+  kind?: 'flat-kc' | 'ciphertext-chunks';
 }
 
 export interface ProofBuilder {
@@ -55,6 +67,9 @@ export interface ProofBuilder {
  */
 export class InProcessProofBuilder implements ProofBuilder {
   async build(req: ProofBuilderRequest): Promise<V10ProofMaterial> {
+    if (req.kind === 'ciphertext-chunks') {
+      return buildV10CiphertextChunksProofMaterial(req.leaves, req.chunkId, req.expected);
+    }
     return buildV10ProofMaterial(req.leaves, req.chunkId, req.expected);
   }
 

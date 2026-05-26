@@ -33,6 +33,11 @@ import {
   KCNotFoundError,
   KCRootEntitiesNotFoundError,
 } from './kc-extractor.js';
+import {
+  extractCiphertextChunksFromStore,
+  CiphertextChunksMissingError,
+  CiphertextChunksMalformedError,
+} from './ciphertext-chunks-extractor.js';
 import type { ProofBuilder } from './proof-builder.js';
 import { InProcessProofBuilder } from './proof-builder.js';
 import {
@@ -330,50 +335,139 @@ export class RandomSamplingProver {
       return { kind: 'cg-not-found', kcId };
     }
 
-    const expectedRoot = await this.chain.getLatestMerkleRoot(kcId);
-    const expectedLeafCount = await this.chain.getMerkleLeafCount(kcId);
+    // OT-RFC-39 — pick the V10 substrate the challenge was drawn against.
+    // The on-chain picker (`_pickWeightedChallenge`) reads
+    // `getCiphertextChunkCount` for curated KCs and `getMerkleLeafCount`
+    // for public KCs; the prover MUST mirror that choice or the
+    // root recomputation diverges 100% of the time. Curation status is
+    // sourced from the chain (one extra `getAccessPolicy` view call) —
+    // the local triple store is not authoritative for CGs the node
+    // didn't create or join.
+    let isCurated = false;
+    if (typeof this.chain.getContextGraphAccessPolicy === 'function') {
+      try {
+        const policy = await this.chain.getContextGraphAccessPolicy(cgId);
+        isCurated = policy === 1;
+      } catch (err) {
+        this.log.warn('rs.tick.curation-probe-failed', {
+          cgId: cgId.toString(),
+          err: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    const expectedRoot = isCurated
+      ? await this.chain.getLatestCiphertextChunksRoot!(kcId)
+      : await this.chain.getLatestMerkleRoot(kcId);
+    const expectedLeafCount = isCurated
+      ? await this.chain.getCiphertextChunkCount!(kcId)
+      : await this.chain.getMerkleLeafCount(kcId);
 
     let leaves: Uint8Array[];
-    try {
-      const extracted = await extractV10KCFromStore(this.store, cgId, kcId);
-      leaves = extracted.leaves;
-    } catch (err) {
-      if (err instanceof KCNotFoundError || err instanceof KCDataMissingError) {
-        this.log.warn('rs.tick.kc-not-synced', {
-          kcId: kcId.toString(),
-          cgId: cgId.toString(),
-          err: (err as Error).name,
+    let proofKind: 'flat-kc' | 'ciphertext-chunks';
+    if (isCurated) {
+      proofKind = 'ciphertext-chunks';
+      // batchId for the curated chunk store IS the V10 KC plaintext
+      // merkleRoot — that's how the publisher deterministically derives
+      // per-chunk AEAD nonces and how the agent's
+      // `ingestSwmCiphertextChunkEnvelope` keys persisted chunks.
+      // Read it from chain on the public-merkleRoot slot (still present
+      // even on curated KCs; LU-11 added a parallel ciphertext slot,
+      // not a replacement of the plaintext one).
+      const batchId = await this.chain.getLatestMerkleRoot(kcId);
+      try {
+        const extracted = await extractCiphertextChunksFromStore({
+          store: this.store,
+          contextGraphId: cgId,
+          kcId,
+          batchId,
+          expectedCount: expectedLeafCount,
         });
-        await this.wal.append(
-          makeWalEntry(periodKey, 'failed', {
+        leaves = extracted.chunks;
+      } catch (err) {
+        if (err instanceof CiphertextChunksMissingError) {
+          this.log.warn('rs.tick.kc-not-synced', {
             kcId: kcId.toString(),
             cgId: cgId.toString(),
-            chunkId: chunkId.toString(),
-            error: {
-              code: (err as Error).name,
-              message: (err as Error).message.slice(0, 200),
-            },
-          }),
-        );
-        return { kind: 'kc-not-synced', kcId, cgId };
-      }
-      if (err instanceof KCRootEntitiesNotFoundError) {
-        this.log.error('rs.tick.meta-graph-bug', {
-          kcId: kcId.toString(),
-          cgId: cgId.toString(),
-          ual: err.ual,
-        });
-        await this.wal.append(
-          makeWalEntry(periodKey, 'failed', {
+            err: err.name,
+            missingCount: err.missingChunkIndexes.length,
+            expectedCount: err.expectedCount,
+          });
+          await this.wal.append(
+            makeWalEntry(periodKey, 'failed', {
+              kcId: kcId.toString(),
+              cgId: cgId.toString(),
+              chunkId: chunkId.toString(),
+              error: {
+                code: err.name,
+                message: err.message.slice(0, 200),
+              },
+            }),
+          );
+          return { kind: 'kc-not-synced', kcId, cgId };
+        }
+        if (err instanceof CiphertextChunksMalformedError) {
+          this.log.error('rs.tick.data-corrupted', {
             kcId: kcId.toString(),
             cgId: cgId.toString(),
-            chunkId: chunkId.toString(),
-            error: { code: 'KCRootEntitiesNotFoundError', message: err.message.slice(0, 200) },
-          }),
-        );
-        return { kind: 'data-corrupted', kcId, cgId, reason: 'meta-graph-bug' };
+            reason: 'ciphertext-chunk-malformed',
+            chunkIndex: err.chunkIndex,
+          });
+          await this.wal.append(
+            makeWalEntry(periodKey, 'failed', {
+              kcId: kcId.toString(),
+              cgId: cgId.toString(),
+              chunkId: chunkId.toString(),
+              error: { code: err.name, message: err.message.slice(0, 200) },
+            }),
+          );
+          return { kind: 'data-corrupted', kcId, cgId, reason: 'meta-graph-bug' };
+        }
+        throw err;
       }
-      throw err;
+    } else {
+      proofKind = 'flat-kc';
+      try {
+        const extracted = await extractV10KCFromStore(this.store, cgId, kcId);
+        leaves = extracted.leaves;
+      } catch (err) {
+        if (err instanceof KCNotFoundError || err instanceof KCDataMissingError) {
+          this.log.warn('rs.tick.kc-not-synced', {
+            kcId: kcId.toString(),
+            cgId: cgId.toString(),
+            err: (err as Error).name,
+          });
+          await this.wal.append(
+            makeWalEntry(periodKey, 'failed', {
+              kcId: kcId.toString(),
+              cgId: cgId.toString(),
+              chunkId: chunkId.toString(),
+              error: {
+                code: (err as Error).name,
+                message: (err as Error).message.slice(0, 200),
+              },
+            }),
+          );
+          return { kind: 'kc-not-synced', kcId, cgId };
+        }
+        if (err instanceof KCRootEntitiesNotFoundError) {
+          this.log.error('rs.tick.meta-graph-bug', {
+            kcId: kcId.toString(),
+            cgId: cgId.toString(),
+            ual: err.ual,
+          });
+          await this.wal.append(
+            makeWalEntry(periodKey, 'failed', {
+              kcId: kcId.toString(),
+              cgId: cgId.toString(),
+              chunkId: chunkId.toString(),
+              error: { code: 'KCRootEntitiesNotFoundError', message: err.message.slice(0, 200) },
+            }),
+          );
+          return { kind: 'data-corrupted', kcId, cgId, reason: 'meta-graph-bug' };
+        }
+        throw err;
+      }
     }
 
     await this.wal.append(
@@ -390,6 +484,7 @@ export class RandomSamplingProver {
         leaves,
         chunkId: Number(chunkId),
         expected: { merkleRoot: expectedRoot, merkleLeafCount: expectedLeafCount },
+        kind: proofKind,
       });
     } catch (err) {
       const reason = mapBuilderError(err);

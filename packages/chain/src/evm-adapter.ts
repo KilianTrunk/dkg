@@ -3694,6 +3694,20 @@ export class EVMChainAdapter implements ChainAdapter {
     return Number(count);
   }
 
+  async getLatestCiphertextChunksRoot(kcId: bigint): Promise<Uint8Array> {
+    await this.init();
+    const kcs = this.requireKCStorage();
+    const rootHex: string = await kcs.getLatestCiphertextChunksRoot(kcId);
+    return ethers.getBytes(rootHex);
+  }
+
+  async getCiphertextChunkCount(kcId: bigint): Promise<number> {
+    await this.init();
+    const kcs = this.requireKCStorage();
+    const count: bigint = BigInt(await kcs.getCiphertextChunkCount(kcId));
+    return Number(count);
+  }
+
   async getLatestMerkleRootPublisher(kcId: bigint): Promise<string> {
     await this.init();
     const kcs = this.requireKCStorage();

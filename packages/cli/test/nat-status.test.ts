@@ -205,6 +205,54 @@ describe('startNatStatusWatcher — soft-timeout', () => {
     w.stop();
   });
 
+  it('Codex #668 — first event-driven `private` reclassification is not yet definitive (soft timeout still arms)', async () => {
+    // Codex (#668#discussion_r3302734688): the very first
+    // `self:peer:update` after listen also fires for the initial
+    // post-listen peer record AutoNAT publishes. If that record contains
+    // only private-class addresses (cold boot before AutoNAT verifies
+    // external reach), the previous logic marked `private` as DEFINITIVE
+    // immediately — disabling the soft timeout and locking the verdict.
+    // The fix: treat the FIRST non-public event-driven reclassification
+    // the same as the initial bound-address snapshot.
+    const node = makeFakeNode([]);
+    const onClass = vi.fn();
+    const w = startNatStatusWatcher({ node, onClassification: onClass, softTimeoutMs: 1_000 });
+    // Simulate AutoNAT's first post-listen update with only private addresses.
+    node.setAddrs(['/ip4/192.168.1.5/tcp/4001']);
+    node.emit();
+    // The status DOES update (so /api/status surfaces the current state),
+    // but it MUST NOT be definitive — the soft timeout must still fire
+    // for a downstream consumer to receive a non-stale verdict.
+    expect(onClass).toHaveBeenCalledWith('private', 'unknown');
+    // Now AutoNAT verifies an external address and reclassifies to public:
+    // the soft timeout did its job because the first private event did not
+    // mark `sawDefinitiveClassification`.
+    node.setAddrs(['/ip4/8.8.8.8/tcp/4001']);
+    node.emit();
+    expect(onClass).toHaveBeenLastCalledWith('public', 'private');
+    w.stop();
+  });
+
+  it('Codex #668 — second event-driven `private` reclassification IS definitive', async () => {
+    // Sanity check the inverse: once an event has fired, a subsequent
+    // private classification is treated as the real verdict — we don't
+    // permanently suppress the private branch.
+    const node = makeFakeNode([]);
+    const onClass = vi.fn();
+    const w = startNatStatusWatcher({ node, onClassification: onClass, softTimeoutMs: 1_000 });
+    // First event arrives with public addresses, marks definitive public.
+    node.setAddrs(['/ip4/8.8.8.8/tcp/4001']);
+    node.emit();
+    expect(onClass).toHaveBeenLastCalledWith('public', 'unknown');
+    // Second event flips to private (e.g. external uplink dropped). This
+    // is now treated as a definitive transition; the soft timeout would
+    // not need to fire again.
+    node.setAddrs(['/ip4/192.168.1.5/tcp/4001']);
+    node.emit();
+    expect(onClass).toHaveBeenLastCalledWith('private', 'public');
+    w.stop();
+  });
+
   it('softTimeoutMs=0 disables the soft-timeout entirely', async () => {
     const node = makeFakeNode([]);
     const onClass = vi.fn();

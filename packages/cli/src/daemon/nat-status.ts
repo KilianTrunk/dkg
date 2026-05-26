@@ -242,6 +242,20 @@ export function startNatStatusWatcher(opts: StartNatWatcherOpts): { stop(): void
   let softTimer: ReturnType<typeof setTimeout> | null = null;
   let sawDefinitiveClassification = false;
 
+  // Codex (#668#discussion_r3302734688): the very first `self:peer:update`
+  // also fires for the initial post-listen peer record AutoNAT publishes
+  // when the daemon binds. If that record contains only RFC1918/CGNAT
+  // multiaddrs (common during a cold boot before AutoNAT has verified
+  // external reach), the previous logic marked `private` as DEFINITIVE
+  // — disabling the soft timeout and locking the verdict until a later
+  // address-update event happened (which may never come on a stable
+  // private-only host). Treat the FIRST non-public reclassification the
+  // same as the initial bound-address snapshot: report it via the cache
+  // for `/api/status` observability, but DO NOT mark it definitive. Only
+  // the soft-timeout or a SUBSEQUENT non-public event escalates to
+  // definitive.
+  let sawAnyEventReclassify = false;
+
   const reclassify = (cause: 'event' | 'soft-timeout' | 'initial'): NatStatus => {
     if (stopped) return cachedNatStatus;
     const addrs = opts.node.getMultiaddrs().map((ma) => ma.toString());
@@ -251,6 +265,21 @@ export function startNatStatusWatcher(opts: StartNatWatcherOpts): { stop(): void
       // AutoNAT has not necessarily updated the peer record yet, so do not
       // turn RFC1918/CGNAT binds into a definitive private verdict here.
       return cachedNatStatus;
+    }
+    if (cause === 'event' && next === 'private' && !sawAnyEventReclassify) {
+      // First post-listen `self:peer:update` is still effectively the
+      // bound-address baseline — AutoNAT may not have published a
+      // verified external address yet. See Codex #668 note above.
+      sawAnyEventReclassify = true;
+      const previous = cachedNatStatus;
+      if (next !== previous) {
+        cachedNatStatus = next;
+        opts.onClassification?.(next, previous);
+      }
+      return next;
+    }
+    if (cause === 'event') {
+      sawAnyEventReclassify = true;
     }
     if (next !== 'unknown') {
       sawDefinitiveClassification = true;

@@ -21,6 +21,7 @@ const SCHEMA_VERSION = 15;
 // retention can override via `setRetentionDays()`; the setting is persisted
 // in the `settings` table and re-read on next boot.
 const DEFAULT_RETENTION_DAYS = 14;
+const LEGACY_IMPLICIT_RETENTION_DAYS = 90;
 const LOGS_VACUUM_DELETE_THRESHOLD = 10_000;
 // SQLite reports reusable-but-not-yet-reclaimed pages via freelist_count.
 // With the default 4 KiB page size this is roughly 4 MiB, large enough
@@ -39,15 +40,18 @@ export class DashboardDB {
   readonly db: Database.Database;
   readonly dataDir: string;
   private retentionDays: number;
+  private readonly explicitRetentionDays: boolean;
 
   constructor(opts: DashboardDBOptions) {
     this.dataDir = opts.dataDir;
+    this.explicitRetentionDays = opts.retentionDays !== undefined;
     this.retentionDays = opts.retentionDays ?? DEFAULT_RETENTION_DAYS;
     const dbPath = join(opts.dataDir, 'node-ui.db');
     this.db = new Database(dbPath);
     this.db.pragma('journal_mode = WAL');
     this.db.pragma('synchronous = NORMAL');
     this.migrate();
+    this.loadRetentionSetting();
     this.prune();
   }
 
@@ -59,6 +63,7 @@ export class DashboardDB {
 
   private migrate(): void {
     const version = this.db.pragma('user_version', { simple: true }) as number;
+    const upgradedExistingDb = version > 0 && version < SCHEMA_VERSION;
     if (version >= SCHEMA_VERSION) return;
 
     if (version < 1) {
@@ -551,7 +556,12 @@ export class DashboardDB {
     }
 
     this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
+    if (upgradedExistingDb && !this.explicitRetentionDays) {
+      this.retentionDays = LEGACY_IMPLICIT_RETENTION_DAYS;
+    }
+  }
 
+  private loadRetentionSetting(): void {
     const savedRetention = this.db.prepare("SELECT value FROM settings WHERE key = 'retentionDays'").get() as { value: string } | undefined;
     if (savedRetention) {
       const days = Number(savedRetention.value);
@@ -1514,14 +1524,48 @@ export class DashboardDB {
     });
   }
 
-  // NOTE: `searchLogs()` / `searchLogsFts()` were removed in V15. They
-  // were the only consumers of the FTS5 index that has now been dropped
-  // from the schema, and the only HTTP route that called them
-  // (/api/logs) had no production client. Free-text log search now goes
-  // through the file-backed /api/node-log endpoint. The per-operation
-  // log lookup used by /api/operations/:id and the failed-ops list is
-  // still served from this table via simple `operation_id = ?` queries
-  // in `getOperation()` / `getFailedOperations()`.
+  /**
+   * Backwards-compatible DB-backed log search. V15 deliberately removed
+   * the FTS5 shadow table that made `q=` fast because it dominated DB
+   * growth on production nodes. Keep the public method/API surface using
+   * bounded LIKE scans over the retained base `logs` table.
+   */
+  searchLogs(opts: {
+    q?: string;
+    operationId?: string;
+    level?: string;
+    module?: string;
+    from?: number;
+    to?: number;
+    limit?: number;
+    offset?: number;
+  } = {}): { logs: LogRow[]; total: number } {
+    const wheres: string[] = [];
+    const params: unknown[] = [];
+
+    if (opts.q) {
+      wheres.push(`message LIKE ? ESCAPE '\\'`);
+      params.push(this.likeContains(opts.q));
+    }
+    if (opts.operationId) { wheres.push('operation_id = ?'); params.push(opts.operationId); }
+    if (opts.level) { wheres.push('level = ?'); params.push(opts.level); }
+    if (opts.module) { wheres.push('module = ?'); params.push(opts.module); }
+    if (opts.from) { wheres.push('ts >= ?'); params.push(opts.from); }
+    if (opts.to) { wheres.push('ts <= ?'); params.push(opts.to); }
+
+    const where = wheres.length ? `WHERE ${wheres.join(' AND ')}` : '';
+    const limit = Math.max(1, Math.min(1000, opts.limit ?? 200));
+    const offset = Math.max(0, opts.offset ?? 0);
+    const total = (this.db.prepare(`SELECT COUNT(*) as c FROM logs ${where}`).get(...params) as { c: number }).c;
+    const logs = this.db.prepare(
+      `SELECT * FROM logs ${where} ORDER BY ts DESC LIMIT ? OFFSET ?`,
+    ).all(...params, limit, offset) as LogRow[];
+    return { logs, total };
+  }
+
+  private likeContains(value: string): string {
+    return `%${value.replace(/[\\%_]/g, (m) => `\\${m}`)}%`;
+  }
 
   // --- Query history ---
 

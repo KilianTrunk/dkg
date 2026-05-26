@@ -248,12 +248,9 @@ describe('DashboardDB — operations', () => {
 });
 
 describe('DashboardDB — logs', () => {
-  // NOTE: The free-text / level / time-range / pagination search paths
-  // were removed in V15 along with /api/logs. The remaining production
-  // usage of the `logs` table is operation-correlated lookup (see
-  // `getOperation` / `getFailedOperations` tests above). Below we cover
-  // just the writer side and a baseline row-count to guard against a
-  // future regression that breaks insertion.
+  // NOTE: V15 removed the FTS5 index, not the public search surface.
+  // `searchLogs()` now uses bounded LIKE scans over the retained base
+  // `logs` table for backwards compatibility.
 
   it('insertLog persists the row with all columns', () => {
     db.insertLog({
@@ -282,6 +279,16 @@ describe('DashboardDB — logs', () => {
     const row = db.db.prepare(`SELECT * FROM logs WHERE ts = 2000`).get() as any;
     expect(row.operation_id).toBeNull();
     expect(row.operation_name).toBeNull();
+  });
+
+  it('searchLogs keeps the non-FTS compatibility surface', () => {
+    db.insertLog({ ts: 1000, level: 'info', operation_name: 'publish', operation_id: 'op-1', module: 'Publisher', message: 'publish started' });
+    db.insertLog({ ts: 2000, level: 'error', operation_name: 'sync', operation_id: 'op-2', module: 'Agent', message: 'sync timeout' });
+    db.insertLog({ ts: 3000, level: 'info', operation_name: 'publish', operation_id: 'op-3', module: 'Publisher', message: 'publish completed 100%' });
+
+    const result = db.searchLogs({ q: 'publish completed 100%', level: 'info', module: 'Publisher' });
+    expect(result.total).toBe(1);
+    expect(result.logs[0].operation_id).toBe('op-3');
   });
 });
 
@@ -324,6 +331,28 @@ describe('DashboardDB — saved queries', () => {
 });
 
 describe('DashboardDB — retention', () => {
+  it('uses 14 days for fresh installs', () => {
+    expect(db.getRetentionDays()).toBe(14);
+  });
+
+  it('preserves legacy implicit 90-day retention for upgraded DBs without a saved setting', () => {
+    const dbPath = join(dir, 'node-ui.db');
+    db.close();
+
+    const raw = new Database(dbPath);
+    const twentyDaysAgo = Date.now() - 20 * 86_400_000;
+    raw.prepare(
+      `INSERT INTO logs (ts, level, module, message) VALUES (?, 'info', 'test', 'legacy retained')`,
+    ).run(twentyDaysAgo);
+    raw.pragma('user_version = 14');
+    raw.close();
+
+    db = new DashboardDB({ dataDir: dir });
+    expect(db.getRetentionDays()).toBe(90);
+    const count = (db.db.prepare(`SELECT COUNT(*) AS c FROM logs`).get() as { c: number }).c;
+    expect(count).toBe(1);
+  });
+
   it('prunes data older than retention period', () => {
     const db2 = new DashboardDB({ dataDir: dir, retentionDays: 0 });
 

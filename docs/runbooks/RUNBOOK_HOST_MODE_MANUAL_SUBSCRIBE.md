@@ -8,6 +8,18 @@ This runbook covers **when** to reach for it (and when not to), **how**
 to call it safely, and **what the four discovery paths each look like**
 so you can tell from a log whether the manual call is actually needed.
 
+> **Operator-only — NOT an agent MCP tool.** This endpoint changes
+> *which node hosts* a curated CG's opaque ciphertext, which is a
+> trust-boundary decision the curator owns. Always invoke it via a
+> direct `curl` (or wrap it in the operator's `dkg` CLI / deploy
+> scripts). It is intentionally **not** registered as an MCP tool on
+> `mcp-dkg`, so an agent cannot autonomously enroll its connected core
+> as a host. The earlier `dkg_request_hosting` tool was removed in the
+> PR #672 Codex review pass for exactly this reason (review comment
+> `id=3302086584`); the `requestHostMode` client method in
+> `packages/mcp-dkg/src/client.ts` stays only for use inside operator
+> scripts.
+
 ## TL;DR
 
 Almost always you should let LU-6 Phase B's automatic discovery do its
@@ -130,8 +142,16 @@ After a successful POST:
    `totalBytes`, `totalEntries`). This is the host-mode store
    diagnostics endpoint, served by
    `packages/cli/src/daemon/routes/memory.ts:947-957` and backed by
-   `DKGAgent.getSwmHostModeStats()`. Example response after a single
-   subscribe:
+   `DKGAgent.getSwmHostModeStats()`. Entries in `subscribedCgIds`
+   are always the **canonical wire-form** id (the curator-committed
+   `nameHash`, lowercase 0x-prefixed 32-byte hex) regardless of
+   whether the CG was subscribed via the chain-event path, the
+   beacon, the reconciler, or a manual subscribe call — see
+   `canonicalSwmHostModeKey` in `packages/agent/src/dkg-agent.ts`
+   for the rationale (PR #672 review `id=3302086589`). If you
+   POSTed a cleartext id, expect the corresponding hash to come
+   back here, not the original cleartext. Example response after a
+   single subscribe:
 
    ```json
    {
@@ -139,7 +159,7 @@ After a successful POST:
      "cgCount": 1,
      "totalBytes": 0,
      "totalEntries": 0,
-     "subscribedCgIds": ["<curator-agent>/lj-A-1717000000"]
+     "subscribedCgIds": ["0x4ad12a3e…0a9c1b"]
    }
    ```
 
@@ -186,9 +206,12 @@ blocklist.
 - **Don't** wire it into MCP-tool calling patterns that an agent
   invokes automatically. Operator-only by design: an agent that
   reaches for host mode is bypassing the curator's authority over
-  who hosts the curated CG. (The optional `dkg_request_hosting`
-  MCP tool, where it ships, is a thin operator UI for this same
-  endpoint — not an agent escalation path.)
+  who hosts the curated CG. The previous `dkg_request_hosting` MCP
+  tool was removed in PR #672 (Codex review `id=3302086584`) for
+  this exact reason — there is no agent-facing entrypoint. If you
+  want a friendlier CLI wrapper, add it to the operator-side `dkg`
+  CLI (which is human-invoked), not to `mcp-dkg` (which agents
+  drive).
 
 ## Related
 

@@ -414,6 +414,19 @@ export class DKGAgent {
    * handler routes them via `sharedMemoryGossipRegistered` (source =
    * `member`) instead.
    *
+   * Keys are ALWAYS the canonical wire-form id (the curator-committed
+   * `nameHash`, normalized through {@link canonicalSwmHostModeKey} /
+   * {@link gossipWireIdFor}). Phase B's four discovery paths receive
+   * the CG id in different shapes — chain-event/beacon already carry
+   * the hash, while reconciler/manual typically receive the cleartext
+   * local id or whatever string the operator POSTed — so each
+   * insert/lookup/delete site canonicalizes first. Codex PR #672
+   * review comment `id=3302086589` flagged the pre-canonicalization
+   * regression: a chain-event subscribe (hash key) followed by a
+   * manual subscribe (cleartext key) would miss `has()` and wire a
+   * second handler on the same topic, causing duplicate host-mode
+   * ingest/persistence and ambiguous provenance.
+   *
    * On daemon restart, CGs reconstructed from `swmHostModeStore` boot
    * back through the `reconcileSwmHostModeSubscription` periodic
    * sweep, which defaults their source to `reconciler` (the original
@@ -433,6 +446,9 @@ export class DKGAgent {
    * defect where both host- and member-mode handlers ran in
    * parallel after authorization flipped, causing every gossip
    * message to be both decrypted-and-applied AND opaquely appended.
+   *
+   * Keyed by the canonical wire-form id (same invariant as
+   * `swmHostModeSubscribed`); see {@link canonicalSwmHostModeKey}.
    */
   private readonly swmHostModeHandlers = new Map<string, (topic: string, data: Uint8Array, from: string) => void>();
   /** Async lock for the host-mode reconciler so simultaneous calls don't double-subscribe. */
@@ -1621,32 +1637,24 @@ export class DKGAgent {
               // bookkeeping so every signed ACK carries which of the
               // four LU-6 Phase B discovery paths brought this CG's
               // hosting state up. Resolver tries each candidate id
-              // because the bookkeeping is keyed differently per
-              // path (cleartext for reconciler/manual, wire-hash for
-              // chain-event/beacon). See `getSwmSubscriptionSource`.
+              // because the two consulted maps are keyed differently:
+              // `sharedMemoryGossipRegistered` (member-mode) uses the
+              // CALLER-supplied cleartext id verbatim, while
+              // `swmHostModeSubscribed` (host-mode) is canonical-keyed
+              // by the wire-form hash (see `getSwmSubscriptionSource`
+              // and `canonicalSwmHostModeKey`).
               //
-              // PR5 (review fix #1): chain-event AND discovery-beacon
-              // paths key `swmHostModeSubscribed` by the WIRE form
-              // (the curator-committed nameHash, normalized through
-              // `gossipWireIdFor`). The numeric `cgId` and the
-              // cleartext `swmGraphId` carried by the ACK intent are
-              // NOT in the wire form, so passing ONLY those two would
-              // miss every chain-event / beacon host-only subscription
-              // and degrade `subscriptionSource` to `undefined` →
-              // reported as `?` in the publisher's ACK-provenance log
-              // on the common host-only paths.
-              //
-              // Canonicalize both ACK-intent candidates through
-              // `gossipWireIdFor()` and pass the wire forms as
-              // additional candidates. `gossipWireIdFor` is a pure
-              // local computation: if the local node is a member of
-              // the CG it returns the cached `onChainHash`; otherwise
-              // it returns the input lowercased if it's already a
-              // 32-byte hex string, or `keccak256(utf8(input))`
-              // otherwise. `getSwmSubscriptionSource` is variadic and
-              // dedupes via its internal `seen` Set, so over-passing
-              // is cheap, order-independent, and a no-op when one of
-              // the four shapes is already covered.
+              // PR5 (review fix #1) + PR-B Codex #672 review
+              // `id=3302086589`: `getSwmSubscriptionSource` now
+              // canonicalises each candidate internally before the
+              // host-mode lookup, so on the host-only paths a single
+              // pass through any of the four shapes (numeric / cleartext
+              // / pre-canonical / hash) lands. We still hand it both
+              // the cleartext and the pre-computed wire forms so the
+              // MEMBER-mode `has(id)` check (which keys by cleartext)
+              // gets the cleartext candidate without the canonicaliser
+              // having to round-trip it. Variadic + internal `seen` Set
+              // dedups, so over-passing is cheap and order-independent.
               getSubscriptionSourceForCg: (cgId, swmGraphId) => {
                 const wireFromCgId = cgId ? this.gossipWireIdFor(cgId) : undefined;
                 const wireFromSwmGraphId = swmGraphId && swmGraphId !== cgId
@@ -9071,8 +9079,14 @@ export class DKGAgent {
         // is still applicable.
         this.gossip.unsubscribe(swmTopic);
         this.sharedMemoryGossipRegistered.delete(contextGraphId);
-        this.swmHostModeSubscribed.delete(contextGraphId);
-        this.swmHostModeHandlers.delete(contextGraphId);
+        // Host-mode maps are canonical-keyed (wire-form hash); delete
+        // by canonical id so this cleanup hits the entry regardless
+        // of which discovery path wired it. Without this, the
+        // immediate `reconcileSwmHostModeSubscription()` call below
+        // would see a stale entry and early-return.
+        const hostKey = this.canonicalSwmHostModeKey(contextGraphId);
+        this.swmHostModeSubscribed.delete(hostKey);
+        this.swmHostModeHandlers.delete(hostKey);
         this.log.warn(ctx, `SWM gossip unsubscribed for "${contextGraphId}": local node is no longer authorized`);
       } else {
         this.log.warn(ctx, `SWM gossip subscription denied for "${contextGraphId}": local node is not authorized`);
@@ -9265,7 +9279,7 @@ export class DKGAgent {
       // local consumption; no need to also opaquely store.
       return;
     }
-    if (this.swmHostModeSubscribed.has(contextGraphId)) {
+    if (this.swmHostModeSubscribed.has(this.canonicalSwmHostModeKey(contextGraphId))) {
       // Codex PR #610 R2: idempotent re-entry on the periodic
       // reconcile path must still re-probe on-chain registration
       // state. Without this, a core that subscribed while the CG
@@ -9273,6 +9287,11 @@ export class DKGAgent {
       // limits forever — even after the CG is registered — and
       // ciphertext gets pruned much earlier than intended.
       // Mirrors the same safeguard in `enableSwmHostModeFor`.
+      //
+      // The `has()` check goes through `canonicalSwmHostModeKey` so
+      // a reconcile call with cleartext finds an entry written by
+      // the chain-event/beacon path with the hash form (and vice
+      // versa). Codex PR #672 review `id=3302086589`.
       await this.maybeMarkRegisteredForHostMode(contextGraphId);
       return;
     }
@@ -9340,22 +9359,29 @@ export class DKGAgent {
     contextGraphId: string,
     source: SubscriptionSource = SUBSCRIPTION_SOURCES.RECONCILER,
   ): void {
-    if (this.swmHostModeHandlers.has(contextGraphId)) {
-      // Idempotent re-entry — preserve the original source. The first
-      // discovery path to wire the handler wins the provenance label;
-      // a later path covering the same CG is "also true" but the
-      // operator-meaningful answer is "which path got us here first".
-      return;
-    }
     // OT-RFC-38 / LU-6 Phase B — host-mode subscribes on the wire-form
     // topic. For chain-event-driven auto-subscribe, `contextGraphId`
     // IS the wire id (the core has no cleartext to translate from).
     // For an operator-driven `enableSwmHostModeFor("cleartext-id")`
     // path on a node that's also a member, `gossipWireIdFor`
     // resolves to the curator-committed hash via the local meta.
-    const wireCgId = this.gossipWireIdFor(contextGraphId);
+    //
+    // Codex PR #672 review `id=3302086589`: canonicalize FIRST and
+    // key both bookkeeping maps off `wireCgId` so a chain-event-
+    // driven hash subscribe collides with a later manual-driven
+    // cleartext subscribe on the SAME CG and the second call is a
+    // genuine no-op (instead of silently wiring a second handler on
+    // the same topic).
+    const wireCgId = this.canonicalSwmHostModeKey(contextGraphId);
+    if (this.swmHostModeHandlers.has(wireCgId)) {
+      // Idempotent re-entry — preserve the original source. The first
+      // discovery path to wire the handler wins the provenance label;
+      // a later path covering the same CG is "also true" but the
+      // operator-meaningful answer is "which path got us here first".
+      return;
+    }
     const swmTopic = contextGraphWorkspaceTopic(wireCgId);
-    this.swmHostModeSubscribed.set(contextGraphId, source);
+    this.swmHostModeSubscribed.set(wireCgId, source);
     this.gossip.subscribe(swmTopic);
     const handler = (_topic: string, data: Uint8Array, from: string) => {
       this.ingestSwmHostModeEnvelope(contextGraphId, data, from).catch((err: unknown) => {
@@ -9366,7 +9392,7 @@ export class DKGAgent {
         );
       });
     };
-    this.swmHostModeHandlers.set(contextGraphId, handler);
+    this.swmHostModeHandlers.set(wireCgId, handler);
     this.gossip.onMessage(swmTopic, handler);
     // B3: persist the host-mode designation so a restart re-engages
     // this handler before the chain-event poller catches up.
@@ -9392,13 +9418,17 @@ export class DKGAgent {
    * appended opaquely. Wasted disk + apply work.
    */
   private unwireSwmHostModeHandler(contextGraphId: string): void {
-    const handler = this.swmHostModeHandlers.get(contextGraphId);
+    // Both bookkeeping maps are canonical-keyed (see
+    // {@link canonicalSwmHostModeKey}); canonicalize the input
+    // before lookup so the unwire path is shape-agnostic just like
+    // the wire path.
+    const wireCgId = this.canonicalSwmHostModeKey(contextGraphId);
+    const handler = this.swmHostModeHandlers.get(wireCgId);
     if (!handler) return;
-    const wireCgId = this.gossipWireIdFor(contextGraphId);
     const swmTopic = contextGraphWorkspaceTopic(wireCgId);
     this.gossip.offMessage(swmTopic, handler);
-    this.swmHostModeHandlers.delete(contextGraphId);
-    this.swmHostModeSubscribed.delete(contextGraphId);
+    this.swmHostModeHandlers.delete(wireCgId);
+    this.swmHostModeSubscribed.delete(wireCgId);
     // B3: clear the persisted host-mode designation so a restart
     // does NOT re-engage. Serialized via the per-CG persistence
     // queue (see `enqueueHostModePersistence` for the ordering
@@ -10441,15 +10471,17 @@ export class DKGAgent {
    * path but is plumbed through defensively so a future race doesn't
    * crash the ACK encoder.
    *
-   * Takes multiple candidate ids because `swmHostModeSubscribed`'s
-   * key shape is path-dependent: chain-event and beacon paths key by
-   * the curator-committed wire hash; the reconciler keys by the
-   * cleartext local id from `listContextGraphs()`; manual keys by
-   * whatever string the operator passed to
-   * `POST /api/shared-memory/host-mode/subscribe`. The StorageACK
-   * handler has all three (numeric on-chain `cgId`, cleartext
-   * `swmGraphId`, and may have computed the wire hash) so it passes
-   * the full set and we resolve against the first one that hits.
+   * Takes multiple candidate ids because the two consulted maps are
+   * keyed differently: `sharedMemoryGossipRegistered` (member-mode)
+   * uses the CALLER-supplied cleartext id verbatim, while
+   * `swmHostModeSubscribed` (host-mode) is canonical-keyed by the
+   * wire-form hash via {@link canonicalSwmHostModeKey}. The
+   * StorageACK handler has the numeric on-chain `cgId`, the
+   * cleartext `swmGraphId`, and may have pre-computed the wire hash;
+   * passing the full set lets us hit member-mode on any cleartext
+   * shape AND host-mode on any candidate after canonicalisation. The
+   * `seen` set dedupes both raw and canonical forms so the per-call
+   * cost stays O(distinct shapes).
    *
    * Public so `StorageACKHandlerConfig.getSubscriptionSourceForCg`
    * can bind directly to it at agent wire-up time (in `lifecycle.ts`).
@@ -10463,8 +10495,16 @@ export class DKGAgent {
       if (this.sharedMemoryGossipRegistered.has(id)) {
         return SUBSCRIPTION_SOURCES.MEMBER;
       }
-      const hostSource = this.swmHostModeSubscribed.get(id);
-      if (hostSource) return hostSource;
+      // Host-mode bookkeeping is canonical-keyed (Codex PR #672
+      // review `id=3302086589`); resolve every candidate through
+      // `canonicalSwmHostModeKey` before lookup so any of the
+      // numeric / cleartext / hash shapes hits the same entry.
+      const canonical = this.canonicalSwmHostModeKey(id);
+      if (!seen.has(canonical)) {
+        seen.add(canonical);
+        const hostSource = this.swmHostModeSubscribed.get(canonical);
+        if (hostSource) return hostSource;
+      }
     }
     return undefined;
   }
@@ -10513,12 +10553,20 @@ export class DKGAgent {
       );
       return { subscribed: false, alreadySubscribed: false, hostingEnabled: true, memberMode: true };
     }
-    if (this.swmHostModeSubscribed.has(contextGraphId)) {
+    if (this.swmHostModeSubscribed.has(this.canonicalSwmHostModeKey(contextGraphId))) {
       // Idempotent re-entry: even when the subscription is already
       // active, re-probe registration state. This handles the
       // legitimate "CG was unregistered when first subscribed,
       // operator later registered it on-chain, operator re-calls
       // /host-mode/subscribe" flow without forcing a daemon restart.
+      //
+      // The `has()` check goes through `canonicalSwmHostModeKey` so
+      // a manual subscribe with the cleartext id finds an entry the
+      // chain-event/beacon path wrote with the wire-hash form (and
+      // vice versa). Codex PR #672 review `id=3302086589` — without
+      // this canonicalisation the second subscribe would wire a
+      // duplicate gossip handler on the same topic and double every
+      // host-mode ingest/persistence.
       await this.maybeMarkRegisteredForHostMode(contextGraphId);
       return { subscribed: false, alreadySubscribed: true, hostingEnabled: true };
     }
@@ -15714,6 +15762,37 @@ export class DKGAgent {
     if (sub?.onChainHash) return sub.onChainHash;
     if (/^0x[0-9a-fA-F]{64}$/.test(localId)) return localId.toLowerCase();
     return ethers.keccak256(ethers.toUtf8Bytes(localId)).toLowerCase();
+  }
+
+  /**
+   * Canonical key for the host-mode subscription bookkeeping maps
+   * (`swmHostModeSubscribed`, `swmHostModeHandlers`).
+   *
+   * Codex PR #672 review `id=3302086589`: the four LU-6 Phase B
+   * discovery paths (chain-event, beacon, reconciler, manual)
+   * deliver the same CG to host-mode wiring in different shapes —
+   * the chain-event and beacon paths already carry the curator-
+   * committed wire hash, while the reconciler and manual paths
+   * typically carry the cleartext local id (or whatever string the
+   * operator POSTed). Without a single canonical key, a later
+   * subscribe under a different shape misses `has()` and wires a
+   * second handler on the same topic, doubling ingest and
+   * persistence.
+   *
+   * We standardise on the WIRE FORM (curator-committed `nameHash`,
+   * lowercase 0x-prefixed 32-byte hex) because it's the one shape
+   * every path can reach without external lookups:
+   * {@link gossipWireIdFor} already implements the reverse
+   * cleartext→hash mapping (cache hit → on-chain hash; bare hex →
+   * lowercased; otherwise `keccak256(utf8(cleartext))`, which IS the
+   * curator-committed nameHash by definition).
+   *
+   * Thin alias today; kept as a separate method so the canonicalisation
+   * intent is callsite-obvious and any future divergence between the
+   * gossip topic key and the bookkeeping key can land in one place.
+   */
+  private canonicalSwmHostModeKey(rawCgId: string): string {
+    return this.gossipWireIdFor(rawCgId);
   }
 
   /**

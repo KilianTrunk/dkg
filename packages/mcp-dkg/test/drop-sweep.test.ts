@@ -60,6 +60,15 @@ const DROPPED_TOOLS = [
   'dkg_propose_decision',
   'dkg_add_task',
   'dkg_comment',
+  // PR-B Codex review #672 (id=3302086584) — operator-only host-mode
+  // subscribe MUST NOT have an agent-facing MCP entrypoint. Re-adding
+  // here would re-open the trust-boundary regression flagged on
+  // setup.ts:268: an agent could autonomously change which node hosts
+  // a curated CG's opaque ciphertext, bypassing the curator's
+  // authority. Operators still drive the manual path via the daemon's
+  // `POST /api/shared-memory/host-mode/subscribe` route directly (see
+  // `docs/runbooks/RUNBOOK_HOST_MODE_MANUAL_SUBSCRIBE.md`).
+  'dkg_request_hosting',
 ] as const;
 
 describe('drop-sweep — none of the 10 W2-dropped tools reappear in tools/list', () => {
@@ -88,11 +97,15 @@ describe('drop-sweep — none of the 10 W2-dropped tools reappear in tools/list'
   // cleanup that added `dkg_request_hosting` under registerSetupTools
   // (the LU-6 Phase B operator UX sugar for
   // `POST /api/shared-memory/host-mode/subscribe`; see
-  // `docs/runbooks/RUNBOOK_HOST_MODE_MANUAL_SUBSCRIBE.md`). Bump again
+  // `docs/runbooks/RUNBOOK_HOST_MODE_MANUAL_SUBSCRIBE.md`). Dropped
+  // back to 25 in the PR-B Codex review fix (id=3302086584) — the
+  // host-mode subscribe is operator-only and must not have an
+  // agent-facing MCP entrypoint; see the `dkg_request_hosting` entry
+  // in `DROPPED_TOOLS` for the trust-boundary rationale. Bump again
   // when a new tool is intentionally added, drop when a tool is
   // removed, and keep a comment trail so future drops are auditable.
-  it('registered surface contains exactly 26 tools (post-PR locked count)', () => {
-    expect(server.tools.size).toBe(26);
+  it('registered surface contains exactly 25 tools (post-PR locked count)', () => {
+    expect(server.tools.size).toBe(25);
   });
 });
 

@@ -245,89 +245,25 @@ export function registerSetupTools(
     },
   );
 
-  // ── dkg_request_hosting ─────────────────────────────────────────
-  // OT-RFC-38 / LU-6 Phase B — operator UX sugar over
-  // `POST /api/shared-memory/host-mode/subscribe`. Lets an edge
-  // curator (or any operator running an MCP client) directly ask
-  // their own core for opaque host-mode subscription on a specific
-  // CG, instead of curl-ing the endpoint by hand.
+  // ── dkg_request_hosting (intentionally NOT registered) ──────────
+  // OT-RFC-38 / LU-6 Phase B — `POST /api/shared-memory/host-mode/
+  // subscribe` is the operator-driven manual path (#4 of the four
+  // LU-6 discovery mechanisms). It changes WHICH NODE hosts a
+  // curated CG's opaque ciphertext, which is a trust-boundary
+  // decision the curator owns — the agent must not invoke it
+  // autonomously through an MCP tool.
   //
-  // This is the LAST-RESORT path of the four LU-6 discovery
-  // mechanisms (chain-event / beacon / reconciler / manual). The
-  // first three are automatic; this tool just exposes the manual
-  // one through MCP. See `docs/runbooks/RUNBOOK_HOST_MODE_MANUAL_
-  // SUBSCRIBE.md` for the full when/why decision tree.
+  // Codex review #672 (id=3302086584): the previous `dkg_request_
+  // hosting` MCP tool let any connected agent flip its core into a
+  // host for any curated CG by name. Removed entirely here; the
+  // route stays in place for operators who invoke it directly via
+  // `curl` or the `dkg` CLI (see
+  // `docs/runbooks/RUNBOOK_HOST_MODE_MANUAL_SUBSCRIBE.md`).
   //
-  // The connected daemon does the actual host-mode wiring; the tool
-  // is a thin RPC shim that re-shapes the daemon's response into a
-  // human-readable summary the calling agent can render. If the
-  // daemon isn't a core or doesn't have `swmHostMode` enabled, the
-  // call returns a clean `hostingEnabled: false` rather than a
-  // throw — the tool surfaces that as a helpful no-op message
-  // instead of an error.
-  server.registerTool(
-    'dkg_request_hosting',
-    {
-      title: 'Request CG hosting on this node (host-mode subscribe)',
-      description:
-        'Ask the connected DKG daemon to start hosting a curated context ' +
-        "graph's opaque encrypted SWM substrate as a host-mode peer (NOT " +
-        'as a CG member). Last-resort path of the four LU-6 discovery ' +
-        'mechanisms (chain-event auto-subscribe / discovery beacon / ' +
-        'periodic reconciler / this manual call). Use only when the first ' +
-        'three paths cannot apply — off-chain-only CGs, coverage gaps ' +
-        'during rc.10 rollout, or a late-joining member needs catchup ' +
-        'that no core is yet serving. Idempotent — re-subscribing an ' +
-        'already-hosted CG is a no-op. Refused when the local node is ' +
-        'already a CG member (member-mode handler takes precedence). ' +
-        'Requires the connected daemon to be a core node with ' +
-        '`swmHostMode` enabled.',
-      inputSchema: {
-        contextGraphId: z
-          .string()
-          .min(1)
-          .describe(
-            'Context graph id to host. On a core that already knows the ' +
-              'CG via local meta, this can be the cleartext id; on a core ' +
-              'that only knows the curator-committed nameHash (the on-chain ' +
-              'wire id), pass that hash. Must match what the curator used ' +
-              'at create time.',
-          ),
-      },
-    },
-    async ({ contextGraphId }): Promise<ToolResult> => {
-      const cgId = contextGraphId.trim();
-      if (!cgId) return errResult('"contextGraphId" is required.');
-      try {
-        const result = await client.requestHostMode({ contextGraphId: cgId });
-        if (!result.hostingEnabled) {
-          return ok(
-            `Host-mode hosting is not enabled on the connected daemon ` +
-              `(this is normal for edge nodes — only cores with ` +
-              `\`swmHostMode\` enabled in config host opaque ciphertext).`,
-          );
-        }
-        if (result.memberMode) {
-          return ok(
-            `This node is already a member of '${cgId}'. Member-mode ` +
-              `handler takes precedence over host-mode; no separate ` +
-              `host-mode subscription is needed.`,
-          );
-        }
-        if (result.alreadySubscribed) {
-          return ok(
-            `Host-mode already active for '${cgId}' (subscribed earlier ` +
-              `via chain-event, beacon, reconciler, or a prior manual call).`,
-          );
-        }
-        return ok(
-          `Host-mode subscribed for '${cgId}'. The daemon will now ingest ` +
-            `opaque SWM envelopes on the CG's gossip topic and serve them ` +
-            `to authorised catchup callers.`,
-        );
-      } catch (e) {
-        return errResult(`Failed to request host-mode subscribe: ${formatError(e)}`);
-      }
-    },
-  );
+  // The `requestHostMode` client method (`packages/mcp-dkg/src/
+  // client.ts`) stays — it's still useful inside operator scripts
+  // that wrap the daemon API for their own internal tooling, just
+  // not exposed as an MCP-discoverable tool. The drop-sweep guard
+  // in `packages/mcp-dkg/test/drop-sweep.test.ts` blocks silent
+  // re-registration.
 }

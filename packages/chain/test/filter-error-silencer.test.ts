@@ -15,11 +15,20 @@ import {
   DEFAULT_DEDUP_WINDOW_MS,
 } from '../src/filter-error-silencer.js';
 
+function filterNotFoundError(): Error {
+  return Object.assign(new Error('could not coalesce error'), {
+    info: {
+      error: { code: -32602, message: 'filter not found' },
+      payload: { method: 'eth_getFilterChanges' },
+    },
+  });
+}
+
 describe('isFilterNotFoundError', () => {
-  it('matches plain ethers error messages containing "filter not found"', () => {
-    expect(isFilterNotFoundError(new Error('filter not found'))).toBe(true);
-    expect(isFilterNotFoundError(new Error('Filter Not Found'))).toBe(true);
-    expect(isFilterNotFoundError(new Error('JSON-RPC response: -32602 filter not found'))).toBe(true);
+  it('matches outer ethers messages only when they identify eth_getFilterChanges', () => {
+    expect(isFilterNotFoundError(new Error('filter not found'))).toBe(false);
+    expect(isFilterNotFoundError(new Error('Filter Not Found'))).toBe(false);
+    expect(isFilterNotFoundError(new Error('JSON-RPC response: -32602 filter not found'))).toBe(false);
     expect(
       isFilterNotFoundError(
         new Error(
@@ -84,7 +93,7 @@ describe('isFilterNotFoundError', () => {
   });
 
   it('handles non-Error inputs gracefully', () => {
-    expect(isFilterNotFoundError('filter not found')).toBe(true);
+    expect(isFilterNotFoundError('filter not found')).toBe(false);
     expect(isFilterNotFoundError({ message: 'no match here' })).toBe(false);
   });
 });
@@ -116,7 +125,7 @@ describe('createFilterErrorSilencer', () => {
   it('emits the first filter error immediately', () => {
     const log = vi.fn();
     const silencer = createFilterErrorSilencer({ log, now: () => 1_000 });
-    expect(silencer.handle(new Error('filter not found'))).toBe(true);
+    expect(silencer.handle(filterNotFoundError())).toBe(true);
     expect(log).toHaveBeenCalledTimes(1);
     expect(log.mock.calls[0][0]).toContain('RPC filter expired');
     expect(silencer.stats().filterErrorsTotal).toBe(1);
@@ -131,12 +140,12 @@ describe('createFilterErrorSilencer', () => {
       dedupWindowMs: 60_000,
       now: () => clock,
     });
-    silencer.handle(new Error('filter not found'));
+    silencer.handle(filterNotFoundError());
     expect(log).toHaveBeenCalledTimes(1);
     clock = 30_000;
-    silencer.handle(new Error('filter not found'));
-    silencer.handle(new Error('filter not found'));
-    silencer.handle(new Error('filter not found'));
+    silencer.handle(filterNotFoundError());
+    silencer.handle(filterNotFoundError());
+    silencer.handle(filterNotFoundError());
     expect(log).toHaveBeenCalledTimes(1);
     expect(silencer.stats().filterErrorsTotal).toBe(4);
     expect(silencer.stats().filterErrorsSuppressedInWindow).toBe(3);
@@ -150,13 +159,13 @@ describe('createFilterErrorSilencer', () => {
       dedupWindowMs: 60_000,
       now: () => clock,
     });
-    silencer.handle(new Error('filter not found'));
+    silencer.handle(filterNotFoundError());
     expect(log).toHaveBeenCalledTimes(1);
     clock = 30_000;
-    silencer.handle(new Error('filter not found'));
-    silencer.handle(new Error('filter not found'));
+    silencer.handle(filterNotFoundError());
+    silencer.handle(filterNotFoundError());
     clock = 70_000;
-    silencer.handle(new Error('filter not found'));
+    silencer.handle(filterNotFoundError());
     expect(log).toHaveBeenCalledTimes(2);
     expect(log.mock.calls[1][0]).toContain('2 similar errors suppressed');
     expect(silencer.stats().filterErrorsTotal).toBe(4);
@@ -171,9 +180,9 @@ describe('createFilterErrorSilencer', () => {
       dedupWindowMs: 1_000,
       now: () => clock,
     });
-    silencer.handle(new Error('filter not found'));
+    silencer.handle(filterNotFoundError());
     clock = 5_000;
-    silencer.handle(new Error('filter not found'));
+    silencer.handle(filterNotFoundError());
     expect(log).toHaveBeenCalledTimes(2);
     expect(log.mock.calls[0][0]).not.toContain('similar errors suppressed');
     expect(log.mock.calls[1][0]).not.toContain('similar errors suppressed');
@@ -183,21 +192,21 @@ describe('createFilterErrorSilencer', () => {
     const log = vi.fn();
     let clock = 1_000;
     const silencer = createFilterErrorSilencer({ log, now: () => clock });
-    silencer.handle(new Error('filter not found'));
+    silencer.handle(filterNotFoundError());
     expect(log).toHaveBeenCalledTimes(1);
     clock = 1_000 + DEFAULT_DEDUP_WINDOW_MS - 1;
-    silencer.handle(new Error('filter not found'));
+    silencer.handle(filterNotFoundError());
     expect(log).toHaveBeenCalledTimes(1);
     clock = 1_000 + DEFAULT_DEDUP_WINDOW_MS;
-    silencer.handle(new Error('filter not found'));
+    silencer.handle(filterNotFoundError());
     expect(log).toHaveBeenCalledTimes(2);
   });
 
   it('resetForTest clears all internal state', () => {
     const log = vi.fn();
     const silencer = createFilterErrorSilencer({ log, now: () => 1_000 });
-    silencer.handle(new Error('filter not found'));
-    silencer.handle(new Error('filter not found'));
+    silencer.handle(filterNotFoundError());
+    silencer.handle(filterNotFoundError());
     expect(silencer.stats().filterErrorsTotal).toBe(2);
     silencer.resetForTest();
     expect(silencer.stats()).toEqual({
@@ -215,7 +224,7 @@ describe('createFilterErrorSilencer', () => {
       dedupWindowMs: 60_000,
       now: () => clock,
     });
-    silencer.handle(new Error('filter not found'));
+    silencer.handle(filterNotFoundError());
     silencer.handle(new Error('ECONNRESET'));
     silencer.handle(new Error('rate limited'));
     expect(silencer.stats().filterErrorsTotal).toBe(1);
@@ -227,7 +236,7 @@ describe('production wiring shape (sanity)', () => {
   it('createFilterErrorSilencer with no args returns a working silencer using console.warn', () => {
     const silencer = createFilterErrorSilencer();
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    silencer.handle(new Error('filter not found'));
+    silencer.handle(filterNotFoundError());
     expect(warnSpy).toHaveBeenCalledTimes(1);
     warnSpy.mockRestore();
   });

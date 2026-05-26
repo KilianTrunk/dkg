@@ -54,20 +54,32 @@
  *
  * Defensive: matches on the canonical expiry strings ("filter not found" /
  * "filter expired") with the RPC error code (-32602 / -32000) when the
- * provider exposes structured payloads. We intentionally do NOT swallow
- * unrelated filter-shaped errors like "invalid filter object".
+ * provider exposes structured payloads. Plain outer messages only match when
+ * they also identify the failing RPC method as `eth_getFilterChanges`. We
+ * intentionally do NOT swallow unrelated filter-shaped errors like "invalid
+ * filter object".
  */
 export function isFilterNotFoundError(err: unknown): boolean {
   if (err == null) return false;
   const msg = err instanceof Error ? err.message : String(err);
   const lower = msg.toLowerCase();
-  if (isExpiredFilterMessage(lower)) return true;
   // ethers wraps the JSON-RPC error and exposes the code on err.info / err.code.
-  const candidate = err as { code?: unknown; info?: { error?: { code?: unknown; message?: unknown } } };
+  const candidate = err as {
+    code?: unknown;
+    info?: { error?: { code?: unknown; message?: unknown }; payload?: { method?: unknown } };
+    payload?: { method?: unknown };
+  };
   const rpcCode = typeof candidate.code === 'number' ? candidate.code : candidate.info?.error?.code;
   const rpcMessage = candidate.info?.error?.message;
   if ((rpcCode === -32602 || rpcCode === -32000) && typeof rpcMessage === 'string') {
     if (isExpiredFilterMessage(rpcMessage.toLowerCase())) return true;
+  }
+  const method = candidate.info?.payload?.method ?? candidate.payload?.method;
+  if (
+    isExpiredFilterMessage(lower) &&
+    (lower.includes('eth_getfilterchanges') || method === 'eth_getFilterChanges')
+  ) {
+    return true;
   }
   return false;
 }

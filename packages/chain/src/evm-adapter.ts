@@ -378,11 +378,11 @@ export class EVMChainAdapter implements ChainAdapter {
     this.filterErrorSilencer = createFilterErrorSilencer();
     this.provider.on('error', (err: unknown) => {
       if (this.filterErrorSilencer.handle(err)) return;
-      // Non-filter provider errors fall through to the default warn
+      // Non-filter provider errors fall through to the error
       // path so they remain visible. Operators grepping their logs
       // for chain-provider issues still see everything they used to
       // EXCEPT the filter-spam class.
-      console.warn(`[chain] provider error: ${formatProviderError(err)}`);
+      console.error(`[chain] provider error: ${formatProviderError(err)}`);
     });
     this.signer = new Wallet(config.privateKey, this.provider);
     this.signerPool = [this.signer];

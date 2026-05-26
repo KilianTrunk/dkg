@@ -591,6 +591,7 @@ describe('TripleStoreAsyncPromoteQueue', () => {
     expect(job?.state).toBe('failed');
     expect(job?.reason).toMatch(/partial promote ambiguity/i);
     expect(job?.lease).toBeUndefined();
+    await expect(queue.recover(jobId)).rejects.toThrow(/Cannot recover job .*partial promote ambiguity/i);
   });
 
   it('26. recoverOnStartup() reclaims expired running jobs when promote never started', async () => {
@@ -647,6 +648,7 @@ describe('TripleStoreAsyncPromoteQueue', () => {
     expect(job?.lease).toBeUndefined();
     expect(job?.reason).toMatch(/legacy promote job/i);
     expect(job?.attempt.lastError?.message).toMatch(/formatVersion=0/);
+    await expect(queue.recover(jobId)).rejects.toThrow(/Cannot recover job .*legacy promote job/i);
   });
 
   it('26c. recoverOnStartup() RECLAIMS v2 running jobs with promoteStarted=false', async () => {

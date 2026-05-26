@@ -171,6 +171,63 @@ describe('runPromoteJob', () => {
     expect(final?.result?.promotedCount).toBe(42);
   });
 
+  it('Codex #665 — post-promote bookkeeping failure returns partial_promote_ambiguity and leaves job running', async () => {
+    // Codex (#665#discussion_r3302646439): if `assertion.promote()` has
+    // already returned successfully and the next `recordCommitMarker
+    // ('swmInserted')` or `queue.succeed()` write fails (store hiccup,
+    // lost lease, transient FS error, …), the previous behavior let the
+    // outer worker catch park the job as `failed` with retryable=false.
+    // Re-running through `/promote-async/{jobId}/recover` would then
+    // promote already-promoted data — duplicate WM/SWM writes + re-gossip.
+    //
+    // The fix returns `partial_promote_ambiguity` and DOES NOT call
+    // queue.fail(). The job stays in `running` state until the lease
+    // expires; recoverOnStartup() then routes it into the abandoned
+    // partial-promote bucket on next daemon boot.
+    const job = await enqueueAndClaim();
+    const failingQueue: AsyncPromoteQueue = {
+      ...queue,
+      recordCommitMarker: async (jobId, claimToken, step) => {
+        if (step === 'swmInserted') {
+          throw new Error('simulated store hiccup');
+        }
+        return queue.recordCommitMarker(jobId, claimToken, step);
+      },
+    } as AsyncPromoteQueue;
+
+    const result = await runPromoteJob({
+      job,
+      queue: failingQueue,
+      workerId: 'worker-test',
+      runPromote: async (_request, markPromoteStarted) => {
+        await markPromoteStarted();
+        return { promotedCount: 99 };
+      },
+      now: () => now,
+      heartbeatIntervalMs: 0,
+      log: (m) => logs.push(m),
+    });
+
+    expect(result.outcome).toBe('partial_promote_ambiguity');
+    expect(result.error?.classification).toBe('fatal');
+    expect(result.error?.retryable).toBe(false);
+    // Job remains in `running` state until lease expiry — NOT immediately
+    // `failed` — so /recover cannot re-promote it during the unsafe window.
+    const final = await queue.getStatus(job.jobId);
+    expect(final?.state).toBe('running');
+    expect(final?.commitMarker?.promoteStarted).toBe(true);
+    expect(final?.commitMarker?.swmInserted).toBe(false);
+    // The loud log line operators need to see.
+    expect(logs.some((l) => l.includes('PARTIAL-PROMOTE-AMBIGUITY'))).toBe(true);
+
+    now += 6 * 60 * 1000;
+    await queue.claimNext('worker-after-lease-expiry');
+    const reconciled = await queue.getStatus(job.jobId);
+    expect(reconciled?.state).toBe('failed');
+    expect(reconciled?.reason).toContain('partial promote ambiguity');
+    await expect(queue.recover(job.jobId)).rejects.toThrow(/Cannot recover job job-1: partial promote ambiguity/);
+  });
+
   it('emits memoryGraphChanged on successful promote with >0 triples', async () => {
     const events: any[] = [];
     const job = await enqueueAndClaim();

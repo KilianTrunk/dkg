@@ -123,8 +123,16 @@ export function formatProviderError(err: unknown): string {
 }
 
 function safeJson(value: unknown): string {
+  // Codex (#670#discussion_r3301775310): ethers error payloads commonly
+  // contain `bigint` fields (e.g. transaction values, chain ids), which
+  // `JSON.stringify` rejects with a TypeError. The previous fallback
+  // returned `"[object Object]"`, discarding the structured diagnostics
+  // this path is trying to preserve. Stringify bigints in a replacer so
+  // the serialized form survives the round-trip.
   try {
-    return JSON.stringify(value);
+    return JSON.stringify(value, (_key, v) =>
+      typeof v === 'bigint' ? v.toString() : v,
+    );
   } catch {
     return String(value);
   }

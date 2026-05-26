@@ -157,13 +157,25 @@ for i in $(seq 1 $CONCURRENCY); do
     ")
     api_call "$LOAD_NODE" POST /api/shared-memory/write "$QUADS" \
       > "$TMP_OUT_DIR/write-$i.json" 2>&1 || true
-    api_call "$LOAD_NODE" POST /api/shared-memory/publish "$(cat <<EOF
-{ "contextGraphId": "$CG_ID",
-  "selection": { "kind": "sparql",
-                 "query": "SELECT ?s ?p ?o WHERE { ?s ?p ?o FILTER STRSTARTS(STR(?s), 'urn:rc11-shutdown/${STAMP}/pub${i}/') }" },
-  "kaSelection": { "kind": "all" } }
-EOF
-)" > "$TMP_OUT_DIR/publish-$i.json" 2>&1 || true
+    # Codex (#673#discussion_r3302023873): `/api/shared-memory/publish`
+    # accepts `selection: "all"` or a root-entity string array — NOT a
+    # SPARQL-shaped object. Pass the 8 generated root entities directly so
+    # each background pipeline drives a real StorageACK round trip.
+    ROOT_ENTITIES=$(node -e "
+      const roots = [];
+      for (let j = 0; j < 8; j++) {
+        roots.push('urn:rc11-shutdown/${STAMP}/pub${i}/item' + j);
+      }
+      console.log(JSON.stringify({
+        contextGraphId: '$CG_ID',
+        selection: roots,
+      }));
+    ")
+    PUBLISH_OUT=$(api_call "$LOAD_NODE" POST /api/shared-memory/publish "$ROOT_ENTITIES" 2>&1) || PUBLISH_RC=$? && PUBLISH_RC=${PUBLISH_RC:-0}
+    echo "$PUBLISH_OUT" > "$TMP_OUT_DIR/publish-$i.json"
+    if [ "$PUBLISH_RC" -ne 0 ]; then
+      echo "[publish-$i] api_call exit=$PUBLISH_RC" >> "$TMP_OUT_DIR/publish-$i.json"
+    fi
   ) &
   PUBLISH_PIDS+=($!)
 done

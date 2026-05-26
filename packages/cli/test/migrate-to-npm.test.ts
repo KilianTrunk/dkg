@@ -24,6 +24,7 @@ import {
   renderPlan,
   findDkgMonorepoRootFromCwd,
   resolveMigrationDkgHome,
+  selectMigrationDkgHome,
   type ApplyPlanIo,
   type MigrationPlan,
 } from '../src/migrate-to-npm.js';
@@ -656,5 +657,118 @@ describe('resolveMigrationDkgHome — partial-migration home selection', () => {
       configExists: true,
     });
     expect(home).toBe('/home/op/.dkg');
+  });
+});
+
+describe('selectMigrationDkgHome — Codex #666 probe-both-homes', () => {
+  // Codex (#666#discussion_r3302712591): when a globally-installed `dkg`
+  // CLI (standalone install-mode) is run from inside an unmigrated git
+  // checkout, `repoDir() === null`, but the local daemon is still
+  // writing to ~/.dkg-dev. The previous code derived the home purely
+  // from the executing CLI's install mode and missed the live daemon,
+  // so the orphan-state blocker silently skipped and `autoUpdate.source`
+  // landed in the wrong config.
+  const noopReadPid = async (_h: string) => null;
+  const noopRunning = (_pid: number) => false;
+
+  it('global CLI in unmigrated checkout: picks ~/.dkg-dev when a daemon is alive there', async () => {
+    const result = await selectMigrationDkgHome({
+      repoRoot: '/home/op/dkg-v9',
+      detectedRepoRoot: null,
+      homeDir: '/home/op',
+      readPidFromHome: async (home) =>
+        home === '/home/op/.dkg-dev' ? 4242 : null,
+      isProcessRunning: (pid) => pid === 4242,
+    });
+    expect(result.dkgHome).toBe('/home/op/.dkg-dev');
+    expect(result.pid).toBe(4242);
+    expect(result.recoveredGlobalCliInCheckout).toBe(true);
+  });
+
+  it('probes ~/.dkg-dev even when standalone ~/.dkg config exists', async () => {
+    const result = await selectMigrationDkgHome({
+      repoRoot: '/home/op/dkg-v9',
+      detectedRepoRoot: null,
+      homeDir: '/home/op',
+      configExists: true,
+      readPidFromHome: async (home) =>
+        home === '/home/op/.dkg-dev' ? 4343 : null,
+      isProcessRunning: (pid) => pid === 4343,
+    });
+    expect(result.dkgHome).toBe('/home/op/.dkg-dev');
+    expect(result.pid).toBe(4343);
+    expect(result.recoveredGlobalCliInCheckout).toBe(true);
+  });
+
+  it('refuses ambiguous migration when both monorepo and standalone daemons are alive', async () => {
+    await expect(selectMigrationDkgHome({
+      repoRoot: '/home/op/dkg-v9',
+      detectedRepoRoot: null,
+      homeDir: '/home/op',
+      readPidFromHome: async (home) =>
+        home === '/home/op/.dkg-dev' ? 4242 : home === '/home/op/.dkg' ? 6666 : null,
+      isProcessRunning: () => true,
+    })).rejects.toThrow(/Multiple live DKG daemons detected/);
+  });
+
+  it('greenfield (no daemons): falls back to install-mode resolution', async () => {
+    const standalone = await selectMigrationDkgHome({
+      repoRoot: '/home/op/dkg-v9',
+      detectedRepoRoot: null,
+      homeDir: '/home/op',
+      readPidFromHome: noopReadPid,
+      isProcessRunning: noopRunning,
+    });
+    expect(standalone.dkgHome).toBe('/home/op/.dkg');
+    expect(standalone.pid).toBeNull();
+    expect(standalone.recoveredGlobalCliInCheckout).toBe(false);
+
+    const monorepo = await selectMigrationDkgHome({
+      repoRoot: '/home/op/dkg-v9',
+      detectedRepoRoot: '/home/op/dkg-v9',
+      homeDir: '/home/op',
+      readPidFromHome: noopReadPid,
+      isProcessRunning: noopRunning,
+    });
+    expect(monorepo.dkgHome).toBe('/home/op/.dkg-dev');
+  });
+
+  it('monorepo CLI matches monorepo daemon: no flag, no recovery message', async () => {
+    const result = await selectMigrationDkgHome({
+      repoRoot: '/home/op/dkg-v9',
+      detectedRepoRoot: '/home/op/dkg-v9',
+      homeDir: '/home/op',
+      readPidFromHome: async (home) =>
+        home === '/home/op/.dkg-dev' ? 5555 : null,
+      isProcessRunning: () => true,
+    });
+    expect(result.dkgHome).toBe('/home/op/.dkg-dev');
+    expect(result.recoveredGlobalCliInCheckout).toBe(false);
+  });
+
+  it('standalone daemon present + standalone CLI: picks ~/.dkg, no recovery message', async () => {
+    const result = await selectMigrationDkgHome({
+      repoRoot: '/home/op/dkg-v9',
+      detectedRepoRoot: null,
+      homeDir: '/home/op',
+      readPidFromHome: async (home) =>
+        home === '/home/op/.dkg' ? 6666 : null,
+      isProcessRunning: () => true,
+    });
+    expect(result.dkgHome).toBe('/home/op/.dkg');
+    expect(result.recoveredGlobalCliInCheckout).toBe(false);
+  });
+
+  it('dead pid in ~/.dkg-dev: not picked, falls through to install-mode resolution', async () => {
+    const result = await selectMigrationDkgHome({
+      repoRoot: '/home/op/dkg-v9',
+      detectedRepoRoot: null,
+      homeDir: '/home/op',
+      readPidFromHome: async (home) =>
+        home === '/home/op/.dkg-dev' ? 99999 : null,
+      isProcessRunning: () => false,
+    });
+    expect(result.dkgHome).toBe('/home/op/.dkg');
+    expect(result.recoveredGlobalCliInCheckout).toBe(false);
   });
 });

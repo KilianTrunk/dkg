@@ -547,3 +547,103 @@ export function resolveMigrationDkgHome(opts: {
     configExists: opts.configExists,
   });
 }
+
+/**
+ * Result of `selectMigrationDkgHome()` — the home the migration should
+ * read/write from, the pid found there (if any), and whether the
+ * monorepo-candidate had a live daemon despite the executing CLI being
+ * in standalone install-mode (operator messaging hint).
+ */
+export interface MigrationHomeSelection {
+  dkgHome: string;
+  pid: number | null;
+  /**
+   * True when a live daemon was found at the monorepo-candidate home
+   * AND the executing CLI is itself in standalone install-mode. This
+   * is the global-CLI-in-checkout case from Codex
+   * #666#discussion_r3302712591 — operators need an explicit log line
+   * so they aren't surprised by the home selection.
+   */
+  recoveredGlobalCliInCheckout: boolean;
+}
+
+/**
+ * Pick the DKG home the migration should target by probing BOTH the
+ * monorepo-mode home (`~/.dkg-dev`) and the standalone home (`~/.dkg`)
+ * for an active daemon. Falls back to `resolveMigrationDkgHome()` when
+ * neither home has a running daemon (greenfield migration).
+ *
+ * Codex (#666#discussion_r3302712591): the previous logic derived the
+ * home purely from the LIVE CLI's install mode via `repoDir()`. When
+ * an operator runs a globally installed `dkg` (standalone CLI →
+ * `repoDir() === null`) from inside an unmigrated git checkout, that
+ * call resolved to `~/.dkg` and missed the live daemon running out of
+ * `~/.dkg-dev`. The migration then wrote `autoUpdate.source` into the
+ * wrong config and bypassed the orphan-state blocker.
+ *
+ * `repoRoot` is the structural checkout (`findDkgMonorepoRootFromCwd`)
+ * — used to compute the monorepo-candidate home regardless of how the
+ * live CLI sees its own install mode. `detectedRepoRoot` is the LIVE
+ * CLI's `repoDir()` — used purely to set `recoveredGlobalCliInCheckout`
+ * so callers can log the divergence.
+ */
+export function selectMigrationDkgHome(opts: {
+  repoRoot: string;
+  detectedRepoRoot: string | null;
+  homeDir: string;
+  readPidFromHome: (dkgHome: string) => Promise<number | null> | number | null;
+  isProcessRunning: (pid: number) => boolean;
+  env?: Pick<NodeJS.ProcessEnv, 'DKG_HOME'>;
+  configExists?: boolean;
+}): Promise<MigrationHomeSelection> {
+  return (async () => {
+    const monorepoCandidate = join(opts.homeDir, '.dkg-dev');
+    const standaloneCandidate = join(opts.homeDir, '.dkg');
+    const candidates: string[] = [];
+    const addCandidate = (candidate: string | undefined): void => {
+      if (candidate && !candidates.includes(candidate)) candidates.push(candidate);
+    };
+    addCandidate(opts.env?.DKG_HOME);
+    addCandidate(monorepoCandidate);
+    addCandidate(standaloneCandidate);
+
+    const live: Array<{ dkgHome: string; pid: number }> = [];
+    for (const dkgHome of candidates) {
+      const pid = await opts.readPidFromHome(dkgHome);
+      if (pid !== null && opts.isProcessRunning(pid)) {
+        live.push({ dkgHome, pid });
+      }
+    }
+
+    if (live.length > 1) {
+      const detail = live.map((entry) => `${entry.dkgHome} (pid ${entry.pid})`).join(', ');
+      throw new Error(
+        `Multiple live DKG daemons detected while selecting migration home: ${detail}. ` +
+          `Stop all but the daemon you intend to migrate, then rerun dkg migrate-to-npm.`,
+      );
+    }
+
+    if (live.length === 1) {
+      const selected = live[0]!;
+      return {
+        dkgHome: selected.dkgHome,
+        pid: selected.pid,
+        recoveredGlobalCliInCheckout:
+          opts.detectedRepoRoot === null &&
+          selected.dkgHome === monorepoCandidate &&
+          monorepoCandidate !== standaloneCandidate,
+      };
+    }
+    const fallback = resolveMigrationDkgHome({
+      detectedRepoRoot: opts.detectedRepoRoot,
+      homeDir: opts.homeDir,
+      env: opts.env,
+      configExists: opts.configExists,
+    });
+    return {
+      dkgHome: fallback,
+      pid: await opts.readPidFromHome(fallback),
+      recoveredGlobalCliInCheckout: false,
+    };
+  })();
+}

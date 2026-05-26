@@ -169,6 +169,11 @@ export class TripleStoreAsyncPromoteQueue implements AsyncPromoteQueue {
           `Cannot recover job in state '${job.state}'. Only 'failed' jobs can be recovered.`,
         );
       }
+      if (this.requiresManualInspection(job)) {
+        throw new Error(
+          `Cannot recover job ${jobId}: ${job.reason ?? job.attempt.lastError?.message ?? 'manual inspection required'}`,
+        );
+      }
       await this.assertNoActiveConflict(job.request, job.jobId);
       const recovered: PromoteJob = {
         jobId: job.jobId,
@@ -600,6 +605,15 @@ export class TripleStoreAsyncPromoteQueue implements AsyncPromoteQueue {
       },
     };
     await this.writeJob(abandonedJob);
+  }
+
+  private requiresManualInspection(job: PromoteJob): boolean {
+    const reason = (job.reason ?? '').toLowerCase();
+    const lastError = (job.attempt.lastError?.message ?? '').toLowerCase();
+    return reason.includes('partial promote ambiguity')
+      || lastError.includes('partial promote ambiguity')
+      || reason.includes('legacy promote job')
+      || lastError.includes('legacy promote job');
   }
 
   private async activeUniquenessKeys(state: PromoteJobState): Promise<Set<string>> {

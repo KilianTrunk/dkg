@@ -4059,6 +4059,7 @@ program
       renderPlan,
       findDkgMonorepoRootFromCwd,
       resolveMigrationDkgHome,
+      selectMigrationDkgHome,
     } = await import('./migrate-to-npm.js');
     const detectedRepoRoot = repoDir();
     const cwdRepoRoot = findDkgMonorepoRootFromCwd(process.cwd());
@@ -4073,21 +4074,33 @@ program
       console.log('No active git-checkout marker detected at this location (repoDir() === null).');
       console.log(`Continuing from ${repoRoot} so a partial migration can still repair config pins.`);
     }
-    // Codex review (3302171976): base the home on the LIVE CLI's install
-    // mode (detectedRepoRoot !== null) rather than the structural markers
-    // at repoRoot. The structural markers stay true after the load-bearing
-    // package.json rename, so a rerun from a partially-migrated checkout
-    // would otherwise still target ~/.dkg-dev while the standalone CLI
-    // already reads ~/.dkg.
-    const dkgHomeNow = resolveMigrationDkgHome({
+    // Codex review (3302171976 → #666#discussion_r3302712591): probe BOTH
+    // the monorepo-candidate home (~/.dkg-dev) and the standalone home
+    // (~/.dkg) for a live daemon before picking which one the migration
+    // targets. The previous code derived the home purely from the LIVE
+    // CLI's install mode via `repoDir()`, which is the WRONG signal when
+    // an operator runs a globally installed `dkg` from inside an
+    // unmigrated git checkout — `repoDir()` is null but the local daemon
+    // still writes to ~/.dkg-dev.
+    const homeSelection = await selectMigrationDkgHome({
+      repoRoot,
       detectedRepoRoot,
       homeDir: homedir(),
+      readPidFromHome,
+      isProcessRunning,
     });
+    if (homeSelection.recoveredGlobalCliInCheckout) {
+      console.log(
+        `Detected a live daemon at ${homeSelection.dkgHome} even though the running CLI is in standalone install-mode. ` +
+          `Using ${homeSelection.dkgHome} for migration so the orphan-state blocker and autoUpdate.source pin target the right config.`,
+      );
+    }
+    const dkgHomeNow = homeSelection.dkgHome;
+    const pid = homeSelection.pid;
     const dkgHomePostMigration = resolveMigrationDkgHome({
       detectedRepoRoot: null,
       homeDir: homedir(),
     });
-    const pid = await readPidFromHome(dkgHomeNow);
     const daemonAlive = pid !== null && isProcessRunning(pid);
     const currentAutoUpdateSource = await readAutoUpdateSourceFromHome(dkgHomeNow);
     const backupSuffix = new Date()

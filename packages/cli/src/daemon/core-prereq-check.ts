@@ -259,7 +259,17 @@ function classifyIPv6(ipRaw: string): AddrClassification {
   const ip = ipRaw.toLowerCase();
   if (ip === '::') return 'reserved';
   if (ip === '::1') return 'loopback';
-  if (ip.startsWith('2001:db8:') || ip === '2001:db8::') return 'unknown';
+  // Codex #661 (discussion_r3302752877): bare-string `startsWith('2001:db8:')`
+  // misses valid zero-padded spellings like `2001:0db8::1`. Normalize by
+  // parsing the first two hextets numerically before comparing, so any
+  // documentation address inside `2001:db8::/32` (RFC 3849) is caught
+  // regardless of textual form.
+  const hextets = ip.split('::')[0]?.split(':') ?? [];
+  if (hextets.length >= 2) {
+    const h0 = parseInt(hextets[0], 16);
+    const h1 = parseInt(hextets[1], 16);
+    if (h0 === 0x2001 && h1 === 0x0db8) return 'unknown';
+  }
   if (/^fe[89ab][0-9a-f]?:/.test(ip)) return 'linkLocal';
   if (/^f[cd][0-9a-f]{2}:/.test(ip)) return 'ulaIpv6';
   if (/^ff[0-9a-f]{2}:/.test(ip)) return 'multicast';
@@ -306,7 +316,12 @@ function isPublicAnnounceAddress(
  *   - single-label (no dot)          → not a fully-qualified domain name
  */
 function isReservedDnsName(name: string): boolean {
-  const lower = name.toLowerCase();
+  // Codex #661 (discussion_r3302752890): FQDNs may carry a trailing root
+  // dot (e.g. `localhost.`, `relay.test.`, `svc.cluster.local.`); without
+  // stripping it the `.local`/`.test` suffix checks miss and a reserved
+  // name leaks through as a usable DNS host that would rescue a degraded
+  // listener.
+  const lower = name.toLowerCase().replace(/\.$/, '');
   if (lower === 'localhost') return true;
   if (lower.endsWith('.localhost')) return true;
   if (lower.endsWith('.local')) return true;

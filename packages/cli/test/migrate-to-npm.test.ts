@@ -262,6 +262,23 @@ describe('buildMigrationPlan — orphan-home blocker', () => {
     expect(plan.blockers.find((b) => b.includes('state-directory orphan'))).toBeDefined();
   });
 
+  it('does not suggest plain mv when the post-migration home already exists', () => {
+    const plan = buildMigrationPlan({
+      repoRoot: REPO,
+      backupSuffix: 'ts',
+      dkgHomeNow: '/home/op/.dkg-dev',
+      dkgHomePostMigration: '/home/op/.dkg',
+      daemonAlive: false,
+      forceAliveBypass: false,
+      currentAutoUpdateSource: 'git',
+      exists: existsOf(['/home/op/.dkg-dev/auth.token', '/home/op/.dkg']),
+    });
+
+    expect(plan.blockers[0]).toContain('Destination /home/op/.dkg already exists');
+    expect(plan.blockers[0]).toContain('Merge/copy the state');
+    expect(plan.blockers[0]).not.toMatch(/mv \/home\/op\/\.dkg-dev \/home\/op\/\.dkg/);
+  });
+
   it('does not flag the orphan blocker when homes match', () => {
     const plan = buildMigrationPlan({
       repoRoot: REPO,

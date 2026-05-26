@@ -3939,7 +3939,14 @@ program
     const quoteForShell = (value: string) => `'${value.replace(/'/g, "'\\''")}'`;
     const { buildMigrationPlan, applyPlan, renderPlan } = await import('./migrate-to-npm.js');
     const detectedRepoRoot = repoDir();
-    const repoRoot = detectedRepoRoot ?? findDkgRepoRootFromCwd(process.cwd()) ?? process.cwd();
+    const cwdRepoRoot = findDkgRepoRootFromCwd(process.cwd());
+    const repoRoot = detectedRepoRoot ?? cwdRepoRoot;
+    if (!repoRoot) {
+      console.error('Refusing to run: current directory is not inside a DKG monorepo checkout.');
+      console.error('Run this command from the git-checkout install you want to migrate.');
+      process.exitCode = 1;
+      return;
+    }
     if (!detectedRepoRoot) {
       console.log('No active git-checkout marker detected at this location (repoDir() === null).');
       console.log(`Continuing from ${repoRoot} so a partial migration can still repair config pins.`);

@@ -230,11 +230,16 @@ export function buildMigrationPlan(opts: BuildPlanOpts): MigrationPlan {
     // Classic orphan case: state in ~/.dkg-dev, post-migration the CLI
     // looks at ~/.dkg. Hard refuse — no `--force` override; this one is
     // genuinely unsafe.
+    const remediation = exists(opts.dkgHomePostMigration)
+      ? `Destination ${opts.dkgHomePostMigration} already exists; do not run a plain \`mv\`. ` +
+        `Merge/copy the state from ${opts.dkgHomeNow} into ${opts.dkgHomePostMigration} manually, ` +
+        `or set \`DKG_HOME=${opts.dkgHomeNow}\` permanently in your shell rc and re-run.`
+      : `Run \`mv ${opts.dkgHomeNow} ${opts.dkgHomePostMigration}\` BEFORE re-running this command, ` +
+        `or set \`DKG_HOME=${opts.dkgHomeNow}\` permanently in your shell rc and re-run.`;
     blockers.push(
       `state-directory orphan risk: state currently lives in ${opts.dkgHomeNow}, ` +
         `but post-migration the CLI would resolve to ${opts.dkgHomePostMigration}. ` +
-        `Run \`mv ${opts.dkgHomeNow} ${opts.dkgHomePostMigration}\` BEFORE re-running this command, ` +
-        `or set \`DKG_HOME=${opts.dkgHomeNow}\` permanently in your shell rc and re-run.`,
+        remediation,
     );
   }
 

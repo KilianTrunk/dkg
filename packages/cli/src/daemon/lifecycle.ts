@@ -602,7 +602,8 @@ export function startPromoteWorkerDaemonLifecycle(input: {
         emitMemoryGraphChanged: input.emitMemoryGraphChanged,
       });
       promoteWorkerSupervisor = supervisor;
-      const startup = (async () => {
+      let startup!: Promise<void>;
+      startup = (async () => {
         try {
           await supervisor.start();
           if (!input.isShuttingDown?.() && promoteWorkerSupervisor === supervisor) {
@@ -2541,8 +2542,9 @@ export async function runDaemonInner(
   // any of the cleanup awaits below (notably `agent.stop()` when in-flight sync
   // work holds libp2p reads open) cannot leave the worker process a zombie. See
   // `./shutdown.ts` for the offset-exit-code convention used to signal forced
-  // exits to the supervisor + external monitoring.
-  let shuttingDown = false;
+  // exits to the supervisor + external monitoring. (`shuttingDown` is hoisted
+  // up next to `promoteWorkerLifecycle` above so the worker-stop call inside
+  // the cleanup IIFE can read it.)
   async function shutdown(exitCode = 0) {
     if (shuttingDown) return;
     shuttingDown = true;

@@ -184,34 +184,46 @@ contract DKGPublishingConvictionNFT is INamed, IVersioned, HubDependent, IInitia
      * @notice Mint a new conviction-account NFT to the caller and
      *         transfer `committedTRAC` into the V10 vault.
      *
-     * @dev    Order of operations (mirrors the legacy v2.x semantics):
+     * @dev    CEI ordering with `_safeMint` last:
      *           1. Allocate `accountId` from the wrapper's mint counter.
-     *           2. Mint the ERC-721 to `msg.sender` (publisher).
-     *           3. Forward to `PublishingConviction.createAccount` which
+     *           2. Forward to `PublishingConviction.createAccount` which
      *              persists the `Account` record on PCS and emits
-     *              `AccountCreated`.
-     *           4. Pull TRAC from publisher to the V10 vault. The
+     *              `AccountCreated`. Logic-side parameter validation
+     *              runs here, BEFORE any funds move.
+     *           3. Pull TRAC from publisher to the V10 vault. The
      *              wrapper holds NO TRAC — this is a direct
      *              `transferFrom(publisher, ConvictionStakingStorage,
      *              committedTRAC)`.
+     *           4. `_safeMint(msg.sender, accountId)` LAST. The
+     *              receiver's `onERC721Received` callback therefore
+     *              observes a fully-consistent post-state: Account
+     *              recorded on PCS and TRAC funded into the vault. It
+     *              cannot re-enter `coverPublishingCost` against an
+     *              unfunded or unrecorded account.
      *
-     *         The TRAC pull is intentionally LAST so a logic-side
-     *         revert (e.g. parameter validation) does not move funds.
-     *         A failed `transferFrom` reverts the whole tx — atomic,
-     *         the NFT is never minted without TRAC backing it.
+     *         The forward-before-pull order means a logic-side revert
+     *         does not move funds. The whole tx reverts atomically on
+     *         any failure path — the NFT is never minted without TRAC
+     *         backing it and a recorded `Account` row.
      */
     function createAccount(uint96 committedTRAC) external returns (uint256 accountId) {
         if (committedTRAC == 0) revert InvalidAmount();
 
         accountId = _nextAccountId++;
 
-        _mint(msg.sender, accountId);
-
         _publishingConviction().createAccount(msg.sender, accountId, committedTRAC);
 
+        // Direct publisher -> CSS vault transfer. Contract never holds TRAC.
+        // The TRAC sits in escrow against this account's billing windows and
+        // is accounted to the staker pool lazily via active/passive sinks.
+        // Pulled BEFORE `_safeMint` so the receiver's `onERC721Received`
+        // callback observes a fully-funded account and cannot re-enter
+        // `coverPublishingCost` against an unfunded balance.
         if (!tokenContract.transferFrom(msg.sender, stakingStorageAddress, committedTRAC)) {
             revert TokenTransferFailed();
         }
+
+        _safeMint(msg.sender, accountId);
     }
 
     /**

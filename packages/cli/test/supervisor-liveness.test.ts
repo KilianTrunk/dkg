@@ -383,6 +383,35 @@ describe('startLivenessWatcher', () => {
     watcher.stop();
   });
 
+  it('resets stale failure count when entering shutdown grace', async () => {
+    const probe = vi.fn().mockResolvedValue(false);
+    const onUnresponsive = vi.fn();
+    const onFailure = vi.fn();
+    let shuttingDown = false;
+    const watcher = startLivenessWatcher({
+      port: 1234,
+      probe,
+      onUnresponsive,
+      onFailure,
+      isShuttingDown: () => shuttingDown,
+      intervalMs: 1000,
+      consecutiveFailuresToKill: 3,
+      shutdownGraceMs: 3000,
+    });
+
+    await advanceTicks(2, 1000);
+    expect(onFailure).toHaveBeenCalledTimes(2);
+    shuttingDown = true;
+    await advanceTicks(3, 1000);
+    expect(onUnresponsive).not.toHaveBeenCalled();
+
+    await advanceTicks(2, 1000);
+    expect(onUnresponsive).not.toHaveBeenCalled();
+    await advanceTicks(1, 1000);
+    expect(onUnresponsive).toHaveBeenCalledTimes(1);
+    watcher.stop();
+  });
+
   it('Codex #664 — shutdownGraceMs<0 preserves legacy disarm-forever behavior', async () => {
     // Operators who explicitly want the rc.11-and-earlier "never SIGKILL
     // during graceful shutdown" semantic can opt back in with a negative

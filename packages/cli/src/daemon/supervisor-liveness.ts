@@ -218,6 +218,7 @@ export function startLivenessWatcher(opts: LivenessWatcherOpts): { stop(): void 
         if (inShutdown) {
           if (shutdownObservedAt === null) {
             shutdownObservedAt = Date.now();
+            consecutiveFailures = 0;
           }
           const elapsedMs = Date.now() - shutdownObservedAt;
           // Within the grace window OR the operator opted out of the
@@ -225,6 +226,7 @@ export function startLivenessWatcher(opts: LivenessWatcherOpts): { stop(): void 
           // counting so the worker's own graceful teardown can complete
           // without supervisor interference.
           if (shutdownGraceMs < 0 || elapsedMs < shutdownGraceMs) {
+            consecutiveFailures = 0;
             return;
           }
           // Grace window exceeded: fall through and count this as a real

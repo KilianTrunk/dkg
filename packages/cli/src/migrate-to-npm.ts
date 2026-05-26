@@ -597,42 +597,41 @@ export function selectMigrationDkgHome(opts: {
   configExists?: boolean;
 }): Promise<MigrationHomeSelection> {
   return (async () => {
-    const monorepoCandidate = resolveMigrationDkgHome({
-      detectedRepoRoot: opts.repoRoot,
-      homeDir: opts.homeDir,
-      env: opts.env,
-      configExists: opts.configExists,
-    });
-    const standaloneCandidate = resolveMigrationDkgHome({
-      detectedRepoRoot: null,
-      homeDir: opts.homeDir,
-      env: opts.env,
-      configExists: opts.configExists,
-    });
-    const monorepoPid =
-      monorepoCandidate !== standaloneCandidate
-        ? await opts.readPidFromHome(monorepoCandidate)
-        : null;
-    const standalonePid = await opts.readPidFromHome(standaloneCandidate);
-    const monorepoAlive =
-      monorepoPid !== null && opts.isProcessRunning(monorepoPid);
-    const standaloneAlive =
-      standalonePid !== null && opts.isProcessRunning(standalonePid);
+    const monorepoCandidate = join(opts.homeDir, '.dkg-dev');
+    const standaloneCandidate = join(opts.homeDir, '.dkg');
+    const candidates: string[] = [];
+    const addCandidate = (candidate: string | undefined): void => {
+      if (candidate && !candidates.includes(candidate)) candidates.push(candidate);
+    };
+    addCandidate(opts.env?.DKG_HOME);
+    addCandidate(monorepoCandidate);
+    addCandidate(standaloneCandidate);
 
-    if (monorepoAlive) {
+    const live: Array<{ dkgHome: string; pid: number }> = [];
+    for (const dkgHome of candidates) {
+      const pid = await opts.readPidFromHome(dkgHome);
+      if (pid !== null && opts.isProcessRunning(pid)) {
+        live.push({ dkgHome, pid });
+      }
+    }
+
+    if (live.length > 1) {
+      const detail = live.map((entry) => `${entry.dkgHome} (pid ${entry.pid})`).join(', ');
+      throw new Error(
+        `Multiple live DKG daemons detected while selecting migration home: ${detail}. ` +
+          `Stop all but the daemon you intend to migrate, then rerun dkg migrate-to-npm.`,
+      );
+    }
+
+    if (live.length === 1) {
+      const selected = live[0]!;
       return {
-        dkgHome: monorepoCandidate,
-        pid: monorepoPid,
+        dkgHome: selected.dkgHome,
+        pid: selected.pid,
         recoveredGlobalCliInCheckout:
           opts.detectedRepoRoot === null &&
+          selected.dkgHome === monorepoCandidate &&
           monorepoCandidate !== standaloneCandidate,
-      };
-    }
-    if (standaloneAlive) {
-      return {
-        dkgHome: standaloneCandidate,
-        pid: standalonePid,
-        recoveredGlobalCliInCheckout: false,
       };
     }
     const fallback = resolveMigrationDkgHome({

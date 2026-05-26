@@ -211,14 +211,21 @@ describe('runPromoteJob', () => {
     expect(result.outcome).toBe('partial_promote_ambiguity');
     expect(result.error?.classification).toBe('fatal');
     expect(result.error?.retryable).toBe(false);
-    // Job remains in `running` state — NOT `failed` — so /recover cannot
-    // re-promote it.
+    // Job remains in `running` state until lease expiry — NOT immediately
+    // `failed` — so /recover cannot re-promote it during the unsafe window.
     const final = await queue.getStatus(job.jobId);
     expect(final?.state).toBe('running');
     expect(final?.commitMarker?.promoteStarted).toBe(true);
     expect(final?.commitMarker?.swmInserted).toBe(false);
     // The loud log line operators need to see.
     expect(logs.some((l) => l.includes('PARTIAL-PROMOTE-AMBIGUITY'))).toBe(true);
+
+    now += 6 * 60 * 1000;
+    await queue.claimNext('worker-after-lease-expiry');
+    const reconciled = await queue.getStatus(job.jobId);
+    expect(reconciled?.state).toBe('failed');
+    expect(reconciled?.reason).toContain('partial promote ambiguity');
+    await expect(queue.recover(job.jobId)).rejects.toThrow(/Cannot recover job job-1: partial promote ambiguity/);
   });
 
   it('emits memoryGraphChanged on successful promote with >0 triples', async () => {

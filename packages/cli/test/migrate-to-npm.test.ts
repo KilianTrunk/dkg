@@ -685,6 +685,32 @@ describe('selectMigrationDkgHome — Codex #666 probe-both-homes', () => {
     expect(result.recoveredGlobalCliInCheckout).toBe(true);
   });
 
+  it('probes ~/.dkg-dev even when standalone ~/.dkg config exists', async () => {
+    const result = await selectMigrationDkgHome({
+      repoRoot: '/home/op/dkg-v9',
+      detectedRepoRoot: null,
+      homeDir: '/home/op',
+      configExists: true,
+      readPidFromHome: async (home) =>
+        home === '/home/op/.dkg-dev' ? 4343 : null,
+      isProcessRunning: (pid) => pid === 4343,
+    });
+    expect(result.dkgHome).toBe('/home/op/.dkg-dev');
+    expect(result.pid).toBe(4343);
+    expect(result.recoveredGlobalCliInCheckout).toBe(true);
+  });
+
+  it('refuses ambiguous migration when both monorepo and standalone daemons are alive', async () => {
+    await expect(selectMigrationDkgHome({
+      repoRoot: '/home/op/dkg-v9',
+      detectedRepoRoot: null,
+      homeDir: '/home/op',
+      readPidFromHome: async (home) =>
+        home === '/home/op/.dkg-dev' ? 4242 : home === '/home/op/.dkg' ? 6666 : null,
+      isProcessRunning: () => true,
+    })).rejects.toThrow(/Multiple live DKG daemons detected/);
+  });
+
   it('greenfield (no daemons): falls back to install-mode resolution', async () => {
     const standalone = await selectMigrationDkgHome({
       repoRoot: '/home/op/dkg-v9',

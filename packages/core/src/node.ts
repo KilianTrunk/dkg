@@ -126,6 +126,58 @@ export function isFinitePositiveInteger(input: unknown): input is number {
 }
 
 /**
+ * Pure builder for the libp2p `peerStore` overrides we forward into
+ * `createLibp2p`. Returns `undefined` when no operator field is valid
+ * (the canonical signal for "omit the option block entirely so libp2p
+ * keeps every upstream default"), otherwise returns an object whose
+ * shape mirrors `@libp2p/peer-store`'s `PersistentPeerStoreInit`.
+ *
+ * Extracted from `DKGNode.start()` so a regression test can assert the
+ * wiring without having to spin up a real libp2p node — Codex review
+ * of PR #698 round 2 flagged that the previous test suite only
+ * verified JSON persistence, so a typo in `maxAddressAge` /
+ * `maxPeerAge` would ship as a silent no-op while the existing tests
+ * still passed.
+ */
+export function buildPeerStoreOverrides(
+  config: Pick<DKGNodeConfig, 'peerStoreMaxAddressAgeMs' | 'peerStoreMaxPeerAgeMs'>,
+): { maxAddressAge?: number; maxPeerAge?: number } | undefined {
+  const maxAddressAge = isFinitePositiveInteger(config.peerStoreMaxAddressAgeMs)
+    ? config.peerStoreMaxAddressAgeMs
+    : undefined;
+  const maxPeerAge = isFinitePositiveInteger(config.peerStoreMaxPeerAgeMs)
+    ? config.peerStoreMaxPeerAgeMs
+    : undefined;
+  if (maxAddressAge === undefined && maxPeerAge === undefined) return undefined;
+  const out: { maxAddressAge?: number; maxPeerAge?: number } = {};
+  if (maxAddressAge !== undefined) out.maxAddressAge = maxAddressAge;
+  if (maxPeerAge !== undefined) out.maxPeerAge = maxPeerAge;
+  return out;
+}
+
+/**
+ * Pure builder for the `kadDHT()` init object. Always includes the
+ * `protocol` (the daemon never wants the upstream default protocol
+ * string); adds `querySelfInterval` only when operator config supplies
+ * a positive finite integer.
+ *
+ * Extracted so the wiring is unit-testable without spinning up a real
+ * libp2p — Codex review of PR #698 round 2 flagged the same silent-
+ * no-op risk as `buildPeerStoreOverrides` above.
+ */
+export function buildKadDHTOptions(
+  config: Pick<DKGNodeConfig, 'dhtQuerySelfIntervalMs'>,
+  protocol: string,
+): { protocol: string; querySelfInterval?: number } {
+  const querySelfInterval = isFinitePositiveInteger(config.dhtQuerySelfIntervalMs)
+    ? config.dhtQuerySelfIntervalMs
+    : undefined;
+  return querySelfInterval !== undefined
+    ? { protocol, querySelfInterval }
+    : { protocol };
+}
+
+/**
  * Validate an operator-supplied `relayReservationCount`. Same shape +
  * defensive surface as `validateRelayServerCapacity` (rejects 0,
  * negatives, NaN, Infinity, fractional, non-numbers). Additionally
@@ -800,19 +852,10 @@ export class DKGNode {
     const useAutoNAT = this.config.enableAutoNAT ??
       !(usableRelayCandidates.length > 0 || enableRelay);
 
-    const dhtQuerySelfInterval = isFinitePositiveInteger(this.config.dhtQuerySelfIntervalMs)
-      ? this.config.dhtQuerySelfIntervalMs
-      : undefined;
-
     const services: Record<string, any> = {
       identify: identify(),
       ping: ping(),
-      dht: kadDHT({
-        protocol: DHT_PROTOCOL,
-        ...(dhtQuerySelfInterval !== undefined
-          ? { querySelfInterval: dhtQuerySelfInterval }
-          : {}),
-      }),
+      dht: kadDHT(buildKadDHTOptions(this.config, DHT_PROTOCOL)),
       pubsub: gossipsub({
         emitSelf: false,
         allowPublishToZeroTopicPeers: true,
@@ -948,25 +991,20 @@ export class DKGNode {
       this.relayReservationCountTarget = 1;
     }
 
-    const peerStoreMaxAddressAge = isFinitePositiveInteger(this.config.peerStoreMaxAddressAgeMs)
-      ? this.config.peerStoreMaxAddressAgeMs
-      : undefined;
-    const peerStoreMaxPeerAge = isFinitePositiveInteger(this.config.peerStoreMaxPeerAgeMs)
-      ? this.config.peerStoreMaxPeerAgeMs
-      : undefined;
     // Explicit field shape (NOT `Record<string, number>`) so a typo in
     // a new key fails to compile instead of silently disabling the
     // tunable. Mirrors `PersistentPeerStoreInit` from
     // `@libp2p/peer-store`; if upstream adds a third knob we want to
-    // expose, this object is the single place to extend.
-    // Codex review of PR #698 caught the prior loose typing.
-    const peerStoreOverrides: { maxAddressAge?: number; maxPeerAge?: number } = {};
-    if (peerStoreMaxAddressAge !== undefined) peerStoreOverrides.maxAddressAge = peerStoreMaxAddressAge;
-    if (peerStoreMaxPeerAge !== undefined) peerStoreOverrides.maxPeerAge = peerStoreMaxPeerAge;
+    // expose, the `buildPeerStoreOverrides` return type is the single
+    // place to extend. Codex review of PR #698 caught the prior loose
+    // typing; round 2 then asked for a wiring test, which lives in
+    // `core/test/libp2p-tunables-wiring.test.ts` against the same
+    // helper.
+    const peerStoreOverrides = buildPeerStoreOverrides(this.config);
 
     this.node = await createLibp2p<DKGServices>({
       privateKey,
-      ...(Object.keys(peerStoreOverrides).length > 0
+      ...(peerStoreOverrides !== undefined
         ? { peerStore: peerStoreOverrides }
         : {}),
       // `nodeInfo.userAgent` is libp2p's only knob for the identify

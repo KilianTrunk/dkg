@@ -647,19 +647,16 @@ export interface DKGAgentConfig {
    */
   nodeVersion?: string;
   /**
-   * libp2p networking tunables for small / sparse networks. The
-   * peer-store and DHT fields are forwarded into `DKGNodeConfig`;
-   * `peerResolveTimeoutMs` is applied when constructing the agent's
-   * `PeerResolver`. Omitting any field preserves the upstream default.
-   * See `packages/core/src/types.ts` and
-   * `packages/core/src/network/peer-resolver.ts` for per-field
-   * semantics and the operator-facing surface in
-   * `packages/cli/src/config.ts` (`network` block).
+   * libp2p networking tunables for small / sparse networks. All three
+   * fields are optional and forwarded straight into the matching
+   * `DKGNodeConfig` slots. Omitting any field preserves the upstream
+   * default. See `packages/core/src/types.ts` for per-field semantics
+   * and the operator-facing surface in `packages/cli/src/config.ts`
+   * (`network` block).
    */
   peerStoreMaxAddressAgeMs?: number;
   peerStoreMaxPeerAgeMs?: number;
   dhtQuerySelfIntervalMs?: number;
-  peerResolveTimeoutMs?: number;
   /**
    * Path to the V10 Random Sampling prover write-ahead log. Core
    * nodes only; ignored on edge. When omitted, an in-memory WAL is

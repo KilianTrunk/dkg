@@ -29,6 +29,14 @@ export {
   MAX_RELAY_RESERVATION_COUNT,
   validateRelayReservationCount,
   type RelayReservationCountValidation,
+  // Pure libp2p-tunable builders. Exported so the wiring test in
+  // `core/test/libp2p-tunables-wiring.test.ts` can assert that
+  // operator config flows into the libp2p init objects without
+  // having to spin up a real libp2p node. Codex review of PR #698
+  // round 2 requested this regression fence.
+  isFinitePositiveInteger,
+  buildPeerStoreOverrides,
+  buildKadDHTOptions,
 } from './node.js';
 export {
   type Network,

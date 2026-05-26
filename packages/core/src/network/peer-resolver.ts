@@ -81,10 +81,12 @@ export interface PeerResolverDeps {
    * `resolve()` that doesn't explicitly pass `opts.perStepTimeoutMs`.
    * Per-call values still take precedence over this default.
    *
-   * Operator-tunable via `network.peerResolveTimeoutMs` in
-   * `~/.dkg/config.json` — on small networks where DHT lookups
-   * legitimately need >5s, bumping this avoids unnecessary fallback
-   * to slower agents-CG resolution.
+   * NOTE: this option is intentionally NOT wired to operator config.
+   * Production callers (`connectToPeerId`, chat / routed sends) always
+   * pass an explicit `perStepTimeoutMs` derived from their own
+   * deadline budget, so a constructor default would be a silent no-op
+   * for those paths. It survives as a test-fixture surface. Codex
+   * review of PR #698 round 2 caught the earlier operator wiring.
    *
    * Ignored when not a positive finite integer.
    */

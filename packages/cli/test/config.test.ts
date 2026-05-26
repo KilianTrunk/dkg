@@ -287,11 +287,11 @@ describe('localAgentIntegrations config round-trip', () => {
   });
 
   it('round-trips the network.* libp2p tunables through saveConfig/loadConfig', async () => {
-    // PR feat/chain-network-libp2p-tunables: the four small-network
-    // knobs are documented as `config.json` keys, so the CLI schema
-    // must persist + restore them. This guards against regressions
-    // where any field gets dropped from the DkgConfig type or
-    // stripped on serialization.
+    // PR feat/chain-network-libp2p-tunables: the small-network knobs
+    // are documented as `config.json` keys, so the CLI schema must
+    // persist + restore them. This guards against regressions where
+    // any field gets dropped from the DkgConfig type or stripped on
+    // serialization.
     await saveConfig({
       name: 'test-node',
       apiPort: 9200,
@@ -301,7 +301,6 @@ describe('localAgentIntegrations config round-trip', () => {
         peerStoreMaxAddressAgeMs: 24 * 3_600_000,
         peerStoreMaxPeerAgeMs: 7 * 24 * 3_600_000,
         dhtQuerySelfIntervalMs: 60_000,
-        peerResolveTimeoutMs: 15_000,
       },
     });
 
@@ -309,7 +308,6 @@ describe('localAgentIntegrations config round-trip', () => {
     expect(loaded.network?.peerStoreMaxAddressAgeMs).toBe(24 * 3_600_000);
     expect(loaded.network?.peerStoreMaxPeerAgeMs).toBe(7 * 24 * 3_600_000);
     expect(loaded.network?.dhtQuerySelfIntervalMs).toBe(60_000);
-    expect(loaded.network?.peerResolveTimeoutMs).toBe(15_000);
   });
 
   it('omits the network block entirely when not set (upstream libp2p defaults apply)', async () => {

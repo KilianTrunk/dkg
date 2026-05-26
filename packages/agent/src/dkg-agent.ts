@@ -1239,7 +1239,14 @@ export class DKGAgent {
       // Bootstrap is a libp2p-startup concern (`bootstrap({ list })` in
       // peerDiscovery, see node.ts) — not a per-peer resolution concern.
       // Removed here per Codex review feedback on PR #496.
-      defaultPerStepTimeoutMs: this.config.peerResolveTimeoutMs,
+      //
+      // Note: `defaultPerStepTimeoutMs` is intentionally NOT wired from
+      // operator config. Production callers (`connectToPeerId`, chat /
+      // routed sends) always pass an explicit `perStepTimeoutMs`
+      // derived from their own deadline budget, so any constructor
+      // default would be a silent no-op for those paths. The
+      // constructor option survives as a test-fixture surface.
+      // Codex review of PR #698 round 2 caught this.
     });
     this.peerResolver = peerResolver;
     this.router = new ProtocolRouter(this.node, { peerResolver });

@@ -173,12 +173,14 @@ export interface DKGNodeConfig {
    * back to the upstream default with no warning.
    */
   dhtQuerySelfIntervalMs?: number;
-  // NOTE: `peerResolveTimeoutMs` intentionally lives on
-  // `DKGAgentConfig` (packages/agent), not here. The PeerResolver is
-  // owned by `DKGAgent` (constructed at agent start, not by `DKGNode`),
-  // so a field on `DKGNodeConfig` would be a silent no-op for direct
-  // `new DKGNode({...})` consumers. Codex review of PR #698 caught
-  // this leak.
+  // NOTE: `peerResolveTimeoutMs` was considered but intentionally NOT
+  // exposed. Production callers (`connectToPeerId`, chat / routed
+  // sends) always pass an explicit `perStepTimeoutMs` derived from
+  // their own deadline budget, so a constructor default on the
+  // `PeerResolver` would be a silent no-op for those paths. To
+  // influence dial latency on small / sparse networks, bump the
+  // caller-side timeout instead. Codex review of PR #698 rounds 1+2
+  // caught this leak.
 }
 
 export type ConnectionTransport = 'direct' | 'relayed';

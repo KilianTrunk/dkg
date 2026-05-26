@@ -993,7 +993,6 @@ export async function runDaemonInner(
     peerStoreMaxAddressAgeMs: config.network?.peerStoreMaxAddressAgeMs,
     peerStoreMaxPeerAgeMs: config.network?.peerStoreMaxPeerAgeMs,
     dhtQuerySelfIntervalMs: config.network?.dhtQuerySelfIntervalMs,
-    peerResolveTimeoutMs: config.network?.peerResolveTimeoutMs,
     syncContextGraphs: syncContextGraphs,
     storeConfig: config.store ? {
       backend: config.store.backend,

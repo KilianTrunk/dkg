@@ -405,11 +405,14 @@ describe('PeerResolver', () => {
   });
 
   it('defaultPerStepTimeoutMs constructor override applies when opts.perStepTimeoutMs is omitted', async () => {
-    // PR feat/chain-network-libp2p-tunables: operators on small
-    // networks can bump the resolver's per-step timeout via
-    // config.network.peerResolveTimeoutMs. Verify the constructor
-    // override is honoured when callers don't pass a per-call value,
-    // and that per-call values still win when they do.
+    // PR feat/chain-network-libp2p-tunables: the constructor option
+    // exists for test fixtures and embedders that wire their own
+    // resolver — production callers (`connectToPeerId`, chat / routed
+    // sends) always pass an explicit `perStepTimeoutMs`. Verify the
+    // constructor override is honoured when callers don't pass a
+    // per-call value, and that per-call values still win when they
+    // do. Codex review of PR #698 round 2 removed the operator-facing
+    // wiring; this test still covers the embedder surface.
     const seenTimeouts: number[] = [];
     net.__findPeerImpl = async (_pid, opts) => {
       if (opts?.timeoutMs != null) seenTimeouts.push(opts.timeoutMs);

@@ -202,7 +202,15 @@ async function handleGetCapture(
   if (!captureID) {
     return jsonResponse(ctx.res, 404, { error: 'CaptureNotFound' });
   }
-  const job = await ctx.publisherControl.getStatus(captureID);
+  let job;
+  try {
+    job = await ctx.publisherControl.getStatus(captureID);
+  } catch (err) {
+    return jsonResponse(ctx.res, 503, {
+      error: 'StatusLookupFailed',
+      message: err instanceof Error ? err.message : String(err),
+    });
+  }
   const subGraphName = resolvePublishSubGraphName(opts);
   if (
     !job ||

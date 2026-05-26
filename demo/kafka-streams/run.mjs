@@ -19,6 +19,7 @@ const NODE1_HOME = process.env.DKG_HOME ?? join(homedir(), '.dkg');
 const NODE2_HOME = process.env.NODE2_DKG_HOME ?? '';
 const BASE_PATH = process.env.KAFKA_BASE_PATH ?? '/api/kafka/streams';
 const CG_ID = process.env.CG_ID ?? 'kafka-streams-demo';
+const ALLOW_FACTORY_CONTEXT_GRAPH = process.env.KAFKA_ALLOW_FACTORY_CONTEXT_GRAPH === '1';
 const SYNC_TIMEOUT_MS = Number.parseInt(process.env.SYNC_TIMEOUT_MS ?? '60000', 10);
 const POLL_INTERVAL_MS = 1000;
 const FINALIZE_TIMEOUT_MS = 120_000;
@@ -34,7 +35,7 @@ export function buildKafkaStreamUrls(baseUrl, basePath, captureId, ual) {
   };
 }
 
-export async function validateKafkaContextGraphConfig(nodes, expectedCgId) {
+export async function validateKafkaContextGraphConfig(nodes, expectedCgId, { allowFactoryContextGraph = false } = {}) {
   const mismatches = [];
   for (const node of nodes) {
     let cfg;
@@ -53,7 +54,7 @@ export async function validateKafkaContextGraphConfig(nodes, expectedCgId) {
     }
 
     const actual = cfg?.kafka?.contextGraphId;
-    if (actual !== undefined && actual !== expectedCgId) {
+    if ((actual === undefined && !allowFactoryContextGraph) || (actual !== undefined && actual !== expectedCgId)) {
       mismatches.push(
         `${node.label} kafka.contextGraphId=${actual === undefined ? '(missing)' : JSON.stringify(actual)} ` +
           `does not match demo context graph ${JSON.stringify(expectedCgId)}`,
@@ -129,13 +130,7 @@ export async function ensureContextGraph(auth, cgId, options = {}) {
       `context-graph create on node1 failed: status=${res.status} body=${res.body.slice(0, 300)}`,
     );
   }
-  if (
-    res.parsed?.registered === false &&
-    res.parsed.registerErrorStatus !== 409
-  ) {
-    throw new Error(`context-graph create: on-chain register leg failed: ${res.body.slice(0, 300)}`);
-  }
-  if (res.status === 409) {
+  if (res.status === 409 || res.parsed?.registered === false) {
     const register = await requestJson(`${auth.baseUrl}/api/context-graph/register`, {
       method: 'POST',
       headers: authHeaders(auth, 'application/json'),
@@ -307,7 +302,7 @@ async function main() {
   await validateKafkaContextGraphConfig([
     { label: 'node1', dkgHome: NODE1_HOME },
     { label: 'node2', dkgHome: NODE2_HOME },
-  ], CG_ID);
+  ], CG_ID, { allowFactoryContextGraph: ALLOW_FACTORY_CONTEXT_GRAPH });
   log('     kafka.contextGraphId matches on both nodes.');
   await pause();
 

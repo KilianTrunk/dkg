@@ -278,6 +278,15 @@ describe('handler — GET /register/:captureID', () => {
     expect(captured.statusCode).toBe(404);
     expect(captured.body).toMatchObject({ error: 'CaptureNotFound' });
   });
+  it('maps publisherControl.getStatus failures to structured JSON', async () => {
+    const { req, res, captured } = mockReqRes('GET', '/api/kafka/streams/register/cap-err');
+    const { ctx, getStatus } = mockCtx();
+    getStatus.mockRejectedValueOnce(new Error('status store down'));
+    const handler = createHandler({ basePath: '/api/kafka/streams', contextGraphId: 'urn:cg:demo' });
+    await handler({ ...ctx, req, res, path: '/api/kafka/streams/register/cap-err' });
+    expect(captured.statusCode).toBe(503);
+    expect(captured.body).toMatchObject({ error: 'StatusLookupFailed', message: 'status store down' });
+  });
   it.each([
     ['another context graph', { contextGraphId: 'urn:cg:other' }, {}],
     ['another sub-graph', { contextGraphId: 'urn:cg:demo', subGraphName: 'private' }, { subGraphName: 'streams' }],

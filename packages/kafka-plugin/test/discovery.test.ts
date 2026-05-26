@@ -225,6 +225,14 @@ describe('discovery — bindingsToKa decodes real N-Quads literal binding values
     expect(ka![`${prefix}:enabled`]).toBe(true);
     expect(ka![`${prefix}:threshold`]).toBe(0.75);
   });
+  it('keeps unsafe XSD numeric values as strings to avoid precision loss', () => {
+    const ka = bindingsToKa([
+      { ual: 'did:dkg:1/0xabc', root: 'urn:entity:1', p: 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type', o: 'https://ontology.dkg.io/streams#KafkaStream' },
+      { ual: 'did:dkg:1/0xabc', root: 'urn:entity:1', p: 'https://source.example/offset', o: '"9007199254740993"^^<http://www.w3.org/2001/XMLSchema#integer>' },
+    ]);
+    const prefix = Object.entries(ka!['@context']).find(([, iri]) => iri === 'https://source.example/')![0];
+    expect(ka![`${prefix}:offset`]).toBe('9007199254740993');
+  });
   it('decodes language-tagged literals to their lexical value (drops the lang tag)', () => {
     const ka = bindingsToKa([
       { ual: 'did:dkg:1/0xabc', root: 'urn:entity:1', p: 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type', o: 'https://ontology.dkg.io/streams#KafkaStream' },

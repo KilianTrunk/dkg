@@ -70,24 +70,34 @@ test('ensureContextGraph registers on-chain after duplicate local create', async
   assert.deepEqual(JSON.parse(calls[1].init.body), { id: 'demo-cg' });
 });
 test('ensureContextGraph accepts idempotent duplicate register responses with registered false', async () => {
+  const calls = [];
   await ensureContextGraph({ baseUrl: 'http://node1', token: 't' }, 'demo-cg', {
-    httpJson: async () => ({ status: 200, body: '{"registered":false,"registerErrorStatus":409}', parsed: { registered: false, registerErrorStatus: 409 } }),
+    httpJson: async (url) => (calls.push(url) === 1
+        ? { status: 200, body: '{"registered":false,"registerErrorStatus":409}', parsed: { registered: false, registerErrorStatus: 409 } }
+        : { status: 409, body: '{"error":"already registered"}', parsed: { error: 'already registered' } }),
   });
+  assert.equal(calls[1], 'http://node1/api/context-graph/register');
 });
-test('ensureContextGraph fails fast when register leg returns unclassified registered false', async () => {
-  await assert.rejects(
-    ensureContextGraph({ baseUrl: 'http://node1', token: 't' }, 'demo-cg', {
-      httpJson: async () => ({ status: 200, body: '{"registered":false}', parsed: { registered: false } }),
-    }),
-    /register leg failed/,
-  );
+test('ensureContextGraph verifies on-chain registration after unclassified registered false', async () => {
+  const calls = [];
+  await ensureContextGraph({ baseUrl: 'http://node1', token: 't' }, 'demo-cg', {
+    httpJson: async (url) => (calls.push(url) === 1
+        ? { status: 200, body: '{"registered":false}', parsed: { registered: false } }
+        : { status: 200, body: '{"registered":"demo-cg"}', parsed: { registered: 'demo-cg' } }),
+  });
+  assert.deepEqual(calls, [
+    'http://node1/api/context-graph/create',
+    'http://node1/api/context-graph/register',
+  ]);
 });
 test('ensureContextGraph fails fast on non-idempotent register leg errors', async () => {
   await assert.rejects(
     ensureContextGraph({ baseUrl: 'http://node1', token: 't' }, 'demo-cg', {
-      httpJson: async () => ({ status: 200, body: '{"registered":false,"registerErrorStatus":403}', parsed: { registered: false, registerErrorStatus: 403 } }),
+      httpJson: async (url) => url.endsWith('/create')
+        ? { status: 200, body: '{"registered":false}', parsed: { registered: false } }
+        : { status: 403, body: '{"error":"denied"}', parsed: { error: 'denied' } },
     }),
-    /register leg failed.*403/,
+    /register on node1 failed.*403/,
   );
 });
 async function writeNodeConfig(dkgHome, kafkaConfig) {
@@ -115,7 +125,11 @@ test('validateKafkaContextGraphConfig accepts matching kafka contextGraphId on b
     { label: 'node2', dkgHome: node2Home },
   ], 'demo-cg');
   await writeNodeConfig(node2Home, undefined);
-  await validateKafkaContextGraphConfig([{ label: 'node2', dkgHome: node2Home }], 'demo-cg');
+  await assert.rejects(
+    validateKafkaContextGraphConfig([{ label: 'node2', dkgHome: node2Home }], 'demo-cg'),
+    /node2.*missing.*demo-cg/,
+  );
+  await validateKafkaContextGraphConfig([{ label: 'node2', dkgHome: node2Home }], 'demo-cg', { allowFactoryContextGraph: true });
 });
 test('validateKafkaContextGraphConfig falls back from malformed config.json to config.yaml', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'kafka-streams-demo-run-'));

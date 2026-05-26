@@ -10,6 +10,7 @@ const RDF_TYPE = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type';
 const KAFKA_STREAM_TYPE = `${DKG_STREAMS}KafkaStream`;
 const XSD = 'http://www.w3.org/2001/XMLSchema#';
 const XSD_NUMERIC = /^(?:decimal|float|double|integer|long|int|short|byte|nonPositiveInteger|negativeInteger|nonNegativeInteger|positiveInteger|unsignedLong|unsignedInt|unsignedShort|unsignedByte)$/;
+const XSD_INTEGER = /^(?:integer|long|int|short|byte|nonPositiveInteger|negativeInteger|nonNegativeInteger|positiveInteger|unsignedLong|unsignedInt|unsignedShort|unsignedByte)$/;
 const CONTEXT_GRAPH_ID = /^[\w:/.@-]+$/;
 
 const UNSAFE_IRI_CHARS = /[<>"{}|\\^`\s]/;
@@ -296,9 +297,15 @@ function decodeRdfTerm(raw: string): string | number | boolean {
   }
   if (datatype?.startsWith(XSD) && XSD_NUMERIC.test(datatype.slice(XSD.length))) {
     const n = Number(value);
-    if (Number.isFinite(n)) return n;
+    if (isLosslessNumericLiteral(value, n, datatype.slice(XSD.length))) return n;
   }
   return value;
+}
+
+function isLosslessNumericLiteral(value: string, n: number, localDatatype: string): boolean {
+  if (!Number.isFinite(n)) return false;
+  if (XSD_INTEGER.test(localDatatype)) return Number.isSafeInteger(n);
+  return String(n) === value;
 }
 
 function unescapeNQuadsLiteral(s: string): string {

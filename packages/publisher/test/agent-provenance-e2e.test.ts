@@ -37,7 +37,7 @@ import {
   createTestContextGraph,
   HARDHAT_KEYS,
 } from '../../chain/test/evm-test-context.js';
-import { mintTokens, stakeAndSetAsk } from '../../chain/test/hardhat-harness.js';
+import { mintTokens } from '../../chain/test/hardhat-harness.js';
 import type { Quad } from '@origintrail-official/dkg-storage';
 
 // ---- shared fixture ---------------------------------------------------------

@@ -159,6 +159,7 @@ describe('runPromoteJob', () => {
     const final = await queue.getStatus(job.jobId);
     expect(final?.state).toBe('succeeded');
     expect(final?.commitMarker).toEqual({
+      promoteStarted: true,
       swmInserted: true,
       wmCleaned: false,
       lifecycleStamped: false,
@@ -527,8 +528,8 @@ describe('createPromoteWorkerSupervisor', () => {
   });
 
   it('runs recoverOnStartup() during start()', async () => {
-    // Build a queue with a stale `running` job (lease expired, swmInserted=false)
-    // and verify start() parks it for operator recovery.
+    // Build a queue with a stale `running` job that had already entered
+    // promote, then verify start() parks it for operator recovery.
     let nowFn = 0;
     const recoverableQueue = new TripleStoreAsyncPromoteQueue(store, {
       now: () => nowFn,
@@ -536,8 +537,9 @@ describe('createPromoteWorkerSupervisor', () => {
       leaseMs: 1000,
     });
     nowFn = 1_000_000;
-    await recoverableQueue.enqueue(makeRequest('stale'));
-    await recoverableQueue.claimNext('worker-old');
+    const staleJobId = await recoverableQueue.enqueue(makeRequest('stale'));
+    const claimed = await recoverableQueue.claimNext('worker-old');
+    await recoverableQueue.recordCommitMarker(staleJobId, claimed!.lease!.claimToken, 'promoteStarted');
     nowFn += 60_000; // lease expired
 
     const sup = createPromoteWorkerSupervisor({

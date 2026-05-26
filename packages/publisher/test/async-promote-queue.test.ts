@@ -446,11 +446,29 @@ describe('TripleStoreAsyncPromoteQueue', () => {
     expect(job?.lease).toBeUndefined();
   });
 
-  it('26. recoverOnStartup() abandons expired running jobs even when swmInserted=false', async () => {
+  it('26. recoverOnStartup() reclaims expired running jobs when promote never started', async () => {
     const queue = createQueue({ leaseMs: 10_000 });
     const jobId = await queue.enqueue(makeRequest());
     await queue.claimNext('worker-1');
-    // No commit marker recorded — worker crashed before assertionPromote returned.
+    // No progress marker recorded — worker crashed after claim but before
+    // entering assertionPromote, so a rerun is safe.
+
+    advance(60_000);
+    const summary = await queue.recoverOnStartup();
+
+    expect(summary.reclaimed).toBe(1);
+    expect(summary.abandoned).toBe(0);
+    const job = await queue.getStatus(jobId);
+    expect(job?.state).toBe('queued');
+    expect(job?.lease).toBeUndefined();
+    expect(job?.reason).toBeUndefined();
+  });
+
+  it('27. recoverOnStartup() abandons expired running jobs after promote has started', async () => {
+    const queue = createQueue({ leaseMs: 10_000 });
+    const jobId = await queue.enqueue(makeRequest());
+    const claimed = await queue.claimNext('worker-1');
+    await queue.recordCommitMarker(jobId, claimed!.lease!.claimToken, 'promoteStarted');
 
     advance(60_000);
     const summary = await queue.recoverOnStartup();
@@ -460,11 +478,10 @@ describe('TripleStoreAsyncPromoteQueue', () => {
     const job = await queue.getStatus(jobId);
     expect(job?.state).toBe('failed');
     expect(job?.lease).toBeUndefined();
-    expect(job?.attempt.count).toBe(0);
     expect(job?.reason).toMatch(/partial promote ambiguity/i);
   });
 
-  it('27. recoverOnStartup() leaves `running` jobs alone when the lease is still valid', async () => {
+  it('28. recoverOnStartup() leaves `running` jobs alone when the lease is still valid', async () => {
     const queue = createQueue({ leaseMs: 60_000 });
     const jobId = await queue.enqueue(makeRequest());
     await queue.claimNext('worker-1');
@@ -479,7 +496,7 @@ describe('TripleStoreAsyncPromoteQueue', () => {
     expect(job?.lease).toBeDefined();
   });
 
-  it('28. recoverOnStartup() returns counts of {reclaimed, abandoned}', async () => {
+  it('29. recoverOnStartup() returns counts of {reclaimed, abandoned}', async () => {
     const queue = createQueue({ leaseMs: 10_000 });
     const ids: string[] = [];
     for (let i = 0; i < 4; i++) {
@@ -487,23 +504,23 @@ describe('TripleStoreAsyncPromoteQueue', () => {
       ids.push(id);
       const claimed = await queue.claimNext(`worker-${i}`);
       if (i < 2) {
-        // Half have swmInserted marker; all expired running jobs are now
-        // abandoned because a false marker is not proof that SWM was untouched.
+        // Half crossed into promote and are ambiguous; the other half died
+        // before promoteStarted and can be safely reclaimed.
         await queue.recordCommitMarker(id, claimed!.lease!.claimToken, 'swmInserted');
       }
     }
 
     advance(60_000);
     const summary = await queue.recoverOnStartup();
-    expect(summary.abandoned).toBe(4);
-    expect(summary.reclaimed).toBe(0);
+    expect(summary.abandoned).toBe(2);
+    expect(summary.reclaimed).toBe(2);
   });
 
   // ---------------------------------------------------------------------------
   // Observability
   // ---------------------------------------------------------------------------
 
-  it('29. getStats() returns queue depth per state', async () => {
+  it('30. getStats() returns queue depth per state', async () => {
     const queue = createQueue();
     const stats0 = await queue.getStats();
     for (const s of PROMOTE_JOB_STATES) expect(stats0[s]).toBe(0);

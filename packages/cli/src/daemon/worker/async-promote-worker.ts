@@ -221,6 +221,7 @@ export async function runPromoteJob(
   try {
     let result: { promotedCount: number };
     try {
+      await queue.recordCommitMarker(job.jobId, claimToken, 'promoteStarted');
       result = await runPromote(job.request);
     } catch (err: unknown) {
       const classified = classifyPromoteError(err);

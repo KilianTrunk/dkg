@@ -10,8 +10,8 @@
  *    workers total.
  *  - **No private staging.** The worker calls `assertionPromote` directly.
  *  - **No chain integration.** Recovery decides "rerun safely" vs
- *    "needs human inspection" via the `commitMarker.swmInserted` flag,
- *    not via on-chain lookups.
+ *    "needs human inspection" via the `commitMarker.promoteStarted` /
+ *    `commitMarker.swmInserted` flags, not via on-chain lookups.
  *
  * See `docs/specs/SPEC_ASYNC_PROMOTE_QUEUE.md` (RFC) and
  * `docs/specs/SPEC_ASYNC_PROMOTE_QUEUE_IMPLEMENTATION_PLAN.md` (plan).
@@ -218,7 +218,13 @@ export class TripleStoreAsyncPromoteQueue implements AsyncPromoteQueue {
         },
         // Reset commit marker on every claim — recovery checks the
         // marker BEFORE we reset, so this is safe to do at claim time.
-        commitMarker: { swmInserted: false, wmCleaned: false, lifecycleStamped: false, gossiped: false },
+        commitMarker: {
+          promoteStarted: false,
+          swmInserted: false,
+          wmCleaned: false,
+          lifecycleStamped: false,
+          gossiped: false,
+        },
       };
       await this.writeJob(claimed);
       return claimed;
@@ -247,6 +253,7 @@ export class TripleStoreAsyncPromoteQueue implements AsyncPromoteQueue {
     const job = await this.requireJob(jobId);
     this.assertLeaseHeld(job, claimToken);
     const marker: PromoteCommitMarker = {
+      promoteStarted: job.commitMarker?.promoteStarted ?? false,
       swmInserted: job.commitMarker?.swmInserted ?? false,
       wmCleaned: job.commitMarker?.wmCleaned ?? false,
       lifecycleStamped: job.commitMarker?.lifecycleStamped ?? false,
@@ -332,11 +339,29 @@ export class TripleStoreAsyncPromoteQueue implements AsyncPromoteQueue {
       const expiresAt = job.lease?.expiresAt ?? 0;
       if (expiresAt > now) continue; // lease still valid; worker is fine
 
-      // RFC §4.4 partial-promote ambiguity. The worker can only persist
-      // commitMarker.swmInserted after assertionPromote() returns, so a crash
-      // between the internal SWM write and marker write leaves a false marker
-      // even though SWM may already contain the assertion. Without a stronger
-      // store-side proof, expired running jobs are not safe to re-run.
+      if (!job.commitMarker?.promoteStarted && !job.commitMarker?.swmInserted) {
+        const reclaimedJob: PromoteJob = {
+          ...job,
+          state: 'queued',
+          updatedAt: now,
+          reason: undefined,
+          lease: undefined,
+          attempt: {
+            ...job.attempt,
+            nextRetryAt: undefined,
+          },
+          commitMarker: undefined,
+        };
+        await this.writeJob(reclaimedJob);
+        reclaimed += 1;
+        continue;
+      }
+
+      // RFC §4.4 partial-promote ambiguity. Once the worker has entered
+      // assertionPromote(), a crash may have happened after the internal SWM
+      // write but before our outer swmInserted marker. Without a stronger
+      // store-side proof, expired running jobs past promoteStarted are not
+      // safe to re-run automatically.
       const abandonedJob: PromoteJob = {
         ...job,
         state: 'failed',

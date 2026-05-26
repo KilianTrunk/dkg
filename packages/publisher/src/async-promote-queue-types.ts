@@ -84,14 +84,15 @@ export interface PromoteResult {
 }
 
 /**
- * Per-job commit marker — written by the worker as it observes
- * `assertionPromote` advancing through its internal phases. Recovery uses
- * `swmInserted` to decide whether re-running a crashed job is safe (see
- * RFC §4.4 and plan §7). The other three flags are informational; we
- * record them so an operator can see which step in the multi-step commit
- * was reached, but they don't gate any control-flow decision in v1.
+ * Per-job commit marker — written by the worker as it observes progress.
+ * `promoteStarted` means the worker has crossed into the promote pipeline,
+ * so recovery can no longer prove SWM was untouched. `swmInserted` means
+ * the outer promote call returned and the worker observed the local commit.
+ * The remaining flags are reserved/informational for future phase-level
+ * plumbing.
  */
 export interface PromoteCommitMarker {
+  promoteStarted: boolean;
   swmInserted: boolean;
   wmCleaned: boolean;
   lifecycleStamped: boolean;
@@ -99,6 +100,7 @@ export interface PromoteCommitMarker {
 }
 
 export const PROMOTE_COMMIT_MARKER_STEPS = [
+  'promoteStarted',
   'swmInserted',
   'wmCleaned',
   'lifecycleStamped',
@@ -134,15 +136,16 @@ export interface PromoteListFilter {
 /**
  * Result of a startup recovery sweep. See RFC §4.4.
  *
- * - `reclaimed`  — `running` jobs whose lease expired but whose
- *                  `commitMarker.swmInserted` was still `false`. The
- *                  queue moves them back to `queued` for a clean rerun.
- * - `abandoned`  — `running` jobs whose lease expired AND whose
- *                  `commitMarker.swmInserted` was `true`. The queue parks
- *                  them in `failed` with `reason="partial promote
- *                  ambiguity"` because re-running risks duplicate gossip
- *                  and partial WM state. An operator inspects and either
- *                  cancels or manually `recover()`s after verifying SWM.
+ * - `reclaimed`  — `running` jobs whose lease expired before the worker
+ *                  recorded `commitMarker.promoteStarted`. The queue moves
+ *                  them back to `queued` for a clean rerun.
+ * - `abandoned`  — `running` jobs whose lease expired after
+ *                  `commitMarker.promoteStarted` (or after `swmInserted`).
+ *                  The queue parks them in `failed` with
+ *                  `reason="partial promote ambiguity"` because re-running
+ *                  risks duplicate gossip and partial WM state. An operator
+ *                  inspects and either cancels or manually `recover()`s
+ *                  after verifying SWM.
  */
 export interface PromoteRecoverySummary {
   reclaimed: number;

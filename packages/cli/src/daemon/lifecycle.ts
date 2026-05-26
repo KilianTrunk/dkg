@@ -879,6 +879,40 @@ export async function runDaemonInner(
     }, 0);
     if (profileTimer.unref) profileTimer.unref();
 
+    const promoteWorkerTimer = setTimeout(() => {
+      void (async () => {
+        // Async-promote queue worker (PR #3) — drains the queue introduced
+        // in PR #1 + #2. It is intentionally independent from async-publisher
+        // bootstrap: `/promote-async` jobs only need the agent assertion API,
+        // and should not sit queued forever if publisher wallet/chain recovery
+        // hangs.
+        const promoteWorkerConfig = config.promoteQueue;
+        daemonState.promoteWorkerEnabled = promoteWorkerConfig?.enabled !== false;
+        if (daemonState.promoteWorkerEnabled) {
+          try {
+            const supervisor = createPromoteWorkerSupervisor({
+              agent,
+              workerConcurrency: promoteWorkerConfig?.workerConcurrency,
+              pollIntervalMs: promoteWorkerConfig?.pollIntervalMs,
+              heartbeatIntervalMs: promoteWorkerConfig?.heartbeatIntervalMs,
+              shutdownTimeoutMs: promoteWorkerConfig?.shutdownTimeoutMs,
+              log: (msg) => log(`[promote-worker] ${msg}`),
+              emitMemoryGraphChanged,
+            });
+            await supervisor.start();
+            promoteWorkerSupervisor = supervisor;
+            log("Async promote worker supervisor started");
+          } catch (err: any) {
+            daemonState.promoteWorkerEnabled = false;
+            log(`Async promote worker startup failed: ${err?.message ?? String(err)}`);
+          }
+        } else {
+          log("Async promote worker disabled via config.promoteQueue.enabled=false");
+        }
+      })();
+    }, 0);
+    if (promoteWorkerTimer.unref) promoteWorkerTimer.unref();
+
     const publisherTimer = setTimeout(() => {
       void (async () => {
         try {
@@ -944,42 +978,6 @@ export async function runDaemonInner(
           publisherRuntime = runtime;
         } catch (err: any) {
           log(`Async publisher startup failed: ${err?.message ?? String(err)}`);
-        }
-
-        // Async-promote queue worker (PR #3) — drains the queue introduced
-        // in PR #1 + #2. Until this supervisor is running, jobs sit in
-        // `queued` forever; an operator could still inspect/cancel them
-        // via the HTTP routes. We start only after publisher startup has
-        // settled because the publisher runtime owns the upstream async-lift
-        // queue and may be recovering the same triple store.
-        //
-        // Unlike the publisher runtime, the promote worker is ON by
-        // default — opt OUT via `config.promoteQueue.enabled: false`. Sizing
-        // knobs (`workerConcurrency`, `pollIntervalMs`,
-        // `heartbeatIntervalMs`, `shutdownTimeoutMs`) all live on the same
-        // block; omitted values use the supervisor defaults.
-        const promoteWorkerConfig = config.promoteQueue;
-        daemonState.promoteWorkerEnabled = promoteWorkerConfig?.enabled !== false;
-        if (daemonState.promoteWorkerEnabled) {
-          try {
-            const supervisor = createPromoteWorkerSupervisor({
-              agent,
-              workerConcurrency: promoteWorkerConfig?.workerConcurrency,
-              pollIntervalMs: promoteWorkerConfig?.pollIntervalMs,
-              heartbeatIntervalMs: promoteWorkerConfig?.heartbeatIntervalMs,
-              shutdownTimeoutMs: promoteWorkerConfig?.shutdownTimeoutMs,
-              log: (msg) => log(`[promote-worker] ${msg}`),
-              emitMemoryGraphChanged,
-            });
-            await supervisor.start();
-            promoteWorkerSupervisor = supervisor;
-            log("Async promote worker supervisor started");
-          } catch (err: any) {
-            daemonState.promoteWorkerEnabled = false;
-            log(`Async promote worker startup failed: ${err?.message ?? String(err)}`);
-          }
-        } else {
-          log("Async promote worker disabled via config.promoteQueue.enabled=false");
         }
       })();
     }, 0);

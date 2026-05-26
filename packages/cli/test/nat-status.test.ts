@@ -205,6 +205,26 @@ describe('startNatStatusWatcher — soft-timeout', () => {
     w.stop();
   });
 
+  it('Codex review — unknown first event does not consume the first private baseline', async () => {
+    const node = makeFakeNode([]);
+    const onClass = vi.fn();
+    const w = startNatStatusWatcher({ node, onClassification: onClass, softTimeoutMs: 1_000 });
+
+    node.emit();
+    expect(onClass).toHaveBeenCalledTimes(0);
+
+    node.setAddrs(['/ip4/192.168.1.5/tcp/4001']);
+    node.emit();
+    expect(onClass).toHaveBeenCalledTimes(1);
+    expect(onClass).toHaveBeenLastCalledWith('private', 'unknown');
+
+    node.setAddrs(['/ip4/8.8.8.8/tcp/4001']);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(onClass).toHaveBeenCalledTimes(2);
+    expect(onClass).toHaveBeenLastCalledWith('public', 'private');
+    w.stop();
+  });
+
   it('Codex #668 — first event-driven `private` reclassification is not yet definitive (soft timeout still arms)', async () => {
     // Codex (#668#discussion_r3302734688): the very first
     // `self:peer:update` after listen also fires for the initial

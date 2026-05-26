@@ -249,11 +249,11 @@ export function startNatStatusWatcher(opts: StartNatWatcherOpts): { stop(): void
   // external reach), the previous logic marked `private` as DEFINITIVE
   // — disabling the soft timeout and locking the verdict until a later
   // address-update event happened (which may never come on a stable
-  // private-only host). Treat the FIRST non-public reclassification the
-  // same as the initial bound-address snapshot: report it via the cache
-  // for `/api/status` observability, but DO NOT mark it definitive. Only
-  // the soft-timeout or a SUBSEQUENT non-public event escalates to
-  // definitive.
+  // private-only host). Treat the FIRST non-public, non-unknown
+  // reclassification the same as the initial bound-address snapshot:
+  // report it via the cache for `/api/status` observability, but DO NOT
+  // mark it definitive. Only the soft-timeout or a SUBSEQUENT non-public
+  // event escalates to definitive.
   let sawAnyEventReclassify = false;
 
   const reclassify = (cause: 'event' | 'soft-timeout' | 'initial'): NatStatus => {
@@ -278,7 +278,7 @@ export function startNatStatusWatcher(opts: StartNatWatcherOpts): { stop(): void
       }
       return next;
     }
-    if (cause === 'event') {
+    if (cause === 'event' && next !== 'unknown') {
       sawAnyEventReclassify = true;
     }
     if (next !== 'unknown') {

@@ -128,6 +128,7 @@ export interface PromoteWorkerCounters {
 export type ClassifiedPromoteError = {
   classification: PromoteFailureClassification;
   retryable: boolean;
+  message?: string;
 };
 
 /**
@@ -440,12 +441,13 @@ export function createPromoteWorkerSupervisor(config: PromoteWorkerConfig): Prom
               recordedAt: now(),
             });
           } catch (failErr: unknown) {
+            const failMessage = failErr instanceof Error ? failErr.message : String(failErr);
             if (failErr instanceof PromoteJobLeaseError) {
-              log(`Lease lost while parking crashed job ${claimed.jobId}: ${failErr.message}`);
+              log(`Lease lost while parking crashed job ${claimed.jobId}: ${failMessage}`);
             } else {
               log(
                 `Failed to park crashed job ${claimed.jobId}; next startup recovery must reconcile it: ` +
-                  `${failErr instanceof Error ? failErr.message : String(failErr)}`,
+                  `${failMessage}`,
               );
             }
           }

@@ -9,9 +9,10 @@
  *    `(contextGraphId, subGraphName, assertionName)` runs at a time. N
  *    workers total.
  *  - **No private staging.** The worker calls `assertionPromote` directly.
- *  - **No chain integration.** Recovery decides "rerun safely" vs
- *    "needs human inspection" via the `commitMarker.swmInserted` flag,
- *    not via on-chain lookups.
+ *  - **No chain integration.** Expired running attempts are parked for
+ *    operator inspection unless a worker explicitly fails before the ambiguous
+ *    promote window. The commit marker is observability, not proof that an
+ *    unmarked crash left SWM untouched.
  *
  * See `docs/specs/SPEC_ASYNC_PROMOTE_QUEUE.md` (RFC) and
  * `docs/specs/SPEC_ASYNC_PROMOTE_QUEUE_IMPLEMENTATION_PLAN.md` (plan).
@@ -54,13 +55,12 @@ import {
 
 export class TripleStoreAsyncPromoteQueue implements AsyncPromoteQueue {
   /**
-   * Per-graph-URI mutex map. Serialises `claimNext` so two concurrent
-   * worker loops can't both observe the same "queued" row and try to
-   * claim it. Mirrors `AsyncLiftPublisher.claimQueues` but keyed on the
-   * control-graph URI instead of walletId — workers compete for any job
-   * the queue holds.
+   * Per-graph-URI mutex map. Serialises uniqueness-affecting mutations
+   * callers can't both observe stale state and then persist conflicting
+   * rows. Mirrors `AsyncLiftPublisher.claimQueues` but keyed on the
+   * control-graph URI instead of walletId.
    */
-  private static readonly claimQueues = new Map<string, Promise<void>>();
+  private static readonly mutationQueues = new Map<string, Promise<void>>();
   private static readonly DEFAULT_MAX_RETRIES = 5;
   private static readonly DEFAULT_LEASE_MS = 5 * 60 * 1000;
 
@@ -69,6 +69,7 @@ export class TripleStoreAsyncPromoteQueue implements AsyncPromoteQueue {
   private readonly leaseMs: number;
   private readonly now: () => number;
   private readonly idGenerator: () => string;
+  private readonly claimTokenGenerator: () => string;
   private readonly backoff: (attemptCount: number) => number;
   private paused = false;
   private graphEnsured = false;
@@ -82,6 +83,7 @@ export class TripleStoreAsyncPromoteQueue implements AsyncPromoteQueue {
     this.leaseMs = config.leaseMs ?? TripleStoreAsyncPromoteQueue.DEFAULT_LEASE_MS;
     this.now = config.now ?? (() => Date.now());
     this.idGenerator = config.idGenerator ?? (() => crypto.randomUUID());
+    this.claimTokenGenerator = config.claimTokenGenerator ?? (() => crypto.randomUUID());
     this.backoff = config.backoff ?? defaultBackoffMs;
   }
 
@@ -91,30 +93,24 @@ export class TripleStoreAsyncPromoteQueue implements AsyncPromoteQueue {
 
   async enqueue(request: PromoteRequest): Promise<string> {
     this.validateRequest(request);
-    await this.ensureGraph();
+    return this.withMutationLock(async () => {
+      await this.ensureGraph();
+      await this.assertNoActiveConflict(request);
 
-    const existing = await this.findActiveByUniquenessKey(uniquenessKey(request));
-    if (existing) {
-      throw new PromoteJobConflictError(existing.jobId, {
-        contextGraphId: request.contextGraphId,
-        subGraphName: request.subGraphName,
-        assertionName: request.assertionName,
-      });
-    }
-
-    const now = this.now();
-    const jobId = this.idGenerator();
-    this.validateJobId(jobId);
-    const job: PromoteJob = {
-      jobId,
-      request: this.normalizeRequest(request),
-      state: 'queued',
-      enqueuedAt: now,
-      updatedAt: now,
-      attempt: { count: 0, maxRetries: this.maxRetries },
-    };
-    await this.writeJob(job);
-    return jobId;
+      const now = this.now();
+      const jobId = this.idGenerator();
+      this.validateJobId(jobId);
+      const job: PromoteJob = {
+        jobId,
+        request: this.normalizeRequest(request),
+        state: 'queued',
+        enqueuedAt: now,
+        updatedAt: now,
+        attempt: { count: 0, maxRetries: this.maxRetries },
+      };
+      await this.writeJob(job);
+      return jobId;
+    });
   }
 
   async getStatus(jobId: string): Promise<PromoteJob | null> {
@@ -132,52 +128,57 @@ export class TripleStoreAsyncPromoteQueue implements AsyncPromoteQueue {
     if (filter.contextGraphId) {
       filters.push(`?job <${PROMOTE_CONTEXT_GRAPH_ID}> ${literal(filter.contextGraphId)} .`);
     }
-    const limitClause = filter.limit && filter.limit > 0 ? `LIMIT ${Math.floor(filter.limit)}` : '';
     const result = await this.store.query(
-      `SELECT ?payload WHERE { GRAPH <${this.graphUri}> { ?job <${PROMOTE_STATE}> ?state ; <${PROMOTE_PAYLOAD}> ?payload . ${filters.join(' ')} } } ${limitClause}`,
+      `SELECT ?payload WHERE { GRAPH <${this.graphUri}> { ?job <${PROMOTE_STATE}> ?state ; <${PROMOTE_PAYLOAD}> ?payload . ${filters.join(' ')} } }`,
     );
-    return expectBindings(result)
+    const sorted = expectBindings(result)
       .map((row) => parseJobPayload(row['payload']))
       .filter((job): job is PromoteJob => job !== null)
       .sort(comparePromoteJobs);
+    return filter.limit && filter.limit > 0 ? sorted.slice(0, Math.floor(filter.limit)) : sorted;
   }
 
   async cancel(jobId: string): Promise<void> {
-    await this.ensureGraph();
-    const job = await this.requireJob(jobId);
-    if (job.state !== 'queued' && job.state !== 'failed_retrying') {
-      throw new Error(
-        `Cannot cancel job in state '${job.state}'. Only 'queued' and 'failed_retrying' jobs can be cancelled.`,
-      );
-    }
-    const cancelled: PromoteJob = {
-      ...job,
-      state: 'failed',
-      reason: 'cancelled',
-      updatedAt: this.now(),
-      lease: undefined,
-      attempt: { ...job.attempt, nextRetryAt: undefined },
-    };
-    await this.writeJob(cancelled);
+    await this.withMutationLock(async () => {
+      await this.ensureGraph();
+      const job = await this.requireJob(jobId);
+      if (job.state !== 'queued') {
+        throw new Error(
+          `Cannot cancel job in state '${job.state}'. Only 'queued' jobs can be cancelled.`,
+        );
+      }
+      const cancelled: PromoteJob = {
+        ...job,
+        state: 'failed',
+        reason: 'cancelled',
+        updatedAt: this.now(),
+        lease: undefined,
+        attempt: { ...job.attempt, nextRetryAt: undefined },
+      };
+      await this.writeJob(cancelled);
+    });
   }
 
   async recover(jobId: string): Promise<void> {
-    await this.ensureGraph();
-    const job = await this.requireJob(jobId);
-    if (job.state !== 'failed') {
-      throw new Error(
-        `Cannot recover job in state '${job.state}'. Only 'failed' jobs can be recovered.`,
-      );
-    }
-    const recovered: PromoteJob = {
-      jobId: job.jobId,
-      request: job.request,
-      state: 'queued',
-      enqueuedAt: job.enqueuedAt,
-      updatedAt: this.now(),
-      attempt: { count: 0, maxRetries: job.attempt.maxRetries },
-    };
-    await this.writeJob(recovered);
+    await this.withMutationLock(async () => {
+      await this.ensureGraph();
+      const job = await this.requireJob(jobId);
+      if (job.state !== 'failed') {
+        throw new Error(
+          `Cannot recover job in state '${job.state}'. Only 'failed' jobs can be recovered.`,
+        );
+      }
+      await this.assertNoActiveConflict(job.request, job.jobId);
+      const recovered: PromoteJob = {
+        jobId: job.jobId,
+        request: job.request,
+        state: 'queued',
+        enqueuedAt: job.enqueuedAt,
+        updatedAt: this.now(),
+        attempt: { count: 0, maxRetries: job.attempt.maxRetries },
+      };
+      await this.writeJob(recovered);
+    });
   }
 
   // ===========================================================================
@@ -188,11 +189,12 @@ export class TripleStoreAsyncPromoteQueue implements AsyncPromoteQueue {
     if (!workerId || typeof workerId !== 'string') {
       throw new Error('workerId is required');
     }
-    return this.withClaimLock(async () => {
+    return this.withMutationLock(async () => {
       await this.ensureGraph();
       if (this.paused) return null;
 
       const now = this.now();
+      await this.reconcileExpiredRunning(now);
       const candidates = (await this.list()).filter((j) => {
         if (j.state === 'queued') return true;
         if (j.state === 'failed_retrying' && (j.attempt.nextRetryAt ?? 0) <= now) return true;
@@ -204,12 +206,13 @@ export class TripleStoreAsyncPromoteQueue implements AsyncPromoteQueue {
       if (eligible.length === 0) return null;
 
       const next = eligible.sort(comparePromoteJobs)[0]!;
-      const claimToken = `${workerId}:${now}:${next.jobId}`;
+      const claimToken = `${workerId}:${next.jobId}:${this.claimTokenGenerator()}`;
+      const attemptCount = next.attempt.count + 1;
       const claimed: PromoteJob = {
         ...next,
         state: 'running',
         updatedAt: now,
-        attempt: { ...next.attempt, nextRetryAt: undefined },
+        attempt: { ...next.attempt, count: attemptCount, nextRetryAt: undefined },
         lease: {
           workerId,
           acquiredAt: now,
@@ -227,94 +230,106 @@ export class TripleStoreAsyncPromoteQueue implements AsyncPromoteQueue {
   }
 
   async heartbeat(jobId: string, claimToken: string): Promise<void> {
-    await this.ensureGraph();
-    const job = await this.requireJob(jobId);
-    this.assertLeaseHeld(job, claimToken);
-    const now = this.now();
-    const refreshed: PromoteJob = {
-      ...job,
-      updatedAt: now,
-      lease: {
-        ...job.lease!,
-        expiresAt: now + this.leaseMs,
-        lastHeartbeatAt: now,
-      },
-    };
-    await this.writeJob(refreshed);
+    await this.withMutationLock(async () => {
+      await this.ensureGraph();
+      const job = await this.requireJob(jobId);
+      this.assertLeaseHeld(job, claimToken);
+      const now = this.now();
+      const refreshed: PromoteJob = {
+        ...job,
+        updatedAt: now,
+        lease: {
+          ...job.lease!,
+          expiresAt: now + this.leaseMs,
+          lastHeartbeatAt: now,
+        },
+      };
+      await this.writeJob(refreshed);
+    });
   }
 
   async recordCommitMarker(jobId: string, claimToken: string, step: PromoteCommitMarkerStep): Promise<void> {
-    await this.ensureGraph();
-    const job = await this.requireJob(jobId);
-    this.assertLeaseHeld(job, claimToken);
-    const marker: PromoteCommitMarker = {
-      swmInserted: job.commitMarker?.swmInserted ?? false,
-      wmCleaned: job.commitMarker?.wmCleaned ?? false,
-      lifecycleStamped: job.commitMarker?.lifecycleStamped ?? false,
-      gossiped: job.commitMarker?.gossiped ?? false,
-      [step]: true,
-    };
-    const updated: PromoteJob = { ...job, updatedAt: this.now(), commitMarker: marker };
-    await this.writeJob(updated);
+    await this.withMutationLock(async () => {
+      await this.ensureGraph();
+      const job = await this.requireJob(jobId);
+      this.assertLeaseHeld(job, claimToken);
+      const marker: PromoteCommitMarker = {
+        swmInserted: job.commitMarker?.swmInserted ?? false,
+        wmCleaned: job.commitMarker?.wmCleaned ?? false,
+        lifecycleStamped: job.commitMarker?.lifecycleStamped ?? false,
+        gossiped: job.commitMarker?.gossiped ?? false,
+        [step]: true,
+      };
+      const updated: PromoteJob = { ...job, updatedAt: this.now(), commitMarker: marker };
+      await this.writeJob(updated);
+    });
   }
 
   async succeed(jobId: string, claimToken: string, result: PromoteResult): Promise<void> {
-    await this.ensureGraph();
-    const job = await this.requireJob(jobId);
-    this.assertLeaseHeld(job, claimToken);
-    if (!job.commitMarker?.swmInserted) {
-      throw new Error(
-        `Cannot succeed job ${jobId}: commitMarker.swmInserted is false. Worker must record SWM commit before declaring success.`,
-      );
-    }
-    const succeeded: PromoteJob = {
-      ...job,
-      state: 'succeeded',
-      updatedAt: this.now(),
-      lease: undefined,
-      result,
-    };
-    await this.writeJob(succeeded);
+    await this.withMutationLock(async () => {
+      await this.ensureGraph();
+      const job = await this.requireJob(jobId);
+      this.assertLeaseHeld(job, claimToken);
+      if (!job.commitMarker?.swmInserted) {
+        throw new Error(
+          `Cannot succeed job ${jobId}: commitMarker.swmInserted is false. Worker must record SWM commit before declaring success.`,
+        );
+      }
+      const succeeded: PromoteJob = {
+        ...job,
+        state: 'succeeded',
+        updatedAt: this.now(),
+        lease: undefined,
+        result,
+      };
+      await this.writeJob(succeeded);
+    });
   }
 
   async fail(jobId: string, claimToken: string, error: PromoteAttemptError): Promise<void> {
-    await this.ensureGraph();
-    const job = await this.requireJob(jobId);
-    this.assertLeaseHeld(job, claimToken);
+    await this.withMutationLock(async () => {
+      await this.ensureGraph();
+      const job = await this.requireJob(jobId);
+      this.assertLeaseHeld(job, claimToken);
 
-    const now = this.now();
-    const nextCount = job.attempt.count + 1;
-    const canRetry = error.retryable && nextCount < job.attempt.maxRetries;
+      const now = this.now();
+      const attemptCount = Math.max(1, job.attempt.count);
+      const swmInserted = job.commitMarker?.swmInserted === true;
+      const canRetry = error.retryable && !swmInserted && attemptCount < job.attempt.maxRetries;
 
-    if (canRetry) {
-      const failedRetrying: PromoteJob = {
+      if (canRetry) {
+        const failedRetrying: PromoteJob = {
+          ...job,
+          state: 'failed_retrying',
+          updatedAt: now,
+          lease: undefined,
+          attempt: {
+            count: attemptCount,
+            maxRetries: job.attempt.maxRetries,
+            nextRetryAt: now + this.backoff(attemptCount),
+            lastError: error,
+          },
+        };
+        await this.writeJob(failedRetrying);
+        return;
+      }
+
+      const failed: PromoteJob = {
         ...job,
-        state: 'failed_retrying',
+        state: 'failed',
         updatedAt: now,
         lease: undefined,
         attempt: {
-          count: nextCount,
+          count: attemptCount,
           maxRetries: job.attempt.maxRetries,
-          nextRetryAt: now + this.backoff(nextCount),
           lastError: error,
         },
+        reason: swmInserted
+          ? 'partial promote ambiguity: failed after SWM insert; needs operator inspection'
+          : job.reason,
       };
-      await this.writeJob(failedRetrying);
-      return;
-    }
-
-    const failed: PromoteJob = {
-      ...job,
-      state: 'failed',
-      updatedAt: now,
-      lease: undefined,
-      attempt: {
-        count: nextCount,
-        maxRetries: job.attempt.maxRetries,
-        lastError: error,
-      },
-    };
-    await this.writeJob(failed);
+      await this.writeJob(failed);
+    });
   }
 
   // ===========================================================================
@@ -322,8 +337,13 @@ export class TripleStoreAsyncPromoteQueue implements AsyncPromoteQueue {
   // ===========================================================================
 
   async recoverOnStartup(): Promise<PromoteRecoverySummary> {
-    await this.ensureGraph();
-    const now = this.now();
+    return this.withMutationLock(async () => {
+      await this.ensureGraph();
+      return this.reconcileExpiredRunning(this.now());
+    });
+  }
+
+  private async reconcileExpiredRunning(now: number): Promise<PromoteRecoverySummary> {
     const running = await this.list({ state: ['running'] });
 
     let reclaimed = 0;
@@ -333,44 +353,34 @@ export class TripleStoreAsyncPromoteQueue implements AsyncPromoteQueue {
       const expiresAt = job.lease?.expiresAt ?? 0;
       if (expiresAt > now) continue; // lease still valid; worker is fine
 
-      if (job.commitMarker?.swmInserted) {
-        // RFC §4.4: partial-promote ambiguity. SWM already has the data;
-        // re-running would double-gossip and could leave WM in an
-        // inconsistent state. Park for operator inspection.
-        const abandonedJob: PromoteJob = {
-          ...job,
-          state: 'failed',
-          updatedAt: now,
-          reason: 'partial promote ambiguity: lease expired after SWM insert; needs operator inspection',
-          lease: undefined,
-          attempt: {
-            count: job.attempt.count,
-            maxRetries: job.attempt.maxRetries,
-            lastError: {
-              message: 'Worker crashed after SWM insert; recovery aborted to prevent duplicate gossip',
-              retryable: false,
-              classification: 'fatal',
-              recordedAt: now,
-            },
-          },
-        };
-        await this.writeJob(abandonedJob);
+      const conflicting = await this.findActiveByUniquenessKey(uniquenessKey(job.request), job.jobId);
+      if (conflicting) {
+        await this.abandonStartupRecovery(
+          job,
+          now,
+          `recovery conflict: active promote job ${conflicting.jobId} already owns this assertion`,
+          `Startup recovery found active promote job ${conflicting.jobId} for the same assertion`,
+        );
         abandoned += 1;
         continue;
       }
 
-      // Safe to rerun: nothing landed in SWM yet, so a fresh attempt is idempotent.
-      const requeued: PromoteJob = {
-        ...job,
-        state: 'queued',
-        updatedAt: now,
-        lease: undefined,
-        // Preserve attempt count — this is a recovery, not a normal retry.
-        // The job will be picked up immediately by the next claimNext().
-        commitMarker: undefined,
-      };
-      await this.writeJob(requeued);
-      reclaimed += 1;
+      // The worker records `swmInserted` only after `assertionPromote()`
+      // returns. A crash with the marker still false may have happened before
+      // promote started, or after the internal SWM write but before the marker
+      // write. Without a stronger on-store reconciliation signal, rerun is
+      // unsafe.
+      await this.abandonStartupRecovery(
+        job,
+        now,
+        job.commitMarker?.swmInserted
+          ? 'partial promote ambiguity: lease expired after SWM insert; needs operator inspection'
+          : 'partial promote ambiguity: lease expired before durable SWM marker; needs operator inspection',
+        job.commitMarker?.swmInserted
+          ? 'Worker crashed after SWM insert; recovery aborted to prevent duplicate gossip'
+          : 'Worker crashed during promote with no durable commit marker; recovery aborted because SWM state is ambiguous',
+      );
+      abandoned += 1;
     }
 
     return { reclaimed, abandoned };
@@ -409,6 +419,9 @@ export class TripleStoreAsyncPromoteQueue implements AsyncPromoteQueue {
       throw new Error('entities must be either "all" or an array of URIs');
     }
     if (Array.isArray(request.entities)) {
+      if (request.entities.length === 0) {
+        throw new Error('entities array must not be empty; use "all" to promote every root');
+      }
       for (const e of request.entities) {
         if (typeof e !== 'string' || e.length === 0) {
           throw new Error('entities array must contain non-empty strings');
@@ -483,16 +496,57 @@ export class TripleStoreAsyncPromoteQueue implements AsyncPromoteQueue {
     }
   }
 
-  private async findActiveByUniquenessKey(key: string): Promise<PromoteJob | null> {
+  private async assertNoActiveConflict(
+    request: Pick<PromoteRequest, 'contextGraphId' | 'subGraphName' | 'assertionName'>,
+    excludeJobId?: string,
+  ): Promise<void> {
+    const existing = await this.findActiveByUniquenessKey(uniquenessKey(request), excludeJobId);
+    if (existing) {
+      throw new PromoteJobConflictError(existing.jobId, {
+        contextGraphId: request.contextGraphId,
+        subGraphName: request.subGraphName,
+        assertionName: request.assertionName,
+      });
+    }
+  }
+
+  private async findActiveByUniquenessKey(key: string, excludeJobId?: string): Promise<PromoteJob | null> {
     const result = await this.store.query(
       `SELECT ?payload WHERE { GRAPH <${this.graphUri}> { ?job <${PROMOTE_UNIQUENESS_KEY}> ${literal(key)} ; <${PROMOTE_PAYLOAD}> ?payload . } }`,
     );
     const rows = expectBindings(result);
     for (const row of rows) {
       const job = parseJobPayload(row['payload']);
+      if (job?.jobId === excludeJobId) continue;
       if (job && ACTIVE_PROMOTE_STATES.includes(job.state)) return job;
     }
     return null;
+  }
+
+  private async abandonStartupRecovery(
+    job: PromoteJob,
+    now: number,
+    reason: string,
+    message: string,
+  ): Promise<void> {
+    const abandonedJob: PromoteJob = {
+      ...job,
+      state: 'failed',
+      updatedAt: now,
+      reason,
+      lease: undefined,
+      attempt: {
+        count: job.attempt.count,
+        maxRetries: job.attempt.maxRetries,
+        lastError: {
+          message,
+          retryable: false,
+          classification: 'fatal',
+          recordedAt: now,
+        },
+      },
+    };
+    await this.writeJob(abandonedJob);
   }
 
   private async activeUniquenessKeys(state: PromoteJobState): Promise<Set<string>> {
@@ -515,25 +569,26 @@ export class TripleStoreAsyncPromoteQueue implements AsyncPromoteQueue {
   }
 
   /**
-   * In-process mutex so concurrent `claimNext` calls don't race the
-   * "pick oldest queued" SPARQL query. Mirrors
-   * `AsyncLiftPublisher.withClaimLock`.
+   * In-process mutex so concurrent queue mutations don't race the
+   * uniqueness/read-then-write SPARQL flow. Mirrors
+   * `AsyncLiftPublisher.withClaimLock`, widened from worker claims to
+   * all operations that can activate a uniqueness key.
    */
-  private async withClaimLock<T>(fn: () => Promise<T>): Promise<T> {
-    const previous = TripleStoreAsyncPromoteQueue.claimQueues.get(this.graphUri) ?? Promise.resolve();
+  private async withMutationLock<T>(fn: () => Promise<T>): Promise<T> {
+    const previous = TripleStoreAsyncPromoteQueue.mutationQueues.get(this.graphUri) ?? Promise.resolve();
     let release!: () => void;
     const next = new Promise<void>((resolve) => {
       release = resolve;
     });
-    TripleStoreAsyncPromoteQueue.claimQueues.set(this.graphUri, next);
+    TripleStoreAsyncPromoteQueue.mutationQueues.set(this.graphUri, next);
 
     await previous;
     try {
       return await fn();
     } finally {
       release();
-      if (TripleStoreAsyncPromoteQueue.claimQueues.get(this.graphUri) === next) {
-        TripleStoreAsyncPromoteQueue.claimQueues.delete(this.graphUri);
+      if (TripleStoreAsyncPromoteQueue.mutationQueues.get(this.graphUri) === next) {
+        TripleStoreAsyncPromoteQueue.mutationQueues.delete(this.graphUri);
       }
     }
   }

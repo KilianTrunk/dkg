@@ -40,7 +40,7 @@ specific divergence.
 | ID generation | `config.idGenerator ?? () => crypto.randomUUID()` | Reuse |
 | Time source | `config.now ?? () => Date.now()` | Reuse — tests need deterministic time |
 | Pause/resume | Boolean flag stops `claimNext` from picking new work | Reuse |
-| Recovery | On startup, lease-expired `claimed` jobs are reset to `accepted` | Reuse — RFC §4.4 lease-expiry-only recovery (no "mark running → queued + exit") |
+| Recovery | On startup, lease-expired `claimed` jobs are reset to `accepted` | Diverge: expired `running` promotes are parked for operator inspection unless a future reconciler can prove no SWM side effect happened |
 
 ## 2. Differences from AsyncLiftPublisher
 
@@ -65,16 +65,17 @@ specific divergence.
 
 4. **Single recovery resolver, no chain.** AsyncLift has a
    `chainRecoveryResolver` for `broadcast/included` → on-chain lookup
-   reconciliation. Promote has no chain interaction; recovery is purely
-   "did this assertion already make it to SWM?" via a SPARQL count on
-   the SWM graph.
+   reconciliation. Promote has no chain interaction; v1 therefore parks
+   expired running attempts as ambiguous instead of guessing from a stale
+   marker or an imprecise SWM graph probe.
 
 5. **Idempotency story.** `agent.publisher.assertionPromote` writes
    SWM, mutates WM cleanup, and stamps lifecycle metadata in three
    separate stages (see `packages/publisher/src/dkg-publisher.ts` L3102).
-   The RFC §4.4 attempt commit marker handles partial commits; this is
-   the **single biggest implementation risk** and gets its own section
-   below (§7).
+   The RFC §4.4 attempt commit marker is operator-facing evidence for
+   partial commits; automatic rerun waits for a stronger idempotency hook
+   or on-store reconciler. This is the **single biggest implementation
+   risk** and gets its own section below (§7).
 
 ## 3. File layout
 
@@ -151,9 +152,8 @@ export interface PromoteJob {
   };
   // RFC §4.4 attempt commit marker — written after `assertionPromote`
   // returns successfully but BEFORE the job row is moved to `succeeded`.
-  // Recovery checks this on `running` jobs to distinguish "crashed
-  // before SWM write" from "crashed after SWM write but before status
-  // update".
+  // Recovery uses this as operator-facing evidence, not as proof that an
+  // unmarked expired attempt is safe to rerun.
   commitMarker?: {
     swmInserted: boolean;
     wmCleaned: boolean;
@@ -237,7 +237,7 @@ are green.
 | 23 | `recover(jobId)` on 'failed' resets attempt counter and moves to 'queued' | §3.4 explicit recover |
 | 24 | `recover(jobId)` on non-'failed' state rejects with 400 | §3.4 |
 | 25 | `recoverOnStartup() abandons claimed jobs whose lease expired more than 2× lease ago` | §4.4 lease-expiry |
-| 26 | `recoverOnStartup() requeues claimed jobs whose lease expired recently AND commitMarker.swmInserted=false` | §4.4 safe rerun |
+| 26 | `recoverOnStartup() parks expired claimed jobs even when commitMarker.swmInserted=false` | §4.4 ambiguous crash window |
 | 27 | `recoverOnStartup() parks claimed jobs whose lease expired recently AND commitMarker.swmInserted=true into 'failed' with reason="partial promote ambiguity"` | §4.4 unsafe rerun |
 | 28 | `recoverOnStartup() returns counts of {reclaimed, abandoned}` | §4.4 observability |
 | 29 | `getStats() returns the queue depth per state` | observability |

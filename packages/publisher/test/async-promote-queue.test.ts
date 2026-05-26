@@ -15,6 +15,14 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { OxigraphStore } from '@origintrail-official/dkg-storage';
 import {
+  DEFAULT_PROMOTE_CONTROL_GRAPH_URI,
+  PROMOTE_PAYLOAD,
+  PROMOTE_STATE,
+  literal,
+  serializeJob,
+  uniquenessKey,
+} from '../src/async-promote-queue-utils.js';
+import {
   PROMOTE_JOB_STATES,
   PromoteJobConflictError,
   PromoteJobLeaseError,
@@ -82,6 +90,7 @@ describe('TripleStoreAsyncPromoteQueue', () => {
     const queue = createQueue();
     await expect(queue.enqueue(makeRequest({ assertionName: '' }))).rejects.toThrow(/assertionName/);
     await expect(queue.enqueue(makeRequest({ contextGraphId: '' }))).rejects.toThrow(/contextGraphId/);
+    await expect(queue.enqueue(makeRequest({ entities: [] }))).rejects.toThrow(/entities array must not be empty/);
   });
 
   it('3. enqueue() rejects with PromoteJobConflictError when (cgId, subGraphName, assertionName) has an active job', async () => {
@@ -101,6 +110,21 @@ describe('TripleStoreAsyncPromoteQueue', () => {
     expect(third).toBe('job-3');
   });
 
+  it('3b. enqueue() serialises concurrent uniqueness checks for the same assertion', async () => {
+    const queue = createQueue();
+    const attempts = await Promise.allSettled([
+      queue.enqueue(makeRequest()),
+      queue.enqueue(makeRequest()),
+    ]);
+
+    const fulfilled = attempts.filter((r): r is PromiseFulfilledResult<string> => r.status === 'fulfilled');
+    const rejected = attempts.filter((r): r is PromiseRejectedResult => r.status === 'rejected');
+    expect(fulfilled.length).toBe(1);
+    expect(rejected.length).toBe(1);
+    expect(rejected[0]!.reason).toBeInstanceOf(PromoteJobConflictError);
+    expect((await queue.list()).filter((j) => uniquenessKey(j.request) === uniquenessKey(makeRequest()))).toHaveLength(1);
+  });
+
   // ---------------------------------------------------------------------------
   // §3.2 getStatus
   // ---------------------------------------------------------------------------
@@ -117,6 +141,7 @@ describe('TripleStoreAsyncPromoteQueue', () => {
     expect(claimed?.jobId).toBe(jobId);
     expect(claimed?.state).toBe('running');
     expect(claimed?.lease?.workerId).toBe('worker-1');
+    expect(claimed?.attempt.count).toBe(1);
 
     const fetched = await queue.getStatus(jobId);
     expect(fetched).toEqual(claimed);
@@ -156,6 +181,18 @@ describe('TripleStoreAsyncPromoteQueue', () => {
     expect(cg1.every((j) => j.request.contextGraphId === 'cg-1')).toBe(true);
   });
 
+  it('7b. list({limit}) slices after deterministic queue ordering', async () => {
+    const queue = createQueue();
+    await queue.enqueue(makeRequest({ assertionName: 'oldest' }));
+    advance(10);
+    await queue.enqueue(makeRequest({ assertionName: 'middle' }));
+    advance(10);
+    await queue.enqueue(makeRequest({ assertionName: 'newest' }));
+
+    const limited = await queue.list({ limit: 2 });
+    expect(limited.map((j) => j.request.assertionName)).toEqual(['oldest', 'middle']);
+  });
+
   // ---------------------------------------------------------------------------
   // §3.4 cancel / recover
   // ---------------------------------------------------------------------------
@@ -179,6 +216,21 @@ describe('TripleStoreAsyncPromoteQueue', () => {
     await expect(queue.cancel(jobId)).rejects.toThrow(/running/);
   });
 
+  it('9b. cancel() on `failed_retrying` rejects so transient failures keep their retry budget', async () => {
+    const queue = createQueue({ backoff: () => 1_000 });
+    const jobId = await queue.enqueue(makeRequest());
+    const claimed = await queue.claimNext('worker-1');
+    await queue.fail(jobId, claimed!.lease!.claimToken, {
+      message: 'transient blip',
+      retryable: true,
+      classification: 'transient',
+      recordedAt: now,
+    });
+
+    await expect(queue.cancel(jobId)).rejects.toThrow(/failed_retrying/);
+    expect((await queue.getStatus(jobId))?.state).toBe('failed_retrying');
+  });
+
   // ---------------------------------------------------------------------------
   // §4.3 claimNext / lease
   // ---------------------------------------------------------------------------
@@ -192,6 +244,7 @@ describe('TripleStoreAsyncPromoteQueue', () => {
     const claimed = await queue.claimNext('worker-1');
     expect(claimed?.jobId).toBe(first);
     expect(claimed?.state).toBe('running');
+    expect(claimed?.attempt.count).toBe(1);
     expect(claimed?.lease).toBeDefined();
     expect(claimed?.lease?.workerId).toBe('worker-1');
     expect(claimed?.lease?.expiresAt).toBe(now + 60_000);
@@ -381,7 +434,60 @@ describe('TripleStoreAsyncPromoteQueue', () => {
     const reclaim = await queue.claimNext('worker-1');
     expect(reclaim?.jobId).toBe(jobId);
     expect(reclaim?.state).toBe('running');
-    expect(reclaim?.attempt.count).toBe(1);
+    expect(reclaim?.attempt.count).toBe(2);
+  });
+
+  it('21a. claimNext() increments attempt count before a retry can succeed', async () => {
+    const queue = createQueue({ backoff: () => 0 });
+    const jobId = await queue.enqueue(makeRequest());
+    const first = await queue.claimNext('worker-1');
+    await queue.fail(jobId, first!.lease!.claimToken, {
+      message: 'first attempt failed',
+      retryable: true,
+      classification: 'transient',
+      recordedAt: now,
+    });
+
+    const retry = await queue.claimNext('worker-1');
+    expect(retry?.attempt.count).toBe(2);
+    await queue.recordCommitMarker(jobId, retry!.lease!.claimToken, 'swmInserted');
+    await queue.succeed(jobId, retry!.lease!.claimToken, { promotedCount: 1, succeededAt: now });
+
+    const job = await queue.getStatus(jobId);
+    expect(job?.state).toBe('succeeded');
+    expect(job?.attempt.count).toBe(2);
+  });
+
+  it('21b. claimNext() generates a fresh claim token when the same worker reclaims the same job in the same millisecond', async () => {
+    const queue = createQueue({ backoff: () => 0 });
+    const jobId = await queue.enqueue(makeRequest());
+    const firstClaim = await queue.claimNext('worker-1');
+    const firstToken = firstClaim!.lease!.claimToken;
+
+    await queue.fail(jobId, firstToken, {
+      message: 'retry immediately',
+      retryable: true,
+      classification: 'transient',
+      recordedAt: now,
+    });
+
+    const secondClaim = await queue.claimNext('worker-1');
+    const secondToken = secondClaim!.lease!.claimToken;
+    expect(secondToken).not.toBe(firstToken);
+    await expect(queue.heartbeat(jobId, firstToken)).rejects.toBeInstanceOf(PromoteJobLeaseError);
+  });
+
+  it('21c. claimNext() reconciles expired running jobs before scanning candidates', async () => {
+    const queue = createQueue({ leaseMs: 10_000 });
+    const jobId = await queue.enqueue(makeRequest());
+    await queue.claimNext('worker-1');
+    advance(60_000);
+
+    expect(await queue.claimNext('worker-2')).toBeNull();
+    expect((await queue.getStatus(jobId))?.state).toBe('failed');
+
+    const replacement = await queue.enqueue(makeRequest());
+    expect(replacement).toBe('job-2');
   });
 
   it('22. claimNext() does NOT pick up failed_retrying before nextRetryAt', async () => {
@@ -397,6 +503,25 @@ describe('TripleStoreAsyncPromoteQueue', () => {
 
     advance(30_000);
     expect(await queue.claimNext('worker-1')).toBeNull();
+  });
+
+  it('22b. fail() treats retryable errors after swmInserted as terminal operator-recovery cases', async () => {
+    const queue = createQueue({ backoff: () => 1_000 });
+    const jobId = await queue.enqueue(makeRequest());
+    const claimed = await queue.claimNext('worker-1');
+    await queue.recordCommitMarker(jobId, claimed!.lease!.claimToken, 'swmInserted');
+
+    await queue.fail(jobId, claimed!.lease!.claimToken, {
+      message: 'network dropped after SWM insert',
+      retryable: true,
+      classification: 'transient',
+      recordedAt: now,
+    });
+
+    const job = await queue.getStatus(jobId);
+    expect(job?.state).toBe('failed');
+    expect(job?.attempt.nextRetryAt).toBeUndefined();
+    expect(job?.reason).toMatch(/SWM insert/i);
   });
 
   // ---------------------------------------------------------------------------
@@ -428,6 +553,20 @@ describe('TripleStoreAsyncPromoteQueue', () => {
     await expect(queue.recover(jobId)).rejects.toThrow(/running/);
   });
 
+  it('24b. recover(jobId) rejects when another active job already owns the assertion', async () => {
+    const queue = createQueue();
+    const first = await queue.enqueue(makeRequest());
+    await queue.cancel(first);
+    const second = await queue.enqueue(makeRequest());
+
+    await expect(queue.recover(first)).rejects.toMatchObject({
+      name: 'PromoteJobConflictError',
+      existingJobId: second,
+    });
+    expect((await queue.getStatus(first))?.state).toBe('failed');
+    expect((await queue.getStatus(second))?.state).toBe('queued');
+  });
+
   it('25. recoverOnStartup() abandons running jobs whose lease expired AND swmInserted=true (partial-promote ambiguity)', async () => {
     const queue = createQueue({ leaseMs: 10_000 });
     const jobId = await queue.enqueue(makeRequest());
@@ -446,22 +585,23 @@ describe('TripleStoreAsyncPromoteQueue', () => {
     expect(job?.lease).toBeUndefined();
   });
 
-  it('26. recoverOnStartup() requeues running jobs whose lease expired AND swmInserted=false', async () => {
+  it('26. recoverOnStartup() abandons expired running jobs even when swmInserted=false', async () => {
     const queue = createQueue({ leaseMs: 10_000 });
     const jobId = await queue.enqueue(makeRequest());
     await queue.claimNext('worker-1');
-    // No commit marker recorded — worker crashed before assertionPromote returned.
+    // No commit marker recorded. That could mean the worker crashed before
+    // assertionPromote started, or after the internal SWM write and before the
+    // marker write, so automatic rerun is unsafe.
 
     advance(60_000);
     const summary = await queue.recoverOnStartup();
 
-    expect(summary.reclaimed).toBe(1);
-    expect(summary.abandoned).toBe(0);
+    expect(summary.reclaimed).toBe(0);
+    expect(summary.abandoned).toBe(1);
     const job = await queue.getStatus(jobId);
-    expect(job?.state).toBe('queued');
+    expect(job?.state).toBe('failed');
+    expect(job?.reason).toMatch(/partial promote ambiguity/i);
     expect(job?.lease).toBeUndefined();
-    // Attempt counter preserved — this is a recovery, not a normal retry.
-    expect(job?.attempt.count).toBe(0);
   });
 
   it('27. recoverOnStartup() leaves `running` jobs alone when the lease is still valid', async () => {
@@ -479,6 +619,35 @@ describe('TripleStoreAsyncPromoteQueue', () => {
     expect(job?.lease).toBeDefined();
   });
 
+  it('27b. recoverOnStartup() abandons expired running jobs when another active job has the same assertion', async () => {
+    const queue = createQueue({ leaseMs: 10_000 });
+    const jobId = await queue.enqueue(makeRequest());
+    const claimed = await queue.claimNext('worker-1');
+
+    await store.insert(
+      serializeJob(
+        {
+          jobId: 'corrupt-duplicate',
+          request: makeRequest(),
+          state: 'queued',
+          enqueuedAt: now,
+          updatedAt: now,
+          attempt: { count: 0, maxRetries: 5 },
+        },
+        DEFAULT_PROMOTE_CONTROL_GRAPH_URI,
+      ),
+    );
+
+    advance(60_000);
+    const summary = await queue.recoverOnStartup();
+    expect(summary.reclaimed).toBe(0);
+    expect(summary.abandoned).toBe(1);
+    expect((await queue.getStatus(jobId))?.state).toBe('failed');
+    expect((await queue.getStatus(jobId))?.reason).toMatch(/recovery conflict/i);
+    expect((await queue.getStatus('corrupt-duplicate'))?.state).toBe('queued');
+    expect(claimed?.state).toBe('running');
+  });
+
   it('28. recoverOnStartup() returns counts of {reclaimed, abandoned}', async () => {
     const queue = createQueue({ leaseMs: 10_000 });
     const ids: string[] = [];
@@ -494,8 +663,8 @@ describe('TripleStoreAsyncPromoteQueue', () => {
 
     advance(60_000);
     const summary = await queue.recoverOnStartup();
-    expect(summary.abandoned).toBe(2);
-    expect(summary.reclaimed).toBe(2);
+    expect(summary.abandoned).toBe(4);
+    expect(summary.reclaimed).toBe(0);
   });
 
   // ---------------------------------------------------------------------------
@@ -552,7 +721,7 @@ describe('TripleStoreAsyncPromoteQueue', () => {
     // The good token still works.
     await queue.recordCommitMarker(jobId, goodToken, 'swmInserted');
 
-    // A stale token (e.g. another worker reclaimed after lease expiry) — all
+    // A stale token (e.g. another worker reclaimed after retry backoff) — all
     // four lease-protected ops reject.
     await expect(queue.recordCommitMarker(jobId, 'stale', 'wmCleaned')).rejects.toBeInstanceOf(PromoteJobLeaseError);
     await expect(queue.heartbeat(jobId, 'stale')).rejects.toBeInstanceOf(PromoteJobLeaseError);
@@ -562,6 +731,23 @@ describe('TripleStoreAsyncPromoteQueue', () => {
     await expect(
       queue.succeed(jobId, 'stale', { promotedCount: 1, succeededAt: now }),
     ).rejects.toBeInstanceOf(PromoteJobLeaseError);
+  });
+
+  it('31b. concurrent heartbeat and succeed transitions cannot resurrect a succeeded job', async () => {
+    const queue = createQueue({ leaseMs: 60_000 });
+    const jobId = await queue.enqueue(makeRequest());
+    const claimed = await queue.claimNext('worker-1');
+    const token = claimed!.lease!.claimToken;
+    await queue.recordCommitMarker(jobId, token, 'swmInserted');
+
+    await Promise.allSettled([
+      queue.heartbeat(jobId, token),
+      queue.succeed(jobId, token, { promotedCount: 1, succeededAt: now }),
+    ]);
+
+    const job = await queue.getStatus(jobId);
+    expect(job?.state).toBe('succeeded');
+    expect(job?.lease).toBeUndefined();
   });
 
   // ---------------------------------------------------------------------------
@@ -616,5 +802,27 @@ describe('TripleStoreAsyncPromoteQueue', () => {
 
     const all = await queue.list();
     expect(all.length).toBe(3);
+  });
+
+  it('33. list() skips corrupted payload rows with missing nested fields', async () => {
+    const queue = createQueue();
+    await queue.enqueue(makeRequest({ assertionName: 'valid' }));
+    await store.insert([
+      {
+        subject: 'urn:dkg:promote-queue:job:corrupt',
+        predicate: PROMOTE_STATE,
+        object: literal('queued'),
+        graph: DEFAULT_PROMOTE_CONTROL_GRAPH_URI,
+      },
+      {
+        subject: 'urn:dkg:promote-queue:job:corrupt',
+        predicate: PROMOTE_PAYLOAD,
+        object: literal(JSON.stringify({ jobId: 'corrupt', state: 'queued' })),
+        graph: DEFAULT_PROMOTE_CONTROL_GRAPH_URI,
+      },
+    ]);
+
+    const jobs = await queue.list();
+    expect(jobs.map((j) => j.request.assertionName)).toEqual(['valid']);
   });
 });

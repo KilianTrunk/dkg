@@ -28,6 +28,7 @@ export default defineConfig({
           'test/core-prereq-check.test.ts',
           'test/relay-status-block.test.ts',
           'test/supervisor-liveness.test.ts',
+          'test/promote-async-routes.test.ts',
         ],
     testTimeout: runsDaemonHttpBehavior ? 120_000 : 60_000,
     globalSetup: runsDaemonHttpBehavior ? ['../chain/test/hardhat-global-setup.ts'] : [],

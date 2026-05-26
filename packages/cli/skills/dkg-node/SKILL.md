@@ -146,6 +146,8 @@ Drop to HTTP when the operation isn't in the table — participant self-service 
 
 P2P tools fail gracefully when the peer is offline. `dkg_publish` (fresh quads + write + publish, two HTTP calls) and `dkg_shared_memory_publish` (publish existing SWM, one HTTP call) differ in intent: use the two-call helper for "I have quads, publish now"; use the canonical finalizer as step 4 of the stepwise write → promote → publish flow. `dkg_share` is a direct SWM convenience helper for quick team-visible notes, not a replacement for assertion lifecycle tracking.
 
+**Bulk imports (>5,000 quads in one logical operation):** the per-call `dkg_assertion_*` loop IS the chunked-write API; there is no `/api/import/bulk`. Keep `/api/assertion/<name>/write` payloads under the 10 MB body cap, keep `/api/assertion/<name>/promote` payloads under the 256 KB body cap, and remember that promotion can still fail at the 10 MB gossip-message cap even when the HTTP body is small. For multi-part imports, write a resumable manifest in the `meta` sub-graph (`scripts/lib/manifest.mjs` is the canonical helper), promote import roots in size-aware batches, and halve/retry on 413 rather than restarting the whole import. Source checkouts also include the expanded guide at `packages/cli/skills/dkg-importer/SKILL.md`; installed agents should treat this paragraph as the portable minimum contract.
+
 ### HTTP-only operations (no tool wrapper)
 
 - **Participant self-service join/sign flow** — see §6.

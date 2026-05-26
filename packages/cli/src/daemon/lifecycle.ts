@@ -671,6 +671,12 @@ export async function runDaemonInner(
     nodeRole: role,
     relayServerCapacity: config.relayServerCapacity,
     relayReservationCount: config.relayReservationCount,
+    // `dkg/<semver>` convention: broadcast our release on every libp2p
+    // identify exchange so remote operators can answer "which DKG
+    // release is each peer running?" via /api/peer-info instead of
+    // having to guess from contract registrations. Travels the wire
+    // as libp2p's `AgentVersion` PB field (their naming, not ours).
+    nodeVersion: `dkg/${nodeVersion}`,
     syncContextGraphs: syncContextGraphs,
     storeConfig: config.store ? {
       backend: config.store.backend,

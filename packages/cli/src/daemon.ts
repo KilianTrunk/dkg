@@ -19,3 +19,4 @@ export * from './daemon/hermes.js';
 export * from './daemon/local-agents.js';
 export * from './daemon/lifecycle.js';
 export * from './daemon/handle-request.js';
+export * from './daemon/shutdown.js';

@@ -201,22 +201,21 @@ describe('checkCoreRelayPrereqs — 7 canonical cases from the plan', () => {
     expect(result.nonRoutableAddresses[0].class).toBe('ulaIpv6');
   });
 
-  it('case 7: DNS-only listen + public announce rescues the result', () => {
-    // The VPS-with-static-IP case: listen via `/dns4/relay.origintrail.io/...` because
-    // the operator wants to point clients at a stable name, then announce the
-    // resolved public IP separately. Either side alone would not classify as
-    // public, but the public announceAddresses entry rescues the verdict.
+  it('case 7: DNS-only listen + public announce stays degraded without listener reachability evidence', () => {
+    // DNS listen multiaddrs are intentionally not resolved by the pure checker.
+    // A public announce IP does not prove the DNS-bound socket is listening on
+    // a public or NAT-forwarded local interface.
     const result = checkCoreRelayPrereqs({
       listenAddresses: ['/dns4/relay.origintrail.io/tcp/4001'],
       hostInterfaces: [RFC1918_IFACE],
       announceAddresses: ['/ip4/8.8.8.8/tcp/4001'],
       nodeRole: 'core',
     });
-    expect(result.looksDegraded).toBe(false);
+    expect(result.looksDegraded).toBe(true);
     expect(result.nonRoutableAddresses[0].class).toBe('dns');
   });
 
-  it('DNS announce rescues a private bound listener for stable public-DNS deployments', () => {
+  it('DNS announce does not rescue a private bound listener without DNS resolution evidence', () => {
     const result = checkCoreRelayPrereqs({
       listenAddresses: ['/ip4/192.168.1.1/tcp/4001'],
       hostInterfaces: [RFC1918_IFACE],
@@ -224,20 +223,44 @@ describe('checkCoreRelayPrereqs — 7 canonical cases from the plan', () => {
       nodeRole: 'core',
     });
 
-    expect(result.looksDegraded).toBe(false);
+    expect(result.looksDegraded).toBe(true);
     expect(result.nonRoutableAddresses[0].class).toBe('rfc1918');
   });
 
-  it('public announce can rescue an unresolved wildcard pre-start listener', () => {
+  it('literal public announce can rescue an unresolved wildcard pre-start listener', () => {
     const result = checkCoreRelayPrereqs({
       listenAddresses: ['/ip4/0.0.0.0/tcp/4001'],
       hostInterfaces: [],
-      announceAddresses: ['/dnsaddr/relay.origintrail.io'],
+      announceAddresses: ['/ip4/8.8.8.8/tcp/4001'],
       nodeRole: 'core',
     });
 
     expect(result.looksDegraded).toBe(false);
     expect(result.nonRoutableAddresses[0].class).toBe('wildcardNoPublicInterface');
+  });
+
+  it('literal public announce does not rescue CGNAT-only listeners', () => {
+    const result = checkCoreRelayPrereqs({
+      listenAddresses: ['/ip4/100.99.142.87/tcp/4001'],
+      hostInterfaces: [TAILSCALE_IFACE],
+      announceAddresses: ['/ip4/8.8.8.8/tcp/4001'],
+      nodeRole: 'core',
+    });
+
+    expect(result.looksDegraded).toBe(true);
+    expect(result.nonRoutableAddresses[0].class).toBe('cgnat');
+  });
+
+  it('literal public announce does not rescue ULA-only IPv6 listeners', () => {
+    const result = checkCoreRelayPrereqs({
+      listenAddresses: ['/ip6/fdab:cdef::1/tcp/4001'],
+      hostInterfaces: [],
+      announceAddresses: ['/ip4/8.8.8.8/tcp/4001'],
+      nodeRole: 'core',
+    });
+
+    expect(result.looksDegraded).toBe(true);
+    expect(result.nonRoutableAddresses[0].class).toBe('ulaIpv6');
   });
 });
 
@@ -329,7 +352,7 @@ describe('checkCoreRelayPrereqs — additional safety cases', () => {
       nodeRole: 'core',
     });
     expect(result.looksDegraded).toBe(true);
-    expect(result.reasons.some((r) => r.includes('announceAddress') && r.includes('none classify as public or public DNS'))).toBe(true);
+    expect(result.reasons.some((r) => r.includes('announceAddress') && r.includes('none classify as a literal public IP'))).toBe(true);
   });
 
   it('reserved DNS announce names do not rescue private listeners', () => {

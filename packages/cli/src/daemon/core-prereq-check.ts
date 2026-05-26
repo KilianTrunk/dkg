@@ -43,9 +43,9 @@
  * link-local → ULAv6 — so a more-specific class wins over a less-specific
  * one. DNS multiaddrs deliberately classify as `dns` rather than resolving at
  * boot (DNS resolution is async + flaky + the answer can change). DNS listen
- * addresses are not themselves proof of public reachability, but externally
- * routable DNS announce addresses can rescue an otherwise private/wildcard
- * binding because the operator is explicitly advertising a stable name.
+ * addresses are not themselves proof of public reachability, and unresolved
+ * DNS announce addresses do not rescue a degraded listener: this pure checker
+ * only trusts literal public IP announce addresses.
  */
 
 import { isIP } from 'node:net';
@@ -71,12 +71,11 @@ export interface CorePrereqResult {
   nonRoutableAddresses: Array<{ addr: string; class: AddrClassification }>;
   /**
    * True iff `publicListenAddresses` is empty AND no `announceAddresses` entry
-   * can rescue the result. Operators with public DNS announce addresses (the
-   * VPS-with-static-IP case) are not degraded when they still have at least
-   * one bound listen address, even if that listen address is a wildcard /
-   * non-routable address. A node with zero bound listen addresses is always
-   * degraded: an announce address cannot make an unbound transport serve
-   * relay traffic.
+   * can rescue the result. Operators with literal public announce addresses
+   * (the VPS-with-static-IP case) are not degraded when they still have at
+   * least one bound wildcard / private-LAN listen address. A node with zero
+   * bound listen addresses is always degraded: an announce address cannot make
+   * an unbound transport serve relay traffic.
    */
   looksDegraded: boolean;
   /**
@@ -107,8 +106,10 @@ export interface CheckCoreRelayPrereqsOpts {
   /**
    * Optional multiaddrs the daemon advertises to the network (the VPS /
    * cloud case where the public IP isn't bound to a local interface).
-   * A public announce address rescues an otherwise-degraded result only when
-   * the node also has at least one bound listen address.
+   * A literal public-IP announce address rescues an otherwise-degraded result
+   * only when the node also has at least one wildcard/private-LAN listener.
+   * DNS announce addresses are intentionally not resolved in this pure check,
+   * so they do not count as public evidence here.
    */
   announceAddresses?: string[];
   /**
@@ -199,45 +200,12 @@ function classifyIPv6(ipRaw: string): AddrClassification {
   return 'public';
 }
 
-function dnsHostFromMultiaddr(addr: string): string | undefined {
-  const parts = addr.split('/').filter(Boolean);
-  const proto = parts[0];
-  if (proto !== 'dns' && proto !== 'dns4' && proto !== 'dns6' && proto !== 'dnsaddr') {
-    return undefined;
-  }
-  return parts[1];
-}
-
-function isPublicDnsHostname(hostRaw: string | undefined): boolean {
-  if (!hostRaw) return false;
-  const host = hostRaw.toLowerCase().replace(/\.$/, '');
-  if (!host || host === 'localhost') return false;
-  const ipFamily = isIP(host);
-  if (ipFamily === 4) return classifyIPv4(host) === 'public';
-  if (ipFamily === 6) return classifyIPv6(host) === 'public';
-  if (!host.includes('.')) return false;
-  if (!/^[a-z0-9-]+(?:\.[a-z0-9-]+)+$/.test(host)) return false;
-  return !(
-    host.endsWith('.local')
-    || host.endsWith('.internal')
-    || host.endsWith('.test')
-    || host.endsWith('.example')
-    || host.endsWith('.invalid')
-    || host.endsWith('.localhost')
-    || host.endsWith('.home.arpa')
-    || host.endsWith('.lan')
-    || host.endsWith('.cluster.local')
-  );
-}
-
 function isPublicAnnounceAddress(
   addr: string,
   hostInterfaces: ReadonlyArray<NetworkInterfaceInfo>,
 ): boolean {
   const klass = classifyMultiaddr(addr, hostInterfaces);
-  if (klass === 'public') return true;
-  if (klass !== 'dns') return false;
-  return isPublicDnsHostname(dnsHostFromMultiaddr(addr));
+  return klass === 'public';
 }
 
 /**
@@ -332,10 +300,7 @@ export function checkCoreRelayPrereqs(
 
   const announcePublic = announceAddresses.some((a) => isPublicAnnounceAddress(a, hostInterfaces));
   const announceCanServe = classified.some(
-    (c) => c.class === 'dns'
-      || c.class === 'rfc1918'
-      || c.class === 'cgnat'
-      || c.class === 'ulaIpv6'
+    (c) => c.class === 'rfc1918'
       || c.class === 'wildcardNoPublicInterface',
   );
   const announceRescues = announceCanServe && announcePublic;
@@ -366,7 +331,7 @@ export function checkCoreRelayPrereqs(
     }
     if (announceAddresses.length > 0 && !announcePublic) {
       reasons.push(
-        `${announceAddresses.length} announceAddress${announceAddresses.length === 1 ? '' : 'es'} present but none classify as public or public DNS`,
+        `${announceAddresses.length} announceAddress${announceAddresses.length === 1 ? '' : 'es'} present but none classify as a literal public IP`,
       );
     }
     if (announceAddresses.length === 0) {

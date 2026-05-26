@@ -96,6 +96,13 @@ const MOCK_EXEMPT_FROM_EVM = new Set<string>([
   'init',
   'requireV9',
   'getBlockTimestamp',
+  'broadcastSignedTransactionWithFailover',
+  'getTransactionReceiptWithFailover',
+  'waitForReceiptWithFailover',
+  'signPopulatedTransaction',
+  'sendSignedTransactionAndWait',
+  'sendPopulatedTransaction',
+  'sendContractTransaction',
   'parseV10PublishReceipt',
   'parseV9PublishReceipt',
   // Random Sampling (Slice 1) — TS-private helpers that survive into

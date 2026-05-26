@@ -66,8 +66,15 @@ function opaqueCustomErrorRevert(dataHex: string): Error {
 function adapterWithFakeNft(nftOverrides: Record<string, unknown>): EVMChainAdapter {
   const a = new EVMChainAdapter(minimalConfig());
   (a as any).init = async () => undefined;
+  const connected: Record<string, unknown> = {};
+  for (const [name, value] of Object.entries(nftOverrides)) {
+    connected[name] = typeof value === 'function'
+      ? { populateTransaction: (...args: unknown[]) => (value as (...args: unknown[]) => unknown)(...args) }
+      : value;
+  }
   (a as any).contracts.dkgPublishingConvictionNFT = {
     getAddress: async () => NFT_ADDRESS,
+    connect: () => connected,
     ...nftOverrides,
   };
   // Leave contracts.token undefined so the allowance/approve branch in

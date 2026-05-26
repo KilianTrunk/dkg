@@ -1,7 +1,7 @@
 import {
   DKGNode, ProtocolRouter, GossipSubManager, TypedEventBus, DKGEvent,
   LibP2PNetwork, PeerResolver, StubNetworkStateRegistry,
-  PROTOCOL_ACCESS, PROTOCOL_PUBLISH, PROTOCOL_SYNC, PROTOCOL_QUERY_REMOTE, PROTOCOL_STORAGE_ACK, PROTOCOL_VERIFY_PROPOSAL, PROTOCOL_JOIN_REQUEST,
+  PROTOCOL_ACCESS, PROTOCOL_PUBLISH, PROTOCOL_SYNC, PROTOCOL_QUERY_REMOTE, PROTOCOL_STORAGE_ACK, PROTOCOL_STORAGE_ACK_V2, PROTOCOL_VERIFY_PROPOSAL, PROTOCOL_JOIN_REQUEST,
   PROTOCOL_SWM_SENDER_KEY, PROTOCOL_SWM_UPDATE, PROTOCOL_SWM_SHARE_ACK, PROTOCOL_SWM_HOST_CATCHUP, PROTOCOL_MESSAGE,
   contextGraphPublishTopic, contextGraphWorkspaceTopic, contextGraphAppTopic, contextGraphUpdateTopic, contextGraphFinalizationTopic,
   contextGraphDataGraphUri, contextGraphMetaGraphUri, contextGraphWorkspaceGraphUri, contextGraphWorkspaceMetaGraphUri,
@@ -73,6 +73,9 @@ import {
   buildCiphertextChunksRoot,
   computeGossipSigningPayloadV2,
   GOSSIP_TYPE_WORKSPACE_PUBLISH_CHUNKED,
+  ciphertextChunkStoreGraph,
+  ciphertextChunkStoreSubject,
+  CIPHERTEXT_CHUNK_PREDICATE,
   type SubscriptionSource,
   SUBSCRIPTION_SOURCES,
   pickNetworkTunables,
@@ -1746,6 +1749,7 @@ export class DKGAgent {
                 // router.register under the hood (see Messenger.register
                 // implementation), so router.unregister still removes it.
                 this.router.unregister(PROTOCOL_STORAGE_ACK);
+                this.router.unregister(PROTOCOL_STORAGE_ACK_V2);
                 this.log.warn(
                   attemptCtx,
                   `Unregistered V10 StorageACK handler: signer ${ackSignerWallet.address} ` +
@@ -1819,6 +1823,20 @@ export class DKGAgent {
             // messenger.register handles envelope decode + receiver
             // dedup; ackHandler's signature stays the same.
             this.messenger.register(PROTOCOL_STORAGE_ACK, async (data, peerIdStr) => {
+              const peerId = { toString: () => peerIdStr, toBytes: () => new Uint8Array() };
+              return ackHandler.handler(data, peerId);
+            });
+            // OT-RFC-38 LU-11 / OT-RFC-39 — V2 protocol id. Same
+            // handler instance, distinct libp2p protocol. Publishers
+            // running the chunked emit path negotiate V2 explicitly
+            // so pre-LU-11 cores (V1-only) never see a V2 envelope;
+            // the handler dispatches on `intent.ackProtocolVersion`
+            // internally — V2 envelopes hit the chunked verify
+            // branch, V1 envelopes (if any ever arrive on the V2
+            // protocol id, which spec-conforming clients won't send)
+            // fall through to the legacy single-blob / public-CG
+            // paths.
+            this.messenger.register(PROTOCOL_STORAGE_ACK_V2, async (data, peerIdStr) => {
               const peerId = { toString: () => peerIdStr, toBytes: () => new Uint8Array() };
               return ackHandler.handler(data, peerId);
             });
@@ -9924,6 +9942,27 @@ export class DKGAgent {
     this.swmHostModeSubscribed.set(wireCgId, source);
     this.gossip.subscribe(swmTopic);
     const handler = (_topic: string, data: Uint8Array, from: string) => {
+      // OT-RFC-38 LU-11: peek envelope type and dispatch. Chunked
+      // envelopes (`type='share-write-chunked'`) take the V2 chunk
+      // persistence path; everything else flows through the legacy
+      // host-mode store unchanged. Failed decode falls through to
+      // `ingestSwmHostModeEnvelope` which is also defensive — the
+      // dispatch here is best-effort, not a security boundary.
+      let envelopeType: string | undefined;
+      try {
+        const peek = decodeGossipEnvelope(data);
+        envelopeType = peek?.type;
+      } catch { /* drop into legacy path */ }
+      if (envelopeType === GOSSIP_TYPE_WORKSPACE_PUBLISH_CHUNKED) {
+        this.ingestSwmCiphertextChunkEnvelope(contextGraphId, data, from).catch((err: unknown) => {
+          const msg = err instanceof Error ? err.message : String(err);
+          this.log.warn(
+            createOperationContext('system'),
+            `LU-11: chunked SWM ingest failed for "${contextGraphId}": ${msg}`,
+          );
+        });
+        return;
+      }
       this.ingestSwmHostModeEnvelope(contextGraphId, data, from).catch((err: unknown) => {
         const msg = err instanceof Error ? err.message : String(err);
         this.log.warn(
@@ -10256,6 +10295,119 @@ export class DKGAgent {
     this.log.debug(
       ctx,
       `Host-mode stored opaque SWM envelope cg=${storageCgId} seqno=${seqno} bytes=${data.length}`,
+    );
+  }
+
+  /**
+   * OT-RFC-38 LU-11 / OT-RFC-39 — chunked-ciphertext SWM ingest.
+   * Receives per-chunk SWM gossip envelopes
+   * (`type='share-write-chunked'`) that the publisher fans out via
+   * `_resolveEncryptInlineChunked`, verifies envelope authority
+   * against the curated CG's agent allowlist (same gate as the
+   * legacy host-mode store), strips the 32-byte `batchId` prefix
+   * from the payload, and persists the remaining ciphertext bytes
+   * under the deterministic chunk-store subject so the V2 ACK
+   * verifier can recompute the publisher's claimed
+   * `ciphertextChunksRoot` keyed by `(cgId, batchId, chunkIndex)`.
+   *
+   * Persistence model: one base64-encoded literal per chunk, in the
+   * per-CG named graph `ciphertextChunkStoreGraph(cgId)` under the
+   * subject `ciphertextChunkStoreSubject(batchId, chunkIndex)`. The
+   * store insert is idempotent — the same chunk arriving twice (or
+   * out of order) overwrites the existing triple harmlessly because
+   * `subject + predicate + graph` is unique.
+   *
+   * Late-join cores that come online after a publish has finalised
+   * end up here only opportunistically (if a peer's mesh re-floods
+   * the chunked envelope), which is unreliable; commit 7 adds the
+   * `GetCiphertextChunk` sync verb that pulls missing chunks
+   * explicitly via the protocol router.
+   */
+  private async ingestSwmCiphertextChunkEnvelope(
+    contextGraphId: string,
+    data: Uint8Array,
+    fromPeerId: string,
+  ): Promise<void> {
+    if (data.length === 0) return;
+    const ctx = createOperationContext('share');
+    let envelope: GossipEnvelopeMsg | undefined;
+    try {
+      envelope = decodeGossipEnvelope(data);
+    } catch {
+      return;
+    }
+    if (!envelope || envelope.type !== GOSSIP_TYPE_WORKSPACE_PUBLISH_CHUNKED) {
+      return;
+    }
+    if (envelope.payload.length <= 32) {
+      // Chunked payload format: [32-byte batchId][ciphertext...].
+      // Anything shorter can't carry a single ciphertext byte.
+      this.log.debug(
+        ctx,
+        `LU-11: ignoring chunked envelope on cg=${contextGraphId} from=${fromPeerId} with truncated payload (${envelope.payload.length} bytes)`,
+      );
+      return;
+    }
+    if (typeof envelope.swmMessageIndex !== 'number' || envelope.swmMessageIndex < 0) {
+      this.log.debug(
+        ctx,
+        `LU-11: ignoring chunked envelope on cg=${contextGraphId} with invalid swmMessageIndex=${envelope.swmMessageIndex}`,
+      );
+      return;
+    }
+
+    // Subscription CG-id can be either cleartext (operator / member
+    // path) or wire-form hash (chain-event auto-subscribe). Compare
+    // both sides in wire-form so any combination accepts.
+    const envelopeWireId = this.gossipWireIdFor(envelope.contextGraphId);
+    const subscriptionWireId = this.gossipWireIdFor(contextGraphId);
+    if (envelopeWireId !== subscriptionWireId) return;
+    const storageCgId = envelope.contextGraphId;
+
+    // Verify envelope signature against the curated CG's agent
+    // allowlist — exactly the same authority check the host-mode
+    // store uses; without it, any topic-reachable peer could plant
+    // arbitrary ciphertext under a victim's (cgId, batchId) keys.
+    const handlerSm = this.getOrCreateSharedMemoryHandler();
+    const verdict = await handlerSm.verifyHostModeEnvelopeAuthority(data, storageCgId, fromPeerId);
+    if (!verdict.accepted) {
+      // Same transient-race classification as the LU-6 host-mode
+      // path: "no agent allowlist yet" is the post-create / pre-
+      // chain-event window; everything else is a real auth failure.
+      const isTransientRace = verdict.reason === 'no agent allowlist on context graph';
+      const logFn = isTransientRace ? this.log.debug.bind(this.log) : this.log.warn.bind(this.log);
+      logFn(
+        ctx,
+        `LU-11: chunked envelope auth ${isTransientRace ? 'deferred' : 'rejected'} for cg=${storageCgId} from=${fromPeerId} swmMessageIndex=${envelope.swmMessageIndex}: ${verdict.reason}`,
+      );
+      return;
+    }
+
+    const batchId = envelope.payload.subarray(0, 32);
+    const ciphertext = envelope.payload.subarray(32);
+    const chunkIndex = envelope.swmMessageIndex;
+    const chunksGraph = ciphertextChunkStoreGraph(storageCgId);
+    const subject = ciphertextChunkStoreSubject(batchId, chunkIndex);
+    const literal = `"${Buffer.from(ciphertext).toString('base64')}"`;
+    try {
+      await this.store.insert([{
+        subject,
+        predicate: CIPHERTEXT_CHUNK_PREDICATE,
+        object: literal,
+        graph: chunksGraph,
+      }]);
+    } catch (err) {
+      this.log.warn(
+        ctx,
+        `LU-11: failed to persist chunk cg=${storageCgId} batchId=${ethers.hexlify(batchId).slice(0, 18)}... chunkIndex=${chunkIndex}: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      return;
+    }
+    this.log.debug(
+      ctx,
+      `LU-11: persisted ciphertext chunk cg=${storageCgId} batchId=${ethers.hexlify(batchId).slice(0, 18)}... chunkIndex=${chunkIndex} bytes=${ciphertext.length}`,
     );
   }
 

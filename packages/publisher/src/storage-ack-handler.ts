@@ -6,6 +6,11 @@ import {
   computePublishACKDigest,
   assertSafeIri,
   STORAGE_ACK_DECLINE_CODES,
+  ACK_PROTOCOL_VERSION_V2_LU11,
+  buildCiphertextChunksRoot,
+  ciphertextChunkStoreSubject,
+  ciphertextChunkStoreGraph,
+  CIPHERTEXT_CHUNK_PREDICATE,
 } from '@origintrail-official/dkg-core';
 import {
   computeFlatKCRootV10 as computeFlatKCRoot,
@@ -238,6 +243,205 @@ export class StorageACKHandler {
     const swmGraphUri = this.config.contextGraphSharedMemoryUri(swmGraphId, subGraphName);
 
     let swmQuads: Quad[];
+
+    // OT-RFC-38 LU-11 / OT-RFC-39 — V2 chunked ACK. Publishers running
+    // the chunked emit path send `ackProtocolVersion >= 2` and ship
+    // empty `stagingQuads`; the per-chunk ciphertexts arrived on this
+    // core via the workspace SWM gossip earlier (one envelope per
+    // chunk with `type='share-write-chunked'` + `swmMessageIndex=i`),
+    // were persisted under
+    //   urn:dkg:swm:v10-publish-ciphertext-chunk/<batchId>/<i>
+    // and the V2 verifier now: (1) loads every chunk from local
+    // store, (2) rebuilds the Merkle root over `keccak256(ct_i)`
+    // leaves in index order, (3) compares to the publisher's claim,
+    // (4) signs the V10 ACK digest only on match. Curated-policy is
+    // enforced before signing — same `isCgCurated` gate the LU-5
+    // path uses, lifted up here so a publisher can't bypass it by
+    // dropping the encrypted-payload flag on the V2 wire.
+    if (
+      typeof intent.ackProtocolVersion === 'number'
+      && intent.ackProtocolVersion >= ACK_PROTOCOL_VERSION_V2_LU11
+    ) {
+      const swmGraphIdForCuration = intent.swmGraphId && intent.swmGraphId.length > 0
+        ? intent.swmGraphId
+        : undefined;
+      if (!this.config.isCgCurated) {
+        return this.encodeDecline(
+          cgId,
+          STORAGE_ACK_DECLINE_CODES.SIGNER_NOT_REGISTERED,
+          'V2 chunked ACK rejected: this core has no curation oracle wired and cannot verify the CG access policy',
+        );
+      }
+      const curationVerdict = await this.config.isCgCurated(cgId, swmGraphIdForCuration);
+      if (curationVerdict !== true) {
+        return this.encodeDecline(
+          cgId,
+          STORAGE_ACK_DECLINE_CODES.SIGNER_NOT_REGISTERED,
+          `V2 chunked ACK rejected for cg=${cgId}: local curation oracle reports ${curationVerdict === false ? 'PUBLIC (not curated)' : 'UNKNOWN'}; chunked path is curated-only`,
+        );
+      }
+      if (intent.stagingQuads && intent.stagingQuads.length > 0) {
+        return this.encodeDecline(
+          cgId,
+          STORAGE_ACK_DECLINE_CODES.MERKLE_MISMATCH_IN_SWM,
+          'V2 chunked ACK request must not carry stagingQuads — ciphertext lives in SWM, not on the ACK wire',
+        );
+      }
+      const claimedChunkCount = intent.ciphertextChunkCount ?? 0;
+      const claimedRoot = intent.ciphertextChunksRoot;
+      if (claimedChunkCount <= 0 || !claimedRoot || claimedRoot.length !== 32) {
+        return this.encodeDecline(
+          cgId,
+          STORAGE_ACK_DECLINE_CODES.MERKLE_MISMATCH_IN_SWM,
+          `V2 chunked ACK requires ciphertextChunkCount > 0 and a 32-byte ciphertextChunksRoot; got count=${claimedChunkCount}, root=${claimedRoot ? claimedRoot.length : 'missing'} bytes`,
+        );
+      }
+      const claimedByteSize = typeof intent.publicByteSize === 'number'
+        ? intent.publicByteSize
+        : Number(intent.publicByteSize);
+
+      // Load chunks 0..count-1 from local store. Each is a base64
+      // literal under the per-(batchId, chunkIndex) subject the LU-11
+      // SWM ingest writes to.
+      const chunksGraph = ciphertextChunkStoreGraph(cgId);
+      const chunkBytes: Uint8Array[] = [];
+      const missing: number[] = [];
+      let totalChunkBytes = 0;
+      for (let i = 0; i < claimedChunkCount; i++) {
+        const subject = ciphertextChunkStoreSubject(merkleRoot, i);
+        // SELECT ?o WHERE { GRAPH <chunksGraph> { <subject> <CIPHERTEXT_CHUNK_PREDICATE> ?o } } LIMIT 1
+        const sparql = `SELECT ?o WHERE { GRAPH <${chunksGraph}> { <${subject}> <${CIPHERTEXT_CHUNK_PREDICATE}> ?o } } LIMIT 1`;
+        const result = await this.store.query(sparql);
+        if (result.type !== 'bindings' || result.bindings.length === 0) {
+          missing.push(i);
+          if (missing.length > 8) break;
+          continue;
+        }
+        const literal = result.bindings[0]?.['o'];
+        if (typeof literal !== 'string') {
+          missing.push(i);
+          continue;
+        }
+        // Strip surrounding quotes if the store returns them.
+        const base64 = literal.startsWith('"') && literal.endsWith('"')
+          ? literal.slice(1, -1)
+          : literal;
+        const bytes = Buffer.from(base64, 'base64');
+        chunkBytes.push(bytes);
+        totalChunkBytes += bytes.length;
+      }
+      if (missing.length > 0) {
+        const preview = missing.slice(0, 8).join(',') + (missing.length > 8 ? `,+${missing.length - 8} more` : '');
+        return this.encodeDecline(
+          cgId,
+          STORAGE_ACK_DECLINE_CODES.MISSING_CIPHERTEXT_CHUNKS,
+          `V2 chunked ACK: missing ${missing.length}/${claimedChunkCount} chunks (indexes=${preview}) under (cgId=${cgId}, batchId=${ethers.hexlify(merkleRoot).slice(0, 18)}...). Late-join sync should backfill; the publisher should retry.`,
+        );
+      }
+      if (totalChunkBytes !== claimedByteSize) {
+        return this.encodeDecline(
+          cgId,
+          STORAGE_ACK_DECLINE_CODES.MERKLE_MISMATCH_IN_SWM,
+          `V2 chunked ACK byteSize mismatch: local chunks sum to ${totalChunkBytes} bytes but publisher claims publicByteSize=${claimedByteSize}`,
+        );
+      }
+      const computed = buildCiphertextChunksRoot(chunkBytes);
+      if (computed.leafCount !== claimedChunkCount) {
+        return this.encodeDecline(
+          cgId,
+          STORAGE_ACK_DECLINE_CODES.CIPHERTEXT_ROOT_MISMATCH,
+          `V2 chunked ACK count mismatch: built tree has ${computed.leafCount} leaves but publisher claims ${claimedChunkCount}`,
+        );
+      }
+      if (!bytesEqual(computed.root, claimedRoot)) {
+        return this.encodeDecline(
+          cgId,
+          STORAGE_ACK_DECLINE_CODES.CIPHERTEXT_ROOT_MISMATCH,
+          `V2 chunked ACK root mismatch: recomputed root=${ethers.hexlify(computed.root).slice(0, 18)}... does not match publisher claim=${ethers.hexlify(claimedRoot).slice(0, 18)}...`,
+        );
+      }
+
+      // Cores can't enumerate KAs from ciphertext — use the publisher's
+      // claimed counts for the V10 digest. Same shape as the LU-5
+      // single-blob path below; deliberately repeated rather than
+      // factored out so the V2 verify slot stays self-contained and
+      // easy to audit against the spec.
+      if (!intent.kaCount || intent.kaCount <= 0) {
+        return this.encodeDecline(
+          cgId,
+          STORAGE_ACK_DECLINE_CODES.MERKLE_MISMATCH_IN_SWM,
+          `V2 chunked PublishIntent.kaCount must be positive; got ${intent.kaCount}`,
+        );
+      }
+      const claimedLeafCount = intent.merkleLeafCount == null ? 0 : Number(intent.merkleLeafCount);
+      if (claimedLeafCount < 1) {
+        return this.encodeDecline(
+          cgId,
+          STORAGE_ACK_DECLINE_CODES.MERKLE_MISMATCH_IN_SWM,
+          `V2 chunked PublishIntent.merkleLeafCount must be a positive integer; got ${claimedLeafCount}`,
+        );
+      }
+      const intentEpochs = (typeof intent.epochs === 'number' && intent.epochs > 0) ? intent.epochs : 1;
+      const intentTokenAmount = intent.tokenAmountStr ? BigInt(intent.tokenAmountStr) : 0n;
+      let contextGraphIdBigInt: bigint;
+      try {
+        contextGraphIdBigInt = BigInt(cgId);
+      } catch {
+        throw new Error(
+          `V2 chunked StorageACK: V10 publish requires a numeric on-chain context graph id; got '${cgId}'.`,
+        );
+      }
+      if (contextGraphIdBigInt <= 0n) {
+        throw new Error(
+          `V2 chunked StorageACK: V10 publish requires a positive on-chain context graph id; got ${contextGraphIdBigInt}.`,
+        );
+      }
+      const digest = computePublishACKDigest(
+        this.config.chainId,
+        this.config.kav10Address,
+        contextGraphIdBigInt,
+        merkleRoot,
+        BigInt(intent.kaCount),
+        BigInt(claimedByteSize),
+        BigInt(intentEpochs),
+        intentTokenAmount,
+        BigInt(claimedLeafCount),
+      );
+      if (this.config.isSignerRegistered) {
+        let signerRegistered: boolean | undefined;
+        try {
+          signerRegistered = await this.config.isSignerRegistered();
+        } catch (err) {
+          try { await this.config.onSignerRegistrationLookupFailed?.(err); } catch { /* swallow */ }
+          throw new Error('V2 chunked StorageACK signer registration lookup failed; refusing to sign');
+        }
+        if (signerRegistered === false) {
+          try { await this.config.onSignerUnregistered?.(); } catch { /* swallow */ }
+          return this.encodeDecline(
+            cgId,
+            STORAGE_ACK_DECLINE_CODES.SIGNER_NOT_REGISTERED,
+            'V2 chunked StorageACK signer is not confirmed on-chain as an operational wallet',
+          );
+        }
+      }
+      const signature = ethers.Signature.from(
+        await this.config.signerWallet.signMessage(digest),
+      );
+      const v2SubscriptionSource = this.config.getSubscriptionSourceForCg?.(
+        cgId,
+        swmGraphId !== cgId ? swmGraphId : undefined,
+      );
+      return encodeStorageACK({
+        merkleRoot,
+        coreNodeSignatureR: ethers.getBytes(signature.r),
+        coreNodeSignatureVS: ethers.getBytes(signature.yParityAndS),
+        contextGraphId: cgId,
+        nodeIdentityId: this.config.nodeIdentityId <= BigInt(Number.MAX_SAFE_INTEGER)
+          ? Number(this.config.nodeIdentityId)
+          : { low: Number(this.config.nodeIdentityId & 0xFFFFFFFFn), high: Number((this.config.nodeIdentityId >> 32n) & 0xFFFFFFFFn), unsigned: true },
+        ...(v2SubscriptionSource ? { subscriptionSource: v2SubscriptionSource } : {}),
+      });
+    }
 
     // OT-RFC-38 / LU-5 encrypted-payload path. For curated CGs the publisher
     // ships AEAD-encrypted nquad bytes inline so cores can store the

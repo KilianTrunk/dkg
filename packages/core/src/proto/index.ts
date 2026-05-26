@@ -173,3 +173,10 @@ export {
   encodePublishIntent,
   decodePublishIntent,
 } from './publish-intent.js';
+
+export {
+  CIPHERTEXT_CHUNK_PREDICATE,
+  ciphertextChunkStoreGraph,
+  ciphertextChunkStoreSubject,
+  ciphertextChunkStoreBatchPrefix,
+} from './ciphertext-chunk-store.js';

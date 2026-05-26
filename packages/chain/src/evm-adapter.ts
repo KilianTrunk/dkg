@@ -95,10 +95,11 @@ const MAX_PROBE_AGE_MS = 30_000;
  * the corresponding boot-bound field on `EVMChainAdapter.contracts`.
  *
  * Used by:
- *   1. `startHubRotationListener` — when `Hub.ContractChanged` /
- *      `NewContract` fires for `name`, the listener nulls the local
- *      handle and flips `initialized=false` so the next public-method
- *      call goes through `init()` and re-resolves fresh from Hub.
+ *   1. `startHubRotationListener` — when a Hub rotation event fires
+ *      for `name`, the listener checks this allowlist, marks the
+ *      adapter uninitialised, and leaves the existing handle intact so
+ *      in-flight calls that already passed `init()` don't observe a
+ *      transient `undefined`.
  *   2. `invalidateAllBoundContracts` — bulk drop, called by the
  *      write-side self-heal path (`withHubStaleRetry`) when a stale
  *      address surfaces `UnauthorizedAccess(Only Contracts in Hub)`.
@@ -2824,6 +2825,7 @@ export class EVMChainAdapter implements ChainAdapter {
     try {
       return await fn();
     } catch (err) {
+      if (err instanceof Error) enrichEvmError(err);
       const msg = err instanceof Error ? err.message : '';
       if (HUB_STALE_ERROR_MARKERS.some((m) => msg.includes(m))) {
         this.invalidateRandomSamplingPair();
@@ -2859,6 +2861,7 @@ export class EVMChainAdapter implements ChainAdapter {
     try {
       return await fn();
     } catch (err) {
+      if (err instanceof Error) enrichEvmError(err);
       const msg = err instanceof Error ? err.message : '';
       if (HUB_STALE_ERROR_MARKERS.some((m) => msg.includes(m))) {
         this.invalidateAllBoundContracts();
@@ -2898,8 +2901,8 @@ export class EVMChainAdapter implements ChainAdapter {
   }
 
   /**
-   * Subscribe to Hub `ContractChanged` / `NewContract` events and
-   * invalidate the local cache for any Hub-rotated contract.
+   * Subscribe to Hub rotation events and invalidate the local cache for any
+   * Hub-rotated contract.
    *
    * Two invalidation paths, dispatched by name:
    *
@@ -2909,13 +2912,16 @@ export class EVMChainAdapter implements ChainAdapter {
    *      See the `randomSamplingPairCache` field comment for the
    *      coupling invariants this path preserves.
    *
-   *   2. Any other name in `BOUND_CONTRACT_INVALIDATORS` → null the
-   *      corresponding boot-bound `this.contracts.X` field and flip
+   *   2. Any other name in `BOUND_CONTRACT_INVALIDATORS` → leave the
+   *      existing `this.contracts.X` field intact but flip
    *      `this.initialized` back to `false` so the next `await
-   *      this.init()` re-resolves every binding fresh from Hub. This
-   *      is the structural fix for the post-rotation stale-address
-   *      bug on the wider V10 contract set (PCA NFT, ContextGraphs,
-   *      KnowledgeCollection family, etc.) — without this dispatch,
+   *      this.init()` re-resolves every binding fresh from Hub. Keeping
+   *      the old handle until the next init pass avoids a race where an
+   *      in-flight public method already passed `init()` and then trips
+   *      over a transient `undefined` field. This is the structural fix
+   *      for the post-rotation stale-address bug on the wider V10
+   *      contract set (PCA NFT, ContextGraphs, KnowledgeCollection
+   *      family, storage contracts, etc.) — without this dispatch,
    *      operators were silently stuck on the pre-rotation address
    *      until a daemon restart.
    *
@@ -2928,16 +2934,18 @@ export class EVMChainAdapter implements ChainAdapter {
    * `Hub._setContractAddress` is double-tap-emitting (`Hub-extra.test.ts`
    * E-7): on the new-contract path it emits `NewContract` twice, and
    * on the update path it emits both `ContractChanged` AND
-   * `NewContract`. We listen to BOTH events so the cache invalidates
-   * regardless of which Hub variant the deployment ships, and both
-   * the RS-pair invalidation and the generic boot-bound invalidation
-   * are idempotent so duplicate notifications are harmless.
+   * `NewContract`. Storage bindings resolved through
+   * `getAssetStorageAddress(...)` emit the parallel `AssetStorageChanged`
+   * / `NewAssetStorage` events. We listen to all four events so the cache
+   * invalidates regardless of which Hub set owns the name, and both the
+   * RS-pair invalidation and the generic boot-bound invalidation are
+   * idempotent so duplicate notifications are harmless.
    *
    * `Contract.on(...)` is async in ethers v6: a sync `try/catch` would
    * miss provider rejections (e.g. HTTP-only endpoints that can't
    * install filter subscriptions) and leave us with an unhandled
-   * rejection. We `await` both subscriptions and only set
-   * `hubRotationListenerStarted` after both succeed, so a failed
+   * rejection. We `await` every subscription and only set
+   * `hubRotationListenerStarted` after all succeed, so a failed
    * provider can be retried by a future call site if we ever need to
    * — and meanwhile the TTL refresh path (for RS) and the
    * `withHubStaleRetry` write-side fallback (for all boot-bound
@@ -2952,20 +2960,20 @@ export class EVMChainAdapter implements ChainAdapter {
         this.invalidateRandomSamplingPair();
         return;
       }
-      const invalidator = BOUND_CONTRACT_INVALIDATORS.get(name);
-      if (invalidator) {
-        invalidator(this);
+      if (BOUND_CONTRACT_INVALIDATORS.has(name)) {
         this.invalidatePublishPreflightCache();
         // Force the next public-method entry through `init()` so it
-        // re-resolves every binding. Cheap — rotation events are rare
-        // and `init()` is idempotent past the `if (this.initialized)
-        // return` short-circuit.
+        // re-resolves every binding. Do not clear the current handle
+        // here: the callback can fire between a public method's
+        // `await init()` and its first `this.contracts.X` read.
         this.initialized = false;
       }
     };
     try {
       await this.contracts.hub.on('ContractChanged', onChange);
       await this.contracts.hub.on('NewContract', onChange);
+      await this.contracts.hub.on('AssetStorageChanged', onChange);
+      await this.contracts.hub.on('NewAssetStorage', onChange);
       this.hubRotationListenerStarted = true;
     } catch {
       /* provider doesn't support filter subscriptions — TTL refresh (RS)

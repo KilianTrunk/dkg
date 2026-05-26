@@ -14,8 +14,8 @@
  *
  *   1. TTL refresh    — cached address is replaced after `ttlMs` elapses
  *                       and the next adapter call re-resolves from Hub.
- *   2. Event listener — adapter's `Hub.ContractChanged`/`NewContract`
- *                       subscription invalidates the cache as soon as
+ *   2. Event listener — adapter's Hub contract/storage rotation
+ *                       subscriptions invalidate the cache as soon as
  *                       the rotation is mined.
  *   3. Self-heal      — `withHubStaleRetry()` catches the exact revert
  *                       wording the prover sees in the wild
@@ -48,9 +48,13 @@ import {
 // as accounts[0].
 const HUB_ABI = [
   'function getContractAddress(string) view returns (address)',
+  'function getAssetStorageAddress(string) view returns (address)',
   'function setContractAddress(string, address) external',
+  'function setAssetStorageAddress(string, address) external',
   'event ContractChanged(string contractName, address newContractAddress)',
   'event NewContract(string contractName, address newContractAddress)',
+  'event AssetStorageChanged(string contractName, address newContractAddress)',
+  'event NewAssetStorage(string contractName, address newContractAddress)',
 ];
 
 let ctx: HardhatContext;
@@ -70,6 +74,16 @@ function makeAdapter(rpcUrl: string, hubAddress: string, refreshMs: number): EVM
 async function readHubAddress(hubAddress: string, signer: Wallet, name: string): Promise<string> {
   const hub = new Contract(hubAddress, HUB_ABI, signer);
   return hub.getContractAddress(name);
+}
+
+/** Resolve asset-storage `name` straight from the on-chain Hub. */
+async function readHubAssetStorageAddress(
+  hubAddress: string,
+  signer: Wallet,
+  name: string,
+): Promise<string> {
+  const hub = new Contract(hubAddress, HUB_ABI, signer);
+  return hub.getAssetStorageAddress(name);
 }
 
 /**
@@ -93,6 +107,18 @@ async function rotateHubContract(
 ): Promise<void> {
   const hub = new Contract(hubAddress, HUB_ABI, signer);
   const tx = await hub.setContractAddress(name, newAddr);
+  await tx.wait();
+}
+
+/** Re-register an asset-storage binding to `newAddr` on-chain. */
+async function rotateHubAssetStorage(
+  hubAddress: string,
+  signer: Wallet,
+  name: string,
+  newAddr: string,
+): Promise<void> {
+  const hub = new Contract(hubAddress, HUB_ABI, signer);
+  const tx = await hub.setAssetStorageAddress(name, newAddr);
   await tx.wait();
 }
 
@@ -449,7 +475,7 @@ describe('EVMChainAdapter — Hub rotation self-refresh (E2E)', () => {
   // ===================================================================
 
   it(
-    'event listener (generic): rotating Identity nulls this.contracts.identity and re-arms init()',
+    'event listener (generic): rotating Identity preserves live handle and re-arms init()',
     async () => {
       // High TTL — only the event listener can flip the field within
       // the test window. (RS cache has its own TTL; the generic path
@@ -468,10 +494,11 @@ describe('EVMChainAdapter — Hub rotation self-refresh (E2E)', () => {
       try {
         await rotateHubContract(ctx.hubAddress, deployer, 'Identity', replacementAddr);
 
-        // Listener nulls the field AND flips `initialized`.
+        // Listener keeps the field usable for in-flight calls and flips
+        // `initialized` so the next public entry re-resolves from Hub.
         const observed = await waitFor(
           () =>
-            (adapter as any).contracts.identity === undefined &&
+            (adapter as any).contracts.identity === identityBefore &&
             (adapter as any).initialized === false,
           15_000,
           100,
@@ -502,6 +529,7 @@ describe('EVMChainAdapter — Hub rotation self-refresh (E2E)', () => {
       await drainHistoricalRotationEvents(adapter);
 
       const kav10Before = await adapter.getKnowledgeAssetsV10Address();
+      const kav10HandleBefore: Contract = (adapter as any).contracts.knowledgeAssetsV10;
       expect((adapter as any).cachedKav10Address?.value.toLowerCase()).toBe(
         kav10Before.toLowerCase(),
       );
@@ -514,7 +542,7 @@ describe('EVMChainAdapter — Hub rotation self-refresh (E2E)', () => {
 
         const observed = await waitFor(
           () =>
-            (adapter as any).contracts.knowledgeAssetsV10 === undefined &&
+            (adapter as any).contracts.knowledgeAssetsV10 === kav10HandleBefore &&
             (adapter as any).cachedKav10Address === undefined &&
             (adapter as any).cachedMinRequiredSignatures === undefined &&
             (adapter as any).initialized === false,
@@ -527,6 +555,63 @@ describe('EVMChainAdapter — Hub rotation self-refresh (E2E)', () => {
         expect(kav10After.toLowerCase()).toBe(replacementAddr.toLowerCase());
       } finally {
         await rotateHubContract(ctx.hubAddress, deployer, 'KnowledgeAssetsV10', kav10Before);
+      }
+    },
+    60_000,
+  );
+
+  it(
+    'event listener (asset storage): rotating ContextGraphStorage preserves live handle and re-arms init()',
+    async () => {
+      const adapter = makeAdapter(ctx.rpcUrl, ctx.hubAddress, 600_000);
+      (adapter as any).provider.pollingInterval = 250;
+
+      await (adapter as any).init();
+      await drainHistoricalRotationEvents(adapter);
+
+      const storageBefore: Contract = (adapter as any).contracts.contextGraphStorage;
+      expect(storageBefore).toBeDefined();
+      const storageAddrBefore: string = await storageBefore.getAddress();
+
+      const deployer = new Wallet(HARDHAT_KEYS.DEPLOYER, ctx.provider);
+      const hubAddrBefore = await readHubAssetStorageAddress(
+        ctx.hubAddress,
+        deployer,
+        'ContextGraphStorage',
+      );
+      expect(hubAddrBefore.toLowerCase()).toBe(storageAddrBefore.toLowerCase());
+      const replacementAddr = freshAddress();
+
+      try {
+        await rotateHubAssetStorage(
+          ctx.hubAddress,
+          deployer,
+          'ContextGraphStorage',
+          replacementAddr,
+        );
+
+        const observed = await waitFor(
+          () =>
+            (adapter as any).contracts.contextGraphStorage === storageBefore &&
+            (adapter as any).initialized === false,
+          15_000,
+          100,
+        );
+        expect(observed).toBe(true);
+
+        await (adapter as any).init();
+        const storageAfter: Contract = (adapter as any).contracts.contextGraphStorage;
+        expect(storageAfter).toBeDefined();
+        const storageAddrAfter: string = await storageAfter.getAddress();
+        expect(storageAddrAfter.toLowerCase()).toBe(replacementAddr.toLowerCase());
+        expect(storageAddrAfter.toLowerCase()).not.toBe(storageAddrBefore.toLowerCase());
+      } finally {
+        await rotateHubAssetStorage(
+          ctx.hubAddress,
+          deployer,
+          'ContextGraphStorage',
+          storageAddrBefore,
+        );
       }
     },
     60_000,

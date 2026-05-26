@@ -26,6 +26,7 @@ export default defineConfig({
           'test/migrate-to-npm.test.ts',
           'test/nat-status.test.ts',
           'test/core-prereq-check.test.ts',
+          'test/relay-status-block.test.ts',
         ],
     testTimeout: runsDaemonHttpBehavior ? 120_000 : 60_000,
     globalSetup: runsDaemonHttpBehavior ? ['../chain/test/hardhat-global-setup.ts'] : [],

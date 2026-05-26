@@ -472,8 +472,7 @@ export class ProtocolRouter {
         if (
           overallSignal.aborted ||
           overallDeadline.aborted ||
-          stopSignal?.aborted ||
-          isAbortLikeError(err)
+          stopSignal?.aborted
         ) {
           throw err;
         }
@@ -1248,8 +1247,23 @@ export function composeAbortSignals(
   const AnyImpl = (AbortSignal as unknown as { any?: (signals: AbortSignal[]) => AbortSignal }).any;
   if (AnyImpl) return AnyImpl([primary, secondary]);
   const combined = new AbortController();
-  const forwardPrimary = () => combined.abort(primary.reason);
-  const forwardSecondary = () => combined.abort(secondary.reason);
+  let settled = false;
+  const cleanup = () => {
+    primary.removeEventListener('abort', forwardPrimary);
+    secondary.removeEventListener('abort', forwardSecondary);
+  };
+  const forwardPrimary = () => {
+    if (settled) return;
+    settled = true;
+    cleanup();
+    combined.abort(primary.reason);
+  };
+  const forwardSecondary = () => {
+    if (settled) return;
+    settled = true;
+    cleanup();
+    combined.abort(secondary.reason);
+  };
   if (primary.aborted) combined.abort(primary.reason);
   else if (secondary.aborted) combined.abort(secondary.reason);
   else {
@@ -1274,13 +1288,6 @@ function asAbortError(reason: unknown): Error {
   const err = new Error(typeof reason === 'string' ? reason : 'aborted');
   (err as Error & { name: string }).name = 'AbortError';
   return err;
-}
-
-function isAbortLikeError(err: unknown): boolean {
-  if (!(err instanceof Error)) return false;
-  const name = err.name.toLowerCase();
-  const message = err.message.toLowerCase();
-  return name === 'aborterror' || message.includes('abort');
 }
 
 async function readAll(

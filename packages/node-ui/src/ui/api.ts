@@ -1828,7 +1828,22 @@ export const fetchWalletsBalances = () =>
     error?: string;
   }>('/api/wallets/balances');
 export const fetchRpcHealth = () =>
-  get<{ ok: boolean; rpcUrl: string | null; latencyMs: number | null; blockNumber: number | null; error?: string }>('/api/chain/rpc-health');
+  get<{
+    ok: boolean;
+    configured: boolean;
+    rpcEndpointCount: number;
+    latencyMs: number | null;
+    blockNumber: number | null;
+    error?: string;
+    rpcs: Array<{
+      index: number;
+      role: 'primary' | 'backup';
+      ok: boolean;
+      latencyMs: number | null;
+      blockNumber: number | null;
+      error?: string;
+    }>;
+  }>('/api/chain/rpc-health');
 
 // --- Node control ---
 export const shutdownNode = () =>

@@ -4,7 +4,7 @@
  */
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { Interface, ethers } from 'ethers';
-import { decodeEvmError, enrichEvmError, EVMChainAdapter, type EVMAdapterConfig } from '../src/evm-adapter.js';
+import { decodeEvmError, enrichEvmError, EVMChainAdapter, resolveRpcUrls, type EVMAdapterConfig } from '../src/evm-adapter.js';
 
 const DEPLOYER_PK = '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80';
 const OTHER_PK = '0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b63b91100';
@@ -143,6 +143,197 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
     const a = new EVMChainAdapter(minimalConfig());
     expect(a.getProvider()).toBeDefined();
     expect(typeof a.getProvider().getBlockNumber).toBe('function');
+    expect(a.getReadProvider()).toBeDefined();
+  });
+
+  it('dedupes configured RPC URLs in priority order', () => {
+    expect(resolveRpcUrls('https://primary.example', [
+      'https://primary.example',
+      ' https://backup-a.example ',
+      'https://backup-b.example',
+      'https://backup-a.example',
+    ])).toEqual([
+      'https://primary.example',
+      'https://backup-a.example',
+      'https://backup-b.example',
+    ]);
+
+    const a = new EVMChainAdapter(minimalConfig({
+      rpcUrl: 'https://primary.example',
+      rpcUrls: ['https://primary.example', 'https://backup.example'],
+    }));
+    expect(a.getRpcUrls()).toEqual(['https://primary.example', 'https://backup.example']);
+  });
+
+  it('receipt lookup succeeds on backup when primary throws retryable provider error', async () => {
+    const a = new EVMChainAdapter(minimalConfig({
+      rpcUrl: 'https://primary.example',
+      rpcUrls: ['https://backup.example'],
+    }));
+    const receipt = { hash: '0xabc', blockNumber: 12, status: 1, logs: [] };
+    const primary = {
+      getTransactionReceipt: vi.fn(async () => {
+        const err = new Error('socket hang up');
+        (err as any).code = 'ECONNRESET';
+        throw err;
+      }),
+    };
+    const backup = { getTransactionReceipt: vi.fn(async () => receipt) };
+    (a as any).providers = [primary, backup];
+
+    await expect((a as any).getTransactionReceiptWithFailover('0xabc')).resolves.toBe(receipt);
+    expect(primary.getTransactionReceipt).toHaveBeenCalledTimes(1);
+    expect(backup.getTransactionReceipt).toHaveBeenCalledTimes(1);
+  });
+
+  it('fails receipt lookup immediately when every RPC endpoint errors', async () => {
+    const a = new EVMChainAdapter(minimalConfig({
+      rpcUrl: 'https://primary.example',
+      rpcUrls: ['https://backup.example'],
+    }));
+    const primary = {
+      getTransactionReceipt: vi.fn(async () => {
+        const err = new Error('socket hang up');
+        (err as any).code = 'ECONNRESET';
+        throw err;
+      }),
+    };
+    const backup = {
+      getTransactionReceipt: vi.fn(async () => {
+        const err = new Error('502 bad gateway');
+        (err as any).status = 502;
+        throw err;
+      }),
+    };
+    (a as any).providers = [primary, backup];
+
+    await expect((a as any).getTransactionReceiptWithFailover('0xabc')).rejects.toMatchObject({
+      code: 'RPC_RECEIPT_LOOKUP_FAILED',
+    });
+    expect(primary.getTransactionReceipt).toHaveBeenCalledTimes(1);
+    expect(backup.getTransactionReceipt).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not fail over deterministic CALL_EXCEPTION errors', async () => {
+    const a = new EVMChainAdapter(minimalConfig({
+      rpcUrl: 'https://primary.example',
+      rpcUrls: ['https://backup.example'],
+    }));
+    const err = new Error('execution reverted');
+    (err as any).code = 'CALL_EXCEPTION';
+    const primary = { getTransactionReceipt: vi.fn(async () => { throw err; }) };
+    const backup = { getTransactionReceipt: vi.fn(async () => null) };
+    (a as any).providers = [primary, backup];
+
+    await expect((a as any).getTransactionReceiptWithFailover('0xabc')).rejects.toBe(err);
+    expect(backup.getTransactionReceipt).not.toHaveBeenCalled();
+  });
+
+  it('broadcasts the exact same signed raw transaction to backup after primary send failure', async () => {
+    const a = new EVMChainAdapter(minimalConfig({
+      rpcUrl: 'https://primary.example',
+      rpcUrls: ['https://backup.example'],
+    }));
+    const signedTx = '0x02f86c0180843b9aca0084773594008252089400000000000000000000000000000000000000018080c001a0' +
+      'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+    const txHash = '0x' + '11'.repeat(32);
+    const receipt = { hash: txHash, blockNumber: 45, status: 1, logs: [] };
+    const primary = {
+      broadcastTransaction: vi.fn(async (_raw: string) => {
+        const err = new Error('429 too many requests');
+        (err as any).status = 429;
+        throw err;
+      }),
+      getTransactionReceipt: vi.fn(async () => null),
+    };
+    const backup = {
+      broadcastTransaction: vi.fn(async () => ({ hash: txHash })),
+      getTransactionReceipt: vi.fn(async () => receipt),
+    };
+    (a as any).providers = [primary, backup];
+
+    await expect((a as any).sendSignedTransactionAndWait(signedTx, txHash, 'unit write')).resolves.toBe(receipt);
+    expect(primary.broadcastTransaction).toHaveBeenCalledWith(signedTx);
+    expect(backup.broadcastTransaction).toHaveBeenCalledWith(signedTx);
+  });
+
+  it('treats already-known transaction responses as accepted and polls receipts', async () => {
+    const a = new EVMChainAdapter(minimalConfig({
+      rpcUrl: 'https://primary.example',
+      rpcUrls: ['https://backup.example'],
+    }));
+    const signedTx = '0xdeadbeef';
+    const txHash = '0x' + '22'.repeat(32);
+    const receipt = { hash: txHash, blockNumber: 46, status: 1, logs: [] };
+    const primary = {
+      broadcastTransaction: vi.fn(async () => {
+        throw new Error('already known');
+      }),
+      getTransactionReceipt: vi.fn(async () => receipt),
+    };
+    const backup = {
+      broadcastTransaction: vi.fn(async () => ({ hash: txHash })),
+      getTransactionReceipt: vi.fn(async () => receipt),
+    };
+    (a as any).providers = [primary, backup];
+
+    await expect((a as any).sendSignedTransactionAndWait(signedTx, txHash, 'unit write')).resolves.toBe(receipt);
+    expect(primary.broadcastTransaction).toHaveBeenCalledTimes(1);
+    expect(backup.broadcastTransaction).not.toHaveBeenCalled();
+    expect(primary.getTransactionReceipt).toHaveBeenCalledWith(txHash);
+  });
+
+  it('treats nonce-too-low transaction responses as accepted and polls receipts', async () => {
+    const a = new EVMChainAdapter(minimalConfig({
+      rpcUrl: 'https://primary.example',
+      rpcUrls: ['https://backup.example'],
+    }));
+    const signedTx = '0xdeadbeef';
+    const txHash = '0x' + '44'.repeat(32);
+    const receipt = { hash: txHash, blockNumber: 48, status: 1, logs: [] };
+    const primary = {
+      broadcastTransaction: vi.fn(async () => {
+        const err = new Error('nonce too low');
+        (err as any).code = 'NONCE_EXPIRED';
+        throw err;
+      }),
+      getTransactionReceipt: vi.fn(async () => receipt),
+    };
+    const backup = {
+      broadcastTransaction: vi.fn(async () => ({ hash: txHash })),
+      getTransactionReceipt: vi.fn(async () => receipt),
+    };
+    (a as any).providers = [primary, backup];
+
+    await expect((a as any).sendSignedTransactionAndWait(signedTx, txHash, 'unit write')).resolves.toBe(receipt);
+    expect(primary.broadcastTransaction).toHaveBeenCalledTimes(1);
+    expect(backup.broadcastTransaction).not.toHaveBeenCalled();
+    expect(primary.getTransactionReceipt).toHaveBeenCalledWith(txHash);
+  });
+
+  it('throws CALL_EXCEPTION when a mined write receipt reverted', async () => {
+    const a = new EVMChainAdapter(minimalConfig({
+      rpcUrl: 'https://primary.example',
+      rpcUrls: ['https://backup.example'],
+    }));
+    const signedTx = '0xdeadbeef';
+    const txHash = '0x' + '33'.repeat(32);
+    const receipt = { hash: txHash, blockNumber: 47, status: 0, logs: [] };
+    const primary = {
+      broadcastTransaction: vi.fn(async () => ({ hash: txHash })),
+      getTransactionReceipt: vi.fn(async () => receipt),
+    };
+    const backup = {
+      broadcastTransaction: vi.fn(async () => ({ hash: txHash })),
+      getTransactionReceipt: vi.fn(async () => receipt),
+    };
+    (a as any).providers = [primary, backup];
+
+    await expect((a as any).sendSignedTransactionAndWait(signedTx, txHash, 'unit write')).rejects.toMatchObject({
+      code: 'CALL_EXCEPTION',
+      receipt,
+    });
+    expect(backup.getTransactionReceipt).not.toHaveBeenCalled();
   });
 
   it('signMessage returns 32-byte r and vs (no contract init)', async () => {
@@ -745,4 +936,3 @@ describe('PR3 / RC11 — publish-preflight TTL cache', () => {
     expect(getNetwork).toHaveBeenCalledTimes(2);
   });
 });
-

@@ -107,6 +107,10 @@ export class MockChainAdapter implements ChainAdapter {
     return existing ?? 0n;
   }
 
+  getRpcUrls(): string[] {
+    return [];
+  }
+
   async ensureProfile(_options?: { nodeName?: string; stakeAmount?: bigint; lockTier?: number }): Promise<bigint> {
     const existing = await this.getIdentityId();
     if (existing > 0n) return existing;

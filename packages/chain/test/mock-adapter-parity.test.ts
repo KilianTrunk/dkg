@@ -76,6 +76,7 @@ const MOCK_EXEMPT_FROM_EVM = new Set<string>([
   'getContract',            // resolves a Contract from the Hub — not applicable off-chain
   'getBlockNumber',         // the mock exposes its own block counter differently (advanceBlock)
   'getProvider',            // returns a JsonRpcProvider; mock has none
+  'getReadProvider',        // returns the EVM fallback read provider; mock has no RPC provider
   'getSignerAddress',       // mock exposes `signerAddress` as a field
   'getSignerAddresses',     // pool not applicable to mock
   'getAuthorizedPublisherAddress', // pool-specific signer selection; mock has one signerAddress
@@ -96,6 +97,13 @@ const MOCK_EXEMPT_FROM_EVM = new Set<string>([
   'init',
   'requireV9',
   'getBlockTimestamp',
+  'broadcastSignedTransactionWithFailover',
+  'getTransactionReceiptWithFailover',
+  'waitForReceiptWithFailover',
+  'signPopulatedTransaction',
+  'sendSignedTransactionAndWait',
+  'sendPopulatedTransaction',
+  'sendContractTransaction',
   'parseV10PublishReceipt',
   'parseV9PublishReceipt',
   // Random Sampling (Slice 1) — TS-private helpers that survive into

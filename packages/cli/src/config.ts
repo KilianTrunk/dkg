@@ -127,6 +127,7 @@ export interface NetworkConfig {
   chain?: {
     type: 'evm';
     rpcUrl: string;
+    rpcUrls?: string[];
     hubAddress: string;
     tokenAddress?: string;
     chainId: string;
@@ -159,6 +160,8 @@ export interface ChainConfig {
   type: 'evm' | 'mock';
   /** JSON-RPC endpoint URL */
   rpcUrl: string;
+  /** Ordered JSON-RPC backup endpoints. `rpcUrl` remains the primary endpoint. */
+  rpcUrls?: string[];
   /** Hub contract address */
   hubAddress: string;
   /** Optional token contract address override. When omitted, resolve from Hub.Token. */
@@ -786,8 +789,19 @@ export function resolveChainConfig(
   const merged: Partial<ChainConfig> = {
     type: cfg?.type ?? net?.type ?? 'evm',
   };
-  const rpcUrl = cfg?.rpcUrl ?? net?.rpcUrl;
-  if (rpcUrl !== undefined) merged.rpcUrl = rpcUrl;
+  const primaryRpcUrl = cfg?.rpcUrl ?? net?.rpcUrl;
+  const backupRpcUrls = cfg?.rpcUrls ?? net?.rpcUrls ?? [];
+  const orderedRpcUrls: string[] = [];
+  for (const candidate of [primaryRpcUrl, ...backupRpcUrls]) {
+    if (typeof candidate !== 'string') continue;
+    const trimmed = candidate.trim();
+    if (!trimmed || orderedRpcUrls.includes(trimmed)) continue;
+    orderedRpcUrls.push(trimmed);
+  }
+  if (orderedRpcUrls[0] !== undefined) merged.rpcUrl = orderedRpcUrls[0];
+  if (orderedRpcUrls.length > 1 || cfg?.rpcUrls !== undefined || net?.rpcUrls !== undefined) {
+    merged.rpcUrls = orderedRpcUrls.slice(1);
+  }
   const hubAddress = cfg?.hubAddress ?? net?.hubAddress;
   if (hubAddress !== undefined) merged.hubAddress = hubAddress;
   const tokenAddress = cfg?.tokenAddress ?? net?.tokenAddress;

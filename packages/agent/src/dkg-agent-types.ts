@@ -730,6 +730,7 @@ export interface DKGAgentConfig {
    */
   chainConfig?: {
     rpcUrl: string;
+    rpcUrls?: string[];
     hubAddress: string;
     adminPrivateKey?: string;
     operationalKeys: string[];

@@ -1,4 +1,4 @@
-import { ethers, JsonRpcProvider, Wallet, Contract, Interface } from 'ethers';
+import { ethers, JsonRpcProvider, FallbackProvider, Wallet, Contract, Interface } from 'ethers';
 import {
   createFilterErrorSilencer,
   formatProviderError,
@@ -82,6 +82,11 @@ const DURATION_PROBE_TIMEOUT_MS = 2000;
  * Codex round 8 on PR #369.
  */
 const MAX_PROBE_AGE_MS = 30_000;
+const RPC_READ_STALL_TIMEOUT_MS = 4_000;
+const RPC_BROADCAST_ATTEMPT_TIMEOUT_MS = 10_000;
+const RPC_RECEIPT_ATTEMPT_TIMEOUT_MS = 5_000;
+const RPC_RECEIPT_POLL_INTERVAL_MS = 2_000;
+const RPC_RECEIPT_TIMEOUT_MS = 180_000;
 
 /**
  * Substrings we treat as "the Hub no longer recognises this contract
@@ -137,6 +142,108 @@ const HUB_STALE_ERROR_MARKERS = [
   'Only Contracts in Hub',
   'UnauthorizedAccess(Only Contracts in Hub)',
 ];
+
+export function resolveRpcUrls(rpcUrl: string, rpcUrls?: string[]): string[] {
+  const out: string[] = [];
+  for (const candidate of [rpcUrl, ...(rpcUrls ?? [])]) {
+    const trimmed = typeof candidate === 'string' ? candidate.trim() : '';
+    if (!trimmed || out.includes(trimmed)) continue;
+    out.push(trimmed);
+  }
+  if (out.length === 0) {
+    throw new Error('EVMChainAdapter requires at least one RPC URL');
+  }
+  return out;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      const err = new Error(`${label} timed out after ${ms}ms`);
+      (err as any).code = 'TIMEOUT';
+      reject(err);
+    }, ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  }) as Promise<T>;
+}
+
+function errorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  try { return JSON.stringify(err); } catch { return String(err); }
+}
+
+function errorCode(err: unknown): string {
+  return String((err as any)?.code ?? (err as any)?.error?.code ?? '').toUpperCase();
+}
+
+function errorStatus(err: unknown): number | undefined {
+  const raw =
+    (err as any)?.status ??
+    (err as any)?.statusCode ??
+    (err as any)?.response?.status ??
+    (err as any)?.error?.status ??
+    (err as any)?.error?.statusCode;
+  return typeof raw === 'number' ? raw : undefined;
+}
+
+function isRetryableRpcError(err: unknown): boolean {
+  if (err instanceof Error) enrichEvmError(err);
+  const code = errorCode(err);
+  const status = errorStatus(err);
+  const msg = errorMessage(err).toLowerCase();
+
+  if (code === 'CALL_EXCEPTION' || code === 'INSUFFICIENT_FUNDS' || code === 'NONCE_EXPIRED'
+    || code === 'RPC_RECEIPT_LOOKUP_FAILED'
+    || code === 'REPLACEMENT_UNDERPRICED' || code === 'TRANSACTION_REPLACED'
+    || code === 'ACTION_REJECTED' || code === 'INVALID_ARGUMENT' || code === 'UNPREDICTABLE_GAS_LIMIT') {
+    return false;
+  }
+  if (msg.includes('execution reverted') || msg.includes('call exception')
+    || msg.includes('insufficient funds') || msg.includes('invalid argument')
+    || msg.includes('nonce too low') || msg.includes('replacement transaction underpriced')
+    || msg.includes('intrinsic gas too low') || msg.includes('exceeds block gas limit')) {
+    return false;
+  }
+
+  if (status === 429 || (typeof status === 'number' && status >= 500)) return true;
+  if (code === 'TIMEOUT' || code === 'TIMEOUT_ERROR' || code === 'SERVER_ERROR'
+    || code === 'NETWORK_ERROR' || code === 'ECONNRESET' || code === 'ECONNREFUSED'
+    || code === 'ETIMEDOUT' || code === 'ENOTFOUND' || code === 'EAI_AGAIN'
+    || code === 'UNKNOWN_ERROR' || code === 'BAD_DATA') {
+    return true;
+  }
+  return /timeout|timed out|network|socket|reset|econnreset|econnrefused|etimedout|enotfound|eai_again|rate limit|too many requests|429|503|502|500|gateway|temporarily unavailable|fetch failed|connection/i
+    .test(msg);
+}
+
+function assertSuccessfulReceipt(receipt: ethers.TransactionReceipt, label: string): void {
+  if (receipt.status !== 0) return;
+  const err = new Error(`${label} tx ${receipt.hash} was mined but reverted (status=0)`);
+  (err as any).code = 'CALL_EXCEPTION';
+  (err as any).receipt = receipt;
+  throw err;
+}
+
+function isKnownTransactionError(err: unknown): boolean {
+  const code = errorCode(err);
+  const msg = errorMessage(err).toLowerCase();
+  return code === 'NONCE_EXPIRED'
+    || msg.includes('already known')
+    || msg.includes('known transaction')
+    || msg.includes('already imported')
+    || msg.includes('transaction already in mempool')
+    || msg.includes('already exists')
+    || msg.includes('already have transaction')
+    || msg.includes('nonce too low')
+    || msg.includes('duplicate transaction');
+}
 
 const require = createRequire(import.meta.url);
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -256,6 +363,7 @@ export function enrichEvmError(err: unknown): string | null {
 
 interface EVMAdapterBaseConfig {
   rpcUrl: string;
+  rpcUrls?: string[];
   /** Primary operational wallet key (used for identity registration, staking, etc.) */
   privateKey: string;
   /** Additional operational wallet keys for parallel transaction submission. */
@@ -342,7 +450,10 @@ export class EVMChainAdapter implements ChainAdapter {
   readonly chainType = 'evm' as const;
   readonly chainId: string;
 
-  private readonly provider: JsonRpcProvider;
+  private readonly provider: JsonRpcProvider | FallbackProvider;
+  private readonly primaryProvider: JsonRpcProvider;
+  private readonly providers: JsonRpcProvider[];
+  private readonly rpcUrls: string[];
   private readonly filterErrorSilencer: FilterErrorSilencer;
   /** Primary signer — used for identity/profile/staking operations. */
   private readonly signer: Wallet;
@@ -474,7 +585,21 @@ export class EVMChainAdapter implements ChainAdapter {
   }
 
   constructor(config: EVMAdapterConfig) {
-    this.provider = new JsonRpcProvider(config.rpcUrl, undefined, { cacheTimeout: -1 });
+    this.rpcUrls = resolveRpcUrls(config.rpcUrl, config.rpcUrls);
+    this.providers = this.rpcUrls.map((url) => new JsonRpcProvider(url, undefined, { cacheTimeout: -1 }));
+    this.primaryProvider = this.providers[0];
+    this.provider = this.providers.length === 1
+      ? this.primaryProvider
+      : new FallbackProvider(
+        this.providers.map((provider, index) => ({
+          provider,
+          priority: index + 1,
+          stallTimeout: RPC_READ_STALL_TIMEOUT_MS,
+          weight: 1,
+        })),
+        undefined,
+        { quorum: 1 },
+      );
     const providerContext = formatProviderContext(config);
     // PR-8: install the filter-not-found silencer. Without this, RPC
     // nodes that GC filters faster than ethers' polling cadence
@@ -496,16 +621,20 @@ export class EVMChainAdapter implements ChainAdapter {
       // EXCEPT the filter-spam class.
       console.error(`[chain] provider error (${providerContext}): ${formatProviderError(err)}`);
     };
-    try {
-      void Promise.resolve(this.provider.on('error', providerErrorHandler)).catch((err: unknown) => {
+    for (let i = 0; i < this.providers.length; i += 1) {
+      const provider = this.providers[i];
+      const listenerContext = `${providerContext}; rpc #${i + 1}`;
+      try {
+        void Promise.resolve(provider.on('error', providerErrorHandler)).catch((err: unknown) => {
+          console.error(
+            `[chain] provider error listener registration failed (${listenerContext}): ${formatProviderError(err)}`,
+          );
+        });
+      } catch (err) {
         console.error(
-          `[chain] provider error listener registration failed (${providerContext}): ${formatProviderError(err)}`,
+          `[chain] provider error listener registration failed (${listenerContext}): ${formatProviderError(err)}`,
         );
-      });
-    } catch (err) {
-      console.error(
-        `[chain] provider error listener registration failed (${providerContext}): ${formatProviderError(err)}`,
-      );
+      }
     }
     this.signer = new Wallet(config.privateKey, this.provider);
     this.signerPool = [this.signer];
@@ -558,6 +687,128 @@ export class EVMChainAdapter implements ChainAdapter {
   private findSignerByAddress(address: string): Wallet | undefined {
     const normalized = ethers.getAddress(address).toLowerCase();
     return this.signerPool.find((signer) => signer.address.toLowerCase() === normalized);
+  }
+
+  private async broadcastSignedTransactionWithFailover(
+    signedTx: string,
+    txHash: string,
+    label: string,
+  ): Promise<void> {
+    let lastRetryable: unknown;
+    for (let i = 0; i < this.providers.length; i += 1) {
+      const provider = this.providers[i];
+      try {
+        await withTimeout(
+          provider.broadcastTransaction(signedTx),
+          RPC_BROADCAST_ATTEMPT_TIMEOUT_MS,
+          `${label} broadcast via RPC #${i + 1}`,
+        );
+        return;
+      } catch (err) {
+        if (isKnownTransactionError(err)) return;
+        if (!isRetryableRpcError(err)) throw err;
+        lastRetryable = err;
+      }
+    }
+    throw new Error(
+      `${label} broadcast failed on all configured RPC endpoints for tx ${txHash}: ${errorMessage(lastRetryable)}`,
+      { cause: lastRetryable },
+    );
+  }
+
+  private async getTransactionReceiptWithFailover(txHash: string): Promise<ethers.TransactionReceipt | null> {
+    let lastRetryable: unknown;
+    let sawNonErrorResponse = false;
+    for (let i = 0; i < this.providers.length; i += 1) {
+      const provider = this.providers[i];
+      try {
+        const receipt = await withTimeout(
+          provider.getTransactionReceipt(txHash),
+          RPC_RECEIPT_ATTEMPT_TIMEOUT_MS,
+          `receipt lookup via RPC #${i + 1}`,
+        );
+        sawNonErrorResponse = true;
+        if (receipt) return receipt;
+      } catch (err) {
+        if (!isRetryableRpcError(err)) throw err;
+        lastRetryable = err;
+      }
+    }
+    if (lastRetryable && !sawNonErrorResponse) {
+      const err = new Error(
+        `Receipt lookup for tx ${txHash} failed on all configured RPC endpoints: ${errorMessage(lastRetryable)}`,
+        { cause: lastRetryable },
+      );
+      (err as any).code = 'RPC_RECEIPT_LOOKUP_FAILED';
+      throw err;
+    }
+    return null;
+  }
+
+  private async waitForReceiptWithFailover(
+    txHash: string,
+    label: string,
+  ): Promise<ethers.TransactionReceipt> {
+    const deadline = Date.now() + RPC_RECEIPT_TIMEOUT_MS;
+    let lastError: unknown;
+    while (Date.now() < deadline) {
+      try {
+        const receipt = await this.getTransactionReceiptWithFailover(txHash);
+        if (receipt) {
+          assertSuccessfulReceipt(receipt, label);
+          return receipt;
+        }
+      } catch (err) {
+        if (!isRetryableRpcError(err)) throw err;
+        lastError = err;
+      }
+      await sleep(RPC_RECEIPT_POLL_INTERVAL_MS);
+    }
+    throw new Error(
+      `${label} tx ${txHash} was broadcast but no receipt was found within ${RPC_RECEIPT_TIMEOUT_MS}ms` +
+      (lastError ? ` (last RPC error: ${errorMessage(lastError)})` : ''),
+      { cause: lastError },
+    );
+  }
+
+  private async signPopulatedTransaction(
+    signer: Wallet,
+    populated: ethers.TransactionRequest,
+  ): Promise<{ signedTx: string; txHash: string }> {
+    const filled = await signer.populateTransaction(populated);
+    const signedTx = await signer.signTransaction(filled);
+    const txHash = ethers.Transaction.from(signedTx).hash ?? '0x';
+    return { signedTx, txHash };
+  }
+
+  private async sendSignedTransactionAndWait(
+    signedTx: string,
+    txHash: string,
+    label: string,
+  ): Promise<ethers.TransactionReceipt> {
+    await this.broadcastSignedTransactionWithFailover(signedTx, txHash, label);
+    return this.waitForReceiptWithFailover(txHash, label);
+  }
+
+  private async sendPopulatedTransaction(
+    signer: Wallet,
+    populated: ethers.TransactionRequest,
+    label: string,
+  ): Promise<ethers.TransactionReceipt> {
+    const { signedTx, txHash } = await this.signPopulatedTransaction(signer, populated);
+    return this.sendSignedTransactionAndWait(signedTx, txHash, label);
+  }
+
+  private async sendContractTransaction(
+    contract: Contract,
+    method: string,
+    args: readonly unknown[],
+    signer: Wallet,
+    label: string,
+  ): Promise<ethers.TransactionReceipt> {
+    const connected = contract.connect(signer) as any;
+    const populated = await connected[method].populateTransaction(...args);
+    return this.sendPopulatedTransaction(signer, populated, label);
   }
 
   /**
@@ -704,9 +955,13 @@ export class EVMChainAdapter implements ChainAdapter {
       );
     }
 
-    const profile = this.contracts.profile!.connect(this.adminSigner) as Contract;
-    const tx = await profile.addOperationalWallets(identityId, missing);
-    await tx.wait();
+    await this.sendContractTransaction(
+      this.contracts.profile!,
+      'addOperationalWallets',
+      [identityId, missing],
+      this.adminSigner,
+      'addOperationalWallets',
+    );
 
     for (const address of missing) {
       if (await this.hasOperationalPurpose(identityStorage, identityId, address)) {
@@ -740,8 +995,13 @@ export class EVMChainAdapter implements ChainAdapter {
     if (identityId === 0n) {
       throw new Error('setRelayCapable: signer has no on-chain profile (call ensureProfile first).');
     }
-    const tx = await this.contracts.profile.updateRelayCapable(identityId, relayCapable);
-    const receipt = await tx.wait();
+    const receipt = await this.sendContractTransaction(
+      this.contracts.profile,
+      'updateRelayCapable',
+      [identityId, relayCapable],
+      this.signer,
+      'updateRelayCapable',
+    );
     return {
       hash: receipt.hash,
       blockNumber: receipt.blockNumber,
@@ -939,14 +1199,13 @@ export class EVMChainAdapter implements ChainAdapter {
       }
       const nodeId = ethers.hexlify(ethers.randomBytes(32));
 
-      const tx = await this.contracts.profile!.createProfile(
-        this.adminSigner.address,
-        [],
-        nodeName,
-        nodeId,
-        0,
+      const receipt = await this.sendContractTransaction(
+        this.contracts.profile!,
+        'createProfile',
+        [this.adminSigner.address, [], nodeName, nodeId, 0],
+        this.signer,
+        'createProfile',
       );
-      const receipt = await tx.wait();
 
       for (const log of receipt.logs) {
         try {
@@ -990,13 +1249,23 @@ export class EVMChainAdapter implements ChainAdapter {
         if (stakingV10Addr === ethers.ZeroAddress) {
           throw new Error('StakingV10 not registered in Hub — V10 staking unavailable');
         }
-        const approveTx = await this.contracts.token.approve(stakingV10Addr, stakeAmount);
-        await approveTx.wait();
+        await this.sendContractTransaction(
+          this.contracts.token,
+          'approve',
+          [stakingV10Addr, stakeAmount],
+          this.signer,
+          'approve staking TRAC',
+        );
         // Wait an extra block for state propagation on public RPCs
         await new Promise(r => setTimeout(r, 2000));
 
-        const stakeTx = await stakingNFT.createConviction(identityId, stakeAmount, lockTier);
-        await stakeTx.wait();
+        await this.sendContractTransaction(
+          stakingNFT,
+          'createConviction',
+          [identityId, stakeAmount, lockTier],
+          this.signer,
+          'create staking conviction',
+        );
       } catch (err) {
         console.warn(
           `[ensureProfile] V10 staking failed for identity ${identityId} (profile exists, stake manually via DKGStakingConvictionNFT.createConviction): ` +
@@ -1018,14 +1287,13 @@ export class EVMChainAdapter implements ChainAdapter {
     const nodeName = `node-${ethers.hexlify(ethers.randomBytes(4)).slice(2)}`;
     const nodeId = proof.publicKey.length > 0 ? proof.publicKey : ethers.randomBytes(32);
 
-    const tx = await this.contracts.profile!.createProfile(
-      this.adminSigner.address,
-      [],
-      nodeName,
-      nodeId,
-      0,
+    const receipt = await this.sendContractTransaction(
+      this.contracts.profile!,
+      'createProfile',
+      [this.adminSigner.address, [], nodeName, nodeId, 0],
+      this.signer,
+      'createProfile',
     );
-    const receipt = await tx.wait();
 
     for (const log of receipt.logs) {
       try {
@@ -1062,8 +1330,13 @@ export class EVMChainAdapter implements ChainAdapter {
     await this.init();
     this.requireV9();
 
-    const tx = await this.contracts.knowledgeAssets!.reserveUALRange(count);
-    const receipt = await tx.wait();
+    const receipt = await this.sendContractTransaction(
+      this.contracts.knowledgeAssets!,
+      'reserveUALRange',
+      [count],
+      this.signer,
+      'reserveUALRange',
+    );
 
     for (const log of receipt.logs) {
       try {
@@ -1097,8 +1370,13 @@ export class EVMChainAdapter implements ChainAdapter {
     if (this.contracts.token && params.tokenAmount > 0n) {
       const currentAllowance: bigint = await this.contracts.token.allowance(this.signer.address, kaAddress);
       if (currentAllowance < params.tokenAmount) {
-        const approveTx = await this.contracts.token.approve(kaAddress, ethers.MaxUint256);
-        await approveTx.wait();
+        await this.sendContractTransaction(
+          this.contracts.token,
+          'approve',
+          [kaAddress, ethers.MaxUint256],
+          this.signer,
+          'approve KA TRAC',
+        );
       }
     }
 
@@ -1106,23 +1384,27 @@ export class EVMChainAdapter implements ChainAdapter {
     const rValues = params.receiverSignatures.map((s) => ethers.hexlify(s.r));
     const vsValues = params.receiverSignatures.map((s) => ethers.hexlify(s.vs));
 
-    const tx = await ka.batchMintKnowledgeAssets(
-      params.publisherNodeIdentityId,
-      ethers.hexlify(params.merkleRoot),
-      params.startKAId,
-      params.endKAId,
-      params.publicByteSize,
-      params.epochs,
-      params.tokenAmount,
-      ethers.ZeroAddress, // paymaster
-      ethers.hexlify(params.publisherSignature.r),
-      ethers.hexlify(params.publisherSignature.vs),
-      identityIds,
-      rValues,
-      vsValues,
+    const receipt = await this.sendContractTransaction(
+      ka,
+      'batchMintKnowledgeAssets',
+      [
+        params.publisherNodeIdentityId,
+        ethers.hexlify(params.merkleRoot),
+        params.startKAId,
+        params.endKAId,
+        params.publicByteSize,
+        params.epochs,
+        params.tokenAmount,
+        ethers.ZeroAddress, // paymaster
+        ethers.hexlify(params.publisherSignature.r),
+        ethers.hexlify(params.publisherSignature.vs),
+        identityIds,
+        rValues,
+        vsValues,
+      ],
+      this.signer,
+      'batchMintKnowledgeAssets',
     );
-
-    const receipt = await tx.wait();
 
     let batchId = 0n;
     for (const log of receipt.logs) {
@@ -1157,7 +1439,7 @@ export class EVMChainAdapter implements ChainAdapter {
     }
 
     try {
-      const receipt = await this.provider.getTransactionReceipt(txHash);
+      const receipt = await this.getTransactionReceiptWithFailover(txHash);
       if (!receipt || receipt.status !== 1) return { verified: false };
 
       let onChainMerkleRoot: Uint8Array | undefined;
@@ -1470,8 +1752,13 @@ export class EVMChainAdapter implements ChainAdapter {
     }
     const accessPolicy = params.accessPolicy ?? 0;
     const nameHash = ethers.keccak256(ethers.toUtf8Bytes(name));
-    const tx = await registry.claimName(nameHash, accessPolicy);
-    const receipt = await tx.wait();
+    const receipt = await this.sendContractTransaction(
+      registry,
+      'claimName',
+      [nameHash, accessPolicy],
+      this.signer,
+      'claim context graph name',
+    );
     if (!receipt) throw new Error('createContextGraph: no receipt');
     let contextGraphIdHex: string | undefined;
     for (const log of receipt.logs) {
@@ -1506,8 +1793,13 @@ export class EVMChainAdapter implements ChainAdapter {
     await this.init();
     const registry = this.contracts.contextGraphNameRegistry;
     if (!registry) throw new Error('revealContextGraphMetadata: ContextGraphNameRegistry not available');
-    const tx = await registry.revealMetadata(contextGraphId, name, description);
-    const receipt = await tx.wait();
+    const receipt = await this.sendContractTransaction(
+      registry,
+      'revealMetadata',
+      [contextGraphId, name, description],
+      this.signer,
+      'reveal context graph metadata',
+    );
     if (!receipt) throw new Error('revealContextGraphMetadata: no receipt');
     return { hash: receipt.hash, blockNumber: receipt.blockNumber, success: true };
   }
@@ -1558,20 +1850,25 @@ export class EVMChainAdapter implements ChainAdapter {
         'Pass both explicitly — e.g. { accessPolicy: 1, publishPolicy: 0 } for invite-only + curators-only.',
       );
     }
-    const tx = await this.contracts.contextGraphs.createContextGraph(
-      params.participantAgents ?? [],
-      params.metadataBatchId ?? 0n,
-      params.accessPolicy,
-      params.publishPolicy,
-      params.publishAuthority ?? ethers.ZeroAddress,
-      params.publishAuthorityAccountId ?? 0n,
-      // OT-RFC-38 / LU-6 Phase B — opt-in wire-id commitment. Default
-      // `bytes32(0)` opts out; the agent supplies a non-zero hash
-      // (typically `keccak256(bytes(cleartextId))`) to enable cores'
-      // chain-event-driven host-mode auto-subscribe path.
-      params.nameHash ?? ethers.ZeroHash,
+    const receipt = await this.sendContractTransaction(
+      this.contracts.contextGraphs,
+      'createContextGraph',
+      [
+        params.participantAgents ?? [],
+        params.metadataBatchId ?? 0n,
+        params.accessPolicy,
+        params.publishPolicy,
+        params.publishAuthority ?? ethers.ZeroAddress,
+        params.publishAuthorityAccountId ?? 0n,
+        // OT-RFC-38 / LU-6 Phase B — opt-in wire-id commitment. Default
+        // `bytes32(0)` opts out; the agent supplies a non-zero hash
+        // (typically `keccak256(bytes(cleartextId))`) to enable cores'
+        // chain-event-driven host-mode auto-subscribe path.
+        params.nameHash ?? ethers.ZeroHash,
+      ],
+      this.signer,
+      'create on-chain context graph',
     );
-    const receipt = await tx.wait();
 
     let contextGraphId: bigint | undefined;
     for (const log of receipt.logs) {
@@ -1610,11 +1907,13 @@ export class EVMChainAdapter implements ChainAdapter {
       throw new Error('ContextGraphs contract not deployed.');
     }
 
-    const tx = await this.contracts.contextGraphs.registerKnowledgeCollection(
-      params.contextGraphId,
-      params.batchId,
+    const receipt = await this.sendContractTransaction(
+      this.contracts.contextGraphs,
+      'registerKnowledgeCollection',
+      [params.contextGraphId, params.batchId],
+      this.signer,
+      'register knowledge collection',
     );
-    const receipt = await tx.wait();
 
     return {
       hash: receipt.hash,
@@ -1647,8 +1946,13 @@ export class EVMChainAdapter implements ChainAdapter {
       const token = this.contracts.token.connect(signer) as Contract;
       const currentAllowance: bigint = await token.allowance(signer.address, kaAddress);
       if (currentAllowance < params.tokenAmount) {
-        const approveTx = await token.approve(kaAddress, ethers.MaxUint256);
-        await approveTx.wait();
+        await this.sendContractTransaction(
+          token,
+          'approve',
+          [kaAddress, ethers.MaxUint256],
+          signer,
+          'approve context graph publish TRAC',
+        );
       }
     }
 
@@ -1743,7 +2047,7 @@ export class EVMChainAdapter implements ChainAdapter {
     await this.init();
 
     try {
-      const receipt = await this.provider.getTransactionReceipt(txHash);
+      const receipt = await this.getTransactionReceiptWithFailover(txHash);
       if (!receipt || receipt.status !== 1) return null;
 
       const v10 = this.contracts.knowledgeCollectionStorage
@@ -1886,8 +2190,13 @@ export class EVMChainAdapter implements ChainAdapter {
       const tokenWithSigner = this.contracts.token.connect(txSigner) as Contract;
       const currentAllowance = await tokenWithSigner.allowance(txSigner.address, kaAddress);
       if (currentAllowance < params.tokenAmount) {
-        const approveTx = await tokenWithSigner.approve(kaAddress, params.tokenAmount);
-        await approveTx.wait();
+        await this.sendContractTransaction(
+          tokenWithSigner,
+          'approve',
+          [kaAddress, params.tokenAmount],
+          txSigner,
+          'approve V10 publish TRAC',
+        );
       }
     }
 
@@ -1944,12 +2253,10 @@ export class EVMChainAdapter implements ChainAdapter {
     const populated = await (ka as any).publish.populateTransaction(
       publishParamsStruct,
     );
-    const filled = await txSigner.populateTransaction(populated);
-    const signedTx = await txSigner.signTransaction(filled);
+    const { signedTx, txHash: preBroadcastTxHash } = await this.signPopulatedTransaction(txSigner, populated);
     // Derive the pre-broadcast tx hash from the signed raw hex so WAL
     // consumers can log the exact identity of the tx about to hit the
     // wire. After broadcast completes, the receipt hash matches this.
-    const preBroadcastTxHash = ethers.Transaction.from(signedTx).hash ?? '0x';
     // Codex PR #241 iter-7: `await` the hook. `onBroadcast` is typed
     // as `Promise<void> | void`, so an async WAL writer (disk flush,
     // remote gossip) must run to completion BEFORE we proceed to
@@ -1967,9 +2274,7 @@ export class EVMChainAdapter implements ChainAdapter {
         `${hookErr instanceof Error ? hookErr.message : String(hookErr)}`,
       );
     }
-    const tx = await this.provider.broadcastTransaction(signedTx);
-
-    const receipt = await tx.wait();
+    const receipt = await this.sendSignedTransactionAndWait(signedTx, preBroadcastTxHash, 'V10 publish');
     if (!receipt) throw new Error('Transaction receipt is null');
 
     let kcId = 0n;
@@ -2282,8 +2587,13 @@ export class EVMChainAdapter implements ChainAdapter {
       const tokenWithSigner = this.contracts.token.connect(signer) as Contract;
       const prevAllowance = await tokenWithSigner.allowance(signer.address, kav10Address);
       if (prevAllowance < newTokenAmount) {
-        const approveTx = await tokenWithSigner.approve(kav10Address, newTokenAmount);
-        await approveTx.wait();
+        await this.sendContractTransaction(
+          tokenWithSigner,
+          'approve',
+          [kav10Address, newTokenAmount],
+          signer,
+          'approve V10 update TRAC',
+        );
       }
     }
 
@@ -2297,9 +2607,7 @@ export class EVMChainAdapter implements ChainAdapter {
     // via `agentToAccountId(msg.sender)` for any positive
     // `deltaTokenAmount`.
     const populated = await (ka as any).update.populateTransaction(updateParams);
-    const filled = await signer.populateTransaction(populated);
-    const signedTx = await signer.signTransaction(filled);
-    const preBroadcastTxHash = ethers.Transaction.from(signedTx).hash ?? '0x';
+    const { signedTx, txHash: preBroadcastTxHash } = await this.signPopulatedTransaction(signer, populated);
     // Codex PR #241 iter-7: `await` so async WAL writes complete
     // before broadcast (see publish above for the full rationale).
     try {
@@ -2310,9 +2618,7 @@ export class EVMChainAdapter implements ChainAdapter {
         `${hookErr instanceof Error ? hookErr.message : String(hookErr)}`,
       );
     }
-    const tx = await this.provider.broadcastTransaction(signedTx);
-
-    const receipt = await tx.wait();
+    const receipt = await this.sendSignedTransactionAndWait(signedTx, preBroadcastTxHash, 'V10 update');
     if (!receipt) {
       throw new Error(
         `update broadcast succeeded (txHash=${preBroadcastTxHash}) but receipt was null ` +
@@ -2445,12 +2751,23 @@ export class EVMChainAdapter implements ChainAdapter {
       if (this.contracts.token) {
         const allowance: bigint = await this.contracts.token.allowance(this.signer.address, nftAddress);
         if (allowance < committedTRAC) {
-          await (await this.contracts.token.approve(nftAddress, ethers.MaxUint256)).wait();
+          await this.sendContractTransaction(
+            this.contracts.token,
+            'approve',
+            [nftAddress, ethers.MaxUint256],
+            this.signer,
+            'approve PCA TRAC',
+          );
         }
       }
 
-      const tx = await nft.createAccount(committedTRAC);
-      const receipt = await tx.wait();
+      const receipt = await this.sendContractTransaction(
+        nft,
+        'createAccount',
+        [committedTRAC],
+        this.signer,
+        'create publishing conviction account',
+      );
 
       // Post PR #650 split, `AccountCreated` is emitted by
       // `PublishingConviction` (logic), NOT by the wrapper. Parse via
@@ -2516,10 +2833,22 @@ export class EVMChainAdapter implements ChainAdapter {
       if (this.contracts.token) {
         const allowance: bigint = await this.contracts.token.allowance(this.signer.address, nftAddress);
         if (allowance < amount) {
-          await (await this.contracts.token.approve(nftAddress, ethers.MaxUint256)).wait();
+          await this.sendContractTransaction(
+            this.contracts.token,
+            'approve',
+            [nftAddress, ethers.MaxUint256],
+            this.signer,
+            'approve PCA top-up TRAC',
+          );
         }
       }
-      const receipt = await (await nft.topUp(accountId, amount)).wait();
+      const receipt = await this.sendContractTransaction(
+        nft,
+        'topUp',
+        [accountId, amount],
+        this.signer,
+        'top up publishing conviction account',
+      );
       return { hash: receipt.hash, blockNumber: receipt.blockNumber, success: receipt.status === 1 };
     });
   }
@@ -2528,7 +2857,13 @@ export class EVMChainAdapter implements ChainAdapter {
     await this.init();
     return this.pcaWrite(async () => {
       const nft = this.requireConvictionNFT();
-      const receipt = await (await nft.settle(accountId)).wait();
+      const receipt = await this.sendContractTransaction(
+        nft,
+        'settle',
+        [accountId],
+        this.signer,
+        'settle publishing conviction account',
+      );
       return { hash: receipt.hash, blockNumber: receipt.blockNumber, success: receipt.status === 1 };
     });
   }
@@ -2537,7 +2872,13 @@ export class EVMChainAdapter implements ChainAdapter {
     await this.init();
     return this.pcaWrite(async () => {
       const nft = this.requireConvictionNFT();
-      const receipt = await (await nft.registerAgent(accountId, agent)).wait();
+      const receipt = await this.sendContractTransaction(
+        nft,
+        'registerAgent',
+        [accountId, agent],
+        this.signer,
+        'register publishing conviction agent',
+      );
       return { hash: receipt.hash, blockNumber: receipt.blockNumber, success: receipt.status === 1 };
     });
   }
@@ -2546,7 +2887,13 @@ export class EVMChainAdapter implements ChainAdapter {
     await this.init();
     return this.pcaWrite(async () => {
       const nft = this.requireConvictionNFT();
-      const receipt = await (await nft.deregisterAgent(accountId, agent)).wait();
+      const receipt = await this.sendContractTransaction(
+        nft,
+        'deregisterAgent',
+        [accountId, agent],
+        this.signer,
+        'deregister publishing conviction agent',
+      );
       return { hash: receipt.hash, blockNumber: receipt.blockNumber, success: receipt.status === 1 };
     });
   }
@@ -2752,7 +3099,15 @@ export class EVMChainAdapter implements ChainAdapter {
   }
 
   getProvider(): JsonRpcProvider {
+    return this.primaryProvider;
+  }
+
+  getReadProvider(): JsonRpcProvider | FallbackProvider {
     return this.provider;
+  }
+
+  getRpcUrls(): string[] {
+    return [...this.rpcUrls];
   }
 
   async getContract(name: string): Promise<Contract> {
@@ -3069,8 +3424,13 @@ export class EVMChainAdapter implements ChainAdapter {
 
       let receipt: ethers.TransactionReceipt;
       try {
-        const tx = await rs.createChallenge();
-        receipt = await tx.wait();
+        receipt = await this.sendContractTransaction(
+          rs,
+          'createChallenge',
+          [],
+          this.signer,
+          'create random-sampling challenge',
+        );
       } catch (err) {
         this.translateRandomSamplingError(err);
       }
@@ -3135,8 +3495,13 @@ export class EVMChainAdapter implements ChainAdapter {
 
       let receipt: ethers.TransactionReceipt;
       try {
-        const tx = await rs.submitProof(leafHex, proofHex);
-        receipt = await tx.wait();
+        receipt = await this.sendContractTransaction(
+          rs,
+          'submitProof',
+          [leafHex, proofHex],
+          this.signer,
+          'submit random-sampling proof',
+        );
       } catch (err) {
         this.translateRandomSamplingError(err);
       }

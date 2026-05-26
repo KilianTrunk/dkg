@@ -53,6 +53,12 @@ export interface DaemonStatusResponse {
   relayConnected: boolean;
   multiaddrs: string[];
   relay: RelayStatusResponse;
+  chain?: {
+    chainId: string | null;
+    configured: boolean;
+    rpcEndpointCount: number;
+    hubConfigured: boolean;
+  } | null;
 }
 
 export class ApiClient {

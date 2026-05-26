@@ -14,6 +14,8 @@ export default defineConfig({
       ? ['test/daemon-http-behavior-extra.test.ts']
       : [
           'test/api-client.test.ts',
+          'test/config.test.ts',
+          'test/status-route-rpc.test.ts',
           'test/memory-graph-events.test.ts',
           'test/trust-endpoint-validation.test.ts',
           'test/daemon/plugin-loader.test.ts',

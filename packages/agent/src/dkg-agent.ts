@@ -113,7 +113,7 @@ import { ProfileManager } from './profile-manager.js';
 import { DiscoveryClient, type SkillSearchOptions, type DiscoveredAgent, type DiscoveredOffering } from './discovery.js';
 import { MessageHandler, type SkillHandler, type SkillRequest, type SkillResponse, type ChatHandler, type ChatAclCheck } from './messaging.js';
 import { ed25519ToX25519Private, ed25519ToX25519Public } from './encryption.js';
-import { AGENT_REGISTRY_CONTEXT_GRAPH, canonicalAgentDidSubject, type AgentProfileConfig } from './profile.js';
+import { AGENT_REGISTRY_CONTEXT_GRAPH, canonicalAgentDidSubject, collectPublishableMultiaddrs, type AgentProfileConfig } from './profile.js';
 import {
   signAgentDelegation,
   verifyAgentDelegation,
@@ -249,6 +249,8 @@ import {
   STORAGE_ACK_REGISTRATION_RETRY_MS,
   JOIN_APPROVAL_RETRY_TICK_MS,
   MESSAGE_OUTBOX_TICK_MS,
+  AGENT_PROFILE_HEARTBEAT_MS,
+  AGENT_PROFILE_STALE_THRESHOLD_MS,
 } from './dkg-agent-constants.js';
 import {
   ContextGraphNotFoundError,
@@ -725,6 +727,15 @@ export class DKGAgent {
    */
   private beaconReannounceTimer?: ReturnType<typeof setInterval>;
   /**
+   * PR feat/chain-agents-cg-phonebook — periodic agent-profile
+   * heartbeat. Re-publishes the profile to the `agents` Context
+   * Graph on `AGENT_PROFILE_HEARTBEAT_MS` cadence (operator
+   * override via `config.network.agentProfileHeartbeatMs`; `0`
+   * disables). Undefined until {@link start} runs and `null` after
+   * {@link stop} clears it.
+   */
+  private agentProfileHeartbeatTimer?: ReturnType<typeof setInterval>;
+  /**
    * OT-RFC-38 / LU-6 Phase B — sliding-window rate-limiter applied
    * to pre-registration (beacon-discovered) ciphertext writes.
    * Bounds the freemium-tier abuse vector: any wallet can broadcast
@@ -1175,6 +1186,25 @@ export class DKGAgent {
     }
 
     const network = new LibP2PNetwork(this.node);
+    // Local helper: race a lookup against an optional AbortSignal so
+    // an in-flight SPARQL query honours the resolver's outer deadline.
+    // Codex PR #499 round 5 race: re-check signal.aborted INSIDE the
+    // listener-attach Promise so we don't lose the one-shot 'abort'
+    // event between the early gate and addEventListener.
+    const raceAgainstAbort = <T>(lookup: Promise<T | null>, signal: AbortSignal | undefined): Promise<T | null> => {
+      if (!signal) return lookup;
+      return Promise.race<T | null>([
+        lookup,
+        new Promise<null>((resolve) => {
+          if (signal.aborted) {
+            resolve(null);
+            return;
+          }
+          signal.addEventListener('abort', () => resolve(null), { once: true });
+        }),
+      ]);
+    };
+
     const peerResolver = new PeerResolver({
       network,
       registry: new StubNetworkStateRegistry(),
@@ -1207,32 +1237,29 @@ export class DKGAgent {
           if (opts?.signal?.aborted) return null;
           const lookup = this.discovery.findAgentByPeerId(peerId)
             .then((agent) => agent?.relayAddress ?? null);
-          const signal = opts?.signal;
-          if (!signal) return lookup;
-          return Promise.race<string | null>([
-            lookup,
-            new Promise<null>((resolve) => {
-              // Codex PR #499 round 5 (dkg-agent.ts:1354): the early
-              // `signal.aborted` check above and `addEventListener`
-              // are not atomic — the signal could fire in between, and
-              // since `abort` is a one-shot event, our late listener
-              // would never see it and this Promise would hang for the
-              // full lookup duration. Re-check INSIDE the constructor
-              // before subscribing so the abort branch resolves
-              // immediately if we lost that race.
-              if (signal.aborted) {
-                resolve(null);
-                return;
-              }
-              signal.addEventListener(
-                'abort',
-                () => resolve(null),
-                { once: true },
-              );
-            }),
-          ]);
+          return raceAgainstAbort(lookup, opts?.signal);
+        },
+        // PR feat/chain-agents-cg-phonebook: richer lookup that
+        // returns direct multiaddrs + relayAddress + lastSeen so the
+        // resolver can prime the peerStore with current dialable
+        // addrs and filter by freshness. The resolver falls through
+        // to `findRelayForPeer` if this returns null.
+        findAgentDialAddresses: async (peerId, opts) => {
+          if (opts?.signal?.aborted) return null;
+          const lookup = this.discovery.findAgentByPeerId(peerId)
+            .then((agent) => {
+              if (!agent) return null;
+              const lastSeenMs = agent.lastSeen ? Date.parse(agent.lastSeen) : undefined;
+              return {
+                multiaddrs: agent.multiaddrs ?? [],
+                relayAddress: agent.relayAddress,
+                lastSeenMs: Number.isFinite(lastSeenMs) ? lastSeenMs : undefined,
+              };
+            });
+          return raceAgainstAbort(lookup, opts?.signal);
         },
       },
+      agentDirectoryStaleThresholdMs: AGENT_PROFILE_STALE_THRESHOLD_MS,
       // Bootstrap is a libp2p-startup concern (`bootstrap({ list })` in
       // peerDiscovery, see node.ts) — not a per-peer resolution concern.
       // Removed here per Codex review feedback on PR #496.
@@ -1258,10 +1285,19 @@ export class DKGAgent {
       router: this.router,
       idempotencyStore,
       outboxStore,
+      // PR feat/chain-agents-cg-phonebook: stall-recovery now routes
+      // through the full PeerResolver instead of raw DHT findPeer.
+      // The dial fast-path (ProtocolRouter) already prefers
+      // PeerResolver.resolve() on every attempt, but the outbox
+      // stall-walk (`messenger.maybeScheduleDhtWalk`) was hardcoded
+      // to a DHT-only path — so an entry that timed out 5x because
+      // its addresses were stale couldn't recover by consulting
+      // agents-CG. Routing through PeerResolver picks up the
+      // phonebook fallback automatically; the raw findPeer call
+      // remains the step-2 DHT lookup inside resolve(), so we don't
+      // lose any pre-existing recovery path.
       resolvePeer: async (peerId, { signal }) => {
-        const { peerIdFromString } = await import('@libp2p/peer-id');
-        const pid = peerIdFromString(peerId);
-        await this.node.libp2p.peerRouting.findPeer(pid, { signal });
+        await peerResolver.resolve(peerId, { signal }).catch(() => undefined);
       },
     });
     this.gossip = new GossipSubManager(this.node, this.eventBus);
@@ -1932,6 +1968,25 @@ export class DKGAgent {
     // open during test teardown.
     if (typeof this.beaconReannounceTimer.unref === 'function') {
       this.beaconReannounceTimer.unref();
+    }
+
+    // PR feat/chain-agents-cg-phonebook: schedule the periodic
+    // profile heartbeat alongside the beacon timer. The one-shot
+    // startup publish happens in `lifecycle.ts` (setTimeout 0); this
+    // timer is the steady-state refresh that keeps `dkg:multiaddr` +
+    // `dkg:lastSeen` fresh for peers' dial fallback. Default 5 min;
+    // operator-tunable; `0` disables.
+    const heartbeatMs = this.config.agentProfileHeartbeatMs ?? AGENT_PROFILE_HEARTBEAT_MS;
+    if (Number.isFinite(heartbeatMs) && Number.isInteger(heartbeatMs) && heartbeatMs > 0) {
+      this.agentProfileHeartbeatTimer = setInterval(() => {
+        this.publishProfile().catch((err) => {
+          const msg = err instanceof Error ? err.message : String(err);
+          this.log.warn(ctx, `Agent profile heartbeat publish failed: ${msg}`);
+        });
+      }, heartbeatMs);
+      if (typeof this.agentProfileHeartbeatTimer.unref === 'function') {
+        this.agentProfileHeartbeatTimer.unref();
+      }
     }
 
     // Set up messaging
@@ -3875,6 +3930,8 @@ export class DKGAgent {
       publicKey: pubKeyBase64,
       relayAddress: relayAddrs?.[0],
       agentAddress: this.defaultAgentAddress,
+      multiaddrs: collectPublishableMultiaddrs(this.node.multiaddrs),
+      lastSeen: new Date().toISOString(),
       encryptionKeys: defaultAgent?.workspaceEncryptionKeys.map((k) => ({
         encryptionKeyAlgorithm: k.encryptionKeyAlgorithm,
         publicEncryptionKey: k.publicEncryptionKey,
@@ -17774,6 +17831,10 @@ export class DKGAgent {
     if (this.beaconReannounceTimer) {
       clearInterval(this.beaconReannounceTimer);
       this.beaconReannounceTimer = undefined;
+    }
+    if (this.agentProfileHeartbeatTimer) {
+      clearInterval(this.agentProfileHeartbeatTimer);
+      this.agentProfileHeartbeatTimer = undefined;
     }
     if (this.syncReconcilerTimer) {
       clearInterval(this.syncReconcilerTimer);

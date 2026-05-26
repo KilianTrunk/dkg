@@ -990,6 +990,7 @@ export async function runDaemonInner(
     // having to guess from contract registrations. Travels the wire
     // as libp2p's `AgentVersion` PB field (their naming, not ours).
     nodeVersion: `dkg/${nodeVersion}`,
+    agentProfileHeartbeatMs: config.network?.agentProfileHeartbeatMs,
     syncContextGraphs: syncContextGraphs,
     storeConfig: config.store ? {
       backend: config.store.backend,

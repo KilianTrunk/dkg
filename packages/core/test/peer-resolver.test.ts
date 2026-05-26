@@ -404,6 +404,101 @@ describe('PeerResolver', () => {
     expect(receivedSignal).toBe(ctrl.signal);
   });
 
+  it('step 4 (phonebook): findAgentDialAddresses returns direct multiaddrs (preferred over findRelayForPeer)', async () => {
+    // PR feat/chain-agents-cg-phonebook: when the directory exposes
+    // the richer lookup, the resolver primes the peerStore with the
+    // agent's published `dkg:multiaddr` entries instead of (only)
+    // synthesising the legacy circuit-relay form.
+    net.__findPeerImpl = async () => [];
+    const direct = '/ip4/203.0.113.10/tcp/9090/p2p/' + PEER_B;
+    const dir: AgentDirectoryLookup = {
+      findRelayForPeer: async () => RELAY_ADDR,
+      findAgentDialAddresses: async () => ({
+        multiaddrs: [direct],
+        relayAddress: RELAY_ADDR,
+        lastSeenMs: Date.now(),
+      }),
+    };
+    const resolver = new PeerResolver({
+      network: net,
+      registry,
+      agentDirectory: dir,
+    });
+    const out = await resolver.resolve(PEER_B);
+    expect(out).toContain(direct);
+    expect(out).toContain(`${RELAY_ADDR}/p2p-circuit/p2p/${PEER_B}`);
+  });
+
+  it('step 4 (phonebook): stale dkg:lastSeen drops multiaddrs but keeps the relay address', async () => {
+    // Staleness threshold defaults to 24h. Agents whose lastSeen is
+    // older are assumed offline / NAT-rebound; their direct addrs
+    // are skipped. The relay address is still tried because relays
+    // outlive individual peer NAT bindings.
+    net.__findPeerImpl = async () => [];
+    const direct = '/ip4/203.0.113.10/tcp/9090/p2p/' + PEER_B;
+    const dir: AgentDirectoryLookup = {
+      findRelayForPeer: async () => null,
+      findAgentDialAddresses: async () => ({
+        multiaddrs: [direct],
+        relayAddress: RELAY_ADDR,
+        lastSeenMs: Date.now() - 48 * 60 * 60 * 1000, // 48h old
+      }),
+    };
+    const resolver = new PeerResolver({
+      network: net,
+      registry,
+      agentDirectory: dir,
+    });
+    const out = await resolver.resolve(PEER_B);
+    expect(out).not.toContain(direct);
+    expect(out).toContain(`${RELAY_ADDR}/p2p-circuit/p2p/${PEER_B}`);
+  });
+
+  it('step 4 (phonebook): falls back to findRelayForPeer when findAgentDialAddresses is not implemented', async () => {
+    // Backward-compat: older directory implementations that only
+    // implement `findRelayForPeer` continue to work unchanged.
+    net.__findPeerImpl = async () => [];
+    const dir: AgentDirectoryLookup = {
+      findRelayForPeer: async () => RELAY_ADDR,
+      // findAgentDialAddresses intentionally omitted
+    };
+    const resolver = new PeerResolver({
+      network: net,
+      registry,
+      agentDirectory: dir,
+    });
+    const out = await resolver.resolve(PEER_B);
+    expect(out).toEqual([`${RELAY_ADDR}/p2p-circuit/p2p/${PEER_B}`]);
+  });
+
+  it('step 4 (phonebook): custom agentDirectoryStaleThresholdMs is honoured', async () => {
+    net.__findPeerImpl = async () => [];
+    const direct = '/ip4/203.0.113.10/tcp/9090/p2p/' + PEER_B;
+    const dir: AgentDirectoryLookup = {
+      findRelayForPeer: async () => null,
+      findAgentDialAddresses: async () => ({
+        multiaddrs: [direct],
+        lastSeenMs: Date.now() - 10_000, // 10s ago — fresh by default
+      }),
+    };
+    // With a strict 1ms threshold even a 10s-old profile is stale.
+    const strict = new PeerResolver({
+      network: net,
+      registry,
+      agentDirectory: dir,
+      agentDirectoryStaleThresholdMs: 1,
+    });
+    expect(await strict.resolve(PEER_B)).toEqual([]);
+
+    // Default threshold (24h) keeps the same profile fresh.
+    const lenient = new PeerResolver({
+      network: net,
+      registry,
+      agentDirectory: dir,
+    });
+    expect(await lenient.resolve(PEER_B)).toContain(direct);
+  });
+
   it('returns empty array when nothing resolves', async () => {
     net.__findPeerImpl = async () => [];
     const resolver = new PeerResolver({

@@ -14,6 +14,20 @@ export interface DiscoveredAgent {
   nodeRole?: string;
   relayAddress?: string;
   agentAddress?: string;
+  /**
+   * Direct libp2p multiaddrs the agent has published via
+   * `dkg:multiaddr` (PR feat/chain-agents-cg-phonebook). Empty
+   * array when the profile pre-dates the phonebook schema or the
+   * agent has nothing dialable to advertise.
+   */
+  multiaddrs?: string[];
+  /**
+   * ISO-8601 timestamp from the agent's `dkg:lastSeen` triple.
+   * Undefined when the profile pre-dates the phonebook schema;
+   * consumers should treat undefined as "unknown freshness" and
+   * fall back to `relayAddress` only.
+   */
+  lastSeen?: string;
 }
 
 export interface DiscoveredOffering {
@@ -131,29 +145,51 @@ export class DiscoveryClient {
   }
 
   async findAgentByPeerId(peerId: string): Promise<DiscoveredAgent | null> {
-    const sparql = `
-      SELECT ?agent ?name ?framework ?nodeRole ?relayAddress WHERE {
+    // Two-query path keeps the existing single-row SELECT semantics
+    // for scalar columns (name, framework, nodeRole, relayAddress,
+    // lastSeen) while a separate query gathers all `dkg:multiaddr`
+    // rows. Pulling multiaddrs inline would force a GROUP_CONCAT
+    // round-trip; that works but is harder to test deterministically
+    // (engine-specific ordering / separator semantics). Two queries
+    // keep each result simple.
+    const scalar = `
+      SELECT ?agent ?name ?framework ?nodeRole ?relayAddress ?lastSeen WHERE {
         ?agent a <${DKG}Agent> ;
                <${SCHEMA}name> ?name ;
                <${DKG}peerId> "${escapeSparqlLiteral(peerId)}" .
         OPTIONAL { ?agent <${SKILL}framework> ?framework }
         OPTIONAL { ?agent <${DKG}nodeRole> ?nodeRole }
         OPTIONAL { ?agent <${DKG}relayAddress> ?relayAddress }
+        OPTIONAL { ?agent <${DKG}lastSeen> ?lastSeen }
       }
       LIMIT 1
     `;
 
-    const result = await this.engine.query(sparql, { contextGraphId: AGENT_REGISTRY_CONTEXT_GRAPH });
-    if (result.bindings.length === 0) return null;
+    const scalarResult = await this.engine.query(scalar, { contextGraphId: AGENT_REGISTRY_CONTEXT_GRAPH });
+    if (scalarResult.bindings.length === 0) return null;
 
-    const row = result.bindings[0];
+    const row = scalarResult.bindings[0];
+    const agentUri = row['agent'];
+
+    const multiSparql = `
+      SELECT ?multiaddr WHERE {
+        <${agentUri}> <${DKG}multiaddr> ?multiaddr .
+      }
+    `;
+    const multiResult = await this.engine.query(multiSparql, { contextGraphId: AGENT_REGISTRY_CONTEXT_GRAPH });
+    const multiaddrs = multiResult.bindings
+      .map((r) => (r['multiaddr'] ? stripQuotes(r['multiaddr']) : ''))
+      .filter((s) => s.length > 0);
+
     return {
-      agentUri: row['agent'],
+      agentUri,
       name: stripQuotes(row['name']),
       peerId,
       framework: row['framework'] ? stripQuotes(row['framework']) : undefined,
       nodeRole: row['nodeRole'] ? stripQuotes(row['nodeRole']) : undefined,
       relayAddress: row['relayAddress'] ? stripQuotes(row['relayAddress']) : undefined,
+      multiaddrs: multiaddrs.length > 0 ? multiaddrs : undefined,
+      lastSeen: row['lastSeen'] ? stripQuotes(row['lastSeen']) : undefined,
     };
   }
 }

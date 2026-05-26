@@ -67,6 +67,39 @@ export interface AgentDirectoryLookup {
     peerId: NodeIdentity,
     opts?: { signal?: AbortSignal },
   ): Promise<Address | null>;
+  /**
+   * Optional richer lookup (PR feat/chain-agents-cg-phonebook).
+   * When present, the resolver prefers this over `findRelayForPeer`
+   * so it can pick up direct multiaddrs + freshness metadata. The
+   * resolver falls back to `findRelayForPeer` if this returns null
+   * or the implementation omits the method (older directories).
+   *
+   * Returns:
+   *   - `null` if the peer is unknown to the directory.
+   *   - `{ multiaddrs, relayAddress?, lastSeenMs? }` otherwise.
+   *     `multiaddrs` may be empty if the agent only published a
+   *     relay address; the resolver still uses the relay form in
+   *     that case.
+   *
+   * Staleness filtering: when `lastSeenMs` is present AND older than
+   * `staleThresholdMs` the resolver ignores `multiaddrs` (but still
+   * tries `relayAddress`, which is conservative — even an old relay
+   * address dialled via a circuit usually still works because the
+   * relay itself is more long-lived than a NATed peer).
+   */
+  findAgentDialAddresses?(
+    peerId: NodeIdentity,
+    opts?: { signal?: AbortSignal },
+  ): Promise<AgentDirectoryDialAddresses | null>;
+}
+
+export interface AgentDirectoryDialAddresses {
+  /** Direct multiaddrs the agent has published via `dkg:multiaddr`. May be empty. */
+  multiaddrs: Address[];
+  /** Relay address (legacy `dkg:relayAddress`), if any. */
+  relayAddress?: Address;
+  /** Epoch ms of the agent's `dkg:lastSeen`. Undefined if the agent didn't publish one. */
+  lastSeenMs?: number;
 }
 
 export interface PeerResolverDeps {
@@ -75,6 +108,14 @@ export interface PeerResolverDeps {
   agentDirectory: AgentDirectoryLookup;
   /** Optional logger; defaults to silent except for serious errors. */
   logger?: PeerResolverLogger;
+  /**
+   * Max age (ms) of an agent's `dkg:lastSeen` before its published
+   * direct multiaddrs are ignored during step-4 resolution. Defaults
+   * to 24h. Only applies to the richer `findAgentDialAddresses` code
+   * path — when present, `relayAddress` is still tried regardless
+   * (relays themselves outlive individual peer NAT bindings).
+   */
+  agentDirectoryStaleThresholdMs?: number;
 }
 
 export interface PeerResolverLogger {
@@ -98,6 +139,7 @@ export interface ResolveOpts {
 }
 
 const DEFAULT_PER_STEP_TIMEOUT_MS = 5_000;
+const DEFAULT_AGENT_DIRECTORY_STALE_THRESHOLD_MS = 24 * 60 * 60 * 1000;
 
 const SILENT_LOGGER: PeerResolverLogger = {
   warn: () => undefined,
@@ -108,12 +150,21 @@ export class PeerResolver {
   private readonly registry: NetworkStateRegistry;
   private readonly agentDirectory: AgentDirectoryLookup;
   private readonly logger: PeerResolverLogger;
+  private readonly agentDirectoryStaleThresholdMs: number;
 
   constructor(deps: PeerResolverDeps) {
     this.network = deps.network;
     this.registry = deps.registry;
     this.agentDirectory = deps.agentDirectory;
     this.logger = deps.logger ?? SILENT_LOGGER;
+    const stale = deps.agentDirectoryStaleThresholdMs;
+    this.agentDirectoryStaleThresholdMs =
+      typeof stale === 'number' &&
+      Number.isFinite(stale) &&
+      Number.isInteger(stale) &&
+      stale > 0
+        ? stale
+        : DEFAULT_AGENT_DIRECTORY_STALE_THRESHOLD_MS;
   }
 
   /**
@@ -249,14 +300,38 @@ export class PeerResolver {
     // Messenger.ensureCircuitRelayAddress path. Pass `opts.signal`
     // through so an in-flight SPARQL query honours the outer deadline
     // (Codex review feedback on PR #496 round 4).
+    //
+    // PR feat/chain-agents-cg-phonebook: prefer the richer
+    // `findAgentDialAddresses` when the directory implementation
+    // supports it — that returns direct multiaddrs + relay + lastSeen
+    // for staleness filtering. Falls back to `findRelayForPeer` for
+    // older directories.
     if (aborted()) return accumulated;
     try {
-      const relay = await this.agentDirectory.findRelayForPeer(peerId, {
-        signal: opts?.signal,
-      });
-      if (relay) {
-        const circuitAddr = `${relay}/p2p-circuit/p2p/${peerId}`;
-        await primeAndAppend([circuitAddr], 'agents-CG');
+      if (typeof this.agentDirectory.findAgentDialAddresses === 'function') {
+        const dial = await this.agentDirectory.findAgentDialAddresses(peerId, {
+          signal: opts?.signal,
+        });
+        if (dial) {
+          const isStale =
+            dial.lastSeenMs !== undefined &&
+            Date.now() - dial.lastSeenMs > this.agentDirectoryStaleThresholdMs;
+          if (!isStale && dial.multiaddrs.length > 0) {
+            await primeAndAppend(dial.multiaddrs, 'agents-CG');
+          }
+          if (dial.relayAddress) {
+            const circuitAddr = `${dial.relayAddress}/p2p-circuit/p2p/${peerId}`;
+            await primeAndAppend([circuitAddr], 'agents-CG');
+          }
+        }
+      } else {
+        const relay = await this.agentDirectory.findRelayForPeer(peerId, {
+          signal: opts?.signal,
+        });
+        if (relay) {
+          const circuitAddr = `${relay}/p2p-circuit/p2p/${peerId}`;
+          await primeAndAppend([circuitAddr], 'agents-CG');
+        }
       }
     } catch (err) {
       this.logger.debug?.(`agents-CG lookup for ${peerId} failed: ${errMsg(err)}`);

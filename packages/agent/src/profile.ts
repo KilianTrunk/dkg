@@ -24,6 +24,44 @@ export function canonicalAgentDidSubject(raw: string): string {
   return raw;
 }
 
+/**
+ * Filter a node's live libp2p multiaddrs down to the set worth
+ * publishing in the agent profile. Drops:
+ *   - loopback (127.0.0.0/8, ::1) — never dialable from another host
+ *   - link-local (169.254.0.0/16, fe80::/10) — not routable
+ *   - 0.0.0.0 / :: unspecified bind addresses
+ *   - duplicates
+ *
+ * Keeps everything else as-is — TCP, WebSocket, circuit-relayed
+ * (`/p2p-circuit`), DNS, public IPs. Callers (`DKGAgent.publishProfile`)
+ * feed the result into `AgentProfileConfig.multiaddrs`.
+ *
+ * Exported separately so it can be unit-tested without standing up a
+ * full agent.
+ */
+export function collectPublishableMultiaddrs(
+  raw: readonly string[],
+): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const ma of raw) {
+    if (!ma || seen.has(ma)) continue;
+    if (
+      /\/ip4\/127\./.test(ma) ||
+      /\/ip4\/0\.0\.0\.0\//.test(ma) ||
+      /\/ip4\/169\.254\./.test(ma) ||
+      /\/ip6\/::1\//.test(ma) ||
+      /\/ip6\/::\//.test(ma) ||
+      /\/ip6\/fe80:/i.test(ma)
+    ) {
+      continue;
+    }
+    seen.add(ma);
+    out.push(ma);
+  }
+  return out;
+}
+
 const RDF_TYPE = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type';
 const SCHEMA = 'https://schema.org/';
 const DKG = 'https://dkg.network/ontology#';
@@ -62,6 +100,28 @@ export interface AgentProfileConfig {
   publicKey?: string;
   relayAddress?: string;
   agentAddress?: string;
+  /**
+   * Live libp2p multiaddrs other peers should use to dial this node.
+   * Should be the publicly-reachable / circuit-relayed forms (filtered
+   * to exclude loopback + link-local). Empty/undefined leaves the
+   * `dkg:multiaddr` triples unset — older agents may publish profiles
+   * without these and the discovery path falls back to
+   * `dkg:relayAddress` alone.
+   *
+   * Caller is responsible for filtering; this function emits whatever
+   * it receives. See `DKGAgent.publishProfile` for the production
+   * filter (drops loopback / link-local / unspecified).
+   */
+  multiaddrs?: readonly string[];
+  /**
+   * ISO-8601 timestamp of when this profile was generated. Consumers
+   * use this as a freshness signal: profiles older than the
+   * application's staleness threshold (typically 24h) are skipped
+   * during dial fallback so we don't try addresses from a node that
+   * has been offline for days. Defaults to `new Date().toISOString()`
+   * when omitted.
+   */
+  lastSeen?: string;
   /**
    * Every workspace encryption key registered to this agent, including retired
    * ones (so the registry can publish their wallet-signed revocations and
@@ -133,6 +193,25 @@ export function buildAgentProfile(config: AgentProfileConfig): {
   if (config.agentAddress) {
     q(entity, `${DKG}agentAddress`, `"${canonicalAgentDidSubject(config.agentAddress)}"`);
   }
+  // Distributed phonebook (PR feat/chain-agents-cg-phonebook).
+  // Note: properties `dkg:multiaddr` and `dkg:lastSeen` are emitted on
+  // the agent entity without a matching genesis ontology declaration.
+  // Adding them to genesis would change the hashed `networkId`
+  // (`computeNetworkId` hashes all genesis quads), breaking any node
+  // still on rc.11. RDF doesn't require properties to be declared —
+  // they're usable as-is. Ontology declarations can land in a
+  // coordinated genesis bump later.
+  if (config.multiaddrs && config.multiaddrs.length > 0) {
+    for (const ma of config.multiaddrs) {
+      // Defensive: skip entries containing a `"` which would break
+      // the N-Quad literal encoding. Real libp2p multiaddrs never
+      // contain quote characters; this guard is purely against
+      // malformed callers.
+      if (!ma || ma.includes('"')) continue;
+      q(entity, `${DKG}multiaddr`, `"${ma}"`);
+    }
+  }
+  q(entity, `${DKG}lastSeen`, `"${config.lastSeen ?? new Date().toISOString()}"`);
   // Encryption keys: prefer the multi-key array; fall back to the deprecated
   // singular fields only when the array isn't supplied (legacy callers /
   // test fixtures). Retired keys still get published so peers learn their

@@ -29,7 +29,7 @@ test('resolveDaemonAuth reads api.port + auth.token from DKG_HOME', async () => 
   });
 });
 
-test('resolveDaemonAuth uses DKG_API_PORT before api.port file', async () => {
+test('resolveDaemonAuth ignores ambient DKG_API_PORT unless explicitly opted in', async () => {
   await withHome(async (dir) => {
     await writeFile(join(dir, 'api.port'), '9301\n');
     await writeFile(join(dir, 'auth.token'), 'secret-token\n');
@@ -38,9 +38,9 @@ test('resolveDaemonAuth uses DKG_API_PORT before api.port file', async () => {
     process.env.DKG_API_PORT = '9402';
     try {
       const auth = await resolveDaemonAuth(dir);
-      assert.equal(auth.baseUrl, 'http://127.0.0.1:9402');
-      const secondaryAuth = await resolveDaemonAuth(dir, { useEnvPort: false });
-      assert.equal(secondaryAuth.baseUrl, 'http://127.0.0.1:9301');
+      assert.equal(auth.baseUrl, 'http://127.0.0.1:9301');
+      const envAuth = await resolveDaemonAuth(dir, { useEnvPort: true });
+      assert.equal(envAuth.baseUrl, 'http://127.0.0.1:9402');
     } finally {
       if (oldPort === undefined) {
         delete process.env.DKG_API_PORT;

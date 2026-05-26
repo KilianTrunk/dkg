@@ -205,6 +205,8 @@ describe('mergeAugmentFragment — Bug 1: @type multi-type union', () => {
       new Set<string>(),
     );
     expect(warnSpy).not.toHaveBeenCalled();
+    const reserved = mergeAugmentFragment(base, { '@id': 'urn:extension-owned-root' }, new Set<string>());
+    expect(reserved).not.toHaveProperty('@id');
     warnSpy.mockRestore();
   });
 });

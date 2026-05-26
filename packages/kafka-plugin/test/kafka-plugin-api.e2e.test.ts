@@ -96,6 +96,10 @@ async function copyFixtureWithoutDist(sourceDir: string): Promise<FixtureEntrypo
   await rm(packageDir, { recursive: true, force: true });
   await cp(sourceDir, packageDir, { recursive: true });
   await rm(join(packageDir, 'dist'), { recursive: true, force: true });
+  const packageJsonPath = join(packageDir, 'package.json');
+  const pkg = JSON.parse(await readFile(packageJsonPath, 'utf-8'));
+  pkg.dependencies['@origintrail-official/kafka-plugin'] = `file:${KAFKA_PLUGIN_PACKAGE_DIR}`;
+  await writeFile(packageJsonPath, `${JSON.stringify(pkg, null, 2)}\n`);
   return { tempRoot: packageDir, packageDir, entrypoint: join(packageDir, 'dist', 'index.js') };
 }
 interface DaemonOpts {

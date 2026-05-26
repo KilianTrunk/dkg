@@ -3,7 +3,7 @@ import { join } from 'node:path';
 
 import { readDkgConfig } from './config-file.mjs';
 
-export async function resolveDaemonAuth(dkgHome, { useEnvPort = true } = {}) {
+export async function resolveDaemonAuth(dkgHome, { useEnvPort = false } = {}) {
   const portPath = join(dkgHome, 'api.port');
   let portSource = useEnvPort ? process.env.DKG_API_PORT : undefined;
   if (portSource === undefined) {

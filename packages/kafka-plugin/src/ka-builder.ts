@@ -39,6 +39,10 @@ export function mergeAugmentFragment(
       merged['@context'] = mergeContexts(baseKa['@context'], value, loggedCollisionKeys);
       continue;
     }
+    if (key.startsWith('@')) {
+      logCollisionOnce(key, loggedCollisionKeys);
+      continue;
+    }
     if (key in baseKa) {
       logCollisionOnce(key, loggedCollisionKeys);
       continue;

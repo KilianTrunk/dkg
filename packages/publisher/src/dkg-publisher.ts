@@ -1158,6 +1158,15 @@ export class DKGPublisher implements Publisher {
        * for the full semantics.
        */
       encryptInlinePayload?: PublishOptions['encryptInlinePayload'];
+      /**
+       * OT-RFC-38 LU-11. Sibling of `encryptInlinePayload` — when set,
+       * the publisher routes through the chunked path that fans
+       * per-chunk ciphertexts via SWM gossip and ships only the
+       * commitment to cores via V2 ACK. See
+       * `PublishOptions.encryptInlineChunked` for the full
+       * semantics.
+       */
+      encryptInlineChunked?: PublishOptions['encryptInlineChunked'];
     },
   ): Promise<PublishResult> {
     const ctx = options?.operationCtx ?? createOperationContext('publishFromSWM');
@@ -1275,6 +1284,7 @@ export class DKGPublisher implements Publisher {
       publisherNodeIdentityIdOverride: options?.publisherNodeIdentityIdOverride,
       precomputedAttestation: options?.precomputedAttestation,
       encryptInlinePayload: options?.encryptInlinePayload,
+      encryptInlineChunked: options?.encryptInlineChunked,
       [INTERNAL_ORIGIN_TOKEN]: true,
     };
     const publishResult = await this.publish(internalPublishOptions);
@@ -1812,9 +1822,39 @@ export class DKGPublisher implements Publisher {
     // the existing behaviour: `fromSharedMemory` → cores look up SWM
     // locally; otherwise plaintext inline.
     const useEncryptedInline = typeof options.encryptInlinePayload === 'function';
+    // OT-RFC-38 LU-11: chunked path takes precedence when wired. The
+    // agent always sets BOTH callbacks for curated CGs (see
+    // `_resolveEncryptInlinePayload` + `_resolveEncryptInlineChunked`
+    // on DKGAgent) so this branch picks the strictly-better path
+    // without needing per-call flag plumbing. A future commit can drop
+    // the LU-5 single-blob callback once chunked is the only path.
+    const useChunkedInline = useEncryptedInline && typeof options.encryptInlineChunked === 'function';
     let stagingQuads: Uint8Array | undefined;
     let stagingByteSize = publicByteSize;
-    if (useEncryptedInline) {
+    let chunkedCommitment: {
+      ciphertextChunksRoot: Uint8Array;
+      ciphertextChunkCount: number;
+    } | undefined;
+    if (useChunkedInline) {
+      const plaintextBytes = new TextEncoder().encode(nquadsStr);
+      // batchId = V10 KC merkleRoot. Stable per-publish identifier the
+      // cores use to key per-chunk persistence as
+      // (cgId, batchId, chunkIndex) — the exact triple RFC-39 random
+      // sampling samples against.
+      const chunked = await options.encryptInlineChunked!({
+        plaintextNquads: plaintextBytes,
+        batchId: kcMerkleRoot,
+      });
+      // No stagingQuads on the chunked path — chunks travel via SWM
+      // gossip, never on the ACK wire. Cores recompute the root from
+      // local per-chunk store and DECLINE on mismatch.
+      stagingQuads = undefined;
+      stagingByteSize = BigInt(chunked.totalCiphertextBytes);
+      chunkedCommitment = {
+        ciphertextChunksRoot: chunked.ciphertextChunksRoot,
+        ciphertextChunkCount: chunked.ciphertextChunkCount,
+      };
+    } else if (useEncryptedInline) {
       const plaintextBytes = new TextEncoder().encode(nquadsStr);
       const ciphertext = await options.encryptInlinePayload!(plaintextBytes);
       stagingQuads = ciphertext instanceof Uint8Array ? ciphertext : new Uint8Array(ciphertext);
@@ -1974,6 +2014,7 @@ export class DKGPublisher implements Publisher {
           swmGraphId, options.subGraphName,
           kcMerkleLeafCount,
           useEncryptedInline,
+          chunkedCommitment,
         );
         // PR5 ACK-provenance summary — one line per publish that names
         // every ACKing core and the LU-6 Phase B discovery path that

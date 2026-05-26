@@ -69,6 +69,10 @@ import {
   type ProtocolOutboxStore,
   type ProtocolOutboxEntry,
   encryptV10PublishPayload,
+  encryptChunked,
+  buildCiphertextChunksRoot,
+  computeGossipSigningPayloadV2,
+  GOSSIP_TYPE_WORKSPACE_PUBLISH_CHUNKED,
   type SubscriptionSource,
   SUBSCRIPTION_SOURCES,
   pickNetworkTunables,
@@ -363,6 +367,33 @@ export type {
  *   const response = await agent.invokeSkill(offerings[0], inputData);
  *   await agent.stop();
  */
+/**
+ * OT-RFC-38 LU-11. Target ciphertext-chunk size on the SWM gossip
+ * wire. 32 KiB stays well under libp2p's per-message ceiling (the
+ * mesh defaults to 1 MiB) so chunks rarely fragment at the transport
+ * layer, and produces a tree shallow enough that on-chain proof
+ * verification per RFC-39 sampling tick stays cheap. The last chunk
+ * is whatever fraction remains.
+ */
+const CIPHERTEXT_CHUNK_SIZE_BYTES = 32 * 1024;
+
+/**
+ * OT-RFC-38 LU-11. Split a single plaintext buffer into the
+ * fixed-size pieces the chunked AEAD path expects. Empty input is
+ * rejected — the publisher computes `merkleRoot` from non-empty
+ * `kaCount` quads, so an empty plaintext upstream is always a bug.
+ */
+function sliceIntoCiphertextChunks(plaintext: Uint8Array): Uint8Array[] {
+  if (plaintext.length === 0) {
+    throw new Error('LU-11: sliceIntoCiphertextChunks rejects empty plaintext');
+  }
+  const chunks: Uint8Array[] = [];
+  for (let off = 0; off < plaintext.length; off += CIPHERTEXT_CHUNK_SIZE_BYTES) {
+    chunks.push(plaintext.subarray(off, Math.min(off + CIPHERTEXT_CHUNK_SIZE_BYTES, plaintext.length)));
+  }
+  return chunks;
+}
+
 export class DKGAgent {
   readonly wallet: AgentWallet;
   readonly node: DKGNode;
@@ -7315,6 +7346,17 @@ export class DKGAgent {
       undefined,
       onChainId ?? undefined,
     );
+    // OT-RFC-38 LU-11 — also resolve the chunked emitter for curated
+    // CGs. When set, the publisher prefers this path: chunks fan out
+    // via SWM gossip and the V2 ACK carries only the commitment.
+    // Public CGs short-circuit to `undefined` here just like the
+    // single-blob resolver above.
+    const encryptInlineChunked = await this._resolveEncryptInlineChunked(
+      contextGraphId,
+      opts?.subGraphName,
+      undefined,
+      onChainId ?? undefined,
+    );
 
     const result = await this.publisher.publish({
       contextGraphId,
@@ -7330,6 +7372,7 @@ export class DKGAgent {
       publishContextGraphId: onChainId ?? undefined,
       precomputedAttestation,
       encryptInlinePayload,
+      encryptInlineChunked,
     });
 
     onPhase?.('broadcast', 'start');
@@ -8177,33 +8220,27 @@ export class DKGAgent {
    * NO_DATA_IN_SWM (same observable as today, the §1.1 bug). The
    * agent surfaces a warn so operators see the configuration miss.
    */
-  private async _resolveEncryptInlinePayload(
+  /**
+   * Shared resolution between LU-5 (`_resolveEncryptInlinePayload`) and
+   * LU-11 (`_resolveEncryptInlineChunked`). Probes the access policy,
+   * bootstraps / rotates the swm-sender-key epoch, and returns the
+   * effective `chainKey` + AEAD CG-id binding. Returns `undefined` for
+   * public CGs so the caller stays on the plaintext-inline path.
+   *
+   * The original LU-5 method body lived inline here pre-LU-11; pulling
+   * it into a helper avoided drifting two near-identical curated-
+   * probe / epoch-rotation blocks once chunked emission joined the
+   * picture. All semantics (probe order, rotation triggers, fail-
+   * closed branches, error texts) are preserved.
+   */
+  private async _resolveCuratedChainKeyContext(
     contextGraphId: string,
-    subGraphName?: string,
-    authorAgentAddress?: string,
-    publishContextGraphId?: string,
-  ): Promise<((plaintext: Uint8Array) => Promise<Uint8Array>) | undefined> {
+    subGraphName: string | undefined,
+    authorAgentAddress: string | undefined,
+    publishContextGraphId: string | undefined,
+    logPrefix: string,
+  ): Promise<{ chainKey: Uint8Array; aeadCgId: string; senderAddress: string } | undefined> {
     const ctx = createOperationContext('publish');
-    // Codex PR #608 R4 #7375: the encryption decision must be keyed
-    // off the TARGET on-chain CG, not the source SWM graph. On remap
-    // publishes (`publishContextGraphId` differs from the local SWM
-    // `contextGraphId`), the prior source-only probe produced two
-    // distinct failure modes:
-    //
-    //   public source → curated target: skipped encryption → plaintext
-    //     leaked to the curated target's ACK peers (security).
-    //   private source → public target: applied encryption → core's
-    //     `isCgCurated` check (R3 #1325, now target-keyed) correctly
-    //     rejected the opaque ACK → publish blocked (correctness).
-    //
-    // The probe mirrors the SWM data-plane `isCgCurated` callback at
-    // line 1499: local meta-graph first (works for URL-style ids the
-    // local store knows about), then chain access-policy fallback
-    // for numeric on-chain ids (covers the C2 case where the target
-    // is just the numeric `cgId` from the publish intent and the
-    // local store has no triple keyed by that id). Numeric IDs are
-    // chain-owned; if chain truth is unavailable, return UNKNOWN and
-    // fail closed instead of silently publishing plaintext.
     const targetCgId = publishContextGraphId ?? contextGraphId;
     const probeIsCurated = async (cgId: string): Promise<boolean | null> => {
       try {
@@ -8220,10 +8257,6 @@ export class DKGAgent {
       if (numericId <= 0n) return false;
       const getAccessPolicy = this.chain.getContextGraphAccessPolicy;
       if (typeof getAccessPolicy !== 'function') {
-        // Numeric ids are chain-owned policy surfaces. If the adapter
-        // cannot expose chain truth, choosing plaintext would risk a
-        // curated-target leak, so keep the UNKNOWN path and let the
-        // caller fail closed below.
         return null;
       }
       try {
@@ -8234,7 +8267,7 @@ export class DKGAgent {
         }
         return null;
       } catch (err) {
-        this.log.warn(ctx, `_resolveEncryptInlinePayload: chain.getContextGraphAccessPolicy(${cgId}) failed — treating as UNKNOWN (fail-closed): ${err instanceof Error ? err.message : String(err)}`);
+        this.log.warn(ctx, `${logPrefix}: chain.getContextGraphAccessPolicy(${cgId}) failed — treating as UNKNOWN (fail-closed): ${err instanceof Error ? err.message : String(err)}`);
       }
       return null;
     };
@@ -8244,19 +8277,15 @@ export class DKGAgent {
       : await probeIsCurated(targetCgId);
     if (targetIsCurated == null || (targetCgId !== contextGraphId && sourceIsCurated == null)) {
       throw new Error(
-        `LU-5: publish access-policy is unknown — ` +
+        `${logPrefix}: publish access-policy is unknown — ` +
         `source CG "${contextGraphId}" curated=${sourceIsCurated ?? 'unknown'}, ` +
         `target CG "${targetCgId}" curated=${targetIsCurated ?? 'unknown'}. ` +
         `Refusing to choose plaintext vs encrypted inline payload without chain-confirmed policy.`,
       );
     }
     if (targetCgId !== contextGraphId && sourceIsCurated !== targetIsCurated) {
-      // Fail-closed: a remap publish that crosses the privacy
-      // boundary in either direction is almost certainly an
-      // operator/caller mistake. Refuse rather than silently picking
-      // one side and producing the wrong wire shape.
       throw new Error(
-        `LU-5: remap publish source/target access-policy mismatch — ` +
+        `${logPrefix}: remap publish source/target access-policy mismatch — ` +
         `source CG "${contextGraphId}" curated=${sourceIsCurated}, ` +
         `target CG "${targetCgId}" curated=${targetIsCurated}. ` +
         `Refusing to publish: encrypting against the wrong CG's policy ` +
@@ -8271,45 +8300,32 @@ export class DKGAgent {
       ?? this.defaultAgentAddress
       ?? this.peerId;
 
-    // Codex PR #608 R3 #7: mirror the rotation contract from
-    // `encryptWorkspacePayloadWithSenderKey` — always load persisted
-    // state FIRST so a daemon restart reuses the existing epoch
-    // instead of minting a new one, and ALWAYS recompute the current
-    // membership hash so an allowlist change forces an epoch
-    // rotation. The prior implementation only entered the bootstrap
-    // branch when the in-memory map happened to be empty AND never
-    // compared the current membership against the cached state, so
-    // (a) every restart silently rotated and (b) revocations /
-    // additions kept reusing a stale epoch until the next manual
-    // SWM write through `share()`.
     await this.loadSwmSenderKeyState();
     const sender = this.getLocalSigningAgentForAddress(senderAddress);
     if (!sender) {
       throw new Error(
-        `LU-5: curated CG ${contextGraphId}: cannot bootstrap swm-sender-key — ` +
+        `${logPrefix}: curated CG ${contextGraphId}: cannot bootstrap swm-sender-key — ` +
         `no local custodial signing key for agent ${senderAddress}. ` +
         `Refusing to publish curated CG payload via the plaintext-inline fallback.`,
       );
     }
     const resolution = await resolveWorkspaceAgentRecipients(this.store, { contextGraphId });
     if (!resolution.requiresEncryption) {
-      // Access policy lookup said curated, but the recipient resolver
-      // disagrees. Conservative: refuse rather than silently downgrade.
       throw new Error(
-        `LU-5: curated CG ${contextGraphId}: access-policy says curated but recipient resolver ` +
+        `${logPrefix}: curated CG ${contextGraphId}: access-policy says curated but recipient resolver ` +
         `returned no agent recipients. Refusing to publish to avoid plaintext leak.`,
       );
     }
     if (resolution.recipients.length === 0) {
       throw new Error(
-        `LU-5: curated CG ${contextGraphId}: no DKG agent recipients available — ` +
+        `${logPrefix}: curated CG ${contextGraphId}: no DKG agent recipients available — ` +
         `add at least one allowed agent before publishing.`,
       );
     }
     const recipientSet = new Set(resolution.recipients.map((r) => r.agentAddress.toLowerCase()));
     if (!recipientSet.has(ethers.getAddress(senderAddress).toLowerCase())) {
       throw new Error(
-        `LU-5: curated CG ${contextGraphId}: sender ${senderAddress} is not in the recipient set — ` +
+        `${logPrefix}: curated CG ${contextGraphId}: sender ${senderAddress} is not in the recipient set — ` +
         `add yourself to the allowedAgents before publishing.`,
       );
     }
@@ -8330,7 +8346,7 @@ export class DKGAgent {
         : `membership changed (was=${state.membershipHash} now=${membershipHash})`;
       this.log.info(
         ctx,
-        `LU-5: bootstrapping/rotating swm-sender-key epoch for curated CG ${contextGraphId} ` +
+        `${logPrefix}: bootstrapping/rotating swm-sender-key epoch for curated CG ${contextGraphId} ` +
         `(sender=${senderAddress}, recipients=${resolution.recipients.length}, reason=${reason})`,
       );
       state = await this.createAndDistributeSwmSenderKeyEpoch({
@@ -8345,21 +8361,167 @@ export class DKGAgent {
       await this.saveSwmSenderKeyState();
     }
 
-    const chainKey = state.chainKey;
-    // Codex PR #608 R2 #12: the AEAD key must be derived from the
-    // *target* on-chain CG id (the one the published KC is bound to
-    // on chain) — not the source SWM CG id. On remap publishes
-    // (where the source `contextGraphId` differs from the target
-    // `publishContextGraphId`/`onChainId`), consumers verifying the
-    // KC use the canonical on-chain id; if we derive with the
-    // source id here, every consumer's decrypt fails.
-    const aeadCgId = publishContextGraphId ?? contextGraphId;
+    return {
+      chainKey: state.chainKey,
+      aeadCgId: publishContextGraphId ?? contextGraphId,
+      senderAddress,
+    };
+  }
+
+  private async _resolveEncryptInlinePayload(
+    contextGraphId: string,
+    subGraphName?: string,
+    authorAgentAddress?: string,
+    publishContextGraphId?: string,
+  ): Promise<((plaintext: Uint8Array) => Promise<Uint8Array>) | undefined> {
+    const resolved = await this._resolveCuratedChainKeyContext(
+      contextGraphId, subGraphName, authorAgentAddress, publishContextGraphId, 'LU-5',
+    );
+    if (!resolved) return undefined;
+    const { chainKey, aeadCgId } = resolved;
     return async (plaintextNquads: Uint8Array): Promise<Uint8Array> => {
       return encryptV10PublishPayload({
         chainKey,
         contextGraphId: aeadCgId,
         plaintext: plaintextNquads,
       });
+    };
+  }
+
+  /**
+   * OT-RFC-38 LU-11 / OT-RFC-39 — produce the chunked-AEAD inline
+   * callback for curated CGs. Returns `undefined` for public CGs so
+   * the LU-5 callback (also resolved unconditionally for curated CGs)
+   * stays as the only path.
+   *
+   * The returned closure does THREE things on the publish hot path:
+   *
+   *   1. slice plaintext into `CIPHERTEXT_CHUNK_SIZE_BYTES`-sized
+   *      pieces (last chunk smaller),
+   *   2. AEAD-encrypt each chunk with a publish-operation-deterministic
+   *      nonce (`deriveChunkNonce(batchId, chunkIndex)`) so retries
+   *      produce bit-identical ciphertext and idempotent SWM writes
+   *      (idempotency is the spec's only protection against double-
+   *      gossip racing the on-chain commitment),
+   *   3. fan each ciphertext chunk out as a V2 SWM gossip envelope
+   *      (`type = 'share-write-chunked'`, `swmMessageIndex = i`,
+   *      payload = `[batchId(32)][ct_i]`) on the curated CG's
+   *      workspace topic — so hosting cores (RFC-38 LU-6 host-mode)
+   *      persist the bytes opaquely keyed by
+   *      `(cgId, batchId, swmMessageIndex)` and members decrypt
+   *      locally with the same chainKey they already hold.
+   *
+   * The returned `ciphertextChunksRoot` is the keccak256 root over
+   * `keccak256(ct_i)` leaves in `swmMessageIndex` order (see
+   * `buildCiphertextChunksRoot` in `@origintrail-official/dkg-core`).
+   * That same root lands on-chain via
+   * `KnowledgeAssetsV10.PublishParams.ciphertextChunksRoot` and binds
+   * the SWM-gossiped bytes to the chain commitment — RFC-39 random
+   * sampling samples `(cgId, batchId, chunkId)` against this root.
+   */
+  private async _resolveEncryptInlineChunked(
+    contextGraphId: string,
+    subGraphName?: string,
+    authorAgentAddress?: string,
+    publishContextGraphId?: string,
+  ): Promise<
+    | ((input: { plaintextNquads: Uint8Array; batchId: Uint8Array }) => Promise<{
+        ciphertextChunksRoot: Uint8Array;
+        ciphertextChunkCount: number;
+        totalCiphertextBytes: number;
+      }>)
+    | undefined
+  > {
+    const resolved = await this._resolveCuratedChainKeyContext(
+      contextGraphId, subGraphName, authorAgentAddress, publishContextGraphId, 'LU-11',
+    );
+    if (!resolved) return undefined;
+    const { chainKey, aeadCgId } = resolved;
+    const wireCgId = this.gossipWireIdFor(contextGraphId);
+    const topic = contextGraphWorkspaceTopic(wireCgId);
+    const signer = await this.resolveWorkspaceGossipSigningAgent(contextGraphId);
+    if (!signer) {
+      throw new Error(
+        `LU-11: curated CG ${contextGraphId}: cannot resolve a workspace-gossip signing agent — ` +
+        `cores reject unsigned chunked envelopes. Add a local custodial signing key for an ` +
+        `allowed agent before publishing.`,
+      );
+    }
+    const signerWallet = new ethers.Wallet(signer.privateKey);
+    const signerAgentAddress = signer.agentAddress;
+    const log = this.log;
+    const ctx = createOperationContext('publish');
+    const gossip = this.gossip;
+
+    return async (input: { plaintextNquads: Uint8Array; batchId: Uint8Array }): Promise<{
+      ciphertextChunksRoot: Uint8Array;
+      ciphertextChunkCount: number;
+      totalCiphertextBytes: number;
+    }> => {
+      if (input.batchId.length !== 32) {
+        throw new Error(
+          `LU-11: chunked emit requires a 32-byte batchId (V10 KC merkleRoot); got ${input.batchId.length}`,
+        );
+      }
+      const plaintextChunks = sliceIntoCiphertextChunks(input.plaintextNquads);
+      const publishOperationId = ethers.hexlify(input.batchId);
+      const { ciphertextChunks } = encryptChunked({
+        chainKey,
+        contextGraphId: aeadCgId,
+        plaintextChunks,
+        publishOperationId,
+      });
+      const { root, leafCount } = buildCiphertextChunksRoot(ciphertextChunks);
+      let totalCiphertextBytes = 0;
+      for (let i = 0; i < ciphertextChunks.length; i++) {
+        const ct = ciphertextChunks[i];
+        totalCiphertextBytes += ct.length;
+        const payload = new Uint8Array(input.batchId.length + ct.length);
+        payload.set(input.batchId, 0);
+        payload.set(ct, input.batchId.length);
+        const timestamp = new Date().toISOString();
+        const signingPayload = computeGossipSigningPayloadV2(
+          GOSSIP_TYPE_WORKSPACE_PUBLISH_CHUNKED,
+          contextGraphId,
+          timestamp,
+          payload,
+          i,
+        );
+        const signature = await signerWallet.signMessage(signingPayload);
+        const envelope = encodeGossipEnvelope({
+          version: GOSSIP_ENVELOPE_VERSION,
+          type: GOSSIP_TYPE_WORKSPACE_PUBLISH_CHUNKED,
+          contextGraphId,
+          agentAddress: signerAgentAddress,
+          timestamp,
+          signature: ethers.getBytes(signature),
+          payload,
+          swmMessageIndex: i,
+        });
+        try {
+          await gossip.publish(topic, envelope);
+        } catch (err) {
+          log.warn(
+            ctx,
+            `LU-11: chunked gossip publish failed for cgId=${contextGraphId} ` +
+            `batchId=${publishOperationId.slice(0, 18)}... chunkIndex=${i}: ${
+              err instanceof Error ? err.message : String(err)
+            } — cores without this chunk will DECLINE the V2 ACK; ` +
+            `late-join sync can backfill once the catchup verb lands.`,
+          );
+        }
+      }
+      log.info(
+        ctx,
+        `LU-11: emitted ${ciphertextChunks.length} ciphertext chunks ` +
+        `(${totalCiphertextBytes} bytes total) for curated CG ${contextGraphId} ` +
+        `batchId=${publishOperationId.slice(0, 18)}... on topic ${topic}`,
+      );
+      return {
+        ciphertextChunksRoot: root,
+        ciphertextChunkCount: leafCount,
+        totalCiphertextBytes,
+      };
     };
   }
 
@@ -8683,6 +8845,21 @@ export class DKGAgent {
     if (encryptInlinePayload) {
       this.log.info(ctx, `LU-5: curated CG ${contextGraphId} — wrapping inline ACK payload with chain-key AEAD`);
     }
+    // OT-RFC-38 LU-11 — also resolve the chunked emitter. Publisher
+    // prefers the chunked path when both are set; single-blob remains
+    // the unconditional fallback for any code path that resolves the
+    // chunked callback to `undefined` (currently impossible since
+    // both helpers share the curated probe, but kept defensively to
+    // future-proof CG types whose chunked path might lag rollout).
+    const encryptInlineChunked = await this._resolveEncryptInlineChunked(
+      contextGraphId,
+      options?.subGraphName,
+      options?.authorAgentAddress,
+      onChainId ?? undefined,
+    );
+    if (encryptInlineChunked) {
+      this.log.info(ctx, `LU-11: curated CG ${contextGraphId} — chunked path active (per-chunk SWM gossip + V2 ACK)`);
+    }
 
     const result = await this.publisher.publishFromSharedMemory(contextGraphId, selection, {
       operationCtx: ctx,
@@ -8696,6 +8873,7 @@ export class DKGAgent {
       publisherNodeIdentityIdOverride: options?.publisherNodeIdentityIdOverride,
       precomputedAttestation: resolvedSeal,
       encryptInlinePayload,
+      encryptInlineChunked,
     });
 
     if (result.status === 'confirmed' && result.onChainResult) {
@@ -18319,6 +18497,14 @@ export class DKGAgent {
       subGraphName: string | undefined,
       merkleLeafCount: number,
       isEncryptedPayload?: boolean,
+      // OT-RFC-38 LU-11 — when present, the publisher's chunked
+      // emitter has already AEAD-encrypted + SWM-gossiped per-chunk
+      // ciphertexts. The collector routes through V2 ACK with empty
+      // stagingQuads and these fields populating PublishIntent.
+      chunkedCommitment?: {
+        ciphertextChunksRoot: Uint8Array;
+        ciphertextChunkCount: number;
+      },
     ) => {
       // Fail loud on non-numeric or non-positive CG ids: V10 publish requires
       // a real on-chain context graph and the contract rejects `cgId == 0`
@@ -18406,6 +18592,7 @@ export class DKGAgent {
         subGraphName,
         merkleLeafCount,
         isEncryptedPayload,
+        chunkedCommitment,
       });
       return result.acks;
     };

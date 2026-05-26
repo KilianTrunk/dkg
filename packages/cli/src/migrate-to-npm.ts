@@ -226,10 +226,23 @@ export function buildMigrationPlan(opts: BuildPlanOpts): MigrationPlan {
     exists(join(opts.repoRoot, a.name)),
   );
 
+  if (opts.dkgHomeNow !== opts.dkgHomePostMigration && hasDkgHomeState(opts.dkgHomeNow, exists)) {
+    // Classic orphan case: state in ~/.dkg-dev, post-migration the CLI
+    // looks at ~/.dkg. Hard refuse — no `--force` override; this one is
+    // genuinely unsafe.
+    blockers.push(
+      `state-directory orphan risk: state currently lives in ${opts.dkgHomeNow}, ` +
+        `but post-migration the CLI would resolve to ${opts.dkgHomePostMigration}. ` +
+        `Run \`mv ${opts.dkgHomeNow} ${opts.dkgHomePostMigration}\` BEFORE re-running this command, ` +
+        `or set \`DKG_HOME=${opts.dkgHomeNow}\` permanently in your shell rc and re-run.`,
+    );
+  }
+
   if (
     !loadBearingPresent &&
     !cosmeticPresent &&
-    (opts.currentAutoUpdateSource === 'npm' || opts.currentAutoUpdateSource === undefined)
+    (opts.currentAutoUpdateSource === 'npm' || opts.currentAutoUpdateSource === undefined) &&
+    blockers.length === 0
   ) {
     // No load-bearing artifact AND config already at npm (or unset which
     // PR-2 treats as auto — but with no marker tree, auto-detect returns
@@ -246,18 +259,6 @@ export function buildMigrationPlan(opts: BuildPlanOpts): MigrationPlan {
     } else {
       blockers.push(`${msg}. Stop the daemon (\`dkg stop\` or \`kill -9 <pid>\`) then re-run, or pass --force to bypass.`);
     }
-  }
-
-  if (opts.dkgHomeNow !== opts.dkgHomePostMigration && hasDkgHomeState(opts.dkgHomeNow, exists)) {
-    // Classic orphan case: state in ~/.dkg-dev, post-migration the CLI
-    // looks at ~/.dkg. Hard refuse — no `--force` override; this one is
-    // genuinely unsafe.
-    blockers.push(
-      `state-directory orphan risk: state currently lives in ${opts.dkgHomeNow}, ` +
-        `but post-migration the CLI would resolve to ${opts.dkgHomePostMigration}. ` +
-        `Run \`mv ${opts.dkgHomeNow} ${opts.dkgHomePostMigration}\` BEFORE re-running this command, ` +
-        `or set \`DKG_HOME=${opts.dkgHomeNow}\` permanently in your shell rc and re-run.`,
-    );
   }
 
   for (const artifact of SOURCE_TREE_ARTIFACTS_LOAD_BEARING) {

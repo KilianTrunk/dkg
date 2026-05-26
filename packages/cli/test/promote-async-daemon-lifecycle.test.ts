@@ -191,7 +191,10 @@ describe('promote-async daemon lifecycle wiring', () => {
       subGraphName: 'code',
       entities: ['urn:dkg:entity:a'],
     });
-    expect(enqueued.status).toBe(202);
+    // Spec §3.1: enqueue replies 200 OK with `{ jobId, state: "queued" }`.
+    // (Routes return 503 when the worker flag is off — the test arms it
+    // explicitly above so the enqueue gets through.)
+    expect(enqueued.status).toBe(200);
     expect(enqueued.body.jobId).toBe('job-daemon-1');
 
     daemonState.promoteWorkerAvailable = false;
@@ -245,5 +248,58 @@ describe('promote-async daemon lifecycle wiring', () => {
       source: 'async-worker',
       counts: { triples: 2 },
     });
+  });
+
+  it('worker startup failure leaves the daemon-state flag off and tags the structured log (Codex PR #665 id=3300423547)', async () => {
+    // Force `supervisor.start()` to throw by handing it an agent whose
+    // queue.recoverOnStartup rejects. The lifecycle wrapper must record
+    // the failure on `daemonState` (so the route layer surfaces 503
+    // instead of silently queueing jobs) and emit a structured
+    // `[async-promote-worker]` log line so operators can grep for it.
+    const recoverError = new Error('triple-store offline during recovery');
+    const failingAgent = {
+      promoteQueue: {
+        recoverOnStartup: async () => {
+          throw recoverError;
+        },
+        claimNext: async () => {
+          throw new Error('claimNext must not run after a failed startup');
+        },
+      },
+      assertion: {
+        promote: async () => ({ promotedCount: 0 }),
+      },
+    };
+    const logs: string[] = [];
+    lifecycle = startPromoteWorkerDaemonLifecycle({
+      agent: failingAgent as any,
+      log: (m) => logs.push(m),
+      emitMemoryGraphChanged: () => {},
+      workerConfig: {
+        workerConcurrency: 1,
+        pollIntervalMs: 1_000_000,
+        heartbeatIntervalMs: 0,
+        shutdownTimeoutMs: 200,
+        now: () => now,
+        workerIdPrefix: 'startup-failure-test',
+      },
+    });
+
+    await lifecycle.waitForStartup();
+    expect(daemonState.promoteWorkerAvailable).toBe(false);
+    expect(daemonState.promoteWorkerUnavailableReason).toContain(
+      'triple-store offline during recovery',
+    );
+    // Greppable tag + the "read-only until daemon restart" phrasing the
+    // operator-runbook docs point at.
+    expect(
+      logs.some(
+        (m) =>
+          m.includes('[async-promote-worker]') &&
+          m.includes('startup failed') &&
+          m.includes('queue is read-only'),
+      ),
+    ).toBe(true);
+    expect(lifecycle.getSupervisor()).toBeNull();
   });
 });

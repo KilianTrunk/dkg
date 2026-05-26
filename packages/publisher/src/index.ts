@@ -147,6 +147,7 @@ export {
 } from './async-lift-publisher.js';
 export {
   TripleStoreAsyncPromoteQueue,
+  ASYNC_PROMOTE_QUEUE_FORMAT_VERSION,
   PROMOTE_COMMIT_MARKER_STEPS,
   PROMOTE_JOB_STATES,
   PromoteJobConflictError,

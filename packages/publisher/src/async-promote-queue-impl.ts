@@ -19,6 +19,7 @@
 
 import type { TripleStore } from '@origintrail-official/dkg-storage';
 import {
+  ASYNC_PROMOTE_QUEUE_FORMAT_VERSION,
   PromoteJobConflictError,
   PromoteJobLeaseError,
   PROMOTE_JOB_STATES,
@@ -106,6 +107,7 @@ export class TripleStoreAsyncPromoteQueue implements AsyncPromoteQueue {
         enqueuedAt: now,
         updatedAt: now,
         attempt: { count: 0, maxRetries: this.maxRetries },
+        formatVersion: ASYNC_PROMOTE_QUEUE_FORMAT_VERSION,
       };
       await this.writeJob(job);
       return jobId;
@@ -175,6 +177,12 @@ export class TripleStoreAsyncPromoteQueue implements AsyncPromoteQueue {
         enqueuedAt: job.enqueuedAt,
         updatedAt: this.now(),
         attempt: { count: 0, maxRetries: job.attempt.maxRetries },
+        // Explicit operator recovery is the right place to upgrade a
+        // legacy row to the current persistence format: the operator
+        // has already inspected the job and decided it's safe to
+        // requeue, so subsequent failures will be reclaimable per the
+        // current invariants.
+        formatVersion: ASYNC_PROMOTE_QUEUE_FORMAT_VERSION,
       };
       await this.writeJob(recovered);
     });
@@ -373,7 +381,17 @@ export class TripleStoreAsyncPromoteQueue implements AsyncPromoteQueue {
 
       const promoteStarted = job.commitMarker?.promoteStarted;
       const swmInserted = job.commitMarker?.swmInserted;
-      if (swmInserted === false && promoteStarted !== true) {
+      // Codex PR #665 review id=3302135756: a `running` row from a
+      // pre-v2 daemon (`formatVersion` missing or < 2) can have already
+      // crossed into `assertionPromote()` even though its
+      // `commitMarker.promoteStarted` field never existed — the old
+      // worker simply didn't write it. Reclaiming such a row would
+      // duplicate the SWM insert + gossip. Gate the reclaim path on
+      // an explicit format-version marker; legacy rows fall through
+      // to the manual-recovery path below.
+      const formatVersion = job.formatVersion ?? 0;
+      const isCurrentFormat = formatVersion >= ASYNC_PROMOTE_QUEUE_FORMAT_VERSION;
+      if (isCurrentFormat && swmInserted === false && promoteStarted !== true) {
         const reclaimedJob: PromoteJob = {
           ...job,
           state: 'queued',
@@ -385,6 +403,7 @@ export class TripleStoreAsyncPromoteQueue implements AsyncPromoteQueue {
             nextRetryAt: undefined,
           },
           commitMarker: undefined,
+          formatVersion: ASYNC_PROMOTE_QUEUE_FORMAT_VERSION,
         };
         await this.writeJob(reclaimedJob);
         reclaimed += 1;
@@ -396,15 +415,23 @@ export class TripleStoreAsyncPromoteQueue implements AsyncPromoteQueue {
       // write but before our outer swmInserted marker. Without a stronger
       // store-side proof, expired running jobs past promoteStarted are not
       // safe to re-run automatically.
+      const legacyReason = !isCurrentFormat
+        ? `legacy promote job (formatVersion=${formatVersion}); needs operator inspection — recovery refuses to reclaim pre-v${ASYNC_PROMOTE_QUEUE_FORMAT_VERSION} rows that may have started promote without writing a marker`
+        : null;
+      const legacyMessage = !isCurrentFormat
+        ? `Legacy promote job (formatVersion=${formatVersion}) found in recovery; daemon refuses automatic reclaim because pre-v${ASYNC_PROMOTE_QUEUE_FORMAT_VERSION} workers may have entered assertionPromote without recording promoteStarted`
+        : null;
       await this.abandonStartupRecovery(
         job,
         now,
-        swmInserted
-          ? 'partial promote ambiguity: lease expired after SWM insert; needs operator inspection'
-          : 'partial promote ambiguity: lease expired while job was running; needs operator inspection',
-        swmInserted
-          ? 'Worker crashed after SWM insert; recovery aborted to prevent duplicate gossip'
-          : 'Worker lease expired during promote; recovery aborted to prevent duplicate SWM/gossip',
+        legacyReason
+          ?? (swmInserted
+            ? 'partial promote ambiguity: lease expired after SWM insert; needs operator inspection'
+            : 'partial promote ambiguity: lease expired while job was running; needs operator inspection'),
+        legacyMessage
+          ?? (swmInserted
+            ? 'Worker crashed after SWM insert; recovery aborted to prevent duplicate gossip'
+            : 'Worker lease expired during promote; recovery aborted to prevent duplicate SWM/gossip'),
       );
       abandoned += 1;
     }

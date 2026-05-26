@@ -24,6 +24,23 @@ export const PROMOTE_JOB_STATES = [
 export type PromoteJobState = (typeof PROMOTE_JOB_STATES)[number];
 
 /**
+ * Version stamp written on every job persisted by this implementation
+ * — used by startup recovery to refuse legacy rows. Version 2 is the
+ * first format that guarantees a `commitMarker.promoteStarted` flag is
+ * written **before** the worker enters `assertionPromote()`, so a
+ * `running` row with `promoteStarted === false` can be safely
+ * reclaimed.
+ *
+ * Anything missing `formatVersion` (or carrying `formatVersion < 2`)
+ * predates the marker contract and MUST be routed to the manual /
+ * abandoned recovery path — see Codex PR #665 review id=3302135756
+ * for the failure mode (upgraded daemon re-running a partially-promoted
+ * legacy job). Bump this constant any time the on-disk job shape or
+ * the recovery invariants change.
+ */
+export const ASYNC_PROMOTE_QUEUE_FORMAT_VERSION = 2;
+
+/**
  * Classification of a promote failure, used by the queue's retry policy.
  * Set by the worker when calling `fail()` — the queue itself never inspects
  * the error message.
@@ -125,6 +142,14 @@ export interface PromoteJob {
    * on successful re-queue.
    */
   reason?: string;
+  /**
+   * Persistence-format version stamped at enqueue / recover time. See
+   * `ASYNC_PROMOTE_QUEUE_FORMAT_VERSION`. Optional on the type so
+   * legacy rows still parse (so recovery can inspect and quarantine
+   * them), but always set to `ASYNC_PROMOTE_QUEUE_FORMAT_VERSION` by
+   * the current implementation when it writes a fresh job.
+   */
+  formatVersion?: number;
 }
 
 export interface PromoteListFilter {

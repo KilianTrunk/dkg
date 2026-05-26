@@ -460,13 +460,24 @@ export function startPromoteWorkerDaemonLifecycle(input: {
           if (!input.isShuttingDown?.() && promoteWorkerSupervisor === supervisor) {
             daemonState.promoteWorkerAvailable = true;
             daemonState.promoteWorkerUnavailableReason = null;
-            input.log("Async promote worker supervisor started");
+            input.log("[async-promote-worker] supervisor started; /promote-async accepting jobs");
           }
         } catch (err: any) {
+          // Codex PR #665 review (id=3300423547): a single startup
+          // failure here used to leave the queue silently dead. The
+          // route layer now gates `/promote-async` on
+          // `promoteWorkerAvailable`, so enqueue / list / status all
+          // 503 until something explicitly restarts the supervisor.
+          // The structured `[async-promote-worker]` tag makes the
+          // failure trivially greppable in operator logs alongside
+          // the daemon's other startup banners.
+          const message = err?.message ?? String(err);
           daemonState.promoteWorkerAvailable = false;
-          daemonState.promoteWorkerUnavailableReason = err?.message ?? String(err);
+          daemonState.promoteWorkerUnavailableReason = message;
           if (!input.isShuttingDown?.()) {
-            input.log(`Async promote worker startup failed: ${err?.message ?? String(err)}`);
+            input.log(
+              `[async-promote-worker] startup failed; queue is read-only until daemon restart: ${message}`,
+            );
           }
           if (promoteWorkerSupervisor === supervisor) {
             promoteWorkerSupervisor = null;

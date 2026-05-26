@@ -88,8 +88,8 @@ export interface PromoteResult {
  * `promoteStarted` means the worker has crossed into the promote pipeline,
  * so recovery can no longer prove SWM was untouched. `swmInserted` means
  * the outer promote call returned and the worker observed the local commit.
- * The remaining flags are reserved/informational for future phase-level
- * plumbing.
+ * The remaining flags are operator-facing evidence reserved for future
+ * phase-level plumbing.
  */
 export interface PromoteCommitMarker {
   promoteStarted: boolean;
@@ -190,6 +190,8 @@ export interface AsyncPromoteQueueConfig {
   now?: () => number;
   /** Defaults to `crypto.randomUUID()`. Tests inject deterministic ids. */
   idGenerator?: () => string;
+  /** Defaults to `crypto.randomUUID()`. Must be fresh for every lease claim. */
+  claimTokenGenerator?: () => string;
   /**
    * Backoff curve for `failed_retrying` jobs. Receives the next attempt
    * count (1-indexed — first retry is attempt 1) and returns ms-from-now.

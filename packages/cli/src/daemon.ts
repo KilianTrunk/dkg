@@ -20,3 +20,4 @@ export * from './daemon/local-agents.js';
 export * from './daemon/lifecycle.js';
 export * from './daemon/handle-request.js';
 export * from './daemon/shutdown.js';
+export * from './daemon/core-prereq-check.js';

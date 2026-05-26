@@ -36,6 +36,8 @@ import { existsSync, readdirSync, readFileSync, openSync, closeSync, writeFileSy
 // OpenClaw config helper (~line 2535) uses a bare `homedir()` — aliased
 // below so both sites coexist without a duplicate-module import.
 import * as osModule from 'node:os';
+import type { NetworkInterfaceInfo } from 'node:os';
+import { checkCoreRelayPrereqs } from './core-prereq-check.js';
 const { homedir } = osModule;
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
@@ -336,6 +338,68 @@ import {
 import { handleRequest } from './handle-request.js';
 import { loadRoutePlugins, countConfiguredPluginSpecs } from './plugin-loader.js';
 import type { MemoryGraphChangedEvent, MemoryGraphLayer } from './routes/context.js';
+
+type MultiaddrLike = { toString: () => string };
+
+function stringifyMultiaddrList(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((ma) => {
+      try {
+        return (ma as MultiaddrLike).toString();
+      } catch {
+        return '';
+      }
+    })
+    .filter((addr) => addr.length > 0);
+}
+
+function listenerMultiaddrs(listener: unknown): string[] {
+  const candidate = listener as {
+    getAddrs?: () => unknown;
+    getMultiaddrs?: () => unknown;
+    addrs?: unknown;
+    multiaddrs?: unknown;
+  };
+  if (typeof candidate?.getAddrs === 'function') {
+    const addrs = stringifyMultiaddrList(candidate.getAddrs());
+    if (addrs.length > 0) return addrs;
+  }
+  if (typeof candidate?.getMultiaddrs === 'function') {
+    const addrs = stringifyMultiaddrList(candidate.getMultiaddrs());
+    if (addrs.length > 0) return addrs;
+  }
+  const addrs = stringifyMultiaddrList(candidate?.addrs);
+  if (addrs.length > 0) return addrs;
+  return stringifyMultiaddrList(candidate?.multiaddrs);
+}
+
+function getBoundListenMultiaddrs(libp2p: unknown): string[] | null {
+  const node = libp2p as {
+    components?: { transportManager?: unknown };
+    services?: { transportManager?: unknown };
+    transportManager?: unknown;
+    getMultiaddrs?: () => unknown;
+  };
+  const managers = [
+    node.components?.transportManager,
+    node.services?.transportManager,
+    node.transportManager,
+  ];
+  for (const manager of managers) {
+    const getListeners = (manager as { getListeners?: () => unknown } | undefined)?.getListeners;
+    if (typeof getListeners !== 'function') continue;
+    const listeners = getListeners.call(manager);
+    if (!Array.isArray(listeners)) continue;
+    const addrs = listeners.flatMap((listener) => listenerMultiaddrs(listener));
+    if (addrs.length > 0) return Array.from(new Set(addrs));
+  }
+
+  // If this libp2p shape does not expose transport listeners, prefer an
+  // indeterminate result over treating advertised self-addresses as bound
+  // listener evidence.
+  return null;
+}
 
 /**
  * Resolve the WM agentAddress the daemon hands to `ChatMemoryManager`.
@@ -645,6 +709,36 @@ export async function runDaemonInner(
 
   const dashDb = new DashboardDB({ dataDir: dkgDir() });
 
+  if (role === 'core' && config.core?.allowDegradedRelay === false) {
+    const hostInterfaces = Object.values(osModule.networkInterfaces())
+      .flat()
+      .filter((i): i is NetworkInterfaceInfo => i !== undefined);
+    const prereq = checkCoreRelayPrereqs({
+      listenAddresses: [`/ip4/0.0.0.0/tcp/${config.listenPort ?? 0}`],
+      hostInterfaces,
+      announceAddresses: config.announceAddresses ?? [],
+      nodeRole: 'core',
+    });
+    if (prereq.looksDegraded) {
+      log(
+        `[CORE-PREREQ] FATAL before libp2p start: this Core node looks degraded as a relay. ` +
+          `reasons: ${prereq.reasons.join('; ')}. ` +
+          `non-routable addresses: ${prereq.nonRoutableAddresses
+            .map((a) => `${a.addr} (${a.class})`)
+            .join(', ')}. ` +
+          `Set core.allowDegradedRelay: true to downgrade this to a warning.`,
+      );
+      try {
+        dashDb.close();
+      } catch (err: any) {
+        log(`Core prereq fatal DB close error: ${err?.message ?? String(err)}`);
+      }
+      await removePid().catch(() => {});
+      process.exit(1);
+      return;
+    }
+  }
+
   // Universal Messenger substrate stores (rc.9 PR-2). Wired into the
   // DKGAgent's Messenger so any caller that opts into
   // `messenger.sendReliable` gets durable receiver-side idempotency
@@ -871,22 +965,34 @@ export async function runDaemonInner(
 
   await agent.start();
 
-  // PR-5: AutoNAT-driven boot self-probe. Subscribes to libp2p's
-  // self:peer:update event for core nodes and updates the
-  // module-level NAT-status cache that PR-4's /api/status relay block
-  // reads. Skip on edge — edge nodes don't need to be publicly
-  // reachable to function. The watcher returns a stop() handle that
-  // the shutdown closure MUST call to remove the listener; otherwise
-  // a respawn leaks listeners (eventually libp2p logs max-listener
-  // warnings).
+  // Core-only post-start checks (PR-5 NAT-status watcher + PR-3 relay
+  // prereq sanity check). Edge nodes skip both — they don't need to be
+  // publicly reachable, and reset any stale NAT-status state.
   //
-  // Observability-only here. PR-3 (#661) owns the refuse-to-boot gate
-  // via core.allowDegradedRelay — when both merge, that gate's
-  // post-start re-check picks up the same multiaddr set this watcher
-  // classifies. PR-5 stays pure-classifier so the two can land in any
-  // order without merge conflicts.
+  // PR-5 (#668): AutoNAT-driven boot self-probe. Subscribes to libp2p's
+  // self:peer:update event and updates the module-level NAT-status
+  // cache that PR-4's /api/status relay block reads. Returns a stop()
+  // handle that the shutdown closure MUST call to remove the listener;
+  // otherwise a respawn leaks listeners (eventually libp2p logs
+  // max-listener warnings).
+  //
+  // PR-3 (#661): Core-relay capability sanity check. Runs post-start so
+  // libp2p has already expanded `0.0.0.0` to per-interface bindings.
+  // Strict `allowDegradedRelay: false` operators also get a pre-start
+  // pass above so we can refuse before binding sockets. If the node
+  // declares itself as a Core (`nodeRole: "core"`) but its
+  // actually-bound multiaddrs can't serve inbound traffic (all
+  // loopback / RFC1918 / CGNAT / IPv6 ULA — beacon-01 was the
+  // canonical Tailscale-only case), surface a structured
+  // `[CORE-PREREQ]` log so the operator sees it before any
+  // peer-discovery noise scrolls past. Behaviour gated by
+  // `config.core.allowDegradedRelay`: `true` (default) is warn-only,
+  // `false` is refuse-to-boot. Uses transport listener addresses
+  // (`getBoundListenMultiaddrs`) not `libp2p.getMultiaddrs()`: the
+  // latter is the advertised self-address set and can include public
+  // announce addrs or `/p2p-circuit` reservations.
   let natStatusWatcherStop: (() => void) | null = null;
-  if ((config.nodeRole ?? 'edge') === 'core') {
+  if (role === 'core') {
     const watcher = startNatStatusWatcher({
       node: agent.node.libp2p as unknown as {
         addEventListener(event: 'self:peer:update', h: () => void): void;
@@ -898,6 +1004,65 @@ export async function runDaemonInner(
       },
     });
     natStatusWatcherStop = watcher.stop;
+
+    try {
+      const resolvedMultiaddrs = getBoundListenMultiaddrs(agent.node.libp2p);
+      if (resolvedMultiaddrs === null) {
+        log(
+          `[CORE-PREREQ] WARNING: could not inspect bound libp2p listener addresses; ` +
+            `skipping post-start relay prerequisite verdict.`,
+        );
+      } else {
+        const hostInterfaces = Object.values(osModule.networkInterfaces())
+          .flat()
+          .filter((i): i is NetworkInterfaceInfo => i !== undefined);
+        const prereq = checkCoreRelayPrereqs({
+          listenAddresses: resolvedMultiaddrs,
+          hostInterfaces,
+          announceAddresses: config.announceAddresses ?? [],
+          nodeRole: 'core',
+        });
+        if (prereq.looksDegraded) {
+          const allowDegraded = config.core?.allowDegradedRelay !== false;
+          const verb = allowDegraded ? 'WARNING' : 'FATAL';
+          log(
+            `[CORE-PREREQ] ${verb}: this Core node looks degraded as a relay. ` +
+              `reasons: ${prereq.reasons.join('; ')}. ` +
+              `non-routable addresses: ${prereq.nonRoutableAddresses
+                .map((a) => `${a.addr} (${a.class})`)
+                .join(', ')}. ` +
+              (allowDegraded
+                ? `Set core.allowDegradedRelay: false in ~/.dkg/config.json to refuse-to-boot on this state. ` +
+                  `See docs/specs/SPEC_RELAY_DISCOVERY.md for the full rationale.`
+                : `Refusing to boot. Set core.allowDegradedRelay: true to downgrade this to a warning.`),
+          );
+          if (!allowDegraded) {
+            natStatusWatcherStop?.();
+            resetNatStatus();
+            await agent.stop().catch((err: any) =>
+              log(`Core prereq fatal-stop error: ${err?.message ?? String(err)}`),
+            );
+            try {
+              dashDb.close();
+            } catch (err: any) {
+              log(`Core prereq fatal DB close error: ${err?.message ?? String(err)}`);
+            }
+            await removePid().catch(() => {});
+            process.exit(1);
+            return;
+          }
+        } else {
+          log(
+            `[CORE-PREREQ] OK: ${prereq.publicListenAddresses.length} ` +
+              `public-class listen address${prereq.publicListenAddresses.length === 1 ? '' : 'es'} bound.`,
+          );
+        }
+      }
+    } catch (err) {
+      log(
+        `[CORE-PREREQ] check failed (continuing boot): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   } else {
     resetNatStatus();
   }

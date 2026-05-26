@@ -25,6 +25,7 @@ export default defineConfig({
           'test/resolve-standalone-install.test.ts',
           'test/migrate-to-npm.test.ts',
           'test/nat-status.test.ts',
+          'test/core-prereq-check.test.ts',
         ],
     testTimeout: runsDaemonHttpBehavior ? 120_000 : 60_000,
     globalSetup: runsDaemonHttpBehavior ? ['../chain/test/hardhat-global-setup.ts'] : [],

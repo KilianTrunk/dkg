@@ -328,7 +328,11 @@ import {
 import { handleRequest } from './handle-request.js';
 import { loadRoutePlugins, countConfiguredPluginSpecs } from './plugin-loader.js';
 import type { MemoryGraphChangedEvent, MemoryGraphLayer } from './routes/context.js';
-import { createPromoteWorkerSupervisor, type PromoteWorkerSupervisor } from './worker/async-promote-worker.js';
+import {
+  createPromoteWorkerSupervisor,
+  type PromoteWorkerConfig,
+  type PromoteWorkerSupervisor,
+} from './worker/async-promote-worker.js';
 
 /**
  * Resolve the WM agentAddress the daemon hands to `ChatMemoryManager`.
@@ -414,6 +418,100 @@ export function mergePreferredRelays(input: {
     envCount: envParsed.length,
     configCount: configParsed.length,
     preferredCount: preferredInResult.length,
+  };
+}
+
+export interface PromoteWorkerDaemonLifecycle {
+  waitForStartup(): Promise<void>;
+  stop(reason?: string | null): Promise<void>;
+  getSupervisor(): PromoteWorkerSupervisor | null;
+}
+
+export function startPromoteWorkerDaemonLifecycle(input: {
+  agent: PromoteWorkerConfig['agent'];
+  log: (msg: string) => void;
+  emitMemoryGraphChanged: (event: MemoryGraphChangedEvent) => void;
+  isShuttingDown?: () => boolean;
+  workerConfig?: Omit<PromoteWorkerConfig, 'agent' | 'log' | 'emitMemoryGraphChanged'>;
+}): PromoteWorkerDaemonLifecycle {
+  let promoteWorkerSupervisor: PromoteWorkerSupervisor | null = null;
+  let promoteWorkerStartup: Promise<void> | null = null;
+  let promoteWorkerTimer: ReturnType<typeof setTimeout> | null = null;
+
+  promoteWorkerTimer = setTimeout(() => {
+    promoteWorkerTimer = null;
+    void (async () => {
+      if (input.isShuttingDown?.()) return;
+      // Async-promote queue worker (PR #3) — drains the queue introduced
+      // in PR #1 + #2. It is intentionally independent from async-publisher
+      // bootstrap: `/promote-async` jobs only need the agent assertion API,
+      // and should not sit queued forever if publisher wallet/chain recovery
+      // hangs.
+      const supervisor = createPromoteWorkerSupervisor({
+        ...input.workerConfig,
+        agent: input.agent,
+        log: (msg) => input.log(`[promote-worker] ${msg}`),
+        emitMemoryGraphChanged: input.emitMemoryGraphChanged,
+      });
+      promoteWorkerSupervisor = supervisor;
+      const startup = (async () => {
+        try {
+          await supervisor.start();
+          if (!input.isShuttingDown?.() && promoteWorkerSupervisor === supervisor) {
+            daemonState.promoteWorkerAvailable = true;
+            daemonState.promoteWorkerUnavailableReason = null;
+            input.log("Async promote worker supervisor started");
+          }
+        } catch (err: any) {
+          daemonState.promoteWorkerAvailable = false;
+          daemonState.promoteWorkerUnavailableReason = err?.message ?? String(err);
+          if (!input.isShuttingDown?.()) {
+            input.log(`Async promote worker startup failed: ${err?.message ?? String(err)}`);
+          }
+          if (promoteWorkerSupervisor === supervisor) {
+            promoteWorkerSupervisor = null;
+          }
+        } finally {
+          if (promoteWorkerStartup === startup) {
+            promoteWorkerStartup = null;
+          }
+        }
+      })();
+      promoteWorkerStartup = startup;
+      await startup;
+    })();
+  }, 0);
+  if (promoteWorkerTimer.unref) promoteWorkerTimer.unref();
+
+  async function waitForStartup(): Promise<void> {
+    if (promoteWorkerTimer) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+    await promoteWorkerStartup;
+  }
+
+  async function stop(reason: string | null = null): Promise<void> {
+    if (promoteWorkerTimer) {
+      clearTimeout(promoteWorkerTimer);
+      promoteWorkerTimer = null;
+    }
+    daemonState.promoteWorkerAvailable = false;
+    daemonState.promoteWorkerUnavailableReason = reason;
+    await promoteWorkerSupervisor
+      ?.stop()
+      .catch((err: any) =>
+        input.log(`Promote worker stop error: ${err?.message ?? String(err)}`),
+      );
+    await promoteWorkerStartup
+      ?.catch((err: any) =>
+        input.log(`Promote worker startup wait error: ${err?.message ?? String(err)}`),
+      );
+  }
+
+  return {
+    waitForStartup,
+    stop,
+    getSupervisor: () => promoteWorkerSupervisor,
   };
 }
 
@@ -746,14 +844,12 @@ export async function runDaemonInner(
   });
 
   let publisherRuntime: PublisherRuntime | null = null;
-  // Holds the running async-promote worker supervisor (PR #3 of the
+  // Holds the running async-promote worker lifecycle (PR #3 of the
   // async-promote-queue series). Initialised in `startPostApiPublishing`
   // after the API is up so a recoverOnStartup hiccup never blocks boot;
   // torn down in `shutdown` before `agent.stop()` so the queue store is
   // still open when we wait for in-flight promotes to drain.
-  let promoteWorkerSupervisor: PromoteWorkerSupervisor | null = null;
-  let promoteWorkerStartup: Promise<void> | null = null;
-  let promoteWorkerTimer: ReturnType<typeof setTimeout> | null = null;
+  let promoteWorkerLifecycle: PromoteWorkerDaemonLifecycle | null = null;
   let shuttingDown = false;
 
   const networkId = await computeNetworkId();
@@ -882,49 +978,12 @@ export async function runDaemonInner(
     }, 0);
     if (profileTimer.unref) profileTimer.unref();
 
-    promoteWorkerTimer = setTimeout(() => {
-      promoteWorkerTimer = null;
-      void (async () => {
-        if (shuttingDown) return;
-        // Async-promote queue worker (PR #3) — drains the queue introduced
-        // in PR #1 + #2. It is intentionally independent from async-publisher
-        // bootstrap: `/promote-async` jobs only need the agent assertion API,
-        // and should not sit queued forever if publisher wallet/chain recovery
-        // hangs.
-        const supervisor = createPromoteWorkerSupervisor({
-          agent,
-          log: (msg) => log(`[promote-worker] ${msg}`),
-          emitMemoryGraphChanged,
-        });
-        promoteWorkerSupervisor = supervisor;
-        const startup = (async () => {
-          try {
-            await supervisor.start();
-            if (!shuttingDown && promoteWorkerSupervisor === supervisor) {
-              daemonState.promoteWorkerAvailable = true;
-              daemonState.promoteWorkerUnavailableReason = null;
-              log("Async promote worker supervisor started");
-            }
-          } catch (err: any) {
-            daemonState.promoteWorkerAvailable = false;
-            daemonState.promoteWorkerUnavailableReason = err?.message ?? String(err);
-            if (!shuttingDown) {
-              log(`Async promote worker startup failed: ${err?.message ?? String(err)}`);
-            }
-            if (promoteWorkerSupervisor === supervisor) {
-              promoteWorkerSupervisor = null;
-            }
-          } finally {
-            if (promoteWorkerStartup === startup) {
-              promoteWorkerStartup = null;
-            }
-          }
-        })();
-        promoteWorkerStartup = startup;
-        await startup;
-      })();
-    }, 0);
-    if (promoteWorkerTimer.unref) promoteWorkerTimer.unref();
+    promoteWorkerLifecycle = startPromoteWorkerDaemonLifecycle({
+      agent,
+      log,
+      emitMemoryGraphChanged,
+      isShuttingDown: () => shuttingDown,
+    });
 
     const publisherTimer = setTimeout(() => {
       void (async () => {
@@ -2150,12 +2209,6 @@ export async function runDaemonInner(
     clearInterval(pruneTimer);
     rateLimiter.destroy();
     metricsCollector.stop();
-    if (promoteWorkerTimer) {
-      clearTimeout(promoteWorkerTimer);
-      promoteWorkerTimer = null;
-    }
-    daemonState.promoteWorkerAvailable = false;
-    daemonState.promoteWorkerUnavailableReason = shuttingDown ? 'daemon shutting down' : null;
     await publisherRuntime
       ?.stop()
       .catch((err: any) =>
@@ -2166,15 +2219,7 @@ export async function runDaemonInner(
     // away. We let in-flight promotes complete (or hit
     // `shutdownTimeoutMs`); RFC §6.2 forbids marking `running →
     // queued` here so the next boot's `recoverOnStartup()` decides.
-    await promoteWorkerSupervisor
-      ?.stop()
-      .catch((err: any) =>
-        log(`Promote worker stop error: ${err?.message ?? String(err)}`),
-      );
-    await promoteWorkerStartup
-      ?.catch((err: any) =>
-        log(`Promote worker startup wait error: ${err?.message ?? String(err)}`),
-      );
+    await promoteWorkerLifecycle?.stop(shuttingDown ? 'daemon shutting down' : null);
     await daemonState.catchupRunner
       ?.close()
       .catch((err: any) =>

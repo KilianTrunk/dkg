@@ -90,6 +90,47 @@ const MAX_PROBE_AGE_MS = 30_000;
  * `UnauthorizedAccess(Only Contracts in Hub)` so we don't accidentally
  * drop the cache on an unrelated authorization failure.
  */
+/**
+ * Maps a Hub-registered contract name to the function that invalidates
+ * the corresponding boot-bound field on `EVMChainAdapter.contracts`.
+ *
+ * Used by:
+ *   1. `startHubRotationListener` — when `Hub.ContractChanged` /
+ *      `NewContract` fires for `name`, the listener nulls the local
+ *      handle and flips `initialized=false` so the next public-method
+ *      call goes through `init()` and re-resolves fresh from Hub.
+ *   2. `invalidateAllBoundContracts` — bulk drop, called by the
+ *      write-side self-heal path (`withHubStaleRetry`) when a stale
+ *      address surfaces `UnauthorizedAccess(Only Contracts in Hub)`.
+ *
+ * `RandomSampling` / `RandomSamplingStorage` are intentionally absent —
+ * they go through `randomSamplingPairCache` + `invalidateRandomSamplingPair()`
+ * which owns side-channel state (in-flight probe, ready flag) that
+ * a simple field reset wouldn't touch.
+ *
+ * Names listed here MUST match what `init()` resolves via
+ * `Hub.getContractAddress(name)` / `Hub.getAssetStorageAddress(name)`
+ * — keep these in sync when adding/removing bindings in `init()`.
+ */
+const BOUND_CONTRACT_INVALIDATORS = new Map<string, (adapter: EVMChainAdapter) => void>([
+  ['Identity',                   (a) => { (a as any).contracts.identity = undefined; }],
+  ['Profile',                    (a) => { (a as any).contracts.profile = undefined; }],
+  ['ProfileStorage',             (a) => { (a as any).contracts.profileStorage = undefined; }],
+  ['ParametersStorage',          (a) => { (a as any).contracts.parametersStorage = undefined; }],
+  ['Staking',                    (a) => { (a as any).contracts.staking = undefined; }],
+  ['Token',                      (a) => { (a as any).contracts.token = undefined; }],
+  ['AskStorage',                 (a) => { (a as any).contracts.askStorage = undefined; }],
+  ['KnowledgeAssets',            (a) => { (a as any).contracts.knowledgeAssets = undefined; }],
+  ['KnowledgeAssetsStorage',     (a) => { (a as any).contracts.knowledgeAssetsStorage = undefined; }],
+  ['KnowledgeAssetsV10',         (a) => { (a as any).contracts.knowledgeAssetsV10 = undefined; }],
+  ['KnowledgeCollection',        (a) => { (a as any).contracts.knowledgeCollection = undefined; }],
+  ['KnowledgeCollectionStorage', (a) => { (a as any).contracts.knowledgeCollectionStorage = undefined; }],
+  ['ContextGraphNameRegistry',   (a) => { (a as any).contracts.contextGraphNameRegistry = undefined; }],
+  ['ContextGraphs',              (a) => { (a as any).contracts.contextGraphs = undefined; }],
+  ['ContextGraphStorage',        (a) => { (a as any).contracts.contextGraphStorage = undefined; }],
+  ['DKGPublishingConvictionNFT', (a) => { (a as any).contracts.dkgPublishingConvictionNFT = undefined; }],
+]);
+
 const HUB_STALE_ERROR_MARKERS = [
   'Only Contracts in Hub',
   'UnauthorizedAccess(Only Contracts in Hub)',
@@ -2349,15 +2390,44 @@ export class EVMChainAdapter implements ChainAdapter {
     return nft;
   }
 
-  // Opaque "unknown custom error"+data reverts carry no name; enrich so the
-  // daemon classifier matches it (mirrors isContractMissingRevert et al).
+  /**
+   * Common wrapper for every PCA (Publisher Conviction Account) write
+   * path. Two responsibilities:
+   *
+   *   1. Opaque "unknown custom error"+data reverts from the post-split
+   *      `PublishingConviction` logic contract carry no decoded name
+   *      out of ethers — `enrichEvmError` decodes them so the daemon's
+   *      error classifier can match downstream (mirrors what
+   *      `isContractMissingRevert` does for the resolution path).
+   *
+   *   2. Self-heal on a stale `DKGPublishingConvictionNFT` /
+   *      `PublishingConvictionStorage` binding. Both contracts were
+   *      redeployed for v10.0.0-rc.11 (PCA split); the wrapper NFT
+   *      lazy-resolves `PublishingConviction` on every call so a
+   *      logic rotation is handled on-chain, but a wrapper rotation
+   *      surfaces here as `UnauthorizedAccess(Only Contracts in Hub)`
+   *      on the FIRST PCA write after the Hub re-registration. The
+   *      `withHubStaleRetryAny` outer layer drops every boot-bound
+   *      handle, re-runs `init()` to repopulate from the live Hub,
+   *      and retries the closure once — `op` re-reads
+   *      `this.contracts.dkgPublishingConvictionNFT` via
+   *      `requireConvictionNFT()` so the retry uses the new address.
+   *
+   * NOTE — rc.12 follow-up: other V10 write paths
+   * (`createKnowledgeAssetsV10`, `createContextGraph`,
+   * `updateKnowledgeCollectionV10`, etc.) should be wrapped with the
+   * same self-heal pattern. Tracked in the broader migration to
+   * `HubResolutionCache` for every boot-bound contract.
+   */
   private async pcaWrite<T>(op: () => Promise<T>): Promise<T> {
-    try {
-      return await op();
-    } catch (err) {
-      if (err instanceof Error) enrichEvmError(err);
-      throw err;
-    }
+    return this.withHubStaleRetryAny(async () => {
+      try {
+        return await op();
+      } catch (err) {
+        if (err instanceof Error) enrichEvmError(err);
+        throw err;
+      }
+    });
   }
 
   async createPublishingConvictionAccount(
@@ -2764,6 +2834,42 @@ export class EVMChainAdapter implements ChainAdapter {
   }
 
   /**
+   * Like `withHubStaleRetry` but generalized for any boot-bound
+   * contract — not just the RS pair. On `UnauthorizedAccess(Only
+   * Contracts in Hub)`, drops every boot-bound `this.contracts.X`
+   * handle, re-runs `init()` to re-resolve all bindings from Hub,
+   * then retries the operation exactly once.
+   *
+   * Used at write-side call sites that touch any of the redeployable
+   * V10 contracts (PCA NFT, ContextGraphs, KnowledgeCollection, etc.)
+   * so the FIRST write after a Hub rotation self-heals even when the
+   * event listener never fired (HTTP-only RPC endpoints, dropped
+   * subscriptions, rate-limited filter installs — all of which we
+   * see in the wild on public Base Sepolia / Gnosis Chain RPCs).
+   *
+   * Idempotency note: the wrapped closure MUST be safe to call twice.
+   * That holds for our write paths because the on-chain side either
+   * (a) reverted with the marker error, meaning no state changed, or
+   * (b) succeeded, meaning no retry happens. The closure SHOULD
+   * re-read `this.contracts.X` on each invocation (don't capture the
+   * handle into a local outside the closure) so the retry uses the
+   * fresh binding.
+   */
+  private async withHubStaleRetryAny<T>(fn: () => Promise<T>): Promise<T> {
+    try {
+      return await fn();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : '';
+      if (HUB_STALE_ERROR_MARKERS.some((m) => msg.includes(m))) {
+        this.invalidateAllBoundContracts();
+        await this.init();
+        return await fn();
+      }
+      throw err;
+    }
+  }
+
+  /**
    * Invalidate both the cache AND the side-channel contract handles. Without
    * dropping `this.contracts.randomSampling[Storage]`, the public
    * `isRandomSamplingReady()` probe would keep returning `true` after a Hub
@@ -2793,18 +2899,39 @@ export class EVMChainAdapter implements ChainAdapter {
 
   /**
    * Subscribe to Hub `ContractChanged` / `NewContract` events and
-   * invalidate the RS pair cache whenever **either** RS-side name is
-   * rotated. The pair is treated as a single coupled unit (see the
-   * `randomSamplingPairCache` field comment) — invalidating on either
-   * name forces an atomic re-resolve of both.
+   * invalidate the local cache for any Hub-rotated contract.
+   *
+   * Two invalidation paths, dispatched by name:
+   *
+   *   1. `RandomSampling` / `RandomSamplingStorage` → atomic pair
+   *      invalidation through `invalidateRandomSamplingPair()` so the
+   *      coupled cache + in-flight probe lifecycle stays consistent.
+   *      See the `randomSamplingPairCache` field comment for the
+   *      coupling invariants this path preserves.
+   *
+   *   2. Any other name in `BOUND_CONTRACT_INVALIDATORS` → null the
+   *      corresponding boot-bound `this.contracts.X` field and flip
+   *      `this.initialized` back to `false` so the next `await
+   *      this.init()` re-resolves every binding fresh from Hub. This
+   *      is the structural fix for the post-rotation stale-address
+   *      bug on the wider V10 contract set (PCA NFT, ContextGraphs,
+   *      KnowledgeCollection family, etc.) — without this dispatch,
+   *      operators were silently stuck on the pre-rotation address
+   *      until a daemon restart.
+   *
+   *   3. Unknown name → ignored. We deliberately allowlist rather
+   *      than reflexively re-init on any rotation: third-party
+   *      deployments may register names we don't bind, and we don't
+   *      want a benign rotation of an unrelated contract to thrash
+   *      our cache.
    *
    * `Hub._setContractAddress` is double-tap-emitting (`Hub-extra.test.ts`
    * E-7): on the new-contract path it emits `NewContract` twice, and
    * on the update path it emits both `ContractChanged` AND
    * `NewContract`. We listen to BOTH events so the cache invalidates
-   * regardless of which Hub variant the deployment ships, and the
-   * invalidation is idempotent so duplicate notifications are
-   * harmless.
+   * regardless of which Hub variant the deployment ships, and both
+   * the RS-pair invalidation and the generic boot-bound invalidation
+   * are idempotent so duplicate notifications are harmless.
    *
    * `Contract.on(...)` is async in ethers v6: a sync `try/catch` would
    * miss provider rejections (e.g. HTTP-only endpoints that can't
@@ -2812,8 +2939,10 @@ export class EVMChainAdapter implements ChainAdapter {
    * rejection. We `await` both subscriptions and only set
    * `hubRotationListenerStarted` after both succeed, so a failed
    * provider can be retried by a future call site if we ever need to
-   * — and meanwhile the TTL refresh path still keeps the RandomSampling
-   * pair fresh.
+   * — and meanwhile the TTL refresh path (for RS) and the
+   * `withHubStaleRetry` write-side fallback (for all boot-bound
+   * contracts) still keep stale bindings recoverable without a
+   * working event subscription.
    */
   private async startHubRotationListener(): Promise<void> {
     if (this.hubRotationListenerStarted) return;
@@ -2821,6 +2950,16 @@ export class EVMChainAdapter implements ChainAdapter {
       if (typeof name !== 'string') return;
       if (name === 'RandomSampling' || name === 'RandomSamplingStorage') {
         this.invalidateRandomSamplingPair();
+        return;
+      }
+      const invalidator = BOUND_CONTRACT_INVALIDATORS.get(name);
+      if (invalidator) {
+        invalidator(this);
+        // Force the next public-method entry through `init()` so it
+        // re-resolves every binding. Cheap — rotation events are rare
+        // and `init()` is idempotent past the `if (this.initialized)
+        // return` short-circuit.
+        this.initialized = false;
       }
     };
     try {
@@ -2828,8 +2967,32 @@ export class EVMChainAdapter implements ChainAdapter {
       await this.contracts.hub.on('NewContract', onChange);
       this.hubRotationListenerStarted = true;
     } catch {
-      /* provider doesn't support filter subscriptions — TTL refresh is the fallback */
+      /* provider doesn't support filter subscriptions — TTL refresh (RS)
+       * and `withHubStaleRetry` (writes) are the fallbacks */
     }
+  }
+
+  /**
+   * Drop every boot-bound contract handle and re-arm `init()`.
+   *
+   * Used by `withHubStaleRetry` on the write-side self-heal path when
+   * a Hub-rotated contract surfaces `UnauthorizedAccess(Only Contracts
+   * in Hub)`: the listener may have missed the rotation event (HTTP-only
+   * RPC, dropped subscription, etc.) so the failing operation can't tell
+   * which specific name was rotated. Resetting everything is the safest
+   * fallback — the next `await this.init()` re-resolves all 15+ bindings
+   * in a single pass (still under a second on a healthy RPC) and the
+   * caller's retry picks up the fresh handles.
+   *
+   * RS pair is handled separately because it owns side-channel state
+   * (in-flight probe, ready flag) that `init()` alone won't reset.
+   */
+  private invalidateAllBoundContracts(): void {
+    for (const invalidator of BOUND_CONTRACT_INVALIDATORS.values()) {
+      invalidator(this);
+    }
+    this.invalidateRandomSamplingPair();
+    this.initialized = false;
   }
 
   /**

@@ -110,6 +110,27 @@ async function waitFor(
   return false;
 }
 
+/**
+ * Let the adapter's Hub rotation listener consume any historical
+ * `ContractChanged` / `NewContract` events that a previous test in
+ * the same Hardhat session may have left behind. ethers v6 subscribes
+ * its polling filter with fromBlock=latest, but in practice the
+ * computed `latest` can include the most-recent rotation tx — so a
+ * brand-new adapter can fire its first listener callback against an
+ * event it never directly caused.
+ *
+ * This mirrors production behaviour: a daemon that boots immediately
+ * after a Hub rotation will catch the rotation it didn't subscribe
+ * to. The "drain" step here just ensures the test snapshots are
+ * taken AFTER that catch-up, so steady-state assertions hold.
+ */
+async function drainHistoricalRotationEvents(adapter: EVMChainAdapter): Promise<void> {
+  await new Promise((r) => setTimeout(r, 1_000));
+  if (!(adapter as any).initialized) {
+    await (adapter as any).init();
+  }
+}
+
 describe('EVMChainAdapter — Hub rotation self-refresh (E2E)', () => {
   beforeAll(async () => {
     // Unique port to avoid collision with the other Hardhat-backed
@@ -413,5 +434,167 @@ describe('EVMChainAdapter — Hub rotation self-refresh (E2E)', () => {
       expect(typeof after!.activeProofPeriodStartBlock).toBe('bigint');
     },
     90_000,
+  );
+
+  // ===================================================================
+  // Generic boot-bound contract rotation (rc.12 PR
+  // `feat/chain-hub-rotation-auto-recovery`). Mirrors the RS-specific
+  // cases above but exercises the table-driven path in
+  // `startHubRotationListener` + the `withHubStaleRetryAny` wrapper
+  // that backs `pcaWrite` and any future write-side caller. The
+  // contract under test is `Identity` — it's always deployed, always
+  // boot-bound, and listed in `BOUND_CONTRACT_INVALIDATORS`; the
+  // listener should treat it identically to any other entry in the
+  // map.
+  // ===================================================================
+
+  it(
+    'event listener (generic): rotating Identity nulls this.contracts.identity and re-arms init()',
+    async () => {
+      // High TTL — only the event listener can flip the field within
+      // the test window. (RS cache has its own TTL; the generic path
+      // doesn't use one — only event/listener + write-side retry.)
+      const adapter = makeAdapter(ctx.rpcUrl, ctx.hubAddress, 600_000);
+      (adapter as any).provider.pollingInterval = 250;
+
+      await (adapter as any).init();
+      const identityBefore: Contract = (adapter as any).contracts.identity;
+      expect(identityBefore).toBeDefined();
+      const identityAddrBefore: string = await identityBefore.getAddress();
+
+      const deployer = new Wallet(HARDHAT_KEYS.DEPLOYER, ctx.provider);
+      const replacementAddr = freshAddress();
+
+      try {
+        await rotateHubContract(ctx.hubAddress, deployer, 'Identity', replacementAddr);
+
+        // Listener nulls the field AND flips `initialized`.
+        const observed = await waitFor(
+          () =>
+            (adapter as any).contracts.identity === undefined &&
+            (adapter as any).initialized === false,
+          15_000,
+          100,
+        );
+        expect(observed).toBe(true);
+
+        // Next init() re-resolves from the live Hub and binds the new address.
+        await (adapter as any).init();
+        const identityAfter: Contract = (adapter as any).contracts.identity;
+        expect(identityAfter).toBeDefined();
+        const identityAddrAfter: string = await identityAfter.getAddress();
+        expect(identityAddrAfter.toLowerCase()).toBe(replacementAddr.toLowerCase());
+        expect(identityAddrAfter.toLowerCase()).not.toBe(identityAddrBefore.toLowerCase());
+      } finally {
+        await rotateHubContract(ctx.hubAddress, deployer, 'Identity', identityAddrBefore);
+      }
+    },
+    60_000,
+  );
+
+  it(
+    'event listener (generic): rotating an unknown contract name is ignored — no fields touched',
+    async () => {
+      const adapter = makeAdapter(ctx.rpcUrl, ctx.hubAddress, 600_000);
+      (adapter as any).provider.pollingInterval = 250;
+
+      await (adapter as any).init();
+      await drainHistoricalRotationEvents(adapter);
+
+      const identityBefore: Contract = (adapter as any).contracts.identity;
+      expect(identityBefore).toBeDefined();
+      expect((adapter as any).initialized).toBe(true);
+
+      const deployer = new Wallet(HARDHAT_KEYS.DEPLOYER, ctx.provider);
+      // Use a name NOT in BOUND_CONTRACT_INVALIDATORS. Hub.setContractAddress
+      // accepts arbitrary strings and emits `NewContract` for first
+      // registrations — exactly the noise we need to confirm the listener
+      // safely allowlists.
+      const unknownName = `RC12TestUnknown-${Date.now()}`;
+      await rotateHubContract(ctx.hubAddress, deployer, unknownName, freshAddress());
+
+      // Give the listener multiple polling cycles to mis-fire if it would.
+      await new Promise((r) => setTimeout(r, 1_500));
+
+      expect((adapter as any).contracts.identity).toBe(identityBefore);
+      expect((adapter as any).initialized).toBe(true);
+    },
+    30_000,
+  );
+
+  it(
+    'withHubStaleRetryAny: marker error invalidates ALL boot-bound contracts, re-inits, and retries once',
+    async () => {
+      const adapter = makeAdapter(ctx.rpcUrl, ctx.hubAddress, 600_000);
+      (adapter as any).provider.pollingInterval = 250;
+      await (adapter as any).init();
+      await drainHistoricalRotationEvents(adapter);
+
+      const identityBefore: Contract = (adapter as any).contracts.identity;
+      expect(identityBefore).toBeDefined();
+      const identityAddrBefore: string = await identityBefore.getAddress();
+
+      let calls = 0;
+      let identityDuringRetry: Contract | undefined;
+      const result = await (adapter as any).withHubStaleRetryAny(async () => {
+        calls += 1;
+        if (calls === 1) {
+          // Snapshot what the retry path produced — invalidated then
+          // re-resolved. Capturing it inside the closure proves the
+          // wrapper called init() between the throw and the retry.
+          throw new Error(
+            'execution reverted (unknown custom error): UnauthorizedAccess(Only Contracts in Hub)',
+          );
+        }
+        identityDuringRetry = (adapter as any).contracts.identity;
+        return 'ok';
+      });
+
+      expect(result).toBe('ok');
+      expect(calls).toBe(2);
+      // After self-heal: a fresh Identity handle is bound (same on-chain
+      // address since we didn't rotate, but a distinct ethers.Contract
+      // instance because resolveContract() built a new one) and the
+      // adapter is initialised again.
+      expect(identityDuringRetry).toBeDefined();
+      expect(identityDuringRetry).not.toBe(identityBefore);
+      const identityAddrAfter: string = await identityDuringRetry!.getAddress();
+      expect(identityAddrAfter.toLowerCase()).toBe(identityAddrBefore.toLowerCase());
+      expect((adapter as any).initialized).toBe(true);
+    },
+    30_000,
+  );
+
+  it(
+    'withHubStaleRetryAny: unrelated revert messages do NOT invalidate bindings and do NOT retry',
+    async () => {
+      const adapter = makeAdapter(ctx.rpcUrl, ctx.hubAddress, 600_000);
+      (adapter as any).provider.pollingInterval = 250;
+      await (adapter as any).init();
+      await drainHistoricalRotationEvents(adapter);
+
+      const identityBefore: Contract = (adapter as any).contracts.identity;
+      expect(identityBefore).toBeDefined();
+
+      let calls = 0;
+      let caught: Error | null = null;
+      try {
+        await (adapter as any).withHubStaleRetryAny(async () => {
+          calls += 1;
+          throw new Error('execution reverted: ProfileDoesntExist(0)');
+        });
+      } catch (err) {
+        caught = err as Error;
+      }
+
+      expect(caught).not.toBeNull();
+      expect(caught!.message).toMatch(/ProfileDoesntExist/);
+      expect(calls).toBe(1);
+
+      // Same handle reference — wrapper didn't touch the cache.
+      expect((adapter as any).contracts.identity).toBe(identityBefore);
+      expect((adapter as any).initialized).toBe(true);
+    },
+    30_000,
   );
 });

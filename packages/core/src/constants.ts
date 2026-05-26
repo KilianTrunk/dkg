@@ -111,6 +111,14 @@ export const PROTOCOL_JOIN_REQUEST = '/dkg/10.0.1/join-request';
 export const PROTOCOL_VERIFY_PROPOSAL = '/dkg/10.0.1/verify-proposal';
 export const PROTOCOL_VERIFY_APPROVAL = '/dkg/10.0.0/verify-approval';
 export const PROTOCOL_STORAGE_ACK = '/dkg/10.0.1/storage-ack';
+/**
+ * OT-RFC-38 LU-11 / OT-RFC-39 — storage-ack protocol version that
+ * carries `ciphertextChunksRoot` + `ciphertextChunkCount` +
+ * `ackProtocolVersion` on `PublishIntent`. Pre-LU-11 nodes don't
+ * register this handler so an LU-11 publisher falls back to V1 against
+ * legacy peers (with no curated chunked-publish support there).
+ */
+export const PROTOCOL_STORAGE_ACK_V2 = '/dkg/10.0.2/storage-ack';
 
 export const DHT_PROTOCOL = '/dkg/kad/1.0.0';
 

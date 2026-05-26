@@ -110,10 +110,12 @@ export {
   type GossipEnvelopeMsg,
   GOSSIP_ENVELOPE_VERSION,
   GOSSIP_TYPE_WORKSPACE_PUBLISH,
+  GOSSIP_TYPE_WORKSPACE_PUBLISH_CHUNKED,
   GOSSIP_ENVELOPE_FRESHNESS_MS,
   encodeGossipEnvelope,
   decodeGossipEnvelope,
   computeGossipSigningPayload,
+  computeGossipSigningPayloadV2,
 } from './gossip-envelope.js';
 
 export {
@@ -166,6 +168,8 @@ export {
 
 export {
   type PublishIntentMsg,
+  ACK_PROTOCOL_VERSION_V1_LU5,
+  ACK_PROTOCOL_VERSION_V2_LU11,
   encodePublishIntent,
   decodePublishIntent,
 } from './publish-intent.js';

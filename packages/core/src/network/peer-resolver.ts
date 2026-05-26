@@ -75,6 +75,20 @@ export interface PeerResolverDeps {
   agentDirectory: AgentDirectoryLookup;
   /** Optional logger; defaults to silent except for serious errors. */
   logger?: PeerResolverLogger;
+  /**
+   * Optional default per-step timeout in ms. When set, this overrides
+   * the built-in `DEFAULT_PER_STEP_TIMEOUT_MS` (5s) for every call to
+   * `resolve()` that doesn't explicitly pass `opts.perStepTimeoutMs`.
+   * Per-call values still take precedence over this default.
+   *
+   * Operator-tunable via `network.peerResolveTimeoutMs` in
+   * `~/.dkg/config.json` — on small networks where DHT lookups
+   * legitimately need >5s, bumping this avoids unnecessary fallback
+   * to slower agents-CG resolution.
+   *
+   * Ignored when not a positive finite integer.
+   */
+  defaultPerStepTimeoutMs?: number;
 }
 
 export interface PeerResolverLogger {
@@ -108,12 +122,21 @@ export class PeerResolver {
   private readonly registry: NetworkStateRegistry;
   private readonly agentDirectory: AgentDirectoryLookup;
   private readonly logger: PeerResolverLogger;
+  private readonly defaultPerStepTimeoutMs: number;
 
   constructor(deps: PeerResolverDeps) {
     this.network = deps.network;
     this.registry = deps.registry;
     this.agentDirectory = deps.agentDirectory;
     this.logger = deps.logger ?? SILENT_LOGGER;
+    const override = deps.defaultPerStepTimeoutMs;
+    this.defaultPerStepTimeoutMs =
+      typeof override === 'number' &&
+      Number.isFinite(override) &&
+      Number.isInteger(override) &&
+      override > 0
+        ? override
+        : DEFAULT_PER_STEP_TIMEOUT_MS;
   }
 
   /**
@@ -219,7 +242,7 @@ export class PeerResolver {
     if (!opts?.skipDht && typeof this.network.findPeer === 'function') {
       if (aborted()) return accumulated;
       try {
-        const perStepMs = opts?.perStepTimeoutMs ?? DEFAULT_PER_STEP_TIMEOUT_MS;
+        const perStepMs = opts?.perStepTimeoutMs ?? this.defaultPerStepTimeoutMs;
         const dhtAddrs = await this.network.findPeer(peerId, {
           signal: stepSignal(perStepMs),
           timeoutMs: perStepMs,

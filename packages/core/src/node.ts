@@ -105,6 +105,27 @@ export const DEFAULT_RELAY_RESERVATION_COUNT = 3;
 export const MAX_RELAY_RESERVATION_COUNT = 16;
 
 /**
+ * Permissive validator for the small / sparse-network tunables
+ * (`peerStoreMaxAddressAgeMs`, `peerStoreMaxPeerAgeMs`,
+ * `dhtQuerySelfIntervalMs`, `peerResolveTimeoutMs`). Returns the
+ * value when it is a positive finite integer; returns `undefined`
+ * otherwise so callers can fall through to the upstream default
+ * silently. Unlike `validateRelayServerCapacity` these knobs are
+ * passed straight to libp2p / resolver code that already validates
+ * its own input — we just defend against the obviously-wrong values
+ * (0, negative, NaN, fractional, non-numeric) without taking on a
+ * warning surface.
+ */
+export function isFinitePositiveInteger(input: unknown): input is number {
+  return (
+    typeof input === 'number' &&
+    Number.isFinite(input) &&
+    Number.isInteger(input) &&
+    input > 0
+  );
+}
+
+/**
  * Validate an operator-supplied `relayReservationCount`. Same shape +
  * defensive surface as `validateRelayServerCapacity` (rejects 0,
  * negatives, NaN, Infinity, fractional, non-numbers). Additionally
@@ -779,10 +800,19 @@ export class DKGNode {
     const useAutoNAT = this.config.enableAutoNAT ??
       !(usableRelayCandidates.length > 0 || enableRelay);
 
+    const dhtQuerySelfInterval = isFinitePositiveInteger(this.config.dhtQuerySelfIntervalMs)
+      ? this.config.dhtQuerySelfIntervalMs
+      : undefined;
+
     const services: Record<string, any> = {
       identify: identify(),
       ping: ping(),
-      dht: kadDHT({ protocol: DHT_PROTOCOL }),
+      dht: kadDHT({
+        protocol: DHT_PROTOCOL,
+        ...(dhtQuerySelfInterval !== undefined
+          ? { querySelfInterval: dhtQuerySelfInterval }
+          : {}),
+      }),
       pubsub: gossipsub({
         emitSelf: false,
         allowPublishToZeroTopicPeers: true,
@@ -918,8 +948,21 @@ export class DKGNode {
       this.relayReservationCountTarget = 1;
     }
 
+    const peerStoreMaxAddressAge = isFinitePositiveInteger(this.config.peerStoreMaxAddressAgeMs)
+      ? this.config.peerStoreMaxAddressAgeMs
+      : undefined;
+    const peerStoreMaxPeerAge = isFinitePositiveInteger(this.config.peerStoreMaxPeerAgeMs)
+      ? this.config.peerStoreMaxPeerAgeMs
+      : undefined;
+    const peerStoreOverrides: Record<string, number> = {};
+    if (peerStoreMaxAddressAge !== undefined) peerStoreOverrides.maxAddressAge = peerStoreMaxAddressAge;
+    if (peerStoreMaxPeerAge !== undefined) peerStoreOverrides.maxPeerAge = peerStoreMaxPeerAge;
+
     this.node = await createLibp2p<DKGServices>({
       privateKey,
+      ...(Object.keys(peerStoreOverrides).length > 0
+        ? { peerStore: peerStoreOverrides }
+        : {}),
       // `nodeInfo.userAgent` is libp2p's only knob for the identify
       // protocol's `agentVersion` PB field — every remote peer reads
       // it back as `Peer.metadata.AgentVersion`. Without it, libp2p

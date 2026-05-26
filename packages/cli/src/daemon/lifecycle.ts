@@ -990,6 +990,10 @@ export async function runDaemonInner(
     // having to guess from contract registrations. Travels the wire
     // as libp2p's `AgentVersion` PB field (their naming, not ours).
     nodeVersion: `dkg/${nodeVersion}`,
+    peerStoreMaxAddressAgeMs: config.network?.peerStoreMaxAddressAgeMs,
+    peerStoreMaxPeerAgeMs: config.network?.peerStoreMaxPeerAgeMs,
+    dhtQuerySelfIntervalMs: config.network?.dhtQuerySelfIntervalMs,
+    peerResolveTimeoutMs: config.network?.peerResolveTimeoutMs,
     syncContextGraphs: syncContextGraphs,
     storeConfig: config.store ? {
       backend: config.store.backend,

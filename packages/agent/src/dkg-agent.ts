@@ -1023,6 +1023,9 @@ export class DKGAgent {
       relayServerCapacity: config.relayServerCapacity,
       relayReservationCount: config.relayReservationCount,
       nodeVersion: config.nodeVersion,
+      peerStoreMaxAddressAgeMs: config.peerStoreMaxAddressAgeMs,
+      peerStoreMaxPeerAgeMs: config.peerStoreMaxPeerAgeMs,
+      dhtQuerySelfIntervalMs: config.dhtQuerySelfIntervalMs,
     };
 
     const node = new DKGNode(nodeConfig);
@@ -1236,6 +1239,7 @@ export class DKGAgent {
       // Bootstrap is a libp2p-startup concern (`bootstrap({ list })` in
       // peerDiscovery, see node.ts) — not a per-peer resolution concern.
       // Removed here per Codex review feedback on PR #496.
+      defaultPerStepTimeoutMs: this.config.peerResolveTimeoutMs,
     });
     this.peerResolver = peerResolver;
     this.router = new ProtocolRouter(this.node, { peerResolver });

@@ -503,6 +503,28 @@ export interface DkgConfig {
   chat?: ChatConfig;
   /** Route-plugin specs (absolute paths / package names) loaded at daemon startup. ADR 0001. */
   routePlugins?: string[];
+  /**
+   * libp2p networking tunables for small / sparse networks. Forwarded
+   * to `DKGNodeConfig` and applied at `createLibp2p` / `kadDHT` /
+   * `PeerResolver` construction. All optional; omitting any field
+   * preserves the upstream default. See packages/core/src/types.ts
+   * for per-field rationale + default values.
+   *
+   * Targeted at testnet / small-mesh operators where DHT lookups are
+   * flaky (sparse routing tables) and direct addresses age out before
+   * being re-discovered. Mainnet / large-mesh deployments should leave
+   * all fields unset to keep upstream defaults.
+   */
+  network?: {
+    /** libp2p `peerStore.maxAddressAge` (default 3_600_000 = 1h upstream). */
+    peerStoreMaxAddressAgeMs?: number;
+    /** libp2p `peerStore.maxPeerAge` (default 21_600_000 = 6h upstream). */
+    peerStoreMaxPeerAgeMs?: number;
+    /** libp2p `kadDHT.querySelfInterval` (default kad-DHT upstream). */
+    dhtQuerySelfIntervalMs?: number;
+    /** `PeerResolver` per-step timeout (default 5_000ms). */
+    peerResolveTimeoutMs?: number;
+  };
 }
 
 /**

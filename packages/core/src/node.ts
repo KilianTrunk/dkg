@@ -412,9 +412,9 @@ export class DKGNode {
    * `libp2p.stop()`, so any in-flight stream read can bail out
    * immediately rather than wedge on a silent peer / dead relay.
    *
-   * `null` between `stop()` and the next `start()`, so callers must
-   * always read via the `stopSignal` getter (returns `undefined` when
-   * the node isn't started, which downstream code treats as
+   * `null` before `start()` and after `stop()` finishes, so callers
+   * must always read via the `stopSignal` getter (returns `undefined`
+   * when the node isn't started, which downstream code treats as
    * "no abort wiring available — fall back to whatever per-call
    * timeout was supplied").
    */
@@ -426,9 +426,9 @@ export class DKGNode {
    * per-call signals via AbortSignal.any so a graceful shutdown
    * cancels every in-flight network read.
    *
-   * Returns `undefined` before `start()` and after `stop()` — guard
-   * for "node-stopped" cases at the call site rather than fabricating
-   * a never-aborts signal here.
+   * Returns `undefined` before `start()` and after `stop()` completes
+   * — guard for "node-stopped" cases at the call site rather than
+   * fabricating a never-aborts signal here.
    */
   get stopSignal(): AbortSignal | undefined {
     return this.stopAbortController?.signal;
@@ -1390,9 +1390,14 @@ export class DKGNode {
     this.relayCapacity = null;
     this.relayReservationCountTarget = 1;
     const node = this.node;
-    this.node = null;
-    this.stopAbortController = null;
-    await node.stop();
+    try {
+      await node.stop();
+    } finally {
+      if (this.node === node) {
+        this.node = null;
+      }
+      this.stopAbortController = null;
+    }
   }
 
   get peerId(): string {

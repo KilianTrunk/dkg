@@ -352,7 +352,7 @@ export class ProtocolRouter {
     const limit = this.maxReadBytes;
     libp2p.handle(protocolId, async (stream: Stream, connection) => {
       try {
-        const requestData = await readAll(stream, limit);
+        const requestData = await readAllWithSignal(stream, limit, this.node.stopSignal);
         const peerId = {
           toString: () => connection.remotePeer.toString(),
           toBytes: () => connection.remotePeer.toMultihash().bytes,
@@ -361,6 +361,14 @@ export class ProtocolRouter {
         stream.send(responseData);
         await stream.close();
       } catch (err) {
+        if (this.node.stopSignal?.aborted) {
+          try {
+            stream.abort(asAbortError(this.node.stopSignal.reason));
+          } catch {
+            // stream already closed
+          }
+          return;
+        }
         console.error(`[ProtocolRouter] handler error on ${protocolId} from ${connection.remotePeer.toString().slice(-8)}:`, err instanceof Error ? err.message : err);
         try {
           stream.abort(new Error('handler error'));

@@ -179,6 +179,14 @@ function isRetryableRpcError(err: unknown): boolean {
     .test(msg);
 }
 
+function assertSuccessfulReceipt(receipt: ethers.TransactionReceipt, label: string): void {
+  if (receipt.status !== 0) return;
+  const err = new Error(`${label} tx ${receipt.hash} was mined but reverted (status=0)`);
+  (err as any).code = 'CALL_EXCEPTION';
+  (err as any).receipt = receipt;
+  throw err;
+}
+
 function isKnownTransactionError(err: unknown): boolean {
   const msg = errorMessage(err).toLowerCase();
   return msg.includes('already known')
@@ -688,7 +696,10 @@ export class EVMChainAdapter implements ChainAdapter {
     while (Date.now() < deadline) {
       try {
         const receipt = await this.getTransactionReceiptWithFailover(txHash);
-        if (receipt) return receipt;
+        if (receipt) {
+          assertSuccessfulReceipt(receipt, label);
+          return receipt;
+        }
       } catch (err) {
         if (!isRetryableRpcError(err)) throw err;
         lastError = err;

@@ -254,6 +254,31 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
     expect(primary.getTransactionReceipt).toHaveBeenCalledWith(txHash);
   });
 
+  it('throws CALL_EXCEPTION when a mined write receipt reverted', async () => {
+    const a = new EVMChainAdapter(minimalConfig({
+      rpcUrl: 'https://primary.example',
+      rpcUrls: ['https://backup.example'],
+    }));
+    const signedTx = '0xdeadbeef';
+    const txHash = '0x' + '33'.repeat(32);
+    const receipt = { hash: txHash, blockNumber: 47, status: 0, logs: [] };
+    const primary = {
+      broadcastTransaction: vi.fn(async () => ({ hash: txHash })),
+      getTransactionReceipt: vi.fn(async () => receipt),
+    };
+    const backup = {
+      broadcastTransaction: vi.fn(async () => ({ hash: txHash })),
+      getTransactionReceipt: vi.fn(async () => receipt),
+    };
+    (a as any).providers = [primary, backup];
+
+    await expect((a as any).sendSignedTransactionAndWait(signedTx, txHash, 'unit write')).rejects.toMatchObject({
+      code: 'CALL_EXCEPTION',
+      receipt,
+    });
+    expect(backup.getTransactionReceipt).not.toHaveBeenCalled();
+  });
+
   it('signMessage returns 32-byte r and vs (no contract init)', async () => {
     const a = new EVMChainAdapter(minimalConfig());
     const digest = ethers.randomBytes(32);

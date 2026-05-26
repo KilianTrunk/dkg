@@ -196,6 +196,14 @@ async function getCliReceiptWithFailover(
   return null;
 }
 
+function assertCliSuccessfulReceipt(receipt: ethers.TransactionReceipt, txHash: string): void {
+  if (receipt.status !== 0) return;
+  const err = new Error(`Transaction ${txHash} was mined but reverted (status=0)`);
+  (err as any).code = 'CALL_EXCEPTION';
+  (err as any).receipt = receipt;
+  throw err;
+}
+
 async function sendCliRawTransactionWithFailover(
   providers: ethers.JsonRpcProvider[],
   signedTx: string,
@@ -227,7 +235,10 @@ async function sendCliRawTransactionWithFailover(
   const deadline = Date.now() + CLI_RPC_RECEIPT_TIMEOUT_MS;
   while (Date.now() < deadline) {
     const receipt = await getCliReceiptWithFailover(providers, txHash);
-    if (receipt) return receipt;
+    if (receipt) {
+      assertCliSuccessfulReceipt(receipt, txHash);
+      return receipt;
+    }
     await cliSleep(CLI_RPC_RECEIPT_POLL_INTERVAL_MS);
   }
   throw new Error(`Transaction ${txHash} was broadcast but no receipt was found within ${CLI_RPC_RECEIPT_TIMEOUT_MS}ms`);

@@ -1954,8 +1954,9 @@ export class DKGPublisher implements Publisher {
     // Descriptive/local CG ids may still pass a daemon-provided provider
     // (the agent wires it eagerly), but those are intentional local
     // publishes and must not fail before the local branch below can run.
+    const v10ACKProvider = options.v10ACKProvider;
     const shouldCollectV10ACKs =
-      options.v10ACKProvider !== undefined &&
+      v10ACKProvider !== undefined &&
       !hasPrivateData &&
       canAttemptOnChainPublish;
     let v10ACKs: V10CoreNodeACK[] | undefined;
@@ -1966,7 +1967,7 @@ export class DKGPublisher implements Publisher {
         // LU-5: for curated CGs the publisher pays / signs against the
         // ciphertext byte size (`effectiveByteSize`). For public CGs
         // nothing changed — `effectiveByteSize === publicByteSize`.
-        v10ACKs = await options.v10ACKProvider(
+        v10ACKs = await v10ACKProvider(
           kcMerkleRoot, v10CgDomain, kaCount, rootEntities,
           effectiveByteSize, stagingQuads,
           publishEpochs, precomputedTokenAmount,
@@ -2003,7 +2004,7 @@ export class DKGPublisher implements Publisher {
       } finally {
         onPhase?.('collect_v10_acks', 'end');
       }
-    } else if (options.v10ACKProvider && hasPrivateData && canAttemptOnChainPublish) {
+    } else if (v10ACKProvider && hasPrivateData && canAttemptOnChainPublish) {
       this.log.info(ctx, `V10 ACK collection skipped: publish contains private quads (${privateRoots.length} private roots)`);
     }
 

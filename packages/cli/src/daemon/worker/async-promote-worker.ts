@@ -294,10 +294,17 @@ interface WorkerSlot {
   timer: ReturnType<typeof setInterval> | null;
 }
 
+const DEFAULT_PROMOTE_LEASE_MS = 5 * 60 * 1000;
+
 export function createPromoteWorkerSupervisor(config: PromoteWorkerConfig): PromoteWorkerSupervisor {
   const concurrency = Math.max(1, config.workerConcurrency ?? 4);
   const pollIntervalMs = Math.max(10, config.pollIntervalMs ?? 100);
   const heartbeatIntervalMs = config.heartbeatIntervalMs ?? 60_000;
+  if (heartbeatIntervalMs > 0 && heartbeatIntervalMs >= DEFAULT_PROMOTE_LEASE_MS) {
+    throw new Error(
+      `promoteQueue.heartbeatIntervalMs must be shorter than the queue lease (${DEFAULT_PROMOTE_LEASE_MS}ms)`,
+    );
+  }
   const shutdownTimeoutMs = config.shutdownTimeoutMs ?? 30_000;
   const now = config.now ?? (() => Date.now());
   const log = config.log ?? ((msg: string) => console.warn(`[promote-worker] ${msg}`));

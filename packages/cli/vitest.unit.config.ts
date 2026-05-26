@@ -31,6 +31,8 @@ export default defineConfig({
           'test/promote-async-routes.test.ts',
           'test/promote-async-daemon-lifecycle.test.ts',
           'test/async-promote-worker.test.ts',
+          'test/async-promote-queue-e2e.test.ts',
+          'test/skill-endpoint.test.ts',
         ],
     testTimeout: runsDaemonHttpBehavior ? 120_000 : 60_000,
     globalSetup: runsDaemonHttpBehavior ? ['../chain/test/hardhat-global-setup.ts'] : [],

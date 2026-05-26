@@ -399,6 +399,16 @@ describe('createPromoteWorkerSupervisor', () => {
     await sup.stop();
   });
 
+  it('rejects a heartbeat interval that is not shorter than the queue lease', () => {
+    expect(() =>
+      createPromoteWorkerSupervisor({
+        agent: makeAgentStub(async () => ({ promotedCount: 0 })),
+        heartbeatIntervalMs: 5 * 60 * 1000,
+        log: () => {},
+      }),
+    ).toThrow(/heartbeatIntervalMs.*shorter than the queue lease/);
+  });
+
   it('two slots never pick the same job (per-assertion lock holds across workers)', async () => {
     // Two jobs with the SAME uniqueness key shouldn't even both be enqueueable;
     // but two DIFFERENT jobs targeting the same CG should run in parallel.

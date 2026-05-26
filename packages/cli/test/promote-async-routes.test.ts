@@ -263,6 +263,19 @@ describe('promote-async daemon routes', () => {
     expect(second.body.error).toMatch(/already active/i);
   });
 
+  it('POST /:name/promote-async returns 503 when the worker is disabled', async () => {
+    daemonState.promoteWorkerAvailable = false;
+    daemonState.promoteWorkerUnavailableReason = 'disabled via config.promoteQueue.enabled=false';
+    await startRoutes(makeAgent());
+    const r = await post('/api/assertion/my-assertion/promote-async', {
+      contextGraphId: 'graphify',
+      entities: 'all',
+    });
+    expect(r.status).toBe(503);
+    expect(r.body.error).toMatch(/disabled/);
+    expect(await queue.getStats()).toMatchObject({ queued: 0 });
+  });
+
   it('POST /:name/promote-async returns 400 on missing contextGraphId', async () => {
     await startRoutes(makeAgent());
     const r = await post('/api/assertion/x/promote-async', { entities: 'all' });

@@ -503,12 +503,27 @@ export function startPromoteWorkerDaemonLifecycle(input: {
   agent: PromoteWorkerConfig['agent'];
   log: (msg: string) => void;
   emitMemoryGraphChanged: (event: MemoryGraphChangedEvent) => void;
+  enabled?: boolean;
   isShuttingDown?: () => boolean;
   workerConfig?: Omit<PromoteWorkerConfig, 'agent' | 'log' | 'emitMemoryGraphChanged'>;
 }): PromoteWorkerDaemonLifecycle {
   let promoteWorkerSupervisor: PromoteWorkerSupervisor | null = null;
   let promoteWorkerStartup: Promise<void> | null = null;
   let promoteWorkerTimer: ReturnType<typeof setTimeout> | null = null;
+
+  if (input.enabled === false) {
+    daemonState.promoteWorkerAvailable = false;
+    daemonState.promoteWorkerUnavailableReason = 'disabled via config.promoteQueue.enabled=false';
+    input.log("Async promote worker disabled via config.promoteQueue.enabled=false");
+    return {
+      waitForStartup: async () => {},
+      stop: async (reason: string | null = 'disabled via config.promoteQueue.enabled=false') => {
+        daemonState.promoteWorkerAvailable = false;
+        daemonState.promoteWorkerUnavailableReason = reason;
+      },
+      getSupervisor: () => null,
+    };
+  }
 
   promoteWorkerTimer = setTimeout(() => {
     promoteWorkerTimer = null;
@@ -1199,11 +1214,19 @@ export async function runDaemonInner(
     }, 0);
     if (profileTimer.unref) profileTimer.unref();
 
+    const promoteWorkerConfig = config.promoteQueue;
     promoteWorkerLifecycle = startPromoteWorkerDaemonLifecycle({
       agent,
       log,
       emitMemoryGraphChanged,
       isShuttingDown: () => shuttingDown,
+      enabled: promoteWorkerConfig?.enabled !== false,
+      workerConfig: {
+        workerConcurrency: promoteWorkerConfig?.workerConcurrency,
+        pollIntervalMs: promoteWorkerConfig?.pollIntervalMs,
+        heartbeatIntervalMs: promoteWorkerConfig?.heartbeatIntervalMs,
+        shutdownTimeoutMs: promoteWorkerConfig?.shutdownTimeoutMs,
+      },
     });
 
     const publisherTimer = setTimeout(() => {

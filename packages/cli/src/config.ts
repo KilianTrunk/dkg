@@ -414,6 +414,27 @@ export interface DkgConfig {
     errorBackoffMs?: number;
     maxRetries?: number;
   };
+  /**
+   * Async promote queue worker (WM → SWM). Unlike `publisher` which is
+   * opt-in, the promote worker is **on by default** — without it, jobs
+   * enqueued via `POST /api/assertion/{name}/promote-async` sit in
+   * `queued` forever. Set `enabled: false` to disable when running a
+   * read-only / forensic node where you don't want the worker mutating
+   * SWM. See `docs/specs/SPEC_ASYNC_PROMOTE_QUEUE.md` and the
+   * `dkg-node` skill (§8 "Async promote queue") for the full contract.
+   */
+  promoteQueue?: {
+    /** Default `true`. Set `false` to disable the in-daemon worker. */
+    enabled?: boolean;
+    /** Default 4. Number of concurrent worker slots polling the queue. */
+    workerConcurrency?: number;
+    /** Default 100ms. Polling interval per slot. */
+    pollIntervalMs?: number;
+    /** Default 60_000ms (1 min). Must be >0 and shorter than the queue's 5-min lease when enabled. */
+    heartbeatIntervalMs?: number;
+    /** Default 30_000ms. Max time `stop()` waits for in-flight promotes to drain on shutdown. */
+    shutdownTimeoutMs?: number;
+  };
   /** Allowed CORS origins. Defaults to '*' when apiHost is '127.0.0.1', otherwise restrictive. */
   corsOrigins?: string | string[];
   /** HTTP rate limiting settings. */

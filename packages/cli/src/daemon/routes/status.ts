@@ -180,6 +180,7 @@ import {
   getNodeVersion,
   getCurrentCommitShort,
   loadSkillTemplate,
+  loadImporterSkillTemplate,
   buildSkillMd,
   skillEtag,
   DAEMON_EXIT_CODE_RESTART,
@@ -444,6 +445,33 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
       Vary: "Host, X-Forwarded-Host, X-Forwarded-Proto",
     });
     res.end(req.method === "HEAD" ? undefined : content);
+    return;
+  }
+
+  // Second agent-readable manual: the bulk-import / chunking / manifest /
+  // async-promote-queue contract. Mirrors the `/.well-known/skill.md`
+  // route exactly — public, GET/HEAD, ETag-cacheable, no dynamic
+  // substitution because the importer skill doesn't carry node-state
+  // placeholders today. See Codex PR #642 follow-up: until this endpoint
+  // landed, the cross-link in dkg-node/SKILL.md was unreachable for
+  // agents installed via setup flows.
+  if (
+    (req.method === "GET" || req.method === "HEAD") &&
+    path === "/.well-known/skill-importer.md"
+  ) {
+    const importerContent = loadImporterSkillTemplate();
+    const importerEtag = skillEtag(importerContent);
+    if (req.headers["if-none-match"] === importerEtag) {
+      res.writeHead(304).end();
+      return;
+    }
+    res.writeHead(200, {
+      "Content-Type": "text/markdown; charset=utf-8",
+      ETag: importerEtag,
+      "Cache-Control": "public, max-age=300",
+      Vary: "Host, X-Forwarded-Host, X-Forwarded-Proto",
+    });
+    res.end(req.method === "HEAD" ? undefined : importerContent);
     return;
   }
 

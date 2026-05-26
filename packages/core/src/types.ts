@@ -173,21 +173,12 @@ export interface DKGNodeConfig {
    * back to the upstream default with no warning.
    */
   dhtQuerySelfIntervalMs?: number;
-  /**
-   * Default per-step timeout in ms for the in-process PeerResolver
-   * (used by `ProtocolRouter` on every outbound dial attempt).
-   * Overrides the built-in 5_000ms default; per-call
-   * `ResolveOpts.perStepTimeoutMs` still wins over this value.
-   *
-   * On small networks DHT lookups often need >5s to converge — bumping
-   * to e.g. 15_000 trades dial latency for a meaningfully better hit
-   * rate on the resolver's DHT step, which in turn reduces fallback
-   * pressure on the agents-CG step and outbox retries.
-   *
-   * Invalid values (0, negative, NaN, fractional, non-numeric) fall
-   * back to the built-in default with no warning.
-   */
-  peerResolveTimeoutMs?: number;
+  // NOTE: `peerResolveTimeoutMs` intentionally lives on
+  // `DKGAgentConfig` (packages/agent), not here. The PeerResolver is
+  // owned by `DKGAgent` (constructed at agent start, not by `DKGNode`),
+  // so a field on `DKGNodeConfig` would be a silent no-op for direct
+  // `new DKGNode({...})` consumers. Codex review of PR #698 caught
+  // this leak.
 }
 
 export type ConnectionTransport = 'direct' | 'relayed';

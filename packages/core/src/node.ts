@@ -954,7 +954,13 @@ export class DKGNode {
     const peerStoreMaxPeerAge = isFinitePositiveInteger(this.config.peerStoreMaxPeerAgeMs)
       ? this.config.peerStoreMaxPeerAgeMs
       : undefined;
-    const peerStoreOverrides: Record<string, number> = {};
+    // Explicit field shape (NOT `Record<string, number>`) so a typo in
+    // a new key fails to compile instead of silently disabling the
+    // tunable. Mirrors `PersistentPeerStoreInit` from
+    // `@libp2p/peer-store`; if upstream adds a third knob we want to
+    // expose, this object is the single place to extend.
+    // Codex review of PR #698 caught the prior loose typing.
+    const peerStoreOverrides: { maxAddressAge?: number; maxPeerAge?: number } = {};
     if (peerStoreMaxAddressAge !== undefined) peerStoreOverrides.maxAddressAge = peerStoreMaxAddressAge;
     if (peerStoreMaxPeerAge !== undefined) peerStoreOverrides.maxPeerAge = peerStoreMaxPeerAge;
 

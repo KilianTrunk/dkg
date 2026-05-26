@@ -99,9 +99,16 @@ export {
   encryptV10PublishPayload,
   decryptV10PublishPayload,
   isEncryptedV10PublishPayload,
+  encryptChunked,
+  decryptChunked,
+  deriveChunkNonce,
   V10_PUBLISH_PAYLOAD_MAGIC,
   type EncryptV10PublishPayloadInput,
   type DecryptV10PublishPayloadInput,
+  type EncryptChunkedInput,
+  type EncryptChunkedResult,
+  type DecryptChunkedInput,
+  type DecryptChunkedResult,
 } from './v10-publish-payload.js';
 
 export { resolveRootEntities, type Quad as RootEntityQuad } from './root-entity.js';

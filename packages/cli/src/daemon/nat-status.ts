@@ -90,6 +90,10 @@ export function _setNatStatusForTest(status: NatStatus): void {
   cachedNatStatus = status;
 }
 
+export function resetNatStatus(): void {
+  cachedNatStatus = 'unknown';
+}
+
 /**
  * Classify a set of multiaddr strings into a NAT-status verdict.
  *
@@ -128,18 +132,29 @@ export function classifyAddressesForNat(addrs: ReadonlyArray<string>): NatStatus
  * fails the public test (loopback, RFC1918, CGNAT, link-local, ULA,
  * documentation ranges) is treated as non-public.
  *
- * DNS-form addresses (`/dns4/example.com/...`) are treated as public
- * here because we can't cheaply resolve them at classification time
- * and the operator-supplied DNS name is overwhelmingly meant to point
- * at a routable address. This mirrors PR-3's behaviour (`dns` class →
- * treated as public for `looksDegraded` purposes).
+ * DNS-form addresses are treated as public only when they pass the same
+ * public-hostname exclusions used by the core reachability helper. We do
+ * not resolve DNS here; split-horizon/internal names stay non-public.
  */
+function isLocalOrInternalHostname(host: string): boolean {
+  if (typeof host !== 'string' || host.length === 0) return true;
+  const h = host.toLowerCase().replace(/\.$/, '');
+  if (h === 'localhost') return true;
+  if (h.endsWith('.local') || h.endsWith('.localhost')) return true;
+  if (h.endsWith('.test') || h.endsWith('.example')) return true;
+  if (h.endsWith('.invalid') || h.endsWith('.localdomain')) return true;
+  if (h.endsWith('.internal') || h.endsWith('.lan')) return true;
+  if (h.endsWith('.home.arpa') || h.endsWith('.cluster.local')) return true;
+  if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(h)) return true;
+  if (/^\[?[0-9a-f:]+\]?$/.test(h) && h.includes(':')) return true;
+  if (!h.includes('.')) return true;
+  return false;
+}
+
 function isPublicMultiaddr(addr: string): boolean {
   const dnsMatch = addr.match(/^\/(?:dns|dns4|dns6|dnsaddr)\/([^/]+)/);
   if (dnsMatch) {
-    const host = dnsMatch[1].toLowerCase();
-    if (host === 'localhost' || host.endsWith('.localhost')) return false;
-    return true;
+    return !isLocalOrInternalHostname(dnsMatch[1]);
   }
   const ip4Match = addr.match(/^\/ip4\/(\d+)\.(\d+)\.(\d+)\.(\d+)\//);
   if (ip4Match) {
@@ -225,12 +240,15 @@ export function startNatStatusWatcher(opts: StartNatWatcherOpts): { stop(): void
   const softTimeoutMs = opts.softTimeoutMs ?? DEFAULT_NAT_SOFT_TIMEOUT_MS;
   let stopped = false;
   let softTimer: ReturnType<typeof setTimeout> | null = null;
-  let sawAnyUpdate = false;
+  let sawDefinitiveClassification = false;
 
-  const reclassify = (cause: 'event' | 'soft-timeout' | 'initial') => {
-    if (stopped) return;
+  const reclassify = (cause: 'event' | 'soft-timeout' | 'initial'): NatStatus => {
+    if (stopped) return cachedNatStatus;
     const addrs = opts.node.getMultiaddrs().map((ma) => ma.toString());
     const next = classifyAddressesForNat(addrs);
+    if (next !== 'unknown') {
+      sawDefinitiveClassification = true;
+    }
     const previous = cachedNatStatus;
     if (next === previous) {
       if (cause === 'soft-timeout') {
@@ -239,14 +257,14 @@ export function startNatStatusWatcher(opts: StartNatWatcherOpts): { stop(): void
         // transitions, not "still 'unknown' after 60s". The status
         // block continues to expose the cached value.
       }
-      return;
+      return next;
     }
     cachedNatStatus = next;
     opts.onClassification?.(next, previous);
+    return next;
   };
 
   const onEvent = () => {
-    sawAnyUpdate = true;
     reclassify('event');
   };
 
@@ -260,7 +278,7 @@ export function startNatStatusWatcher(opts: StartNatWatcherOpts): { stop(): void
 
   if (softTimeoutMs > 0) {
     softTimer = setTimeout(() => {
-      if (stopped || sawAnyUpdate) return;
+      if (stopped || sawDefinitiveClassification) return;
       reclassify('soft-timeout');
     }, softTimeoutMs);
     // Don't keep the parent process alive just to fire the soft timer.
@@ -274,6 +292,7 @@ export function startNatStatusWatcher(opts: StartNatWatcherOpts): { stop(): void
       stopped = true;
       opts.node.removeEventListener('self:peer:update', onEvent);
       if (softTimer) clearTimeout(softTimer);
+      resetNatStatus();
     },
   };
 }

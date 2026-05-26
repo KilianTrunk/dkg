@@ -244,7 +244,7 @@ import {
   checkForUpdate,
 } from './auto-update.js';
 import { chainResetWipe } from './chain-reset-wipe.js';
-import { startNatStatusWatcher } from './nat-status.js';
+import { resetNatStatus, startNatStatusWatcher } from './nat-status.js';
 import {
   OPENCLAW_UI_CONNECT_TIMEOUT_MS,
   OPENCLAW_UI_CONNECT_POLL_MS,
@@ -885,6 +885,8 @@ export async function runDaemonInner(
       },
     });
     natStatusWatcherStop = watcher.stop;
+  } else {
+    resetNatStatus();
   }
 
   const publisherChainBase = chainBase?.rpcUrl && chainBase?.hubAddress
@@ -2127,6 +2129,7 @@ export async function runDaemonInner(
     rateLimiter.destroy();
     metricsCollector.stop();
     natStatusWatcherStop?.();
+    resetNatStatus();
     await publisherRuntime
       ?.stop()
       .catch((err: any) =>

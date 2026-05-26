@@ -41,8 +41,13 @@ describe('classifyAddressesForNat — pure classifier', () => {
     ['IPv6 ULA fd00 → private', ['/ip6/fdfd::1/tcp/4001'], 'private'],
     ['IPv6 documentation range → private', ['/ip6/2001:db8::1/tcp/4001'], 'private'],
     ['IPv6 public → public', ['/ip6/2606:4700:4700::1111/tcp/4001'], 'public'],
-    ['DNS form → public (heuristic)', ['/dns4/relay.example.com/tcp/443/wss'], 'public'],
+    ['public DNS form → public (heuristic)', ['/dns4/relay.origintrail.io/tcp/443/wss'], 'public'],
     ['localhost DNS form → private', ['/dns4/localhost/tcp/4001'], 'private'],
+    ['single-label DNS form → private', ['/dns4/myhost/tcp/4001'], 'private'],
+    ['.local DNS form → private', ['/dns4/relay.local/tcp/4001'], 'private'],
+    ['.test DNS form → private', ['/dns4/relay.test/tcp/4001'], 'private'],
+    ['.example DNS form → private', ['/dns4/relay.example/tcp/4001'], 'private'],
+    ['literal IP DNS form → private', ['/dns4/8.8.8.8/tcp/4001'], 'private'],
     ['circuit-relay-only → private', ['/ip4/8.8.8.8/tcp/4001/p2p-circuit/p2p/QmRelay'], 'private'],
     ['mix: public + circuit → public', ['/ip4/8.8.8.8/tcp/4001', '/ip4/1.2.3.4/p2p-circuit'], 'public'],
     ['mix: private + circuit → private', ['/ip4/192.168.1.5/tcp/4001', '/ip4/8.8.8.8/p2p-circuit'], 'private'],
@@ -171,6 +176,20 @@ describe('startNatStatusWatcher — soft-timeout', () => {
     w.stop();
   });
 
+  it('still fires the soft-timeout pass after non-definitive update events', async () => {
+    const node = makeFakeNode([]);
+    const onClass = vi.fn();
+    const w = startNatStatusWatcher({ node, onClassification: onClass, softTimeoutMs: 1_000 });
+    node.emit();
+    expect(onClass).toHaveBeenCalledTimes(0);
+
+    node.setAddrs(['/ip4/192.168.1.5/tcp/4001']);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(onClass).toHaveBeenCalledTimes(1);
+    expect(onClass).toHaveBeenLastCalledWith('private', 'unknown');
+    w.stop();
+  });
+
   it('softTimeoutMs=0 disables the soft-timeout entirely', async () => {
     const node = makeFakeNode([]);
     const onClass = vi.fn();
@@ -196,6 +215,14 @@ describe('startNatStatusWatcher — stop()', () => {
     node.setAddrs(['/ip4/192.168.1.5/tcp/4001']);
     node.emit();
     expect(onClass).toHaveBeenCalledTimes(1);
+  });
+
+  it('resets the cached status to unknown on stop()', () => {
+    const node = makeFakeNode(['/ip4/8.8.8.8/tcp/4001']);
+    const w = startNatStatusWatcher({ node, softTimeoutMs: 0 });
+    expect(getNatStatus()).toBe('public');
+    w.stop();
+    expect(getNatStatus()).toBe('unknown');
   });
 
   it('stop() is idempotent — second call is a no-op', () => {

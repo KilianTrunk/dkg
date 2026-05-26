@@ -1,0 +1,582 @@
+/**
+ * `TripleStoreAsyncPromoteQueue` — RDF-backed persistent queue for
+ * WM→SWM promotes. Mirrors the structure of
+ * `TripleStoreAsyncLiftPublisher` (claim/lease/retry pattern, jobs stored
+ * as RDF in a dedicated control graph) but adapted for promote's
+ * simpler model:
+ *
+ *  - **Per-assertion lock** (not per-wallet). One promote per
+ *    `(contextGraphId, subGraphName, assertionName)` runs at a time. N
+ *    workers total.
+ *  - **No private staging.** The worker calls `assertionPromote` directly.
+ *  - **No chain integration.** Expired running attempts are parked for
+ *    operator inspection unless a worker explicitly fails before the ambiguous
+ *    promote window. The commit marker is observability, not proof that an
+ *    unmarked crash left SWM untouched.
+ *
+ * See `docs/specs/SPEC_ASYNC_PROMOTE_QUEUE.md` (RFC) and
+ * `docs/specs/SPEC_ASYNC_PROMOTE_QUEUE_IMPLEMENTATION_PLAN.md` (plan).
+ */
+
+import type { TripleStore } from '@origintrail-official/dkg-storage';
+import {
+  PromoteJobConflictError,
+  PromoteJobLeaseError,
+  PROMOTE_JOB_STATES,
+  type AsyncPromoteQueue,
+  type AsyncPromoteQueueConfig,
+  type PromoteAttemptError,
+  type PromoteCommitMarker,
+  type PromoteCommitMarkerStep,
+  type PromoteJob,
+  type PromoteJobState,
+  type PromoteListFilter,
+  type PromoteRecoverySummary,
+  type PromoteRequest,
+  type PromoteResult,
+  type PromoteStats,
+} from './async-promote-queue-types.js';
+import {
+  ACTIVE_PROMOTE_STATES,
+  DEFAULT_PROMOTE_CONTROL_GRAPH_URI,
+  PROMOTE_CONTEXT_GRAPH_ID,
+  PROMOTE_PAYLOAD,
+  PROMOTE_STATE,
+  PROMOTE_UNIQUENESS_KEY,
+  comparePromoteJobs,
+  defaultBackoffMs,
+  expectBindings,
+  jobSubject,
+  literal,
+  parseJobPayload,
+  serializeJob,
+  uniquenessKey,
+} from './async-promote-queue-utils.js';
+
+export class TripleStoreAsyncPromoteQueue implements AsyncPromoteQueue {
+  /**
+   * Per-graph-URI mutex map. Serialises uniqueness-affecting mutations
+   * callers can't both observe stale state and then persist conflicting
+   * rows. Mirrors `AsyncLiftPublisher.claimQueues` but keyed on the
+   * control-graph URI instead of walletId.
+   */
+  private static readonly mutationQueues = new Map<string, Promise<void>>();
+  private static readonly DEFAULT_MAX_RETRIES = 5;
+  private static readonly DEFAULT_LEASE_MS = 5 * 60 * 1000;
+
+  private readonly graphUri: string;
+  private readonly maxRetries: number;
+  private readonly leaseMs: number;
+  private readonly now: () => number;
+  private readonly idGenerator: () => string;
+  private readonly claimTokenGenerator: () => string;
+  private readonly backoff: (attemptCount: number) => number;
+  private paused = false;
+  private graphEnsured = false;
+
+  constructor(
+    private readonly store: TripleStore,
+    config: AsyncPromoteQueueConfig = {},
+  ) {
+    this.graphUri = config.graphUri ?? DEFAULT_PROMOTE_CONTROL_GRAPH_URI;
+    this.maxRetries = config.maxRetries ?? TripleStoreAsyncPromoteQueue.DEFAULT_MAX_RETRIES;
+    this.leaseMs = config.leaseMs ?? TripleStoreAsyncPromoteQueue.DEFAULT_LEASE_MS;
+    this.now = config.now ?? (() => Date.now());
+    this.idGenerator = config.idGenerator ?? (() => crypto.randomUUID());
+    this.claimTokenGenerator = config.claimTokenGenerator ?? (() => crypto.randomUUID());
+    this.backoff = config.backoff ?? defaultBackoffMs;
+  }
+
+  // ===========================================================================
+  // Public surface — RFC §3.1–3.4
+  // ===========================================================================
+
+  async enqueue(request: PromoteRequest): Promise<string> {
+    this.validateRequest(request);
+    return this.withMutationLock(async () => {
+      await this.ensureGraph();
+      await this.assertNoActiveConflict(request);
+
+      const now = this.now();
+      const jobId = this.idGenerator();
+      const job: PromoteJob = {
+        jobId,
+        request: this.normalizeRequest(request),
+        state: 'queued',
+        enqueuedAt: now,
+        updatedAt: now,
+        attempt: { count: 0, maxRetries: this.maxRetries },
+      };
+      await this.writeJob(job);
+      return jobId;
+    });
+  }
+
+  async getStatus(jobId: string): Promise<PromoteJob | null> {
+    await this.ensureGraph();
+    return this.readJob(jobId);
+  }
+
+  async list(filter: PromoteListFilter = {}): Promise<PromoteJob[]> {
+    await this.ensureGraph();
+    const filters: string[] = [];
+    if (filter.state && filter.state.length > 0) {
+      const literals = filter.state.map((s) => literal(s)).join(', ');
+      filters.push(`FILTER (?state IN (${literals}))`);
+    }
+    if (filter.contextGraphId) {
+      filters.push(`?job <${PROMOTE_CONTEXT_GRAPH_ID}> ${literal(filter.contextGraphId)} .`);
+    }
+    const result = await this.store.query(
+      `SELECT ?payload WHERE { GRAPH <${this.graphUri}> { ?job <${PROMOTE_STATE}> ?state ; <${PROMOTE_PAYLOAD}> ?payload . ${filters.join(' ')} } }`,
+    );
+    const sorted = expectBindings(result)
+      .map((row) => parseJobPayload(row['payload']))
+      .filter((job): job is PromoteJob => job !== null)
+      .sort(comparePromoteJobs);
+    return filter.limit && filter.limit > 0 ? sorted.slice(0, Math.floor(filter.limit)) : sorted;
+  }
+
+  async cancel(jobId: string): Promise<void> {
+    await this.withMutationLock(async () => {
+      await this.ensureGraph();
+      const job = await this.requireJob(jobId);
+      if (job.state !== 'queued') {
+        throw new Error(
+          `Cannot cancel job in state '${job.state}'. Only 'queued' jobs can be cancelled.`,
+        );
+      }
+      const cancelled: PromoteJob = {
+        ...job,
+        state: 'failed',
+        reason: 'cancelled',
+        updatedAt: this.now(),
+        lease: undefined,
+        attempt: { ...job.attempt, nextRetryAt: undefined },
+      };
+      await this.writeJob(cancelled);
+    });
+  }
+
+  async recover(jobId: string): Promise<void> {
+    await this.withMutationLock(async () => {
+      await this.ensureGraph();
+      const job = await this.requireJob(jobId);
+      if (job.state !== 'failed') {
+        throw new Error(
+          `Cannot recover job in state '${job.state}'. Only 'failed' jobs can be recovered.`,
+        );
+      }
+      await this.assertNoActiveConflict(job.request, job.jobId);
+      const recovered: PromoteJob = {
+        jobId: job.jobId,
+        request: job.request,
+        state: 'queued',
+        enqueuedAt: job.enqueuedAt,
+        updatedAt: this.now(),
+        attempt: { count: 0, maxRetries: job.attempt.maxRetries },
+      };
+      await this.writeJob(recovered);
+    });
+  }
+
+  // ===========================================================================
+  // Worker-side surface
+  // ===========================================================================
+
+  async claimNext(workerId: string): Promise<PromoteJob | null> {
+    if (!workerId || typeof workerId !== 'string') {
+      throw new Error('workerId is required');
+    }
+    return this.withMutationLock(async () => {
+      await this.ensureGraph();
+      if (this.paused) return null;
+
+      const now = this.now();
+      await this.reconcileExpiredRunning(now);
+      const candidates = (await this.list()).filter((j) => {
+        if (j.state === 'queued') return true;
+        if (j.state === 'failed_retrying' && (j.attempt.nextRetryAt ?? 0) <= now) return true;
+        return false;
+      });
+
+      const runningKeys = await this.activeUniquenessKeys('running');
+      const eligible = candidates.filter((j) => !runningKeys.has(uniquenessKey(j.request)));
+      if (eligible.length === 0) return null;
+
+      const next = eligible.sort(comparePromoteJobs)[0]!;
+      const claimToken = `${workerId}:${next.jobId}:${this.claimTokenGenerator()}`;
+      const attemptCount = next.attempt.count + 1;
+      const claimed: PromoteJob = {
+        ...next,
+        state: 'running',
+        updatedAt: now,
+        attempt: { ...next.attempt, count: attemptCount, nextRetryAt: undefined },
+        lease: {
+          workerId,
+          acquiredAt: now,
+          expiresAt: now + this.leaseMs,
+          lastHeartbeatAt: now,
+          claimToken,
+        },
+        // Reset commit marker on every claim — recovery checks the
+        // marker BEFORE we reset, so this is safe to do at claim time.
+        commitMarker: { swmInserted: false, wmCleaned: false, lifecycleStamped: false, gossiped: false },
+      };
+      await this.writeJob(claimed);
+      return claimed;
+    });
+  }
+
+  async heartbeat(jobId: string, claimToken: string): Promise<void> {
+    await this.withMutationLock(async () => {
+      await this.ensureGraph();
+      const job = await this.requireJob(jobId);
+      this.assertLeaseHeld(job, claimToken);
+      const now = this.now();
+      const refreshed: PromoteJob = {
+        ...job,
+        updatedAt: now,
+        lease: {
+          ...job.lease!,
+          expiresAt: now + this.leaseMs,
+          lastHeartbeatAt: now,
+        },
+      };
+      await this.writeJob(refreshed);
+    });
+  }
+
+  async recordCommitMarker(jobId: string, claimToken: string, step: PromoteCommitMarkerStep): Promise<void> {
+    await this.withMutationLock(async () => {
+      await this.ensureGraph();
+      const job = await this.requireJob(jobId);
+      this.assertLeaseHeld(job, claimToken);
+      const marker: PromoteCommitMarker = {
+        swmInserted: job.commitMarker?.swmInserted ?? false,
+        wmCleaned: job.commitMarker?.wmCleaned ?? false,
+        lifecycleStamped: job.commitMarker?.lifecycleStamped ?? false,
+        gossiped: job.commitMarker?.gossiped ?? false,
+        [step]: true,
+      };
+      const updated: PromoteJob = { ...job, updatedAt: this.now(), commitMarker: marker };
+      await this.writeJob(updated);
+    });
+  }
+
+  async succeed(jobId: string, claimToken: string, result: PromoteResult): Promise<void> {
+    await this.withMutationLock(async () => {
+      await this.ensureGraph();
+      const job = await this.requireJob(jobId);
+      this.assertLeaseHeld(job, claimToken);
+      if (!job.commitMarker?.swmInserted) {
+        throw new Error(
+          `Cannot succeed job ${jobId}: commitMarker.swmInserted is false. Worker must record SWM commit before declaring success.`,
+        );
+      }
+      const succeeded: PromoteJob = {
+        ...job,
+        state: 'succeeded',
+        updatedAt: this.now(),
+        lease: undefined,
+        result,
+      };
+      await this.writeJob(succeeded);
+    });
+  }
+
+  async fail(jobId: string, claimToken: string, error: PromoteAttemptError): Promise<void> {
+    await this.withMutationLock(async () => {
+      await this.ensureGraph();
+      const job = await this.requireJob(jobId);
+      this.assertLeaseHeld(job, claimToken);
+
+      const now = this.now();
+      const attemptCount = Math.max(1, job.attempt.count);
+      const swmInserted = job.commitMarker?.swmInserted === true;
+      const canRetry = error.retryable && !swmInserted && attemptCount < job.attempt.maxRetries;
+
+      if (canRetry) {
+        const failedRetrying: PromoteJob = {
+          ...job,
+          state: 'failed_retrying',
+          updatedAt: now,
+          lease: undefined,
+          attempt: {
+            count: attemptCount,
+            maxRetries: job.attempt.maxRetries,
+            nextRetryAt: now + this.backoff(attemptCount),
+            lastError: error,
+          },
+        };
+        await this.writeJob(failedRetrying);
+        return;
+      }
+
+      const failed: PromoteJob = {
+        ...job,
+        state: 'failed',
+        updatedAt: now,
+        lease: undefined,
+        attempt: {
+          count: attemptCount,
+          maxRetries: job.attempt.maxRetries,
+          lastError: error,
+        },
+        reason: swmInserted
+          ? 'partial promote ambiguity: failed after SWM insert; needs operator inspection'
+          : job.reason,
+      };
+      await this.writeJob(failed);
+    });
+  }
+
+  // ===========================================================================
+  // Startup / lifecycle
+  // ===========================================================================
+
+  async recoverOnStartup(): Promise<PromoteRecoverySummary> {
+    return this.withMutationLock(async () => {
+      await this.ensureGraph();
+      return this.reconcileExpiredRunning(this.now());
+    });
+  }
+
+  private async reconcileExpiredRunning(now: number): Promise<PromoteRecoverySummary> {
+    const running = await this.list({ state: ['running'] });
+
+    let reclaimed = 0;
+    let abandoned = 0;
+
+    for (const job of running) {
+      const expiresAt = job.lease?.expiresAt ?? 0;
+      if (expiresAt > now) continue; // lease still valid; worker is fine
+
+      const conflicting = await this.findActiveByUniquenessKey(uniquenessKey(job.request), job.jobId);
+      if (conflicting) {
+        await this.abandonStartupRecovery(
+          job,
+          now,
+          `recovery conflict: active promote job ${conflicting.jobId} already owns this assertion`,
+          `Startup recovery found active promote job ${conflicting.jobId} for the same assertion`,
+        );
+        abandoned += 1;
+        continue;
+      }
+
+      // The worker records `swmInserted` only after `assertionPromote()`
+      // returns. A crash with the marker still false may have happened before
+      // promote started, or after the internal SWM write but before the marker
+      // write. Without a stronger on-store reconciliation signal, rerun is
+      // unsafe.
+      await this.abandonStartupRecovery(
+        job,
+        now,
+        job.commitMarker?.swmInserted
+          ? 'partial promote ambiguity: lease expired after SWM insert; needs operator inspection'
+          : 'partial promote ambiguity: lease expired before durable SWM marker; needs operator inspection',
+        job.commitMarker?.swmInserted
+          ? 'Worker crashed after SWM insert; recovery aborted to prevent duplicate gossip'
+          : 'Worker crashed during promote with no durable commit marker; recovery aborted because SWM state is ambiguous',
+      );
+      abandoned += 1;
+    }
+
+    return { reclaimed, abandoned };
+  }
+
+  async pause(): Promise<void> {
+    this.paused = true;
+  }
+
+  async resume(): Promise<void> {
+    this.paused = false;
+  }
+
+  async getStats(): Promise<PromoteStats> {
+    await this.ensureGraph();
+    const stats = Object.fromEntries(PROMOTE_JOB_STATES.map((s) => [s, 0])) as PromoteStats;
+    for (const job of await this.list()) stats[job.state] += 1;
+    return stats;
+  }
+
+  // ===========================================================================
+  // Internals
+  // ===========================================================================
+
+  private validateRequest(request: PromoteRequest): void {
+    if (!request.contextGraphId || typeof request.contextGraphId !== 'string') {
+      throw new Error('contextGraphId is required');
+    }
+    if (!request.assertionName || typeof request.assertionName !== 'string') {
+      throw new Error('assertionName is required');
+    }
+    if (request.subGraphName !== undefined && typeof request.subGraphName !== 'string') {
+      throw new Error('subGraphName must be a string when provided');
+    }
+    if (request.entities !== 'all' && !Array.isArray(request.entities)) {
+      throw new Error('entities must be either "all" or an array of URIs');
+    }
+    if (Array.isArray(request.entities)) {
+      if (request.entities.length === 0) {
+        throw new Error('entities array must not be empty; use "all" to promote every root');
+      }
+      for (const e of request.entities) {
+        if (typeof e !== 'string' || e.length === 0) {
+          throw new Error('entities array must contain non-empty strings');
+        }
+      }
+    }
+  }
+
+  /** Freeze entity arrays so downstream callers can't mutate the persisted job. */
+  private normalizeRequest(request: PromoteRequest): PromoteRequest {
+    const normalized: PromoteRequest = {
+      contextGraphId: request.contextGraphId,
+      assertionName: request.assertionName,
+      entities: request.entities === 'all' ? 'all' : Object.freeze([...request.entities]),
+    };
+    if (request.subGraphName !== undefined) {
+      normalized.subGraphName = request.subGraphName;
+    }
+    return normalized;
+  }
+
+  private async ensureGraph(): Promise<void> {
+    if (this.graphEnsured) return;
+    await this.store.createGraph(this.graphUri);
+    this.graphEnsured = true;
+  }
+
+  private async readJob(jobId: string): Promise<PromoteJob | null> {
+    const result = await this.store.query(
+      `SELECT ?payload WHERE { GRAPH <${this.graphUri}> { <${jobSubject(jobId)}> <${PROMOTE_PAYLOAD}> ?payload } }`,
+    );
+    const rows = expectBindings(result);
+    if (rows.length === 0) return null;
+    return parseJobPayload(rows[0]?.['payload']);
+  }
+
+  private async requireJob(jobId: string): Promise<PromoteJob> {
+    const job = await this.readJob(jobId);
+    if (!job) throw new Error(`Promote job not found: ${jobId}`);
+    return job;
+  }
+
+  private async writeJob(job: PromoteJob): Promise<void> {
+    await this.store.deleteByPattern({ subject: jobSubject(job.jobId), graph: this.graphUri });
+    await this.store.insert(serializeJob(job, this.graphUri));
+  }
+
+  private assertLeaseHeld(job: PromoteJob, claimToken: string): void {
+    if (job.state !== 'running') {
+      throw new PromoteJobLeaseError(job.jobId, `job is in state '${job.state}', not 'running'`);
+    }
+    if (!job.lease) {
+      throw new PromoteJobLeaseError(job.jobId, 'no lease present');
+    }
+    if (job.lease.claimToken !== claimToken) {
+      throw new PromoteJobLeaseError(job.jobId, 'claim token does not match active lease');
+    }
+    if (job.lease.expiresAt <= this.now()) {
+      throw new PromoteJobLeaseError(job.jobId, 'lease expired');
+    }
+  }
+
+  private async assertNoActiveConflict(
+    request: Pick<PromoteRequest, 'contextGraphId' | 'subGraphName' | 'assertionName'>,
+    excludeJobId?: string,
+  ): Promise<void> {
+    const existing = await this.findActiveByUniquenessKey(uniquenessKey(request), excludeJobId);
+    if (existing) {
+      throw new PromoteJobConflictError(existing.jobId, {
+        contextGraphId: request.contextGraphId,
+        subGraphName: request.subGraphName,
+        assertionName: request.assertionName,
+      });
+    }
+  }
+
+  private async findActiveByUniquenessKey(key: string, excludeJobId?: string): Promise<PromoteJob | null> {
+    const result = await this.store.query(
+      `SELECT ?payload WHERE { GRAPH <${this.graphUri}> { ?job <${PROMOTE_UNIQUENESS_KEY}> ${literal(key)} ; <${PROMOTE_PAYLOAD}> ?payload . } }`,
+    );
+    const rows = expectBindings(result);
+    for (const row of rows) {
+      const job = parseJobPayload(row['payload']);
+      if (job?.jobId === excludeJobId) continue;
+      if (job && ACTIVE_PROMOTE_STATES.includes(job.state)) return job;
+    }
+    return null;
+  }
+
+  private async abandonStartupRecovery(
+    job: PromoteJob,
+    now: number,
+    reason: string,
+    message: string,
+  ): Promise<void> {
+    const abandonedJob: PromoteJob = {
+      ...job,
+      state: 'failed',
+      updatedAt: now,
+      reason,
+      lease: undefined,
+      attempt: {
+        count: job.attempt.count,
+        maxRetries: job.attempt.maxRetries,
+        lastError: {
+          message,
+          retryable: false,
+          classification: 'fatal',
+          recordedAt: now,
+        },
+      },
+    };
+    await this.writeJob(abandonedJob);
+  }
+
+  private async activeUniquenessKeys(state: PromoteJobState): Promise<Set<string>> {
+    const result = await this.store.query(
+      `SELECT ?key WHERE { GRAPH <${this.graphUri}> { ?job <${PROMOTE_STATE}> ${literal(state)} ; <${PROMOTE_UNIQUENESS_KEY}> ?key . } }`,
+    );
+    const out = new Set<string>();
+    for (const row of expectBindings(result)) {
+      const lit = row['key'];
+      if (!lit) continue;
+      try {
+        const parsed = JSON.parse(lit);
+        if (typeof parsed === 'string') out.add(parsed);
+      } catch {
+        // Corrupted row; skip rather than crash. The next writeJob will
+        // overwrite the row anyway.
+      }
+    }
+    return out;
+  }
+
+  /**
+   * In-process mutex so concurrent queue mutations don't race the
+   * uniqueness/read-then-write SPARQL flow. Mirrors
+   * `AsyncLiftPublisher.withClaimLock`, widened from worker claims to
+   * all operations that can activate a uniqueness key.
+   */
+  private async withMutationLock<T>(fn: () => Promise<T>): Promise<T> {
+    const previous = TripleStoreAsyncPromoteQueue.mutationQueues.get(this.graphUri) ?? Promise.resolve();
+    let release!: () => void;
+    const next = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    TripleStoreAsyncPromoteQueue.mutationQueues.set(this.graphUri, next);
+
+    await previous;
+    try {
+      return await fn();
+    } finally {
+      release();
+      if (TripleStoreAsyncPromoteQueue.mutationQueues.get(this.graphUri) === next) {
+        TripleStoreAsyncPromoteQueue.mutationQueues.delete(this.graphUri);
+      }
+    }
+  }
+}

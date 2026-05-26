@@ -473,9 +473,11 @@ describe('Access protocol round-trip', () => {
     const accessClient = new AccessClient(messengerFor(routerB), keypairB, nodeB.peerId);
 
     expect(result.status).toBe('tentative');
-    const accessResult = await accessClient.requestAccess(nodeA.peerId, result.ual);
+    const ka = result.kaManifest[0];
+    expect(ka).toBeDefined();
+    const accessResult = await accessClient.requestAccess(nodeA.peerId, `${result.ual}/${ka!.tokenId}`);
 
-    expect(accessResult.granted).toBe(true);
+    expect(accessResult.granted, accessResult.rejectionReason).toBe(true);
     expect(accessResult.quads.length).toBeGreaterThanOrEqual(2);
 
     const predicates = accessResult.quads.map(q => q.predicate);

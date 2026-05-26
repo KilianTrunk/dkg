@@ -255,12 +255,17 @@ describe('startLivenessWatcher', () => {
     watcher.stop();
   });
 
-  it('disarms (no SIGKILL, no failure increment) when isShuttingDown returns true', async () => {
+  it('suppresses SIGKILL during the shutdown grace window when isShuttingDown returns true', async () => {
     // Regression: PR #664 originally counted every failed probe toward the
     // SIGKILL threshold, so a slow shutdown tail (server.close() runs early
     // → probe fails → 5 × 30s later we SIGKILL) bypassed agent.stop() / DB
     // close. The supervisor wires `isShuttingDown` to "api.port file gone"
     // because the worker's shutdown() removes it before the slow awaits.
+    //
+    // Codex #664 follow-up: the watcher no longer disarms PERMANENTLY —
+    // it enters a bounded grace window during which failures are
+    // suppressed. The "still armed after the window" case is covered in
+    // the dedicated `re-arms SIGKILL after shutdownGraceMs elapses` test.
     const probe = vi.fn().mockResolvedValue(false);
     const onUnresponsive = vi.fn();
     const onFailure = vi.fn();
@@ -273,6 +278,8 @@ describe('startLivenessWatcher', () => {
       isShuttingDown,
       intervalMs: 1000,
       consecutiveFailuresToKill: 1,
+      // Long enough that 5s of ticks stays inside the window.
+      shutdownGraceMs: 60_000,
     });
 
     await advanceTicks(5, 1000);
@@ -341,6 +348,60 @@ describe('startLivenessWatcher', () => {
 
     await advanceTicks(5, 1000);
     expect(isShuttingDown).not.toHaveBeenCalled();
+    watcher.stop();
+  });
+
+  it('Codex #664 — re-arms SIGKILL after shutdownGraceMs elapses', async () => {
+    // Codex (#664#discussion_r3302432762): the previous implementation
+    // PERMANENTLY disarmed the watcher on the first shutdown observation.
+    // If a later teardown step hung, the supervisor could never SIGKILL
+    // or respawn the worker. The fix: keep probing during shutdown, but
+    // resume counting failures after a bounded grace window so wedged
+    // teardowns still get force-killed.
+    const probe = vi.fn().mockResolvedValue(false);
+    const onUnresponsive = vi.fn();
+    const isShuttingDown = vi.fn().mockReturnValue(true);
+    const watcher = startLivenessWatcher({
+      port: 1234,
+      probe,
+      onUnresponsive,
+      isShuttingDown,
+      intervalMs: 1000,
+      consecutiveFailuresToKill: 2,
+      shutdownGraceMs: 5000,
+    });
+
+    // Within grace window: no SIGKILL even though probes are failing.
+    await advanceTicks(4, 1000);
+    expect(onUnresponsive).not.toHaveBeenCalled();
+
+    // After grace window expires, consecutive failures start counting
+    // again; with threshold=2 the watcher trips on the next 2 failed
+    // probes.
+    await advanceTicks(3, 1000);
+    expect(onUnresponsive).toHaveBeenCalledTimes(1);
+    watcher.stop();
+  });
+
+  it('Codex #664 — shutdownGraceMs<0 preserves legacy disarm-forever behavior', async () => {
+    // Operators who explicitly want the rc.11-and-earlier "never SIGKILL
+    // during graceful shutdown" semantic can opt back in with a negative
+    // grace value.
+    const probe = vi.fn().mockResolvedValue(false);
+    const onUnresponsive = vi.fn();
+    const isShuttingDown = vi.fn().mockReturnValue(true);
+    const watcher = startLivenessWatcher({
+      port: 1234,
+      probe,
+      onUnresponsive,
+      isShuttingDown,
+      intervalMs: 1000,
+      consecutiveFailuresToKill: 1,
+      shutdownGraceMs: -1,
+    });
+
+    await advanceTicks(20, 1000);
+    expect(onUnresponsive).not.toHaveBeenCalled();
     watcher.stop();
   });
 });

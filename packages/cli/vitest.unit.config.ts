@@ -22,6 +22,7 @@ export default defineConfig({
           // Pure logic — no hardhat needed. Adding to the unit config means
           // contributors can run it via `pnpm test:unit` in ~2s instead of
           // paying the 2-minute hardhat-boot tax of the default config.
+          'test/resolve-standalone-install.test.ts',
           'test/core-prereq-check.test.ts',
         ],
     testTimeout: runsDaemonHttpBehavior ? 120_000 : 60_000,

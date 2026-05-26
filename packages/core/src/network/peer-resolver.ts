@@ -81,11 +81,16 @@ export interface AgentDirectoryLookup {
    *     relay address; the resolver still uses the relay form in
    *     that case.
    *
-   * Staleness filtering: when `lastSeenMs` is present AND older than
-   * `staleThresholdMs` the resolver ignores `multiaddrs` (but still
-   * tries `relayAddress`, which is conservative — even an old relay
-   * address dialled via a circuit usually still works because the
-   * relay itself is more long-lived than a NATed peer).
+   * Staleness filtering: the resolver only uses `multiaddrs` when
+   * `lastSeenMs` is present AND within `staleThresholdMs`. When
+   * `lastSeenMs` is missing (older agent profile, manual / partial
+   * agents-CG entry without a heartbeat) the multiaddrs are
+   * ignored — unknown freshness is treated as stale to keep the
+   * phonebook conservative. `relayAddress` is still tried regardless,
+   * because even an old relay address dialled via a circuit usually
+   * still works (the relay itself is more long-lived than a NATed
+   * peer). Codex review of PR #700 round 2 caught the "undefined
+   * treated as fresh" regression.
    */
   findAgentDialAddresses?(
     peerId: NodeIdentity,
@@ -330,10 +335,15 @@ export class PeerResolver {
         });
         if (dial) {
           handledByRicher = true;
-          const isStale =
+          // Codex review of PR #700 round 2: only use direct multiaddrs
+          // when `lastSeenMs` is present AND within the freshness
+          // window. Missing freshness = treat as stale (fall back to
+          // relay only), so a profile without a `dkg:lastSeen`
+          // heartbeat doesn't bypass the stale-data guard.
+          const isFresh =
             dial.lastSeenMs !== undefined &&
-            Date.now() - dial.lastSeenMs > this.agentDirectoryStaleThresholdMs;
-          if (!isStale && dial.multiaddrs.length > 0) {
+            Date.now() - dial.lastSeenMs <= this.agentDirectoryStaleThresholdMs;
+          if (isFresh && dial.multiaddrs.length > 0) {
             await primeAndAppend(dial.multiaddrs, 'agents-CG');
           }
           if (dial.relayAddress) {

@@ -645,26 +645,43 @@ describe('Profile Builder', () => {
     expect(lastSeen! >= before && lastSeen! <= after).toBe(true);
   });
 
-  it('collectPublishableMultiaddrs drops loopback, link-local, unspecified bind, dedups', () => {
-    // Filter must drop addresses that are never dialable from another
-    // host (loopback / link-local) or that represent a bind wildcard
-    // (0.0.0.0 / ::). Real production addrs (public IPs + circuit
-    // forms) pass through. Duplicates from libp2p's listen/announce
-    // dedup are collapsed.
+  it('collectPublishableMultiaddrs drops non-public addresses + dedups (uses core isPublicLikeAddress)', () => {
+    // Filter must drop addresses that no remote peer could plausibly
+    // dial — loopback, link-local, unspecified bind, RFC1918, CGNAT,
+    // ULA, and DNS hostnames that resolve to local-only names.
+    // Real production addrs (public IPs + circuit forms anchored on a
+    // public relay) pass through. Duplicates from libp2p's listen /
+    // announce dedup are collapsed.
+    //
+    // Codex review of PR #700 round 2 flagged that the previous regex
+    // filter still leaked RFC1918 / CGNAT / ULA / `/dns*/localhost`
+    // into the agent profile. The fence below pins the wider drop set
+    // we now reuse from `core/src/node.ts:isPublicLikeAddress`.
     const out = collectPublishableMultiaddrs([
       '/ip4/127.0.0.1/tcp/9090/p2p/QmA',           // loopback
       '/ip4/0.0.0.0/tcp/9090/p2p/QmA',             // unspecified bind
       '/ip4/169.254.0.5/tcp/9090/p2p/QmA',         // link-local
+      '/ip4/10.0.0.5/tcp/9090/p2p/QmA',            // RFC1918 (10/8)
+      '/ip4/172.16.0.5/tcp/9090/p2p/QmA',          // RFC1918 (172.16/12)
+      '/ip4/172.31.255.255/tcp/9090/p2p/QmA',      // RFC1918 boundary
+      '/ip4/192.168.1.5/tcp/9090/p2p/QmA',         // RFC1918 (192.168/16)
+      '/ip4/100.105.212.110/tcp/9090/p2p/QmA',     // CGNAT (100.64/10)
       '/ip6/::1/tcp/9090/p2p/QmA',                 // loopback
       '/ip6/::/tcp/9090/p2p/QmA',                  // unspecified
       '/ip6/fe80::1/tcp/9090/p2p/QmA',             // link-local
+      '/ip6/fc00::1/tcp/9090/p2p/QmA',             // ULA
+      '/ip6/fd12::1/tcp/9090/p2p/QmA',             // ULA
+      '/dns4/localhost/tcp/9090/p2p/QmA',          // DNS localhost
+      '/dns4/host.local/tcp/9090/p2p/QmA',         // mDNS .local
       '/ip4/203.0.113.10/tcp/9090/p2p/QmA',        // public, keep
       '/ip4/203.0.113.10/tcp/9090/p2p/QmA',        // duplicate of above, drop
-      '/ip4/198.51.100.20/tcp/9090/p2p-circuit/p2p/QmA', // circuit, keep
+      '/ip4/198.51.100.20/tcp/9090/p2p-circuit/p2p/QmA', // circuit on public relay, keep
+      '/dns4/relay.origintrail.network/tcp/443/p2p/QmA', // public DNS, keep
     ]);
     expect(out).toEqual([
       '/ip4/203.0.113.10/tcp/9090/p2p/QmA',
       '/ip4/198.51.100.20/tcp/9090/p2p-circuit/p2p/QmA',
+      '/dns4/relay.origintrail.network/tcp/443/p2p/QmA',
     ]);
   });
 

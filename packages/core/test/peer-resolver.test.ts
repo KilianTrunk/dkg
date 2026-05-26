@@ -533,6 +533,34 @@ describe('PeerResolver', () => {
     expect(out).not.toContain(bad);
   });
 
+  it('step 4 (phonebook): missing lastSeenMs is treated as stale (multiaddrs dropped, relay still used)', async () => {
+    // Codex review of PR #700 round 2: the `DiscoveredAgent.lastSeen`
+    // JSDoc says unknown freshness should fall back to relay only.
+    // The round-1 implementation treated `lastSeenMs === undefined` as
+    // fresh, so partial / manual agents-CG entries (no heartbeat
+    // pulse) bypassed the stale-data guard. This test pins the
+    // round-2 behaviour: no `lastSeenMs` ⇒ multiaddrs ignored, relay
+    // address still tried.
+    net.__findPeerImpl = async () => [];
+    const direct = '/ip4/203.0.113.10/tcp/9090/p2p/' + PEER_B;
+    const dir: AgentDirectoryLookup = {
+      findRelayForPeer: async () => null,
+      findAgentDialAddresses: async () => ({
+        multiaddrs: [direct],
+        relayAddress: RELAY_ADDR,
+        // lastSeenMs intentionally omitted
+      }),
+    };
+    const resolver = new PeerResolver({
+      network: net,
+      registry,
+      agentDirectory: dir,
+    });
+    const out = await resolver.resolve(PEER_B);
+    expect(out).not.toContain(direct);
+    expect(out).toContain(`${RELAY_ADDR}/p2p-circuit/p2p/${PEER_B}`);
+  });
+
   it('step 4 (phonebook): custom agentDirectoryStaleThresholdMs is honoured', async () => {
     net.__findPeerImpl = async () => [];
     const direct = '/ip4/203.0.113.10/tcp/9090/p2p/' + PEER_B;

@@ -1,5 +1,9 @@
 import type { Quad } from '@origintrail-official/dkg-storage';
-import { DKG_ONTOLOGY, SYSTEM_CONTEXT_GRAPHS } from '@origintrail-official/dkg-core';
+import {
+  DKG_ONTOLOGY,
+  SYSTEM_CONTEXT_GRAPHS,
+  isPublicLikeAddress,
+} from '@origintrail-official/dkg-core';
 
 /**
  * Canonicalise the DID subject for an agent.
@@ -26,15 +30,30 @@ export function canonicalAgentDidSubject(raw: string): string {
 
 /**
  * Filter a node's live libp2p multiaddrs down to the set worth
- * publishing in the agent profile. Drops:
- *   - loopback (127.0.0.0/8, ::1) — never dialable from another host
- *   - link-local (169.254.0.0/16, fe80::/10) — not routable
- *   - 0.0.0.0 / :: unspecified bind addresses
- *   - duplicates
+ * publishing in the agent profile.
  *
- * Keeps everything else as-is — TCP, WebSocket, circuit-relayed
- * (`/p2p-circuit`), DNS, public IPs. Callers (`DKGAgent.publishProfile`)
- * feed the result into `AgentProfileConfig.multiaddrs`.
+ * Reuses the shared `isPublicLikeAddress` classifier from `dkg-core`
+ * (the same one `share-project-modal.test.ts` and the daemon's
+ * "node is remotely-dialable" check pin to). That classifier rejects:
+ *   - loopback (127.0.0.0/8, ::1)
+ *   - unspecified bind (0.0.0.0, ::)
+ *   - link-local (169.254.0.0/16, fe80::/10)
+ *   - RFC1918 (10/8, 172.16/12, 192.168/16)
+ *   - CGNAT (100.64/10)
+ *   - multicast / reserved (224.0.0.0+)
+ *   - IPv6 ULA (fc00::/7) and multicast (ff00::/8)
+ *   - `/dns4/` / `/dns6/` / `/dnsaddr/` hostnames that resolve to
+ *     localhost-y / `.local` / etc.
+ *
+ * The classifier evaluates the LEADING address segment, which is
+ * exactly what we want for `/p2p-circuit` entries — those are encoded
+ * as `/ip4/<relay-ip>/.../p2p-circuit/p2p/<peer-id>` and only the
+ * public-relay form should be advertised.
+ *
+ * Codex review of PR #700 round 2 flagged that the round-1 regex
+ * filter still leaked RFC1918 / CGNAT / ULA into the agent profile, so
+ * peers learnt self-referential or private multiaddrs from the
+ * phonebook and wasted dial attempts before falling back to the relay.
  *
  * Exported separately so it can be unit-tested without standing up a
  * full agent.
@@ -46,16 +65,7 @@ export function collectPublishableMultiaddrs(
   const out: string[] = [];
   for (const ma of raw) {
     if (!ma || seen.has(ma)) continue;
-    if (
-      /\/ip4\/127\./.test(ma) ||
-      /\/ip4\/0\.0\.0\.0\//.test(ma) ||
-      /\/ip4\/169\.254\./.test(ma) ||
-      /\/ip6\/::1\//.test(ma) ||
-      /\/ip6\/::\//.test(ma) ||
-      /\/ip6\/fe80:/i.test(ma)
-    ) {
-      continue;
-    }
+    if (!isPublicLikeAddress(ma)) continue;
     seen.add(ma);
     out.push(ma);
   }

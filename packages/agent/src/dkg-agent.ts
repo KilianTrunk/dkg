@@ -736,14 +736,30 @@ export class DKGAgent {
    */
   private agentProfileHeartbeatTimer?: ReturnType<typeof setInterval>;
   /**
-   * In-flight guard for {@link agentProfileHeartbeatTimer}.
-   * `publishProfile()` mutates `ProfileManager.currentKcId` and
-   * rewrites registry triples, so two concurrent runs (e.g. when the
-   * heartbeat is configured shorter than publish latency, or chain
-   * RPC is slow) would race each other. The interval skips the tick
-   * if a publish is already in flight. Codex review of PR #700.
+   * Heartbeat-tick coalescing flag. When a heartbeat is already
+   * in flight, the next tick logs + skips instead of queueing — this
+   * keeps the queue depth at 1 even if publish latency exceeds the
+   * heartbeat cadence (slow chain RPC, congested gossip mesh).
+   *
+   * NOT a correctness gate against concurrent `publishProfile()`
+   * callers — startup, key-rotation, and revocation also call
+   * `publishProfile()` directly, and they bypass this flag. The
+   * correctness gate is the `publishProfileTail` mutex below.
    */
   private agentProfileHeartbeatInFlight = false;
+  /**
+   * Serialization mutex for `publishProfile()`. Tail-promise chain:
+   * each new caller `await`s the prior call (success or failure) and
+   * only then runs its own publish. Codex review of PR #700 round 2
+   * flagged that the heartbeat-only inFlight guard left a race
+   * window between the heartbeat tick and the existing `startup` /
+   * key-rotation / revocation callers, both of which mutate
+   * `ProfileManager.currentKcId` and rewrite the registry triples
+   * on every call. Serializing inside `publishProfile()` covers
+   * every entry point at the lowest level instead of duplicating
+   * the guard at every caller.
+   */
+  private publishProfileTail: Promise<unknown> = Promise.resolve();
   /**
    * OT-RFC-38 / LU-6 Phase B — sliding-window rate-limiter applied
    * to pre-registration (beacon-discovered) ciphertext writes.
@@ -3906,6 +3922,24 @@ export class DKGAgent {
   }
 
   async publishProfile(): Promise<PublishResult> {
+    // Tail-chain serialization: every caller waits for the prior
+    // `publishProfile()` to settle (success or failure) before
+    // running its own publish. Prevents the startup / heartbeat /
+    // key-rotation / revocation paths from racing each other on
+    // `ProfileManager.currentKcId` and the registry triples.
+    // Codex review of PR #700 round 2.
+    const run = this.publishProfileTail
+      .catch(() => {
+        // swallow prior errors so a transient publish failure does
+        // not poison every subsequent publish for the lifetime of
+        // the agent
+      })
+      .then(() => this.publishProfileImpl());
+    this.publishProfileTail = run;
+    return run;
+  }
+
+  private async publishProfileImpl(): Promise<PublishResult> {
     const pubKeyBase64 = Buffer.from(this.wallet.keypair.publicKey).toString('base64');
     const relayAddrs = this.config.relayPeers;
     const defaultAgent = this.defaultAgentAddress ? this.localAgents.get(this.defaultAgentAddress) : undefined;

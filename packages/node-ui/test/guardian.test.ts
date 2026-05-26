@@ -59,6 +59,26 @@ describe('Guardian audit analysis', () => {
     ]);
   });
 
+  it('classifies sensitive tilde paths from agent commands and responses', () => {
+    const event = normalizeGuardianEvent({
+      type: 'tool_call',
+      sourceAgent: { framework: 'hermes', name: 'Named Hermes child' },
+      sessionId: 'session-tilde',
+      toolName: 'terminal',
+      data: {
+        command: 'ls ~/.ssh && ls ~/.aws',
+        result: 'config\ncredentials',
+      },
+    });
+    const findings = analyzeGuardianEvent(event);
+    const pathFindings = findings.filter((f) => f.type === 'sensitive_path_access');
+
+    expect(pathFindings).toHaveLength(2);
+    expect(pathFindings.map((f) => f.severity)).toEqual(['critical', 'critical']);
+    expect(pathFindings.map((f) => f.evidence_json).join('\n')).toContain(`${homedir()}/.ssh`);
+    expect(pathFindings.map((f) => f.evidence_json).join('\n')).toContain(`${homedir()}/.aws`);
+  });
+
   it('builds a sanitized remediation prompt from open findings', () => {
     const event = normalizeGuardianEvent({
       type: 'tool_call',

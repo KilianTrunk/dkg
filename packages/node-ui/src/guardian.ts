@@ -180,7 +180,7 @@ const SHELL_INSTALL_PATTERNS = [
 ];
 
 const REMOTE_SCRIPT_RE = /\b(?:curl|wget)\b[\s\S]{0,500}\|\s*(?:sh|bash|zsh|python|python3|node)\b/i;
-const PATH_RE = /(?:~|\/Users\/[^\s"'`;$|<>]+|\/(?:etc|var|tmp|opt|usr|private|home|Volumes)\/[^\s"'`;$|<>]+)/g;
+const PATH_RE = /(?:~(?:\/[^\s"'`;$|<>]+)?|\/Users\/[^\s"'`;$|<>]+|\/(?:etc|var|tmp|opt|usr|private|home|Volumes)\/[^\s"'`;$|<>]+)/g;
 const PACKAGE_TOKEN_RE = /^(?:@[A-Za-z0-9._-]+\/)?[A-Za-z0-9._-]+(?:==|@)[A-Za-z0-9][A-Za-z0-9._+!~-]*$/;
 
 export function stableHash(value: unknown, length = 24): string {
@@ -686,7 +686,7 @@ function classifyPaths(paths: string[]): ClassifiedPath[] {
   const out: ClassifiedPath[] = [];
   const seen = new Set<string>();
   for (const raw of paths) {
-    const expanded = raw.startsWith('~') ? resolve(home, raw.slice(2)) : raw;
+    const expanded = raw === '~' ? home : raw.startsWith('~/') ? resolve(home, raw.slice(2)) : raw;
     const path = normalize(expanded);
     if (seen.has(path)) continue;
     seen.add(path);

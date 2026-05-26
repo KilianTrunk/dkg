@@ -741,13 +741,15 @@ describe('[Q-5] Context Oracle proof params → correct graph targets', () => {
     expect(res.graphPrefixes).toEqual([]);
   });
 
-  it('verified-memory without verifiedGraph targets ONLY the `_verified_memory/` prefix (RC11 / PR2: root data graph removed from VM)', () => {
+  it('verified-memory without verifiedGraph unions root content graph + `_verified_memory/` prefix (RC11 / PR-A: Codex #671)', () => {
     const res = resolveViewGraphs('verified-memory', CG, {});
-    // RC11 / PR2: pre-PR2 the root content graph was unioned in here,
-    // which combined with the publisher's unconditional pre-chain
-    // data-graph insert produced the "tentative VM" leak. VM now sources
-    // exclusively from `_verified_memory/*` (post-`verify` writer).
-    expect(res.graphs).toEqual([]);
+    // RC11 / PR-A (Codex review fix on #671, comment 3302058969):
+    // the root content graph is re-included so a successful publish
+    // shows up in VM immediately (memory-search flows depend on this).
+    // The tentative-VM leak the PR2 first cut was guarding against is
+    // now plugged at the publisher (root-graph insert deferred to the
+    // chain-success branch in `DKGPublisher.publish`).
+    expect(res.graphs).toEqual([`did:dkg:context-graph:${CG}`]);
     expect(res.graphPrefixes).toEqual([`did:dkg:context-graph:${CG}/_verified_memory/`]);
   });
 

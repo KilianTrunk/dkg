@@ -41,11 +41,12 @@
  * link-local → ULAv6 — so a more-specific class wins over a less-specific
  * one. DNS multiaddrs deliberately classify as `dns` rather than resolving at
  * boot (DNS resolution is async + flaky + the answer can change). DNS listen
- * addresses are not themselves proof of public reachability, but DNS announce
- * addresses can rescue an otherwise private/wildcard binding because the
- * operator is explicitly advertising a stable externally-routable name.
+ * addresses are not themselves proof of public reachability, but externally
+ * routable DNS announce addresses can rescue an otherwise private/wildcard
+ * binding because the operator is explicitly advertising a stable name.
  */
 
+import { isIP } from 'node:net';
 import type { NetworkInterfaceInfo } from 'node:os';
 
 export type AddrClassification =
@@ -121,6 +122,16 @@ const RFC1918_REGEXES: ReadonlyArray<RegExp> = [
   /^192\.168\./,
 ];
 
+function isValidIPv4(ip: string): boolean {
+  return isIP(ip) === 4;
+}
+
+function isDocumentationIPv4(ip: string): boolean {
+  return /^192\.0\.2\./.test(ip)
+    || /^198\.51\.100\./.test(ip)
+    || /^203\.0\.113\./.test(ip);
+}
+
 /**
  * Tailscale CGNAT: 100.64.0.0/10 (== first octet 100, second octet 64..127).
  * RFC6598 carrier-grade NAT range; routable on the Tailscale overlay only,
@@ -153,11 +164,13 @@ function isRfc1918IPv4(ip: string): boolean {
 }
 
 function classifyIPv4(ip: string): AddrClassification {
+  if (!isValidIPv4(ip)) return 'unknown';
   if (isLoopbackIPv4(ip)) return 'loopback';
   if (isLinkLocalIPv4(ip)) return 'linkLocal';
   if (isCgnatIPv4(ip)) return 'cgnat';
   if (isRfc1918IPv4(ip)) return 'rfc1918';
   if (isMulticastIPv4(ip)) return 'multicast';
+  if (isDocumentationIPv4(ip)) return 'unknown';
   return 'public';
 }
 
@@ -173,12 +186,55 @@ function classifyIPv4(ip: string): AddrClassification {
  *   - everything else             → public
  */
 function classifyIPv6(ipRaw: string): AddrClassification {
+  if (isIP(ipRaw) !== 6) return 'unknown';
   const ip = ipRaw.toLowerCase();
   if (ip === '::1') return 'loopback';
+  if (ip.startsWith('2001:db8:') || ip === '2001:db8::') return 'unknown';
   if (/^fe[89ab][0-9a-f]?:/.test(ip)) return 'linkLocal';
   if (/^f[cd][0-9a-f]{2}:/.test(ip)) return 'ulaIpv6';
   if (/^ff[0-9a-f]{2}:/.test(ip)) return 'multicast';
   return 'public';
+}
+
+function dnsHostFromMultiaddr(addr: string): string | undefined {
+  const parts = addr.split('/').filter(Boolean);
+  const proto = parts[0];
+  if (proto !== 'dns' && proto !== 'dns4' && proto !== 'dns6' && proto !== 'dnsaddr') {
+    return undefined;
+  }
+  return parts[1];
+}
+
+function isPublicDnsHostname(hostRaw: string | undefined): boolean {
+  if (!hostRaw) return false;
+  const host = hostRaw.toLowerCase().replace(/\.$/, '');
+  if (!host || host === 'localhost') return false;
+  const ipFamily = isIP(host);
+  if (ipFamily === 4) return classifyIPv4(host) === 'public';
+  if (ipFamily === 6) return classifyIPv6(host) === 'public';
+  if (!host.includes('.')) return false;
+  if (!/^[a-z0-9-]+(?:\.[a-z0-9-]+)+$/.test(host)) return false;
+  return !(
+    host.endsWith('.local')
+    || host.endsWith('.internal')
+    || host.endsWith('.test')
+    || host.endsWith('.example')
+    || host.endsWith('.invalid')
+    || host.endsWith('.localhost')
+    || host.endsWith('.home.arpa')
+    || host.endsWith('.lan')
+    || host.endsWith('.cluster.local')
+  );
+}
+
+function isPublicAnnounceAddress(
+  addr: string,
+  hostInterfaces: ReadonlyArray<NetworkInterfaceInfo>,
+): boolean {
+  const klass = classifyMultiaddr(addr, hostInterfaces);
+  if (klass === 'public') return true;
+  if (klass !== 'dns') return false;
+  return isPublicDnsHostname(dnsHostFromMultiaddr(addr));
 }
 
 /**
@@ -269,10 +325,7 @@ export function checkCoreRelayPrereqs(
     .map((c) => c.addr);
   const nonRoutableAddresses = classified.filter((c) => c.class !== 'public');
 
-  const announcePublic = announceAddresses.some((a) => {
-    const klass = classifyMultiaddr(a, hostInterfaces);
-    return klass === 'public' || klass === 'dns';
-  });
+  const announcePublic = announceAddresses.some((a) => isPublicAnnounceAddress(a, hostInterfaces));
   const announceCanServe = classified.some(
     (c) => c.class === 'dns'
       || c.class === 'rfc1918'
@@ -307,7 +360,7 @@ export function checkCoreRelayPrereqs(
     }
     if (announceAddresses.length > 0 && !announcePublic) {
       reasons.push(
-        `${announceAddresses.length} announceAddress${announceAddresses.length === 1 ? '' : 'es'} present but none classify as public or DNS`,
+        `${announceAddresses.length} announceAddress${announceAddresses.length === 1 ? '' : 'es'} present but none classify as public or public DNS`,
       );
     }
     if (announceAddresses.length === 0) {

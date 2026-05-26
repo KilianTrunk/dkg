@@ -12,21 +12,21 @@ import {
  * tests are deterministic regardless of where they run.
  */
 const PUBLIC_IPV4_IFACE: NetworkInterfaceInfo = {
-  address: '203.0.113.5', // RFC 5737 documentation range — never routable but textually public
+  address: '8.8.8.8',
   netmask: '255.255.255.0',
   family: 'IPv4',
   mac: '00:00:00:00:00:00',
   internal: false,
-  cidr: '203.0.113.5/24',
+  cidr: '8.8.8.8/24',
 };
 
 const PUBLIC_IPV6_IFACE: NetworkInterfaceInfo = {
-  address: '2001:db8::5',
+  address: '2606:4700:4700::1111',
   netmask: 'ffff:ffff:ffff:ffff::',
   family: 'IPv6',
   mac: '00:00:00:00:00:00',
   internal: false,
-  cidr: '2001:db8::5/64',
+  cidr: '2606:4700:4700::1111/64',
 };
 
 const RFC1918_IFACE: NetworkInterfaceInfo = {
@@ -60,7 +60,9 @@ describe('classifyMultiaddr — per-class smoke tests', () => {
   type Case = [string, AddrClassification];
   const cases: Case[] = [
     // The 8 base classes plus wildcards.
-    ['/ip4/203.0.113.5/tcp/4001',     'public'],
+    ['/ip4/8.8.8.8/tcp/4001',         'public'],
+    ['/ip4/203.0.113.5/tcp/4001',     'unknown'],
+    ['/ip4/999.999.999.999/tcp/4001', 'unknown'],
     ['/ip4/10.0.0.1/tcp/4001',        'rfc1918'],
     ['/ip4/172.20.0.1/tcp/4001',      'rfc1918'],
     ['/ip4/192.168.1.1/tcp/4001',     'rfc1918'],
@@ -75,7 +77,8 @@ describe('classifyMultiaddr — per-class smoke tests', () => {
     ['/ip6/fd00::1/tcp/4001',         'ulaIpv6'],  // RFC 4193 fc00::/7
     ['/ip6/fdab:cdef::1/tcp/4001',    'ulaIpv6'],  // Tailscale ULA range
     ['/ip6/ff02::1/tcp/4001',         'multicast'],
-    ['/ip6/2001:db8::1/tcp/4001',     'public'],   // RFC 3849 documentation range
+    ['/ip6/2606:4700:4700::1111/tcp/4001', 'public'],
+    ['/ip6/2001:db8::1/tcp/4001',     'unknown'],  // RFC 3849 documentation range
     ['/dns4/example.com/tcp/4001',    'dns'],
     ['/dns6/example.com/tcp/4001',    'dns'],
     ['/dns/example.com/tcp/4001',     'dns'],
@@ -167,14 +170,14 @@ describe('checkCoreRelayPrereqs — 7 canonical cases from the plan', () => {
     expect(result.nonRoutableAddresses[0].class).toBe('rfc1918');
   });
 
-  it('case 4: single public IPv4 (203.0.113.5) is not degraded', () => {
+  it('case 4: single public IPv4 is not degraded', () => {
     const result = checkCoreRelayPrereqs({
-      listenAddresses: ['/ip4/203.0.113.5/tcp/4001'],
+      listenAddresses: ['/ip4/8.8.8.8/tcp/4001'],
       hostInterfaces: [PUBLIC_IPV4_IFACE],
       nodeRole: 'core',
     });
     expect(result.looksDegraded).toBe(false);
-    expect(result.publicListenAddresses).toEqual(['/ip4/203.0.113.5/tcp/4001']);
+    expect(result.publicListenAddresses).toEqual(['/ip4/8.8.8.8/tcp/4001']);
   });
 
   it('case 5: loopback-only is degraded', () => {
@@ -198,14 +201,14 @@ describe('checkCoreRelayPrereqs — 7 canonical cases from the plan', () => {
   });
 
   it('case 7: DNS-only listen + public announce rescues the result', () => {
-    // The VPS-with-static-IP case: listen via `/dns4/foo.example/...` because
+    // The VPS-with-static-IP case: listen via `/dns4/relay.origintrail.io/...` because
     // the operator wants to point clients at a stable name, then announce the
     // resolved public IP separately. Either side alone would not classify as
     // public, but the public announceAddresses entry rescues the verdict.
     const result = checkCoreRelayPrereqs({
-      listenAddresses: ['/dns4/relay.example.com/tcp/4001'],
+      listenAddresses: ['/dns4/relay.origintrail.io/tcp/4001'],
       hostInterfaces: [RFC1918_IFACE],
-      announceAddresses: ['/ip4/203.0.113.5/tcp/4001'],
+      announceAddresses: ['/ip4/8.8.8.8/tcp/4001'],
       nodeRole: 'core',
     });
     expect(result.looksDegraded).toBe(false);
@@ -216,7 +219,7 @@ describe('checkCoreRelayPrereqs — 7 canonical cases from the plan', () => {
     const result = checkCoreRelayPrereqs({
       listenAddresses: ['/ip4/192.168.1.1/tcp/4001'],
       hostInterfaces: [RFC1918_IFACE],
-      announceAddresses: ['/dnsaddr/relay.example.com'],
+      announceAddresses: ['/dnsaddr/relay.origintrail.io'],
       nodeRole: 'core',
     });
 
@@ -253,7 +256,7 @@ describe('checkCoreRelayPrereqs — additional safety cases', () => {
     const result = checkCoreRelayPrereqs({
       listenAddresses: [],
       hostInterfaces: [PUBLIC_IPV4_IFACE],
-      announceAddresses: ['/ip4/203.0.113.5/tcp/4001'],
+      announceAddresses: ['/ip4/8.8.8.8/tcp/4001'],
       nodeRole: 'core',
     });
     expect(result.looksDegraded).toBe(true);
@@ -264,7 +267,7 @@ describe('checkCoreRelayPrereqs — additional safety cases', () => {
     const result = checkCoreRelayPrereqs({
       listenAddresses: ['/ip4/127.0.0.1/tcp/4001'],
       hostInterfaces: [LOOPBACK_IFACE],
-      announceAddresses: ['/ip4/203.0.113.5/tcp/4001'],
+      announceAddresses: ['/ip4/8.8.8.8/tcp/4001'],
       nodeRole: 'core',
     });
     expect(result.looksDegraded).toBe(true);
@@ -300,7 +303,19 @@ describe('checkCoreRelayPrereqs — additional safety cases', () => {
       nodeRole: 'core',
     });
     expect(result.looksDegraded).toBe(true);
-    expect(result.reasons.some((r) => r.includes('announceAddress') && r.includes('none classify as public or DNS'))).toBe(true);
+    expect(result.reasons.some((r) => r.includes('announceAddress') && r.includes('none classify as public or public DNS'))).toBe(true);
+  });
+
+  it('reserved DNS announce names do not rescue private listeners', () => {
+    for (const host of ['localhost', 'relay.local', 'svc.cluster.local', 'myhost', 'relay.test', 'relay.example']) {
+      const result = checkCoreRelayPrereqs({
+        listenAddresses: ['/ip4/192.168.1.1/tcp/4001'],
+        hostInterfaces: [],
+        announceAddresses: [`/dnsaddr/${host}`],
+        nodeRole: 'core',
+      });
+      expect(result.looksDegraded, host).toBe(true);
+    }
   });
 
   it('no announceAddresses on a degraded result surfaces the missing-rescue hint', () => {

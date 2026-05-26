@@ -639,6 +639,36 @@ export async function runDaemonInner(
 
   const dashDb = new DashboardDB({ dataDir: dkgDir() });
 
+  if (role === 'core' && config.core?.allowDegradedRelay === false) {
+    const hostInterfaces = Object.values(osModule.networkInterfaces())
+      .flat()
+      .filter((i): i is NetworkInterfaceInfo => i !== undefined);
+    const prereq = checkCoreRelayPrereqs({
+      listenAddresses: [`/ip4/0.0.0.0/tcp/${config.listenPort ?? 0}`],
+      hostInterfaces,
+      announceAddresses: config.announceAddresses ?? [],
+      nodeRole: 'core',
+    });
+    if (prereq.looksDegraded) {
+      log(
+        `[CORE-PREREQ] FATAL before libp2p start: this Core node looks degraded as a relay. ` +
+          `reasons: ${prereq.reasons.join('; ')}. ` +
+          `non-routable addresses: ${prereq.nonRoutableAddresses
+            .map((a) => `${a.addr} (${a.class})`)
+            .join(', ')}. ` +
+          `Set core.allowDegradedRelay: true to downgrade this to a warning.`,
+      );
+      try {
+        dashDb.close();
+      } catch (err: any) {
+        log(`Core prereq fatal DB close error: ${err?.message ?? String(err)}`);
+      }
+      await removePid().catch(() => {});
+      process.exit(1);
+      return;
+    }
+  }
+
   // Universal Messenger substrate stores (rc.9 PR-2). Wired into the
   // DKGAgent's Messenger so any caller that opts into
   // `messenger.sendReliable` gets durable receiver-side idempotency
@@ -859,8 +889,10 @@ export async function runDaemonInner(
 
   await agent.start();
 
-  // Core-relay capability sanity check. Runs once, post-start, while the boot
-  // banner is still in operator focus. If the node declares itself as a Core
+  // Core-relay capability sanity check. Runs post-start, while the boot
+  // banner is still in operator focus. Strict `allowDegradedRelay: false`
+  // operators also get a pre-start pass above so we can refuse before
+  // binding sockets. If the node declares itself as a Core
   // (`nodeRole: "core"`) but its actually-bound multiaddrs can't serve inbound
   // traffic (all loopback / RFC1918 / CGNAT / IPv6 ULA — beacon-01 was the
   // canonical Tailscale-only case), surface a structured `[CORE-PREREQ]` log
@@ -871,12 +903,8 @@ export async function runDaemonInner(
   //   - `false`: refuse to boot via a minimal post-agent-start cleanup path —
   //     fail-loud opt-in.
   //
-  // The check is deliberately scoped to a single post-start pass. A pre-start
-  // pass (classifying the *configured* listenAddresses + host interfaces
-  // before libp2p resolves wildcards) is doable but adds plumbing — and the
-  // post-start data is the authoritative source anyway (libp2p has already
-  // expanded `0.0.0.0` to per-interface bindings here). We leave the pre-start
-  // pass as a future extension; the cost is one extra warning ~50ms earlier.
+  // The post-start pass remains authoritative because libp2p has already
+  // expanded `0.0.0.0` to per-interface bindings here.
   if (role === 'core') {
     try {
       const resolvedMultiaddrs = agent.node.libp2p

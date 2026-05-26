@@ -1,4 +1,9 @@
 import { ethers, JsonRpcProvider, Wallet, Contract, Interface } from 'ethers';
+import {
+  createFilterErrorSilencer,
+  formatProviderError,
+  type FilterErrorSilencer,
+} from './filter-error-silencer.js';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
 import { existsSync, readFileSync } from 'node:fs';
@@ -271,6 +276,17 @@ interface ContractCache {
   randomSamplingStorage?: Contract;
 }
 
+function formatProviderContext(config: Pick<EVMAdapterConfig, 'chainId' | 'rpcUrl'>): string {
+  let rpcHost: string;
+  try {
+    const parsed = new URL(config.rpcUrl);
+    rpcHost = parsed.host || parsed.protocol || 'unknown-rpc';
+  } catch {
+    rpcHost = 'unparseable-rpc';
+  }
+  return `chainId=${config.chainId ?? 'unknown'} rpc=${rpcHost}`;
+}
+
 /**
  * EVM chain adapter implementing the V9 ChainAdapter interface.
  * Resolves contract addresses dynamically from the Hub.
@@ -284,6 +300,7 @@ export class EVMChainAdapter implements ChainAdapter {
   readonly chainId: string;
 
   private readonly provider: JsonRpcProvider;
+  private readonly filterErrorSilencer: FilterErrorSilencer;
   /** Primary signer — used for identity/profile/staking operations. */
   private readonly signer: Wallet;
   /** All operational signers (includes primary). Used round-robin for publish TXs. */
@@ -359,6 +376,38 @@ export class EVMChainAdapter implements ChainAdapter {
 
   constructor(config: EVMAdapterConfig) {
     this.provider = new JsonRpcProvider(config.rpcUrl, undefined, { cacheTimeout: -1 });
+    const providerContext = formatProviderContext(config);
+    // PR-8: install the filter-not-found silencer. Without this, RPC
+    // nodes that GC filters faster than ethers' polling cadence
+    // (observed: 134 MB of daemon.log spam in 24h on beacon-01) spam
+    // the operator's logs with per-tick "filter not found" errors.
+    // The silencer dedupe-logs once per DEDUP_WINDOW_MS and lets every
+    // other provider error propagate normally. It does not recreate
+    // filters or guarantee every Hub-resolved contract handle stays
+    // fresh; only the RandomSampling pair has a TTL self-heal path.
+    // The warning text keeps the wider event-polling degradation visible.
+    this.filterErrorSilencer = createFilterErrorSilencer({
+      log: (msg) => console.warn(`${msg} (${providerContext})`),
+    });
+    const providerErrorHandler = (err: unknown) => {
+      if (this.filterErrorSilencer.handle(err)) return;
+      // Non-filter provider errors fall through to the error
+      // path so they remain visible. Operators grepping their logs
+      // for chain-provider issues still see everything they used to
+      // EXCEPT the filter-spam class.
+      console.error(`[chain] provider error (${providerContext}): ${formatProviderError(err)}`);
+    };
+    try {
+      void Promise.resolve(this.provider.on('error', providerErrorHandler)).catch((err: unknown) => {
+        console.error(
+          `[chain] provider error listener registration failed (${providerContext}): ${formatProviderError(err)}`,
+        );
+      });
+    } catch (err) {
+      console.error(
+        `[chain] provider error listener registration failed (${providerContext}): ${formatProviderError(err)}`,
+      );
+    }
     this.signer = new Wallet(config.privateKey, this.provider);
     this.signerPool = [this.signer];
     for (const key of config.additionalKeys ?? []) {
@@ -2676,7 +2725,8 @@ export class EVMChainAdapter implements ChainAdapter {
    * rejection. We `await` both subscriptions and only set
    * `hubRotationListenerStarted` after both succeed, so a failed
    * provider can be retried by a future call site if we ever need to
-   * — and meanwhile the TTL refresh path still keeps the pair fresh.
+   * — and meanwhile the TTL refresh path still keeps the RandomSampling
+   * pair fresh.
    */
   private async startHubRotationListener(): Promise<void> {
     if (this.hubRotationListenerStarted) return;

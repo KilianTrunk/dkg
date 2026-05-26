@@ -100,6 +100,7 @@ import {
   gitCommandEnv,
   gitCommandArgs,
   isStandaloneInstall,
+  resolveAutoUpdateSource,
   slotEntryPoint,
   CLI_NPM_PACKAGE,
 } from '../config.js';
@@ -145,6 +146,7 @@ import { DkgClient } from '@origintrail-official/dkg-mcp/client';
 // the project's tsconfig (`noUnusedLocals` is off).
 import {
   daemonState,
+  resolveStandaloneInstall,
   type CorsAllowlist,
 } from './state.js';
 import {
@@ -183,6 +185,11 @@ import {
   bindingValue,
   carryForwardBundledMarkItDownBinary,
 } from './manifest.js';
+import {
+  SHUTDOWN_HARD_TIMEOUT_MS,
+  encodeForcedShutdownExitCode,
+  raceShutdownWithTimeout,
+} from './shutdown.js';
 import {
   resolveNameToPeerId,
   isPublishQuad,
@@ -1060,7 +1067,12 @@ export async function runDaemonInner(
   // omits the field (the common case after `dkg init` with default answers).
   let updateInterval: ReturnType<typeof setInterval> | null = null;
   const au = resolveAutoUpdateConfig(config, network);
-  const standalone = isStandaloneInstall();
+  // Honour `autoUpdate.source` override (config.ts) — explicit "npm" / "git"
+  // wins over the filesystem probe (`isStandaloneInstall()`); "auto" or omitted
+  // falls through to today's behaviour. Resolve source even when `au` is null
+  // (auto-update disabled) so local/network install-mode policy still seeds the
+  // cache for anyone else who reads `daemonState.standaloneCache` later in boot.
+  const standalone = resolveStandaloneInstall(au?.source ?? resolveAutoUpdateSource(config, network));
   const hasGitConfig = !!au;
 
   if (standalone || hasGitConfig) {
@@ -2090,35 +2102,59 @@ export async function runDaemonInner(
   log('Node is running. Use "dkg status" or "dkg peers" to interact.');
   startPostApiPublishing();
 
-  // Graceful shutdown
+  // Graceful shutdown — wrapped with a hard wall-clock timeout so a deadlock in
+  // any of the cleanup awaits below (notably `agent.stop()` when in-flight sync
+  // work holds libp2p reads open) cannot leave the worker process a zombie. See
+  // `./shutdown.ts` for the offset-exit-code convention used to signal forced
+  // exits to the supervisor + external monitoring.
   let shuttingDown = false;
   async function shutdown(exitCode = 0) {
     if (shuttingDown) return;
     shuttingDown = true;
     log("Shutting down...");
-    if (updateInterval) clearInterval(updateInterval);
-    clearInterval(chainScanTimer);
-    clearInterval(pingTimer);
-    clearInterval(pruneTimer);
-    rateLimiter.destroy();
-    metricsCollector.stop();
-    await publisherRuntime
-      ?.stop()
-      .catch((err: any) =>
-        log(`Publisher runtime stop error: ${err?.message ?? String(err)}`),
+    const cleanupStateFiles = async () => {
+      await removePid().catch((err: any) =>
+        log(`PID cleanup error: ${err?.message ?? String(err)}`),
       );
-    await daemonState.catchupRunner
-      ?.close()
-      .catch((err: any) =>
-        log(`Catch-up runner stop error: ${err?.message ?? String(err)}`),
+      await removeApiPort().catch((err: any) =>
+        log(`API port cleanup error: ${err?.message ?? String(err)}`),
       );
-    server.close();
-    await agent.stop();
-    dashDb.close();
-    await removePid();
-    await removeApiPort();
-    log("Stopped.");
-    process.exit(exitCode);
+    };
+    const cleanup = (async () => {
+      try {
+        if (updateInterval) clearInterval(updateInterval);
+        clearInterval(chainScanTimer);
+        clearInterval(pingTimer);
+        clearInterval(pruneTimer);
+        rateLimiter.destroy();
+        metricsCollector.stop();
+        await publisherRuntime
+          ?.stop()
+          .catch((err: any) =>
+            log(`Publisher runtime stop error: ${err?.message ?? String(err)}`),
+          );
+        await daemonState.catchupRunner
+          ?.close()
+          .catch((err: any) =>
+            log(`Catch-up runner stop error: ${err?.message ?? String(err)}`),
+          );
+        server.close();
+        await agent.stop();
+        dashDb.close();
+        log("Stopped.");
+      } finally {
+        await cleanupStateFiles();
+      }
+    })().catch((err: any) => {
+      log(`Shutdown cleanup error: ${err?.message ?? String(err)}`);
+    });
+    const { forced } = await raceShutdownWithTimeout(
+      cleanup,
+      SHUTDOWN_HARD_TIMEOUT_MS,
+      log,
+      cleanupStateFiles,
+    );
+    process.exit(forced ? encodeForcedShutdownExitCode(exitCode) : exitCode);
   }
 
   process.on("SIGINT", () => shutdown(0));

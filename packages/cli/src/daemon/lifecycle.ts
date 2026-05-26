@@ -366,7 +366,7 @@ function listenerMultiaddrs(listener: unknown): string[] {
   return stringifyMultiaddrList(candidate?.multiaddrs);
 }
 
-function getBoundListenMultiaddrs(libp2p: unknown): string[] {
+function getBoundListenMultiaddrs(libp2p: unknown): string[] | null {
   const node = libp2p as {
     components?: { transportManager?: unknown };
     services?: { transportManager?: unknown };
@@ -388,9 +388,9 @@ function getBoundListenMultiaddrs(libp2p: unknown): string[] {
   }
 
   // If this libp2p shape does not expose transport listeners, prefer an
-  // indeterminate/degraded result over treating advertised self-addresses as
-  // bound listener evidence.
-  return [];
+  // indeterminate result over treating advertised self-addresses as bound
+  // listener evidence.
+  return null;
 }
 
 /**
@@ -973,47 +973,54 @@ export async function runDaemonInner(
   if (role === 'core') {
     try {
       const resolvedMultiaddrs = getBoundListenMultiaddrs(agent.node.libp2p);
-      const hostInterfaces = Object.values(osModule.networkInterfaces())
-        .flat()
-        .filter((i): i is NetworkInterfaceInfo => i !== undefined);
-      const prereq = checkCoreRelayPrereqs({
-        listenAddresses: resolvedMultiaddrs,
-        hostInterfaces,
-        announceAddresses: config.announceAddresses ?? [],
-        nodeRole: 'core',
-      });
-      if (prereq.looksDegraded) {
-        const allowDegraded = config.core?.allowDegradedRelay !== false;
-        const verb = allowDegraded ? 'WARNING' : 'FATAL';
+      if (resolvedMultiaddrs === null) {
         log(
-          `[CORE-PREREQ] ${verb}: this Core node looks degraded as a relay. ` +
-            `reasons: ${prereq.reasons.join('; ')}. ` +
-            `non-routable addresses: ${prereq.nonRoutableAddresses
-              .map((a) => `${a.addr} (${a.class})`)
-              .join(', ')}. ` +
-            (allowDegraded
-              ? `Set core.allowDegradedRelay: false in ~/.dkg/config.json to refuse-to-boot on this state. ` +
-                `See docs/specs/SPEC_RELAY_DISCOVERY.md for the full rationale.`
-              : `Refusing to boot. Set core.allowDegradedRelay: true to downgrade this to a warning.`),
+          `[CORE-PREREQ] WARNING: could not inspect bound libp2p listener addresses; ` +
+            `skipping post-start relay prerequisite verdict.`,
         );
-        if (!allowDegraded) {
-          await agent.stop().catch((err: any) =>
-            log(`Core prereq fatal-stop error: ${err?.message ?? String(err)}`),
-          );
-          try {
-            dashDb.close();
-          } catch (err: any) {
-            log(`Core prereq fatal DB close error: ${err?.message ?? String(err)}`);
-          }
-          await removePid().catch(() => {});
-          process.exit(1);
-          return;
-        }
       } else {
-        log(
-          `[CORE-PREREQ] OK: ${prereq.publicListenAddresses.length} ` +
-            `public-class listen address${prereq.publicListenAddresses.length === 1 ? '' : 'es'} bound.`,
-        );
+        const hostInterfaces = Object.values(osModule.networkInterfaces())
+          .flat()
+          .filter((i): i is NetworkInterfaceInfo => i !== undefined);
+        const prereq = checkCoreRelayPrereqs({
+          listenAddresses: resolvedMultiaddrs,
+          hostInterfaces,
+          announceAddresses: config.announceAddresses ?? [],
+          nodeRole: 'core',
+        });
+        if (prereq.looksDegraded) {
+          const allowDegraded = config.core?.allowDegradedRelay !== false;
+          const verb = allowDegraded ? 'WARNING' : 'FATAL';
+          log(
+            `[CORE-PREREQ] ${verb}: this Core node looks degraded as a relay. ` +
+              `reasons: ${prereq.reasons.join('; ')}. ` +
+              `non-routable addresses: ${prereq.nonRoutableAddresses
+                .map((a) => `${a.addr} (${a.class})`)
+                .join(', ')}. ` +
+              (allowDegraded
+                ? `Set core.allowDegradedRelay: false in ~/.dkg/config.json to refuse-to-boot on this state. ` +
+                  `See docs/specs/SPEC_RELAY_DISCOVERY.md for the full rationale.`
+                : `Refusing to boot. Set core.allowDegradedRelay: true to downgrade this to a warning.`),
+          );
+          if (!allowDegraded) {
+            await agent.stop().catch((err: any) =>
+              log(`Core prereq fatal-stop error: ${err?.message ?? String(err)}`),
+            );
+            try {
+              dashDb.close();
+            } catch (err: any) {
+              log(`Core prereq fatal DB close error: ${err?.message ?? String(err)}`);
+            }
+            await removePid().catch(() => {});
+            process.exit(1);
+            return;
+          }
+        } else {
+          log(
+            `[CORE-PREREQ] OK: ${prereq.publicListenAddresses.length} ` +
+              `public-class listen address${prereq.publicListenAddresses.length === 1 ? '' : 'es'} bound.`,
+          );
+        }
       }
     } catch (err) {
       // The check is defensive — never let a crash inside it block the boot.

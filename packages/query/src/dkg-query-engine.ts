@@ -111,15 +111,24 @@ export function resolveViewGraphs(
           graphPrefixes: [],
         };
       }
-      // §16.1: the root content graph `did:dkg:context-graph:{id}` IS the
-      // Verified Memory content layer (chain-confirmed data lands here after
-      // finalization).  Any quorum-specific verified-memory sub-graphs live
-      // under `_verified_memory/` and are unioned in as well.
-      //
-      // Keep all verified-memory candidate graphs in scope. Trust is
-      // determined only by explicit metadata joined into the query below.
+      // RC11 / PR2 (post-tentative-VM-cleanup): verified-memory is now
+      // EXCLUSIVELY the `_verified_memory/*` named graphs that the
+      // post-confirmation writer in `DKGAgent.promoteToVerifiedMemory`
+      // populates (and stamps with `dkg:trustLevel` ConsensusVerified).
+      // The root content graph `did:dkg:context-graph:{id}` is no
+      // longer aliased into VM at all — pre-PR2 it was, which combined
+      // with the publisher's unconditional pre-chain data-graph insert
+      // produced the "tentative VM" leak: failed publishes left their
+      // quads in the root graph and `/api/query?view=verified-memory`
+      // returned them as if they had been confirmed. With the
+      // publisher's data-graph insert deferred to the chain-success
+      // branch (PR2) the root graph is now strictly the publisher's
+      // OWN confirmed-publish copy, but it is intentionally not part
+      // of the cross-node VM view — receivers see VM data only via
+      // their own `verify` operation, which writes into
+      // `_verified_memory/{vmId}` with chain-witnessed signers.
       return {
-        graphs: [contextGraphDataUri(contextGraphId)],
+        graphs: [],
         graphPrefixes: [`did:dkg:context-graph:${contextGraphId}/_verified_memory/`],
       };
     }

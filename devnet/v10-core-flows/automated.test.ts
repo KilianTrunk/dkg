@@ -14,13 +14,17 @@
  *      depend on. (Caught a real bug during devnet validation: standalone
  *      `/finalize` was missing the emit. See FINDINGS.md.)
  *
- *   2. Edge-node publish — runs create+write+finalize+promote+publish from
- *      an edge daemon (no on-chain identity) and asserts the publish
- *      surfaces `status: "tentative"` to the caller, with the daemon log
- *      showing the explicit "Identity not set (0) — skipping on-chain
- *      publish" warning. This is the architectural rule for app/relay
- *      nodes; a regression that crashed or pretended to chain-submit
- *      would silently break every edge integration.
+ *   2. Failed-publish honesty (RC11 / PR2) — runs create+write+finalize
+ *      +promote+publish from an edge daemon (no on-chain identity) so the
+ *      publisher's chain-submit branch necessarily fails. Asserts the
+ *      INVERSE of the old "tentative VM" contract: the publish reports
+ *      failure to the caller AND `/api/query?view=verified-memory` returns
+ *      zero rows for the just-published triples. Pre-RC11 a failed publish
+ *      silently wrote its quads into the root data graph and the VM view
+ *      aliased that graph into VM, so an external app would observe
+ *      "verified" data that the chain had never anchored. PR2 deletes
+ *      `generateTentativeMetadata` from the on-chain catch and limits VM
+ *      to `_verified_memory/*` graphs; this test pins both halves.
  *
  *   3. NFT staking withdraw — `DKGStakingConvictionNFT.withdraw(tokenId)`
  *      on an unlocked tier-0 position. Verifies: TRAC delta to staker EOA
@@ -354,36 +358,68 @@ describe('1. chained sign-at-creation assertion lifecycle', () => {
   }, 60_000);
 });
 
-// ────────────────────────── 2. Edge-node publish ─────────────────────────
-describe('2. edge-node publish', () => {
-  it('runs full lifecycle on edge node and surfaces tentative status (no on-chain identity)', async () => {
+// ─────────────────── 2. Failed-publish honesty (RC11 / PR2) ───────────────────
+describe('2. failed publish does not leak triples into verified-memory (RC11 / PR2)', () => {
+  it('edge-node publish fails AND /api/query?view=verified-memory returns zero rows for its triples', async () => {
     const assertionName = `core-flows-edge-${Date.now().toString(36)}`;
+    const subject = `urn:test:edge:rc11:${Date.now().toString(36)}`;
+    const witnessLiteral = `"PR2 failed-publish witness ${Date.now().toString(36)}"`;
 
     let r = await postJson(NODE5_API, '/api/assertion/create', { contextGraphId: CONTEXT_GRAPH, name: assertionName }, state.node5Token);
     expect(r.status, `edge create: ${JSON.stringify(r.body)}`).toBe(200);
 
+    // The witness literal is unique per run so the verified-memory query
+    // below can isolate THIS publish's quads from any bootstrap data
+    // sitting in the same context graph.
     const quads = [
-      { subject: 'urn:test:edge:s1', predicate: 'http://schema.org/name', object: '"Edge-node publish test"', graph: '' },
-      { subject: 'urn:test:edge:s1', predicate: 'http://schema.org/author', object: '"edge-node-5"', graph: '' },
+      { subject, predicate: 'http://schema.org/name', object: witnessLiteral, graph: '' },
+      { subject, predicate: 'http://schema.org/author', object: '"edge-node-5"', graph: '' },
     ];
     r = await postJson(NODE5_API, `/api/assertion/${assertionName}/write`, { contextGraphId: CONTEXT_GRAPH, quads }, state.node5Token);
     expect(r.status).toBe(200);
     r = await postJson(NODE5_API, `/api/assertion/${assertionName}/finalize`, { contextGraphId: CONTEXT_GRAPH }, state.node5Token);
     expect(r.status).toBe(200);
-    const sealMerkleRoot = r.body.merkleRoot;
     r = await postJson(NODE5_API, `/api/assertion/${assertionName}/promote`, { contextGraphId: CONTEXT_GRAPH }, state.node5Token);
     expect(r.status).toBe(200);
 
+    // The publish MUST NOT confirm — node5 is the edge node, has no
+    // on-chain identity, so the publisher's chain-submit branch hits
+    // `PublisherWalletRequiredError` (or the equivalent typed ACK /
+    // signer guard). Pre-RC11 the publisher's catch swallowed this
+    // into `status: 'tentative'` and `/api/shared-memory/publish`
+    // returned 200; post-RC11 / PR2 the error propagates and the
+    // daemon route surfaces a non-2xx (or a 200 with `status: 'failed'`,
+    // depending on the route's error translation — accept either).
     r = await postJson(NODE5_API, '/api/shared-memory/publish', { contextGraphId: CONTEXT_GRAPH, assertionName }, state.node5Token);
-    expect(r.status, `edge publish: ${JSON.stringify(r.body)}`).toBe(200);
+    const publishOk = r.status === 200 && r.body?.status === 'confirmed';
+    expect(publishOk, `edge publish unexpectedly confirmed: ${JSON.stringify(r.body)}`).toBe(false);
 
-    // The architectural rule: edge has no on-chain identity, so the publish
-    // is held tentative and gossiped — not chain-anchored. Caller learns
-    // this from the response status.
-    expect(r.body.status, 'edge publish must be tentative — edge has no on-chain identity').toBe('tentative');
-    expect(r.body.merkleRoot).toBe(sealMerkleRoot);
-    // kcId 0 is the placeholder for "no chain anchor yet"
-    expect(['0', 0]).toContain(r.body.kcId);
+    // CORE ASSERTION (inverse of the deleted "tentative VM" contract):
+    // the failed publish's triples MUST NOT appear in the
+    // verified-memory view on ANY node. We poll node1 (a core) for up
+    // to a few seconds so any in-flight gossip from the edge had time
+    // to land in the wrong graph, then assert zero rows.
+    const vmQuery = await postJson(
+      NODE1_API,
+      '/api/query',
+      {
+        sparql:
+          `SELECT ?o WHERE { <${subject}> <http://schema.org/name> ?o . FILTER(?o = ${witnessLiteral}) }`,
+        contextGraphId: CONTEXT_GRAPH,
+        view: 'verified-memory',
+      },
+      state.node1Token,
+    );
+    expect(vmQuery.status, `vm query: ${JSON.stringify(vmQuery.body)}`).toBe(200);
+    const vmBindings: unknown[] = vmQuery.body?.bindings ?? vmQuery.body?.results?.bindings ?? [];
+    expect(
+      vmBindings.length,
+      `PR2 invariant violated: failed publish leaked ${vmBindings.length} row(s) into ` +
+      `view=verified-memory for ${subject} — the on-chain catch is still ` +
+      `writing tentative quads to a graph that the VM view aliases. ` +
+      `Re-check dkg-publisher.ts catch block and dkg-query-engine.ts ` +
+      `verified-memory branch.`,
+    ).toBe(0);
   }, 90_000);
 });
 

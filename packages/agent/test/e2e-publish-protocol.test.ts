@@ -337,7 +337,7 @@ describe('E2E: Publish KC directly to context graph', () => {
     try { await nodeA?.stop(); } catch {}
   });
 
-  it('publishes KC via publishDirect and registers it to the CG atomically', async () => {
+  it('publishes KC via publishDirect from a lone core: no peer ACKs → tentative (RC11 / PR1)', async () => {
     nodeA = await DKGAgent.create({
       name: 'DirectCGA',
       listenPort: 0,
@@ -359,10 +359,16 @@ describe('E2E: Publish KC directly to context graph', () => {
     ]);
     await sleep(2000);
 
+    // RC11 / PR1: the publisher's self-signed ACK fallback is gone, so a
+    // single-node publishFromSharedMemory has no real peers to dial for
+    // ACKs and the publisher correctly downgrades the publish to
+    // `tentative` instead of synthesising a `peerId: 'self'` ACK that the
+    // contract would reject on any network with `minimumRequiredSignatures
+    // >= 2` anyway. The replicate-then-publish on-chain path is covered
+    // by the multi-node §1 / §2 tests above.
     const result = await nodeA.publishFromSharedMemory(CONTEXT_GRAPH, { rootEntities: [ENTITY_3] });
-    expect(result.status).toBe('confirmed');
-    expect(result.onChainResult).toBeDefined();
-    expect(result.onChainResult!.batchId).toBeGreaterThan(0n);
+    expect(result.status).toBe('tentative');
+    expect(result.onChainResult).toBeUndefined();
   }, 20_000);
 });
 
@@ -409,16 +415,19 @@ describe('E2E: Publish rejected with insufficient receiver signatures', () => {
     ]);
 
     /**
-     * With minimumRequiredSignatures=2 on-chain, the self-signed
-     * single signature will be rejected by the chain's signature check,
-     * resulting in a tentative (off-chain only) publish.
+     * RC11 / PR1: with `minimumRequiredSignatures=2` on-chain AND the
+     * lone publisher having no peer cores to collect ACKs from, the
+     * publisher's ACK provider returns 0 ACKs, the on-chain submit
+     * branch throws "V10 ACKs required" pre-flight, and the publish
+     * downgrades to `tentative`. Pre-PR1 the publisher synthesised a
+     * single self-signed ACK that the chain rejected as 1<2; same
+     * tentative outcome, different (and more honest) failure point.
      */
     const result = await nodeA.publishFromSharedMemory(
       CONTEXT_GRAPH,
       { rootEntities: [ENTITY_1] },
     );
 
-    // Should be tentative since the on-chain tx rejects with only 1 self-signed sig
     expect(result.status).toBe('tentative');
   }, 20_000);
 });
@@ -434,7 +443,7 @@ describe('E2E: Context graph registration rejected with insufficient participant
     try { await nodeA?.stop(); } catch {}
   });
 
-  it('context graph enshrine fails when participant sigs not met', async () => {
+  it('context graph publish from a lone core: no peer ACKs → tentative (RC11 / PR1)', async () => {
     const ctx = getSharedContext();
     nodeA = await DKGAgent.create({
       name: 'ParticipantA',
@@ -450,7 +459,6 @@ describe('E2E: Context graph registration rejected with insufficient participant
     await nodeA.createContextGraph({ id: CONTEXT_GRAPH, name: 'Participant Test', description: '' });
     nodeA.subscribeToContextGraph(CONTEXT_GRAPH);
 
-    // Context graph requires 2 signatures, but only 1 node available
     const cgResult = await nodeA.registerContextGraphOnChain({
       accessPolicy: 0,
       publishPolicy: 1,
@@ -461,17 +469,24 @@ describe('E2E: Context graph registration rejected with insufficient participant
       { subject: ENTITY_1, predicate: 'http://schema.org/name', object: '"Needs Sigs"', graph: '' },
     ]);
 
+    // RC11 / PR1: V10 + LU-2 still enforces the *global*
+    // `minimumRequiredSignatures`, but the publisher no longer
+    // synthesises a self-signed ACK when peer collection yields
+    // nothing. A lone core with no other peers in its mesh therefore
+    // sees `ACKs collected = 0`, the publisher throws the typed
+    // ACK-collection failure, and the on-chain submit branch downgrades
+    // to `tentative`. This test previously asserted `confirmed` because
+    // the (now-deleted) self-signed ACK satisfied the 1-of-1 quorum on
+    // the harness; that path is gone. The multi-peer happy path is
+    // covered by §1 / §2 above.
     const result = await nodeA.publishFromSharedMemory(
       CONTEXT_GRAPH,
       { rootEntities: [ENTITY_1] },
       { subContextGraphId: contextGraphId },
     );
 
-    // V10 + LU-2: publishDirect enforces the *global*
-    // minimumRequiredSignatures (set via ParametersStorage). Per-CG
-    // hosting committees and per-CG quorum overrides are gone, so the
-    // global minimum (1) plus a valid self-signed ACK is enough.
-    expect(result.status).toBe('confirmed');
+    expect(result.status).toBe('tentative');
+    expect(result.onChainResult).toBeUndefined();
   }, 20_000);
 });
 
@@ -549,8 +564,18 @@ describe('E2E: Edge node participates in context graph governance', () => {
      *
      * Edge node should be able to sign (contextGraphId, merkleRoot)
      * even though it has no stake and isn't in the sharding table.
+     *
+     * RC11 / PR1: the only peer in coreNode's mesh is an EDGE node,
+     * which does not register the StorageACK handler. coreNode therefore
+     * collects 0 receiver ACKs (it does not — and pre-PR1 did not —
+     * self-ACK). With the self-signed fallback deleted, the publisher
+     * downgrades to `tentative` instead of submitting a single bogus
+     * `peerId: 'self'` ACK. The participant-sig governance layer this
+     * test exercises is independent of the receiver-ACK gate: the
+     * triples still land in the data graph (publisher's unconditional
+     * insert, removed in PR2), which is what the bindings check below
+     * actually validates.
      */
-    // Both core and edge node sign as participants
     const result = await coreNode.publishFromSharedMemory(
       CONTEXT_GRAPH,
       { rootEntities: [ENTITY_1] },
@@ -563,7 +588,7 @@ describe('E2E: Edge node participates in context graph governance', () => {
       },
     );
 
-    expect(result.status).toBe('confirmed');
+    expect(result.status).toBe('tentative');
 
     const ctxDataGraph = `did:dkg:context-graph:${CONTEXT_GRAPH}/context/${contextGraphId}`;
     const data = await coreNode.query(

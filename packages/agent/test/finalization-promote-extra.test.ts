@@ -199,8 +199,8 @@ describe('Round 5 §10: replica-side dkg:Publication / dkg:authoredBy provenance
   });
 });
 
-describe('A-4: e2e — agent.publish() data lands in canonical (verified-memory) view', () => {
-  it('published data is observable via query(view:"verified-memory") on the publisher', async () => {
+describe('A-4: e2e — agent.publish() data lands in canonical (data) view post-confirmation', () => {
+  it('published data is observable via query(contextGraphId: cgId) on the publisher (RC11 / PR2: VM separation)', async () => {
     const cgId = `a4-e2e-${ethers.hexlify(ethers.randomBytes(3)).slice(2)}`;
     const entity = `urn:a4:e2e:${ethers.hexlify(ethers.randomBytes(3)).slice(2)}`;
 
@@ -212,18 +212,37 @@ describe('A-4: e2e — agent.publish() data lands in canonical (verified-memory)
     ]);
     expect(pub.status, 'publish must confirm for the promotion invariant to apply').toBe('confirmed');
 
-    // Canonical/verified memory must contain the published triple. If this
-    // returns 0 bindings, the agent layer is stuck in SWM — A-4's suspected
-    // PROD-BUG would be confirmed.
+    // RC11 / PR2: the canonical data graph (`did:dkg:context-graph:{cg}`)
+    // is populated AFTER on-chain confirmation now (not unconditionally
+    // pre-chain). The original BUGS_FOUND.md A-4 invariant — "confirmed
+    // publishes land where the publisher's own SPARQL can see them" —
+    // is unchanged; we just check it via the default context-graph
+    // scope rather than the cross-node `view: 'verified-memory'` view,
+    // which post-PR2 sources only `_verified_memory/*` graphs populated
+    // by a separate `verify` operation.
     const qr = await nodeA!.query(
+      `SELECT ?o WHERE { <${entity}> <http://schema.org/name> ?o }`,
+      cgId,
+    );
+    expect(
+      qr.bindings.length,
+      'root context-graph must contain the published triple after confirmed publish (BUGS_FOUND.md A-4)',
+    ).toBe(1);
+    expect(qr.bindings[0]['o']).toBe('"E2E-A4"');
+
+    // RC11 / PR2: `view: 'verified-memory'` sources exclusively from
+    // `_verified_memory/{vmId}` graphs that the agent's `verify`
+    // operation populates. Without an explicit `verify` step, the VM
+    // view stays empty for this entity — that's the intended PR2
+    // separation: published ≠ cross-node verified.
+    const vmQr = await nodeA!.query(
       `SELECT ?o WHERE { <${entity}> <http://schema.org/name> ?o }`,
       { contextGraphId: cgId, view: 'verified-memory' },
     );
     expect(
-      qr.bindings.length,
-      'canonical (verified-memory) graph must contain the published triple after confirmed publish (BUGS_FOUND.md A-4)',
-    ).toBe(1);
-    expect(qr.bindings[0]['o']).toBe('"E2E-A4"');
+      vmQr.bindings.length,
+      'verified-memory view must NOT include published-but-not-yet-verified data after PR2',
+    ).toBe(0);
 
     // And the same data MUST NOT remain in SWM post-confirmation —
     // leaving it there would be a double-counting leak.

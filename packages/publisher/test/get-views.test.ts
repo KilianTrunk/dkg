@@ -46,9 +46,16 @@ describe('resolveViewGraphs', () => {
   });
 
   describe('verified-memory', () => {
-    it('includes root content graph and _verified_memory/ prefix when no specific verifiedGraph is given', () => {
+    it('returns only the _verified_memory/ prefix when no specific verifiedGraph is given (RC11 / PR2: root data graph is no longer aliased into VM)', () => {
       const res = resolveViewGraphs('verified-memory', CG);
-      expect(res.graphs).toEqual([`did:dkg:context-graph:${CG}`]);
+      // RC11 / PR2: the root content graph `did:dkg:context-graph:{id}`
+      // used to be unioned in here, which combined with the publisher's
+      // unconditional pre-chain data-graph insert produced the
+      // "tentative VM" leak. The publisher's data-graph write is now
+      // gated on chain confirmation AND the VM view sources only
+      // `_verified_memory/*` (populated by `DKGAgent.promoteToVerifiedMemory`
+      // after a successful `verify`).
+      expect(res.graphs).toEqual([]);
       expect(res.graphPrefixes).toEqual([`did:dkg:context-graph:${CG}/_verified_memory/`]);
     });
 

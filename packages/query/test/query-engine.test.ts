@@ -183,16 +183,24 @@ describe('DKGQueryEngine', () => {
     ).rejects.toThrow('SPARQL rejected');
   });
 
-  it('view=verified-memory queries the root content graph (§16.1)', async () => {
+  it('view=verified-memory does NOT include the root content graph (RC11 / PR2)', async () => {
+    // RC11 / PR2: VM view sources only `_verified_memory/*` graphs now
+    // (root data graph is no longer aliased into VM). The `"ImageBot"`
+    // quad lives in the root context graph via the test setup, so the
+    // VM-scoped query MUST NOT return it. This pins the inverse of the
+    // pre-PR2 "tentative VM" leak: even when the root graph holds
+    // confirmed publisher-side data, the cross-node VM view requires
+    // an explicit `_verified_memory/{vmId}` entry from a successful
+    // `verify` operation before it surfaces the data.
     const result = await engine.query(
       'SELECT ?name WHERE { ?s <http://schema.org/name> ?name }',
       { contextGraphId: CONTEXT_GRAPH, view: 'verified-memory' },
     );
-    expect(result.bindings).toHaveLength(1);
-    expect(result.bindings[0]['name']).toBe('"ImageBot"');
+    const names = result.bindings.map(r => r['name']);
+    expect(names).not.toContain('"ImageBot"');
   });
 
-  it('view=verified-memory unions root content graph with _verified_memory/ graphs', async () => {
+  it('view=verified-memory returns ONLY _verified_memory/ graph data (RC11 / PR2)', async () => {
     const vmGraph = `did:dkg:context-graph:${CONTEXT_GRAPH}/_verified_memory/quorum-1`;
     await store.insert([
       q('urn:vm:entity:1', 'http://schema.org/name', '"Quorum Verified"', vmGraph),
@@ -202,7 +210,9 @@ describe('DKGQueryEngine', () => {
       { contextGraphId: CONTEXT_GRAPH, view: 'verified-memory' },
     );
     const names = result.bindings.map(r => r['name']);
-    expect(names).toContain('"ImageBot"');
+    // RC11 / PR2: only VM-sub-graph data surfaces. Root-graph quads
+    // (incl. the `"ImageBot"` test setup quad) are excluded.
+    expect(names).not.toContain('"ImageBot"');
     expect(names).toContain('"Quorum Verified"');
   });
 

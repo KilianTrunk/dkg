@@ -254,6 +254,95 @@ describe('startLivenessWatcher', () => {
     expect(onFailure).not.toHaveBeenCalled();
     watcher.stop();
   });
+
+  it('disarms (no SIGKILL, no failure increment) when isShuttingDown returns true', async () => {
+    // Regression: PR #664 originally counted every failed probe toward the
+    // SIGKILL threshold, so a slow shutdown tail (server.close() runs early
+    // → probe fails → 5 × 30s later we SIGKILL) bypassed agent.stop() / DB
+    // close. The supervisor wires `isShuttingDown` to "api.port file gone"
+    // because the worker's shutdown() removes it before the slow awaits.
+    const probe = vi.fn().mockResolvedValue(false);
+    const onUnresponsive = vi.fn();
+    const onFailure = vi.fn();
+    const isShuttingDown = vi.fn().mockReturnValue(true);
+    const watcher = startLivenessWatcher({
+      port: 1234,
+      probe,
+      onUnresponsive,
+      onFailure,
+      isShuttingDown,
+      intervalMs: 1000,
+      consecutiveFailuresToKill: 1,
+    });
+
+    await advanceTicks(5, 1000);
+    expect(onUnresponsive).not.toHaveBeenCalled();
+    expect(onFailure).not.toHaveBeenCalled();
+    expect(isShuttingDown).toHaveBeenCalled();
+    watcher.stop();
+  });
+
+  it('still SIGKILLs zombies when isShuttingDown returns false', async () => {
+    // Mirror image of the previous test: api.port present + probe failing
+    // means the worker is genuinely a zombie (event loop wedged after a
+    // partial shutdown attempt), and the watcher must still trip.
+    const probe = vi.fn().mockResolvedValue(false);
+    const onUnresponsive = vi.fn();
+    const isShuttingDown = vi.fn().mockReturnValue(false);
+    const watcher = startLivenessWatcher({
+      port: 1234,
+      probe,
+      onUnresponsive,
+      isShuttingDown,
+      intervalMs: 1000,
+      consecutiveFailuresToKill: 3,
+    });
+
+    await advanceTicks(3, 1000);
+    expect(onUnresponsive).toHaveBeenCalledTimes(1);
+    watcher.stop();
+  });
+
+  it('treats isShuttingDown errors as "still alive" (fail-safe — keeps SIGKILL path armed)', async () => {
+    // If the shutdown detector itself throws (e.g. transient FS error reading
+    // api.port), we MUST NOT silently disarm — that would let a real zombie
+    // hide behind a flaky FS. Treat detector errors as "not shutting down"
+    // and keep counting failures.
+    const probe = vi.fn().mockResolvedValue(false);
+    const onUnresponsive = vi.fn();
+    const isShuttingDown = vi.fn().mockRejectedValue(new Error('FS busy'));
+    const watcher = startLivenessWatcher({
+      port: 1234,
+      probe,
+      onUnresponsive,
+      isShuttingDown,
+      intervalMs: 1000,
+      consecutiveFailuresToKill: 2,
+    });
+
+    await advanceTicks(2, 1000);
+    expect(onUnresponsive).toHaveBeenCalledTimes(1);
+    watcher.stop();
+  });
+
+  it('checks isShuttingDown only on failed probes (no FS pressure when worker is healthy)', async () => {
+    // Performance: the supervisor probes every 30s in production. We only
+    // need to consult `isShuttingDown` when the probe FAILS — checking on
+    // every healthy tick wastes a syscall in the steady state.
+    const probe = vi.fn().mockResolvedValue(true);
+    const isShuttingDown = vi.fn().mockReturnValue(false);
+    const watcher = startLivenessWatcher({
+      port: 1234,
+      probe,
+      onUnresponsive: vi.fn(),
+      isShuttingDown,
+      intervalMs: 1000,
+    });
+
+    await advanceTicks(5, 1000);
+    expect(isShuttingDown).not.toHaveBeenCalled();
+    watcher.stop();
+  });
 });
 
 describe('probeWorkerAlive (real TCP socket round-trip)', () => {

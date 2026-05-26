@@ -21,6 +21,7 @@ import yaml from 'js-yaml';
 import {
   loadConfig, saveConfig, configExists, configPath,
   readPid, readApiPort, isProcessRunning, dkgDir, logPath, ensureDkgDir, removeApiPort,
+  apiPortPath,
   loadNetworkConfig, loadProjectConfig, resolveAutoUpdateConfig, resolveChainConfig,
   releasesDir, activeSlot, swapSlot,
   slotEntryPoint, isStandaloneInstall,
@@ -230,6 +231,12 @@ async function maybeStartSupervisorLivenessWatcher(
         watcher = startLivenessWatcher({
           port,
           host: probeHostForApiHost(config.apiHost),
+          // Graceful-shutdown disarm: the worker's `shutdown()` removes
+          // `api.port` BEFORE the slow cleanup tail (`agent.stop()`,
+          // `dashDb.close()`, …), so its absence is the unambiguous "I'm
+          // intentionally shutting down" signal. Without this the watcher
+          // would race a slow teardown and SIGKILL mid-cleanup.
+          isShuttingDown: () => !existsSync(apiPortPath()),
           onUnresponsive: () => {
             supervisorWarn(
               `[supervisor] worker unresponsive after ${LIVENESS_CONSECUTIVE_FAILURES_TO_KILL} consecutive liveness probes; SIGKILL + respawn.`,

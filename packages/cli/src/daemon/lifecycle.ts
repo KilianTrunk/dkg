@@ -2096,6 +2096,14 @@ export async function runDaemonInner(
     if (shuttingDown) return;
     shuttingDown = true;
     log("Shutting down...");
+    // Tell the supervisor's liveness watcher that this is a graceful shutdown
+    // before any slow cleanup runs. The watcher reads `api.port`'s absence as
+    // "worker is intentionally going down — don't SIGKILL me mid-teardown."
+    // Idempotent with the second `removeApiPort()` below; if shutdown crashes
+    // here we'd be in the same state as if the late removeApiPort had failed.
+    await removeApiPort().catch((err: any) =>
+      log(`Early api.port cleanup error: ${err?.message ?? String(err)}`),
+    );
     if (updateInterval) clearInterval(updateInterval);
     clearInterval(chainScanTimer);
     clearInterval(pingTimer);

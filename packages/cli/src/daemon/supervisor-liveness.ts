@@ -128,6 +128,21 @@ export interface LivenessWatcherOpts {
   consecutiveFailuresToKill?: number;
   /** Injectable probe — tests pass a stub. Defaults to `probeWorkerAlive`. */
   probe?: (port: number, host?: string, timeoutMs?: number) => Promise<boolean>;
+  /**
+   * Optional graceful-shutdown detector. Called on every failed probe BEFORE
+   * the consecutive-failure counter is incremented. If it returns truthy, the
+   * watcher disarms — the worker is in the slow tail of an intentional
+   * shutdown (e.g. `agent.stop()` / DB close after `server.close()`), and
+   * SIGKILLing now would skip the rest of teardown.
+   *
+   * The supervisor wires this to `existsSync(apiPortFile) === false`: the
+   * worker's `shutdown()` removes `api.port` BEFORE the slow awaits, so its
+   * absence is the "graceful shutdown initiated" signal the watcher needs.
+   * Without this check, a slow cleanup tail (or future `SHUTDOWN_HARD_TIMEOUT_MS`
+   * bump above ~2.5 min) would race with `consecutiveFailuresToKill * intervalMs`
+   * and SIGKILL the worker mid-teardown.
+   */
+  isShuttingDown?: () => boolean | Promise<boolean>;
 }
 
 /**
@@ -160,6 +175,21 @@ export function startLivenessWatcher(opts: LivenessWatcherOpts): { stop(): void 
       if (alive) {
         consecutiveFailures = 0;
         return;
+      }
+      // Probe failed. Before counting it toward the SIGKILL threshold,
+      // ask the supervisor whether the worker is in a graceful shutdown
+      // (api.port file absent — see `LivenessWatcherOpts.isShuttingDown`).
+      // If so, disarm the watcher: SIGKILLing now would bypass `agent.stop()`,
+      // DB close, and pid cleanup, leaving local state dirty.
+      if (opts.isShuttingDown) {
+        try {
+          if (await opts.isShuttingDown()) {
+            stopped = true;
+            return;
+          }
+        } catch {
+          /* shutdown detector errors shouldn't unconditionally arm the SIGKILL path; treat as "still alive" and keep counting failures. */
+        }
       }
       consecutiveFailures += 1;
       opts.onFailure?.(consecutiveFailures);

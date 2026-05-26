@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   buildPeerStoreOverrides,
   buildKadDHTOptions,
+  pickNetworkTunables,
 } from '../src/node.js';
 
 // PR feat/chain-network-libp2p-tunables, round 2 (Codex review of PR
@@ -73,6 +74,67 @@ describe('buildPeerStoreOverrides', () => {
     });
     expect(out).toEqual({ maxPeerAge: 120_000 });
     expect(out).not.toHaveProperty('maxAddressAge');
+  });
+});
+
+describe('pickNetworkTunables (forwarding-hop fence)', () => {
+  // PR feat/chain-network-libp2p-tunables, round 3 (Codex review of
+  // PR #698): round-2's test pinned the lowest layer
+  // (`buildPeerStoreOverrides` / `buildKadDHTOptions`) against the
+  // libp2p init keys. The two forwarding hops above that —
+  // `DkgConfig.network` → `DKGAgentConfig` (in
+  // `cli/src/daemon/lifecycle.ts`) and `DKGAgentConfig` →
+  // `DKGNodeConfig` (in `agent/src/dkg-agent.ts`) — were still
+  // unfenced. Both now route through `pickNetworkTunables`, so the
+  // tests below are the single regression fence for the whole chain.
+  // A typo at any caller is a compile-time failure (the helper's
+  // return type is `NetworkTunables`); a copy-paste-cross bug at
+  // the helper itself is what these tests catch.
+
+  it('returns an empty-valued shape when source is empty', () => {
+    // We MUST return all three keys (even when undefined) so that
+    // spread-merging at the call site keeps the property names
+    // explicit in the resulting config object — easier to grep for
+    // when debugging.
+    expect(pickNetworkTunables({})).toEqual({
+      peerStoreMaxAddressAgeMs: undefined,
+      peerStoreMaxPeerAgeMs: undefined,
+      dhtQuerySelfIntervalMs: undefined,
+    });
+  });
+
+  it('forwards each field to the SAME-named slot (no copy-paste-cross)', () => {
+    // Distinct integers — a swap like
+    // `peerStoreMaxAddressAgeMs ← source.peerStoreMaxPeerAgeMs`
+    // would surface here as a value mismatch.
+    const out = pickNetworkTunables({
+      peerStoreMaxAddressAgeMs: 111,
+      peerStoreMaxPeerAgeMs: 222,
+      dhtQuerySelfIntervalMs: 333,
+    });
+    expect(out).toEqual({
+      peerStoreMaxAddressAgeMs: 111,
+      peerStoreMaxPeerAgeMs: 222,
+      dhtQuerySelfIntervalMs: 333,
+    });
+  });
+
+  it('ignores extra fields on the source (defensive against partial supersets)', () => {
+    // The forwarding hops pass `DkgConfig.network` (cli) and
+    // `DKGAgentConfig` (agent) — both have many other fields. The
+    // helper must not leak any of them into the result, otherwise
+    // a spread would pollute the downstream config object.
+    const out = pickNetworkTunables({
+      peerStoreMaxAddressAgeMs: 111,
+      // @ts-expect-error testing runtime defensive behaviour
+      unrelated: 'ignored',
+    });
+    expect(out).toEqual({
+      peerStoreMaxAddressAgeMs: 111,
+      peerStoreMaxPeerAgeMs: undefined,
+      dhtQuerySelfIntervalMs: undefined,
+    });
+    expect(out).not.toHaveProperty('unrelated');
   });
 });
 

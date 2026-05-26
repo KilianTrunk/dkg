@@ -126,6 +126,46 @@ export function isFinitePositiveInteger(input: unknown): input is number {
 }
 
 /**
+ * The three small / sparse-network tunables we forward end-to-end
+ * (`DkgConfig.network` → `DKGAgentConfig` → `DKGNodeConfig` →
+ * `createLibp2p` / `kadDHT`). Centralising the field list as a single
+ * named type means the forwarding hops cannot drift — `pickNetworkTunables`
+ * below is the one chokepoint they all travel through, and its return
+ * type is pinned to this interface so a missing / typo'd field in any
+ * forwarder fails at compile time. Codex review of PR #698 round 3.
+ */
+export interface NetworkTunables {
+  peerStoreMaxAddressAgeMs?: number;
+  peerStoreMaxPeerAgeMs?: number;
+  dhtQuerySelfIntervalMs?: number;
+}
+
+/**
+ * Forward exactly the three operator-tunable network fields. Used at
+ * every hop along `DkgConfig.network` → `DKGAgentConfig` →
+ * `DKGNodeConfig`, so the mapping (and any future addition to
+ * `NetworkTunables`) lives in exactly one place.
+ *
+ * The explicit field-by-field assignment is intentional: it guarantees
+ * (via the `NetworkTunables` return type) that a typo at any caller
+ * would fail to compile, and the value-preserving test in
+ * `libp2p-tunables-wiring.test.ts` catches copy-paste-cross bugs
+ * (e.g. wiring `peerStoreMaxAddressAgeMs ← source.peerStoreMaxPeerAgeMs`).
+ * Round-2 tests fence the lowest layer (`buildPeerStoreOverrides` /
+ * `buildKadDHTOptions`); this helper + its test fence the two
+ * forwarding hops above that. Codex review of PR #698 round 3.
+ */
+export function pickNetworkTunables(
+  source: Partial<NetworkTunables>,
+): NetworkTunables {
+  return {
+    peerStoreMaxAddressAgeMs: source.peerStoreMaxAddressAgeMs,
+    peerStoreMaxPeerAgeMs: source.peerStoreMaxPeerAgeMs,
+    dhtQuerySelfIntervalMs: source.dhtQuerySelfIntervalMs,
+  };
+}
+
+/**
  * Pure builder for the libp2p `peerStore` overrides we forward into
  * `createLibp2p`. Returns `undefined` when no operator field is valid
  * (the canonical signal for "omit the option block entirely so libp2p

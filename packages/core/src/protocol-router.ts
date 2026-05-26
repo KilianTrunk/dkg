@@ -1071,10 +1071,10 @@ export interface MultiPathResult {
  * selection is a follow-up if Gate B shows duplicate-relay
  * amplification matters.
  *
- * Returns `null` (not `throw`) on every failure mode so the caller
- * can fall through to single-path within the same logical `send()`
- * call. Throwing here would short-circuit the cold-peer recovery
- * path that the single-path resolver + retry loop is built for.
+ * Returns `null` (not `throw`) on path failures so the caller can fall
+ * through to single-path within the same logical `send()` call. AbortSignal
+ * cancellation is different: shutdown/deadline aborts propagate so the caller
+ * does not start a fresh fallback attempt after stop has begun.
  *
  * SAFETY: caller is responsible for the `/dkg/10.0.1/*` prefix
  * invariant (see {@link SendOptions.parallelPaths}). The receiver
@@ -1091,6 +1091,7 @@ export async function raceMultiPath(args: {
   maxReadBytes: number;
 }): Promise<MultiPathResult | null> {
   const { protocolId, data, parallelPaths, signal, maxReadBytes } = args;
+  if (signal.aborted) throw asAbortError(signal.reason);
   const candidates = args.getConnections().filter((c) => !c.status || c.status === 'open');
   if (candidates.length < 2) {
     // Single (or zero) live candidates — multi-path adds no value;
@@ -1172,8 +1173,9 @@ export async function raceMultiPath(args: {
     });
   } catch {
     // All N attempts failed — return null so caller falls through
-    // to single-path. At this point every attempt rejected, so any
-    // streams that opened can be aborted synchronously.
+    // to single-path, unless the shared signal was aborted. At that point the
+    // caller is stopping or out of budget, so starting a fresh fallback attempt
+    // would violate the abort contract.
     for (const s of streams) {
       if (s && !s.aborted) {
         s.aborted = true;
@@ -1184,6 +1186,7 @@ export async function raceMultiPath(args: {
         }
       }
     }
+    if (signal.aborted) throw asAbortError(signal.reason);
     return null;
   }
 

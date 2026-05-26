@@ -1445,7 +1445,7 @@ describe('ProtocolRouter', () => {
       expect(lateLoserSent).toBe(false);
     });
 
-    it('aborts hanging multipath reads when the signal fires', async () => {
+    it('propagates aborts from hanging multipath reads when the signal fires', async () => {
       const { raceMultiPath } = await import('../src/protocol-router.js');
       const controller = new AbortController();
       let aborts = 0;
@@ -1464,16 +1464,15 @@ describe('ProtocolRouter', () => {
       ];
       setTimeout(() => controller.abort(new Error('node stopping')), 10);
 
-      const result = await raceMultiPath({
+      await expect(raceMultiPath({
         getConnections: () => conns as any[],
         protocolId: '/test/1.0.0',
         data: new Uint8Array([1]),
         parallelPaths: 2,
         signal: controller.signal,
         maxReadBytes: 1024,
-      });
+      })).rejects.toThrow(/node stopping/);
 
-      expect(result).toBeNull();
       expect(aborts).toBeGreaterThanOrEqual(2);
     });
   });

@@ -440,12 +440,11 @@ export class DKGNode {
 
   async start(): Promise<void> {
     if (this.node) return;
-    // PR-6: fresh AbortController per start cycle. A daemon restart
-    // path (kill worker → respawn) calls start() again on a brand-new
-    // DKGNode, but defense-in-depth: if somebody were ever to call
-    // start() twice on the same instance without stop() in between,
-    // the early return at line 414 prevents this from re-running.
-    this.stopAbortController = new AbortController();
+    // PR-6: fresh AbortController per completed start cycle. Create it
+    // locally and publish it only after libp2p exists; otherwise a startup
+    // failure before `this.node` is set would leave callers composing against
+    // a stale stopSignal that stop() cannot clear.
+    const startStopAbortController = new AbortController();
 
     // Reset sticky relay state so a node restarted with a different
     // role / capacity doesn't leak the previous run's adapter or
@@ -945,6 +944,7 @@ export class DKGNode {
       // no-op metrics; the adapter is purely additive.
       ...(this.relayMetrics ? { metrics: () => this.relayMetrics! } : {}),
     } as any);
+    this.stopAbortController = startStopAbortController;
 
     this.setupConnectionObservability();
 

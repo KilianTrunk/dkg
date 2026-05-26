@@ -119,12 +119,15 @@ function cliErrorMessage(err: unknown): string {
 }
 
 function isCliKnownTransactionError(err: unknown): boolean {
+  const code = String((err as any)?.code ?? (err as any)?.error?.code ?? '').toUpperCase();
   const msg = cliErrorMessage(err).toLowerCase();
-  return msg.includes('already known')
+  return code === 'NONCE_EXPIRED'
+    || msg.includes('already known')
     || msg.includes('known transaction')
     || msg.includes('already imported')
     || msg.includes('transaction already in mempool')
     || msg.includes('already exists')
+    || msg.includes('nonce too low')
     || msg.includes('duplicate transaction');
 }
 
@@ -137,6 +140,7 @@ function isCliRetryableRpcError(err: unknown): boolean {
     (err as any)?.error?.status;
   const msg = cliErrorMessage(err).toLowerCase();
   if (code === 'CALL_EXCEPTION' || code === 'INSUFFICIENT_FUNDS' || code === 'NONCE_EXPIRED'
+    || code === 'RPC_RECEIPT_LOOKUP_FAILED'
     || code === 'REPLACEMENT_UNDERPRICED' || code === 'ACTION_REJECTED' || code === 'INVALID_ARGUMENT') {
     return false;
   }
@@ -181,6 +185,8 @@ async function getCliReceiptWithFailover(
   providers: ethers.JsonRpcProvider[],
   txHash: string,
 ): Promise<ethers.TransactionReceipt | null> {
+  let lastRetryable: unknown;
+  let sawNonErrorResponse = false;
   for (let i = 0; i < providers.length; i += 1) {
     try {
       const receipt = await cliWithTimeout(
@@ -188,10 +194,20 @@ async function getCliReceiptWithFailover(
         CLI_RPC_RECEIPT_ATTEMPT_TIMEOUT_MS,
         `receipt lookup via RPC #${i + 1}`,
       );
+      sawNonErrorResponse = true;
       if (receipt) return receipt;
     } catch (err) {
       if (!isCliRetryableRpcError(err)) throw err;
+      lastRetryable = err;
     }
+  }
+  if (lastRetryable && !sawNonErrorResponse) {
+    const err = new Error(
+      `Receipt lookup for transaction ${txHash} failed on all configured RPC endpoints: ${cliErrorMessage(lastRetryable)}`,
+      { cause: lastRetryable },
+    );
+    (err as any).code = 'RPC_RECEIPT_LOOKUP_FAILED';
+    throw err;
   }
   return null;
 }
@@ -662,15 +678,16 @@ program
 
     console.log('\nBlockchain Configuration:');
     const rpcUrl = await ask('RPC URL', defaultRpcUrl);
-    const rpcUrlsInput = await ask('Backup RPC URLs (comma-separated, optional)', defaultRpcUrls);
-    const rpcUrls = rpcUrlsInput.split(',').map((s) => s.trim()).filter(Boolean);
+    const rpcUrlsInput = await ask('Backup RPC URLs (comma-separated, optional; type "none" to clear)', defaultRpcUrls);
+    const clearRpcUrls = rpcUrlsInput.trim().toLowerCase() === 'none';
+    const rpcUrls = clearRpcUrls ? [] : rpcUrlsInput.split(',').map((s) => s.trim()).filter(Boolean);
     const hubAddress = await ask('Hub contract address', defaultHubAddress);
     const chainIdStr = await ask('Chain ID', defaultChainId);
 
     const chainSection = rpcUrl && hubAddress ? {
       type: 'evm' as const,
       rpcUrl,
-      ...(rpcUrls.length ? { rpcUrls } : {}),
+      ...(clearRpcUrls || rpcUrls.length ? { rpcUrls } : {}),
       hubAddress,
       chainId: chainIdStr || undefined,
     } : undefined;

@@ -143,12 +143,12 @@ describe('status route multi-RPC shape', () => {
     const res = await fetch(`${baseUrl}/api/chain/rpc-health`);
     const body: any = await res.json();
     expect(res.status).toBe(200);
-    expect(body.ok).toBe(false);
+    expect(body.ok).toBe(true);
     expect(body.configured).toBe(true);
     expect(body.rpcEndpointCount).toBe(2);
     expect(body).not.toHaveProperty('rpcUrl');
     expect(body).not.toHaveProperty('rpcUrls');
-    expect(body.blockNumber).toBeNull();
+    expect(body.blockNumber).toBe(456);
     expect(body.rpcs).toEqual([
       expect.objectContaining({
         index: 0,

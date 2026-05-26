@@ -903,13 +903,14 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
     const rpcUrls = resolveRpcUrls(rpcUrl, chain?.rpcUrls);
     const rpcs = await Promise.all(rpcUrls.map((url, index) => probeRpcEndpoint(url, index)));
     const primary = rpcs[0];
+    const healthy = rpcs.find((rpc) => rpc.ok);
     return jsonResponse(res, 200, {
-      ok: primary?.ok ?? false,
+      ok: !!healthy,
       configured: true,
       rpcEndpointCount: rpcUrls.length,
-      latencyMs: primary?.latencyMs ?? null,
-      blockNumber: primary?.blockNumber ?? null,
-      error: primary?.ok ? undefined : (primary?.error ?? "RPC health probe failed"),
+      latencyMs: healthy?.latencyMs ?? null,
+      blockNumber: healthy?.blockNumber ?? null,
+      error: healthy ? undefined : (primary?.error ?? "RPC health probe failed"),
       rpcs,
     });
   }

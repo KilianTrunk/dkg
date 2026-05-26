@@ -157,6 +157,7 @@ function isRetryableRpcError(err: unknown): boolean {
   const msg = errorMessage(err).toLowerCase();
 
   if (code === 'CALL_EXCEPTION' || code === 'INSUFFICIENT_FUNDS' || code === 'NONCE_EXPIRED'
+    || code === 'RPC_RECEIPT_LOOKUP_FAILED'
     || code === 'REPLACEMENT_UNDERPRICED' || code === 'TRANSACTION_REPLACED'
     || code === 'ACTION_REJECTED' || code === 'INVALID_ARGUMENT' || code === 'UNPREDICTABLE_GAS_LIMIT') {
     return false;
@@ -188,13 +189,16 @@ function assertSuccessfulReceipt(receipt: ethers.TransactionReceipt, label: stri
 }
 
 function isKnownTransactionError(err: unknown): boolean {
+  const code = errorCode(err);
   const msg = errorMessage(err).toLowerCase();
-  return msg.includes('already known')
+  return code === 'NONCE_EXPIRED'
+    || msg.includes('already known')
     || msg.includes('known transaction')
     || msg.includes('already imported')
     || msg.includes('transaction already in mempool')
     || msg.includes('already exists')
     || msg.includes('already have transaction')
+    || msg.includes('nonce too low')
     || msg.includes('duplicate transaction');
 }
 
@@ -574,16 +578,20 @@ export class EVMChainAdapter implements ChainAdapter {
       // EXCEPT the filter-spam class.
       console.error(`[chain] provider error (${providerContext}): ${formatProviderError(err)}`);
     };
-    try {
-      void Promise.resolve(this.primaryProvider.on('error', providerErrorHandler)).catch((err: unknown) => {
+    for (let i = 0; i < this.providers.length; i += 1) {
+      const provider = this.providers[i];
+      const listenerContext = `${providerContext}; rpc #${i + 1}`;
+      try {
+        void Promise.resolve(provider.on('error', providerErrorHandler)).catch((err: unknown) => {
+          console.error(
+            `[chain] provider error listener registration failed (${listenerContext}): ${formatProviderError(err)}`,
+          );
+        });
+      } catch (err) {
         console.error(
-          `[chain] provider error listener registration failed (${providerContext}): ${formatProviderError(err)}`,
+          `[chain] provider error listener registration failed (${listenerContext}): ${formatProviderError(err)}`,
         );
-      });
-    } catch (err) {
-      console.error(
-        `[chain] provider error listener registration failed (${providerContext}): ${formatProviderError(err)}`,
-      );
+      }
     }
     this.signer = new Wallet(config.privateKey, this.provider);
     this.signerPool = [this.signer];
@@ -667,6 +675,7 @@ export class EVMChainAdapter implements ChainAdapter {
 
   private async getTransactionReceiptWithFailover(txHash: string): Promise<ethers.TransactionReceipt | null> {
     let lastRetryable: unknown;
+    let sawNonErrorResponse = false;
     for (let i = 0; i < this.providers.length; i += 1) {
       const provider = this.providers[i];
       try {
@@ -675,14 +684,20 @@ export class EVMChainAdapter implements ChainAdapter {
           RPC_RECEIPT_ATTEMPT_TIMEOUT_MS,
           `receipt lookup via RPC #${i + 1}`,
         );
+        sawNonErrorResponse = true;
         if (receipt) return receipt;
       } catch (err) {
         if (!isRetryableRpcError(err)) throw err;
         lastRetryable = err;
       }
     }
-    if (lastRetryable && this.providers.length === 1) {
-      throw lastRetryable;
+    if (lastRetryable && !sawNonErrorResponse) {
+      const err = new Error(
+        `Receipt lookup for tx ${txHash} failed on all configured RPC endpoints: ${errorMessage(lastRetryable)}`,
+        { cause: lastRetryable },
+      );
+      (err as any).code = 'RPC_RECEIPT_LOOKUP_FAILED';
+      throw err;
     }
     return null;
   }
@@ -3005,7 +3020,11 @@ export class EVMChainAdapter implements ChainAdapter {
     return this.provider.getBlockNumber();
   }
 
-  getProvider(): JsonRpcProvider | FallbackProvider {
+  getProvider(): JsonRpcProvider {
+    return this.primaryProvider;
+  }
+
+  getReadProvider(): JsonRpcProvider | FallbackProvider {
     return this.provider;
   }
 

@@ -391,6 +391,15 @@ describe('resolveChainConfig (field-level merge)', () => {
     expect(merged?.rpcUrls).toEqual(['https://operator-backup.example/rpc']);
   });
 
+  it('preserves an explicit empty operator backup list instead of inheriting network backups', () => {
+    const merged = resolveChainConfig(
+      { chain: { rpcUrls: [] } },
+      { chain: fullNetworkChain },
+    );
+    expect(merged?.rpcUrl).toBe(fullNetworkChain.rpcUrl);
+    expect(merged?.rpcUrls).toEqual([]);
+  });
+
   it('strips rpcUrls under mock mode along with rpcUrl', () => {
     const merged = resolveChainConfig(
       {

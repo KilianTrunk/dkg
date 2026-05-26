@@ -493,6 +493,46 @@ describe('EVMChainAdapter — Hub rotation self-refresh (E2E)', () => {
   );
 
   it(
+    'event listener (generic): boot-bound rotation clears publish preflight cache before TTL',
+    async () => {
+      const adapter = makeAdapter(ctx.rpcUrl, ctx.hubAddress, 600_000);
+      (adapter as any).provider.pollingInterval = 250;
+
+      await (adapter as any).init();
+      await drainHistoricalRotationEvents(adapter);
+
+      const kav10Before = await adapter.getKnowledgeAssetsV10Address();
+      expect((adapter as any).cachedKav10Address?.value.toLowerCase()).toBe(
+        kav10Before.toLowerCase(),
+      );
+
+      const deployer = new Wallet(HARDHAT_KEYS.DEPLOYER, ctx.provider);
+      const replacementAddr = freshAddress();
+
+      try {
+        await rotateHubContract(ctx.hubAddress, deployer, 'KnowledgeAssetsV10', replacementAddr);
+
+        const observed = await waitFor(
+          () =>
+            (adapter as any).contracts.knowledgeAssetsV10 === undefined &&
+            (adapter as any).cachedKav10Address === undefined &&
+            (adapter as any).cachedMinRequiredSignatures === undefined &&
+            (adapter as any).initialized === false,
+          15_000,
+          100,
+        );
+        expect(observed).toBe(true);
+
+        const kav10After = await adapter.getKnowledgeAssetsV10Address();
+        expect(kav10After.toLowerCase()).toBe(replacementAddr.toLowerCase());
+      } finally {
+        await rotateHubContract(ctx.hubAddress, deployer, 'KnowledgeAssetsV10', kav10Before);
+      }
+    },
+    60_000,
+  );
+
+  it(
     'event listener (generic): rotating an unknown contract name is ignored — no fields touched',
     async () => {
       const adapter = makeAdapter(ctx.rpcUrl, ctx.hubAddress, 600_000);
@@ -533,6 +573,10 @@ describe('EVMChainAdapter — Hub rotation self-refresh (E2E)', () => {
       const identityBefore: Contract = (adapter as any).contracts.identity;
       expect(identityBefore).toBeDefined();
       const identityAddrBefore: string = await identityBefore.getAddress();
+      await adapter.getKnowledgeAssetsV10Address();
+      await adapter.getMinimumRequiredSignatures();
+      expect((adapter as any).cachedKav10Address).toBeDefined();
+      expect((adapter as any).cachedMinRequiredSignatures).toBeDefined();
 
       let calls = 0;
       let identityDuringRetry: Contract | undefined;
@@ -561,6 +605,8 @@ describe('EVMChainAdapter — Hub rotation self-refresh (E2E)', () => {
       const identityAddrAfter: string = await identityDuringRetry!.getAddress();
       expect(identityAddrAfter.toLowerCase()).toBe(identityAddrBefore.toLowerCase());
       expect((adapter as any).initialized).toBe(true);
+      expect((adapter as any).cachedKav10Address).toBeUndefined();
+      expect((adapter as any).cachedMinRequiredSignatures).toBeUndefined();
     },
     30_000,
   );

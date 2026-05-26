@@ -2955,6 +2955,7 @@ export class EVMChainAdapter implements ChainAdapter {
       const invalidator = BOUND_CONTRACT_INVALIDATORS.get(name);
       if (invalidator) {
         invalidator(this);
+        this.invalidatePublishPreflightCache();
         // Force the next public-method entry through `init()` so it
         // re-resolves every binding. Cheap — rotation events are rare
         // and `init()` is idempotent past the `if (this.initialized)
@@ -2991,6 +2992,7 @@ export class EVMChainAdapter implements ChainAdapter {
     for (const invalidator of BOUND_CONTRACT_INVALIDATORS.values()) {
       invalidator(this);
     }
+    this.invalidatePublishPreflightCache();
     this.invalidateRandomSamplingPair();
     this.initialized = false;
   }

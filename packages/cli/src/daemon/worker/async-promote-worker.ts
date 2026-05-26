@@ -112,6 +112,13 @@ export interface PromoteWorkerCounters {
   succeeded: number;
   failedTerminal: number;
   failedRetrying: number;
+  /**
+   * Codex #665: jobs whose promote ran successfully but whose post-promote
+   * bookkeeping (commit-marker write / queue.succeed) failed mid-flight.
+   * These remain in `running` state until next startup recovery; operators
+   * MUST inspect SWM/VM before any explicit `/recover`.
+   */
+  partialPromoteAmbiguity: number;
   /** Number of `runJob` invocations that started (regardless of outcome). */
   attempted: number;
   /** Set when shuttingDown was hit mid-job; ops can correlate with abandoned counts at next startup. */
@@ -198,7 +205,14 @@ export async function runPromoteJob(
     log: (msg: string) => void;
     emitMemoryGraphChanged?: (event: PromoteMemoryGraphChangedEvent) => void;
   },
-): Promise<{ outcome: 'succeeded' | 'failed_retrying' | 'failed_terminal'; error?: ClassifiedPromoteError }> {
+): Promise<{
+  outcome:
+    | 'succeeded'
+    | 'failed_retrying'
+    | 'failed_terminal'
+    | 'partial_promote_ambiguity';
+  error?: ClassifiedPromoteError;
+}> {
   const { job, queue, runPromote, now, heartbeatIntervalMs, log, emitMemoryGraphChanged } = args;
   if (!job.lease) {
     throw new Error(`runPromoteJob requires a job with an active lease (jobId=${job.jobId})`);
@@ -259,11 +273,48 @@ export async function runPromoteJob(
     // `assertionPromote` returns. We can't observe the internal phases
     // (WM clean / lifecycle stamp / gossip), so only stamp the recovery
     // gate the queue actually consumes.
-    await queue.recordCommitMarker(job.jobId, claimToken, 'swmInserted');
-    await queue.succeed(job.jobId, claimToken, {
-      promotedCount: result.promotedCount,
-      succeededAt: now(),
-    });
+    //
+    // Codex (#665#discussion_r3302646439): `assertion.promote()` has
+    // ALREADY mutated SWM / gossiped data at this point. If either of
+    // the next two writes throws (store hiccup, lost lease, transient
+    // FS error, …), we MUST NOT let the outer worker catch park this
+    // job as a normal `failed` row — that would expose it to
+    // `/promote-async/{jobId}/recover`, which blindly re-queues
+    // `failed` jobs. Re-running an already-completed promote risks
+    // duplicate WM/SWM writes and re-gossip. Instead, return the
+    // dedicated `partial_promote_ambiguity` outcome so the supervisor
+    // leaves the job in `running` state; on next daemon boot the lease
+    // will have expired and `recoverOnStartup()` will correctly route
+    // it into the "abandoned partial promote" bucket (promoteStarted
+    // = true, swmInserted = false → operator action required).
+    try {
+      await queue.recordCommitMarker(job.jobId, claimToken, 'swmInserted');
+      await queue.succeed(job.jobId, claimToken, {
+        promotedCount: result.promotedCount,
+        succeededAt: now(),
+      });
+    } catch (bookkeepingErr: unknown) {
+      const message =
+        bookkeepingErr instanceof Error
+          ? bookkeepingErr.message
+          : String(bookkeepingErr);
+      log(
+        `PARTIAL-PROMOTE-AMBIGUITY: jobId=${job.jobId} ` +
+          `assertion.promote() returned successfully (promotedCount=${result.promotedCount}) ` +
+          `but post-promote bookkeeping failed: ${message}. ` +
+          `Leaving job in 'running' state; recoverOnStartup() will pick this up ` +
+          `on next boot as abandoned partial promote. ` +
+          `Operator action: inspect SWM/VM for the assertion before any /recover.`,
+      );
+      return {
+        outcome: 'partial_promote_ambiguity',
+        error: {
+          retryable: false,
+          classification: 'fatal',
+          message: `partial-promote ambiguity (post-promote bookkeeping failed): ${message}`,
+        },
+      };
+    }
 
     if (result.promotedCount > 0 && emitMemoryGraphChanged) {
       try {
@@ -320,7 +371,14 @@ export function createPromoteWorkerSupervisor(config: PromoteWorkerConfig): Prom
   let counters: PromoteWorkerCounters = freshCounters();
 
   function freshCounters(): PromoteWorkerCounters {
-    return { succeeded: 0, failedTerminal: 0, failedRetrying: 0, attempted: 0, interruptedAtShutdown: 0 };
+    return {
+      succeeded: 0,
+      failedTerminal: 0,
+      failedRetrying: 0,
+      partialPromoteAmbiguity: 0,
+      attempted: 0,
+      interruptedAtShutdown: 0,
+    };
   }
 
   async function tickSlot(slot: WorkerSlot): Promise<boolean> {
@@ -365,6 +423,9 @@ export function createPromoteWorkerSupervisor(config: PromoteWorkerConfig): Prom
             break;
           case 'failed_terminal':
             counters.failedTerminal += 1;
+            break;
+          case 'partial_promote_ambiguity':
+            counters.partialPromoteAmbiguity += 1;
             break;
         }
       } catch (err: unknown) {

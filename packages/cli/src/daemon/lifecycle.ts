@@ -1274,6 +1274,18 @@ export async function runDaemonInner(
             process.exit(1);
             return;
           }
+        } else if (prereq.indeterminate) {
+          // Codex (#661#discussion_r3302752893): the DNS-rescue / warn-only
+          // path previously fell into the unconditional `OK` branch below
+          // and hid the indeterminate verdict the checker had just
+          // computed. Surface the reasons so operators see why the prereq
+          // sweep neither passed strictly nor failed; the lifecycle
+          // continues to boot since this is a soft rescue.
+          log(
+            `[CORE-PREREQ] INDETERMINATE: ${prereq.publicListenAddresses.length} ` +
+              `public-class listen address${prereq.publicListenAddresses.length === 1 ? '' : 'es'} bound. ` +
+              `reasons: ${prereq.reasons.join('; ')}.`,
+          );
         } else {
           log(
             `[CORE-PREREQ] OK: ${prereq.publicListenAddresses.length} ` +

@@ -89,6 +89,8 @@ describe('classifyMultiaddr — per-class smoke tests', () => {
     ['/ip6/ff02::1/tcp/4001',         'multicast'],
     ['/ip6/2606:4700:4700::1111/tcp/4001', 'public'],
     ['/ip6/2001:db8::1/tcp/4001',     'unknown'],  // RFC 3849 documentation range
+    ['/ip6/2001:0db8::1/tcp/4001',    'unknown'],  // Codex #661 regression — zero-padded
+    ['/ip6/2001:0db8:0000:0000::1/tcp/4001', 'unknown'],  // Codex #661 regression — fully expanded
     ['/dns4/example.com/tcp/4001',    'dns'],
     ['/dns6/example.com/tcp/4001',    'dns'],
     ['/dns/example.com/tcp/4001',     'dns'],
@@ -245,6 +247,27 @@ describe('checkCoreRelayPrereqs — 7 canonical cases from the plan', () => {
     expect(result.indeterminate).toBe(true);
     expect(result.nonRoutableAddresses[0].class).toBe('rfc1918');
     expect(result.reasons.some((r) => r.includes('DNS hostname'))).toBe(true);
+  });
+
+  it('Codex #661 — reserved DNS announce WITH trailing root dot is not a rescue', () => {
+    // Codex (#661#discussion_r3302752890): `isReservedDnsName()` previously
+    // missed FQDNs with a trailing root dot, so `localhost.`, `relay.test.`,
+    // `svc.cluster.local.` could rescue a degraded RFC1918 listener even
+    // though they are reserved by RFC 6761 and not externally dialable.
+    for (const announce of [
+      '/dnsaddr/localhost.',
+      '/dns4/relay.test.',
+      '/dns/svc.cluster.local.',
+    ]) {
+      const result = checkCoreRelayPrereqs({
+        listenAddresses: ['/ip4/192.168.1.1/tcp/4001'],
+        hostInterfaces: [RFC1918_IFACE],
+        announceAddresses: [announce],
+        nodeRole: 'core',
+      });
+      // No rescue: looksDegraded stays true, no `indeterminate` warn-only escape.
+      expect(result.looksDegraded).toBe(true);
+    }
   });
 
   it('literal public announce can rescue an unresolved wildcard pre-start listener', () => {

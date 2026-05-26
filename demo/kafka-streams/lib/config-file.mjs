@@ -17,7 +17,7 @@ export function parseConfigYaml(text) {
   let listKey;
 
   for (const [idx, rawLine] of text.split('\n').entries()) {
-    const line = rawLine.replace(/(^|\s+)#.*$/, '');
+    const line = stripYamlComment(rawLine);
     const trimmed = line.trim();
     if (!trimmed) continue;
     const indent = line.match(/^ */)[0].length;
@@ -46,6 +46,21 @@ export function parseConfigYaml(text) {
   }
 
   return root;
+}
+
+function stripYamlComment(line) {
+  let quote;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (quote) {
+      if (c === quote) quote = undefined;
+    } else if (c === '"' || c === "'") {
+      quote = c;
+    } else if (c === '#' && (i === 0 || /\s/.test(line[i - 1]))) {
+      return line.slice(0, i);
+    }
+  }
+  return line;
 }
 
 export async function readDkgConfig(dkgHome, { tolerateMalformed = false } = {}) {

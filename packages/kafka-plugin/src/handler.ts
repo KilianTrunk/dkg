@@ -142,7 +142,15 @@ async function handlePostRegister(
   let ka: Record<string, unknown> = baseKa as unknown as Record<string, unknown>;
   if (opts.extension) {
     const extensionFields = pickExtensionFields(parsedData);
-    const fragment = opts.extension.augment(extensionFields);
+    let fragment;
+    try {
+      fragment = opts.extension.augment(extensionFields);
+    } catch (err) {
+      return jsonResponse(ctx.res, 400, {
+        error: 'InvalidContent',
+        message: err instanceof Error ? err.message : String(err),
+      });
+    }
     ka = mergeAugmentFragment(baseKa, fragment, loggedCollisionKeys) as unknown as Record<
       string,
       unknown

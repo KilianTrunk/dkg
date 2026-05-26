@@ -7,7 +7,6 @@ import {
   type KafkaPluginExtension,
 } from '../src/extension.js';
 import { coreSchema, CORE_FIELDS } from '../src/schema.js';
-
 describe('validateExtensionAgainstCore — boot-time collision', () => {
   it.each(CORE_FIELDS.map((k) => [k]))(
     'throws ExtensionSchemaCollisionError when extension redeclares core key %s',
@@ -28,7 +27,6 @@ describe('validateExtensionAgainstCore — boot-time collision', () => {
       }
     },
   );
-
   it('lists every overlapping key in the error message and collidingKeys', () => {
     const ext: KafkaPluginExtension<Record<string, unknown>> = {
       schema: z.object({ name: z.string(), kafkaTopicName: z.string(), extra: z.string() }),
@@ -46,7 +44,6 @@ describe('validateExtensionAgainstCore — boot-time collision', () => {
       expect(e.message).toContain('kafkaTopicName');
     }
   });
-
   it('passes silently for a clean extension whose keys do not overlap core', () => {
     const ext: KafkaPluginExtension<{ externalRef: string; sourceRef: string }> = {
       schema: z.object({ externalRef: z.string(), sourceRef: z.string() }),
@@ -54,7 +51,6 @@ describe('validateExtensionAgainstCore — boot-time collision', () => {
     };
     expect(() => validateExtensionAgainstCore(ext, coreSchema)).not.toThrow();
   });
-
   it('rejects nested/object-valued extension fields because discovery cannot round-trip them', () => {
     const ext: KafkaPluginExtension<Record<string, unknown>> = {
       schema: z.object({ nested: z.object({ value: z.string() }) }),
@@ -64,7 +60,6 @@ describe('validateExtensionAgainstCore — boot-time collision', () => {
       ExtensionSchemaUnsupportedFieldError,
     );
   });
-
   it('rejects catchall extension schemas that would allow arbitrary request keys', () => {
     const ext: KafkaPluginExtension<Record<string, unknown>> = {
       schema: z.object({}).catchall(z.string()),
@@ -74,7 +69,6 @@ describe('validateExtensionAgainstCore — boot-time collision', () => {
       ExtensionSchemaUnsupportedFieldError,
     );
   });
-
   it('allows optional scalar extension fields', () => {
     const ext: KafkaPluginExtension<Record<string, unknown>> = {
       schema: z.object({ externalRef: z.string().optional() }),
@@ -82,7 +76,6 @@ describe('validateExtensionAgainstCore — boot-time collision', () => {
     };
     expect(() => validateExtensionAgainstCore(ext, coreSchema)).not.toThrow();
   });
-
   it('rejects nullable scalar extension fields because KA merge cannot round-trip null', () => {
     const ext: KafkaPluginExtension<Record<string, unknown>> = {
       schema: z.object({
@@ -91,12 +84,10 @@ describe('validateExtensionAgainstCore — boot-time collision', () => {
       }),
       augment: () => ({}),
     };
-
     expect(() => validateExtensionAgainstCore(ext, coreSchema)).toThrow(
       ExtensionSchemaUnsupportedFieldError,
     );
   });
-
   it('rejects literal null extension fields because KA merge cannot round-trip null', () => {
     const ext: KafkaPluginExtension<Record<string, unknown>> = {
       schema: z.object({ externalRef: z.literal(null) }),
@@ -106,7 +97,6 @@ describe('validateExtensionAgainstCore — boot-time collision', () => {
       ExtensionSchemaUnsupportedFieldError,
     );
   });
-
   it('rejects transformed fields because scalar input may parse to non-scalar output', () => {
     const ext: KafkaPluginExtension<Record<string, unknown>> = {
       schema: z.object({ externalRef: z.string().transform(() => ({ nested: true })) }),
@@ -117,10 +107,8 @@ describe('validateExtensionAgainstCore — boot-time collision', () => {
     );
   });
 });
-
 import { z as z2 } from 'zod';
 import { createKafkaPlugin } from '../src/index.js';
-
 describe('createKafkaPlugin — extension wiring', () => {
   it('throws ExtensionSchemaCollisionError at factory call time when extension collides with core', () => {
     expect(() =>
@@ -133,7 +121,6 @@ describe('createKafkaPlugin — extension wiring', () => {
       }),
     ).toThrow(ExtensionSchemaCollisionError);
   });
-
   it('returns a plugin when extension is clean', () => {
     const plugin = createKafkaPlugin({
       contextGraphId: 'urn:cg:demo',
@@ -146,16 +133,13 @@ describe('createKafkaPlugin — extension wiring', () => {
     expect(typeof plugin.handle).toBe('function');
   });
 });
-
 // Bug 1: ADR 0004 lets extensions ADD secondary `@type` entries and ADD new
 // `@context` prefixes. The blanket "core wins, drop everything" rule was
 // wrong for these two keys specifically.
 import { buildKa, mergeAugmentFragment } from '../src/ka-builder.js';
 import { coreSchema as baseSchema } from '../src/schema.js';
-
 describe('mergeAugmentFragment — Bug 1: @type multi-type union', () => {
   const baseInputs = { name: 'n', kafkaBootstrapUrl: 'u', kafkaTopicName: 't' };
-
   it('unions a scalar extension @type with the baseline as a deduped array', () => {
     const base = buildKa(baseSchema.parse(baseInputs));
     const merged = mergeAugmentFragment(
@@ -168,7 +152,6 @@ describe('mergeAugmentFragment — Bug 1: @type multi-type union', () => {
       'source:StreamingSource',
     ]);
   });
-
   it('unions an array extension @type with the baseline, baseline first, dedupe', () => {
     const base = buildKa(baseSchema.parse(baseInputs));
     const merged = mergeAugmentFragment(
@@ -182,7 +165,6 @@ describe('mergeAugmentFragment — Bug 1: @type multi-type union', () => {
       'vendor:TelemetryFeed',
     ]);
   });
-
   it('deduplicates when extension repeats the baseline @type', () => {
     const base = buildKa(baseSchema.parse(baseInputs));
     const merged = mergeAugmentFragment(
@@ -195,7 +177,6 @@ describe('mergeAugmentFragment — Bug 1: @type multi-type union', () => {
       'source:StreamingSource',
     ]);
   });
-
   it('does not log a collision warning for @type — multi-type is the contract', () => {
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const base = buildKa(baseSchema.parse(baseInputs));
@@ -210,10 +191,8 @@ describe('mergeAugmentFragment — Bug 1: @type multi-type union', () => {
     warnSpy.mockRestore();
   });
 });
-
 describe('mergeAugmentFragment — Bug 1: @context object-merge', () => {
   const baseInputs = { name: 'n', kafkaBootstrapUrl: 'u', kafkaTopicName: 't' };
-
   it('merges new extension @context prefixes onto the baseline context', () => {
     const base = buildKa(baseSchema.parse(baseInputs));
     const merged = mergeAugmentFragment(
@@ -227,7 +206,6 @@ describe('mergeAugmentFragment — Bug 1: @context object-merge', () => {
       vendor: 'https://vendor.example.com/ontology#',
     });
   });
-
   it('keeps core prefix mapping when extension tries to redefine dkg-streams (core wins + warn once)', () => {
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const base = buildKa(baseSchema.parse(baseInputs));
@@ -252,7 +230,6 @@ describe('mergeAugmentFragment — Bug 1: @context object-merge', () => {
     expect(messages.some((m) => m.includes('@context') && m.includes('dkg-streams'))).toBe(true);
     warnSpy.mockRestore();
   });
-
   it('drops the extension @context entirely if it is not an object (defensive)', () => {
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const base = buildKa(baseSchema.parse(baseInputs));

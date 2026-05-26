@@ -1,8 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-
 import { ensureSubscribed } from '../lib/subscribe.mjs';
-
 test('ensureSubscribed posts subscribe body, auth headers, and returns parsed success', async () => {
   const calls = [];
   const res = await ensureSubscribed(
@@ -20,7 +18,6 @@ test('ensureSubscribed posts subscribe body, auth headers, and returns parsed su
   assert.equal(calls[0].init.headers['Content-Type'], 'application/json');
   assert.equal(res.catchup.status, 'queued');
 });
-
 test('ensureSubscribed throws descriptively on non-2xx', async () => {
   await assert.rejects(
     ensureSubscribed(async () => ({ status: 403, parsed: { error: 'not allowed' } }), 'http://node2', 'cg-z'),

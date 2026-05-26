@@ -701,6 +701,20 @@ describe('handler — POST /register with extension', () => {
     expect(arg).not.toHaveProperty('name');
     expect(arg).not.toHaveProperty('kafkaBootstrapUrl');
   });
+  it('maps extension augment failures to 400 InvalidContent', async () => {
+    const ext = {
+      schema: z.object({ externalRef: z.string(), sourceRef: z.string() }),
+      augment: () => { throw new Error('extension says no'); },
+    };
+    const body = { ...validBody, externalRef: 'ref-alpha', sourceRef: 'source-1' };
+    const { req, res, captured } = mockReqRes('POST', '/api/kafka/streams/register', body);
+    const { ctx, publishAsync } = mockCtx();
+    const handler = createHandler({ basePath: '/api/kafka/streams', contextGraphId: 'urn:cg:demo', extension: ext });
+    await handler({ ...ctx, req, res, path: '/api/kafka/streams/register' });
+    expect(captured.statusCode).toBe(400);
+    expect(captured.body).toMatchObject({ error: 'InvalidContent', message: 'extension says no' });
+    expect(publishAsync).not.toHaveBeenCalled();
+  });
 });
 describe('handler — extension runtime collision (one warn per unique key across requests)', () => {
   it('drops collision keys and warns exactly once per unique key across N requests', async () => {

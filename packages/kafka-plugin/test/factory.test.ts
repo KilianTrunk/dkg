@@ -3,7 +3,6 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { Readable } from 'node:stream';
 import { z } from 'zod';
 import { createKafkaPlugin } from '../src/index.js';
-
 if (false) {
   createKafkaPlugin({
     extension: {
@@ -13,7 +12,6 @@ if (false) {
     },
   });
 }
-
 function mockReqRes(method: string, urlPath: string, body?: unknown) {
   const payload = body === undefined ? Buffer.alloc(0) : Buffer.from(JSON.stringify(body));
   const reqStream = Readable.from([payload]) as unknown as IncomingMessage;
@@ -33,7 +31,6 @@ function mockReqRes(method: string, urlPath: string, body?: unknown) {
   } as unknown as ServerResponse;
   return { req: reqStream, res, captured };
 }
-
 describe('createKafkaPlugin factory wiring', () => {
   it('default base path dispatches POST /register through to the handler', async () => {
     const plugin = createKafkaPlugin({ contextGraphId: 'urn:cg:demo' });
@@ -53,7 +50,6 @@ describe('createKafkaPlugin factory wiring', () => {
     expect(publishAsync).toHaveBeenCalledTimes(1);
     expect(publishAsync.mock.calls[0][0]).toBe('urn:cg:demo');
   });
-
   it('forwards publishOptions through the factory to publishAsync', async () => {
     const plugin = createKafkaPlugin({
       contextGraphId: 'urn:cg:demo',
@@ -73,7 +69,6 @@ describe('createKafkaPlugin factory wiring', () => {
     } as never);
     expect(publishAsync.mock.calls[0][2]).toEqual({ accessPolicy: 'public' });
   });
-
   it('respects custom basePath override', async () => {
     const plugin = createKafkaPlugin({ basePath: '/custom/kafka', contextGraphId: 'urn:cg:demo' });
     const { req, res, captured } = mockReqRes('POST', '/custom/kafka/register', {

@@ -1,7 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { coreSchema } from '../src/schema.js';
 import { buildKa } from '../src/ka-builder.js';
-
 describe('buildKa — bare core fields', () => {
   it('produces a KafkaStream JSON-LD KA with @context + @type + protocol', () => {
     const parsed = coreSchema.parse({
@@ -23,7 +22,6 @@ describe('buildKa — bare core fields', () => {
       'dkg-streams:dataFormat': 'JSON',
     });
   });
-
   it('maps description to schema:description when present', () => {
     const parsed = coreSchema.parse({
       name: 'n',
@@ -34,7 +32,6 @@ describe('buildKa — bare core fields', () => {
     const ka = buildKa(parsed);
     expect(ka['schema:description']).toBe('d');
   });
-
   it('maps every optional dkg-streams field present in the parsed body', () => {
     const parsed = coreSchema.parse({
       name: 'n',
@@ -49,7 +46,6 @@ describe('buildKa — bare core fields', () => {
     expect(ka['dkg-streams:kafkaSaslMechanism']).toBe('PLAIN');
     expect(ka['dkg-streams:dataFormat']).toBe('AVRO');
   });
-
   it('omits keys for absent optional fields', () => {
     const parsed = coreSchema.parse({
       name: 'n',
@@ -62,10 +58,8 @@ describe('buildKa — bare core fields', () => {
     expect('dkg-streams:kafkaSaslMechanism' in ka).toBe(false);
   });
 });
-
 import { vi } from 'vitest';
 import { mergeAugmentFragment } from '../src/ka-builder.js';
-
 describe('mergeAugmentFragment — core wins + log-once', () => {
   it('adds extension keys that do not collide with the base KA', () => {
     const base = buildKa(
@@ -80,7 +74,6 @@ describe('mergeAugmentFragment — core wins + log-once', () => {
     expect(merged['x:sourceRef']).toBe('source-1');
     expect(merged['@type']).toBe('dkg-streams:KafkaStream');
   });
-
   it('drops non-scalar extension values that discovery cannot round-trip', () => {
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const base = buildKa(
@@ -99,7 +92,6 @@ describe('mergeAugmentFragment — core wins + log-once', () => {
     );
     warnSpy.mockRestore();
   });
-
   it('drops extension keys that collide with core (core wins)', () => {
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const base = buildKa(
@@ -115,7 +107,6 @@ describe('mergeAugmentFragment — core wins + log-once', () => {
     expect(merged['x:ok']).toBe('ok');
     warnSpy.mockRestore();
   });
-
   it('emits exactly one console.warn per unique colliding key across N calls', () => {
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const logged = new Set<string>();
@@ -138,7 +129,6 @@ describe('mergeAugmentFragment — core wins + log-once', () => {
     expect(logged.has('dkg-streams:kafkaTopicName')).toBe(true);
     warnSpy.mockRestore();
   });
-
   it('does not mutate the base KA in place', () => {
     const base = buildKa(
       coreSchema.parse({ name: 'n', kafkaBootstrapUrl: 'u', kafkaTopicName: 't' }),

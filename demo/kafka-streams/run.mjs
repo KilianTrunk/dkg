@@ -53,7 +53,7 @@ export async function validateKafkaContextGraphConfig(nodes, expectedCgId) {
     }
 
     const actual = cfg?.kafka?.contextGraphId;
-    if (actual !== expectedCgId) {
+    if (actual !== undefined && actual !== expectedCgId) {
       mismatches.push(
         `${node.label} kafka.contextGraphId=${actual === undefined ? '(missing)' : JSON.stringify(actual)} ` +
           `does not match demo context graph ${JSON.stringify(expectedCgId)}`,
@@ -67,6 +67,12 @@ export async function validateKafkaContextGraphConfig(nodes, expectedCgId) {
         mismatches.map((line) => `- ${line}`).join('\n'),
     );
   }
+}
+
+export async function resolveDemoDaemons(node1Home, node2Home) {
+  const node1 = await resolveDaemonAuth(node1Home, { useEnvPort: true });
+  const node2 = await resolveDaemonAuth(node2Home, { useEnvPort: false });
+  return { node1, node2 };
 }
 
 function log(line) {
@@ -294,8 +300,7 @@ async function main() {
   }
 
   log('\n[1/6] Resolving daemon auth on both nodes…');
-  const node1 = await resolveDaemonAuth(NODE1_HOME);
-  const node2 = await resolveDaemonAuth(NODE2_HOME, { useEnvPort: false });
+  const { node1, node2 } = await resolveDemoDaemons(NODE1_HOME, NODE2_HOME);
   log(`     node1 → ${node1.baseUrl}`);
   log(`     node2 → ${node2.baseUrl}`);
   log('     validating kafka.contextGraphId in both node configs…');

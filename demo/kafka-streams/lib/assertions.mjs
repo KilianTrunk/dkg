@@ -7,7 +7,8 @@ export function assertKaMatches(ka, { ual, body }) {
   if (ka['@id'] !== ual) {
     throw new Error(`KA @id mismatch: expected ${ual}, got ${ka['@id']}`);
   }
-  if (ka['@type'] !== CORE_TYPE) {
+  const types = Array.isArray(ka['@type']) ? ka['@type'] : [ka['@type']];
+  if (!types.includes(CORE_TYPE)) {
     throw new Error(`KA @type mismatch: expected ${CORE_TYPE}, got ${ka['@type']}`);
   }
   if (ka['schema:name'] !== body.name) {

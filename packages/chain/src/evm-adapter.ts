@@ -109,6 +109,11 @@ const ERROR_ABI_CONTRACTS = [
   'Staking', 'StakingStorage', 'StakingV10', 'StakingKPI',
   'ConvictionStakingStorage',
   'DKGStakingConvictionNFT', 'DKGPublishingConvictionNFT',
+  // Post PR #650 split — PCA business errors are declared on the logic
+  // and storage contracts, NOT the slim wrapper. Both must be in this
+  // list so wrapper-bubbled reverts (e.g. NoConvictionAccount, AccountExpired,
+  // UnknownAccount, InvalidAmount, AgentAlreadyRegistered) decode at runtime.
+  'PublishingConviction', 'PublishingConvictionStorage',
   'Hub', 'Token', 'Ask', 'AskStorage',
   'Paymaster', 'ShardingTable', 'ParametersStorage',
   'PublishingConvictionAccount',
@@ -119,6 +124,26 @@ const ADMIN_KEY_PURPOSE = 1;
 const OPERATIONAL_KEY_PURPOSE = 2;
 
 let _errorInterface: Interface | null = null;
+let _pcaLogicInterface: Interface | null = null;
+
+/**
+ * Lazy-cached `ethers.Interface` over the `PublishingConviction` (logic)
+ * contract ABI.
+ *
+ * Post PR #650, all PCA state-change events (`AccountCreated`, `ToppedUp`,
+ * `CostCovered`, `WindowSettled`, `AccountFinalSwept`,
+ * `AgentRegistered`, `AgentDeregistered`) are emitted by the logic contract
+ * — NOT by the `DKGPublishingConvictionNFT` wrapper. Receipt-log parsing
+ * for those events MUST go through this interface; parsing through the
+ * wrapper's interface returns `null` because the wrapper ABI no longer
+ * declares those events. See `DKGPublishingConvictionNFT.sol` NatSpec
+ * "Deliberate breaks in the v2.x → v3.0.0 wrapper bump".
+ */
+function getPcaLogicInterface(): Interface {
+  if (_pcaLogicInterface) return _pcaLogicInterface;
+  _pcaLogicInterface = new Interface(loadAbi('PublishingConviction') as any[]);
+  return _pcaLogicInterface;
+}
 
 function getErrorInterface(): Interface {
   if (_errorInterface) return _errorInterface;
@@ -2230,15 +2255,21 @@ export class EVMChainAdapter implements ChainAdapter {
       const tx = await nft.createAccount(committedTRAC);
       const receipt = await tx.wait();
 
+      // Post PR #650 split, `AccountCreated` is emitted by
+      // `PublishingConviction` (logic), NOT by the wrapper. Parse via
+      // the logic ABI so this keeps working once `chain/abi/DKGPublishingConvictionNFT.json`
+      // is refreshed to its post-split slim surface (which no longer
+      // declares any PCA events).
+      const pcaLogic = getPcaLogicInterface();
       let accountId = 0n;
       for (const log of receipt.logs) {
         try {
-          const parsed = nft.interface.parseLog({ topics: [...log.topics], data: log.data });
+          const parsed = pcaLogic.parseLog({ topics: [...log.topics], data: log.data });
           if (parsed?.name === 'AccountCreated') {
             accountId = BigInt(parsed.args.accountId);
             break;
           }
-        } catch { /* not this contract's event */ }
+        } catch { /* not a PublishingConviction event */ }
       }
       if (accountId === 0n) {
         throw new Error('createPublishingConvictionAccount succeeded but no AccountCreated event found');

@@ -37,7 +37,7 @@ import {
   createTestContextGraph,
   HARDHAT_KEYS,
 } from '../../chain/test/evm-test-context.js';
-import { mintTokens, stakeAndSetAsk } from '../../chain/test/hardhat-harness.js';
+import { mintTokens } from '../../chain/test/hardhat-harness.js';
 import type { Quad } from '@origintrail-official/dkg-storage';
 
 // ---- shared fixture ---------------------------------------------------------
@@ -78,13 +78,8 @@ beforeAll(async () => {
     await mintTokens(provider, ctx.hubAddress, HARDHAT_KEYS.DEPLOYER, addr, ethers.parseEther('100000000'));
   }
 
-  // Stake the receiver nodes so they're in the sharding table — required
-  // for mode (e) attribution validation (`shardingTable.nodeExists`) and
-  // for ACK quorum on multi-node publishes. Mirrors `v10-publish-e2e.test.ts`.
-  for (let i = 0; i < ctx.receiverIds.length; i++) {
-    const recOpKey = [HARDHAT_KEYS.REC1_OP, HARDHAT_KEYS.REC2_OP, HARDHAT_KEYS.REC3_OP][i]!;
-    await stakeAndSetAsk(provider, ctx.hubAddress, HARDHAT_KEYS.DEPLOYER, recOpKey, ctx.receiverIds[i]!);
-  }
+  // REC1..REC3 are staked by the shared Hardhat harness. Re-staking here
+  // double-spends the setup path and reverts before the skipped shard tests run.
 
   const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
   const cgId = await createTestContextGraph(chain);

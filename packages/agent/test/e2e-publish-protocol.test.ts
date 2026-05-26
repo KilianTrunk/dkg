@@ -13,7 +13,7 @@
 import { describe, it, expect, afterAll, beforeAll } from 'vitest';
 import { DKGAgent } from '../src/index.js';
 import { createEVMAdapter, getSharedContext, createProvider, takeSnapshot, revertSnapshot, HARDHAT_KEYS } from '../../chain/test/evm-test-context.js';
-import { mintTokens, stakeAndSetAsk, setMinimumRequiredSignatures } from '../../chain/test/hardhat-harness.js';
+import { mintTokens, setMinimumRequiredSignatures } from '../../chain/test/hardhat-harness.js';
 import { ethers } from 'ethers';
 
 const CONTEXT_GRAPH = 'publish-protocol-e2e';
@@ -43,13 +43,12 @@ async function pollUntil(
 let _fileSnapshot: string;
 beforeAll(async () => {
   _fileSnapshot = await takeSnapshot();
-  const { hubAddress, receiverIds } = getSharedContext();
+  const { hubAddress } = getSharedContext();
   const provider = createProvider();
   const coreOp = new ethers.Wallet(HARDHAT_KEYS.CORE_OP);
   await mintTokens(provider, hubAddress, HARDHAT_KEYS.DEPLOYER, coreOp.address, ethers.parseEther('50000000'));
-  await stakeAndSetAsk(provider, hubAddress, HARDHAT_KEYS.DEPLOYER, HARDHAT_KEYS.REC1_OP, receiverIds[0]);
-  await stakeAndSetAsk(provider, hubAddress, HARDHAT_KEYS.DEPLOYER, HARDHAT_KEYS.REC2_OP, receiverIds[1]);
-  await stakeAndSetAsk(provider, hubAddress, HARDHAT_KEYS.DEPLOYER, HARDHAT_KEYS.REC3_OP, receiverIds[2]);
+  // REC1..REC3 are staked by the shared Hardhat harness. Re-staking here
+  // double-spends the setup path and reverts before the skipped shard tests run.
 });
 afterAll(async () => {
   await revertSnapshot(_fileSnapshot);

@@ -752,6 +752,8 @@ export async function runDaemonInner(
   // torn down in `shutdown` before `agent.stop()` so the queue store is
   // still open when we wait for in-flight promotes to drain.
   let promoteWorkerSupervisor: PromoteWorkerSupervisor | null = null;
+  let promoteWorkerStartup: Promise<void> | null = null;
+  let shuttingDown = false;
 
   const networkId = await computeNetworkId();
   const publisherControl = createPublisherControlFromStore(
@@ -891,13 +893,28 @@ export async function runDaemonInner(
           log: (msg) => log(`[promote-worker] ${msg}`),
           emitMemoryGraphChanged,
         });
-        try {
-          await supervisor.start();
-          promoteWorkerSupervisor = supervisor;
-          log("Async promote worker supervisor started");
-        } catch (err: any) {
-          log(`Async promote worker startup failed: ${err?.message ?? String(err)}`);
-        }
+        promoteWorkerSupervisor = supervisor;
+        const startup = (async () => {
+          try {
+            await supervisor.start();
+            if (!shuttingDown && promoteWorkerSupervisor === supervisor) {
+              log("Async promote worker supervisor started");
+            }
+          } catch (err: any) {
+            if (!shuttingDown) {
+              log(`Async promote worker startup failed: ${err?.message ?? String(err)}`);
+            }
+            if (promoteWorkerSupervisor === supervisor) {
+              promoteWorkerSupervisor = null;
+            }
+          } finally {
+            if (promoteWorkerStartup === startup) {
+              promoteWorkerStartup = null;
+            }
+          }
+        })();
+        promoteWorkerStartup = startup;
+        await startup;
       })();
     }, 0);
     if (promoteWorkerTimer.unref) promoteWorkerTimer.unref();
@@ -2116,7 +2133,6 @@ export async function runDaemonInner(
   startPostApiPublishing();
 
   // Graceful shutdown
-  let shuttingDown = false;
   async function shutdown(exitCode = 0) {
     if (shuttingDown) return;
     shuttingDown = true;
@@ -2141,6 +2157,10 @@ export async function runDaemonInner(
       ?.stop()
       .catch((err: any) =>
         log(`Promote worker stop error: ${err?.message ?? String(err)}`),
+      );
+    await promoteWorkerStartup
+      ?.catch((err: any) =>
+        log(`Promote worker startup wait error: ${err?.message ?? String(err)}`),
       );
     await daemonState.catchupRunner
       ?.close()

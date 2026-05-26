@@ -352,7 +352,27 @@ export function createPromoteWorkerSupervisor(config: PromoteWorkerConfig): Prom
             break;
         }
       } catch (err: unknown) {
-        log(`Worker ${slot.workerId} crashed processing ${claimed.jobId}: ${err instanceof Error ? err.message : String(err)}`);
+        const message = err instanceof Error ? err.message : String(err);
+        log(`Worker ${slot.workerId} crashed processing ${claimed.jobId}: ${message}`);
+        if (claimed.lease) {
+          try {
+            await config.agent.promoteQueue.fail(claimed.jobId, claimed.lease.claimToken, {
+              message: `Worker crashed after claiming job: ${message}`,
+              retryable: false,
+              classification: 'fatal',
+              recordedAt: now(),
+            });
+          } catch (failErr: unknown) {
+            if (failErr instanceof PromoteJobLeaseError) {
+              log(`Lease lost while parking crashed job ${claimed.jobId}: ${failErr.message}`);
+            } else {
+              log(
+                `Failed to park crashed job ${claimed.jobId}; next startup recovery must reconcile it: ` +
+                  `${failErr instanceof Error ? failErr.message : String(failErr)}`,
+              );
+            }
+          }
+        }
       } finally {
         slot.inFlight = null;
       }
@@ -411,6 +431,10 @@ export function createPromoteWorkerSupervisor(config: PromoteWorkerConfig): Prom
         started = false;
         shuttingDown = true;
         throw new Error(`recoverOnStartup failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      if (shuttingDown) {
+        started = false;
+        return;
       }
       for (const slot of slots) {
         slot.timer = setInterval(() => {

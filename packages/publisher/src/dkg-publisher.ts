@@ -2096,7 +2096,30 @@ export class DKGPublisher implements Publisher {
       // tentative-metadata generation here scopes the metadata write
       // exclusively to those intentional-skip branches and keeps the
       // chain-failure path inert.
-      const tentativeMeta = generateTentativeMetadata(
+      // RC11 / PR2 (review fix): preserve the exact provenance + meta-graph
+      // routing the pre-PR2 catch block did. Two strictly-additive
+      // requirements relative to the minimal call above:
+      //
+      //   1. `authorAddress` / `publishOperationId` — emits the
+      //      `dkg:Publication` + `dkg:authoredBy` quads that RFC-001 §3.5
+      //      requires for tentative publishes so downstream consumers
+      //      (`access-handler`, `assertion-history`, the verified-memory
+      //      view) can still attribute the publish locally before any
+      //      chain confirmation. The on-chain `KnowledgeBatch.authorAddress`
+      //      is canonical only once the publish confirms; until then this
+      //      is a self-claim. `publisherSigner` may be undefined
+      //      (no-chain / no-key path) — skip the fields in that case so
+      //      the publication subject is not emitted with a missing author.
+      //
+      //   2. `targetMetaGraphUri` remap — every generated meta quad sits
+      //      in the default `did:dkg:context-graph:<id>/_meta` graph. If
+      //      the caller supplied a `targetMetaGraphUri` (e.g. for SWM /
+      //      private-channel meta isolation) the pre-PR2 path remapped
+      //      them; without this, intentional-local publishes targeting a
+      //      non-default meta graph would silently drop their `_meta`
+      //      triples into the wrong graph and become invisible to the
+      //      caller's own meta-graph queries.
+      let tentativeMeta = generateTentativeMetadata(
         {
           ual,
           contextGraphId,
@@ -2107,9 +2130,23 @@ export class DKGPublisher implements Publisher {
           allowedPeers: normalizedAllowedPeers,
           timestamp: new Date(),
           subGraphName: options.subGraphName,
+          ...((options.precomputedAttestation?.authorAddress
+            ?? publisherSigner?.address) != null
+            ? {
+                authorAddress: (options.precomputedAttestation?.authorAddress
+                  ?? publisherSigner!.address),
+                publishOperationId,
+              }
+            : {}),
         },
         kaMetadata,
       );
+      if (options.targetMetaGraphUri) {
+        const defaultMeta = `did:dkg:context-graph:${contextGraphId}/_meta`;
+        tentativeMeta = tentativeMeta.map((q) =>
+          q.graph === defaultMeta ? { ...q, graph: options.targetMetaGraphUri! } : q,
+        );
+      }
       this.log.info(ctx, `Storing ${normalizedQuads.length} triples in local store (${reasonLog})`);
       await this.store.insert(normalizedQuads);
       await this.store.insert(tentativeMeta);

@@ -542,6 +542,40 @@ describe('DashboardDB — V15 migration: drop FTS5 logs index', () => {
       upgraded.close();
     }
   });
+
+  it('prune vacuums a large freelist even when retained logs are not deleted', () => {
+    const mkdtempSync = require('node:fs').mkdtempSync;
+    const { tmpdir } = require('node:os');
+    const { join } = require('node:path');
+
+    const vacuumDir = mkdtempSync(join(tmpdir(), 'dkg-dashboard-db-vacuum-'));
+    const vacuumDb = new DashboardDB({ dataDir: vacuumDir, retentionDays: 365 });
+
+    try {
+      // Simulate the failure mode where a migration dropped a large object
+      // (V15 drops logs_fts + its shadow tables) but retained logs are still
+      // younger than the cutoff, so logsDeleted alone would not trigger VACUUM.
+      vacuumDb.db.exec(`CREATE TABLE vacuum_fixture (payload BLOB NOT NULL);`);
+      const insert = vacuumDb.db.prepare(
+        `INSERT INTO vacuum_fixture (payload) VALUES (zeroblob(4096))`,
+      );
+      const fillFixture = vacuumDb.db.transaction(() => {
+        for (let i = 0; i < 2_000; i += 1) insert.run();
+      });
+      fillFixture();
+      vacuumDb.db.exec(`DROP TABLE vacuum_fixture;`);
+
+      const beforePrune = Number(vacuumDb.db.pragma('freelist_count', { simple: true }));
+      expect(beforePrune).toBeGreaterThan(1_000);
+
+      vacuumDb.prune();
+
+      const afterPrune = Number(vacuumDb.db.pragma('freelist_count', { simple: true }));
+      expect(afterPrune).toBeLessThan(1_000);
+    } finally {
+      vacuumDb.close();
+    }
+  });
 });
 
 describe('DashboardDB — context graph subscriptions', () => {

@@ -21,11 +21,17 @@ const SCHEMA_VERSION = 15;
 // retention can override via `setRetentionDays()`; the setting is persisted
 // in the `settings` table and re-read on next boot.
 const DEFAULT_RETENTION_DAYS = 14;
+const LOGS_VACUUM_DELETE_THRESHOLD = 10_000;
+// SQLite reports reusable-but-not-yet-reclaimed pages via freelist_count.
+// With the default 4 KiB page size this is roughly 4 MiB, large enough
+// to avoid VACUUM churn on idle nodes but small enough to retry a failed
+// V15 FTS-drop reclamation immediately on the next prune.
+const VACUUM_FREE_PAGE_THRESHOLD = 1_000;
 
 export interface DashboardDBOptions {
   /** Directory to store the SQLite database file. */
   dataDir: string;
-  /** Days to retain data before pruning. Default: 90 */
+  /** Days to retain data before pruning. Default: 14 */
   retentionDays?: number;
 }
 
@@ -537,9 +543,10 @@ export class DashboardDB {
         this.db.exec(`VACUUM`);
       } catch {
         // VACUUM can fail if a connection elsewhere holds the DB open
-        // (it requires an exclusive lock). On the next boot prune()
-        // will trigger another VACUUM attempt; we never block startup
-        // on disk reclamation.
+        // (it requires an exclusive lock). prune() also checks the
+        // freelist size, so the next boot retries as long as dropping
+        // FTS left meaningful reclaimable space behind. We never block
+        // startup on disk reclamation.
       }
     }
 
@@ -582,13 +589,12 @@ export class DashboardDB {
     this.db.exec(`DELETE FROM message_idempotency WHERE ts < ${messengerCutoff}`);
 
     // Reclaim free pages from the file. Without this, the SQLite file
-    // size only ever grows — DELETE just marks pages reusable, it does
-    // not return them to the OS. We gate this on actually having
-    // deleted a meaningful number of log rows so we don't VACUUM the
-    // whole file on every prune of an idle node. Threshold (10k rows)
-    // is conservative: well above test-suite noise, well below the
-    // ~80k rows/day a busy edge node accumulates.
-    if (logsDeleted > 10_000) {
+    // size only ever grows — DELETE / DROP just marks pages reusable,
+    // it does not return them to the OS. Vacuum when prune removed a
+    // meaningful number of log rows, or when a previous migration/drop
+    // left a large freelist behind without deleting any retained logs.
+    const freePages = Number(this.db.pragma('freelist_count', { simple: true }) ?? 0);
+    if (logsDeleted > LOGS_VACUUM_DELETE_THRESHOLD || freePages > VACUUM_FREE_PAGE_THRESHOLD) {
       try {
         this.db.exec(`VACUUM`);
       } catch {

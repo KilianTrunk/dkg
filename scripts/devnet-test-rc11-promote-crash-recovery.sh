@@ -102,7 +102,13 @@ fail() { echo "[rc11-promote-crash] FAIL: $*" >&2; exit 1; }
 node_dir()    { echo "$DEVNET_DIR/node$1"; }
 node_token()  { tail -1 "$(node_dir "$1")/auth.token" 2>/dev/null | tr -d '\r\n'; }
 node_port()   { echo $((API_PORT_BASE + $1 - 1)); }
+# devnet.pid is the outer foreground supervisor; daemon.pid is the inner
+# `daemon-foreground-worker` that actually runs the libp2p node and async-promote
+# worker. Codex (#673#discussion_r3302023868) flagged that killing only the
+# supervisor leaves the worker alive, so the API port + SQLite store stays open
+# and the "restart" path doesn't reflect a real crash. We now kill BOTH.
 node_pidfile(){ echo "$(node_dir "$1")/devnet.pid"; }
+node_daemon_pidfile(){ echo "$(node_dir "$1")/daemon.pid"; }
 
 api_call() {
   local node="$1" method="$2" path="$3" data="${4:-}"
@@ -203,10 +209,14 @@ while [ "$(date +%s)" -lt "$RACE_DEADLINE" ]; do
       break
       ;;
     succeeded)
+      # Codex (#673#discussion_r3302023872): the crash/restart scenario was
+      # never exercised on this path. Exit non-zero so callers can
+      # distinguish an inconclusive run from a pass — this script asserts
+      # crash-recovery behavior, not happy-path completion.
       warn "job drained before kill could land (state=succeeded). Worker faster than poll loop — rerun for a reliable crash window."
       log "  raw status: $STATUS"
-      log "RESULT: INCONCLUSIVE (worker finished before kill)"
-      exit 0
+      log "RESULT: INCONCLUSIVE (worker finished before kill — crash-recovery path not exercised)"
+      exit 2
       ;;
     failed)
       fail "job in state=failed before any kill — pre-existing recovery condition? raw status: $STATUS"
@@ -230,25 +240,41 @@ fi
 # graceful-shutdown path drain the worker, defeating the test.
 # ---------------------------------------------------------------------------
 
-PIDFILE=$(node_pidfile "$CURATOR_NODE")
-[ -f "$PIDFILE" ] || fail "expected pidfile at $PIDFILE — node may not be running"
-DAEMON_PID=$(cat "$PIDFILE")
+SUPERVISOR_PIDFILE=$(node_pidfile "$CURATOR_NODE")
+WORKER_PIDFILE=$(node_daemon_pidfile "$CURATOR_NODE")
+[ -f "$SUPERVISOR_PIDFILE" ] || fail "expected pidfile at $SUPERVISOR_PIDFILE — node may not be running"
+SUPERVISOR_PID=$(cat "$SUPERVISOR_PIDFILE")
+# Codex (#673#discussion_r3302023868): SIGKILL on the supervisor alone leaves
+# `daemon-foreground-worker` alive and holding the API port + SQLite store
+# open, so the restart isn't a real crash. Kill both the supervisor and the
+# worker (whichever pidfiles are present).
+WORKER_PID=""
+if [ -f "$WORKER_PIDFILE" ]; then
+  WORKER_PID=$(cat "$WORKER_PIDFILE")
+fi
 log ""
-log "SIGKILL daemon (pid=$DAEMON_PID) — bypassing graceful-shutdown to reproduce a hard crash..."
-kill -9 "$DAEMON_PID" 2>/dev/null || warn "kill -9 returned non-zero; pid may already be gone"
+log "SIGKILL daemon (supervisor pid=$SUPERVISOR_PID, worker pid=${WORKER_PID:-<none>}) — bypassing graceful-shutdown to reproduce a hard crash..."
+[ -n "$WORKER_PID" ] && { kill -9 "$WORKER_PID" 2>/dev/null || warn "kill -9 $WORKER_PID returned non-zero; pid may already be gone"; }
+kill -9 "$SUPERVISOR_PID" 2>/dev/null || warn "kill -9 $SUPERVISOR_PID returned non-zero; pid may already be gone"
 
-# Wait for the process to actually disappear so the restart doesn't race
-# the dying process.
+# Wait for both processes to actually disappear so the restart doesn't race
+# a dying process holding the API port.
 for _ in 1 2 3 4 5 6 7 8 9 10; do
-  if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
+  supervisor_alive=0; worker_alive=0
+  kill -0 "$SUPERVISOR_PID" 2>/dev/null && supervisor_alive=1
+  [ -n "$WORKER_PID" ] && kill -0 "$WORKER_PID" 2>/dev/null && worker_alive=1
+  if [ "$supervisor_alive" -eq 0 ] && [ "$worker_alive" -eq 0 ]; then
     break
   fi
   sleep 0.5
 done
-if kill -0 "$DAEMON_PID" 2>/dev/null; then
-  fail "daemon pid $DAEMON_PID still alive 5s after SIGKILL — kernel did not reap"
+if kill -0 "$SUPERVISOR_PID" 2>/dev/null; then
+  fail "supervisor pid $SUPERVISOR_PID still alive 5s after SIGKILL — kernel did not reap"
 fi
-log "✓ daemon dead"
+if [ -n "$WORKER_PID" ] && kill -0 "$WORKER_PID" 2>/dev/null; then
+  fail "worker pid $WORKER_PID still alive 5s after SIGKILL — kernel did not reap"
+fi
+log "✓ supervisor + worker dead"
 
 # ---------------------------------------------------------------------------
 # Stage 4: Restart the node. Lifecycle wires queue.recoverOnStartup()

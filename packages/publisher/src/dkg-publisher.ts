@@ -1950,8 +1950,16 @@ export class DKGPublisher implements Publisher {
       }
     }
 
+    // Collect ACKs only when this publish can actually submit to V10.
+    // Descriptive/local CG ids may still pass a daemon-provided provider
+    // (the agent wires it eagerly), but those are intentional local
+    // publishes and must not fail before the local branch below can run.
+    const shouldCollectV10ACKs =
+      options.v10ACKProvider !== undefined &&
+      !hasPrivateData &&
+      canAttemptOnChainPublish;
     let v10ACKs: V10CoreNodeACK[] | undefined;
-    if (options.v10ACKProvider && !hasPrivateData) {
+    if (shouldCollectV10ACKs) {
       onPhase?.('collect_v10_acks', 'start');
       try {
         const rootEntities = manifestEntries.map(m => m.rootEntity);
@@ -1995,7 +2003,7 @@ export class DKGPublisher implements Publisher {
       } finally {
         onPhase?.('collect_v10_acks', 'end');
       }
-    } else if (options.v10ACKProvider && hasPrivateData) {
+    } else if (options.v10ACKProvider && hasPrivateData && canAttemptOnChainPublish) {
       this.log.info(ctx, `V10 ACK collection skipped: publish contains private quads (${privateRoots.length} private roots)`);
     }
 
@@ -2206,14 +2214,13 @@ export class DKGPublisher implements Publisher {
       // `kcId: 0` (which the daemon previously had to special-case).
       //
       // Missing-seal — `precomputedAttestation === undefined` — is
-      // intentionally NOT hoisted. The publisher's contract historically
-      // permits no-seal publishes (they fall through to tentative);
-      // breaking that surface in this PR would invalidate ~120 publisher
-      // unit tests that exercise transport, ownership, and lifecycle
-      // mechanics without caring about author attribution. Production
-      // call sites (agent.publish, /api/shared-memory/publish) always
-      // mint a seal at the agent layer — see Phase 4 wiring; no
-      // user-facing path can reach the publisher without a seal.
+      // checked inside the chain-submit branch below, after ACK
+      // collection has proven this is a real V10 publish attempt. RC11
+      // / PR-A deliberately rethrows that failure instead of
+      // downgrading to local tentative VM, so ACK-ready no-seal callers
+      // get a clear contract error and no root data-graph write.
+      // Intentional local publishes (no on-chain CG id / non-V10 /
+      // private data) still bypass this branch and can remain tentative.
       // ─────────────────────────────────────────────────────────────
       if (
         options.precomputedAttestation &&

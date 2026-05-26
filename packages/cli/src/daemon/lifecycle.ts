@@ -251,6 +251,7 @@ import {
   checkForUpdate,
 } from './auto-update.js';
 import { chainResetWipe } from './chain-reset-wipe.js';
+import { resetNatStatus, startNatStatusWatcher } from './nat-status.js';
 import {
   OPENCLAW_UI_CONNECT_TIMEOUT_MS,
   OPENCLAW_UI_CONNECT_POLL_MS,
@@ -869,6 +870,37 @@ export async function runDaemonInner(
   });
 
   await agent.start();
+
+  // PR-5: AutoNAT-driven boot self-probe. Subscribes to libp2p's
+  // self:peer:update event for core nodes and updates the
+  // module-level NAT-status cache that PR-4's /api/status relay block
+  // reads. Skip on edge — edge nodes don't need to be publicly
+  // reachable to function. The watcher returns a stop() handle that
+  // the shutdown closure MUST call to remove the listener; otherwise
+  // a respawn leaks listeners (eventually libp2p logs max-listener
+  // warnings).
+  //
+  // Observability-only here. PR-3 (#661) owns the refuse-to-boot gate
+  // via core.allowDegradedRelay — when both merge, that gate's
+  // post-start re-check picks up the same multiaddr set this watcher
+  // classifies. PR-5 stays pure-classifier so the two can land in any
+  // order without merge conflicts.
+  let natStatusWatcherStop: (() => void) | null = null;
+  if ((config.nodeRole ?? 'edge') === 'core') {
+    const watcher = startNatStatusWatcher({
+      node: agent.node.libp2p as unknown as {
+        addEventListener(event: 'self:peer:update', h: () => void): void;
+        removeEventListener(event: 'self:peer:update', h: () => void): void;
+        getMultiaddrs(): Array<{ toString(): string }>;
+      },
+      onClassification: (status, previous) => {
+        log(`[CORE-PREREQ] AutoNAT status transition: ${previous} → ${status}`);
+      },
+    });
+    natStatusWatcherStop = watcher.stop;
+  } else {
+    resetNatStatus();
+  }
 
   const publisherChainBase = chainBase?.rpcUrl && chainBase?.hubAddress
     ? {
@@ -2128,6 +2160,8 @@ export async function runDaemonInner(
         clearInterval(pruneTimer);
         rateLimiter.destroy();
         metricsCollector.stop();
+        natStatusWatcherStop?.();
+        resetNatStatus();
         await publisherRuntime
           ?.stop()
           .catch((err: any) =>

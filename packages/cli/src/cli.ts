@@ -8,7 +8,7 @@ import { createReadStream } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
-import { readFile, writeFile, unlink } from 'node:fs/promises';
+import { readFile, writeFile, unlink, appendFile } from 'node:fs/promises';
 import { ethers } from 'ethers';
 import {
   dkgAuthTokenPath,
@@ -22,7 +22,8 @@ import {
 import yaml from 'js-yaml';
 import {
   loadConfig, saveConfig, configExists, configPath,
-  readPid, readApiPort, isProcessRunning, dkgDir, logPath, ensureDkgDir,
+  readPid, readApiPort, isProcessRunning, dkgDir, logPath, ensureDkgDir, removeApiPort,
+  apiPortPath,
   loadNetworkConfig, loadProjectConfig, resolveAutoUpdateConfig, resolveAutoUpdateSource, resolveChainConfig,
   releasesDir, activeSlot, swapSlot,
   slotEntryPoint, isStandaloneInstall, repoDir,
@@ -64,6 +65,11 @@ import {
   resolveStandaloneInstall,
   decodeForcedExitCode,
 } from './daemon.js';
+import {
+  isLivenessProbeEnabled,
+  startLivenessWatcher,
+  LIVENESS_CONSECUTIVE_FAILURES_TO_KILL,
+} from './daemon/supervisor-liveness.js';
 import { migrateToBlueGreen } from './migration.js';
 import { ensureRollbackNodeUiBundle } from './rollback-node-ui.js';
 import { registerIntegrationCommands } from './integrations/commands.js';
@@ -72,6 +78,16 @@ import { registerIntegrationCommands } from './integrations/commands.js';
 type ActionOpts = Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
 const VERIFY_COLLECTION_TIMEOUT_MIN_MS = 1_000;
 const VERIFY_COLLECTION_TIMEOUT_MAX_MS = 30 * 60 * 1000;
+
+async function appendSupervisorLog(message: string): Promise<void> {
+  await ensureDkgDir();
+  await appendFile(logPath(), `${new Date().toISOString()} ${message}\n`, 'utf-8');
+}
+
+function supervisorWarn(message: string): void {
+  console.warn(message);
+  void appendSupervisorLog(message).catch(() => {});
+}
 
 const STARTUP_BANNER = `
 \x1b[36m██████╗ ██╗  ██╗ ██████╗     ██╗   ██╗ ██╗ ██████╗
@@ -179,11 +195,88 @@ function resolveDaemonEntryPoint(): string {
   return fileURLToPath(import.meta.url);
 }
 
+function probeHostForApiHost(apiHost: string | undefined): string {
+  if (!apiHost || apiHost === '0.0.0.0') return '127.0.0.1';
+  if (apiHost === '::') return '::1';
+  return apiHost;
+}
+
+/**
+ * Wire up the supervisor-liveness watchdog for a spawned worker child.
+ *
+ * Returns a `stop()` function the supervisor must call when the child
+ * exits (cleanly or via SIGKILL). Returns a no-op if:
+ *   - The env gate is disabled (`DKG_SUPERVISOR_LIVENESS_PROBE=off`).
+ *
+ * Wraps the apiPort-read in a polling loop because the worker writes the
+ * port file midway through boot, AFTER spawn returns. The loop stays alive
+ * until the supervisor stops it; slow boots must still get liveness
+ * protection once their HTTP listener is ready.
+ */
+async function maybeStartSupervisorLivenessWatcher(
+  child: { kill(signal: 'SIGKILL'): boolean },
+): Promise<() => void> {
+  if (!isLivenessProbeEnabled(process.env.DKG_SUPERVISOR_LIVENESS_PROBE)) {
+    return () => {};
+  }
+
+  // Defer-start: keep waiting for the worker to write api.port. Some normal
+  // boots do heavy initialization before binding HTTP; a fixed cutoff would
+  // permanently disable the watchdog for those processes.
+  let cancelled = false;
+  let watcher: { stop(): void } | null = null;
+  void (async () => {
+    while (!cancelled) {
+      const port = await readApiPort().catch(() => null);
+      if (port) {
+        if (cancelled) return;
+        const config = await loadConfig().catch(() => ({ apiHost: undefined }));
+        if (cancelled) return;
+        watcher = startLivenessWatcher({
+          port,
+          host: probeHostForApiHost(config.apiHost),
+          // Graceful-shutdown disarm: the worker's `shutdown()` removes
+          // `api.port` BEFORE the slow cleanup tail (`agent.stop()`,
+          // `dashDb.close()`, …), so its absence is the unambiguous "I'm
+          // intentionally shutting down" signal. Without this the watcher
+          // would race a slow teardown and SIGKILL mid-cleanup.
+          isShuttingDown: () => !existsSync(apiPortPath()),
+          onUnresponsive: () => {
+            supervisorWarn(
+              `[supervisor] worker unresponsive after ${LIVENESS_CONSECUTIVE_FAILURES_TO_KILL} consecutive liveness probes; SIGKILL + respawn.`,
+            );
+            try {
+              child.kill('SIGKILL');
+            } catch {
+              /* child may already be exiting; ignore */
+            }
+          },
+          onFailure: (consecutive: number) => {
+            supervisorWarn(`[supervisor] liveness probe failed (${consecutive} in a row).`);
+          },
+        });
+        return;
+      }
+      await sleep(500);
+    }
+  })();
+
+  return () => {
+    cancelled = true;
+    watcher?.stop();
+  };
+}
+
 async function runDaemonSupervisor(): Promise<void> {
   const maxCrashRestarts = 5;
   let crashRestartCount = 0;
 
   while (true) {
+    await removeApiPort().catch((err: any) => {
+      supervisorWarn(
+        `[supervisor] could not clear stale api.port before spawn: ${err?.message ?? String(err)}`,
+      );
+    });
     const child = spawn(
       process.execPath,
       [...process.execArgv, resolveDaemonEntryPoint(), 'daemon-worker'],
@@ -193,9 +286,18 @@ async function runDaemonSupervisor(): Promise<void> {
       },
     );
 
+    // Positive-liveness watchdog. Catches the generic zombie shape (HTTP
+    // listener dead but process still alive) that the exit-watcher can't
+    // see. SIGKILL forces the child's exit, the existing respawn logic
+    // takes it from there. Gated by DKG_SUPERVISOR_LIVENESS_PROBE so
+    // tests + headless-worker scenarios can opt out. See
+    // packages/cli/src/daemon/supervisor-liveness.ts for the full rationale.
+    const stopWatcher = await maybeStartSupervisorLivenessWatcher(child);
+
     const rawExitCode = await new Promise<number | null>((resolve) => {
       child.once('exit', (code) => resolve(code));
     });
+    stopWatcher();
     const { forced, originalExitCode } = decodeForcedExitCode(rawExitCode);
     if (forced) {
       console.warn(
@@ -234,6 +336,12 @@ async function runForegroundSupervisor(childEnv: NodeJS.ProcessEnv = process.env
   while (true) {
     if (signalled) process.exit(0);
 
+    await removeApiPort().catch((err: any) => {
+      supervisorWarn(
+        `[supervisor] could not clear stale api.port before foreground spawn: ${err?.message ?? String(err)}`,
+      );
+    });
+
     currentChild = spawn(
       process.execPath,
       [...process.execArgv, resolveDaemonEntryPoint(), 'daemon-foreground-worker'],
@@ -243,10 +351,13 @@ async function runForegroundSupervisor(childEnv: NodeJS.ProcessEnv = process.env
       },
     );
 
+    const stopWatcher = await maybeStartSupervisorLivenessWatcher(currentChild);
+
     const rawExitCode = await new Promise<number | null>((resolve) => {
       currentChild!.once('exit', (code) => resolve(code));
       currentChild!.once('error', () => resolve(1));
     });
+    stopWatcher();
     currentChild = null;
     const { forced, originalExitCode } = decodeForcedExitCode(rawExitCode);
     if (forced) {

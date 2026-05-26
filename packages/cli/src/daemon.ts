@@ -22,3 +22,4 @@ export * from './daemon/handle-request.js';
 export * from './daemon/shutdown.js';
 export * from './daemon/core-prereq-check.js';
 export * from './daemon/relay-status-block.js';
+export * from './daemon/supervisor-liveness.js';

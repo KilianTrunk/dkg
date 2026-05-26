@@ -193,9 +193,13 @@ export function buildMigrationPlan(opts: BuildPlanOpts): MigrationPlan {
   const loadBearingPresent = SOURCE_TREE_ARTIFACTS_LOAD_BEARING.some((a) =>
     exists(join(opts.repoRoot, a.name)),
   );
+  const cosmeticPresent = SOURCE_TREE_ARTIFACTS_COSMETIC.some((a) =>
+    exists(join(opts.repoRoot, a.name)),
+  );
 
   if (
     !loadBearingPresent &&
+    !cosmeticPresent &&
     (opts.currentAutoUpdateSource === 'npm' || opts.currentAutoUpdateSource === undefined)
   ) {
     // No load-bearing artifact AND config already at npm (or unset which

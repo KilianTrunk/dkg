@@ -122,6 +122,22 @@ describe('buildMigrationPlan — alreadyMigrated short-circuit', () => {
     expect(plan.alreadyMigrated).toBe(false);
     expect(plan.actions.find((a) => a.kind === 'config-write')).toBeDefined();
   });
+
+  it('does NOT short-circuit when package.json is gone but .git still needs cleanup', () => {
+    const plan = buildMigrationPlan({
+      repoRoot: REPO,
+      backupSuffix: 'ts',
+      dkgHomeNow: DKG_HOME,
+      dkgHomePostMigration: DKG_HOME,
+      daemonAlive: false,
+      forceAliveBypass: false,
+      currentAutoUpdateSource: undefined,
+      exists: existsOf([`${REPO}/.git`]),
+    });
+    expect(plan.alreadyMigrated).toBe(false);
+    expect(plan.actions.some((a) => a.kind === 'rename' && a.from === `${REPO}/.git`)).toBe(true);
+    expect(plan.actions.find((a) => a.kind === 'config-write')).toBeDefined();
+  });
 });
 
 describe('buildMigrationPlan — config-write action', () => {

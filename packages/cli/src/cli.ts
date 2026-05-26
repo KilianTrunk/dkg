@@ -8,13 +8,15 @@ import { createReadStream } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
-import { writeFile, unlink } from 'node:fs/promises';
+import { readFile, writeFile, unlink } from 'node:fs/promises';
 import { ethers } from 'ethers';
 import {
   dkgAuthTokenPath,
   FAUCET_WALLETS_PER_REQUEST,
   getFundableWalletAddresses,
+  isDkgMonorepoRoot,
   requestFaucetFunding,
+  resolveDkgConfigHome,
   toErrorMessage,
   hasErrorCode,
 } from '@origintrail-official/dkg-core';
@@ -3884,6 +3886,29 @@ async function stopDaemonIfRunning(): Promise<boolean> {
   return false;
 }
 
+async function readPidFromHome(dkgHome: string): Promise<number | null> {
+  try {
+    const raw = await readFile(join(dkgHome, 'daemon.pid'), 'utf-8');
+    const pid = Number.parseInt(raw.trim(), 10);
+    return Number.isFinite(pid) ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
+async function readAutoUpdateSourceFromHome(
+  dkgHome: string,
+): Promise<'npm' | 'git' | 'auto' | undefined> {
+  try {
+    const raw = await readFile(join(dkgHome, 'config.json'), 'utf-8');
+    const parsed = JSON.parse(raw) as { autoUpdate?: { source?: unknown } };
+    const source = parsed.autoUpdate?.source;
+    return source === 'npm' || source === 'git' || source === 'auto' ? source : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 // ─── dkg migrate-to-npm ──────────────────────────────────────────────
 
 program
@@ -3900,17 +3925,17 @@ program
       console.log('No active git-checkout marker detected at this location (repoDir() === null).');
       console.log(`Continuing from ${repoRoot} so a partial migration can still repair config pins.`);
     }
-    const dkgHomeNow = dkgDir();
-    const dkgHomePostMigration = process.env.DKG_HOME ?? join(homedir(), '.dkg');
-    const pid = await readPid();
+    const dkgHomeNow = resolveDkgConfigHome({
+      isDkgMonorepo: isDkgMonorepoRoot(repoRoot),
+      homeDir: homedir(),
+    });
+    const dkgHomePostMigration = resolveDkgConfigHome({
+      isDkgMonorepo: false,
+      homeDir: homedir(),
+    });
+    const pid = await readPidFromHome(dkgHomeNow);
     const daemonAlive = pid !== null && isProcessRunning(pid);
-    let currentAutoUpdateSource: 'npm' | 'git' | 'auto' | undefined;
-    try {
-      const cfg = await loadConfig();
-      currentAutoUpdateSource = (cfg.autoUpdate as { source?: 'npm' | 'git' | 'auto' } | undefined)?.source;
-    } catch {
-      currentAutoUpdateSource = undefined;
-    }
+    const currentAutoUpdateSource = await readAutoUpdateSourceFromHome(dkgHomeNow);
     const backupSuffix = new Date()
       .toISOString()
       .replace(/[:.]/g, '-')
@@ -3924,7 +3949,6 @@ program
       daemonAlive,
       forceAliveBypass: Boolean(opts.force),
       currentAutoUpdateSource,
-      ...(detectedRepoRoot ? {} : { exists: () => false }),
     });
     process.stdout.write(renderPlan(plan));
     if (plan.alreadyMigrated) return;

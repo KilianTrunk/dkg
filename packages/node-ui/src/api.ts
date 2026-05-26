@@ -81,7 +81,7 @@ export interface TelemetrySettingsCallbacks {
 }
 
 /**
- * Handles all /api/metrics, /api/operations, /api/logs, /api/query-history,
+ * Handles all /api/metrics, /api/operations, /api/node-log, /api/query-history,
  * /api/saved-queries, and /ui routes. Returns true if the request was handled.
  */
 export async function handleNodeUIRequest(
@@ -258,7 +258,7 @@ export async function handleNodeUIRequest(
     return json(res, 200, spending);
   }
 
-  // --- Logs ---
+  // --- Logs (compatibility endpoint) ---
 
   if (req.method === 'GET' && path === '/api/logs') {
     const q = url.searchParams.get('q') ?? undefined;
@@ -760,4 +760,3 @@ function readBody(req: IncomingMessage, maxBytes?: number): Promise<string> {
     req.on('error', reject);
   });
 }
-

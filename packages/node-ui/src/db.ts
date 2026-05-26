@@ -9,13 +9,30 @@ import {
   type ProtocolOutboxStore,
 } from '@origintrail-official/dkg-core';
 
-const SCHEMA_VERSION = 14;
-const DEFAULT_RETENTION_DAYS = 90;
+const SCHEMA_VERSION = 15;
+// Default operator retention. Lowered from 90 → 14 days on V15 (2026-05) after
+// a production incident in which the `logs` table + its FTS5 shadow tables
+// grew to ~9 GB on a 12-day-old node and corrupted the SQLite page (header
+// hash mismatch on boot). 90 days had been chosen for "metrics history",
+// but logs were the dominant grower (~1M rows/12d) and pruning was a no-op
+// on any DB younger than 90 days. 14 days is still long enough for any
+// realistic operator-driven post-mortem while bounding worst-case growth
+// of the (now FTS5-less) logs table to ~150 MB. Operators who want longer
+// retention can override via `setRetentionDays()`; the setting is persisted
+// in the `settings` table and re-read on next boot.
+const DEFAULT_RETENTION_DAYS = 14;
+const LEGACY_IMPLICIT_RETENTION_DAYS = 90;
+const LOGS_VACUUM_DELETE_THRESHOLD = 10_000;
+// SQLite reports reusable-but-not-yet-reclaimed pages via freelist_count.
+// With the default 4 KiB page size this is roughly 4 MiB, large enough
+// to avoid VACUUM churn on idle nodes but small enough to retry a failed
+// V15 FTS-drop reclamation immediately on the next prune.
+const VACUUM_FREE_PAGE_THRESHOLD = 1_000;
 
 export interface DashboardDBOptions {
   /** Directory to store the SQLite database file. */
   dataDir: string;
-  /** Days to retain data before pruning. Default: 90 */
+  /** Days to retain data before pruning. Default: 14 */
   retentionDays?: number;
 }
 
@@ -23,15 +40,18 @@ export class DashboardDB {
   readonly db: Database.Database;
   readonly dataDir: string;
   private retentionDays: number;
+  private readonly explicitRetentionDays: boolean;
 
   constructor(opts: DashboardDBOptions) {
     this.dataDir = opts.dataDir;
+    this.explicitRetentionDays = opts.retentionDays !== undefined;
     this.retentionDays = opts.retentionDays ?? DEFAULT_RETENTION_DAYS;
     const dbPath = join(opts.dataDir, 'node-ui.db');
     this.db = new Database(dbPath);
     this.db.pragma('journal_mode = WAL');
     this.db.pragma('synchronous = NORMAL');
     this.migrate();
+    this.loadRetentionSetting();
     this.prune();
   }
 
@@ -43,6 +63,7 @@ export class DashboardDB {
 
   private migrate(): void {
     const version = this.db.pragma('user_version', { simple: true }) as number;
+    const upgradedExistingDb = version > 0 && version < SCHEMA_VERSION;
     if (version >= SCHEMA_VERSION) return;
 
     if (version < 1) {
@@ -108,16 +129,15 @@ export class DashboardDB {
         CREATE INDEX IF NOT EXISTS idx_logs_operation_id ON logs(operation_id);
         CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
 
-        CREATE VIRTUAL TABLE IF NOT EXISTS logs_fts USING fts5(
-          message, content=logs, content_rowid=id
-        );
-
-        CREATE TRIGGER IF NOT EXISTS logs_ai AFTER INSERT ON logs BEGIN
-          INSERT INTO logs_fts(rowid, message) VALUES (new.id, new.message);
-        END;
-        CREATE TRIGGER IF NOT EXISTS logs_ad AFTER DELETE ON logs BEGIN
-          INSERT INTO logs_fts(logs_fts, rowid, message) VALUES('delete', old.id, old.message);
-        END;
+        -- NOTE: Earlier schema versions (V1..V14) also created an FTS5
+        -- virtual table "logs_fts" plus AFTER INSERT/DELETE triggers to
+        -- keep it in sync with "logs". That fed a free-text search path
+        -- behind /api/logs?q=... The FTS5 index turned out to dominate
+        -- on-disk size (multi-GB shadow tables on long-lived nodes) and
+        -- the corresponding HTTP route had no production consumer
+        -- (the dashboard log viewer is file-backed via /api/node-log).
+        -- V15 drops it for fresh installs; the migration below cleans
+        -- it up for in-place upgrades.
 
         CREATE TABLE IF NOT EXISTS query_history (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -490,8 +510,58 @@ export class DashboardDB {
       }
     }
 
-    this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
+    if (version < 15) {
+      // Drop FTS5 free-text-search infrastructure on `logs`.
+      //
+      // Production incident (rc.10/rc.11 boundary, May 2026): a 12-day-old
+      // testnet edge node accumulated a 9 GB node-ui.db with the FTS5
+      // shadow tables (`logs_fts_data`, `_idx`, `_docsize`, `_config`)
+      // accounting for ~7 GB. SQLite eventually returned
+      // "database disk image is malformed" on boot and the daemon refused
+      // to start. Root causes were structural, not operational:
+      //   1. /api/logs?q= (the only consumer of FTS5 here) has no
+      //      production UI wiring — the dashboard's log viewer is
+      //      file-backed via /api/node-log.
+      //   2. prune() ran on a 90-day cutoff and never deleted anything
+      //      on this 12-day-old DB, so the index grew unbounded.
+      //   3. FTS5 fragments aggressively without periodic `optimize`,
+      //      which we never called.
+      //
+      // V15 deletes the dead infrastructure: triggers first, then the
+      // virtual table (which drops its 4 shadow tables atomically), then
+      // a one-shot VACUUM to actually reclaim disk on existing nodes.
+      // The base `logs` table is preserved — it still backs the
+      // operation-correlated log views (`getOperation`,
+      // `getFailedOperations`). Substring/text search moves to
+      // /api/node-log, which already supports `?q=`.
+      this.db.exec(`
+        DROP TRIGGER IF EXISTS logs_ai;
+        DROP TRIGGER IF EXISTS logs_ad;
+        DROP TABLE   IF EXISTS logs_fts;
+      `);
+      // VACUUM cannot run inside a transaction; better-sqlite3 wraps
+      // multi-statement exec() in implicit BEGIN/COMMIT, so we issue
+      // it as its own call. Skipped on fresh installs where the
+      // virtual table never existed: VACUUM on an empty DB is cheap
+      // but unnecessary, and is harmless if it runs anyway.
+      try {
+        this.db.exec(`VACUUM`);
+      } catch {
+        // VACUUM can fail if a connection elsewhere holds the DB open
+        // (it requires an exclusive lock). prune() also checks the
+        // freelist size, so the next boot retries as long as dropping
+        // FTS left meaningful reclaimable space behind. We never block
+        // startup on disk reclamation.
+      }
+    }
 
+    this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
+    if (upgradedExistingDb && !this.explicitRetentionDays) {
+      this.retentionDays = LEGACY_IMPLICIT_RETENTION_DAYS;
+    }
+  }
+
+  private loadRetentionSetting(): void {
     const savedRetention = this.db.prepare("SELECT value FROM settings WHERE key = 'retentionDays'").get() as { value: string } | undefined;
     if (savedRetention) {
       const days = Number(savedRetention.value);
@@ -503,21 +573,45 @@ export class DashboardDB {
 
   prune(): void {
     const cutoff = Date.now() - this.retentionDays * 86_400_000;
+    // Count total rows actually deleted across all DELETE statements.
+    // SQLite's per-statement change count is exposed via better-sqlite3's
+    // `Database.run().changes`, but `exec()` returns nothing — for a
+    // proper accounting we'd switch each statement to `prepare/run`. For
+    // the VACUUM gating decision below we only need to know whether
+    // *something* substantial was deleted, so we sample the only table
+    // that actually grows fast in practice: `logs`.
+    const logsDeleted = this.db.prepare(
+      `DELETE FROM logs WHERE ts < ?`,
+    ).run(cutoff).changes;
     this.db.exec(`DELETE FROM metric_snapshots WHERE ts < ${cutoff}`);
     this.db.exec(`DELETE FROM operation_phases WHERE started_at < ${cutoff}`);
     this.db.exec(`DELETE FROM operations WHERE started_at < ${cutoff}`);
-    this.db.exec(`DELETE FROM logs WHERE ts < ${cutoff}`);
     this.db.exec(`DELETE FROM query_history WHERE ts < ${cutoff}`);
     this.db.exec(`DELETE FROM chat_messages WHERE ts < ${cutoff}`);
     this.db.exec(`DELETE FROM chat_persistence_jobs WHERE updated_at < ${cutoff} AND status IN ('stored', 'failed')`);
     this.db.exec(`DELETE FROM notifications WHERE ts < ${cutoff}`);
     // Universal Messenger idempotency table. Shorter TTL than the
-    // 90-day operator retention: no realistic dedup window extends
-    // beyond a day. The protocol_outbox table is intentionally not
-    // pruned here; its max-age is store policy and must be applied
-    // by SqliteProtocolOutboxStore.dropExpired().
+    // operator retention: no realistic dedup window extends beyond
+    // a day. The protocol_outbox table is intentionally not pruned
+    // here; its max-age is store policy and must be applied by
+    // SqliteProtocolOutboxStore.dropExpired().
     const messengerCutoff = Date.now() - 24 * 60 * 60 * 1000;
     this.db.exec(`DELETE FROM message_idempotency WHERE ts < ${messengerCutoff}`);
+
+    // Reclaim free pages from the file. Without this, the SQLite file
+    // size only ever grows — DELETE / DROP just marks pages reusable,
+    // it does not return them to the OS. Vacuum when prune removed a
+    // meaningful number of log rows, or when a previous migration/drop
+    // left a large freelist behind without deleting any retained logs.
+    const freePages = Number(this.db.pragma('freelist_count', { simple: true }) ?? 0);
+    if (logsDeleted > LOGS_VACUUM_DELETE_THRESHOLD || freePages > VACUUM_FREE_PAGE_THRESHOLD) {
+      try {
+        this.db.exec(`VACUUM`);
+      } catch {
+        // VACUUM requires an exclusive lock. If another connection is
+        // holding the DB open we skip and retry on the next prune.
+      }
+    }
   }
 
   // --- Prepared statements (lazy-initialized) ---
@@ -1430,6 +1524,12 @@ export class DashboardDB {
     });
   }
 
+  /**
+   * Backwards-compatible DB-backed log search. V15 deliberately removed
+   * the FTS5 shadow table that made `q=` fast because it dominated DB
+   * growth on production nodes. Keep the public method/API surface using
+   * bounded LIKE scans over the retained base `logs` table.
+   */
   searchLogs(opts: {
     q?: string;
     operationId?: string;
@@ -1440,13 +1540,13 @@ export class DashboardDB {
     limit?: number;
     offset?: number;
   } = {}): { logs: LogRow[]; total: number } {
-    if (opts.q) {
-      return this.searchLogsFts(opts);
-    }
-
     const wheres: string[] = [];
     const params: unknown[] = [];
 
+    if (opts.q) {
+      wheres.push(`message LIKE ? ESCAPE '\\'`);
+      params.push(this.likeContains(opts.q));
+    }
     if (opts.operationId) { wheres.push('operation_id = ?'); params.push(opts.operationId); }
     if (opts.level) { wheres.push('level = ?'); params.push(opts.level); }
     if (opts.module) { wheres.push('module = ?'); params.push(opts.module); }
@@ -1454,49 +1554,17 @@ export class DashboardDB {
     if (opts.to) { wheres.push('ts <= ?'); params.push(opts.to); }
 
     const where = wheres.length ? `WHERE ${wheres.join(' AND ')}` : '';
-    const limit = opts.limit ?? 200;
-    const offset = opts.offset ?? 0;
-
+    const limit = Math.max(1, Math.min(1000, opts.limit ?? 200));
+    const offset = Math.max(0, opts.offset ?? 0);
     const total = (this.db.prepare(`SELECT COUNT(*) as c FROM logs ${where}`).get(...params) as { c: number }).c;
     const logs = this.db.prepare(
       `SELECT * FROM logs ${where} ORDER BY ts DESC LIMIT ? OFFSET ?`,
     ).all(...params, limit, offset) as LogRow[];
-
     return { logs, total };
   }
 
-  private searchLogsFts(opts: {
-    q?: string;
-    operationId?: string;
-    level?: string;
-    module?: string;
-    from?: number;
-    to?: number;
-    limit?: number;
-    offset?: number;
-  }): { logs: LogRow[]; total: number } {
-    const wheres: string[] = ['logs_fts MATCH ?'];
-    const params: unknown[] = [opts.q!];
-
-    if (opts.operationId) { wheres.push('l.operation_id = ?'); params.push(opts.operationId); }
-    if (opts.level) { wheres.push('l.level = ?'); params.push(opts.level); }
-    if (opts.module) { wheres.push('l.module = ?'); params.push(opts.module); }
-    if (opts.from) { wheres.push('l.ts >= ?'); params.push(opts.from); }
-    if (opts.to) { wheres.push('l.ts <= ?'); params.push(opts.to); }
-
-    const where = wheres.join(' AND ');
-    const limit = opts.limit ?? 200;
-    const offset = opts.offset ?? 0;
-
-    const total = (this.db.prepare(
-      `SELECT COUNT(*) as c FROM logs l JOIN logs_fts ON l.id = logs_fts.rowid WHERE ${where}`,
-    ).get(...params) as { c: number }).c;
-
-    const logs = this.db.prepare(
-      `SELECT l.* FROM logs l JOIN logs_fts ON l.id = logs_fts.rowid WHERE ${where} ORDER BY l.ts DESC LIMIT ? OFFSET ?`,
-    ).all(...params, limit, offset) as LogRow[];
-
-    return { logs, total };
+  private likeContains(value: string): string {
+    return `%${value.replace(/[\\%_]/g, (m) => `\\${m}`)}%`;
   }
 
   // --- Query history ---

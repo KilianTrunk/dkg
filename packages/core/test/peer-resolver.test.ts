@@ -404,6 +404,57 @@ describe('PeerResolver', () => {
     expect(receivedSignal).toBe(ctrl.signal);
   });
 
+  it('defaultPerStepTimeoutMs constructor override applies when opts.perStepTimeoutMs is omitted', async () => {
+    // PR feat/chain-network-libp2p-tunables: the constructor option
+    // exists for test fixtures and embedders that wire their own
+    // resolver — production callers (`connectToPeerId`, chat / routed
+    // sends) always pass an explicit `perStepTimeoutMs`. Verify the
+    // constructor override is honoured when callers don't pass a
+    // per-call value, and that per-call values still win when they
+    // do. Codex review of PR #698 round 2 removed the operator-facing
+    // wiring; this test still covers the embedder surface.
+    const seenTimeouts: number[] = [];
+    net.__findPeerImpl = async (_pid, opts) => {
+      if (opts?.timeoutMs != null) seenTimeouts.push(opts.timeoutMs);
+      return [];
+    };
+    const resolver = new PeerResolver({
+      network: net,
+      registry,
+      agentDirectory: makeAgentDir(),
+      defaultPerStepTimeoutMs: 9999,
+    });
+
+    await resolver.resolve(PEER_B);
+    expect(seenTimeouts).toEqual([9999]);
+
+    seenTimeouts.length = 0;
+    await resolver.resolve(PEER_B, { perStepTimeoutMs: 1234 });
+    expect(seenTimeouts).toEqual([1234]);
+  });
+
+  it('defaultPerStepTimeoutMs ignores invalid values (NaN / 0 / fractional / negative)', async () => {
+    // Permissive validator: invalid values silently fall back to the
+    // built-in 5s default so a typo in config.json doesn't brick the
+    // resolver at startup.
+    const seenTimeouts: number[] = [];
+    net.__findPeerImpl = async (_pid, opts) => {
+      if (opts?.timeoutMs != null) seenTimeouts.push(opts.timeoutMs);
+      return [];
+    };
+    for (const bad of [NaN, 0, -1, 1.5, Infinity, -Infinity]) {
+      seenTimeouts.length = 0;
+      const resolver = new PeerResolver({
+        network: net,
+        registry,
+        agentDirectory: makeAgentDir(),
+        defaultPerStepTimeoutMs: bad,
+      });
+      await resolver.resolve(PEER_B);
+      expect(seenTimeouts, `bad value: ${bad}`).toEqual([5_000]);
+    }
+  });
+
   it('returns empty array when nothing resolves', async () => {
     net.__findPeerImpl = async () => [];
     const resolver = new PeerResolver({

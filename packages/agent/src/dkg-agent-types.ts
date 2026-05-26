@@ -678,6 +678,17 @@ export interface DKGAgentConfig {
    */
   nodeVersion?: string;
   /**
+   * libp2p networking tunables for small / sparse networks. All three
+   * fields are optional and forwarded straight into the matching
+   * `DKGNodeConfig` slots. Omitting any field preserves the upstream
+   * default. See `packages/core/src/types.ts` for per-field semantics
+   * and the operator-facing surface in `packages/cli/src/config.ts`
+   * (`network` block).
+   */
+  peerStoreMaxAddressAgeMs?: number;
+  peerStoreMaxPeerAgeMs?: number;
+  dhtQuerySelfIntervalMs?: number;
+  /**
    * Path to the V10 Random Sampling prover write-ahead log. Core
    * nodes only; ignored on edge. When omitted, an in-memory WAL is
    * used (loses crash-recovery context on restart). Production

@@ -503,6 +503,34 @@ export interface DkgConfig {
   chat?: ChatConfig;
   /** Route-plugin specs (absolute paths / package names) loaded at daemon startup. ADR 0001. */
   routePlugins?: string[];
+  /**
+   * libp2p networking tunables for small / sparse networks. Forwarded
+   * through `DKGAgentConfig` and applied at `createLibp2p` / `kadDHT`
+   * construction. All optional; omitting any field preserves the
+   * upstream default. See packages/core/src/types.ts for per-field
+   * rationale + default values.
+   *
+   * Targeted at testnet / small-mesh operators where DHT lookups are
+   * flaky (sparse routing tables) and direct addresses age out before
+   * being re-discovered. Mainnet / large-mesh deployments should leave
+   * all fields unset to keep upstream defaults.
+   *
+   * Note: a per-step PeerResolver timeout knob was intentionally NOT
+   * exposed here. Production callers (`connectToPeerId`, chat /
+   * routed sends) always pass an explicit `perStepTimeoutMs` derived
+   * from their own deadline budget, so an operator default would be a
+   * silent no-op for those paths. To influence dial latency on small
+   * networks, bump the caller-side `timeoutMs` (e.g. `connectToPeerId`'s
+   * `timeoutMs` option) instead. Codex review of PR #698 caught this.
+   */
+  network?: {
+    /** libp2p `peerStore.maxAddressAge` (default 3_600_000 = 1h upstream). */
+    peerStoreMaxAddressAgeMs?: number;
+    /** libp2p `peerStore.maxPeerAge` (default 21_600_000 = 6h upstream). */
+    peerStoreMaxPeerAgeMs?: number;
+    /** libp2p `kadDHT.querySelfInterval` (default kad-DHT upstream). */
+    dhtQuerySelfIntervalMs?: number;
+  };
 }
 
 /**

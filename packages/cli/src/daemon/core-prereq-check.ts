@@ -40,12 +40,22 @@
  * any interface is public, the binding is effectively public). Without the
  * host-interface lookup, the wildcard alone is unclassifiable. Then the
  * specific ranges in narrowing order — loopback → CGNAT → RFC1918 →
- * link-local → ULAv6 — so a more-specific class wins over a less-specific
- * one. DNS multiaddrs deliberately classify as `dns` rather than resolving at
+ * link-local → ULAv6 → reserved (0/8, 198.18/15, 240/4 etc.) — so a
+ * more-specific class wins over a less-specific one. The IPv4 classifier is
+ * "reject if matches any reserved/non-global range, else public" rather than
+ * a small allow-list, so blocks like `198.18.0.0/15` (RFC 2544 benchmarking)
+ * and `240.0.0.0/4` (RFC 1112 reserved) don't sneak through as `public`.
+ *
+ * DNS multiaddrs deliberately classify as `dns` rather than resolving at
  * boot (DNS resolution is async + flaky + the answer can change). DNS listen
- * addresses are not themselves proof of public reachability, and unresolved
- * DNS announce addresses do not rescue a degraded listener: this pure checker
- * only trusts literal public IP announce addresses.
+ * addresses are not themselves proof of public reachability. DNS announce
+ * addresses with a non-reserved hostname rescue an otherwise-degraded
+ * listener as **indeterminate** — we can't prove it's public, but it's not a
+ * footgun like a private IP either, so the verdict is `looksDegraded: false`
+ * with `indeterminate: true` so strict (`allowDegradedRelay: false`) operators
+ * don't refuse-to-boot on a stable DNS deployment. Reserved DNS names
+ * (`localhost`, `*.local`, `*.test`, `*.example`, `*.invalid`, single-label)
+ * are excluded from indeterminate rescue — they can't resolve to a public IP.
  */
 
 import { isIP } from 'node:net';
@@ -61,6 +71,7 @@ export type AddrClassification =
   | 'dns'
   | 'multicast'
   | 'relayed'
+  | 'reserved'
   | 'wildcardNoPublicInterface'
   | 'unknown';
 
@@ -73,14 +84,28 @@ export interface CorePrereqResult {
    * True iff `publicListenAddresses` is empty AND no `announceAddresses` entry
    * can rescue the result. Operators with literal public announce addresses
    * (the VPS-with-static-IP case) are not degraded when they still have at
-   * least one bound wildcard / private-LAN listen address. A node with zero
-   * bound listen addresses is always degraded: an announce address cannot make
-   * an unbound transport serve relay traffic.
+   * least one bound wildcard / private-LAN listen address. DNS announce
+   * addresses with a non-reserved hostname also rescue (as indeterminate —
+   * see `indeterminate` below) so a stable DNS deployment doesn't refuse to
+   * boot under strict `allowDegradedRelay: false`. A node with zero bound
+   * listen addresses is always degraded: an announce address cannot make an
+   * unbound transport serve relay traffic.
    */
   looksDegraded: boolean;
   /**
+   * True when the result is non-degraded only because a DNS announce
+   * address rescued it. The pure checker can't prove the DNS hostname
+   * resolves to a publicly reachable IP, so it lets the boot proceed but
+   * marks the verdict as soft. Strict-mode lifecycle layers MAY surface
+   * a clear warning when this is set instead of treating it as an OK
+   * verdict; resolving DNS in the lifecycle layer would let them upgrade
+   * to a hard verdict either way.
+   */
+  indeterminate: boolean;
+  /**
    * Human-readable reasons (one per failure mode hit). Empty when
-   * `looksDegraded === false`. Logged verbatim by the lifecycle wiring.
+   * `looksDegraded === false` and `indeterminate === false`. Logged verbatim
+   * by the lifecycle wiring.
    */
   reasons: string[];
 }
@@ -108,8 +133,12 @@ export interface CheckCoreRelayPrereqsOpts {
    * cloud case where the public IP isn't bound to a local interface).
    * A literal public-IP announce address rescues an otherwise-degraded result
    * only when the node also has at least one wildcard/private-LAN listener.
-   * DNS announce addresses are intentionally not resolved in this pure check,
-   * so they do not count as public evidence here.
+   * DNS announce addresses are intentionally not resolved here (DNS is
+   * async + flaky); a non-reserved DNS hostname triggers an *indeterminate*
+   * rescue (`looksDegraded: false, indeterminate: true`) so strict-mode
+   * operators don't refuse-to-boot on stable DNS deployments. Reserved DNS
+   * hostnames (`localhost`, `*.local`, `*.test`, `*.example`, `*.invalid`,
+   * single-label) are excluded from indeterminate rescue.
    */
   announceAddresses?: string[];
   /**
@@ -167,6 +196,38 @@ function isRfc1918IPv4(ip: string): boolean {
   return RFC1918_REGEXES.some((r) => r.test(ip));
 }
 
+/**
+ * Ranges that MUST NOT be confused with global-unicast IPs even though they
+ * sit outside the more-specific classes above. Without these explicit checks
+ * the classifier falls back to `public` for `0.x.x.x` ("this network" per
+ * RFC 1122), `198.18.x.x` / `198.19.x.x` (RFC 2544 benchmarking), and
+ * `240.x.x.x` … `255.255.255.254` (RFC 1112 reserved-for-future-use), all of
+ * which are not globally routable. Switched from a small "looks public"
+ * allow-list to "reject if reserved, else public" so future IANA assignments
+ * we forget to model still default to optimistic-public, while the known
+ * non-global blocks always reject.
+ */
+function isThisNetworkIPv4(ip: string): boolean {
+  return /^0\./.test(ip);
+}
+
+function isBenchmarkIPv4(ip: string): boolean {
+  return /^198\.(1[89])\./.test(ip);
+}
+
+/**
+ * 240.0.0.0/4 is reserved for future use (RFC 1112), with the sole exception
+ * of the limited broadcast address `255.255.255.255`. Treat the entire /4 as
+ * non-public — broadcast doesn't classify as public anyway and isn't a
+ * reasonable listen address.
+ */
+function isReservedFutureIPv4(ip: string): boolean {
+  const m = /^(\d{1,3})\./.exec(ip);
+  if (!m) return false;
+  const first = Number(m[1]);
+  return first >= 240 && first <= 255;
+}
+
 function classifyIPv4(ip: string): AddrClassification {
   if (!isValidIPv4(ip)) return 'unknown';
   if (isLoopbackIPv4(ip)) return 'loopback';
@@ -175,6 +236,9 @@ function classifyIPv4(ip: string): AddrClassification {
   if (isRfc1918IPv4(ip)) return 'rfc1918';
   if (isMulticastIPv4(ip)) return 'multicast';
   if (isDocumentationIPv4(ip)) return 'unknown';
+  if (isThisNetworkIPv4(ip)) return 'reserved';
+  if (isBenchmarkIPv4(ip)) return 'reserved';
+  if (isReservedFutureIPv4(ip)) return 'reserved';
   return 'public';
 }
 
@@ -183,6 +247,7 @@ function classifyIPv4(ip: string): AddrClassification {
  * the textual prefix instead of doing a numeric range check because the
  * input is already a string and these prefixes are short.
  *
+ *   - `::`                        → reserved   (unspecified address; never a valid src/dst)
  *   - `::1`                       → loopback
  *   - `fe80::/10`                 → linkLocal  (first hextet starts with fe8/fe9/fea/feb)
  *   - `fc00::/7`                  → ulaIpv6    (first hextet starts with fc or fd)
@@ -192,6 +257,7 @@ function classifyIPv4(ip: string): AddrClassification {
 function classifyIPv6(ipRaw: string): AddrClassification {
   if (isIP(ipRaw) !== 6) return 'unknown';
   const ip = ipRaw.toLowerCase();
+  if (ip === '::') return 'reserved';
   if (ip === '::1') return 'loopback';
   if (ip.startsWith('2001:db8:') || ip === '2001:db8::') return 'unknown';
   if (/^fe[89ab][0-9a-f]?:/.test(ip)) return 'linkLocal';
@@ -200,19 +266,76 @@ function classifyIPv6(ipRaw: string): AddrClassification {
   return 'public';
 }
 
+/**
+ * Wildcard listen addresses (`/ip4/0.0.0.0` and `/ip6/::`) bind to every
+ * interface on the host but are NOT themselves dialable from elsewhere — a
+ * remote peer cannot connect to `0.0.0.0`. Reject wildcards explicitly here
+ * so that an `announceAddresses: ['/ip4/0.0.0.0/tcp/9090']` entry can't
+ * suppress the degraded verdict via `bestClassAmongInterfaces` returning
+ * `public` whenever any host interface happens to be public. Wildcard rescue
+ * was the listener-side semantic; on the announce side it's just a misconfig.
+ */
+function isWildcardMultiaddr(addr: string): boolean {
+  const parts = addr.split('/').filter(Boolean);
+  if (parts.length < 2) return false;
+  if (parts[0] === 'ip4' && parts[1] === '0.0.0.0') return true;
+  if (parts[0] === 'ip6' && parts[1] === '::') return true;
+  return false;
+}
+
 function isPublicAnnounceAddress(
   addr: string,
   hostInterfaces: ReadonlyArray<NetworkInterfaceInfo>,
 ): boolean {
+  if (isWildcardMultiaddr(addr)) return false;
   const klass = classifyMultiaddr(addr, hostInterfaces);
   return klass === 'public';
 }
 
 /**
+ * DNS hostnames that cannot resolve to a globally routable address. A node
+ * announcing one of these is misconfigured, so the indeterminate-rescue
+ * heuristic excludes them: we only let a DNS announce stop a refuse-to-boot
+ * when the operator declared a name that *could* resolve to a public IP.
+ *
+ *   - `localhost`, `*.localhost`     → RFC 6761 (always loopback)
+ *   - `*.local`                      → RFC 6762 (mDNS, local link only)
+ *   - `*.test`                       → RFC 6761 (testing only)
+ *   - `*.example`                    → RFC 6761 (documentation TLD)
+ *   - `*.invalid`                    → RFC 6761 (guaranteed-not-resolvable)
+ *   - single-label (no dot)          → not a fully-qualified domain name
+ */
+function isReservedDnsName(name: string): boolean {
+  const lower = name.toLowerCase();
+  if (lower === 'localhost') return true;
+  if (lower.endsWith('.localhost')) return true;
+  if (lower.endsWith('.local')) return true;
+  if (lower.endsWith('.test')) return true;
+  if (lower.endsWith('.example')) return true;
+  if (lower.endsWith('.invalid')) return true;
+  if (!lower.includes('.')) return true;
+  return false;
+}
+
+/**
+ * Extract the hostname segment from a `/dns(4|6|addr)/<host>/...` multiaddr.
+ * Returns `null` for non-DNS multiaddrs.
+ */
+function dnsHostFromAddr(addr: string): string | null {
+  const parts = addr.split('/').filter(Boolean);
+  if (parts.length < 2) return null;
+  const proto = parts[0];
+  if (proto !== 'dns' && proto !== 'dns4' && proto !== 'dns6' && proto !== 'dnsaddr') {
+    return null;
+  }
+  return parts[1];
+}
+
+/**
  * Pick the best (most-public) class across a host's interface IPs. Wins
  * order: public > dns > ulaIpv6 > rfc1918 > cgnat > linkLocal > loopback >
- * everything else. We treat the wildcard binding as "effectively the best
- * interface" since libp2p will accept inbound on any of them.
+ * reserved > everything else. We treat the wildcard binding as "effectively
+ * the best interface" since libp2p will accept inbound on any of them.
  */
 function bestClassAmongInterfaces(
   ifs: ReadonlyArray<NetworkInterfaceInfo>,
@@ -222,6 +345,7 @@ function bestClassAmongInterfaces(
   const RANK: Record<AddrClassification, number> = {
     wildcardNoPublicInterface: -1,
     unknown: 0,
+    reserved: 1,
     multicast: 1,
     relayed: 1,
     loopback: 2,
@@ -303,11 +427,28 @@ export function checkCoreRelayPrereqs(
     (c) => c.class === 'rfc1918'
       || c.class === 'wildcardNoPublicInterface',
   );
+  // DNS announce evidence: a non-reserved hostname is not statically
+  // verifiable (we don't resolve here) but it's also not a footgun like a
+  // private IP. The lifecycle layer should treat this as warn-only rather
+  // than refuse-to-boot, so we surface a soft rescue + the `indeterminate`
+  // flag below for callers that want to upgrade the warning.
+  const announceUsableDns = announceAddresses.some((a) => {
+    const host = dnsHostFromAddr(a);
+    return host !== null && !isReservedDnsName(host);
+  });
   const announceRescues = announceCanServe && announcePublic;
+  const announceIndeterminateRescues = nodeRole === 'core'
+    && publicListenAddresses.length === 0
+    && !announceRescues
+    && announceCanServe
+    && announceUsableDns;
 
   const looksDegraded = nodeRole === 'core'
     && publicListenAddresses.length === 0
-    && !announceRescues;
+    && !announceRescues
+    && !announceIndeterminateRescues;
+
+  const indeterminate = announceIndeterminateRescues;
 
   const reasons: string[] = [];
   if (looksDegraded) {
@@ -337,12 +478,20 @@ export function checkCoreRelayPrereqs(
     if (announceAddresses.length === 0) {
       reasons.push('no announceAddresses configured (would have rescued an otherwise-degraded result)');
     }
+  } else if (indeterminate) {
+    // Surface why the boot was allowed despite a non-routable listener — so
+    // operators see in the structured result that the rescue was soft, not a
+    // proof of public reachability. Lifecycle layers can log this verbatim.
+    reasons.push(
+      `non-routable listener tolerated because announceAddresses include a DNS hostname; reachability cannot be statically verified (set core.allowDegradedRelay: false and pre-resolve DNS to enforce strictly)`,
+    );
   }
 
   return {
     publicListenAddresses,
     nonRoutableAddresses,
     looksDegraded,
+    indeterminate,
     reasons,
   };
 }

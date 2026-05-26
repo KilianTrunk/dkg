@@ -15,6 +15,14 @@
  * Fix: `resolveViewGraphs` keeps the root data graph and verified-memory
  * graphs as candidates. `DKGQueryEngine` then enforces `minTrust` with
  * writer-side `dkg:trustLevel` metadata instead of graph-scope inference.
+ *
+ * RC11 / PR-A (Codex review fix on #671): the root content graph
+ * `did:dkg:context-graph:{id}` is unioned into VM alongside the
+ * `_verified_memory/*` prefix — the PR2 first cut dropped it but that
+ * broke `/api/shared-memory/publish` → immediate VM query for existing
+ * callers. The tentative-VM leak that change was guarding against is
+ * now plugged at the publisher (root-graph insert deferred to the
+ * chain-success branch).
  */
 import { describe, expect, it } from 'vitest';
 import { TrustLevel } from '@origintrail-official/dkg-core';
@@ -24,10 +32,15 @@ const CG = '42';
 const VM_QUORUM_A = '0xa0a0a0';
 
 describe('P-13: resolveViewGraphs handles minTrust for verified-memory', () => {
-  it('default verified-memory resolution targets only the verified-memory prefix (RC11 / PR2: root graph dropped from VM)', () => {
+  it('default verified-memory resolution unions root context-graph + _verified_memory/ prefix (RC11 / PR-A: Codex #671)', () => {
     const res: ViewResolution = resolveViewGraphs('verified-memory', CG);
-    // RC11 / PR2: root content graph is no longer aliased into VM.
-    expect(res.graphs).toEqual([]);
+    // RC11 / PR-A (Codex review fix on #671): the root context-graph
+    // is re-included alongside the `_verified_memory/*` prefix so a
+    // successful publish is immediately observable via VM. The
+    // tentative-VM leak the PR2 first cut was guarding against is now
+    // plugged at the publisher (root-graph insert deferred to the
+    // chain-success branch).
+    expect(res.graphs).toEqual([`did:dkg:context-graph:${CG}`]);
     expect(res.graphPrefixes).toContain(`did:dkg:context-graph:${CG}/_verified_memory/`);
   });
 
@@ -39,23 +52,26 @@ describe('P-13: resolveViewGraphs handles minTrust for verified-memory', () => {
     expect(res.graphPrefixes).toEqual([]);
   });
 
-  it('minTrust=SelfAttested (or omitted) keeps only the verified-memory prefix (RC11 / PR2)', () => {
+  it('minTrust=SelfAttested (or omitted) matches the default resolution (RC11 / PR-A)', () => {
     const omitted = resolveViewGraphs('verified-memory', CG);
     const explicit = resolveViewGraphs('verified-memory', CG, {
       minTrust: TrustLevel.SelfAttested,
     });
-    expect(omitted.graphs).toEqual([]);
+    expect(omitted.graphs).toEqual([`did:dkg:context-graph:${CG}`]);
     expect(explicit.graphs).toEqual(omitted.graphs);
     expect(explicit.graphPrefixes).toEqual(omitted.graphPrefixes);
   });
 
   it(
-    'minTrust=Endorsed keeps only the verified-memory prefix (RC11 / PR2: root dropped from VM)',
+    'minTrust=Endorsed keeps the same graph candidates (trust enforced by writer-side metadata) (RC11 / PR-A)',
     () => {
       const res = resolveViewGraphs('verified-memory', CG, {
         minTrust: TrustLevel.Endorsed,
       });
-      expect(res.graphs).toEqual([]);
+      // Graph candidates are identical across trust floors — the floor
+      // is enforced downstream by `injectMinTrustFilter` against
+      // writer-side `dkg:trustLevel` quads.
+      expect(res.graphs).toEqual([`did:dkg:context-graph:${CG}`]);
       expect(res.graphPrefixes).toEqual([
         `did:dkg:context-graph:${CG}/_verified_memory/`,
       ]);
@@ -63,7 +79,7 @@ describe('P-13: resolveViewGraphs handles minTrust for verified-memory', () => {
   );
 
   it(
-    'minTrust > Endorsed keeps only the verified-memory prefix for trust-tag filtering (RC11 / PR2)',
+    'minTrust > Endorsed keeps the same graph candidates for trust-tag filtering (RC11 / PR-A)',
     () => {
       const partially = resolveViewGraphs('verified-memory', CG, {
         minTrust: TrustLevel.PartiallyVerified,
@@ -72,7 +88,7 @@ describe('P-13: resolveViewGraphs handles minTrust for verified-memory', () => {
         minTrust: TrustLevel.ConsensusVerified,
       });
       for (const res of [partially, consensus]) {
-        expect(res.graphs).toEqual([]);
+        expect(res.graphs).toEqual([`did:dkg:context-graph:${CG}`]);
         expect(res.graphPrefixes).toEqual([
           `did:dkg:context-graph:${CG}/_verified_memory/`,
         ]);
@@ -170,11 +186,12 @@ describe('P-13: resolveViewGraphs handles minTrust for verified-memory', () => {
       // `_minTrust` is silently dropped, the row remains visible; if it
       // is honoured, the trust metadata filter removes it.
       //
-      // RC11 / PR2: pre-PR2 this probe lived in the root context graph
-      // (`did:dkg:context-graph:{CG}`) because the VM view aliased the
-      // root in. The VM view now sources only `_verified_memory/*`, so
-      // the probe quad moves there. The trust filter semantics — what
-      // this test actually validates — are unchanged.
+      // The probe quad is placed in a `_verified_memory/*` sub-graph
+      // so the trust filter is exercised on writer-side metadata, not
+      // graph-scope. (RC11 / PR-A re-includes the root graph in VM —
+      // see top-of-file commentary — but that's orthogonal: this test
+      // pins the trust-filter contract, which fires regardless of
+      // which VM-eligible graph the probe lives in.)
       const { OxigraphStore } = await import('@origintrail-official/dkg-storage');
       const { DKGQueryEngine } = await import('@origintrail-official/dkg-query');
       const store = new OxigraphStore();

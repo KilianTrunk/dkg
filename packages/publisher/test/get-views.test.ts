@@ -46,16 +46,19 @@ describe('resolveViewGraphs', () => {
   });
 
   describe('verified-memory', () => {
-    it('returns only the _verified_memory/ prefix when no specific verifiedGraph is given (RC11 / PR2: root data graph is no longer aliased into VM)', () => {
+    it('unions the root content graph + `_verified_memory/` prefix when no specific verifiedGraph is given (RC11 / PR-A: Codex #671)', () => {
       const res = resolveViewGraphs('verified-memory', CG);
-      // RC11 / PR2: the root content graph `did:dkg:context-graph:{id}`
-      // used to be unioned in here, which combined with the publisher's
-      // unconditional pre-chain data-graph insert produced the
-      // "tentative VM" leak. The publisher's data-graph write is now
-      // gated on chain confirmation AND the VM view sources only
-      // `_verified_memory/*` (populated by `DKGAgent.promoteToVerifiedMemory`
-      // after a successful `verify`).
-      expect(res.graphs).toEqual([]);
+      // RC11 / PR-A (Codex review fix on #671, comment 3302058969):
+      // re-includes the root content graph `did:dkg:context-graph:{id}`
+      // alongside the `_verified_memory/*` post-`verify` named graphs.
+      // The tentative-VM leak the PR2 first cut was guarding against is
+      // now plugged at the publisher (root-graph insert deferred to the
+      // chain-success branch in `DKGPublisher.publish`), so re-unioning
+      // root in VM no longer surfaces unconfirmed quads while still
+      // letting `/api/shared-memory/publish` → VM-query callers (incl.
+      // memory-search) see confirmed data immediately, without needing
+      // a separate `verify` step.
+      expect(res.graphs).toEqual([`did:dkg:context-graph:${CG}`]);
       expect(res.graphPrefixes).toEqual([`did:dkg:context-graph:${CG}/_verified_memory/`]);
     });
 

@@ -183,24 +183,25 @@ describe('DKGQueryEngine', () => {
     ).rejects.toThrow('SPARQL rejected');
   });
 
-  it('view=verified-memory does NOT include the root content graph (RC11 / PR2)', async () => {
-    // RC11 / PR2: VM view sources only `_verified_memory/*` graphs now
-    // (root data graph is no longer aliased into VM). The `"ImageBot"`
-    // quad lives in the root context graph via the test setup, so the
-    // VM-scoped query MUST NOT return it. This pins the inverse of the
-    // pre-PR2 "tentative VM" leak: even when the root graph holds
-    // confirmed publisher-side data, the cross-node VM view requires
-    // an explicit `_verified_memory/{vmId}` entry from a successful
-    // `verify` operation before it surfaces the data.
+  it('view=verified-memory includes the root content graph (RC11 / PR-A: Codex #671)', async () => {
+    // RC11 / PR-A (Codex review fix on #671, comment 3302058969):
+    // re-includes the root context-graph alongside `_verified_memory/*`
+    // so a successful `/api/shared-memory/publish` is immediately
+    // observable via `view: 'verified-memory'` (the pre-PR2 behaviour
+    // existing callers, including memory-search, rely on). The
+    // tentative-VM leak that PR2 was meant to plug is now fixed at the
+    // publisher (root-graph insert deferred to the chain-success
+    // branch); see the comment in `dkg-query-engine.ts` for the full
+    // rationale.
     const result = await engine.query(
       'SELECT ?name WHERE { ?s <http://schema.org/name> ?name }',
       { contextGraphId: CONTEXT_GRAPH, view: 'verified-memory' },
     );
     const names = result.bindings.map(r => r['name']);
-    expect(names).not.toContain('"ImageBot"');
+    expect(names).toContain('"ImageBot"');
   });
 
-  it('view=verified-memory returns ONLY _verified_memory/ graph data (RC11 / PR2)', async () => {
+  it('view=verified-memory unions root content graph + _verified_memory/ sub-graphs (RC11 / PR-A)', async () => {
     const vmGraph = `did:dkg:context-graph:${CONTEXT_GRAPH}/_verified_memory/quorum-1`;
     await store.insert([
       q('urn:vm:entity:1', 'http://schema.org/name', '"Quorum Verified"', vmGraph),
@@ -210,9 +211,10 @@ describe('DKGQueryEngine', () => {
       { contextGraphId: CONTEXT_GRAPH, view: 'verified-memory' },
     );
     const names = result.bindings.map(r => r['name']);
-    // RC11 / PR2: only VM-sub-graph data surfaces. Root-graph quads
-    // (incl. the `"ImageBot"` test setup quad) are excluded.
-    expect(names).not.toContain('"ImageBot"');
+    // Both the publisher's confirmed root-graph data AND post-`verify`
+    // `_verified_memory/*` data must surface — VM is the union of both
+    // (Codex #671 review fix).
+    expect(names).toContain('"ImageBot"');
     expect(names).toContain('"Quorum Verified"');
   });
 

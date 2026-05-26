@@ -1012,6 +1012,125 @@ describe('Tentative publish UAL uniqueness', () => {
     }
   });
 
+  // RC11 / PR-A (Codex review fix on #671, comment 3301913220): the
+  // `finalizeIntentionalLocalPublish` helper that handles the three
+  // intentional-local branches MUST preserve the same provenance and
+  // meta-graph-remap behaviour the pre-PR2 catch-block had. Without
+  // this, intentional-local publishes silently drop their RFC-001 §3.5
+  // `dkg:Publication` / `dkg:authoredBy` quads and (when the caller
+  // supplies a `targetMetaGraphUri`) write their `_meta` triples into
+  // the wrong graph. These two regressions pin the fix.
+  //
+  // Both tests use the "private data — no ACKs collectable" intentional-
+  // local branch: a numeric on-chain CG + V10-ready chain means the
+  // publisher resolves a real `publisherSigner`, so the conditional
+  // spread of `authorAddress`/`publishOperationId` (gated on either a
+  // precomputedAttestation or a resolved signer) is exercised end-to-end.
+  it('intentional-local tentative publish (private-data branch) emits dkg:Publication + dkg:authoredBy provenance (RC11 / PR-A)', async () => {
+    const store = new OxigraphStore();
+    const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
+    const bus = new TypedEventBus();
+    const keypair = await generateEd25519Keypair();
+
+    const publisher = new DKGPublisher({
+      store, chain, eventBus: bus, keypair,
+      publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
+      publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
+    });
+
+    const result = await publisher.publish({
+      contextGraphId: CONTEXT_GRAPH,
+      publisherPeerId: '12D3KooWTestProvenance',
+      quads: [
+        q('did:dkg:agent:ProvenanceProbe', 'http://schema.org/name', '"ProvenanceProbe"'),
+      ],
+      privateQuads: [
+        q('did:dkg:agent:ProvenanceProbe', 'http://dkg.io/ontology/secret', '"hidden"'),
+      ],
+    });
+
+    expect(result.status).toBe('tentative');
+
+    const pubResult = await store.query(
+      `SELECT ?pub WHERE {
+        GRAPH ?g { ?pub a <http://dkg.io/ontology/Publication> }
+      }`,
+    );
+    expect(pubResult.type).toBe('bindings');
+    if (pubResult.type === 'bindings') {
+      expect(pubResult.bindings.length).toBeGreaterThan(0);
+    }
+
+    const authorResult = await store.query(
+      `SELECT ?author WHERE {
+        GRAPH ?g {
+          ?pub a <http://dkg.io/ontology/Publication> .
+          ?pub <http://dkg.io/ontology/authoredBy> ?author .
+        }
+      }`,
+    );
+    expect(authorResult.type).toBe('bindings');
+    if (authorResult.type === 'bindings') {
+      expect(authorResult.bindings.length).toBeGreaterThan(0);
+      const expectedAddr = new ethers.Wallet(HARDHAT_KEYS.CORE_OP).address;
+      const authors = authorResult.bindings.map((b) => b['author'].replace(/^"|"$/g, ''));
+      expect(authors).toContain(expectedAddr);
+    }
+  });
+
+  it('intentional-local tentative publish (private-data branch) remaps _meta quads to options.targetMetaGraphUri (RC11 / PR-A)', async () => {
+    const store = new OxigraphStore();
+    const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
+    const bus = new TypedEventBus();
+    const keypair = await generateEd25519Keypair();
+
+    const publisher = new DKGPublisher({
+      store, chain, eventBus: bus, keypair,
+      publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
+      publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
+    });
+
+    const defaultMetaGraph = `did:dkg:context-graph:${CONTEXT_GRAPH}/_meta`;
+    const customMetaGraph = `did:dkg:context-graph:${CONTEXT_GRAPH}/sub-channel/_shared_memory_meta`;
+
+    const result = await publisher.publish({
+      contextGraphId: CONTEXT_GRAPH,
+      publisherPeerId: '12D3KooWTestMetaRemap',
+      quads: [
+        q('did:dkg:agent:MetaRemap', 'http://schema.org/name', '"MetaRemap"'),
+      ],
+      privateQuads: [
+        q('did:dkg:agent:MetaRemap', 'http://dkg.io/ontology/secret', '"hidden"'),
+      ],
+      targetMetaGraphUri: customMetaGraph,
+    });
+
+    expect(result.status).toBe('tentative');
+
+    const inCustom = await store.query(
+      `SELECT (COUNT(*) AS ?c) WHERE {
+        GRAPH <${customMetaGraph}> { ?s ?p ?o }
+      }`,
+    );
+    const inDefault = await store.query(
+      `SELECT (COUNT(*) AS ?c) WHERE {
+        GRAPH <${defaultMetaGraph}> { ?s ?p ?o }
+      }`,
+    );
+    const customCount = inCustom.type === 'bindings'
+      ? parseInt(inCustom.bindings[0]['c'].match(/^"?(\d+)/)?.[1] ?? '0', 10)
+      : 0;
+    const defaultCount = inDefault.type === 'bindings'
+      ? parseInt(inDefault.bindings[0]['c'].match(/^"?(\d+)/)?.[1] ?? '0', 10)
+      : 0;
+
+    // The `_meta` quads must land in the caller-supplied target, not
+    // the default `_meta` graph — this is the remap PR2's first cut
+    // dropped and Codex flagged.
+    expect(customCount).toBeGreaterThan(0);
+    expect(defaultCount).toBe(0);
+  });
+
   it('publish invokes onPhase for every major step', async () => {
     const store = new OxigraphStore();
     const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);

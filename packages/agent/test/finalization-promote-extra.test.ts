@@ -203,7 +203,7 @@ describe('Round 5 §10: replica-side dkg:Publication / dkg:authoredBy provenance
 });
 
 describe('A-4: e2e — agent.publish() data lands in canonical (data) view post-confirmation', () => {
-  it('published data is observable via query(contextGraphId: cgId) on the publisher (RC11 / PR2: VM separation)', async () => {
+  it('published data is observable via query(contextGraphId: cgId) AND via view=verified-memory on the publisher (RC11 / PR-A: Codex #671)', async () => {
     const cgId = `a4-e2e-${ethers.hexlify(ethers.randomBytes(3)).slice(2)}`;
     const entity = `urn:a4:e2e:${ethers.hexlify(ethers.randomBytes(3)).slice(2)}`;
 
@@ -219,10 +219,11 @@ describe('A-4: e2e — agent.publish() data lands in canonical (data) view post-
     // is populated AFTER on-chain confirmation now (not unconditionally
     // pre-chain). The original BUGS_FOUND.md A-4 invariant — "confirmed
     // publishes land where the publisher's own SPARQL can see them" —
-    // is unchanged; we just check it via the default context-graph
-    // scope rather than the cross-node `view: 'verified-memory'` view,
-    // which post-PR2 sources only `_verified_memory/*` graphs populated
-    // by a separate `verify` operation.
+    // is unchanged; we check it both via the default context-graph
+    // scope AND via `view: 'verified-memory'` (RC11 / PR-A re-includes
+    // the root data graph in VM so memory-search-style callers see
+    // post-publish data immediately, without needing an explicit
+    // `verify` step).
     const qr = await nodeA!.query(
       `SELECT ?o WHERE { <${entity}> <http://schema.org/name> ?o }`,
       cgId,
@@ -233,19 +234,22 @@ describe('A-4: e2e — agent.publish() data lands in canonical (data) view post-
     ).toBe(1);
     expect(qr.bindings[0]['o']).toBe('"E2E-A4"');
 
-    // RC11 / PR2: `view: 'verified-memory'` sources exclusively from
-    // `_verified_memory/{vmId}` graphs that the agent's `verify`
-    // operation populates. Without an explicit `verify` step, the VM
-    // view stays empty for this entity — that's the intended PR2
-    // separation: published ≠ cross-node verified.
+    // RC11 / PR-A (Codex review fix on #671, comment 3302058969):
+    // `view: 'verified-memory'` now unions the root context-graph with
+    // `_verified_memory/{vmId}` sub-graphs, so a confirmed publish is
+    // immediately observable via VM. The tentative-VM leak the PR2
+    // first cut was guarding against is plugged at the publisher
+    // (root-graph insert deferred to the chain-success branch), so
+    // re-including root in VM no longer surfaces unconfirmed quads.
     const vmQr = await nodeA!.query(
       `SELECT ?o WHERE { <${entity}> <http://schema.org/name> ?o }`,
       { contextGraphId: cgId, view: 'verified-memory' },
     );
     expect(
       vmQr.bindings.length,
-      'verified-memory view must NOT include published-but-not-yet-verified data after PR2',
-    ).toBe(0);
+      'verified-memory view must include confirmed publishes immediately (PR-A: root graph re-unioned into VM)',
+    ).toBe(1);
+    expect(vmQr.bindings[0]['o']).toBe('"E2E-A4"');
 
     // And the same data MUST NOT remain in SWM post-confirmation —
     // leaving it there would be a double-counting leak.

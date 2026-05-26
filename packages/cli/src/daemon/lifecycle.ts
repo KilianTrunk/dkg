@@ -379,19 +379,22 @@ export function resolveMemoryAgentAddress(agent: {
  * WARN when the daemon inherits them from `network/<env>.json#chain.rpcUrl`
  * without an explicit operator override. The list is intentionally
  * conservative: only well-known free public endpoints make the cut, so
- * a private RPC behind a load balancer never trips it. Match by
- * lowercase substring against the URL host to tolerate https://, port
- * suffixes, and trailing path segments. The trigger is purely
+ * a private RPC behind a load balancer never trips it. Match against
+ * the parsed URL's hostname (lowercased) so a private proxy URL that
+ * happens to embed a public hostname in its PATH (e.g.
+ * `https://rpc.my-company.example/proxy?url=https://sepolia.base.org/`)
+ * is never misclassified as public. The trigger is purely
  * informational — it does NOT block startup, it only gives the
  * operator a single prominent log line so the dzudza failure mode
  * (silent RPC rate-limit during ACK pre-flight) becomes self-diagnostic.
  *
  * If the list grows out of sync with reality the cost is a noisy
- * WARN for a private RPC that happens to share a substring (over-warn)
- * or a quiet failure on a new public endpoint (under-warn). Both are
- * recoverable by editing this list — and an operator who reads the
- * WARN can always suppress it by setting `chain.rpcUrl` in their
- * config.json. The default behaviour stays correct either way.
+ * WARN for a private RPC whose hostname is literally one of the entries
+ * (over-warn) or a quiet false-negative on a new public endpoint
+ * (under-warn). Both are recoverable by editing this list — and an
+ * operator who reads the WARN can always suppress it by setting
+ * `chain.rpcUrl` in their config.json. The default behaviour stays
+ * correct either way.
  */
 const KNOWN_PUBLIC_RPC_HOSTS = [
   'sepolia.base.org',
@@ -404,6 +407,30 @@ const KNOWN_PUBLIC_RPC_HOSTS = [
 ];
 
 export function isLikelyPublicRpc(url: string): boolean {
+  // PR3 (review fix #2): parse the URL and match against `hostname`
+  // only. The previous implementation did a `lower.includes(host)`
+  // against the full URL string, which would flag a private proxy
+  // URL like `https://rpc.my-company.example/upstream/sepolia.base.org`
+  // as public — the host substring appears in the PATH, not the host.
+  //
+  // Endpoint suffix match (`===` OR `.endsWith('.' + host)`) is the
+  // standard way to match a hostname against a known list while still
+  // matching well-known subdomains (e.g. `eu.rpc.ankr.com` for
+  // `rpc.ankr.com`). Falls back to the old substring scan if the URL
+  // is unparseable (e.g. a bare host without a scheme), so the
+  // diagnostic surface stays the same for malformed inputs an operator
+  // might still want flagged.
+  let hostname: string | undefined;
+  try {
+    hostname = new URL(url).hostname.toLowerCase();
+  } catch {
+    hostname = undefined;
+  }
+  if (hostname !== undefined) {
+    return KNOWN_PUBLIC_RPC_HOSTS.some(
+      (host) => hostname === host || hostname!.endsWith(`.${host}`),
+    );
+  }
   const lower = url.toLowerCase();
   return KNOWN_PUBLIC_RPC_HOSTS.some((host) => lower.includes(host));
 }

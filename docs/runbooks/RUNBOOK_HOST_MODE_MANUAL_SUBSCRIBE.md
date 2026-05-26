@@ -125,8 +125,26 @@ After a successful POST:
 
 1. The daemon log on the core should include
    `Host-mode subscribed CG=<id>` (or the persistence-queue equivalent).
-2. `GET /api/shared-memory/host-mode/list` reports the CG (along with
-   every other host-mode-subscribed CG on this daemon).
+2. `GET /api/shared-memory/host-mode/stats` reports the CG in its
+   `subscribedCgIds` array (alongside `enabled`, `cgCount`,
+   `totalBytes`, `totalEntries`). This is the host-mode store
+   diagnostics endpoint, served by
+   `packages/cli/src/daemon/routes/memory.ts:947-957` and backed by
+   `DKGAgent.getSwmHostModeStats()`. Example response after a single
+   subscribe:
+
+   ```json
+   {
+     "enabled": true,
+     "cgCount": 1,
+     "totalBytes": 0,
+     "totalEntries": 0,
+     "subscribedCgIds": ["<curator-agent>/lj-A-1717000000"]
+   }
+   ```
+
+   `totalBytes` / `totalEntries` stay at zero until the first
+   gossiped SWM envelope lands and is persisted — see step 3.
 3. Within a few seconds, gossiped SWM envelopes for that CG should
    start showing up in the core's `swm-host-mode` substrate. With no
    curator currently writing, you won't see ingest until the next

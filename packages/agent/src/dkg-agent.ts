@@ -1624,8 +1624,41 @@ export class DKGAgent {
               // because the bookkeeping is keyed differently per
               // path (cleartext for reconciler/manual, wire-hash for
               // chain-event/beacon). See `getSwmSubscriptionSource`.
-              getSubscriptionSourceForCg: (cgId, swmGraphId) =>
-                this.getSwmSubscriptionSource(cgId, swmGraphId),
+              //
+              // PR5 (review fix #1): chain-event AND discovery-beacon
+              // paths key `swmHostModeSubscribed` by the WIRE form
+              // (the curator-committed nameHash, normalized through
+              // `gossipWireIdFor`). The numeric `cgId` and the
+              // cleartext `swmGraphId` carried by the ACK intent are
+              // NOT in the wire form, so passing ONLY those two would
+              // miss every chain-event / beacon host-only subscription
+              // and degrade `subscriptionSource` to `undefined` →
+              // reported as `?` in the publisher's ACK-provenance log
+              // on the common host-only paths.
+              //
+              // Canonicalize both ACK-intent candidates through
+              // `gossipWireIdFor()` and pass the wire forms as
+              // additional candidates. `gossipWireIdFor` is a pure
+              // local computation: if the local node is a member of
+              // the CG it returns the cached `onChainHash`; otherwise
+              // it returns the input lowercased if it's already a
+              // 32-byte hex string, or `keccak256(utf8(input))`
+              // otherwise. `getSwmSubscriptionSource` is variadic and
+              // dedupes via its internal `seen` Set, so over-passing
+              // is cheap, order-independent, and a no-op when one of
+              // the four shapes is already covered.
+              getSubscriptionSourceForCg: (cgId, swmGraphId) => {
+                const wireFromCgId = cgId ? this.gossipWireIdFor(cgId) : undefined;
+                const wireFromSwmGraphId = swmGraphId && swmGraphId !== cgId
+                  ? this.gossipWireIdFor(swmGraphId)
+                  : undefined;
+                return this.getSwmSubscriptionSource(
+                  cgId,
+                  swmGraphId,
+                  wireFromCgId,
+                  wireFromSwmGraphId,
+                );
+              },
             }, this.eventBus);
             // rc.9 PR-11: migrated onto the Universal Messenger
             // substrate (wire prefix /dkg/10.0.1/storage-ack).

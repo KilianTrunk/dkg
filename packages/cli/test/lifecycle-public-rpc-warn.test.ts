@@ -29,7 +29,30 @@ describe('isLikelyPublicRpc (PR3 / RC11 — startup WARN on inherited public RPC
     'http://127.0.0.1:8545',
     'https://infura.io/v3/private-key',
     'http://localhost:8545',
+    // PR3 (review fix #2) regression: a private proxy URL that
+    // embeds a known-public hostname in its PATH must NOT be
+    // misclassified as public. Pre-fix this returned `true` because
+    // the helper did a `lower.includes(host)` against the whole URL
+    // string; post-fix it parses the URL and matches against
+    // `hostname` only, so this stays `false`.
+    'https://rpc.my-company.example/upstream/sepolia.base.org',
+    'https://proxy.my-company.example/?target=https://rpc.ankr.com',
   ])('does NOT flag private/private-relayed endpoint %s', (url) => {
     expect(isLikelyPublicRpc(url)).toBe(false);
+  });
+
+  it.each([
+    // Subdomains of known-public hosts (e.g. region prefixes) should
+    // still flag — the helper matches `hostname === host ||
+    // hostname.endsWith('.' + host)` so `eu.rpc.ankr.com` is treated
+    // as a subdomain of `rpc.ankr.com`.
+    ['https://eu.rpc.ankr.com', true],
+    // Adjacency: `notsepolia.base.org` is NOT a subdomain of
+    // `sepolia.base.org` even though it shares the suffix. The
+    // endpoint match prevents `endsWith('sepolia.base.org')` false-
+    // positives.
+    ['https://notsepolia.base.org', false],
+  ])('subdomain handling: %s → %s', (url, expected) => {
+    expect(isLikelyPublicRpc(url)).toBe(expected);
   });
 });

@@ -81,7 +81,7 @@ export interface TelemetrySettingsCallbacks {
 }
 
 /**
- * Handles all /api/metrics, /api/operations, /api/logs, /api/query-history,
+ * Handles all /api/metrics, /api/operations, /api/node-log, /api/query-history,
  * /api/saved-queries, and /ui routes. Returns true if the request was handled.
  */
 export async function handleNodeUIRequest(
@@ -258,20 +258,13 @@ export async function handleNodeUIRequest(
     return json(res, 200, spending);
   }
 
-  // --- Logs ---
-
-  if (req.method === 'GET' && path === '/api/logs') {
-    const q = url.searchParams.get('q') ?? undefined;
-    const operationId = url.searchParams.get('operationId') ?? undefined;
-    const level = url.searchParams.get('level') ?? undefined;
-    const module = url.searchParams.get('module') ?? undefined;
-    const from = url.searchParams.get('from') ? parseInt(url.searchParams.get('from')!, 10) : undefined;
-    const to = url.searchParams.get('to') ? parseInt(url.searchParams.get('to')!, 10) : undefined;
-    const limit = parseInt(url.searchParams.get('limit') ?? '200', 10);
-    const offset = parseInt(url.searchParams.get('offset') ?? '0', 10);
-    const result = db.searchLogs({ q, operationId, level, module, from, to, limit, offset });
-    return json(res, 200, result);
-  }
+  // NOTE: The DB-backed /api/logs route (free-text search over the
+  // `logs` table via FTS5) was removed in V15 of the dashboard schema
+  // after a production incident: its FTS5 shadow tables grew to
+  // multiple GB on long-lived nodes and corrupted the SQLite file. It
+  // had no production client — the dashboard log viewer is served by
+  // /api/node-log (below), which tails the `daemon.log` file directly
+  // and supports the same `q=` substring filter the UI ever exercised.
 
   // --- Node log (daemon.log file) ---
 

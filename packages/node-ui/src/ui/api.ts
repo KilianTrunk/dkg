@@ -175,10 +175,11 @@ export const fetchPerTypeStats = (periodMs: number, bucketMs?: number) => {
 };
 
 // --- Logs ---
-export const fetchLogs = (params: Record<string, string> = {}) => {
-  const qs = new URLSearchParams(params).toString();
-  return get<{ logs: any[]; total: number }>(`/api/logs${qs ? '?' + qs : ''}`);
-};
+// NOTE: A `fetchLogs()` wrapper around the DB-backed /api/logs route
+// used to live here. It had no production importer (only its own unit
+// test) and the underlying route was removed in V15 of the dashboard
+// DB schema. The UI's actual log viewer uses `fetchNodeLog()` below,
+// which is file-backed.
 
 export const fetchNodeLog = (params: { lines?: number; q?: string } = {}) => {
   const qs = new URLSearchParams();

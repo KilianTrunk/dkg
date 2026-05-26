@@ -11,7 +11,6 @@ import {
   fetchOperationsWithPhases,
   fetchOperation,
   fetchErrorHotspots,
-  fetchLogs,
   fetchNodeLog,
   fetchConnections,
   fetchLlmSettings,
@@ -89,8 +88,6 @@ function startTestServer(): Promise<void> {
           res.end(JSON.stringify({ operations: [], total: 0 }));
         } else if (url.startsWith('/api/error-hotspots')) {
           res.end(JSON.stringify({ hotspots: [] }));
-        } else if (url.startsWith('/api/logs')) {
-          res.end(JSON.stringify({ logs: [], total: 0 }));
         } else if (url.startsWith('/api/node-log')) {
           res.end(JSON.stringify({ lines: [], totalSize: 0 }));
         } else if (url.startsWith('/api/sync/catchup-status')) {
@@ -270,12 +267,6 @@ describe('UI API tests', () => {
       await fetchErrorHotspots(3600000);
       const call = requestLog.find(r => r.url.includes('error-hotspots'));
       expect(call?.url).toContain('periodMs=3600000');
-    });
-
-    it('fetchLogs with params', async () => {
-      await fetchLogs({ level: 'error' });
-      const call = requestLog.find(r => r.url.includes('/api/logs'));
-      expect(call?.url).toContain('level=error');
     });
 
     it('fetchNodeLog with lines', async () => {

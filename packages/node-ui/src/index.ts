@@ -23,7 +23,6 @@ export type {
   ContextGraphMemberRow,
 } from './db.js';
 
-export { StructuredLogger } from './structured-logger.js';
 export { OperationTracker } from './operation-tracker.js';
 export { MetricsCollector } from './metrics-collector.js';
 export type { MetricsSource } from './metrics-collector.js';

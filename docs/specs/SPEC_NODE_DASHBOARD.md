@@ -5,6 +5,34 @@
 
 ---
 
+> **2026-05 changelog — V15 of `DashboardDB`**
+>
+> The original design (below) included a `StructuredLogger` class that
+> mirrored every log line into a SQLite `logs` table + FTS5 free-text
+> index, exposed via `/api/logs?q=...`. After a production incident in
+> which the FTS5 shadow tables grew to multiple GB on a 12-day-old node
+> and corrupted the SQLite file, that path was removed:
+>
+> - `StructuredLogger` (class) — deleted; the dashboard was never wired
+>   to substitute it for `Logger` in production, so removal was a no-op
+>   for the daemon.
+> - `logs_fts` virtual table + its two triggers — dropped in the V15
+>   migration; one-shot `VACUUM` reclaims disk on upgrade.
+> - `/api/logs` and `fetchLogs()` — removed; the dashboard log viewer
+>   uses `/api/node-log` (file-tail over `daemon.log`) which has always
+>   been the file-backed read path.
+>
+> The base `logs` table itself was retained: it backs the
+> operation-correlated log lookup in `/api/operations/:id` and the
+> failed-ops list (simple `WHERE operation_id = ?` queries — no FTS5
+> involved). Retention was lowered from 90 days to 14 to bound table
+> growth in the absence of free-text search.
+>
+> Sections below describing the original FTS5/StructuredLogger design
+> are kept for historical context; treat them as superseded.
+
+---
+
 ## Overview
 
 A unified web interface for operating a DKG node — monitoring,

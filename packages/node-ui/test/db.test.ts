@@ -86,7 +86,7 @@ describe('DashboardDB — metric snapshots', () => {
     raw.close();
 
     db = new DashboardDB({ dataDir: dir });
-    expect(db.db.pragma('user_version', { simple: true })).toBe(14);
+    expect(db.db.pragma('user_version', { simple: true })).toBe(15);
 
     const cols = (db.db.prepare('PRAGMA table_info(metric_snapshots)').all() as Array<{ name: string }>)
       .map((c) => c.name);
@@ -142,7 +142,7 @@ describe('DashboardDB — metric snapshots', () => {
     raw.close();
 
     db = new DashboardDB({ dataDir: dir });
-    expect(db.db.pragma('user_version', { simple: true })).toBe(14);
+    expect(db.db.pragma('user_version', { simple: true })).toBe(15);
 
     const newSnapshotCols = (db.db.prepare('PRAGMA table_info(metric_snapshots)').all() as { name: string }[])
       .map(c => c.name);
@@ -248,60 +248,40 @@ describe('DashboardDB — operations', () => {
 });
 
 describe('DashboardDB — logs', () => {
-  it('inserts and searches logs by level', () => {
-    db.insertLog({ ts: 1000, level: 'info', module: 'Agent', message: 'started' });
-    db.insertLog({ ts: 2000, level: 'error', module: 'Agent', message: 'something broke' });
-    db.insertLog({ ts: 3000, level: 'info', module: 'Publisher', message: 'published' });
+  // NOTE: The free-text / level / time-range / pagination search paths
+  // were removed in V15 along with /api/logs. The remaining production
+  // usage of the `logs` table is operation-correlated lookup (see
+  // `getOperation` / `getFailedOperations` tests above). Below we cover
+  // just the writer side and a baseline row-count to guard against a
+  // future regression that breaks insertion.
 
-    const errors = db.searchLogs({ level: 'error' });
-    expect(errors.logs).toHaveLength(1);
-    expect(errors.logs[0].message).toBe('something broke');
+  it('insertLog persists the row with all columns', () => {
+    db.insertLog({
+      ts: 1000,
+      level: 'error',
+      operation_name: 'sync',
+      operation_id: 'op-1',
+      module: 'Agent',
+      message: 'something broke',
+    });
 
-    const all = db.searchLogs({});
-    expect(all.total).toBe(3);
+    const rows = db.db.prepare(`SELECT * FROM logs ORDER BY ts ASC`).all() as any[];
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      ts: 1000,
+      level: 'error',
+      operation_name: 'sync',
+      operation_id: 'op-1',
+      module: 'Agent',
+      message: 'something broke',
+    });
   });
 
-  it('searches logs by operationId', () => {
-    db.insertLog({ ts: 1000, level: 'info', operation_id: 'op-1', module: 'A', message: 'hello' });
-    db.insertLog({ ts: 2000, level: 'info', operation_id: 'op-2', module: 'A', message: 'world' });
-
-    const result = db.searchLogs({ operationId: 'op-1' });
-    expect(result.logs).toHaveLength(1);
-    expect(result.logs[0].message).toBe('hello');
-  });
-
-  it('supports full-text search', () => {
-    db.insertLog({ ts: 1000, level: 'info', module: 'A', message: 'merkle root verified successfully' });
-    db.insertLog({ ts: 2000, level: 'info', module: 'A', message: 'connection established' });
-    db.insertLog({ ts: 3000, level: 'error', module: 'A', message: 'merkle root mismatch detected' });
-
-    const result = db.searchLogs({ q: 'merkle' });
-    expect(result.total).toBe(2);
-    expect(result.logs.every((l: any) => l.message.includes('merkle'))).toBe(true);
-  });
-
-  it('filters by time range', () => {
-    db.insertLog({ ts: 1000, level: 'info', module: 'A', message: 'early' });
-    db.insertLog({ ts: 5000, level: 'info', module: 'A', message: 'middle' });
-    db.insertLog({ ts: 9000, level: 'info', module: 'A', message: 'late' });
-
-    const result = db.searchLogs({ from: 4000, to: 6000 });
-    expect(result.total).toBe(1);
-    expect(result.logs[0].message).toBe('middle');
-  });
-
-  it('paginates with limit and offset', () => {
-    for (let i = 0; i < 20; i++) {
-      db.insertLog({ ts: i * 1000, level: 'info', module: 'A', message: `log-${i}` });
-    }
-
-    const page1 = db.searchLogs({ limit: 5, offset: 0 });
-    expect(page1.logs).toHaveLength(5);
-    expect(page1.total).toBe(20);
-
-    const page2 = db.searchLogs({ limit: 5, offset: 5 });
-    expect(page2.logs).toHaveLength(5);
-    expect(page2.logs[0].id).not.toBe(page1.logs[0].id);
+  it('insertLog tolerates null operation context', () => {
+    db.insertLog({ ts: 2000, level: 'info', module: 'Publisher', message: 'published' });
+    const row = db.db.prepare(`SELECT * FROM logs WHERE ts = 2000`).get() as any;
+    expect(row.operation_id).toBeNull();
+    expect(row.operation_name).toBeNull();
   });
 });
 
@@ -354,7 +334,8 @@ describe('DashboardDB — retention', () => {
     db2.prune();
 
     expect(db2.getLatestSnapshot()).toBeUndefined();
-    expect(db2.searchLogs({}).total).toBe(0);
+    const remainingLogs = (db2.db.prepare(`SELECT COUNT(*) AS c FROM logs`).get() as { c: number }).c;
+    expect(remainingLogs).toBe(0);
     expect(db2.getOperations().total).toBe(0);
 
     db2.close();
@@ -478,9 +459,88 @@ describe('DashboardDB — schema idempotency', () => {
     db.close();
     const db2 = new DashboardDB({ dataDir: dir });
     db2.insertLog({ ts: 1, level: 'info', module: 'Test', message: 'ok' });
-    expect(db2.searchLogs({}).total).toBe(1);
+    const count = (db2.db.prepare(`SELECT COUNT(*) AS c FROM logs`).get() as { c: number }).c;
+    expect(count).toBe(1);
     db2.close();
     db = new DashboardDB({ dataDir: dir });
+  });
+});
+
+describe('DashboardDB — V15 migration: drop FTS5 logs index', () => {
+  // Regression guard for the rc.11 incident
+  // (~9 GB node-ui.db, corrupt SQLite page from a runaway FTS5 index).
+  // We construct a V14-shape database by hand — virtual table + the
+  // two triggers + an actual log row that the trigger should mirror
+  // into the shadow tables — then open it through DashboardDB and
+  // confirm the migration removes the FTS5 infrastructure while
+  // preserving the base `logs` row.
+  it('drops logs_fts virtual table and its two triggers on upgrade from V14', () => {
+    const mkdtempSync = require('node:fs').mkdtempSync;
+    const { tmpdir } = require('node:os');
+    const { join } = require('node:path');
+    const Database = require('better-sqlite3');
+
+    const upgradeDir = mkdtempSync(join(tmpdir(), 'dkg-dashboard-db-v15-'));
+    const upgradeDbPath = join(upgradeDir, 'node-ui.db');
+
+    // Build a realistic V14-shape DB. We let DashboardDB create the
+    // full schema first (so prune() during the upgrade re-open won't
+    // trip on missing tables), then downgrade user_version to 14 and
+    // bolt the V14-era FTS5 infrastructure back onto `logs`. Reopening
+    // through DashboardDB exercises the real migrate() codepath.
+    const v14 = new DashboardDB({ dataDir: upgradeDir });
+    // Use a recent timestamp so the V15 default 14-day retention prune
+    // (which runs on every DashboardDB open) doesn't delete this row
+    // before the assertion can see it.
+    const recentTs = Date.now() - 60_000;
+    v14.insertLog({ ts: recentTs, level: 'info', module: 'Agent', message: 'pre-migration row' });
+    v14.close();
+
+    const downgrade = new Database(upgradeDbPath);
+    downgrade.exec(`
+      CREATE VIRTUAL TABLE logs_fts USING fts5(
+        message, content=logs, content_rowid=id
+      );
+      CREATE TRIGGER logs_ai AFTER INSERT ON logs BEGIN
+        INSERT INTO logs_fts(rowid, message) VALUES (new.id, new.message);
+      END;
+      CREATE TRIGGER logs_ad AFTER DELETE ON logs BEGIN
+        INSERT INTO logs_fts(logs_fts, rowid, message) VALUES('delete', old.id, old.message);
+      END;
+      -- Backfill the index from the existing row so the fixture matches
+      -- what a long-lived V14 DB would actually look like on disk.
+      INSERT INTO logs_fts(rowid, message) SELECT id, message FROM logs;
+    `);
+    downgrade.pragma(`user_version = 14`);
+    downgrade.close();
+
+    const upgraded = new DashboardDB({ dataDir: upgradeDir });
+    try {
+      expect(upgraded.db.pragma('user_version', { simple: true })).toBe(15);
+
+      const ftsTables = upgraded.db.prepare(
+        `SELECT name FROM sqlite_master WHERE type IN ('table','view') AND name LIKE 'logs_fts%'`,
+      ).all() as { name: string }[];
+      expect(ftsTables).toHaveLength(0);
+
+      const triggers = upgraded.db.prepare(
+        `SELECT name FROM sqlite_master WHERE type='trigger' AND name IN ('logs_ai','logs_ad')`,
+      ).all() as { name: string }[];
+      expect(triggers).toHaveLength(0);
+
+      const preserved = upgraded.db.prepare(
+        `SELECT message FROM logs ORDER BY ts ASC`,
+      ).all() as { message: string }[];
+      expect(preserved).toEqual([{ message: 'pre-migration row' }]);
+
+      // Sanity: inserts on `logs` still succeed (no orphaned trigger
+      // pointing at the deleted virtual table).
+      expect(() => upgraded.insertLog({
+        ts: 2000, level: 'warn', module: 'Agent', message: 'post-migration row',
+      })).not.toThrow();
+    } finally {
+      upgraded.close();
+    }
   });
 });
 
@@ -879,7 +939,7 @@ describe('DashboardDB — V11→V13 chat schema migration chain', () => {
     raw.close();
 
     db = new DashboardDB({ dataDir: dir });
-    expect(db.db.pragma('user_version', { simple: true })).toBe(14);
+    expect(db.db.pragma('user_version', { simple: true })).toBe(15);
 
     const cols = (db.db.prepare('PRAGMA table_info(chat_messages)').all() as Array<{ name: string }>)
       .map((c) => c.name);

@@ -338,6 +338,11 @@ import {
 import { handleRequest } from './handle-request.js';
 import { loadRoutePlugins, countConfiguredPluginSpecs } from './plugin-loader.js';
 import type { MemoryGraphChangedEvent, MemoryGraphLayer } from './routes/context.js';
+import {
+  createPromoteWorkerSupervisor,
+  type PromoteWorkerConfig,
+  type PromoteWorkerSupervisor,
+} from './worker/async-promote-worker.js';
 
 type MultiaddrLike = { toString: () => string };
 
@@ -485,6 +490,111 @@ export function mergePreferredRelays(input: {
     envCount: envParsed.length,
     configCount: configParsed.length,
     preferredCount: preferredInResult.length,
+  };
+}
+
+export interface PromoteWorkerDaemonLifecycle {
+  waitForStartup(): Promise<void>;
+  stop(reason?: string | null): Promise<void>;
+  getSupervisor(): PromoteWorkerSupervisor | null;
+}
+
+export function startPromoteWorkerDaemonLifecycle(input: {
+  agent: PromoteWorkerConfig['agent'];
+  log: (msg: string) => void;
+  emitMemoryGraphChanged: (event: MemoryGraphChangedEvent) => void;
+  isShuttingDown?: () => boolean;
+  workerConfig?: Omit<PromoteWorkerConfig, 'agent' | 'log' | 'emitMemoryGraphChanged'>;
+}): PromoteWorkerDaemonLifecycle {
+  let promoteWorkerSupervisor: PromoteWorkerSupervisor | null = null;
+  let promoteWorkerStartup: Promise<void> | null = null;
+  let promoteWorkerTimer: ReturnType<typeof setTimeout> | null = null;
+
+  promoteWorkerTimer = setTimeout(() => {
+    promoteWorkerTimer = null;
+    void (async () => {
+      if (input.isShuttingDown?.()) return;
+      // Async-promote queue worker (PR #3) — drains the queue introduced
+      // in PR #1 + #2. It is intentionally independent from async-publisher
+      // bootstrap: `/promote-async` jobs only need the agent assertion API,
+      // and should not sit queued forever if publisher wallet/chain recovery
+      // hangs.
+      const supervisor = createPromoteWorkerSupervisor({
+        ...input.workerConfig,
+        agent: input.agent,
+        log: (msg) => input.log(`[promote-worker] ${msg}`),
+        emitMemoryGraphChanged: input.emitMemoryGraphChanged,
+      });
+      promoteWorkerSupervisor = supervisor;
+      const startup = (async () => {
+        try {
+          await supervisor.start();
+          if (!input.isShuttingDown?.() && promoteWorkerSupervisor === supervisor) {
+            daemonState.promoteWorkerAvailable = true;
+            daemonState.promoteWorkerUnavailableReason = null;
+            input.log("[async-promote-worker] supervisor started; /promote-async accepting jobs");
+          }
+        } catch (err: any) {
+          // Codex PR #665 review (id=3300423547): a single startup
+          // failure here used to leave the queue silently dead. The
+          // route layer now gates `/promote-async` on
+          // `promoteWorkerAvailable`, so enqueue / list / status all
+          // 503 until something explicitly restarts the supervisor.
+          // The structured `[async-promote-worker]` tag makes the
+          // failure trivially greppable in operator logs alongside
+          // the daemon's other startup banners.
+          const message = err?.message ?? String(err);
+          daemonState.promoteWorkerAvailable = false;
+          daemonState.promoteWorkerUnavailableReason = message;
+          if (!input.isShuttingDown?.()) {
+            input.log(
+              `[async-promote-worker] startup failed; queue is read-only until daemon restart: ${message}`,
+            );
+          }
+          if (promoteWorkerSupervisor === supervisor) {
+            promoteWorkerSupervisor = null;
+          }
+        } finally {
+          if (promoteWorkerStartup === startup) {
+            promoteWorkerStartup = null;
+          }
+        }
+      })();
+      promoteWorkerStartup = startup;
+      await startup;
+    })();
+  }, 0);
+  if (promoteWorkerTimer.unref) promoteWorkerTimer.unref();
+
+  async function waitForStartup(): Promise<void> {
+    if (promoteWorkerTimer) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+    await promoteWorkerStartup;
+  }
+
+  async function stop(reason: string | null = null): Promise<void> {
+    if (promoteWorkerTimer) {
+      clearTimeout(promoteWorkerTimer);
+      promoteWorkerTimer = null;
+    }
+    daemonState.promoteWorkerAvailable = false;
+    daemonState.promoteWorkerUnavailableReason = reason;
+    await promoteWorkerSupervisor
+      ?.stop()
+      .catch((err: any) =>
+        input.log(`Promote worker stop error: ${err?.message ?? String(err)}`),
+      );
+    await promoteWorkerStartup
+      ?.catch((err: any) =>
+        input.log(`Promote worker startup wait error: ${err?.message ?? String(err)}`),
+      );
+  }
+
+  return {
+    waitForStartup,
+    stop,
+    getSupervisor: () => promoteWorkerSupervisor,
   };
 }
 
@@ -853,6 +963,13 @@ export async function runDaemonInner(
   });
 
   let publisherRuntime: PublisherRuntime | null = null;
+  // Holds the running async-promote worker lifecycle (PR #3 of the
+  // async-promote-queue series). Initialised in `startPostApiPublishing`
+  // after the API is up so a recoverOnStartup hiccup never blocks boot;
+  // torn down in `shutdown` before `agent.stop()` so the queue store is
+  // still open when we wait for in-flight promotes to drain.
+  let promoteWorkerLifecycle: PromoteWorkerDaemonLifecycle | null = null;
+  let shuttingDown = false;
 
   const networkId = await computeNetworkId();
   const publisherControl = createPublisherControlFromStore(
@@ -1082,72 +1199,80 @@ export async function runDaemonInner(
     }, 0);
     if (profileTimer.unref) profileTimer.unref();
 
+    promoteWorkerLifecycle = startPromoteWorkerDaemonLifecycle({
+      agent,
+      log,
+      emitMemoryGraphChanged,
+      isShuttingDown: () => shuttingDown,
+    });
+
     const publisherTimer = setTimeout(() => {
-      void startPublisherRuntimeIfEnabled({
-        dataDir: dkgDir(),
-        config,
-        store: agent.store,
-        keypair: agent.wallet.keypair,
-        chainBase: publisherChainBase,
-        ackTransportFactory: () => ({
-          publisherPeerId: agent.peerId,
-          gossipPublish: async (topic: string, data: Uint8Array) => {
-            await agent.gossip.publish(topic, data);
-          },
-          // Route storage-ack + verify-proposal outbound sends through
-          // the Messenger rather than directly through ProtocolRouter
-          // (rc.9 PR-2 wiring). Today this is semantically identical
-          // to the prior `agent.router.send` path — `/dkg/10.0.0/*`
-          // protocols travel `Messenger.sendToPeer` (legacy pass-
-          // through) → `ProtocolRouter.send`. The wiring matters at
-          // Milestone C PR-11 when `/storage-ack` + `/verify-proposal`
-          // migrate to `/dkg/10.0.1/*` and start using
-          // `messenger.sendReliable`, picking up the substrate's
-          // durable outbox + sender-side idempotency without
-          // touching this factory again.
-          //
-          // HIGH RISK gate (rc.9 plan): Milestone C migration of
-          // these protocols MUST include an explicit publishing-flow
-          // integration test covering ACK quorum collection + the
-          // ackTransportFactory hot path before the prefix bump
-          // lands.
-          // rc.9 PR-11: /storage-ack + /verify-proposal migrated to
-          // /dkg/10.0.1/* and now route through messenger.sendReliable
-          // (envelope wrap + sender-side idempotency + durable
-          // outbox). queued surfaces as a thrown transport error so
-          // ACKCollector's MAX_RETRIES loop + per-peer skip semantics
-          // kick in unchanged.
-          sendP2P: async (peerId: string, protocol: string, data: Uint8Array) => {
-            const sendResult = await agent.messenger.sendReliable(peerId, protocol, data);
-            if (!sendResult.delivered) {
-              throw new Error(`substrate queued (transport): ${sendResult.error}`);
-            }
-            return sendResult.response;
-          },
-          getConnectedCorePeers: () => {
-            const allPeers = agent.node.libp2p
-              .getPeers()
-              .map((p) => p.toString())
-              .filter((id) => id !== agent.peerId);
-            const knownCorePeerIds = (agent as any).knownCorePeerIds as
-              | Set<string>
-              | undefined;
-            if (knownCorePeerIds && knownCorePeerIds.size > 0) {
-              const filtered = allPeers.filter((id) => knownCorePeerIds.has(id));
-              if (filtered.length > 0) return filtered;
-            }
-            return allPeers;
-          },
-          log,
-        }),
-        log,
-      })
-        .then((runtime) => {
+      void (async () => {
+        try {
+          const runtime = await startPublisherRuntimeIfEnabled({
+            dataDir: dkgDir(),
+            config,
+            store: agent.store,
+            keypair: agent.wallet.keypair,
+            chainBase: publisherChainBase,
+            ackTransportFactory: () => ({
+              publisherPeerId: agent.peerId,
+              gossipPublish: async (topic: string, data: Uint8Array) => {
+                await agent.gossip.publish(topic, data);
+              },
+              // Route storage-ack + verify-proposal outbound sends through
+              // the Messenger rather than directly through ProtocolRouter
+              // (rc.9 PR-2 wiring). Today this is semantically identical
+              // to the prior `agent.router.send` path — `/dkg/10.0.0/*`
+              // protocols travel `Messenger.sendToPeer` (legacy pass-
+              // through) → `ProtocolRouter.send`. The wiring matters at
+              // Milestone C PR-11 when `/storage-ack` + `/verify-proposal`
+              // migrate to `/dkg/10.0.1/*` and start using
+              // `messenger.sendReliable`, picking up the substrate's
+              // durable outbox + sender-side idempotency without
+              // touching this factory again.
+              //
+              // HIGH RISK gate (rc.9 plan): Milestone C migration of
+              // these protocols MUST include an explicit publishing-flow
+              // integration test covering ACK quorum collection + the
+              // ackTransportFactory hot path before the prefix bump
+              // lands.
+              // rc.9 PR-11: /storage-ack + /verify-proposal migrated to
+              // /dkg/10.0.1/* and now route through messenger.sendReliable
+              // (envelope wrap + sender-side idempotency + durable
+              // outbox). queued surfaces as a thrown transport error so
+              // ACKCollector's MAX_RETRIES loop + per-peer skip semantics
+              // kick in unchanged.
+              sendP2P: async (peerId: string, protocol: string, data: Uint8Array) => {
+                const sendResult = await agent.messenger.sendReliable(peerId, protocol, data);
+                if (!sendResult.delivered) {
+                  throw new Error(`substrate queued (transport): ${sendResult.error}`);
+                }
+                return sendResult.response;
+              },
+              getConnectedCorePeers: () => {
+                const allPeers = agent.node.libp2p
+                  .getPeers()
+                  .map((p) => p.toString())
+                  .filter((id) => id !== agent.peerId);
+                const knownCorePeerIds = (agent as any).knownCorePeerIds as
+                  | Set<string>
+                  | undefined;
+                if (knownCorePeerIds && knownCorePeerIds.size > 0) {
+                  const filtered = allPeers.filter((id) => knownCorePeerIds.has(id));
+                  if (filtered.length > 0) return filtered;
+                }
+                return allPeers;
+              },
+              log,
+            }),
+            log,
+          });
           publisherRuntime = runtime;
-        })
-        .catch((err: any) => {
+        } catch (err: any) {
           log(`Async publisher startup failed: ${err?.message ?? String(err)}`);
-        });
+        }
+      })();
     }, 0);
     if (publisherTimer.unref) publisherTimer.unref();
   };
@@ -2341,6 +2466,12 @@ export async function runDaemonInner(
           .catch((err: any) =>
             log(`Publisher runtime stop error: ${err?.message ?? String(err)}`),
           );
+        // Drain the async-promote worker before closing the agent — once
+        // `agent.stop()` runs the queue's underlying triple store goes
+        // away. We let in-flight promotes complete (or hit
+        // `shutdownTimeoutMs`); RFC §6.2 forbids marking `running →
+        // queued` here so the next boot's `recoverOnStartup()` decides.
+        await promoteWorkerLifecycle?.stop(shuttingDown ? 'daemon shutting down' : null);
         await daemonState.catchupRunner
           ?.close()
           .catch((err: any) =>

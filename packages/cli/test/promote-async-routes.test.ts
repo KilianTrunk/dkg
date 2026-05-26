@@ -45,9 +45,9 @@ describe('promote-async daemon routes', () => {
       idGenerator: () => `job-${++idCounter}`,
       backoff: () => 60_000,
     });
-    // The supervisor that flips this on lives in a follow-up PR; for
-    // the wire-contract tests we pretend the worker is already up.
-    // Individual tests can flip it back off to exercise the 503 path.
+    // Wire-contract tests don't spin up the worker supervisor — they
+    // pretend the worker is already up. Individual tests can flip
+    // `promoteWorkerAvailable` back off to exercise the 503 path.
     daemonState.promoteWorkerAvailable = true;
     daemonState.promoteWorkerUnavailableReason = null;
   });
@@ -231,6 +231,18 @@ describe('promote-async daemon routes', () => {
     expect(r.body.jobId).toBe('job-1');
     expect(r.body.state).toBe('queued');
     expect(r.body.enqueuedAt).toBeUndefined();
+  });
+
+  it('POST /:name/promote-async returns 503 when the worker is unavailable', async () => {
+    await startRoutes(makeAgent());
+    daemonState.promoteWorkerAvailable = false;
+    daemonState.promoteWorkerUnavailableReason = 'recoverOnStartup failed';
+    const r = await post('/api/assertion/my-assertion/promote-async', {
+      contextGraphId: 'graphify',
+      entities: 'all',
+    });
+    expect(r.status).toBe(503);
+    expect(r.body.error).toContain('recoverOnStartup failed');
   });
 
   it('POST /:name/promote-async returns 409 with existingJobId on duplicate enqueue', async () => {

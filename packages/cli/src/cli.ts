@@ -190,6 +190,12 @@ function resolveDaemonEntryPoint(): string {
   return fileURLToPath(import.meta.url);
 }
 
+function probeHostForApiHost(apiHost: string | undefined): string {
+  if (!apiHost || apiHost === '0.0.0.0') return '127.0.0.1';
+  if (apiHost === '::') return '::1';
+  return apiHost;
+}
+
 /**
  * Wire up the supervisor-liveness watchdog for a spawned worker child.
  *
@@ -221,8 +227,11 @@ async function maybeStartSupervisorLivenessWatcher(
       const port = await readApiPort().catch(() => null);
       if (port) {
         if (cancelled) return;
+        const config = await loadConfig().catch(() => ({ apiHost: undefined }));
+        if (cancelled) return;
         watcher = startLivenessWatcher({
           port,
+          host: probeHostForApiHost(config.apiHost),
           onUnresponsive: () => {
             supervisorWarn(
               `[supervisor] worker unresponsive after ${LIVENESS_CONSECUTIVE_FAILURES_TO_KILL} consecutive liveness probes; SIGKILL + respawn.`,

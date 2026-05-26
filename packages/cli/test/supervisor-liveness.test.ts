@@ -191,6 +191,51 @@ describe('startLivenessWatcher', () => {
     watcher.stop();
   });
 
+  it('passes the configured host through to the probe', async () => {
+    const probe = vi.fn().mockResolvedValue(true);
+    const watcher = startLivenessWatcher({
+      port: 1234,
+      host: '::1',
+      probe,
+      onUnresponsive: vi.fn(),
+      intervalMs: 1000,
+      timeoutMs: 250,
+    });
+
+    await advanceTicks(1, 1000);
+    expect(probe).toHaveBeenCalledWith(1234, '::1', 250);
+    watcher.stop();
+  });
+
+  it('ignores a probe result that resolves after stop()', async () => {
+    let resolveProbe: (alive: boolean) => void;
+    const probe = vi.fn().mockImplementation(
+      () =>
+        new Promise<boolean>((resolve) => {
+          resolveProbe = resolve;
+        }),
+    );
+    const onUnresponsive = vi.fn();
+    const onFailure = vi.fn();
+    const watcher = startLivenessWatcher({
+      port: 1234,
+      probe,
+      onUnresponsive,
+      onFailure,
+      intervalMs: 1000,
+      consecutiveFailuresToKill: 1,
+    });
+
+    await advanceTicks(1, 1000);
+    watcher.stop();
+    resolveProbe!(false);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(onFailure).not.toHaveBeenCalled();
+    expect(onUnresponsive).not.toHaveBeenCalled();
+  });
+
   it('healthy probes never trigger onFailure / onUnresponsive', async () => {
     const probe = vi.fn().mockResolvedValue(true);
     const onUnresponsive = vi.fn();

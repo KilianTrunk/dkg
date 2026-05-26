@@ -114,6 +114,8 @@ export function isLivenessProbeEnabled(envValue: string | undefined): boolean {
 export interface LivenessWatcherOpts {
   /** Port to probe (the worker's API listener). */
   port: number;
+  /** Host to probe. Defaults to IPv4 loopback for the common apiHost case. */
+  host?: string;
   /** Called whenever the threshold trips. Wired by the supervisor to `child.kill('SIGKILL')`. */
   onUnresponsive: () => void;
   /**
@@ -143,6 +145,7 @@ export function startLivenessWatcher(opts: LivenessWatcherOpts): { stop(): void 
   const timeoutMs = opts.timeoutMs ?? LIVENESS_PROBE_TIMEOUT_MS;
   const threshold = opts.consecutiveFailuresToKill ?? LIVENESS_CONSECUTIVE_FAILURES_TO_KILL;
   const probe = opts.probe ?? probeWorkerAlive;
+  const host = opts.host ?? '127.0.0.1';
 
   let consecutiveFailures = 0;
   let probing = false;
@@ -152,7 +155,8 @@ export function startLivenessWatcher(opts: LivenessWatcherOpts): { stop(): void 
     if (stopped || probing) return;
     probing = true;
     try {
-      const alive = await probe(opts.port, '127.0.0.1', timeoutMs);
+      const alive = await probe(opts.port, host, timeoutMs);
+      if (stopped) return;
       if (alive) {
         consecutiveFailures = 0;
         return;

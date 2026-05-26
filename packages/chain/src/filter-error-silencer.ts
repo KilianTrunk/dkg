@@ -54,8 +54,9 @@
  *
  * Defensive: matches on the canonical expiry strings ("filter not found" /
  * "filter expired") with the RPC error code (-32602 / -32000) when the
- * provider exposes structured payloads. Plain outer messages only match when
- * they also identify the failing RPC method as `eth_getFilterChanges`. We
+ * provider exposes structured payloads; if the payload names an RPC method, it
+ * must be `eth_getFilterChanges`. Plain outer messages only match when they
+ * also identify the failing RPC method as `eth_getFilterChanges`. We
  * intentionally do NOT swallow unrelated filter-shaped errors like "invalid
  * filter object".
  */
@@ -69,12 +70,13 @@ export function isFilterNotFoundError(err: unknown): boolean {
     info?: { error?: { code?: unknown; message?: unknown }; payload?: { method?: unknown } };
     payload?: { method?: unknown };
   };
+  const method = candidate.info?.payload?.method ?? candidate.payload?.method;
+  const isGetFilterChanges = method === undefined || method === 'eth_getFilterChanges';
   const rpcCode = typeof candidate.code === 'number' ? candidate.code : candidate.info?.error?.code;
   const rpcMessage = candidate.info?.error?.message;
   if ((rpcCode === -32602 || rpcCode === -32000) && typeof rpcMessage === 'string') {
-    if (isExpiredFilterMessage(rpcMessage.toLowerCase())) return true;
+    if (isExpiredFilterMessage(rpcMessage.toLowerCase()) && isGetFilterChanges) return true;
   }
-  const method = candidate.info?.payload?.method ?? candidate.payload?.method;
   if (
     isExpiredFilterMessage(lower) &&
     (lower.includes('eth_getfilterchanges') || method === 'eth_getFilterChanges')
@@ -191,8 +193,7 @@ export function createFilterErrorSilencer(opts: FilterErrorSilencerOpts = {}): F
             : '';
         log(
           `[chain] RPC filter expired (eth_getFilterChanges returned "filter not found"). ` +
-            `ethers will recreate the filter on its next polling cycle; ` +
-            `Hub TTL-refresh fallback keeps contract addresses fresh meanwhile.${suppressedSuffix}`,
+            `Hub TTL-refresh fallback keeps contract addresses fresh while event polling is degraded.${suppressedSuffix}`,
         );
         lastEmitAt = currentTime;
         filterErrorsSuppressedInWindow = 0;

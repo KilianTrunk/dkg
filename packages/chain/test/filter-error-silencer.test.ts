@@ -84,6 +84,16 @@ describe('isFilterNotFoundError', () => {
     expect(isFilterNotFoundError(serverErr)).toBe(false);
   });
 
+  it('does NOT match structured filter expiry errors from other RPC methods', () => {
+    const err = Object.assign(new Error('could not coalesce error'), {
+      info: {
+        error: { code: -32602, message: 'filter not found' },
+        payload: { method: 'eth_getLogs' },
+      },
+    });
+    expect(isFilterNotFoundError(err)).toBe(false);
+  });
+
   it('does NOT match unrelated provider errors', () => {
     expect(isFilterNotFoundError(new Error('ECONNRESET'))).toBe(false);
     expect(isFilterNotFoundError(new Error('rate limited'))).toBe(false);
@@ -238,6 +248,7 @@ describe('production wiring shape (sanity)', () => {
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     silencer.handle(filterNotFoundError());
     expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(warnSpy.mock.calls[0][0]).not.toContain('recreate');
     warnSpy.mockRestore();
   });
 });

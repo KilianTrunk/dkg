@@ -10,9 +10,7 @@ import { JoinProjectModal } from '../Modals/JoinProjectModal.js';
 import { useNodeEvents } from '../../hooks/useNodeEvents.js';
 import { useHiddenContextGraphIds as useHiddenProjectIds } from '../../hooks/useHiddenContextGraphIds.js';
 import {
-  fetchCurrentAgent,
   fetchLocalAgentIntegrations,
-  type AgentIdentity,
   type LocalAgentIntegration,
   type LocalAgentIntegrationStatus,
 } from '../../api.js';
@@ -22,6 +20,7 @@ import {
   toSidebarIdentity,
   type AgentSidebarIdentity,
 } from '../../lib/contextGraphSidebar.js';
+import { useCurrentAgent } from '../../hooks/useCurrentAgent.js';
 
 // Project tree row: a flat, clickable header that opens the project tab.
 // Memory-layer expansion was removed by request — layers are surfaced inside
@@ -164,7 +163,8 @@ export function PanelLeft() {
   const [treeMode, setTreeMode] = useState<TreeMode>('explorer');
 
   const { hidden: hiddenIds, hide: hideProject, unhideAll } = useHiddenProjectIds();
-  const [agentIdentity, setAgentIdentity] = useState<AgentSidebarIdentity | null>(null);
+  const sharedAgent = useCurrentAgent().data;
+  const agentIdentity: AgentSidebarIdentity | null = sharedAgent ? toSidebarIdentity(sharedAgent) : null;
 
   const visibleContextGraphs = contextGraphs.filter((cg) => !hiddenIds.has(cg.id));
   const myProjects = visibleContextGraphs.filter((cg) =>
@@ -178,7 +178,9 @@ export function PanelLeft() {
 
   const loadCGs = useCallback(() => {
     setLoading(true);
-    fetchCurrentAgent().then((a: AgentIdentity) => setAgentIdentity(toSidebarIdentity(a))).catch(() => {});
+    // Identity is now sourced from the shared `useCurrentAgent` hook
+    // — see `agentIdentity` above. This effect only refreshes the CG
+    // list, which is what the user actually expects from a poll.
     api.fetchContextGraphs()
       .then(({ contextGraphs: cgs }: any) => setContextGraphs(cgs ?? []))
       .catch(() => {})
@@ -187,8 +189,16 @@ export function PanelLeft() {
 
   useEffect(() => {
     loadCGs();
-    const iv = setInterval(loadCGs, 60_000);
-    return () => clearInterval(iv);
+    let timer: ReturnType<typeof setInterval> | null = null;
+    const start = () => { if (!timer) timer = setInterval(loadCGs, 60_000); };
+    const stop = () => { if (timer) { clearInterval(timer); timer = null; } };
+    const onVisibility = () => { if (document.hidden) stop(); else { loadCGs(); start(); } };
+    if (!document.hidden) start();
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      stop();
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
   }, [loadCGs]);
 
   useNodeEvents(useCallback((event) => {

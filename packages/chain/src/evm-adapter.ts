@@ -1,6 +1,7 @@
 import { ethers, JsonRpcProvider, Wallet, Contract, Interface } from 'ethers';
 import {
   createFilterErrorSilencer,
+  installFilterNotFoundConsoleSuppressor,
   formatProviderError,
   type FilterErrorSilencer,
 } from './filter-error-silencer.js';
@@ -445,6 +446,16 @@ export class EVMChainAdapter implements ChainAdapter {
     this.filterErrorSilencer = createFilterErrorSilencer({
       log: (msg) => console.warn(`${msg} (${providerContext})`),
     });
+    // BUG-022: ethers v6 swallows `eth_getFilterChanges` "filter not
+    // found" errors with a literal `console.log("@TODO", error)` from
+    // subscriber-filterid.js — that path bypasses
+    // `provider.on('error', ...)` entirely, so the per-provider
+    // silencer above never gets a chance to suppress them. Install a
+    // process-wide `console.log` interceptor (idempotent) that catches
+    // exactly that two-arg shape and routes it through a dedicated
+    // silencer with the same dedup window. Real `console.log` calls
+    // are forwarded untouched.
+    installFilterNotFoundConsoleSuppressor();
     const providerErrorHandler = (err: unknown) => {
       if (this.filterErrorSilencer.handle(err)) return;
       // Non-filter provider errors fall through to the error

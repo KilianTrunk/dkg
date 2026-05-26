@@ -202,12 +202,11 @@ function probeHostForApiHost(apiHost: string | undefined): string {
  * Returns a `stop()` function the supervisor must call when the child
  * exits (cleanly or via SIGKILL). Returns a no-op if:
  *   - The env gate is disabled (`DKG_SUPERVISOR_LIVENESS_PROBE=off`).
- *   - The worker's api.port file doesn't appear within ~10s (e.g. headless
- *     workers that don't bind an HTTP listener — benchmarks, tests).
  *
  * Wraps the apiPort-read in a polling loop because the worker writes the
- * port file midway through boot, AFTER spawn returns. The first probe
- * therefore has to wait for the file to exist.
+ * port file midway through boot, AFTER spawn returns. The loop stays alive
+ * until the supervisor stops it; slow boots must still get liveness
+ * protection once their HTTP listener is ready.
  */
 async function maybeStartSupervisorLivenessWatcher(
   child: { kill(signal: 'SIGKILL'): boolean },
@@ -216,14 +215,13 @@ async function maybeStartSupervisorLivenessWatcher(
     return () => {};
   }
 
-  // Defer-start: wait up to 10s for the worker to write api.port. If it
-  // never appears, the worker is headless (no HTTP listener) and we skip
-  // the probe entirely rather than false-positive every tick.
+  // Defer-start: keep waiting for the worker to write api.port. Some normal
+  // boots do heavy initialization before binding HTTP; a fixed cutoff would
+  // permanently disable the watchdog for those processes.
   let cancelled = false;
   let watcher: { stop(): void } | null = null;
   void (async () => {
-    const startedAt = Date.now();
-    while (!cancelled && Date.now() - startedAt < 10_000) {
+    while (!cancelled) {
       const port = await readApiPort().catch(() => null);
       if (port) {
         if (cancelled) return;

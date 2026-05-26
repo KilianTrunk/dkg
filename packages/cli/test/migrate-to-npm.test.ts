@@ -240,7 +240,7 @@ describe('buildMigrationPlan — orphan-home blocker', () => {
       daemonAlive: false,
       forceAliveBypass: true,
       currentAutoUpdateSource: 'git',
-      exists: existsOf([`${REPO}/package.json`, '/home/op/.dkg-dev/config.json']),
+      exists: existsOf([`${REPO}/package.json`, '/home/op/.dkg-dev/daemon.pid']),
     });
     expect(plan.blockers.find((b) => b.includes('state-directory orphan'))).toBeDefined();
     expect(plan.blockers[0]).toMatch(/mv \/home\/op\/\.dkg-dev \/home\/op\/\.dkg/);

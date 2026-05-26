@@ -184,8 +184,9 @@ const SOURCE_TREE_ARTIFACTS_COSMETIC: ReadonlyArray<{
 const DKG_HOME_STATE_MARKERS = [
   'config.json',
   'config.yaml',
-  'pid',
+  'daemon.pid',
   'api.port',
+  'auth.token',
   'data',
   'releases',
 ] as const;

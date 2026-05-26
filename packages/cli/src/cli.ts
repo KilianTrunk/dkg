@@ -6,7 +6,7 @@ import { createInterface } from 'node:readline';
 import { spawn, execSync } from 'node:child_process';
 import { createReadStream } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import { readFile, writeFile, unlink } from 'node:fs/promises';
 import { ethers } from 'ethers';
@@ -3918,6 +3918,16 @@ async function readAutoUpdateSourceFromHome(
   }
 }
 
+function findDkgRepoRootFromCwd(startDir: string): string | null {
+  let cur = startDir;
+  for (;;) {
+    if (isDkgMonorepoRoot(cur)) return cur;
+    const parent = dirname(cur);
+    if (parent === cur) return null;
+    cur = parent;
+  }
+}
+
 // ─── dkg migrate-to-npm ──────────────────────────────────────────────
 
 program
@@ -3929,7 +3939,7 @@ program
     const quoteForShell = (value: string) => `'${value.replace(/'/g, "'\\''")}'`;
     const { buildMigrationPlan, applyPlan, renderPlan } = await import('./migrate-to-npm.js');
     const detectedRepoRoot = repoDir();
-    const repoRoot = detectedRepoRoot ?? process.cwd();
+    const repoRoot = detectedRepoRoot ?? findDkgRepoRootFromCwd(process.cwd()) ?? process.cwd();
     if (!detectedRepoRoot) {
       console.log('No active git-checkout marker detected at this location (repoDir() === null).');
       console.log(`Continuing from ${repoRoot} so a partial migration can still repair config pins.`);

@@ -42,18 +42,18 @@ touch a daemon whose PID file it does not own, and runs against an isolated
 
 ```sh
 # One-time, against the repro DKG_HOME:
-DKG_HOME=/Users/aleatoric/dev/dkg-graphify/.dkg-repro \
+DKG_HOME=$DKG_HOME \
 DKG_API_PORT=54293 \
 dkg init
 
 # Single-cell run (defaults: N=5, M=1000, restart=clean, pause=0ms):
-DKG_HOME=/Users/aleatoric/dev/dkg-graphify/.dkg-repro \
+DKG_HOME=$DKG_HOME \
 DKG_API_PORT=54293 \
 node scripts/repro/wm-persistence-regression.mjs \
   --num-assertions=50 --quads-per-assertion=20000 --restart-mode=kill
 
 # Full matrix (clean × kill × small/medium/large × pause-0/pause-30s):
-DKG_HOME=/Users/aleatoric/dev/dkg-graphify/.dkg-repro \
+DKG_HOME=$DKG_HOME \
 DKG_API_PORT=54293 \
 node scripts/repro/wm-persistence-regression.mjs --matrix
 ```

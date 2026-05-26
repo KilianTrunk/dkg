@@ -7,9 +7,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 EXPERIMENT_DIR="$(dirname "$SCRIPT_DIR")"
-DKG_ROOT="/Users/aleatoric/dev/dkg-v9"
+DKG_ROOT="${DKG_ROOT:-$(cd "$EXPERIMENT_DIR/../../.." && pwd)}"
 RESULTS_DIR="$EXPERIMENT_DIR/results/exp-b"
-OPENCLAW_DIR="${OPENCLAW_DIR:-/Users/aleatoric/dev/openclaw}"
+OPENCLAW_DIR="${OPENCLAW_DIR:-$HOME/dev/openclaw}"
 
 if [[ ! -d "$OPENCLAW_DIR" ]]; then
   echo "Error: OpenClaw not found at $OPENCLAW_DIR"

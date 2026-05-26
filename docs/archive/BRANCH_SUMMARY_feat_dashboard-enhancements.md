@@ -95,7 +95,7 @@ Adds **Node UI dashboard improvements**: peer online/offline and transport (dire
 ## How to merge (when ready)
 
 ```bash
-cd /Users/aleatoric/dev/dkg-v9
+cd $DKG_ROOT
 
 # Optional: do this on a clean tree (commit or stash your work first)
 git status

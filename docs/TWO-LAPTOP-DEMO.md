@@ -48,7 +48,7 @@ Click **Create Project**. The modal walks through:
 
 In the Wire workspace step:
 
-- **Workspace path:** e.g. `/Users/<you>/code/tic-tac-toe` (or whatever absolute path you want; the daemon creates the directory if it doesn't exist)
+- **Workspace path:** e.g. `$WORKSPACE` (or whatever absolute path you want; the daemon creates the directory if it doesn't exist)
 - **Agent slug for this machine:** something descriptive, e.g. `cursor-alice-laptop1`
 - **Skip Claude Code wiring:** leave checked unless you actually use Claude Code
 
@@ -57,11 +57,11 @@ Click **Preview install**. The modal shows the markdown diff: which files will b
 You should see something like:
 
 ```
-created   /Users/alice/code/tic-tac-toe/.cursor/rules/dkg-annotate.mdc (4,210 bytes)
-created   /Users/alice/code/tic-tac-toe/.cursor/hooks.json (590 bytes)
-created   /Users/alice/code/tic-tac-toe/.cursor/mcp.json (310 bytes)
-created   /Users/alice/code/tic-tac-toe/.dkg/config.yaml (290 bytes)
-created   /Users/alice/code/tic-tac-toe/AGENTS.md (12,400 bytes)
+created   $WORKSPACE/.cursor/rules/dkg-annotate.mdc (4,210 bytes)
+created   $WORKSPACE/.cursor/hooks.json (590 bytes)
+created   $WORKSPACE/.cursor/mcp.json (310 bytes)
+created   $WORKSPACE/.dkg/config.yaml (290 bytes)
+created   $WORKSPACE/AGENTS.md (12,400 bytes)
 ```
 
 Click **Done**. The modal closes and Laptop A's UI shows the new project tab.
@@ -73,7 +73,7 @@ Click **Done**. The modal closes and Laptop A's UI shows the new project tab.
 Open the wired workspace in Cursor:
 
 ```bash
-cursor /Users/alice/code/tic-tac-toe
+cursor $WORKSPACE
 ```
 
 Start a new chat and prompt:
@@ -111,7 +111,7 @@ In Laptop B's Node UI, click **+ Join Project** and paste the invite code. The m
 
 In the Wire workspace step:
 
-- **Workspace path:** e.g. `/Users/<you>/code/tic-tac-toe` (a fresh local path on this machine)
+- **Workspace path:** e.g. `$WORKSPACE` (a fresh local path on this machine)
 - **Agent slug:** something distinct from Laptop A, e.g. `cursor-bob-laptop2`
 - **Skip Claude Code:** as before
 

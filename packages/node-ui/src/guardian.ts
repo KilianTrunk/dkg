@@ -469,7 +469,7 @@ export function buildPrivateAuditQuads(
   findings: GuardianFindingRecord[],
   contextGraphId = 'guardian-local-audit',
 ): Array<{ subject: string; predicate: string; object: string; graph: string }> {
-  const graph = `did:dkg:context-graph:${contextGraphId}/audit`;
+  const graph = `did:dkg:context-graph:${contextGraphId}`;
   const eventUri = `urn:guardian:event:${event.id}`;
   const quads = [
     q(eventUri, 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type', 'http://umanitek.ai/ontology/guardian/Event', graph),
@@ -498,7 +498,7 @@ export function buildPublicDependencyQuads(
   intel: GuardianDependencyIntelRecord,
   contextGraphId = 'guardian-vulnerability-intel',
 ): Array<{ subject: string; predicate: string; object: string; graph: string }> {
-  const graph = `did:dkg:context-graph:${contextGraphId}/vulnerabilities`;
+  const graph = `did:dkg:context-graph:${contextGraphId}`;
   const pkgUri = `urn:guardian:package:${slug(intel.ecosystem)}:${slug(intel.package_name)}:${slug(intel.package_version)}`;
   const advisoryUri = `urn:guardian:advisory:${slug(intel.advisory_id)}`;
   const cves = parseStringArray(intel.cve_ids_json);

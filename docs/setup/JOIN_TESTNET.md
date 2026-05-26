@@ -87,7 +87,7 @@ ContextGraphs to subscribe? (comma-separated):
 API port? (9200):
 Enable auto-update from GitHub? (y/n) (y):
 
-Config saved to /Users/you/.dkg/config.json
+Config saved to $DKG_HOME/config.json
   name:       alice-mini
   role:       edge
   relay:      /ip4/167.71.33.105/tcp/9090/p2p/12D3KooWPXP5m...
@@ -502,7 +502,7 @@ Create `~/Library/LaunchAgents/com.dkg.node.plist`:
     <key>ProgramArguments</key>
     <array>
         <string>/usr/local/bin/node</string>
-        <string>/Users/YOU/dkg-v9/packages/cli/dist/cli.js</string>
+        <string>$DKG_ROOT/packages/cli/dist/cli.js</string>
         <string>start</string>
         <string>-f</string>
     </array>
@@ -511,9 +511,9 @@ Create `~/Library/LaunchAgents/com.dkg.node.plist`:
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>/Users/YOU/.dkg/launchd-stdout.log</string>
+    <string>$DKG_HOME/launchd-stdout.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/YOU/.dkg/launchd-stderr.log</string>
+    <string>$DKG_HOME/launchd-stderr.log</string>
 </dict>
 </plist>
 ```

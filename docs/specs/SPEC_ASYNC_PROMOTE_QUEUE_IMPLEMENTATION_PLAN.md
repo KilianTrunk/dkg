@@ -425,7 +425,7 @@ not blocked on a separate spec update.
 ## 11. Empirical exit criterion
 
 Re-run the rc.10 Graphify import (see
-[`/Users/aleatoric/dev/dkg-graphify-rc10-test/FINDINGS_v2.md`](file:///Users/aleatoric/dev/dkg-graphify-rc10-test/FINDINGS_v2.md))
+`FINDINGS_v2.md`)
 against a daemon with the queue enabled and demonstrate:
 
 - All 17 partitions promote without manual halve-and-retry (no

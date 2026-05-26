@@ -10,7 +10,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 EXPERIMENT_DIR="$(dirname "$SCRIPT_DIR")"
 RESULTS_DIR="$EXPERIMENT_DIR/results/exp-c1"
-OPENCLAW_DIR="${OPENCLAW_DIR:-/Users/aleatoric/dev/openclaw}"
+OPENCLAW_DIR="${OPENCLAW_DIR:-$HOME/dev/openclaw}"
 CLAUDE_RUN="$SCRIPT_DIR/claude-run.mjs"
 WORKSPACE_LOG_TOOL="$SCRIPT_DIR/collab-workspace-log.py"
 

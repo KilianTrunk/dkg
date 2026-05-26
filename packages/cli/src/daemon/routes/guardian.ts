@@ -295,8 +295,9 @@ async function publishPublicDependencyIntel(ctx: RequestContext, intel: Guardian
     }));
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
+    const missingPublishIdentity = /cannot be registered on-chain without an address-scoped curator|configure a default agent address|insufficient funds|insufficient balance|not enough funds/i.test(message);
     ctx.dashDb.updateGuardianDependencyPublish(intel.id, {
-      publish_status: 'failed',
+      publish_status: missingPublishIdentity ? 'skipped' : 'failed',
       publish_error: sanitizeText(message, 1000),
       public_graph_id: contextGraphId,
     });
@@ -304,7 +305,7 @@ async function publishPublicDependencyIntel(ctx: RequestContext, intel: Guardian
       id: 'guardian-public-vulnerability-intel',
       scope: 'public',
       contextGraphId,
-      status: 'failed',
+      status: missingPublishIdentity ? 'skipped' : 'failed',
       error: message,
       details: { advisoryId: intel.advisory_id, package: intel.package_name },
     }));

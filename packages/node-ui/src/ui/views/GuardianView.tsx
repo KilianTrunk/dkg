@@ -28,6 +28,7 @@ import {
 } from '../api.js';
 
 const SEVERITY_ORDER: GuardianSeverity[] = ['critical', 'high', 'medium', 'low', 'info'];
+type JsonRecord = Record<string, unknown>;
 
 function severityClass(severity: string): string {
   return `guardian-severity-${severity || 'info'}`;
@@ -49,6 +50,102 @@ function parseJsonArray(value: string): string[] {
   } catch {
     return [];
   }
+}
+
+function parseJsonRecord(value: string | null | undefined): JsonRecord {
+  if (!value) return {};
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as JsonRecord : {};
+  } catch {
+    return {};
+  }
+}
+
+function displayText(value: unknown, maxLength = 260): string {
+  if (value == null) return '';
+  const raw = typeof value === 'string' ? value : JSON.stringify(value);
+  const homeSafe = raw
+    .replace(/\/Users\/[^/\s"']+/g, '~')
+    .replace(/\/home\/[^/\s"']+/g, '~');
+  return homeSafe.length > maxLength ? `${homeSafe.slice(0, maxLength)}...` : homeSafe;
+}
+
+function recordAt(value: unknown, key: string): unknown {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as JsonRecord)[key]
+    : undefined;
+}
+
+function rawEventData(event: GuardianEvent): JsonRecord {
+  const raw = parseJsonRecord(event.raw_json);
+  const data = raw.data;
+  return data && typeof data === 'object' && !Array.isArray(data) ? data as JsonRecord : {};
+}
+
+function eventInstanceLabel(event: GuardianEvent): string {
+  const raw = parseJsonRecord(event.raw_json);
+  const source = raw.sourceAgent;
+  const instance = recordAt(source, 'instanceId');
+  return typeof instance === 'string' && instance.trim()
+    ? displayText(instance, 120)
+    : displayText(event.source_agent, 120);
+}
+
+function commandFromEvent(event: GuardianEvent): string {
+  const data = rawEventData(event);
+  for (const key of ['command', 'cmd', 'shell', 'input']) {
+    const value = data[key];
+    if (typeof value === 'string' && value.trim()) return displayText(value, 900);
+  }
+  const args = data.args;
+  for (const key of ['command', 'cmd']) {
+    const value = recordAt(args, key);
+    if (typeof value === 'string' && value.trim()) return displayText(value, 900);
+  }
+  return '';
+}
+
+function promptFromEvent(event: GuardianEvent): string {
+  const data = rawEventData(event);
+  const direct = data.prompt ?? data.input ?? data.user_message ?? data.userMessage ?? data.assistantSample;
+  if (typeof direct === 'string' && direct.trim()) return displayText(direct, 900);
+  const messages = data.messages ?? data.requestMessages;
+  if (Array.isArray(messages)) {
+    const text = messages
+      .map((item) => {
+        const role = recordAt(item, 'role');
+        const content = recordAt(item, 'content') ?? recordAt(item, 'text');
+        return typeof content === 'string' ? `${typeof role === 'string' ? role : 'message'}: ${content}` : '';
+      })
+      .filter(Boolean)
+      .join('\n');
+    if (text) return displayText(text, 900);
+  }
+  return '';
+}
+
+function evidenceFromFinding(finding: GuardianFinding): JsonRecord {
+  return parseJsonRecord(finding.evidence_json);
+}
+
+function findingAction(finding: GuardianFinding, event?: GuardianEvent): string {
+  const evidence = evidenceFromFinding(finding);
+  const command = displayText(evidence.command, 900) || (event ? commandFromEvent(event) : '');
+  if (command) return command;
+  const sample = displayText(evidence.sample, 900);
+  if (sample) return sample;
+  const path = displayText(evidence.path, 300);
+  if (path) return path;
+  return event ? (promptFromEvent(event) || displayText(event.summary, 300)) : '';
+}
+
+function publishDisplay(status: GuardianDependencyIntel['publish_status'] | GuardianGraphSync['status'], error?: string | null) {
+  const blocked = Boolean(error && /insufficient funds|funds|balance|cannot be registered|default agent address|curator/i.test(error));
+  if (status === 'published' || status === 'synced') return { label: 'synced', className: 'published', title: 'Stored and published to the configured graph.' };
+  if (status === 'pending') return { label: 'pending', className: 'pending', title: 'Waiting to publish.' };
+  if (status === 'skipped' || blocked) return { label: 'local only', className: 'skipped', title: error ? displayText(error, 500) : 'Stored locally; public publishing is not configured for this node.' };
+  return { label: 'failed', className: 'failed', title: error ? displayText(error, 500) : 'Publish failed.' };
 }
 
 function StatTile({
@@ -77,8 +174,9 @@ function StatTile({
 }
 
 function GraphStatus({ graph }: { graph: GuardianGraphSync }) {
+  const status = publishDisplay(graph.status, graph.last_error);
   return (
-    <div className={`guardian-graph-row guardian-graph-${graph.status}`}>
+    <div className={`guardian-graph-row guardian-graph-${status.className}`} title={status.title}>
       <div className="guardian-graph-icon">
         {graph.scope === 'public' ? <Globe2 size={16} /> : <KeyRound size={16} />}
       </div>
@@ -86,12 +184,14 @@ function GraphStatus({ graph }: { graph: GuardianGraphSync }) {
         <span>{graph.context_graph_id}</span>
         <small>{graph.scope} graph</small>
       </div>
-      <span className="guardian-graph-status">{graph.status}</span>
+      <span className="guardian-graph-status">{status.label}</span>
     </div>
   );
 }
 
 function EventRow({ event }: { event: GuardianEvent }) {
+  const command = commandFromEvent(event);
+  const prompt = promptFromEvent(event);
   return (
     <div className="guardian-event-row">
       <div className={`guardian-severity-dot ${severityClass(event.severity)}`} />
@@ -99,16 +199,25 @@ function EventRow({ event }: { event: GuardianEvent }) {
         <div className="guardian-row-title">{event.title}</div>
         <div className="guardian-row-meta">
           <span>{event.agent_framework}</span>
+          <span>{eventInstanceLabel(event)}</span>
           <span>{event.tool_name || event.event_type}</span>
           <span>{timeAgo(event.ts)}</span>
         </div>
+        {(command || prompt) && (
+          <details className="guardian-event-detail">
+            <summary>{command ? 'Command' : 'Prompt / context'}</summary>
+            <pre>{command || prompt}</pre>
+          </details>
+        )}
       </div>
       <span className={`guardian-pill ${severityClass(event.severity)}`}>{event.severity}</span>
     </div>
   );
 }
 
-function FindingRow({ finding }: { finding: GuardianFinding }) {
+function FindingRow({ finding, event }: { finding: GuardianFinding; event?: GuardianEvent }) {
+  const action = findingAction(finding, event);
+  const evidence = evidenceFromFinding(finding);
   return (
     <div className="guardian-finding-row">
       <div className="guardian-finding-head">
@@ -116,8 +225,26 @@ function FindingRow({ finding }: { finding: GuardianFinding }) {
         <span className="guardian-finding-type">{finding.type.replace(/_/g, ' ')}</span>
       </div>
       <div className="guardian-finding-title">{finding.title}</div>
-      <p>{finding.summary}</p>
+      <div className="guardian-row-meta guardian-finding-source">
+        <span>{event?.agent_framework ?? 'unknown agent'}</span>
+        {event ? <span>{eventInstanceLabel(event)}</span> : null}
+        <span>{event?.tool_name || event?.event_type || 'event unavailable'}</span>
+        <span>{timeAgo(finding.ts)}</span>
+      </div>
+      <p>{displayText(finding.summary, 700)}</p>
+      {action && (
+        <div className="guardian-evidence">
+          <span>{finding.type === 'prompt_injection' ? 'Observed prompt/context' : finding.type === 'dependency_install' ? 'Observed command' : 'Observed evidence'}</span>
+          <pre>{action}</pre>
+        </div>
+      )}
       <div className="guardian-finding-rec">{finding.recommendation}</div>
+      {Object.keys(evidence).length > 0 && (
+        <details className="guardian-event-detail">
+          <summary>Structured evidence</summary>
+          <pre>{displayText(evidence, 1200)}</pre>
+        </details>
+      )}
     </div>
   );
 }
@@ -125,6 +252,7 @@ function FindingRow({ finding }: { finding: GuardianFinding }) {
 function DependencyRow({ intel }: { intel: GuardianDependencyIntel }) {
   const cves = parseJsonArray(intel.cve_ids_json);
   const fixed = parseJsonArray(intel.fixed_versions_json);
+  const status = publishDisplay(intel.publish_status, intel.publish_error);
   return (
     <div className="guardian-dep-row">
       <div className="guardian-dep-package">
@@ -143,7 +271,7 @@ function DependencyRow({ intel }: { intel: GuardianDependencyIntel }) {
         {intel.epss_score != null ? <span>EPSS {(intel.epss_score * 100).toFixed(1)}%</span> : <span>EPSS pending</span>}
         {fixed.length > 0 ? <span>fix {fixed.slice(0, 2).join(', ')}</span> : <span>fix unknown</span>}
       </div>
-      <span className={`guardian-publish guardian-publish-${intel.publish_status}`}>{intel.publish_status}</span>
+      <span className={`guardian-publish guardian-publish-${status.className}`} title={status.title}>{status.label}</span>
     </div>
   );
 }
@@ -204,7 +332,7 @@ export function GuardianView() {
     try {
       const [summaryRes, eventsRes, findingsRes] = await Promise.all([
         fetchGuardianSummary(),
-        fetchGuardianEvents({ limit: 50 }),
+        fetchGuardianEvents({ limit: 100 }),
         fetchGuardianFindings({ status: 'open', limit: 50 }),
       ]);
       setSummary(summaryRes.summary);
@@ -243,6 +371,12 @@ export function GuardianView() {
     return SEVERITY_ORDER.find((severity) => by[severity] > 0) ?? 'info';
   }, [summary]);
 
+  const eventById = useMemo(() => {
+    const map = new Map<string, GuardianEvent>();
+    for (const event of events) map.set(event.id, event);
+    return map;
+  }, [events]);
+
   if (loading) {
     return (
       <div className="guardian-view">
@@ -269,9 +403,12 @@ export function GuardianView() {
             disabled={auditBusy}
             onClick={async () => {
               setAuditBusy(true);
+              setError(null);
               try {
                 await runGuardianDependencyAudit();
                 await load(true);
+              } catch (err) {
+                setError(err instanceof Error ? `Dependency audit failed: ${err.message}` : `Dependency audit failed: ${String(err)}`);
               } finally {
                 setAuditBusy(false);
               }
@@ -302,11 +439,11 @@ export function GuardianView() {
         <StatTile label="Open Findings" value={summary?.totals.openFindings ?? 0} detail={`${summary?.totals.criticalFindings ?? 0} critical`} icon={<AlertTriangle size={18} />} tone={topSeverity === 'critical' || topSeverity === 'high' ? 'danger' : 'neutral'} />
         <StatTile label="Agent Events" value={summary?.totals.events ?? 0} detail="Hermes and OpenClaw" icon={<Bot size={18} />} />
         <StatTile label="Sensitive Access" value={summary?.totals.sensitivePathFindings ?? 0} detail="outside normal workspace" icon={<FileWarning size={18} />} tone={(summary?.totals.sensitivePathFindings ?? 0) > 0 ? 'warn' : 'good'} />
-        <StatTile label="Dependency Intel" value={summary?.totals.vulnerableDependencies ?? 0} detail="public-safe graph facts" icon={<DatabaseZap size={18} />} />
+        <StatTile label="Dependency Intel" value={summary?.totals.vulnerableDependencies ?? 0} detail="OSV, EPSS, KEV facts" icon={<DatabaseZap size={18} />} />
       </section>
 
       <section className="guardian-grid">
-        <div className="guardian-panel guardian-panel-wide">
+        <div className="guardian-panel guardian-panel-findings">
           <div className="guardian-panel-head">
             <h2>Findings</h2>
             <span>{findings.length} open</span>
@@ -315,12 +452,12 @@ export function GuardianView() {
             <div className="guardian-empty"><CheckCircle2 size={18} /> No open findings.</div>
           ) : (
             <div className="guardian-list">
-              {findings.map((finding) => <FindingRow key={finding.id} finding={finding} />)}
+              {findings.map((finding) => <FindingRow key={finding.id} finding={finding} event={finding.event_id ? eventById.get(finding.event_id) : undefined} />)}
             </div>
           )}
         </div>
 
-        <div className="guardian-panel">
+        <div className="guardian-panel guardian-panel-agents">
           <div className="guardian-panel-head">
             <h2>Protected Agents</h2>
           </div>
@@ -337,7 +474,7 @@ export function GuardianView() {
           </div>
         </div>
 
-        <div className="guardian-panel">
+        <div className="guardian-panel guardian-panel-graphs">
           <div className="guardian-panel-head">
             <h2>Graphs</h2>
           </div>
@@ -350,7 +487,7 @@ export function GuardianView() {
           )}
         </div>
 
-        <div className="guardian-panel guardian-panel-wide">
+        <div className="guardian-panel guardian-panel-events">
           <div className="guardian-panel-head">
             <h2>Live Audit</h2>
             <span>{events.length} recent</span>
@@ -364,7 +501,7 @@ export function GuardianView() {
           )}
         </div>
 
-        <div className="guardian-panel guardian-panel-wide">
+        <div className="guardian-panel guardian-panel-deps">
           <div className="guardian-panel-head">
             <h2>Dependency Intelligence</h2>
             <span>{dependencyIntel.length} advisories</span>

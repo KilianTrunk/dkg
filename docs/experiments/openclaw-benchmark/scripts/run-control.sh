@@ -7,7 +7,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 EXPERIMENT_DIR="$(dirname "$SCRIPT_DIR")"
 RESULTS_DIR="$EXPERIMENT_DIR/results/control"
-OPENCLAW_DIR="${OPENCLAW_DIR:-/Users/aleatoric/dev/openclaw}"
+OPENCLAW_DIR="${OPENCLAW_DIR:-$HOME/dev/openclaw}"
 CLAUDE_RUN="$SCRIPT_DIR/claude-run.mjs"
 
 if [[ ! -d "$OPENCLAW_DIR" ]]; then

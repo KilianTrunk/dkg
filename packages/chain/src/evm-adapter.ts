@@ -2544,7 +2544,9 @@ export class EVMChainAdapter implements ChainAdapter {
     const identityStorage = await this.resolveContract('IdentityStorage');
     if (!identityStorage) return false;
 
-    // Match on-chain verification: keyHasPurpose(identityId, keccak256(signer), OPERATIONAL_KEY)
+    // Gate 1: signer must be registered as an operational key for the claimed
+    // identity. Mirrors the on-chain `keyHasPurpose(id, keccak256(signer),
+    // OPERATIONAL_KEY)` check inside `KnowledgeAssetsV10._verifyACKSignature`.
     const keyHash = ethers.keccak256(ethers.solidityPacked(['address'], [recoveredAddress]));
     const hasPurpose: boolean = await identityStorage.keyHasPurpose(
       claimedIdentityId,
@@ -2553,36 +2555,21 @@ export class EVMChainAdapter implements ChainAdapter {
     );
     if (!hasPurpose) return false;
 
-    // Verify the identity is a staked core node (spec §9.0: "Core nodes MUST be staked").
-    // v4.0.0 — read V10 canonical stake (`ConvictionStakingStorage.getNodeStakeV10`)
-    // instead of the V8 `StakingStorage.getNodeStake` archive: under mandatory
-    // migration the V8 `nodeStake` field is unmaintained for V10 nodes and
-    // would zero-gate every legitimate V10 ACK signer (this exactly mirrors
-    // the on-chain `KnowledgeAssetsV10` ACK-signer gate, also rewired in
-    // v4.0.0). Falls back to V8 if CSS is not registered (older deploys).
-    let cs: Contract | null = null;
-    try {
-      cs = await this.resolveContract('ConvictionStakingStorage');
-    } catch {
-      cs = null;
-    }
-    if (cs) {
-      const stake: bigint = await cs.getNodeStakeV10(claimedIdentityId);
-      if (stake === 0n) return false;
-      return true;
-    }
-
-    let ss: Contract | null = null;
-    try {
-      ss = await this.resolveContract('StakingStorage');
-    } catch {
-      ss = null;
-    }
-    if (!ss) return false;
-    const v8Stake: bigint = await ss.getNodeStake(claimedIdentityId);
-    if (v8Stake === 0n) return false;
-
-    return true;
+    // Gate 2: identity must be in the active sharding table.
+    //
+    // RFC-001 rewired the on-chain ACK signer gate from `getNodeStakeV10 > 0`
+    // to `shardingTableStorage.nodeExists(identityId)` (see
+    // `KnowledgeAssetsV10._verifyACKSignature`: "ACK signers must be in the
+    // active sharding table, not merely staked"). The off-chain pre-flight
+    // here exists to spare a doomed on-chain submission gas — so it MUST
+    // mirror the on-chain check exactly. Pre-RFC-001 versions of this method
+    // gated on positive V10 stake, which let sub-`minimumStake` operators
+    // pass off-chain but reverted on-chain with `ACK signer not in sharding
+    // table`. ST membership is updated atomically by `StakingV10` whenever a
+    // node's V10 stake crosses `minimumStake` up or down.
+    const shardingTableStorage = await this.resolveContract('ShardingTableStorage');
+    if (!shardingTableStorage) return false;
+    return Boolean(await shardingTableStorage.nodeExists(claimedIdentityId));
   }
 
   async verifySyncIdentity(recoveredAddress: string, claimedIdentityId: bigint): Promise<boolean> {

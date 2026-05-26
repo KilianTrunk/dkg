@@ -61,6 +61,14 @@ describe('isFilterNotFoundError', () => {
       info: { error: { code: -32602, message: 'invalid params: from must be hex' } },
     });
     expect(isFilterNotFoundError(err)).toBe(false);
+    const invalidFilter = Object.assign(new Error('rpc failure'), {
+      info: { error: { code: -32602, message: 'invalid filter object' } },
+    });
+    expect(isFilterNotFoundError(invalidFilter)).toBe(false);
+    const unsupportedFilter = Object.assign(new Error('rpc failure'), {
+      info: { error: { code: -32000, message: 'filter type not supported' } },
+    });
+    expect(isFilterNotFoundError(unsupportedFilter)).toBe(false);
     const serverErr = Object.assign(new Error('rpc failure'), {
       info: { error: { code: -32000, message: 'rate limited' } },
     });

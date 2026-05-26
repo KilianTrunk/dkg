@@ -98,7 +98,7 @@ describe('publishJsonLd', () => {
       '@type': 'Person',
       'name': 'Alice',
     });
-    expect(result.status).toBe('tentative');
+    expect(result.status).toBe('confirmed');
 
     const publicResult = await store.query(
       `ASK { GRAPH <did:dkg:context-graph:bare-priv> { ?s ?p ?o } }`,
@@ -180,7 +180,7 @@ describe('publishJsonLd', () => {
         'name': 'Top Secret',
       },
     });
-    expect(result.status).toBe('tentative');
+    expect(result.status).toBe('confirmed');
 
     const anchorResult = await store.query(
       `ASK { GRAPH <did:dkg:context-graph:priv-only> { ?s ?p ?o } }`,

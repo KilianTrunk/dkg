@@ -107,9 +107,12 @@ const MOCK_EXEMPT_FROM_EVM = new Set<string>([
   'translateRandomSamplingError',
   'toNodeChallenge',
   // Hub-rotation handling — adapter-internal plumbing that backs the
-  // self-refreshing RS resolution. The mock has no Hub, so no live
-  // rotation surface to mirror.
+  // self-refreshing RS resolution and the generic boot-bound contract
+  // self-refresh (rc.12 PR `feat/chain-hub-rotation-auto-recovery`).
+  // The mock has no Hub, so no live rotation surface to mirror.
   'withHubStaleRetry',
+  'withHubStaleRetryAny',
+  'invalidateAllBoundContracts',
   'startHubRotationListener',
   'invalidateRandomSamplingPair',
   'resolveAndAssignRandomSamplingPair',

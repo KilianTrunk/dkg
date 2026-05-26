@@ -15,6 +15,16 @@ describe('cg-name validation (BUG-016)', () => {
       expect(sanitiseCgName('<img src=x onerror=foo() />')).toBe('');
     });
 
+    it('survives the classic incomplete-sanitisation obfuscation (CodeQL js/incomplete-multi-character-sanitization)', () => {
+      // A naive single-pass `replace(HTML_TAG_RE, '')` collapses this
+      // to `<script>` because the inner tag is removed and the outer
+      // `<scr` + `ipt>` reunites. The fixed-point loop must keep
+      // chewing until no tags remain.
+      expect(sanitiseCgName('<scr<script>ipt>alert(1)</scr</script>ipt>')).not.toMatch(/<script/i);
+      expect(sanitiseCgName('<scr<script>ipt>alert(1)</scr</script>ipt>')).not.toContain('<');
+      expect(sanitiseCgName('<scr<script>ipt>alert(1)</scr</script>ipt>')).not.toContain('>');
+    });
+
     it('strips lonely `<` and `>` characters', () => {
       expect(sanitiseCgName('Project >>> Beta')).toBe('Project Beta');
       expect(sanitiseCgName('< not a tag >')).toBe('not a tag');

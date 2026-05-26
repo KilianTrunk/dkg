@@ -40,8 +40,18 @@ const NON_WHITESPACE_CONTROL_CHARS_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F
 export function sanitiseCgName(input: string): string {
   if (typeof input !== 'string') return '';
   let v = input;
-  v = v.replace(HTML_TAG_RE, '');
-  v = v.replace(/<|>/g, '');
+  // CWE-20 / "incomplete multi-character sanitization": a single pass
+  // of `HTML_TAG_RE` is unsafe because a crafted input like
+  // `<scr<script>ipt>` collapses *to* `<script>` after one pass.
+  // Iterate to a fixed point so any residue is also stripped, then
+  // strip any leftover bare `<`/`>` defensively. CG names have no
+  // legitimate use for angle brackets.
+  let prev: string;
+  do {
+    prev = v;
+    v = v.replace(HTML_TAG_RE, '');
+  } while (v !== prev);
+  v = v.replace(/[<>]/g, '');
   v = v.replace(NON_WHITESPACE_CONTROL_CHARS_RE, '');
   v = v.replace(/\s+/g, ' ');
   v = v.trim();

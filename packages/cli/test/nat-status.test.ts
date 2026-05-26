@@ -94,12 +94,15 @@ describe('startNatStatusWatcher — transition-only callback semantics', () => {
     _setNatStatusForTest('unknown');
   });
 
-  it('fires onClassification on the initial pass when addrs already populated', () => {
+  it('keeps the initial populated snapshot non-definitive until an event fires', () => {
     const node = makeFakeNode(['/ip4/8.8.8.8/tcp/4001']);
     const onClass = vi.fn();
     const w = startNatStatusWatcher({ node, onClassification: onClass, softTimeoutMs: 0 });
+    expect(onClass).toHaveBeenCalledTimes(0);
+    expect(getNatStatus()).toBe('unknown');
+    node.emit();
     expect(onClass).toHaveBeenCalledTimes(1);
-    expect(onClass).toHaveBeenCalledWith('public', 'unknown');
+    expect(onClass).toHaveBeenLastCalledWith('public', 'unknown');
     expect(getNatStatus()).toBe('public');
     w.stop();
   });
@@ -108,6 +111,7 @@ describe('startNatStatusWatcher — transition-only callback semantics', () => {
     const node = makeFakeNode(['/ip4/8.8.8.8/tcp/4001']);
     const onClass = vi.fn();
     const w = startNatStatusWatcher({ node, onClassification: onClass, softTimeoutMs: 0 });
+    node.emit();
     expect(onClass).toHaveBeenCalledTimes(1);
     node.setAddrs(['/ip4/8.8.8.8/tcp/4001', '/ip4/1.1.1.1/tcp/4001']);
     node.emit();
@@ -119,6 +123,7 @@ describe('startNatStatusWatcher — transition-only callback semantics', () => {
     const node = makeFakeNode(['/ip4/8.8.8.8/tcp/4001']);
     const onClass = vi.fn();
     const w = startNatStatusWatcher({ node, onClassification: onClass, softTimeoutMs: 0 });
+    node.emit();
     expect(onClass).toHaveBeenLastCalledWith('public', 'unknown');
     node.setAddrs(['/ip4/192.168.1.5/tcp/4001']);
     node.emit();
@@ -158,6 +163,19 @@ describe('startNatStatusWatcher — soft-timeout', () => {
     expect(onClass).toHaveBeenCalledTimes(0);
     // Populate addrs so the soft-timeout pass has something to classify.
     node.setAddrs(['/ip4/192.168.1.5/tcp/4001']);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(onClass).toHaveBeenCalledTimes(1);
+    expect(onClass).toHaveBeenLastCalledWith('private', 'unknown');
+    w.stop();
+  });
+
+  it('does not mark private before the first event; soft timeout remains active', async () => {
+    const node = makeFakeNode(['/ip4/192.168.1.5/tcp/4001']);
+    const onClass = vi.fn();
+    const w = startNatStatusWatcher({ node, onClassification: onClass, softTimeoutMs: 1_000 });
+    expect(getNatStatus()).toBe('unknown');
+    expect(onClass).toHaveBeenCalledTimes(0);
+
     await vi.advanceTimersByTimeAsync(1_000);
     expect(onClass).toHaveBeenCalledTimes(1);
     expect(onClass).toHaveBeenLastCalledWith('private', 'unknown');
@@ -210,6 +228,7 @@ describe('startNatStatusWatcher — stop()', () => {
     const node = makeFakeNode(['/ip4/8.8.8.8/tcp/4001']);
     const onClass = vi.fn();
     const w = startNatStatusWatcher({ node, onClassification: onClass, softTimeoutMs: 0 });
+    node.emit();
     expect(onClass).toHaveBeenCalledTimes(1);
     w.stop();
     node.setAddrs(['/ip4/192.168.1.5/tcp/4001']);
@@ -220,6 +239,7 @@ describe('startNatStatusWatcher — stop()', () => {
   it('resets the cached status to unknown on stop()', () => {
     const node = makeFakeNode(['/ip4/8.8.8.8/tcp/4001']);
     const w = startNatStatusWatcher({ node, softTimeoutMs: 0 });
+    node.emit();
     expect(getNatStatus()).toBe('public');
     w.stop();
     expect(getNatStatus()).toBe('unknown');
@@ -239,6 +259,7 @@ describe('module-level cache', () => {
     expect(getNatStatus()).toBe('unknown');
     const node = makeFakeNode(['/ip4/8.8.8.8/tcp/4001']);
     const w = startNatStatusWatcher({ node, softTimeoutMs: 0 });
+    node.emit();
     expect(getNatStatus()).toBe('public');
     w.stop();
   });

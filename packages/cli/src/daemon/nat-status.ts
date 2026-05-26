@@ -244,6 +244,12 @@ export function startNatStatusWatcher(opts: StartNatWatcherOpts): { stop(): void
 
   const reclassify = (cause: 'event' | 'soft-timeout' | 'initial'): NatStatus => {
     if (stopped) return cachedNatStatus;
+    if (cause === 'initial') {
+      // The first post-start snapshot is only the bound-address baseline.
+      // AutoNAT has not necessarily updated the peer record yet, so do not
+      // turn RFC1918/CGNAT binds into a definitive private verdict here.
+      return cachedNatStatus;
+    }
     const addrs = opts.node.getMultiaddrs().map((ma) => ma.toString());
     const next = classifyAddressesForNat(addrs);
     if (next !== 'unknown') {
@@ -270,10 +276,9 @@ export function startNatStatusWatcher(opts: StartNatWatcherOpts): { stop(): void
 
   opts.node.addEventListener('self:peer:update', onEvent);
 
-  // Cover the race: libp2p may have already populated addresses by
-  // the time we attach the listener (e.g. core nodes whose listen
-  // sockets bind before we wire the watcher). Same pattern as
-  // `checkDialable` in `packages/core/src/node.ts:1346`.
+  // Capture the initial baseline without treating it as an AutoNAT verdict.
+  // A real `self:peer:update` or the soft timeout below performs the first
+  // definitive classification.
   reclassify('initial');
 
   if (softTimeoutMs > 0) {

@@ -43,9 +43,20 @@ export const daemonState: {
   standaloneCache: boolean | null;
   /** CORS allowlist, set by `runDaemonInner`, read in `handleRequest`. */
   moduleCorsAllowed: CorsAllowlist;
-  /** Whether the async promote worker is currently able to drain queued jobs. */
+  /**
+   * Whether the async-promote queue worker is currently able to drain
+   * queued jobs. Defaults to `false`; the worker supervisor (this PR)
+   * flips it to `true` on successful startup so the
+   * `/promote-async` routes can accept jobs, and back to `false` on
+   * shutdown / supervisor crash so they return `503` rather than
+   * silently queueing jobs that nothing will drain.
+   */
   promoteWorkerAvailable: boolean;
-  /** Last startup/availability error for the async promote worker, surfaced by enqueue routes. */
+  /**
+   * Last startup/availability error for the async-promote worker.
+   * Surfaced alongside the `503` when `promoteWorkerAvailable` is
+   * `false` so operators see *why* the queue is closed.
+   */
   promoteWorkerUnavailableReason: string | null;
   /** OpenClaw bridge health cache. Mutated from both `openclaw.ts`
    *  (read) and `handle-request.ts` (write after each /send round

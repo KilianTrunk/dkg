@@ -45,6 +45,9 @@ describe('promote-async daemon routes', () => {
       idGenerator: () => `job-${++idCounter}`,
       backoff: () => 60_000,
     });
+    // Wire-contract tests don't spin up the worker supervisor — they
+    // pretend the worker is already up. Individual tests can flip
+    // `promoteWorkerAvailable` back off to exercise the 503 path.
     daemonState.promoteWorkerAvailable = true;
     daemonState.promoteWorkerUnavailableReason = null;
   });
@@ -165,6 +168,55 @@ describe('promote-async daemon routes', () => {
   }
 
   // ---------------------------------------------------------------------------
+  // Worker-availability gate (RFC §3.1 / Codex PR #660 review id=3302072808)
+  //
+  // The async-promote routes go public in this PR but the supervisor that
+  // drains the queue ships in a follow-up PR. Until `promoteWorkerAvailable`
+  // flips to true, every enqueue / list / status call must return 503 with
+  // a reason — silently accepting jobs that would sit `queued` forever is
+  // exactly the "silent black hole" the reviewer flagged.
+  // ---------------------------------------------------------------------------
+
+  it('POST /:name/promote-async returns 503 when the worker is unavailable', async () => {
+    daemonState.promoteWorkerAvailable = false;
+    daemonState.promoteWorkerUnavailableReason = null;
+    await startRoutes(makeAgent());
+    const r = await post('/api/assertion/x/promote-async', {
+      contextGraphId: 'cg',
+      entities: 'all',
+    });
+    expect(r.status).toBe(503);
+    expect(r.body.error).toMatch(/async-promote worker is not available/i);
+  });
+
+  it('POST /:name/promote-async surfaces the unavailability reason when set', async () => {
+    daemonState.promoteWorkerAvailable = false;
+    daemonState.promoteWorkerUnavailableReason = 'supervisor crashed during recoverOnStartup';
+    await startRoutes(makeAgent());
+    const r = await post('/api/assertion/x/promote-async', { contextGraphId: 'cg' });
+    expect(r.status).toBe(503);
+    expect(r.body.error).toContain('supervisor crashed during recoverOnStartup');
+  });
+
+  it('GET /promote-async returns 503 when the worker is unavailable', async () => {
+    daemonState.promoteWorkerAvailable = false;
+    daemonState.promoteWorkerUnavailableReason = null;
+    await startRoutes(makeAgent());
+    const r = await get('/api/assertion/promote-async');
+    expect(r.status).toBe(503);
+    expect(r.body.error).toMatch(/async-promote worker is not available/i);
+  });
+
+  it('GET /promote-async/:jobId returns 503 when the worker is unavailable', async () => {
+    daemonState.promoteWorkerAvailable = false;
+    daemonState.promoteWorkerUnavailableReason = null;
+    await startRoutes(makeAgent());
+    const r = await get('/api/assertion/promote-async/anything');
+    expect(r.status).toBe(503);
+    expect(r.body.error).toMatch(/async-promote worker is not available/i);
+  });
+
+  // ---------------------------------------------------------------------------
   // POST /api/assertion/:name/promote-async
   // ---------------------------------------------------------------------------
 
@@ -242,18 +294,48 @@ describe('promote-async daemon routes', () => {
   // GET /api/assertion/promote-async/:jobId
   // ---------------------------------------------------------------------------
 
-  it('GET /promote-async/:jobId returns the full job', async () => {
+  it('GET /promote-async/:jobId returns the documented wire schema (RFC §3.2)', async () => {
     await startRoutes(makeAgent());
     const enq = await post('/api/assertion/single/promote-async', {
       contextGraphId: 'cg',
+      subGraphName: 'sg',
       entities: 'all',
     });
     const r = await get(`/api/assertion/promote-async/${enq.body.jobId}`);
     expect(r.status).toBe(200);
     expect(r.body.jobId).toBe(enq.body.jobId);
     expect(r.body.state).toBe('queued');
-    expect(r.body.request.contextGraphId).toBe('cg');
-    expect(r.body.attempt.maxRetries).toBeGreaterThan(0);
+    // Flat assertion identity at the top level, not nested under `request`.
+    expect(r.body.contextGraphId).toBe('cg');
+    expect(r.body.assertionName).toBe('single');
+    expect(r.body.subGraphName).toBe('sg');
+    expect(r.body.entities).toBe('all');
+    expect(r.body.attempts).toBe(0);
+    expect(r.body.maxAttempts).toBeGreaterThan(0);
+    // ISO-8601 timestamps, not raw epoch ms.
+    expect(typeof r.body.enqueuedAt).toBe('string');
+    expect(new Date(r.body.enqueuedAt).toISOString()).toBe(r.body.enqueuedAt);
+    expect(typeof r.body.updatedAt).toBe('string');
+  });
+
+  it('GET /promote-async/:jobId never leaks the internal queue shape (claimToken, request, attempt, commitMarker)', async () => {
+    await startRoutes(makeAgent());
+    const enq = await post('/api/assertion/internals/promote-async', {
+      contextGraphId: 'cg',
+      entities: 'all',
+    });
+    // Force the job into `running` so the queue assigns a lease + claim
+    // token; the wire shape must still hide both.
+    await queue.claimNext('test-worker');
+    const r = await get(`/api/assertion/promote-async/${enq.body.jobId}`);
+    expect(r.status).toBe(200);
+    expect(r.body.state).toBe('running');
+    expect(r.body).not.toHaveProperty('request');
+    expect(r.body).not.toHaveProperty('attempt');
+    expect(r.body).not.toHaveProperty('lease');
+    expect(r.body).not.toHaveProperty('commitMarker');
+    expect(JSON.stringify(r.body)).not.toContain('claimToken');
+    expect(JSON.stringify(r.body)).not.toContain('workerId');
   });
 
   it('GET /promote-async/:jobId returns 404 for unknown job', async () => {
@@ -294,7 +376,7 @@ describe('promote-async daemon routes', () => {
     const r = await get('/api/assertion/promote-async?contextGraphId=cg-1');
     expect(r.status).toBe(200);
     expect(r.body.jobs).toHaveLength(2);
-    expect(r.body.jobs.every((j: PromoteJob) => j.request.contextGraphId === 'cg-1')).toBe(true);
+    expect(r.body.jobs.every((j: { contextGraphId: string }) => j.contextGraphId === 'cg-1')).toBe(true);
   });
 
   it('GET /promote-async?state=queued filters by state', async () => {

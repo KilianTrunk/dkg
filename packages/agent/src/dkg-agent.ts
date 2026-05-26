@@ -5593,93 +5593,142 @@ export class DKGAgent {
     // (the recipient daemon has no matching local privkey for them) — that's
     // expected, not a hard error. We only abort when EVERY key for a given
     // agent failed.
+    //
+    // Fanout runs in parallel via Promise.allSettled. The pre-rc.12 loop
+    // awaited each `messenger.sendReliable` sequentially, so foreground
+    // publish latency scaled as `O(n_recipients × n_keys × send_timeout)` —
+    // a single offline member paid the full per-send timeout before the
+    // loop advanced. Concurrent fanout keeps the wall-clock cost bounded
+    // by the slowest individual send (~`DEFAULT_SEND_TIMEOUT_MS`).
+    //
+    // Concurrent mutation is moot: each per-recipient async closure runs
+    // on the single JS event loop and yields only at `await` points; the
+    // aggregation maps are appended to ONLY in the post-settle pass below.
+    type PerRecipientOutcome =
+      | { kind: 'success'; agentAddress: string }
+      | { kind: 'failure'; agentAddress: string; keyId: string; error: Error };
+
+    const settled = await Promise.allSettled(
+      input.recipients.map(async (recipient): Promise<PerRecipientOutcome> => {
+        const recipientAgentAddress = ethers.getAddress(recipient.agentAddress);
+        const pkg = await this.createSignedSwmSenderKeyPackage({
+          state,
+          recipient,
+          senderPrivateKey: input.sender.privateKey,
+        });
+
+        if (this.hasLocalAgent(recipientAgentAddress)) {
+          try {
+            await this.acceptSwmSenderKeyPackage(pkg, this.node.peerId.toString(), input.ctx);
+            return { kind: 'success', agentAddress: recipientAgentAddress };
+          } catch (err) {
+            return {
+              kind: 'failure',
+              agentAddress: recipientAgentAddress,
+              keyId: recipient.recipientKeyId,
+              error: err instanceof Error ? err : new Error(String(err)),
+            };
+          }
+        }
+
+        if (!recipient.peerId) {
+          return {
+            kind: 'failure',
+            agentAddress: recipientAgentAddress,
+            keyId: recipient.recipientKeyId,
+            error: new Error('no advertised peerId'),
+          };
+        }
+
+        this.log.info(
+          input.ctx,
+          `SWM sender-key setup send: senderAgent=${senderAgentAddress} recipientAgent=${recipientAgentAddress} ` +
+          `peerId=${recipient.peerId} contextGraph=${state.contextGraphId}${state.subGraphName ? `/${state.subGraphName}` : ''} ` +
+          `epoch=${state.epochId} membershipHash=${state.membershipHash} recipientKeyId=${recipient.recipientKeyId}`,
+        );
+        try {
+          // rc.9 PR-8: route through messenger.sendReliable so
+          // sender-side idempotency + durable outbox + retry-with-
+          // backoff cover this protocol the same way they cover chat.
+          //
+          // Delivery semantics (C2 integration-pass relaxation):
+          //   • `delivered=true && ack.accepted=true`  → success.
+          //   • `delivered=true && ack.accepted=false` → HARD failure
+          //     (recipient explicitly rejected the package — bad key,
+          //     bad membership hash, etc; queuing won't help).
+          //   • `delivered=false`                      → SOFT success.
+          //     The setup-package landed in the messenger's durable
+          //     outbox and will be replayed when the recipient comes
+          //     back online. Treating this as a hard failure used to
+          //     block any open-publish-CG write whenever the curator
+          //     was offline mid-batch, breaking the "members keep
+          //     publishing under intermittent curator availability"
+          //     contract C2 exercises. The recipient still gets the
+          //     epoch + chain key eventually; the only cost is that
+          //     they can't decrypt the broadcast that immediately
+          //     follows until the queued setup catches up.
+          const sendResult = await this.messenger.sendReliable(
+            recipient.peerId,
+            PROTOCOL_SWM_SENDER_KEY,
+            encodeSwmSenderKeyPackage(pkg),
+          );
+          if (!sendResult.delivered) {
+            this.log.warn(
+              input.ctx,
+              `SWM sender-key setup for ${recipientAgentAddress} keyId=${recipient.recipientKeyId} ` +
+              `queued (not synchronously deliverable): ${sendResult.error} — recipient will receive on next reconnect`,
+            );
+            return { kind: 'success', agentAddress: recipientAgentAddress };
+          }
+          const ack = decodeSwmSenderKeyPackageAck(sendResult.response);
+          if (
+            ack.version !== SWM_SENDER_KEY_PACKAGE_VERSION ||
+            ack.type !== SWM_SENDER_KEY_PACKAGE_ACK_TYPE ||
+            !ack.accepted
+          ) {
+            return {
+              kind: 'failure',
+              agentAddress: recipientAgentAddress,
+              keyId: recipient.recipientKeyId,
+              error: new Error(ack.reason ?? 'unknown reason'),
+            };
+          }
+          return { kind: 'success', agentAddress: recipientAgentAddress };
+        } catch (err) {
+          return {
+            kind: 'failure',
+            agentAddress: recipientAgentAddress,
+            keyId: recipient.recipientKeyId,
+            error: err instanceof Error ? err : new Error(String(err)),
+          };
+        }
+      }),
+    );
+
     const failuresByAgent = new Map<string, string[]>();
     const successByAgent = new Set<string>();
-    const recordFailure = (agent: string, keyId: string, err: unknown) => {
-      const msg = err instanceof Error ? err.message : String(err);
-      const key = agent.toLowerCase();
-      const list = failuresByAgent.get(key) ?? [];
-      list.push(`${keyId}: ${msg}`);
-      failuresByAgent.set(key, list);
-    };
-
-    for (const recipient of input.recipients) {
-      const recipientAgentAddress = ethers.getAddress(recipient.agentAddress);
-      const pkg = await this.createSignedSwmSenderKeyPackage({
-        state,
-        recipient,
-        senderPrivateKey: input.sender.privateKey,
-      });
-
-      const isLocalRecipient = this.hasLocalAgent(recipientAgentAddress);
-      if (isLocalRecipient) {
-        try {
-          await this.acceptSwmSenderKeyPackage(pkg, this.node.peerId.toString(), input.ctx);
-          successByAgent.add(recipientAgentAddress.toLowerCase());
-        } catch (err) {
-          recordFailure(recipientAgentAddress, recipient.recipientKeyId, err);
-        }
+    for (let i = 0; i < settled.length; i++) {
+      const r = settled[i];
+      if (r.status === 'rejected') {
+        // The per-recipient closure catches all throw paths and returns a
+        // failure outcome, so a rejection here means the closure itself
+        // crashed (programmer error). Record it against the recipient so
+        // the surrounding logic doesn't lose track of the slot.
+        const recipient = input.recipients[i];
+        const agent = ethers.getAddress(recipient.agentAddress).toLowerCase();
+        const list = failuresByAgent.get(agent) ?? [];
+        list.push(`${recipient.recipientKeyId}: ${String(r.reason)}`);
+        failuresByAgent.set(agent, list);
         continue;
       }
-
-      if (!recipient.peerId) {
-        recordFailure(recipientAgentAddress, recipient.recipientKeyId, new Error('no advertised peerId'));
-        continue;
-      }
-
-      this.log.info(
-        input.ctx,
-        `SWM sender-key setup send: senderAgent=${senderAgentAddress} recipientAgent=${recipientAgentAddress} ` +
-        `peerId=${recipient.peerId} contextGraph=${state.contextGraphId}${state.subGraphName ? `/${state.subGraphName}` : ''} ` +
-        `epoch=${state.epochId} membershipHash=${state.membershipHash} recipientKeyId=${recipient.recipientKeyId}`,
-      );
-      try {
-        // rc.9 PR-8: route through messenger.sendReliable so
-        // sender-side idempotency + durable outbox + retry-with-
-        // backoff cover this protocol the same way they cover chat.
-        //
-        // Delivery semantics (C2 integration-pass relaxation):
-        //   • `delivered=true && ack.accepted=true`  → success.
-        //   • `delivered=true && ack.accepted=false` → HARD failure
-        //     (recipient explicitly rejected the package — bad key,
-        //     bad membership hash, etc; queuing won't help).
-        //   • `delivered=false`                      → SOFT success.
-        //     The setup-package landed in the messenger's durable
-        //     outbox and will be replayed when the recipient comes
-        //     back online. Treating this as a hard failure used to
-        //     block any open-publish-CG write whenever the curator
-        //     was offline mid-batch, breaking the "members keep
-        //     publishing under intermittent curator availability"
-        //     contract C2 exercises. The recipient still gets the
-        //     epoch + chain key eventually; the only cost is that
-        //     they can't decrypt the broadcast that immediately
-        //     follows until the queued setup catches up.
-        const sendResult = await this.messenger.sendReliable(
-          recipient.peerId,
-          PROTOCOL_SWM_SENDER_KEY,
-          encodeSwmSenderKeyPackage(pkg),
-        );
-        if (!sendResult.delivered) {
-          this.log.warn(
-            input.ctx,
-            `SWM sender-key setup for ${recipientAgentAddress} keyId=${recipient.recipientKeyId} ` +
-            `queued (not synchronously deliverable): ${sendResult.error} — recipient will receive on next reconnect`,
-          );
-          successByAgent.add(recipientAgentAddress.toLowerCase());
-          continue;
-        }
-        const ack = decodeSwmSenderKeyPackageAck(sendResult.response);
-        if (
-          ack.version !== SWM_SENDER_KEY_PACKAGE_VERSION ||
-          ack.type !== SWM_SENDER_KEY_PACKAGE_ACK_TYPE ||
-          !ack.accepted
-        ) {
-          recordFailure(recipientAgentAddress, recipient.recipientKeyId, new Error(ack.reason ?? 'unknown reason'));
-        } else {
-          successByAgent.add(recipientAgentAddress.toLowerCase());
-        }
-      } catch (err) {
-        recordFailure(recipientAgentAddress, recipient.recipientKeyId, err);
+      const outcome = r.value;
+      if (outcome.kind === 'success') {
+        successByAgent.add(outcome.agentAddress.toLowerCase());
+      } else {
+        const agent = outcome.agentAddress.toLowerCase();
+        const list = failuresByAgent.get(agent) ?? [];
+        list.push(`${outcome.keyId}: ${outcome.error.message}`);
+        failuresByAgent.set(agent, list);
       }
     }
 

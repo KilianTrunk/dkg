@@ -84,11 +84,15 @@ describe('drop-sweep — none of the 10 W2-dropped tools reappear in tools/list'
 
   // Locked count bumped to 25 in the `dkg_peer_info` PR (per-peer
   // diagnostics surface added under registerHealthTools after the
-  // May 2026 soak postmortem). Bump again when a new tool is
-  // intentionally added, drop when a tool is removed, and keep a
-  // comment trail so future drops are auditable.
-  it('registered surface contains exactly 25 tools (post-PR locked count)', () => {
-    expect(server.tools.size).toBe(25);
+  // May 2026 soak postmortem), then to 26 by the PR4 honest-ACK
+  // cleanup that added `dkg_request_hosting` under registerSetupTools
+  // (the LU-6 Phase B operator UX sugar for
+  // `POST /api/shared-memory/host-mode/subscribe`; see
+  // `docs/runbooks/RUNBOOK_HOST_MODE_MANUAL_SUBSCRIBE.md`). Bump again
+  // when a new tool is intentionally added, drop when a tool is
+  // removed, and keep a comment trail so future drops are auditable.
+  it('registered surface contains exactly 26 tools (post-PR locked count)', () => {
+    expect(server.tools.size).toBe(26);
   });
 });
 

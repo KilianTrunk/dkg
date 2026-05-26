@@ -1966,9 +1966,20 @@ export class DKGPublisher implements Publisher {
           kcMerkleLeafCount,
           useEncryptedInline,
         );
+        // PR5 ACK-provenance summary — one line per publish that names
+        // every ACKing core and the LU-6 Phase B discovery path that
+        // brought it to the curated CG. Lets an operator answer
+        // "*why* did this CG get hosted by these cores?" from the
+        // daemon log alone instead of cross-referencing the chain
+        // event poller, beacon receiver, and reconciler timer.
+        // Pre-PR5 cores show `?` for the source; that's the honest
+        // shape until they upgrade.
+        const provenance = v10ACKs
+          .map((a) => `${a.peerId.slice(-8)}:${a.subscriptionSource ?? '?'}`)
+          .join(', ');
         this.log.info(
           ctx,
-          `V10: Collected ${v10ACKs.length} core node ACKs`,
+          `V10: Collected ${v10ACKs.length} core node ACKs [${provenance}]`,
         );
       } catch (err) {
         // RC11 / PR1+PR3: no self-signed ACK fallback. ACK collection

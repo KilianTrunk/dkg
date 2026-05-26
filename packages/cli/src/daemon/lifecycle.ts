@@ -374,6 +374,40 @@ export function resolveMemoryAgentAddress(agent: {
  * relays. Counts (`envCount`, `configCount`, `preferredCount`) are
  * reported back for the operator-visible startup log line.
  */
+/**
+ * PR3 / RC11 — known-public JSON-RPC hostnames that emit a startup
+ * WARN when the daemon inherits them from `network/<env>.json#chain.rpcUrl`
+ * without an explicit operator override. The list is intentionally
+ * conservative: only well-known free public endpoints make the cut, so
+ * a private RPC behind a load balancer never trips it. Match by
+ * lowercase substring against the URL host to tolerate https://, port
+ * suffixes, and trailing path segments. The trigger is purely
+ * informational — it does NOT block startup, it only gives the
+ * operator a single prominent log line so the dzudza failure mode
+ * (silent RPC rate-limit during ACK pre-flight) becomes self-diagnostic.
+ *
+ * If the list grows out of sync with reality the cost is a noisy
+ * WARN for a private RPC that happens to share a substring (over-warn)
+ * or a quiet failure on a new public endpoint (under-warn). Both are
+ * recoverable by editing this list — and an operator who reads the
+ * WARN can always suppress it by setting `chain.rpcUrl` in their
+ * config.json. The default behaviour stays correct either way.
+ */
+const KNOWN_PUBLIC_RPC_HOSTS = [
+  'sepolia.base.org',
+  'mainnet.base.org',
+  'rpc.sepolia.org',
+  'ethereum-sepolia.publicnode.com',
+  'rpc.ankr.com',
+  'eth-sepolia.public.blastapi.io',
+  'sepolia.gateway.tenderly.co',
+];
+
+export function isLikelyPublicRpc(url: string): boolean {
+  const lower = url.toLowerCase();
+  return KNOWN_PUBLIC_RPC_HOSTS.some((host) => lower.includes(host));
+}
+
 export function mergePreferredRelays(input: {
   envValue: string | undefined;
   configPreferred: unknown;
@@ -576,6 +610,35 @@ export async function runDaemonInner(
   // Operators can override individual fields (e.g. just rpcUrl) without
   // restating the rest; missing fields fall back to the network defaults.
   const chainBase = resolveChainConfig(config, network);
+
+  // PR3 / RC11 — operator-visible WARN when the node is going to talk
+  // to the chain through a known-public, rate-limited JSON-RPC
+  // endpoint that it inherited from the network defaults. The dzudza
+  // failure (Sun 20:42 UTC) traced to a `-32016 over rate limit`
+  // error on the public Base Sepolia RPC during the V10 ACK
+  // pre-flight; without an explicit `chain.rpcUrl` override the
+  // operator never noticed they were sharing a budget with the rest
+  // of the internet. A startup WARN gives them a single, prominent
+  // line in the daemon log instead of waiting for a publish to
+  // silently fail. Skip the WARN entirely in mock mode.
+  //
+  // The "operator overrode it" detection is purposely structural —
+  // only an explicit `config.chain.rpcUrl` entry suppresses the
+  // warning; an empty `chain` block in config that inherits rpcUrl
+  // from network defaults still trips the WARN. That matches the
+  // intent: the operator knows about the rpcUrl iff they set it
+  // themselves.
+  if (chainBase?.type !== 'mock' && chainBase?.rpcUrl) {
+    const operatorSetRpc = config.chain?.rpcUrl !== undefined;
+    if (!operatorSetRpc && isLikelyPublicRpc(chainBase.rpcUrl)) {
+      log(
+        `[warn] chain.rpcUrl is using the network-default public endpoint (${chainBase.rpcUrl}). ` +
+        `Publishing nodes share a global rate-limit budget on public RPCs and may see ` +
+        `ACK pre-flight failures (RpcPreconditionError on eth_chainId, etc.). ` +
+        `Set chain.rpcUrl in ~/.dkg/config.json to a private endpoint to avoid this.`,
+      );
+    }
+  }
 
   // Relay: prefer config.relay, fall back to network testnet.json relays so
   // local nodes connect without having run init or set relay manually.

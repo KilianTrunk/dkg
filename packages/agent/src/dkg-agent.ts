@@ -69,6 +69,8 @@ import {
   type ProtocolOutboxStore,
   type ProtocolOutboxEntry,
   encryptV10PublishPayload,
+  type SubscriptionSource,
+  SUBSCRIPTION_SOURCES,
 } from '@origintrail-official/dkg-core';
 import { GraphManager, PrivateContentStore, createTripleStore, type TripleStore, type TripleStoreConfig, type Quad, type LargeLiteralStorageConfig } from '@origintrail-official/dkg-storage';
 import { EVMChainAdapter, NoChainAdapter, enrichEvmError, type EVMAdapterConfig, type ChainAdapter, type CreateContextGraphParams, type CreateOnChainContextGraphParams, type CreateOnChainContextGraphResult, type TxResult, type V10PublishingConvictionAccountInfo } from '@origintrail-official/dkg-chain';
@@ -86,6 +88,7 @@ import {
   TripleStoreAsyncLiftPublisher,
   FileWorkspacePublicSnapshotStore,
   parseWorkspacePublicSnapshotNQuads,
+  wrapAsRpcPreconditionIfApplicable,
   type PublishOptions, type PublishResult, type PhaseCallback, type KAMetadata, type CASCondition,
   type CollectedACK, type LiftAuthorityProof, type LiftTransitionType,
   type LiftRequest, type LiftRequestAuthorSeal,
@@ -399,8 +402,28 @@ export class DKGAgent {
    * Lazily constructed on first use; absent on edge nodes by default.
    */
   private swmHostModeStore?: SwmHostModeStore;
-  /** CGs we've subscribed to in host mode (cores only). */
-  private readonly swmHostModeSubscribed = new Set<string>();
+  /**
+   * CGs we've subscribed to in host mode (cores only), with the
+   * discovery-path source that caused each subscription. PR5
+   * ACK-provenance telemetry reads this map to populate the
+   * `subscriptionSource` field on every signed StorageACK.
+   *
+   * Sources track the four LU-6 Phase B discovery paths defined in
+   * `SUBSCRIPTION_SOURCES`: `chain-event`, `beacon`, `reconciler`,
+   * `manual`. Member-mode CGs are NOT in this map — the StorageACK
+   * handler routes them via `sharedMemoryGossipRegistered` (source =
+   * `member`) instead.
+   *
+   * On daemon restart, CGs reconstructed from `swmHostModeStore` boot
+   * back through the `reconcileSwmHostModeSubscription` periodic
+   * sweep, which defaults their source to `reconciler` (the original
+   * cause is not persisted on disk and the periodic sweep IS what
+   * restored them). Operators who need to differentiate "originally
+   * subscribed via beacon" from "restored on restart" should consult
+   * the daemon log at subscribe time, not the live `subscriptionSource`
+   * field.
+   */
+  private readonly swmHostModeSubscribed = new Map<string, SubscriptionSource>();
   /**
    * Per-CG reference to the host-mode gossip handler closure. Kept
    * so we can call `gossip.offMessage(topic, handler)` to remove
@@ -1594,6 +1617,15 @@ export class DKGAgent {
                   `keeping handler active: ${err instanceof Error ? err.message : String(err)}`,
                 );
               },
+              // PR5 ACK-provenance — bind to the agent's host-mode
+              // bookkeeping so every signed ACK carries which of the
+              // four LU-6 Phase B discovery paths brought this CG's
+              // hosting state up. Resolver tries each candidate id
+              // because the bookkeeping is keyed differently per
+              // path (cleartext for reconciler/manual, wire-hash for
+              // chain-event/beacon). See `getSwmSubscriptionSource`.
+              getSubscriptionSourceForCg: (cgId, swmGraphId) =>
+                this.getSwmSubscriptionSource(cgId, swmGraphId),
             }, this.eventBus);
             // rc.9 PR-11: migrated onto the Universal Messenger
             // substrate (wire prefix /dkg/10.0.1/storage-ack).
@@ -1794,7 +1826,10 @@ export class DKGAgent {
             // of the host-mode gossip handler. Async + best-effort:
             // the periodic reconciler covers the timer-driven fallback
             // path, so a missed event here heals on the next sweep.
-            void this.reconcileSwmHostModeSubscription(hashLower).catch((err) => {
+            void this.reconcileSwmHostModeSubscription(
+              hashLower,
+              SUBSCRIPTION_SOURCES.CHAIN_EVENT,
+            ).catch((err) => {
               this.log.warn(
                 ctx,
                 `Phase B chain-event auto-subscribe for ${hashLower.slice(0, 18)}… failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -9186,7 +9221,10 @@ export class DKGAgent {
    * No-op when the store isn't initialized, when the CG is system-
    * reserved, or when the node is already subscribed in member mode.
    */
-  private async reconcileSwmHostModeSubscription(contextGraphId: string): Promise<void> {
+  private async reconcileSwmHostModeSubscription(
+    contextGraphId: string,
+    source: SubscriptionSource = SUBSCRIPTION_SOURCES.RECONCILER,
+  ): Promise<void> {
     if (!this.swmHostModeStore) return;
     if ((Object.values(SYSTEM_CONTEXT_GRAPHS) as string[]).includes(contextGraphId)) return;
     if (this.sharedMemoryGossipRegistered.has(contextGraphId)) {
@@ -9245,7 +9283,7 @@ export class DKGAgent {
     }
     if (!curated) return;
 
-    this.wireSwmHostModeHandler(contextGraphId);
+    this.wireSwmHostModeHandler(contextGraphId, source);
 
     await this.maybeMarkRegisteredForHostMode(contextGraphId);
 
@@ -9265,8 +9303,17 @@ export class DKGAgent {
    * `enableSwmHostModeFor` (operator-driven) funnel through here
    * so the host-mode lifecycle is in one place.
    */
-  private wireSwmHostModeHandler(contextGraphId: string): void {
-    if (this.swmHostModeHandlers.has(contextGraphId)) return;
+  private wireSwmHostModeHandler(
+    contextGraphId: string,
+    source: SubscriptionSource = SUBSCRIPTION_SOURCES.RECONCILER,
+  ): void {
+    if (this.swmHostModeHandlers.has(contextGraphId)) {
+      // Idempotent re-entry — preserve the original source. The first
+      // discovery path to wire the handler wins the provenance label;
+      // a later path covering the same CG is "also true" but the
+      // operator-meaningful answer is "which path got us here first".
+      return;
+    }
     // OT-RFC-38 / LU-6 Phase B — host-mode subscribes on the wire-form
     // topic. For chain-event-driven auto-subscribe, `contextGraphId`
     // IS the wire id (the core has no cleartext to translate from).
@@ -9275,7 +9322,7 @@ export class DKGAgent {
     // resolves to the curator-committed hash via the local meta.
     const wireCgId = this.gossipWireIdFor(contextGraphId);
     const swmTopic = contextGraphWorkspaceTopic(wireCgId);
-    this.swmHostModeSubscribed.add(contextGraphId);
+    this.swmHostModeSubscribed.set(contextGraphId, source);
     this.gossip.subscribe(swmTopic);
     const handler = (_topic: string, data: Uint8Array, from: string) => {
       this.ingestSwmHostModeEnvelope(contextGraphId, data, from).catch((err: unknown) => {
@@ -9791,7 +9838,7 @@ export class DKGAgent {
     this.recordCgWireId(wireId, wireId);
 
     try {
-      await this.reconcileSwmHostModeSubscription(wireId);
+      await this.reconcileSwmHostModeSubscription(wireId, SUBSCRIPTION_SOURCES.BEACON);
       this.log.info(
         ctx,
         `Beacon-driven auto-host engaged for wireId=${wireId.slice(0, 12)}… (curator=${curatorEoa.slice(0, 10)}…, from=${fromPeer})`,
@@ -10346,7 +10393,47 @@ export class DKGAgent {
       return { enabled: false, cgCount: 0, totalBytes: 0, totalEntries: 0, subscribedCgIds: [] };
     }
     const stats = await this.swmHostModeStore.stats();
-    return { enabled: true, ...stats, subscribedCgIds: [...this.swmHostModeSubscribed] };
+    return { enabled: true, ...stats, subscribedCgIds: [...this.swmHostModeSubscribed.keys()] };
+  }
+
+  /**
+   * PR5 — ACK-provenance lookup for the StorageACK handler. Returns
+   * which of the four LU-6 Phase B discovery paths caused this node
+   * to be hosting the CG identified by ANY of the passed candidate
+   * ids at the time of the call. `'member'` when the CG is in
+   * member-mode (decrypt+apply handler is authoritative), the
+   * recorded host-mode source when it's in host-mode, or `undefined`
+   * when neither — the latter means the core has no live subscription
+   * for the CG, which should never happen on a successful ACK code
+   * path but is plumbed through defensively so a future race doesn't
+   * crash the ACK encoder.
+   *
+   * Takes multiple candidate ids because `swmHostModeSubscribed`'s
+   * key shape is path-dependent: chain-event and beacon paths key by
+   * the curator-committed wire hash; the reconciler keys by the
+   * cleartext local id from `listContextGraphs()`; manual keys by
+   * whatever string the operator passed to
+   * `POST /api/shared-memory/host-mode/subscribe`. The StorageACK
+   * handler has all three (numeric on-chain `cgId`, cleartext
+   * `swmGraphId`, and may have computed the wire hash) so it passes
+   * the full set and we resolve against the first one that hits.
+   *
+   * Public so `StorageACKHandlerConfig.getSubscriptionSourceForCg`
+   * can bind directly to it at agent wire-up time (in `lifecycle.ts`).
+   */
+  getSwmSubscriptionSource(...candidateIds: Array<string | undefined>): SubscriptionSource | undefined {
+    const seen = new Set<string>();
+    for (const id of candidateIds) {
+      if (typeof id !== 'string' || id.length === 0) continue;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      if (this.sharedMemoryGossipRegistered.has(id)) {
+        return SUBSCRIPTION_SOURCES.MEMBER;
+      }
+      const hostSource = this.swmHostModeSubscribed.get(id);
+      if (hostSource) return hostSource;
+    }
+    return undefined;
   }
 
   /**
@@ -10402,7 +10489,7 @@ export class DKGAgent {
       await this.maybeMarkRegisteredForHostMode(contextGraphId);
       return { subscribed: false, alreadySubscribed: true, hostingEnabled: true };
     }
-    this.wireSwmHostModeHandler(contextGraphId);
+    this.wireSwmHostModeHandler(contextGraphId, SUBSCRIPTION_SOURCES.MANUAL);
     // Codex PR #610 R1 comment 5: a core that only knows the CG by
     // topic id (the explicit /host-mode/subscribe entrypoint) must
     // still transition the store to the registered-CG limits as
@@ -17747,16 +17834,39 @@ export class DKGAgent {
         );
       }
 
-      const requiredACKs = typeof chain.getMinimumRequiredSignatures === 'function'
-        ? await chain.getMinimumRequiredSignatures()
-        : undefined;
+      // PR3: chain pre-flight reads are split into individual try/catch
+      // shells so a failure can be promoted to the typed
+      // `RpcPreconditionError` with the specific adapter method that
+      // died. Without this discriminator, dzudza-style RPC rate-limits
+      // (`-32016 over rate limit` on `eth_chainId`) get logged as the
+      // same opaque "V10 ACK collection failed" string as a peer-side
+      // QuorumUnmet — operators cannot tell whether to fix their RPC
+      // config or their network topology.
+      let requiredACKs: number | undefined;
+      if (typeof chain.getMinimumRequiredSignatures === 'function') {
+        try {
+          requiredACKs = await chain.getMinimumRequiredSignatures();
+        } catch (err) {
+          throw wrapAsRpcPreconditionIfApplicable(err, 'getMinimumRequiredSignatures');
+        }
+      }
 
       // H5 prefix inputs — both come from the chain adapter so that
       // publisher-side digest construction matches what core-node handlers
       // produced on their side. These are required for any V10 path; the
       // adapter must implement them.
-      const chainIdBig = await chain.getEvmChainId();
-      const kav10Address = await chain.getKnowledgeAssetsV10Address();
+      let chainIdBig: bigint;
+      try {
+        chainIdBig = await chain.getEvmChainId();
+      } catch (err) {
+        throw wrapAsRpcPreconditionIfApplicable(err, 'getEvmChainId');
+      }
+      let kav10Address: string;
+      try {
+        kav10Address = await chain.getKnowledgeAssetsV10Address();
+      } catch (err) {
+        throw wrapAsRpcPreconditionIfApplicable(err, 'getKnowledgeAssetsV10Address');
+      }
 
       const result = await collector.collect({
         merkleRoot,

@@ -991,6 +991,7 @@ export async function runDaemonInner(
     // as libp2p's `AgentVersion` PB field (their naming, not ours).
     nodeVersion: `dkg/${nodeVersion}`,
     ...pickNetworkTunables(config.network ?? {}),
+    agentProfileHeartbeatMs: config.network?.agentProfileHeartbeatMs,
     syncContextGraphs: syncContextGraphs,
     storeConfig: config.store ? {
       backend: config.store.backend,

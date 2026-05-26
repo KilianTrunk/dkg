@@ -507,11 +507,13 @@ export interface DkgConfig {
   /** Route-plugin specs (absolute paths / package names) loaded at daemon startup. ADR 0001. */
   routePlugins?: string[];
   /**
-   * libp2p networking tunables for small / sparse networks. Forwarded
-   * through `DKGAgentConfig` and applied at `createLibp2p` / `kadDHT`
-   * construction. All optional; omitting any field preserves the
-   * upstream default. See packages/core/src/types.ts for per-field
-   * rationale + default values.
+   * libp2p / discovery network tunables for small / sparse meshes.
+   * Forwarded through `DKGAgentConfig` and applied at `createLibp2p` /
+   * `kadDHT` construction (libp2p tunables) and to the agent-profile
+   * heartbeat timer (phonebook side). All fields optional; omitting
+   * any field preserves the built-in default. See companion knobs in
+   * `packages/core/src/types.ts` (libp2p side) +
+   * `packages/agent/src/dkg-agent-constants.ts` (agent side).
    *
    * Targeted at testnet / small-mesh operators where DHT lookups are
    * flaky (sparse routing tables) and direct addresses age out before
@@ -533,6 +535,17 @@ export interface DkgConfig {
     peerStoreMaxPeerAgeMs?: number;
     /** libp2p `kadDHT.querySelfInterval` (default kad-DHT upstream). */
     dhtQuerySelfIntervalMs?: number;
+    /**
+     * Cadence at which the daemon re-publishes its own profile to the
+     * `agents` Context Graph (default 5min — see
+     * `AGENT_PROFILE_HEARTBEAT_MS`). Set to `0` to disable; the
+     * one-shot startup publish still fires.
+     *
+     * Each heartbeat refreshes `dkg:multiaddr` + `dkg:lastSeen` so
+     * other peers' dial fallback can find fresh phonebook entries
+     * even when direct connections have aged out of the peerStore.
+     */
+    agentProfileHeartbeatMs?: number;
   };
 }
 

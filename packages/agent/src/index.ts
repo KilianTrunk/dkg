@@ -17,6 +17,7 @@ export {
 export {
   buildAgentProfile,
   canonicalAgentDidSubject,
+  collectPublishableMultiaddrs,
   AGENT_REGISTRY_CONTEXT_GRAPH,
   AGENT_REGISTRY_GRAPH,
   type AgentProfileConfig,

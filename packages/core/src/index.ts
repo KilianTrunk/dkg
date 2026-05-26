@@ -38,6 +38,11 @@ export {
   // every hop. Codex review of PR #698 round 3.
   type NetworkTunables,
   pickNetworkTunables,
+  // Public-address classifier (used by profile.ts to filter what we
+  // advertise as `dkg:multiaddr` so peers don't learn RFC1918/CGNAT
+  // entries from the phonebook).
+  isPublicLikeAddress,
+  isLocalOrInternalHostname,
 } from './node.js';
 // NOTE: `isFinitePositiveInteger`, `buildPeerStoreOverrides`, and
 // `buildKadDHTOptions` are intentionally NOT re-exported. They are

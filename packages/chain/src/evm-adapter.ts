@@ -276,6 +276,17 @@ interface ContractCache {
   randomSamplingStorage?: Contract;
 }
 
+function formatProviderContext(config: Pick<EVMAdapterConfig, 'chainId' | 'rpcUrl'>): string {
+  let rpcHost: string;
+  try {
+    const parsed = new URL(config.rpcUrl);
+    rpcHost = parsed.host || parsed.protocol || 'unknown-rpc';
+  } catch {
+    rpcHost = 'unparseable-rpc';
+  }
+  return `chainId=${config.chainId ?? 'unknown'} rpc=${rpcHost}`;
+}
+
 /**
  * EVM chain adapter implementing the V9 ChainAdapter interface.
  * Resolves contract addresses dynamically from the Hub.
@@ -365,6 +376,7 @@ export class EVMChainAdapter implements ChainAdapter {
 
   constructor(config: EVMAdapterConfig) {
     this.provider = new JsonRpcProvider(config.rpcUrl, undefined, { cacheTimeout: -1 });
+    const providerContext = formatProviderContext(config);
     // PR-8: install the filter-not-found silencer. Without this, RPC
     // nodes that GC filters faster than ethers' polling cadence
     // (observed: 134 MB of daemon.log spam in 24h on beacon-01) spam
@@ -375,15 +387,28 @@ export class EVMChainAdapter implements ChainAdapter {
     // addresses fresh while filters are silently failing — this PR is
     // log-spam suppression, not filter recreation. (See module
     // docblock for the rationale on the deliberate scope limit.)
-    this.filterErrorSilencer = createFilterErrorSilencer();
-    this.provider.on('error', (err: unknown) => {
+    this.filterErrorSilencer = createFilterErrorSilencer({
+      log: (msg) => console.warn(`${msg} (${providerContext})`),
+    });
+    const providerErrorHandler = (err: unknown) => {
       if (this.filterErrorSilencer.handle(err)) return;
       // Non-filter provider errors fall through to the error
       // path so they remain visible. Operators grepping their logs
       // for chain-provider issues still see everything they used to
       // EXCEPT the filter-spam class.
-      console.error(`[chain] provider error: ${formatProviderError(err)}`);
-    });
+      console.error(`[chain] provider error (${providerContext}): ${formatProviderError(err)}`);
+    };
+    try {
+      void Promise.resolve(this.provider.on('error', providerErrorHandler)).catch((err: unknown) => {
+        console.error(
+          `[chain] provider error listener registration failed (${providerContext}): ${formatProviderError(err)}`,
+        );
+      });
+    } catch (err) {
+      console.error(
+        `[chain] provider error listener registration failed (${providerContext}): ${formatProviderError(err)}`,
+      );
+    }
     this.signer = new Wallet(config.privateKey, this.provider);
     this.signerPool = [this.signer];
     for (const key of config.additionalKeys ?? []) {

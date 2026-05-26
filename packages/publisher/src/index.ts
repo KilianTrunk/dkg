@@ -146,6 +146,28 @@ export {
   type AsyncLiftPublisherRecoveryResolver,
 } from './async-lift-publisher.js';
 export {
+  TripleStoreAsyncPromoteQueue,
+  PROMOTE_COMMIT_MARKER_STEPS,
+  PROMOTE_JOB_STATES,
+  PromoteJobConflictError,
+  PromoteJobLeaseError,
+  type AsyncPromoteQueue,
+  type AsyncPromoteQueueConfig,
+  type PromoteAttemptError,
+  type PromoteAttemptState,
+  type PromoteCommitMarker,
+  type PromoteCommitMarkerStep,
+  type PromoteFailureClassification,
+  type PromoteJob,
+  type PromoteJobState,
+  type PromoteLease,
+  type PromoteListFilter,
+  type PromoteRecoverySummary,
+  type PromoteRequest,
+  type PromoteResult,
+  type PromoteStats,
+} from './async-promote-queue.js';
+export {
   AsyncLiftRunner,
   type AsyncLiftRunnerConfig,
 } from './async-lift-runner.js';

@@ -471,6 +471,68 @@ describe('PeerResolver', () => {
     expect(out).toEqual([`${RELAY_ADDR}/p2p-circuit/p2p/${PEER_B}`]);
   });
 
+  it('step 4 (phonebook): falls back to findRelayForPeer when findAgentDialAddresses returns null', async () => {
+    // Codex review of PR #700: the interface JSDoc documents that
+    // the resolver falls back to the legacy lookup when the richer
+    // one returns null. This protects peers whose profile pre-dates
+    // the phonebook schema (no dkg:multiaddr) but who DO have a
+    // legacy relay entry — without the fallback they'd resolve to
+    // an empty address list.
+    net.__findPeerImpl = async () => [];
+    const findRelayForPeer = vi.fn(async () => RELAY_ADDR);
+    const findAgentDialAddresses = vi.fn(async () => null);
+    const dir: AgentDirectoryLookup = {
+      findRelayForPeer,
+      findAgentDialAddresses,
+    };
+    const resolver = new PeerResolver({
+      network: net,
+      registry,
+      agentDirectory: dir,
+    });
+    const out = await resolver.resolve(PEER_B);
+    expect(out).toEqual([`${RELAY_ADDR}/p2p-circuit/p2p/${PEER_B}`]);
+    expect(findAgentDialAddresses).toHaveBeenCalledOnce();
+    expect(findRelayForPeer).toHaveBeenCalledOnce();
+  });
+
+  it('step 4 (phonebook): one malformed multiaddr does not poison sibling valid addresses', async () => {
+    // Codex review of PR #700: `addKnownAddresses` runs `multiaddr(a)`
+    // on every element in one batch; a single bad literal from an
+    // untrusted profile would otherwise throw and drop the whole
+    // array. The per-address retry path preserves valid siblings.
+    net.__findPeerImpl = async () => [];
+    const good1 = '/ip4/203.0.113.10/tcp/9090/p2p/' + PEER_B;
+    const bad = 'not-a-multiaddr';
+    const good2 = '/ip4/198.51.100.20/tcp/9090/p2p/' + PEER_B;
+    // Mock addKnownAddresses: throw on any batch containing the bad
+    // entry; succeed otherwise. Simulates libp2p's actual behaviour.
+    const originalAdd = net.addKnownAddresses.bind(net);
+    net.addKnownAddresses = async (pid, addrs) => {
+      if (addrs.some((a) => a === bad)) {
+        throw new Error(`Invalid multiaddr: ${bad}`);
+      }
+      await originalAdd(pid, addrs);
+    };
+
+    const dir: AgentDirectoryLookup = {
+      findRelayForPeer: async () => null,
+      findAgentDialAddresses: async () => ({
+        multiaddrs: [good1, bad, good2],
+        lastSeenMs: Date.now(),
+      }),
+    };
+    const resolver = new PeerResolver({
+      network: net,
+      registry,
+      agentDirectory: dir,
+    });
+    const out = await resolver.resolve(PEER_B);
+    expect(out).toContain(good1);
+    expect(out).toContain(good2);
+    expect(out).not.toContain(bad);
+  });
+
   it('step 4 (phonebook): custom agentDirectoryStaleThresholdMs is honoured', async () => {
     net.__findPeerImpl = async () => [];
     const direct = '/ip4/203.0.113.10/tcp/9090/p2p/' + PEER_B;

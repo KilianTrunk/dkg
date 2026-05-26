@@ -258,9 +258,24 @@ export class PeerResolver {
         await this.network.addKnownAddresses(peerId, addrs);
         append(addrs);
       } catch (err) {
+        // Codex review of PR #700: a single malformed address (e.g.
+        // a `dkg:multiaddr` literal pulled from an untrusted profile
+        // in step 4) makes the whole batch `multiaddr()` conversion
+        // throw, poisoning every otherwise-valid sibling. Retry
+        // per-address so the bad entry is dropped in isolation.
         this.logger.debug?.(
-          `peerStore merge during ${stepLabel} for ${peerId} failed: ${errMsg(err)}`,
+          `peerStore batch merge during ${stepLabel} for ${peerId} failed (${errMsg(err)}); retrying per-address`,
         );
+        for (const addr of addrs) {
+          try {
+            await this.network.addKnownAddresses(peerId, [addr]);
+            append([addr]);
+          } catch (innerErr) {
+            this.logger.debug?.(
+              `peerStore per-addr merge during ${stepLabel} for ${peerId}/${addr} failed: ${errMsg(innerErr)}`,
+            );
+          }
+        }
       }
     };
 
@@ -308,11 +323,13 @@ export class PeerResolver {
     // older directories.
     if (aborted()) return accumulated;
     try {
+      let handledByRicher = false;
       if (typeof this.agentDirectory.findAgentDialAddresses === 'function') {
         const dial = await this.agentDirectory.findAgentDialAddresses(peerId, {
           signal: opts?.signal,
         });
         if (dial) {
+          handledByRicher = true;
           const isStale =
             dial.lastSeenMs !== undefined &&
             Date.now() - dial.lastSeenMs > this.agentDirectoryStaleThresholdMs;
@@ -324,7 +341,14 @@ export class PeerResolver {
             await primeAndAppend([circuitAddr], 'agents-CG');
           }
         }
-      } else {
+        // dial === null intentionally falls through to findRelayForPeer:
+        // the interface contract documents that the resolver falls back
+        // to the legacy lookup when the richer one returns null, so a
+        // peer with only a legacy relay entry (e.g. profile pre-dates
+        // the phonebook schema, or operator hasn't restarted onto the
+        // PR yet) still resolves. Codex review of PR #700 caught this.
+      }
+      if (!handledByRicher) {
         const relay = await this.agentDirectory.findRelayForPeer(peerId, {
           signal: opts?.signal,
         });

@@ -736,6 +736,15 @@ export class DKGAgent {
    */
   private agentProfileHeartbeatTimer?: ReturnType<typeof setInterval>;
   /**
+   * In-flight guard for {@link agentProfileHeartbeatTimer}.
+   * `publishProfile()` mutates `ProfileManager.currentKcId` and
+   * rewrites registry triples, so two concurrent runs (e.g. when the
+   * heartbeat is configured shorter than publish latency, or chain
+   * RPC is slow) would race each other. The interval skips the tick
+   * if a publish is already in flight. Codex review of PR #700.
+   */
+  private agentProfileHeartbeatInFlight = false;
+  /**
    * OT-RFC-38 / LU-6 Phase B — sliding-window rate-limiter applied
    * to pre-registration (beacon-discovered) ciphertext writes.
    * Bounds the freemium-tier abuse vector: any wallet can broadcast
@@ -1979,10 +1988,19 @@ export class DKGAgent {
     const heartbeatMs = this.config.agentProfileHeartbeatMs ?? AGENT_PROFILE_HEARTBEAT_MS;
     if (Number.isFinite(heartbeatMs) && Number.isInteger(heartbeatMs) && heartbeatMs > 0) {
       this.agentProfileHeartbeatTimer = setInterval(() => {
-        this.publishProfile().catch((err) => {
-          const msg = err instanceof Error ? err.message : String(err);
-          this.log.warn(ctx, `Agent profile heartbeat publish failed: ${msg}`);
-        });
+        if (this.agentProfileHeartbeatInFlight) {
+          this.log.debug?.(ctx, 'Agent profile heartbeat skipped: previous publish still in flight');
+          return;
+        }
+        this.agentProfileHeartbeatInFlight = true;
+        this.publishProfile()
+          .catch((err) => {
+            const msg = err instanceof Error ? err.message : String(err);
+            this.log.warn(ctx, `Agent profile heartbeat publish failed: ${msg}`);
+          })
+          .finally(() => {
+            this.agentProfileHeartbeatInFlight = false;
+          });
       }, heartbeatMs);
       if (typeof this.agentProfileHeartbeatTimer.unref === 'function') {
         this.agentProfileHeartbeatTimer.unref();

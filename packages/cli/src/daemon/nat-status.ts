@@ -244,14 +244,14 @@ export function startNatStatusWatcher(opts: StartNatWatcherOpts): { stop(): void
 
   const reclassify = (cause: 'event' | 'soft-timeout' | 'initial'): NatStatus => {
     if (stopped) return cachedNatStatus;
-    if (cause === 'initial') {
+    const addrs = opts.node.getMultiaddrs().map((ma) => ma.toString());
+    const next = classifyAddressesForNat(addrs);
+    if (cause === 'initial' && next !== 'public') {
       // The first post-start snapshot is only the bound-address baseline.
       // AutoNAT has not necessarily updated the peer record yet, so do not
       // turn RFC1918/CGNAT binds into a definitive private verdict here.
       return cachedNatStatus;
     }
-    const addrs = opts.node.getMultiaddrs().map((ma) => ma.toString());
-    const next = classifyAddressesForNat(addrs);
     if (next !== 'unknown') {
       sawDefinitiveClassification = true;
     }
@@ -276,9 +276,9 @@ export function startNatStatusWatcher(opts: StartNatWatcherOpts): { stop(): void
 
   opts.node.addEventListener('self:peer:update', onEvent);
 
-  // Capture the initial baseline without treating it as an AutoNAT verdict.
-  // A real `self:peer:update` or the soft timeout below performs the first
-  // definitive classification.
+  // Capture the initial baseline. Public addrs are safe to surface
+  // immediately; private addrs wait for a real `self:peer:update` or the soft
+  // timeout before becoming definitive.
   reclassify('initial');
 
   if (softTimeoutMs > 0) {

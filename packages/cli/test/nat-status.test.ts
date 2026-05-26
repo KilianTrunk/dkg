@@ -94,15 +94,12 @@ describe('startNatStatusWatcher — transition-only callback semantics', () => {
     _setNatStatusForTest('unknown');
   });
 
-  it('keeps the initial populated snapshot non-definitive until an event fires', () => {
+  it('fires onClassification on the initial pass when addrs are already public', () => {
     const node = makeFakeNode(['/ip4/8.8.8.8/tcp/4001']);
     const onClass = vi.fn();
     const w = startNatStatusWatcher({ node, onClassification: onClass, softTimeoutMs: 0 });
-    expect(onClass).toHaveBeenCalledTimes(0);
-    expect(getNatStatus()).toBe('unknown');
-    node.emit();
     expect(onClass).toHaveBeenCalledTimes(1);
-    expect(onClass).toHaveBeenLastCalledWith('public', 'unknown');
+    expect(onClass).toHaveBeenCalledWith('public', 'unknown');
     expect(getNatStatus()).toBe('public');
     w.stop();
   });

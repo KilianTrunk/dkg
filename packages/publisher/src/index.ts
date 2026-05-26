@@ -49,6 +49,17 @@ export {
   type CollectedACK,
   type ACKCollectionResult,
 } from './ack-collector.js';
+export {
+  ACKProviderError,
+  RpcPreconditionError,
+  QuorumUnmetError,
+  isACKProviderError,
+  isRpcPreconditionError,
+  isQuorumUnmetError,
+  wrapAsRpcPreconditionIfApplicable,
+  type PeerOutcome,
+  type UnwrapRpcOptions,
+} from './ack-errors.js';
 export { StorageACKHandler, type StorageACKHandlerConfig } from './storage-ack-handler.js';
 export {
   VerifyCollector,
@@ -147,6 +158,7 @@ export {
 } from './async-lift-publisher.js';
 export {
   TripleStoreAsyncPromoteQueue,
+  ASYNC_PROMOTE_QUEUE_FORMAT_VERSION,
   PROMOTE_COMMIT_MARKER_STEPS,
   PROMOTE_JOB_STATES,
   PromoteJobConflictError,

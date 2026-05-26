@@ -44,6 +44,7 @@ function messengerFor(router: import('@origintrail-official/dkg-core').ProtocolR
   });
 }
 import { wrapPublisherForTest } from '../../publisher/test/_helpers/seal.js';
+import { hardhatACKProvider } from '../../publisher/test/_helpers/acks.js';
 import { ethers } from 'ethers';
 
 const agents: DKGAgent[] = [];
@@ -65,12 +66,14 @@ afterAll(async () => {
 // Phase C requires `precomputedAttestation` for on-chain publishes; wrap each
 // raw `DKGPublisher` in this file so the proxy mints a seal automatically.
 async function wrapPub(p: DKGPublisher, chain: ReturnType<typeof createEVMAdapter>): Promise<DKGPublisher> {
+  const kav10Address = await chain.getKnowledgeAssetsV10Address();
   return wrapPublisherForTest(p, {
     author: new ethers.Wallet(HARDHAT_KEYS.CORE_OP),
     ctx: {
       provider: createProvider(),
-      kav10Address: await chain.getKnowledgeAssetsV10Address(),
+      kav10Address,
     },
+    v10ACKProvider: hardhatACKProvider(kav10Address),
   });
 }
 
@@ -467,11 +470,12 @@ describe('Access protocol round-trip', () => {
     const keypairB = await generateEd25519Keypair();
     const accessClient = new AccessClient(messengerFor(routerB), keypairB, nodeB.peerId);
 
-    const onChain = result.onChainResult!;
-    const ual = `did:dkg:evm:31337/${onChain.publisherAddress}/${onChain.startKAId}/1`;
-    const accessResult = await accessClient.requestAccess(nodeA.peerId, ual);
+    expect(result.status).toBe('tentative');
+    const ka = result.kaManifest[0];
+    expect(ka).toBeDefined();
+    const accessResult = await accessClient.requestAccess(nodeA.peerId, `${result.ual}/${ka!.tokenId}`);
 
-    expect(accessResult.granted).toBe(true);
+    expect(accessResult.granted, accessResult.rejectionReason).toBe(true);
     expect(accessResult.quads.length).toBeGreaterThanOrEqual(2);
 
     const predicates = accessResult.quads.map(q => q.predicate);

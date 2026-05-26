@@ -293,6 +293,28 @@ export interface DkgConfig {
   listenPort: number;
   nodeRole: 'core' | 'edge';
   /**
+   * Core-Node-specific operator tuning. Today only `allowDegradedRelay`;
+   * future Core-only knobs (e.g. relay-target prioritisation) belong here
+   * rather than at the top level so they stay grouped.
+   */
+  core?: {
+    /**
+     * Gate for the boot-time core-relay sanity check (`core-prereq-check.ts`).
+     *
+     *   - `true` (default): the daemon logs `[CORE-PREREQ] looks degraded`
+     *     with a structured reason if its bound multiaddrs can't serve
+     *     inbound traffic, but boots normally. Backwards-compatible — no
+     *     behaviour change for any existing operator on this PR.
+     *   - `false`: the daemon refuses to boot if the sanity check says
+     *     degraded. Opt-in for operators who want fail-loud semantics
+     *     instead of warn-and-continue.
+     *
+     * Edge nodes ignore this field — the prereq check skips the degraded
+     * verdict for `nodeRole: 'edge'`.
+     */
+    allowDegradedRelay?: boolean;
+  };
+  /**
    * Core Node relay-server capacity tuning. Forwarded into the libp2p
    * relay configuration via `DKGNodeConfig.relayServerCapacity`. Sets
    * the maximum number of simultaneous circuit-relay v2 reservations
@@ -391,6 +413,27 @@ export interface DkgConfig {
     pollIntervalMs?: number;
     errorBackoffMs?: number;
     maxRetries?: number;
+  };
+  /**
+   * Async promote queue worker (WM → SWM). Unlike `publisher` which is
+   * opt-in, the promote worker is **on by default** — without it, jobs
+   * enqueued via `POST /api/assertion/{name}/promote-async` sit in
+   * `queued` forever. Set `enabled: false` to disable when running a
+   * read-only / forensic node where you don't want the worker mutating
+   * SWM. See `docs/specs/SPEC_ASYNC_PROMOTE_QUEUE.md` and the
+   * `dkg-node` skill (§8 "Async promote queue") for the full contract.
+   */
+  promoteQueue?: {
+    /** Default `true`. Set `false` to disable the in-daemon worker. */
+    enabled?: boolean;
+    /** Default 4. Number of concurrent worker slots polling the queue. */
+    workerConcurrency?: number;
+    /** Default 100ms. Polling interval per slot. */
+    pollIntervalMs?: number;
+    /** Default 60_000ms (1 min). Must be >0 and shorter than the queue's 5-min lease when enabled. */
+    heartbeatIntervalMs?: number;
+    /** Default 30_000ms. Max time `stop()` waits for in-flight promotes to drain on shutdown. */
+    shutdownTimeoutMs?: number;
   };
   /** Allowed CORS origins. Defaults to '*' when apiHost is '127.0.0.1', otherwise restrictive. */
   corsOrigins?: string | string[];

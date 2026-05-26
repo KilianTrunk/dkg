@@ -23,6 +23,7 @@ import {
   uniquenessKey,
 } from '../src/async-promote-queue-utils.js';
 import {
+  ASYNC_PROMOTE_QUEUE_FORMAT_VERSION,
   PROMOTE_JOB_STATES,
   PromoteJobConflictError,
   PromoteJobLeaseError,
@@ -478,9 +479,16 @@ describe('TripleStoreAsyncPromoteQueue', () => {
   });
 
   it('21c. claimNext() reconciles expired running jobs before scanning candidates', async () => {
+    // Scenario: worker-1 crashed mid-promote (lease expired after it had
+    // already entered `assertionPromote()`). reconcileExpiredRunning
+    // must ABANDON that row — re-running risks duplicate gossip — so
+    // worker-2's claim sweep sees no eligible candidates and a fresh
+    // enqueue for the same assertion succeeds because the abandoned
+    // row no longer holds the uniqueness key.
     const queue = createQueue({ leaseMs: 10_000 });
     const jobId = await queue.enqueue(makeRequest());
-    await queue.claimNext('worker-1');
+    const claimed = await queue.claimNext('worker-1');
+    await queue.recordCommitMarker(jobId, claimed!.lease!.claimToken, 'promoteStarted');
     advance(60_000);
 
     expect(await queue.claimNext('worker-2')).toBeNull();
@@ -585,13 +593,49 @@ describe('TripleStoreAsyncPromoteQueue', () => {
     expect(job?.lease).toBeUndefined();
   });
 
-  it('26. recoverOnStartup() abandons expired running jobs even when swmInserted=false', async () => {
+  it('26. recoverOnStartup() reclaims expired running jobs when promote never started', async () => {
     const queue = createQueue({ leaseMs: 10_000 });
     const jobId = await queue.enqueue(makeRequest());
     await queue.claimNext('worker-1');
-    // No commit marker recorded. That could mean the worker crashed before
-    // assertionPromote started, or after the internal SWM write and before the
-    // marker write, so automatic rerun is unsafe.
+    // Claim initialises all progress markers to false. If the worker crashed
+    // before promoteStarted=true, a clean rerun is safe.
+
+    advance(60_000);
+    const summary = await queue.recoverOnStartup();
+
+    expect(summary.reclaimed).toBe(1);
+    expect(summary.abandoned).toBe(0);
+    const job = await queue.getStatus(jobId);
+    expect(job?.state).toBe('queued');
+    expect(job?.lease).toBeUndefined();
+    expect(job?.reason).toBeUndefined();
+  });
+
+  it('26b. recoverOnStartup() ABANDONS legacy running jobs without a formatVersion marker (Codex PR #665 id=3302135756)', async () => {
+    // The pre-v2 format had no `commitMarker.promoteStarted` field, so a
+    // running row with `swmInserted: false` could mean either "worker
+    // never started promote" (safe to rerun) or "worker started promote
+    // but the old format never wrote a marker" (rerun would duplicate
+    // gossip + SWM insert). Reclaim is no longer backward-compatible:
+    // legacy rows go to the manual-recovery path.
+    const queue = createQueue({ leaseMs: 10_000 });
+    const jobId = await queue.enqueue(makeRequest());
+    const claimed = await queue.claimNext('worker-1');
+    await (queue as unknown as { writeJob(job: PromoteJob): Promise<void> }).writeJob({
+      ...claimed!,
+      // Drop the formatVersion stamp to simulate a row written by a
+      // pre-v2 daemon process. Marker keeps the full shape (parser
+      // requires every flag) but no `promoteStarted` truth value —
+      // the version gate is what makes the row legacy, not the marker
+      // contents.
+      formatVersion: undefined,
+      commitMarker: {
+        swmInserted: false,
+        wmCleaned: false,
+        lifecycleStamped: false,
+        gossiped: false,
+      } as PromoteJob['commitMarker'],
+    });
 
     advance(60_000);
     const summary = await queue.recoverOnStartup();
@@ -600,11 +644,80 @@ describe('TripleStoreAsyncPromoteQueue', () => {
     expect(summary.abandoned).toBe(1);
     const job = await queue.getStatus(jobId);
     expect(job?.state).toBe('failed');
-    expect(job?.reason).toMatch(/partial promote ambiguity/i);
     expect(job?.lease).toBeUndefined();
+    expect(job?.reason).toMatch(/legacy promote job/i);
+    expect(job?.attempt.lastError?.message).toMatch(/formatVersion=0/);
   });
 
-  it('27. recoverOnStartup() leaves `running` jobs alone when the lease is still valid', async () => {
+  it('26c. recoverOnStartup() RECLAIMS v2 running jobs with promoteStarted=false', async () => {
+    const queue = createQueue({ leaseMs: 10_000 });
+    const jobId = await queue.enqueue(makeRequest());
+    const claimed = await queue.claimNext('worker-1');
+    // Fresh claim leaves promoteStarted=false; row carries the current
+    // formatVersion stamp from enqueue + claimNext.
+    expect(claimed?.formatVersion).toBe(ASYNC_PROMOTE_QUEUE_FORMAT_VERSION);
+    expect(claimed?.commitMarker?.promoteStarted).toBe(false);
+
+    advance(60_000);
+    const summary = await queue.recoverOnStartup();
+
+    expect(summary.reclaimed).toBe(1);
+    expect(summary.abandoned).toBe(0);
+    const job = await queue.getStatus(jobId);
+    expect(job?.state).toBe('queued');
+    expect(job?.formatVersion).toBe(ASYNC_PROMOTE_QUEUE_FORMAT_VERSION);
+    expect(job?.lease).toBeUndefined();
+    expect(job?.commitMarker).toBeUndefined();
+  });
+
+  it('26d. recoverOnStartup() ABANDONS legacy running jobs even when promoteStarted=false is explicitly present', async () => {
+    // Belt-and-braces: even if a hypothetical legacy daemon happens to
+    // have written `promoteStarted: false` into the marker, the version
+    // gate still parks the job for manual inspection. The whole point of
+    // the version field is "trust the marker shape only when the writer
+    // is at our format level or higher".
+    const queue = createQueue({ leaseMs: 10_000 });
+    const jobId = await queue.enqueue(makeRequest());
+    const claimed = await queue.claimNext('worker-1');
+    await (queue as unknown as { writeJob(job: PromoteJob): Promise<void> }).writeJob({
+      ...claimed!,
+      formatVersion: 1,
+      commitMarker: {
+        promoteStarted: false,
+        swmInserted: false,
+        wmCleaned: false,
+        lifecycleStamped: false,
+        gossiped: false,
+      },
+    });
+
+    advance(60_000);
+    const summary = await queue.recoverOnStartup();
+    expect(summary.reclaimed).toBe(0);
+    expect(summary.abandoned).toBe(1);
+    const job = await queue.getStatus(jobId);
+    expect(job?.state).toBe('failed');
+    expect(job?.reason).toMatch(/legacy promote job/i);
+  });
+
+  it('27. recoverOnStartup() abandons expired running jobs after promote has started', async () => {
+    const queue = createQueue({ leaseMs: 10_000 });
+    const jobId = await queue.enqueue(makeRequest());
+    const claimed = await queue.claimNext('worker-1');
+    await queue.recordCommitMarker(jobId, claimed!.lease!.claimToken, 'promoteStarted');
+
+    advance(60_000);
+    const summary = await queue.recoverOnStartup();
+
+    expect(summary.reclaimed).toBe(0);
+    expect(summary.abandoned).toBe(1);
+    const job = await queue.getStatus(jobId);
+    expect(job?.state).toBe('failed');
+    expect(job?.lease).toBeUndefined();
+    expect(job?.reason).toMatch(/partial promote ambiguity/i);
+  });
+
+  it('28. recoverOnStartup() leaves `running` jobs alone when the lease is still valid', async () => {
     const queue = createQueue({ leaseMs: 60_000 });
     const jobId = await queue.enqueue(makeRequest());
     await queue.claimNext('worker-1');
@@ -648,7 +761,7 @@ describe('TripleStoreAsyncPromoteQueue', () => {
     expect(claimed?.state).toBe('running');
   });
 
-  it('28. recoverOnStartup() returns counts of {reclaimed, abandoned}', async () => {
+  it('29. recoverOnStartup() returns counts of {reclaimed, abandoned}', async () => {
     const queue = createQueue({ leaseMs: 10_000 });
     const ids: string[] = [];
     for (let i = 0; i < 4; i++) {
@@ -656,22 +769,23 @@ describe('TripleStoreAsyncPromoteQueue', () => {
       ids.push(id);
       const claimed = await queue.claimNext(`worker-${i}`);
       if (i < 2) {
-        // Half have swmInserted marker → abandoned on recovery.
+        // Half crossed into promote and are ambiguous; the other half died
+        // before promoteStarted and can be safely reclaimed.
         await queue.recordCommitMarker(id, claimed!.lease!.claimToken, 'swmInserted');
       }
     }
 
     advance(60_000);
     const summary = await queue.recoverOnStartup();
-    expect(summary.abandoned).toBe(4);
-    expect(summary.reclaimed).toBe(0);
+    expect(summary.abandoned).toBe(2);
+    expect(summary.reclaimed).toBe(2);
   });
 
   // ---------------------------------------------------------------------------
   // Observability
   // ---------------------------------------------------------------------------
 
-  it('29. getStats() returns queue depth per state', async () => {
+  it('30. getStats() returns queue depth per state', async () => {
     const queue = createQueue();
     const stats0 = await queue.getStats();
     for (const s of PROMOTE_JOB_STATES) expect(stats0[s]).toBe(0);

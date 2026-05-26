@@ -22,6 +22,8 @@ import {
   buildMigrationPlan,
   applyPlan,
   renderPlan,
+  findDkgMonorepoRootFromCwd,
+  resolveMigrationDkgHome,
   type ApplyPlanIo,
   type MigrationPlan,
 } from '../src/migrate-to-npm.js';
@@ -91,10 +93,7 @@ describe('buildMigrationPlan — load-bearing detection', () => {
 });
 
 describe('buildMigrationPlan — alreadyMigrated short-circuit', () => {
-  it.each([
-    ['npm-pinned, no markers', 'npm' as const],
-    ['undefined source, no markers', undefined],
-  ])('returns alreadyMigrated for %s', (_label, src) => {
+  it('returns alreadyMigrated when source is npm-pinned and no markers remain', () => {
     const plan = buildMigrationPlan({
       repoRoot: REPO,
       backupSuffix: 'ts',
@@ -102,10 +101,33 @@ describe('buildMigrationPlan — alreadyMigrated short-circuit', () => {
       dkgHomePostMigration: DKG_HOME,
       daemonAlive: false,
       forceAliveBypass: false,
-      currentAutoUpdateSource: src,
+      currentAutoUpdateSource: 'npm',
       exists: existsOf([]),
     });
     expect(plan).toEqual({ actions: [], warnings: [], blockers: [], alreadyMigrated: true });
+  });
+
+  // Codex review (3301781920): regression — undefined source on a
+  // partially-migrated tree must keep going and emit the config-write
+  // pin, not short-circuit. Previously this case returned alreadyMigrated.
+  it('does NOT short-circuit when source is undefined even if no markers (partial migration repair path)', () => {
+    const plan = buildMigrationPlan({
+      repoRoot: REPO,
+      backupSuffix: 'ts',
+      dkgHomeNow: DKG_HOME,
+      dkgHomePostMigration: DKG_HOME,
+      daemonAlive: false,
+      forceAliveBypass: false,
+      currentAutoUpdateSource: undefined,
+      exists: existsOf([]),
+    });
+    expect(plan.alreadyMigrated).toBe(false);
+    const write = plan.actions.find((a) => a.kind === 'config-write');
+    expect(write).toMatchObject({
+      kind: 'config-write',
+      key: 'autoUpdate.source',
+      value: 'npm',
+    });
   });
 
   it('does NOT short-circuit when source is "git" even if no markers (operator pinned git explicitly)', () => {
@@ -539,5 +561,100 @@ describe('renderPlan — operator-facing output', () => {
       alreadyMigrated: false,
     };
     expect(renderPlan(plan)).toMatch(/Blockers \(must be resolved/);
+  });
+});
+
+describe('findDkgMonorepoRootFromCwd — walk-up', () => {
+  // Codex review (3300428735): regression — a globally installed `dkg`
+  // resolves repoDir() to null even when the operator is cd-ed into the
+  // monorepo they want to migrate. The CLI must walk up from cwd to
+  // locate the real root so the load-bearing top-level package.json
+  // gets renamed.
+  it('returns the monorepo root when started from a subdirectory', () => {
+    const isMonorepo = (dir: string) => dir === '/home/op/dkg-v9';
+    expect(findDkgMonorepoRootFromCwd('/home/op/dkg-v9/packages/cli/dist', isMonorepo))
+      .toBe('/home/op/dkg-v9');
+  });
+
+  it('returns null when no ancestor is a monorepo root', () => {
+    const isMonorepo = () => false;
+    expect(findDkgMonorepoRootFromCwd('/some/random/path', isMonorepo)).toBeNull();
+  });
+
+  it('returns startDir itself when it is the monorepo root', () => {
+    const isMonorepo = (dir: string) => dir === '/repo';
+    expect(findDkgMonorepoRootFromCwd('/repo', isMonorepo)).toBe('/repo');
+  });
+
+  it('integrates with buildMigrationPlan: cwd-walked root produces the load-bearing rename', async () => {
+    const tmp = await mkdtemp(join(tmpdir(), 'dkg-migrate-walkup-'));
+    try {
+      const repoRoot = join(tmp, 'dkg-v9');
+      await mkdir(join(repoRoot, 'packages', 'cli'), { recursive: true });
+      await writeFile(join(repoRoot, 'package.json'), '{}');
+      // Mark the repo as a DKG monorepo per isDkgMonorepoRoot's contract.
+      await writeFile(join(repoRoot, 'pnpm-workspace.yaml'), 'packages:\n  - "packages/*"\n');
+      await writeFile(join(repoRoot, 'project.json'), '{}');
+      await writeFile(
+        join(repoRoot, 'packages', 'cli', 'package.json'),
+        JSON.stringify({ name: '@origintrail-official/dkg' }),
+      );
+      const subDir = join(repoRoot, 'packages', 'cli');
+      const found = findDkgMonorepoRootFromCwd(subDir);
+      expect(found).toBe(repoRoot);
+      // Sanity: the planner emits the load-bearing rename when handed
+      // the walked-up root with a real package.json present.
+      const plan = buildMigrationPlan({
+        repoRoot: found!,
+        backupSuffix: 'ts',
+        dkgHomeNow: DKG_HOME,
+        dkgHomePostMigration: DKG_HOME,
+        daemonAlive: false,
+        forceAliveBypass: false,
+        currentAutoUpdateSource: 'git',
+        exists: existsSync,
+      });
+      expect(plan.actions.some((a) => a.kind === 'rename' && a.from === join(repoRoot, 'package.json') && a.loadBearing)).toBe(true);
+    } finally {
+      await rm(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('resolveMigrationDkgHome — partial-migration home selection', () => {
+  // Codex review (3302171976): regression — a rerun from a
+  // partially-migrated checkout must read/write the standalone home
+  // (~/.dkg) because the live CLI is already in standalone mode
+  // (repoDir() === null after the load-bearing rename), even though
+  // the structural monorepo markers (pnpm-workspace.yaml, project.json,
+  // packages/cli/package.json) remain on disk.
+  it('returns ~/.dkg when detectedRepoRoot is null (live CLI is standalone)', () => {
+    const home = resolveMigrationDkgHome({
+      detectedRepoRoot: null,
+      homeDir: '/home/op',
+      env: {},
+      configExists: false,
+    });
+    expect(home).toBe('/home/op/.dkg');
+  });
+
+  it('returns ~/.dkg-dev when detectedRepoRoot points at a real repo (live CLI in monorepo mode, no global config)', () => {
+    const home = resolveMigrationDkgHome({
+      detectedRepoRoot: '/home/op/dkg-v9',
+      homeDir: '/home/op',
+      env: {},
+      configExists: false,
+    });
+    expect(home).toBe('/home/op/.dkg-dev');
+  });
+
+  it('returns ~/.dkg even with detectedRepoRoot when global config already exists (operator opted in)', () => {
+    const home = resolveMigrationDkgHome({
+      detectedRepoRoot: '/home/op/dkg-v9',
+      homeDir: '/home/op',
+      env: {},
+      configExists: true,
+    });
+    expect(home).toBe('/home/op/.dkg');
   });
 });

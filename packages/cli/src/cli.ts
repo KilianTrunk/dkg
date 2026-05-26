@@ -14,7 +14,6 @@ import {
   dkgAuthTokenPath,
   FAUCET_WALLETS_PER_REQUEST,
   getFundableWalletAddresses,
-  isDkgMonorepoRoot,
   requestFaucetFunding,
   resolveDkgConfigHome,
   toErrorMessage,
@@ -3918,16 +3917,6 @@ async function readAutoUpdateSourceFromHome(
   }
 }
 
-function findDkgRepoRootFromCwd(startDir: string): string | null {
-  let cur = startDir;
-  for (;;) {
-    if (isDkgMonorepoRoot(cur)) return cur;
-    const parent = dirname(cur);
-    if (parent === cur) return null;
-    cur = parent;
-  }
-}
-
 // ─── dkg migrate-to-npm ──────────────────────────────────────────────
 
 program
@@ -3937,9 +3926,15 @@ program
   .option('--force', 'Bypass the daemon-alive safety check. Operator must SIGKILL the worker first; in-flight writes may be lost.', false)
   .action(async (opts: ActionOpts) => {
     const quoteForShell = (value: string) => `'${value.replace(/'/g, "'\\''")}'`;
-    const { buildMigrationPlan, applyPlan, renderPlan } = await import('./migrate-to-npm.js');
+    const {
+      buildMigrationPlan,
+      applyPlan,
+      renderPlan,
+      findDkgMonorepoRootFromCwd,
+      resolveMigrationDkgHome,
+    } = await import('./migrate-to-npm.js');
     const detectedRepoRoot = repoDir();
-    const cwdRepoRoot = findDkgRepoRootFromCwd(process.cwd());
+    const cwdRepoRoot = findDkgMonorepoRootFromCwd(process.cwd());
     const repoRoot = detectedRepoRoot ?? cwdRepoRoot;
     if (!repoRoot) {
       console.error('Refusing to run: current directory is not inside a DKG monorepo checkout.');
@@ -3951,12 +3946,18 @@ program
       console.log('No active git-checkout marker detected at this location (repoDir() === null).');
       console.log(`Continuing from ${repoRoot} so a partial migration can still repair config pins.`);
     }
-    const dkgHomeNow = resolveDkgConfigHome({
-      isDkgMonorepo: isDkgMonorepoRoot(repoRoot),
+    // Codex review (3302171976): base the home on the LIVE CLI's install
+    // mode (detectedRepoRoot !== null) rather than the structural markers
+    // at repoRoot. The structural markers stay true after the load-bearing
+    // package.json rename, so a rerun from a partially-migrated checkout
+    // would otherwise still target ~/.dkg-dev while the standalone CLI
+    // already reads ~/.dkg.
+    const dkgHomeNow = resolveMigrationDkgHome({
+      detectedRepoRoot,
       homeDir: homedir(),
     });
-    const dkgHomePostMigration = resolveDkgConfigHome({
-      isDkgMonorepo: false,
+    const dkgHomePostMigration = resolveMigrationDkgHome({
+      detectedRepoRoot: null,
       homeDir: homedir(),
     });
     const pid = await readPidFromHome(dkgHomeNow);

@@ -70,6 +70,10 @@ import { existsSync } from 'node:fs';
 import { rename, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import yaml from 'js-yaml';
+import {
+  isDkgMonorepoRoot,
+  resolveDkgConfigHome,
+} from '@origintrail-official/dkg-core';
 
 export type MigrationActionKind = 'rename' | 'config-write';
 type ConfigFormat = 'json' | 'yaml';
@@ -246,12 +250,14 @@ export function buildMigrationPlan(opts: BuildPlanOpts): MigrationPlan {
   if (
     !loadBearingPresent &&
     !cosmeticPresent &&
-    (opts.currentAutoUpdateSource === 'npm' || opts.currentAutoUpdateSource === undefined) &&
+    opts.currentAutoUpdateSource === 'npm' &&
     blockers.length === 0
   ) {
-    // No load-bearing artifact AND config already at npm (or unset which
-    // PR-2 treats as auto — but with no marker tree, auto-detect returns
-    // standalone too). Migration is already done.
+    // Codex review (3301781920): only short-circuit when the config pin
+    // is explicitly `npm`. An `undefined` source on a partially-migrated
+    // tree (markers gone, but the previous run died before writing the
+    // pin) needs the config-write action to finish the repair, even
+    // though the markers are absent.
     return { actions: [], warnings: [], blockers: [], alreadyMigrated: true };
   }
 
@@ -440,7 +446,7 @@ async function writeConfigKey(
  */
 export function renderPlan(plan: MigrationPlan): string {
   if (plan.alreadyMigrated) {
-    return 'Already migrated: no source-tree markers found and config is at autoUpdate.source = "npm" (or unset).\n';
+    return 'Already migrated: no source-tree markers found and config is at autoUpdate.source = "npm".\n';
   }
 
   const lines: string[] = [];
@@ -476,4 +482,68 @@ export function renderPlan(plan: MigrationPlan): string {
   }
 
   return lines.join('\n') + '\n';
+}
+
+/**
+ * Walk up from `startDir` looking for a DKG monorepo root.
+ *
+ * Used by `dkg migrate-to-npm` when the executing CLI is a globally
+ * installed binary (so `repoDir()` resolves from `node_modules` and
+ * returns `null`) but the operator is `cd`-ed into the checkout they
+ * want to migrate. Without this fallback the command never finds the
+ * load-bearing top-level `package.json` to rename (Codex 3300428735).
+ *
+ * The default `isMonorepo` predicate is `isDkgMonorepoRoot` from core,
+ * which checks structural markers (`pnpm-workspace.yaml`, `packages/`,
+ * `project.json`) plus the canonical `packages/cli/package.json` name
+ * `@origintrail-official/dkg`. Tests inject a custom predicate so they
+ * don't need on-disk fixtures.
+ */
+export function findDkgMonorepoRootFromCwd(
+  startDir: string,
+  isMonorepo: (dir: string) => boolean = isDkgMonorepoRoot,
+): string | null {
+  let cur = startDir;
+  for (;;) {
+    if (isMonorepo(cur)) return cur;
+    const parent = dirname(cur);
+    if (parent === cur) return null;
+    cur = parent;
+  }
+}
+
+/**
+ * Resolve the DKG home the migration should read/write FROM (i.e. the
+ * one the live CLI is currently using).
+ *
+ * Codex review (3302171976): basing this on `isDkgMonorepoRoot(repoRoot)`
+ * is wrong on a partially-migrated checkout. After the load-bearing
+ * `package.json` rename the structural monorepo markers
+ * (`pnpm-workspace.yaml`, `project.json`, `packages/cli/package.json`)
+ * remain, so `isDkgMonorepoRoot` still returns true. But `repoDir()`
+ * in the live CLI now returns `null` (the rename broke
+ * `findPackageRepoDir`'s `package.json + packages/` check), so the
+ * running daemon and CLI read `~/.dkg`. If the migration command keeps
+ * resolving to `~/.dkg-dev` based on the structural markers, it
+ * "fixes" a config the daemon never reads.
+ *
+ * We mirror the live CLI's view instead: when `repoDir()` returned a
+ * concrete path the install is still in monorepo mode (and uses
+ * `~/.dkg-dev`); when it's `null` the install is standalone (uses
+ * `~/.dkg`), regardless of what walking-up-from-cwd found.
+ */
+export function resolveMigrationDkgHome(opts: {
+  detectedRepoRoot: string | null;
+  homeDir: string;
+  /** Test override forwarded to `resolveDkgConfigHome` to bypass DKG_HOME. */
+  env?: Pick<NodeJS.ProcessEnv, 'DKG_HOME'>;
+  /** Test override forwarded to `resolveDkgConfigHome` to bypass on-disk state. */
+  configExists?: boolean;
+}): string {
+  return resolveDkgConfigHome({
+    isDkgMonorepo: opts.detectedRepoRoot !== null,
+    homeDir: opts.homeDir,
+    env: opts.env,
+    configExists: opts.configExists,
+  });
 }

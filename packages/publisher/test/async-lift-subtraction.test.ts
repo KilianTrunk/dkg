@@ -180,6 +180,78 @@ describe('subtractFinalizedExactQuads', () => {
     expect(result.resolved.privateQuads).toBeUndefined();
   });
 
+  it('removes finalized private IRI-object quads after store round-trip normalization', async () => {
+    const input: LiftValidationInput = {
+      ...baseInput(),
+      resolved: {
+        ...baseInput().resolved,
+        privateQuads: [
+          {
+            subject: 'urn:local:/rihana',
+            predicate: 'http://schema.org/secretLink',
+            object: '<urn:secret:iri-object>',
+            graph: '',
+          },
+        ],
+      },
+    };
+    const validated = validateLiftPublishPayload(input);
+
+    await publisher.publish({
+      contextGraphId: CONTEXT_GRAPH,
+      quads: validated.resolved.quads,
+      privateQuads: validated.resolved.privateQuads,
+      publisherPeerId: 'peer-1',
+    });
+
+    const result = await subtractFinalizedExactQuads({
+      store,
+      graphManager,
+      request: input.request,
+      validation: validated.validation,
+      resolved: validated.resolved,
+    });
+
+    expect(result.alreadyPublishedPrivateCount).toBe(1);
+    expect(result.resolved.privateQuads).toBeUndefined();
+  });
+
+  it('removes finalized private bare IRI-object quads after store round-trip normalization', async () => {
+    const input: LiftValidationInput = {
+      ...baseInput(),
+      resolved: {
+        ...baseInput().resolved,
+        privateQuads: [
+          {
+            subject: 'urn:local:/rihana',
+            predicate: 'http://schema.org/secretBareLink',
+            object: 'urn:secret:bare-iri-object',
+            graph: '',
+          },
+        ],
+      },
+    };
+    const validated = validateLiftPublishPayload(input);
+
+    await publisher.publish({
+      contextGraphId: CONTEXT_GRAPH,
+      quads: validated.resolved.quads,
+      privateQuads: validated.resolved.privateQuads,
+      publisherPeerId: 'peer-1',
+    });
+
+    const result = await subtractFinalizedExactQuads({
+      store,
+      graphManager,
+      request: input.request,
+      validation: validated.validation,
+      resolved: validated.resolved,
+    });
+
+    expect(result.alreadyPublishedPrivateCount).toBe(1);
+    expect(result.resolved.privateQuads).toBeUndefined();
+  });
+
   it('does not subtract when the root is not confirmed even if the quad exists locally', async () => {
     const validated = validateLiftPublishPayload(baseInput());
     const dataGraph = graphManager.dataGraphUri(CONTEXT_GRAPH);

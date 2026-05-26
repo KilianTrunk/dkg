@@ -22,6 +22,35 @@ export type {
   ContextGraphMemberStatus,
   ContextGraphMemberRow,
 } from './db.js';
+export {
+  analyzeGuardianEvent,
+  buildFixPrompt,
+  buildPrivateAuditQuads,
+  buildPublicDependencyQuads,
+  componentsFromFindings,
+  detectDependencyInstalls,
+  ecosystemForOsv,
+  guardianDependencyIntelId,
+  maxSeverity,
+  normalizeGuardianEvent,
+  normalizeSeverity,
+  redactGuardianData,
+  sanitizeText,
+  stableHash,
+} from './guardian.js';
+export type {
+  GuardianDependencyComponent,
+  GuardianDependencyIntelRecord,
+  GuardianEventInput,
+  GuardianEventRecord,
+  GuardianEventType,
+  GuardianFindingRecord,
+  GuardianFindingType,
+  GuardianGraphSyncRecord,
+  GuardianSeverity,
+  GuardianSourceAgent,
+  GuardianSummary,
+} from './guardian.js';
 
 export { StructuredLogger } from './structured-logger.js';
 export { OperationTracker } from './operation-tracker.js';

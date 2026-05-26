@@ -17,12 +17,13 @@ interface TabsState {
 }
 
 const INITIAL_TABS: CenterTab[] = [
+  { id: 'guardian', label: 'Guardian', closable: false },
   { id: 'dashboard', label: 'Dashboard', closable: false },
 ];
 
 export const useTabsStore = create<TabsState>((set, get) => ({
   tabs: INITIAL_TABS,
-  activeTabId: 'dashboard',
+  activeTabId: 'guardian',
 
   openTab: (tab) => {
     const { tabs } = get();

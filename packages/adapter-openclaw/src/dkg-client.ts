@@ -152,6 +152,24 @@ export interface AgentIdentity {
   nodeIdentityId: string;
 }
 
+export interface OpenClawGuardianEvent {
+  idempotencyKey?: string;
+  occurredAt?: string | number;
+  type?: string;
+  sourceAgent?: {
+    framework: 'openclaw';
+    name?: string;
+    version?: string;
+  };
+  sessionId?: string;
+  toolName?: string;
+  severity?: string;
+  title?: string;
+  summary?: string;
+  data?: Record<string, unknown>;
+  metadata?: Record<string, unknown>;
+}
+
 const CHAT_TURNS_CONTEXT_GRAPH_ID = 'agent-context';
 const CHAT_TURNS_ASSERTION_NAME = 'chat-turns';
 const RDF_TYPE = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type';
@@ -714,6 +732,36 @@ export class DkgDaemonClient {
       persistenceState: opts?.persistenceState,
       failureReason: opts?.failureReason,
     });
+    await this.recordGuardianEvent({
+      type: 'llm_turn',
+      sourceAgent: { framework: 'openclaw', name: 'OpenClaw' },
+      sessionId,
+      idempotencyKey: `openclaw:turn:${sessionId}:${opts?.turnId ?? stableClientHash({
+        userMessage,
+        assistantReply,
+        toolCalls: opts?.toolCalls,
+        attachmentRefs: opts?.attachmentRefs,
+      })}`,
+      title: 'OpenClaw turn observed',
+      summary: 'OpenClaw persisted a chat turn through the DKG adapter.',
+      data: {
+        turnId: opts?.turnId,
+        userMessage,
+        assistantReply,
+        toolCalls: opts?.toolCalls,
+        attachmentRefs: opts?.attachmentRefs,
+        persistenceState: opts?.persistenceState,
+        failureReason: opts?.failureReason,
+      },
+    });
+  }
+
+  async recordGuardianEvent(event: OpenClawGuardianEvent): Promise<void> {
+    try {
+      await this.post('/api/guardian/events', event);
+    } catch {
+      // Guardian is observational; audit delivery must never break OpenClaw.
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -1066,4 +1114,12 @@ function stripTrailingSlashes(value: string): string {
     end -= 1;
   }
   return value.slice(0, end);
+}
+
+function stableClientHash(value: unknown): string {
+  return JSON.stringify(value, Object.keys(value as object).sort())
+    .split('')
+    .reduce((hash, ch) => ((hash << 5) - hash + ch.charCodeAt(0)) | 0, 0)
+    .toString(16)
+    .replace('-', 'n');
 }

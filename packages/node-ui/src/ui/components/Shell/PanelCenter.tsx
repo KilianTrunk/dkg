@@ -1,6 +1,7 @@
 import React, { Suspense, useState, useEffect } from 'react';
 import { useTabsStore } from '../../stores/tabs.js';
 import { DashboardView } from '../../views/DashboardView.js';
+import { GuardianView } from '../../views/GuardianView.js';
 import { ProjectView } from '../../views/ProjectView.js';
 import { ContextGraphPrimerView } from '../../views/ContextGraphPrimerView.js';
 import { MemoryLayerView } from '../../views/MemoryLayerView.js';
@@ -269,6 +270,8 @@ function DocumentViewer({ docRef, contentType: expectedContentType }: { docRef: 
 
 function ViewContainer() {
   const activeTabId = useTabsStore((s) => s.activeTabId);
+
+  if (activeTabId === 'guardian') return <GuardianView />;
 
   if (activeTabId === 'dashboard') return <DashboardView />;
 

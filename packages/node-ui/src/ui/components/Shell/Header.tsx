@@ -7,6 +7,8 @@ import { useProjectsStore } from '../../stores/projects.js';
 import { useTabsStore } from '../../stores/tabs.js';
 import { useNodeEvents } from '../../hooks/useNodeEvents.js';
 
+const GUARDIAN_LOGO_URL = new URL('../../assets/guardian-logo.svg', import.meta.url).href;
+
 /** OriginTrail wordmark — same paths as `v9-stable` packages/node-ui App.tsx sidebar. */
 const ORIGINTRAIL_WORDMARK = (
   <span className="v10-header-ot-wordmark">
@@ -127,7 +129,8 @@ export function Header() {
   return (
     <header className="v10-header">
       <div className="v10-header-logo">
-        <span className="v10-header-logo-text">DKG <span className="v10-header-logo-version">v10</span></span>
+        <img className="v10-header-guardian-logo" src={GUARDIAN_LOGO_URL} alt="Umanitek" />
+        <span className="v10-header-logo-text">Guardian <span className="v10-header-logo-version">DKG v10</span></span>
         <div className="v10-header-logo-ot" aria-label="Powered by OriginTrail">
           <span className="v10-header-logo-ot-by">powered by</span>
           {ORIGINTRAIL_WORDMARK}

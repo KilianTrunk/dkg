@@ -17,5 +17,6 @@ export * from './http-utils.js';
 export * from './auto-update.js';
 export * from './openclaw.js';
 export * from './local-agents.js';
+export * from './routes/guardian.js';
 export * from './lifecycle.js';
 export * from './handle-request.js';

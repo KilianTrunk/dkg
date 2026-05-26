@@ -329,6 +329,7 @@ import { handleContextGraphRoutes } from './routes/context-graph.js';
 import { handleAssertionRoutes } from './routes/assertion.js';
 import { handleQueryRoutes } from './routes/query.js';
 import { handleLocalAgentsRoutes } from './routes/local-agents.js';
+import { handleGuardianRoutes } from './routes/guardian.js';
 import { handleEpcisRoutes } from './routes/epcis.js';
 import { handlePcaRoutes } from './routes/pca.js';
 import { handlePluginRoutes } from './routes/plugins.js';
@@ -438,6 +439,9 @@ export async function handleRequest(
   if (res.writableEnded) return;
 
   await handleLocalAgentsRoutes(ctx);
+  if (res.writableEnded) return;
+
+  await handleGuardianRoutes(ctx);
   if (res.writableEnded) return;
 
   await handleEpcisRoutes(ctx);

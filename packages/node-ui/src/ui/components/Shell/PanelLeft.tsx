@@ -222,6 +222,13 @@ export function PanelLeft() {
       {treeMode === 'explorer' && (
         <div className="v10-tree-content">
           <div
+            className={`v10-tree-dashboard ${activeTabId === 'guardian' ? 'active' : ''}`}
+            onClick={() => { setActiveTab('guardian'); setActiveProject(null); }}
+          >
+            <span>G</span> Guardian
+          </div>
+
+          <div
             className={`v10-tree-dashboard ${activeTabId === 'dashboard' ? 'active' : ''}`}
             onClick={() => { setActiveTab('dashboard'); setActiveProject(null); }}
           >

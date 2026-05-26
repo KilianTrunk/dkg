@@ -722,6 +722,7 @@ describe('DkgDaemonClient', () => {
   it('storeChatTurn should POST to /api/openclaw-channel/persist-turn', async () => {
     fetchResponses.push(
       new Response(JSON.stringify({}), { status: 200 }),
+      new Response(JSON.stringify({ ok: true }), { status: 200 }),
     );
 
     await client.storeChatTurn('session-1', 'Hello', 'Hi there', { turnId: 'turn-1' });
@@ -734,6 +735,28 @@ describe('DkgDaemonClient', () => {
     expect(body.userMessage).toBe('Hello');
     expect(body.assistantReply).toBe('Hi there');
     expect(body.turnId).toBe('turn-1');
+
+    const [guardianUrl, guardianOpts] = fetchCalls[1];
+    expect(guardianUrl).toBe('http://localhost:9200/api/guardian/events');
+    const guardianBody = JSON.parse(guardianOpts?.body as string);
+    expect(guardianBody.type).toBe('llm_turn');
+    expect(guardianBody.sourceAgent.framework).toBe('openclaw');
+    expect(guardianBody.sessionId).toBe('session-1');
+    expect(guardianBody.idempotencyKey).toBe('openclaw:turn:session-1:turn-1');
+    expect(guardianBody.data.userMessage).toBe('Hello');
+  });
+
+  it('storeChatTurn fails open when Guardian event delivery fails', async () => {
+    fetchResponses.push(
+      new Response(JSON.stringify({}), { status: 200 }),
+      new Response(JSON.stringify({ error: 'offline' }), { status: 503 }),
+    );
+
+    await expect(client.storeChatTurn('session-1', 'Hello', 'Hi there', { turnId: 'turn-1' })).resolves.toBeUndefined();
+    expect(fetchCalls.map(([url]) => String(url))).toEqual([
+      'http://localhost:9200/api/openclaw-channel/persist-turn',
+      'http://localhost:9200/api/guardian/events',
+    ]);
   });
 
   // ---------------------------------------------------------------------------

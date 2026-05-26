@@ -153,6 +153,131 @@ export const fetchFailedOperations = (params: { phase?: string; operationName?: 
   return get<{ operations: any[] }>(`/api/failed-operations${q ? '?' + q : ''}`);
 };
 
+// --- Guardian audit ---
+export type GuardianSeverity = 'info' | 'low' | 'medium' | 'high' | 'critical';
+
+export interface GuardianEvent {
+  id: string;
+  ts: number;
+  source_agent: string;
+  agent_framework: string;
+  session_id: string | null;
+  task_id: string | null;
+  tool_call_id: string | null;
+  event_type: string;
+  severity: GuardianSeverity;
+  title: string;
+  summary: string;
+  tool_name: string | null;
+  status: string;
+  raw_json: string;
+  redacted: number;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface GuardianFinding {
+  id: string;
+  event_id: string | null;
+  ts: number;
+  type: string;
+  severity: GuardianSeverity;
+  title: string;
+  summary: string;
+  recommendation: string;
+  evidence_json: string;
+  status: 'open' | 'acknowledged' | 'resolved';
+  public_safe: number;
+  package_name: string | null;
+  package_version: string | null;
+  package_ecosystem: string | null;
+  advisory_id: string | null;
+  graph_scope: 'private' | 'public';
+  created_at: number;
+  updated_at: number;
+}
+
+export interface GuardianDependencyIntel {
+  id: string;
+  ecosystem: string;
+  package_name: string;
+  package_version: string;
+  advisory_id: string;
+  cve_ids_json: string;
+  severity: GuardianSeverity;
+  summary: string;
+  fixed_versions_json: string;
+  references_json: string;
+  known_exploited: number;
+  exploited_at: string | null;
+  epss_score: number | null;
+  epss_percentile: number | null;
+  epss_date: string | null;
+  publish_status: 'pending' | 'published' | 'failed' | 'skipped';
+  publish_error: string | null;
+  publish_tx_hash: string | null;
+  public_graph_id: string | null;
+  updated_at: number;
+  last_seen_at: number;
+}
+
+export interface GuardianGraphSync {
+  id: string;
+  scope: 'private' | 'public';
+  context_graph_id: string;
+  status: 'pending' | 'synced' | 'failed' | 'skipped';
+  last_error: string | null;
+  last_synced_at: number | null;
+  details_json: string;
+  updated_at: number;
+}
+
+export interface GuardianSummary {
+  totals: {
+    events: number;
+    openFindings: number;
+    criticalFindings: number;
+    vulnerableDependencies: number;
+    sensitivePathFindings: number;
+    promptInjectionFindings: number;
+  };
+  bySeverity: Record<GuardianSeverity, number>;
+  agents: Array<{ framework: string; name: string; events: number; lastSeenAt: number }>;
+  graphs: GuardianGraphSync[];
+}
+
+export const fetchGuardianSummary = () =>
+  get<{ summary: GuardianSummary; dependencyIntel: GuardianDependencyIntel[] }>('/api/guardian/summary');
+
+export const fetchGuardianEvents = (params: { agent?: string; type?: string; severity?: string; since?: number; limit?: number; offset?: number } = {}) => {
+  const qs = new URLSearchParams();
+  if (params.agent) qs.set('agent', params.agent);
+  if (params.type) qs.set('type', params.type);
+  if (params.severity) qs.set('severity', params.severity);
+  if (params.since) qs.set('since', String(params.since));
+  if (params.limit) qs.set('limit', String(params.limit));
+  if (params.offset) qs.set('offset', String(params.offset));
+  const q = qs.toString();
+  return get<{ events: GuardianEvent[]; total: number }>(`/api/guardian/events${q ? '?' + q : ''}`);
+};
+
+export const fetchGuardianFindings = (params: { status?: string; type?: string; severity?: string; limit?: number; offset?: number } = {}) => {
+  const qs = new URLSearchParams();
+  if (params.status) qs.set('status', params.status);
+  if (params.type) qs.set('type', params.type);
+  if (params.severity) qs.set('severity', params.severity);
+  if (params.limit) qs.set('limit', String(params.limit));
+  if (params.offset) qs.set('offset', String(params.offset));
+  const q = qs.toString();
+  return get<{ findings: GuardianFinding[]; total: number }>(`/api/guardian/findings${q ? '?' + q : ''}`);
+};
+
+export const runGuardianDependencyAudit = (components?: Array<{ ecosystem: string; name: string; version: string; source?: string }>) =>
+  post<{ ok: boolean; dependencyIntel: GuardianDependencyIntel[] }>('/api/guardian/audit/dependencies', { components: components ?? [] });
+
+export const generateGuardianFixPrompt = () =>
+  post<{ ok: boolean; prompt: string; findingCount: number }>('/api/guardian/fix-prompt', {});
+
 // --- Operation stats ---
 export const fetchOperationStats = (params: { name?: string; periodMs?: number } = {}) => {
   const qs = new URLSearchParams();

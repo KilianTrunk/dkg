@@ -12,6 +12,7 @@ export * from './daemon/auto-update.js';
 export * from './daemon/openclaw.js';
 export * from './daemon/hermes.js';
 export * from './daemon/local-agents.js';
+export * from './daemon/routes/guardian.js';
 export * from './daemon/lifecycle.js';
 export * from './daemon/handle-request.js';
 export * from './daemon/shutdown.js';

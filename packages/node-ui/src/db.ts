@@ -8,8 +8,16 @@ import {
   type ProtocolOutboxEntry,
   type ProtocolOutboxStore,
 } from '@origintrail-official/dkg-core';
+import type {
+  GuardianDependencyIntelRecord,
+  GuardianEventRecord,
+  GuardianFindingRecord,
+  GuardianGraphSyncRecord,
+  GuardianSeverity,
+  GuardianSummary,
+} from './guardian.js';
 
-const SCHEMA_VERSION = 14;
+const SCHEMA_VERSION = 15;
 const DEFAULT_RETENTION_DAYS = 90;
 
 export interface DashboardDBOptions {
@@ -490,6 +498,102 @@ export class DashboardDB {
       }
     }
 
+    if (version < 15) {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS guardian_events (
+          id TEXT PRIMARY KEY,
+          ts INTEGER NOT NULL,
+          source_agent TEXT NOT NULL,
+          agent_framework TEXT NOT NULL,
+          session_id TEXT,
+          task_id TEXT,
+          tool_call_id TEXT,
+          event_type TEXT NOT NULL,
+          severity TEXT NOT NULL,
+          title TEXT NOT NULL,
+          summary TEXT NOT NULL,
+          tool_name TEXT,
+          status TEXT NOT NULL,
+          raw_json TEXT NOT NULL,
+          redacted INTEGER NOT NULL DEFAULT 1,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_guardian_events_ts ON guardian_events(ts);
+        CREATE INDEX IF NOT EXISTS idx_guardian_events_framework ON guardian_events(agent_framework);
+        CREATE INDEX IF NOT EXISTS idx_guardian_events_type ON guardian_events(event_type);
+        CREATE INDEX IF NOT EXISTS idx_guardian_events_severity ON guardian_events(severity);
+
+        CREATE TABLE IF NOT EXISTS guardian_findings (
+          id TEXT PRIMARY KEY,
+          event_id TEXT,
+          ts INTEGER NOT NULL,
+          type TEXT NOT NULL,
+          severity TEXT NOT NULL,
+          title TEXT NOT NULL,
+          summary TEXT NOT NULL,
+          recommendation TEXT NOT NULL,
+          evidence_json TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'open',
+          public_safe INTEGER NOT NULL DEFAULT 0,
+          package_name TEXT,
+          package_version TEXT,
+          package_ecosystem TEXT,
+          advisory_id TEXT,
+          graph_scope TEXT NOT NULL DEFAULT 'private',
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL,
+          FOREIGN KEY(event_id) REFERENCES guardian_events(id) ON DELETE SET NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_guardian_findings_event ON guardian_findings(event_id);
+        CREATE INDEX IF NOT EXISTS idx_guardian_findings_status ON guardian_findings(status);
+        CREATE INDEX IF NOT EXISTS idx_guardian_findings_severity ON guardian_findings(severity);
+        CREATE INDEX IF NOT EXISTS idx_guardian_findings_type ON guardian_findings(type);
+        CREATE INDEX IF NOT EXISTS idx_guardian_findings_package ON guardian_findings(package_ecosystem, package_name, package_version);
+
+        CREATE TABLE IF NOT EXISTS guardian_dependency_intel (
+          id TEXT PRIMARY KEY,
+          ecosystem TEXT NOT NULL,
+          package_name TEXT NOT NULL,
+          package_version TEXT NOT NULL,
+          advisory_id TEXT NOT NULL,
+          cve_ids_json TEXT NOT NULL,
+          severity TEXT NOT NULL,
+          summary TEXT NOT NULL,
+          fixed_versions_json TEXT NOT NULL,
+          references_json TEXT NOT NULL,
+          known_exploited INTEGER NOT NULL DEFAULT 0,
+          exploited_at TEXT,
+          epss_score REAL,
+          epss_percentile REAL,
+          epss_date TEXT,
+          osv_json TEXT NOT NULL,
+          publish_status TEXT NOT NULL DEFAULT 'pending',
+          publish_error TEXT,
+          publish_tx_hash TEXT,
+          public_graph_id TEXT,
+          updated_at INTEGER NOT NULL,
+          last_seen_at INTEGER NOT NULL,
+          UNIQUE(ecosystem, package_name, package_version, advisory_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_guardian_dependency_pkg ON guardian_dependency_intel(ecosystem, package_name, package_version);
+        CREATE INDEX IF NOT EXISTS idx_guardian_dependency_publish ON guardian_dependency_intel(publish_status);
+        CREATE INDEX IF NOT EXISTS idx_guardian_dependency_exploited ON guardian_dependency_intel(known_exploited);
+
+        CREATE TABLE IF NOT EXISTS guardian_graph_sync (
+          id TEXT PRIMARY KEY,
+          scope TEXT NOT NULL,
+          context_graph_id TEXT NOT NULL,
+          status TEXT NOT NULL,
+          last_error TEXT,
+          last_synced_at INTEGER,
+          details_json TEXT NOT NULL,
+          updated_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_guardian_graph_sync_scope ON guardian_graph_sync(scope);
+      `);
+    }
+
     this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
 
     const savedRetention = this.db.prepare("SELECT value FROM settings WHERE key = 'retentionDays'").get() as { value: string } | undefined;
@@ -511,6 +615,7 @@ export class DashboardDB {
     this.db.exec(`DELETE FROM chat_messages WHERE ts < ${cutoff}`);
     this.db.exec(`DELETE FROM chat_persistence_jobs WHERE updated_at < ${cutoff} AND status IN ('stored', 'failed')`);
     this.db.exec(`DELETE FROM notifications WHERE ts < ${cutoff}`);
+    this.db.exec(`DELETE FROM guardian_events WHERE ts < ${cutoff}`);
     // Universal Messenger idempotency table. Shorter TTL than the
     // 90-day operator retention: no realistic dedup window extends
     // beyond a day. The protocol_outbox table is intentionally not
@@ -527,6 +632,265 @@ export class DashboardDB {
   private stmt(key: string, sql: string): Database.Statement {
     if (!this._stmts[key]) this._stmts[key] = this.db.prepare(sql);
     return this._stmts[key];
+  }
+
+  // --- Guardian audit ---
+
+  upsertGuardianEvent(event: GuardianEventRecord): { inserted: boolean } {
+    const existing = this.db.prepare('SELECT id FROM guardian_events WHERE id = ?').get(event.id) as { id: string } | undefined;
+    this.stmt('upsertGuardianEvent', `
+      INSERT INTO guardian_events (
+        id, ts, source_agent, agent_framework, session_id, task_id, tool_call_id,
+        event_type, severity, title, summary, tool_name, status, raw_json,
+        redacted, created_at, updated_at
+      ) VALUES (
+        @id, @ts, @source_agent, @agent_framework, @session_id, @task_id, @tool_call_id,
+        @event_type, @severity, @title, @summary, @tool_name, @status, @raw_json,
+        @redacted, @created_at, @updated_at
+      )
+      ON CONFLICT(id) DO UPDATE SET
+        ts = excluded.ts,
+        source_agent = excluded.source_agent,
+        agent_framework = excluded.agent_framework,
+        session_id = excluded.session_id,
+        task_id = excluded.task_id,
+        tool_call_id = excluded.tool_call_id,
+        event_type = excluded.event_type,
+        severity = excluded.severity,
+        title = excluded.title,
+        summary = excluded.summary,
+        tool_name = excluded.tool_name,
+        status = excluded.status,
+        raw_json = excluded.raw_json,
+        redacted = excluded.redacted,
+        updated_at = excluded.updated_at
+    `).run(event);
+    return { inserted: !existing };
+  }
+
+  upsertGuardianFindings(findings: GuardianFindingRecord[]): void {
+    if (findings.length === 0) return;
+    const stmt = this.stmt('upsertGuardianFinding', `
+      INSERT INTO guardian_findings (
+        id, event_id, ts, type, severity, title, summary, recommendation,
+        evidence_json, status, public_safe, package_name, package_version,
+        package_ecosystem, advisory_id, graph_scope, created_at, updated_at
+      ) VALUES (
+        @id, @event_id, @ts, @type, @severity, @title, @summary, @recommendation,
+        @evidence_json, @status, @public_safe, @package_name, @package_version,
+        @package_ecosystem, @advisory_id, @graph_scope, @created_at, @updated_at
+      )
+      ON CONFLICT(id) DO UPDATE SET
+        event_id = excluded.event_id,
+        ts = excluded.ts,
+        type = excluded.type,
+        severity = excluded.severity,
+        title = excluded.title,
+        summary = excluded.summary,
+        recommendation = excluded.recommendation,
+        evidence_json = excluded.evidence_json,
+        public_safe = excluded.public_safe,
+        package_name = excluded.package_name,
+        package_version = excluded.package_version,
+        package_ecosystem = excluded.package_ecosystem,
+        advisory_id = COALESCE(excluded.advisory_id, guardian_findings.advisory_id),
+        graph_scope = excluded.graph_scope,
+        updated_at = excluded.updated_at
+    `);
+    const tx = this.db.transaction((rows: GuardianFindingRecord[]) => {
+      for (const row of rows) stmt.run(row);
+    });
+    tx(findings);
+  }
+
+  upsertGuardianDependencyIntel(intel: GuardianDependencyIntelRecord): void {
+    this.stmt('upsertGuardianDependencyIntel', `
+      INSERT INTO guardian_dependency_intel (
+        id, ecosystem, package_name, package_version, advisory_id, cve_ids_json,
+        severity, summary, fixed_versions_json, references_json, known_exploited,
+        exploited_at, epss_score, epss_percentile, epss_date, osv_json,
+        publish_status, publish_error, publish_tx_hash, public_graph_id,
+        updated_at, last_seen_at
+      ) VALUES (
+        @id, @ecosystem, @package_name, @package_version, @advisory_id, @cve_ids_json,
+        @severity, @summary, @fixed_versions_json, @references_json, @known_exploited,
+        @exploited_at, @epss_score, @epss_percentile, @epss_date, @osv_json,
+        @publish_status, @publish_error, @publish_tx_hash, @public_graph_id,
+        @updated_at, @last_seen_at
+      )
+      ON CONFLICT(ecosystem, package_name, package_version, advisory_id) DO UPDATE SET
+        cve_ids_json = excluded.cve_ids_json,
+        severity = excluded.severity,
+        summary = excluded.summary,
+        fixed_versions_json = excluded.fixed_versions_json,
+        references_json = excluded.references_json,
+        known_exploited = excluded.known_exploited,
+        exploited_at = excluded.exploited_at,
+        epss_score = excluded.epss_score,
+        epss_percentile = excluded.epss_percentile,
+        epss_date = excluded.epss_date,
+        osv_json = excluded.osv_json,
+        publish_status = CASE
+          WHEN guardian_dependency_intel.publish_status = 'published' THEN guardian_dependency_intel.publish_status
+          ELSE excluded.publish_status
+        END,
+        publish_error = excluded.publish_error,
+        publish_tx_hash = COALESCE(guardian_dependency_intel.publish_tx_hash, excluded.publish_tx_hash),
+        public_graph_id = excluded.public_graph_id,
+        updated_at = excluded.updated_at,
+        last_seen_at = excluded.last_seen_at
+    `).run(intel);
+  }
+
+  updateGuardianDependencyPublish(id: string, patch: {
+    publish_status: GuardianDependencyIntelRecord['publish_status'];
+    publish_error?: string | null;
+    publish_tx_hash?: string | null;
+    public_graph_id?: string | null;
+  }): void {
+    this.stmt('updateGuardianDependencyPublish', `
+      UPDATE guardian_dependency_intel
+      SET publish_status = @publish_status,
+          publish_error = @publish_error,
+          publish_tx_hash = COALESCE(@publish_tx_hash, publish_tx_hash),
+          public_graph_id = COALESCE(@public_graph_id, public_graph_id),
+          updated_at = @updated_at
+      WHERE id = @id
+    `).run({
+      id,
+      publish_status: patch.publish_status,
+      publish_error: patch.publish_error ?? null,
+      publish_tx_hash: patch.publish_tx_hash ?? null,
+      public_graph_id: patch.public_graph_id ?? null,
+      updated_at: Date.now(),
+    });
+  }
+
+  listGuardianEvents(opts: {
+    agentFramework?: string;
+    type?: string;
+    severity?: string;
+    since?: number;
+    limit?: number;
+    offset?: number;
+  } = {}): { events: GuardianEventRecord[]; total: number } {
+    const wheres: string[] = [];
+    const params: unknown[] = [];
+    if (opts.agentFramework) { wheres.push('agent_framework = ?'); params.push(opts.agentFramework); }
+    if (opts.type) { wheres.push('event_type = ?'); params.push(opts.type); }
+    if (opts.severity) { wheres.push('severity = ?'); params.push(opts.severity); }
+    if (opts.since) { wheres.push('ts >= ?'); params.push(opts.since); }
+    const where = wheres.length ? `WHERE ${wheres.join(' AND ')}` : '';
+    const total = (this.db.prepare(`SELECT COUNT(*) as c FROM guardian_events ${where}`).get(...params) as { c: number }).c;
+    const events = this.db.prepare(`
+      SELECT * FROM guardian_events ${where}
+      ORDER BY ts DESC
+      LIMIT ? OFFSET ?
+    `).all(...params, opts.limit ?? 100, opts.offset ?? 0) as GuardianEventRecord[];
+    return { events, total };
+  }
+
+  listGuardianFindings(opts: {
+    status?: string;
+    type?: string;
+    severity?: string;
+    limit?: number;
+    offset?: number;
+  } = {}): { findings: GuardianFindingRecord[]; total: number } {
+    const wheres: string[] = [];
+    const params: unknown[] = [];
+    if (opts.status) { wheres.push('status = ?'); params.push(opts.status); }
+    if (opts.type) { wheres.push('type = ?'); params.push(opts.type); }
+    if (opts.severity) { wheres.push('severity = ?'); params.push(opts.severity); }
+    const where = wheres.length ? `WHERE ${wheres.join(' AND ')}` : '';
+    const total = (this.db.prepare(`SELECT COUNT(*) as c FROM guardian_findings ${where}`).get(...params) as { c: number }).c;
+    const findings = this.db.prepare(`
+      SELECT * FROM guardian_findings ${where}
+      ORDER BY
+        CASE severity
+          WHEN 'critical' THEN 4
+          WHEN 'high' THEN 3
+          WHEN 'medium' THEN 2
+          WHEN 'low' THEN 1
+          ELSE 0
+        END DESC,
+        ts DESC
+      LIMIT ? OFFSET ?
+    `).all(...params, opts.limit ?? 100, opts.offset ?? 0) as GuardianFindingRecord[];
+    return { findings, total };
+  }
+
+  listGuardianDependencyIntel(limit = 100): GuardianDependencyIntelRecord[] {
+    return this.db.prepare(`
+      SELECT * FROM guardian_dependency_intel
+      ORDER BY known_exploited DESC,
+        CASE severity
+          WHEN 'critical' THEN 4
+          WHEN 'high' THEN 3
+          WHEN 'medium' THEN 2
+          WHEN 'low' THEN 1
+          ELSE 0
+        END DESC,
+        updated_at DESC
+      LIMIT ?
+    `).all(limit) as GuardianDependencyIntelRecord[];
+  }
+
+  upsertGuardianGraphSync(record: GuardianGraphSyncRecord): void {
+    this.stmt('upsertGuardianGraphSync', `
+      INSERT INTO guardian_graph_sync (
+        id, scope, context_graph_id, status, last_error, last_synced_at, details_json, updated_at
+      ) VALUES (
+        @id, @scope, @context_graph_id, @status, @last_error, @last_synced_at, @details_json, @updated_at
+      )
+      ON CONFLICT(id) DO UPDATE SET
+        scope = excluded.scope,
+        context_graph_id = excluded.context_graph_id,
+        status = excluded.status,
+        last_error = excluded.last_error,
+        last_synced_at = excluded.last_synced_at,
+        details_json = excluded.details_json,
+        updated_at = excluded.updated_at
+    `).run(record);
+  }
+
+  listGuardianGraphSync(): GuardianGraphSyncRecord[] {
+    return this.db.prepare('SELECT * FROM guardian_graph_sync ORDER BY scope ASC, context_graph_id ASC').all() as GuardianGraphSyncRecord[];
+  }
+
+  getGuardianSummary(): GuardianSummary {
+    const count = (sql: string, ...params: unknown[]) =>
+      (this.db.prepare(sql).get(...params) as { c: number } | undefined)?.c ?? 0;
+    const severityRows = this.db.prepare(`
+      SELECT severity, COUNT(*) as c
+      FROM guardian_findings
+      WHERE status = 'open'
+      GROUP BY severity
+    `).all() as Array<{ severity: GuardianSeverity; c: number }>;
+    const bySeverity: Record<GuardianSeverity, number> = { info: 0, low: 0, medium: 0, high: 0, critical: 0 };
+    for (const row of severityRows) {
+      if (row.severity in bySeverity) bySeverity[row.severity] = row.c;
+    }
+    const agents = this.db.prepare(`
+      SELECT agent_framework as framework, source_agent as name, COUNT(*) as events, MAX(ts) as lastSeenAt
+      FROM guardian_events
+      GROUP BY agent_framework, source_agent
+      ORDER BY lastSeenAt DESC
+      LIMIT 20
+    `).all() as Array<{ framework: string; name: string; events: number; lastSeenAt: number }>;
+    return {
+      totals: {
+        events: count('SELECT COUNT(*) as c FROM guardian_events'),
+        openFindings: count("SELECT COUNT(*) as c FROM guardian_findings WHERE status = 'open'"),
+        criticalFindings: count("SELECT COUNT(*) as c FROM guardian_findings WHERE status = 'open' AND severity = 'critical'"),
+        vulnerableDependencies: count('SELECT COUNT(*) as c FROM guardian_dependency_intel'),
+        sensitivePathFindings: count("SELECT COUNT(*) as c FROM guardian_findings WHERE status = 'open' AND type = 'sensitive_path_access'"),
+        promptInjectionFindings: count("SELECT COUNT(*) as c FROM guardian_findings WHERE status = 'open' AND type = 'prompt_injection'"),
+      },
+      bySeverity,
+      agents,
+      graphs: this.listGuardianGraphSync(),
+    };
   }
 
   // --- Metric snapshots ---

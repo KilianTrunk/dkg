@@ -374,6 +374,62 @@ export class EVMChainAdapter implements ChainAdapter {
   private inflightDurationProbeContract: Contract | undefined;
   private inflightDurationProbeStartedAt = 0;
 
+  /**
+   * PR3 / RC11 — TTL cache for the three "publish pre-flight" reads the
+   * V10 ACK provider needs on every publish:
+   *
+   *   - `getEvmChainId()`           (chain id, never changes after
+   *                                  the JSON-RPC endpoint is configured)
+   *   - `getKnowledgeAssetsV10Address()` (KAV10 contract address —
+   *                                  changes only on contract redeploy)
+   *   - `getMinimumRequiredSignatures()` (governance parameter — changes
+   *                                  only on a `ParametersStorage` write)
+   *
+   * Pre-PR3 every publish issued three serial JSON-RPC calls before
+   * even dialling peers for ACKs. The dzudza incident (Sun 20:42 UTC,
+   * `eth_chainId` rate-limited on the public Base Sepolia RPC) is the
+   * canonical symptom: a single rate-limited pre-flight call killed
+   * the entire publish path even though the chain values themselves
+   * had never changed for the daemon's lifetime.
+   *
+   * The TTL is conservative (1h) because all three values are
+   * structurally stable. A `ParametersStorage` governance vote that
+   * changed `minimumRequiredSignatures` mid-cycle would take up to 1h
+   * to propagate to the ACK collector — acceptable, since the contract
+   * itself rejects mismatched-quorum publishes and the publisher
+   * retries on the next attempt. Chain-id and KAV10 address never
+   * change without a daemon restart in practice.
+   *
+   * Cache is keyed implicitly on `this` (per-adapter instance); a
+   * second adapter pointed at a different chain has its own cache
+   * with no cross-talk.
+   */
+  private static readonly PREFLIGHT_TTL_MS = 60 * 60 * 1000;
+  private cachedChainId: { value: bigint; cachedAt: number } | undefined;
+  private cachedKav10Address: { value: string; cachedAt: number } | undefined;
+  private cachedMinRequiredSignatures: { value: number; cachedAt: number } | undefined;
+
+  /**
+   * Reset the PR3 publish-preflight cache. Public so daemon code that
+   * knows about an external chain reconfiguration (e.g. a hot-reload
+   * of `chainRpcUrl` or a deliberate governance-vote test fixture)
+   * can flush the cache without waiting out the TTL. Tests use this
+   * to reset state between cases.
+   */
+  invalidatePublishPreflightCache(): void {
+    this.cachedChainId = undefined;
+    this.cachedKav10Address = undefined;
+    this.cachedMinRequiredSignatures = undefined;
+  }
+
+  private static preflightCacheFresh(
+    entry: { cachedAt: number } | undefined,
+    now: number,
+  ): boolean {
+    if (!entry) return false;
+    return now - entry.cachedAt < EVMChainAdapter.PREFLIGHT_TTL_MS;
+  }
+
   constructor(config: EVMAdapterConfig) {
     this.provider = new JsonRpcProvider(config.rpcUrl, undefined, { cacheTimeout: -1 });
     const providerContext = formatProviderContext(config);
@@ -1670,15 +1726,35 @@ export class EVMChainAdapter implements ChainAdapter {
   // =====================================================================
 
   async getKnowledgeAssetsV10Address(): Promise<string> {
+    // PR3 / RC11: TTL-cached. KAV10 address only changes on a contract
+    // redeploy + Hub-rotation event; 1h staleness is harmless and the
+    // ACK digest mismatch the contract would surface on actually-stale
+    // input is loud enough that operators would notice immediately.
+    const now = Date.now();
+    if (EVMChainAdapter.preflightCacheFresh(this.cachedKav10Address, now)) {
+      return this.cachedKav10Address!.value;
+    }
     await this.init();
     if (!this.contracts.knowledgeAssetsV10) {
       throw new Error('KnowledgeAssetsV10 contract not deployed on this chain.');
     }
-    return await this.contracts.knowledgeAssetsV10.getAddress();
+    const addr = await this.contracts.knowledgeAssetsV10.getAddress();
+    this.cachedKav10Address = { value: addr, cachedAt: now };
+    return addr;
   }
 
   async getEvmChainId(): Promise<bigint> {
+    // PR3 / RC11: TTL-cached so an `eth_chainId` rate-limit on the
+    // public RPC (the dzudza failure mode) cannot kill steady-state
+    // publish traffic. Chain id is structurally immutable for a given
+    // provider — once we've read it successfully we know it can't
+    // change without a daemon restart.
+    const now = Date.now();
+    if (EVMChainAdapter.preflightCacheFresh(this.cachedChainId, now)) {
+      return this.cachedChainId!.value;
+    }
     const network = await this.provider.getNetwork();
+    this.cachedChainId = { value: network.chainId, cachedAt: now };
     return network.chainId;
   }
 
@@ -2424,6 +2500,15 @@ export class EVMChainAdapter implements ChainAdapter {
   }
 
   async getMinimumRequiredSignatures(): Promise<number> {
+    // PR3 / RC11: TTL-cached. Governance vote that changes
+    // `minimumRequiredSignatures` propagates within 1h to the ACK
+    // collector; on-chain validation in `KnowledgeAssetsV10` would
+    // reject a publish that used the stale quorum so a single
+    // mis-routed retry past the boundary is the worst-case symptom.
+    const now = Date.now();
+    if (EVMChainAdapter.preflightCacheFresh(this.cachedMinRequiredSignatures, now)) {
+      return this.cachedMinRequiredSignatures!.value;
+    }
     await this.init();
     // FAIL-CLOSED (Codex PR #595 round-5): the agent + publisher
     // verify paths trust whatever this method returns. A silent
@@ -2436,7 +2521,9 @@ export class EVMChainAdapter implements ChainAdapter {
         'Verify cannot enforce ACK quorum without a real chain read — fix the adapter wiring or pass an explicit override.',
       );
     }
-    return Number(await this.contracts.parametersStorage.minimumRequiredSignatures());
+    const value = Number(await this.contracts.parametersStorage.minimumRequiredSignatures());
+    this.cachedMinRequiredSignatures = { value, cachedAt: now };
+    return value;
   }
 
   async isShardingTableMember(identityId: bigint): Promise<boolean> {

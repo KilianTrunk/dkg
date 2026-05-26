@@ -49,6 +49,17 @@ export {
   type CollectedACK,
   type ACKCollectionResult,
 } from './ack-collector.js';
+export {
+  ACKProviderError,
+  RpcPreconditionError,
+  QuorumUnmetError,
+  isACKProviderError,
+  isRpcPreconditionError,
+  isQuorumUnmetError,
+  wrapAsRpcPreconditionIfApplicable,
+  type PeerOutcome,
+  type UnwrapRpcOptions,
+} from './ack-errors.js';
 export { StorageACKHandler, type StorageACKHandlerConfig } from './storage-ack-handler.js';
 export {
   VerifyCollector,

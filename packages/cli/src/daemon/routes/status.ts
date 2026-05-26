@@ -356,8 +356,9 @@ function routeWithTimeout<T>(promise: Promise<T>, ms: number, label: string): Pr
   }) as Promise<T>;
 }
 
-async function probeRpcEndpoint(rpcUrl: string): Promise<{
-  rpcUrl: string;
+async function probeRpcEndpoint(rpcUrl: string, index: number): Promise<{
+  index: number;
+  role: 'primary' | 'backup';
   ok: boolean;
   latencyMs: number | null;
   blockNumber: number | null;
@@ -366,20 +367,24 @@ async function probeRpcEndpoint(rpcUrl: string): Promise<{
   const provider = new ethers.JsonRpcProvider(rpcUrl, undefined, { cacheTimeout: -1 });
   const start = Date.now();
   try {
-    const blockNumber = await routeWithTimeout(provider.getBlockNumber(), 3_000, `RPC health probe ${rpcUrl}`);
+    const blockNumber = await routeWithTimeout(provider.getBlockNumber(), 3_000, 'RPC health probe');
     return {
-      rpcUrl,
+      index,
+      role: index === 0 ? 'primary' : 'backup',
       ok: true,
       latencyMs: Date.now() - start,
       blockNumber,
     };
   } catch (err) {
     return {
-      rpcUrl,
+      index,
+      role: index === 0 ? 'primary' : 'backup',
       ok: false,
       latencyMs: null,
       blockNumber: null,
-      error: err instanceof Error ? err.message : String(err),
+      error: err instanceof Error && err.message.includes('timed out')
+        ? 'RPC health probe timed out'
+        : 'RPC health probe failed',
     };
   }
 }
@@ -561,6 +566,9 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
     );
     const networkId = await computeNetworkId();
     const chainConf = resolveChainConfig(config, network);
+    const rpcEndpointCount = chainConf?.rpcUrl
+      ? resolveRpcUrls(chainConf.rpcUrl, chainConf.rpcUrls).length
+      : 0;
     const blockExplorerUrl =
       config.blockExplorerUrl ?? deriveBlockExplorerUrl(chainConf?.chainId);
     const identityId = agent.publisher.getIdentityId();
@@ -610,9 +618,9 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
       chain: chainConf
         ? {
             chainId: chainConf.chainId ?? null,
-            rpcUrl: chainConf.rpcUrl,
-            rpcUrls: chainConf.rpcUrls ?? [],
-            hubAddress: chainConf.hubAddress,
+            configured: Boolean(chainConf.rpcUrl && chainConf.hubAddress),
+            rpcEndpointCount,
+            hubConfigured: Boolean(chainConf.hubAddress),
           }
         : null,
       updateAvailable:
@@ -884,8 +892,8 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
     if (!rpcUrl) {
       return jsonResponse(res, 200, {
         ok: false,
-        rpcUrl: null,
-        rpcUrls: [],
+        configured: false,
+        rpcEndpointCount: 0,
         latencyMs: null,
         blockNumber: null,
         rpcs: [],
@@ -893,12 +901,12 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
       });
     }
     const rpcUrls = resolveRpcUrls(rpcUrl, chain?.rpcUrls);
-    const rpcs = await Promise.all(rpcUrls.map((url) => probeRpcEndpoint(url)));
+    const rpcs = await Promise.all(rpcUrls.map((url, index) => probeRpcEndpoint(url, index)));
     const primary = rpcs[0];
     return jsonResponse(res, 200, {
       ok: primary?.ok ?? false,
-      rpcUrl,
-      rpcUrls: rpcUrls.slice(1),
+      configured: true,
+      rpcEndpointCount: rpcUrls.length,
       latencyMs: primary?.latencyMs ?? null,
       blockNumber: primary?.blockNumber ?? null,
       error: primary?.ok ? undefined : (primary?.error ?? "RPC health probe failed"),

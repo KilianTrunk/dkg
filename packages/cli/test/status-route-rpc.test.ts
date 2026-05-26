@@ -121,15 +121,22 @@ describe('status route multi-RPC shape', () => {
     }
   });
 
-  it('/api/status returns primary rpcUrl and backup rpcUrls', async () => {
+  it('/api/status returns sanitized chain summary without raw RPC endpoints', async () => {
     const res = await fetch(`${baseUrl}/api/status`);
     const body: any = await res.json();
     expect(res.status).toBe(200);
-    expect(body.chain.rpcUrl).toBe('https://primary.example/rpc');
-    expect(body.chain.rpcUrls).toEqual(['https://backup.example/rpc']);
+    expect(body.chain).toEqual({
+      chainId: 'base:84532',
+      configured: true,
+      rpcEndpointCount: 2,
+      hubConfigured: true,
+    });
+    expect(body.chain).not.toHaveProperty('rpcUrl');
+    expect(body.chain).not.toHaveProperty('rpcUrls');
+    expect(body.chain).not.toHaveProperty('hubAddress');
   });
 
-  it('/api/chain/rpc-health preserves primary fields and adds per-endpoint probes', async () => {
+  it('/api/chain/rpc-health probes all endpoints without returning raw RPC URLs', async () => {
     rpcState.responses.set('https://primary.example/rpc', new Error('primary down'));
     rpcState.responses.set('https://backup.example/rpc', 456);
 
@@ -137,20 +144,28 @@ describe('status route multi-RPC shape', () => {
     const body: any = await res.json();
     expect(res.status).toBe(200);
     expect(body.ok).toBe(false);
-    expect(body.rpcUrl).toBe('https://primary.example/rpc');
-    expect(body.rpcUrls).toEqual(['https://backup.example/rpc']);
+    expect(body.configured).toBe(true);
+    expect(body.rpcEndpointCount).toBe(2);
+    expect(body).not.toHaveProperty('rpcUrl');
+    expect(body).not.toHaveProperty('rpcUrls');
     expect(body.blockNumber).toBeNull();
     expect(body.rpcs).toEqual([
       expect.objectContaining({
-        rpcUrl: 'https://primary.example/rpc',
+        index: 0,
+        role: 'primary',
         ok: false,
         blockNumber: null,
+        error: 'RPC health probe failed',
       }),
       expect.objectContaining({
-        rpcUrl: 'https://backup.example/rpc',
+        index: 1,
+        role: 'backup',
         ok: true,
         blockNumber: 456,
       }),
     ]);
+    for (const probe of body.rpcs) {
+      expect(probe).not.toHaveProperty('rpcUrl');
+    }
   });
 });

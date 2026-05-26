@@ -55,9 +55,9 @@ export interface DaemonStatusResponse {
   relay: RelayStatusResponse;
   chain?: {
     chainId: string | null;
-    rpcUrl?: string;
-    rpcUrls: string[];
-    hubAddress?: string;
+    configured: boolean;
+    rpcEndpointCount: number;
+    hubConfigured: boolean;
   } | null;
 }
 

@@ -1,7 +1,7 @@
 import {
   DKGNode, ProtocolRouter, GossipSubManager, TypedEventBus, DKGEvent,
   LibP2PNetwork, PeerResolver, StubNetworkStateRegistry,
-  PROTOCOL_ACCESS, PROTOCOL_PUBLISH, PROTOCOL_SYNC, PROTOCOL_QUERY_REMOTE, PROTOCOL_STORAGE_ACK, PROTOCOL_STORAGE_ACK_V2, PROTOCOL_VERIFY_PROPOSAL, PROTOCOL_JOIN_REQUEST,
+  PROTOCOL_ACCESS, PROTOCOL_PUBLISH, PROTOCOL_SYNC, PROTOCOL_QUERY_REMOTE, PROTOCOL_STORAGE_ACK, PROTOCOL_STORAGE_ACK_V2, PROTOCOL_GET_CIPHERTEXT_CHUNK, PROTOCOL_VERIFY_PROPOSAL, PROTOCOL_JOIN_REQUEST,
   PROTOCOL_SWM_SENDER_KEY, PROTOCOL_SWM_UPDATE, PROTOCOL_SWM_SHARE_ACK, PROTOCOL_SWM_HOST_CATCHUP, PROTOCOL_MESSAGE,
   contextGraphPublishTopic, contextGraphWorkspaceTopic, contextGraphAppTopic, contextGraphUpdateTopic, contextGraphFinalizationTopic,
   contextGraphDataGraphUri, contextGraphMetaGraphUri, contextGraphWorkspaceGraphUri, contextGraphWorkspaceMetaGraphUri,
@@ -175,6 +175,18 @@ import {
   mintSignedCatchupRequest,
   verifySignedCatchupRequest,
 } from './swm/host-catchup-sign.js';
+import {
+  createCiphertextChunkCatchupReplayGuard,
+  decodeCiphertextChunkCatchupRequest,
+  encodeCiphertextChunkCatchupRequest,
+  encodeCiphertextChunkCatchupResponse,
+  decodeCiphertextChunkCatchupResponse,
+  mintSignedCiphertextChunkCatchupRequest,
+  verifySignedCiphertextChunkCatchupRequest,
+  CIPHERTEXT_CHUNK_CATCHUP_WIRE_VERSION,
+  type CiphertextChunkCatchupRequest,
+  type CiphertextChunkCatchupResponse,
+} from './swm/ciphertext-chunk-catchup.js';
 import { waitForPeerProtocol } from './p2p/protocol-readiness.js';
 import { orderCatchupPeers } from './p2p/peer-selection.js';
 import { fetchSyncPages, type SyncPageResult } from './sync/requester/page-fetch.js';
@@ -757,6 +769,13 @@ export class DKGAgent {
    * See {@link CatchupReplayGuard}.
    */
   private readonly catchupReplayGuard = new CatchupReplayGuard();
+  /**
+   * OT-RFC-38 LU-11 / OT-RFC-39 — separate replay LRU for the chunk
+   * sync verb. Kept distinct from the host-catchup guard so a single
+   * EOA's two concurrent streams (one for the LU-6 envelope catchup,
+   * one for per-chunk backfill) never collide on nonce uniqueness.
+   */
+  private readonly ciphertextChunkCatchupReplayGuard = createCiphertextChunkCatchupReplayGuard();
   /**
    * OT-RFC-38 / LU-6 Phase B — periodic beacon re-announce timer
    * (curators only). See {@link beaconRegistry} jsdoc.
@@ -1525,6 +1544,14 @@ export class DKGAgent {
     // Going through messenger.register opts into the substrate's
     // envelope versioning, idempotency cache, and `/api/slo` stats.
     this.messenger.register(PROTOCOL_SWM_HOST_CATCHUP, (data, fromPeerId) => this.handleSwmHostCatchup(data, fromPeerId));
+
+    // OT-RFC-38 LU-11 / OT-RFC-39: per-chunk ciphertext sync verb.
+    // Symmetric to PROTOCOL_SWM_HOST_CATCHUP but pulls one
+    // (cgId, batchId, chunkIndex) ciphertext at a time from the
+    // triple-store-backed chunk store the V2 ACK verifier reads
+    // against. Registered unconditionally — the handler itself
+    // gates by node role + per-CG authorization.
+    this.messenger.register(PROTOCOL_GET_CIPHERTEXT_CHUNK, (data, fromPeerId) => this.handleGetCiphertextChunk(data, fromPeerId));
 
     const effectiveRole = this.config.nodeRole ?? 'edge';
     const ackSignerCandidates = this.getACKSignerCandidateWallets(ctx);
@@ -10741,6 +10768,255 @@ export class DKGAgent {
       truncated: truncatedByEntries || truncatedByBytes,
       entries,
     });
+  }
+
+  /**
+   * OT-RFC-38 LU-11 / OT-RFC-39 — responder for the
+   * `/dkg/10.0.2/get-ciphertext-chunk` sync verb. Loads one
+   * `(cgId, batchId, chunkIndex)` ciphertext from the local
+   * triple-store-backed chunk store and returns the base64 bytes
+   * (or a typed denial: bad signature, unauthorized, missing
+   * chunk). Authorization piggybacks on the existing LU-6
+   * UNION-of-authorities gate: any source that recognises the
+   * requester EOA accepts (on-chain participants, beacon curator,
+   * local agent gate, libp2p peer allowlist). PR-B will refine
+   * this to include a sharding-table-membership chain probe so
+   * late-joining hosting cores (which won't be on the agent
+   * allowlist) can backfill ciphertexts they need to participate
+   * in RFC-39 random sampling.
+   */
+  private async handleGetCiphertextChunk(data: Uint8Array, fromPeerId: string): Promise<Uint8Array> {
+    const ctx = createOperationContext('share');
+    let req: CiphertextChunkCatchupRequest;
+    try {
+      req = decodeCiphertextChunkCatchupRequest(data);
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      return encodeCiphertextChunkCatchupResponse({
+        version: CIPHERTEXT_CHUNK_CATCHUP_WIRE_VERSION,
+        contextGraphId: '',
+        batchIdHex: '',
+        chunkIndex: -1,
+        denied: `malformed request: ${reason}`,
+      });
+    }
+    const nowMs = Date.now();
+    const verify = verifySignedCiphertextChunkCatchupRequest(req, nowMs);
+    if (!verify.ok || !verify.recoveredSigner) {
+      this.log.info(
+        ctx,
+        `LU-11 chunk-catchup denied cg=${req.contextGraphId} from=${fromPeerId} requesterEoa=${req.requesterEoa} chunkIndex=${req.chunkIndex}: ${verify.reason}`,
+      );
+      return encodeCiphertextChunkCatchupResponse({
+        version: CIPHERTEXT_CHUNK_CATCHUP_WIRE_VERSION,
+        contextGraphId: req.contextGraphId,
+        batchIdHex: ethers.hexlify(req.batchId),
+        chunkIndex: req.chunkIndex,
+        denied: verify.reason ?? 'signature verification failed',
+      });
+    }
+    const requesterEoa = verify.recoveredSigner;
+    if (!this.ciphertextChunkCatchupReplayGuard.recordIfFresh(requesterEoa, req.nonce, req.issuedAtMs, nowMs)) {
+      return encodeCiphertextChunkCatchupResponse({
+        version: CIPHERTEXT_CHUNK_CATCHUP_WIRE_VERSION,
+        contextGraphId: req.contextGraphId,
+        batchIdHex: ethers.hexlify(req.batchId),
+        chunkIndex: req.chunkIndex,
+        denied: 'replayed chunk-catchup nonce',
+      });
+    }
+
+    // Reuse the LU-6 host-catchup authorization shape via a thin
+    // adapter — same UNION-of-authorities logic, but the chunk-catchup
+    // request payload lacks `sinceSeqno`/`maxEntries`/`maxBytes` so
+    // we pack the chunked-request fields into the shared verifier's
+    // shape with zero-defaults for the unused slots. (The shared
+    // authorization helper only reads `contextGraphId` and the EOA;
+    // the other fields are signature-digest input, not authorization
+    // input.)
+    let authOk = false;
+    let authReason: string = 'no authority source available for context graph';
+    const requesterLower = requesterEoa.toLowerCase();
+    let anyAuthorityFound = false;
+    try {
+      const chainParticipants = await this.resolveOnChainParticipantAgents(req.contextGraphId);
+      if (chainParticipants !== null) {
+        anyAuthorityFound = true;
+        if (chainParticipants.some((a) => a.toLowerCase() === requesterLower)) authOk = true;
+      }
+    } catch { /* probe failure non-fatal */ }
+    if (!authOk) {
+      try {
+        const beaconCurator = await this.resolveBeaconPinnedCuratorEoa(req.contextGraphId);
+        if (beaconCurator) {
+          anyAuthorityFound = true;
+          if (beaconCurator.toLowerCase() === requesterLower) authOk = true;
+        }
+      } catch { /* probe failure non-fatal */ }
+    }
+    if (!authOk) {
+      try {
+        const agentGate = await this.getContextGraphAgentGateAddresses(req.contextGraphId);
+        if (agentGate !== null) {
+          anyAuthorityFound = true;
+          if (agentGate.some((a) => a.toLowerCase() === requesterLower)) authOk = true;
+        }
+      } catch { /* probe failure non-fatal */ }
+    }
+    if (!authOk) {
+      try {
+        const allowedPeers = await this.getContextGraphAllowedPeers(req.contextGraphId);
+        if (allowedPeers !== null) {
+          anyAuthorityFound = true;
+          if (allowedPeers.includes(fromPeerId)) authOk = true;
+        }
+      } catch { /* probe failure non-fatal */ }
+    }
+    if (!authOk) {
+      authReason = anyAuthorityFound
+        ? 'requester EOA not in any of: on-chain participants, beacon curator, local agent-gate, allowedPeers'
+        : 'no authority source available for context graph';
+      this.log.info(
+        ctx,
+        `LU-11 chunk-catchup denied cg=${req.contextGraphId} from=${fromPeerId} requesterEoa=${requesterEoa} chunkIndex=${req.chunkIndex}: ${authReason}`,
+      );
+      return encodeCiphertextChunkCatchupResponse({
+        version: CIPHERTEXT_CHUNK_CATCHUP_WIRE_VERSION,
+        contextGraphId: req.contextGraphId,
+        batchIdHex: ethers.hexlify(req.batchId),
+        chunkIndex: req.chunkIndex,
+        denied: authReason,
+      });
+    }
+
+    // Locate the chunk in the triple-store-backed per-CG chunk graph.
+    const chunksGraph = ciphertextChunkStoreGraph(req.contextGraphId);
+    const subject = ciphertextChunkStoreSubject(req.batchId, req.chunkIndex);
+    const sparql = `SELECT ?o WHERE { GRAPH <${chunksGraph}> { <${subject}> <${CIPHERTEXT_CHUNK_PREDICATE}> ?o } } LIMIT 1`;
+    let result;
+    try {
+      result = await this.store.query(sparql);
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      this.log.warn(ctx, `LU-11 chunk-catchup store query failed cg=${req.contextGraphId} chunkIndex=${req.chunkIndex}: ${reason}`);
+      return encodeCiphertextChunkCatchupResponse({
+        version: CIPHERTEXT_CHUNK_CATCHUP_WIRE_VERSION,
+        contextGraphId: req.contextGraphId,
+        batchIdHex: ethers.hexlify(req.batchId),
+        chunkIndex: req.chunkIndex,
+        denied: `store error: ${reason}`,
+      });
+    }
+    if (result.type !== 'bindings' || result.bindings.length === 0) {
+      return encodeCiphertextChunkCatchupResponse({
+        version: CIPHERTEXT_CHUNK_CATCHUP_WIRE_VERSION,
+        contextGraphId: req.contextGraphId,
+        batchIdHex: ethers.hexlify(req.batchId),
+        chunkIndex: req.chunkIndex,
+        denied: 'chunk not found',
+      });
+    }
+    const literal = result.bindings[0]?.['o'];
+    if (typeof literal !== 'string') {
+      return encodeCiphertextChunkCatchupResponse({
+        version: CIPHERTEXT_CHUNK_CATCHUP_WIRE_VERSION,
+        contextGraphId: req.contextGraphId,
+        batchIdHex: ethers.hexlify(req.batchId),
+        chunkIndex: req.chunkIndex,
+        denied: 'chunk stored value malformed',
+      });
+    }
+    const ciphertextB64 = literal.startsWith('"') && literal.endsWith('"')
+      ? literal.slice(1, -1)
+      : literal;
+    this.log.debug(
+      ctx,
+      `LU-11 chunk-catchup served cg=${req.contextGraphId} from=${fromPeerId} batchId=${ethers.hexlify(req.batchId).slice(0, 18)}... chunkIndex=${req.chunkIndex} bytes=${Buffer.from(ciphertextB64, 'base64').length}`,
+    );
+    return encodeCiphertextChunkCatchupResponse({
+      version: CIPHERTEXT_CHUNK_CATCHUP_WIRE_VERSION,
+      contextGraphId: req.contextGraphId,
+      batchIdHex: ethers.hexlify(req.batchId),
+      chunkIndex: req.chunkIndex,
+      ciphertextB64,
+    });
+  }
+
+  /**
+   * OT-RFC-38 LU-11 / OT-RFC-39 — requester for the
+   * `/dkg/10.0.2/get-ciphertext-chunk` sync verb. Pulls one
+   * `(cgId, batchId, chunkIndex)` ciphertext from a known host and
+   * (when `persist === true`) writes it into the local per-chunk
+   * store so the V2 ACK verifier sees it on the next pass. Returns
+   * the raw decoded response so callers can inspect denial reasons
+   * or feed bytes to a member-side verifier.
+   *
+   * Late-joining hosting cores call this in a loop to backfill the
+   * `(cgId, batchId, 0..count-1)` set after seeing
+   * `KnowledgeCollectionCiphertextCommitmentSet` on chain or
+   * `MISSING_CIPHERTEXT_CHUNKS` from a V2 ACK request they
+   * routed forward. Loop policy + peer selection are intentionally
+   * caller-owned — this method is the single-pull primitive.
+   */
+  async fetchCiphertextChunkFromPeer(
+    remotePeerId: string,
+    contextGraphId: string,
+    batchId: Uint8Array,
+    chunkIndex: number,
+    options?: { persist?: boolean; signWithChainAdapter?: boolean },
+  ): Promise<CiphertextChunkCatchupResponse> {
+    if (batchId.length !== 32) {
+      throw new Error(`fetchCiphertextChunkFromPeer requires a 32-byte batchId; got ${batchId.length}`);
+    }
+    if (!Number.isInteger(chunkIndex) || chunkIndex < 0) {
+      throw new Error(`fetchCiphertextChunkFromPeer requires a non-negative chunkIndex; got ${chunkIndex}`);
+    }
+    const ctx = createOperationContext('share');
+    const useChainSigner = options?.signWithChainAdapter !== false;
+    if (useChainSigner && typeof this.chain.signMessage !== 'function') {
+      throw new Error('fetchCiphertextChunkFromPeer: chain adapter does not expose signMessage; pass signWithChainAdapter:false and supply your own gate');
+    }
+    const sign = async (digest: Uint8Array) => {
+      // Match the host-catchup pattern: chain.signMessage returns
+      // {r, vs}; re-serialise to the 65-byte EIP-191 hex shape.
+      const { r, vs } = await this.chain.signMessage!(digest);
+      const sig = ethers.Signature.from({ r: ethers.hexlify(r), yParityAndS: ethers.hexlify(vs) });
+      return sig.serialized;
+    };
+    const signedReq = await mintSignedCiphertextChunkCatchupRequest({
+      contextGraphId,
+      batchId,
+      chunkIndex,
+      sign,
+    });
+    const reqBytes = encodeCiphertextChunkCatchupRequest(signedReq);
+    const sendResult = await this.messenger.sendReliable(remotePeerId, PROTOCOL_GET_CIPHERTEXT_CHUNK, reqBytes);
+    if (!sendResult.delivered) {
+      throw new Error(`LU-11 chunk-catchup transport failed: ${sendResult.error}`);
+    }
+    const resp = decodeCiphertextChunkCatchupResponse(sendResult.response);
+    if (options?.persist && resp.ciphertextB64) {
+      const subject = ciphertextChunkStoreSubject(batchId, chunkIndex);
+      const literal = `"${resp.ciphertextB64}"`;
+      try {
+        await this.store.insert([{
+          subject,
+          predicate: CIPHERTEXT_CHUNK_PREDICATE,
+          object: literal,
+          graph: ciphertextChunkStoreGraph(contextGraphId),
+        }]);
+        this.log.debug(
+          ctx,
+          `LU-11 chunk-catchup persisted cg=${contextGraphId} batchId=${ethers.hexlify(batchId).slice(0, 18)}... chunkIndex=${chunkIndex} from=${remotePeerId}`,
+        );
+      } catch (err) {
+        this.log.warn(
+          ctx,
+          `LU-11 chunk-catchup persistence failed cg=${contextGraphId} batchId=${ethers.hexlify(batchId).slice(0, 18)}... chunkIndex=${chunkIndex}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+    return resp;
   }
 
   /**

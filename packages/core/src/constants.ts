@@ -120,6 +120,18 @@ export const PROTOCOL_STORAGE_ACK = '/dkg/10.0.1/storage-ack';
  */
 export const PROTOCOL_STORAGE_ACK_V2 = '/dkg/10.0.2/storage-ack';
 
+/**
+ * OT-RFC-38 LU-11 / OT-RFC-39 — point-to-point sync verb for one
+ * curated-CG ciphertext chunk identified by (cgId, batchId,
+ * chunkIndex). Used by late-joining hosting cores (and any
+ * sharding-table member that missed the original chunked SWM
+ * gossip) to backfill the per-chunk store before the V2 ACK
+ * verifier needs the bytes. See
+ * `packages/agent/src/swm/ciphertext-chunk-catchup.ts` for the
+ * signed JSON wire format and per-pull authorization gate.
+ */
+export const PROTOCOL_GET_CIPHERTEXT_CHUNK = '/dkg/10.0.2/get-ciphertext-chunk';
+
 export const DHT_PROTOCOL = '/dkg/kad/1.0.0';
 
 /** Maximum application payload size allowed for one DKG GossipSub message (10 MB). */

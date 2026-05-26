@@ -324,6 +324,77 @@ describe('ACKCollector identity verification', () => {
       (c: unknown[]) => (c[0] as string).includes('not registered'),
     )).toBe(true);
   });
+
+  // Structured-verifier path: when the chain adapter implements
+  // `verifyACKIdentityDetailed` the rejection log surfaces the actual
+  // failing gate so operators can tell apart key-registration issues,
+  // sub-`minimumStake` stake (the regression case after rc.11), and
+  // RPC outages — three distinct operational situations that all
+  // looked identical pre-PR.
+  it('detailed verifier surfaces specific reason in rejection log', async () => {
+    const log = noop();
+    const deps: ACKCollectorDeps = {
+      gossipPublish: noop(),
+      sendP2P: buildSendP2P(),
+      getConnectedCorePeers: () => ['peer-0', 'peer-1', 'peer-2'],
+      verifyIdentityDetailed: tracked(async () => ({ valid: false, reason: 'not-in-sharding-table' as const })),
+      log,
+    };
+    const collector = new ACKCollector(deps);
+
+    await expect(collector.collect(buildCollectParams()))
+      .rejects.toThrow('storage_ack_insufficient');
+    expect(log.calls.some(
+      (c: unknown[]) => /not-in-sharding-table/.test(c[0] as string),
+    )).toBe(true);
+    // Legacy "not registered" string MUST NOT appear when the structured
+    // path is taken — operators relying on the new reason for alerting
+    // would silently miss every stake-side rejection otherwise.
+    expect(log.calls.some(
+      (c: unknown[]) => /not registered for identity/.test(c[0] as string),
+    )).toBe(false);
+  });
+
+  it('detailed verifier flags rpc-error distinct from key-not-registered', async () => {
+    const log = noop();
+    const deps: ACKCollectorDeps = {
+      gossipPublish: noop(),
+      sendP2P: buildSendP2P(),
+      getConnectedCorePeers: () => ['peer-0', 'peer-1', 'peer-2'],
+      verifyIdentityDetailed: tracked(async () => ({ valid: false, reason: 'rpc-error' as const })),
+      log,
+    };
+    const collector = new ACKCollector(deps);
+
+    await expect(collector.collect(buildCollectParams()))
+      .rejects.toThrow('storage_ack_insufficient');
+    expect(log.calls.some(
+      (c: unknown[]) => /rpc-error/.test(c[0] as string),
+    )).toBe(true);
+  });
+
+  it('detailed verifier takes precedence over legacy boolean verifier', async () => {
+    const log = noop();
+    const verifyIdentity = tracked(async () => true);
+    const verifyIdentityDetailed = tracked(async () => ({ valid: false, reason: 'key-not-registered' as const }));
+    const deps: ACKCollectorDeps = {
+      gossipPublish: noop(),
+      sendP2P: buildSendP2P(),
+      getConnectedCorePeers: () => ['peer-0', 'peer-1', 'peer-2'],
+      verifyIdentity,
+      verifyIdentityDetailed,
+      log,
+    };
+    const collector = new ACKCollector(deps);
+
+    await expect(collector.collect(buildCollectParams()))
+      .rejects.toThrow('storage_ack_insufficient');
+    // Legacy `verifyIdentity` MUST NOT be consulted when the detailed
+    // form is provided — otherwise contradictory verdicts would let
+    // ACKs through that the structured verifier rejected.
+    expect(verifyIdentity.calls.length).toBe(0);
+    expect(verifyIdentityDetailed.calls.length).toBeGreaterThan(0);
+  });
 });
 
 // ── ACKCollector deduplication ───────────────────────────────────────────

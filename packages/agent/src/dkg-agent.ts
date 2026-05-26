@@ -17962,6 +17962,20 @@ export class DKGAgent {
             }
           }
         : undefined,
+      // Surface the structured verifier when the chain adapter implements
+      // it. Translates a thrown chain-side exception into an explicit
+      // `'rpc-error'` reason so the ACKCollector can log infra failures
+      // distinctly from definitive key/stake rejections — pre-PR this
+      // try/catch swallowed RPC errors as `false`, conflating them.
+      verifyIdentityDetailed: typeof this.chain.verifyACKIdentityDetailed === 'function'
+        ? async (recoveredAddress: string, claimedIdentityId: bigint) => {
+            try {
+              return await this.chain.verifyACKIdentityDetailed!(recoveredAddress, claimedIdentityId);
+            } catch {
+              return { valid: false, reason: 'rpc-error' as const };
+            }
+          }
+        : undefined,
       log: (msg: string) => {
         const ctx = createOperationContext('publish');
         this.log.info(ctx, msg);

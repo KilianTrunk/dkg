@@ -32,6 +32,7 @@ import type {
   CreateChallengeResult,
   OperationalWalletRegistrationResult,
   V10PublishingConvictionAccountInfo,
+  VerifyACKIdentityResult,
 } from './chain-adapter.js';
 import {
   NoEligibleContextGraphError,
@@ -2539,37 +2540,56 @@ export class EVMChainAdapter implements ChainAdapter {
     return Boolean(await storage.nodeExists(identityId));
   }
 
+  /**
+   * Off-chain pre-flight for the V10 ACK signer gate. Mirrors the on-chain
+   * check in `KnowledgeAssetsV10._verifyACKSignature` (post-RFC-001): the
+   * recovered signer must be a registered OPERATIONAL_KEY for the claimed
+   * identity AND that identity must be in the active sharding table.
+   *
+   * Returns a structured reason on rejection so the ACKCollector log can
+   * distinguish operator-actionable failures (key registration, sub-
+   * `minimumStake` stake) from infrastructure failures (RPC outage). Pre-
+   * RFC-001 versions of this method gated on `getNodeStakeV10 > 0`, which
+   * let sub-`minimumStake` operators clear off-chain quorum and then revert
+   * on-chain with `"ACK signer not in sharding table"`. ST membership is
+   * updated atomically by `StakingV10` whenever a node's V10 stake crosses
+   * `minimumStake` up or down.
+   */
+  async verifyACKIdentityDetailed(
+    recoveredAddress: string,
+    claimedIdentityId: bigint,
+  ): Promise<VerifyACKIdentityResult> {
+    try {
+      await this.init();
+      const identityStorage = await this.resolveContract('IdentityStorage');
+      if (!identityStorage) return { valid: false, reason: 'rpc-error' };
+
+      const keyHash = ethers.keccak256(ethers.solidityPacked(['address'], [recoveredAddress]));
+      const hasPurpose: boolean = await identityStorage.keyHasPurpose(
+        claimedIdentityId,
+        keyHash,
+        OPERATIONAL_KEY_PURPOSE,
+      );
+      if (!hasPurpose) return { valid: false, reason: 'key-not-registered' };
+
+      const shardingTableStorage = await this.resolveContract('ShardingTableStorage');
+      if (!shardingTableStorage) return { valid: false, reason: 'rpc-error' };
+      const inST: boolean = Boolean(await shardingTableStorage.nodeExists(claimedIdentityId));
+      if (!inST) return { valid: false, reason: 'not-in-sharding-table' };
+      return { valid: true };
+    } catch {
+      // Any chain-side throw (filter expired, RPC rate-limit, contract
+      // resolution failure mid-call) is reported as `rpc-error` so the
+      // ACKCollector can log it distinctly from a definitive negative.
+      // Mirrors the existing wrapper in `dkg-agent.ts:createV10ACKProvider`
+      // which used to swallow these exceptions as `false`, conflating
+      // transient infra failures with permanent rejections.
+      return { valid: false, reason: 'rpc-error' };
+    }
+  }
+
   async verifyACKIdentity(recoveredAddress: string, claimedIdentityId: bigint): Promise<boolean> {
-    await this.init();
-    const identityStorage = await this.resolveContract('IdentityStorage');
-    if (!identityStorage) return false;
-
-    // Gate 1: signer must be registered as an operational key for the claimed
-    // identity. Mirrors the on-chain `keyHasPurpose(id, keccak256(signer),
-    // OPERATIONAL_KEY)` check inside `KnowledgeAssetsV10._verifyACKSignature`.
-    const keyHash = ethers.keccak256(ethers.solidityPacked(['address'], [recoveredAddress]));
-    const hasPurpose: boolean = await identityStorage.keyHasPurpose(
-      claimedIdentityId,
-      keyHash,
-      OPERATIONAL_KEY_PURPOSE,
-    );
-    if (!hasPurpose) return false;
-
-    // Gate 2: identity must be in the active sharding table.
-    //
-    // RFC-001 rewired the on-chain ACK signer gate from `getNodeStakeV10 > 0`
-    // to `shardingTableStorage.nodeExists(identityId)` (see
-    // `KnowledgeAssetsV10._verifyACKSignature`: "ACK signers must be in the
-    // active sharding table, not merely staked"). The off-chain pre-flight
-    // here exists to spare a doomed on-chain submission gas — so it MUST
-    // mirror the on-chain check exactly. Pre-RFC-001 versions of this method
-    // gated on positive V10 stake, which let sub-`minimumStake` operators
-    // pass off-chain but reverted on-chain with `ACK signer not in sharding
-    // table`. ST membership is updated atomically by `StakingV10` whenever a
-    // node's V10 stake crosses `minimumStake` up or down.
-    const shardingTableStorage = await this.resolveContract('ShardingTableStorage');
-    if (!shardingTableStorage) return false;
-    return Boolean(await shardingTableStorage.nodeExists(claimedIdentityId));
+    return (await this.verifyACKIdentityDetailed(recoveredAddress, claimedIdentityId)).valid;
   }
 
   async verifySyncIdentity(recoveredAddress: string, claimedIdentityId: bigint): Promise<boolean> {

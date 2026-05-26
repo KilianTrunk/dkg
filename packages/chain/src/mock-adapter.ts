@@ -23,6 +23,7 @@ import type {
   CreateChallengeResult,
   OperationalWalletRegistrationResult,
   V10PublishingConvictionAccountInfo,
+  VerifyACKIdentityResult,
 } from './chain-adapter.js';
 import {
   NoEligibleContextGraphError,
@@ -812,14 +813,27 @@ export class MockChainAdapter implements ChainAdapter {
   }
 
   async verifyACKIdentity(recoveredAddress: string, claimedIdentityId: bigint): Promise<boolean> {
-    // Strict binding: recovered address must match the identity's registered address
+    return (await this.verifyACKIdentityDetailed(recoveredAddress, claimedIdentityId)).valid;
+  }
+
+  /**
+   * Mock implementation: the harness has no separate sharding-table /
+   * stake state, so a key registered for the claimed identity is treated
+   * as both `keyHasPurpose` AND `nodeExists`. Tests that need to exercise
+   * the `'not-in-sharding-table'` branch should use the EVM adapter
+   * against a Hardhat env with a freshly-keyed but unstaked profile.
+   */
+  async verifyACKIdentityDetailed(
+    recoveredAddress: string,
+    claimedIdentityId: bigint,
+  ): Promise<VerifyACKIdentityResult> {
     const normalizedAddress = recoveredAddress.toLowerCase();
     for (const [addr, id] of this.identities) {
       if (id === claimedIdentityId && addr.toLowerCase() === normalizedAddress) {
-        return true;
+        return { valid: true };
       }
     }
-    return false;
+    return { valid: false, reason: 'key-not-registered' };
   }
 
   async isOperationalWalletRegistered(identityId: bigint, address: string): Promise<boolean> {

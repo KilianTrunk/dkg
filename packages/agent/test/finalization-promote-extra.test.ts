@@ -42,6 +42,7 @@ import {
   takeSnapshot,
 } from '../../chain/test/evm-test-context.js';
 import { mintTokens } from '../../chain/test/hardhat-harness.js';
+import { installHardhatACKProvider } from './_helpers/v10-acks.js';
 
 const CONTEXT_GRAPH = `a4-finalize-${ethers.hexlify(ethers.randomBytes(4)).slice(2)}`;
 
@@ -56,14 +57,16 @@ beforeAll(async () => {
   await mintTokens(
     provider, hubAddress, HARDHAT_KEYS.DEPLOYER, coreOp.address, ethers.parseEther('1000000'),
   );
+  const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
   nodeA = await DKGAgent.create({
     name: 'A4Promoter',
     listenPort: 0,
     skills: [],
-    chainAdapter: createEVMAdapter(HARDHAT_KEYS.CORE_OP),
+    chainAdapter: chain,
     nodeRole: 'core',
   });
   await nodeA.start();
+  await installHardhatACKProvider(nodeA, chain);
 });
 
 afterAll(async () => {

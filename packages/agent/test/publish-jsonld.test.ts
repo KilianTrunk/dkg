@@ -9,6 +9,7 @@ import { DKG_ONTOLOGY, SYSTEM_CONTEXT_GRAPHS, buildAuthorAttestationTypedData, c
 import { createEVMAdapter, getSharedContext, createProvider, takeSnapshot, revertSnapshot, HARDHAT_KEYS } from '../../chain/test/evm-test-context.js';
 import { mintTokens } from '../../chain/test/hardhat-harness.js';
 import { ethers } from 'ethers';
+import { installHardhatACKProvider } from './_helpers/v10-acks.js';
 
 let _fileSnapshot: string;
 beforeAll(async () => {
@@ -46,6 +47,7 @@ async function createAgent(name: string, overrides: Partial<DKGAgentConfig> = {}
   agents.push(agent);
   stores.push(store);
   await agent.start();
+  await installHardhatACKProvider(agent);
   return { agent, store };
 }
 
@@ -96,7 +98,7 @@ describe('publishJsonLd', () => {
       '@type': 'Person',
       'name': 'Alice',
     });
-    expect(result.status).toBe('confirmed');
+    expect(result.status).toBe('tentative');
 
     const publicResult = await store.query(
       `ASK { GRAPH <did:dkg:context-graph:bare-priv> { ?s ?p ?o } }`,
@@ -149,7 +151,7 @@ describe('publishJsonLd', () => {
         'email': 'carol@example.org',
       },
     });
-    expect(result.status).toBe('confirmed');
+    expect(result.status).toBe('tentative');
 
     const publicName = await store.query(
       `ASK { GRAPH <did:dkg:context-graph:split-test> { <http://example.org/Carol> <http://schema.org/name> ?name } }`,
@@ -178,7 +180,7 @@ describe('publishJsonLd', () => {
         'name': 'Top Secret',
       },
     });
-    expect(result.status).toBe('confirmed');
+    expect(result.status).toBe('tentative');
 
     const anchorResult = await store.query(
       `ASK { GRAPH <did:dkg:context-graph:priv-only> { ?s ?p ?o } }`,

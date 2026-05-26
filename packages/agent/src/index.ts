@@ -108,6 +108,7 @@ export {
   type PeerHealth,
   type CclPublishedEvaluationRecord,
   type CclPublishedResultEntry,
+  type PendingSenderKeyEntry,
 } from './dkg-agent-types.js';
 export {
   bindRandomSampling,

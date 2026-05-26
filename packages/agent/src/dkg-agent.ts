@@ -258,6 +258,7 @@ import {
   type PreSignedAuthorAttestation,
   type LocalSwmSenderKeySendState,
   type LocalSwmSenderKeyReceiveState,
+  type PendingSenderKeyEntry,
   type RandomSamplingStartResult,
   type ACKSignerResolution,
   type SyncRequestEnvelope,
@@ -914,6 +915,27 @@ export class DKGAgent {
   private readonly swmSenderKeySendStates = new Map<string, LocalSwmSenderKeySendState>();
   private readonly swmSenderKeyReceiveStates = new Map<string, LocalSwmSenderKeyReceiveState>();
   private swmSenderKeyStateLoaded = false;
+  /**
+   * PR-2 (SWM-fanout plan): pending sender-key package fanouts that
+   * landed in the "no advertised peerId" branch of
+   * `createAndDistributeSwmSenderKeyEpoch`. Keyed by lowercased
+   * `recipientAgentAddress` so the connection:open listener can drain
+   * by agent identity (the only handle we have when we minted the row
+   * without a peerId). Per-key triple `(senderAgentAddress,
+   * recipientKeyId, epochId)` deduplicates within an agent.
+   *
+   * In-memory only for now. Older epochs are evicted whenever a newer
+   * epoch is enqueued for the same `(sender, recipient)` pair — the
+   * supersession matches what the membership-hash flow already implies
+   * sender-side, and avoids the "queued package for epoch N replays
+   * after we've rolled to N+1" footgun.
+   *
+   * A future PR will plumb a SQLite-backed store through
+   * `config.swmSenderKeyStores?.pendingByAgent` so durability survives
+   * daemon restart. Today, restart loses pending rows and the next
+   * publish re-enqueues if the same member still has no peerId.
+   */
+  private readonly pendingSenderKeyByAgent = new Map<string, PendingSenderKeyEntry[]>();
 
   private constructor(
     config: DKGAgentConfig,
@@ -2379,6 +2401,19 @@ export class DKGAgent {
         } catch (err: unknown) {
           const message = err instanceof Error ? err.message : String(err);
           this.log.warn(ctx, `Opportunistic Messenger-outbox retry on connect failed for ${remotePeer}: ${message}`);
+        }
+        // PR-2 (SWM-fanout plan): drain pending sender-key packages
+        // that were queued because the recipient had no advertised
+        // peerId at publish time. Tolerant of profile-lookup failure
+        // (the next connection:open will retry).
+        try {
+          const drained = await this.drainPendingSenderKeyForPeer(remotePeer);
+          if (drained > 0) {
+            this.log.info(ctx, `Drained ${drained} pending SWM sender-key package(s) for ${remotePeer}`);
+          }
+        } catch (err: unknown) {
+          const message = err instanceof Error ? err.message : String(err);
+          this.log.warn(ctx, `Pending SWM sender-key drain on connect failed for ${remotePeer}: ${message}`);
         }
       })();
 
@@ -5632,12 +5667,32 @@ export class DKGAgent {
         }
 
         if (!recipient.peerId) {
-          return {
-            kind: 'failure',
-            agentAddress: recipientAgentAddress,
-            keyId: recipient.recipientKeyId,
-            error: new Error('no advertised peerId'),
-          };
+          // PR-2 (SWM-fanout plan): the recipient agent has no advertised
+          // `dkg:peerId` triple in our local store (typically because we
+          // haven't synced their profile yet, or they really were never
+          // online). Pre-PR-2 this was a HARD failure for that key, and
+          // if every key for the agent landed here the whole publish
+          // threw — turning "one never-seen member" into "publish blocked
+          // for everyone". We now match the messenger.sendReliable
+          // soft-success contract: durably remember the package and
+          // attempt delivery once the agent shows up (via the
+          // connection:open drain below).
+          this.enqueuePendingSenderKey({
+            senderAgentAddress: senderAgentAddress.toLowerCase(),
+            recipientAgentAddress: recipientAgentAddress.toLowerCase(),
+            recipientKeyId: recipient.recipientKeyId,
+            epochId: state.epochId,
+            contextGraphId: state.contextGraphId,
+            subGraphName: state.subGraphName,
+            packageBytes: encodeSwmSenderKeyPackage(pkg),
+            createdAtMs: Date.now(),
+          });
+          this.log.warn(
+            input.ctx,
+            `SWM sender-key setup for ${recipientAgentAddress} keyId=${recipient.recipientKeyId} ` +
+            `queued (no advertised peerId) — will deliver when recipient connects`,
+          );
+          return { kind: 'success', agentAddress: recipientAgentAddress };
         }
 
         this.log.info(
@@ -5752,6 +5807,100 @@ export class DKGAgent {
     }
 
     return state;
+  }
+
+  /**
+   * PR-2 (SWM-fanout plan): enqueue a sender-key package whose recipient
+   * has no advertised `dkg:peerId` (so we can't even ask the messenger
+   * to queue it). Older epochs for the same `(sender, recipient)` pair
+   * are evicted — a newer epoch supersedes them by definition.
+   *
+   * Per-key dedup: `(senderAgentAddress, recipientKeyId, epochId)`
+   * matches an existing row, we replace it (idempotent re-enqueue).
+   */
+  private enqueuePendingSenderKey(entry: PendingSenderKeyEntry): void {
+    const recipientKey = entry.recipientAgentAddress.toLowerCase();
+    const existing = this.pendingSenderKeyByAgent.get(recipientKey) ?? [];
+    // Drop older epochs for the same (sender, recipient) pair; the newer
+    // epoch's membership-hash supersedes them. Keep entries for OTHER
+    // senders / recipients unchanged.
+    const filtered = existing.filter((e) => {
+      if (e.senderAgentAddress !== entry.senderAgentAddress) return true;
+      if (e.epochId === entry.epochId) {
+        // Same epoch: dedupe by recipientKeyId — caller may re-enqueue
+        // on retry. Replace by dropping the old slot; the new one is
+        // appended below.
+        return e.recipientKeyId !== entry.recipientKeyId;
+      }
+      return false;
+    });
+    filtered.push(entry);
+    this.pendingSenderKeyByAgent.set(recipientKey, filtered);
+  }
+
+  /**
+   * Drain queued sender-key packages whose recipient agent is one of
+   * the agent addresses advertised by `peerId`. Returns the number of
+   * rows successfully delivered (acked) and removed.
+   *
+   * Fired from the `connection:open` listener — see line 2382 — so the
+   * cost lives on the cold path of "we just connected to a new peer",
+   * not on every share. Each successful `sendReliable` with
+   * `delivered=true && ack.accepted=true` deletes the row; soft
+   * (`delivered=false`) leaves it queued for the next attempt; hard
+   * negative acks also delete it (the package is permanently invalid
+   * for this recipient).
+   */
+  private async drainPendingSenderKeyForPeer(peerId: string): Promise<number> {
+    if (this.pendingSenderKeyByAgent.size === 0) return 0;
+    let drained = 0;
+    let agentAddresses: string[] = [];
+    try {
+      const profile = await this.discovery.findAgentByPeerId(peerId);
+      if (profile?.agentAddress) {
+        agentAddresses = [profile.agentAddress.toLowerCase()];
+      }
+    } catch {
+      // Resolution failure is benign — we'll try again on the next
+      // connection:open burst. Don't propagate.
+    }
+    if (agentAddresses.length === 0) return 0;
+
+    for (const recipientAgentAddress of agentAddresses) {
+      const queue = this.pendingSenderKeyByAgent.get(recipientAgentAddress);
+      if (!queue || queue.length === 0) continue;
+      const remaining: PendingSenderKeyEntry[] = [];
+      for (const entry of queue) {
+        try {
+          const sendResult = await this.messenger.sendReliable(
+            peerId,
+            PROTOCOL_SWM_SENDER_KEY,
+            entry.packageBytes,
+          );
+          if (!sendResult.delivered) {
+            // Messenger queued for retry — keep our row so the next
+            // connection:open / publish has another shot.
+            remaining.push(entry);
+            continue;
+          }
+          // Both accepted=true and accepted=false are terminal: the
+          // recipient saw the package. Don't retry — the messenger's
+          // idempotency key would block re-delivery anyway.
+          drained += 1;
+        } catch {
+          // Wire error: keep the row queued. Next connection:open
+          // attempt has its own try/catch wrapper so this never
+          // propagates out of the listener.
+          remaining.push(entry);
+        }
+      }
+      if (remaining.length === 0) {
+        this.pendingSenderKeyByAgent.delete(recipientAgentAddress);
+      } else {
+        this.pendingSenderKeyByAgent.set(recipientAgentAddress, remaining);
+      }
+    }
+    return drained;
   }
 
   private async createSignedSwmSenderKeyPackage(input: {

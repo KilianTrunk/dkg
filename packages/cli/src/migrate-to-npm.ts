@@ -547,3 +547,104 @@ export function resolveMigrationDkgHome(opts: {
     configExists: opts.configExists,
   });
 }
+
+/**
+ * Result of `selectMigrationDkgHome()` — the home the migration should
+ * read/write from, the pid found there (if any), and whether the
+ * monorepo-candidate had a live daemon despite the executing CLI being
+ * in standalone install-mode (operator messaging hint).
+ */
+export interface MigrationHomeSelection {
+  dkgHome: string;
+  pid: number | null;
+  /**
+   * True when a live daemon was found at the monorepo-candidate home
+   * AND the executing CLI is itself in standalone install-mode. This
+   * is the global-CLI-in-checkout case from Codex
+   * #666#discussion_r3302712591 — operators need an explicit log line
+   * so they aren't surprised by the home selection.
+   */
+  recoveredGlobalCliInCheckout: boolean;
+}
+
+/**
+ * Pick the DKG home the migration should target by probing BOTH the
+ * monorepo-mode home (`~/.dkg-dev`) and the standalone home (`~/.dkg`)
+ * for an active daemon. Falls back to `resolveMigrationDkgHome()` when
+ * neither home has a running daemon (greenfield migration).
+ *
+ * Codex (#666#discussion_r3302712591): the previous logic derived the
+ * home purely from the LIVE CLI's install mode via `repoDir()`. When
+ * an operator runs a globally installed `dkg` (standalone CLI →
+ * `repoDir() === null`) from inside an unmigrated git checkout, that
+ * call resolved to `~/.dkg` and missed the live daemon running out of
+ * `~/.dkg-dev`. The migration then wrote `autoUpdate.source` into the
+ * wrong config and bypassed the orphan-state blocker.
+ *
+ * `repoRoot` is the structural checkout (`findDkgMonorepoRootFromCwd`)
+ * — used to compute the monorepo-candidate home regardless of how the
+ * live CLI sees its own install mode. `detectedRepoRoot` is the LIVE
+ * CLI's `repoDir()` — used purely to set `recoveredGlobalCliInCheckout`
+ * so callers can log the divergence.
+ */
+export function selectMigrationDkgHome(opts: {
+  repoRoot: string;
+  detectedRepoRoot: string | null;
+  homeDir: string;
+  readPidFromHome: (dkgHome: string) => Promise<number | null> | number | null;
+  isProcessRunning: (pid: number) => boolean;
+  env?: Pick<NodeJS.ProcessEnv, 'DKG_HOME'>;
+  configExists?: boolean;
+}): Promise<MigrationHomeSelection> {
+  return (async () => {
+    const monorepoCandidate = resolveMigrationDkgHome({
+      detectedRepoRoot: opts.repoRoot,
+      homeDir: opts.homeDir,
+      env: opts.env,
+      configExists: opts.configExists,
+    });
+    const standaloneCandidate = resolveMigrationDkgHome({
+      detectedRepoRoot: null,
+      homeDir: opts.homeDir,
+      env: opts.env,
+      configExists: opts.configExists,
+    });
+    const monorepoPid =
+      monorepoCandidate !== standaloneCandidate
+        ? await opts.readPidFromHome(monorepoCandidate)
+        : null;
+    const standalonePid = await opts.readPidFromHome(standaloneCandidate);
+    const monorepoAlive =
+      monorepoPid !== null && opts.isProcessRunning(monorepoPid);
+    const standaloneAlive =
+      standalonePid !== null && opts.isProcessRunning(standalonePid);
+
+    if (monorepoAlive) {
+      return {
+        dkgHome: monorepoCandidate,
+        pid: monorepoPid,
+        recoveredGlobalCliInCheckout:
+          opts.detectedRepoRoot === null &&
+          monorepoCandidate !== standaloneCandidate,
+      };
+    }
+    if (standaloneAlive) {
+      return {
+        dkgHome: standaloneCandidate,
+        pid: standalonePid,
+        recoveredGlobalCliInCheckout: false,
+      };
+    }
+    const fallback = resolveMigrationDkgHome({
+      detectedRepoRoot: opts.detectedRepoRoot,
+      homeDir: opts.homeDir,
+      env: opts.env,
+      configExists: opts.configExists,
+    });
+    return {
+      dkgHome: fallback,
+      pid: await opts.readPidFromHome(fallback),
+      recoveredGlobalCliInCheckout: false,
+    };
+  })();
+}

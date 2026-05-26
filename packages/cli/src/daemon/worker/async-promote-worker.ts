@@ -189,7 +189,10 @@ export async function runPromoteJob(
     job: PromoteJob;
     queue: AsyncPromoteQueue;
     workerId: string;
-    runPromote: (request: PromoteRequest) => Promise<{ promotedCount: number }>;
+    runPromote: (
+      request: PromoteRequest,
+      markPromoteStarted: () => Promise<void>,
+    ) => Promise<{ promotedCount: number }>;
     now: () => number;
     heartbeatIntervalMs: number;
     log: (msg: string) => void;
@@ -220,9 +223,14 @@ export async function runPromoteJob(
 
   try {
     let result: { promotedCount: number };
-    try {
+    let promoteStartedMarked = false;
+    const markPromoteStarted = async (): Promise<void> => {
+      if (promoteStartedMarked) return;
       await queue.recordCommitMarker(job.jobId, claimToken, 'promoteStarted');
-      result = await runPromote(job.request);
+      promoteStartedMarked = true;
+    };
+    try {
+      result = await runPromote(job.request, markPromoteStarted);
     } catch (err: unknown) {
       const classified = classifyPromoteError(err);
       const message = err instanceof Error ? err.message : String(err);
@@ -330,13 +338,14 @@ export function createPromoteWorkerSupervisor(config: PromoteWorkerConfig): Prom
           job: claimed,
           queue: config.agent.promoteQueue,
           workerId: slot.workerId,
-          runPromote: async (request) => {
+          runPromote: async (request, markPromoteStarted) => {
             const entities: 'all' | string[] | undefined =
               request.entities === undefined
                 ? undefined
                 : request.entities === 'all'
                 ? 'all'
                 : [...request.entities];
+            await markPromoteStarted();
             return config.agent.assertion.promote(request.contextGraphId, request.assertionName, {
               entities,
               subGraphName: request.subGraphName,
@@ -359,7 +368,27 @@ export function createPromoteWorkerSupervisor(config: PromoteWorkerConfig): Prom
             break;
         }
       } catch (err: unknown) {
-        log(`Worker ${slot.workerId} crashed processing ${claimed.jobId}: ${err instanceof Error ? err.message : String(err)}`);
+        const message = err instanceof Error ? err.message : String(err);
+        log(`Worker ${slot.workerId} crashed processing ${claimed.jobId}: ${message}`);
+        if (claimed.lease) {
+          try {
+            await config.agent.promoteQueue.fail(claimed.jobId, claimed.lease.claimToken, {
+              message: `Worker crashed after claiming job: ${message}`,
+              retryable: false,
+              classification: 'fatal',
+              recordedAt: now(),
+            });
+          } catch (failErr: unknown) {
+            if (failErr instanceof PromoteJobLeaseError) {
+              log(`Lease lost while parking crashed job ${claimed.jobId}: ${failErr.message}`);
+            } else {
+              log(
+                `Failed to park crashed job ${claimed.jobId}; next startup recovery must reconcile it: ` +
+                  `${failErr instanceof Error ? failErr.message : String(failErr)}`,
+              );
+            }
+          }
+        }
       } finally {
         slot.inFlight = null;
       }
@@ -418,6 +447,10 @@ export function createPromoteWorkerSupervisor(config: PromoteWorkerConfig): Prom
         started = false;
         shuttingDown = true;
         throw new Error(`recoverOnStartup failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      if (shuttingDown) {
+        started = false;
+        return;
       }
       for (const slot of slots) {
         slot.timer = setInterval(() => {

@@ -45,7 +45,8 @@ describe('promote-async daemon routes', () => {
       idGenerator: () => `job-${++idCounter}`,
       backoff: () => 60_000,
     });
-    daemonState.promoteWorkerEnabled = true;
+    daemonState.promoteWorkerAvailable = true;
+    daemonState.promoteWorkerUnavailableReason = null;
   });
 
   afterEach(async () => {
@@ -55,6 +56,8 @@ describe('promote-async daemon routes', () => {
       });
       server = undefined;
     }
+    daemonState.promoteWorkerAvailable = false;
+    daemonState.promoteWorkerUnavailableReason = null;
   });
 
   function makeAgent() {
@@ -178,6 +181,18 @@ describe('promote-async daemon routes', () => {
     expect(r.body.enqueuedAt).toBeTypeOf('number');
   });
 
+  it('POST /:name/promote-async returns 503 when the worker is unavailable', async () => {
+    await startRoutes(makeAgent());
+    daemonState.promoteWorkerAvailable = false;
+    daemonState.promoteWorkerUnavailableReason = 'recoverOnStartup failed';
+    const r = await post('/api/assertion/my-assertion/promote-async', {
+      contextGraphId: 'graphify',
+      entities: 'all',
+    });
+    expect(r.status).toBe(503);
+    expect(r.body.error).toContain('recoverOnStartup failed');
+  });
+
   it('POST /:name/promote-async returns 409 with existingJobId on duplicate enqueue', async () => {
     await startRoutes(makeAgent());
     const first = await post('/api/assertion/dup/promote-async', {
@@ -197,14 +212,15 @@ describe('promote-async daemon routes', () => {
   });
 
   it('POST /:name/promote-async returns 503 when the worker is disabled', async () => {
-    daemonState.promoteWorkerEnabled = false;
+    daemonState.promoteWorkerAvailable = false;
+    daemonState.promoteWorkerUnavailableReason = 'disabled via config.promoteQueue.enabled=false';
     await startRoutes(makeAgent());
     const r = await post('/api/assertion/my-assertion/promote-async', {
       contextGraphId: 'graphify',
       entities: 'all',
     });
     expect(r.status).toBe(503);
-    expect(r.body.error).toMatch(/worker is disabled/);
+    expect(r.body.error).toMatch(/disabled/);
     expect(await queue.getStats()).toMatchObject({ queued: 0 });
   });
 

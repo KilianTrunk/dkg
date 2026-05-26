@@ -149,7 +149,10 @@ describe('runPromoteJob', () => {
       job,
       queue,
       workerId: 'worker-test',
-      runPromote: async () => ({ promotedCount: 42 }),
+      runPromote: async (_request, markPromoteStarted) => {
+        await markPromoteStarted();
+        return { promotedCount: 42 };
+      },
       now: () => now,
       heartbeatIntervalMs: 0,
       log: (m) => logs.push(m),
@@ -175,7 +178,10 @@ describe('runPromoteJob', () => {
       job,
       queue,
       workerId: 'worker-test',
-      runPromote: async () => ({ promotedCount: 7 }),
+      runPromote: async (_request, markPromoteStarted) => {
+        await markPromoteStarted();
+        return { promotedCount: 7 };
+      },
       now: () => now,
       heartbeatIntervalMs: 0,
       log: () => {},
@@ -199,7 +205,10 @@ describe('runPromoteJob', () => {
       job,
       queue,
       workerId: 'worker-test',
-      runPromote: async () => ({ promotedCount: 0 }),
+      runPromote: async (_request, markPromoteStarted) => {
+        await markPromoteStarted();
+        return { promotedCount: 0 };
+      },
       now: () => now,
       heartbeatIntervalMs: 0,
       log: () => {},

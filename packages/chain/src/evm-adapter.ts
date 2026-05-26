@@ -381,12 +381,11 @@ export class EVMChainAdapter implements ChainAdapter {
     // nodes that GC filters faster than ethers' polling cadence
     // (observed: 134 MB of daemon.log spam in 24h on beacon-01) spam
     // the operator's logs with per-tick "filter not found" errors.
-    // The silencer dedupe-logs once per DEDUP_WINDOW_MS, lets every
-    // other provider error propagate normally. The Hub TTL-refresh
-    // fallback in startHubRotationListener already keeps contract
-    // addresses fresh while filters are silently failing — this PR is
-    // log-spam suppression, not filter recreation. (See module
-    // docblock for the rationale on the deliberate scope limit.)
+    // The silencer dedupe-logs once per DEDUP_WINDOW_MS and lets every
+    // other provider error propagate normally. It does not recreate
+    // filters or guarantee every Hub-resolved contract handle stays
+    // fresh; only the RandomSampling pair has a TTL self-heal path.
+    // The warning text keeps the wider event-polling degradation visible.
     this.filterErrorSilencer = createFilterErrorSilencer({
       log: (msg) => console.warn(`${msg} (${providerContext})`),
     });
@@ -2726,7 +2725,8 @@ export class EVMChainAdapter implements ChainAdapter {
    * rejection. We `await` both subscriptions and only set
    * `hubRotationListenerStarted` after both succeed, so a failed
    * provider can be retried by a future call site if we ever need to
-   * — and meanwhile the TTL refresh path still keeps the pair fresh.
+   * — and meanwhile the TTL refresh path still keeps the RandomSampling
+   * pair fresh.
    */
   private async startHubRotationListener(): Promise<void> {
     if (this.hubRotationListenerStarted) return;

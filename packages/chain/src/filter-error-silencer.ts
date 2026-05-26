@@ -36,11 +36,13 @@
  *   3. Any other provider error still flows through to the default
  *      logger (we don't want to mask non-filter errors).
  *
- * The TTL-refresh fallback in `evm-adapter.ts:startHubRotationListener`
- * already covers the application-correctness side — the Hub contract
- * address pair stays fresh via periodic re-read even when filter
- * subscriptions are silently failing. So the operator pain is purely
- * the log volume, and that's what this PR addresses.
+ * The TTL-refresh fallback currently covers the highest-value
+ * RandomSampling / RandomSamplingStorage pair, which is the pair that
+ * already has self-healing cache logic. Other one-shot Hub-resolved
+ * contract handles still depend on Hub event delivery (or process
+ * restart) to observe rotations. So the warning emitted by this module
+ * must keep that degradation visible while deduping the repeated provider
+ * errors.
  *
  * Future PR can wrap a true `RecoverableEventProvider` once we have a
  * live repro to verify against; tracked in the planning doc as the
@@ -193,7 +195,8 @@ export function createFilterErrorSilencer(opts: FilterErrorSilencerOpts = {}): F
             : '';
         log(
           `[chain] RPC filter expired (eth_getFilterChanges returned "filter not found"). ` +
-            `Hub TTL-refresh fallback keeps contract addresses fresh while event polling is degraded.${suppressedSuffix}`,
+            `Hub event polling is degraded; RandomSampling/RandomSamplingStorage have a TTL fallback, ` +
+            `but other Hub-resolved contract handles may stay stale until filters recover or the adapter restarts.${suppressedSuffix}`,
         );
         lastEmitAt = currentTime;
         filterErrorsSuppressedInWindow = 0;

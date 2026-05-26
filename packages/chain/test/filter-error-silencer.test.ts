@@ -138,6 +138,8 @@ describe('createFilterErrorSilencer', () => {
     expect(silencer.handle(filterNotFoundError())).toBe(true);
     expect(log).toHaveBeenCalledTimes(1);
     expect(log.mock.calls[0][0]).toContain('RPC filter expired');
+    expect(log.mock.calls[0][0]).toContain('RandomSampling/RandomSamplingStorage have a TTL fallback');
+    expect(log.mock.calls[0][0]).toContain('other Hub-resolved contract handles may stay stale');
     expect(silencer.stats().filterErrorsTotal).toBe(1);
     expect(silencer.stats().filterErrorsSuppressedInWindow).toBe(0);
   });

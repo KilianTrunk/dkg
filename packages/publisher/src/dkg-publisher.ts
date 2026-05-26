@@ -1950,15 +1950,24 @@ export class DKGPublisher implements Publisher {
       }
     }
 
+    // Collect ACKs only when this publish can actually submit to V10.
+    // Descriptive/local CG ids may still pass a daemon-provided provider
+    // (the agent wires it eagerly), but those are intentional local
+    // publishes and must not fail before the local branch below can run.
+    const v10ACKProvider = options.v10ACKProvider;
+    const shouldCollectV10ACKs =
+      v10ACKProvider !== undefined &&
+      !hasPrivateData &&
+      canAttemptOnChainPublish;
     let v10ACKs: V10CoreNodeACK[] | undefined;
-    if (options.v10ACKProvider && !hasPrivateData) {
+    if (shouldCollectV10ACKs) {
       onPhase?.('collect_v10_acks', 'start');
       try {
         const rootEntities = manifestEntries.map(m => m.rootEntity);
         // LU-5: for curated CGs the publisher pays / signs against the
         // ciphertext byte size (`effectiveByteSize`). For public CGs
         // nothing changed — `effectiveByteSize === publicByteSize`.
-        v10ACKs = await options.v10ACKProvider(
+        v10ACKs = await v10ACKProvider(
           kcMerkleRoot, v10CgDomain, kaCount, rootEntities,
           effectiveByteSize, stagingQuads,
           publishEpochs, precomputedTokenAmount,
@@ -2006,7 +2015,7 @@ export class DKGPublisher implements Publisher {
       } finally {
         onPhase?.('collect_v10_acks', 'end');
       }
-    } else if (options.v10ACKProvider && hasPrivateData) {
+    } else if (v10ACKProvider && hasPrivateData && canAttemptOnChainPublish) {
       this.log.info(ctx, `V10 ACK collection skipped: publish contains private quads (${privateRoots.length} private roots)`);
     }
 
@@ -2107,7 +2116,30 @@ export class DKGPublisher implements Publisher {
       // tentative-metadata generation here scopes the metadata write
       // exclusively to those intentional-skip branches and keeps the
       // chain-failure path inert.
-      const tentativeMeta = generateTentativeMetadata(
+      // RC11 / PR2 (review fix): preserve the exact provenance + meta-graph
+      // routing the pre-PR2 catch block did. Two strictly-additive
+      // requirements relative to the minimal call above:
+      //
+      //   1. `authorAddress` / `publishOperationId` — emits the
+      //      `dkg:Publication` + `dkg:authoredBy` quads that RFC-001 §3.5
+      //      requires for tentative publishes so downstream consumers
+      //      (`access-handler`, `assertion-history`, the verified-memory
+      //      view) can still attribute the publish locally before any
+      //      chain confirmation. The on-chain `KnowledgeBatch.authorAddress`
+      //      is canonical only once the publish confirms; until then this
+      //      is a self-claim. `publisherSigner` may be undefined
+      //      (no-chain / no-key path) — skip the fields in that case so
+      //      the publication subject is not emitted with a missing author.
+      //
+      //   2. `targetMetaGraphUri` remap — every generated meta quad sits
+      //      in the default `did:dkg:context-graph:<id>/_meta` graph. If
+      //      the caller supplied a `targetMetaGraphUri` (e.g. for SWM /
+      //      private-channel meta isolation) the pre-PR2 path remapped
+      //      them; without this, intentional-local publishes targeting a
+      //      non-default meta graph would silently drop their `_meta`
+      //      triples into the wrong graph and become invisible to the
+      //      caller's own meta-graph queries.
+      let tentativeMeta = generateTentativeMetadata(
         {
           ual,
           contextGraphId,
@@ -2118,9 +2150,23 @@ export class DKGPublisher implements Publisher {
           allowedPeers: normalizedAllowedPeers,
           timestamp: new Date(),
           subGraphName: options.subGraphName,
+          ...((options.precomputedAttestation?.authorAddress
+            ?? publisherSigner?.address) != null
+            ? {
+                authorAddress: (options.precomputedAttestation?.authorAddress
+                  ?? publisherSigner!.address),
+                publishOperationId,
+              }
+            : {}),
         },
         kaMetadata,
       );
+      if (options.targetMetaGraphUri) {
+        const defaultMeta = `did:dkg:context-graph:${contextGraphId}/_meta`;
+        tentativeMeta = tentativeMeta.map((q) =>
+          q.graph === defaultMeta ? { ...q, graph: options.targetMetaGraphUri! } : q,
+        );
+      }
       this.log.info(ctx, `Storing ${normalizedQuads.length} triples in local store (${reasonLog})`);
       await this.store.insert(normalizedQuads);
       await this.store.insert(tentativeMeta);
@@ -2180,14 +2226,13 @@ export class DKGPublisher implements Publisher {
       // `kcId: 0` (which the daemon previously had to special-case).
       //
       // Missing-seal — `precomputedAttestation === undefined` — is
-      // intentionally NOT hoisted. The publisher's contract historically
-      // permits no-seal publishes (they fall through to tentative);
-      // breaking that surface in this PR would invalidate ~120 publisher
-      // unit tests that exercise transport, ownership, and lifecycle
-      // mechanics without caring about author attribution. Production
-      // call sites (agent.publish, /api/shared-memory/publish) always
-      // mint a seal at the agent layer — see Phase 4 wiring; no
-      // user-facing path can reach the publisher without a seal.
+      // checked inside the chain-submit branch below, after ACK
+      // collection has proven this is a real V10 publish attempt. RC11
+      // / PR-A deliberately rethrows that failure instead of
+      // downgrading to local tentative VM, so ACK-ready no-seal callers
+      // get a clear contract error and no root data-graph write.
+      // Intentional local publishes (no on-chain CG id / non-V10 /
+      // private data) still bypass this branch and can remain tentative.
       // ─────────────────────────────────────────────────────────────
       if (
         options.precomputedAttestation &&

@@ -437,21 +437,60 @@ describe('Reordered Publish Flow (replicate-then-publish)', () => {
 
     const failChain = createEVMAdapter(HARDHAT_KEYS.EXTRA1);
     const keypair = await generateEd25519Keypair();
-    const failPublisher = new DKGPublisher({
-      store,
-      chain: failChain,
-      eventBus,
-      keypair,
-      publisherPrivateKey: HARDHAT_KEYS.EXTRA1,
-      publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
-    });
+    // RC11 / PR1+PR2 (review fix): wire the Hardhat receiver-ACK
+    // provider so the publish actually reaches the chain-submit branch
+    // before it throws. Without an injected `v10ACKProvider`, the
+    // submit branch's pre-flight guard ("V10 ACKs required for on-chain
+    // publish — no ACKs collected") fires first and the resulting
+    // `rejects.toThrow()` would accept the wrong-cause rejection.
+    // That would silently re-pass even after a future regression
+    // restores the catch-then-tentative behaviour on the chain branch
+    // — defeating the test's actual purpose. With the ACK provider
+    // wired in, ACK collection succeeds (REC1..REC3 sign), the chain
+    // branch is entered, and the publish fails because EXTRA1 has no
+    // tokens to satisfy the publisher-stake / fee precondition on the
+    // V10 contract — which is the path PR2's "no silent tentative
+    // downgrade on chain failure" actually guards.
+    const failPublisher = wrapPublisherForTest(
+      new DKGPublisher({
+        store,
+        chain: failChain,
+        eventBus,
+        keypair,
+        publisherPrivateKey: HARDHAT_KEYS.EXTRA1,
+        publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
+      }),
+      {
+        author: _author,
+        ctx: { provider: _provider, kav10Address: _kav10Address },
+        v10ACKProvider: getAckProvider(),
+      },
+    );
 
-    await expect(
-      failPublisher.publish({
+    // The intent is "publish() does NOT silently downgrade on a
+    // chain-branch failure". Capture the rejection once and check two
+    // things on the same error: (a) the publish rejected at all, and
+    // (b) it didn't reject with the ACK-pre-flight message — otherwise
+    // we'd be exercising the wrong branch and a future regression that
+    // restores the catch-then-tentative behaviour on the chain branch
+    // could slip past undetected.
+    let err: unknown;
+    try {
+      await failPublisher.publish({
         contextGraphId: CONTEXT_GRAPH,
         quads,
-      }),
-    ).rejects.toThrow();
+      });
+    } catch (e) {
+      err = e;
+    }
+    expect(err, 'publish() must reject — no silent tentative downgrade on chain failure').toBeDefined();
+    const msg = err instanceof Error ? err.message : String(err);
+    expect(
+      msg,
+      `publish() must reject AT the chain-submit branch, not at the ` +
+      `V10-ACKs-required pre-flight guard; otherwise the test does not ` +
+      `exercise the PR2 catch-block-removal contract. Got: "${msg}"`,
+    ).not.toMatch(/V10 ACKs required for on-chain publish/);
   });
 });
 

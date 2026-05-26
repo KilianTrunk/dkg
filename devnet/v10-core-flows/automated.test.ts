@@ -382,44 +382,89 @@ describe('2. failed publish does not leak triples into verified-memory (RC11 / P
     r = await postJson(NODE5_API, `/api/assertion/${assertionName}/promote`, { contextGraphId: CONTEXT_GRAPH }, state.node5Token);
     expect(r.status).toBe(200);
 
-    // The publish MUST NOT confirm — node5 is the edge node, has no
-    // on-chain identity, so the publisher's chain-submit branch hits
-    // `PublisherWalletRequiredError` (or the equivalent typed ACK /
-    // signer guard). Pre-RC11 the publisher's catch swallowed this
-    // into `status: 'tentative'` and `/api/shared-memory/publish`
-    // returned 200; post-RC11 / PR2 the error propagates and the
-    // daemon route surfaces a non-2xx (or a 200 with `status: 'failed'`,
-    // depending on the route's error translation — accept either).
+    // The publish MUST be surfaced as a failure — node5 is the edge
+    // node, has no on-chain identity, so the publisher's chain-submit
+    // branch hits `PublisherWalletRequiredError` (or the equivalent
+    // typed ACK / signer guard). Pre-RC11 the publisher's catch
+    // swallowed this into `status: 'tentative'` and
+    // `/api/shared-memory/publish` returned 200; post-RC11 / PR2 the
+    // error propagates and the daemon route surfaces it. Accept the
+    // two known post-RC11 shapes — a non-2xx response, or a 200 with
+    // an explicit `error` / `status: 'failed'` payload — and
+    // EXPLICITLY reject `200 { status: 'tentative' }` so a regression
+    // back to the pre-RC11 silent-tentative path fails this test
+    // immediately instead of being absorbed by `publishOk === false`.
     r = await postJson(NODE5_API, '/api/shared-memory/publish', { contextGraphId: CONTEXT_GRAPH, assertionName }, state.node5Token);
-    const publishOk = r.status === 200 && r.body?.status === 'confirmed';
-    expect(publishOk, `edge publish unexpectedly confirmed: ${JSON.stringify(r.body)}`).toBe(false);
+    const isNon2xx = r.status < 200 || r.status >= 300;
+    const isExplicitFailure = r.status === 200
+      && (r.body?.status === 'failed' || typeof r.body?.error === 'string');
+    expect(
+      isNon2xx || isExplicitFailure,
+      `edge publish must surface failure explicitly post-RC11 / PR2 ` +
+      `(non-2xx OR 200 { status: 'failed' | error: <string> }), got ` +
+      `status=${r.status} body=${JSON.stringify(r.body)}. ` +
+      `A 200 { status: 'tentative' } here is the pre-PR2 silent ` +
+      `downgrade and is the regression this test guards against.`,
+    ).toBe(true);
+    expect(
+      r.body?.status,
+      `edge publish unexpectedly returned status='tentative' — the ` +
+      `RC11 / PR1+PR2 contract rejects this outcome (would re-enable ` +
+      `the verified-memory leak).`,
+    ).not.toBe('tentative');
+    expect(
+      r.body?.status,
+      `edge publish unexpectedly returned status='confirmed' — node5 ` +
+      `has no on-chain identity, so this would mean the chain submit ` +
+      `branch silently passed without an ACK signer.`,
+    ).not.toBe('confirmed');
 
     // CORE ASSERTION (inverse of the deleted "tentative VM" contract):
     // the failed publish's triples MUST NOT appear in the
-    // verified-memory view on ANY node. We poll node1 (a core) for up
-    // to a few seconds so any in-flight gossip from the edge had time
-    // to land in the wrong graph, then assert zero rows.
-    const vmQuery = await postJson(
-      NODE1_API,
-      '/api/query',
-      {
-        sparql:
-          `SELECT ?o WHERE { <${subject}> <http://schema.org/name> ?o . FILTER(?o = ${witnessLiteral}) }`,
-        contextGraphId: CONTEXT_GRAPH,
-        view: 'verified-memory',
-      },
-      state.node1Token,
-    );
-    expect(vmQuery.status, `vm query: ${JSON.stringify(vmQuery.body)}`).toBe(200);
-    const vmBindings: unknown[] = vmQuery.body?.bindings ?? vmQuery.body?.results?.bindings ?? [];
+    // verified-memory view on ANY node. Poll node1 (a core) over a few
+    // seconds so any in-flight gossip from the edge has time to land
+    // in the wrong graph — a leak that materialises 1-2s after the
+    // publish call returns would be missed by a single immediate
+    // query. The retry exits early on success (zero rows seen at any
+    // poll); the loop only runs to completion when the query keeps
+    // succeeding with zero rows, which is what we want.
+    const VM_POLL_ATTEMPTS = 6;
+    const VM_POLL_INTERVAL_MS = 500;
+    let lastVmStatus = 0;
+    let lastVmBody: any = undefined;
+    let lastVmBindings: unknown[] = [];
+    let leakSeen = false;
+    for (let attempt = 0; attempt < VM_POLL_ATTEMPTS; attempt++) {
+      const vmQuery = await postJson(
+        NODE1_API,
+        '/api/query',
+        {
+          sparql:
+            `SELECT ?o WHERE { <${subject}> <http://schema.org/name> ?o . FILTER(?o = ${witnessLiteral}) }`,
+          contextGraphId: CONTEXT_GRAPH,
+          view: 'verified-memory',
+        },
+        state.node1Token,
+      );
+      lastVmStatus = vmQuery.status;
+      lastVmBody = vmQuery.body;
+      lastVmBindings = vmQuery.body?.bindings ?? vmQuery.body?.results?.bindings ?? [];
+      if (lastVmBindings.length > 0) {
+        leakSeen = true;
+        break;
+      }
+      if (attempt < VM_POLL_ATTEMPTS - 1) await sleep(VM_POLL_INTERVAL_MS);
+    }
+    expect(lastVmStatus, `vm query: ${JSON.stringify(lastVmBody)}`).toBe(200);
     expect(
-      vmBindings.length,
-      `PR2 invariant violated: failed publish leaked ${vmBindings.length} row(s) into ` +
-      `view=verified-memory for ${subject} — the on-chain catch is still ` +
+      leakSeen,
+      `PR2 invariant violated: failed publish leaked ${lastVmBindings.length} row(s) into ` +
+      `view=verified-memory for ${subject} after up to ` +
+      `${VM_POLL_ATTEMPTS * VM_POLL_INTERVAL_MS}ms of polling — the on-chain catch is still ` +
       `writing tentative quads to a graph that the VM view aliases. ` +
       `Re-check dkg-publisher.ts catch block and dkg-query-engine.ts ` +
       `verified-memory branch.`,
-    ).toBe(0);
+    ).toBe(false);
   }, 90_000);
 });
 

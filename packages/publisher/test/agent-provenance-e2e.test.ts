@@ -539,14 +539,29 @@ describe('Diagram 6 — attribution modes via per-publish override', () => {
 });
 
 // =============================================================================
-// Diagram 7 — Tentative fallback (daemon=0, no override)
+// Diagram 7 — no-attribution publish and intentional local fallback
 //
-// Already covered exhaustively in `publish-lifecycle.test.ts` T-OVERRIDE.
-// Reference test below is a single-line sanity check.
+// The legacy tentative fallback was removed in RC11 / PR-A: when a daemon
+// has no node identity but does have a funded publisher wallet, it should
+// publish on-chain with `publisherNodeIdentityId = 0` instead of downgrading.
+// PR-B keeps explicit coverage for the only remaining tentative path here:
+// structurally-local publishes whose context graph cannot map to a V10
+// on-chain id.
 // =============================================================================
 
-describe('Diagram 7 — tentative fallback when daemon has no identity and no override', () => {
-  it('returns tentative status with a /t-prefixed UAL', async () => {
+describe('Diagram 7 — no-attribution publish when daemon has no identity and no override', () => {
+  it('confirms numeric on-chain publishes with publisherNodeIdentityId=0', async () => {
+    const publisher = makePublisher({ daemonId: 0n });
+    const result = await publishSealed(publisher, {
+      contextGraphId: CONTEXT_GRAPH,
+      quads: [q(`${ENTITY}/D7`, 'http://schema.org/name', '"NoAttribution"')],
+    });
+
+    expect(result.status).toBe('confirmed');
+    expect(result.onChainResult).toBeDefined();
+  });
+
+  it('returns tentative status for structurally-local non-numeric context graphs', async () => {
     // RC11 / PR3: tentative is now reached via the structurally-
     // impossible-to-chain branches only (non-numeric CG, hasPrivateData,
     // !chainV10Ready). Use a non-numeric SWM CG label so the publish
@@ -643,10 +658,9 @@ describe('Diagram 8 — multi-update author array stays consistent with the cano
 //     its merkle/signer doesn't match, this is a hard error rather
 //     than a silent downgrade).
 //   - Missing seal: a publish() call without precomputedAttestation
-//     falls through to tentative because the publisher refuses to
-//     broadcast without a finalize-time seal (RFC-001 §9.x Phase C).
-//     This is the no-seal contract — production call sites mint a
-//     seal at the agent layer; tests can opt out by omitting it.
+//     fails before chain submit because RC11 / PR-A removed the
+//     chain-failure → tentative downgrade. Production call sites mint a
+//     seal at the agent layer, so this is a caller-contract guard.
 //
 // The agent-layer wrapper (`agent.assertion.finalize` →
 // `publishFromFinalizedAssertion`) is exercised separately by the
@@ -758,6 +772,7 @@ describe('Diagram 11 — Phase 5 precomputedAttestation (sign-at-creation)', () 
           },
           schemeVersion: AUTHOR_SCHEME_VERSION_V1,
         },
+        v10ACKProvider: hardhatACKProvider(kav10Address),
       }),
     ).rejects.toThrow(/expectedMerkleRoot mismatch/);
   });
@@ -833,6 +848,7 @@ describe('Diagram 11 — Phase 5 precomputedAttestation (sign-at-creation)', () 
           },
           schemeVersion: AUTHOR_SCHEME_VERSION_V1,
         },
+        v10ACKProvider: hardhatACKProvider(kav10Address),
       });
     } catch (e) {
       threw = e;

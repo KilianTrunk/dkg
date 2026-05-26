@@ -359,16 +359,21 @@ describe('E2E: Publish KC directly to context graph', () => {
     ]);
     await sleep(2000);
 
-    // RC11 / PR1: the publisher's self-signed ACK fallback is gone, so a
-    // single-node publishFromSharedMemory has no real peers to dial for
-    // ACKs and the publisher correctly downgrades the publish to
-    // `tentative` instead of synthesising a `peerId: 'self'` ACK that the
-    // contract would reject on any network with `minimumRequiredSignatures
-    // >= 2` anyway. The replicate-then-publish on-chain path is covered
-    // by the multi-node §1 / §2 tests above.
-    const result = await nodeA.publishFromSharedMemory(CONTEXT_GRAPH, { rootEntities: [ENTITY_3] });
-    expect(result.status).toBe('tentative');
-    expect(result.onChainResult).toBeUndefined();
+    // RC11 / PR1 (review fix): the publisher's self-signed ACK fallback
+    // is gone. `DKGAgent.publishFromSharedMemory()` unconditionally wires
+    // `createV10ACKProvider()` on a V10-ready Hardhat chain, and that
+    // provider routes through `ACKCollector.collect()` which throws
+    // verbatim on "no connected core peers". The publisher's catch at
+    // `dkg-publisher.ts:1989-1994` rethrows verbatim (RC11 / PR1+PR3),
+    // so the publish REJECTS — it does not silently downgrade to
+    // `tentative`. Pre-PR1 the publisher synthesised a `peerId: 'self'`
+    // ACK that the contract would reject anyway on any network with
+    // `minimumRequiredSignatures >= 2`; the new behaviour fails loudly
+    // in the daemon log instead. The replicate-then-publish on-chain
+    // path is covered by the multi-node §1 / §2 tests above.
+    await expect(
+      nodeA.publishFromSharedMemory(CONTEXT_GRAPH, { rootEntities: [ENTITY_3] }),
+    ).rejects.toThrow(/ACK collection failed: no connected core peers/);
   }, 20_000);
 });
 
@@ -415,20 +420,21 @@ describe('E2E: Publish rejected with insufficient receiver signatures', () => {
     ]);
 
     /**
-     * RC11 / PR1: with `minimumRequiredSignatures=2` on-chain AND the
-     * lone publisher having no peer cores to collect ACKs from, the
-     * publisher's ACK provider returns 0 ACKs, the on-chain submit
-     * branch throws "V10 ACKs required" pre-flight, and the publish
-     * downgrades to `tentative`. Pre-PR1 the publisher synthesised a
-     * single self-signed ACK that the chain rejected as 1<2; same
-     * tentative outcome, different (and more honest) failure point.
+     * RC11 / PR1 (review fix): with `minimumRequiredSignatures=2`
+     * on-chain AND the lone publisher having no peer cores, the ACK
+     * collector throws "no connected core peers" before the on-chain
+     * submit branch is even reached. The publisher rethrows verbatim
+     * (no self-signed-ACK fallback in PR1+PR3), so the call REJECTS.
+     * Pre-PR1 the publisher synthesised a single self-signed ACK that
+     * the chain rejected as 1<2; the new behaviour fails earlier and
+     * the operator sees the real cause in the daemon log.
      */
-    const result = await nodeA.publishFromSharedMemory(
-      CONTEXT_GRAPH,
-      { rootEntities: [ENTITY_1] },
-    );
-
-    expect(result.status).toBe('tentative');
+    await expect(
+      nodeA.publishFromSharedMemory(
+        CONTEXT_GRAPH,
+        { rootEntities: [ENTITY_1] },
+      ),
+    ).rejects.toThrow(/ACK collection failed: no connected core peers/);
   }, 20_000);
 });
 
@@ -469,24 +475,24 @@ describe('E2E: Context graph registration rejected with insufficient participant
       { subject: ENTITY_1, predicate: 'http://schema.org/name', object: '"Needs Sigs"', graph: '' },
     ]);
 
-    // RC11 / PR1: V10 + LU-2 still enforces the *global*
+    // RC11 / PR1 (review fix): V10 + LU-2 still enforces the *global*
     // `minimumRequiredSignatures`, but the publisher no longer
     // synthesises a self-signed ACK when peer collection yields
     // nothing. A lone core with no other peers in its mesh therefore
-    // sees `ACKs collected = 0`, the publisher throws the typed
-    // ACK-collection failure, and the on-chain submit branch downgrades
-    // to `tentative`. This test previously asserted `confirmed` because
-    // the (now-deleted) self-signed ACK satisfied the 1-of-1 quorum on
-    // the harness; that path is gone. The multi-peer happy path is
-    // covered by §1 / §2 above.
-    const result = await nodeA.publishFromSharedMemory(
-      CONTEXT_GRAPH,
-      { rootEntities: [ENTITY_1] },
-      { subContextGraphId: contextGraphId },
-    );
-
-    expect(result.status).toBe('tentative');
-    expect(result.onChainResult).toBeUndefined();
+    // hits `ACKCollector.collect` with `corePeers.length === 0`, which
+    // throws "no connected core peers". The publisher rethrows
+    // verbatim and `publishFromSharedMemory` REJECTS — there is no
+    // silent tentative-downgrade. Pre-PR1 this test asserted
+    // `confirmed` because the (now-deleted) self-signed ACK satisfied
+    // the 1-of-1 quorum on the harness; that path is gone. The
+    // multi-peer happy path is covered by §1 / §2 above.
+    await expect(
+      nodeA.publishFromSharedMemory(
+        CONTEXT_GRAPH,
+        { rootEntities: [ENTITY_1] },
+        { subContextGraphId: contextGraphId },
+      ),
+    ).rejects.toThrow(/ACK collection failed: no connected core peers/);
   }, 20_000);
 });
 
@@ -565,35 +571,47 @@ describe('E2E: Edge node participates in context graph governance', () => {
      * Edge node should be able to sign (contextGraphId, merkleRoot)
      * even though it has no stake and isn't in the sharding table.
      *
-     * RC11 / PR1: the only peer in coreNode's mesh is an EDGE node,
-     * which does not register the StorageACK handler. coreNode therefore
-     * collects 0 receiver ACKs (it does not — and pre-PR1 did not —
-     * self-ACK). With the self-signed fallback deleted, the publisher
-     * downgrades to `tentative` instead of submitting a single bogus
-     * `peerId: 'self'` ACK. The participant-sig governance layer this
-     * test exercises is independent of the receiver-ACK gate: the
-     * triples still land in the data graph (publisher's unconditional
-     * insert, removed in PR2), which is what the bindings check below
-     * actually validates.
+     * RC11 / PR1+PR2 (review fix): the only peer in coreNode's mesh is
+     * an EDGE node, which does not register the StorageACK handler.
+     * `ACKCollector.collect` therefore either sees zero "known core
+     * peers" and throws "no connected core peers", or falls through to
+     * the edge peer and fails at protocol negotiation. The publisher
+     * rethrows verbatim (PR1+PR3) and `publishFromSharedMemory`
+     * REJECTS — no silent tentative-downgrade.
+     *
+     * PR2 also defers the data-graph insert until either on-chain
+     * confirmation OR an intentional-local-skip branch fires. A reject
+     * is neither, so the pre-PR2 "triples still land in the data graph
+     * on tentative" invariant this test used to validate is GONE on
+     * purpose (it was the LU-1 / PR2 verified-memory leak — see
+     * `automated.test.ts §2`).
+     *
+     * What's still meaningful to check here is the inverse: the failed
+     * publish does NOT leak its triples into the data graph on the
+     * publishing core. The participant-sig governance layer this test
+     * was named after is exercised by §1/§2/§5 above with a real
+     * multi-core mesh; preserving this test as a regression for "edge
+     * peer cannot stand in for a core ACK signer" + "failed publish
+     * doesn't leak" keeps both PR1 and PR2 covered in this file.
      */
-    const result = await coreNode.publishFromSharedMemory(
-      CONTEXT_GRAPH,
-      { rootEntities: [ENTITY_1] },
-      {
-        subContextGraphId: contextGraphId,
-        contextGraphSignatures: [
-          { identityId: BigInt(ctx.coreProfileId), r: new Uint8Array(32), vs: new Uint8Array(32) },
-          { identityId: BigInt(ctx.receiverIds[0]), r: new Uint8Array(32), vs: new Uint8Array(32) },
-        ],
-      },
-    );
-
-    expect(result.status).toBe('tentative');
+    await expect(
+      coreNode.publishFromSharedMemory(
+        CONTEXT_GRAPH,
+        { rootEntities: [ENTITY_1] },
+        {
+          subContextGraphId: contextGraphId,
+          contextGraphSignatures: [
+            { identityId: BigInt(ctx.coreProfileId), r: new Uint8Array(32), vs: new Uint8Array(32) },
+            { identityId: BigInt(ctx.receiverIds[0]), r: new Uint8Array(32), vs: new Uint8Array(32) },
+          ],
+        },
+      ),
+    ).rejects.toThrow();
 
     const ctxDataGraph = `did:dkg:context-graph:${CONTEXT_GRAPH}/context/${contextGraphId}`;
     const data = await coreNode.query(
       `SELECT ?name WHERE { GRAPH <${ctxDataGraph}> { <${ENTITY_1}> <http://schema.org/name> ?name } }`,
     );
-    expect(data.bindings.length).toBe(1);
+    expect(data.bindings.length).toBe(0);
   }, 40_000);
 });

@@ -339,7 +339,7 @@ export class TripleStoreAsyncPromoteQueue implements AsyncPromoteQueue {
       const expiresAt = job.lease?.expiresAt ?? 0;
       if (expiresAt > now) continue; // lease still valid; worker is fine
 
-      if (!job.commitMarker?.promoteStarted && !job.commitMarker?.swmInserted) {
+      if (job.commitMarker?.promoteStarted === false && job.commitMarker?.swmInserted === false) {
         const reclaimedJob: PromoteJob = {
           ...job,
           state: 'queued',

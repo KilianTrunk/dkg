@@ -27,6 +27,7 @@ import {
   type PromoteListFilter,
 } from '@origintrail-official/dkg-publisher';
 import { handleAssertionRoutes } from '../src/daemon/routes/assertion.js';
+import { daemonState } from '../src/daemon/state.js';
 
 describe('promote-async daemon routes', () => {
   let server: Server | undefined;
@@ -44,6 +45,8 @@ describe('promote-async daemon routes', () => {
       idGenerator: () => `job-${++idCounter}`,
       backoff: () => 60_000,
     });
+    daemonState.promoteWorkerAvailable = true;
+    daemonState.promoteWorkerUnavailableReason = null;
   });
 
   afterEach(async () => {
@@ -53,6 +56,8 @@ describe('promote-async daemon routes', () => {
       });
       server = undefined;
     }
+    daemonState.promoteWorkerAvailable = false;
+    daemonState.promoteWorkerUnavailableReason = null;
   });
 
   function makeAgent() {
@@ -174,6 +179,18 @@ describe('promote-async daemon routes', () => {
     expect(r.body.jobId).toBe('job-1');
     expect(r.body.state).toBe('queued');
     expect(r.body.enqueuedAt).toBeTypeOf('number');
+  });
+
+  it('POST /:name/promote-async returns 503 when the worker is unavailable', async () => {
+    await startRoutes(makeAgent());
+    daemonState.promoteWorkerAvailable = false;
+    daemonState.promoteWorkerUnavailableReason = 'recoverOnStartup failed';
+    const r = await post('/api/assertion/my-assertion/promote-async', {
+      contextGraphId: 'graphify',
+      entities: 'all',
+    });
+    expect(r.status).toBe(503);
+    expect(r.body.error).toContain('recoverOnStartup failed');
   });
 
   it('POST /:name/promote-async returns 409 with existingJobId on duplicate enqueue', async () => {

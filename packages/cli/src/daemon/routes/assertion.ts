@@ -1326,6 +1326,15 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
       return jsonResponse(res, 400, {
         error: `Invalid assertion name: ${nameVal.reason}`,
       });
+    if (!daemonState.promoteWorkerAvailable) {
+      return jsonResponse(res, 503, {
+        error:
+          `Async promote worker is not available` +
+          (daemonState.promoteWorkerUnavailableReason
+            ? `: ${daemonState.promoteWorkerUnavailableReason}`
+            : ''),
+      });
+    }
     const body = await readBody(req, SMALL_BODY_BYTES);
     const parsed = safeParseJson(body, res);
     if (!parsed) return;

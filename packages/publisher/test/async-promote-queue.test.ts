@@ -464,6 +464,25 @@ describe('TripleStoreAsyncPromoteQueue', () => {
     expect(job?.reason).toBeUndefined();
   });
 
+  it('26b. recoverOnStartup() treats legacy running jobs without promoteStarted as ambiguous', async () => {
+    const queue = createQueue({ leaseMs: 10_000 });
+    const jobId = await queue.enqueue(makeRequest());
+    const claimed = await queue.claimNext('worker-1');
+    await (queue as unknown as { writeJob(job: PromoteJob): Promise<void> }).writeJob({
+      ...claimed!,
+      commitMarker: undefined,
+    });
+
+    advance(60_000);
+    const summary = await queue.recoverOnStartup();
+
+    expect(summary.reclaimed).toBe(0);
+    expect(summary.abandoned).toBe(1);
+    const job = await queue.getStatus(jobId);
+    expect(job?.state).toBe('failed');
+    expect(job?.reason).toMatch(/partial promote ambiguity/i);
+  });
+
   it('27. recoverOnStartup() abandons expired running jobs after promote has started', async () => {
     const queue = createQueue({ leaseMs: 10_000 });
     const jobId = await queue.enqueue(makeRequest());

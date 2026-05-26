@@ -753,6 +753,7 @@ export async function runDaemonInner(
   // still open when we wait for in-flight promotes to drain.
   let promoteWorkerSupervisor: PromoteWorkerSupervisor | null = null;
   let promoteWorkerStartup: Promise<void> | null = null;
+  let promoteWorkerTimer: ReturnType<typeof setTimeout> | null = null;
   let shuttingDown = false;
 
   const networkId = await computeNetworkId();
@@ -881,8 +882,10 @@ export async function runDaemonInner(
     }, 0);
     if (profileTimer.unref) profileTimer.unref();
 
-    const promoteWorkerTimer = setTimeout(() => {
+    promoteWorkerTimer = setTimeout(() => {
+      promoteWorkerTimer = null;
       void (async () => {
+        if (shuttingDown) return;
         // Async-promote queue worker (PR #3) — drains the queue introduced
         // in PR #1 + #2. It is intentionally independent from async-publisher
         // bootstrap: `/promote-async` jobs only need the agent assertion API,
@@ -898,9 +901,13 @@ export async function runDaemonInner(
           try {
             await supervisor.start();
             if (!shuttingDown && promoteWorkerSupervisor === supervisor) {
+              daemonState.promoteWorkerAvailable = true;
+              daemonState.promoteWorkerUnavailableReason = null;
               log("Async promote worker supervisor started");
             }
           } catch (err: any) {
+            daemonState.promoteWorkerAvailable = false;
+            daemonState.promoteWorkerUnavailableReason = err?.message ?? String(err);
             if (!shuttingDown) {
               log(`Async promote worker startup failed: ${err?.message ?? String(err)}`);
             }
@@ -2143,6 +2150,12 @@ export async function runDaemonInner(
     clearInterval(pruneTimer);
     rateLimiter.destroy();
     metricsCollector.stop();
+    if (promoteWorkerTimer) {
+      clearTimeout(promoteWorkerTimer);
+      promoteWorkerTimer = null;
+    }
+    daemonState.promoteWorkerAvailable = false;
+    daemonState.promoteWorkerUnavailableReason = shuttingDown ? 'daemon shutting down' : null;
     await publisherRuntime
       ?.stop()
       .catch((err: any) =>

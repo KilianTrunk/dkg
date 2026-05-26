@@ -43,6 +43,10 @@ export const daemonState: {
   standaloneCache: boolean | null;
   /** CORS allowlist, set by `runDaemonInner`, read in `handleRequest`. */
   moduleCorsAllowed: CorsAllowlist;
+  /** Whether the async promote worker is currently able to drain queued jobs. */
+  promoteWorkerAvailable: boolean;
+  /** Last startup/availability error for the async promote worker, surfaced by enqueue routes. */
+  promoteWorkerUnavailableReason: string | null;
   /** OpenClaw bridge health cache. Mutated from both `openclaw.ts`
    *  (read) and `handle-request.ts` (write after each /send round
    *  trip), so it lives here rather than inside openclaw.ts. */
@@ -58,6 +62,8 @@ export const daemonState: {
   },
   standaloneCache: null,
   moduleCorsAllowed: '*',
+  promoteWorkerAvailable: false,
+  promoteWorkerUnavailableReason: null,
   openClawBridgeHealth: null,
 };
 

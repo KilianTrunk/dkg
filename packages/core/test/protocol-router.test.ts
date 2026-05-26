@@ -99,6 +99,42 @@ describe('ProtocolRouter', () => {
       expect(closeSignal?.aborted).toBe(true);
       expect(dialCalls).toBe(1);
     });
+
+    it('does not fall through from pooled send into one-shot work after node stop aborts', async () => {
+      const stopController = new AbortController();
+      let dialCalls = 0;
+      const node = {
+        get stopSignal() {
+          return stopController.signal;
+        },
+        libp2p: {
+          getConnections: () => [],
+          dialProtocol: async () => {
+            dialCalls += 1;
+            throw new Error('must not dial after stop abort');
+          },
+          handle: () => undefined,
+          unhandle: () => undefined,
+          peerStore: { get: async () => { throw new Error('NotFound'); } },
+        },
+      } as unknown as DKGNode;
+      const router = new ProtocolRouter(node);
+      (router as any).pooledByLogical.set('/dkg/test/1.0.0', {
+        logicalProtocolId: '/dkg/test/1.0.0',
+        wireProtocolId: '/dkg/10.0.2/message',
+        pool: {
+          send: async () => {
+            stopController.abort(new Error('node stopping'));
+            throw new Error('The operation was aborted');
+          },
+        },
+      });
+
+      await expect(
+        router.send(FAKE_PEER_ID, '/dkg/test/1.0.0', new Uint8Array([1]), 5000),
+      ).rejects.toThrow(/aborted/i);
+      expect(dialCalls).toBe(0);
+    });
   });
 
   // Per-attempt resolver re-run was added in the MessageOutbox PR after
@@ -1336,6 +1372,38 @@ describe('ProtocolRouter', () => {
       await new Promise((r) => setTimeout(r, 50));
       expect(lateLoserAborted).toBe(true);
       expect(lateLoserSent).toBe(false);
+    });
+
+    it('aborts hanging multipath reads when the signal fires', async () => {
+      const { raceMultiPath } = await import('../src/protocol-router.js');
+      const controller = new AbortController();
+      let aborts = 0;
+      const makeHangingStream = () => ({
+        writeStatus: 'open',
+        send: () => undefined,
+        close: async () => undefined,
+        abort: () => { aborts += 1; },
+        async *[Symbol.asyncIterator]() {
+          await new Promise(() => undefined);
+        },
+      } as any);
+      const conns = [
+        { status: 'open', newStream: async () => makeHangingStream() },
+        { status: 'open', newStream: async () => makeHangingStream() },
+      ];
+      setTimeout(() => controller.abort(new Error('node stopping')), 10);
+
+      const result = await raceMultiPath({
+        getConnections: () => conns as any[],
+        protocolId: '/test/1.0.0',
+        data: new Uint8Array([1]),
+        parallelPaths: 2,
+        signal: controller.signal,
+        maxReadBytes: 1024,
+      });
+
+      expect(result).toBeNull();
+      expect(aborts).toBeGreaterThanOrEqual(2);
     });
   });
 });

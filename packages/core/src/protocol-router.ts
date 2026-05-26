@@ -469,6 +469,14 @@ export class ProtocolRouter {
         this.memoizePeerWire(peerIdStr, protocolId, 'pooled');
         return response;
       } catch (err) {
+        if (
+          overallSignal.aborted ||
+          overallDeadline.aborted ||
+          stopSignal?.aborted ||
+          isAbortLikeError(err)
+        ) {
+          throw err;
+        }
         if (isProtocolUnsupportedError(err)) {
           // Definitive: peer doesn't advertise the pooled wire
           // variant. Pin to one-shot for future sends; fall through
@@ -1130,7 +1138,7 @@ export async function raceMultiPath(args: {
     }
     stream.send(data);
     await stream.close({ signal });
-    return await readAll(stream, maxReadBytes);
+    return await readAllWithSignal(stream, maxReadBytes, signal);
   });
 
   let winnerResponse: Uint8Array | null = null;
@@ -1266,6 +1274,13 @@ function asAbortError(reason: unknown): Error {
   const err = new Error(typeof reason === 'string' ? reason : 'aborted');
   (err as Error & { name: string }).name = 'AbortError';
   return err;
+}
+
+function isAbortLikeError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const name = err.name.toLowerCase();
+  const message = err.message.toLowerCase();
+  return name === 'aborterror' || message.includes('abort');
 }
 
 async function readAll(

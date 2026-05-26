@@ -990,6 +990,7 @@ export class DKGAgent {
     } else if (config.chainConfig && opKeys?.length) {
       const evmConfigBase = {
         rpcUrl: config.chainConfig.rpcUrl,
+        rpcUrls: config.chainConfig.rpcUrls,
         privateKey: opKeys[0],
         additionalKeys: opKeys.slice(1),
         hubAddress: config.chainConfig.hubAddress,

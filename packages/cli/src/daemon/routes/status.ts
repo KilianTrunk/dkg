@@ -55,7 +55,7 @@ const daemonRequire = createRequire(import.meta.url);
 
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
-import { enrichEvmError, MockChainAdapter } from '@origintrail-official/dkg-chain';
+import { enrichEvmError, MockChainAdapter, resolveRpcUrls } from '@origintrail-official/dkg-chain';
 import { DKGAgent, loadOpWallets } from '@origintrail-official/dkg-agent';
 import { computeNetworkId, createOperationContext, DKGEvent, Logger, PayloadTooLargeError, GET_VIEWS, TrustLevel, validateSubGraphName, validateAssertionName, validateContextGraphId, isSafeIri, assertSafeIri, sparqlIri, contextGraphSharedMemoryUri, contextGraphAssertionUri, contextGraphMetaUri } from '@origintrail-official/dkg-core';
 import { findReservedSubjectPrefix, isSkolemizedUri } from '@origintrail-official/dkg-publisher';
@@ -346,6 +346,60 @@ interface RegistryCacheSnapshot {
 let registryCache: RegistryCacheSnapshot | null = null;
 let registryCacheInflight: Promise<RegistryCacheSnapshot> | null = null;
 
+function routeWithTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  }) as Promise<T>;
+}
+
+async function probeRpcEndpoint(rpcUrl: string): Promise<{
+  rpcUrl: string;
+  ok: boolean;
+  latencyMs: number | null;
+  blockNumber: number | null;
+  error?: string;
+}> {
+  const provider = new ethers.JsonRpcProvider(rpcUrl, undefined, { cacheTimeout: -1 });
+  const start = Date.now();
+  try {
+    const blockNumber = await routeWithTimeout(provider.getBlockNumber(), 3_000, `RPC health probe ${rpcUrl}`);
+    return {
+      rpcUrl,
+      ok: true,
+      latencyMs: Date.now() - start,
+      blockNumber,
+    };
+  } catch (err) {
+    return {
+      rpcUrl,
+      ok: false,
+      latencyMs: null,
+      blockNumber: null,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+function createRouteEvmProvider(rpcUrl: string, rpcUrls?: string[]): ethers.JsonRpcProvider | ethers.FallbackProvider {
+  const providers = resolveRpcUrls(rpcUrl, rpcUrls)
+    .map((url) => new ethers.JsonRpcProvider(url, undefined, { cacheTimeout: -1 }));
+  if (providers.length === 1) return providers[0];
+  return new ethers.FallbackProvider(
+    providers.map((provider, index) => ({
+      provider,
+      priority: index + 1,
+      stallTimeout: 4_000,
+      weight: 1,
+    })),
+    undefined,
+    { quorum: 1 },
+  );
+}
+
 async function getRegistryCacheSnapshot(): Promise<RegistryCacheSnapshot> {
   const now = Date.now();
   if (registryCache && now - registryCache.fetchedAt < REGISTRY_CACHE_TTL_MS) {
@@ -553,6 +607,14 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
       localAgentIntegrations,
       connectedLocalAgentIds: localAgentIntegrations.filter((integration) => integration.enabled).map((integration) => integration.id),
       autoUpdate: resolveAutoUpdateEnabled(config),
+      chain: chainConf
+        ? {
+            chainId: chainConf.chainId ?? null,
+            rpcUrl: chainConf.rpcUrl,
+            rpcUrls: chainConf.rpcUrls ?? [],
+            hubAddress: chainConf.hubAddress,
+          }
+        : null,
       updateAvailable:
         daemonState.lastUpdateCheck.checkedAt > 0 ? !daemonState.lastUpdateCheck.upToDate : null,
       latestCommit: daemonState.lastUpdateCheck.latestCommit || null,
@@ -581,6 +643,7 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
         ? {
             chainId: chainConf.chainId ?? null,
             rpcUrl: chainConf.rpcUrl,
+            rpcUrls: chainConf.rpcUrls ?? [],
             hubAddress: chainConf.hubAddress,
           }
         : null,
@@ -748,11 +811,12 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
         balances: [],
         chainId,
         rpcUrl: rpcUrl ?? null,
+        rpcUrls: chain?.rpcUrls ?? [],
         error: !rpcUrl || !hubAddress ? "Chain not configured" : "No wallets",
       });
     }
     try {
-      const provider = new ethers.JsonRpcProvider(rpcUrl);
+      const provider = createRouteEvmProvider(rpcUrl, chain?.rpcUrls);
       const tokenAddr = chain?.tokenAddress
         ?? (await new ethers.Contract(
           hubAddress,
@@ -793,6 +857,7 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
         balances,
         chainId,
         rpcUrl,
+        rpcUrls: chain?.rpcUrls ?? [],
         symbol: tokenSymbol,
       });
     } catch (err: any) {
@@ -801,6 +866,7 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
         balances: [],
         chainId,
         rpcUrl,
+        rpcUrls: chain?.rpcUrls ?? [],
         error: err.message,
       });
     }
@@ -819,31 +885,25 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
       return jsonResponse(res, 200, {
         ok: false,
         rpcUrl: null,
+        rpcUrls: [],
         latencyMs: null,
         blockNumber: null,
+        rpcs: [],
         error: "Chain not configured",
       });
     }
-    try {
-      const provider = new ethers.JsonRpcProvider(rpcUrl);
-      const start = Date.now();
-      const blockNumber = await provider.getBlockNumber();
-      const latencyMs = Date.now() - start;
-      return jsonResponse(res, 200, {
-        ok: true,
-        rpcUrl,
-        latencyMs,
-        blockNumber,
-      });
-    } catch (err: any) {
-      return jsonResponse(res, 200, {
-        ok: false,
-        rpcUrl,
-        latencyMs: null,
-        blockNumber: null,
-        error: err.message,
-      });
-    }
+    const rpcUrls = resolveRpcUrls(rpcUrl, chain?.rpcUrls);
+    const rpcs = await Promise.all(rpcUrls.map((url) => probeRpcEndpoint(url)));
+    const primary = rpcs[0];
+    return jsonResponse(res, 200, {
+      ok: primary?.ok ?? false,
+      rpcUrl,
+      rpcUrls: rpcUrls.slice(1),
+      latencyMs: primary?.latencyMs ?? null,
+      blockNumber: primary?.blockNumber ?? null,
+      error: primary?.ok ? undefined : (primary?.error ?? "RPC health probe failed"),
+      rpcs,
+    });
   }
 
   // GET /api/identity — current on-chain identity status

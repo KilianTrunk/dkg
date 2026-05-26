@@ -1004,6 +1004,7 @@ export async function runDaemonInner(
     // network supplies one of them; the agent expects rpcUrl + hubAddress.
     chainConfig: chainBase?.rpcUrl && chainBase?.hubAddress ? {
       rpcUrl: chainBase.rpcUrl,
+      rpcUrls: chainBase.rpcUrls,
       hubAddress: chainBase.hubAddress,
       ...(opWallets.adminWallet
         ? { adminPrivateKey: opWallets.adminWallet.privateKey }
@@ -1293,6 +1294,7 @@ export async function runDaemonInner(
   const publisherChainBase = chainBase?.rpcUrl && chainBase?.hubAddress
     ? {
         rpcUrl: chainBase.rpcUrl,
+        rpcUrls: chainBase.rpcUrls,
         hubAddress: chainBase.hubAddress,
         chainId: chainBase.chainId,
       }

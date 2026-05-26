@@ -314,6 +314,7 @@ describe('resolveChainConfig (field-level merge)', () => {
   const fullNetworkChain = {
     type: 'evm' as const,
     rpcUrl: 'https://network.example/rpc',
+    rpcUrls: ['https://network-backup-1.example/rpc', 'https://network-backup-2.example/rpc'],
     hubAddress: '0xNETWORKHUB000000000000000000000000000000',
     chainId: 'base:84532',
   };
@@ -329,6 +330,7 @@ describe('resolveChainConfig (field-level merge)', () => {
     expect(merged).toEqual({
       type: 'evm',
       rpcUrl: fullNetworkChain.rpcUrl,
+      rpcUrls: fullNetworkChain.rpcUrls,
       hubAddress: fullNetworkChain.hubAddress,
       chainId: fullNetworkChain.chainId,
     });
@@ -341,6 +343,7 @@ describe('resolveChainConfig (field-level merge)', () => {
       { chain: fullNetworkChain },
     );
     expect(merged?.rpcUrl).toBe('https://my-private-rpc.example/abc');
+    expect(merged?.rpcUrls).toEqual(fullNetworkChain.rpcUrls);
     expect(merged?.hubAddress).toBe(fullNetworkChain.hubAddress);
     expect(merged?.chainId).toBe(fullNetworkChain.chainId);
     expect(merged?.type).toBe('evm');
@@ -353,7 +356,56 @@ describe('resolveChainConfig (field-level merge)', () => {
     );
     expect(merged?.hubAddress).toBe('0xOPERATORHUB0000000000000000000000000000');
     expect(merged?.rpcUrl).toBe(fullNetworkChain.rpcUrl);
+    expect(merged?.rpcUrls).toEqual(fullNetworkChain.rpcUrls);
     expect(merged?.chainId).toBe(fullNetworkChain.chainId);
+  });
+
+  it('dedupes primary + backups while preserving operator priority', () => {
+    const merged = resolveChainConfig(
+      {
+        chain: {
+          rpcUrl: 'https://operator.example/rpc',
+          rpcUrls: [
+            'https://operator.example/rpc',
+            ' https://backup-a.example/rpc ',
+            'https://backup-b.example/rpc',
+            'https://backup-a.example/rpc',
+          ],
+        },
+      },
+      { chain: fullNetworkChain },
+    );
+    expect(merged?.rpcUrl).toBe('https://operator.example/rpc');
+    expect(merged?.rpcUrls).toEqual([
+      'https://backup-a.example/rpc',
+      'https://backup-b.example/rpc',
+    ]);
+  });
+
+  it('uses operator backup list instead of network backups when set', () => {
+    const merged = resolveChainConfig(
+      { chain: { rpcUrls: ['https://operator-backup.example/rpc'] } },
+      { chain: fullNetworkChain },
+    );
+    expect(merged?.rpcUrl).toBe(fullNetworkChain.rpcUrl);
+    expect(merged?.rpcUrls).toEqual(['https://operator-backup.example/rpc']);
+  });
+
+  it('strips rpcUrls under mock mode along with rpcUrl', () => {
+    const merged = resolveChainConfig(
+      {
+        chain: {
+          type: 'mock',
+          rpcUrl: 'https://stale-rpc.example',
+          rpcUrls: ['https://stale-backup.example'],
+          hubAddress: '0xDEADBEEF00000000000000000000000000000000',
+        },
+      },
+      { chain: fullNetworkChain },
+    );
+    expect(merged?.type).toBe('mock');
+    expect(merged?.rpcUrl).toBeUndefined();
+    expect(merged?.rpcUrls).toBeUndefined();
   });
 
   it('merges tokenAddress with operator override precedence', () => {
@@ -377,6 +429,7 @@ describe('resolveChainConfig (field-level merge)', () => {
       null,
     );
     expect(merged?.rpcUrl).toBe('https://standalone.example/rpc');
+    expect(merged?.rpcUrls).toBeUndefined();
     expect(merged?.hubAddress).toBeUndefined();
     expect(merged?.chainId).toBeUndefined();
     // Callers (lifecycle, publisher-runner) MUST guard for the missing
@@ -397,6 +450,7 @@ describe('resolveChainConfig (field-level merge)', () => {
     expect(merged?.type).toBe('mock');
     expect(merged?.mockIdentityId).toBe('42');
     expect(merged?.rpcUrl).toBeUndefined();
+    expect(merged?.rpcUrls).toBeUndefined();
     expect(merged?.hubAddress).toBeUndefined();
     expect(merged?.chainId).toBeUndefined();
   });
@@ -449,6 +503,7 @@ describe('resolveChainConfig (field-level merge)', () => {
       mockIdentityId: '9',
     });
     expect(merged?.rpcUrl).toBeUndefined();
+    expect(merged?.rpcUrls).toBeUndefined();
     expect(merged?.hubAddress).toBeUndefined();
   });
 

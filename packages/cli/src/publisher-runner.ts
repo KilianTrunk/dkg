@@ -34,6 +34,7 @@ export async function startPublisherRuntimeIfEnabled(args: {
   keypair: Ed25519Keypair;
   chainBase?: {
     rpcUrl: string;
+    rpcUrls?: string[];
     hubAddress: string;
     chainId?: string;
   };
@@ -76,6 +77,7 @@ interface PublisherRuntimeBaseArgs {
   store: TripleStore;
   chainBase?: {
     rpcUrl: string;
+    rpcUrls?: string[];
     hubAddress: string;
     chainId?: string;
   };
@@ -111,7 +113,7 @@ export async function createPublisherRuntime(args: {
   // finality but still functions).
   const merged = resolveChainConfig(args.config, network);
   const chainBase = merged?.rpcUrl && merged?.hubAddress
-    ? { rpcUrl: merged.rpcUrl, hubAddress: merged.hubAddress, chainId: merged.chainId }
+    ? { rpcUrl: merged.rpcUrl, rpcUrls: merged.rpcUrls, hubAddress: merged.hubAddress, chainId: merged.chainId }
     : undefined;
   return createPublisherRuntimeFromBase({
     dataDir: args.dataDir,
@@ -162,6 +164,7 @@ export async function createPublisherRuntimeFromAgent(args: {
   keypair: Ed25519Keypair;
   chainBase?: {
     rpcUrl: string;
+    rpcUrls?: string[];
     hubAddress: string;
     chainId?: string;
   };
@@ -201,6 +204,7 @@ async function createPublisherRuntimeFromBase(args: PublisherRuntimeBaseArgs): P
     const chain = args.chainBase
       ? new EVMChainAdapter({
           rpcUrl: args.chainBase.rpcUrl,
+          rpcUrls: args.chainBase.rpcUrls,
           privateKey: wallet.privateKey,
           hubAddress: args.chainBase.hubAddress,
           chainId: args.chainBase.chainId,

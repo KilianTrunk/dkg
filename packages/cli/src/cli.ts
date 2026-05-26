@@ -10,6 +10,7 @@ import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import { readFile, writeFile, unlink, appendFile } from 'node:fs/promises';
 import { ethers } from 'ethers';
+import { resolveRpcUrls } from '@origintrail-official/dkg-chain';
 import {
   dkgAuthTokenPath,
   FAUCET_WALLETS_PER_REQUEST,
@@ -78,6 +79,11 @@ import { registerIntegrationCommands } from './integrations/commands.js';
 type ActionOpts = Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
 const VERIFY_COLLECTION_TIMEOUT_MIN_MS = 1_000;
 const VERIFY_COLLECTION_TIMEOUT_MAX_MS = 30 * 60 * 1000;
+const CLI_RPC_READ_STALL_TIMEOUT_MS = 4_000;
+const CLI_RPC_BROADCAST_TIMEOUT_MS = 10_000;
+const CLI_RPC_RECEIPT_ATTEMPT_TIMEOUT_MS = 5_000;
+const CLI_RPC_RECEIPT_POLL_INTERVAL_MS = 2_000;
+const CLI_RPC_RECEIPT_TIMEOUT_MS = 180_000;
 
 async function appendSupervisorLog(message: string): Promise<void> {
   await ensureDkgDir();
@@ -87,6 +93,144 @@ async function appendSupervisorLog(message: string): Promise<void> {
 function supervisorWarn(message: string): void {
   console.warn(message);
   void appendSupervisorLog(message).catch(() => {});
+}
+
+function cliSleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function cliWithTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      const err = new Error(`${label} timed out after ${ms}ms`);
+      (err as any).code = 'TIMEOUT';
+      reject(err);
+    }, ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  }) as Promise<T>;
+}
+
+function cliErrorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  try { return JSON.stringify(err); } catch { return String(err); }
+}
+
+function isCliKnownTransactionError(err: unknown): boolean {
+  const msg = cliErrorMessage(err).toLowerCase();
+  return msg.includes('already known')
+    || msg.includes('known transaction')
+    || msg.includes('already imported')
+    || msg.includes('transaction already in mempool')
+    || msg.includes('already exists')
+    || msg.includes('duplicate transaction');
+}
+
+function isCliRetryableRpcError(err: unknown): boolean {
+  const code = String((err as any)?.code ?? (err as any)?.error?.code ?? '').toUpperCase();
+  const status =
+    (err as any)?.status ??
+    (err as any)?.statusCode ??
+    (err as any)?.response?.status ??
+    (err as any)?.error?.status;
+  const msg = cliErrorMessage(err).toLowerCase();
+  if (code === 'CALL_EXCEPTION' || code === 'INSUFFICIENT_FUNDS' || code === 'NONCE_EXPIRED'
+    || code === 'REPLACEMENT_UNDERPRICED' || code === 'ACTION_REJECTED' || code === 'INVALID_ARGUMENT') {
+    return false;
+  }
+  if (msg.includes('execution reverted') || msg.includes('call exception')
+    || msg.includes('insufficient funds') || msg.includes('invalid argument')
+    || msg.includes('nonce too low') || msg.includes('replacement transaction underpriced')) {
+    return false;
+  }
+  if (status === 429 || (typeof status === 'number' && status >= 500)) return true;
+  if (code === 'TIMEOUT' || code === 'SERVER_ERROR' || code === 'NETWORK_ERROR'
+    || code === 'ECONNRESET' || code === 'ECONNREFUSED' || code === 'ETIMEDOUT'
+    || code === 'ENOTFOUND' || code === 'EAI_AGAIN' || code === 'UNKNOWN_ERROR') {
+    return true;
+  }
+  return /timeout|timed out|network|socket|reset|econnreset|econnrefused|etimedout|enotfound|rate limit|too many requests|429|503|502|500|gateway|temporarily unavailable|fetch failed|connection/i
+    .test(msg);
+}
+
+function createCliEvmProviders(rpcUrl: string, rpcUrls?: string[]): {
+  urls: string[];
+  providers: ethers.JsonRpcProvider[];
+  readProvider: ethers.JsonRpcProvider | ethers.FallbackProvider;
+} {
+  const urls = resolveRpcUrls(rpcUrl, rpcUrls);
+  const providers = urls.map((url) => new ethers.JsonRpcProvider(url, undefined, { cacheTimeout: -1 }));
+  const readProvider = providers.length === 1
+    ? providers[0]
+    : new ethers.FallbackProvider(
+      providers.map((provider, index) => ({
+        provider,
+        priority: index + 1,
+        stallTimeout: CLI_RPC_READ_STALL_TIMEOUT_MS,
+        weight: 1,
+      })),
+      undefined,
+      { quorum: 1 },
+    );
+  return { urls, providers, readProvider };
+}
+
+async function getCliReceiptWithFailover(
+  providers: ethers.JsonRpcProvider[],
+  txHash: string,
+): Promise<ethers.TransactionReceipt | null> {
+  for (let i = 0; i < providers.length; i += 1) {
+    try {
+      const receipt = await cliWithTimeout(
+        providers[i].getTransactionReceipt(txHash),
+        CLI_RPC_RECEIPT_ATTEMPT_TIMEOUT_MS,
+        `receipt lookup via RPC #${i + 1}`,
+      );
+      if (receipt) return receipt;
+    } catch (err) {
+      if (!isCliRetryableRpcError(err)) throw err;
+    }
+  }
+  return null;
+}
+
+async function sendCliRawTransactionWithFailover(
+  providers: ethers.JsonRpcProvider[],
+  signedTx: string,
+  txHash: string,
+): Promise<ethers.TransactionReceipt> {
+  let lastError: unknown;
+  for (let i = 0; i < providers.length; i += 1) {
+    try {
+      await cliWithTimeout(
+        providers[i].broadcastTransaction(signedTx),
+        CLI_RPC_BROADCAST_TIMEOUT_MS,
+        `broadcast via RPC #${i + 1}`,
+      );
+      lastError = undefined;
+      break;
+    } catch (err) {
+      if (isCliKnownTransactionError(err)) {
+        lastError = undefined;
+        break;
+      }
+      if (!isCliRetryableRpcError(err)) throw err;
+      lastError = err;
+    }
+  }
+  if (lastError) {
+    throw new Error(`Broadcast failed on all configured RPC endpoints: ${cliErrorMessage(lastError)}`, { cause: lastError });
+  }
+
+  const deadline = Date.now() + CLI_RPC_RECEIPT_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    const receipt = await getCliReceiptWithFailover(providers, txHash);
+    if (receipt) return receipt;
+    await cliSleep(CLI_RPC_RECEIPT_POLL_INTERVAL_MS);
+  }
+  throw new Error(`Transaction ${txHash} was broadcast but no receipt was found within ${CLI_RPC_RECEIPT_TIMEOUT_MS}ms`);
 }
 
 const STARTUP_BANNER = `
@@ -501,17 +645,21 @@ program
     // override even after `dkg init` re-prompts.
     const chainDefaults = resolveChainConfig(existing, network);
     const defaultRpcUrl = chainDefaults?.rpcUrl;
+    const defaultRpcUrls = chainDefaults?.rpcUrls?.join(', ') ?? '';
     const defaultHubAddress = chainDefaults?.hubAddress;
     const defaultChainId = chainDefaults?.chainId;
 
     console.log('\nBlockchain Configuration:');
     const rpcUrl = await ask('RPC URL', defaultRpcUrl);
+    const rpcUrlsInput = await ask('Backup RPC URLs (comma-separated, optional)', defaultRpcUrls);
+    const rpcUrls = rpcUrlsInput.split(',').map((s) => s.trim()).filter(Boolean);
     const hubAddress = await ask('Hub contract address', defaultHubAddress);
     const chainIdStr = await ask('Chain ID', defaultChainId);
 
     const chainSection = rpcUrl && hubAddress ? {
       type: 'evm' as const,
       rpcUrl,
+      ...(rpcUrls.length ? { rpcUrls } : {}),
       hubAddress,
       chainId: chainIdStr || undefined,
     } : undefined;
@@ -576,7 +724,7 @@ program
       // who only set rpcUrl still sees the inherited hub from the network.
       const effective = resolveChainConfig(config, network);
       console.log(`  chain:      ${effective?.rpcUrl && effective?.hubAddress
-        ? `${effective.rpcUrl} (hub: ${effective.hubAddress.slice(0, 10)}...)`
+        ? `${effective.rpcUrl}${effective.rpcUrls?.length ? ` (+${effective.rpcUrls.length} backups)` : ''} (hub: ${effective.hubAddress.slice(0, 10)}...)`
         : '(not configured)'}`);
     }
     if (network) {
@@ -3683,13 +3831,13 @@ program
       const tokenAddress = chainResolved?.tokenAddress;
       const chainId = chainResolved?.chainId ?? '(unknown)';
 
-      let provider: ethers.JsonRpcProvider | null = null;
+      let provider: ethers.JsonRpcProvider | ethers.FallbackProvider | null = null;
       let token: ethers.Contract | null = null;
       let tokenSymbol = 'TRAC';
 
       if (rpcUrl) {
         try {
-          provider = new ethers.JsonRpcProvider(rpcUrl);
+          provider = createCliEvmProviders(rpcUrl, chainResolved?.rpcUrls).readProvider;
           if (tokenAddress && tokenAddress !== ethers.ZeroAddress) {
             token = new ethers.Contract(tokenAddress, ['function balanceOf(address) view returns (uint256)', 'function symbol() view returns (string)'], provider);
             tokenSymbol = await token.symbol().catch(() => 'TRAC');
@@ -3740,6 +3888,7 @@ program
 
       console.log(`\n  Chain: ${chainId}`);
       if (rpcUrl) console.log(`  RPC:   ${rpcUrl}`);
+      if (chainResolved?.rpcUrls?.length) console.log(`  RPC backups: ${chainResolved.rpcUrls.join(', ')}`);
       console.log(`  File:  ~/.dkg/wallets.json`);
       console.log('\nFund these addresses with ETH (gas) and TRAC (staking/publishing).');
       if (opWallets.adminWallet) {
@@ -3785,17 +3934,17 @@ program
         process.exit(1);
       }
 
-      const provider = new ethers.JsonRpcProvider(rpcUrl);
-      const wallet = new ethers.Wallet(opWallets.wallets[0].privateKey, provider);
+      const { providers, readProvider } = createCliEvmProviders(rpcUrl, chainResolved?.rpcUrls);
+      const wallet = new ethers.Wallet(opWallets.wallets[0].privateKey, readProvider);
 
       const hub = new ethers.Contract(hubAddress, [
         'function getContractAddress(string) view returns (address)',
-      ], provider);
+      ], readProvider);
 
       const identityStorageAddr = await hub.getContractAddress('IdentityStorage');
       const identityStorage = new ethers.Contract(identityStorageAddr, [
         'function getIdentityId(address) view returns (uint72)',
-      ], provider);
+      ], readProvider);
 
       let identityId: bigint;
       if (opts.identity) {
@@ -3814,7 +3963,7 @@ program
       const profileStorageAddr = await hub.getContractAddress('ProfileStorage');
       const profileStorage = new ethers.Contract(profileStorageAddr, [
         'function getAsk(uint72) view returns (uint96)',
-      ], provider);
+      ], readProvider);
       const currentAsk = await profileStorage.getAsk(identityId);
 
       console.log(`  Identity:    ${identityId}`);
@@ -3832,10 +3981,13 @@ program
       ], wallet);
 
       console.log(`  Setting ask to ${amount} TRAC...`);
-      const tx = await profile.updateAsk(identityId, askWei);
-      console.log(`  TX: ${tx.hash}`);
-      const receipt = await tx.wait();
-      console.log(`  Confirmed in block ${receipt!.blockNumber}`);
+      const populated = await profile.updateAsk.populateTransaction(identityId, askWei);
+      const filled = await wallet.populateTransaction(populated);
+      const signedTx = await wallet.signTransaction(filled);
+      const txHash = ethers.Transaction.from(signedTx).hash ?? '0x';
+      console.log(`  TX: ${txHash}`);
+      const receipt = await sendCliRawTransactionWithFailover(providers, signedTx, txHash);
+      console.log(`  Confirmed in block ${receipt.blockNumber}`);
       console.log(`  New ask: ${amount} TRAC`);
     } catch (err) {
       if (hasErrorCode(err, 'CALL_EXCEPTION')) {

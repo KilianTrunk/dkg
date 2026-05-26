@@ -32,6 +32,7 @@ import type {
   CreateChallengeResult,
   OperationalWalletRegistrationResult,
   V10PublishingConvictionAccountInfo,
+  VerifyACKIdentityResult,
 } from './chain-adapter.js';
 import {
   NoEligibleContextGraphError,
@@ -2539,50 +2540,56 @@ export class EVMChainAdapter implements ChainAdapter {
     return Boolean(await storage.nodeExists(identityId));
   }
 
+  /**
+   * Off-chain pre-flight for the V10 ACK signer gate. Mirrors the on-chain
+   * check in `KnowledgeAssetsV10._verifyACKSignature` (post-RFC-001): the
+   * recovered signer must be a registered OPERATIONAL_KEY for the claimed
+   * identity AND that identity must be in the active sharding table.
+   *
+   * Returns a structured reason on rejection so the ACKCollector log can
+   * distinguish operator-actionable failures (key registration, sub-
+   * `minimumStake` stake) from infrastructure failures (RPC outage). Pre-
+   * RFC-001 versions of this method gated on `getNodeStakeV10 > 0`, which
+   * let sub-`minimumStake` operators clear off-chain quorum and then revert
+   * on-chain with `"ACK signer not in sharding table"`. ST membership is
+   * updated atomically by `StakingV10` whenever a node's V10 stake crosses
+   * `minimumStake` up or down.
+   */
+  async verifyACKIdentityDetailed(
+    recoveredAddress: string,
+    claimedIdentityId: bigint,
+  ): Promise<VerifyACKIdentityResult> {
+    try {
+      await this.init();
+      const identityStorage = await this.resolveContract('IdentityStorage');
+      if (!identityStorage) return { valid: false, reason: 'rpc-error' };
+
+      const keyHash = ethers.keccak256(ethers.solidityPacked(['address'], [recoveredAddress]));
+      const hasPurpose: boolean = await identityStorage.keyHasPurpose(
+        claimedIdentityId,
+        keyHash,
+        OPERATIONAL_KEY_PURPOSE,
+      );
+      if (!hasPurpose) return { valid: false, reason: 'key-not-registered' };
+
+      const shardingTableStorage = await this.resolveContract('ShardingTableStorage');
+      if (!shardingTableStorage) return { valid: false, reason: 'rpc-error' };
+      const inST: boolean = Boolean(await shardingTableStorage.nodeExists(claimedIdentityId));
+      if (!inST) return { valid: false, reason: 'not-in-sharding-table' };
+      return { valid: true };
+    } catch {
+      // Any chain-side throw (filter expired, RPC rate-limit, contract
+      // resolution failure mid-call) is reported as `rpc-error` so the
+      // ACKCollector can log it distinctly from a definitive negative.
+      // Mirrors the existing wrapper in `dkg-agent.ts:createV10ACKProvider`
+      // which used to swallow these exceptions as `false`, conflating
+      // transient infra failures with permanent rejections.
+      return { valid: false, reason: 'rpc-error' };
+    }
+  }
+
   async verifyACKIdentity(recoveredAddress: string, claimedIdentityId: bigint): Promise<boolean> {
-    await this.init();
-    const identityStorage = await this.resolveContract('IdentityStorage');
-    if (!identityStorage) return false;
-
-    // Match on-chain verification: keyHasPurpose(identityId, keccak256(signer), OPERATIONAL_KEY)
-    const keyHash = ethers.keccak256(ethers.solidityPacked(['address'], [recoveredAddress]));
-    const hasPurpose: boolean = await identityStorage.keyHasPurpose(
-      claimedIdentityId,
-      keyHash,
-      OPERATIONAL_KEY_PURPOSE,
-    );
-    if (!hasPurpose) return false;
-
-    // Verify the identity is a staked core node (spec §9.0: "Core nodes MUST be staked").
-    // v4.0.0 — read V10 canonical stake (`ConvictionStakingStorage.getNodeStakeV10`)
-    // instead of the V8 `StakingStorage.getNodeStake` archive: under mandatory
-    // migration the V8 `nodeStake` field is unmaintained for V10 nodes and
-    // would zero-gate every legitimate V10 ACK signer (this exactly mirrors
-    // the on-chain `KnowledgeAssetsV10` ACK-signer gate, also rewired in
-    // v4.0.0). Falls back to V8 if CSS is not registered (older deploys).
-    let cs: Contract | null = null;
-    try {
-      cs = await this.resolveContract('ConvictionStakingStorage');
-    } catch {
-      cs = null;
-    }
-    if (cs) {
-      const stake: bigint = await cs.getNodeStakeV10(claimedIdentityId);
-      if (stake === 0n) return false;
-      return true;
-    }
-
-    let ss: Contract | null = null;
-    try {
-      ss = await this.resolveContract('StakingStorage');
-    } catch {
-      ss = null;
-    }
-    if (!ss) return false;
-    const v8Stake: bigint = await ss.getNodeStake(claimedIdentityId);
-    if (v8Stake === 0n) return false;
-
-    return true;
+    return (await this.verifyACKIdentityDetailed(recoveredAddress, claimedIdentityId)).valid;
   }
 
   async verifySyncIdentity(recoveredAddress: string, claimedIdentityId: bigint): Promise<boolean> {

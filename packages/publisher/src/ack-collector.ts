@@ -13,11 +13,42 @@ import {
 import { ethers } from 'ethers';
 import { QuorumUnmetError, type PeerOutcome } from './ack-errors.js';
 
+/**
+ * Why an ACK signer pre-flight rejected a recovered signer. Mirrors
+ * `VerifyACKIdentityReason` from `@origintrail-official/dkg-chain`.
+ * Kept as a string union here to avoid a hard cross-package type dep
+ * — adapters wire concrete reasons through; legacy `boolean` callers
+ * still work and surface `undefined`.
+ */
+export type ACKVerifyReason = 'key-not-registered' | 'not-in-sharding-table' | 'rpc-error';
+
+export interface ACKVerifyResult {
+  valid: boolean;
+  reason?: ACKVerifyReason;
+}
+
 export interface ACKCollectorDeps {
   gossipPublish: (topic: string, data: Uint8Array) => Promise<void>;
   sendP2P: (peerId: string, protocol: string, data: Uint8Array) => Promise<Uint8Array>;
   getConnectedCorePeers: () => string[];
+  /**
+   * Boolean ACK signer pre-flight. Backward-compatible legacy entry
+   * point — when only this is provided the rejection log surfaces a
+   * generic "ACK rejected" line without a reason. New code should
+   * prefer `verifyIdentityDetailed`.
+   */
   verifyIdentity?: (recoveredAddress: string, claimedIdentityId: bigint) => Promise<boolean>;
+  /**
+   * Structured ACK signer pre-flight. When provided, the collector
+   * uses this in preference to `verifyIdentity` and surfaces the
+   * specific failing gate (`key-not-registered`, `not-in-sharding-
+   * table`, `rpc-error`) in the rejection log so operators can act on
+   * the actual root cause instead of guessing.
+   */
+  verifyIdentityDetailed?: (
+    recoveredAddress: string,
+    claimedIdentityId: bigint,
+  ) => Promise<ACKVerifyResult>;
   log?: (msg: string) => void;
 }
 
@@ -330,7 +361,24 @@ export class ACKCollector {
             ? BigInt(ack.nodeIdentityId)
             : BigInt(ack.nodeIdentityId.low) | (BigInt(ack.nodeIdentityId.high) << 32n);
 
-          if (this.deps.verifyIdentity) {
+          // Prefer the detailed verifier — surfaces the specific failing
+          // gate in the rejection log so operators can tell apart "this
+          // signer is genuinely not registered" (operator-side) from
+          // "the node is registered but has not crossed minimumStake"
+          // (operator-side, different action) from "we couldn't reach
+          // the chain to check" (infra-side, retryable). Pre-PR every
+          // failure surfaced as the same "not registered" string.
+          if (this.deps.verifyIdentityDetailed) {
+            const verdict = await this.deps.verifyIdentityDetailed(recoveredAddress, identityId);
+            if (!verdict.valid) {
+              const reason = verdict.reason ?? 'unknown';
+              log(
+                `[ACKCollector] ACK from ${peerId.slice(-8)} rejected: ${reason}` +
+                ` (signer=${recoveredAddress.slice(0, 10)}..., identity=${identityId})`,
+              );
+              return null;
+            }
+          } else if (this.deps.verifyIdentity) {
             const valid = await this.deps.verifyIdentity(recoveredAddress, identityId);
             if (!valid) {
               log(`[ACKCollector] Signer ${recoveredAddress.slice(0, 10)}... not registered for identity ${identityId} — rejecting ACK from ${peerId.slice(-8)}`);

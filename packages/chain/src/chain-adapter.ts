@@ -113,6 +113,26 @@ export interface ChainEvent {
   data: Record<string, unknown>;
 }
 
+/**
+ * Why an off-chain ACK signer pre-flight rejected a recovered signer.
+ * Mirrors the two on-chain gates in
+ * `KnowledgeAssetsV10._verifyACKSignature` plus an explicit
+ * `'rpc-error'` for transient chain-read failures so the publisher
+ * can distinguish "definitive rejection" from "couldn't verify".
+ * Stable wire surface — the ACKCollector rejection log includes
+ * this string verbatim.
+ */
+export type VerifyACKIdentityReason =
+  | 'key-not-registered'      // signer is not an OPERATIONAL_KEY for the claimed identity
+  | 'not-in-sharding-table'   // identity exists & key registered, but identity is not in active sharding table
+  | 'rpc-error';              // chain read threw — distinct from a definitive negative
+
+export interface VerifyACKIdentityResult {
+  valid: boolean;
+  /** Present iff `valid === false`. */
+  reason?: VerifyACKIdentityReason;
+}
+
 export interface EventFilter {
   eventTypes: string[];
   fromBlock?: number;
@@ -795,6 +815,22 @@ export interface ChainAdapter {
 
   /** Verify that a recovered signer address is a registered operational key for the given identity. */
   verifyACKIdentity?(recoveredAddress: string, claimedIdentityId: bigint): Promise<boolean>;
+
+  /**
+   * Same gate as `verifyACKIdentity`, but returns the FAILING gate so callers
+   * can produce diagnostics that an operator can act on (key registration vs
+   * stake/sharding-table eligibility vs RPC outage). The publisher's ACK
+   * collector uses this to log a precise rejection reason instead of the
+   * three-failure-modes-look-the-same legacy "not registered" string.
+   *
+   * `valid: true` MUST imply that `verifyACKIdentity` would also return `true`
+   * for the same inputs at the same chain height. Adapters that don't or
+   * can't distinguish the gates may omit this method.
+   */
+  verifyACKIdentityDetailed?(
+    recoveredAddress: string,
+    claimedIdentityId: bigint,
+  ): Promise<VerifyACKIdentityResult>;
 
   /** Idempotently register local operational wallets for an existing identity. */
   ensureOperationalWalletsRegistered?(options?: {

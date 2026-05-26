@@ -2457,6 +2457,43 @@ export class DKGPublisher implements Publisher {
           onPhase?.('chain:writeahead', 'start');
         };
         try {
+          // OT-RFC-38 LU-11 / OT-RFC-39 — handshake hardening.
+          // When the publisher ran the chunked emit path, the chain
+          // submit MUST carry the same `(ciphertextChunksRoot,
+          // ciphertextChunkCount)` pair that was signed into the V2
+          // ACK digest. Anything else (e.g. silently submitting
+          // `bytes32(0)` / `0` on a curated KC) would leave the
+          // on-chain commitment empty — RFC-39 random sampling would
+          // then skip the KC because `_isCGEligible` filters zero-
+          // commitment curated CGs out of the picker. Fail loud
+          // here so the bug surfaces at the publisher instead of as
+          // missing reward proofs days later.
+          if (useChunkedInline) {
+            if (
+              !chunkedCommitment
+              || chunkedCommitment.ciphertextChunksRoot.length !== 32
+              || chunkedCommitment.ciphertextChunkCount <= 0
+            ) {
+              throw new Error(
+                `LU-11: dkg-publisher refused to submit chunked publish with empty commitment ` +
+                `(root=${chunkedCommitment?.ciphertextChunksRoot.length ?? 0} bytes, ` +
+                `count=${chunkedCommitment?.ciphertextChunkCount ?? 0}). ` +
+                `Either the chunked emitter returned no chunks (publisher bug — see ` +
+                `_resolveEncryptInlineChunked) or the commitment was lost between encrypt ` +
+                `and submit (threading bug — chunkedCommitment is intentionally optional ` +
+                `on the chain adapter so non-chunked callers stay unchanged).`,
+              );
+            }
+            const zeroRoot = chunkedCommitment.ciphertextChunksRoot
+              .every((b) => b === 0);
+            if (zeroRoot) {
+              throw new Error(
+                `LU-11: dkg-publisher refused to submit chunked publish with zero ciphertextChunksRoot — ` +
+                `treat as a programmer error in the chunked emitter; the root MUST be the keccak256 ` +
+                `Merkle root over per-chunk leaves, never bytes32(0).`,
+              );
+            }
+          }
           onChainResult = await this.chain.createKnowledgeAssetsV10!({
             publishOperationId,
             contextGraphId: v10CgId,
@@ -2464,6 +2501,8 @@ export class DKGPublisher implements Publisher {
             merkleRoot: kcMerkleRoot,
             knowledgeAssetsAmount: kaCount,
             byteSize: effectiveByteSize,
+            ciphertextChunksRoot: chunkedCommitment?.ciphertextChunksRoot,
+            ciphertextChunkCount: chunkedCommitment?.ciphertextChunkCount,
             // PCA strict-equality: must match the value committed to the
             // ACK digest produced by the ACK collector
             // (`packages/publisher/src/ack-collector.ts:159` invokes

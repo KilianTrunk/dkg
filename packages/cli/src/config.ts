@@ -505,10 +505,12 @@ export interface DkgConfig {
   routePlugins?: string[];
   /**
    * libp2p networking tunables for small / sparse networks. Forwarded
-   * to `DKGNodeConfig` and applied at `createLibp2p` / `kadDHT` /
-   * `PeerResolver` construction. All optional; omitting any field
-   * preserves the upstream default. See packages/core/src/types.ts
-   * for per-field rationale + default values.
+   * through `DKGAgentConfig`; peer-store / DHT values are applied at
+   * `createLibp2p` / `kadDHT` construction and `peerResolveTimeoutMs`
+   * is applied at `PeerResolver` construction. All optional; omitting
+   * any field preserves the upstream default. See packages/core/src/types.ts
+   * and packages/core/src/network/peer-resolver.ts for per-field
+   * rationale + default values.
    *
    * Targeted at testnet / small-mesh operators where DHT lookups are
    * flaky (sparse routing tables) and direct addresses age out before

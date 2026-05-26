@@ -107,11 +107,11 @@ export const MAX_RELAY_RESERVATION_COUNT = 16;
 /**
  * Permissive validator for the small / sparse-network tunables
  * (`peerStoreMaxAddressAgeMs`, `peerStoreMaxPeerAgeMs`,
- * `dhtQuerySelfIntervalMs`, `peerResolveTimeoutMs`). Returns the
+ * `dhtQuerySelfIntervalMs`). Returns the
  * value when it is a positive finite integer; returns `undefined`
  * otherwise so callers can fall through to the upstream default
  * silently. Unlike `validateRelayServerCapacity` these knobs are
- * passed straight to libp2p / resolver code that already validates
+ * passed straight to libp2p / kad-DHT code that already validates
  * its own input — we just defend against the obviously-wrong values
  * (0, negative, NaN, fractional, non-numeric) without taking on a
  * warning surface.

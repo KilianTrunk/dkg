@@ -8,6 +8,8 @@ import {
   type MessageStreamPoolOptions,
 } from './message-stream-pool.js';
 
+type AbortableByteStream = Stream | (AsyncIterable<Uint8Array> & { abort(reason?: unknown): void });
+
 /** Default max bytes readAll will buffer before aborting (10 MB). */
 export const DEFAULT_MAX_READ_BYTES = 10 * 1024 * 1024;
 
@@ -795,6 +797,10 @@ export class ProtocolRouter {
           const t = setTimeout(resolve, backoff);
           const onAbort = (): void => {
             clearTimeout(t);
+            if (stopSignal?.aborted) {
+              reject(asAbortError(stopSignal.reason));
+              return;
+            }
             reject(new Error(`send timeout: backoff aborted by overall deadline (${timeoutMs}ms)`));
           };
           if (overallSignal.aborted) {
@@ -1204,7 +1210,7 @@ export async function raceMultiPath(args: {
  * propagates the abort error out of the for-await loop naturally.
  */
 export async function readAllWithSignal(
-  stream: Stream | AsyncIterable<Uint8Array>,
+  stream: AbortableByteStream,
   maxBytes: number,
   signal?: AbortSignal,
 ): Promise<Uint8Array> {
@@ -1273,10 +1279,10 @@ export function composeAbortSignals(
   return combined.signal;
 }
 
-function abortStream(stream: Stream | AsyncIterable<Uint8Array>, reason: unknown): void {
-  if ('abort' in stream && typeof (stream as Stream).abort === 'function') {
+function abortStream(stream: AbortableByteStream, reason: unknown): void {
+  if ('abort' in stream && typeof stream.abort === 'function') {
     try {
-      (stream as Stream).abort(reason instanceof Error ? reason : new Error(String(reason ?? 'aborted')));
+      stream.abort(reason instanceof Error ? reason : new Error(String(reason ?? 'aborted')));
     } catch {
       /* stream may already be torn down */
     }

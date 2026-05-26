@@ -1389,9 +1389,10 @@ export class DKGNode {
     this.relayMetrics = null;
     this.relayCapacity = null;
     this.relayReservationCountTarget = 1;
-    await this.node.stop();
+    const node = this.node;
     this.node = null;
     this.stopAbortController = null;
+    await node.stop();
   }
 
   get peerId(): string {

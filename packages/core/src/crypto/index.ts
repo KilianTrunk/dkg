@@ -15,6 +15,12 @@ export { MerkleTree, compareBytes } from './merkle.js';
 export { V10MerkleTree } from './v10-merkle.js';
 
 export {
+  V10CiphertextChunksMerkleTree,
+  buildCiphertextChunksRoot,
+  type CiphertextChunksCommitment,
+} from './v10-ciphertext-merkle.js';
+
+export {
   buildV10ProofMaterial,
   verifyV10ProofMaterial,
   V10ProofRootMismatchError,

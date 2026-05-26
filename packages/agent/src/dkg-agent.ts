@@ -10432,7 +10432,7 @@ export class DKGAgent {
       );
       return;
     }
-    this.log.debug(
+    this.log.info(
       ctx,
       `LU-11: persisted ciphertext chunk cg=${storageCgId} batchId=${ethers.hexlify(batchId).slice(0, 18)}... chunkIndex=${chunkIndex} bytes=${ciphertext.length}`,
     );
@@ -10889,10 +10889,18 @@ export class DKGAgent {
       });
     }
 
-    // Locate the chunk in the triple-store-backed per-CG chunk graph.
-    const chunksGraph = ciphertextChunkStoreGraph(req.contextGraphId);
+    // Locate the chunk. Subject URI
+    //   urn:dkg:swm:v10-publish-ciphertext-chunk/<batchIdHex>/<i>
+    // is globally unique (batchId === V10 KC merkleRoot), so we scan
+    // `GRAPH ?g` rather than pinning to `ciphertextChunkStoreGraph(req.contextGraphId)`
+    // — the requester may have learned the CG under either the
+    // cleartext SWM id (what `ingestSwmCiphertextChunkEnvelope`
+    // persists under) or the numeric on-chain id (what the prover /
+    // ACK pipeline carry). The per-CG named graph is retained as a
+    // cheap-eviction key, not a lookup discriminator. Mirrors the
+    // ACK V2 verifier and `extractCiphertextChunksFromStore`.
     const subject = ciphertextChunkStoreSubject(req.batchId, req.chunkIndex);
-    const sparql = `SELECT ?o WHERE { GRAPH <${chunksGraph}> { <${subject}> <${CIPHERTEXT_CHUNK_PREDICATE}> ?o } } LIMIT 1`;
+    const sparql = `SELECT ?o WHERE { GRAPH ?g { <${subject}> <${CIPHERTEXT_CHUNK_PREDICATE}> ?o } } LIMIT 1`;
     let result;
     try {
       result = await this.store.query(sparql);

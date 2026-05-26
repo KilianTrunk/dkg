@@ -9,7 +9,6 @@ import {
   ACK_PROTOCOL_VERSION_V2_LU11,
   buildCiphertextChunksRoot,
   ciphertextChunkStoreSubject,
-  ciphertextChunkStoreGraph,
   CIPHERTEXT_CHUNK_PREDICATE,
 } from '@origintrail-official/dkg-core';
 import {
@@ -303,32 +302,75 @@ export class StorageACKHandler {
       // Load chunks 0..count-1 from local store. Each is a base64
       // literal under the per-(batchId, chunkIndex) subject the LU-11
       // SWM ingest writes to.
-      const chunksGraph = ciphertextChunkStoreGraph(cgId);
-      const chunkBytes: Uint8Array[] = [];
-      const missing: number[] = [];
+      //
+      // Tight race window: the publisher emits the chunked SWM
+      // envelopes and the V2 ACK request back-to-back (sub-second).
+      // On a busy or freshly-subscribed core, the storage-ack
+      // handler can run before the SWM ingest finishes persisting
+      // the matching chunks. Block briefly and re-poll missing
+      // indexes a handful of times before declining — the eventual
+      // arrival is the normal happy path, and a transient decline
+      // forces the whole publish to round-trip through the
+      // publisher's retry loop for no gain. We cap the wait at
+      // ~3s total (6 retries × 500ms) so a genuinely-lost chunk
+      // still surfaces fast.
+      // Note on the persisted-vs-looked-up graph key:
+      //
+      // `ingestSwmCiphertextChunkEnvelope` in dkg-agent persists each
+      // chunk into `ciphertextChunkStoreGraph(envelope.contextGraphId)`,
+      // where `envelope.contextGraphId` carries the SOURCE/cleartext
+      // SWM CG id (e.g. "0xCURATOR/rfc39-curated-…"), not the numeric
+      // on-chain CG id. The Subject URI is
+      //   urn:dkg:swm:v10-publish-ciphertext-chunk/<batchIdHex>/<i>
+      // which is globally unique (batchId === V10 KC merkleRoot), so
+      // we don't strictly need the named-graph key to locate a chunk.
+      // The V2 ACK SPARQL therefore scans `GRAPH ?g` (see `loadChunk`
+      // below) and lets the unique Subject URI route to the right
+      // per-CG graph itself — matches the prover's
+      // `extractCiphertextChunksFromStore` behaviour and tolerates
+      // publishers that map the on-chain id → cleartext SWM id
+      // differently across remap vs direct-publish flows.
+      const chunkBytes: Uint8Array[] = new Array(claimedChunkCount);
       let totalChunkBytes = 0;
-      for (let i = 0; i < claimedChunkCount; i++) {
+      // Dev-friendly default: 20 retries × 500ms = 10s. On a freshly-
+      // created curated CG the SWM host-mode subscription needs to
+      // finish the beacon-driven auto-host handshake, then the
+      // GossipSub mesh needs to ferry the chunked envelope across; on
+      // small devnets that can take a few seconds. Production cores
+      // that have been hosting the CG for ages will hit the cache on
+      // the first iteration so the extra budget is free.
+      const MAX_LOCAL_WAIT_RETRIES = 20;
+      const LOCAL_WAIT_DELAY_MS = 500;
+      const loadChunk = async (i: number): Promise<Uint8Array | null> => {
         const subject = ciphertextChunkStoreSubject(merkleRoot, i);
-        // SELECT ?o WHERE { GRAPH <chunksGraph> { <subject> <CIPHERTEXT_CHUNK_PREDICATE> ?o } } LIMIT 1
-        const sparql = `SELECT ?o WHERE { GRAPH <${chunksGraph}> { <${subject}> <${CIPHERTEXT_CHUNK_PREDICATE}> ?o } } LIMIT 1`;
+        const sparql = `SELECT ?o WHERE { GRAPH ?g { <${subject}> <${CIPHERTEXT_CHUNK_PREDICATE}> ?o } } LIMIT 1`;
         const result = await this.store.query(sparql);
-        if (result.type !== 'bindings' || result.bindings.length === 0) {
-          missing.push(i);
-          if (missing.length > 8) break;
-          continue;
-        }
+        if (result.type !== 'bindings' || result.bindings.length === 0) return null;
         const literal = result.bindings[0]?.['o'];
-        if (typeof literal !== 'string') {
-          missing.push(i);
-          continue;
-        }
-        // Strip surrounding quotes if the store returns them.
+        if (typeof literal !== 'string') return null;
         const base64 = literal.startsWith('"') && literal.endsWith('"')
           ? literal.slice(1, -1)
           : literal;
-        const bytes = Buffer.from(base64, 'base64');
-        chunkBytes.push(bytes);
-        totalChunkBytes += bytes.length;
+        return Buffer.from(base64, 'base64');
+      };
+      let pending = Array.from({ length: claimedChunkCount }, (_, i) => i);
+      let missing: number[] = [];
+      for (let attempt = 0; attempt <= MAX_LOCAL_WAIT_RETRIES && pending.length > 0; attempt++) {
+        if (attempt > 0) {
+          await new Promise((resolve) => setTimeout(resolve, LOCAL_WAIT_DELAY_MS));
+        }
+        const stillPending: number[] = [];
+        for (const i of pending) {
+          const bytes = await loadChunk(i);
+          if (bytes === null) {
+            stillPending.push(i);
+            continue;
+          }
+          chunkBytes[i] = bytes;
+          totalChunkBytes += bytes.length;
+        }
+        pending = stillPending;
+        missing = stillPending;
       }
       if (missing.length > 0) {
         const preview = missing.slice(0, 8).join(',') + (missing.length > 8 ? `,+${missing.length - 8} more` : '');

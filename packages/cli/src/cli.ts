@@ -59,6 +59,7 @@ import {
   checkForNpmVersionUpdate,
   performNpmUpdate,
   DAEMON_EXIT_CODE_RESTART,
+  decodeForcedExitCode,
 } from './daemon.js';
 import { migrateToBlueGreen } from './migration.js';
 import { ensureRollbackNodeUiBundle } from './rollback-node-ui.js';
@@ -189,17 +190,24 @@ async function runDaemonSupervisor(): Promise<void> {
       },
     );
 
-    const exitCode = await new Promise<number | null>((resolve) => {
+    const rawExitCode = await new Promise<number | null>((resolve) => {
       child.once('exit', (code) => resolve(code));
     });
+    const { forced, originalExitCode } = decodeForcedExitCode(rawExitCode);
+    if (forced) {
+      console.warn(
+        `[supervisor] previous worker forced-exited (code ${rawExitCode}; original intent ${originalExitCode}). ` +
+          `Shutdown cleanup deadlocked — see worker logs for [shutdown-timeout].`,
+      );
+    }
 
-    if (exitCode === DAEMON_EXIT_CODE_RESTART) {
+    if (originalExitCode === DAEMON_EXIT_CODE_RESTART) {
       crashRestartCount = 0;
       await sleep(250);
       continue;
     }
 
-    if (exitCode === 0) return;
+    if (originalExitCode === 0) return;
 
     crashRestartCount += 1;
     if (crashRestartCount >= maxCrashRestarts) return;
@@ -232,25 +240,32 @@ async function runForegroundSupervisor(childEnv: NodeJS.ProcessEnv = process.env
       },
     );
 
-    const exitCode = await new Promise<number | null>((resolve) => {
+    const rawExitCode = await new Promise<number | null>((resolve) => {
       currentChild!.once('exit', (code) => resolve(code));
       currentChild!.once('error', () => resolve(1));
     });
     currentChild = null;
+    const { forced, originalExitCode } = decodeForcedExitCode(rawExitCode);
+    if (forced) {
+      console.warn(
+        `[supervisor] previous worker forced-exited (code ${rawExitCode}; original intent ${originalExitCode}). ` +
+          `Shutdown cleanup deadlocked — see worker logs for [shutdown-timeout].`,
+      );
+    }
 
-    if (signalled) process.exit(exitCode ?? 0);
+    if (signalled) process.exit(originalExitCode ?? 0);
 
-    if (exitCode === DAEMON_EXIT_CODE_RESTART) {
+    if (originalExitCode === DAEMON_EXIT_CODE_RESTART) {
       crashRestartCount = 0;
       await sleep(250);
       if (signalled) process.exit(0);
       continue;
     }
 
-    if (exitCode === 0) process.exit(0);
+    if (originalExitCode === 0) process.exit(0);
 
     crashRestartCount += 1;
-    if (crashRestartCount >= maxCrashRestarts) process.exit(exitCode ?? 1);
+    if (crashRestartCount >= maxCrashRestarts) process.exit(originalExitCode ?? 1);
     await sleep(1000);
     if (signalled) process.exit(0);
   }

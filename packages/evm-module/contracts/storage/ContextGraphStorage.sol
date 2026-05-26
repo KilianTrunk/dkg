@@ -229,12 +229,8 @@ contract ContextGraphStorage is INamed, IVersioned, Guardian, ERC721Enumerable {
 
         contextGraphId = ++_contextGraphCounter;
 
-        // CEI ordering: populate ALL CG state below first; `_safeMint`
-        // happens last so the receiver's `onERC721Received` callback
-        // observes a fully-built CG (metadata, policy, participant agents,
-        // PCA accountId, nameHash) and cannot re-enter into a half-built
-        // graph. The `owner_` argument is caller-supplied (the function is
-        // `onlyContracts`-gated, but `owner_` may be a contract recipient).
+        _mint(owner_, contextGraphId);
+
         KnowledgeAssetsLib.ContextGraph storage cg = _contextGraphs[contextGraphId];
         cg.metadataBatchId = metadataBatchId;
         cg.active = true;
@@ -265,8 +261,6 @@ contract ContextGraphStorage is INamed, IVersioned, Guardian, ERC721Enumerable {
         if (nameHash != bytes32(0)) {
             _contextGraphNameHash[contextGraphId] = nameHash;
         }
-
-        _safeMint(owner_, contextGraphId);
 
         emit ContextGraphCreated(
             contextGraphId,

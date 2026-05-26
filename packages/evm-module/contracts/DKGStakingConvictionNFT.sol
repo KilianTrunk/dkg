@@ -374,12 +374,8 @@ contract DKGStakingConvictionNFT is IVersioned, ContractStatus, IInitializable, 
         _convictionMultiplier(lockTier);
 
         tokenId = ++nextTokenId;
-        // CEI + ERC-721 safe-mint: settle CSS state and pull TRAC FIRST,
-        // then `_safeMint` last. The receiver's `onERC721Received` callback
-        // therefore observes a fully-consistent stake/NFT pair and cannot
-        // re-enter the wrapper to act on a half-built position.
+        _mint(msg.sender, tokenId);
         stakingV10.stake(msg.sender, tokenId, identityId, amount, lockTier);
-        _safeMint(msg.sender, tokenId);
 
         emit PositionCreated(msg.sender, tokenId, identityId, amount, lockTier);
     }
@@ -397,18 +393,14 @@ contract DKGStakingConvictionNFT is IVersioned, ContractStatus, IInitializable, 
     ///      here (and the CSS-level `PositionReplaced` with the full reward
     ///      stat continuity).
     ///
-    ///      CEI ordering with `_safeMint`:
-    ///        1. `stakingV10.relock` — drives CSS's `createNewPositionFromExisting`
-    ///           which itself asserts the new slot is empty
-    ///           (`positions[newTokenId].identityId == 0`). That assertion is
-    ///           a CSS-state check, not an NFT-existence check, so the new
-    ///           NFT does NOT need to exist yet.
-    ///        2. `_burn(oldTokenId)` — removes the old NFT after CSS has
-    ///           moved the position. A mid-call revert leaves BOTH NFT and
-    ///           position state intact at the old tokenId.
-    ///        3. `_safeMint(msg.sender, newTokenId)` — last, so the receiver's
-    ///           `onERC721Received` callback observes a fully-consistent
-    ///           burn-mint outcome and cannot re-enter on a half-built state.
+    ///      Mint-before-forward ordering: we mint `newTokenId` BEFORE the
+    ///      StakingV10 call so that CSS's `createNewPositionFromExisting`
+    ///      can assert the new slot is empty (`positions[newTokenId].identityId == 0`)
+    ///      — there's no NFT collision because the ERC-721 tokenId space
+    ///      and the CSS position space are the same namespace.
+    ///      Burn-after-forward: we burn `oldTokenId` AFTER CSS has moved
+    ///      the position across, so a mid-call revert leaves BOTH NFT and
+    ///      position state intact at the old tokenId.
     function relock(uint256 oldTokenId, uint40 newLockTier) external returns (uint256 newTokenId) {
         if (ownerOf(oldTokenId) != msg.sender) revert NotPositionOwner();
         // Fail-fast on unregistered tiers (e.g. 2, 4, 7). Tier 0 is valid:
@@ -420,9 +412,9 @@ contract DKGStakingConvictionNFT is IVersioned, ContractStatus, IInitializable, 
         _convictionMultiplier(newLockTier);
 
         newTokenId = ++nextTokenId;
+        _mint(msg.sender, newTokenId);
         stakingV10.relock(msg.sender, oldTokenId, newTokenId, newLockTier);
         _burn(oldTokenId);
-        _safeMint(msg.sender, newTokenId);
 
         emit PositionRelocked(oldTokenId, newTokenId, newLockTier);
     }
@@ -521,9 +513,8 @@ contract DKGStakingConvictionNFT is IVersioned, ContractStatus, IInitializable, 
         _convictionMultiplier(lockTier);
 
         tokenId = ++nextTokenId;
-        // CEI + `_safeMint`: settle CSS state first; mint after.
+        _mint(msg.sender, tokenId);
         stakingV10.selfConvertToNFT(msg.sender, tokenId, identityId, lockTier);
-        _safeMint(msg.sender, tokenId);
 
         emit ConvertedFromV8(msg.sender, tokenId, identityId, lockTier, false);
     }
@@ -588,13 +579,8 @@ contract DKGStakingConvictionNFT is IVersioned, ContractStatus, IInitializable, 
     ) internal returns (uint256 tokenId) {
         _convictionMultiplier(lockTier);
         tokenId = ++nextTokenId;
-        // CEI + `_safeMint`: settle CSS state first; mint to `delegator` after.
-        // `delegator` is admin-supplied (V8 stragglers), so a malicious /
-        // mis-typed contract recipient that doesn't implement
-        // `IERC721Receiver` will revert the rescue cleanly instead of
-        // permanently locking the migrated position.
+        _mint(delegator, tokenId);
         stakingV10.adminConvertToNFT(delegator, tokenId, identityId, lockTier);
-        _safeMint(delegator, tokenId);
         emit ConvertedFromV8(delegator, tokenId, identityId, lockTier, true);
     }
 

@@ -69,8 +69,10 @@
 import { existsSync } from 'node:fs';
 import { rename, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
+import yaml from 'js-yaml';
 
 export type MigrationActionKind = 'rename' | 'config-write';
+type ConfigFormat = 'json' | 'yaml';
 
 export interface RenameAction {
   kind: 'rename';
@@ -91,7 +93,9 @@ export interface ConfigWriteAction {
   kind: 'config-write';
   /** Path of the config file we'll edit. */
   configPath: string;
-  /** Dotted path within the JSON, e.g. `autoUpdate.source`. */
+  /** Preserve the active config format for yaml-only installs. */
+  configFormat: ConfigFormat;
+  /** Dotted path within the config object, e.g. `autoUpdate.source`. */
   key: string;
   value: unknown;
   reason: string;
@@ -177,6 +181,30 @@ const SOURCE_TREE_ARTIFACTS_COSMETIC: ReadonlyArray<{
   },
 ];
 
+const DKG_HOME_STATE_MARKERS = [
+  'config.json',
+  'config.yaml',
+  'pid',
+  'api.port',
+  'data',
+  'releases',
+] as const;
+
+function resolveConfigWriteTarget(
+  dkgHome: string,
+  exists: (path: string) => boolean,
+): { path: string; format: ConfigFormat } {
+  const jsonPath = join(dkgHome, 'config.json');
+  if (exists(jsonPath)) return { path: jsonPath, format: 'json' };
+  const yamlPath = join(dkgHome, 'config.yaml');
+  if (exists(yamlPath)) return { path: yamlPath, format: 'yaml' };
+  return { path: jsonPath, format: 'json' };
+}
+
+function hasDkgHomeState(dkgHome: string, exists: (path: string) => boolean): boolean {
+  return DKG_HOME_STATE_MARKERS.some((marker) => exists(join(dkgHome, marker)));
+}
+
 /**
  * Pure plan-builder. Inspects the source tree, produces an action list
  * + blocker list + warnings without touching the filesystem.
@@ -219,7 +247,7 @@ export function buildMigrationPlan(opts: BuildPlanOpts): MigrationPlan {
     }
   }
 
-  if (opts.dkgHomeNow !== opts.dkgHomePostMigration) {
+  if (opts.dkgHomeNow !== opts.dkgHomePostMigration && hasDkgHomeState(opts.dkgHomeNow, exists)) {
     // Classic orphan case: state in ~/.dkg-dev, post-migration the CLI
     // looks at ~/.dkg. Hard refuse — no `--force` override; this one is
     // genuinely unsafe.
@@ -256,9 +284,11 @@ export function buildMigrationPlan(opts: BuildPlanOpts): MigrationPlan {
   }
 
   if (opts.currentAutoUpdateSource !== 'npm') {
+    const configTarget = resolveConfigWriteTarget(opts.dkgHomeNow, exists);
     actions.push({
       kind: 'config-write',
-      configPath: join(opts.dkgHomeNow, 'config.json'),
+      configPath: configTarget.path,
+      configFormat: configTarget.format,
       key: 'autoUpdate.source',
       value: 'npm',
       reason:
@@ -292,7 +322,7 @@ export async function applyPlan(
   }
   for (const action of plan.actions) {
     if (action.kind === 'config-write') {
-      await validateConfigKeyWrite(action.configPath, action.key, io);
+      await validateConfigKeyWrite(action.configPath, action.key, action.configFormat, io);
     }
   }
   for (const action of plan.actions) {
@@ -304,7 +334,7 @@ export async function applyPlan(
   for (const action of plan.actions) {
     if (action.kind === 'config-write') {
       log(`writing ${action.key}=${JSON.stringify(action.value)} → ${action.configPath}`);
-      await writeConfigKey(action.configPath, action.key, action.value, io);
+      await writeConfigKey(action.configPath, action.key, action.value, action.configFormat, io);
     }
   }
 }
@@ -335,11 +365,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-function parseConfigObject(raw: string | null, configPath: string): Record<string, unknown> {
+function parseConfigObject(raw: string | null, configPath: string, format: ConfigFormat): Record<string, unknown> {
   if (!raw) return {};
-  const parsed = JSON.parse(raw);
+  const parsed = format === 'yaml' ? yaml.load(raw) : JSON.parse(raw);
   if (!isRecord(parsed)) {
-    throw new Error(`${configPath} must contain a JSON object`);
+    throw new Error(`${configPath} must contain a config object`);
   }
   return parsed;
 }
@@ -347,20 +377,20 @@ function parseConfigObject(raw: string | null, configPath: string): Record<strin
 async function validateConfigKeyWrite(
   configPath: string,
   dottedKey: string,
+  format: ConfigFormat,
   io: ApplyPlanIo,
 ): Promise<void> {
   const segments = dottedKey.split('.');
-  const parsed = parseConfigObject(await io.readFile(configPath), configPath);
+  const parsed = parseConfigObject(await io.readFile(configPath), configPath, format);
   if (segments.length === 2 && parsed[segments[0]] !== undefined && !isRecord(parsed[segments[0]])) {
     throw new Error(`${configPath} key ${segments[0]} must be an object before writing ${dottedKey}`);
   }
 }
 
 /**
- * Read `configPath` (or treat as empty object if missing), set the
- * dotted key, write back with the same `JSON.stringify(_, null, 2) + "\n"`
- * formatting that `saveConfig()` uses. Keeps the file diff-clean for
- * operators who track `~/.dkg/config.json` in their own version control.
+ * Read `configPath` (or treat as empty object if missing), set the dotted key,
+ * and write back in the same active format. Keeps yaml-only operators on YAML
+ * instead of creating a new JSON file that would shadow their existing config.
  *
  * Only supports two-segment keys (`autoUpdate.source`) because that's
  * all this migration writes. Deeper-nesting support is YAGNI — add when
@@ -370,6 +400,7 @@ async function writeConfigKey(
   configPath: string,
   dottedKey: string,
   value: unknown,
+  format: ConfigFormat,
   io: ApplyPlanIo,
 ): Promise<void> {
   const segments = dottedKey.split('.');
@@ -377,7 +408,7 @@ async function writeConfigKey(
     throw new Error(`writeConfigKey only supports 1- or 2-segment keys; got ${dottedKey}`);
   }
   const existing = await io.readFile(configPath);
-  const parsed = parseConfigObject(existing, configPath);
+  const parsed = parseConfigObject(existing, configPath, format);
   if (segments.length === 1) {
     parsed[segments[0]] = value;
   } else {
@@ -390,7 +421,10 @@ async function writeConfigKey(
     parsed[segments[0]] = top;
   }
   await io.mkdir(dirname(configPath));
-  await io.writeFile(configPath, JSON.stringify(parsed, null, 2) + '\n');
+  const rendered = format === 'yaml'
+    ? yaml.dump(parsed, { noRefs: true, lineWidth: 120 })
+    : JSON.stringify(parsed, null, 2) + '\n';
+  await io.writeFile(configPath, rendered);
 }
 
 /**

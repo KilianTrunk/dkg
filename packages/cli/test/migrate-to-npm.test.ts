@@ -156,8 +156,28 @@ describe('buildMigrationPlan — config-write action', () => {
     expect(write).toMatchObject({
       kind: 'config-write',
       configPath: `${DKG_HOME}/config.json`,
+      configFormat: 'json',
       key: 'autoUpdate.source',
       value: 'npm',
+    });
+  });
+
+  it('targets config.yaml when the active install is yaml-only', () => {
+    const plan = buildMigrationPlan({
+      repoRoot: REPO,
+      backupSuffix: 'ts',
+      dkgHomeNow: DKG_HOME,
+      dkgHomePostMigration: DKG_HOME,
+      daemonAlive: false,
+      forceAliveBypass: false,
+      currentAutoUpdateSource: 'git',
+      exists: existsOf([`${REPO}/package.json`, `${DKG_HOME}/config.yaml`]),
+    });
+    const write = plan.actions.find((a) => a.kind === 'config-write');
+    expect(write).toMatchObject({
+      kind: 'config-write',
+      configPath: `${DKG_HOME}/config.yaml`,
+      configFormat: 'yaml',
     });
   });
 
@@ -220,7 +240,7 @@ describe('buildMigrationPlan — orphan-home blocker', () => {
       daemonAlive: false,
       forceAliveBypass: true,
       currentAutoUpdateSource: 'git',
-      exists: existsOf([`${REPO}/package.json`]),
+      exists: existsOf([`${REPO}/package.json`, '/home/op/.dkg-dev/config.json']),
     });
     expect(plan.blockers.find((b) => b.includes('state-directory orphan'))).toBeDefined();
     expect(plan.blockers[0]).toMatch(/mv \/home\/op\/\.dkg-dev \/home\/op\/\.dkg/);
@@ -232,6 +252,20 @@ describe('buildMigrationPlan — orphan-home blocker', () => {
       repoRoot: REPO,
       backupSuffix: 'ts',
       dkgHomeNow: '/home/op/.dkg',
+      dkgHomePostMigration: '/home/op/.dkg',
+      daemonAlive: false,
+      forceAliveBypass: false,
+      currentAutoUpdateSource: 'git',
+      exists: existsOf([`${REPO}/package.json`]),
+    });
+    expect(plan.blockers.find((b) => b.includes('state-directory orphan'))).toBeUndefined();
+  });
+
+  it('does not flag the orphan blocker for an empty derived home', () => {
+    const plan = buildMigrationPlan({
+      repoRoot: REPO,
+      backupSuffix: 'ts',
+      dkgHomeNow: '/home/op/.dkg-dev',
       dkgHomePostMigration: '/home/op/.dkg',
       daemonAlive: false,
       forceAliveBypass: false,
@@ -267,7 +301,7 @@ describe('applyPlan — refuses to mutate when blockers present', () => {
     const plan: MigrationPlan = {
       actions: [
         { kind: 'rename', from: '/repo/package.json', to: '/repo/package.json.bak', loadBearing: true, reason: 'r' },
-        { kind: 'config-write', configPath: '/state/config.json', key: 'autoUpdate.source', value: 'npm', reason: 'r' },
+        { kind: 'config-write', configPath: '/state/config.json', configFormat: 'json', key: 'autoUpdate.source', value: 'npm', reason: 'r' },
       ],
       warnings: [],
       blockers: [],
@@ -290,7 +324,7 @@ describe('applyPlan — refuses to mutate when blockers present', () => {
     const plan: MigrationPlan = {
       actions: [
         { kind: 'rename', from: '/repo/package.json', to: '/repo/package.json.bak', loadBearing: true, reason: 'r' },
-        { kind: 'config-write', configPath: '/state/config.json', key: 'autoUpdate.source', value: 'npm', reason: 'r' },
+        { kind: 'config-write', configPath: '/state/config.json', configFormat: 'json', key: 'autoUpdate.source', value: 'npm', reason: 'r' },
       ],
       warnings: [],
       blockers: [],
@@ -375,6 +409,44 @@ describe('applyPlan — happy path on a real fixture', () => {
         name: 'beacon-01',
         autoUpdate: { enabled: true, checkIntervalMinutes: 30, source: 'npm' },
       });
+    } finally {
+      await rm(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves yaml-only config format when patching the dotted key', async () => {
+    const tmp = await mkdtemp(join(tmpdir(), 'dkg-migrate-test-'));
+    try {
+      const repoRoot = join(tmp, 'repo');
+      const dkgHome = join(tmp, 'state');
+      await mkdir(repoRoot, { recursive: true });
+      await mkdir(dkgHome, { recursive: true });
+      await writeFile(join(repoRoot, 'package.json'), '{}');
+      await writeFile(
+        join(dkgHome, 'config.yaml'),
+        [
+          'name: beacon-01',
+          'autoUpdate:',
+          '  enabled: true',
+          '  checkIntervalMinutes: 30',
+          '',
+        ].join('\n'),
+      );
+      const plan = buildMigrationPlan({
+        repoRoot,
+        backupSuffix: 'fixture',
+        dkgHomeNow: dkgHome,
+        dkgHomePostMigration: dkgHome,
+        daemonAlive: false,
+        forceAliveBypass: false,
+        currentAutoUpdateSource: 'git',
+        exists: existsSync,
+      });
+      await applyPlan(plan, () => {});
+      expect(existsSync(join(dkgHome, 'config.json'))).toBe(false);
+      const cfg = await readFile(join(dkgHome, 'config.yaml'), 'utf-8');
+      expect(cfg).toContain('name: beacon-01');
+      expect(cfg).toContain('source: npm');
     } finally {
       await rm(tmp, { recursive: true, force: true });
     }

@@ -3899,11 +3899,20 @@ async function readPidFromHome(dkgHome: string): Promise<number | null> {
 async function readAutoUpdateSourceFromHome(
   dkgHome: string,
 ): Promise<'npm' | 'git' | 'auto' | undefined> {
+  const normalize = (parsed: unknown): 'npm' | 'git' | 'auto' | undefined => {
+    const source = (parsed as { autoUpdate?: { source?: unknown } } | null)?.autoUpdate?.source;
+    return source === 'npm' || source === 'git' || source === 'auto' ? source : undefined;
+  };
   try {
     const raw = await readFile(join(dkgHome, 'config.json'), 'utf-8');
-    const parsed = JSON.parse(raw) as { autoUpdate?: { source?: unknown } };
-    const source = parsed.autoUpdate?.source;
-    return source === 'npm' || source === 'git' || source === 'auto' ? source : undefined;
+    const source = normalize(JSON.parse(raw));
+    if (source) return source;
+  } catch {
+    // Fall through to config.yaml below.
+  }
+  try {
+    const raw = await readFile(join(dkgHome, 'config.yaml'), 'utf-8');
+    return normalize(yaml.load(raw));
   } catch {
     return undefined;
   }

@@ -28,6 +28,14 @@ export function redactRpcUrl(rpc: string | null | undefined): string {
   // turn a friendly `••••••••` into `%E2%80%A2…` and defeat the point
   // of the redaction.
   const MASK = '************';
+  // Some operators paste RPC URLs with HTTP basic auth baked in
+  // (`https://user:pass@host/path`). Strip the credentials entirely —
+  // a partial mask isn't enough for a screen-share leak class because
+  // the username already identifies the tenant in many setups.
+  if (parsed.password) {
+    parsed.password = '';
+    parsed.username = '';
+  }
   const segments = parsed.pathname.split('/').map((seg) => {
     if (seg.length < 16) return seg;
     if (/^[A-Za-z0-9_-]+$/.test(seg)) return MASK;

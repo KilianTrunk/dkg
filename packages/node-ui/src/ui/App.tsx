@@ -171,7 +171,6 @@ function useShellRouting() {
   const navigate = useNavigate();
   const openTab = useTabsStore((s) => s.openTab);
   const activeTabId = useTabsStore((s) => s.activeTabId);
-  const setActiveTab = useTabsStore((s) => s.setActiveTab);
 
   // Step 1: when the user lands on a deep-link path, open the matching
   // centre tab once. We deliberately key the effect on `pathname` so
@@ -187,7 +186,6 @@ function useShellRouting() {
       openTab({ id: match.id, label: match.label, closable: true });
     }
   }, [pathname, openTab]);
-  void setActiveTab; // kept on the hook surface for future deep-link work
 
   // Step 2: keep the URL aligned with the *active* tab so a refresh
   // restores you to the same place and the location bar reflects what

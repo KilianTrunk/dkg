@@ -55,4 +55,13 @@ describe('redactRpcUrl (BUG-012)', () => {
     const redacted = redactRpcUrl(malformed);
     expect(redacted).not.toContain('664a23a04122d3fa485778b9141bc92e17293c73');
   });
+
+  it('strips HTTP basic-auth credentials baked into the URL (user:pass@host)', () => {
+    const original = 'https://tenant1234:s3cr3t-shared-token@rpc.example.com/path';
+    const redacted = redactRpcUrl(original);
+    expect(redacted).not.toContain('s3cr3t-shared-token');
+    expect(redacted).not.toContain('tenant1234');
+    expect(redacted).not.toContain('@rpc.example.com');
+    expect(redacted).toContain('rpc.example.com');
+  });
 });

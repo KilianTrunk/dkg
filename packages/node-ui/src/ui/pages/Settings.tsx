@@ -713,6 +713,26 @@ function CatchupStatusSection() {
           Hide system CGs
         </label>
       </div>
+      {/* If the user filters such that the previously-selected CG is
+          no longer in the visible list, the status panel below still
+          shows that CG's data — which is confusing. Surface a small
+          hint with a one-click "show full list" reset so the user
+          isn't left wondering why their search returned nothing. */}
+      {selectedContextGraph &&
+       filteredContextGraphs.length > 0 &&
+       !filteredContextGraphs.some((p: any) => p.id === selectedContextGraph) && (
+        <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 8 }}>
+          Selection hidden by current filter.{' '}
+          <button
+            type="button"
+            onClick={() => { setFilterText(''); setShowOnlyMine(false); }}
+            className="btn btn-ghost btn-xs"
+            style={{ padding: '0 6px' }}
+          >
+            Clear filter
+          </button>
+        </div>
+      )}
       <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 12 }}>
         <select
           id="dkg-bg-sync-graph"

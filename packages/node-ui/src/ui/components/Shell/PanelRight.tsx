@@ -31,6 +31,7 @@ import { Select } from '../common/Select.js';
 import { MarkdownMessage } from '../chat/MarkdownMessage.js';
 import { computeSelectableProjects, toSidebarIdentity } from '../../lib/contextGraphSidebar.js';
 import { useCurrentAgent as useSharedCurrentAgentRaw } from '../../hooks/useCurrentAgent.js';
+import { useVisibilityPolling } from '../../hooks/useVisibilityPolling.js';
 
 /**
  * Shared-hook wrapper that returns just the `data` slice — the rest of
@@ -2490,26 +2491,16 @@ export function PanelRight() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  useEffect(() => {
-    let cancelled = false;
-    let timer: ReturnType<typeof setInterval> | null = null;
-    const startTimer = () => {
-      if (timer || cancelled) return;
-      timer = setInterval(() => { loadSessions(); refreshPeers(); }, 15_000);
-    };
-    const stopTimer = () => { if (timer) { clearInterval(timer); timer = null; } };
-    const onVisibility = () => {
-      if (document.hidden) stopTimer();
-      else { loadSessions(); refreshPeers(); startTimer(); }
-    };
-    if (!document.hidden) startTimer();
-    document.addEventListener('visibilitychange', onVisibility);
-    return () => {
-      cancelled = true;
-      stopTimer();
-      document.removeEventListener('visibilitychange', onVisibility);
-    };
+  // BUG-007: sessions + peers refresh now goes through the shared
+  // visibility-aware poller (was a hand-rolled visibilitychange loop
+  // with the same intent). Skip the immediate fire-on-mount because
+  // both loadSessions and refreshPeers already ran in the mount-time
+  // effect above; otherwise we'd duplicate the network call.
+  const refreshChatPanelLive = useCallback(() => {
+    loadSessions();
+    refreshPeers();
   }, [loadSessions, refreshPeers]);
+  useVisibilityPolling(refreshChatPanelLive, 15_000, { runImmediately: false });
 
   const localIntegrationRefreshMs = integrations.some((integration) =>
     integration.persistentChat && (!integration.chatReady || integration.status === 'connecting'),

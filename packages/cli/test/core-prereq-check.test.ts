@@ -83,6 +83,7 @@ describe('classifyMultiaddr — per-class smoke tests', () => {
     ['/dns6/example.com/tcp/4001',    'dns'],
     ['/dns/example.com/tcp/4001',     'dns'],
     ['/dnsaddr/example.com',          'dns'],
+    ['/ip4/8.8.8.8/tcp/4001/p2p/12D3KooRelay/p2p-circuit/p2p/12D3KooSelf', 'relayed'],
     ['/unix/var/run/foo.sock',        'unknown'],
   ];
 
@@ -261,6 +262,19 @@ describe('checkCoreRelayPrereqs — additional safety cases', () => {
     });
     expect(result.looksDegraded).toBe(true);
     expect(result.reasons).toContain('listenAddresses is empty');
+  });
+
+  it('relayed self-addresses do not count as public direct listeners', () => {
+    const result = checkCoreRelayPrereqs({
+      listenAddresses: [
+        '/ip4/8.8.8.8/tcp/4001/p2p/12D3KooRelay/p2p-circuit/p2p/12D3KooSelf',
+      ],
+      hostInterfaces: [PUBLIC_IPV4_IFACE],
+      nodeRole: 'core',
+    });
+    expect(result.looksDegraded).toBe(true);
+    expect(result.publicListenAddresses).toEqual([]);
+    expect(result.nonRoutableAddresses[0].class).toBe('relayed');
   });
 
   it('loopback listenAddresses stay degraded even when announceAddresses contains a public address', () => {

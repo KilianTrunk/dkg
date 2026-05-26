@@ -331,6 +331,72 @@ import { handleRequest } from './handle-request.js';
 import { loadRoutePlugins, countConfiguredPluginSpecs } from './plugin-loader.js';
 import type { MemoryGraphChangedEvent, MemoryGraphLayer } from './routes/context.js';
 
+type MultiaddrLike = { toString: () => string };
+
+function stringifyMultiaddrList(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((ma) => {
+      try {
+        return (ma as MultiaddrLike).toString();
+      } catch {
+        return '';
+      }
+    })
+    .filter((addr) => addr.length > 0);
+}
+
+function listenerMultiaddrs(listener: unknown): string[] {
+  const candidate = listener as {
+    getAddrs?: () => unknown;
+    getMultiaddrs?: () => unknown;
+    addrs?: unknown;
+    multiaddrs?: unknown;
+  };
+  if (typeof candidate?.getAddrs === 'function') {
+    const addrs = stringifyMultiaddrList(candidate.getAddrs());
+    if (addrs.length > 0) return addrs;
+  }
+  if (typeof candidate?.getMultiaddrs === 'function') {
+    const addrs = stringifyMultiaddrList(candidate.getMultiaddrs());
+    if (addrs.length > 0) return addrs;
+  }
+  const addrs = stringifyMultiaddrList(candidate?.addrs);
+  if (addrs.length > 0) return addrs;
+  return stringifyMultiaddrList(candidate?.multiaddrs);
+}
+
+function getBoundListenMultiaddrs(libp2p: unknown): string[] {
+  const node = libp2p as {
+    components?: { transportManager?: unknown };
+    services?: { transportManager?: unknown };
+    transportManager?: unknown;
+    getMultiaddrs?: () => unknown;
+  };
+  const managers = [
+    node.components?.transportManager,
+    node.services?.transportManager,
+    node.transportManager,
+  ];
+  for (const manager of managers) {
+    const getListeners = (manager as { getListeners?: () => unknown } | undefined)?.getListeners;
+    if (typeof getListeners !== 'function') continue;
+    const listeners = getListeners.call(manager);
+    if (!Array.isArray(listeners)) continue;
+    const addrs = listeners.flatMap((listener) => listenerMultiaddrs(listener));
+    if (addrs.length > 0) return Array.from(new Set(addrs));
+  }
+
+  // Fallback for libp2p shapes that do not expose transport listeners. This
+  // keeps the check operational, while excluding relay reservations so they
+  // cannot masquerade as direct listener capability.
+  if (typeof node.getMultiaddrs === 'function') {
+    return stringifyMultiaddrList(node.getMultiaddrs())
+      .filter((addr) => !addr.includes('/p2p-circuit'));
+  }
+  return [];
+}
+
 /**
  * Resolve the WM agentAddress the daemon hands to `ChatMemoryManager`.
  *
@@ -904,12 +970,13 @@ export async function runDaemonInner(
   //     fail-loud opt-in.
   //
   // The post-start pass remains authoritative because libp2p has already
-  // expanded `0.0.0.0` to per-interface bindings here.
+  // expanded `0.0.0.0` to per-interface bindings here. Use transport
+  // listener addresses, not `libp2p.getMultiaddrs()`: the latter is the
+  // advertised self-address set and can include public announce addrs or
+  // `/p2p-circuit` reservations.
   if (role === 'core') {
     try {
-      const resolvedMultiaddrs = agent.node.libp2p
-        .getMultiaddrs()
-        .map((ma: { toString: () => string }) => ma.toString());
+      const resolvedMultiaddrs = getBoundListenMultiaddrs(agent.node.libp2p);
       const hostInterfaces = Object.values(osModule.networkInterfaces())
         .flat()
         .filter((i): i is NetworkInterfaceInfo => i !== undefined);

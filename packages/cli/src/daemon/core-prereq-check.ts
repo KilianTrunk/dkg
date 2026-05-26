@@ -25,11 +25,13 @@
  *   listenAddresses *before* `libp2p.start()` resolves wildcards. Catches
  *   "no public interface on the host" early — operator sees the warning
  *   before paying the boot cost.
- * - **Post-start pass**: re-run with `resolvedListenAddresses` from
- *   `agent.node.libp2p.getMultiaddrs()` — those are the actually-bound
- *   addresses after libp2p's address-resolver has done its thing (NAT64,
- *   `/ip4/0.0.0.0` → per-interface expansion, etc.). This is the
- *   authoritative pass; the pre-start pass is just a heads-up.
+ * - **Post-start pass**: re-run with the transport manager's listener
+ *   addresses — those are the actually-bound addresses after libp2p's
+ *   address-resolver has done its thing (NAT64, `/ip4/0.0.0.0` →
+ *   per-interface expansion, etc.). This is the authoritative pass; the
+ *   pre-start pass is just a heads-up. Do not use `libp2p.getMultiaddrs()`
+ *   here: that is the advertised self-address set and can include public
+ *   announce addresses or `/p2p-circuit` relay reservations.
  *
  * # Order of classifier rules (matters)
  *
@@ -58,6 +60,7 @@ export type AddrClassification =
   | 'ulaIpv6'
   | 'dns'
   | 'multicast'
+  | 'relayed'
   | 'wildcardNoPublicInterface'
   | 'unknown';
 
@@ -87,8 +90,8 @@ export interface CheckCoreRelayPrereqsOpts {
   /**
    * Multiaddrs the daemon configured itself to listen on. Pre-start pass:
    * the values from the config (may include `/ip4/0.0.0.0/...` wildcards).
-   * Post-start pass: pass `resolvedListenAddresses` here instead — those are
-   * the post-wildcard-expansion addresses libp2p actually bound.
+   * Post-start pass: pass transport listener addresses here instead — those
+   * are the post-wildcard-expansion addresses libp2p actually bound.
    */
   listenAddresses: string[];
   /**
@@ -252,6 +255,7 @@ function bestClassAmongInterfaces(
     wildcardNoPublicInterface: -1,
     unknown: 0,
     multicast: 1,
+    relayed: 1,
     loopback: 2,
     linkLocal: 3,
     cgnat: 4,
@@ -283,6 +287,7 @@ export function classifyMultiaddr(
 ): AddrClassification {
   const parts = addr.split('/').filter(Boolean);
   if (parts.length < 2) return 'unknown';
+  if (parts.includes('p2p-circuit')) return 'relayed';
   const proto = parts[0];
   const value = parts[1];
 

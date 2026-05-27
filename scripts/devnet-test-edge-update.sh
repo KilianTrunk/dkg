@@ -157,11 +157,20 @@ registry=http://127.0.0.1:$VERDACCIO_PORT/
 @origintrail-official:registry=http://127.0.0.1:$VERDACCIO_PORT/
 EOF
 
-# Always-on env so every subsequent `npm` / `dkg` invocation in this
-# shell uses the scratch registry + scratch prefix + scratch npmrc.
+# PUBLIC_REGISTRY is the upstream we fetch verdaccio's own package
+# from. Required because once `NPM_CONFIG_REGISTRY` flips to the
+# scratch verdaccio (below, after it's up), a cold `npx -y
+# verdaccio@latest` would chicken-and-egg itself — npx would try to
+# fetch verdaccio's tarball from `http://127.0.0.1:$VERDACCIO_PORT/`
+# and get ECONNREFUSED before the registry has been launched.
+PUBLIC_REGISTRY="https://registry.npmjs.org/"
+
+# DKG_HOME, NPM_CONFIG_PREFIX, NPM_CONFIG_USERCONFIG can be exported
+# unconditionally — they don't affect the `npx verdaccio` fetch
+# (npx's own cache lives outside our scratch prefix). NPM_CONFIG_REGISTRY
+# is the dangerous one and is applied AFTER verdaccio is up.
 export NPM_CONFIG_USERCONFIG="$NPMRC"
 export NPM_CONFIG_PREFIX="$NPM_PREFIX"
-export NPM_CONFIG_REGISTRY="http://127.0.0.1:$VERDACCIO_PORT/"
 # `dkg init` and `dkg rollback` read DKG_HOME for state. Without this
 # they'd write into the operator's real ~/.dkg, polluting the host.
 export DKG_HOME="$DKG_HOME_DIR"
@@ -170,8 +179,14 @@ export DKG_HOME="$DKG_HOME_DIR"
 # `@origintrail-official/dkg` the operator might already have.
 export PATH="$NPM_PREFIX/bin:$PATH"
 
-log "stage 1: launching verdaccio"
-nohup npx -y verdaccio@latest --listen "$VERDACCIO_PORT" --config "$VERDACCIO_CONFIG" \
+log "stage 1: launching verdaccio (npx fetch via $PUBLIC_REGISTRY)"
+# Inline `NPM_CONFIG_REGISTRY` override for the npx subprocess only:
+# npx fetches verdaccio's tarball from the public registry, NOT from
+# the local verdaccio that doesn't exist yet. The export below
+# (after verdaccio is reachable) then flips NPM_CONFIG_REGISTRY to
+# the scratch instance for all subsequent npm/dkg invocations.
+NPM_CONFIG_REGISTRY="$PUBLIC_REGISTRY" nohup npx -y verdaccio@latest \
+  --listen "$VERDACCIO_PORT" --config "$VERDACCIO_CONFIG" \
   >"$VERDACCIO_LOG" 2>&1 &
 VERDACCIO_PID=$!
 
@@ -189,6 +204,11 @@ done
 if ! curl -fsS "http://127.0.0.1:$VERDACCIO_PORT/-/ping" >/dev/null 2>&1; then
   fail "verdaccio did not respond to /-/ping within 60s — see $VERDACCIO_LOG"
 fi
+
+# Verdaccio is now serving — safe to flip the default registry. Every
+# subsequent npm / dkg invocation in this shell now uses the scratch
+# verdaccio for resolution + publish.
+export NPM_CONFIG_REGISTRY="http://127.0.0.1:$VERDACCIO_PORT/"
 
 # ---------------------------------------------------------------------------
 # Stage 2 — pack every public workspace package, then a v2 of just the CLI.

@@ -310,6 +310,24 @@ describe('DKGQueryEngine', () => {
     )).resolves.toMatchObject({ bindings: expect.any(Array) });
   });
 
+  it('allows scoped queries with hyphenated graph/from prefix labels', async () => {
+    await store.insert([
+      q(ENTITY, 'http://example.com/name', '"HyphenatedPrefixPredicate"'),
+    ]);
+
+    await expect(engine.query(
+      `PREFIX graph-viz: <http://example.com/>
+       SELECT ?name WHERE { ?s graph-viz:name ?name }`,
+      { contextGraphId: CONTEXT_GRAPH },
+    )).resolves.toMatchObject({ bindings: expect.any(Array) });
+
+    await expect(engine.query(
+      `PREFIX from-schema: <http://example.com/>
+       SELECT ?name WHERE { ?s from-schema:name ?name }`,
+      { contextGraphId: CONTEXT_GRAPH },
+    )).resolves.toMatchObject({ bindings: expect.any(Array) });
+  });
+
   it('rejects explicit GRAPH IRIs outside the scoped context graph', async () => {
     const otherGraph = 'did:dkg:context-graph:other-agent-registry';
     await store.insert([

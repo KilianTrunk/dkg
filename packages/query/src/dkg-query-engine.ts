@@ -972,7 +972,11 @@ function isKeywordStart(src: string, idx: number): boolean {
 }
 
 function isSparqlKeyword(src: string, start: number, end: number, keyword: string): boolean {
-  return src.slice(start, end).toUpperCase() === keyword && src[end] !== ':';
+  const next = src[end];
+  return src.slice(start, end).toUpperCase() === keyword
+    && next !== ':'
+    && next !== '-'
+    && next !== '.';
 }
 
 function isWordStart(ch: string | undefined): ch is string {

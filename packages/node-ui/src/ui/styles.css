@@ -96,7 +96,13 @@
 /* ══════════════════════════════════════════
    LIGHT THEME
    ══════════════════════════════════════════ */
-body.light {
+/* BUG-004: the variable overrides have to apply at the html element
+   level too, otherwise the `html { background: var(--bg-root) }` rule
+   keeps reading the dark `:root` definition and macOS rubber-band
+   overscroll flashes the dark colour in light mode. The matching
+   class is set on both html and body in App.tsx so existing
+   `body.light .foo` selectors below still work unchanged. */
+:root.light, body.light {
   --bg-root: #fafafa;
   --bg-panel: #f5f5f5;
   --bg-surface: #ffffff;

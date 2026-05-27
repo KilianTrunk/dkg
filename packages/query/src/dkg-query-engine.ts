@@ -471,7 +471,7 @@ function hasCallerDatasetClause(sparql: string): boolean {
     if (isKeywordStart(sparql, i)) {
       let j = i + 1;
       while (j < n && isWordContinuation(sparql[j])) j++;
-      if (sparql.slice(i, j).toUpperCase() === 'FROM' && sparql[j] !== ':') {
+      if (isSparqlKeyword(sparql, i, j, 'FROM')) {
         return true;
       }
       i = j;
@@ -519,7 +519,7 @@ function assertNoUnvalidatedExplicitGraphTargets(sparql: string): void {
       let j = i + 1;
       while (j < n && isWordContinuation(sparql[j])) j++;
       const word = sparql.slice(i, j);
-      if (word.toUpperCase() === 'GRAPH') {
+      if (isSparqlKeyword(sparql, i, j, 'GRAPH')) {
         const operandStart = skipSparqlSpaceAndLineComments(sparql, j);
         const variable = readSparqlVariable(sparql, operandStart);
         if (variable) {
@@ -608,7 +608,7 @@ function hasNestedSelectWithGraphVariable(sparql: string): boolean {
       let j = i + 1;
       while (j < n && isWordContinuation(sparql[j])) j++;
       const word = sparql.slice(i, j);
-      if (word.toUpperCase() === 'SELECT' && braceDepth > 0) {
+      if (isSparqlKeyword(sparql, i, j, 'SELECT') && braceDepth > 0) {
         const end = findNestedSelectEnd(sparql, j, braceDepth);
         if (rangeContainsGraphVariable(sparql, j, end === -1 ? n : end)) {
           return true;
@@ -686,7 +686,7 @@ function rangeContainsGraphVariable(sparql: string, start: number, end: number):
       let j = i + 1;
       while (j < n && isWordContinuation(sparql[j])) j++;
       const word = sparql.slice(i, j);
-      if (word.toUpperCase() === 'GRAPH') {
+      if (isSparqlKeyword(sparql, i, j, 'GRAPH')) {
         const operandStart = skipSparqlSpaceAndLineComments(sparql, j);
         if (operandStart < n && readSparqlVariable(sparql, operandStart)) {
           return true;
@@ -725,7 +725,7 @@ function collectExplicitGraphIris(sparql: string): string[] {
       let j = i + 1;
       while (j < n && isWordContinuation(sparql[j])) j++;
       const word = sparql.slice(i, j);
-      if (word.toUpperCase() === 'GRAPH') {
+      if (isSparqlKeyword(sparql, i, j, 'GRAPH')) {
         const operandStart = skipSparqlSpaceAndLineComments(sparql, j);
         if (sparql[operandStart] === '<') {
           const operandEnd = skipSparqlIriRef(sparql, operandStart);
@@ -769,7 +769,7 @@ function collectGraphVariables(sparql: string): string[] {
       let j = i + 1;
       while (j < n && isWordContinuation(sparql[j])) j++;
       const word = sparql.slice(i, j);
-      if (word.toUpperCase() === 'GRAPH') {
+      if (isSparqlKeyword(sparql, i, j, 'GRAPH')) {
         const operandStart = skipSparqlSpaceAndLineComments(sparql, j);
         const variable = readSparqlVariable(sparql, operandStart);
         if (variable && !seen.has(variable)) {
@@ -914,6 +914,10 @@ function isKeywordStart(src: string, idx: number): boolean {
   if (!isWordStart(ch)) return false;
   const prev = idx > 0 ? src[idx - 1] : '';
   return !prev || (!isWordContinuation(prev) && prev !== '?' && prev !== '$' && prev !== ':' && prev !== '#');
+}
+
+function isSparqlKeyword(src: string, start: number, end: number, keyword: string): boolean {
+  return src.slice(start, end).toUpperCase() === keyword && src[end] !== ':';
 }
 
 function isWordStart(ch: string | undefined): ch is string {

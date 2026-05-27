@@ -461,6 +461,7 @@ describe('toEpcisEvent', () => {
       parentID: '',
       disposition: '',
       bizStep: '',
+      eventTimeZoneOffset: '',
       ual: '',
     });
     const event = toEpcisEvent(binding);
@@ -477,6 +478,7 @@ describe('toEpcisEvent', () => {
     expect(event).not.toHaveProperty('parentID');
     expect(event).not.toHaveProperty('disposition');
     expect(event).not.toHaveProperty('bizStep');
+    expect(event).not.toHaveProperty('eventTimeZoneOffset');
     expect(event).not.toHaveProperty('dkg:ual');
   });
 
@@ -494,6 +496,12 @@ describe('toEpcisEvent', () => {
     const event = toEpcisEvent(binding);
     expect(event.configurationId).toBe('CFG-001');
     expect(event.shipmentId).toBe('SHIP-001');
+  });
+
+  it('includes eventTimeZoneOffset when binding is present', () => {
+    const binding = makeBindings({ eventTimeZoneOffset: '"+02:00"' });
+    const event = toEpcisEvent(binding);
+    expect(event.eventTimeZoneOffset).toBe('+02:00');
   });
 
   it('omits dkg:ual when UAL binding is empty', () => {

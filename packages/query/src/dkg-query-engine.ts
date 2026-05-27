@@ -282,7 +282,7 @@ export class DKGQueryEngine implements QueryEngine {
       return emptyResultForSparql(sparql);
     }
 
-    if (view === 'verified-memory') {
+    if (view === 'verified-memory' || view === 'shared-working-memory') {
       assertExplicitGraphIrisAllowed(sparql, allGraphs);
       sparql = constrainGraphVariablesToAllowedSet(sparql, allGraphs);
     }

@@ -1467,6 +1467,10 @@ async function _performNpmUpdateInnerEdge(
   currentVersion: string | null,
   log: (msg: string) => void,
 ): Promise<UpdateStatus> {
+  // Destructure from `_autoUpdateIo` so unit tests can stub each
+  // dependency — matches the existing `_performNpmUpdateInner`
+  // (Core) pattern.
+  const { writeFile, exec: execAsyncIo, dkgDir } = _autoUpdateIo;
   const previousVersionPath = join(dkgDir(), "previous-version");
   if (currentVersion && currentVersion.length > 0) {
     try {
@@ -1493,7 +1497,7 @@ async function _performNpmUpdateInnerEdge(
   log(`Auto-update (npm-edge): running '${installCmd}'…`);
   try {
     const installStart = Date.now();
-    await execAsync(installCmd, {
+    await execAsyncIo(installCmd, {
       encoding: "utf-8",
       timeout: 300_000,
       // Allow npm's progress / warning output to surface in the daemon

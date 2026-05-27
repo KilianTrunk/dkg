@@ -122,13 +122,7 @@ function NodeLogContent() {
       </div>
       <div className="v10-log-output" ref={scrollRef}>
         {visible.map((line, i) => (
-          <div
-            key={i}
-            className="v10-log-line"
-            style={{ color: LEVEL_COLORS[classifyLine(line)], whiteSpace: 'pre-wrap', wordBreak: 'break-word', overflowWrap: 'anywhere' }}
-          >
-            {line}
-          </div>
+          <div key={i} className="v10-log-line" style={{ color: LEVEL_COLORS[classifyLine(line)] }}>{line}</div>
         ))}
         {visible.length === 0 && (
           <div className="v10-log-line" style={{ color: 'var(--text-tertiary)' }}>No log output</div>
@@ -318,13 +312,7 @@ function GossipContent() {
       </div>
       <div className="v10-log-output" ref={scrollRef}>
         {visible.map((line, i) => (
-          <div
-            key={i}
-            className="v10-log-line"
-            style={{ color: 'var(--text-secondary)', whiteSpace: 'pre-wrap', wordBreak: 'break-word', overflowWrap: 'anywhere' }}
-          >
-            {line}
-          </div>
+          <div key={i} className="v10-log-line" style={{ color: 'var(--text-secondary)' }}>{line}</div>
         ))}
         {visible.length === 0 && (
           <div className="v10-log-line" style={{ color: 'var(--text-tertiary)' }}>

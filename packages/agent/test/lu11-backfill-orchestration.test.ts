@@ -50,6 +50,7 @@ import { MockChainAdapter } from '@origintrail-official/dkg-chain';
 import {
   contextGraphWorkspaceTopic,
   createOperationContext,
+  PROTOCOL_GET_CIPHERTEXT_CHUNK,
 } from '@origintrail-official/dkg-core';
 import { DKGAgent } from '../src/index.js';
 import {
@@ -98,17 +99,13 @@ async function bootBackfillAgent(): Promise<{ agent: DKGAgent; internals: Backfi
   // `getSubscribers(topic)` on it; setting just that method is
   // sufficient for every code path under test.
   internals.gossip = { getSubscribers: () => [] };
-  // Codex review feedback: do NOT replace `agent.node` wholesale —
-  // `DKGAgent.stop()` reaches into `this.node.stop()` during
-  // teardown, and a bare `{ peerId }` stub would silently break
-  // shutdown (the `afterEach(...catch(() => undefined))` clause
-  // would then mask the failed teardown, leaking timers / libp2p
-  // state into later tests).
-  //
-  // Instead override the agent's OWN `peerId` getter on the instance
-  // — shadowing the prototype getter via `Object.defineProperty` so
-  // the closure's `this.peerId` returns our deterministic test
-  // string. Keeps the real `node` intact for shutdown.
+  // Override the agent's OWN `peerId` getter on the instance —
+  // shadowing the prototype getter via `Object.defineProperty` so
+  // the closure's `this.peerId` returns a deterministic test
+  // string. Do NOT replace `agent.node` wholesale: `DKGAgent.stop()`
+  // reaches into `this.node.stop()` during teardown, and a bare
+  // `{ peerId }` stub would silently break shutdown — leaking
+  // timers / libp2p state into later tests.
   Object.defineProperty(agent, 'peerId', {
     get: () => SELF_PEER,
     configurable: true,
@@ -146,11 +143,10 @@ function stubMessengerSequence(
   internals: BackfillInternals,
   resultFor: (peerId: string, callOrdinal: number) => PerCallResult,
 ): { calls: { peer: string; protocol: string; payload: Uint8Array }[] } {
-  // Codex review (round 2) feedback: capture the payload bytes so
-  // happy-path tests can decode and verify the wire request fields
-  // (contextGraphId, batchId, chunkIndex). Otherwise a regression
-  // that called the right protocol with the wrong request shape
-  // would slip through.
+  // Capture payload bytes so happy-path tests can decode and verify
+  // the wire request fields (contextGraphId, batchId, chunkIndex).
+  // Without that, a regression that called the right protocol with
+  // the wrong request shape would slip through.
   const calls: { peer: string; protocol: string; payload: Uint8Array }[] = [];
   internals.messenger = {
     sendReliable: async (peer: string, protocol: string, payload: Uint8Array): Promise<PerCallResult> => {
@@ -189,16 +185,11 @@ describe('DKGAgent.buildCiphertextChunkBackfill — prover-side backfill orchest
     if (agent) {
       const ref = agent;
       // Null FIRST so the next test gets a fresh slot even if
-      // teardown throws.
+      // teardown throws. Then await without catching — teardown
+      // failures (e.g. a stale node/peerId stub breaking
+      // `node.stop()`) must surface locally rather than silently
+      // leaking timers/libp2p state into the next test.
       agent = null;
-      // Codex review (round 2) feedback: do NOT swallow
-      // `agent.stop()` errors. A teardown regression
-      // (e.g. someone reintroducing the `node` replacement bug
-      // we fixed in round 1) would otherwise leak timers/libp2p
-      // state into later tests AND stay invisible because the
-      // failing afterEach was the only place that would have
-      // surfaced it. Re-raise so teardown bugs fail the test
-      // locally, not in a downstream suite.
       await ref.stop();
     }
   });
@@ -293,17 +284,17 @@ describe('DKGAgent.buildCiphertextChunkBackfill — prover-side backfill orchest
     expect(calls).toHaveLength(3);
     expect(calls.every((c) => c.peer === peerA)).toBe(true);
 
-    // Codex review (round 2) feedback: the stub previously
-    // captured `protocol` but never validated it, and ignored
-    // the payload entirely. A regression that called the wrong
-    // protocol id or sent the wrong (contextGraphId, batchId,
-    // chunkIndex) wire fields would slip through. Validate all
-    // three in the happy-path case where we know the expected
-    // values exactly.
-    expect(calls.every((c) => c.protocol === '/dkg/10.0.2/get-ciphertext-chunk')).toBe(true);
+    // Wire-fidelity check: protocol id, contextGraphId, batchId
+    // and chunk indexes on the wire must match what the orchestrator
+    // was asked to fetch. Without this, a regression that called
+    // the wrong protocol or sent the wrong (contextGraphId, batchId,
+    // chunkIndex) tuple would slip through every test that uses
+    // this messenger stub. We reuse `PROTOCOL_GET_CIPHERTEXT_CHUNK`
+    // from dkg-core so a routine protocol-version bump (e.g.
+    // `/dkg/10.0.3/...`) doesn't spuriously fail this test — only a
+    // real behavior change would.
+    expect(calls.every((c) => c.protocol === PROTOCOL_GET_CIPHERTEXT_CHUNK)).toBe(true);
     const decoded = calls.map((c) => decodeCiphertextChunkCatchupRequest(c.payload));
-    // Local CG id is preserved on the wire (the responder
-    // canonicalises it on its end).
     expect(decoded.every((d) => d.contextGraphId === localCgId)).toBe(true);
     expect(decoded.every((d) => Buffer.from(d.batchId).equals(Buffer.from(batchId)))).toBe(true);
     // Chunk indexes match the missingIndexes we asked for, in
@@ -340,12 +331,11 @@ describe('DKGAgent.buildCiphertextChunkBackfill — prover-side backfill orchest
           messageId: `m-${callOrdinal}`,
         };
       }
-      // Codex review feedback: the `ReliableSendResult` union only
-      // admits `delivered: false` with either `{queued: true, nextAttemptAtMs}`
-      // (durable retry) or `{queued: false, inFlight: true, attempts: 0}`
-      // (sender-side dedup). Pick the realistic production shape
-      // for a transport failure: `queued: true` with a near-future
-      // retry timestamp.
+      // `ReliableSendResult` admits `delivered: false` only with
+      // either `{queued: true, nextAttemptAtMs}` (durable retry) or
+      // `{queued: false, inFlight: true, attempts: 0}` (sender-side
+      // dedup). The realistic production shape for a transport
+      // failure is the durable-retry variant.
       return {
         delivered: false,
         queued: true,
@@ -385,38 +375,44 @@ describe('DKGAgent.buildCiphertextChunkBackfill — prover-side backfill orchest
     // `lastDenied` on each denial — operators see the most recent
     // root cause, which on a homogeneous fleet is usually the
     // representative one).
-    stubMessengerSequence(boot.internals, (peer) => {
+    stubMessengerSequence(boot.internals, (peer, callOrdinal) => {
       const reason = peer === peerA ? 'peer-not-in-agent-allowlist' : 'peer-rate-limited';
       return {
         delivered: true,
         response: ackBytes({
           contextGraphId: localCgId,
           batchId,
-          chunkIndex: 0,
+          // Per-chunk loop pattern: peers are visited per chunk so
+          // ordinals 0,1 belong to chunk 0 and 2,3 belong to chunk 1.
+          chunkIndex: callOrdinal < 2 ? 0 : 1,
           denied: reason,
         }),
         attempts: 1,
-        messageId: 'm-denied',
+        messageId: `m-denied-${callOrdinal}`,
       };
     });
 
     const result = await boot.backfill({
       cgId: onChainId,
       batchId,
-      missingIndexes: [0],
+      // Two missing indexes so this actually exercises the
+      // cross-chunk `lastDenied`/`failures` aggregation rather than
+      // a single-chunk happy/sad path.
+      missingIndexes: [0, 1],
     });
 
     expect(result.fetched).toBe(0);
-    expect(result.failures).toBe(1);
-    // Codex review feedback: pin the EXACT last-denied reason
-    // rather than a regex that accepts either peer's. The closure
-    // iterates `candidatePeers` in insertion order via
-    // `Array.from(new Set(allSubscribers.filter(...)))`, which
-    // preserves the original Array order. With subscribers
-    // `[peerA, peerB]` the iteration visits A then B and
-    // `lastDenied` is overwritten on each denial — so the final
-    // value is peerB's reason. A regression from "last-denial-wins"
-    // to "first-denial-wins" would otherwise pass silently here.
+    // Both chunks failed — failures count must aggregate per chunk.
+    expect(result.failures).toBe(2);
+    // Pin the EXACT last-denied reason rather than a regex that
+    // accepts either peer's. The closure iterates `candidatePeers`
+    // in insertion order via `Array.from(new Set(allSubscribers
+    // .filter(...)))`, which preserves the original Array order.
+    // With subscribers `[peerA, peerB]` the iteration visits A then B
+    // and `lastDenied` is overwritten on each denial — so across
+    // BOTH chunks the final value is still peerB's reason. A
+    // regression from "last-denial-wins" to "first-denial-wins"
+    // would otherwise pass silently here.
     expect(result.reason).toBe('all-denied: peer-rate-limited');
   });
 
@@ -433,10 +429,10 @@ describe('DKGAgent.buildCiphertextChunkBackfill — prover-side backfill orchest
     stubSubscribers(boot.internals, new Map([[workspaceTopic, [peerA, peerB]]]));
 
     const batchId = ethers.getBytes(ethers.id('all-errored-batch'));
-    // Codex review feedback on `ReliableSendResult` union: use the
-    // valid `delivered: false, queued: true, nextAttemptAtMs` variant
-    // (durable retry, the realistic transport-failure shape) rather
-    // than an invalid `queued: false` variant.
+    // Use the valid `ReliableSendResult` durable-retry variant
+    // (`queued: true, nextAttemptAtMs`) rather than an invalid
+    // `queued: false` shape — this is the realistic production
+    // transport-failure result.
     stubMessengerSequence(boot.internals, () => ({
       delivered: false,
       queued: true,
@@ -449,11 +445,14 @@ describe('DKGAgent.buildCiphertextChunkBackfill — prover-side backfill orchest
     const result = await boot.backfill({
       cgId: onChainId,
       batchId,
-      missingIndexes: [0],
+      // Two missing indexes so cross-chunk aggregation is exercised
+      // (a regression that miscounts failures across chunks would
+      // pass a single-chunk variant).
+      missingIndexes: [0, 1],
     });
 
     expect(result.fetched).toBe(0);
-    expect(result.failures).toBe(1);
+    expect(result.failures).toBe(2);
     // No denied responses, only transport errors → "no-responders"
     // gets the operator's attention as "the network couldn't even
     // give me an ACK", different from "I was authoritatively told no".

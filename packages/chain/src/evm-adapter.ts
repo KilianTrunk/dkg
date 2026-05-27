@@ -274,6 +274,9 @@ interface ContractCache {
   dkgPublishingConvictionNFT?: Contract;
   randomSampling?: Contract;
   randomSamplingStorage?: Contract;
+  identityStorage?: Contract;
+  convictionStakingStorage?: Contract;
+  stakingStorage?: Contract;
 }
 
 function formatProviderContext(config: Pick<EVMAdapterConfig, 'chainId' | 'rpcUrl'>): string {
@@ -577,6 +580,10 @@ export class EVMChainAdapter implements ChainAdapter {
     return ethers.keccak256(ethers.solidityPacked(['address'], [ethers.getAddress(address)]));
   }
 
+  private async getIdentityStorage(): Promise<Contract> {
+    return this.contracts.identityStorage ?? await this.resolveContract('IdentityStorage');
+  }
+
   private async hasAdminPurpose(
     identityStorage: Contract,
     identityId: bigint,
@@ -603,7 +610,7 @@ export class EVMChainAdapter implements ChainAdapter {
 
   async isOperationalWalletRegistered(identityId: bigint, address: string): Promise<boolean> {
     await this.init();
-    const identityStorage = await this.resolveContract('IdentityStorage');
+    const identityStorage = await this.getIdentityStorage();
     return this.hasOperationalPurpose(identityStorage, identityId, address);
   }
 
@@ -622,21 +629,28 @@ export class EVMChainAdapter implements ChainAdapter {
     };
     if (identityId === 0n) return result;
 
-    const identityStorage = await this.resolveContract('IdentityStorage');
+    const identityStorage = await this.getIdentityStorage();
     const candidates = [
       ...this.signerPool.map((s) => s.address),
       ...(options?.additionalAddresses ?? []),
     ];
     const seen = new Set<string>();
-    const missing: string[] = [];
-
+    const uniqueAddresses: string[] = [];
     for (const candidate of candidates) {
       const address = ethers.getAddress(candidate);
       const key = address.toLowerCase();
       if (seen.has(key)) continue;
       seen.add(key);
+      uniqueAddresses.push(address);
+    }
 
-      const existingIdentityId = BigInt(await identityStorage.getIdentityId(address));
+    const onChainIds = await Promise.all(
+      uniqueAddresses.map((addr) => identityStorage.getIdentityId(addr).then(BigInt)),
+    );
+    const missing: string[] = [];
+    for (let i = 0; i < uniqueAddresses.length; i++) {
+      const address = uniqueAddresses[i];
+      const existingIdentityId = onChainIds[i];
       if (existingIdentityId === identityId) {
         result.alreadyRegistered.push(address);
       } else if (existingIdentityId === 0n) {
@@ -833,6 +847,23 @@ export class EVMChainAdapter implements ChainAdapter {
     }
 
     try {
+      this.contracts.identityStorage = await this.resolveContract('IdentityStorage');
+    } catch {
+      // IdentityStorage not deployed — identity checks will re-resolve per call
+    }
+
+    try {
+      this.contracts.convictionStakingStorage = await this.resolveContract('ConvictionStakingStorage');
+    } catch {
+      // ConvictionStakingStorage not deployed — falls back to V8 StakingStorage
+    }
+    try {
+      this.contracts.stakingStorage = await this.resolveContract('StakingStorage');
+    } catch {
+      // V8 StakingStorage not deployed — ACK verification skips stake check
+    }
+
+    try {
       await this.resolveAndAssignRandomSamplingPair();
     } catch {
       // RandomSampling not deployed — proof submission unavailable
@@ -876,7 +907,7 @@ export class EVMChainAdapter implements ChainAdapter {
 
   async getIdentityId(): Promise<bigint> {
     await this.init();
-    const identityStorage = await this.resolveContract('IdentityStorage');
+    const identityStorage = await this.getIdentityStorage();
     const id: bigint = await identityStorage.getIdentityId(this.signer.address);
     return id;
   }
@@ -2541,10 +2572,9 @@ export class EVMChainAdapter implements ChainAdapter {
 
   async verifyACKIdentity(recoveredAddress: string, claimedIdentityId: bigint): Promise<boolean> {
     await this.init();
-    const identityStorage = await this.resolveContract('IdentityStorage');
+    const identityStorage = await this.getIdentityStorage();
     if (!identityStorage) return false;
 
-    // Match on-chain verification: keyHasPurpose(identityId, keccak256(signer), OPERATIONAL_KEY)
     const keyHash = ethers.keccak256(ethers.solidityPacked(['address'], [recoveredAddress]));
     const hasPurpose: boolean = await identityStorage.keyHasPurpose(
       claimedIdentityId,
@@ -2560,34 +2590,21 @@ export class EVMChainAdapter implements ChainAdapter {
     // would zero-gate every legitimate V10 ACK signer (this exactly mirrors
     // the on-chain `KnowledgeAssetsV10` ACK-signer gate, also rewired in
     // v4.0.0). Falls back to V8 if CSS is not registered (older deploys).
-    let cs: Contract | null = null;
-    try {
-      cs = await this.resolveContract('ConvictionStakingStorage');
-    } catch {
-      cs = null;
-    }
+    const cs = this.contracts.convictionStakingStorage ?? null;
     if (cs) {
       const stake: bigint = await cs.getNodeStakeV10(claimedIdentityId);
-      if (stake === 0n) return false;
-      return true;
+      return stake !== 0n;
     }
 
-    let ss: Contract | null = null;
-    try {
-      ss = await this.resolveContract('StakingStorage');
-    } catch {
-      ss = null;
-    }
+    const ss = this.contracts.stakingStorage ?? null;
     if (!ss) return false;
     const v8Stake: bigint = await ss.getNodeStake(claimedIdentityId);
-    if (v8Stake === 0n) return false;
-
-    return true;
+    return v8Stake !== 0n;
   }
 
   async verifySyncIdentity(recoveredAddress: string, claimedIdentityId: bigint): Promise<boolean> {
     await this.init();
-    const identityStorage = await this.resolveContract('IdentityStorage');
+    const identityStorage = await this.getIdentityStorage();
     if (!identityStorage) return false;
 
     const keyHash = ethers.keccak256(ethers.solidityPacked(['address'], [recoveredAddress]));
@@ -2881,7 +2898,7 @@ export class EVMChainAdapter implements ChainAdapter {
   async createChallenge(): Promise<CreateChallengeResult> {
     await this.init();
 
-    const identityStorage = await this.resolveContract('IdentityStorage');
+    const identityStorage = await this.getIdentityStorage();
     const identityId: bigint = await identityStorage.getIdentityId(this.signer.address);
 
     return this.withHubStaleRetry(async () => {

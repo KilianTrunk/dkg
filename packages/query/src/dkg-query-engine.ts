@@ -177,6 +177,7 @@ export class DKGQueryEngine implements QueryEngine {
           ? [sharedMemoryGraph]
           : [dataGraph];
       assertExplicitGraphIrisAllowed(sparql, allowedGraphs);
+      sparql = constrainGraphVariablesToAllowedSet(sparql, allowedGraphs);
     }
 
     if (options?.view) {
@@ -458,6 +459,27 @@ function assertExplicitGraphIrisAllowed(sparql: string, allowedGraphs: string[])
   }
 }
 
+function constrainGraphVariablesToAllowedSet(sparql: string, allowedGraphs: string[]): string {
+  const graphVariables = collectGraphVariables(sparql);
+  if (graphVariables.length === 0) return sparql;
+
+  const braceStart = findWhereBraceStart(sparql);
+  if (braceStart === -1) {
+    throw new ScopedQueryViolationError(
+      'GRAPH variables cannot be constrained because the WHERE block could not be located',
+    );
+  }
+
+  const values = allowedGraphs
+    .map((g) => `<${assertSafeIri(g)}>`)
+    .join(' ');
+  const constraints = graphVariables
+    .map((variable) => `VALUES ${variable} { ${values} }`)
+    .join(' ');
+
+  return `${sparql.slice(0, braceStart + 1)} ${constraints} ${sparql.slice(braceStart + 1)}`;
+}
+
 function collectExplicitGraphIris(sparql: string): string[] {
   const iris: string[] = [];
   const n = sparql.length;
@@ -500,6 +522,66 @@ function collectExplicitGraphIris(sparql: string): string[] {
   }
 
   return iris;
+}
+
+function collectGraphVariables(sparql: string): string[] {
+  const variables: string[] = [];
+  const seen = new Set<string>();
+  const n = sparql.length;
+  let i = 0;
+
+  while (i < n) {
+    const ch = sparql[i];
+    if (ch === '#') {
+      while (i < n && sparql[i] !== '\n') i++;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      i = skipSparqlStringLiteral(sparql, i);
+      continue;
+    }
+    if (ch === '<') {
+      const end = sparql.indexOf('>', i + 1);
+      if (end === -1) return variables;
+      i = end + 1;
+      continue;
+    }
+    if (isKeywordStart(sparql, i)) {
+      let j = i + 1;
+      while (j < n && isWordContinuation(sparql[j])) j++;
+      const word = sparql.slice(i, j);
+      if (word.toUpperCase() === 'GRAPH') {
+        const operandStart = skipSparqlSpaceAndLineComments(sparql, j);
+        const variable = readSparqlVariable(sparql, operandStart);
+        if (variable && !seen.has(variable)) {
+          seen.add(variable);
+          variables.push(variable);
+        }
+        i = operandStart + (variable?.length ?? 0);
+        continue;
+      }
+      i = j;
+      continue;
+    }
+    i++;
+  }
+
+  return variables;
+}
+
+function readSparqlVariable(sparql: string, start: number): string | null {
+  const sigil = sparql[start];
+  if (sigil !== '?' && sigil !== '$') return null;
+  let end = start + 1;
+  while (end < sparql.length && isSparqlVariableContinuation(sparql[end])) end++;
+  return end > start + 1 ? sparql.slice(start, end) : null;
+}
+
+function isSparqlVariableContinuation(ch: string | undefined): ch is string {
+  return !!ch && (
+    isWordStart(ch) ||
+    (ch >= '0' && ch <= '9')
+  );
 }
 
 function skipSparqlSpaceAndLineComments(sparql: string, start: number): number {

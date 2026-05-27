@@ -269,6 +269,21 @@ describe('DKGQueryEngine', () => {
       ),
     ).rejects.toThrow(/Scoped query violation: GRAPH <did:dkg:context-graph:other-agent-registry> is outside the allowed graph set/i);
   });
+
+  it('constrains GRAPH variables to the scoped context graph data graph', async () => {
+    await store.insert([
+      q('urn:other:entity', 'http://schema.org/name', '"OtherGraph"', 'did:dkg:context-graph:other-agent-registry'),
+    ]);
+
+    const result = await engine.query(
+      'SELECT ?g ?name WHERE { GRAPH ?g { ?s <http://schema.org/name> ?name } } ORDER BY ?name',
+      { contextGraphId: CONTEXT_GRAPH },
+    );
+
+    expect(result.bindings).toHaveLength(1);
+    expect(result.bindings[0]['g']).toBe(GRAPH);
+    expect(result.bindings[0]['name']).toBe('"ImageBot"');
+  });
 });
 
 describe('validateReadOnlySparql', () => {

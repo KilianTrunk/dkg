@@ -155,6 +155,46 @@ export interface NetworkConfig {
   chainResetMarker?: string;
 }
 
+/**
+ * Operator-facing config block for V10 TRAC allowance sizing. Mirrors
+ * `ApprovalPolicy` from `@origintrail-official/dkg-chain` but with
+ * stringly-typed numeric fields (YAML doesn't speak bigint) so YAML/JSON
+ * config can express it.
+ *
+ * Defaults match the legacy behaviour (`mode: per-publish`); operators
+ * preparing for high-volume publishing should consider `replenishing`.
+ * See `packages/cli/skills/dkg-node/SKILL.md` §8 for the operator guide.
+ */
+export interface ApprovalPolicyConfig {
+  /**
+   * Allowance sizing strategy. Defaults to `'per-publish'`:
+   *
+   *   - `per-publish` — approve exactly each publish's TRAC cost (with the
+   *     on-chain `1n` floor). Cheapest blast radius, most approve-gas at
+   *     scale. Backward-compatible.
+   *   - `replenishing` — approve a configurable ceiling (default 1000 TRAC),
+   *     refill when allowance drops below `target × refillBelowFraction`
+   *     (default 10%). One approve per ~9 publishes' worth of TRAC.
+   *     **Recommended for mainnet.**
+   *   - `unlimited` — approve `MaxUint256` once per wallet, never again.
+   *     Lowest gas, widest blast radius. Use only if you trust the V10 KA
+   *     contract absolutely.
+   */
+  mode?: 'per-publish' | 'replenishing' | 'unlimited';
+  /**
+   * `replenishing` only. TRAC amount (decimal wei-TRAC string — `1000 *
+   * 10^18 = '1000000000000000000000'` for 1000 TRAC) to approve up to.
+   * Defaults to `'1000000000000000000000'` (1000 TRAC).
+   */
+  targetAllowance?: string;
+  /**
+   * `replenishing` only. Refill when current allowance drops below
+   * `targetAllowance × refillBelowFraction`. Float between 0 and 1.
+   * Defaults to `0.1` (refill at 10% remaining).
+   */
+  refillBelowFraction?: number;
+}
+
 export interface ChainConfig {
   /** 'evm' for real blockchain, omit or 'mock' for in-memory (testing only) */
   type: 'evm' | 'mock';
@@ -173,6 +213,13 @@ export interface ChainConfig {
    * to this identity ID so private participant flows can be exercised from black-box CLI tests.
    */
   mockIdentityId?: string;
+  /**
+   * V10 TRAC auto-approve policy. Controls how the adapter sizes the
+   * allowance it requests from each operational signer before a publish or
+   * update. See {@link ApprovalPolicyConfig} for the modes and
+   * `packages/cli/skills/dkg-node/SKILL.md` §8 for the operator guide.
+   */
+  approvalPolicy?: ApprovalPolicyConfig;
 }
 
 export interface LargeLiteralStorageConfig {
@@ -585,6 +632,63 @@ export function resolveNetworkDefaultContextGraphs(network: NetworkConfig | null
 /** Resolve shared memory TTL from config, accepting both V10 and legacy keys. */
 export function resolveSharedMemoryTtlMs(config: DkgConfig): number | undefined {
   return config.sharedMemoryTtlMs ?? config.workspaceTtlMs;
+}
+
+/**
+ * Translates the operator-facing {@link ApprovalPolicyConfig} (YAML/JSON,
+ * string-typed numerics) into the runtime `ApprovalPolicy` shape the
+ * chain adapter expects (`bigint` for `targetAllowance`).
+ *
+ * - Returns `undefined` if the operator didn't configure a policy — lets
+ *   the chain adapter fall back to its built-in default
+ *   (`DEFAULT_APPROVAL_POLICY`, currently `per-publish`).
+ * - Throws a descriptive `Error` if the operator supplied an unparseable
+ *   `targetAllowance` (e.g. `'one thousand TRAC'`). Fails fast at startup
+ *   rather than silently falling back — config bugs are easier to find
+ *   when they don't lurk for hours.
+ */
+export function resolveApprovalPolicy(
+  policy: ApprovalPolicyConfig | undefined,
+): { mode: 'per-publish' | 'replenishing' | 'unlimited'; targetAllowance?: bigint; refillBelowFraction?: number } | undefined {
+  if (!policy) return undefined;
+  const mode = policy.mode ?? 'per-publish';
+  if (mode !== 'per-publish' && mode !== 'replenishing' && mode !== 'unlimited') {
+    throw new Error(
+      `chain.approvalPolicy.mode must be one of 'per-publish' | 'replenishing' | 'unlimited' (got: ${JSON.stringify(mode)})`,
+    );
+  }
+  let targetAllowance: bigint | undefined;
+  if (policy.targetAllowance !== undefined) {
+    try {
+      targetAllowance = BigInt(policy.targetAllowance);
+    } catch (err: any) {
+      throw new Error(
+        `chain.approvalPolicy.targetAllowance must be a decimal wei-TRAC bigint string (got: ${JSON.stringify(policy.targetAllowance)}, ${err?.message ?? err})`,
+      );
+    }
+    if (targetAllowance < 0n) {
+      throw new Error(
+        `chain.approvalPolicy.targetAllowance must be non-negative (got: ${targetAllowance})`,
+      );
+    }
+  }
+  if (policy.refillBelowFraction !== undefined) {
+    if (
+      typeof policy.refillBelowFraction !== 'number'
+      || !Number.isFinite(policy.refillBelowFraction)
+      || policy.refillBelowFraction < 0
+      || policy.refillBelowFraction > 1
+    ) {
+      throw new Error(
+        `chain.approvalPolicy.refillBelowFraction must be a finite number in [0, 1] (got: ${JSON.stringify(policy.refillBelowFraction)})`,
+      );
+    }
+  }
+  return {
+    mode,
+    targetAllowance,
+    refillBelowFraction: policy.refillBelowFraction,
+  };
 }
 
 let _networkConfig: NetworkConfig | null = null;

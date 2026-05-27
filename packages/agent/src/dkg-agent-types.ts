@@ -33,7 +33,7 @@ import type {
   LiftAuthorityProof,
   SharedMemoryPublicSnapshotStorageConfig,
 } from '@origintrail-official/dkg-publisher';
-import type { ChainAdapter } from '@origintrail-official/dkg-chain';
+import type { ApprovalPolicy, ChainAdapter } from '@origintrail-official/dkg-chain';
 import type { QueryAccessConfig } from '@origintrail-official/dkg-query';
 import type { SkillHandler } from './messaging.js';
 import type { CclFactResolutionMode } from './ccl-fact-resolution.js';
@@ -743,6 +743,13 @@ export interface DKGAgentConfig {
     adminPrivateKey?: string;
     operationalKeys: string[];
     chainId?: string;
+    /**
+     * Optional V10 allowance-sizing policy. Threaded straight through to
+     * the `EVMChainAdapter`; see `ApprovalPolicy` in
+     * `@origintrail-official/dkg-chain`. Omit to inherit the default
+     * (`'per-publish'`, bounded-per-publish with on-chain 1n floor).
+     */
+    approvalPolicy?: ApprovalPolicy;
   };
   /** Cross-agent query access configuration. */
   queryAccess?: QueryAccessConfig;

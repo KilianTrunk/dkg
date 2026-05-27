@@ -1107,6 +1107,7 @@ export class DKGAgent {
         additionalKeys: opKeys.slice(1),
         hubAddress: config.chainConfig.hubAddress,
         chainId: config.chainConfig.chainId,
+        approvalPolicy: config.chainConfig.approvalPolicy,
       };
       if (config.chainConfig.adminPrivateKey) {
         chain = new EVMChainAdapter({ ...evmConfigBase, adminPrivateKey: config.chainConfig.adminPrivateKey });

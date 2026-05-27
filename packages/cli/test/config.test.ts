@@ -20,6 +20,7 @@ import {
   dkgDir,
   repoDir,
   resolveAutoUpdateSource,
+  resolveApprovalPolicy,
   resolveChainConfig,
 } from '../src/config.js';
 
@@ -559,5 +560,91 @@ describe('resolveChainConfig (field-level merge)', () => {
     );
     expect(merged).toBeDefined();
     expect(Object.keys(merged ?? {})).toEqual(['type', 'rpcUrl']);
+  });
+});
+
+describe('resolveApprovalPolicy (YAML/JSON config → runtime ApprovalPolicy)', () => {
+  // The chain adapter's runtime API takes a bigint for targetAllowance;
+  // YAML / JSON can't carry bigints natively, so the operator-facing config
+  // accepts a decimal string. This converter pins down the contract.
+
+  it('returns undefined when the operator omitted the field (chain adapter uses its built-in default)', () => {
+    expect(resolveApprovalPolicy(undefined)).toBeUndefined();
+  });
+
+  it('passes through per-publish with no extra fields', () => {
+    expect(resolveApprovalPolicy({ mode: 'per-publish' })).toEqual({
+      mode: 'per-publish',
+      targetAllowance: undefined,
+      refillBelowFraction: undefined,
+    });
+  });
+
+  it('defaults mode to per-publish if omitted (operator could supply only fraction overrides for replenishing post-hoc)', () => {
+    expect(resolveApprovalPolicy({})).toEqual({
+      mode: 'per-publish',
+      targetAllowance: undefined,
+      refillBelowFraction: undefined,
+    });
+  });
+
+  it('converts targetAllowance string → bigint for replenishing', () => {
+    const out = resolveApprovalPolicy({
+      mode: 'replenishing',
+      targetAllowance: '1000000000000000000000', // 1000 TRAC
+      refillBelowFraction: 0.2,
+    });
+    expect(out).toEqual({
+      mode: 'replenishing',
+      targetAllowance: 10n ** 21n,
+      refillBelowFraction: 0.2,
+    });
+  });
+
+  it('accepts unlimited', () => {
+    expect(resolveApprovalPolicy({ mode: 'unlimited' })).toEqual({
+      mode: 'unlimited',
+      targetAllowance: undefined,
+      refillBelowFraction: undefined,
+    });
+  });
+
+  it('throws on unknown mode', () => {
+    expect(() => resolveApprovalPolicy({ mode: 'free-for-all' as any })).toThrow(
+      /must be one of 'per-publish' \| 'replenishing' \| 'unlimited'/,
+    );
+  });
+
+  it('throws on unparseable targetAllowance', () => {
+    expect(() =>
+      resolveApprovalPolicy({
+        mode: 'replenishing',
+        targetAllowance: 'one thousand TRAC',
+      }),
+    ).toThrow(/must be a decimal wei-TRAC bigint string/);
+  });
+
+  it('throws on negative targetAllowance', () => {
+    expect(() =>
+      resolveApprovalPolicy({
+        mode: 'replenishing',
+        targetAllowance: '-1',
+      }),
+    ).toThrow(/must be non-negative/);
+  });
+
+  it('throws on out-of-range refillBelowFraction', () => {
+    expect(() =>
+      resolveApprovalPolicy({ mode: 'replenishing', refillBelowFraction: 1.5 }),
+    ).toThrow(/must be a finite number in \[0, 1\]/);
+    expect(() =>
+      resolveApprovalPolicy({ mode: 'replenishing', refillBelowFraction: -0.1 }),
+    ).toThrow(/must be a finite number in \[0, 1\]/);
+    expect(() =>
+      resolveApprovalPolicy({
+        mode: 'replenishing',
+        refillBelowFraction: Number.NaN,
+      }),
+    ).toThrow(/must be a finite number in \[0, 1\]/);
   });
 });

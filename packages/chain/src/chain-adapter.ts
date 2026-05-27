@@ -37,6 +37,55 @@ export interface PublishParams {
   receiverSignatures: Array<{ identityId: bigint; r: Uint8Array; vs: Uint8Array }>;
 }
 
+/**
+ * How the EVM adapter sizes the TRAC allowance it requests from an
+ * operational signer before a V10 publish or update.
+ *
+ * - `per-publish` (default, backward-compatible) — approve exactly what
+ *   this publish needs (floored at the on-chain `1n` minimum). Re-approve
+ *   on every publish where `tokenAmount > currentAllowance`. Cheapest blast
+ *   radius if the KA contract is ever compromised; most expensive gas
+ *   profile because every dynamic-priced publish triggers an approve tx.
+ *
+ * - `replenishing` (recommended for mainnet operators) — approve a
+ *   configurable target ceiling (default 1000 TRAC) and refill only when
+ *   `currentAllowance` drops below `target × refillBelowFraction` (default
+ *   10%). One approve per ~9 publishes' worth of TRAC, capped exposure.
+ *
+ * - `unlimited` (V9 pattern) — approve `MaxUint256` once per wallet; never
+ *   approve again. Lowest gas, widest blast radius. Choose only if you
+ *   trust the KA contract address absolutely.
+ *
+ * Computed by `computeApprovalAction` in `evm-adapter.ts`. Operators set
+ * this via the daemon config (`chain.approvalPolicy` block in
+ * `dkg.config.yaml`); the field threads through `DKGAgentConfig.chainConfig`
+ * → `EVMAdapterBaseConfig`.
+ */
+export type ApprovalPolicyMode = 'per-publish' | 'replenishing' | 'unlimited';
+
+export interface ApprovalPolicy {
+  /** Sizing strategy. Defaults to `'per-publish'`. */
+  mode: ApprovalPolicyMode;
+  /**
+   * `replenishing` only. Ceiling to approve to when topping up. Defaults
+   * to 1000 TRAC (`10n ** 21n` wei-TRAC). Always raised to at least the
+   * current publish's `tokenAmount` so the immediate publish succeeds even
+   * if the operator misconfigured `targetAllowance` too low.
+   */
+  targetAllowance?: bigint;
+  /**
+   * `replenishing` only. Refill when `currentAllowance < target ×
+   * refillBelowFraction`. Defaults to `0.1` (refill at 10% remaining).
+   * Clamped to `[0, 1]`.
+   */
+  refillBelowFraction?: number;
+}
+
+/** Defaults used when the daemon config omits the field. */
+export const DEFAULT_APPROVAL_POLICY: ApprovalPolicy = { mode: 'per-publish' };
+export const DEFAULT_REPLENISH_TARGET_ALLOWANCE: bigint = 1000n * (10n ** 18n);
+export const DEFAULT_REFILL_BELOW_FRACTION: number = 0.1;
+
 export interface OnChainPublishResult {
   batchId: bigint;
   /** Absent for updates (no new KAs minted). */

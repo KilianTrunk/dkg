@@ -281,15 +281,22 @@ section "5. GOSSIP REPLICATION — public data on other nodes"
 # while letting a cold mesh actually exercise the sync path before we
 # fail. `RC_VALIDATION_GOSSIP_BUDGET_S` lets CI/operators tune this.
 GOSSIP_BUDGET_S="${RC_VALIDATION_GOSSIP_BUDGET_S:-60}"
+# Per-request curl timeout makes the poll budget real: if a node wedges
+# its HTTP socket, a bare `post` (no `--max-time`) would hang the whole
+# script and never let the budget expire. Cap each tick at
+# `GOSSIP_TICK_MAX_S` (default 5s) so we always stay within budget.
+GOSSIP_TICK_MAX_S="${RC_VALIDATION_GOSSIP_TICK_MAX_S:-5}"
 
 for PORT in 9202 9203 9204; do
   DEADLINE=$(( $(date +%s) + GOSSIP_BUDGET_S ))
   NAME_VAL=""
   while [ "$(date +%s)" -lt "$DEADLINE" ]; do
-    REP=$(post $PORT /api/query -H "Content-Type: application/json" -d "{
+    REP=$(curl -s --max-time "$GOSSIP_TICK_MAX_S" --connect-timeout 2 \
+      -H "$H" -H "Content-Type: application/json" \
+      -X POST "http://127.0.0.1:$PORT/api/query" -d "{
       \"sparql\": \"SELECT ?name WHERE { <$ALICE_URI> <http://schema.org/name> ?name }\",
       \"contextGraphId\": \"$CG\"
-    }")
+    }" || echo '')
     NAME_VAL=$(echo "$REP" | pyfield "(lambda b: (b[0].get('name') if b else 'EMPTY'))(d.get('result',{}).get('bindings',[]))")
     echo "$NAME_VAL" | grep -q "Alice" && break
     sleep 2

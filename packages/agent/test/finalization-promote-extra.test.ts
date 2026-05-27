@@ -263,3 +263,36 @@ describe('A-4: e2e — agent.publish() data lands in canonical (data) view post-
     ).toBe(0);
   });
 });
+
+describe('#774 F1: registerContextGraph access-policy mismatch is rejected (Codex review on #777)', () => {
+  // Regression coverage for #774 finding #1. Before this fix, a CG
+  // created public could be registered on-chain with `accessPolicy: 1`
+  // (curated). The on-chain side ended up curated while the local
+  // ACL stayed open; the next `dkg publish` then tripped the
+  // pre-publish LU-5 guard with a mismatch error and the operator had
+  // no easy path to recover. The fix fails fast at register time with
+  // a remediation pointer. These tests pin both the rejection branch
+  // and the matching-policy branch so the half-registered state can't
+  // slip back in.
+  it('rejects register({ accessPolicy: 1 }) on a public-created CG with a remediation message', async () => {
+    const cgId = `f1-mismatch-${ethers.hexlify(ethers.randomBytes(3)).slice(2)}`;
+    await nodeA!.createContextGraph({ id: cgId, name: 'F1 mismatch', description: '' });
+
+    await expect(
+      nodeA!.registerContextGraph(cgId, { accessPolicy: 1 }),
+    ).rejects.toThrow(/local access policy=public\/open \(0\)/i);
+
+    await expect(
+      nodeA!.registerContextGraph(cgId, { accessPolicy: 1 }),
+    ).rejects.toThrow(/dkg context-graph create.*--access-policy 1/);
+  });
+
+  it('accepts register({ accessPolicy: 0 }) on a public-created CG (matching policy is fine)', async () => {
+    const cgId = `f1-match-${ethers.hexlify(ethers.randomBytes(3)).slice(2)}`;
+    await nodeA!.createContextGraph({ id: cgId, name: 'F1 match', description: '' });
+
+    const result = await nodeA!.registerContextGraph(cgId, { accessPolicy: 0 });
+    expect(result.onChainId).toBeDefined();
+    expect(Number(result.onChainId)).toBeGreaterThan(0);
+  });
+});

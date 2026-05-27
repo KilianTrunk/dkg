@@ -1464,6 +1464,87 @@ function writeRegistration(
 }
 
 /**
+ * RFC-41 §4.5: explicit SKILL.md delivery into skill-discovery
+ * directories of MCP-aware clients that don't walk `node_modules`.
+ *
+ * Cursor scans `~/.cursor/skills/<skill>/SKILL.md`; Claude Code
+ * scans `~/.claude/skills/<skill>/SKILL.md`. Neither walks the
+ * `node_modules` tree where the bundled SKILL.md ships inside the
+ * `@origintrail-official/dkg` npm package. So `dkg mcp setup`
+ * explicitly copies the bundled file into each client's
+ * user-level skill directory at registration time.
+ *
+ * Returns the absolute path written, or `null` if this client
+ * doesn't support skill delivery (the table maps Cursor + Claude
+ * Code to fixed destinations; other client targets get `null`
+ * and the caller skips the copy step).
+ */
+function skillTargetForClient(target: ClientTarget, home: string): string | null {
+  // Match by name prefix so the WSL2-side variants ("Cursor (Windows-side via WSL)")
+  // also get skill delivery if the operator-facing client config lives Windows-side.
+  // Both Cursor and Claude Code keep skills under `~/.cursor/skills/` and
+  // `~/.claude/skills/` respectively on the operator's primary OS — for the
+  // WSL2 case the operator runs the GUI client on Windows so the Linux-side
+  // ~/.cursor/skills/ they have inside WSL is the right destination iff
+  // they ALSO run a Cursor instance against WSL. Erring on the side of "deliver
+  // to the Linux-side too" is safe — extra files in skill dirs are inert,
+  // and a corresponding miss is what RFC-41 specifies the operator should
+  // notice via SKILL.md being absent.
+  if (target.name === 'Cursor' || target.name.startsWith('Cursor ')) {
+    return join(home, '.cursor', 'skills', 'dkg-node', 'SKILL.md');
+  }
+  if (target.name === 'Claude Code' || target.name.startsWith('Claude Code ')) {
+    return join(home, '.claude', 'skills', 'dkg-node', 'SKILL.md');
+  }
+  return null;
+}
+
+/**
+ * Load the bundled DKG-node SKILL.md from the npm package's `skills/`
+ * directory. Same shape as `loadBundledDkgNodeSkill()` in
+ * `hermes-setup.ts` so the two delivery paths share the canonical
+ * source artifact byte-for-byte.
+ */
+function loadBundledDkgNodeSkill(): string {
+  return readFileSync(new URL('../skills/dkg-node/SKILL.md', import.meta.url), 'utf-8');
+}
+
+/**
+ * Copy the bundled SKILL.md into the per-client skills directory if
+ * one applies. Idempotent — a re-run with the same bundled content
+ * overwrites with identical bytes (Cursor / Claude Code re-read on
+ * launch, so updates land on the next client restart).
+ *
+ * Errors are non-fatal: a write failure here logs a warning and
+ * returns — the MCP registration that triggered this copy already
+ * succeeded, and skill delivery is a best-effort enhancement.
+ * Operators can fall back to `GET /api/skills` from the daemon, or
+ * `dkg mcp setup --force` re-runs.
+ *
+ * Returns the absolute path written, or `null` if no skill delivery
+ * was attempted (client doesn't support it, or the write failed).
+ */
+function deliverSkillToClient(target: ClientTarget): string | null {
+  const home = homedir();
+  const skillPath = skillTargetForClient(target, home);
+  if (!skillPath) return null;
+  try {
+    const skillContent = loadBundledDkgNodeSkill();
+    const skillDir = dirname(skillPath);
+    if (!existsSync(skillDir)) mkdirSync(skillDir, { recursive: true });
+    writeFileSync(skillPath, skillContent);
+    return skillPath;
+  } catch (err: any) {
+    process.stderr.write(
+      `[setup] WARNING: SKILL.md delivery to ${target.name} (${tildify(skillPath)}) ` +
+        `failed (${err?.message ?? err}); the MCP server registration still applied. ` +
+        `Re-run \`dkg mcp setup\` after resolving the issue, or use GET /api/skills as a fallback.\n`,
+    );
+    return null;
+  }
+}
+
+/**
  * Fallback agent-name minter for first-init when no `--name` is passed
  * and no persisted config exists. Mirrors `discoverAgentName`'s
  * unique-fallback shape (`openclaw-agent-XXXXX`) but with `mcp-` prefix
@@ -1976,6 +2057,14 @@ export async function mcpSetupAction(
       try {
         writeRegistration(s.target, expectedEntry);
         console.log(`  ${action === 'register' ? 'Registered' : 'Refreshed'} ${s.target.name} → ${s.target.displayPath}`);
+        // RFC-41 §4.5: explicit SKILL.md delivery for Cursor + Claude Code,
+        // which don't walk node_modules for skill discovery. Returns null
+        // for clients that don't support skill delivery; logs a warning
+        // on failure but doesn't fail the MCP registration that just succeeded.
+        const skillPath = deliverSkillToClient(s.target);
+        if (skillPath) {
+          console.log(`    └─ SKILL.md copied to ${tildify(skillPath)}`);
+        }
       } catch (err: any) {
         // Codex Round-8 Fix 15: per-client write error isolation.
         // Pre-fix this `throw err` aborted the entire setup on the

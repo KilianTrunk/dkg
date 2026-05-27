@@ -338,6 +338,46 @@ describe('DKGQueryEngine', () => {
     expect(result.bindings.map((row) => row['name'])).toEqual(['"Team Data"', '"Team Workspace"']);
     expect(result.bindings.map((row) => row['g']).sort()).toEqual([subGraph, subGraphSharedMemory].sort());
   });
+
+  it('rejects nested subqueries that would keep GRAPH variables outside the scoped binding', async () => {
+    await store.insert([
+      q('urn:other:entity', 'http://schema.org/name', '"OtherGraph"', 'did:dkg:context-graph:other-agent-registry'),
+    ]);
+
+    await expect(
+      engine.query(
+        `SELECT ?name WHERE {
+          {
+            SELECT ?name WHERE {
+              GRAPH ?g { ?s <http://schema.org/name> ?name }
+            }
+          }
+        }`,
+        { contextGraphId: CONTEXT_GRAPH },
+      ),
+    ).rejects.toThrow(/Scoped query violation: GRAPH variables inside nested SELECT subqueries/i);
+  });
+
+  it('rejects nested GRAPH-variable subqueries even when comparison syntax appears before GRAPH', async () => {
+    await store.insert([
+      q('urn:other:entity', 'http://schema.org/name', '"OtherGraph"', 'did:dkg:context-graph:other-agent-registry'),
+    ]);
+
+    await expect(
+      engine.query(
+        `SELECT ?name WHERE {
+          {
+            SELECT ?name WHERE {
+              BIND(1 AS ?score)
+              FILTER(?score < 10)
+              GRAPH ?g { ?s <http://schema.org/name> ?name }
+            }
+          }
+        }`,
+        { contextGraphId: CONTEXT_GRAPH },
+      ),
+    ).rejects.toThrow(/Scoped query violation: GRAPH variables inside nested SELECT subqueries/i);
+  });
 });
 
 describe('validateReadOnlySparql', () => {

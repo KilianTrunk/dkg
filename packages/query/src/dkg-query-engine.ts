@@ -460,6 +460,12 @@ function assertExplicitGraphIrisAllowed(sparql: string, allowedGraphs: string[])
 }
 
 function constrainGraphVariablesToAllowedSet(sparql: string, allowedGraphs: string[]): string {
+  if (hasNestedSelectWithGraphVariable(sparql)) {
+    throw new ScopedQueryViolationError(
+      'GRAPH variables inside nested SELECT subqueries cannot be constrained safely',
+    );
+  }
+
   const graphVariables = collectGraphVariables(sparql);
   if (graphVariables.length === 0) return sparql;
 
@@ -480,6 +486,133 @@ function constrainGraphVariablesToAllowedSet(sparql: string, allowedGraphs: stri
   return `${sparql.slice(0, braceStart + 1)} ${constraints} ${sparql.slice(braceStart + 1)}`;
 }
 
+function hasNestedSelectWithGraphVariable(sparql: string): boolean {
+  const n = sparql.length;
+  let i = 0;
+  let braceDepth = 0;
+
+  while (i < n) {
+    const ch = sparql[i];
+    if (ch === '#') {
+      while (i < n && sparql[i] !== '\n') i++;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      i = skipSparqlStringLiteral(sparql, i);
+      continue;
+    }
+    if (ch === '<') {
+      const end = skipSparqlIriRef(sparql, i);
+      i = end ?? i + 1;
+      continue;
+    }
+    if (ch === '{') {
+      braceDepth++;
+      i++;
+      continue;
+    }
+    if (ch === '}') {
+      braceDepth = Math.max(0, braceDepth - 1);
+      i++;
+      continue;
+    }
+    if (isKeywordStart(sparql, i)) {
+      let j = i + 1;
+      while (j < n && isWordContinuation(sparql[j])) j++;
+      const word = sparql.slice(i, j);
+      if (word.toUpperCase() === 'SELECT' && braceDepth > 0) {
+        const end = findNestedSelectEnd(sparql, j, braceDepth);
+        if (rangeContainsGraphVariable(sparql, j, end === -1 ? n : end)) {
+          return true;
+        }
+        i = end === -1 ? j : end + 1;
+        continue;
+      }
+      i = j;
+      continue;
+    }
+    i++;
+  }
+
+  return false;
+}
+
+function findNestedSelectEnd(sparql: string, start: number, startingDepth: number): number {
+  const n = sparql.length;
+  let depth = startingDepth;
+  let i = start;
+
+  while (i < n) {
+    const ch = sparql[i];
+    if (ch === '#') {
+      while (i < n && sparql[i] !== '\n') i++;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      i = skipSparqlStringLiteral(sparql, i);
+      continue;
+    }
+    if (ch === '<') {
+      const end = skipSparqlIriRef(sparql, i);
+      i = end ?? i + 1;
+      continue;
+    }
+    if (ch === '{') {
+      depth++;
+      i++;
+      continue;
+    }
+    if (ch === '}') {
+      depth--;
+      if (depth < startingDepth) return i;
+      if (depth < 0) return -1;
+      i++;
+      continue;
+    }
+    i++;
+  }
+
+  return -1;
+}
+
+function rangeContainsGraphVariable(sparql: string, start: number, end: number): boolean {
+  const n = Math.min(sparql.length, end);
+  let i = start;
+
+  while (i < n) {
+    const ch = sparql[i];
+    if (ch === '#') {
+      while (i < n && sparql[i] !== '\n') i++;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      i = skipSparqlStringLiteral(sparql, i);
+      continue;
+    }
+    if (ch === '<') {
+      const iriEnd = skipSparqlIriRef(sparql, i);
+      i = iriEnd && iriEnd <= n ? iriEnd : i + 1;
+      continue;
+    }
+    if (isKeywordStart(sparql, i)) {
+      let j = i + 1;
+      while (j < n && isWordContinuation(sparql[j])) j++;
+      const word = sparql.slice(i, j);
+      if (word.toUpperCase() === 'GRAPH') {
+        const operandStart = skipSparqlSpaceAndLineComments(sparql, j);
+        if (operandStart < n && readSparqlVariable(sparql, operandStart)) {
+          return true;
+        }
+      }
+      i = j;
+      continue;
+    }
+    i++;
+  }
+
+  return false;
+}
+
 function collectExplicitGraphIris(sparql: string): string[] {
   const iris: string[] = [];
   const n = sparql.length;
@@ -496,9 +629,8 @@ function collectExplicitGraphIris(sparql: string): string[] {
       continue;
     }
     if (ch === '<') {
-      const end = sparql.indexOf('>', i + 1);
-      if (end === -1) return iris;
-      i = end + 1;
+      const end = skipSparqlIriRef(sparql, i);
+      i = end ?? i + 1;
       continue;
     }
     if (isKeywordStart(sparql, i)) {
@@ -541,9 +673,8 @@ function collectGraphVariables(sparql: string): string[] {
       continue;
     }
     if (ch === '<') {
-      const end = sparql.indexOf('>', i + 1);
-      if (end === -1) return variables;
-      i = end + 1;
+      const end = skipSparqlIriRef(sparql, i);
+      i = end ?? i + 1;
       continue;
     }
     if (isKeywordStart(sparql, i)) {
@@ -567,6 +698,43 @@ function collectGraphVariables(sparql: string): string[] {
   }
 
   return variables;
+}
+
+function skipSparqlIriRef(sparql: string, start: number): number | null {
+  if (sparql[start] !== '<') return null;
+  const next = sparql[start + 1];
+  if (!isLikelyIriRefStart(next)) return null;
+
+  for (let i = start + 1; i < sparql.length; i++) {
+    const ch = sparql[i];
+    if (ch === '>') return i + 1;
+    if (
+      ch === '<' ||
+      ch === '"' ||
+      ch === '{' ||
+      ch === '}' ||
+      ch === '|' ||
+      ch === '\\' ||
+      ch === '^' ||
+      ch === '`' ||
+      /\s/.test(ch)
+    ) {
+      return null;
+    }
+  }
+
+  return null;
+}
+
+function isLikelyIriRefStart(ch: string | undefined): boolean {
+  return !!ch && (
+    (ch >= 'A' && ch <= 'Z') ||
+    (ch >= 'a' && ch <= 'z') ||
+    ch === '#' ||
+    ch === '_' ||
+    ch === '/' ||
+    ch === '.'
+  );
 }
 
 function readSparqlVariable(sparql: string, start: number): string | null {

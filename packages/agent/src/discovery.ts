@@ -160,7 +160,7 @@ export class DiscoveryClient {
     // the second query's `<${agentUri}>` interpolation. Codex review
     // of PR #700 round 3 caught the prior unguarded interpolation.
     const scalar = `
-      SELECT ?agent ?name ?framework ?nodeRole ?relayAddress ?lastSeen WHERE {
+      SELECT ?agent ?name ?framework ?nodeRole ?relayAddress ?agentAddress ?lastSeen WHERE {
         ?agent a <${DKG}Agent> ;
                <${SCHEMA}name> ?name ;
                <${DKG}peerId> "${escapeSparqlLiteral(peerId)}" .
@@ -168,6 +168,7 @@ export class DiscoveryClient {
         OPTIONAL { ?agent <${SKILL}framework> ?framework }
         OPTIONAL { ?agent <${DKG}nodeRole> ?nodeRole }
         OPTIONAL { ?agent <${DKG}relayAddress> ?relayAddress }
+        OPTIONAL { ?agent <${DKG}agentAddress> ?agentAddress }
         OPTIONAL { ?agent <${DKG}lastSeen> ?lastSeen }
       }
       LIMIT 1
@@ -213,6 +214,13 @@ export class DiscoveryClient {
       framework: row['framework'] ? stripQuotes(row['framework']) : undefined,
       nodeRole: row['nodeRole'] ? stripQuotes(row['nodeRole']) : undefined,
       relayAddress: row['relayAddress'] ? stripQuotes(row['relayAddress']) : undefined,
+      // `agentAddress` is what `DKGAgent.drainPendingSenderKeyForPeer` keys
+      // its pending-by-agent queue lookups against. Omitting it here makes
+      // `drainPendingSenderKeyForPeer` an unconditional no-op in production
+      // — the queue grows but never replays. Match `findAgents()`'s scalar
+      // surface (`SELECT ... ?agentAddress`) so both discovery entry points
+      // resolve the same identity for the same peer.
+      agentAddress: row['agentAddress'] ? stripQuotes(row['agentAddress']) : undefined,
       multiaddrs: multiaddrs.length > 0 ? multiaddrs : undefined,
       lastSeen: row['lastSeen'] ? stripQuotes(row['lastSeen']) : undefined,
     };

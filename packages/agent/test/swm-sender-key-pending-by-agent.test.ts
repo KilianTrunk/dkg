@@ -33,11 +33,13 @@ import {
 import {
   DKGAgent,
   agentFromPrivateKey,
+  buildAgentProfile,
   type AgentKeyRecord,
   type DiscoveredAgent,
   type PendingSenderKeyEntry,
 } from '../src/index.js';
 import type { ReliableSendResult } from '../src/p2p/messenger.js';
+import type { TripleStore } from '@origintrail-official/dkg-storage';
 
 type StubMessenger = {
   sendReliable: (
@@ -51,6 +53,7 @@ interface PendingInternals {
   messenger: StubMessenger;
   node: { peerId: { toString(): string } };
   discovery: { findAgentByPeerId(peerId: string): Promise<DiscoveredAgent | null> };
+  store: TripleStore;
   pendingSenderKeyByAgent: Map<string, PendingSenderKeyEntry[]>;
   createAndDistributeSwmSenderKeyEpoch(input: {
     contextGraphId: string;
@@ -303,5 +306,130 @@ describe('createAndDistributeSwmSenderKeyEpoch: missing-peerId soft success', ()
     )!;
     expect(queueAfterSecond).toHaveLength(1);
     expect(queueAfterSecond[0].epochId).not.toBe(firstEpochId);
+  });
+});
+
+// -----------------------------------------------------------------------------
+// PR #700 regression — drain must work with the agent's *real* DiscoveryClient,
+// not just the stubs used above. The original implementation was a silent
+// no-op in production because `DiscoveryClient.findAgentByPeerId` selected
+// every other column EXCEPT `?agentAddress`, while
+// `drainPendingSenderKeyForPeer` gates on exactly that field. The stub-based
+// tests above (`installStubDiscovery`) inject the field explicitly and so
+// masked the bug. This block exercises the path end-to-end against the
+// agent's actual store + discovery so we'd catch this kind of regression on
+// CI rather than on mainnet.
+// -----------------------------------------------------------------------------
+describe('drainPendingSenderKeyForPeer: real discovery + agent registry CG', () => {
+  let agent: DKGAgent | null = null;
+  afterEach(async () => {
+    if (agent) {
+      await agent.stop().catch(() => undefined);
+      agent = null;
+    }
+  });
+
+  it("drains queued sender keys when the recipient's agent profile is published with peerId+agentAddress (no stubbed discovery)", async () => {
+    const boot = await bootAgent();
+    agent = boot.agent;
+    const internals = boot.internals;
+
+    const sendCalls: { peerId: string; payload: Uint8Array }[] = [];
+    installStubMessenger(internals, async (peerId, _protocolId, payload) => {
+      sendCalls.push({ peerId, payload });
+      return { delivered: true, response: new Uint8Array(), attempts: 1, messageId: 'm-real-drain' };
+    });
+
+    // Build a recipient and seed the queue via the no-peerId path — same
+    // shape as production: publisher emits the encrypted package, the
+    // fan-out can't find a peerId, the row lands in
+    // `pendingSenderKeyByAgent` keyed by lowercased recipientAgentAddress.
+    const recipient = makeFakeRecipient();
+    const sender = agentFromPrivateKey(
+      ethers.Wallet.createRandom().privateKey,
+      'sender',
+    ) as AgentKeyRecord & { privateKey: string };
+
+    await internals.createAndDistributeSwmSenderKeyEpoch({
+      contextGraphId: 'test-cg/real-drain',
+      sender,
+      recipients: [recipient],
+      membershipHash: 'sha256:real-drain',
+      ctx: { operationId: 'test-op', operationName: 'share' },
+    });
+    expect(sendCalls).toHaveLength(0);
+    expect(internals.pendingSenderKeyByAgent.size).toBe(1);
+
+    // Now the recipient publishes its profile to the agent registry CG.
+    // In production this lands via gossip + `SyncManager` ingest from a
+    // remote agent's `publishProfile()`. The shape we care about for
+    // drain is identical either way: a `dkg:Agent` triple-bundle with
+    // `dkg:peerId`, `schema:name`, and crucially `dkg:agentAddress`.
+    const recipientPeerId = '12D3KooWRealDrainTestRecipient';
+    const { quads } = buildAgentProfile({
+      peerId: recipientPeerId,
+      name: 'RealDrainRecipient',
+      agentAddress: recipient.agentAddress,
+      skills: [],
+    });
+    await internals.store.insert(quads);
+
+    // No `installStubDiscovery` call — the agent's real `DiscoveryClient`
+    // (built in `DKGAgent.create` at `dkg-agent.ts:1054`) resolves the
+    // profile from the freshly-inserted triples.
+    const drained = await internals.drainPendingSenderKeyForPeer(recipientPeerId);
+
+    // The bug we're regression-testing was: `agentAddress` came back
+    // `undefined`, drain early-returned 0, queue was never emptied, no
+    // messenger send ever happened. With the fix in place all three
+    // observables flip:
+    expect(drained).toBe(1);
+    expect(sendCalls).toHaveLength(1);
+    expect(sendCalls[0].peerId).toBe(recipientPeerId);
+    expect(internals.pendingSenderKeyByAgent.size).toBe(0);
+  });
+
+  it('treats a profile published without `dkg:agentAddress` as not-found — legacy profiles do not crash drain', async () => {
+    // Defensive boundary: legacy nodes pre-#700 don't emit
+    // `dkg:agentAddress` at all (the triple is optional in
+    // `buildAgentProfile`). In that case drain must safely no-op for that
+    // peerId — the queue stays in place for a future re-publish — rather
+    // than throwing or proceeding with a wrong/empty address.
+    const boot = await bootAgent();
+    agent = boot.agent;
+    const internals = boot.internals;
+
+    installStubMessenger(internals, async () => {
+      throw new Error('sendReliable must not be called when agentAddress is absent');
+    });
+
+    const recipient = makeFakeRecipient();
+    const sender = agentFromPrivateKey(
+      ethers.Wallet.createRandom().privateKey,
+      'sender',
+    ) as AgentKeyRecord & { privateKey: string };
+
+    await internals.createAndDistributeSwmSenderKeyEpoch({
+      contextGraphId: 'test-cg/legacy-profile',
+      sender,
+      recipients: [recipient],
+      membershipHash: 'sha256:legacy-profile',
+      ctx: { operationId: 'test-op', operationName: 'share' },
+    });
+    expect(internals.pendingSenderKeyByAgent.size).toBe(1);
+
+    const legacyPeerId = '12D3KooWLegacyProfileNoAgentAddr';
+    const { quads } = buildAgentProfile({
+      peerId: legacyPeerId,
+      name: 'LegacyAgent',
+      // NB: no `agentAddress` field — the triple is omitted from the
+      // emitted quads (see `profile.ts:203-205`).
+      skills: [],
+    });
+    await internals.store.insert(quads);
+
+    const drained = await internals.drainPendingSenderKeyForPeer(legacyPeerId);
+    expect(drained).toBe(0);
+    expect(internals.pendingSenderKeyByAgent.size).toBe(1);
   });
 });

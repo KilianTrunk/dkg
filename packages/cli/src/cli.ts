@@ -7,7 +7,6 @@ import { spawn, execSync } from 'node:child_process';
 import { createReadStream } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { homedir } from 'node:os';
 import { readFile, writeFile, unlink, appendFile } from 'node:fs/promises';
 import { ethers } from 'ethers';
 import { resolveRpcUrls } from '@origintrail-official/dkg-chain';
@@ -4292,142 +4291,15 @@ async function stopDaemonIfRunning(): Promise<boolean> {
   return false;
 }
 
-async function readPidFromHome(dkgHome: string): Promise<number | null> {
-  try {
-    const raw = await readFile(join(dkgHome, 'daemon.pid'), 'utf-8');
-    const pid = Number.parseInt(raw.trim(), 10);
-    return Number.isFinite(pid) ? pid : null;
-  } catch {
-    return null;
-  }
-}
-
-async function readAutoUpdateSourceFromHome(
-  dkgHome: string,
-): Promise<'npm' | 'git' | 'auto' | undefined> {
-  const normalize = (parsed: unknown): 'npm' | 'git' | 'auto' | undefined => {
-    const source = (parsed as { autoUpdate?: { source?: unknown } } | null)?.autoUpdate?.source;
-    return source === 'npm' || source === 'git' || source === 'auto' ? source : undefined;
-  };
-  try {
-    const raw = await readFile(join(dkgHome, 'config.json'), 'utf-8');
-    const source = normalize(JSON.parse(raw));
-    if (source) return source;
-  } catch {
-    // Fall through to config.yaml below.
-  }
-  try {
-    const raw = await readFile(join(dkgHome, 'config.yaml'), 'utf-8');
-    return normalize(yaml.load(raw));
-  } catch {
-    return undefined;
-  }
-}
-
-// ─── dkg migrate-to-npm ──────────────────────────────────────────────
-
-program
-  .command('migrate-to-npm')
-  .description('Convert a git-checkout install into an npm-style install in place (renames source-tree markers + pins autoUpdate.source = "npm")')
-  .option('--apply', 'Mutate the filesystem. Without this flag, prints the plan and exits.', false)
-  .option('--force', 'Bypass the daemon-alive safety check. Operator must SIGKILL the worker first; in-flight writes may be lost.', false)
-  .action(async (opts: ActionOpts) => {
-    const quoteForShell = (value: string) => `'${value.replace(/'/g, "'\\''")}'`;
-    const {
-      buildMigrationPlan,
-      applyPlan,
-      renderPlan,
-      findDkgMonorepoRootFromCwd,
-      resolveMigrationDkgHome,
-      selectMigrationDkgHome,
-    } = await import('./migrate-to-npm.js');
-    const detectedRepoRoot = repoDir();
-    const cwdRepoRoot = findDkgMonorepoRootFromCwd(process.cwd());
-    const repoRoot = detectedRepoRoot ?? cwdRepoRoot;
-    if (!repoRoot) {
-      console.error('Refusing to run: current directory is not inside a DKG monorepo checkout.');
-      console.error('Run this command from the git-checkout install you want to migrate.');
-      process.exitCode = 1;
-      return;
-    }
-    if (!detectedRepoRoot) {
-      console.log('No active git-checkout marker detected at this location (repoDir() === null).');
-      console.log(`Continuing from ${repoRoot} so a partial migration can still repair config pins.`);
-    }
-    // Codex review (3302171976 → #666#discussion_r3302712591): probe BOTH
-    // the monorepo-candidate home (~/.dkg-dev) and the standalone home
-    // (~/.dkg) for a live daemon before picking which one the migration
-    // targets. The previous code derived the home purely from the LIVE
-    // CLI's install mode via `repoDir()`, which is the WRONG signal when
-    // an operator runs a globally installed `dkg` from inside an
-    // unmigrated git checkout — `repoDir()` is null but the local daemon
-    // still writes to ~/.dkg-dev.
-    const homeSelection = await selectMigrationDkgHome({
-      repoRoot,
-      detectedRepoRoot,
-      homeDir: homedir(),
-      readPidFromHome,
-      isProcessRunning,
-    });
-    if (homeSelection.recoveredGlobalCliInCheckout) {
-      console.log(
-        `Detected a live daemon at ${homeSelection.dkgHome} even though the running CLI is in standalone install-mode. ` +
-          `Using ${homeSelection.dkgHome} for migration so the orphan-state blocker and autoUpdate.source pin target the right config.`,
-      );
-    }
-    const dkgHomeNow = homeSelection.dkgHome;
-    const pid = homeSelection.pid;
-    const dkgHomePostMigration = resolveMigrationDkgHome({
-      detectedRepoRoot: null,
-      homeDir: homedir(),
-    });
-    const daemonAlive = pid !== null && isProcessRunning(pid);
-    const currentAutoUpdateSource = await readAutoUpdateSourceFromHome(dkgHomeNow);
-    const backupSuffix = new Date()
-      .toISOString()
-      .replace(/[:.]/g, '-')
-      .replace(/T/, '_')
-      .replace(/Z$/, '');
-    const plan = buildMigrationPlan({
-      repoRoot,
-      backupSuffix,
-      dkgHomeNow,
-      dkgHomePostMigration,
-      daemonAlive,
-      forceAliveBypass: Boolean(opts.force),
-      currentAutoUpdateSource,
-    });
-    process.stdout.write(renderPlan(plan));
-    if (plan.alreadyMigrated) return;
-    if (!opts.apply) {
-      console.log('Re-run with --apply to execute.');
-      return;
-    }
-    if (plan.blockers.length > 0) {
-      console.error('Refusing to apply: resolve the blocker(s) above and re-run.');
-      process.exit(1);
-    }
-    await applyPlan(plan, (msg) => console.log(`  ${msg}`));
-    console.log('');
-    console.log('Done. Next steps:');
-    console.log('  1. Verify the renames:');
-    for (const action of plan.actions) {
-      if (action.kind === 'rename') console.log(`     ls -ld ${action.to}`);
-    }
-    console.log('  2. Restart the daemon:');
-    console.log('     dkg start');
-    console.log('  3. (Optional) globally install the npm package so `dkg` no longer depends on this tree:');
-    console.log('     npm install -g @origintrail-official/dkg');
-    console.log(
-      `     After that, this cleanup is safe: rm -rf ${[
-        join(repoRoot, 'packages'),
-        join(repoRoot, 'node_modules'),
-        join(repoRoot, 'pnpm-lock.yaml'),
-      ].map(quoteForShell).join(' ')}`,
-    );
-  });
-
 // ─── dkg update ──────────────────────────────────────────────────────
+//
+// OT-RFC-41 §4.5 / §5 PR 6: `dkg migrate-to-npm` was removed.
+// Edge nodes coming from a pre-rc.12 install are migrated
+// automatically on first `dkg start` via `noteEdgeLegacyReleases`
+// (see migration.ts + cli.ts dkg start). Core node operators
+// who still hold a git-checkout install follow the manual
+// procedure documented in `docs/archive/MIGRATE_TO_NPM.md`
+// (formerly `docs/operator/MIGRATE_TO_NPM.md`).
 
 // ─── dkg query-catalog ───────────────────────────────────────────────
 
@@ -4616,8 +4488,9 @@ program
     // For monorepo contributors: the canonical "update" is
     // `git pull && pnpm install && pnpm build` from the repo
     // root — `dkg update` is not the right tool.
-    // For pre-rc.12 `install.sh` operators: see
-    // docs/operator/MIGRATE_TO_NPM.md to convert to the npm path.
+    // For pre-rc.12 `install.sh` operators: re-install via
+    // `npm install -g @origintrail-official/dkg` and let the
+    // first-start migration record `~/.dkg/previous-version`.
     //
     // The dead `_performUpdateInner` / `performUpdate` /
     // `checkForUpdate` / `checkForNewCommit*` symbols stay in
@@ -4632,9 +4505,10 @@ program
       '\n' +
       '  - Monorepo contributors: use `git pull && pnpm install && pnpm build`\n' +
       '    from the repo root. `dkg update` is for npm-installed nodes only.\n' +
-      '  - install.sh-style operators: migrate to npm first. See\n' +
-      '    docs/operator/MIGRATE_TO_NPM.md (or `dkg doctor --json` for a\n' +
-      '    diagnostic of your current install layout).\n' +
+      '  - install.sh-style operators: re-install via `npm install -g\n' +
+      '    @origintrail-official/dkg`. The first daemon start records\n' +
+      '    your existing slot version as the rollback target. Run\n' +
+      '    `dkg doctor --json` for a diagnostic of your current layout.\n' +
       '  - Then re-run `dkg update` from a fresh `npm install -g\n' +
       '    @origintrail-official/dkg` install.\n' +
       '\n' +

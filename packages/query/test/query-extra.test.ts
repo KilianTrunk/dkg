@@ -669,6 +669,22 @@ describe('DKGQueryEngine view routing constrains GRAPH variables', () => {
 
     expect(result.bindings).toEqual([]);
   });
+
+  it('shared-working-memory with GRAPH ?g does not read verified data', async () => {
+    const store = new OxigraphStore();
+    const engine = new DKGQueryEngine(store);
+
+    await store.insert([
+      quad('urn:view:verified-only', 'http://schema.org/name', '"VerifiedOnly"', contextGraphVerifiedMemoryUri(CG, 'published')),
+    ]);
+
+    const result = await engine.query(
+      'SELECT ?g ?name WHERE { GRAPH ?g { ?s <http://schema.org/name> ?name } }',
+      { contextGraphId: CG, view: 'shared-working-memory' },
+    );
+
+    expect(result.bindings).toEqual([]);
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────

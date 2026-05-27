@@ -71,7 +71,7 @@ import {
   startLivenessWatcher,
   LIVENESS_CONSECUTIVE_FAILURES_TO_KILL,
 } from './daemon/supervisor-liveness.js';
-import { migrateToBlueGreen } from './migration.js';
+import { migrateToBlueGreen, noteEdgeLegacyReleases } from './migration.js';
 import { ensureRollbackNodeUiBundle } from './rollback-node-ui.js';
 import { registerIntegrationCommands } from './integrations/commands.js';
 
@@ -356,8 +356,43 @@ async function loadQuadsFromInput(
   process.exit(1);
 }
 
+/**
+ * Synchronous best-effort read of `~/.dkg/config.json#nodeRole`. Used
+ * by {@link resolveDaemonEntryPoint} which runs from supervisor /
+ * spawn paths that cannot afford an async config load.
+ *
+ * Returns `'edge'` on any failure (default role) so a malformed or
+ * missing config does NOT silently keep Edge nodes pinned to a stale
+ * blue-green slot — the worst case is "we try the npm-global entry
+ * and let the daemon's own startup error out with a useful message"
+ * rather than "we run rc.10 instead of rc.12 because slots survived
+ * the upgrade".
+ */
+function readNodeRoleSync(): 'edge' | 'core' {
+  try {
+    const configPath = join(dkgDir(), 'config.json');
+    if (!existsSync(configPath)) return 'edge';
+    const parsed = JSON.parse(readFileSync(configPath, 'utf-8')) as { nodeRole?: unknown };
+    return parsed.nodeRole === 'core' ? 'core' : 'edge';
+  } catch {
+    return 'edge';
+  }
+}
+
+/**
+ * Resolve the daemon entry point passed to spawned worker processes.
+ *
+ * OT-RFC-41 §4.1 / Bundle B1a: Edge nodes run from the npm-global
+ * install (`import.meta.url`). Core nodes keep using blue-green
+ * slots (`~/.dkg/releases/current`). The role gate is applied here
+ * because the supervisor spawns workers via this entry point on
+ * every restart — without the gate, an Edge node that had legacy
+ * slots from a pre-rc.12 install would keep running the stale slot
+ * forever even after `npm install -g` updated the global.
+ */
 function resolveDaemonEntryPoint(): string {
   if (process.env.DKG_NO_BLUE_GREEN) return fileURLToPath(import.meta.url);
+  if (readNodeRoleSync() === 'edge') return fileURLToPath(import.meta.url);
   const rDir = releasesDir();
   if (existsSync(rDir)) {
     const entry = slotEntryPoint(join(rDir, 'current'));
@@ -979,12 +1014,23 @@ program
       process.exit(1);
     }
 
-    // Keep blue-green slots initialized for both foreground and daemonized start.
+    // OT-RFC-41 §4.1 / Bundle B1a: blue-green slot initialization is
+    // a Core-only concern under rc.12+. Edge nodes run directly from
+    // the npm-global install. Pre-rc.12 Edge users may still have
+    // legacy ~/.dkg/releases/ on disk; noteEdgeLegacyReleases() records
+    // the slot version as a rollback target without auto-deleting the
+    // directory (operator owns cleanup per RFC).
     if (!process.env.DKG_NO_BLUE_GREEN) {
-      await migrateToBlueGreen((msg) => console.log(msg), {
-        allowRemoteBootstrap: false,
-        repairLiveNodeUi: true,
-      });
+      const startConfig = await loadConfig().catch(() => null);
+      const startNodeRole = startConfig?.nodeRole ?? 'edge';
+      if (startNodeRole === 'core') {
+        await migrateToBlueGreen((msg) => console.log(msg), {
+          allowRemoteBootstrap: false,
+          repairLiveNodeUi: true,
+        });
+      } else {
+        await noteEdgeLegacyReleases((msg) => console.log(msg));
+      }
     }
 
     // rc.9 PR-7: forward --relay-preferred to the spawned daemon via

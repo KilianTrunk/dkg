@@ -1,8 +1,8 @@
 import { existsSync, lstatSync, readFileSync } from 'node:fs';
-import { mkdir, rm, readFile, readlink } from 'node:fs/promises';
+import { mkdir, rm, readFile, readlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { execSync, execFileSync } from 'node:child_process';
-import { releasesDir, repoDir, swapSlot, loadConfig, loadNetworkConfig, loadProjectConfig, gitCommandEnv, gitCommandArgs, slotReady } from './config.js';
+import { releasesDir, repoDir, swapSlot, loadConfig, loadNetworkConfig, loadProjectConfig, gitCommandEnv, gitCommandArgs, slotReady, activeSlot, dkgDir } from './config.js';
 import {
   FULL_BUILD_COMMAND,
   isNodeUiGitLayoutSlot,
@@ -375,4 +375,80 @@ export async function migrateToBlueGreen(
   }
 
   log('Migration complete: repaired incomplete blue-green slots');
+}
+
+/**
+ * Edge first-start migration (OT-RFC-41 §4.1, Bundle B1a).
+ *
+ * Under rc.12+, Edge nodes do not use blue-green slots — they run the
+ * daemon directly from the npm-global install. Pre-rc.12 Edge users
+ * who got slots from `install.sh` or an earlier `dkg update` will
+ * still have `~/.dkg/releases/{a,b,current}` on disk; this helper:
+ *
+ *   - Detects the legacy layout (`releases/current` resolves to a slot
+ *     that contains an `@origintrail-official/dkg` package.json).
+ *   - Reads the active slot's package.json version and writes it to
+ *     `~/.dkg/previous-version` so a follow-up `dkg rollback` (Edge
+ *     branch, Bundle B1b) has a target to reinstall.
+ *   - Surfaces an operator advisory pointing at `dkg doctor` and the
+ *     RFC's safe-cleanup steps.
+ *
+ * Deliberately **does not** delete `~/.dkg/releases/`. Per the RFC's
+ * "no auto-delete" invariant, the operator owns slot cleanup — the
+ * doctor's `install-layout` check (Bundle A2) flags the directory as
+ * cleanable legacy state, and `MIGRATE_TO_NPM.md` documents the
+ * `rm -rf ~/.dkg/releases/` step.
+ *
+ * Idempotent: re-invocations with `~/.dkg/previous-version` already
+ * present do nothing (preserving whatever the most recent successful
+ * `dkg update` recorded).
+ */
+export async function noteEdgeLegacyReleases(
+  log: (msg: string) => void = console.log,
+): Promise<void> {
+  const rDir = releasesDir();
+  if (!existsSync(rDir)) return;
+
+  const previousVersionPath = join(dkgDir(), 'previous-version');
+  if (existsSync(previousVersionPath)) {
+    // Either a prior `dkg update` Edge run already recorded it, or
+    // this helper already ran. Either way, leave it alone.
+    return;
+  }
+
+  const slot = await activeSlot().catch(() => null);
+  if (!slot) return;
+  const slotDir = join(rDir, slot);
+  // Try both npm-layout and git-layout slot package.json shapes —
+  // mirrors the resolution `dkg rollback`'s pre-Bundle-B logic
+  // already used (cli.ts ~4650).
+  const candidates = [
+    join(slotDir, 'node_modules', '@origintrail-official', 'dkg', 'package.json'),
+    join(slotDir, 'packages', 'cli', 'package.json'),
+  ];
+  let slotVersion: string | null = null;
+  for (const candidate of candidates) {
+    if (!existsSync(candidate)) continue;
+    try {
+      const parsed = JSON.parse(readFileSync(candidate, 'utf-8')) as { version?: unknown };
+      if (typeof parsed.version === 'string' && parsed.version.length > 0) {
+        slotVersion = parsed.version;
+        break;
+      }
+    } catch {
+      // Try next candidate.
+    }
+  }
+  if (!slotVersion) return;
+
+  await writeFile(previousVersionPath, slotVersion);
+  log(
+    `Edge migration (RFC-41 §4.1): detected legacy ~/.dkg/releases/ from a pre-rc.12 ` +
+      `install. Recorded slot ${slot} version ${slotVersion} as the rollback target.`,
+  );
+  log(
+    '  Edge nodes run directly from the npm-global install under rc.12. ' +
+      "Safe to clean up the slot tree once you've confirmed the new install works: " +
+      "'rm -rf ~/.dkg/releases/'. See OT-RFC-41 §4.1 and 'dkg doctor' for details.",
+  );
 }

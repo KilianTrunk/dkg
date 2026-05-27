@@ -4,7 +4,15 @@
  */
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { Interface, ethers } from 'ethers';
-import { decodeEvmError, enrichEvmError, EVMChainAdapter, resolveRpcUrls, type EVMAdapterConfig } from '../src/evm-adapter.js';
+import {
+  decodeEvmError,
+  effectivePublishAllowance,
+  enrichEvmError,
+  EVMChainAdapter,
+  resolveRpcUrls,
+  V10_PUBLISH_ONCHAIN_MIN_ALLOWANCE,
+  type EVMAdapterConfig,
+} from '../src/evm-adapter.js';
 
 const DEPLOYER_PK = '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80';
 const OTHER_PK = '0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b63b91100';
@@ -936,3 +944,45 @@ describe('PR3 / RC11 — publish-preflight TTL cache', () => {
     expect(getNetwork).toHaveBeenCalledTimes(2);
   });
 });
+
+describe('effectivePublishAllowance (V10 approval-ceiling policy)', () => {
+  // Empirical motivation, May 2026 on Base Sepolia (`miles-publish-stress-26may`):
+  // a publish with JS-side `params.tokenAmount === 0n` reverted with
+  // `TooLowAllowance(token, 0, 1)` because the auto-approve path skipped
+  // approval entirely (`currentAllowance < 0n` is never true). The contract
+  // pulls `transferFrom(..., 1n)` even for zero-value publishes. These tests
+  // pin down the policy that floors approvals at the on-chain minimum.
+
+  it('exposes the on-chain minimum constant as 1n', () => {
+    expect(V10_PUBLISH_ONCHAIN_MIN_ALLOWANCE).toBe(1n);
+  });
+
+  it('floors at 1n when tokenAmount is 0n (the bug we hit)', () => {
+    expect(effectivePublishAllowance(0n)).toBe(1n);
+  });
+
+  it('floors at 1n when tokenAmount equals the minimum', () => {
+    expect(effectivePublishAllowance(1n)).toBe(1n);
+  });
+
+  it('passes through tokenAmount when larger than the minimum', () => {
+    expect(effectivePublishAllowance(42n)).toBe(42n);
+    expect(effectivePublishAllowance(10n ** 18n)).toBe(10n ** 18n);
+  });
+
+  it('respects an injected on-chain minimum (forward-compat for contract upgrades)', () => {
+    expect(effectivePublishAllowance(0n, 10n)).toBe(10n);
+    expect(effectivePublishAllowance(5n, 10n)).toBe(10n);
+    expect(effectivePublishAllowance(50n, 10n)).toBe(50n);
+  });
+
+  it('preserves the bounded-approval security property (never returns MaxUint256 unless asked)', () => {
+    // The policy must never silently widen approval beyond what the caller
+    // requested — that would defeat the per-publish ceiling that protects
+    // the operational wallet against a compromised KA contract.
+    const huge = 10n ** 30n;
+    expect(effectivePublishAllowance(huge)).toBe(huge);
+    expect(effectivePublishAllowance(huge)).not.toBe(ethers.MaxUint256);
+  });
+});
+

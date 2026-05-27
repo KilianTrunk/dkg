@@ -156,6 +156,40 @@ export function resolveRpcUrls(rpcUrl: string, rpcUrls?: string[]): string[] {
   return out;
 }
 
+/**
+ * On-chain minimum the `KnowledgeAssetsV10.publish` / `update` contract
+ * pulls via `token.transferFrom(msg.sender, CSS, fullCost)` even for
+ * zero-byte / zero-value publishes — the contract rounds `fullCost` up to
+ * `1` wei-TRAC. Empirically reproduced on Base Sepolia, May 2026: a
+ * publish with JS-side `params.tokenAmount === 0n` reverted with
+ * `TooLowAllowance(token, 0, 1)` because the auto-approve path (then
+ * gated on `tokenAmount > 0n` / `currentAllowance < tokenAmount`) skipped
+ * approval entirely.
+ *
+ * On mainnet the same fires whenever the pricing oracle returns `0`
+ * (new / dust-value CGs, certain edge cases in `getRequiredPublishTokenAmount`),
+ * so we floor the approval ceiling at the on-chain minimum.
+ */
+export const V10_PUBLISH_ONCHAIN_MIN_ALLOWANCE: bigint = 1n;
+
+/**
+ * Returns the TRAC allowance ceiling that must be approved before a V10
+ * publish / update for the chosen operational signer. Floors at the
+ * on-chain minimum (`V10_PUBLISH_ONCHAIN_MIN_ALLOWANCE`) so the
+ * direct-spend branch (`token.transferFrom(..., fullCost)`) never reverts
+ * with `TooLowAllowance` when the JS-side `tokenAmount` is `0n`.
+ *
+ * Preserves the existing bounded-approval policy (we still approve only
+ * what we need, never `MaxUint256` from this code path) so a compromised
+ * KA contract can't drain more than the per-publish ceiling.
+ */
+export function effectivePublishAllowance(
+  tokenAmount: bigint,
+  onChainMin: bigint = V10_PUBLISH_ONCHAIN_MIN_ALLOWANCE,
+): bigint {
+  return tokenAmount > onChainMin ? tokenAmount : onChainMin;
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -2186,14 +2220,20 @@ export class EVMChainAdapter implements ChainAdapter {
     // direct-spend branch. A redundant allowance is cheap and idle when
     // the PCA branch covers the cost, so we always approve up to
     // `tokenAmount` for the direct-spend ceiling.
+    //
+    // Floor at the on-chain minimum (`V10_PUBLISH_ONCHAIN_MIN_ALLOWANCE`)
+    // so a JS-side `tokenAmount` of `0n` (testnet pricing oracle, dust
+    // CGs, mainnet pricing edge cases) still satisfies the contract's
+    // `transferFrom(..., 1n)` minimum — see `effectivePublishAllowance`.
     if (this.contracts.token) {
       const tokenWithSigner = this.contracts.token.connect(txSigner) as Contract;
+      const requiredAllowance = effectivePublishAllowance(params.tokenAmount);
       const currentAllowance = await tokenWithSigner.allowance(txSigner.address, kaAddress);
-      if (currentAllowance < params.tokenAmount) {
+      if (currentAllowance < requiredAllowance) {
         await this.sendContractTransaction(
           tokenWithSigner,
           'approve',
-          [kaAddress, params.tokenAmount],
+          [kaAddress, requiredAllowance],
           txSigner,
           'approve V10 publish TRAC',
         );
@@ -2583,14 +2623,18 @@ export class EVMChainAdapter implements ChainAdapter {
 
     // Approve TRAC for the V10 update — the contract may transferFrom
     // for the newTokenAmount (same direct-spend policy as publish).
-    if (this.contracts.token && newTokenAmount > 0n) {
+    // Same `effectivePublishAllowance` floor as the publish path: even a
+    // metadata-only update with `newTokenAmount === 0n` still requires
+    // `>= 1n` allowance for the on-chain `transferFrom(..., 1n)` minimum.
+    if (this.contracts.token) {
       const tokenWithSigner = this.contracts.token.connect(signer) as Contract;
+      const requiredAllowance = effectivePublishAllowance(newTokenAmount);
       const prevAllowance = await tokenWithSigner.allowance(signer.address, kav10Address);
-      if (prevAllowance < newTokenAmount) {
+      if (prevAllowance < requiredAllowance) {
         await this.sendContractTransaction(
           tokenWithSigner,
           'approve',
-          [kav10Address, newTokenAmount],
+          [kav10Address, requiredAllowance],
           signer,
           'approve V10 update TRAC',
         );

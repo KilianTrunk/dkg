@@ -82,7 +82,6 @@ interface BackfillInternals {
   gossipWireIdFor(rawId: string): string;
   messenger?: { sendReliable: (peerId: string, protocol: string, payload: Uint8Array) => Promise<ReliableSendResult> };
   gossip: { getSubscribers(topic: string): string[] };
-  node: { peerId: string };
 }
 
 async function bootBackfillAgent(): Promise<{ agent: DKGAgent; internals: BackfillInternals; backfill: BackfillFn; ctx: ReturnType<typeof createOperationContext> }> {
@@ -98,11 +97,21 @@ async function bootBackfillAgent(): Promise<{ agent: DKGAgent; internals: Backfi
   // `getSubscribers(topic)` on it; setting just that method is
   // sufficient for every code path under test.
   internals.gossip = { getSubscribers: () => [] };
-  // The agent's `peerId` getter delegates `this.node.peerId`. In
-  // production `node` is a `DKGNode` instance whose `peerId` getter
-  // returns a string. Mirror that shape here so the closure's
-  // `p !== selfPeer` strict-equality filter actually fires.
-  (internals as unknown as { node: { peerId: string } }).node = { peerId: SELF_PEER };
+  // Codex review feedback: do NOT replace `agent.node` wholesale —
+  // `DKGAgent.stop()` reaches into `this.node.stop()` during
+  // teardown, and a bare `{ peerId }` stub would silently break
+  // shutdown (the `afterEach(...catch(() => undefined))` clause
+  // would then mask the failed teardown, leaking timers / libp2p
+  // state into later tests).
+  //
+  // Instead override the agent's OWN `peerId` getter on the instance
+  // — shadowing the prototype getter via `Object.defineProperty` so
+  // the closure's `this.peerId` returns our deterministic test
+  // string. Keeps the real `node` intact for shutdown.
+  Object.defineProperty(agent, 'peerId', {
+    get: () => SELF_PEER,
+    configurable: true,
+  });
   const backfill = internals.buildCiphertextChunkBackfill(ctx);
   return { agent, internals, backfill, ctx };
 }
@@ -297,12 +306,19 @@ describe('DKGAgent.buildCiphertextChunkBackfill — prover-side backfill orchest
           messageId: `m-${callOrdinal}`,
         };
       }
+      // Codex review feedback: the `ReliableSendResult` union only
+      // admits `delivered: false` with either `{queued: true, nextAttemptAtMs}`
+      // (durable retry) or `{queued: false, inFlight: true, attempts: 0}`
+      // (sender-side dedup). Pick the realistic production shape
+      // for a transport failure: `queued: true` with a near-future
+      // retry timestamp.
       return {
         delivered: false,
-        queued: false,
-        attempts: 3,
+        queued: true,
+        attempts: 1,
         messageId: `m-${callOrdinal}-fail`,
         error: 'peer-disconnected',
+        nextAttemptAtMs: Date.now() + 60_000,
       };
     });
 
@@ -358,13 +374,16 @@ describe('DKGAgent.buildCiphertextChunkBackfill — prover-side backfill orchest
 
     expect(result.fetched).toBe(0);
     expect(result.failures).toBe(1);
-    // Reason is `all-denied: <lastDeniedReason>` — at least one
-    // peer's denial reason MUST surface. We don't pin a specific
-    // peer ordering because the closure iterates the candidate
-    // set in insertion order (Set-from-Array preserves order), but
-    // pinning a specific peer would entangle this test with an
-    // unrelated implementation detail.
-    expect(result.reason).toMatch(/^all-denied: (peer-not-in-agent-allowlist|peer-rate-limited)$/);
+    // Codex review feedback: pin the EXACT last-denied reason
+    // rather than a regex that accepts either peer's. The closure
+    // iterates `candidatePeers` in insertion order via
+    // `Array.from(new Set(allSubscribers.filter(...)))`, which
+    // preserves the original Array order. With subscribers
+    // `[peerA, peerB]` the iteration visits A then B and
+    // `lastDenied` is overwritten on each denial — so the final
+    // value is peerB's reason. A regression from "last-denial-wins"
+    // to "first-denial-wins" would otherwise pass silently here.
+    expect(result.reason).toBe('all-denied: peer-rate-limited');
   });
 
   it('all-errored (no denied, all transport failures): returns reason "no-responders"', async () => {
@@ -380,12 +399,17 @@ describe('DKGAgent.buildCiphertextChunkBackfill — prover-side backfill orchest
     stubSubscribers(boot.internals, new Map([[workspaceTopic, [peerA, peerB]]]));
 
     const batchId = ethers.getBytes(ethers.id('all-errored-batch'));
+    // Codex review feedback on `ReliableSendResult` union: use the
+    // valid `delivered: false, queued: true, nextAttemptAtMs` variant
+    // (durable retry, the realistic transport-failure shape) rather
+    // than an invalid `queued: false` variant.
     stubMessengerSequence(boot.internals, () => ({
       delivered: false,
-      queued: false,
-      attempts: 3,
+      queued: true,
+      attempts: 1,
       messageId: 'm-transport-fail',
       error: 'peer-unreachable',
+      nextAttemptAtMs: Date.now() + 60_000,
     }));
 
     const result = await boot.backfill({

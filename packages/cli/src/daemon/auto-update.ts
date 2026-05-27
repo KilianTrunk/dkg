@@ -1,9 +1,23 @@
 // Auto-update subsystem extracted from the legacy monolithic
-// `daemon.ts`. Two independent flavours of update: `performNpmUpdate`
-// (standalone npm-installed `dkg` binary) and `performUpdate` (dkg-v9
-// monorepo checkout, blue/green release slots). Live "last check"
-// state is shared with `handleRequest`'s `/status` endpoint via
-// `daemonState` in `./state.js`.
+// `daemon.ts`.
+//
+// OT-RFC-41 / rc.12+ update mechanism:
+//   - `performNpmUpdateEdge` — Edge nodes (single-tree, npm-global).
+//   - `performNpmUpdate`     — Core nodes (blue-green slots, npm install
+//                              into inactive slot + swap).
+//
+// The legacy git-clone + build-from-source path (`performUpdate`,
+// `_performUpdateInner`, `checkForUpdate`, `checkForNewCommit*`,
+// `runBuildStep`, `cleanGeneratedOutputs`, `sweepOrphanBuildProcesses`,
+// `resolveBuildTimeouts`) remains in this file as **dead production
+// code** under Bundle B: no user-facing CLI entry point or daemon
+// polling loop calls into it anymore (see `cli.ts` `dkg update` and
+// `daemon/lifecycle.ts` polling, both updated in OT-RFC-41 §4.2 /
+// §5 PR 5). A follow-up rc.12.x cleanup PR deletes these symbols
+// once Bundle B has soaked on devnet.
+//
+// Live "last check" state is shared with `handleRequest`'s `/status`
+// endpoint via `daemonState` in `./state.js`.
 
 import { execSync, exec, execFile } from 'node:child_process';
 import { promisify } from 'node:util';

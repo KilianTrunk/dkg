@@ -58,8 +58,6 @@ function isDaemonUnreachable(err: unknown): boolean {
 import { batchEntityQuads } from './batching.js';
 import {
   runDaemon,
-  performUpdateWithStatus,
-  checkForNewCommitWithStatus,
   checkForNpmVersionUpdate,
   performNpmUpdate,
   performNpmUpdateEdge,
@@ -4606,92 +4604,44 @@ program
       return;
     }
 
-    // --- Git-based update path (monorepo / install.sh installs) ---
-
-    // RFC-41 §5 PR 2 deprecation warning. The git-based update path
-    // (monorepo `dkg update` + install.sh-style git-checkout updates)
-    // is being removed in Bundle B. Bundle A only warns; B converts
-    // this to a hard refusal once the npm path is the proven default
-    // and the §6.5 rollout prerequisites are green.
+    // --- Git-based update path: hard refusal under OT-RFC-41 §4.2 / §5 PR 5 ---
+    //
+    // Bundle A shipped this branch with a deprecation warning;
+    // Bundle B converts it to a hard refusal. The npm path above
+    // is the canonical update mechanism for both Edge (`npm
+    // install -g`) and Core (`npm install` into a slot). The
+    // git-pull + build-from-source path is no longer reachable
+    // from any user-facing CLI entry point.
     //
     // For monorepo contributors: the canonical "update" is
-    // `git pull && pnpm install && pnpm build` from the repo root.
-    // For install.sh operators: see docs/operator/MIGRATE_TO_NPM.md
-    // to convert to the npm path before Bundle B lands.
-    process.stderr.write(
+    // `git pull && pnpm install && pnpm build` from the repo
+    // root — `dkg update` is not the right tool.
+    // For pre-rc.12 `install.sh` operators: see
+    // docs/operator/MIGRATE_TO_NPM.md to convert to the npm path.
+    //
+    // The dead `_performUpdateInner` / `performUpdate` /
+    // `checkForUpdate` / `checkForNewCommit*` symbols stay in
+    // `daemon/auto-update.ts` for one release so a rollback to
+    // rc.11 still type-checks; a follow-up cleanup PR deletes
+    // them once Bundle B has soaked on devnet.
+    console.error(
       '\n' +
-      '[dkg update] WARNING: invoking the git-based update path. This path is\n' +
-      '  deprecated in rc.12 per OT-RFC-41 and will be removed in a near-term\n' +
-      '  release. The canonical update mechanism is `npm install -g\n' +
-      '  @origintrail-official/dkg` + `dkg update`.\n' +
+      '[dkg update] ERROR: git-based update is no longer supported.\n' +
+      '\n' +
+      '  Per OT-RFC-41, all DKG node updates now flow through the npm registry.\n' +
       '\n' +
       '  - Monorepo contributors: use `git pull && pnpm install && pnpm build`\n' +
-      '    in the repo root instead of `dkg update`.\n' +
-      '  - install.sh-style operators: see docs/operator/MIGRATE_TO_NPM.md.\n' +
+      '    from the repo root. `dkg update` is for npm-installed nodes only.\n' +
+      '  - install.sh-style operators: migrate to npm first. See\n' +
+      '    docs/operator/MIGRATE_TO_NPM.md (or `dkg doctor --json` for a\n' +
+      '    diagnostic of your current install layout).\n' +
+      '  - Then re-run `dkg update` from a fresh `npm install -g\n' +
+      '    @origintrail-official/dkg` install.\n' +
       '\n' +
       '  RFC: https://github.com/OriginTrail/dkgv10-spec/blob/main/rfcs/OT-RFC-41-edge-node-npm-only-install-and-update.md\n' +
       '\n',
     );
-
-    const refOverride = versionOrRef ? normalizeVersionTagRef(versionOrRef) : undefined;
-    const verifyTagSignature = Boolean(refOverride && refOverride.startsWith('refs/tags/')) && opts.verifyTag !== false;
-
-    if (opts.check) {
-      console.log('Checking for updates...');
-      const check = await checkForNewCommitWithStatus(au, (msg) => console.log(msg), refOverride);
-      if (check.status === 'available' && check.commit) {
-        console.log(`Update available: ${check.commit.slice(0, 8)}`);
-      } else if (check.status === 'up-to-date') {
-        console.log('No updates available.');
-      } else {
-        console.error('Update check failed. See logs above for details.');
-        process.exit(1);
-      }
-      return;
-    }
-
-    await migrateToBlueGreen((msg) => console.log(msg), {
-      allowRemoteBootstrap: true,
-      repairLiveNodeUi: false,
-    });
-    console.log('Checking for updates and applying...');
-    try {
-      const updateStatus = await performUpdateWithStatus(au, (msg) => console.log(msg), {
-        refOverride,
-        allowPrerelease: opts.allowPrerelease ? true : undefined,
-        verifyTagSignature,
-      });
-      if (updateStatus === 'updated') {
-        const pid = await readPid();
-        if (pid && isProcessRunning(pid)) {
-          console.log('Stopping daemon...');
-          try {
-            process.kill(pid, 'SIGTERM');
-          } catch (err) {
-            if (!hasErrorCode(err, 'ESRCH')) throw err;
-          }
-          for (let i = 0; i < 20; i++) {
-            await sleep(500);
-            if (!isProcessRunning(pid)) break;
-          }
-          if (isProcessRunning(pid)) {
-            console.error('Update applied but daemon is still running after SIGTERM. Stop it manually before restarting.');
-            process.exit(1);
-          }
-          console.log('Update applied. Run "dkg start" to start with the new version.');
-        } else {
-          console.log('Update applied. Start the daemon with: dkg start');
-        }
-      } else if (updateStatus === 'up-to-date') {
-        console.log('No update needed — already on latest.');
-      } else {
-        console.error('Update failed before activation. Check logs and retry.');
-        process.exit(1);
-      }
-    } catch (err) {
-      console.error(`Update failed: ${toErrorMessage(err)}`);
-      process.exit(1);
-    }
+    process.exit(1);
   });
 
 // ─── dkg rollback ────────────────────────────────────────────────────

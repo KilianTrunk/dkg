@@ -54,33 +54,32 @@ export interface AutoUpdateConfig {
   /** Optional per-step build timeout overrides for the git-based update path. */
   buildTimeoutMs?: AutoUpdateBuildTimeouts;
   /**
-   * Override how the daemon resolves "am I a standalone (npm-global) install
-   * or a git checkout?" — the question that decides whether auto-update goes
-   * through `performNpmUpdate` (npm install into a blue/green slot) or
-   * `performUpdate` (git pull + build from source).
+   * Override how the daemon resolves "am I an npm-installed node or a
+   * monorepo dev checkout?" under OT-RFC-41 §4.3 / Bundle B1d.
    *
-   *   `'auto'` (default): probe the filesystem (`repoDir() === null`).
-   *     Preserves today's behaviour. Operators who set up the daemon via
-   *     `npm install -g` get the npm path; operators who cloned the
-   *     monorepo for development get the git path.
+   *   `'npm'` (recommended; default for fresh installs from rc.12+):
+   *     Edge → `npm install -g`; Core → `npm install` into a
+   *     blue-green slot. `dkg init` writes this value explicitly
+   *     for every new node.
    *
-   *   `'npm'`: force the npm path regardless of `.git` presence. The fix for
-   *     Core nodes that were originally cloned but should now track npm
-   *     releases — beacon-01 is the canonical case (its `~/dkg-v9/.git`
-   *     directory caused the auto-update path to build from `main`'s HEAD
-   *     during the v10.0.0-rc.10 rollout, which then hit the shutdown
-   *     deadlock that left the worker a zombie). Next polling cycle wipes
-   *     the inactive slot, runs `npm install @origintrail-official/dkg@<version>`,
-   *     and swaps — no filesystem prep required.
+   *   `'monorepo'`: dev checkout — auto-update polling is suppressed
+   *     entirely. Contributors update via `git pull && pnpm install
+   *     && pnpm build` from the repo root.
    *
-   *   `'git'`: force the git path regardless of `.git` presence. Opt-in for
-   *     dev nodes that want to keep tracking a branch even after running
-   *     from a globally-installed CLI.
+   *   `'auto'` (legacy; pre-rc.12): probe the filesystem
+   *     (`repoDir() === null`). Treated as `'npm'` under rc.12+ via
+   *     `resolveStandaloneInstall()`.
+   *
+   *   `'git'` (legacy; pre-rc.12): the now-removed git-build update
+   *     path. Treated as `'monorepo'` under rc.12+ (the daemon does
+   *     not auto-update, no git pull/build). User-facing `dkg
+   *     update` from such a config refuses to run — see OT-RFC-41
+   *     §4.2 and `cli.ts dkg update`.
    *
    * Implementation: read once at boot via `resolveStandaloneInstall(source)`
    * in `daemon/state.ts`, which writes the result into the shared
-   * `daemonState.standaloneCache` memo so every later caller (status route,
-   * `dkg update` CLI subcommand, …) sees the same answer.
+   * `daemonState.standaloneCache` memo so every later caller (status
+   * route, `dkg update` CLI subcommand, …) sees the same answer.
    */
   source?: 'auto' | 'npm' | 'git' | 'monorepo';
 }

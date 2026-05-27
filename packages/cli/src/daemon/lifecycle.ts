@@ -249,16 +249,11 @@ import {
   getCurrentCliVersion,
   type NpmVersionStatus,
   checkForNpmVersionUpdate,
-  checkForNewCommit,
-  checkForNewCommitWithStatus,
   type UpdateStatus,
   acquireUpdateLock,
   releaseUpdateLock,
-  performUpdate,
-  performUpdateWithStatus,
   performNpmUpdate,
   performNpmUpdateEdge,
-  checkForUpdate,
 } from './auto-update.js';
 import { chainResetWipe } from './chain-reset-wipe.js';
 import { resetNatStatus, startNatStatusWatcher } from './nat-status.js';
@@ -1558,79 +1553,55 @@ export async function runDaemonInner(
   // omits the field (the common case after `dkg init` with default answers).
   let updateInterval: ReturnType<typeof setInterval> | null = null;
   const au = resolveAutoUpdateConfig(config, network);
-  // Honour `autoUpdate.source` override (config.ts) — explicit "npm" / "git"
-  // wins over the filesystem probe (`isStandaloneInstall()`); "auto" or omitted
-  // falls through to today's behaviour. Resolve source even when `au` is null
-  // (auto-update disabled) so local/network install-mode policy still seeds the
-  // cache for anyone else who reads `daemonState.standaloneCache` later in boot.
+  // OT-RFC-41 §4.2 / §5 PR 5: auto-update polling is npm-only.
+  // `resolveStandaloneInstall` still seeds `daemonState.standaloneCache`
+  // for `/api/status` consumers; monorepo dev daemons (standalone=false)
+  // skip the polling loop entirely — contributors update via
+  // `git pull && pnpm install && pnpm build`.
   const standalone = resolveStandaloneInstall(au?.source ?? resolveAutoUpdateSource(config, network));
-  const hasGitConfig = !!au;
 
-  if (standalone || hasGitConfig) {
+  if (standalone) {
     const checkIntervalMs = (au?.checkIntervalMinutes ?? 30) * 60_000;
     const allowPre = au?.allowPrerelease ?? true;
 
-    if (standalone) {
-      log(
-        `Auto-update (npm): ${au ? "enabled" : "disabled — version check only"} (every ${au?.checkIntervalMinutes ?? 30}min)`,
-      );
-    } else if (au) {
-      log(
-        `Auto-update enabled: ${au.repo}@${au.branch} (every ${au.checkIntervalMinutes}min)`,
-      );
-    }
+    log(
+      `Auto-update (npm): ${au ? "enabled" : "disabled — version check only"} (every ${au?.checkIntervalMinutes ?? 30}min)`,
+    );
 
     const runCheck = async () => {
-      let updateAvailable = false;
-      let targetNpmVersion = "";
-
-      if (standalone) {
-        const npmStatus = await checkForNpmVersionUpdate(log, allowPre);
-        if (npmStatus.status !== "error") {
-          daemonState.lastUpdateCheck.upToDate = npmStatus.status === "up-to-date";
-          daemonState.lastUpdateCheck.checkedAt = Date.now();
-          if (npmStatus.version)
-            daemonState.lastUpdateCheck.latestVersion = npmStatus.version;
-        }
-        if (npmStatus.status === "available" && npmStatus.version) {
-          updateAvailable = true;
-          targetNpmVersion = npmStatus.version;
-        }
-      } else if (au) {
-        const commitStatus = await checkForNewCommitWithStatus(au, log);
-        if (commitStatus.status !== "error") {
-          daemonState.lastUpdateCheck.upToDate = commitStatus.status === "up-to-date";
-          daemonState.lastUpdateCheck.checkedAt = Date.now();
-          if (commitStatus.commit)
-            daemonState.lastUpdateCheck.latestCommit = commitStatus.commit.slice(0, 8);
-        }
-        updateAvailable = commitStatus.status === "available";
+      const npmStatus = await checkForNpmVersionUpdate(log, allowPre);
+      if (npmStatus.status !== "error") {
+        daemonState.lastUpdateCheck.upToDate = npmStatus.status === "up-to-date";
+        daemonState.lastUpdateCheck.checkedAt = Date.now();
+        if (npmStatus.version)
+          daemonState.lastUpdateCheck.latestVersion = npmStatus.version;
       }
+      if (npmStatus.status !== "available" || !npmStatus.version) return;
+      if (!au) return; // version check only — no auto-apply when polling disabled
 
-      if (au && updateAvailable) {
-        daemonState.isUpdating = true;
-        let updated = false;
-        if (standalone && targetNpmVersion) {
-          // OT-RFC-41 Bundle B1b: Edge → npm install -g, Core → slot install.
-          const role = config.nodeRole ?? "edge";
-          const status = role === "edge"
-            ? await performNpmUpdateEdge(targetNpmVersion, getCurrentCliVersion(), log)
-            : await performNpmUpdate(targetNpmVersion, log);
-          updated = status === "updated";
-        } else {
-          updated = await checkForUpdate(au, log);
-        }
-        daemonState.isUpdating = false;
-        if (updated) {
-          log("Auto-update: update activated; exiting for supervised restart.");
-          await shutdown(DAEMON_EXIT_CODE_RESTART);
-          return;
-        }
+      daemonState.isUpdating = true;
+      // OT-RFC-41 Bundle B1b: Edge → npm install -g, Core → slot install.
+      const role = config.nodeRole ?? "edge";
+      const status = role === "edge"
+        ? await performNpmUpdateEdge(npmStatus.version, getCurrentCliVersion(), log)
+        : await performNpmUpdate(npmStatus.version, log);
+      const updated = status === "updated";
+      daemonState.isUpdating = false;
+      if (updated) {
+        log("Auto-update: update activated; exiting for supervised restart.");
+        await shutdown(DAEMON_EXIT_CODE_RESTART);
+        return;
       }
     };
 
     setTimeout(runCheck, 15_000);
     updateInterval = setInterval(runCheck, checkIntervalMs);
+  } else if (au?.enabled) {
+    // Monorepo dev daemon with auto-update enabled in config — log
+    // once at boot so contributors understand why polling is silent.
+    log(
+      "Auto-update: skipped — monorepo checkout detected. Use `git pull && pnpm install && pnpm build` to update.",
+    );
   }
 
   // --- Dashboard DB + Metrics ---

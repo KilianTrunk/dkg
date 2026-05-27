@@ -15,11 +15,11 @@ export default defineConfig({
     // drops new `*.unit.test.ts` files added later. The original list missed
     // `hub-resolution-cache.unit.test.ts` which had existed for several
     // sprints. Use a glob so unit coverage stays auto-discovered. The
-    // explicit `filter-error-silencer.test.ts` entry is preserved because
-    // that file is pure-logic and does not follow the `.unit.test.ts`
-    // naming convention.
+    // explicit entries below are preserved for files that are pure-logic
+    // but do not follow the `.unit.test.ts` naming convention.
     include: [
       'test/**/*.unit.test.ts',
+      'test/filter-error-console-suppressor.test.ts',
       'test/filter-error-silencer.test.ts',
     ],
     exclude: ['**/node_modules/**', '**/dist/**'],

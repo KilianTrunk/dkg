@@ -51,9 +51,18 @@ CURATOR_NODE=5
 M1_NODE=6
 CORE_NODE=1
 
-# Tune via env. Default: 20 fat triples → enough for ≥2 catchup pages.
-WRITES_COUNT="${WRITES_COUNT:-20}"
-WRITE_PAYLOAD_BYTES="${WRITE_PAYLOAD_BYTES:-4096}"
+# Tune via env. Defaults sized so M1's first catchup paginates with a real
+# mid-batch kill window. rc.12 SWM catchup is dramatically faster than
+# rc.11, so the pre-rc.12 defaults (20 × 4096 B = 80 KiB) finish in a
+# single sub-second page — the test then false-fails with "catchup too
+# fast" because the mid-batch poll never sees an in-progress state.
+#
+# 200 × 16 KiB = ~3.2 MiB. At the rc.12 catchup throughput observed on
+# the reference devnet (~1.5 MiB/s host-mode) this opens a ~2 s mid-batch
+# window — comfortably wide for the 100 ms poll loop below to catch.
+# Operators on faster boxes can keep bumping via the env vars.
+WRITES_COUNT="${WRITES_COUNT:-200}"
+WRITE_PAYLOAD_BYTES="${WRITE_PAYLOAD_BYTES:-16384}"
 
 log()  { echo "[urr] $*"; }
 warn() { echo "[urr] WARN: $*" >&2; }
@@ -77,9 +86,18 @@ api_call() {
   local port; port=$(node_port "$node")
   local token; token=$(node_token "$node")
   local -a curl_args=(-sS --max-time 240 -X "$method" -H "Authorization: Bearer $token" -H 'Content-Type: application/json')
-  [ -n "$data" ] && curl_args+=(-d "$data")
-  curl_args+=("http://127.0.0.1:${port}${path}")
-  curl "${curl_args[@]}"
+  # Stream the body through stdin (`-d @-`) instead of putting it on the
+  # argv. Pre-fix, large stress payloads (80 writes × 16 KiB ≈ 1.3 MiB
+  # JSON body) hit macOS's ARG_MAX with "Argument list too long" before
+  # curl ever ran. -d @- has no length limit beyond available memory.
+  if [ -n "$data" ]; then
+    curl_args+=(-d @-)
+    curl_args+=("http://127.0.0.1:${port}${path}")
+    printf '%s' "$data" | curl "${curl_args[@]}"
+  else
+    curl_args+=("http://127.0.0.1:${port}${path}")
+    curl "${curl_args[@]}"
+  fi
 }
 
 parse_json() {
@@ -252,13 +270,17 @@ EOF
 )" >/dev/null 2>&1 || true
 
 M1_PARTIAL=0
-for _ in $(seq 1 25); do
+# Sub-second poll — at rc.12 catchup speeds the mid-batch window can be
+# narrower than 1 s. ~200 iterations × 100 ms keeps the total budget at
+# the same ~25 s as the 1 s loop did, while raising the resolution by 10×.
+for _ in $(seq 1 200); do
   M1_PARTIAL=$(count_triples "$M1_NODE")
   M1_PARTIAL=${M1_PARTIAL:-0}
   if [ "$M1_PARTIAL" -gt 0 ] && [ "$M1_PARTIAL" -lt "$WRITES_COUNT" ] 2>/dev/null; then
     break
   fi
-  sleep 1
+  # macOS bash sleep accepts fractional seconds; gnu coreutils does too.
+  sleep 0.1
 done
 log "M1 partial catchup count: $M1_PARTIAL (target mid-batch: 0 < partial < $WRITES_COUNT)"
 if [ "$M1_PARTIAL" -le 0 ]; then

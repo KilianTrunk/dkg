@@ -1226,7 +1226,58 @@ cmd_stop() {
   stop_blazegraph
   stop_oxigraph_servers
 
+  # Belt-and-braces port sweep. Hunts down any process still bound to the
+  # ports this devnet uses — even if its pidfile is gone (covers stale
+  # processes inherited from earlier rc.X devnets that crashed before
+  # they could clean up, and supervisor/worker pairs where killing only
+  # the worker let the supervisor respawn it).
+  #
+  # Set `DEVNET_STOP_PORT_SWEEP=0` to disable when running multiple
+  # isolated devnets on the same host (different DEVNET_DIR, different
+  # port bases — sweeping would happily kill the neighbour).
+  if [ "${DEVNET_STOP_PORT_SWEEP:-1}" = "1" ]; then
+    sweep_ports_for_devnet
+  fi
+
   log "Devnet stopped."
+}
+
+# Find and SIGTERM (then SIGKILL after a grace window) any process holding
+# this devnet's known ports. Safe on macOS (lsof) and Linux (lsof). Always
+# exits 0 — best-effort, never blocks the wider stop flow.
+sweep_ports_for_devnet() {
+  local -a ports=("$HARDHAT_PORT")
+  local i
+  for i in $(seq 1 "$NUM_NODES"); do
+    ports+=("$((API_PORT_BASE + i - 1))")
+    ports+=("$((LIBP2P_PORT_BASE + i - 1))")
+  done
+
+  if ! command -v lsof >/dev/null 2>&1; then
+    log "(port-sweep skipped: lsof not on PATH)"
+    return 0
+  fi
+
+  local stragglers=""
+  for p in "${ports[@]}"; do
+    local pids
+    pids=$(lsof -nP -iTCP:"$p" -sTCP:LISTEN -t 2>/dev/null | sort -u | tr '\n' ' ')
+    [ -z "$pids" ] && continue
+    log "Port-sweep: TCP:$p still LISTEN — pids=$pids (SIGTERM)"
+    stragglers+=" $pids"
+    for pid in $pids; do kill "$pid" 2>/dev/null || true; done
+  done
+
+  # Brief grace; then SIGKILL any survivor on the same port set.
+  [ -n "$stragglers" ] || return 0
+  sleep 2
+  for p in "${ports[@]}"; do
+    local pids
+    pids=$(lsof -nP -iTCP:"$p" -sTCP:LISTEN -t 2>/dev/null | sort -u | tr '\n' ' ')
+    [ -z "$pids" ] && continue
+    log "Port-sweep: TCP:$p still held after SIGTERM — pids=$pids (SIGKILL)"
+    for pid in $pids; do kill -9 "$pid" 2>/dev/null || true; done
+  done
 }
 
 cmd_status() {

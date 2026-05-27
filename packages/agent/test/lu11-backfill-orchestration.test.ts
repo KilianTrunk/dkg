@@ -55,6 +55,7 @@ import { DKGAgent } from '../src/index.js';
 import {
   CIPHERTEXT_CHUNK_CATCHUP_WIRE_VERSION,
   encodeCiphertextChunkCatchupResponse,
+  decodeCiphertextChunkCatchupRequest,
 } from '../src/swm/ciphertext-chunk-catchup.js';
 import type { ReliableSendResult } from '../src/p2p/messenger.js';
 
@@ -144,12 +145,17 @@ type PerCallResult = ReliableSendResult;
 function stubMessengerSequence(
   internals: BackfillInternals,
   resultFor: (peerId: string, callOrdinal: number) => PerCallResult,
-): { calls: { peer: string; protocol: string }[] } {
-  const calls: { peer: string; protocol: string }[] = [];
+): { calls: { peer: string; protocol: string; payload: Uint8Array }[] } {
+  // Codex review (round 2) feedback: capture the payload bytes so
+  // happy-path tests can decode and verify the wire request fields
+  // (contextGraphId, batchId, chunkIndex). Otherwise a regression
+  // that called the right protocol with the wrong request shape
+  // would slip through.
+  const calls: { peer: string; protocol: string; payload: Uint8Array }[] = [];
   internals.messenger = {
-    sendReliable: async (peer: string, protocol: string, _payload: Uint8Array): Promise<PerCallResult> => {
+    sendReliable: async (peer: string, protocol: string, payload: Uint8Array): Promise<PerCallResult> => {
       const ordinal = calls.length;
-      calls.push({ peer, protocol });
+      calls.push({ peer, protocol, payload });
       return resultFor(peer, ordinal);
     },
   };
@@ -181,8 +187,19 @@ describe('DKGAgent.buildCiphertextChunkBackfill — prover-side backfill orchest
   let agent: DKGAgent | null = null;
   afterEach(async () => {
     if (agent) {
-      await agent.stop().catch(() => undefined);
+      const ref = agent;
+      // Null FIRST so the next test gets a fresh slot even if
+      // teardown throws.
       agent = null;
+      // Codex review (round 2) feedback: do NOT swallow
+      // `agent.stop()` errors. A teardown regression
+      // (e.g. someone reintroducing the `node` replacement bug
+      // we fixed in round 1) would otherwise leak timers/libp2p
+      // state into later tests AND stay invisible because the
+      // failing afterEach was the only place that would have
+      // surfaced it. Re-raise so teardown bugs fail the test
+      // locally, not in a downstream suite.
+      await ref.stop();
     }
   });
 
@@ -275,6 +292,23 @@ describe('DKGAgent.buildCiphertextChunkBackfill — prover-side backfill orchest
     expect(result).toEqual({ fetched: 3, failures: 0 });
     expect(calls).toHaveLength(3);
     expect(calls.every((c) => c.peer === peerA)).toBe(true);
+
+    // Codex review (round 2) feedback: the stub previously
+    // captured `protocol` but never validated it, and ignored
+    // the payload entirely. A regression that called the wrong
+    // protocol id or sent the wrong (contextGraphId, batchId,
+    // chunkIndex) wire fields would slip through. Validate all
+    // three in the happy-path case where we know the expected
+    // values exactly.
+    expect(calls.every((c) => c.protocol === '/dkg/10.0.2/get-ciphertext-chunk')).toBe(true);
+    const decoded = calls.map((c) => decodeCiphertextChunkCatchupRequest(c.payload));
+    // Local CG id is preserved on the wire (the responder
+    // canonicalises it on its end).
+    expect(decoded.every((d) => d.contextGraphId === localCgId)).toBe(true);
+    expect(decoded.every((d) => Buffer.from(d.batchId).equals(Buffer.from(batchId)))).toBe(true);
+    // Chunk indexes match the missingIndexes we asked for, in
+    // order (per-chunk loop in `buildCiphertextChunkBackfill`).
+    expect(decoded.map((d) => d.chunkIndex)).toEqual([0, 1, 2]);
   });
 
   it('partial success: 2-of-3 chunks land, third has no responder → fetched=2, failures=1, no aggregated reason (mixed result has no single cause)', async () => {

@@ -77,10 +77,39 @@ export interface PromptStoreBackendResult {
    * DKG-owned namespaces) and scoped DELETE (mandatory on
    * shared / V6 / V8 instances).
    */
-  storeBlock: {
-    backend: 'blazegraph' | 'sparql-http';
-    options: { url: string; managedByDkg: boolean };
-  } | null;
+  storeBlock: ExternalStoreBlock | null;
+}
+
+export type ExternalStoreBlock =
+  | {
+      backend: 'blazegraph';
+      options: { url: string; managedByDkg: boolean };
+    }
+  | {
+      backend: 'sparql-http';
+      options: {
+        queryEndpoint: string;
+        updateEndpoint: string;
+        managedByDkg: boolean;
+      };
+    };
+
+function externalStoreBlock(
+  backend: 'blazegraph' | 'sparql-http',
+  url: string,
+  managedByDkg: boolean,
+): ExternalStoreBlock {
+  if (backend === 'blazegraph') {
+    return { backend, options: { url, managedByDkg } };
+  }
+  return {
+    backend,
+    options: {
+      queryEndpoint: url,
+      updateEndpoint: url,
+      managedByDkg,
+    },
+  };
 }
 
 export async function promptStoreBackend(
@@ -181,10 +210,7 @@ export async function promptStoreBackend(
     if (health.ok) {
       log(`  Store endpoint reachable: ${backend} ${url}`);
       return {
-        storeBlock: {
-          backend,
-          options: { url, managedByDkg: false },
-        },
+        storeBlock: externalStoreBlock(backend, url, false),
       };
     }
 
@@ -283,10 +309,7 @@ export async function applyStoreFlagsToConfig(
   const existing = await load();
   const next: DkgConfig = {
     ...existing,
-    store: {
-      backend,
-      options: { url, managedByDkg: false },
-    },
+    store: externalStoreBlock(backend, url, false),
   };
   await save(next);
   log(`  Store configured: ${backend} (${url}) — verified reachable.`);

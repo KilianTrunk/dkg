@@ -928,6 +928,26 @@ export async function runDaemonInner(
       `Chain-state auto-wipe complete: ${wipeResult.removedFiles.length} file(s) removed ` +
       `(prev marker: ${wipeResult.prevMarker ?? '<none>'}, now: ${network?.chainResetMarker})`,
     );
+    // A DKG-managed external wipe uses DROP ALL, which also removes the
+    // namespace ownership tag verified above. Re-tag before continuing so
+    // this daemon never runs against an unclaimed namespace.
+    if (isExternalBackend(config.store?.backend)) {
+      const identity = await checkOrSetStoreIdentity({
+        storeConfig: config.store,
+        nodeName: config.name,
+      });
+      if (!identity.ok) {
+        if (identity.action === 'mismatch') {
+          log(formatIdentityTagMismatch(identity));
+        } else {
+          log(`[STORE-IDENTITY] failed to re-tag namespace after wipe: ${identity.error}`);
+        }
+        process.exit(1);
+      }
+      if (identity.action === 'tagged') {
+        log(`Re-tagged triple-store namespace for node "${identity.nodeName}" after chain-state wipe.`);
+      }
+    }
   }
 
   // Load admin + operational wallets from ~/.dkg/wallets.json (auto-generated on first run)

@@ -25,6 +25,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   provisionBlazegraphDocker,
+  normaliseBlazegraphNamespace,
   isDockerAvailable,
   BLAZEGRAPH_NAMESPACE_XML_TEMPLATE,
   type DockerRunner,
@@ -361,15 +362,15 @@ describe('provisionBlazegraphDocker', () => {
         { when: (a) => a[0] === 'run', respond: () => ({ stdout: 'id', stderr: '', exitCode: 0 }) },
       ],
     });
-    const { fn } = mockFetch((url) => {
+    const { fn, calls: httpCalls } = mockFetch((url) => {
       if (url.endsWith('/bigdata/status')) return new Response('ok', { status: 200 });
       if (url.endsWith('/bigdata/namespace')) return new Response(null, { status: 200 });
       return new Response(null, { status: 200 });
     });
-    await provisionBlazegraphDocker({
-      // Embedded spaces + apostrophes + uppercase get slugified down to
-      // characters Docker accepts.
-      namespace: "Bob's Node",
+    const result = await provisionBlazegraphDocker({
+      // Embedded spaces + apostrophes + uppercase and path/query-sensitive
+      // characters get slugified down once before Docker, XML, and URL use.
+      namespace: "Bob's Node / Main & Co",
       docker: runner,
       fetch: fn,
       isPortFree: async () => true,
@@ -378,6 +379,21 @@ describe('provisionBlazegraphDocker', () => {
     const inspectCall = calls.find((c) => c[0] === 'inspect');
     expect(inspectCall?.[1]).toMatch(/^dkg-blazegraph-/);
     expect(inspectCall?.[1]).not.toMatch(/['\s]/);
+    expect(result.url).toBe(
+      'http://127.0.0.1:9999/bigdata/namespace/bob-s-node-main-co/sparql',
+    );
+    const createCall = httpCalls.find((c) => c.url.endsWith('/bigdata/namespace'));
+    expect(String(createCall?.init?.body)).toContain(
+      '<entry key="com.bigdata.rdf.sail.namespace">bob-s-node-main-co</entry>',
+    );
+  });
+
+  it('normalises operator node names into safe Blazegraph namespace names', () => {
+    expect(normaliseBlazegraphNamespace("Bob's Node / Main & Co")).toBe(
+      'bob-s-node-main-co',
+    );
+    expect(normaliseBlazegraphNamespace('dkg.node_01')).toBe('dkg.node_01');
+    expect(normaliseBlazegraphNamespace('   ')).toBe('dkg-node');
   });
 });
 

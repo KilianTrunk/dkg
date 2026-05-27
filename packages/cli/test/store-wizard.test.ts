@@ -109,7 +109,13 @@ describe('promptStoreBackend', () => {
       fetch: fn,
       log: (m) => logs.push(m),
     });
-    expect(result.storeBlock?.options.url).toBe('http://blaze.test/sparql');
+    expect(result.storeBlock).toEqual({
+      backend: 'blazegraph',
+      options: {
+        url: 'http://blaze.test/sparql',
+        managedByDkg: false,
+      },
+    });
     expect(logs.some((l) => l.includes('STORE-HEALTH'))).toBe(true);
   });
 
@@ -161,7 +167,13 @@ describe('promptStoreBackend', () => {
       fetch: fn,
       log: (m) => logs.push(m),
     });
-    expect(result.storeBlock?.options.url).toBe('http://blaze.test/sparql');
+    expect(result.storeBlock).toEqual({
+      backend: 'blazegraph',
+      options: {
+        url: 'http://blaze.test/sparql',
+        managedByDkg: false,
+      },
+    });
     expect(logs.some((l) => l.includes('Docker not detected'))).toBe(true);
   });
 
@@ -251,7 +263,13 @@ describe('promptStoreBackend', () => {
       fetch: fn,
       log: (m) => logs.push(m),
     });
-    expect(result.storeBlock?.options.url).toBe('http://blaze.test/sparql');
+    expect(result.storeBlock).toEqual({
+      backend: 'blazegraph',
+      options: {
+        url: 'http://blaze.test/sparql',
+        managedByDkg: false,
+      },
+    });
     expect(logs.some((l) => l.includes('Docker provisioning failed'))).toBe(true);
   });
 
@@ -297,7 +315,13 @@ describe('promptStoreBackend', () => {
       fetch: fn,
       log: () => {},
     });
-    expect(result.storeBlock?.options.url).toBe('http://prefilled.test/sparql');
+    expect(result.storeBlock).toEqual({
+      backend: 'blazegraph',
+      options: {
+        url: 'http://prefilled.test/sparql',
+        managedByDkg: false,
+      },
+    });
     expect(calls[0].url).toBe('http://prefilled.test/sparql');
   });
 
@@ -314,7 +338,13 @@ describe('promptStoreBackend', () => {
       fetch: fn,
       log: () => {},
     });
-    expect(result.storeBlock?.options.url).toBe('http://existing.test/sparql');
+    expect(result.storeBlock).toEqual({
+      backend: 'blazegraph',
+      options: {
+        url: 'http://existing.test/sparql',
+        managedByDkg: false,
+      },
+    });
   });
 
   it('supports sparql-http with its own queryEndpoint URL', async () => {
@@ -326,8 +356,14 @@ describe('promptStoreBackend', () => {
       fetch: fn,
       log: () => {},
     });
-    expect(result.storeBlock?.backend).toBe('sparql-http');
-    expect(result.storeBlock?.options.url).toBe('http://server.test/query');
+    expect(result.storeBlock).toEqual({
+      backend: 'sparql-http',
+      options: {
+        queryEndpoint: 'http://server.test/query',
+        updateEndpoint: 'http://server.test/query',
+        managedByDkg: false,
+      },
+    });
     expect(calls[0].url).toBe('http://server.test/query');
   });
 });
@@ -468,7 +504,14 @@ describe('applyStoreFlagsToConfig', () => {
       fetch: fn,
       log: () => {},
     });
-    expect(store.saved[0].store?.backend).toBe('sparql-http');
+    expect(store.saved[0].store).toEqual({
+      backend: 'sparql-http',
+      options: {
+        queryEndpoint: 'http://server.test/query',
+        updateEndpoint: 'http://server.test/query',
+        managedByDkg: false,
+      },
+    });
     expect(calls[0].url).toBe('http://server.test/query');
   });
 });

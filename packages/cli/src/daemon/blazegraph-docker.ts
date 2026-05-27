@@ -195,6 +195,20 @@ function sanitiseContainerName(namespace: string): string {
   return `dkg-blazegraph-${slug || 'node'}`;
 }
 
+export function normaliseBlazegraphNamespace(namespace: string): string {
+  const slug = namespace
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-zA-Z0-9_.-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .toLowerCase();
+  return slug || 'dkg-node';
+}
+
+function sparqlUrlForNamespace(baseUrl: string, namespace: string): string {
+  return `${baseUrl}/bigdata/namespace/${encodeURIComponent(namespace)}/sparql`;
+}
+
 async function findFreePort(
   start: number,
   range: number,
@@ -335,7 +349,11 @@ export async function provisionBlazegraphDocker(
   const pollIntervalMs = opts.pollIntervalMs ?? 1000;
   const pollTimeoutMs = opts.pollTimeoutMs ?? 30_000;
   const portRange = opts.portRange ?? DEFAULT_HOST_PORT_RANGE;
-  const containerName = opts.containerName ?? sanitiseContainerName(opts.namespace);
+  const namespace = normaliseBlazegraphNamespace(opts.namespace);
+  if (namespace !== opts.namespace) {
+    log(`  Normalized Blazegraph namespace "${opts.namespace}" → "${namespace}".`);
+  }
+  const containerName = opts.containerName ?? sanitiseContainerName(namespace);
 
   // 1. Pre-flight: is docker installed?
   const versionResult = await docker.run(['--version'], { timeoutMs: 5000 });
@@ -354,14 +372,14 @@ export async function provisionBlazegraphDocker(
     const url = `http://127.0.0.1:${port}`;
     log(`  Reusing running container "${containerName}" on port ${port}.`);
     await waitForBlazegraphReady({ url, fetch, intervalMs: pollIntervalMs, timeoutMs: pollTimeoutMs, log });
-    const created = !(await namespaceExists({ url, namespace: opts.namespace, fetch }));
+    const created = !(await namespaceExists({ url, namespace, fetch }));
     if (created) {
-      await createNamespace({ url, namespace: opts.namespace, fetch, log });
+      await createNamespace({ url, namespace, fetch, log });
     } else {
-      log(`  Namespace "${opts.namespace}" already exists.`);
+      log(`  Namespace "${namespace}" already exists.`);
     }
     return {
-      url: `${url}/bigdata/namespace/${opts.namespace}/sparql`,
+      url: sparqlUrlForNamespace(url, namespace),
       port,
       containerName,
       managedByDkg: true,
@@ -385,14 +403,14 @@ export async function provisionBlazegraphDocker(
         ?? DEFAULT_HOST_PORT_START;
       const url = `http://127.0.0.1:${port}`;
       await waitForBlazegraphReady({ url, fetch, intervalMs: pollIntervalMs, timeoutMs: pollTimeoutMs, log });
-      const created = !(await namespaceExists({ url, namespace: opts.namespace, fetch }));
+      const created = !(await namespaceExists({ url, namespace, fetch }));
       if (created) {
-        await createNamespace({ url, namespace: opts.namespace, fetch, log });
+        await createNamespace({ url, namespace, fetch, log });
       } else {
-        log(`  Namespace "${opts.namespace}" already exists.`);
+        log(`  Namespace "${namespace}" already exists.`);
       }
       return {
-        url: `${url}/bigdata/namespace/${opts.namespace}/sparql`,
+        url: sparqlUrlForNamespace(url, namespace),
         port,
         containerName,
         managedByDkg: true,
@@ -423,10 +441,10 @@ export async function provisionBlazegraphDocker(
 
   const url = `http://127.0.0.1:${chosenPort}`;
   await waitForBlazegraphReady({ url, fetch, intervalMs: pollIntervalMs, timeoutMs: pollTimeoutMs, log });
-  await createNamespace({ url, namespace: opts.namespace, fetch, log });
+  await createNamespace({ url, namespace, fetch, log });
 
   return {
-    url: `${url}/bigdata/namespace/${opts.namespace}/sparql`,
+    url: sparqlUrlForNamespace(url, namespace),
     port: chosenPort,
     containerName,
     managedByDkg: true,

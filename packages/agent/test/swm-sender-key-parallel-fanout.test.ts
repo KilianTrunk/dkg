@@ -322,4 +322,147 @@ describe('createAndDistributeSwmSenderKeyEpoch: parallel fanout latency', () => 
     // failure list (proves the per-key reasons are forwarded).
     expect(thrown!.message).toContain('simulated per-recipient fatal');
   });
+
+  it('per-AGENT (not per-key) aggregation: an agent with 2 keys where 1 accepts and 1 rejects is NOT fatal', async () => {
+    // Codex review feedback on #740: the 1-of-N test above uses one
+    // key per agent, so it does not actually exercise the
+    // "fatal only when EVERY key for an agent fails" aggregation
+    // rule documented at `dkg-agent.ts:5998-6042`. A regression
+    // that started aggregating by key (instead of by agent) would
+    // pass that test silently — any one key rejection would still
+    // throw, even if other keys for the SAME agent succeeded.
+    //
+    // To pin the per-agent semantics, build recipientB with TWO
+    // keys (same `agentAddress` + `peerId`, distinct
+    // `recipientKeyId` + `publicKeyBytes`) and have the messenger
+    // accept one and reject the other. The expected production
+    // behavior: B is logged as a partial-delivery warning but NOT
+    // added to `fatalAgents`, so the fanout call resolves
+    // successfully overall. recipientA with a single all-fail key
+    // is the actual fatal — the only one cited in the throw.
+    const boot = await bootAgent();
+    agent = boot.agent;
+    const internals = boot.internals;
+
+    // Build recipientB with two keys for the SAME agent.
+    const wallet = ethers.Wallet.createRandom();
+    const agentAddress = wallet.address;
+    const recipientId = `did:dkg:agent:${agentAddress.toLowerCase()}`;
+    const peerId = `12D3KooWFakeTestPeer${ethers.id(agentAddress).slice(2, 18)}`;
+    const keyAId = `${recipientId}#x25519-keyA-${ethers.id(`${agentAddress}|A`).slice(2, 10)}`;
+    const keyBId = `${recipientId}#x25519-keyB-${ethers.id(`${agentAddress}|B`).slice(2, 10)}`;
+    const keyA = generateWorkspaceRecipientEncryptionKey(recipientId, keyAId);
+    const keyB = generateWorkspaceRecipientEncryptionKey(recipientId, keyBId);
+    const recipientB_keyA: FakeRecipient = {
+      agentAddress,
+      peerId,
+      recipientKeyId: keyAId,
+      recipientId,
+      purpose: WORKSPACE_RECIPIENT_ENCRYPTION_KEY_PURPOSE,
+      encryptionKeyAlgorithm: WORKSPACE_AGENT_ENCRYPTION_KEY_ALGORITHM_X25519,
+      publicKeyBytes: keyA.publicKeyBytes!,
+    };
+    const recipientB_keyB: FakeRecipient = {
+      agentAddress,
+      peerId,
+      recipientKeyId: keyBId,
+      recipientId,
+      purpose: WORKSPACE_RECIPIENT_ENCRYPTION_KEY_PURPOSE,
+      encryptionKeyAlgorithm: WORKSPACE_AGENT_ENCRYPTION_KEY_ALGORITHM_X25519,
+      publicKeyBytes: keyB.publicKeyBytes!,
+    };
+    // A separate agent whose only key always fails — the genuine
+    // fatal, used as the control to keep the throw observable.
+    const recipientFatal = makeFakeRecipient();
+    // And one fully-successful agent to keep the all-accept path
+    // active in this scenario.
+    const recipientHappy = makeFakeRecipient();
+
+    // Messenger discrimination:
+    //  - recipientFatal: always reject (genuine fatal)
+    //  - recipientB peerId: reject the FIRST call (key A), accept
+    //    the SECOND (key B). Both calls are to the same peerId so
+    //    we count per-peer ordinals.
+    //  - everyone else: accept.
+    const callsByPeer = new Map<string, number>();
+    installStubMessenger(internals, async (sendPeerId): Promise<ReliableSendResult> => {
+      const acceptedEnvelope = encodeSwmSenderKeyPackageAck({
+        version: SWM_SENDER_KEY_PACKAGE_VERSION,
+        type: SWM_SENDER_KEY_PACKAGE_ACK_TYPE,
+        accepted: true,
+      });
+      const rejectedEnvelope = encodeSwmSenderKeyPackageAck({
+        version: SWM_SENDER_KEY_PACKAGE_VERSION,
+        type: SWM_SENDER_KEY_PACKAGE_ACK_TYPE,
+        accepted: false,
+        reason: 'simulated key-level rejection',
+      });
+      const seenSoFar = callsByPeer.get(sendPeerId) ?? 0;
+      callsByPeer.set(sendPeerId, seenSoFar + 1);
+
+      if (sendPeerId === recipientFatal.peerId) {
+        return {
+          delivered: true,
+          response: rejectedEnvelope,
+          attempts: 1,
+          messageId: `m-fatal-${sendPeerId.slice(-6)}`,
+        };
+      }
+      if (sendPeerId === peerId) {
+        // recipientB's peer: reject only the first call (key A).
+        return {
+          delivered: true,
+          response: seenSoFar === 0 ? rejectedEnvelope : acceptedEnvelope,
+          attempts: 1,
+          messageId: `m-mixed-${seenSoFar}-${sendPeerId.slice(-6)}`,
+        };
+      }
+      return {
+        delivered: true,
+        response: acceptedEnvelope,
+        attempts: 1,
+        messageId: `m-happy-${sendPeerId.slice(-6)}`,
+      };
+    });
+
+    const sender = agentFromPrivateKey(
+      ethers.Wallet.createRandom().privateKey,
+      'sender',
+    ) as AgentKeyRecord & { privateKey: string };
+
+    let thrown: Error | null = null;
+    try {
+      await internals.createAndDistributeSwmSenderKeyEpoch({
+        contextGraphId: 'test-cg/per-agent-mixed',
+        sender,
+        // Order matters for the per-peer ordinal discrimination:
+        // B_keyA is sent BEFORE B_keyB, so the messenger's "first
+        // call to recipientB's peerId" reliably maps to keyA.
+        recipients: [recipientHappy, recipientB_keyA, recipientB_keyB, recipientFatal],
+        membershipHash: 'sha256:per-agent-mixed',
+        ctx: { operationId: 'test-op', operationName: 'share' },
+      });
+    } catch (err) {
+      thrown = err as Error;
+    }
+
+    // We expect a throw — recipientFatal is the only ALL-fail agent.
+    expect(thrown).not.toBeNull();
+
+    // Pin per-AGENT semantics: exactly 1 fatal agent (not 2). A
+    // regression that counted per-key would surface "2 agent(s)"
+    // because recipientB had a key-level rejection too.
+    expect(thrown!.message).toMatch(/rejected by 1 agent\(s\)/);
+
+    // The throw must cite recipientFatal but NOT recipientB —
+    // recipientB had partial success and is intentionally not
+    // listed as fatal under the per-agent rule.
+    expect(thrown!.message.toLowerCase()).toContain(recipientFatal.agentAddress.toLowerCase());
+    expect(thrown!.message.toLowerCase()).not.toContain(agentAddress.toLowerCase());
+    expect(thrown!.message.toLowerCase()).not.toContain(recipientHappy.agentAddress.toLowerCase());
+
+    // Sanity: recipientB's peerId was called exactly twice and the
+    // per-peer discrimination wired the rejection to the FIRST call.
+    expect(callsByPeer.get(peerId)).toBe(2);
+  });
 });

@@ -130,18 +130,41 @@ describe('DKGAgent.publishProfile — tail-chain mutex serialization (PR #700 ro
       return { ok: true, invocation: myInvocation };
     } as PublishProfileInternals['publishProfileImpl'];
 
-    const first = agent.publishProfile();
-    const second = agent.publishProfile();
-    const third = agent.publishProfile();
+    // Codex review feedback: collecting the three promises with
+    // `Promise.allSettled` attaches a handler to each one BEFORE
+    // awaiting. Without it, the middle promise can reject between
+    // the call site at line `agent.publishProfile()` and the
+    // subsequent `await expect(...).rejects.toThrow(...)` call,
+    // surfacing as an unhandled rejection under Vitest/Node and
+    // making the test flaky on busy CI runners.
+    const settled = await Promise.allSettled([
+      agent.publishProfile(),
+      agent.publishProfile(),
+      agent.publishProfile(),
+    ]);
 
-    await expect(first).resolves.toEqual({ ok: true, invocation: 0 });
-    await expect(second).rejects.toThrow('synthetic failure to test error isolation');
+    expect(settled[0].status).toBe('fulfilled');
+    expect((settled[0] as PromiseFulfilledResult<unknown>).value).toEqual({
+      ok: true,
+      invocation: 0,
+    });
+
+    expect(settled[1].status).toBe('rejected');
+    expect((settled[1] as PromiseRejectedResult).reason).toBeInstanceOf(Error);
+    expect(((settled[1] as PromiseRejectedResult).reason as Error).message).toMatch(
+      /synthetic failure to test error isolation/,
+    );
+
     // The crucial assertion: the third call must still run even
     // though the second tail rejected. The `.catch()` in
     // `publishProfile()` swallows the prior error before chaining.
-    await expect(third).resolves.toEqual({ ok: true, invocation: 2 });
+    expect(settled[2].status).toBe('fulfilled');
+    expect((settled[2] as PromiseFulfilledResult<unknown>).value).toEqual({
+      ok: true,
+      invocation: 2,
+    });
 
-    // And: the next *fresh* call (after the bad one settled) also
+    // And: the next *fresh* call (after the bad ones settled) also
     // succeeds — proves the tail is healthy long-term.
     await expect(agent.publishProfile()).resolves.toEqual({ ok: true, invocation: 3 });
   });

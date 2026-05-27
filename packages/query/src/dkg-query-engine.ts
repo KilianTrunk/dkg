@@ -563,6 +563,7 @@ function constrainGraphVariablesToAllowedSet(sparql: string, allowedGraphs: stri
       'GRAPH variables cannot be constrained because the WHERE block could not be located',
     );
   }
+  assertGraphVariablesAreTopLevel(sparql, braceStart);
 
   const values = allowedGraphs
     .map((g) => `<${assertSafeIri(g)}>`)
@@ -572,6 +573,60 @@ function constrainGraphVariablesToAllowedSet(sparql: string, allowedGraphs: stri
     .join(' ');
 
   return `${sparql.slice(0, braceStart + 1)} ${constraints} ${sparql.slice(braceStart + 1)}`;
+}
+
+function assertGraphVariablesAreTopLevel(sparql: string, braceStart: number): void {
+  const braceEnd = findMatchingCloseBrace(sparql, braceStart);
+  if (braceEnd === -1) {
+    throw new ScopedQueryViolationError(
+      'GRAPH variables cannot be constrained because the WHERE block could not be located',
+    );
+  }
+
+  let depth = 0;
+  let i = braceStart + 1;
+
+  while (i < braceEnd) {
+    const ch = sparql[i];
+    if (ch === '#') {
+      while (i < braceEnd && sparql[i] !== '\n') i++;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      i = skipSparqlStringLiteral(sparql, i);
+      continue;
+    }
+    if (ch === '<') {
+      const iriEnd = skipSparqlIriRef(sparql, i);
+      i = iriEnd && iriEnd <= braceEnd ? iriEnd : i + 1;
+      continue;
+    }
+    if (ch === '{') {
+      depth++;
+      i++;
+      continue;
+    }
+    if (ch === '}') {
+      depth = Math.max(0, depth - 1);
+      i++;
+      continue;
+    }
+    if (isKeywordStart(sparql, i)) {
+      let j = i + 1;
+      while (j < braceEnd && isWordContinuation(sparql[j])) j++;
+      if (isSparqlKeyword(sparql, i, j, 'GRAPH')) {
+        const operandStart = skipSparqlSpaceAndLineComments(sparql, j);
+        if (operandStart < braceEnd && readSparqlVariable(sparql, operandStart) && depth !== 0) {
+          throw new ScopedQueryViolationError(
+            'GRAPH variables must appear at the top level of scoped local queries',
+          );
+        }
+      }
+      i = j;
+      continue;
+    }
+    i++;
+  }
 }
 
 function hasNestedSelectWithGraphVariable(sparql: string): boolean {

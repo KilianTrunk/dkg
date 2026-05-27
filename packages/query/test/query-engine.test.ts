@@ -498,6 +498,20 @@ describe('DKGQueryEngine', () => {
       ),
     ).rejects.toThrow(/Scoped query violation: GRAPH variables inside nested SELECT subqueries/i);
   });
+
+  it('rejects optional GRAPH-variable patterns instead of changing OPTIONAL semantics', async () => {
+    await expect(
+      engine.query(
+        `SELECT ?name ?g ?nickname WHERE {
+          ?s <http://schema.org/name> ?name
+          OPTIONAL {
+            GRAPH ?g { ?s <http://schema.org/alternateName> ?nickname }
+          }
+        }`,
+        { contextGraphId: CONTEXT_GRAPH },
+      ),
+    ).rejects.toThrow(/Scoped query violation: GRAPH variables must appear at the top level/i);
+  });
 });
 
 describe('validateReadOnlySparql', () => {

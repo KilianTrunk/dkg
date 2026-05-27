@@ -19,17 +19,35 @@ import {
 const DKG_NS = 'http://dkg.io/ontology/';
 import { ethers } from 'ethers';
 
+/**
+ * Resolves a local context-graph id (the topic/CG name used in gossip) to
+ * its on-chain numeric id. Returns `null`/`undefined` for CGs that aren't
+ * registered on-chain. Used as a fallback when a peer-finalization gossip
+ * envelope omits `targetContextGraphId` (e.g. a pre-cd68fa689 publisher
+ * still in the mesh).
+ */
+export type ResolveContextGraphOnChainId = (
+  contextGraphId: string,
+) => Promise<string | null | undefined>;
+
 export class FinalizationHandler {
   private readonly store: TripleStore;
   private readonly chain: ChainAdapter | undefined;
   private readonly eventBus: EventBus | undefined;
+  private readonly resolveContextGraphOnChainId: ResolveContextGraphOnChainId | undefined;
   private readonly log = new Logger('FinalizationHandler');
   private readonly processedUals = new Set<string>();
 
-  constructor(store: TripleStore, chain: ChainAdapter | undefined, eventBus?: EventBus) {
+  constructor(
+    store: TripleStore,
+    chain: ChainAdapter | undefined,
+    eventBus?: EventBus,
+    resolveContextGraphOnChainId?: ResolveContextGraphOnChainId,
+  ) {
     this.store = store;
     this.chain = chain;
     this.eventBus = eventBus;
+    this.resolveContextGraphOnChainId = resolveContextGraphOnChainId;
   }
 
   async handleFinalizationMessage(data: Uint8Array, contextGraphId: string): Promise<void> {
@@ -61,7 +79,29 @@ export class FinalizationHandler {
       const startKAId = protoToBigInt(msg.startKAId);
       const endKAId = protoToBigInt(msg.endKAId);
 
-      const ctxGraphId = msg.targetContextGraphId || undefined;
+      // The publisher's `cd68fa689` fix threads the resolved on-chain CG id
+      // into `targetContextGraphId` so receivers route SWM promotion into
+      // the per-cgId `<cgName>/context/<cgId>/_meta` graph that the RS
+      // prover reads from. Pre-fix publishers (or any publisher whose
+      // `getContextGraphOnChainId` lookup returns null at gossip time) emit
+      // `targetContextGraphId: undefined`, which used to silently downgrade
+      // the receiver to legacy `<cgName>/_meta` promotion — leaving the
+      // prover stuck on `kc-not-synced` until every publisher in the mesh
+      // ships the fix. As a belt-and-braces for rolling upgrades we resolve
+      // the id locally when the wire is empty; resolver failures or
+      // not-on-chain CGs fall back to legacy behavior unchanged.
+      let ctxGraphId = msg.targetContextGraphId || undefined;
+      if (!ctxGraphId && this.resolveContextGraphOnChainId) {
+        try {
+          const resolved = await this.resolveContextGraphOnChainId(contextGraphId);
+          if (resolved !== null && resolved !== undefined && String(resolved).length > 0) {
+            ctxGraphId = String(resolved);
+            this.log.info(ctx, `Finalization: gossip omitted targetContextGraphId; resolved locally to ${ctxGraphId} (defensive lookup)`);
+          }
+        } catch (err) {
+          this.log.warn(ctx, `Finalization: defensive on-chain CG id lookup failed for ${contextGraphId}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
 
       // Validate sub-graph name from gossip — reject invalid names entirely
       let subGraphName: string | undefined;

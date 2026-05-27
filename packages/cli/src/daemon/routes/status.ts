@@ -957,6 +957,170 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
     return jsonResponse(res, 200, status);
   }
 
+  // POST /api/random-sampling/backfill-percgid-meta
+  //
+  // One-shot operator tool to rescue KCs that landed on a receiver core
+  // BEFORE the cd68fa689 publisher fix (or before the receiver shipped
+  // the defensive `ctxGraphId` lookup). Such KCs have their per-KC
+  // metadata sitting at the canonical `<cgName>/_meta` URI, but the RS
+  // prover's `extractV10KCFromStore` reads the per-cgId
+  // `<cgName>/context/<cgId>/_meta` graph and so sees nothing — every
+  // prover tick returns `kc-not-synced`.
+  //
+  // For each subscribed CG that has an on-chain id, we copy the
+  // per-KC subset of `<cgName>/_meta` (subjects with a `dkg:batchId`
+  // triple, plus the KA UALs they reference via `dkg:partOf`, plus the
+  // publication URIs referenced via `dkg:authoredBy`) into
+  // `<cgName>/context/<cgId>/_meta`. Mirrors the publisher's own
+  // promotion in `dkg-publisher.ts:1407-1422` so the prover sees the
+  // exact same shape it would have seen on a fresh publish.
+  //
+  // Body (all fields optional):
+  //   {
+  //     "contextGraphIds": ["foo", "bar"], // restrict to specific CG names; omit/empty for all subscribed
+  //     "dryRun": true                     // probe-only: don't write, just report what would happen
+  //   }
+  //
+  // Idempotent. Cores that already have a populated per-cgId meta graph
+  // are skipped with `status: "already-populated"`.
+  if (req.method === 'POST' && path === '/api/random-sampling/backfill-percgid-meta') {
+    const body = await readBody(req, SMALL_BODY_BYTES);
+    let parsed: { contextGraphIds?: unknown; dryRun?: unknown };
+    try {
+      parsed = body.trim() ? JSON.parse(body) : {};
+    } catch {
+      return jsonResponse(res, 400, { error: 'Invalid JSON body' });
+    }
+    const requestedIds = Array.isArray(parsed.contextGraphIds)
+      ? (parsed.contextGraphIds as unknown[]).filter((x): x is string => typeof x === 'string' && x.length > 0)
+      : [];
+    const dryRun = parsed.dryRun === true;
+
+    type CgReport = {
+      contextGraphId: string;
+      onChainId?: string;
+      status: 'backfilled' | 'already-populated' | 'no-source-meta' | 'not-on-chain' | 'failed';
+      copiedTriples?: number;
+      sourceTripleCount?: number;
+      preExistingTargetTripleCount?: number;
+      error?: string;
+    };
+
+    const subscribed = agent.getSubscribedContextGraphs();
+    const cgEntries: Array<[string, string]> = [];
+    for (const [cgName, sub] of subscribed) {
+      if (requestedIds.length > 0 && !requestedIds.includes(cgName)) continue;
+      if (!sub.onChainId) {
+        cgEntries.push([cgName, '']);
+        continue;
+      }
+      cgEntries.push([cgName, String(sub.onChainId)]);
+    }
+
+    const reports: CgReport[] = [];
+    for (const [cgName, onChainId] of cgEntries) {
+      if (!onChainId) {
+        reports.push({ contextGraphId: cgName, status: 'not-on-chain' });
+        continue;
+      }
+      const sourceMeta = `did:dkg:context-graph:${cgName}/_meta`;
+      const targetMeta = contextGraphMetaUri(cgName, onChainId);
+      try {
+        const preCount = await agent.store.query(
+          `SELECT (COUNT(*) AS ?n) WHERE { GRAPH <${targetMeta}> { ?s ?p ?o } }`,
+        );
+        const preTriples = preCount.type === 'bindings'
+          ? Number((preCount.bindings[0]?.['n'] as string ?? '"0"').replace(/^"|".*$/g, ''))
+          : 0;
+        if (preTriples > 0) {
+          reports.push({
+            contextGraphId: cgName,
+            onChainId,
+            status: 'already-populated',
+            preExistingTargetTripleCount: preTriples,
+          });
+          continue;
+        }
+
+        // CONSTRUCT the per-KC subset of source meta — three disjoint
+        // patterns matching the publisher's own promotion filter:
+        //   1. KC UAL subjects (have `dkg:batchId`).
+        //   2. KA UAL subjects (have `dkg:partOf <KC>` where KC has `dkg:batchId`).
+        //   3. Publication URIs referenced from a KC via `dkg:authoredBy`.
+        // SPARQL union ⇒ each ?s ?p ?o is duplicated per matching
+        // arm; store.insert is set-based so duplicates collapse.
+        const constructResult = await agent.store.query(`CONSTRUCT { ?s ?p ?o } WHERE {
+          GRAPH <${sourceMeta}> {
+            {
+              ?s ?p ?o .
+              ?s <http://dkg.io/ontology/batchId> ?bid .
+            } UNION {
+              ?s ?p ?o .
+              ?s <http://dkg.io/ontology/partOf> ?kc .
+              ?kc <http://dkg.io/ontology/batchId> ?bid2 .
+            } UNION {
+              ?s ?p ?o .
+              ?kc2 <http://dkg.io/ontology/authoredBy> ?s .
+              ?kc2 <http://dkg.io/ontology/batchId> ?bid3 .
+            }
+          }
+        }`);
+        const sourceQuads = constructResult.type === 'quads' ? constructResult.quads : [];
+        if (sourceQuads.length === 0) {
+          reports.push({
+            contextGraphId: cgName,
+            onChainId,
+            status: 'no-source-meta',
+            sourceTripleCount: 0,
+          });
+          continue;
+        }
+
+        if (dryRun) {
+          reports.push({
+            contextGraphId: cgName,
+            onChainId,
+            status: 'backfilled',
+            copiedTriples: sourceQuads.length,
+            sourceTripleCount: sourceQuads.length,
+          });
+          continue;
+        }
+
+        const targeted = sourceQuads.map(q => ({ ...q, graph: targetMeta }));
+        await agent.store.insert(targeted);
+
+        reports.push({
+          contextGraphId: cgName,
+          onChainId,
+          status: 'backfilled',
+          copiedTriples: targeted.length,
+          sourceTripleCount: sourceQuads.length,
+        });
+      } catch (err) {
+        reports.push({
+          contextGraphId: cgName,
+          onChainId,
+          status: 'failed',
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    return jsonResponse(res, 200, {
+      dryRun,
+      processed: reports.length,
+      summary: {
+        backfilled: reports.filter(r => r.status === 'backfilled').length,
+        alreadyPopulated: reports.filter(r => r.status === 'already-populated').length,
+        noSourceMeta: reports.filter(r => r.status === 'no-source-meta').length,
+        notOnChain: reports.filter(r => r.status === 'not-on-chain').length,
+        failed: reports.filter(r => r.status === 'failed').length,
+      },
+      reports,
+    });
+  }
+
   // POST /api/shutdown
   if (req.method === "POST" && path === "/api/shutdown") {
     jsonResponse(res, 200, { ok: true });

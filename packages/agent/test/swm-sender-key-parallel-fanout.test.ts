@@ -245,4 +245,81 @@ describe('createAndDistributeSwmSenderKeyEpoch: parallel fanout latency', () => 
     });
     expect(state).toBeDefined();
   });
+
+  it('1-of-N partial fail: throw cites only the agent whose keys all failed; non-failed peers do not appear in the error', async () => {
+    // The aggregation logic at `dkg-agent.ts:5998-6042` separates per-
+    // agent outcomes: a fatal agent is one where EVERY key failed. The
+    // throw must:
+    //   - include exactly the fatal agent(s) — not the successful ones
+    //   - count them correctly ("N agent(s)" in the message)
+    //   - leave the other recipients' deliveries observable as
+    //     successes (e.g. their epoch state)
+    //
+    // This pins the "M of N agents fatal" branch the existing all-fail
+    // and all-soft tests don't reach.
+    const boot = await bootAgent();
+    agent = boot.agent;
+    const internals = boot.internals;
+
+    const recipientA = makeFakeRecipient();
+    const recipientB = makeFakeRecipient(); // <-- this one's keys will fail
+    const recipientC = makeFakeRecipient();
+
+    // Messenger returns ACCEPTED for A and C, REJECTED for B. We
+    // discriminate on the recipient peerId since each fake recipient
+    // has a deterministic peerId derived from its agentAddress.
+    installStubMessenger(internals, async (peerId): Promise<ReliableSendResult> => {
+      const acceptedEnvelope = encodeSwmSenderKeyPackageAck({
+        version: SWM_SENDER_KEY_PACKAGE_VERSION,
+        type: SWM_SENDER_KEY_PACKAGE_ACK_TYPE,
+        accepted: true,
+      });
+      const rejectedEnvelope = encodeSwmSenderKeyPackageAck({
+        version: SWM_SENDER_KEY_PACKAGE_VERSION,
+        type: SWM_SENDER_KEY_PACKAGE_ACK_TYPE,
+        accepted: false,
+        reason: 'simulated per-recipient fatal',
+      });
+      const isBfailure = peerId === recipientB.peerId;
+      return {
+        delivered: true,
+        response: isBfailure ? rejectedEnvelope : acceptedEnvelope,
+        attempts: 1,
+        messageId: `m-test-${peerId.slice(-6)}`,
+      };
+    });
+
+    const sender = agentFromPrivateKey(
+      ethers.Wallet.createRandom().privateKey,
+      'sender',
+    ) as AgentKeyRecord & { privateKey: string };
+
+    let thrown: Error | null = null;
+    try {
+      await internals.createAndDistributeSwmSenderKeyEpoch({
+        contextGraphId: 'test-cg/fanout-1ofN',
+        sender,
+        recipients: [recipientA, recipientB, recipientC],
+        membershipHash: 'sha256:fanout-1ofN',
+        ctx: { operationId: 'test-op', operationName: 'share' },
+      });
+    } catch (err) {
+      thrown = err as Error;
+    }
+
+    // Must throw — recipient B is fatal even though A and C succeeded.
+    expect(thrown).not.toBeNull();
+    // Aggregation count must be EXACTLY 1 — not 3 (every agent), not
+    // 0 (none).
+    expect(thrown!.message).toMatch(/rejected by 1 agent\(s\)/);
+    // Identity of the fatal agent must be present in the throw.
+    expect(thrown!.message.toLowerCase()).toContain(recipientB.agentAddress.toLowerCase());
+    // Identities of the successful agents MUST NOT be present (would
+    // leak diagnostic noise and mislead operators).
+    expect(thrown!.message.toLowerCase()).not.toContain(recipientA.agentAddress.toLowerCase());
+    expect(thrown!.message.toLowerCase()).not.toContain(recipientC.agentAddress.toLowerCase());
+    // The simulated per-recipient reason should bubble up via the
+    // failure list (proves the per-key reasons are forwarded).
+    expect(thrown!.message).toContain('simulated per-recipient fatal');
+  });
 });

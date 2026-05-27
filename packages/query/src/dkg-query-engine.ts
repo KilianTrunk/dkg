@@ -4,6 +4,7 @@ import type { QueryResult, QueryOptions, QueryEngine } from './query-engine.js';
 import {
   contextGraphDataUri, contextGraphSharedMemoryUri, contextGraphVerifiedMemoryUri, contextGraphAssertionUri,
   contextGraphSubGraphUri, contextGraphMetaUri, contextGraphSharedMemoryMetaUri,
+  contextGraphSubGraphMetaUri,
   assertSafeIri, escapeSparqlLiteral, validateSubGraphName,
   type GetView,
   REMOVED_VIEWS,
@@ -211,25 +212,39 @@ export class DKGQueryEngine implements QueryEngine {
       //     ownership metadata (devnet-test-swm-ownership-restart
       //     `wait_for_owner_meta` probe, ACL enforcement on replicas).
       //
-      // Both metadata graph URIs are added to the EXPLICIT-IRI allow
-      // set ONLY. Graph-variable expansion (`constrainGraphVariables...
-      // ToAllowedSet`) stays constrained to the data / SWM graphs so a
-      // benign-looking `GRAPH ?g { … }` SELECT still cannot iterate
-      // into the meta graphs and leak the allowedAgent list or the
-      // workspaceOwner peer id. When `subGraphName` is supplied we
-      // additionally allow the sub-graph-scoped `_meta` and
-      // `_shared_memory_meta` URIs (parallel to the data / sub-graph
-      // asymmetry above).
+      // Privacy fence: a caller that explicitly narrowed routing to
+      // SWM-only via `graphSuffix: '_shared_memory'` does NOT gain
+      // access to the CG-level `_meta` (curator / allowedAgent /
+      // registrationStatus). They asked for SWM, they get SWM
+      // (including `_shared_memory_meta` for the workspaceOwner /
+      // ownership ACL probe). All other scoped routes still expose
+      // `_meta` and `_shared_memory_meta` for the legitimate metadata
+      // reads called out above.
+      //
+      // Sub-graph metadata uses `contextGraphSubGraphMetaUri`
+      // (`/<sub>/_meta`) — the same path the storage layer
+      // (`graph-manager.ts`) writes to — not the `/context/<sub>/_meta`
+      // shape produced by `contextGraphMetaUri` when a subGraphId is
+      // passed.
+      //
+      // The widening applies to the EXPLICIT-IRI allow set ONLY. Graph-
+      // variable expansion (`constrainGraphVariablesToAllowedSet`)
+      // stays constrained to the data / SWM graphs so a benign-looking
+      // `GRAPH ?g { … }` SELECT still cannot iterate into the meta
+      // graphs and leak the allowedAgent list or the workspaceOwner
+      // peer id.
+      const subGraphName = options?.subGraphName;
+      const isSwmOnlyRoute = options?.graphSuffix === '_shared_memory';
       const explicitAllowedGraphs = [
         ...allowedGraphs,
-        contextGraphMetaUri(effectiveContextGraphId),
-        contextGraphSharedMemoryMetaUri(effectiveContextGraphId),
-        ...(options?.subGraphName
-          ? [
-              contextGraphMetaUri(effectiveContextGraphId, options.subGraphName),
-              contextGraphSharedMemoryMetaUri(effectiveContextGraphId, options.subGraphName),
-            ]
-          : []),
+        ...(isSwmOnlyRoute
+          ? []
+          : [
+              subGraphName
+                ? contextGraphSubGraphMetaUri(effectiveContextGraphId, subGraphName)
+                : contextGraphMetaUri(effectiveContextGraphId),
+            ]),
+        contextGraphSharedMemoryMetaUri(effectiveContextGraphId, subGraphName),
       ];
       assertExplicitGraphIrisAllowed(sparql, explicitAllowedGraphs);
       sparql = constrainGraphVariablesToAllowedSet(sparql, allowedGraphs);

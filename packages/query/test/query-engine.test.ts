@@ -461,6 +461,79 @@ describe('DKGQueryEngine', () => {
     expect(result.bindings[0]['owner']).toBe('"12D3KooWowner"');
   });
 
+  it('rejects explicit GRAPH IRI against CG _meta when caller narrowed to graphSuffix=_shared_memory (privacy fence)', async () => {
+    // Bot review on #776: the `_meta` widening MUST NOT apply when the
+    // caller explicitly narrowed routing to SWM-only via
+    // `graphSuffix: '_shared_memory'`. `_meta` lives on the CG-data
+    // path, not the SWM path, so a SWM-narrowed caller has no business
+    // reading it. We pair each meta URI with the corresponding data
+    // graph and ONLY widen the explicit-IRI allow set when the
+    // matching data graph is in `allowedGraphs`.
+    await store.insert([
+      {
+        subject: GRAPH,
+        predicate: 'https://dkg.network/ontology#allowedAgent',
+        object: '"0xsecret"',
+        graph: META,
+      },
+    ]);
+    await expect(
+      engine.query(
+        `SELECT ?o WHERE { GRAPH <${META}> { <${GRAPH}> <https://dkg.network/ontology#allowedAgent> ?o } }`,
+        { contextGraphId: CONTEXT_GRAPH, graphSuffix: '_shared_memory' },
+      ),
+    ).rejects.toThrow(/Scoped query violation/i);
+  });
+
+  it('allows explicit GRAPH IRI against _shared_memory_meta even on graphSuffix=_shared_memory route', async () => {
+    // SWM-only narrowed callers should still see SWM metadata
+    // (workspaceOwner / promote-time ACL). The privacy fence drops
+    // CG-level `_meta` for SWM-narrowed routes (covered in the next
+    // test) but keeps the SWM analogue accessible.
+    const swmMetaGraph = `${GRAPH}/_shared_memory_meta`;
+    await store.insert([
+      {
+        subject: 'urn:swm-root:test',
+        predicate: 'http://dkg.io/ontology/workspaceOwner',
+        object: '"12D3KooWowner"',
+        graph: swmMetaGraph,
+      },
+    ]);
+    const result = await engine.query(
+      `SELECT ?owner WHERE { GRAPH <${swmMetaGraph}> { <urn:swm-root:test> <http://dkg.io/ontology/workspaceOwner> ?owner } }`,
+      { contextGraphId: CONTEXT_GRAPH, graphSuffix: '_shared_memory' },
+    );
+    expect(result.bindings).toHaveLength(1);
+    expect(result.bindings[0]['owner']).toBe('"12D3KooWowner"');
+  });
+
+  it('allows explicit GRAPH IRI against the actual sub-graph _meta location (\u003ccg\u003e/\u003csub\u003e/_meta)', async () => {
+    // Bot review on #776: sub-graph metadata is written by
+    // `graph-manager.ts` to `did:dkg:context-graph:<cg>/<sub>/_meta`
+    // (via `contextGraphSubGraphMetaUri`), NOT to
+    // `did:dkg:context-graph:<cg>/context/<sub>/_meta` (which is what
+    // `contextGraphMetaUri(cg, sub)` produces). The earlier draft of
+    // this fix used the wrong helper and would have left scoped
+    // sub-graph metadata reads still rejected; this test pins the
+    // correct path.
+    const subGraphName = 'code';
+    const subGraphMeta = `${GRAPH}/${subGraphName}/_meta`;
+    await store.insert([
+      {
+        subject: GRAPH,
+        predicate: 'https://dkg.network/ontology#curator',
+        object: 'did:dkg:agent:0xsubgraph',
+        graph: subGraphMeta,
+      },
+    ]);
+    const result = await engine.query(
+      `SELECT ?owner WHERE { GRAPH <${subGraphMeta}> { <${GRAPH}> <https://dkg.network/ontology#curator> ?owner } }`,
+      { contextGraphId: CONTEXT_GRAPH, subGraphName },
+    );
+    expect(result.bindings).toHaveLength(1);
+    expect(result.bindings[0]['owner']).toBe('did:dkg:agent:0xsubgraph');
+  });
+
   it('still rejects GRAPH variables binding to _meta even with same-CG _meta allowed (fail-closed)', async () => {
     // `GRAPH ?g` rewrites are intentionally constrained to data-only
     // graphs. Allowing `_meta` only on the EXPLICIT-IRI path keeps the

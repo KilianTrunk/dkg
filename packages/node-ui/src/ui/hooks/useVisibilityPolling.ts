@@ -50,7 +50,14 @@ export function useVisibilityPolling(
       start();
     };
 
-    if (optionsRef.current.runImmediately !== false) cbRef.current();
+    // BUG-007 / codex #752: the eager mount call must also pause when
+    // the tab is hidden. Browser session restore and "open all tabs"
+    // commonly mount React in a backgrounded tab; without this guard
+    // every `useVisibilityPolling` consumer still fires one fetch on
+    // mount, which is most of the daemon-fan-out we were trying to
+    // suppress. The visibilitychange handler will run the deferred
+    // initial refresh as soon as the user returns to the tab.
+    if (optionsRef.current.runImmediately !== false && !document.hidden) cbRef.current();
     if (!document.hidden) start();
     document.addEventListener('visibilitychange', onVisibility);
 

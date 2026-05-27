@@ -102,5 +102,30 @@ describe('cg-name validation (BUG-016)', () => {
         expect(validateCgName('<b>tagged</b>')).toContain('HTML');
       }
     });
+
+    it('warns when sanitise drops content via an unclosed `<tag` (codex #752 — was silent)', () => {
+      // `Project <b` has tag-shape start but no closing `>`. The
+      // sanitiser drops everything from `<` onward; submitting would
+      // post just `Project` while the input field shows `Project <b`.
+      // Pre-fix this returned null (no warning). The new check must
+      // surface it to the user.
+      const msg = validateCgName('Project <b');
+      expect(msg).not.toBeNull();
+      expect(msg).toMatch(/angle bracket|<|>|stripped/i);
+    });
+
+    it('warns when sanitise strips bare `<` / `>` characters that did not form a tag span (codex #752 — was silent)', () => {
+      // `< not a tag >` survives the tag-span scan (because `< ` does
+      // not look like a tag start), then the bare-bracket strip drops
+      // both `<` and `>`. Pre-fix the user saw `< not a tag >` in the
+      // input but submitted `not a tag`.
+      const msg = validateCgName('< not a tag >');
+      expect(msg).not.toBeNull();
+      expect(msg).toMatch(/angle bracket|stripped/i);
+
+      const msg2 = validateCgName('Project >>> Beta');
+      expect(msg2).not.toBeNull();
+      expect(msg2).toMatch(/angle bracket|stripped/i);
+    });
   });
 });

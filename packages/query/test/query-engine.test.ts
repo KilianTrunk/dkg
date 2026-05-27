@@ -256,6 +256,36 @@ describe('DKGQueryEngine', () => {
     ).rejects.toThrow(/Scoped query violation: FROM clauses are not allowed/i);
   });
 
+  it('rejects compact FROM clauses on context-graph-scoped local queries', async () => {
+    await expect(
+      engine.query(
+        `SELECT ?name FROM<${GRAPH}> WHERE { ?s <http://schema.org/name> ?name }`,
+        { contextGraphId: CONTEXT_GRAPH },
+      ),
+    ).rejects.toThrow(/Scoped query violation: FROM clauses are not allowed/i);
+  });
+
+  it('rejects compact FROM NAMED clauses on context-graph-scoped local queries', async () => {
+    await expect(
+      engine.query(
+        `SELECT ?name FROM NAMED<${GRAPH}> WHERE { GRAPH ?g { ?s <http://schema.org/name> ?name } }`,
+        { contextGraphId: CONTEXT_GRAPH },
+      ),
+    ).rejects.toThrow(/Scoped query violation: FROM clauses are not allowed/i);
+  });
+
+  it('allows scoped queries with prefixed names that contain FROM', async () => {
+    await store.insert([
+      q(ENTITY, 'http://example.com/from', '"FromPredicate"'),
+    ]);
+
+    await expect(engine.query(
+      `PREFIX ex: <http://example.com/>
+       SELECT ?name WHERE { ?s ex:from ?name }`,
+      { contextGraphId: CONTEXT_GRAPH },
+    )).resolves.toMatchObject({ bindings: expect.any(Array) });
+  });
+
   it('rejects explicit GRAPH IRIs outside the scoped context graph', async () => {
     const otherGraph = 'did:dkg:context-graph:other-agent-registry';
     await store.insert([
@@ -265,6 +295,20 @@ describe('DKGQueryEngine', () => {
     await expect(
       engine.query(
         `SELECT ?name WHERE { GRAPH <${otherGraph}> { ?s <http://schema.org/name> ?name } }`,
+        { contextGraphId: CONTEXT_GRAPH },
+      ),
+    ).rejects.toThrow(/Scoped query violation: GRAPH <did:dkg:context-graph:other-agent-registry> is outside the allowed graph set/i);
+  });
+
+  it('rejects compact explicit GRAPH IRIs outside the scoped context graph', async () => {
+    const otherGraph = 'did:dkg:context-graph:other-agent-registry';
+    await store.insert([
+      q('urn:secret:entity', 'http://schema.org/name', '"Secret"', otherGraph),
+    ]);
+
+    await expect(
+      engine.query(
+        `SELECT ?name WHERE { GRAPH<${otherGraph}> { ?s <http://schema.org/name> ?name } }`,
         { contextGraphId: CONTEXT_GRAPH },
       ),
     ).rejects.toThrow(/Scoped query violation: GRAPH <did:dkg:context-graph:other-agent-registry> is outside the allowed graph set/i);

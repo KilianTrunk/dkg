@@ -14,7 +14,6 @@ import {
   validateReadOnlySparql,
   emptyResultForSparql,
 } from './sparql-guard.js';
-import { stripLiteralsAndComments } from './sparql-utils.js';
 
 /**
  * Result of resolving a V10 GET view to concrete graph targets.
@@ -443,12 +442,45 @@ export class DKGQueryEngine implements QueryEngine {
 }
 
 function assertNoCallerDatasetClauses(sparql: string): void {
-  const code = stripLiteralsAndComments(sparql);
-  if (/\bFROM\s+(?:NAMED\s+)?/i.test(code)) {
+  if (hasCallerDatasetClause(sparql)) {
     throw new ScopedQueryViolationError(
       'FROM clauses are not allowed on scoped local queries',
     );
   }
+}
+
+function hasCallerDatasetClause(sparql: string): boolean {
+  const n = sparql.length;
+  let i = 0;
+
+  while (i < n) {
+    const ch = sparql[i];
+    if (ch === '#') {
+      while (i < n && sparql[i] !== '\n') i++;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      i = skipSparqlStringLiteral(sparql, i);
+      continue;
+    }
+    if (ch === '<') {
+      const end = skipSparqlIriRef(sparql, i);
+      i = end ?? i + 1;
+      continue;
+    }
+    if (isKeywordStart(sparql, i)) {
+      let j = i + 1;
+      while (j < n && isWordContinuation(sparql[j])) j++;
+      if (sparql.slice(i, j).toUpperCase() === 'FROM') {
+        return true;
+      }
+      i = j;
+      continue;
+    }
+    i++;
+  }
+
+  return false;
 }
 
 function assertExplicitGraphIrisAllowed(sparql: string, allowedGraphs: string[]): void {
@@ -642,11 +674,11 @@ function collectExplicitGraphIris(sparql: string): string[] {
       const word = sparql.slice(i, j);
       if (word.toUpperCase() === 'GRAPH') {
         const operandStart = skipSparqlSpaceAndLineComments(sparql, j);
-        if (operandStart > j && sparql[operandStart] === '<') {
-          const operandEnd = sparql.indexOf('>', operandStart + 1);
-          if (operandEnd === -1) return iris;
-          iris.push(sparql.slice(operandStart + 1, operandEnd));
-          i = operandEnd + 1;
+        if (sparql[operandStart] === '<') {
+          const operandEnd = skipSparqlIriRef(sparql, operandStart);
+          if (!operandEnd) return iris;
+          iris.push(sparql.slice(operandStart + 1, operandEnd - 1));
+          i = operandEnd;
           continue;
         }
       }

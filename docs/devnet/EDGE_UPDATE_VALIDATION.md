@@ -51,11 +51,17 @@ What this does **not** validate (separate suites cover these):
    pnpm install
    pnpm build
    ```
-2. **Network access for `npx`.** The script boots verdaccio via
-   `npx -y verdaccio@latest`. Warm the npx cache once:
+2. **Network access for `npx`.** The script boots a pinned
+   verdaccio (default `verdaccio@6.7.2`, see `VERDACCIO_VERSION`
+   in `scripts/devnet-test-edge-update.sh`) via `npx`. Warm the
+   npx cache once:
    ```bash
-   npx -y verdaccio@latest --version
+   npx -y verdaccio@6.7.2 --version
    ```
+   Override the pin per-run with `VERDACCIO_VERSION=<x.y.z>
+   ./scripts/devnet-test-edge-update.sh` when debugging against
+   a different verdaccio. Bumping the default pin should be a
+   deliberate edit + a manual re-run against the updated runbook.
 3. **No conflicting verdaccio.** Port `4873` must be free, or set
    `VERDACCIO_PORT=<free port>` when invoking the script.
 4. **Node ≥ what the repo requires.** Use `nvm use` (reads `.nvmrc`)
@@ -145,7 +151,7 @@ log:
   level: warn
 EOF
 
-nohup npx -y verdaccio@latest \
+nohup npx -y verdaccio@6.7.2 \
   --listen 4873 --config "$SCRATCH_ROOT/verdaccio-config.yaml" \
   >"$SCRATCH_ROOT/verdaccio.log" 2>&1 &
 echo "verdaccio pid: $!"
@@ -273,7 +279,7 @@ A passing run looks like:
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `verdaccio did not respond to /-/ping within 60s` | First-time `npx verdaccio` is downloading | Pre-warm with `npx -y verdaccio@latest --version` |
+| `verdaccio did not respond to /-/ping within 60s` | First-time `npx verdaccio` is downloading | Pre-warm with `npx -y verdaccio@6.7.2 --version` |
 | `port 4873 in use` | Existing verdaccio | `lsof -i :4873` → kill it, or `VERDACCIO_PORT=4874 ./script.sh` |
 | `pnpm pack failed` | Workspace not built | `pnpm build` from repo root |
 | `expected dkg binary at .../bin/dkg after install` | `npm install -g` silently failed | Re-run with `EDGE_UPDATE_KEEP_SCRATCH=1`, then `cat <scratch>/verdaccio.log` |

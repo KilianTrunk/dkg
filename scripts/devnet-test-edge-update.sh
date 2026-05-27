@@ -160,10 +160,17 @@ EOF
 # PUBLIC_REGISTRY is the upstream we fetch verdaccio's own package
 # from. Required because once `NPM_CONFIG_REGISTRY` flips to the
 # scratch verdaccio (below, after it's up), a cold `npx -y
-# verdaccio@latest` would chicken-and-egg itself — npx would try to
+# verdaccio@<pin>` would chicken-and-egg itself — npx would try to
 # fetch verdaccio's tarball from `http://127.0.0.1:$VERDACCIO_PORT/`
 # and get ECONNREFUSED before the registry has been launched.
 PUBLIC_REGISTRY="https://registry.npmjs.org/"
+
+# Verdaccio version is pinned to keep this gate reproducible — an
+# unpinned `@latest` would let an upstream Verdaccio release break
+# CI without any change in this repo. Bump deliberately by editing
+# this constant; verify the new version against the manual runbook
+# in docs/devnet/EDGE_UPDATE_VALIDATION.md before merging.
+VERDACCIO_VERSION="${VERDACCIO_VERSION:-6.7.2}"
 
 # DKG_HOME, NPM_CONFIG_PREFIX, NPM_CONFIG_USERCONFIG can be exported
 # unconditionally — they don't affect the `npx verdaccio` fetch
@@ -179,13 +186,13 @@ export DKG_HOME="$DKG_HOME_DIR"
 # `@origintrail-official/dkg` the operator might already have.
 export PATH="$NPM_PREFIX/bin:$PATH"
 
-log "stage 1: launching verdaccio (npx fetch via $PUBLIC_REGISTRY)"
+log "stage 1: launching verdaccio@$VERDACCIO_VERSION (npx fetch via $PUBLIC_REGISTRY)"
 # Inline `NPM_CONFIG_REGISTRY` override for the npx subprocess only:
 # npx fetches verdaccio's tarball from the public registry, NOT from
 # the local verdaccio that doesn't exist yet. The export below
 # (after verdaccio is reachable) then flips NPM_CONFIG_REGISTRY to
 # the scratch instance for all subsequent npm/dkg invocations.
-NPM_CONFIG_REGISTRY="$PUBLIC_REGISTRY" nohup npx -y verdaccio@latest \
+NPM_CONFIG_REGISTRY="$PUBLIC_REGISTRY" nohup npx -y "verdaccio@$VERDACCIO_VERSION" \
   --listen "$VERDACCIO_PORT" --config "$VERDACCIO_CONFIG" \
   >"$VERDACCIO_LOG" 2>&1 &
 VERDACCIO_PID=$!

@@ -1689,8 +1689,8 @@ export function EntityList({
     if (externallySorted) return entities;
     const copy = [...entities];
     copy.sort((a, b) => {
-      const aCount = a.connections.length + a.properties.size;
-      const bCount = b.connections.length + b.properties.size;
+      const aCount = a.tripleCount ?? 0;
+      const bCount = b.tripleCount ?? 0;
       return bCount - aCount;
     });
     return copy;
@@ -1723,7 +1723,7 @@ export function EntityList({
       </div>
       {sorted.map(e => {
         const { icon, type } = entityMeta(e, profile);
-        const tripleCount = e.connections.length + e.properties.size;
+        const tripleCount = e.tripleCount ?? 0;
         const authorUri = entityAuthorUri(e);
         const author = authorUri ? agents?.get(authorUri) : null;
         const ts = timestampPredicate ? entityTimestamp(e, timestampPredicate) : null;
@@ -3227,7 +3227,16 @@ export function KADetailView({ entity, allEntities, allTriples, onNavigate, onCl
   }, [entity.uri, allEntities]);
 
   const entityTriples = useMemo(
-    () => allTriples.filter(t => t.subject === entity.uri || t.object === entity.uri),
+    // Canonicalise raw triple sides before comparing — `entity.uri`
+    // was canonicalised by `getOrCreate` in `buildEntities`, but
+    // `allTriples` keeps the raw daemon strings (which can ship
+    // wrapped as `<urn:...>`). Without this both surfaces disagree
+    // for wrapped-IRI rows: the entity-row badge counts them (it
+    // uses the canonicalised entity key) while this filter would
+    // drop them. Idempotent + no-op for already-bare URIs.
+    () => allTriples.filter(t =>
+      canonicalEntityUri(t.subject) === entity.uri ||
+      canonicalEntityUri(t.object) === entity.uri),
     [entity.uri, allTriples]
   );
 
@@ -3300,7 +3309,14 @@ export function KADetailView({ entity, allEntities, allTriples, onNavigate, onCl
     focal: { uri: entity.uri, sizeMultiplier: 2.4 },
   }), [entity.uri, theme]);
 
-  const tripleCount = entity.connections.length + entity.properties.size;
+  // Derive from the actual triples this view renders, NOT from
+  // `entity.tripleCount`. The KADetailView is opened with either
+  // the raw `allTriples` (overview scope) or the SPO-deduped slice
+  // (layer scope, see `ProjectView.dedupeTriplesBySpo`). Reading
+  // the precomputed field would freeze on the deduped semantic and
+  // disagree with the tab on overview-scoped opens. `entityTriples`
+  // is already the filtered set the Triples tab counts rows from.
+  const tripleCount = entityTriples.length;
 
   return (
     <div className="v10-ka-detail">
@@ -4305,8 +4321,8 @@ export function SubGraphDetailView({
     }
     // 'triples' (default fallback)
     copy.sort((a, b) => {
-      const aCount = a.connections.length + a.properties.size;
-      const bCount = b.connections.length + b.properties.size;
+      const aCount = a.tripleCount ?? 0;
+      const bCount = b.tripleCount ?? 0;
       return bCount - aCount;
     });
     return copy;

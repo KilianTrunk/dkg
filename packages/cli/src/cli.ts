@@ -7,7 +7,6 @@ import { spawn, execSync } from 'node:child_process';
 import { createReadStream } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { homedir } from 'node:os';
 import { readFile, writeFile, unlink, appendFile } from 'node:fs/promises';
 import { ethers } from 'ethers';
 import { resolveRpcUrls } from '@origintrail-official/dkg-chain';
@@ -27,7 +26,7 @@ import {
   apiPortPath,
   loadNetworkConfig, loadProjectConfig, resolveAutoUpdateConfig, resolveAutoUpdateSource, resolveChainConfig,
   releasesDir, activeSlot, swapSlot,
-  slotEntryPoint, isStandaloneInstall, repoDir,
+  slotEntryPoint, isStandaloneInstall, repoDir, isDkgMonorepo,
   resolveContextGraphs, resolveNetworkDefaultContextGraphs,
   type AutoUpdateConfig,
 } from './config.js';
@@ -58,10 +57,10 @@ function isDaemonUnreachable(err: unknown): boolean {
 import { batchEntityQuads } from './batching.js';
 import {
   runDaemon,
-  performUpdateWithStatus,
-  checkForNewCommitWithStatus,
   checkForNpmVersionUpdate,
   performNpmUpdate,
+  performNpmUpdateEdge,
+  getCurrentCliVersion,
   DAEMON_EXIT_CODE_RESTART,
   resolveStandaloneInstall,
   decodeForcedExitCode,
@@ -71,7 +70,7 @@ import {
   startLivenessWatcher,
   LIVENESS_CONSECUTIVE_FAILURES_TO_KILL,
 } from './daemon/supervisor-liveness.js';
-import { migrateToBlueGreen } from './migration.js';
+import { migrateToBlueGreen, noteEdgeLegacyReleases } from './migration.js';
 import { ensureRollbackNodeUiBundle } from './rollback-node-ui.js';
 import { registerIntegrationCommands } from './integrations/commands.js';
 
@@ -356,8 +355,43 @@ async function loadQuadsFromInput(
   process.exit(1);
 }
 
+/**
+ * Synchronous best-effort read of `~/.dkg/config.json#nodeRole`. Used
+ * by {@link resolveDaemonEntryPoint} which runs from supervisor /
+ * spawn paths that cannot afford an async config load.
+ *
+ * Returns `'edge'` on any failure (default role) so a malformed or
+ * missing config does NOT silently keep Edge nodes pinned to a stale
+ * blue-green slot — the worst case is "we try the npm-global entry
+ * and let the daemon's own startup error out with a useful message"
+ * rather than "we run rc.10 instead of rc.12 because slots survived
+ * the upgrade".
+ */
+function readNodeRoleSync(): 'edge' | 'core' {
+  try {
+    const configPath = join(dkgDir(), 'config.json');
+    if (!existsSync(configPath)) return 'edge';
+    const parsed = JSON.parse(readFileSync(configPath, 'utf-8')) as { nodeRole?: unknown };
+    return parsed.nodeRole === 'core' ? 'core' : 'edge';
+  } catch {
+    return 'edge';
+  }
+}
+
+/**
+ * Resolve the daemon entry point passed to spawned worker processes.
+ *
+ * OT-RFC-41 §4.1 / Bundle B1a: Edge nodes run from the npm-global
+ * install (`import.meta.url`). Core nodes keep using blue-green
+ * slots (`~/.dkg/releases/current`). The role gate is applied here
+ * because the supervisor spawns workers via this entry point on
+ * every restart — without the gate, an Edge node that had legacy
+ * slots from a pre-rc.12 install would keep running the stale slot
+ * forever even after `npm install -g` updated the global.
+ */
 function resolveDaemonEntryPoint(): string {
   if (process.env.DKG_NO_BLUE_GREEN) return fileURLToPath(import.meta.url);
+  if (readNodeRoleSync() === 'edge') return fileURLToPath(import.meta.url);
   const rDir = releasesDir();
   if (existsSync(rDir)) {
     const entry = slotEntryPoint(join(rDir, 'current'));
@@ -566,8 +600,37 @@ program
 
 program
   .command('init')
-  .description('Interactive setup — set node name and relay')
-  .action(async () => {
+  .description('Interactive setup — set node name, role, and relay')
+  .option('--role <role>', "Node role: 'edge' (default; personal laptop / behind NAT) or 'core' (24/7 relay / SLA)")
+  .action(async (opts: ActionOpts) => {
+    // OT-RFC-41 Bundle B1c: monorepo guard. `dkg init` from a
+    // contributor checkout is almost always a mistake — the
+    // monorepo dev workflow is `pnpm dev` against the local CLI,
+    // not a globally-installed config. Surface this loudly so
+    // contributors don't accidentally write an Edge-style
+    // ~/.dkg/config.json that then disagrees with the binary on
+    // their $PATH.
+    if (isDkgMonorepo()) {
+      console.error(
+        '\n[dkg init] Refusing to run from a DKG monorepo checkout.\n' +
+          '\n' +
+          '  Detected monorepo root: ' + (repoDir() ?? '(unknown)') + '\n' +
+          '\n' +
+          "  Monorepo dev workflow uses 'pnpm dev' against the local CLI build; ~/.dkg/config.json\n" +
+          "  is for npm-installed nodes (`npm install -g @origintrail-official/dkg`). Writing one\n" +
+          '  here would diverge from how the local CLI resolves its own working state.\n' +
+          '\n' +
+          '  If you really want to bootstrap a config for testing from this checkout, set\n' +
+          '  DKG_HOME to a scratch directory:\n' +
+          '\n' +
+          '    DKG_HOME=/tmp/dkg-test dkg init\n' +
+          '\n' +
+          '  RFC: https://github.com/OriginTrail/dkgv10-spec/blob/main/rfcs/OT-RFC-41-edge-node-npm-only-install-and-update.md\n' +
+          '\n',
+      );
+      process.exit(1);
+    }
+
     await ensureDkgDir();
     const existing = await loadConfig();
     const network = await loadNetworkConfig();
@@ -585,9 +648,24 @@ program
     }
 
     const name = await ask('Node name', existing.name !== 'dkg-node' ? existing.name : undefined);
+    // OT-RFC-41 Bundle B1d: `--role <edge|core>` flag short-circuits
+    // the interactive role prompt. Default precedence:
+    //   1. `--role` flag (explicit operator intent)
+    //   2. existing config (re-running `dkg init` on an existing node)
+    //   3. network default (per-network preferred role)
+    //   4. 'edge' (safe default — RFC §1)
     const defaultRole = existing.nodeRole ?? network?.defaultNodeRole ?? 'edge';
-    const roleAnswer = await ask('Node role (edge / core)', defaultRole);
-    const nodeRole = roleAnswer === 'core' ? 'core' as const : 'edge' as const;
+    let nodeRole: 'edge' | 'core';
+    if (opts.role === 'edge' || opts.role === 'core') {
+      nodeRole = opts.role;
+      console.log(`Node role: ${nodeRole} (from --role flag)`);
+    } else if (opts.role !== undefined) {
+      console.error(`Invalid --role value: ${JSON.stringify(opts.role)}. Expected 'edge' or 'core'.`);
+      process.exit(1);
+    } else {
+      const roleAnswer = await ask('Node role (edge / core)', defaultRole);
+      nodeRole = roleAnswer === 'core' ? 'core' : 'edge';
+    }
 
     // Pre-fill relay from network config if user hasn't set one.
     // Show the first relay as the default, but only persist to config if the
@@ -612,9 +690,13 @@ program
     const contextGraphs = contextGraphsStr ? contextGraphsStr.split(',').map(s => s.trim()).filter(Boolean) : [];
     const apiPort = parseInt(await ask('API port', String(existing.apiPort)), 10);
 
+    // OT-RFC-41 §4.3 Bundle B1d: post-rc.12, auto-update is npm-only.
+    // The prompt wording is updated; the persisted config carries an
+    // explicit `source: 'npm'` so the daemon's resolution is
+    // unambiguous (no implicit `isStandaloneInstall()` probe).
     const autoUpdateDefault = existing.autoUpdate?.enabled ?? network?.autoUpdate?.enabled ?? false;
     const enableAutoUpdate = (await ask(
-      'Enable git-based auto-update (y/n)',
+      'Enable auto-update (npm; y/n)',
       autoUpdateDefault ? 'y' : 'n',
     )).toLowerCase() === 'y';
 
@@ -652,6 +734,12 @@ program
 
       autoUpdate = {
         enabled: true,
+        // OT-RFC-41 Bundle B1d: explicit source. Under rc.12+, fresh
+        // installs always use the npm path (Edge: install -g; Core:
+        // slot install). The legacy 'auto'/'git' values still parse
+        // (rc.11 nodes carrying them upgrade-in-place) but the
+        // daemon dispatches them as 'npm' under §5 PR 5.
+        source: 'npm' as const,
         ...(repo && repo !== effectiveRepo ? { repo } : {}),
         ...(branch && branch !== effectiveBranch ? { branch } : {}),
         ...(allowPrerelease !== effectiveAllowPrerelease ? { allowPrerelease } : {}),
@@ -979,12 +1067,23 @@ program
       process.exit(1);
     }
 
-    // Keep blue-green slots initialized for both foreground and daemonized start.
+    // OT-RFC-41 §4.1 / Bundle B1a: blue-green slot initialization is
+    // a Core-only concern under rc.12+. Edge nodes run directly from
+    // the npm-global install. Pre-rc.12 Edge users may still have
+    // legacy ~/.dkg/releases/ on disk; noteEdgeLegacyReleases() records
+    // the slot version as a rollback target without auto-deleting the
+    // directory (operator owns cleanup per RFC).
     if (!process.env.DKG_NO_BLUE_GREEN) {
-      await migrateToBlueGreen((msg) => console.log(msg), {
-        allowRemoteBootstrap: false,
-        repairLiveNodeUi: true,
-      });
+      const startConfig = await loadConfig().catch(() => null);
+      const startNodeRole = startConfig?.nodeRole ?? 'edge';
+      if (startNodeRole === 'core') {
+        await migrateToBlueGreen((msg) => console.log(msg), {
+          allowRemoteBootstrap: false,
+          repairLiveNodeUi: true,
+        });
+      } else {
+        await noteEdgeLegacyReleases((msg) => console.log(msg));
+      }
     }
 
     // rc.9 PR-7: forward --relay-preferred to the spawned daemon via
@@ -4192,142 +4291,15 @@ async function stopDaemonIfRunning(): Promise<boolean> {
   return false;
 }
 
-async function readPidFromHome(dkgHome: string): Promise<number | null> {
-  try {
-    const raw = await readFile(join(dkgHome, 'daemon.pid'), 'utf-8');
-    const pid = Number.parseInt(raw.trim(), 10);
-    return Number.isFinite(pid) ? pid : null;
-  } catch {
-    return null;
-  }
-}
-
-async function readAutoUpdateSourceFromHome(
-  dkgHome: string,
-): Promise<'npm' | 'git' | 'auto' | undefined> {
-  const normalize = (parsed: unknown): 'npm' | 'git' | 'auto' | undefined => {
-    const source = (parsed as { autoUpdate?: { source?: unknown } } | null)?.autoUpdate?.source;
-    return source === 'npm' || source === 'git' || source === 'auto' ? source : undefined;
-  };
-  try {
-    const raw = await readFile(join(dkgHome, 'config.json'), 'utf-8');
-    const source = normalize(JSON.parse(raw));
-    if (source) return source;
-  } catch {
-    // Fall through to config.yaml below.
-  }
-  try {
-    const raw = await readFile(join(dkgHome, 'config.yaml'), 'utf-8');
-    return normalize(yaml.load(raw));
-  } catch {
-    return undefined;
-  }
-}
-
-// ─── dkg migrate-to-npm ──────────────────────────────────────────────
-
-program
-  .command('migrate-to-npm')
-  .description('Convert a git-checkout install into an npm-style install in place (renames source-tree markers + pins autoUpdate.source = "npm")')
-  .option('--apply', 'Mutate the filesystem. Without this flag, prints the plan and exits.', false)
-  .option('--force', 'Bypass the daemon-alive safety check. Operator must SIGKILL the worker first; in-flight writes may be lost.', false)
-  .action(async (opts: ActionOpts) => {
-    const quoteForShell = (value: string) => `'${value.replace(/'/g, "'\\''")}'`;
-    const {
-      buildMigrationPlan,
-      applyPlan,
-      renderPlan,
-      findDkgMonorepoRootFromCwd,
-      resolveMigrationDkgHome,
-      selectMigrationDkgHome,
-    } = await import('./migrate-to-npm.js');
-    const detectedRepoRoot = repoDir();
-    const cwdRepoRoot = findDkgMonorepoRootFromCwd(process.cwd());
-    const repoRoot = detectedRepoRoot ?? cwdRepoRoot;
-    if (!repoRoot) {
-      console.error('Refusing to run: current directory is not inside a DKG monorepo checkout.');
-      console.error('Run this command from the git-checkout install you want to migrate.');
-      process.exitCode = 1;
-      return;
-    }
-    if (!detectedRepoRoot) {
-      console.log('No active git-checkout marker detected at this location (repoDir() === null).');
-      console.log(`Continuing from ${repoRoot} so a partial migration can still repair config pins.`);
-    }
-    // Codex review (3302171976 → #666#discussion_r3302712591): probe BOTH
-    // the monorepo-candidate home (~/.dkg-dev) and the standalone home
-    // (~/.dkg) for a live daemon before picking which one the migration
-    // targets. The previous code derived the home purely from the LIVE
-    // CLI's install mode via `repoDir()`, which is the WRONG signal when
-    // an operator runs a globally installed `dkg` from inside an
-    // unmigrated git checkout — `repoDir()` is null but the local daemon
-    // still writes to ~/.dkg-dev.
-    const homeSelection = await selectMigrationDkgHome({
-      repoRoot,
-      detectedRepoRoot,
-      homeDir: homedir(),
-      readPidFromHome,
-      isProcessRunning,
-    });
-    if (homeSelection.recoveredGlobalCliInCheckout) {
-      console.log(
-        `Detected a live daemon at ${homeSelection.dkgHome} even though the running CLI is in standalone install-mode. ` +
-          `Using ${homeSelection.dkgHome} for migration so the orphan-state blocker and autoUpdate.source pin target the right config.`,
-      );
-    }
-    const dkgHomeNow = homeSelection.dkgHome;
-    const pid = homeSelection.pid;
-    const dkgHomePostMigration = resolveMigrationDkgHome({
-      detectedRepoRoot: null,
-      homeDir: homedir(),
-    });
-    const daemonAlive = pid !== null && isProcessRunning(pid);
-    const currentAutoUpdateSource = await readAutoUpdateSourceFromHome(dkgHomeNow);
-    const backupSuffix = new Date()
-      .toISOString()
-      .replace(/[:.]/g, '-')
-      .replace(/T/, '_')
-      .replace(/Z$/, '');
-    const plan = buildMigrationPlan({
-      repoRoot,
-      backupSuffix,
-      dkgHomeNow,
-      dkgHomePostMigration,
-      daemonAlive,
-      forceAliveBypass: Boolean(opts.force),
-      currentAutoUpdateSource,
-    });
-    process.stdout.write(renderPlan(plan));
-    if (plan.alreadyMigrated) return;
-    if (!opts.apply) {
-      console.log('Re-run with --apply to execute.');
-      return;
-    }
-    if (plan.blockers.length > 0) {
-      console.error('Refusing to apply: resolve the blocker(s) above and re-run.');
-      process.exit(1);
-    }
-    await applyPlan(plan, (msg) => console.log(`  ${msg}`));
-    console.log('');
-    console.log('Done. Next steps:');
-    console.log('  1. Verify the renames:');
-    for (const action of plan.actions) {
-      if (action.kind === 'rename') console.log(`     ls -ld ${action.to}`);
-    }
-    console.log('  2. Restart the daemon:');
-    console.log('     dkg start');
-    console.log('  3. (Optional) globally install the npm package so `dkg` no longer depends on this tree:');
-    console.log('     npm install -g @origintrail-official/dkg');
-    console.log(
-      `     After that, this cleanup is safe: rm -rf ${[
-        join(repoRoot, 'packages'),
-        join(repoRoot, 'node_modules'),
-        join(repoRoot, 'pnpm-lock.yaml'),
-      ].map(quoteForShell).join(' ')}`,
-    );
-  });
-
 // ─── dkg update ──────────────────────────────────────────────────────
+//
+// OT-RFC-41 §4.5 / §5 PR 6: `dkg migrate-to-npm` was removed.
+// Edge nodes coming from a pre-rc.12 install are migrated
+// automatically on first `dkg start` via `noteEdgeLegacyReleases`
+// (see migration.ts + cli.ts dkg start). Core node operators
+// who still hold a git-checkout install follow the manual
+// procedure documented in `docs/archive/MIGRATE_TO_NPM.md`
+// (formerly `docs/operator/MIGRATE_TO_NPM.md`).
 
 // ─── dkg query-catalog ───────────────────────────────────────────────
 
@@ -4479,8 +4451,17 @@ program
         }
       }
 
-      console.log(`Updating to ${version} via NPM...`);
-      const updateStatus = await performNpmUpdate(version!, logFn);
+      // OT-RFC-41 Bundle B1b: dispatch on nodeRole. Edge runs
+      // `npm install -g` against the global install (no slots);
+      // Core continues to use the slot-based update path.
+      const npmUpdateRole = config.nodeRole ?? 'edge';
+      console.log(
+        `Updating to ${version} via NPM ` +
+          `(${npmUpdateRole === 'edge' ? 'global npm install' : 'blue-green slot'})...`,
+      );
+      const updateStatus = npmUpdateRole === 'edge'
+        ? await performNpmUpdateEdge(version!, getCurrentCliVersion(), logFn)
+        : await performNpmUpdate(version!, logFn);
       if (updateStatus === 'updated') {
         const stopped = await stopDaemonIfRunning();
         if (!stopped) {
@@ -4495,100 +4476,103 @@ program
       return;
     }
 
-    // --- Git-based update path (monorepo / install.sh installs) ---
-
-    // RFC-41 §5 PR 2 deprecation warning. The git-based update path
-    // (monorepo `dkg update` + install.sh-style git-checkout updates)
-    // is being removed in Bundle B. Bundle A only warns; B converts
-    // this to a hard refusal once the npm path is the proven default
-    // and the §6.5 rollout prerequisites are green.
+    // --- Git-based update path: hard refusal under OT-RFC-41 §4.2 / §5 PR 5 ---
+    //
+    // Bundle A shipped this branch with a deprecation warning;
+    // Bundle B converts it to a hard refusal. The npm path above
+    // is the canonical update mechanism for both Edge (`npm
+    // install -g`) and Core (`npm install` into a slot). The
+    // git-pull + build-from-source path is no longer reachable
+    // from any user-facing CLI entry point.
     //
     // For monorepo contributors: the canonical "update" is
-    // `git pull && pnpm install && pnpm build` from the repo root.
-    // For install.sh operators: see docs/operator/MIGRATE_TO_NPM.md
-    // to convert to the npm path before Bundle B lands.
-    process.stderr.write(
+    // `git pull && pnpm install && pnpm build` from the repo
+    // root — `dkg update` is not the right tool.
+    // For pre-rc.12 `install.sh` operators: re-install via
+    // `npm install -g @origintrail-official/dkg` and let the
+    // first-start migration record `~/.dkg/previous-version`.
+    //
+    // The dead `_performUpdateInner` / `performUpdate` /
+    // `checkForUpdate` / `checkForNewCommit*` symbols stay in
+    // `daemon/auto-update.ts` for one release so a rollback to
+    // rc.11 still type-checks; a follow-up cleanup PR deletes
+    // them once Bundle B has soaked on devnet.
+    console.error(
       '\n' +
-      '[dkg update] WARNING: invoking the git-based update path. This path is\n' +
-      '  deprecated in rc.12 per OT-RFC-41 and will be removed in a near-term\n' +
-      '  release. The canonical update mechanism is `npm install -g\n' +
-      '  @origintrail-official/dkg` + `dkg update`.\n' +
+      '[dkg update] ERROR: git-based update is no longer supported.\n' +
+      '\n' +
+      '  Per OT-RFC-41, all DKG node updates now flow through the npm registry.\n' +
       '\n' +
       '  - Monorepo contributors: use `git pull && pnpm install && pnpm build`\n' +
-      '    in the repo root instead of `dkg update`.\n' +
-      '  - install.sh-style operators: see docs/operator/MIGRATE_TO_NPM.md.\n' +
+      '    from the repo root. `dkg update` is for npm-installed nodes only.\n' +
+      '  - install.sh-style operators: re-install via `npm install -g\n' +
+      '    @origintrail-official/dkg`. The first daemon start records\n' +
+      '    your existing slot version as the rollback target. Run\n' +
+      '    `dkg doctor --json` for a diagnostic of your current layout.\n' +
+      '  - Then re-run `dkg update` from a fresh `npm install -g\n' +
+      '    @origintrail-official/dkg` install.\n' +
       '\n' +
       '  RFC: https://github.com/OriginTrail/dkgv10-spec/blob/main/rfcs/OT-RFC-41-edge-node-npm-only-install-and-update.md\n' +
       '\n',
     );
-
-    const refOverride = versionOrRef ? normalizeVersionTagRef(versionOrRef) : undefined;
-    const verifyTagSignature = Boolean(refOverride && refOverride.startsWith('refs/tags/')) && opts.verifyTag !== false;
-
-    if (opts.check) {
-      console.log('Checking for updates...');
-      const check = await checkForNewCommitWithStatus(au, (msg) => console.log(msg), refOverride);
-      if (check.status === 'available' && check.commit) {
-        console.log(`Update available: ${check.commit.slice(0, 8)}`);
-      } else if (check.status === 'up-to-date') {
-        console.log('No updates available.');
-      } else {
-        console.error('Update check failed. See logs above for details.');
-        process.exit(1);
-      }
-      return;
-    }
-
-    await migrateToBlueGreen((msg) => console.log(msg), {
-      allowRemoteBootstrap: true,
-      repairLiveNodeUi: false,
-    });
-    console.log('Checking for updates and applying...');
-    try {
-      const updateStatus = await performUpdateWithStatus(au, (msg) => console.log(msg), {
-        refOverride,
-        allowPrerelease: opts.allowPrerelease ? true : undefined,
-        verifyTagSignature,
-      });
-      if (updateStatus === 'updated') {
-        const pid = await readPid();
-        if (pid && isProcessRunning(pid)) {
-          console.log('Stopping daemon...');
-          try {
-            process.kill(pid, 'SIGTERM');
-          } catch (err) {
-            if (!hasErrorCode(err, 'ESRCH')) throw err;
-          }
-          for (let i = 0; i < 20; i++) {
-            await sleep(500);
-            if (!isProcessRunning(pid)) break;
-          }
-          if (isProcessRunning(pid)) {
-            console.error('Update applied but daemon is still running after SIGTERM. Stop it manually before restarting.');
-            process.exit(1);
-          }
-          console.log('Update applied. Run "dkg start" to start with the new version.');
-        } else {
-          console.log('Update applied. Start the daemon with: dkg start');
-        }
-      } else if (updateStatus === 'up-to-date') {
-        console.log('No update needed — already on latest.');
-      } else {
-        console.error('Update failed before activation. Check logs and retry.');
-        process.exit(1);
-      }
-    } catch (err) {
-      console.error(`Update failed: ${toErrorMessage(err)}`);
-      process.exit(1);
-    }
+    process.exit(1);
   });
 
 // ─── dkg rollback ────────────────────────────────────────────────────
 
 program
   .command('rollback')
-  .description('Roll back to the previous release slot and stop the daemon')
+  .description('Roll back to the previous DKG version (Edge: npm reinstall; Core: blue-green slot flip)')
   .action(async () => {
+    // OT-RFC-41 §4.8 / Bundle B1b: Edge rollback is a pure
+    // `npm install -g @<previous>` against the npm-global install.
+    // The previous version is recorded in `~/.dkg/previous-version`
+    // by `performNpmUpdateEdge` (and by `noteEdgeLegacyReleases` on
+    // first-start under rc.12 for users coming from a slot-based
+    // install). Core continues to use the slot-flip mechanism.
+    const rollbackConfig = await loadConfig().catch(() => null);
+    const rollbackRole = rollbackConfig?.nodeRole ?? 'edge';
+
+    if (rollbackRole === 'edge') {
+      const previousVersionPath = join(dkgDir(), 'previous-version');
+      if (!existsSync(previousVersionPath)) {
+        console.error(
+          "No rollback target recorded. ~/.dkg/previous-version is absent — either this is the first install, or a previous 'dkg update' did not record a target.\n",
+        );
+        console.error(
+          'To roll back manually, run:\n' +
+            `  npm install -g @origintrail-official/dkg@<version>\n\n` +
+            'See https://www.npmjs.com/package/@origintrail-official/dkg?activeTab=versions for available versions.',
+        );
+        process.exit(1);
+      }
+      const targetVersion = readFileSync(previousVersionPath, 'utf-8').trim();
+      if (!targetVersion) {
+        console.error('~/.dkg/previous-version is empty; cannot determine rollback target.');
+        process.exit(1);
+      }
+
+      const currentVersion = getCurrentCliVersion();
+      console.log(`Rolling back from ${currentVersion} to ${targetVersion} via NPM...`);
+      const rollbackStatus = await performNpmUpdateEdge(
+        targetVersion,
+        currentVersion,
+        (msg) => console.log(msg),
+      );
+      if (rollbackStatus !== 'updated') {
+        console.error('Rollback failed. Check logs and retry.');
+        process.exit(1);
+      }
+      const stopped = await stopDaemonIfRunning();
+      if (!stopped) {
+        console.error('Rollback applied but old daemon is still running. Stop it manually and run "dkg start".');
+        process.exit(1);
+      }
+      console.log(`Rolled back to ${targetVersion}. Run "dkg start" to start with the rolled-back version.`);
+      return;
+    }
+
+    // Core path: existing slot-flip rollback (unchanged).
     const current = await activeSlot();
     if (!current) {
       console.error('Blue-green slots not initialized. Nothing to roll back.');

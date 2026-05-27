@@ -25,7 +25,6 @@ export default defineConfig({
           // contributors can run it via `pnpm test:unit` in ~2s instead of
           // paying the 2-minute hardhat-boot tax of the default config.
           'test/resolve-standalone-install.test.ts',
-          'test/migrate-to-npm.test.ts',
           'test/nat-status.test.ts',
           'test/core-prereq-check.test.ts',
           'test/relay-status-block.test.ts',

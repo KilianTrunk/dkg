@@ -169,7 +169,7 @@ pnpm dkg start             # or `pnpm dkg <any subcommand>`
 
 Contributor state lives under `~/.dkg-dev/` (separated from `~/.dkg/` so a contributor's dev work doesn't stomp on their own Edge install). `dkg update` is intentionally disabled in monorepo-checkout mode — use `git pull && pnpm install && pnpm build` instead.
 
-The legacy `install.sh` git-checkout installer is deprecated and slated for removal in a near-term release. See [`MIGRATE_TO_NPM.md`](docs/operator/MIGRATE_TO_NPM.md) if you have an existing `install.sh`-style install you want to migrate to the npm path.
+The legacy `install.sh` git-checkout installer was removed in rc.12 (OT-RFC-41 §5 PR 6). If you have an existing `install.sh`-style install, run `npm install -g @origintrail-official/dkg` to take over the install; the daemon will detect the legacy `~/.dkg/releases/` tree on first start, record the active slot version into `~/.dkg/previous-version` (rollback target), and resume from the npm-global install. `dkg doctor` flags any leftover cleanable state. See [`docs/archive/MIGRATE_TO_NPM.md`](docs/archive/MIGRATE_TO_NPM.md) for historical context on the pre-rc.12 procedure.
 
 ---
 

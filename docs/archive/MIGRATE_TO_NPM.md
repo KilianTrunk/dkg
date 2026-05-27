@@ -1,3 +1,17 @@
+# ARCHIVED — Migrate a git-checkout install to the npm path
+
+> **This document is archived as of rc.12 (OT-RFC-41 §5 PR 6).**
+> The `dkg migrate-to-npm` command and the procedures below have been removed from the CLI. They are kept here for historical reference only.
+>
+> **What replaced this:**
+> - **Edge nodes (default):** First-start migration is automatic. On first `dkg start` under rc.12, an Edge node with a legacy `~/.dkg/releases/` tree from a pre-rc.12 install records the active slot's version into `~/.dkg/previous-version` (so `dkg rollback` keeps working) and resumes running directly from the npm-global install. No operator action is needed. The legacy `~/.dkg/releases/` directory is left in place — `dkg doctor` will flag it as cleanable legacy state; `rm -rf ~/.dkg/releases/` is safe once you've verified the new install runs.
+> - **Core nodes:** Keep using blue-green slots. Updates flow through `dkg update` (npm install into the inactive slot + atomic swap). No migration needed unless you were on a git-checkout install — in that case, follow the (historical) procedure below, then explicitly set `autoUpdate.source: "npm"` in `~/.dkg/config.json`.
+> - **Diagnostics:** `dkg doctor` is the canonical "what does my install look like?" command. It reports an 18-field state summary plus six anomaly checks (install layout, version skew, orphan repos, plugin root, served-UI mismatch, config sanity). Use it before reasoning about install-state issues.
+>
+> See [OT-RFC-41](https://github.com/OriginTrail/dkgv10-spec/blob/main/rfcs/OT-RFC-41-edge-node-npm-only-install-and-update.md) for the full design.
+
+---
+
 # Migrate a git-checkout install to the npm-pinned auto-update path
 
 This guide is for operators currently running a DKG node from a `git clone`d checkout (typical layout: `~/dkg-v9/` with `.git`, `packages/`, `node_modules/`, `pnpm-lock.yaml`, `package.json`). It walks through converting that install to use the npm-pinned auto-update path without re-installing.

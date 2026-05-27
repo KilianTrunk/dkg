@@ -8483,10 +8483,12 @@ export class DKGAgent {
    *   1. slice plaintext into `CIPHERTEXT_CHUNK_SIZE_BYTES`-sized
    *      pieces (last chunk smaller),
    *   2. AEAD-encrypt each chunk with a publish-operation-deterministic
-   *      nonce (`deriveChunkNonce(batchId, chunkIndex)`) so retries
-   *      produce bit-identical ciphertext and idempotent SWM writes
-   *      (idempotency is the spec's only protection against double-
-   *      gossip racing the on-chain commitment),
+   *      nonce (`deriveChunkNonce(publishOperationId, chunkIndex)`) so
+   *      retries produce bit-identical ciphertext and idempotent SWM
+   *      writes (idempotency is the spec's only protection against double-
+   *      gossip racing the on-chain commitment), while distinct publish
+   *      attempts rotate the AEAD nonce domain even if they share the
+   *      same merkle root,
    *   3. fan each ciphertext chunk out as a V2 SWM gossip envelope
    *      (`type = 'share-write-chunked'`, `swmMessageIndex = i`,
    *      payload = `[batchId(32)][ct_i]`) on the curated CG's
@@ -8509,7 +8511,7 @@ export class DKGAgent {
     authorAgentAddress?: string,
     publishContextGraphId?: string,
   ): Promise<
-    | ((input: { plaintextNquads: Uint8Array; batchId: Uint8Array }) => Promise<{
+    | ((input: { plaintextNquads: Uint8Array; batchId: Uint8Array; publishOperationId: string }) => Promise<{
         ciphertextChunksRoot: Uint8Array;
         ciphertextChunkCount: number;
         totalCiphertextBytes: number;
@@ -8537,7 +8539,7 @@ export class DKGAgent {
     const ctx = createOperationContext('publish');
     const gossip = this.gossip;
 
-    return async (input: { plaintextNquads: Uint8Array; batchId: Uint8Array }): Promise<{
+    return async (input: { plaintextNquads: Uint8Array; batchId: Uint8Array; publishOperationId: string }): Promise<{
       ciphertextChunksRoot: Uint8Array;
       ciphertextChunkCount: number;
       totalCiphertextBytes: number;
@@ -8547,15 +8549,18 @@ export class DKGAgent {
           `LU-11: chunked emit requires a 32-byte batchId (V10 KC merkleRoot); got ${input.batchId.length}`,
         );
       }
+      if (input.publishOperationId.length === 0) {
+        throw new Error('LU-11: chunked emit requires a non-empty publishOperationId');
+      }
       const plaintextChunks = sliceIntoCiphertextChunks(input.plaintextNquads);
-      const publishOperationId = ethers.hexlify(input.batchId);
       const { ciphertextChunks } = encryptChunked({
         chainKey,
         contextGraphId: aeadCgId,
         plaintextChunks,
-        publishOperationId,
+        publishOperationId: input.publishOperationId,
       });
       const { root, leafCount } = buildCiphertextChunksRoot(ciphertextChunks);
+      const batchIdHex = ethers.hexlify(input.batchId);
       let totalCiphertextBytes = 0;
       for (let i = 0; i < ciphertextChunks.length; i++) {
         const ct = ciphertextChunks[i];
@@ -8588,7 +8593,7 @@ export class DKGAgent {
           log.warn(
             ctx,
             `LU-11: chunked gossip publish failed for cgId=${contextGraphId} ` +
-            `batchId=${publishOperationId.slice(0, 18)}... chunkIndex=${i}: ${
+            `batchId=${batchIdHex.slice(0, 18)}... op=${input.publishOperationId} chunkIndex=${i}: ${
               err instanceof Error ? err.message : String(err)
             } — cores without this chunk will DECLINE the V2 ACK; ` +
             `late-join sync can backfill once the catchup verb lands.`,
@@ -8599,7 +8604,7 @@ export class DKGAgent {
         ctx,
         `LU-11: emitted ${ciphertextChunks.length} ciphertext chunks ` +
         `(${totalCiphertextBytes} bytes total) for curated CG ${contextGraphId} ` +
-        `batchId=${publishOperationId.slice(0, 18)}... on topic ${topic}`,
+        `batchId=${batchIdHex.slice(0, 18)}... op=${input.publishOperationId} on topic ${topic}`,
       );
       return {
         ciphertextChunksRoot: root,

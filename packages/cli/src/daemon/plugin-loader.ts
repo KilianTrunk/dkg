@@ -119,14 +119,20 @@ async function importSpec(
   //   3. On ESM resolver-shape failure, retry via the loader-local
   //      `createRequire` (final fallback for CJS-only packages).
   if (stableRootRequire) {
+    let resolved: string | undefined;
     try {
-      const resolved = stableRootRequire.resolve(spec);
-      return await import(pathToFileURL(resolved).href);
-    } catch (stableErr) {
+      resolved = stableRootRequire.resolve(spec);
+    } catch {
       // Stable root either does not have the plugin installed yet
       // or hit a resolver-shape edge case. Fall through to ESM
       // import — the loader-level try/catch surfaces the failure
       // with a clear spec name if both anchors miss.
+    }
+    if (resolved) {
+      // Once the stable root resolves the plugin, load/evaluation errors
+      // are authoritative and must not fall through to an older daemon-local
+      // or global install of the same package.
+      return await import(pathToFileURL(resolved).href);
     }
   }
   try {

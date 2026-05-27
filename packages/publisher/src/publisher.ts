@@ -189,15 +189,19 @@ export interface PublishOptions {
    * carrying only the resulting `ciphertextChunksRoot` +
    * `ciphertextChunkCount` over `PROTOCOL_STORAGE_ACK_V2`. The
    * `batchId` argument lets the agent's implementation key each
-   * chunk's persistence slot to a stable per-publish identifier
-   * (the V10 KC `merkleRoot`) so cores can index per-chunk
-   * ciphertexts by `(cgId, batchId, chunkIndex)` for RFC-39 random
-   * sampling. Returning bytes is intentionally NOT exposed here —
-   * the chunks live on the SWM substrate, never in the ACK request.
+   * chunk's persistence slot to the V10 KC `merkleRoot` so cores can
+   * index per-chunk ciphertexts by `(cgId, batchId, chunkIndex)` for
+   * RFC-39 random sampling. `publishOperationId` is intentionally
+   * separate: it is the unique per-operation nonce domain for chunked
+   * AEAD, so the same merkle root can never force nonce reuse across
+   * distinct publish attempts. Returning bytes is intentionally NOT
+   * exposed here — the chunks live on the SWM substrate, never in the
+   * ACK request.
    */
   encryptInlineChunked?: (input: {
     plaintextNquads: Uint8Array;
     batchId: Uint8Array;
+    publishOperationId: string;
   }) => Promise<{
     ciphertextChunksRoot: Uint8Array;
     ciphertextChunkCount: number;

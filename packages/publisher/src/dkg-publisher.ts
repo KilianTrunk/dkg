@@ -1802,6 +1802,17 @@ export class DKGPublisher implements Publisher {
       .join('\n');
     const publicByteSize = BigInt(new TextEncoder().encode(nquadsStr).length);
     const merkleRootHex = ethers.hexlify(kcMerkleRoot);
+    let publishOperationId = '';
+    let ual = '';
+    const ensurePublishOperationIdentity = () => {
+      if (publishOperationId.length > 0) return;
+      const tentativeSeq = ++this.tentativeCounter;
+      // RFC-001 §3.5 publication identifier. Stable across tentative and
+      // confirmed states for this publish so the `dkg:Publication` subject
+      // emitted in metadata stays the same after on-chain confirmation.
+      publishOperationId = `${this.sessionId}-${tentativeSeq}`;
+      ual = `did:dkg:${this.chain.chainId}/${publisherAddress}/t${publishOperationId}`;
+    };
 
     // V10: Collect core node StorageACKs (spec §9.0, Phase 3).
     // For direct publish: send staging quads inline via P2P so core nodes
@@ -1837,13 +1848,14 @@ export class DKGPublisher implements Publisher {
     } | undefined;
     if (useChunkedInline) {
       const plaintextBytes = new TextEncoder().encode(nquadsStr);
-      // batchId = V10 KC merkleRoot. Stable per-publish identifier the
-      // cores use to key per-chunk persistence as
-      // (cgId, batchId, chunkIndex) — the exact triple RFC-39 random
-      // sampling samples against.
+      ensurePublishOperationIdentity();
+      // batchId = V10 KC merkleRoot. It remains the core-side
+      // persistence/sampling key, while publishOperationId is the
+      // distinct per-operation nonce domain for chunked AEAD.
       const chunked = await options.encryptInlineChunked!({
         plaintextNquads: plaintextBytes,
         batchId: kcMerkleRoot,
+        publishOperationId,
       });
       // No stagingQuads on the chunked path — chunks travel via SWM
       // gossip, never on the ACK wire. Cores recompute the root from
@@ -2108,12 +2120,7 @@ export class DKGPublisher implements Publisher {
 
     let onChainResult: OnChainPublishResult | undefined;
     let status: 'tentative' | 'confirmed' = 'tentative';
-    const tentativeSeq = ++this.tentativeCounter;
-    // RFC-001 §3.5 publication identifier. Stable across tentative and
-    // confirmed states for this publish so the `dkg:Publication` subject
-    // emitted in metadata stays the same after on-chain confirmation.
-    const publishOperationId = `${this.sessionId}-${tentativeSeq}`;
-    let ual = `did:dkg:${this.chain.chainId}/${publisherAddress}/t${publishOperationId}`;
+    ensurePublishOperationIdentity();
 
     // Resolve the on-chain attribution target from the per-call override
     // (computed above) or fall back to the daemon's persistent identity.

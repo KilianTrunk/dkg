@@ -38,7 +38,10 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { MockChainAdapter } from '@origintrail-official/dkg-chain';
-import type { ACKVerifyResult } from '@origintrail-official/dkg-chain';
+// Codex review feedback: the chain package exports the verifier
+// result type as `VerifyACKIdentityResult`; `ACKVerifyResult` is the
+// publisher-side mirror (same shape, different export site).
+import type { VerifyACKIdentityResult } from '@origintrail-official/dkg-chain';
 import { DKGAgent } from '../src/index.js';
 
 /**
@@ -80,7 +83,7 @@ interface ACKCollectorDepsCapture {
   verifyIdentityDetailed?: (
     recoveredAddress: string,
     identityId: bigint,
-  ) => Promise<ACKVerifyResult>;
+  ) => Promise<VerifyACKIdentityResult>;
 }
 
 /**
@@ -102,7 +105,7 @@ interface ProviderInternals {
     verifyACKIdentityDetailed?: (
       recoveredAddress: string,
       identityId: bigint,
-    ) => Promise<ACKVerifyResult>;
+    ) => Promise<VerifyACKIdentityResult>;
   };
   node: { libp2p: { getPeers(): unknown[] } };
 }
@@ -157,7 +160,7 @@ describe('DKGAgent.createV10ACKProvider — structured ACK verifier wiring (PR #
     // string as a definitive identity rejection. PR #711's fix is
     // that the agent translates the throw into the dedicated
     // `'rpc-error'` reason so operators can act on it.
-    internals.chain.verifyACKIdentityDetailed = async (): Promise<ACKVerifyResult> => {
+    internals.chain.verifyACKIdentityDetailed = async (): Promise<VerifyACKIdentityResult> => {
       throw new Error('synthetic RPC outage — filter expired');
     };
 
@@ -183,7 +186,7 @@ describe('DKGAgent.createV10ACKProvider — structured ACK verifier wiring (PR #
     agent = boot.agent;
     const internals = boot.internals;
 
-    internals.chain.verifyACKIdentityDetailed = async (): Promise<ACKVerifyResult> => ({
+    internals.chain.verifyACKIdentityDetailed = async (): Promise<VerifyACKIdentityResult> => ({
       valid: false,
       reason: 'key-not-registered' as const,
     });

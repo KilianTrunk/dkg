@@ -32,9 +32,9 @@ beforeEach(() => {
 afterEach(() => {
   // Restore unconditionally — install patches console.log; tests must
   // not leak that patch between cases.
+  _uninstallFilterNotFoundConsoleSuppressorForTest();
   console.log = originalLog;
   console.warn = originalWarn;
-  _uninstallFilterNotFoundConsoleSuppressorForTest();
 });
 
 function buildEthersFilterError(): Error {
@@ -84,6 +84,20 @@ describe('installFilterNotFoundConsoleSuppressor (BUG-022)', () => {
     const a = installFilterNotFoundConsoleSuppressor();
     const b = installFilterNotFoundConsoleSuppressor();
     expect(a).toBe(b);
+  });
+
+  it('uninstall restores the console.log implementation captured at install time', () => {
+    const captured: unknown[][] = [];
+    const testLogger = (...args: unknown[]) => { captured.push(args); };
+    console.log = testLogger;
+
+    installFilterNotFoundConsoleSuppressor({ now: () => 0 });
+    expect(console.log).not.toBe(testLogger);
+
+    _uninstallFilterNotFoundConsoleSuppressorForTest();
+    expect(console.log).toBe(testLogger);
+    console.log('after uninstall');
+    expect(captured).toEqual([['after uninstall']]);
   });
 
   it('does NOT match when args are not (string, error) — guards against a hostile caller spoofing the shape', () => {

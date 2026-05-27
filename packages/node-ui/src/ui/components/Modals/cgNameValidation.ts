@@ -44,11 +44,12 @@ const HTML_TAG_SHAPE_RE = /<\/?[a-z][^>]*>/i;
 // ("\nnewlines\nand\ttabs\n" would render as "newlinesandtabs").
 const NON_WHITESPACE_CONTROL_CHARS_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g;
 
-// Anything Unicode "letter or digit" — what the daemon's slugify pass
-// keeps. If the cleaned name has none of these, slugify returns "" and
-// the resulting context-graph ID would end with a stray "/", which
-// none of the downstream APIs accept.
-const SLUG_PRODUCING_RE = /[\p{L}\p{N}]/u;
+// The Create modal and CG setup helpers slugify with `/[^a-z0-9]+/g`.
+// A Unicode-only display name can survive sanitisation, but it still
+// produces an empty context-graph slug. Validate against the exact
+// ASCII slug-producing contract so the submit button never sends an id
+// ending in a stray "/".
+const SLUG_PRODUCING_RE = /[a-z0-9]/i;
 
 /**
  * Strip HTML-tag-shaped spans (`<…>`) from `input` using a manual

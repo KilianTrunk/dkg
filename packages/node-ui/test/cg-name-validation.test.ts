@@ -75,7 +75,7 @@ describe('cg-name validation (BUG-016)', () => {
 
     it('accepts a normal short name', () => {
       expect(validateCgName('Pharma Drug Interactions')).toBeNull();
-      expect(validateCgName('日本語プロジェクト')).toBeNull();
+      expect(validateCgName('Pharma 🧪')).toBeNull();
     });
 
     it('does NOT flag a name that uses normal ASCII punctuation', () => {
@@ -90,6 +90,7 @@ describe('cg-name validation (BUG-016)', () => {
       expect(validateCgName('---')).toMatch(/letter or digit/i);
       expect(validateCgName('***')).toMatch(/letter or digit/i);
       expect(validateCgName('   .   ')).toMatch(/letter or digit/i);
+      expect(validateCgName('日本語プロジェクト')).toMatch(/letter or digit/i);
     });
 
     it('is stateless across calls (HTML_TAG_SHAPE_RE has no `g` flag, .test does not flicker)', () => {

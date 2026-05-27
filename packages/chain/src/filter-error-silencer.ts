@@ -242,6 +242,7 @@ export function createFilterErrorSilencer(opts: FilterErrorSilencerOpts = {}): F
  */
 let consoleSuppressorInstalled = false;
 let consoleSuppressorSilencer: FilterErrorSilencer | null = null;
+let consoleSuppressorOriginalLog: typeof console.log | null = null;
 
 export function installFilterNotFoundConsoleSuppressor(opts: FilterErrorSilencerOpts = {}): FilterErrorSilencer {
   if (consoleSuppressorInstalled && consoleSuppressorSilencer) return consoleSuppressorSilencer;
@@ -254,14 +255,15 @@ export function installFilterNotFoundConsoleSuppressor(opts: FilterErrorSilencer
     ...opts,
     log: opts.log ?? ((msg: string) => originalConsoleWarn(msg)),
   });
-  const originalConsoleLog = console.log.bind(console);
+  const originalConsoleLog = console.log;
+  consoleSuppressorOriginalLog = originalConsoleLog;
   console.log = (...args: unknown[]) => {
     // ethers v6 emits `console.log("@TODO", error)` from
     // subscriber-filterid.js. Intercept exactly that two-arg shape so
     // we don't accidentally swallow legitimate "@TODO" log lines that
     // happen to start with the same string.
     if (args.length === 2 && args[0] === '@TODO' && silencer.handle(args[1])) return;
-    originalConsoleLog(...args);
+    originalConsoleLog.apply(console, args);
   };
   consoleSuppressorInstalled = true;
   consoleSuppressorSilencer = silencer;
@@ -273,6 +275,10 @@ export function installFilterNotFoundConsoleSuppressor(opts: FilterErrorSilencer
  *  production, but vitest specs need a way to undo the wrap between
  *  cases. */
 export function _uninstallFilterNotFoundConsoleSuppressorForTest(): void {
+  if (consoleSuppressorOriginalLog) {
+    console.log = consoleSuppressorOriginalLog;
+  }
   consoleSuppressorInstalled = false;
   consoleSuppressorSilencer = null;
+  consoleSuppressorOriginalLog = null;
 }

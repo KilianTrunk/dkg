@@ -463,6 +463,46 @@ export async function importFile(
 }
 
 // --- Query ---
+
+// In-flight POST /api/query dedup. Coalesces concurrent identical
+// requests so React strict-mode double-mounts and sibling views asking
+// the same SPARQL against the same CG share one underlying fetch.
+//
+// Scope is *strictly inflight*: the entry is deleted as soon as the
+// promise settles (success OR failure), so the next call always issues
+// a fresh request. No caching, no staleness window — this is purely
+// concurrent-coalescing, drop-in safe for every existing caller.
+//
+// Motivation: opening a project on the dashboard fires `useMemoryEntities`
+// from two mounted instances (Dashboard card + ProjectView), giving 6
+// identical `/api/query` POSTs for the WM/SWM/VM fan-out against a
+// multi-GB Oxigraph store. Each duplicate adds seconds of wall time on
+// large stores. Inflight dedup collapses the dupes to one.
+const inflightQuery = new Map<string, Promise<{ result: any }>>();
+
+export function postQueryDeduped(body: Record<string, unknown>): Promise<{ result: any }> {
+  const key = JSON.stringify(body);
+  const existing = inflightQuery.get(key);
+  if (existing) return existing;
+  const promise = (async () => {
+    const res = await fetch(`${BASE}/api/query`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
+      body: key,
+    });
+    if (!res.ok) {
+      const errBody = await res.json().catch(() => ({}));
+      const msg = (errBody as { error?: string })?.error ?? `HTTP ${res.status}`;
+      throw new HttpError(res.status, msg, errBody);
+    }
+    return res.json() as Promise<{ result: any }>;
+  })().finally(() => {
+    inflightQuery.delete(key);
+  });
+  inflightQuery.set(key, promise);
+  return promise;
+}
+
 export const executeQuery = (
   sparql: string,
   contextGraphId?: string,
@@ -470,7 +510,7 @@ export const executeQuery = (
   graphSuffix?: '_shared_memory',
   view?: 'verified-memory' | 'shared-working-memory',
 ) =>
-  post<{ result: any }>('/api/query', { sparql, contextGraphId, includeSharedMemory, graphSuffix, view });
+  postQueryDeduped({ sparql, contextGraphId, includeSharedMemory, graphSuffix, view });
 
 // --- Publish (assertion-lifecycle: RFC-001 §9.x sign-at-creation) ---
 //

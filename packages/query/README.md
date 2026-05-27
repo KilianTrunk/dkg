@@ -19,15 +19,26 @@ const engine = new DKGQueryEngine(store);
 
 const results = await engine.query(
   'SELECT ?s ?p ?o WHERE { ?s ?p ?o } LIMIT 10',
-  { contextGraphId: 'urn:contextGraph:example' },
+  { contextGraphId: 'example', view: 'verified-memory' },
 );
 
-// Query with workspace data included
-const wsResults = await engine.query(
-  'SELECT ?s ?p ?o WHERE { ?s ?p ?o } LIMIT 10',
-  { contextGraphId: 'urn:contextGraph:example', includeWorkspace: true },
+// Inspect allowed named graphs without expanding the selected scope.
+const graphResults = await engine.query(
+  'SELECT ?g ?s ?p ?o WHERE { GRAPH ?g { ?s ?p ?o } } LIMIT 10',
+  { contextGraphId: 'example', view: 'shared-working-memory' },
 );
 ```
+
+contextGraphId and view are authoritative for local queries. A local
+`GRAPH ?g` pattern is constrained locally to the graph set resolved from those
+fields; it cannot range over another context graph or memory view. Local scoped
+queries reject explicit out-of-scope `GRAPH <iri>` targets and `FROM` /
+`FROM NAMED` clauses because those would let caller SPARQL redefine the dataset.
+
+Remote raw SPARQL handled by `QueryHandler` remains stricter: `GRAPH`, `FROM`,
+and `FROM NAMED` clauses are rejected before execution. Structured remote
+lookups such as `ENTITIES_BY_TYPE` and `ENTITY_TRIPLES` continue to build their
+own internal graph patterns.
 
 ## Internal Dependencies
 

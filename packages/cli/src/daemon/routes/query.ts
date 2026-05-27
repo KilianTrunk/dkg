@@ -620,6 +620,7 @@ export async function handleQueryRoutes(ctx: RequestContext): Promise<void> {
         msg.includes("agentAddress is required") ||
         msg.includes("requires a contextGraphId") ||
         msg.includes("cannot be combined with") ||
+        msg.startsWith("Scoped query violation:") ||
         // A-1 review: DKGAgent.query throws these when the caller sends
         // a non-string `agentAddress` / `callerAgentAddress` in the
         // body. Classify as 400 so malformed input is a clean client

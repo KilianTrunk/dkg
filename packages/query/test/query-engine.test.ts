@@ -218,6 +218,40 @@ describe('DKGQueryEngine', () => {
     expect(names).toContain('"Quorum Verified"');
   });
 
+  it('view=verified-memory constrains compact GRAPH variables without duplicating multi-graph rows', async () => {
+    const vmGraph = `did:dkg:context-graph:${CONTEXT_GRAPH}/_verified_memory/quorum-1`;
+    await store.insert([
+      q('urn:vm:entity:1', 'http://schema.org/name', '"Quorum Verified"', vmGraph),
+      q('urn:other:entity', 'http://schema.org/name', '"OtherGraph"', 'did:dkg:context-graph:other-agent-registry'),
+    ]);
+
+    const result = await engine.query(
+      'SELECT ?g ?name WHERE { GRAPH?g { ?s <http://schema.org/name> ?name } } ORDER BY ?name',
+      { contextGraphId: CONTEXT_GRAPH, view: 'verified-memory' },
+    );
+
+    expect(result.bindings).toEqual([
+      { g: GRAPH, name: '"ImageBot"' },
+      { g: vmGraph, name: '"Quorum Verified"' },
+    ]);
+  });
+
+  it('view=verified-memory honors compact explicit GRAPH IRIs without duplicating multi-graph rows', async () => {
+    const vmGraph = `did:dkg:context-graph:${CONTEXT_GRAPH}/_verified_memory/quorum-1`;
+    await store.insert([
+      q('urn:vm:entity:1', 'http://schema.org/name', '"Quorum Verified"', vmGraph),
+    ]);
+
+    const result = await engine.query(
+      `SELECT ?name WHERE { GRAPH<${vmGraph}> { ?s <http://schema.org/name> ?name } }`,
+      { contextGraphId: CONTEXT_GRAPH, view: 'verified-memory' },
+    );
+
+    expect(result.bindings).toEqual([
+      { name: '"Quorum Verified"' },
+    ]);
+  });
+
   it('view=verified-memory with verifiedGraph scopes to that graph only', async () => {
     const vmGraph = `did:dkg:context-graph:${CONTEXT_GRAPH}/_verified_memory/team-a`;
     await store.insert([
@@ -257,6 +291,342 @@ describe('DKGQueryEngine', () => {
     await expect(
       engine.query('SELECT ?s WHERE { ?s ?p ?o }', { view: 'verified-memory' }),
     ).rejects.toThrow('requires a contextGraphId');
+  });
+
+  it('rejects FROM clauses on context-graph-scoped local queries', async () => {
+    await expect(
+      engine.query(
+        `SELECT ?name FROM <${GRAPH}> WHERE { ?s <http://schema.org/name> ?name }`,
+        { contextGraphId: CONTEXT_GRAPH },
+      ),
+    ).rejects.toThrow(/Scoped query violation: FROM clauses are not allowed/i);
+  });
+
+  it('rejects compact FROM clauses on context-graph-scoped local queries', async () => {
+    await expect(
+      engine.query(
+        `SELECT ?name FROM<${GRAPH}> WHERE { ?s <http://schema.org/name> ?name }`,
+        { contextGraphId: CONTEXT_GRAPH },
+      ),
+    ).rejects.toThrow(/Scoped query violation: FROM clauses are not allowed/i);
+  });
+
+  it('rejects compact FROM NAMED clauses on context-graph-scoped local queries', async () => {
+    await expect(
+      engine.query(
+        `SELECT ?name FROM NAMED<${GRAPH}> WHERE { GRAPH ?g { ?s <http://schema.org/name> ?name } }`,
+        { contextGraphId: CONTEXT_GRAPH },
+      ),
+    ).rejects.toThrow(/Scoped query violation: FROM clauses are not allowed/i);
+  });
+
+  it('allows scoped queries with prefixed names that contain FROM', async () => {
+    await store.insert([
+      q(ENTITY, 'http://example.com/from', '"FromPredicate"'),
+    ]);
+
+    await expect(engine.query(
+      `PREFIX ex: <http://example.com/>
+       SELECT ?name WHERE { ?s ex:from ?name }`,
+      { contextGraphId: CONTEXT_GRAPH },
+    )).resolves.toMatchObject({ bindings: expect.any(Array) });
+  });
+
+  it('allows scoped queries with a prefix label named from', async () => {
+    await store.insert([
+      q(ENTITY, 'http://example.com/name', '"FromPrefixPredicate"'),
+    ]);
+
+    await expect(engine.query(
+      `PREFIX from: <http://example.com/>
+       SELECT ?name WHERE { ?s from:name ?name }`,
+      { contextGraphId: CONTEXT_GRAPH },
+    )).resolves.toMatchObject({ bindings: expect.any(Array) });
+  });
+
+  it('allows scoped queries with a prefix label named graph', async () => {
+    await store.insert([
+      q(ENTITY, 'http://example.com/name', '"GraphPrefixPredicate"'),
+    ]);
+
+    await expect(engine.query(
+      `PREFIX graph: <http://example.com/>
+       SELECT ?name WHERE { ?s graph:name ?name }`,
+      { contextGraphId: CONTEXT_GRAPH },
+    )).resolves.toMatchObject({ bindings: expect.any(Array) });
+  });
+
+  it('allows scoped queries with hyphenated graph/from prefix labels', async () => {
+    await store.insert([
+      q(ENTITY, 'http://example.com/name', '"HyphenatedPrefixPredicate"'),
+    ]);
+
+    await expect(engine.query(
+      `PREFIX graph-viz: <http://example.com/>
+       SELECT ?name WHERE { ?s graph-viz:name ?name }`,
+      { contextGraphId: CONTEXT_GRAPH },
+    )).resolves.toMatchObject({ bindings: expect.any(Array) });
+
+    await expect(engine.query(
+      `PREFIX from-schema: <http://example.com/>
+       SELECT ?name WHERE { ?s from-schema:name ?name }`,
+      { contextGraphId: CONTEXT_GRAPH },
+    )).resolves.toMatchObject({ bindings: expect.any(Array) });
+  });
+
+  it('rejects explicit GRAPH IRIs outside the scoped context graph', async () => {
+    const otherGraph = 'did:dkg:context-graph:other-agent-registry';
+    await store.insert([
+      q('urn:secret:entity', 'http://schema.org/name', '"Secret"', otherGraph),
+    ]);
+
+    await expect(
+      engine.query(
+        `SELECT ?name WHERE { GRAPH <${otherGraph}> { ?s <http://schema.org/name> ?name } }`,
+        { contextGraphId: CONTEXT_GRAPH },
+      ),
+    ).rejects.toThrow(/Scoped query violation: GRAPH <did:dkg:context-graph:other-agent-registry> is outside the allowed graph set/i);
+  });
+
+  it('rejects compact explicit GRAPH IRIs outside the scoped context graph', async () => {
+    const otherGraph = 'did:dkg:context-graph:other-agent-registry';
+    await store.insert([
+      q('urn:secret:entity', 'http://schema.org/name', '"Secret"', otherGraph),
+    ]);
+
+    await expect(
+      engine.query(
+        `SELECT ?name WHERE { GRAPH<${otherGraph}> { ?s <http://schema.org/name> ?name } }`,
+        { contextGraphId: CONTEXT_GRAPH },
+      ),
+    ).rejects.toThrow(/Scoped query violation: GRAPH <did:dkg:context-graph:other-agent-registry> is outside the allowed graph set/i);
+  });
+
+  it('allows prefixed explicit GRAPH targets that resolve to the scoped graph', async () => {
+    const result = await engine.query(
+      `PREFIX cg: <did:dkg:context-graph:>
+       SELECT ?name WHERE { GRAPH cg:${CONTEXT_GRAPH} { ?s <http://schema.org/name> ?name } }`,
+      { contextGraphId: CONTEXT_GRAPH },
+    );
+
+    expect(result.bindings).toEqual([
+      { name: '"ImageBot"' },
+    ]);
+  });
+
+  it('rejects prefixed explicit GRAPH targets outside the scoped graph set', async () => {
+    const otherGraph = 'did:dkg:context-graph:other-agent-registry';
+    await store.insert([
+      q('urn:secret:entity', 'http://schema.org/name', '"Secret"', otherGraph),
+    ]);
+
+    await expect(
+      engine.query(
+        `PREFIX other: <${otherGraph}>
+         SELECT ?name WHERE { GRAPH other: { ?s <http://schema.org/name> ?name } }`,
+        { contextGraphId: CONTEXT_GRAPH },
+      ),
+    ).rejects.toThrow(/Scoped query violation: GRAPH <did:dkg:context-graph:other-agent-registry> is outside the allowed graph set/i);
+  });
+
+  it('rejects unresolved prefixed GRAPH targets fail-closed', async () => {
+    await expect(
+      engine.query(
+        `SELECT ?name WHERE { GRAPH missing:allowed { ?s <http://schema.org/name> ?name } }`,
+        { contextGraphId: CONTEXT_GRAPH },
+      ),
+    ).rejects.toThrow(/Scoped query violation: GRAPH prefixed target missing:allowed cannot be resolved/i);
+  });
+
+  it('allows prefixed explicit GRAPH targets alongside constrained GRAPH variables', async () => {
+    await store.insert([
+      q('urn:other:entity', 'http://schema.org/name', '"OtherGraph"', 'did:dkg:context-graph:other-agent-registry'),
+    ]);
+
+    const result = await engine.query(
+      `PREFIX cg: <did:dkg:context-graph:>
+       SELECT ?g ?name ?sameName WHERE {
+         GRAPH ?g { ?s <http://schema.org/name> ?name }
+         GRAPH cg:${CONTEXT_GRAPH} { ?s <http://schema.org/name> ?sameName }
+       }`,
+      { contextGraphId: CONTEXT_GRAPH },
+    );
+
+    expect(result.bindings).toEqual([
+      { g: GRAPH, name: '"ImageBot"', sameName: '"ImageBot"' },
+    ]);
+  });
+
+  it('constrains GRAPH variables to the scoped context graph data graph', async () => {
+    await store.insert([
+      q('urn:other:entity', 'http://schema.org/name', '"OtherGraph"', 'did:dkg:context-graph:other-agent-registry'),
+    ]);
+
+    const result = await engine.query(
+      'SELECT ?g ?name WHERE { GRAPH ?g { ?s <http://schema.org/name> ?name } } ORDER BY ?name',
+      { contextGraphId: CONTEXT_GRAPH },
+    );
+
+    expect(result.bindings).toHaveLength(1);
+    expect(result.bindings[0]['g']).toBe(GRAPH);
+    expect(result.bindings[0]['name']).toBe('"ImageBot"');
+  });
+
+  it('rejects mixed GRAPH-variable and default-graph triple patterns', async () => {
+    await expect(
+      engine.query(
+        `SELECT ?g ?name ?description WHERE {
+          GRAPH ?g { ?s <http://schema.org/name> ?name }
+          ?s <http://schema.org/description> ?description
+        }`,
+        { contextGraphId: CONTEXT_GRAPH },
+      ),
+    ).rejects.toThrow(/Scoped query violation: GRAPH variables cannot be mixed with default-graph triple patterns/i);
+  });
+
+  it('constrains GRAPH variables with non-ASCII names to the scoped context graph data graph', async () => {
+    await store.insert([
+      q('urn:other:entity', 'http://schema.org/name', '"OtherGraph"', 'did:dkg:context-graph:other-agent-registry'),
+    ]);
+
+    const result = await engine.query(
+      'SELECT ?name WHERE { GRAPH ?é { ?s <http://schema.org/name> ?name } } ORDER BY ?name',
+      { contextGraphId: CONTEXT_GRAPH },
+    );
+
+    expect(result.bindings).toEqual([
+      { name: '"ImageBot"' },
+    ]);
+  });
+
+  it('constrains GRAPH variables to data and shared memory for includeSharedMemory', async () => {
+    const sharedMemoryGraph = `did:dkg:context-graph:${CONTEXT_GRAPH}/_shared_memory`;
+    await store.insert([
+      q('urn:ws:entity:1', 'http://schema.org/name', '"Workspace Only"', sharedMemoryGraph),
+      q('urn:other:entity', 'http://schema.org/name', '"OtherGraph"', 'did:dkg:context-graph:other-agent-registry'),
+      q('urn:other:ws', 'http://schema.org/name', '"OtherWorkspace"', 'did:dkg:context-graph:other-agent-registry/_shared_memory'),
+    ]);
+
+    const result = await engine.query(
+      'SELECT ?g ?name WHERE { GRAPH ?g { ?s <http://schema.org/name> ?name } } ORDER BY ?name',
+      { contextGraphId: CONTEXT_GRAPH, includeSharedMemory: true },
+    );
+
+    expect(result.bindings.map((row) => row['name'])).toEqual(['"ImageBot"', '"Workspace Only"']);
+    expect(result.bindings.map((row) => row['g']).sort()).toEqual([GRAPH, sharedMemoryGraph].sort());
+  });
+
+  it('constrains GRAPH variables to shared memory when graphSuffix is _shared_memory', async () => {
+    const sharedMemoryGraph = `did:dkg:context-graph:${CONTEXT_GRAPH}/_shared_memory`;
+    await store.insert([
+      q('urn:ws:entity:1', 'http://schema.org/name', '"Workspace Only"', sharedMemoryGraph),
+      q('urn:other:ws', 'http://schema.org/name', '"OtherWorkspace"', 'did:dkg:context-graph:other-agent-registry/_shared_memory'),
+    ]);
+
+    const result = await engine.query(
+      'SELECT ?g ?name WHERE { GRAPH ?g { ?s <http://schema.org/name> ?name } } ORDER BY ?name',
+      { contextGraphId: CONTEXT_GRAPH, graphSuffix: '_shared_memory' },
+    );
+
+    expect(result.bindings).toEqual([
+      { g: sharedMemoryGraph, name: '"Workspace Only"' },
+    ]);
+  });
+
+  it('constrains GRAPH variables to the requested legacy sub-graph and shared memory graph', async () => {
+    const subGraphName = 'team-a';
+    const subGraph = `did:dkg:context-graph:${CONTEXT_GRAPH}/${subGraphName}`;
+    const subGraphSharedMemory = `did:dkg:context-graph:${CONTEXT_GRAPH}/${subGraphName}/_shared_memory`;
+    await store.insert([
+      q('urn:team:entity', 'http://schema.org/name', '"Team Data"', subGraph),
+      q('urn:team:ws', 'http://schema.org/name', '"Team Workspace"', subGraphSharedMemory),
+      q('urn:other-team:entity', 'http://schema.org/name', '"Other Team"', `did:dkg:context-graph:${CONTEXT_GRAPH}/team-b`),
+      q('urn:other-team:ws', 'http://schema.org/name', '"Other Team Workspace"', `did:dkg:context-graph:${CONTEXT_GRAPH}/team-b/_shared_memory`),
+    ]);
+
+    const result = await engine.query(
+      'SELECT ?g ?name WHERE { GRAPH ?g { ?s <http://schema.org/name> ?name } } ORDER BY ?name',
+      { contextGraphId: CONTEXT_GRAPH, subGraphName, includeSharedMemory: true },
+    );
+
+    expect(result.bindings.map((row) => row['name'])).toEqual(['"Team Data"', '"Team Workspace"']);
+    expect(result.bindings.map((row) => row['g']).sort()).toEqual([subGraph, subGraphSharedMemory].sort());
+  });
+
+  it('constrains outer shorthand GRAPH variables after a nested SELECT WHERE', async () => {
+    await store.insert([
+      q('urn:other:entity', 'http://schema.org/name', '"OtherGraph"', 'did:dkg:context-graph:other-agent-registry'),
+    ]);
+
+    const result = await engine.query(
+      `SELECT ?g ?name {
+        {
+          SELECT ?x WHERE {
+            BIND("keep" AS ?x)
+          }
+        }
+        GRAPH ?g { ?s <http://schema.org/name> ?name }
+      } ORDER BY ?name`,
+      { contextGraphId: CONTEXT_GRAPH },
+    );
+
+    expect(result.bindings).toEqual([
+      { g: GRAPH, name: '"ImageBot"' },
+    ]);
+  });
+
+  it('rejects nested subqueries that would keep GRAPH variables outside the scoped binding', async () => {
+    await store.insert([
+      q('urn:other:entity', 'http://schema.org/name', '"OtherGraph"', 'did:dkg:context-graph:other-agent-registry'),
+    ]);
+
+    await expect(
+      engine.query(
+        `SELECT ?name WHERE {
+          {
+            SELECT ?name WHERE {
+              GRAPH ?g { ?s <http://schema.org/name> ?name }
+            }
+          }
+        }`,
+        { contextGraphId: CONTEXT_GRAPH },
+      ),
+    ).rejects.toThrow(/Scoped query violation: GRAPH variables inside nested SELECT subqueries/i);
+  });
+
+  it('rejects nested GRAPH-variable subqueries even when comparison syntax appears before GRAPH', async () => {
+    await store.insert([
+      q('urn:other:entity', 'http://schema.org/name', '"OtherGraph"', 'did:dkg:context-graph:other-agent-registry'),
+    ]);
+
+    await expect(
+      engine.query(
+        `SELECT ?name WHERE {
+          {
+            SELECT ?name WHERE {
+              BIND(1 AS ?score)
+              FILTER(?score < 10)
+              GRAPH ?g { ?s <http://schema.org/name> ?name }
+            }
+          }
+        }`,
+        { contextGraphId: CONTEXT_GRAPH },
+      ),
+    ).rejects.toThrow(/Scoped query violation: GRAPH variables inside nested SELECT subqueries/i);
+  });
+
+  it('rejects optional GRAPH-variable patterns instead of changing OPTIONAL semantics', async () => {
+    await expect(
+      engine.query(
+        `SELECT ?name ?g ?nickname WHERE {
+          ?s <http://schema.org/name> ?name
+          OPTIONAL {
+            GRAPH ?g { ?s <http://schema.org/alternateName> ?nickname }
+          }
+        }`,
+        { contextGraphId: CONTEXT_GRAPH },
+      ),
+    ).rejects.toThrow(/Scoped query violation: GRAPH variables must appear at the top level/i);
   });
 });
 

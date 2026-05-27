@@ -581,7 +581,28 @@ export class EVMChainAdapter implements ChainAdapter {
   }
 
   private async getIdentityStorage(): Promise<Contract> {
-    return this.contracts.identityStorage ?? await this.resolveContract('IdentityStorage');
+    if (!this.contracts.identityStorage) {
+      this.contracts.identityStorage = await this.resolveContract('IdentityStorage');
+    }
+    return this.contracts.identityStorage;
+  }
+
+  private async getConvictionStakingStorage(): Promise<Contract | null> {
+    if (!this.contracts.convictionStakingStorage) {
+      try {
+        this.contracts.convictionStakingStorage = await this.resolveContract('ConvictionStakingStorage');
+      } catch { return null; }
+    }
+    return this.contracts.convictionStakingStorage;
+  }
+
+  private async getStakingStorage(): Promise<Contract | null> {
+    if (!this.contracts.stakingStorage) {
+      try {
+        this.contracts.stakingStorage = await this.resolveContract('StakingStorage');
+      } catch { return null; }
+    }
+    return this.contracts.stakingStorage;
   }
 
   private async hasAdminPurpose(
@@ -844,23 +865,6 @@ export class EVMChainAdapter implements ChainAdapter {
       this.contracts.dkgPublishingConvictionNFT = await this.resolveContract('DKGPublishingConvictionNFT');
     } catch {
       // DKGPublishingConvictionNFT not deployed — V10 PCA agent-resolution unavailable
-    }
-
-    try {
-      this.contracts.identityStorage = await this.resolveContract('IdentityStorage');
-    } catch {
-      // IdentityStorage not deployed — identity checks will re-resolve per call
-    }
-
-    try {
-      this.contracts.convictionStakingStorage = await this.resolveContract('ConvictionStakingStorage');
-    } catch {
-      // ConvictionStakingStorage not deployed — falls back to V8 StakingStorage
-    }
-    try {
-      this.contracts.stakingStorage = await this.resolveContract('StakingStorage');
-    } catch {
-      // V8 StakingStorage not deployed — ACK verification skips stake check
     }
 
     try {
@@ -2590,13 +2594,13 @@ export class EVMChainAdapter implements ChainAdapter {
     // would zero-gate every legitimate V10 ACK signer (this exactly mirrors
     // the on-chain `KnowledgeAssetsV10` ACK-signer gate, also rewired in
     // v4.0.0). Falls back to V8 if CSS is not registered (older deploys).
-    const cs = this.contracts.convictionStakingStorage ?? null;
+    const cs = await this.getConvictionStakingStorage();
     if (cs) {
       const stake: bigint = await cs.getNodeStakeV10(claimedIdentityId);
       return stake !== 0n;
     }
 
-    const ss = this.contracts.stakingStorage ?? null;
+    const ss = await this.getStakingStorage();
     if (!ss) return false;
     const v8Stake: bigint = await ss.getNodeStake(claimedIdentityId);
     return v8Stake !== 0n;

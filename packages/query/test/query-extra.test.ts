@@ -651,6 +651,27 @@ describe('[Q-3] resolveViewGraphs + DKGQueryEngine route working-memory', () => 
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// View routing constrains caller GRAPH variables to the selected View
+// ─────────────────────────────────────────────────────────────────────────────
+describe('DKGQueryEngine view routing constrains GRAPH variables', () => {
+  it('verified-memory with GRAPH ?g does not read SWM-only data', async () => {
+    const store = new OxigraphStore();
+    const engine = new DKGQueryEngine(store);
+
+    await store.insert([
+      quad('urn:view:swm-only', 'http://schema.org/name', '"SwmOnly"', contextGraphSharedMemoryUri(CG)),
+    ]);
+
+    const result = await engine.query(
+      'SELECT ?g ?name WHERE { GRAPH ?g { ?s <http://schema.org/name> ?name } }',
+      { contextGraphId: CG, view: 'verified-memory' },
+    );
+
+    expect(result.bindings).toEqual([]);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Q-4  QueryHandler.executeSparql timeout → GAS_LIMIT_EXCEEDED
 // ─────────────────────────────────────────────────────────────────────────────
 describe('[Q-4] QueryHandler executeSparql hits the timeout path', () => {

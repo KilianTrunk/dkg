@@ -4435,6 +4435,32 @@ program
         return;
       }
 
+      // RFC-41 §4.7.7 invocation pattern #3: before applying an update,
+      // `dkg update` MUST run the install-layout + version-skew doctor
+      // checks. If either reports an `error`, abort with a pointer at
+      // `dkg doctor --json` for full context. Warnings do not block.
+      try {
+        const { createProductionDeps, runDoctor, UPDATE_PREFLIGHT_CHECKS } =
+          await import('./doctor/index.js');
+        const preflightDeps = createProductionDeps({ apiPort: config.apiPort ?? 9200 });
+        const preflight = await runDoctor(preflightDeps, { checks: UPDATE_PREFLIGHT_CHECKS });
+        if (preflight.exitCode === 2) {
+          const errors = preflight.findings.filter((f) => f.severity === 'error');
+          console.error('\n[dkg update] Pre-flight checks failed; refusing to apply update.\n');
+          for (const f of errors) {
+            console.error(`  • [${f.check}] ${f.message}`);
+            if (f.advisory) console.error(`      → ${f.advisory}`);
+          }
+          console.error('\nRun `dkg doctor --json` for the full diagnostic report.\n');
+          process.exit(2);
+        }
+      } catch (err: any) {
+        // Pre-flight crashing should not block updates — fall through
+        // and let the real update path do its thing. Warn loudly so a
+        // recurring failure is visible.
+        process.stderr.write(`[dkg update] WARNING: pre-flight doctor check crashed (${err?.message ?? err}); continuing without it.\n`);
+      }
+
       let version = versionOrRef ?? null;
       if (version) {
         version = version.replace(/^refs\/tags\/v?/, '').replace(/^v/, '');
@@ -4470,6 +4496,31 @@ program
     }
 
     // --- Git-based update path (monorepo / install.sh installs) ---
+
+    // RFC-41 §5 PR 2 deprecation warning. The git-based update path
+    // (monorepo `dkg update` + install.sh-style git-checkout updates)
+    // is being removed in Bundle B. Bundle A only warns; B converts
+    // this to a hard refusal once the npm path is the proven default
+    // and the §6.5 rollout prerequisites are green.
+    //
+    // For monorepo contributors: the canonical "update" is
+    // `git pull && pnpm install && pnpm build` from the repo root.
+    // For install.sh operators: see docs/operator/MIGRATE_TO_NPM.md
+    // to convert to the npm path before Bundle B lands.
+    process.stderr.write(
+      '\n' +
+      '[dkg update] WARNING: invoking the git-based update path. This path is\n' +
+      '  deprecated in rc.12 per OT-RFC-41 and will be removed in a near-term\n' +
+      '  release. The canonical update mechanism is `npm install -g\n' +
+      '  @origintrail-official/dkg` + `dkg update`.\n' +
+      '\n' +
+      '  - Monorepo contributors: use `git pull && pnpm install && pnpm build`\n' +
+      '    in the repo root instead of `dkg update`.\n' +
+      '  - install.sh-style operators: see docs/operator/MIGRATE_TO_NPM.md.\n' +
+      '\n' +
+      '  RFC: https://github.com/OriginTrail/dkgv10-spec/blob/main/rfcs/OT-RFC-41-edge-node-npm-only-install-and-update.md\n' +
+      '\n',
+    );
 
     const refOverride = versionOrRef ? normalizeVersionTagRef(versionOrRef) : undefined;
     const verifyTagSignature = Boolean(refOverride && refOverride.startsWith('refs/tags/')) && opts.verifyTag !== false;
@@ -4612,6 +4663,48 @@ program
     }
     console.log(`Rolled back: current → slot ${target}`);
     console.log('Daemon stopped. Run "dkg start" to start with the rolled-back version.');
+  });
+
+// ─── dkg doctor ──────────────────────────────────────────────────────
+//
+// Per OT-RFC-41 §4.7. Surfaces install-layout / version-skew / orphan-clone
+// anomalies before an agent touches DKG state. Wired into SKILL.md as a
+// session-start ritual; also invoked by `dkg update`'s pre-flight check
+// (the orchestrator runs a narrow subset — install-layout + version-skew).
+
+program
+  .command('doctor')
+  .description('Diagnose install state, version skew, orphan clones, plugin root, and config sanity')
+  .option('--json', 'Emit the report as JSON instead of human-readable text')
+  .option('--no-orphan-scan', "Skip the orphan-repository home-directory scan (§4.7.1)")
+  .action(async (opts: { json?: boolean; orphanScan?: boolean }) => {
+    const { createProductionDeps, runDoctor, formatDoctorReport, ALL_CHECK_IDS } =
+      await import('./doctor/index.js');
+    const config = await loadConfig();
+    const deps = createProductionDeps({ apiPort: config.apiPort ?? 9200 });
+    // Overlay operator-configured scan roots + skipChecks from config.
+    // The doctor namespace is opt-in — absent config means defaults.
+    const doctorConfig = (config as Record<string, unknown>).doctor as
+      | { scanRoots?: unknown; skipChecks?: unknown }
+      | undefined;
+    if (doctorConfig) {
+      if (Array.isArray(doctorConfig.scanRoots)) {
+        deps.extraScanRoots = doctorConfig.scanRoots.filter((s): s is string => typeof s === 'string');
+      }
+      if (Array.isArray(doctorConfig.skipChecks)) {
+        deps.skipChecks = doctorConfig.skipChecks.filter((s): s is string => typeof s === 'string');
+      }
+    }
+    const requestedChecks = opts.orphanScan === false
+      ? ALL_CHECK_IDS.filter((id) => id !== 'orphan-repos')
+      : ALL_CHECK_IDS;
+    const report = await runDoctor(deps, { checks: requestedChecks });
+    if (opts.json) {
+      console.log(JSON.stringify(report, null, 2));
+    } else {
+      console.log(formatDoctorReport(report));
+    }
+    process.exit(report.exitCode);
   });
 
 // ─── dkg random-sampling (alias: rs) ─────────────────────────────────

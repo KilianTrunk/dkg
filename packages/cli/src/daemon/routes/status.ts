@@ -179,6 +179,8 @@ import {
   loadMarkItDownTargets,
   getNodeVersion,
   getCurrentCommitShort,
+  loadBuildInfo,
+  detectInstallMode,
   loadSkillTemplate,
   loadImporterSkillTemplate,
   buildSkillMd,
@@ -589,10 +591,22 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
       advertisedAddresses: agent.multiaddrs,
       configuredAnnounceAddresses: config.announceAddresses ?? [],
     });
+    // RFC-41 §4.9 + §4.3: expose build-info + installMode for
+    // doctor / agent disambiguation. loadBuildInfo() falls back to
+    // the {commit: "uncommitted", distTag: "monorepo", ...}
+    // sentinels when build-info.json is absent (monorepo / dev),
+    // so consumers can branch reliably.
+    const buildInfo = loadBuildInfo();
     return jsonResponse(res, 200, {
       name: config.name,
       version: nodeVersion,
-      commit: nodeCommit || null,
+      commit: buildInfo.commit !== "uncommitted" ? buildInfo.commit : (nodeCommit || null),
+      commitShort: buildInfo.commitShort !== "00000000"
+        ? buildInfo.commitShort
+        : (nodeCommit ? nodeCommit.slice(0, 8) : null),
+      buildTime: buildInfo.buildTime,
+      distTag: buildInfo.distTag,
+      installMode: detectInstallMode(),
       peerId: agent.peerId,
       nodeRole: config.nodeRole ?? "edge",
       networkId: networkId.slice(0, 16),

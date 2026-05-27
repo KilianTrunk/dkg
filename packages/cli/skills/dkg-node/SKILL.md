@@ -20,6 +20,33 @@ This skill teaches you the full node API surface so you can operate autonomously
 
 To see which context graphs (projects) are currently subscribed, call `GET /api/context-graph/list` — this returns a live list that stays current as projects are created or subscribed during the session.
 
+## 1a. Operating the node (install, update, troubleshoot)
+
+> **Before reasoning about install state, run `dkg doctor`.** Detects orphan repository clones, version skew between the daemon and the global `dkg` CLI, served-UI / source mismatch, broken plugin install roots, and other install-layout anomalies. Use `dkg doctor --json` for a machine-parsable report; the `state` field always carries the full diagnostic snapshot (daemon entry point, install mode, node role, dkg-home, current version + commit, auto-update settings) independent of any anomaly findings.
+
+**Updating DKG:**
+
+- The canonical update verb is `dkg update`. It resolves the next release from the npm registry and applies it.
+- **Do not `git pull`.** Do not clone the repository. Do not edit files under `~/.dkg/releases/` (on Core nodes — Edge nodes have no `~/.dkg/releases/` at all under RFC-41).
+- If `dkg doctor` reports orphan clones at `~/dkg/`, `~/Projects/dkg/`, or similar, ask the operator before touching them — they are not the running daemon.
+- `dkg update --check` previews the available version without applying.
+- `dkg update --allow-prerelease` follows the `next` dist-tag for pre-release builds.
+- `dkg rollback` reverts to the previous version (Edge: re-installs the prior npm version recorded in `~/.dkg/previous-version`; Core: flips the blue-green slot symlink).
+
+**Detecting current install state:**
+
+- `dkg --version` — the global CLI's version.
+- `curl http://127.0.0.1:9200/api/status | jq '{version, commit, commitShort, buildTime, distTag, installMode, nodeRole}'` — the running daemon's version, commit, and install mode. Mismatch between `dkg --version` and the daemon's version is the §1a version-skew condition; `dkg doctor` reports it explicitly.
+- `cat ~/.dkg/config.json | jq .nodeRole` — `edge` (default; daemon runs from npm-global install, no release slots) or `core` (operator opted into blue-green slots via `dkg init --role core`).
+
+**Troubleshooting common confusion:**
+
+- "There seem to be multiple DKG installations on this machine" → run `dkg doctor`; the `state.cli.globalPath`, `state.daemon.entryPoint`, and orphan-repos check together identify the canonical install and any stray clones.
+- "The UI shows an old version even after I updated" → run `dkg doctor`; the served-UI / source-mismatch check flags stale browser / PWA / service-worker caches.
+- "I ran `npm install -g @origintrail-official/dkg@latest` but the daemon still reports the old version" → on Edge nodes the daemon needs a restart to pick up the new install (`dkg restart`). On Core nodes, the slot mechanism gates the visible version on `dkg update`'s atomic swap, not on `npm install -g` directly — use `dkg update` for Core nodes.
+
+The full design rationale lives in [OT-RFC-41](https://github.com/OriginTrail/dkgv10-spec/blob/main/rfcs/OT-RFC-41-edge-node-npm-only-install-and-update.md).
+
 ## 2. Capabilities Overview
 
 > **Note:** This skill describes the full DKG V10 API surface. Some endpoints

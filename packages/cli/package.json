@@ -65,6 +65,7 @@
     "project.json",
     "markitdown-build-info.json",
     "markitdown-targets.json",
+    "build-info.json",
     "scripts",
     "skills",
     "README.md",

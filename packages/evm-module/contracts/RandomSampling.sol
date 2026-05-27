@@ -187,6 +187,9 @@ contract RandomSampling is INamed, IVersioned, ContractStatus, IInitializable {
      * Generates a random knowledge collection and chunk to be proven
      * Can only create one challenge per proofing period
      */
+    // Slither: strict equality is the intended proof-period identity check;
+    // updateAndGetActiveProofPeriodStartBlock writes only to protocol storage.
+    // slither-disable-next-line incorrect-equality,reentrancy-events
     function createChallenge()
         external
         profileExists(identityStorage.getIdentityId(msg.sender))
@@ -393,6 +396,9 @@ contract RandomSampling is INamed, IVersioned, ContractStatus, IInitializable {
      * @return challenge The generated challenge struct (signature-compatible
      *         with V8 — `submitProof` does not need to know the cgId).
      */
+    // Slither: event-after-storage-write is expected; the storage contract is
+    // trusted protocol state, not an untrusted external callback surface.
+    // slither-disable-next-line reentrancy-events
     function _generateChallenge(address originalSender) internal returns (RandomSamplingLib.Challenge memory) {
         bytes32 baseSeed = _deriveChallengeSeed(originalSender);
         uint256 currentEpoch = chronos.getCurrentEpoch();
@@ -491,6 +497,10 @@ contract RandomSampling is INamed, IVersioned, ContractStatus, IInitializable {
      *      - {NoEligibleKnowledgeCollection} CG has an empty KC list, or
      *                                        every retry hit an expired KC.
      */
+    // Slither: protocol sampling intentionally derives bounded pseudo-random
+    // indices from the period seed; the storage reads are bounded by
+    // MAX_CG_RETRIES/MAX_KC_RETRIES and strict equality checks are guards.
+    // slither-disable-start weak-prng,uninitialized-local,cyclomatic-complexity,incorrect-equality,calls-loop,timestamp
     function _pickWeightedChallenge(
         bytes32 seed,
         uint256 currentEpoch
@@ -591,6 +601,7 @@ contract RandomSampling is INamed, IVersioned, ContractStatus, IInitializable {
         // fresh entropy.
         revert NoEligibleKnowledgeCollection();
     }
+    // slither-disable-end weak-prng,uninitialized-local,cyclomatic-complexity,incorrect-equality,calls-loop,timestamp
 
     /// @dev O(n) membership check against the exhausted-CG list. `n` is bounded
     ///      by `MAX_CG_RETRIES` (≤ 5), so this is a fixed sub-linear cost per
@@ -620,6 +631,9 @@ contract RandomSampling is INamed, IVersioned, ContractStatus, IInitializable {
      *      inside `_pickWeightedChallenge` step 2 via the per-KC commitment
      *      check, not here.
      */
+    // Slither: this storage read is intentionally used inside the bounded
+    // sampling loop above.
+    // slither-disable-next-line calls-loop
     function _isCGEligible(uint256 contextGraphId) internal view returns (bool) {
         // RFC-39 Phase B (PR-B): curated CGs are re-enabled in the random-
         // sampling draw now that the off-chain prover ships a curated branch
@@ -657,6 +671,9 @@ contract RandomSampling is INamed, IVersioned, ContractStatus, IInitializable {
         return _calculateNodeScore(identityId, convictionStakingStorage.getNodeEffectiveStake(identityId));
     }
 
+    // Slither: score math uses fixed-point integer ratios deliberately; epoch
+    // storage reads are over a bounded four-epoch window.
+    // slither-disable-start divide-before-multiply,calls-loop
     function _calculateNodeScore(uint72 identityId, uint256 nodeEffectiveStake) internal view returns (uint256) {
         uint256 currentEpoch = chronos.getCurrentEpoch();
 
@@ -708,12 +725,16 @@ contract RandomSampling is INamed, IVersioned, ContractStatus, IInitializable {
         uint256 innerScore18 = baselineComponent18 + publishingComponent18 + askPublishingComponent18;
         return (stakeFactor18 * innerScore18) / SCALE18;
     }
+    // slither-disable-end divide-before-multiply,calls-loop
 
     /**
      * @dev Updates and returns the current active proof period start block
      * Automatically advances to the next period if the current one has ended
      * @return Current active proof period start block number
      */
+    // Slither: divide-then-multiply intentionally floors to the latest complete
+    // proof period boundary.
+    // slither-disable-next-line divide-before-multiply
     function updateAndGetActiveProofPeriodStartBlock() public returns (uint256) {
         uint256 activeProofingPeriodDurationInBlocks = getActiveProofingPeriodDurationInBlocks();
 

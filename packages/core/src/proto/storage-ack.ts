@@ -66,6 +66,24 @@ export const STORAGE_ACK_DECLINE_CODES = {
   MERKLE_MISMATCH_IN_SWM: 'MERKLE_MISMATCH_IN_SWM',
   /** Operational signer was just removed / rotated off-chain. */
   SIGNER_NOT_REGISTERED: 'SIGNER_NOT_REGISTERED',
+  /**
+   * OT-RFC-38 LU-11 / OT-RFC-39 — V2 chunked ACK: one or more of the
+   * `ciphertextChunkCount` ciphertext chunks the publisher claims are
+   * staged for this batch were not found locally under
+   * `urn:dkg:swm:v10-publish-ciphertext-chunk/<batchId>/<i>`. Typical
+   * causes: a chunk-emitting SWM gossip was lost in flight; the core
+   * just subscribed and hasn't backfilled yet; an attacker is bluffing.
+   * Transient — the publisher should retry against this peer once the
+   * late-join sync verb has a chance to backfill.
+   */
+  MISSING_CIPHERTEXT_CHUNKS: 'MISSING_CIPHERTEXT_CHUNKS',
+  /**
+   * OT-RFC-38 LU-11 / OT-RFC-39 — V2 chunked ACK: all chunks were
+   * present locally but the recomputed `ciphertextChunksRoot` does
+   * not match the publisher's claim. Permanent (a content-integrity
+   * lie); the publisher MUST republish with a corrected commitment.
+   */
+  CIPHERTEXT_ROOT_MISMATCH: 'CIPHERTEXT_ROOT_MISMATCH',
 } as const;
 
 export type StorageACKDeclineCode =
@@ -85,6 +103,12 @@ export type StorageACKDeclineCode =
 export const TRANSIENT_STORAGE_ACK_DECLINE_CODES: ReadonlySet<string> = new Set<string>([
   STORAGE_ACK_DECLINE_CODES.NO_DATA_IN_SWM,
   STORAGE_ACK_DECLINE_CODES.MERKLE_MISMATCH_IN_SWM,
+  // LU-11: a missing chunk usually means a gossip lost or a late-join
+  // sync hasn't backfilled yet — both clear on the publisher's normal
+  // retry cadence once SWM has caught up. A root mismatch is NOT
+  // transient: the publisher's commitment is wrong, no amount of
+  // waiting fixes it.
+  STORAGE_ACK_DECLINE_CODES.MISSING_CIPHERTEXT_CHUNKS,
 ]);
 
 /** True iff `code` names a decline the publisher should retry rather than treat as permanent. */

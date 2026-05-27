@@ -2214,13 +2214,37 @@ export class EVMChainAdapter implements ChainAdapter {
       tokenAmount: params.tokenAmount,
       isImmutable: params.isImmutable,
       merkleLeafCount: params.merkleLeafCount,
-      // RFC-39 Phase A.5 — ciphertext-commitment pair. Defaults to
-      // `bytes32(0)` / 0 (legacy/transitional, picker skips this KC in
-      // the curated draw). Callers that have an LU-11 commitment set
-      // both via `ciphertextChunksRoot` + `ciphertextChunkCount`.
-      ciphertextChunksRoot: params.ciphertextChunksRoot
-        ? ethers.hexlify(params.ciphertextChunksRoot)
-        : ethers.ZeroHash,
+      // RFC-39 Phase A.5 / LU-11 — ciphertext-commitment pair.
+      //
+      // The two fields MUST be set together or omitted together.
+      // - Both omitted (or root=ZeroHash + count=0) = legacy /
+      //   public-KC path: picker skips this KC in the curated draw
+      //   today (commit 8 baseline) and RFC-39 random sampling never
+      //   indexes it; safe wire-compatible default for non-chunked
+      //   callers.
+      // - Both set = LU-11 chunked publish: cores already hold the
+      //   matching per-chunk ciphertexts under
+      //   urn:dkg:swm:v10-publish-ciphertext-chunk/<batchId>/<i> and
+      //   recomputed the same root before signing the V2 ACK.
+      // Anything else is a programmer error — fail loud instead of
+      // silently defaulting one side and producing an asymmetric
+      // commitment that on-chain `_pickWeightedChallenge` would
+      // skip (count=0) or that core-side V2 verifiers would never
+      // try to satisfy (root=ZeroHash but count>0).
+      ciphertextChunksRoot: (() => {
+        const haveRoot = !!params.ciphertextChunksRoot && params.ciphertextChunksRoot.length === 32;
+        const haveCount = typeof params.ciphertextChunkCount === 'number' && params.ciphertextChunkCount > 0;
+        if (haveRoot !== haveCount) {
+          throw new Error(
+            `evm-adapter.createKnowledgeAssetsV10: ciphertextChunksRoot and ciphertextChunkCount ` +
+            `must both be set or both omitted; got root=${haveRoot ? 'set' : 'unset'}, ` +
+            `count=${haveCount ? params.ciphertextChunkCount : 'unset'}. ` +
+            `An asymmetric pair would leave RandomSampling._pickWeightedChallenge unable to ` +
+            `verify the curated draw against off-chain ciphertext storage.`,
+          );
+        }
+        return haveRoot ? ethers.hexlify(params.ciphertextChunksRoot!) : ethers.ZeroHash;
+      })(),
       ciphertextChunkCount: params.ciphertextChunkCount ?? 0,
       publisherNodeIdentityId: params.publisherNodeIdentityId,
       authorAddress: params.author.address,

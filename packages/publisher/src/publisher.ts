@@ -80,6 +80,25 @@ export type V10ACKProvider = (
    * are unchanged.
    */
   isEncryptedPayload?: boolean,
+  /**
+   * OT-RFC-38 LU-11 / OT-RFC-39. When present, the publisher has
+   * already chunked + AEAD-encrypted the curated payload + fanned
+   * per-chunk ciphertexts via SWM gossip. The ACK request is sent
+   * over `PROTOCOL_STORAGE_ACK_V2` with `stagingQuads` empty (chunks
+   * live on SWM, never on the ACK wire) and the PublishIntent
+   * carries `ciphertextChunksRoot` + `ciphertextChunkCount` +
+   * `ackProtocolVersion = 2`. Cores recompute the root from local
+   * per-chunk store and DECLINE on mismatch.
+   *
+   * Mutually exclusive with the LU-5 single-blob path:
+   * `isEncryptedPayload` must also be `true` when this is set, and
+   * `stagingQuads` MUST be empty/undefined. Pre-LU-11 cores never
+   * see this field and stay on V1 semantics.
+   */
+  chunkedCommitment?: {
+    ciphertextChunksRoot: Uint8Array;
+    ciphertextChunkCount: number;
+  },
 ) => Promise<V10CoreNodeACK[]>;
 
 /**
@@ -159,6 +178,37 @@ export interface PublishOptions {
    * plaintext nquads inline.
    */
   encryptInlinePayload?: (plaintextNquads: Uint8Array) => Promise<Uint8Array> | Uint8Array;
+  /**
+   * OT-RFC-38 LU-11 / OT-RFC-39. The chunked-AEAD sibling of
+   * `encryptInlinePayload`. When set AND `encryptInlinePayload` is
+   * also set, the chunked path takes precedence: the publisher slices
+   * the plaintext into N chunks, encrypts each with a deterministic
+   * per-chunk nonce, fans the per-chunk ciphertexts out via SWM
+   * gossip (one envelope per chunk, with `swmMessageIndex` + chunked
+   * type marker), and sends an empty `stagingQuads` ACK request
+   * carrying only the resulting `ciphertextChunksRoot` +
+   * `ciphertextChunkCount` over `PROTOCOL_STORAGE_ACK_V2`. The
+   * `batchId` argument lets the agent's implementation key each
+   * chunk's persistence slot to a stable per-publish identifier
+   * (the V10 KC `merkleRoot`) so cores can index per-chunk
+   * ciphertexts by `(cgId, batchId, chunkIndex)` for RFC-39 random
+   * sampling. Returning bytes is intentionally NOT exposed here —
+   * the chunks live on the SWM substrate, never in the ACK request.
+   */
+  encryptInlineChunked?: (input: {
+    plaintextNquads: Uint8Array;
+    batchId: Uint8Array;
+  }) => Promise<{
+    ciphertextChunksRoot: Uint8Array;
+    ciphertextChunkCount: number;
+    /**
+     * Ciphertext byte size the publisher signed into the V10 ACK
+     * digest. Concatenation of every per-chunk ciphertext length —
+     * used downstream as `publicByteSize` for pricing parity with
+     * the LU-5 single-blob path.
+     */
+    totalCiphertextBytes: number;
+  }>;
   /** When true, the KC was created via V10 and updates should use the V10 path. */
   v10Origin?: boolean;
   /**

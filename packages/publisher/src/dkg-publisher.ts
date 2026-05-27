@@ -1158,6 +1158,15 @@ export class DKGPublisher implements Publisher {
        * for the full semantics.
        */
       encryptInlinePayload?: PublishOptions['encryptInlinePayload'];
+      /**
+       * OT-RFC-38 LU-11. Sibling of `encryptInlinePayload` — when set,
+       * the publisher routes through the chunked path that fans
+       * per-chunk ciphertexts via SWM gossip and ships only the
+       * commitment to cores via V2 ACK. See
+       * `PublishOptions.encryptInlineChunked` for the full
+       * semantics.
+       */
+      encryptInlineChunked?: PublishOptions['encryptInlineChunked'];
     },
   ): Promise<PublishResult> {
     const ctx = options?.operationCtx ?? createOperationContext('publishFromSWM');
@@ -1275,6 +1284,7 @@ export class DKGPublisher implements Publisher {
       publisherNodeIdentityIdOverride: options?.publisherNodeIdentityIdOverride,
       precomputedAttestation: options?.precomputedAttestation,
       encryptInlinePayload: options?.encryptInlinePayload,
+      encryptInlineChunked: options?.encryptInlineChunked,
       [INTERNAL_ORIGIN_TOKEN]: true,
     };
     const publishResult = await this.publish(internalPublishOptions);
@@ -1812,9 +1822,39 @@ export class DKGPublisher implements Publisher {
     // the existing behaviour: `fromSharedMemory` → cores look up SWM
     // locally; otherwise plaintext inline.
     const useEncryptedInline = typeof options.encryptInlinePayload === 'function';
+    // OT-RFC-38 LU-11: chunked path takes precedence when wired. The
+    // agent always sets BOTH callbacks for curated CGs (see
+    // `_resolveEncryptInlinePayload` + `_resolveEncryptInlineChunked`
+    // on DKGAgent) so this branch picks the strictly-better path
+    // without needing per-call flag plumbing. A future commit can drop
+    // the LU-5 single-blob callback once chunked is the only path.
+    const useChunkedInline = useEncryptedInline && typeof options.encryptInlineChunked === 'function';
     let stagingQuads: Uint8Array | undefined;
     let stagingByteSize = publicByteSize;
-    if (useEncryptedInline) {
+    let chunkedCommitment: {
+      ciphertextChunksRoot: Uint8Array;
+      ciphertextChunkCount: number;
+    } | undefined;
+    if (useChunkedInline) {
+      const plaintextBytes = new TextEncoder().encode(nquadsStr);
+      // batchId = V10 KC merkleRoot. Stable per-publish identifier the
+      // cores use to key per-chunk persistence as
+      // (cgId, batchId, chunkIndex) — the exact triple RFC-39 random
+      // sampling samples against.
+      const chunked = await options.encryptInlineChunked!({
+        plaintextNquads: plaintextBytes,
+        batchId: kcMerkleRoot,
+      });
+      // No stagingQuads on the chunked path — chunks travel via SWM
+      // gossip, never on the ACK wire. Cores recompute the root from
+      // local per-chunk store and DECLINE on mismatch.
+      stagingQuads = undefined;
+      stagingByteSize = BigInt(chunked.totalCiphertextBytes);
+      chunkedCommitment = {
+        ciphertextChunksRoot: chunked.ciphertextChunksRoot,
+        ciphertextChunkCount: chunked.ciphertextChunkCount,
+      };
+    } else if (useEncryptedInline) {
       const plaintextBytes = new TextEncoder().encode(nquadsStr);
       const ciphertext = await options.encryptInlinePayload!(plaintextBytes);
       stagingQuads = ciphertext instanceof Uint8Array ? ciphertext : new Uint8Array(ciphertext);
@@ -1974,6 +2014,7 @@ export class DKGPublisher implements Publisher {
           swmGraphId, options.subGraphName,
           kcMerkleLeafCount,
           useEncryptedInline,
+          chunkedCommitment,
         );
         // PR5 ACK-provenance summary — one line per publish that names
         // every ACKing core and the LU-6 Phase B discovery path that
@@ -2416,6 +2457,43 @@ export class DKGPublisher implements Publisher {
           onPhase?.('chain:writeahead', 'start');
         };
         try {
+          // OT-RFC-38 LU-11 / OT-RFC-39 — handshake hardening.
+          // When the publisher ran the chunked emit path, the chain
+          // submit MUST carry the same `(ciphertextChunksRoot,
+          // ciphertextChunkCount)` pair that was signed into the V2
+          // ACK digest. Anything else (e.g. silently submitting
+          // `bytes32(0)` / `0` on a curated KC) would leave the
+          // on-chain commitment empty — RFC-39 random sampling would
+          // then skip the KC because `_isCGEligible` filters zero-
+          // commitment curated CGs out of the picker. Fail loud
+          // here so the bug surfaces at the publisher instead of as
+          // missing reward proofs days later.
+          if (useChunkedInline) {
+            if (
+              !chunkedCommitment
+              || chunkedCommitment.ciphertextChunksRoot.length !== 32
+              || chunkedCommitment.ciphertextChunkCount <= 0
+            ) {
+              throw new Error(
+                `LU-11: dkg-publisher refused to submit chunked publish with empty commitment ` +
+                `(root=${chunkedCommitment?.ciphertextChunksRoot.length ?? 0} bytes, ` +
+                `count=${chunkedCommitment?.ciphertextChunkCount ?? 0}). ` +
+                `Either the chunked emitter returned no chunks (publisher bug — see ` +
+                `_resolveEncryptInlineChunked) or the commitment was lost between encrypt ` +
+                `and submit (threading bug — chunkedCommitment is intentionally optional ` +
+                `on the chain adapter so non-chunked callers stay unchanged).`,
+              );
+            }
+            const zeroRoot = chunkedCommitment.ciphertextChunksRoot
+              .every((b) => b === 0);
+            if (zeroRoot) {
+              throw new Error(
+                `LU-11: dkg-publisher refused to submit chunked publish with zero ciphertextChunksRoot — ` +
+                `treat as a programmer error in the chunked emitter; the root MUST be the keccak256 ` +
+                `Merkle root over per-chunk leaves, never bytes32(0).`,
+              );
+            }
+          }
           onChainResult = await this.chain.createKnowledgeAssetsV10!({
             publishOperationId,
             contextGraphId: v10CgId,
@@ -2423,6 +2501,8 @@ export class DKGPublisher implements Publisher {
             merkleRoot: kcMerkleRoot,
             knowledgeAssetsAmount: kaCount,
             byteSize: effectiveByteSize,
+            ciphertextChunksRoot: chunkedCommitment?.ciphertextChunksRoot,
+            ciphertextChunkCount: chunkedCommitment?.ciphertextChunkCount,
             // PCA strict-equality: must match the value committed to the
             // ACK digest produced by the ACK collector
             // (`packages/publisher/src/ack-collector.ts:159` invokes

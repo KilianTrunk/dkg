@@ -1,5 +1,8 @@
 import {
   PROTOCOL_STORAGE_ACK,
+  PROTOCOL_STORAGE_ACK_V2,
+  ACK_PROTOCOL_VERSION_V1_LU5,
+  ACK_PROTOCOL_VERSION_V2_LU11,
   encodePublishIntent,
   decodeStorageACK,
   computePublishACKDigest,
@@ -139,6 +142,21 @@ export class ACKCollector {
      * unchanged.
      */
     isEncryptedPayload?: boolean;
+    /**
+     * OT-RFC-38 LU-11 / OT-RFC-39. When set, the publisher has fanned
+     * per-chunk ciphertexts via SWM gossip (one envelope per chunk,
+     * carrying `swmMessageIndex` + the chunked type marker) and the
+     * ACK request goes out on `PROTOCOL_STORAGE_ACK_V2` with empty
+     * `stagingQuads` + populated `ciphertextChunksRoot` /
+     * `ciphertextChunkCount` / `ackProtocolVersion = 2`. Pre-LU-11
+     * cores never see this field and stay on V1 semantics. Required
+     * when `isEncryptedPayload === true` AND chunked emission was
+     * used; mutually exclusive with non-empty `stagingQuads`.
+     */
+    chunkedCommitment?: {
+      ciphertextChunksRoot: Uint8Array;
+      ciphertextChunkCount: number;
+    };
   }): Promise<ACKCollectionResult> {
     const {
       merkleRoot, contextGraphId, contextGraphIdStr,
@@ -163,6 +181,40 @@ export class ACKCollector {
     // the ACK against. `swmGraphId` (optional) is the SOURCE graph where
     // data lives in SWM — only set when the publisher is remapping a named
     // SWM graph to a numeric on-chain id.
+    // OT-RFC-38 LU-11: chunked path requires V2 ACK protocol id and
+    // empty `stagingQuads` (chunks live on SWM, not on the ACK wire).
+    // Anything else is a programmer error in the publisher's branch
+    // selection — surface it loudly instead of silently shipping a
+    // V1 envelope that pre-LU-11 cores would still accept.
+    if (params.chunkedCommitment) {
+      if (!params.isEncryptedPayload) {
+        throw new Error(
+          'ACKCollector: chunkedCommitment requires isEncryptedPayload=true (curated-CG-only path)',
+        );
+      }
+      if (params.stagingQuads && params.stagingQuads.length > 0) {
+        throw new Error(
+          'ACKCollector: chunkedCommitment + non-empty stagingQuads is invalid — ' +
+          'on the LU-11 chunked path the ciphertext lives in SWM, not on the ACK wire',
+        );
+      }
+      if (params.chunkedCommitment.ciphertextChunkCount <= 0) {
+        throw new Error(
+          `ACKCollector: chunkedCommitment.ciphertextChunkCount must be positive; got ${params.chunkedCommitment.ciphertextChunkCount}`,
+        );
+      }
+      if (params.chunkedCommitment.ciphertextChunksRoot.length !== 32) {
+        throw new Error(
+          `ACKCollector: chunkedCommitment.ciphertextChunksRoot must be 32 bytes; got ${params.chunkedCommitment.ciphertextChunksRoot.length}`,
+        );
+      }
+    }
+    const ackProtocolVersion = params.chunkedCommitment
+      ? ACK_PROTOCOL_VERSION_V2_LU11
+      : ACK_PROTOCOL_VERSION_V1_LU5;
+    const ackProtocolId = params.chunkedCommitment
+      ? PROTOCOL_STORAGE_ACK_V2
+      : PROTOCOL_STORAGE_ACK;
     const p2pMsg: PublishIntentMsg = {
       merkleRoot,
       contextGraphId: contextGraphIdStr,
@@ -180,6 +232,9 @@ export class ACKCollector {
       subGraphName: params.subGraphName,
       merkleLeafCount: params.merkleLeafCount,
       isEncryptedPayload: params.isEncryptedPayload === true ? true : undefined,
+      ciphertextChunksRoot: params.chunkedCommitment?.ciphertextChunksRoot,
+      ciphertextChunkCount: params.chunkedCommitment?.ciphertextChunkCount,
+      ackProtocolVersion: params.chunkedCommitment ? ackProtocolVersion : undefined,
     };
     const intentBytes = encodePublishIntent(p2pMsg);
 
@@ -303,7 +358,7 @@ export class ACKCollector {
     const requestACK = async (peerId: string): Promise<CollectedACK | null> => {
       for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
         try {
-          const response = await this.deps.sendP2P(peerId, PROTOCOL_STORAGE_ACK, intentBytes);
+          const response = await this.deps.sendP2P(peerId, ackProtocolId, intentBytes);
           const ack: StorageACKMsg = decodeStorageACK(response);
 
           if (isStorageACKDecline(ack)) {

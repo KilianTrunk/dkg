@@ -93,21 +93,23 @@ export function CreateProjectModal({ open, onClose }: CreateProjectModalProps) {
 
   if (!open) return null;
 
-  const slug = slugify(name);
+  // Store the raw user input verbatim so `validateCgName(name)` can
+  // see and surface every warning the helper emits (stripped HTML
+  // tags, over-length, slug-empty). The cleaned form is derived for
+  // the submit path and the slug preview only.
+  const cleanedName = sanitiseCgName(name);
+  const slug = slugify(cleanedName);
   const cgIdPreview = agentAddress && slug
     ? `${agentAddress}/${slug}`
     : slug ? `<agent-address>/${slug}` : '';
   const nameValidationError = name ? validateCgName(name) : null;
   const onNameChange = (raw: string) => {
-    // Always feed the sanitised value back through the controlled
-    // input — the user sees the cleaned-up name exactly as it will be
-    // submitted, no surprise transform on the server side.
-    setName(sanitiseCgName(raw));
+    setName(raw);
   };
 
   const handleCreate = async () => {
-    const trimmedName = name.trim();
-    if (!trimmedName) return;
+    const trimmedName = cleanedName;
+    if (!trimmedName || nameValidationError) return;
 
     setCreating(true);
     setError(null);

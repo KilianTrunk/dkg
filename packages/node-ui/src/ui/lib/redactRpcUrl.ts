@@ -29,12 +29,14 @@ export function redactRpcUrl(rpc: string | null | undefined): string {
   // of the redaction.
   const MASK = '************';
   // Some operators paste RPC URLs with HTTP basic auth baked in
-  // (`https://user:pass@host/path`). Strip the credentials entirely —
-  // a partial mask isn't enough for a screen-share leak class because
-  // the username already identifies the tenant in many setups.
-  if (parsed.password) {
-    parsed.password = '';
+  // (`https://user:pass@host/path` or `https://tenantonly@host/path`).
+  // Strip BOTH userinfo fields whenever EITHER is present — the
+  // username alone identifies the tenant on many providers (e.g.
+  // `tenantId@rpc.example.com`) and is just as much of a screen-share
+  // leak as the password.
+  if (parsed.username || parsed.password) {
     parsed.username = '';
+    parsed.password = '';
   }
   const segments = parsed.pathname.split('/').map((seg) => {
     if (seg.length < 16) return seg;

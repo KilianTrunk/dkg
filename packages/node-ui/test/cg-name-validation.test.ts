@@ -81,5 +81,25 @@ describe('cg-name validation (BUG-016)', () => {
     it('does NOT flag a name that uses normal ASCII punctuation', () => {
       expect(validateCgName('Project: alpha & beta (v2)')).toBeNull();
     });
+
+    it('rejects names that survive sanitise but slugify to empty (e.g. !!!, ---)', () => {
+      // These pass `cleaned !== ""` but the daemon's slugify would
+      // reduce them to `""`, producing a context-graph ID that ends
+      // with `/`. validateCgName must reject before submit.
+      expect(validateCgName('!!!')).toMatch(/letter or digit/i);
+      expect(validateCgName('---')).toMatch(/letter or digit/i);
+      expect(validateCgName('***')).toMatch(/letter or digit/i);
+      expect(validateCgName('   .   ')).toMatch(/letter or digit/i);
+    });
+
+    it('is stateless across calls (HTML_TAG_SHAPE_RE has no `g` flag, .test does not flicker)', () => {
+      // If the regex were declared with the global flag, .test() would
+      // step `lastIndex` between calls and the second/third call could
+      // return false for the same tagged input until the regex resets.
+      // Iterate enough times that any g-flag regression would surface.
+      for (let i = 0; i < 5; i += 1) {
+        expect(validateCgName('<b>tagged</b>')).toContain('HTML');
+      }
+    });
   });
 });

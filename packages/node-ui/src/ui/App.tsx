@@ -189,13 +189,21 @@ function useShellRouting() {
 
   // Step 2: keep the URL aligned with the *active* tab so a refresh
   // restores you to the same place and the location bar reflects what
-  // the user sees. We only touch the URL when the canonical mapping
-  // disagrees with the current pathname — non-deep-linkable tabs
-  // (project:..., context-graph-primer, etc.) leave the URL alone.
+  // the user sees. When the active tab IS deep-linkable, sync to its
+  // mapped path. When the active tab is NOT deep-linkable (project:…,
+  // context-graph-primer, etc.) but the URL is still showing a
+  // previously-deep-linked path, reset to `/` so a refresh doesn't
+  // ping-pong the user back into the old tab. Other routes (/network,
+  // /context-graph-primer) aren't in the mapping table, so this leaves
+  // them alone.
   useEffect(() => {
     const target = TAB_TO_URL_PATH[activeTabId];
-    if (target && target !== pathname) {
-      navigate(target, { replace: true });
+    if (target) {
+      if (target !== pathname) navigate(target, { replace: true });
+      return;
+    }
+    if (URL_PATH_TO_TAB[pathname]) {
+      navigate('/', { replace: true });
     }
   }, [activeTabId, pathname, navigate]);
 }

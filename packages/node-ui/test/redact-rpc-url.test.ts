@@ -64,4 +64,13 @@ describe('redactRpcUrl (BUG-012)', () => {
     expect(redacted).not.toContain('@rpc.example.com');
     expect(redacted).toContain('rpc.example.com');
   });
+
+  it('strips a username-only credential (user@host with no password) — the username alone identifies the tenant', () => {
+    const original = 'https://tenantonly@rpc.example.com/v1/abcdef0123456789abcdef0123456789';
+    const redacted = redactRpcUrl(original);
+    expect(redacted).not.toContain('tenantonly');
+    expect(redacted).not.toContain('tenantonly@');
+    expect(redacted).toContain('rpc.example.com');
+    expect(redacted).not.toContain('abcdef0123456789abcdef0123456789');
+  });
 });

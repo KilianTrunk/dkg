@@ -109,7 +109,7 @@ export function formatDuration(ms: number | null | undefined): string {
  * indistinguishable. Hovering still surfaces the full date+time via
  * the caller's `title` attribute when set.
  */
-export function formatTime(ts: number | string | null | undefined, now: Date = new Date()): string {
+export function formatTime(ts: number | string | Date | null | undefined, now: Date = new Date()): string {
   if (ts == null || ts === '') return '—';
   const d = ts instanceof Date ? ts : new Date(ts);
   if (Number.isNaN(d.getTime())) return '—';

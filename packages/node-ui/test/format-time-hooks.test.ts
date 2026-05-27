@@ -44,4 +44,16 @@ describe('formatTime (BUG-003 — Operations table column)', () => {
     old.setMonth(NOW.getMonth() - 2);
     expect(formatTime(old, NOW)).toMatch(/^[A-Z][a-z]{2}/);
   });
+
+  it('type-checks every accepted input shape (number | string | Date)', () => {
+    // Compile-time guard for the public signature widened in BUG-003.
+    // If the parameter type ever drops `Date` again, this file will
+    // fail `tsc` even before vitest sees it.
+    const numeric: number = NOW.getTime();
+    const stringy: string = NOW.toISOString();
+    const date: Date = NOW;
+    expect(formatTime(numeric, NOW)).toBeTypeOf('string');
+    expect(formatTime(stringy, NOW)).toBeTypeOf('string');
+    expect(formatTime(date, NOW)).toBeTypeOf('string');
+  });
 });

@@ -8,7 +8,7 @@ import { useTabsStore } from '../../stores/tabs.js';
 import { useNodeEvents } from '../../hooks/useNodeEvents.js';
 import { useCurrentAgent } from '../../hooks/useCurrentAgent.js';
 import { useVisibilityPolling } from '../../hooks/useVisibilityPolling.js';
-import { formatNotificationTimestamp } from '../../lib/formatTimestamp.js';
+import { compareNotificationByTsDesc, formatNotificationTimestamp } from '../../lib/formatTimestamp.js';
 
 /** OriginTrail wordmark — same paths as `v9-stable` packages/node-ui App.tsx sidebar. */
 const ORIGINTRAIL_WORDMARK = (
@@ -161,14 +161,15 @@ export function Header() {
   const statusLoaded = nodeStatus != null;
   const synced = statusLoaded && nodeStatus?.synced !== false;
   const peerStatusLabel = formatPeerStatusTooltip(synced, connectedPeers, directConns, relayedConns, uptimeMs);
-  const sortedNotifications = [...notifications].sort((a, b) => {
-    const at = a.ts ? Date.parse(a.ts as unknown as string) : 0;
-    const bt = b.ts ? Date.parse(b.ts as unknown as string) : 0;
-    return bt - at;
-  });
-  const onClear = () => {
+  const sortedNotifications = [...notifications].sort(compareNotificationByTsDesc);
+  // The /api/notifications/read endpoint flips the `read` flag on
+  // existing rows; it does not delete them. We therefore drop the
+  // unread badge but keep the dropdown contents in place — clearing
+  // local state would lie to the user and the same items would come
+  // back on the next poll.
+  const onMarkAllRead = () => {
     api.markNotificationsRead().then(() => {
-      setNotifications([]);
+      setNotifications((prev) => prev.map((n) => ({ ...n, read: 1 })));
       setUnread(0);
     }).catch(() => {});
   };
@@ -232,14 +233,14 @@ export function Header() {
             <div className="v10-header-notif-dropdown" role="region" aria-label="Notifications">
               <div className="v10-header-notif-titlebar">
                 <div className="v10-header-notif-title">Notifications</div>
-                {notifications.length > 0 && (
+                {unread > 0 && (
                   <button
                     type="button"
                     className="v10-header-notif-clear"
-                    onClick={onClear}
-                    title="Mark all as read and clear the list"
+                    onClick={onMarkAllRead}
+                    title="Mark all notifications as read"
                   >
-                    Clear all
+                    Mark all read
                   </button>
                 )}
               </div>

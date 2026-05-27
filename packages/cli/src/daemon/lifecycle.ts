@@ -687,6 +687,7 @@ export async function runDaemonInner(
     largeLiteralStorage: config.largeLiteralStorage,
     sharedMemoryPublicSnapshotStorage: config.sharedMemoryPublicSnapshotStorage,
     syncSharedMemoryOnConnect: config.syncSharedMemoryOnConnect,
+    queryAccess: config.queryAccess,
     chainAdapter: mockChainAdapter,
     // Only forward chain to the agent when both required fields resolved.
     // resolveChainConfig() may return a partial block if neither config nor

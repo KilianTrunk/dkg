@@ -87,6 +87,7 @@ export class QueryHandler {
     try {
       const limit = Math.min(request.limit ?? DEFAULT_LIMIT, MAX_LIMIT);
       const timeout = Math.min(request.timeout ?? DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
+      const contextGraphPolicy = this.contextGraphPolicy(contextGraphId);
 
       let response: QueryResponse;
 
@@ -101,7 +102,13 @@ export class QueryHandler {
           response = await this.lookupEntityTriples(opId, contextGraphId!, request.entityUri!);
           break;
         case 'SPARQL_QUERY':
-          response = await this.executeSparql(opId, contextGraphId!, request.sparql!, limit, timeout);
+          response = await this.executeSparql(
+            opId,
+            contextGraphId!,
+            request.sparql!,
+            capByPolicy(limit, contextGraphPolicy?.sparqlMaxResults),
+            capByPolicy(timeout, contextGraphPolicy?.sparqlTimeout),
+          );
           break;
         default:
           response = errorResponse(opId, 'UNSUPPORTED_LOOKUP', `Unknown lookup type: ${request.lookupType}`);
@@ -168,6 +175,11 @@ export class QueryHandler {
     const cgConfigs = this.config.contextGraphs ?? this.config.contextGraphs;
     if (!cgConfigs) return false;
     return Object.values(cgConfigs).some(p => p.policy === 'public');
+  }
+
+  private contextGraphPolicy(contextGraphId: string | undefined): ContextGraphQueryPolicy | undefined {
+    if (!contextGraphId) return undefined;
+    return this.config.contextGraphs?.[contextGraphId];
   }
 
   private checkRateLimit(peerId: string): QueryResponse | null {
@@ -347,6 +359,13 @@ function errorResponse(opId: string, status: QueryStatus, error: string): QueryR
     resultCount: 0,
     error,
   };
+}
+
+function capByPolicy(value: number, policyCap: number | undefined): number {
+  if (policyCap === undefined || !Number.isFinite(policyCap) || policyCap <= 0) {
+    return value;
+  }
+  return Math.min(value, Math.floor(policyCap));
 }
 
 function formatObject(value: string): string {

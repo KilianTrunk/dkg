@@ -78,6 +78,12 @@ interface ResponderInternals {
   chain: { getIdentityIdForAddress?: (address: string) => Promise<bigint> };
   subscribedContextGraphs: Map<string, unknown>;
   gossipWireIdFor(rawId: string): string;
+  // Used by Codex-review-driven tests to (a) pin the
+  // canonicalChunkStoreCgIdOrNull===null precondition explicitly
+  // and (b) freeze the numeric-id lookup so future fixture
+  // changes can't accidentally make Bug 5 coverage disappear.
+  canonicalChunkStoreCgIdOrNull(rawId: string): string | null;
+  resolveLocalCgIdByOnChainId(onChainId: bigint): string | null;
 }
 
 async function bootResponderAgent(): Promise<{ agent: DKGAgent; internals: ResponderInternals }> {
@@ -218,6 +224,24 @@ describe('DKGAgent.handleGetCiphertextChunk — canonical CG keying (#729 Bug 5 
     const requester = ethers.Wallet.createRandom();
     authorizeAsNodeOperator(internals, requester);
 
+    // Codex review feedback: this regression test only exercises
+    // the `GRAPH ?g` fallback if `canonicalChunkStoreCgIdOrNull("42")`
+    // returns null. That precondition was implicit — if
+    // `bootResponderAgent()` ever started with a local mapping for
+    // on-chain id 42 the test would still pass while no longer
+    // covering Bug 5. Make the precondition explicit AND defend it
+    // against future helper changes:
+    //   1) Assert directly that the responder's canonicalization
+    //      returns null for "42" right now (pins the runtime state).
+    //   2) Stub `resolveLocalCgIdByOnChainId(42n)` to forever return
+    //      null, so even if a future fixture seeds a mapping for
+    //      "42" the canonicalization branch still hits the null
+    //      path that Bug 5 lived on.
+    const originalResolve = internals.resolveLocalCgIdByOnChainId.bind(internals);
+    internals.resolveLocalCgIdByOnChainId = (onChainId: bigint) =>
+      onChainId === 42n ? null : originalResolve(onChainId);
+    expect(internals.canonicalChunkStoreCgIdOrNull('42')).toBeNull();
+
     // Persist the chunk under an ARBITRARY canonical graph that the
     // responder can't reconstruct from `contextGraphId = "42"` alone
     // (no local CG mapping for the numeric id). With Bug 5 unfixed
@@ -287,10 +311,23 @@ describe('DKGAgent.handleGetCiphertextChunk — canonical CG keying (#729 Bug 5 
     const internals = boot.internals;
 
     const requester = ethers.Wallet.createRandom();
-    // Explicitly DON'T call `authorizeAsNodeOperator`. MockChainAdapter
-    // doesn't implement `getIdentityIdForAddress` natively so the
-    // fifth-authority probe is skipped entirely (typeof !== 'function').
-    expect(typeof internals.chain.getIdentityIdForAddress).toBe('undefined');
+    // Codex review feedback: the test name says
+    // "getIdentityIdForAddress=0" but prior to this change the
+    // method was actually `undefined` on MockChainAdapter, which
+    // makes `dkg-agent.ts:10963` SKIP the fifth-authority probe
+    // entirely (`typeof !== 'function'`). A regression that
+    // incorrectly authorized `identityId === 0n` would slip
+    // through silently. Patch the chain stub to return 0n
+    // explicitly so the negative path of layer 5 is genuinely
+    // exercised — i.e. the `if (reqIdentityId > 0n)` guard is the
+    // only thing preventing authorization.
+    internals.chain.getIdentityIdForAddress = async (address: string) => {
+      // Sanity: this is the requester we mint below; assert via
+      // toLowerCase to mirror production casing.
+      expect(address.toLowerCase()).toBe(requester.address.toLowerCase());
+      return 0n;
+    };
+    expect(typeof internals.chain.getIdentityIdForAddress).toBe('function');
 
     const cleartextCgId = 'cg-unauthorized-test';
     internals.subscribedContextGraphs.set(cleartextCgId, { topic: cleartextCgId });

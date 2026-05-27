@@ -484,8 +484,6 @@ function hasCallerDatasetClause(sparql: string): boolean {
 }
 
 function assertExplicitGraphIrisAllowed(sparql: string, allowedGraphs: string[]): void {
-  assertNoUnvalidatedExplicitGraphTargets(sparql);
-
   const allowed = new Set(allowedGraphs);
   for (const graphIri of collectExplicitGraphIris(sparql)) {
     if (!allowed.has(graphIri)) {
@@ -496,7 +494,8 @@ function assertExplicitGraphIrisAllowed(sparql: string, allowedGraphs: string[])
   }
 }
 
-function assertNoUnvalidatedExplicitGraphTargets(sparql: string): void {
+function collectPrefixDeclarations(sparql: string): Map<string, string> {
+  const prefixes = new Map<string, string>();
   const n = sparql.length;
   let i = 0;
 
@@ -518,33 +517,120 @@ function assertNoUnvalidatedExplicitGraphTargets(sparql: string): void {
     if (isKeywordStart(sparql, i)) {
       let j = i + 1;
       while (j < n && isWordContinuation(sparql[j])) j++;
-      const word = sparql.slice(i, j);
-      if (isSparqlKeyword(sparql, i, j, 'GRAPH')) {
-        const operandStart = skipSparqlSpaceAndLineComments(sparql, j);
-        const variable = readSparqlVariable(sparql, operandStart);
-        if (variable) {
-          i = operandStart + variable.length;
+      if (isSparqlKeyword(sparql, i, j, 'PREFIX')) {
+        const prefixStart = skipSparqlSpaceAndLineComments(sparql, j);
+        const prefix = readSparqlPrefixName(sparql, prefixStart);
+        if (!prefix || prefix.local.length > 0) {
+          i = j;
           continue;
         }
-        if (sparql[operandStart] === '<') {
-          const iriEnd = skipSparqlIriRef(sparql, operandStart);
-          if (!iriEnd) {
-            throw new ScopedQueryViolationError(
-              'GRAPH target must be a variable or explicit IRI on scoped queries',
-            );
-          }
+        const iriStart = skipSparqlSpaceAndLineComments(sparql, prefixStart + prefix.length);
+        const iriEnd = skipSparqlIriRef(sparql, iriStart);
+        if (iriEnd) {
+          prefixes.set(prefix.prefix, sparql.slice(iriStart + 1, iriEnd - 1));
           i = iriEnd;
           continue;
         }
-        throw new ScopedQueryViolationError(
-          'GRAPH target must be a variable or explicit IRI on scoped queries',
-        );
       }
       i = j;
       continue;
     }
     i++;
   }
+
+  return prefixes;
+}
+
+interface SparqlPrefixName {
+  prefix: string;
+  local: string;
+  length: number;
+}
+
+function readSparqlPrefixName(sparql: string, start: number): SparqlPrefixName | null {
+  let colon = start;
+  while (colon < sparql.length && isSparqlPrefixLabelChar(sparql[colon])) colon++;
+  if (sparql[colon] !== ':') return null;
+
+  let end = colon + 1;
+  while (end < sparql.length && isSparqlPrefixedLocalChar(sparql[end])) end++;
+
+  return {
+    prefix: sparql.slice(start, colon),
+    local: sparql.slice(colon + 1, end),
+    length: end - start,
+  };
+}
+
+function isSparqlPrefixLabelChar(ch: string | undefined): ch is string {
+  return !!ch && (
+    (ch >= 'A' && ch <= 'Z') ||
+    (ch >= 'a' && ch <= 'z') ||
+    (ch >= '0' && ch <= '9') ||
+    ch === '_' ||
+    ch === '-'
+  );
+}
+
+function isSparqlPrefixedLocalChar(ch: string | undefined): ch is string {
+  return !!ch && !/\s/.test(ch) && ch !== '{' && ch !== '}' && ch !== '(' && ch !== ')' && ch !== ';' && ch !== ',';
+}
+
+function resolveSparqlPrefixedName(
+  prefixedName: SparqlPrefixName,
+  prefixes: Map<string, string>,
+): string | null {
+  const base = prefixes.get(prefixedName.prefix);
+  if (base === undefined) return null;
+  return `${base}${prefixedName.local}`;
+}
+
+interface GraphTarget {
+  kind: 'variable' | 'iri';
+  iri?: string;
+  end: number;
+}
+
+function readGraphTarget(
+  sparql: string,
+  start: number,
+  prefixes: Map<string, string>,
+): GraphTarget | null {
+  const variable = readSparqlVariable(sparql, start);
+  if (variable) {
+    return { kind: 'variable', end: start + variable.length };
+  }
+
+  if (sparql[start] === '<') {
+    const iriEnd = skipSparqlIriRef(sparql, start);
+    if (!iriEnd) {
+      throw new ScopedQueryViolationError(
+        'GRAPH target must be a variable, explicit IRI, or resolvable prefixed name on scoped queries',
+      );
+    }
+    return {
+      kind: 'iri',
+      iri: sparql.slice(start + 1, iriEnd - 1),
+      end: iriEnd,
+    };
+  }
+
+  const prefixedName = readSparqlPrefixName(sparql, start);
+  if (prefixedName) {
+    const iri = resolveSparqlPrefixedName(prefixedName, prefixes);
+    if (!iri) {
+      throw new ScopedQueryViolationError(
+        `GRAPH prefixed target ${sparql.slice(start, start + prefixedName.length)} cannot be resolved from PREFIX declarations`,
+      );
+    }
+    return {
+      kind: 'iri',
+      iri,
+      end: start + prefixedName.length,
+    };
+  }
+
+  return null;
 }
 
 function constrainGraphVariablesToAllowedSet(sparql: string, allowedGraphs: string[]): string {
@@ -588,6 +674,7 @@ function hasTopLevelDefaultGraphPattern(sparql: string, braceStart: number): boo
   const braceEnd = findMatchingCloseBrace(sparql, braceStart);
   if (braceEnd === -1) return true;
 
+  const prefixes = collectPrefixDeclarations(sparql);
   let depth = 0;
   let i = braceStart + 1;
 
@@ -622,15 +709,8 @@ function hasTopLevelDefaultGraphPattern(sparql: string, braceStart: number): boo
       while (j < braceEnd && isWordContinuation(sparql[j])) j++;
       if (isSparqlKeyword(sparql, i, j, 'GRAPH')) {
         const operandStart = skipSparqlSpaceAndLineComments(sparql, j);
-        const variable = readSparqlVariable(sparql, operandStart);
-        if (variable) {
-          i = operandStart + variable.length;
-          continue;
-        }
-        const iriEnd = sparql[operandStart] === '<'
-          ? skipSparqlIriRef(sparql, operandStart)
-          : null;
-        i = iriEnd && iriEnd <= braceEnd ? iriEnd : j;
+        const target = readGraphTarget(sparql, operandStart, prefixes);
+        i = target && target.end <= braceEnd ? target.end : j;
         continue;
       }
       if (isSparqlKeyword(sparql, i, j, 'FILTER') || isSparqlKeyword(sparql, i, j, 'BIND')) {
@@ -846,6 +926,7 @@ function rangeContainsGraphVariable(sparql: string, start: number, end: number):
 
 function collectExplicitGraphIris(sparql: string): string[] {
   const iris: string[] = [];
+  const prefixes = collectPrefixDeclarations(sparql);
   const n = sparql.length;
   let i = 0;
 
@@ -867,16 +948,17 @@ function collectExplicitGraphIris(sparql: string): string[] {
     if (isKeywordStart(sparql, i)) {
       let j = i + 1;
       while (j < n && isWordContinuation(sparql[j])) j++;
-      const word = sparql.slice(i, j);
       if (isSparqlKeyword(sparql, i, j, 'GRAPH')) {
         const operandStart = skipSparqlSpaceAndLineComments(sparql, j);
-        if (sparql[operandStart] === '<') {
-          const operandEnd = skipSparqlIriRef(sparql, operandStart);
-          if (!operandEnd) return iris;
-          iris.push(sparql.slice(operandStart + 1, operandEnd - 1));
-          i = operandEnd;
-          continue;
+        const target = readGraphTarget(sparql, operandStart, prefixes);
+        if (!target) {
+          throw new ScopedQueryViolationError(
+            'GRAPH target must be a variable, explicit IRI, or resolvable prefixed name on scoped queries',
+          );
         }
+        if (target.kind === 'iri' && target.iri) iris.push(target.iri);
+        i = target.end;
+        continue;
       }
       i = j;
       continue;
@@ -885,6 +967,40 @@ function collectExplicitGraphIris(sparql: string): string[] {
   }
 
   return iris;
+}
+
+function hasGraphClause(sparql: string): boolean {
+  const n = sparql.length;
+  let i = 0;
+
+  while (i < n) {
+    const ch = sparql[i];
+    if (ch === '#') {
+      while (i < n && sparql[i] !== '\n') i++;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      i = skipSparqlStringLiteral(sparql, i);
+      continue;
+    }
+    if (ch === '<') {
+      const end = skipSparqlIriRef(sparql, i);
+      i = end ?? i + 1;
+      continue;
+    }
+    if (isKeywordStart(sparql, i)) {
+      let j = i + 1;
+      while (j < n && isWordContinuation(sparql[j])) j++;
+      if (isSparqlKeyword(sparql, i, j, 'GRAPH')) {
+        return true;
+      }
+      i = j;
+      continue;
+    }
+    i++;
+  }
+
+  return false;
 }
 
 function collectGraphVariables(sparql: string): string[] {
@@ -1129,10 +1245,11 @@ function isWordStart(ch: string | undefined): ch is string {
 }
 
 function isWordContinuation(ch: string | undefined): ch is string {
-  return !!ch && (
-    isWordStart(ch) ||
-    (ch >= '0' && ch <= '9')
-  );
+  return isWordStart(ch) || isAsciiDigitChar(ch);
+}
+
+function isAsciiDigitChar(ch: string | undefined): ch is string {
+  return !!ch && ch >= '0' && ch <= '9';
 }
 
 /**
@@ -1583,7 +1700,7 @@ function findMatchingCloseBrace(sparql: string, openIdx: number): number {
  * If the query already uses GRAPH patterns, returns it unchanged.
  */
 function wrapWithGraph(sparql: string, graphUri: string): string {
-  if (sparql.toLowerCase().includes('graph ')) return sparql;
+  if (hasGraphClause(sparql)) return sparql;
 
   const braceStart = findWhereBraceStart(sparql);
   if (braceStart === -1) return sparql;
@@ -1626,7 +1743,7 @@ function wrapWithGraph(sparql: string, graphUri: string): string {
  * `GRAPH <uri>` block.
  */
 function wrapWithGraphUnion(sparql: string, graphUris: string[]): string {
-  if (sparql.toLowerCase().includes('graph ')) return sparql;
+  if (hasGraphClause(sparql)) return sparql;
   if (graphUris.length === 0) return sparql;
 
   const braceStart = findWhereBraceStart(sparql);

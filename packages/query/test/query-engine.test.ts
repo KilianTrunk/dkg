@@ -206,6 +206,40 @@ describe('DKGQueryEngine', () => {
     expect(names).toContain('"Quorum Verified"');
   });
 
+  it('view=verified-memory constrains compact GRAPH variables without duplicating multi-graph rows', async () => {
+    const vmGraph = `did:dkg:context-graph:${CONTEXT_GRAPH}/_verified_memory/quorum-1`;
+    await store.insert([
+      q('urn:vm:entity:1', 'http://schema.org/name', '"Quorum Verified"', vmGraph),
+      q('urn:other:entity', 'http://schema.org/name', '"OtherGraph"', 'did:dkg:context-graph:other-agent-registry'),
+    ]);
+
+    const result = await engine.query(
+      'SELECT ?g ?name WHERE { GRAPH?g { ?s <http://schema.org/name> ?name } } ORDER BY ?name',
+      { contextGraphId: CONTEXT_GRAPH, view: 'verified-memory' },
+    );
+
+    expect(result.bindings).toEqual([
+      { g: GRAPH, name: '"ImageBot"' },
+      { g: vmGraph, name: '"Quorum Verified"' },
+    ]);
+  });
+
+  it('view=verified-memory honors compact explicit GRAPH IRIs without duplicating multi-graph rows', async () => {
+    const vmGraph = `did:dkg:context-graph:${CONTEXT_GRAPH}/_verified_memory/quorum-1`;
+    await store.insert([
+      q('urn:vm:entity:1', 'http://schema.org/name', '"Quorum Verified"', vmGraph),
+    ]);
+
+    const result = await engine.query(
+      `SELECT ?name WHERE { GRAPH<${vmGraph}> { ?s <http://schema.org/name> ?name } }`,
+      { contextGraphId: CONTEXT_GRAPH, view: 'verified-memory' },
+    );
+
+    expect(result.bindings).toEqual([
+      { name: '"Quorum Verified"' },
+    ]);
+  });
+
   it('view=verified-memory with verifiedGraph scopes to that graph only', async () => {
     const vmGraph = `did:dkg:context-graph:${CONTEXT_GRAPH}/_verified_memory/team-a`;
     await store.insert([
@@ -356,7 +390,19 @@ describe('DKGQueryEngine', () => {
     ).rejects.toThrow(/Scoped query violation: GRAPH <did:dkg:context-graph:other-agent-registry> is outside the allowed graph set/i);
   });
 
-  it('rejects prefixed explicit GRAPH targets that cannot be validated against the scoped graph set', async () => {
+  it('allows prefixed explicit GRAPH targets that resolve to the scoped graph', async () => {
+    const result = await engine.query(
+      `PREFIX cg: <did:dkg:context-graph:>
+       SELECT ?name WHERE { GRAPH cg:${CONTEXT_GRAPH} { ?s <http://schema.org/name> ?name } }`,
+      { contextGraphId: CONTEXT_GRAPH },
+    );
+
+    expect(result.bindings).toEqual([
+      { name: '"ImageBot"' },
+    ]);
+  });
+
+  it('rejects prefixed explicit GRAPH targets outside the scoped graph set', async () => {
     const otherGraph = 'did:dkg:context-graph:other-agent-registry';
     await store.insert([
       q('urn:secret:entity', 'http://schema.org/name', '"Secret"', otherGraph),
@@ -368,7 +414,35 @@ describe('DKGQueryEngine', () => {
          SELECT ?name WHERE { GRAPH other: { ?s <http://schema.org/name> ?name } }`,
         { contextGraphId: CONTEXT_GRAPH },
       ),
-    ).rejects.toThrow(/Scoped query violation: GRAPH target must be a variable or explicit IRI/i);
+    ).rejects.toThrow(/Scoped query violation: GRAPH <did:dkg:context-graph:other-agent-registry> is outside the allowed graph set/i);
+  });
+
+  it('rejects unresolved prefixed GRAPH targets fail-closed', async () => {
+    await expect(
+      engine.query(
+        `SELECT ?name WHERE { GRAPH missing:allowed { ?s <http://schema.org/name> ?name } }`,
+        { contextGraphId: CONTEXT_GRAPH },
+      ),
+    ).rejects.toThrow(/Scoped query violation: GRAPH prefixed target missing:allowed cannot be resolved/i);
+  });
+
+  it('allows prefixed explicit GRAPH targets alongside constrained GRAPH variables', async () => {
+    await store.insert([
+      q('urn:other:entity', 'http://schema.org/name', '"OtherGraph"', 'did:dkg:context-graph:other-agent-registry'),
+    ]);
+
+    const result = await engine.query(
+      `PREFIX cg: <did:dkg:context-graph:>
+       SELECT ?g ?name ?sameName WHERE {
+         GRAPH ?g { ?s <http://schema.org/name> ?name }
+         GRAPH cg:${CONTEXT_GRAPH} { ?s <http://schema.org/name> ?sameName }
+       }`,
+      { contextGraphId: CONTEXT_GRAPH },
+    );
+
+    expect(result.bindings).toEqual([
+      { g: GRAPH, name: '"ImageBot"', sameName: '"ImageBot"' },
+    ]);
   });
 
   it('constrains GRAPH variables to the scoped context graph data graph', async () => {

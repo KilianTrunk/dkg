@@ -8865,6 +8865,10 @@ export class DKGAgent {
   ): Promise<PublishResult> {
     const ctx = options?.operationCtx ?? createOperationContext('publishFromSWM');
     const effectiveSubCG = options?.subContextGraphId ?? options?.contextGraphId;
+    // `ctxGraphIdStr` doubles as `publishContextGraphId` for REMAP-flow
+    // publishes — the publisher uses its presence as a signal to DELETE the
+    // original copy from the default data graph. Keep it empty for non-REMAP
+    // publishes so we don't accidentally trigger the delete.
     const ctxGraphIdStr = effectiveSubCG != null ? String(effectiveSubCG) : undefined;
 
     const onChainId = ctxGraphIdStr ?? (await this.getContextGraphOnChainId(contextGraphId)) ?? undefined;
@@ -8963,6 +8967,16 @@ export class DKGAgent {
     if (result.status === 'confirmed' && result.onChainResult) {
       const rootEntities = result.kaManifest.map(ka => ka.rootEntity);
 
+      // Always carry the resolved on-chain CG id in the finalization gossip
+      // so receiving cores promote SWM into the per-cgId `_meta` namespace
+      // (`<cgName>/context/<cgId>/_meta`) that the RS prover reads from.
+      // Without this the prover 404'd with `KCNotFoundError` on every
+      // freshly-published KC even though the SWM payload had been
+      // replicated — see scripts/devnet-test-rfc39-comprehensive.sh
+      // Scenario A. We pass the *publisher-resolved* `onChainId` (which
+      // includes both explicit REMAP targets and the auto-lookup fallback)
+      // rather than the REMAP-only `ctxGraphIdStr`.
+      const broadcastCgId = onChainId != null ? String(onChainId) : undefined;
       const msg: FinalizationMessageMsg = {
         ual: result.ual,
         contextGraphId: contextGraphId,
@@ -8976,14 +8990,14 @@ export class DKGAgent {
         rootEntities,
         timestampMs: Date.now(),
         operationId: ctx.operationId,
-        targetContextGraphId: result.contextGraphError ? undefined : ctxGraphIdStr,
+        targetContextGraphId: result.contextGraphError ? undefined : broadcastCgId,
         subGraphName: options?.subGraphName,
       };
 
       const topic = contextGraphFinalizationTopic(contextGraphId);
       try {
         await this.gossip.publish(topic, encodeFinalizationMessage(msg));
-        this.log.info(ctx, `Broadcast finalization for ${result.ual} to ${topic}${ctxGraphIdStr ? ` (contextGraph=${ctxGraphIdStr})` : ''}${result.contextGraphError ? ' (ctx-graph registration failed, omitting targetContextGraphId)' : ''}`);
+        this.log.info(ctx, `Broadcast finalization for ${result.ual} to ${topic}${broadcastCgId ? ` (contextGraph=${broadcastCgId})` : ''}${result.contextGraphError ? ' (ctx-graph registration failed, omitting targetContextGraphId)' : ''}`);
       } catch {
         this.log.warn(ctx, `No peers subscribed to ${topic} yet`);
       }

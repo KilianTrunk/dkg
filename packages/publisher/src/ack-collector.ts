@@ -148,10 +148,28 @@ export class ACKCollector {
      * carrying `swmMessageIndex` + the chunked type marker) and the
      * ACK request goes out on `PROTOCOL_STORAGE_ACK_V2` with empty
      * `stagingQuads` + populated `ciphertextChunksRoot` /
-     * `ciphertextChunkCount` / `ackProtocolVersion = 2`. Pre-LU-11
-     * cores never see this field and stay on V1 semantics. Required
+     * `ciphertextChunkCount` / `ackProtocolVersion = 2`. Required
      * when `isEncryptedPayload === true` AND chunked emission was
      * used; mutually exclusive with non-empty `stagingQuads`.
+     *
+     * **Cluster-wide V2 requirement** (Codex review on PR #715): this
+     * collector unconditionally dispatches chunked ACK requests over
+     * `PROTOCOL_STORAGE_ACK_V2` — there is NO automatic V1 fallback
+     * for cores in the quorum target that don't advertise V2. A core
+     * that only speaks `/dkg/10.0.1/storage-ack` will surface a
+     * libp2p "could not negotiate" send error here, which counts as a
+     * peer-unreachable failure against `requiredACKs`. The
+     * mixed-rc.11-rc.12 cluster case is therefore strictly an
+     * upgrade-window concern (a rc.11 core can't decode LU-11
+     * chunked gossip envelopes either, so it would fail upstream of
+     * this collector even with a V1 fallback). The operational
+     * assumption for rc.12 — and the rc.12 release runbook — is that
+     * every quorum-target core has been upgraded to LU-11 BEFORE the
+     * curator's first chunked publish. The OT-RFC-38 §A.1 host-mode
+     * reconciler converges the cluster within the per-CG window the
+     * curator sets; operators must respect that window before
+     * issuing curated publishes. A per-peer capability probe + V1
+     * downgrade is filed as a follow-up — see TODO(rc.12.1) below.
      */
     chunkedCommitment?: {
       ciphertextChunksRoot: Uint8Array;
@@ -212,6 +230,12 @@ export class ACKCollector {
     const ackProtocolVersion = params.chunkedCommitment
       ? ACK_PROTOCOL_VERSION_V2_LU11
       : ACK_PROTOCOL_VERSION_V1_LU5;
+    // TODO(rc.12.1, Codex review on PR #715): add per-peer capability
+    // probe so chunked publishes can opportunistically downgrade to V1
+    // for cores that don't advertise V2. Until then, chunked publishes
+    // require every quorum-target core to support V2 — see the
+    // `chunkedCommitment` field doc for the cluster-wide requirement
+    // and the rc.12 release-runbook rationale.
     const ackProtocolId = params.chunkedCommitment
       ? PROTOCOL_STORAGE_ACK_V2
       : PROTOCOL_STORAGE_ACK;

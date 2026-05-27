@@ -75,6 +75,14 @@ export interface RandomSamplingBindOptions {
    * the workspace-topic subscribers — the natural authorized-host set.
    */
   ciphertextChunkBackfill?: CiphertextChunkBackfillFn;
+  /**
+   * Codex review on PR #715 — resolves a numeric on-chain `cgId` to
+   * the curator-committed `nameHash` (wire form) used to scope the
+   * ciphertext-chunks named graph. The prover forwards the result to
+   * the extractor so its SPARQL lookup pins the per-CG named graph.
+   * Wired in `dkg-agent` to `resolveLocalCgIdByOnChainId` + `gossipWireIdFor`.
+   */
+  canonicalCgIdForChunkStore?: (cgId: bigint) => string | null;
 }
 
 /**
@@ -156,6 +164,7 @@ export async function bindRandomSampling(
     wal,
     log: opts.log,
     ciphertextChunkBackfill: opts.ciphertextChunkBackfill,
+    canonicalCgIdForChunkStore: opts.canonicalCgIdForChunkStore,
   });
 
   const loop = startProverLoop({

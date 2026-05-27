@@ -11,7 +11,7 @@
  *
  * Storage layout:
  *
- *   Named graph:  urn:dkg:swm:ciphertext-chunks/<sanitizedCgId>
+ *   Named graph:  urn:dkg:swm:ciphertext-chunks/<sanitizedCanonicalCgId>
  *   Subject:      urn:dkg:swm:v10-publish-ciphertext-chunk/<batchIdHex>/<chunkIndex>
  *   Predicate:    urn:dkg:swm:v10-publish-ciphertext-chunk-bytes
  *   Object:       "<base64(ciphertext_chunk_bytes)>"
@@ -24,6 +24,24 @@
  * keep `batchId` first so the SPARQL "list every chunk for one
  * batch" query (V2 ACK verify path) needs only a STRSTARTS on the
  * full per-batch prefix, no cross-batch scan.
+ *
+ * **Codex review on PR #715** — `(batchId, chunkIndex)` is NOT a
+ * globally unique storage key on its own: two CGs publishing
+ * identical V10 KCs would share a batchId (it's a plaintext-derived
+ * merkleRoot), so a wildcard `GRAPH ?g` lookup risks returning the
+ * wrong CG's ciphertext bytes and corrupting either the V2 ACK
+ * verify or the curated random-sampling proof. The fix is operational:
+ * BOTH persist AND lookup sites canonicalize the CG id (cleartext or
+ * numeric → curator-committed `nameHash` via `gossipWireIdFor` in
+ * `dkg-agent`) BEFORE computing `ciphertextChunkStoreGraph`. The
+ * per-CG named graph then provides the discriminator the subject URI
+ * alone cannot. See the persist site in
+ * `dkg-agent.ingestSwmCiphertextChunkEnvelope`, the V2 ACK lookup in
+ * `storage-ack-handler.loadChunk`, the responder lookup in
+ * `dkg-agent.handleGetCiphertextChunk`, and the prover-side lookup in
+ * `random-sampling/ciphertext-chunks-extractor.extractCiphertextChunksFromStore`
+ * — every one converges on the wire-form `nameHash` so per-CG
+ * isolation holds without changing the subject URI shape.
  *
  * `batchId` MUST be a 32-byte buffer (the V10 KC merkleRoot). The
  * helpers stringify it via lowercase 0x-prefixed hex so the same

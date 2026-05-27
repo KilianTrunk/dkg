@@ -104,6 +104,24 @@ export interface RandomSamplingProverDeps {
    *     retry extract finds the chunks in the local store).
    */
   ciphertextChunkBackfill?: CiphertextChunkBackfillFn;
+  /**
+   * Codex review on PR #715 — canonical CG-id resolver for the
+   * ciphertext-chunks named graph. Given a numeric on-chain `cgId`,
+   * returns the curator-committed `nameHash` (wire form, lowercase
+   * 0x-prefixed 32-byte hex) the agent uses when persisting chunks
+   * to `ciphertextChunkStoreGraph(canonical)`. The prover passes the
+   * result through to the extractor so its SPARQL lookup pins the
+   * correct per-CG named graph instead of scanning `GRAPH ?g`, which
+   * eliminates the multi-CG identical-KC collision the bot called
+   * out on `ciphertext-chunk-store.ts:73`.
+   *
+   * Return `null` when the local node doesn't have the CG metadata
+   * yet — the extractor will fall back to wildcard scanning for that
+   * tick (preserves correctness for the single-tenant common case,
+   * sacrifices the cross-CG isolation guard only when the local
+   * mapping hasn't caught up).
+   */
+  canonicalCgIdForChunkStore?: (cgId: bigint) => string | null;
 }
 
 export interface CiphertextChunkBackfillRequest {
@@ -160,6 +178,7 @@ export class RandomSamplingProver {
   private readonly wal: ProverWal;
   private readonly log: ProverLogger;
   private readonly ciphertextChunkBackfill?: CiphertextChunkBackfillFn;
+  private readonly canonicalCgIdForChunkStore?: (cgId: bigint) => string | null;
   private inflight: Promise<TickOutcome> | null = null;
 
   constructor(deps: RandomSamplingProverDeps) {
@@ -170,6 +189,7 @@ export class RandomSamplingProver {
     this.wal = deps.wal ?? new InMemoryProverWal();
     this.log = deps.log ?? noopLog;
     this.ciphertextChunkBackfill = deps.ciphertextChunkBackfill;
+    this.canonicalCgIdForChunkStore = deps.canonicalCgIdForChunkStore;
   }
 
   /** Single-flight tick. Concurrent callers await the same result. */
@@ -433,6 +453,7 @@ export class RandomSamplingProver {
       // anyway — repeated misses keep retrying naturally without
       // burning the worker thread on a single period.
       let curatedExtracted: { chunks: Uint8Array[] } | null = null;
+      const cgIdCanonicalForChunks = this.canonicalCgIdForChunkStore?.(cgId) ?? undefined;
       for (let attempt = 0; attempt < 2 && !curatedExtracted; attempt++) {
         try {
           curatedExtracted = await extractCiphertextChunksFromStore({
@@ -441,6 +462,7 @@ export class RandomSamplingProver {
             kcId,
             batchId,
             expectedCount: expectedLeafCount,
+            contextGraphIdCanonical: cgIdCanonicalForChunks,
           });
         } catch (err) {
           if (err instanceof CiphertextChunksMissingError) {

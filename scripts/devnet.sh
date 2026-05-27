@@ -1226,7 +1226,136 @@ cmd_stop() {
   stop_blazegraph
   stop_oxigraph_servers
 
+  # Port-sweep — kills processes still holding *this* devnet's ports after the
+  # normal pidfile-based stop has run. Two modes:
+  #
+  #   default ("scoped"):   only kill listeners whose pid matches one we know
+  #                          belongs to this devnet (hardhat.pid + each
+  #                          node*/devnet.pid + supervisor/daemon pids, plus
+  #                          the process-tree descendants of those). Safe to
+  #                          leave on permanently — never touches unrelated
+  #                          local services that happen to use 8545 etc.
+  #
+  #   "broad" (opt-in):     kill any listener on the configured port set,
+  #                          regardless of pid provenance. Useful after an
+  #                          rc.X devnet crashed and forgot its pidfiles, but
+  #                          dangerous in shared environments. Enable with
+  #                          `DEVNET_STOP_PORT_SWEEP_BROAD=1`.
+  #
+  # `DEVNET_STOP_PORT_SWEEP=0` disables both. Default is scoped sweep ON.
+  if [ "${DEVNET_STOP_PORT_SWEEP:-1}" = "1" ]; then
+    sweep_ports_for_devnet
+  fi
+
   log "Devnet stopped."
+}
+
+# Collect every pid we believe belongs to this devnet by walking the on-disk
+# pidfile set. Echoes a space-separated list of unique pids. Safe to call
+# even when the devnet has been mostly torn down — missing files are skipped.
+#
+# Note: bash 3.2 (macOS default) errors on `${arr[@]}` when the array is
+# empty under `set -u`. We use a plain space-separated string so the logic
+# stays bash 3.2 clean.
+collect_devnet_pids() {
+  local pids="" f pid children
+  for f in "$DEVNET_DIR/hardhat.pid" "$DEVNET_DIR"/node*/devnet.pid "$DEVNET_DIR"/node*/daemon.pid; do
+    [ -f "$f" ] || continue
+    pid=$(cat "$f" 2>/dev/null || true)
+    [ -n "$pid" ] && pids+=" $pid"
+  done
+  # Children — node.js often forks a worker. ps -A -o pid,ppid is portable
+  # across macOS and Linux; awk filters in a single pass.
+  if [ -n "$pids" ] && command -v ps >/dev/null 2>&1; then
+    children=$(ps -A -o pid=,ppid= 2>/dev/null | awk -v plist="$pids" '
+      BEGIN { n = split(plist, arr, " "); for (i=1;i<=n;i++) if (arr[i] != "") parents[arr[i]] = 1 }
+      { if ($2 in parents) print $1 }
+    ' 2>/dev/null || true)
+    for pid in $children; do pids+=" $pid"; done
+  fi
+  # De-dup, drop empties.
+  echo "$pids" | tr ' ' '\n' | awk 'NF && !seen[$0]++' | tr '\n' ' '
+}
+
+# Find and SIGTERM (then SIGKILL after a grace window) any process holding
+# this devnet's known ports. Safe on macOS (lsof) and Linux (lsof). Always
+# exits 0 — best-effort, never blocks the wider stop flow.
+sweep_ports_for_devnet() {
+  local -a ports=("$HARDHAT_PORT")
+  local i
+  for i in $(seq 1 "$NUM_NODES"); do
+    ports+=("$((API_PORT_BASE + i - 1))")
+    ports+=("$((LIBP2P_PORT_BASE + i - 1))")
+  done
+
+  if ! command -v lsof >/dev/null 2>&1; then
+    log "(port-sweep skipped: lsof not on PATH)"
+    return 0
+  fi
+
+  local broad="${DEVNET_STOP_PORT_SWEEP_BROAD:-0}"
+  local owned_pids=""
+  if [ "$broad" != "1" ]; then
+    owned_pids=" $(collect_devnet_pids) "
+    if [ "$owned_pids" = "  " ]; then
+      # No pidfiles left — likely a crash recovery. In scoped mode we refuse
+      # to fire blindly; user opts in via DEVNET_STOP_PORT_SWEEP_BROAD=1.
+      log "(port-sweep skipped: no known devnet pids on disk; set DEVNET_STOP_PORT_SWEEP_BROAD=1 to sweep anyway)"
+      return 0
+    fi
+  fi
+
+  local stragglers=""
+  local p raw_pids targeted pid
+  for p in "${ports[@]}"; do
+    targeted=""
+    # NOTE: lsof exits 1 when no listener matches the filter. Under
+    # `set -e` + `pipefail` that would abort the whole stop. Wrap with
+    # `|| true` so an "empty result" is just empty, not a fatal error.
+    raw_pids=$(lsof -nP -iTCP:"$p" -sTCP:LISTEN -t 2>/dev/null | sort -u | tr '\n' ' ' || true)
+    [ -z "$(echo "$raw_pids" | tr -d ' ')" ] && continue
+    if [ "$broad" = "1" ]; then
+      targeted="$raw_pids"
+    else
+      # Scoped mode: intersect listeners with our owned pid set so we never
+      # SIGKILL an unrelated local service that happens to be on 8545.
+      for pid in $raw_pids; do
+        if echo "$owned_pids" | grep -q " $pid "; then
+          targeted+=" $pid"
+        fi
+      done
+    fi
+    if [ -z "$(echo "$targeted" | tr -d ' ')" ]; then
+      if [ "$broad" != "1" ]; then
+        log "Port-sweep: TCP:$p held by pid(s)=$raw_pids — NOT owned by this devnet, leaving alone"
+      fi
+      continue
+    fi
+    log "Port-sweep: TCP:$p still LISTEN — pids=$targeted (SIGTERM)"
+    stragglers+=" $targeted"
+    for pid in $targeted; do kill "$pid" 2>/dev/null || true; done
+  done
+
+  # Brief grace; then SIGKILL any survivor on the same port set.
+  [ -n "$(echo "$stragglers" | tr -d ' ')" ] || return 0
+  sleep 2
+  for p in "${ports[@]}"; do
+    targeted=""
+    raw_pids=$(lsof -nP -iTCP:"$p" -sTCP:LISTEN -t 2>/dev/null | sort -u | tr '\n' ' ' || true)
+    [ -z "$(echo "$raw_pids" | tr -d ' ')" ] && continue
+    if [ "$broad" = "1" ]; then
+      targeted="$raw_pids"
+    else
+      for pid in $raw_pids; do
+        if echo "$owned_pids" | grep -q " $pid "; then
+          targeted+=" $pid"
+        fi
+      done
+    fi
+    [ -z "$(echo "$targeted" | tr -d ' ')" ] && continue
+    log "Port-sweep: TCP:$p still held after SIGTERM — pids=$targeted (SIGKILL)"
+    for pid in $targeted; do kill -9 "$pid" 2>/dev/null || true; done
+  done
 }
 
 cmd_status() {

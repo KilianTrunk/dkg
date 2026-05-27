@@ -792,19 +792,31 @@ log ""
 log "Per-CG final inbox (delivery validation — operators cross-reference):"
 log ""
 ALL_CGS_CSV=$(IFS=','; printf '%s' "${ALL_CGS[*]}")
-python3 <<PYTHON | tee -a "$LOG_DIR/main.log"
+# Heredoc delimiter is QUOTED so bash performs no expansion on the body.
+# That is critical because the Python script's comments contain backtick-
+# quoted code references like `m = re.match(...)`; with an unquoted
+# delimiter bash would attempt to execute those as command substitutions
+# (producing a stream of "command not found" / "syntax error" messages
+# that swamped the soak's actual summary output). All bash-side values
+# travel into the Python script through environment variables instead.
+export SWM_SUMMARY_LOG_DIR="$LOG_DIR"
+export SWM_SUMMARY_SENDER_TAG="$SENDER_TAG"
+export SWM_SUMMARY_PEERS_EXPECTED="$PEERS_EXPECTED"
+export SWM_SUMMARY_ALL_CGS_CSV="$ALL_CGS_CSV"
+export SWM_SUMMARY_TOTAL_CYCLES="$SWM_TOTAL_CYCLES"
+python3 <<'PYTHON' | tee -a "$LOG_DIR/main.log"
 import json, os, re
-log_dir = "$LOG_DIR"
-self_tag = "$SENDER_TAG"
-peers_expected = [p.strip() for p in "$PEERS_EXPECTED".split(',') if p.strip()]
+log_dir = os.environ["SWM_SUMMARY_LOG_DIR"]
+self_tag = os.environ["SWM_SUMMARY_SENDER_TAG"]
+peers_expected = [p.strip() for p in os.environ.get("SWM_SUMMARY_PEERS_EXPECTED", "").split(',') if p.strip()]
 # Codex PR #572 R14 (round 5): seed the report set from the
 # configured CG list so a context graph that observed ZERO final
 # rows (total failure: nothing — even our own writes — landed in
 # its local SWM) is still surfaced in the breakdown as
 # INDETERMINATE rather than being silently omitted because it
 # never appeared in `by_cg_final`.
-all_cgs_configured = [c.strip() for c in "$ALL_CGS_CSV".split(',') if c.strip()]
-cycles = $SWM_TOTAL_CYCLES
+all_cgs_configured = [c.strip() for c in os.environ.get("SWM_SUMMARY_ALL_CGS_CSV", "").split(',') if c.strip()]
+cycles = int(os.environ.get("SWM_SUMMARY_TOTAL_CYCLES", "0") or "0")
 
 # Codex PR #572 R12 (round 4): build per-(cg, sender) denominator
 # table from the writes-accepted summary tombstones each peer

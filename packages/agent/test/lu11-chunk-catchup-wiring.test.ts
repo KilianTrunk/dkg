@@ -432,6 +432,20 @@ describe('DKGAgent.fetchCiphertextChunkFromPeer — initiator wiring (LU-11)', (
 
     expect(resp.denied).toBe('unauthorized requester (not on agent allowlist)');
     expect(resp.ciphertextB64).toBeUndefined();
+
+    // Codex review (round 2) feedback: also pin that a denied
+    // response SKIPS persistence even when the caller set
+    // `persist: true`. Without this assertion, a refactor that
+    // wrote to the chunk store BEFORE checking `resp.denied`
+    // would pass the test silently while writing untrusted
+    // (potentially attacker-controlled) bytes to local storage.
+    const canonical = internals.gossipWireIdFor(cgId);
+    const persistedDespiteDenied = await chunkPersistedAt(internals, {
+      canonicalCgId: canonical,
+      batchId,
+      chunkIndex: 0,
+    });
+    expect(persistedDespiteDenied).toBeNull();
   });
 
   it('transport failure (delivered=false): throws with the messenger error in the message — backfill loop records as a failure', async () => {
@@ -625,9 +639,20 @@ describe('DKGAgent.ingestSwmCiphertextChunkEnvelope — gossip ingester wiring (
 
     await internals.ingestSwmCiphertextChunkEnvelope(subscriptionCgId, envelopeBytes, REMOTE_PEER);
 
-    // Nothing persisted under EITHER cg's canonical graph.
+    // Codex review (round 2) feedback: assert NOTHING persisted
+    // under EITHER cg's canonical graph. Previously only the
+    // envelope CG was checked, which means a regression that
+    // persisted under the SUBSCRIPTION cg's graph (e.g. by trusting
+    // the topic-CG and ignoring the envelope-CG) would pass
+    // silently. Both must be null for the drop semantics to hold.
+    const canonicalSubscription = internals.gossipWireIdFor(subscriptionCgId);
     expect(await chunkPersistedAt(internals, {
       canonicalCgId: canonicalEnvelope,
+      batchId,
+      chunkIndex: 0,
+    })).toBeNull();
+    expect(await chunkPersistedAt(internals, {
+      canonicalCgId: canonicalSubscription,
       batchId,
       chunkIndex: 0,
     })).toBeNull();

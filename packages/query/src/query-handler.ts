@@ -285,7 +285,7 @@ export class QueryHandler {
       return errorResponse(opId, 'ERROR', 'SERVICE clauses are not allowed in remote queries');
     }
 
-    if (/\bGRAPH\s+/i.test(stripped)) {
+    if (/\bGRAPH(?:\s+|(?=[?$<]))/i.test(stripped)) {
       return errorResponse(opId, 'ERROR', 'Explicit GRAPH clauses are not allowed in remote queries — queries are automatically scoped to the target context graph');
     }
 

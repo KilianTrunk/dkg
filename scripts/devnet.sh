@@ -927,7 +927,7 @@ cmd_start() {
         if (idId === 0n) { console.log('Node ' + (i+1) + ' (core): no identity after 60s, skipping'); continue; }
 
         const stakeAmount = ethers.parseEther('50000');
-        const askAmount = ethers.parseEther('1');
+        const askAmount = ethers.parseEther('${DEVNET_CORE_ASK_TRAC:-1}');
         // Lock tier 1 (1-month). Cheapest tier with non-zero multiplier; sufficient
         // for devnet random-sampling soak tests where we need nodeStakeV10 > 0.
         const lockTier = 1;

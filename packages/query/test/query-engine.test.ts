@@ -318,6 +318,26 @@ describe('DKGQueryEngine', () => {
       { g: sharedMemoryGraph, name: '"Workspace Only"' },
     ]);
   });
+
+  it('constrains GRAPH variables to the requested legacy sub-graph and shared memory graph', async () => {
+    const subGraphName = 'team-a';
+    const subGraph = `did:dkg:context-graph:${CONTEXT_GRAPH}/${subGraphName}`;
+    const subGraphSharedMemory = `did:dkg:context-graph:${CONTEXT_GRAPH}/${subGraphName}/_shared_memory`;
+    await store.insert([
+      q('urn:team:entity', 'http://schema.org/name', '"Team Data"', subGraph),
+      q('urn:team:ws', 'http://schema.org/name', '"Team Workspace"', subGraphSharedMemory),
+      q('urn:other-team:entity', 'http://schema.org/name', '"Other Team"', `did:dkg:context-graph:${CONTEXT_GRAPH}/team-b`),
+      q('urn:other-team:ws', 'http://schema.org/name', '"Other Team Workspace"', `did:dkg:context-graph:${CONTEXT_GRAPH}/team-b/_shared_memory`),
+    ]);
+
+    const result = await engine.query(
+      'SELECT ?g ?name WHERE { GRAPH ?g { ?s <http://schema.org/name> ?name } } ORDER BY ?name',
+      { contextGraphId: CONTEXT_GRAPH, subGraphName, includeSharedMemory: true },
+    );
+
+    expect(result.bindings.map((row) => row['name'])).toEqual(['"Team Data"', '"Team Workspace"']);
+    expect(result.bindings.map((row) => row['g']).sort()).toEqual([subGraph, subGraphSharedMemory].sort());
+  });
 });
 
 describe('validateReadOnlySparql', () => {

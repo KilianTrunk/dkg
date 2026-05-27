@@ -402,17 +402,50 @@ describe('StorageACKHandler V2 chunked ACK — canonical CG keying (#729 Bug 4 r
       makeEventBus() as any,
     );
 
-    // ACK for CG-A — must find chunksA, root match.
-    const ackA = decodeStorageACK(await handler.handler(
-      buildV2IntentBytes({
-        cgId: NUMERIC_CG_ID,
-        swmGraphId: 'cg-A',
-        merkleRoot: sharedBatchId,
-        chunks: chunksA,
-      }),
-      fakePeerId,
-    ));
+    // Codex review feedback: the original test used the SAME
+    // numeric `cgId` for both ACK calls and asserted only
+    // (A→accept, A-with-B-claim→decline). Under a buggy `GRAPH ?g`
+    // wildcard regression that ignored `swmGraphId` entirely, the
+    // `LIMIT 1` could happen to return CG-A's chunks first → ackA
+    // still accepts AND the cross-claim still declines (rootB ≠
+    // rootA) → the buggy implementation passes silently.
+    //
+    // Strengthen the test with FOUR assertions covering both CGs
+    // symmetrically — a wildcard regression would now have to make
+    // both CG-A's and CG-B's lookups return the OTHER CG's chunks
+    // depending on which `swmGraphId` was passed, which a
+    // non-scoped query cannot do (LIMIT 1 is deterministic for a
+    // given store state). Both positive cases (A→chunksA AND
+    // B→chunksB succeed) plus the cross-claim declines pin the
+    // per-CG scoping unambiguously.
+    const intentA_ok = buildV2IntentBytes({
+      cgId: NUMERIC_CG_ID,
+      swmGraphId: 'cg-A',
+      merkleRoot: sharedBatchId,
+      chunks: chunksA,
+    });
+    const intentB_ok = buildV2IntentBytes({
+      // Distinct on-chain cgId for CG-B reinforces the isolation
+      // (production publishers always pair `cgId` with `swmGraphId`
+      // 1:1; the test now exercises both pairings).
+      cgId: NUMERIC_CG_ID + 1n,
+      swmGraphId: 'cg-B',
+      merkleRoot: sharedBatchId,
+      chunks: chunksB,
+    });
+
+    const ackA = decodeStorageACK(await handler.handler(intentA_ok, fakePeerId));
     expect(isStorageACKDecline(ackA)).toBe(false);
+    expect(ackA.contextGraphId).toBe(NUMERIC_CG_ID);
+
+    // Symmetric positive case — under a wildcard-regression bug,
+    // this would either accept-the-wrong-chunks (computed root
+    // would equal rootA, not rootB → DECLINE) or accept with the
+    // wrong chunk content. Pinning a successful ACK here pins
+    // proper per-CG scoping.
+    const ackB = decodeStorageACK(await handler.handler(intentB_ok, fakePeerId));
+    expect(isStorageACKDecline(ackB)).toBe(false);
+    expect(ackB.contextGraphId).toBe(NUMERIC_CG_ID + 1n);
 
     // ACK for CG-A but claiming CG-B's root — must DECLINE with root
     // mismatch (proves the lookup didn't cross-pull chunksB even
@@ -422,9 +455,6 @@ describe('StorageACKHandler V2 chunked ACK — canonical CG keying (#729 Bug 4 r
         cgId: NUMERIC_CG_ID,
         swmGraphId: 'cg-A',
         merkleRoot: sharedBatchId,
-        // Lie about the root + count to match CG-B, but the lookup
-        // is scoped to CG-A's named graph so we get CG-A's chunks
-        // and the recomputed root is rootA, not rootB.
         chunks: chunksB,
         override: { ciphertextChunksRoot: rootB, ciphertextChunkCount: chunksB.length },
       }),
@@ -432,6 +462,22 @@ describe('StorageACKHandler V2 chunked ACK — canonical CG keying (#729 Bug 4 r
     ));
     expect(isStorageACKDecline(ackACrossClaim)).toBe(true);
     expect(ackACrossClaim.declineCode).toBe(STORAGE_ACK_DECLINE_CODES.CIPHERTEXT_ROOT_MISMATCH);
+
+    // Symmetric cross-claim: ACK for CG-B but claiming CG-A's root —
+    // must also decline. Without this, a regression to a wildcard
+    // scan could quietly serve CG-A's chunks under a CG-B request.
+    const ackBCrossClaim = decodeStorageACK(await handler.handler(
+      buildV2IntentBytes({
+        cgId: NUMERIC_CG_ID + 1n,
+        swmGraphId: 'cg-B',
+        merkleRoot: sharedBatchId,
+        chunks: chunksA,
+        override: { ciphertextChunksRoot: rootA, ciphertextChunkCount: chunksA.length },
+      }),
+      fakePeerId,
+    ));
+    expect(isStorageACKDecline(ackBCrossClaim)).toBe(true);
+    expect(ackBCrossClaim.declineCode).toBe(STORAGE_ACK_DECLINE_CODES.CIPHERTEXT_ROOT_MISMATCH);
   });
 
   it('declines with MISSING_CIPHERTEXT_CHUNKS when only some claimed chunks are persisted', async () => {
@@ -447,9 +493,12 @@ describe('StorageACKHandler V2 chunked ACK — canonical CG keying (#729 Bug 4 r
     const kcMerkleRoot = ethers.getBytes(ethers.id('v2-missing-chunks'));
 
     // Persist only 0 and 2 — leave 1 and 3 missing. The handler
-    // retries for ~10s in production; vitest's default test timeout
-    // here is generous enough but we keep the retry budget short by
-    // setting only the chunks we want missing.
+    // retries for ~10s in production to absorb the SWM ingest race
+    // window; for this DETERMINISTIC missing-chunks test there's
+    // no race to wait for, so wire the test-only retry knob to
+    // collapse the wait budget to 0 retries × 0ms. Codex review
+    // feedback on PR #738 — the prior test paid the full ~10s
+    // budget on every run, slowing CI and making timing fragile.
     await seedChunks(store, {
       canonicalCgId: CANONICAL_WIRE_FOR_CLEARTEXT,
       batchId: kcMerkleRoot,
@@ -461,6 +510,7 @@ describe('StorageACKHandler V2 chunked ACK — canonical CG keying (#729 Bug 4 r
       store,
       createV2Config(coreWallet, {
         normalizeContextGraphIdForChunkStore: () => CANONICAL_WIRE_FOR_CLEARTEXT,
+        _v2ChunkLookupRetryPolicyForTests: { maxRetries: 0, delayMs: 0 },
       }),
       makeEventBus() as any,
     );
@@ -479,7 +529,7 @@ describe('StorageACKHandler V2 chunked ACK — canonical CG keying (#729 Bug 4 r
     // knows which chunks to re-broadcast on retry.
     expect(ack.declineMessage).toMatch(/missing 2\/4/);
     expect(ack.declineMessage).toMatch(/1,3/);
-  }, 20_000);
+  });
 
   it('declines with CIPHERTEXT_ROOT_MISMATCH when all chunks present but the recomputed root differs from the publisher claim', async () => {
     coreWallet = ethers.Wallet.createRandom();

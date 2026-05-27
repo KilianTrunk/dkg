@@ -255,6 +255,20 @@ describe('DKGQueryEngine', () => {
       ),
     ).rejects.toThrow(/Scoped query violation: FROM clauses are not allowed/i);
   });
+
+  it('rejects explicit GRAPH IRIs outside the scoped context graph', async () => {
+    const otherGraph = 'did:dkg:context-graph:other-agent-registry';
+    await store.insert([
+      q('urn:secret:entity', 'http://schema.org/name', '"Secret"', otherGraph),
+    ]);
+
+    await expect(
+      engine.query(
+        `SELECT ?name WHERE { GRAPH <${otherGraph}> { ?s <http://schema.org/name> ?name } }`,
+        { contextGraphId: CONTEXT_GRAPH },
+      ),
+    ).rejects.toThrow(/Scoped query violation: GRAPH <did:dkg:context-graph:other-agent-registry> is outside the allowed graph set/i);
+  });
 });
 
 describe('validateReadOnlySparql', () => {

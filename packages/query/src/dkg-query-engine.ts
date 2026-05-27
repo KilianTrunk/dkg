@@ -166,6 +166,19 @@ export class DKGQueryEngine implements QueryEngine {
       if (!v.valid) throw new Error(`Invalid sub-graph name for query: ${v.reason}`);
     }
 
+    if (effectiveContextGraphId && !options?.view) {
+      const dataGraph = options?.subGraphName
+        ? contextGraphSubGraphUri(effectiveContextGraphId, options.subGraphName)
+        : contextGraphDataUri(effectiveContextGraphId);
+      const sharedMemoryGraph = contextGraphSharedMemoryUri(effectiveContextGraphId, options?.subGraphName);
+      const allowedGraphs = options?.includeSharedMemory ?? options?.includeWorkspace
+        ? [dataGraph, sharedMemoryGraph]
+        : options?.graphSuffix === '_shared_memory'
+          ? [sharedMemoryGraph]
+          : [dataGraph];
+      assertExplicitGraphIrisAllowed(sparql, allowedGraphs);
+    }
+
     if (options?.view) {
       if (!effectiveContextGraphId) {
         throw new Error(
@@ -432,6 +445,99 @@ function assertNoCallerDatasetClauses(sparql: string): void {
       'FROM clauses are not allowed on scoped local queries',
     );
   }
+}
+
+function assertExplicitGraphIrisAllowed(sparql: string, allowedGraphs: string[]): void {
+  const allowed = new Set(allowedGraphs);
+  for (const graphIri of collectExplicitGraphIris(sparql)) {
+    if (!allowed.has(graphIri)) {
+      throw new ScopedQueryViolationError(
+        `GRAPH <${graphIri}> is outside the allowed graph set`,
+      );
+    }
+  }
+}
+
+function collectExplicitGraphIris(sparql: string): string[] {
+  const iris: string[] = [];
+  const n = sparql.length;
+  let i = 0;
+
+  while (i < n) {
+    const ch = sparql[i];
+    if (ch === '#') {
+      while (i < n && sparql[i] !== '\n') i++;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      i = skipSparqlStringLiteral(sparql, i);
+      continue;
+    }
+    if (ch === '<') {
+      const end = sparql.indexOf('>', i + 1);
+      if (end === -1) return iris;
+      i = end + 1;
+      continue;
+    }
+    if (isKeywordStart(sparql, i)) {
+      let j = i + 1;
+      while (j < n && isWordContinuation(sparql[j])) j++;
+      const word = sparql.slice(i, j);
+      if (word.toUpperCase() === 'GRAPH') {
+        const operandStart = skipSparqlSpaceAndLineComments(sparql, j);
+        if (operandStart > j && sparql[operandStart] === '<') {
+          const operandEnd = sparql.indexOf('>', operandStart + 1);
+          if (operandEnd === -1) return iris;
+          iris.push(sparql.slice(operandStart + 1, operandEnd));
+          i = operandEnd + 1;
+          continue;
+        }
+      }
+      i = j;
+      continue;
+    }
+    i++;
+  }
+
+  return iris;
+}
+
+function skipSparqlSpaceAndLineComments(sparql: string, start: number): number {
+  let i = start;
+  while (i < sparql.length) {
+    if (/\s/.test(sparql[i])) {
+      i++;
+      continue;
+    }
+    if (sparql[i] === '#') {
+      while (i < sparql.length && sparql[i] !== '\n') i++;
+      continue;
+    }
+    break;
+  }
+  return i;
+}
+
+function isKeywordStart(src: string, idx: number): boolean {
+  const ch = src[idx];
+  if (!isWordStart(ch)) return false;
+  const prev = idx > 0 ? src[idx - 1] : '';
+  return !prev || (!isWordContinuation(prev) && prev !== '?' && prev !== '$' && prev !== ':' && prev !== '#');
+}
+
+function isWordStart(ch: string | undefined): ch is string {
+  return !!ch && (
+    (ch >= 'A' && ch <= 'Z') ||
+    (ch >= 'a' && ch <= 'z') ||
+    ch === '_'
+  );
+}
+
+function isWordContinuation(ch: string | undefined): ch is string {
+  return !!ch && (
+    isWordStart(ch) ||
+    (ch >= '0' && ch <= '9')
+  );
 }
 
 /**

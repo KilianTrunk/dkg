@@ -637,6 +637,36 @@ Failure classifications you'll see in `attempt.lastError.classification`:
 | `cap_exceeded` | no | `Promoted assertion too large for gossip` (10 MB) or `Request body too large` (256 KB) | Re-enqueue with a smaller `entities` slice — the queue can't subdivide on its own. |
 | `fatal` | no | Bad request, missing assertion, etc. | Inspect the error message, fix the cause, then `POST /api/assertion/promote-async/{jobId}/recover`. |
 
+### TRAC auto-approve policy (V10 publish + update)
+
+Every V10 publish or update pulls TRAC from the operational signer via `token.transferFrom(msg.sender, CSS, fullCost)`. Before that call, the EVM adapter checks the signer's allowance for the V10 KA contract and approves more if it's short. `config.chain.approvalPolicy` controls how much it approves at each top-up — a per-publish gas trade-off that's neutral on testnet (zero-cost publishes) but matters at mainnet scale.
+
+| Mode | Per-publish gas | Blast radius (compromised KA) | When to use |
+|---|---|---|---|
+| `per-publish` (default) | One `approve` tx whenever `tokenAmount` exceeds prior allowance | One publish's cost ceiling | Conservative default. Low publish volume, or operators who trust nothing. |
+| `replenishing` | One `approve` per ~`targetAllowance / avgPublishCost` publishes | Capped at `targetAllowance` (1000 TRAC default) | **Recommended for mainnet at any volume.** Predictable gas profile + bounded exposure. |
+| `unlimited` | One `approve` ever per wallet | Operational wallet's full TRAC balance | High-volume operators on a contract they trust absolutely. Matches V9 behaviour. |
+
+Configuration (defaults shown):
+
+```yaml
+chain:
+  type: evm
+  rpcUrl: https://base.llamarpc.com
+  hubAddress: '0x...'
+  approvalPolicy:
+    mode: per-publish                # 'per-publish' | 'replenishing' | 'unlimited'
+    # `replenishing` mode only:
+    targetAllowance: '1000000000000000000000'   # decimal wei-TRAC string (1000 TRAC = 10^21)
+    refillBelowFraction: 0.1                     # refill when current < target × this (default 10%)
+```
+
+`targetAllowance` is a string because YAML/JSON can't carry bigints natively — the daemon parses it into a bigint at startup, fails fast on garbage input. `refillBelowFraction` clamps to `[0, 1]`; a value of `1` means "refill on every publish" (defeats the policy) and `0` means "never refill until the publish floor (1 wei-TRAC) is breached" (which on a zero-cost CG would mean approve once then never again).
+
+The policy never approves *less* than the immediate publish needs — a too-low `targetAllowance` gets quietly raised to the publish's on-chain floor so misconfiguration can't brick a publish.
+
+This entire surface was empirically driven by [PR #720](https://github.com/OriginTrail/dkg/pull/720)'s `TooLowAllowance(token, 0, 1)` finding on the May 2026 Base Sepolia publish-stress run; see also `packages/chain/test/evm-adapter.unit.test.ts` for the policy's invariants and edge cases.
+
 ## 9. Error Reference
 
 | Status | Meaning | Recovery |

@@ -33,12 +33,16 @@ import type {
   OperationalWalletRegistrationResult,
   V10PublishingConvictionAccountInfo,
   VerifyACKIdentityResult,
+  ApprovalPolicy,
 } from './chain-adapter.js';
 import {
   NoEligibleContextGraphError,
   NoEligibleKnowledgeCollectionError,
   MerkleRootMismatchError,
   ChallengeNoLongerActiveError,
+  DEFAULT_APPROVAL_POLICY,
+  DEFAULT_REPLENISH_TARGET_ALLOWANCE,
+  DEFAULT_REFILL_BELOW_FRACTION,
 } from './chain-adapter.js';
 import { HubResolutionCache } from './hub-resolution-cache.js';
 import { PcaUnavailableError } from './pca-errors.js';
@@ -173,21 +177,103 @@ export function resolveRpcUrls(rpcUrl: string, rpcUrls?: string[]): string[] {
 export const V10_PUBLISH_ONCHAIN_MIN_ALLOWANCE: bigint = 1n;
 
 /**
- * Returns the TRAC allowance ceiling that must be approved before a V10
- * publish / update for the chosen operational signer. Floors at the
- * on-chain minimum (`V10_PUBLISH_ONCHAIN_MIN_ALLOWANCE`) so the
- * direct-spend branch (`token.transferFrom(..., fullCost)`) never reverts
- * with `TooLowAllowance` when the JS-side `tokenAmount` is `0n`.
+ * Returns the TRAC allowance ceiling required to cover one V10 publish /
+ * update. Floors at the on-chain minimum so the direct-spend branch
+ * (`token.transferFrom(..., fullCost)`) never reverts with
+ * `TooLowAllowance` when the JS-side `tokenAmount` is `0n`.
  *
- * Preserves the existing bounded-approval policy (we still approve only
- * what we need, never `MaxUint256` from this code path) so a compromised
- * KA contract can't drain more than the per-publish ceiling.
+ * This is the *building block* for the `per-publish` approval policy and
+ * the lower-bound clamp used by every other policy mode in
+ * `computeApprovalAction`. The bounded-per-publish security property of
+ * the legacy code path lives here.
  */
 export function effectivePublishAllowance(
   tokenAmount: bigint,
   onChainMin: bigint = V10_PUBLISH_ONCHAIN_MIN_ALLOWANCE,
 ): bigint {
   return tokenAmount > onChainMin ? tokenAmount : onChainMin;
+}
+
+const MAX_UINT256_ALLOWANCE: bigint = (1n << 256n) - 1n;
+
+function clampApprovalFraction(value: number): number {
+  if (!Number.isFinite(value)) return DEFAULT_REFILL_BELOW_FRACTION;
+  if (value < 0) return 0;
+  if (value > 1) return 1;
+  return value;
+}
+
+/**
+ * Computes the approval action for one V10 publish / update, dispatched
+ * by `ApprovalPolicy.mode`.
+ *
+ * Contract:
+ *   - `needsApprove === true`  → caller MUST submit `approve(KA,
+ *     targetAllowance)` before the publish to satisfy
+ *     `token.transferFrom(..., fullCost)` on-chain.
+ *   - `needsApprove === false` → skip the approve; the existing allowance
+ *     already covers this publish.
+ *
+ * Invariants enforced for every mode:
+ *   - `targetAllowance >= effectivePublishAllowance(tokenAmount)` — even
+ *     a misconfigured `replenishing` target gets raised to the on-chain
+ *     minimum so the immediate publish succeeds.
+ *   - `needsApprove` is monotone in `currentAllowance` — strictly more
+ *     existing allowance never flips a `false` to `true`.
+ *
+ * See {@link ApprovalPolicy} in `chain-adapter.ts` for the mode
+ * semantics; see `evm-adapter.unit.test.ts` for the pinned-down behaviour
+ * under every combination of `(mode, tokenAmount, currentAllowance)`.
+ */
+export function computeApprovalAction(
+  policy: ApprovalPolicy,
+  tokenAmount: bigint,
+  currentAllowance: bigint,
+): { needsApprove: boolean; targetAllowance: bigint } {
+  const publishFloor = effectivePublishAllowance(tokenAmount);
+  switch (policy.mode) {
+    case 'unlimited': {
+      // Approve `MaxUint256` once per wallet. After that, currentAllowance
+      // covers any plausible tokenAmount — re-approve only if some external
+      // actor brought it back under the immediate publish's floor (manual
+      // `approve(KA, 0)`, contract upgrade, etc.).
+      return {
+        needsApprove: currentAllowance < publishFloor,
+        targetAllowance: MAX_UINT256_ALLOWANCE,
+      };
+    }
+    case 'replenishing': {
+      // Approve a configurable ceiling once, then refill when current drops
+      // below `target × fraction`. Raise the target to at least the publish
+      // floor so a misconfigured low `targetAllowance` doesn't brick the
+      // publish — the bigger of (operator's intent, what we need right now).
+      const requestedTarget =
+        policy.targetAllowance ?? DEFAULT_REPLENISH_TARGET_ALLOWANCE;
+      const target = requestedTarget > publishFloor ? requestedTarget : publishFloor;
+      const fraction = clampApprovalFraction(
+        policy.refillBelowFraction ?? DEFAULT_REFILL_BELOW_FRACTION,
+      );
+      // bigint-safe `target * fraction` via basis points so a fractional
+      // refill threshold never drifts on round-trip.
+      const fractionBp = BigInt(Math.round(fraction * 10_000));
+      let threshold = (target * fractionBp) / 10_000n;
+      // The refill threshold must cover the immediate publish's floor too —
+      // refilling below it would just let the next publish revert with
+      // `TooLowAllowance` again.
+      if (threshold < publishFloor) threshold = publishFloor;
+      return { needsApprove: currentAllowance < threshold, targetAllowance: target };
+    }
+    case 'per-publish':
+    default: {
+      // Approve exactly the publish floor. Matches the legacy bounded-
+      // per-publish behaviour (with the 1n on-chain minimum closing the
+      // gap that previously bricked zero-cost publishes).
+      return {
+        needsApprove: currentAllowance < publishFloor,
+        targetAllowance: publishFloor,
+      };
+    }
+  }
 }
 
 function sleep(ms: number): Promise<void> {
@@ -419,6 +505,14 @@ interface EVMAdapterBaseConfig {
    * still effectively zero.
    */
   randomSamplingHubRefreshMs?: number;
+  /**
+   * Policy that controls how the V10 publish / update auto-approve sizes
+   * its TRAC allowance request. Defaults to {@link DEFAULT_APPROVAL_POLICY}
+   * (`per-publish`), preserving the bounded-per-publish behaviour that
+   * existed before this field landed. See {@link ApprovalPolicy} for the
+   * mode semantics.
+   */
+  approvalPolicy?: ApprovalPolicy;
 }
 
 export interface EVMAdapterConfig extends EVMAdapterBaseConfig {
@@ -498,6 +592,13 @@ export class EVMChainAdapter implements ChainAdapter {
   private signerIndex = 0;
   private signerSelectionQueue: Promise<void> = Promise.resolve();
   private readonly hubAddress: string;
+  /**
+   * Operator-configured allowance sizing policy for V10 publish / update
+   * auto-approve. See {@link ApprovalPolicy}. Default is `'per-publish'`,
+   * preserving the bounded-per-publish behaviour from before the policy
+   * landed.
+   */
+  private readonly approvalPolicy: ApprovalPolicy;
   private contracts: ContractCache;
   private initialized = false;
   /**
@@ -684,6 +785,7 @@ export class EVMChainAdapter implements ChainAdapter {
     }
     this.hubAddress = config.hubAddress;
     this.chainId = config.chainId ?? 'evm:31337';
+    this.approvalPolicy = config.approvalPolicy ?? DEFAULT_APPROVAL_POLICY;
 
     this.contracts = {
       hub: new Contract(config.hubAddress, loadAbi('Hub'), this.signer),
@@ -2218,22 +2320,31 @@ export class EVMChainAdapter implements ChainAdapter {
     // `agentToAccountId[msg.sender] != 0` and falls through to
     // `token.transferFrom(msg.sender, CSS, fullCost)` for the
     // direct-spend branch. A redundant allowance is cheap and idle when
-    // the PCA branch covers the cost, so we always approve up to
-    // `tokenAmount` for the direct-spend ceiling.
+    // the PCA branch covers the cost.
     //
-    // Floor at the on-chain minimum (`V10_PUBLISH_ONCHAIN_MIN_ALLOWANCE`)
-    // so a JS-side `tokenAmount` of `0n` (testnet pricing oracle, dust
-    // CGs, mainnet pricing edge cases) still satisfies the contract's
-    // `transferFrom(..., 1n)` minimum — see `effectivePublishAllowance`.
+    // How much to approve is delegated to `computeApprovalAction(policy,
+    // tokenAmount, currentAllowance)`. The default `per-publish` policy
+    // matches the legacy bounded-per-publish behaviour with the on-chain
+    // 1n floor; operators preparing for high-volume publishing can
+    // switch to `replenishing` (approve a ceiling, refill at threshold)
+    // or `unlimited` (approve MaxUint256 once) via the daemon config's
+    // `chain.approvalPolicy` block. See {@link ApprovalPolicy}.
     if (this.contracts.token) {
       const tokenWithSigner = this.contracts.token.connect(txSigner) as Contract;
-      const requiredAllowance = effectivePublishAllowance(params.tokenAmount);
-      const currentAllowance = await tokenWithSigner.allowance(txSigner.address, kaAddress);
-      if (currentAllowance < requiredAllowance) {
+      const currentAllowance: bigint = await tokenWithSigner.allowance(
+        txSigner.address,
+        kaAddress,
+      );
+      const { needsApprove, targetAllowance } = computeApprovalAction(
+        this.approvalPolicy,
+        params.tokenAmount,
+        currentAllowance,
+      );
+      if (needsApprove) {
         await this.sendContractTransaction(
           tokenWithSigner,
           'approve',
-          [kaAddress, requiredAllowance],
+          [kaAddress, targetAllowance],
           txSigner,
           'approve V10 publish TRAC',
         );
@@ -2623,18 +2734,27 @@ export class EVMChainAdapter implements ChainAdapter {
 
     // Approve TRAC for the V10 update — the contract may transferFrom
     // for the newTokenAmount (same direct-spend policy as publish).
-    // Same `effectivePublishAllowance` floor as the publish path: even a
-    // metadata-only update with `newTokenAmount === 0n` still requires
-    // `>= 1n` allowance for the on-chain `transferFrom(..., 1n)` minimum.
+    // Same `computeApprovalAction` dispatch as the publish path so a
+    // single config knob (`chain.approvalPolicy`) controls allowance
+    // sizing for both V10 surfaces. The default `per-publish` policy
+    // floors at 1n so metadata-only updates with `newTokenAmount === 0n`
+    // still satisfy the contract's `transferFrom(..., 1n)` minimum.
     if (this.contracts.token) {
       const tokenWithSigner = this.contracts.token.connect(signer) as Contract;
-      const requiredAllowance = effectivePublishAllowance(newTokenAmount);
-      const prevAllowance = await tokenWithSigner.allowance(signer.address, kav10Address);
-      if (prevAllowance < requiredAllowance) {
+      const prevAllowance: bigint = await tokenWithSigner.allowance(
+        signer.address,
+        kav10Address,
+      );
+      const { needsApprove, targetAllowance } = computeApprovalAction(
+        this.approvalPolicy,
+        newTokenAmount,
+        prevAllowance,
+      );
+      if (needsApprove) {
         await this.sendContractTransaction(
           tokenWithSigner,
           'approve',
-          [kav10Address, requiredAllowance],
+          [kav10Address, targetAllowance],
           signer,
           'approve V10 update TRAC',
         );

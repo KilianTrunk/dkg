@@ -5,6 +5,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { Interface, ethers } from 'ethers';
 import {
+  computeApprovalAction,
   decodeEvmError,
   effectivePublishAllowance,
   enrichEvmError,
@@ -13,6 +14,12 @@ import {
   V10_PUBLISH_ONCHAIN_MIN_ALLOWANCE,
   type EVMAdapterConfig,
 } from '../src/evm-adapter.js';
+import {
+  DEFAULT_APPROVAL_POLICY,
+  DEFAULT_REPLENISH_TARGET_ALLOWANCE,
+  DEFAULT_REFILL_BELOW_FRACTION,
+  type ApprovalPolicy,
+} from '../src/chain-adapter.js';
 
 const DEPLOYER_PK = '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80';
 const OTHER_PK = '0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b63b91100';
@@ -983,6 +990,232 @@ describe('effectivePublishAllowance (V10 approval-ceiling policy)', () => {
     const huge = 10n ** 30n;
     expect(effectivePublishAllowance(huge)).toBe(huge);
     expect(effectivePublishAllowance(huge)).not.toBe(ethers.MaxUint256);
+  });
+});
+
+describe('computeApprovalAction — per-publish (default, backward-compatible)', () => {
+  // Reproduces every code path the policy-less adapter took before this
+  // PR. New operators inherit this default; explicit `mode: 'per-publish'`
+  // produces identical behaviour.
+
+  const policy: ApprovalPolicy = { mode: 'per-publish' };
+
+  it('matches DEFAULT_APPROVAL_POLICY', () => {
+    expect(DEFAULT_APPROVAL_POLICY.mode).toBe('per-publish');
+  });
+
+  it('approves the 1n floor when tokenAmount=0n and currentAllowance=0n', () => {
+    const action = computeApprovalAction(policy, 0n, 0n);
+    expect(action.needsApprove).toBe(true);
+    expect(action.targetAllowance).toBe(1n);
+  });
+
+  it('skips approve when current already covers the publish floor (0n / 1n)', () => {
+    expect(computeApprovalAction(policy, 0n, 1n)).toEqual({
+      needsApprove: false,
+      targetAllowance: 1n,
+    });
+  });
+
+  it('approves exactly tokenAmount when current is short', () => {
+    const action = computeApprovalAction(policy, 1000n, 500n);
+    expect(action.needsApprove).toBe(true);
+    expect(action.targetAllowance).toBe(1000n);
+  });
+
+  it('does not re-approve when current >= tokenAmount', () => {
+    expect(computeApprovalAction(policy, 1000n, 1000n).needsApprove).toBe(false);
+    expect(computeApprovalAction(policy, 1000n, 5000n).needsApprove).toBe(false);
+  });
+
+  it('never widens approval beyond tokenAmount (bounded-per-publish security property)', () => {
+    const action = computeApprovalAction(policy, 10n ** 18n, 0n);
+    expect(action.targetAllowance).toBe(10n ** 18n);
+    expect(action.targetAllowance).not.toBe(ethers.MaxUint256);
+  });
+});
+
+describe('computeApprovalAction — replenishing (recommended for mainnet)', () => {
+  // Approve a configurable ceiling once; refill when current drops below
+  // `target × refillBelowFraction`. Pre-mainnet stress run on Base Sepolia
+  // showed this would amortise approve-gas to ~1/9 of the per-publish
+  // policy at default config.
+
+  it('exposes sane defaults', () => {
+    // 1000 TRAC = 1e21 wei-TRAC
+    expect(DEFAULT_REPLENISH_TARGET_ALLOWANCE).toBe(10n ** 21n);
+    expect(DEFAULT_REFILL_BELOW_FRACTION).toBe(0.1);
+  });
+
+  it('approves the default 1000 TRAC ceiling on a fresh wallet', () => {
+    const policy: ApprovalPolicy = { mode: 'replenishing' };
+    const action = computeApprovalAction(policy, 1n, 0n);
+    expect(action.needsApprove).toBe(true);
+    expect(action.targetAllowance).toBe(10n ** 21n);
+  });
+
+  it('skips approve when current is comfortably above the refill threshold', () => {
+    const policy: ApprovalPolicy = { mode: 'replenishing' };
+    // Default target 1000 TRAC, refill at 100 TRAC. 500 TRAC current → no refill.
+    const action = computeApprovalAction(policy, 1n, 500n * (10n ** 18n));
+    expect(action.needsApprove).toBe(false);
+    expect(action.targetAllowance).toBe(10n ** 21n);
+  });
+
+  it('triggers refill when current drops below 10% of target (default fraction)', () => {
+    const policy: ApprovalPolicy = { mode: 'replenishing' };
+    // 99 TRAC current, threshold is 100 TRAC → refill.
+    const action = computeApprovalAction(policy, 1n, 99n * (10n ** 18n));
+    expect(action.needsApprove).toBe(true);
+    expect(action.targetAllowance).toBe(10n ** 21n);
+  });
+
+  it('respects a custom targetAllowance + refillBelowFraction', () => {
+    const policy: ApprovalPolicy = {
+      mode: 'replenishing',
+      targetAllowance: 100n * (10n ** 18n), // 100 TRAC ceiling
+      refillBelowFraction: 0.5,              // refill at 50 TRAC
+    };
+    // Current 60 TRAC → above threshold (50 TRAC) → no refill.
+    expect(computeApprovalAction(policy, 1n, 60n * (10n ** 18n)).needsApprove).toBe(false);
+    // Current 40 TRAC → below threshold → refill to 100 TRAC.
+    const action = computeApprovalAction(policy, 1n, 40n * (10n ** 18n));
+    expect(action.needsApprove).toBe(true);
+    expect(action.targetAllowance).toBe(100n * (10n ** 18n));
+  });
+
+  it('raises a too-low targetAllowance to at least the publish floor', () => {
+    // Operator misconfigured `targetAllowance: 100n` but this publish
+    // needs 500n — should approve 500n, not let it brick the publish.
+    const policy: ApprovalPolicy = { mode: 'replenishing', targetAllowance: 100n };
+    const action = computeApprovalAction(policy, 500n, 0n);
+    expect(action.needsApprove).toBe(true);
+    expect(action.targetAllowance).toBe(500n);
+  });
+
+  it('treats targetAllowance=0n as "use publish floor"', () => {
+    const policy: ApprovalPolicy = { mode: 'replenishing', targetAllowance: 0n };
+    const action = computeApprovalAction(policy, 0n, 0n);
+    expect(action.needsApprove).toBe(true);
+    expect(action.targetAllowance).toBe(1n); // publish floor wins
+  });
+
+  it('clamps refillBelowFraction to [0, 1]', () => {
+    const above: ApprovalPolicy = { mode: 'replenishing', refillBelowFraction: 2 };
+    const aboveAction = computeApprovalAction(above, 1n, 10n ** 21n - 1n);
+    expect(aboveAction.needsApprove).toBe(true); // fraction clamps to 1 → always refill below full target
+
+    const below: ApprovalPolicy = { mode: 'replenishing', refillBelowFraction: -1 };
+    const belowAction = computeApprovalAction(below, 1n, 0n);
+    // fraction clamps to 0 → threshold = 0, but publishFloor (1n) wins
+    expect(belowAction.needsApprove).toBe(true);
+    expect(belowAction.targetAllowance).toBe(10n ** 21n);
+  });
+
+  it('handles NaN / non-finite refillBelowFraction by falling back to the default', () => {
+    const policy: ApprovalPolicy = {
+      mode: 'replenishing',
+      refillBelowFraction: Number.NaN,
+    };
+    // Default 0.1 → threshold = 100 TRAC. 99 TRAC current → refill.
+    const action = computeApprovalAction(policy, 1n, 99n * (10n ** 18n));
+    expect(action.needsApprove).toBe(true);
+  });
+
+  it('refill threshold respects the publish floor even when fraction × target is below it', () => {
+    // Tiny target, tiny fraction, but the immediate publish needs 1000n.
+    const policy: ApprovalPolicy = {
+      mode: 'replenishing',
+      targetAllowance: 100n,
+      refillBelowFraction: 0.01, // threshold = 1n
+    };
+    // Current 500n: above the 1n threshold but below the publish floor (1000n).
+    const action = computeApprovalAction(policy, 1000n, 500n);
+    expect(action.needsApprove).toBe(true);
+    expect(action.targetAllowance).toBe(1000n); // target raised to publish floor
+  });
+});
+
+describe('computeApprovalAction — unlimited (V9 pattern)', () => {
+  const policy: ApprovalPolicy = { mode: 'unlimited' };
+
+  it('approves MaxUint256 on a fresh wallet', () => {
+    const action = computeApprovalAction(policy, 1n, 0n);
+    expect(action.needsApprove).toBe(true);
+    expect(action.targetAllowance).toBe(ethers.MaxUint256);
+  });
+
+  it('never re-approves once the wallet has any usable allowance', () => {
+    // currentAllowance of 1n is enough for a 0n-floored publish — skip approve.
+    expect(computeApprovalAction(policy, 0n, 1n).needsApprove).toBe(false);
+    // currentAllowance of MaxUint256 — definitely skip.
+    expect(computeApprovalAction(policy, 10n ** 30n, ethers.MaxUint256).needsApprove).toBe(false);
+  });
+
+  it('re-approves if external actor revoked allowance back below the publish floor', () => {
+    // Defensive path: if someone called approve(KA, 0) on this wallet, the
+    // next publish should refill MaxUint256, not silently revert.
+    expect(computeApprovalAction(policy, 1n, 0n).needsApprove).toBe(true);
+  });
+});
+
+describe('computeApprovalAction — invariants across all modes', () => {
+  // Properties that must hold for every policy/tokenAmount/currentAllowance
+  // combination — exercised explicitly because they're the structural
+  // safety net behind the policy abstraction.
+
+  const allModes: ApprovalPolicy[] = [
+    { mode: 'per-publish' },
+    { mode: 'replenishing' },
+    { mode: 'unlimited' },
+  ];
+
+  it('targetAllowance is always >= effectivePublishAllowance(tokenAmount)', () => {
+    for (const policy of allModes) {
+      for (const tokenAmount of [0n, 1n, 1000n, 10n ** 18n]) {
+        for (const currentAllowance of [0n, 1n, 10n ** 21n]) {
+          const action = computeApprovalAction(policy, tokenAmount, currentAllowance);
+          const floor = effectivePublishAllowance(tokenAmount);
+          expect(action.targetAllowance).toBeGreaterThanOrEqual(floor);
+        }
+      }
+    }
+  });
+
+  it('needsApprove is monotone in currentAllowance (more allowance never flips false → true)', () => {
+    for (const policy of allModes) {
+      for (const tokenAmount of [0n, 1n, 1000n, 10n ** 18n]) {
+        let lastNeedsApprove = true;
+        for (const currentAllowance of [
+          0n,
+          1n,
+          10n ** 18n,
+          10n ** 21n,
+          ethers.MaxUint256,
+        ]) {
+          const action = computeApprovalAction(policy, tokenAmount, currentAllowance);
+          // Once we've seen needsApprove=false for some currentAllowance,
+          // any larger currentAllowance must also yield false.
+          if (lastNeedsApprove === false) {
+            expect(action.needsApprove).toBe(false);
+          }
+          lastNeedsApprove = action.needsApprove;
+        }
+      }
+    }
+  });
+
+  it('unknown mode falls back to per-publish behaviour', () => {
+    // Defensive — if a malformed config sneaks through, we should still
+    // produce *some* sane action rather than throwing inside the publish
+    // hot path.
+    const action = computeApprovalAction(
+      { mode: 'gibberish' as any },
+      1000n,
+      0n,
+    );
+    expect(action.needsApprove).toBe(true);
+    expect(action.targetAllowance).toBe(1000n); // per-publish
   });
 });
 

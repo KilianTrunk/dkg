@@ -72,6 +72,12 @@ const TEST_KAV10_ADDR = '0x000000000000000000000000000000000000c10a';
 // normalizer-canonicalises-cleartext path is deterministic and doesn't
 // have to reach into agent internals.
 const NUMERIC_CG_ID = '42';
+// A second distinct on-chain numeric CG id for tests that need to
+// exercise per-CG isolation. The `+ 1n` shape used previously
+// silently produced `"421"` (string concat with a BigInt coerces to
+// string) — functionally fine but misleading vs the "next numeric
+// id" intent. A literal makes the test's data crystal clear.
+const NUMERIC_CG_ID_B = '43';
 const CLEARTEXT_CG_ID = 'my-cg-cleartext-name';
 const CANONICAL_WIRE_FOR_CLEARTEXT =
   '0x' + ethers.keccak256(ethers.toUtf8Bytes(CLEARTEXT_CG_ID)).slice(2);
@@ -428,7 +434,7 @@ describe('StorageACKHandler V2 chunked ACK — canonical CG keying (#729 Bug 4 r
       // Distinct on-chain cgId for CG-B reinforces the isolation
       // (production publishers always pair `cgId` with `swmGraphId`
       // 1:1; the test now exercises both pairings).
-      cgId: NUMERIC_CG_ID + 1n,
+      cgId: NUMERIC_CG_ID_B,
       swmGraphId: 'cg-B',
       merkleRoot: sharedBatchId,
       chunks: chunksB,
@@ -445,7 +451,7 @@ describe('StorageACKHandler V2 chunked ACK — canonical CG keying (#729 Bug 4 r
     // proper per-CG scoping.
     const ackB = decodeStorageACK(await handler.handler(intentB_ok, fakePeerId));
     expect(isStorageACKDecline(ackB)).toBe(false);
-    expect(ackB.contextGraphId).toBe(NUMERIC_CG_ID + 1n);
+    expect(ackB.contextGraphId).toBe(NUMERIC_CG_ID_B);
 
     // ACK for CG-A but claiming CG-B's root — must DECLINE with root
     // mismatch (proves the lookup didn't cross-pull chunksB even
@@ -468,7 +474,7 @@ describe('StorageACKHandler V2 chunked ACK — canonical CG keying (#729 Bug 4 r
     // scan could quietly serve CG-A's chunks under a CG-B request.
     const ackBCrossClaim = decodeStorageACK(await handler.handler(
       buildV2IntentBytes({
-        cgId: NUMERIC_CG_ID + 1n,
+        cgId: NUMERIC_CG_ID_B,
         swmGraphId: 'cg-B',
         merkleRoot: sharedBatchId,
         chunks: chunksA,

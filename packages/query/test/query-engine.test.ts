@@ -286,6 +286,18 @@ describe('DKGQueryEngine', () => {
     )).resolves.toMatchObject({ bindings: expect.any(Array) });
   });
 
+  it('allows scoped queries with a prefix label named from', async () => {
+    await store.insert([
+      q(ENTITY, 'http://example.com/name', '"FromPrefixPredicate"'),
+    ]);
+
+    await expect(engine.query(
+      `PREFIX from: <http://example.com/>
+       SELECT ?name WHERE { ?s from:name ?name }`,
+      { contextGraphId: CONTEXT_GRAPH },
+    )).resolves.toMatchObject({ bindings: expect.any(Array) });
+  });
+
   it('rejects explicit GRAPH IRIs outside the scoped context graph', async () => {
     const otherGraph = 'did:dkg:context-graph:other-agent-registry';
     await store.insert([

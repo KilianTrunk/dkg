@@ -471,7 +471,7 @@ function hasCallerDatasetClause(sparql: string): boolean {
     if (isKeywordStart(sparql, i)) {
       let j = i + 1;
       while (j < n && isWordContinuation(sparql[j])) j++;
-      if (sparql.slice(i, j).toUpperCase() === 'FROM') {
+      if (sparql.slice(i, j).toUpperCase() === 'FROM' && sparql[j] !== ':') {
         return true;
       }
       i = j;

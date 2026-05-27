@@ -143,6 +143,34 @@ TOKEN=$(dkg auth show)
 curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:9200/api/agents
 ```
 
+### Updating your node
+
+To update DKG, run one command:
+
+```bash
+dkg update                  # pull the latest release from npm and restart
+dkg update --check          # check what's available without applying
+dkg update --allow-prerelease   # follow the `next` dist-tag for pre-release builds
+dkg rollback                # revert to the previous version
+```
+
+Do **not** `git pull` or clone the repository to update — `dkg update` is the canonical verb. If anything looks off (multiple repositories on disk, served UI doesn't match version, version skew between daemon and CLI), run `dkg doctor` for a structured diagnostic of the install state. See [`OT-RFC-41`](https://github.com/OriginTrail/dkgv10-spec/blob/main/rfcs/OT-RFC-41-edge-node-npm-only-install-and-update.md) for the design rationale.
+
+### Contributors / monorepo development
+
+Hacking on DKG itself? Don't go through `npm install -g`. Clone, install, and run from the workspace:
+
+```bash
+git clone https://github.com/OriginTrail/dkg.git
+cd dkg
+pnpm install
+pnpm dkg start             # or `pnpm dkg <any subcommand>`
+```
+
+Contributor state lives under `~/.dkg-dev/` (separated from `~/.dkg/` so a contributor's dev work doesn't stomp on their own Edge install). `dkg update` is intentionally disabled in monorepo-checkout mode — use `git pull && pnpm install && pnpm build` instead.
+
+The legacy `install.sh` git-checkout installer is deprecated and slated for removal in a near-term release. See [`MIGRATE_TO_NPM.md`](docs/operator/MIGRATE_TO_NPM.md) if you have an existing `install.sh`-style install you want to migrate to the npm path.
+
 ---
 
 ## Community integrations
@@ -236,9 +264,10 @@ dkg integration list [--tier community]  # default tier filter is `verified`+
 dkg integration info <slug>              # show details for one entry
 dkg integration install <slug>           # install cli/mcp kind; --allow-community for community-tier entries
 
-# Update / rollback
-dkg update [--check] [--allow-prerelease]  # update node software
+# Update / rollback / diagnose
+dkg update [--check] [--allow-prerelease]  # update node software via npm registry
 dkg rollback                               # roll back to previous version
+dkg doctor [--json]                        # diagnostic report: install layout, version skew, orphan clones, UI mismatch, plugin root, config sanity
 ```
 
 Run `dkg <command> --help` for per-command options.

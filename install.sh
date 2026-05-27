@@ -7,8 +7,36 @@ BRANCH="${DKG_BRANCH:-main}"
 BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
 
 red() { printf '\033[0;31m%s\033[0m\n' "$1"; }
+yellow() { printf '\033[0;33m%s\033[0m\n' "$1"; }
 green() { printf '\033[0;32m%s\033[0m\n' "$1"; }
 info() { printf '  %s\n' "$1"; }
+
+# RFC-41 deprecation banner.
+# install.sh is deprecated. The canonical install path is now
+# `npm install -g @origintrail-official/dkg`, which ships pre-built
+# artifacts and avoids the multi-tree on-disk shape that confused
+# operator agents. install.sh will be removed in a near-term release.
+#
+# See:
+#   https://github.com/OriginTrail/dkgv10-spec/blob/main/rfcs/OT-RFC-41-edge-node-npm-only-install-and-update.md
+#   https://github.com/OriginTrail/dkg/blob/main/docs/operator/MIGRATE_TO_NPM.md
+yellow "DEPRECATED: install.sh is no longer the recommended install path."
+echo ""
+echo "  The canonical installer for DKG V10 is now:"
+echo ""
+echo "      npm install -g @origintrail-official/dkg"
+echo ""
+echo "  install.sh will be removed in a near-term release. See OT-RFC-41:"
+echo "    https://github.com/OriginTrail/dkgv10-spec/blob/main/rfcs/OT-RFC-41-edge-node-npm-only-install-and-update.md"
+echo ""
+echo "  If you have an existing install.sh-style install you want to migrate,"
+echo "  see docs/operator/MIGRATE_TO_NPM.md."
+echo ""
+echo "  Continuing with install.sh in 5 seconds... (Ctrl-C to abort)"
+echo ""
+if [ -z "${DKG_INSTALL_SH_NO_DEPRECATION_DELAY:-}" ]; then
+  sleep 5
+fi
 
 echo ""
 echo "DKG V9 Node Installer"

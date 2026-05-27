@@ -2,7 +2,21 @@
 
 This guide is for operators currently running a DKG node from a `git clone`d checkout (typical layout: `~/dkg-v9/` with `.git`, `packages/`, `node_modules/`, `pnpm-lock.yaml`, `package.json`). It walks through converting that install to use the npm-pinned auto-update path without re-installing.
 
-The end-state: the daemon's auto-updater fetches pre-built artifacts of a specific `@origintrail-official/dkg` version from npm into `~/.dkg/releases/{a,b}/`, instead of building from source against the tracked git branch on every update cycle.
+The end-state: the daemon's auto-updater fetches pre-built artifacts of a specific `@origintrail-official/dkg` version from npm, instead of building from source against the tracked git branch on every update cycle.
+
+## rc.12 changes — read first
+
+This runbook predates [OT-RFC-41](https://github.com/OriginTrail/dkgv10-spec/blob/main/rfcs/OT-RFC-41-edge-node-npm-only-install-and-update.md) ("Edge Node NPM-Only Install and Update"). The RFC ships in rc.12 and changes several details described below:
+
+- **`dkg migrate-to-npm` is being removed in rc.12.** The migration logic is automated: on first daemon start under rc.12, an Edge node with a legacy `~/.dkg/releases/` tree records the active slot's version into `~/.dkg/previous-version` (so `dkg rollback` continues to work) and resumes running from the npm-global install. No operator action required. This runbook is retained for historical context and for operators upgrading on an older release that still has the command.
+- **`install.sh` is deprecated and removed in rc.12.** Use `npm install -g @origintrail-official/dkg` for fresh installs.
+- **Edge nodes no longer use blue-green release slots in rc.12.** The daemon runs directly from the npm-global install (`/usr/local/lib/node_modules/@origintrail-official/dkg/`); `~/.dkg/releases/` is not created. Core nodes (operators running `dkg init --role core`) retain blue-green slots — they still earn their keep on the 24/7 SLA.
+- **`dkg update` semantics differ by `nodeRole` in rc.12.** Edge: `npm install -g @origintrail-official/dkg@<target>` + restart. Core: in-slot install + atomic symlink swap, unchanged from prior behaviour.
+- **Route plugins now resolve from `~/.dkg/plugins/node_modules/`** (a stable, install-mode-independent root). If you operate a fork with bare-name `routePlugins` entries previously installed via `npm install -g <plugin>`, re-install them with `npm install --prefix ~/.dkg/plugins <plugin>` so they survive update cycles.
+- **`dkg doctor`** ships as a first-class diagnostic command. Run it before reasoning about install-state confusion — it surfaces orphan repository clones, version skew between the CLI and the daemon, served-UI / source mismatch, plugin install root health, and (on Core) blue-green slot health.
+- **The `installMode`, `commit`, `commitShort`, `buildTime`, and `distTag` fields are exposed on `/api/status`** (per RFC §4.9). When opening a support ticket, paste the output of `curl http://localhost:9200/api/status | jq` rather than just the version string.
+
+The rest of this document describes the now-deprecated `dkg migrate-to-npm` flow as it existed pre-rc.12. If you are on rc.11 or earlier and need to migrate before upgrading, follow it. Otherwise upgrade to rc.12 and let the automated migration handle it.
 
 ## Why migrate
 

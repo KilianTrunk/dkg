@@ -284,6 +284,23 @@ describe('DKGQueryEngine', () => {
     expect(result.bindings[0]['g']).toBe(GRAPH);
     expect(result.bindings[0]['name']).toBe('"ImageBot"');
   });
+
+  it('constrains GRAPH variables to data and shared memory for includeSharedMemory', async () => {
+    const sharedMemoryGraph = `did:dkg:context-graph:${CONTEXT_GRAPH}/_shared_memory`;
+    await store.insert([
+      q('urn:ws:entity:1', 'http://schema.org/name', '"Workspace Only"', sharedMemoryGraph),
+      q('urn:other:entity', 'http://schema.org/name', '"OtherGraph"', 'did:dkg:context-graph:other-agent-registry'),
+      q('urn:other:ws', 'http://schema.org/name', '"OtherWorkspace"', 'did:dkg:context-graph:other-agent-registry/_shared_memory'),
+    ]);
+
+    const result = await engine.query(
+      'SELECT ?g ?name WHERE { GRAPH ?g { ?s <http://schema.org/name> ?name } } ORDER BY ?name',
+      { contextGraphId: CONTEXT_GRAPH, includeSharedMemory: true },
+    );
+
+    expect(result.bindings.map((row) => row['name'])).toEqual(['"ImageBot"', '"Workspace Only"']);
+    expect(result.bindings.map((row) => row['g']).sort()).toEqual([GRAPH, sharedMemoryGraph].sort());
+  });
 });
 
 describe('validateReadOnlySparql', () => {

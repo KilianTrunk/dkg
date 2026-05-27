@@ -354,6 +354,28 @@ describe('DKGQueryEngine', () => {
     expect(result.bindings.map((row) => row['g']).sort()).toEqual([subGraph, subGraphSharedMemory].sort());
   });
 
+  it('constrains outer shorthand GRAPH variables after a nested SELECT WHERE', async () => {
+    await store.insert([
+      q('urn:other:entity', 'http://schema.org/name', '"OtherGraph"', 'did:dkg:context-graph:other-agent-registry'),
+    ]);
+
+    const result = await engine.query(
+      `SELECT ?g ?name {
+        {
+          SELECT ?x WHERE {
+            BIND("keep" AS ?x)
+          }
+        }
+        GRAPH ?g { ?s <http://schema.org/name> ?name }
+      } ORDER BY ?name`,
+      { contextGraphId: CONTEXT_GRAPH },
+    );
+
+    expect(result.bindings).toEqual([
+      { g: GRAPH, name: '"ImageBot"' },
+    ]);
+  });
+
   it('rejects nested subqueries that would keep GRAPH variables outside the scoped binding', async () => {
     await store.insert([
       q('urn:other:entity', 'http://schema.org/name', '"OtherGraph"', 'did:dkg:context-graph:other-agent-registry'),

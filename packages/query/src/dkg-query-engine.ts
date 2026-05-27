@@ -966,6 +966,7 @@ function findExplicitWhereTokenIdx(sparql: string): number {
   };
 
   let i = 0;
+  let braceDepth = 0;
   while (i < n) {
     const ch = sparql[i];
     if (ch === '#') {
@@ -986,6 +987,16 @@ function findExplicitWhereTokenIdx(sparql: string): number {
       i++;
       continue;
     }
+    if (ch === '{') {
+      braceDepth++;
+      i++;
+      continue;
+    }
+    if (ch === '}') {
+      braceDepth = Math.max(0, braceDepth - 1);
+      i++;
+      continue;
+    }
     if (isWordStart(ch)) {
       // Word boundary check: previous char (if any) must NOT be a
       // word-continuation byte. The outer lexer already skipped
@@ -1002,7 +1013,7 @@ function findExplicitWhereTokenIdx(sparql: string): number {
       let j = i + 1;
       while (j < n && isWordCont(sparql[j])) j++;
       const word = sparql.substring(i, j);
-      if (word.length === 5 && word.toUpperCase() === 'WHERE') {
+      if (braceDepth === 0 && word.length === 5 && word.toUpperCase() === 'WHERE') {
         return i;
       }
       i = j;

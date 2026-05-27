@@ -386,6 +386,18 @@ describe('DKGQueryEngine', () => {
     expect(result.bindings[0]['name']).toBe('"ImageBot"');
   });
 
+  it('rejects mixed GRAPH-variable and default-graph triple patterns', async () => {
+    await expect(
+      engine.query(
+        `SELECT ?g ?name ?description WHERE {
+          GRAPH ?g { ?s <http://schema.org/name> ?name }
+          ?s <http://schema.org/description> ?description
+        }`,
+        { contextGraphId: CONTEXT_GRAPH },
+      ),
+    ).rejects.toThrow(/Scoped query violation: GRAPH variables cannot be mixed with default-graph triple patterns/i);
+  });
+
   it('constrains GRAPH variables with non-ASCII names to the scoped context graph data graph', async () => {
     await store.insert([
       q('urn:other:entity', 'http://schema.org/name', '"OtherGraph"', 'did:dkg:context-graph:other-agent-registry'),

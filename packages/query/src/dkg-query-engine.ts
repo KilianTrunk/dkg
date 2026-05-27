@@ -564,6 +564,7 @@ function constrainGraphVariablesToAllowedSet(sparql: string, allowedGraphs: stri
     );
   }
   assertGraphVariablesAreTopLevel(sparql, braceStart);
+  assertNoTopLevelDefaultGraphPatternsWithGraphVariables(sparql, braceStart);
 
   const values = allowedGraphs
     .map((g) => `<${assertSafeIri(g)}>`)
@@ -573,6 +574,93 @@ function constrainGraphVariablesToAllowedSet(sparql: string, allowedGraphs: stri
     .join(' ');
 
   return `${sparql.slice(0, braceStart + 1)} ${constraints} ${sparql.slice(braceStart + 1)}`;
+}
+
+function assertNoTopLevelDefaultGraphPatternsWithGraphVariables(sparql: string, braceStart: number): void {
+  if (!hasTopLevelDefaultGraphPattern(sparql, braceStart)) return;
+
+  throw new ScopedQueryViolationError(
+    'GRAPH variables cannot be mixed with default-graph triple patterns on scoped local queries',
+  );
+}
+
+function hasTopLevelDefaultGraphPattern(sparql: string, braceStart: number): boolean {
+  const braceEnd = findMatchingCloseBrace(sparql, braceStart);
+  if (braceEnd === -1) return true;
+
+  let depth = 0;
+  let i = braceStart + 1;
+
+  while (i < braceEnd) {
+    const ch = sparql[i];
+    if (ch === '#') {
+      while (i < braceEnd && sparql[i] !== '\n') i++;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      i = skipSparqlStringLiteral(sparql, i);
+      continue;
+    }
+    if (ch === '{') {
+      depth++;
+      i++;
+      continue;
+    }
+    if (ch === '}') {
+      depth = Math.max(0, depth - 1);
+      i++;
+      continue;
+    }
+    if (depth !== 0 || /\s/.test(ch) || ch === '.' || ch === ';' || ch === ',') {
+      i++;
+      continue;
+    }
+    if (ch === '<') return !!skipSparqlIriRef(sparql, i);
+    if (ch === '?' || ch === '$' || ch === '[') return true;
+    if (isKeywordStart(sparql, i)) {
+      let j = i + 1;
+      while (j < braceEnd && isWordContinuation(sparql[j])) j++;
+      if (isSparqlKeyword(sparql, i, j, 'GRAPH')) {
+        const operandStart = skipSparqlSpaceAndLineComments(sparql, j);
+        const variable = readSparqlVariable(sparql, operandStart);
+        if (variable) {
+          i = operandStart + variable.length;
+          continue;
+        }
+        const iriEnd = sparql[operandStart] === '<'
+          ? skipSparqlIriRef(sparql, operandStart)
+          : null;
+        i = iriEnd && iriEnd <= braceEnd ? iriEnd : j;
+        continue;
+      }
+      if (isSparqlKeyword(sparql, i, j, 'FILTER') || isSparqlKeyword(sparql, i, j, 'BIND')) {
+        const exprStart = skipSparqlSpaceAndLineComments(sparql, j);
+        if (sparql[exprStart] === '(') {
+          const exprEnd = skipBalancedParentheses(sparql, exprStart, braceEnd);
+          i = exprEnd ?? j;
+          continue;
+        }
+      }
+      if (isSparqlKeyword(sparql, i, j, 'VALUES')) {
+        i = skipValuesClause(sparql, j, braceEnd);
+        continue;
+      }
+      if (
+        isSparqlKeyword(sparql, i, j, 'OPTIONAL') ||
+        isSparqlKeyword(sparql, i, j, 'MINUS') ||
+        isSparqlKeyword(sparql, i, j, 'SERVICE') ||
+        isSparqlKeyword(sparql, i, j, 'UNION') ||
+        isSparqlKeyword(sparql, i, j, 'SELECT')
+      ) {
+        i = j;
+        continue;
+      }
+      return true;
+    }
+    i++;
+  }
+
+  return false;
 }
 
 function assertGraphVariablesAreTopLevel(sparql: string, braceStart: number): void {
@@ -960,6 +1048,59 @@ function skipSparqlSpaceAndLineComments(sparql: string, start: number): number {
       continue;
     }
     break;
+  }
+  return i;
+}
+
+function skipBalancedParentheses(sparql: string, start: number, limit = sparql.length): number | null {
+  if (sparql[start] !== '(') return null;
+  let depth = 1;
+  let i = start + 1;
+
+  while (i < limit) {
+    const ch = sparql[i];
+    if (ch === '#') {
+      while (i < limit && sparql[i] !== '\n') i++;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      i = skipSparqlStringLiteral(sparql, i);
+      continue;
+    }
+    if (ch === '<') {
+      const iriEnd = skipSparqlIriRef(sparql, i);
+      i = iriEnd && iriEnd <= limit ? iriEnd : i + 1;
+      continue;
+    }
+    if (ch === '(') depth++;
+    else if (ch === ')') {
+      depth--;
+      if (depth === 0) return i + 1;
+    }
+    i++;
+  }
+
+  return null;
+}
+
+function skipValuesClause(sparql: string, start: number, limit: number): number {
+  let i = start;
+  while (i < limit) {
+    const ch = sparql[i];
+    if (ch === '#') {
+      while (i < limit && sparql[i] !== '\n') i++;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      i = skipSparqlStringLiteral(sparql, i);
+      continue;
+    }
+    if (ch === '{') {
+      const end = findMatchingCloseBrace(sparql, i);
+      return end === -1 || end > limit ? i : end + 1;
+    }
+    if (ch === '.') return i + 1;
+    i++;
   }
   return i;
 }

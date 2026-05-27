@@ -68,6 +68,14 @@ api_capture() {
 api_call() {
   local node="$1" method="$2" path="$3" data="${4:-}" body code
   api_capture "$node" "$method" "$path" "$data" body code
+  # `$code` can be empty when curl exits before printing `%{http_code}`
+  # (timeouts, connection refused under load, the API returning an
+  # empty body, etc.). Without this guard the arithmetic compares
+  # below blow up with "integer expression expected" and obscure the
+  # real "node ack'd nothing" failure (#774 finding #3 fired this on
+  # every probe). Normalize to `000` so the HTTP-status check below
+  # surfaces a single clean "transport failure" error instead.
+  [ -z "$code" ] && code="000"
   if [ "$code" -lt 200 ] || [ "$code" -ge 300 ]; then
     fail "$method $path on node $node failed with HTTP $code: $body"
   fi

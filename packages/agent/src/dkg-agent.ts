@@ -1684,6 +1684,7 @@ export class DKGAgent {
               contextGraphSharedMemoryUri,
               chainId: chainIdForHandler,
               kav10Address: kav10AddressForHandler,
+              normalizeContextGraphIdForChunkStore: (rawCgId: string) => this.gossipWireIdFor(rawCgId),
               // Codex PR #608: independently verify the publisher's
               // `isEncryptedPayload=true` claim against this node's
               // local view of the CG. `isPrivateContextGraph()` is the
@@ -2839,6 +2840,23 @@ export class DKGAgent {
         // `buildCiphertextChunkBackfill` for the discovery + fetch
         // policy.
         ciphertextChunkBackfill: this.buildCiphertextChunkBackfill(ctx),
+        // Codex review on PR #715 — let the prover's extractor pin
+        // the per-CG named graph instead of scanning `GRAPH ?g`. We
+        // chain `resolveLocalCgIdByOnChainId` (numeric → cleartext)
+        // then `gossipWireIdFor` (cleartext → curator nameHash, the
+        // wire form), matching what `ingestSwmCiphertextChunkEnvelope`
+        // and the V2 ACK loadChunk persist/look up under. Returns
+        // null when the local node doesn't have the CG metadata yet
+        // (chain replay still catching up); the extractor falls back
+        // to wildcard scanning for that tick, identical to pre-fix
+        // behaviour, so a missing local map degrades to "no
+        // cross-CG collision guard for this tick" rather than
+        // "extract fails outright".
+        canonicalCgIdForChunkStore: (cgId: bigint): string | null => {
+          const local = this.resolveLocalCgIdByOnChainId(cgId);
+          if (local === null) return null;
+          return this.gossipWireIdFor(local);
+        },
       });
       if (this.randomSamplingHandle && this.randomSamplingHandle !== handle) {
         try { await this.randomSamplingHandle.stop(); } catch { /* swallow bind replacement cleanup */ }
@@ -10424,7 +10442,13 @@ export class DKGAgent {
     const batchId = envelope.payload.subarray(0, 32);
     const ciphertext = envelope.payload.subarray(32);
     const chunkIndex = envelope.swmMessageIndex;
-    const chunksGraph = ciphertextChunkStoreGraph(storageCgId);
+    // Codex review on PR #715: canonicalize the cgId used in the
+    // per-CG named graph so persist (here) and lookup
+    // (`handleGetCiphertextChunk`, V2 ACK loadChunk, prover extractor)
+    // converge on the same wire-form key — eliminates the
+    // cleartext-vs-numeric mismatch that previously forced wildcard
+    // `GRAPH ?g` scans and exposed multi-CG identical-KC collisions.
+    const chunksGraph = ciphertextChunkStoreGraph(this.gossipWireIdFor(storageCgId));
     const subject = ciphertextChunkStoreSubject(batchId, chunkIndex);
     const literal = `"${Buffer.from(ciphertext).toString('base64')}"`;
     try {
@@ -10955,18 +10979,21 @@ export class DKGAgent {
       });
     }
 
-    // Locate the chunk. Subject URI
-    //   urn:dkg:swm:v10-publish-ciphertext-chunk/<batchIdHex>/<i>
-    // is globally unique (batchId === V10 KC merkleRoot), so we scan
-    // `GRAPH ?g` rather than pinning to `ciphertextChunkStoreGraph(req.contextGraphId)`
-    // — the requester may have learned the CG under either the
-    // cleartext SWM id (what `ingestSwmCiphertextChunkEnvelope`
-    // persists under) or the numeric on-chain id (what the prover /
-    // ACK pipeline carry). The per-CG named graph is retained as a
-    // cheap-eviction key, not a lookup discriminator. Mirrors the
-    // ACK V2 verifier and `extractCiphertextChunksFromStore`.
+    // Locate the chunk. Codex review on PR #715: we now pin to the
+    // per-CG named graph keyed by `gossipWireIdFor(req.contextGraphId)`
+    // — same canonical key the persist site and V2 ACK loadChunk use.
+    // The previous wildcard `GRAPH ?g` tolerated cleartext-vs-numeric
+    // CG-id mismatches but exposed the multi-CG identical-KC collision
+    // the bot called out (two CGs publishing the same V10 KC plaintext
+    // share a batchId; per-CG keys differ; cross-pollution would
+    // return another CG's ciphertext bytes). `gossipWireIdFor` covers
+    // both the cleartext-id and bare-hex routes, so the requester can
+    // still learn the CG under whichever form their subscription path
+    // delivered it.
+    const canonicalCgIdForChunks = this.gossipWireIdFor(req.contextGraphId);
+    const chunksGraphForLookup = ciphertextChunkStoreGraph(canonicalCgIdForChunks);
     const subject = ciphertextChunkStoreSubject(req.batchId, req.chunkIndex);
-    const sparql = `SELECT ?o WHERE { GRAPH ?g { <${subject}> <${CIPHERTEXT_CHUNK_PREDICATE}> ?o } } LIMIT 1`;
+    const sparql = `SELECT ?o WHERE { GRAPH <${chunksGraphForLookup}> { <${subject}> <${CIPHERTEXT_CHUNK_PREDICATE}> ?o } } LIMIT 1`;
     let result;
     try {
       result = await this.store.query(sparql);
@@ -11037,7 +11064,7 @@ export class DKGAgent {
     contextGraphId: string,
     batchId: Uint8Array,
     chunkIndex: number,
-    options?: { persist?: boolean; signWithChainAdapter?: boolean },
+    options?: { persist?: boolean },
   ): Promise<CiphertextChunkCatchupResponse> {
     if (batchId.length !== 32) {
       throw new Error(`fetchCiphertextChunkFromPeer requires a 32-byte batchId; got ${batchId.length}`);
@@ -11046,9 +11073,16 @@ export class DKGAgent {
       throw new Error(`fetchCiphertextChunkFromPeer requires a non-negative chunkIndex; got ${chunkIndex}`);
     }
     const ctx = createOperationContext('share');
-    const useChainSigner = options?.signWithChainAdapter !== false;
-    if (useChainSigner && typeof this.chain.signMessage !== 'function') {
-      throw new Error('fetchCiphertextChunkFromPeer: chain adapter does not expose signMessage; pass signWithChainAdapter:false and supply your own gate');
+    // Codex review on PR #715 / #717: the previous shape exposed a
+    // `signWithChainAdapter` option pointing at an alternate-signer
+    // path that was never plumbed through — the closure below ALWAYS
+    // calls `chain.signMessage!`, so callers acting on the "pass
+    // signWithChainAdapter:false" error message would have crashed
+    // at runtime. Until a real alternate-signer plumb-through ships,
+    // the contract is simpler and honest: requires a chain adapter
+    // with `signMessage`. No production caller has ever set the flag.
+    if (typeof this.chain.signMessage !== 'function') {
+      throw new Error('fetchCiphertextChunkFromPeer: chain adapter does not expose signMessage; the LU-11 sync verb requires an operator-key signer');
     }
     const sign = async (digest: Uint8Array) => {
       // Match the host-catchup pattern: chain.signMessage returns
@@ -11072,12 +11106,17 @@ export class DKGAgent {
     if (options?.persist && resp.ciphertextB64) {
       const subject = ciphertextChunkStoreSubject(batchId, chunkIndex);
       const literal = `"${resp.ciphertextB64}"`;
+      // Codex review on PR #715: canonical wire-form CG id for the
+      // named graph — matches the ingest persist site so a future
+      // local lookup hits the same graph URI as the original gossip
+      // delivery (or whichever path landed the chunk first).
+      const chunksGraphForPersist = ciphertextChunkStoreGraph(this.gossipWireIdFor(contextGraphId));
       try {
         await this.store.insert([{
           subject,
           predicate: CIPHERTEXT_CHUNK_PREDICATE,
           object: literal,
-          graph: ciphertextChunkStoreGraph(contextGraphId),
+          graph: chunksGraphForPersist,
         }]);
         this.log.debug(
           ctx,

@@ -8,6 +8,7 @@ import {
   STORAGE_ACK_DECLINE_CODES,
   ACK_PROTOCOL_VERSION_V2_LU11,
   buildCiphertextChunksRoot,
+  ciphertextChunkStoreGraph,
   ciphertextChunkStoreSubject,
   CIPHERTEXT_CHUNK_PREDICATE,
 } from '@origintrail-official/dkg-core';
@@ -157,6 +158,24 @@ export interface StorageACKHandlerConfig {
     swmGraphId?: string,
     gossipTopic?: string,
   ) => SubscriptionSource | undefined;
+  /**
+   * Codex review on PR #715: the per-CG named graph that backs the
+   * LU-11 ciphertext chunk store MUST use a CANONICAL form of the CG
+   * id so that publishers (writing `envelope.contextGraphId` from
+   * their gossip envelope) and cores (looking up by `swmGraphId` from
+   * the V2 ACK request) land on the same graph URI. Without
+   * canonicalization, the cleartext-vs-wire-hash mismatch causes
+   * lookups to miss and forces a `GRAPH ?g` wildcard scan, which in
+   * turn exposes the multi-CG identical-KC collision the bot called
+   * out on `ciphertext-chunk-store.ts`.
+   *
+   * The agent wires this to {@link DKGAgent.gossipWireIdFor} (cleartext
+   * → curator-committed nameHash). Optional: handlers without this
+   * hook continue to use the raw `swmGraphId` as the graph key, which
+   * preserves the legacy (pre-fix) behaviour for any caller that
+   * doesn't yet expose a normalizer.
+   */
+  normalizeContextGraphIdForChunkStore?: (cgId: string) => string;
 }
 
 /**
@@ -317,19 +336,19 @@ export class StorageACKHandler {
       // Note on the persisted-vs-looked-up graph key:
       //
       // `ingestSwmCiphertextChunkEnvelope` in dkg-agent persists each
-      // chunk into `ciphertextChunkStoreGraph(envelope.contextGraphId)`,
-      // where `envelope.contextGraphId` carries the SOURCE/cleartext
-      // SWM CG id (e.g. "0xCURATOR/rfc39-curated-…"), not the numeric
-      // on-chain CG id. The Subject URI is
-      //   urn:dkg:swm:v10-publish-ciphertext-chunk/<batchIdHex>/<i>
-      // which is globally unique (batchId === V10 KC merkleRoot), so
-      // we don't strictly need the named-graph key to locate a chunk.
-      // The V2 ACK SPARQL therefore scans `GRAPH ?g` (see `loadChunk`
-      // below) and lets the unique Subject URI route to the right
-      // per-CG graph itself — matches the prover's
-      // `extractCiphertextChunksFromStore` behaviour and tolerates
-      // publishers that map the on-chain id → cleartext SWM id
-      // differently across remap vs direct-publish flows.
+      // chunk into `ciphertextChunkStoreGraph(canonical(envelope.contextGraphId))`,
+      // where `canonical()` is the curator-committed nameHash (wire
+      // form) — `DKGAgent.gossipWireIdFor` wired via
+      // `normalizeContextGraphIdForChunkStore`. Both publisher persist
+      // and ACK-side lookup canonicalize the same way, so a scoped
+      // `GRAPH <ciphertextChunkStoreGraph(canonical(swmGraphId))>`
+      // query is correct and necessary — the previous `GRAPH ?g`
+      // wildcard scan tolerated the cleartext-vs-numeric mismatch but
+      // exposed the multi-CG identical-KC collision the Codex bot
+      // called out on `ciphertext-chunk-store.ts:73`. Two CGs publishing
+      // identical KCs now stay isolated by their per-CG named graph.
+      // Legacy / no-normalizer fallback keeps the raw `swmGraphId` —
+      // matches pre-fix behaviour for tests that haven't wired the hook.
       const chunkBytes: Uint8Array[] = new Array(claimedChunkCount);
       let totalChunkBytes = 0;
       // Dev-friendly default: 20 retries × 500ms = 10s. On a freshly-
@@ -341,9 +360,12 @@ export class StorageACKHandler {
       // the first iteration so the extra budget is free.
       const MAX_LOCAL_WAIT_RETRIES = 20;
       const LOCAL_WAIT_DELAY_MS = 500;
+      const normalizeCgId = this.config.normalizeContextGraphIdForChunkStore;
+      const canonicalCgIdForChunks = normalizeCgId ? normalizeCgId(swmGraphId) : swmGraphId;
+      const chunkStoreGraph = ciphertextChunkStoreGraph(canonicalCgIdForChunks);
       const loadChunk = async (i: number): Promise<Uint8Array | null> => {
         const subject = ciphertextChunkStoreSubject(merkleRoot, i);
-        const sparql = `SELECT ?o WHERE { GRAPH ?g { <${subject}> <${CIPHERTEXT_CHUNK_PREDICATE}> ?o } } LIMIT 1`;
+        const sparql = `SELECT ?o WHERE { GRAPH <${chunkStoreGraph}> { <${subject}> <${CIPHERTEXT_CHUNK_PREDICATE}> ?o } } LIMIT 1`;
         const result = await this.store.query(sparql);
         if (result.type !== 'bindings' || result.bindings.length === 0) return null;
         const literal = result.bindings[0]?.['o'];

@@ -28,6 +28,7 @@
  */
 
 import {
+  ciphertextChunkStoreGraph,
   ciphertextChunkStoreSubject,
   CIPHERTEXT_CHUNK_PREDICATE,
 } from '@origintrail-official/dkg-core';
@@ -79,6 +80,22 @@ export interface ExtractCiphertextChunksInput {
   batchId: Uint8Array;
   /** Chain-sourced `ciphertextChunkCount`. */
   expectedCount: number;
+  /**
+   * Codex review on PR #715: canonical wire-form CG id (curator-
+   * committed `nameHash`, lowercase 0x-prefixed 32-byte hex) used to
+   * scope the named-graph lookup. When provided, the extractor pins
+   * the SPARQL `GRAPH` clause to `ciphertextChunkStoreGraph(canonical)`
+   * — matches the persist site and V2 ACK loadChunk, so two CGs
+   * publishing identical V10 KCs stay isolated by per-CG named graph.
+   *
+   * When omitted, the extractor falls back to wildcard `GRAPH ?g`
+   * scanning — preserves the pre-fix behaviour for callers that
+   * haven't yet wired the numeric→nameHash resolver (e.g. unit tests
+   * without a live agent). The fallback path retains the multi-CG
+   * identical-KC collision risk the Codex bot called out and SHOULD
+   * be avoided in production wiring.
+   */
+  contextGraphIdCanonical?: string;
 }
 
 export async function extractCiphertextChunksFromStore(
@@ -95,24 +112,16 @@ export async function extractCiphertextChunksFromStore(
     );
   }
 
-  // The persisted chunk Subject URI is
-  //   urn:dkg:swm:v10-publish-ciphertext-chunk/<batchIdHex>/<i>
-  // which is globally unique (batchId is a 32-byte V10 KC merkleRoot),
-  // so we don't need to know the named-graph key to locate a chunk.
-  // That matters here because the per-CG named graph is keyed off the
-  // *cleartext SWM CG id* the cores see on the chunked gossip envelope
-  // (`envelope.contextGraphId`), while the prover only has the
-  // numeric on-chain CG id from `_pickWeightedChallenge`. Scanning
-  // `GRAPH ?g` decouples lookup from the cleartext/numeric duality so
-  // the prover doesn't need a numeric→cleartext reverse map (the
-  // chain stores only `getContextGraphNameHash`, not the name itself).
+  const graphClause = input.contextGraphIdCanonical
+    ? `GRAPH <${ciphertextChunkStoreGraph(input.contextGraphIdCanonical)}>`
+    : 'GRAPH ?g';
   const chunks: Uint8Array[] = new Array(input.expectedCount);
   const missing: number[] = [];
 
   for (let i = 0; i < input.expectedCount; i++) {
     const subject = ciphertextChunkStoreSubject(input.batchId, i);
     const result = await input.store.query(
-      `SELECT ?o WHERE { GRAPH ?g { <${subject}> <${CIPHERTEXT_CHUNK_PREDICATE}> ?o } } LIMIT 1`,
+      `SELECT ?o WHERE { ${graphClause} { <${subject}> <${CIPHERTEXT_CHUNK_PREDICATE}> ?o } } LIMIT 1`,
     );
     if (result.type !== 'bindings' || result.bindings.length === 0) {
       missing.push(i);

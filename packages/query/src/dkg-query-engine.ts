@@ -14,6 +14,7 @@ import {
   validateReadOnlySparql,
   emptyResultForSparql,
 } from './sparql-guard.js';
+import { stripLiteralsAndComments } from './sparql-utils.js';
 
 /**
  * Result of resolving a V10 GET view to concrete graph targets.
@@ -27,6 +28,13 @@ export interface ViewResolution {
    * assertions) and verified-memory (multiple quorum graphs).
    */
   graphPrefixes: string[];
+}
+
+export class ScopedQueryViolationError extends Error {
+  constructor(message: string) {
+    super(`Scoped query violation: ${message}`);
+    this.name = 'ScopedQueryViolationError';
+  }
 }
 
 /**
@@ -149,6 +157,9 @@ export class DKGQueryEngine implements QueryEngine {
 
     // ── V10 view-based routing ────────────────────────────────────────
     const effectiveContextGraphId = options?.contextGraphId;
+    if (effectiveContextGraphId) {
+      assertNoCallerDatasetClauses(sparql);
+    }
 
     if (options?.subGraphName) {
       const v = validateSubGraphName(options.subGraphName);
@@ -412,6 +423,15 @@ export class DKGQueryEngine implements QueryEngine {
     return { bindings: allBindings };
   }
 
+}
+
+function assertNoCallerDatasetClauses(sparql: string): void {
+  const code = stripLiteralsAndComments(sparql);
+  if (/\bFROM\s+(?:NAMED\s+)?/i.test(code)) {
+    throw new ScopedQueryViolationError(
+      'FROM clauses are not allowed on scoped local queries',
+    );
+  }
 }
 
 /**

@@ -246,6 +246,15 @@ describe('DKGQueryEngine', () => {
       engine.query('SELECT ?s WHERE { ?s ?p ?o }', { view: 'verified-memory' }),
     ).rejects.toThrow('requires a contextGraphId');
   });
+
+  it('rejects FROM clauses on context-graph-scoped local queries', async () => {
+    await expect(
+      engine.query(
+        `SELECT ?name FROM <${GRAPH}> WHERE { ?s <http://schema.org/name> ?name }`,
+        { contextGraphId: CONTEXT_GRAPH },
+      ),
+    ).rejects.toThrow(/Scoped query violation: FROM clauses are not allowed/i);
+  });
 });
 
 describe('validateReadOnlySparql', () => {

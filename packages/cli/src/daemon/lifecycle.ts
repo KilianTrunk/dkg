@@ -182,6 +182,8 @@ import {
   loadMarkItDownTargets,
   getNodeVersion,
   getCurrentCommitShort,
+  loadBuildInfo,
+  detectInstallMode,
   loadSkillTemplate,
   buildSkillMd,
   skillEtag,
@@ -790,6 +792,36 @@ export async function runDaemonInner(
     ? `v${nodeVersion}, ${nodeCommit}`
     : `v${nodeVersion}`;
   log(`Starting DKG ${role} node "${config.name}" (${versionTag})...`);
+
+  // RFC-41 §4.9 / §4.3: structured startup log lines for telemetry.
+  // The doctor's state summary correlates these with /api/status —
+  // every successful daemon start emits a parseable JSON line that
+  // an operator or CI pipeline can grep without needing the API up.
+  // Distinct tags (`dkg-build-info` + `install-mode-detected`) so a
+  // log shipper can split them into separate streams.
+  try {
+    const buildInfo = loadBuildInfo();
+    const installMode = detectInstallMode();
+    log(
+      `[dkg-build-info] ${JSON.stringify({
+        version: nodeVersion,
+        commit: buildInfo.commit,
+        commitShort: buildInfo.commitShort,
+        buildTime: buildInfo.buildTime,
+        distTag: buildInfo.distTag,
+        ciRun: buildInfo.ciRun,
+      })}`,
+    );
+    log(
+      `[install-mode-detected] ${JSON.stringify({
+        installMode,
+        nodeRole: role,
+      })}`,
+    );
+  } catch (err) {
+    // Never fail startup on a telemetry-log failure.
+    log(`[dkg-build-info] WARNING: failed to emit startup telemetry: ${String(err)}`);
+  }
 
   const network = await loadNetworkConfig();
   const syncContextGraphs = [

@@ -66,8 +66,27 @@ if ! curl -sf -H "Authorization: Bearer $AUTH" "http://127.0.0.1:$API_PORT_BASE/
   log "FATAL: node 1 not responding on :$API_PORT_BASE"
   exit 2
 fi
+# Don't just trust node 1 — earlier orchestrator runs let v10-rc-validation
+# and 4 sibling suites fail downstream because one node had silently died
+# overnight. Check every node we'll actually exercise so triage time isn't
+# wasted on "test broke" when the truth is "devnet broke".
+NUM_NODES="${NUM_NODES:-6}"
+DOWN_NODES=""
+for n in $(seq 1 "$NUM_NODES"); do
+  port=$((API_PORT_BASE + n - 1))
+  code=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $AUTH" \
+    "http://127.0.0.1:$port/api/status" 2>/dev/null || echo "000")
+  if [ "$code" != "200" ]; then
+    DOWN_NODES="${DOWN_NODES} node${n}(port=$port,http=$code)"
+  fi
+done
+if [ -n "$DOWN_NODES" ]; then
+  log "FATAL: not all $NUM_NODES nodes are reachable. Down:${DOWN_NODES}"
+  log "Hint: ./scripts/devnet.sh stop && ./scripts/devnet.sh start"
+  exit 2
+fi
 export DKG_AUTH="$AUTH"
-log "Devnet is up. Results dir: $RESULTS"
+log "Devnet is up — all $NUM_NODES nodes healthy. Results dir: $RESULTS"
 
 # ── Suite registry (parallel arrays; bash 3.2 compatible) ───────
 SUITE_IDS=()

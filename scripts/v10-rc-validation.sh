@@ -24,7 +24,23 @@
 
 set -uo pipefail
 
-AUTH="${DKG_AUTH:-${AUTH_TOKEN:-i4xSYqGXePm6DCCc6WHPfnccw2cb8iv9Z3dg5HBNY}}"
+# Resolve bearer token: explicit env var wins; otherwise read the devnet's
+# generated auth token from disk. We never hard-code a token here — every
+# `./scripts/devnet.sh start` rolls a fresh one, so a baked-in default would
+# work only by accident (and fail loudly with 401s on every POST after a
+# clean restart, which is exactly the trap this fallback path avoids).
+REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
+DEVNET_DIR="${DEVNET_DIR:-$REPO_ROOT/.devnet}"
+if [ -n "${DKG_AUTH:-}" ]; then
+  AUTH="$DKG_AUTH"
+elif [ -n "${AUTH_TOKEN:-}" ]; then
+  AUTH="$AUTH_TOKEN"
+elif [ -r "$DEVNET_DIR/node1/auth.token" ]; then
+  AUTH=$(grep -v '^#' "$DEVNET_DIR/node1/auth.token" | head -1)
+else
+  echo "  ❌ Could not resolve bearer token: set DKG_AUTH, or run devnet first (expected $DEVNET_DIR/node1/auth.token)" >&2
+  exit 2
+fi
 H="Authorization: Bearer $AUTH"
 PASS=0; FAIL=0; WARN=0; TOTAL=0
 

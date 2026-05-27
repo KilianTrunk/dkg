@@ -685,6 +685,25 @@ describe('DKGQueryEngine view routing constrains GRAPH variables', () => {
 
     expect(result.bindings).toEqual([]);
   });
+
+  it('working-memory with GRAPH ?g does not read another agent assertion', async () => {
+    const store = new OxigraphStore();
+    const engine = new DKGQueryEngine(store);
+    const agent = '0xAbC0000000000000000000000000000000000001';
+    const otherAgent = '0xDeAd000000000000000000000000000000000002';
+
+    await store.insert([
+      quad('urn:view:mine', 'http://schema.org/name', '"Mine"', contextGraphAssertionUri(CG, agent, 'mine')),
+      quad('urn:view:theirs', 'http://schema.org/name', '"Theirs"', contextGraphAssertionUri(CG, otherAgent, 'theirs')),
+    ]);
+
+    const result = await engine.query(
+      'SELECT ?g ?name WHERE { GRAPH ?g { ?s <http://schema.org/name> ?name } }',
+      { contextGraphId: CG, view: 'working-memory', agentAddress: agent },
+    );
+
+    expect(result.bindings.map((b) => b['name'])).toEqual(['"Mine"']);
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────

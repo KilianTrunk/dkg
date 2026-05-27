@@ -37,6 +37,29 @@ function makeRequest(overrides: Partial<QueryRequest> = {}): QueryRequest {
   };
 }
 
+function makeNoExecuteBoundary(): { handler: QueryHandler; wasExecuted: () => boolean } {
+  let executed = false;
+  const noExecuteEngine = {
+    query: async () => {
+      executed = true;
+      return { bindings: [] };
+    },
+    resolveKA: async () => {
+      throw new Error('not used');
+    },
+  } as unknown as DKGQueryEngine;
+
+  return {
+    handler: new QueryHandler(noExecuteEngine, {
+      defaultPolicy: 'deny',
+      contextGraphs: {
+        [CONTEXT_GRAPH]: { policy: 'public', sparqlEnabled: true },
+      },
+    }),
+    wasExecuted: () => executed,
+  };
+}
+
 describe('I-004: Default query access should be deny', () => {
   let store: OxigraphStore;
   let engine: DKGQueryEngine;
@@ -152,24 +175,9 @@ describe('I-009: SPARQL graph scope bypass prevention', () => {
   });
 
   it('rejects token-adjacent GRAPH variables before executing remote SPARQL', async () => {
-    let executed = false;
-    const noExecuteEngine = {
-      query: async () => {
-        executed = true;
-        return { bindings: [] };
-      },
-      resolveKA: async () => {
-        throw new Error('not used');
-      },
-    } as unknown as DKGQueryEngine;
-    const boundaryHandler = new QueryHandler(noExecuteEngine, {
-      defaultPolicy: 'deny',
-      contextGraphs: {
-        [CONTEXT_GRAPH]: { policy: 'public', sparqlEnabled: true },
-      },
-    });
+    const boundary = makeNoExecuteBoundary();
 
-    const response = await boundaryHandler.handle(
+    const response = await boundary.handler.handle(
       makeRequest({
         sparql: `SELECT ?s WHERE { GRAPH?g { ?s <${SCHEMA_NAME}> ?name } }`,
       }),
@@ -178,7 +186,7 @@ describe('I-009: SPARQL graph scope bypass prevention', () => {
 
     expect(response.status).toBe('ERROR');
     expect(response.error).toContain('GRAPH clauses are not allowed');
-    expect(executed).toBe(false);
+    expect(boundary.wasExecuted()).toBe(false);
   });
 
   it('rejects SPARQL with GRAPH clause targeting the allowed context graph too', async () => {
@@ -207,24 +215,9 @@ describe('I-009: SPARQL graph scope bypass prevention', () => {
   });
 
   it('rejects token-adjacent FROM IRIs before executing remote SPARQL', async () => {
-    let executed = false;
-    const noExecuteEngine = {
-      query: async () => {
-        executed = true;
-        return { bindings: [] };
-      },
-      resolveKA: async () => {
-        throw new Error('not used');
-      },
-    } as unknown as DKGQueryEngine;
-    const boundaryHandler = new QueryHandler(noExecuteEngine, {
-      defaultPolicy: 'deny',
-      contextGraphs: {
-        [CONTEXT_GRAPH]: { policy: 'public', sparqlEnabled: true },
-      },
-    });
+    const boundary = makeNoExecuteBoundary();
 
-    const response = await boundaryHandler.handle(
+    const response = await boundary.handler.handle(
       makeRequest({
         sparql: `SELECT ?name FROM<${OTHER_GRAPH}> WHERE { ?s <${SCHEMA_NAME}> ?name }`,
       }),
@@ -233,7 +226,7 @@ describe('I-009: SPARQL graph scope bypass prevention', () => {
 
     expect(response.status).toBe('ERROR');
     expect(response.error).toContain('FROM');
-    expect(executed).toBe(false);
+    expect(boundary.wasExecuted()).toBe(false);
   });
 
   it('rejects SPARQL with FROM NAMED clause', async () => {

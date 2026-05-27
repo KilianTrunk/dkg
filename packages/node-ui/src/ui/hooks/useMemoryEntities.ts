@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
-import { authHeaders } from '../api.js';
+import { postQueryDeduped } from '../api.js';
 import { useMemoryGraphEvents } from './useNodeEvents.js';
 import { MEMORY_LABEL_PREDICATES } from '../lib/memoryLabels.js';
 
@@ -316,14 +316,12 @@ async function queryLayer(
   // (Codex). Whether a total failure escalates to a hard `error` stays
   // the configurable part (see `signalErrors`).
   try {
+    // Routed through `postQueryDeduped` so the 3-way WM/SWM/VM fan-out
+    // here coalesces with any other concurrently-mounted instance of
+    // this hook (e.g. Dashboard card + ProjectView both subscribed to
+    // the same CG). One underlying fetch instead of N for each layer.
     const body: any = { sparql, contextGraphId, ...opts };
-    const res = await fetch('/api/query', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...authHeaders() },
-      body: JSON.stringify(body),
-    });
-    if (!res.ok) throw new Error(`/api/query failed (${res.status})`);
-    const data = await res.json();
+    const data: any = await postQueryDeduped(body);
     const bindings = data?.result?.bindings ?? data?.results?.bindings ?? [];
     const triples = bindings
       .map((row: any) => {

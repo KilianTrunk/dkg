@@ -1219,3 +1219,459 @@ describe('computeApprovalAction — invariants across all modes', () => {
   });
 });
 
+// -----------------------------------------------------------------------------
+// Adapter-level integration tests for the V10 approval gate (#720 + Codex
+// follow-up on PR #720). The pure-helper tests above prove that
+// `computeApprovalAction(policy, tokenAmount, currentAllowance)` produces
+// the right `(needsApprove, targetAllowance)`. The tests below exercise the
+// real publish/update wiring: that `ensureV10ApproveTrac`
+//   1. reads `token.allowance(signerAddr, kaV10Addr)` from the connected
+//      token contract,
+//   2. forwards `(policy, tokenAmount, currentAllowance)` to the helper,
+//   3. issues exactly one `approve(kaV10Addr, targetAllowance)` when
+//      `needsApprove === true` (with the correct label so publish vs update
+//      stay distinguishable on-chain in tracing),
+//   4. is a strict no-op otherwise (the metadata-only update happy path),
+//   5. and is a no-op for read-only adapters (`this.contracts.token`
+//      absent).
+//
+// `sendContractTransaction` is stubbed at the adapter so the assertions
+// stay on the public call shape without dragging the broadcast / signing
+// machinery into scope; that surface is covered by the
+// `sendContractTransaction` / `sendSignedTransactionAndWait` tests above.
+// -----------------------------------------------------------------------------
+
+const V10_KA_ADDRESS = '0x' + 'aa'.repeat(20);
+
+function makeMockToken(allowance: bigint) {
+  const tokenWithSigner = {
+    allowance: vi.fn(async () => allowance),
+    // `approve` is invoked through the adapter's `sendContractTransaction`
+    // (which is stubbed below), so the mock just needs to exist for any
+    // future code path that probes it.
+    approve: vi.fn(),
+  };
+  const tokenRoot = {
+    connect: vi.fn(() => tokenWithSigner),
+  };
+  return { tokenRoot, tokenWithSigner };
+}
+
+function makeV10Adapter(approvalPolicy?: ApprovalPolicy, allowance: bigint = 0n) {
+  const a = new EVMChainAdapter(minimalConfig({ approvalPolicy }));
+  const { tokenRoot, tokenWithSigner } = makeMockToken(allowance);
+  (a as any).contracts.token = tokenRoot;
+  const sendSpy = vi.fn(async () => ({} as unknown));
+  (a as any).sendContractTransaction = sendSpy;
+  const signer = new ethers.Wallet(DEPLOYER_PK);
+  return { a, signer, tokenRoot, tokenWithSigner, sendSpy };
+}
+
+function getApproveCallArgs(sendSpy: ReturnType<typeof vi.fn>): {
+  contract: unknown;
+  method: string;
+  args: readonly unknown[];
+  signer: unknown;
+  label: string;
+} {
+  expect(sendSpy).toHaveBeenCalledTimes(1);
+  const [contract, method, args, signerArg, label] = sendSpy.mock.calls[0];
+  return { contract, method, args, signer: signerArg, label };
+}
+
+describe('ensureV10ApproveTrac — per-publish (default) approval gate', () => {
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  it('zero-cost publish on a fresh wallet → approves the 1n floor (#720 mainnet revert fix)', async () => {
+    // The exact scenario that reverted on mainnet pre-#720: a publish with
+    // `tokenAmount=0n` against a wallet that has never approved TRAC to the
+    // V10 KnowledgeAssets contract. The fix is the 1n floor in
+    // `effectivePublishAllowance`; the test asserts that the adapter
+    // *actually* observes it on the publish call path.
+    const { a, signer, tokenWithSigner, sendSpy } = makeV10Adapter(undefined, 0n);
+
+    await (a as any).ensureV10ApproveTrac(
+      signer,
+      V10_KA_ADDRESS,
+      0n,
+      'approve V10 publish TRAC',
+    );
+
+    expect(tokenWithSigner.allowance).toHaveBeenCalledTimes(1);
+    expect(tokenWithSigner.allowance).toHaveBeenCalledWith(signer.address, V10_KA_ADDRESS);
+
+    const call = getApproveCallArgs(sendSpy);
+    expect(call.method).toBe('approve');
+    expect(call.args).toEqual([V10_KA_ADDRESS, 1n]);
+    expect(call.signer).toBe(signer);
+    expect(call.label).toBe('approve V10 publish TRAC');
+  });
+
+  it('metadata-only update with existing 1n allowance → NO approve (idle reuse, #720)', async () => {
+    // After the first publish, the wallet retains a 1n allowance. A
+    // subsequent metadata-only update (`newTokenAmount=0n`) must NOT
+    // re-send an approve — that would be a pointless on-chain write and
+    // a Codex review concern on PR #720.
+    const { a, signer, tokenWithSigner, sendSpy } = makeV10Adapter(undefined, 1n);
+
+    await (a as any).ensureV10ApproveTrac(
+      signer,
+      V10_KA_ADDRESS,
+      0n,
+      'approve V10 update TRAC',
+    );
+
+    expect(tokenWithSigner.allowance).toHaveBeenCalledTimes(1);
+    expect(sendSpy).not.toHaveBeenCalled();
+  });
+
+  it('zero-cost publish with comfortable leftover allowance → NO approve', async () => {
+    // Operator pre-approved a large allowance (e.g. switching from
+    // unlimited or replenishing on a previous run). A zero-cost publish
+    // must reuse the existing allowance, not refill.
+    const { a, signer, sendSpy } = makeV10Adapter(undefined, 10n ** 18n);
+
+    await (a as any).ensureV10ApproveTrac(
+      signer,
+      V10_KA_ADDRESS,
+      0n,
+      'approve V10 publish TRAC',
+    );
+
+    expect(sendSpy).not.toHaveBeenCalled();
+  });
+
+  it('positive tokenAmount with empty allowance → approve(tokenAmount)', async () => {
+    // The standard per-publish path: fresh wallet, paid publish. Approve
+    // exactly `tokenAmount` (bounded-per-publish security property).
+    const { a, signer, sendSpy } = makeV10Adapter(undefined, 0n);
+
+    await (a as any).ensureV10ApproveTrac(
+      signer,
+      V10_KA_ADDRESS,
+      100n,
+      'approve V10 publish TRAC',
+    );
+
+    const call = getApproveCallArgs(sendSpy);
+    expect(call.method).toBe('approve');
+    expect(call.args).toEqual([V10_KA_ADDRESS, 100n]);
+  });
+
+  it('positive tokenAmount with partial allowance → approve(tokenAmount) (top-up to exact)', async () => {
+    // Per-publish never widens beyond `tokenAmount`. If the wallet has 50n
+    // and we need 100n, we approve 100n — not e.g. (100n - 50n) or a
+    // larger ceiling.
+    const { a, signer, sendSpy } = makeV10Adapter(undefined, 50n);
+
+    await (a as any).ensureV10ApproveTrac(
+      signer,
+      V10_KA_ADDRESS,
+      100n,
+      'approve V10 publish TRAC',
+    );
+
+    const call = getApproveCallArgs(sendSpy);
+    expect(call.args).toEqual([V10_KA_ADDRESS, 100n]);
+  });
+
+  it('positive tokenAmount with allowance already covering it → NO approve', async () => {
+    // Two paid publishes in a row from the same wallet to the same KA
+    // contract: the second one must skip the approve.
+    const { a, signer, sendSpy } = makeV10Adapter(undefined, 200n);
+
+    await (a as any).ensureV10ApproveTrac(
+      signer,
+      V10_KA_ADDRESS,
+      100n,
+      'approve V10 publish TRAC',
+    );
+
+    expect(sendSpy).not.toHaveBeenCalled();
+  });
+
+  it('positive tokenAmount with allowance exactly matching → NO approve (boundary case)', async () => {
+    const { a, signer, sendSpy } = makeV10Adapter(undefined, 100n);
+
+    await (a as any).ensureV10ApproveTrac(
+      signer,
+      V10_KA_ADDRESS,
+      100n,
+      'approve V10 publish TRAC',
+    );
+
+    expect(sendSpy).not.toHaveBeenCalled();
+  });
+
+  it('read-only adapter (no token contract bound) → no-op, no allowance read, no approve', async () => {
+    // Adapters constructed for read-only nodes don't resolve the V10 Token
+    // contract. The gate must be a clean no-op there — not throw on
+    // `this.contracts.token.connect(...)`.
+    const a = new EVMChainAdapter(minimalConfig());
+    const sendSpy = vi.fn(async () => ({} as unknown));
+    (a as any).sendContractTransaction = sendSpy;
+    (a as any).contracts.token = undefined;
+    const signer = new ethers.Wallet(DEPLOYER_PK);
+
+    await expect((a as any).ensureV10ApproveTrac(
+      signer,
+      V10_KA_ADDRESS,
+      0n,
+      'approve V10 publish TRAC',
+    )).resolves.toBeUndefined();
+
+    expect(sendSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe('ensureV10ApproveTrac — replenishing policy (high-volume operator default)', () => {
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  it('approves the default 1000 TRAC ceiling on a fresh wallet', async () => {
+    const { a, signer, sendSpy } = makeV10Adapter(
+      { mode: 'replenishing' },
+      0n,
+    );
+
+    await (a as any).ensureV10ApproveTrac(
+      signer,
+      V10_KA_ADDRESS,
+      100n,
+      'approve V10 publish TRAC',
+    );
+
+    const call = getApproveCallArgs(sendSpy);
+    expect(call.args).toEqual([V10_KA_ADDRESS, DEFAULT_REPLENISH_TARGET_ALLOWANCE]);
+  });
+
+  it('skips approve when allowance is comfortably above the refill threshold', async () => {
+    // Default refill fraction is 0.1, so the threshold is 100 TRAC. A
+    // wallet with 500 TRAC should NOT trigger a refill on the next
+    // publish.
+    const allowance = 500n * (10n ** 18n);
+    const { a, signer, sendSpy } = makeV10Adapter(
+      { mode: 'replenishing' },
+      allowance,
+    );
+
+    await (a as any).ensureV10ApproveTrac(
+      signer,
+      V10_KA_ADDRESS,
+      100n,
+      'approve V10 publish TRAC',
+    );
+
+    expect(sendSpy).not.toHaveBeenCalled();
+  });
+
+  it('refills back to target when allowance drops below the refill threshold', async () => {
+    // Threshold (10% of default target) is 100 TRAC. An allowance of
+    // 50 TRAC is *below* threshold → refill to the full 1000 TRAC.
+    const allowance = 50n * (10n ** 18n);
+    const { a, signer, sendSpy } = makeV10Adapter(
+      { mode: 'replenishing' },
+      allowance,
+    );
+
+    await (a as any).ensureV10ApproveTrac(
+      signer,
+      V10_KA_ADDRESS,
+      100n,
+      'approve V10 publish TRAC',
+    );
+
+    const call = getApproveCallArgs(sendSpy);
+    expect(call.args).toEqual([V10_KA_ADDRESS, DEFAULT_REPLENISH_TARGET_ALLOWANCE]);
+  });
+
+  it('honours a custom targetAllowance + refillBelowFraction from operator config', async () => {
+    // Operator-configured policy: ceiling 200n, refill below 50%. Below
+    // 100n → refill; at/above 100n → skip.
+    const policy: ApprovalPolicy = {
+      mode: 'replenishing',
+      targetAllowance: 200n,
+      refillBelowFraction: 0.5,
+    };
+
+    {
+      const { a, signer, sendSpy } = makeV10Adapter(policy, 99n);
+      await (a as any).ensureV10ApproveTrac(signer, V10_KA_ADDRESS, 0n, 'approve V10 publish TRAC');
+      const call = getApproveCallArgs(sendSpy);
+      expect(call.args).toEqual([V10_KA_ADDRESS, 200n]);
+    }
+    {
+      const { a, signer, sendSpy } = makeV10Adapter(policy, 100n);
+      await (a as any).ensureV10ApproveTrac(signer, V10_KA_ADDRESS, 0n, 'approve V10 publish TRAC');
+      expect(sendSpy).not.toHaveBeenCalled();
+    }
+  });
+});
+
+describe('ensureV10ApproveTrac — unlimited policy (V9 pattern)', () => {
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  it('approves MaxUint256 once on a fresh wallet', async () => {
+    const { a, signer, sendSpy } = makeV10Adapter(
+      { mode: 'unlimited' },
+      0n,
+    );
+
+    await (a as any).ensureV10ApproveTrac(
+      signer,
+      V10_KA_ADDRESS,
+      100n,
+      'approve V10 publish TRAC',
+    );
+
+    const call = getApproveCallArgs(sendSpy);
+    expect(call.args).toEqual([V10_KA_ADDRESS, ethers.MaxUint256]);
+  });
+
+  it('never re-approves once the wallet has the unlimited allowance live', async () => {
+    // Steady state after the first publish: the wallet has MaxUint256 in
+    // allowance. Any reasonable subsequent publish must skip re-approving
+    // — that's the whole point of the unlimited policy.
+    const { a, signer, sendSpy } = makeV10Adapter(
+      { mode: 'unlimited' },
+      ethers.MaxUint256,
+    );
+
+    await (a as any).ensureV10ApproveTrac(
+      signer,
+      V10_KA_ADDRESS,
+      100n,
+      'approve V10 publish TRAC',
+    );
+
+    expect(sendSpy).not.toHaveBeenCalled();
+  });
+
+  it('skips re-approve once current >= publish floor (defensive — partial residual allowance from another policy)', async () => {
+    // If an operator switched into unlimited mode mid-flight and the
+    // wallet already has enough for the immediate publish, don't waste
+    // an approve — even though the *intended* steady state is MaxUint256,
+    // the immediate publish doesn't need it.
+    const { a, signer, sendSpy } = makeV10Adapter(
+      { mode: 'unlimited' },
+      100n,
+    );
+
+    await (a as any).ensureV10ApproveTrac(
+      signer,
+      V10_KA_ADDRESS,
+      100n,
+      'approve V10 publish TRAC',
+    );
+
+    expect(sendSpy).not.toHaveBeenCalled();
+  });
+
+  it('still re-approves MaxUint256 if an external actor revoked allowance to 0', async () => {
+    // Defensive path: someone called `approve(KA, 0)` on this wallet
+    // out-of-band. The next publish must refill, not silently revert in
+    // the contract's `transferFrom`.
+    const { a, signer, sendSpy } = makeV10Adapter(
+      { mode: 'unlimited' },
+      0n,
+    );
+
+    await (a as any).ensureV10ApproveTrac(
+      signer,
+      V10_KA_ADDRESS,
+      0n,
+      'approve V10 publish TRAC',
+    );
+
+    const call = getApproveCallArgs(sendSpy);
+    expect(call.args).toEqual([V10_KA_ADDRESS, ethers.MaxUint256]);
+  });
+});
+
+describe('ensureV10ApproveTrac — call-site invariants (publish vs update)', () => {
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  it('passes the publish label through verbatim (so on-chain tracing distinguishes publish from update)', async () => {
+    const { a, signer, sendSpy } = makeV10Adapter(undefined, 0n);
+    await (a as any).ensureV10ApproveTrac(signer, V10_KA_ADDRESS, 0n, 'approve V10 publish TRAC');
+    expect(sendSpy.mock.calls[0][4]).toBe('approve V10 publish TRAC');
+  });
+
+  it('passes the update label through verbatim', async () => {
+    const { a, signer, sendSpy } = makeV10Adapter(undefined, 0n);
+    await (a as any).ensureV10ApproveTrac(signer, V10_KA_ADDRESS, 0n, 'approve V10 update TRAC');
+    expect(sendSpy.mock.calls[0][4]).toBe('approve V10 update TRAC');
+  });
+
+  it('connects the bound token contract to the operational signer (not the admin signer)', async () => {
+    // The approve must go out from the same signer that the publish/
+    // update tx will use, so `tokenAmount` is debited from the right
+    // wallet's allowance and not from the admin EOA.
+    const { a, signer, tokenRoot } = makeV10Adapter(undefined, 0n);
+
+    await (a as any).ensureV10ApproveTrac(
+      signer,
+      V10_KA_ADDRESS,
+      100n,
+      'approve V10 publish TRAC',
+    );
+
+    expect(tokenRoot.connect).toHaveBeenCalledTimes(1);
+    expect(tokenRoot.connect).toHaveBeenCalledWith(signer);
+  });
+
+  it('reads allowance against the passed-in KA address (not a globally cached one)', async () => {
+    // Defensive against future refactors that try to cache `kaAddress`
+    // on the adapter and forget to invalidate after a Hub rotation.
+    const otherKa = '0x' + 'bb'.repeat(20);
+    const { a, signer, tokenWithSigner } = makeV10Adapter(undefined, 0n);
+
+    await (a as any).ensureV10ApproveTrac(
+      signer,
+      otherKa,
+      0n,
+      'approve V10 publish TRAC',
+    );
+
+    expect(tokenWithSigner.allowance).toHaveBeenCalledWith(signer.address, otherKa);
+  });
+
+  it('propagates approve failures to the caller (so publish/update aborts cleanly)', async () => {
+    // If the approve broadcast fails (RPC outage, insufficient gas, ...),
+    // the caller must see the rejection — silently swallowing it would
+    // lead to a downstream `publishV10` that reverts deep in the
+    // contract's `transferFrom`.
+    const a = new EVMChainAdapter(minimalConfig());
+    const { tokenRoot } = makeMockToken(0n);
+    (a as any).contracts.token = tokenRoot;
+    (a as any).sendContractTransaction = vi.fn(async () => {
+      throw new Error('approve broadcast failed');
+    });
+    const signer = new ethers.Wallet(DEPLOYER_PK);
+
+    await expect((a as any).ensureV10ApproveTrac(
+      signer,
+      V10_KA_ADDRESS,
+      0n,
+      'approve V10 publish TRAC',
+    )).rejects.toThrow('approve broadcast failed');
+  });
+
+  it('is invariant to allowance() returning a string-encoded bigint (defensive against ABI quirks)', async () => {
+    // ethers v6 returns `bigint` from contract reads, but bonus coverage:
+    // the gate must not coerce-via-Number or otherwise lose precision on
+    // very large allowances. Use a 2^200 allowance to make any Number
+    // coercion immediately wrong.
+    const huge = 2n ** 200n;
+    const { a, signer, sendSpy } = makeV10Adapter(undefined, huge);
+
+    await (a as any).ensureV10ApproveTrac(
+      signer,
+      V10_KA_ADDRESS,
+      100n,
+      'approve V10 publish TRAC',
+    );
+
+    expect(sendSpy).not.toHaveBeenCalled();
+  });
+});
+

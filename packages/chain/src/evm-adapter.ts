@@ -968,6 +968,52 @@ export class EVMChainAdapter implements ChainAdapter {
   }
 
   /**
+   * V10 approval gate shared by `publishV10` and `updateV10`.
+   *
+   * Reads the on-chain TRAC allowance from `signer.address` to the V10
+   * `KnowledgeAssets` contract, then dispatches through
+   * `computeApprovalAction(this.approvalPolicy, tokenAmount, current)`:
+   *   - `per-publish` (default): bounded-per-call, with a `1n` floor so
+   *     zero-cost publishes / metadata-only updates still satisfy the
+   *     contract's `transferFrom(..., 1n)` minimum (the #720 mainnet
+   *     revert we shipped a fix for).
+   *   - `replenishing`: approve a ceiling, refill at a fraction.
+   *   - `unlimited`: V9-style one-shot MaxUint256.
+   *
+   * Acts as a no-op when `this.contracts.token` is absent (read-only
+   * adapters). Extracted from the two near-identical inline blocks in
+   * `publishV10` / `updateV10` so the approve branches are exercised by
+   * a single seam in unit tests (`mock allowance() / approve()`).
+   */
+  private async ensureV10ApproveTrac(
+    signer: Wallet,
+    kav10Address: string,
+    tokenAmount: bigint,
+    txLabel: string,
+  ): Promise<void> {
+    if (!this.contracts.token) return;
+    const tokenWithSigner = this.contracts.token.connect(signer) as Contract;
+    const currentAllowance: bigint = await tokenWithSigner.allowance(
+      signer.address,
+      kav10Address,
+    );
+    const { needsApprove, targetAllowance } = computeApprovalAction(
+      this.approvalPolicy,
+      tokenAmount,
+      currentAllowance,
+    );
+    if (needsApprove) {
+      await this.sendContractTransaction(
+        tokenWithSigner,
+        'approve',
+        [kav10Address, targetAllowance],
+        signer,
+        txLabel,
+      );
+    }
+  }
+
+  /**
    * Pick the next signer in the pool that the on-chain ContextGraphs contract
    * authorizes for the target context graph. Falls back to round-robin only
    * when the auth surface is unavailable.
@@ -2389,43 +2435,23 @@ export class EVMChainAdapter implements ChainAdapter {
     const ka = this.contracts.knowledgeAssetsV10.connect(txSigner) as Contract;
     const kaAddress = await ka.getAddress();
 
-    // Approval policy: always approve TRAC from the operational signer.
-    //
-    // RFC-001 unified `publish`/`publishDirect` (KnowledgeAssetsV10.sol):
-    // the contract auto-detects PCA discount via
-    // `agentToAccountId[msg.sender] != 0` and falls through to
+    // Approval policy: always ensure the operational signer has the
+    // allowance required by the configured `chain.approvalPolicy` for
+    // this `tokenAmount`. RFC-001 unified `publish`/`publishDirect`
+    // (KnowledgeAssetsV10.sol): the contract auto-detects PCA discount
+    // via `agentToAccountId[msg.sender] != 0` and falls through to
     // `token.transferFrom(msg.sender, CSS, fullCost)` for the
     // direct-spend branch. A redundant allowance is cheap and idle when
-    // the PCA branch covers the cost.
-    //
-    // How much to approve is delegated to `computeApprovalAction(policy,
-    // tokenAmount, currentAllowance)`. The default `per-publish` policy
-    // matches the legacy bounded-per-publish behaviour with the on-chain
-    // 1n floor; operators preparing for high-volume publishing can
-    // switch to `replenishing` (approve a ceiling, refill at threshold)
-    // or `unlimited` (approve MaxUint256 once) via the daemon config's
-    // `chain.approvalPolicy` block. See {@link ApprovalPolicy}.
-    if (this.contracts.token) {
-      const tokenWithSigner = this.contracts.token.connect(txSigner) as Contract;
-      const currentAllowance: bigint = await tokenWithSigner.allowance(
-        txSigner.address,
-        kaAddress,
-      );
-      const { needsApprove, targetAllowance } = computeApprovalAction(
-        this.approvalPolicy,
-        params.tokenAmount,
-        currentAllowance,
-      );
-      if (needsApprove) {
-        await this.sendContractTransaction(
-          tokenWithSigner,
-          'approve',
-          [kaAddress, targetAllowance],
-          txSigner,
-          'approve V10 publish TRAC',
-        );
-      }
-    }
+    // the PCA branch covers the cost. Helper handles the
+    // `tokenAmount === 0n` floor (`transferFrom(..., 1n)` minimum), the
+    // bounded-per-publish vs replenishing vs unlimited dispatch, and the
+    // `this.contracts.token === undefined` no-op for read-only adapters.
+    await this.ensureV10ApproveTrac(
+      txSigner,
+      kaAddress,
+      params.tokenAmount,
+      'approve V10 publish TRAC',
+    );
 
     // Build the on-chain PublishParams struct matching the field order +
     // types in `KnowledgeAssetsV10.sol` (RFC-001 author-attestation
@@ -2834,32 +2860,17 @@ export class EVMChainAdapter implements ChainAdapter {
 
     // Approve TRAC for the V10 update — the contract may transferFrom
     // for the newTokenAmount (same direct-spend policy as publish).
-    // Same `computeApprovalAction` dispatch as the publish path so a
+    // Shares the `ensureV10ApproveTrac` helper with the publish path so a
     // single config knob (`chain.approvalPolicy`) controls allowance
     // sizing for both V10 surfaces. The default `per-publish` policy
     // floors at 1n so metadata-only updates with `newTokenAmount === 0n`
     // still satisfy the contract's `transferFrom(..., 1n)` minimum.
-    if (this.contracts.token) {
-      const tokenWithSigner = this.contracts.token.connect(signer) as Contract;
-      const prevAllowance: bigint = await tokenWithSigner.allowance(
-        signer.address,
-        kav10Address,
-      );
-      const { needsApprove, targetAllowance } = computeApprovalAction(
-        this.approvalPolicy,
-        newTokenAmount,
-        prevAllowance,
-      );
-      if (needsApprove) {
-        await this.sendContractTransaction(
-          tokenWithSigner,
-          'approve',
-          [kav10Address, targetAllowance],
-          signer,
-          'approve V10 update TRAC',
-        );
-      }
-    }
+    await this.ensureV10ApproveTrac(
+      signer,
+      kav10Address,
+      newTokenAmount,
+      'approve V10 update TRAC',
+    );
 
     // P-1 review (Codex iter-5): same pattern as the publish path —
     // break the single contract call into populate / sign / hook /

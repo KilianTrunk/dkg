@@ -61,8 +61,8 @@ CORE_NODE=1
 # the reference devnet (~1.5 MiB/s host-mode) this opens a ~2 s mid-batch
 # window — comfortably wide for the 100 ms poll loop below to catch.
 # Operators on faster boxes can keep bumping via the env vars.
-WRITES_COUNT="${WRITES_COUNT:-200}"
-WRITE_PAYLOAD_BYTES="${WRITE_PAYLOAD_BYTES:-16384}"
+WRITES_COUNT="${WRITES_COUNT:-1000}"
+WRITE_PAYLOAD_BYTES="${WRITE_PAYLOAD_BYTES:-32768}"
 
 log()  { echo "[urr] $*"; }
 warn() { echo "[urr] WARN: $*" >&2; }

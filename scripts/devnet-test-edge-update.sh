@@ -312,14 +312,35 @@ done
 log "published all tarballs"
 
 # Sanity: verify verdaccio knows about CLI v1 + v2.
+#
+# Stream the registry JSON to Node via stdin (NOT shell-interpolated)
+# and pass the expected versions through env vars. The package
+# metadata can legitimately contain shell-significant characters
+# like `$` or backticks (e.g. in `description`, `readme`, or
+# `repository.url` fields), and direct interpolation into `node -e`
+# would let bash expand them before Node ever parses the script.
+# Single-quoting the node script keeps bash out of its body entirely.
 VERSIONS_JSON="$(curl -fsS "http://127.0.0.1:$VERDACCIO_PORT/@origintrail-official%2Fdkg" \
   || fail "verdaccio metadata fetch failed for @origintrail-official/dkg")"
-node -e "
-  const meta = $VERSIONS_JSON;
-  const versions = Object.keys(meta.versions || {});
-  if (!versions.includes('$V1_VERSION')) { console.error('missing v1: $V1_VERSION'); process.exit(1); }
-  if (!versions.includes('$V2_VERSION')) { console.error('missing v2: $V2_VERSION'); process.exit(1); }
-" || fail "verdaccio is missing CLI v1 or v2 — see $VERDACCIO_LOG"
+printf '%s' "$VERSIONS_JSON" | \
+  V1_VERSION="$V1_VERSION" V2_VERSION="$V2_VERSION" node -e '
+    let d = "";
+    process.stdin.on("data", (c) => { d += c; });
+    process.stdin.on("end", () => {
+      const meta = JSON.parse(d);
+      const versions = Object.keys(meta.versions || {});
+      const want1 = process.env.V1_VERSION;
+      const want2 = process.env.V2_VERSION;
+      if (!versions.includes(want1)) {
+        console.error("missing v1: " + want1);
+        process.exit(1);
+      }
+      if (!versions.includes(want2)) {
+        console.error("missing v2: " + want2);
+        process.exit(1);
+      }
+    });
+  ' || fail "verdaccio is missing CLI v1 or v2 — see $VERDACCIO_LOG"
 log "verdaccio knows CLI v1 + v2"
 
 # ---------------------------------------------------------------------------

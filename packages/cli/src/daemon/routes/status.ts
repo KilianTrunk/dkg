@@ -1026,6 +1026,15 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
       cgEntries.push([cgName, String(sub.onChainId)]);
     }
 
+    // Operator-typo guard: requested CG names that don't match any
+    // subscribed CG on this node are surfaced explicitly so a no-op
+    // run is diagnosable. Without this, a typo like
+    // `miles-publish-stress-26mayyy` yields `processed: 0` and looks
+    // identical to "nothing needed backfilling". (Codex review on PR
+    // #763, round 2.)
+    const subscribedNames = new Set(subscribed.keys());
+    const unknownContextGraphIds = requestedIds.filter((id) => !subscribedNames.has(id));
+
     const DKG_BATCH_ID = 'http://dkg.io/ontology/batchId';
     const DKG_PART_OF = 'http://dkg.io/ontology/partOf';
     const DKG_PUBLICATION = 'http://dkg.io/ontology/publication';
@@ -1162,6 +1171,10 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
         notOnChain: reports.filter(r => r.status === 'not-on-chain').length,
         failed: reports.filter(r => r.status === 'failed').length,
       },
+      // Always included so the script/operator can `.length > 0`-check.
+      // Empty array when no filter was supplied or every requested CG
+      // resolved against the local subscription set.
+      unknownContextGraphIds,
       reports,
     });
   }

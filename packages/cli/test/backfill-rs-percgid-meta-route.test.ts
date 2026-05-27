@@ -59,11 +59,11 @@ function tripleCountForKc(kc: KcEntry): number {
   return 6 + (kc.publication ? 1 + 5 : 0);
 }
 
-function seedCanonicalMeta(store: OxigraphStore, cg: CGEntry, graphOverride?: string): void {
-  if (!cg.kcEntries) return;
+async function seedCanonicalMeta(store: OxigraphStore, cg: CGEntry, graphOverride?: string): Promise<void> {
+  if (!cg.kcEntries && !cg.cgLifecycleSubject) return;
   const metaGraph = graphOverride ?? `did:dkg:context-graph:${cg.name}/_meta`;
   const quads: Array<{ subject: string; predicate: string; object: string; graph: string }> = [];
-  for (const kc of cg.kcEntries) {
+  for (const kc of cg.kcEntries ?? []) {
     const kaUri = `${kc.ual}/${kc.tokenId}`;
     quads.push(
       { subject: kc.ual, predicate: `${DKG_NS}batchId`, object: `"${kc.batchId}"^^<http://www.w3.org/2001/XMLSchema#integer>`, graph: metaGraph },
@@ -88,7 +88,7 @@ function seedCanonicalMeta(store: OxigraphStore, cg: CGEntry, graphOverride?: st
   if (cg.cgLifecycleSubject) {
     quads.push({ ...cg.cgLifecycleSubject, graph: metaGraph });
   }
-  void store.insert(quads);
+  await store.insert(quads);
 }
 
 function makeAgentMock(opts: { store: OxigraphStore; cgs: Array<{ name: string; onChainId?: string }> }) {
@@ -197,7 +197,7 @@ describe('POST /api/random-sampling/backfill-percgid-meta', () => {
       { ual: 'did:dkg:base:84532/0xAAA/1000001', batchId: 7, rootEntity: 'urn:test:e1', tokenId: 1 },
       { ual: 'did:dkg:base:84532/0xAAA/2000001', batchId: 8, rootEntity: 'urn:test:e2', tokenId: 1 },
     ];
-    seedCanonicalMeta(store, { name: cgName, onChainId, kcEntries: kcs });
+    await seedCanonicalMeta(store, { name: cgName, onChainId, kcEntries: kcs });
     agent.getSubscribedContextGraphs = () => new Map([[cgName, { subscribed: true, synced: true, onChainId }]]);
 
     const expectedTriples = kcs.reduce((acc, kc) => acc + tripleCountForKc(kc), 0);
@@ -241,10 +241,10 @@ describe('POST /api/random-sampling/backfill-percgid-meta', () => {
 
     // Source has BOTH KCs (canonical `<cg>/_meta` is the catch-all
     // where every receiver landing wrote before the publisher fix).
-    seedCanonicalMeta(store, { name: cgName, onChainId, kcEntries: [kcAlreadyInTarget, kcOrphaned] });
+    await seedCanonicalMeta(store, { name: cgName, onChainId, kcEntries: [kcAlreadyInTarget, kcOrphaned] });
 
     // Target has only the first KC (simulating one post-fix publish).
-    seedCanonicalMeta(
+    await seedCanonicalMeta(
       store,
       { name: cgName, onChainId, kcEntries: [kcAlreadyInTarget] },
       `did:dkg:context-graph:${cgName}/context/${onChainId}/_meta`,
@@ -298,7 +298,7 @@ describe('POST /api/random-sampling/backfill-percgid-meta', () => {
       ual: 'did:dkg:base:84532/0xPRV/9000001', batchId: 73, rootEntity: 'urn:prov:root', tokenId: 1,
       publication: { opId, author, merkleRootHex: '00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff' },
     };
-    seedCanonicalMeta(store, { name: cgName, onChainId, kcEntries: [kc] });
+    await seedCanonicalMeta(store, { name: cgName, onChainId, kcEntries: [kc] });
     agent.getSubscribedContextGraphs = () => new Map([[cgName, { subscribed: true, synced: true, onChainId }]]);
 
     const res = await fetch(`${baseUrl}/api/random-sampling/backfill-percgid-meta`, {
@@ -340,11 +340,11 @@ describe('POST /api/random-sampling/backfill-percgid-meta', () => {
     const kc: KcEntry = {
       ual: 'did:dkg:base:84532/0xBBB/3000001', batchId: 11, rootEntity: 'urn:test:e3', tokenId: 1,
     };
-    seedCanonicalMeta(store, { name: cgName, onChainId, kcEntries: [kc] });
+    await seedCanonicalMeta(store, { name: cgName, onChainId, kcEntries: [kc] });
     // Pre-seed the per-cgId graph with the SAME KC's `dkg:batchId` —
     // that's the anchor the endpoint's FILTER NOT EXISTS uses to gate
     // each KC. Re-running on this state must be a no-op.
-    seedCanonicalMeta(
+    await seedCanonicalMeta(
       store,
       { name: cgName, onChainId, kcEntries: [kc] },
       `did:dkg:context-graph:${cgName}/context/${onChainId}/_meta`,
@@ -378,7 +378,7 @@ describe('POST /api/random-sampling/backfill-percgid-meta', () => {
     // KCs) should report cleanly, not crash.
     const cgName = 'rs-backfill-empty-source';
     const onChainId = '7';
-    seedCanonicalMeta(store, {
+    await seedCanonicalMeta(store, {
       name: cgName,
       onChainId,
       cgLifecycleSubject: {
@@ -423,7 +423,7 @@ describe('POST /api/random-sampling/backfill-percgid-meta', () => {
     const cgName = 'rs-backfill-dryrun';
     const onChainId = '17';
     const kc: KcEntry = { ual: 'did:dkg:base:84532/0xCCC/4000001', batchId: 19, rootEntity: 'urn:test:e4', tokenId: 1 };
-    seedCanonicalMeta(store, { name: cgName, onChainId, kcEntries: [kc] });
+    await seedCanonicalMeta(store, { name: cgName, onChainId, kcEntries: [kc] });
     agent.getSubscribedContextGraphs = () => new Map([[cgName, { subscribed: true, synced: true, onChainId }]]);
 
     const res = await fetch(`${baseUrl}/api/random-sampling/backfill-percgid-meta`, {
@@ -453,7 +453,7 @@ describe('POST /api/random-sampling/backfill-percgid-meta', () => {
     const cgName = 'rs-backfill-filter';
     const onChainId = '23';
     const kc: KcEntry = { ual: 'did:dkg:base:84532/0xDDD/5000001', batchId: 31, rootEntity: 'urn:test:e5', tokenId: 1 };
-    seedCanonicalMeta(store, {
+    await seedCanonicalMeta(store, {
       name: cgName,
       onChainId,
       kcEntries: [kc],
@@ -491,8 +491,8 @@ describe('POST /api/random-sampling/backfill-percgid-meta', () => {
   it('restricts to specific CG names when contextGraphIds is provided', async () => {
     const cgA = 'rs-backfill-restrict-a';
     const cgB = 'rs-backfill-restrict-b';
-    seedCanonicalMeta(store, { name: cgA, onChainId: '1', kcEntries: [{ ual: 'did:dkg:base:84532/0xEEE/6000001', batchId: 41, rootEntity: 'urn:e:a', tokenId: 1 }] });
-    seedCanonicalMeta(store, { name: cgB, onChainId: '2', kcEntries: [{ ual: 'did:dkg:base:84532/0xFFF/7000001', batchId: 43, rootEntity: 'urn:e:b', tokenId: 1 }] });
+    await seedCanonicalMeta(store, { name: cgA, onChainId: '1', kcEntries: [{ ual: 'did:dkg:base:84532/0xEEE/6000001', batchId: 41, rootEntity: 'urn:e:a', tokenId: 1 }] });
+    await seedCanonicalMeta(store, { name: cgB, onChainId: '2', kcEntries: [{ ual: 'did:dkg:base:84532/0xFFF/7000001', batchId: 43, rootEntity: 'urn:e:b', tokenId: 1 }] });
     agent.getSubscribedContextGraphs = () => new Map([
       [cgA, { subscribed: true, synced: true, onChainId: '1' }],
       [cgB, { subscribed: true, synced: true, onChainId: '2' }],
@@ -507,10 +507,51 @@ describe('POST /api/random-sampling/backfill-percgid-meta', () => {
     expect(res.status).toBe(200);
     expect(body.processed).toBe(1);
     expect(body.reports[0].contextGraphId).toBe(cgA);
+    expect(body.unknownContextGraphIds).toEqual([]);
 
     const aCount = await countTriples(store, `did:dkg:context-graph:${cgA}/context/1/_meta`);
     const bCount = await countTriples(store, `did:dkg:context-graph:${cgB}/context/2/_meta`);
     expect(aCount).toBeGreaterThan(0);
     expect(bCount).toBe(0);
+  });
+
+  it('surfaces unknown contextGraphIds when none of the requested names match a subscribed CG', async () => {
+    // Regression for Codex round-2 review on PR #763: a typo'd CG
+    // name used to yield `processed: 0` and looked identical to a
+    // successful no-op. Now the endpoint reports the unknown names
+    // explicitly so the operator script can fail loudly.
+    const cgA = 'rs-backfill-known-cg';
+    await seedCanonicalMeta(store, { name: cgA, onChainId: '1', kcEntries: [{ ual: 'did:dkg:base:84532/0xAAA/1', batchId: 1, rootEntity: 'urn:e:a', tokenId: 1 }] });
+    agent.getSubscribedContextGraphs = () => new Map([[cgA, { subscribed: true, synced: true, onChainId: '1' }]]);
+
+    const res = await fetch(`${baseUrl}/api/random-sampling/backfill-percgid-meta`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ contextGraphIds: ['rs-backfill-typo', 'another-typo'] }),
+    });
+    const body: any = await res.json();
+    expect(res.status).toBe(200);
+    expect(body.processed).toBe(0);
+    expect(body.unknownContextGraphIds).toEqual(['rs-backfill-typo', 'another-typo']);
+  });
+
+  it('reports unknownContextGraphIds even when some requested names DO match', async () => {
+    // Mixed case: operator passes a typo alongside a real CG name —
+    // the real one is processed, the typo is reported as unknown so
+    // the partial-success run is fully diagnosable.
+    const cgA = 'rs-backfill-mixed-known';
+    await seedCanonicalMeta(store, { name: cgA, onChainId: '1', kcEntries: [{ ual: 'did:dkg:base:84532/0xAAA/1', batchId: 1, rootEntity: 'urn:e:m', tokenId: 1 }] });
+    agent.getSubscribedContextGraphs = () => new Map([[cgA, { subscribed: true, synced: true, onChainId: '1' }]]);
+
+    const res = await fetch(`${baseUrl}/api/random-sampling/backfill-percgid-meta`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ contextGraphIds: [cgA, 'mistyped'] }),
+    });
+    const body: any = await res.json();
+    expect(res.status).toBe(200);
+    expect(body.processed).toBe(1);
+    expect(body.reports[0]).toMatchObject({ contextGraphId: cgA, status: 'backfilled' });
+    expect(body.unknownContextGraphIds).toEqual(['mistyped']);
   });
 });

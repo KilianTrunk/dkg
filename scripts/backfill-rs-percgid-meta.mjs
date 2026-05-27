@@ -89,21 +89,34 @@ try {
   process.exit(1);
 }
 
-const { processed, summary, reports } = result;
+const { processed, summary, reports, unknownContextGraphIds } = result;
 console.log(
   `[backfill] processed=${processed} backfilled=${summary.backfilled} ` +
   `alreadyPopulated=${summary.alreadyPopulated} noSourceMeta=${summary.noSourceMeta} ` +
   `notOnChain=${summary.notOnChain} failed=${summary.failed}`,
 );
 
+if (Array.isArray(unknownContextGraphIds) && unknownContextGraphIds.length > 0) {
+  // Operators commonly mistype CG names. Surface them loudly so a
+  // typo run doesn't look identical to a successful no-op.
+  console.warn(
+    `[backfill] WARNING: ${unknownContextGraphIds.length} requested CG name(s) not in this node's subscription list: ${unknownContextGraphIds.join(', ')}`,
+  );
+}
+
 for (const r of reports) {
   const tag = r.onChainId ? `cg=${r.contextGraphId}#${r.onChainId}` : `cg=${r.contextGraphId}`;
   switch (r.status) {
     case 'backfilled':
-      console.log(`  · ${tag} BACKFILLED copied=${r.copiedTriples}${DRY_RUN ? ' (dry-run)' : ''}`);
+      console.log(
+        `  · ${tag} BACKFILLED kcsCopied=${r.copiedKcCount ?? '?'}/${r.sourceKcCount ?? '?'} ` +
+        `triples=${r.copiedTriples}${DRY_RUN ? ' (dry-run)' : ''}`,
+      );
       break;
     case 'already-populated':
-      console.log(`  · ${tag} ALREADY-POPULATED target=${r.preExistingTargetTripleCount} triples`);
+      console.log(
+        `  · ${tag} ALREADY-POPULATED kcsInSource=${r.sourceKcCount ?? '?'} kcsToCopy=${r.copiedKcCount ?? 0}`,
+      );
       break;
     case 'no-source-meta':
       console.log(`  · ${tag} NO-SOURCE-META (nothing to copy)`);
@@ -119,9 +132,12 @@ for (const r of reports) {
   }
 }
 
-// Exit non-zero only when an actual operation failed; "nothing to do"
-// states are not errors so the script is safe to chain in a multi-host
-// for-loop.
+// Exit non-zero on actual operation failures OR unknown CG name typos —
+// the latter looks like a successful no-op and would mask a real
+// operator error.
 if (summary.failed > 0) {
   process.exit(2);
+}
+if (Array.isArray(unknownContextGraphIds) && unknownContextGraphIds.length > 0) {
+  process.exit(3);
 }

@@ -26,8 +26,10 @@ const MUTATING_PATTERN = new RegExp(
   'i',
 );
 
-// Matches the query form keyword after optional PREFIX/BASE preamble
-const READ_ONLY_FORMS = /^\s*(?:(?:PREFIX|BASE)\s+[^\n]*\n\s*)*(SELECT|CONSTRUCT|ASK|DESCRIBE)\b/i;
+// Matches the query form keyword after optional PREFIX/BASE preamble.
+// `stripLiteralsAndComments` blanks IRI bodies first, so this accepts both
+// newline-separated and inline declarations, e.g. `PREFIX ex: <...> SELECT`.
+const READ_ONLY_FORMS = /^\s*(?:(?:PREFIX\s+(?:[A-Za-z][A-Za-z0-9_-]*)?:\s*)|(?:BASE\s+))*\s*(SELECT|CONSTRUCT|ASK|DESCRIBE)\b/i;
 
 /** SPARQL query form — enough to shape a `QueryResult` correctly. */
 export type SparqlQueryForm = 'SELECT' | 'CONSTRUCT' | 'ASK' | 'DESCRIBE' | 'UNKNOWN';

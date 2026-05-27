@@ -326,10 +326,19 @@ describe('DKGQueryEngine', () => {
     ]);
 
     await expect(engine.query(
+      `SELECT ?from WHERE { ?s <http://example.com/from> ?from }`,
+      { contextGraphId: CONTEXT_GRAPH },
+    )).resolves.toMatchObject({
+      bindings: [{ from: '"FromPredicate"' }],
+    });
+
+    await expect(engine.query(
       `PREFIX ex: <http://example.com/>
        SELECT ?name WHERE { ?s ex:from ?name }`,
       { contextGraphId: CONTEXT_GRAPH },
-    )).resolves.toMatchObject({ bindings: expect.any(Array) });
+    )).resolves.toMatchObject({
+      bindings: [{ name: '"FromPredicate"' }],
+    });
   });
 
   it('allows scoped queries with a prefix label named from', async () => {
@@ -685,6 +694,20 @@ describe('validateReadOnlySparql', () => {
       PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
       SELECT ?name WHERE { ?s <http://schema.org/name> ?name }
     `);
+    expect(result.safe).toBe(true);
+  });
+
+  it('allows inline PREFIX declarations before SELECT', () => {
+    const result = validateReadOnlySparql(
+      'PREFIX schema: <http://schema.org/> SELECT ?s WHERE { ?s schema:name ?name }',
+    );
+    expect(result.safe).toBe(true);
+  });
+
+  it('allows inline default PREFIX declarations before SELECT', () => {
+    const result = validateReadOnlySparql(
+      'PREFIX : <http://schema.org/> SELECT ?s WHERE { ?s :name ?name }',
+    );
     expect(result.safe).toBe(true);
   });
 

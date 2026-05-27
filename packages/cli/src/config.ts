@@ -333,6 +333,19 @@ export interface LocalAgentIntegrationConfig {
   updatedAt?: string;
 }
 
+export interface QueryAccessConfig {
+  defaultPolicy: 'deny' | 'public';
+  contextGraphs?: Record<string, {
+    policy: 'deny' | 'public' | 'allowList';
+    allowedPeers?: string[];
+    allowedLookupTypes?: Array<'ENTITY_BY_UAL' | 'ENTITIES_BY_TYPE' | 'ENTITY_TRIPLES' | 'SPARQL_QUERY'>;
+    sparqlEnabled?: boolean;
+    sparqlTimeout?: number;
+    sparqlMaxResults?: number;
+  }>;
+  rateLimitPerMinute?: number;
+}
+
 export interface DkgConfig {
   name: string;
   relay?: string;
@@ -414,6 +427,8 @@ export interface DkgConfig {
   bootstrapPeers?: string[];
   /** V10: context graphs to subscribe. */
   contextGraphs?: string[];
+  /** Cross-agent query access policy for inbound query-remote requests. */
+  queryAccess?: QueryAccessConfig;
   autoUpdate?: AutoUpdateConfig;
   /**
    * Chain config. Field-merged on top of `network/<env>.json#chain` via

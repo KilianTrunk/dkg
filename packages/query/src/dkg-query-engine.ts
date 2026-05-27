@@ -222,7 +222,7 @@ export class DKGQueryEngine implements QueryEngine {
     // ── Legacy routing (V9 compat) ────────────────────────────────────
     let effectiveSparql = sparql;
 
-    if (effectiveContextGraphId && !sparql.toLowerCase().includes('from ')) {
+    if (effectiveContextGraphId) {
       const dataGraph = options?.subGraphName
         ? contextGraphSubGraphUri(effectiveContextGraphId, options.subGraphName)
         : contextGraphDataUri(effectiveContextGraphId);

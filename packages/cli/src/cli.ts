@@ -62,6 +62,8 @@ import {
   checkForNewCommitWithStatus,
   checkForNpmVersionUpdate,
   performNpmUpdate,
+  performNpmUpdateEdge,
+  getCurrentCliVersion,
   DAEMON_EXIT_CODE_RESTART,
   resolveStandaloneInstall,
   decodeForcedExitCode,
@@ -4525,8 +4527,17 @@ program
         }
       }
 
-      console.log(`Updating to ${version} via NPM...`);
-      const updateStatus = await performNpmUpdate(version!, logFn);
+      // OT-RFC-41 Bundle B1b: dispatch on nodeRole. Edge runs
+      // `npm install -g` against the global install (no slots);
+      // Core continues to use the slot-based update path.
+      const npmUpdateRole = config.nodeRole ?? 'edge';
+      console.log(
+        `Updating to ${version} via NPM ` +
+          `(${npmUpdateRole === 'edge' ? 'global npm install' : 'blue-green slot'})...`,
+      );
+      const updateStatus = npmUpdateRole === 'edge'
+        ? await performNpmUpdateEdge(version!, getCurrentCliVersion(), logFn)
+        : await performNpmUpdate(version!, logFn);
       if (updateStatus === 'updated') {
         const stopped = await stopDaemonIfRunning();
         if (!stopped) {
@@ -4633,8 +4644,57 @@ program
 
 program
   .command('rollback')
-  .description('Roll back to the previous release slot and stop the daemon')
+  .description('Roll back to the previous DKG version (Edge: npm reinstall; Core: blue-green slot flip)')
   .action(async () => {
+    // OT-RFC-41 §4.8 / Bundle B1b: Edge rollback is a pure
+    // `npm install -g @<previous>` against the npm-global install.
+    // The previous version is recorded in `~/.dkg/previous-version`
+    // by `performNpmUpdateEdge` (and by `noteEdgeLegacyReleases` on
+    // first-start under rc.12 for users coming from a slot-based
+    // install). Core continues to use the slot-flip mechanism.
+    const rollbackConfig = await loadConfig().catch(() => null);
+    const rollbackRole = rollbackConfig?.nodeRole ?? 'edge';
+
+    if (rollbackRole === 'edge') {
+      const previousVersionPath = join(dkgDir(), 'previous-version');
+      if (!existsSync(previousVersionPath)) {
+        console.error(
+          "No rollback target recorded. ~/.dkg/previous-version is absent — either this is the first install, or a previous 'dkg update' did not record a target.\n",
+        );
+        console.error(
+          'To roll back manually, run:\n' +
+            `  npm install -g @origintrail-official/dkg@<version>\n\n` +
+            'See https://www.npmjs.com/package/@origintrail-official/dkg?activeTab=versions for available versions.',
+        );
+        process.exit(1);
+      }
+      const targetVersion = readFileSync(previousVersionPath, 'utf-8').trim();
+      if (!targetVersion) {
+        console.error('~/.dkg/previous-version is empty; cannot determine rollback target.');
+        process.exit(1);
+      }
+
+      const currentVersion = getCurrentCliVersion();
+      console.log(`Rolling back from ${currentVersion} to ${targetVersion} via NPM...`);
+      const rollbackStatus = await performNpmUpdateEdge(
+        targetVersion,
+        currentVersion,
+        (msg) => console.log(msg),
+      );
+      if (rollbackStatus !== 'updated') {
+        console.error('Rollback failed. Check logs and retry.');
+        process.exit(1);
+      }
+      const stopped = await stopDaemonIfRunning();
+      if (!stopped) {
+        console.error('Rollback applied but old daemon is still running. Stop it manually and run "dkg start".');
+        process.exit(1);
+      }
+      console.log(`Rolled back to ${targetVersion}. Run "dkg start" to start with the rolled-back version.`);
+      return;
+    }
+
+    // Core path: existing slot-flip rollback (unchanged).
     const current = await activeSlot();
     if (!current) {
       console.error('Blue-green slots not initialized. Nothing to roll back.');

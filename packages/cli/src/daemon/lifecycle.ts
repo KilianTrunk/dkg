@@ -257,6 +257,7 @@ import {
   performUpdate,
   performUpdateWithStatus,
   performNpmUpdate,
+  performNpmUpdateEdge,
   checkForUpdate,
 } from './auto-update.js';
 import { chainResetWipe } from './chain-reset-wipe.js';
@@ -1610,7 +1611,11 @@ export async function runDaemonInner(
         daemonState.isUpdating = true;
         let updated = false;
         if (standalone && targetNpmVersion) {
-          const status = await performNpmUpdate(targetNpmVersion, log);
+          // OT-RFC-41 Bundle B1b: Edge → npm install -g, Core → slot install.
+          const role = config.nodeRole ?? "edge";
+          const status = role === "edge"
+            ? await performNpmUpdateEdge(targetNpmVersion, getCurrentCliVersion(), log)
+            : await performNpmUpdate(targetNpmVersion, log);
           updated = status === "updated";
         } else {
           updated = await checkForUpdate(au, log);

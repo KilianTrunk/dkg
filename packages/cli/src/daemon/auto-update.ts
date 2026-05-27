@@ -1400,6 +1400,115 @@ export async function performNpmUpdate(
   }
 }
 
+/**
+ * Edge npm-only update path (OT-RFC-41 §4.1 + §4.8, Bundle B1b).
+ *
+ * Unlike {@link performNpmUpdate} (Core), Edge nodes do not use
+ * blue-green slots. The update is a direct `npm install -g` against
+ * the user's npm-global install, after recording the current
+ * version to `~/.dkg/previous-version` so `dkg rollback` (Edge
+ * branch) has a target to reinstall.
+ *
+ * Tradeoffs accepted (per RFC §7.2):
+ *   - Non-atomic: a mid-install crash leaves the global state
+ *     half-updated. Recovery is `npm install -g` re-run.
+ *   - Network-dependent rollback: requires the npm registry to
+ *     have the previous version available.
+ *
+ * The function returns `'updated'` after the npm install completes;
+ * the caller is responsible for stopping the running daemon so the
+ * supervisor respawns from the new entry point (mirrors how the
+ * Core path's swap-slot+restart sequence works).
+ *
+ * Returns `'failed'` on any npm install failure; the previous-version
+ * write is best-effort and a write failure does NOT block the install
+ * (the operator can still rollback manually via
+ * `npm install -g @origintrail-official/dkg@<known-version>`).
+ */
+export async function performNpmUpdateEdge(
+  targetVersion: string,
+  currentVersion: string | null,
+  log: (msg: string) => void,
+): Promise<UpdateStatus> {
+  if (_updateInProgress) {
+    log("Auto-update (npm-edge): another update is already in progress, skipping");
+    return "failed";
+  }
+  _updateInProgress = true;
+  const locked = await acquireUpdateLock(log);
+  if (!locked) {
+    _updateInProgress = false;
+    return "failed";
+  }
+  try {
+    return await _performNpmUpdateInnerEdge(targetVersion, currentVersion, log);
+  } finally {
+    await releaseUpdateLock();
+    _updateInProgress = false;
+  }
+}
+
+async function _performNpmUpdateInnerEdge(
+  targetVersion: string,
+  currentVersion: string | null,
+  log: (msg: string) => void,
+): Promise<UpdateStatus> {
+  const previousVersionPath = join(dkgDir(), "previous-version");
+  if (currentVersion && currentVersion.length > 0) {
+    try {
+      await writeFile(previousVersionPath, currentVersion);
+      log(
+        `Auto-update (npm-edge): recorded ${currentVersion} → ~/.dkg/previous-version (rollback target).`,
+      );
+    } catch (err: any) {
+      log(
+        `Auto-update (npm-edge): WARNING failed to record previous version — ${err?.message ?? err}. ` +
+          "Update will proceed; rollback may require an explicit version argument.",
+      );
+    }
+  } else {
+    log(
+      "Auto-update (npm-edge): WARNING current version unknown; skipping previous-version write. " +
+        "Rollback will require an explicit version argument.",
+    );
+  }
+
+  // 5-minute timeout covers slow network + npm registry round-trips on
+  // CI / homegrown runners. Any longer is almost certainly a hung process.
+  const installCmd = `npm install -g ${CLI_NPM_PACKAGE}@${targetVersion}`;
+  log(`Auto-update (npm-edge): running '${installCmd}'…`);
+  try {
+    const installStart = Date.now();
+    await execAsync(installCmd, {
+      encoding: "utf-8",
+      timeout: 300_000,
+      // Allow npm's progress / warning output to surface in the daemon
+      // log — operators tailing the log get real-time feedback on slow
+      // installs. stderr → stdout merge mirrors how npm itself runs
+      // interactively.
+    });
+    const installMs = Date.now() - installStart;
+    log(`Auto-update (npm-edge): npm install completed in ${installMs}ms.`);
+  } catch (installErr: any) {
+    const msg = String(installErr?.message ?? installErr ?? "unknown error");
+    log(`Auto-update (npm-edge): npm install -g failed — ${msg}`);
+    if (msg.includes("EACCES") || msg.includes("permission")) {
+      log(
+        "  EACCES indicates a permission issue against your npm-global prefix. " +
+          "Common fixes: configure a user-writable prefix (`npm config set prefix ~/.npm-global`), " +
+          "use nvm/volta/fnm (npm-global path inside $HOME), or re-run with sudo (NOT recommended on macOS).",
+      );
+    }
+    return "failed";
+  }
+
+  log(
+    `Auto-update (npm-edge): ${CLI_NPM_PACKAGE}@${targetVersion} installed. ` +
+      "Stop the daemon to restart from the new entry point.",
+  );
+  return "updated";
+}
+
 export async function checkForUpdate(
   au: ResolvedAutoUpdateConfig,
   log: (msg: string) => void,

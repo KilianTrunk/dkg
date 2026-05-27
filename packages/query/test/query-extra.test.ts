@@ -704,6 +704,24 @@ describe('DKGQueryEngine view routing constrains GRAPH variables', () => {
 
     expect(result.bindings.map((b) => b['name'])).toEqual(['"Mine"']);
   });
+
+  it('verified-memory minTrust with GRAPH ?g fails closed instead of returning trusted data', async () => {
+    const store = new OxigraphStore();
+    const engine = new DKGQueryEngine(store);
+    const graph = contextGraphVerifiedMemoryUri(CG, 'trusted-graph-pattern');
+
+    await store.insert([
+      quad('urn:view:trusted', 'http://schema.org/name', '"Trusted"', graph),
+      quad('urn:view:trusted', 'http://dkg.io/ontology/trustLevel', `"${TrustLevel.ConsensusVerified}"`, graph),
+    ]);
+
+    const result = await engine.query(
+      'SELECT ?g ?name WHERE { GRAPH ?g { ?s <http://schema.org/name> ?name } }',
+      { contextGraphId: CG, view: 'verified-memory', minTrust: TrustLevel.Endorsed },
+    );
+
+    expect(result.bindings).toEqual([]);
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────

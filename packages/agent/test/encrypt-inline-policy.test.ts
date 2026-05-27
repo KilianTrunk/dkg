@@ -6,6 +6,7 @@
  * closed instead of falling back to plaintext.
  */
 import { describe, it, expect, vi } from 'vitest';
+import { ethers } from 'ethers';
 import { DKGAgent } from '../src/dkg-agent.js';
 
 function makeAgentLike(opts: {
@@ -107,5 +108,54 @@ describe('DKGAgent._resolveEncryptInlinePayload policy lookup', () => {
     await expect(resolveEncryptInlinePayload(agentLike, 'local-public-cg', '42')).rejects.toThrow(
       /target CG "42" curated=unknown/,
     );
+  });
+});
+
+describe('DKGAgent._resolveEncryptInlineChunked nonce domain', () => {
+  it('uses publishOperationId, not batchId, as the chunked AEAD nonce domain', async () => {
+    const signer = ethers.Wallet.createRandom();
+    const agentLike = {
+      log: {
+        info: vi.fn(),
+        warn: vi.fn(),
+        error: vi.fn(),
+        debug: vi.fn(),
+      },
+      gossip: {
+        publish: vi.fn(async () => {}),
+      },
+      gossipWireIdFor: vi.fn((cgId: string) => cgId),
+      _resolveCuratedChainKeyContext: vi.fn(async () => ({
+        chainKey: new Uint8Array(32).fill(7),
+        aeadCgId: '42',
+      })),
+      resolveWorkspaceGossipSigningAgent: vi.fn(async () => ({
+        privateKey: signer.privateKey,
+        agentAddress: signer.address,
+      })),
+    } as any;
+
+    const encryptInlineChunked = await (DKGAgent.prototype as any)
+      ._resolveEncryptInlineChunked.call(agentLike, '42');
+    expect(encryptInlineChunked).toBeDefined();
+
+    const batchId = ethers.getBytes(ethers.id('same-merkle-root'));
+    const plaintextNquads = new TextEncoder().encode(
+      '<urn:a> <urn:p> "one" <urn:g> .\n<urn:b> <urn:p> "two" <urn:g> .',
+    );
+
+    const first = await encryptInlineChunked({
+      plaintextNquads,
+      batchId,
+      publishOperationId: 'publish-op-1',
+    });
+    const second = await encryptInlineChunked({
+      plaintextNquads,
+      batchId,
+      publishOperationId: 'publish-op-2',
+    });
+
+    expect(Buffer.from(first.ciphertextChunksRoot).toString('hex'))
+      .not.toBe(Buffer.from(second.ciphertextChunksRoot).toString('hex'));
   });
 });

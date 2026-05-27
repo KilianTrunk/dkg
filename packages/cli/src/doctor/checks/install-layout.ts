@@ -132,9 +132,12 @@ export async function runInstallLayoutCheck(
   }
 
   if (state.daemon.entryPoint && state.paths.npmGlobalDkg) {
-    const ep = state.daemon.entryPoint.replace(/\\/g, '/');
-    const npm = state.paths.npmGlobalDkg.replace(/\\/g, '/');
-    if (!ep.startsWith(npm + '/') && !ep.startsWith(npm)) {
+    const normalizePathForContainment = (p: string) =>
+      p.replace(/\\/g, '/').replace(/\/+$/, '');
+    const ep = normalizePathForContainment(state.daemon.entryPoint);
+    const npm = normalizePathForContainment(state.paths.npmGlobalDkg);
+    const insideNpmGlobal = ep === npm || ep.startsWith(npm + '/');
+    if (!insideNpmGlobal) {
       // Edge daemon is running from somewhere unexpected. Possible
       // causes: stale slot, contributor monorepo, manual override.
       // We report this as a warning so the operator + agent can

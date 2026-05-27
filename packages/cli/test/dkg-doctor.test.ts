@@ -456,6 +456,19 @@ describe('install-layout check (§4.7.3)', () => {
     expect(findings.find((f) => f.message.includes('not inside the npm-global install'))).toBeDefined();
   });
 
+  it('Edge: warns when daemon entryPoint only shares the npm-global path prefix', async () => {
+    const deps = makeDeps({
+      fs: {
+        '/test/.dkg/config.json': JSON.stringify({ nodeRole: 'edge' }),
+      },
+    });
+    const state = await collectStateSummary(deps);
+    state.paths.npmGlobalDkg = '/usr/local/lib/node_modules/@origintrail-official/dkg';
+    state.daemon.entryPoint = '/usr/local/lib/node_modules/@origintrail-official/dkg-old/dist/cli.js';
+    const findings = await runInstallLayoutCheck(deps, state);
+    expect(findings.find((f) => f.message.includes('not inside the npm-global install'))).toBeDefined();
+  });
+
   it('Core: errors on missing current symlink', async () => {
     const deps = makeDeps({
       fs: {

@@ -169,13 +169,23 @@ export interface StorageACKHandlerConfig {
    * turn exposes the multi-CG identical-KC collision the bot called
    * out on `ciphertext-chunk-store.ts`.
    *
-   * The agent wires this to {@link DKGAgent.gossipWireIdFor} (cleartext
-   * → curator-committed nameHash). Optional: handlers without this
-   * hook continue to use the raw `swmGraphId` as the graph key, which
-   * preserves the legacy (pre-fix) behaviour for any caller that
-   * doesn't yet expose a normalizer.
+   * The agent wires this to `DKGAgent.canonicalChunkStoreCgIdOrNull`
+   * (which routes 0x-hex, cleartext, and decimal-numeric ids through
+   * the local subscription map). Returning `null` is honest:
+   * "I can't safely canonicalize this id — please degrade to the
+   * legacy `GRAPH ?g` wildcard scan for this lookup." Codex review
+   * (round 2) on PR #727: the previous shape forced a
+   * `gossipWireIdFor(cgId)` even for decimal-numeric ids, which
+   * keccak'd "42" as a literal string and missed every persisted
+   * chunk — required for ACK V2 robustness when
+   * `PublishIntent.swmGraphId` is absent.
+   *
+   * Optional: handlers without this hook continue to use the raw
+   * `swmGraphId` as the graph key, which preserves the legacy
+   * (pre-fix) behaviour for any caller that doesn't yet expose a
+   * normalizer.
    */
-  normalizeContextGraphIdForChunkStore?: (cgId: string) => string;
+  normalizeContextGraphIdForChunkStore?: (cgId: string) => string | null;
 }
 
 /**
@@ -361,11 +371,27 @@ export class StorageACKHandler {
       const MAX_LOCAL_WAIT_RETRIES = 20;
       const LOCAL_WAIT_DELAY_MS = 500;
       const normalizeCgId = this.config.normalizeContextGraphIdForChunkStore;
-      const canonicalCgIdForChunks = normalizeCgId ? normalizeCgId(swmGraphId) : swmGraphId;
-      const chunkStoreGraph = ciphertextChunkStoreGraph(canonicalCgIdForChunks);
+      // Codex review (round 2) on PR #727: explicitly allow the
+      // normalizer to return null — that means "can't trust a canonical
+      // form for this id, please widen the lookup". We then degrade to
+      // the wildcard `GRAPH ?g` scan, identical to the pre-fix
+      // behaviour. Required because `PublishIntent.swmGraphId` is
+      // optional on the wire (a chunked V2 intent that omits it would
+      // otherwise fall through to `cgId` — a decimal-numeric string —
+      // and the previous unconditional `gossipWireIdFor` would keccak
+      // "42" instead of resolving the curator nameHash.
+      const canonicalCgIdForChunks = normalizeCgId
+        ? normalizeCgId(swmGraphId)
+        : swmGraphId;
+      const chunkStoreGraph = canonicalCgIdForChunks
+        ? ciphertextChunkStoreGraph(canonicalCgIdForChunks)
+        : null;
+      const graphClause = chunkStoreGraph
+        ? `GRAPH <${chunkStoreGraph}>`
+        : 'GRAPH ?g';
       const loadChunk = async (i: number): Promise<Uint8Array | null> => {
         const subject = ciphertextChunkStoreSubject(merkleRoot, i);
-        const sparql = `SELECT ?o WHERE { GRAPH <${chunkStoreGraph}> { <${subject}> <${CIPHERTEXT_CHUNK_PREDICATE}> ?o } } LIMIT 1`;
+        const sparql = `SELECT ?o WHERE { ${graphClause} { <${subject}> <${CIPHERTEXT_CHUNK_PREDICATE}> ?o } } LIMIT 1`;
         const result = await this.store.query(sparql);
         if (result.type !== 'bindings' || result.bindings.length === 0) return null;
         const literal = result.bindings[0]?.['o'];

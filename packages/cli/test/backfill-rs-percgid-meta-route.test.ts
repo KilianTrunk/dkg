@@ -6,45 +6,84 @@ import { OxigraphStore } from '@origintrail-official/dkg-storage';
  * Endpoint test for `POST /api/random-sampling/backfill-percgid-meta`.
  *
  * The endpoint reads the canonical `<cgName>/_meta` graph, picks the
- * per-KC subset (subjects with `dkg:batchId`, the KA UALs they
- * reference via `dkg:partOf`, and the publication URIs referenced via
- * `dkg:authoredBy`), and copies that subset into the per-cgId
- * `<cgName>/context/<cgId>/_meta` graph that the RS prover
- * (`kc-extractor.ts`) reads from.
+ * per-KC subset (`generateKCMetadata` shape from
+ * `packages/publisher/src/metadata.ts`):
  *
- * Pre-cd68fa689 publishers gossiped finalization without a
- * `targetContextGraphId`, so receivers settled the per-KC meta at
- * the legacy URI; nothing in the post-fix code path puts it where it
- * belongs in retrospect. This endpoint is the one-shot operator
- * rescue for that historical state.
+ *   - KC UAL subjects (`dkg:batchId` + many siblings).
+ *   - KA UAL subjects (`<UAL/tokenId>`; carry `dkg:partOf <KC>`).
+ *   - Publication URIs (`urn:dkg:publication:<opId>`); reached from a
+ *     KA via `<KA> dkg:publication <pub>`. The publication node itself
+ *     carries `dkg:authoredBy`, `dkg:Publication` type, etc.
+ *
+ * Per-KC granularity is the headline contract: each KC is gated by an
+ * independent `FILTER NOT EXISTS` against the target graph, so a
+ * mixed-state CG (some pre-fix KCs orphaned at `<cg>/_meta`, some
+ * post-fix KCs already in the per-cgId graph) gets only the missing
+ * KCs copied. Earlier revisions of this endpoint short-circuited on
+ * "any triple in target" — Codex review on PR #763 pointed out that
+ * this would silently skip the rescue on every CG that received even
+ * a single post-fix publish.
  */
 
 const { handleStatusRoutes } = await import('../src/daemon/routes/status.js');
 
+type KcEntry = {
+  ual: string;
+  batchId: number;
+  rootEntity: string;
+  tokenId: number;
+  /** When set, emit a `dkg:Publication` node + `<KA> dkg:publication <pubUri>` link.
+   *  Mirrors `generateKCMetadata` (`metadata.ts:172-185`). */
+  publication?: { opId: string; author: string; merkleRootHex: string };
+};
+
 type CGEntry = {
   name: string;
   onChainId: string;
-  /** Pre-seed canonical meta with N per-KC entries. */
-  kcEntries?: Array<{ ual: string; batchId: number; rootEntity: string; tokenId: number }>;
-  /** Pre-seed an extra non-KC subject in the canonical meta so the
-   *  endpoint's filter can be verified — should NOT be copied. */
+  kcEntries?: KcEntry[];
   cgLifecycleSubject?: { subject: string; predicate: string; object: string };
 };
 
-function seedCanonicalMeta(store: OxigraphStore, cg: CGEntry): void {
+const DKG_NS = 'http://dkg.io/ontology/';
+const RDF_TYPE = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type';
+
+/**
+ * How many quads `seedCanonicalMeta` emits for one KC. Exposed so
+ * counting assertions in the tests stay readable.
+ *   3 KC triples (batchId, kaCount, status)
+ * + 3 KA triples (partOf, rootEntity, tokenId)
+ * + 1 KA→pub link (when `publication` set)
+ * + 5 publication triples (when `publication` set)
+ */
+function tripleCountForKc(kc: KcEntry): number {
+  return 6 + (kc.publication ? 1 + 5 : 0);
+}
+
+function seedCanonicalMeta(store: OxigraphStore, cg: CGEntry, graphOverride?: string): void {
   if (!cg.kcEntries) return;
-  const metaGraph = `did:dkg:context-graph:${cg.name}/_meta`;
+  const metaGraph = graphOverride ?? `did:dkg:context-graph:${cg.name}/_meta`;
   const quads: Array<{ subject: string; predicate: string; object: string; graph: string }> = [];
   for (const kc of cg.kcEntries) {
+    const kaUri = `${kc.ual}/${kc.tokenId}`;
     quads.push(
-      { subject: kc.ual, predicate: 'http://dkg.io/ontology/batchId', object: `"${kc.batchId}"^^<http://www.w3.org/2001/XMLSchema#integer>`, graph: metaGraph },
-      { subject: kc.ual, predicate: 'http://dkg.io/ontology/kaCount', object: '"1"^^<http://www.w3.org/2001/XMLSchema#integer>', graph: metaGraph },
-      { subject: kc.ual, predicate: 'http://dkg.io/ontology/status', object: '"confirmed"', graph: metaGraph },
-      // KA-level subject (resolved via partOf → KC has batchId).
-      { subject: `${kc.ual}/${kc.tokenId}`, predicate: 'http://dkg.io/ontology/partOf', object: kc.ual, graph: metaGraph },
-      { subject: `${kc.ual}/${kc.tokenId}`, predicate: 'http://dkg.io/ontology/rootEntity', object: kc.rootEntity, graph: metaGraph },
-      { subject: `${kc.ual}/${kc.tokenId}`, predicate: 'http://dkg.io/ontology/tokenId', object: `"${kc.tokenId}"^^<http://www.w3.org/2001/XMLSchema#integer>`, graph: metaGraph },
+      { subject: kc.ual, predicate: `${DKG_NS}batchId`, object: `"${kc.batchId}"^^<http://www.w3.org/2001/XMLSchema#integer>`, graph: metaGraph },
+      { subject: kc.ual, predicate: `${DKG_NS}kaCount`, object: '"1"^^<http://www.w3.org/2001/XMLSchema#integer>', graph: metaGraph },
+      { subject: kc.ual, predicate: `${DKG_NS}status`, object: '"confirmed"', graph: metaGraph },
+      { subject: kaUri, predicate: `${DKG_NS}partOf`, object: kc.ual, graph: metaGraph },
+      { subject: kaUri, predicate: `${DKG_NS}rootEntity`, object: kc.rootEntity, graph: metaGraph },
+      { subject: kaUri, predicate: `${DKG_NS}tokenId`, object: `"${kc.tokenId}"^^<http://www.w3.org/2001/XMLSchema#integer>`, graph: metaGraph },
     );
+    if (kc.publication) {
+      const pubUri = `urn:dkg:publication:${kc.publication.opId}`;
+      quads.push(
+        { subject: kaUri, predicate: `${DKG_NS}publication`, object: pubUri, graph: metaGraph },
+        { subject: pubUri, predicate: RDF_TYPE, object: `${DKG_NS}Publication`, graph: metaGraph },
+        { subject: pubUri, predicate: `${DKG_NS}publishOperationId`, object: `"${kc.publication.opId}"`, graph: metaGraph },
+        { subject: pubUri, predicate: `${DKG_NS}contextGraphId`, object: `"${cg.name}"`, graph: metaGraph },
+        { subject: pubUri, predicate: `${DKG_NS}merkleRoot`, object: `"${kc.publication.merkleRootHex}"^^<http://www.w3.org/2001/XMLSchema#hexBinary>`, graph: metaGraph },
+        { subject: pubUri, predicate: `${DKG_NS}authoredBy`, object: `"${kc.publication.author}"`, graph: metaGraph },
+      );
+    }
   }
   if (cg.cgLifecycleSubject) {
     quads.push({ ...cg.cgLifecycleSubject, graph: metaGraph });
@@ -64,9 +103,6 @@ function makeAgentMock(opts: { store: OxigraphStore; cgs: Array<{ name: string; 
     publisher: { getIdentityId: () => 0n },
     store: opts.store,
     getSubscribedContextGraphs: () => subscribed,
-    // The endpoint doesn't call these but the ctx shape includes them
-    // through unrelated routes — keep them noop-safe in case any
-    // sibling guard touches them.
     getRandomSamplingStatus: () => ({ enabled: false, role: 'edge' }),
   };
 }
@@ -157,16 +193,14 @@ describe('POST /api/random-sampling/backfill-percgid-meta', () => {
   it('copies per-KC meta from <cg>/_meta to <cg>/context/<cgId>/_meta for an on-chain CG', async () => {
     const cgName = 'rs-backfill-happy';
     const onChainId = '42';
-    seedCanonicalMeta(store, {
-      name: cgName,
-      onChainId,
-      kcEntries: [
-        { ual: 'did:dkg:base:84532/0xAAA/1000001', batchId: 7, rootEntity: 'urn:test:e1', tokenId: 1 },
-        { ual: 'did:dkg:base:84532/0xAAA/2000001', batchId: 8, rootEntity: 'urn:test:e2', tokenId: 1 },
-      ],
-    });
+    const kcs: KcEntry[] = [
+      { ual: 'did:dkg:base:84532/0xAAA/1000001', batchId: 7, rootEntity: 'urn:test:e1', tokenId: 1 },
+      { ual: 'did:dkg:base:84532/0xAAA/2000001', batchId: 8, rootEntity: 'urn:test:e2', tokenId: 1 },
+    ];
+    seedCanonicalMeta(store, { name: cgName, onChainId, kcEntries: kcs });
     agent.getSubscribedContextGraphs = () => new Map([[cgName, { subscribed: true, synced: true, onChainId }]]);
 
+    const expectedTriples = kcs.reduce((acc, kc) => acc + tripleCountForKc(kc), 0);
     const before = await countTriples(store, `did:dkg:context-graph:${cgName}/context/${onChainId}/_meta`);
     expect(before).toBe(0);
 
@@ -178,30 +212,144 @@ describe('POST /api/random-sampling/backfill-percgid-meta', () => {
     const body: any = await res.json();
     expect(res.status).toBe(200);
     expect(body.summary).toMatchObject({ backfilled: 1, alreadyPopulated: 0, failed: 0 });
-
-    const after = await countTriples(store, `did:dkg:context-graph:${cgName}/context/${onChainId}/_meta`);
-    // 2 KCs × (3 KC-level + 3 KA-level) = 12 triples.
-    expect(after).toBe(12);
     expect(body.reports[0]).toMatchObject({
       contextGraphId: cgName,
       onChainId,
       status: 'backfilled',
-      copiedTriples: 12,
+      sourceKcCount: 2,
+      copiedKcCount: 2,
+      copiedTriples: expectedTriples,
     });
+
+    const after = await countTriples(store, `did:dkg:context-graph:${cgName}/context/${onChainId}/_meta`);
+    expect(after).toBe(expectedTriples);
   });
 
-  it('skips already-populated per-cgId meta graphs (idempotent)', async () => {
+  it('per-KC granularity: mixed-state CG only backfills KCs missing from target', async () => {
+    // Regression for Codex review on PR #763: an earlier revision
+    // short-circuited the whole CG when COUNT(*) > 0 in target,
+    // which silently skipped historical KCs on any CG that had
+    // received even one post-fix publish.
+    const cgName = 'rs-backfill-mixed-state';
+    const onChainId = '101';
+    const kcAlreadyInTarget: KcEntry = {
+      ual: 'did:dkg:base:84532/0xMIX/1000001', batchId: 51, rootEntity: 'urn:mix:already', tokenId: 1,
+    };
+    const kcOrphaned: KcEntry = {
+      ual: 'did:dkg:base:84532/0xMIX/2000001', batchId: 52, rootEntity: 'urn:mix:orphan', tokenId: 1,
+    };
+
+    // Source has BOTH KCs (canonical `<cg>/_meta` is the catch-all
+    // where every receiver landing wrote before the publisher fix).
+    seedCanonicalMeta(store, { name: cgName, onChainId, kcEntries: [kcAlreadyInTarget, kcOrphaned] });
+
+    // Target has only the first KC (simulating one post-fix publish).
+    seedCanonicalMeta(
+      store,
+      { name: cgName, onChainId, kcEntries: [kcAlreadyInTarget] },
+      `did:dkg:context-graph:${cgName}/context/${onChainId}/_meta`,
+    );
+    const targetBefore = await countTriples(store, `did:dkg:context-graph:${cgName}/context/${onChainId}/_meta`);
+    expect(targetBefore).toBe(tripleCountForKc(kcAlreadyInTarget));
+
+    agent.getSubscribedContextGraphs = () => new Map([[cgName, { subscribed: true, synced: true, onChainId }]]);
+
+    const res = await fetch(`${baseUrl}/api/random-sampling/backfill-percgid-meta`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    const body: any = await res.json();
+    expect(res.status).toBe(200);
+    expect(body.reports[0]).toMatchObject({
+      contextGraphId: cgName,
+      onChainId,
+      status: 'backfilled',
+      sourceKcCount: 2,
+      copiedKcCount: 1,
+      copiedTriples: tripleCountForKc(kcOrphaned),
+    });
+
+    const target = `did:dkg:context-graph:${cgName}/context/${onChainId}/_meta`;
+    const targetAfter = await countTriples(store, target);
+    // Target = (1 KC pre-existing) + (1 KC backfilled). De-duplicated by set semantics.
+    expect(targetAfter).toBe(tripleCountForKc(kcAlreadyInTarget) + tripleCountForKc(kcOrphaned));
+
+    // Tripwire: the originally-present KC's triples were NOT re-copied
+    // (FILTER NOT EXISTS gated it out) — only the orphan KC's were.
+    const ask = await store.query(
+      `ASK { GRAPH <${target}> { <${kcOrphaned.ual}> <${DKG_NS}batchId> ?o } }`,
+    );
+    expect(ask.type).toBe('boolean');
+    if (ask.type === 'boolean') expect(ask.value).toBe(true);
+  });
+
+  it('preserves dkg:Publication / dkg:authoredBy provenance for backfilled KCs', async () => {
+    // Regression for Codex review on PR #763: an earlier revision
+    // matched provenance via `?kc dkg:authoredBy ?pub` — the wrong
+    // direction. `generateKCMetadata` emits `<KA> dkg:publication <pub>`
+    // and the publication node ITSELF carries `dkg:authoredBy`. The
+    // fix follows the KA→pub link.
+    const cgName = 'rs-backfill-provenance';
+    const onChainId = '202';
+    const opId = 'op-fixture-2026';
+    const author = '0x600AB8102eB4EFA9De4eFF2f4069D7a2D4c8A8fe';
+    const kc: KcEntry = {
+      ual: 'did:dkg:base:84532/0xPRV/9000001', batchId: 73, rootEntity: 'urn:prov:root', tokenId: 1,
+      publication: { opId, author, merkleRootHex: '00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff' },
+    };
+    seedCanonicalMeta(store, { name: cgName, onChainId, kcEntries: [kc] });
+    agent.getSubscribedContextGraphs = () => new Map([[cgName, { subscribed: true, synced: true, onChainId }]]);
+
+    const res = await fetch(`${baseUrl}/api/random-sampling/backfill-percgid-meta`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    const body: any = await res.json();
+    expect(res.status).toBe(200);
+    expect(body.summary).toMatchObject({ backfilled: 1 });
+
+    // The publication URI MUST be in the target with its dkg:authoredBy.
+    const target = `did:dkg:context-graph:${cgName}/context/${onChainId}/_meta`;
+    const pubUri = `urn:dkg:publication:${opId}`;
+    const authorAsk = await store.query(
+      `ASK { GRAPH <${target}> { <${pubUri}> <${DKG_NS}authoredBy> ?author } }`,
+    );
+    expect(authorAsk.type).toBe('boolean');
+    if (authorAsk.type === 'boolean') expect(authorAsk.value).toBe(true);
+
+    const typeAsk = await store.query(
+      `ASK { GRAPH <${target}> { <${pubUri}> <${RDF_TYPE}> <${DKG_NS}Publication> } }`,
+    );
+    expect(typeAsk.type).toBe('boolean');
+    if (typeAsk.type === 'boolean') expect(typeAsk.value).toBe(true);
+
+    // And the KA→pub link is preserved so future readers can resolve
+    // provenance from either direction.
+    const kaPubAsk = await store.query(
+      `ASK { GRAPH <${target}> { <${kc.ual}/${kc.tokenId}> <${DKG_NS}publication> <${pubUri}> } }`,
+    );
+    expect(kaPubAsk.type).toBe('boolean');
+    if (kaPubAsk.type === 'boolean') expect(kaPubAsk.value).toBe(true);
+  });
+
+  it('reports already-populated when every source KC is already in target (idempotent)', async () => {
     const cgName = 'rs-backfill-idempotent';
     const onChainId = '99';
-    seedCanonicalMeta(store, {
-      name: cgName,
-      onChainId,
-      kcEntries: [{ ual: 'did:dkg:base:84532/0xBBB/3000001', batchId: 11, rootEntity: 'urn:test:e3', tokenId: 1 }],
-    });
-    // Pre-seed the per-cgId graph so the endpoint sees it as already done.
-    await store.insert([
-      { subject: 'did:dkg:base:84532/0xBBB/3000001', predicate: 'http://dkg.io/ontology/status', object: '"confirmed"', graph: `did:dkg:context-graph:${cgName}/context/${onChainId}/_meta` },
-    ]);
+    const kc: KcEntry = {
+      ual: 'did:dkg:base:84532/0xBBB/3000001', batchId: 11, rootEntity: 'urn:test:e3', tokenId: 1,
+    };
+    seedCanonicalMeta(store, { name: cgName, onChainId, kcEntries: [kc] });
+    // Pre-seed the per-cgId graph with the SAME KC's `dkg:batchId` —
+    // that's the anchor the endpoint's FILTER NOT EXISTS uses to gate
+    // each KC. Re-running on this state must be a no-op.
+    seedCanonicalMeta(
+      store,
+      { name: cgName, onChainId, kcEntries: [kc] },
+      `did:dkg:context-graph:${cgName}/context/${onChainId}/_meta`,
+    );
+    const targetBefore = await countTriples(store, `did:dkg:context-graph:${cgName}/context/${onChainId}/_meta`);
     agent.getSubscribedContextGraphs = () => new Map([[cgName, { subscribed: true, synced: true, onChainId }]]);
 
     const res = await fetch(`${baseUrl}/api/random-sampling/backfill-percgid-meta`, {
@@ -215,7 +363,44 @@ describe('POST /api/random-sampling/backfill-percgid-meta', () => {
     expect(body.reports[0]).toMatchObject({
       contextGraphId: cgName,
       status: 'already-populated',
-      preExistingTargetTripleCount: 1,
+      sourceKcCount: 1,
+      copiedKcCount: 0,
+      copiedTriples: 0,
+    });
+
+    const targetAfter = await countTriples(store, `did:dkg:context-graph:${cgName}/context/${onChainId}/_meta`);
+    expect(targetAfter).toBe(targetBefore);
+  });
+
+  it('reports no-source-meta when canonical _meta has no KCs', async () => {
+    // Belt-and-braces test: a CG that's registered on-chain but
+    // whose canonical meta carries only CG-lifecycle subjects (no
+    // KCs) should report cleanly, not crash.
+    const cgName = 'rs-backfill-empty-source';
+    const onChainId = '7';
+    seedCanonicalMeta(store, {
+      name: cgName,
+      onChainId,
+      cgLifecycleSubject: {
+        subject: `did:dkg:context-graph:${cgName}`,
+        predicate: 'http://schema.org/dateCreated',
+        object: '"2026-05-26T18:18:00Z"',
+      },
+    });
+    agent.getSubscribedContextGraphs = () => new Map([[cgName, { subscribed: true, synced: true, onChainId }]]);
+
+    const res = await fetch(`${baseUrl}/api/random-sampling/backfill-percgid-meta`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    const body: any = await res.json();
+    expect(res.status).toBe(200);
+    expect(body.summary).toMatchObject({ noSourceMeta: 1, backfilled: 0 });
+    expect(body.reports[0]).toMatchObject({
+      contextGraphId: cgName,
+      status: 'no-source-meta',
+      sourceKcCount: 0,
     });
   });
 
@@ -237,11 +422,8 @@ describe('POST /api/random-sampling/backfill-percgid-meta', () => {
   it('dry-run reports copy count without writing', async () => {
     const cgName = 'rs-backfill-dryrun';
     const onChainId = '17';
-    seedCanonicalMeta(store, {
-      name: cgName,
-      onChainId,
-      kcEntries: [{ ual: 'did:dkg:base:84532/0xCCC/4000001', batchId: 19, rootEntity: 'urn:test:e4', tokenId: 1 }],
-    });
+    const kc: KcEntry = { ual: 'did:dkg:base:84532/0xCCC/4000001', batchId: 19, rootEntity: 'urn:test:e4', tokenId: 1 };
+    seedCanonicalMeta(store, { name: cgName, onChainId, kcEntries: [kc] });
     agent.getSubscribedContextGraphs = () => new Map([[cgName, { subscribed: true, synced: true, onChainId }]]);
 
     const res = await fetch(`${baseUrl}/api/random-sampling/backfill-percgid-meta`, {
@@ -253,23 +435,28 @@ describe('POST /api/random-sampling/backfill-percgid-meta', () => {
     expect(res.status).toBe(200);
     expect(body.dryRun).toBe(true);
     expect(body.summary).toMatchObject({ backfilled: 1 });
+    expect(body.reports[0]).toMatchObject({
+      status: 'backfilled',
+      copiedKcCount: 1,
+      copiedTriples: tripleCountForKc(kc),
+    });
 
-    // Dry-run MUST NOT have written anything to the per-cgId graph.
     const after = await countTriples(store, `did:dkg:context-graph:${cgName}/context/${onChainId}/_meta`);
     expect(after).toBe(0);
   });
 
   it('filters out CG-lifecycle subjects (only copies KC/KA/publication URIs)', async () => {
     // Subjects without `dkg:batchId` (and not reached via `dkg:partOf`
-    // or `dkg:authoredBy`) belong to CG-level metadata — accessPolicy,
-    // createdAt on the cgEntity, allowlist members, etc. The publisher
+    // or `<KA> dkg:publication <s>`) belong to CG-level metadata —
+    // accessPolicy, createdAt on the cgEntity, etc. The publisher
     // doesn't promote them into per-cgId; neither should the backfill.
     const cgName = 'rs-backfill-filter';
     const onChainId = '23';
+    const kc: KcEntry = { ual: 'did:dkg:base:84532/0xDDD/5000001', batchId: 31, rootEntity: 'urn:test:e5', tokenId: 1 };
     seedCanonicalMeta(store, {
       name: cgName,
       onChainId,
-      kcEntries: [{ ual: 'did:dkg:base:84532/0xDDD/5000001', batchId: 31, rootEntity: 'urn:test:e5', tokenId: 1 }],
+      kcEntries: [kc],
       cgLifecycleSubject: {
         subject: `did:dkg:context-graph:${cgName}`,
         predicate: 'http://schema.org/dateCreated',
@@ -287,7 +474,6 @@ describe('POST /api/random-sampling/backfill-percgid-meta', () => {
     expect(res.status).toBe(200);
     expect(body.summary.backfilled).toBe(1);
 
-    // The lifecycle subject should NOT have been copied.
     const target = `did:dkg:context-graph:${cgName}/context/${onChainId}/_meta`;
     const lifecycleProbe = await store.query(
       `ASK { GRAPH <${target}> { <did:dkg:context-graph:${cgName}> <http://schema.org/dateCreated> ?o } }`,
@@ -295,9 +481,8 @@ describe('POST /api/random-sampling/backfill-percgid-meta', () => {
     expect(lifecycleProbe.type).toBe('boolean');
     if (lifecycleProbe.type === 'boolean') expect(lifecycleProbe.value).toBe(false);
 
-    // The KC subject SHOULD have been copied.
     const kcProbe = await store.query(
-      `ASK { GRAPH <${target}> { <did:dkg:base:84532/0xDDD/5000001> <http://dkg.io/ontology/batchId> ?o } }`,
+      `ASK { GRAPH <${target}> { <${kc.ual}> <${DKG_NS}batchId> ?o } }`,
     );
     expect(kcProbe.type).toBe('boolean');
     if (kcProbe.type === 'boolean') expect(kcProbe.value).toBe(true);

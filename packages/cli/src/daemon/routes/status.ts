@@ -968,21 +968,27 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
   // prover tick returns `kc-not-synced`.
   //
   // For each subscribed CG that has an on-chain id, we copy the
-  // per-KC subset of `<cgName>/_meta` (subjects with a `dkg:batchId`
-  // triple, plus the KA UALs they reference via `dkg:partOf`, plus the
-  // publication URIs referenced via `dkg:authoredBy`) into
-  // `<cgName>/context/<cgId>/_meta`. Mirrors the publisher's own
-  // promotion in `dkg-publisher.ts:1407-1422` so the prover sees the
-  // exact same shape it would have seen on a fresh publish.
+  // per-KC subset of `<cgName>/_meta` into
+  // `<cgName>/context/<cgId>/_meta`. The "per-KC subset" matches the
+  // shape `generateKCMetadata` emits (`packages/publisher/src/metadata.ts`):
+  //   - KC UAL subjects (carry `dkg:batchId`, `dkg:merkleRoot`, `dkg:status`, …).
+  //   - KA UAL subjects (`<UAL/tokenId>`; identified by `dkg:partOf <KC>`).
+  //   - Publication URIs (`<urn:dkg:publication:opId>`; reached from a KA
+  //     via `<KA> dkg:publication <pub>`; carry `dkg:authoredBy`,
+  //     `dkg:Publication` type, etc).
+  //
+  // Granularity is PER-KC, not per-CG: each KC is gated by an
+  // independent `FILTER NOT EXISTS` against the target graph, so a
+  // mixed-state CG (some pre-fix KCs orphaned at `<cg>/_meta`, some
+  // post-fix KCs already in the per-cgId graph) gets only the missing
+  // KCs copied. Re-running the backfill after additional post-fix
+  // publishes is a no-op for KCs already present in the target.
   //
   // Body (all fields optional):
   //   {
   //     "contextGraphIds": ["foo", "bar"], // restrict to specific CG names; omit/empty for all subscribed
   //     "dryRun": true                     // probe-only: don't write, just report what would happen
   //   }
-  //
-  // Idempotent. Cores that already have a populated per-cgId meta graph
-  // are skipped with `status: "already-populated"`.
   if (req.method === 'POST' && path === '/api/random-sampling/backfill-percgid-meta') {
     const body = await readBody(req, SMALL_BODY_BYTES);
     let parsed: { contextGraphIds?: unknown; dryRun?: unknown };
@@ -1000,9 +1006,12 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
       contextGraphId: string;
       onChainId?: string;
       status: 'backfilled' | 'already-populated' | 'no-source-meta' | 'not-on-chain' | 'failed';
+      /** Total triples written (or that would be written, in dry-run). */
       copiedTriples?: number;
-      sourceTripleCount?: number;
-      preExistingTargetTripleCount?: number;
+      /** Distinct KCs that needed backfilling (rows where source had a KC absent from target). */
+      copiedKcCount?: number;
+      /** Distinct KCs present in `<cg>/_meta` regardless of target state — observability signal. */
+      sourceKcCount?: number;
       error?: string;
     };
 
@@ -1017,6 +1026,10 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
       cgEntries.push([cgName, String(sub.onChainId)]);
     }
 
+    const DKG_BATCH_ID = 'http://dkg.io/ontology/batchId';
+    const DKG_PART_OF = 'http://dkg.io/ontology/partOf';
+    const DKG_PUBLICATION = 'http://dkg.io/ontology/publication';
+
     const reports: CgReport[] = [];
     for (const [cgName, onChainId] of cgEntries) {
       if (!onChainId) {
@@ -1026,52 +1039,82 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
       const sourceMeta = `did:dkg:context-graph:${cgName}/_meta`;
       const targetMeta = contextGraphMetaUri(cgName, onChainId);
       try {
-        const preCount = await agent.store.query(
-          `SELECT (COUNT(*) AS ?n) WHERE { GRAPH <${targetMeta}> { ?s ?p ?o } }`,
+        // Total distinct KCs present in source — observability counter.
+        // Includes both KCs that need copying and KCs already in target.
+        const sourceKcResult = await agent.store.query(
+          `SELECT (COUNT(DISTINCT ?kc) AS ?n) WHERE { GRAPH <${sourceMeta}> { ?kc <${DKG_BATCH_ID}> ?bid } }`,
         );
-        const preTriples = preCount.type === 'bindings'
-          ? Number((preCount.bindings[0]?.['n'] as string ?? '"0"').replace(/^"|".*$/g, ''))
+        const sourceKcCount = sourceKcResult.type === 'bindings'
+          ? Number((sourceKcResult.bindings[0]?.['n'] as string ?? '"0"').replace(/^"|".*$/g, ''))
           : 0;
-        if (preTriples > 0) {
-          reports.push({
-            contextGraphId: cgName,
-            onChainId,
-            status: 'already-populated',
-            preExistingTargetTripleCount: preTriples,
-          });
+
+        if (sourceKcCount === 0) {
+          reports.push({ contextGraphId: cgName, onChainId, status: 'no-source-meta', sourceKcCount: 0 });
           continue;
         }
 
-        // CONSTRUCT the per-KC subset of source meta — three disjoint
-        // patterns matching the publisher's own promotion filter:
-        //   1. KC UAL subjects (have `dkg:batchId`).
-        //   2. KA UAL subjects (have `dkg:partOf <KC>` where KC has `dkg:batchId`).
-        //   3. Publication URIs referenced from a KC via `dkg:authoredBy`.
-        // SPARQL union ⇒ each ?s ?p ?o is duplicated per matching
-        // arm; store.insert is set-based so duplicates collapse.
+        // CONSTRUCT only the meta for KCs that are MISSING from the
+        // target per-cgId graph. Three UNION arms:
+        //   1. KC subjects (`?kc`) whose `dkg:batchId` is in source
+        //      but not in target.
+        //   2. KA subjects (`?ka`) whose parent KC is in that
+        //      missing-from-target set.
+        //   3. Publication subjects (`?pub`) reached from a KA via
+        //      `<KA> dkg:publication <pub>`. This is the actual
+        //      provenance shape `generateKCMetadata` emits — earlier
+        //      revisions of this endpoint used the wrong direction
+        //      (`<KC> dkg:authoredBy <pub>`) and silently dropped all
+        //      `dkg:Publication` / `dkg:authoredBy` triples (Codex
+        //      review on PR #763).
+        //
+        // The `FILTER NOT EXISTS` is anchored on the KC's `dkg:batchId`
+        // because every per-KC promotion writes that triple — so its
+        // presence in the target is the canonical signal that the KC
+        // (and its KAs + publication) are already there. Set semantics
+        // of `store.insert` mean accidentally re-inserting a quad is a
+        // no-op; the filter is for efficiency + clean diagnostic
+        // counts, not for correctness.
         const constructResult = await agent.store.query(`CONSTRUCT { ?s ?p ?o } WHERE {
           GRAPH <${sourceMeta}> {
             {
               ?s ?p ?o .
-              ?s <http://dkg.io/ontology/batchId> ?bid .
+              ?s <${DKG_BATCH_ID}> ?bid .
+              FILTER NOT EXISTS { GRAPH <${targetMeta}> { ?s <${DKG_BATCH_ID}> ?bidT } }
             } UNION {
               ?s ?p ?o .
-              ?s <http://dkg.io/ontology/partOf> ?kc .
-              ?kc <http://dkg.io/ontology/batchId> ?bid2 .
+              ?s <${DKG_PART_OF}> ?kc .
+              ?kc <${DKG_BATCH_ID}> ?bid2 .
+              FILTER NOT EXISTS { GRAPH <${targetMeta}> { ?kc <${DKG_BATCH_ID}> ?bidT2 } }
             } UNION {
               ?s ?p ?o .
-              ?kc2 <http://dkg.io/ontology/authoredBy> ?s .
-              ?kc2 <http://dkg.io/ontology/batchId> ?bid3 .
+              ?ka <${DKG_PUBLICATION}> ?s .
+              ?ka <${DKG_PART_OF}> ?kc3 .
+              ?kc3 <${DKG_BATCH_ID}> ?bid3 .
+              FILTER NOT EXISTS { GRAPH <${targetMeta}> { ?kc3 <${DKG_BATCH_ID}> ?bidT3 } }
             }
           }
         }`);
         const sourceQuads = constructResult.type === 'quads' ? constructResult.quads : [];
+
+        // Distinct KCs in the construct result — every backfilled KC
+        // shows up as at least one quad with itself as subject (the
+        // first UNION arm). De-duplicating by subject is the cleanest
+        // way to derive a per-KC count without a second SPARQL probe.
+        const copiedKcCount = new Set(
+          sourceQuads
+            .filter(q => sourceQuads.some(qq => qq.subject === q.subject && qq.predicate === DKG_BATCH_ID))
+            .map(q => q.subject),
+        ).size;
+
         if (sourceQuads.length === 0) {
+          // Source has KCs but none are missing from target — fully synced.
           reports.push({
             contextGraphId: cgName,
             onChainId,
-            status: 'no-source-meta',
-            sourceTripleCount: 0,
+            status: 'already-populated',
+            sourceKcCount,
+            copiedKcCount: 0,
+            copiedTriples: 0,
           });
           continue;
         }
@@ -1081,8 +1124,9 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
             contextGraphId: cgName,
             onChainId,
             status: 'backfilled',
+            sourceKcCount,
+            copiedKcCount,
             copiedTriples: sourceQuads.length,
-            sourceTripleCount: sourceQuads.length,
           });
           continue;
         }
@@ -1094,8 +1138,9 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
           contextGraphId: cgName,
           onChainId,
           status: 'backfilled',
+          sourceKcCount,
+          copiedKcCount,
           copiedTriples: targeted.length,
-          sourceTripleCount: sourceQuads.length,
         });
       } catch (err) {
         reports.push({

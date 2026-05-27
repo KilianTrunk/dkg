@@ -32,6 +32,7 @@ import {
 } from './config.js';
 import { ApiClient } from './api-client.js';
 import { parsePositiveIntegerOption, parsePositiveMsOption } from './publisher-runner.js';
+import { promptStoreBackend, applyStoreFlagsToConfig } from './store-wizard.js';
 import { runConfiguredSourceWorker } from './source-worker-runner.js';
 
 function isDaemonUnreachable(err: unknown): boolean {
@@ -602,6 +603,14 @@ program
   .command('init')
   .description('Interactive setup — set node name, role, and relay')
   .option('--role <role>', "Node role: 'edge' (default; personal laptop / behind NAT) or 'core' (24/7 relay / SLA)")
+  .option(
+    '--store <backend>',
+    'Pre-fill the triple-store backend prompt (oxigraph | blazegraph | sparql-http).',
+  )
+  .option(
+    '--store-url <url>',
+    'Pre-fill the SPARQL endpoint URL prompt for external backends.',
+  )
   .action(async (opts: ActionOpts) => {
     // OT-RFC-41 Bundle B1c: monorepo guard. `dkg init` from a
     // contributor checkout is almost always a mistake — the
@@ -630,6 +639,7 @@ program
       );
       process.exit(1);
     }
+
 
     await ensureDkgDir();
     const existing = await loadConfig();
@@ -666,6 +676,19 @@ program
       const roleAnswer = await ask('Node role (edge / core)', defaultRole);
       nodeRole = roleAnswer === 'core' ? 'core' : 'edge';
     }
+
+    // Triple-store backend (RFC 120, plan PR 2 item 1 + PR 3 Docker
+    // branch). Default: stay on local Oxigraph. Operators selecting
+    // "blazegraph" with a blank URL get the Docker convenience path
+    // (if Docker is installed) — the namespace name defaults to the
+    // node name so each operator gets their own DKG-owned namespace.
+    const { storeBlock } = await promptStoreBackend({
+      ask,
+      existingStore: existing.store,
+      flagBackend: opts.store,
+      flagUrl: opts.storeUrl,
+      nodeName: name || existing.name,
+    });
 
     // Pre-fill relay from network config if user hasn't set one.
     // Show the first relay as the default, but only persist to config if the
@@ -800,6 +823,11 @@ program
       autoUpdate: enableAutoUpdate ? autoUpdate : existing.autoUpdate,
       chain: chainSection ?? existing.chain,
       auth: { enabled: enableAuth, tokens: existing.auth?.tokens },
+      // Persist the chosen backend. `storeBlock === null` from the
+      // wizard means "use the local default" — we explicitly clear any
+      // existing block so re-running `dkg init` to switch from
+      // blazegraph back to oxigraph actually applies.
+      store: storeBlock ?? undefined,
     };
     await saveConfig(config);
 
@@ -823,6 +851,13 @@ program
     console.log(`  context graphs: ${contextGraphs.length ? contextGraphs.join(', ') : '(none)'}`);
     console.log(`  apiPort:    ${config.apiPort}`);
     console.log(`  auth:       ${enableAuth ? `enabled (token in ${dkgAuthTokenPath(dkgDir())})` : 'disabled'}`);
+    console.log(
+      `  store:      ${
+        storeBlock
+          ? `${storeBlock.backend} (${(storeBlock.options as { url: string }).url})`
+          : 'oxigraph (local default)'
+      }`,
+    );
     {
       const resolved = resolveAutoUpdateConfig(config, network);
       console.log(
@@ -1200,6 +1235,20 @@ program
       console.log(`  Uptime:    ${uptime}`);
       console.log(`  Peers:     ${s.connectedPeers}`);
       console.log(`  Relay:     ${s.relayConnected ? 'connected' : 'not connected'}`);
+      // Backend visibility: local backends print just the name (file
+      // bytes are graphed via /api/dashboard); external backends print
+      // backend + endpoint + quad count, falling back to a clear
+      // "unreachable" signal when the daemon couldn't talk to the
+      // remote store. Quad count = null is rare in practice (cached
+      // every 30 s on the daemon side) so when it shows up the
+      // operator should treat it as an alert, not a no-op.
+      const backend = s.storeBackend ?? 'oxigraph-worker';
+      if (s.storeUrl) {
+        const quads = s.storeQuads == null ? 'UNREACHABLE' : `${s.storeQuads.toLocaleString()} quads`;
+        console.log(`  Store:     ${backend} (${s.storeUrl}) — ${quads}`);
+      } else {
+        console.log(`  Store:     ${backend}`);
+      }
     } catch (err) {
       console.error(toErrorMessage(err));
       process.exit(1);
@@ -2382,6 +2431,14 @@ openclawCmd
   .option('--dry-run', 'Preview changes without writing anything')
   .option('--no-fund', 'Skip wallet funding via testnet faucet')
   .option('--fund', 'Fund wallets via testnet faucet (default)')
+  .option(
+    '--store <backend>',
+    'Triple-store backend (oxigraph | blazegraph | sparql-http). Validates the URL via an ASK probe and persists the store block after setup completes.',
+  )
+  .option(
+    '--store-url <url>',
+    'SPARQL endpoint URL — required when --store is blazegraph or sparql-http.',
+  )
   .action(async (opts, command) => {
     // Dynamic import + process.exit plumbing stay here; the actual `runSetup`
     // call lives in `openclawSetupAction` so it can be unit-tested without
@@ -2400,6 +2457,14 @@ openclawCmd
     const { openclawSetupAction } = await import('./openclaw-setup.js');
     try {
       await openclawSetupAction(opts, command, { runSetup });
+      // Persist --store / --store-url after the action's ensureDkgNodeConfig
+      // has run; otherwise the config file may not exist yet on a fresh
+      // install. Validation hits the same boot-time probe used by the
+      // daemon, so an invalid URL fails here, not on the next dkg start.
+      await applyStoreFlagsToConfig({
+        storeFlag: opts.store,
+        storeUrlFlag: opts.storeUrl,
+      });
     } catch (err: any) {
       console.error(`\n[setup] ERROR: ${err?.message ?? err}\n`);
       process.exit(1);
@@ -2456,6 +2521,14 @@ mcpCmd
   .option('--force', 'Refresh every detected client regardless of current registration state')
   .option('--print-only', 'Print the canonical JSON to stdout; skip every other step')
   .option('--yes', 'Auto-confirm per-client registrations (default false: prompt interactively in TTY mode; non-TTY auto-confirms — pass `--yes` in scripts for the safer scripted-environment posture)')
+  .option(
+    '--store <backend>',
+    'Triple-store backend (oxigraph | blazegraph | sparql-http). Validates the URL and persists the store block after setup.',
+  )
+  .option(
+    '--store-url <url>',
+    'SPARQL endpoint URL — required when --store is blazegraph or sparql-http.',
+  )
   .option('--installed', 'Force installed-mode setup. Bootstrap home: `~/.dkg`. Registered binary: the running CLI (whichever invoked this command — typically the global `dkg`). Use this from a monorepo cwd when you want the global install instead of the local dist. Mutually exclusive with --monorepo.')
   .option('--monorepo', 'Force monorepo-mode setup. Bootstrap home: `~/.dkg-dev`. Registered binary: the local `<repo>/packages/cli/dist/cli.js` script (located via cwd-first walk; falls back to the running CLI dir). Errors if no DKG monorepo root is detected. Switches BOTH bootstrap home AND the registered binary, unlike --installed which only switches the home. Mutually exclusive with --installed.')
   .action(async (opts) => {
@@ -2493,6 +2566,10 @@ mcpCmd
         requestFaucetFunding: coreExports.requestFaucetFunding,
         findDkgMonorepoRoot: coreExports.findDkgMonorepoRoot,
         resolveDkgConfigHome: coreExports.resolveDkgConfigHome,
+      });
+      await applyStoreFlagsToConfig({
+        storeFlag: opts.store,
+        storeUrlFlag: opts.storeUrl,
       });
     } catch (err: any) {
       console.error(`\n[dkg mcp setup] ERROR: ${err?.message ?? err}\n`);
@@ -2579,6 +2656,14 @@ hermesCmd
     '--no-replace-provider',
     'Alias for --preserve-provider',
   )
+  .option(
+    '--store <backend>',
+    'Triple-store backend (oxigraph | blazegraph | sparql-http). Validates the URL and persists the store block after setup.',
+  )
+  .option(
+    '--store-url <url>',
+    'SPARQL endpoint URL — required when --store is blazegraph or sparql-http.',
+  )
   .action(async (opts, command) => {
     const runSetup = await loadHermesAdapterAction('setup', ['runSetup', 'setup']);
     const { hermesSetupAction } = await import('./hermes-setup.js');
@@ -2590,6 +2675,10 @@ hermesCmd
         ? { ...opts, preserveProvider: true }
         : opts;
       await hermesSetupAction(merged, command, { runSetup });
+      await applyStoreFlagsToConfig({
+        storeFlag: opts.store,
+        storeUrlFlag: opts.storeUrl,
+      });
     } catch (err: any) {
       console.error(`\n[hermes setup] ERROR: ${err?.message ?? err}\n`);
       process.exit(1);
@@ -4668,7 +4757,7 @@ program
     const deps = createProductionDeps({ apiPort: config.apiPort ?? 9200 });
     // Overlay operator-configured scan roots + skipChecks from config.
     // The doctor namespace is opt-in — absent config means defaults.
-    const doctorConfig = (config as Record<string, unknown>).doctor as
+    const doctorConfig = (config as unknown as Record<string, unknown>).doctor as
       | { scanRoots?: unknown; skipChecks?: unknown }
       | undefined;
     if (doctorConfig) {

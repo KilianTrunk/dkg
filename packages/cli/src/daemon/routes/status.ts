@@ -57,6 +57,7 @@ const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
 import { enrichEvmError, MockChainAdapter, resolveRpcUrls } from '@origintrail-official/dkg-chain';
 import { DKGAgent, loadOpWallets } from '@origintrail-official/dkg-agent';
+import { isExternalBackend } from '@origintrail-official/dkg-storage';
 import { computeNetworkId, createOperationContext, DKGEvent, Logger, PayloadTooLargeError, GET_VIEWS, TrustLevel, validateSubGraphName, validateAssertionName, validateContextGraphId, isSafeIri, assertSafeIri, sparqlIri, contextGraphSharedMemoryUri, contextGraphAssertionUri, contextGraphMetaUri } from '@origintrail-official/dkg-core';
 import { findReservedSubjectPrefix, isSkolemizedUri } from '@origintrail-official/dkg-publisher';
 import {
@@ -402,6 +403,53 @@ function createRouteEvmProvider(rpcUrl: string, rpcUrls?: string[]): ethers.Json
   );
 }
 
+// Quad-count cache for external SPARQL backends. Every /api/status hit
+// otherwise issues a `SELECT (COUNT(*))` against the remote endpoint —
+// expensive on a large namespace, and the route is polled by the
+// dashboard, telemetry, and `dkg status` operators. 30 s TTL is short
+// enough that a fresh wipe / bulk publish shows up quickly without
+// flooding Blazegraph. Local backends bypass this entirely (file-bytes
+// metric stays on the metrics collector tick).
+const STORE_QUADS_CACHE_TTL_MS = 30_000;
+let storeQuadsCache: { value: number | null; fetchedAt: number } | null = null;
+let storeQuadsInflight: Promise<number | null> | null = null;
+
+async function getCachedExternalStoreQuads(
+  agent: DKGAgent,
+  now: number,
+): Promise<number | null> {
+  if (storeQuadsCache && now - storeQuadsCache.fetchedAt < STORE_QUADS_CACHE_TTL_MS) {
+    return storeQuadsCache.value;
+  }
+  if (storeQuadsInflight) return storeQuadsInflight;
+
+  storeQuadsInflight = (async () => {
+    try {
+      const r = await agent.store.query(
+        'SELECT (COUNT(*) AS ?c) WHERE { GRAPH ?g { ?s ?p ?o } }',
+      );
+      let value: number | null = null;
+      if (r.type === 'bindings' && r.bindings.length > 0) {
+        const cell = r.bindings[0].c ?? '';
+        const digits = cell.match(/\d+/)?.[0];
+        value = digits ? parseInt(digits, 10) : 0;
+      }
+      storeQuadsCache = { value, fetchedAt: Date.now() };
+      return value;
+    } catch {
+      // Surface "unknown" rather than a stale value; operators can
+      // distinguish unreachable from genuinely-empty via storeBackend +
+      // their network logs. Cache the null briefly to avoid hammering
+      // a flapping endpoint.
+      storeQuadsCache = { value: null, fetchedAt: Date.now() };
+      return null;
+    } finally {
+      storeQuadsInflight = null;
+    }
+  })();
+  return storeQuadsInflight;
+}
+
 async function getRegistryCacheSnapshot(): Promise<RegistryCacheSnapshot> {
   const now = Date.now();
   if (registryCache && now - registryCache.fetchedAt < REGISTRY_CACHE_TTL_MS) {
@@ -607,6 +655,21 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
       networkId: networkId.slice(0, 16),
       networkName: network?.networkName ?? null,
       storeBackend: config.store?.backend ?? "oxigraph-worker",
+      // External backend visibility (RFC 120 / plan PR 1 item 3). For
+      // local backends both fields stay null so the response shape is
+      // stable across deployments.
+      storeUrl: isExternalBackend(config.store?.backend)
+        ? (() => {
+            const opts = (config.store?.options ?? {}) as Record<string, unknown>;
+            const url = typeof opts.url === 'string' ? opts.url
+              : typeof opts.queryEndpoint === 'string' ? opts.queryEndpoint
+              : null;
+            return url;
+          })()
+        : null,
+      storeQuads: isExternalBackend(config.store?.backend)
+        ? await getCachedExternalStoreQuads(agent, Date.now())
+        : null,
       uptimeMs: Date.now() - startedAt,
       connectedPeers: uniquePeers.size,
       connections: {

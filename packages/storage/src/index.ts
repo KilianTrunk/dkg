@@ -10,6 +10,9 @@ export {
   type LargeLiteralStorageConfig,
   registerTripleStoreAdapter,
   createTripleStore,
+  isExternalBackend,
+  getSparqlEndpoint,
+  type SparqlEndpoint,
 } from './triple-store.js';
 export {
   EXTERNAL_LITERAL_REF_DATATYPE,

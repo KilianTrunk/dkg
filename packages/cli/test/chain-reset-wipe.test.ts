@@ -26,7 +26,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, mkdirSync, chmodSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { chainResetWipe } from '../src/daemon/chain-reset-wipe.js';
+import { chainResetWipe, detectBackendSwitch } from '../src/daemon/chain-reset-wipe.js';
 
 const STATE_FILE = '.network-state.json';
 const NEW_MARKER = 'v10-rs-staking-consolidation-2026-04-30';
@@ -62,9 +62,9 @@ afterEach(() => {
 });
 
 describe('chainResetWipe — opt-in protocol', () => {
-  it('is a no-op when network config has no marker (back-compat)', () => {
+  it('is a no-op when network config has no marker (back-compat)', async () => {
     seedAllFiles(dataDir);
-    const result = chainResetWipe({ dataDir, currentMarker: undefined });
+    const result = await chainResetWipe({ dataDir, currentMarker: undefined });
 
     expect(result.wiped).toBe(false);
     expect(result.prevMarker).toBeNull();
@@ -78,11 +78,11 @@ describe('chainResetWipe — opt-in protocol', () => {
 });
 
 describe('chainResetWipe — first boot with marker present', () => {
-  it('wipes and saves marker (the chain-reset rollout case)', () => {
+  it('wipes and saves marker (the chain-reset rollout case)', async () => {
     seedAllFiles(dataDir);
     const logs: string[] = [];
 
-    const result = chainResetWipe({
+    const result = await chainResetWipe({
       dataDir,
       currentMarker: NEW_MARKER,
       log: (msg) => logs.push(msg),
@@ -110,8 +110,8 @@ describe('chainResetWipe — first boot with marker present', () => {
     expect(logs.some((l) => l.includes('first detected'))).toBe(true);
   });
 
-  it('still records the marker on a fresh install with no chain-state files yet', () => {
-    const result = chainResetWipe({ dataDir, currentMarker: NEW_MARKER });
+  it('still records the marker on a fresh install with no chain-state files yet', async () => {
+    const result = await chainResetWipe({ dataDir, currentMarker: NEW_MARKER });
 
     expect(result.wiped).toBe(true);
     expect(result.removedFiles).toEqual([]);
@@ -120,14 +120,14 @@ describe('chainResetWipe — first boot with marker present', () => {
 });
 
 describe('chainResetWipe — same marker (steady state)', () => {
-  it('does nothing when persisted marker equals current', () => {
+  it('does nothing when persisted marker equals current', async () => {
     writeFileSync(
       join(dataDir, STATE_FILE),
       JSON.stringify({ chainResetMarker: NEW_MARKER, savedAt: Date.now() }),
     );
     seedAllFiles(dataDir);
 
-    const result = chainResetWipe({ dataDir, currentMarker: NEW_MARKER });
+    const result = await chainResetWipe({ dataDir, currentMarker: NEW_MARKER });
 
     expect(result.wiped).toBe(false);
     expect(result.prevMarker).toBe(NEW_MARKER);
@@ -138,7 +138,7 @@ describe('chainResetWipe — same marker (steady state)', () => {
 });
 
 describe('chainResetWipe — marker changed (chain reset)', () => {
-  it('wipes chain-state files and preserves operator state when marker differs', () => {
+  it('wipes chain-state files and preserves operator state when marker differs', async () => {
     writeFileSync(
       join(dataDir, STATE_FILE),
       JSON.stringify({ chainResetMarker: OLD_MARKER, savedAt: Date.now() - 86_400_000 }),
@@ -146,7 +146,7 @@ describe('chainResetWipe — marker changed (chain reset)', () => {
     seedAllFiles(dataDir);
 
     const logs: string[] = [];
-    const result = chainResetWipe({
+    const result = await chainResetWipe({
       dataDir,
       currentMarker: NEW_MARKER,
       log: (msg) => logs.push(msg),
@@ -183,7 +183,7 @@ describe('chainResetWipe — marker changed (chain reset)', () => {
     expect(logs.some((l) => l.includes('Wiping'))).toBe(true);
   });
 
-  it('handles missing chain-state files gracefully (subset wipe)', () => {
+  it('handles missing chain-state files gracefully (subset wipe)', async () => {
     writeFileSync(
       join(dataDir, STATE_FILE),
       JSON.stringify({ chainResetMarker: OLD_MARKER, savedAt: Date.now() }),
@@ -191,27 +191,27 @@ describe('chainResetWipe — marker changed (chain reset)', () => {
     // Only seed store.nq; the others don't exist on this node yet.
     writeFileSync(join(dataDir, 'store.nq'), '...');
 
-    const result = chainResetWipe({ dataDir, currentMarker: NEW_MARKER });
+    const result = await chainResetWipe({ dataDir, currentMarker: NEW_MARKER });
 
     expect(result.wiped).toBe(true);
     expect(result.removedFiles).toEqual(['store.nq']);
     expect(existsSync(join(dataDir, 'store.nq'))).toBe(false);
   });
 
-  it('is idempotent: a second call with the same input is a no-op', () => {
+  it('is idempotent: a second call with the same input is a no-op', async () => {
     writeFileSync(
       join(dataDir, STATE_FILE),
       JSON.stringify({ chainResetMarker: OLD_MARKER, savedAt: Date.now() }),
     );
     seedAllFiles(dataDir);
 
-    const first = chainResetWipe({ dataDir, currentMarker: NEW_MARKER });
+    const first = await chainResetWipe({ dataDir, currentMarker: NEW_MARKER });
     expect(first.wiped).toBe(true);
 
     // Re-seed the chain-state files to simulate "boot, work, boot again".
     writeFileSync(join(dataDir, 'store.nq'), '<s> <p> <o> .');
 
-    const second = chainResetWipe({ dataDir, currentMarker: NEW_MARKER });
+    const second = await chainResetWipe({ dataDir, currentMarker: NEW_MARKER });
     expect(second.wiped).toBe(false);
     expect(second.prevMarker).toBe(NEW_MARKER);
     expect(existsSync(join(dataDir, 'store.nq'))).toBe(true);
@@ -219,11 +219,11 @@ describe('chainResetWipe — marker changed (chain reset)', () => {
 });
 
 describe('chainResetWipe — corrupt state file', () => {
-  it('treats unparseable state as missing (first-boot semantics)', () => {
+  it('treats unparseable state as missing (first-boot semantics)', async () => {
     writeFileSync(join(dataDir, STATE_FILE), '{ this is not valid JSON');
     seedAllFiles(dataDir);
 
-    const result = chainResetWipe({ dataDir, currentMarker: NEW_MARKER });
+    const result = await chainResetWipe({ dataDir, currentMarker: NEW_MARKER });
 
     expect(result.wiped).toBe(true);
     expect(result.prevMarker).toBeNull();
@@ -238,7 +238,7 @@ describe('chainResetWipe — custom random-sampling WAL path (PR #357 feedback)'
   // their config keep a stale WAL across chain resets — the wipe was
   // hardcoding `dataDir/random-sampling.wal`. These tests pin the fix.
 
-  it('wipes the operator-supplied WAL path when set, not the default', () => {
+  it('wipes the operator-supplied WAL path when set, not the default', async () => {
     const customWal = join(dataDir, 'custom', 'rs.wal');
     mkdirSync(join(dataDir, 'custom'), { recursive: true });
     writeFileSync(customWal, 'WAL\n');
@@ -247,7 +247,7 @@ describe('chainResetWipe — custom random-sampling WAL path (PR #357 feedback)'
     writeFileSync(join(dataDir, 'random-sampling.wal'), 'STALE\n');
     writeFileSync(join(dataDir, 'store.nq'), '...');
 
-    const result = chainResetWipe({
+    const result = await chainResetWipe({
       dataDir,
       currentMarker: NEW_MARKER,
       randomSamplingWalPath: customWal,
@@ -259,10 +259,10 @@ describe('chainResetWipe — custom random-sampling WAL path (PR #357 feedback)'
     expect(existsSync(join(dataDir, 'random-sampling.wal'))).toBe(true);
   });
 
-  it('falls back to default WAL path when randomSamplingWalPath is empty', () => {
+  it('falls back to default WAL path when randomSamplingWalPath is empty', async () => {
     writeFileSync(join(dataDir, 'random-sampling.wal'), 'WAL\n');
 
-    const result = chainResetWipe({
+    const result = await chainResetWipe({
       dataDir,
       currentMarker: NEW_MARKER,
       randomSamplingWalPath: '',
@@ -272,13 +272,13 @@ describe('chainResetWipe — custom random-sampling WAL path (PR #357 feedback)'
     expect(existsSync(join(dataDir, 'random-sampling.wal'))).toBe(false);
   });
 
-  it('handles WAL path outside dataDir (absolute, e.g. /var/lib/dkg/wal)', () => {
+  it('handles WAL path outside dataDir (absolute, e.g. /var/lib/dkg/wal)', async () => {
     const externalWalDir = mkdtempSync(join(tmpdir(), 'dkg-external-wal-'));
     const externalWal = join(externalWalDir, 'rs.wal');
     writeFileSync(externalWal, 'EXTERNAL_WAL\n');
 
     try {
-      const result = chainResetWipe({
+      const result = await chainResetWipe({
         dataDir,
         currentMarker: NEW_MARKER,
         randomSamplingWalPath: externalWal,
@@ -300,7 +300,7 @@ describe('chainResetWipe — FS errors must not crash boot (PR #357 feedback)', 
   // to boot. Crashing here would create a worse failure mode (node down)
   // than the original problem (stale state).
 
-  it('logs and continues when saveState throws (e.g. read-only FS)', () => {
+  it('logs and continues when saveState throws (e.g. read-only FS)', async () => {
     // Make dataDir read-only so writeFileSync on the state file throws.
     // Skip on platforms where chmod 0o555 doesn't actually deny root or
     // where tests run as root (CI containers); the scenario we care
@@ -322,13 +322,13 @@ describe('chainResetWipe — FS errors must not crash boot (PR #357 feedback)', 
         // Good: FS denied the write. Now run the wipe.
       }
 
-      expect(() => {
+      await expect(
         chainResetWipe({
           dataDir,
           currentMarker: NEW_MARKER,
           log: (msg) => logsCaptured.push(msg),
-        });
-      }).not.toThrow();
+        }),
+      ).resolves.toBeDefined();
 
       // Loud log so operators can find this in journalctl.
       expect(logsCaptured.some((l) => l.includes('failed to persist chain reset marker'))).toBe(true);
@@ -337,7 +337,7 @@ describe('chainResetWipe — FS errors must not crash boot (PR #357 feedback)', 
     }
   });
 
-  it('does not save the marker when an individual file wipe throws', () => {
+  it('does not save the marker when an individual file wipe throws', async () => {
     writeFileSync(
       join(dataDir, STATE_FILE),
       JSON.stringify({ chainResetMarker: OLD_MARKER, savedAt: Date.now() }),
@@ -356,14 +356,12 @@ describe('chainResetWipe — FS errors must not crash boot (PR #357 feedback)', 
         // Good: removing from this directory is denied for this process.
       }
 
-      expect(() => {
-        const result = chainResetWipe({
-          dataDir,
-          currentMarker: NEW_MARKER,
-          log: (msg) => logsCaptured.push(msg),
-        });
-        expect(result.failedFiles.some((f) => f.file === 'store.nq')).toBe(true);
-      }).not.toThrow();
+      const result = await chainResetWipe({
+        dataDir,
+        currentMarker: NEW_MARKER,
+        log: (msg) => logsCaptured.push(msg),
+      });
+      expect(result.failedFiles.some((f) => f.file === 'store.nq')).toBe(true);
     } finally {
       chmodSync(dataDir, originalMode);
       rmSync(join(dataDir, '.probe'), { force: true });
@@ -372,5 +370,360 @@ describe('chainResetWipe — FS errors must not crash boot (PR #357 feedback)', 
     const persisted = JSON.parse(readFileSync(join(dataDir, STATE_FILE), 'utf8'));
     expect(persisted.chainResetMarker).toBe(OLD_MARKER);
     expect(logsCaptured.some((l) => l.includes('marker was not persisted'))).toBe(true);
+  });
+});
+
+// =====================================================================
+// External SPARQL wipe (RFC 120, plan PR 1 item 5b)
+// =====================================================================
+//
+// Operators who configure an external triple-store backend (Blazegraph
+// or sparql-http) need the same "stale state goes away on chain reset"
+// guarantee as Oxigraph operators get from the local file wipe. The
+// wipe runs a SPARQL UPDATE against the configured endpoint after the
+// local file wipe. Two modes:
+//
+//   - `managedByDkg: true` (Docker convenience path, PR 3): DROP ALL.
+//     Safe because the CLI owns the namespace exclusively.
+//   - operator-provided URL (default): scoped DELETE filtered by the
+//     V10 named-graph prefix `did:dkg:context-graph:` so V6/V8 nodes or
+//     unrelated data sharing the same Blazegraph instance survive.
+//
+// Failures append to `failedFiles`, marker is not persisted, wipe
+// retries on next boot — same partial-failure semantics as the local
+// file wipe.
+
+describe('chainResetWipe — external SPARQL wipe', () => {
+  type FetchCall = { url: string; init?: RequestInit };
+
+  function mockFetch(handler: (call: FetchCall) => Response | Promise<Response>) {
+    const calls: FetchCall[] = [];
+    const fn: typeof globalThis.fetch = (async (input: any, init?: any) => {
+      const call: FetchCall = { url: String(input), init };
+      calls.push(call);
+      return handler(call);
+    }) as typeof globalThis.fetch;
+    return { fn, calls };
+  }
+
+  function decodeUpdateBody(body: unknown): string {
+    const s = String(body ?? '');
+    if (!s.startsWith('update=')) return '';
+    return decodeURIComponent(s.slice('update='.length));
+  }
+
+  it('issues DROP ALL when storeConfig.options.managedByDkg=true', async () => {
+    writeFileSync(
+      join(dataDir, STATE_FILE),
+      JSON.stringify({ chainResetMarker: OLD_MARKER, savedAt: Date.now() }),
+    );
+    writeFileSync(join(dataDir, 'store.nq'), '<s> <p> <o> .');
+
+    const { fn, calls } = mockFetch(() => new Response(null, { status: 200 }));
+    const result = await chainResetWipe({
+      dataDir,
+      currentMarker: NEW_MARKER,
+      storeConfig: {
+        backend: 'blazegraph',
+        options: { url: 'http://blaze.test/sparql', managedByDkg: true },
+      },
+      fetch: fn,
+    });
+
+    expect(result.wiped).toBe(true);
+    expect(result.failedFiles).toEqual([]);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toBe('http://blaze.test/sparql');
+    expect(decodeUpdateBody(calls[0].init?.body)).toBe('DROP ALL');
+    expect(result.removedFiles.some((f) => f.includes('drop-all'))).toBe(true);
+  });
+
+  it('issues scoped DELETE when managedByDkg is false (operator URL — V6/V8 safety)', async () => {
+    writeFileSync(
+      join(dataDir, STATE_FILE),
+      JSON.stringify({ chainResetMarker: OLD_MARKER, savedAt: Date.now() }),
+    );
+    writeFileSync(join(dataDir, 'store.nq'), '<s> <p> <o> .');
+
+    const { fn, calls } = mockFetch(() => new Response(null, { status: 200 }));
+    const result = await chainResetWipe({
+      dataDir,
+      currentMarker: NEW_MARKER,
+      storeConfig: {
+        backend: 'blazegraph',
+        options: { url: 'http://shared-blaze.test/sparql' },
+      },
+      fetch: fn,
+    });
+
+    expect(result.wiped).toBe(true);
+    expect(calls).toHaveLength(1);
+    const update = decodeUpdateBody(calls[0].init?.body);
+    expect(update).toContain('DELETE');
+    expect(update).toContain('did:dkg:context-graph:');
+    expect(update).toContain('strstarts');
+    expect(update).not.toBe('DROP ALL');
+  });
+
+  it('records SPARQL failure in failedFiles + does not persist marker', async () => {
+    writeFileSync(
+      join(dataDir, STATE_FILE),
+      JSON.stringify({ chainResetMarker: OLD_MARKER, savedAt: Date.now() }),
+    );
+    writeFileSync(join(dataDir, 'store.nq'), '<s> <p> <o> .');
+
+    const { fn } = mockFetch(
+      () => new Response('endpoint exploded', { status: 500, statusText: 'Server Error' }),
+    );
+    const logs: string[] = [];
+    const result = await chainResetWipe({
+      dataDir,
+      currentMarker: NEW_MARKER,
+      storeConfig: {
+        backend: 'blazegraph',
+        options: { url: 'http://broken.test/sparql' },
+      },
+      fetch: fn,
+      log: (m) => logs.push(m),
+    });
+
+    expect(result.wiped).toBe(true);
+    expect(result.failedFiles).toHaveLength(1);
+    expect(result.failedFiles[0].file).toContain('scoped-delete');
+    expect(result.failedFiles[0].error).toContain('500');
+
+    // Local files still wiped (we don't gate file wipe on SPARQL).
+    expect(existsSync(join(dataDir, 'store.nq'))).toBe(false);
+
+    // Marker NOT persisted — retry on next boot.
+    const persisted = JSON.parse(readFileSync(join(dataDir, STATE_FILE), 'utf8'));
+    expect(persisted.chainResetMarker).toBe(OLD_MARKER);
+    expect(logs.some((l) => l.includes('Chain reset marker was not persisted'))).toBe(true);
+  });
+
+  it('records transport error in failedFiles', async () => {
+    writeFileSync(join(dataDir, 'store.nq'), '<s> <p> <o> .');
+
+    const fn: typeof globalThis.fetch = (async () => {
+      throw new Error('ECONNREFUSED');
+    }) as typeof globalThis.fetch;
+
+    const result = await chainResetWipe({
+      dataDir,
+      currentMarker: NEW_MARKER,
+      storeConfig: {
+        backend: 'blazegraph',
+        options: { url: 'http://nope.test/sparql' },
+      },
+      fetch: fn,
+    });
+
+    expect(result.failedFiles.some((f) => f.error.includes('ECONNREFUSED'))).toBe(true);
+  });
+
+  it('skips external wipe entirely for local backends (storeConfig present, backend oxigraph-worker)', async () => {
+    writeFileSync(join(dataDir, 'store.nq'), '<s> <p> <o> .');
+
+    const { fn, calls } = mockFetch(() => new Response(null, { status: 200 }));
+    const result = await chainResetWipe({
+      dataDir,
+      currentMarker: NEW_MARKER,
+      storeConfig: {
+        backend: 'oxigraph-worker',
+        // Options that LOOK like an external URL: these must be ignored
+        // because the backend itself is local. Otherwise an operator who
+        // hand-tuned options would see surprise SPARQL requests.
+        options: { url: 'http://ignored.test/sparql' as unknown as string },
+      },
+      fetch: fn,
+    });
+
+    expect(result.wiped).toBe(true);
+    expect(calls).toHaveLength(0);
+    expect(result.failedFiles).toEqual([]);
+  });
+
+  it('uses sparql-http updateEndpoint when configured separately from queryEndpoint', async () => {
+    writeFileSync(join(dataDir, 'store.nq'), '<s> <p> <o> .');
+
+    const { fn, calls } = mockFetch(() => new Response(null, { status: 200 }));
+    await chainResetWipe({
+      dataDir,
+      currentMarker: NEW_MARKER,
+      storeConfig: {
+        backend: 'sparql-http',
+        options: {
+          queryEndpoint: 'http://server.test/query',
+          updateEndpoint: 'http://server.test/update',
+          auth: 'Bearer t0ken',
+          managedByDkg: false,
+        },
+      },
+      fetch: fn,
+    });
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toBe('http://server.test/update');
+    const headers = (calls[0].init?.headers ?? {}) as Record<string, string>;
+    expect(headers.Authorization).toBe('Bearer t0ken');
+  });
+});
+
+// =====================================================================
+// Backend-switch detection (RFC 120 review point #6 / plan PR 1 item 8)
+// =====================================================================
+//
+// Without an explicit check, an operator who hand-edits
+// `config.store.backend` between boots gets a fresh empty backend and
+// no warning — looks identical to data loss. detectBackendSwitch tags
+// each boot's backend into the same `.network-state.json` file and
+// refuses to boot on mismatch unless `acceptStoreReset` is true.
+
+describe('detectBackendSwitch', () => {
+  it('records current backend on first boot (no state file) without warning', () => {
+    const logs: string[] = [];
+    const result = detectBackendSwitch({
+      dataDir,
+      currentBackend: 'oxigraph-worker',
+      acceptStoreReset: false,
+      log: (m) => logs.push(m),
+    });
+
+    expect(result.changed).toBe(false);
+    expect(result.previous).toBeNull();
+    expect(result.aborted).toBe(false);
+
+    const persisted = JSON.parse(readFileSync(join(dataDir, STATE_FILE), 'utf8'));
+    expect(persisted.lastBackend).toBe('oxigraph-worker');
+    // First-boot path is silent — no STORE-SWITCH warning header.
+    expect(logs.find((l) => l.includes('STORE-SWITCH'))).toBeUndefined();
+  });
+
+  it('records current backend on a legacy state file (lastBackend absent) without warning', () => {
+    // Legacy: state file from before this field was added. Has only
+    // chainResetMarker + savedAt.
+    writeFileSync(
+      join(dataDir, STATE_FILE),
+      JSON.stringify({ chainResetMarker: NEW_MARKER, savedAt: Date.now() }),
+    );
+
+    const logs: string[] = [];
+    const result = detectBackendSwitch({
+      dataDir,
+      currentBackend: 'blazegraph',
+      acceptStoreReset: false,
+      log: (m) => logs.push(m),
+    });
+
+    expect(result.changed).toBe(false);
+    expect(result.previous).toBeNull();
+    expect(result.aborted).toBe(false);
+
+    const persisted = JSON.parse(readFileSync(join(dataDir, STATE_FILE), 'utf8'));
+    expect(persisted.lastBackend).toBe('blazegraph');
+    // chainResetMarker must survive the backend-tag write.
+    expect(persisted.chainResetMarker).toBe(NEW_MARKER);
+  });
+
+  it('is a no-op when backend matches previous boot', () => {
+    writeFileSync(
+      join(dataDir, STATE_FILE),
+      JSON.stringify({ chainResetMarker: null, lastBackend: 'oxigraph-worker', savedAt: Date.now() }),
+    );
+
+    const logs: string[] = [];
+    const result = detectBackendSwitch({
+      dataDir,
+      currentBackend: 'oxigraph-worker',
+      acceptStoreReset: false,
+      log: (m) => logs.push(m),
+    });
+
+    expect(result.changed).toBe(false);
+    expect(result.previous).toBe('oxigraph-worker');
+    expect(result.aborted).toBe(false);
+    expect(logs).toEqual([]);
+  });
+
+  it('aborts boot on mismatch without acceptStoreReset, surfaces multi-line warning', () => {
+    writeFileSync(
+      join(dataDir, STATE_FILE),
+      JSON.stringify({ chainResetMarker: null, lastBackend: 'oxigraph-worker', savedAt: Date.now() }),
+    );
+
+    const logs: string[] = [];
+    const result = detectBackendSwitch({
+      dataDir,
+      currentBackend: 'blazegraph',
+      acceptStoreReset: false,
+      log: (m) => logs.push(m),
+    });
+
+    expect(result.changed).toBe(true);
+    expect(result.previous).toBe('oxigraph-worker');
+    expect(result.aborted).toBe(true);
+
+    const joined = logs.join('\n');
+    expect(joined).toMatch(/STORE-SWITCH/);
+    expect(joined).toMatch(/previous: oxigraph-worker/);
+    expect(joined).toMatch(/current:\s+blazegraph/);
+    expect(joined).toMatch(/DKG_ACCEPT_STORE_RESET=1/);
+
+    // State file MUST still record the old backend so a corrected
+    // config (operator reverts the edit) sees a match on next boot.
+    const persisted = JSON.parse(readFileSync(join(dataDir, STATE_FILE), 'utf8'));
+    expect(persisted.lastBackend).toBe('oxigraph-worker');
+  });
+
+  it('proceeds and updates state when acceptStoreReset=true', () => {
+    writeFileSync(
+      join(dataDir, STATE_FILE),
+      JSON.stringify({ chainResetMarker: null, lastBackend: 'oxigraph-worker', savedAt: Date.now() }),
+    );
+
+    const logs: string[] = [];
+    const result = detectBackendSwitch({
+      dataDir,
+      currentBackend: 'blazegraph',
+      acceptStoreReset: true,
+      log: (m) => logs.push(m),
+    });
+
+    expect(result.changed).toBe(true);
+    expect(result.aborted).toBe(false);
+
+    // Warning still surfaces so the choice is visible in journalctl,
+    // but with the "proceeding" tail rather than the "refusing" tail.
+    const joined = logs.join('\n');
+    expect(joined).toMatch(/STORE-SWITCH/);
+    expect(joined).toMatch(/proceeding/i);
+    expect(joined).not.toMatch(/Refusing to start/);
+
+    const persisted = JSON.parse(readFileSync(join(dataDir, STATE_FILE), 'utf8'));
+    expect(persisted.lastBackend).toBe('blazegraph');
+  });
+
+  it('coexists with chainResetWipe — wipe does not clobber the backend tag', async () => {
+    // Establish a baseline by running detectBackendSwitch first.
+    detectBackendSwitch({
+      dataDir,
+      currentBackend: 'oxigraph-worker',
+      acceptStoreReset: false,
+    });
+    expect(
+      JSON.parse(readFileSync(join(dataDir, STATE_FILE), 'utf8')).lastBackend,
+    ).toBe('oxigraph-worker');
+
+    // Now run a marker change — the wipe path persists chainResetMarker
+    // and MUST preserve lastBackend.
+    writeFileSync(join(dataDir, 'store.nq'), '<s> <p> <o> .');
+    await chainResetWipe({
+      dataDir,
+      currentMarker: NEW_MARKER,
+    });
+
+    const persisted = JSON.parse(readFileSync(join(dataDir, STATE_FILE), 'utf8'));
+    expect(persisted.chainResetMarker).toBe(NEW_MARKER);
+    expect(persisted.lastBackend).toBe('oxigraph-worker');
   });
 });

@@ -2,7 +2,7 @@ import type { Quad, TripleStore } from '@origintrail-official/dkg-storage';
 import type { ChainAdapter, OnChainPublishResult, AddBatchToContextGraphParams } from '@origintrail-official/dkg-chain';
 import { enrichEvmError } from '@origintrail-official/dkg-chain';
 import type { EventBus, OperationContext } from '@origintrail-official/dkg-core';
-import { DKGEvent, Logger, createOperationContext, sha256, encodeWorkspacePublishRequest, encodeEncryptedWorkspacePayload, encryptWorkspacePayload, contextGraphDataUri, contextGraphMetaUri, contextGraphAssertionUri, assertionLifecycleUri, contextGraphSubGraphUri, contextGraphSubGraphMetaUri, validateSubGraphName, isSafeIri, assertSafeIri, assertSafeRdfTerm, DKG_GOSSIP_MAX_MESSAGE_BYTES, type Ed25519Keypair, buildAuthorAttestationTypedData, AUTHOR_SCHEME_VERSION_V1, TrustLevel, TRUST_LEVEL_PREDICATE, assertNoUserAuthoredTrustLevelQuads, buildTrustLevelQuads, isTrustLevelQuad } from '@origintrail-official/dkg-core';
+import { DKGEvent, Logger, createOperationContext, sha256, encodeWorkspacePublishRequest, encodeEncryptedWorkspacePayload, encryptWorkspacePayload, contextGraphDataUri, contextGraphDataGraphUri, contextGraphMetaUri, contextGraphAssertionUri, assertionLifecycleUri, contextGraphSubGraphUri, contextGraphSubGraphMetaUri, SYSTEM_CONTEXT_GRAPHS, validateSubGraphName, isSafeIri, assertSafeIri, assertSafeRdfTerm, DKG_GOSSIP_MAX_MESSAGE_BYTES, type Ed25519Keypair, buildAuthorAttestationTypedData, AUTHOR_SCHEME_VERSION_V1, TrustLevel, TRUST_LEVEL_PREDICATE, assertNoUserAuthoredTrustLevelQuads, buildTrustLevelQuads, isTrustLevelQuad } from '@origintrail-official/dkg-core';
 import { GraphManager, PrivateContentStore } from '@origintrail-official/dkg-storage';
 import type { Publisher, PublishOptions, PublishResult, KAManifestEntry, PhaseCallback, V10CoreNodeACK } from './publisher.js';
 import { autoPartition } from './auto-partition.js';
@@ -948,6 +948,7 @@ export class DKGPublisher implements Publisher {
       rootEntities,
       quads: normalized,
       publisherPeerId: options.publisherPeerId,
+      agentAddress: options.senderAgentAddress,
       subGraphName: options.subGraphName,
       timestamp: operationTimestamp,
       publicSnapshotStore: this.publicSnapshotStore,
@@ -3088,71 +3089,462 @@ export class DKGPublisher implements Publisher {
   private async reconstructOwnershipFromGraph(
     ownershipKey: string, swmMetaGraph: string, DKG: string, PROV: string,
   ): Promise<number> {
-    const result = await this.store.query(
-      `SELECT ?entity ?creator WHERE { GRAPH <${swmMetaGraph}> { ?entity <${DKG}workspaceOwner> ?creator } }`,
+    const durableOwners = await this.loadValidatedSharedMemoryOwners(
+      swmMetaGraph,
+      DKG,
+      PROV,
+      undefined,
+      'reconstruct',
     );
-    if (result.type !== 'bindings' || result.bindings.length === 0) return 0;
-
-    const opsResult = await this.store.query(
-      `SELECT ?op ?peer ?root WHERE { GRAPH <${swmMetaGraph}> { ?op <${PROV}wasAttributedTo> ?peer . ?op <${DKG}rootEntity> ?root } }`,
-    );
-    const validatedOwners = new Map<string, Set<string>>();
-    if (opsResult.type === 'bindings') {
-      for (const row of opsResult.bindings) {
-        const root = row['root'];
-        const peer = row['peer'];
-        if (!root || !peer) continue;
-        const peerStr = peer.startsWith('"')
-          ? peer.replace(/^"/, '').replace(/"(\^\^<[^>]+>)?$/, '')
-          : peer;
-        if (!validatedOwners.has(root)) validatedOwners.set(root, new Set());
-        validatedOwners.get(root)!.add(peerStr);
-      }
-    }
+    if (durableOwners.size === 0) return 0;
 
     if (!this.sharedMemoryOwnedEntities.has(ownershipKey)) {
       this.sharedMemoryOwnedEntities.set(ownershipKey, new Map());
     }
     const ownedMap = this.sharedMemoryOwnedEntities.get(ownershipKey)!;
     let count = 0;
-    for (const row of result.bindings) {
-      const entity = row['entity'];
-      const creator = row['creator'];
-      if (!entity || !creator) continue;
-      const creatorStr = creator.startsWith('"')
-        ? creator.replace(/^"/, '').replace(/"(\^\^<[^>]+>)?$/, '')
-        : creator;
-
-      const validPeers = validatedOwners.get(entity);
-      if (!validPeers || !validPeers.has(creatorStr)) {
-        this.log.warn(
-          createOperationContext('reconstruct'),
-          `Skipping unvalidated ownership: entity=${entity} creator=${creatorStr}`,
-        );
-        continue;
-      }
-
+    for (const [entity, creator] of durableOwners) {
       if (ownedMap.has(entity)) {
         const existing = ownedMap.get(entity)!;
-        if (existing !== creatorStr) {
+        if (existing !== creator) {
           this.log.warn(
             createOperationContext('reconstruct'),
-            `Conflicting ownership for ${entity}: "${existing}" vs "${creatorStr}"; keeping alphabetically first`,
+            `Conflicting ownership for ${entity}: "${existing}" vs "${creator}"; keeping alphabetically first`,
           );
-          if (creatorStr < existing) ownedMap.set(entity, creatorStr);
+          setEffectiveOwner(ownedMap, entity, creator);
         }
         continue;
       }
 
-      ownedMap.set(entity, creatorStr);
+      ownedMap.set(entity, creator);
       count++;
     }
     return count;
   }
 
+  private async loadValidatedSharedMemoryOwners(
+    swmMetaGraph: string,
+    DKG: string,
+    PROV: string,
+    rootEntities: readonly string[] | undefined,
+    logOperation: 'reconstruct' | 'share',
+  ): Promise<Map<string, string>> {
+    const valuesClause = rootEntities?.length
+      ? `VALUES ?entity { ${rootEntities.map((root) => `<${assertSafeIri(root)}>`).join(' ')} }`
+      : '';
+
+    const ownershipResult = await this.store.query(
+      `SELECT DISTINCT ?entity ?creator WHERE {
+        GRAPH <${assertSafeIri(swmMetaGraph)}> {
+          ${valuesClause}
+          ?entity <${DKG}workspaceOwner> ?creator .
+        }
+      }`,
+    );
+    if (ownershipResult.type !== 'bindings' || ownershipResult.bindings.length === 0) {
+      return new Map();
+    }
+
+    // GH #748: prefer the dedicated `dkg:publisherPeerId` literal; fall
+    // back to a literal-form `prov:wasAttributedTo` for legacy un-migrated
+    // rows. Skip post-fix URI attribution — `workspaceOwner` (queried
+    // above) is always a peer-ID literal, so a URI `?creator` from
+    // `wasAttributedTo` would never match and every ownership row would
+    // be rejected as unvalidated. `FILTER(BOUND(?creator))` guards against
+    // an op having `rootEntity` but neither peer-ID source.
+    const operationResult = await this.store.query(
+      `SELECT DISTINCT ?entity ?creator WHERE {
+        GRAPH <${assertSafeIri(swmMetaGraph)}> {
+          ${valuesClause}
+          ?op <${DKG}rootEntity> ?entity .
+          OPTIONAL { ?op <${DKG}publisherPeerId> ?pidField }
+          OPTIONAL { ?op <${PROV}wasAttributedTo> ?attrField . FILTER(isLiteral(?attrField)) }
+          BIND(COALESCE(?pidField, ?attrField) AS ?creator)
+          FILTER(BOUND(?creator))
+        }
+      }`,
+    );
+
+    const validatedOwners = new Map<string, Set<string>>();
+    if (operationResult.type === 'bindings') {
+      for (const row of operationResult.bindings) {
+        const entity = row['entity'];
+        const creator = stripSparqlLiteral(row['creator']);
+        if (!entity || !creator) continue;
+        addOwner(validatedOwners, entity, creator);
+      }
+    }
+
+    const durableOwners = new Map<string, string>();
+    for (const row of ownershipResult.bindings) {
+      const entity = row['entity'];
+      const creator = stripSparqlLiteral(row['creator']);
+      if (!entity || !creator) continue;
+      const validPeers = validatedOwners.get(entity);
+      if (!validPeers?.has(creator)) {
+        this.log.warn(
+          createOperationContext(logOperation),
+          `Skipping unvalidated ownership: entity=${entity} creator=${creator}`,
+        );
+        continue;
+      }
+
+      const existing = durableOwners.get(entity);
+      if (existing && existing !== creator) {
+        this.log.warn(
+          createOperationContext(logOperation),
+          `Conflicting ownership for ${entity}: "${existing}" vs "${creator}"; keeping alphabetically first`,
+        );
+      }
+      setEffectiveOwner(durableOwners, entity, creator);
+    }
+
+    return durableOwners;
+  }
+
+  private async sharedMemoryOwnersForPromotion(
+    contextGraphId: string,
+    subGraphName: string | undefined,
+    ownershipKey: string,
+    rootEntities: readonly string[],
+  ): Promise<Map<string, string>> {
+    const owners = new Map<string, string>();
+    const liveOwned = this.sharedMemoryOwnedEntities.get(ownershipKey);
+    if (liveOwned) {
+      for (const [root, owner] of liveOwned) {
+        setEffectiveOwner(owners, root, owner);
+      }
+    }
+
+    if (rootEntities.length === 0) return owners;
+
+    const DKG = 'http://dkg.io/ontology/';
+    const PROV = 'http://www.w3.org/ns/prov#';
+    const swmMetaGraph = this.graphManager.sharedMemoryMetaUri(contextGraphId, subGraphName);
+    const durableOwners = await this.loadValidatedSharedMemoryOwners(
+      swmMetaGraph,
+      DKG,
+      PROV,
+      rootEntities,
+      'share',
+    );
+    if (durableOwners.size === 0) return owners;
+
+    if (!this.sharedMemoryOwnedEntities.has(ownershipKey)) {
+      this.sharedMemoryOwnedEntities.set(ownershipKey, new Map());
+    }
+    const hydratedOwned = this.sharedMemoryOwnedEntities.get(ownershipKey)!;
+
+    for (const [entity, creator] of durableOwners) {
+      setEffectiveOwner(owners, entity, creator);
+      setEffectiveOwner(hydratedOwned, entity, creator);
+    }
+
+    return owners;
+  }
+
   /** @deprecated Use reconstructSharedMemoryOwnership */
   async reconstructWorkspaceOwnership(): Promise<number> {
     return this.reconstructSharedMemoryOwnership();
+  }
+
+  /**
+   * One-shot startup migration for GH #748: rewrite SWM
+   * `prov:wasAttributedTo` from peer-ID string literals to agent DID
+   * URIs (`<did:dkg:agent:0x…>`). Idempotent — each CG carries a
+   * `<urn:dkg:migration:swm-attr-agent-did> dkg:appliedAt "<ts>"`
+   * marker in `_meta` after a successful pass; subsequent boots skip
+   * marked CGs. Best-effort: rows whose peer ID can't be resolved
+   * against the AGENTS system graph are left in place.
+   */
+  async migrateSwmAttributionToAgentDid(): Promise<{ rewritten: number; skipped: number; swmMetaGraphs: number }> {
+    // GH #748 Codex round 3: the AGENTS registry vocabulary is the spec-aligned
+    // `https://dkg.network/ontology#` namespace (see `buildAgentProfile` and
+    // `discovery.ts:findAgentByPeerId`), distinct from the internal
+    // `http://dkg.io/ontology/` namespace used by SWM meta predicates
+    // (`dkg:rootEntity`, `dkg:publisherPeerId`, `dkg:workspaceOwner`, etc.).
+    // The migration touches both: SWM meta predicates use DKG_INTERNAL; the
+    // AGENTS registry lookup uses DKG_REGISTRY. Confirmed against live data:
+    // a real node's `did:dkg:context-graph:agents` graph carries
+    // `https://dkg.network/ontology#peerId`, not `http://dkg.io/ontology/peerId`.
+    const DKG = 'http://dkg.io/ontology/';
+    const DKG_REGISTRY = 'https://dkg.network/ontology#';
+    const PROV = 'http://www.w3.org/ns/prov#';
+    const RDF = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#';
+    const XSD = 'http://www.w3.org/2001/XMLSchema#';
+    const SWM_META_SUFFIX = '/_shared_memory_meta';
+    const CG_PREFIX = 'did:dkg:context-graph:';
+    const MIGRATION_MARKER_SUBJECT = 'urn:dkg:migration:swm-attr-agent-did';
+    // Use the canonical AGENTS system-graph URI helper rather than hardcoding;
+    // `contextGraphDataGraphUri('agents')` yields `did:dkg:context-graph:agents`
+    // (no `/_data` suffix), which is where `registerAgent()` actually writes.
+    const AGENTS_GRAPH = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.AGENTS);
+    const ctx = createOperationContext('migrate-swm-attr');
+
+    let totalRewritten = 0;
+    let totalSkipped = 0;
+    // GH #748 Codex round 7: counts SWM-meta graphs processed (root + any
+    // sub-graph-scoped ones), not distinct context graphs — the migration
+    // operates per SWM-meta graph after the round-6 enumeration fix. Field
+    // name kept honest so the startup log doesn't over-report "CG(s)".
+    let swmMetaGraphsProcessed = 0;
+
+    try {
+      const peerToAddress = new Map<string, string | null>();
+      const allGraphs = await this.store.listGraphs();
+      // GH #748 Codex round 6 (user report): enumerate `_shared_memory_meta`
+      // graphs directly via `store.listGraphs()`. The earlier approach used
+      // `graphManager.listContextGraphs()`, but that helper filters out CG
+      // IDs containing a slash (storage/graph-manager.ts:104) to dedupe
+      // sub-graph paths — which also excludes legitimate curated CGs of the
+      // `<addr>/<slug>` shape (the on-chain-anchored ones a user is NOT the
+      // curator of). On a real node, that meant the migration silently
+      // skipped every curated CG and only touched bare-slug shadows.
+      // Iterating the SWM-meta graphs directly catches both forms (curated
+      // root + sub-graph-scoped) naturally — each graph is processed once,
+      // marker stored adjacent at `<...>/_meta`.
+      const swmMetaGraphs = allGraphs.filter(
+        g => g.startsWith(CG_PREFIX) && g.endsWith(SWM_META_SUFFIX),
+      );
+
+      for (const swmMetaGraph of swmMetaGraphs) {
+        // Defensive: skip system graphs even though they shouldn't carry SWM.
+        const cgPath = swmMetaGraph.slice(CG_PREFIX.length, swmMetaGraph.length - SWM_META_SUFFIX.length);
+        if (cgPath === 'agents' || cgPath === 'ontology') continue;
+
+        // Derive marker graph by swapping the suffix — works for root CG
+        // and sub-graph-scoped SWMs alike. Marker lives in the adjacent
+        // `_meta` graph so a SWM graph wipe doesn't accidentally re-arm
+        // the migration.
+        const markerGraph = `${CG_PREFIX}${cgPath}/_meta`;
+
+        const markerResult = await this.store.query(
+          `SELECT ?ts WHERE { GRAPH <${markerGraph}> { <${MIGRATION_MARKER_SUBJECT}> <${DKG}appliedAt> ?ts } } LIMIT 1`,
+        );
+        const markerPresent =
+          markerResult.type === 'bindings' && markerResult.bindings.length > 0;
+
+        // GH #748 (user-reported regression): the round-1 → round-6 delete
+        // logic used `store.delete([{ object: literalString }])` which
+        // silently no-op'd against `xsd:string`-typed literals on a
+        // persistent oxigraph store — the URI insert succeeded but the
+        // literal stayed. Affected stores end up with BOTH forms for the
+        // same subject. If a marker is present BUT subjects exist with
+        // BOTH a literal AND a URI `wasAttributedTo`, the previous pass
+        // was broken — override the marker so we re-process and clean up.
+        // Only this exact broken state triggers re-run; legitimate
+        // remaining literals (e.g. `"unknown"` permanent placeholders) do
+        // not, because they don't also have a URI counterpart.
+        if (markerPresent) {
+          const staleCheck = await this.store.query(
+            `ASK { GRAPH <${swmMetaGraph}> {
+              ?s <${PROV}wasAttributedTo> ?lit . FILTER(isLiteral(?lit))
+              ?s <${PROV}wasAttributedTo> ?uri . FILTER(isURI(?uri))
+            } }`,
+          );
+          const hasBrokenDuplicates = staleCheck.type === 'boolean' && staleCheck.value;
+          if (!hasBrokenDuplicates) continue;
+          // Drop the stale marker so we record a fresh `appliedAt`
+          // timestamp when the (now-fixed) pass completes.
+          await this.store.deleteByPattern({
+            graph: markerGraph,
+            subject: MIGRATION_MARKER_SUBJECT,
+            predicate: `${DKG}appliedAt`,
+          });
+        }
+
+        let swmRewritten = 0;
+        // GH #748 Codex round 4: track retriable vs permanent skips
+        // separately. Marker-block decision uses retriable only — permanent
+        // misses (sentinel `"unknown"`, empty string) can never be resolved,
+        // so they must not keep the migration hot on every boot.
+        let swmRetriableSkipped = 0;
+        let swmPermanentSkipped = 0;
+
+        const sparql = `SELECT ?s ?o WHERE { GRAPH <${swmMetaGraph}> { ?s <${PROV}wasAttributedTo> ?o . FILTER(isLiteral(?o)) } }`;
+        const result = await this.store.query(sparql);
+        if (result.type === 'bindings') {
+          for (const row of result.bindings) {
+            const subject = row['s'];
+            const objectLit = row['o'];
+            if (!subject || !objectLit) continue;
+
+            const peerId = objectLit.startsWith('"')
+              ? objectLit.replace(/^"/, '').replace(/"(\^\^<[^>]+>)?$/, '')
+              : objectLit;
+            // Permanent skip: the literal sentinel `"unknown"` (legacy
+            // `generateKCMetadata` placeholder when peer ID wasn't supplied)
+            // or empty — neither can ever resolve to an agent address.
+            if (!peerId || peerId === 'unknown') {
+              swmPermanentSkipped++;
+              continue;
+            }
+
+            let address: string | null;
+            if (peerToAddress.has(peerId)) {
+              address = peerToAddress.get(peerId)!;
+            } else {
+              address = await this.resolveAgentAddressForPeer(peerId, AGENTS_GRAPH, DKG_REGISTRY, RDF);
+              peerToAddress.set(peerId, address);
+            }
+
+            if (!address) {
+              // Retriable: AGENTS record might sync on a future boot.
+              swmRetriableSkipped++;
+              continue;
+            }
+
+            // Backward-compat: per-root snapshot rows historically stored the
+            // peer ID only via `wasAttributedTo`. If this subject has no
+            // `dkg:publisherPeerId` quad yet, materialise one from the literal
+            // we're about to rewrite — otherwise the post-fix readers (which
+            // now query `dkg:publisherPeerId` rather than `wasAttributedTo`)
+            // would lose the peer ID entirely for migrated rows.
+            const hasPeerIdField = await this.store.query(
+              `ASK { GRAPH <${swmMetaGraph}> { <${subject}> <${DKG}publisherPeerId> ?x } }`,
+            );
+            const peerIdFieldPresent =
+              hasPeerIdField.type === 'boolean' ? hasPeerIdField.value : false;
+            if (!peerIdFieldPresent) {
+              await this.store.insert([{
+                subject,
+                predicate: `${DKG}publisherPeerId`,
+                object: objectLit,
+                graph: swmMetaGraph,
+              }]);
+            }
+
+            // GH #748 (user-reported regression): use `deleteByPattern` rather
+            // than `store.delete([{ object: literalString }])`. Exact-match
+            // delete silently no-op'd against `xsd:string`-typed literals on
+            // a persistent oxigraph store — the literal stayed alongside the
+            // newly-inserted URI, leaving the legend with duplicate
+            // peer-ID + agent-DID attribution for every migrated row.
+            // Pattern-based delete is form-agnostic; safe to wipe all
+            // wasAttributedTo for this subject because writers only ever
+            // emit one (we're about to insert the canonical URI).
+            await this.store.deleteByPattern({
+              graph: swmMetaGraph,
+              subject,
+              predicate: `${PROV}wasAttributedTo`,
+            });
+            await this.store.insert([{
+              subject,
+              predicate: `${PROV}wasAttributedTo`,
+              object: `did:dkg:agent:${address}`,
+              graph: swmMetaGraph,
+            }]);
+            swmRewritten++;
+          }
+        }
+
+        // GH #748 Codex rounds 2 + 4: write the marker when there are no
+        // RETRIABLE misses left. Permanent placeholders (sentinel
+        // `"unknown"`) are never resolvable, so blocking the marker on them
+        // would keep the migration hot on every boot forever. Retriable
+        // misses (AGENTS record not yet synced) still suppress the marker so
+        // future boots retry. The re-run cost is bounded by the residual
+        // literal count — already-rewritten rows fail the `isLiteral(?o)`
+        // filter and contribute zero work.
+        if (swmRetriableSkipped === 0) {
+          await this.store.insert([{
+            subject: MIGRATION_MARKER_SUBJECT,
+            predicate: `${DKG}appliedAt`,
+            object: `"${new Date().toISOString()}"^^<${XSD}dateTime>`,
+            graph: markerGraph,
+          }]);
+        }
+
+        const swmSkipped = swmRetriableSkipped + swmPermanentSkipped;
+        totalRewritten += swmRewritten;
+        totalSkipped += swmSkipped;
+        swmMetaGraphsProcessed++;
+
+        if (swmRewritten > 0 || swmSkipped > 0) {
+          const retryNote = swmRetriableSkipped > 0
+            ? ` (${swmRetriableSkipped} will retry on next boot, ${swmPermanentSkipped} permanent placeholders)`
+            : swmPermanentSkipped > 0
+              ? ` (${swmPermanentSkipped} permanent placeholders)`
+              : '';
+          this.log.info(
+            ctx,
+            `SWM ${cgPath}: rewrote ${swmRewritten} attribution literal(s) to agent DID, left ${swmSkipped} unresolved${retryNote}`,
+          );
+        }
+      }
+
+      return { rewritten: totalRewritten, skipped: totalSkipped, swmMetaGraphs: swmMetaGraphsProcessed };
+    } catch (err) {
+      this.log.warn(
+        ctx,
+        `migrateSwmAttributionToAgentDid failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return { rewritten: totalRewritten, skipped: totalSkipped, swmMetaGraphs: swmMetaGraphsProcessed };
+    }
+  }
+
+  private async resolveAgentAddressForPeer(
+    peerId: string, agentsGraph: string, dkgRegistry: string, RDF: string,
+  ): Promise<string | null> {
+    // SPARQL string-literal escape: only `"` and `\` are special inside `"..."`.
+    const escaped = peerId.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+    // GH #748 Codex rounds 2, 3, 5: resolve the agent address for a peer ID.
+    // - Round 3: vocabulary is `https://dkg.network/ontology#` (the registry
+    //   namespace `buildAgentProfile` writes), NOT the internal
+    //   `http://dkg.io/ontology/` one — the latter matches zero rows.
+    // - Round 2: a libp2p PeerId can be shared across multiple registered
+    //   agents on the same node (multi-agent-per-node via
+    //   `DKGAgent.registerAgent`). Reject genuine cross-agent ambiguity.
+    // - Round 5: an upgraded store can legitimately have multiple AGENTS
+    //   records for the SAME agent — e.g. the legacy
+    //   `did:dkg:agent:<peerId>` subject (profile.ts fallback) plus the
+    //   canonical `did:dkg:agent:<address>` subject. Prefer the explicit
+    //   `dkg:agentAddress` literal as the source of truth, and dedup by
+    //   normalised address before deciding the mapping is ambiguous.
+    // - The fallback subject-URI parse handles records that pre-date the
+    //   `dkg:agentAddress` field and still encode the address only in the
+    //   subject (`did:dkg:agent:0x<40hex>`).
+    const sparql = `SELECT ?agent ?addr WHERE {
+      GRAPH <${agentsGraph}> {
+        ?agent <${RDF}type> <${dkgRegistry}Agent> ;
+               <${dkgRegistry}peerId> "${escaped}" .
+        OPTIONAL { ?agent <${dkgRegistry}agentAddress> ?addr }
+      }
+    }`;
+    const result = await this.store.query(sparql);
+    if (result.type !== 'bindings' || result.bindings.length === 0) return null;
+
+    const addresses = new Set<string>();
+    for (const row of result.bindings) {
+      const explicit = row['addr'];
+      if (explicit) {
+        // `dkg:agentAddress` is a literal — strip surrounding quotes.
+        const raw = explicit.startsWith('"')
+          ? explicit.replace(/^"/, '').replace(/"(\^\^<[^>]+>)?$/, '')
+          : explicit;
+        if (/^0x[0-9a-fA-F]{40}$/.test(raw)) {
+          addresses.add(raw.toLowerCase());
+          continue;
+        }
+      }
+      // Fallback: parse the subject URI for records without an explicit
+      // `agentAddress` field. Only accept the canonical wallet-DID shape
+      // — a legacy `did:dkg:agent:<peerId>` subject is NOT an address and
+      // contributes nothing useful here.
+      const agentUri = row['agent'];
+      if (agentUri && agentUri.startsWith('did:dkg:agent:')) {
+        const tail = agentUri.slice('did:dkg:agent:'.length);
+        if (/^0x[0-9a-fA-F]{40}$/.test(tail)) {
+          addresses.add(tail.toLowerCase());
+        }
+      }
+    }
+
+    // 0 distinct addresses → no resolvable mapping.
+    // 1 → unambiguous: same agent (possibly across multiple profile records).
+    // 2+ → genuinely multiple agents on this peer; refuse to mis-attribute.
+    if (addresses.size !== 1) return null;
+    return [...addresses][0];
   }
 
   private async deleteMetaForRoot(metaGraph: string, rootEntity: string): Promise<void> {
@@ -3404,6 +3796,12 @@ export class DKGPublisher implements Publisher {
 
     const swmMetaGraph = this.graphManager.sharedMemoryMetaUri(contextGraphId, opts?.subGraphName);
     const ownershipKey = opts?.subGraphName ? `${contextGraphId}\0${opts.subGraphName}` : contextGraphId;
+    const swmOwners = await this.sharedMemoryOwnersForPromotion(
+      contextGraphId,
+      opts?.subGraphName,
+      ownershipKey,
+      rootEntities,
+    );
     const swmOwned = this.sharedMemoryOwnedEntities.get(ownershipKey) ?? new Map<string, string>();
 
     // Pre-encode gossip message and enforce size limit BEFORE any destructive
@@ -3468,7 +3866,7 @@ export class DKGPublisher implements Publisher {
     // Rule 4: reject roots owned by a different peer before any mutations.
     const skippedRoots = new Set<string>();
     for (const root of rootEntities) {
-      const owner = swmOwned.get(root);
+      const owner = swmOwners.get(root);
       if (!owner) continue;
       if (opts?.publisherPeerId) {
         if (owner !== opts.publisherPeerId) {
@@ -3567,6 +3965,7 @@ export class DKGPublisher implements Publisher {
         rootEntities: effectiveRoots,
         quads: swmQuads,
         publisherPeerId: opts.publisherPeerId,
+        agentAddress,
         subGraphName: opts.subGraphName,
         timestamp: operationTimestamp,
         publicSnapshotStore: this.publicSnapshotStore,
@@ -3655,4 +4054,22 @@ function parseCountLiteral(val: string | false | undefined): number {
   const stripped = val.replace(/^"/, '').replace(/"(\^\^<[^>]+>)?$/, '');
   const n = Number(stripped);
   return Number.isFinite(n) ? n : NaN;
+}
+
+function stripSparqlLiteral(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  if (!value.startsWith('"')) return value;
+  return value.replace(/^"/, '').replace(/"(\^\^<[^>]+>)?$/, '');
+}
+
+function addOwner(owners: Map<string, Set<string>>, root: string, owner: string): void {
+  if (!owners.has(root)) owners.set(root, new Set());
+  owners.get(root)!.add(owner);
+}
+
+function setEffectiveOwner(owners: Map<string, string>, root: string, owner: string): void {
+  const existing = owners.get(root);
+  if (!existing || owner < existing) {
+    owners.set(root, owner);
+  }
 }

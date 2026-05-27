@@ -15,9 +15,11 @@ import { createEVMAdapter, getSharedContext, HARDHAT_KEYS } from '../../chain/te
 
 const CG_ID = 'test-assertion-cg';
 const SWM_GRAPH = `did:dkg:context-graph:${CG_ID}/_shared_memory`;
+const SWM_META_GRAPH = `did:dkg:context-graph:${CG_ID}/_shared_memory_meta`;
 const AGENT = '0x1234567890abcdef1234567890abcdef12345678';
 const AGENT_B = '0xabcdefabcdefabcdefabcdefabcdefabcdefabcd';
 const PEER = '12D3KooWPromoteBoundary';
+const PEER_B = '12D3KooWPromoteBoundaryB';
 const ASSERTION_NAME = 'my-assertion';
 
 const TRIPLES = [
@@ -111,6 +113,185 @@ describe('Working Memory Assertion Lifecycle', () => {
     expect(swmResult.type).toBe('bindings');
     if (swmResult.type === 'bindings') {
       expect(swmResult.bindings.length).toBe(3);
+    }
+  });
+
+  it('durable SWM ownership blocks cross-author promote after publisher restart with empty map', async () => {
+    const root = 'urn:test:entity:restart-owned';
+    const firstAssertion = 'restart-owner-a';
+    const secondAssertion = 'restart-owner-b';
+
+    await publisher.assertionCreate(CG_ID, firstAssertion, AGENT);
+    await publisher.assertionWrite(CG_ID, firstAssertion, AGENT, [
+      { subject: root, predicate: 'http://schema.org/name', object: '"Original"' },
+    ]);
+    await publisher.assertionPromote(CG_ID, firstAssertion, AGENT, { publisherPeerId: PEER });
+
+    const ownerBefore = await store.query(
+      `SELECT ?creator WHERE { GRAPH <${SWM_META_GRAPH}> { <${root}> <http://dkg.io/ontology/workspaceOwner> ?creator } }`,
+    );
+    expect(ownerBefore.type).toBe('bindings');
+    if (ownerBefore.type === 'bindings') {
+      expect(ownerBefore.bindings.map((row) => row['creator'])).toEqual([`"${PEER}"`]);
+    }
+
+    const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
+    const keypair = await generateEd25519Keypair();
+    const restartedPublisher = new DKGPublisher({
+      store,
+      chain,
+      eventBus: new TypedEventBus(),
+      keypair,
+      publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
+      publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
+      sharedMemoryOwnedEntities: new Map(),
+    });
+
+    await restartedPublisher.assertionCreate(CG_ID, secondAssertion, AGENT_B);
+    await restartedPublisher.assertionWrite(CG_ID, secondAssertion, AGENT_B, [
+      { subject: root, predicate: 'http://schema.org/name', object: '"Overwritten"' },
+    ]);
+
+    await expect(
+      restartedPublisher.assertionPromote(CG_ID, secondAssertion, AGENT_B, { publisherPeerId: PEER_B }),
+    ).rejects.toThrow(
+      `Cannot promote entity <${root}>: owned by peer ${PEER}, not by caller ${PEER_B}.`,
+    );
+
+    const remaining = await restartedPublisher.assertionQuery(CG_ID, secondAssertion, AGENT_B);
+    expect(remaining).toHaveLength(1);
+
+    const swmAfter = await store.query(
+      `SELECT ?o WHERE { GRAPH <${SWM_GRAPH}> { <${root}> <http://schema.org/name> ?o } }`,
+    );
+    expect(swmAfter.type).toBe('bindings');
+    if (swmAfter.type === 'bindings') {
+      expect(swmAfter.bindings.map((row) => row['o'])).toEqual(['"Original"']);
+    }
+
+    const ownerAfter = await store.query(
+      `SELECT ?creator WHERE { GRAPH <${SWM_META_GRAPH}> { <${root}> <http://dkg.io/ontology/workspaceOwner> ?creator } }`,
+    );
+    expect(ownerAfter.type).toBe('bindings');
+    if (ownerAfter.type === 'bindings') {
+      expect(ownerAfter.bindings.map((row) => row['creator'])).toEqual([`"${PEER}"`]);
+    }
+  });
+
+  it('durable SWM ownership allows owner promote after publisher restart with empty map', async () => {
+    const root = 'urn:test:entity:restart-owned-upsert';
+    const firstAssertion = 'restart-owner-upsert-a';
+    const secondAssertion = 'restart-owner-upsert-b';
+
+    await publisher.assertionCreate(CG_ID, firstAssertion, AGENT);
+    await publisher.assertionWrite(CG_ID, firstAssertion, AGENT, [
+      { subject: root, predicate: 'http://schema.org/name', object: '"Original"' },
+    ]);
+    await publisher.assertionPromote(CG_ID, firstAssertion, AGENT, { publisherPeerId: PEER });
+
+    const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
+    const keypair = await generateEd25519Keypair();
+    const restartedPublisher = new DKGPublisher({
+      store,
+      chain,
+      eventBus: new TypedEventBus(),
+      keypair,
+      publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
+      publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
+      sharedMemoryOwnedEntities: new Map(),
+    });
+
+    await restartedPublisher.assertionCreate(CG_ID, secondAssertion, AGENT_B);
+    await restartedPublisher.assertionWrite(CG_ID, secondAssertion, AGENT_B, [
+      { subject: root, predicate: 'http://schema.org/name', object: '"Updated"' },
+    ]);
+
+    const result = await restartedPublisher.assertionPromote(CG_ID, secondAssertion, AGENT_B, {
+      publisherPeerId: PEER,
+    });
+    expect(result.promotedCount).toBe(1);
+
+    const remaining = await restartedPublisher.assertionQuery(CG_ID, secondAssertion, AGENT_B);
+    expect(remaining).toHaveLength(0);
+
+    const swmAfter = await store.query(
+      `SELECT ?o WHERE { GRAPH <${SWM_GRAPH}> { <${root}> <http://schema.org/name> ?o } }`,
+    );
+    expect(swmAfter.type).toBe('bindings');
+    if (swmAfter.type === 'bindings') {
+      expect(swmAfter.bindings.map((row) => row['o'])).toEqual(['"Updated"']);
+    }
+
+    const ownerAfter = await store.query(
+      `SELECT ?creator WHERE { GRAPH <${SWM_META_GRAPH}> { <${root}> <http://dkg.io/ontology/workspaceOwner> ?creator } }`,
+    );
+    expect(ownerAfter.type).toBe('bindings');
+    if (ownerAfter.type === 'bindings') {
+      expect(ownerAfter.bindings.map((row) => row['creator'])).toEqual([`"${PEER}"`]);
+    }
+  });
+
+  it('durable SWM ownership collapses conflicts before owner promote after restart', async () => {
+    const root = 'urn:test:entity:restart-owned-conflict';
+    const firstAssertion = 'restart-owner-conflict-a';
+    const secondAssertion = 'restart-owner-conflict-b';
+    const conflictOperation = 'urn:dkg:share:test-assertion-cg:restart-owner-conflict';
+
+    await publisher.assertionCreate(CG_ID, firstAssertion, AGENT);
+    await publisher.assertionWrite(CG_ID, firstAssertion, AGENT, [
+      { subject: root, predicate: 'http://schema.org/name', object: '"Original"' },
+    ]);
+    await publisher.assertionPromote(CG_ID, firstAssertion, AGENT, { publisherPeerId: PEER });
+
+    await store.insert([
+      {
+        subject: root,
+        predicate: 'http://dkg.io/ontology/workspaceOwner',
+        object: `"${PEER_B}"`,
+        graph: SWM_META_GRAPH,
+      },
+      {
+        subject: conflictOperation,
+        predicate: 'http://dkg.io/ontology/rootEntity',
+        object: root,
+        graph: SWM_META_GRAPH,
+      },
+      {
+        subject: conflictOperation,
+        predicate: 'http://www.w3.org/ns/prov#wasAttributedTo',
+        object: `"${PEER_B}"`,
+        graph: SWM_META_GRAPH,
+      },
+    ]);
+
+    const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
+    const keypair = await generateEd25519Keypair();
+    const restartedPublisher = new DKGPublisher({
+      store,
+      chain,
+      eventBus: new TypedEventBus(),
+      keypair,
+      publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
+      publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
+      sharedMemoryOwnedEntities: new Map(),
+    });
+
+    await restartedPublisher.assertionCreate(CG_ID, secondAssertion, AGENT_B);
+    await restartedPublisher.assertionWrite(CG_ID, secondAssertion, AGENT_B, [
+      { subject: root, predicate: 'http://schema.org/name', object: '"Effective owner update"' },
+    ]);
+
+    const result = await restartedPublisher.assertionPromote(CG_ID, secondAssertion, AGENT_B, {
+      publisherPeerId: PEER,
+    });
+    expect(result.promotedCount).toBe(1);
+
+    const swmAfter = await store.query(
+      `SELECT ?o WHERE { GRAPH <${SWM_GRAPH}> { <${root}> <http://schema.org/name> ?o } }`,
+    );
+    expect(swmAfter.type).toBe('bindings');
+    if (swmAfter.type === 'bindings') {
+      expect(swmAfter.bindings.map((row) => row['o'])).toEqual(['"Effective owner update"']);
     }
   });
 
@@ -229,6 +410,389 @@ describe('Working Memory Assertion Lifecycle', () => {
       );
       expect(shareTransitions.length).toBe(1);
       expect(shareTransitions[0]['s']).toMatch(/^urn:dkg:share:/);
+    }
+  });
+
+  it('GH #748 migration: rewrites peer-ID literal wasAttributedTo → agent DID URI when AGENTS lookup hits, leaves miss as-is, backfills dkg:publisherPeerId on legacy per-root snapshots, skips marked CGs on re-run', async () => {
+    // Canonical AGENTS graph URI — `did:dkg:context-graph:agents` (no /_data
+    // suffix) per `contextGraphDataGraphUri('agents')` in @origintrail-official/dkg-core.
+    const AGENTS_GRAPH = 'did:dkg:context-graph:agents';
+    const CG_META = `did:dkg:context-graph:${CG_ID}/_meta`;
+    const SWM_META = `did:dkg:context-graph:${CG_ID}/_shared_memory_meta`;
+    const RDF_TYPE = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type';
+    const DKG = 'http://dkg.io/ontology/';
+    // GH #748 Codex round 3: AGENTS registry uses the spec-aligned
+    // `https://dkg.network/ontology#` namespace (same as `buildAgentProfile`
+    // in agent/profile.ts), not the internal `http://dkg.io/ontology/` one
+    // used by SWM meta predicates.
+    const DKG_REGISTRY = 'https://dkg.network/ontology#';
+    const PROV = 'http://www.w3.org/ns/prov#';
+
+    // Seed AGENTS registry: one peer with a known agent address, one without.
+    const PEER_KNOWN = '12D3KooWKnownPeer';
+    const PEER_UNKNOWN = '12D3KooWUnknownPeer';
+    // Lowercased per `canonicalAgentDidSubject` — matches what
+    // `buildAgentProfile` writes when registering an agent.
+    const ADDR_KNOWN = '0xaf7e932f79263f1a303790bd6c01b096f5334bbb';
+
+    await store.insert([
+      { subject: `did:dkg:agent:${ADDR_KNOWN}`, predicate: RDF_TYPE, object: `${DKG_REGISTRY}Agent`, graph: AGENTS_GRAPH },
+      { subject: `did:dkg:agent:${ADDR_KNOWN}`, predicate: `${DKG_REGISTRY}peerId`, object: `"${PEER_KNOWN}"`, graph: AGENTS_GRAPH },
+    ]);
+
+    // Seed SWM meta with three legacy rows that mirror real shapes:
+    //   - WorkspaceOperation (resolvable peer) — already has both
+    //     `dkg:publisherPeerId` and `prov:wasAttributedTo` (the new field
+    //     should NOT be re-inserted by the backfill).
+    //   - WorkspaceOperation (unresolved peer) — same two fields.
+    //   - Per-root snapshot (resolvable peer) — only `prov:wasAttributedTo`
+    //     literal, NO `dkg:publisherPeerId`. The migration must materialise
+    //     the peer-ID field from the literal before rewriting.
+    const OP_KNOWN = `urn:dkg:share:${CG_ID}:op-known`;
+    const OP_UNKNOWN = `urn:dkg:share:${CG_ID}:op-unknown`;
+    const SNAPSHOT_LEGACY = `urn:dkg:share:${CG_ID}:op-known:snapshot/urn:test:root`;
+    await store.insert([
+      { subject: OP_KNOWN, predicate: RDF_TYPE, object: `${DKG}WorkspaceOperation`, graph: SWM_META },
+      { subject: OP_KNOWN, predicate: `${DKG}publisherPeerId`, object: `"${PEER_KNOWN}"`, graph: SWM_META },
+      { subject: OP_KNOWN, predicate: `${PROV}wasAttributedTo`, object: `"${PEER_KNOWN}"`, graph: SWM_META },
+      { subject: OP_UNKNOWN, predicate: RDF_TYPE, object: `${DKG}WorkspaceOperation`, graph: SWM_META },
+      { subject: OP_UNKNOWN, predicate: `${DKG}publisherPeerId`, object: `"${PEER_UNKNOWN}"`, graph: SWM_META },
+      { subject: OP_UNKNOWN, predicate: `${PROV}wasAttributedTo`, object: `"${PEER_UNKNOWN}"`, graph: SWM_META },
+      // Legacy per-root snapshot row — wasAttributedTo only, no dkg:publisherPeerId
+      { subject: SNAPSHOT_LEGACY, predicate: `${PROV}wasAttributedTo`, object: `"${PEER_KNOWN}"`, graph: SWM_META },
+    ]);
+    // Ensure the CG itself appears in `listContextGraphs` so the migration
+    // visits its meta graph (the bare `_meta` graph plus any data is enough).
+    await store.insert([
+      { subject: `did:dkg:context-graph:${CG_ID}`, predicate: RDF_TYPE, object: `${DKG}ContextGraph`, graph: CG_META },
+    ]);
+
+    // First pass: rewrite resolvable rows (OP_KNOWN + SNAPSHOT_LEGACY = 2),
+    // leave the unresolved one, drop a marker.
+    const r1 = await publisher.migrateSwmAttributionToAgentDid();
+    expect(r1.rewritten).toBe(2);
+    expect(r1.skipped).toBe(1);
+
+    const rowsAfter = await store.query(
+      `SELECT ?s ?o WHERE { GRAPH <${SWM_META}> { ?s <${PROV}wasAttributedTo> ?o } }`,
+    );
+    expect(rowsAfter.type).toBe('bindings');
+    if (rowsAfter.type === 'bindings') {
+      const known = rowsAfter.bindings.find((b) => b['s'] === OP_KNOWN);
+      const unknown = rowsAfter.bindings.find((b) => b['s'] === OP_UNKNOWN);
+      const snapshot = rowsAfter.bindings.find((b) => b['s'] === SNAPSHOT_LEGACY);
+      // Resolvable rows → URI form (no surrounding quotes).
+      expect(known!['o']).toBe(`did:dkg:agent:${ADDR_KNOWN}`);
+      expect(snapshot!['o']).toBe(`did:dkg:agent:${ADDR_KNOWN}`);
+      // Unresolved peer → still a literal.
+      expect(unknown!['o']).toBe(`"${PEER_UNKNOWN}"`);
+    }
+
+    // Backward-compat backfill: SNAPSHOT_LEGACY had no `dkg:publisherPeerId`
+    // before the migration. After migration, it MUST carry the peer-ID
+    // literal materialised from the old `wasAttributedTo` value, so the
+    // post-fix readers (which now query `dkg:publisherPeerId`) still find it.
+    const peerIdAfter = await store.query(
+      `SELECT ?s ?o WHERE { GRAPH <${SWM_META}> { ?s <${DKG}publisherPeerId> ?o } }`,
+    );
+    expect(peerIdAfter.type).toBe('bindings');
+    if (peerIdAfter.type === 'bindings') {
+      const snapshotPid = peerIdAfter.bindings.find((b) => b['s'] === SNAPSHOT_LEGACY);
+      expect(snapshotPid).toBeDefined();
+      expect(snapshotPid!['o']).toBe(`"${PEER_KNOWN}"`);
+      // OP_KNOWN already had a dkg:publisherPeerId — the migration must NOT
+      // have duplicated it.
+      const opKnownPids = peerIdAfter.bindings.filter((b) => b['s'] === OP_KNOWN);
+      expect(opKnownPids.length).toBe(1);
+    }
+
+    // Codex round 2 Finding 6: marker is NOT written when cgSkipped > 0 (one
+    // unresolved row remained). Future boots must retry as AGENTS data syncs.
+    const markerAfter = await store.query(
+      `SELECT ?ts WHERE { GRAPH <${CG_META}> { <urn:dkg:migration:swm-attr-agent-did> <${DKG}appliedAt> ?ts } }`,
+    );
+    expect(markerAfter.type).toBe('bindings');
+    if (markerAfter.type === 'bindings') expect(markerAfter.bindings.length).toBe(0);
+
+    // Second pass with no AGENTS changes: nothing new to resolve, marker
+    // still not written, no churn — the literal-only filter eliminates the
+    // already-rewritten URI rows so we only retry the genuine unresolved one.
+    const r2 = await publisher.migrateSwmAttributionToAgentDid();
+    expect(r2.rewritten).toBe(0);
+    expect(r2.skipped).toBe(1);
+
+    // Add the previously-missing AGENTS record for the unresolved peer.
+    const ADDR_LATE = '0xba7e932f79263f1a303790bd6c01b096f5334bba';
+    await store.insert([
+      { subject: `did:dkg:agent:${ADDR_LATE}`, predicate: RDF_TYPE, object: `${DKG_REGISTRY}Agent`, graph: AGENTS_GRAPH },
+      { subject: `did:dkg:agent:${ADDR_LATE}`, predicate: `${DKG_REGISTRY}peerId`, object: `"${PEER_UNKNOWN}"`, graph: AGENTS_GRAPH },
+    ]);
+    // Third pass: the previously-unresolved row now resolves, and since
+    // cgSkipped reaches 0 the marker finally gets written.
+    const r3 = await publisher.migrateSwmAttributionToAgentDid();
+    expect(r3.rewritten).toBe(1);
+    expect(r3.skipped).toBe(0);
+    const markerFinal = await store.query(
+      `SELECT ?ts WHERE { GRAPH <${CG_META}> { <urn:dkg:migration:swm-attr-agent-did> <${DKG}appliedAt> ?ts } }`,
+    );
+    if (markerFinal.type === 'bindings') expect(markerFinal.bindings.length).toBe(1);
+
+    // Fourth pass: marker present → fast-path skip; no SPARQL work.
+    const r4 = await publisher.migrateSwmAttributionToAgentDid();
+    expect(r4.rewritten).toBe(0);
+    expect(r4.skipped).toBe(0);
+  });
+
+  it('GH #748 user-reported: stale literal duplicates from a broken previous pass are cleaned up despite marker present', async () => {
+    // Regression: round-1 → round-6 `store.delete([{ object: literalString }])`
+    // silently no-op'd against `xsd:string`-typed literals on a persistent
+    // store. The URI insert succeeded, leaving BOTH forms behind. The
+    // user's daemon ended up with 52 literals + 52 URIs after a single
+    // migration pass, with the marker set so subsequent boots wouldn't
+    // self-heal.
+    //
+    // This test seeds that exact end state — marker present + both literal
+    // AND URI form `wasAttributedTo` on the same subject — and asserts the
+    // next migration pass overrides the marker, deletes the literal via
+    // `deleteByPattern`, and writes a fresh marker.
+    const CG_META_LOCAL = `did:dkg:context-graph:${CG_ID}/_meta`;
+    const SWM_META_LOCAL = `did:dkg:context-graph:${CG_ID}/_shared_memory_meta`;
+    const AGENTS_GRAPH = 'did:dkg:context-graph:agents';
+    const RDF_TYPE = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type';
+    const DKG = 'http://dkg.io/ontology/';
+    const DKG_REGISTRY = 'https://dkg.network/ontology#';
+    const PROV = 'http://www.w3.org/ns/prov#';
+    const PEER = '12D3KooWStaleLiteralPeer';
+    const ADDR = '0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef';
+
+    await store.insert([
+      { subject: `did:dkg:agent:${ADDR}`, predicate: RDF_TYPE, object: `${DKG_REGISTRY}Agent`, graph: AGENTS_GRAPH },
+      { subject: `did:dkg:agent:${ADDR}`, predicate: `${DKG_REGISTRY}peerId`, object: `"${PEER}"`, graph: AGENTS_GRAPH },
+      { subject: `did:dkg:agent:${ADDR}`, predicate: `${DKG_REGISTRY}agentAddress`, object: `"${ADDR}"`, graph: AGENTS_GRAPH },
+    ]);
+
+    // Seed inconsistent state: WorkspaceOperation with BOTH literal and URI
+    // form `wasAttributedTo`, marker present from the broken previous pass.
+    const OP = `urn:dkg:share:${CG_ID}:op-stale-dup`;
+    await store.insert([
+      { subject: OP, predicate: RDF_TYPE, object: `${DKG}WorkspaceOperation`, graph: SWM_META_LOCAL },
+      { subject: OP, predicate: `${DKG}publisherPeerId`, object: `"${PEER}"`, graph: SWM_META_LOCAL },
+      { subject: OP, predicate: `${PROV}wasAttributedTo`, object: `"${PEER}"`, graph: SWM_META_LOCAL },
+      { subject: OP, predicate: `${PROV}wasAttributedTo`, object: `did:dkg:agent:${ADDR}`, graph: SWM_META_LOCAL },
+      { subject: 'urn:dkg:migration:swm-attr-agent-did', predicate: `${DKG}appliedAt`, object: `"2026-05-26T00:00:00.000Z"^^<http://www.w3.org/2001/XMLSchema#dateTime>`, graph: CG_META_LOCAL },
+    ]);
+
+    const r = await publisher.migrateSwmAttributionToAgentDid();
+    expect(r.rewritten).toBeGreaterThanOrEqual(1);
+
+    // After cleanup, exactly ONE wasAttributedTo (the URI form) remains.
+    const after = await store.query(
+      `SELECT ?o WHERE { GRAPH <${SWM_META_LOCAL}> { <${OP}> <${PROV}wasAttributedTo> ?o } }`,
+    );
+    if (after.type === 'bindings') {
+      expect(after.bindings.length).toBe(1);
+      expect(after.bindings[0]['o']).toBe(`did:dkg:agent:${ADDR}`);
+    }
+
+    // Marker still present, refreshed with a new timestamp (we deleted the
+    // stale one before re-running). Just assert presence.
+    const marker = await store.query(
+      `SELECT ?ts WHERE { GRAPH <${CG_META_LOCAL}> { <urn:dkg:migration:swm-attr-agent-did> <${DKG}appliedAt> ?ts } }`,
+    );
+    if (marker.type === 'bindings') expect(marker.bindings.length).toBe(1);
+  });
+
+  it('GH #748 Codex round 6: curated CG (<addr>/<slug> form) is migrated, not silently skipped', async () => {
+    // Regression for a user-reported bug: the previous version iterated
+    // `graphManager.listContextGraphs()`, which filters out IDs containing
+    // a slash — silently skipping every curated `<addr>/<slug>` CG (the
+    // ones a user is NOT the curator of). The migration now enumerates
+    // `_shared_memory_meta` graphs directly so both bare-slug and curated
+    // CGs are processed.
+    const CURATOR = '0xE5B88968Ed464F4e3f5354C54DFAB9e39dfEAfBd';
+    const CURATED_CG = `${CURATOR}/tuesday-cg-curated`;
+    const AGENTS_GRAPH = 'did:dkg:context-graph:agents';
+    const CURATED_META = `did:dkg:context-graph:${CURATED_CG}/_meta`;
+    const CURATED_SWM_META = `did:dkg:context-graph:${CURATED_CG}/_shared_memory_meta`;
+    const RDF_TYPE = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type';
+    const DKG = 'http://dkg.io/ontology/';
+    const DKG_REGISTRY = 'https://dkg.network/ontology#';
+    const PROV = 'http://www.w3.org/ns/prov#';
+    const PEER = '12D3KooWCuratedAgent';
+    const ADDR = '0xc7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7';
+
+    await store.insert([
+      { subject: `did:dkg:agent:${ADDR}`, predicate: RDF_TYPE, object: `${DKG_REGISTRY}Agent`, graph: AGENTS_GRAPH },
+      { subject: `did:dkg:agent:${ADDR}`, predicate: `${DKG_REGISTRY}peerId`, object: `"${PEER}"`, graph: AGENTS_GRAPH },
+      { subject: `did:dkg:agent:${ADDR}`, predicate: `${DKG_REGISTRY}agentAddress`, object: `"${ADDR}"`, graph: AGENTS_GRAPH },
+    ]);
+
+    // Seed a SWM op in the curated CG with the legacy literal shape.
+    const OP = `urn:dkg:share:${CURATED_CG}:op-curated`;
+    await store.insert([
+      { subject: OP, predicate: RDF_TYPE, object: `${DKG}WorkspaceOperation`, graph: CURATED_SWM_META },
+      { subject: OP, predicate: `${DKG}publisherPeerId`, object: `"${PEER}"`, graph: CURATED_SWM_META },
+      { subject: OP, predicate: `${PROV}wasAttributedTo`, object: `"${PEER}"`, graph: CURATED_SWM_META },
+      // No CG existence triple — the migration must find the SWM-meta
+      // graph by direct enumeration, not via `listContextGraphs()`.
+    ]);
+
+    const r = await publisher.migrateSwmAttributionToAgentDid();
+    expect(r.rewritten).toBeGreaterThanOrEqual(1);
+
+    // Curated CG's SWM-meta row was rewritten to URI form.
+    const after = await store.query(
+      `SELECT ?o WHERE { GRAPH <${CURATED_SWM_META}> { <${OP}> <${PROV}wasAttributedTo> ?o } }`,
+    );
+    if (after.type === 'bindings') {
+      expect(after.bindings.length).toBe(1);
+      expect(after.bindings[0]['o']).toBe(`did:dkg:agent:${ADDR}`);
+    }
+
+    // Marker landed in the adjacent CG `_meta` for the curated form (note
+    // the `<addr>/<slug>` segment is preserved verbatim in the marker path).
+    const marker = await store.query(
+      `SELECT ?ts WHERE { GRAPH <${CURATED_META}> { <urn:dkg:migration:swm-attr-agent-did> <${DKG}appliedAt> ?ts } }`,
+    );
+    if (marker.type === 'bindings') expect(marker.bindings.length).toBe(1);
+  });
+
+  it('GH #748 Codex round 4: permanent "unknown" sentinel does not block the marker', async () => {
+    // Legacy `generateKCMetadata` wrote `prov:wasAttributedTo "unknown"`
+    // when no peer ID was supplied. That value can never resolve to an
+    // agent address — it's permanent, not retriable. The migration must
+    // still write the per-CG marker so subsequent boots fast-path skip
+    // instead of re-scanning every time.
+    const AGENTS_GRAPH = 'did:dkg:context-graph:agents';
+    const CG_META = `did:dkg:context-graph:${CG_ID}/_meta`;
+    const SWM_META = `did:dkg:context-graph:${CG_ID}/_shared_memory_meta`;
+    const RDF_TYPE = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type';
+    const DKG = 'http://dkg.io/ontology/';
+    const PROV = 'http://www.w3.org/ns/prov#';
+
+    const OP = `urn:dkg:share:${CG_ID}:op-unknown-sentinel`;
+    await store.insert([
+      { subject: OP, predicate: RDF_TYPE, object: `${DKG}WorkspaceOperation`, graph: SWM_META },
+      { subject: OP, predicate: `${PROV}wasAttributedTo`, object: '"unknown"', graph: SWM_META },
+      { subject: `did:dkg:context-graph:${CG_ID}`, predicate: RDF_TYPE, object: `${DKG}ContextGraph`, graph: CG_META },
+    ]);
+
+    const r1 = await publisher.migrateSwmAttributionToAgentDid();
+    expect(r1.rewritten).toBe(0);
+    expect(r1.skipped).toBe(1); // counted as permanent skip
+
+    // Marker IS written even though one row was skipped (permanent).
+    const marker = await store.query(
+      `SELECT ?ts WHERE { GRAPH <${CG_META}> { <urn:dkg:migration:swm-attr-agent-did> <${DKG}appliedAt> ?ts } }`,
+    );
+    if (marker.type === 'bindings') expect(marker.bindings.length).toBe(1);
+
+    // The "unknown" literal is left in place — there's no real attribution
+    // to migrate to.
+    const after = await store.query(
+      `SELECT ?o WHERE { GRAPH <${SWM_META}> { <${OP}> <${PROV}wasAttributedTo> ?o } }`,
+    );
+    if (after.type === 'bindings') {
+      expect(after.bindings.length).toBe(1);
+      expect(after.bindings[0]['o']).toBe('"unknown"');
+    }
+
+    // Second pass: marker present → fast-path skip, no work.
+    const r2 = await publisher.migrateSwmAttributionToAgentDid();
+    expect(r2.rewritten).toBe(0);
+    expect(r2.skipped).toBe(0);
+  });
+
+  it('GH #748 Codex round 5: legacy + canonical AGENTS records for the same agent resolve unambiguously', async () => {
+    // Upgraded stores can carry two profile records for the same wallet:
+    // - the legacy `did:dkg:agent:<peerId>` subject (profile.ts fallback)
+    // - the canonical `did:dkg:agent:<address>` subject
+    // The resolver must dedupe by normalised address (preferring the
+    // explicit `dkg:agentAddress` literal) and treat them as one agent
+    // rather than rejecting as ambiguous.
+    const AGENTS_GRAPH = 'did:dkg:context-graph:agents';
+    const CG_META = `did:dkg:context-graph:${CG_ID}/_meta`;
+    const SWM_META = `did:dkg:context-graph:${CG_ID}/_shared_memory_meta`;
+    const RDF_TYPE = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type';
+    const DKG = 'http://dkg.io/ontology/';
+    const DKG_REGISTRY = 'https://dkg.network/ontology#';
+    const PROV = 'http://www.w3.org/ns/prov#';
+    const PEER = '12D3KooWUpgradedNode';
+    const ADDR = '0xaf7e932f79263f1a303790bd6c01b096f5334bbb';
+
+    await store.insert([
+      // Legacy profile: subject is the peer ID, no explicit agentAddress.
+      { subject: `did:dkg:agent:${PEER}`, predicate: RDF_TYPE, object: `${DKG_REGISTRY}Agent`, graph: AGENTS_GRAPH },
+      { subject: `did:dkg:agent:${PEER}`, predicate: `${DKG_REGISTRY}peerId`, object: `"${PEER}"`, graph: AGENTS_GRAPH },
+      // Canonical profile: subject is the wallet DID, explicit agentAddress literal.
+      { subject: `did:dkg:agent:${ADDR}`, predicate: RDF_TYPE, object: `${DKG_REGISTRY}Agent`, graph: AGENTS_GRAPH },
+      { subject: `did:dkg:agent:${ADDR}`, predicate: `${DKG_REGISTRY}peerId`, object: `"${PEER}"`, graph: AGENTS_GRAPH },
+      { subject: `did:dkg:agent:${ADDR}`, predicate: `${DKG_REGISTRY}agentAddress`, object: `"${ADDR}"`, graph: AGENTS_GRAPH },
+    ]);
+
+    const OP = `urn:dkg:share:${CG_ID}:op-legacy-canonical`;
+    await store.insert([
+      { subject: OP, predicate: RDF_TYPE, object: `${DKG}WorkspaceOperation`, graph: SWM_META },
+      { subject: OP, predicate: `${DKG}publisherPeerId`, object: `"${PEER}"`, graph: SWM_META },
+      { subject: OP, predicate: `${PROV}wasAttributedTo`, object: `"${PEER}"`, graph: SWM_META },
+      { subject: `did:dkg:context-graph:${CG_ID}`, predicate: RDF_TYPE, object: `${DKG}ContextGraph`, graph: CG_META },
+    ]);
+
+    const r = await publisher.migrateSwmAttributionToAgentDid();
+    expect(r.rewritten).toBe(1);
+    expect(r.skipped).toBe(0);
+
+    const after = await store.query(
+      `SELECT ?o WHERE { GRAPH <${SWM_META}> { <${OP}> <${PROV}wasAttributedTo> ?o } }`,
+    );
+    if (after.type === 'bindings') {
+      expect(after.bindings.length).toBe(1);
+      expect(after.bindings[0]['o']).toBe(`did:dkg:agent:${ADDR}`);
+    }
+  });
+
+  it('GH #748 Codex round 2: ambiguous peer→agent mapping (multi-agent-per-node) leaves literal in place', async () => {
+    // Two agents share the same libp2p peer ID (multi-agent-per-node, e.g.
+    // via `DKGAgent.registerAgent`). The resolver must NOT pick one
+    // arbitrarily — the migration leaves the legacy literal alone.
+    const AGENTS_GRAPH = 'did:dkg:context-graph:agents';
+    const CG_META = `did:dkg:context-graph:${CG_ID}/_meta`;
+    const SWM_META = `did:dkg:context-graph:${CG_ID}/_shared_memory_meta`;
+    const RDF_TYPE = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type';
+    const DKG = 'http://dkg.io/ontology/';
+    const PROV = 'http://www.w3.org/ns/prov#';
+    const PEER_SHARED = '12D3KooWMultiAgentNode';
+    const ADDR_A = '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+    const ADDR_B = '0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+    // GH #748 Codex round 3: registry namespace is `https://dkg.network/ontology#`.
+    const DKG_REGISTRY = 'https://dkg.network/ontology#';
+
+    await store.insert([
+      { subject: `did:dkg:agent:${ADDR_A}`, predicate: RDF_TYPE, object: `${DKG_REGISTRY}Agent`, graph: AGENTS_GRAPH },
+      { subject: `did:dkg:agent:${ADDR_A}`, predicate: `${DKG_REGISTRY}peerId`, object: `"${PEER_SHARED}"`, graph: AGENTS_GRAPH },
+      { subject: `did:dkg:agent:${ADDR_B}`, predicate: RDF_TYPE, object: `${DKG_REGISTRY}Agent`, graph: AGENTS_GRAPH },
+      { subject: `did:dkg:agent:${ADDR_B}`, predicate: `${DKG_REGISTRY}peerId`, object: `"${PEER_SHARED}"`, graph: AGENTS_GRAPH },
+    ]);
+
+    const OP = `urn:dkg:share:${CG_ID}:op-ambiguous`;
+    await store.insert([
+      { subject: OP, predicate: RDF_TYPE, object: `${DKG}WorkspaceOperation`, graph: SWM_META },
+      { subject: OP, predicate: `${DKG}publisherPeerId`, object: `"${PEER_SHARED}"`, graph: SWM_META },
+      { subject: OP, predicate: `${PROV}wasAttributedTo`, object: `"${PEER_SHARED}"`, graph: SWM_META },
+      { subject: `did:dkg:context-graph:${CG_ID}`, predicate: RDF_TYPE, object: `${DKG}ContextGraph`, graph: CG_META },
+    ]);
+
+    const r = await publisher.migrateSwmAttributionToAgentDid();
+    expect(r.rewritten).toBe(0);
+    expect(r.skipped).toBe(1);
+
+    // The row stays as a literal — no arbitrary attribution.
+    const after = await store.query(
+      `SELECT ?o WHERE { GRAPH <${SWM_META}> { <${OP}> <${PROV}wasAttributedTo> ?o } }`,
+    );
+    if (after.type === 'bindings') {
+      expect(after.bindings.length).toBe(1);
+      expect(after.bindings[0]['o']).toBe(`"${PEER_SHARED}"`);
     }
   });
 

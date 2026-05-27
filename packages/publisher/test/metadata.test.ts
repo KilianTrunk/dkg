@@ -121,6 +121,76 @@ describe('generateKCMetadata', () => {
     const kaSubjects = new Set(quads.filter(q => q.predicate === RDF_TYPE && q.object === `${DKG}KnowledgeAsset`).map(q => q.subject));
     expect(kaSubjects.size).toBe(2);
   });
+
+  it('GH #748 fallback: attribution is the peer-ID literal when neither agentAddress nor authorAddress is supplied', () => {
+    const quads = generateKCMetadata(makeMeta(), [makeKA()]);
+    const attribution = quads.find(q => q.subject === UAL && q.predicate === `${PROV}wasAttributedTo`);
+    expect(attribution).toBeDefined();
+    expect(attribution!.object).toBe('"12D3KooWTestPeer"');
+  });
+
+  it('GH #748: attribution is the agent DID URI when agentAddress is supplied', () => {
+    const ADDR = '0xaF7E932F79263f1A303790Bd6C01b096f5334BBB';
+    const quads = generateKCMetadata(makeMeta({ agentAddress: ADDR }), [makeKA()]);
+    const attribution = quads.find(q => q.subject === UAL && q.predicate === `${PROV}wasAttributedTo`);
+    expect(attribution).toBeDefined();
+    // GH #748 Codex round 3: EVM-shape addresses lowercased so the same
+    // wallet doesn't split into multiple RDF subjects (see `agentDid()`
+    // and `canonicalAgentDidSubject` in agent/profile.ts:20).
+    expect(attribution!.object).toBe(`did:dkg:agent:${ADDR.toLowerCase()}`);
+  });
+
+  it('GH #748: attribution falls back to authorAddress when agentAddress is omitted but publication provenance is set', () => {
+    const ADDR = '0x70997970C51812dc3A010C7d01b50e0d17dc79C8';
+    const quads = generateKCMetadata(
+      makeMeta({ authorAddress: ADDR, publishOperationId: 'op-x' }),
+      [makeKA()],
+    );
+    const attribution = quads.find(q => q.subject === UAL && q.predicate === `${PROV}wasAttributedTo`);
+    expect(attribution).toBeDefined();
+    // GH #748 Codex round 3: EVM-shape addresses lowercased so the same
+    // wallet doesn't split into multiple RDF subjects (see `agentDid()`
+    // and `canonicalAgentDidSubject` in agent/profile.ts:20).
+    expect(attribution!.object).toBe(`did:dkg:agent:${ADDR.toLowerCase()}`);
+  });
+
+  it('GH #748 Codex round 7: zero-address authorAddress is treated as unattributed (no fake agent DID)', () => {
+    // `publisherNodeIdentityIdOverride = 0` writes `authorAddress = 0x0…0`
+    // as the sentinel for "no author". The fallback chain must NOT mint a
+    // real-looking `did:dkg:agent:0x000…000` URI — fall through to the
+    // peer-ID literal so downstream provenance correctly reflects the
+    // unattributed publish.
+    const ZERO = '0x0000000000000000000000000000000000000000';
+    const quads = generateKCMetadata(
+      makeMeta({ authorAddress: ZERO, publishOperationId: 'op-x' }),
+      [makeKA()],
+    );
+    const attribution = quads.find(q => q.subject === UAL && q.predicate === `${PROV}wasAttributedTo`);
+    expect(attribution).toBeDefined();
+    // Must NOT be the synthesised zero-address agent DID.
+    expect(attribution!.object).not.toBe(`did:dkg:agent:${ZERO}`);
+    // Falls back to peer-ID literal — preserves the pre-fix unattributed shape.
+    expect(attribution!.object).toBe('"12D3KooWTestPeer"');
+  });
+
+  it('GH #748 Codex round 7: zero-address with mixed casing also treated as unattributed', () => {
+    // Sanity: case-insensitive zero-address detection.
+    const ZERO_MIXED = '0x0000000000000000000000000000000000000000';
+    const quads = generateKCMetadata(makeMeta({ agentAddress: ZERO_MIXED }), [makeKA()]);
+    const attribution = quads.find(q => q.subject === UAL && q.predicate === `${PROV}wasAttributedTo`);
+    expect(attribution!.object).toBe('"12D3KooWTestPeer"');
+  });
+
+  it('GH #748: explicit agentAddress takes precedence over authorAddress', () => {
+    const AGENT = '0xaF7E932F79263f1A303790Bd6C01b096f5334BBB';
+    const AUTHOR = '0x70997970C51812dc3A010C7d01b50e0d17dc79C8';
+    const quads = generateKCMetadata(
+      makeMeta({ agentAddress: AGENT, authorAddress: AUTHOR, publishOperationId: 'op-x' }),
+      [makeKA()],
+    );
+    const attribution = quads.find(q => q.subject === UAL && q.predicate === `${PROV}wasAttributedTo`);
+    expect(attribution!.object).toBe(`did:dkg:agent:${AGENT.toLowerCase()}`);
+  });
 });
 
 describe('generateKCMetadata — RFC-001 §3.5 publication provenance', () => {
@@ -322,6 +392,45 @@ describe('generateShareMetadata', () => {
     const preds = quads.map(q => q.predicate);
     expect(preds).toContain(`${DKG}publishedAt`);
     expect(preds).toContain('http://www.w3.org/ns/prov#wasAttributedTo');
+  });
+
+  it('GH #748 fallback: attribution is the peer-ID literal when agentAddress is omitted', () => {
+    const quads = generateShareMetadata(wsMeta, wsGraph);
+    const attribution = quads.find(q => q.predicate === 'http://www.w3.org/ns/prov#wasAttributedTo');
+    expect(attribution).toBeDefined();
+    expect(attribution!.object).toBe('"12D3KooWTestPeer"');
+  });
+
+  it('GH #748: attribution is the agent DID URI when agentAddress is supplied', () => {
+    const ADDR = '0xaF7E932F79263f1A303790Bd6C01b096f5334BBB';
+    const quads = generateShareMetadata(
+      { ...wsMeta, agentAddress: ADDR },
+      wsGraph,
+    );
+    const attribution = quads.find(q => q.predicate === 'http://www.w3.org/ns/prov#wasAttributedTo');
+    expect(attribution).toBeDefined();
+    // GH #748 Codex round 3: EVM-shape addresses lowercased to converge with
+    // `canonicalAgentDidSubject` in agent/profile.ts:20.
+    expect(attribution!.object).toBe(`did:dkg:agent:${ADDR.toLowerCase()}`);
+    // The peer ID is still recorded separately for transport-layer audit.
+    const peerIdQuad = quads.find(q => q.predicate === `${DKG}publisherPeerId`);
+    expect(peerIdQuad!.object).toBe('"12D3KooWTestPeer"');
+  });
+
+  it('GH #748 Codex round 3: agentDid lowercases EVM-shape addresses, passes through non-EVM', () => {
+    // EVM checksummed → lowercased (test via the share writer which calls agentDid)
+    const checksummedAddr = '0xaF7E932F79263f1A303790Bd6C01b096f5334BBB';
+    const lowerQuads = generateShareMetadata(
+      { ...wsMeta, agentAddress: checksummedAddr.toLowerCase() }, wsGraph,
+    );
+    const upperQuads = generateShareMetadata(
+      { ...wsMeta, agentAddress: checksummedAddr }, wsGraph,
+    );
+    const lowerAttr = lowerQuads.find(q => q.predicate === 'http://www.w3.org/ns/prov#wasAttributedTo');
+    const upperAttr = upperQuads.find(q => q.predicate === 'http://www.w3.org/ns/prov#wasAttributedTo');
+    // Same wallet, two casings, must converge on one DID.
+    expect(lowerAttr!.object).toBe(upperAttr!.object);
+    expect(lowerAttr!.object).toBe('did:dkg:agent:0xaf7e932f79263f1a303790bd6c01b096f5334bbb');
   });
 
   it('includes compact operation reference fields', () => {
@@ -551,6 +660,22 @@ describe('generateAssertionCreatedMetadata', () => {
       expect(q.graph).toBe(META_GRAPH);
     }
   });
+
+  it('emits dkg:subGraphName on the assertion subject when scoped to a sub-graph', () => {
+    const scopedLifecycleUri = assertionLifecycleUri(CONTEXT_GRAPH, AGENT_ADDR, ASSERTION, 'players');
+    const quads = generateAssertionCreatedMetadata({ ...meta, subGraphName: 'players' });
+    expect(quads).toContainEqual(expect.objectContaining({
+      subject: scopedLifecycleUri,
+      predicate: `${DKG}subGraphName`,
+      object: '"players"',
+      graph: META_GRAPH,
+    }));
+  });
+
+  it('omits dkg:subGraphName when assertion is in the root bucket', () => {
+    const quads = generateAssertionCreatedMetadata(meta);
+    expect(quads.find(q => q.predicate === `${DKG}subGraphName`)).toBeUndefined();
+  });
 });
 
 describe('generateAssertionPromotedMetadata', () => {
@@ -602,6 +727,22 @@ describe('generateAssertionPromotedMetadata', () => {
     expect(entities.map(q => q.object)).toContain('urn:test:alice');
     expect(entities.map(q => q.object)).toContain('urn:test:bob');
   });
+
+  it('emits dkg:subGraphName on the assertion subject when scoped to a sub-graph', () => {
+    const scopedLifecycleUri = assertionLifecycleUri(CONTEXT_GRAPH, AGENT_ADDR, ASSERTION, 'players');
+    const { insert } = generateAssertionPromotedMetadata({ ...meta, subGraphName: 'players' });
+    expect(insert).toContainEqual(expect.objectContaining({
+      subject: scopedLifecycleUri,
+      predicate: `${DKG}subGraphName`,
+      object: '"players"',
+      graph: META_GRAPH,
+    }));
+  });
+
+  it('omits dkg:subGraphName when assertion is in the root bucket', () => {
+    const { insert } = generateAssertionPromotedMetadata(meta);
+    expect(insert.find(q => q.predicate === `${DKG}subGraphName`)).toBeUndefined();
+  });
 });
 
 describe('generateAssertionPublishedMetadata', () => {
@@ -625,6 +766,22 @@ describe('generateAssertionPublishedMetadata', () => {
     const { insert } = generateAssertionPublishedMetadata(meta);
     const eventUri = findEventUriFromInsert(insert);
     expect(insert.find(q => q.subject === eventUri && q.predicate === `${DKG}kcUal`)!.object).toBe('did:dkg:kc:test-kc-001');
+  });
+
+  it('emits dkg:subGraphName on the assertion subject when scoped to a sub-graph', () => {
+    const scopedLifecycleUri = assertionLifecycleUri(CONTEXT_GRAPH, AGENT_ADDR, ASSERTION, 'players');
+    const { insert } = generateAssertionPublishedMetadata({ ...meta, subGraphName: 'players' });
+    expect(insert).toContainEqual(expect.objectContaining({
+      subject: scopedLifecycleUri,
+      predicate: `${DKG}subGraphName`,
+      object: '"players"',
+      graph: META_GRAPH,
+    }));
+  });
+
+  it('omits dkg:subGraphName when assertion is in the root bucket', () => {
+    const { insert } = generateAssertionPublishedMetadata(meta);
+    expect(insert.find(q => q.predicate === `${DKG}subGraphName`)).toBeUndefined();
   });
 });
 
@@ -654,6 +811,22 @@ describe('generateAssertionDiscardedMetadata', () => {
     const eventUri = findEventUriFromInsert(insert);
     expect(insert.find(q => q.subject === eventUri && q.predicate === `${DKG}fromLayer`)!.object).toBe(`"${MemoryLayer.WorkingMemory}"`);
     expect(insert.find(q => q.subject === eventUri && q.predicate === `${DKG}toLayer`)!.object).toBe('"none"');
+  });
+
+  it('emits dkg:subGraphName on the assertion subject when scoped to a sub-graph', () => {
+    const scopedLifecycleUri = assertionLifecycleUri(CONTEXT_GRAPH, AGENT_ADDR, ASSERTION, 'players');
+    const { insert } = generateAssertionDiscardedMetadata({ ...meta, subGraphName: 'players' });
+    expect(insert).toContainEqual(expect.objectContaining({
+      subject: scopedLifecycleUri,
+      predicate: `${DKG}subGraphName`,
+      object: '"players"',
+      graph: META_GRAPH,
+    }));
+  });
+
+  it('omits dkg:subGraphName when assertion is in the root bucket', () => {
+    const { insert } = generateAssertionDiscardedMetadata(meta);
+    expect(insert.find(q => q.predicate === `${DKG}subGraphName`)).toBeUndefined();
   });
 });
 

@@ -1058,6 +1058,20 @@ export class SharedMemoryHandler {
         if (metaQuads.length > 0) {
           await this.store.insert(metaQuads);
         }
+        // The gossip envelope carries the verified author address
+        // (`verifyAgentEnvelope` above already cryptographically bound
+        // it to `recovered`); use it for SWM `prov:wasAttributedTo` so
+        // attribution survives peer-key rotation. Falls back to peer-ID
+        // literal in the writer if envelope agentAddress is missing or
+        // unparseable. See GH #748.
+        let senderAgentAddress: string | undefined;
+        if (envelope?.agentAddress && envelope.agentAddress.length > 0) {
+          try {
+            senderAgentAddress = ethers.getAddress(envelope.agentAddress);
+          } catch {
+            senderAgentAddress = undefined;
+          }
+        }
         await storeWorkspaceOperationPublicQuads({
           store: this.store,
           graphManager: this.graphManager,
@@ -1066,6 +1080,7 @@ export class SharedMemoryHandler {
           rootEntities,
           quads: normalized,
           publisherPeerId,
+          agentAddress: senderAgentAddress,
           subGraphName,
           timestamp: operationTimestamp,
           publicSnapshotStore: this.publicSnapshotStore,

@@ -7,6 +7,7 @@
  * - FROM/FROM NAMED clauses in remote SPARQL are rejected
  * - Standard context-graph-scoped queries still work correctly
  */
+import { readFileSync } from 'node:fs';
 import { describe, it, expect, beforeEach } from 'vitest';
 import { OxigraphStore, type Quad } from '@origintrail-official/dkg-storage';
 import { DKGQueryEngine } from '../src/dkg-query-engine.js';
@@ -526,5 +527,15 @@ describe('I-009: SPARQL keyword detection — no false positives on literals/com
     );
     expect(response.status).toBe('ERROR');
     expect(response.error).toContain('FROM');
+  });
+});
+
+describe('caller documentation for named graph scope', () => {
+  it('documents that local GRAPH variables stay constrained by contextGraphId and view', () => {
+    const readme = readFileSync(new URL('../README.md', import.meta.url), 'utf8');
+
+    expect(readme).toContain('contextGraphId and view are authoritative');
+    expect(readme).toContain('GRAPH ?g');
+    expect(readme).toMatch(/constrained locally/i);
   });
 });

@@ -70,6 +70,7 @@ import {
   CIPHERTEXT_CHUNK_CATCHUP_WIRE_VERSION,
   encodeCiphertextChunkCatchupResponse,
   decodeCiphertextChunkCatchupRequest,
+  verifySignedCiphertextChunkCatchupRequest,
 } from '../src/swm/ciphertext-chunk-catchup.js';
 import type { ReliableSendResult } from '../src/p2p/messenger.js';
 
@@ -261,6 +262,17 @@ describe('DKGAgent.fetchCiphertextChunkFromPeer — initiator wiring (LU-11)', (
     expect(decoded.batchId).toEqual(batchId);
     expect(decoded.sig).toMatch(/^0x[0-9a-fA-F]{130}$/);
     expect(decoded.requesterEoa).toMatch(/^0x[0-9a-f]{40}$/);
+    // Codex review feedback: the shape check above only proves the
+    // sig field is hex-shaped — a regression in the `{r, vs}` →
+    // 65-byte serialization (the bridge between `chain.signMessage`
+    // and ethers-recoverable bytes) would pass the regex but FAIL
+    // on the responder side. Round-trip through the real verifier
+    // so the test pins the actual signing contract (digest binds
+    // the wire fields + sig recovers to the claimed EOA + freshness
+    // window).
+    const verification = verifySignedCiphertextChunkCatchupRequest(decoded, Date.now());
+    expect(verification.ok).toBe(true);
+    expect(verification.recoveredSigner).toBe(decoded.requesterEoa);
 
     // Persist landed under the CANONICAL graph (wire hash), which
     // matches the responder lookup site. Pre-#729 Bug 5 the persist
@@ -273,6 +285,81 @@ describe('DKGAgent.fetchCiphertextChunkFromPeer — initiator wiring (LU-11)', (
       chunkIndex: 0,
     });
     expect(persistedB64).toBe(`"${expectedCiphertextB64}"`);
+  });
+
+  it('canonicalChunkStoreCgIdOrNull returns null (unknown numeric CG id): persist falls back to ciphertextChunkStoreGraph(rawContextGraphId) — #729 Bug 5 mirror', async () => {
+    // Codex review feedback: the file header docstring claims this
+    // fallback is pinned, but no test actually exercises the
+    // `persistCanonical ?? contextGraphId` branch
+    // (`dkg-agent.ts:11150-11151`). The branch is the persist-side
+    // mirror of the responder's #729 Bug 5 fix — without it, the
+    // initiator could end up persisting under the canonical graph
+    // while the responder reads from the raw graph (or vice versa),
+    // causing a write/read address mismatch that silently drops
+    // backfilled chunks.
+    //
+    // To force canonicalization to return null we use a numeric
+    // `contextGraphId` ("42") with no entry in
+    // `subscribedContextGraphs` and no `onChainId` match — this
+    // hits `resolveLocalCgIdByOnChainId(42n) → null` and
+    // `canonicalChunkStoreCgIdOrNull` returns null via the `\d+`
+    // branch at `dkg-agent.ts:17048-17055`. The persist site then
+    // falls back to the raw `"42"` graph.
+    const boot = await bootAgent();
+    agent = boot.agent;
+    const internals = boot.internals;
+
+    const numericCgId = '42';
+    // Important: do NOT register "42" in subscribedContextGraphs —
+    // that's what makes canonicalChunkStoreCgIdOrNull return null.
+    // The closest analogue in production: a chain-event race window
+    // where the prover ticks before the local CG mapping arrives.
+    expect(internals.subscribedContextGraphs.has(numericCgId)).toBe(false);
+
+    const batchId = ethers.getBytes(ethers.id('canon-null-batch'));
+    const expectedCiphertext = new Uint8Array([0xC0, 0xDE]);
+    const expectedCiphertextB64 = Buffer.from(expectedCiphertext).toString('base64');
+
+    installStubMessenger(internals, async (): Promise<ReliableSendResult> => ({
+      delivered: true,
+      response: encodeCiphertextChunkCatchupResponse({
+        version: CIPHERTEXT_CHUNK_CATCHUP_WIRE_VERSION,
+        contextGraphId: numericCgId,
+        batchIdHex: ethers.hexlify(batchId),
+        chunkIndex: 0,
+        ciphertextB64: expectedCiphertextB64,
+      }),
+      attempts: 1,
+      messageId: 'm-canon-null',
+    }));
+
+    const resp = await agent.fetchCiphertextChunkFromPeer(REMOTE_PEER, numericCgId, batchId, 0, {
+      persist: true,
+    });
+    expect(resp.ciphertextB64).toBe(expectedCiphertextB64);
+
+    // Pin the fallback: persist landed under the RAW "42" graph
+    // (because the canonical resolver returned null), NOT under a
+    // synthesised `keccak("42")` graph (which is the pre-#729 bug
+    // shape — fabricating a keccak-of-decimal-string was the
+    // exact failure mode that dropped backfilled chunks).
+    const persistedAtRaw = await chunkPersistedAt(internals, {
+      canonicalCgId: numericCgId,
+      batchId,
+      chunkIndex: 0,
+    });
+    expect(persistedAtRaw).toBe(`"${expectedCiphertextB64}"`);
+
+    // And: nothing landed at `keccak("42")` (the misleading
+    // canonical-looking graph). Without this assertion the test
+    // would silently pass if the fallback were inverted.
+    const wrongGraph = internals.gossipWireIdFor(numericCgId);
+    const persistedAtWrongGraph = await chunkPersistedAt(internals, {
+      canonicalCgId: wrongGraph,
+      batchId,
+      chunkIndex: 0,
+    });
+    expect(persistedAtWrongGraph).toBeNull();
   });
 
   it('persist=false: no write to the store (random sampling prover path that wants in-memory bytes only)', async () => {
@@ -356,12 +443,19 @@ describe('DKGAgent.fetchCiphertextChunkFromPeer — initiator wiring (LU-11)', (
     internals.subscribedContextGraphs.set(cgId, { topic: cgId });
     const batchId = ethers.getBytes(ethers.id('transport-fail-batch'));
 
+    // Codex review feedback: `delivered: false` only admits two
+    // variants on `ReliableSendResult` — `{queued: true, ...,
+    // nextAttemptAtMs}` (durable retry, the realistic transport-
+    // failure shape) or `{queued: false, inFlight: true, attempts: 0}`
+    // (sender-side dedup). Use the durable-retry shape so the test
+    // pins the real production contract.
     installStubMessenger(internals, async (): Promise<ReliableSendResult> => ({
       delivered: false,
-      queued: false,
-      attempts: 3,
+      queued: true,
+      attempts: 1,
       messageId: 'm-fail',
       error: 'peer-not-reachable',
+      nextAttemptAtMs: Date.now() + 60_000,
     }));
 
     await expect(

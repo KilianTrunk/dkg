@@ -326,6 +326,21 @@ describe('DKGQueryEngine', () => {
     ).rejects.toThrow(/Scoped query violation: GRAPH <did:dkg:context-graph:other-agent-registry> is outside the allowed graph set/i);
   });
 
+  it('rejects prefixed explicit GRAPH targets that cannot be validated against the scoped graph set', async () => {
+    const otherGraph = 'did:dkg:context-graph:other-agent-registry';
+    await store.insert([
+      q('urn:secret:entity', 'http://schema.org/name', '"Secret"', otherGraph),
+    ]);
+
+    await expect(
+      engine.query(
+        `PREFIX other: <${otherGraph}>
+         SELECT ?name WHERE { GRAPH other: { ?s <http://schema.org/name> ?name } }`,
+        { contextGraphId: CONTEXT_GRAPH },
+      ),
+    ).rejects.toThrow(/Scoped query violation: GRAPH target must be a variable or explicit IRI/i);
+  });
+
   it('constrains GRAPH variables to the scoped context graph data graph', async () => {
     await store.insert([
       q('urn:other:entity', 'http://schema.org/name', '"OtherGraph"', 'did:dkg:context-graph:other-agent-registry'),

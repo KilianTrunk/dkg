@@ -484,6 +484,8 @@ function hasCallerDatasetClause(sparql: string): boolean {
 }
 
 function assertExplicitGraphIrisAllowed(sparql: string, allowedGraphs: string[]): void {
+  assertNoUnvalidatedExplicitGraphTargets(sparql);
+
   const allowed = new Set(allowedGraphs);
   for (const graphIri of collectExplicitGraphIris(sparql)) {
     if (!allowed.has(graphIri)) {
@@ -491,6 +493,57 @@ function assertExplicitGraphIrisAllowed(sparql: string, allowedGraphs: string[])
         `GRAPH <${graphIri}> is outside the allowed graph set`,
       );
     }
+  }
+}
+
+function assertNoUnvalidatedExplicitGraphTargets(sparql: string): void {
+  const n = sparql.length;
+  let i = 0;
+
+  while (i < n) {
+    const ch = sparql[i];
+    if (ch === '#') {
+      while (i < n && sparql[i] !== '\n') i++;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      i = skipSparqlStringLiteral(sparql, i);
+      continue;
+    }
+    if (ch === '<') {
+      const end = skipSparqlIriRef(sparql, i);
+      i = end ?? i + 1;
+      continue;
+    }
+    if (isKeywordStart(sparql, i)) {
+      let j = i + 1;
+      while (j < n && isWordContinuation(sparql[j])) j++;
+      const word = sparql.slice(i, j);
+      if (word.toUpperCase() === 'GRAPH') {
+        const operandStart = skipSparqlSpaceAndLineComments(sparql, j);
+        const variable = readSparqlVariable(sparql, operandStart);
+        if (variable) {
+          i = operandStart + variable.length;
+          continue;
+        }
+        if (sparql[operandStart] === '<') {
+          const iriEnd = skipSparqlIriRef(sparql, operandStart);
+          if (!iriEnd) {
+            throw new ScopedQueryViolationError(
+              'GRAPH target must be a variable or explicit IRI on scoped queries',
+            );
+          }
+          i = iriEnd;
+          continue;
+        }
+        throw new ScopedQueryViolationError(
+          'GRAPH target must be a variable or explicit IRI on scoped queries',
+        );
+      }
+      i = j;
+      continue;
+    }
+    i++;
   }
 }
 

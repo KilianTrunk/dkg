@@ -29,6 +29,7 @@ import {
   SWM_SENDER_KEY_PACKAGE_VERSION,
   SWM_SENDER_KEY_PACKAGE_ACK_TYPE,
   encodeSwmSenderKeyPackageAck,
+  decodeSwmSenderKeyPackage,
   generateWorkspaceRecipientEncryptionKey,
   type OperationContext,
 } from '@origintrail-official/dkg-core';
@@ -380,12 +381,21 @@ describe('createAndDistributeSwmSenderKeyEpoch: parallel fanout latency', () => 
 
     // Messenger discrimination:
     //  - recipientFatal: always reject (genuine fatal)
-    //  - recipientB peerId: reject the FIRST call (key A), accept
-    //    the SECOND (key B). Both calls are to the same peerId so
-    //    we count per-peer ordinals.
+    //  - recipientB peerId: reject the call carrying keyAId, accept
+    //    the call carrying keyBId. Both calls go to the SAME peerId
+    //    so we need a STABLE per-key discriminator — Codex review
+    //    feedback on the prior revision: keying off the per-peer
+    //    call ordinal was order-dependent because the fanout's
+    //    `createSignedSwmSenderKeyPackage` runs per-recipient in
+    //    parallel and the two sends can race to the messenger in
+    //    either order. The `SwmSenderKeyPackage` proto encodes
+    //    `recipientKeyId` as a top-level plaintext field (the
+    //    recipient needs it to pick the right decryption key), so
+    //    we decode the payload and key the decision off that.
     //  - everyone else: accept.
     const callsByPeer = new Map<string, number>();
-    installStubMessenger(internals, async (sendPeerId): Promise<ReliableSendResult> => {
+    const seenKeyIds: string[] = [];
+    installStubMessenger(internals, async (sendPeerId, _protocolId, payload): Promise<ReliableSendResult> => {
       const acceptedEnvelope = encodeSwmSenderKeyPackageAck({
         version: SWM_SENDER_KEY_PACKAGE_VERSION,
         type: SWM_SENDER_KEY_PACKAGE_ACK_TYPE,
@@ -397,8 +407,7 @@ describe('createAndDistributeSwmSenderKeyEpoch: parallel fanout latency', () => 
         accepted: false,
         reason: 'simulated key-level rejection',
       });
-      const seenSoFar = callsByPeer.get(sendPeerId) ?? 0;
-      callsByPeer.set(sendPeerId, seenSoFar + 1);
+      callsByPeer.set(sendPeerId, (callsByPeer.get(sendPeerId) ?? 0) + 1);
 
       if (sendPeerId === recipientFatal.peerId) {
         return {
@@ -409,12 +418,15 @@ describe('createAndDistributeSwmSenderKeyEpoch: parallel fanout latency', () => 
         };
       }
       if (sendPeerId === peerId) {
-        // recipientB's peer: reject only the first call (key A).
+        // Decode the package to read `recipientKeyId` directly —
+        // robust against the per-recipient send race.
+        const pkg = decodeSwmSenderKeyPackage(payload);
+        seenKeyIds.push(pkg.recipientKeyId);
         return {
           delivered: true,
-          response: seenSoFar === 0 ? rejectedEnvelope : acceptedEnvelope,
+          response: pkg.recipientKeyId === keyAId ? rejectedEnvelope : acceptedEnvelope,
           attempts: 1,
-          messageId: `m-mixed-${seenSoFar}-${sendPeerId.slice(-6)}`,
+          messageId: `m-mixed-${pkg.recipientKeyId.slice(-8)}`,
         };
       }
       return {
@@ -462,7 +474,10 @@ describe('createAndDistributeSwmSenderKeyEpoch: parallel fanout latency', () => 
     expect(thrown!.message.toLowerCase()).not.toContain(recipientHappy.agentAddress.toLowerCase());
 
     // Sanity: recipientB's peerId was called exactly twice and the
-    // per-peer discrimination wired the rejection to the FIRST call.
+    // per-key discrimination correctly saw BOTH keyAId and keyBId
+    // (order doesn't matter — that's the whole point of decoding
+    // the payload instead of using a per-peer call ordinal).
     expect(callsByPeer.get(peerId)).toBe(2);
+    expect([...seenKeyIds].sort()).toEqual([keyAId, keyBId].sort());
   });
 });

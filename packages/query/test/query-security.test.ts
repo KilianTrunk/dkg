@@ -205,6 +205,36 @@ describe('I-009: SPARQL graph scope bypass prevention', () => {
     expect(response.error).toContain('FROM');
   });
 
+  it('rejects token-adjacent FROM IRIs before executing remote SPARQL', async () => {
+    let executed = false;
+    const noExecuteEngine = {
+      query: async () => {
+        executed = true;
+        return { bindings: [] };
+      },
+      resolveKA: async () => {
+        throw new Error('not used');
+      },
+    } as unknown as DKGQueryEngine;
+    const boundaryHandler = new QueryHandler(noExecuteEngine, {
+      defaultPolicy: 'deny',
+      contextGraphs: {
+        [CONTEXT_GRAPH]: { policy: 'public', sparqlEnabled: true },
+      },
+    });
+
+    const response = await boundaryHandler.handle(
+      makeRequest({
+        sparql: `SELECT ?name FROM<${OTHER_GRAPH}> WHERE { ?s <${SCHEMA_NAME}> ?name }`,
+      }),
+      'peer-attacker',
+    );
+
+    expect(response.status).toBe('ERROR');
+    expect(response.error).toContain('FROM');
+    expect(executed).toBe(false);
+  });
+
   it('rejects SPARQL with FROM NAMED clause', async () => {
     const response = await handler.handle(
       makeRequest({

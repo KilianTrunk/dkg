@@ -155,6 +155,15 @@ export function useAssertionLifecycleEvents(
   const [error, setError] = useState<string | null>(null);
   const [resultContextGraphId, setResultContextGraphId] = useState<string | undefined>(undefined);
   const lastRequestedCg = useRef<string | undefined>(undefined);
+  // Mirrors `resultContextGraphId` for use inside the async effect
+  // closure WITHOUT capturing a stale value. PR #769 Codex review —
+  // the prior shape read `resultContextGraphId` via a functional
+  // `setResultContextGraphId(prev => …)` updater that also fired
+  // `setEvents([])` as a side effect; React requires updaters to
+  // stay pure (and Strict Mode invokes them twice to detect impurity).
+  // A ref kept in sync at every write site is the contract-clean way
+  // to read "what graph last resolved" inside the catch path.
+  const lastResultCg = useRef<string | undefined>(undefined);
 
   useEffect(() => {
     if (!contextGraphId) {
@@ -177,6 +186,7 @@ export function useAssertionLifecycleEvents(
       setEvents([]);
       setError(null);
       setResultContextGraphId(undefined);
+      lastResultCg.current = undefined;
     }
     let cancelled = false;
     const controller = new AbortController();
@@ -254,11 +264,32 @@ export function useAssertionLifecycleEvents(
         }
         setEvents(out);
         setResultContextGraphId(contextGraphId);
+        lastResultCg.current = contextGraphId;
         setError(null);
       } catch (err) {
         if (cancelled || (err as any)?.name === 'AbortError') return;
         setError((err as Error).message ?? String(err));
-        setEvents([]);
+        // PR #694 polish carry-over (a) — preserve the last-known-
+        // good feed on a same-graph refresh failure (transient
+        // 503 / timeout / network blip). Different-graph stale
+        // cache was already cleared at the top of the effect
+        // (lines ~176-181) before the fetch fired, so by the time
+        // we reach this catch `lastResultCg.current` is EITHER
+        // undefined (first fetch on this graph — nothing cached
+        // for us to keep) OR === contextGraphId (a prior fetch on
+        // THIS graph succeeded — keep those rows so the UI doesn't
+        // collapse to empty while the error indicator surfaces
+        // alongside).
+        //
+        // PR #769 Codex review — the ref-based read avoids both
+        // the stale-closure trap on `resultContextGraphId` AND
+        // the React-contract violation of nesting `setEvents([])`
+        // inside a `setResultContextGraphId` updater (updaters must
+        // stay pure; Strict Mode invokes them twice to detect
+        // impurity).
+        if (lastResultCg.current !== contextGraphId) {
+          setEvents([]);
+        }
         // PR #694 review fix — advance `resultContextGraphId` on
         // failure so consumers gating on
         // `resultContextGraphId === contextGraphId` (the Code7 pattern
@@ -268,6 +299,7 @@ export function useAssertionLifecycleEvents(
         // failure keeps consumers stuck in the previous-graph state
         // until the hook re-runs.
         setResultContextGraphId(contextGraphId);
+        lastResultCg.current = contextGraphId;
       } finally {
         if (timeoutId) clearTimeout(timeoutId);
         if (!cancelled) setLoading(false);

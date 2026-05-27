@@ -4668,7 +4668,7 @@ program
     const deps = createProductionDeps({ apiPort: config.apiPort ?? 9200 });
     // Overlay operator-configured scan roots + skipChecks from config.
     // The doctor namespace is opt-in — absent config means defaults.
-    const doctorConfig = (config as Record<string, unknown>).doctor as
+    const doctorConfig = (config as unknown as Record<string, unknown>).doctor as
       | { scanRoots?: unknown; skipChecks?: unknown }
       | undefined;
     if (doctorConfig) {

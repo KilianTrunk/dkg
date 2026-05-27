@@ -58,7 +58,19 @@ api_capture() {
   curl_args+=(-H "Authorization: Bearer $token" -H "Content-Type: application/json")
   [ -n "$data" ] && curl_args+=(-d "$data")
   curl_args+=("http://127.0.0.1:${port}${path}")
-  code=$(curl "${curl_args[@]}" 2>/dev/null || echo "000")
+  # Capture curl's exit status separately and only trust the printed
+  # `%{http_code}` when curl actually finished the request. Codex
+  # review on #778: on transport failures curl can already emit `000`
+  # via `-w` and *then* the `|| echo "000"` fallback appends another
+  # `000`, leaving `$code = "000000"` which then fails the `-lt 200`
+  # arithmetic with "integer expression expected" — the very bug this
+  # script is trying to avoid surfacing. Branching on `$?` keeps `$code`
+  # to either a real 3-digit HTTP status or a single canonical `000`.
+  code=$(curl "${curl_args[@]}" 2>/dev/null)
+  rc=$?
+  if [ "$rc" -ne 0 ] || [ -z "$code" ]; then
+    code="000"
+  fi
   content="$(cat "$tmp" 2>/dev/null || true)"
   rm -f "$tmp"
   printf -v "$body_out" '%s' "$content"
@@ -68,14 +80,15 @@ api_capture() {
 api_call() {
   local node="$1" method="$2" path="$3" data="${4:-}" body code
   api_capture "$node" "$method" "$path" "$data" body code
-  # `$code` can be empty when curl exits before printing `%{http_code}`
-  # (timeouts, connection refused under load, the API returning an
-  # empty body, etc.). Without this guard the arithmetic compares
-  # below blow up with "integer expression expected" and obscure the
-  # real "node ack'd nothing" failure (#774 finding #3 fired this on
-  # every probe). Normalize to `000` so the HTTP-status check below
-  # surfaces a single clean "transport failure" error instead.
-  [ -z "$code" ] && code="000"
+  # Defensive normalization for any caller that bypasses `api_capture`
+  # — transport failures should always surface as a clean `000` so the
+  # HTTP-status arithmetic below never blows up with "integer
+  # expression expected" and obscures the real "node ack'd nothing"
+  # failure mode (#774 finding #3 fired this on every probe).
+  case "$code" in
+    [0-9][0-9][0-9]) ;;
+    *) code="000" ;;
+  esac
   if [ "$code" -lt 200 ] || [ "$code" -ge 300 ]; then
     fail "$method $path on node $node failed with HTTP $code: $body"
   fi

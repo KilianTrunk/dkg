@@ -3,7 +3,7 @@ import { GraphManager } from '@origintrail-official/dkg-storage';
 import type { QueryResult, QueryOptions, QueryEngine } from './query-engine.js';
 import {
   contextGraphDataUri, contextGraphSharedMemoryUri, contextGraphVerifiedMemoryUri, contextGraphAssertionUri,
-  contextGraphSubGraphUri,
+  contextGraphSubGraphUri, contextGraphMetaUri, contextGraphSharedMemoryMetaUri,
   assertSafeIri, escapeSparqlLiteral, validateSubGraphName,
   type GetView,
   REMOVED_VIEWS,
@@ -200,7 +200,38 @@ export class DKGQueryEngine implements QueryEngine {
         : options?.graphSuffix === '_shared_memory'
           ? [sharedMemoryGraph]
           : [dataGraph];
-      assertExplicitGraphIrisAllowed(sparql, allowedGraphs);
+      // Authenticated callers that scope a query to a `contextGraphId`
+      // already have read access to that CG; refusing them visibility
+      // into the same CG's metadata graphs breaks every legitimate
+      // metadata read:
+      //   - `/_meta` — curator lookup, allowedAgent list, registration
+      //     status (invite-flow `assert_curator_triple_landed` probe,
+      //     CG Overview UI, downstream sync code)
+      //   - `/_shared_memory_meta` — workspaceOwner / promote-time
+      //     ownership metadata (devnet-test-swm-ownership-restart
+      //     `wait_for_owner_meta` probe, ACL enforcement on replicas).
+      //
+      // Both metadata graph URIs are added to the EXPLICIT-IRI allow
+      // set ONLY. Graph-variable expansion (`constrainGraphVariables...
+      // ToAllowedSet`) stays constrained to the data / SWM graphs so a
+      // benign-looking `GRAPH ?g { … }` SELECT still cannot iterate
+      // into the meta graphs and leak the allowedAgent list or the
+      // workspaceOwner peer id. When `subGraphName` is supplied we
+      // additionally allow the sub-graph-scoped `_meta` and
+      // `_shared_memory_meta` URIs (parallel to the data / sub-graph
+      // asymmetry above).
+      const explicitAllowedGraphs = [
+        ...allowedGraphs,
+        contextGraphMetaUri(effectiveContextGraphId),
+        contextGraphSharedMemoryMetaUri(effectiveContextGraphId),
+        ...(options?.subGraphName
+          ? [
+              contextGraphMetaUri(effectiveContextGraphId, options.subGraphName),
+              contextGraphSharedMemoryMetaUri(effectiveContextGraphId, options.subGraphName),
+            ]
+          : []),
+      ];
+      assertExplicitGraphIrisAllowed(sparql, explicitAllowedGraphs);
       sparql = constrainGraphVariablesToAllowedSet(sparql, allowedGraphs);
     }
 

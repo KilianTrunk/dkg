@@ -370,12 +370,14 @@ describe('DKGAgent.buildCiphertextChunkBackfill — prover-side backfill orchest
     stubSubscribers(boot.internals, new Map([[workspaceTopic, [peerA, peerB]]]));
 
     const batchId = ethers.getBytes(ethers.id('all-denied-batch'));
-    // Both peers say "denied" with distinguishable reasons so we
-    // can confirm the LAST one is surfaced (the closure overwrites
-    // `lastDenied` on each denial — operators see the most recent
-    // root cause, which on a homogeneous fleet is usually the
-    // representative one).
-    stubMessengerSequence(boot.internals, (peer, callOrdinal) => {
+    // Both peers say "denied" with distinguishable reasons so we can
+    // see a real reason was surfaced (not a stale empty/garbled
+    // value).
+    const ALL_DENIED_REASONS = new Set([
+      'peer-not-in-agent-allowlist',
+      'peer-rate-limited',
+    ]);
+    const { calls } = stubMessengerSequence(boot.internals, (peer, callOrdinal) => {
       const reason = peer === peerA ? 'peer-not-in-agent-allowlist' : 'peer-rate-limited';
       return {
         delivered: true,
@@ -404,16 +406,34 @@ describe('DKGAgent.buildCiphertextChunkBackfill — prover-side backfill orchest
     expect(result.fetched).toBe(0);
     // Both chunks failed — failures count must aggregate per chunk.
     expect(result.failures).toBe(2);
-    // Pin the EXACT last-denied reason rather than a regex that
-    // accepts either peer's. The closure iterates `candidatePeers`
-    // in insertion order via `Array.from(new Set(allSubscribers
-    // .filter(...)))`, which preserves the original Array order.
-    // With subscribers `[peerA, peerB]` the iteration visits A then B
-    // and `lastDenied` is overwritten on each denial — so across
-    // BOTH chunks the final value is still peerB's reason. A
-    // regression from "last-denial-wins" to "first-denial-wins"
-    // would otherwise pass silently here.
-    expect(result.reason).toBe('all-denied: peer-rate-limited');
+
+    // Pin the per-chunk REQUEST PATTERN, not just the final counters.
+    // Without this, a regression that derived `failures` from
+    // `missingIndexes.length` (or stopped after the first missing
+    // index) would pass — the counters would still read `failures: 2`
+    // even though only 2 wire requests went out instead of 4.
+    //
+    // Expected: 4 sends total, peers cycle [A, B, A, B] across the
+    // two chunks (per-chunk peer loop), chunk indexes are [0, 0, 1, 1].
+    expect(calls).toHaveLength(4);
+    const decoded = calls.map((c) => decodeCiphertextChunkCatchupRequest(c.payload));
+    expect(decoded.map((d) => d.chunkIndex)).toEqual([0, 0, 1, 1]);
+    expect(calls.map((c) => c.peer)).toEqual([peerA, peerB, peerA, peerB]);
+
+    // Reason is operator-facing free-form per the
+    // `CiphertextChunkBackfillResult.reason` contract — pin the
+    // `all-denied:` class (proves the aggregator surfaced a denial
+    // rather than a transport-error reason or empty string) and
+    // that the suffix is one of the reasons we wired into the stub
+    // (proves a reason IS forwarded, not stuck on empty/garbled).
+    // Don't pin which specific peer's reason wins last — that's a
+    // function of the closure's iteration order (currently
+    // sequential insertion order, but a harmless refactor to peer
+    // sorting or parallel fetches would change it without changing
+    // the contract).
+    expect(result.reason).toMatch(/^all-denied: /);
+    const surfacedReason = result.reason!.slice('all-denied: '.length);
+    expect(ALL_DENIED_REASONS.has(surfacedReason)).toBe(true);
   });
 
   it('all-errored (no denied, all transport failures): returns reason "no-responders"', async () => {

@@ -49,7 +49,7 @@ import {
 // `_pickWeightedChallenge` retains the curated branches so the unskip is a
 // one-line revert in `RandomSampling._isCGEligible` + removing the
 // `.skip` below.
-describe.skip('@unit RandomSampling — RFC-39 curated picker [Phase B deferred]', () => {
+describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () => {
   const CURATED_POLICY = 0;
   const OPEN_POLICY = 1;
   const TEST_KC_BYTE_SIZE = 128n;

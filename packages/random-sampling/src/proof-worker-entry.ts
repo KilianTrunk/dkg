@@ -10,6 +10,7 @@
 import { parentPort } from 'node:worker_threads';
 import {
   buildV10ProofMaterial,
+  buildV10CiphertextChunksProofMaterial,
   V10ProofRootMismatchError,
   V10ProofLeafCountMismatchError,
   V10ProofChunkOutOfRangeError,
@@ -23,6 +24,8 @@ interface BuildRequest {
   leaves: Uint8Array[];
   chunkId: number;
   expected: V10MerkleCommitment;
+  /** OT-RFC-39 — selects flat-KC (default) vs curated chunked tree. */
+  kind?: 'flat-kc' | 'ciphertext-chunks';
 }
 
 interface BuildResponse {
@@ -64,7 +67,9 @@ if (!parentPort) {
 
 parentPort.on('message', (msg: BuildRequest) => {
   try {
-    const material = buildV10ProofMaterial(msg.leaves, msg.chunkId, msg.expected);
+    const material = msg.kind === 'ciphertext-chunks'
+      ? buildV10CiphertextChunksProofMaterial(msg.leaves, msg.chunkId, msg.expected)
+      : buildV10ProofMaterial(msg.leaves, msg.chunkId, msg.expected);
     const response: BuildResponse = {
       taskId: msg.taskId,
       ok: true,

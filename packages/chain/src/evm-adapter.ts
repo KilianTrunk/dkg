@@ -490,6 +490,12 @@ export class EVMChainAdapter implements ChainAdapter {
    * `UnauthorizedAccess(Only Contracts in Hub)`.
    */
   private readonly randomSamplingPairCache: HubResolutionCache<{ rs: Contract; rss: Contract }>;
+  /**
+   * OT-RFC-39 — per-process cache for `getIdentityIdForAddress`.
+   * Only positive (non-zero) hits are memoised; see the method body
+   * for the rationale (negative-hit invalidation hazard).
+   */
+  private readonly identityIdByAddressCache: Map<string, bigint> = new Map();
   private hubRotationListenerStarted = false;
   /**
    * Single-flight guard for the best-effort
@@ -1181,6 +1187,30 @@ export class EVMChainAdapter implements ChainAdapter {
     await this.init();
     const identityStorage = await this.resolveContract('IdentityStorage');
     const id: bigint = await identityStorage.getIdentityId(this.signer.address);
+    return id;
+  }
+
+  /**
+   * OT-RFC-39 — view-only address → identityId lookup. Returns 0n
+   * when the address is not registered as a node operator. Caches
+   * results per-process: `IdentityStorage.identities` is append-only
+   * (operator key rotation goes through a separate slot), so a
+   * memoised hit is safe.
+   */
+  async getIdentityIdForAddress(address: string): Promise<bigint> {
+    if (!ethers.isAddress(address)) return 0n;
+    const checksum = ethers.getAddress(address);
+    const cached = this.identityIdByAddressCache.get(checksum.toLowerCase());
+    if (cached !== undefined) return cached;
+    await this.init();
+    const identityStorage = await this.resolveContract('IdentityStorage');
+    const id: bigint = await identityStorage.getIdentityId(checksum);
+    if (id > 0n) {
+      // Only memoise positive hits — a 0n result may flip to non-zero
+      // once the operator registers, and we don't want to lock the
+      // negative answer in for the process lifetime.
+      this.identityIdByAddressCache.set(checksum.toLowerCase(), id);
+    }
     return id;
   }
 
@@ -3691,6 +3721,20 @@ export class EVMChainAdapter implements ChainAdapter {
     await this.init();
     const kcs = this.requireKCStorage();
     const count: bigint = BigInt(await kcs.getMerkleLeafCount(kcId));
+    return Number(count);
+  }
+
+  async getLatestCiphertextChunksRoot(kcId: bigint): Promise<Uint8Array> {
+    await this.init();
+    const kcs = this.requireKCStorage();
+    const rootHex: string = await kcs.getLatestCiphertextChunksRoot(kcId);
+    return ethers.getBytes(rootHex);
+  }
+
+  async getCiphertextChunkCount(kcId: bigint): Promise<number> {
+    await this.init();
+    const kcs = this.requireKCStorage();
+    const count: bigint = BigInt(await kcs.getCiphertextChunkCount(kcId));
     return Number(count);
   }
 

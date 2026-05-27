@@ -596,6 +596,14 @@ export interface ChainAdapter {
   // Identity
   registerIdentity(proof: IdentityProof): Promise<bigint>;
   getIdentityId(): Promise<bigint>;
+  /**
+   * OT-RFC-39 — resolve an arbitrary operational EOA to its on-chain
+   * identityId. Returns 0n for addresses that are not registered
+   * node operators. Cheap view-only read against `IdentityStorage`;
+   * suitable for per-request authorization probes. Optional because
+   * legacy mock chains have no identity registry.
+   */
+  getIdentityIdForAddress?(address: string): Promise<bigint>;
   ensureProfile(options?: { nodeName?: string; stakeAmount?: bigint; lockTier?: number }): Promise<bigint>;
 
   // V9 UAL reservation (publisher address is derived from signer)
@@ -1013,6 +1021,38 @@ export interface ChainAdapter {
    * check the on-chain `chunkId = leafIndex` falls within the tree.
    */
   getMerkleLeafCount?(kcId: bigint): Promise<number>;
+
+  /**
+   * OT-RFC-38 LU-11 / OT-RFC-39 — latest on-chain ciphertext-chunks
+   * Merkle root for `kcId`. Read from
+   * `KnowledgeCollectionStorage.getLatestCiphertextChunksRoot(uint256)`.
+   *
+   * Returns 32 raw bytes. Returns `bytes32(0)` (all-zero) when the KC
+   * has no chunked-ciphertext commitment set — either because it is
+   * a public KC (legacy V10 plaintext path) or because it is a
+   * pre-LU-11 transitional curated KC that predates the chunked
+   * substrate. RFC-39 random-sampling treats both as unsampleable
+   * via the picker's per-KC commitment check.
+   *
+   * Optional so non-V10 / no-chain adapters can stub the surface.
+   */
+  getLatestCiphertextChunksRoot?(kcId: bigint): Promise<Uint8Array>;
+
+  /**
+   * OT-RFC-38 LU-11 / OT-RFC-39 — number of ciphertext chunks
+   * committed on chain for `kcId`. Read from
+   * `KnowledgeCollectionStorage.getCiphertextChunkCount(uint256)`.
+   *
+   * Returns `0` for KCs without a chunked commitment (see
+   * `getLatestCiphertextChunksRoot` for the bisection). Matches the
+   * Solidity default-zero mapping. The prover uses this as the
+   * curated counterpart of `getMerkleLeafCount` for the on-chain
+   * `chunkId = leafIndex` bounds check and for sanity-checking the
+   * local chunk-store extraction before building a proof.
+   *
+   * Optional so non-V10 / no-chain adapters can stub the surface.
+   */
+  getCiphertextChunkCount?(kcId: bigint): Promise<number>;
 
   /**
    * Address that signed the latest merkle root for `kcId` (the EOA that

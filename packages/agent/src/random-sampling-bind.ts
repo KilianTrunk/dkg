@@ -20,6 +20,7 @@ import {
   FileProverWal,
   InMemoryProverWal,
   startProverLoop,
+  type CiphertextChunkBackfillFn,
   type ProofBuilder,
   type ProverLogger,
   type ProverLoopStatus,
@@ -65,6 +66,15 @@ export interface RandomSamplingBindOptions {
    * by the hook are caught and logged so the prover stays running.
    */
   onTick?: (outcome: TickOutcome) => void;
+  /**
+   * OT-RFC-39 — optional late-join auto-backfill hook for curated KCs.
+   * When supplied, the prover invokes it on `CiphertextChunksMissingError`
+   * to pull missing chunks from authorized peers via the V10
+   * `PROTOCOL_GET_CIPHERTEXT_CHUNK` sync verb, then retries the extract
+   * once. Wired in `dkg-agent` to `fetchCiphertextChunkFromPeer` against
+   * the workspace-topic subscribers — the natural authorized-host set.
+   */
+  ciphertextChunkBackfill?: CiphertextChunkBackfillFn;
 }
 
 /**
@@ -145,6 +155,7 @@ export async function bindRandomSampling(
     builder,
     wal,
     log: opts.log,
+    ciphertextChunkBackfill: opts.ciphertextChunkBackfill,
   });
 
   const loop = startProverLoop({

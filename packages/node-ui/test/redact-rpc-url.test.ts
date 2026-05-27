@@ -56,6 +56,26 @@ describe('redactRpcUrl (BUG-012)', () => {
     expect(redacted).not.toContain('664a23a04122d3fa485778b9141bc92e17293c73');
   });
 
+  it('redacts a base62/JWT-shaped (non-hex) secret in a malformed URL (codex #752 — fallback used to leak)', () => {
+    // `new URL()` throws on a scheme-less RPC paste like this, so the
+    // fallback branch handles redaction. The previous regex only matched
+    // hex runs, so a mixed-case base62 / JWT-ish token survived unmasked.
+    const malformed = 'mainnet.infura.io/v3/JBKLMNZ5HrA1B2C3D4E5F6G7H8I9';
+    const redacted = redactRpcUrl(malformed);
+    expect(redacted).not.toContain('JBKLMNZ5HrA1B2C3D4E5F6G7H8I9');
+    expect(redacted).toContain('infura.io');
+    expect(redacted).toContain('/v3/');
+    expect(redacted).toMatch(/\*+/);
+  });
+
+  it('also redacts base62 tokens in scheme-less paste with mixed-case + hyphens (defence in depth)', () => {
+    // A QuickNode-style mixed-case + hyphen token without a scheme.
+    const malformed = 'greatest-sound.base-sepolia.quiknode.pro/AbCdEf01234567-MixedCase';
+    const redacted = redactRpcUrl(malformed);
+    expect(redacted).not.toContain('AbCdEf01234567-MixedCase');
+    expect(redacted).toContain('quiknode.pro');
+  });
+
   it('strips HTTP basic-auth credentials baked into the URL (user:pass@host)', () => {
     const original = 'https://tenant1234:s3cr3t-shared-token@rpc.example.com/path';
     const redacted = redactRpcUrl(original);

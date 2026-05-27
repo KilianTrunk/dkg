@@ -241,24 +241,30 @@ JSON
   done
 
   echo ""
-  echo "--- 4c: Private triples accepted on publisher (storage receipt) ---"
-  # rc.12 stores private triples encrypted-at-rest in the PrivateStore — they
-  # are intentionally NOT served back through /api/query, which only sees the
-  # standard (WM / SWM / VM) views. We can still prove the publisher accepted
-  # them by re-fetching the KC and inspecting `kas[].privateTripleCount` on
-  # the update response (already captured in $PRIV_RESULT).
-  PRIV_TRIPLES_STORED=$(echo "$PRIV_RESULT" | pyfield "sum(int(ka.get('privateTripleCount',0)) for ka in d.get('kas',[]))")
-  [ -z "$PRIV_TRIPLES_STORED" ] && PRIV_TRIPLES_STORED=0
-  if [ "$PRIV_TRIPLES_STORED" -ge 1 ]; then
-    ok "Publisher accepted $PRIV_TRIPLES_STORED private triple(s) (privateMerkleRoot on update receipt)"
+  echo "--- 4c: Private triples invisible to publisher's own public SPARQL view ---"
+  # rc.12 stores private triples encrypted-at-rest in the PrivateStore. The
+  # /api/update response exposes only { tokenId, rootEntity } per KA — neither
+  # `privateTripleCount` nor `privateMerkleRoot` are part of the public wire
+  # shape (see agent-chat.ts /api/update route). The unit test
+  # core/test/private-store-update.test.ts pins the storage round-trip.
+  #
+  # At the public API surface we can only assert two things:
+  #   (a) §4 above: the update with privateQuads returned status=confirmed
+  #       (i.e., the daemon accepted the private payload without erroring);
+  #   (b) here: the private subject is invisible in the public SPARQL view
+  #       on the PUBLISHER itself — not just on §4b's peer nodes. This is
+  #       the strongest "privacy boundary" assertion we can make without
+  #       leaking the decryption key into a test fixture.
+  PUB_LEAK=$(post 9201 /api/query -H "Content-Type: application/json" -d "{
+    \"sparql\": \"SELECT ?o WHERE { <$BOB_URI> <http://schema.org/email> ?o }\",
+    \"contextGraphId\": \"$CG\"
+  }")
+  PUB_BINDINGS=$(echo "$PUB_LEAK" | pyfield "len(d.get('result',{}).get('bindings',[]))")
+  [ -z "$PUB_BINDINGS" ] && PUB_BINDINGS=0
+  if [ "$PUB_BINDINGS" = "0" ]; then
+    ok "Publisher (node 9201) public view does NOT leak private email — privacy boundary intact"
   else
-    # Some update receipts only carry privateMerkleRoot without privateTripleCount; treat as soft warn.
-    PRIV_ROOT=$(echo "$PRIV_RESULT" | pyfield "[ka.get('privateMerkleRoot') for ka in d.get('kas',[]) if ka.get('privateMerkleRoot')]")
-    if [ -n "$PRIV_ROOT" ] && [ "$PRIV_ROOT" != "[]" ]; then
-      ok "Publisher returned privateMerkleRoot ($PRIV_ROOT) — private quads were processed"
-    else
-      warn "Update receipt did not surface a private-quad receipt: $PRIV_RESULT"
-    fi
+    fail "Publisher (node 9201) public view leaked private email ($PUB_BINDINGS bindings): $PUB_LEAK"
   fi
 else
   warn "Skipping §4 — §3 publish did not yield a kcId (private-update path needs an existing KC)"

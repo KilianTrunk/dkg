@@ -40,9 +40,11 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TS=$(date -u +'%Y%m%dT%H%M%SZ')
 RESULTS="${RESULTS_DIR:-$REPO_ROOT/.devnet/comprehensive-results/$TS}"
 mkdir -p "$RESULTS"
-# `latest` symlink for convenience. Use -sfn so re-runs in the same dir
-# atomically replace any prior link without leaving a "latest/latest" trail.
-ln -sfn "$TS" "$(dirname "$RESULTS")/latest" 2>/dev/null || true
+# `latest` symlink for convenience. Use the absolute path as the target so
+# it resolves correctly even when RESULTS_DIR is overridden to a directory
+# outside the default `<parent>/<ts>` layout. -sfn makes re-runs atomically
+# replace any prior link without leaving a "latest/latest" trail.
+ln -sfn "$RESULTS" "$(dirname "$RESULTS")/latest" 2>/dev/null || true
 
 log() { echo "[orch $(date -u +'%H:%M:%S')] $*" | tee -a "$RESULTS/orchestrator.log"; }
 

@@ -12749,6 +12749,11 @@ export class DKGAgent {
         this.store,
         this.chain.chainId === 'none' ? undefined : this.chain,
         this.eventBus,
+        // Defensive: when a peer's finalization gossip omits
+        // `targetContextGraphId` (pre-cd68fa689 publisher in the mesh),
+        // resolve the on-chain id locally so per-cgId promotion still
+        // fires and the RS prover sees the KC.
+        (cgName: string) => this.getContextGraphOnChainId(cgName),
       );
     }
     return this.finalizationHandler;

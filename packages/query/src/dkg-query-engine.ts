@@ -282,10 +282,8 @@ export class DKGQueryEngine implements QueryEngine {
       return emptyResultForSparql(sparql);
     }
 
-    if (view === 'verified-memory' || view === 'shared-working-memory') {
-      assertExplicitGraphIrisAllowed(sparql, allGraphs);
-      sparql = constrainGraphVariablesToAllowedSet(sparql, allGraphs);
-    }
+    assertExplicitGraphIrisAllowed(sparql, allGraphs);
+    sparql = constrainGraphVariablesToAllowedSet(sparql, allGraphs);
 
     // Spec §14 trust-gradient filter — only enforced on verified-memory
     // where on-chain-anchored trust metadata is expected to live.

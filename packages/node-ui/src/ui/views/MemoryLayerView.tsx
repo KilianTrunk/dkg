@@ -4,6 +4,7 @@ import { executeQuery, listAssertions, promoteAssertion, publishSharedMemory, li
 import { FilePreviewModal } from '../components/Modals/FilePreviewModal.js';
 import { useMemoryGraphEvents } from '../hooks/useNodeEvents.js';
 import { memoryGraphLabels } from '../lib/memoryLabels.js';
+import { truncateMiddle } from '../lib/truncate.js';
 
 const RdfGraph = lazy(() =>
   import('@origintrail-official/dkg-graph-viz/react').then(m => ({ default: m.RdfGraph }))
@@ -391,18 +392,35 @@ function AssertionList({ contextGraphId, onPromoted }: { contextGraphId: string;
     0
   );
   useMemoryGraphEvents(contextGraphId, refresh, { layers: ['wm'] });
+  // PR #710 Fix D — busy state keyed on `graphUri` (unique per row,
+  // produced by the daemon). `name` is no longer unique once
+  // sub-graph + root partitions share names, so a name-keyed busy
+  // would highlight two rows on a single click. `'__all__'`
+  // sentinel stays — not collidable with any graphUri.
   const [promoting, setPromoting] = useState<string | null>(null);
-  const [promoteResult, setPromoteResult] = useState<{ name: string; count: number } | null>(null);
+  // PR #710 — track `subGraph` on the success state so the result
+  // copy can disambiguate which partition was promoted. Two rows
+  // labeled `draft` (one root, one sub-graph) would otherwise emit
+  // the same message and leave the user guessing.
+  const [promoteResult, setPromoteResult] = useState<{ name: string; count: number; subGraph?: string } | null>(null);
   const [promoteError, setPromoteError] = useState<string | null>(null);
-  const [previewName, setPreviewName] = useState<string | null>(null);
+  // PR #710 Fix E — preview state carries the sub-graph slug too so
+  // `FilePreviewModal` can pass it through to the daemon's
+  // `/extraction-status` route. Pre-fix, clicking a sub-graph
+  // assertion's filename queried the root-bucket assertion → 404
+  // or wrong file.
+  const [preview, setPreview] = useState<{ name: string; subGraph?: string } | null>(null);
 
-  const handlePromote = useCallback(async (name: string) => {
-    setPromoting(name);
+  const handlePromote = useCallback(async (assertion: AssertionInfo) => {
+    setPromoting(assertion.graphUri);
     setPromoteResult(null);
     setPromoteError(null);
     try {
-      const res = await promoteAssertion(contextGraphId, name);
-      setPromoteResult({ name, count: res.promotedCount });
+      // PR #710 Fix A — thread `subGraph` so the daemon's
+      // `(cg, name, subGraph)` lookup hits the right partition;
+      // mirrors the AssertionsList fix in components.tsx.
+      const res = await promoteAssertion(contextGraphId, assertion.name, 'all', assertion.subGraph);
+      setPromoteResult({ name: assertion.name, count: res.promotedCount, subGraph: assertion.subGraph });
       refresh();
       onPromoted();
     } catch (err: any) {
@@ -420,7 +438,8 @@ function AssertionList({ contextGraphId, onPromoted }: { contextGraphId: string;
     let totalPromoted = 0;
     try {
       for (const a of assertions) {
-        const res = await promoteAssertion(contextGraphId, a.name);
+        // PR #710 — see comment on the single-row handler above.
+        const res = await promoteAssertion(contextGraphId, a.name, 'all', a.subGraph);
         totalPromoted += res.promotedCount;
       }
       setPromoteResult({ name: 'all assertions', count: totalPromoted });
@@ -450,33 +469,46 @@ function AssertionList({ contextGraphId, onPromoted }: { contextGraphId: string;
       </div>
       <div className="v10-assertion-items">
         {assertions.map((a) => (
-          <div key={a.name} className="v10-assertion-item">
+          <div key={a.graphUri} className="v10-assertion-item">
             <div className="v10-assertion-item-info">
               <button
                 className="v10-assertion-item-name clickable"
                 title={a.graphUri}
-                onClick={() => setPreviewName(a.name)}
+                onClick={() => setPreview({ name: a.name, subGraph: a.subGraph })}
               >
                 {a.name}
               </button>
               {a.tripleCount != null && (
                 <span className="v10-assertion-item-count">{a.tripleCount} triples</span>
               )}
+              {a.subGraph && (
+                // PR #710 — mirror the AssertionsList chip pattern
+                // (components.tsx). Same class, same `›` glyph, same
+                // truncation, same tooltip — disambiguates rows that
+                // share a name across root/sub-graph partitions.
+                <span
+                  className="v10-item-count v10-item-subgraph"
+                  title={`In sub-graph: ${a.subGraph}`}
+                >
+                  › {truncateMiddle(a.subGraph, 18)}
+                </span>
+              )}
             </div>
             <button
               className="v10-btn-promote"
               disabled={promoting !== null}
-              onClick={() => handlePromote(a.name)}
+              onClick={() => handlePromote(a)}
               title="Copy these triples to Shared Working Memory"
             >
-              {promoting === a.name ? 'Promoting...' : '→ SWM'}
+              {promoting === a.graphUri ? 'Promoting...' : '→ SWM'}
             </button>
           </div>
         ))}
       </div>
       {promoteResult && (
         <div className="v10-promote-result success">
-          Promoted {promoteResult.count} triples from {promoteResult.name} to Shared Working Memory.
+          Promoted {promoteResult.count} triples from {promoteResult.name}
+          {promoteResult.subGraph ? ` (in ${promoteResult.subGraph})` : ''} to Shared Working Memory.
         </div>
       )}
       {promoteError && (
@@ -485,11 +517,12 @@ function AssertionList({ contextGraphId, onPromoted }: { contextGraphId: string;
         </div>
       )}
 
-      {previewName && (
+      {preview && (
         <FilePreviewModal
           open
-          onClose={() => setPreviewName(null)}
-          assertionName={previewName}
+          onClose={() => setPreview(null)}
+          assertionName={preview.name}
+          subGraphName={preview.subGraph}
           contextGraphId={contextGraphId}
         />
       )}

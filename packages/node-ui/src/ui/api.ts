@@ -524,6 +524,15 @@ export interface AssertionInfo {
   name: string;
   graphUri: string;
   tripleCount?: number;
+  /**
+   * Sub-graph slug when the assertion lives in a sub-graph
+   * partition, undefined for root-bucket assertions. Lets the UI
+   * surface the structural placement inline on each row without a
+   * separate lookup. Field is uniformly populated on both WM and
+   * SWM `AssertionInfo`s so consumers don't need a layer-aware
+   * branch.
+   */
+  subGraph?: string;
 }
 
 /**
@@ -623,7 +632,7 @@ export async function listAssertions(
 
       if (seen.has(lifecycle)) continue;
       seen.add(lifecycle);
-      result.push({ name, graphUri: lifecycle });
+      result.push({ name, graphUri: lifecycle, subGraph: subGraphName });
     }
     return result;
   }
@@ -632,23 +641,66 @@ export async function listAssertions(
   const sparql = `SELECT DISTINCT ?g (COUNT(?s) AS ?cnt) WHERE { GRAPH ?g { ?s ?p ?o } } GROUP BY ?g`;
   const data = await executeQuery(sparql, contextGraphId);
   const bindings: any[] = data?.result?.bindings ?? [];
-  const prefix = `did:dkg:context-graph:${contextGraphId}/assertion/`;
+  // #706 fix — the prior `startsWith('did:dkg:context-graph:<cg>/assertion/')`
+  // shape silently dropped sub-graph-scoped WM assertions, whose graph
+  // URI is `did:dkg:context-graph:<cg>/<sg>/assertion/<agent>/<name>`
+  // (the sub-graph segment sits between `<cg>/` and `/assertion/`).
+  // We accept exactly two shapes, post-cgPrefix:
+  //   root-bucket : ['assertion', <agent>, <name>]            (3 segs)
+  //   sub-graph   : [<subGraphName>, 'assertion', <agent>, <name>] (4 segs)
+  // Anything else (extra segments on either side, internal meta
+  // graphs sharing the prefix, etc.) is silently dropped. The parse
+  // is deliberately strict so a row never gets admitted with a
+  // mis-derived name — promote/preview lookups key on `name` and
+  // would silently miss otherwise. The cgId itself is treated as
+  // opaque (it may contain `/assertion/` as a literal substring,
+  // per `validateContextGraphId`).
+  const cgPrefix = `did:dkg:context-graph:${contextGraphId}/`;
   const result: AssertionInfo[] = [];
   for (const b of bindings) {
     const g = typeof b.g === 'string' ? b.g : b.g?.value;
-    if (!g || !g.startsWith(prefix)) continue;
-    const tail = g.slice(prefix.length);
-    const slash = tail.indexOf('/');
-    const name = slash >= 0 ? tail.slice(slash + 1) : tail;
+    if (!g || !g.startsWith(cgPrefix)) continue;
+    const segments = g.slice(cgPrefix.length).split('/');
+    let subGraph: string | undefined;
+    let name: string;
+    if (segments.length === 3 && segments[0] === 'assertion') {
+      subGraph = undefined;
+      name = segments[2];
+    } else if (segments.length === 4 && segments[1] === 'assertion') {
+      subGraph = segments[0];
+      name = segments[3];
+    } else {
+      continue;
+    }
+    if (!name) continue;
     const cnt = typeof b.cnt === 'string' ? parseInt(b.cnt, 10) : (b.cnt?.value ? parseInt(b.cnt.value, 10) : undefined);
-    result.push({ name, graphUri: g, tripleCount: Number.isFinite(cnt) ? cnt : undefined });
+    result.push({ name, graphUri: g, tripleCount: Number.isFinite(cnt) ? cnt : undefined, subGraph });
   }
   return result;
 }
 
-/** Promote an assertion from WM to SWM. */
-export const promoteAssertion = (contextGraphId: string, assertionName: string, entities: string | string[] = 'all') =>
-  post<{ promotedCount: number }>(`/api/assertion/${encodeURIComponent(assertionName)}/promote`, { contextGraphId, entities });
+/**
+ * Promote an assertion from WM to SWM.
+ *
+ * PR #710 fix — `subGraphName` is the third part of the daemon's
+ * lookup key alongside `(contextGraphId, assertionName)`. Without
+ * it, promoting a sub-graph-scoped assertion either 404s or
+ * silently promotes a same-named root-bucket assertion. The
+ * daemon route already accepts the field
+ * (`packages/cli/src/daemon/routes/assertion.ts:820-823`); only
+ * spread it when supplied so root-bucket promotes keep the prior
+ * wire shape.
+ */
+export const promoteAssertion = (
+  contextGraphId: string,
+  assertionName: string,
+  entities: string | string[] = 'all',
+  subGraphName?: string,
+) =>
+  post<{ promotedCount: number }>(
+    `/api/assertion/${encodeURIComponent(assertionName)}/promote`,
+    { contextGraphId, entities, ...(subGraphName ? { subGraphName } : {}) },
+  );
 
 // --- File preview ---
 
@@ -664,9 +716,26 @@ export interface ExtractionStatus {
   completedAt?: string;
 }
 
-/** Fetch extraction status for an assertion (includes fileHash + contentType). */
-export const fetchExtractionStatus = (assertionName: string, contextGraphId: string) =>
-  get<ExtractionStatus>(`/api/assertion/${encodeURIComponent(assertionName)}/extraction-status?contextGraphId=${encodeURIComponent(contextGraphId)}`);
+/**
+ * Fetch extraction status for an assertion (includes fileHash + contentType).
+ *
+ * PR #710 Fix E — `subGraphName` is the third part of the daemon's
+ * lookup key alongside `(contextGraphId, assertionName)`. The route
+ * already accepts the query param
+ * (`packages/cli/src/daemon/routes/assertion.ts:3364`); only set it
+ * when supplied so root-bucket calls keep the prior URL shape.
+ */
+export const fetchExtractionStatus = (
+  assertionName: string,
+  contextGraphId: string,
+  subGraphName?: string,
+) => {
+  const params = new URLSearchParams({ contextGraphId });
+  if (subGraphName) params.set('subGraphName', subGraphName);
+  return get<ExtractionStatus>(
+    `/api/assertion/${encodeURIComponent(assertionName)}/extraction-status?${params}`,
+  );
+};
 
 /** Build a URL to serve a stored file by its hash (sha256: or keccak256:). */
 export function fileUrl(hash: string, contentType?: string): string {

@@ -2828,6 +2828,17 @@ export class DKGAgent {
         useWorkerThread: this.config.randomSamplingUseWorkerThread ?? true,
         tickIntervalMs: this.config.randomSamplingTickIntervalMs,
         log: this.randomSamplingLogger(ctx),
+        // OT-RFC-39 late-join sync — gives the prover an escape hatch
+        // when its tick fires on a curated KC whose ciphertext chunks
+        // never reached this core's local triple store (typically: the
+        // core was offline during the curator's publish, or joined the
+        // CG after the gossip envelopes rolled off the mesh). The hook
+        // pulls the missing chunks from authorized peers on demand via
+        // `PROTOCOL_GET_CIPHERTEXT_CHUNK` and persists them, after
+        // which the prover retries the extract exactly once. See
+        // `buildCiphertextChunkBackfill` for the discovery + fetch
+        // policy.
+        ciphertextChunkBackfill: this.buildCiphertextChunkBackfill(ctx),
       });
       if (this.randomSamplingHandle && this.randomSamplingHandle !== handle) {
         try { await this.randomSamplingHandle.stop(); } catch { /* swallow bind replacement cleanup */ }
@@ -10872,9 +10883,64 @@ export class DKGAgent {
         }
       } catch { /* probe failure non-fatal */ }
     }
+    // OT-RFC-39 fifth authority — registered node operator.
+    //
+    // The four authorities above are MEMBER- or CURATOR-shaped: they
+    // gate "can this EOA decrypt / participate in" the CG. Curated
+    // CGs almost never list every sharding-table core in
+    // `allowedAgents` (curators only enrol agents that need to
+    // decrypt), so the existing layers deny EVERY core-to-core
+    // chunk fetch — exactly the late-join scenario OT-RFC-39 is
+    // designed to fix. Closing that gap means admitting any peer
+    // whose EOA is a registered node operator (identityId > 0n on
+    // chain). Three reasons this is safe for the CIPHERTEXT path
+    // (and not generalisable to plaintext catchup):
+    //
+    //  1. The bytes carried are AEAD-encrypted with the curator's
+    //     sender key. A node operator without the sender key gets
+    //     opaque ciphertext that is computationally indistinguishable
+    //     from random, so no decryption power leaks.
+    //
+    //  2. The on-chain `(ciphertextChunksRoot, ciphertextChunkCount)`
+    //     commitment is already public — anyone observing chain state
+    //     learns "curated KC X has N chunks of size up to S each"
+    //     without needing the wire fetch. The metadata our responder
+    //     reveals is a strict subset of what the chain already
+    //     reveals.
+    //
+    //  3. Registering an on-chain identity costs TRAC stake — it's
+    //     a Sybil-resistant credential. Pairing the EOA recovery
+    //     above (which proves the requester holds the operator key)
+    //     with a non-zero identityId restricts ciphertext fetch to
+    //     the same trust set the random-sampling picker draws from,
+    //     which is the spec-intended population for hosting.
+    //
+    // Wire effect: the late-join sync verb now succeeds for any
+    // sharding-table core requesting chunks for any curated CG. The
+    // prover's auto-backfill can complete; the missed core proves
+    // its hosting and earns rewards on the period it would otherwise
+    // forfeit.
+    if (!authOk && typeof this.chain.getIdentityIdForAddress === 'function') {
+      try {
+        const reqIdentityId = await this.chain.getIdentityIdForAddress(requesterEoa);
+        if (reqIdentityId > 0n) {
+          anyAuthorityFound = true;
+          authOk = true;
+          this.log.debug(
+            ctx,
+            `LU-11 chunk-catchup admitted via OT-RFC-39 node-operator authority cg=${req.contextGraphId} requesterEoa=${requesterEoa} identityId=${reqIdentityId.toString()}`,
+          );
+        }
+      } catch (err) {
+        this.log.debug(
+          ctx,
+          `LU-11 chunk-catchup node-operator probe failed cg=${req.contextGraphId} requesterEoa=${requesterEoa}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
     if (!authOk) {
       authReason = anyAuthorityFound
-        ? 'requester EOA not in any of: on-chain participants, beacon curator, local agent-gate, allowedPeers'
+        ? 'requester EOA not in any of: on-chain participants, beacon curator, local agent-gate, allowedPeers, node-operator-registry'
         : 'no authority source available for context graph';
       this.log.info(
         ctx,
@@ -11025,6 +11091,134 @@ export class DKGAgent {
       }
     }
     return resp;
+  }
+
+  /**
+   * OT-RFC-39 — resolve a numeric on-chain CG id (the form the prover
+   * sees from `createChallenge` / `getKCContextGraphId`) back to the
+   * local cleartext id this agent registered the CG under. Scans
+   * `subscribedContextGraphs` because the reverse map is keyed by the
+   * wire-form `onChainHash`, not the numeric id. Returns null when
+   * this node has never seen the CG (legitimate during the chain-event
+   * replay race window after restart — caller falls back to passing
+   * the numeric id as a string, which the responder's authorization
+   * layer also resolves via on-chain participant lookup).
+   */
+  private resolveLocalCgIdByOnChainId(onChainId: bigint): string | null {
+    const target = onChainId.toString();
+    for (const [localId, sub] of this.subscribedContextGraphs) {
+      if (sub.onChainId === target) return localId;
+    }
+    return null;
+  }
+
+  /**
+   * OT-RFC-39 — build the per-tick auto-backfill closure handed to the
+   * Random Sampling prover via {@link bindRandomSampling}. The closure
+   * is invoked when `extractCiphertextChunksFromStore` reports
+   * `CiphertextChunksMissingError`; it pulls the missing chunks from
+   * authorized peers and persists them so the prover's one-shot retry
+   * can build the proof.
+   *
+   * Peer discovery uses the same source the publish path uses:
+   * `gossip.getSubscribers(contextGraphWorkspaceTopic(wireId))`. Every
+   * authorized hosting core subscribes to that topic to receive the
+   * chunked-publish gossip, so the subscriber snapshot is the natural
+   * "who can answer me right now" set. Falls back to "no peers" when
+   * the local cleartext CG id is unknown (chain replay hasn't caught
+   * up yet) — the prover then logs `kc-not-synced` and re-ticks in
+   * 30s, by which time the chain handler has populated
+   * `subscribedContextGraphs`.
+   *
+   * Authorization happens on the RESPONDER side
+   * (`handleGetCiphertextChunk`): every peer the requester contacts
+   * verifies the request's recovered EOA against the on-chain
+   * participant set / beacon curator / agent-gate / allowedPeers.
+   * Requesters that aren't in any authority set get a `denied` ACK
+   * and we skip to the next peer.
+   *
+   * Cap policy: one fetch per missing chunk per peer; iterate peers
+   * until a chunk lands or we exhaust the list. No retries inside the
+   * hook — the prover's outer 30s loop is the natural retry boundary.
+   */
+  private buildCiphertextChunkBackfill(
+    ctx: OperationContext,
+  ): (req: { cgId: bigint; batchId: Uint8Array; missingIndexes: number[] }) => Promise<{ fetched: number; failures: number; reason?: string }> {
+    return async ({ cgId, batchId, missingIndexes }) => {
+      if (missingIndexes.length === 0) return { fetched: 0, failures: 0 };
+
+      const localCgId = this.resolveLocalCgIdByOnChainId(cgId);
+      if (!localCgId) {
+        return {
+          fetched: 0,
+          failures: missingIndexes.length,
+          reason: 'cg-not-locally-registered',
+        };
+      }
+
+      const wireId = this.gossipWireIdFor(localCgId);
+      const workspaceTopic = contextGraphWorkspaceTopic(wireId);
+      let selfPeer: string | null = null;
+      try { selfPeer = this.peerId; } catch { /* pre-start */ }
+      const allSubscribers = this.gossip.getSubscribers(workspaceTopic);
+      const candidatePeers = Array.from(new Set(
+        allSubscribers.filter((p) => p && p !== selfPeer),
+      ));
+
+      if (candidatePeers.length === 0) {
+        return {
+          fetched: 0,
+          failures: missingIndexes.length,
+          reason: 'no-peers',
+        };
+      }
+
+      const batchIdHex = ethers.hexlify(batchId).slice(0, 18);
+      this.log.info(
+        ctx,
+        `LU-11 backfill start cg=${localCgId} batchId=${batchIdHex}... missing=${missingIndexes.length} peers=${candidatePeers.length}`,
+      );
+
+      let fetched = 0;
+      let failures = 0;
+      let lastDenied: string | undefined;
+      for (const idx of missingIndexes) {
+        let got = false;
+        for (const peer of candidatePeers) {
+          try {
+            const resp = await this.fetchCiphertextChunkFromPeer(peer, localCgId, batchId, idx, {
+              persist: true,
+            });
+            if (resp.denied) {
+              lastDenied = resp.denied;
+              continue;
+            }
+            if (resp.ciphertextB64) {
+              got = true;
+              break;
+            }
+          } catch (err) {
+            this.log.debug(
+              ctx,
+              `LU-11 backfill peer=${peer} chunk=${idx} cg=${localCgId} error: ${err instanceof Error ? err.message.slice(0, 200) : String(err).slice(0, 200)}`,
+            );
+          }
+        }
+        if (got) fetched++;
+        else failures++;
+      }
+
+      this.log.info(
+        ctx,
+        `LU-11 backfill done cg=${localCgId} batchId=${batchIdHex}... fetched=${fetched} failures=${failures}${lastDenied ? ` lastDenied=${lastDenied}` : ''}`,
+      );
+      return {
+        fetched,
+        failures,
+        ...(failures > 0 && fetched === 0 && lastDenied ? { reason: `all-denied: ${lastDenied}` } : {}),
+        ...(failures > 0 && fetched === 0 && !lastDenied ? { reason: 'no-responders' } : {}),
+      };
+    };
   }
 
   /**

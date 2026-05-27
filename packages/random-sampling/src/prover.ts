@@ -83,7 +83,53 @@ export interface RandomSamplingProverDeps {
   wal?: ProverWal;
   /** Hook for observability / structured logs. Default = no-op. */
   log?: ProverLogger;
+  /**
+   * OT-RFC-39 — optional late-join auto-backfill for curated KCs. When set,
+   * the prover invokes this hook on a `CiphertextChunksMissingError` to ask
+   * the host (typically `dkg-agent`) to fetch the missing chunks from
+   * authorized peers via `PROTOCOL_GET_CIPHERTEXT_CHUNK`, then retries the
+   * extract exactly once. When unset (or the hook reports zero fetched
+   * chunks), the tick falls back to the historical `kc-not-synced` outcome.
+   *
+   * Owner-side concerns the hook MUST take care of:
+   *   - resolving `cgId` (numeric on-chain) to the contextGraphId string the
+   *     remote responder will accept for authorization (cleartext or wire
+   *     form — both work, since `handleGetCiphertextChunk` resolves
+   *     authority from on-chain participants / beacon / agent-gate);
+   *   - peer discovery (gossip subscribers of the workspace topic is the
+   *     pragmatic default — every authorized host is subscribed there);
+   *   - signing + transport (`fetchCiphertextChunkFromPeer` already does
+   *     both end-to-end);
+   *   - persistence (the hook is expected to set `persist: true` so the
+   *     retry extract finds the chunks in the local store).
+   */
+  ciphertextChunkBackfill?: CiphertextChunkBackfillFn;
 }
+
+export interface CiphertextChunkBackfillRequest {
+  cgId: bigint;
+  /** 32-byte V10 KC plaintext merkleRoot — doubles as the curated batchId. */
+  batchId: Uint8Array;
+  /** Indexes the local store is missing. Length > 0. */
+  missingIndexes: number[];
+}
+
+export interface CiphertextChunkBackfillResult {
+  /** Number of chunks successfully persisted to the local store. */
+  fetched: number;
+  /** Number of chunks still missing after the hook ran. */
+  failures: number;
+  /**
+   * Optional short reason for the operator log when nothing was fetched
+   * (e.g. `no-peers`, `unknown-cg`, `all-denied`). Free-form; not load
+   * bearing for control flow.
+   */
+  reason?: string;
+}
+
+export type CiphertextChunkBackfillFn = (
+  req: CiphertextChunkBackfillRequest,
+) => Promise<CiphertextChunkBackfillResult>;
 
 export interface ProverLogger {
   info(event: string, fields: Record<string, unknown>): void;
@@ -113,6 +159,7 @@ export class RandomSamplingProver {
   private readonly builder: ProofBuilder;
   private readonly wal: ProverWal;
   private readonly log: ProverLogger;
+  private readonly ciphertextChunkBackfill?: CiphertextChunkBackfillFn;
   private inflight: Promise<TickOutcome> | null = null;
 
   constructor(deps: RandomSamplingProverDeps) {
@@ -122,6 +169,7 @@ export class RandomSamplingProver {
     this.builder = deps.builder ?? new InProcessProofBuilder();
     this.wal = deps.wal ?? new InMemoryProverWal();
     this.log = deps.log ?? noopLog;
+    this.ciphertextChunkBackfill = deps.ciphertextChunkBackfill;
   }
 
   /** Single-flight tick. Concurrent callers await the same result. */
@@ -375,56 +423,117 @@ export class RandomSamplingProver {
       // even on curated KCs; LU-11 added a parallel ciphertext slot,
       // not a replacement of the plaintext one).
       const batchId = await this.chain.getLatestMerkleRoot(kcId);
-      try {
-        const extracted = await extractCiphertextChunksFromStore({
-          store: this.store,
-          contextGraphId: cgId,
-          kcId,
-          batchId,
-          expectedCount: expectedLeafCount,
-        });
-        leaves = extracted.chunks;
-      } catch (err) {
-        if (err instanceof CiphertextChunksMissingError) {
-          this.log.warn('rs.tick.kc-not-synced', {
-            kcId: kcId.toString(),
-            cgId: cgId.toString(),
-            err: err.name,
-            missingCount: err.missingChunkIndexes.length,
-            expectedCount: err.expectedCount,
+      // Two-attempt extract loop: the first attempt reads whatever the
+      // local store already holds. If chunks are missing AND the host
+      // wired a backfill hook (OT-RFC-39 late-join sync), we ask it to
+      // pull the missing indexes from authorized peers via
+      // `PROTOCOL_GET_CIPHERTEXT_CHUNK`, then retry the extract exactly
+      // once. The cap is intentional: a single tick must not block on an
+      // unbounded peer fan-out, and the prover loop re-ticks every 30s
+      // anyway — repeated misses keep retrying naturally without
+      // burning the worker thread on a single period.
+      let curatedExtracted: { chunks: Uint8Array[] } | null = null;
+      for (let attempt = 0; attempt < 2 && !curatedExtracted; attempt++) {
+        try {
+          curatedExtracted = await extractCiphertextChunksFromStore({
+            store: this.store,
+            contextGraphId: cgId,
+            kcId,
+            batchId,
+            expectedCount: expectedLeafCount,
           });
-          await this.wal.append(
-            makeWalEntry(periodKey, 'failed', {
+        } catch (err) {
+          if (err instanceof CiphertextChunksMissingError) {
+            if (attempt === 0 && this.ciphertextChunkBackfill) {
+              this.log.warn('rs.tick.chunk-backfill-start', {
+                kcId: kcId.toString(),
+                cgId: cgId.toString(),
+                missingCount: err.missingChunkIndexes.length,
+                expectedCount: err.expectedCount,
+              });
+              let backfill: CiphertextChunkBackfillResult;
+              try {
+                backfill = await this.ciphertextChunkBackfill({
+                  cgId,
+                  batchId,
+                  missingIndexes: err.missingChunkIndexes,
+                });
+              } catch (hookErr) {
+                this.log.warn('rs.tick.chunk-backfill-error', {
+                  kcId: kcId.toString(),
+                  cgId: cgId.toString(),
+                  err: hookErr instanceof Error ? hookErr.message.slice(0, 200) : String(hookErr).slice(0, 200),
+                });
+                backfill = { fetched: 0, failures: err.missingChunkIndexes.length, reason: 'hook-threw' };
+              }
+              this.log.info('rs.tick.chunk-backfill-result', {
+                kcId: kcId.toString(),
+                cgId: cgId.toString(),
+                fetched: backfill.fetched,
+                failures: backfill.failures,
+                ...(backfill.reason ? { reason: backfill.reason } : {}),
+              });
+              if (backfill.fetched > 0) {
+                // Retry extract — at least one chunk was newly persisted.
+                continue;
+              }
+              // Zero progress → fall through to the kc-not-synced branch
+              // (no point retrying an extract that just failed for the
+              // same reason).
+            }
+            // `backfillAttempted` is true iff we entered the inline backfill
+            // branch and it failed to make progress. When the hook isn't
+            // wired (no host-side support), or when we hit the second
+            // attempt's miss after a partial backfill that closed some but
+            // not all gaps, both surface as `false`/`true` respectively so
+            // operators can grep `kc-not-synced backfillAttempted=true` to
+            // find legitimate replication failures (vs. unwired-hook
+            // misses, which read as `backfillAttempted=false`).
+            const backfillAttempted = attempt > 0;
+            this.log.warn('rs.tick.kc-not-synced', {
               kcId: kcId.toString(),
               cgId: cgId.toString(),
-              chunkId: chunkId.toString(),
-              error: {
-                code: err.name,
-                message: err.message.slice(0, 200),
-              },
-            }),
-          );
-          return { kind: 'kc-not-synced', kcId, cgId };
-        }
-        if (err instanceof CiphertextChunksMalformedError) {
-          this.log.error('rs.tick.data-corrupted', {
-            kcId: kcId.toString(),
-            cgId: cgId.toString(),
-            reason: 'ciphertext-chunk-malformed',
-            chunkIndex: err.chunkIndex,
-          });
-          await this.wal.append(
-            makeWalEntry(periodKey, 'failed', {
+              err: err.name,
+              missingCount: err.missingChunkIndexes.length,
+              expectedCount: err.expectedCount,
+              backfillAttempted,
+            });
+            await this.wal.append(
+              makeWalEntry(periodKey, 'failed', {
+                kcId: kcId.toString(),
+                cgId: cgId.toString(),
+                chunkId: chunkId.toString(),
+                error: {
+                  code: err.name,
+                  message: err.message.slice(0, 200),
+                },
+              }),
+            );
+            return { kind: 'kc-not-synced', kcId, cgId };
+          }
+          if (err instanceof CiphertextChunksMalformedError) {
+            this.log.error('rs.tick.data-corrupted', {
               kcId: kcId.toString(),
               cgId: cgId.toString(),
-              chunkId: chunkId.toString(),
-              error: { code: err.name, message: err.message.slice(0, 200) },
-            }),
-          );
-          return { kind: 'data-corrupted', kcId, cgId, reason: 'meta-graph-bug' };
+              reason: 'ciphertext-chunk-malformed',
+              chunkIndex: err.chunkIndex,
+            });
+            await this.wal.append(
+              makeWalEntry(periodKey, 'failed', {
+                kcId: kcId.toString(),
+                cgId: cgId.toString(),
+                chunkId: chunkId.toString(),
+                error: { code: err.name, message: err.message.slice(0, 200) },
+              }),
+            );
+            return { kind: 'data-corrupted', kcId, cgId, reason: 'meta-graph-bug' };
+          }
+          throw err;
         }
-        throw err;
       }
+      // Loop invariant: either `curatedExtracted` is set, or we returned
+      // a terminal outcome from inside the catch. The `!` reflects that.
+      leaves = curatedExtracted!.chunks;
     } else {
       proofKind = 'flat-kc';
       try {

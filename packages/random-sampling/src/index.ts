@@ -55,6 +55,9 @@ export {
   type RandomSamplingProverDeps,
   type ProverLogger,
   type TickOutcome,
+  type CiphertextChunkBackfillFn,
+  type CiphertextChunkBackfillRequest,
+  type CiphertextChunkBackfillResult,
 } from './prover.js';
 
 export {

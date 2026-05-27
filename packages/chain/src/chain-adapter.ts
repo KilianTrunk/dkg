@@ -596,6 +596,14 @@ export interface ChainAdapter {
   // Identity
   registerIdentity(proof: IdentityProof): Promise<bigint>;
   getIdentityId(): Promise<bigint>;
+  /**
+   * OT-RFC-39 — resolve an arbitrary operational EOA to its on-chain
+   * identityId. Returns 0n for addresses that are not registered
+   * node operators. Cheap view-only read against `IdentityStorage`;
+   * suitable for per-request authorization probes. Optional because
+   * legacy mock chains have no identity registry.
+   */
+  getIdentityIdForAddress?(address: string): Promise<bigint>;
   ensureProfile(options?: { nodeName?: string; stakeAmount?: bigint; lockTier?: number }): Promise<bigint>;
 
   // V9 UAL reservation (publisher address is derived from signer)

@@ -14,7 +14,7 @@ prefer running them before falling back to the manual recipes below.
 | Suite | Scope | Runtime | Command |
 | --- | --- | --- | --- |
 | Hardhat e2e | All 10 sequence diagrams from `RFC-001-implementation-walkthrough.md` (incl. Phase 4 author override + pre-signed AuthorAttestation), run against an in-process Hardhat EVM. Covers contract correctness + publisher integration in a single process. | ~30s | `pnpm test:e2e:agent-provenance` |
-| 5-node devnet | All 4 modes (a/b/c/d) + negative case from §4 + §9.5, run against `./scripts/devnet.sh start 5`. Mode (b) registers a custodial agent on core 2 and validates `KC.author = agent.wallet` while `publisherNodeIdentityId = core2.id`. | ~35s after devnet is up | `pnpm test:devnet:agent-provenance` |
+| 5-node devnet | All 4 modes (a/b/c/d) + negative case from §4 + §9.5, run against `./scripts/devnet.sh start 5`. Mode (b) registers a custodial agent on core 2 and validates `KC.author = agent.wallet` while `publisherNodeIdentityId = core2.id`. Includes a `mode (a) strict` variant that drains edge op-wallets' TRAC to literal zero via `hardhat_setStorageAt` and asserts the publish still succeeds via the PCA — pinning the "publisher EOA holds only gas tokens, spends TRAC from PCA" operator scenario. | ~35s after devnet is up | `pnpm test:devnet:agent-provenance` |
 
 Phase 4 author override (RFC §4(b)) is now wired end-to-end via the
 agent-keystore: end-user agents register on a daemon (`POST

@@ -186,6 +186,24 @@ export interface StorageACKHandlerConfig {
    * normalizer.
    */
   normalizeContextGraphIdForChunkStore?: (cgId: string) => string | null;
+  /**
+   * Test-only knob to shrink the V2 chunked-ACK local-wait retry
+   * budget (default 20 retries × 500ms = 10s). The defaults exist so
+   * the SWM ingest can finish persisting chunks before the ACK
+   * lookup runs on freshly-subscribed cores; production callers
+   * MUST NOT override this. Tests that exercise the deterministic
+   * MISSING_CIPHERTEXT_CHUNKS decline path use it to keep CI fast
+   * without changing the production behaviour pin.
+   *
+   * Codex review on PR #738: the prior MISSING_CHUNKS regression
+   * burned the full ~10s retry budget on every run. The injection
+   * point is intentionally narrow — only `maxRetries` and
+   * `delayMs` are tunable; the loop structure is unchanged.
+   */
+  _v2ChunkLookupRetryPolicyForTests?: {
+    maxRetries: number;
+    delayMs: number;
+  };
 }
 
 /**
@@ -368,8 +386,14 @@ export class StorageACKHandler {
       // small devnets that can take a few seconds. Production cores
       // that have been hosting the CG for ages will hit the cache on
       // the first iteration so the extra budget is free.
-      const MAX_LOCAL_WAIT_RETRIES = 20;
-      const LOCAL_WAIT_DELAY_MS = 500;
+      //
+      // The optional `_v2ChunkLookupRetryPolicyForTests` config knob
+      // shrinks this for the MISSING_CIPHERTEXT_CHUNKS regression
+      // test; production callers leave it undefined and inherit the
+      // 20×500ms defaults.
+      const testRetryPolicy = this.config._v2ChunkLookupRetryPolicyForTests;
+      const MAX_LOCAL_WAIT_RETRIES = testRetryPolicy?.maxRetries ?? 20;
+      const LOCAL_WAIT_DELAY_MS = testRetryPolicy?.delayMs ?? 500;
       const normalizeCgId = this.config.normalizeContextGraphIdForChunkStore;
       // Codex review (round 2) on PR #727: explicitly allow the
       // normalizer to return null — that means "can't trust a canonical

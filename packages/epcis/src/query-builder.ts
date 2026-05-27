@@ -176,6 +176,7 @@ export function buildEpcisQuery(params: EpcisQueryParams, contextGraphId: string
   } else {
     optionalClauses.push('OPTIONAL { ?event epcis:eventTime ?eventTime . }');
   }
+  optionalClauses.push('OPTIONAL { ?event epcis:eventTimeZoneOffset ?eventTimeZoneOffset . }');
 
   // Action filter — required when filtered, OPTIONAL otherwise
   if (params.action) {
@@ -236,7 +237,7 @@ export function buildEpcisQuery(params: EpcisQueryParams, contextGraphId: string
   ].join('\n      ');
 
   return `${PREFIXES}
-SELECT ?event ?eventType ?eventTime ?bizStep ?bizLocation ?disposition ?readPoint ?action ?parentID ?configurationId ?shipmentId ?ual
+SELECT ?event ?eventType ?eventTime ?eventTimeZoneOffset ?bizStep ?bizLocation ?disposition ?readPoint ?action ?parentID ?configurationId ?shipmentId ?ual
   (GROUP_CONCAT(DISTINCT ?epc; SEPARATOR=", ") AS ?epcList)
   (GROUP_CONCAT(DISTINCT ?childEPCs; SEPARATOR=", ") AS ?childEPCList)
   (GROUP_CONCAT(DISTINCT ?inputEPCList; SEPARATOR=", ") AS ?inputEPCs)
@@ -266,7 +267,7 @@ WHERE {
     }
   }
 }
-GROUP BY ?event ?eventType ?eventTime ?bizStep ?bizLocation ?disposition ?readPoint ?action ?parentID ?configurationId ?shipmentId ?ual
+GROUP BY ?event ?eventType ?eventTime ?eventTimeZoneOffset ?bizStep ?bizLocation ?disposition ?readPoint ?action ?parentID ?configurationId ?shipmentId ?ual
 ORDER BY DESC(?eventTime) ?event
 LIMIT ${limit}
 OFFSET ${offset}`;

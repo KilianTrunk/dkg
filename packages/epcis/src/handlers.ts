@@ -93,6 +93,9 @@ export function toEpcisEvent(binding: Record<string, string>): Record<string, un
   const eventTime = unwrapLiteral(binding['eventTime']);
   if (eventTime) event.eventTime = eventTime;
 
+  const eventTimeZoneOffset = unwrapLiteral(binding['eventTimeZoneOffset']);
+  if (eventTimeZoneOffset) event.eventTimeZoneOffset = eventTimeZoneOffset;
+
   const action = unwrapLiteral(binding['action']);
   if (action) event.action = action;
 

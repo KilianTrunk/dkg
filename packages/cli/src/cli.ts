@@ -27,7 +27,7 @@ import {
   apiPortPath,
   loadNetworkConfig, loadProjectConfig, resolveAutoUpdateConfig, resolveAutoUpdateSource, resolveChainConfig,
   releasesDir, activeSlot, swapSlot,
-  slotEntryPoint, isStandaloneInstall, repoDir,
+  slotEntryPoint, isStandaloneInstall, repoDir, isDkgMonorepo,
   resolveContextGraphs, resolveNetworkDefaultContextGraphs,
   type AutoUpdateConfig,
 } from './config.js';
@@ -603,8 +603,37 @@ program
 
 program
   .command('init')
-  .description('Interactive setup — set node name and relay')
-  .action(async () => {
+  .description('Interactive setup — set node name, role, and relay')
+  .option('--role <role>', "Node role: 'edge' (default; personal laptop / behind NAT) or 'core' (24/7 relay / SLA)")
+  .action(async (opts: ActionOpts) => {
+    // OT-RFC-41 Bundle B1c: monorepo guard. `dkg init` from a
+    // contributor checkout is almost always a mistake — the
+    // monorepo dev workflow is `pnpm dev` against the local CLI,
+    // not a globally-installed config. Surface this loudly so
+    // contributors don't accidentally write an Edge-style
+    // ~/.dkg/config.json that then disagrees with the binary on
+    // their $PATH.
+    if (isDkgMonorepo()) {
+      console.error(
+        '\n[dkg init] Refusing to run from a DKG monorepo checkout.\n' +
+          '\n' +
+          '  Detected monorepo root: ' + (repoDir() ?? '(unknown)') + '\n' +
+          '\n' +
+          "  Monorepo dev workflow uses 'pnpm dev' against the local CLI build; ~/.dkg/config.json\n" +
+          "  is for npm-installed nodes (`npm install -g @origintrail-official/dkg`). Writing one\n" +
+          '  here would diverge from how the local CLI resolves its own working state.\n' +
+          '\n' +
+          '  If you really want to bootstrap a config for testing from this checkout, set\n' +
+          '  DKG_HOME to a scratch directory:\n' +
+          '\n' +
+          '    DKG_HOME=/tmp/dkg-test dkg init\n' +
+          '\n' +
+          '  RFC: https://github.com/OriginTrail/dkgv10-spec/blob/main/rfcs/OT-RFC-41-edge-node-npm-only-install-and-update.md\n' +
+          '\n',
+      );
+      process.exit(1);
+    }
+
     await ensureDkgDir();
     const existing = await loadConfig();
     const network = await loadNetworkConfig();
@@ -622,9 +651,24 @@ program
     }
 
     const name = await ask('Node name', existing.name !== 'dkg-node' ? existing.name : undefined);
+    // OT-RFC-41 Bundle B1d: `--role <edge|core>` flag short-circuits
+    // the interactive role prompt. Default precedence:
+    //   1. `--role` flag (explicit operator intent)
+    //   2. existing config (re-running `dkg init` on an existing node)
+    //   3. network default (per-network preferred role)
+    //   4. 'edge' (safe default — RFC §1)
     const defaultRole = existing.nodeRole ?? network?.defaultNodeRole ?? 'edge';
-    const roleAnswer = await ask('Node role (edge / core)', defaultRole);
-    const nodeRole = roleAnswer === 'core' ? 'core' as const : 'edge' as const;
+    let nodeRole: 'edge' | 'core';
+    if (opts.role === 'edge' || opts.role === 'core') {
+      nodeRole = opts.role;
+      console.log(`Node role: ${nodeRole} (from --role flag)`);
+    } else if (opts.role !== undefined) {
+      console.error(`Invalid --role value: ${JSON.stringify(opts.role)}. Expected 'edge' or 'core'.`);
+      process.exit(1);
+    } else {
+      const roleAnswer = await ask('Node role (edge / core)', defaultRole);
+      nodeRole = roleAnswer === 'core' ? 'core' : 'edge';
+    }
 
     // Pre-fill relay from network config if user hasn't set one.
     // Show the first relay as the default, but only persist to config if the
@@ -649,9 +693,13 @@ program
     const contextGraphs = contextGraphsStr ? contextGraphsStr.split(',').map(s => s.trim()).filter(Boolean) : [];
     const apiPort = parseInt(await ask('API port', String(existing.apiPort)), 10);
 
+    // OT-RFC-41 §4.3 Bundle B1d: post-rc.12, auto-update is npm-only.
+    // The prompt wording is updated; the persisted config carries an
+    // explicit `source: 'npm'` so the daemon's resolution is
+    // unambiguous (no implicit `isStandaloneInstall()` probe).
     const autoUpdateDefault = existing.autoUpdate?.enabled ?? network?.autoUpdate?.enabled ?? false;
     const enableAutoUpdate = (await ask(
-      'Enable git-based auto-update (y/n)',
+      'Enable auto-update (npm; y/n)',
       autoUpdateDefault ? 'y' : 'n',
     )).toLowerCase() === 'y';
 
@@ -689,6 +737,12 @@ program
 
       autoUpdate = {
         enabled: true,
+        // OT-RFC-41 Bundle B1d: explicit source. Under rc.12+, fresh
+        // installs always use the npm path (Edge: install -g; Core:
+        // slot install). The legacy 'auto'/'git' values still parse
+        // (rc.11 nodes carrying them upgrade-in-place) but the
+        // daemon dispatches them as 'npm' under §5 PR 5.
+        source: 'npm' as const,
         ...(repo && repo !== effectiveRepo ? { repo } : {}),
         ...(branch && branch !== effectiveBranch ? { branch } : {}),
         ...(allowPrerelease !== effectiveAllowPrerelease ? { allowPrerelease } : {}),

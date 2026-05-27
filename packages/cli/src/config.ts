@@ -82,7 +82,7 @@ export interface AutoUpdateConfig {
    * `daemonState.standaloneCache` memo so every later caller (status route,
    * `dkg update` CLI subcommand, …) sees the same answer.
    */
-  source?: 'auto' | 'npm' | 'git';
+  source?: 'auto' | 'npm' | 'git' | 'monorepo';
 }
 
 /**

@@ -2569,9 +2569,13 @@ export async function runDaemonInner(
   const apiHost = config.apiHost || "127.0.0.1";
 
   // Route plugins: loaded before listen() so requests can't race the array; fail-soft per ADR 0001.
+  // OT-RFC-41 §4.6.1 / Bundle B1e: bare-name specs resolve from
+  // ~/.dkg/plugins (stable root) before the daemon-local node_modules,
+  // so plugin installs survive Core slot swaps and Edge npm reinstalls.
   const routePlugins = await loadRoutePlugins(
     config.routePlugins,
     new Logger('route-plugins'),
+    { dkgHome: dkgDir() },
   );
   // Validated count for telemetry — `configured=` is 0 for non-arrays so a typo doesn't report character count.
   const configuredCount = countConfiguredPluginSpecs(config.routePlugins);

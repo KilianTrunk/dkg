@@ -40,6 +40,19 @@ async function resolveEncryptInlinePayload(
   contextGraphId: string,
   publishContextGraphId?: string,
 ) {
+  // RFC-39 / LU-11 refactor extracted the access-policy probe + curated
+  // bootstrap into the private helper `_resolveCuratedChainKeyContext`,
+  // which `_resolveEncryptInlinePayload` now delegates to before returning
+  // either the AEAD callback or `undefined`. The lightweight `agentLike`
+  // harness in this file does not extend `DKGAgent.prototype`, so we must
+  // also bind the helper here — otherwise the first call throws
+  // `TypeError: this._resolveCuratedChainKeyContext is not a function`
+  // before any of the policy assertions below can run. All test cases in
+  // this file short-circuit inside the policy probe (public CG → undefined,
+  // unknown policy → throw) so they never touch the curated bootstrap
+  // dependencies (`createAndDistributeSwmSenderKeyEpoch` etc.).
+  agentLike._resolveCuratedChainKeyContext = (DKGAgent.prototype as any)
+    ._resolveCuratedChainKeyContext;
   return (DKGAgent.prototype as any)._resolveEncryptInlinePayload.call(
     agentLike,
     contextGraphId,

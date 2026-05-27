@@ -138,6 +138,28 @@ export class MockChainAdapter implements ChainAdapter {
   }
 
   /**
+   * OT-RFC-39 LU-11 — resolve an EOA to its on-chain identityId.
+   *
+   * Mirrors `EVMChainAdapter.getIdentityIdForAddress` so the mock-backed
+   * fifth authorization path for `PROTOCOL_GET_CIPHERTEXT_CHUNK`
+   * (registered-node-operator auth in `dkg-agent`) can be exercised
+   * offline. Address lookups try both checksum and lowercase forms
+   * because `seedIdentity` stores whatever the caller passed.
+   *
+   * Returns `0n` for non-addresses or addresses with no seeded identity
+   * — matching Solidity's zero-init mapping semantics.
+   */
+  async getIdentityIdForAddress(address: string): Promise<bigint> {
+    if (!ethers.isAddress(address)) return 0n;
+    const checksum = ethers.getAddress(address);
+    return (
+      this.identities.get(checksum) ??
+      this.identities.get(checksum.toLowerCase()) ??
+      0n
+    );
+  }
+
+  /**
    * Test helper: seed a deterministic identity for an address in this in-memory adapter.
    * Used by black-box daemon tests that need stable participant IDs across processes.
    */

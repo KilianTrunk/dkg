@@ -1118,6 +1118,117 @@ export async function loadConfig(): Promise<DkgConfig> {
   }
 }
 
+// =====================================================================
+// External-backend config validation (RFC 120, plan PR 1 item 6)
+// =====================================================================
+//
+// External triple-store backends (Blazegraph, sparql-http) impose two
+// requirements beyond the local-file default:
+//
+//   1. `store.options.url` (or `queryEndpoint`) must be set. The adapter
+//      will throw without it, but only deep inside agent boot — by which
+//      point logs already have stack traces from finalization wiring
+//      that started before the agent. Surfacing the error here at
+//      config-load time gives operators a single-line, actionable error.
+//   2. `largeLiteralStorage.directory` and
+//      `sharedMemoryPublicSnapshotStorage.directory` must be explicit
+//      when those features are enabled. The defaults derive a directory
+//      from the local triple-store's persistent path; an external
+//      backend has no such path, so without explicit directories the
+//      blob store throws when it sees its first oversized literal
+//      (potentially weeks after install).
+//
+// Returns an array of error messages — empty if config is valid. Caller
+// decides whether to log + exit (boot path) or surface as a config-save
+// rejection (future wizard path).
+const EXTERNAL_VALIDATION_PREFIX = '[config] store.backend';
+
+export interface StoreConfigValidationError {
+  /** Field path within the config that failed validation. */
+  field: string;
+  /** Human-readable error message including remediation hint. */
+  message: string;
+}
+
+export function validateStoreConfig(config: DkgConfig): StoreConfigValidationError[] {
+  const errors: StoreConfigValidationError[] = [];
+  const backend = config.store?.backend;
+  // Mirror of `isExternalBackend` from @origintrail-official/dkg-storage.
+  // Duplicated here to keep config.ts free of upward dependencies on the
+  // storage package (config.ts is leaf-imported by many other modules).
+  const isExternal = backend === 'blazegraph' || backend === 'sparql-http';
+  if (!isExternal) return errors;
+
+  const opts = (config.store?.options ?? {}) as Record<string, unknown>;
+
+  if (backend === 'blazegraph') {
+    if (typeof opts.url !== 'string' || !opts.url.trim()) {
+      errors.push({
+        field: 'store.options.url',
+        message:
+          `${EXTERNAL_VALIDATION_PREFIX} is "blazegraph" but ` +
+          `store.options.url is missing. Set it to the SPARQL endpoint URL ` +
+          `(e.g. http://127.0.0.1:9999/bigdata/namespace/mynode/sparql) or ` +
+          `switch backend to oxigraph-worker.`,
+      });
+    }
+  } else if (backend === 'sparql-http') {
+    if (typeof opts.queryEndpoint !== 'string' || !opts.queryEndpoint.trim()) {
+      errors.push({
+        field: 'store.options.queryEndpoint',
+        message:
+          `${EXTERNAL_VALIDATION_PREFIX} is "sparql-http" but ` +
+          `store.options.queryEndpoint is missing. Set it to the SPARQL query URL.`,
+      });
+    }
+  }
+
+  if (config.largeLiteralStorage?.enabled === true) {
+    const dir = config.largeLiteralStorage.directory;
+    if (typeof dir !== 'string' || !dir.trim()) {
+      errors.push({
+        field: 'largeLiteralStorage.directory',
+        message:
+          `largeLiteralStorage.enabled=true with an external store backend requires ` +
+          `largeLiteralStorage.directory to be set explicitly (no local store path ` +
+          `to infer it from). Either set the directory or disable large-literal storage.`,
+      });
+    }
+  }
+
+  if (config.sharedMemoryPublicSnapshotStorage?.enabled === true) {
+    const dir = config.sharedMemoryPublicSnapshotStorage.directory;
+    if (typeof dir !== 'string' || !dir.trim()) {
+      errors.push({
+        field: 'sharedMemoryPublicSnapshotStorage.directory',
+        message:
+          `sharedMemoryPublicSnapshotStorage.enabled=true with an external store backend ` +
+          `requires sharedMemoryPublicSnapshotStorage.directory to be set explicitly.`,
+      });
+    }
+  }
+
+  return errors;
+}
+
+/**
+ * Convenience helper: validate, log every error, exit if any. Daemon
+ * boot uses this; the future wizard path will iterate `errors` to
+ * re-prompt instead of exiting.
+ */
+export function exitOnStoreConfigErrors(
+  config: DkgConfig,
+  log: (msg: string) => void,
+): void {
+  const errors = validateStoreConfig(config);
+  if (errors.length === 0) return;
+  log(`[STORE-CONFIG] ${errors.length} validation error(s) — refusing to start.`);
+  for (const err of errors) {
+    log(`  ${err.field}: ${err.message}`);
+  }
+  process.exit(1);
+}
+
 export async function saveConfig(config: DkgConfig): Promise<void> {
   await ensureDkgDir();
   await writeFile(configPath(), JSON.stringify(config, null, 2) + '\n');

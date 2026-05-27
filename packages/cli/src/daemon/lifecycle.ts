@@ -59,6 +59,7 @@ import {
   type ApprovalPolicy,
 } from '@origintrail-official/dkg-chain';
 import { DKGAgent, loadOpWallets } from '@origintrail-official/dkg-agent';
+import { isExternalBackend } from '@origintrail-official/dkg-storage';
 import { computeNetworkId, createOperationContext, DKGEvent, Logger, PayloadTooLargeError, GET_VIEWS, TrustLevel, validateSubGraphName, validateAssertionName, validateContextGraphId, isSafeIri, assertSafeIri, sparqlIri, contextGraphSharedMemoryUri, contextGraphAssertionUri, contextGraphMetaUri, DEFAULT_PROTOCOL_OUTBOX_BACKOFFS_MS, DEFAULT_PROTOCOL_OUTBOX_MAX_AGE_MS, pickNetworkTunables } from '@origintrail-official/dkg-core';
 import { findReservedSubjectPrefix, isSkolemizedUri } from '@origintrail-official/dkg-publisher';
 import {
@@ -110,6 +111,7 @@ import {
   resolveAutoUpdateSource,
   slotEntryPoint,
   CLI_NPM_PACKAGE,
+  exitOnStoreConfigErrors,
 } from '../config.js';
 import { createPublicSnapshotStore, createPublisherControlFromStore, startPublisherRuntimeIfEnabled, type PublisherRuntime } from '../publisher-runner.js';
 import { createCatchupRunner, type CatchupJobResult, type CatchupRunner } from '../catchup-runner.js';
@@ -255,7 +257,13 @@ import {
   performNpmUpdate,
   performNpmUpdateEdge,
 } from './auto-update.js';
-import { chainResetWipe } from './chain-reset-wipe.js';
+import { chainResetWipe, detectBackendSwitch } from './chain-reset-wipe.js';
+import {
+  checkExternalStoreReachable,
+  checkOrSetStoreIdentity,
+  formatHealthCheckFailure,
+  formatIdentityTagMismatch,
+} from './store-health-check.js';
 import { resetNatStatus, startNatStatusWatcher } from './nat-status.js';
 import {
   OPENCLAW_UI_CONNECT_TIMEOUT_MS,
@@ -835,13 +843,84 @@ export async function runDaemonInner(
   // detects the change and wipes the now-orphaned chain state.
   // Operator's keystore + dashboard DB + uploaded files are preserved.
   // See docs/TESTNET_RESET.md and packages/cli/src/daemon/chain-reset-wipe.ts.
-  const wipeResult = chainResetWipe({
+  // Detect backend switch first. If the operator hand-edited
+  // store.backend between boots, refuse to start unless they opt in
+  // via DKG_ACCEPT_STORE_RESET=1. The new backend is fresh — any data
+  // held in the previous one is invisible to this boot. Booting
+  // silently would look like data loss to the operator.
+  const backendSwitch = detectBackendSwitch({
+    dataDir: dkgDir(),
+    currentBackend: config.store?.backend ?? 'oxigraph-worker',
+    acceptStoreReset: process.env.DKG_ACCEPT_STORE_RESET === '1',
+    log,
+  });
+  if (backendSwitch.aborted) {
+    process.exit(1);
+  }
+
+  // Refuse to start on invalid external-backend config (missing URL,
+  // missing blob/snapshot directory). This fires before the health
+  // check so operators see a single-line config error, not a confusing
+  // probe failure when the URL is just plain absent.
+  exitOnStoreConfigErrors(config, log);
+
+  // External triple-store backends (Blazegraph, sparql-http) get a
+  // boot-time reachability probe before anything that depends on them
+  // runs. We want operators who misconfigure the URL to see an
+  // actionable error within seconds — not a confusing failure deep in
+  // agent boot after we've already partially wiped local state.
+  //
+  // Sequencing: this fires BEFORE chainResetWipe so a marker bump
+  // against an unreachable endpoint doesn't strand the operator with
+  // wiped local files but stale remote data; we'd rather not start at
+  // all and let them fix the URL.
+  if (isExternalBackend(config.store?.backend)) {
+    const health = await checkExternalStoreReachable({
+      storeConfig: config.store,
+    });
+    if (!health.ok) {
+      log(formatHealthCheckFailure(health));
+      process.exit(1);
+    }
+    log(
+      `External triple-store reachable: ${health.backend} ${health.endpoint}`,
+    );
+
+    // Namespace identity check (RFC 120, plan PR 3 item 3). Refuses to
+    // start if another DKG node has already booted against this same
+    // namespace — without this, two daemons sharing one Blazegraph
+    // namespace silently corrupt each other. Fires BEFORE
+    // chainResetWipe so a mismatched tag never triggers a wipe of
+    // someone else's data.
+    const identity = await checkOrSetStoreIdentity({
+      storeConfig: config.store,
+      nodeName: config.name,
+    });
+    if (!identity.ok) {
+      if (identity.action === 'mismatch') {
+        log(formatIdentityTagMismatch(identity));
+      } else {
+        log(`[STORE-IDENTITY] failed to verify namespace ownership: ${identity.error}`);
+      }
+      process.exit(1);
+    }
+    if (identity.action === 'tagged') {
+      log(`Tagged triple-store namespace for node "${identity.nodeName}".`);
+    }
+  }
+
+  const wipeResult = await chainResetWipe({
     dataDir: dkgDir(),
     currentMarker: network?.chainResetMarker,
     // Honour operator's `randomSampling.walPath` override; the prover
     // writes its WAL there, so a fresh chain reset must wipe that file
     // (not the default ~/.dkg/random-sampling.wal which would be empty).
     randomSamplingWalPath: config.randomSampling?.walPath,
+    // For external triple-store backends, the wipe extends from local
+    // files to a SPARQL DROP/DELETE on the remote endpoint; otherwise
+    // operators with a chain-reset marker bump would keep stale V10 data
+    // in Blazegraph / sparql-http even after the local store.nq is gone.
+    storeConfig: config.store,
     log,
   });
   if (wipeResult.wiped) {
@@ -1693,6 +1772,14 @@ export async function runDaemonInner(
       return parseRdfInt(r?.bindings?.[0]?.c);
     },
     getStoreBytes: async () => {
+      // External SPARQL backends own no local file; `null` is the
+      // correct signal here (returning 0 misleads operators into
+      // thinking the store is empty). Quad count is exposed on
+      // demand via /api/status instead — too expensive to compute
+      // on the metrics tick. (RFC 120, plan PR 1 item 2.)
+      if (isExternalBackend(config.store?.backend)) {
+        return null;
+      }
       try {
         const s = await stat(join(dkgDir(), "store.nq"));
         return s.size;

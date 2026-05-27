@@ -741,15 +741,68 @@ function readSparqlVariable(sparql: string, start: number): string | null {
   const sigil = sparql[start];
   if (sigil !== '?' && sigil !== '$') return null;
   let end = start + 1;
-  while (end < sparql.length && isSparqlVariableContinuation(sparql[end])) end++;
+  const first = readCodePoint(sparql, end);
+  if (!first || !isSparqlVariableInitialCodePoint(first.codePoint)) return null;
+  end += first.width;
+
+  while (end < sparql.length) {
+    const next = readCodePoint(sparql, end);
+    if (!next || !isSparqlVariableContinuationCodePoint(next.codePoint)) break;
+    end += next.width;
+  }
+
   return end > start + 1 ? sparql.slice(start, end) : null;
 }
 
-function isSparqlVariableContinuation(ch: string | undefined): ch is string {
-  return !!ch && (
-    isWordStart(ch) ||
-    (ch >= '0' && ch <= '9')
+function readCodePoint(src: string, index: number): { codePoint: number; width: number } | null {
+  if (index >= src.length) return null;
+  const codePoint = src.codePointAt(index);
+  if (codePoint === undefined) return null;
+  return { codePoint, width: codePoint > 0xffff ? 2 : 1 };
+}
+
+function isSparqlVariableInitialCodePoint(codePoint: number): boolean {
+  return isSparqlPnCharsUCodePoint(codePoint) || isAsciiDigitCodePoint(codePoint);
+}
+
+function isSparqlVariableContinuationCodePoint(codePoint: number): boolean {
+  return (
+    isSparqlPnCharsUCodePoint(codePoint) ||
+    isAsciiDigitCodePoint(codePoint) ||
+    codePoint === 0x00b7 ||
+    (codePoint >= 0x0300 && codePoint <= 0x036f) ||
+    (codePoint >= 0x203f && codePoint <= 0x2040)
   );
+}
+
+function isSparqlPnCharsUCodePoint(codePoint: number): boolean {
+  return (
+    codePoint === 0x5f ||
+    isAsciiAlphaCodePoint(codePoint) ||
+    (codePoint >= 0x00c0 && codePoint <= 0x00d6) ||
+    (codePoint >= 0x00d8 && codePoint <= 0x00f6) ||
+    (codePoint >= 0x00f8 && codePoint <= 0x02ff) ||
+    (codePoint >= 0x0370 && codePoint <= 0x037d) ||
+    (codePoint >= 0x037f && codePoint <= 0x1fff) ||
+    (codePoint >= 0x200c && codePoint <= 0x200d) ||
+    (codePoint >= 0x2070 && codePoint <= 0x218f) ||
+    (codePoint >= 0x2c00 && codePoint <= 0x2fef) ||
+    (codePoint >= 0x3001 && codePoint <= 0xd7ff) ||
+    (codePoint >= 0xf900 && codePoint <= 0xfdcf) ||
+    (codePoint >= 0xfdf0 && codePoint <= 0xfffd) ||
+    (codePoint >= 0x10000 && codePoint <= 0xeffff)
+  );
+}
+
+function isAsciiAlphaCodePoint(codePoint: number): boolean {
+  return (
+    (codePoint >= 0x41 && codePoint <= 0x5a) ||
+    (codePoint >= 0x61 && codePoint <= 0x7a)
+  );
+}
+
+function isAsciiDigitCodePoint(codePoint: number): boolean {
+  return codePoint >= 0x30 && codePoint <= 0x39;
 }
 
 function skipSparqlSpaceAndLineComments(sparql: string, start: number): number {

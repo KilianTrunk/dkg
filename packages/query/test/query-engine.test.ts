@@ -285,6 +285,21 @@ describe('DKGQueryEngine', () => {
     expect(result.bindings[0]['name']).toBe('"ImageBot"');
   });
 
+  it('constrains GRAPH variables with non-ASCII names to the scoped context graph data graph', async () => {
+    await store.insert([
+      q('urn:other:entity', 'http://schema.org/name', '"OtherGraph"', 'did:dkg:context-graph:other-agent-registry'),
+    ]);
+
+    const result = await engine.query(
+      'SELECT ?name WHERE { GRAPH ?é { ?s <http://schema.org/name> ?name } } ORDER BY ?name',
+      { contextGraphId: CONTEXT_GRAPH },
+    );
+
+    expect(result.bindings).toEqual([
+      { name: '"ImageBot"' },
+    ]);
+  });
+
   it('constrains GRAPH variables to data and shared memory for includeSharedMemory', async () => {
     const sharedMemoryGraph = `did:dkg:context-graph:${CONTEXT_GRAPH}/_shared_memory`;
     await store.insert([

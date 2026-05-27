@@ -419,7 +419,18 @@ async function main() {
     }
     checkpoint.lastPublishedIdx = i;
 
-    // Periodic snapshot for cost tracking
+    // Codex review on PR #722: persist `lastPublishedIdx` after EVERY
+    // successful publish so a crash between the costly periodic snapshot
+    // boundaries can't replay an already-published partition on restart
+    // (which would hit Rule 4 / root-entity conflicts because each
+    // partition's anchor URI is deterministic). The expensive wallet-
+    // snapshot path below still runs only every `CFG.checkpointEvery`,
+    // but the cheap partition-bookkeeping write is now eager.
+    await saveCheckpoint(checkpoint);
+
+    // Periodic snapshot for cost tracking (expensive: N getWalletSnapshot
+    // RPC calls). Kept on the original cadence — only `lastPublishedIdx`
+    // needed the every-success treatment above.
     if ((i + 1) % CFG.checkpointEvery === 0 || i + 1 === target) {
       const snap = await getWalletSnapshot();
       checkpoint.tracSpent = startSnap.trac - snap.trac;

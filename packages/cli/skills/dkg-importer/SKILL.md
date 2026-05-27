@@ -428,9 +428,19 @@ function buildPartitionQuads(partitionIdx, rawQuads, anchorUri) {
 
   // 2. Rewrite every non-anchor URI in the subject (and object, when an IRI)
   //    position to its partition-scoped blank node.
+  //
+  // Detect IRIs generically via the RFC 3986 scheme grammar rather than
+  // hard-coding a scheme list. Earlier drafts checked only `http` / `urn:`,
+  // which silently misses valid RDF IRIs that use other schemes — `did:`,
+  // `ipfs:`, `tag:`, `file:`, plain-IRI imports etc. — and lets colliding
+  // root entities leak through to keep hitting Rule 4 on subsequent
+  // partitions. If your parser exposes `term.termType === 'NamedNode'`,
+  // prefer that over the regex.
+  const ABS_IRI = /^[A-Za-z][A-Za-z0-9+\-.]*:/;
+  const isIri = (s) => ABS_IRI.test(s);
   const out = [];
   for (const { s, p, o } of rawQuads) {
-    const subj = s.startsWith('http') || s.startsWith('urn:') ? blankNodeFor(s) : s;
+    const subj = isIri(s) ? blankNodeFor(s) : s;
     const obj  = (o.kind === 'iri' && o.value !== anchorUri)
       ? blankNodeFor(o.value)
       : serializeObject(o);

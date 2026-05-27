@@ -90,7 +90,11 @@ let alreadyExists = false;
 let resolvedCgId = null;
 let onChainId = null;
 {
-  const r = await apiCall('GET', '/api/context-graph');
+  // Codex review on PR #722: the daemon-side route is `/api/context-graph/list`;
+  // GET `/api/context-graph` would not list existing CGs, which made this
+  // helper drop through to create() and exit on a duplicate-id 409 instead
+  // of being idempotent as documented.
+  const r = await apiCall('GET', '/api/context-graph/list');
   if (r.ok && Array.isArray(r.json.contextGraphs)) {
     const match = r.json.contextGraphs.find(
       (cg) => cg.id === CG_SHORT_ID || cg.id?.endsWith(`/${CG_SHORT_ID}`),
@@ -104,7 +108,7 @@ let onChainId = null;
       console.error(`  ${r.json.contextGraphs.length} other CG(s) present; '${CG_SHORT_ID}' not yet created.`);
     }
   } else {
-    console.error(`  (no /api/context-graph response — will attempt create anyway)`);
+    console.error(`  (no /api/context-graph/list response — will attempt create anyway)`);
   }
 }
 

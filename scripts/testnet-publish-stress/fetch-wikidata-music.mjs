@@ -69,7 +69,7 @@ const QUERY_CLASSES = [
           OPTIONAL { ?s wdt:P569 ?birthDate }
           OPTIONAL { ?s wdt:P19 ?birthPlace }
           OPTIONAL { ?s wdt:P27 ?country }
-        } LIMIT ${limit} OFFSET ${offset}
+        } ORDER BY ?s LIMIT ${limit} OFFSET ${offset}
       }`,
   },
   {
@@ -98,7 +98,7 @@ const QUERY_CLASSES = [
           OPTIONAL { ?s wdt:P571 ?inception }
           OPTIONAL { ?s wdt:P2031 ?activeStart }
           OPTIONAL { ?s wdt:P2032 ?activeEnd }
-        } LIMIT ${limit} OFFSET ${offset}
+        } ORDER BY ?s LIMIT ${limit} OFFSET ${offset}
       }`,
   },
   {
@@ -127,7 +127,7 @@ const QUERY_CLASSES = [
           OPTIONAL { ?s wdt:P136 ?genre }
           OPTIONAL { ?s wdt:P364 ?language }
           OPTIONAL { ?s wdt:P162 ?producer }
-        } LIMIT ${limit} OFFSET ${offset}
+        } ORDER BY ?s LIMIT ${limit} OFFSET ${offset}
       }`,
   },
   {
@@ -154,7 +154,7 @@ const QUERY_CLASSES = [
           OPTIONAL { ?s wdt:P577 ?pubDate }
           OPTIONAL { ?s wdt:P136 ?genre }
           OPTIONAL { ?s wdt:P361 ?partOfAlbum }
-        } LIMIT ${limit} OFFSET ${offset}
+        } ORDER BY ?s LIMIT ${limit} OFFSET ${offset}
       }`,
   },
   {
@@ -179,7 +179,7 @@ const QUERY_CLASSES = [
           OPTIONAL { ?s wdt:P279 ?parentGenre }
           OPTIONAL { ?s wdt:P495 ?country }
           OPTIONAL { ?s wdt:P571 ?inception }
-        } LIMIT ${limit} OFFSET ${offset}
+        } ORDER BY ?s LIMIT ${limit} OFFSET ${offset}
       }`,
   },
 ];
@@ -214,6 +214,33 @@ function parseNtriplesLines(body) {
     if (trimmed.length > 0) out.push(trimmed);
   }
   return out;
+}
+
+// Codex review on PR #722: persist per-class offsets + class cursor in a
+// sidecar state file so a resumed run continues from the same SPARQL pages
+// it left off on, instead of restarting from offset 0 and appending
+// duplicated early data under new partition ids. The buffer of in-flight
+// triples is NOT persisted (cheap to rebuild on the next fetch), but the
+// fetch-cursor IS — the cost is one tiny JSON write per fetch.
+const STATE_PATH = `${OUT_PATH}.state.json`;
+
+async function loadFetchState() {
+  try {
+    const { readFile } = await import('node:fs/promises');
+    const raw = await readFile(STATE_PATH, 'utf8');
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed.offsets)
+        && parsed.offsets.length === QUERY_CLASSES.length
+        && Number.isInteger(parsed.classCursor)) {
+      return { offsets: parsed.offsets.slice(), classCursor: parsed.classCursor };
+    }
+  } catch { /* fresh */ }
+  return null;
+}
+
+async function saveFetchState(offsets, classCursor) {
+  const { writeFile } = await import('node:fs/promises');
+  await writeFile(STATE_PATH, JSON.stringify({ offsets, classCursor }, null, 2));
 }
 
 async function main() {
@@ -262,8 +289,14 @@ async function main() {
   };
 
   // Round-robin pages across the 5 classes until we hit the partition target.
-  let classCursor = 0;
-  const offsets = new Array(QUERY_CLASSES.length).fill(0);
+  // Codex review on PR #722: load the persisted fetch cursor so resume
+  // continues from where the prior run left off.
+  const restored = await loadFetchState();
+  let classCursor = restored?.classCursor ?? 0;
+  const offsets = restored?.offsets ?? new Array(QUERY_CLASSES.length).fill(0);
+  if (restored) {
+    console.error(`[resume] fetch cursor: classCursor=${classCursor} offsets=${JSON.stringify(offsets)}`);
+  }
 
   while (partitionIdx < TARGET_PARTITIONS) {
     const cls = QUERY_CLASSES[classCursor];
@@ -297,6 +330,9 @@ async function main() {
     );
     await flushPartition();
     classCursor = (classCursor + 1) % QUERY_CLASSES.length;
+    // Persist the fetch cursor after every page so a crash between
+    // partition flushes still allows clean resume.
+    await saveFetchState(offsets, classCursor);
     await sleep(PAGE_SLEEP_MS);
   }
 

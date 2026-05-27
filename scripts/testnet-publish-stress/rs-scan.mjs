@@ -50,8 +50,15 @@ const RPC_URL = process.env.RPC_URL ?? 'https://sepolia.base.org';
 const WINDOW_HOURS = parseFloat(process.env.WINDOW_HOURS ?? '4');
 const BASE_SEPOLIA_BLOCK_TIME_S = 2;  // observed
 const WINDOW_BLOCKS = Math.floor((WINDOW_HOURS * 3600) / BASE_SEPOLIA_BLOCK_TIME_S);
+// Codex review on PR #722: derive the default checkpoint filename from the
+// same `STRESS_RUN_ID` env var the producer (`publish-loop.mjs`) uses, so a
+// vanilla run of `rs-scan.mjs` against a vanilla run of `publish-loop.mjs`
+// loads the right KC ids out of the box. Hard-coding `26may2.json` here
+// (an artefact of the original Base Sepolia sweep) caused rs-scan to load
+// no KC ids and report "none of ours sampled" on fresh runs.
+const STRESS_RUN_ID = process.env.STRESS_RUN_ID ?? '26may';
 const CHECKPOINT_FILE = process.env.CHECKPOINT_FILE
-  ?? `${homedir()}/.dkg-publish-stress/checkpoints/26may2.json`;
+  ?? `${homedir()}/.dkg-publish-stress/checkpoints/${STRESS_RUN_ID}.json`;
 
 const RS_ADDR = '0x73AefE8AD301f7eac8c45C1B91A60Ed01BF24B1b';
 const RS_STORAGE_ADDR = '0xd84640BA70F18527827A3572C8Acf52E10ff5BC5';

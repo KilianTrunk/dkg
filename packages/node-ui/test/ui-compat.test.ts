@@ -214,11 +214,18 @@ describe('backward-compatible URL redirects (V10 consolidation)', () => {
 
   it('does NOT redirect /settings — it must open the Settings tab via the shell router (BUG-018)', () => {
     expect(app).not.toMatch(/path="\/settings".*element=\{<Navigate to="\/"/);
-    expect(app).toContain('URL_PATH_TO_TAB');
+    expect(app).toContain('useShellRouting');
   });
 
   it('exposes /observability as a deep-linkable path (BUG-018)', () => {
-    expect(app).toContain("'/observability'");
+    // The mapping table now lives in `hooks/useShellRouting.ts`; the
+    // companion behavioural tests in `use-shell-routing.test.ts`
+    // exercise the deep-link / unmapped-tab reset semantics directly.
+    const shellRouting = readFileSync(
+      resolve(__dirname, '../src/ui/hooks/useShellRouting.ts'),
+      'utf-8',
+    );
+    expect(shellRouting).toContain("'/observability'");
   });
 });
 

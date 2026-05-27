@@ -554,6 +554,9 @@ interface ContractCache {
   dkgPublishingConvictionNFT?: Contract;
   randomSampling?: Contract;
   randomSamplingStorage?: Contract;
+  identityStorage?: Contract;
+  convictionStakingStorage?: Contract;
+  stakingStorage?: Contract;
 }
 
 function formatProviderContext(config: Pick<EVMAdapterConfig, 'chainId' | 'rpcUrl'>): string {
@@ -1024,6 +1027,31 @@ export class EVMChainAdapter implements ChainAdapter {
     return ethers.keccak256(ethers.solidityPacked(['address'], [ethers.getAddress(address)]));
   }
 
+  private async getIdentityStorage(): Promise<Contract> {
+    if (!this.contracts.identityStorage) {
+      this.contracts.identityStorage = await this.resolveContract('IdentityStorage');
+    }
+    return this.contracts.identityStorage;
+  }
+
+  private async getConvictionStakingStorage(): Promise<Contract | null> {
+    if (!this.contracts.convictionStakingStorage) {
+      try {
+        this.contracts.convictionStakingStorage = await this.resolveContract('ConvictionStakingStorage');
+      } catch { return null; }
+    }
+    return this.contracts.convictionStakingStorage;
+  }
+
+  private async getStakingStorage(): Promise<Contract | null> {
+    if (!this.contracts.stakingStorage) {
+      try {
+        this.contracts.stakingStorage = await this.resolveContract('StakingStorage');
+      } catch { return null; }
+    }
+    return this.contracts.stakingStorage;
+  }
+
   private async hasAdminPurpose(
     identityStorage: Contract,
     identityId: bigint,
@@ -1050,7 +1078,7 @@ export class EVMChainAdapter implements ChainAdapter {
 
   async isOperationalWalletRegistered(identityId: bigint, address: string): Promise<boolean> {
     await this.init();
-    const identityStorage = await this.resolveContract('IdentityStorage');
+    const identityStorage = await this.getIdentityStorage();
     return this.hasOperationalPurpose(identityStorage, identityId, address);
   }
 
@@ -1069,21 +1097,28 @@ export class EVMChainAdapter implements ChainAdapter {
     };
     if (identityId === 0n) return result;
 
-    const identityStorage = await this.resolveContract('IdentityStorage');
+    const identityStorage = await this.getIdentityStorage();
     const candidates = [
       ...this.signerPool.map((s) => s.address),
       ...(options?.additionalAddresses ?? []),
     ];
     const seen = new Set<string>();
-    const missing: string[] = [];
-
+    const uniqueAddresses: string[] = [];
     for (const candidate of candidates) {
       const address = ethers.getAddress(candidate);
       const key = address.toLowerCase();
       if (seen.has(key)) continue;
       seen.add(key);
+      uniqueAddresses.push(address);
+    }
 
-      const existingIdentityId = BigInt(await identityStorage.getIdentityId(address));
+    const onChainIds = await Promise.all(
+      uniqueAddresses.map((addr) => identityStorage.getIdentityId(addr).then(BigInt)),
+    );
+    const missing: string[] = [];
+    for (let i = 0; i < uniqueAddresses.length; i++) {
+      const address = uniqueAddresses[i];
+      const existingIdentityId = onChainIds[i];
       if (existingIdentityId === identityId) {
         result.alreadyRegistered.push(address);
       } else if (existingIdentityId === 0n) {
@@ -1332,7 +1367,7 @@ export class EVMChainAdapter implements ChainAdapter {
 
   async getIdentityId(): Promise<bigint> {
     await this.init();
-    const identityStorage = await this.resolveContract('IdentityStorage');
+    const identityStorage = await this.getIdentityStorage();
     const id: bigint = await identityStorage.getIdentityId(this.signer.address);
     return id;
   }
@@ -3236,12 +3271,21 @@ export class EVMChainAdapter implements ChainAdapter {
   }
 
   async verifyACKIdentity(recoveredAddress: string, claimedIdentityId: bigint): Promise<boolean> {
+    // PR #711 + rc.12: delegate to the structured variant so the off-chain
+    // gate stays in lockstep with the on-chain `KnowledgeAssetsV10` ACK-
+    // signer check (operational-key purpose AND sharding-table membership).
+    // The legacy V10-stake / V8-stake fallback that lived inline here is
+    // superseded by the ST-membership check inside
+    // `verifyACKIdentityDetailed`, which is updated atomically by
+    // `StakingV10` whenever a node crosses `minimumStake`. PR #732's
+    // lazy-cache perf optimization is unaffected — the other call sites
+    // in this file pick up `getIdentityStorage()` via the auto-merge.
     return (await this.verifyACKIdentityDetailed(recoveredAddress, claimedIdentityId)).valid;
   }
 
   async verifySyncIdentity(recoveredAddress: string, claimedIdentityId: bigint): Promise<boolean> {
     await this.init();
-    const identityStorage = await this.resolveContract('IdentityStorage');
+    const identityStorage = await this.getIdentityStorage();
     if (!identityStorage) return false;
 
     const keyHash = ethers.keccak256(ethers.solidityPacked(['address'], [recoveredAddress]));
@@ -3645,7 +3689,7 @@ export class EVMChainAdapter implements ChainAdapter {
   async createChallenge(): Promise<CreateChallengeResult> {
     await this.init();
 
-    const identityStorage = await this.resolveContract('IdentityStorage');
+    const identityStorage = await this.getIdentityStorage();
     const identityId: bigint = await identityStorage.getIdentityId(this.signer.address);
 
     return this.withHubStaleRetry(async () => {

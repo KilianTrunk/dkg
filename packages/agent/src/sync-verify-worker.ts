@@ -92,26 +92,38 @@ export class SyncVerifyWorker {
     if (!isSourceMode && existsSync(sibJsPath)) {
       workerPath = sibJsPath;
     } else if (existsSync(distJsPath)) {
-      if (isSourceMode && existsSync(sibTsPath)) {
-        // Anchor staleness against `tsconfig.tsbuildinfo` rather than the
-        // emitted `.js` mtime: tsc with `composite: true` only re-emits a
-        // file when its OUTPUT changes byte-for-byte, but it always
-        // refreshes the tsbuildinfo on a successful incremental compile.
-        // Comparing against the buildinfo gives us a reliable "the build
-        // has been run since this source was edited" marker.
-        const tsbuildinfoPath = join(dirname(hereDir), 'tsconfig.tsbuildinfo');
+      // Stale-build guard. We only enforce this when BOTH:
+      //   a) we're loaded from `src/` (vitest source-mode); AND
+      //   b) `tsconfig.tsbuildinfo` is present in this checkout.
+      //
+      // (a) is obvious. (b) is what makes the check robust in CI: the
+      // shared `Build packages` job tars only `dist/`, `dist-ui/`, and
+      // `network/` directories — NOT the buildinfo — and each test job
+      // checks out source fresh (mtime ≈ test-job start) before
+      // untarring the build artifact (dist mtime = build-job time). In
+      // that environment src always looks "newer" than dist, but the
+      // dist artifact is trusted by construction (it was emitted from
+      // the same git ref). Anchoring on the buildinfo's existence
+      // limits the check to local developer machines, where editing
+      // `src/.ts` and running vitest without `pnpm build` is the actual
+      // failure mode the bot review on PR #792 flagged.
+      //
+      // tsc with `composite: true` only re-emits an OUTPUT file when
+      // its bytes change but ALWAYS refreshes the buildinfo, so the
+      // buildinfo mtime is the canonical "last successful build" anchor.
+      const tsbuildinfoPath = join(dirname(hereDir), 'tsconfig.tsbuildinfo');
+      if (
+        isSourceMode &&
+        existsSync(sibTsPath) &&
+        existsSync(tsbuildinfoPath)
+      ) {
         const tsMtime = statSync(sibTsPath).mtimeMs;
-        const buildinfoMtime = existsSync(tsbuildinfoPath)
-          ? statSync(tsbuildinfoPath).mtimeMs
-          : 0;
+        const buildinfoMtime = statSync(tsbuildinfoPath).mtimeMs;
         if (tsMtime > buildinfoMtime) {
-          const where = existsSync(tsbuildinfoPath)
-            ? `${tsbuildinfoPath} (last built ${new Date(buildinfoMtime).toISOString()})`
-            : `${tsbuildinfoPath} (no build artifact found)`;
           throw new Error(
             `[SyncVerifyWorker] Stale build detected.\n` +
               `  Source: ${sibTsPath} (modified ${new Date(tsMtime).toISOString()})\n` +
-              `  Build:  ${where}\n\n` +
+              `  Build:  ${tsbuildinfoPath} (last built ${new Date(buildinfoMtime).toISOString()})\n\n` +
               `Node's Worker cannot load TypeScript directly, so vitest's\n` +
               `source-mode delegates to the compiled artifact. The .ts file\n` +
               `is newer than the last successful build, which would silently\n` +

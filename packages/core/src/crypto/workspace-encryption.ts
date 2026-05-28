@@ -297,7 +297,27 @@ export function encodeWorkspaceEncryptionKey(bytes: Uint8Array): string {
 
 export function decodeWorkspaceEncryptionKey(value: string): Uint8Array {
   const raw = value.trim();
-  const bytes = raw.startsWith('0x')
+  // Disambiguate `0x…hex` vs base64url. The base64url alphabet
+  // (`[A-Za-z0-9_-]`) overlaps with hex (`[0-9a-fA-F]` after `0x`) and
+  // ~0.02% of randomly-generated 32-byte x25519 public keys encode to
+  // base64url strings that happen to start with `0x` (e.g.
+  // `0xbT0xAeVsXZ3f7alN53CypTY2D4ejqY6CJlfEg2Yws`). The original
+  // `startsWith('0x')` heuristic mis-routed those to the hex branch and
+  // produced shorter byte arrays, which then tripped the 32-byte assert
+  // in mintCustodialWorkspaceEncryptionKey → signWorkspaceEncryptionKey
+  // and surfaced as an intermittent CI failure on PR #792
+  // (test/ack-eip191-agent-extra.test.ts > "tampered signature does NOT
+  // recover the agent address" at agent-keystore.ts:293).
+  //
+  // Resolution: only treat the input as hex when it actually looks like
+  // hex — i.e. has the canonical `0x` + 64 hex-only characters length
+  // for a 32-byte key. Anything else falls through to base64url, which
+  // is what `encodeWorkspaceEncryptionKey` always emits.
+  const looksLikeHex32 =
+    raw.length === 2 + WORKSPACE_X25519_KEY_BYTES * 2 &&
+    raw.startsWith('0x') &&
+    /^0x[0-9a-fA-F]+$/.test(raw);
+  const bytes = looksLikeHex32
     ? Buffer.from(raw.slice(2), 'hex')
     : Buffer.from(padBase64(raw.replace(/-/g, '+').replace(/_/g, '/')), 'base64');
   const out = new Uint8Array(bytes);

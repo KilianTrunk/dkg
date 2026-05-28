@@ -8,7 +8,9 @@ import {
   WORKSPACE_ENCRYPTION_KEY_BYTES,
   WORKSPACE_RECIPIENT_ENCRYPTION_KEY_PURPOSE,
   assertSupportedEncryptedWorkspaceEnvelope,
+  decodeWorkspaceEncryptionKey,
   decryptWorkspacePayload,
+  encodeWorkspaceEncryptionKey,
   encryptWorkspacePayload,
   generateWorkspaceRecipientEncryptionKey,
   type EncryptWorkspacePayloadInput,
@@ -158,5 +160,74 @@ describe('workspace encrypted payload helpers', () => {
     expect(key.recipientKeyId).toBe('alice-key-1');
     expect(key.publicKeyBytes).toHaveLength(WORKSPACE_ENCRYPTION_KEY_BYTES);
     expect(key.privateKeyBytes).toHaveLength(WORKSPACE_ENCRYPTION_KEY_BYTES);
+  });
+
+  // Regression: PR #792 (CI shard `Tornado: agent [7/10]`,
+  // test/ack-eip191-agent-extra.test.ts > "tampered signature does NOT
+  // recover the agent address") flaked at ~0.02% with
+  // `workspaceEncryptionKey must be 32 bytes` in
+  // `mintCustodialWorkspaceEncryptionKey → signWorkspaceEncryptionKey →
+  // decodeWorkspaceEncryptionKey`.
+  //
+  // Root cause: `encodeWorkspaceEncryptionKey` emits base64url. The
+  // base64url alphabet (`[A-Za-z0-9_-]`) overlaps with hex
+  // (`[0-9a-fA-F]` after `0x`) — every ~5,000th randomly-generated
+  // 32-byte x25519 public key encodes to a base64url string whose first
+  // two characters are `0x` (e.g.
+  // `0xbT0xAeVsXZ3f7alN53CypTY2D4ejqY6CJlfEg2Yws`). The original
+  // `decodeWorkspaceEncryptionKey` heuristic
+  // `raw.startsWith('0x') ? hex : base64` then mis-routed those keys
+  // to the hex branch — Buffer.from('bT0…', 'hex') silently truncates
+  // at the first non-hex char, producing fewer than 32 bytes and
+  // tripping the assertion.
+  //
+  // The fix narrows the hex branch to "exactly `0x` + 64 hex chars"
+  // (the canonical 32-byte hex form). Anything else falls through to
+  // the base64url path that `encodeWorkspaceEncryptionKey` always
+  // emits.
+  it('encode → decode round-trip is byte-stable for 10k random x25519 keys', () => {
+    const N = 10_000;
+    let zeroXPrefixCount = 0;
+    for (let i = 0; i < N; i++) {
+      const key = generateWorkspaceRecipientEncryptionKey(
+        `did:dkg:agent:test-${i}`,
+        `did:dkg:agent:test-${i}#x25519`,
+      );
+      const encoded = encodeWorkspaceEncryptionKey(key.publicKeyBytes);
+      if (encoded.startsWith('0x')) zeroXPrefixCount++;
+      const decoded = decodeWorkspaceEncryptionKey(encoded);
+      expect(decoded).toHaveLength(WORKSPACE_ENCRYPTION_KEY_BYTES);
+      expect(Buffer.from(decoded).equals(Buffer.from(key.publicKeyBytes))).toBe(true);
+    }
+    // Sanity check: at 10k samples we expect ≥1 base64url-with-0x-prefix
+    // collision (geometric distribution, ~1 per 4096 samples). If this
+    // is zero on a healthy generator the regression would silently
+    // re-pass; surface it explicitly so the regression value of the
+    // test stays visible.
+    expect(zeroXPrefixCount).toBeGreaterThan(0);
+  });
+
+  it('decodes the literal failing base64url-with-0x-prefix key from PR #792 CI', () => {
+    // The exact string captured from the failing iteration (32 random
+    // bytes that, by chance, encode to base64url starting with `0x`).
+    const encoded = '0xbT0xAeVsXZ3f7alN53CypTY2D4ejqY6CJlfEg2Yws';
+    const expected = Buffer.from(
+      'd316d3d3101e56c5d9ddfeda94de770b2a536360f87a3a98e822657c4836630b',
+      'hex',
+    );
+    const decoded = decodeWorkspaceEncryptionKey(encoded);
+    expect(decoded).toHaveLength(WORKSPACE_ENCRYPTION_KEY_BYTES);
+    expect(Buffer.from(decoded).equals(expected)).toBe(true);
+  });
+
+  it('still decodes the legitimate 0x-prefixed hex form (32 bytes)', () => {
+    const expected = Buffer.from(
+      'd316d3d3101e56c5d9ddfeda94de770b2a536360f87a3a98e822657c4836630b',
+      'hex',
+    );
+    const hexEncoded = `0x${expected.toString('hex')}`;
+    const decoded = decodeWorkspaceEncryptionKey(hexEncoded);
+    expect(decoded).toHaveLength(WORKSPACE_ENCRYPTION_KEY_BYTES);
+    expect(Buffer.from(decoded).equals(expected)).toBe(true);
   });
 });

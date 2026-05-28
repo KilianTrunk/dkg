@@ -909,6 +909,11 @@
         "internalType": "uint32",
         "name": "migrationEpoch",
         "type": "uint32"
+      },
+      {
+        "internalType": "uint40",
+        "name": "expiryShortenedBy",
+        "type": "uint40"
       }
     ],
     "name": "createPosition",

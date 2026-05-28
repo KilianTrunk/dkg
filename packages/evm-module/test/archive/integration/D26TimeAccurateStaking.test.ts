@@ -192,7 +192,7 @@ describe('@integration D26 — time-accurate staking accounting', () => {
       const raw = (await ParametersStorage.maximumStake()) / 10n;
       const boostedEffectiveStake = (raw * SIX_X) / SCALE18;
 
-      await CSS.createPosition(1, ALICE_ID, raw, 12, 0);
+      await CSS.createPosition(1, ALICE_ID, raw, 12, 0, 0);
 
       expect(await CSS.getNodeStakeV10(ALICE_ID)).to.equal(raw);
       expect(await CSS.getNodeEffectiveStake(ALICE_ID)).to.equal(boostedEffectiveStake);
@@ -208,7 +208,7 @@ describe('@integration D26 — time-accurate staking accounting', () => {
       const raw = maximumStake / 2n;
       const boostedEffectiveStake = (raw * SIX_X) / SCALE18;
 
-      await CSS.createPosition(1, ALICE_ID, raw, 12, 0);
+      await CSS.createPosition(1, ALICE_ID, raw, 12, 0, 0);
 
       expect(raw).to.be.lessThan(maximumStake);
       expect(boostedEffectiveStake).to.be.greaterThan(maximumStake);
@@ -224,7 +224,7 @@ describe('@integration D26 — time-accurate staking accounting', () => {
     it('RandomSampling.calculateNodeScore simulates expired multiplier drops', async () => {
       const raw = (await ParametersStorage.maximumStake()) / 10n;
 
-      await CSS.createPosition(1, ALICE_ID, raw, 12, 0);
+      await CSS.createPosition(1, ALICE_ID, raw, 12, 0, 0);
       const position = await CSS.getPosition(1);
       const boostedEffectiveStake = (raw * SIX_X) / SCALE18;
 
@@ -243,7 +243,7 @@ describe('@integration D26 — time-accurate staking accounting', () => {
       const raw = (await ParametersStorage.maximumStake()) / 10n;
       const boostedEffectiveStake = (raw * SIX_X) / SCALE18;
 
-      await CSS.createPosition(1, identityId, raw, 12, 0);
+      await CSS.createPosition(1, identityId, raw, 12, 0, 0);
       const position = await CSS.getPosition(1);
       expect(await CSS.getNodeRunningEffectiveStake(identityId)).to.equal(boostedEffectiveStake);
 
@@ -291,7 +291,7 @@ describe('@integration D26 — time-accurate staking accounting', () => {
     it('Node effective stake transitions from boosted to raw at exact expiryTimestamp', async () => {
       // Alice opens a 30-day tier-1 position (boost 1.5x on 2000 raw).
       // Effective now: 3000. At +30d it collapses to 2000 (raw tail).
-      await CSS.createPosition(1, ALICE_ID, 2000, 1, 0);
+      await CSS.createPosition(1, ALICE_ID, 2000, 1, 0, 0);
       const created = await tsNow();
       const expiry = created + 30n * DAY;
 
@@ -314,7 +314,7 @@ describe('@integration D26 — time-accurate staking accounting', () => {
     });
 
     it('Simulated read at arbitrary future timestamp does not mutate state', async () => {
-      await CSS.createPosition(1, ALICE_ID, 1000, 12, 0);
+      await CSS.createPosition(1, ALICE_ID, 1000, 12, 0, 0);
       const created = await tsNow();
       const expiry = created + 366n * DAY;
 
@@ -375,9 +375,9 @@ describe('@integration D26 — time-accurate staking accounting', () => {
   describe('node dormancy resume', () => {
     it('Settling to `now` after years of dormancy drains all pending expiries in O(pending)', async () => {
       // Three positions with staggered expiries (30d / 180d / 366d).
-      await CSS.createPosition(1, ALICE_ID, 100, 1, 0);
-      await CSS.createPosition(2, ALICE_ID, 100, 6, 0);
-      await CSS.createPosition(3, ALICE_ID, 100, 12, 0);
+      await CSS.createPosition(1, ALICE_ID, 100, 1, 0, 0);
+      await CSS.createPosition(2, ALICE_ID, 100, 6, 0, 0);
+      await CSS.createPosition(3, ALICE_ID, 100, 12, 0, 0);
 
       // Jump 5 years forward — every expiry is well in the past.
       const base = await tsNow();
@@ -396,7 +396,7 @@ describe('@integration D26 — time-accurate staking accounting', () => {
     });
 
     it('getNodeEffectiveStakeAtEpoch still works on a dormant node (legacy adapter)', async () => {
-      await CSS.createPosition(1, ALICE_ID, 1000, 3, 0);
+      await CSS.createPosition(1, ALICE_ID, 1000, 3, 0, 0);
       // Force a long time jump that crosses many Chronos epochs.
       const epochLength = await Chronos.epochLength();
       await time.increase(Number(epochLength) * 100);

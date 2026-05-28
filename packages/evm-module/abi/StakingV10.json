@@ -764,6 +764,19 @@
   },
   {
     "inputs": [],
+    "name": "v8MigrationEligibility",
+    "outputs": [
+      {
+        "internalType": "contract V8MigrationEligibility",
+        "name": "",
+        "type": "address"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
     "name": "version",
     "outputs": [
       {

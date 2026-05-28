@@ -273,21 +273,38 @@ fi
 # ────────────────────────────────────────────────────────────────────────────
 section "5. GOSSIP REPLICATION — public data on other nodes"
 
-# Generous wait: 3-node devnet sees gossip in ~1s on a warm mesh, but a
-# cold mesh post-reboot can take up to ~10s before the first SWM/VM
-# sync arrives at edge nodes. Better to wait than to false-fail.
-sleep 5
+# Closes #774 finding #2 — the original single `sleep 5` + one-shot
+# query was flaky on cold/warming meshes: replication did happen, but
+# the test polled before the first SWM/VM sync arrived at the edge
+# nodes. Switch to a per-node poll-until-found loop with a 60s budget
+# and 2s tick — gives a warm mesh the same fast-path (first tick OK)
+# while letting a cold mesh actually exercise the sync path before we
+# fail. `RC_VALIDATION_GOSSIP_BUDGET_S` lets CI/operators tune this.
+GOSSIP_BUDGET_S="${RC_VALIDATION_GOSSIP_BUDGET_S:-60}"
+# Per-request curl timeout makes the poll budget real: if a node wedges
+# its HTTP socket, a bare `post` (no `--max-time`) would hang the whole
+# script and never let the budget expire. Cap each tick at
+# `GOSSIP_TICK_MAX_S` (default 5s) so we always stay within budget.
+GOSSIP_TICK_MAX_S="${RC_VALIDATION_GOSSIP_TICK_MAX_S:-5}"
 
 for PORT in 9202 9203 9204; do
-  REP=$(post $PORT /api/query -H "Content-Type: application/json" -d "{
-    \"sparql\": \"SELECT ?name WHERE { <$ALICE_URI> <http://schema.org/name> ?name }\",
-    \"contextGraphId\": \"$CG\"
-  }")
-  NAME_VAL=$(echo "$REP" | pyfield "(lambda b: (b[0].get('name') if b else 'EMPTY'))(d.get('result',{}).get('bindings',[]))")
+  DEADLINE=$(( $(date +%s) + GOSSIP_BUDGET_S ))
+  NAME_VAL=""
+  while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+    REP=$(curl -s --max-time "$GOSSIP_TICK_MAX_S" --connect-timeout 2 \
+      -H "$H" -H "Content-Type: application/json" \
+      -X POST "http://127.0.0.1:$PORT/api/query" -d "{
+      \"sparql\": \"SELECT ?name WHERE { <$ALICE_URI> <http://schema.org/name> ?name }\",
+      \"contextGraphId\": \"$CG\"
+    }" || echo '')
+    NAME_VAL=$(echo "$REP" | pyfield "(lambda b: (b[0].get('name') if b else 'EMPTY'))(d.get('result',{}).get('bindings',[]))")
+    echo "$NAME_VAL" | grep -q "Alice" && break
+    sleep 2
+  done
   if echo "$NAME_VAL" | grep -q "Alice"; then
     ok "Node $PORT: replicated Alice data"
   else
-    fail "Node $PORT: Alice data not found (got: $NAME_VAL)"
+    fail "Node $PORT: Alice data not found after ${GOSSIP_BUDGET_S}s poll (got: $NAME_VAL)"
   fi
 done
 

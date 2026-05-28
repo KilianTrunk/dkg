@@ -263,3 +263,52 @@ describe('A-4: e2e — agent.publish() data lands in canonical (data) view post-
     ).toBe(0);
   });
 });
+
+describe('#774 F1: registerContextGraph access-policy mismatch is rejected (Codex review on #777)', () => {
+  // Regression coverage for #774 finding #1. Before this fix, a CG
+  // created public could be registered on-chain with `accessPolicy: 1`
+  // (curated). The on-chain side ended up curated while the local
+  // ACL stayed open; the next `dkg publish` then tripped the
+  // pre-publish LU-5 guard with a mismatch error and the operator had
+  // no easy path to recover. The fix fails fast at register time with
+  // a remediation pointer. These tests pin both the rejection branch
+  // and the matching-policy branch so the half-registered state can't
+  // slip back in.
+  it('rejects register({ accessPolicy: 1 }) on a public-created CG with a remediation message', async () => {
+    // Codex r2 on #777: capture the rejection once and assert all
+    // substrings against the same error object — the previous draft
+    // invoked `registerContextGraph` twice just to match two
+    // fragments, and the new guard runs after some local metadata
+    // setup so a future refactor could make the second call land in
+    // a different state/path while the test still passes.
+    const cgId = `f1-mismatch-${ethers.hexlify(ethers.randomBytes(3)).slice(2)}`;
+    await nodeA!.createContextGraph({ id: cgId, name: 'F1 mismatch', description: '' });
+
+    let caught: Error | undefined;
+    try {
+      await nodeA!.registerContextGraph(cgId, { accessPolicy: 1 });
+    } catch (e) {
+      caught = e as Error;
+    }
+    expect(caught, 'expected register({ accessPolicy: 1 }) to reject').toBeDefined();
+    const msg = caught!.message;
+    expect(msg, 'message must surface the actual local ACL state').toMatch(
+      /local access policy=public\/open \(0\)/i,
+    );
+    expect(msg, 'message must point at the supported atomic create+register path').toMatch(
+      /dkg context-graph create.*--access-policy 1/,
+    );
+    expect(msg, 'message must mention the single-call API alternative').toMatch(
+      /POST \/api\/context-graph\/create/,
+    );
+  });
+
+  it('accepts register({ accessPolicy: 0 }) on a public-created CG (matching policy is fine)', async () => {
+    const cgId = `f1-match-${ethers.hexlify(ethers.randomBytes(3)).slice(2)}`;
+    await nodeA!.createContextGraph({ id: cgId, name: 'F1 match', description: '' });
+
+    const result = await nodeA!.registerContextGraph(cgId, { accessPolicy: 0 });
+    expect(result.onChainId).toBeDefined();
+    expect(Number(result.onChainId)).toBeGreaterThan(0);
+  });
+});

@@ -13376,8 +13376,52 @@ export class DKGAgent {
     if (resolvedLocalAccessPolicy !== undefined && resolvedLocalAccessPolicy !== LOCAL_ACCESS_OPEN && resolvedLocalAccessPolicy !== LOCAL_ACCESS_CURATED) {
       throw new Error('accessPolicy must be 0 (open) or 1 (private/curated)');
     }
+    // Closes #774 finding #1 — `dkg context-graph register
+    // --access-policy 1` against a CG that was created public used to
+    // silently register on-chain as curated while the local CG stayed
+    // public. The subsequent `dkg publish my-cg` then tripped the
+    // pre-publish LU-5 guard with a CG-policy-mismatch error and the
+    // operator had no easy way to recover (the LU-5 guard is correct
+    // — encrypting against the wrong CG's policy would leak plaintext
+    // OR be rejected by cores).
+    //
+    // Fail fast at register time with a clear remediation pointer so
+    // the operator never gets into the half-registered state. The
+    // single-call API (`POST /api/context-graph/create
+    // {accessPolicy:1, register:true, allowedAgents:[…]}`) and the
+    // CLI `dkg context-graph create my-cg --access-policy 1` BOTH set
+    // the local access policy at create time — those remain the
+    // supported paths for curated CGs.
+    // `isPrivateContextGraph()` reflects the CURRENT local ACL state,
+    // not strictly the create-time policy: a CG created public can
+    // later be locked down via allowlist mutations and would then
+    // also report `actualLocalIsCurated = true`. Phrase the error in
+    // terms of the current ACL state so the message stays accurate
+    // regardless of which write flipped the local policy (Codex r2
+    // on #777). The remediation pointer covers both atomic-create
+    // paths because that is the only supported way to bring the CG
+    // out of the mismatched state.
+    const actualLocalIsCurated = await this.isPrivateContextGraph(id);
+    if (
+      resolvedLocalAccessPolicy !== undefined
+      && ((resolvedLocalAccessPolicy === LOCAL_ACCESS_CURATED) !== actualLocalIsCurated)
+    ) {
+      const localStr = actualLocalIsCurated ? 'private/curated (1)' : 'public/open (0)';
+      const requestedStr = resolvedLocalAccessPolicy === LOCAL_ACCESS_CURATED
+        ? 'private/curated (1)'
+        : 'public/open (0)';
+      throw new Error(
+        `Context graph "${id}" currently has local access policy=${localStr} but register was called with --access-policy ${requestedStr}. ` +
+        `register cannot change the local access policy — encrypting against a different policy than the CG actually has would either leak plaintext or be rejected by cores ` +
+        `(this is what the pre-publish LU-5 guard then refuses). ` +
+        `To create a curated CG atomically, use one of: ` +
+        `(a) \`dkg context-graph create <id> --access-policy 1 --allowed-agent <addr>\`, ` +
+        `(b) the single-call API \`POST /api/context-graph/create { accessPolicy: 1, register: true, allowedAgents: [...] }\`. ` +
+        `Then register without --access-policy.`,
+      );
+    }
     if (resolvedLocalAccessPolicy === undefined) {
-      resolvedLocalAccessPolicy = await this.isPrivateContextGraph(id)
+      resolvedLocalAccessPolicy = actualLocalIsCurated
         ? LOCAL_ACCESS_CURATED
         : LOCAL_ACCESS_OPEN;
     }

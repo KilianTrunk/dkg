@@ -40,13 +40,15 @@ import * as net from 'node:net';
  * Mirrors the body inlined at scripts/devnet.sh:287-294. Kept here so
  * future tweaks land in one place.
  */
-export const BLAZEGRAPH_NAMESPACE_XML_TEMPLATE = `<?xml version="1.0" encoding="UTF-8"?>
+export const BLAZEGRAPH_NAMESPACE_XML_TEMPLATE = `<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!DOCTYPE properties SYSTEM "http://java.sun.com/dtd/properties.dtd">
 <properties>
   <entry key="com.bigdata.rdf.sail.namespace">{namespace}</entry>
   <entry key="com.bigdata.rdf.store.AbstractTripleStore.quads">true</entry>
   <entry key="com.bigdata.rdf.store.AbstractTripleStore.statementIdentifiers">false</entry>
   <entry key="com.bigdata.rdf.store.AbstractTripleStore.textIndex">false</entry>
   <entry key="com.bigdata.rdf.sail.truthMaintenance">false</entry>
+  <entry key="com.bigdata.rdf.store.AbstractTripleStore.axiomsClass">com.bigdata.rdf.axioms.NoAxioms</entry>
 </properties>`;
 
 /** Pinned image tag — matches devnet.sh and Blazegraph mainnet. */

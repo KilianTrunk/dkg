@@ -429,5 +429,9 @@ describe('BLAZEGRAPH_NAMESPACE_XML_TEMPLATE', () => {
     expect(body).toContain('com.bigdata.rdf.store.AbstractTripleStore.quads">true');
     expect(body).toContain('truthMaintenance">false');
     expect(body).toContain('statementIdentifiers">false');
+    // Blazegraph requires the Java properties DOCTYPE for XML parsing.
+    expect(body).toContain('<!DOCTYPE properties SYSTEM "http://java.sun.com/dtd/properties.dtd">');
+    // Quads mode requires inference disabled via NoAxioms.
+    expect(body).toContain('axiomsClass">com.bigdata.rdf.axioms.NoAxioms');
   });
 });

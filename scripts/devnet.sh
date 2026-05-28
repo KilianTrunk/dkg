@@ -284,13 +284,15 @@ start_blazegraph() {
         local ns="node${n}"
         curl -s -X POST "http://127.0.0.1:$BLAZEGRAPH_PORT/bigdata/namespace" \
           -H "Content-Type: application/xml" \
-          -d "<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+          -d "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"no\"?>
+<!DOCTYPE properties SYSTEM \"http://java.sun.com/dtd/properties.dtd\">
 <properties>
   <entry key=\"com.bigdata.rdf.sail.namespace\">$ns</entry>
   <entry key=\"com.bigdata.rdf.store.AbstractTripleStore.quads\">true</entry>
   <entry key=\"com.bigdata.rdf.store.AbstractTripleStore.statementIdentifiers\">false</entry>
   <entry key=\"com.bigdata.rdf.store.AbstractTripleStore.textIndex\">false</entry>
   <entry key=\"com.bigdata.rdf.sail.truthMaintenance\">false</entry>
+  <entry key=\"com.bigdata.rdf.store.AbstractTripleStore.axiomsClass\">com.bigdata.rdf.axioms.NoAxioms</entry>
 </properties>" > /dev/null 2>&1
         log "Created Blazegraph namespace: $ns"
       done

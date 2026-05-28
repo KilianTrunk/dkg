@@ -259,29 +259,64 @@ export class DKGQueryEngine implements QueryEngine {
       // (e.g. `useSwmAttributions` / `useVerifiedMemoryAnchors` /
       // `useVerifiedEntityIdentity` doing
       // `GRAPH ?g { … } FILTER(CONTAINS(STR(?g), "_shared_memory_meta"))`
-      // with only `contextGraphId` scope), the static
-      // `metaAllowList` is just the root meta URIs — `?g` cannot bind
-      // to any `<cg>/<sub>/_shared_memory_meta`, so metadata for
-      // entities published in sub-graphs stays invisible.
+      // with only `contextGraphId` scope), the static `metaAllowList`
+      // is just the root meta URIs — `?g` cannot bind to any
+      // `<cg>/<sub>/_shared_memory_meta`, so metadata for entities
+      // published in sub-graphs stays invisible.
       //
       // Dynamically enumerate same-CG sub-graph metadata graphs from
-      // the store and append them to the variable allow set so
-      // `GRAPH ?g` can bind across all of them. This only runs when
-      // the SPARQL actually contains a graph variable, so
-      // explicit-IRI queries pay no extra cost. Cross-CG isolation is
-      // preserved by the prefix filter; SWM-only routes
-      // (`graphSuffix='_shared_memory'`) still drop `_meta`
-      // sub-graphs.
-      if (collectGraphVariables(sparql).length > 0) {
-        const cgPrefix = `did:dkg:context-graph:${effectiveContextGraphId}/`;
+      // the store. Codex r4 hardenings:
+      //   1. Build candidate URIs structurally rather than using
+      //      `startsWith` — wallet-scoped CG ids like
+      //      `0xabc.../my-project` contain `/`, so a plain prefix test
+      //      would also admit graphs that belong to a *different*
+      //      CG whose root happens to extend the current one
+      //      (`foo/bar` scope leaking `foo/bar/baz/_meta`). Match the
+      //      sub-graph segment against `validateSubGraphName` so
+      //      reserved prefixes (`_verified_memory`, `_meta`,
+      //      `_shared_memory`, `context`, `assertion`, `draft`) and
+      //      multi-segment paths are rejected.
+      //   2. Honor the requested route: a caller scoped with
+      //      `subGraphName: 'code'` enumerates ONLY the `code/_meta`
+      //      and `code/_shared_memory_meta` partitions, never sibling
+      //      sub-graphs.
+      //   3. Skip the enumeration entirely when the caller supplied an
+      //      explicit `subGraphName` — the static `metaAllowList`
+      //      already covers exactly that sub-graph's metas, so the
+      //      `listGraphs()` round-trip is wasted work and would re-add
+      //      the same URIs.
+      //
+      // Cross-CG isolation is preserved by the structural match;
+      // SWM-only routes (`graphSuffix='_shared_memory'`) still drop
+      // `_meta` sub-graphs.
+      //
+      // Residual edge case: when two CGs share an id-prefix
+      // (`foo/bar` and `foo/bar/baz`) AND both happen to be hosted on
+      // the same node, the URI `<cgRoot:foo/bar>/baz/_meta` is
+      // genuinely ambiguous between "sub-graph baz of foo/bar" and
+      // "root meta of foo/bar/baz". A definitive resolution would
+      // need a CG-registry lookup; the structural match keeps the
+      // common single-segment case tight without that round-trip,
+      // and the same-CG access boundary still holds for any node
+      // that only hosts one of the colliding ids.
+      if (!subGraphName && collectGraphVariables(sparql).length > 0) {
+        const cgRoot = `did:dkg:context-graph:${effectiveContextGraphId}`;
         const allGraphs = await this.store.listGraphs();
-        const subMetaSuffixes = isSwmOnlyRoute
-          ? ['/_shared_memory_meta']
-          : ['/_meta', '/_shared_memory_meta'];
-        const subGraphMetaUris = allGraphs.filter((g) => {
-          if (!g.startsWith(cgPrefix)) return false;
-          return subMetaSuffixes.some((suffix) => g.endsWith(suffix));
-        });
+        const subMetaTokens = isSwmOnlyRoute
+          ? ['_shared_memory_meta']
+          : ['_meta', '_shared_memory_meta'];
+        const subGraphMetaUris: string[] = [];
+        for (const g of allGraphs) {
+          if (!g.startsWith(`${cgRoot}/`)) continue;
+          const rest = g.slice(cgRoot.length + 1);
+          const slashIdx = rest.indexOf('/');
+          if (slashIdx === -1) continue;
+          const subSegment = rest.slice(0, slashIdx);
+          const tail = rest.slice(slashIdx + 1);
+          if (!subMetaTokens.includes(tail)) continue;
+          if (!validateSubGraphName(subSegment).valid) continue;
+          subGraphMetaUris.push(g);
+        }
         variableAllowedGraphs = [
           ...variableAllowedGraphs,
           ...subGraphMetaUris.filter((g) => !variableAllowedGraphs.includes(g)),

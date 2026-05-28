@@ -597,6 +597,81 @@ describe('DKGQueryEngine', () => {
     expect(result.bindings.some((b) => b['g'] === otherCgSwmMeta)).toBe(false);
   });
 
+  it('GRAPH ?g enumeration excludes _verified_memory/<vmId>/_meta and other reserved sub-segments', async () => {
+    // Codex r4 on #776: the previous draft used `endsWith('/_meta')`
+    // which would have admitted `<cg>/_verified_memory/<vmId>/_meta`
+    // alongside legitimate sub-graph `_meta`. Reserved sub-segments
+    // (matching `validateSubGraphName`'s reject list:
+    // `_verified_memory`, `context`, `assertion`, `draft`, anything
+    // starting with `_`) must NOT be enumerated.
+    const verifiedMemoryMeta = `${GRAPH}/_verified_memory/q1/_meta`;
+    const reservedContext = `${GRAPH}/context/sub-x/_meta`;
+    const validSubMeta = `${GRAPH}/code/_meta`;
+    await store.insert([
+      { subject: 'urn:secret:vm', predicate: 'http://schema.org/x', object: '"vm"', graph: verifiedMemoryMeta },
+      { subject: 'urn:secret:ctx', predicate: 'http://schema.org/x', object: '"ctx"', graph: reservedContext },
+      { subject: 'urn:visible:code', predicate: 'http://schema.org/x', object: '"code"', graph: validSubMeta },
+    ]);
+    const result = await engine.query(
+      `SELECT ?v WHERE { GRAPH ?g { ?s <http://schema.org/x> ?v } }`,
+      { contextGraphId: CONTEXT_GRAPH },
+    );
+    const values = result.bindings.map((b) => b['v']).sort();
+    expect(values).toContain('"code"');
+    expect(values).not.toContain('"vm"');
+    expect(values).not.toContain('"ctx"');
+  });
+
+  it('GRAPH ?g enumeration with subGraphName=code does NOT bind sibling sub-graphs (route honored)', async () => {
+    // Codex r4 on #776: `{ contextGraphId, subGraphName: 'code' }`
+    // must constrain `?g` to that sub-graph's metas only — sibling
+    // sub-graphs like `decisions/_meta` remain invisible. The static
+    // `metaAllowList` already pins this exactly; the dynamic
+    // enumeration is skipped when `subGraphName` is supplied.
+    const codeSwmMeta = `${GRAPH}/code/_shared_memory_meta`;
+    const decisionsSwmMeta = `${GRAPH}/decisions/_shared_memory_meta`;
+    await store.insert([
+      { subject: 'urn:op:in-scope', predicate: 'http://schema.org/agent', object: '"agentCode"', graph: codeSwmMeta },
+      { subject: 'urn:op:sibling', predicate: 'http://schema.org/agent', object: '"agentDecisions"', graph: decisionsSwmMeta },
+    ]);
+    const result = await engine.query(
+      `SELECT ?agent WHERE { GRAPH ?g { ?op <http://schema.org/agent> ?agent } }`,
+      { contextGraphId: CONTEXT_GRAPH, subGraphName: 'code' },
+    );
+    const agents = result.bindings.map((b) => b['agent']).sort();
+    expect(agents).toEqual(['"agentCode"']);
+  });
+
+  it('GRAPH ?g enumeration uses structural match — wallet-scoped cgId does NOT leak from id-prefix-collision CG', async () => {
+    // Codex r4 RED on #776: `validateContextGraphId` allows `/`, so
+    // wallet-scoped ids like `0xabc.../my-project` would have made a
+    // plain `startsWith` prefix test also admit graphs from any CG
+    // whose id is `<this-cg>/<extra-segment>` (e.g.
+    // `0xabc.../my-project/sub-cg`). The structural match (one
+    // sub-graph segment between `<cgRoot>/` and the meta suffix,
+    // segment validated by `validateSubGraphName`) keeps cross-CG
+    // isolation intact.
+    //
+    // Note: the engine doesn't enforce `validateContextGraphId` at
+    // construction time; we exercise the structural fence directly
+    // by seeding two parallel "CG roots" that overlap via the slash
+    // convention.
+    const walletCg = 'did:dkg:context-graph:0xabc/proj';
+    const collidingCgRootMeta = `${walletCg}/legitimate-sub/_meta`;
+    const otherCgUnderSlash = `${walletCg}/other-cg/extra/_meta`;
+    await store.insert([
+      { subject: 'urn:in', predicate: 'http://schema.org/n', object: '"in"', graph: collidingCgRootMeta },
+      { subject: 'urn:out', predicate: 'http://schema.org/n', object: '"out"', graph: otherCgUnderSlash },
+    ]);
+    const result = await engine.query(
+      `SELECT ?v WHERE { GRAPH ?g { ?s <http://schema.org/n> ?v } }`,
+      { contextGraphId: '0xabc/proj' },
+    );
+    const values = result.bindings.map((b) => b['v']).sort();
+    expect(values).toContain('"in"');
+    expect(values).not.toContain('"out"');
+  });
+
   it('graphSuffix=_shared_memory drops sub-graph _meta from variable enumeration (privacy fence holds)', async () => {
     // The dynamic sub-graph enumeration must respect the SWM-only
     // privacy fence: a caller scoped to `graphSuffix='_shared_memory'`

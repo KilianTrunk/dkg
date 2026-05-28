@@ -185,26 +185,25 @@ describe('workspace encrypted payload helpers', () => {
   // (the canonical 32-byte hex form). Anything else falls through to
   // the base64url path that `encodeWorkspaceEncryptionKey` always
   // emits.
-  it('encode → decode round-trip is byte-stable for 10k random x25519 keys', () => {
-    const N = 10_000;
-    let zeroXPrefixCount = 0;
+  it('encode → decode round-trip is byte-stable across many random x25519 keys', () => {
+    // Deterministic background coverage. The base64url-with-0x-prefix
+    // collision the next test pins is rare (~1/4096 per key) so an
+    // expectation that 10k samples contain ≥1 collision flakes at ~8%
+    // on its own; that flaky assertion was removed in favour of the
+    // deterministic literal fixture below. This test still exercises
+    // round-trip stability for 1k random keys, which is fast and gives
+    // the byte-equality assertion broad coverage.
+    const N = 1_000;
     for (let i = 0; i < N; i++) {
       const key = generateWorkspaceRecipientEncryptionKey(
         `did:dkg:agent:test-${i}`,
         `did:dkg:agent:test-${i}#x25519`,
       );
       const encoded = encodeWorkspaceEncryptionKey(key.publicKeyBytes);
-      if (encoded.startsWith('0x')) zeroXPrefixCount++;
       const decoded = decodeWorkspaceEncryptionKey(encoded);
       expect(decoded).toHaveLength(WORKSPACE_ENCRYPTION_KEY_BYTES);
       expect(Buffer.from(decoded).equals(Buffer.from(key.publicKeyBytes))).toBe(true);
     }
-    // Sanity check: at 10k samples we expect ≥1 base64url-with-0x-prefix
-    // collision (geometric distribution, ~1 per 4096 samples). If this
-    // is zero on a healthy generator the regression would silently
-    // re-pass; surface it explicitly so the regression value of the
-    // test stays visible.
-    expect(zeroXPrefixCount).toBeGreaterThan(0);
   });
 
   it('decodes the literal failing base64url-with-0x-prefix key from PR #792 CI', () => {

@@ -127,14 +127,22 @@ export async function promptStoreBackend(
   const defaultBackend = opts.flagBackend
     ?? (existingBackend === 'blazegraph' || existingBackend === 'sparql-http' ? existingBackend : 'oxigraph');
 
-  const backendAnswer = (await opts.ask(
-    'Triple store backend (oxigraph / blazegraph)',
-    defaultBackend,
-  )).toLowerCase();
+  const backendChoices = ['oxigraph', 'blazegraph'] as const;
+  const defaultIdx = Math.max(0, backendChoices.indexOf(defaultBackend as typeof backendChoices[number]));
+  log('  Triple store backend:');
+  for (let i = 0; i < backendChoices.length; i++) {
+    log(`    ${i + 1}) ${backendChoices[i]}`);
+  }
+  const backendInput = (await opts.ask(
+    `Choose (1-${backendChoices.length})`,
+    String(defaultIdx + 1),
+  )).trim();
 
-  // Normalise: anything that isn't a known external alias falls back to
-  // the local default. We accept the internal alias `oxigraph-worker`
-  // for power users but don't advertise it.
+  // Accept both the number ("1", "2") and the name ("blazegraph")
+  const backendAnswer = /^\d+$/.test(backendInput)
+    ? (backendChoices[parseInt(backendInput, 10) - 1] ?? 'oxigraph')
+    : backendInput.toLowerCase();
+
   if (backendAnswer !== 'blazegraph' && backendAnswer !== 'sparql-http') {
     return { storeBlock: null };
   }
@@ -146,7 +154,7 @@ export async function promptStoreBackend(
     const defaultUrl = opts.flagUrl ?? existingUrl;
     const url = (await opts.ask(
       backend === 'blazegraph'
-        ? 'Blazegraph SPARQL endpoint URL'
+        ? 'Blazegraph SPARQL endpoint URL (leave empty to auto-provision via Docker)'
         : 'SPARQL query endpoint URL',
       defaultUrl,
     )).trim();
@@ -160,7 +168,7 @@ export async function promptStoreBackend(
         const dockerOk = await probeDocker();
         if (dockerOk) {
           const yes = (await opts.ask(
-            'No URL provided. Provision a Blazegraph container via Docker? (y/n)',
+            'Provision a Blazegraph container via Docker? (y/n)',
             'y',
           )).toLowerCase();
           if (yes !== 'n') {
@@ -188,8 +196,11 @@ export async function promptStoreBackend(
             }
           }
         } else {
-          log('  Docker not detected on PATH. Install Docker Desktop or the Docker Engine');
-          log('  to use the convenience path, or provide a URL to an existing instance.');
+          log('');
+          log('  Docker is not installed on this system.');
+          log('  Install Docker to auto-provision Blazegraph, or start it manually');
+          log('  and enter its SPARQL endpoint URL below.');
+          log('');
         }
       }
       const retry = (await opts.ask('Retry with a URL? (y/n)', 'y')).toLowerCase();

@@ -46,7 +46,19 @@ contract Profile is INamed, IVersioned, ContractStatus, IInitializable {
     // `OperationalKeyTaken(bytes32)`. Pure diagnostic refinement, no
     // behaviour change for valid callers. The cross-identity (global
     // `identityIds`) collision still surfaces as `OperationalKeyTaken`.
-    string private constant _VERSION = "1.4.1";
+    // Bumped 1.4.1 -> 1.4.2: the createProfile op-wallet validation block
+    // is removed entirely. The single source of truth moves into
+    // `Identity.addOperationalWallets` (Identity 1.1.0), which now
+    // disambiguates same-identity duplicates (primary added by
+    // `createIdentity` OR intra-array dup) from cross-identity
+    // collisions via the same `OperationalWalletDuplicate(wallet)` /
+    // `OperationalKeyTaken(key)` error pair. Admin/operational overlap
+    // surfaces as `KeyAlreadyAttached(key)` from Identity. Eliminates
+    // the duplicate validation pass on the happy path; atomic-revert
+    // semantics make the prior "fail-fast at the entrypoint" rationale
+    // moot. `OperationalWalletAlreadyPrimary` and
+    // `OperationalWalletEqualsAdmin` are dropped from `IdentityLib`.
+    string private constant _VERSION = "1.4.2";
 
     Ask public askContract;
     Identity public identityContract;
@@ -144,46 +156,16 @@ contract Profile is INamed, IVersioned, ContractStatus, IInitializable {
             revert ProfileLib.OperatorFeeOutOfRange(initialOperatorFee);
         }
 
-        // Pre-flight operational-key validation. Surfaces collisions
-        // at the entrypoint with a single deterministic revert, before
-        // any identity is minted. Five classes, each with a distinct
-        // error so the caller can disambiguate without inspecting input:
-        //   - zero address                           → `OperationalAddressZero`
-        //   - opWallet == msg.sender                 → `OperationalWalletAlreadyPrimary(wallet)`
-        //   - opWallet == adminWallet                → `OperationalWalletEqualsAdmin(wallet)`
-        //   - intra-array duplicate                  → `OperationalWalletDuplicate(wallet)`
-        //   - already mapped to existing identity    → `OperationalKeyTaken(keccak256(wallet))`
-        // Same constraints were previously enforced indirectly inside
-        // `Identity.addOperationalWallets`; surfacing them up front
-        // avoids partial-failure half-built identities. Admin-key reuse
-        // across identities remains intentionally un-policed.
-        for (uint256 i; i < operationalWallets.length; ) {
-            address opWallet = operationalWallets[i];
-            if (opWallet == address(0)) {
-                revert IdentityLib.OperationalAddressZero();
-            }
-            if (opWallet == msg.sender) {
-                revert IdentityLib.OperationalWalletAlreadyPrimary(opWallet);
-            }
-            if (opWallet == adminWallet) {
-                revert IdentityLib.OperationalWalletEqualsAdmin(opWallet);
-            }
-            if (ids.identityIds(keccak256(abi.encodePacked(opWallet))) != 0) {
-                revert IdentityLib.OperationalKeyTaken(keccak256(abi.encodePacked(opWallet)));
-            }
-            for (uint256 j = i + 1; j < operationalWallets.length; ) {
-                if (operationalWallets[j] == opWallet) {
-                    revert IdentityLib.OperationalWalletDuplicate(opWallet);
-                }
-                unchecked {
-                    j++;
-                }
-            }
-            unchecked {
-                i++;
-            }
-        }
-
+        // `Identity.addOperationalWallets` (Identity 1.1.0) carries the
+        // single source of truth for the op-wallet validation suite:
+        //   - zero address                  → `OperationalAddressZero`
+        //   - intra-array dup / primary     → `OperationalWalletDuplicate(wallet)`
+        //   - cross-identity collision      → `OperationalKeyTaken(key)`
+        //   - admin/operational overlap     → `KeyAlreadyAttached(key)`
+        // Per-class diagnostics are surfaced from there, so this
+        // entrypoint no longer pays the gas of a duplicate pre-flight
+        // pass on the happy path. A failing tx reverts atomically, so
+        // there is never a partial / half-built identity to clean up.
         uint72 identityId = id.createIdentity(msg.sender, adminWallet);
         id.addOperationalWallets(identityId, operationalWallets);
 

@@ -5,6 +5,7 @@ import hre from 'hardhat';
 
 import {
   Hub,
+  Identity,
   IdentityStorage,
   ParametersStorage,
   Profile,
@@ -18,6 +19,7 @@ import {
 type ProfileFixture = {
   accounts: SignerWithAddress[];
   Hub: Hub;
+  Identity: Identity;
   IdentityStorage: IdentityStorage;
   Profile: Profile;
   ParametersStorage: ParametersStorage;
@@ -31,6 +33,7 @@ type ProfileFixture = {
 describe('@unit Profile contract', function () {
   let accounts: SignerWithAddress[];
   let Hub: Hub;
+  let Identity: Identity;
   let IdentityStorage: IdentityStorage;
   let Profile: Profile;
   let ParametersStorage: ParametersStorage;
@@ -47,6 +50,7 @@ describe('@unit Profile contract', function () {
   async function deployProfileFixture(): Promise<ProfileFixture> {
     await hre.deployments.fixture(['Profile']);
     Profile = await hre.ethers.getContract<Profile>('Profile');
+    Identity = await hre.ethers.getContract<Identity>('Identity');
     IdentityStorage =
       await hre.ethers.getContract<IdentityStorage>('IdentityStorage');
     ParametersStorage =
@@ -69,6 +73,7 @@ describe('@unit Profile contract', function () {
     return {
       accounts,
       Hub,
+      Identity,
       IdentityStorage,
       Profile,
       ParametersStorage,
@@ -84,6 +89,7 @@ describe('@unit Profile contract', function () {
     ({
       accounts,
       Hub,
+      Identity,
       IdentityStorage,
       Profile,
       ParametersStorage,
@@ -99,8 +105,8 @@ describe('@unit Profile contract', function () {
     expect(await Profile.name()).to.equal('Profile');
   });
 
-  it('The contract is version "1.4.1"', async () => {
-    expect(await Profile.version()).to.equal('1.4.1');
+  it('The contract is version "1.4.2"', async () => {
+    expect(await Profile.version()).to.equal('1.4.2');
   });
 
   it('Create a profile with valid inputs, expect to pass', async () => {
@@ -255,9 +261,13 @@ describe('@unit Profile contract', function () {
     ).to.be.revertedWithCustomError(Profile, 'OperatorFeeOutOfRange');
   });
 
-  // Profile 1.4.1 — createProfile pre-flight op-wallet validation: each
-  // local collision class surfaces a distinct error so the caller can
-  // disambiguate without inspecting the input array.
+  // Profile 1.4.2 / Identity 1.1.0 — createProfile delegates op-wallet
+  // validation to `Identity.addOperationalWallets`. The same-identity
+  // duplicate vs cross-identity collision disambiguation surfaces via
+  // distinct errors; admin-wallet overlap surfaces as the existing
+  // `KeyAlreadyAttached` (admin/operational wallet reuse is a
+  // deliberate operator choice and stays un-policed beyond the key
+  // attachment check).
 
   it('createProfile reverts OperationalAddressZero when an op wallet is the zero address', async () => {
     await expect(
@@ -268,10 +278,10 @@ describe('@unit Profile contract', function () {
         nodeId1,
         1000,
       ),
-    ).to.be.revertedWithCustomError(Profile, 'OperationalAddressZero');
+    ).to.be.revertedWithCustomError(Identity, 'OperationalAddressZero');
   });
 
-  it('createProfile reverts OperationalWalletAlreadyPrimary when an op wallet equals msg.sender', async () => {
+  it('createProfile reverts OperationalWalletDuplicate when an op wallet equals msg.sender (already attached as primary)', async () => {
     await expect(
       Profile.connect(accounts[0]).createProfile(
         accounts[1].address,
@@ -281,11 +291,11 @@ describe('@unit Profile contract', function () {
         1000,
       ),
     )
-      .to.be.revertedWithCustomError(Profile, 'OperationalWalletAlreadyPrimary')
+      .to.be.revertedWithCustomError(Identity, 'OperationalWalletDuplicate')
       .withArgs(accounts[0].address);
   });
 
-  it('createProfile reverts OperationalWalletEqualsAdmin when an op wallet equals adminWallet', async () => {
+  it('createProfile reverts KeyAlreadyAttached when an op wallet equals adminWallet (admin/operational overlap)', async () => {
     await expect(
       Profile.createProfile(
         accounts[1].address,
@@ -294,9 +304,7 @@ describe('@unit Profile contract', function () {
         nodeId1,
         1000,
       ),
-    )
-      .to.be.revertedWithCustomError(Profile, 'OperationalWalletEqualsAdmin')
-      .withArgs(accounts[1].address);
+    ).to.be.revertedWithCustomError(Identity, 'KeyAlreadyAttached');
   });
 
   it('createProfile reverts OperationalWalletDuplicate when the op-wallet array has an intra-array duplicate', async () => {
@@ -309,7 +317,7 @@ describe('@unit Profile contract', function () {
         1000,
       ),
     )
-      .to.be.revertedWithCustomError(Profile, 'OperationalWalletDuplicate')
+      .to.be.revertedWithCustomError(Identity, 'OperationalWalletDuplicate')
       .withArgs(accounts[2].address);
   });
 
@@ -332,7 +340,7 @@ describe('@unit Profile contract', function () {
         nodeId1,
         1000,
       ),
-    ).to.be.revertedWithCustomError(Profile, 'OperationalKeyTaken');
+    ).to.be.revertedWithCustomError(Identity, 'OperationalKeyTaken');
   });
 
   it('Update ask for a profile with valid input, expect to pass', async () => {

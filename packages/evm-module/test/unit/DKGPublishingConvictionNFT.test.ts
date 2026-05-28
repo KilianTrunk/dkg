@@ -973,6 +973,118 @@ describe('@unit DKGPublishingConvictionNFT', function () {
       expect(fn!.inputs[2].name).to.equal('kcStartEpoch');
       expect(fn!.inputs[3].name).to.equal('kcEpochs');
     });
+
+    // PublishingConviction 1.0.1 — post-discount floor pin.
+    //
+    // Integer truncation in `(baseCost * (BPS - discountBps)) / BPS`
+    // collapses `baseCost == 1` against any non-zero `discountBps` to
+    // `discountedCost == 0`, which would skip `windowSpent` accounting
+    // AND the active-sink reward distribution — i.e. a free
+    // conviction-discounted publish on the PCA branch. The on-chain
+    // `tokenAmount > 0` floor in KAV10 10.1.1 only protects the
+    // direct-spend branch; this is its conviction-branch twin. The
+    // floor inflates `discountedCost` to 1 wei TRAC when `baseCost > 0`
+    // so both branches charge a non-zero economic cost.
+    it('floors discountedCost at 1 wei when baseCost > 0 and integer truncation rounds the discount to 0', async () => {
+      // Lowest tier still triggers a non-zero discountBps (1000bps).
+      // Any committed amount that hits the 1000bps tier suffices.
+      const committed = hre.ethers.parseEther('30000');
+      await createAtWithAgent(committed, agent.address);
+      const info = await NFT.getAccountInfo(1);
+      expect(info.discountBps).to.be.gt(0n);
+
+      const baseCost = 1n;
+      const expectedFloor = 1n;
+      const kcStart = await ChronosContract.getCurrentEpoch();
+      const kcEpochs = 2n;
+
+      // staticCall verifies the floor reaches the return value.
+      const returned = await NFT.connect(Kav10Signer).coverPublishingCost.staticCall(
+        agent.address,
+        baseCost,
+        kcStart,
+        kcEpochs,
+      );
+      expect(returned).to.equal(expectedFloor);
+
+      // Execute the real call: the floor must propagate through to
+      // `_distributeProrated` and `windowSpent` accounting.
+      const epochLength = await ChronosContract.epochLength();
+      const currentWindow = await currentBillingWindow(
+        info.createdAtTimestamp,
+        epochLength,
+      );
+      const windowSpentBefore = await NFT.windowSpent(1, currentWindow);
+
+      const tx = await NFT.connect(Kav10Signer).coverPublishingCost(
+        agent.address,
+        baseCost,
+        kcStart,
+        kcEpochs,
+      );
+      const receipt = await tx.wait();
+
+      // Active-sink invariant: sum of `TokensAddedToEpochRange` events
+      // emitted against `STAKER_SHARD_ID` MUST equal 1 (the floor).
+      const epsAddr = (await EpochStorageContract.getAddress()).toLowerCase();
+      const iface = EpochStorageContract.interface;
+      let totalDistributed = 0n;
+      let eventCount = 0;
+      for (const log of receipt!.logs) {
+        if (log.address.toLowerCase() !== epsAddr) continue;
+        let parsed;
+        try {
+          parsed = iface.parseLog({ topics: log.topics as string[], data: log.data });
+        } catch {
+          continue;
+        }
+        if (parsed?.name !== 'TokensAddedToEpochRange') continue;
+        eventCount++;
+        expect(parsed.args.shardId).to.equal(STAKER_SHARD_ID);
+        totalDistributed += BigInt(parsed.args.tokenAmount);
+      }
+      expect(eventCount).to.be.greaterThan(0);
+      expect(totalDistributed).to.equal(expectedFloor);
+
+      // windowSpent accounting must also increment by 1 (drawnFromEpoch
+      // is the floored amount when the base allowance covers it).
+      const windowSpentAfter = await NFT.windowSpent(1, currentWindow);
+      expect(windowSpentAfter - windowSpentBefore).to.equal(expectedFloor);
+    });
+
+    it('coverPublishingCost(baseCost = 0) stays a no-op (post-discount floor is gated on baseCost > 0)', async () => {
+      const committed = hre.ethers.parseEther('30000');
+      await createAtWithAgent(committed, agent.address);
+
+      const kcStart = await ChronosContract.getCurrentEpoch();
+      const kcEpochs = 2n;
+
+      const returned = await NFT.connect(Kav10Signer).coverPublishingCost.staticCall(
+        agent.address,
+        0n,
+        kcStart,
+        kcEpochs,
+      );
+      expect(returned).to.equal(0n);
+
+      const info = await NFT.getAccountInfo(1);
+      const epochLength = await ChronosContract.epochLength();
+      const currentWindow = await currentBillingWindow(
+        info.createdAtTimestamp,
+        epochLength,
+      );
+      const windowSpentBefore = await NFT.windowSpent(1, currentWindow);
+
+      await NFT.connect(Kav10Signer).coverPublishingCost(
+        agent.address,
+        0n,
+        kcStart,
+        kcEpochs,
+      );
+
+      const windowSpentAfter = await NFT.windowSpent(1, currentWindow);
+      expect(windowSpentAfter - windowSpentBefore).to.equal(0n);
+    });
   });
 
   // ======================================================================

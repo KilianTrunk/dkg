@@ -761,7 +761,12 @@ cmd_start() {
   # Start node 1 (relay) first, then the rest
   start_node 1
 
-  for i in $(seq 2 "$NUM_NODES"); do
+  # macOS BSD `seq` counts DOWN when the start exceeds the stop
+  # (`seq 2 1` -> "2\n1") whereas GNU seq returns empty. With NUM_NODES=1
+  # the BSD path looped backwards into start_node 2, which then crashed
+  # on a missing node2/config.json. Use a C-style arithmetic for loop
+  # so the empty-range case is handled identically on both systems.
+  for ((i = 2; i <= NUM_NODES; i++)); do
     start_node "$i"
   done
 

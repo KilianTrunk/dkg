@@ -39,7 +39,14 @@ contract Profile is INamed, IVersioned, ContractStatus, IInitializable {
     // explicit operational-key uniqueness pre-flight validation inside
     // createProfile so collision diagnostics surface at the entrypoint
     // instead of mid-loop inside `Identity.addOperationalWallets`.
-    string private constant _VERSION = "1.4.0";
+    // Bumped 1.4.0 -> 1.4.1: the createProfile op-wallet validation block
+    // emits distinct errors for the local collision classes
+    // (`OperationalWalletDuplicate` / `OperationalWalletAlreadyPrimary` /
+    // `OperationalWalletEqualsAdmin`) instead of overloading
+    // `OperationalKeyTaken(bytes32)`. Pure diagnostic refinement, no
+    // behaviour change for valid callers. The cross-identity (global
+    // `identityIds`) collision still surfaces as `OperationalKeyTaken`.
+    string private constant _VERSION = "1.4.1";
 
     Ask public askContract;
     Identity public identityContract;
@@ -139,33 +146,34 @@ contract Profile is INamed, IVersioned, ContractStatus, IInitializable {
 
         // Pre-flight operational-key validation. Surfaces collisions
         // at the entrypoint with a single deterministic revert, before
-        // any identity is minted. Four classes:
-        //   - msg.sender / adminWallet collision with an entry in
-        //     `operationalWallets`.
-        //   - intra-array duplicates inside `operationalWallets`.
-        //   - entries already mapped to an existing identity (global
-        //     operational-key uniqueness via `identityIds`).
-        //   - zero address.
+        // any identity is minted. Five classes, each with a distinct
+        // error so the caller can disambiguate without inspecting input:
+        //   - zero address                           → `OperationalAddressZero`
+        //   - opWallet == msg.sender                 → `OperationalWalletAlreadyPrimary(wallet)`
+        //   - opWallet == adminWallet                → `OperationalWalletEqualsAdmin(wallet)`
+        //   - intra-array duplicate                  → `OperationalWalletDuplicate(wallet)`
+        //   - already mapped to existing identity    → `OperationalKeyTaken(keccak256(wallet))`
         // Same constraints were previously enforced indirectly inside
         // `Identity.addOperationalWallets`; surfacing them up front
-        // avoids partial-failure half-built identities and gives a
-        // single deterministic error. Admin-key reuse across identities
-        // remains intentionally un-policed.
-        IdentityStorage idsRef = ids;
+        // avoids partial-failure half-built identities. Admin-key reuse
+        // across identities remains intentionally un-policed.
         for (uint256 i; i < operationalWallets.length; ) {
             address opWallet = operationalWallets[i];
             if (opWallet == address(0)) {
                 revert IdentityLib.OperationalAddressZero();
             }
-            if (opWallet == msg.sender || opWallet == adminWallet) {
-                revert IdentityLib.OperationalKeyTaken(keccak256(abi.encodePacked(opWallet)));
+            if (opWallet == msg.sender) {
+                revert IdentityLib.OperationalWalletAlreadyPrimary(opWallet);
             }
-            if (idsRef.identityIds(keccak256(abi.encodePacked(opWallet))) != 0) {
+            if (opWallet == adminWallet) {
+                revert IdentityLib.OperationalWalletEqualsAdmin(opWallet);
+            }
+            if (ids.identityIds(keccak256(abi.encodePacked(opWallet))) != 0) {
                 revert IdentityLib.OperationalKeyTaken(keccak256(abi.encodePacked(opWallet)));
             }
             for (uint256 j = i + 1; j < operationalWallets.length; ) {
                 if (operationalWallets[j] == opWallet) {
-                    revert IdentityLib.OperationalKeyTaken(keccak256(abi.encodePacked(opWallet)));
+                    revert IdentityLib.OperationalWalletDuplicate(opWallet);
                 }
                 unchecked {
                     j++;

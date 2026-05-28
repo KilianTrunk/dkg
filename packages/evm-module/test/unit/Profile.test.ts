@@ -99,8 +99,8 @@ describe('@unit Profile contract', function () {
     expect(await Profile.name()).to.equal('Profile');
   });
 
-  it('The contract is version "1.4.0"', async () => {
-    expect(await Profile.version()).to.equal('1.4.0');
+  it('The contract is version "1.4.1"', async () => {
+    expect(await Profile.version()).to.equal('1.4.1');
   });
 
   it('Create a profile with valid inputs, expect to pass', async () => {
@@ -253,6 +253,86 @@ describe('@unit Profile contract', function () {
     await expect(
       Profile.createProfile(accounts[1].address, [], 'Node 1', nodeId1, 10001),
     ).to.be.revertedWithCustomError(Profile, 'OperatorFeeOutOfRange');
+  });
+
+  // Profile 1.4.1 — createProfile pre-flight op-wallet validation: each
+  // local collision class surfaces a distinct error so the caller can
+  // disambiguate without inspecting the input array.
+
+  it('createProfile reverts OperationalAddressZero when an op wallet is the zero address', async () => {
+    await expect(
+      Profile.createProfile(
+        accounts[1].address,
+        [hre.ethers.ZeroAddress],
+        'Node 1',
+        nodeId1,
+        1000,
+      ),
+    ).to.be.revertedWithCustomError(Profile, 'OperationalAddressZero');
+  });
+
+  it('createProfile reverts OperationalWalletAlreadyPrimary when an op wallet equals msg.sender', async () => {
+    await expect(
+      Profile.connect(accounts[0]).createProfile(
+        accounts[1].address,
+        [accounts[0].address],
+        'Node 1',
+        nodeId1,
+        1000,
+      ),
+    )
+      .to.be.revertedWithCustomError(Profile, 'OperationalWalletAlreadyPrimary')
+      .withArgs(accounts[0].address);
+  });
+
+  it('createProfile reverts OperationalWalletEqualsAdmin when an op wallet equals adminWallet', async () => {
+    await expect(
+      Profile.createProfile(
+        accounts[1].address,
+        [accounts[1].address],
+        'Node 1',
+        nodeId1,
+        1000,
+      ),
+    )
+      .to.be.revertedWithCustomError(Profile, 'OperationalWalletEqualsAdmin')
+      .withArgs(accounts[1].address);
+  });
+
+  it('createProfile reverts OperationalWalletDuplicate when the op-wallet array has an intra-array duplicate', async () => {
+    await expect(
+      Profile.createProfile(
+        accounts[1].address,
+        [accounts[2].address, accounts[2].address],
+        'Node 1',
+        nodeId1,
+        1000,
+      ),
+    )
+      .to.be.revertedWithCustomError(Profile, 'OperationalWalletDuplicate')
+      .withArgs(accounts[2].address);
+  });
+
+  it('createProfile reverts OperationalKeyTaken when an op wallet is already attached to a different identity', async () => {
+    const nodeId2 =
+      '0x17f38512786964d9e70453371e7c98975d284100d44bd68dab67fe00b525cb66';
+    await Profile.connect(accounts[3]).createProfile(
+      accounts[4].address,
+      [accounts[5].address],
+      'Node 2',
+      nodeId2,
+      1000,
+    );
+
+    await expect(
+      Profile.createProfile(
+        accounts[1].address,
+        [accounts[5].address],
+        'Node 1',
+        nodeId1,
+        1000,
+      ),
+    ).to.be.revertedWithCustomError(Profile, 'OperationalKeyTaken');
   });
 
   it('Update ask for a profile with valid input, expect to pass', async () => {

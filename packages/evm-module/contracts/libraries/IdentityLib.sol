@@ -18,4 +18,11 @@ library IdentityLib {
     error CannotDeleteOnlyAdminKey(uint72 identityId);
     error CannotDeleteOnlyOperationalKey(uint72 identityId);
     error AdminFunctionOnly(uint72 identityId, address sender);
+
+    // Distinct diagnostics for the createProfile op-wallet pre-flight
+    // validation block. `OperationalKeyTaken(bytes32)` remains in use for
+    // the cross-identity (global `identityIds`) collision case.
+    error OperationalWalletDuplicate(address wallet);
+    error OperationalWalletAlreadyPrimary(address wallet);
+    error OperationalWalletEqualsAdmin(address wallet);
 }

@@ -18,6 +18,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import type { DkgClient } from '../client.js';
 import type { DkgConfig } from '../config.js';
+import { EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION } from './context-graph-description.js';
 
 type ToolResult = {
   content: Array<{ type: 'text'; text: string }>;
@@ -68,7 +69,7 @@ export function registerAssertionTools(
         projectId: z
           .string()
           .optional()
-          .describe('contextGraphId; defaults to .dkg/config.yaml'),
+          .describe(`${EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION} Defaults to .dkg/config.yaml.`),
         subGraphName: z
           .string()
           .optional()
@@ -141,7 +142,7 @@ export function registerAssertionTools(
           )
           .min(1)
           .describe('Non-empty array of RDF quads to append'),
-        projectId: z.string().optional(),
+        projectId: z.string().optional().describe(`${EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION} Defaults to .dkg/config.yaml.`),
         subGraphName: z.string().optional(),
       },
     },
@@ -194,7 +195,7 @@ export function registerAssertionTools(
           .describe(
             'Root entity URIs to promote. Omit to promote all roots.',
           ),
-        projectId: z.string().optional(),
+        projectId: z.string().optional().describe(`${EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION} Defaults to .dkg/config.yaml.`),
         subGraphName: z.string().optional(),
       },
     },
@@ -243,7 +244,7 @@ export function registerAssertionTools(
         '*replace* rather than *merge*.',
       inputSchema: {
         name: z.string().describe('Existing assertion name'),
-        projectId: z.string().optional(),
+        projectId: z.string().optional().describe(`${EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION} Defaults to .dkg/config.yaml.`),
         subGraphName: z.string().optional(),
       },
     },
@@ -275,7 +276,7 @@ export function registerAssertionTools(
         '`assertion_create + assertion_write + assertion_promote` round-trip.',
       inputSchema: {
         name: z.string().describe('Existing assertion name'),
-        projectId: z.string().optional(),
+        projectId: z.string().optional().describe(`${EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION} Defaults to .dkg/config.yaml.`),
         subGraphName: z.string().optional(),
       },
     },
@@ -312,7 +313,7 @@ export function registerAssertionTools(
       description:
         'Optional validation/debug helper: resolve a completed imported attachment/assertion into deterministic metadata such as source file hash, Markdown hash/form, extraction method, root entity, and structural counts. Skipped imports are rejected.',
       inputSchema: {
-        projectId: z.string().optional().describe('contextGraphId; defaults to .dkg/config.yaml'),
+        projectId: z.string().optional().describe(`${EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION} Defaults to .dkg/config.yaml.`),
         assertionUri: z.string().min(1).describe('Completed imported assertion URI from the attachment ref'),
         fileHash: z.string().optional().describe('Optional source file hash to verify'),
         subGraphName: z.string().optional(),
@@ -342,7 +343,7 @@ export function registerAssertionTools(
       description:
         'Read Markdown for a completed imported attachment via the daemon content-addressed file store. This never reads arbitrary filesystem paths.',
       inputSchema: {
-        projectId: z.string().optional().describe('contextGraphId; defaults to .dkg/config.yaml'),
+        projectId: z.string().optional().describe(`${EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION} Defaults to .dkg/config.yaml.`),
         assertionUri: z.string().min(1).describe('Completed imported assertion URI from the attachment ref'),
         fileHash: z.string().optional().describe('Optional source file hash to verify'),
         subGraphName: z.string().optional(),
@@ -374,7 +375,7 @@ export function registerAssertionTools(
       description:
         'Append model-derived semantic triples to a completed imported assertion with daemon-stamped provenance. Does not promote, finalize, or publish.',
       inputSchema: {
-        projectId: z.string().optional().describe('contextGraphId; defaults to .dkg/config.yaml'),
+        projectId: z.string().optional().describe(`${EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION} Defaults to .dkg/config.yaml.`),
         assertionUri: z.string().min(1).describe('Source imported assertion URI from the attachment ref'),
         fileHash: z.string().optional().describe('Optional source file hash to verify'),
         semanticQuads: z
@@ -439,7 +440,7 @@ export function registerAssertionTools(
       inputSchema: {
         name: z.string().describe('Target assertion name'),
         filePath: z.string().describe('Absolute local path to the file to import'),
-        projectId: z.string().optional(),
+        projectId: z.string().optional().describe(`${EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION} Defaults to .dkg/config.yaml.`),
         contentType: z
           .string()
           .optional()
@@ -550,7 +551,7 @@ export function registerAssertionTools(
         'debug/audit; not required for the canonical write flow.',
       inputSchema: {
         name: z.string().describe('Assertion name'),
-        projectId: z.string().optional(),
+        projectId: z.string().optional().describe(`${EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION} Defaults to .dkg/config.yaml.`),
         agentAddress: z
           .string()
           .optional()

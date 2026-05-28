@@ -18,6 +18,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import type { DkgClient } from '../client.js';
 import type { DkgConfig } from '../config.js';
+import { EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION } from './context-graph-description.js';
 
 type ToolResult = {
   content: Array<{ type: 'text'; text: string }>;
@@ -77,6 +78,9 @@ export function registerSetupTools(
         'The `id` slug is auto-derived from `name` when omitted (e.g. ' +
         '"My Research" → "my-research"); slugs must match ' +
         '/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/. ' +
+        'This create-only slug is not the same contract as existing-CG write targets: ' +
+        'after creation, pass the returned canonical `id` or full `did:dkg:context-graph:...` ' +
+        'URI to assertion, sub-graph, publish, and other write tools. ' +
         'Defaults to safe `sharing="invite-only"` + `contribution="curators-only"`; ' +
         'switch to `"open"` to make the CG publicly discoverable or to allow ' +
         'anyone to publish to Verified Memory respectively.',
@@ -87,8 +91,8 @@ export function registerSetupTools(
           .string()
           .optional()
           .describe(
-            'Optional explicit slug. Auto-derived from `name` when omitted. ' +
-              'Must match /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.',
+            'Optional explicit slug for creating a new CG. Auto-derived from `name` when omitted. ' +
+              'Must match /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/. Do not use this field as a model for existing-CG write targets; use the returned canonical id after creation.',
           ),
         sharing: z
           .enum(['open', 'invite-only'])
@@ -171,7 +175,7 @@ export function registerSetupTools(
         'pass `includeSharedMemory: false` to skip SWM sync (saves ' +
         'bandwidth when you only need on-chain data).',
       inputSchema: {
-        contextGraphId: z.string().min(1).describe('Context graph id (e.g. "my-research")'),
+        contextGraphId: z.string().min(1).describe(EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION),
         includeSharedMemory: z
           .boolean()
           .optional()
@@ -224,7 +228,7 @@ export function registerSetupTools(
         'silently reused, no error. Names must be lowercase letters, ' +
         'digits, and hyphens, and must not start with `_`.',
       inputSchema: {
-        contextGraphId: z.string().min(1).describe('Parent context graph id'),
+        contextGraphId: z.string().min(1).describe(`Parent context graph id. ${EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION}`),
         subGraphName: z
           .string()
           .min(1)

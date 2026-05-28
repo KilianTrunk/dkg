@@ -33,6 +33,22 @@ describe('assertion CRUD quintet — round-trip with @en literal preservation', 
     }
   });
 
+  it('documents canonical context graph ids for assertion write tools', () => {
+    for (const name of [
+      'dkg_assertion_create',
+      'dkg_assertion_write',
+      'dkg_assertion_promote',
+      'dkg_assertion_discard',
+      'dkg_assertion_query',
+    ]) {
+      const projectId = server.get(name).config.inputSchema?.projectId;
+      expect(projectId?.description).toContain('dkg_list_context_graphs');
+      expect(projectId?.description).toContain('local-notes');
+      expect(projectId?.description).toContain('<curatorAddress>/<slug>');
+      expect(projectId?.description).toContain('Do not guess');
+    }
+  });
+
   it('exposes imported attachment resolve/read/enrichment helpers without promoting', async () => {
     const assertionUri = 'did:dkg:context-graph:test-cg/assertion/peer-test/imported-doc';
 

@@ -65,6 +65,18 @@ describe('promote-async daemon routes', () => {
 
   function makeAgent() {
     return {
+      async listContextGraphs() {
+        return ['cg', 'cg-1', 'cg-2', 'graphify', 'team-graph'].map((id) => ({
+          id,
+          uri: `did:dkg:context-graph:${id}`,
+          name: id,
+          subscribed: true,
+          synced: true,
+        }));
+      },
+      async contextGraphExists(contextGraphId: string) {
+        return ['cg', 'cg-1', 'cg-2', 'graphify', 'team-graph'].includes(contextGraphId);
+      },
       assertion: {
         async promoteAsync(
           contextGraphId: string,

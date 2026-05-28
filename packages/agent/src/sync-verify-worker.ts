@@ -58,23 +58,51 @@ export class SyncVerifyWorker {
 
   constructor() {
     // Workers boot from compiled `.js`. In production, `import.meta.url`
-    // resolves to `dist/sync-verify-worker.js` and the sibling `.js`
-    // exists. In dev / vitest source-mode, `import.meta.url` resolves
-    // into `src/`, where only `.ts` exists — Node's `Worker` cannot load
-    // bare `.ts` (Codex round-2). Fall back through the parallel `dist/`
-    // path so vitest source-runs still pick up the compiled worker if
-    // the package has been built. As a final fallback we try the `.ts`
-    // path — that only succeeds on a Node loader that understands TS
-    // (e.g. tsx). The worker fails fast otherwise instead of silently
-    // poisoning sync results with a thrown promise.
-    const candidates: URL[] = [
-      new URL('./sync-verify-worker-impl.js', import.meta.url),
-      // src/foo.js → dist/foo.js (vitest source-mode)
-      new URL('./sync-verify-worker-impl.js', import.meta.url.replace('/src/', '/dist/')),
-      new URL('./sync-verify-worker-impl.ts', import.meta.url),
-    ];
-    const workerUrl = candidates.find((u) => existsSync(fileURLToPath(u))) ?? candidates[0];
-    this.worker = new Worker(fileURLToPath(workerUrl));
+    // resolves to `dist/sync-verify-worker.js` and the sibling `.js` is
+    // present. In dev / vitest source-mode, `import.meta.url` points
+    // into `src/`, where only `.ts` exists — Node's `Worker` cannot
+    // load bare `.ts`, and `tsx`'s ESM hooks intentionally do not
+    // auto-register inside worker threads (see
+    // `node_modules/tsx/dist/esm/index.mjs` — `isMainThread && register()`).
+    //
+    // Resolution order (Codex round-3 hardening):
+    //   1. sibling `.js`       — production / consumed via dist/
+    //   2. parallel dist/*.js  — source-mode where `pnpm build` ran
+    //
+    // Anything else triggers an actionable error rather than letting
+    // Node spit `Unknown file extension ".ts"` from inside the Worker,
+    // which previously silently poisoned every `runSharedMemorySync`
+    // consumer with a thrown promise.
+    const sibJs = new URL('./sync-verify-worker-impl.js', import.meta.url);
+    const distJs = new URL(
+      './sync-verify-worker-impl.js',
+      import.meta.url.replace('/src/', '/dist/'),
+    );
+
+    const sibJsPath = fileURLToPath(sibJs);
+    const distJsPath = fileURLToPath(distJs);
+
+    let workerPath: string;
+    if (existsSync(sibJsPath)) {
+      workerPath = sibJsPath;
+    } else if (existsSync(distJsPath)) {
+      workerPath = distJsPath;
+    } else {
+      throw new Error(
+        `[SyncVerifyWorker] Compiled worker not found.\n` +
+          `  Looked for: ${sibJsPath}\n` +
+          `              ${distJsPath}\n` +
+          `Node's Worker cannot load TypeScript directly, and tsx's loader\n` +
+          `intentionally does not register inside worker threads. Build the\n` +
+          `agent package first:\n\n` +
+          `  pnpm --filter @origintrail-official/dkg-agent build\n\n` +
+          `(CI's "Build packages" stage already does this; this error only\n` +
+          `triggers in a fresh checkout where vitest is invoked before the\n` +
+          `package has been compiled.)`,
+      );
+    }
+
+    this.worker = new Worker(workerPath);
     this.worker.on('message', (message: { id: number; result?: SyncVerifyResult; error?: string }) => {
       const pending = this.pending.get(message.id);
       if (!pending) return;

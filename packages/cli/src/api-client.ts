@@ -59,6 +59,13 @@ export interface DaemonStatusResponse {
     rpcEndpointCount: number;
     hubConfigured: boolean;
   } | null;
+  // Triple-store backend fields (RFC 120). For local backends only
+  // `storeBackend` is meaningful; external backends additionally surface
+  // `storeUrl` and a TTL-cached `storeQuads` count. `null` when local /
+  // unreachable.
+  storeBackend?: string;
+  storeUrl?: string | null;
+  storeQuads?: number | null;
 }
 
 export class ApiClient {

@@ -34,6 +34,19 @@ export default defineConfig({
           'test/async-promote-worker.test.ts',
           'test/async-promote-queue-e2e.test.ts',
           'test/skill-endpoint.test.ts',
+          // RFC 120 / plan PR 1 + 2 — Blazegraph support. Pure logic
+          // (mocked fetch + in-memory config); cheap to keep in the
+          // fast unit lane.
+          'test/chain-reset-wipe.test.ts',
+          'test/store-health-check.test.ts',
+          'test/validate-store-config.test.ts',
+          'test/store-wizard.test.ts',
+          'test/blazegraph-docker.test.ts',
+          'test/store-identity-tag.test.ts',
+          // Opt-in via BLAZEGRAPH_INTEGRATION_TEST=1. Skips silently
+          // (no fetch / no docker spawn) when the env-var is unset, so
+          // keeping it in the fast unit lane costs nothing.
+          'test/blazegraph-integration.test.ts',
         ],
     testTimeout: runsDaemonHttpBehavior ? 120_000 : 60_000,
     globalSetup: runsDaemonHttpBehavior ? ['../chain/test/hardhat-global-setup.ts'] : [],

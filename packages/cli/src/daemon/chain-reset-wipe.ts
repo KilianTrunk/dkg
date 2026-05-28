@@ -53,14 +53,62 @@
  */
 import { existsSync, readFileSync, writeFileSync, readdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
+import { isExternalBackend, getSparqlEndpoint } from '@origintrail-official/dkg-storage';
 
 const STATE_FILE = '.network-state.json';
 
 interface PersistedNetworkState {
   /** Last chainResetMarker value the daemon booted on. */
   chainResetMarker: string | null;
+  /**
+   * Last triple-store backend the daemon booted on. Used by
+   * `detectBackendSwitch` to warn loudly when an operator hand-edits
+   * `config.store.backend` between boots — the new backend is fresh
+   * and empty, so silently booting would mean stale SWM/VM data is
+   * inaccessible. `null` on legacy state files (pre-RFC 120) and on
+   * first boot. (RFC 120 review point #6.)
+   */
+  lastBackend?: string | null;
   savedAt: number;
 }
+
+/**
+ * Subset of `DkgConfig['store']` used by the wipe step to talk to an
+ * external SPARQL endpoint. Decoupled from the CLI's config types so
+ * this module stays free of upward dependencies.
+ */
+export interface ChainResetWipeStoreConfig {
+  backend: string;
+  options?: {
+    url?: string;
+    queryEndpoint?: string;
+    updateEndpoint?: string;
+    auth?: string;
+    /**
+     * True when the namespace was provisioned by the CLI (PR 3 Docker
+     * convenience path). Operator-provided URLs default to false; the
+     * wipe then scopes deletes to the V10 named-graph prefix to avoid
+     * clobbering V6/V8 data sharing the same Blazegraph instance.
+     */
+    managedByDkg?: boolean;
+  };
+}
+
+/**
+ * V10 named-graph prefix. Every context-graph the agent writes — meta,
+ * shared-memory, finalisation — is rooted at `did:dkg:context-graph:`
+ * (confirmed in core/genesis.ts + finalization-handler.ts + dkg-agent.ts).
+ * Scoped DELETE for operator-provided external endpoints filters on this
+ * prefix to leave non-V10 data (V6/V8 assertions, operator side
+ * projects) alone.
+ */
+const V10_GRAPH_PREFIX = 'did:dkg:context-graph:';
+
+const SPARQL_DROP_ALL = 'DROP ALL';
+const SPARQL_SCOPED_DELETE =
+  'DELETE { GRAPH ?g { ?s ?p ?o } } ' +
+  'WHERE { GRAPH ?g { ?s ?p ?o } ' +
+  `FILTER(strstarts(str(?g), "${V10_GRAPH_PREFIX}")) }`;
 
 export interface ChainResetWipeResult {
   /** True when a wipe was performed. */
@@ -94,6 +142,19 @@ export interface ChainResetWipeOptions {
    * Falsy → fall back to `dataDir/random-sampling.wal` (the default).
    */
   randomSamplingWalPath?: string;
+  /**
+   * Operator's `config.store` block. Required to wipe an external SPARQL
+   * endpoint when the backend is `blazegraph` / `sparql-http`. Local
+   * backends ignore this field.
+   */
+  storeConfig?: ChainResetWipeStoreConfig;
+  /**
+   * Override for the SPARQL HTTP transport. Tests inject a mock to
+   * assert the issued UPDATE body; defaults to `globalThis.fetch`.
+   * Kept on the options surface (rather than module-scope monkey-patch)
+   * so parallel test cases don't race.
+   */
+  fetch?: typeof globalThis.fetch;
   /** Optional logger. Defaults to no-op so the function is silent in tests by default. */
   log?: (msg: string) => void;
 }
@@ -110,14 +171,94 @@ function loadState(dataDir: string): PersistedNetworkState | null {
 }
 
 function saveState(dataDir: string, marker: string | null): void {
+  // Preserve any sibling fields (lastBackend) that `detectBackendSwitch`
+  // may have written. Otherwise a chain-reset wipe would clobber a
+  // freshly-recorded backend tag and the next boot would re-warn.
+  const existing = loadState(dataDir) ?? { chainResetMarker: null, savedAt: 0 };
   writeFileSync(
     join(dataDir, STATE_FILE),
     JSON.stringify(
-      { chainResetMarker: marker, savedAt: Date.now() } satisfies PersistedNetworkState,
+      {
+        ...existing,
+        chainResetMarker: marker,
+        savedAt: Date.now(),
+      } satisfies PersistedNetworkState,
       null,
       2,
     ),
   );
+}
+
+function saveBackendTag(dataDir: string, backend: string): void {
+  const existing = loadState(dataDir) ?? { chainResetMarker: null, savedAt: 0 };
+  writeFileSync(
+    join(dataDir, STATE_FILE),
+    JSON.stringify(
+      {
+        ...existing,
+        lastBackend: backend,
+        savedAt: Date.now(),
+      } satisfies PersistedNetworkState,
+      null,
+      2,
+    ),
+  );
+}
+
+/**
+ * Wipe the V10 data sitting in an external SPARQL endpoint. Runs after
+ * the local file wipe so we don't strand the operator with a wiped FS
+ * but a populated remote namespace (or vice versa).
+ *
+ * - `managedByDkg === true` → `DROP ALL`. Safe because the namespace
+ *   was provisioned by the CLI and nobody else writes to it.
+ * - otherwise → scoped DELETE filtered by `did:dkg:context-graph:`. The
+ *   operator may be sharing the instance with V6/V8 nodes or unrelated
+ *   data; the wipe must leave anything that isn't V10 alone.
+ */
+async function performExternalWipe(
+  storeConfig: ChainResetWipeStoreConfig,
+  fetchImpl: typeof globalThis.fetch,
+  log: (msg: string) => void,
+): Promise<{ label: string; ok: boolean; error?: string }> {
+  const { updateUrl, headers } = getSparqlEndpoint({
+    backend: storeConfig.backend,
+    options: storeConfig.options,
+  });
+  const managed = storeConfig.options?.managedByDkg === true;
+  const update = managed ? SPARQL_DROP_ALL : SPARQL_SCOPED_DELETE;
+  const label = managed
+    ? `<sparql:drop-all ${updateUrl}>`
+    : `<sparql:scoped-delete ${updateUrl}>`;
+
+  log(
+    managed
+      ? `  external store (DKG-managed namespace): issuing DROP ALL against ${updateUrl}`
+      : `  external store (operator-provided URL): issuing scoped DELETE for "${V10_GRAPH_PREFIX}…" graphs against ${updateUrl}`,
+  );
+
+  try {
+    const res = await fetchImpl(updateUrl, {
+      method: 'POST',
+      headers: {
+        ...headers,
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: `update=${encodeURIComponent(update)}`,
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      const error = `${res.status} ${res.statusText}: ${text.slice(0, 200)}`;
+      log(`  WARN: external wipe failed: ${error}`);
+      return { label, ok: false, error };
+    }
+    log(`  removed: ${label}`);
+    return { label, ok: true };
+  } catch (err) {
+    const error = (err as Error).message;
+    log(`  WARN: external wipe transport error: ${error}`);
+    return { label, ok: false, error };
+  }
 }
 
 function performWipe(
@@ -183,8 +324,11 @@ function performWipe(
   return { removedFiles, failedFiles };
 }
 
-export function chainResetWipe(opts: ChainResetWipeOptions): ChainResetWipeResult {
+export async function chainResetWipe(
+  opts: ChainResetWipeOptions,
+): Promise<ChainResetWipeResult> {
   const log = opts.log ?? (() => {});
+  const fetchImpl = opts.fetch ?? globalThis.fetch;
 
   // Networks that haven't opted in: hook is a no-op. No state file is
   // touched so we don't accidentally turn on the protocol later just
@@ -231,6 +375,27 @@ export function chainResetWipe(opts: ChainResetWipeOptions): ChainResetWipeResul
     );
   }
 
+  // External SPARQL wipe runs AFTER local file wipe. We don't gate one
+  // on the other — both wipes attempt independently so an operator with
+  // a flaky external endpoint still gets a clean local state and a
+  // failedFiles entry that retries on next boot. Wrapped in try/catch
+  // because helper construction (URL extraction) can throw on malformed
+  // config; we want to surface that as a failedFile, not crash the boot.
+  if (opts.storeConfig && isExternalBackend(opts.storeConfig.backend)) {
+    try {
+      const result = await performExternalWipe(opts.storeConfig, fetchImpl, log);
+      if (result.ok) {
+        removedFiles.push(result.label);
+      } else {
+        failedFiles.push({ file: result.label, error: result.error ?? 'unknown' });
+      }
+    } catch (err) {
+      const message = (err as Error).message;
+      failedFiles.push({ file: '<external-wipe>', error: message });
+      log(`WARN: external SPARQL wipe failed to start: ${message}.`);
+    }
+  }
+
   if (failedFiles.length === 0) {
     try {
       saveState(opts.dataDir, opts.currentMarker);
@@ -255,4 +420,124 @@ export function chainResetWipe(opts: ChainResetWipeOptions): ChainResetWipeResul
   }
 
   return { wiped: true, prevMarker, removedFiles, failedFiles };
+}
+
+// =====================================================================
+// Backend switch detection (RFC 120 review point #6)
+// =====================================================================
+//
+// Switching from Oxigraph to Blazegraph (or vice versa) mid-flight means
+// the new backend is fresh and empty — all SWM / VM data from the
+// previous backend is unreachable. The chain-reset-wipe marker doesn't
+// move when only the backend changes, so without a separate signal the
+// daemon would silently boot on an empty store and the operator would
+// see vanished context graphs with no explanation.
+//
+// This check runs at boot, BEFORE config validation / health probe /
+// chain-reset wipe. Outcomes:
+//   - First boot (no persisted lastBackend): silently record current.
+//   - Match: silently re-record (handles legacy state files that lacked
+//     the field).
+//   - Mismatch + `acceptStoreReset === true`: log warning, record new.
+//   - Mismatch + no override: log multi-line warning, return aborted.
+//     Caller (lifecycle) exits the process.
+//
+// `acceptStoreReset` is controlled by the env var
+// `DKG_ACCEPT_STORE_RESET=1`. A CLI flag on `dkg start` would also work
+// but env keeps the boot entrypoint flat; operators set the env once,
+// restart the daemon, then unset.
+
+export interface BackendSwitchDetectOptions {
+  dataDir: string;
+  /**
+   * Backend name from the current config. Pass the effective value
+   * including the default — e.g. when `config.store?.backend` is
+   * undefined, callers should pass `'oxigraph-worker'` so the check
+   * is symmetric across "no store block" ↔ "explicit store block".
+   */
+  currentBackend: string;
+  /**
+   * Operator opt-in to proceed despite a backend change. Sourced from
+   * `process.env.DKG_ACCEPT_STORE_RESET === '1'` in production; tests
+   * inject explicitly.
+   */
+  acceptStoreReset: boolean;
+  log?: (msg: string) => void;
+}
+
+export interface BackendSwitchDetectResult {
+  /** True when `lastBackend` was recorded and differs from `currentBackend`. */
+  changed: boolean;
+  /** Previously-recorded backend, or null if none / legacy state file. */
+  previous: string | null;
+  /** Effective current backend (passed through for callers). */
+  current: string;
+  /**
+   * True when the daemon should abort boot. Set on `changed && !acceptStoreReset`.
+   * Caller exits the process so the operator can either flip the env
+   * var or revert their config edit.
+   */
+  aborted: boolean;
+}
+
+export function detectBackendSwitch(
+  opts: BackendSwitchDetectOptions,
+): BackendSwitchDetectResult {
+  const log = opts.log ?? (() => {});
+  const prev = loadState(opts.dataDir);
+  const previous =
+    typeof prev?.lastBackend === 'string' && prev.lastBackend.length > 0
+      ? prev.lastBackend
+      : null;
+
+  // First boot or legacy state file: silently record and move on. We
+  // explicitly do NOT treat null-previous as a "switch from
+  // oxigraph-worker"; that would re-warn every operator who upgrades
+  // into this release without ever having touched their store
+  // configuration. Only operator-visible config changes between two
+  // recorded backends count as a switch.
+  if (previous === null) {
+    try {
+      saveBackendTag(opts.dataDir, opts.currentBackend);
+    } catch {
+      // Non-fatal: if we can't write the tag now, we'll try again next
+      // boot. The downside is one missed early-warning window.
+    }
+    return { changed: false, previous: null, current: opts.currentBackend, aborted: false };
+  }
+
+  if (previous === opts.currentBackend) {
+    return { changed: false, previous, current: opts.currentBackend, aborted: false };
+  }
+
+  // Mismatch.
+  const warningHeader = [
+    `[STORE-SWITCH] triple-store backend changed since last boot:`,
+    `  previous: ${previous}`,
+    `  current:  ${opts.currentBackend}`,
+    ``,
+    `The new backend is a fresh store. Any context graphs, shared`,
+    `memory, or finalised assertions held only in the previous backend`,
+    `are NOT migrated and will be inaccessible until you either:`,
+    `  - revert config.store.backend to "${previous}", or`,
+    `  - accept the data loss by setting DKG_ACCEPT_STORE_RESET=1 in`,
+    `    the environment and restarting.`,
+  ].join('\n');
+
+  if (!opts.acceptStoreReset) {
+    log(warningHeader);
+    log(``);
+    log(`Refusing to start: set DKG_ACCEPT_STORE_RESET=1 to proceed.`);
+    return { changed: true, previous, current: opts.currentBackend, aborted: true };
+  }
+
+  log(warningHeader);
+  log(``);
+  log(`DKG_ACCEPT_STORE_RESET=1 set — proceeding with the new backend.`);
+  try {
+    saveBackendTag(opts.dataDir, opts.currentBackend);
+  } catch (err) {
+    log(`WARN: failed to persist new backend tag: ${(err as Error).message}. Will re-warn on next boot.`);
+  }
+  return { changed: true, previous, current: opts.currentBackend, aborted: false };
 }

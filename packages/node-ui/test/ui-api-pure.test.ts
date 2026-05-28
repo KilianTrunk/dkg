@@ -346,6 +346,53 @@ describe('UI API tests', () => {
     });
   });
 
+  // The Node UI mounts `useMemoryEntities` and `useProjectProfile` from
+  // multiple sibling views simultaneously when a project is opened
+  // (e.g. Dashboard card + ProjectView). Pre-dedup, each duplicate
+  // fan-out hit `/api/query` separately and added seconds of wall-time
+  // on a multi-GB Oxigraph store. These tests pin the contract that
+  // `executeQuery` collapses concurrent identical POSTs to one fetch
+  // while still firing fresh requests once a prior one settles.
+  describe('executeQuery in-flight dedup', () => {
+    it('coalesces concurrent identical queries to one /api/query POST', async () => {
+      const results = await Promise.all([
+        executeQuery('SELECT * WHERE { ?s ?p ?o }', 'cg-dedup'),
+        executeQuery('SELECT * WHERE { ?s ?p ?o }', 'cg-dedup'),
+        executeQuery('SELECT * WHERE { ?s ?p ?o }', 'cg-dedup'),
+        executeQuery('SELECT * WHERE { ?s ?p ?o }', 'cg-dedup'),
+        executeQuery('SELECT * WHERE { ?s ?p ?o }', 'cg-dedup'),
+      ]);
+      const queryCalls = requestLog.filter(
+        r => r.method === 'POST' && r.url.startsWith('/api/query'),
+      );
+      expect(queryCalls).toHaveLength(1);
+      expect(results).toHaveLength(5);
+      for (const r of results) {
+        expect(r).toEqual({ result: { bindings: [] } });
+      }
+    });
+
+    it('does not coalesce when args differ', async () => {
+      await Promise.all([
+        executeQuery('SELECT * WHERE { ?s ?p ?o }', 'cg-a'),
+        executeQuery('SELECT * WHERE { ?s ?p ?o }', 'cg-b'),
+      ]);
+      const queryCalls = requestLog.filter(
+        r => r.method === 'POST' && r.url.startsWith('/api/query'),
+      );
+      expect(queryCalls).toHaveLength(2);
+    });
+
+    it('issues a fresh fetch once the prior request has settled', async () => {
+      await executeQuery('SELECT * WHERE { ?s ?p ?o }', 'cg-sequential');
+      await executeQuery('SELECT * WHERE { ?s ?p ?o }', 'cg-sequential');
+      const queryCalls = requestLog.filter(
+        r => r.method === 'POST' && r.url.startsWith('/api/query'),
+      );
+      expect(queryCalls).toHaveLength(2);
+    });
+  });
+
   // IMPORT_SOURCES test block removed — the constant was retired along
   // with /api/memory/import as part of the openclaw-dkg-primary-memory
   // work. See Dashboard / ui/api.ts for the deletion context.

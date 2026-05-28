@@ -20,8 +20,25 @@ afterEach(async () => {
   await Promise.all(cleanupPaths.splice(0).map((path) => rm(path, { recursive: true, force: true })));
 });
 
+// `node:sqlite` is opt-in in Node 22.5–23.x (`--experimental-sqlite`) and
+// stabilised in Node 24+. We probe once at module load: if the import
+// fails (older Node, or Node 22/23 without the flag), we skip the
+// real-SQLite test rather than reporting a hard failure that doesn't
+// reflect a code bug. Every OTHER test in this file works against the
+// in-memory connector and is unaffected by Node's flag state.
+const NODE_SQLITE_AVAILABLE = await (async (): Promise<boolean> => {
+  try {
+    await import('node:sqlite' /* @vite-ignore */);
+    return true;
+  } catch {
+    return false;
+  }
+})();
+
+const itIfSqlite = NODE_SQLITE_AVAILABLE ? it : it.skip;
+
 describe('generic SQL source handler', () => {
-  it('queries a real SQLite database and maps typed literals and joins', async () => {
+  itIfSqlite('queries a real SQLite database and maps typed literals and joins', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'generic-sql-source-'));
     cleanupPaths.push(dir);
     const databasePath = join(dir, 'fixture.sqlite');

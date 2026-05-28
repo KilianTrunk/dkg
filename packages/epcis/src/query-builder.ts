@@ -101,25 +101,21 @@ export function buildEpcisQuery(params: EpcisQueryParams, contextGraphId: string
     filterClauses.push(`FILTER(?eventType = <https://gs1.github.io/EPCIS/${escapeSparql(params.eventType)}>)`);
   }
 
-  // EPC filter — UNION epcList + childEPCs per Section 8.2.7.1
+  // EPC filter — match epcList OR childEPCs per Section 8.2.7.1.
+  // Uses VALUES + predicate variable instead of UNION to avoid
+  // Blazegraph's nested-UnionNode crash when this lands inside a
+  // GRAPH block that is itself part of an outer UNION.
   if (params.epc) {
     const epcValue = escapeSparql(params.epc);
-    wherePatterns.push(`{
-          { ?event epcis:epcList "${epcValue}" }
-          UNION { ?event epcis:childEPCs "${epcValue}" }
-        }`);
+    wherePatterns.push(`VALUES ?_epcPred { epcis:epcList epcis:childEPCs }
+      ?event ?_epcPred "${epcValue}" .`);
   }
 
-  // anyEPC — 5-way UNION across all EPC fields
+  // anyEPC — match across all 5 EPC fields (same VALUES approach)
   if (params.anyEPC) {
     const epcValue = escapeSparql(params.anyEPC);
-    wherePatterns.push(`{
-          { ?event epcis:epcList "${epcValue}" }
-          UNION { ?event epcis:childEPCs "${epcValue}" }
-          UNION { ?event epcis:parentID "${epcValue}" }
-          UNION { ?event epcis:inputEPCList "${epcValue}" }
-          UNION { ?event epcis:outputEPCList "${epcValue}" }
-        }`);
+    wherePatterns.push(`VALUES ?_epcPred { epcis:epcList epcis:childEPCs epcis:parentID epcis:inputEPCList epcis:outputEPCList }
+      ?event ?_epcPred "${epcValue}" .`);
   }
   optionalClauses.push('OPTIONAL { ?event epcis:epcList ?epc . }');
 

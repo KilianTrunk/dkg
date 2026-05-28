@@ -1874,6 +1874,16 @@ function wrapWithGraphUnion(sparql: string, graphUris: string[]): string {
     return `${before} GRAPH <${graphUris[0]}> { ${inner} } ${after}`;
   }
 
+  // Blazegraph crashes with "Illegal child type for union: UnionNode"
+  // when a UNION appears inside a GRAPH block that is itself a branch
+  // of an outer UNION. Detect this case and fall back to VALUES+GRAPH
+  // (minor scope-leak trade-off vs. hard crash).
+  const innerHasUnion = /\bUNION\b/i.test(inner);
+  if (innerHasUnion) {
+    const valuesEntries = graphUris.map((g) => `<${g}>`).join(' ');
+    return `${before} VALUES ?__dkg_viewGraph { ${valuesEntries} } GRAPH ?__dkg_viewGraph { ${inner} } ${after}`;
+  }
+
   const unionBranches = graphUris
     .map((g) => `{ GRAPH <${g}> { ${inner} } }`)
     .join(' UNION ');

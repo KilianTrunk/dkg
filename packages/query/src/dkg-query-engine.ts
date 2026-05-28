@@ -254,94 +254,39 @@ export class DKGQueryEngine implements QueryEngine {
         contextGraphSharedMemoryMetaUri(effectiveContextGraphId, subGraphName),
       ];
       const explicitAllowedGraphs = [...allowedGraphs, ...metaAllowList];
-      let variableAllowedGraphs: string[] = [...allowedGraphs, ...metaAllowList];
-      // Codex r3 on #776: when the SPARQL has a graph variable
-      // (e.g. `useSwmAttributions` / `useVerifiedMemoryAnchors` /
-      // `useVerifiedEntityIdentity` doing
-      // `GRAPH ?g { … } FILTER(CONTAINS(STR(?g), "_shared_memory_meta"))`
-      // with only `contextGraphId` scope), the static `metaAllowList`
-      // is just the root meta URIs — `?g` cannot bind to any
-      // `<cg>/<sub>/_shared_memory_meta`, so metadata for entities
-      // published in sub-graphs stays invisible.
+      const variableAllowedGraphs = [...allowedGraphs, ...metaAllowList];
+      // Codex r5 RED on #776: dynamic sub-graph metadata enumeration
+      // (originally added to fix `useSwmAttributions` /
+      // `useVerifiedMemoryAnchors` / `useVerifiedEntityIdentity`
+      // `GRAPH ?g` enumeration over `*_shared_memory_meta`)
+      // fundamentally cannot tell, *from URI structure alone*,
+      // whether a candidate URI like
+      // `did:dkg:context-graph:<cg>/<seg>/_meta` is sub-graph `<seg>`
+      // metadata of `<cg>` (admit) or the root `_meta` of a separate
+      // registered CG `<cg>/<seg>` (cross-CG leak). The collision is
+      // possible whether or not `<cg>` itself contains `/`, because
+      // `validateContextGraphId` allows `/` in CG ids, and the URI
+      // scheme uses `/` as the only sub-graph separator. Resolving
+      // the ambiguity requires a CG-registry lookup on every scoped
+      // `GRAPH ?g` query — and threading a registry interface
+      // through the engine is out of scope for the #774 F4+F3 fix
+      // this PR is targeting.
       //
-      // Dynamically enumerate same-CG sub-graph metadata graphs from
-      // the store. Codex r4 hardenings:
-      //   1. Build candidate URIs structurally rather than using
-      //      `startsWith` — wallet-scoped CG ids like
-      //      `0xabc.../my-project` contain `/`, so a plain prefix test
-      //      would also admit graphs that belong to a *different*
-      //      CG whose root happens to extend the current one
-      //      (`foo/bar` scope leaking `foo/bar/baz/_meta`). Match the
-      //      sub-graph segment against `validateSubGraphName` so
-      //      reserved prefixes (`_verified_memory`, `_meta`,
-      //      `_shared_memory`, `context`, `assertion`, `draft`) and
-      //      multi-segment paths are rejected.
-      //   2. Honor the requested route: a caller scoped with
-      //      `subGraphName: 'code'` enumerates ONLY the `code/_meta`
-      //      and `code/_shared_memory_meta` partitions, never sibling
-      //      sub-graphs.
-      //   3. Skip the enumeration entirely when the caller supplied an
-      //      explicit `subGraphName` — the static `metaAllowList`
-      //      already covers exactly that sub-graph's metas, so the
-      //      `listGraphs()` round-trip is wasted work and would re-add
-      //      the same URIs.
-      //
-      // Cross-CG isolation is preserved by the structural match;
-      // SWM-only routes (`graphSuffix='_shared_memory'`) still drop
-      // `_meta` sub-graphs.
-      //
-      // Codex r4 RED on #776: wallet-scoped cgIds like
-      // `0xabc/my-project` contain `/` (per
-      // `validateContextGraphId`). If the same node happens to host
-      // both `foo/bar` AND `foo/bar/baz` as separate CGs, the URI
-      // `did:dkg:context-graph:foo/bar/baz/_meta` is genuinely
-      // ambiguous between "sub-graph `baz` of `foo/bar`" (admit) and
-      // "root `_meta` of `foo/bar/baz`" (cross-CG leak). A definitive
-      // resolution would need a CG-registry lookup on every scoped
-      // GRAPH ?g query, which is exactly the kind of per-request
-      // round-trip the YELLOW review on `listGraphs()` flagged as
-      // expensive.
-      //
-      // Conservative fence: when `effectiveContextGraphId` contains
-      // `/` (i.e. it could be wallet-scoped or otherwise have a
-      // colliding-id sibling), SKIP the dynamic enumeration entirely
-      // and fall back to the static `metaAllowList`. UI hooks lose
-      // sub-graph enumeration on wallet-scoped CGs (tracked as a
-      // follow-up — proper fix is to inject a CG-registry interface
-      // here so we can authoritatively reject a candidate that is
-      // itself a registered CG root), but cross-CG isolation stays
-      // tight without a registry round-trip. For non-wallet-scoped
-      // cgIds (no `/`), the structural match below is unambiguous —
-      // there is no way to construct a colliding sibling CG without
-      // adding `/` to the id.
-      const cgIdHasSlash = effectiveContextGraphId.includes('/');
-      if (
-        !subGraphName
-        && !cgIdHasSlash
-        && collectGraphVariables(sparql).length > 0
-      ) {
-        const cgRoot = `did:dkg:context-graph:${effectiveContextGraphId}`;
-        const allGraphs = await this.store.listGraphs();
-        const subMetaTokens = isSwmOnlyRoute
-          ? ['_shared_memory_meta']
-          : ['_meta', '_shared_memory_meta'];
-        const subGraphMetaUris: string[] = [];
-        for (const g of allGraphs) {
-          if (!g.startsWith(`${cgRoot}/`)) continue;
-          const rest = g.slice(cgRoot.length + 1);
-          const slashIdx = rest.indexOf('/');
-          if (slashIdx === -1) continue;
-          const subSegment = rest.slice(0, slashIdx);
-          const tail = rest.slice(slashIdx + 1);
-          if (!subMetaTokens.includes(tail)) continue;
-          if (!validateSubGraphName(subSegment).valid) continue;
-          subGraphMetaUris.push(g);
-        }
-        variableAllowedGraphs = [
-          ...variableAllowedGraphs,
-          ...subGraphMetaUris.filter((g) => !variableAllowedGraphs.includes(g)),
-        ];
-      }
+      // The static `metaAllowList` above (`<cg>/_meta` +
+      // `<cg>/_shared_memory_meta`, or the explicit
+      // `<cg>/<sub>/...meta` when `subGraphName` is supplied) covers
+      // exactly the use cases #774 needs (invite-flow curator probe,
+      // SWM-ownership workspaceOwner probe). UI hooks that enumerate
+      // sub-graph metadata via `GRAPH ?g + CONTAINS(...)` are NOT
+      // exercised by the SWM-ownership / invite-flow devnet tests
+      // and remain a tracked follow-up: the proper fix is a
+      // CG-registry-aware allow-set construction so wallet-scoped
+      // and id-prefix-colliding CGs can be authoritatively
+      // disambiguated. Until that lands, we keep the variable allow
+      // set strictly equal to the explicit allow set — same-CG `?g`
+      // bindings against the root `_meta` / `_shared_memory_meta`
+      // work, and there is no path through this branch that can
+      // leak another CG's metadata.
       assertExplicitGraphIrisAllowed(sparql, explicitAllowedGraphs);
       sparql = constrainGraphVariablesToAllowedSet(sparql, variableAllowedGraphs);
     }

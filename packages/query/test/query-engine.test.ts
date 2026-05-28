@@ -558,26 +558,30 @@ describe('DKGQueryEngine', () => {
     expect(result.bindings[0]['o']).toBe('did:dkg:agent:0xowner');
   });
 
-  it('GRAPH ?g + CONTAINS("_shared_memory_meta") enumerates all same-CG sub-graph SWM meta partitions (UI hook shape)', async () => {
-    // Codex r3 on #776: `useSwmAttributions`, `useVerifiedMemoryAnchors`,
-    // and `useVerifiedEntityIdentity` use `GRAPH ?g { … }
-    // FILTER(CONTAINS(STR(?g), "_shared_memory_meta"))` with only a
-    // `contextGraphId` scope to enumerate every sub-graph's
-    // `_shared_memory_meta`. The previous draft only added the root
-    // `<cg>/_shared_memory_meta` to the variable allow set, so
-    // sub-graph metadata stayed invisible. The engine now
-    // dynamically enumerates same-CG sub-graph meta partitions from
-    // the store before constraining `?g`, restoring the UI shape.
-    // Cross-CG sub-graph metadata still cannot bind (prefix filter).
+  it('GRAPH ?g over sub-graph SWM meta does NOT bind without a CG-registry-aware allow set (#774 follow-up)', async () => {
+    // Codex r5 RED on #776: dynamic sub-graph metadata enumeration
+    // is fundamentally unsafe without a CG-registry interface
+    // because the URI `<cg>/<seg>/_meta` cannot be disambiguated
+    // structurally from the root `_meta` of a separate registered
+    // CG `<cg>/<seg>`. We therefore restrict the variable allow set
+    // to the static `metaAllowList` (root metas only), which is
+    // exactly what #774 F4 + F3 need. UI hooks that enumerate
+    // sub-graph SWM metadata via
+    // `GRAPH ?g + CONTAINS("_shared_memory_meta")` are a tracked
+    // follow-up that requires the CG-registry plumbing to land
+    // safely.
+    //
+    // This test pins the limitation: same-CG sub-graph
+    // `_shared_memory_meta` partitions are NOT bound by `GRAPH ?g`
+    // under `contextGraphId` scope. Removing this fence in a
+    // future PR must come with an authoritative cross-CG
+    // disambiguation mechanism, otherwise this test catches the
+    // regression.
     const cgRootSwmMeta = `${GRAPH}/_shared_memory_meta`;
     const cgCodeSwmMeta = `${GRAPH}/code/_shared_memory_meta`;
-    const cgRunsSwmMeta = `${GRAPH}/runs/_shared_memory_meta`;
-    const otherCgSwmMeta = `did:dkg:context-graph:other-cg/code/_shared_memory_meta`;
     await store.insert([
       { subject: 'urn:op:root', predicate: 'http://schema.org/agent', object: '"agentRoot"', graph: cgRootSwmMeta },
-      { subject: 'urn:op:a', predicate: 'http://schema.org/agent', object: '"agentA"', graph: cgCodeSwmMeta },
-      { subject: 'urn:op:b', predicate: 'http://schema.org/agent', object: '"agentB"', graph: cgRunsSwmMeta },
-      { subject: 'urn:op:c', predicate: 'http://schema.org/agent', object: '"agentC"', graph: otherCgSwmMeta },
+      { subject: 'urn:op:code', predicate: 'http://schema.org/agent', object: '"agentCode"', graph: cgCodeSwmMeta },
     ]);
     const result = await engine.query(
       `SELECT ?g ?agent WHERE {
@@ -589,45 +593,16 @@ describe('DKGQueryEngine', () => {
       { contextGraphId: CONTEXT_GRAPH },
     );
     const agents = result.bindings.map((b) => b['agent']).sort();
-    expect(agents).toEqual(['"agentA"', '"agentB"', '"agentRoot"']);
-    expect(
-      result.bindings.every((b) => (b['g'] as string).startsWith(`${GRAPH}/`)
-        || b['g'] === GRAPH),
-    ).toBe(true);
-    expect(result.bindings.some((b) => b['g'] === otherCgSwmMeta)).toBe(false);
+    expect(agents).toEqual(['"agentRoot"']);
+    expect(result.bindings.some((b) => b['g'] === cgCodeSwmMeta)).toBe(false);
   });
 
-  it('GRAPH ?g enumeration excludes _verified_memory/<vmId>/_meta and other reserved sub-segments', async () => {
-    // Codex r4 on #776: the previous draft used `endsWith('/_meta')`
-    // which would have admitted `<cg>/_verified_memory/<vmId>/_meta`
-    // alongside legitimate sub-graph `_meta`. Reserved sub-segments
-    // (matching `validateSubGraphName`'s reject list:
-    // `_verified_memory`, `context`, `assertion`, `draft`, anything
-    // starting with `_`) must NOT be enumerated.
-    const verifiedMemoryMeta = `${GRAPH}/_verified_memory/q1/_meta`;
-    const reservedContext = `${GRAPH}/context/sub-x/_meta`;
-    const validSubMeta = `${GRAPH}/code/_meta`;
-    await store.insert([
-      { subject: 'urn:secret:vm', predicate: 'http://schema.org/x', object: '"vm"', graph: verifiedMemoryMeta },
-      { subject: 'urn:secret:ctx', predicate: 'http://schema.org/x', object: '"ctx"', graph: reservedContext },
-      { subject: 'urn:visible:code', predicate: 'http://schema.org/x', object: '"code"', graph: validSubMeta },
-    ]);
-    const result = await engine.query(
-      `SELECT ?v WHERE { GRAPH ?g { ?s <http://schema.org/x> ?v } }`,
-      { contextGraphId: CONTEXT_GRAPH },
-    );
-    const values = result.bindings.map((b) => b['v']).sort();
-    expect(values).toContain('"code"');
-    expect(values).not.toContain('"vm"');
-    expect(values).not.toContain('"ctx"');
-  });
-
-  it('GRAPH ?g enumeration with subGraphName=code does NOT bind sibling sub-graphs (route honored)', async () => {
-    // Codex r4 on #776: `{ contextGraphId, subGraphName: 'code' }`
-    // must constrain `?g` to that sub-graph's metas only — sibling
-    // sub-graphs like `decisions/_meta` remain invisible. The static
-    // `metaAllowList` already pins this exactly; the dynamic
-    // enumeration is skipped when `subGraphName` is supplied.
+  it('GRAPH ?g with subGraphName=code DOES bind that exact sub-graph meta (explicit route)', async () => {
+    // The static `metaAllowList` for `subGraphName: 'code'` already
+    // contains `<cg>/code/_meta` and `<cg>/code/_shared_memory_meta`,
+    // so a `GRAPH ?g` query under that scope binds the exact
+    // sub-graph the caller asked for. Sibling sub-graphs are not
+    // visible (the metaAllowList is exact, not prefixed).
     const codeSwmMeta = `${GRAPH}/code/_shared_memory_meta`;
     const decisionsSwmMeta = `${GRAPH}/decisions/_shared_memory_meta`;
     await store.insert([
@@ -640,64 +615,6 @@ describe('DKGQueryEngine', () => {
     );
     const agents = result.bindings.map((b) => b['agent']).sort();
     expect(agents).toEqual(['"agentCode"']);
-  });
-
-  it('GRAPH ?g enumeration is SKIPPED for wallet-scoped cgIds (defense against id-prefix collision)', async () => {
-    // Codex r4 RED on #776 (round 2): even with the structural match,
-    // wallet-scoped ids like `0xabc/proj` admit a real cross-CG leak
-    // when the same node hosts both `foo/bar` and `foo/bar/baz` as
-    // separate registered CGs — the URI
-    // `<cgRoot:foo/bar>/baz/_meta` is genuinely ambiguous between
-    // "sub-graph baz of foo/bar" and "root _meta of foo/bar/baz".
-    // The query engine cannot resolve this ambiguity without a
-    // CG-registry round-trip on every scoped GRAPH ?g query (which
-    // the YELLOW perf review separately flagged as expensive).
-    //
-    // Conservative fence: when the cgId contains `/` (any
-    // wallet-scoped or otherwise potentially-colliding form), the
-    // dynamic enumeration is SKIPPED. The static `metaAllowList`
-    // (root `_meta` + root `_shared_memory_meta`) still works, so
-    // basic `GRAPH ?g` over root metas binds. Sub-graph enumeration
-    // for wallet-scoped CGs is a tracked follow-up that needs a
-    // CG-registry interface threaded into the engine.
-    const walletCg = 'did:dkg:context-graph:0xabc/proj';
-    const rootMeta = `${walletCg}/_meta`;
-    const collidingCgRootMeta = `${walletCg}/legitimate-sub/_meta`;
-    const otherCgUnderSlash = `${walletCg}/other-cg/extra/_meta`;
-    await store.insert([
-      { subject: 'urn:root', predicate: 'http://schema.org/n', object: '"root"', graph: rootMeta },
-      { subject: 'urn:sub', predicate: 'http://schema.org/n', object: '"sub"', graph: collidingCgRootMeta },
-      { subject: 'urn:out', predicate: 'http://schema.org/n', object: '"out"', graph: otherCgUnderSlash },
-    ]);
-    const result = await engine.query(
-      `SELECT ?v WHERE { GRAPH ?g { ?s <http://schema.org/n> ?v } }`,
-      { contextGraphId: '0xabc/proj' },
-    );
-    const values = result.bindings.map((b) => b['v']).sort();
-    expect(values).toContain('"root"');
-    expect(values).not.toContain('"sub"');
-    expect(values).not.toContain('"out"');
-  });
-
-  it('graphSuffix=_shared_memory drops sub-graph _meta from variable enumeration (privacy fence holds)', async () => {
-    // The dynamic sub-graph enumeration must respect the SWM-only
-    // privacy fence: a caller scoped to `graphSuffix='_shared_memory'`
-    // gets sub-graph `_shared_memory_meta` partitions but NOT
-    // sub-graph `_meta` partitions, mirroring the explicit-IRI
-    // behavior pinned earlier.
-    const cgCodeMeta = `${GRAPH}/code/_meta`;
-    const cgCodeSwmMeta = `${GRAPH}/code/_shared_memory_meta`;
-    await store.insert([
-      { subject: 'urn:op:secret', predicate: 'http://schema.org/secret', object: '"locked"', graph: cgCodeMeta },
-      { subject: 'urn:op:visible', predicate: 'http://schema.org/secret', object: '"open"', graph: cgCodeSwmMeta },
-    ]);
-    const result = await engine.query(
-      `SELECT ?g ?v WHERE { GRAPH ?g { ?s <http://schema.org/secret> ?v } }`,
-      { contextGraphId: CONTEXT_GRAPH, graphSuffix: '_shared_memory' },
-    );
-    const values = result.bindings.map((b) => b['v']).sort();
-    expect(values).not.toContain('"locked"');
-    expect(result.bindings.some((b) => b['g'] === cgCodeMeta)).toBe(false);
   });
 
   it('rejects compact explicit GRAPH IRIs outside the scoped context graph', async () => {

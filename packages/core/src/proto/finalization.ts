@@ -29,6 +29,22 @@ export const FinalizationMessageSchema = new Type('FinalizationMessage')
   .add(new Field('operationId', 12, 'string'))
   .add(new Field('targetContextGraphId', 13, 'string'))
   .add(new Field('subGraphName', 14, 'string'))
+  // ---------------------------------------------------------------
+  // Tag 15 is permanently RESERVED. Earlier rounds of PR #779 used
+  // tag 15 for a proto3 `bool keepRootCopyOnLabel`. Codex review
+  // r6 correctly flagged that reusing tag 15 with a different
+  // scalar type (the tristate uint32 sentinel introduced in r5)
+  // is wire-unsafe on mixed-version meshes: a peer that still has
+  // the bool schema for tag 15 reads any non-zero varint as `true`,
+  // so a new sender emitting `DROP_ROOT (2)` would be misread as
+  // `keepRootCopyOnLabel = true` and the old replica would
+  // recreate a root copy the publisher had intentionally deleted —
+  // the exact data-isolation regression Codex r5b warned about,
+  // but coming through the wire this time. PR #779 has not shipped
+  // to any production peer, but to keep the contract clean we
+  // retire tag 15 forever; new readers MUST ignore any tag-15
+  // bytes they receive.
+  // ---------------------------------------------------------------
   // Codex review (PR #779) — distinguishes a same-graph publish (where
   // the publisher kept a root-graph copy of the canonical quads so
   // label-scoped queries find them) from an explicit-`subContextGraphId`
@@ -47,10 +63,12 @@ export const FinalizationMessageSchema = new Type('FinalizationMessage')
   // wire (proto3 default), the receiver's legacy fallback would fire
   // (`targetContextGraphId === local-on-chain-id-for(contextGraphId)`)
   // and dual-write the root copy the publisher had intentionally
-  // deleted. So we widen tag 15 to a `uint32` sentinel that carries
-  // explicit presence:
+  // deleted. So we encode this on a fresh tag (16) as a `uint32`
+  // sentinel that carries explicit presence:
   //   0 = UNSET (legacy publisher OR forward-compat default).
-  //       Receivers fall back to inferring same-graph intent.
+  //       Receivers fall back to the safe no-dual-write path
+  //       (`finalization-handler.ts` Codex r5b — the older
+  //       inference fallback was unsound and has been removed).
   //   1 = KEEP_ROOT (publisher kept the root copy; same-graph publish).
   //       Receivers MUST mirror the dual-write into the root data /
   //       _meta graphs.
@@ -61,12 +79,10 @@ export const FinalizationMessageSchema = new Type('FinalizationMessage')
   // protobuf library (protobufjs, protoc-go, prost, …) round-trips
   // it correctly. `encodeFinalizationMessage` /
   // `decodeFinalizationMessage` translate to / from the public
-  // `keepRootCopyOnLabel?: boolean` shape for ergonomic call sites
-  // (the top-level field name preserves the post-r3 API). PR #779 has
-  // not shipped to any production peer yet, so widening tag 15 from
-  // `bool` to `uint32` here has no rolling-upgrade impact within this
-  // patch series.
-  .add(new Field('keepRootCopyOnLabelTri', 15, 'uint32'));
+  // `keepRootCopyOnLabel?: boolean` shape for ergonomic call sites.
+  // Tag 16 wire bytes are `0x80 0x01 <value-byte>` (3 bytes when set;
+  // omitted entirely when undefined / proto3 default).
+  .add(new Field('keepRootCopyOnLabelTri', 16, 'uint32'));
 
 type Long = { low: number; high: number; unsigned: boolean };
 
@@ -98,18 +114,24 @@ export interface FinalizationMessageMsg {
    * remap-style publish) and receivers MUST NOT dual-write into the
    * source CG's root graph.
    *
-   * Backward compat (Codex r3/r4): the wire field is a `uint32`
-   * tristate sentinel (0=UNSET, 1=KEEP, 2=DROP — see the schema
-   * comment above). `encodeFinalizationMessage` /
-   * `decodeFinalizationMessage` translate between the wire sentinel
-   * and this public `boolean | undefined` API. Older publishers omit
-   * the bit on the wire (decoded as `0` → `undefined` here); receivers
-   * treat `undefined` by inferring same-graph intent from
-   * `targetContextGraphId === local-on-chain-id`
-   * (`finalization-handler.ts handleFinalizationMessage`). This
-   * preserves label-scoped query convergence on mixed-version meshes
-   * AND on cross-language meshes where the sender uses a non-`protobufjs`
-   * encoder.
+   * Wire shape (Codex r3 / r4 / r6): the wire field lives at tag 16
+   * as a `uint32` tristate sentinel (0=UNSET, 1=KEEP, 2=DROP — see
+   * the schema comment above). Tag 15 is permanently reserved (was
+   * an intermediate `bool` shape; reusing the tag was wire-unsafe).
+   * `encodeFinalizationMessage` / `decodeFinalizationMessage`
+   * translate between the wire sentinel and this public
+   * `boolean | undefined` API.
+   *
+   * Older publishers omit the bit on the wire (decoded as
+   * `undefined` here). Codex r5b removed the receiver-side
+   * inference fallback that tried to recover same-graph intent
+   * from `targetContextGraphId === local-on-chain-id` because the
+   * same wire shape is also produced by an explicit-remap-to-self
+   * publish (`subContextGraphId === ownCG.onChainId`). Receivers
+   * therefore treat `undefined` as "no dual-write" — the
+   * conservative branch that preserves data isolation at the cost
+   * of a bounded label-scoped query gap until the publisher
+   * upgrades and re-emits.
    */
   keepRootCopyOnLabel?: boolean;
 }

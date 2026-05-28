@@ -103,11 +103,11 @@ describe('keepRootCopyOnLabel tristate wire contract', () => {
     // tristate UNSET sentinel would split the legacy/forward-compat
     // path on mixed-version meshes (some receivers would see UNSET,
     // some KEEP, some DROP). protobufjs happens to serialise `uint32=0`
-    // as 2 explicit wire bytes (proto2-style default emission), which
-    // is *also* what a legacy publisher's `bool=false` looks like on
-    // the wire — so this equivalence doubles as the rolling-upgrade
-    // bridge. We assert byte-level equality, not length-only, so any
-    // accidental shift in the encoder shows up.
+    // as explicit wire bytes (proto2-style default emission); that's
+    // fine — the receiver normalises 0 / unknown / absent all to
+    // `undefined`. We assert byte-level equality of undef vs base, and
+    // explicit non-equality vs KEEP, so any accidental shift in the
+    // encoder shows up.
     const baseBuf  = encodeFinalizationMessage(minimalFinalization({}) as any);
     const undefBuf = encodeFinalizationMessage(
       minimalFinalization({ keepRootCopyOnLabel: undefined }) as any,
@@ -116,42 +116,89 @@ describe('keepRootCopyOnLabel tristate wire contract', () => {
       minimalFinalization({ keepRootCopyOnLabel: true }) as any,
     );
     expect(Buffer.from(undefBuf).equals(Buffer.from(baseBuf))).toBe(true);
-    expect(keepBuf.length).toBe(baseBuf.length);
     expect(Buffer.from(keepBuf).equals(Buffer.from(baseBuf))).toBe(false);
   });
 
-  it('decodes a legacy tag-15 bool=true payload as true (wire-compatible varint)', () => {
-    // A pre-#779 publisher that still treats tag-15 as `bool` will encode
-    // `keepRootCopyOnLabel=true` as a varint value of 1 under the same
-    // tag byte. proto3 wire types 0 (bool) and 0 (uint32) are identical,
-    // so this byte sequence MUST decode cleanly as the new tristate's
-    // KEEP sentinel and surface as `true` on the public API. This test
-    // pins the rolling-upgrade compatibility Codex r4 demanded:
-    //   tag = (15 << 3) | 0 (varint) = 0x78, value = 0x01.
-    const legacyBuf = new Uint8Array([0x78, 0x01]);
-    const dec = decodeFinalizationMessage(legacyBuf);
-    expect(dec.keepRootCopyOnLabel).toBe(true);
+  it('writes the tristate sentinel on tag 16, never on tag 15 (Codex r6 — retired tag)', () => {
+    // Codex r6: tag 15 was briefly the bool variant of this field
+    // during intermediate r2/r3/r4 work. A peer running an
+    // intermediate build would decode any non-zero tag-15 varint as
+    // `bool=true`, so a new sender emitting `DROP_ROOT (2)` on tag 15
+    // would be misread as `keepRootCopyOnLabel=true` and the old
+    // replica would recreate a root copy the publisher had
+    // intentionally deleted. Move the tristate to a fresh tag (16)
+    // and reserve tag 15 forever.
+    //
+    // Tag 16 wire-type 0 (varint) tag bytes are 0x80 0x01 (varint of
+    // (16 << 3) | 0 = 128). Tag 15 wire bytes are 0x78 (single byte).
+    // After this round, NO encoded message should contain 0x78 with a
+    // following varint that looks like the tristate sentinel.
+    // Cross-check: a KEEP-encoded message must contain the 0x80 0x01
+    // tag bytes, and the prior tag-15 (0x78) byte must not appear in
+    // a position that could be parsed as the keepRootCopyOnLabel
+    // wire field. (Note: 0x78 is also ASCII 'x', which legitimately
+    // appears in string fields like UALs — so we can't assert global
+    // absence; we instead pin the encoded length delta.)
+    const baseBuf = encodeFinalizationMessage(minimalFinalization({}) as any);
+    const keepBuf = encodeFinalizationMessage(
+      minimalFinalization({ keepRootCopyOnLabel: true }) as any,
+    );
+    // A KEEP message has tag bytes 0x80 0x01 followed by value 0x01.
+    // protobufjs's emit-default behaviour on tag 16 means baseBuf
+    // ALSO contains 0x80 0x01 + value 0x00. So the byte-level diff
+    // between baseBuf (UNSET=0) and keepBuf (KEEP=1) is exactly one
+    // value byte — confirming we're still on the new tag.
+    expect(keepBuf.length).toBe(baseBuf.length);
+    // Find the 0x80 0x01 sequence; the subsequent byte holds the
+    // sentinel value. Walk back-to-front because tag 16 lives near
+    // the end of the message.
+    function findSentinelValue(buf: Uint8Array): number | null {
+      for (let i = buf.length - 3; i >= 0; i--) {
+        if (buf[i] === 0x80 && buf[i + 1] === 0x01) return buf[i + 2];
+      }
+      return null;
+    }
+    expect(findSentinelValue(baseBuf)).toBe(0);
+    expect(findSentinelValue(keepBuf)).toBe(1);
   });
 
-  it('decodes a legacy tag-15 bool=false payload (explicit 0) as undefined', () => {
-    // protobufjs (and most proto3 encoders) drop default scalars, but a
-    // non-strict encoder COULD ship `bool=false` as `0x78 0x00`. The
-    // tristate decoder treats `0` as UNSET — the rolling-upgrade fallback
-    // in `finalization-handler.ts handleFinalizationMessage` then infers
-    // intent from `targetContextGraphId`. Crucially we must NOT collapse
-    // wire-`0` back to `false` (that would re-introduce the exact
-    // ambiguity the tristate was added to eliminate).
-    const legacyBuf = new Uint8Array([0x78, 0x00]);
-    const dec = decodeFinalizationMessage(legacyBuf);
-    expect(dec.keepRootCopyOnLabel).toBeUndefined();
+  it('ignores intermediate-PR tag-15 bool payloads as unknown fields (Codex r6 — no legacy bool reuse)', () => {
+    // An intermediate-PR-#779 build would have shipped `bool` on tag 15
+    // (`0x78 0x01` for true, `0x78 0x00` for false-but-most-encoders-
+    // would-omit). After Codex r6 we permanently retire tag 15: the
+    // schema no longer has it, so protobufjs decodes those bytes as
+    // unknown-field bytes and the public `keepRootCopyOnLabel` lands
+    // on `undefined`. No production peer ever ran an intermediate
+    // build, so this is a defence-in-depth pin rather than a real
+    // rolling-upgrade bridge — the contract we're protecting is
+    // "post-r6 receivers MUST NOT honour tag-15 wire bytes" so a
+    // future refactor can't silently re-introduce the unsound legacy
+    // bool reuse.
+    const tag15TrueBuf  = new Uint8Array([0x78, 0x01]);
+    const tag15FalseBuf = new Uint8Array([0x78, 0x00]);
+    expect(decodeFinalizationMessage(tag15TrueBuf).keepRootCopyOnLabel).toBeUndefined();
+    expect(decodeFinalizationMessage(tag15FalseBuf).keepRootCopyOnLabel).toBeUndefined();
+  });
+
+  it('decodes a tag-16 KEEP payload as true (rolling-upgrade bridge for cross-language meshes)', () => {
+    // Manually construct the minimum-viable post-r6 payload that a
+    // non-protobufjs publisher (protoc-go, prost, …) would emit:
+    // just the tristate field on tag 16 with value 1. protobufjs
+    // tolerates a partial message; the decoder fills the remaining
+    // fields with their type defaults. This pins the cross-language
+    // wire compatibility for the keepRootCopyOnLabel signal.
+    const buf = new Uint8Array([0x80, 0x01, 0x01]);
+    const dec = decodeFinalizationMessage(buf);
+    expect(dec.keepRootCopyOnLabel).toBe(true);
   });
 
   it('clamps unknown forward-compat sentinel values to undefined', () => {
     // Future protocol versions may extend the sentinel (e.g. 3 = a new
     // mode). Today's receivers MUST treat unknowns the same as UNSET so
-    // they fall back to the safe inference path rather than guessing one
-    // of KEEP/DROP and risking divergence from the publisher's intent.
-    const forwardBuf = new Uint8Array([0x78, 0x07]);
+    // they fall back to the safe no-dual-write path rather than
+    // guessing one of KEEP/DROP and risking divergence from the
+    // publisher's intent.
+    const forwardBuf = new Uint8Array([0x80, 0x01, 0x07]);
     const dec = decodeFinalizationMessage(forwardBuf);
     expect(dec.keepRootCopyOnLabel).toBeUndefined();
   });

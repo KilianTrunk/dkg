@@ -129,39 +129,40 @@ describe('JoinProjectModal — BUG-017 a11y dismiss wiring', () => {
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
-  it('clicking the backdrop dismisses; clicking inside the dialog body does NOT', async () => {
+  it('clicking inside the dialog body does NOT invoke onClose', async () => {
+    // useModalDismiss.onBackdropClick is wired to the OVERLAY
+    // (`.v10-modal-overlay`). It only fires onClose when
+    // `event.target === event.currentTarget` — i.e. only when the
+    // click landed on the overlay itself, not on a child. A click
+    // inside the dialog bubbles up to the overlay's onClick, but the
+    // target/currentTarget identity check filters it out.
     const onClose = vi.fn();
     const container = await renderModal({ open: true, onClose });
     const dialog = container.querySelector('[role="dialog"]') as HTMLElement;
+    expect(dialog).toBeTruthy();
 
-    // Click inside the dialog (the inner panel container) — should
-    // NOT propagate to onClose because useModalDismiss only fires
-    // when target === currentTarget on the backdrop.
     act(() => {
       dialog.dispatchEvent(new MouseEvent('click', { bubbles: true }));
     });
     expect(onClose).not.toHaveBeenCalled();
+  });
 
-    // Click the backdrop directly. JoinProjectModal wires the
-    // backdrop click to the same useModalDismiss-returned handler;
-    // the backdrop is the dialog's parent. Find it via class names
-    // typical for the modal overlay.
-    const backdrop = dialog.parentElement!;
-    expect(backdrop).toBeTruthy();
+  it('clicking the backdrop overlay invokes onClose exactly once', async () => {
+    // The dismissable backdrop is `.v10-modal-overlay`, which is the
+    // dialog's parent in the rendered tree. Dispatching a bubbling
+    // click directly on the overlay sends target === currentTarget
+    // through React's synthetic event, so onBackdropClick fires.
+    // This test pins the behaviour: backdrop dismissal IS wired (a
+    // pre-rc.11 BUG-017 regression where Esc worked but the backdrop
+    // didn't would re-fail this).
+    const onClose = vi.fn();
+    const container = await renderModal({ open: true, onClose });
+    const overlay = container.querySelector('.v10-modal-overlay') as HTMLElement;
+    expect(overlay).toBeTruthy();
+
     act(() => {
-      backdrop.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+      overlay.dispatchEvent(new MouseEvent('click', { bubbles: true }));
     });
-    // The backdrop's onClick is `onBackdropClick`, which checks
-    // event.target === event.currentTarget; in a happy-dom dispatch
-    // the synthetic React onClick still fires through the React tree
-    // — assert at least one of dialog-click or backdrop-click did
-    // NOT spuriously invoke onClose, and that explicit Close did.
-    // (We've already proven Escape + close-button paths above.)
-    // The dispatched native event on the parent passes target ===
-    // currentTarget for the React handler if it's actually wired
-    // to the parent. If JoinProjectModal hasn't wired the backdrop
-    // (some implementations forward only Esc + close-button), this
-    // expectation is informational only — not a regression.
-    expect(onClose.mock.calls.length).toBeLessThanOrEqual(1);
+    expect(onClose).toHaveBeenCalledTimes(1);
   });
 });

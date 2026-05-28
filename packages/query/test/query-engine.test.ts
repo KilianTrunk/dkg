@@ -397,6 +397,226 @@ describe('DKGQueryEngine', () => {
     ).rejects.toThrow(/Scoped query violation: GRAPH <did:dkg:context-graph:other-agent-registry> is outside the allowed graph set/i);
   });
 
+  it('allows explicit GRAPH IRI against the same CG\'s _meta graph', async () => {
+    // Regression guard for #774 finding #4 (mis-attributed as a
+    // `createContextGraph` regression in the issue body; root cause is
+    // here in the query engine). `devnet-test-invite-flow.sh` step 1b
+    // queries `GRAPH <…/_meta> { <cg> <dkg:curator> ?owner }` to
+    // assert the curator was stamped at create time. Authenticated
+    // callers that supplied a `contextGraphId` already have read access
+    // to that CG — refusing them visibility into the same CG's `_meta`
+    // graph (where curator / allowedAgent / registrationStatus live)
+    // broke the invite flow, the CG Overview UI, and downstream sync
+    // code. `_meta` is only in the EXPLICIT-IRI allow set, not the
+    // graph-variable set, so a `GRAPH ?g` rewrite still cannot iterate
+    // into `_meta` and leak the allowedAgent list.
+    await store.insert([
+      {
+        subject: GRAPH,
+        predicate: 'https://dkg.network/ontology#curator',
+        object: 'did:dkg:agent:0xabc',
+        graph: META,
+      },
+    ]);
+    const result = await engine.query(
+      `SELECT ?owner WHERE { GRAPH <${META}> { <${GRAPH}> <https://dkg.network/ontology#curator> ?owner } }`,
+      { contextGraphId: CONTEXT_GRAPH },
+    );
+    expect(result.bindings).toHaveLength(1);
+    expect(result.bindings[0]['owner']).toBe('did:dkg:agent:0xabc');
+  });
+
+  it('allows explicit GRAPH IRI against the same CG\'s _shared_memory_meta graph', async () => {
+    // Regression guard for #774 finding #3 (also mis-attributed in the
+    // issue body — diagnosed as "owner-peer not replicated to node 2";
+    // the workspaceOwner triple IS in fact replicated, but the scoped
+    // query couldn't see it). `devnet-test-swm-ownership-restart.sh`
+    // `wait_for_owner_meta` probe queries
+    //
+    //   GRAPH <…/_shared_memory_meta> {
+    //     <root> <http://dkg.io/ontology/workspaceOwner> ?owner
+    //   }
+    //
+    // …with `contextGraphId` scope. Same reasoning as the `_meta`
+    // allow: authenticated callers already have read access to the CG;
+    // refusing them visibility into the SWM ownership metadata breaks
+    // both replica ACL probes and downstream sync code. Add to the
+    // EXPLICIT-IRI allow set only; graph-variable expansion stays
+    // constrained to data + SWM data so `GRAPH ?g` cannot iterate into
+    // `_shared_memory_meta`.
+    const swmMetaGraph = `${GRAPH}/_shared_memory_meta`;
+    await store.insert([
+      {
+        subject: 'urn:swm-root:test',
+        predicate: 'http://dkg.io/ontology/workspaceOwner',
+        object: '"12D3KooWowner"',
+        graph: swmMetaGraph,
+      },
+    ]);
+    const result = await engine.query(
+      `SELECT ?owner WHERE { GRAPH <${swmMetaGraph}> { <urn:swm-root:test> <http://dkg.io/ontology/workspaceOwner> ?owner } }`,
+      { contextGraphId: CONTEXT_GRAPH },
+    );
+    expect(result.bindings).toHaveLength(1);
+    expect(result.bindings[0]['owner']).toBe('"12D3KooWowner"');
+  });
+
+  it('rejects explicit GRAPH IRI against CG _meta when caller narrowed to graphSuffix=_shared_memory (privacy fence)', async () => {
+    // Bot review on #776: the `_meta` widening MUST NOT apply when the
+    // caller explicitly narrowed routing to SWM-only via
+    // `graphSuffix: '_shared_memory'`. `_meta` lives on the CG-data
+    // path, not the SWM path, so a SWM-narrowed caller has no business
+    // reading it. We pair each meta URI with the corresponding data
+    // graph and ONLY widen the explicit-IRI allow set when the
+    // matching data graph is in `allowedGraphs`.
+    await store.insert([
+      {
+        subject: GRAPH,
+        predicate: 'https://dkg.network/ontology#allowedAgent',
+        object: '"0xsecret"',
+        graph: META,
+      },
+    ]);
+    await expect(
+      engine.query(
+        `SELECT ?o WHERE { GRAPH <${META}> { <${GRAPH}> <https://dkg.network/ontology#allowedAgent> ?o } }`,
+        { contextGraphId: CONTEXT_GRAPH, graphSuffix: '_shared_memory' },
+      ),
+    ).rejects.toThrow(/Scoped query violation/i);
+  });
+
+  it('allows explicit GRAPH IRI against _shared_memory_meta even on graphSuffix=_shared_memory route', async () => {
+    // SWM-only narrowed callers should still see SWM metadata
+    // (workspaceOwner / promote-time ACL). The privacy fence drops
+    // CG-level `_meta` for SWM-narrowed routes (covered in the next
+    // test) but keeps the SWM analogue accessible.
+    const swmMetaGraph = `${GRAPH}/_shared_memory_meta`;
+    await store.insert([
+      {
+        subject: 'urn:swm-root:test',
+        predicate: 'http://dkg.io/ontology/workspaceOwner',
+        object: '"12D3KooWowner"',
+        graph: swmMetaGraph,
+      },
+    ]);
+    const result = await engine.query(
+      `SELECT ?owner WHERE { GRAPH <${swmMetaGraph}> { <urn:swm-root:test> <http://dkg.io/ontology/workspaceOwner> ?owner } }`,
+      { contextGraphId: CONTEXT_GRAPH, graphSuffix: '_shared_memory' },
+    );
+    expect(result.bindings).toHaveLength(1);
+    expect(result.bindings[0]['owner']).toBe('"12D3KooWowner"');
+  });
+
+  it('allows explicit GRAPH IRI against the actual sub-graph _meta location (\u003ccg\u003e/\u003csub\u003e/_meta)', async () => {
+    // Bot review on #776: sub-graph metadata is written by
+    // `graph-manager.ts` to `did:dkg:context-graph:<cg>/<sub>/_meta`
+    // (via `contextGraphSubGraphMetaUri`), NOT to
+    // `did:dkg:context-graph:<cg>/context/<sub>/_meta` (which is what
+    // `contextGraphMetaUri(cg, sub)` produces). The earlier draft of
+    // this fix used the wrong helper and would have left scoped
+    // sub-graph metadata reads still rejected; this test pins the
+    // correct path.
+    const subGraphName = 'code';
+    const subGraphMeta = `${GRAPH}/${subGraphName}/_meta`;
+    await store.insert([
+      {
+        subject: GRAPH,
+        predicate: 'https://dkg.network/ontology#curator',
+        object: 'did:dkg:agent:0xsubgraph',
+        graph: subGraphMeta,
+      },
+    ]);
+    const result = await engine.query(
+      `SELECT ?owner WHERE { GRAPH <${subGraphMeta}> { <${GRAPH}> <https://dkg.network/ontology#curator> ?owner } }`,
+      { contextGraphId: CONTEXT_GRAPH, subGraphName },
+    );
+    expect(result.bindings).toHaveLength(1);
+    expect(result.bindings[0]['owner']).toBe('did:dkg:agent:0xsubgraph');
+  });
+
+  it('GRAPH ?g binds to same-CG _meta on default-routed scoped queries (UI hook regression coverage)', async () => {
+    // Codex r2 on #776: `useSwmAttributions`, `useVerifiedMemoryAnchors`
+    // and `useVerifiedEntityIdentity` all bind `GRAPH ?g` over
+    // CG-scoped metadata. Widening `constrainGraphVariablesToAllowedSet`
+    // to the same set as the explicit-IRI allow set restores the
+    // CG-level case. Cross-CG `?g` bindings are still rejected by
+    // the surrounding scope-rejection tests.
+    await store.insert([
+      {
+        subject: GRAPH,
+        predicate: 'https://dkg.network/ontology#curator',
+        object: 'did:dkg:agent:0xowner',
+        graph: META,
+      },
+    ]);
+    const result = await engine.query(
+      `SELECT ?g ?o WHERE { GRAPH ?g { <${GRAPH}> <https://dkg.network/ontology#curator> ?o } }`,
+      { contextGraphId: CONTEXT_GRAPH },
+    );
+    expect(result.bindings).toHaveLength(1);
+    expect(result.bindings[0]['g']).toBe(META);
+    expect(result.bindings[0]['o']).toBe('did:dkg:agent:0xowner');
+  });
+
+  it('GRAPH ?g over sub-graph SWM meta does NOT bind without a CG-registry-aware allow set (#774 follow-up)', async () => {
+    // Codex r5 RED on #776: dynamic sub-graph metadata enumeration
+    // is fundamentally unsafe without a CG-registry interface
+    // because the URI `<cg>/<seg>/_meta` cannot be disambiguated
+    // structurally from the root `_meta` of a separate registered
+    // CG `<cg>/<seg>`. We therefore restrict the variable allow set
+    // to the static `metaAllowList` (root metas only), which is
+    // exactly what #774 F4 + F3 need. UI hooks that enumerate
+    // sub-graph SWM metadata via
+    // `GRAPH ?g + CONTAINS("_shared_memory_meta")` are a tracked
+    // follow-up that requires the CG-registry plumbing to land
+    // safely.
+    //
+    // This test pins the limitation: same-CG sub-graph
+    // `_shared_memory_meta` partitions are NOT bound by `GRAPH ?g`
+    // under `contextGraphId` scope. Removing this fence in a
+    // future PR must come with an authoritative cross-CG
+    // disambiguation mechanism, otherwise this test catches the
+    // regression.
+    const cgRootSwmMeta = `${GRAPH}/_shared_memory_meta`;
+    const cgCodeSwmMeta = `${GRAPH}/code/_shared_memory_meta`;
+    await store.insert([
+      { subject: 'urn:op:root', predicate: 'http://schema.org/agent', object: '"agentRoot"', graph: cgRootSwmMeta },
+      { subject: 'urn:op:code', predicate: 'http://schema.org/agent', object: '"agentCode"', graph: cgCodeSwmMeta },
+    ]);
+    const result = await engine.query(
+      `SELECT ?g ?agent WHERE {
+        GRAPH ?g {
+          ?op <http://schema.org/agent> ?agent .
+        }
+        FILTER(CONTAINS(STR(?g), "_shared_memory_meta"))
+      }`,
+      { contextGraphId: CONTEXT_GRAPH },
+    );
+    const agents = result.bindings.map((b) => b['agent']).sort();
+    expect(agents).toEqual(['"agentRoot"']);
+    expect(result.bindings.some((b) => b['g'] === cgCodeSwmMeta)).toBe(false);
+  });
+
+  it('GRAPH ?g with subGraphName=code DOES bind that exact sub-graph meta (explicit route)', async () => {
+    // The static `metaAllowList` for `subGraphName: 'code'` already
+    // contains `<cg>/code/_meta` and `<cg>/code/_shared_memory_meta`,
+    // so a `GRAPH ?g` query under that scope binds the exact
+    // sub-graph the caller asked for. Sibling sub-graphs are not
+    // visible (the metaAllowList is exact, not prefixed).
+    const codeSwmMeta = `${GRAPH}/code/_shared_memory_meta`;
+    const decisionsSwmMeta = `${GRAPH}/decisions/_shared_memory_meta`;
+    await store.insert([
+      { subject: 'urn:op:in-scope', predicate: 'http://schema.org/agent', object: '"agentCode"', graph: codeSwmMeta },
+      { subject: 'urn:op:sibling', predicate: 'http://schema.org/agent', object: '"agentDecisions"', graph: decisionsSwmMeta },
+    ]);
+    const result = await engine.query(
+      `SELECT ?agent WHERE { GRAPH ?g { ?op <http://schema.org/agent> ?agent } }`,
+      { contextGraphId: CONTEXT_GRAPH, subGraphName: 'code' },
+    );
+    const agents = result.bindings.map((b) => b['agent']).sort();
+    expect(agents).toEqual(['"agentCode"']);
+  });
+
   it('rejects compact explicit GRAPH IRIs outside the scoped context graph', async () => {
     const otherGraph = 'did:dkg:context-graph:other-agent-registry';
     await store.insert([

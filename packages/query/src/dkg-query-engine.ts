@@ -3,7 +3,8 @@ import { GraphManager } from '@origintrail-official/dkg-storage';
 import type { QueryResult, QueryOptions, QueryEngine } from './query-engine.js';
 import {
   contextGraphDataUri, contextGraphSharedMemoryUri, contextGraphVerifiedMemoryUri, contextGraphAssertionUri,
-  contextGraphSubGraphUri,
+  contextGraphSubGraphUri, contextGraphMetaUri, contextGraphSharedMemoryMetaUri,
+  contextGraphSubGraphMetaUri,
   assertSafeIri, escapeSparqlLiteral, validateSubGraphName,
   type GetView,
   REMOVED_VIEWS,
@@ -200,8 +201,94 @@ export class DKGQueryEngine implements QueryEngine {
         : options?.graphSuffix === '_shared_memory'
           ? [sharedMemoryGraph]
           : [dataGraph];
-      assertExplicitGraphIrisAllowed(sparql, allowedGraphs);
-      sparql = constrainGraphVariablesToAllowedSet(sparql, allowedGraphs);
+      // Authenticated callers that scope a query to a `contextGraphId`
+      // already have read access to that CG; refusing them visibility
+      // into the same CG's metadata graphs breaks every legitimate
+      // metadata read:
+      //   - `/_meta` — curator lookup, allowedAgent list, registration
+      //     status (invite-flow `assert_curator_triple_landed` probe,
+      //     CG Overview UI, downstream sync code)
+      //   - `/_shared_memory_meta` — workspaceOwner / promote-time
+      //     ownership metadata (devnet-test-swm-ownership-restart
+      //     `wait_for_owner_meta` probe, ACL enforcement on replicas).
+      //
+      // Privacy fence: a caller that explicitly narrowed routing to
+      // SWM-only via `graphSuffix: '_shared_memory'` does NOT gain
+      // access to the CG-level `_meta` (curator / allowedAgent /
+      // registrationStatus). They asked for SWM, they get SWM
+      // (including `_shared_memory_meta` for the workspaceOwner /
+      // ownership ACL probe). All other scoped routes expose both
+      // `_meta` and `_shared_memory_meta` for the legitimate metadata
+      // reads called out above.
+      //
+      // Sub-graph metadata uses `contextGraphSubGraphMetaUri`
+      // (`/<sub>/_meta`) — the same path the storage layer
+      // (`graph-manager.ts`) writes to — not the
+      // `/context/<sub>/_meta` shape produced by `contextGraphMetaUri`
+      // when a subGraphId is passed.
+      //
+      // The widening applies to BOTH the explicit-IRI allow set
+      // (`assertExplicitGraphIrisAllowed`) AND the graph-variable
+      // allow set (`constrainGraphVariablesToAllowedSet`). The UI
+      // hooks `useSwmAttributions`, `useVerifiedMemoryAnchors` and
+      // `useVerifiedEntityIdentity` enumerate sub-graph metadata via
+      // `GRAPH ?g { … } FILTER(CONTAINS(STR(?g), "_shared_memory_meta"))`
+      // with `contextGraphId` scope only — the strict variable allow
+      // (Codex r2 on #776) was breaking those callers in addition to
+      // the bash-test paths. Authenticated CG-scoped callers already
+      // have read access to that CG, so widening the variable allow
+      // to the same set as the explicit allow does not enlarge the
+      // privacy boundary; the boundary is the `contextGraphId` scope
+      // itself. Cross-CG access is still rejected by the data-graph
+      // allow construction above.
+      const subGraphName = options?.subGraphName;
+      const isSwmOnlyRoute = options?.graphSuffix === '_shared_memory';
+      const metaAllowList = [
+        ...(isSwmOnlyRoute
+          ? []
+          : [
+              subGraphName
+                ? contextGraphSubGraphMetaUri(effectiveContextGraphId, subGraphName)
+                : contextGraphMetaUri(effectiveContextGraphId),
+            ]),
+        contextGraphSharedMemoryMetaUri(effectiveContextGraphId, subGraphName),
+      ];
+      const explicitAllowedGraphs = [...allowedGraphs, ...metaAllowList];
+      const variableAllowedGraphs = [...allowedGraphs, ...metaAllowList];
+      // Codex r5 RED on #776: dynamic sub-graph metadata enumeration
+      // (originally added to fix `useSwmAttributions` /
+      // `useVerifiedMemoryAnchors` / `useVerifiedEntityIdentity`
+      // `GRAPH ?g` enumeration over `*_shared_memory_meta`)
+      // fundamentally cannot tell, *from URI structure alone*,
+      // whether a candidate URI like
+      // `did:dkg:context-graph:<cg>/<seg>/_meta` is sub-graph `<seg>`
+      // metadata of `<cg>` (admit) or the root `_meta` of a separate
+      // registered CG `<cg>/<seg>` (cross-CG leak). The collision is
+      // possible whether or not `<cg>` itself contains `/`, because
+      // `validateContextGraphId` allows `/` in CG ids, and the URI
+      // scheme uses `/` as the only sub-graph separator. Resolving
+      // the ambiguity requires a CG-registry lookup on every scoped
+      // `GRAPH ?g` query — and threading a registry interface
+      // through the engine is out of scope for the #774 F4+F3 fix
+      // this PR is targeting.
+      //
+      // The static `metaAllowList` above (`<cg>/_meta` +
+      // `<cg>/_shared_memory_meta`, or the explicit
+      // `<cg>/<sub>/...meta` when `subGraphName` is supplied) covers
+      // exactly the use cases #774 needs (invite-flow curator probe,
+      // SWM-ownership workspaceOwner probe). UI hooks that enumerate
+      // sub-graph metadata via `GRAPH ?g + CONTAINS(...)` are NOT
+      // exercised by the SWM-ownership / invite-flow devnet tests
+      // and remain a tracked follow-up: the proper fix is a
+      // CG-registry-aware allow-set construction so wallet-scoped
+      // and id-prefix-colliding CGs can be authoritatively
+      // disambiguated. Until that lands, we keep the variable allow
+      // set strictly equal to the explicit allow set — same-CG `?g`
+      // bindings against the root `_meta` / `_shared_memory_meta`
+      // work, and there is no path through this branch that can
+      // leak another CG's metadata.
+      assertExplicitGraphIrisAllowed(sparql, explicitAllowedGraphs);
+      sparql = constrainGraphVariablesToAllowedSet(sparql, variableAllowedGraphs);
     }
 
     if (options?.view) {

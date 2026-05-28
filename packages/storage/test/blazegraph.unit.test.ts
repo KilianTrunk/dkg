@@ -262,20 +262,28 @@ describe('BlazegraphStore (mocked HTTP)', () => {
     expect(fetchCalls).toHaveLength(0);
   });
 
-  it('insert silently drops quads with oversized literals (>20KB)', async () => {
+  it('insert throws when a literal exceeds MUTF-8 65535 limit', async () => {
     setFetch(async () => new Response(null, { status: 200 }));
     const s = new BlazegraphStore(baseUrl);
-    const oversized = '"' + 'x'.repeat(25_000) + '"';
-    await s.insert([
+    // 70 000 ASCII chars = 70 000 MUTF-8 bytes, exceeds 65 535
+    const oversized = '"' + 'x'.repeat(70_000) + '"';
+    await expect(s.insert([
       { subject: 'http://s1', predicate: 'http://p', object: '"small"', graph: 'http://g' },
       { subject: 'http://s2', predicate: 'http://p', object: oversized, graph: 'http://g' },
-      { subject: 'http://s3', predicate: 'http://p', object: '"also-small"', graph: 'http://g' },
+    ])).rejects.toThrow(/MUTF-8 limit/);
+    expect(fetchCalls).toHaveLength(0);
+  });
+
+  it('insert allows 25KB ASCII literal (under MUTF-8 limit)', async () => {
+    setFetch(async () => new Response(null, { status: 200 }));
+    const s = new BlazegraphStore(baseUrl);
+    const largeButValid = '"' + 'x'.repeat(25_000) + '"';
+    await s.insert([
+      { subject: 'http://s1', predicate: 'http://p', object: largeButValid, graph: 'http://g' },
     ]);
     expect(fetchCalls).toHaveLength(1);
     const body = String(fetchCalls[0][1]?.body);
     expect(body).toContain('http://s1');
-    expect(body).not.toContain('http://s2');
-    expect(body).toContain('http://s3');
   });
 
   it('insert keeps non-literal quads regardless of size', async () => {

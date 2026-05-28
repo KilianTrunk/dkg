@@ -29,7 +29,7 @@ export class BlazegraphStore implements TripleStore {
 
   async insert(quads: DKGQuad[]): Promise<void> {
     if (quads.length === 0) return;
-    const safe = rejectOversizedLiterals(quads, BLAZEGRAPH_MAX_LITERAL_BYTES);
+    const safe = rejectOversizedLiterals(quads, BLAZEGRAPH_MUTF8_LIMIT);
     const nquads = safe.map(quadToNQuad).join('\n') + '\n';
     const res = await fetch(this.url, {
       method: 'POST',
@@ -309,38 +309,72 @@ function escapeString(s: string): string {
 // =====================================================================
 
 /**
- * Blazegraph uses Java's modified UTF-8 for index keys, which caps any
- * single string value at 65 535 bytes **in Java Modified UTF-8**.
- * Java MUTF-8 encodes supplementary Unicode codepoints (emoji, CJK
- * extensions, etc.) as 6 bytes each vs 4 in standard UTF-8 — a ~3×
- * expansion for heavy-Unicode content. A 28 KB UTF-8 literal can
- * therefore exceed the 64 KB MUTF-8 ceiling.
+ * Java Modified UTF-8 byte length of a string.
  *
- * Exceeding this limit triggers `java.io.UTFDataFormatException` and
- * causes the entire batch to fail with HTTP 500.
+ * Blazegraph uses `DataOutputStream.writeUTF()` for index keys, which
+ * encodes strings in Java's Modified UTF-8 (MUTF-8).  The key
+ * differences from standard UTF-8:
+ *   - U+0000 (NUL) is encoded as 2 bytes (0xC0, 0x80) instead of 1
+ *   - Supplementary codepoints (U+10000–U+10FFFF) are encoded as a
+ *     UTF-16 surrogate pair, each surrogate taking 3 MUTF-8 bytes =
+ *     6 bytes total (vs 4 in standard UTF-8)
  *
- * We silently drop quads whose object literal exceeds the threshold
- * rather than aborting the whole batch — one bad triple should not
- * block thousands of valid ones from being persisted.
- *
- * 20 000 UTF-8 bytes ≈ 60 000 MUTF-8 worst-case, safely under 65 535.
+ * `writeUTF()` hard-caps the encoded length at 65 535 bytes.
+ * Exceeding this triggers `java.io.UTFDataFormatException` and causes
+ * the entire batch to fail with HTTP 500.
  */
-const BLAZEGRAPH_MAX_LITERAL_BYTES = 20_000;
+const BLAZEGRAPH_MUTF8_LIMIT = 65_535;
 
+function javaModifiedUtf8Length(str: string): number {
+  let len = 0;
+  for (let i = 0; i < str.length; i++) {
+    const code = str.charCodeAt(i);
+    if (code === 0) {
+      len += 2;
+    } else if (code <= 0x7f) {
+      len += 1;
+    } else if (code <= 0x7ff) {
+      len += 2;
+    } else if (code >= 0xd800 && code <= 0xdbff) {
+      // High surrogate — the low surrogate at i+1 will add another 3
+      len += 3;
+    } else {
+      len += 3;
+    }
+  }
+  return len;
+}
+
+/**
+ * Check quads for literal objects that would exceed Blazegraph's
+ * MUTF-8 index key limit.  Throws with details about the offending
+ * quads so callers know the batch was NOT fully persisted.
+ */
 function rejectOversizedLiterals(quads: DKGQuad[], maxBytes: number): DKGQuad[] {
+  const rejected: Array<{ subject: string; predicate: string; mutf8Len: number }> = [];
   const out: DKGQuad[] = [];
   for (const q of quads) {
     if (q.object.startsWith('"')) {
-      const byteLen = new TextEncoder().encode(q.object).length;
-      if (byteLen > maxBytes) {
-        console.warn(
-          `[BlazegraphStore] Dropping quad with oversized literal (${byteLen} bytes > ${maxBytes} limit): ` +
-          `subject=${q.subject.slice(0, 80)}, predicate=${q.predicate.slice(0, 80)}`,
-        );
+      const mutf8Len = javaModifiedUtf8Length(q.object);
+      if (mutf8Len > maxBytes) {
+        rejected.push({
+          subject: q.subject.slice(0, 120),
+          predicate: q.predicate.slice(0, 120),
+          mutf8Len,
+        });
         continue;
       }
     }
     out.push(q);
+  }
+  if (rejected.length > 0) {
+    const details = rejected
+      .map((r) => `  subject=${r.subject} predicate=${r.predicate} (${r.mutf8Len} MUTF-8 bytes)`)
+      .join('\n');
+    throw new Error(
+      `[BlazegraphStore] ${rejected.length} quad(s) exceed Blazegraph's ${maxBytes}-byte MUTF-8 limit ` +
+      `and would cause UTFDataFormatException. Rejected quads:\n${details}`,
+    );
   }
   return out;
 }

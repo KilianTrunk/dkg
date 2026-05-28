@@ -1,6 +1,7 @@
 import { Worker } from 'node:worker_threads';
-import { existsSync } from 'node:fs';
+import { existsSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { dirname, join, sep } from 'node:path';
 import type { Quad } from '@origintrail-official/dkg-storage';
 
 export interface SyncVerifyLogEntry {
@@ -58,40 +59,74 @@ export class SyncVerifyWorker {
 
   constructor() {
     // Workers boot from compiled `.js`. In production, `import.meta.url`
-    // resolves to `dist/sync-verify-worker.js` and the sibling `.js` is
-    // present. In dev / vitest source-mode, `import.meta.url` points
-    // into `src/`, where only `.ts` exists — Node's `Worker` cannot
-    // load bare `.ts`, and `tsx`'s ESM hooks intentionally do not
-    // auto-register inside worker threads (see
+    // resolves to `…/packages/agent/dist/sync-verify-worker.js` and the
+    // sibling `.js` is present. In dev / vitest source-mode it points
+    // into `…/packages/agent/src/`, where only `.ts` exists — Node's
+    // `Worker` cannot load bare `.ts`, and `tsx`'s ESM hooks intentionally
+    // do not auto-register inside worker threads (see
     // `node_modules/tsx/dist/esm/index.mjs` — `isMainThread && register()`).
     //
-    // Resolution order (Codex round-3 hardening):
+    // Resolution (Codex round-3 + round-4 hardening):
     //   1. sibling `.js`       — production / consumed via dist/
-    //   2. parallel dist/*.js  — source-mode where `pnpm build` ran
+    //   2. parallel dist/*.js  — source-mode AFTER `pnpm build`
     //
-    // Anything else triggers an actionable error rather than letting
-    // Node spit `Unknown file extension ".ts"` from inside the Worker,
-    // which previously silently poisoned every `runSharedMemorySync`
-    // consumer with a thrown promise.
-    const sibJs = new URL('./sync-verify-worker-impl.js', import.meta.url);
-    const distJs = new URL(
-      './sync-verify-worker-impl.js',
-      import.meta.url.replace('/src/', '/dist/'),
-    );
+    // We compute the parallel dist path RELATIVE to this file's directory
+    // (Codex round-4 #1: a global string-replace of `/src/` → `/dist/`
+    // matches the wrong segment when the checkout itself lives under a
+    // path containing `/src/`, e.g. `~/src/dkg/...`). And we refuse to
+    // load a stale dist (Codex round-4 #2: if `sync-verify-worker-impl.ts`
+    // has been edited since the last `pnpm build` we'd otherwise execute
+    // an obsolete artifact and silently green-light a regression).
+    const here = fileURLToPath(import.meta.url);
+    const hereDir = dirname(here);
+    const sibJsPath = join(hereDir, 'sync-verify-worker-impl.js');
+    const sibTsPath = join(hereDir, 'sync-verify-worker-impl.ts');
 
-    const sibJsPath = fileURLToPath(sibJs);
-    const distJsPath = fileURLToPath(distJs);
+    const isSourceMode = hereDir.endsWith(`${sep}src`);
+    const distJsPath = isSourceMode
+      ? join(dirname(hereDir), 'dist', 'sync-verify-worker-impl.js')
+      : sibJsPath;
 
     let workerPath: string;
-    if (existsSync(sibJsPath)) {
+
+    if (!isSourceMode && existsSync(sibJsPath)) {
       workerPath = sibJsPath;
     } else if (existsSync(distJsPath)) {
+      if (isSourceMode && existsSync(sibTsPath)) {
+        // Anchor staleness against `tsconfig.tsbuildinfo` rather than the
+        // emitted `.js` mtime: tsc with `composite: true` only re-emits a
+        // file when its OUTPUT changes byte-for-byte, but it always
+        // refreshes the tsbuildinfo on a successful incremental compile.
+        // Comparing against the buildinfo gives us a reliable "the build
+        // has been run since this source was edited" marker.
+        const tsbuildinfoPath = join(dirname(hereDir), 'tsconfig.tsbuildinfo');
+        const tsMtime = statSync(sibTsPath).mtimeMs;
+        const buildinfoMtime = existsSync(tsbuildinfoPath)
+          ? statSync(tsbuildinfoPath).mtimeMs
+          : 0;
+        if (tsMtime > buildinfoMtime) {
+          const where = existsSync(tsbuildinfoPath)
+            ? `${tsbuildinfoPath} (last built ${new Date(buildinfoMtime).toISOString()})`
+            : `${tsbuildinfoPath} (no build artifact found)`;
+          throw new Error(
+            `[SyncVerifyWorker] Stale build detected.\n` +
+              `  Source: ${sibTsPath} (modified ${new Date(tsMtime).toISOString()})\n` +
+              `  Build:  ${where}\n\n` +
+              `Node's Worker cannot load TypeScript directly, so vitest's\n` +
+              `source-mode delegates to the compiled artifact. The .ts file\n` +
+              `is newer than the last successful build, which would silently\n` +
+              `run the previous build's behaviour. Recompile before re-running\n` +
+              `tests:\n\n` +
+              `  pnpm --filter @origintrail-official/dkg-agent build\n`,
+          );
+        }
+      }
       workerPath = distJsPath;
     } else {
       throw new Error(
         `[SyncVerifyWorker] Compiled worker not found.\n` +
           `  Looked for: ${sibJsPath}\n` +
-          `              ${distJsPath}\n` +
+          `              ${distJsPath}\n\n` +
           `Node's Worker cannot load TypeScript directly, and tsx's loader\n` +
           `intentionally does not register inside worker threads. Build the\n` +
           `agent package first:\n\n` +

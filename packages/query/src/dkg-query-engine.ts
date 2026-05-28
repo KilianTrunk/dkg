@@ -450,7 +450,20 @@ export class DKGQueryEngine implements QueryEngine {
     // Build a single union query so LIMIT/ORDER BY/DISTINCT/aggregates
     // apply over the full dataset rather than per-graph.
     const unionSparql = wrapWithGraphUnion(sparql, graphs);
-    return this.execAndNormalize(unionSparql);
+    if (unionSparql !== null) {
+      return this.execAndNormalize(unionSparql);
+    }
+    // Fallback: the inner body contains a UNION so we cannot safely wrap
+    // in a single query without either crashing Blazegraph (nested
+    // UnionNode) or leaking a helper variable. Run per-graph instead;
+    // cross-graph LIMIT/ORDER BY/DISTINCT are approximate but this path
+    // is rare (user queries with UNION over multi-graph views).
+    const all: Record<string, string>[] = [];
+    for (const g of graphs) {
+      const r = await this.execAndNormalize(wrapWithGraph(sparql, g));
+      all.push(...r.bindings);
+    }
+    return { bindings: all };
   }
 
   private async discoverGraphsByPrefix(prefix: string): Promise<string[]> {
@@ -1853,8 +1866,14 @@ function wrapWithGraph(sparql: string, graphUri: string): string {
  * neither SELECT * leakage nor variable-name collisions can happen.
  * Single-graph views skip the UNION wrapper entirely and use a plain
  * `GRAPH <uri>` block.
+ *
+ * Returns `null` when the inner WHERE body contains a UNION — the
+ * UNION-of-GRAPHs wrapper would produce a nested UnionNode that
+ * crashes Blazegraph, and a VALUES+GRAPH fallback leaks a helper
+ * variable into the caller's scope.  The caller should fall back to
+ * per-graph execution.
  */
-function wrapWithGraphUnion(sparql: string, graphUris: string[]): string {
+function wrapWithGraphUnion(sparql: string, graphUris: string[]): string | null {
   if (hasGraphClause(sparql)) return sparql;
   if (graphUris.length === 0) return sparql;
 
@@ -1876,12 +1895,12 @@ function wrapWithGraphUnion(sparql: string, graphUris: string[]): string {
 
   // Blazegraph crashes with "Illegal child type for union: UnionNode"
   // when a UNION appears inside a GRAPH block that is itself a branch
-  // of an outer UNION. Detect this case and fall back to VALUES+GRAPH
-  // (minor scope-leak trade-off vs. hard crash).
+  // of an outer UNION. We cannot use VALUES+GRAPH either because the
+  // helper variable leaks into caller scope (SELECT *, name collisions).
+  // Signal the caller to fall back to per-graph execution.
   const innerHasUnion = /\bUNION\b/i.test(inner);
   if (innerHasUnion) {
-    const valuesEntries = graphUris.map((g) => `<${g}>`).join(' ');
-    return `${before} VALUES ?__dkg_viewGraph { ${valuesEntries} } GRAPH ?__dkg_viewGraph { ${inner} } ${after}`;
+    return null;
   }
 
   const unionBranches = graphUris

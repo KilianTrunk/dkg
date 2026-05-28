@@ -105,17 +105,20 @@ export function buildEpcisQuery(params: EpcisQueryParams, contextGraphId: string
   // Uses VALUES + predicate variable instead of UNION to avoid
   // Blazegraph's nested-UnionNode crash when this lands inside a
   // GRAPH block that is itself part of an outer UNION.
+  // Each filter gets its own scoped { VALUES ... } block so
+  // the two predicate variables never collide when both are set.
   if (params.epc) {
     const epcValue = escapeSparql(params.epc);
-    wherePatterns.push(`VALUES ?_epcPred { epcis:epcList epcis:childEPCs }
-      ?event ?_epcPred "${epcValue}" .`);
+    wherePatterns.push(`{ VALUES ?_epcPred { epcis:epcList epcis:childEPCs }
+      ?event ?_epcPred "${epcValue}" . }`);
   }
 
-  // anyEPC — match across all 5 EPC fields (same VALUES approach)
+  // anyEPC — match across all 5 EPC fields (same VALUES approach,
+  // own variable name to avoid collision with the epc filter above)
   if (params.anyEPC) {
     const epcValue = escapeSparql(params.anyEPC);
-    wherePatterns.push(`VALUES ?_epcPred { epcis:epcList epcis:childEPCs epcis:parentID epcis:inputEPCList epcis:outputEPCList }
-      ?event ?_epcPred "${epcValue}" .`);
+    wherePatterns.push(`{ VALUES ?_anyEpcPred { epcis:epcList epcis:childEPCs epcis:parentID epcis:inputEPCList epcis:outputEPCList }
+      ?event ?_anyEpcPred "${epcValue}" . }`);
   }
   optionalClauses.push('OPTIONAL { ?event epcis:epcList ?epc . }');
 

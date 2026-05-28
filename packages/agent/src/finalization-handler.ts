@@ -625,14 +625,41 @@ export class FinalizationHandler {
       chainId: this.chain?.chainId ?? 'unknown',
     };
 
-    // Remove any existing tentative status for this UAL before inserting confirmed metadata.
-    // For context-graph KCs, tentative status lives in the context-graph meta graph.
-    const tentativeQuad = getTentativeStatusQuad(ual, contextGraphId);
+    // Remove any existing tentative status for this UAL before inserting
+    // confirmed metadata. Two graph locations can carry it on this replica:
+    //   1. Root `<cg>/_meta` — gossip-publish-handler ALWAYS writes
+    //      `generateTentativeMetadata(...)` here (via `getTentativeStatusQuad`,
+    //      which hardcodes the root `_meta` graph). This applies to every
+    //      gossip-replicated KC regardless of `ctxGraphId` / dual-write mode.
+    //   2. Per-cgId `<cg>/context/<id>/_meta` — older code paths (and any
+    //      future writer that respects the same partition split as canonical
+    //      data) may park a tentative quad here when `ctxGraphId` is set.
+    //
+    // Codex r5 on PR #779: the previous form mutated `tentativeQuad.graph`
+    // to the per-cgId URI when `ctxGraphId` was set and deleted ONLY that
+    // copy. The root tentative survived. With the same-graph dual-write
+    // path (`keepRootCopyOnLabel === true`) we then re-inserted confirmed
+    // `_meta` into root `<cg>/_meta`, leaving `tentative` AND `confirmed`
+    // status quads coexisting on the same UAL in the root meta graph —
+    // label-scoped status reads were non-deterministic. Even on the
+    // `keepRootCopyOnLabel === false` path the leftover root tentative was
+    // wrong (the publisher had moved/dropped its root copy on remap).
+    //
+    // Fix: always queue the root tentative for deletion AND, when ctxGraphId
+    // is set, also queue the per-cgId variant. Single `store.delete` call so
+    // all stale tentative copies are reaped in one shot — `delete` no-ops on
+    // missing quads, so it's safe to enumerate both regardless of which
+    // writer actually populated them.
+    const rootTentativeQuad = getTentativeStatusQuad(ual, contextGraphId);
+    const tentativesToDelete = [rootTentativeQuad];
     if (ctxGraphId) {
-      tentativeQuad.graph = contextGraphMetaUri(contextGraphId, ctxGraphId);
+      tentativesToDelete.push({
+        ...rootTentativeQuad,
+        graph: contextGraphMetaUri(contextGraphId, ctxGraphId),
+      });
     }
     try {
-      await this.store.delete([tentativeQuad]);
+      await this.store.delete(tentativesToDelete);
     } catch { /* tentative status may not exist */ }
 
     let metaQuads = generateConfirmedFullMetadata(kcMeta, kaMetadata, provenance);

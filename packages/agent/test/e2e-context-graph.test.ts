@@ -166,31 +166,23 @@ describe('E2E: context graph publish + finalization (shared chain)', () => {
     expect(statuses.some(s => s === '"confirmed"')).toBe(true);
   }, 10_000);
 
-  it('B label-scoped query finds the published data (dual-write into root mirrors publisher)', async () => {
-    // Pre-#774-followup the recipient `finalization-handler` wrote the
-    // canonical quads ONLY into the per-on-chain-id partition
-    // (`<cg>/context/<ctxGraphId>`), so a CG-label-scoped query on B
-    // returned 0 even though the data was local — the v10-rc-validation
-    // §5 "gossip replication" assertion exposed this end-to-end.
-    // The fix mirrors the publisher's same-graph dual-write
-    // (`dkg-publisher.ts` ~line 1382) on the recipient too: canonical
-    // quads land in BOTH `<cg>/context/<ctxGraphId>` (RS prover path)
-    // and the root `<cg>` data graph (label-scoped query path). This
-    // test now pins the new symmetric behavior — receivers expose the
-    // same data shape as publishers via the label route.
-    //
-    // For the explicit-`subContextGraphId` flow the test exercises,
-    // publisher A still deletes root locally (REMAP-style, see
-    // `dkg-publisher.ts` ~line 1393), so A's label-scoped query
-    // remains 0 — that's an A-side implementation detail this test
-    // does not assert. What we DO assert is that recipients are no
-    // longer worse-off than publishers on label queries.
+  it('B contextGraph data graph does NOT contain context graph data (remap/explicit-subCG flow)', async () => {
+    // This test exercises the explicit-`subContextGraphId` publish flow
+    // (line ~115 above), which is the REMAP-style path on the publisher:
+    // `dkg-publisher.ts` ~line 1393 deletes the root copy of the
+    // canonical quads on purpose, leaving them only in the per-cgId
+    // partition `<cg>/context/<ctxGraphId>`. PR #779's recipient
+    // dual-write (which fixes the v10-rc-validation §5 same-graph
+    // gossip-replication regression) is correctly gated on the
+    // wire-level `keepRootCopyOnLabel` flag and MUST NOT fire here, so
+    // B's root stays empty, mirroring A's deliberate remap behaviour.
+    // The pure same-graph dual-write parity is covered separately by
+    // `scripts/v10-rc-validation.sh` §5 against a 6-node devnet.
     const contextGraphData = await nodeB.query(
       `SELECT ?name WHERE { <${ENTITY_CTX_1}> <http://schema.org/name> ?name }`,
       CONTEXT_GRAPH,
     );
-    expect(contextGraphData.bindings.length).toBe(1);
-    expect(contextGraphData.bindings[0]['name']).toBe('"Context Graph Entity"');
+    expect(contextGraphData.bindings.length).toBe(0);
   }, 5_000);
 
   it('B workspace is cleaned up after promotion', async () => {

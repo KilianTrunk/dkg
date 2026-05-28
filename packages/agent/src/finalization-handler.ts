@@ -145,6 +145,7 @@ export class FinalizationHandler {
               msg.publisherAddress, msg.txHash, blockNumber, startKAId, endKAId,
               protoToBigInt(msg.batchId), ctx, ctxGraphId, subGraphName,
               authorAddress,
+              msg.keepRootCopyOnLabel === true,
             );
             this.markProcessed(dedupeKey);
             this.log.info(ctx, `Finalization: promoted SWM snapshot to ${ctxGraphId ? `context graph ${ctxGraphId}` : 'canonical'} for ${msg.ual} (tx=${msg.txHash.slice(0, 10)}…)`);
@@ -410,6 +411,16 @@ export class FinalizationHandler {
      * unattributed-publish path's no-author behaviour from RFC-001 §3.6).
      */
     authorAddress?: string,
+    /**
+     * PR #779 same-graph signal: when `true` the publisher kept a root-graph
+     * copy of the canonical quads, so receivers mirror the dual-write so
+     * label-scoped queries resolve. When `false` (or omitted on older
+     * publishers) the publisher used the explicit-`subContextGraphId` /
+     * remap path and deleted its own root copy on purpose — receivers
+     * MUST NOT dual-write or they re-expose the KC under the source CG
+     * label and double-count it in unscoped queries.
+     */
+    keepRootCopyOnLabel?: boolean,
   ): Promise<void> {
     const graphManager = new GraphManager(this.store);
     await graphManager.ensureContextGraph(contextGraphId);
@@ -455,13 +466,18 @@ export class FinalizationHandler {
     // (id-prefix collisions, see PR #776 r6 in dkg-query-engine.ts).
     // Mirroring the publisher's same-graph dual-write fixes the
     // visibility asymmetry without re-introducing that ambiguity.
-    // REMAP-flow publishes (`publishContextGraphId` set on publisher)
-    // are not represented on the gossip wire — recipients can't tell a
-    // remap from a same-graph publish. The publisher's REMAP path
-    // already moves the data off the source CG locally, and on the
-    // target CG behaves identically to a same-graph publish. So the
-    // recipient dual-write is correct in both cases.
-    const rootDataGraphForLabel = (!subGraphName && ctxGraphId)
+    //
+    // Critical scoping (Codex review on PR #779): the recipient dual-write
+    // MUST only fire for same-graph publishes (the publisher kept the
+    // root copy too). Explicit-`subContextGraphId` / remap publishes
+    // delete the root copy on purpose (`dkg-publisher.ts` ~line 1393),
+    // and a recipient that re-adds it would re-expose the KC under the
+    // source CG's label on every replica — leaking remap intent and
+    // double-counting the same triples in unscoped queries. The
+    // publisher signals same-graph vs remap on the wire via
+    // `keepRootCopyOnLabel`; missing/false (older publishers, or any
+    // remap publish) → no dual-write.
+    const rootDataGraphForLabel = (!subGraphName && ctxGraphId && keepRootCopyOnLabel === true)
       ? graphManager.dataGraphUri(contextGraphId)
       : null;
 

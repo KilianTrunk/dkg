@@ -2668,6 +2668,135 @@ describe('@unit KnowledgeAssetsV10', () => {
         // 0x3ee5aeb5 == bytes4(keccak256("ReentrancyGuardReentrantCall()"))
         expect(await mock.lastInnerSelector()).to.equal('0x3ee5aeb5');
       });
+
+      // --------------------------------------------------------------------
+      // T-HARDEN.4: nonReentrant on `update`. The update path mints
+      // `mintKnowledgeAssetsAmount` ERC-1155Delta tokens to `msg.sender`
+      // (the publisher of record). When the publisher is a contract,
+      // the mint dispatches `onERC1155BatchReceived` to it — exactly
+      // the same receiver-callback surface `publish` exercises in
+      // T-HARDEN.3. This test pins that the `nonReentrant` modifier on
+      // `update` rejects a callback-driven re-entry with the same
+      // `ReentrancyGuardReentrantCall()` selector.
+      //
+      // Setup steps:
+      //   1. Deploy the mock with empty `innerCalldata` so the mint
+      //      callback during the BASELINE publish is a no-op.
+      //   2. Publish a KC from the mock (mock becomes publisher of
+      //      record). The OPEN-CG update auth gate keys on the
+      //      original publisher, so the mock can subsequently update.
+      //   3. Arm the mock with an update payload (resets all re-entry
+      //      flags) and have the mock drive the outer update from its
+      //      own storage context.
+      //   4. The outer update mints again to the mock, the mint
+      //      callback fires, the mock re-enters `update`, the
+      //      `nonReentrant` modifier fires BEFORE any
+      //      signature/ACK/byte-size validation runs and reverts with
+      //      `ReentrancyGuardReentrantCall()`. The mock captures the
+      //      selector and returns the ERC-1155 success magic value so
+      //      the outer update completes.
+      // --------------------------------------------------------------------
+      it('update reverts ReentrancyGuardReentrantCall when re-entered from the ERC-1155 mint callback', async () => {
+        const creator = getDefaultKCCreator(accounts);
+        const nodes = await setupNodes();
+        const cgId = await createOpenCG(creator);
+
+        const Mock = await hre.ethers.getContractFactory(
+          'MockReentrantPublisher',
+        );
+        const mock = await Mock.deploy();
+        const mockAddr = await mock.getAddress();
+        await mock.setKAV10(kav10Address);
+
+        const baselineTokenAmount = ethers.parseEther('100');
+        const deltaTokenAmount = ethers.parseEther('50');
+        const totalTracForMock = baselineTokenAmount + deltaTokenAmount;
+
+        // Fund + approve once, covers both the baseline publish and the
+        // post-publish update delta.
+        await TokenContract.connect(accounts[0]).transfer(
+          mockAddr,
+          totalTracForMock,
+        );
+        await mock.approveTrac(
+          await TokenContract.getAddress(),
+          totalTracForMock,
+        );
+
+        // Step 2: clean baseline publish (no re-entry — innerCalldata
+        // is still the empty default, so `_maybeReenter` short-circuits
+        // on the mint callback).
+        const publishParams = await buildPublishParams({
+          chainId,
+          kav10Address,
+          receivingNodes: nodes.receivingNodes,
+          publisherIdentityId: nodes.publisherIdentityId,
+          receiverIdentityIds: nodes.receiverIdentityIds,
+          author: creator,
+          contextGraphId: cgId,
+          merkleRoot: ethers.keccak256(ethers.toUtf8Bytes('t-harden-4-root')),
+          knowledgeAssetsAmount: 10,
+          byteSize: 1000,
+          epochs: 5,
+          tokenAmount: baselineTokenAmount,
+          isImmutable: false,
+          publishOperationId: 't-harden-4-publish-op',
+        });
+        const publishCalldata = KAV10.interface.encodeFunctionData('publish', [
+          publishParams,
+        ]);
+        await mock.callKAV10(publishCalldata);
+
+        // Sanity: the baseline publish must have completed cleanly —
+        // no spurious re-entry recorded.
+        expect(await mock.reentryAttempted()).to.equal(false);
+        expect(await mock.reentryRejected()).to.equal(false);
+
+        const kcId = 1n;
+
+        // Step 3: build update params for the KC the mock just
+        // published. `preUpdateMerkleRootCount: 1n` because a fresh
+        // publish lays down exactly one merkle root. The author field
+        // in `buildUpdateParams` is irrelevant on the V10.1 update
+        // path (no per-update author signature yet — see the
+        // `_executeUpdateCore` NatSpec).
+        const updateParams = await buildUpdateParams({
+          chainId,
+          kav10Address,
+          receivingNodes: nodes.receivingNodes,
+          publisherIdentityId: nodes.publisherIdentityId,
+          receiverIdentityIds: nodes.receiverIdentityIds,
+          contextGraphId: cgId,
+          id: kcId,
+          preUpdateMerkleRootCount: 1n,
+          newMerkleRoot: ethers.keccak256(
+            ethers.toUtf8Bytes('t-harden-4-update-root'),
+          ),
+          newByteSize: 1000,
+          newTokenAmount: baselineTokenAmount + deltaTokenAmount,
+          mintKnowledgeAssetsAmount: 1n, // > 0 so the mint callback fires
+          knowledgeAssetsToBurn: [],
+          updateOperationId: 't-harden-4-update-op',
+        });
+
+        const updateCalldata = KAV10.interface.encodeFunctionData('update', [
+          updateParams,
+        ]);
+        await mock.arm(updateCalldata);
+
+        // Step 4: outer update. The mint callback fires, the mock
+        // re-enters with the same `update(...)` calldata, the inner
+        // call reverts `ReentrancyGuardReentrantCall()` (the modifier
+        // runs BEFORE any ACK / signature / byte-size validation), the
+        // mock captures the selector, returns the ERC-1155 success
+        // magic value, and the outer update completes.
+        await mock.callKAV10(updateCalldata);
+
+        expect(await mock.reentryAttempted()).to.equal(true);
+        expect(await mock.reentryRejected()).to.equal(true);
+        // 0x3ee5aeb5 == bytes4(keccak256("ReentrancyGuardReentrantCall()"))
+        expect(await mock.lastInnerSelector()).to.equal('0x3ee5aeb5');
+      });
     });
   });
 });

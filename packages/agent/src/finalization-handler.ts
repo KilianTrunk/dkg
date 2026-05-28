@@ -140,38 +140,29 @@ export class FinalizationHandler {
           );
 
           if (verified) {
-            // Codex r3 — rolling-upgrade fallback. Pre-PR-779 publishers
-            // do not set `keepRootCopyOnLabel` on the wire. A naive
-            // `=== true` test treats them as remap-style and skips the
-            // dual-write — but those publishers' same-graph publishes
-            // legitimately kept a root copy locally, so a new receiver
-            // would silently keep serving the old label-scoped miss
-            // for those peers until every publisher upgrades. We can
-            // recover same-graph intent from existing wire signals: a
-            // legacy SAME-graph publish carries `targetContextGraphId`
-            // = publisher's-local on-chain id for `contextGraphId`,
-            // which on the receiver resolves to the SAME local on-chain
-            // id (it's the same CG, same chain). A legacy REMAP publish
-            // carries `targetContextGraphId` = a DIFFERENT on-chain id
-            // (the remap target's). So `targetContextGraphId ===
-            // local-on-chain-id-for(contextGraphId)` is a precise
-            // legacy-publisher proxy for "same-graph publish, mirror
-            // root". When `keepRootCopyOnLabel` is set on the wire we
-            // honour it directly; the fallback only applies when the
-            // bit is missing.
-            let keepRootCopyOnLabel: boolean;
-            if (typeof msg.keepRootCopyOnLabel === 'boolean') {
-              keepRootCopyOnLabel = msg.keepRootCopyOnLabel;
-            } else if (ctxGraphId && this.resolveContextGraphOnChainId) {
-              try {
-                const local = await this.resolveContextGraphOnChainId(contextGraphId);
-                keepRootCopyOnLabel = local !== null && local !== undefined && String(local) === String(ctxGraphId);
-              } catch {
-                keepRootCopyOnLabel = false;
-              }
-            } else {
-              keepRootCopyOnLabel = false;
-            }
+            // Codex r5b — drop the rolling-upgrade legacy-publisher
+            // fallback. Earlier rounds inferred same-graph intent from
+            // `targetContextGraphId === local-on-chain-id-for(contextGraphId)`,
+            // but Codex r5b correctly observed that signal is ambiguous:
+            // it ALSO matches an explicit-remap-to-self publish (one where
+            // the legacy publisher passed `subContextGraphId === ownCG's
+            // own on-chain id` to deliberately drop the root copy). Both
+            // shapes hit `targetContextGraphId === local id` on the wire,
+            // so the fallback would re-add a root copy that the publisher
+            // had intentionally removed — a data-isolation regression.
+            //
+            // The cure is worse than the disease: trading a hard
+            // data-isolation bug for a soft query-discoverability gap is
+            // unacceptable. Without an unambiguous version/intent signal
+            // on the wire, a legacy publisher's same-graph publish stays
+            // queryable on receivers via per-cgId partitions but not via
+            // the bare `<cg>` label until the publisher upgrades to a
+            // tristate-emitting build and re-emits. New publishers always
+            // set the tristate (encoded with explicit KEEP/DROP) so the
+            // gap is bounded by the upgrade window. PR #779 has not
+            // shipped to any production peer yet, so this is the right
+            // moment to harden the contract.
+            const keepRootCopyOnLabel: boolean = msg.keepRootCopyOnLabel === true;
             await this.promoteSharedMemoryToCanonical(
               contextGraphId, sharedMemoryQuads, msg.ual, msg.rootEntities,
               msg.publisherAddress, msg.txHash, blockNumber, startKAId, endKAId,

@@ -241,16 +241,20 @@ describe('PR #779: same-graph dual-write into root + per-on-chain-id partition',
   });
 
   it('keepRootCopyOnLabel undefined (older publisher) at promote-call layer → conservative no-dual-write', async () => {
-    // Backward-compat pin for the LOWER-level
-    // `promoteSharedMemoryToCanonical` API: when the caller (the
-    // top-level `handleFinalizationMessage` already applied the legacy
-    // fallback or the test driver invoking promote directly) passes
-    // `keepRootCopyOnLabel === undefined`, promote MUST NOT dual-write.
-    // The legacy fallback that infers "same-graph" from the wire
-    // belongs at the message-decode layer (covered by the
-    // `handleFinalizationMessage` rolling-upgrade test below) and
-    // promote keeps its conservative contract: only true triggers
-    // dual-write.
+    // Codex r5b — the receiver-side legacy-publisher fallback that
+    // earlier rounds inferred from
+    // `targetContextGraphId === local-on-chain-id` is GONE. That signal
+    // can't distinguish a legacy same-graph publish from an explicit
+    // remap-to-self (`subContextGraphId === ownCG.onChainId`), so the
+    // fallback would re-add a root copy the publisher had intentionally
+    // dropped. The new contract is simpler and unambiguous: only an
+    // explicit wire-level `keepRootCopyOnLabel === true` triggers the
+    // recipient dual-write. Anything else — `false`, `undefined`, an
+    // unknown forward-compat sentinel, a legacy message with no tag-15
+    // at all — keeps the per-cgId-only path. This test pins the
+    // `undefined` case at the lower-level promote API; the wire-flag
+    // round-trips and legacy decode behaviour are covered by
+    // `proto-finalization-edge.test.ts`.
     const store = new OxigraphStore();
     const handler = new FinalizationHandler(store, undefined);
     const entity = 'urn:dualwrite:legacy';

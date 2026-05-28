@@ -217,26 +217,33 @@ export class DKGQueryEngine implements QueryEngine {
       // access to the CG-level `_meta` (curator / allowedAgent /
       // registrationStatus). They asked for SWM, they get SWM
       // (including `_shared_memory_meta` for the workspaceOwner /
-      // ownership ACL probe). All other scoped routes still expose
+      // ownership ACL probe). All other scoped routes expose both
       // `_meta` and `_shared_memory_meta` for the legitimate metadata
       // reads called out above.
       //
       // Sub-graph metadata uses `contextGraphSubGraphMetaUri`
       // (`/<sub>/_meta`) — the same path the storage layer
-      // (`graph-manager.ts`) writes to — not the `/context/<sub>/_meta`
-      // shape produced by `contextGraphMetaUri` when a subGraphId is
-      // passed.
+      // (`graph-manager.ts`) writes to — not the
+      // `/context/<sub>/_meta` shape produced by `contextGraphMetaUri`
+      // when a subGraphId is passed.
       //
-      // The widening applies to the EXPLICIT-IRI allow set ONLY. Graph-
-      // variable expansion (`constrainGraphVariablesToAllowedSet`)
-      // stays constrained to the data / SWM graphs so a benign-looking
-      // `GRAPH ?g { … }` SELECT still cannot iterate into the meta
-      // graphs and leak the allowedAgent list or the workspaceOwner
-      // peer id.
+      // The widening applies to BOTH the explicit-IRI allow set
+      // (`assertExplicitGraphIrisAllowed`) AND the graph-variable
+      // allow set (`constrainGraphVariablesToAllowedSet`). The UI
+      // hooks `useSwmAttributions`, `useVerifiedMemoryAnchors` and
+      // `useVerifiedEntityIdentity` enumerate sub-graph metadata via
+      // `GRAPH ?g { … } FILTER(CONTAINS(STR(?g), "_shared_memory_meta"))`
+      // with `contextGraphId` scope only — the strict variable allow
+      // (Codex r2 on #776) was breaking those callers in addition to
+      // the bash-test paths. Authenticated CG-scoped callers already
+      // have read access to that CG, so widening the variable allow
+      // to the same set as the explicit allow does not enlarge the
+      // privacy boundary; the boundary is the `contextGraphId` scope
+      // itself. Cross-CG access is still rejected by the data-graph
+      // allow construction above.
       const subGraphName = options?.subGraphName;
       const isSwmOnlyRoute = options?.graphSuffix === '_shared_memory';
-      const explicitAllowedGraphs = [
-        ...allowedGraphs,
+      const metaAllowList = [
         ...(isSwmOnlyRoute
           ? []
           : [
@@ -246,8 +253,10 @@ export class DKGQueryEngine implements QueryEngine {
             ]),
         contextGraphSharedMemoryMetaUri(effectiveContextGraphId, subGraphName),
       ];
+      const explicitAllowedGraphs = [...allowedGraphs, ...metaAllowList];
+      const variableAllowedGraphs = [...allowedGraphs, ...metaAllowList];
       assertExplicitGraphIrisAllowed(sparql, explicitAllowedGraphs);
-      sparql = constrainGraphVariablesToAllowedSet(sparql, allowedGraphs);
+      sparql = constrainGraphVariablesToAllowedSet(sparql, variableAllowedGraphs);
     }
 
     if (options?.view) {

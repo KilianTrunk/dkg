@@ -534,27 +534,38 @@ describe('DKGQueryEngine', () => {
     expect(result.bindings[0]['owner']).toBe('did:dkg:agent:0xsubgraph');
   });
 
-  it('still rejects GRAPH variables binding to _meta even with same-CG _meta allowed (fail-closed)', async () => {
-    // `GRAPH ?g` rewrites are intentionally constrained to data-only
-    // graphs. Allowing `_meta` only on the EXPLICIT-IRI path keeps the
-    // variable-binding path strict so a `SELECT ?g WHERE { GRAPH ?g
-    // { … } }` cannot iterate into `_meta` and leak metadata.
+  it('GRAPH ?g binds to same-CG _meta on default-routed scoped queries (UI hook regression coverage)', async () => {
+    // Codex r2 on #776: `useSwmAttributions`, `useVerifiedMemoryAnchors`
+    // and `useVerifiedEntityIdentity` (in `packages/node-ui/src/ui/hooks/`)
+    // all bind `GRAPH ?g` over CG-scoped metadata. The strict
+    // variable allow set was silently breaking those UI callers;
+    // widening `constrainGraphVariablesToAllowedSet` to the same set
+    // as the explicit-IRI allow set restores the
+    // CG-level / single-sub-graph cases. The privacy boundary is the
+    // `contextGraphId` scope (cross-CG `?g` bindings are still
+    // rejected) — see the immediately-preceding scope-rejection
+    // tests. NOTE: a `GRAPH ?g` query that needs to enumerate ACROSS
+    // every sub-graph's `_shared_memory_meta`
+    // (`FILTER(CONTAINS(STR(?g), "_shared_memory_meta"))`) still
+    // requires either an explicit sub-graph list or a prefix-based
+    // routing mode, which is tracked as a follow-up beyond #774 F4 +
+    // F3 — those callers are not exercised by the SWM-ownership /
+    // invite-flow devnet tests this PR is unblocking.
     await store.insert([
       {
         subject: GRAPH,
-        predicate: 'https://dkg.network/ontology#allowedAgent',
-        object: '"0xsecret"',
+        predicate: 'https://dkg.network/ontology#curator',
+        object: 'did:dkg:agent:0xowner',
         graph: META,
       },
     ]);
-    // The rewrite constrains ?g to the data graph only — so a query
-    // pattern that exists ONLY in _meta returns empty rather than
-    // leaking the allowedAgent triple.
     const result = await engine.query(
-      `SELECT ?g ?o WHERE { GRAPH ?g { <${GRAPH}> <https://dkg.network/ontology#allowedAgent> ?o } }`,
+      `SELECT ?g ?o WHERE { GRAPH ?g { <${GRAPH}> <https://dkg.network/ontology#curator> ?o } }`,
       { contextGraphId: CONTEXT_GRAPH },
     );
-    expect(result.bindings).toHaveLength(0);
+    expect(result.bindings).toHaveLength(1);
+    expect(result.bindings[0]['g']).toBe(META);
+    expect(result.bindings[0]['o']).toBe('did:dkg:agent:0xowner');
   });
 
   it('rejects compact explicit GRAPH IRIs outside the scoped context graph', async () => {

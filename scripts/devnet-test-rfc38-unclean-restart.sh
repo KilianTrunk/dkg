@@ -61,12 +61,22 @@ CORE_NODE=1
 # MiB) were already comfortably above the rc.12 ~1.5 MiB/s host-mode
 # catchup throughput on the reference devnet but still closed the
 # mid-batch window on faster (M-series / desktop) boxes. New defaults:
-# 1000 × 32 KiB = ~32 MiB, which holds the kill window open for ~20 s
-# even on the fastest hardware seen in CI/dev — well above the 100 ms
-# poll cadence below. Operators on slower boxes can dial these back
-# via the env vars.
+# 1000 × 32 KiB = ~32 MiB total payload, which holds the kill window
+# open for ~20 s even on the fastest hardware seen in CI/dev — well
+# above the 100 ms poll cadence below. Operators on slower boxes can
+# dial these back via the env vars.
+#
+# Codex r2 RED on #777: a single `/api/shared-memory/write` POST is
+# capped at `MAX_BODY_BYTES = 10 MiB` by the daemon — packing all
+# 1000 × 32 KiB quads into one request would 413 before catchup
+# starts. Split the writes across multiple `/write` calls of at most
+# `WRITES_PER_BATCH` quads (default 200, ~6.4 MiB body, comfortably
+# under the 10 MiB cap with JSON-overhead headroom) so the total
+# stress payload still hits the target without violating the body
+# cap.
 WRITES_COUNT="${WRITES_COUNT:-1000}"
 WRITE_PAYLOAD_BYTES="${WRITE_PAYLOAD_BYTES:-32768}"
+WRITES_PER_BATCH="${WRITES_PER_BATCH:-200}"
 
 log()  { echo "[urr] $*"; }
 warn() { echo "[urr] WARN: $*" >&2; }
@@ -207,24 +217,36 @@ EOF
 sleep 3
 
 # ===========================================================================
-act "2. Curator writes $WRITES_COUNT triples"
+act "2. Curator writes $WRITES_COUNT triples (batched ≤$WRITES_PER_BATCH per POST to fit MAX_BODY_BYTES)"
 # ===========================================================================
-PAYLOAD=$(STAMP="$STAMP" CG_ID="$CG_ID" N="$WRITES_COUNT" BYTES="$WRITE_PAYLOAD_BYTES" node -e '
-  const stamp = process.env.STAMP;
-  const cgId = process.env.CG_ID;
-  const n = Number(process.env.N);
-  const bytes = Number(process.env.BYTES);
-  const filler = "f".repeat(bytes);
-  const quads = [];
-  for (let i = 0; i < n; i++) {
-    const entity = "urn:urr:" + stamp + "/t-" + i;
-    quads.push({ subject: entity, predicate: "http://schema.org/note", object: "\"" + filler + "\"", graph: "" });
-  }
-  console.log(JSON.stringify({ contextGraphId: cgId, quads }));
-')
-W=$(api_call "$CURATOR_NODE" POST /api/shared-memory/write "$PAYLOAD")
-[ "$(parse_json "$W" '.triplesWritten')" = "$WRITES_COUNT" ] || fail "write expected $WRITES_COUNT triples: $W"
-log "✓ $WRITES_COUNT triples written"
+TOTAL_WRITTEN=0
+BATCH_START=0
+while [ "$BATCH_START" -lt "$WRITES_COUNT" ]; do
+  BATCH_END=$(( BATCH_START + WRITES_PER_BATCH ))
+  [ "$BATCH_END" -gt "$WRITES_COUNT" ] && BATCH_END="$WRITES_COUNT"
+  BATCH_LEN=$(( BATCH_END - BATCH_START ))
+  PAYLOAD=$(STAMP="$STAMP" CG_ID="$CG_ID" START="$BATCH_START" END="$BATCH_END" BYTES="$WRITE_PAYLOAD_BYTES" node -e '
+    const stamp = process.env.STAMP;
+    const cgId = process.env.CG_ID;
+    const start = Number(process.env.START);
+    const end = Number(process.env.END);
+    const bytes = Number(process.env.BYTES);
+    const filler = "f".repeat(bytes);
+    const quads = [];
+    for (let i = start; i < end; i++) {
+      const entity = "urn:urr:" + stamp + "/t-" + i;
+      quads.push({ subject: entity, predicate: "http://schema.org/note", object: "\"" + filler + "\"", graph: "" });
+    }
+    console.log(JSON.stringify({ contextGraphId: cgId, quads }));
+  ')
+  W=$(api_call "$CURATOR_NODE" POST /api/shared-memory/write "$PAYLOAD")
+  GOT=$(parse_json "$W" '.triplesWritten')
+  [ "$GOT" = "$BATCH_LEN" ] || fail "batch [$BATCH_START..$BATCH_END) expected $BATCH_LEN triples, got '$GOT': $W"
+  TOTAL_WRITTEN=$(( TOTAL_WRITTEN + BATCH_LEN ))
+  BATCH_START="$BATCH_END"
+done
+[ "$TOTAL_WRITTEN" = "$WRITES_COUNT" ] || fail "expected $WRITES_COUNT total triples written, got $TOTAL_WRITTEN"
+log "✓ $WRITES_COUNT triples written (across batches of ≤$WRITES_PER_BATCH)"
 sleep 4
 
 # Codex PR #624 R1: /api/shared-memory/list isn't a daemon route.

@@ -3,7 +3,17 @@
  * Reads `packages/evm-module/coverage/lcov.info` (produced by `pnpm test:coverage`
  * in evm-module) and fails if totals fall below ratchet floors.
  *
- * Ratchet baseline: 2026-04-06 (`hardhat coverage` Istanbul summary).
+ * Ratchet baseline: 2026-04-06 (`hardhat coverage` Istanbul summary), measured
+ * against the contract set instrumented by `packages/evm-module/.solcover.js`.
+ *
+ * Note on scope (2026-05-28): `.solcover.js` was extended to skip
+ * `contracts/archive/` after PR #500 moved 10 V8/V9 contracts there as part of
+ * the V10 transition (commit 929e29fe). Their matching tests were moved to
+ * `test/archive/` in the same change, so leaving the contracts instrumented
+ * would just inject ~3K lines of "0% covered" dead code into the totals and
+ * trip the ratchet on a fake regression. After the skip, the floors below are
+ * still the original ones; the live measurement comfortably exceeds them, so
+ * the ratchet keeps its anti-regression role without measuring archived code.
  */
 
 import fs from 'node:fs';

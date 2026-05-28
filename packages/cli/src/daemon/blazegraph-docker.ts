@@ -219,7 +219,7 @@ async function findFreePort(
 ): Promise<number> {
   for (let p = start; p < start + range; p++) {
     if (await isPortFree(p)) {
-      if (p !== start) log(`  Port ${start} taken; using ${p} instead.`);
+      if (p !== start) log(`  Port ${start} is in use (another Blazegraph or service?). Using port ${p} instead.`);
       return p;
     }
   }

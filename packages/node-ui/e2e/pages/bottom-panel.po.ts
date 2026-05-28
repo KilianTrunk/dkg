@@ -10,7 +10,13 @@ export class BottomPanelPage {
   constructor(page: Page) {
     this.page = page;
     this.root = page.locator(sel.bottom.root);
-    this.toggleBtn = page.locator(sel.bottom.toggle);
+    // PanelBottom now ships TWO `.v10-bottom-toggle` buttons:
+    //   1) Maximise / Restore  (full-screen the panel)
+    //   2) Expand   / Collapse (show/hide the panel body)
+    // The PO's original `toggle()` semantics is the second one, so pin
+    // the locator to that title pair to avoid Playwright's strict-mode
+    // "resolved to 2 elements" violation.
+    this.toggleBtn = this.root.getByRole('button', { name: /^(Expand|Collapse)$/ });
     this.content = page.locator(sel.bottom.content);
   }
 

@@ -37,7 +37,35 @@ export class DashboardPage {
   }
 
   async clickQuickAction(label: string) {
-    await this.quickActions.filter({ hasText: label }).click();
+    // The legacy `.v10-quick-action` row on the dashboard was removed in
+    // the rc11 redesign — the entry points moved into the left panel
+    // ("+ New Context Graph") and into the project view ("Import files"
+    // hub). Rather than ripping every spec that opens these modals as a
+    // precondition, this method now resolves to the still-extant entry
+    // point per label so the *modal-under-test* is what gets asserted,
+    // not the obsolete dashboard row.
+    const entryByLabel: Record<string, () => Promise<void>> = {
+      'Create Project': async () => {
+        await this.page
+          .locator('.v10-new-project-btn')
+          .filter({ hasText: /New Context Graph/i })
+          .first()
+          .click();
+      },
+    };
+    const direct = this.quickActions.filter({ hasText: label });
+    if ((await direct.count()) > 0) {
+      await direct.first().click();
+      return;
+    }
+    const fallback = entryByLabel[label];
+    if (fallback) {
+      await fallback();
+      return;
+    }
+    // Preserve the original locator-error if neither path resolves so a
+    // future regression doesn't silently no-op.
+    await direct.click();
   }
 
   async getProjectCardNames() {

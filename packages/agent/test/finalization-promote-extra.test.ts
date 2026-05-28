@@ -275,16 +275,32 @@ describe('#774 F1: registerContextGraph access-policy mismatch is rejected (Code
   // and the matching-policy branch so the half-registered state can't
   // slip back in.
   it('rejects register({ accessPolicy: 1 }) on a public-created CG with a remediation message', async () => {
+    // Codex r2 on #777: capture the rejection once and assert all
+    // substrings against the same error object — the previous draft
+    // invoked `registerContextGraph` twice just to match two
+    // fragments, and the new guard runs after some local metadata
+    // setup so a future refactor could make the second call land in
+    // a different state/path while the test still passes.
     const cgId = `f1-mismatch-${ethers.hexlify(ethers.randomBytes(3)).slice(2)}`;
     await nodeA!.createContextGraph({ id: cgId, name: 'F1 mismatch', description: '' });
 
-    await expect(
-      nodeA!.registerContextGraph(cgId, { accessPolicy: 1 }),
-    ).rejects.toThrow(/local access policy=public\/open \(0\)/i);
-
-    await expect(
-      nodeA!.registerContextGraph(cgId, { accessPolicy: 1 }),
-    ).rejects.toThrow(/dkg context-graph create.*--access-policy 1/);
+    let caught: Error | undefined;
+    try {
+      await nodeA!.registerContextGraph(cgId, { accessPolicy: 1 });
+    } catch (e) {
+      caught = e as Error;
+    }
+    expect(caught, 'expected register({ accessPolicy: 1 }) to reject').toBeDefined();
+    const msg = caught!.message;
+    expect(msg, 'message must surface the actual local ACL state').toMatch(
+      /local access policy=public\/open \(0\)/i,
+    );
+    expect(msg, 'message must point at the supported atomic create+register path').toMatch(
+      /dkg context-graph create.*--access-policy 1/,
+    );
+    expect(msg, 'message must mention the single-call API alternative').toMatch(
+      /POST \/api\/context-graph\/create/,
+    );
   });
 
   it('accepts register({ accessPolicy: 0 }) on a public-created CG (matching policy is fine)', async () => {

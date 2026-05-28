@@ -57,10 +57,14 @@ CORE_NODE=1
 # single sub-second page — the test then false-fails with "catchup too
 # fast" because the mid-batch poll never sees an in-progress state.
 #
-# 200 × 16 KiB = ~3.2 MiB. At the rc.12 catchup throughput observed on
-# the reference devnet (~1.5 MiB/s host-mode) this opens a ~2 s mid-batch
-# window — comfortably wide for the 100 ms poll loop below to catch.
-# Operators on faster boxes can keep bumping via the env vars.
+# Closes #774 finding #7 — the previous defaults (200 × 16 KiB = ~3.2
+# MiB) were already comfortably above the rc.12 ~1.5 MiB/s host-mode
+# catchup throughput on the reference devnet but still closed the
+# mid-batch window on faster (M-series / desktop) boxes. New defaults:
+# 1000 × 32 KiB = ~32 MiB, which holds the kill window open for ~20 s
+# even on the fastest hardware seen in CI/dev — well above the 100 ms
+# poll cadence below. Operators on slower boxes can dial these back
+# via the env vars.
 WRITES_COUNT="${WRITES_COUNT:-1000}"
 WRITE_PAYLOAD_BYTES="${WRITE_PAYLOAD_BYTES:-32768}"
 

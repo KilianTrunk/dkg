@@ -34,11 +34,23 @@ export const FinalizationMessageSchema = new Type('FinalizationMessage')
   // label-scoped queries find them) from an explicit-`subContextGraphId`
   // / remap publish (where the publisher deletes the root copy on
   // purpose). Receivers MUST honor this to avoid re-exposing remap-style
-  // KCs under the source CG label. Optional uint32 (encoded as
-  // boolean-equivalent) for forward/backward compat: older publishers
-  // that omit the field default to "no dual-write" on receivers — which
-  // matches the pre-PR-779 conservative behaviour and never widens
-  // visibility on a mixed-version mesh.
+  // KCs under the source CG label.
+  //
+  // Wire encoding caveat (Codex review r3 on PR #779): proto3 `bool`
+  // omits the field on the wire when the value is the default `false`,
+  // and protobufjs decodes the omitted field as `false` through the
+  // Message prototype. To distinguish "legacy publisher (no bit on the
+  // wire)" from "new publisher that explicitly set `false`" we strip
+  // prototype defaults inside `decodeFinalizationMessage` (see below)
+  // and expose presence via own-properties — receivers then read
+  // `msg.keepRootCopyOnLabel === undefined` for legacy publishers and
+  // fall back to inferring same-graph intent from
+  // `targetContextGraphId === local-on-chain-id-for(contextGraphId)`.
+  // The fallback lives in `finalization-handler.ts`
+  // `handleFinalizationMessage`, gated on this presence check, so a
+  // mixed-version mesh stays correct: legacy same-graph publishes still
+  // trigger the recipient root dual-write, and legacy remap publishes
+  // still skip it.
   .add(new Field('keepRootCopyOnLabel', 15, 'bool'));
 
 type Long = { low: number; high: number; unsigned: boolean };
@@ -71,9 +83,14 @@ export interface FinalizationMessageMsg {
    * remap-style publish) and receivers MUST NOT dual-write into the
    * source CG's root graph.
    *
-   * Backward compat: older publishers leave this undefined; new
-   * receivers treat undefined as `false` to preserve the pre-PR-779
-   * conservative routing on mixed-version meshes.
+   * Backward compat (Codex r3): older publishers omit the bit on the
+   * wire. `decodeFinalizationMessage` strips proto3 prototype defaults
+   * so receivers see `keepRootCopyOnLabel === undefined` for legacy
+   * publishers and `=== false` only for new publishers that explicitly
+   * cleared the bit. Receivers treat `undefined` by inferring
+   * same-graph intent from `targetContextGraphId === local-on-chain-id`
+   * (`finalization-handler.ts handleFinalizationMessage`), preserving
+   * label-scoped query convergence on mixed-version meshes.
    */
   keepRootCopyOnLabel?: boolean;
 }
@@ -106,5 +123,35 @@ export function encodeFinalizationMessage(msg: FinalizationMessageMsg): Uint8Arr
 }
 
 export function decodeFinalizationMessage(buf: Uint8Array): FinalizationMessageMsg {
-  return FinalizationMessageSchema.decode(buf) as unknown as FinalizationMessageMsg;
+  const decoded = FinalizationMessageSchema.decode(buf);
+  // Codex review (PR #779) — protobufjs decodes scalar fields with proto3
+  // default semantics: a field that is omitted on the wire reads as its
+  // type-default (`false` for bool, `0` for numerics, `''` for strings)
+  // through the runtime instance's prototype chain. Receivers that need
+  // to distinguish "publisher did not set this field" from "publisher
+  // explicitly set this field to its zero value" cannot use
+  // `typeof x === 'boolean'` against the raw Message instance, because a
+  // legacy publisher's omitted `keepRootCopyOnLabel` reads as the bool
+  // default `false` and looks indistinguishable from an explicit
+  // `false`. That's exactly the rolling-upgrade hazard the
+  // `keepRootCopyOnLabel` wire bit is meant to handle:
+  //   - new publisher, same-graph publish    → keepRootCopyOnLabel = true
+  //   - new publisher, remap publish         → keepRootCopyOnLabel = false
+  //   - legacy publisher (any kind)          → field NOT on the wire,
+  //                                            receiver must fall back
+  //                                            to inferring same-graph
+  //                                            from `targetContextGraphId`
+  //                                            (see `finalization-handler.ts`
+  //                                            handleFinalizationMessage).
+  // To preserve presence we surface only own properties of the decoded
+  // Message — `Object.keys`/`getOwnPropertyNames` skip the prototype
+  // defaults, so downstream `hasOwnProperty` and
+  // `msg.keepRootCopyOnLabel === undefined` checks correctly identify
+  // legacy publishers vs. explicit-false publishers vs. explicit-true
+  // publishers.
+  const result: Record<string, unknown> = {};
+  for (const key of Object.getOwnPropertyNames(decoded)) {
+    result[key] = (decoded as unknown as Record<string, unknown>)[key];
+  }
+  return result as unknown as FinalizationMessageMsg;
 }

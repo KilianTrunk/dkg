@@ -181,10 +181,14 @@ describe('workspace encrypted payload helpers', () => {
   // at the first non-hex char, producing fewer than 32 bytes and
   // tripping the assertion.
   //
-  // The fix narrows the hex branch to "exactly `0x` + 64 hex chars"
-  // (the canonical 32-byte hex form). Anything else falls through to
-  // the base64url path that `encodeWorkspaceEncryptionKey` always
-  // emits.
+  // The round-5 fix narrowed the hex branch to "exactly `0x` + 64 hex
+  // chars". Round 6+7 went further: the bot caught that `0x` + 41 'a'
+  // chars (length 43) is a valid base64url string AND a plausible
+  // mistype of canonical 64-char hex. There is no heuristic that
+  // disambiguates the two without breaking the other edge. The final
+  // resolution is to drop hex support from the decoder entirely (no
+  // caller produces hex via this API anyway), so all `0x…` strings
+  // unambiguously decode as base64url.
   it('encode → decode round-trip is byte-stable across many random x25519 keys', () => {
     // Deterministic background coverage. The base64url-with-0x-prefix
     // collision the next test pins is rare (~1/4096 per key) so an
@@ -219,14 +223,26 @@ describe('workspace encrypted payload helpers', () => {
     expect(Buffer.from(decoded).equals(expected)).toBe(true);
   });
 
-  it('still decodes the legitimate 0x-prefixed hex form (32 bytes)', () => {
+  // Regression: PR #792 round-6 bot review caught that
+  //   `0x` + 41 'a' chars (length 43) is structurally indistinguishable
+  // from a malformed hex key vs a legitimate base64url key — they're
+  // both valid 43-char base64url AND look like a typo of canonical
+  // 64-char hex. There is no length+alphabet heuristic that resolves
+  // both edges without misrouting the other.
+  //
+  // Resolution (round 7): drop hex support from the decoder entirely.
+  // `0x…hex` was dead code (no caller in this workspace produces or
+  // consumes it via this API), so any 66-char canonical hex input is
+  // now refused with an explicit message pointing at the base64url
+  // wire format. This eliminates the ambiguity at the source.
+  it('rejects canonical 0x-prefixed 32-byte hex with an explicit message', () => {
     const expected = Buffer.from(
       'd316d3d3101e56c5d9ddfeda94de770b2a536360f87a3a98e822657c4836630b',
       'hex',
     );
     const hexEncoded = `0x${expected.toString('hex')}`;
-    const decoded = decodeWorkspaceEncryptionKey(hexEncoded);
-    expect(decoded).toHaveLength(WORKSPACE_ENCRYPTION_KEY_BYTES);
-    expect(Buffer.from(decoded).equals(expected)).toBe(true);
+    expect(() => decodeWorkspaceEncryptionKey(hexEncoded)).toThrow(
+      /refusing to decode 0x-prefixed hex form/,
+    );
   });
 });

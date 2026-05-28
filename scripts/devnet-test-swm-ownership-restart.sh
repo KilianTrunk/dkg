@@ -58,17 +58,18 @@ api_capture() {
   curl_args+=(-H "Authorization: Bearer $token" -H "Content-Type: application/json")
   [ -n "$data" ] && curl_args+=(-d "$data")
   curl_args+=("http://127.0.0.1:${port}${path}")
-  # Capture curl's exit status separately and only trust the printed
-  # `%{http_code}` when curl actually finished the request. Codex
-  # review on #778: on transport failures curl can already emit `000`
-  # via `-w` and *then* the `|| echo "000"` fallback appends another
-  # `000`, leaving `$code = "000000"` which then fails the `-lt 200`
-  # arithmetic with "integer expression expected" — the very bug this
-  # script is trying to avoid surfacing. Branching on `$?` keeps `$code`
-  # to either a real 3-digit HTTP status or a single canonical `000`.
-  code=$(curl "${curl_args[@]}" 2>/dev/null)
-  rc=$?
-  if [ "$rc" -ne 0 ] || [ -z "$code" ]; then
+  # `set -euo pipefail` is in effect (line 22), so a bare
+  # `code=$(curl ...) ; rc=$?` would `errexit` the whole script before
+  # `$?` is captured (Codex review on #778). Wrap the call in
+  # `if cmd; then ... else ...; fi` — that branch is one of the
+  # documented `errexit` exceptions, so a transport failure flows to
+  # the `else` arm and we get a single canonical `000` back. We also
+  # guard against `curl` exiting cleanly while emitting nothing
+  # (rare, but `-w "%{http_code}"` can yield an empty stdout if the
+  # request is aborted between connect and first byte).
+  if code=$(curl "${curl_args[@]}" 2>/dev/null); then
+    [ -z "$code" ] && code="000"
+  else
     code="000"
   fi
   content="$(cat "$tmp" 2>/dev/null || true)"

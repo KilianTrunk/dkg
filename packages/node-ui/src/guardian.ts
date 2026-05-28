@@ -181,6 +181,7 @@ const SHELL_INSTALL_PATTERNS = [
 
 const REMOTE_SCRIPT_RE = /\b(?:curl|wget)\b[\s\S]{0,500}\|\s*(?:sh|bash|zsh|python|python3|node)\b/i;
 const PATH_RE = /(?:~(?:\/[^\s"'`;$|<>]+)?|\/Users\/[^\s"'`;$|<>]+|\/(?:etc|var|tmp|opt|usr|private|home|Volumes)\/[^\s"'`;$|<>]+)/g;
+const WINDOWS_USER_PATH_RE = /[A-Z]:\\Users\\[^\\\s"'`;$|<>]+(?:\\[^\s"'`;$|<>]+)*/gi;
 const PACKAGE_TOKEN_RE = /^(?:@[A-Za-z0-9._-]+\/)?[A-Za-z0-9._-]+(?:==|@)[A-Za-z0-9][A-Za-z0-9._+!~-]*$/;
 
 export function stableHash(value: unknown, length = 24): string {
@@ -794,7 +795,9 @@ function humanizeType(value: string): string {
 }
 
 function sanitizeRemediationText(value: string): string {
-  return sanitizeText(value, 1000).replace(PATH_RE, '[LOCAL_PATH]');
+  return sanitizeText(value, 1000)
+    .replace(WINDOWS_USER_PATH_RE, '[LOCAL_PATH]')
+    .replace(PATH_RE, '[LOCAL_PATH]');
 }
 
 function parseStringArray(json: string): string[] {

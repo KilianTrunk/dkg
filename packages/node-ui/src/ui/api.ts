@@ -213,6 +213,7 @@ export interface GuardianDependencyIntel {
   epss_score: number | null;
   epss_percentile: number | null;
   epss_date: string | null;
+  osv_json: string;
   publish_status: 'pending' | 'published' | 'failed' | 'skipped';
   publish_error: string | null;
   publish_tx_hash: string | null;

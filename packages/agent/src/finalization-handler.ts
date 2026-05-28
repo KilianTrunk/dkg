@@ -439,6 +439,31 @@ export class FinalizationHandler {
       : ctxGraphId
         ? contextGraphDataUri(contextGraphId, ctxGraphId)
         : graphManager.dataGraphUri(contextGraphId);
+    // Devnet test #774-followup (v10-rc-validation §5 gossip replication):
+    // when `ctxGraphId` is set on a non-sub-graph publish, the canonical
+    // data lands in the per-on-chain-id partition
+    // `<cg>/context/<ctxGraphId>` only. The publisher path
+    // (`dkg-publisher.ts` ~line 1382) intentionally ALSO writes the same
+    // quads to the root `<cg>` graph "so `agent.query(label)` (which
+    // resolves to `did:dkg:context-graph:<label>` without a
+    // `/context/<id>` suffix) still finds the just-published triples"
+    // (commit c2abbc9a). Replicas were never updated to mirror that
+    // dual-write — so a CG-scoped query against a label on a recipient
+    // node finds 0 bindings even though the data is local in
+    // `<cg>/context/<ctxGraphId>`. The query engine cannot widen its
+    // allow set to `<cg>/context/<num>` without a CG-registry lookup
+    // (id-prefix collisions, see PR #776 r6 in dkg-query-engine.ts).
+    // Mirroring the publisher's same-graph dual-write fixes the
+    // visibility asymmetry without re-introducing that ambiguity.
+    // REMAP-flow publishes (`publishContextGraphId` set on publisher)
+    // are not represented on the gossip wire — recipients can't tell a
+    // remap from a same-graph publish. The publisher's REMAP path
+    // already moves the data off the source CG locally, and on the
+    // target CG behaves identically to a same-graph publish. So the
+    // recipient dual-write is correct in both cases.
+    const rootDataGraphForLabel = (!subGraphName && ctxGraphId)
+      ? graphManager.dataGraphUri(contextGraphId)
+      : null;
 
     // Compute canonical quads now, but defer the `store.insert` until AFTER
     // the confirmed-meta write and SWM cleanup (see bottom of this method).
@@ -593,6 +618,15 @@ export class FinalizationHandler {
     // `_meta` already carries `confirmed` status + chain provenance and the
     // matching SWM entries have been drained.
     await this.store.insert(canonicalQuads);
+    if (rootDataGraphForLabel) {
+      // Mirror publisher's same-graph dual-write so label-scoped queries
+      // (`contextGraphId=<label>` with no `/context/<num>` suffix) on
+      // recipients see the same data as the publisher. See the
+      // `rootDataGraphForLabel` comment near the start of this method
+      // for full rationale.
+      const rootCopy = canonicalQuads.map(q => ({ ...q, graph: rootDataGraphForLabel }));
+      await this.store.insert(rootCopy);
+    }
 
     this.log.info(ctx, `Promoted ${canonicalQuads.length} quads from shared memory to canonical for ${ual}`);
     this.eventBus?.emit(DKGEvent.MEMORY_GRAPH_CHANGED, {

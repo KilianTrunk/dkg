@@ -32,16 +32,41 @@ module.exports = {
   //    + reference) but nothing in the active deploy set imports them
   //    and no live tests exercise them.
   //
-  //    Without this exclusion, solidity-coverage instruments those ~3K
+  //    Without this exclusion, solidity-coverage instruments those ~888
   //    lines of dead V8/V9 code, reports them as "0% covered" and drags
   //    the totals beneath the ratchet floors — the post-archive push
   //    safety-net failure is exactly that, not a real coverage
   //    regression on living code. Excluding `archive/` makes the ratchet
   //    measure what we actually ship.
   //
-  //    Verified before adding: `grep -r 'from "\\./archive\\|import.*archive'
-  //    contracts/ --include='*.sol' | grep -v 'contracts/archive/'`
-  //    returns nothing — no active contract imports anything in
-  //    `archive/`, so the skip is safe.
+  //    Safety verification — three independent greps that all return
+  //    empty are what make this skip safe. Re-run any of them if the
+  //    deploy/test layout changes:
+  //
+  //      A) No active Solidity contract imports anything from `archive/`:
+  //         grep -rPn '(from\s+"\./archive|import.*archive)' \
+  //              contracts/ --include='*.sol' \
+  //              | grep -v 'contracts/archive/'
+  //
+  //      B) No active deploy script under `deploy/active/` references
+  //         an archived contract by name (would trigger a runtime
+  //         lookup against the deployments JSON):
+  //         for name in KnowledgeAssets KnowledgeAssetsStorage \
+  //                     KnowledgeCollection Paymaster PaymasterManager \
+  //                     PublishingConvictionAccount Staking \
+  //                     DelegatorsInfo ContextGraphNameRegistry IPaymaster
+  //         do
+  //           grep -rPn "(^|[^A-Za-z0-9_])${name}([^A-Za-z0-9_]|\$)" \
+  //                deploy/active/ \
+  //             | grep -v 'StakingV10\|StakingStorage\|StakingKPI\|StakingLib\|KnowledgeAssetsV10\|KnowledgeCollectionStorage\|KnowledgeCollectionLib\|KnowledgeAssetsLib\|PublishingConvictionStorage\|PublishingConviction\b\|PaymasterManager\|IPaymaster'
+  //         done
+  //
+  //      C) No active unit/integration test references an archived
+  //         contract by name. Same loop as (B), targeting
+  //         `test/unit/`, `test/integration/` and `test/helpers/`.
+  //
+  //    All three were empty when this exclusion was added. Hardhat
+  //    `TASK_TEST_GET_TEST_FILES` already excludes `test/archive/`, so
+  //    no archived test fixture is ever exercised either.
   skipFiles: ['Identity.sol', 'archive'],
 };

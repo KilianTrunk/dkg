@@ -4,6 +4,18 @@ All notable changes to the DKG V9 node are documented here. The format is based 
 
 ## [Unreleased]
 
+### Changed — V10 EVM module hardening pass
+
+Consistency and defense-in-depth refinements across the V10 EVM-module contracts. No behaviour change for valid callers.
+
+- **CEI ordering on `DKGStakingConvictionNFT.withdraw`.** The receipt NFT is now burned before `StakingV10.withdraw` drives the CSS teardown + TRAC payout. `StakingV10.withdraw` gates on the CSS position (`pos.identityId == 0`), not NFT existence, so the CSS teardown is unaffected.
+- **`nonReentrant` perimeter on KAV10 entrypoints.** `publish` / `update` / `extendKnowledgeCollectionLifetime` now carry OZ `ReentrancyGuard.nonReentrant` as a defense-in-depth perimeter against the ERC-1155 receiver-hook callback path. ~50 gas/call overhead. KAV10 version: `10.1.0` → `10.1.1`.
+- **Strict-positive `tokenAmount` floor in `_validateTokenAmount`.** Reverts `InvalidTokenAmount(1, 0)` for any zero token amount on publish / extendKnowledgeCollectionLifetime, so the publish path charges a non-zero economic cost regardless of input rounding. The update path is unaffected (pure metadata updates skip this validator entirely).
+- **Operational-key uniqueness fail-fast in `Profile.createProfile`.** Lifts the global operational-key uniqueness + intra-array dedup + adminWallet / msg.sender collision check from inside `Identity.addOperationalWallets` to the entrypoint, giving a single deterministic error and avoiding partial-failure half-built identities. Admin-key reuse remains intentionally un-policed. Profile version: `1.3.0` → `1.4.0`.
+- **`Profile.recreateProfile` signature refinement.** Drops the `uint16 initialOperatorFee` argument; the recovered profile is seeded at fee = 0 and the admin sets the real value via the cooldown-gated `updateOperatorFee` path. Keeps the recovery and steady-state surfaces symmetric on the operator-fee dimension. ADR `docs/adr/0001-recreate-profile-admin-only.md` updated.
+
+Compatibility: `recreateProfile`'s signature is a BREAKING change for the recovery script. Off-chain consumers pinned to `KnowledgeAssetsV10@10.1.0` or `Profile@1.3.0` need a version bump. No storage-layout changes — KAV10's added `ReentrancyGuard` storage slot lands at the end of the inheritance chain, and V10's redeploy-and-reinit pattern doesn't preserve storage across upgrades anyway.
+
 ## [10.0.0-rc.11] - 2026-05-26
 
 ### Added — Node release visible on the libp2p wire

@@ -31,7 +31,15 @@ contract Profile is INamed, IVersioned, ContractStatus, IInitializable {
     // (testnet ProfileStorage-redeploy recovery). The id is reused so the
     // surviving staking/conviction/sharding state stays addressable. See
     // docs/adr/0001-recreate-profile-admin-only.md.
-    string private constant _VERSION = "1.3.0";
+    // Bumped 1.3.0 -> 1.4.0: recreateProfile drops the
+    // `initialOperatorFee` argument and seeds the recovered profile at
+    // fee = 0; admin sets the real fee via the cooldown-gated
+    // `updateOperatorFee` path (keeps the recovery and steady-state
+    // surfaces symmetric on the operator-fee dimension). Also adds
+    // explicit operational-key uniqueness pre-flight validation inside
+    // createProfile so collision diagnostics surface at the entrypoint
+    // instead of mid-loop inside `Identity.addOperationalWallets`.
+    string private constant _VERSION = "1.4.0";
 
     Ask public askContract;
     Identity public identityContract;
@@ -128,6 +136,46 @@ contract Profile is INamed, IVersioned, ContractStatus, IInitializable {
         if (initialOperatorFee > parametersStorage.maxOperatorFee()) {
             revert ProfileLib.OperatorFeeOutOfRange(initialOperatorFee);
         }
+
+        // Pre-flight operational-key validation. Surfaces collisions
+        // at the entrypoint with a single deterministic revert, before
+        // any identity is minted. Four classes:
+        //   - msg.sender / adminWallet collision with an entry in
+        //     `operationalWallets`.
+        //   - intra-array duplicates inside `operationalWallets`.
+        //   - entries already mapped to an existing identity (global
+        //     operational-key uniqueness via `identityIds`).
+        //   - zero address.
+        // Same constraints were previously enforced indirectly inside
+        // `Identity.addOperationalWallets`; surfacing them up front
+        // avoids partial-failure half-built identities and gives a
+        // single deterministic error. Admin-key reuse across identities
+        // remains intentionally un-policed.
+        IdentityStorage idsRef = ids;
+        for (uint256 i; i < operationalWallets.length; ) {
+            address opWallet = operationalWallets[i];
+            if (opWallet == address(0)) {
+                revert IdentityLib.OperationalAddressZero();
+            }
+            if (opWallet == msg.sender || opWallet == adminWallet) {
+                revert IdentityLib.OperationalKeyTaken(keccak256(abi.encodePacked(opWallet)));
+            }
+            if (idsRef.identityIds(keccak256(abi.encodePacked(opWallet))) != 0) {
+                revert IdentityLib.OperationalKeyTaken(keccak256(abi.encodePacked(opWallet)));
+            }
+            for (uint256 j = i + 1; j < operationalWallets.length; ) {
+                if (operationalWallets[j] == opWallet) {
+                    revert IdentityLib.OperationalKeyTaken(keccak256(abi.encodePacked(opWallet)));
+                }
+                unchecked {
+                    j++;
+                }
+            }
+            unchecked {
+                i++;
+            }
+        }
+
         uint72 identityId = id.createIdentity(msg.sender, adminWallet);
         id.addOperationalWallets(identityId, operationalWallets);
 
@@ -145,11 +193,18 @@ contract Profile is INamed, IVersioned, ContractStatus, IInitializable {
     // (a zero/unknown wallet resolves to id 0, which has no admin and
     // reverts). The identityId is reused — no new identity is minted — so
     // id-keyed staking/conviction/sharding state stays addressable.
+    //
+    // Profile 1.4.0: the `initialOperatorFee` argument is removed and the
+    // recovered profile is seeded at fee = 0. The admin sets the real
+    // value via the standard `updateOperatorFee` path, which carries the
+    // cooldown + prior-epoch-claim gate. Keeps the recovery and
+    // steady-state surfaces symmetric on the operator-fee dimension; the
+    // pre-redeploy fee history remains unrecoverable on-chain by design
+    // (testnet-only path, ADR 0001).
     function recreateProfile(
         address operationalWallet,
         string calldata nodeName,
-        bytes calldata nodeId,
-        uint16 initialOperatorFee
+        bytes calldata nodeId
     ) external onlyWhitelisted {
         uint72 identityId = identityStorage.getIdentityId(operationalWallet);
         _checkAdmin(identityId);
@@ -185,11 +240,11 @@ contract Profile is INamed, IVersioned, ContractStatus, IInitializable {
         if (ps.nodeIdsList(nodeId)) {
             revert ProfileLib.NodeIdAlreadyExists(nodeId);
         }
-        if (initialOperatorFee > parametersStorage.maxOperatorFee()) {
-            revert ProfileLib.OperatorFeeOutOfRange(initialOperatorFee);
-        }
 
-        ps.createProfile(identityId, nodeName, nodeId, initialOperatorFee);
+        // Hardcode seed fee to 0 — admin sets the real value via the
+        // standard `updateOperatorFee` path (cooldown-gated, prior-epoch
+        // settled). See the rationale block above.
+        ps.createProfile(identityId, nodeName, nodeId, 0);
 
         // ShardingTable survived a ProfileStorage-only redeploy: if this
         // node is already in the ring, Ask's active-set / pricing

@@ -25,6 +25,7 @@ import {ContractStatus} from "./abstract/ContractStatus.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC1271} from "@openzeppelin/contracts/interfaces/IERC1271.sol";
 import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {ECDSA} from "solady/src/utils/ECDSA.sol";
 
 /**
@@ -88,9 +89,15 @@ import {ECDSA} from "solady/src/utils/ECDSA.sol";
  * `originalByteSize` ceiling mapping is REMOVED; byte-size audit provenance
  * lives in the KCS `KnowledgeCollectionByteSizeUpdated` event history.
  */
-contract KnowledgeAssetsV10 is INamed, IVersioned, ContractStatus, IInitializable {
+contract KnowledgeAssetsV10 is INamed, IVersioned, ContractStatus, IInitializable, ReentrancyGuard {
     string private constant _NAME = "KnowledgeAssetsV10";
-    string private constant _VERSION = "10.1.0";
+    // 10.1.0 → 10.1.1: ReentrancyGuard perimeter on publish / update /
+    // extendKnowledgeCollectionLifetime; strict-positive tokenAmount floor
+    // in `_validateTokenAmount`. ReentrancyGuard contributes one uint256
+    // storage slot at the end of the inheritance chain; KAV10 owns its
+    // slots below the inherited chain and V10 deploys are redeploy +
+    // reinit, so no storage-layout migration is required.
+    string private constant _VERSION = "10.1.1";
 
     // --- V10 publish input (grouped to bypass the 16-arg stack limit) ---
 
@@ -410,7 +417,12 @@ contract KnowledgeAssetsV10 is INamed, IVersioned, ContractStatus, IInitializabl
      * @param p All publish parameters (see `PublishParams` struct).
      * @return kcId Newly created knowledge collection id.
      */
-    function publish(PublishParams calldata p) external returns (uint256 kcId) {
+    // Defense-in-depth perimeter on the three KAV10 entrypoints
+    // (`publish`, `update`, `extendKnowledgeCollectionLifetime`). KCS
+    // mint dispatches an ERC-1155 receiver acceptance callback to the
+    // publisher; `nonReentrant` keeps that callback from re-entering
+    // these entrypoints. No behaviour change for valid callers.
+    function publish(PublishParams calldata p) external nonReentrant returns (uint256 kcId) {
         uint40 currentEpoch;
         (currentEpoch, kcId) = _executePublishCore(p);
 
@@ -672,7 +684,7 @@ contract KnowledgeAssetsV10 is INamed, IVersioned, ContractStatus, IInitializabl
         uint256 id,
         uint40 epochs,
         uint96 tokenAmount
-    ) external {
+    ) external nonReentrant {
         KnowledgeCollectionStorage kcs = knowledgeCollectionStorage;
 
         (, , , uint88 byteSize, , uint40 endEpoch, uint96 oldTokenAmount, ) = kcs.getKnowledgeCollectionMetadata(id);
@@ -895,6 +907,19 @@ contract KnowledgeAssetsV10 is INamed, IVersioned, ContractStatus, IInitializabl
     ) internal view {
         Chronos chron = chronos;
 
+        // Strict-positive `tokenAmount` floor. The expected-cost formula
+        // `(ask * byteSize * window) / 1024` flows through integer
+        // truncation; for `(ask * byteSize * window) < 1024` the
+        // expected cost collapses to 0 and the under-payment branch
+        // below becomes unreachable on `tokenAmount == 0`. The explicit
+        // floor ensures publish / lifetime-extension always charge a
+        // non-zero economic cost regardless of input rounding. The
+        // update path is unaffected (pure metadata updates skip this
+        // validator entirely — gated on `newByteSize > currentByteSize`).
+        if (tokenAmount == 0) {
+            revert KnowledgeCollectionLib.InvalidTokenAmount(1, 0);
+        }
+
         uint256 stakeWeightedAverageAsk = askStorage.getStakeWeightedAverageAsk();
         // H7: `SafeCast.toUint96` reverts on overflow instead of silently
         // truncating. A publisher sending `stakeWeightedAverageAsk * byteSize
@@ -989,7 +1014,7 @@ contract KnowledgeAssetsV10 is INamed, IVersioned, ContractStatus, IInitializabl
      * direct spend. Metadata-only updates (`delta == 0`) skip cost
      * coverage entirely on either branch.
      */
-    function update(UpdateParams calldata p) external {
+    function update(UpdateParams calldata p) external nonReentrant {
         (uint96 deltaTokenAmount, uint40 remainingEpochs, uint40 currentEpoch) = _executeUpdateCore(p);
 
         if (deltaTokenAmount == 0) return;

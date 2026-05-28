@@ -1178,7 +1178,7 @@ describe('@integration Profile recreate preserves id-keyed state', () => {
     await expect(
       profile
         .connect(admin)
-        .recreateProfile(operational.address, 'Recover Node', nodeId, 1000),
+        .recreateProfile(operational.address, 'Recover Node', nodeId),
     ).to.not.be.reverted;
 
     // Profile restored under the SAME id; no new identity minted; the
@@ -1228,7 +1228,7 @@ describe('@integration Profile recreate preserves id-keyed state', () => {
 
     await profile
       .connect(admin)
-      .recreateProfile(operational.address, 'Recover Node', nodeId, 1000);
+      .recreateProfile(operational.address, 'Recover Node', nodeId);
 
     // recalculateActiveSet ran: it copies totalActiveStake -> prev first.
     expect(await askStorage.prevTotalActiveStake()).to.equal(777n);
@@ -1259,7 +1259,7 @@ describe('@integration Profile recreate preserves id-keyed state', () => {
 
     await profile
       .connect(admin)
-      .recreateProfile(operational.address, 'Recover Node', nodeId, 1000);
+      .recreateProfile(operational.address, 'Recover Node', nodeId);
 
     // Node not in the ring → guard skips recalc → prev stays 0.
     expect(await askStorage.prevTotalActiveStake()).to.equal(0n);

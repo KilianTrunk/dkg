@@ -99,8 +99,8 @@ describe('@unit Profile contract', function () {
     expect(await Profile.name()).to.equal('Profile');
   });
 
-  it('The contract is version "1.3.0"', async () => {
-    expect(await Profile.version()).to.equal('1.3.0');
+  it('The contract is version "1.4.0"', async () => {
+    expect(await Profile.version()).to.equal('1.4.0');
   });
 
   it('Create a profile with valid inputs, expect to pass', async () => {
@@ -368,7 +368,6 @@ describe('@unit Profile contract', function () {
           accounts[0].address,
           'Node 1',
           nodeId1,
-          1000,
         ),
       ).to.not.be.reverted;
 
@@ -385,13 +384,29 @@ describe('@unit Profile contract', function () {
           accounts[0].address,
           'Node 1',
           nodeId1,
-          1000,
         ),
       ).to.not.be.reverted;
 
       expect(await ProfileStorage.profileExists(identityId1)).to.equal(true);
       expect(await ProfileStorage.getNodeId(identityId1)).to.equal(nodeId1);
       expect(await ProfileStorage.getName(identityId1)).to.equal('Node 1');
+    });
+
+    // Profile 1.4.0 — recreateProfile no longer accepts an
+    // `initialOperatorFee` argument. The recovered profile is seeded at
+    // fee = 0 and the admin sets the real value via the cooldown-gated
+    // `updateOperatorFee` path.
+    it('seeds the recovered profile at operator fee = 0', async () => {
+      await seedBrickedIdentity();
+      await Profile.connect(accounts[1]).recreateProfile(
+        accounts[0].address,
+        'Node 1',
+        nodeId1,
+      );
+      const latestFee = await ProfileStorage.getLatestOperatorFeePercentage(
+        identityId1,
+      );
+      expect(latestFee).to.equal(0n);
     });
 
     it('does not mint a new identity (id counter and resolved id unchanged)', async () => {
@@ -405,7 +420,6 @@ describe('@unit Profile contract', function () {
         accounts[0].address,
         'Node 1',
         nodeId1,
-        1000,
       );
 
       expect(await IdentityStorage.lastIdentityId()).to.equal(lastIdBefore);
@@ -431,7 +445,6 @@ describe('@unit Profile contract', function () {
           accounts[0].address,
           'Node 1',
           nodeId1,
-          1000,
         ),
       )
         .to.be.revertedWithCustomError(Profile, 'ProfileAlreadyExists')
@@ -447,7 +460,6 @@ describe('@unit Profile contract', function () {
           accounts[0].address,
           'Node 1',
           nodeId1,
-          1000,
         ),
       ).to.be.revertedWithCustomError(Profile, 'OnlyProfileAdminFunction');
     });
@@ -460,7 +472,6 @@ describe('@unit Profile contract', function () {
           accounts[0].address,
           'Node 1',
           nodeId1,
-          1000,
         ),
       ).to.be.revertedWithCustomError(Profile, 'OnlyProfileAdminFunction');
     });
@@ -474,7 +485,6 @@ describe('@unit Profile contract', function () {
           accounts[6].address,
           'Node 1',
           nodeId1,
-          1000,
         ),
       ).to.be.revertedWithCustomError(Profile, 'OnlyProfileAdminFunction');
     });
@@ -496,7 +506,6 @@ describe('@unit Profile contract', function () {
           accounts[0].address,
           'Node 1',
           nodeId1,
-          1000,
         ),
       ).to.be.revertedWithCustomError(Profile, 'OnlyProfileAdminFunction');
     });
@@ -514,7 +523,6 @@ describe('@unit Profile contract', function () {
           accounts[0].address,
           'Node 1',
           differentNodeId,
-          1000,
         ),
       ).to.be.revertedWithCustomError(Profile, 'NodeIdShardingMismatch');
     });
@@ -528,7 +536,6 @@ describe('@unit Profile contract', function () {
           accounts[0].address,
           'Node 1',
           nodeId1,
-          1000,
         ),
       ).to.not.be.reverted;
       expect(await ProfileStorage.profileExists(identityId1)).to.equal(true);
@@ -542,7 +549,6 @@ describe('@unit Profile contract', function () {
           accounts[0].address,
           '',
           nodeId1,
-          1000,
         ),
       ).to.be.revertedWithCustomError(Profile, 'EmptyNodeName');
     });
@@ -555,7 +561,6 @@ describe('@unit Profile contract', function () {
           accounts[0].address,
           'Node 1',
           '0x',
-          1000,
         ),
       ).to.be.revertedWithCustomError(Profile, 'EmptyNodeId');
     });
@@ -575,7 +580,6 @@ describe('@unit Profile contract', function () {
           accounts[0].address,
           'Node 1',
           nodeId1,
-          1000,
         ),
       ).to.be.revertedWithCustomError(Profile, 'NodeIdAlreadyExists');
     });
@@ -587,33 +591,11 @@ describe('@unit Profile contract', function () {
     // only "passed" by faking it via a hardcoded storage slot. The dead
     // mapping itself is tracked as separate pre-existing cleanup.
 
-    it('accepts initialOperatorFee equal to the max and rejects above it', async () => {
-      await seedBrickedIdentity();
-      const maxFee = await ParametersStorage.maxOperatorFee();
-
-      await expect(
-        Profile.connect(accounts[1]).recreateProfile(
-          accounts[0].address,
-          'Node 1',
-          nodeId1,
-          maxFee,
-        ),
-      ).to.not.be.reverted;
-    });
-
-    it('reverts OperatorFeeOutOfRange when initialOperatorFee exceeds the max', async () => {
-      await seedBrickedIdentity();
-      const maxFee = await ParametersStorage.maxOperatorFee();
-
-      await expect(
-        Profile.connect(accounts[1]).recreateProfile(
-          accounts[0].address,
-          'Node 1',
-          nodeId1,
-          maxFee + 1n,
-        ),
-      ).to.be.revertedWithCustomError(Profile, 'OperatorFeeOutOfRange');
-    });
+    // Profile 1.4.0 — the `initialOperatorFee` argument was removed from
+    // `recreateProfile`. The two tests that asserted its bounds-check
+    // behaviour (max-fee accept / above-max reject) were deleted
+    // alongside the argument; the `updateOperatorFee` test suite already
+    // covers the same bounds for the steady-state path.
 
     it('is gated by the whitelist: reverts when enabled and admin not whitelisted', async () => {
       await seedBrickedIdentity();
@@ -624,7 +606,6 @@ describe('@unit Profile contract', function () {
           accounts[0].address,
           'Node 1',
           nodeId1,
-          1000,
         ),
       ).to.be.revertedWithCustomError(
         Profile,
@@ -642,7 +623,6 @@ describe('@unit Profile contract', function () {
           accounts[0].address,
           'Node 1',
           nodeId1,
-          1000,
         ),
       ).to.not.be.reverted;
     });
@@ -653,7 +633,6 @@ describe('@unit Profile contract', function () {
         accounts[0].address,
         'Node 1',
         nodeId1,
-        1000,
       );
 
       const nodeId2 =

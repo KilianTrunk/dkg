@@ -11,6 +11,7 @@ export default defineConfig({
       'test/swm/host-catchup-wire.test.ts',
       'test/swm/host-mode-store.test.ts',
       'test/swm/host-mode-key-canonicalization.test.ts',
+      'test/profile-fix-verify.test.ts',
     ],
     testTimeout: 60_000,
     maxWorkers: 1,

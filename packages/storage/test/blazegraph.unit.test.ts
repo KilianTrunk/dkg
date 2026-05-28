@@ -261,4 +261,32 @@ describe('BlazegraphStore (mocked HTTP)', () => {
     await expect(s.close()).resolves.toBeUndefined();
     expect(fetchCalls).toHaveLength(0);
   });
+
+  it('insert silently drops quads with oversized literals (>20KB)', async () => {
+    setFetch(async () => new Response(null, { status: 200 }));
+    const s = new BlazegraphStore(baseUrl);
+    const oversized = '"' + 'x'.repeat(25_000) + '"';
+    await s.insert([
+      { subject: 'http://s1', predicate: 'http://p', object: '"small"', graph: 'http://g' },
+      { subject: 'http://s2', predicate: 'http://p', object: oversized, graph: 'http://g' },
+      { subject: 'http://s3', predicate: 'http://p', object: '"also-small"', graph: 'http://g' },
+    ]);
+    expect(fetchCalls).toHaveLength(1);
+    const body = String(fetchCalls[0][1]?.body);
+    expect(body).toContain('http://s1');
+    expect(body).not.toContain('http://s2');
+    expect(body).toContain('http://s3');
+  });
+
+  it('insert keeps non-literal quads regardless of size', async () => {
+    setFetch(async () => new Response(null, { status: 200 }));
+    const s = new BlazegraphStore(baseUrl);
+    const longUri = 'http://example.org/' + 'a'.repeat(80_000);
+    await s.insert([
+      { subject: longUri, predicate: 'http://p', object: '"o"', graph: 'http://g' },
+    ]);
+    expect(fetchCalls).toHaveLength(1);
+    const body = String(fetchCalls[0][1]?.body);
+    expect(body).toContain(longUri);
+  });
 });

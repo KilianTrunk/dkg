@@ -281,14 +281,14 @@ export function buildAgentProfile(config: AgentProfileConfig): {
   q(activityUri, RDF_TYPE, `${PROV}Activity`);
   q(activityUri, `${PROV}atTime`, `"${new Date().toISOString()}"`);
 
-  const served = config.contextGraphsServed ?? config.contextGraphsServed;
+  const served = config.contextGraphsServed;
   if (served?.length) {
     const hostingUri = `${entity}/.well-known/genid/hosting`;
     q(entity, `${SKILL}hostingProfile`, hostingUri);
     q(hostingUri, RDF_TYPE, `${SKILL}HostingProfile`);
-    const val = `"${served.join(',')}"`;
-    q(hostingUri, `${SKILL}contextGraphsServed`, val);
-    q(hostingUri, `${SKILL}contextGraphsServed`, val);
+    for (const cg of served) {
+      q(hostingUri, `${SKILL}contextGraphsServed`, `"${cg}"`);
+    }
   }
 
   return { quads, rootEntity: entity };

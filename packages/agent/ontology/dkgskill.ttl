@@ -176,4 +176,4 @@ dkgskill:contextGraphsServed a owl:DatatypeProperty ;
     rdfs:domain dkgskill:HostingProfile ;
     rdfs:range xsd:string ;
     rdfs:label "contextGraphs served" ;
-    rdfs:comment "Comma-separated contextGraph IDs this node serves." .
+    rdfs:comment "Context graph ID this node serves. Multi-valued: one triple per CG." .

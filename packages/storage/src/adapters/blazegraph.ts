@@ -29,7 +29,8 @@ export class BlazegraphStore implements TripleStore {
 
   async insert(quads: DKGQuad[]): Promise<void> {
     if (quads.length === 0) return;
-    const nquads = quads.map(quadToNQuad).join('\n') + '\n';
+    const safe = rejectOversizedLiterals(quads, BLAZEGRAPH_MAX_LITERAL_BYTES);
+    const nquads = safe.map(quadToNQuad).join('\n') + '\n';
     const res = await fetch(this.url, {
       method: 'POST',
       headers: { 'Content-Type': 'text/x-nquads' },
@@ -301,6 +302,47 @@ function escapeUri(uri: string): string {
 
 function escapeString(s: string): string {
   return s.replace(/[\\"]/g, '\\$&');
+}
+
+// =====================================================================
+// Oversized-literal guard
+// =====================================================================
+
+/**
+ * Blazegraph uses Java's modified UTF-8 for index keys, which caps any
+ * single string value at 65 535 bytes **in Java Modified UTF-8**.
+ * Java MUTF-8 encodes supplementary Unicode codepoints (emoji, CJK
+ * extensions, etc.) as 6 bytes each vs 4 in standard UTF-8 — a ~3×
+ * expansion for heavy-Unicode content. A 28 KB UTF-8 literal can
+ * therefore exceed the 64 KB MUTF-8 ceiling.
+ *
+ * Exceeding this limit triggers `java.io.UTFDataFormatException` and
+ * causes the entire batch to fail with HTTP 500.
+ *
+ * We silently drop quads whose object literal exceeds the threshold
+ * rather than aborting the whole batch — one bad triple should not
+ * block thousands of valid ones from being persisted.
+ *
+ * 20 000 UTF-8 bytes ≈ 60 000 MUTF-8 worst-case, safely under 65 535.
+ */
+const BLAZEGRAPH_MAX_LITERAL_BYTES = 20_000;
+
+function rejectOversizedLiterals(quads: DKGQuad[], maxBytes: number): DKGQuad[] {
+  const out: DKGQuad[] = [];
+  for (const q of quads) {
+    if (q.object.startsWith('"')) {
+      const byteLen = new TextEncoder().encode(q.object).length;
+      if (byteLen > maxBytes) {
+        console.warn(
+          `[BlazegraphStore] Dropping quad with oversized literal (${byteLen} bytes > ${maxBytes} limit): ` +
+          `subject=${q.subject.slice(0, 80)}, predicate=${q.predicate.slice(0, 80)}`,
+        );
+        continue;
+      }
+    }
+    out.push(q);
+  }
+  return out;
 }
 
 // =====================================================================

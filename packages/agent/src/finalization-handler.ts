@@ -140,12 +140,44 @@ export class FinalizationHandler {
           );
 
           if (verified) {
+            // Codex r3 — rolling-upgrade fallback. Pre-PR-779 publishers
+            // do not set `keepRootCopyOnLabel` on the wire. A naive
+            // `=== true` test treats them as remap-style and skips the
+            // dual-write — but those publishers' same-graph publishes
+            // legitimately kept a root copy locally, so a new receiver
+            // would silently keep serving the old label-scoped miss
+            // for those peers until every publisher upgrades. We can
+            // recover same-graph intent from existing wire signals: a
+            // legacy SAME-graph publish carries `targetContextGraphId`
+            // = publisher's-local on-chain id for `contextGraphId`,
+            // which on the receiver resolves to the SAME local on-chain
+            // id (it's the same CG, same chain). A legacy REMAP publish
+            // carries `targetContextGraphId` = a DIFFERENT on-chain id
+            // (the remap target's). So `targetContextGraphId ===
+            // local-on-chain-id-for(contextGraphId)` is a precise
+            // legacy-publisher proxy for "same-graph publish, mirror
+            // root". When `keepRootCopyOnLabel` is set on the wire we
+            // honour it directly; the fallback only applies when the
+            // bit is missing.
+            let keepRootCopyOnLabel: boolean;
+            if (typeof msg.keepRootCopyOnLabel === 'boolean') {
+              keepRootCopyOnLabel = msg.keepRootCopyOnLabel;
+            } else if (ctxGraphId && this.resolveContextGraphOnChainId) {
+              try {
+                const local = await this.resolveContextGraphOnChainId(contextGraphId);
+                keepRootCopyOnLabel = local !== null && local !== undefined && String(local) === String(ctxGraphId);
+              } catch {
+                keepRootCopyOnLabel = false;
+              }
+            } else {
+              keepRootCopyOnLabel = false;
+            }
             await this.promoteSharedMemoryToCanonical(
               contextGraphId, sharedMemoryQuads, msg.ual, msg.rootEntities,
               msg.publisherAddress, msg.txHash, blockNumber, startKAId, endKAId,
               protoToBigInt(msg.batchId), ctx, ctxGraphId, subGraphName,
               authorAddress,
-              msg.keepRootCopyOnLabel === true,
+              keepRootCopyOnLabel,
             );
             this.markProcessed(dedupeKey);
             this.log.info(ctx, `Finalization: promoted SWM snapshot to ${ctxGraphId ? `context graph ${ctxGraphId}` : 'canonical'} for ${msg.ual} (tx=${msg.txHash.slice(0, 10)}…)`);
@@ -607,9 +639,35 @@ export class FinalizationHandler {
     if (ctxGraphId) {
       const defaultMeta = `did:dkg:context-graph:${contextGraphId}/_meta`;
       const targetMeta = contextGraphMetaUri(contextGraphId, ctxGraphId);
-      metaQuads = metaQuads.map((q) =>
-        q.graph === defaultMeta ? { ...q, graph: targetMeta } : q,
-      );
+      // Codex r3 on PR #779: the publisher's same-graph path keeps the
+      // confirmed `_meta` triples in BOTH the root `<cg>/_meta` and
+      // the per-cgId `<cg>/context/<cgId>/_meta` graphs (see the
+      // matching dual-write in `dkg-publisher.ts` ~line 1419, comment
+      // "on remap publishes the original copy at `<NAME>/_meta` is
+      // also moved; on same-graph publishes we leave the default copy
+      // in place"). Replicas were only writing the per-cgId copy, so
+      // label-only `_meta` reads (status / UAL / authoredBy lookups
+      // that don't know the on-chain id) diverged between publisher
+      // and recipients. Mirror the publisher's same-graph dual-write
+      // here too — gated on the same `keepRootCopyOnLabel` signal as
+      // the data-graph dual-write below, and folded into a single
+      // `store.insert` for the same retry-safety reason (`_meta`
+      // tentative→confirmed flip is supposed to be the durable point
+      // post-this-call; splitting the writes would re-introduce a
+      // partial-state window).
+      if (keepRootCopyOnLabel === true) {
+        const rootCopies = metaQuads
+          .filter((q) => q.graph === defaultMeta)
+          .map((q) => ({ ...q }));
+        const perCgIdCopies = metaQuads.map((q) =>
+          q.graph === defaultMeta ? { ...q, graph: targetMeta } : q,
+        );
+        metaQuads = [...perCgIdCopies, ...rootCopies];
+      } else {
+        metaQuads = metaQuads.map((q) =>
+          q.graph === defaultMeta ? { ...q, graph: targetMeta } : q,
+        );
+      }
     }
     await this.store.insert(metaQuads);
 

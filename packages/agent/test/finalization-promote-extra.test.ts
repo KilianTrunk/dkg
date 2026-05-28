@@ -131,11 +131,12 @@ describe('PR #779: same-graph dual-write into root + per-on-chain-id partition',
   const cgRoot = `did:dkg:context-graph:${CONTEXT_GRAPH}`;
   const cgPerCgId = `did:dkg:context-graph:${CONTEXT_GRAPH}/context/42`;
 
-  it('keepRootCopyOnLabel=true → quads land in BOTH root and per-cgId graphs', async () => {
+  it('keepRootCopyOnLabel=true → quads AND meta land in BOTH root and per-cgId graphs', async () => {
     const store = new OxigraphStore();
     const handler = new FinalizationHandler(store, undefined);
     const entity = 'urn:dualwrite:alice';
     const publisher = '0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266';
+    const ual = 'did:dkg:evm:31337/0xDW/1';
     const quads = [
       { subject: entity, predicate: 'http://schema.org/name', object: '"DualWrite"', graph: '' },
     ];
@@ -143,7 +144,7 @@ describe('PR #779: same-graph dual-write into root + per-on-chain-id partition',
     await (handler as any).promoteSharedMemoryToCanonical(
       CONTEXT_GRAPH,
       quads,
-      'did:dkg:evm:31337/0xDW/1',
+      ual,
       [entity],
       publisher,
       '0x' + '11'.repeat(32),
@@ -172,6 +173,28 @@ describe('PR #779: same-graph dual-write into root + per-on-chain-id partition',
         'same-graph publish (keepRootCopyOnLabel=true) MUST mirror publisher dual-write so label-scoped queries find the data on replicas',
       ).toBe(true);
     }
+
+    // Codex r3: confirmed `_meta` must also live in BOTH root `_meta` and
+    // per-cgId `_meta` so label-only status / UAL / authoredBy lookups
+    // converge across publisher and replicas. Pin the dual-write of the
+    // confirmed status quad on both meta graphs.
+    const rootMeta = `did:dkg:context-graph:${CONTEXT_GRAPH}/_meta`;
+    const perCgIdMeta = `did:dkg:context-graph:${CONTEXT_GRAPH}/context/42/_meta`;
+    const rootMetaAsk = await store.query(
+      `ASK { GRAPH <${rootMeta}> { <${ual}> <http://dkg.io/ontology/status> "confirmed" } }`,
+    );
+    expect(rootMetaAsk.type).toBe('boolean');
+    if (rootMetaAsk.type === 'boolean') {
+      expect(
+        rootMetaAsk.value,
+        'same-graph publish must dual-write confirmed `_meta` to ROOT meta graph too — label-only meta lookups otherwise miss the KC on replicas',
+      ).toBe(true);
+    }
+    const perCgIdMetaAsk = await store.query(
+      `ASK { GRAPH <${perCgIdMeta}> { <${ual}> <http://dkg.io/ontology/status> "confirmed" } }`,
+    );
+    expect(perCgIdMetaAsk.type).toBe('boolean');
+    if (perCgIdMetaAsk.type === 'boolean') expect(perCgIdMetaAsk.value).toBe(true);
   });
 
   it('keepRootCopyOnLabel=false → root stays empty (remap-style publisher deleted root)', async () => {
@@ -217,14 +240,17 @@ describe('PR #779: same-graph dual-write into root + per-on-chain-id partition',
     }
   });
 
-  it('keepRootCopyOnLabel undefined (older publisher) → conservative no-dual-write', async () => {
-    // Backward-compat pin: a publisher that predates PR #779 omits the
-    // wire field entirely. Receivers MUST decode that as "no dual-write"
-    // (the pre-PR-779 conservative behaviour) so an old publisher cannot
-    // accidentally trigger the new dual-write on a new receiver — that
-    // path is only safe if the publisher actually kept the root copy,
-    // which old publishers never do (their REMAP detection lacks the new
-    // bit and they always single-write to the per-cgId partition).
+  it('keepRootCopyOnLabel undefined (older publisher) at promote-call layer → conservative no-dual-write', async () => {
+    // Backward-compat pin for the LOWER-level
+    // `promoteSharedMemoryToCanonical` API: when the caller (the
+    // top-level `handleFinalizationMessage` already applied the legacy
+    // fallback or the test driver invoking promote directly) passes
+    // `keepRootCopyOnLabel === undefined`, promote MUST NOT dual-write.
+    // The legacy fallback that infers "same-graph" from the wire
+    // belongs at the message-decode layer (covered by the
+    // `handleFinalizationMessage` rolling-upgrade test below) and
+    // promote keeps its conservative contract: only true triggers
+    // dual-write.
     const store = new OxigraphStore();
     const handler = new FinalizationHandler(store, undefined);
     const entity = 'urn:dualwrite:legacy';
@@ -246,7 +272,7 @@ describe('PR #779: same-graph dual-write into root + per-on-chain-id partition',
       '42',
       undefined,
       undefined,
-      undefined, // keepRootCopyOnLabel undefined — older publisher
+      undefined, // keepRootCopyOnLabel undefined at the promote layer
     );
 
     const rootAsk = await store.query(

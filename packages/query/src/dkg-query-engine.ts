@@ -290,16 +290,36 @@ export class DKGQueryEngine implements QueryEngine {
       // SWM-only routes (`graphSuffix='_shared_memory'`) still drop
       // `_meta` sub-graphs.
       //
-      // Residual edge case: when two CGs share an id-prefix
-      // (`foo/bar` and `foo/bar/baz`) AND both happen to be hosted on
-      // the same node, the URI `<cgRoot:foo/bar>/baz/_meta` is
-      // genuinely ambiguous between "sub-graph baz of foo/bar" and
-      // "root meta of foo/bar/baz". A definitive resolution would
-      // need a CG-registry lookup; the structural match keeps the
-      // common single-segment case tight without that round-trip,
-      // and the same-CG access boundary still holds for any node
-      // that only hosts one of the colliding ids.
-      if (!subGraphName && collectGraphVariables(sparql).length > 0) {
+      // Codex r4 RED on #776: wallet-scoped cgIds like
+      // `0xabc/my-project` contain `/` (per
+      // `validateContextGraphId`). If the same node happens to host
+      // both `foo/bar` AND `foo/bar/baz` as separate CGs, the URI
+      // `did:dkg:context-graph:foo/bar/baz/_meta` is genuinely
+      // ambiguous between "sub-graph `baz` of `foo/bar`" (admit) and
+      // "root `_meta` of `foo/bar/baz`" (cross-CG leak). A definitive
+      // resolution would need a CG-registry lookup on every scoped
+      // GRAPH ?g query, which is exactly the kind of per-request
+      // round-trip the YELLOW review on `listGraphs()` flagged as
+      // expensive.
+      //
+      // Conservative fence: when `effectiveContextGraphId` contains
+      // `/` (i.e. it could be wallet-scoped or otherwise have a
+      // colliding-id sibling), SKIP the dynamic enumeration entirely
+      // and fall back to the static `metaAllowList`. UI hooks lose
+      // sub-graph enumeration on wallet-scoped CGs (tracked as a
+      // follow-up — proper fix is to inject a CG-registry interface
+      // here so we can authoritatively reject a candidate that is
+      // itself a registered CG root), but cross-CG isolation stays
+      // tight without a registry round-trip. For non-wallet-scoped
+      // cgIds (no `/`), the structural match below is unambiguous —
+      // there is no way to construct a colliding sibling CG without
+      // adding `/` to the id.
+      const cgIdHasSlash = effectiveContextGraphId.includes('/');
+      if (
+        !subGraphName
+        && !cgIdHasSlash
+        && collectGraphVariables(sparql).length > 0
+      ) {
         const cgRoot = `did:dkg:context-graph:${effectiveContextGraphId}`;
         const allGraphs = await this.store.listGraphs();
         const subMetaTokens = isSwmOnlyRoute

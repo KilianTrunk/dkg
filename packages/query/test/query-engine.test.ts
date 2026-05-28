@@ -642,25 +642,31 @@ describe('DKGQueryEngine', () => {
     expect(agents).toEqual(['"agentCode"']);
   });
 
-  it('GRAPH ?g enumeration uses structural match — wallet-scoped cgId does NOT leak from id-prefix-collision CG', async () => {
-    // Codex r4 RED on #776: `validateContextGraphId` allows `/`, so
-    // wallet-scoped ids like `0xabc.../my-project` would have made a
-    // plain `startsWith` prefix test also admit graphs from any CG
-    // whose id is `<this-cg>/<extra-segment>` (e.g.
-    // `0xabc.../my-project/sub-cg`). The structural match (one
-    // sub-graph segment between `<cgRoot>/` and the meta suffix,
-    // segment validated by `validateSubGraphName`) keeps cross-CG
-    // isolation intact.
+  it('GRAPH ?g enumeration is SKIPPED for wallet-scoped cgIds (defense against id-prefix collision)', async () => {
+    // Codex r4 RED on #776 (round 2): even with the structural match,
+    // wallet-scoped ids like `0xabc/proj` admit a real cross-CG leak
+    // when the same node hosts both `foo/bar` and `foo/bar/baz` as
+    // separate registered CGs — the URI
+    // `<cgRoot:foo/bar>/baz/_meta` is genuinely ambiguous between
+    // "sub-graph baz of foo/bar" and "root _meta of foo/bar/baz".
+    // The query engine cannot resolve this ambiguity without a
+    // CG-registry round-trip on every scoped GRAPH ?g query (which
+    // the YELLOW perf review separately flagged as expensive).
     //
-    // Note: the engine doesn't enforce `validateContextGraphId` at
-    // construction time; we exercise the structural fence directly
-    // by seeding two parallel "CG roots" that overlap via the slash
-    // convention.
+    // Conservative fence: when the cgId contains `/` (any
+    // wallet-scoped or otherwise potentially-colliding form), the
+    // dynamic enumeration is SKIPPED. The static `metaAllowList`
+    // (root `_meta` + root `_shared_memory_meta`) still works, so
+    // basic `GRAPH ?g` over root metas binds. Sub-graph enumeration
+    // for wallet-scoped CGs is a tracked follow-up that needs a
+    // CG-registry interface threaded into the engine.
     const walletCg = 'did:dkg:context-graph:0xabc/proj';
+    const rootMeta = `${walletCg}/_meta`;
     const collidingCgRootMeta = `${walletCg}/legitimate-sub/_meta`;
     const otherCgUnderSlash = `${walletCg}/other-cg/extra/_meta`;
     await store.insert([
-      { subject: 'urn:in', predicate: 'http://schema.org/n', object: '"in"', graph: collidingCgRootMeta },
+      { subject: 'urn:root', predicate: 'http://schema.org/n', object: '"root"', graph: rootMeta },
+      { subject: 'urn:sub', predicate: 'http://schema.org/n', object: '"sub"', graph: collidingCgRootMeta },
       { subject: 'urn:out', predicate: 'http://schema.org/n', object: '"out"', graph: otherCgUnderSlash },
     ]);
     const result = await engine.query(
@@ -668,7 +674,8 @@ describe('DKGQueryEngine', () => {
       { contextGraphId: '0xabc/proj' },
     );
     const values = result.bindings.map((b) => b['v']).sort();
-    expect(values).toContain('"in"');
+    expect(values).toContain('"root"');
+    expect(values).not.toContain('"sub"');
     expect(values).not.toContain('"out"');
   });
 

@@ -1,6 +1,26 @@
 import { type Page, type Locator } from '@playwright/test';
 import { sel } from '../helpers/selectors.js';
 
+/**
+ * DashboardPage — page object for the rc11 redesigned dashboard.
+ *
+ * The legacy dashboard had quick-action buttons, demo project cards
+ * (`.v10-dash-project-card`), and a recent-operations feed
+ * (`.v10-recent-op`). All three were removed in the rc11 redesign.
+ * The current dashboard ships:
+ *   - 3 StatCards (My Context Graphs / Context Graph Size /
+ *     Collaborating Agents) in `.v10-dash-stats.v10-dash-stats-3`,
+ *   - the My-Context-Graphs section (`.v10-cg-list` with `.v10-cg-row`
+ *     buttons) — which doubles as the project picker,
+ *   - the Wallets and Spending section (`.v10-ws-wtable` / `.v10-ws-spend`).
+ *
+ * The PO surface still exposes `clickQuickAction(label)` as a shim so
+ * specs that just need to *open the create-project modal* as a
+ * precondition keep working — the shim delegates to the left panel's
+ * "+ New Context Graph" button. Methods that have no replacement in
+ * the new UI (project cards, recent ops, "view all" link) have been
+ * removed.
+ */
 export class DashboardPage {
   readonly page: Page;
   readonly root: Locator;
@@ -8,9 +28,15 @@ export class DashboardPage {
   readonly subtitle: Locator;
   readonly statsContainer: Locator;
   readonly quickActions: Locator;
-  readonly projectCards: Locator;
-  readonly recentOps: Locator;
-  readonly viewAllLink: Locator;
+
+  // Newly-named handles for the rc11 dashboard. The CG list IS the
+  // project picker now — clicking a `.v10-cg-row` opens that project's
+  // tab in the centre panel (replacing the legacy `.v10-dash-project-card`).
+  readonly cgRows: Locator;
+  readonly cgEmpty: Locator;
+  readonly walletsSection: Locator;
+  readonly spendingTable: Locator;
+  readonly chainRow: Locator;
 
   constructor(page: Page) {
     this.page = page;
@@ -19,9 +45,13 @@ export class DashboardPage {
     this.subtitle = page.locator(sel.dashboard.subtitle);
     this.statsContainer = page.locator(sel.dashboard.stats);
     this.quickActions = page.locator(sel.dashboard.quickAction);
-    this.projectCards = page.locator(sel.dashboard.projectCard);
-    this.recentOps = page.locator(sel.dashboard.recentOp);
-    this.viewAllLink = page.locator(sel.dashboard.sectionLink).filter({ hasText: 'View all' });
+    this.cgRows = page.locator('.v10-cg-list .v10-cg-row');
+    this.cgEmpty = page.locator('.v10-cg-empty');
+    this.walletsSection = page
+      .locator('.v10-dash-section')
+      .filter({ has: page.getByRole('heading', { name: 'Wallets and Spending' }) });
+    this.spendingTable = page.locator('.v10-ws-spend');
+    this.chainRow = page.locator('.v10-ws-chain-row');
   }
 
   async getStatCards() {
@@ -68,32 +98,21 @@ export class DashboardPage {
     await direct.click();
   }
 
-  async getProjectCardNames() {
-    const count = await this.projectCards.count();
+  async getCgNames(): Promise<string[]> {
+    const count = await this.cgRows.count();
     const names: string[] = [];
     for (let i = 0; i < count; i++) {
-      const name = await this.projectCards.nth(i).locator(sel.dashboard.projectName).textContent();
-      if (name) names.push(name.trim());
+      const text = await this.cgRows.nth(i).locator('.v10-cg-name').textContent();
+      if (text) names.push(text.trim());
     }
     return names;
   }
 
-  async clickProjectCard(name: string) {
-    await this.projectCards.filter({ hasText: name }).click();
+  async clickCgRow(name: string) {
+    await this.cgRows.filter({ hasText: name }).first().click();
   }
 
-  async getRecentOperations() {
-    const count = await this.recentOps.count();
-    const ops: Array<{ type: string; status: string }> = [];
-    for (let i = 0; i < count; i++) {
-      const type = await this.recentOps.nth(i).locator(sel.dashboard.recentOpType).textContent() ?? '';
-      const status = await this.recentOps.nth(i).locator(sel.dashboard.recentOpStatus).textContent() ?? '';
-      ops.push({ type: type.trim(), status: status.trim() });
-    }
-    return ops;
-  }
-
-  async clickViewAllOperations() {
-    await this.viewAllLink.click();
+  async getSubtitleText(): Promise<string> {
+    return (await this.subtitle.textContent())?.trim() ?? '';
   }
 }

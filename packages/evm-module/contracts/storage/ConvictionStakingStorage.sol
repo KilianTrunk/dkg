@@ -922,6 +922,13 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
         // v4.1.0 — apply the V8→V10 migration credit. The credit is in
         // seconds; we subtract from the freshly-computed default expiry.
         // Constraints:
+        //   * The credit is V8→V10 migration-exclusive — fresh `stake()`
+        //     calls (`migrationEpoch == 0`) MUST pass 0. Without this
+        //     guard, any future Hub-registered caller could mint a
+        //     fresh stake at a shortened lock just by remembering / not
+        //     to pass the bonus. Tying the credit to a non-zero
+        //     `migrationEpoch` keeps the bonus a closed eligibility set
+        //     scoped to the V8→V10 drain path.
         //   * Tier 0 has no boost / no expiry, so any non-zero credit is
         //     a caller bug (guard catches it explicitly).
         //   * Credit must be strictly less than the tier duration —
@@ -931,6 +938,7 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
         //     future. Belt-and-suspenders against off-by-one rounding
         //     in the tier table.
         if (expiryShortenedBy != 0) {
+            require(migrationEpoch != 0, "Credit requires migrationEpoch");
             require(lockTier != 0, "Credit requires locked tier");
             uint256 dur = _tierDuration(lockTier);
             require(uint256(expiryShortenedBy) < dur, "Credit >= tier duration");

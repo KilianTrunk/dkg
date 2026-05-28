@@ -963,19 +963,38 @@ contract StakingV10 is INamed, IVersioned, ContractStatus, IInitializable {
         // v3.1.0 — V8→V10 conviction credit. Eligible delegators (continuous
         // V8 stake on this node for the 60d preceding V10 launch, recorded in
         // the frozen `V8MigrationEligibility` registry) who pick a high-
-        // conviction tier (6 or 12) get their lock shortened by 2 epochs.
-        // Lower tiers and ineligible migrants migrate at the default lock.
+        // conviction tier (6 or 12) get their lock shortened by a fixed
+        // 60 days. Lower tiers and ineligible migrants migrate at the
+        // default lock.
+        //
+        // Frozen-registry precondition: every migration must read against a
+        // finalised eligibility set. Without `frozen() == true`, HubOwner
+        // could still grow the set after migrations open, which would let
+        // two otherwise-identical migrants receive different lock expiries
+        // depending on tx ordering. Failing loud (vs. silently skipping the
+        // bonus) protects eligible delegators against the operator
+        // mis-ordering the runbook — they get a clean revert and can retry
+        // after `freeze()` lands, instead of paying the migration tx and
+        // losing the credit. The runbook
+        // (V8_MIGRATION_CREDIT_RUNBOOK.md) already calls `freeze()` as
+        // the last step before opening migration, so this just enforces
+        // the documented invariant on-chain.
         uint40 expiryShortenedBy = 0;
-        if (
-            (lockTier == 6 || lockTier == 12) &&
-            v8MigrationEligibility.isEligible(identityId, delegator)
-        ) {
-            // `chronos.epochLength()` is the protocol-wide epoch in seconds
-            // (30 days on mainnet). Two epochs == the "2 months of V8
-            // conviction" being credited. Reading it dynamically (instead
-            // of hard-coding 60d) keeps the credit correct on networks /
-            // forks where epochLength has been tuned.
-            expiryShortenedBy = uint40(chronos.epochLength() * 2);
+        if (lockTier == 6 || lockTier == 12) {
+            V8MigrationEligibility eligibility = v8MigrationEligibility;
+            require(eligibility.frozen(), "V8 eligibility not frozen");
+            if (eligibility.isEligible(identityId, delegator)) {
+                // Fixed 60-day credit, expressed in seconds. Earlier revs
+                // computed this as `chronos.epochLength() * 2` to track
+                // the "two epochs" framing, but that silently degrades on
+                // networks where `epochLength` is tuned (devnet: 1h →
+                // 2h credit; testnet: 1d → 2d credit). The off-chain
+                // eligibility window in `V8MigrationEligibility` is a
+                // fixed 60-day wall-clock window preceding V10 launch,
+                // so the credit must match — independent of the
+                // destination network's epoch tuning.
+                expiryShortenedBy = uint40(60 days);
+            }
         }
 
         // L11 — multiplier18 is no longer passed; CSS reads it from the tier table.

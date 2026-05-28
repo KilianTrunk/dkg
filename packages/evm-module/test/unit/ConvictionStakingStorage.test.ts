@@ -777,5 +777,16 @@ describe('@unit ConvictionStakingStorage', () => {
       const pos = await ConvictionStakingStorage.getPosition(1);
       expect(pos.expiryTimestamp).to.equal(tsNow + TIER_DURATIONS[12]);
     });
+
+    it('Reverts when a non-zero credit is passed with migrationEpoch == 0 (fresh-stake guard)', async () => {
+      // The credit is V8→V10 migration-exclusive. Fresh `stake()` calls
+      // (which pass `migrationEpoch == 0`) must never apply the bonus,
+      // otherwise a future Hub-registered caller could mint a shortened
+      // fresh stake just by passing a non-zero `expiryShortenedBy`. This
+      // test pins the guard that ties the credit to the V8 drain path.
+      await expect(
+        ConvictionStakingStorage.createPosition(1, ALICE_ID, 1000, 12, 0, SIXTY_DAYS),
+      ).to.be.revertedWith('Credit requires migrationEpoch');
+    });
   });
 });

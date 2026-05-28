@@ -80,25 +80,20 @@ cast call <STAKINGV10>   'v8MigrationEligibility()(address)' --rpc-url $RPC_BASE
 ## Phase 2 — snapshot V8 eligibility
 
 `base_sepolia` was added to `dkg-evm-module/scripts/snapshot_v8_eligibility.ts`.
-The default 60-day window only matches mainnet — on testnet, set the
-window to `2 * chronos.epochLength()` of the testnet V10 deployment.
+The 60-day window is a wall-clock duration tied to the V8 launch
+schedule, so it is the SAME on every network. The off-chain snapshot
+script accepts `--window-seconds` only for forward-compat / regression
+testing; in production every rollout (devnet, testnet, mainnet) uses
+the same 60-day window.
 
-Read the testnet's V10 epoch length:
-
-```bash
-cast call <V10_CHRONOS_ADDR> 'epochLength()(uint256)' \
-  --rpc-url $RPC_BASE_SEPOLIA_V10
-# example: 3600 (1 hour epochs) → window = 7200s
-```
-
-Run the snapshot from `dkg-evm-module/`:
+Run the snapshot from `dkg-evm-module/` (default `--window-seconds`
+is 60d = 5184000):
 
 ```bash
 cd ../../dkg-evm-module   # adjust path to where the V8 module lives
 export RPC_BASE_SEPOLIA_V10=<archival rpc>
 npx ts-node scripts/snapshot_v8_eligibility.ts \
   --network base_sepolia \
-  --window-seconds <2 * epochLength> \
   --concurrency 4
 ```
 
@@ -171,15 +166,20 @@ and the block timestamp at the migration tx. Compare:
 
 ```
 expected default expiry = tsAtMigrate + tierDurationSeconds(tier)
-expected with credit    = expected default expiry - 2 * chronos.epochLength()
+expected with credit    = expected default expiry - 60 days  (5184000 seconds)
 ```
 
 | Case | Eligible? | Tier | Expected `expiryShortenedBy` |
 | --- | --- | --- | --- |
-| A | yes | 12 | `2 * epochLength` |
-| B | yes |  6 | `2 * epochLength` |
+| A | yes | 12 | `60 days` (5184000s) |
+| B | yes |  6 | `60 days` (5184000s) |
 | C | yes |  3 | 0 (lower tier) |
 | D | no  | 12 | 0 |
+
+The contract requires the registry to be `frozen()` before any tier-6/12
+migration tx — otherwise `selfMigrateV8` / `adminMigrateV8` revert with
+`V8 eligibility not frozen`. Verify the freeze gate by attempting a
+tier-12 migration BEFORE Phase 4 and confirming the revert.
 
 `tierDurationSeconds`: tier 1 = 30d, tier 3 = 90d, tier 6 = 180d, tier 12 = 366d.
 
@@ -220,8 +220,9 @@ pipeline against the new address).
 
 When testnet passes end-to-end, mirror Phases 1–5 on mainnet:
 
-- Phase 2 default window = 60 days = `2 * 30d` epoch (omit
-  `--window-seconds`).
+- Phase 2 default window = 60 days = `5,184,000` seconds (omit
+  `--window-seconds`; literal is independent of the target network's
+  `epochLength`).
 - Phase 2 should be re-run as close to V10 launch as possible to keep
   the snapshot fresh (re-runs are idempotent — same CSV → same on-chain
   state).

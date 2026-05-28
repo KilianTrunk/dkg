@@ -344,11 +344,12 @@ async function main() {
   console.log('Registry state matches expectations.');
 
   // 7. Self-migrate per scenario and verify the resulting V10 NFT
-  //    expiryTimestamp.
+  //    expiryTimestamp. StakingV10 3.1.0 review follow-up: the credit is
+  //    a fixed 60-day literal, independent of `chronos.epochLength`.
   const epochLength = BigInt(await Chronos.epochLength());
-  const credit = epochLength * 2n;
+  const credit = 60n * 24n * 60n * 60n;
   console.log(
-    `\nChronos.epochLength()=${epochLength}s (${fmtSeconds(epochLength)}), credit=${credit}s (${fmtSeconds(credit)})\n`,
+    `\nChronos.epochLength()=${epochLength}s (${fmtSeconds(epochLength)}); fixed credit=${credit}s (${fmtSeconds(credit)})\n`,
   );
 
   type Result = { scenario: Scenario; ok: boolean; detail: string };

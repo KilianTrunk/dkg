@@ -14,11 +14,15 @@
 // ---------------
 //   * `V8MigrationEligibility` — frozen registry of `(identityId, delegator)`
 //     pairs that the off-chain snapshot script certified as continuous-V8.
+//     Must be `frozen()` before any migration can apply the credit.
 //   * `ConvictionStakingStorage.createPosition` — gained an
-//     `expiryShortenedBy` parameter (v4.1.0).
-//   * `StakingV10._convertToNFT` — reads the registry and, for eligible 6m/12m
-//     migrants, passes `2 * chronos.epochLength()` as `expiryShortenedBy`
-//     (v3.1.0).
+//     `expiryShortenedBy` parameter (v4.1.0); gated on `migrationEpoch != 0`
+//     so the V8→V10 bonus cannot leak into fresh V10 stakes.
+//   * `StakingV10._convertToNFT` — reads the (frozen) registry and, for
+//     eligible 6m/12m migrants, passes a fixed `60 days` as
+//     `expiryShortenedBy` (v3.1.0). The literal matches the off-chain
+//     eligibility window and is independent of network-tuned
+//     `chronos.epochLength`.
 //
 // What this file tests
 // --------------------
@@ -50,6 +54,11 @@ import {
 const SCALE18 = 10n ** 18n;
 const SIX_X = 6n * SCALE18;
 const THREE_AND_HALF_X = (35n * SCALE18) / 10n;
+// 60-day credit, in seconds. Hard-coded literal (StakingV10 3.1.0 review
+// follow-up): the off-chain V8MigrationEligibility window is a fixed
+// 60-day wall-clock window before V10 launch; the on-chain credit must
+// match independent of network-tuned epochLength (devnet: 1h; testnet: 1d).
+const SIXTY_DAYS_SECONDS = 60n * 24n * 60n * 60n;
 
 type Fixture = {
   accounts: SignerWithAddress[];
@@ -259,8 +268,8 @@ describe('@integration V8→V10 migration conviction credit', function () {
       const identityId = await createProfile();
       await seedV8Stake(accounts[2], identityId, migrationAmount);
       await RegistryContract.setEligibleBatch([identityId], [accounts[2].address]);
+      await RegistryContract.freeze();
 
-      const epochLength = await ChronosContract.epochLength();
       const tier12Duration = 366n * 24n * 60n * 60n;
 
       // selfMigrateV8 with tier 12.
@@ -272,7 +281,7 @@ describe('@integration V8→V10 migration conviction credit', function () {
 
       const pos = await CSS.getPosition(1);
       const tierDefault = blockTs + tier12Duration;
-      const expectedExpiry = tierDefault - epochLength * 2n;
+      const expectedExpiry = tierDefault - SIXTY_DAYS_SECONDS;
       expect(pos.expiryTimestamp).to.equal(
         expectedExpiry,
         'eligible 12m migrant expiry must be 60d before tier default',
@@ -298,8 +307,8 @@ describe('@integration V8→V10 migration conviction credit', function () {
       const identityId = await createProfile();
       await seedV8Stake(accounts[2], identityId, migrationAmount);
       await RegistryContract.setEligibleBatch([identityId], [accounts[2].address]);
+      await RegistryContract.freeze();
 
-      const epochLength = await ChronosContract.epochLength();
       const tier6Duration = 180n * 24n * 60n * 60n;
 
       const tx = await NFT.connect(accounts[2]).selfMigrateV8(identityId, 6);
@@ -310,7 +319,7 @@ describe('@integration V8→V10 migration conviction credit', function () {
 
       const pos = await CSS.getPosition(1);
       expect(pos.lockTier).to.equal(6n);
-      expect(pos.expiryTimestamp).to.equal(blockTs + tier6Duration - epochLength * 2n);
+      expect(pos.expiryTimestamp).to.equal(blockTs + tier6Duration - SIXTY_DAYS_SECONDS);
       expect(pos.multiplier18).to.equal(THREE_AND_HALF_X);
     });
 
@@ -318,6 +327,7 @@ describe('@integration V8→V10 migration conviction credit', function () {
       const identityId = await createProfile();
       await seedV8Stake(accounts[2], identityId, migrationAmount);
       // NOT calling setEligibleBatch — delegator is absent from the registry.
+      await RegistryContract.freeze();
 
       const tx = await NFT.connect(accounts[2]).selfMigrateV8(identityId, 12);
       const receipt = await tx.wait();
@@ -334,6 +344,7 @@ describe('@integration V8→V10 migration conviction credit', function () {
       const identityId = await createProfile();
       await seedV8Stake(accounts[2], identityId, migrationAmount);
       await RegistryContract.setEligibleBatch([identityId], [accounts[2].address]);
+      await RegistryContract.freeze();
 
       const tx = await NFT.connect(accounts[2]).selfMigrateV8(identityId, 3);
       const receipt = await tx.wait();
@@ -354,6 +365,7 @@ describe('@integration V8→V10 migration conviction credit', function () {
       const identityId = await createProfile();
       await seedV8Stake(accounts[2], identityId, migrationAmount);
       await RegistryContract.setEligibleBatch([identityId], [accounts[2].address]);
+      await RegistryContract.freeze();
 
       const tx = await NFT.connect(accounts[2]).selfMigrateV8(identityId, 1);
       const receipt = await tx.wait();
@@ -367,6 +379,43 @@ describe('@integration V8→V10 migration conviction credit', function () {
       expect(pos.expiryTimestamp).to.equal(blockTs + tier1Duration);
     });
 
+    it('Migration of a tier 6/12 reverts before the registry is frozen', async () => {
+      // freeze() invariant: every credit-bearing migration must read against
+      // a finalised eligibility set. Without this guard, HubOwner could
+      // still grow the set after migrations opened — different lock
+      // expiries for otherwise-identical migrants depending on tx ordering.
+      // Lower tiers are exempt (they never read the registry).
+      const identityId = await createProfile();
+      await seedV8Stake(accounts[2], identityId, migrationAmount);
+      await RegistryContract.setEligibleBatch([identityId], [accounts[2].address]);
+      // Deliberately NOT calling freeze() here.
+
+      await expect(
+        NFT.connect(accounts[2]).selfMigrateV8(identityId, 12),
+      ).to.be.revertedWith('V8 eligibility not frozen');
+      await expect(
+        NFT.connect(accounts[2]).selfMigrateV8(identityId, 6),
+      ).to.be.revertedWith('V8 eligibility not frozen');
+    });
+
+    it('Migration of a tier 0/1/3 (no credit) does NOT require the registry to be frozen', async () => {
+      // Lower tiers never read the registry, so an operator who hasn't
+      // finished setting up eligibility can still let opt-out / lower-
+      // tier migrants drain. Pinning so the freeze gate stays narrow.
+      const identityId = await createProfile();
+      await seedV8Stake(accounts[2], identityId, migrationAmount);
+      // No setEligibleBatch, no freeze — registry is empty + open.
+
+      const tx = await NFT.connect(accounts[2]).selfMigrateV8(identityId, 3);
+      const receipt = await tx.wait();
+      const blockTs = BigInt(
+        (await hre.ethers.provider.getBlock(receipt!.blockNumber))!.timestamp,
+      );
+      const pos = await CSS.getPosition(1);
+      const tier3Duration = 90n * 24n * 60n * 60n;
+      expect(pos.expiryTimestamp).to.equal(blockTs + tier3Duration);
+    });
+
     it('Eligibility is per-(identityId, delegator): same delegator on a different node gets no credit', async () => {
       const idA = await createProfile(1);
       // Distinct operational wallet for node B; createProfile is keyed by
@@ -377,6 +426,7 @@ describe('@integration V8→V10 migration conviction credit', function () {
       await seedV8Stake(accounts[2], idB, migrationAmount);
       // Only mark eligible on node A.
       await RegistryContract.setEligibleBatch([idA], [accounts[2].address]);
+      await RegistryContract.freeze();
 
       // Migrate on node A (eligible) — credit applies.
       const txA = await NFT.connect(accounts[2]).selfMigrateV8(idA, 12);
@@ -384,11 +434,10 @@ describe('@integration V8→V10 migration conviction credit', function () {
       const tsA = BigInt(
         (await hre.ethers.provider.getBlock(recA!.blockNumber))!.timestamp,
       );
-      const epochLength = await ChronosContract.epochLength();
       const tier12Duration = 366n * 24n * 60n * 60n;
       const posA = await CSS.getPosition(1);
       expect(posA.expiryTimestamp).to.equal(
-        tsA + tier12Duration - epochLength * 2n,
+        tsA + tier12Duration - SIXTY_DAYS_SECONDS,
       );
 
       // Migrate on node B (NOT eligible) — no credit.
@@ -405,6 +454,7 @@ describe('@integration V8→V10 migration conviction credit', function () {
       const identityId = await createProfile();
       await seedV8Stake(accounts[2], identityId, migrationAmount);
       await RegistryContract.setEligibleBatch([identityId], [accounts[2].address]);
+      await RegistryContract.freeze();
 
       // Admin path (caller is HubOwner = accounts[0]; delegator is accounts[2]).
       const tx = await NFT.connect(accounts[0]).adminMigrateV8(
@@ -418,10 +468,9 @@ describe('@integration V8→V10 migration conviction credit', function () {
       );
 
       const pos = await CSS.getPosition(1);
-      const epochLength = await ChronosContract.epochLength();
       const tier12Duration = 366n * 24n * 60n * 60n;
       expect(pos.expiryTimestamp).to.equal(
-        blockTs + tier12Duration - epochLength * 2n,
+        blockTs + tier12Duration - SIXTY_DAYS_SECONDS,
       );
     });
   });

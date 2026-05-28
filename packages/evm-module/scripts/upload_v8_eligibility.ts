@@ -59,7 +59,21 @@ function parseArgs(argv: string[]): Args {
     const a = argv[i];
     if (a === '--network') out.network = argv[++i];
     else if (a === '--csv') out.csv = argv[++i];
-    else if (a === '--chunk') out.chunk = Number(argv[++i]);
+    else if (a === '--chunk') {
+      const raw = argv[++i];
+      // `i += args.chunk` advances the upload loop, so a non-positive
+      // (or NaN) chunk would either infinite-loop or skip work. Validate
+      // up-front before any RPC / signer setup so the operator gets a
+      // fast, deterministic error.
+      const parsed = Number(raw);
+      if (!Number.isInteger(parsed) || parsed <= 0) {
+        console.error(
+          `--chunk must be a positive integer; got "${raw}" (parsed as ${parsed}).`,
+        );
+        process.exit(2);
+      }
+      out.chunk = parsed;
+    }
     else if (a === '--freeze') out.freeze = true;
     else if (a === '--dry-run') out.dryRun = true;
     else if (a === '-h' || a === '--help') {

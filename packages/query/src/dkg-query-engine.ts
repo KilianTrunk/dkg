@@ -14,7 +14,9 @@ import {
 import {
   validateReadOnlySparql,
   emptyResultForSparql,
+  detectSparqlQueryForm,
 } from './sparql-guard.js';
+import { stripLiteralsAndComments } from './sparql-utils.js';
 
 /**
  * Result of resolving a V10 GET view to concrete graph targets.
@@ -455,9 +457,56 @@ export class DKGQueryEngine implements QueryEngine {
     }
     // Fallback: the inner body contains a UNION so we cannot safely wrap
     // in a single query without either crashing Blazegraph (nested
-    // UnionNode) or leaking a helper variable. Run per-graph instead;
-    // cross-graph LIMIT/ORDER BY/DISTINCT are approximate but this path
-    // is rare (user queries with UNION over multi-graph views).
+    // UnionNode) or leaking a helper variable. Run per-graph and merge
+    // results in a FORM-AWARE way (Codex review on #789): flattening
+    // every form into `bindings` silently corrupts CONSTRUCT/DESCRIBE
+    // (drops `quads`), ASK (drops the boolean), and SELECT result sets
+    // (concatenation can't honour cross-graph LIMIT/ORDER BY/DISTINCT/
+    // aggregates). This path is rare (a user UNION over a multi-graph
+    // view), but it must not return the wrong shape.
+    const form = detectSparqlQueryForm(sparql);
+
+    if (form === 'CONSTRUCT' || form === 'DESCRIBE') {
+      // Graph-shaped results: the correct cross-graph merge is the union
+      // of the per-graph triple sets (deduped — the same triple can be
+      // constructed from multiple source graphs).
+      const merged: Quad[] = [];
+      for (const g of graphs) {
+        const r = await this.execAndNormalize(wrapWithGraph(sparql, g));
+        if (r.quads) merged.push(...r.quads);
+      }
+      return { bindings: [], quads: dedupeQuads(merged) };
+    }
+
+    if (form === 'ASK') {
+      // Boolean result: true iff the pattern matches in ANY graph.
+      // Short-circuit on the first positive graph.
+      for (const g of graphs) {
+        const r = await this.execAndNormalize(wrapWithGraph(sparql, g));
+        if (r.bindings[0]?.result === 'true') {
+          return { bindings: [{ result: 'true' }] };
+        }
+      }
+      return { bindings: [{ result: 'false' }] };
+    }
+
+    // SELECT (and UNKNOWN, which validateReadOnlySparql should already
+    // have rejected upstream). Per-graph concatenation is only correct
+    // when there are NO solution-set modifiers — DISTINCT/ORDER BY/
+    // LIMIT/OFFSET/GROUP BY/HAVING/aggregates all operate over the full
+    // solution set and cannot be reconstructed from per-graph slices.
+    // Rather than silently return duplicate / mis-ordered / over-limit
+    // rows, reject the unsupported shape explicitly so the caller gets a
+    // clear error instead of wrong data.
+    if (hasCrossGraphUnsafeModifier(sparql)) {
+      throw new Error(
+        'Multi-graph query combines an inner UNION with a solution-set ' +
+          'modifier (DISTINCT/ORDER BY/LIMIT/OFFSET/GROUP BY/aggregate). ' +
+          'This shape cannot be evaluated across graphs without corrupting ' +
+          'the modifier semantics. Scope the query to a single graph (pass ' +
+          'contextGraphId) or remove the inner UNION.',
+      );
+    }
     const all: Record<string, string>[] = [];
     for (const g of graphs) {
       const r = await this.execAndNormalize(wrapWithGraph(sparql, g));
@@ -2412,4 +2461,31 @@ function dedupeQuads(quads: Quad[]): Quad[] {
     out.push(q);
   }
   return out;
+}
+
+/**
+ * True when a SELECT carries a solution-set modifier whose semantics
+ * cannot be reconstructed from per-graph result slices: DISTINCT,
+ * ORDER BY, LIMIT, OFFSET, GROUP BY, HAVING, or an aggregate function
+ * in the projection. Used by the per-graph multi-graph fallback (the
+ * inner-UNION case in `queryMultipleGraphs`) to reject shapes that
+ * would otherwise return duplicate / mis-ordered / over-limit rows.
+ *
+ * Literals, comments, and IRI bodies are blanked first
+ * (`stripLiteralsAndComments`) so a keyword appearing inside a string
+ * literal or IRI (e.g. `"top 10 LIMIT"`) doesn't trigger a false
+ * positive. The aggregate check is intentionally broad — any of the
+ * standard SPARQL aggregate functions invalidates naive concatenation
+ * because the per-graph partial aggregates can't be combined post-hoc.
+ */
+function hasCrossGraphUnsafeModifier(sparql: string): boolean {
+  const s = stripLiteralsAndComments(sparql);
+  if (/\bDISTINCT\b/i.test(s)) return true;
+  if (/\bORDER\s+BY\b/i.test(s)) return true;
+  if (/\bGROUP\s+BY\b/i.test(s)) return true;
+  if (/\bHAVING\b/i.test(s)) return true;
+  if (/\bLIMIT\b/i.test(s)) return true;
+  if (/\bOFFSET\b/i.test(s)) return true;
+  if (/\b(COUNT|SUM|AVG|MIN|MAX|SAMPLE|GROUP_CONCAT)\s*\(/i.test(s)) return true;
+  return false;
 }

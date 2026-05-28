@@ -85,6 +85,99 @@ describe('DKGQueryEngine', () => {
     );
   });
 
+  // ───────────────────────────────────────────────────────────────────
+  // #789 Codex review: when a user query carries an inner UNION over a
+  // multi-graph view, `wrapWithGraphUnion` returns null (a nested
+  // UnionNode would crash Blazegraph) and `queryMultipleGraphs` falls
+  // back to per-graph execution. The fallback MUST merge results in a
+  // FORM-AWARE way — flattening every form into `bindings` silently
+  // corrupts CONSTRUCT/DESCRIBE (drops quads), ASK (drops the boolean),
+  // and SELECT with solution-set modifiers (LIMIT/ORDER BY/DISTINCT/
+  // aggregates can't be reconstructed from per-graph slices).
+  //
+  // The `verified-memory` view resolves to TWO graphs — the root
+  // `<cg>` graph plus every `<cg>/_verified_memory/*` sub-graph — so
+  // seeding one VM sub-graph reaches the multi-graph fallback path.
+  describe('#789 multi-graph inner-UNION fallback is form-aware', () => {
+    const VM_SUB = `${GRAPH}/_verified_memory/vm1`;
+    const E1 = 'urn:vm:e1';
+    const E2 = 'urn:vm:e2';
+
+    beforeEach(async () => {
+      // E1 lives in the root graph (already a VM candidate), E2 only in
+      // the VM sub-graph, so a correct cross-graph merge must surface both.
+      await store.insert([
+        q(E1, 'http://ex.org/p1', '"root-val"', GRAPH),
+        q(E2, 'http://ex.org/p2', '"vm-val"', VM_SUB),
+      ]);
+    });
+
+    it('CONSTRUCT merges quads across graphs (does not drop the quad shape)', async () => {
+      const result = await engine.query(
+        `CONSTRUCT { ?s <urn:out> ?v } WHERE {
+           { ?s <http://ex.org/p1> ?v } UNION { ?s <http://ex.org/p2> ?v }
+         }`,
+        { contextGraphId: CONTEXT_GRAPH, view: 'verified-memory' },
+      );
+      expect(result.quads).toBeDefined();
+      const subjects = (result.quads ?? []).map((qd) => qd.subject).sort();
+      expect(subjects).toEqual([E1, E2]);
+    });
+
+    it('ASK returns true when the pattern matches in ANY graph', async () => {
+      const result = await engine.query(
+        `ASK {
+           { ?s <http://ex.org/p1> ?v } UNION { ?s <http://ex.org/p2> ?v }
+         }`,
+        { contextGraphId: CONTEXT_GRAPH, view: 'verified-memory' },
+      );
+      expect(result.bindings).toEqual([{ result: 'true' }]);
+    });
+
+    it('ASK returns false when the pattern matches in NO graph', async () => {
+      const result = await engine.query(
+        `ASK {
+           { ?s <http://ex.org/nope1> ?v } UNION { ?s <http://ex.org/nope2> ?v }
+         }`,
+        { contextGraphId: CONTEXT_GRAPH, view: 'verified-memory' },
+      );
+      expect(result.bindings).toEqual([{ result: 'false' }]);
+    });
+
+    it('SELECT without modifiers concatenates bindings across graphs', async () => {
+      const result = await engine.query(
+        `SELECT ?s ?v WHERE {
+           { ?s <http://ex.org/p1> ?v } UNION { ?s <http://ex.org/p2> ?v }
+         }`,
+        { contextGraphId: CONTEXT_GRAPH, view: 'verified-memory' },
+      );
+      const subjects = result.bindings.map((b) => b['s']).sort();
+      expect(subjects).toEqual([E1, E2]);
+    });
+
+    it('SELECT with a solution-set modifier (ORDER BY) is rejected, not silently corrupted', async () => {
+      await expect(
+        engine.query(
+          `SELECT ?s ?v WHERE {
+             { ?s <http://ex.org/p1> ?v } UNION { ?s <http://ex.org/p2> ?v }
+           } ORDER BY ?v`,
+          { contextGraphId: CONTEXT_GRAPH, view: 'verified-memory' },
+        ),
+      ).rejects.toThrow(/cannot be evaluated across graphs/i);
+    });
+
+    it('SELECT with LIMIT is rejected too (per-graph slices would over-count)', async () => {
+      await expect(
+        engine.query(
+          `SELECT ?s ?v WHERE {
+             { ?s <http://ex.org/p1> ?v } UNION { ?s <http://ex.org/p2> ?v }
+           } LIMIT 1`,
+          { contextGraphId: CONTEXT_GRAPH, view: 'verified-memory' },
+        ),
+      ).rejects.toThrow(/cannot be evaluated across graphs/i);
+    });
+  });
+
   it('queries across all contextGraphs', async () => {
     // Add data to another context graph
     await store.insert([

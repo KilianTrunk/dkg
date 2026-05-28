@@ -8999,6 +8999,19 @@ export class DKGAgent {
       // includes both explicit REMAP targets and the auto-lookup fallback)
       // rather than the REMAP-only `ctxGraphIdStr`.
       const broadcastCgId = onChainId != null ? String(onChainId) : undefined;
+      // PR #779 / #774 followup: tell receivers whether the publisher
+      // kept a root-graph copy of the canonical quads. Same-graph
+      // publishes (no explicit `subContextGraphId` / `publishContextGraphId`)
+      // dual-write to the root `<cg>` graph and the per-on-chain-id
+      // partition `<cg>/context/<ctxGraphId>` so label-scoped queries
+      // resolve. Explicit-`subContextGraphId` / remap publishes delete
+      // the root copy on purpose (`dkg-publisher.ts` ~line 1393), so
+      // receivers MUST NOT dual-write either — otherwise a remap-style
+      // KC would re-appear under the source CG's label on every replica.
+      // `ctxGraphIdStr` is the publisher-side `publishContextGraphId`
+      // (set on REMAP/explicit-subCG calls, undefined otherwise) — the
+      // exact same signal the publisher uses to gate its own root delete.
+      const keepRootCopyOnLabel = !ctxGraphIdStr;
       const msg: FinalizationMessageMsg = {
         ual: result.ual,
         contextGraphId: contextGraphId,
@@ -9014,6 +9027,7 @@ export class DKGAgent {
         operationId: ctx.operationId,
         targetContextGraphId: result.contextGraphError ? undefined : broadcastCgId,
         subGraphName: options?.subGraphName,
+        keepRootCopyOnLabel,
       };
 
       const topic = contextGraphFinalizationTopic(contextGraphId);

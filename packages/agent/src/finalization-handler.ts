@@ -633,16 +633,24 @@ export class FinalizationHandler {
     // By the time any reader observes these quads in the canonical graph,
     // `_meta` already carries `confirmed` status + chain provenance and the
     // matching SWM entries have been drained.
-    await this.store.insert(canonicalQuads);
-    if (rootDataGraphForLabel) {
-      // Mirror publisher's same-graph dual-write so label-scoped queries
-      // (`contextGraphId=<label>` with no `/context/<num>` suffix) on
-      // recipients see the same data as the publisher. See the
-      // `rootDataGraphForLabel` comment near the start of this method
-      // for full rationale.
-      const rootCopy = canonicalQuads.map(q => ({ ...q, graph: rootDataGraphForLabel }));
-      await this.store.insert(rootCopy);
-    }
+    //
+    // Codex r2 on PR #779: when same-graph dual-write is in play, both
+    // copies (per-cgId partition + root label graph) MUST land in a single
+    // `store.insert` so a crash or store-write failure between them
+    // cannot leave the replica with the per-cgId copy but no root copy.
+    // The previous split form would be skipped on retry by
+    // `isAlreadyConfirmed()` (`_meta` already confirmed) and the root
+    // copy would never be back-filled — a permanent label-scoped query
+    // miss on that replica. Folding both into one insert call ties their
+    // durability to the same store-write transaction (Oxigraph's `load`
+    // and SPARQL-backend bulk insert are both atomic at the call level).
+    const allCanonicalQuads = rootDataGraphForLabel
+      ? [
+          ...canonicalQuads,
+          ...canonicalQuads.map(q => ({ ...q, graph: rootDataGraphForLabel })),
+        ]
+      : canonicalQuads;
+    await this.store.insert(allCanonicalQuads);
 
     this.log.info(ctx, `Promoted ${canonicalQuads.length} quads from shared memory to canonical for ${ual}`);
     this.eventBus?.emit(DKGEvent.MEMORY_GRAPH_CHANGED, {

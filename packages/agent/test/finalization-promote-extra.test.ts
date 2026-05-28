@@ -116,6 +116,147 @@ describe('A-4: promoteSharedMemoryToCanonical lands data in the CANONICAL data g
   });
 });
 
+describe('PR #779: same-graph dual-write into root + per-on-chain-id partition', () => {
+  // Pin the new behaviour added to fix the v10-rc-validation §5
+  // gossip-replication regression: when the publisher kept a root copy of
+  // the canonical quads (same-graph publish, signalled on the wire by
+  // `keepRootCopyOnLabel: true`), receivers MUST also write the quads to
+  // the root `<cg>` graph alongside the per-on-chain-id partition
+  // `<cg>/context/<ctxGraphId>`. Without this, label-scoped queries
+  // (`contextGraphId=<label>` with no `/context/<num>` suffix) return 0
+  // bindings on every replica even though the data is local. CI was
+  // previously only exercising the remap branch via `e2e-context-graph`,
+  // so a regression on the new wire flag would have escaped — the
+  // automated suite now pins both branches (Codex review on PR #779 r2).
+  const cgRoot = `did:dkg:context-graph:${CONTEXT_GRAPH}`;
+  const cgPerCgId = `did:dkg:context-graph:${CONTEXT_GRAPH}/context/42`;
+
+  it('keepRootCopyOnLabel=true → quads land in BOTH root and per-cgId graphs', async () => {
+    const store = new OxigraphStore();
+    const handler = new FinalizationHandler(store, undefined);
+    const entity = 'urn:dualwrite:alice';
+    const publisher = '0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266';
+    const quads = [
+      { subject: entity, predicate: 'http://schema.org/name', object: '"DualWrite"', graph: '' },
+    ];
+
+    await (handler as any).promoteSharedMemoryToCanonical(
+      CONTEXT_GRAPH,
+      quads,
+      'did:dkg:evm:31337/0xDW/1',
+      [entity],
+      publisher,
+      '0x' + '11'.repeat(32),
+      300,
+      1n, 1n, 1n,
+      createOperationContext('system'),
+      '42', // ctxGraphId — non-undefined enables per-cgId partition routing
+      undefined, // subGraphName
+      undefined, // authorAddress
+      true, // keepRootCopyOnLabel — same-graph signal from the wire
+    );
+
+    const perCgIdAsk = await store.query(
+      `ASK { GRAPH <${cgPerCgId}> { <${entity}> <http://schema.org/name> "DualWrite" } }`,
+    );
+    expect(perCgIdAsk.type).toBe('boolean');
+    if (perCgIdAsk.type === 'boolean') expect(perCgIdAsk.value).toBe(true);
+
+    const rootAsk = await store.query(
+      `ASK { GRAPH <${cgRoot}> { <${entity}> <http://schema.org/name> "DualWrite" } }`,
+    );
+    expect(rootAsk.type).toBe('boolean');
+    if (rootAsk.type === 'boolean') {
+      expect(
+        rootAsk.value,
+        'same-graph publish (keepRootCopyOnLabel=true) MUST mirror publisher dual-write so label-scoped queries find the data on replicas',
+      ).toBe(true);
+    }
+  });
+
+  it('keepRootCopyOnLabel=false → root stays empty (remap-style publisher deleted root)', async () => {
+    const store = new OxigraphStore();
+    const handler = new FinalizationHandler(store, undefined);
+    const entity = 'urn:dualwrite:remap';
+    const publisher = '0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266';
+    const quads = [
+      { subject: entity, predicate: 'http://schema.org/name', object: '"Remap"', graph: '' },
+    ];
+
+    await (handler as any).promoteSharedMemoryToCanonical(
+      CONTEXT_GRAPH,
+      quads,
+      'did:dkg:evm:31337/0xRM/1',
+      [entity],
+      publisher,
+      '0x' + '22'.repeat(32),
+      301,
+      1n, 1n, 1n,
+      createOperationContext('system'),
+      '42', // ctxGraphId set
+      undefined, // subGraphName
+      undefined, // authorAddress
+      false, // keepRootCopyOnLabel=false — remap-style, publisher deleted root
+    );
+
+    const perCgIdAsk = await store.query(
+      `ASK { GRAPH <${cgPerCgId}> { <${entity}> <http://schema.org/name> "Remap" } }`,
+    );
+    expect(perCgIdAsk.type).toBe('boolean');
+    if (perCgIdAsk.type === 'boolean') expect(perCgIdAsk.value).toBe(true);
+
+    const rootAsk = await store.query(
+      `ASK { GRAPH <${cgRoot}> { <${entity}> <http://schema.org/name> "Remap" } }`,
+    );
+    expect(rootAsk.type).toBe('boolean');
+    if (rootAsk.type === 'boolean') {
+      expect(
+        rootAsk.value,
+        'remap-style publish (keepRootCopyOnLabel=false) MUST NOT dual-write root — receiver would re-expose KC under source CG label and double-count in unscoped queries',
+      ).toBe(false);
+    }
+  });
+
+  it('keepRootCopyOnLabel undefined (older publisher) → conservative no-dual-write', async () => {
+    // Backward-compat pin: a publisher that predates PR #779 omits the
+    // wire field entirely. Receivers MUST decode that as "no dual-write"
+    // (the pre-PR-779 conservative behaviour) so an old publisher cannot
+    // accidentally trigger the new dual-write on a new receiver — that
+    // path is only safe if the publisher actually kept the root copy,
+    // which old publishers never do (their REMAP detection lacks the new
+    // bit and they always single-write to the per-cgId partition).
+    const store = new OxigraphStore();
+    const handler = new FinalizationHandler(store, undefined);
+    const entity = 'urn:dualwrite:legacy';
+    const publisher = '0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266';
+    const quads = [
+      { subject: entity, predicate: 'http://schema.org/name', object: '"Legacy"', graph: '' },
+    ];
+
+    await (handler as any).promoteSharedMemoryToCanonical(
+      CONTEXT_GRAPH,
+      quads,
+      'did:dkg:evm:31337/0xLG/1',
+      [entity],
+      publisher,
+      '0x' + '33'.repeat(32),
+      302,
+      1n, 1n, 1n,
+      createOperationContext('system'),
+      '42',
+      undefined,
+      undefined,
+      undefined, // keepRootCopyOnLabel undefined — older publisher
+    );
+
+    const rootAsk = await store.query(
+      `ASK { GRAPH <${cgRoot}> { <${entity}> <http://schema.org/name> "Legacy" } }`,
+    );
+    expect(rootAsk.type).toBe('boolean');
+    if (rootAsk.type === 'boolean') expect(rootAsk.value).toBe(false);
+  });
+});
+
 describe('Round 5 §10: replica-side dkg:Publication / dkg:authoredBy provenance', () => {
   it('emits dkg:authoredBy + dkg:Publication when authorAddress is threaded through', async () => {
     // Regression for the round-5 review finding: replicas confirming a KC via

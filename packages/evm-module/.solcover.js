@@ -22,51 +22,58 @@ module.exports = {
   //    bytecode in the PR sharded Solidity job — the skip removes only
   //    line/branch reporting for this file in the HTML/lcov output.
   //
-  // 2. `archive/` — V8/V9 legacy contracts that were intentionally moved
-  //    out of the active deploy set in commit 929e29fe
-  //    (`refactor(evm-module): archive 9 V8/V9 test files under
-  //    test/archive/`). The matching test fixtures were moved to
-  //    `test/archive/` in the same change and `hardhat.node.config.ts`
-  //    was patched to exclude them from `TASK_TEST_GET_TEST_FILES`. The
-  //    contract sources stayed in the tree (kept on-disk for git history
-  //    + reference) but nothing in the active deploy set imports them
-  //    and no live tests exercise them.
+  // 2. `archive/` — V8/V9 legacy contracts moved out of the active
+  //    *test* surface in commit 929e29fe (PR #500, "refactor: archive
+  //    non-V10 contracts and downstream V8/V9 backward-compat code").
+  //    Their unit + integration suites were moved to `test/archive/`,
+  //    and `hardhat.node.config.ts` was patched to exclude that
+  //    directory from `TASK_TEST_GET_TEST_FILES`. No active test
+  //    invokes any function on an archived contract.
   //
-  //    Without this exclusion, solidity-coverage instruments those ~888
-  //    lines of dead V8/V9 code, reports them as "0% covered" and drags
-  //    the totals beneath the ratchet floors — the post-archive push
-  //    safety-net failure is exactly that, not a real coverage
-  //    regression on living code. Excluding `archive/` makes the ratchet
-  //    measure what we actually ship.
+  //    Important nuance — the archived contracts are NOT fully
+  //    name-isolated from active code:
   //
-  //    Safety verification — three independent greps that all return
-  //    empty are what make this skip safe. Re-run any of them if the
-  //    deploy/test layout changes:
+  //      * Their sources still live under `contracts/archive/` and
+  //        Hardhat compiles them.
+  //      * A few `deploy/active/*.ts` scripts still list them as
+  //        fixture dependencies for deployment-slot parity (e.g.
+  //        `054_deploy_dkg_staking_conviction_nft.ts:28` keeps
+  //        `'Staking'` "only because slot during tests — the NFT
+  //        wrapper itself does not call into V8 Staking", per the
+  //        inline comment there).
+  //      * A few active test files
+  //        (`test/integration/RandomSampling.test.ts`,
+  //        `test/helpers/setup-helpers.ts`,
+  //        `test/helpers/kc-helpers.ts`) import V8 typechain types
+  //        and hold contract handles to them for fixture parity.
   //
-  //      A) No active Solidity contract imports anything from `archive/`:
-  //         grep -rPn '(from\s+"\./archive|import.*archive)' \
-  //              contracts/ --include='*.sol' \
-  //              | grep -v 'contracts/archive/'
+  //    So the safety argument for this skip is NOT "no active code
+  //    references archived contracts" — that's empirically false.
+  //    The safety argument is "no active test invokes archived
+  //    contract bytecode", which the lcov data itself proves:
+  //    instrumenting `archive/` only adds rows whose hit counts are
+  //    all zero. Removing them shrinks the LF/BRF/FNF denominators
+  //    but leaves LH/BRH/FNH unchanged.
   //
-  //      B) No active deploy script under `deploy/active/` references
-  //         an archived contract by name (would trigger a runtime
-  //         lookup against the deployments JSON):
-  //         for name in KnowledgeAssets KnowledgeAssetsStorage \
-  //                     KnowledgeCollection Paymaster PaymasterManager \
-  //                     PublishingConvictionAccount Staking \
-  //                     DelegatorsInfo ContextGraphNameRegistry IPaymaster
-  //         do
-  //           grep -rPn "(^|[^A-Za-z0-9_])${name}([^A-Za-z0-9_]|\$)" \
-  //                deploy/active/ \
-  //             | grep -v 'StakingV10\|StakingStorage\|StakingKPI\|StakingLib\|KnowledgeAssetsV10\|KnowledgeCollectionStorage\|KnowledgeCollectionLib\|KnowledgeAssetsLib\|PublishingConvictionStorage\|PublishingConviction\b\|PaymasterManager\|IPaymaster'
-  //         done
+  //    Measured on `fix/solidity-coverage-skip-archive`:
   //
-  //      C) No active unit/integration test references an archived
-  //         contract by name. Same loop as (B), targeting
-  //         `test/unit/`, `test/integration/` and `test/helpers/`.
+  //                          LF    LH | BRF  BRH | FNF FNH
+  //      with `archive`:   4061  2279 | 2222 1030 | 926 529
+  //      no  `archive`:    3173  2279 | 1776 1030 | 777 529
+  //      delta:            -888    0  | -446    0 | -149   0
   //
-  //    All three were empty when this exclusion was added. Hardhat
-  //    `TASK_TEST_GET_TEST_FILES` already excludes `test/archive/`, so
-  //    no archived test fixture is ever exercised either.
+  //    Every hit count is identical → the skip removes only dead
+  //    rows. The same equality is the maintenance contract for this
+  //    skip: if a future PR makes any archived contract's bytecode
+  //    reachable from an active test, the with-archive LH / BRH /
+  //    FNH would tick UP and diverge from the without-archive
+  //    numbers — that's the moment to either restore tests for the
+  //    contract (un-archive it) or strip the active invocation.
+  //
+  //    To re-verify safety when archive contents or active fixtures
+  //    change, temporarily drop `'archive'` from `skipFiles` below,
+  //    run `pnpm test:coverage` in `packages/evm-module/`, record the
+  //    resulting LH / BRH / FNH, restore the skip, re-run, and
+  //    confirm equality of the three hit counts.
   skipFiles: ['Identity.sol', 'archive'],
 };

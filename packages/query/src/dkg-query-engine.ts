@@ -254,7 +254,39 @@ export class DKGQueryEngine implements QueryEngine {
         contextGraphSharedMemoryMetaUri(effectiveContextGraphId, subGraphName),
       ];
       const explicitAllowedGraphs = [...allowedGraphs, ...metaAllowList];
-      const variableAllowedGraphs = [...allowedGraphs, ...metaAllowList];
+      let variableAllowedGraphs: string[] = [...allowedGraphs, ...metaAllowList];
+      // Codex r3 on #776: when the SPARQL has a graph variable
+      // (e.g. `useSwmAttributions` / `useVerifiedMemoryAnchors` /
+      // `useVerifiedEntityIdentity` doing
+      // `GRAPH ?g { … } FILTER(CONTAINS(STR(?g), "_shared_memory_meta"))`
+      // with only `contextGraphId` scope), the static
+      // `metaAllowList` is just the root meta URIs — `?g` cannot bind
+      // to any `<cg>/<sub>/_shared_memory_meta`, so metadata for
+      // entities published in sub-graphs stays invisible.
+      //
+      // Dynamically enumerate same-CG sub-graph metadata graphs from
+      // the store and append them to the variable allow set so
+      // `GRAPH ?g` can bind across all of them. This only runs when
+      // the SPARQL actually contains a graph variable, so
+      // explicit-IRI queries pay no extra cost. Cross-CG isolation is
+      // preserved by the prefix filter; SWM-only routes
+      // (`graphSuffix='_shared_memory'`) still drop `_meta`
+      // sub-graphs.
+      if (collectGraphVariables(sparql).length > 0) {
+        const cgPrefix = `did:dkg:context-graph:${effectiveContextGraphId}/`;
+        const allGraphs = await this.store.listGraphs();
+        const subMetaSuffixes = isSwmOnlyRoute
+          ? ['/_shared_memory_meta']
+          : ['/_meta', '/_shared_memory_meta'];
+        const subGraphMetaUris = allGraphs.filter((g) => {
+          if (!g.startsWith(cgPrefix)) return false;
+          return subMetaSuffixes.some((suffix) => g.endsWith(suffix));
+        });
+        variableAllowedGraphs = [
+          ...variableAllowedGraphs,
+          ...subGraphMetaUris.filter((g) => !variableAllowedGraphs.includes(g)),
+        ];
+      }
       assertExplicitGraphIrisAllowed(sparql, explicitAllowedGraphs);
       sparql = constrainGraphVariablesToAllowedSet(sparql, variableAllowedGraphs);
     }

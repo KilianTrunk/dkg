@@ -536,21 +536,11 @@ describe('DKGQueryEngine', () => {
 
   it('GRAPH ?g binds to same-CG _meta on default-routed scoped queries (UI hook regression coverage)', async () => {
     // Codex r2 on #776: `useSwmAttributions`, `useVerifiedMemoryAnchors`
-    // and `useVerifiedEntityIdentity` (in `packages/node-ui/src/ui/hooks/`)
-    // all bind `GRAPH ?g` over CG-scoped metadata. The strict
-    // variable allow set was silently breaking those UI callers;
-    // widening `constrainGraphVariablesToAllowedSet` to the same set
-    // as the explicit-IRI allow set restores the
-    // CG-level / single-sub-graph cases. The privacy boundary is the
-    // `contextGraphId` scope (cross-CG `?g` bindings are still
-    // rejected) — see the immediately-preceding scope-rejection
-    // tests. NOTE: a `GRAPH ?g` query that needs to enumerate ACROSS
-    // every sub-graph's `_shared_memory_meta`
-    // (`FILTER(CONTAINS(STR(?g), "_shared_memory_meta"))`) still
-    // requires either an explicit sub-graph list or a prefix-based
-    // routing mode, which is tracked as a follow-up beyond #774 F4 +
-    // F3 — those callers are not exercised by the SWM-ownership /
-    // invite-flow devnet tests this PR is unblocking.
+    // and `useVerifiedEntityIdentity` all bind `GRAPH ?g` over
+    // CG-scoped metadata. Widening `constrainGraphVariablesToAllowedSet`
+    // to the same set as the explicit-IRI allow set restores the
+    // CG-level case. Cross-CG `?g` bindings are still rejected by
+    // the surrounding scope-rejection tests.
     await store.insert([
       {
         subject: GRAPH,
@@ -566,6 +556,66 @@ describe('DKGQueryEngine', () => {
     expect(result.bindings).toHaveLength(1);
     expect(result.bindings[0]['g']).toBe(META);
     expect(result.bindings[0]['o']).toBe('did:dkg:agent:0xowner');
+  });
+
+  it('GRAPH ?g + CONTAINS("_shared_memory_meta") enumerates all same-CG sub-graph SWM meta partitions (UI hook shape)', async () => {
+    // Codex r3 on #776: `useSwmAttributions`, `useVerifiedMemoryAnchors`,
+    // and `useVerifiedEntityIdentity` use `GRAPH ?g { … }
+    // FILTER(CONTAINS(STR(?g), "_shared_memory_meta"))` with only a
+    // `contextGraphId` scope to enumerate every sub-graph's
+    // `_shared_memory_meta`. The previous draft only added the root
+    // `<cg>/_shared_memory_meta` to the variable allow set, so
+    // sub-graph metadata stayed invisible. The engine now
+    // dynamically enumerates same-CG sub-graph meta partitions from
+    // the store before constraining `?g`, restoring the UI shape.
+    // Cross-CG sub-graph metadata still cannot bind (prefix filter).
+    const cgRootSwmMeta = `${GRAPH}/_shared_memory_meta`;
+    const cgCodeSwmMeta = `${GRAPH}/code/_shared_memory_meta`;
+    const cgRunsSwmMeta = `${GRAPH}/runs/_shared_memory_meta`;
+    const otherCgSwmMeta = `did:dkg:context-graph:other-cg/code/_shared_memory_meta`;
+    await store.insert([
+      { subject: 'urn:op:root', predicate: 'http://schema.org/agent', object: '"agentRoot"', graph: cgRootSwmMeta },
+      { subject: 'urn:op:a', predicate: 'http://schema.org/agent', object: '"agentA"', graph: cgCodeSwmMeta },
+      { subject: 'urn:op:b', predicate: 'http://schema.org/agent', object: '"agentB"', graph: cgRunsSwmMeta },
+      { subject: 'urn:op:c', predicate: 'http://schema.org/agent', object: '"agentC"', graph: otherCgSwmMeta },
+    ]);
+    const result = await engine.query(
+      `SELECT ?g ?agent WHERE {
+        GRAPH ?g {
+          ?op <http://schema.org/agent> ?agent .
+        }
+        FILTER(CONTAINS(STR(?g), "_shared_memory_meta"))
+      }`,
+      { contextGraphId: CONTEXT_GRAPH },
+    );
+    const agents = result.bindings.map((b) => b['agent']).sort();
+    expect(agents).toEqual(['"agentA"', '"agentB"', '"agentRoot"']);
+    expect(
+      result.bindings.every((b) => (b['g'] as string).startsWith(`${GRAPH}/`)
+        || b['g'] === GRAPH),
+    ).toBe(true);
+    expect(result.bindings.some((b) => b['g'] === otherCgSwmMeta)).toBe(false);
+  });
+
+  it('graphSuffix=_shared_memory drops sub-graph _meta from variable enumeration (privacy fence holds)', async () => {
+    // The dynamic sub-graph enumeration must respect the SWM-only
+    // privacy fence: a caller scoped to `graphSuffix='_shared_memory'`
+    // gets sub-graph `_shared_memory_meta` partitions but NOT
+    // sub-graph `_meta` partitions, mirroring the explicit-IRI
+    // behavior pinned earlier.
+    const cgCodeMeta = `${GRAPH}/code/_meta`;
+    const cgCodeSwmMeta = `${GRAPH}/code/_shared_memory_meta`;
+    await store.insert([
+      { subject: 'urn:op:secret', predicate: 'http://schema.org/secret', object: '"locked"', graph: cgCodeMeta },
+      { subject: 'urn:op:visible', predicate: 'http://schema.org/secret', object: '"open"', graph: cgCodeSwmMeta },
+    ]);
+    const result = await engine.query(
+      `SELECT ?g ?v WHERE { GRAPH ?g { ?s <http://schema.org/secret> ?v } }`,
+      { contextGraphId: CONTEXT_GRAPH, graphSuffix: '_shared_memory' },
+    );
+    const values = result.bindings.map((b) => b['v']).sort();
+    expect(values).not.toContain('"locked"');
+    expect(result.bindings.some((b) => b['g'] === cgCodeMeta)).toBe(false);
   });
 
   it('rejects compact explicit GRAPH IRIs outside the scoped context graph', async () => {

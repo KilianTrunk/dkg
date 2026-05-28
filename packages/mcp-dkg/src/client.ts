@@ -49,6 +49,24 @@ export interface DkgClientOptions {
   fetcher?: typeof fetch;
 }
 
+const CONTEXT_GRAPH_URI_PREFIX = 'did:dkg:context-graph:';
+
+function normalizeContextGraphId(contextGraphIdOrUri: string): string {
+  const trimmed = contextGraphIdOrUri.trim();
+  return trimmed.startsWith(CONTEXT_GRAPH_URI_PREFIX)
+    ? trimmed.slice(CONTEXT_GRAPH_URI_PREFIX.length)
+    : trimmed;
+}
+
+function optionalContextGraphId(contextGraphIdOrUri: string | undefined): string | undefined {
+  if (typeof contextGraphIdOrUri !== 'string') return undefined;
+  return normalizeContextGraphId(contextGraphIdOrUri) || undefined;
+}
+
+function toContextGraphUri(contextGraphIdOrUri: string): string {
+  return `${CONTEXT_GRAPH_URI_PREFIX}${normalizeContextGraphId(contextGraphIdOrUri)}`;
+}
+
 /**
  * Per-peer diagnostic snapshot returned by `GET /api/peer-info`. Shape
  * mirrors the daemon-side `PeerDiagnostics` interface plus the legacy
@@ -218,7 +236,7 @@ export class DkgClient {
   }
 
   async listSubGraphs(contextGraphId: string): Promise<SubGraphRow[]> {
-    const qs = `?contextGraphId=${encodeURIComponent(contextGraphId)}`;
+    const qs = `?contextGraphId=${encodeURIComponent(normalizeContextGraphId(contextGraphId))}`;
     const r = await this.request<{ subGraphs?: SubGraphRow[] }>('GET', `/api/sub-graph/list${qs}`);
     return r.subGraphs ?? [];
   }
@@ -270,7 +288,8 @@ export class DkgClient {
     minTrust?: 'SelfAttested' | 'Endorsed' | 0 | 1;
   }): Promise<SparqlResult> {
     const body: Record<string, unknown> = { sparql: args.sparql };
-    if (args.contextGraphId) body.contextGraphId = args.contextGraphId;
+    const contextGraphId = optionalContextGraphId(args.contextGraphId);
+    if (contextGraphId) body.contextGraphId = contextGraphId;
     if (args.subGraphName) body.subGraphName = args.subGraphName;
     if (args.graphSuffix) body.graphSuffix = args.graphSuffix;
     if (args.includeSharedMemory != null) body.includeSharedMemory = args.includeSharedMemory;
@@ -353,7 +372,8 @@ export class DkgClient {
     phases?: Record<string, number>;
   }> {
     const body: Record<string, unknown> = { to: args.to, text: args.text };
-    if (args.contextGraphId) body.contextGraphId = args.contextGraphId;
+    const contextGraphId = optionalContextGraphId(args.contextGraphId);
+    if (contextGraphId) body.contextGraphId = contextGraphId;
     return this.request('POST', '/api/chat', body);
   }
 
@@ -428,9 +448,10 @@ export class DkgClient {
     contextGraphId: string,
     subGraphName: string,
   ): Promise<void> {
+    const cgId = normalizeContextGraphId(contextGraphId);
     try {
       await this.request('POST', '/api/sub-graph/create', {
-        contextGraphId,
+        contextGraphId: cgId,
         subGraphName,
       });
     } catch (err) {
@@ -468,7 +489,7 @@ export class DkgClient {
       object: t.object,
     }));
     const body: Record<string, unknown> = {
-      contextGraphId: args.contextGraphId,
+      contextGraphId: normalizeContextGraphId(args.contextGraphId),
       quads,
     };
     if (args.subGraphName) body.subGraphName = args.subGraphName;
@@ -495,7 +516,7 @@ export class DkgClient {
     subGraphName?: string;
   }): Promise<void> {
     const body: Record<string, unknown> = {
-      contextGraphId: args.contextGraphId,
+      contextGraphId: normalizeContextGraphId(args.contextGraphId),
     };
     if (args.subGraphName) body.subGraphName = args.subGraphName;
     await this.request(
@@ -513,7 +534,7 @@ export class DkgClient {
     entities: string[];
   }): Promise<void> {
     const body: Record<string, unknown> = {
-      contextGraphId: args.contextGraphId,
+      contextGraphId: normalizeContextGraphId(args.contextGraphId),
       entities: args.entities,
     };
     if (args.subGraphName) body.subGraphName = args.subGraphName;
@@ -536,7 +557,7 @@ export class DkgClient {
     subGraphName?: string;
   }): Promise<{ assertionUri: string | null; alreadyExists: boolean }> {
     const body: Record<string, unknown> = {
-      contextGraphId: args.contextGraphId,
+      contextGraphId: normalizeContextGraphId(args.contextGraphId),
       name: args.assertionName,
     };
     if (args.subGraphName) body.subGraphName = args.subGraphName;
@@ -566,7 +587,7 @@ export class DkgClient {
     subGraphName?: string;
   }): Promise<{ quads: unknown[]; count: number }> {
     const body: Record<string, unknown> = {
-      contextGraphId: args.contextGraphId,
+      contextGraphId: normalizeContextGraphId(args.contextGraphId),
     };
     if (args.subGraphName) body.subGraphName = args.subGraphName;
     return this.request(
@@ -585,7 +606,7 @@ export class DkgClient {
     subGraphName?: string;
   }): Promise<Record<string, unknown>> {
     const body: Record<string, unknown> = {
-      contextGraphId: args.contextGraphId,
+      contextGraphId: normalizeContextGraphId(args.contextGraphId),
     };
     body.assertionUri = args.assertionUri;
     if (args.assertionName) body.assertionName = args.assertionName;
@@ -604,7 +625,7 @@ export class DkgClient {
     maxBytes?: number;
   }): Promise<Record<string, unknown>> {
     const body: Record<string, unknown> = {
-      contextGraphId: args.contextGraphId,
+      contextGraphId: normalizeContextGraphId(args.contextGraphId),
     };
     body.assertionUri = args.assertionUri;
     if (args.assertionName) body.assertionName = args.assertionName;
@@ -627,7 +648,7 @@ export class DkgClient {
     generatedAt?: string;
   }): Promise<Record<string, unknown>> {
     const body: Record<string, unknown> = {
-      contextGraphId: args.contextGraphId,
+      contextGraphId: normalizeContextGraphId(args.contextGraphId),
       semanticQuads: args.semanticQuads,
     };
     body.assertionUri = args.assertionUri;
@@ -651,7 +672,7 @@ export class DkgClient {
     agentAddress?: string;
     subGraphName?: string;
   }): Promise<Record<string, unknown>> {
-    const params = new URLSearchParams({ contextGraphId: args.contextGraphId });
+    const params = new URLSearchParams({ contextGraphId: normalizeContextGraphId(args.contextGraphId) });
     if (args.agentAddress) params.set('agentAddress', args.agentAddress);
     if (args.subGraphName) params.set('subGraphName', args.subGraphName);
     return this.request(
@@ -689,7 +710,7 @@ export class DkgClient {
       type: args.contentType ?? 'application/octet-stream',
     });
     form.append('file', blob, args.fileName);
-    form.append('contextGraphId', args.contextGraphId);
+    form.append('contextGraphId', normalizeContextGraphId(args.contextGraphId));
     if (args.contentType) form.append('contentType', args.contentType);
     if (args.ontologyRef) form.append('ontologyRef', args.ontologyRef);
     if (args.subGraphName) form.append('subGraphName', args.subGraphName);
@@ -765,7 +786,7 @@ export class DkgClient {
     catchup?: { jobId: string; status: string; includeSharedMemory: boolean };
   }> {
     return this.request('POST', '/api/subscribe', {
-      contextGraphId: args.contextGraphId,
+      contextGraphId: normalizeContextGraphId(args.contextGraphId),
       includeSharedMemory: args.includeSharedMemory,
     });
   }
@@ -798,7 +819,7 @@ export class DkgClient {
     memberMode?: boolean;
   }> {
     return this.request('POST', '/api/shared-memory/host-mode/subscribe', {
-      contextGraphId: args.contextGraphId,
+      contextGraphId: normalizeContextGraphId(args.contextGraphId),
     });
   }
 
@@ -877,7 +898,7 @@ export class DkgClient {
     const hasSubset = Array.isArray(args.rootEntities) && args.rootEntities.length > 0;
     const clearAfter = args.clearAfter ?? !hasSubset;
     return this.request('POST', '/api/shared-memory/publish', {
-      contextGraphId: args.contextGraphId,
+      contextGraphId: normalizeContextGraphId(args.contextGraphId),
       selection: args.rootEntities ?? 'all',
       clearAfter,
       subGraphName: args.subGraphName,
@@ -903,18 +924,19 @@ export class DkgClient {
     contextGraphId: string;
     quads: Array<{ subject: string; predicate: string; object: string; graph?: string }>;
   }): Promise<Record<string, unknown>> {
+    const cgId = normalizeContextGraphId(args.contextGraphId);
     const assertionName = `mcp-publish-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const quadsWithGraph = args.quads.map((q) => ({
       subject: q.subject,
       predicate: q.predicate,
       object: q.object,
-      graph: q.graph ?? `did:dkg:context-graph:${args.contextGraphId}`,
+      graph: q.graph || toContextGraphUri(cgId),
     }));
     const created = await this.request<{ assertionUri?: string; seal?: Record<string, unknown> }>(
       'POST',
       '/api/assertion/create',
       {
-        contextGraphId: args.contextGraphId,
+        contextGraphId: cgId,
         name: assertionName,
         quads: quadsWithGraph,
         finalize: true,
@@ -925,7 +947,7 @@ export class DkgClient {
       'POST',
       '/api/shared-memory/publish',
       {
-        contextGraphId: args.contextGraphId,
+        contextGraphId: cgId,
         assertionName,
       },
     );
@@ -965,7 +987,7 @@ export class DkgClient {
         txHash?: string;
         hint?: string;
       }>('POST', '/api/context-graph/register', {
-        id: args.id,
+        id: normalizeContextGraphId(args.id),
         accessPolicy: args.accessPolicy,
       });
       return { ...response, alreadyRegistered: false };
@@ -975,7 +997,7 @@ export class DkgClient {
       // can branch on it without the locale-fragile substring match.
       if (err instanceof DkgHttpError && err.status === 409) {
         return {
-          registered: args.id,
+          registered: normalizeContextGraphId(args.id),
           alreadyRegistered: true,
         };
       }

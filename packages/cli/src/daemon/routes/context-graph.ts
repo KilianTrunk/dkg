@@ -194,6 +194,7 @@ import {
   safeParseJson,
   validateOptionalSubGraphName,
   validateRequiredContextGraphId,
+  resolveRequiredWriteContextGraphId,
   validateEntities,
   validateConditions,
   MAX_BODY_BYTES,
@@ -416,6 +417,13 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
     requestAgentAddress,
     emitMemoryGraphChanged,
   } = ctx;
+  const writePreflightCallerAgentAddress = requestToken
+    ? agent.resolveAgentByToken(requestToken)
+    : undefined;
+  const writePreflightContextGraphOpts = {
+    callerAgentAddress: writePreflightCallerAgentAddress,
+    allowLocalExactFallback: !writePreflightCallerAgentAddress,
+  };
 
 
   // POST /api/context-graph/create — context graph definition create.
@@ -599,7 +607,13 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
     const { id, accessPolicy, publishPolicy, strictEoaCuratorMatch } = parsed;
     if (!id) return jsonResponse(res, 400, { error: 'Missing "id"' });
     if (typeof id !== 'string') return jsonResponse(res, 400, { error: '"id" must be a string' });
-    if (!isValidContextGraphId(id)) return jsonResponse(res, 400, { error: 'Invalid context graph id' });
+    const resolvedContextGraphId = await resolveRequiredWriteContextGraphId(
+      agent,
+      id,
+      res,
+      writePreflightContextGraphOpts,
+    );
+    if (!resolvedContextGraphId) return;
     if (accessPolicy !== undefined && (accessPolicy !== 0 && accessPolicy !== 1)) {
       return jsonResponse(res, 400, { error: '"accessPolicy" must be 0 (open) or 1 (private)' });
     }
@@ -624,7 +638,7 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
       // launch deployment shape — see `registerContextGraph` jsdoc),
       // but multi-tenant operators can pass `strictEoaCuratorMatch:true`
       // to require an exact wallet match before registration proceeds.
-      const result = await agent.registerContextGraph(id, {
+      const result = await agent.registerContextGraph(resolvedContextGraphId, {
         accessPolicy,
         publishPolicy,
         callerAgentAddress: requestAgentAddress,
@@ -632,7 +646,7 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
         ...(strictEoaCuratorMatch === true ? { strictEoaCuratorMatch: true } : {}),
       });
       return jsonResponse(res, 200, {
-        registered: id,
+        registered: resolvedContextGraphId,
         onChainId: result.onChainId,
         ...(result.txHash ? { txHash: result.txHash } : {}),
         hint: 'Context graph registered on-chain. You can now publish SWM to Verified Memory.',
@@ -656,10 +670,16 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
     if (!contextGraphId || !targetPeerId) {
       return jsonResponse(res, 400, { error: 'Missing "contextGraphId" or "peerId"' });
     }
-    if (!isValidContextGraphId(contextGraphId)) return jsonResponse(res, 400, { error: 'Invalid context graph id' });
+    const resolvedContextGraphId = await resolveRequiredWriteContextGraphId(
+      agent,
+      contextGraphId,
+      res,
+      writePreflightContextGraphOpts,
+    );
+    if (!resolvedContextGraphId) return;
     try {
-      await agent.inviteToContextGraph(contextGraphId, targetPeerId, requestAgentAddress);
-      return jsonResponse(res, 200, { invited: targetPeerId, contextGraphId });
+      await agent.inviteToContextGraph(resolvedContextGraphId, targetPeerId, requestAgentAddress);
+      return jsonResponse(res, 200, { invited: targetPeerId, contextGraphId: resolvedContextGraphId });
     } catch (err: any) {
       const msg = err?.message ?? '';
       if (msg.includes('does not exist')) {
@@ -686,7 +706,13 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
     const { contextGraphId, subGraphName } = parsed;
     if (!subGraphName)
       return jsonResponse(res, 400, { error: 'Missing "subGraphName"' });
-    if (!validateRequiredContextGraphId(contextGraphId, res)) return;
+    const resolvedContextGraphId = await resolveRequiredWriteContextGraphId(
+      agent,
+      contextGraphId,
+      res,
+      writePreflightContextGraphOpts,
+    );
+    if (!resolvedContextGraphId) return;
     if (typeof subGraphName !== "string")
       return jsonResponse(res, 400, {
         error: '"subGraphName" must be a string',
@@ -697,15 +723,15 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
         error: `Invalid "subGraphName": ${sgVal.reason}`,
       });
     try {
-      await agent.createSubGraph(contextGraphId, subGraphName);
+      await agent.createSubGraph(resolvedContextGraphId, subGraphName);
       emitMemoryGraphChanged?.({
-        contextGraphId,
+        contextGraphId: resolvedContextGraphId,
         layers: [],
         subGraphName,
         operation: "sub_graph_created",
         source: "api",
       });
-      return jsonResponse(res, 200, { created: subGraphName, contextGraphId });
+      return jsonResponse(res, 200, { created: subGraphName, contextGraphId: resolvedContextGraphId });
     } catch (err: any) {
       if (
         err.message?.includes("already exists") ||
@@ -787,14 +813,21 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
   const addParticipantMatch = path.match(/^\/api\/context-graph\/([^/]+)\/add-participant$/);
   if (req.method === "POST" && addParticipantMatch) {
     const contextGraphId = decodeURIComponent(addParticipantMatch[1]);
+    const resolvedContextGraphId = await resolveRequiredWriteContextGraphId(
+      agent,
+      contextGraphId,
+      res,
+      writePreflightContextGraphOpts,
+    );
+    if (!resolvedContextGraphId) return;
     const body = await readBody(req);
     const { agentAddress } = JSON.parse(body);
     if (!agentAddress || typeof agentAddress !== 'string') {
       return jsonResponse(res, 400, { error: 'agentAddress is required' });
     }
     try {
-      await agent.inviteAgentToContextGraph(contextGraphId, agentAddress, requestAgentAddress);
-      return jsonResponse(res, 200, { ok: true, contextGraphId, agentAddress });
+      await agent.inviteAgentToContextGraph(resolvedContextGraphId, agentAddress, requestAgentAddress);
+      return jsonResponse(res, 200, { ok: true, contextGraphId: resolvedContextGraphId, agentAddress });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       return jsonResponse(res, 400, { error: msg });
@@ -805,14 +838,21 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
   const removeParticipantMatch = path.match(/^\/api\/context-graph\/([^/]+)\/remove-participant$/);
   if (req.method === "POST" && removeParticipantMatch) {
     const contextGraphId = decodeURIComponent(removeParticipantMatch[1]);
+    const resolvedContextGraphId = await resolveRequiredWriteContextGraphId(
+      agent,
+      contextGraphId,
+      res,
+      writePreflightContextGraphOpts,
+    );
+    if (!resolvedContextGraphId) return;
     const body = await readBody(req);
     const { agentAddress } = JSON.parse(body);
     if (!agentAddress || typeof agentAddress !== 'string') {
       return jsonResponse(res, 400, { error: 'agentAddress is required' });
     }
     try {
-      await agent.removeAgentFromContextGraph(contextGraphId, agentAddress, requestAgentAddress);
-      return jsonResponse(res, 200, { ok: true, contextGraphId, agentAddress });
+      await agent.removeAgentFromContextGraph(resolvedContextGraphId, agentAddress, requestAgentAddress);
+      return jsonResponse(res, 200, { ok: true, contextGraphId: resolvedContextGraphId, agentAddress });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       return jsonResponse(res, 400, { error: msg });
@@ -907,11 +947,18 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
   const approveJoinMatch = path.match(/^\/api\/context-graph\/([^/]+)\/approve-join$/);
   if (req.method === "POST" && approveJoinMatch) {
     const contextGraphId = decodeURIComponent(approveJoinMatch[1]);
+    const resolvedContextGraphId = await resolveRequiredWriteContextGraphId(
+      agent,
+      contextGraphId,
+      res,
+      writePreflightContextGraphOpts,
+    );
+    if (!resolvedContextGraphId) return;
     const body = await readBody(req);
     try {
       const { agentAddress } = JSON.parse(body);
       if (!agentAddress) return jsonResponse(res, 400, { error: 'Missing agentAddress' });
-      await agent.approveJoinRequest(contextGraphId, agentAddress, requestAgentAddress);
+      await agent.approveJoinRequest(resolvedContextGraphId, agentAddress, requestAgentAddress);
       return jsonResponse(res, 200, { ok: true, status: 'approved', agentAddress });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -976,11 +1023,18 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
   const rejectJoinMatch = path.match(/^\/api\/context-graph\/([^/]+)\/reject-join$/);
   if (req.method === "POST" && rejectJoinMatch) {
     const contextGraphId = decodeURIComponent(rejectJoinMatch[1]);
+    const resolvedContextGraphId = await resolveRequiredWriteContextGraphId(
+      agent,
+      contextGraphId,
+      res,
+      writePreflightContextGraphOpts,
+    );
+    if (!resolvedContextGraphId) return;
     const body = await readBody(req);
     try {
       const { agentAddress } = JSON.parse(body);
       if (!agentAddress) return jsonResponse(res, 400, { error: 'Missing agentAddress' });
-      await agent.rejectJoinRequest(contextGraphId, agentAddress);
+      await agent.rejectJoinRequest(resolvedContextGraphId, agentAddress);
       return jsonResponse(res, 200, { ok: true, status: 'rejected', agentAddress });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -1047,6 +1101,13 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
   const manifestPublishMatch = path.match(/^\/api\/context-graph\/([^/]+)\/manifest\/publish$/);
   if (req.method === 'POST' && manifestPublishMatch) {
     const contextGraphId = decodeURIComponent(manifestPublishMatch[1]);
+    const resolvedContextGraphId = await resolveRequiredWriteContextGraphId(
+      agent,
+      contextGraphId,
+      res,
+      writePreflightContextGraphOpts,
+    );
+    if (!resolvedContextGraphId) return;
     let body: any = {};
     try { body = JSON.parse(await readBody(req, SMALL_BODY_BYTES) || '{}'); }
     catch { return jsonResponse(res, 400, { error: 'Invalid JSON body' }); }
@@ -1059,7 +1120,7 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
     // URLs, swapped agent URIs, etc.). Only the CG's registered
     // curator/creator may publish.
     try {
-      await agent.assertContextGraphOwner(contextGraphId, requestAgentAddress, 'publish a project manifest');
+      await agent.assertContextGraphOwner(resolvedContextGraphId, requestAgentAddress, 'publish a project manifest');
     } catch (authErr: unknown) {
       const msg = authErr instanceof Error ? authErr.message : String(authErr);
       // Distinguish "not the owner" from "CG has no registered owner".
@@ -1118,10 +1179,10 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
         });
       }
 
-      const ontologyUri = body.ontologyUri ?? `urn:dkg:project:${contextGraphId}:ontology`;
+      const ontologyUri = body.ontologyUri ?? `urn:dkg:project:${resolvedContextGraphId}:ontology`;
       const client = manifestSelfClient(apiHost, apiPortRef.value, requestToken);
       const result = await publishManifestImpl({
-        contextGraphId,
+        contextGraphId: resolvedContextGraphId,
         network: networkLabel,
         supportedTools,
         publisherAgentUri,
@@ -1530,9 +1591,16 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
     if (!id || !name) {
       return jsonResponse(res, 400, { error: 'Missing "id" or "name"' });
     }
+    const resolvedContextGraphId = await resolveRequiredWriteContextGraphId(
+      agent,
+      id,
+      res,
+      writePreflightContextGraphOpts,
+    );
+    if (!resolvedContextGraphId) return;
     try {
-      await agent.renameContextGraph(id, String(name), requestAgentAddress);
-      return jsonResponse(res, 200, { renamed: id, name });
+      await agent.renameContextGraph(resolvedContextGraphId, String(name), requestAgentAddress);
+      return jsonResponse(res, 200, { renamed: resolvedContextGraphId, name });
     } catch (err: any) {
       const msg = err?.message ?? String(err);
       if (/Only the context graph creator/.test(msg)) {

@@ -2,7 +2,7 @@ import { useMemo, useState, useCallback, useEffect, useRef } from 'react';
 import { useFetch } from '../hooks.js';
 import { api } from '../api-wrapper.js';
 import { useMemoryGraphEvents } from '../hooks/useNodeEvents.js';
-import { isUserFacingSubGraph } from '../lib/subGraphs.js';
+import { isUserFacingSubGraph, ROOT_SLUG_SENTINEL } from '../lib/subGraphs.js';
 import { ImportFilesModal } from '../components/Modals/ImportFilesModal.js';
 import { ShareProjectModal } from '../components/Modals/ShareProjectModal.js';
 import {
@@ -32,6 +32,7 @@ import {
   OverviewPrimerEntry,
   curatorStatusForOverview,
   SubGraphOverviewGrid,
+  SubGraphExplorerHeader,
   ContextGraphQueryView,
   LayerDetailView,
 } from './project/components.js';
@@ -255,7 +256,17 @@ export function ProjectView({ contextGraphId }: ProjectViewProps) {
     [cgData, contextGraphId]
   );
 
-  const rawMemory = useMemoryEntities(contextGraphId);
+  // `signalErrors: true` flips `rawMemory.error` to a real string
+  // when all three layer queries fail. Without it the hook treats
+  // "every layer failed" as `error: null, partial: false` (since
+  // `partial` only triggers on a PARTIAL failure), and the Bug C
+  // `memoryReady` gate below incorrectly classes that state as
+  // ready — passing an empty entityList into SubGraphBar while the
+  // daemon-backed `sg.entityCount` totals stay non-zero (the same
+  // contradiction Bug C set out to prevent). Mirrors the
+  // DashboardView caller, which already opts in for the same
+  // failed-vs-empty-distinct reason.
+  const rawMemory = useMemoryEntities(contextGraphId, { signalErrors: true });
   // SWM attribution drives the SWM graph's agent-tint legend (its
   // sole remaining consumer). PR #694 review — the Overview no
   // longer reads this stream (lifecycle source replaced it), so the
@@ -476,6 +487,20 @@ export function ProjectView({ contextGraphId }: ProjectViewProps) {
   // Active sub-graph binding (for the breadcrumb strip) — stays in scope
   // across sub-graph / layer / overview routes.
   const activeSubGraphBinding = activeSubGraph ? profile.forSubGraph(activeSubGraph) : null;
+
+  // Codex Bug C — gate the `entities`-driven chip-count path on a
+  // fully-loaded memory snapshot. While `useMemoryEntities` is mid-
+  // hydration or a layer query is in-flight, `entityList` is partial
+  // (often empty) and the chip counts derived from it disagree with
+  // the daemon-side `sg.entityCount` fallback used by
+  // SubGraphOverviewGrid — same screen, two numbers for the same
+  // subgraph. Passing `undefined` keeps SubGraphBar on the daemon
+  // total path until both readiness conditions hold; the `partial`
+  // flag covers individual-layer fetch failures (counts incomplete
+  // but not absent), which is also a contradiction we don't want
+  // surfacing on the chip row.
+  const memoryReady = !rawMemory.loading && !rawMemory.error && !rawMemory.partial;
+  const chipBarEntities = memoryReady ? rawMemory.entityList : undefined;
   const activePage = selectedEntity
     ? 'entity'
     : activeSubGraph
@@ -528,14 +553,18 @@ export function ProjectView({ contextGraphId }: ProjectViewProps) {
         />
       )}
 
-      {/* Sub-graph page mode — first-class peer of the layer views */}
+      {/* Subgraph Explorer — page mode (specific chip or Root selected).
+          First-class peer of the layer views; the page identity, intro
+          and chip row are shared with the All / Subgraphs-overview state
+          (rendered below in the graph-overview branch). */}
       {activeSubGraph && !selectedEntity && (
         <>
+          <SubGraphExplorerHeader />
           <SubGraphBar
             contextGraphId={contextGraphId}
             profile={profile}
             selected={activeSubGraph}
-            entities={rawMemory.entityList}
+            entities={chipBarEntities}
             onSelect={handleSelectSubGraph}
           />
           <SubGraphDetailView
@@ -602,14 +631,26 @@ export function ProjectView({ contextGraphId }: ProjectViewProps) {
         </>
       )}
 
-      {/* Subgraphs — one mini graph per sub-graph, side-by-side */}
+      {/* Subgraph Explorer — All state (page heading + intro + chip row
+          + card-wall body). Selecting a chip transitions to the detail
+          body via `activeSubGraph` (branch above). */}
       {!activeSubGraph && activeLayer === 'graph-overview' && !selectedEntity && (
-        <SubGraphOverviewGrid
-          contextGraphId={contextGraphId}
-          memory={rawMemory}
-          onNodeClick={handleNodeClick}
-          onSelectSubGraph={handleSelectSubGraph}
-        />
+        <>
+          <SubGraphExplorerHeader />
+          <SubGraphBar
+            contextGraphId={contextGraphId}
+            profile={profile}
+            selected={null}
+            entities={chipBarEntities}
+            onSelect={handleSelectSubGraph}
+          />
+          <SubGraphOverviewGrid
+            contextGraphId={contextGraphId}
+            memory={rawMemory}
+            onNodeClick={handleNodeClick}
+            onSelectSubGraph={handleSelectSubGraph}
+          />
+        </>
       )}
 
       {!activeSubGraph && activeLayer === 'query' && !selectedEntity && (
@@ -623,7 +664,7 @@ export function ProjectView({ contextGraphId }: ProjectViewProps) {
             contextGraphId={contextGraphId}
             profile={profile}
             selected={activeSubGraph}
-            entities={rawMemory.entityList}
+            entities={chipBarEntities}
             onSelect={handleSelectSubGraph}
             layer={activeLayer}
           />

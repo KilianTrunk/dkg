@@ -27,6 +27,7 @@ import {
 } from '@origintrail-official/dkg-core';
 import {
   DkgDaemonClient,
+  normalizeContextGraphId,
   type LocalAgentIntegrationRecord,
   type LocalAgentIntegrationTransport,
 } from './dkg-client.js';
@@ -69,6 +70,13 @@ const CONTEXT_GRAPH_QUERY_SUBGRAPH = '__context_graph';
 const USER_QUERY_CATALOG_SLUG = 'ui-saved-queries';
 const USER_QUERY_CATALOG_NAME = 'Saved queries';
 const USER_QUERY_CATALOG_DESCRIPTION = 'Queries saved from the Query tab.';
+const EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION =
+  'Use the injected target context graph id/URI when present; otherwise use ' +
+  'an exact existing context graph id from dkg_list_context_graphs, or its ' +
+  'full did:dkg:context-graph:<id> URI. Locally-created context graphs ' +
+  'may have ids like "local-notes"; joined/curated context graphs use ' +
+  '<curatorAddress>/<slug> ids like "0x.../team-notes". Do not guess, ' +
+  'shorten, or pass only the suffix slug for curator-scoped graphs.';
 const PROFILE_NS = 'http://dkg.io/ontology/profile/';
 const SCHEMA_NS = 'http://schema.org/';
 const RDF_TYPE = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type';
@@ -227,6 +235,23 @@ function queryCatalogIntLiteral(value: number): string {
 
 function optionalString(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function contextGraphBelongsToCaller(row: Record<string, unknown>): boolean {
+  if (row.isSystem === true) return false;
+  if (row.callerInvolved === true) return true;
+  if (row.callerInvolved === false) return false;
+  const role = typeof row.role === 'string' ? row.role.trim().toLowerCase() : '';
+  if (['curator', 'creator', 'owner', 'participant', 'member'].includes(role)) return true;
+  // Older daemons did not include callerInvolved. Preserve compatibility by
+  // leaving those unscoped rows visible instead of hiding everything.
+  return true;
+}
+
+function filterContextGraphsForScope(graphs: unknown[], scope: string | undefined): unknown[] {
+  return scope === 'all'
+    ? graphs
+    : graphs.filter((graph) => graph && typeof graph === 'object' && contextGraphBelongsToCaller(graph as Record<string, unknown>));
 }
 
 function readOnlySparqlOperation(sparql: string): string | null {
@@ -2691,21 +2716,32 @@ export class DkgNodePlugin {
       {
         name: 'dkg_list_context_graphs',
         description:
-          'List all contextGraphs this node knows about. Returns context graph IDs, names, subscription status, ' +
-          'and sync status. Use this to discover available contextGraphs before publishing or querying.',
-        parameters: { type: 'object', properties: {}, required: [] },
-        execute: async (_toolCallId, _params) => this.handleListContextGraphs(),
+          'List contextGraphs known to this node. Defaults to this caller\'s created/joined context graphs ' +
+          'to avoid noisy discovered graphs; pass scope="all" to inspect every known graph. Use this only ' +
+          'when no target context graph is injected or configured and the agent needs to choose one.',
+        parameters: {
+          type: 'object',
+          properties: {
+            scope: {
+              type: 'string',
+              enum: ['mine', 'all'],
+              description: 'Defaults to "mine" (created/joined context graphs for this caller). Use "all" for every known graph.',
+            },
+          },
+          required: [],
+        },
+        execute: async (_toolCallId, params) => this.handleListContextGraphs(params ?? {}),
       },
       {
         name: 'dkg_context_graph_create',
         description:
           'Create a new context graph on the DKG node. A context graph is a scoped knowledge domain ' +
-          'that organizes published knowledge. Use dkg_list_context_graphs first to check if the ' +
-          'context graph already exists. Returns the context graph ID and URI (did:dkg:context-graph:<id>). ' +
+          'that organizes published knowledge. Returns the context graph ID and URI (did:dkg:context-graph:<id>). ' +
           'The ID is auto-generated from the name if not provided. ' +
           'Defaults to a curated/private context graph — the creator is auto-included in the allowlist ' +
           'and can immediately write to working/shared memory. Pass `public: true` for an open/discoverable ' +
-          'context graph, or `allowed_agents` to invite collaborators atomically with creation.',
+          'context graph, or `allowed_agents` to invite collaborators atomically with creation. ' +
+          'For later writes, use the exact returned id or full did:dkg:context-graph:<id> URI.',
         parameters: {
           type: 'object',
           properties: {
@@ -2719,7 +2755,10 @@ export class DkgNodePlugin {
             },
             id: {
               type: 'string',
-              description: 'Optional custom context graph ID slug. Auto-generated from name if omitted (e.g. "My Research" → "my-research").',
+              description:
+                'Optional create-only context graph id slug. Auto-generated from name if omitted ' +
+                '(e.g. "My Research" -> "my-research"). For later writes, use the exact returned id ' +
+                'or full did:dkg:context-graph:<id> URI.',
             },
             public: {
               type: 'boolean',
@@ -2745,7 +2784,7 @@ export class DkgNodePlugin {
         parameters: {
           type: 'object',
           properties: {
-            context_graph_id: { type: 'string', description: 'Target context graph ID.' },
+            context_graph_id: { type: 'string', description: `Target context graph. ${EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION}` },
             peer_id: { type: 'string', description: 'Target peer ID (12D3KooW...).' },
           },
           required: ['context_graph_id', 'peer_id'],
@@ -2762,7 +2801,7 @@ export class DkgNodePlugin {
         parameters: {
           type: 'object',
           properties: {
-            context_graph_id: { type: 'string', description: 'Target context graph ID.' },
+            context_graph_id: { type: 'string', description: `Target context graph. ${EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION}` },
             agent_address: { type: 'string', description: 'Friend\'s DKG agent address (0x...).' },
           },
           required: ['context_graph_id', 'agent_address'],
@@ -2776,7 +2815,7 @@ export class DkgNodePlugin {
         parameters: {
           type: 'object',
           properties: {
-            context_graph_id: { type: 'string', description: 'Target context graph ID.' },
+            context_graph_id: { type: 'string', description: `Target context graph. ${EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION}` },
             agent_address: { type: 'string', description: 'Agent address to remove (0x...).' },
           },
           required: ['context_graph_id', 'agent_address'],
@@ -2790,7 +2829,7 @@ export class DkgNodePlugin {
         parameters: {
           type: 'object',
           properties: {
-            context_graph_id: { type: 'string', description: 'Target context graph ID.' },
+            context_graph_id: { type: 'string', description: `Target context graph. ${EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION}` },
           },
           required: ['context_graph_id'],
         },
@@ -2803,7 +2842,7 @@ export class DkgNodePlugin {
         parameters: {
           type: 'object',
           properties: {
-            context_graph_id: { type: 'string', description: 'Target context graph ID.' },
+            context_graph_id: { type: 'string', description: `Target context graph. ${EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION}` },
           },
           required: ['context_graph_id'],
         },
@@ -2816,7 +2855,7 @@ export class DkgNodePlugin {
         parameters: {
           type: 'object',
           properties: {
-            context_graph_id: { type: 'string', description: 'Target context graph ID.' },
+            context_graph_id: { type: 'string', description: `Target context graph. ${EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION}` },
             agent_address: { type: 'string', description: 'Requesting agent address (0x...).' },
           },
           required: ['context_graph_id', 'agent_address'],
@@ -2830,7 +2869,7 @@ export class DkgNodePlugin {
         parameters: {
           type: 'object',
           properties: {
-            context_graph_id: { type: 'string', description: 'Target context graph ID.' },
+            context_graph_id: { type: 'string', description: `Target context graph. ${EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION}` },
             agent_address: { type: 'string', description: 'Requesting agent address (0x...).' },
           },
           required: ['context_graph_id', 'agent_address'],
@@ -2845,7 +2884,7 @@ export class DkgNodePlugin {
         parameters: {
           type: 'object',
           properties: {
-            context_graph_id: { type: 'string', description: 'Context graph ID (e.g. "my-research").' },
+            context_graph_id: { type: 'string', description: `Context graph to subscribe to. ${EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION}` },
             include_shared_memory: {
               type: 'boolean',
               description: 'Also sync Shared Working Memory. Default: true.',
@@ -2865,7 +2904,7 @@ export class DkgNodePlugin {
         parameters: {
           type: 'object',
           properties: {
-            context_graph_id: { type: 'string', description: 'Target context graph ID.' },
+            context_graph_id: { type: 'string', description: `Target context graph. ${EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION}` },
             quads: {
               type: 'array',
               items: {
@@ -2907,7 +2946,8 @@ export class DkgNodePlugin {
             context_graph_id: {
               type: 'string',
               description:
-                'CG scope. Optional when `view` is omitted (unscoped cross-graph query); required ' +
+                'CG scope. Use the injected target id when present, an exact existing id from dkg_list_context_graphs, or the full ' +
+                'did:dkg:context-graph:<id> URI. Optional when `view` is omitted (unscoped cross-graph query); required ' +
                 'when `view` is set (view-based routing always targets a single CG).',
             },
             view: {
@@ -2948,7 +2988,7 @@ export class DkgNodePlugin {
           properties: {
             context_graph_id: {
               type: 'string',
-              description: 'Context graph/project ID whose profile query catalog should be read.',
+              description: `Context graph/project whose profile query catalog should be read. ${EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION}`,
             },
           },
           required: ['context_graph_id'],
@@ -2966,7 +3006,7 @@ export class DkgNodePlugin {
           properties: {
             context_graph_id: {
               type: 'string',
-              description: 'Context graph/project ID whose saved query should be used.',
+              description: `Context graph/project whose saved query should be used. ${EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION}`,
             },
             query: {
               type: 'string',
@@ -2988,7 +3028,7 @@ export class DkgNodePlugin {
           properties: {
             context_graph_id: {
               type: 'string',
-              description: 'Context graph/project ID whose profile query catalog should receive the saved query.',
+              description: `Context graph/project whose profile query catalog should receive the saved query. ${EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION}`,
             },
             name: {
               type: 'string',
@@ -3102,7 +3142,7 @@ export class DkgNodePlugin {
         parameters: {
           type: 'object',
           properties: {
-            context_graph_id: { type: 'string', description: 'Target context graph ID.' },
+            context_graph_id: { type: 'string', description: `Target context graph. ${EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION}` },
             name: { type: 'string', description: 'Assertion name (lowercase letters, digits, hyphens).' },
             sub_graph_name: { type: 'string', description: 'Optional sub-graph (must be pre-registered).' },
           },
@@ -3118,7 +3158,7 @@ export class DkgNodePlugin {
         parameters: {
           type: 'object',
           properties: {
-            context_graph_id: { type: 'string', description: 'Target context graph ID.' },
+            context_graph_id: { type: 'string', description: `Target context graph. ${EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION}` },
             name: { type: 'string', description: 'Assertion name (must already exist).' },
             quads: {
               type: 'array',
@@ -3149,7 +3189,7 @@ export class DkgNodePlugin {
         parameters: {
           type: 'object',
           properties: {
-            context_graph_id: { type: 'string', description: 'Target context graph ID.' },
+            context_graph_id: { type: 'string', description: `Target context graph. ${EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION}` },
             name: { type: 'string', description: 'Assertion name to promote.' },
             entities: {
               type: 'array',
@@ -3171,7 +3211,7 @@ export class DkgNodePlugin {
         parameters: {
           type: 'object',
           properties: {
-            context_graph_id: { type: 'string', description: 'Target context graph ID.' },
+            context_graph_id: { type: 'string', description: `Target context graph. ${EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION}` },
             name: { type: 'string', description: 'Assertion name to discard.' },
             sub_graph_name: { type: 'string', description: 'Must match the one used at create time.' },
           },
@@ -3188,7 +3228,7 @@ export class DkgNodePlugin {
         parameters: {
           type: 'object',
           properties: {
-            context_graph_id: { type: 'string', description: 'Target context graph ID.' },
+            context_graph_id: { type: 'string', description: `Target context graph. ${EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION}` },
             name: { type: 'string', description: 'Target assertion name.' },
             file_path: { type: 'string', description: 'Absolute local path to the file to import.' },
             content_type: { type: 'string', description: 'MIME override (e.g. "text/markdown", "application/pdf"). Inferred from extension when omitted — covers .md/.markdown/.pdf/.docx/.html/.htm/.txt/.csv; other extensions fall through to application/octet-stream.' },
@@ -3207,7 +3247,7 @@ export class DkgNodePlugin {
         parameters: {
           type: 'object',
           properties: {
-            context_graph_id: { type: 'string', description: 'Target context graph ID.' },
+            context_graph_id: { type: 'string', description: `Target context graph. ${EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION}` },
             name: { type: 'string', description: 'Assertion name to dump.' },
             sub_graph_name: { type: 'string', description: 'Must match the one used at write time.' },
           },
@@ -3223,7 +3263,7 @@ export class DkgNodePlugin {
         parameters: {
           type: 'object',
           properties: {
-            context_graph_id: { type: 'string', description: 'Context graph ID from the attachment ref.' },
+            context_graph_id: { type: 'string', description: `Context graph id from the attachment ref. ${EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION}` },
             assertion_uri: { type: 'string', description: 'Completed imported assertion URI from the attachment ref.' },
             assertion_name: { type: 'string', description: 'Optional source assertion name to cross-check against assertion_uri.' },
             file_hash: { type: 'string', description: 'Optional source file hash to verify against deterministic metadata.' },
@@ -3241,7 +3281,7 @@ export class DkgNodePlugin {
         parameters: {
           type: 'object',
           properties: {
-            context_graph_id: { type: 'string', description: 'Context graph ID from the attachment ref.' },
+            context_graph_id: { type: 'string', description: `Context graph id from the attachment ref. ${EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION}` },
             assertion_uri: { type: 'string', description: 'Completed imported assertion URI from the attachment ref.' },
             assertion_name: { type: 'string', description: 'Optional source assertion name to cross-check against assertion_uri.' },
             file_hash: { type: 'string', description: 'Optional source file hash to verify against deterministic metadata.' },
@@ -3260,7 +3300,7 @@ export class DkgNodePlugin {
         parameters: {
           type: 'object',
           properties: {
-            context_graph_id: { type: 'string', description: 'Context graph ID from the attachment ref.' },
+            context_graph_id: { type: 'string', description: `Context graph id from the attachment ref. ${EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION}` },
             assertion_uri: { type: 'string', description: 'Source imported assertion URI from the attachment ref.' },
             assertion_name: { type: 'string', description: 'Optional source assertion name to cross-check against assertion_uri.' },
             file_hash: { type: 'string', description: 'Optional source file hash to verify against deterministic metadata.' },
@@ -3294,7 +3334,7 @@ export class DkgNodePlugin {
         parameters: {
           type: 'object',
           properties: {
-            context_graph_id: { type: 'string', description: 'Target context graph ID.' },
+            context_graph_id: { type: 'string', description: `Target context graph. ${EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION}` },
             name: { type: 'string', description: 'Assertion name.' },
             agent_address: { type: 'string', description: "Optional author — defaults to this node's agent address." },
             sub_graph_name: { type: 'string', description: 'Must match the one used at write time.' },
@@ -3312,7 +3352,7 @@ export class DkgNodePlugin {
         parameters: {
           type: 'object',
           properties: {
-            context_graph_id: { type: 'string', description: 'Parent context graph ID.' },
+            context_graph_id: { type: 'string', description: `Parent context graph. ${EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION}` },
             sub_graph_name: { type: 'string', description: 'Sub-graph name (lowercase letters, digits, hyphens; must not start with "_").' },
           },
           required: ['context_graph_id', 'sub_graph_name'],
@@ -3326,7 +3366,7 @@ export class DkgNodePlugin {
         parameters: {
           type: 'object',
           properties: {
-            context_graph_id: { type: 'string', description: 'Parent context graph ID.' },
+            context_graph_id: { type: 'string', description: `Parent context graph. ${EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION}` },
           },
           required: ['context_graph_id'],
         },
@@ -3344,7 +3384,7 @@ export class DkgNodePlugin {
         parameters: {
           type: 'object',
           properties: {
-            context_graph_id: { type: 'string', description: 'Target context graph ID.' },
+            context_graph_id: { type: 'string', description: `Target context graph. ${EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION}` },
             root_entities: {
               type: 'array',
               items: { type: 'string', description: 'Root entity URI to publish.' },
@@ -3387,7 +3427,7 @@ export class DkgNodePlugin {
             },
             context_graph_id: {
               type: 'string',
-              description: 'Target context graph ID.',
+              description: `Target context graph. ${EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION}`,
             },
             sub_graph_name: {
               type: 'string',
@@ -3670,11 +3710,15 @@ export class DkgNodePlugin {
     }
   }
 
-  private async handleListContextGraphs(): Promise<OpenClawToolResult> {
+  private async handleListContextGraphs(args: Record<string, unknown>): Promise<OpenClawToolResult> {
     try {
+      const scope = typeof args.scope === 'string' && args.scope.trim() ? args.scope.trim() : 'mine';
+      if (scope !== 'mine' && scope !== 'all') {
+        return this.error('"scope" must be "mine" or "all".');
+      }
       const result = await this.client.listContextGraphs();
-      const graphs = result.contextGraphs;
-      return this.json({ contextGraphs: graphs, count: graphs.length });
+      const graphs = filterContextGraphsForScope(result.contextGraphs ?? [], scope);
+      return this.json({ contextGraphs: graphs, count: graphs.length, scope });
     } catch (err: any) {
       return this.daemonError(err);
     }
@@ -3846,7 +3890,7 @@ export class DkgNodePlugin {
 
   private async handleQueryCatalogList(args: Record<string, unknown>): Promise<OpenClawToolResult> {
     try {
-      const contextGraphId = String(args.context_graph_id ?? '').trim();
+      const contextGraphId = normalizeContextGraphId(String(args.context_graph_id ?? ''));
       if (!contextGraphId) return this.error('"context_graph_id" is required.');
       const response = await this.client.readQueryCatalog(contextGraphId);
       const items = normalizeQueryCatalogItems(response);
@@ -3862,7 +3906,7 @@ export class DkgNodePlugin {
 
   private async handleQueryCatalogRun(args: Record<string, unknown>): Promise<OpenClawToolResult> {
     try {
-      const contextGraphId = String(args.context_graph_id ?? '').trim();
+      const contextGraphId = normalizeContextGraphId(String(args.context_graph_id ?? ''));
       const selector = String(args.query ?? '').trim();
       if (!contextGraphId) return this.error('"context_graph_id" is required.');
       if (!selector) return this.error('"query" is required.');
@@ -3906,7 +3950,7 @@ export class DkgNodePlugin {
 
   private async handleQueryCatalogSave(args: Record<string, unknown>): Promise<OpenClawToolResult> {
     try {
-      const contextGraphId = String(args.context_graph_id ?? '').trim();
+      const contextGraphId = normalizeContextGraphId(String(args.context_graph_id ?? ''));
       const name = String(args.name ?? '').trim();
       const sparql = String(args.sparql ?? '').trim();
       if (!contextGraphId) return this.error('"context_graph_id" is required.');

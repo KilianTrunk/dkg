@@ -356,4 +356,133 @@ describe('SubGraphBar — layer-scoped chip counts (P4)', () => {
     const allCount = Number(allChip?.querySelector('.v10-subgraph-chip-count')?.textContent ?? 'NaN');
     expect(allCount).toBe(11);
   });
+
+  // S3 — Root chip rendering. Surfaces only when the consumer
+  // supplies `entities` AND at least one entity is in the root
+  // bucket (no sub-graph membership). On Overview / Subgraphs
+  // pages the bar has no entities prop, so the chip stays hidden
+  // (we can't tell whether root entities exist without the list).
+  it('renders the Root chip when at least one entity has no subGraph membership', async () => {
+    const rootEntity = {
+      uri: 'urn:e:root', label: 'Root', types: [],
+      trustLevel: 'working' as const,
+      layers: new Set(['working']),
+      subGraphs: new Set<string>(),
+      properties: new Map(),
+      connections: [],
+    };
+    const namedEntity = mkEntity('urn:e:named', 'shared', 'alpha');
+    await act(async () => {
+      root.render(React.createElement(SubGraphBar, {
+        contextGraphId: 'cg',
+        profile,
+        selected: null,
+        onSelect: vi.fn(),
+        entities: [rootEntity, namedEntity],
+      }));
+    });
+    await flushNet();
+    // Root chip is present and reports the single root-bucket
+    // entity. Symbol from §4.4.1 is `⊘` (U+2298).
+    const rootChip = container.querySelector('.v10-subgraph-chip-root') as HTMLButtonElement | null;
+    expect(rootChip).toBeTruthy();
+    expect(rootChip!.textContent).toContain('Root');
+    expect(rootChip!.querySelector('.v10-subgraph-chip-count')?.textContent).toBe('1');
+  });
+
+  it('hides the Root chip when every supplied entity has a sub-graph membership', async () => {
+    const a = mkEntity('urn:a', 'working', 'alpha');
+    const b = mkEntity('urn:b', 'working', 'beta');
+    await act(async () => {
+      root.render(React.createElement(SubGraphBar, {
+        contextGraphId: 'cg',
+        profile,
+        selected: null,
+        onSelect: vi.fn(),
+        entities: [a, b],
+      }));
+    });
+    await flushNet();
+    expect(container.querySelector('.v10-subgraph-chip-root')).toBeNull();
+  });
+
+  it('Root chip click calls onSelect with ROOT_SLUG_SENTINEL', async () => {
+    const onSelect = vi.fn();
+    const rootEntity = {
+      uri: 'urn:e:root', label: 'Root', types: [],
+      trustLevel: 'working' as const,
+      layers: new Set(['working']),
+      subGraphs: new Set<string>(),
+      properties: new Map(),
+      connections: [],
+    };
+    await act(async () => {
+      root.render(React.createElement(SubGraphBar, {
+        contextGraphId: 'cg',
+        profile,
+        selected: null,
+        onSelect,
+        entities: [rootEntity, mkEntity('urn:e:named', 'shared', 'alpha')],
+      }));
+    });
+    await flushNet();
+    const { ROOT_SLUG_SENTINEL } = await import('../src/ui/lib/subGraphs.js');
+    const rootChip = container.querySelector('.v10-subgraph-chip-root') as HTMLButtonElement;
+    await act(async () => { rootChip.click(); });
+    expect(onSelect).toHaveBeenCalledWith(ROOT_SLUG_SENTINEL);
+  });
+
+  // S3 Codex follow-up (Issue B on PR #772). The Root chip must stay
+  // visible whenever Root is the selected scope, even after a live
+  // refresh drops the root-bucket count to 0 (e.g. the last root
+  // entity got scoped to a sub-graph). Pre-fix the chip vanished and
+  // the detail body kept Root scope with no matching active chip in
+  // the row — a confusing UI state.
+  it('keeps the Root chip visible (and active) when ROOT_SLUG_SENTINEL is selected even after the root count drops to 0', async () => {
+    const { ROOT_SLUG_SENTINEL } = await import('../src/ui/lib/subGraphs.js');
+    const rootEntity = {
+      uri: 'urn:e:root', label: 'Root', types: [],
+      trustLevel: 'working' as const,
+      layers: new Set(['working']),
+      subGraphs: new Set<string>(),
+      properties: new Map(),
+      connections: [],
+    };
+    // Initial render: one root entity, Root selected.
+    await act(async () => {
+      root.render(React.createElement(SubGraphBar, {
+        contextGraphId: 'cg',
+        profile,
+        selected: ROOT_SLUG_SENTINEL,
+        onSelect: vi.fn(),
+        entities: [rootEntity, mkEntity('urn:e:named', 'shared', 'alpha')],
+      }));
+    });
+    await flushNet();
+    {
+      const chip = container.querySelector('.v10-subgraph-chip-root') as HTMLElement | null;
+      expect(chip).toBeTruthy();
+      expect(chip!.getAttribute('data-active')).toBe('true');
+      expect(chip!.getAttribute('data-count')).toBe('1');
+    }
+    // Live-refresh: the previously-root entity has been scoped to
+    // `alpha`. The root-bucket count drops to 0, but the user is
+    // still in Root scope (selected stays ROOT_SLUG_SENTINEL).
+    const movedEntity = { ...rootEntity, subGraphs: new Set(['alpha']) };
+    await act(async () => {
+      root.render(React.createElement(SubGraphBar, {
+        contextGraphId: 'cg',
+        profile,
+        selected: ROOT_SLUG_SENTINEL,
+        onSelect: vi.fn(),
+        entities: [movedEntity, mkEntity('urn:e:named', 'shared', 'alpha')],
+      }));
+    });
+    await flushNet();
+    const chip = container.querySelector('.v10-subgraph-chip-root') as HTMLElement | null;
+    expect(chip).toBeTruthy();
+    // Still active (selected hasn't changed) and now reads 0.
+    expect(chip!.getAttribute('data-active')).toBe('true');
+    expect(chip!.getAttribute('data-count')).toBe('0');
+  });
 });

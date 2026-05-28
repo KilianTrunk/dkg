@@ -375,6 +375,12 @@ function getProjectDisplayName(projects: ContextGraph[], projectId: string): str
   return projects.find((project) => project.id === projectId)?.name ?? projectId;
 }
 
+function toContextGraphUri(projectId: string): string {
+  return projectId.startsWith('did:dkg:context-graph:')
+    ? projectId
+    : `did:dkg:context-graph:${projectId}`;
+}
+
 function normalizeAttachmentFileName(file: File): string {
   return file.name.trim();
 }
@@ -457,7 +463,7 @@ function buildAttachmentTurnSummary(
   return parts.length ? `${parts.join('; ')}.` : '';
 }
 
-function buildChatContextEntries(
+export function buildChatContextEntries(
   projects: ContextGraph[],
   activeProjectId: string | null,
   currentAgent: AgentIdentity | null,
@@ -467,8 +473,18 @@ function buildChatContextEntries(
     const displayName = getProjectDisplayName(projects, activeProjectId);
     entries.push({
       key: 'target_context_graph',
-      label: 'Target context graph',
-      value: displayName === activeProjectId ? activeProjectId : `${displayName} (${activeProjectId})`,
+      label: 'Target context graph id',
+      value: activeProjectId,
+    });
+    entries.push({
+      key: 'target_context_graph_uri',
+      label: 'Target context graph URI',
+      value: toContextGraphUri(activeProjectId),
+    });
+    entries.push({
+      key: 'target_context_graph_name',
+      label: 'Target context graph name',
+      value: displayName,
     });
   }
   if (currentAgent?.agentAddress) {

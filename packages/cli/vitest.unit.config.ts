@@ -33,6 +33,7 @@ export default defineConfig({
           'test/promote-async-daemon-lifecycle.test.ts',
           'test/async-promote-worker.test.ts',
           'test/async-promote-queue-e2e.test.ts',
+          'test/import-artifact-routes.test.ts',
           'test/skill-endpoint.test.ts',
           // RFC 120 / plan PR 1 + 2 — Blazegraph support. Pure logic
           // (mocked fetch + in-memory config); cheap to keep in the
@@ -47,6 +48,8 @@ export default defineConfig({
           // (no fetch / no docker spawn) when the env-var is unset, so
           // keeping it in the fast unit lane costs nothing.
           'test/blazegraph-integration.test.ts',
+          // #761 — context graph write-target validation (from main).
+          'test/context-graph-write-path-validation.test.ts',
         ],
     testTimeout: runsDaemonHttpBehavior ? 120_000 : 60_000,
     globalSetup: runsDaemonHttpBehavior ? ['../chain/test/hardhat-global-setup.ts'] : [],

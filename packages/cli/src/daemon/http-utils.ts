@@ -451,6 +451,250 @@ export function validateRequiredContextGraphId(
   return true;
 }
 
+const CONTEXT_GRAPH_URI_PREFIX = "did:dkg:context-graph:";
+
+export function normalizeContextGraphIdOrUri(contextGraphId: string): string {
+  return contextGraphId.startsWith(CONTEXT_GRAPH_URI_PREFIX)
+    ? contextGraphId.slice(CONTEXT_GRAPH_URI_PREFIX.length)
+    : contextGraphId;
+}
+
+type ExistingContextGraphRow = {
+  id?: unknown;
+  uri?: unknown;
+  creator?: unknown;
+  curator?: unknown;
+  accessPolicy?: unknown;
+  onChainId?: unknown;
+  isSystem?: unknown;
+  subscribed?: unknown;
+  synced?: unknown;
+};
+
+function normalizeContextGraphCallerAddress(
+  callerAgentAddress?: string | null,
+): string | null {
+  if (!callerAgentAddress) return null;
+  const didPrefix = "did:dkg:agent:";
+  const address = callerAgentAddress.startsWith(didPrefix)
+    ? callerAgentAddress.slice(didPrefix.length)
+    : callerAgentAddress;
+  return /^0x[0-9a-fA-F]{40}$/.test(address) ? address : null;
+}
+
+function uniqueStrings(values: Iterable<string>): string[] {
+  return [...new Set(values)];
+}
+
+function isWalletScopedContextGraphId(id: string): boolean {
+  return /^0x[0-9a-fA-F]{40}\//.test(id);
+}
+
+function isShadowLikeBareContextGraphRow(row: ExistingContextGraphRow): boolean {
+  const id = typeof row.id === "string" ? row.id : "";
+  if (!id || id.includes("/")) return false;
+  return (
+    typeof row.creator !== "string" &&
+    typeof row.curator !== "string" &&
+    typeof row.accessPolicy !== "string" &&
+    typeof row.onChainId !== "string" &&
+    row.subscribed !== true
+  );
+}
+
+async function contextGraphRowIsWritable(
+  agent: {
+    contextGraphHasLocalContent?: (contextGraphId: string) => Promise<boolean>;
+    contextGraphExists?: (contextGraphId: string) => Promise<boolean>;
+  },
+  row: ExistingContextGraphRow,
+): Promise<boolean> {
+  if (row.isSystem === true || (row.subscribed === true && row.synced === true)) {
+    return true;
+  }
+  const id = typeof row.id === "string" ? row.id : "";
+  if (!id) return false;
+  if (agent.contextGraphHasLocalContent && await agent.contextGraphHasLocalContent(id)) {
+    return true;
+  }
+  if (
+    row.subscribed !== true &&
+    !isShadowLikeBareContextGraphRow(row) &&
+    agent.contextGraphExists
+  ) {
+    return agent.contextGraphExists(id);
+  }
+  return false;
+}
+
+function rejectKnownNonWritableContextGraph(
+  res: ServerResponse,
+  raw: string,
+): null {
+  jsonResponse(res, 400, {
+    code: "CONTEXT_GRAPH_NOT_WRITABLE",
+    error:
+      `Context graph "${raw}" is known but is not locally synced for writes. ` +
+      `Subscribe/sync the context graph first, then retry the write.`,
+  });
+  return null;
+}
+
+/**
+ * Resolve a write target to a known, canonical context graph id.
+ *
+ * The storage layer auto-materializes named graphs on first insert, so syntax
+ * validation is not enough for mutation routes. This helper fail-closes before
+ * callers reach agent/publisher/storage code that would create a shadow CG.
+ */
+export async function resolveRequiredWriteContextGraphId(
+  agent: {
+    listContextGraphs(opts?: {
+      callerAgentAddress?: string | null;
+    }): Promise<ExistingContextGraphRow[]>;
+    contextGraphHasLocalContent?: (contextGraphId: string) => Promise<boolean>;
+    contextGraphExists?: (contextGraphId: string) => Promise<boolean>;
+  },
+  contextGraphId: unknown,
+  res: ServerResponse,
+  opts: {
+    callerAgentAddress?: string | null;
+    requireLocalWritable?: boolean;
+    allowLocalExactFallback?: boolean;
+  } = {},
+): Promise<string | null> {
+  if (!validateRequiredContextGraphId(contextGraphId, res)) return null;
+
+  const raw = (contextGraphId as string).trim();
+  const candidateId = normalizeContextGraphIdOrUri(raw);
+  const requireLocalWritable = opts.requireLocalWritable !== false;
+  const candidateValidation = validateContextGraphId(candidateId);
+  if (!candidateValidation.valid) {
+    jsonResponse(res, 400, {
+      error: `Invalid "contextGraphId": ${candidateValidation.reason}`,
+    });
+    return null;
+  }
+
+  let contextGraphs: ExistingContextGraphRow[];
+  try {
+    const callerAgentAddress = normalizeContextGraphCallerAddress(
+      opts.callerAgentAddress,
+    );
+    contextGraphs = callerAgentAddress
+      ? await agent.listContextGraphs({ callerAgentAddress })
+      : await agent.listContextGraphs();
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    jsonResponse(res, 500, {
+      error: `Failed to validate contextGraphId against known context graphs: ${message}`,
+    });
+    return null;
+  }
+
+  const knownIds = contextGraphs
+    .map((row) => (typeof row.id === "string" ? row.id : ""))
+    .filter((id) => id.length > 0);
+
+  const isBareCandidateId = !candidateId.includes("/");
+  const exact = contextGraphs.find((row) => {
+    const id = typeof row.id === "string" ? row.id : "";
+    const uri = typeof row.uri === "string" ? row.uri : "";
+    return id === candidateId || uri === raw;
+  });
+  let exactWritable = false;
+  if (exact?.id && typeof exact.id === "string") {
+    try {
+      exactWritable = await contextGraphRowIsWritable(agent, exact);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      jsonResponse(res, 500, {
+        error: `Failed to validate contextGraphId local writability: ${message}`,
+      });
+      return null;
+    }
+  }
+  if (isBareCandidateId) {
+    const suffixMatches = uniqueStrings(
+      knownIds.filter((id) =>
+        isWalletScopedContextGraphId(id) && id.endsWith(`/${candidateId}`),
+      ),
+    );
+    if (exact?.id && typeof exact.id === "string" && suffixMatches.length > 0 && exactWritable) {
+      return exact.id;
+    }
+    if (
+      exact?.id &&
+      typeof exact.id === "string" &&
+      suffixMatches.length > 0 &&
+      !isShadowLikeBareContextGraphRow(exact)
+    ) {
+      if (requireLocalWritable && !exactWritable) {
+        return rejectKnownNonWritableContextGraph(res, raw);
+      }
+      return exact.id;
+    }
+    if (suffixMatches.length === 1) {
+      const canonicalContextGraphId = suffixMatches[0];
+      jsonResponse(res, 400, {
+        code: "CONTEXT_GRAPH_ID_NOT_CANONICAL",
+        error:
+          `Context graph id "${candidateId}" matches a curated context graph. ` +
+          `Use canonical contextGraphId "${canonicalContextGraphId}".`,
+        canonicalContextGraphId,
+      });
+      return null;
+    }
+    if (suffixMatches.length > 1) {
+      jsonResponse(res, 400, {
+        code: "CONTEXT_GRAPH_ID_AMBIGUOUS",
+        error:
+          `Context graph id "${candidateId}" matches multiple context graphs. ` +
+          `Use one of the canonical contextGraphIds from canonicalContextGraphIds.`,
+        canonicalContextGraphIds: suffixMatches,
+      });
+      return null;
+    }
+    if (exact?.id && typeof exact.id === "string") {
+      if (requireLocalWritable && !exactWritable) {
+        return rejectKnownNonWritableContextGraph(res, raw);
+      }
+      return exact.id;
+    }
+  }
+
+  if (exact?.id && typeof exact.id === "string") {
+    if (requireLocalWritable && !exactWritable) {
+      return rejectKnownNonWritableContextGraph(res, raw);
+    }
+    return exact.id;
+  }
+
+  if (opts.allowLocalExactFallback && agent.contextGraphExists) {
+    try {
+      if (await agent.contextGraphExists(candidateId)) {
+        return candidateId;
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      jsonResponse(res, 500, {
+        error: `Failed to validate contextGraphId local existence: ${message}`,
+      });
+      return null;
+    }
+  }
+
+  jsonResponse(res, 400, {
+    code: "CONTEXT_GRAPH_NOT_FOUND",
+    error:
+      `Unknown contextGraphId "${raw}". Write operations must target an existing ` +
+      `context graph. Use /api/context-graph/list or dkg_list_context_graphs and ` +
+      `pass the canonical id (for curated graphs, "<curatorAddress>/<slug>") ` +
+      `or full did:dkg:context-graph:... URI.`,
+  });
+  return null;
+}
+
 export function validateEntities(entities: unknown, res: ServerResponse): boolean {
   if (entities === undefined || entities === null || entities === "all")
     return true;

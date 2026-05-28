@@ -133,7 +133,7 @@ const PINNED_DIGESTS: Record<string, string> = {
   // + the `CiphertextChunksCommitmentSet` event surface that
   // `KnowledgeAssetsV10._executeUpdateCore` emits when a non-zero pair
   // rotates the commitment.
-  KnowledgeAssetsV10:           '6f186793993c18c40a212d2e2a663689b520cf96f351e86492a23a75416c417c',
+  KnowledgeAssetsV10:           'e42e64493eb788474c3134a5371d22814d80909fbbd69dbab77f858466d7813f',
   KnowledgeCollectionStorage:   '8c0e6e3b19f072b15f6c54852ff0a58ffc0dffddb9676d221de78b8019d32bdd',
   // V8 `KnowledgeCollection` ABI was moved to `abi/archive/` in
   // `archive-non-v10-contracts`; the pin entry is intentionally dropped.
@@ -156,7 +156,7 @@ const PINNED_DIGESTS: Record<string, string> = {
   ContextGraphStorage:          '295160a2bb171dae51fb791d2a8642b22196ede95f3308366589edaea40d22cb',
   // Identity / staking — consulted on every publish.
   Hub:                          '36976cc71bb87963b8b715791b32e4eb6b7bb85c712998afd6184221289a506b',
-  Identity:                     '29d09dd97de53de69d5bf2282d2f3008044ab43fb86c812fc4912552c9288946',
+  Identity:                     'ca39efe9bd9ec4fd8ae67dccdf9eb888bf91232341c3a56216624477620ff4d8',
   IdentityStorage:              'd7c58ba8ae28523dc1a6ff0bc228a3bceb9d327e53d258099dada656db262479',
   // Updated PR #470 round 2: `MAX_PUBLISHING_CONVICTION_EPOCHS = 60`
   // exposed as a public constant + tightened bound in

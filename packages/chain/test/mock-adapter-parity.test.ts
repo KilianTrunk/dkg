@@ -106,6 +106,10 @@ const MOCK_EXEMPT_FROM_EVM = new Set<string>([
   'sendContractTransaction',
   'parseV10PublishReceipt',
   'parseV9PublishReceipt',
+  // TS-private V10 TRAC-allowance helper backing publish/update. Encodes
+  // the `chain.approvalPolicy` dispatch and the `transferFrom(..., 1n)`
+  // floor; the mock has no ERC-20 allowance surface to mirror.
+  'ensureV10ApproveTrac',
   // Lazy-cache helpers for frequently-resolved contracts — TS-private,
   // not part of the ChainAdapter interface.
   'getIdentityStorage',

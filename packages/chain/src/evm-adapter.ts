@@ -50,6 +50,7 @@ import { PcaUnavailableError } from './pca-errors.js';
 import {
   buildAuthorAttestationTypedData,
   AUTHOR_SCHEME_VERSION_V1,
+  floorPublishTokenAmount,
 } from '@origintrail-official/dkg-core';
 
 /**
@@ -2457,6 +2458,13 @@ export class EVMChainAdapter implements ChainAdapter {
     // types in `KnowledgeAssetsV10.sol` (RFC-001 author-attestation
     // shape). ethers v6 encodes object literals to solidity structs
     // positionally by field name.
+    // KAV10 10.1.1 strict-positive `tokenAmount` floor: the contract now
+    // reverts on `tokenAmount == 0`. Free-publish flows (devnets where
+    // `ask == 0`) used to round to 1 wei-TRAC silently inside the
+    // direct-spend branch; clamp here so they keep working. Matches the
+    // same floor inside `computePublishACKDigest`, so the on-chain ACK
+    // recovery hashes the same `tokenAmount` the contract receives.
+    const flooredTokenAmount = floorPublishTokenAmount(params.tokenAmount);
     const publishParamsStruct = {
       publishOperationId: params.publishOperationId,
       contextGraphId: params.contextGraphId,
@@ -2464,7 +2472,7 @@ export class EVMChainAdapter implements ChainAdapter {
       knowledgeAssetsAmount: params.knowledgeAssetsAmount,
       byteSize: params.byteSize,
       epochs: params.epochs,
-      tokenAmount: params.tokenAmount,
+      tokenAmount: flooredTokenAmount,
       isImmutable: params.isImmutable,
       merkleLeafCount: params.merkleLeafCount,
       // RFC-39 Phase A.5 / LU-11 — ciphertext-commitment pair.
@@ -2788,7 +2796,14 @@ export class EVMChainAdapter implements ChainAdapter {
       } catch { /* use 0 */ }
     }
     const baseTokenAmount = params.newTokenAmount ?? currentTokenAmount;
-    const newTokenAmount = baseTokenAmount > requiredForNewSize ? baseTokenAmount : requiredForNewSize;
+    // KAV10 10.1.1: floor at 1n so the contract's strict-positive
+    // `_validateTokenAmount` check accepts metadata-only updates where
+    // both the carry-forward amount and the size-derived requirement are
+    // 0. The same floor runs through both the inline ACK-digest hash
+    // below and (canonically) `computeUpdateACKDigest`.
+    const newTokenAmount = floorPublishTokenAmount(
+      baseTokenAmount > requiredForNewSize ? baseTokenAmount : requiredForNewSize,
+    );
 
     // Look up the contextGraphId for this KC
     const contextGraphStorage = this.contracts.contextGraphStorage;

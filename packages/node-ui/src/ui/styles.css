@@ -7532,11 +7532,11 @@ body.light .guardian-view {
   position: fixed;
   inset: var(--header-h) 0 0 0;
   pointer-events: none;
-  opacity: 0.28;
+  opacity: 0.14;
   background-image: radial-gradient(currentColor 1px, transparent 1px);
-  background-size: 22px 22px;
+  background-size: 28px 28px;
   color: var(--text-tertiary);
-  mask-image: linear-gradient(to bottom, black, transparent 78%);
+  mask-image: linear-gradient(to bottom, black, transparent 64%);
 }
 .guardian-hero,
 .guardian-stats,
@@ -7566,6 +7566,15 @@ body.light .guardian-view {
   font-size: 34px;
   line-height: 1;
   letter-spacing: 0;
+  text-wrap: balance;
+}
+.guardian-hero-copy {
+  max-width: 680px;
+  margin-top: 8px;
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.5;
+  text-wrap: pretty;
 }
 .guardian-actions {
   display: flex;
@@ -7579,19 +7588,36 @@ body.light .guardian-view {
   align-items: center;
   justify-content: center;
   gap: 7px;
-  min-height: 34px;
+  min-height: 40px;
   border: 1px solid var(--border-default);
   background: var(--bg-surface);
   color: var(--text-primary);
   border-radius: 8px;
-  padding: 7px 11px;
+  padding: 8px 12px;
   font-size: 12px;
   font-weight: 700;
+  transition-property: transform, border-color, background-color, color;
+  transition-duration: 160ms;
+  transition-timing-function: cubic-bezier(0.2, 0, 0, 1);
+}
+.guardian-icon-button {
+  width: 40px;
+  padding: 0;
 }
 .guardian-button:hover,
 .guardian-icon-button:hover {
   border-color: var(--border-strong);
   background: var(--bg-hover);
+}
+.guardian-button:active,
+.guardian-icon-button:active {
+  transform: scale(0.96);
+}
+.guardian-button:focus-visible,
+.guardian-icon-button:focus-visible,
+.guardian-test-prompt:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent-blue) 70%, transparent);
+  outline-offset: 2px;
 }
 .guardian-button-primary {
   background: var(--text-primary);
@@ -7639,6 +7665,7 @@ body.light .guardian-button-primary {
   background: color-mix(in srgb, var(--bg-surface) 92%, transparent);
   border-radius: 8px;
   padding: 14px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.10);
 }
 .guardian-stat-icon {
   width: 36px;
@@ -7663,6 +7690,7 @@ body.light .guardian-button-primary {
   font-size: 24px;
   font-weight: 800;
   line-height: 1.1;
+  font-variant-numeric: tabular-nums;
 }
 .guardian-stat-detail {
   color: var(--text-secondary);
@@ -7670,7 +7698,7 @@ body.light .guardian-button-primary {
 }
 .guardian-grid {
   display: grid;
-  grid-template-columns: minmax(420px, 1.15fr) minmax(340px, 0.85fr);
+  grid-template-columns: minmax(420px, 1.16fr) minmax(260px, 0.84fr);
   gap: 12px;
   align-items: start;
 }
@@ -7680,12 +7708,12 @@ body.light .guardian-button-primary {
   background: color-mix(in srgb, var(--bg-surface) 92%, transparent);
   border-radius: 8px;
   overflow: hidden;
+  box-shadow: 0 16px 42px rgba(0,0,0,0.16);
 }
 .guardian-panel-wide { grid-column: span 1; }
-.guardian-panel-findings {
-  grid-row: span 3;
+.guardian-panel-events {
+  grid-row: span 5;
 }
-.guardian-panel-events,
 .guardian-panel-deps {
   grid-column: span 2;
 }
@@ -7726,6 +7754,26 @@ body.light .guardian-button-primary {
 }
 .guardian-event-row {
   align-items: start;
+  position: relative;
+  min-height: 64px;
+}
+.guardian-event-row::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 3px;
+  background: transparent;
+}
+.guardian-event-failed::before { background: var(--accent-red); }
+.guardian-event-warning::before { background: var(--accent-amber); }
+.guardian-event-ok:hover,
+.guardian-agent-row:hover,
+.guardian-graph-row:hover,
+.guardian-finding-row:hover,
+.guardian-dep-row:hover {
+  background: color-mix(in srgb, var(--bg-hover) 60%, transparent);
 }
 .guardian-agent-row { grid-template-columns: auto minmax(0, 1fr); }
 .guardian-event-row:last-child,
@@ -7750,6 +7798,45 @@ body.light .guardian-button-primary {
   font-weight: 750;
   overflow-wrap: anywhere;
 }
+.guardian-row-title-line,
+.guardian-agent-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.guardian-row-title-line {
+  justify-content: space-between;
+}
+.guardian-event-kind,
+.guardian-agent-state {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  min-height: 20px;
+  border-radius: 999px;
+  padding: 1px 7px;
+  border: 1px solid var(--border-subtle);
+  color: var(--text-tertiary);
+  background: color-mix(in srgb, var(--bg-root) 70%, transparent);
+  font-size: 10px;
+  font-style: normal;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+.guardian-agent-state.active {
+  color: var(--accent-green);
+  border-color: rgba(34,197,94,0.32);
+  background: rgba(34,197,94,0.10);
+}
+.guardian-agent-state.seen {
+  color: var(--accent-blue);
+  border-color: rgba(59,130,246,0.28);
+  background: rgba(59,130,246,0.09);
+}
+.guardian-agent-state.offline {
+  color: var(--text-tertiary);
+}
 .guardian-row-meta,
 .guardian-agent-row small,
 .guardian-graph-main small,
@@ -7765,12 +7852,39 @@ body.light .guardian-button-primary {
 .guardian-event-detail {
   margin-top: 7px;
 }
+.guardian-event-summary {
+  margin: 6px 0 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.45;
+}
+.guardian-event-output {
+  margin: 8px 0 0;
+  max-height: 86px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text-secondary);
+  background: color-mix(in srgb, var(--bg-root) 78%, transparent);
+  border: 1px solid var(--border-subtle);
+  border-radius: 6px;
+  padding: 8px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.45;
+}
+.guardian-event-failed .guardian-event-output {
+  color: color-mix(in srgb, var(--accent-red) 72%, var(--text-primary));
+  border-color: rgba(239,68,68,0.28);
+  background: rgba(239,68,68,0.07);
+}
 .guardian-event-detail summary {
   cursor: pointer;
   color: var(--text-secondary);
   font-size: 11px;
   font-weight: 800;
   text-transform: uppercase;
+  font-variant-numeric: tabular-nums;
 }
 .guardian-event-detail pre,
 .guardian-evidence pre {
@@ -7849,6 +7963,11 @@ body.light .guardian-button-primary {
   border-left: 2px solid var(--border-strong);
   padding-left: 10px;
 }
+.guardian-empty-good {
+  color: var(--accent-green);
+  border-color: rgba(34,197,94,0.28);
+  background: rgba(34,197,94,0.07);
+}
 .guardian-agent-icon,
 .guardian-graph-icon {
   width: 30px;
@@ -7875,6 +7994,54 @@ body.light .guardian-button-primary {
   min-height: 58px;
   padding: 10px 13px;
   border-bottom: 1px solid var(--border-subtle);
+}
+.guardian-test-copy {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+}
+.guardian-test-copy p {
+  margin: 0 0 3px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.45;
+}
+.guardian-test-prompt {
+  width: 100%;
+  min-height: 40px;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  text-align: left;
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--bg-root) 68%, transparent);
+  color: var(--text-primary);
+  padding: 9px 10px;
+  transition-property: transform, border-color, background-color;
+  transition-duration: 160ms;
+  transition-timing-function: cubic-bezier(0.2, 0, 0, 1);
+}
+.guardian-test-prompt:hover {
+  border-color: var(--border-strong);
+  background: var(--bg-hover);
+}
+.guardian-test-prompt:active {
+  transform: scale(0.96);
+}
+.guardian-test-prompt span {
+  min-width: 0;
+  color: var(--text-primary);
+  font-size: 12px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+.guardian-test-prompt small {
+  color: var(--text-tertiary);
+  font-size: 10px;
+  font-weight: 800;
+  text-transform: uppercase;
 }
 .guardian-dep-package,
 .guardian-dep-advisory,
@@ -7948,12 +8115,18 @@ body.light .guardian-button-primary {
   .guardian-panel-findings,
   .guardian-panel-events,
   .guardian-panel-deps { grid-column: span 1; }
+  .guardian-panel-events { grid-row: auto; }
 }
 @media (max-width: 720px) {
   .guardian-view { padding: 16px; }
   .guardian-hero { align-items: stretch; flex-direction: column; }
   .guardian-actions { justify-content: flex-start; }
   .guardian-stats { grid-template-columns: 1fr; }
+  .guardian-row-title-line,
+  .guardian-agent-name {
+    align-items: flex-start;
+    flex-direction: column;
+  }
   .guardian-dep-row {
     grid-template-columns: 1fr;
     align-items: start;

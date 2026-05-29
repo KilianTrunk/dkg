@@ -174,7 +174,15 @@ export async function handleEventsQuery(
     { ...params, subGraphName: config.subGraphName, limit: perPage + 1, offset },
     config.contextGraphId,
   );
-  const result = await config.queryEngine.query(sparql, { contextGraphId: config.contextGraphId });
+  // The EPCIS query always references the context graph's `_private`
+  // partition (the branch that surfaces private-anchored events), so the
+  // scoped query must opt into private-graph access. Without this the
+  // engine's scope guard rejects every events query with
+  // "GRAPH <…/_private> is outside the allowed graph set".
+  const result = await config.queryEngine.query(sparql, {
+    contextGraphId: config.contextGraphId,
+    includePrivate: true,
+  });
 
   const hasMore = result.bindings.length > perPage;
   const bindings = hasMore ? result.bindings.slice(0, perPage) : result.bindings;

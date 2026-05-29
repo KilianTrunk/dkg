@@ -9146,6 +9146,13 @@ export class DKGAgent {
       includeSharedMemory?: boolean;
       /** @deprecated Use includeSharedMemory */
       includeWorkspace?: boolean;
+      /**
+       * Opt-in: allow the scoped query to reference the context graph's own
+       * `_private` partition (excluded from the scope guard's allow-set by
+       * default). Used by the EPCIS events query, whose SPARQL always names
+       * `<cg>/_private`. Does not widen access for other callers.
+       */
+      includePrivate?: boolean;
       operationCtx?: OperationContext;
       view?: GetView;
       agentAddress?: string;
@@ -9365,6 +9372,7 @@ export class DKGAgent {
       excludeGraphPrefixes,
       graphSuffix: opts.graphSuffix,
       includeSharedMemory: opts.includeSharedMemory,
+      includePrivate: opts.includePrivate,
       view: opts.view,
       agentAddress: agentAddressStr ?? (opts.view === 'working-memory' ? this.peerId : undefined),
       verifiedGraph: opts.verifiedGraph,

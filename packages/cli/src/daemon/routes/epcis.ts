@@ -438,7 +438,7 @@ export async function handleEpcisRoutes(ctx: RequestContext): Promise<void> {
     if (!sg.ok) return jsonResponse(res, sg.status, sg.body);
 
     const epcisQueryEngine = {
-      query: (sparql: string, opts?: { contextGraphId?: string }) =>
+      query: (sparql: string, opts?: { contextGraphId?: string; includePrivate?: boolean }) =>
         agent.query(sparql, opts),
     };
     try {

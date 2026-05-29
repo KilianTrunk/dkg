@@ -80,7 +80,9 @@ describe('handleEventsQuery', () => {
 
     expect(calls).toHaveLength(1);
     expect(calls[0].sparql).toContain('GRAPH <did:dkg:context-graph:test-cg>');
-    expect(calls[0].opts).toEqual({ contextGraphId: CONTEXT_GRAPH_ID });
+    // The events query references the CG's `_private` partition, so the
+    // engine must be told to allow it (else the scope guard rejects it).
+    expect(calls[0].opts).toEqual({ contextGraphId: CONTEXT_GRAPH_ID, includePrivate: true });
   });
 
   it('returns multiple events in eventList', async () => {

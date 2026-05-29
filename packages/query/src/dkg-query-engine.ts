@@ -4,7 +4,7 @@ import type { QueryResult, QueryOptions, QueryEngine } from './query-engine.js';
 import {
   contextGraphDataUri, contextGraphSharedMemoryUri, contextGraphVerifiedMemoryUri, contextGraphAssertionUri,
   contextGraphSubGraphUri, contextGraphMetaUri, contextGraphSharedMemoryMetaUri,
-  contextGraphSubGraphMetaUri,
+  contextGraphSubGraphMetaUri, contextGraphPrivateUri, contextGraphSubGraphPrivateUri,
   assertSafeIri, escapeSparqlLiteral, validateSubGraphName,
   type GetView,
   REMOVED_VIEWS,
@@ -255,8 +255,21 @@ export class DKGQueryEngine implements QueryEngine {
             ]),
         contextGraphSharedMemoryMetaUri(effectiveContextGraphId, subGraphName),
       ];
-      const explicitAllowedGraphs = [...allowedGraphs, ...metaAllowList];
-      const variableAllowedGraphs = [...allowedGraphs, ...metaAllowList];
+      // `_private` is excluded from the allow-set by default (it is more
+      // sensitive than the `_meta` graphs above). Only callers that opt in
+      // via `includePrivate` may name the CG's own private partition — the
+      // EPCIS events query does this to surface private-anchored events to
+      // the hosting node. This stays strictly within the queried CG, so it
+      // is not a cross-CG leak, and it does not widen any other caller.
+      const privateAllowList = options?.includePrivate
+        ? [
+            subGraphName
+              ? contextGraphSubGraphPrivateUri(effectiveContextGraphId, subGraphName)
+              : contextGraphPrivateUri(effectiveContextGraphId),
+          ]
+        : [];
+      const explicitAllowedGraphs = [...allowedGraphs, ...metaAllowList, ...privateAllowList];
+      const variableAllowedGraphs = [...allowedGraphs, ...metaAllowList, ...privateAllowList];
       // Codex r5 RED on #776: dynamic sub-graph metadata enumeration
       // (originally added to fix `useSwmAttributions` /
       // `useVerifiedMemoryAnchors` / `useVerifiedEntityIdentity`

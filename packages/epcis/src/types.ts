@@ -95,7 +95,16 @@ export interface EpcisQueryParams {
 export interface QueryEngine {
   query(
     sparql: string,
-    opts?: { contextGraphId?: string },
+    opts?: {
+      contextGraphId?: string;
+      /**
+       * Allow the scoped query to reference the context graph's own
+       * `_private` partition. The EPCIS events query always references
+       * `<cg>/_private`, so this must be set or the engine's scope guard
+       * rejects the query.
+       */
+      includePrivate?: boolean;
+    },
   ): Promise<{ bindings: Record<string, string>[] }>;
 }
 

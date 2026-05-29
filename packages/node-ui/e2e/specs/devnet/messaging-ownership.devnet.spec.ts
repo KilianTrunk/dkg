@@ -35,8 +35,9 @@ test.describe('Inter-node messaging (devnet API)', () => {
   });
 
   test('memory sessions endpoint responds (messaging persistence surface)', async () => {
+    // `/api/memory/sessions` is served by the UI proxy layer; daemon may 404.
     const res = await devnetApiFetch('/api/memory/sessions?limit=5');
-    expect(res.status).toBeLessThan(500);
+    expect([200, 404]).toContain(res.status);
   });
 });
 

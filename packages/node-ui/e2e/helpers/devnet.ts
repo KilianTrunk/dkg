@@ -52,6 +52,8 @@ export async function devnetApiFetch(
   if (!node) {
     throw new Error(`Devnet node${init.nodeNum ?? 1} not running`);
   }
+  // UI alias paths that the daemon exposes under a different route.
+  const daemonPath = path === '/api/context-graphs' ? '/api/context-graph/list' : path;
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     ...(init.headers as Record<string, string>),
@@ -60,7 +62,7 @@ export async function devnetApiFetch(
     headers.Authorization = `Bearer ${node.authToken}`;
   }
   const { nodeNum: _n, ...rest } = init;
-  return fetch(`http://127.0.0.1:${node.apiPort}${path}`, { ...rest, headers });
+  return fetch(`http://127.0.0.1:${node.apiPort}${daemonPath}`, { ...rest, headers });
 }
 
 export async function waitForDevnetStatus(

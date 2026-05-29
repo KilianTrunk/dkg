@@ -76,10 +76,17 @@ curl -s "http://127.0.0.1:${API_PORT}/api/status" > /dev/null \
 [ -f "$CLI_JS" ]         || fail "missing $CLI_JS (run pnpm run build)"
 [ -f "$DAEMON_LOG" ]     || fail "missing $DAEMON_LOG"
 
-for abi in ContextGraphs ContextGraphStorage IdentityStorage KnowledgeCollectionStorage; do
+for abi in ContextGraphs ContextGraphStorage IdentityStorage; do
   [ -f "$EVM_ABI_DIR/${abi}.json" ] \
     || fail "missing ABI: $EVM_ABI_DIR/${abi}.json"
 done
+if [ -f "$EVM_ABI_DIR/DKGKnowledgeAssets.json" ]; then
+  KCS_ABI="DKGKnowledgeAssets.json"
+elif [ -f "$EVM_ABI_DIR/KnowledgeCollectionStorage.json" ]; then
+  KCS_ABI="KnowledgeCollectionStorage.json"
+else
+  fail "missing ABI: $EVM_ABI_DIR/DKGKnowledgeAssets.json (or legacy KnowledgeCollectionStorage.json)"
+fi
 
 log "Preconditions OK (hardhat pid=$HARDHAT_PID, node $NODE_NUM pid=$NODE_PID, api :$API_PORT)"
 

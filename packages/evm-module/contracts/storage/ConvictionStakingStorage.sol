@@ -10,6 +10,7 @@ import {IVersioned} from "../interfaces/IVersioned.sol";
 import {HubLib} from "../libraries/HubLib.sol";
 import {StakingLib} from "../libraries/StakingLib.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 /**
  * @title ConvictionStakingStorage
@@ -70,6 +71,8 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
  *     consumers that need them should settle and read "current" state.
  */
 contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
+    using SafeERC20 for IERC20;
+
     string private constant _NAME = "ConvictionStakingStorage";
     // Version history:
     //   1.1.0 — split-bucket rewards, discrete tier ladder.
@@ -1446,7 +1449,7 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
     // ============================================================
 
     function transferStake(address receiver, uint96 stakeAmount) external onlyContracts {
-        tokenContract.transfer(receiver, stakeAmount);
+        tokenContract.safeTransfer(receiver, stakeAmount);
         emit StakedTokensTransferred(receiver, stakeAmount);
     }
 

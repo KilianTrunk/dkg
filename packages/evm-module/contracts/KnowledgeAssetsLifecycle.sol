@@ -1037,6 +1037,9 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
     /// @dev Protocol treasury fee (in TRAC) skimmed from `amount`. Returns
     ///      `(0, address(0))` while no treasury is wired or the fee is 0, so
     ///      callers can branch on `treasury != address(0)`.
+    /// @param amount Gross staker-bound TRAC the fee is computed against.
+    /// @return fee Treasury cut in TRAC (0 when no treasury or 0 bps).
+    /// @return treasury Configured `protocolTreasury` (address(0) when unset).
     function _treasuryFee(uint96 amount) internal view returns (uint96 fee, address treasury) {
         treasury = parametersStorage.protocolTreasury();
         if (treasury == address(0)) {

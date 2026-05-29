@@ -4,7 +4,7 @@ import type { QueryResult, QueryOptions, QueryEngine } from './query-engine.js';
 import {
   contextGraphDataUri, contextGraphSharedMemoryUri, contextGraphVerifiedMemoryUri, contextGraphAssertionUri,
   contextGraphSubGraphUri, contextGraphMetaUri, contextGraphSharedMemoryMetaUri,
-  contextGraphSubGraphMetaUri,
+  contextGraphSubGraphMetaUri, contextGraphPrivateUri, contextGraphSubGraphPrivateUri,
   assertSafeIri, escapeSparqlLiteral, validateSubGraphName,
   type GetView,
   REMOVED_VIEWS,
@@ -248,15 +248,39 @@ export class DKGQueryEngine implements QueryEngine {
       const metaAllowList = [
         ...(isSwmOnlyRoute
           ? []
-          : [
-              subGraphName
-                ? contextGraphSubGraphMetaUri(effectiveContextGraphId, subGraphName)
-                : contextGraphMetaUri(effectiveContextGraphId),
-            ]),
+          : subGraphName
+            ? [
+                // Sub-graph metadata graph (`<cg>/<sub>/_meta`).
+                contextGraphSubGraphMetaUri(effectiveContextGraphId, subGraphName),
+                // Root CG metadata graph (`<cg>/_meta`). Canonical KA provenance
+                // (`rootEntity` / `partOf` / `confirmed` status) is written to the
+                // ROOT `_meta` even for sub-graph publishes — see
+                // `finalization-handler.ts` (the confirmed-meta writes hardcode
+                // `<cg>/_meta`). A sub-graph-scoped reader (e.g. the EPCIS events
+                // query) joins provenance from there, so the root `_meta` must be
+                // admitted alongside the sub-graph `_meta`. Both are within the
+                // same `contextGraphId`, so this does not cross the privacy
+                // boundary (which is the CG scope itself).
+                contextGraphMetaUri(effectiveContextGraphId),
+              ]
+            : [contextGraphMetaUri(effectiveContextGraphId)]),
         contextGraphSharedMemoryMetaUri(effectiveContextGraphId, subGraphName),
       ];
-      const explicitAllowedGraphs = [...allowedGraphs, ...metaAllowList];
-      const variableAllowedGraphs = [...allowedGraphs, ...metaAllowList];
+      // `_private` is excluded from the allow-set by default (it is more
+      // sensitive than the `_meta` graphs above). Only callers that opt in
+      // via `includePrivate` may name the CG's own private partition — the
+      // EPCIS events query does this to surface private-anchored events to
+      // the hosting node. This stays strictly within the queried CG, so it
+      // is not a cross-CG leak, and it does not widen any other caller.
+      const privateAllowList = options?.includePrivate
+        ? [
+            subGraphName
+              ? contextGraphSubGraphPrivateUri(effectiveContextGraphId, subGraphName)
+              : contextGraphPrivateUri(effectiveContextGraphId),
+          ]
+        : [];
+      const explicitAllowedGraphs = [...allowedGraphs, ...metaAllowList, ...privateAllowList];
+      const variableAllowedGraphs = [...allowedGraphs, ...metaAllowList, ...privateAllowList];
       // Codex r5 RED on #776: dynamic sub-graph metadata enumeration
       // (originally added to fix `useSwmAttributions` /
       // `useVerifiedMemoryAnchors` / `useVerifiedEntityIdentity`

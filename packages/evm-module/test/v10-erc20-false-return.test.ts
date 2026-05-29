@@ -1,7 +1,7 @@
 import { randomBytes } from 'crypto';
 
 import { SignerWithAddress } from '@nomicfoundation/hardhat-ethers/signers';
-import { loadFixture } from '@nomicfoundation/hardhat-network-helpers';
+import { loadFixture, time } from '@nomicfoundation/hardhat-network-helpers';
 import { expect } from 'chai';
 import hre from 'hardhat';
 
@@ -134,5 +134,26 @@ describe('@integration V10 ERC-20 false-return staking guards', () => {
     const positionAfter = await ConvictionStakingStorageContract.getPosition(1);
     expect(positionAfter.identityId).to.equal(positionBefore.identityId);
     expect(positionAfter.raw).to.equal(positionBefore.raw);
+  });
+
+  it('keeps the operator-fee withdrawal request when finalization transfer returns false', async () => {
+    const { identityId } = await createProfile();
+    const amount = hre.ethers.parseEther('1000');
+    const token = await useFalseReturnToken();
+
+    await token.mint(await ConvictionStakingStorageContract.getAddress(), amount);
+    await ConvictionStakingStorageContract.increaseOperatorFeeBalance(identityId, amount);
+    await StakingV10Contract.requestOperatorFeeWithdrawal(identityId, amount);
+
+    const requestBefore = await ConvictionStakingStorageContract.getOperatorFeeWithdrawalRequest(identityId);
+    await time.increaseTo(requestBefore[2]);
+    await token.setTransferReturnsFalse(true);
+
+    await expect(StakingV10Contract.finalizeOperatorFeeWithdrawal(identityId)).to.be.reverted;
+
+    const requestAfter = await ConvictionStakingStorageContract.getOperatorFeeWithdrawalRequest(identityId);
+    expect(requestAfter[0]).to.equal(requestBefore[0]);
+    expect(requestAfter[1]).to.equal(requestBefore[1]);
+    expect(requestAfter[2]).to.equal(requestBefore[2]);
   });
 });

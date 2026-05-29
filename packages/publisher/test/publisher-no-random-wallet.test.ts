@@ -40,6 +40,25 @@ import { ethers } from 'ethers';
 import { wrapPublisherForTest, mockSealCtx, updateSealed } from './_helpers/seal.js';
 import { mockChainStubACKProvider } from './_helpers/acks.js';
 
+// Greenfield (PR #815): the confirmed UAL embeds the DKGKnowledgeAssets
+// storage address resolved via `getDKGKnowledgeAssetsAddress()`, not the
+// publisher address. Asserting only the UAL shape (40-hex) would still pass
+// if the publisher embedded the zero address, the legacy storage contract,
+// or any other 40-hex value. Compare the embedded address against the
+// adapter's resolved storage address so the specific result stays covered.
+async function expectUalEmbedsStorageAddress(
+  ual: string | undefined,
+  chain: { getDKGKnowledgeAssetsAddress(): Promise<string> },
+  tokenId: number,
+): Promise<void> {
+  expect(ual).toMatch(/^did:dkg:mock:31337\/0x[0-9a-fA-F]{40}\/\d+$/);
+  const [, embeddedAddr, embeddedTokenId] = (ual ?? '').split('/');
+  expect(embeddedAddr.toLowerCase()).toBe(
+    (await chain.getDKGKnowledgeAssetsAddress()).toLowerCase(),
+  );
+  expect(embeddedTokenId).toBe(String(tokenId));
+}
+
 // Phase C (commit `d353c6a5`) made `DKGPublisher.publish` reject on-chain
 // publishes that arrive without a `precomputedAttestation`. The mock-chain
 // tests in this file pre-date that requirement; wrap each publisher so the
@@ -968,7 +987,7 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
     // Greenfield (PR #815): the UAL embeds the DKGKnowledgeAssets storage
     // address, not the publisher address — attribution lives in
     // `onChainResult.publisherAddress` below.
-    expect(updated.ual).toMatch(/^did:dkg:mock:31337\/0x[0-9a-fA-F]{40}\/11$/);
+    await expectUalEmbedsStorageAddress(updated.ual, chain, 11);
     expect(updated.onChainResult?.publisherAddress.toLowerCase()).toBe(wallet.address.toLowerCase());
   });
 
@@ -1023,7 +1042,7 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
     expect(updated.status).toBe('confirmed');
     // Greenfield (PR #815): UAL embeds the DKGKnowledgeAssets storage
     // address; attribution is asserted via onChainResult below.
-    expect(updated.ual).toMatch(/^did:dkg:mock:31337\/0x[0-9a-fA-F]{40}\/11$/);
+    await expectUalEmbedsStorageAddress(updated.ual, chain, 11);
     expect(updated.onChainResult?.publisherAddress.toLowerCase()).toBe(wallet.address.toLowerCase());
   });
 
@@ -1052,7 +1071,7 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
     expect(updated.status).toBe('failed');
     // Greenfield (PR #815): UAL embeds the DKGKnowledgeAssets storage
     // address; attribution is asserted via capturedPublisherAddress above.
-    expect(updated.ual).toMatch(/^did:dkg:mock:31337\/0x[0-9a-fA-F]{40}\/12$/);
+    await expectUalEmbedsStorageAddress(updated.ual, chain, 12);
   });
 
   it('preserves failed adapter-managed updates when publisher attribution is unavailable', async () => {
@@ -1077,7 +1096,7 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
 
     expect(chain.capturedPublisherAddress).toBeUndefined();
     expect(updated.status).toBe('failed');
-    expect(updated.ual).toMatch(/^did:dkg:mock:31337\/0x[0-9a-fA-F]{40}\/12$/);
+    await expectUalEmbedsStorageAddress(updated.ual, chain, 12);
   });
 
   it('does not confirm adapter-managed updates from local metadata alone', async () => {
@@ -1131,7 +1150,7 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
     expect(chain.capturedPublisherAddress?.toLowerCase()).toBe(wallet.address.toLowerCase());
     expect(updated.status).toBe('tentative');
     expect(updated.onChainResult).toBeUndefined();
-    expect(updated.ual).toMatch(/^did:dkg:mock:31337\/0x[0-9a-fA-F]{40}\/13$/);
+    await expectUalEmbedsStorageAddress(updated.ual, chain, 13);
 
     const stored = await store.query(`
       SELECT ?p ?o WHERE {
@@ -1168,7 +1187,7 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
     expect(chain.capturedPublisherAddress).toBeUndefined();
     expect(updated.status).toBe('tentative');
     expect(updated.onChainResult).toBeUndefined();
-    expect(updated.ual).toMatch(/^did:dkg:mock:31337\/0x[0-9a-fA-F]{40}\/12$/);
+    await expectUalEmbedsStorageAddress(updated.ual, chain, 12);
 
     const stored = await store.query(`
       SELECT ?p ?o WHERE {

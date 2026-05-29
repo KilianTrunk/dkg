@@ -174,8 +174,13 @@ describe('SWM subset publish cleanup', () => {
     });
     expect(carolResult.status).toBe('confirmed');
     const carolRoots = carolResult.kaManifest.map((ka) => ka.rootEntity);
-    expect(carolRoots).toContain(carol);
+    // The final `'all'` publish must cover exactly Carol: Alice was published
+    // first, and Bob's confirmed publish above must have removed him from SWM.
+    // Asserting only `toContain(carol)` would still pass if cleanup regressed
+    // and Bob were republished here alongside Carol — pin the exact set.
+    expect(carolRoots).toEqual([carol]);
     expect(carolRoots).not.toContain(alice);
+    expect(carolRoots).not.toContain(bob);
 
     // SWM should be empty
     expect(await countInGraph(store, WORKSPACE_GRAPH)).toBe(0);

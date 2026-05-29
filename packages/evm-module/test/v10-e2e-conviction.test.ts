@@ -423,12 +423,12 @@ describe('V10 E2E Conviction System', function () {
         await DKGKnowledgeAssets.getLatestMerkleRootPublisher(kcId);
       expect(latestPublisher).to.equal(creator.address);
       // The KA NFT (ERC-721, one token per KC id) is minted to the author on
-      // publish (`DKGKnowledgeAssets._safeMint(author, kcId)`), so the
-      // creator's balance is non-zero. A follow-up `update` passes the
-      // author-ownership gate.
-      expect(
-        await DKGKnowledgeAssets.balanceOf(creator.address),
-      ).to.be.gt(0n);
+      // publish (`DKGKnowledgeAssets._safeMint(author, kcId)`). Assert the
+      // specific token `kcId` is owned by `creator` — a `balanceOf > 0` check
+      // would also pass if some unrelated KA were owned by `creator` while
+      // `kcId` was minted to the wrong address. A follow-up `update` passes
+      // the author-ownership gate.
+      expect(await DKGKnowledgeAssets.ownerOf(kcId)).to.equal(creator.address);
 
       // ---- Step 8: Atomic CG binding written ----
       expect(await CGS.kcToContextGraph(kcId)).to.equal(cgId);

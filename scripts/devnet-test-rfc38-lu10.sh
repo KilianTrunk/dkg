@@ -158,8 +158,10 @@ const fs = require("fs"); const path = require("path");
 (async () => {
   const provider = new ethers.JsonRpcProvider(process.env.RPC_URL);
   const contracts = JSON.parse(fs.readFileSync(process.env.CONTRACTS_JSON, "utf8")).contracts;
-  const kcs = new ethers.Contract(contracts.KnowledgeCollectionStorage.evmAddress,
-    JSON.parse(fs.readFileSync(path.join(process.env.ABI_DIR, "KnowledgeCollectionStorage.json"), "utf8")), provider);
+  const kcsAddr = contracts.DKGKnowledgeAssets?.evmAddress ?? contracts.KnowledgeCollectionStorage.evmAddress;
+  const kcsAbiFile = fs.existsSync(path.join(process.env.ABI_DIR, "DKGKnowledgeAssets.json")) ? "DKGKnowledgeAssets.json" : "KnowledgeCollectionStorage.json";
+  const kcs = new ethers.Contract(kcsAddr,
+    JSON.parse(fs.readFileSync(path.join(process.env.ABI_DIR, kcsAbiFile), "utf8")), provider);
   const [merkleRoots, , minted, byteSize] = await kcs.getKnowledgeCollectionMetadata(BigInt(process.env.BATCH_ID));
   if (!merkleRoots || merkleRoots.length === 0) throw new Error("no merkleRoots");
   if (minted !== 5n) throw new Error("expected 5 KAs (one per root entity), got " + minted);

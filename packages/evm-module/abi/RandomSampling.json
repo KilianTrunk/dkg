@@ -362,7 +362,7 @@
     "name": "knowledgeCollectionStorage",
     "outputs": [
       {
-        "internalType": "contract KnowledgeCollectionStorage",
+        "internalType": "contract DKGKnowledgeAssets",
         "name": "",
         "type": "address"
       }

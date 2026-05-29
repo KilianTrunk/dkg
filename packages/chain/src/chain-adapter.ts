@@ -86,8 +86,21 @@ export const DEFAULT_APPROVAL_POLICY: ApprovalPolicy = { mode: 'per-publish' };
 export const DEFAULT_REPLENISH_TARGET_ALLOWANCE: bigint = 1000n * (10n ** 18n);
 export const DEFAULT_REFILL_BELOW_FRACTION: number = 0.1;
 
+/** Canonical greenfield UAL: did:dkg:{chainId}/{DKGKnowledgeAssets}/{kaId} */
+export function buildKnowledgeAssetUal(
+  chainId: string,
+  knowledgeAssetsContract: string,
+  kaId: bigint,
+): string {
+  return `did:dkg:${chainId}/${knowledgeAssetsContract.toLowerCase()}/${kaId.toString()}`;
+}
+
 export interface OnChainPublishResult {
   batchId: bigint;
+  /** Greenfield: equals `batchId` when tokenId == kaId. */
+  kaId?: bigint;
+  /** `DKGKnowledgeAssets` contract address used in the UAL path segment. */
+  knowledgeAssetsContract?: string;
   /** Absent for updates (no new KAs minted). */
   startKAId?: bigint;
   /** Absent for updates (no new KAs minted). */
@@ -446,6 +459,11 @@ export interface V10UpdateKCParams {
   /** When true, the caller asserts the KC was created via V10. Skips probing. */
   v10Origin?: boolean;
   publisherAddress?: string;
+  /** Greenfield: ERC-721 owner (required — from `precomputedUpdateAttestation`). */
+  authorAddress: string;
+  authorR: Uint8Array;
+  authorVS: Uint8Array;
+  authorSchemeVersion?: number;
   updateOperationId?: string;
   publisherNodeIdentityId?: bigint;
   ackSignatures?: Array<{ identityId: bigint; r: Uint8Array; vs: Uint8Array }>;
@@ -852,6 +870,9 @@ export interface ChainAdapter {
    * direct-spend based on `agentToAccountId(msg.sender)`.
    */
   createKnowledgeAssetsV10(params: V10PublishParams): Promise<OnChainPublishResult>;
+
+  /** Deployed `DKGKnowledgeAssets` (or legacy `KnowledgeCollectionStorage`) address. */
+  getDKGKnowledgeAssetsAddress?(): Promise<string>;
 
   /** Read minimumRequiredSignatures from ParametersStorage. Used by ACKCollector. */
   getMinimumRequiredSignatures?(): Promise<number>;

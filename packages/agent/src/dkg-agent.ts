@@ -7486,7 +7486,11 @@ export class DKGAgent {
 
   async update(
     kcId: bigint, contextGraphId: string, quads: Quad[], privateQuads?: Quad[],
-    opts?: { onPhase?: PhaseCallback; operationCtx?: OperationContext },
+    opts?: {
+      onPhase?: PhaseCallback;
+      operationCtx?: OperationContext;
+      precomputedUpdateAttestation?: PublishOptions['precomputedUpdateAttestation'];
+    },
   ): Promise<PublishResult> {
     const ctx = opts?.operationCtx ?? createOperationContext('update');
     const onPhase = opts?.onPhase;
@@ -7498,6 +7502,7 @@ export class DKGAgent {
       publisherPeerId: this.node.peerId.toString(),
       operationCtx: ctx,
       onPhase,
+      precomputedUpdateAttestation: opts?.precomputedUpdateAttestation,
     });
     this.log.info(ctx, `Update complete — status=${result.status}`);
 

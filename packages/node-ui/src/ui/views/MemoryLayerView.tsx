@@ -687,7 +687,7 @@ function PublishPanel({ contextGraphId, onPublished }: { contextGraphId: string;
               </div>
             )}
             <div className="v10-publish-result-details">
-              <div><span className="v10-publish-result-label">Knowledge Collection:</span> {publishResult.kcId}</div>
+              <div><span className="v10-publish-result-label">Knowledge Asset:</span> {publishResult.kcId}</div>
               <div><span className="v10-publish-result-label">Status:</span> {publishResult.status}</div>
               {publishResult.kas?.length > 0 && (
                 <div><span className="v10-publish-result-label">Knowledge Assets:</span> {publishResult.kas.length}</div>

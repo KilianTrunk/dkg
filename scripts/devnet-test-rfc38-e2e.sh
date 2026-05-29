@@ -240,9 +240,10 @@ const path = require("path");
 (async () => {
   const provider = new ethers.JsonRpcProvider(process.env.RPC_URL);
   const contracts = JSON.parse(fs.readFileSync(process.env.CONTRACTS_JSON, "utf8")).contracts;
-  const kcsAddr = contracts.KnowledgeCollectionStorage?.evmAddress;
-  if (!kcsAddr) throw new Error("KCS not deployed");
-  const abi = JSON.parse(fs.readFileSync(path.join(process.env.ABI_DIR, "KnowledgeCollectionStorage.json"), "utf8"));
+  const kcsAddr = contracts.DKGKnowledgeAssets?.evmAddress ?? contracts.KnowledgeCollectionStorage?.evmAddress;
+  if (!kcsAddr) throw new Error("DKGKnowledgeAssets / KnowledgeCollectionStorage not deployed");
+  const abiFile = fs.existsSync(path.join(process.env.ABI_DIR, "DKGKnowledgeAssets.json")) ? "DKGKnowledgeAssets.json" : "KnowledgeCollectionStorage.json";
+  const abi = JSON.parse(fs.readFileSync(path.join(process.env.ABI_DIR, abiFile), "utf8"));
   const kcs = new ethers.Contract(kcsAddr, abi, provider);
   const [merkleRoots, burned, minted, byteSize, , , tokenAmount] =
     await kcs.getKnowledgeCollectionMetadata(BigInt(process.env.BATCH_ID));

@@ -43,7 +43,11 @@ import {
   HARDHAT_KEYS,
 } from './evm-test-context.js';
 import { mintTokens } from './hardhat-harness.js';
-import { buildAuthorAttestationTypedData } from '@origintrail-official/dkg-core';
+import {
+  buildAuthorAttestationTypedData,
+  buildUpdateAuthorAttestationTypedData,
+  AUTHOR_SCHEME_VERSION_V1,
+} from '@origintrail-official/dkg-core';
 
 let fileSnapshotId: string;
 let testSnapshotId: string;
@@ -69,7 +73,7 @@ async function publishOneKCV10(opts: {
 
   const contextGraphId = await createTestContextGraph(adapter);
 
-  const kaCount = opts.kaCount ?? 2;
+  const kaCount = opts.kaCount ?? 1;
   const byteSize = opts.byteSize ?? 256n;
   const epochs = opts.epochs ?? 2;
   const tokenAmount = await adapter.getRequiredPublishTokenAmount(byteSize, epochs);
@@ -164,7 +168,7 @@ describe('chain-lifecycle-extra — V10 lifecycle + adapter invariants', () => {
       const adapter = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
 
       const { kcId, txHash: publishTxHash, merkleRoot: originalRoot } = await publishOneKCV10({
-        kaCount: 2,
+        kaCount: 1,
         byteSize: 256n,
         epochs: 2,
       });
@@ -175,14 +179,33 @@ describe('chain-lifecycle-extra — V10 lifecycle + adapter invariants', () => {
       expect(resolved!.batchId).toBe(kcId);
       expect(resolved!.txHash.toLowerCase()).toBe(publishTxHash.toLowerCase());
       expect(resolved!.startKAId).toBeGreaterThan(0n);
-      expect(resolved!.endKAId).toBeGreaterThanOrEqual(resolved!.startKAId);
+      expect(resolved!.endKAId).toBe(resolved!.startKAId);
       expect(resolved!.publisherAddress.toLowerCase()).toBe(adapter.getSignerAddress().toLowerCase());
 
-      // --- updateKnowledgeCollectionV10 with auto-generated signatures ---
+      // --- updateKnowledgeCollectionV10 (publisher ACK + owner EIP-712 seal) ---
       const newMerkleRoot = ethers.getBytes(
         ethers.keccak256(ethers.toUtf8Bytes(`lifecycle-update-${Date.now()}`)),
       );
       expect(ethers.hexlify(newMerkleRoot)).not.toBe(ethers.hexlify(originalRoot));
+
+      const provider = createProvider();
+      const coreOp = new Wallet(HARDHAT_KEYS.CORE_OP, provider);
+      const kav10Address = await adapter.getKnowledgeAssetsV10Address();
+      const evmChainId = await adapter.getEvmChainId();
+      const updateAuthorTyped = buildUpdateAuthorAttestationTypedData({
+        chainId: evmChainId,
+        kav10Address,
+        kaId: kcId,
+        newMerkleRoot,
+        authorAddress: coreOp.address,
+      });
+      const updateAuthorRaw = ethers.Signature.from(
+        await coreOp.signTypedData(
+          updateAuthorTyped.domain,
+          updateAuthorTyped.types,
+          updateAuthorTyped.message,
+        ),
+      );
 
       // Pass newTokenAmount explicitly: the adapter's auto-derivation
       // from askStorage + byteSize can under-shoot the V10 contract's
@@ -197,7 +220,11 @@ describe('chain-lifecycle-extra — V10 lifecycle + adapter invariants', () => {
         newByteSize: 256n,
         newTokenAmount: publishTokenAmount,
         newMerkleLeafCount: 1,
-      } as any);
+        authorAddress: coreOp.address,
+        authorR: ethers.getBytes(updateAuthorRaw.r),
+        authorVS: ethers.getBytes(updateAuthorRaw.yParityAndS),
+        authorSchemeVersion: AUTHOR_SCHEME_VERSION_V1,
+      });
 
       expect(updateResult.success).toBe(true);
       expect(updateResult.hash).toMatch(/^0x[0-9a-f]{64}$/);

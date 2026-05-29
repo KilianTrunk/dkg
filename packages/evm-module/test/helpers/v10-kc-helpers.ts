@@ -3,12 +3,12 @@ import { ethers } from 'ethers';
 
 import { signMessage } from './kc-helpers';
 import { NodeAccounts } from './types';
-import { KnowledgeAssetsV10 } from '../../typechain';
+import { KnowledgeAssetsLifecycle } from '../../typechain';
 
 /**
  * V10 publish/update test helpers.
  *
- * Digest construction must match `KnowledgeAssetsV10.sol` EXACTLY. Any drift
+ * Digest construction must match `KnowledgeAssetsLifecycle.sol` EXACTLY. Any drift
  * between the contract and these helpers will fail at ECDSA.tryRecover with
  * `SignerIsNotNodeOperator`, `InvalidSignature`, or `InvalidAuthorSignature`.
  *
@@ -16,7 +16,7 @@ import { KnowledgeAssetsV10 } from '../../typechain';
  * carries an EIP-712 author attestation.
  *
  * ACK digest prefix (H5 closure):
- *   (block.chainid, address(KnowledgeAssetsV10), ...)
+ *   (block.chainid, address(KnowledgeAssetsLifecycle), ...)
  *
  * ACK digest (publish) — PRD V10 "Publish Flow" + decision #25 Option B,
  * extended with `merkleLeafCount` (uint256 on wire). Wrapped in
@@ -33,7 +33,7 @@ import { KnowledgeAssetsV10 } from '../../typechain';
  *   || uint256(newMerkleLeafCount)
  *
  * Author attestation (RFC-001) — EIP-712 typed data:
- *   domain   = EIP712Domain(name="KnowledgeAssetsV10", version="10.1",
+ *   domain   = EIP712Domain(name="KnowledgeAssetsLifecycle", version="2.0.0",
  *                           chainId, verifyingContract=KAV10)
  *   struct   = AuthorAttestation(uint256 contextGraphId, bytes32 merkleRoot,
  *                                address authorAddress, uint8 schemeVersion)
@@ -73,7 +73,7 @@ export type AuthorAttestationPayload = {
  * Build the EIP-712 typed-data payload for a V10 author attestation.
  *
  * Domain mirrors the contract's `_hashAuthorAttestation`:
- *   name="KnowledgeAssetsV10", version="10.1", chainId, verifyingContract.
+ *   name="KnowledgeAssetsLifecycle", version="2.0.0", chainId, verifyingContract.
  *
  * The struct hash binds (contextGraphId, merkleRoot, authorAddress,
  * schemeVersion). Drift between this builder and the contract will surface
@@ -90,8 +90,8 @@ export function buildAuthorAttestationPayload(args: {
   const schemeVersion = args.schemeVersion ?? AUTHOR_SCHEME_VERSION_V1;
   return {
     domain: {
-      name: 'KnowledgeAssetsV10',
-      version: '10.1',
+      name: 'KnowledgeAssetsLifecycle',
+      version: '2.0.0',
       chainId: args.chainId,
       verifyingContract: ethers.getAddress(args.kav10Address),
     },
@@ -263,7 +263,7 @@ export async function signAckDigest(
 }
 
 /**
- * Build a full `PublishParamsStruct` ready for `KnowledgeAssetsV10.publish`.
+ * Build a full `PublishParamsStruct` ready for `KnowledgeAssetsLifecycle.publish`.
  * Runs the ACK signing flow internally and produces an EOA author attestation
  * over the publish payload.
  */
@@ -305,7 +305,7 @@ export async function buildPublishParams(args: {
    */
   ciphertextChunksRoot?: string;
   ciphertextChunkCount?: number | bigint;
-}): Promise<KnowledgeAssetsV10.PublishParamsStruct> {
+}): Promise<KnowledgeAssetsLifecycle.PublishParamsStruct> {
   const merkleLeafCount = args.merkleLeafCount ?? 1;
   const ackDigest = buildPublishAckDigest(
     args.chainId,
@@ -362,12 +362,72 @@ export async function buildPublishParams(args: {
 }
 
 /**
- * Build a full `UpdateParamsStruct` for `KnowledgeAssetsV10.update` / `updateDirect`.
+ * Build a full `UpdateParamsStruct` for `KnowledgeAssetsLifecycle.update` / `updateDirect`.
  *
  * Requires the on-chain `contextGraphId` (read by the test from
  * `ContextGraphStorage.kcToContextGraph(id)`) and the pre-update merkle-root
- * count (read from `KnowledgeCollectionStorage.getKnowledgeCollectionMetadata(id)`).
+ * count (read from `DKGKnowledgeAssets.getKnowledgeCollectionMetadata(id)`).
  */
+export type UpdateAuthorAttestationPayload = {
+  domain: ethers.TypedDataDomain;
+  types: Record<string, { name: string; type: string }[]>;
+  value: {
+    kaId: bigint;
+    newMerkleRoot: string;
+    authorAddress: string;
+    schemeVersion: number;
+  };
+};
+
+export function buildUpdateAuthorAttestationPayload(args: {
+  chainId: bigint;
+  kav10Address: string;
+  kaId: bigint;
+  newMerkleRoot: string;
+  authorAddress: string;
+  schemeVersion?: number;
+}): UpdateAuthorAttestationPayload {
+  const schemeVersion = args.schemeVersion ?? AUTHOR_SCHEME_VERSION_V1;
+  return {
+    domain: {
+      name: 'KnowledgeAssetsLifecycle',
+      version: '2.0.0',
+      chainId: args.chainId,
+      verifyingContract: ethers.getAddress(args.kav10Address),
+    },
+    types: {
+      UpdateAuthorAttestation: [
+        { name: 'kaId', type: 'uint256' },
+        { name: 'newMerkleRoot', type: 'bytes32' },
+        { name: 'authorAddress', type: 'address' },
+        { name: 'schemeVersion', type: 'uint8' },
+      ],
+    },
+    value: {
+      kaId: args.kaId,
+      newMerkleRoot: args.newMerkleRoot,
+      authorAddress: ethers.getAddress(args.authorAddress),
+      schemeVersion,
+    },
+  };
+}
+
+export async function signUpdateAuthorAttestation(
+  signer: SignerWithAddress,
+  payload: UpdateAuthorAttestationPayload,
+): Promise<AuthorSig> {
+  const fullSig = await signer.signTypedData(
+    payload.domain,
+    payload.types,
+    payload.value,
+  );
+  const split = ethers.Signature.from(fullSig);
+  return {
+    authorR: split.r,
+    authorVS: split.yParityAndS,
+  };
+}
+
 export async function buildUpdateParams(args: {
   chainId: bigint;
   kav10Address: string;
@@ -383,9 +443,11 @@ export async function buildUpdateParams(args: {
   mintKnowledgeAssetsAmount: bigint;
   knowledgeAssetsToBurn: bigint[];
   updateOperationId: string;
+  /** KA owner / attestation signer. */
+  author: SignerWithAddress;
   /** Defaults to 1 for fixtures that only assert economics / signatures. */
   newMerkleLeafCount?: number;
-}): Promise<KnowledgeAssetsV10.UpdateParamsStruct> {
+}): Promise<KnowledgeAssetsLifecycle.UpdateParamsStruct> {
   const newMerkleLeafCount = args.newMerkleLeafCount ?? 1;
   const ackDigest = buildUpdateAckDigest(
     args.chainId,
@@ -401,6 +463,14 @@ export async function buildUpdateParams(args: {
     newMerkleLeafCount,
   );
   const sig = await signAckDigest(args.receivingNodes, ackDigest);
+  const updateAttPayload = buildUpdateAuthorAttestationPayload({
+    chainId: args.chainId,
+    kav10Address: args.kav10Address,
+    kaId: args.id,
+    newMerkleRoot: args.newMerkleRoot,
+    authorAddress: await args.author.getAddress(),
+  });
+  const authorSig = await signUpdateAuthorAttestation(args.author, updateAttPayload);
   return {
     id: args.id,
     updateOperationId: args.updateOperationId,
@@ -410,15 +480,15 @@ export async function buildUpdateParams(args: {
     newMerkleLeafCount,
     mintKnowledgeAssetsAmount: args.mintKnowledgeAssetsAmount,
     knowledgeAssetsToBurn: args.knowledgeAssetsToBurn,
-    // Codex PR #630 R1 #2 — RFC-39 Phase A.5 commitment refresh. Default
-    // both to zero so the existing public-CG fixtures (which never
-    // touch curated ciphertext) stay green. Curated-rotation tests
-    // override these explicitly via the returned struct.
     newCiphertextChunksRoot: ethers.ZeroHash,
     newCiphertextChunkCount: 0,
     publisherNodeIdentityId: args.publisherIdentityId,
     identityIds: args.receiverIdentityIds,
     r: sig.receiverRs,
     vs: sig.receiverVSs,
+    authorAddress: await args.author.getAddress(),
+    authorR: authorSig.authorR,
+    authorVS: authorSig.authorVS,
+    authorSchemeVersion: AUTHOR_SCHEME_VERSION_V1,
   };
 }

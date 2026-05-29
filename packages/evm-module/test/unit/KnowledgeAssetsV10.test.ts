@@ -1944,6 +1944,82 @@ describe('@unit KnowledgeAssetsLifecycle', () => {
         expect(totalDelta).to.equal(tokenAmount);
       });
 
+      it('protocol treasury fee: direct publish skims the fee, distributes net, conserves the gross', async () => {
+        const creator = getDefaultKCCreator(accounts);
+        const { publisherIdentityId, receivingNodes, receiverIdentityIds } =
+          await setupNodes();
+
+        // Wire a treasury recipient. Default fee is 300 bps (3%).
+        const treasury = accounts[18];
+        const ParametersStorageContract =
+          await hre.ethers.getContract('ParametersStorage');
+        await HubContract.forwardCall(
+          await ParametersStorageContract.getAddress(),
+          ParametersStorageContract.interface.encodeFunctionData(
+            'setProtocolTreasury',
+            [treasury.address],
+          ),
+        );
+        expect(await ParametersStorageContract.protocolTreasuryFee()).to.equal(
+          300n,
+        );
+
+        const cgId = await createOpenCG(creator);
+        const merkleRoot = ethers.keccak256(ethers.toUtf8Bytes('t2.1-fee-root'));
+        const tokenAmount = ethers.parseEther('100');
+        const expectedFee = (tokenAmount * 300n) / 10_000n; // 3 ether
+        const expectedNet = tokenAmount - expectedFee; // 97 ether
+        const epochs = 2;
+
+        const currentEpoch = await ChronosContract.getCurrentEpoch();
+        const poolsBefore: bigint[] = [];
+        for (let i = 0n; i <= BigInt(epochs); i++) {
+          poolsBefore.push(
+            await EpochStorageContract.getEpochPool(STAKER_SHARD_ID, currentEpoch + i),
+          );
+        }
+        const treasuryBalBefore = await TokenContract.balanceOf(treasury.address);
+
+        const p = await buildPublishParams({
+          chainId,
+          kav10Address,
+          receivingNodes,
+          publisherIdentityId,
+          receiverIdentityIds,
+          author: creator,
+          contextGraphId: cgId,
+          merkleRoot,
+          knowledgeAssetsAmount: 1,
+          byteSize: 1000,
+          epochs,
+          tokenAmount,
+          isImmutable: false,
+          publishOperationId: 't2.1-fee-op',
+        });
+
+        await TokenContract.connect(creator).approve(kav10Address, tokenAmount);
+        await expect(KAV10.connect(creator).publish(p)).to.not.be.reverted;
+
+        // Treasury physically receives exactly the fee.
+        expect(
+          (await TokenContract.balanceOf(treasury.address)) - treasuryBalBefore,
+        ).to.equal(expectedFee);
+
+        // Staker pool is credited only the NET across the window.
+        let totalDelta = 0n;
+        for (let i = 0n; i <= BigInt(epochs); i++) {
+          const after = await EpochStorageContract.getEpochPool(
+            STAKER_SHARD_ID,
+            currentEpoch + i,
+          );
+          totalDelta += after - poolsBefore[Number(i)];
+        }
+        expect(totalDelta).to.equal(expectedNet);
+
+        // Conservation: net to pool + fee to treasury == gross paid.
+        expect(totalDelta + expectedFee).to.equal(tokenAmount);
+      });
+
       it('reverts TooLowAllowance when caller has no PCA and no TRAC approval', async () => {
         const creator = getDefaultKCCreator(accounts);
         const { publisherIdentityId, receivingNodes, receiverIdentityIds } =

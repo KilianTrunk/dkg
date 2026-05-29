@@ -11,6 +11,7 @@ import {EpochStorage} from "./storage/EpochStorage.sol";
 import {PublishingMathLib} from "./libraries/PublishingMathLib.sol";
 import {ParametersStorage} from "./storage/ParametersStorage.sol";
 import {PublishingConvictionStorage} from "./storage/PublishingConvictionStorage.sol";
+import {ConvictionStakingStorage} from "./storage/ConvictionStakingStorage.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 /**
@@ -56,8 +57,19 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
  *     window's base allowance is exhausted. Any leftover at account
  *     expiry is swept to the staker pool (final chain epoch) via the
  *     same `settle()` path.
- *   - Invariant: over a full account lifetime, the total TRAC accounted
- *     to the staker pool equals `committedTRAC + sum(topUps)`. Any
+ *   - Invariant: over a full account lifetime, the total TRAC drained
+ *     from the escrowed `committedTRAC + sum(topUps)` is conserved and
+ *     splits into exactly two destinations:
+ *       (a) the staker reward pool, credited via
+ *           `EpochStorage.addTokensToEpochRange(STAKER_SHARD_ID, ...)`, and
+ *       (b) the protocol treasury, paid via
+ *           `ConvictionStakingStorage.transferStake(protocolTreasury, fee)`.
+ *     The treasury fee (`ParametersStorage.protocolTreasuryFee`, bps) is
+ *     skimmed from every staker-bound amount — the active-sink
+ *     distribution, each passive window sweep, and the final dust/topUp
+ *     tail — so `pool + treasury == committedTRAC + sum(topUps)` still
+ *     holds. While `protocolTreasury == address(0)` the fee is 0 and the
+ *     whole amount flows to the pool (legacy behaviour). Any
  *     `committedTRAC % lockDurationEpochs` dust is swept on the final
  *     settle alongside the topUp tail.
  *
@@ -92,6 +104,14 @@ contract PublishingConviction is INamed, IVersioned, ContractStatus, IInitializa
     //           and the active-sink reward distribution. Twin of KAV10
     //           10.1.1's `tokenAmount > 0` floor, which protects only
     //           the direct-spend branch.
+    //   protocol treasury fee — a `ParametersStorage`-configured bps cut
+    //           is skimmed from every staker-bound amount (active sink,
+    //           passive window sweeps, final dust/topUp tail) and paid to
+    //           `protocolTreasury` via `ConvictionStakingStorage.transferStake`.
+    //           Fees are accumulated and transferred ONCE per settlement
+    //           call, AFTER all PCS state writes (effects-before-interactions),
+    //           keeping the permissionless `settle()` reentrancy-safe.
+    //           Dormant while `protocolTreasury == address(0)`.
     string private constant _VERSION = "10.0.2";
 
     uint256 public constant BPS_DENOMINATOR = 10_000;
@@ -126,6 +146,13 @@ contract PublishingConviction is INamed, IVersioned, ContractStatus, IInitializa
     ///         `publishingConvictionEpochs` setting that fixes
     ///         `Account.lockDurationEpochs` at creation time.
     ParametersStorage public parametersStorage;
+
+    /// @notice The V10 TRAC vault. Escrowed conviction TRAC
+    ///         (`committedTRAC` + top-ups) physically lives here; the
+    ///         only outflow is `transferStake`. Used to pay the protocol
+    ///         treasury fee out of the escrow when it is skimmed from a
+    ///         staker-bound amount.
+    ConvictionStakingStorage public convictionStakingStorage;
 
     // ============================================================
     //                          Events
@@ -211,6 +238,10 @@ contract PublishingConviction is INamed, IVersioned, ContractStatus, IInitializa
         address params = hub.getContractAddress("ParametersStorage");
         if (params == address(0)) revert ZeroAddressDependency("ParametersStorage");
         parametersStorage = ParametersStorage(params);
+
+        address css = hub.getContractAddress("ConvictionStakingStorage");
+        if (css == address(0)) revert ZeroAddressDependency("ConvictionStakingStorage");
+        convictionStakingStorage = ConvictionStakingStorage(css);
     }
 
     function name() external pure virtual override returns (string memory) {
@@ -447,7 +478,15 @@ contract PublishingConviction is INamed, IVersioned, ContractStatus, IInitializa
         // are identical (modulo the conviction discount).
         uint96 distributed = drawnFromEpoch + drawnFromTopUp;
         if (distributed > 0) {
-            _distributeProrated(distributed, kcStartEpoch, uint256(kcEpochs));
+            (address treasury, uint256 feeBps) = _treasuryParams();
+            uint96 fee = _feeOf(distributed, feeBps);
+            uint96 net = distributed - fee;
+            if (net > 0) {
+                _distributeProrated(net, kcStartEpoch, uint256(kcEpochs));
+            }
+            // PCS window/topUp writes (above) are already persisted, so
+            // paying the treasury last keeps effects-before-interactions.
+            _payTreasury(treasury, fee);
         }
 
         emit CostCovered(accountId, currentEpoch, baseCost, discountedCost, drawnFromEpoch, drawnFromTopUp);
@@ -484,6 +523,42 @@ contract PublishingConviction is INamed, IVersioned, ContractStatus, IInitializa
                 ranges[i].tokenAmount
             );
         }
+    }
+
+    // ============================================================
+    //                  Protocol treasury fee
+    // ============================================================
+
+    /// @dev Snapshot the treasury config once per settlement so the per-
+    ///      window loops in `_settleElapsed` / `_finalSweep` don't pay a
+    ///      cross-contract read on every iteration. Returns
+    ///      `(address(0), 0)` while the fee is disabled (no treasury
+    ///      wired), which makes `_feeOf` a no-op and `_payTreasury` skip.
+    function _treasuryParams() internal view returns (address treasury, uint256 bps) {
+        treasury = parametersStorage.protocolTreasury();
+        if (treasury == address(0)) return (address(0), 0);
+        bps = uint256(parametersStorage.protocolTreasuryFee());
+    }
+
+    /// @dev Treasury fee (TRAC) for a single staker-bound `amount` given a
+    ///      pre-read `bps`. `bps` is capped at
+    ///      `ParametersStorage.MAX_PROTOCOL_TREASURY_FEE` (10%), so the
+    ///      returned fee never exceeds `amount` and `amount - fee` cannot
+    ///      underflow.
+    function _feeOf(uint96 amount, uint256 bps) internal pure returns (uint96) {
+        if (bps == 0) return 0;
+        return uint96((uint256(amount) * bps) / BPS_DENOMINATOR);
+    }
+
+    /// @dev Pay an accumulated treasury `totalFee` out of the escrowed
+    ///      conviction TRAC. MUST be the LAST statement in any function
+    ///      that mutated PCS state: this `transferStake` is the only
+    ///      external-call reentrancy surface on the permissionless
+    ///      `settle()` path, and running it after the settlement cursor /
+    ///      `fullySwept` flag are persisted makes any re-entry a no-op.
+    function _payTreasury(address treasury, uint96 totalFee) internal {
+        if (totalFee == 0 || treasury == address(0)) return;
+        convictionStakingStorage.transferStake(treasury, totalFee);
     }
 
     // ============================================================
@@ -568,18 +643,31 @@ contract PublishingConviction is INamed, IVersioned, ContractStatus, IInitializa
 
         uint96 baseAllowance = acct.committedTRAC / uint96(acct.lockDurationEpochs);
 
+        (address treasury, uint256 feeBps) = _treasuryParams();
+        uint96 accruedFee;
+
         for (uint40 w = uint40(acct.lastSettledWindow); w < stopAt; w++) {
             uint96 spent = publishingConvictionStorage.windowSpent(accountId, w);
             uint96 remainder = spent < baseAllowance ? baseAllowance - spent : 0;
             (uint40 startEp, uint40 endEp) = _windowChainEpochRange(acct, w);
             if (remainder > 0) {
-                _sweepWindowProrated(acct, w, startEp, endEp, remainder);
+                uint96 fee = _feeOf(remainder, feeBps);
+                accruedFee += fee;
+                uint96 net = remainder - fee;
+                if (net > 0) {
+                    _sweepWindowProrated(acct, w, startEp, endEp, net);
+                }
             }
+            // `remainderSwept` stays gross (net to pool + fee to treasury).
             emit WindowSettled(accountId, w, startEp, endEp, remainder);
         }
 
         acct.lastSettledWindow = uint16(stopAt);
         publishingConvictionStorage.setLastSettledWindow(accountId, uint16(stopAt));
+
+        // Effects (cursor SSTORE) complete; pay the treasury last so the
+        // permissionless `settle()` entry point is reentrancy-safe.
+        _payTreasury(treasury, accruedFee);
     }
 
     /// @dev Distribute `amount` across the chain-epoch range
@@ -642,12 +730,20 @@ contract PublishingConviction is INamed, IVersioned, ContractStatus, IInitializa
         uint40 maxWindow = uint40(acct.lockDurationEpochs);
         uint96 baseAllowance = acct.committedTRAC / uint96(acct.lockDurationEpochs);
 
+        (address treasury, uint256 feeBps) = _treasuryParams();
+        uint96 accruedFee;
+
         for (uint40 w = uint40(acct.lastSettledWindow); w < maxWindow; w++) {
             uint96 spent = publishingConvictionStorage.windowSpent(accountId, w);
             uint96 remainder = spent < baseAllowance ? baseAllowance - spent : 0;
             (uint40 startEp, uint40 endEp) = _windowChainEpochRange(acct, w);
             if (remainder > 0) {
-                _sweepWindowProrated(acct, w, startEp, endEp, remainder);
+                uint96 fee = _feeOf(remainder, feeBps);
+                accruedFee += fee;
+                uint96 net = remainder - fee;
+                if (net > 0) {
+                    _sweepWindowProrated(acct, w, startEp, endEp, net);
+                }
             }
             emit WindowSettled(accountId, w, startEp, endEp, remainder);
         }
@@ -661,12 +757,17 @@ contract PublishingConviction is INamed, IVersioned, ContractStatus, IInitializa
         uint96 leftoverTopUp = publishingConvictionStorage.topUpBalance(accountId);
         uint96 tailSweep = dust + leftoverTopUp;
         if (tailSweep > 0) {
-            epochStorage.addTokensToEpochRange(
-                STAKER_SHARD_ID,
-                uint256(finalChainEpoch),
-                uint256(finalChainEpoch),
-                tailSweep
-            );
+            uint96 tailFee = _feeOf(tailSweep, feeBps);
+            accruedFee += tailFee;
+            uint96 tailNet = tailSweep - tailFee;
+            if (tailNet > 0) {
+                epochStorage.addTokensToEpochRange(
+                    STAKER_SHARD_ID,
+                    uint256(finalChainEpoch),
+                    uint256(finalChainEpoch),
+                    tailNet
+                );
+            }
         }
         if (leftoverTopUp > 0) {
             publishingConvictionStorage.clearTopUpBalance(accountId);
@@ -674,6 +775,10 @@ contract PublishingConviction is INamed, IVersioned, ContractStatus, IInitializa
 
         publishingConvictionStorage.setFullySwept(accountId, true);
         emit AccountFinalSwept(accountId, leftoverTopUp, dust);
+
+        // All PCS state (cursor, topUp clear, fullySwept) is persisted;
+        // pay the treasury last for `settle()` reentrancy safety.
+        _payTreasury(treasury, accruedFee);
     }
 
     // ============================================================

@@ -319,7 +319,7 @@ async function loadContractAddresses(
   );
   return {
     hub,
-    kcsAddress: await hub.getAssetStorageAddress('KnowledgeCollectionStorage'),
+    kcsAddress: await hub.getAssetStorageAddress('DKGKnowledgeAssets'),
     nftAddress: await hub.getContractAddress('DKGPublishingConvictionNFT'),
     tokenAddress: await hub.getContractAddress('Token'),
     epsAddress: await hub.getContractAddress('EpochStorageV8'),

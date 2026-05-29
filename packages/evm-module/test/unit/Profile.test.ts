@@ -295,6 +295,25 @@ describe('@unit Profile contract', function () {
       .withArgs(accounts[0].address);
   });
 
+  it('admin wallet may call createProfile when operationalWallets[0] is distinct', async () => {
+    const tx = await Profile.connect(accounts[1]).createProfile(
+      accounts[1].address,
+      [accounts[2].address],
+      'Admin-Created Node',
+      nodeId1,
+      1000,
+    );
+    await tx.wait();
+    const identityId = await IdentityStorage.getIdentityId(accounts[2].address);
+    expect(identityId).to.be.gt(0);
+    const adminKey = await IdentityStorage.keyHasPurpose(
+      identityId,
+      ethers.keccak256(ethers.solidityPacked(['address'], [accounts[1].address])),
+      1,
+    );
+    expect(adminKey).to.be.true;
+  });
+
   it('createProfile reverts KeyAlreadyAttached when an op wallet equals adminWallet (admin/operational overlap)', async () => {
     await expect(
       Profile.createProfile(

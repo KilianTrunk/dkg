@@ -51,6 +51,7 @@ import {
   buildAuthorAttestationTypedData,
   AUTHOR_SCHEME_VERSION_V1,
   floorPublishTokenAmount,
+  computeUpdateACKDigest,
 } from '@origintrail-official/dkg-core';
 
 /**
@@ -2163,6 +2164,17 @@ export class EVMChainAdapter implements ChainAdapter {
   // On-Chain Context Graphs (ContextGraphs contract)
   // =====================================================================
 
+  /** True when `contextGraphId` is an active minted CG in ContextGraphStorage. */
+  async isContextGraphActiveOnChain(contextGraphId: bigint): Promise<boolean> {
+    await this.init();
+    if (!this.contracts.contextGraphStorage) return false;
+    try {
+      return Boolean(await this.contracts.contextGraphStorage.isContextGraphActive(contextGraphId));
+    } catch {
+      return false;
+    }
+  }
+
   async createOnChainContextGraph(params: CreateOnChainContextGraphParams): Promise<CreateOnChainContextGraphResult> {
     await this.init();
     if (!this.contracts.contextGraphs || !this.contracts.contextGraphStorage) {
@@ -2647,11 +2659,13 @@ export class EVMChainAdapter implements ChainAdapter {
         `contract is not available — cannot parse minted IDs from receipt`,
       );
     }
-    const storageAddress = String(kcs.target);
+    const storageAddress = String(kcs.target).toLowerCase();
     {
       let foundCreated = false;
       let foundLegacyMint = false;
       for (const log of receipt.logs) {
+        const logAddr = typeof log.address === 'string' ? log.address.toLowerCase() : '';
+        if (logAddr !== storageAddress) continue;
         try {
           const parsed = kcs.interface.parseLog({ topics: [...log.topics], data: log.data });
           if (parsed?.name === 'KnowledgeAssetCreated' || parsed?.name === 'KnowledgeCollectionCreated') {
@@ -2666,12 +2680,6 @@ export class EVMChainAdapter implements ChainAdapter {
             endKAId = BigInt(parsed.args.endId) - 1n;
             publisherAddress = parsed.args.to;
             foundLegacyMint = true;
-          }
-          if (parsed?.name === 'Transfer' && parsed.args.to && parsed.args.tokenId != null) {
-            const tid = BigInt(parsed.args.tokenId);
-            if (tid === kcId || !foundCreated) {
-              publisherAddress = String(parsed.args.to);
-            }
           }
         } catch { /* not this contract */ }
       }
@@ -2719,8 +2727,11 @@ export class EVMChainAdapter implements ChainAdapter {
     let publisherAddress = '';
     let authorAddress: string | undefined;
     let foundCreated = false;
+    const storageAddress = String(kcs.target).toLowerCase();
 
     for (const log of receipt.logs) {
+      const logAddr = typeof log.address === 'string' ? log.address.toLowerCase() : '';
+      if (logAddr !== storageAddress) continue;
       try {
         const parsed = kcs.interface.parseLog({ topics: [...log.topics], data: log.data });
         if (parsed?.name === 'KnowledgeAssetCreated' || parsed?.name === 'KnowledgeCollectionCreated') {
@@ -2735,12 +2746,6 @@ export class EVMChainAdapter implements ChainAdapter {
           endKAId = BigInt(parsed.args.endId) - 1n;
           publisherAddress = parsed.args.to;
         }
-        if (parsed?.name === 'Transfer' && parsed.args.to && parsed.args.tokenId != null) {
-          const tid = BigInt(parsed.args.tokenId);
-          if (tid === kcId || !foundCreated) {
-            publisherAddress = String(parsed.args.to);
-          }
-        }
       } catch {
         // ignore unrelated logs
       }
@@ -2749,10 +2754,7 @@ export class EVMChainAdapter implements ChainAdapter {
     if (!foundCreated) return null;
 
     if (!publisherAddress) {
-      publisherAddress = authorAddress ?? '';
-    }
-    if (!publisherAddress && receipt.from) {
-      publisherAddress = receipt.from;
+      publisherAddress = receipt.from ?? authorAddress ?? '';
     }
 
     const blockTimestamp = await this.getBlockTimestamp(receipt.blockNumber);
@@ -2818,6 +2820,90 @@ export class EVMChainAdapter implements ChainAdapter {
   // =====================================================================
   // V10 Update (KnowledgeAssetsV10 → KnowledgeCollectionStorage)
   // =====================================================================
+
+  /**
+   * Canonical V10 update ACK digest — mirrors `KnowledgeAssetsLifecycle`
+   * `_executeUpdateCore` and the values `updateKnowledgeCollectionV10`
+   * submits on-chain. Test helpers and ACK collectors should call this
+   * instead of re-deriving inputs so signatures recover to the expected
+   * operational keys.
+   */
+  async computeV10UpdateAckDigest(params: {
+    kcId: bigint;
+    newMerkleRoot: Uint8Array;
+    newByteSize: bigint;
+    newMerkleLeafCount: number;
+    mintAmount?: bigint;
+    burnTokenIds?: bigint[];
+    newTokenAmount?: bigint;
+    newCiphertextChunksRoot?: Uint8Array;
+    newCiphertextChunkCount?: number;
+  }): Promise<Uint8Array> {
+    await this.init();
+    if (!this.contracts.knowledgeAssetsV10) {
+      throw new Error('KnowledgeAssetsV10 contract not deployed');
+    }
+
+    const kcs = this.contracts.knowledgeCollectionStorage;
+    const kav10Address = await this.contracts.knowledgeAssetsV10.getAddress();
+    const evmChainId = BigInt((await this.provider.getNetwork()).chainId);
+
+    let currentTokenAmount = 0n;
+    if (kcs) {
+      try {
+        currentTokenAmount = BigInt(await kcs.getTokenAmount(params.kcId));
+      } catch { /* not in KCS */ }
+    }
+
+    let requiredForNewSize = 0n;
+    if (this.contracts.askStorage) {
+      try {
+        const ask = BigInt(await this.contracts.askStorage.getStakeWeightedAverageAsk());
+        requiredForNewSize = (ask * params.newByteSize) / 1024n;
+      } catch { /* use 0 */ }
+    }
+    const baseTokenAmount = params.newTokenAmount ?? currentTokenAmount;
+    const newTokenAmount = floorPublishTokenAmount(
+      baseTokenAmount > requiredForNewSize ? baseTokenAmount : requiredForNewSize,
+    );
+
+    let contextGraphId = 0n;
+    if (this.contracts.contextGraphStorage) {
+      try {
+        contextGraphId = BigInt(
+          await this.contracts.contextGraphStorage.kcToContextGraph(params.kcId),
+        );
+      } catch { /* use 0 */ }
+    }
+
+    let preUpdateMerkleRootCount = 0n;
+    if (kcs) {
+      try {
+        const roots: unknown[] = await kcs.getMerkleRoots(params.kcId);
+        preUpdateMerkleRootCount = BigInt(roots.length);
+      } catch { /* use 0 */ }
+    }
+
+    const burnIds = params.burnTokenIds ?? [];
+    const ciphertextRoot = params.newCiphertextChunksRoot ?? new Uint8Array(32);
+    const ciphertextCount = BigInt(params.newCiphertextChunkCount ?? 0);
+
+    return computeUpdateACKDigest(
+      evmChainId,
+      kav10Address,
+      contextGraphId,
+      params.kcId,
+      preUpdateMerkleRootCount,
+      params.newMerkleRoot,
+      params.newByteSize,
+      newTokenAmount,
+      params.mintAmount ?? 0n,
+      burnIds,
+      BigInt(params.newMerkleLeafCount),
+      ciphertextRoot,
+      ciphertextCount,
+    );
+  }
 
   async updateKnowledgeCollectionV10(params: V10UpdateKCParams): Promise<TxResult> {
     await this.init();
@@ -2939,19 +3025,17 @@ export class EVMChainAdapter implements ChainAdapter {
 
     let ackSigs = params.ackSignatures ?? [];
     if (ackSigs.length === 0) {
-      // Update ACK digest: keccak256(abi.encodePacked(chainid, KAV10, cgId, kcId, preCount, newRoot, byteSize, tokenAmount, mintAmount, keccak256(burnIds)))
-      const burnPackedHash = ethers.keccak256(
-        burnIds.length > 0
-          ? ethers.solidityPacked(burnIds.map(() => 'uint256'), burnIds)
-          : new Uint8Array(0),
-      );
-      const newMerkleLeafCount = BigInt(params.newMerkleLeafCount ?? 0);
-      const ackDigest = ethers.getBytes(ethers.solidityPackedKeccak256(
-        ['uint256', 'address', 'uint256', 'uint256', 'uint256', 'bytes32', 'uint256', 'uint256', 'uint256', 'bytes32', 'uint256'],
-        [evmChainId, kav10Address, contextGraphId, params.kcId, preUpdateMerkleRootCount,
-         ethers.hexlify(params.newMerkleRoot), params.newByteSize, newTokenAmount,
-         BigInt(params.mintAmount ?? 0), burnPackedHash, newMerkleLeafCount],
-      ));
+      const ackDigest = await this.computeV10UpdateAckDigest({
+        kcId: params.kcId,
+        newMerkleRoot: params.newMerkleRoot,
+        newByteSize: params.newByteSize,
+        newMerkleLeafCount: params.newMerkleLeafCount ?? 0,
+        mintAmount: params.mintAmount !== undefined ? BigInt(params.mintAmount) : undefined,
+        burnTokenIds: burnIds,
+        newTokenAmount: params.newTokenAmount,
+        newCiphertextChunksRoot: params.newCiphertextChunksRoot,
+        newCiphertextChunkCount: params.newCiphertextChunkCount,
+      });
       const raw = ethers.Signature.from(await signer.signMessage(ackDigest));
       ackSigs = [{ identityId, r: ethers.getBytes(raw.r), vs: ethers.getBytes(raw.yParityAndS) }];
     }

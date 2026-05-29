@@ -155,6 +155,9 @@ export function buildPublishAckDigest(
   epochs: number | bigint,
   tokenAmount: bigint,
   merkleLeafCount: number | bigint,
+  ciphertextChunksRoot: string = ethers.ZeroHash,
+  ciphertextChunkCount: number | bigint = 0,
+  isImmutable: boolean = false,
 ): string {
   return ethers.solidityPackedKeccak256(
     [
@@ -167,6 +170,9 @@ export function buildPublishAckDigest(
       'uint256', // epochs (cast to uint256 in contract)
       'uint256', // tokenAmount (cast to uint256 in contract)
       'uint256', // merkleLeafCount (cast to uint256 in contract)
+      'bytes32', // ciphertextChunksRoot
+      'uint256', // ciphertextChunkCount
+      'uint256', // isImmutable (0/1)
     ],
     [
       chainId,
@@ -178,6 +184,9 @@ export function buildPublishAckDigest(
       epochs,
       tokenAmount,
       merkleLeafCount,
+      ciphertextChunksRoot,
+      ciphertextChunkCount,
+      isImmutable ? 1 : 0,
     ],
   );
 }
@@ -205,6 +214,8 @@ export function buildUpdateAckDigest(
   mintKnowledgeAssetsAmount: bigint,
   knowledgeAssetsToBurn: bigint[],
   newMerkleLeafCount: number | bigint,
+  newCiphertextChunksRoot: string = ethers.ZeroHash,
+  newCiphertextChunkCount: number | bigint = 0,
 ): string {
   // Inner burn-list keccak matches `keccak256(abi.encodePacked(knowledgeAssetsToBurn))`.
   const innerBurnHash = ethers.solidityPackedKeccak256(
@@ -224,6 +235,8 @@ export function buildUpdateAckDigest(
       'uint256', // mintKnowledgeAssetsAmount
       'bytes32', // keccak(burn list)
       'uint256', // newMerkleLeafCount
+      'bytes32', // newCiphertextChunksRoot
+      'uint256', // newCiphertextChunkCount
     ],
     [
       chainId,
@@ -237,6 +250,8 @@ export function buildUpdateAckDigest(
       mintKnowledgeAssetsAmount,
       innerBurnHash,
       newMerkleLeafCount,
+      newCiphertextChunksRoot,
+      newCiphertextChunkCount,
     ],
   );
 }

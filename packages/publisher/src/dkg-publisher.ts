@@ -2951,6 +2951,27 @@ export class DKGPublisher implements Publisher {
       }
       onPhase?.('chain:writeahead', 'start');
     };
+    let v10UpdateACKs: V10CoreNodeACK[] | undefined;
+    const v10UpdateACKProvider = options.v10UpdateACKProvider;
+    if (v10UpdateACKProvider) {
+      onPhase?.('collect_v10_update_acks', 'start');
+      try {
+        v10UpdateACKs = await v10UpdateACKProvider(
+          kcId,
+          kcMerkleRoot,
+          contextGraphId,
+          updateByteSize,
+          kcMerkleLeafCount,
+        );
+        this.log.info(
+          ctx,
+          `V10: Collected ${v10UpdateACKs.length} core node update ACKs`,
+        );
+      } finally {
+        onPhase?.('collect_v10_update_acks', 'end');
+      }
+    }
+
     try {
       if (typeof this.chain.updateKnowledgeCollectionV10 === 'function') {
         try {
@@ -2966,6 +2987,11 @@ export class DKGPublisher implements Publisher {
             authorR: updateSeal.signature.r,
             authorVS: updateSeal.signature.vs,
             authorSchemeVersion: effectiveSchemeVersion,
+            ackSignatures: v10UpdateACKs?.map((ack) => ({
+              identityId: ack.nodeIdentityId,
+              r: ack.signatureR,
+              vs: ack.signatureVS,
+            })),
             onBroadcast: emitWriteAheadStart,
           });
         } catch (v10Err) {

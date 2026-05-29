@@ -29,7 +29,7 @@ const IDENTITY_ID = 5n;
 // If either of these diverges from the contract, on-chain _verifySignatures and
 // _verifySignature revert on every publish; keep these vectors pinned.
 const ACK_DIGEST_GOLDEN =
-  '0xe950463d621d6b63c55eaa2dd52e95281826f5bd6611205b80bf9597c56ac82a';
+  '0x7a57a53739a3ff4cf76efc82802f792cf3418f4d8f8522ec2101171c88b2d266';
 const PUBLISHER_DIGEST_GOLDEN =
   '0x511ca6d1022288492fb07cd51c6285513790e6ac1e99745ad1a369bb5b53d991';
 // The same fields in the WRONG order (cgId before identityId) — must NOT match.

@@ -38,8 +38,10 @@ const REPO_ROOT = resolve(__dirname, '../..');
 const RPC = 'http://127.0.0.1:8545';
 const DEVNET_DIR = join(REPO_ROOT, '.devnet');
 /** Registered by devnet.sh; use isolation CG when devnet-test publish ACL is tight. */
-const CONTEXT_GRAPH = process.env.DEVNET_CONTEXT_GRAPH ?? 'devnet-isolation';
+/** devnet-test is registered open (publishPolicy=1) by devnet.sh; isolation may be curated. */
+const CONTEXT_GRAPH = process.env.DEVNET_CONTEXT_GRAPH ?? 'devnet-test';
 const RS_TIMEOUT_S = Number(process.env.RS_TIMEOUT ?? 150);
+const MINE_BLOCKS = Number(process.env.MINE_BLOCKS ?? 80);
 /** Set in phase 1 so re-runs do not collide with prior devnet state. */
 let entityUri = `urn:devnet:greenfield-10min:ka:${Date.now()}`;
 
@@ -637,14 +639,34 @@ describe('Devnet greenfield 10min — publish, update, stake, random sampling', 
         }
       }
 
+      if (MINE_BLOCKS > 0) {
+        await s.provider.send('hardhat_mine', [
+          '0x' + Math.min(MINE_BLOCKS, 80).toString(16),
+          '0x0',
+        ]);
+        console.log(`phase 4: mined ${Math.min(MINE_BLOCKS, 80)} blocks`);
+      }
+
+      // Fresh publish from core1 so the RS prover has local chunks for the
+      // challenged KC (mirrors v10-end-to-end phase-1 RS ordering).
+      const core1 = s.nodes[1]!;
+      const rsSubject = `urn:devnet:greenfield-10min:rs:${Date.now()}`;
+      const rsFile = makeNquadsFile('gf10-rs', rsSubject, 'rs-phase4');
+      const rsPublish = await publishViaCli(core1, rsFile);
+      expect(rsPublish.status.toLowerCase()).toBe('confirmed');
       console.log(
-        `phase 4: polling RS (kaId=${run.kaId}, timeout ${RS_TIMEOUT_S}s)...`,
+        `phase 4: RS seed publish from node1 kaId=${rsPublish.kcId}`,
+      );
+
+      console.log(
+        `phase 4: polling RS (timeout ${RS_TIMEOUT_S}s, prover ticks every 5s)...`,
       );
       let success: {
         node: number;
         identityId: bigint;
         txHash: string;
       } | null = null;
+      const lastOutcomeKinds: Record<number, string> = {};
 
       for (let attempt = 0; attempt < RS_TIMEOUT_S; attempt++) {
         for (let n = 1; n <= 4; n++) {
@@ -660,12 +682,19 @@ describe('Devnet greenfield 10min — publish, update, stake, random sampling', 
               loop?: {
                 submittedCount?: number;
                 lastSubmittedTxHash?: string;
+                lastOutcome?: { kind?: string };
               };
             };
-            if ((status.loop?.submittedCount ?? 0) > 0) {
+            const submitted = status.loop?.submittedCount ?? 0;
+            lastOutcomeKinds[n] = status.loop?.lastOutcome?.kind ?? '?';
+            if (submitted <= 0) continue;
+
+            const identityId = BigInt(status.identityId ?? '0');
+            const ch = await s.rss.getNodeChallenge(identityId);
+            if (ch[6] === true) {
               success = {
                 node: n,
-                identityId: BigInt(status.identityId ?? '0'),
+                identityId,
                 txHash: status.loop?.lastSubmittedTxHash ?? '',
               };
               break;
@@ -676,19 +705,30 @@ describe('Devnet greenfield 10min — publish, update, stake, random sampling', 
         }
         if (success) break;
         if (attempt > 0 && attempt % 30 === 0) {
-          console.log(`phase 4 [t+${attempt}s]: still waiting for RS proof...`);
+          console.log(
+            `phase 4 [t+${attempt}s]: still waiting; outcomes=${JSON.stringify(lastOutcomeKinds)}`,
+          );
         }
         await new Promise((r) => setTimeout(r, 1000));
       }
 
       if (!success) {
+        for (let n = 1; n <= 4; n++) {
+          try {
+            const res = await fetch(
+              `http://127.0.0.1:${s.nodes[n]!.apiPort}/api/random-sampling/status`,
+              { headers: headers(s.nodes[n]!) },
+            );
+            console.error(`node${n}: ${await res.text()}`);
+          } catch (err) {
+            console.error(`node${n}: ${(err as Error).message}`);
+          }
+        }
         throw new Error(
-          `no core node submitted an RS proof within ${RS_TIMEOUT_S}s`,
+          `no RS proof with solved=true within ${RS_TIMEOUT_S}s (outcomes=${JSON.stringify(lastOutcomeKinds)})`,
         );
       }
 
-      const ch = await s.rss.getNodeChallenge(success.identityId);
-      expect(ch[6]).toBe(true);
       console.log(
         `phase 4 PASS: node${success.node} proof tx=${success.txHash} solved=true`,
       );

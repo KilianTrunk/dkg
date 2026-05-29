@@ -13527,19 +13527,49 @@ export class DKGAgent {
     // Hosts come from the sharding table at publish time; ACK quorum
     // is `parametersStorage.minimumRequiredSignatures()`.
 
-    // Check if already registered on-chain (prevents duplicate minting)
+    // Check if already registered on-chain (prevents duplicate minting).
+    // A local OnChainId triple alone is not enough — devnet restarts and
+    // partial failures can leave ontology id "1" while the chain slot is
+    // inactive, which would skip registration and strand publishes.
     const existingOnChainId = await this.getContextGraphOnChainId(id);
     if (existingOnChainId) {
-      this.log.info(ctx, `Context graph "${id}" already has on-chain ID ${existingOnChainId} — skipping chain call`);
+      let onChainLive = false;
+      const chainWithCgProbe = this.chain as ChainAdapter & {
+        isContextGraphActiveOnChain?: (id: bigint) => Promise<boolean>;
+      };
+      if (typeof chainWithCgProbe.isContextGraphActiveOnChain === 'function') {
+        try {
+          onChainLive = await chainWithCgProbe.isContextGraphActiveOnChain(BigInt(existingOnChainId));
+        } catch {
+          onChainLive = false;
+        }
+      }
+      if (onChainLive) {
+        this.log.info(ctx, `Context graph "${id}" already has on-chain ID ${existingOnChainId} — skipping chain call`);
+        await this.store.deleteByPattern({
+          graph: cgMetaGraph,
+          subject: contextGraphUri,
+          predicate: DKG_ONTOLOGY.DKG_REGISTRATION_STATUS,
+        });
+        await this.store.insert([
+          { subject: contextGraphUri, predicate: DKG_ONTOLOGY.DKG_REGISTRATION_STATUS, object: `"registered"`, graph: cgMetaGraph },
+        ]);
+        return { onChainId: existingOnChainId, txHash: undefined };
+      }
+      this.log.warn(
+        ctx,
+        `Context graph "${id}" has local on-chain id ${existingOnChainId} but it is not active on-chain — re-registering`,
+      );
+      const ontologyGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
       await this.store.deleteByPattern({
-        graph: cgMetaGraph,
+        graph: ontologyGraph,
         subject: contextGraphUri,
-        predicate: DKG_ONTOLOGY.DKG_REGISTRATION_STATUS,
+        predicate: `${DKG_ONTOLOGY.DKG_CONTEXT_GRAPH}OnChainId`,
       });
-      await this.store.insert([
-        { subject: contextGraphUri, predicate: DKG_ONTOLOGY.DKG_REGISTRATION_STATUS, object: `"registered"`, graph: cgMetaGraph },
-      ]);
-      return { onChainId: existingOnChainId, txHash: undefined };
+      const sub = this.subscribedContextGraphs.get(id);
+      if (sub) {
+        this.setContextGraphSubscription(id, { ...sub, onChainId: undefined });
+      }
     }
 
     // LU-2: edge-owned CG pattern — no `participantIdentityIds`/

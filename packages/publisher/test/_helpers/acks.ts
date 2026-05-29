@@ -16,10 +16,9 @@
  * publish. This keeps test publishes single-RPC (just the publish tx).
  */
 import { ethers } from 'ethers';
-import {
-  computePublishACKDigest,
-} from '@origintrail-official/dkg-core';
-import type { V10ACKProvider, V10CoreNodeACK } from '../../src/publisher.js';
+import { computePublishACKDigest } from '@origintrail-official/dkg-core';
+import type { EVMChainAdapter } from '@origintrail-official/dkg-chain';
+import type { V10ACKProvider, V10CoreNodeACK, V10UpdateACKProvider } from '../../src/publisher.js';
 import { getSharedContext, HARDHAT_KEYS } from '../../../chain/test/evm-test-context.js';
 
 export interface InMemoryACKSigner {
@@ -110,6 +109,9 @@ export function makeInMemoryV10ACKProvider(
       BigInt(epochs ?? 1),
       tokenAmount ?? 0n,
       BigInt(merkleLeafCount),
+      new Uint8Array(32),
+      0n,
+      false,
     );
 
     return Promise.all(
@@ -145,6 +147,42 @@ export function makeInMemoryV10ACKProvider(
  *     { v10ACKProvider: ackProvider },
  *   );
  */
+export function makeHardhatUpdateACKProvider(
+  ctx: { receiverIds: number[] },
+  chain: EVMChainAdapter,
+  signerKeys: readonly [string, string, string],
+): V10UpdateACKProvider {
+  if (ctx.receiverIds.length < 3) {
+    throw new Error(
+      `makeHardhatUpdateACKProvider: harness must have 3 receiver ids, got ${ctx.receiverIds.length}`,
+    );
+  }
+  const wallets = signerKeys.map((pk, i) => ({
+    wallet: new ethers.Wallet(pk),
+    identityId: BigInt(ctx.receiverIds[i]!),
+    peerId: `in-memory-rec${i + 1}`,
+  }));
+  return async (kcId, newMerkleRoot, _contextGraphIdStr, newByteSize, newMerkleLeafCount) => {
+    const digest = await chain.computeV10UpdateAckDigest({
+      kcId,
+      newMerkleRoot,
+      newByteSize,
+      newMerkleLeafCount,
+    });
+    return Promise.all(
+      wallets.map(async ({ wallet, identityId, peerId }) => {
+        const sig = ethers.Signature.from(await wallet.signMessage(digest));
+        return {
+          peerId,
+          signatureR: ethers.getBytes(sig.r),
+          signatureVS: ethers.getBytes(sig.yParityAndS),
+          nodeIdentityId: identityId,
+        };
+      }),
+    );
+  };
+}
+
 export function makeHardhatReceiverACKProvider(
   ctx: { receiverIds: number[] },
   kav10Address: string,

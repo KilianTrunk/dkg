@@ -26,7 +26,7 @@ import {
   type HardhatContext,
 } from '../../chain/test/hardhat-harness.js';
 import { buildSeal, buildUpdateSeal } from './_helpers/seal.js';
-import { makeHardhatReceiverACKProvider } from './_helpers/acks.js';
+import { makeHardhatReceiverACKProvider, makeHardhatUpdateACKProvider } from './_helpers/acks.js';
 
 const HARDHAT_PORT = 8549;
 const ENTITY = 'urn:greenfield-e2e:asset';
@@ -43,6 +43,7 @@ let contextGraphId: string;
 let dataGraph: string;
 let kav10Address: string;
 let ackProvider: ReturnType<typeof makeHardhatReceiverACKProvider>;
+let updateAckProvider: ReturnType<typeof makeHardhatUpdateACKProvider>;
 
 describe('Greenfield KA update E2E (explicit owner seal)', () => {
   beforeAll(async () => {
@@ -75,6 +76,11 @@ describe('Greenfield KA update E2E (explicit owner seal)', () => {
     ackProvider = makeHardhatReceiverACKProvider(
       ctx,
       kav10Address,
+      [HARDHAT_KEYS.REC1_OP, HARDHAT_KEYS.REC2_OP, HARDHAT_KEYS.REC3_OP],
+    );
+    updateAckProvider = makeHardhatUpdateACKProvider(
+      ctx,
+      chain,
       [HARDHAT_KEYS.REC1_OP, HARDHAT_KEYS.REC2_OP, HARDHAT_KEYS.REC3_OP],
     );
 
@@ -141,6 +147,7 @@ describe('Greenfield KA update E2E (explicit owner seal)', () => {
       contextGraphId,
       quads: updateQuads,
       precomputedUpdateAttestation: updateSeal,
+      v10UpdateACKProvider: updateAckProvider,
     });
 
     expect(updated.status).toBe('confirmed');

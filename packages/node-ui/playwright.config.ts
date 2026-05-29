@@ -5,7 +5,14 @@ import { dirname } from 'node:path';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const CI = !!process.env.CI;
 const PORT = 5173;
-const DEVNET_NODE = process.env.DEVNET_NODE || process.env.UI_NODE_ID || '1';
+const DEVNET_NODE = process.env.DEVNET_NODE || process.env.UI_NODE_ID;
+
+function devServerCommand(projectUsesDevnet: boolean): string {
+  if (projectUsesDevnet && DEVNET_NODE) {
+    return `cross-env DEVNET_NODE=${DEVNET_NODE} pnpm dev:ui`;
+  }
+  return 'pnpm dev:ui';
+}
 
 export default defineConfig({
   testDir: './e2e/specs',
@@ -25,13 +32,20 @@ export default defineConfig({
 
   projects: [
     {
-      name: 'chromium',
+      name: 'mock-ui',
       use: { ...devices['Desktop Chrome'] },
+      testIgnore: ['**/devnet/**', '**/*.devnet.spec.ts'],
+    },
+    {
+      name: 'devnet-ui',
+      use: { ...devices['Desktop Chrome'] },
+      testMatch: ['**/devnet/**', '**/*.devnet.spec.ts'],
+      timeout: CI ? 120_000 : 60_000,
     },
   ],
 
   webServer: {
-    command: `cross-env DEVNET_NODE=${DEVNET_NODE} pnpm dev:ui`,
+    command: devServerCommand(!!DEVNET_NODE),
     cwd: __dirname,
     port: PORT,
     reuseExistingServer: !CI,

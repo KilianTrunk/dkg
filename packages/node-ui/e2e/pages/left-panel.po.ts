@@ -14,6 +14,10 @@ export class LeftPanelPage {
     this.oraclePlaceholder = page.locator(sel.leftPanel.oraclePlaceholder);
   }
 
+  private myCgSections() {
+    return this.root.locator(sel.myContextGraphs.peerGroupBody).locator(sel.leftPanel.section);
+  }
+
   async isVisible() {
     return this.root.isVisible();
   }
@@ -23,15 +27,19 @@ export class LeftPanelPage {
   }
 
   async clickMemoryStack() {
-    await this.root.locator(sel.leftPanel.dashboard).filter({ hasText: 'Memory Stack' }).click();
+    const quick = this.page.locator('.v10-quick-action').filter({ hasText: /Memory Stack/i });
+    if (await quick.isVisible().catch(() => false)) {
+      await quick.click();
+    }
   }
 
   async isMemoryStackVisible() {
-    return this.root.locator(sel.leftPanel.dashboard).filter({ hasText: 'Memory Stack' }).isVisible();
+    const quick = this.page.locator('.v10-quick-action').filter({ hasText: /Memory Stack/i });
+    return quick.isVisible().catch(() => false);
   }
 
   async switchToMode(mode: 'explorer' | 'oracle') {
-    const label = mode === 'explorer' ? 'Projects' : 'Context Oracle';
+    const label = mode === 'explorer' ? 'Context Graphs' : 'Context Oracle';
     await this.root.locator(sel.leftPanel.modeBtn).filter({ hasText: label }).click();
   }
 
@@ -45,37 +53,33 @@ export class LeftPanelPage {
   }
 
   async getProjectNames() {
-    const labels = this.root.locator(sel.leftPanel.sectionLabel);
+    const labels = this.myCgSections().locator(sel.leftPanel.sectionLabel);
     const count = await labels.count();
     const names: string[] = [];
     for (let i = 0; i < count; i++) {
       const text = await labels.nth(i).textContent();
-      if (text && text !== 'Integrations') names.push(text);
+      if (text && !text.includes('No context graphs')) names.push(text.trim());
     }
     return names;
   }
 
   async expandProject(name: string) {
-    const header = this.root.locator(sel.leftPanel.sectionHeader).filter({ hasText: name });
-    await header.click();
+    await this.myCgSections()
+      .locator(sel.leftPanel.sectionHeader)
+      .filter({ hasText: name })
+      .click();
   }
 
-  async clickLayer(projectName: string, layer: 'wm' | 'swm' | 'vm' | 'import') {
-    const section = this.root.locator(sel.leftPanel.section).filter({ hasText: projectName });
-    const items = section.locator(sel.leftPanel.treeItem);
-
-    const labelMap: Record<string, string> = {
-      wm: 'agent drafts',
-      import: 'Import files',
-      swm: 'team workspace',
-      vm: 'verified assets',
-    };
-
-    await items.filter({ hasText: labelMap[layer] }).click();
+  async clickLayer(_projectName: string, layer: 'wm' | 'swm' | 'vm' | 'import') {
+    if (layer === 'import') {
+      await this.page.locator(sel.layer.actionBtn).filter({ hasText: /Import/i }).click();
+      return;
+    }
+    await this.page.locator(`${sel.layer.switchBtn}[data-layer="${layer}"]`).click();
   }
 
   async expandIntegrations() {
-    const header = this.root.locator(sel.leftPanel.sectionHeader).filter({ hasText: 'Integrations' });
+    const header = this.page.locator('.v10-peer-group-header').filter({ hasText: 'Integrations' });
     await header.click();
   }
 

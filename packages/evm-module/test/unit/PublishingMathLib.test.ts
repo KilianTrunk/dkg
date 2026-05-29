@@ -52,4 +52,25 @@ describe('@unit PublishingMathLib', () => {
     expect(ends).to.deep.equal([20n, 0n, 21n]);
     expect(amounts).to.deep.equal([250n, 0n, 750n]);
   });
+
+  it('places large active sink remainder dust in the final epoch', async () => {
+    const Harness = await hre.ethers.getContractFactory('PublishingMathLibHarness');
+    const harness = await Harness.deploy();
+
+    const [starts, ends, amounts] = await harness.prorateActiveSink(
+      hre.ethers.parseEther('123456789.123456789123456789'),
+      12345,
+      365,
+      86_400,
+      43_210,
+    );
+
+    expect(starts).to.deep.equal([12345n, 12346n, 12710n]);
+    expect(ends).to.deep.equal([12345n, 12709n, 12710n]);
+    expect(amounts).to.deep.equal([
+      169158037101235662672011n,
+      123118551345036359564214308n,
+      169079741319193896570470n,
+    ]);
+  });
 });

@@ -41,9 +41,13 @@ export class ShareProjectModal {
     return this.page.locator(sel.shareModal.pendingRequests).isVisible().catch(() => false);
   }
 
+  async openJoinRequestsTab() {
+    await this.page.getByRole('button', { name: /Join Requests/i }).click();
+  }
+
   async getInviteCodeText(): Promise<string | null> {
     const group = this.page.locator('.v10-form-group').filter({ hasText: 'Invite Code' });
-    const code = group.locator('code, textarea, input').first();
+    const code = group.locator('code, textarea, input, pre').first();
     if (!(await code.isVisible().catch(() => false))) return null;
     return code.textContent();
   }

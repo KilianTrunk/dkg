@@ -63,7 +63,7 @@ contract Profile is INamed, IVersioned, ContractStatus, IInitializable {
     // semantics make the prior "fail-fast at the entrypoint" rationale
     // moot. `OperationalWalletAlreadyPrimary` and
     // `OperationalWalletEqualsAdmin` are dropped from `IdentityLib`.
-    string private constant _VERSION = "1.4.3";
+    string private constant _VERSION = "10.0.2";
 
     Ask public askContract;
     Identity public identityContract;

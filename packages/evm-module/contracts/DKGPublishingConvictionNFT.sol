@@ -89,7 +89,7 @@ contract DKGPublishingConvictionNFT is INamed, IVersioned, HubDependent, IInitia
     //           mint counter + TRAC-pull only. Public selectors are
     //           preserved so `IDKGPublishingConvictionNFT` consumers
     //           (`KnowledgeAssetsV10`, `ContextGraphs`) need no changes.
-    string private constant _VERSION = "3.0.0";
+    string private constant _VERSION = "10.0.2";
 
     uint256 public constant BPS_DENOMINATOR = 10_000;
 

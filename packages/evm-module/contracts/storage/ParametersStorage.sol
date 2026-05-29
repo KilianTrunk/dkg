@@ -11,7 +11,7 @@ contract ParametersStorage is INamed, IVersioned, HubDependent {
     event ParameterChanged(string parameterName, uint256 parameterValue);
 
     string private constant _NAME = "ParametersStorage";
-    string private constant _VERSION = "1.0.0";
+    string private constant _VERSION = "10.0.2";
 
     uint96 public minimumStake;
     uint96 public maximumStake;

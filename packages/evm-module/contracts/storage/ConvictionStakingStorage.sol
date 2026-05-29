@@ -134,7 +134,7 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
     //             the 60 days preceding V10 launch. Validated against
     //             `_tierDuration(lockTier)` and the current block
     //             timestamp; tier-0 callers MUST pass 0.
-    string private constant _VERSION = "4.1.0";
+    string private constant _VERSION = "10.0.2";
 
     // Multiplier scale, matches DKGStakingConvictionNFT._convictionMultiplier
     // (returns 1e18-scaled values so fractional tiers like 1.5x and 3.5x

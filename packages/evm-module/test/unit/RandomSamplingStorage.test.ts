@@ -514,7 +514,7 @@ describe('@unit RandomSamplingStorage', function () {
       expect(await RandomSamplingStorage.name()).to.equal(
         'RandomSamplingStorage',
       );
-      expect(await RandomSamplingStorage.version()).to.equal('3.0.0');
+      expect(await RandomSamplingStorage.version()).to.equal('10.0.2');
     });
 
     it('Should set the initial parameters correctly', async function () {

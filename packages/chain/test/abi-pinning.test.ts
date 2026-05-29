@@ -136,7 +136,7 @@ const PINNED_DIGESTS: Record<string, string> = {
   KnowledgeAssetsV10:           'e42e64493eb788474c3134a5371d22814d80909fbbd69dbab77f858466d7813f',
   // Greenfield rename (rc.12): logic + storage pair replaces the legacy names.
   KnowledgeAssetsLifecycle:     '90c27fbf79e874a8d0fc7b285d88cb48f3fd143bd7c733bd556b040d14838e75',
-  KnowledgeCollectionStorage:   '8c0e6e3b19f072b15f6c548ff0a58ffc0dffddb9676d221de78b8019d32bdd',
+  KnowledgeCollectionStorage:   '8c0e6e3b19f072b15f6c54852ff0a58ffc0dffddb9676d221de78b8019d32bdd',
   DKGKnowledgeAssets:           '0123eca27aa59d67e671361eb6a0230fc078f76b70db087a4ef98921a055c48a',
   // V8 `KnowledgeCollection` ABI was moved to `abi/archive/` in
   // `archive-non-v10-contracts`; the pin entry is intentionally dropped.

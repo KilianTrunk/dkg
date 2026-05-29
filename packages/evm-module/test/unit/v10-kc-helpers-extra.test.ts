@@ -88,7 +88,11 @@ describe('@unit v10-kc-helpers — digest byte-layout pins (E-15)', () => {
       merkleLeafCount,
     );
 
-    // abi.encodePacked(uint256, address, uint256, bytes32, uint256, uint256, uint256, uint256, uint256)
+    // abi.encodePacked(uint256, address, uint256, bytes32, uint256, uint256,
+    //   uint256, uint256, uint256, bytes32, uint256, uint256)
+    // The trailing (ciphertextChunksRoot, ciphertextChunkCount, isImmutable)
+    // default to (bytes32(0), 0, 0) — RFC-39 fields the contract binds after
+    // merkleLeafCount in `_executePublishCore`.
     const packed = ethers.concat([
       hex(32, chainId),
       addr(kav10),
@@ -99,6 +103,9 @@ describe('@unit v10-kc-helpers — digest byte-layout pins (E-15)', () => {
       hex(32, epochs),
       hex(32, tokenAmount),
       hex(32, merkleLeafCount),
+      hex(32, 0n), // ciphertextChunksRoot (bytes32(0))
+      hex(32, 0n), // ciphertextChunkCount
+      hex(32, 0n), // isImmutable
     ]);
     const expected = ethers.keccak256(packed);
     expect(got).to.equal(expected);
@@ -119,6 +126,9 @@ describe('@unit v10-kc-helpers — digest byte-layout pins (E-15)', () => {
       hex(32, 1),
       hex(32, 1n),
       hex(32, 1),
+      hex(32, 0n), // ciphertextChunksRoot (bytes32(0), default)
+      hex(32, 0n), // ciphertextChunkCount (default)
+      hex(32, 0n), // isImmutable (default)
     ]);
     expect(a).to.equal(ethers.keccak256(packed));
   });
@@ -170,6 +180,9 @@ describe('@unit v10-kc-helpers — digest byte-layout pins (E-15)', () => {
     const innerPacked = ethers.concat(burn.map((b) => hex(32, b)));
     const innerHash = ethers.keccak256(innerPacked);
 
+    // Trailing (newCiphertextChunksRoot, newCiphertextChunkCount) default to
+    // (bytes32(0), 0) — RFC-39 fields the contract binds after
+    // newMerkleLeafCount in `_executeUpdateCore`.
     const outerPacked = ethers.concat([
       hex(32, chainId),
       addr(kav10),
@@ -182,6 +195,8 @@ describe('@unit v10-kc-helpers — digest byte-layout pins (E-15)', () => {
       hex(32, mintAmount),
       innerHash,
       hex(32, newMerkleLeafCount),
+      hex(32, 0n), // newCiphertextChunksRoot (bytes32(0))
+      hex(32, 0n), // newCiphertextChunkCount
     ]);
     const expected = ethers.keccak256(outerPacked);
     expect(got).to.equal(expected);

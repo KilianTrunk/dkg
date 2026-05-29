@@ -1,5 +1,5 @@
-import { test, expect } from '../fixtures/base.js';
-import { isDevnetAvailable, devnetApiFetch, waitForDevnetStatus } from '../helpers/devnet.js';
+import { test, expect } from '../../fixtures/base.js';
+import { isDevnetAvailable, devnetApiFetch, waitForDevnetStatus } from '../../helpers/devnet.js';
 
 test.describe.configure({ mode: 'serial' });
 
@@ -30,7 +30,7 @@ test.describe('MCP server tools (devnet API smoke)', () => {
     expect(json.contextGraphs.length).toBeGreaterThan(0);
   });
 
-  test('SPARQL query endpoint responds for devnet CG', async () => {
+  test('SPARQL query endpoint returns bindings for devnet CG', async () => {
     const cgs = await devnetApiFetch('/api/context-graphs');
     const { contextGraphs } = (await cgs.json()) as { contextGraphs: Array<{ id: string }> };
     test.skip(contextGraphs.length === 0, 'No CGs');
@@ -42,5 +42,7 @@ test.describe('MCP server tools (devnet API smoke)', () => {
       }),
     });
     expect(res.ok).toBe(true);
+    const json = (await res.json()) as { result?: { bindings?: unknown[] } };
+    expect(Array.isArray(json.result?.bindings)).toBe(true);
   });
 });

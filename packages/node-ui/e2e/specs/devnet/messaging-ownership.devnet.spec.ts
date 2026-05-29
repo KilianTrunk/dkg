@@ -1,5 +1,5 @@
-import { test, expect } from '../fixtures/base.js';
-import { isDevnetAvailable, devnetApiFetch, waitForDevnetStatus, readDevnetNode } from '../helpers/devnet.js';
+import { test, expect } from '../../fixtures/base.js';
+import { isDevnetAvailable, devnetApiFetch, waitForDevnetStatus } from '../../helpers/devnet.js';
 
 test.describe.configure({ mode: 'serial' });
 
@@ -17,17 +17,21 @@ test.describe('Inter-node messaging (devnet API)', () => {
   });
 
   test('agents endpoint lists connected peers over prolonged polling window', async () => {
-    const node = readDevnetNode(1)!;
     let maxPeers = 0;
+    let anyOk = false;
     for (let i = 0; i < 6; i++) {
       const res = await devnetApiFetch('/api/agents', { nodeNum: 1 });
       if (res.ok) {
+        anyOk = true;
         const json = (await res.json()) as { agents: unknown[] };
         maxPeers = Math.max(maxPeers, json.agents?.length ?? 0);
       }
       await new Promise((r) => setTimeout(r, 2000));
     }
-    expect(maxPeers).toBeGreaterThanOrEqual(0);
+    expect(anyOk).toBe(true);
+    if (isDevnetAvailable(2)) {
+      expect(maxPeers).toBeGreaterThan(0);
+    }
   });
 
   test('memory sessions endpoint responds (messaging persistence surface)', async () => {

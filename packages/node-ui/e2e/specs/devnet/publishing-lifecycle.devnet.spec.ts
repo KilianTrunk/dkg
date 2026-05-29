@@ -1,9 +1,9 @@
 /**
  * Devnet-backed UI tests — require `./scripts/devnet.sh start 6` and
- * `DEVNET_NODE=1 pnpm test:e2e --project=devnet-ui`.
+ * `pnpm test:e2e:devnet` (starts Vite with DEVNET_NODE=1).
  */
-import { test, expect } from '../fixtures/base.js';
-import { isDevnetAvailable, devnetApiFetch, waitForDevnetStatus } from '../helpers/devnet.js';
+import { test, expect } from '../../fixtures/base.js';
+import { isDevnetAvailable, devnetApiFetch, waitForDevnetStatus } from '../../helpers/devnet.js';
 
 test.describe.configure({ mode: 'serial' });
 

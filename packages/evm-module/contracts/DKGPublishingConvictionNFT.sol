@@ -6,6 +6,7 @@ import {INamed} from "./interfaces/INamed.sol";
 import {IVersioned} from "./interfaces/IVersioned.sol";
 import {IInitializable} from "./interfaces/IInitializable.sol";
 import {HubDependent} from "./abstract/HubDependent.sol";
+import {PublishingMathLib} from "./libraries/PublishingMathLib.sol";
 import {PublishingConviction} from "./PublishingConviction.sol";
 import {PublishingConvictionStorage} from "./storage/PublishingConvictionStorage.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -384,17 +385,10 @@ contract DKGPublishingConvictionNFT is INamed, IVersioned, HubDependent, IInitia
         return publishingConvictionStorage.isRegisteredAgent(accountId, agent);
     }
 
-    /// @notice Discrete 6-tier discount ladder. Pure helper duplicated
-    ///         on the wrapper for cheap caller-side reads. Stays in
-    ///         lockstep with `PublishingConviction.getDiscountBps`.
+    /// @notice Discrete 6-tier discount ladder. Selector-compatible
+    ///         wrapper read over the shared publishing math helper.
     function getDiscountBps(uint96 committedTRAC) public pure returns (uint256) {
-        if (committedTRAC >= 1_000_000 ether) return 7500;
-        if (committedTRAC >= 500_000 ether)   return 5000;
-        if (committedTRAC >= 250_000 ether)   return 4000;
-        if (committedTRAC >= 100_000 ether)   return 3000;
-        if (committedTRAC >= 50_000 ether)    return 2000;
-        if (committedTRAC >= 25_000 ether)    return 1000;
-        return 0;
+        return PublishingMathLib.discountBps(committedTRAC);
     }
 
     /// @notice Discount basis points fixed at creation for `accountId`.

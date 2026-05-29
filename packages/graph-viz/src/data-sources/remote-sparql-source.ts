@@ -128,9 +128,15 @@ export class RemoteSparqlSource implements GraphDataSource {
       const response = await fetch(this.endpointUrl, {
         method: 'POST',
         headers: {
+          // Caller-supplied headers (e.g. auth) go FIRST so the
+          // protocol-required headers below cannot be overridden. The body is
+          // always a raw SPARQL query, so a caller default like
+          // `Content-Type: application/x-www-form-urlencoded` would corrupt the
+          // request (and recreate the large-query form-size regression) or make
+          // a compliant endpoint reject it.
+          ...this._config.headers,
           'Content-Type': 'application/sparql-query',
           'Accept': accept,
-          ...this._config.headers,
         },
         body: sparql,
         signal: controller.signal,

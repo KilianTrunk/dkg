@@ -117,4 +117,24 @@ describe('RemoteSparqlSource — W3C direct POST transport (Bug 4)', () => {
     expect(headers['Authorization']).toBe('Bearer xyz');
     expect(headers['Content-Type']).toBe('application/sparql-query');
   });
+
+  it('does NOT let caller headers override the protocol Content-Type/Accept', async () => {
+    // The raw-body transport requires `application/sparql-query`; a caller that
+    // (accidentally) supplies a form-encoded Content-Type must not be able to
+    // recreate the large-query regression.
+    const overriding = new RemoteSparqlSource({
+      endpoint: 'http://blazegraph.test/sparql',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Accept': 'text/csv',
+      },
+    });
+    const { calls } = stubFetch(() => jsonResponse({ head: { vars: [] }, results: { bindings: [] } }));
+
+    await overriding.select('SELECT ?s WHERE { ?s ?p ?o }');
+
+    const headers = calls[0].init.headers as Record<string, string>;
+    expect(headers['Content-Type']).toBe('application/sparql-query');
+    expect(headers['Accept']).toBe('application/sparql-results+json');
+  });
 });

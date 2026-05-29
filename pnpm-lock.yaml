@@ -118,6 +118,35 @@ importers:
         specifier: 4.0.18
         version: 4.0.18(@types/node@22.19.11)(happy-dom@20.8.9(bufferutil@4.1.0)(utf-8-validate@5.0.10))(jiti@2.7.0)(tsx@4.21.0)(yaml@2.9.0)
 
+  devnet/greenfield-10min:
+    dependencies:
+      '@origintrail-official/dkg-chain':
+        specifier: workspace:*
+        version: link:../../packages/chain
+      '@origintrail-official/dkg-core':
+        specifier: workspace:*
+        version: link:../../packages/core
+      ethers:
+        specifier: ^6.16.0
+        version: 6.16.0(bufferutil@4.1.0)(utf-8-validate@5.0.10)
+    devDependencies:
+      vitest:
+        specifier: ^4.0.18
+        version: 4.0.18(@types/node@22.19.11)(happy-dom@20.8.9(bufferutil@4.1.0)(utf-8-validate@5.0.10))(jiti@2.7.0)(tsx@4.21.0)(yaml@2.9.0)
+
+  devnet/rich-scenario:
+    dependencies:
+      '@origintrail-official/dkg-chain':
+        specifier: workspace:*
+        version: link:../../packages/chain
+      ethers:
+        specifier: ^6.16.0
+        version: 6.16.0(bufferutil@4.1.0)(utf-8-validate@5.0.10)
+    devDependencies:
+      vitest:
+        specifier: ^4.0.18
+        version: 4.0.18(@types/node@22.19.11)(happy-dom@20.8.9(bufferutil@4.1.0)(utf-8-validate@5.0.10))(jiti@2.7.0)(tsx@4.21.0)(yaml@2.9.0)
+
   devnet/v10-core-flows:
     dependencies:
       ethers:
@@ -9886,7 +9915,7 @@ snapshots:
 
   file-selector@2.1.2:
     dependencies:
-      tslib: 2.7.0
+      tslib: 2.8.1
 
   file-uri-to-path@1.0.0: {}
 
@@ -12694,8 +12723,7 @@ snapshots:
 
   tslib@2.7.0: {}
 
-  tslib@2.8.1:
-    optional: true
+  tslib@2.8.1: {}
 
   tsort@0.0.1: {}
 

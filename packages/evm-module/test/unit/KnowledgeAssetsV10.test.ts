@@ -14,8 +14,8 @@ import type {
   DKGStakingConvictionNFT,
   EpochStorage,
   Hub,
-  KnowledgeAssetsV10,
-  KnowledgeCollectionStorage,
+  KnowledgeAssetsLifecycle,
+  DKGKnowledgeAssets,
   MockERC1271Wallet,
   Profile,
   StakingV10,
@@ -25,10 +25,13 @@ import {
   buildAuthorAttestationPayload,
   buildPublishAckDigest,
   buildPublishParams,
+  buildUpdateAckDigest,
+  buildUpdateAuthorAttestationPayload,
   buildUpdateParams,
   DEFAULT_CHAIN_ID,
   signAckDigest,
   signAuthorAttestation,
+  signUpdateAuthorAttestation,
 } from '../helpers/v10-kc-helpers';
 import { createProfile, createProfiles } from '../helpers/profile-helpers';
 import {
@@ -39,7 +42,7 @@ import {
 import { NodeAccounts } from '../helpers/types';
 
 /**
- * V10 KnowledgeAssetsV10 unit tests (Phase 8 Task 4 rewrite).
+ * V10 KnowledgeAssetsLifecycle unit tests (Phase 8 Task 4 rewrite).
  *
  * Coverage prioritized per Tier 1 / Tier 2 / Tier 3 in the task brief. The
  * most important regression is T1.1 (double-count guard): conviction-path
@@ -63,11 +66,11 @@ import { NodeAccounts } from '../helpers/types';
  * digest builders deterministic; T1.6 flips this to demonstrate cross-chain
  * replay rejection.
  */
-describe('@unit KnowledgeAssetsV10', () => {
+describe('@unit KnowledgeAssetsLifecycle', () => {
   let accounts: SignerWithAddress[];
   let HubContract: Hub;
-  let KAV10: KnowledgeAssetsV10;
-  let KCS: KnowledgeCollectionStorage;
+  let KAV10: KnowledgeAssetsLifecycle;
+  let KCS: DKGKnowledgeAssets;
   let EpochStorageContract: EpochStorage;
   let AskStorageContract: AskStorage;
   let ChronosContract: Chronos;
@@ -89,8 +92,8 @@ describe('@unit KnowledgeAssetsV10', () => {
   type Fixture = {
     accounts: SignerWithAddress[];
     HubContract: Hub;
-    KAV10: KnowledgeAssetsV10;
-    KCS: KnowledgeCollectionStorage;
+    KAV10: KnowledgeAssetsLifecycle;
+    KCS: DKGKnowledgeAssets;
     EpochStorageContract: EpochStorage;
     AskStorageContract: AskStorage;
     ChronosContract: Chronos;
@@ -115,7 +118,7 @@ describe('@unit KnowledgeAssetsV10', () => {
       'Identity',
       'ParametersStorage',
       'IdentityStorage',
-      'KnowledgeCollectionStorage',
+      'DKGKnowledgeAssets',
       'ContextGraphStorage',
       'ContextGraphs',
       'ContextGraphValueStorage',
@@ -124,16 +127,16 @@ describe('@unit KnowledgeAssetsV10', () => {
       // staking stack so `setupNodes` can stake via the V10 NFT path.
       'StakingV10',
       'DKGStakingConvictionNFT',
-      'KnowledgeAssetsV10',
+      'KnowledgeAssetsLifecycle',
     ]);
 
     const signers = await hre.ethers.getSigners();
     const HubContract = await hre.ethers.getContract<Hub>('Hub');
     await HubContract.setContractAddress('HubOwner', signers[0].address);
 
-    const KAV10 = await hre.ethers.getContract<KnowledgeAssetsV10>('KnowledgeAssetsV10');
-    const KCS = await hre.ethers.getContract<KnowledgeCollectionStorage>(
-      'KnowledgeCollectionStorage',
+    const KAV10 = await hre.ethers.getContract<KnowledgeAssetsLifecycle>('KnowledgeAssetsLifecycle');
+    const KCS = await hre.ethers.getContract<DKGKnowledgeAssets>(
+      'DKGKnowledgeAssets',
     );
     const EpochStorageContract = await hre.ethers.getContract<EpochStorage>('EpochStorageV8');
     const AskStorageContract = await hre.ethers.getContract<AskStorage>('AskStorage');
@@ -360,7 +363,7 @@ describe('@unit KnowledgeAssetsV10', () => {
           author: creator,
           contextGraphId: cgId,
           merkleRoot,
-          knowledgeAssetsAmount: 10,
+          knowledgeAssetsAmount: 1,
           byteSize: 1000,
           epochs,
           tokenAmount,
@@ -370,7 +373,7 @@ describe('@unit KnowledgeAssetsV10', () => {
 
         // Active-sink invariant: the discounted cost is spread across
         // `epochs + 1` chain epochs (current partial + epochs-1 full +
-        // final partial), mirroring `KnowledgeAssetsV10._distributeTokens`.
+        // final partial), mirroring `KnowledgeAssetsLifecycle._distributeTokens`.
         // Sum of all `TokensAddedToEpochRange` events emitted by
         // `EpochStorage` against shard 1 inside `[currentEpoch,
         // currentEpoch+epochs]` MUST equal `expectedDiscounted`. We
@@ -446,7 +449,7 @@ describe('@unit KnowledgeAssetsV10', () => {
           author: creator,
           contextGraphId: cgId,
           merkleRoot,
-          knowledgeAssetsAmount: 10,
+          knowledgeAssetsAmount: 1,
           byteSize: 1000,
           epochs,
           tokenAmount,
@@ -501,7 +504,7 @@ describe('@unit KnowledgeAssetsV10', () => {
           author: creator,
           contextGraphId: 0n,
           merkleRoot,
-          knowledgeAssetsAmount: 10,
+          knowledgeAssetsAmount: 1,
           byteSize: 1000,
           epochs: 2,
           tokenAmount,
@@ -544,7 +547,7 @@ describe('@unit KnowledgeAssetsV10', () => {
           author: creator,
           contextGraphId: 0n,
           merkleRoot,
-          knowledgeAssetsAmount: 10,
+          knowledgeAssetsAmount: 1,
           byteSize: 1000,
           epochs: 2,
           tokenAmount,
@@ -580,7 +583,7 @@ describe('@unit KnowledgeAssetsV10', () => {
           author: creator,
           contextGraphId: cgId,
           merkleRoot,
-          knowledgeAssetsAmount: 10,
+          knowledgeAssetsAmount: 1,
           byteSize: 1000,
           epochs: 0,
           tokenAmount,
@@ -631,7 +634,7 @@ describe('@unit KnowledgeAssetsV10', () => {
           author: creator,
           contextGraphId: cgId,
           merkleRoot,
-          knowledgeAssetsAmount: 10,
+          knowledgeAssetsAmount: 1,
           byteSize: 1000,
           epochs: 2,
           tokenAmount,
@@ -690,7 +693,7 @@ describe('@unit KnowledgeAssetsV10', () => {
           author: creator,
           contextGraphId: cgId,
           merkleRoot,
-          knowledgeAssetsAmount: 10,
+          knowledgeAssetsAmount: 1,
           byteSize: 1000,
           epochs: 2,
           tokenAmount,
@@ -738,7 +741,7 @@ describe('@unit KnowledgeAssetsV10', () => {
           author: creator,
           contextGraphId: cgIdA,
           merkleRoot: merkleRootA,
-          knowledgeAssetsAmount: 10,
+          knowledgeAssetsAmount: 1,
           byteSize: 1000,
           epochs: 2,
           tokenAmount,
@@ -800,7 +803,7 @@ describe('@unit KnowledgeAssetsV10', () => {
           author: walletSigner,
           contextGraphId: cgId,
           merkleRoot,
-          knowledgeAssetsAmount: 10,
+          knowledgeAssetsAmount: 1,
           byteSize: 1000,
           epochs: 2,
           tokenAmount,
@@ -854,7 +857,7 @@ describe('@unit KnowledgeAssetsV10', () => {
           author: walletSigner,
           contextGraphId: cgId,
           merkleRoot,
-          knowledgeAssetsAmount: 10,
+          knowledgeAssetsAmount: 1,
           byteSize: 1000,
           epochs: 2,
           tokenAmount,
@@ -894,7 +897,7 @@ describe('@unit KnowledgeAssetsV10', () => {
           author,
           contextGraphId: cgId,
           merkleRoot,
-          knowledgeAssetsAmount: 10,
+          knowledgeAssetsAmount: 1,
           byteSize: 1000,
           epochs: 2,
           tokenAmount,
@@ -967,7 +970,7 @@ describe('@unit KnowledgeAssetsV10', () => {
           author: walletSigner,
           contextGraphId: cgId,
           merkleRoot,
-          knowledgeAssetsAmount: 10,
+          knowledgeAssetsAmount: 1,
           byteSize: 1000,
           epochs: 2,
           tokenAmount,
@@ -1000,7 +1003,7 @@ describe('@unit KnowledgeAssetsV10', () => {
         const merkleRoot = ethers.keccak256(ethers.toUtf8Bytes('t1.6-root'));
         const tokenAmount = ethers.parseEther('100');
         const epochs = 2;
-        const knowledgeAssetsAmount = 10;
+        const knowledgeAssetsAmount = 1;
         const byteSize = 1000;
 
         // Build a fake "mainnet" ACK digest (chain id 1) — signer attestation
@@ -1100,7 +1103,7 @@ describe('@unit KnowledgeAssetsV10', () => {
           author: creator,
           contextGraphId: cgId,
           merkleRoot,
-          knowledgeAssetsAmount: 10,
+          knowledgeAssetsAmount: 1,
           byteSize: Number(byteSize),
           epochs: 5, // give ourselves plenty of lifetime for update
           tokenAmount,
@@ -1126,13 +1129,14 @@ describe('@unit KnowledgeAssetsV10', () => {
           receivingNodes: base.receivingNodes,
           publisherIdentityId: base.publisherIdentityId,
           receiverIdentityIds: base.receiverIdentityIds,
+          author: base.creator,
           contextGraphId: base.cgId,
           id: base.kcId,
           preUpdateMerkleRootCount: 1n, // fresh KC has exactly 1 root
           newMerkleRoot,
           newByteSize: base.byteSize,
           newTokenAmount,
-          mintKnowledgeAssetsAmount: 1n, // >= 1 required by KCS mint guard
+          mintKnowledgeAssetsAmount: 0n,
           knowledgeAssetsToBurn: [],
           updateOperationId: 't1.7a-update',
         });
@@ -1157,13 +1161,14 @@ describe('@unit KnowledgeAssetsV10', () => {
           receivingNodes: base.receivingNodes,
           publisherIdentityId: base.publisherIdentityId,
           receiverIdentityIds: base.receiverIdentityIds,
+          author: base.creator,
           contextGraphId: base.cgId,
           id: base.kcId,
           preUpdateMerkleRootCount: 1n,
           newMerkleRoot,
           newByteSize: base.byteSize, // unchanged
           newTokenAmount: base.tokenAmount, // delta == 0
-          mintKnowledgeAssetsAmount: 1n,
+          mintKnowledgeAssetsAmount: 0n,
           knowledgeAssetsToBurn: [],
           updateOperationId: 't1.7b-update',
         });
@@ -1173,15 +1178,11 @@ describe('@unit KnowledgeAssetsV10', () => {
         ).to.not.be.reverted;
       });
 
-      // -- T1.7c: unauthorized (non-publisher) caller reverts --
+      // -- T1.7c: non-owner attestation reverts --
       //
-      // Baseline uses an OPEN CG, where update auth pins to the ORIGINAL
-      // publisher (`merkleRoots[0].publisher`). Any non-publisher caller
-      // reverts `UnauthorizedPublisher`, regardless of KA token ownership.
-      // This is the policy-branch auth gate (Codex Round 4 Finding 3);
-      // replaces the earlier `balanceOf`-based `NotKnowledgeCollectionTokenHolder`
-      // gate, which was hijackable under ERC-1155Delta transferability.
-      it('T1.7c: reverts UnauthorizedPublisher when caller is not the original publisher', async () => {
+      // Greenfield: update auth is `ownerOf(kaId) == authorAddress` (ERC-721).
+      // A stranger may pay TRAC, but the attested author must be the owner.
+      it('T1.7c: reverts NotKnowledgeAssetOwner when attested author is not the KA owner', async () => {
         const base = await publishBaselineKC();
         const stranger = accounts[15];
         const newMerkleRoot = ethers.keccak256(ethers.toUtf8Bytes('t1.7c-new'));
@@ -1194,27 +1195,26 @@ describe('@unit KnowledgeAssetsV10', () => {
           receivingNodes: base.receivingNodes,
           publisherIdentityId: base.publisherIdentityId,
           receiverIdentityIds: base.receiverIdentityIds,
+          author: stranger,
           contextGraphId: base.cgId,
           id: base.kcId,
           preUpdateMerkleRootCount: 1n,
           newMerkleRoot,
           newByteSize: base.byteSize,
           newTokenAmount,
-          mintKnowledgeAssetsAmount: 1n,
+          mintKnowledgeAssetsAmount: 0n,
           knowledgeAssetsToBurn: [],
           updateOperationId: 't1.7c-update',
         });
 
-        // Give stranger TRAC + approval so the revert is auth-only, not
-        // a shortfall in allowance or balance.
         await TokenContract.connect(accounts[0]).transfer(stranger.address, delta);
         await TokenContract.connect(stranger).approve(kav10Address, delta);
 
         await expect(
           KAV10.connect(stranger).update(up),
         )
-          .to.be.revertedWithCustomError(KAV10, 'UnauthorizedPublisher')
-          .withArgs(base.cgId, stranger.address);
+          .to.be.revertedWithCustomError(KAV10, 'NotKnowledgeAssetOwner')
+          .withArgs(base.kcId, base.creator.address, stranger.address);
       });
 
       // -- T1.7d: rebate (newTokenAmount < current) reverts --
@@ -1229,13 +1229,14 @@ describe('@unit KnowledgeAssetsV10', () => {
           receivingNodes: base.receivingNodes,
           publisherIdentityId: base.publisherIdentityId,
           receiverIdentityIds: base.receiverIdentityIds,
+          author: base.creator,
           contextGraphId: base.cgId,
           id: base.kcId,
           preUpdateMerkleRootCount: 1n,
           newMerkleRoot,
           newByteSize: base.byteSize,
           newTokenAmount,
-          mintKnowledgeAssetsAmount: 1n,
+          mintKnowledgeAssetsAmount: 0n,
           knowledgeAssetsToBurn: [],
           updateOperationId: 't1.7d-update',
         });
@@ -1257,7 +1258,7 @@ describe('@unit KnowledgeAssetsV10', () => {
         const base = await publishBaselineKC();
 
         // First update: metadata-only (delta == 0). Chain preUpdate count = 1.
-        // `mintKnowledgeAssetsAmount: 1n` mirrors T1.7b since KCS's mint
+        // `mintKnowledgeAssetsAmount: 0n` mirrors T1.7b since KCS's mint
         // helper requires > 0 (same reason T1.7b uses 1).
         const firstRoot = ethers.keccak256(ethers.toUtf8Bytes('t1.7e-first'));
         const up1 = await buildUpdateParams({
@@ -1266,13 +1267,14 @@ describe('@unit KnowledgeAssetsV10', () => {
           receivingNodes: base.receivingNodes,
           publisherIdentityId: base.publisherIdentityId,
           receiverIdentityIds: base.receiverIdentityIds,
+          author: base.creator,
           contextGraphId: base.cgId,
           id: base.kcId,
           preUpdateMerkleRootCount: 1n,
           newMerkleRoot: firstRoot,
           newByteSize: base.byteSize,
           newTokenAmount: base.tokenAmount,
-          mintKnowledgeAssetsAmount: 1n,
+          mintKnowledgeAssetsAmount: 0n,
           knowledgeAssetsToBurn: [],
           updateOperationId: 't1.7e-first',
         });
@@ -1327,13 +1329,14 @@ describe('@unit KnowledgeAssetsV10', () => {
           receivingNodes: base.receivingNodes,
           publisherIdentityId: base.publisherIdentityId,
           receiverIdentityIds: base.receiverIdentityIds,
+          author: base.creator,
           contextGraphId: base.cgId,
           id: base.kcId,
           preUpdateMerkleRootCount: 1n,
           newMerkleRoot,
           newByteSize: base.byteSize,
           newTokenAmount,
-          mintKnowledgeAssetsAmount: 1n,
+          mintKnowledgeAssetsAmount: 0n,
           knowledgeAssetsToBurn: [],
           updateOperationId: 't1.7f-update',
         });
@@ -1390,6 +1393,7 @@ describe('@unit KnowledgeAssetsV10', () => {
           receivingNodes: base.receivingNodes,
           publisherIdentityId: base.publisherIdentityId,
           receiverIdentityIds: base.receiverIdentityIds,
+          author: base.creator,
           contextGraphId: base.cgId,
           id: base.kcId,
           preUpdateMerkleRootCount: 1n,
@@ -1411,30 +1415,12 @@ describe('@unit KnowledgeAssetsV10', () => {
         expect(roots[1].merkleRoot).to.equal(newMerkleRoot);
         expect(roots[1].publisher).to.equal(base.creator.address);
         const metaAfter = await KCS.getKnowledgeCollectionMetadata(base.kcId);
-        expect(metaAfter[2]).to.equal(10n);
+        expect(metaAfter[2]).to.equal(1n);
         expect(metaAfter[6]).to.equal(base.tokenAmount);
       });
 
-      // -- T1.7h: burn-list happy path (Codex Round 2, Fix A positive) --
-      //
-      // Regression for `_burnBatch` inverted range check. Pre-fix, the
-      // condition reverted on tokens INSIDE the KC's range. Post-fix, the
-      // caller can burn their own KC's KA tokens via updateDirect.
-      it('T1.7h: update with a valid burn list burns the caller-owned KA tokens', async () => {
+      it('T1.7h: reverts when update tries to mint additional ERC-721 tokens', async () => {
         const base = await publishBaselineKC();
-
-        const maxSize = await KCS.KNOWLEDGE_COLLECTION_MAX_SIZE();
-        const firstTokenId = (base.kcId - 1n) * maxSize + 1n;
-
-        // Sanity: caller owns the token BEFORE the update.
-        expect(
-          await KCS['balanceOf(address,uint256,uint256)'](
-            base.creator.address,
-            firstTokenId,
-            firstTokenId + 1n,
-          ),
-        ).to.equal(1n);
-
         const newMerkleRoot = ethers.keccak256(ethers.toUtf8Bytes('t1.7h-new'));
         const up = await buildUpdateParams({
           chainId,
@@ -1442,50 +1428,23 @@ describe('@unit KnowledgeAssetsV10', () => {
           receivingNodes: base.receivingNodes,
           publisherIdentityId: base.publisherIdentityId,
           receiverIdentityIds: base.receiverIdentityIds,
+          author: base.creator,
           contextGraphId: base.cgId,
           id: base.kcId,
           preUpdateMerkleRootCount: 1n,
           newMerkleRoot,
           newByteSize: base.byteSize,
           newTokenAmount: base.tokenAmount,
-          mintKnowledgeAssetsAmount: 0n,
-          knowledgeAssetsToBurn: [firstTokenId],
+          mintKnowledgeAssetsAmount: 1n,
+          knowledgeAssetsToBurn: [],
           updateOperationId: 't1.7h-update',
         });
 
-        await expect(
-          KAV10.connect(base.creator).update(up),
-        ).to.not.be.reverted;
-
-        // Caller no longer owns the token.
-        expect(
-          await KCS['balanceOf(address,uint256,uint256)'](
-            base.creator.address,
-            firstTokenId,
-            firstTokenId + 1n,
-          ),
-        ).to.equal(0n);
-
-        // Token recorded in KC's burned[] list.
-        const metaAfter = await KCS.getKnowledgeCollectionMetadata(base.kcId);
-        const burnedList = metaAfter[1];
-        expect(burnedList.length).to.equal(1);
-        expect(burnedList[0]).to.equal(firstTokenId);
+        await expect(KAV10.connect(base.creator).update(up)).to.be.reverted;
       });
 
-      // -- T1.7i: out-of-range burn reverts (Codex Round 2, Fix A negative) --
-      //
-      // The burn-range gate must still reject tokens from a DIFFERENT KC.
-      // A caller that owns tokens from KC #2 must NOT be able to pass them
-      // to an update on KC #1 — the inverted pre-fix code let this through.
-      it('T1.7i: update with out-of-range burn token reverts NotPartOfKnowledgeCollection', async () => {
+      it('T1.7i: reverts when update tries to burn ERC-721 tokens', async () => {
         const base = await publishBaselineKC();
-
-        // Token ID from KC #2's range (not KC #1's). KC #1 has
-        // [1, 1 + minted); KC #2 has [1 + MAX_SIZE, 1 + MAX_SIZE + minted).
-        const maxSize = await KCS.KNOWLEDGE_COLLECTION_MAX_SIZE();
-        const outOfRangeTokenId = maxSize + 1n;
-
         const newMerkleRoot = ethers.keccak256(ethers.toUtf8Bytes('t1.7i-new'));
         const up = await buildUpdateParams({
           chainId,
@@ -1493,6 +1452,7 @@ describe('@unit KnowledgeAssetsV10', () => {
           receivingNodes: base.receivingNodes,
           publisherIdentityId: base.publisherIdentityId,
           receiverIdentityIds: base.receiverIdentityIds,
+          author: base.creator,
           contextGraphId: base.cgId,
           id: base.kcId,
           preUpdateMerkleRootCount: 1n,
@@ -1500,47 +1460,24 @@ describe('@unit KnowledgeAssetsV10', () => {
           newByteSize: base.byteSize,
           newTokenAmount: base.tokenAmount,
           mintKnowledgeAssetsAmount: 0n,
-          knowledgeAssetsToBurn: [outOfRangeTokenId],
+          knowledgeAssetsToBurn: [base.kcId],
           updateOperationId: 't1.7i-update',
         });
 
-        await expect(KAV10.connect(base.creator).update(up))
-          .to.be.revertedWithCustomError(KCS, 'NotPartOfKnowledgeCollection')
-          .withArgs(base.kcId, outOfRangeTokenId);
+        await expect(KAV10.connect(base.creator).update(up)).to.be.reverted;
       });
 
-      // -- T1.7j: KA token transfer does NOT grant update authority --
-      //
-      // Codex Round 4 Finding 3. Baseline publishes in an open CG. The
-      // original publisher transfers 1 KA token to a stranger via
-      // `safeTransferFrom`. Pre-fix, the `balanceOf(stranger, kcRange) > 0`
-      // gate would have authorized the stranger to rotate the merkle
-      // root, mint new KAs, and burn existing KAs. Post-fix, open-CG
-      // update auth is pinned to `merkleRoots[0].publisher` (the original
-      // paying principal), so holding a transferred KA token buys
-      // nothing. Locks the exploit closed.
-      it('T1.7j: KA token transfer to stranger does NOT grant update auth', async () => {
+      it('T1.7j: ERC-721 transfer grants update auth to the new owner', async () => {
         const base = await publishBaselineKC();
         const stranger = accounts[16];
+        const kaId = base.kcId;
 
-        // Transfer 1 KA from the original publisher to the stranger.
-        const maxSize = await KCS.KNOWLEDGE_COLLECTION_MAX_SIZE();
-        const firstTokenId = (base.kcId - 1n) * maxSize + 1n;
-        await KCS.connect(base.creator).safeTransferFrom(
+        await KCS.connect(base.creator).transferFrom(
           base.creator.address,
           stranger.address,
-          firstTokenId,
-          1n,
-          '0x',
+          kaId,
         );
-        // Sanity: stranger now holds the transferred token.
-        expect(
-          await KCS['balanceOf(address,uint256,uint256)'](
-            stranger.address,
-            firstTokenId,
-            firstTokenId + 1n,
-          ),
-        ).to.equal(1n);
+        expect(await KCS.ownerOf(kaId)).to.equal(stranger.address);
 
         const newMerkleRoot = ethers.keccak256(ethers.toUtf8Bytes('t1.7j-new'));
         const up = await buildUpdateParams({
@@ -1549,33 +1486,44 @@ describe('@unit KnowledgeAssetsV10', () => {
           receivingNodes: base.receivingNodes,
           publisherIdentityId: base.publisherIdentityId,
           receiverIdentityIds: base.receiverIdentityIds,
+          author: stranger,
           contextGraphId: base.cgId,
-          id: base.kcId,
+          id: kaId,
           preUpdateMerkleRootCount: 1n,
           newMerkleRoot,
           newByteSize: base.byteSize,
-          newTokenAmount: base.tokenAmount, // metadata-only update
-          mintKnowledgeAssetsAmount: 1n,
+          newTokenAmount: base.tokenAmount,
+          mintKnowledgeAssetsAmount: 0n,
           knowledgeAssetsToBurn: [],
           updateOperationId: 't1.7j-update',
         });
 
-        // Stranger's update attempt reverts even though they now hold a
-        // KA token from the KC. The revert comes from the open-CG
-        // original-publisher pin, NOT from the balanceOf gate.
         await expect(
           KAV10.connect(stranger).update(up),
-        )
-          .to.be.revertedWithCustomError(KAV10, 'UnauthorizedPublisher')
-          .withArgs(base.cgId, stranger.address);
-
-        // Positive sanity: the original publisher, who no longer holds
-        // token `firstTokenId` (it's with the stranger), can still
-        // update via the original-publisher pin. Locks "original
-        // publisher retains rights even after selling a KA token".
-        await expect(
-          KAV10.connect(base.creator).update(up),
         ).to.not.be.reverted;
+
+        const upOldOwner = await buildUpdateParams({
+          chainId,
+          kav10Address,
+          receivingNodes: base.receivingNodes,
+          publisherIdentityId: base.publisherIdentityId,
+          receiverIdentityIds: base.receiverIdentityIds,
+          author: base.creator,
+          contextGraphId: base.cgId,
+          id: kaId,
+          preUpdateMerkleRootCount: 2n,
+          newMerkleRoot: ethers.keccak256(ethers.toUtf8Bytes('t1.7j-old-owner')),
+          newByteSize: base.byteSize,
+          newTokenAmount: base.tokenAmount,
+          mintKnowledgeAssetsAmount: 0n,
+          knowledgeAssetsToBurn: [],
+          updateOperationId: 't1.7j-old-owner',
+        });
+        await expect(
+          KAV10.connect(base.creator).update(upOldOwner),
+        )
+          .to.be.revertedWithCustomError(KAV10, 'NotKnowledgeAssetOwner')
+          .withArgs(kaId, stranger.address, base.creator.address);
       });
     });
 
@@ -1622,7 +1570,7 @@ describe('@unit KnowledgeAssetsV10', () => {
           author: creator,
           contextGraphId: cgId,
           merkleRoot,
-          knowledgeAssetsAmount: 10,
+          knowledgeAssetsAmount: 1,
           byteSize: Number(byteSize),
           epochs,
           tokenAmount,
@@ -1658,13 +1606,14 @@ describe('@unit KnowledgeAssetsV10', () => {
           receivingNodes: base.receivingNodes,
           publisherIdentityId: base.publisherIdentityId,
           receiverIdentityIds: base.receiverIdentityIds,
+          author: base.creator,
           contextGraphId: base.cgId,
           id: base.kcId,
           preUpdateMerkleRootCount: 1n,
           newMerkleRoot,
           newByteSize,
           newTokenAmount: base.tokenAmount,
-          mintKnowledgeAssetsAmount: 1n,
+          mintKnowledgeAssetsAmount: 0n,
           knowledgeAssetsToBurn: [],
           updateOperationId: 't1.8a-update',
         });
@@ -1692,13 +1641,14 @@ describe('@unit KnowledgeAssetsV10', () => {
           receivingNodes: base.receivingNodes,
           publisherIdentityId: base.publisherIdentityId,
           receiverIdentityIds: base.receiverIdentityIds,
+          author: base.creator,
           contextGraphId: base.cgId,
           id: base.kcId,
           preUpdateMerkleRootCount: 1n,
           newMerkleRoot,
           newByteSize,
           newTokenAmount,
-          mintKnowledgeAssetsAmount: 1n,
+          mintKnowledgeAssetsAmount: 0n,
           knowledgeAssetsToBurn: [],
           updateOperationId: 't1.8b-update',
         });
@@ -1752,13 +1702,14 @@ describe('@unit KnowledgeAssetsV10', () => {
           receivingNodes: base.receivingNodes,
           publisherIdentityId: base.publisherIdentityId,
           receiverIdentityIds: base.receiverIdentityIds,
+          author: base.creator,
           contextGraphId: base.cgId,
           id: base.kcId,
           preUpdateMerkleRootCount: 1n,
           newMerkleRoot,
           newByteSize,
           newTokenAmount,
-          mintKnowledgeAssetsAmount: 1n,
+          mintKnowledgeAssetsAmount: 0n,
           knowledgeAssetsToBurn: [],
           updateOperationId: 't1.8c-update',
         });
@@ -1819,13 +1770,14 @@ describe('@unit KnowledgeAssetsV10', () => {
           receivingNodes: base.receivingNodes,
           publisherIdentityId: base.publisherIdentityId,
           receiverIdentityIds: base.receiverIdentityIds,
+          author: base.creator,
           contextGraphId: base.cgId,
           id: base.kcId,
           preUpdateMerkleRootCount: 1n,
           newMerkleRoot,
           newByteSize,
           newTokenAmount,
-          mintKnowledgeAssetsAmount: 1n,
+          mintKnowledgeAssetsAmount: 0n,
           knowledgeAssetsToBurn: [],
           updateOperationId: 't1.8d-update',
         });
@@ -1886,7 +1838,7 @@ describe('@unit KnowledgeAssetsV10', () => {
           author: creator,
           contextGraphId: cgId,
           merkleRoot,
-          knowledgeAssetsAmount: 10,
+          knowledgeAssetsAmount: 1,
           byteSize: 1000,
           epochs,
           tokenAmount,
@@ -1927,7 +1879,7 @@ describe('@unit KnowledgeAssetsV10', () => {
           author: creator,
           contextGraphId: cgId,
           merkleRoot,
-          knowledgeAssetsAmount: 10,
+          knowledgeAssetsAmount: 1,
           byteSize: 1000,
           epochs: 2,
           tokenAmount,
@@ -1964,7 +1916,7 @@ describe('@unit KnowledgeAssetsV10', () => {
           author: creator,
           contextGraphId: cgId,
           merkleRoot,
-          knowledgeAssetsAmount: 10,
+          knowledgeAssetsAmount: 1,
           byteSize: 1000,
           epochs: 2,
           tokenAmount,
@@ -2007,7 +1959,7 @@ describe('@unit KnowledgeAssetsV10', () => {
           author: stranger,
           contextGraphId: cgId,
           merkleRoot,
-          knowledgeAssetsAmount: 10,
+          knowledgeAssetsAmount: 1,
           byteSize: 1000,
           epochs: 2,
           tokenAmount,
@@ -2073,7 +2025,7 @@ describe('@unit KnowledgeAssetsV10', () => {
           author: agent,
           contextGraphId: cgId,
           merkleRoot,
-          knowledgeAssetsAmount: 10,
+          knowledgeAssetsAmount: 1,
           byteSize: 1000,
           epochs: convictionEpochs,
           tokenAmount,
@@ -2121,7 +2073,7 @@ describe('@unit KnowledgeAssetsV10', () => {
           author: creator,
           contextGraphId: cgId,
           merkleRoot,
-          knowledgeAssetsAmount: 10,
+          knowledgeAssetsAmount: 1,
           byteSize,
           epochs,
           tokenAmount,
@@ -2156,7 +2108,7 @@ describe('@unit KnowledgeAssetsV10', () => {
           newMerkleRoot,
           newByteSize: BigInt(byteSize),
           newTokenAmount,
-          mintKnowledgeAssetsAmount: 1n,
+          mintKnowledgeAssetsAmount: 0n,
           knowledgeAssetsToBurn: [],
           updateOperationId: 't2.5-update',
         });
@@ -2199,7 +2151,7 @@ describe('@unit KnowledgeAssetsV10', () => {
           author: creator,
           contextGraphId: cgId,
           merkleRoot,
-          knowledgeAssetsAmount: 10,
+          knowledgeAssetsAmount: 1,
           byteSize,
           epochs,
           tokenAmount,
@@ -2300,7 +2252,7 @@ describe('@unit KnowledgeAssetsV10', () => {
           author,
           contextGraphId: cgId,
           merkleRoot,
-          knowledgeAssetsAmount: 10,
+          knowledgeAssetsAmount: 1,
           byteSize: 1000,
           epochs: 2,
           tokenAmount,
@@ -2331,7 +2283,7 @@ describe('@unit KnowledgeAssetsV10', () => {
           author,
           contextGraphId: cgId,
           merkleRoot,
-          knowledgeAssetsAmount: 10,
+          knowledgeAssetsAmount: 1,
           byteSize: 1000,
           epochs: 2,
           tokenAmount,
@@ -2368,7 +2320,7 @@ describe('@unit KnowledgeAssetsV10', () => {
           author,
           contextGraphId: cgId,
           merkleRoot,
-          knowledgeAssetsAmount: 10,
+          knowledgeAssetsAmount: 1,
           byteSize: 1000,
           epochs: 2,
           tokenAmount,
@@ -2422,7 +2374,7 @@ describe('@unit KnowledgeAssetsV10', () => {
           author,
           contextGraphId: cgId,
           merkleRoot,
-          knowledgeAssetsAmount: 10,
+          knowledgeAssetsAmount: 1,
           byteSize: 1000,
           epochs: 2,
           tokenAmount,
@@ -2472,7 +2424,7 @@ describe('@unit KnowledgeAssetsV10', () => {
           author,
           contextGraphId: cgId,
           merkleRoot,
-          knowledgeAssetsAmount: 10,
+          knowledgeAssetsAmount: 1,
           byteSize: 1000,
           epochs: 2,
           tokenAmount,
@@ -2514,7 +2466,7 @@ describe('@unit KnowledgeAssetsV10', () => {
     // ----------------------------------------------------------------------
     // T-HARDEN: rc.12 hardening pass regression coverage (PR #781)
     //
-    // Pins the new revert surfaces added in `KnowledgeAssetsV10@10.1.1`:
+    // Pins the new revert surfaces added in `KnowledgeAssetsLifecycle@10.1.1`:
     //   - `_validateTokenAmount` strict-positive `tokenAmount` floor on
     //     `publish` and `extendKnowledgeCollectionLifetime`. Surfaces as
     //     `InvalidTokenAmount(1, 0)` regardless of payload size — the
@@ -2544,7 +2496,7 @@ describe('@unit KnowledgeAssetsV10', () => {
           author: creator,
           contextGraphId: cgId,
           merkleRoot: ethers.keccak256(ethers.toUtf8Bytes('t-harden-1-root')),
-          knowledgeAssetsAmount: 10,
+          knowledgeAssetsAmount: 1,
           byteSize: 1000,
           epochs: 2,
           tokenAmount: 0n,
@@ -2578,7 +2530,7 @@ describe('@unit KnowledgeAssetsV10', () => {
           author: creator,
           contextGraphId: cgId,
           merkleRoot: ethers.keccak256(ethers.toUtf8Bytes('t-harden-2-root')),
-          knowledgeAssetsAmount: 10,
+          knowledgeAssetsAmount: 1,
           byteSize: 1000,
           epochs: 2,
           tokenAmount,
@@ -2597,106 +2549,11 @@ describe('@unit KnowledgeAssetsV10', () => {
       });
 
       // --------------------------------------------------------------------
-      // T-HARDEN.3: nonReentrant guard rejects re-entry from the ERC-1155
-      // mint acceptance callback. The publisher is a contract that catches
-      // the inner-call revert internally, asserts the selector matches
-      // `ReentrancyGuardReentrantCall()`, and returns the ERC-1155 magic
-      // value so the outer publish completes. ERC1155Delta's receiver-
-      // acceptance try/catch would otherwise mask the inner revert as
-      // `TransferToNonERC1155ReceiverImplementer`, so the assertion has to
-      // live inside the receiver — surfaced via the mock's `reentryRejected`
-      // flag and `lastInnerSelector`.
+      // T-HARDEN.3: nonReentrant on `publish` rejects re-entry from the
+      // ERC-721 `_safeMint` callback when the KA owner is the publisher
+      // contract (greenfield: one NFT minted to `authorAddress`).
       // --------------------------------------------------------------------
-      it('publish reverts ReentrancyGuardReentrantCall when re-entered from the ERC-1155 mint callback', async () => {
-        const creator = getDefaultKCCreator(accounts);
-        const nodes = await setupNodes();
-        const cgId = await createOpenCG(creator);
-
-        // Deploy the reentrancy harness. The publisher of record (msg.sender)
-        // of the outer call MUST be the mock — that's the address the
-        // ERC-1155Delta mint will dispatch the acceptance callback to.
-        const Mock = await hre.ethers.getContractFactory(
-          'MockReentrantPublisher',
-        );
-        const mock = await Mock.deploy();
-        await mock.setKAV10(kav10Address);
-
-        // Author is an EOA (`creator`) — the EIP-712 attestation is
-        // recovered via ECDSA, so the publisher being a contract is fine.
-        const tokenAmount = ethers.parseEther('100');
-        const p = await buildPublishParams({
-          chainId,
-          kav10Address,
-          receivingNodes: nodes.receivingNodes,
-          publisherIdentityId: nodes.publisherIdentityId,
-          receiverIdentityIds: nodes.receiverIdentityIds,
-          author: creator,
-          contextGraphId: cgId,
-          merkleRoot: ethers.keccak256(ethers.toUtf8Bytes('t-harden-3-root')),
-          knowledgeAssetsAmount: 10,
-          byteSize: 1000,
-          epochs: 2,
-          tokenAmount,
-          isImmutable: false,
-          publishOperationId: 't-harden-3-op',
-        });
-
-        // Fund the mock with TRAC and have it grant the KAV10 allowance.
-        await TokenContract.connect(accounts[0]).transfer(
-          await mock.getAddress(),
-          tokenAmount,
-        );
-        await mock.approveTrac(await TokenContract.getAddress(), tokenAmount);
-
-        // Inner re-entry payload: any `publish(...)` call works; we're
-        // testing that the `nonReentrant` modifier fires at the gate
-        // before any logic runs. Reusing the outer params is the simplest
-        // shape that encodes cleanly.
-        const publishCalldata = KAV10.interface.encodeFunctionData('publish', [
-          p,
-        ]);
-        await mock.arm(publishCalldata);
-
-        // Drive the outer publish from the mock. The mint callback re-enters,
-        // the inner call reverts with `ReentrancyGuardReentrantCall()`, the
-        // mock captures the selector and sets `reentryRejected`, then
-        // returns the success magic value so the outer call completes.
-        await mock.callKAV10(publishCalldata);
-
-        expect(await mock.reentryAttempted()).to.equal(true);
-        expect(await mock.reentryRejected()).to.equal(true);
-        // 0x3ee5aeb5 == bytes4(keccak256("ReentrancyGuardReentrantCall()"))
-        expect(await mock.lastInnerSelector()).to.equal('0x3ee5aeb5');
-      });
-
-      // --------------------------------------------------------------------
-      // T-HARDEN.4: nonReentrant on `update`. The update path mints
-      // `mintKnowledgeAssetsAmount` ERC-1155Delta tokens to `msg.sender`
-      // (the publisher of record). When the publisher is a contract,
-      // the mint dispatches `onERC1155BatchReceived` to it — exactly
-      // the same receiver-callback surface `publish` exercises in
-      // T-HARDEN.3. This test pins that the `nonReentrant` modifier on
-      // `update` rejects a callback-driven re-entry with the same
-      // `ReentrancyGuardReentrantCall()` selector.
-      //
-      // Setup steps:
-      //   1. Deploy the mock with empty `innerCalldata` so the mint
-      //      callback during the BASELINE publish is a no-op.
-      //   2. Publish a KC from the mock (mock becomes publisher of
-      //      record). The OPEN-CG update auth gate keys on the
-      //      original publisher, so the mock can subsequently update.
-      //   3. Arm the mock with an update payload (resets all re-entry
-      //      flags) and have the mock drive the outer update from its
-      //      own storage context.
-      //   4. The outer update mints again to the mock, the mint
-      //      callback fires, the mock re-enters `update`, the
-      //      `nonReentrant` modifier fires BEFORE any
-      //      signature/ACK/byte-size validation runs and reverts with
-      //      `ReentrancyGuardReentrantCall()`. The mock captures the
-      //      selector and returns the ERC-1155 success magic value so
-      //      the outer update completes.
-      // --------------------------------------------------------------------
-      it('update reverts ReentrancyGuardReentrantCall when re-entered from the ERC-1155 mint callback', async () => {
+      it('publish reverts ReentrancyGuardReentrantCall when re-entered from ERC-721 mint callback', async () => {
         const creator = getDefaultKCCreator(accounts);
         const nodes = await setupNodes();
         const cgId = await createOpenCG(creator);
@@ -2707,26 +2564,120 @@ describe('@unit KnowledgeAssetsV10', () => {
         const mock = await Mock.deploy();
         const mockAddr = await mock.getAddress();
         await mock.setKAV10(kav10Address);
+        await mock.setEip1271Signer(creator.address);
 
-        const baselineTokenAmount = ethers.parseEther('100');
-        const deltaTokenAmount = ethers.parseEther('50');
-        const totalTracForMock = baselineTokenAmount + deltaTokenAmount;
-
-        // Fund + approve once, covers both the baseline publish and the
-        // post-publish update delta.
-        await TokenContract.connect(accounts[0]).transfer(
-          mockAddr,
-          totalTracForMock,
+        const merkleRoot = ethers.keccak256(
+          ethers.toUtf8Bytes('t-harden-3-root'),
         );
-        await mock.approveTrac(
-          await TokenContract.getAddress(),
-          totalTracForMock,
+        const tokenAmount = ethers.parseEther('100');
+        const authorSig = await signAuthorAttestation(
+          creator,
+          buildAuthorAttestationPayload({
+            chainId,
+            kav10Address,
+            contextGraphId: cgId,
+            merkleRoot,
+            authorAddress: mockAddr,
+          }),
+        );
+        const p = {
+          ...(await buildPublishParams({
+            chainId,
+            kav10Address,
+            receivingNodes: nodes.receivingNodes,
+            publisherIdentityId: nodes.publisherIdentityId,
+            receiverIdentityIds: nodes.receiverIdentityIds,
+            author: creator,
+            contextGraphId: cgId,
+            merkleRoot,
+            knowledgeAssetsAmount: 1,
+            byteSize: 1000,
+            epochs: 2,
+            tokenAmount,
+            isImmutable: false,
+            publishOperationId: 't-harden-3-op',
+            authorSigOverride: authorSig,
+          })),
+          authorAddress: mockAddr,
+        };
+
+        await TokenContract.connect(accounts[0]).transfer(mockAddr, tokenAmount);
+        await mock.approveTrac(await TokenContract.getAddress(), tokenAmount);
+
+        const publishCalldata = KAV10.interface.encodeFunctionData('publish', [
+          p,
+        ]);
+        await mock.arm(publishCalldata);
+        await mock.callKAV10(publishCalldata);
+
+        expect(await mock.reentryAttempted()).to.equal(true);
+        expect(await mock.reentryRejected()).to.equal(true);
+        expect(await mock.lastInnerSelector()).to.equal('0x3ee5aeb5');
+      });
+
+      // --------------------------------------------------------------------
+      // T-HARDEN.4: greenfield `update` is metadata-only (no ERC-721/1155
+      // mint callback). Contract publisher + contract owner via EIP-1271
+      // still succeeds end-to-end.
+      // --------------------------------------------------------------------
+      it('update succeeds when contract publisher owns the KA (no mint callback)', async () => {
+        const creator = getDefaultKCCreator(accounts);
+        const nodes = await setupNodes();
+        const cgId = await createOpenCG(creator);
+
+        const Mock = await hre.ethers.getContractFactory(
+          'MockReentrantPublisher',
+        );
+        const mock = await Mock.deploy();
+        const mockAddr = await mock.getAddress();
+        await mock.setKAV10(kav10Address);
+        await mock.setEip1271Signer(creator.address);
+
+        const publishRoot = ethers.keccak256(
+          ethers.toUtf8Bytes('t-harden-4-root'),
+        );
+        const tokenAmount = ethers.parseEther('100');
+        await TokenContract.connect(accounts[0]).transfer(mockAddr, tokenAmount);
+        await mock.approveTrac(await TokenContract.getAddress(), tokenAmount);
+
+        const publishAuthorSig = await signAuthorAttestation(
+          creator,
+          buildAuthorAttestationPayload({
+            chainId,
+            kav10Address,
+            contextGraphId: cgId,
+            merkleRoot: publishRoot,
+            authorAddress: mockAddr,
+          }),
+        );
+        const publishParams = {
+          ...(await buildPublishParams({
+            chainId,
+            kav10Address,
+            receivingNodes: nodes.receivingNodes,
+            publisherIdentityId: nodes.publisherIdentityId,
+            receiverIdentityIds: nodes.receiverIdentityIds,
+            author: creator,
+            contextGraphId: cgId,
+            merkleRoot: publishRoot,
+            knowledgeAssetsAmount: 1,
+            byteSize: 1000,
+            epochs: 5,
+            tokenAmount,
+            isImmutable: false,
+            publishOperationId: 't-harden-4-publish-op',
+            authorSigOverride: publishAuthorSig,
+          })),
+          authorAddress: mockAddr,
+        };
+        await mock.callKAV10(
+          KAV10.interface.encodeFunctionData('publish', [publishParams]),
         );
 
-        // Step 2: clean baseline publish (no re-entry — innerCalldata
-        // is still the empty default, so `_maybeReenter` short-circuits
-        // on the mint callback).
-        const publishParams = await buildPublishParams({
+        const newMerkleRoot = ethers.keccak256(
+          ethers.toUtf8Bytes('t-harden-4-update-root'),
+        );
+        const baseUpdate = await buildUpdateParams({
           chainId,
           kav10Address,
           receivingNodes: nodes.receivingNodes,
@@ -2734,68 +2685,37 @@ describe('@unit KnowledgeAssetsV10', () => {
           receiverIdentityIds: nodes.receiverIdentityIds,
           author: creator,
           contextGraphId: cgId,
-          merkleRoot: ethers.keccak256(ethers.toUtf8Bytes('t-harden-4-root')),
-          knowledgeAssetsAmount: 10,
-          byteSize: 1000,
-          epochs: 5,
-          tokenAmount: baselineTokenAmount,
-          isImmutable: false,
-          publishOperationId: 't-harden-4-publish-op',
-        });
-        const publishCalldata = KAV10.interface.encodeFunctionData('publish', [
-          publishParams,
-        ]);
-        await mock.callKAV10(publishCalldata);
-
-        // Sanity: the baseline publish must have completed cleanly —
-        // no spurious re-entry recorded.
-        expect(await mock.reentryAttempted()).to.equal(false);
-        expect(await mock.reentryRejected()).to.equal(false);
-
-        const kcId = 1n;
-
-        // Step 3: build update params for the KC the mock just
-        // published. `preUpdateMerkleRootCount: 1n` because a fresh
-        // publish lays down exactly one merkle root. The author field
-        // in `buildUpdateParams` is irrelevant on the V10.1 update
-        // path (no per-update author signature yet — see the
-        // `_executeUpdateCore` NatSpec).
-        const updateParams = await buildUpdateParams({
-          chainId,
-          kav10Address,
-          receivingNodes: nodes.receivingNodes,
-          publisherIdentityId: nodes.publisherIdentityId,
-          receiverIdentityIds: nodes.receiverIdentityIds,
-          contextGraphId: cgId,
-          id: kcId,
+          id: 1n,
           preUpdateMerkleRootCount: 1n,
-          newMerkleRoot: ethers.keccak256(
-            ethers.toUtf8Bytes('t-harden-4-update-root'),
-          ),
-          newByteSize: 1000,
-          newTokenAmount: baselineTokenAmount + deltaTokenAmount,
-          mintKnowledgeAssetsAmount: 1n, // > 0 so the mint callback fires
+          newMerkleRoot,
+          newByteSize: 1000n,
+          newTokenAmount: tokenAmount,
+          mintKnowledgeAssetsAmount: 0n,
           knowledgeAssetsToBurn: [],
           updateOperationId: 't-harden-4-update-op',
         });
+        const updateAuthorSig = await signUpdateAuthorAttestation(
+          creator,
+          buildUpdateAuthorAttestationPayload({
+            chainId,
+            kav10Address,
+            kaId: 1n,
+            newMerkleRoot,
+            authorAddress: mockAddr,
+          }),
+        );
+        const updateParams = {
+          ...baseUpdate,
+          authorAddress: mockAddr,
+          authorR: updateAuthorSig.authorR,
+          authorVS: updateAuthorSig.authorVS,
+        };
 
-        const updateCalldata = KAV10.interface.encodeFunctionData('update', [
-          updateParams,
-        ]);
-        await mock.arm(updateCalldata);
-
-        // Step 4: outer update. The mint callback fires, the mock
-        // re-enters with the same `update(...)` calldata, the inner
-        // call reverts `ReentrancyGuardReentrantCall()` (the modifier
-        // runs BEFORE any ACK / signature / byte-size validation), the
-        // mock captures the selector, returns the ERC-1155 success
-        // magic value, and the outer update completes.
-        await mock.callKAV10(updateCalldata);
-
-        expect(await mock.reentryAttempted()).to.equal(true);
-        expect(await mock.reentryRejected()).to.equal(true);
-        // 0x3ee5aeb5 == bytes4(keccak256("ReentrancyGuardReentrantCall()"))
-        expect(await mock.lastInnerSelector()).to.equal('0x3ee5aeb5');
+        await expect(
+          mock.callKAV10(
+            KAV10.interface.encodeFunctionData('update', [updateParams]),
+          ),
+        ).to.not.be.reverted;
       });
     });
   });

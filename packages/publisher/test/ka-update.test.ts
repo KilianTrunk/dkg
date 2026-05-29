@@ -712,12 +712,11 @@ describe('UpdateHandler', () => {
   });
 
   it('handles multi-entity updates', async () => {
+    // Greenfield: one KA per publish — seed with a single entity, then
+    // expand to multiple entities in the same KA via update.
     const original = await publisher.publish({
       contextGraphId: CONTEXT_GRAPH,
-      quads: [
-        q(ENTITY_A, 'http://schema.org/name', '"A"'),
-        q(ENTITY_B, 'http://schema.org/name', '"B"'),
-      ],
+      quads: [q(ENTITY_A, 'http://schema.org/name', '"A"')],
     });
 
     const updateQuads = [

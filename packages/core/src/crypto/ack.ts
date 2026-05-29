@@ -333,7 +333,7 @@ export function computePublishPublisherDigest(
  * `KnowledgeAssetsV10._EIP712_NAME_HASH` — any drift will produce
  * signatures the contract rejects with `InvalidAuthorSignature`.
  */
-export const AUTHOR_ATTESTATION_DOMAIN_NAME = 'KnowledgeAssetsV10';
+export const AUTHOR_ATTESTATION_DOMAIN_NAME = 'KnowledgeAssetsLifecycle';
 
 /**
  * EIP-712 domain version. Bound to the major.minor portion of the
@@ -341,7 +341,7 @@ export const AUTHOR_ATTESTATION_DOMAIN_NAME = 'KnowledgeAssetsV10';
  * this; only major.minor changes do. See
  * `KnowledgeAssetsV10._EIP712_VERSION_HASH`.
  */
-export const AUTHOR_ATTESTATION_DOMAIN_VERSION = '10.1';
+export const AUTHOR_ATTESTATION_DOMAIN_VERSION = '2.0.0';
 
 /**
  * Currently-supported `authorSchemeVersion` value. v1 is single-key
@@ -431,6 +431,65 @@ export function buildAuthorAttestationTypedData(args: {
     message: {
       contextGraphId: args.contextGraphId,
       merkleRoot: merkleRootHex,
+      authorAddress: args.authorAddress,
+      schemeVersion,
+    },
+  };
+}
+
+export const UPDATE_AUTHOR_ATTESTATION_PRIMARY_TYPE = 'UpdateAuthorAttestation';
+
+export interface UpdateAuthorAttestationTypedData {
+  domain: AuthorAttestationTypedData['domain'];
+  types: {
+    UpdateAuthorAttestation: Array<{ name: string; type: string }>;
+  };
+  primaryType: typeof UPDATE_AUTHOR_ATTESTATION_PRIMARY_TYPE;
+  message: {
+    kaId: bigint;
+    newMerkleRoot: string;
+    authorAddress: string;
+    schemeVersion: number;
+  };
+}
+
+/**
+ * EIP-712 typed data for greenfield KA updates (`UpdateAuthorAttestation`).
+ * Owner commits to `(kaId, newMerkleRoot)` before the publisher runs ACK/TRAC.
+ */
+export function buildUpdateAuthorAttestationTypedData(args: {
+  chainId: bigint;
+  kav10Address: string;
+  kaId: bigint;
+  newMerkleRoot: Uint8Array;
+  authorAddress: string;
+  schemeVersion?: number;
+}): UpdateAuthorAttestationTypedData {
+  if (args.newMerkleRoot.length !== 32) {
+    throw new Error('newMerkleRoot must be 32 bytes');
+  }
+  const toHex = (b: Uint8Array) =>
+    '0x' + Array.from(b).map((x) => x.toString(16).padStart(2, '0')).join('');
+  const schemeVersion = args.schemeVersion ?? AUTHOR_SCHEME_VERSION_V1;
+  return {
+    domain: {
+      name: AUTHOR_ATTESTATION_DOMAIN_NAME,
+      version: AUTHOR_ATTESTATION_DOMAIN_VERSION,
+      chainId: args.chainId,
+      verifyingContract: args.kav10Address,
+    },
+    types: {
+      UpdateAuthorAttestation: [
+        { name: 'kaId', type: 'uint256' },
+        { name: 'newMerkleRoot', type: 'bytes32' },
+        { name: 'authorAddress', type: 'address' },
+        { name: 'schemeVersion', type: 'uint8' },
+      ],
+    },
+    primaryType: UPDATE_AUTHOR_ATTESTATION_PRIMARY_TYPE,
+    message: {
+      kaId: args.kaId,
+      newMerkleRoot: toHex(args.newMerkleRoot),
       authorAddress: args.authorAddress,
       schemeVersion,
     },

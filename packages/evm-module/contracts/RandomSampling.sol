@@ -10,7 +10,7 @@ import {RandomSamplingLib} from "./libraries/RandomSamplingLib.sol";
 import {ProfileLib} from "./libraries/ProfileLib.sol";
 import {IdentityStorage} from "./storage/IdentityStorage.sol";
 import {RandomSamplingStorage} from "./storage/RandomSamplingStorage.sol";
-import {KnowledgeCollectionStorage} from "./storage/KnowledgeCollectionStorage.sol";
+import {DKGKnowledgeAssets} from "./storage/DKGKnowledgeAssets.sol";
 import {ProfileStorage} from "./storage/ProfileStorage.sol";
 import {EpochStorage} from "./storage/EpochStorage.sol";
 import {Chronos} from "./storage/Chronos.sol";
@@ -46,7 +46,7 @@ contract RandomSampling is INamed, IVersioned, ContractStatus, IInitializable {
 
     IdentityStorage public identityStorage;
     RandomSamplingStorage public randomSamplingStorage;
-    KnowledgeCollectionStorage public knowledgeCollectionStorage;
+    DKGKnowledgeAssets public knowledgeCollectionStorage;
     ProfileStorage public profileStorage;
     EpochStorage public epochStorage;
     Chronos public chronos;
@@ -119,8 +119,8 @@ contract RandomSampling is INamed, IVersioned, ContractStatus, IInitializable {
     function initialize() public onlyHub {
         identityStorage = IdentityStorage(hub.getContractAddress("IdentityStorage"));
         randomSamplingStorage = RandomSamplingStorage(hub.getContractAddress("RandomSamplingStorage"));
-        knowledgeCollectionStorage = KnowledgeCollectionStorage(
-            hub.getAssetStorageAddress("KnowledgeCollectionStorage")
+        knowledgeCollectionStorage = DKGKnowledgeAssets(
+            hub.getAssetStorageAddress("DKGKnowledgeAssets")
         );
         profileStorage = ProfileStorage(hub.getContractAddress("ProfileStorage"));
         epochStorage = EpochStorage(hub.getContractAddress("EpochStorageV8"));

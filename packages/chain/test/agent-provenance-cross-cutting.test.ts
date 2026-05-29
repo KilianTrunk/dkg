@@ -190,6 +190,35 @@ describe('Cross-cutting verification — agent-provenance via on-chain author at
     });
   });
 
+  describe('§9.7 #2 — greenfield ABI rename (KnowledgeAssetsLifecycle + DKGKnowledgeAssets)', () => {
+    const lifecycleAbi = loadAbi('packages/chain/abi/KnowledgeAssetsLifecycle.json');
+    const lifecycleFns = lifecycleAbi
+      .filter((x) => x.type === 'function')
+      .map((f) => f.name);
+
+    it('KnowledgeAssetsLifecycle exposes publish/update without publishDirect/updateDirect', () => {
+      expect(lifecycleFns).toContain('publish');
+      expect(lifecycleFns).toContain('update');
+      expect(lifecycleFns).not.toContain('publishDirect');
+      expect(lifecycleFns).not.toContain('updateDirect');
+    });
+
+    const storageAbi = loadAbi('packages/chain/abi/DKGKnowledgeAssets.json');
+    const storageEvents = storageAbi.filter((x) => x.type === 'event');
+
+    it('DKGKnowledgeAssets emits KnowledgeAssetCreated with indexed author', () => {
+      const evt = storageEvents.find((e) => e.name === 'KnowledgeAssetCreated');
+      expect(evt).toBeDefined();
+      const argNames = flattenInputNames(evt!.inputs);
+      expect(argNames).toContain('author');
+    });
+
+    it('DKGKnowledgeAssets exposes getLatestMerkleRootAuthor(uint256)', () => {
+      const fns = storageAbi.filter((x) => x.type === 'function').map((f) => f.name);
+      expect(fns).toContain('getLatestMerkleRootAuthor');
+    });
+  });
+
   describe('§9.7 #3 — gateway-as-publisher pattern fully removed', () => {
     it('no remaining gateway-as-publisher symbols in any package src/', () => {
       const findings = findInSources({

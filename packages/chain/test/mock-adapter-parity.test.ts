@@ -455,6 +455,9 @@ describe('MockChainAdapter API parity with EVMChainAdapter [CH-8]', () => {
       newMerkleRoot,
       newByteSize: 2n,
       newMerkleLeafCount: 1,
+      authorAddress: delegatedPublisher,
+      authorR: new Uint8Array(32),
+      authorVS: new Uint8Array(32),
     });
 
     expect(update.publisherAddress?.toLowerCase()).toBe(delegatedPublisher.toLowerCase());

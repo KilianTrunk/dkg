@@ -1108,6 +1108,10 @@ export class MockChainAdapter implements ChainAdapter {
     return '0x000000000000000000000000000000000000c10a';
   }
 
+  async getDKGKnowledgeAssetsAddress(): Promise<string> {
+    return this.getKnowledgeAssetsV10Address();
+  }
+
   async getEvmChainId(): Promise<bigint> {
     return 31337n;
   }

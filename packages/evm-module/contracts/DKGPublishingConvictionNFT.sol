@@ -267,7 +267,7 @@ contract DKGPublishingConvictionNFT is INamed, IVersioned, HubDependent, IInitia
         uint40 kcStartEpoch,
         uint40 kcEpochs
     ) external returns (uint96 discountedCost) {
-        address kav10 = hub.getContractAddress("KnowledgeAssetsV10");
+        address kav10 = hub.getContractAddress("KnowledgeAssetsLifecycle");
         if (msg.sender != kav10) revert OnlyKnowledgeAssetsV10(msg.sender);
 
         return _publishingConviction().coverPublishingCost(publishingAgent, baseCost, kcStartEpoch, kcEpochs);

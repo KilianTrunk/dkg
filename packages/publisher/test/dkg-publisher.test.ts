@@ -12,13 +12,14 @@ import type { Quad } from '@origintrail-official/dkg-storage';
 import { ethers } from 'ethers';
 import { createEVMAdapter, getSharedContext, createProvider, takeSnapshot, revertSnapshot, createTestContextGraph, seedContextGraphRegistration, HARDHAT_KEYS } from '../../chain/test/evm-test-context.js';
 import { mintTokens } from '../../chain/test/hardhat-harness.js';
-import { buildSeal, wrapPublisherForTest } from './_helpers/seal.js';
+import { buildSeal, buildUpdateSeal, wrapPublisherForTest } from './_helpers/seal.js';
 import { makeHardhatReceiverACKProvider } from './_helpers/acks.js';
 import type { V10ACKProvider } from '../src/publisher.js';
 
 let CONTEXT_GRAPH: string;
 let GRAPH: string;
 let _kav10Address: string;
+let _dkaAddress: string;
 let _provider: ethers.JsonRpcProvider;
 const _author = new ethers.Wallet(HARDHAT_KEYS.CORE_OP);
 
@@ -65,6 +66,7 @@ describe('DKGPublisher', () => {
     CONTEXT_GRAPH = String(cgId);
     GRAPH = `did:dkg:context-graph:${CONTEXT_GRAPH}`;
     _kav10Address = await chain.getKnowledgeAssetsV10Address();
+    _dkaAddress = (await chain.getDKGKnowledgeAssetsAddress!()).toLowerCase();
   });
 
   // Phase C made the publisher a pure transport — every on-chain test
@@ -87,16 +89,16 @@ describe('DKGPublisher', () => {
     });
   }
   async function updateWS(kcId: bigint, args: Parameters<DKGPublisher['update']>[1]) {
-    const seal = await buildSeal({
+    const seal = await buildUpdateSeal({
+      kaId: kcId,
       quads: args.quads,
       privateQuads: args.privateQuads,
       author: _author,
-      contextGraphId: args.contextGraphId,
       ctx: { provider: _provider, kav10Address: _kav10Address },
     });
     return publisher.update(kcId, {
       ...args,
-      precomputedAttestation: seal,
+      precomputedUpdateAttestation: seal,
       v10ACKProvider: args.v10ACKProvider ?? getAckProvider(),
     });
   }
@@ -316,9 +318,10 @@ describe('DKGPublisher', () => {
     if (metaResult.type === 'bindings') {
       expect(metaResult.bindings).toHaveLength(1);
       const ual = metaResult.bindings[0]['ual'];
-      // UAL shape: did:dkg:{chainId}/{publisherAddress}/{startKAId}
+      // Greenfield UAL: did:dkg:{chainId}/{DKGKnowledgeAssets}/{kaId}
       expect(ual).toMatch(/^did:dkg:evm:31337\/0x[0-9a-fA-F]{40}\/\d+$/);
-      expect(ual).toContain(result.onChainResult!.publisherAddress);
+      expect(ual.toLowerCase()).toContain(_dkaAddress);
+      expect(ual).toContain(String(result.onChainResult!.startKAId));
     }
   });
 

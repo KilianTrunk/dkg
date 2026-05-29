@@ -3,15 +3,16 @@ import { DeployFunction } from 'hardhat-deploy/types';
 
 const func: DeployFunction = async function (hre: HardhatRuntimeEnvironment) {
   await hre.helpers.deploy({
-    newContractName: 'KnowledgeAssetsV10',
+    newContractName: 'KnowledgeAssetsLifecycle',
+    newContractNameInHub: 'KnowledgeAssetsLifecycle',
   });
 };
 
 export default func;
-func.tags = ['KnowledgeAssetsV10', 'v10'];
+func.tags = ['KnowledgeAssetsLifecycle', 'v10'];
 func.dependencies = [
   'Hub',
-  'KnowledgeCollectionStorage',
+  'DKGKnowledgeAssets',
   'Chronos',
   'ParametersStorage',
   'IdentityStorage',

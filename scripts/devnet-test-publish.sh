@@ -76,10 +76,17 @@ curl -s "http://127.0.0.1:${API_PORT}/api/status" > /dev/null \
 [ -f "$CLI_JS" ]         || fail "missing $CLI_JS (run pnpm run build)"
 [ -f "$DAEMON_LOG" ]     || fail "missing $DAEMON_LOG"
 
-for abi in ContextGraphs ContextGraphStorage IdentityStorage KnowledgeCollectionStorage; do
+for abi in ContextGraphs ContextGraphStorage IdentityStorage; do
   [ -f "$EVM_ABI_DIR/${abi}.json" ] \
     || fail "missing ABI: $EVM_ABI_DIR/${abi}.json"
 done
+if [ -f "$EVM_ABI_DIR/DKGKnowledgeAssets.json" ]; then
+  KCS_ABI="DKGKnowledgeAssets.json"
+elif [ -f "$EVM_ABI_DIR/KnowledgeCollectionStorage.json" ]; then
+  KCS_ABI="KnowledgeCollectionStorage.json"
+else
+  fail "missing ABI: $EVM_ABI_DIR/DKGKnowledgeAssets.json (or legacy KnowledgeCollectionStorage.json)"
+fi
 
 log "Preconditions OK (hardhat pid=$HARDHAT_PID, node $NODE_NUM pid=$NODE_PID, api :$API_PORT)"
 
@@ -205,10 +212,11 @@ const path = require("path");
 (async () => {
   const provider = new ethers.JsonRpcProvider(process.env.RPC_URL);
   const contracts = JSON.parse(fs.readFileSync(process.env.CONTRACTS_JSON, "utf8")).contracts;
-  const kcsAddr = contracts.KnowledgeCollectionStorage?.evmAddress;
-  if (!kcsAddr) throw new Error("KnowledgeCollectionStorage not deployed");
+  const kcsAddr = contracts.DKGKnowledgeAssets?.evmAddress ?? contracts.KnowledgeCollectionStorage?.evmAddress;
+  if (!kcsAddr) throw new Error("DKGKnowledgeAssets / KnowledgeCollectionStorage not deployed");
 
-  const kcsAbi = JSON.parse(fs.readFileSync(path.join(process.env.ABI_DIR, "KnowledgeCollectionStorage.json"), "utf8"));
+  const kcsAbiFile = fs.existsSync(path.join(process.env.ABI_DIR, "DKGKnowledgeAssets.json")) ? "DKGKnowledgeAssets.json" : "KnowledgeCollectionStorage.json";
+  const kcsAbi = JSON.parse(fs.readFileSync(path.join(process.env.ABI_DIR, kcsAbiFile), "utf8"));
   const kcs = new ethers.Contract(kcsAddr, kcsAbi, provider);
 
   const id = BigInt(process.env.BATCH_ID);

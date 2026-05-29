@@ -273,6 +273,18 @@ export interface PublishOptions {
     signature: { r: Uint8Array; vs: Uint8Array };
     schemeVersion: number;
   };
+  /**
+   * RFC-001 greenfield — owner seal for on-chain `update`, produced before
+   * the hosted API call (mirror of `precomputedAttestation` on publish).
+   * Publisher verifies `expectedNewMerkleRoot` and forwards `(authorR, authorVS)`
+   * to the chain adapter; it never signs the update attestation itself.
+   */
+  precomputedUpdateAttestation?: {
+    expectedNewMerkleRoot: Uint8Array;
+    authorAddress: string;
+    signature: { r: Uint8Array; vs: Uint8Array };
+    schemeVersion: number;
+  };
 }
 
 export interface PublishResult {

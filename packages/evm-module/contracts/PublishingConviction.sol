@@ -92,7 +92,7 @@ contract PublishingConviction is INamed, IVersioned, ContractStatus, IInitializa
     //           and the active-sink reward distribution. Twin of KAV10
     //           10.1.1's `tokenAmount > 0` floor, which protects only
     //           the direct-spend branch.
-    string private constant _VERSION = "1.0.1";
+    string private constant _VERSION = "10.0.2";
 
     uint256 public constant BPS_DENOMINATOR = 10_000;
     /// @notice EpochStorage shard ID for the staker reward pool. Mirrors

@@ -128,7 +128,7 @@ contract StakingV10 is INamed, IVersioned, ContractStatus, IInitializable {
     //             new `expiryShortenedBy` arg (CSS v4.1.0). `stake` always
     //             passes 0; `_convertToNFT` passes 0 except for eligible
     //             6m/12m migrants.
-    string private constant _VERSION = "3.1.0";
+    string private constant _VERSION = "10.0.2";
 
     // ========================================================================
     // Constants

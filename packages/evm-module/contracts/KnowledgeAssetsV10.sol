@@ -98,7 +98,7 @@ contract KnowledgeAssetsV10 is INamed, IVersioned, ContractStatus, IInitializabl
     // storage slot at the end of the inheritance chain; KAV10 owns its
     // slots below the inherited chain and V10 deploys are redeploy +
     // reinit, so no storage-layout migration is required.
-    string private constant _VERSION = "10.1.1";
+    string private constant _VERSION = "10.0.2";
 
     // --- V10 publish input (grouped to bypass the 16-arg stack limit) ---
 

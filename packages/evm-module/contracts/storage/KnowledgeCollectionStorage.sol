@@ -76,7 +76,7 @@ contract KnowledgeCollectionStorage is
     );
 
     string private constant _NAME = "KnowledgeCollectionStorage";
-    string private constant _VERSION = "1.0.0";
+    string private constant _VERSION = "10.0.2";
 
     uint256 public immutable KNOWLEDGE_COLLECTION_MAX_SIZE;
 

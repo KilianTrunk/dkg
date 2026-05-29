@@ -3,6 +3,8 @@ import { loadFixture, time } from '@nomicfoundation/hardhat-network-helpers';
 import { expect } from 'chai';
 import { ethers } from 'ethers';
 import hre from 'hardhat';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 
 import type {
   AskStorage,
@@ -477,6 +479,87 @@ describe('@unit KnowledgeAssetsV10', () => {
         // CG binding + value ledger written.
         expect(await CGStorageContract.kcToContextGraph(1)).to.equal(cgId);
         expect(await CGValueStorage.getCurrentCGValue(cgId)).to.be.gt(0n);
+      });
+    });
+
+    describe('PublishingMathLib integration', () => {
+      it('direct publish event ranges match the shared active-sink calculator', async () => {
+        const source = readFileSync(
+          join(__dirname, '../../contracts/KnowledgeAssetsV10.sol'),
+          'utf8',
+        );
+        expect(source).to.include('PublishingMathLib.prorateActiveSink(');
+
+        const creator = getDefaultKCCreator(accounts);
+        const { publishingNode, publisherIdentityId, receivingNodes, receiverIdentityIds } =
+          await setupNodes();
+        const cgId = await createOpenCG(creator);
+        const tokenAmount = ethers.parseEther('1000');
+        const epochs = 3;
+        const merkleRoot = ethers.keccak256(
+          ethers.toUtf8Bytes('publishing-math-direct-root'),
+        );
+
+        const p = await buildPublishParams({
+          chainId,
+          kav10Address,
+          receivingNodes,
+          publisherIdentityId,
+          receiverIdentityIds,
+          author: creator,
+          contextGraphId: cgId,
+          merkleRoot,
+          knowledgeAssetsAmount: 10,
+          byteSize: 1000,
+          epochs,
+          tokenAmount,
+          isImmutable: false,
+          publishOperationId: 'publishing-math-direct-op',
+        });
+
+        await TokenContract.connect(creator).approve(kav10Address, tokenAmount);
+
+        const epochLength = await ChronosContract.epochLength();
+        const targetEpoch = (await ChronosContract.getCurrentEpoch()) + 1n;
+        const elapsed = epochLength / 2n;
+        const targetTimestamp =
+          (await ChronosContract.timestampForEpoch(targetEpoch)) + elapsed;
+        const timeRemaining = epochLength - elapsed;
+
+        const Harness = await hre.ethers.getContractFactory('PublishingMathLibHarness');
+        const harness = await Harness.deploy();
+        const [starts, ends, amounts] = await harness.prorateActiveSink(
+          tokenAmount,
+          targetEpoch,
+          epochs,
+          epochLength,
+          timeRemaining,
+        );
+
+        await time.setNextBlockTimestamp(Number(targetTimestamp));
+        const tx = await KAV10.connect(creator).publish(p);
+        const receipt = await tx.wait();
+        const epsAddr = (await EpochStorageContract.getAddress()).toLowerCase();
+        const iface = EpochStorageContract.interface;
+        const actual: Array<[bigint, bigint, bigint]> = [];
+        for (const log of receipt!.logs) {
+          if (log.address.toLowerCase() !== epsAddr) continue;
+          let parsed;
+          try { parsed = iface.parseLog({ topics: log.topics as string[], data: log.data }); }
+          catch { continue; }
+          if (parsed?.name !== 'TokensAddedToEpochRange') continue;
+          expect(parsed.args.shardId).to.equal(STAKER_SHARD_ID);
+          actual.push([
+            BigInt(parsed.args.startEpoch),
+            BigInt(parsed.args.endEpoch),
+            BigInt(parsed.args.tokenAmount),
+          ]);
+        }
+
+        const expected = starts
+          .map((start, i) => [BigInt(start), BigInt(ends[i]), BigInt(amounts[i])] as [bigint, bigint, bigint])
+          .filter((range) => range[2] > 0n);
+        expect(actual).to.deep.equal(expected);
       });
     });
 

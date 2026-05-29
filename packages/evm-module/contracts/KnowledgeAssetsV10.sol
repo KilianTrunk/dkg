@@ -15,6 +15,7 @@ import {ContextGraphStorage} from "./storage/ContextGraphStorage.sol";
 import {ContextGraphValueStorage} from "./storage/ContextGraphValueStorage.sol";
 import {KnowledgeAssetsLib} from "./libraries/KnowledgeAssetsLib.sol";
 import {KnowledgeCollectionLib} from "./libraries/KnowledgeCollectionLib.sol";
+import {PublishingMathLib} from "./libraries/PublishingMathLib.sol";
 import {TokenLib} from "./libraries/TokenLib.sol";
 import {IdentityLib} from "./libraries/IdentityLib.sol";
 import {INamed} from "./interfaces/INamed.sol";
@@ -1418,37 +1419,17 @@ contract KnowledgeAssetsV10 is INamed, IVersioned, ContractStatus, IInitializabl
 
         uint256 epochLengthInSeconds = chronos.epochLength();
         uint256 timeRemainingInCurrentEpoch = chronos.timeUntilNextEpoch();
-        uint256 baseTokensPerFullEpoch = tokenAmount / epochs;
-        uint256 currentEpochAllocation = (baseTokensPerFullEpoch * timeRemainingInCurrentEpoch) / epochLengthInSeconds;
-        uint256 finalEpochAllocation = baseTokensPerFullEpoch - currentEpochAllocation;
-        uint256 numberOfFullEpochs = epochs - 1;
-        uint256 totalTokensForFullEpochs = baseTokensPerFullEpoch * numberOfFullEpochs;
+        PublishingMathLib.ActiveSinkRange[3] memory ranges = PublishingMathLib.prorateActiveSink(
+            tokenAmount,
+            currentEpoch,
+            epochs,
+            epochLengthInSeconds,
+            timeRemainingInCurrentEpoch
+        );
 
-        uint256 totalAllocated = currentEpochAllocation + totalTokensForFullEpochs + finalEpochAllocation;
-        if (totalAllocated < tokenAmount) {
-            finalEpochAllocation += tokenAmount - totalAllocated;
-        }
-
-        if (currentEpochAllocation > 0) {
-            epochStorage.addTokensToEpochRange(1, currentEpoch, currentEpoch, uint96(currentEpochAllocation));
-        }
-
-        if (numberOfFullEpochs > 0 && totalTokensForFullEpochs > 0) {
-            epochStorage.addTokensToEpochRange(
-                1,
-                currentEpoch + 1,
-                currentEpoch + uint40(numberOfFullEpochs),
-                uint96(totalTokensForFullEpochs)
-            );
-        }
-
-        if (finalEpochAllocation > 0) {
-            epochStorage.addTokensToEpochRange(
-                1,
-                currentEpoch + uint40(epochs),
-                currentEpoch + uint40(epochs),
-                uint96(finalEpochAllocation)
-            );
+        for (uint256 i; i < ranges.length; i++) {
+            if (ranges[i].tokenAmount == 0) continue;
+            epochStorage.addTokensToEpochRange(1, ranges[i].startEpoch, ranges[i].endEpoch, ranges[i].tokenAmount);
         }
     }
 }

@@ -14,7 +14,9 @@ import {
 import {
   validateReadOnlySparql,
   emptyResultForSparql,
+  detectSparqlQueryForm,
 } from './sparql-guard.js';
+import { stripLiteralsAndComments } from './sparql-utils.js';
 
 /**
  * Result of resolving a V10 GET view to concrete graph targets.
@@ -450,7 +452,67 @@ export class DKGQueryEngine implements QueryEngine {
     // Build a single union query so LIMIT/ORDER BY/DISTINCT/aggregates
     // apply over the full dataset rather than per-graph.
     const unionSparql = wrapWithGraphUnion(sparql, graphs);
-    return this.execAndNormalize(unionSparql);
+    if (unionSparql !== null) {
+      return this.execAndNormalize(unionSparql);
+    }
+    // Fallback: the inner body contains a UNION so we cannot safely wrap
+    // in a single query without either crashing Blazegraph (nested
+    // UnionNode) or leaking a helper variable. Run per-graph and merge
+    // results in a FORM-AWARE way (Codex review on #789): flattening
+    // every form into `bindings` silently corrupts CONSTRUCT/DESCRIBE
+    // (drops `quads`), ASK (drops the boolean), and SELECT result sets
+    // (concatenation can't honour cross-graph LIMIT/ORDER BY/DISTINCT/
+    // aggregates). This path is rare (a user UNION over a multi-graph
+    // view), but it must not return the wrong shape.
+    const form = detectSparqlQueryForm(sparql);
+
+    if (form === 'CONSTRUCT' || form === 'DESCRIBE') {
+      // Graph-shaped results: the correct cross-graph merge is the union
+      // of the per-graph triple sets (deduped — the same triple can be
+      // constructed from multiple source graphs).
+      const merged: Quad[] = [];
+      for (const g of graphs) {
+        const r = await this.execAndNormalize(wrapWithGraph(sparql, g));
+        if (r.quads) merged.push(...r.quads);
+      }
+      return { bindings: [], quads: dedupeQuads(merged) };
+    }
+
+    if (form === 'ASK') {
+      // Boolean result: true iff the pattern matches in ANY graph.
+      // Short-circuit on the first positive graph.
+      for (const g of graphs) {
+        const r = await this.execAndNormalize(wrapWithGraph(sparql, g));
+        if (r.bindings[0]?.result === 'true') {
+          return { bindings: [{ result: 'true' }] };
+        }
+      }
+      return { bindings: [{ result: 'false' }] };
+    }
+
+    // SELECT (and UNKNOWN, which validateReadOnlySparql should already
+    // have rejected upstream). Per-graph concatenation is only correct
+    // when there are NO solution-set modifiers — DISTINCT/ORDER BY/
+    // LIMIT/OFFSET/GROUP BY/HAVING/aggregates all operate over the full
+    // solution set and cannot be reconstructed from per-graph slices.
+    // Rather than silently return duplicate / mis-ordered / over-limit
+    // rows, reject the unsupported shape explicitly so the caller gets a
+    // clear error instead of wrong data.
+    if (hasCrossGraphUnsafeModifier(sparql)) {
+      throw new Error(
+        'Multi-graph query combines an inner UNION with a solution-set ' +
+          'modifier (DISTINCT/ORDER BY/LIMIT/OFFSET/GROUP BY/aggregate). ' +
+          'This shape cannot be evaluated across graphs without corrupting ' +
+          'the modifier semantics. Scope the query to a single graph (pass ' +
+          'contextGraphId) or remove the inner UNION.',
+      );
+    }
+    const all: Record<string, string>[] = [];
+    for (const g of graphs) {
+      const r = await this.execAndNormalize(wrapWithGraph(sparql, g));
+      all.push(...r.bindings);
+    }
+    return { bindings: all };
   }
 
   private async discoverGraphsByPrefix(prefix: string): Promise<string[]> {
@@ -1853,8 +1915,14 @@ function wrapWithGraph(sparql: string, graphUri: string): string {
  * neither SELECT * leakage nor variable-name collisions can happen.
  * Single-graph views skip the UNION wrapper entirely and use a plain
  * `GRAPH <uri>` block.
+ *
+ * Returns `null` when the inner WHERE body contains a UNION — the
+ * UNION-of-GRAPHs wrapper would produce a nested UnionNode that
+ * crashes Blazegraph, and a VALUES+GRAPH fallback leaks a helper
+ * variable into the caller's scope.  The caller should fall back to
+ * per-graph execution.
  */
-function wrapWithGraphUnion(sparql: string, graphUris: string[]): string {
+function wrapWithGraphUnion(sparql: string, graphUris: string[]): string | null {
   if (hasGraphClause(sparql)) return sparql;
   if (graphUris.length === 0) return sparql;
 
@@ -1872,6 +1940,16 @@ function wrapWithGraphUnion(sparql: string, graphUris: string[]): string {
 
   if (graphUris.length === 1) {
     return `${before} GRAPH <${graphUris[0]}> { ${inner} } ${after}`;
+  }
+
+  // Blazegraph crashes with "Illegal child type for union: UnionNode"
+  // when a UNION appears inside a GRAPH block that is itself a branch
+  // of an outer UNION. We cannot use VALUES+GRAPH either because the
+  // helper variable leaks into caller scope (SELECT *, name collisions).
+  // Signal the caller to fall back to per-graph execution.
+  const innerHasUnion = /\bUNION\b/i.test(inner);
+  if (innerHasUnion) {
+    return null;
   }
 
   const unionBranches = graphUris
@@ -2383,4 +2461,31 @@ function dedupeQuads(quads: Quad[]): Quad[] {
     out.push(q);
   }
   return out;
+}
+
+/**
+ * True when a SELECT carries a solution-set modifier whose semantics
+ * cannot be reconstructed from per-graph result slices: DISTINCT,
+ * ORDER BY, LIMIT, OFFSET, GROUP BY, HAVING, or an aggregate function
+ * in the projection. Used by the per-graph multi-graph fallback (the
+ * inner-UNION case in `queryMultipleGraphs`) to reject shapes that
+ * would otherwise return duplicate / mis-ordered / over-limit rows.
+ *
+ * Literals, comments, and IRI bodies are blanked first
+ * (`stripLiteralsAndComments`) so a keyword appearing inside a string
+ * literal or IRI (e.g. `"top 10 LIMIT"`) doesn't trigger a false
+ * positive. The aggregate check is intentionally broad — any of the
+ * standard SPARQL aggregate functions invalidates naive concatenation
+ * because the per-graph partial aggregates can't be combined post-hoc.
+ */
+function hasCrossGraphUnsafeModifier(sparql: string): boolean {
+  const s = stripLiteralsAndComments(sparql);
+  if (/\bDISTINCT\b/i.test(s)) return true;
+  if (/\bORDER\s+BY\b/i.test(s)) return true;
+  if (/\bGROUP\s+BY\b/i.test(s)) return true;
+  if (/\bHAVING\b/i.test(s)) return true;
+  if (/\bLIMIT\b/i.test(s)) return true;
+  if (/\bOFFSET\b/i.test(s)) return true;
+  if (/\b(COUNT|SUM|AVG|MIN|MAX|SAMPLE|GROUP_CONCAT)\s*\(/i.test(s)) return true;
+  return false;
 }

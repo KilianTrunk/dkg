@@ -716,11 +716,13 @@ describe('Profile Builder', () => {
     );
     expect(hostingQuads).toHaveLength(1);
 
-    const contextGraphsQuad = quads.find(q =>
+    const contextGraphsQuads = quads.filter(q =>
       q.predicate === 'https://dkg.origintrail.io/skill#contextGraphsServed',
     );
-    expect(contextGraphsQuad).toBeDefined();
-    expect(contextGraphsQuad!.object).toContain('agent-skills,climate');
+    expect(contextGraphsQuads).toHaveLength(2);
+    const servedValues = contextGraphsQuads.map(q => q.object);
+    expect(servedValues).toContain('"agent-skills"');
+    expect(servedValues).toContain('"climate"');
   });
 
   it('omits optional fields when not provided', () => {

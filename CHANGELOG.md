@@ -4,7 +4,13 @@ All notable changes to the DKG V9 node are documented here. The format is based 
 
 ## [Unreleased]
 
-### Changed — V10 EVM module hardening pass
+## [10.0.0-rc.12] - 2026-05-29
+
+### Added
+
+- **Greenfield Knowledge Asset model** (see PR #815): `DKGKnowledgeAssets` + `KnowledgeAssetsLifecycle`, one ERC-721 KA per publish, stable UAL, owner-sealed updates via `precomputedUpdateAttestation`. Devnet gates: `pnpm test:devnet:greenfield-10min`, `pnpm test:devnet:rich-scenario`.
+
+### Changed — V10 EVM module hardening pass (carried from integration branch)
 
 Consistency and defense-in-depth refinements across the V10 EVM-module contracts. No behaviour change for valid callers.
 

@@ -97,7 +97,12 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
     // storage slot at the end of the inheritance chain; KAV10 owns its
     // slots below the inherited chain and V10 deploys are redeploy +
     // reinit, so no storage-layout migration is required.
-    string private constant _VERSION = "2.0.0";
+    // 2.0.0 → 2.0.1 (PATCH): protocol treasury fee skimmed inside
+    // `_addTokens` (publisher pays the same gross amount; the fee is taken
+    // out of the staker-bound net). Patch-level on purpose — the EIP-712
+    // author-attestation domain version (`_EIP712_VERSION_HASH`) MUST stay
+    // pinned at "2.0.0" so previously signed attestations keep verifying.
+    string private constant _VERSION = "2.0.1";
 
     // --- V10 publish input (grouped to bypass the 16-arg stack limit) ---
 
@@ -483,8 +488,8 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
             // earns publishing-factor credit through `_executePublishCore`'s
             // `addEpochProducedKnowledgeValue` write — attribution and TRAC
             // source are decoupled (RFC-001 §3.6).
-            _addTokens(p.tokenAmount);
-            _distributeTokens(p.tokenAmount, p.epochs, currentEpoch);
+            uint96 netTokenAmount = _addTokens(p.tokenAmount);
+            _distributeTokens(netTokenAmount, p.epochs, currentEpoch);
         }
 
         return kcId;
@@ -718,8 +723,12 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
         kcs.setTokenAmount(id, oldTokenAmount + tokenAmount);
 
         _validateTokenAmount(byteSize, epochs, tokenAmount, false);
-        epochStorage.addTokensToEpochRange(1, endEpoch, endEpoch + epochs, tokenAmount);
-        _addTokens(tokenAmount);
+        // Pull gross from the publisher first, then distribute only the net
+        // (post-treasury-fee) amount into the staker reward pool. The CG-value
+        // write below stays on the gross `tokenAmount` so random-sampling
+        // weight tracks the publisher's full committed value.
+        uint96 netTokenAmount = _addTokens(tokenAmount);
+        epochStorage.addTokensToEpochRange(1, endEpoch, endEpoch + epochs, netTokenAmount);
 
         // Phase 1+8 cross-phase fix: extending a KC's lifetime adds value to
         // the CG it belongs to, so the CG's value-weighted random-sampling
@@ -1025,7 +1034,31 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
      * accountId, sponsoredWallet)`, and that wallet's publishes flow through
      * the discount branch in `publish` automatically.
      */
-    function _addTokens(uint96 tokenAmount) internal {
+    /// @dev Protocol treasury fee (in TRAC) skimmed from `amount`. Returns
+    ///      `(0, address(0))` while no treasury is wired or the fee is 0, so
+    ///      callers can branch on `treasury != address(0)`.
+    /// @param amount Gross staker-bound TRAC the fee is computed against.
+    /// @return fee Treasury cut in TRAC (0 when no treasury or 0 bps).
+    /// @return treasury Configured `protocolTreasury` (address(0) when unset).
+    function _treasuryFee(uint96 amount) internal view returns (uint96 fee, address treasury) {
+        treasury = parametersStorage.protocolTreasury();
+        if (treasury == address(0)) {
+            return (0, address(0));
+        }
+        uint16 bps = parametersStorage.protocolTreasuryFee();
+        if (bps == 0) {
+            return (0, treasury);
+        }
+        // bps is capped at MAX_PROTOCOL_TREASURY_FEE (1_000 = 10%), so
+        // `fee <= amount / 10` and `net = amount - fee` never underflows.
+        fee = uint96((uint256(amount) * uint256(bps)) / 10_000);
+    }
+
+    /// @dev Pulls `tokenAmount` (gross) from the publisher, routing the
+    ///      protocol treasury fee to `protocolTreasury` and the remainder
+    ///      (net) into the conviction-staking vault. Returns the net amount so
+    ///      callers distribute only what actually reached the staker pool.
+    function _addTokens(uint96 tokenAmount) internal returns (uint96 net) {
         IERC20 token = tokenContract;
 
         if (token.allowance(msg.sender, address(this)) < tokenAmount) {
@@ -1040,8 +1073,23 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
             revert TokenLib.TooLowBalance(address(token), token.balanceOf(msg.sender), tokenAmount);
         }
 
-        if (!token.transferFrom(msg.sender, address(convictionStakingStorage), tokenAmount)) {
+        (uint96 fee, address treasury) = _treasuryFee(tokenAmount);
+        net = tokenAmount - fee;
+
+        if (!token.transferFrom(msg.sender, address(convictionStakingStorage), net)) {
             revert TokenLib.TransferFailed();
+        }
+        // Defence-in-depth: only move the fee when a real recipient is wired.
+        // `_treasuryFee` already returns fee == 0 when `protocolTreasury` is
+        // the zero address, so this is belt-and-braces — it keeps the
+        // "never transfer to address(0)" invariant local to this function
+        // and survives any future change to the fee helper. Note: if this
+        // branch is ever skipped while `fee > 0`, the uncollected `fee`
+        // simply stays with the publisher (never minted, never burned).
+        if (fee > 0 && treasury != address(0)) {
+            if (!token.transferFrom(msg.sender, treasury, fee)) {
+                revert TokenLib.TransferFailed();
+            }
         }
     }
 
@@ -1126,8 +1174,8 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
                 remainingEpochs
             );
         } else {
-            _addTokens(deltaTokenAmount);
-            _distributeTokens(deltaTokenAmount, uint256(remainingEpochs), currentEpoch);
+            uint96 netDeltaTokenAmount = _addTokens(deltaTokenAmount);
+            _distributeTokens(netDeltaTokenAmount, uint256(remainingEpochs), currentEpoch);
         }
     }
 

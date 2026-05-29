@@ -166,7 +166,16 @@ const PINNED_DIGESTS: Record<string, string> = {
   // `setPublishingConvictionEpochs`. Caps the worst-case
   // `_settleElapsed` / `_finalSweep` loop count so governance can no
   // longer brick PCAs by raising `publishingConvictionEpochs`.
-  ParametersStorage:            '70d4024b4faf2004f59561b8b785a509c3abadaa89b249adfe6177783f996a97',
+  //
+  // Updated (protocol treasury fee): added `protocolTreasuryFee()` (uint16
+  // getter), `protocolTreasury()` (address getter),
+  // `MAX_PROTOCOL_TREASURY_FEE()` (uint16 constant getter),
+  // `setProtocolTreasuryFee(uint16)`, `setProtocolTreasury(address)`, and
+  // the `ProtocolTreasurySet(address indexed)` event. The fee is skimmed
+  // from staker-bound TRAC on every paid publish / update / extend by
+  // `KnowledgeAssetsLifecycle` + `PublishingConviction` (no ABI change on
+  // those two — internal logic + version bump only).
+  ParametersStorage:            'a152ef475986c81b4077648980156aeaa2b91541057a9ad9bfcfd969ee7feb63',
   // Added PR #470 round 3: pin the V10 NFT-backed PCA contract so that
   // any drift in its events (CostCovered / WindowSettled /
   // AccountFinalSwept / TokensAddedToEpochRange consumers) or errors
@@ -194,7 +203,11 @@ const PINNED_DIGESTS: Record<string, string> = {
   // intentional break is documented as the v2.x → v3.0.0 wrapper
   // bump in the wrapper NatSpec.
   DKGPublishingConvictionNFT:   '80a2d5c1962624fc3f7b7e475daaf86a41542a1641d84783c8d4f969d4d86188',
-  PublishingConviction:         '957528bfd31ac6450b33afecb8e7e84aeffd4d4a694be80377b7b73fa21eb861',
+  // Updated (protocol treasury fee): added the public
+  // `convictionStakingStorage()` getter (the TRAC vault the fee is paid out
+  // of via `transferStake`). No event/error surface change — `settle()`,
+  // `coverPublishingCost`, and the PCA business events/errors are unchanged.
+  PublishingConviction:         '55ceb341b2c8df35cd7cbebe5950b7673766c935ad7954b80187bef9f414a5a7',
   PublishingConvictionStorage:  '42d2aae17b575a8e024b7c4503d4b44109ba6eb8a9c2e26bea36192c969a4508',
 };
 

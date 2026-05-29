@@ -36,11 +36,13 @@ library PublishingMathLib {
             finalEpochAllocation += tokenAmount - totalAllocated;
         }
 
-        ranges[0] = ActiveSinkRange({
-            startEpoch: currentEpoch,
-            endEpoch: currentEpoch,
-            tokenAmount: uint96(currentEpochAllocation)
-        });
+        if (currentEpochAllocation > 0) {
+            ranges[0] = ActiveSinkRange({
+                startEpoch: currentEpoch,
+                endEpoch: currentEpoch,
+                tokenAmount: uint96(currentEpochAllocation)
+            });
+        }
         if (numberOfFullEpochs > 0 && totalTokensForFullEpochs > 0) {
             ranges[1] = ActiveSinkRange({
                 startEpoch: currentEpoch + 1,

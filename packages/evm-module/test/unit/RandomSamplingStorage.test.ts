@@ -9,7 +9,7 @@ import {
   Hub,
   RandomSamplingStorage,
   Chronos,
-  KnowledgeCollectionStorage,
+  DKGKnowledgeAssets,
   RandomSampling,
 } from '../../typechain';
 import { RandomSamplingLib } from '../../typechain/contracts/storage/RandomSamplingStorage';
@@ -19,7 +19,7 @@ const HUNDRED_ETH = ethers.parseEther('100');
 // Helper functions for random sampling
 async function createMockChallenge(
   randomSampling: RandomSampling,
-  knowledgeCollectionStorage: KnowledgeCollectionStorage,
+  knowledgeCollectionStorage: DKGKnowledgeAssets,
   chronos: Chronos,
 ): Promise<RandomSamplingLib.ChallengeStruct> {
   const currentEpoch = await chronos.getCurrentEpoch();
@@ -75,7 +75,7 @@ describe('@unit RandomSamplingStorage', function () {
   let RandomSamplingStorage: RandomSamplingStorage;
   let RandomSampling: RandomSampling;
   let Chronos: Chronos;
-  let KnowledgeCollectionStorage: KnowledgeCollectionStorage;
+  let DKGKnowledgeAssets: DKGKnowledgeAssets;
   let MockChallenge: RandomSamplingLib.ChallengeStruct;
   let accounts: SignerWithAddress[];
 
@@ -88,7 +88,7 @@ describe('@unit RandomSamplingStorage', function () {
   async function deployRandomSamplingFixture(): Promise<RandomStorageFixture> {
     await hre.deployments.fixture([
       'Token',
-      'KnowledgeCollectionStorage',
+      'DKGKnowledgeAssets',
       'KnowledgeCollection',
       'RandomSamplingStorage',
       'RandomSampling',
@@ -108,9 +108,9 @@ describe('@unit RandomSamplingStorage', function () {
 
     RandomSampling =
       await hre.ethers.getContract<RandomSampling>('RandomSampling');
-    KnowledgeCollectionStorage =
-      await hre.ethers.getContract<KnowledgeCollectionStorage>(
-        'KnowledgeCollectionStorage',
+    DKGKnowledgeAssets =
+      await hre.ethers.getContract<DKGKnowledgeAssets>(
+        'DKGKnowledgeAssets',
       );
 
     await RandomSamplingStorage.initialize();
@@ -140,7 +140,7 @@ describe('@unit RandomSamplingStorage', function () {
 
     MockChallenge = await createMockChallenge(
       RandomSampling,
-      KnowledgeCollectionStorage,
+      DKGKnowledgeAssets,
       Chronos,
     );
   });

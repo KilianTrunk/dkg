@@ -37,7 +37,7 @@ import {
   type V10UpdateKCParams,
 } from '@origintrail-official/dkg-chain';
 import { ethers } from 'ethers';
-import { wrapPublisherForTest, mockSealCtx } from './_helpers/seal.js';
+import { wrapPublisherForTest, mockSealCtx, updateSealed } from './_helpers/seal.js';
 import { mockChainStubACKProvider } from './_helpers/acks.js';
 
 // Phase C (commit `d353c6a5`) made `DKGPublisher.publish` reject on-chain
@@ -69,6 +69,20 @@ async function sealForWallet(
 
 const TEST_KEY = '0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d';
 const TEST_KEY_ALT = '0x5de4111a56f4c24611d9ed4d5318a7e03f9b9a9d73f3a5f3f6324a2a0e6fbb36';
+
+// Greenfield (PR #815): on-chain updates require an owner seal
+// (`precomputedUpdateAttestation`). The adapter-managed update tests below
+// assert publisher *attribution* resolution, not seal ceremony, so this
+// helper mints a self-consistent seal (author == recovered signer) over
+// the mock chain's `mockSealCtx()` domain and forwards to `update()`.
+const _SEAL_WALLET = new ethers.Wallet(TEST_KEY);
+function updS(
+  publisher: DKGPublisher,
+  kcId: bigint,
+  args: Parameters<DKGPublisher['update']>[1],
+) {
+  return updateSealed(publisher, kcId, args, _SEAL_WALLET, mockSealCtx());
+}
 
 // Minimal stub — DKGPublisher's constructor only reads `chain.chainId`.
 // All other ChainAdapter methods are unused in this test.
@@ -116,6 +130,14 @@ class AsyncAddressSigningChain implements ChainAdapter {
 
   async getKnowledgeAssetsV10Address(): Promise<string> {
     return '0x00000000000000000000000000000000000000A1';
+  }
+
+  // Greenfield (PR #815): the publisher resolves the asset-storage
+  // address via `getDKGKnowledgeAssetsAddress()` (Hub name changed from
+  // KnowledgeCollectionStorage → DKGKnowledgeAssets) when assigning the
+  // confirmed UAL. Mirror MockChainAdapter and reuse the V10 address.
+  async getDKGKnowledgeAssetsAddress(): Promise<string> {
+    return this.getKnowledgeAssetsV10Address();
   }
 
   async getSignerAddress(): Promise<string> {
@@ -285,6 +307,25 @@ class AdapterManagedUpdateChain implements ChainAdapter {
     private readonly latestPublisherAddress?: string,
     private readonly success = true,
   ) {}
+
+  // Greenfield (PR #815): the owner-sealed update path rebuilds the
+  // UpdateAuthorAttestation typed data from `getEvmChainId()` +
+  // `getKnowledgeAssetsV10Address()` to verify the seal before
+  // submitting. These values must match the `mockSealCtx()` defaults the
+  // seal is signed against (chainId 31337, kav10 `0x…c10a`).
+  async getEvmChainId(): Promise<bigint> {
+    return 31337n;
+  }
+
+  async getKnowledgeAssetsV10Address(): Promise<string> {
+    return '0x000000000000000000000000000000000000c10a';
+  }
+
+  // Greenfield (PR #815): `resolveKaUal()` reads the asset-storage
+  // address via `getDKGKnowledgeAssetsAddress()` when building the UAL.
+  async getDKGKnowledgeAssetsAddress(): Promise<string> {
+    return '0x000000000000000000000000000000000000c10a';
+  }
 
   async updateKnowledgeCollectionV10(params: V10UpdateKCParams): Promise<TxResult> {
     this.capturedPublisherAddress = params.publisherAddress;
@@ -886,7 +927,7 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
       publisherAddress: wallet.address,
     });
 
-    const updated = await publisher.update(99n, {
+    const updated = await updS(publisher, 99n, {
       contextGraphId: '1',
       quads: [{
         subject: 'urn:test:update-configured-publisher-fallback',
@@ -912,7 +953,7 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
       keypair,
     });
 
-    const updated = await publisher.update(11n, {
+    const updated = await updS(publisher, 11n, {
       contextGraphId: '1',
       quads: [{
         subject: 'urn:test:adapter-managed-update',
@@ -924,7 +965,10 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
 
     expect(chain.capturedPublisherAddress).toBeUndefined();
     expect(updated.status).toBe('confirmed');
-    expect(updated.ual.toLowerCase()).toContain(wallet.address.toLowerCase());
+    // Greenfield (PR #815): the UAL embeds the DKGKnowledgeAssets storage
+    // address, not the publisher address — attribution lives in
+    // `onChainResult.publisherAddress` below.
+    expect(updated.ual).toMatch(/^did:dkg:mock:31337\/0x[0-9a-fA-F]{40}\/11$/);
     expect(updated.onChainResult?.publisherAddress.toLowerCase()).toBe(wallet.address.toLowerCase());
   });
 
@@ -938,7 +982,7 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
       keypair,
     });
 
-    const updated = await publisher.update(14n, {
+    const updated = await updS(publisher, 14n, {
       contextGraphId: '1',
       quads: [{
         subject: 'urn:test:adapter-managed-update-without-reservation',
@@ -965,7 +1009,7 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
       keypair,
     });
 
-    const updated = await publisher.update(11n, {
+    const updated = await updS(publisher, 11n, {
       contextGraphId: '1',
       quads: [{
         subject: 'urn:test:adapter-managed-update-chain-attribution',
@@ -977,7 +1021,9 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
 
     expect(chain.capturedPublisherAddress?.toLowerCase()).toBe(wallet.address.toLowerCase());
     expect(updated.status).toBe('confirmed');
-    expect(updated.ual.toLowerCase()).toContain(wallet.address.toLowerCase());
+    // Greenfield (PR #815): UAL embeds the DKGKnowledgeAssets storage
+    // address; attribution is asserted via onChainResult below.
+    expect(updated.ual).toMatch(/^did:dkg:mock:31337\/0x[0-9a-fA-F]{40}\/11$/);
     expect(updated.onChainResult?.publisherAddress.toLowerCase()).toBe(wallet.address.toLowerCase());
   });
 
@@ -992,7 +1038,7 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
       keypair,
     });
 
-    const updated = await publisher.update(12n, {
+    const updated = await updS(publisher, 12n, {
       contextGraphId: '1',
       quads: [{
         subject: 'urn:test:adapter-managed-failed-update-chain-attribution',
@@ -1004,7 +1050,9 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
 
     expect(chain.capturedPublisherAddress?.toLowerCase()).toBe(wallet.address.toLowerCase());
     expect(updated.status).toBe('failed');
-    expect(updated.ual.toLowerCase()).toContain(wallet.address.toLowerCase());
+    // Greenfield (PR #815): UAL embeds the DKGKnowledgeAssets storage
+    // address; attribution is asserted via capturedPublisherAddress above.
+    expect(updated.ual).toMatch(/^did:dkg:mock:31337\/0x[0-9a-fA-F]{40}\/12$/);
   });
 
   it('preserves failed adapter-managed updates when publisher attribution is unavailable', async () => {
@@ -1017,7 +1065,7 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
       keypair,
     });
 
-    const updated = await publisher.update(12n, {
+    const updated = await updS(publisher, 12n, {
       contextGraphId: '1',
       quads: [{
         subject: 'urn:test:adapter-managed-failed-update-without-address',
@@ -1070,7 +1118,7 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
       },
     ));
 
-    const updated = await publisher.update(13n, {
+    const updated = await updS(publisher, 13n, {
       contextGraphId: '1',
       quads: [{
         subject: 'urn:test:adapter-managed-update-local-attribution',
@@ -1107,7 +1155,7 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
       keypair,
     });
 
-    const updated = await publisher.update(12n, {
+    const updated = await updS(publisher, 12n, {
       contextGraphId: '1',
       quads: [{
         subject: 'urn:test:adapter-managed-update-without-address',

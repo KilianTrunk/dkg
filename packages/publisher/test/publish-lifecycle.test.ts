@@ -27,7 +27,7 @@ import { computeTripleHashV10 as computeTripleHash } from '../src/merkle.js';
 import { ethers } from 'ethers';
 import { createEVMAdapter, getSharedContext, createProvider, takeSnapshot, revertSnapshot, createTestContextGraph, HARDHAT_KEYS } from '../../chain/test/evm-test-context.js';
 import { mintTokens } from '../../chain/test/hardhat-harness.js';
-import { withSeal as _withSeal } from './_helpers/seal.js';
+import { withSeal as _withSeal, withUpdateSeal as _withUpdateSeal } from './_helpers/seal.js';
 import { hardhatACKProvider } from './_helpers/acks.js';
 
 let CONTEXT_GRAPH: string;
@@ -59,7 +59,11 @@ async function pubS(p: DKGPublisher, args: Parameters<DKGPublisher['publish']>[0
   } as Parameters<DKGPublisher['publish']>[0]);
 }
 async function updS(p: DKGPublisher, kcId: bigint, args: Parameters<DKGPublisher['update']>[1]) {
-  const sealed = await _withSeal(args, _author, { provider: _provider, kav10Address: _kav10Address });
+  // Greenfield (PR #815): on-chain updates are owner-sealed — the publisher
+  // refuses to self-sign and requires a `precomputedUpdateAttestation` over
+  // `UpdateAuthorAttestation(kaId, newMerkleRoot, author)`. Mint it here so
+  // existing update tests stay structurally identical.
+  const sealed = await _withUpdateSeal(kcId, args, _author, { provider: _provider, kav10Address: _kav10Address });
   return p.update(kcId, {
     ...sealed,
     v10ACKProvider: sealed.v10ACKProvider ?? hardhatACKProvider(_kav10Address),
@@ -139,13 +143,17 @@ describe('Publish lifecycle (aligned with diagram)', () => {
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
     });
 
-    const entityA = 'did:dkg:agent:QmEntityA';
-    const entityB = 'did:dkg:agent:QmEntityB';
+    // Greenfield (PR #815): one KA per publish. The flat-kcMerkleRoot
+    // property is independent of how many triples the single KA carries —
+    // the root is always a flat MerkleTree over every triple hash (no
+    // per-entity grouping). Exercise it with a single root entity holding
+    // four triples.
+    const entity = 'did:dkg:agent:QmFlatOptions';
     const triples = [
-      q(entityA, 'http://schema.org/name', '"EntityA"'),
-      q(entityA, 'http://schema.org/version', '"1"'),
-      q(entityB, 'http://schema.org/name', '"EntityB"'),
-      q(entityB, 'http://schema.org/version', '"2"'),
+      q(entity, 'http://schema.org/name', '"EntityA"'),
+      q(entity, 'http://schema.org/version', '"1"'),
+      q(entity, 'http://schema.org/description', '"EntityB"'),
+      q(entity, 'http://schema.org/url', '"2"'),
     ];
 
     const result = await pubS(publisher, {
@@ -175,13 +183,18 @@ describe('Publish lifecycle (aligned with diagram)', () => {
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
     });
 
+    // Greenfield (PR #815): one KA per publish. The golden now pins the
+    // flat-merkle pipeline output for a single root entity carrying six
+    // fixed triples (the old golden combined three entities into one KC,
+    // which the single-KA invariant no longer allows). Re-derived via
+    // V10MerkleTree(quads.map(computeTripleHashV10)) over the quads below.
     const fixedQuads = [
       q('did:dkg:agent:Entity1', 'http://schema.org/name', '"Entity1"'),
       q('did:dkg:agent:Entity1', 'http://schema.org/version', '"1"'),
-      q('did:dkg:agent:Entity2', 'http://schema.org/name', '"Entity2"'),
-      q('did:dkg:agent:Entity2', 'http://schema.org/version', '"2"'),
-      q('did:dkg:agent:Entity3', 'http://schema.org/name', '"Entity3"'),
-      q('did:dkg:agent:Entity3', 'http://schema.org/version', '"3"'),
+      q('did:dkg:agent:Entity1', 'http://schema.org/alternateName', '"Entity2"'),
+      q('did:dkg:agent:Entity1', 'http://schema.org/identifier', '"2"'),
+      q('did:dkg:agent:Entity1', 'http://schema.org/description', '"Entity3"'),
+      q('did:dkg:agent:Entity1', 'http://schema.org/sameAs', '"3"'),
     ];
 
     const result = await pubS(publisher, {
@@ -191,7 +204,7 @@ describe('Publish lifecycle (aligned with diagram)', () => {
 
     const actualHex = Buffer.from(result.merkleRoot).toString('hex');
     const goldenHex =
-      'd0d2a43d52a4925eabf280043ac3fa21043d7da90f9813fb22fecfc038d3da97';
+      '0a3a66a345e5e8a25c50dd01be3373ae3d6b242807b62cbe7ada5ec208812a16';
     expect(actualHex).toBe(goldenHex);
   });
 
@@ -316,33 +329,40 @@ describe('Publisher ↔ Receiver merkle consistency (regression)', () => {
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
     });
 
+    // Greenfield (PR #815): one KA per publish, so the historical
+    // single-KC-with-two-entities publish is now split into two
+    // single-KA publishes. The receiver-consistency invariant is
+    // per-publish: for each KA, the receiver rebuilding a flat
+    // MerkleTree from the public quads MUST reproduce the publisher's
+    // root — otherwise the finalization handler logs "merkle mismatch"
+    // and falls back to full-payload sync.
     const entityA = 'did:dkg:agent:QmEntityAlpha';
     const entityB = 'did:dkg:agent:QmEntityBeta';
-    const triples = [
+    const triplesA = [
       q(entityA, 'http://schema.org/name', '"Alpha"'),
       q(entityA, 'http://schema.org/version', '"1"'),
       q(entityA, 'http://schema.org/description', '"First entity"'),
+    ];
+    const triplesB = [
       q(entityB, 'http://schema.org/name', '"Beta"'),
       q(entityB, 'http://schema.org/version', '"2"'),
     ];
 
-    const result = await pubS(publisher, {
-      contextGraphId: CONTEXT_GRAPH,
-      quads: triples,
-    });
+    for (const triples of [triplesA, triplesB]) {
+      const result = await pubS(publisher, {
+        contextGraphId: CONTEXT_GRAPH,
+        quads: triples,
+      });
 
-    expect(result.merkleRoot).toHaveLength(32);
-    const publisherHex = Buffer.from(result.merkleRoot).toString('hex');
+      expect(result.merkleRoot).toHaveLength(32);
+      const publisherHex = Buffer.from(result.merkleRoot).toString('hex');
 
-    // Simulate what a receiver does: hash all received public quads with
-    // computeTripleHash and build a flat MerkleTree. This MUST match the
-    // publisher's root — if it doesn't, the finalization handler will log
-    // "merkle mismatch" and fall back to full-payload sync.
-    const receiverHashes = result.publicQuads!.map(computeTripleHash);
-    const receiverRoot = new MerkleTree(receiverHashes).root;
-    const receiverHex = Buffer.from(receiverRoot).toString('hex');
+      const receiverHashes = result.publicQuads!.map(computeTripleHash);
+      const receiverRoot = new MerkleTree(receiverHashes).root;
+      const receiverHex = Buffer.from(receiverRoot).toString('hex');
 
-    expect(receiverHex).toBe(publisherHex);
+      expect(receiverHex).toBe(publisherHex);
+    }
   });
 
   it('single-entity publish: receiver flat merkle matches publisher merkle', async () => {

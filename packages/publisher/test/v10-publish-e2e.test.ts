@@ -265,8 +265,11 @@ describe('V10 Publish E2E', () => {
       receiverKeys.map(async (key, idx) => {
         const wallet = new ethers.Wallet(key);
         const digest = computePublishACKDigest(
+          // Greenfield (PR #815): exactly one KA per tx. The quads above are
+          // a single root entity (urn:experiment:wsd), so knowledgeAssetsAmount
+          // is 1 — not the triple count.
           TEST_CHAIN_ID, realKAV10Addr, chainCgId, merkleRoot,
-          BigInt(publishQuads.length), byteSize, epochs, tokenAmount,
+          1n, byteSize, epochs, tokenAmount,
           BigInt(publishMerkleLeafCount),
         );
         const sig = ethers.Signature.from(await wallet.signMessage(digest));
@@ -296,7 +299,7 @@ describe('V10 Publish E2E', () => {
       publishOperationId: 'v10-e2e-test',
       contextGraphId: chainCgId,
       merkleRoot,
-      knowledgeAssetsAmount: publishQuads.length,
+      knowledgeAssetsAmount: 1,
       byteSize,
       epochs: Number(epochs),
       tokenAmount,

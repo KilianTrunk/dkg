@@ -222,6 +222,12 @@ class OperationalKeyOnlyPublishChainAdapter implements ChainAdapter {
     return '0x00000000000000000000000000000000000000A1';
   }
 
+  // Greenfield (PR #815): the publisher needs the DKGKnowledgeAssets address
+  // to build the KA UAL after an on-chain publish.
+  async getDKGKnowledgeAssetsAddress(): Promise<string> {
+    return '0x00000000000000000000000000000000000000A2';
+  }
+
   async createKnowledgeAssetsV10(params: V10PublishDirectParams): Promise<OnChainPublishResult> {
     this.capturedPublisherAddress = params.publisherAddress;
     if (params.publisherAddress.toLowerCase() !== this.wallet.address.toLowerCase()) {
@@ -255,6 +261,12 @@ class ExternalOperationalKeyPublishChainAdapter implements ChainAdapter {
 
   async getKnowledgeAssetsV10Address(): Promise<string> {
     return '0x00000000000000000000000000000000000000A1';
+  }
+
+  // Greenfield (PR #815): the publisher needs the DKGKnowledgeAssets address
+  // to build the KA UAL after an on-chain publish.
+  async getDKGKnowledgeAssetsAddress(): Promise<string> {
+    return '0x00000000000000000000000000000000000000A2';
   }
 
   async createKnowledgeAssetsV10(params: V10PublishDirectParams): Promise<OnChainPublishResult> {

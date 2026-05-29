@@ -9,7 +9,7 @@ import {
   ContextGraphStorage,
   ContextGraphValueStorage,
   Hub,
-  KnowledgeCollectionStorage,
+  DKGKnowledgeAssets,
   RandomSampling,
 } from '../../typechain';
 
@@ -62,7 +62,7 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
   let HubContract: Hub;
   let RandomSamplingContract: RandomSampling;
   let ChronosContract: Chronos;
-  let KCSContract: KnowledgeCollectionStorage;
+  let KCSContract: DKGKnowledgeAssets;
   let CGStorageContract: ContextGraphStorage;
   let CGValueStorage: ContextGraphValueStorage;
 
@@ -83,7 +83,7 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
       'ProfileStorage',
       'Chronos',
       'EpochStorage',
-      'KnowledgeCollectionStorage',
+      'DKGKnowledgeAssets',
       'AskStorage',
       'DelegatorsInfo',
       'RandomSamplingStorage',
@@ -106,8 +106,8 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
       HubContract: Hub,
       RandomSamplingContract: await hre.ethers.getContract<RandomSampling>('RandomSampling'),
       ChronosContract: await hre.ethers.getContract<Chronos>('Chronos'),
-      KCSContract: await hre.ethers.getContract<KnowledgeCollectionStorage>(
-        'KnowledgeCollectionStorage',
+      KCSContract: await hre.ethers.getContract<DKGKnowledgeAssets>(
+        'DKGKnowledgeAssets',
       ),
       CGStorageContract: await hre.ethers.getContract<ContextGraphStorage>(
         'ContextGraphStorage',
@@ -178,7 +178,7 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
   }
 
   /**
-   * Seed a KC directly on KnowledgeCollectionStorage and register it to the
+   * Seed a KC directly on DKGKnowledgeAssets and register it to the
    * given CG. Returns the new KC id.
    *
    * For curated CGs, pass `ciphertext` to also call
@@ -193,7 +193,7 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
     const currentEpoch = await ChronosContract.getCurrentEpoch();
     const createTx = await KCSContract.connect(opSigner).createKnowledgeCollection(
       opSigner.address,
-      ethers.ZeroAddress,
+      opSigner.address,
       'rfc39-curated-test-op',
       ethers.keccak256(
         ethers.toUtf8Bytes(
@@ -210,7 +210,7 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
     );
     const receipt = await createTx.wait();
     const iface = KCSContract.interface;
-    const topic = iface.getEvent('KnowledgeCollectionCreated')!.topicHash;
+    const topic = iface.getEvent('KnowledgeAssetCreated')!.topicHash;
     const log = receipt!.logs.find((l) => l.topics[0] === topic);
     if (!log) {
       throw new Error('KnowledgeCollectionCreated event not found');

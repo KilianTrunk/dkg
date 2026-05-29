@@ -11,7 +11,7 @@ import {
   RandomSamplingStorage,
   IdentityStorage,
   StakingStorage,
-  KnowledgeCollectionStorage,
+  DKGKnowledgeAssets,
   ProfileStorage,
   EpochStorage,
   Chronos,
@@ -63,7 +63,7 @@ type RandomSamplingFixture = {
   RandomSamplingStorage: RandomSamplingStorage;
   IdentityStorage: IdentityStorage;
   StakingStorage: StakingStorage;
-  KnowledgeCollectionStorage: KnowledgeCollectionStorage;
+  DKGKnowledgeAssets: DKGKnowledgeAssets;
   ProfileStorage: ProfileStorage;
   EpochStorage: EpochStorage;
   Chronos: Chronos;
@@ -196,7 +196,7 @@ describe.skip('@integration RandomSampling (OBSOLETE: V8 stake pipeline)', () =>
   let RandomSamplingStorage: RandomSamplingStorage;
   let IdentityStorage: IdentityStorage;
   let StakingStorage: StakingStorage;
-  let KnowledgeCollectionStorage: KnowledgeCollectionStorage;
+  let DKGKnowledgeAssets: DKGKnowledgeAssets;
   let ProfileStorage: ProfileStorage;
   let EpochStorage: EpochStorage;
   let Chronos: Chronos;
@@ -263,9 +263,9 @@ describe.skip('@integration RandomSampling (OBSOLETE: V8 stake pipeline)', () =>
       await hre.ethers.getContract<IdentityStorage>('IdentityStorage');
     StakingStorage =
       await hre.ethers.getContract<StakingStorage>('StakingStorage');
-    KnowledgeCollectionStorage =
-      await hre.ethers.getContract<KnowledgeCollectionStorage>(
-        'KnowledgeCollectionStorage',
+    DKGKnowledgeAssets =
+      await hre.ethers.getContract<DKGKnowledgeAssets>(
+        'DKGKnowledgeAssets',
       );
     ProfileStorage =
       await hre.ethers.getContract<ProfileStorage>('ProfileStorage');
@@ -308,7 +308,7 @@ describe.skip('@integration RandomSampling (OBSOLETE: V8 stake pipeline)', () =>
       RandomSamplingStorage,
       IdentityStorage,
       StakingStorage,
-      KnowledgeCollectionStorage,
+      DKGKnowledgeAssets,
       ProfileStorage,
       EpochStorage,
       Chronos,
@@ -335,7 +335,7 @@ describe.skip('@integration RandomSampling (OBSOLETE: V8 stake pipeline)', () =>
       accounts,
       IdentityStorage,
       StakingStorage,
-      KnowledgeCollectionStorage,
+      DKGKnowledgeAssets,
       ProfileStorage,
       EpochStorage,
       Chronos,
@@ -382,7 +382,7 @@ describe.skip('@integration RandomSampling (OBSOLETE: V8 stake pipeline)', () =>
         await RandomSamplingStorage.getAddress(),
       );
       expect(await RandomSampling.knowledgeCollectionStorage()).to.equal(
-        await KnowledgeCollectionStorage.getAddress(),
+        await DKGKnowledgeAssets.getAddress(),
       );
       expect(await RandomSampling.stakingStorage()).to.equal(
         await StakingStorage.getAddress(),

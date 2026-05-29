@@ -152,19 +152,30 @@ describe('SWM subset publish cleanup', () => {
       v10ACKProvider: hardhatACKProvider(_kav10Address),
     });
 
-    // Publish remaining (Bob + Carol) — should not fail with "already exists"
-    const remainingQuads = allQuads.filter((quad) => quad.subject !== alice);
-    const result = await publisher.publishFromSharedMemory(CONTEXT_GRAPH, 'all', {
-      clearSharedMemoryAfter: true,
-      precomputedAttestation: await sealForAll(remainingQuads),
+    // Publish the remaining entities — should not fail with "already
+    // exists". Greenfield (PR #815) allows one KA per transaction, so
+    // Bob and Carol are published in separate single-KA publishes rather
+    // than a single multi-KA `'all'` call.
+    const bobResult = await publisher.publishFromSharedMemory(CONTEXT_GRAPH, { rootEntities: [bob] }, {
+      clearSharedMemoryAfter: false,
+      precomputedAttestation: await sealForRoots(allQuads, [bob]),
       v10ACKProvider: hardhatACKProvider(_kav10Address),
     });
+    expect(bobResult.status).toBe('confirmed');
+    const bobRoots = bobResult.kaManifest.map((ka) => ka.rootEntity);
+    expect(bobRoots).toContain(bob);
+    expect(bobRoots).not.toContain(alice);
 
-    expect(result.status).toBe('confirmed');
-    const roots = result.kaManifest.map((ka) => ka.rootEntity);
-    expect(roots).toContain(bob);
-    expect(roots).toContain(carol);
-    expect(roots).not.toContain(alice);
+    // Carol is the last entity left in SWM; publish it and clear.
+    const carolResult = await publisher.publishFromSharedMemory(CONTEXT_GRAPH, 'all', {
+      clearSharedMemoryAfter: true,
+      precomputedAttestation: await sealForRoots(allQuads, [carol]),
+      v10ACKProvider: hardhatACKProvider(_kav10Address),
+    });
+    expect(carolResult.status).toBe('confirmed');
+    const carolRoots = carolResult.kaManifest.map((ka) => ka.rootEntity);
+    expect(carolRoots).toContain(carol);
+    expect(carolRoots).not.toContain(alice);
 
     // SWM should be empty
     expect(await countInGraph(store, WORKSPACE_GRAPH)).toBe(0);

@@ -164,7 +164,7 @@ describe('@unit DKGPublishingConvictionNFT — TRAC conservation across full lif
     // ---- Setup: impersonate KAV10 and register an agent ----
     const Kav10Signer = accounts[5];
     const agent = accounts[6];
-    await HubContract.setContractAddress('KnowledgeAssetsV10', Kav10Signer.address);
+    await HubContract.setContractAddress('KnowledgeAssetsLifecycle', Kav10Signer.address);
 
     // Use committedTRAC NOT divisible by 12 to exercise the dust path.
     const committed = hre.ethers.parseEther('120000') + 7n; // 30% tier, ~10K per window

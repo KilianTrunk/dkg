@@ -106,7 +106,9 @@ beforeAll(async () => {
     ],
     provider,
   );
-  kcsAddress = await hub.getAssetStorageAddress('KnowledgeCollectionStorage');
+  // Greenfield (PR #815): the asset-storage Hub key was renamed
+  // KnowledgeCollectionStorage → DKGKnowledgeAssets.
+  kcsAddress = await hub.getAssetStorageAddress('DKGKnowledgeAssets');
   pcaAddress = await hub.getContractAddress('DKGPublishingConvictionNFT');
   tokenAddress = await hub.getContractAddress('Token');
   epsAddress = await hub.getContractAddress('EpochStorageV8');
@@ -180,7 +182,7 @@ function token() {
 // share the ceremony. Local thin wrappers preserve the call shape used
 // throughout this file (CORE_OP author by default; `cgId` defaults to
 // the file-scope `CONTEXT_GRAPH`).
-import { buildSeal as buildSealCore, publishSealed as publishSealedCore } from './_helpers/seal.js';
+import { buildSeal as buildSealCore, publishSealed as publishSealedCore, updateSealed as updateSealedCore } from './_helpers/seal.js';
 import { hardhatACKProvider } from './_helpers/acks.js';
 
 async function buildSeal(
@@ -209,6 +211,24 @@ async function publishSealed(
   // quorum now that the self-signed ACK fallback is gone.
   return publishSealedCore(
     publisher,
+    args,
+    new ethers.Wallet(authorKey),
+    { provider, kav10Address },
+    { v10ACKProvider: hardhatACKProvider(kav10Address) },
+  );
+}
+
+async function updateSealed(
+  publisher: DKGPublisher,
+  kcId: bigint,
+  args: Parameters<DKGPublisher['update']>[1],
+  authorKey: string = HARDHAT_KEYS.CORE_OP,
+) {
+  // Greenfield (PR #815): on-chain updates are owner-sealed — mint the
+  // UpdateAuthorAttestation seal + supply the ACK quorum, same as publish.
+  return updateSealedCore(
+    publisher,
+    kcId,
     args,
     new ethers.Wallet(authorKey),
     { provider, kav10Address },
@@ -412,19 +432,20 @@ describe('Diagram 4 — KC update writes merkleRootAuthors[len-1] unconditionall
     const idx0Author: string = await kcs().getMerkleRootAuthorByIndex(kcId, 0);
     expect(idx0Author.toLowerCase()).toBe(author.address.toLowerCase());
 
-    const updated = await publisher.update(kcId, {
+    const updated = await updateSealed(publisher, kcId, {
       contextGraphId: CONTEXT_GRAPH,
       quads: [q(`${ENTITY}/D4`, 'http://schema.org/name', '"Updated"')],
     });
     expect(updated.status).toBe('confirmed');
 
-    // Index 0 unchanged; index 1 is address(0) since V10.1 update path
-    // doesn't sign authors yet — the unconditional overwrite means a stale
-    // value at this index from a prior pop+push couldn't leak through.
+    // Index 0 unchanged. Greenfield (PR #815): owner-sealed updates carry a
+    // signed UpdateAuthorAttestation, so the update path now records the
+    // author at the appended index — index 1 is the update signer, not
+    // address(0) as in the pre-greenfield V10.1 path.
     expect((await kcs().getMerkleRootAuthorByIndex(kcId, 0)).toLowerCase())
       .toBe(author.address.toLowerCase());
     expect((await kcs().getMerkleRootAuthorByIndex(kcId, 1)).toLowerCase())
-      .toBe(ethers.ZeroAddress);
+      .toBe(author.address.toLowerCase());
   });
 });
 
@@ -607,28 +628,32 @@ describe('Diagram 8 — multi-update author array stays consistent with the cano
     });
     const kcId = created.onChainResult!.batchId;
 
-    const u1 = await publisher.update(kcId, {
+    const u1 = await updateSealed(publisher, kcId, {
       contextGraphId: CONTEXT_GRAPH,
       quads: [q(`${ENTITY}/D8`, 'http://schema.org/name', '"V1"')],
     });
     expect(u1.status).toBe('confirmed');
 
-    const u2 = await publisher.update(kcId, {
+    const u2 = await updateSealed(publisher, kcId, {
       contextGraphId: CONTEXT_GRAPH,
       quads: [q(`${ENTITY}/D8`, 'http://schema.org/name', '"V2"')],
     });
     expect(u2.status).toBe('confirmed');
 
+    // Greenfield (PR #815): owner-sealed updates carry a signed author
+    // attestation, so every appended merkle root is attributed to the
+    // update signer — [author, author, author] rather than the
+    // pre-greenfield [author, 0, 0].
     expect((await kcs().getMerkleRootAuthorByIndex(kcId, 0)).toLowerCase())
       .toBe(author.address.toLowerCase());
     expect((await kcs().getMerkleRootAuthorByIndex(kcId, 1)).toLowerCase())
-      .toBe(ethers.ZeroAddress);
+      .toBe(author.address.toLowerCase());
     expect((await kcs().getMerkleRootAuthorByIndex(kcId, 2)).toLowerCase())
-      .toBe(ethers.ZeroAddress);
+      .toBe(author.address.toLowerCase());
 
-    // Latest reader returns the most-recent slot (index 2) → address(0).
+    // Latest reader returns the most-recent slot (index 2) → update signer.
     expect((await kcs().getLatestMerkleRootAuthor(kcId)).toLowerCase())
-      .toBe(ethers.ZeroAddress);
+      .toBe(author.address.toLowerCase());
   });
 });
 

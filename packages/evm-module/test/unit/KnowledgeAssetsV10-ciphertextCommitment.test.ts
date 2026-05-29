@@ -12,8 +12,8 @@ import type {
   DKGPublishingConvictionNFT,
   DKGStakingConvictionNFT,
   Hub,
-  KnowledgeAssetsV10,
-  KnowledgeCollectionStorage,
+  KnowledgeAssetsLifecycle,
+  DKGKnowledgeAssets,
   Profile,
   StakingV10,
   Token,
@@ -32,7 +32,7 @@ import {
 import { NodeAccounts } from '../helpers/types';
 
 /**
- * RFC-39 Phase A.5 — `KnowledgeAssetsV10` ciphertext-commitment surface.
+ * RFC-39 Phase A.5 — `KnowledgeAssetsLifecycle` ciphertext-commitment surface.
  *
  * Locks the curated-vs-public branching introduced by the new
  * `(ciphertextChunksRoot, ciphertextChunkCount)` `PublishParams` fields:
@@ -44,20 +44,20 @@ import { NodeAccounts } from '../helpers/types';
  *     event fires, KCS getters return the persisted values
  *   - Curated CG + exactly one zero   → reverts `IncompleteCiphertextCommitment`
  *
- * Dedicated test file (separate from `KnowledgeAssetsV10.test.ts`) so the
+ * Dedicated test file (separate from `KnowledgeAssetsLifecycle.test.ts`) so the
  * companion contract PR doesn't conflict with PR #595, which is also
  * modifying the legacy test file.
  *
- * Fixture mirrors the legacy `KnowledgeAssetsV10.test.ts` fixture exactly so
+ * Fixture mirrors the legacy `KnowledgeAssetsLifecycle.test.ts` fixture exactly so
  * the test surface is identical (full V10 stack + V8 KC infra + min-stake
  * profile setup). Diverging would tempt drift between RFC-39 coverage and
  * the rest of the V10 publish suite.
  */
-describe('@unit KnowledgeAssetsV10 — RFC-39 ciphertext commitment', () => {
+describe('@unit KnowledgeAssetsLifecycle — RFC-39 ciphertext commitment', () => {
   let accounts: SignerWithAddress[];
   let HubContract: Hub;
-  let KAV10: KnowledgeAssetsV10;
-  let KCS: KnowledgeCollectionStorage;
+  let KAV10: KnowledgeAssetsLifecycle;
+  let KCS: DKGKnowledgeAssets;
   let AskStorageContract: AskStorage;
   let ChronosContract: Chronos;
   let TokenContract: Token;
@@ -84,14 +84,14 @@ describe('@unit KnowledgeAssetsV10 — RFC-39 ciphertext commitment', () => {
       'Identity',
       'ParametersStorage',
       'IdentityStorage',
-      'KnowledgeCollectionStorage',
+      'DKGKnowledgeAssets',
       'ContextGraphStorage',
       'ContextGraphs',
       'ContextGraphValueStorage',
       'DKGPublishingConvictionNFT',
       'StakingV10',
       'DKGStakingConvictionNFT',
-      'KnowledgeAssetsV10',
+      'KnowledgeAssetsLifecycle',
     ]);
 
     const signers = await hre.ethers.getSigners();
@@ -101,9 +101,9 @@ describe('@unit KnowledgeAssetsV10 — RFC-39 ciphertext commitment', () => {
     return {
       accounts: signers,
       HubContract: Hub,
-      KAV10: await hre.ethers.getContract<KnowledgeAssetsV10>('KnowledgeAssetsV10'),
-      KCS: await hre.ethers.getContract<KnowledgeCollectionStorage>(
-        'KnowledgeCollectionStorage',
+      KAV10: await hre.ethers.getContract<KnowledgeAssetsLifecycle>('KnowledgeAssetsLifecycle'),
+      KCS: await hre.ethers.getContract<DKGKnowledgeAssets>(
+        'DKGKnowledgeAssets',
       ),
       AskStorageContract: await hre.ethers.getContract<AskStorage>('AskStorage'),
       ChronosContract: await hre.ethers.getContract<Chronos>('Chronos'),
@@ -240,7 +240,7 @@ describe('@unit KnowledgeAssetsV10 — RFC-39 ciphertext commitment', () => {
         author: creator,
         contextGraphId: cgId,
         merkleRoot: ethers.keccak256(ethers.toUtf8Bytes('public-zero-ct')),
-        knowledgeAssetsAmount: 10,
+        knowledgeAssetsAmount: 1,
         byteSize: 1000,
         epochs: 2,
         tokenAmount,
@@ -272,7 +272,7 @@ describe('@unit KnowledgeAssetsV10 — RFC-39 ciphertext commitment', () => {
         author: creator,
         contextGraphId: cgId,
         merkleRoot: ethers.keccak256(ethers.toUtf8Bytes('public-root-only')),
-        knowledgeAssetsAmount: 10,
+        knowledgeAssetsAmount: 1,
         byteSize: 1000,
         epochs: 2,
         tokenAmount,
@@ -303,7 +303,7 @@ describe('@unit KnowledgeAssetsV10 — RFC-39 ciphertext commitment', () => {
         author: creator,
         contextGraphId: cgId,
         merkleRoot: ethers.keccak256(ethers.toUtf8Bytes('public-count-only')),
-        knowledgeAssetsAmount: 10,
+        knowledgeAssetsAmount: 1,
         byteSize: 1000,
         epochs: 2,
         tokenAmount,
@@ -339,7 +339,7 @@ describe('@unit KnowledgeAssetsV10 — RFC-39 ciphertext commitment', () => {
         author: creator,
         contextGraphId: cgId,
         merkleRoot: ethers.keccak256(ethers.toUtf8Bytes('public-both-set')),
-        knowledgeAssetsAmount: 10,
+        knowledgeAssetsAmount: 1,
         byteSize: 1000,
         epochs: 2,
         tokenAmount,
@@ -378,7 +378,7 @@ describe('@unit KnowledgeAssetsV10 — RFC-39 ciphertext commitment', () => {
         author: creator,
         contextGraphId: cgId,
         merkleRoot: ethers.keccak256(ethers.toUtf8Bytes('public-atomic-revert')),
-        knowledgeAssetsAmount: 10,
+        knowledgeAssetsAmount: 1,
         byteSize: 1000,
         epochs: 2,
         tokenAmount,
@@ -416,7 +416,7 @@ describe('@unit KnowledgeAssetsV10 — RFC-39 ciphertext commitment', () => {
         author: creator,
         contextGraphId: cgId,
         merkleRoot: ethers.keccak256(ethers.toUtf8Bytes('curated-zero-ct')),
-        knowledgeAssetsAmount: 10,
+        knowledgeAssetsAmount: 1,
         byteSize: 1000,
         epochs: 2,
         tokenAmount,
@@ -449,7 +449,7 @@ describe('@unit KnowledgeAssetsV10 — RFC-39 ciphertext commitment', () => {
         author: creator,
         contextGraphId: cgId,
         merkleRoot: ethers.keccak256(ethers.toUtf8Bytes('curated-full-ct')),
-        knowledgeAssetsAmount: 10,
+        knowledgeAssetsAmount: 1,
         byteSize: 1000,
         epochs: 2,
         tokenAmount,
@@ -461,7 +461,7 @@ describe('@unit KnowledgeAssetsV10 — RFC-39 ciphertext commitment', () => {
 
       await TokenContract.connect(creator).approve(kav10Address, tokenAmount);
 
-      // The contract reads `KnowledgeCollectionStorage.getLatestKnowledgeCollectionId() + 1`
+      // The contract reads `DKGKnowledgeAssets.getLatestKnowledgeCollectionId() + 1`
       // for the next id (counter increments on create). Snapshot before to
       // pin the expected kcId for the event matcher.
       const nextKcId = (await KCS.getLatestKnowledgeCollectionId()) + 1n;
@@ -490,7 +490,7 @@ describe('@unit KnowledgeAssetsV10 — RFC-39 ciphertext commitment', () => {
         author: creator,
         contextGraphId: cgId,
         merkleRoot: ethers.keccak256(ethers.toUtf8Bytes('curated-partial-root')),
-        knowledgeAssetsAmount: 10,
+        knowledgeAssetsAmount: 1,
         byteSize: 1000,
         epochs: 2,
         tokenAmount,
@@ -527,7 +527,7 @@ describe('@unit KnowledgeAssetsV10 — RFC-39 ciphertext commitment', () => {
         chainId, kav10Address, receivingNodes, publisherIdentityId,
         receiverIdentityIds, author: creator, contextGraphId: cgId,
         merkleRoot: ethers.keccak256(ethers.toUtf8Bytes('curated-multi-1')),
-        knowledgeAssetsAmount: 10, byteSize: 1000, epochs: 2,
+        knowledgeAssetsAmount: 1, byteSize: 1000, epochs: 2,
         tokenAmount, isImmutable: false,
         publishOperationId: 'curated-multi-1-op',
         ciphertextChunksRoot: ROOT_1, ciphertextChunkCount: COUNT_1,
@@ -540,7 +540,7 @@ describe('@unit KnowledgeAssetsV10 — RFC-39 ciphertext commitment', () => {
         chainId, kav10Address, receivingNodes, publisherIdentityId,
         receiverIdentityIds, author: creator, contextGraphId: cgId,
         merkleRoot: ethers.keccak256(ethers.toUtf8Bytes('curated-multi-2')),
-        knowledgeAssetsAmount: 10, byteSize: 1000, epochs: 2,
+        knowledgeAssetsAmount: 1, byteSize: 1000, epochs: 2,
         tokenAmount, isImmutable: false,
         publishOperationId: 'curated-multi-2-op',
         ciphertextChunksRoot: ROOT_2, ciphertextChunkCount: COUNT_2,
@@ -573,7 +573,7 @@ describe('@unit KnowledgeAssetsV10 — RFC-39 ciphertext commitment', () => {
         author: creator,
         contextGraphId: cgId,
         merkleRoot: ethers.keccak256(ethers.toUtf8Bytes('curated-partial-count')),
-        knowledgeAssetsAmount: 10,
+        knowledgeAssetsAmount: 1,
         byteSize: 1000,
         epochs: 2,
         tokenAmount,
@@ -634,7 +634,7 @@ describe('@unit KnowledgeAssetsV10 — RFC-39 ciphertext commitment', () => {
         author: creator,
         contextGraphId: cgId,
         merkleRoot: ethers.keccak256(ethers.toUtf8Bytes('curated-baseline')),
-        knowledgeAssetsAmount: 10,
+        knowledgeAssetsAmount: 1,
         byteSize: Number(byteSize),
         epochs: 5,
         tokenAmount,
@@ -680,7 +680,7 @@ describe('@unit KnowledgeAssetsV10 — RFC-39 ciphertext commitment', () => {
         author: creator,
         contextGraphId: cgId,
         merkleRoot: ethers.keccak256(ethers.toUtf8Bytes('public-baseline')),
-        knowledgeAssetsAmount: 10,
+        knowledgeAssetsAmount: 1,
         byteSize: Number(byteSize),
         epochs: 5,
         tokenAmount,
@@ -716,7 +716,7 @@ describe('@unit KnowledgeAssetsV10 — RFC-39 ciphertext commitment', () => {
         author: creator,
         contextGraphId: cgId,
         merkleRoot: ethers.keccak256(ethers.toUtf8Bytes('curated-legacy-baseline')),
-        knowledgeAssetsAmount: 10,
+        knowledgeAssetsAmount: 1,
         byteSize: Number(byteSize),
         epochs: 5,
         tokenAmount,
@@ -741,8 +741,9 @@ describe('@unit KnowledgeAssetsV10 — RFC-39 ciphertext commitment', () => {
         newMerkleRoot: ethers.keccak256(ethers.toUtf8Bytes('curated-legacy-update')),
         newByteSize: byteSize,
         newTokenAmount: tokenAmount,
-        mintKnowledgeAssetsAmount: 1n,
+        mintKnowledgeAssetsAmount: 0n,
         knowledgeAssetsToBurn: [],
+        author: creator,
         updateOperationId: 'curated-legacy-update-op',
       });
 
@@ -774,8 +775,9 @@ describe('@unit KnowledgeAssetsV10 — RFC-39 ciphertext commitment', () => {
         newMerkleRoot: ethers.keccak256(ethers.toUtf8Bytes('curated-update-zero')),
         newByteSize: base.byteSize,
         newTokenAmount: base.tokenAmount, // delta == 0 so no approval/payment needed
-        mintKnowledgeAssetsAmount: 1n,
+        mintKnowledgeAssetsAmount: 0n,
         knowledgeAssetsToBurn: [],
+        author: base.creator,
         updateOperationId: 'curated-update-zero-op',
       });
 
@@ -802,8 +804,9 @@ describe('@unit KnowledgeAssetsV10 — RFC-39 ciphertext commitment', () => {
         newMerkleRoot: ethers.keccak256(ethers.toUtf8Bytes('curated-update-asym')),
         newByteSize: base.byteSize,
         newTokenAmount: base.tokenAmount,
-        mintKnowledgeAssetsAmount: 1n,
+        mintKnowledgeAssetsAmount: 0n,
         knowledgeAssetsToBurn: [],
+        author: base.creator,
         updateOperationId: 'curated-update-asym-op',
       });
       const upPartial = {
@@ -832,8 +835,9 @@ describe('@unit KnowledgeAssetsV10 — RFC-39 ciphertext commitment', () => {
         newMerkleRoot: ethers.keccak256(ethers.toUtf8Bytes('curated-update-asym-count')),
         newByteSize: base.byteSize,
         newTokenAmount: base.tokenAmount,
-        mintKnowledgeAssetsAmount: 1n,
+        mintKnowledgeAssetsAmount: 0n,
         knowledgeAssetsToBurn: [],
+        author: base.creator,
         updateOperationId: 'curated-update-asym-count-op',
       });
       const upPartial = {
@@ -863,8 +867,9 @@ describe('@unit KnowledgeAssetsV10 — RFC-39 ciphertext commitment', () => {
         newMerkleRoot: ethers.keccak256(ethers.toUtf8Bytes('curated-update-same')),
         newByteSize: base.byteSize,
         newTokenAmount: base.tokenAmount,
-        mintKnowledgeAssetsAmount: 1n,
+        mintKnowledgeAssetsAmount: 0n,
         knowledgeAssetsToBurn: [],
+        author: base.creator,
         updateOperationId: 'curated-update-same-op',
       });
       const upSame = {
@@ -892,8 +897,9 @@ describe('@unit KnowledgeAssetsV10 — RFC-39 ciphertext commitment', () => {
         newMerkleRoot: ethers.keccak256(ethers.toUtf8Bytes('curated-update-full')),
         newByteSize: base.byteSize,
         newTokenAmount: base.tokenAmount, // delta == 0
-        mintKnowledgeAssetsAmount: 1n,
+        mintKnowledgeAssetsAmount: 0n,
         knowledgeAssetsToBurn: [],
+        author: base.creator,
         updateOperationId: 'curated-update-full-op',
       });
       // Ciphertext-commitment fields live outside the ACK digest (RFC-38
@@ -929,8 +935,9 @@ describe('@unit KnowledgeAssetsV10 — RFC-39 ciphertext commitment', () => {
         newMerkleRoot: ethers.keccak256(ethers.toUtf8Bytes('public-update-zero')),
         newByteSize: base.byteSize,
         newTokenAmount: base.tokenAmount,
-        mintKnowledgeAssetsAmount: 1n,
+        mintKnowledgeAssetsAmount: 0n,
         knowledgeAssetsToBurn: [],
+        author: base.creator,
         updateOperationId: 'public-update-zero-op',
       });
       await expect(KAV10.connect(base.creator).update(up)).to.not.be.reverted;
@@ -953,8 +960,9 @@ describe('@unit KnowledgeAssetsV10 — RFC-39 ciphertext commitment', () => {
         newMerkleRoot: ethers.keccak256(ethers.toUtf8Bytes('public-update-stray')),
         newByteSize: base.byteSize,
         newTokenAmount: base.tokenAmount,
-        mintKnowledgeAssetsAmount: 1n,
+        mintKnowledgeAssetsAmount: 0n,
         knowledgeAssetsToBurn: [],
+        author: base.creator,
         updateOperationId: 'public-update-stray-op',
       });
       const up2WithCt = { ...up2, newCiphertextChunksRoot: NEW_CT_ROOT };

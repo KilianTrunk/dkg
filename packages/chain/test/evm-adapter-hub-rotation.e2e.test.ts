@@ -538,7 +538,10 @@ describe('EVMChainAdapter — Hub rotation self-refresh (E2E)', () => {
       const replacementAddr = freshAddress();
 
       try {
-        await rotateHubContract(ctx.hubAddress, deployer, 'KnowledgeAssetsV10', replacementAddr);
+        // Greenfield (PR #815): the lifecycle contract is registered under
+        // the Hub key KnowledgeAssetsLifecycle (was KnowledgeAssetsV10), which
+        // is what getKnowledgeAssetsV10Address() resolves. Rotate that key.
+        await rotateHubContract(ctx.hubAddress, deployer, 'KnowledgeAssetsLifecycle', replacementAddr);
 
         const observed = await waitFor(
           () =>
@@ -554,7 +557,7 @@ describe('EVMChainAdapter — Hub rotation self-refresh (E2E)', () => {
         const kav10After = await adapter.getKnowledgeAssetsV10Address();
         expect(kav10After.toLowerCase()).toBe(replacementAddr.toLowerCase());
       } finally {
-        await rotateHubContract(ctx.hubAddress, deployer, 'KnowledgeAssetsV10', kav10Before);
+        await rotateHubContract(ctx.hubAddress, deployer, 'KnowledgeAssetsLifecycle', kav10Before);
       }
     },
     60_000,

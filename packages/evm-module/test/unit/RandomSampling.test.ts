@@ -21,7 +21,7 @@ import {
   AskStorage,
   EpochStorage,
   ParametersStorage,
-  KnowledgeCollectionStorage,
+  DKGKnowledgeAssets,
   Profile,
   ContextGraphStorage,
   ContextGraphValueStorage,
@@ -41,7 +41,7 @@ type RandomSamplingFixture = {
   AskStorage: AskStorage;
   EpochStorage: EpochStorage;
   ParametersStorage: ParametersStorage;
-  KnowledgeCollectionStorage: KnowledgeCollectionStorage;
+  DKGKnowledgeAssets: DKGKnowledgeAssets;
   ContextGraphStorage: ContextGraphStorage;
   ContextGraphValueStorage: ContextGraphValueStorage;
   Profile: Profile;
@@ -63,7 +63,7 @@ describe('@unit RandomSampling', () => {
   let AskStorage: AskStorage;
   let EpochStorage: EpochStorage;
   let ParametersStorage: ParametersStorage;
-  let KnowledgeCollectionStorage: KnowledgeCollectionStorage;
+  let DKGKnowledgeAssets: DKGKnowledgeAssets;
   let ContextGraphStorage: ContextGraphStorage;
   let ContextGraphValueStorage: ContextGraphValueStorage;
   let Profile: Profile;
@@ -80,7 +80,7 @@ describe('@unit RandomSampling', () => {
       'ProfileStorage',
       'Chronos',
       'EpochStorage',
-      'KnowledgeCollectionStorage',
+      'DKGKnowledgeAssets',
       'AskStorage',
       'DelegatorsInfo',
       'RandomSamplingStorage',
@@ -121,9 +121,9 @@ describe('@unit RandomSampling', () => {
     EpochStorage = await hre.ethers.getContract<EpochStorage>('EpochStorageV8');
     ParametersStorage =
       await hre.ethers.getContract<ParametersStorage>('ParametersStorage');
-    KnowledgeCollectionStorage =
-      await hre.ethers.getContract<KnowledgeCollectionStorage>(
-        'KnowledgeCollectionStorage',
+    DKGKnowledgeAssets =
+      await hre.ethers.getContract<DKGKnowledgeAssets>(
+        'DKGKnowledgeAssets',
       );
     Profile = await hre.ethers.getContract<Profile>('Profile');
     ContextGraphStorage = await hre.ethers.getContract<ContextGraphStorage>(
@@ -136,7 +136,7 @@ describe('@unit RandomSampling', () => {
 
     // Register a sentinel signer as a Hub contract so Phase 10 weighted-
     // selection tests can call `onlyContracts` methods on ContextGraphStorage /
-    // ContextGraphValueStorage / KnowledgeCollectionStorage directly, without
+    // ContextGraphValueStorage / DKGKnowledgeAssets directly, without
     // routing through the production facades (ContextGraphs, KnowledgeCollection).
     // Must run after HubOwner is set so `setContractAddress` passes the auth
     // check. Safe for existing tests because accounts[19] is never used elsewhere.
@@ -156,7 +156,7 @@ describe('@unit RandomSampling', () => {
       AskStorage,
       EpochStorage,
       ParametersStorage,
-      KnowledgeCollectionStorage,
+      DKGKnowledgeAssets,
       ContextGraphStorage,
       ContextGraphValueStorage,
       Profile,
@@ -185,7 +185,7 @@ describe('@unit RandomSampling', () => {
       AskStorage,
       EpochStorage,
       ParametersStorage,
-      KnowledgeCollectionStorage,
+      DKGKnowledgeAssets,
       ContextGraphStorage,
       ContextGraphValueStorage,
       Profile,
@@ -392,7 +392,7 @@ describe('@unit RandomSampling', () => {
         await ParametersStorage.getAddress(),
       );
       expect(await RandomSampling.knowledgeCollectionStorage()).to.equal(
-        await KnowledgeCollectionStorage.getAddress(),
+        await DKGKnowledgeAssets.getAddress(),
       );
     });
   });
@@ -875,18 +875,18 @@ describe('@unit RandomSampling', () => {
     }
 
     /**
-     * Seed a KC directly on KnowledgeCollectionStorage and register it to the
+     * Seed a KC directly on DKGKnowledgeAssets and register it to the
      * given CG. Returns the new KC id. `endEpoch` controls the expiry — pass
      * `currentEpoch - 1` to create an already-expired KC.
      */
     async function createKC(cgId: bigint, endEpoch: bigint): Promise<bigint> {
       const currentEpoch = await Chronos.getCurrentEpoch();
       const startEpoch = currentEpoch;
-      const createTx = await KnowledgeCollectionStorage.connect(
+      const createTx = await DKGKnowledgeAssets.connect(
         opSigner,
       ).createKnowledgeCollection(
         opSigner.address, // publisher
-        ethers.ZeroAddress, // author — Phase 10 fixture predates author attestation
+        opSigner.address, // author — ERC-721 KA mint recipient (greenfield model)
         'phase-10-test-op',
         ethers.keccak256(
           ethers.toUtf8Bytes(
@@ -903,8 +903,8 @@ describe('@unit RandomSampling', () => {
       );
       const receipt = await createTx.wait();
       // Parse kc id from the KnowledgeCollectionCreated event.
-      const iface = KnowledgeCollectionStorage.interface;
-      const topic = iface.getEvent('KnowledgeCollectionCreated')!.topicHash;
+      const iface = DKGKnowledgeAssets.interface;
+      const topic = iface.getEvent('KnowledgeAssetCreated')!.topicHash;
       const log = receipt!.logs.find((l) => l.topics[0] === topic);
       if (!log) {
         throw new Error('KnowledgeCollectionCreated event not found');

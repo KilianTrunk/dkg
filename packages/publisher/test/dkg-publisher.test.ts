@@ -169,20 +169,19 @@ describe('DKGPublisher', () => {
     expect(metaCount).toBeGreaterThan(0);
   });
 
-  it('publishes multiple KAs in one KC', async () => {
-    const result = await publishWS({
-      contextGraphId: CONTEXT_GRAPH,
-      quads: [
-        q(ENTITY, 'http://schema.org/name', '"ImageBot"'),
-        q(ENTITY2, 'http://schema.org/name', '"TextBot"'),
-      ],
-    });
-
-    expect(result.kaManifest).toHaveLength(2);
-    expect(result.kaManifest.map((m) => m.rootEntity).sort()).toEqual(
-      [ENTITY, ENTITY2].sort(),
-    );
-    expect(result.status).toBe('confirmed');
+  it('rejects publishing multiple KAs in one KC (greenfield: one KA per tx)', async () => {
+    // Greenfield KA model (PR #815): a V10 on-chain publish must carry
+    // exactly one Knowledge Asset per transaction. Publishing two root
+    // entities (ENTITY + ENTITY2) in a single call is now rejected.
+    await expect(
+      publishWS({
+        contextGraphId: CONTEXT_GRAPH,
+        quads: [
+          q(ENTITY, 'http://schema.org/name', '"ImageBot"'),
+          q(ENTITY2, 'http://schema.org/name', '"TextBot"'),
+        ],
+      }),
+    ).rejects.toThrow(/exactly one Knowledge Asset per transaction/i);
   });
 
   it('publishes with blank nodes (auto-skolemized)', async () => {

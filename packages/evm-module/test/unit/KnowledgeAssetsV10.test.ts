@@ -512,7 +512,7 @@ describe('@unit KnowledgeAssetsLifecycle', () => {
           author: creator,
           contextGraphId: cgId,
           merkleRoot,
-          knowledgeAssetsAmount: 10,
+          knowledgeAssetsAmount: 1,
           byteSize: 1000,
           epochs,
           tokenAmount,

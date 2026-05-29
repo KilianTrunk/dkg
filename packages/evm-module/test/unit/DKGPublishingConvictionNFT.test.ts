@@ -350,7 +350,7 @@ describe('@unit DKGPublishingConvictionNFT', function () {
       // Impersonate KAV10 by registering accounts[5] under that Hub name. The
       // NFT resolves the caller via Hub on every coverPublishingCost call.
       const Kav10Signer = accounts[5];
-      await HubContract.setContractAddress('KnowledgeAssetsV10', Kav10Signer.address);
+      await HubContract.setContractAddress('KnowledgeAssetsLifecycle', Kav10Signer.address);
 
       // committedTRAC divisible by 12 → clean per-epoch allowance math.
       const committed = hre.ethers.parseEther('120000');
@@ -741,7 +741,7 @@ describe('@unit DKGPublishingConvictionNFT', function () {
     beforeEach(async () => {
       Kav10Signer = accounts[5];
       agent = accounts[6];
-      await HubContract.setContractAddress('KnowledgeAssetsV10', Kav10Signer.address);
+      await HubContract.setContractAddress('KnowledgeAssetsLifecycle', Kav10Signer.address);
     });
 
     async function createAt(amount: bigint) {
@@ -1297,7 +1297,7 @@ describe('@unit DKGPublishingConvictionNFT', function () {
     beforeEach(async () => {
       Kav10Signer = accounts[5];
       agent = accounts[6];
-      await HubContract.setContractAddress('KnowledgeAssetsV10', Kav10Signer.address);
+      await HubContract.setContractAddress('KnowledgeAssetsLifecycle', Kav10Signer.address);
     });
 
     /**

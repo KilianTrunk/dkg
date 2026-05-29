@@ -223,7 +223,11 @@ describe('Prefix deletion safety', () => {
       const fooQuads = [q('urn:x:foo', 'http://schema.org/name', '"Foo"')];
       const foobarQuads = [q('urn:x:foobar', 'http://schema.org/name', '"Foobar"')];
 
-      const published = await publisher.publish({ contextGraphId: CONTEXT_GRAPH, quads: [...fooQuads, ...foobarQuads] });
+      // Greenfield (PR #815): one KA per publish, so foo and foobar are
+      // published as two separate single-KA assets. Both land in the same
+      // data graph, which is what the prefix-deletion-safety check needs.
+      const published = await publisher.publish({ contextGraphId: CONTEXT_GRAPH, quads: fooQuads });
+      await publisher.publish({ contextGraphId: CONTEXT_GRAPH, quads: foobarQuads });
 
       const updateQuads = [q('urn:x:foo', 'http://schema.org/name', '"Foo Updated"')];
       const updateResult = await publisher.update(published.kcId, {

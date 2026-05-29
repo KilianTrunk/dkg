@@ -248,11 +248,22 @@ export class DKGQueryEngine implements QueryEngine {
       const metaAllowList = [
         ...(isSwmOnlyRoute
           ? []
-          : [
-              subGraphName
-                ? contextGraphSubGraphMetaUri(effectiveContextGraphId, subGraphName)
-                : contextGraphMetaUri(effectiveContextGraphId),
-            ]),
+          : subGraphName
+            ? [
+                // Sub-graph metadata graph (`<cg>/<sub>/_meta`).
+                contextGraphSubGraphMetaUri(effectiveContextGraphId, subGraphName),
+                // Root CG metadata graph (`<cg>/_meta`). Canonical KA provenance
+                // (`rootEntity` / `partOf` / `confirmed` status) is written to the
+                // ROOT `_meta` even for sub-graph publishes — see
+                // `finalization-handler.ts` (the confirmed-meta writes hardcode
+                // `<cg>/_meta`). A sub-graph-scoped reader (e.g. the EPCIS events
+                // query) joins provenance from there, so the root `_meta` must be
+                // admitted alongside the sub-graph `_meta`. Both are within the
+                // same `contextGraphId`, so this does not cross the privacy
+                // boundary (which is the CG scope itself).
+                contextGraphMetaUri(effectiveContextGraphId),
+              ]
+            : [contextGraphMetaUri(effectiveContextGraphId)]),
         contextGraphSharedMemoryMetaUri(effectiveContextGraphId, subGraphName),
       ];
       // `_private` is excluded from the allow-set by default (it is more

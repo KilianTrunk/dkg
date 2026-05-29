@@ -4,6 +4,8 @@ import {
   contextGraphDataUri,
   contextGraphMetaUri,
   contextGraphPrivateUri,
+  contextGraphSharedMemoryMetaUri,
+  contextGraphSharedMemoryUri,
   contextGraphSubGraphPrivateUri,
   contextGraphSubGraphUri,
 } from '@origintrail-official/dkg-core';
@@ -42,12 +44,54 @@ const OTHER_PRIVATE_GRAPH = contextGraphPrivateUri(OTHER_CG);
 const SUB_DATA_GRAPH = contextGraphSubGraphUri(CG, SUB);
 const SUB_PRIVATE_GRAPH = contextGraphSubGraphPrivateUri(CG, SUB);
 
+// Shared-memory (non-finalized) partitions — the `finalized=false` route.
+const SWM_GRAPH = contextGraphSharedMemoryUri(CG);
+const SWM_META_GRAPH = contextGraphSharedMemoryMetaUri(CG);
+const SUB_SWM_GRAPH = contextGraphSharedMemoryUri(CG, SUB);
+const SUB_SWM_META_GRAPH = contextGraphSharedMemoryMetaUri(CG, SUB);
+
 const EVENT_TYPE = 'https://gs1.github.io/EPCIS/ObjectEvent';
 const PUBLIC_EVENT = 'urn:uuid:public-event-1';
 const PRIVATE_EVENT = 'urn:uuid:private-event-1';
+// Sub-graph finalized event + its canonical (root `_meta`) provenance.
+const SUB_FINAL_EVENT = 'urn:uuid:sub-final-event-1';
+const SUB_FINAL_KA = 'urn:dkg:ka:sub-final-1';
+const SUB_FINAL_UAL = 'did:dkg:otp:2043/0xabc/1';
+// SWM (non-finalized) events for the root and sub-graph routes.
+const SWM_EVENT = 'urn:uuid:swm-event-1';
+const SUB_SWM_EVENT = 'urn:uuid:sub-swm-event-1';
+
+const RDF_TYPE = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type';
+const DKG_ROOT_ENTITY = 'http://dkg.io/ontology/rootEntity';
+const DKG_PART_OF = 'http://dkg.io/ontology/partOf';
+const DKG_PRIVATE_ANCHOR = 'http://dkg.io/ontology/privateDataAnchor';
 
 function q(s: string, p: string, o: string, g: string): Quad {
   return { subject: s, predicate: p, object: o, graph: g };
+}
+
+// Mirror of the explicit-GRAPH structure emitted by
+// packages/epcis/src/query-builder.ts (public branch, private branch gated on
+// the public anchor, OPTIONAL root-meta provenance join) — parameterised by the
+// route-specific graph URIs so each of the 4 routing combinations is exercised
+// against the REAL engine with the EXACT graphs the builder names.
+function epcisShapedQuery(publicGraph: string, privateGraph: string, metaGraph: string): string {
+  return `SELECT ?event ?eventType ?ual WHERE {
+    {
+      GRAPH <${publicGraph}> { ?event a ?eventType }
+    }
+    union
+    {
+      GRAPH <${publicGraph}> { ?event <${DKG_PRIVATE_ANCHOR}> "true" }
+      GRAPH <${privateGraph}> { ?event a ?eventType }
+    }
+    OPTIONAL {
+      GRAPH <${metaGraph}> {
+        ?ka <${DKG_ROOT_ENTITY}> ?event .
+        ?ka <${DKG_PART_OF}> ?ual .
+      }
+    }
+  }`;
 }
 
 describe('DKGQueryEngine — `_private` graph scope guard (#789 follow-up: EPCIS events)', () => {
@@ -70,6 +114,17 @@ describe('DKGQueryEngine — `_private` graph scope guard (#789 follow-up: EPCIS
       // Sub-graph private partition (sub-graph scoped variant).
       q(`${PRIVATE_EVENT}/sub`, 'http://example.org/secret', '"sub-classified"', SUB_PRIVATE_GRAPH),
       q(`${PUBLIC_EVENT}/sub`, 'http://example.org/k', '"v"', SUB_DATA_GRAPH),
+      // Finalized SUB-GRAPH event: body in `<cg>/<sub>`, but its canonical
+      // KA provenance (rootEntity/partOf) lands in the ROOT `<cg>/_meta`
+      // (finalization-handler writes confirmed meta to root regardless of
+      // sub-graph) — so the engine must admit root `_meta` for a sub-graph
+      // scoped read or the OPTIONAL join graph itself trips the scope guard.
+      q(SUB_FINAL_EVENT, RDF_TYPE, `<${EVENT_TYPE}>`, SUB_DATA_GRAPH),
+      q(SUB_FINAL_KA, DKG_ROOT_ENTITY, `<${SUB_FINAL_EVENT}>`, META_GRAPH),
+      q(SUB_FINAL_KA, DKG_PART_OF, `<${SUB_FINAL_UAL}>`, META_GRAPH),
+      // Non-finalized (SWM) events for the `finalized=false` routes.
+      q(SWM_EVENT, RDF_TYPE, `<${EVENT_TYPE}>`, SWM_GRAPH),
+      q(SUB_SWM_EVENT, RDF_TYPE, `<${EVENT_TYPE}>`, SUB_SWM_GRAPH),
       // Another CG's private partition — must NEVER be reachable from CG.
       q('urn:uuid:foreign', 'http://example.org/secret', '"leak"', OTHER_PRIVATE_GRAPH),
     ]);
@@ -171,5 +226,85 @@ describe('DKGQueryEngine — `_private` graph scope guard (#789 follow-up: EPCIS
       includePrivate: true,
     });
     expect(result.bindings.some((b) => b['o'] === '"sub-classified"')).toBe(true);
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Bug 3 (#789 follow-up): the EPCIS events handler systematically failed to
+  // thread its routing scope (`subGraphName`, and `finalized=false` → SWM) into
+  // the engine. The query-builder still referenced `<cg>/<sub>`,
+  // `<cg>[/<sub>]/_shared_memory[_meta]` and (for sub-graphs) the ROOT
+  // `<cg>/_meta`, none of which were in the allow-set the engine derived from
+  // `{ contextGraphId, includePrivate }` alone — so every sub-graph or
+  // non-finalized events request died with a "Scoped query violation" on BOTH
+  // store backends. These exercise all 4 routing combinations end-to-end.
+  // ─────────────────────────────────────────────────────────────────────────
+
+  it('Bug 3 — finalized sub-graph: rejected without subGraphName, allowed (with root-meta join) once threaded', async () => {
+    // Exactly what the builder emits for a finalized sub-graph request.
+    const query = epcisShapedQuery(SUB_DATA_GRAPH, SUB_PRIVATE_GRAPH, META_GRAPH);
+
+    // Pre-fix handler shape (`{ contextGraphId, includePrivate }` only): the
+    // sub-graph data/private graphs are outside the allow-set → rejected.
+    await expect(
+      engine.query(query, { contextGraphId: CG, includePrivate: true }),
+    ).rejects.toThrowError(ScopedQueryViolationError);
+
+    // Post-fix: threading subGraphName admits `<cg>/<sub>` + `<cg>/<sub>/_private`,
+    // and the engine now also admits the ROOT `<cg>/_meta` (where canonical KA
+    // provenance lives) for sub-graph reads, so the OPTIONAL join resolves.
+    const result = await engine.query(query, {
+      contextGraphId: CG,
+      subGraphName: SUB,
+      includePrivate: true,
+    });
+    const row = result.bindings.find((b) => b['event'] === SUB_FINAL_EVENT);
+    expect(row).toBeDefined();
+    // The root-`_meta` provenance join must resolve through the sub-graph scope.
+    expect(row?.['ual']).toBe(SUB_FINAL_UAL);
+  });
+
+  it('Bug 3 — non-finalized (SWM) root: rejected without graphSuffix, allowed once threaded', async () => {
+    const query = epcisShapedQuery(SWM_GRAPH, PRIVATE_GRAPH, SWM_META_GRAPH);
+
+    // Without `graphSuffix:'_shared_memory'` the engine only allows the
+    // canonical `<cg>` data graph, so the SWM data graph is rejected.
+    await expect(
+      engine.query(query, { contextGraphId: CG, includePrivate: true }),
+    ).rejects.toThrowError(ScopedQueryViolationError);
+
+    const result = await engine.query(query, {
+      contextGraphId: CG,
+      graphSuffix: '_shared_memory',
+      includePrivate: true,
+    });
+    expect(result.bindings.some((b) => b['event'] === SWM_EVENT)).toBe(true);
+  });
+
+  it('Bug 3 — non-finalized (SWM) sub-graph: rejected without scope, allowed once both are threaded', async () => {
+    const query = epcisShapedQuery(SUB_SWM_GRAPH, SUB_PRIVATE_GRAPH, SUB_SWM_META_GRAPH);
+
+    await expect(
+      engine.query(query, { contextGraphId: CG, includePrivate: true }),
+    ).rejects.toThrowError(ScopedQueryViolationError);
+
+    const result = await engine.query(query, {
+      contextGraphId: CG,
+      subGraphName: SUB,
+      graphSuffix: '_shared_memory',
+      includePrivate: true,
+    });
+    expect(result.bindings.some((b) => b['event'] === SUB_SWM_EVENT)).toBe(true);
+  });
+
+  it('does NOT leak: a foreign CG\'s root `_meta` stays out even when subGraphName is set', async () => {
+    // Guards the engine widening (sub-graph reads now also admit root `<cg>/_meta`):
+    // it must admit ONLY the queried CG's root meta, never another CG's.
+    const foreignRootMeta = contextGraphMetaUri(OTHER_CG);
+    const crossCgMeta = `SELECT ?s ?p ?o WHERE {
+      GRAPH <${foreignRootMeta}> { ?s ?p ?o }
+    }`;
+    await expect(
+      engine.query(crossCgMeta, { contextGraphId: CG, subGraphName: SUB, includePrivate: true }),
+    ).rejects.toThrowError(ScopedQueryViolationError);
   });
 });

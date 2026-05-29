@@ -174,13 +174,24 @@ export async function handleEventsQuery(
     { ...params, subGraphName: config.subGraphName, limit: perPage + 1, offset },
     config.contextGraphId,
   );
-  // The EPCIS query always references the context graph's `_private`
-  // partition (the branch that surfaces private-anchored events), so the
-  // scoped query must opt into private-graph access. Without this the
-  // engine's scope guard rejects every events query with
-  // "GRAPH <…/_private> is outside the allowed graph set".
+  // The engine's scope guard rejects any explicit GRAPH IRI outside the
+  // allow-set it derives from the query options, so the options MUST match
+  // exactly the graphs `buildEpcisQuery` references for this route:
+  //   - `includePrivate`        → the `<cg>[/<sub>]/_private` partition the
+  //                               private-anchored-events branch always names.
+  //   - `subGraphName`          → reads `<cg>/<sub>` (finalized) /
+  //                               `<cg>/<sub>/_shared_memory` (SWM) plus the
+  //                               sub-graph private/meta graphs.
+  //   - `graphSuffix:'_shared_memory'` (finalized=false) → reads the SWM
+  //                               partition (`…/_shared_memory[_meta]`) instead
+  //                               of the canonical data graph.
+  // Omitting any of these makes the guard reject the query with
+  // "GRAPH <…> is outside the allowed graph set" (it fails for every
+  // sub-graph or non-finalized request, on every store backend).
   const result = await config.queryEngine.query(sparql, {
     contextGraphId: config.contextGraphId,
+    subGraphName: config.subGraphName,
+    graphSuffix: params.finalized === false ? '_shared_memory' : undefined,
     includePrivate: true,
   });
 

@@ -113,14 +113,26 @@ export class RemoteSparqlSource implements GraphDataSource {
     const timeout = setTimeout(() => controller.abort(), this._config.timeoutMs);
 
     try {
+      // W3C SPARQL 1.1 Protocol "query via POST directly" (§2.1.3): send the
+      // raw query as the request body with `Content-Type:
+      // application/sparql-query`, NOT URL-encoded form data.
+      //
+      // The old `application/x-www-form-urlencoded` + `query=<encoded>` form
+      // hits Jetty's default 200 KB form-content limit on Blazegraph
+      // (`UTFDataFormatException` / HTTP 400 "Unable to parse form content")
+      // for large queries — e.g. a CONSTRUCT/SELECT carrying a big `VALUES`
+      // block — which is the same defect fixed in the Blazegraph/SPARQL-HTTP
+      // storage adapters. Direct POST has no such form-size cap and is
+      // supported by every SPARQL 1.1 endpoint (Blazegraph, GraphDB,
+      // Virtuoso, OriginTrail DKG node, …).
       const response = await fetch(this.endpointUrl, {
         method: 'POST',
         headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
+          'Content-Type': 'application/sparql-query',
           'Accept': accept,
           ...this._config.headers,
         },
-        body: `query=${encodeURIComponent(sparql)}`,
+        body: sparql,
         signal: controller.signal,
       });
 

@@ -35,4 +35,21 @@ describe('@unit PublishingMathLib', () => {
     expect(ends).to.deep.equal([10n, 13n, 0n]);
     expect(amounts).to.deep.equal([250n, 750n, 0n]);
   });
+
+  it('leaves the middle active sink slot empty for one storage epoch', async () => {
+    const Harness = await hre.ethers.getContractFactory('PublishingMathLibHarness');
+    const harness = await Harness.deploy();
+
+    const [starts, ends, amounts] = await harness.prorateActiveSink(
+      1000n,
+      20,
+      1,
+      100,
+      25,
+    );
+
+    expect(starts).to.deep.equal([20n, 0n, 21n]);
+    expect(ends).to.deep.equal([20n, 0n, 21n]);
+    expect(amounts).to.deep.equal([250n, 0n, 750n]);
+  });
 });

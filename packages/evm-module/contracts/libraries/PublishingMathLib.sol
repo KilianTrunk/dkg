@@ -31,6 +31,10 @@ library PublishingMathLib {
         uint256 finalEpochAllocation = baseTokensPerFullEpoch - currentEpochAllocation;
         uint256 numberOfFullEpochs = epochs - 1;
         uint256 totalTokensForFullEpochs = baseTokensPerFullEpoch * numberOfFullEpochs;
+        uint256 totalAllocated = currentEpochAllocation + totalTokensForFullEpochs + finalEpochAllocation;
+        if (totalAllocated < tokenAmount) {
+            finalEpochAllocation += tokenAmount - totalAllocated;
+        }
 
         ranges[0] = ActiveSinkRange({
             startEpoch: currentEpoch,

@@ -467,43 +467,21 @@ contract PublishingConviction is INamed, IVersioned, ContractStatus, IInitializa
     ) internal {
         uint256 epochLengthSec = chronos.epochLength();
         uint256 timeRemainingInCurrentEpoch = chronos.timeUntilNextEpoch();
-        uint96 baseTokensPerFullEpoch = uint96(uint256(amount) / storageUnits);
-        uint96 currentEpochAllocation = uint96(
-            (uint256(baseTokensPerFullEpoch) * timeRemainingInCurrentEpoch) / epochLengthSec
+        PublishingMathLib.ActiveSinkRange[3] memory ranges = PublishingMathLib.prorateActiveSink(
+            amount,
+            firstEpoch,
+            storageUnits,
+            epochLengthSec,
+            timeRemainingInCurrentEpoch
         );
-        uint96 finalEpochAllocation = baseTokensPerFullEpoch - currentEpochAllocation;
-        uint256 numberOfFullEpochs = storageUnits - 1;
-        uint96 totalTokensForFullEpochs = uint96(uint256(baseTokensPerFullEpoch) * numberOfFullEpochs);
 
-        uint96 totalAllocated = currentEpochAllocation + totalTokensForFullEpochs + finalEpochAllocation;
-        if (totalAllocated < amount) {
-            finalEpochAllocation += (amount - totalAllocated);
-        }
-
-        if (currentEpochAllocation > 0) {
+        for (uint256 i; i < ranges.length; i++) {
+            if (ranges[i].tokenAmount == 0) continue;
             epochStorage.addTokensToEpochRange(
                 STAKER_SHARD_ID,
-                firstEpoch,
-                firstEpoch,
-                currentEpochAllocation
-            );
-        }
-
-        if (numberOfFullEpochs > 0 && totalTokensForFullEpochs > 0) {
-            epochStorage.addTokensToEpochRange(
-                STAKER_SHARD_ID,
-                firstEpoch + 1,
-                firstEpoch + uint40(numberOfFullEpochs),
-                totalTokensForFullEpochs
-            );
-        }
-
-        if (finalEpochAllocation > 0) {
-            epochStorage.addTokensToEpochRange(
-                STAKER_SHARD_ID,
-                firstEpoch + uint40(storageUnits),
-                firstEpoch + uint40(storageUnits),
-                finalEpochAllocation
+                ranges[i].startEpoch,
+                ranges[i].endEpoch,
+                ranges[i].tokenAmount
             );
         }
     }

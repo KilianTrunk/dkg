@@ -819,6 +819,68 @@ describe('@unit DKGPublishingConvictionNFT', function () {
       expect((await NFT.getAccountInfo(1)).topUpBuffer).to.equal(0n);
     });
 
+    describe('PublishingMathLib integration', () => {
+      it('PCA coverPublishingCost event ranges match the shared active-sink calculator', async () => {
+        const source = readFileSync(
+          join(__dirname, '../../contracts/PublishingConviction.sol'),
+          'utf8',
+        );
+        expect(source).to.include('PublishingMathLib.prorateActiveSink(');
+
+        const committed = hre.ethers.parseEther('1200000');
+        await createAtWithAgent(committed, agent.address);
+
+        const baseCost = hre.ethers.parseEther('10000');
+        const expectedDiscount = (baseCost * (BPS - 7500n)) / BPS;
+        const kcEpochs = 3n;
+
+        const Harness = await hre.ethers.getContractFactory('PublishingMathLibHarness');
+        const harness = await Harness.deploy();
+        const epochLength = await ChronosContract.epochLength();
+        const targetTimestamp = BigInt(await time.latest()) + (epochLength / 2n);
+        const targetEpoch = await ChronosContract.epochAtTimestamp(targetTimestamp);
+        const timeRemaining =
+          (await ChronosContract.timestampForEpoch(targetEpoch + 1n)) - targetTimestamp;
+        const [starts, ends, amounts] = await harness.prorateActiveSink(
+          expectedDiscount,
+          targetEpoch,
+          kcEpochs,
+          epochLength,
+          timeRemaining,
+        );
+
+        await time.setNextBlockTimestamp(Number(targetTimestamp));
+        const tx = await NFT.connect(Kav10Signer).coverPublishingCost(
+          agent.address,
+          baseCost,
+          targetEpoch,
+          kcEpochs,
+        );
+        const receipt = await tx.wait();
+        const epsAddr = (await EpochStorageContract.getAddress()).toLowerCase();
+        const iface = EpochStorageContract.interface;
+        const actual: Array<[bigint, bigint, bigint]> = [];
+        for (const log of receipt!.logs) {
+          if (log.address.toLowerCase() !== epsAddr) continue;
+          let parsed;
+          try { parsed = iface.parseLog({ topics: log.topics as string[], data: log.data }); }
+          catch { continue; }
+          if (parsed?.name !== 'TokensAddedToEpochRange') continue;
+          expect(parsed.args.shardId).to.equal(STAKER_SHARD_ID);
+          actual.push([
+            BigInt(parsed.args.startEpoch),
+            BigInt(parsed.args.endEpoch),
+            BigInt(parsed.args.tokenAmount),
+          ]);
+        }
+
+        const expected = starts
+          .map((start, i) => [BigInt(start), BigInt(ends[i]), BigInt(amounts[i])] as [bigint, bigint, bigint])
+          .filter((range) => range[2] > 0n);
+        expect(actual).to.deep.equal(expected);
+      });
+    });
+
     it('spends epoch allowance first, then topUpBalance', async () => {
       const committed = hre.ethers.parseEther('120000');
       await createAtWithAgent(committed, agent.address);

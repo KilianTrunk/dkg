@@ -388,7 +388,7 @@ async function loadContractAddresses(provider: ethers.JsonRpcProvider, hubAddres
   );
   return {
     hub,
-    kcsAddress: await hub.getAssetStorageAddress('KnowledgeCollectionStorage'),
+    kcsAddress: await hub.getAssetStorageAddress('DKGKnowledgeAssets'),
     nftAddress: await hub.getContractAddress('DKGPublishingConvictionNFT'),
     tokenAddress: await hub.getContractAddress('Token'),
     epsAddress: await hub.getContractAddress('EpochStorageV8'),
@@ -919,7 +919,7 @@ describe('Agent provenance — automated 5-node devnet validation', () => {
         headers: agentHeaders,
         body: JSON.stringify({
           contextGraphId: CONTEXT_GRAPH,
-          selection: 'all',
+          selection: { rootEntities: [subjectIri] },
           clearAfter: true,
         }),
       },

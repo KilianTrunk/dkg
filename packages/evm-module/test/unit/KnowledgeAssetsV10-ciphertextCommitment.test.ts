@@ -808,14 +808,14 @@ describe('@unit KnowledgeAssetsLifecycle — RFC-39 ciphertext commitment', () =
         knowledgeAssetsToBurn: [],
         author: base.creator,
         updateOperationId: 'curated-update-asym-op',
-      });
-      const upPartial = {
-        ...up,
+        // Asymmetric pair must be in the signed ACK digest (the contract binds
+        // both ciphertext fields) so the receiver quorum verifies and the
+        // symmetry guard — not signature recovery — is what reverts.
         newCiphertextChunksRoot: NEW_CT_ROOT,
-        newCiphertextChunkCount: 0, // asymmetric
-      };
+        newCiphertextChunkCount: 0,
+      });
       await expect(
-        KAV10.connect(base.creator).update(upPartial),
+        KAV10.connect(base.creator).update(up),
       ).to.be.revertedWithCustomError(KAV10, 'IncompleteCiphertextCommitment');
     });
 
@@ -839,14 +839,11 @@ describe('@unit KnowledgeAssetsLifecycle — RFC-39 ciphertext commitment', () =
         knowledgeAssetsToBurn: [],
         author: base.creator,
         updateOperationId: 'curated-update-asym-count-op',
-      });
-      const upPartial = {
-        ...up,
         newCiphertextChunksRoot: ethers.ZeroHash,
         newCiphertextChunkCount: NEW_CT_COUNT,
-      };
+      });
       await expect(
-        KAV10.connect(base.creator).update(upPartial),
+        KAV10.connect(base.creator).update(up),
       ).to.be.revertedWithCustomError(KAV10, 'IncompleteCiphertextCommitment');
     });
 
@@ -871,13 +868,10 @@ describe('@unit KnowledgeAssetsLifecycle — RFC-39 ciphertext commitment', () =
         knowledgeAssetsToBurn: [],
         author: base.creator,
         updateOperationId: 'curated-update-same-op',
-      });
-      const upSame = {
-        ...up,
         newCiphertextChunksRoot: SAMPLE_CT_ROOT,
         newCiphertextChunkCount: SAMPLE_CT_COUNT,
-      };
-      await expect(KAV10.connect(base.creator).update(upSame))
+      });
+      await expect(KAV10.connect(base.creator).update(up))
         .to.emit(KCS, 'KnowledgeCollectionCiphertextCommitmentSet')
         .withArgs(base.kcId, SAMPLE_CT_ROOT, SAMPLE_CT_COUNT);
     });
@@ -901,17 +895,14 @@ describe('@unit KnowledgeAssetsLifecycle — RFC-39 ciphertext commitment', () =
         knowledgeAssetsToBurn: [],
         author: base.creator,
         updateOperationId: 'curated-update-full-op',
-      });
-      // Ciphertext-commitment fields live outside the ACK digest (RFC-38
-      // §5.4.2) so spreading them in here doesn't invalidate the
-      // receiver-quorum signatures already baked into `up`.
-      const upWithCt = {
-        ...up,
+        // The contract binds the ciphertext pair into the update ACK digest,
+        // so these must be signed (passed here) rather than spread onto the
+        // struct after the receiver quorum has signed.
         newCiphertextChunksRoot: NEW_CT_ROOT,
         newCiphertextChunkCount: NEW_CT_COUNT,
-      };
+      });
 
-      await expect(KAV10.connect(base.creator).update(upWithCt))
+      await expect(KAV10.connect(base.creator).update(up))
         .to.emit(KCS, 'KnowledgeCollectionCiphertextCommitmentSet')
         .withArgs(base.kcId, NEW_CT_ROOT, NEW_CT_COUNT);
 
@@ -964,10 +955,12 @@ describe('@unit KnowledgeAssetsLifecycle — RFC-39 ciphertext commitment', () =
         knowledgeAssetsToBurn: [],
         author: base.creator,
         updateOperationId: 'public-update-stray-op',
+        // Stray non-zero ciphertext field signed into the ACK digest so the
+        // public-CG rejection — not signature recovery — is what reverts.
+        newCiphertextChunksRoot: NEW_CT_ROOT,
       });
-      const up2WithCt = { ...up2, newCiphertextChunksRoot: NEW_CT_ROOT };
       await expect(
-        KAV10.connect(base.creator).update(up2WithCt),
+        KAV10.connect(base.creator).update(up2),
       ).to.be.revertedWithCustomError(KAV10, 'PublicCGCannotHaveCiphertextCommitment')
         .withArgs(base.cgId);
     });

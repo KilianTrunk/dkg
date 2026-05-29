@@ -152,6 +152,18 @@ const MOCK_EXEMPT_FROM_EVM = new Set<string>([
   // round-trips to cache in the first place; a no-op shim would just
   // pad parity for no behavioural reason.
   'invalidatePublishPreflightCache',
+  // #820 (RFC-39 ciphertext/immutable ACK binding): EVM-only surfaces.
+  //  - `isContextGraphActiveOnChain` is a `ContextGraphStorage.isContextGraphActive`
+  //    read. Its sole upstream caller (dkg-agent CG-liveness probe) already
+  //    feature-detects it via `typeof === 'function'` and degrades gracefully
+  //    when absent, so the mock has no method-not-implemented surprise.
+  //  - `computeV10UpdateAckDigest` mirrors the on-chain
+  //    `KnowledgeAssetsLifecycle._executeUpdateCore` ACK-digest packing for
+  //    test helpers / ACK collectors. The mock performs no real signature
+  //    recovery (its `updateKnowledgeCollectionV10` accepts any ack), so there
+  //    is no on-chain digest to reproduce.
+  'isContextGraphActiveOnChain',
+  'computeV10UpdateAckDigest',
 ]);
 
 const NO_CHAIN_EXEMPT_FROM_EVM = new Set<string>([

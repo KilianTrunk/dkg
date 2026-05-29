@@ -102,6 +102,20 @@ export type V10ACKProvider = (
 ) => Promise<V10CoreNodeACK[]>;
 
 /**
+ * V10 update ACK provider: collects core node signatures over the update ACK
+ * digest before `updateKnowledgeCollectionV10` is broadcast.
+ */
+export type V10UpdateACKProvider = (
+  kcId: bigint,
+  newMerkleRoot: Uint8Array,
+  contextGraphId: string,
+  newByteSize: bigint,
+  newMerkleLeafCount: number,
+  newCiphertextChunksRoot?: Uint8Array,
+  newCiphertextChunkCount?: number,
+) => Promise<V10CoreNodeACK[]>;
+
+/**
  * Callback that collects participant signatures for context graph governance.
  */
 export type ParticipantSignatureProvider = (
@@ -148,6 +162,8 @@ export interface PublishOptions {
    * When provided, ACKs are collected and stored in the result.
    */
   v10ACKProvider?: V10ACKProvider;
+  /** V10 update ACK provider — quorum signatures before on-chain update. */
+  v10UpdateACKProvider?: V10UpdateACKProvider;
   /**
    * When publishing into a specific context graph (publishFromSharedMemory),
    * this overrides contextGraphId as the ACK domain and on-chain contextGraphId.

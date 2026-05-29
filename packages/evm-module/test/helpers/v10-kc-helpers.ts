@@ -155,6 +155,9 @@ export function buildPublishAckDigest(
   epochs: number | bigint,
   tokenAmount: bigint,
   merkleLeafCount: number | bigint,
+  ciphertextChunksRoot: string = ethers.ZeroHash,
+  ciphertextChunkCount: number | bigint = 0,
+  isImmutable: boolean = false,
 ): string {
   return ethers.solidityPackedKeccak256(
     [
@@ -167,6 +170,9 @@ export function buildPublishAckDigest(
       'uint256', // epochs (cast to uint256 in contract)
       'uint256', // tokenAmount (cast to uint256 in contract)
       'uint256', // merkleLeafCount (cast to uint256 in contract)
+      'bytes32', // ciphertextChunksRoot
+      'uint256', // ciphertextChunkCount
+      'uint256', // isImmutable (0/1)
     ],
     [
       chainId,
@@ -178,6 +184,9 @@ export function buildPublishAckDigest(
       epochs,
       tokenAmount,
       merkleLeafCount,
+      ciphertextChunksRoot,
+      ciphertextChunkCount,
+      isImmutable ? 1 : 0,
     ],
   );
 }
@@ -205,6 +214,8 @@ export function buildUpdateAckDigest(
   mintKnowledgeAssetsAmount: bigint,
   knowledgeAssetsToBurn: bigint[],
   newMerkleLeafCount: number | bigint,
+  newCiphertextChunksRoot: string = ethers.ZeroHash,
+  newCiphertextChunkCount: number | bigint = 0,
 ): string {
   // Inner burn-list keccak matches `keccak256(abi.encodePacked(knowledgeAssetsToBurn))`.
   const innerBurnHash = ethers.solidityPackedKeccak256(
@@ -224,6 +235,8 @@ export function buildUpdateAckDigest(
       'uint256', // mintKnowledgeAssetsAmount
       'bytes32', // keccak(burn list)
       'uint256', // newMerkleLeafCount
+      'bytes32', // newCiphertextChunksRoot
+      'uint256', // newCiphertextChunkCount
     ],
     [
       chainId,
@@ -237,6 +250,8 @@ export function buildUpdateAckDigest(
       mintKnowledgeAssetsAmount,
       innerBurnHash,
       newMerkleLeafCount,
+      newCiphertextChunksRoot,
+      newCiphertextChunkCount,
     ],
   );
 }
@@ -298,15 +313,19 @@ export async function buildPublishParams(args: {
    * MUST set both to non-zero values; the contract enforces the
    * paired-or-zero invariant via `IncompleteCiphertextCommitment`.
    *
-   * Note: the on-chain ACK digest does NOT include these fields (RFC-38
-   * §5.4.2 — Phase A cosigned ACK is unchanged; the LU-11 ciphertext
-   * commitment is off-chain ACK material only). So the existing
-   * `buildPublishAckDigest` call below correctly omits them.
+   * Note: the on-chain ACK digest DOES include these fields plus `isImmutable`
+   * (`KnowledgeAssetsLifecycle._executePublishCore` packs
+   * `ciphertextChunksRoot || uint256(ciphertextChunkCount) || uint256(isImmutable)`
+   * after `merkleLeafCount`). The `buildPublishAckDigest` call below MUST pass
+   * the same values the struct carries or the ACK signatures fail recovery
+   * with `SignerIsNotNodeOperator`.
    */
   ciphertextChunksRoot?: string;
   ciphertextChunkCount?: number | bigint;
 }): Promise<KnowledgeAssetsLifecycle.PublishParamsStruct> {
   const merkleLeafCount = args.merkleLeafCount ?? 1;
+  const ciphertextChunksRoot = args.ciphertextChunksRoot ?? ethers.ZeroHash;
+  const ciphertextChunkCount = args.ciphertextChunkCount ?? 0;
   const ackDigest = buildPublishAckDigest(
     args.chainId,
     args.kav10Address,
@@ -317,6 +336,9 @@ export async function buildPublishParams(args: {
     args.epochs,
     args.tokenAmount,
     merkleLeafCount,
+    ciphertextChunksRoot,
+    ciphertextChunkCount,
+    args.isImmutable,
   );
   const sig = await signAckDigest(
     args.receivingNodes,
@@ -348,8 +370,8 @@ export async function buildPublishParams(args: {
     tokenAmount: args.tokenAmount,
     isImmutable: args.isImmutable,
     merkleLeafCount,
-    ciphertextChunksRoot: args.ciphertextChunksRoot ?? ethers.ZeroHash,
-    ciphertextChunkCount: args.ciphertextChunkCount ?? 0,
+    ciphertextChunksRoot,
+    ciphertextChunkCount,
     publisherNodeIdentityId: args.publisherIdentityId,
     authorAddress: args.author.address,
     authorR: authorSig.authorR,
@@ -447,8 +469,19 @@ export async function buildUpdateParams(args: {
   author: SignerWithAddress;
   /** Defaults to 1 for fixtures that only assert economics / signatures. */
   newMerkleLeafCount?: number;
+  /**
+   * RFC-39 curated-CG ciphertext commitment for the update (optional).
+   * Defaults to `bytes32(0)` + `0`. The on-chain ACK digest binds BOTH fields
+   * (`KnowledgeAssetsLifecycle._executeUpdateCore`), so they MUST be passed
+   * here — not spread onto the returned struct after signing — or the receiver
+   * quorum signatures fail recovery with `SignerIsNotNodeOperator`.
+   */
+  newCiphertextChunksRoot?: string;
+  newCiphertextChunkCount?: number | bigint;
 }): Promise<KnowledgeAssetsLifecycle.UpdateParamsStruct> {
   const newMerkleLeafCount = args.newMerkleLeafCount ?? 1;
+  const newCiphertextChunksRoot = args.newCiphertextChunksRoot ?? ethers.ZeroHash;
+  const newCiphertextChunkCount = args.newCiphertextChunkCount ?? 0;
   const ackDigest = buildUpdateAckDigest(
     args.chainId,
     args.kav10Address,
@@ -461,6 +494,8 @@ export async function buildUpdateParams(args: {
     args.mintKnowledgeAssetsAmount,
     args.knowledgeAssetsToBurn,
     newMerkleLeafCount,
+    newCiphertextChunksRoot,
+    newCiphertextChunkCount,
   );
   const sig = await signAckDigest(args.receivingNodes, ackDigest);
   const updateAttPayload = buildUpdateAuthorAttestationPayload({
@@ -480,8 +515,8 @@ export async function buildUpdateParams(args: {
     newMerkleLeafCount,
     mintKnowledgeAssetsAmount: args.mintKnowledgeAssetsAmount,
     knowledgeAssetsToBurn: args.knowledgeAssetsToBurn,
-    newCiphertextChunksRoot: ethers.ZeroHash,
-    newCiphertextChunkCount: 0,
+    newCiphertextChunksRoot,
+    newCiphertextChunkCount,
     publisherNodeIdentityId: args.publisherIdentityId,
     identityIds: args.receiverIdentityIds,
     r: sig.receiverRs,

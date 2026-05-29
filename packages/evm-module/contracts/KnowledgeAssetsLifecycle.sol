@@ -532,7 +532,8 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
         // Verification") and decision #25 Option B, extended with V10 flat-KC
         // Merkle metadata:
         //   (chainid, address(this), contextGraphId, merkleRoot,
-        //    knowledgeAssetsAmount, byteSize, epochs, tokenAmount, merkleLeafCount)
+        //    knowledgeAssetsAmount, byteSize, epochs, tokenAmount, merkleLeafCount,
+        //    ciphertextChunksRoot, ciphertextChunkCount, isImmutable)
         // The publisher node identity is NOT part of the ACK digest — it lives
         // only in the publisher digest above. ACK signers attest to the
         // publication's economic + content shape; the publishing node is a
@@ -548,7 +549,10 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
                 uint256(p.byteSize),
                 uint256(p.epochs),
                 uint256(p.tokenAmount),
-                uint256(p.merkleLeafCount)
+                uint256(p.merkleLeafCount),
+                p.ciphertextChunksRoot,
+                uint256(p.ciphertextChunkCount),
+                p.isImmutable ? uint256(1) : uint256(0)
             )
         );
         _verifySignatures(p.identityIds, ECDSA.toEthSignedMessageHash(ackDigest), p.r, p.vs);
@@ -1260,7 +1264,9 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
                 uint256(p.newTokenAmount),
                 p.mintKnowledgeAssetsAmount,
                 keccak256(abi.encodePacked(p.knowledgeAssetsToBurn)),
-                uint256(p.newMerkleLeafCount)
+                uint256(p.newMerkleLeafCount),
+                p.newCiphertextChunksRoot,
+                uint256(p.newCiphertextChunkCount)
             )
         );
         _verifySignatures(p.identityIds, ECDSA.toEthSignedMessageHash(ackDigest), p.r, p.vs);

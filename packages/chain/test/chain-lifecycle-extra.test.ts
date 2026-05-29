@@ -99,10 +99,14 @@ async function publishOneKCV10(opts: {
 
   // PR #357: V10 ACK now binds merkleLeafCount (uint256). Mirrors
   // helpers/v10-kc-helpers.ts:buildPublishAckDigest.
+  // #820 / RFC-39: the publish ACK digest additionally binds the trailing
+  // (ciphertextChunksRoot, ciphertextChunkCount, isImmutable) triple — see
+  // KnowledgeAssetsLifecycle._executePublishCore and computePublishACKDigest.
+  // This publish is plaintext + mutable, so all three are zero.
   const merkleLeafCount = 1;
   const ackDigest = ethers.getBytes(ethers.solidityPackedKeccak256(
-    ['uint256', 'address', 'uint256', 'bytes32', 'uint256', 'uint256', 'uint256', 'uint256', 'uint256'],
-    [evmChainId, kav10Address, contextGraphId, ethers.hexlify(merkleRoot), kaCount, byteSize, epochs, tokenAmount, merkleLeafCount],
+    ['uint256', 'address', 'uint256', 'bytes32', 'uint256', 'uint256', 'uint256', 'uint256', 'uint256', 'bytes32', 'uint256', 'uint256'],
+    [evmChainId, kav10Address, contextGraphId, ethers.hexlify(merkleRoot), kaCount, byteSize, epochs, tokenAmount, merkleLeafCount, ethers.ZeroHash, 0, 0],
   ));
   const ackRaw = ethers.Signature.from(await coreOp.signMessage(ackDigest));
 

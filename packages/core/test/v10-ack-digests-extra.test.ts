@@ -137,11 +137,11 @@ describe('computeUpdateACKDigest — KAV10 update ACK layout [C-1]', () => {
   const newMerkleLeafCount = 11n;
 
   const GOLDEN =
-    '0xf96a6ec017e13243ed2261a0693962ee24c4dbe5c9221558d31aaef4eec5d674';
+    '0xdd98e80b35d99c065fabae6f7f11308346b9b5e0abfbbce2528e3ab466e1ce73';
   const GOLDEN_WRONG_TOKEN =
-    '0x47360fcf82083938cf87cf9fbd2497de970c6011041ed205ab36b1d90a5a3be0';
+    '0x8ae17a4a33277c7715c9f65cf5946c1329b4b865b55e256a893264d6799a3146';
   const GOLDEN_EMPTY_BURN =
-    '0x9ca167e7fd7c387dd75f58a7b758186f9686e4dcdcc66822aac7f05bbf7b570a';
+    '0xb76f60d101209bb804fd1df2d560d8ad50d6e3d6f974973bf195ba560aeb3f9a';
 
   it('matches the contract-layout golden vector', () => {
     const digest = computeUpdateACKDigest(

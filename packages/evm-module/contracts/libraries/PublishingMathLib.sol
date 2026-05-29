@@ -42,10 +42,12 @@ library PublishingMathLib {
             endEpoch: currentEpoch + uint40(numberOfFullEpochs),
             tokenAmount: uint96(totalTokensForFullEpochs)
         });
-        ranges[2] = ActiveSinkRange({
-            startEpoch: currentEpoch + uint40(epochs),
-            endEpoch: currentEpoch + uint40(epochs),
-            tokenAmount: uint96(finalEpochAllocation)
-        });
+        if (finalEpochAllocation > 0) {
+            ranges[2] = ActiveSinkRange({
+                startEpoch: currentEpoch + uint40(epochs),
+                endEpoch: currentEpoch + uint40(epochs),
+                tokenAmount: uint96(finalEpochAllocation)
+            });
+        }
     }
 }

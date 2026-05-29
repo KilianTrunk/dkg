@@ -73,4 +73,21 @@ describe('@unit PublishingMathLib', () => {
       169079741319193896570470n,
     ]);
   });
+
+  it('leaves the current active sink slot empty when a small allocation rounds to zero', async () => {
+    const Harness = await hre.ethers.getContractFactory('PublishingMathLibHarness');
+    const harness = await Harness.deploy();
+
+    const [starts, ends, amounts] = await harness.prorateActiveSink(
+      10n,
+      10,
+      3,
+      10,
+      1,
+    );
+
+    expect(starts).to.deep.equal([0n, 11n, 13n]);
+    expect(ends).to.deep.equal([0n, 12n, 13n]);
+    expect(amounts).to.deep.equal([0n, 6n, 4n]);
+  });
 });

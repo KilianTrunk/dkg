@@ -98,6 +98,7 @@ function externalStoreBlock(
   backend: 'blazegraph' | 'sparql-http',
   url: string,
   managedByDkg: boolean,
+  updateUrl?: string,
 ): ExternalStoreBlock {
   if (backend === 'blazegraph') {
     return { backend, options: { url, managedByDkg } };
@@ -106,7 +107,10 @@ function externalStoreBlock(
     backend,
     options: {
       queryEndpoint: url,
-      updateEndpoint: url,
+      // Default the update endpoint to the query endpoint, but allow callers
+      // to preserve a distinct existing `updateEndpoint` (sparql-http nodes
+      // can point query/update at different URLs).
+      updateEndpoint: updateUrl ?? url,
       managedByDkg,
     },
   };
@@ -123,19 +127,42 @@ export async function promptStoreBackend(
       : typeof opts.existingStore?.options?.queryEndpoint === 'string'
         ? (opts.existingStore?.options?.queryEndpoint as string)
         : undefined;
+  // sparql-http nodes can point query/update at different URLs. Capture the
+  // existing update endpoint so an Enter-through (reuse) of the current
+  // config doesn't silently collapse it onto the query endpoint.
+  const existingUpdateUrl =
+    typeof opts.existingStore?.options?.updateEndpoint === 'string'
+      ? (opts.existingStore?.options?.updateEndpoint as string)
+      : undefined;
 
   const defaultBackend = opts.flagBackend
     ?? (existingBackend === 'blazegraph' || existingBackend === 'sparql-http' ? existingBackend : 'oxigraph');
 
   const backendChoices = ['oxigraph', 'blazegraph'] as const;
-  const defaultIdx = Math.max(0, backendChoices.indexOf(defaultBackend as typeof backendChoices[number]));
+  // `sparql-http` is intentionally not listed (advanced bring-your-own-server
+  // option) but is still accepted when typed or inherited from an existing
+  // config / `--store` flag. Resolve the default *answer* by name for unlisted
+  // backends so pressing Enter on a node already configured for `sparql-http`
+  // preserves it instead of silently downgrading to oxigraph (option 1).
+  const defaultIsListed = (backendChoices as readonly string[]).includes(defaultBackend);
+  const defaultIdx = defaultIsListed
+    ? backendChoices.indexOf(defaultBackend as typeof backendChoices[number])
+    : 0;
+  const defaultAnswer = defaultIsListed ? String(defaultIdx + 1) : defaultBackend;
   log('  Triple store backend:');
   for (let i = 0; i < backendChoices.length; i++) {
     log(`    ${i + 1}) ${backendChoices[i]}`);
   }
+  // When the inherited/flagged backend isn't one of the numbered choices
+  // (e.g. `sparql-http`), spell out that pressing Enter keeps it and that a
+  // literal backend name is accepted — otherwise the `(sparql-http)` default
+  // on a `Choose (1-2)` prompt reads as a contradiction.
+  if (!defaultIsListed) {
+    log(`    (current: ${defaultBackend} — press Enter to keep it, or type a number / backend name)`);
+  }
   const backendInput = (await opts.ask(
     `Choose (1-${backendChoices.length})`,
-    String(defaultIdx + 1),
+    defaultAnswer,
   )).trim();
 
   // Accept both the number ("1", "2") and the name ("blazegraph")
@@ -197,9 +224,9 @@ export async function promptStoreBackend(
           }
         } else {
           log('');
-          log('  Docker is not installed on this system.');
-          log('  Install Docker to auto-provision Blazegraph, or start it manually');
-          log('  and enter its SPARQL endpoint URL below.');
+          log('  Docker not detected on this system.');
+          log('  Install or start Docker to auto-provision Blazegraph, or start it');
+          log('  manually and enter its SPARQL endpoint URL below.');
           log('');
         }
       }
@@ -220,8 +247,15 @@ export async function promptStoreBackend(
 
     if (health.ok) {
       log(`  Store endpoint reachable: ${backend} ${url}`);
+      // When the operator kept the existing sparql-http query URL
+      // (Enter-through), preserve a distinct existing `updateEndpoint`
+      // instead of collapsing it onto the query URL. If they typed a new
+      // query URL we have no matching update URL, so fall back to the
+      // query URL for both.
+      const preservedUpdateUrl =
+        backend === 'sparql-http' && url === existingUrl ? existingUpdateUrl : undefined;
       return {
-        storeBlock: externalStoreBlock(backend, url, false),
+        storeBlock: externalStoreBlock(backend, url, false, preservedUpdateUrl),
       };
     }
 

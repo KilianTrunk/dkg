@@ -302,6 +302,74 @@ describe('promptStoreBackend', () => {
     expect(result.storeBlock).toBeNull();
   });
 
+  it('preserves an existing sparql-http backend when operator presses Enter (no silent downgrade)', async () => {
+    // sparql-http is not a listed numeric choice, but a node already
+    // configured for it must not be silently downgraded to oxigraph when
+    // the operator accepts the default. First '' = accept backend default
+    // (must resolve to sparql-http, NOT option 1); second '' = accept the
+    // pre-filled existing endpoint URL.
+    const { fn } = mockFetch(
+      () => new Response(JSON.stringify({ boolean: true }), { status: 200 }),
+    );
+    const result = await promptStoreBackend({
+      ask: mockAsk(['', '']),
+      // Use the canonical persisted shape the CLI actually writes for
+      // sparql-http stores (queryEndpoint/updateEndpoint), so this regression
+      // catches breakage of re-runs over real on-disk configs.
+      existingStore: {
+        backend: 'sparql-http',
+        options: {
+          queryEndpoint: 'http://byo.test/sparql',
+          updateEndpoint: 'http://byo.test/sparql',
+        },
+      } as unknown as DkgConfig['store'],
+      fetch: fn,
+      log: () => {},
+    });
+    expect(result.storeBlock?.backend).toBe('sparql-http');
+    expect(result.storeBlock?.options).toMatchObject({
+      queryEndpoint: 'http://byo.test/sparql',
+    });
+  });
+
+  it('preserves a DISTINCT updateEndpoint when reusing an existing sparql-http store (no silent collapse)', async () => {
+    // A node can point query/update at different URLs. Pressing Enter through
+    // the wizard must not overwrite updateEndpoint with the query endpoint.
+    const { fn } = mockFetch(
+      () => new Response(JSON.stringify({ boolean: true }), { status: 200 }),
+    );
+    const result = await promptStoreBackend({
+      ask: mockAsk(['', '']),
+      existingStore: {
+        backend: 'sparql-http',
+        options: {
+          queryEndpoint: 'http://byo.test/query',
+          updateEndpoint: 'http://byo.test/update',
+        },
+      } as unknown as DkgConfig['store'],
+      fetch: fn,
+      log: () => {},
+    });
+    expect(result.storeBlock?.backend).toBe('sparql-http');
+    expect(result.storeBlock?.options).toMatchObject({
+      queryEndpoint: 'http://byo.test/query',
+      updateEndpoint: 'http://byo.test/update',
+    });
+  });
+
+  it('preserves a --store sparql-http flag when operator presses Enter', async () => {
+    const { fn } = mockFetch(
+      () => new Response(JSON.stringify({ boolean: true }), { status: 200 }),
+    );
+    const result = await promptStoreBackend({
+      ask: mockAsk(['', 'http://flag.test/sparql']),
+      flagBackend: 'sparql-http',
+      fetch: fn,
+      log: () => {},
+    });
+    expect(result.storeBlock?.backend).toBe('sparql-http');
+  });
+
   it('pre-fills URL prompt from --store-url flag', async () => {
     const { fn, calls } = mockFetch(
       () => new Response(JSON.stringify({ boolean: true }), { status: 200 }),

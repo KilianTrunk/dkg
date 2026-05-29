@@ -2886,11 +2886,27 @@ export class EVMChainAdapter implements ChainAdapter {
       } catch { /* use 0 */ }
     }
     const baseTokenAmount = params.newTokenAmount ?? currentTokenAmount;
-    // KAV10 10.1.1: floor at 1n so the contract's strict-positive
-    // `_validateTokenAmount` check accepts metadata-only updates where
-    // both the carry-forward amount and the size-derived requirement are
-    // 0. The same floor runs through both the inline ACK-digest hash
-    // below and (canonically) `computeUpdateACKDigest`.
+    // KAV10 10.1.1: this floor is REDUNDANT for any KC that can exist on a
+    // V10 chain and is kept only as belt-and-suspenders. The publish path's
+    // own floor (see `floorPublishTokenAmount` at the publish struct site)
+    // plus the on-chain `_validateTokenAmount` revert on `tokenAmount == 0`
+    // guarantee every V10 KC carries `tokenAmount >= 1`, so the
+    // carry-forward `currentTokenAmount` (and therefore `baseTokenAmount`)
+    // is already >= 1 and this clamp is a no-op. It is NOT what lets
+    // metadata-only updates through: the contract skips `_validateTokenAmount`
+    // entirely unless `newByteSize > currentByteSize`
+    // (KnowledgeAssetsV10.sol §"Byte-size growth cost check"), so a
+    // metadata-only update with delta 0 is accepted without any floor.
+    //
+    // The clamp would only change anything for a legacy `tokenAmount == 0`
+    // KC (none can exist on a fresh V10 chain — only via a future V8/V9
+    // import path), where it would WRONGLY turn a free re-attestation into a
+    // 1-wei delta (and revert a final-epoch metadata update via
+    // `NoRemainingLifetimeForDelta`). Removing it — relying purely on the
+    // publish-time invariant — is tracked as a post-testnet follow-up
+    // (#781; issue #803); it is left in place for the rc.12 cut to avoid
+    // touching signed-ACK-digest math right before the testnet release,
+    // where it is provably inert.
     const newTokenAmount = floorPublishTokenAmount(
       baseTokenAmount > requiredForNewSize ? baseTokenAmount : requiredForNewSize,
     );

@@ -84,6 +84,10 @@ describe('@integration V10 ERC-20 false-return staking guards', () => {
 
     await Hub.setContractAddress('Token', await token.getAddress());
     await Hub.forwardCall(
+      await ConvictionStakingStorageContract.getAddress(),
+      ConvictionStakingStorageContract.interface.encodeFunctionData('initialize'),
+    );
+    await Hub.forwardCall(
       await StakingV10Contract.getAddress(),
       StakingV10Contract.interface.encodeFunctionData('initialize'),
     );
@@ -111,5 +115,24 @@ describe('@integration V10 ERC-20 false-return staking guards', () => {
     expect(position.raw).to.equal(0n);
     expect(await ConvictionStakingStorageContract.getNodeStakeV10(identityId)).to.equal(nodeStakeBefore);
     expect(await token.balanceOf(cssAddress)).to.equal(cssBalanceBefore);
+  });
+
+  it('keeps the CSS position when withdrawal transfer returns false', async () => {
+    const { identityId } = await createProfile();
+    const amount = hre.ethers.parseEther('1000');
+    const token = await useFalseReturnToken();
+
+    await token.mint(accounts[0].address, amount);
+    await token.connect(accounts[0]).approve(await StakingV10Contract.getAddress(), amount);
+    await NFT.connect(accounts[0]).createConviction(identityId, amount, 0);
+
+    const positionBefore = await ConvictionStakingStorageContract.getPosition(1);
+    await token.setTransferReturnsFalse(true);
+
+    await expect(NFT.connect(accounts[0]).withdraw(1)).to.be.reverted;
+
+    const positionAfter = await ConvictionStakingStorageContract.getPosition(1);
+    expect(positionAfter.identityId).to.equal(positionBefore.identityId);
+    expect(positionAfter.raw).to.equal(positionBefore.raw);
   });
 });

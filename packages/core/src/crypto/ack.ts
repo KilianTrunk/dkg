@@ -268,7 +268,7 @@ export function computeUpdateACKDigest(
   // >= 1`, and metadata-only updates skip `_validateTokenAmount` entirely.
   // It only changes a legacy `tokenAmount == 0` KC (which a fresh V10 chain
   // cannot produce). Removing it is tracked as a post-testnet follow-up
-  // (#781); see the matching note in evm-adapter.ts.
+  // (#781; issue #803); see the matching note in evm-adapter.ts.
   const flooredNewTokenAmount = floorPublishTokenAmount(newTokenAmount);
 
   // keccak256(abi.encodePacked(burnTokenIds))

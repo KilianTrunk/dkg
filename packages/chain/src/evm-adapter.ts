@@ -2814,9 +2814,9 @@ export class EVMChainAdapter implements ChainAdapter {
     // 1-wei delta (and revert a final-epoch metadata update via
     // `NoRemainingLifetimeForDelta`). Removing it — relying purely on the
     // publish-time invariant — is tracked as a post-testnet follow-up
-    // (#781); it is left in place for the rc.12 cut to avoid touching
-    // signed-ACK-digest math right before the testnet release, where it is
-    // provably inert.
+    // (#781; issue #803); it is left in place for the rc.12 cut to avoid
+    // touching signed-ACK-digest math right before the testnet release,
+    // where it is provably inert.
     const newTokenAmount = floorPublishTokenAmount(
       baseTokenAmount > requiredForNewSize ? baseTokenAmount : requiredForNewSize,
     );

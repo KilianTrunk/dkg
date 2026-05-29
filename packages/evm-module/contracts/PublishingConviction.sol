@@ -8,6 +8,7 @@ import {IInitializable} from "./interfaces/IInitializable.sol";
 import {ContractStatus} from "./abstract/ContractStatus.sol";
 import {Chronos} from "./storage/Chronos.sol";
 import {EpochStorage} from "./storage/EpochStorage.sol";
+import {PublishingMathLib} from "./libraries/PublishingMathLib.sol";
 import {ParametersStorage} from "./storage/ParametersStorage.sol";
 import {PublishingConvictionStorage} from "./storage/PublishingConvictionStorage.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -816,15 +817,8 @@ contract PublishingConviction is INamed, IVersioned, ContractStatus, IInitializa
 
     /// @notice Discrete 6-tier discount ladder. Tiers are evaluated
     ///         highest-first so the largest commit that qualifies is
-    ///         selected. Pure — duplicated on the NFT wrapper for
-    ///         caller-side cheap reads.
+    ///         selected.
     function getDiscountBps(uint96 committedTRAC) public pure returns (uint256) {
-        if (committedTRAC >= 1_000_000 ether) return 7500; // 75%
-        if (committedTRAC >= 500_000 ether)   return 5000; // 50%
-        if (committedTRAC >= 250_000 ether)   return 4000; // 40%
-        if (committedTRAC >= 100_000 ether)   return 3000; // 30%
-        if (committedTRAC >= 50_000 ether)    return 2000; // 20%
-        if (committedTRAC >= 25_000 ether)    return 1000; // 10%
-        return 0;
+        return PublishingMathLib.discountBps(committedTRAC);
     }
 }

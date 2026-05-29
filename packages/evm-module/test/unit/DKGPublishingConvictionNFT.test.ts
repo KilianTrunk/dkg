@@ -2,6 +2,8 @@ import { SignerWithAddress } from '@nomicfoundation/hardhat-ethers/signers';
 import { loadFixture, time } from '@nomicfoundation/hardhat-network-helpers';
 import { expect } from 'chai';
 import hre from 'hardhat';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 
 import {
   Chronos,
@@ -153,6 +155,36 @@ describe('@unit DKGPublishingConvictionNFT', function () {
         expect(expectedBps(amount)).to.equal(bps);
       });
     }
+
+    it('logic contract and NFT wrapper share the ladder around every threshold', async () => {
+      const sources = [
+        readFileSync(join(__dirname, '../../contracts/PublishingConviction.sol'), 'utf8'),
+        readFileSync(join(__dirname, '../../contracts/DKGPublishingConvictionNFT.sol'), 'utf8'),
+      ];
+      for (const source of sources) {
+        expect(source).to.include('PublishingMathLib.discountBps(committedTRAC)');
+      }
+
+      const thresholds = [
+        hre.ethers.parseEther('25000'),
+        hre.ethers.parseEther('50000'),
+        hre.ethers.parseEther('100000'),
+        hre.ethers.parseEther('250000'),
+        hre.ethers.parseEther('500000'),
+        hre.ethers.parseEther('1000000'),
+      ];
+      const amounts = [
+        0n,
+        ...thresholds.flatMap((threshold) => [threshold - 1n, threshold, threshold + 1n]),
+        (1n << 96n) - 1n,
+      ];
+
+      for (const amount of amounts) {
+        const expected = expectedBps(amount);
+        expect(await NFT.getDiscountBps(amount)).to.equal(expected);
+        expect(await LogicContract.getDiscountBps(amount)).to.equal(expected);
+      }
+    });
   });
 
   // ======================================================================

@@ -121,7 +121,17 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
     //             into the CSS address. `StakingStorage` is no longer in
     //             the V10 hot path; only `StakingV10._convertToNFT` reads
     //             it (V8→V10 drain at cutover).
-    string private constant _VERSION = "4.0.0";
+    //   4.1.0 — V8→V10 migration conviction credit.
+    //           * `createPosition` gains a sixth parameter
+    //             `expiryShortenedBy` (seconds). Subtracted from the
+    //             tier-default `expiryTimestamp` after the standard
+    //             computation so callers (presently
+    //             `StakingV10._convertToNFT`) can grant a one-time time
+    //             credit to V8 delegators who held continuous stake for
+    //             the 60 days preceding V10 launch. Validated against
+    //             `_tierDuration(lockTier)` and the current block
+    //             timestamp; tier-0 callers MUST pass 0.
+    string private constant _VERSION = "4.1.0";
 
     // Multiplier scale, matches DKGStakingConvictionNFT._convictionMultiplier
     // (returns 1e18-scaled values so fractional tiers like 1.5x and 3.5x
@@ -882,12 +892,19 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
     ///         L4 — guards against pre-genesis bootstrap where
     ///         `chronos.getCurrentEpoch()` returns 0 (the `currentEpoch - 1`
     ///         arithmetic would otherwise panic).
+    /// @param  expiryShortenedBy v4.1.0 — seconds to subtract from the
+    ///         tier-default `expiryTimestamp`. Used by
+    ///         `StakingV10._convertToNFT` to grant the V8→V10 migration
+    ///         conviction credit (60 days for eligible delegators on
+    ///         tiers 6/12, 0 otherwise). Caller MUST pass 0 for tier 0
+    ///         and for fresh `stake()` calls.
     function createPosition(
         uint256 tokenId,
         uint72 identityId,
         uint96 raw,
         uint40 lockTier,
-        uint32 migrationEpoch
+        uint32 migrationEpoch,
+        uint40 expiryShortenedBy
     ) external onlyContracts {
         require(identityId != 0, "Zero node");
         require(positions[tokenId].identityId == 0, "Position exists");
@@ -901,6 +918,33 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
         require(currentEpoch >= 1, "Pre-genesis create");
         uint40 tsNow = uint40(block.timestamp);
         uint40 expiryTimestamp = _computeExpiryTimestamp(lockTier);
+
+        // v4.1.0 — apply the V8→V10 migration credit. The credit is in
+        // seconds; we subtract from the freshly-computed default expiry.
+        // Constraints:
+        //   * The credit is V8→V10 migration-exclusive — fresh `stake()`
+        //     calls (`migrationEpoch == 0`) MUST pass 0. Without this
+        //     guard, any future Hub-registered caller could mint a
+        //     fresh stake at a shortened lock just by remembering / not
+        //     to pass the bonus. Tying the credit to a non-zero
+        //     `migrationEpoch` keeps the bonus a closed eligibility set
+        //     scoped to the V8→V10 drain path.
+        //   * Tier 0 has no boost / no expiry, so any non-zero credit is
+        //     a caller bug (guard catches it explicitly).
+        //   * Credit must be strictly less than the tier duration —
+        //     equal-or-greater would land the new expiry at or before
+        //     `block.timestamp`, defeating the lock.
+        //   * After applying, the resulting expiry must still be in the
+        //     future. Belt-and-suspenders against off-by-one rounding
+        //     in the tier table.
+        if (expiryShortenedBy != 0) {
+            require(migrationEpoch != 0, "Credit requires migrationEpoch");
+            require(lockTier != 0, "Credit requires locked tier");
+            uint256 dur = _tierDuration(lockTier);
+            require(uint256(expiryShortenedBy) < dur, "Credit >= tier duration");
+            expiryTimestamp = uint40(uint256(expiryTimestamp) - uint256(expiryShortenedBy));
+            require(expiryTimestamp > tsNow, "Credit leaves no remaining lock");
+        }
 
         positions[tokenId] = Position({
             raw: raw,

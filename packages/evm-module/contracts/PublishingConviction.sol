@@ -83,7 +83,15 @@ contract PublishingConviction is INamed, IVersioned, ContractStatus, IInitializa
     //           accessed via `onlyContracts`-gated mutators. Caller gates
     //           tightened via `onlyConvictionNFT` for NFT-driven write
     //           paths so KAV10 cannot bypass the wrapper.
-    string private constant _VERSION = "1.0.0";
+    //   1.0.1 — post-discount floor in `coverPublishingCost`. Integer
+    //           truncation in `(baseCost * (BPS_DENOMINATOR -
+    //           discountBps)) / BPS_DENOMINATOR` collapsed `baseCost ==
+    //           1` against any non-zero `discountBps` to
+    //           `discountedCost == 0`, skipping `windowSpent` accounting
+    //           and the active-sink reward distribution. Twin of KAV10
+    //           10.1.1's `tokenAmount > 0` floor, which protects only
+    //           the direct-spend branch.
+    string private constant _VERSION = "1.0.1";
 
     uint256 public constant BPS_DENOMINATOR = 10_000;
     /// @notice EpochStorage shard ID for the staker reward pool. Mirrors
@@ -386,6 +394,22 @@ contract PublishingConviction is INamed, IVersioned, ContractStatus, IInitializa
         discountedCost = uint96(
             (uint256(baseCost) * (BPS_DENOMINATOR - uint256(acct.discountBps))) / BPS_DENOMINATOR
         );
+        // Post-discount floor — mirror of the on-chain `tokenAmount > 0`
+        // floor on the direct-spend branch (KAV10 10.1.1). Integer
+        // truncation in the discount math collapses any
+        // `baseCost * (BPS_DENOMINATOR - discountBps) < BPS_DENOMINATOR`
+        // case (most concretely: `baseCost == 1` with any non-zero
+        // discount on the 6-tier ladder) to `discountedCost == 0`, which
+        // would skip both window-spent accounting AND the active-sink
+        // reward distribution — i.e. a free conviction-discounted
+        // publish. KAV10's base-amount floor only protects the
+        // direct-spend branch; this is its conviction-branch twin.
+        // Guard with `baseCost > 0` so the trivially-honest
+        // `coverPublishingCost(_, 0, _, _)` shape (no path exercises it
+        // today; defensive) stays a no-op instead of being inflated to 1.
+        if (discountedCost == 0 && baseCost > 0) {
+            discountedCost = 1;
+        }
 
         uint96 baseAllowance = acct.committedTRAC / uint96(acct.lockDurationEpochs);
         uint96 spent = publishingConvictionStorage.windowSpent(accountId, currentBillingWindow);

@@ -67,13 +67,22 @@ recover their nodes with a single transaction.
 
 - **Operator-fee history is not recoverable.** The pre-redeploy operator-fee
   schedule was Profile-resident and is gone. `recreateProfile` seeds a
-  single fresh fee at recovery time (like genesis `createProfile`). For any
-  **unclaimed pre-recovery epochs**, `StakingV10._claim` resolves the
-  historical split via `getOperatorFeePercentageByTimestampReverse`, which
-  now falls back to the new recovery-time fee — i.e. recovery can
-  retroactively change reward splits for those epochs. This is **accepted
-  as a known testnet limitation**: the data is unrecoverable on-chain, and
-  a real (mainnet) event of this kind would be handled by a state
-  migration, not this recovery path. Operationally: settle/claim all
-  pre-recovery epochs before recovering, or accept reward drift for
-  unclaimed ones.
+  single fresh fee at recovery time. For any **unclaimed pre-recovery
+  epochs**, `StakingV10._claim` resolves the historical split via
+  `getOperatorFeePercentageByTimestampReverse`, which falls back to
+  the recovery-time seed fee — i.e. recovery DOES change reward splits
+  for those epochs. The data is unrecoverable on-chain, and a real
+  (mainnet) event of this kind would be handled by a state migration,
+  not this recovery path. Operationally: settle/claim all pre-recovery
+  epochs before recovering, or accept reward drift for unclaimed ones.
+
+  **Profile 1.4.0 signature refinement.** Recovery no longer accepts a
+  caller-supplied `initialOperatorFee`. The recovered profile is seeded
+  at fee = 0 unconditionally, and the admin sets the real value via
+  the standard `updateOperatorFee` path (cooldown + prior-epoch-claim
+  gate). Recovery and steady-state fee changes now go through the same
+  surface, so the drift behaviour above is delegator-favourable —
+  unclaimed pre-recovery epochs settle at 0% operator fee. Operators
+  wishing to preserve accrued fees MUST settle every pre-recovery
+  epoch before recovery; the recovery script's pre-flight should
+  enforce this.

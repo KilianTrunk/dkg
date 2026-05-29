@@ -5,6 +5,7 @@ import hre from 'hardhat';
 
 import {
   Hub,
+  Identity,
   IdentityStorage,
   ParametersStorage,
   Profile,
@@ -18,6 +19,7 @@ import {
 type ProfileFixture = {
   accounts: SignerWithAddress[];
   Hub: Hub;
+  Identity: Identity;
   IdentityStorage: IdentityStorage;
   Profile: Profile;
   ParametersStorage: ParametersStorage;
@@ -31,6 +33,7 @@ type ProfileFixture = {
 describe('@unit Profile contract', function () {
   let accounts: SignerWithAddress[];
   let Hub: Hub;
+  let Identity: Identity;
   let IdentityStorage: IdentityStorage;
   let Profile: Profile;
   let ParametersStorage: ParametersStorage;
@@ -47,6 +50,7 @@ describe('@unit Profile contract', function () {
   async function deployProfileFixture(): Promise<ProfileFixture> {
     await hre.deployments.fixture(['Profile']);
     Profile = await hre.ethers.getContract<Profile>('Profile');
+    Identity = await hre.ethers.getContract<Identity>('Identity');
     IdentityStorage =
       await hre.ethers.getContract<IdentityStorage>('IdentityStorage');
     ParametersStorage =
@@ -69,6 +73,7 @@ describe('@unit Profile contract', function () {
     return {
       accounts,
       Hub,
+      Identity,
       IdentityStorage,
       Profile,
       ParametersStorage,
@@ -84,6 +89,7 @@ describe('@unit Profile contract', function () {
     ({
       accounts,
       Hub,
+      Identity,
       IdentityStorage,
       Profile,
       ParametersStorage,
@@ -99,8 +105,8 @@ describe('@unit Profile contract', function () {
     expect(await Profile.name()).to.equal('Profile');
   });
 
-  it('The contract is version "1.3.0"', async () => {
-    expect(await Profile.version()).to.equal('1.3.0');
+  it('The contract is version "1.4.2"', async () => {
+    expect(await Profile.version()).to.equal('1.4.2');
   });
 
   it('Create a profile with valid inputs, expect to pass', async () => {
@@ -255,6 +261,88 @@ describe('@unit Profile contract', function () {
     ).to.be.revertedWithCustomError(Profile, 'OperatorFeeOutOfRange');
   });
 
+  // Profile 1.4.2 / Identity 1.1.0 — createProfile delegates op-wallet
+  // validation to `Identity.addOperationalWallets`. The same-identity
+  // duplicate vs cross-identity collision disambiguation surfaces via
+  // distinct errors; admin-wallet overlap surfaces as the existing
+  // `KeyAlreadyAttached` (admin/operational wallet reuse is a
+  // deliberate operator choice and stays un-policed beyond the key
+  // attachment check).
+
+  it('createProfile reverts OperationalAddressZero when an op wallet is the zero address', async () => {
+    await expect(
+      Profile.createProfile(
+        accounts[1].address,
+        [hre.ethers.ZeroAddress],
+        'Node 1',
+        nodeId1,
+        1000,
+      ),
+    ).to.be.revertedWithCustomError(Identity, 'OperationalAddressZero');
+  });
+
+  it('createProfile reverts OperationalWalletDuplicate when an op wallet equals msg.sender (already attached as primary)', async () => {
+    await expect(
+      Profile.connect(accounts[0]).createProfile(
+        accounts[1].address,
+        [accounts[0].address],
+        'Node 1',
+        nodeId1,
+        1000,
+      ),
+    )
+      .to.be.revertedWithCustomError(Identity, 'OperationalWalletDuplicate')
+      .withArgs(accounts[0].address);
+  });
+
+  it('createProfile reverts KeyAlreadyAttached when an op wallet equals adminWallet (admin/operational overlap)', async () => {
+    await expect(
+      Profile.createProfile(
+        accounts[1].address,
+        [accounts[1].address],
+        'Node 1',
+        nodeId1,
+        1000,
+      ),
+    ).to.be.revertedWithCustomError(Identity, 'KeyAlreadyAttached');
+  });
+
+  it('createProfile reverts OperationalWalletDuplicate when the op-wallet array has an intra-array duplicate', async () => {
+    await expect(
+      Profile.createProfile(
+        accounts[1].address,
+        [accounts[2].address, accounts[2].address],
+        'Node 1',
+        nodeId1,
+        1000,
+      ),
+    )
+      .to.be.revertedWithCustomError(Identity, 'OperationalWalletDuplicate')
+      .withArgs(accounts[2].address);
+  });
+
+  it('createProfile reverts OperationalKeyTaken when an op wallet is already attached to a different identity', async () => {
+    const nodeId2 =
+      '0x17f38512786964d9e70453371e7c98975d284100d44bd68dab67fe00b525cb66';
+    await Profile.connect(accounts[3]).createProfile(
+      accounts[4].address,
+      [accounts[5].address],
+      'Node 2',
+      nodeId2,
+      1000,
+    );
+
+    await expect(
+      Profile.createProfile(
+        accounts[1].address,
+        [accounts[5].address],
+        'Node 1',
+        nodeId1,
+        1000,
+      ),
+    ).to.be.revertedWithCustomError(Identity, 'OperationalKeyTaken');
+  });
+
   it('Update ask for a profile with valid input, expect to pass', async () => {
     await Profile.createProfile(
       accounts[1].address,
@@ -368,7 +456,6 @@ describe('@unit Profile contract', function () {
           accounts[0].address,
           'Node 1',
           nodeId1,
-          1000,
         ),
       ).to.not.be.reverted;
 
@@ -385,13 +472,29 @@ describe('@unit Profile contract', function () {
           accounts[0].address,
           'Node 1',
           nodeId1,
-          1000,
         ),
       ).to.not.be.reverted;
 
       expect(await ProfileStorage.profileExists(identityId1)).to.equal(true);
       expect(await ProfileStorage.getNodeId(identityId1)).to.equal(nodeId1);
       expect(await ProfileStorage.getName(identityId1)).to.equal('Node 1');
+    });
+
+    // Profile 1.4.0 — recreateProfile no longer accepts an
+    // `initialOperatorFee` argument. The recovered profile is seeded at
+    // fee = 0 and the admin sets the real value via the cooldown-gated
+    // `updateOperatorFee` path.
+    it('seeds the recovered profile at operator fee = 0', async () => {
+      await seedBrickedIdentity();
+      await Profile.connect(accounts[1]).recreateProfile(
+        accounts[0].address,
+        'Node 1',
+        nodeId1,
+      );
+      const latestFee = await ProfileStorage.getLatestOperatorFeePercentage(
+        identityId1,
+      );
+      expect(latestFee).to.equal(0n);
     });
 
     it('does not mint a new identity (id counter and resolved id unchanged)', async () => {
@@ -405,7 +508,6 @@ describe('@unit Profile contract', function () {
         accounts[0].address,
         'Node 1',
         nodeId1,
-        1000,
       );
 
       expect(await IdentityStorage.lastIdentityId()).to.equal(lastIdBefore);
@@ -431,7 +533,6 @@ describe('@unit Profile contract', function () {
           accounts[0].address,
           'Node 1',
           nodeId1,
-          1000,
         ),
       )
         .to.be.revertedWithCustomError(Profile, 'ProfileAlreadyExists')
@@ -447,7 +548,6 @@ describe('@unit Profile contract', function () {
           accounts[0].address,
           'Node 1',
           nodeId1,
-          1000,
         ),
       ).to.be.revertedWithCustomError(Profile, 'OnlyProfileAdminFunction');
     });
@@ -460,7 +560,6 @@ describe('@unit Profile contract', function () {
           accounts[0].address,
           'Node 1',
           nodeId1,
-          1000,
         ),
       ).to.be.revertedWithCustomError(Profile, 'OnlyProfileAdminFunction');
     });
@@ -474,7 +573,6 @@ describe('@unit Profile contract', function () {
           accounts[6].address,
           'Node 1',
           nodeId1,
-          1000,
         ),
       ).to.be.revertedWithCustomError(Profile, 'OnlyProfileAdminFunction');
     });
@@ -496,7 +594,6 @@ describe('@unit Profile contract', function () {
           accounts[0].address,
           'Node 1',
           nodeId1,
-          1000,
         ),
       ).to.be.revertedWithCustomError(Profile, 'OnlyProfileAdminFunction');
     });
@@ -514,7 +611,6 @@ describe('@unit Profile contract', function () {
           accounts[0].address,
           'Node 1',
           differentNodeId,
-          1000,
         ),
       ).to.be.revertedWithCustomError(Profile, 'NodeIdShardingMismatch');
     });
@@ -528,7 +624,6 @@ describe('@unit Profile contract', function () {
           accounts[0].address,
           'Node 1',
           nodeId1,
-          1000,
         ),
       ).to.not.be.reverted;
       expect(await ProfileStorage.profileExists(identityId1)).to.equal(true);
@@ -542,7 +637,6 @@ describe('@unit Profile contract', function () {
           accounts[0].address,
           '',
           nodeId1,
-          1000,
         ),
       ).to.be.revertedWithCustomError(Profile, 'EmptyNodeName');
     });
@@ -555,7 +649,6 @@ describe('@unit Profile contract', function () {
           accounts[0].address,
           'Node 1',
           '0x',
-          1000,
         ),
       ).to.be.revertedWithCustomError(Profile, 'EmptyNodeId');
     });
@@ -575,7 +668,6 @@ describe('@unit Profile contract', function () {
           accounts[0].address,
           'Node 1',
           nodeId1,
-          1000,
         ),
       ).to.be.revertedWithCustomError(Profile, 'NodeIdAlreadyExists');
     });
@@ -587,33 +679,11 @@ describe('@unit Profile contract', function () {
     // only "passed" by faking it via a hardcoded storage slot. The dead
     // mapping itself is tracked as separate pre-existing cleanup.
 
-    it('accepts initialOperatorFee equal to the max and rejects above it', async () => {
-      await seedBrickedIdentity();
-      const maxFee = await ParametersStorage.maxOperatorFee();
-
-      await expect(
-        Profile.connect(accounts[1]).recreateProfile(
-          accounts[0].address,
-          'Node 1',
-          nodeId1,
-          maxFee,
-        ),
-      ).to.not.be.reverted;
-    });
-
-    it('reverts OperatorFeeOutOfRange when initialOperatorFee exceeds the max', async () => {
-      await seedBrickedIdentity();
-      const maxFee = await ParametersStorage.maxOperatorFee();
-
-      await expect(
-        Profile.connect(accounts[1]).recreateProfile(
-          accounts[0].address,
-          'Node 1',
-          nodeId1,
-          maxFee + 1n,
-        ),
-      ).to.be.revertedWithCustomError(Profile, 'OperatorFeeOutOfRange');
-    });
+    // Profile 1.4.0 — the `initialOperatorFee` argument was removed from
+    // `recreateProfile`. The two tests that asserted its bounds-check
+    // behaviour (max-fee accept / above-max reject) were deleted
+    // alongside the argument; the `updateOperatorFee` test suite already
+    // covers the same bounds for the steady-state path.
 
     it('is gated by the whitelist: reverts when enabled and admin not whitelisted', async () => {
       await seedBrickedIdentity();
@@ -624,7 +694,6 @@ describe('@unit Profile contract', function () {
           accounts[0].address,
           'Node 1',
           nodeId1,
-          1000,
         ),
       ).to.be.revertedWithCustomError(
         Profile,
@@ -642,7 +711,6 @@ describe('@unit Profile contract', function () {
           accounts[0].address,
           'Node 1',
           nodeId1,
-          1000,
         ),
       ).to.not.be.reverted;
     });
@@ -653,7 +721,6 @@ describe('@unit Profile contract', function () {
         accounts[0].address,
         'Node 1',
         nodeId1,
-        1000,
       );
 
       const nodeId2 =

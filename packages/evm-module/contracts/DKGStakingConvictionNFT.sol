@@ -473,9 +473,16 @@ contract DKGStakingConvictionNFT is IVersioned, ContractStatus, IInitializable, 
     function withdraw(uint256 tokenId) external returns (uint96 amount) {
         if (ownerOf(tokenId) != msg.sender) revert NotPositionOwner();
 
-        amount = stakingV10.withdraw(msg.sender, tokenId);
-
+        // CEI ordering — the receipt NFT is dropped BEFORE the CSS
+        // teardown + TRAC payout run, so the on-chain ownership claim
+        // ends before any external token movement. ownerOf-gated
+        // re-entry paths on this contract (claim / withdraw / relock /
+        // redelegate) revert at the entry ownership check.
+        // StakingV10.withdraw gates on the CSS position (`pos.identityId
+        // == 0`), not NFT existence, so the teardown is unaffected.
         _burn(tokenId);
+
+        amount = stakingV10.withdraw(msg.sender, tokenId);
 
         emit PositionWithdrawn(tokenId, amount);
     }

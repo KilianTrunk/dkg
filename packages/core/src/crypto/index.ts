@@ -40,6 +40,7 @@ export {
   computePublishACKDigest,
   computeUpdateACKDigest,
   computePublishPublisherDigest,
+  floorPublishTokenAmount,
   buildAuthorAttestationTypedData,
   AUTHOR_ATTESTATION_DOMAIN_NAME,
   AUTHOR_ATTESTATION_DOMAIN_VERSION,

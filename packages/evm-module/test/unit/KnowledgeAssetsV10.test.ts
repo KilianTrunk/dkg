@@ -2510,5 +2510,293 @@ describe('@unit KnowledgeAssetsV10', () => {
         expect(await KCS.getLatestMerkleRootAuthor(kcId)).to.equal(ethers.ZeroAddress);
       });
     });
+
+    // ----------------------------------------------------------------------
+    // T-HARDEN: rc.12 hardening pass regression coverage (PR #781)
+    //
+    // Pins the new revert surfaces added in `KnowledgeAssetsV10@10.1.1`:
+    //   - `_validateTokenAmount` strict-positive `tokenAmount` floor on
+    //     `publish` and `extendKnowledgeCollectionLifetime`. Surfaces as
+    //     `InvalidTokenAmount(1, 0)` regardless of payload size — the
+    //     rounded `expectedTokenAmount == 0` branch no longer admits
+    //     free publishes.
+    //   - `nonReentrant` perimeter on `publish` / `update` /
+    //     `extendKnowledgeCollectionLifetime`. The ERC-1155 mint
+    //     acceptance callback dispatched to the publisher is the
+    //     attacker-controllable callback surface; re-entry via that
+    //     callback must revert with `ReentrancyGuardReentrantCall()`.
+    // ----------------------------------------------------------------------
+    describe('T-HARDEN: rc.12 hardening pass', () => {
+      // --------------------------------------------------------------------
+      // T-HARDEN.1: zero-tokenAmount publish reverts InvalidTokenAmount(1, 0)
+      // --------------------------------------------------------------------
+      it('publish reverts InvalidTokenAmount(1, 0) when tokenAmount == 0', async () => {
+        const creator = getDefaultKCCreator(accounts);
+        const nodes = await setupNodes();
+        const cgId = await createOpenCG(creator);
+
+        const p = await buildPublishParams({
+          chainId,
+          kav10Address,
+          receivingNodes: nodes.receivingNodes,
+          publisherIdentityId: nodes.publisherIdentityId,
+          receiverIdentityIds: nodes.receiverIdentityIds,
+          author: creator,
+          contextGraphId: cgId,
+          merkleRoot: ethers.keccak256(ethers.toUtf8Bytes('t-harden-1-root')),
+          knowledgeAssetsAmount: 10,
+          byteSize: 1000,
+          epochs: 2,
+          tokenAmount: 0n,
+          isImmutable: false,
+          publishOperationId: 't-harden-1-op',
+        });
+
+        await expect(KAV10.connect(creator).publish(p))
+          .to.be.revertedWithCustomError(KAV10, 'InvalidTokenAmount')
+          .withArgs(1, 0);
+      });
+
+      // --------------------------------------------------------------------
+      // T-HARDEN.2: zero-tokenAmount extendKnowledgeCollectionLifetime reverts
+      // --------------------------------------------------------------------
+      it('extendKnowledgeCollectionLifetime reverts InvalidTokenAmount(1, 0) when tokenAmount == 0', async () => {
+        const creator = getDefaultKCCreator(accounts);
+        const nodes = await setupNodes();
+        const cgId = await createOpenCG(creator);
+
+        // Stand up a real KC first so `extendKnowledgeCollectionLifetime`
+        // has a target. Uses the same publish setup as T2.6 so the
+        // extend-side validation is the only thing under test.
+        const tokenAmount = ethers.parseEther('100');
+        const p = await buildPublishParams({
+          chainId,
+          kav10Address,
+          receivingNodes: nodes.receivingNodes,
+          publisherIdentityId: nodes.publisherIdentityId,
+          receiverIdentityIds: nodes.receiverIdentityIds,
+          author: creator,
+          contextGraphId: cgId,
+          merkleRoot: ethers.keccak256(ethers.toUtf8Bytes('t-harden-2-root')),
+          knowledgeAssetsAmount: 10,
+          byteSize: 1000,
+          epochs: 2,
+          tokenAmount,
+          isImmutable: false,
+          publishOperationId: 't-harden-2-op',
+        });
+        await TokenContract.connect(creator).approve(kav10Address, tokenAmount);
+        await KAV10.connect(creator).publish(p);
+        const kcId = 1n;
+
+        await expect(
+          KAV10.connect(creator).extendKnowledgeCollectionLifetime(kcId, 3n, 0n),
+        )
+          .to.be.revertedWithCustomError(KAV10, 'InvalidTokenAmount')
+          .withArgs(1, 0);
+      });
+
+      // --------------------------------------------------------------------
+      // T-HARDEN.3: nonReentrant guard rejects re-entry from the ERC-1155
+      // mint acceptance callback. The publisher is a contract that catches
+      // the inner-call revert internally, asserts the selector matches
+      // `ReentrancyGuardReentrantCall()`, and returns the ERC-1155 magic
+      // value so the outer publish completes. ERC1155Delta's receiver-
+      // acceptance try/catch would otherwise mask the inner revert as
+      // `TransferToNonERC1155ReceiverImplementer`, so the assertion has to
+      // live inside the receiver — surfaced via the mock's `reentryRejected`
+      // flag and `lastInnerSelector`.
+      // --------------------------------------------------------------------
+      it('publish reverts ReentrancyGuardReentrantCall when re-entered from the ERC-1155 mint callback', async () => {
+        const creator = getDefaultKCCreator(accounts);
+        const nodes = await setupNodes();
+        const cgId = await createOpenCG(creator);
+
+        // Deploy the reentrancy harness. The publisher of record (msg.sender)
+        // of the outer call MUST be the mock — that's the address the
+        // ERC-1155Delta mint will dispatch the acceptance callback to.
+        const Mock = await hre.ethers.getContractFactory(
+          'MockReentrantPublisher',
+        );
+        const mock = await Mock.deploy();
+        await mock.setKAV10(kav10Address);
+
+        // Author is an EOA (`creator`) — the EIP-712 attestation is
+        // recovered via ECDSA, so the publisher being a contract is fine.
+        const tokenAmount = ethers.parseEther('100');
+        const p = await buildPublishParams({
+          chainId,
+          kav10Address,
+          receivingNodes: nodes.receivingNodes,
+          publisherIdentityId: nodes.publisherIdentityId,
+          receiverIdentityIds: nodes.receiverIdentityIds,
+          author: creator,
+          contextGraphId: cgId,
+          merkleRoot: ethers.keccak256(ethers.toUtf8Bytes('t-harden-3-root')),
+          knowledgeAssetsAmount: 10,
+          byteSize: 1000,
+          epochs: 2,
+          tokenAmount,
+          isImmutable: false,
+          publishOperationId: 't-harden-3-op',
+        });
+
+        // Fund the mock with TRAC and have it grant the KAV10 allowance.
+        await TokenContract.connect(accounts[0]).transfer(
+          await mock.getAddress(),
+          tokenAmount,
+        );
+        await mock.approveTrac(await TokenContract.getAddress(), tokenAmount);
+
+        // Inner re-entry payload: any `publish(...)` call works; we're
+        // testing that the `nonReentrant` modifier fires at the gate
+        // before any logic runs. Reusing the outer params is the simplest
+        // shape that encodes cleanly.
+        const publishCalldata = KAV10.interface.encodeFunctionData('publish', [
+          p,
+        ]);
+        await mock.arm(publishCalldata);
+
+        // Drive the outer publish from the mock. The mint callback re-enters,
+        // the inner call reverts with `ReentrancyGuardReentrantCall()`, the
+        // mock captures the selector and sets `reentryRejected`, then
+        // returns the success magic value so the outer call completes.
+        await mock.callKAV10(publishCalldata);
+
+        expect(await mock.reentryAttempted()).to.equal(true);
+        expect(await mock.reentryRejected()).to.equal(true);
+        // 0x3ee5aeb5 == bytes4(keccak256("ReentrancyGuardReentrantCall()"))
+        expect(await mock.lastInnerSelector()).to.equal('0x3ee5aeb5');
+      });
+
+      // --------------------------------------------------------------------
+      // T-HARDEN.4: nonReentrant on `update`. The update path mints
+      // `mintKnowledgeAssetsAmount` ERC-1155Delta tokens to `msg.sender`
+      // (the publisher of record). When the publisher is a contract,
+      // the mint dispatches `onERC1155BatchReceived` to it — exactly
+      // the same receiver-callback surface `publish` exercises in
+      // T-HARDEN.3. This test pins that the `nonReentrant` modifier on
+      // `update` rejects a callback-driven re-entry with the same
+      // `ReentrancyGuardReentrantCall()` selector.
+      //
+      // Setup steps:
+      //   1. Deploy the mock with empty `innerCalldata` so the mint
+      //      callback during the BASELINE publish is a no-op.
+      //   2. Publish a KC from the mock (mock becomes publisher of
+      //      record). The OPEN-CG update auth gate keys on the
+      //      original publisher, so the mock can subsequently update.
+      //   3. Arm the mock with an update payload (resets all re-entry
+      //      flags) and have the mock drive the outer update from its
+      //      own storage context.
+      //   4. The outer update mints again to the mock, the mint
+      //      callback fires, the mock re-enters `update`, the
+      //      `nonReentrant` modifier fires BEFORE any
+      //      signature/ACK/byte-size validation runs and reverts with
+      //      `ReentrancyGuardReentrantCall()`. The mock captures the
+      //      selector and returns the ERC-1155 success magic value so
+      //      the outer update completes.
+      // --------------------------------------------------------------------
+      it('update reverts ReentrancyGuardReentrantCall when re-entered from the ERC-1155 mint callback', async () => {
+        const creator = getDefaultKCCreator(accounts);
+        const nodes = await setupNodes();
+        const cgId = await createOpenCG(creator);
+
+        const Mock = await hre.ethers.getContractFactory(
+          'MockReentrantPublisher',
+        );
+        const mock = await Mock.deploy();
+        const mockAddr = await mock.getAddress();
+        await mock.setKAV10(kav10Address);
+
+        const baselineTokenAmount = ethers.parseEther('100');
+        const deltaTokenAmount = ethers.parseEther('50');
+        const totalTracForMock = baselineTokenAmount + deltaTokenAmount;
+
+        // Fund + approve once, covers both the baseline publish and the
+        // post-publish update delta.
+        await TokenContract.connect(accounts[0]).transfer(
+          mockAddr,
+          totalTracForMock,
+        );
+        await mock.approveTrac(
+          await TokenContract.getAddress(),
+          totalTracForMock,
+        );
+
+        // Step 2: clean baseline publish (no re-entry — innerCalldata
+        // is still the empty default, so `_maybeReenter` short-circuits
+        // on the mint callback).
+        const publishParams = await buildPublishParams({
+          chainId,
+          kav10Address,
+          receivingNodes: nodes.receivingNodes,
+          publisherIdentityId: nodes.publisherIdentityId,
+          receiverIdentityIds: nodes.receiverIdentityIds,
+          author: creator,
+          contextGraphId: cgId,
+          merkleRoot: ethers.keccak256(ethers.toUtf8Bytes('t-harden-4-root')),
+          knowledgeAssetsAmount: 10,
+          byteSize: 1000,
+          epochs: 5,
+          tokenAmount: baselineTokenAmount,
+          isImmutable: false,
+          publishOperationId: 't-harden-4-publish-op',
+        });
+        const publishCalldata = KAV10.interface.encodeFunctionData('publish', [
+          publishParams,
+        ]);
+        await mock.callKAV10(publishCalldata);
+
+        // Sanity: the baseline publish must have completed cleanly —
+        // no spurious re-entry recorded.
+        expect(await mock.reentryAttempted()).to.equal(false);
+        expect(await mock.reentryRejected()).to.equal(false);
+
+        const kcId = 1n;
+
+        // Step 3: build update params for the KC the mock just
+        // published. `preUpdateMerkleRootCount: 1n` because a fresh
+        // publish lays down exactly one merkle root. The author field
+        // in `buildUpdateParams` is irrelevant on the V10.1 update
+        // path (no per-update author signature yet — see the
+        // `_executeUpdateCore` NatSpec).
+        const updateParams = await buildUpdateParams({
+          chainId,
+          kav10Address,
+          receivingNodes: nodes.receivingNodes,
+          publisherIdentityId: nodes.publisherIdentityId,
+          receiverIdentityIds: nodes.receiverIdentityIds,
+          contextGraphId: cgId,
+          id: kcId,
+          preUpdateMerkleRootCount: 1n,
+          newMerkleRoot: ethers.keccak256(
+            ethers.toUtf8Bytes('t-harden-4-update-root'),
+          ),
+          newByteSize: 1000,
+          newTokenAmount: baselineTokenAmount + deltaTokenAmount,
+          mintKnowledgeAssetsAmount: 1n, // > 0 so the mint callback fires
+          knowledgeAssetsToBurn: [],
+          updateOperationId: 't-harden-4-update-op',
+        });
+
+        const updateCalldata = KAV10.interface.encodeFunctionData('update', [
+          updateParams,
+        ]);
+        await mock.arm(updateCalldata);
+
+        // Step 4: outer update. The mint callback fires, the mock
+        // re-enters with the same `update(...)` calldata, the inner
+        // call reverts `ReentrancyGuardReentrantCall()` (the modifier
+        // runs BEFORE any ACK / signature / byte-size validation), the
+        // mock captures the selector, returns the ERC-1155 success
+        // magic value, and the outer update completes.
+        await mock.callKAV10(updateCalldata);
+
+        expect(await mock.reentryAttempted()).to.equal(true);
+        expect(await mock.reentryRejected()).to.equal(true);
+        // 0x3ee5aeb5 == bytes4(keccak256("ReentrancyGuardReentrantCall()"))
+        expect(await mock.lastInnerSelector()).to.equal('0x3ee5aeb5');
+      });
+    });
   });
 });

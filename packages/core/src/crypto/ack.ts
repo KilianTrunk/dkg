@@ -121,6 +121,35 @@ function uint72ToBytes(value: bigint): Uint8Array {
 }
 
 /**
+ * Strict-positive `tokenAmount` floor applied at every off-chain boundary
+ * that hashes or sends a V10 publish/update payload.
+ *
+ * KAV10 10.1.1 added a `tokenAmount > 0` check inside `_validateTokenAmount`,
+ * so `0n` is now an unconditional contract revert. Pre-10.1.1, the contract
+ * silently rounded a 0-cost publish up to 1 wei-TRAC inside the direct-spend
+ * branch (`transferFrom(..., 1n)`); free-publish flows on devnets where
+ * `ask == 0` relied on that round-up. To keep those flows working without
+ * loosening the 10.1.1 hardening, the off-chain stack floors `tokenAmount`
+ * to `1n` at two boundaries:
+ *
+ *   1. Here, inside the canonical ACK-digest helpers, so every signer hashes
+ *      the same value the chain will later see in `_executePublishCore` /
+ *      `_executeUpdateCore`. Without the floor, an ACK signed over a `0n`
+ *      digest would be unverifiable against the on-chain payload (which
+ *      now carries `1n`).
+ *   2. Inside `evm-adapter.ts` at the publish/update struct construction
+ *      site, so the on-chain `_validateTokenAmount` floor is never tripped
+ *      by an integrator who somehow bypasses the digest helpers.
+ *
+ * The clamp is intentionally only `0n → 1n`; non-zero amounts pass through
+ * untouched so the existing `tokenAmount < expectedTokenAmount` check still
+ * fires for under-paid publishes.
+ */
+export function floorPublishTokenAmount(tokenAmount: bigint): bigint {
+  return tokenAmount > 0n ? tokenAmount : 1n;
+}
+
+/**
  * Compute the V10 publish ACK digest that each receiving core node signs.
  *
  * Layout matches `KnowledgeAssetsV10.sol` `_executePublishCore` exactly:
@@ -143,6 +172,10 @@ function uint72ToBytes(value: bigint): Uint8Array {
  * H5 closure: the leading (chainid, kav10Address) prefix pins signatures to
  * this chain and this contract. Replay across chains / forks / contract
  * redeployments is rejected at signature verification.
+ *
+ * KAV10 10.1.1: `tokenAmount` is run through {@link floorPublishTokenAmount}
+ * so a free-publish flow (`tokenAmount === 0n`) hashes the same `1n` value
+ * the adapter sends on-chain.
  */
 export function computePublishACKDigest(
   chainId: bigint,
@@ -159,6 +192,7 @@ export function computePublishACKDigest(
     throw new Error(`merkleRoot must be 32 bytes, got ${merkleRoot.length}`);
   }
   const addrBytes = addressToBytes(kav10Address);
+  const flooredTokenAmount = floorPublishTokenAmount(tokenAmount);
 
   const packed = new Uint8Array(276);
   let offset = 0;
@@ -169,7 +203,7 @@ export function computePublishACKDigest(
   packed.set(uint256ToBytes(kaCount), offset); offset += 32;
   packed.set(uint256ToBytes(byteSize), offset); offset += 32;
   packed.set(uint256ToBytes(epochs), offset); offset += 32;
-  packed.set(uint256ToBytes(tokenAmount), offset); offset += 32;
+  packed.set(uint256ToBytes(flooredTokenAmount), offset); offset += 32;
   packed.set(uint256ToBytes(merkleLeafCount), offset); offset += 32;
 
   return keccak256(packed);
@@ -227,6 +261,8 @@ export function computeUpdateACKDigest(
     throw new Error(`newMerkleRoot must be 32 bytes, got ${newMerkleRoot.length}`);
   }
   const addrBytes = addressToBytes(kav10Address);
+  // KAV10 10.1.1 — same floor as publish; see floorPublishTokenAmount.
+  const flooredNewTokenAmount = floorPublishTokenAmount(newTokenAmount);
 
   // keccak256(abi.encodePacked(burnTokenIds))
   const burnPacked = new Uint8Array(burnTokenIds.length * 32);
@@ -245,7 +281,7 @@ export function computeUpdateACKDigest(
   packed.set(uint256ToBytes(preUpdateMerkleRootCount), offset); offset += 32;
   packed.set(newMerkleRoot, offset); offset += 32;
   packed.set(uint256ToBytes(newByteSize), offset); offset += 32;
-  packed.set(uint256ToBytes(newTokenAmount), offset); offset += 32;
+  packed.set(uint256ToBytes(flooredNewTokenAmount), offset); offset += 32;
   packed.set(uint256ToBytes(mintAmount), offset); offset += 32;
   packed.set(burnHash, offset); offset += 32;
   packed.set(uint256ToBytes(newMerkleLeafCount), offset); offset += 32;

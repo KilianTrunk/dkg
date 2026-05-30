@@ -3026,7 +3026,7 @@ export class EVMChainAdapter implements ChainAdapter {
 
     if (!params.authorAddress || !params.authorR?.length || !params.authorVS?.length) {
       throw new Error(
-        'updateKnowledgeCollectionV10 requires authorAddress, authorR, and authorVS from precomputedUpdateAttestation',
+        'updateKnowledgeAssets requires authorAddress, authorR, and authorVS from precomputedUpdateAttestation',
       );
     }
 

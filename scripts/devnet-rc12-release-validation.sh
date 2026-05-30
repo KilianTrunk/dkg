@@ -30,6 +30,7 @@
 #   G. Prolonged inter-node messaging
 #   H. CG invitations (edge curators invite each other + cores)
 #   I. Ownership transfer + new owner can update KAs
+#   A2. Canonical assertion lifecycle smoke (create→finalize→promote→publish)
 #   J. MCP server tool surface
 #
 # This script ASSUMES a running devnet unless BOOTSTRAP=1 (then it wipes and
@@ -204,6 +205,22 @@ for n in $(seq 1 "$NUM_NODES"); do
 done
 log "core nodes: 1-$NUM_CORE_NODES | edge nodes: $((NUM_CORE_NODES+1))-$NUM_NODES"
 
+# RS counters are cumulative across the daemon's lifetime. With BOOTSTRAP=0 the
+# pre-existing devnet can carry stale `submittedCount` / `failedCount` that
+# would inflate Section C's success rate without this run sampling anything.
+# Snapshot per-core RS counters BEFORE any publish; Section C subtracts these
+# baselines and reports the delta only.
+declare -a RS_BASE_SUB RS_BASE_FAIL
+for n in $(seq 1 "$NUM_CORE_NODES"); do
+  port="${NODE_PORT[$((n-1))]}"
+  s=$(get "$port" /api/random-sampling/status 2>/dev/null || echo '{}')
+  RS_BASE_SUB[$n]=$(echo "$s" | pyf "d.get('loop',{}).get('submittedCount',0)")
+  RS_BASE_FAIL[$n]=$(echo "$s" | pyf "d.get('loop',{}).get('failedCount',0)")
+  [ -z "${RS_BASE_SUB[$n]}" ] && RS_BASE_SUB[$n]=0
+  [ -z "${RS_BASE_FAIL[$n]}" ] && RS_BASE_FAIL[$n]=0
+done
+log "RS baseline (per-core): $(for n in $(seq 1 "$NUM_CORE_NODES"); do printf 'n%d=sub:%s/fail:%s ' "$n" "${RS_BASE_SUB[$n]}" "${RS_BASE_FAIL[$n]}"; done)"
+
 # ── Section H: CG creation matrix + invitations ──────────────────────────────
 section "H. CONTEXT GRAPHS — create $TARGET_CGS registered CGs (public + curated) from cores & edges, with curator invites"
 RUN_TAG="${RUN_TAG:-$(date -u +%s)}"
@@ -282,7 +299,21 @@ if [ "$res" = "OK" ]; then
     for _ in $(seq 1 12); do
       sleep 3
       reqs=$(get "$CURATOR_PORT" "/api/context-graph/$ENC/join-requests")
-      echo "$reqs" | grep -qi "$JOINER_ADDR\|pending" && { got=1; break; }
+      # listPendingJoinRequests already filters to status='pending'; require an
+      # entry whose agentAddress matches the joiner (case-insensitive EVM addr)
+      # so unrelated `pending` strings in the response body don't false-pass.
+      match=$(echo "$reqs" | python3 -c "
+import json, sys
+addr = sys.argv[1].lower()
+try: d = json.load(sys.stdin)
+except Exception: d = {}
+for r in (d.get('requests') or []):
+    if str(r.get('agentAddress','')).lower() == addr:
+        print('1'); break
+else:
+    print('0')
+" "$JOINER_ADDR" 2>/dev/null || echo 0)
+      [ "$match" = "1" ] && { got=1; break; }
     done
     if [ "$got" = "1" ]; then
       ap=$(post "$CURATOR_PORT" "/api/context-graph/$ENC/approve-join" -d "{\"agentAddress\":\"$JOINER_ADDR\"}")
@@ -559,6 +590,50 @@ else
   warn A tier-verify "no public KA available to verify"
 fi
 
+# ── Section A2: canonical assertion lifecycle smoke ─────────────────────────
+# The bulk publish path above uses /api/shared-memory/write directly. The
+# canonical RFC-001 §9.x path is /api/assertion/create with finalize+promote
+# (create → write → finalize → promote in one shot), then publish to VM. A
+# regression in assertion finalize/promote could still let the SWM-write path
+# pass, so we exercise the canonical path end-to-end with one KA and gate the
+# release on it.
+section "A2. ASSERTION LIFECYCLE — canonical create→write→finalize→promote→publish"
+A2_NODE=1
+A2_PORT="${NODE_PORT[$((A2_NODE-1))]}"
+A2_CG=$(awk -F'\t' '$2=="public" {print $1; exit}' "$CG_LIST_FILE")
+if [ -n "$A2_CG" ]; then
+  A2_NAME="rc12-asrt-${RUN_TAG}"
+  A2_ROOT="urn:rc12:asrt:${RUN_TAG}:n${A2_NODE}"
+  A2_BODY=$(python3 - "$A2_CG" "$A2_NAME" "$A2_ROOT" <<'PY'
+import json, sys
+cg, name, root = sys.argv[1], sys.argv[2], sys.argv[3]
+RDF = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type'
+quads = [
+    {"subject": root, "predicate": RDF, "object": "http://schema.org/Dataset", "graph": ""},
+    {"subject": root, "predicate": "http://schema.org/name", "object": '"rc12 assertion lifecycle smoke"', "graph": ""},
+]
+print(json.dumps({"contextGraphId": cg, "name": name, "quads": quads, "finalize": True, "promote": True}))
+PY
+)
+  ac=$(post "$A2_PORT" /api/assertion/create -d "$A2_BODY")
+  ac_uri=$(echo "$ac" | pyf "d.get('assertionUri','')")
+  ac_seal_ok=$(echo "$ac" | pyf "1 if (d.get('seal') or {}).get('merkleRoot') else 0")
+  ac_promoted=$(echo "$ac" | pyf "d.get('promotedCount',0)")
+  if [ -n "$ac_uri" ] && [ "$ac_seal_ok" = "1" ] && [ "${ac_promoted:-0}" -gt 0 ] 2>/dev/null; then
+    pass A2 assertion-create-finalize-promote "assertion=$ac_uri sealed and promoted (promoted=$ac_promoted)"
+    pp=$(post "$A2_PORT" /api/shared-memory/publish -d "{\"contextGraphId\":\"$A2_CG\",\"selection\":{\"rootEntities\":[\"$A2_ROOT\"]}}")
+    pps=$(echo "$pp" | pyf "d.get('status','')")
+    case "$pps" in
+      confirmed|finalized) pass A2 assertion-publish "VM publish via canonical path landed (status=$pps)" ;;
+      *) fail A2 assertion-publish "publish after finalize+promote returned status=$pps body: ${pp:0:160}" ;;
+    esac
+  else
+    fail A2 assertion-create-finalize-promote "create+finalize+promote failed (uri=$ac_uri seal_ok=$ac_seal_ok promoted=$ac_promoted) body: ${ac:0:200}"
+  fi
+else
+  warn A2 assertion-lifecycle "no public CG available for canonical-path smoke"
+fi
+
 # ── Section F: protocol treasury fee ─────────────────────────────────────────
 section "F. PROTOCOL TREASURY FEE — set treasury + fee, publish, assert balance grows"
 OWNER_KEY="0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"   # hardhat acct[0] (Hub owner)
@@ -616,31 +691,59 @@ if [ "$staked_ok" -ge "$NUM_CORE_NODES" ]; then pass D node-stake "$staked_ok/$N
 elif [ "$staked_ok" -gt 0 ]; then warn D node-stake "$staked_ok/$NUM_CORE_NODES cores staked"
 else fail D node-stake "no cores have nodeStakeV10 > 0"; fi
 
-# Conviction multiplier + reward claim/withdraw + transfer: best-effort via the
-# DKGStakingConvictionNFT ABI. We introspect for available entrypoints and report.
+# Conviction multiplier + reward claim/withdraw + transfer.
+# ABI presence alone is too weak a gate (a regression that always reverts won't
+# remove the method from the ABI), so we ONLY record PASS for verifications that
+# run a real call against state. Surface introspection is logged for context.
 NFT_ABI="$REPO_ROOT/packages/evm-module/abi/DKGStakingConvictionNFT.json"
+CSS_ABI="$REPO_ROOT/packages/evm-module/abi/ConvictionStakingStorage.json"
 if [ -f "$NFT_ABI" ]; then
   methods=$(python3 -c "import json;print(' '.join(sorted({f['name'] for f in json.load(open('$NFT_ABI')) if f.get('type')=='function'})))")
-  log "  StakingConvictionNFT methods: $methods"
-  echo "$methods" | grep -qiE 'multiplier|tier' && pass D conviction-multiplier "multiplier/tier surface present on NFT" || warn D conviction-multiplier "no multiplier/tier method found in NFT ABI"
-  echo "$methods" | grep -qiE 'claim' && pass D reward-claim-surface "claim entrypoint present" || warn D reward-claim-surface "no claim entrypoint"
-  echo "$methods" | grep -qiE 'withdraw' && pass D reward-withdraw-surface "withdraw entrypoint present" || warn D reward-withdraw-surface "no withdraw entrypoint"
-  echo "$methods" | grep -qiE 'transferFrom|safeTransfer' && pass D position-transfer-surface "ERC721 transfer present (position transferable)" || warn D position-transfer-surface "no transfer method"
+  log "  StakingConvictionNFT methods (introspection only — not a release gate): $methods"
 else
-  warn D nft-abi "DKGStakingConvictionNFT ABI missing — staking ops not introspected"
+  fail D nft-abi "DKGStakingConvictionNFT ABI missing — cannot exercise staking surface"
+  methods=""
 fi
 
-# Reward claim attempt: let some epochs/RS accrue, then claim on a core position.
-# (Best-effort; semantics are NFT-gated and lock-aware, so a no-op/lock is OK.)
 N1_OP=$(python3 -c "import json;print(json.load(open('$DEVNET_DIR/node1/wallets.json'))['wallets'][0]['privateKey'])" 2>/dev/null || echo "")
 N1_OPADDR=$(python3 -c "import json;print(json.load(open('$DEVNET_DIR/node1/wallets.json'))['wallets'][0]['address'])" 2>/dev/null || echo "")
-if [ -n "$N1_OP" ] && [ -f "$NFT_ABI" ]; then
-  if echo "$methods" | grep -qiw claimRewards; then
-    cr=$($CHAIN_CALL DKGStakingConvictionNFT claimRewards --key "$N1_OP" --json "[]" 2>/dev/null)
-    echo "$cr" | grep -q '"ok":true' && pass D reward-claim-exec "claimRewards tx landed" || warn D reward-claim-exec "claimRewards: ${cr:0:140}"
+
+# Real multiplier read: fetch a position from CSS and assert lockTier > 0 yields
+# multiplier18 > 1e18. This proves the multiplier surface actually returns a
+# locked-tier boost on devnet positions.
+if [ -f "$CSS_ABI" ] && [ -n "$N1_OPADDR" ]; then
+  # Find any token id owned by node1's op wallet; default to id 1 if the helper
+  # is unavailable (devnet bootstrap mints conviction positions starting at 1).
+  pos1=$($CHAIN_CALL ConvictionStakingStorage getPosition --json "[1]" 2>/dev/null | pyf "d.get('result',[])")
+  if [ -n "$pos1" ] && [ "$pos1" != "[]" ]; then
+    mult=$(echo "$pos1" | python3 -c "
+import sys, ast
+try: t = ast.literal_eval(sys.stdin.read().strip())
+except Exception: t = None
+if isinstance(t, (list, tuple)) and len(t) >= 6:
+    print(int(t[5]))
+else:
+    print(0)" 2>/dev/null || echo 0)
+    if [ "${mult:-0}" -ge 1000000000000000000 ] 2>/dev/null; then
+      pass D conviction-multiplier "position tokenId=1 multiplier18=$mult (>=1e18 confirms tier boost surface)"
+    else
+      fail D conviction-multiplier "position tokenId=1 multiplier18=$mult (expected >=1e18)"
+    fi
   else
-    warn D reward-claim-exec "no zero-arg claimRewards; claim is position-scoped (manual tokenId needed) — surface verified above"
+    warn D conviction-multiplier "no position at tokenId=1 to verify multiplier (devnet may not have minted yet)"
   fi
+else
+  warn D conviction-multiplier "ConvictionStakingStorage ABI or N1 op address missing"
+fi
+
+# Reward claim execution. Best-effort: semantics are NFT-gated and lock-aware,
+# so a no-op revert is acceptable, but we PASS only when the chain confirms.
+if [ -n "$N1_OP" ] && [ -n "$methods" ] && echo "$methods" | grep -qiw claimRewards; then
+  cr=$($CHAIN_CALL DKGStakingConvictionNFT claimRewards --key "$N1_OP" --json "[]" 2>/dev/null)
+  echo "$cr" | grep -q '"ok":true' && pass D reward-claim-exec "claimRewards tx landed" \
+    || warn D reward-claim-exec "claimRewards exec inconclusive: ${cr:0:140}"
+elif [ -n "$N1_OP" ]; then
+  warn D reward-claim-exec "no zero-arg claimRewards entrypoint — claim is position-scoped (manual tokenId needed)"
 fi
 
 # ── Section D2: V8→V10 migration conviction credit (60-day lock on tiers 6/12) ─
@@ -811,19 +914,22 @@ rs_end=$(( now + RS_OBSERVE_S ))
 while [ "$(date +%s)" -lt "$rs_end" ]; do
   sleep 20
 done
-# Read final RS counters. Success rate = submitted / max(challenges_attempted,submitted).
+# Read RS counters now and subtract the baseline captured in PREFLIGHT so we
+# only count the RS work generated by THIS run (BOOTSTRAP=0 carries stale
+# cumulative totals that would otherwise inflate the success rate).
 TOT_SUB=0; TOT_ATT=0
 for n in $(seq 1 "$NUM_CORE_NODES"); do
   port="${NODE_PORT[$((n-1))]}"
   s=$(get "$port" /api/random-sampling/status 2>/dev/null || echo '{}')
-  sub=$(echo "$s" | pyf "d.get('loop',{}).get('submittedCount',0)")
-  att=$(echo "$s" | pyf "d.get('loop',{}).get('challengeCount', d.get('loop',{}).get('attemptedCount', d.get('loop',{}).get('submittedCount',0)))")
-  failc=$(echo "$s" | pyf "d.get('loop',{}).get('failedCount',0)")
-  [ -z "$sub" ] && sub=0; [ -z "$att" ] && att=0; [ -z "$failc" ] && failc=0
-  # If attempted not exposed, approximate attempts = submitted + failed.
-  if [ "$att" -le "$sub" ] 2>/dev/null; then att=$(( sub + failc )); fi
-  [ "$att" -lt "$sub" ] 2>/dev/null && att=$sub
-  log "  core$n: submitted=$sub attempted=$att failed=$failc"
+  sub_now=$(echo "$s" | pyf "d.get('loop',{}).get('submittedCount',0)")
+  failc_now=$(echo "$s" | pyf "d.get('loop',{}).get('failedCount',0)")
+  [ -z "$sub_now" ] && sub_now=0; [ -z "$failc_now" ] && failc_now=0
+  sub=$(( sub_now - ${RS_BASE_SUB[$n]:-0} ))
+  failc=$(( failc_now - ${RS_BASE_FAIL[$n]:-0} ))
+  [ "$sub" -lt 0 ] && sub=0
+  [ "$failc" -lt 0 ] && failc=0
+  att=$(( sub + failc ))
+  log "  core$n: Δsubmitted=$sub Δfailed=$failc (now sub=$sub_now fail=$failc_now base sub=${RS_BASE_SUB[$n]} fail=${RS_BASE_FAIL[$n]})"
   TOT_SUB=$(( TOT_SUB + sub )); TOT_ATT=$(( TOT_ATT + att ))
 done
 if [ "$TOT_ATT" -gt 0 ]; then

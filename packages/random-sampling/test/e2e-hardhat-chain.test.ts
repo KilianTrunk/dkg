@@ -102,16 +102,18 @@ describe('Random Sampling E2E (Hardhat)', () => {
       coreOpWallet.address,
       ethers.parseEther('50000000'),
     );
+    // `spawnHardhatEnv` (in `chain/test/hardhat-harness.ts`) already
+    // runs `stakeAndSetAsk` for CORE_OP, REC1..REC3 before this test
+    // file imports its harness module. Calling it again here re-fires
+    // `Profile.updateAsk` for each receiver, which reverts with
+    // `AskUpdateOnCooldown(uint72,uint256)` (selector `0x89b136e5`)
+    // because the previous `updateAsk` from globalSetup is still inside
+    // its cooldown window. The receivers already have 50000 TRAC
+    // staked + ask=1 set — that's enough to make them valid sharding-
+    // table ACK signers and to trigger weighted CG selection. We only
+    // need to bump the global ACK quorum from the harness default of 1
+    // up to 3 so this test exercises the multi-signer ACK path.
     const recOpKeys = [HARDHAT_KEYS.REC1_OP, HARDHAT_KEYS.REC2_OP, HARDHAT_KEYS.REC3_OP];
-    for (let i = 0; i < ctx.receiverIds.length; i++) {
-      await stakeAndSetAsk(
-        provider,
-        ctx.hubAddress,
-        HARDHAT_KEYS.DEPLOYER,
-        recOpKeys[i]!,
-        ctx.receiverIds[i]!,
-      );
-    }
     await setMinimumRequiredSignatures(provider, ctx.hubAddress, HARDHAT_KEYS.DEPLOYER, 3);
 
     // 2. Create an on-chain context graph. The system-wide ACK quorum

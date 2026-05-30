@@ -963,8 +963,9 @@ if [ -n "$OREC" ]; then
   # InvalidTokenAmount(1,0). The transfer leg is the actual release-gate
   # behaviour for ownership; verifying "the new owner can publish" requires
   # a daemon-side fix (compute `newTokenAmount = currentTokenAmount + cost(byteSizeGrowth, remainingEpochs)`)
-  # that is out of scope for this harness. See product issue tracking — once
-  # the daemon is fixed, promote this back to fail-on-non-confirmed.
+  # that is out of scope for this harness. Tracked at
+  # https://github.com/OriginTrail/dkg/issues/831 — once the daemon is fixed,
+  # promote this back to fail-on-non-confirmed.
   if [ "$xfer_ok" = "1" ]; then
     nuri="${oroot}/owner2"
     oquads="[{\"subject\":\"$nuri\",\"predicate\":\"http://www.w3.org/1999/02/22-rdf-syntax-ns#type\",\"object\":\"http://schema.org/UpdateAction\",\"graph\":\"\"},{\"subject\":\"$nuri\",\"predicate\":\"http://schema.org/name\",\"object\":\"\\\"owner2-upd\\\"\",\"graph\":\"\"}]"

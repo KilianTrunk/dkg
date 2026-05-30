@@ -5,12 +5,18 @@ export class LeftPanelPage {
   readonly page: Page;
   readonly root: Locator;
   readonly newProjectBtn: Locator;
+  readonly joinProjectBtn: Locator;
   readonly oraclePlaceholder: Locator;
 
   constructor(page: Page) {
     this.page = page;
     this.root = page.locator(sel.leftPanel.root).first();
-    this.newProjectBtn = page.locator(sel.leftPanel.newProjectBtn);
+    // rc11 renamed "+ New Project" -> "+ New Context Graph". The button
+    // class (`.v10-new-project-btn`) was kept for backwards-compat but
+    // is now shared with "↗ Join Context Graph", so each handle filters
+    // by visible label to disambiguate.
+    this.newProjectBtn = this.root.locator(sel.leftPanel.newProjectBtn).filter({ hasText: /New Context Graph/i });
+    this.joinProjectBtn = this.root.locator(sel.leftPanel.newProjectBtn).filter({ hasText: /Join Context Graph/i });
     this.oraclePlaceholder = page.locator(sel.leftPanel.oraclePlaceholder);
   }
 
@@ -44,6 +50,8 @@ export class LeftPanelPage {
   }
 
   async switchToMode(mode: 'explorer' | 'oracle') {
+    // rc11 renamed mode tab "Projects" -> "Context Graphs"; the underlying
+    // store value `treeMode` is still 'explorer'/'oracle'.
     const label = mode === 'explorer' ? 'Context Graphs' : 'Context Oracle';
     await this.root.locator(sel.leftPanel.modeBtn).filter({ hasText: label }).click();
   }
@@ -61,6 +69,17 @@ export class LeftPanelPage {
     await this.myCgSections().locator(sel.leftPanel.sectionLabel).first().waitFor({ state: 'visible', timeout: 15_000 });
   }
 
+  async clickJoinProject() {
+    await this.joinProjectBtn.first().click();
+  }
+
+  /**
+   * Returns the names of every context graph rendered under the
+   * "My Context Graphs" peer-group. Each CG row is a
+   * `.v10-tree-section > .v10-tree-section-header > .v10-tree-section-label`;
+   * scoping the locator to `.v10-peer-group-body` keeps us from picking
+   * up the parent peer-group label or the Integrations section.
+   */
   async getProjectNames() {
     await this.waitForProjectsLoaded();
     const labels = this.myCgSections().locator(sel.leftPanel.sectionLabel);
@@ -79,6 +98,27 @@ export class LeftPanelPage {
       .locator(sel.leftPanel.sectionHeader)
       .filter({ hasText: name })
       .click();
+  }
+
+  /**
+   * Click a context-graph header. In rc11 this opens the project tab in
+   * the centre panel; the inline "expand to see memory layers" gesture
+   * was removed (memory layers live inside the project view's
+   * LayerSwitcher now).
+   */
+  async clickProject(name: string) {
+    const section = this.root.locator(sel.leftPanel.section).filter({ hasText: name }).first();
+    await section.locator(sel.leftPanel.sectionHeader).first().click();
+  }
+
+  /**
+   * Click the inline `×` next to a CG row, which hides the CG from the
+   * sidebar (reversibly — a "↺ Show N hidden context graphs" button
+   * appears underneath the list while any are hidden).
+   */
+  async hideProject(name: string) {
+    const section = this.root.locator(sel.leftPanel.section).filter({ hasText: name }).first();
+    await section.locator(sel.leftPanel.sectionHeader).first().getByRole('button', { name: '×' }).click();
   }
 
   async clickLayer(projectName: string, layer: 'wm' | 'swm' | 'vm' | 'import') {

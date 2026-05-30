@@ -294,7 +294,7 @@ describe('chain-lifecycle-extra — V10 lifecycle + adapter invariants', () => {
 
       // Grow byteSize from 256 -> 1024. Critically: DO NOT pass `newTokenAmount` —
       // the adapter must derive it from the contract's growth-cost formula.
-      const updateResult = await adapter.updateKnowledgeAssets({
+      const updateResult = await adapter.updateKnowledgeCollectionV10({
         kaId,
         newMerkleRoot,
         newByteSize: 1024n,

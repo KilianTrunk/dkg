@@ -2883,6 +2883,12 @@ export class EVMChainAdapter implements ChainAdapter {
     }
 
     let currentEpoch = 0n;
+    const needsGrowthSizing = params.newByteSize > currentByteSize;
+    if (needsGrowthSizing && !this.contracts.chronos) {
+      throw new Error(
+        'Chronos contract binding required for byte-size growth update tokenAmount sizing',
+      );
+    }
     if (this.contracts.chronos) {
       try {
         currentEpoch = BigInt(await this.contracts.chronos.getCurrentEpoch());
@@ -2937,6 +2943,8 @@ export class EVMChainAdapter implements ChainAdapter {
     mintAmount?: bigint;
     burnTokenIds?: bigint[];
     newTokenAmount?: bigint;
+    /** When set, skip live re-derivation (binds ACK digest to tx submission). */
+    boundNewTokenAmount?: bigint;
     newCiphertextChunksRoot?: Uint8Array;
     newCiphertextChunkCount?: number;
   }): Promise<Uint8Array> {
@@ -2956,7 +2964,7 @@ export class EVMChainAdapter implements ChainAdapter {
     // floor that lived here is now redundant — `computeUpdateNewTokenAmount`
     // returns `currentTokenAmount + growthCost` (with growthCost == 0 for
     // pure metadata updates), which is always >= 1 on a V10 chain.
-    const newTokenAmount = await this.computeUpdateNewTokenAmount({
+    const newTokenAmount = params.boundNewTokenAmount ?? await this.computeUpdateNewTokenAmount({
       kaId: params.kaId,
       newByteSize: params.newByteSize,
       currentTokenAmount,
@@ -3056,11 +3064,11 @@ export class EVMChainAdapter implements ChainAdapter {
     // exact marginal growth cost so the validator's expected-cost branch is
     // satisfied without overshooting.
     //
-    // The old `floorPublishTokenAmount` clamp on the publish-flooring helper
-    // is intentionally NOT applied here: this update path floors to
-    // `currentTokenAmount + growthCost`, which on any V10 KA is already >= 1.
-    // The redundant publish-time floor removal is still tracked separately at
-    // issue #803 (post-testnet follow-up).
+    // The old `floorPublishTokenAmount` clamp is applied INSIDE
+    // `computeUpdateNewTokenAmount` (see r5 in #833) so the ACK digest and the
+    // tx submission below bind the same wire value. Any caller passing a
+    // `boundNewTokenAmount` for an ACK already-signed digest is honoured here
+    // to keep digest-bound updates byte-identical to what the signer saw.
     const newTokenAmount = await this.computeUpdateNewTokenAmount({
       kaId: params.kaId,
       newByteSize: params.newByteSize,
@@ -3104,6 +3112,7 @@ export class EVMChainAdapter implements ChainAdapter {
         mintAmount: params.mintAmount !== undefined ? BigInt(params.mintAmount) : undefined,
         burnTokenIds: burnIds,
         newTokenAmount: params.newTokenAmount,
+        boundNewTokenAmount: newTokenAmount,
         newCiphertextChunksRoot: params.newCiphertextChunksRoot,
         newCiphertextChunkCount: params.newCiphertextChunkCount,
       });

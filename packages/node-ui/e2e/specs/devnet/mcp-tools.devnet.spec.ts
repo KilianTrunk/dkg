@@ -47,4 +47,18 @@ test.describe('MCP server tools (devnet API smoke)', () => {
     expect(Array.isArray(json.result?.bindings)).toBe(true);
     expect(json.result!.bindings!.length).toBeGreaterThan(0);
   });
+
+  test('context graph manifest endpoint responds', async () => {
+    const cgs = await devnetApiFetch('/api/context-graphs');
+    const { contextGraphs } = (await cgs.json()) as { contextGraphs: Array<{ id: string }> };
+    test.skip(contextGraphs.length === 0, 'No CGs');
+    const cgId = contextGraphs[0]!.id;
+    const res = await devnetApiFetch(`/api/context-graph/${encodeURIComponent(cgId)}/manifest`);
+    expect([200, 404]).toContain(res.status);
+  });
+
+  test('gossip log surface is reachable via node log API', async () => {
+    const res = await devnetApiFetch('/api/node-log?limit=5');
+    expect([200, 404]).toContain(res.status);
+  });
 });

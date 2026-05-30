@@ -159,9 +159,9 @@ describe('V10 E2E Conviction System', function () {
   //   7. KC registered in KCS with msg.sender as the publisher of record
   //      (commit 41be7c71 — KA tokens minted to the paying agent, so the
   //      N16 ERC-1155 balanceOf gate works on follow-up updates)
-  //   8. Atomic CG binding via ContextGraphs.registerKnowledgeCollection
-  //      (kcToContextGraph[kcId] == cgId, contextGraphKCList[cgId] includes
-  //      kcId) (N20)
+  //   8. Atomic CG binding via ContextGraphs.registerKnowledgeAsset
+  //      (kaToContextGraph[kaId] == cgId, contextGraphKCList[cgId] includes
+  //      kaId) (N20)
   //   9. CG value ledger written via
   //      ContextGraphValueStorage.addCGValueForEpochRange (N20, Phase 1)
   //  10. Active-sink distribution: `TokensAddedToEpochRange` events
@@ -409,8 +409,8 @@ describe('V10 E2E Conviction System', function () {
       void kav10AddrLower;
 
       // ---- Step 7: KC registered in KCS; publisher of record is msg.sender ----
-      const kcId = 1n;
-      const meta = await DKGKnowledgeAssets.getKnowledgeCollectionMetadata(kcId);
+      const kaId = 1n;
+      const meta = await DKGKnowledgeAssets.getKnowledgeAssetMetadata(kaId);
       // meta[3] = byteSize, meta[4] = startEpoch, meta[5] = endEpoch, meta[6] = tokenAmount
       expect(meta[3]).to.equal(1000n);
       expect(meta[4]).to.equal(currentEpoch);
@@ -420,18 +420,18 @@ describe('V10 E2E Conviction System', function () {
       // (commit 41be7c71). This is what enables the N16 ERC-1155 balanceOf
       // gate to work on follow-up updates.
       const latestPublisher =
-        await DKGKnowledgeAssets.getLatestMerkleRootPublisher(kcId);
+        await DKGKnowledgeAssets.getLatestMerkleRootPublisher(kaId);
       expect(latestPublisher).to.equal(creator.address);
       // The KA NFT (ERC-721, one token per KC id) is minted to the author on
-      // publish (`DKGKnowledgeAssets._safeMint(author, kcId)`). Assert the
-      // specific token `kcId` is owned by `creator` — a `balanceOf > 0` check
+      // publish (`DKGKnowledgeAssets._safeMint(author, kaId)`). Assert the
+      // specific token `kaId` is owned by `creator` — a `balanceOf > 0` check
       // would also pass if some unrelated KA were owned by `creator` while
-      // `kcId` was minted to the wrong address. A follow-up `update` passes
+      // `kaId` was minted to the wrong address. A follow-up `update` passes
       // the author-ownership gate.
-      expect(await DKGKnowledgeAssets.ownerOf(kcId)).to.equal(creator.address);
+      expect(await DKGKnowledgeAssets.ownerOf(kaId)).to.equal(creator.address);
 
       // ---- Step 8: Atomic CG binding written ----
-      expect(await CGS.kcToContextGraph(kcId)).to.equal(cgId);
+      expect(await CGS.kaToContextGraph(kaId)).to.equal(cgId);
 
       // ---- Step 9: CG value ledger written ----
       //
@@ -452,7 +452,7 @@ describe('V10 E2E Conviction System', function () {
       // sum is the canonical guard.
 
       // ---- Step 11: KC retrieval via public reader ----
-      const retrievedKc = await DKGKnowledgeAssets.getKnowledgeCollection(kcId);
+      const retrievedKc = await DKGKnowledgeAssets.getKnowledgeAsset(kaId);
       expect(retrievedKc.byteSize).to.equal(1000n);
       expect(retrievedKc.startEpoch).to.equal(currentEpoch);
       expect(retrievedKc.endEpoch).to.equal(currentEpoch + BigInt(epochs));
@@ -465,12 +465,12 @@ describe('V10 E2E Conviction System', function () {
       // `buildPublishParams` with the creator as both author and msg.sender).
       // Author lives in the parallel `merkleRootAuthors` map (keeps the
       // MerkleRoot struct at 3 storage slots so prior KCs decode correctly
-      // post-upgrade — see KnowledgeCollectionLib comments).
+      // post-upgrade — see KnowledgeAssetLib comments).
       expect(
-        await DKGKnowledgeAssets.getMerkleRootAuthorByIndex(kcId, 0),
+        await DKGKnowledgeAssets.getMerkleRootAuthorByIndex(kaId, 0),
       ).to.equal(creator.address);
       expect(
-        await DKGKnowledgeAssets.getLatestMerkleRootAuthor(kcId),
+        await DKGKnowledgeAssets.getLatestMerkleRootAuthor(kaId),
       ).to.equal(creator.address);
     });
   });

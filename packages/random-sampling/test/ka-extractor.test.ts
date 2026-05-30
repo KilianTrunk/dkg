@@ -3,7 +3,7 @@
  *
  * Pin the bit-for-bit recipe between publisher publish-path and the
  * Random Sampling prover's local extraction:
- *  - resolve KC UAL via `dkg:batchId == kcId` in _meta
+ *  - resolve KC UAL via `dkg:batchId == kaId` in _meta
  *  - resolve root entities via `dkg:partOf` + `dkg:rootEntity`
  *  - pull public quads from the CG data graph filtered by root +
  *    `.well-known/genid/` skolemized blanks (same SPARQL shape as
@@ -42,7 +42,7 @@ const RDF = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#';
 
 interface KCFixture {
   cgId: bigint;
-  kcId: bigint;
+  kaId: bigint;
   /** Local CG name. Defaults to a synthetic `cg-<cgId>` when omitted. */
   cgName?: string;
   ual: string;
@@ -90,7 +90,7 @@ async function seedKC(store: OxigraphStore, fixture: KCFixture): Promise<void> {
     {
       subject: fixture.ual,
       predicate: `${DKG}batchId`,
-      object: `"${fixture.kcId}"^^<${XSD}integer>`,
+      object: `"${fixture.kaId}"^^<${XSD}integer>`,
       graph: metaGraph,
     },
   ];
@@ -129,7 +129,7 @@ describe('extractV10KCFromStore — happy path / publisher round-trip parity', (
   it('returns the KC triples and computes leaves whose V10 root matches a manual rebuild', async () => {
     const fixture: KCFixture = {
       cgId: 7n,
-      kcId: 42n,
+      kaId: 42n,
       ual: 'did:dkg:hardhat:31337/0xpub/42',
       rootEntities: ['urn:entity:alpha', 'urn:entity:beta'],
       publicTriples: [
@@ -140,7 +140,7 @@ describe('extractV10KCFromStore — happy path / publisher round-trip parity', (
     };
     await seedKC(store, fixture);
 
-    const result = await extractV10KCFromStore(store, fixture.cgId, fixture.kcId);
+    const result = await extractV10KCFromStore(store, fixture.cgId, fixture.kaId);
 
     expect(result.ual).toBe(fixture.ual);
     expect(result.rootEntities).toEqual([...fixture.rootEntities].sort()
@@ -161,7 +161,7 @@ describe('extractV10KCFromStore — happy path / publisher round-trip parity', (
     const BLANK = `${ROOT}/.well-known/genid/abc-1`;
     const fixture: KCFixture = {
       cgId: 9n,
-      kcId: 100n,
+      kaId: 100n,
       ual: 'did:dkg:hardhat:31337/0xpub/100',
       rootEntities: [ROOT],
       publicTriples: [
@@ -171,7 +171,7 @@ describe('extractV10KCFromStore — happy path / publisher round-trip parity', (
     };
     await seedKC(store, fixture);
 
-    const result = await extractV10KCFromStore(store, fixture.cgId, fixture.kcId);
+    const result = await extractV10KCFromStore(store, fixture.cgId, fixture.kaId);
     expect(result.triples.map((t) => t.subject).sort()).toEqual([ROOT, BLANK].sort());
 
     const fixtureLeaves = fixture.publicTriples.map((t) => hashTripleV10(t.subject, t.predicate, t.object));
@@ -182,7 +182,7 @@ describe('extractV10KCFromStore — happy path / publisher round-trip parity', (
     const fixture: KCFixture = {
       cgId: 42n,
       cgName: 'devnet-test',
-      kcId: 8n,
+      kaId: 8n,
       ual: 'did:dkg:hardhat:31337/0xpub/8',
       rootEntities: ['urn:e:named'],
       publicTriples: [
@@ -191,7 +191,7 @@ describe('extractV10KCFromStore — happy path / publisher round-trip parity', (
     };
     await seedKC(store, fixture);
 
-    const quads = await extractV10KCQuads(store, fixture.cgId, fixture.kcId);
+    const quads = await extractV10KCQuads(store, fixture.cgId, fixture.kaId);
 
     expect(quads).toHaveLength(1);
     expect(quads[0].graph).toBe(contextGraphDataUri(fixture.cgName!, fixture.cgId.toString()));
@@ -209,7 +209,7 @@ describe('extractV10KCFromStore — happy path / publisher round-trip parity', (
   it('skips post-publish dkg:trustLevel stamps so leaf count stays bit-identical with merkleLeafCount', async () => {
     const fixture: KCFixture = {
       cgId: 11n,
-      kcId: 17n,
+      kaId: 17n,
       ual: 'did:dkg:hardhat:31337/0xpub/17',
       rootEntities: ['urn:entity:trust-target'],
       publicTriples: [
@@ -237,7 +237,7 @@ describe('extractV10KCFromStore — happy path / publisher round-trip parity', (
       },
     ]);
 
-    const result = await extractV10KCFromStore(store, fixture.cgId, fixture.kcId);
+    const result = await extractV10KCFromStore(store, fixture.cgId, fixture.kaId);
 
     expect(result.triples).toHaveLength(fixture.publicTriples.length);
     expect(result.triples.map((t) => t.predicate)).not.toContain(TRUST_LEVEL_PREDICATE);
@@ -251,7 +251,7 @@ describe('extractV10KCFromStore — happy path / publisher round-trip parity', (
   it('round-trips through buildV10ProofMaterial (extractor leaves accept on-chain commitment)', async () => {
     const fixture: KCFixture = {
       cgId: 1n,
-      kcId: 5n,
+      kaId: 5n,
       ual: 'did:dkg:hardhat:31337/0xpub/5',
       rootEntities: ['urn:e:1', 'urn:e:2', 'urn:e:3'],
       publicTriples: [
@@ -262,7 +262,7 @@ describe('extractV10KCFromStore — happy path / publisher round-trip parity', (
     };
     await seedKC(store, fixture);
 
-    const result = await extractV10KCFromStore(store, fixture.cgId, fixture.kcId);
+    const result = await extractV10KCFromStore(store, fixture.cgId, fixture.kaId);
     const tree = new V10MerkleTree(result.leaves);
     const expected = { merkleRoot: tree.root, merkleLeafCount: tree.leafCount };
 
@@ -275,7 +275,7 @@ describe('extractV10KCFromStore — happy path / publisher round-trip parity', (
 
   it('resolves CG names that contain "/" (v9-style <owner>/<slug> namespacing)', async () => {
     // Regression for a testnet incident where every random-sampling proof on every
-    // beacon went unsubmitted: the CG name resolver in `kc-extractor.ts` rejected
+    // beacon went unsubmitted: the CG name resolver in `ka-extractor.ts` rejected
     // any name containing "/", but real CGs were registered as
     // "0xb08…4794c/laptop-smoke" — owner-prefixed slugs. The FinalizationHandler
     // wrote canonical data under `did:dkg:context-graph:<owner>/<slug>/context/<cgId>/_meta`
@@ -283,11 +283,11 @@ describe('extractV10KCFromStore — happy path / publisher round-trip parity', (
     // and threw `KCNotFoundError` even after data was promoted, blocking proofs
     // forever. The relevant log line on every beacon was:
     //   `Finalization: promoted SWM snapshot to context graph 12 …`
-    //   `[rs.tick.kc-not-synced] {"kcId":"6","cgId":"12","err":"KCNotFoundError"}`
+    //   `[rs.tick.kc-not-synced] {"kaId":"6","cgId":"12","err":"KCNotFoundError"}`
     const fixture: KCFixture = {
       cgId: 12n,
       cgName: '0xb08A0F66d5A225D57Dee5fFa6C442e4DC2a4794c/laptop-smoke',
-      kcId: 6n,
+      kaId: 6n,
       ual: 'did:dkg:base:84532/0xb08A0F66d5A225D57Dee5fFa6C442e4DC2a4794c/5000001',
       rootEntities: ['urn:entity:slash-cg'],
       publicTriples: [
@@ -296,7 +296,7 @@ describe('extractV10KCFromStore — happy path / publisher round-trip parity', (
     };
     await seedKC(store, fixture);
 
-    const result = await extractV10KCFromStore(store, fixture.cgId, fixture.kcId);
+    const result = await extractV10KCFromStore(store, fixture.cgId, fixture.kaId);
     expect(result.contextGraphName).toBe(fixture.cgName);
     expect(result.ual).toBe(fixture.ual);
     expect(result.triples).toHaveLength(1);
@@ -306,7 +306,7 @@ describe('extractV10KCFromStore — happy path / publisher round-trip parity', (
     const PRIVATE_ROOT = new Uint8Array(32).fill(0xab);
     const fixture: KCFixture = {
       cgId: 11n,
-      kcId: 88n,
+      kaId: 88n,
       ual: 'did:dkg:hardhat:31337/0xpub/88',
       rootEntities: ['urn:mix:1'],
       publicTriples: [
@@ -316,7 +316,7 @@ describe('extractV10KCFromStore — happy path / publisher round-trip parity', (
     };
     await seedKC(store, fixture);
 
-    const result = await extractV10KCFromStore(store, fixture.cgId, fixture.kcId);
+    const result = await extractV10KCFromStore(store, fixture.cgId, fixture.kaId);
     expect(result.privateRoots).toEqual([PRIVATE_ROOT]);
     expect(result.leaves).toHaveLength(2);
     expect(result.leaves[1]).toEqual(PRIVATE_ROOT);
@@ -334,7 +334,7 @@ describe('extractV10KCFromStore — error paths', () => {
     await expect(extractV10KCFromStore(store, 1n, 999n)).rejects.toBeInstanceOf(KCNotFoundError);
   });
 
-  it('throws KCNotFoundError when the kcId is not indexed in _meta (CG synced, KC missing)', async () => {
+  it('throws KCNotFoundError when the kaId is not indexed in _meta (CG synced, KC missing)', async () => {
     await seedOntology(store, 'cg-1', 1n);
     await expect(extractV10KCFromStore(store, 1n, 999n)).rejects.toBeInstanceOf(KCNotFoundError);
   });
@@ -357,19 +357,19 @@ describe('extractV10KCFromStore — error paths', () => {
   it('throws KCDataMissingError when meta resolves but the data graph has no triples for those roots', async () => {
     const fixture: KCFixture = {
       cgId: 1n,
-      kcId: 7n,
+      kaId: 7n,
       ual: 'did:dkg:hardhat:31337/0xpub/7',
       rootEntities: ['urn:absent:root'],
       publicTriples: [],
     };
     await seedKC(store, fixture);
 
-    await expect(extractV10KCFromStore(store, fixture.cgId, fixture.kcId)).rejects.toBeInstanceOf(
+    await expect(extractV10KCFromStore(store, fixture.cgId, fixture.kaId)).rejects.toBeInstanceOf(
       KCDataMissingError,
     );
   });
 
-  it('uses a typed integer literal so kcId 1 vs 10 do not collide (P-18 lesson, mirrored)', async () => {
+  it('uses a typed integer literal so kaId 1 vs 10 do not collide (P-18 lesson, mirrored)', async () => {
     // Two KCs with different batchIds in the same _meta graph. If the
     // SPARQL accidentally string-prefix-matches "1" against "10", we'd
     // get the wrong UAL. Mirrors publisher-layer P-18 regression test.

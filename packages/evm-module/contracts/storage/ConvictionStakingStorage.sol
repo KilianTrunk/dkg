@@ -25,7 +25,7 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
  *     CSS now extends `Guardian`, so its `tokenContract` reference and
  *     `transferStake` outflow function come from the same base every V10
  *     publish/payment contract uses for vault-routed deposits. Vault-target
- *     consumers (`KnowledgeAssetsV10`, `KnowledgeCollection`, `Paymaster`,
+ *     consumers (`KnowledgeAssetsLifecycle`, `DKGKnowledgeAssets`, `Paymaster`,
  *     `PublishingConvictionAccount`, `DKGPublishingConvictionNFT`,
  *     `DKGStakingConvictionNFT`) resolve `hub.getContractAddress("ConvictionStakingStorage")`
  *     for both deposits (TRAC `transferFrom` to CSS) and withdrawals
@@ -120,7 +120,7 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
     //             `StakingV10` admin surface can be added without further
     //             struct churn).
     //           * Vault deposits across V10 (`KnowledgeAssetsV10`,
-    //             `KnowledgeCollection`, `Paymaster`, etc.) now route TRAC
+    //             `DKGKnowledgeAssets`, `Paymaster`, etc.) now route TRAC
     //             into the CSS address. `StakingStorage` is no longer in
     //             the V10 hot path; only `StakingV10._convertToNFT` reads
     //             it (V8→V10 drain at cutover).

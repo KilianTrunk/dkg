@@ -48,7 +48,7 @@ export interface KCExtractionResult {
   contextGraphName: string;
   /** Data graph URI that contained the public triples. */
   dataGraph: string;
-  /** UAL of the KC discovered via `dkg:batchId == kcId`. */
+  /** UAL of the KC discovered via `dkg:batchId == kaId`. */
   ual: string;
   /** Root entities for each KA, in stable (sorted) order. */
   rootEntities: string[];
@@ -71,15 +71,15 @@ export interface KCExtractionResult {
 }
 
 /**
- * Thrown when the on-chain `kcId` has no UAL recorded in the local
+ * Thrown when the on-chain `kaId` has no UAL recorded in the local
  * `_meta` graph for `cgId`. Almost always indicates the prover has not
  * yet synced this CG to the head; callers SHOULD skip the period and
  * trigger a sync, not retry the same proof.
  */
 export class KCNotFoundError extends Error {
   readonly name = 'KCNotFoundError';
-  constructor(readonly contextGraphId: bigint, readonly kcId: bigint) {
-    super(`KC ${kcId} not found in _meta for context graph ${contextGraphId}`);
+  constructor(readonly contextGraphId: bigint, readonly kaId: bigint) {
+    super(`KC ${kaId} not found in _meta for context graph ${contextGraphId}`);
   }
 }
 
@@ -91,9 +91,9 @@ export class KCNotFoundError extends Error {
  */
 export class KCRootEntitiesNotFoundError extends Error {
   readonly name = 'KCRootEntitiesNotFoundError';
-  constructor(readonly contextGraphId: bigint, readonly kcId: bigint, readonly ual: string) {
+  constructor(readonly contextGraphId: bigint, readonly kaId: bigint, readonly ual: string) {
     super(
-      `KC ${kcId} (UAL ${ual}) in cg ${contextGraphId} has no dkg:rootEntity ` +
+      `KC ${kaId} (UAL ${ual}) in cg ${contextGraphId} has no dkg:rootEntity ` +
       `triples in _meta; meta-graph corruption or partial sync`,
     );
   }
@@ -110,12 +110,12 @@ export class KCDataMissingError extends Error {
   readonly name = 'KCDataMissingError';
   constructor(
     readonly contextGraphId: bigint,
-    readonly kcId: bigint,
+    readonly kaId: bigint,
     readonly ual: string,
     readonly rootEntities: string[],
   ) {
     super(
-      `KC ${kcId} (UAL ${ual}) has root entities ${JSON.stringify(rootEntities)} ` +
+      `KC ${kaId} (UAL ${ual}) has root entities ${JSON.stringify(rootEntities)} ` +
       `but CG data graph for cg ${contextGraphId} returned zero triples`,
     );
   }
@@ -137,7 +137,7 @@ export class KCDataMissingError extends Error {
  *    the name lookup we'd query `did:dkg:context-graph:<cgId>/_meta`,
  *    which is a different URI than the one the publisher writes.
  *
- * 2. Resolve the KC's UAL from `_meta`: `?ual dkg:batchId "<kcId>"^^xsd:integer`.
+ * 2. Resolve the KC's UAL from `_meta`: `?ual dkg:batchId "<kaId>"^^xsd:integer`.
  *    Mirrors `resolveUalByBatchId` in `@origintrail-official/dkg-publisher`
  *    (inlined here to avoid a publisher dep).
  *
@@ -159,7 +159,7 @@ export class KCDataMissingError extends Error {
 export async function extractV10KCFromStore(
   store: TripleStore,
   cgId: bigint,
-  kcId: bigint,
+  kaId: bigint,
 ): Promise<KCExtractionResult> {
   const cgIdStr = cgId.toString();
   // Map cgId (numeric) → local CG name via the ontology graph. The
@@ -168,7 +168,7 @@ export async function extractV10KCFromStore(
   // KCNotFound for every KC the agent has actually synced.
   const cgName = await resolveContextGraphNameFromOnChainId(store, cgIdStr);
   if (cgName === null) {
-    throw new KCNotFoundError(cgId, kcId);
+    throw new KCNotFoundError(cgId, kaId);
   }
   const metaGraph = contextGraphMetaUri(cgName, cgIdStr);
   const dataGraph = contextGraphDataUri(cgName, cgIdStr);
@@ -178,20 +178,20 @@ export async function extractV10KCFromStore(
   // are safe by construction.
 
   // 1. Resolve UAL via dkg:batchId. Use a typed integer literal to
-  //    avoid string-prefix collisions (kcId 1 vs 10) — same lookup
+  //    avoid string-prefix collisions (kaId 1 vs 10) — same lookup
   //    discipline as the publisher's resolveUalByBatchId (P-18 lesson).
   const ualResult = await store.query(
     `SELECT ?ual WHERE {
        GRAPH <${metaGraph}> {
-         ?ual <${DKG}batchId> "${kcId}"^^<${XSD}integer> .
+         ?ual <${DKG}batchId> "${kaId}"^^<${XSD}integer> .
        }
      } LIMIT 1`,
   );
   if (ualResult.type !== 'bindings' || ualResult.bindings.length === 0) {
-    throw new KCNotFoundError(cgId, kcId);
+    throw new KCNotFoundError(cgId, kaId);
   }
   const ual = stripQuotes(ualResult.bindings[0]['ual'] ?? '');
-  if (!ual) throw new KCNotFoundError(cgId, kcId);
+  if (!ual) throw new KCNotFoundError(cgId, kaId);
   assertSafeIri(ual);
 
   // 2. List KAs + root entities + private sub-roots.
@@ -205,7 +205,7 @@ export async function extractV10KCFromStore(
      }`,
   );
   if (kaResult.type !== 'bindings' || kaResult.bindings.length === 0) {
-    throw new KCRootEntitiesNotFoundError(cgId, kcId, ual);
+    throw new KCRootEntitiesNotFoundError(cgId, kaId, ual);
   }
 
   // Stable order: sort by KA URI so leaves are deterministic across
@@ -231,7 +231,7 @@ export async function extractV10KCFromStore(
     }
   }
   if (rootEntities.length === 0) {
-    throw new KCRootEntitiesNotFoundError(cgId, kcId, ual);
+    throw new KCRootEntitiesNotFoundError(cgId, kaId, ual);
   }
 
   // 3. Pull public triples per root entity. Same filter the publisher
@@ -255,7 +255,7 @@ export async function extractV10KCFromStore(
     }
   }
   if (triples.length === 0) {
-    throw new KCDataMissingError(cgId, kcId, ual, rootEntities);
+    throw new KCDataMissingError(cgId, kaId, ual, rootEntities);
   }
 
   // 4. Compute V10 leaves: public triples first, private sub-roots next.
@@ -376,8 +376,8 @@ function escapeSparqlString(val: string): string {
 export async function extractV10KCQuads(
   store: TripleStore,
   cgId: bigint,
-  kcId: bigint,
+  kaId: bigint,
 ): Promise<Quad[]> {
-  const result = await extractV10KCFromStore(store, cgId, kcId);
+  const result = await extractV10KCFromStore(store, cgId, kaId);
   return result.triples.map((t) => ({ ...t, graph: result.dataGraph }));
 }

@@ -78,7 +78,7 @@ export async function publishToVm(opts: {
   assertionName: string;
   nodeNum?: number;
   clearAfter?: boolean;
-}): Promise<{ status?: string; kcId?: string; txHash?: string }> {
+}): Promise<{ status?: string; kaId?: string; txHash?: string }> {
   const res = await devnetApiFetch('/api/shared-memory/publish', {
     method: 'POST',
     nodeNum: opts.nodeNum ?? 1,
@@ -91,14 +91,14 @@ export async function publishToVm(opts: {
   if (!res.ok) {
     throw new Error(`publish failed: ${res.status} ${await res.text()}`);
   }
-  return (await res.json()) as { status?: string; kcId?: string; txHash?: string };
+  return (await res.json()) as { status?: string; kaId?: string; txHash?: string };
 }
 
 export async function runWmSwmVmPipeline(opts: {
   contextGraphId: string;
   stamp?: number;
   nodeNum?: number;
-}): Promise<{ assertionName: string; label: string; kcId?: string }> {
+}): Promise<{ assertionName: string; label: string; kaId?: string }> {
   const stamp = opts.stamp ?? Date.now();
   const assertionName = `e2e-ui-pipeline-${stamp}`;
   const label = `E2E Pipeline ${stamp}`;
@@ -128,7 +128,7 @@ export async function runWmSwmVmPipeline(opts: {
     nodeNum: opts.nodeNum,
   });
 
-  return { assertionName, label, kcId: vm.kcId };
+  return { assertionName, label, kaId: vm.kaId };
 }
 
 export async function registerAgent(nodeNum: number, label: string): Promise<{ agentAddress: string; authToken: string }> {

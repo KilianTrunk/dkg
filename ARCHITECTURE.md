@@ -177,7 +177,7 @@ sequenceDiagram
     Client->>Daemon: POST shared memory publish
     Daemon->>Publisher: publish synchronously
     Publisher->>Store: read staged triples
-    Publisher->>Chain: anchor knowledge collection
+    Publisher->>Chain: anchor knowledge asset
     Chain-->>Publisher: commitment finalized
     Publisher-->>Daemon: kc id
     Daemon-->>Client: publish result

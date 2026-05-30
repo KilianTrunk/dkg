@@ -528,8 +528,8 @@ describe('EVMChainAdapter — Hub rotation self-refresh (E2E)', () => {
       await (adapter as any).init();
       await drainHistoricalRotationEvents(adapter);
 
-      const kav10Before = await adapter.getKnowledgeAssetsV10Address();
-      const kav10HandleBefore: Contract = (adapter as any).contracts.knowledgeAssetsV10;
+      const kav10Before = await adapter.getKnowledgeAssetsLifecycleAddress();
+      const kav10HandleBefore: Contract = (adapter as any).contracts.knowledgeAssetsLifecycle;
       expect((adapter as any).cachedKav10Address?.value.toLowerCase()).toBe(
         kav10Before.toLowerCase(),
       );
@@ -540,12 +540,12 @@ describe('EVMChainAdapter — Hub rotation self-refresh (E2E)', () => {
       try {
         // Greenfield (PR #815): the lifecycle contract is registered under
         // the Hub key KnowledgeAssetsLifecycle (was KnowledgeAssetsV10), which
-        // is what getKnowledgeAssetsV10Address() resolves. Rotate that key.
+        // is what getKnowledgeAssetsLifecycleAddress() resolves. Rotate that key.
         await rotateHubContract(ctx.hubAddress, deployer, 'KnowledgeAssetsLifecycle', replacementAddr);
 
         const observed = await waitFor(
           () =>
-            (adapter as any).contracts.knowledgeAssetsV10 === kav10HandleBefore &&
+            (adapter as any).contracts.knowledgeAssetsLifecycle === kav10HandleBefore &&
             (adapter as any).cachedKav10Address === undefined &&
             (adapter as any).cachedMinRequiredSignatures === undefined &&
             (adapter as any).initialized === false,
@@ -554,7 +554,7 @@ describe('EVMChainAdapter — Hub rotation self-refresh (E2E)', () => {
         );
         expect(observed).toBe(true);
 
-        const kav10After = await adapter.getKnowledgeAssetsV10Address();
+        const kav10After = await adapter.getKnowledgeAssetsLifecycleAddress();
         expect(kav10After.toLowerCase()).toBe(replacementAddr.toLowerCase());
       } finally {
         await rotateHubContract(ctx.hubAddress, deployer, 'KnowledgeAssetsLifecycle', kav10Before);
@@ -661,7 +661,7 @@ describe('EVMChainAdapter — Hub rotation self-refresh (E2E)', () => {
       const identityBefore: Contract = (adapter as any).contracts.identity;
       expect(identityBefore).toBeDefined();
       const identityAddrBefore: string = await identityBefore.getAddress();
-      await adapter.getKnowledgeAssetsV10Address();
+      await adapter.getKnowledgeAssetsLifecycleAddress();
       await adapter.getMinimumRequiredSignatures();
       expect((adapter as any).cachedKav10Address).toBeDefined();
       expect((adapter as any).cachedMinRequiredSignatures).toBeDefined();

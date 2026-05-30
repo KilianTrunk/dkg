@@ -58,13 +58,13 @@ async function pubS(p: DKGPublisher, args: Parameters<DKGPublisher['publish']>[0
     v10ACKProvider: sealed.v10ACKProvider ?? hardhatACKProvider(_kav10Address),
   } as Parameters<DKGPublisher['publish']>[0]);
 }
-async function updS(p: DKGPublisher, kcId: bigint, args: Parameters<DKGPublisher['update']>[1]) {
+async function updS(p: DKGPublisher, kaId: bigint, args: Parameters<DKGPublisher['update']>[1]) {
   // Greenfield (PR #815): on-chain updates are owner-sealed — the publisher
   // refuses to self-sign and requires a `precomputedUpdateAttestation` over
   // `UpdateAuthorAttestation(kaId, newMerkleRoot, author)`. Mint it here so
   // existing update tests stay structurally identical.
-  const sealed = await _withUpdateSeal(kcId, args, _author, { provider: _provider, kav10Address: _kav10Address });
-  return p.update(kcId, {
+  const sealed = await _withUpdateSeal(kaId, args, _author, { provider: _provider, kav10Address: _kav10Address });
+  return p.update(kaId, {
     ...sealed,
     v10ACKProvider: sealed.v10ACKProvider ?? hardhatACKProvider(_kav10Address),
   } as Parameters<DKGPublisher['update']>[1]);
@@ -81,7 +81,7 @@ beforeAll(async () => {
   const cgId = await createTestContextGraph(chain);
   CONTEXT_GRAPH = String(cgId);
   GRAPH = `did:dkg:context-graph:${CONTEXT_GRAPH}`;
-  _kav10Address = await chain.getKnowledgeAssetsV10Address();
+  _kav10Address = await chain.getKnowledgeAssetsLifecycleAddress();
 });
 afterAll(async () => {
   await revertSnapshot(_topSnapshot);
@@ -802,7 +802,7 @@ describe('Update flow', () => {
     });
 
     expect(publishResult.status).toBe('confirmed');
-    const kcId = publishResult.kcId;
+    const kaId = publishResult.kaId;
 
     const before = await store.query(
       `SELECT ?name WHERE { GRAPH <${GRAPH}> { <${ENTITY}> <http://schema.org/name> ?name } }`,
@@ -817,13 +817,13 @@ describe('Update flow', () => {
       q(ENTITY, 'http://schema.org/version', '"2.0"'),
     ];
 
-    const updateResult = await updS(publisher, kcId, {
+    const updateResult = await updS(publisher, kaId, {
       contextGraphId: CONTEXT_GRAPH,
       quads: updatedTriples,
     });
 
     expect(updateResult.status).toBe('confirmed');
-    expect(updateResult.kcId).toBe(kcId);
+    expect(updateResult.kaId).toBe(kaId);
     expect(Buffer.from(updateResult.merkleRoot).toString('hex'))
       .not.toBe(Buffer.from(publishResult.merkleRoot).toString('hex'));
 
@@ -838,7 +838,7 @@ describe('Update flow', () => {
   });
 
   // RC11 / PR1: depends on a private-data publish confirming on-chain
-  // (yielding a real `result1.kcId`) so the subsequent `update` can
+  // (yielding a real `result1.kaId`) so the subsequent `update` can
   // target it. Private-data publishes now go `tentative` because the
   // publisher intentionally skips peer ACK collection for them
   // (`dkg-publisher.ts:1937`) and the self-signed ACK fallback is
@@ -865,7 +865,7 @@ describe('Update flow', () => {
       publisherPeerId: '12D3KooWTestPublisher',
     });
 
-    await updS(publisher, result1.kcId, {
+    await updS(publisher, result1.kaId, {
       contextGraphId: CONTEXT_GRAPH,
       quads: [q(entity, 'http://schema.org/name', '"PrivUpdateBot v2"')],
       privateQuads: [q(entity, 'http://ex.org/secret', '"new-secret"')],
@@ -901,7 +901,7 @@ describe('Update flow', () => {
 
     const oldMerkleHex = Buffer.from(result1.merkleRoot).toString('hex');
 
-    const result2 = await updS(publisher, result1.kcId, {
+    const result2 = await updS(publisher, result1.kaId, {
       contextGraphId: CONTEXT_GRAPH,
       quads: [q(entity, 'http://schema.org/name', '"ChainBot v2"')],
     });
@@ -1203,7 +1203,7 @@ describe('Tentative publish UAL uniqueness', () => {
     const phases: [string, 'start' | 'end'][] = [];
     const onPhase = (phase: string, status: 'start' | 'end') => phases.push([phase, status]);
 
-    await updS(publisher, pub.kcId, {
+    await updS(publisher, pub.kaId, {
       contextGraphId: CONTEXT_GRAPH,
       quads: [q(ENTITY, 'http://schema.org/name', '"Updated"')],
       onPhase,

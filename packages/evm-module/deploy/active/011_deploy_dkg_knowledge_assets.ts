@@ -2,17 +2,17 @@ import { HardhatRuntimeEnvironment } from 'hardhat/types';
 import { DeployFunction } from 'hardhat-deploy/types';
 
 const func: DeployFunction = async function (hre: HardhatRuntimeEnvironment) {
-  const kcParametersConfig =
+  const kaParametersConfig =
     hre.helpers.parametersConfig[hre.network.config.environment]
-      .KnowledgeCollectionStorage;
+      .DKGKnowledgeAssets;
 
   await hre.helpers.deploy({
     newContractName: 'DKGKnowledgeAssets',
     setContractInHub: false,
     setAssetStorageInHub: true,
     additionalArgs: [
-      kcParametersConfig.knowledgeCollectionSize,
-      kcParametersConfig.uriBase,
+      kaParametersConfig.knowledgeAssetBatchSize,
+      kaParametersConfig.uriBase,
     ],
   });
 };

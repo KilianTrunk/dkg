@@ -48,12 +48,12 @@ describe('context graph write-path validation', () => {
     const share = vi.fn(async () => ({ shareOperationId: 'share-1' }));
     const conditionalShare = vi.fn(async () => ({ shareOperationId: 'share-cas-1' }));
     const publishFromSharedMemory = vi.fn(async () => ({
-      kcId: 1n,
+      kaId: 1n,
       status: 'confirmed',
       kaManifest: [],
     }));
     const publishFromFinalizedAssertion = vi.fn(async () => ({
-      kcId: 1n,
+      kaId: 1n,
       status: 'confirmed',
       assertionUri: 'did:dkg:context-graph:test/assertion/test/draft',
       seal: {

@@ -4,7 +4,7 @@
  * Audit findings covered:
  *
  *   CH-3  (CRITICAL) — The V10 lifecycle
- *                        createKnowledgeAssetsV10 → updateKnowledgeCollectionV10
+ *                        createKnowledgeAssets → updateKnowledgeCollectionV10
  *                        → verifyKAUpdate → resolvePublishByTxHash
  *                      has no end-to-end test. If any one hop silently
  *                      regresses (e.g. verifyKAUpdate stops matching the
@@ -53,13 +53,13 @@ let fileSnapshotId: string;
 let testSnapshotId: string;
 
 // Helper: build the V10 PublishDirect params end-to-end (publisher digest,
-// ACK digest, token approval) and invoke createKnowledgeAssetsV10 for a
+// ACK digest, token approval) and invoke createKnowledgeAssets for a
 // freshly-created context graph. Returns the publish result + context id.
 async function publishOneKCV10(opts: {
   kaCount?: number;
   byteSize?: bigint;
   epochs?: number;
-} = {}): Promise<{ kcId: bigint; txHash: string; contextGraphId: bigint; merkleRoot: Uint8Array }> {
+} = {}): Promise<{ kaId: bigint; txHash: string; contextGraphId: bigint; merkleRoot: Uint8Array }> {
   const provider = createProvider();
   const { hubAddress, coreProfileId } = getSharedContext();
   const adapter = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
@@ -79,7 +79,7 @@ async function publishOneKCV10(opts: {
   const tokenAmount = await adapter.getRequiredPublishTokenAmount(byteSize, epochs);
   const merkleRoot = ethers.getBytes(ethers.keccak256(ethers.toUtf8Bytes(`lifecycle-${Date.now()}-${Math.random()}`)));
   const publisherIdentityId = BigInt(coreProfileId);
-  const kav10Address = await adapter.getKnowledgeAssetsV10Address();
+  const kav10Address = await adapter.getKnowledgeAssetsLifecycleAddress();
   const evmChainId = await adapter.getEvmChainId();
 
   const coreOp = new Wallet(HARDHAT_KEYS.CORE_OP, provider);
@@ -110,7 +110,7 @@ async function publishOneKCV10(opts: {
   ));
   const ackRaw = ethers.Signature.from(await coreOp.signMessage(ackDigest));
 
-  const result = await adapter.createKnowledgeAssetsV10!({
+  const result = await adapter.createKnowledgeAssets!({
     publishOperationId: ethers.hexlify(ethers.randomBytes(32)),
     contextGraphId,
     merkleRoot,
@@ -139,7 +139,7 @@ async function publishOneKCV10(opts: {
   expect(result.batchId).toBeGreaterThan(0n);
   expect(result.txHash).toMatch(/^0x[0-9a-f]{64}$/);
   return {
-    kcId: result.batchId,
+    kaId: result.batchId,
     txHash: result.txHash,
     contextGraphId,
     merkleRoot,
@@ -167,11 +167,11 @@ describe('chain-lifecycle-extra — V10 lifecycle + adapter invariants', () => {
   // CH-3 — full V10 publish/update/verify/resolve lifecycle.
   // --------------------------------------------------------------------
 
-  describe('V10 lifecycle: createKnowledgeAssetsV10 + updateKnowledgeCollectionV10 + verifyKAUpdate + resolvePublishByTxHash [CH-3]', () => {
+  describe('V10 lifecycle: createKnowledgeAssets + updateKnowledgeCollectionV10 + verifyKAUpdate + resolvePublishByTxHash [CH-3]', () => {
     it('publishes, updates, verifies the update, and round-trips the publish receipt', async () => {
       const adapter = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
 
-      const { kcId, txHash: publishTxHash, merkleRoot: originalRoot } = await publishOneKCV10({
+      const { kaId, txHash: publishTxHash, merkleRoot: originalRoot } = await publishOneKCV10({
         kaCount: 1,
         byteSize: 256n,
         epochs: 2,
@@ -180,7 +180,7 @@ describe('chain-lifecycle-extra — V10 lifecycle + adapter invariants', () => {
       // --- resolvePublishByTxHash on the publish tx ---
       const resolved = await adapter.resolvePublishByTxHash(publishTxHash);
       expect(resolved).not.toBeNull();
-      expect(resolved!.batchId).toBe(kcId);
+      expect(resolved!.batchId).toBe(kaId);
       expect(resolved!.txHash.toLowerCase()).toBe(publishTxHash.toLowerCase());
       expect(resolved!.startKAId).toBeGreaterThan(0n);
       expect(resolved!.endKAId).toBe(resolved!.startKAId);
@@ -194,12 +194,12 @@ describe('chain-lifecycle-extra — V10 lifecycle + adapter invariants', () => {
 
       const provider = createProvider();
       const coreOp = new Wallet(HARDHAT_KEYS.CORE_OP, provider);
-      const kav10Address = await adapter.getKnowledgeAssetsV10Address();
+      const kav10Address = await adapter.getKnowledgeAssetsLifecycleAddress();
       const evmChainId = await adapter.getEvmChainId();
       const updateAuthorTyped = buildUpdateAuthorAttestationTypedData({
         chainId: evmChainId,
         kav10Address,
-        kaId: kcId,
+        kaId: kaId,
         newMerkleRoot,
         authorAddress: coreOp.address,
       });
@@ -213,13 +213,13 @@ describe('chain-lifecycle-extra — V10 lifecycle + adapter invariants', () => {
 
       // Pass newTokenAmount explicitly: the adapter's auto-derivation
       // from askStorage + byteSize can under-shoot the V10 contract's
-      // `InvalidTokenAmount` check when `getTokenAmount(kcId)` returns 0
+      // `InvalidTokenAmount` check when `getTokenAmount(kaId)` returns 0
       // (KC storage isn't carrying publish cost forward in this path).
       // We keep byteSize the same as the publish so the update is a pure
       // merkle-root rotation.
       const publishTokenAmount = await adapter.getRequiredPublishTokenAmount(256n, 2);
       const updateResult = await adapter.updateKnowledgeCollectionV10({
-        kcId,
+        kaId,
         newMerkleRoot,
         newByteSize: 256n,
         newTokenAmount: publishTokenAmount,
@@ -236,7 +236,7 @@ describe('chain-lifecycle-extra — V10 lifecycle + adapter invariants', () => {
       // --- verifyKAUpdate on the update tx ---
       const verified = await adapter.verifyKAUpdate(
         updateResult.hash,
-        kcId,
+        kaId,
         adapter.getSignerAddress(),
       );
       expect(verified.verified).toBe(true);
@@ -248,8 +248,75 @@ describe('chain-lifecycle-extra — V10 lifecycle + adapter invariants', () => {
 
       // --- verifyKAUpdate returns NOT-verified for a wrong publisher ---
       const wrongPub = new Wallet(HARDHAT_KEYS.EXTRA2).address;
-      const notVerified = await adapter.verifyKAUpdate(updateResult.hash, kcId, wrongPub);
+      const notVerified = await adapter.verifyKAUpdate(updateResult.hash, kaId, wrongPub);
       expect(notVerified.verified).toBe(false);
+    }, 120_000);
+
+    // #831 regression test: a metadata update with `newByteSize > currentByteSize`
+    // MUST land on-chain without the caller specifying `newTokenAmount`. The
+    // adapter's `computeUpdateNewTokenAmount` helper is responsible for paying
+    // the exact marginal growth cost so `KnowledgeAssetsLifecycle._validateTokenAmount`
+    // sees a non-zero `deltaTokenAmount` and accepts the update. Pre-#831 this
+    // reverted with `InvalidTokenAmount(1, 0)` whenever the daemon carried the
+    // current tokenAmount forward (delta=0).
+    it('updates with a larger newByteSize and no caller-provided newTokenAmount (#831)', async () => {
+      const adapter = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
+
+      const { kaId, merkleRoot: originalRoot } = await publishOneKCV10({
+        kaCount: 1,
+        byteSize: 256n,
+        epochs: 2,
+      });
+
+      const newMerkleRoot = ethers.getBytes(
+        ethers.keccak256(ethers.toUtf8Bytes(`growth-update-${Date.now()}`)),
+      );
+      expect(ethers.hexlify(newMerkleRoot)).not.toBe(ethers.hexlify(originalRoot));
+
+      const provider = createProvider();
+      const coreOp = new Wallet(HARDHAT_KEYS.CORE_OP, provider);
+      const kalAddress = await adapter.getKnowledgeAssetsLifecycleAddress();
+      const evmChainId = await adapter.getEvmChainId();
+      const updateAuthorTyped = buildUpdateAuthorAttestationTypedData({
+        chainId: evmChainId,
+        kav10Address: kalAddress,
+        kaId,
+        newMerkleRoot,
+        authorAddress: coreOp.address,
+      });
+      const updateAuthorRaw = ethers.Signature.from(
+        await coreOp.signTypedData(
+          updateAuthorTyped.domain,
+          updateAuthorTyped.types,
+          updateAuthorTyped.message,
+        ),
+      );
+
+      // Grow byteSize from 256 -> 1024. Critically: DO NOT pass `newTokenAmount` —
+      // the adapter must derive it from the contract's growth-cost formula.
+      const updateResult = await adapter.updateKnowledgeCollectionV10({
+        kaId,
+        newMerkleRoot,
+        newByteSize: 1024n,
+        newMerkleLeafCount: 1,
+        authorAddress: coreOp.address,
+        authorR: ethers.getBytes(updateAuthorRaw.r),
+        authorVS: ethers.getBytes(updateAuthorRaw.yParityAndS),
+        authorSchemeVersion: AUTHOR_SCHEME_VERSION_V1,
+      });
+
+      expect(updateResult.success).toBe(true);
+      expect(updateResult.hash).toMatch(/^0x[0-9a-f]{64}$/);
+
+      const verified = await adapter.verifyKAUpdate(
+        updateResult.hash,
+        kaId,
+        adapter.getSignerAddress(),
+      );
+      expect(verified.verified).toBe(true);
+      expect(ethers.hexlify(verified.onChainMerkleRoot!).toLowerCase()).toBe(
+        ethers.hexlify(newMerkleRoot).toLowerCase(),
+      );
     }, 120_000);
 
     it('resolvePublishByTxHash returns null for an unknown / zero tx hash', async () => {
@@ -321,7 +388,7 @@ describe('chain-lifecycle-extra — V10 lifecycle + adapter invariants', () => {
       expect(src).toContain('Ensure at least one configured wallet is permitted by on-chain publish authority.');
     });
 
-    it('createKnowledgeAssetsV10 on a positive but non-existent contextGraphId bubbles a useful error (not silent null)', async () => {
+    it('createKnowledgeAssets on a positive but non-existent contextGraphId bubbles a useful error (not silent null)', async () => {
       // This exercises the nextAuthorizedSigner → isAuthorizedPublisher
       // path against a cgId that does not exist. The contract either
       // reverts or returns false for all candidates; in either case the
@@ -341,7 +408,7 @@ describe('chain-lifecycle-extra — V10 lifecycle + adapter invariants', () => {
         schemeVersion: 1,
       };
       await expect(
-        adapter.createKnowledgeAssetsV10!({
+        adapter.createKnowledgeAssets!({
           publishOperationId: ethers.hexlify(ethers.randomBytes(32)),
           contextGraphId: 10n ** 12n, // huge, never created
           merkleRoot,
@@ -358,10 +425,10 @@ describe('chain-lifecycle-extra — V10 lifecycle + adapter invariants', () => {
       ).rejects.toThrow(/No authorized publisher wallet|authorized|context graph|revert|Unauthorized/i);
     }, 60_000);
 
-    it('createKnowledgeAssetsV10 rejects non-positive contextGraphId with the documented pre-tx guard', async () => {
+    it('createKnowledgeAssets rejects non-positive contextGraphId with the documented pre-tx guard', async () => {
       const adapter = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
       await expect(
-        adapter.createKnowledgeAssetsV10!({
+        adapter.createKnowledgeAssets!({
           publishOperationId: ethers.hexlify(ethers.randomBytes(32)),
           contextGraphId: 0n,
           merkleRoot: new Uint8Array(32),

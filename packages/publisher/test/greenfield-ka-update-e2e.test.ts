@@ -72,7 +72,7 @@ describe('Greenfield KA update E2E (explicit owner seal)', () => {
     contextGraphId = String(cgResult.contextGraphId);
     dataGraph = `did:dkg:context-graph:${contextGraphId}`;
 
-    kav10Address = await chain.getKnowledgeAssetsV10Address();
+    kav10Address = await chain.getKnowledgeAssetsLifecycleAddress();
     ackProvider = makeHardhatReceiverACKProvider(
       ctx,
       kav10Address,

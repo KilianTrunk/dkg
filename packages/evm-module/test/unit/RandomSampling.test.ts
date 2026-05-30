@@ -391,7 +391,7 @@ describe('@unit RandomSampling', () => {
       expect(await RandomSampling.parametersStorage()).to.equal(
         await ParametersStorage.getAddress(),
       );
-      expect(await RandomSampling.knowledgeCollectionStorage()).to.equal(
+      expect(await RandomSampling.knowledgeAssetStorage()).to.equal(
         await DKGKnowledgeAssets.getAddress(),
       );
     });
@@ -884,7 +884,7 @@ describe('@unit RandomSampling', () => {
       const startEpoch = currentEpoch;
       const createTx = await DKGKnowledgeAssets.connect(
         opSigner,
-      ).createKnowledgeCollection(
+      ).createKnowledgeAsset(
         opSigner.address, // publisher
         opSigner.address, // author — ERC-721 KA mint recipient (greenfield model)
         'phase-10-test-op',
@@ -902,23 +902,23 @@ describe('@unit RandomSampling', () => {
         1, // merkleLeafCount (v10 — pin-the-leaf-count guard, not exercised by Phase 10)
       );
       const receipt = await createTx.wait();
-      // Parse kc id from the KnowledgeCollectionCreated event.
+      // Parse kc id from the KnowledgeAssetCreated event.
       const iface = DKGKnowledgeAssets.interface;
       const topic = iface.getEvent('KnowledgeAssetCreated')!.topicHash;
       const log = receipt!.logs.find((l) => l.topics[0] === topic);
       if (!log) {
-        throw new Error('KnowledgeCollectionCreated event not found');
+        throw new Error('KnowledgeAssetCreated event not found');
       }
       const parsed = iface.parseLog(log as unknown as {
         topics: string[];
         data: string;
       })!;
-      const kcId = parsed.args[0] as bigint;
-      await ContextGraphStorage.connect(opSigner).registerKCToContextGraph(
+      const kaId = parsed.args[0] as bigint;
+      await ContextGraphStorage.connect(opSigner).registerKnowledgeAssetToContextGraph(
         cgId,
-        kcId,
+        kaId,
       );
-      return kcId;
+      return kaId;
     }
 
     /**
@@ -959,7 +959,7 @@ describe('@unit RandomSampling', () => {
     it('picks the only public CG when it is the only eligible graph', async () => {
       const cgId = await createCG(OPEN_POLICY);
       const endEpoch = (await Chronos.getCurrentEpoch()) + 5n;
-      const kcId = await createKC(cgId, endEpoch);
+      const kaId = await createKC(cgId, endEpoch);
       await seedCGValue(cgId, 1_000n);
 
       const currentEpoch = await Chronos.getCurrentEpoch();
@@ -972,7 +972,7 @@ describe('@unit RandomSampling', () => {
           currentEpoch,
         );
         expect(preview.cgId).to.equal(cgId);
-        expect(preview.kcId).to.equal(kcId);
+        expect(preview.kaId).to.equal(kaId);
         // KC byte size (128) > chunk byte size (32), so chunkId is drawn from
         // the rotated KC seed in [0, byteSize/chunkSize) = [0, 4).
         expect(preview.chunkId).to.be.lessThan(expectedMaxChunk);
@@ -988,12 +988,12 @@ describe('@unit RandomSampling', () => {
     // (each candidate is skipped at `getCiphertextChunkCount == 0`), then the
     // outer CG-retry marks the curated CG exhausted and re-draws; with no
     // other CGs holding value, the second outer pass hits zero adjustedTotal
-    // and the picker reverts with `NoEligibleKnowledgeCollection` (NOT
+    // and the picker reverts with `NoEligibleKnowledgeAsset` (NOT
     // `NoEligibleContextGraph` — the first pass had a positive adjusted
     // total). This is the spec-faithful behaviour: a curated CG with only
     // pre-LU-11 KCs is functionally the same as a CG with only expired KCs.
     // -----------------------------------------------------------------------
-    it('reverts NoEligibleKnowledgeCollection when only an uncommitted curated CG holds value', async () => {
+    it('reverts NoEligibleKnowledgeAsset when only an uncommitted curated CG holds value', async () => {
       const curatedCgId = await createCG(CURATED_POLICY);
       const endEpoch = (await Chronos.getCurrentEpoch()) + 5n;
       await createKC(curatedCgId, endEpoch);
@@ -1004,7 +1004,7 @@ describe('@unit RandomSampling', () => {
         RandomSampling.previewChallengeForSeed(testSeed(0), currentEpoch),
       ).to.be.revertedWithCustomError(
         RandomSampling,
-        'NoEligibleKnowledgeCollection',
+        'NoEligibleKnowledgeAsset',
       );
     });
 
@@ -1054,16 +1054,16 @@ describe('@unit RandomSampling', () => {
         // success on the curated branch would mean the per-KC commitment
         // filter is leaking.
         expect(preview.cgId).to.equal(openCg);
-        expect(preview.kcId).to.equal(openKc);
+        expect(preview.kaId).to.equal(openKc);
       }
     });
 
     // -----------------------------------------------------------------------
     // Test 4 — CG with only expired KCs: MAX_KC_RETRIES are exhausted and the
-    // picker reverts with NoEligibleKnowledgeCollection (the whole challenge
+    // picker reverts with NoEligibleKnowledgeAsset (the whole challenge
     // is skipped — node retries next proof period).
     // -----------------------------------------------------------------------
-    it('reverts NoEligibleKnowledgeCollection when every KC in the CG has expired', async () => {
+    it('reverts NoEligibleKnowledgeAsset when every KC in the CG has expired', async () => {
       const cgId = await createCG(OPEN_POLICY);
       const currentEpoch = await Chronos.getCurrentEpoch();
       // Create a KC that is still live, seed value, then advance Chronos far
@@ -1087,7 +1087,7 @@ describe('@unit RandomSampling', () => {
         RandomSampling.previewChallengeForSeed(testSeed(0), newEpoch),
       ).to.be.revertedWithCustomError(
         RandomSampling,
-        'NoEligibleKnowledgeCollection',
+        'NoEligibleKnowledgeAsset',
       );
     });
 
@@ -1164,7 +1164,7 @@ describe('@unit RandomSampling', () => {
           currentEpoch,
         );
         expect(preview.cgId).to.equal(activeCg);
-        expect(preview.kcId).to.equal(activeKc);
+        expect(preview.kaId).to.equal(activeKc);
       }
     });
 
@@ -1250,7 +1250,7 @@ describe('@unit RandomSampling', () => {
           newEpoch,
         );
         expect(preview.cgId).to.equal(activeCg);
-        expect(preview.kcId).to.equal(activeKc);
+        expect(preview.kaId).to.equal(activeKc);
       }
     });
   });

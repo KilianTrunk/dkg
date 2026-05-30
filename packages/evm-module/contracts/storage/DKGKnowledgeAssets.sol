@@ -4,7 +4,7 @@ pragma solidity ^0.8.20;
 
 import {Guardian} from "../Guardian.sol";
 import {ERC721} from "@openzeppelin/contracts/token/ERC721/ERC721.sol";
-import {KnowledgeCollectionLib} from "../libraries/KnowledgeCollectionLib.sol";
+import {KnowledgeAssetLib} from "../libraries/KnowledgeAssetLib.sol";
 import {INamed} from "../interfaces/INamed.sol";
 import {IVersioned} from "../interfaces/IVersioned.sol";
 import {HubDependent} from "../abstract/HubDependent.sol";
@@ -18,7 +18,7 @@ contract DKGKnowledgeAssets is INamed, IVersioned, HubDependent, ERC721, Guardia
 
     /// @dev `author` is the verified agent identity from the V10.1+
     ///      author-attestation EIP-712 envelope, or `address(0)` for legacy
-    ///      callers (`KnowledgeCollection.sol`) that do not perform author
+    ///      callers (`KnowledgeAsset (V10.1 active path)`) that do not perform author
     ///      attestation. Indexers SHOULD prefer this `indexed` field over
     ///      walking storage when filtering KCs by author.
     event KnowledgeAssetCreated(
@@ -42,29 +42,29 @@ contract DKGKnowledgeAssets is INamed, IVersioned, HubDependent, ERC721, Guardia
     );
     event KnowledgeAssetsMinted(uint256 indexed id, address indexed to, uint256 startId, uint256 endId);
     event KnowledgeAssetsBurned(uint256 indexed id, address indexed from, uint256[] tokenIds);
-    event KnowledgeCollectionPublisherUpdated(uint256 indexed id, address publisher);
-    event KnowledgeCollectionMerkleRootsUpdated(uint256 indexed id, KnowledgeCollectionLib.MerkleRoot[] merkleRoots);
-    event KnowledgeCollectionMerkleRootAdded(uint256 indexed id, bytes32 merkleRoot);
-    event KnowledgeCollectionMerkleRootRemoved(uint256 indexed id, bytes32 merkleRoot);
-    event KnowledgeCollectionMintedUpdated(uint256 indexed id, uint256 minted);
-    event KnowledgeCollectionBurnedUpdated(uint256 indexed id, uint256[] burned);
-    event KnowledgeCollectionByteSizeUpdated(uint256 indexed id, uint256 byteSize);
-    event KnowledgeCollectionChunksAmountUpdated(uint256 indexed id, uint256 chunksAmount);
-    event KnowledgeCollectionTokenAmountUpdated(uint256 indexed id, uint256 tokenAmount);
-    event KnowledgeCollectionStartEpochUpdated(uint256 indexed id, uint256 startEpoch);
-    event KnowledgeCollectionEndEpochUpdated(uint256 indexed id, uint256 endEpoch);
+    event KnowledgeAssetPublisherUpdated(uint256 indexed id, address publisher);
+    event KnowledgeAssetMerkleRootsUpdated(uint256 indexed id, KnowledgeAssetLib.MerkleRoot[] merkleRoots);
+    event KnowledgeAssetMerkleRootAdded(uint256 indexed id, bytes32 merkleRoot);
+    event KnowledgeAssetMerkleRootRemoved(uint256 indexed id, bytes32 merkleRoot);
+    event KnowledgeAssetMintedUpdated(uint256 indexed id, uint256 minted);
+    event KnowledgeAssetBurnedUpdated(uint256 indexed id, uint256[] burned);
+    event KnowledgeAssetByteSizeUpdated(uint256 indexed id, uint256 byteSize);
+    event KnowledgeAssetChunksAmountUpdated(uint256 indexed id, uint256 chunksAmount);
+    event KnowledgeAssetTokenAmountUpdated(uint256 indexed id, uint256 tokenAmount);
+    event KnowledgeAssetStartEpochUpdated(uint256 indexed id, uint256 startEpoch);
+    event KnowledgeAssetEndEpochUpdated(uint256 indexed id, uint256 endEpoch);
     event URIUpdate(string newURI);
 
     /// @notice RFC-39 Phase A.5: a per-KC ciphertext commitment was set for
     ///         curated random sampling. Emitted by
     ///         `setCiphertextChunksCommitment`, called by `KnowledgeAssetsV10`
-    ///         immediately after `createKnowledgeCollection` when the publish
+    ///         immediately after `createKnowledgeAsset` when the publish
     ///         input carries a non-zero `(ciphertextChunksRoot,
     ///         ciphertextChunkCount)` pair AND the owning CG is curated.
     ///         Off-chain indexers consume this to know which KCs participate
     ///         in the curated-CG sampling lottery (the picker treats
     ///         missing commitments as "skip this KC").
-    event KnowledgeCollectionCiphertextCommitmentSet(
+    event KnowledgeAssetCiphertextCommitmentSet(
         uint256 indexed id,
         bytes32 ciphertextChunksRoot,
         uint32 ciphertextChunkCount
@@ -75,32 +75,32 @@ contract DKGKnowledgeAssets is INamed, IVersioned, HubDependent, ERC721, Guardia
 
     string private _tokenURI;
 
-    uint256 public immutable KNOWLEDGE_COLLECTION_MAX_SIZE;
+    uint256 public immutable KNOWLEDGE_ASSET_BATCH_MAX_SIZE;
 
-    uint256 private _knowledgeCollectionsCounter;
+    uint256 private _knowledgeAssetsCounter;
     uint256 private _totalMintedKnowledgeAssetsCounter;
     uint256 private _totalBurnedKnowledgeAssetsCounter;
 
     uint96 private _totalTokenAmount;
 
-    mapping(uint256 => KnowledgeCollectionLib.KnowledgeCollection) public knowledgeCollections;
+    mapping(uint256 => KnowledgeAssetLib.KnowledgeAsset) public knowledgeAssets;
     mapping(uint256 => bool) public isKnowledgeAssetBurned;
 
     /// @dev Parallel mapping for V10.1+ author attestation.
     ///
     /// Why a parallel map and not a struct field on `MerkleRoot`:
-    /// `KnowledgeCollection.merkleRoots` is a dynamic array, so
+    /// `KnowledgeAsset.merkleRoots` is a dynamic array, so
     /// extending its element struct from 3 to 4 storage slots would
     /// shift the slot stride of every prior root entry — already-
     /// deployed KCs would decode their historical
     /// `publisher`/`merkleRoot`/`timestamp` from the wrong offsets.
     /// Layout-preserving fix: keep `MerkleRoot` at 3 slots and store
     /// the EIP-712-recovered author identity at
-    /// `merkleRootAuthors[kcId][rootIndex]`. `address(0)` means the
+    /// `merkleRootAuthors[kaId][rootIndex]`. `address(0)` means the
     /// state change at `rootIndex` did not carry an attestation
     /// (legacy V8/V9 mutations, V10.1 update path until vNext, etc).
     /// Indexers SHOULD prefer the indexed `author` topic on
-    /// `KnowledgeCollectionCreated` / `KnowledgeCollectionUpdated`
+    /// `KnowledgeAssetCreated` / `KnowledgeAssetUpdated`
     /// events; this on-chain mapping is the canonical lookup for
     /// `/api/kc/:id/author` and SPARQL author-filter queries.
     mapping(uint256 => mapping(uint256 => address)) public merkleRootAuthors;
@@ -115,11 +115,11 @@ contract DKGKnowledgeAssets is INamed, IVersioned, HubDependent, ERC721, Guardia
     /// batch — exactly the ciphertext chunks the curated CG's hosting
     /// cores persist via the LU-11 ACK envelope.
     ///
-    /// Parallel-mapping (not a struct field on `KnowledgeCollection`) for
+    /// Parallel-mapping (not a struct field on `KnowledgeAsset`) for
     /// two reasons: (1) avoids slot-stride drift in the existing dynamic
     /// `merkleRoots[]` array, identical reasoning to the
     /// `merkleRootAuthors` design above; (2) decouples RFC-39 evolution
-    /// from `KnowledgeCollectionLib.KnowledgeCollection`, which is
+    /// from `KnowledgeAssetLib.KnowledgeAsset`, which is
     /// concurrently being extended on other branches — keeping ciphertext
     /// commitment in its own slot space avoids merge friction.
     ///
@@ -147,10 +147,10 @@ contract DKGKnowledgeAssets is INamed, IVersioned, HubDependent, ERC721, Guardia
 
     constructor(
         address hubAddress,
-        uint256 _knowledgeCollectionMaxSize,
+        uint256 _knowledgeAssetBatchMaxSize,
         string memory uri
     ) ERC721("DKG Knowledge Asset", "DKA") Guardian(hubAddress) {
-        KNOWLEDGE_COLLECTION_MAX_SIZE = _knowledgeCollectionMaxSize;
+        KNOWLEDGE_ASSET_BATCH_MAX_SIZE = _knowledgeAssetBatchMaxSize;
         _tokenURI = uri;
     }
 
@@ -162,11 +162,11 @@ contract DKGKnowledgeAssets is INamed, IVersioned, HubDependent, ERC721, Guardia
         return _VERSION;
     }
 
-    function knowledgeCollectionMaxSize() external view returns (uint256) {
-        return KNOWLEDGE_COLLECTION_MAX_SIZE;
+    function knowledgeAssetBatchMaxSize() external view returns (uint256) {
+        return KNOWLEDGE_ASSET_BATCH_MAX_SIZE;
     }
 
-    function createKnowledgeCollection(
+    function createKnowledgeAsset(
         address publisher,
         address author,
         string calldata publishOperationId,
@@ -180,22 +180,22 @@ contract DKGKnowledgeAssets is INamed, IVersioned, HubDependent, ERC721, Guardia
         uint32 merkleLeafCount
     ) external onlyContracts returns (uint256) {
         if (knowledgeAssetsAmount != 1) {
-            revert KnowledgeCollectionLib.ExceededKnowledgeCollectionMaxSize(0, 0, knowledgeAssetsAmount, 1);
+            revert KnowledgeAssetLib.ExceededKnowledgeAssetBatchSize(0, 0, knowledgeAssetsAmount, 1);
         }
 
-        uint256 knowledgeCollectionId = ++_knowledgeCollectionsCounter;
+        uint256 knowledgeAssetId = ++_knowledgeAssetsCounter;
 
-        KnowledgeCollectionLib.KnowledgeCollection storage kc = knowledgeCollections[knowledgeCollectionId];
+        KnowledgeAssetLib.KnowledgeAsset storage kc = knowledgeAssets[knowledgeAssetId];
 
         kc.merkleRoots.push(
-            KnowledgeCollectionLib.MerkleRoot(publisher, merkleRoot, block.timestamp)
+            KnowledgeAssetLib.MerkleRoot(publisher, merkleRoot, block.timestamp)
         );
         // Unconditional write to overwrite any value at this slot.
-        // For `createKnowledgeCollection` the kcId is freshly minted so
+        // For `createKnowledgeAsset` the kaId is freshly minted so
         // the slot is guaranteed empty; the unconditional shape is kept
-        // for parity with `updateKnowledgeCollection` below, where the
+        // for parity with `updateKnowledgeAsset` below, where the
         // index can have been previously used (post-pop).
-        merkleRootAuthors[knowledgeCollectionId][kc.merkleRoots.length - 1] = author;
+        merkleRootAuthors[knowledgeAssetId][kc.merkleRoots.length - 1] = author;
         kc.byteSize = byteSize;
         kc.startEpoch = startEpoch;
         kc.endEpoch = endEpoch;
@@ -209,10 +209,10 @@ contract DKGKnowledgeAssets is INamed, IVersioned, HubDependent, ERC721, Guardia
 
         kc.minted = 1;
         _totalMintedKnowledgeAssetsCounter += 1;
-        _safeMint(author, knowledgeCollectionId);
+        _safeMint(author, knowledgeAssetId);
 
         emit KnowledgeAssetCreated(
-            knowledgeCollectionId,
+            knowledgeAssetId,
             author,
             publishOperationId,
             merkleRoot,
@@ -223,20 +223,20 @@ contract DKGKnowledgeAssets is INamed, IVersioned, HubDependent, ERC721, Guardia
             isImmutable
         );
 
-        return knowledgeCollectionId;
+        return knowledgeAssetId;
     }
 
-    function getKnowledgeCollection(
+    function getKnowledgeAsset(
         uint256 id
-    ) external view returns (KnowledgeCollectionLib.KnowledgeCollection memory) {
-        return knowledgeCollections[id];
+    ) external view returns (KnowledgeAssetLib.KnowledgeAsset memory) {
+        return knowledgeAssets[id];
     }
 
     /// @dev `author` is the verified author identity for this update or
     ///      `address(0)` when the update path doesn't carry an attestation
     ///      (current V10.1 update path emits zero; vNext will sign updates
     ///      against the same EIP-712 envelope as publish).
-    function updateKnowledgeCollection(
+    function updateKnowledgeAsset(
         address publisher,
         address author,
         uint256 id,
@@ -248,14 +248,14 @@ contract DKGKnowledgeAssets is INamed, IVersioned, HubDependent, ERC721, Guardia
         uint96 tokenAmount,
         uint32 merkleLeafCount
     ) external onlyContracts {
-        KnowledgeCollectionLib.KnowledgeCollection storage kc = knowledgeCollections[id];
+        KnowledgeAssetLib.KnowledgeAsset storage kc = knowledgeAssets[id];
 
         unchecked {
             _totalTokenAmount = _totalTokenAmount - kc.tokenAmount + tokenAmount;
         }
 
         kc.merkleRoots.push(
-            KnowledgeCollectionLib.MerkleRoot(publisher, merkleRoot, block.timestamp)
+            KnowledgeAssetLib.MerkleRoot(publisher, merkleRoot, block.timestamp)
         );
         // Unconditional overwrite — this index may have been written by
         // a previous create/update and then popped via `popMerkleRoot`,
@@ -277,7 +277,7 @@ contract DKGKnowledgeAssets is INamed, IVersioned, HubDependent, ERC721, Guardia
         // supported. Guard the mint call so metadata-only rotations work
         // end-to-end. See Codex review round 2, finding 6.
         if (mintKnowledgeAssetsAmount != 0 || knowledgeAssetsToBurn.length != 0) {
-            revert KnowledgeCollectionLib.ExceededKnowledgeCollectionMaxSize(
+            revert KnowledgeAssetLib.ExceededKnowledgeAssetBatchSize(
                 id,
                 kc.minted,
                 mintKnowledgeAssetsAmount,
@@ -293,7 +293,7 @@ contract DKGKnowledgeAssets is INamed, IVersioned, HubDependent, ERC721, Guardia
     /// `KnowledgeAssetsV10._executeUpdateCore`) that need the state
     /// summary but NOT the full history arrays.
     ///
-    /// Problem: `getKnowledgeCollectionMetadata` performs a full
+    /// Problem: `getKnowledgeAssetMetadata` performs a full
     /// storage → memory struct copy, which walks every entry of
     /// `merkleRoots[]` and `burned[]`. Because both arrays grow
     /// monotonically on every update, the memory cost (and thus gas
@@ -307,7 +307,7 @@ contract DKGKnowledgeAssets is INamed, IVersioned, HubDependent, ERC721, Guardia
     /// cost is constant regardless of history.
     ///
     /// Codex review round 3 finding 1.
-    function getKnowledgeCollectionUpdateContext(
+    function getKnowledgeAssetUpdateContext(
         uint256 id
     )
         external
@@ -322,7 +322,7 @@ contract DKGKnowledgeAssets is INamed, IVersioned, HubDependent, ERC721, Guardia
             uint32 merkleLeafCount
         )
     {
-        KnowledgeCollectionLib.KnowledgeCollection storage kc = knowledgeCollections[id];
+        KnowledgeAssetLib.KnowledgeAsset storage kc = knowledgeAssets[id];
         return (
             kc.merkleRoots.length,
             kc.minted,
@@ -335,9 +335,9 @@ contract DKGKnowledgeAssets is INamed, IVersioned, HubDependent, ERC721, Guardia
     }
 
     /// @notice Leaf count for the V10 flat-KC Merkle tree at latest root
-    ///         (see `merkleLeafCount` on `KnowledgeCollection`).
+    ///         (see `merkleLeafCount` on `KnowledgeAsset`).
     function getMerkleLeafCount(uint256 id) external view returns (uint32) {
-        return knowledgeCollections[id].merkleLeafCount;
+        return knowledgeAssets[id].merkleLeafCount;
     }
 
     /// @notice RFC-39 Phase A.5: write the curated ciphertext commitment for
@@ -364,7 +364,7 @@ contract DKGKnowledgeAssets is INamed, IVersioned, HubDependent, ERC721, Guardia
         ciphertextChunksRoots[id] = ciphertextChunksRoot;
         ciphertextChunkCounts[id] = ciphertextChunkCount;
 
-        emit KnowledgeCollectionCiphertextCommitmentSet(id, ciphertextChunksRoot, ciphertextChunkCount);
+        emit KnowledgeAssetCiphertextCommitmentSet(id, ciphertextChunksRoot, ciphertextChunkCount);
     }
 
     /// @notice RFC-39 Phase A.5: latest ciphertext-chunks Merkle root for a
@@ -384,13 +384,13 @@ contract DKGKnowledgeAssets is INamed, IVersioned, HubDependent, ERC721, Guardia
         return ciphertextChunkCounts[id];
     }
 
-    function getKnowledgeCollectionMetadata(
+    function getKnowledgeAssetMetadata(
         uint256 id
     )
         external
         view
         returns (
-            KnowledgeCollectionLib.MerkleRoot[] memory,
+            KnowledgeAssetLib.MerkleRoot[] memory,
             uint256[] memory,
             uint256,
             uint88,
@@ -400,7 +400,7 @@ contract DKGKnowledgeAssets is INamed, IVersioned, HubDependent, ERC721, Guardia
             bool
         )
     {
-        KnowledgeCollectionLib.KnowledgeCollection memory kc = knowledgeCollections[id];
+        KnowledgeAssetLib.KnowledgeAsset memory kc = knowledgeAssets[id];
 
         return (
             kc.merkleRoots,
@@ -416,20 +416,20 @@ contract DKGKnowledgeAssets is INamed, IVersioned, HubDependent, ERC721, Guardia
 
     /// @dev Greenfield: batch mint/burn removed. Updates rotate merkle state only.
     function mintKnowledgeAssetsTokens(uint256, address, uint256) public pure {
-        revert KnowledgeCollectionLib.ExceededKnowledgeCollectionMaxSize(0, 0, 1, 0);
+        revert KnowledgeAssetLib.ExceededKnowledgeAssetBatchSize(0, 0, 1, 0);
     }
 
     function burnKnowledgeAssetsTokens(uint256, address, uint256[] calldata) public pure {
-        revert KnowledgeCollectionLib.ExceededKnowledgeCollectionMaxSize(0, 0, 1, 0);
+        revert KnowledgeAssetLib.ExceededKnowledgeAssetBatchSize(0, 0, 1, 0);
     }
 
-    function getMerkleRoots(uint256 id) external view returns (KnowledgeCollectionLib.MerkleRoot[] memory) {
-        return knowledgeCollections[id].merkleRoots;
+    function getMerkleRoots(uint256 id) external view returns (KnowledgeAssetLib.MerkleRoot[] memory) {
+        return knowledgeAssets[id].merkleRoots;
     }
 
     function setMerkleRoots(
         uint256 id,
-        KnowledgeCollectionLib.MerkleRoot[] memory _merkleRoots
+        KnowledgeAssetLib.MerkleRoot[] memory _merkleRoots
     ) external onlyContracts {
         // Wholesale replacement — clear the parallel author mapping for
         // the union of old and new index ranges so stale authors from
@@ -439,37 +439,37 @@ contract DKGKnowledgeAssets is INamed, IVersioned, HubDependent, ERC721, Guardia
         // post-condition is "all entries unauthenticated until a
         // subsequent create/update writes them". Loop bounded by the
         // larger of the two lengths.
-        uint256 oldLen = knowledgeCollections[id].merkleRoots.length;
+        uint256 oldLen = knowledgeAssets[id].merkleRoots.length;
         uint256 newLen = _merkleRoots.length;
         uint256 maxLen = oldLen > newLen ? oldLen : newLen;
         for (uint256 i = 0; i < maxLen; i++) {
             delete merkleRootAuthors[id][i];
         }
-        knowledgeCollections[id].merkleRoots = _merkleRoots;
+        knowledgeAssets[id].merkleRoots = _merkleRoots;
 
-        emit KnowledgeCollectionMerkleRootsUpdated(id, _merkleRoots);
+        emit KnowledgeAssetMerkleRootsUpdated(id, _merkleRoots);
     }
 
     function getMerkleRootObjectByIndex(
         uint256 id,
         uint256 index
-    ) external view returns (KnowledgeCollectionLib.MerkleRoot memory) {
-        return knowledgeCollections[id].merkleRoots[index];
+    ) external view returns (KnowledgeAssetLib.MerkleRoot memory) {
+        return knowledgeAssets[id].merkleRoots[index];
     }
 
     function getMerkleRootByIndex(uint256 id, uint256 index) external view returns (bytes32) {
-        return knowledgeCollections[id].merkleRoots[index].merkleRoot;
+        return knowledgeAssets[id].merkleRoots[index].merkleRoot;
     }
 
     function getMerkleRootPublisherByIndex(uint256 id, uint256 index) external view returns (address) {
-        return knowledgeCollections[id].merkleRoots[index].publisher;
+        return knowledgeAssets[id].merkleRoots[index].publisher;
     }
 
     function getMerkleRootTimestampByIndex(uint256 id, uint256 index) external view returns (uint256) {
-        return knowledgeCollections[id].merkleRoots[index].timestamp;
+        return knowledgeAssets[id].merkleRoots[index].timestamp;
     }
 
-    function getLatestMerkleRootObject(uint256 id) external view returns (KnowledgeCollectionLib.MerkleRoot memory) {
+    function getLatestMerkleRootObject(uint256 id) external view returns (KnowledgeAssetLib.MerkleRoot memory) {
         return _safeGetLatestMerkleRootObject(id);
     }
 
@@ -490,7 +490,7 @@ contract DKGKnowledgeAssets is INamed, IVersioned, HubDependent, ERC721, Guardia
         // queries revert the same way as the other index-based getters,
         // rather than silently returning address(0) from the parallel
         // mapping (which has no concept of "valid index").
-        require(index < knowledgeCollections[id].merkleRoots.length, "Index out of bounds");
+        require(index < knowledgeAssets[id].merkleRoots.length, "Index out of bounds");
         return merkleRootAuthors[id][index];
     }
 
@@ -501,14 +501,14 @@ contract DKGKnowledgeAssets is INamed, IVersioned, HubDependent, ERC721, Guardia
     /// canonical "who authored this KC" lookup — chain wins over any
     /// off-chain `dkg:authoredBy` triple.
     function getLatestMerkleRootAuthor(uint256 id) external view returns (address) {
-        uint256 len = knowledgeCollections[id].merkleRoots.length;
+        uint256 len = knowledgeAssets[id].merkleRoots.length;
         if (len == 0) return address(0);
         return merkleRootAuthors[id][len - 1];
     }
 
     function pushMerkleRoot(address publisher, uint256 id, bytes32 merkleRoot) external onlyContracts {
-        knowledgeCollections[id].merkleRoots.push(
-            KnowledgeCollectionLib.MerkleRoot(publisher, merkleRoot, block.timestamp)
+        knowledgeAssets[id].merkleRoots.push(
+            KnowledgeAssetLib.MerkleRoot(publisher, merkleRoot, block.timestamp)
         );
         // Defensive clear: this index may have been used by a previously
         // popped author entry (`merkleRoots.length` cycles via push/pop).
@@ -516,15 +516,15 @@ contract DKGKnowledgeAssets is INamed, IVersioned, HubDependent, ERC721, Guardia
         // pop would inherit the popped entry's author and `getLatestMerkleRootAuthor`
         // would lie. Legacy `pushMerkleRoot` carries no author by design —
         // always zero the parallel slot.
-        delete merkleRootAuthors[id][knowledgeCollections[id].merkleRoots.length - 1];
+        delete merkleRootAuthors[id][knowledgeAssets[id].merkleRoots.length - 1];
 
-        emit KnowledgeCollectionMerkleRootAdded(id, merkleRoot);
+        emit KnowledgeAssetMerkleRootAdded(id, merkleRoot);
     }
 
     function popMerkleRoot(uint256 id) external onlyContracts {
-        uint256 oldLen = knowledgeCollections[id].merkleRoots.length;
+        uint256 oldLen = knowledgeAssets[id].merkleRoots.length;
         bytes32 latestMerkleRoot = _safeGetLatestMerkleRootObject(id).merkleRoot;
-        knowledgeCollections[id].merkleRoots.pop();
+        knowledgeAssets[id].merkleRoots.pop();
         // Clear the parallel author slot for the popped index. Without
         // this, the slot survives and a later push at the same index can
         // resurrect a stale author. `oldLen > 0` guards the empty-array
@@ -535,76 +535,76 @@ contract DKGKnowledgeAssets is INamed, IVersioned, HubDependent, ERC721, Guardia
             delete merkleRootAuthors[id][oldLen - 1];
         }
 
-        emit KnowledgeCollectionMerkleRootRemoved(id, latestMerkleRoot);
+        emit KnowledgeAssetMerkleRootRemoved(id, latestMerkleRoot);
     }
 
     function getMinted(uint256 id) external view returns (uint256) {
-        return knowledgeCollections[id].minted;
+        return knowledgeAssets[id].minted;
     }
 
     function setMinted(uint256 id, uint256 _minted) external onlyContracts {
-        knowledgeCollections[id].minted = _minted;
+        knowledgeAssets[id].minted = _minted;
 
-        emit KnowledgeCollectionMintedUpdated(id, _minted);
+        emit KnowledgeAssetMintedUpdated(id, _minted);
     }
 
     function getBurned(uint256 id) external view returns (uint256[] memory) {
-        return knowledgeCollections[id].burned;
+        return knowledgeAssets[id].burned;
     }
 
     function getBurnedAmount(uint256 id) external view returns (uint256) {
-        return knowledgeCollections[id].burned.length;
+        return knowledgeAssets[id].burned.length;
     }
 
     function setBurned(uint256 id, uint256[] calldata _burned) external onlyContracts {
-        knowledgeCollections[id].burned = _burned;
+        knowledgeAssets[id].burned = _burned;
 
-        emit KnowledgeCollectionBurnedUpdated(id, _burned);
+        emit KnowledgeAssetBurnedUpdated(id, _burned);
     }
 
     function getByteSize(uint256 id) external view returns (uint88) {
-        return knowledgeCollections[id].byteSize;
+        return knowledgeAssets[id].byteSize;
     }
 
     function setByteSize(uint256 id, uint88 _byteSize) external onlyContracts {
-        knowledgeCollections[id].byteSize = _byteSize;
+        knowledgeAssets[id].byteSize = _byteSize;
 
-        emit KnowledgeCollectionByteSizeUpdated(id, _byteSize);
+        emit KnowledgeAssetByteSizeUpdated(id, _byteSize);
     }
 
     function getTokenAmount(uint256 id) external view returns (uint96) {
-        return knowledgeCollections[id].tokenAmount;
+        return knowledgeAssets[id].tokenAmount;
     }
 
     function setTokenAmount(uint256 id, uint96 _tokenAmount) external onlyContracts {
-        _totalTokenAmount = _totalTokenAmount - knowledgeCollections[id].tokenAmount + _tokenAmount;
-        knowledgeCollections[id].tokenAmount = _tokenAmount;
+        _totalTokenAmount = _totalTokenAmount - knowledgeAssets[id].tokenAmount + _tokenAmount;
+        knowledgeAssets[id].tokenAmount = _tokenAmount;
 
-        emit KnowledgeCollectionTokenAmountUpdated(id, _tokenAmount);
+        emit KnowledgeAssetTokenAmountUpdated(id, _tokenAmount);
     }
 
     function getStartEpoch(uint256 id) external view returns (uint40) {
-        return knowledgeCollections[id].startEpoch;
+        return knowledgeAssets[id].startEpoch;
     }
 
     function setStartEpoch(uint256 id, uint40 _startEpoch) external onlyContracts {
-        knowledgeCollections[id].startEpoch = _startEpoch;
+        knowledgeAssets[id].startEpoch = _startEpoch;
 
-        emit KnowledgeCollectionStartEpochUpdated(id, _startEpoch);
+        emit KnowledgeAssetStartEpochUpdated(id, _startEpoch);
     }
 
     function getEndEpoch(uint256 id) external view returns (uint40) {
-        return knowledgeCollections[id].endEpoch;
+        return knowledgeAssets[id].endEpoch;
     }
 
     function setEndEpoch(uint256 id, uint40 _endEpoch) external onlyContracts {
-        knowledgeCollections[id].endEpoch = _endEpoch;
+        knowledgeAssets[id].endEpoch = _endEpoch;
 
-        emit KnowledgeCollectionEndEpochUpdated(id, _endEpoch);
+        emit KnowledgeAssetEndEpochUpdated(id, _endEpoch);
     }
 
-    function getLatestKnowledgeCollectionId() external view returns (uint256) {
-        return _knowledgeCollectionsCounter;
+    function getLatestKnowledgeAssetId() external view returns (uint256) {
+        return _knowledgeAssetsCounter;
     }
 
     function currentTotalSupply() external view returns (uint256) {
@@ -623,11 +623,11 @@ contract DKGKnowledgeAssets is INamed, IVersioned, HubDependent, ERC721, Guardia
         return _totalTokenAmount;
     }
 
-    function isPartOfKnowledgeCollection(uint256 id, uint256 tokenId) external view returns (bool) {
+    function isPartOfKnowledgeAsset(uint256 id, uint256 tokenId) external view returns (bool) {
         return id == tokenId && _ownerOf(tokenId) != address(0);
     }
 
-    function getKnowledgeCollectionId(uint256 tokenId) external view returns (uint256) {
+    function getKnowledgeAssetId(uint256 tokenId) external view returns (uint256) {
         if (_ownerOf(tokenId) == address(0)) {
             return 0;
         }
@@ -635,7 +635,7 @@ contract DKGKnowledgeAssets is INamed, IVersioned, HubDependent, ERC721, Guardia
     }
 
     function getKnowledgeAssetsRange(uint256 id) external view returns (uint256, uint256, uint256[] memory) {
-        KnowledgeCollectionLib.KnowledgeCollection memory kc = knowledgeCollections[id];
+        KnowledgeAssetLib.KnowledgeAsset memory kc = knowledgeAssets[id];
         if (kc.minted == 0) {
             return (0, 0, kc.burned);
         }
@@ -643,11 +643,11 @@ contract DKGKnowledgeAssets is INamed, IVersioned, HubDependent, ERC721, Guardia
     }
 
     function getKnowledgeAssetsAmount(uint256 id) external view returns (uint256) {
-        KnowledgeCollectionLib.KnowledgeCollection memory kc = knowledgeCollections[id];
+        KnowledgeAssetLib.KnowledgeAsset memory kc = knowledgeAssets[id];
         return kc.minted - kc.burned.length;
     }
 
-    function isKnowledgeCollectionOwner(address owner, uint256 id) external view returns (bool) {
+    function isKnowledgeAssetOwner(address owner, uint256 id) external view returns (bool) {
         return ownerOf(id) == owner;
     }
 
@@ -663,10 +663,10 @@ contract DKGKnowledgeAssets is INamed, IVersioned, HubDependent, ERC721, Guardia
 
     function _safeGetLatestMerkleRootObject(
         uint256 id
-    ) internal view returns (KnowledgeCollectionLib.MerkleRoot memory) {
-        KnowledgeCollectionLib.KnowledgeCollection memory kc = knowledgeCollections[id];
+    ) internal view returns (KnowledgeAssetLib.MerkleRoot memory) {
+        KnowledgeAssetLib.KnowledgeAsset memory kc = knowledgeAssets[id];
         if (kc.merkleRoots.length == 0) {
-            return KnowledgeCollectionLib.MerkleRoot(address(0), bytes32(0), 0);
+            return KnowledgeAssetLib.MerkleRoot(address(0), bytes32(0), 0);
         }
         return kc.merkleRoots[kc.merkleRoots.length - 1];
     }

@@ -27,7 +27,7 @@
 #      "On-chain confirmed: UAL=... batchId=N tx=0x..." (format from
 #      dkg-publisher.ts:1252). Extracts batchId + tx.
 #   6. Verifies the KC is readable back via
-#      KnowledgeCollectionStorage.getKnowledgeCollectionMetadata(batchId) —
+#      KnowledgeCollectionStorage.getKnowledgeAssetMetadata(batchId) —
 #      merkleRoots array non-empty and byteSize > 0.
 #   7. Exits 0 on success with "Published KC id=N tx=0x..."; non-zero otherwise.
 #
@@ -82,10 +82,10 @@ for abi in ContextGraphs ContextGraphStorage IdentityStorage; do
 done
 if [ -f "$EVM_ABI_DIR/DKGKnowledgeAssets.json" ]; then
   KCS_ABI="DKGKnowledgeAssets.json"
-elif [ -f "$EVM_ABI_DIR/KnowledgeCollectionStorage.json" ]; then
-  KCS_ABI="KnowledgeCollectionStorage.json"
+elif [ -f "$EVM_ABI_DIR/DKGKnowledgeAssets.json" ]; then
+  KCS_ABI="DKGKnowledgeAssets.json"
 else
-  fail "missing ABI: $EVM_ABI_DIR/DKGKnowledgeAssets.json (or legacy KnowledgeCollectionStorage.json)"
+  fail "missing ABI: $EVM_ABI_DIR/DKGKnowledgeAssets.json (or legacy DKGKnowledgeAssets.json)"
 fi
 
 log "Preconditions OK (hardhat pid=$HARDHAT_PID, node $NODE_NUM pid=$NODE_PID, api :$API_PORT)"
@@ -133,7 +133,7 @@ CG_ONCHAIN_ID=$(printf '%s\n' "$REG_OUT" | sed -nE 's/.*On-chain:[[:space:]]+([0
 [ -n "$CG_ONCHAIN_ID" ] || fail "could not parse on-chain id from register output:\n$REG_OUT"
 # The slug is what `dkg publish` and the data-graph URI both consume;
 # CG_ONCHAIN_ID is only used in the post-publish KCS verification at
-# step 6 (kcsAddr.getKnowledgeCollectionMetadata takes a numeric KC id,
+# step 6 (kcsAddr.getKnowledgeAssetMetadata takes a numeric KC id,
 # but the publish receipt gives us batchId directly so CG_ONCHAIN_ID is
 # only kept for logging / debug context).
 CG_ID="$CG_FQ_ID"
@@ -215,13 +215,13 @@ const path = require("path");
   const kcsAddr = contracts.DKGKnowledgeAssets?.evmAddress ?? contracts.KnowledgeCollectionStorage?.evmAddress;
   if (!kcsAddr) throw new Error("DKGKnowledgeAssets / KnowledgeCollectionStorage not deployed");
 
-  const kcsAbiFile = fs.existsSync(path.join(process.env.ABI_DIR, "DKGKnowledgeAssets.json")) ? "DKGKnowledgeAssets.json" : "KnowledgeCollectionStorage.json";
+  const kcsAbiFile = fs.existsSync(path.join(process.env.ABI_DIR, "DKGKnowledgeAssets.json")) ? "DKGKnowledgeAssets.json" : "DKGKnowledgeAssets.json";
   const kcsAbi = JSON.parse(fs.readFileSync(path.join(process.env.ABI_DIR, kcsAbiFile), "utf8"));
-  const kcs = new ethers.Contract(kcsAddr, kcsAbi, provider);
+  const kas = new ethers.Contract(kcsAddr, kcsAbi, provider);
 
   const id = BigInt(process.env.BATCH_ID);
   const [merkleRoots, burned, minted, byteSize, startEpoch, endEpoch, tokenAmount, isImmutable] =
-    await kcs.getKnowledgeCollectionMetadata(id);
+    await kas.getKnowledgeAssetMetadata(id);
 
   if (!merkleRoots || merkleRoots.length === 0) {
     throw new Error("merkleRoots empty — KC not actually created");
@@ -229,7 +229,7 @@ const path = require("path");
   if (byteSize === 0n) {
     throw new Error("byteSize is zero — KC degenerate");
   }
-  console.error("[kcs] merkleRoots=" + merkleRoots.length +
+  console.error("[kas] merkleRoots=" + merkleRoots.length +
                 " minted=" + minted +
                 " byteSize=" + byteSize +
                 " tokenAmount=" + tokenAmount +

@@ -65,7 +65,7 @@ describe('DKGPublisher', () => {
     const cgId = await createTestContextGraph(chain);
     CONTEXT_GRAPH = String(cgId);
     GRAPH = `did:dkg:context-graph:${CONTEXT_GRAPH}`;
-    _kav10Address = await chain.getKnowledgeAssetsV10Address();
+    _kav10Address = await chain.getKnowledgeAssetsLifecycleAddress();
     _dkaAddress = (await chain.getDKGKnowledgeAssetsAddress!()).toLowerCase();
   });
 
@@ -88,15 +88,15 @@ describe('DKGPublisher', () => {
       v10ACKProvider: args.v10ACKProvider ?? getAckProvider(),
     });
   }
-  async function updateWS(kcId: bigint, args: Parameters<DKGPublisher['update']>[1]) {
+  async function updateWS(kaId: bigint, args: Parameters<DKGPublisher['update']>[1]) {
     const seal = await buildUpdateSeal({
-      kaId: kcId,
+      kaId: kaId,
       quads: args.quads,
       privateQuads: args.privateQuads,
       author: _author,
       ctx: { provider: _provider, kav10Address: _kav10Address },
     });
-    return publisher.update(kcId, {
+    return publisher.update(kaId, {
       ...args,
       precomputedUpdateAttestation: seal,
       v10ACKProvider: args.v10ACKProvider ?? getAckProvider(),
@@ -251,7 +251,7 @@ describe('DKGPublisher', () => {
       quads: [q(ENTITY, 'http://schema.org/name', '"OldName"')],
     });
 
-    const updated = await updateWS(initial.kcId, {
+    const updated = await updateWS(initial.kaId, {
       contextGraphId: CONTEXT_GRAPH,
       quads: [q(ENTITY, 'http://schema.org/name', '"NewName"')],
     });
@@ -529,10 +529,10 @@ describe('DKGPublisher', () => {
       // internal-token discriminator.
       //
       // We can't actually reach the on-chain part of update() in a
-      // unit test (it expects an existing kcId to update), but the
+      // unit test (it expects an existing kaId to update), but the
       // guard fires at the very top of the method BEFORE any chain
       // interaction — so the reserved-namespace rejection surfaces
-      // independently of whether the kcId exists.
+      // independently of whether the kaId exists.
       await expect(
         updateWS(0n, {
           contextGraphId: CONTEXT_GRAPH,
@@ -779,7 +779,7 @@ describe('DKGPublisher', () => {
           quads: [q('urn:dkg:filesystem:foo', 'http://schema.org/name', '"near-miss"')],
         });
         expect(result.ual).toMatch(/^did:dkg:/);
-        expect(result.kcId).toBeGreaterThan(0n);
+        expect(result.kaId).toBeGreaterThan(0n);
         expect(result.status === 'confirmed' || result.status === 'tentative').toBe(true);
       });
 
@@ -797,7 +797,7 @@ describe('DKGPublisher', () => {
           quads: [q('http://example.com/bug41-notreserved', 'http://schema.org/name', '"legit"')],
         });
         expect(result.ual).toMatch(/^did:dkg:/);
-        expect(result.kcId).toBeGreaterThan(0n);
+        expect(result.kaId).toBeGreaterThan(0n);
         expect(result.status === 'confirmed' || result.status === 'tentative').toBe(true);
       });
     });

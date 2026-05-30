@@ -396,18 +396,18 @@ contract ContextGraphs is INamed, IVersioned, ContractStatus, IInitializable {
 
     /**
      * @notice Bind a Knowledge Collection to a Context Graph via the facade.
-     * @dev Thin wrapper over `ContextGraphStorage.registerKCToContextGraph`.
+     * @dev Thin wrapper over `ContextGraphStorage.registerKnowledgeAssetToContextGraph`.
      *      Exists so Phase 8's `KnowledgeAssetsV10.publish` / `publishDirect`
      *      can call the facade (stable interface) instead of reaching into
      *      storage directly. `onlyContracts`-gated at the facade layer so the
      *      entry point has one canonical caller — the KA contract — and no
      *      direct EOA call path.
      */
-    function registerKnowledgeCollection(
+    function registerKnowledgeAsset(
         uint256 contextGraphId,
-        uint256 kcId
+        uint256 kaId
     ) external onlyContracts {
-        contextGraphStorage.registerKCToContextGraph(contextGraphId, kcId);
+        contextGraphStorage.registerKnowledgeAssetToContextGraph(contextGraphId, kaId);
     }
 
     // --- Internal: PCA coherence validation ---

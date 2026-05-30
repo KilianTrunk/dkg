@@ -90,7 +90,7 @@ node_op_addr() {
   python3 -c "import json;print(json.load(open('$DEVNET_DIR/node$1/wallets.json'))['wallets'][0]['address'])" 2>/dev/null
 }
 
-# Resolve the on-chain KA owner (DKGKnowledgeAssets.ownerOf(kcId)) and return the
+# Resolve the on-chain KA owner (DKGKnowledgeAssets.ownerOf(kaId)) and return the
 # matching private key from any node's publisher-wallets.json. KC tokens are
 # minted to the EOA that submitted the on-chain publish (the daemon's publisher
 # wallet of whichever node finalized the SWM publish). Because every node has
@@ -100,7 +100,7 @@ node_op_addr() {
 # signature. This helper scans every devnet node's publisher-wallets.json plus
 # operator wallets.json[0..N] and prints "address<TAB>privateKey" for the match.
 # Returns nonzero if the owner address can't be matched against any local key.
-# Args: kcId
+# Args: kaId
 ka_owner_key() {
   local kc=$1
   local owner addr key
@@ -133,9 +133,9 @@ PY
 
 # Build POST /api/update JSON with precomputedUpdateAttestation (RC12 requires it).
 # The seal author MUST equal the on-chain KA owner (KnowledgeAssetsLifecycle._verifyUpdateAuthorAttestation
-# + the `p.authorAddress != kcs.ownerOf(p.id)` revert), so we ignore the
+# + the `p.authorAddress != kas.ownerOf(p.id)` revert), so we ignore the
 # originating node and resolve the owner key from chain state.
-# Args: node_num kcId contextGraphId quads_json_array_string
+# Args: node_num kaId contextGraphId quads_json_array_string
 build_update_body() {
   local node=$1 kc=$2 cg=$3 quads_json=$4 key seal owner_line
   owner_line=$(ka_owner_key "$kc") || return 1
@@ -149,7 +149,7 @@ if not wrap.get('ok'):
     sys.stderr.write(wrap.get('error','seal failed') + '\n')
     sys.exit(1)
 body = {
-    'kcId': sys.argv[2],
+    'kaId': sys.argv[2],
     'contextGraphId': sys.argv[3],
     'quads': json.loads(sys.argv[4]),
     'precomputedUpdateAttestation': wrap['precomputedUpdateAttestation'],
@@ -215,14 +215,40 @@ else log "FATAL: no auth token (set DKG_AUTH or run devnet)"; exit 2; fi
 export DKG_AUTH="$AUTH"
 H="Authorization: Bearer $AUTH"
 
-# Default 30s curl budget was too tight under heavy chain load: bulk publishes
-# spawn ~80 in-flight on-chain txs in parallel, and any concurrent /api/query,
-# /api/assertion/create, /api/random-sampling/status read sometimes exceeds
-# 30s while the daemon's request queue drains. 90s is comfortably above the
-# observed worst case while still failing fast on a hung daemon.
-api()  { curl -s --max-time 90 -H "$H" "$@"; }
-post() { local port=$1; shift; api -X POST -H "Content-Type: application/json" "http://127.0.0.1:$port$@"; }
-get()  { local port=$1; shift; api "http://127.0.0.1:$port$@"; }
+# Default curl budget for control-plane calls (/api/status, CG setup, chat, …).
+# Long-running publish/update/query paths use `post_long`/`api_long` (180s).
+# Even 90s proved too tight for /api/update under sustained bulk-publish
+# load (B-section fires ~20 in-flight updates while curate-publish ACKs
+# drain); those paths get the explicit 180s budget instead of widening
+# every harness call.
+API_TIMEOUT="${HARNESS_API_TIMEOUT:-90}"
+API_LONG_TIMEOUT="${HARNESS_API_LONG_TIMEOUT:-180}"
+api()      { curl -s --max-time "$API_TIMEOUT" -H "$H" "$@"; }
+api_long() { curl -s --max-time "$API_LONG_TIMEOUT" -H "$H" "$@"; }
+post()      { local port=$1; shift; api -X POST -H "Content-Type: application/json" "http://127.0.0.1:$port$@"; }
+post_long() { local port=$1; shift; api_long -X POST -H "Content-Type: application/json" "http://127.0.0.1:$port$@"; }
+get()       { local port=$1; shift; api "http://127.0.0.1:$port$@"; }
+get_long()  { local port=$1; shift; api_long "http://127.0.0.1:$port$@"; }
+
+# Section B /api/update: cap each curl to remaining section budget (not a
+# hard "must have 180s left" gate — a 5s update with 30s left is fine).
+# Response is stored in POST_UPDATE_LAST (not $(...) — subshell would drop
+# UPD_BUDGET_EXHAUSTED).
+POST_UPDATE_LAST=""
+post_update_bounded() {
+  local port=$1; shift
+  local remain=$(( UPD_SECTION_DEADLINE - $(date +%s) ))
+  if [ "$remain" -le 5 ]; then
+    UPD_BUDGET_EXHAUSTED=1
+    POST_UPDATE_LAST=""
+    return 1
+  fi
+  local cap="${API_LONG_TIMEOUT:-180}"
+  if [ "$remain" -lt "$cap" ]; then cap=$remain; fi
+  POST_UPDATE_LAST=$(curl -s --max-time "$cap" -H "$H" -H "Content-Type: application/json" \
+    -X POST "http://127.0.0.1:${port}$@") || return 1
+  return 0
+}
 
 DOWN=""
 for n in $(seq 1 "$NUM_NODES"); do
@@ -479,9 +505,9 @@ publish_one() { # idx node cgid kind
         "http://127.0.0.1:$port/api/shared-memory/publish" \
         -d "{\"contextGraphId\":\"$cgid\",\"selection\":{\"rootEntities\":[\"$root\"]},\"clearAfter\":false}")
     st=$(echo "$p" | pyf "d.get('status','')")
-    kc=$(echo "$p" | pyf "d.get('kcId','')")
+    kc=$(echo "$p" | pyf "d.get('kaId','')")
     if [ "$st" = "confirmed" ] || [ "$st" = "finalized" ]; then
-      printf '{"idx":"%s","node":%d,"cg":"%s","kind":"%s","entities":%d,"ok":true,"kcId":"%s","status":"%s","root":"%s"}\n' \
+      printf '{"idx":"%s","node":%d,"cg":"%s","kind":"%s","entities":%d,"ok":true,"kaId":"%s","status":"%s","root":"%s"}\n' \
         "$idx" "$node" "$cgid" "$kind" "$E" "$kc" "$st" "$root" >> "$METRICS_JSONL"
       return 0
     fi
@@ -589,29 +615,31 @@ if [ "${CUR_KA:-0}" -gt 0 ]; then pass A curated-publish "$CUR_KA KAs published 
 # ── Section B: updates across CG variants ────────────────────────────────────
 section "B. UPDATES — update a sample of published KAs across CG variants"
 UPD_OK=0; UPD_TRY=0
-# Sample up to 40 confirmed PUBLIC KAs spread across distinct CGs.
-# Curated CGs require ciphertext-commitment rotation on every update
-# (KnowledgeAssetsLifecycle.update reverts with IncompleteCiphertextCommitment
-# if a previously-committed KC sees a zero-pair update). The release-validation
-# harness doesn't currently produce curated commitments — testing curated
-# updates would mean threading newCiphertextChunksRoot/Count through the seal,
-# which is out of scope for a release gate. Restricting to public CGs keeps
-# the test honest: it asserts "RC12 update path works end-to-end", which is
-# exactly what this section advertises.
-SAMPLE=$(grep '"ok":true' "$METRICS_JSONL" | python3 -c "
-import sys,json
-seen={}; out=[]
+# Sample up to max(16, TARGET_CGS) PUBLIC KAs, round-robin across CGs.
+# Curated KAs are intentionally excluded: updates need allowlisted ciphers and
+# rotated keys this harness does not thread (curated publish is covered in §A).
+SAMPLE=$(grep '"ok":true' "$METRICS_JSONL" | TARGET_CGS="$TARGET_CGS" python3 -c "
+import os,sys,json
+by_cg={}
 for l in sys.stdin:
     try: r=json.loads(l)
     except Exception: continue
-    if not r.get('kcId'): continue
-    if r.get('kind') != 'public': continue
+    if not r.get('kaId') or r.get('kind') != 'public': continue
     k=r['cg']
-    if seen.get(k,0) < 4:
-        seen[k]=seen.get(k,0)+1
-        out.append(f\"{r['node']}|{r['cg']}|{r['kcId']}|{r['root']}\")
-    if len(out)>=40: break
+    by_cg.setdefault(k, []).append(f\"{r['node']}|{r['cg']}|{r['kaId']}|{r['root']}\")
+MAX=max(16, int(os.environ.get('TARGET_CGS', '12')))
+if os.environ.get('HARNESS_UPD_MAX'):
+    MAX=min(MAX, int(os.environ['HARNESS_UPD_MAX']))
+out=[]
+while len(out) < MAX and any(by_cg.values()):
+    for k in list(by_cg.keys()):
+        bucket=by_cg.get(k) or []
+        if bucket:
+            out.append(bucket.pop(0))
+            if len(out) >= MAX: break
 print('\n'.join(out))")
+UPD_SECTION_DEADLINE=$(( $(date +%s) + ${HARNESS_UPD_SECTION_BUDGET_S:-900} ))
+UPD_BUDGET_EXHAUSTED=0
 while IFS='|' read -r un uc ukc uroot; do
   [ -z "$uc" ] && continue
   UPD_TRY=$((UPD_TRY+1))
@@ -619,11 +647,17 @@ while IFS='|' read -r un uc ukc uroot; do
   newuri="${uroot}/upd${UPD_TRY}"
   quads_json="[{\"subject\":\"$newuri\",\"predicate\":\"http://www.w3.org/1999/02/22-rdf-syntax-ns#type\",\"object\":\"http://schema.org/UpdateAction\",\"graph\":\"\"},{\"subject\":\"$newuri\",\"predicate\":\"http://schema.org/name\",\"object\":\"\\\"upd-$UPD_TRY\\\"\",\"graph\":\"\"}]"
   body=$(build_update_body "$un" "$ukc" "$uc" "$quads_json") || continue
-  r=$(post "$uport" /api/update -d "$body")
+  if ! post_update_bounded "$uport" /api/update -d "$body"; then
+    if [ "$UPD_BUDGET_EXHAUSTED" = "1" ]; then break; fi
+    continue
+  fi
+  r="$POST_UPDATE_LAST"
   stt=$(echo "$r" | pyf "d.get('status','')")
   { [ "$stt" = "confirmed" ] || [ "$stt" = "finalized" ]; } && UPD_OK=$((UPD_OK+1))
 done <<< "$SAMPLE"
-if [ "$UPD_OK" -gt 0 ] && [ "$UPD_OK" -ge $((UPD_TRY * 7 / 10)) ]; then
+if [ "$UPD_BUDGET_EXHAUSTED" = "1" ]; then
+  fail B ka-update "budget-limited: $UPD_OK/$UPD_TRY updates incomplete (${HARNESS_UPD_SECTION_BUDGET_S:-900}s cap)"
+elif [ "$UPD_OK" -gt 0 ] && [ "$UPD_OK" -ge $((UPD_TRY * 7 / 10)) ]; then
   pass B ka-update "$UPD_OK/$UPD_TRY KA updates confirmed across CG variants"
 elif [ "$UPD_OK" -gt 0 ]; then
   warn B ka-update "$UPD_OK/$UPD_TRY KA updates confirmed (below 70%)"
@@ -642,13 +676,16 @@ for l in sys.stdin:
 if [ -n "$SROOT" ]; then
   sn=$(echo "$SROOT"|awk '{print $1}'); sc=$(echo "$SROOT"|awk '{print $2}'); sr=$(echo "$SROOT"|awk '{print $3}')
   sp="${NODE_PORT[$((sn-1))]}"
-  vm=$(post "$sp" /api/query -d "{\"sparql\":\"SELECT ?p WHERE { GRAPH ?g { <$sr> ?p ?o } FILTER(CONTAINS(STR(?g),\\\"$sc\\\")) } LIMIT 1\",\"contextGraphId\":\"$sc\",\"view\":\"verified-memory\"}")
+  vm=$(post_long "$sp" /api/query -d "{\"sparql\":\"SELECT ?p WHERE { GRAPH ?g { <$sr> ?p ?o } FILTER(CONTAINS(STR(?g),\\\"$sc\\\")) } LIMIT 1\",\"contextGraphId\":\"$sc\",\"view\":\"verified-memory\"}")
   vmb=$(echo "$vm" | pyf "len(d.get('result',{}).get('bindings',[]))")
   [ "${vmb:-0}" -gt 0 ] && pass A vm-view "published KA visible in verified-memory view" || warn A vm-view "KA not in VM view yet (got $vm | first 120: ${vm:0:120})"
   # peer replication: query another node
   pn=$(( sn % NUM_NODES + 1 )); pp="${NODE_PORT[$((pn-1))]}"
   found=0
   for _ in $(seq 1 20); do
+    # Retry probes use the short control-plane budget (90s); replication
+    # should succeed within seconds once gossip settles, not block for 180s
+    # per attempt (Codex round-2 on the tier-verify poll loop).
     rep=$(post "$pp" /api/query -d "{\"sparql\":\"SELECT ?p WHERE { GRAPH ?g { <$sr> ?p ?o } FILTER(CONTAINS(STR(?g),\\\"$sc\\\")) } LIMIT 1\",\"contextGraphId\":\"$sc\"}")
     [ "$(echo "$rep" | pyf "len(d.get('result',{}).get('bindings',[]))")" -gt 0 ] 2>/dev/null && { found=1; break; }
     sleep 3
@@ -899,14 +936,14 @@ section "I. OWNERSHIP TRANSFER — transfer a KA and update as new owner"
 # node ends up owning everything because the publisher routing is sticky to
 # the node that drained SWM first). The originating node in metrics.jsonl is
 # the request initiator, NOT necessarily the on-chain owner — so we resolve
-# the real owner via DKGKnowledgeAssets.ownerOf(kcId) and pick a destination
+# the real owner via DKGKnowledgeAssets.ownerOf(kaId) and pick a destination
 # address that is provably distinct from the owner.
 OREC=$(grep '"ok":true' "$METRICS_JSONL" | python3 -c "
 import sys,json
 for l in sys.stdin:
     r=json.loads(l)
-    if r.get('kcId') and r.get('kind')=='public':
-        print(r['cg'], r['kcId'], r['root']); break")
+    if r.get('kaId') and r.get('kind')=='public':
+        print(r['cg'], r['kaId'], r['root']); break")
 if [ -n "$OREC" ]; then
   ocg=$(echo "$OREC"|awk '{print $1}'); okc=$(echo "$OREC"|awk '{print $2}'); oroot=$(echo "$OREC"|awk '{print $3}')
   KA_ABI="$REPO_ROOT/packages/evm-module/abi/DKGKnowledgeAssets.json"
@@ -953,33 +990,27 @@ if [ -n "$OREC" ]; then
   # to POST against. Use node1 (or whichever core is up first) — the daemon
   # only forwards the precomputed seal, it doesn't re-sign.
   #
-  # NOTE: this assertion is currently demoted to WARN because the daemon's
-  # update path has a `newTokenAmount` accounting gap that interacts badly
-  # with small-payload updates on large pre-existing KCs: the chain adapter
-  # sends `newTokenAmount = max(currentTokenAmount, requiredForNewSize)`,
-  # so when the new byteSize is slightly larger than the original but the
-  # current amount already exceeds the new-size cost, `deltaTokenAmount = 0`
-  # and KnowledgeAssetsLifecycle._validateTokenAmount reverts with
-  # InvalidTokenAmount(1,0). The transfer leg is the actual release-gate
-  # behaviour for ownership; verifying "the new owner can publish" requires
-  # a daemon-side fix (compute `newTokenAmount = currentTokenAmount + cost(byteSizeGrowth, remainingEpochs)`)
-  # that is out of scope for this harness. Tracked at
-  # https://github.com/OriginTrail/dkg/issues/831 — once the daemon is fixed,
-  # promote this back to fail-on-non-confirmed.
+  # Hard FAIL on a non-confirmed status. The previously-tracked daemon
+  # `newTokenAmount` accounting gap (issue #831 — daemon under-paid for
+  # byteSize growth and reverted with `InvalidTokenAmount(1, 0)`) was fixed
+  # by adding `computeUpdateNewTokenAmount` in `packages/chain/src/evm-adapter.ts`:
+  # the daemon now pays the exact marginal cost of byteSize growth over the
+  # remaining lifetime, so a new-owner update on a transferred KA must land
+  # cleanly. If this regresses, treat it as a real release-gate failure.
   if [ "$xfer_ok" = "1" ]; then
     nuri="${oroot}/owner2"
     oquads="[{\"subject\":\"$nuri\",\"predicate\":\"http://www.w3.org/1999/02/22-rdf-syntax-ns#type\",\"object\":\"http://schema.org/UpdateAction\",\"graph\":\"\"},{\"subject\":\"$nuri\",\"predicate\":\"http://schema.org/name\",\"object\":\"\\\"owner2-upd\\\"\",\"graph\":\"\"}]"
     ob=$(build_update_body 1 "$okc" "$ocg" "$oquads" 2>/dev/null) || ob=""
     if [ -n "$ob" ]; then
-      orr=$(post "$API_PORT_BASE" /api/update -d "$ob")
+      orr=$(post_long "$API_PORT_BASE" /api/update -d "$ob")
       ost=$(echo "$orr" | pyf "d.get('status','')")
       if [ "$ost" = "confirmed" ] || [ "$ost" = "finalized" ]; then
         pass I new-owner-update "new owner updated KA kc=$okc after transfer (status=$ost)"
       else
-        warn I new-owner-update "new-owner update status=$ost (daemon newTokenAmount delta gap, see comment in script): ${orr:0:160}"
+        fail I new-owner-update "new-owner update status=$ost (expected confirmed/finalized — #831 regression?): ${orr:0:200}"
       fi
     else
-      warn I new-owner-update "could not build update seal for new owner ($destAddr)"
+      fail I new-owner-update "could not build update seal for new owner ($destAddr)"
     fi
   else
     warn I new-owner-update "skipped — transfer did not land (gated by ka-transfer-exec)"

@@ -239,7 +239,7 @@ function openSseAndCollect(
   return { events, close: () => req.destroy() };
 }
 
-async function fullPublish(api: string, token: string, name: string): Promise<{ kcId: string; status: string; merkleRoot: string }> {
+async function fullPublish(api: string, token: string, name: string): Promise<{ kaId: string; status: string; merkleRoot: string }> {
   const cgId = CONTEXT_GRAPH;
   const subject = `urn:test:core-flows:${name}`;
   const quads = [

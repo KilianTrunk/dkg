@@ -14,7 +14,7 @@ import {ContextGraphs} from "./ContextGraphs.sol";
 import {ContextGraphStorage} from "./storage/ContextGraphStorage.sol";
 import {ContextGraphValueStorage} from "./storage/ContextGraphValueStorage.sol";
 import {KnowledgeAssetsLib} from "./libraries/KnowledgeAssetsLib.sol";
-import {KnowledgeCollectionLib} from "./libraries/KnowledgeCollectionLib.sol";
+import {KnowledgeAssetLib} from "./libraries/KnowledgeAssetLib.sol";
 import {TokenLib} from "./libraries/TokenLib.sol";
 import {IdentityLib} from "./libraries/IdentityLib.sol";
 import {INamed} from "./interfaces/INamed.sol";
@@ -32,7 +32,7 @@ import {ECDSA} from "solady/src/utils/ECDSA.sol";
  * @title KnowledgeAssetsLifecycle
  * @notice V10 publish + update contract — wires together:
  *   - ContextGraphs facade (3 curator types, atomic KC↔CG bind)
- *   - ContextGraphStorage (direct read for `kcToContextGraph` on update)
+ *   - ContextGraphStorage (direct read for `kaToContextGraph` on update)
  *   - ContextGraphValueStorage (per-CG value ledger for value-weighted challenges)
  *   - DKGPublishingConvictionNFT (publisher discount NFT; auto-resolves agent→account)
  *   - DKGKnowledgeAssets (ERC-721, tokenId == kaId)
@@ -87,12 +87,12 @@ import {ECDSA} from "solady/src/utils/ECDSA.sol";
  * beyond the original value, as long as the new `tokenAmount` covers the new
  * size × remaining lifetime at the current stake-weighted ask. The
  * `originalByteSize` ceiling mapping is REMOVED; byte-size audit provenance
- * lives in the KCS `KnowledgeCollectionByteSizeUpdated` event history.
+ * lives in the KCS `KnowledgeAssetByteSizeUpdated` event history.
  */
 contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitializable, ReentrancyGuard {
     string private constant _NAME = "KnowledgeAssetsLifecycle";
     // 10.1.0 → 10.1.1: ReentrancyGuard perimeter on publish / update /
-    // extendKnowledgeCollectionLifetime; strict-positive tokenAmount floor
+    // extendKnowledgeAssetLifetime; strict-positive tokenAmount floor
     // in `_validateTokenAmount`. ReentrancyGuard contributes one uint256
     // storage slot at the end of the inheritance chain; KAV10 owns its
     // slots below the inherited chain and V10 deploys are redeploy +
@@ -329,16 +329,16 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
     ///      currentTokenAmount`) but the KC has no full epoch of remaining
     ///      lifetime (`currentEpoch == endEpoch`). No distribution vehicle
     ///      exists for the extra tokens — the publisher must extend the
-    ///      lifetime via `extendKnowledgeCollectionLifetime` before growing
+    ///      lifetime via `extendKnowledgeAssetLifetime` before growing
     ///      byte size or tokenAmount in the final epoch.
-    error NoRemainingLifetimeForDelta(uint256 kcId, uint40 currentEpoch, uint40 endEpoch);
+    error NoRemainingLifetimeForDelta(uint256 kaId, uint40 currentEpoch, uint40 endEpoch);
 
-    /// @dev KC has no CG binding recorded (`kcToContextGraph[kcId] == 0`).
+    /// @dev KC has no CG binding recorded (`kaToContextGraph[kaId] == 0`).
     ///      This is a corrupt-state assertion: publish atomically binds
-    ///      kcId → cgId, so a missing binding indicates a Phase 7 storage
+    ///      kaId → cgId, so a missing binding indicates a Phase 7 storage
     ///      invariant was violated. Update cannot proceed without knowing
     ///      the CG because the CG value ledger needs the target cgId.
-    error MissingContextGraphBinding(uint256 kcId);
+    error MissingContextGraphBinding(uint256 kaId);
 
     constructor(address hubAddress) ContractStatus(hubAddress) {}
 
@@ -363,7 +363,7 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
         if (cgAddr == address(0)) revert ZeroAddressDependency("ContextGraphs");
         contextGraphs = ContextGraphs(cgAddr);
 
-        // ContextGraphStorage is resolved directly for read-only `kcToContextGraph`
+        // ContextGraphStorage is resolved directly for read-only `kaToContextGraph`
         // lookups on the update path. The facade does not expose a KC→CG view
         // getter, and caching the storage here avoids a double-hop SLOAD via
         // `contextGraphs.contextGraphStorage()` on every update. Writes still
@@ -432,16 +432,16 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
      * per-publish on-chain consent gate on the direct-spend branch.
      *
      * @param p All publish parameters (see `PublishParams` struct).
-     * @return kcId Newly created knowledge collection id.
+     * @return kaId Newly created knowledge collection id.
      */
     // Defense-in-depth perimeter on the three KAV10 entrypoints
-    // (`publish`, `update`, `extendKnowledgeCollectionLifetime`). KCS
+    // (`publish`, `update`, `extendKnowledgeAssetLifetime`). KCS
     // mint dispatches an ERC-1155 receiver acceptance callback to the
     // publisher; `nonReentrant` keeps that callback from re-entering
     // these entrypoints. No behaviour change for valid callers.
-    function publish(PublishParams calldata p) external nonReentrant returns (uint256 kcId) {
+    function publish(PublishParams calldata p) external nonReentrant returns (uint256 kaId) {
         uint40 currentEpoch;
-        (currentEpoch, kcId) = _executePublishCore(p);
+        (currentEpoch, kaId) = _executePublishCore(p);
 
         // PCA branch eligibility:
         //   (1) `msg.sender` is registered as an agent on a PCA,
@@ -492,7 +492,7 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
             _distributeTokens(netTokenAmount, p.epochs, currentEpoch);
         }
 
-        return kcId;
+        return kaId;
     }
 
     // ========================================================================
@@ -509,7 +509,7 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
      */
     function _executePublishCore(
         PublishParams calldata p
-    ) internal returns (uint40 currentEpoch, uint256 kcId) {
+    ) internal returns (uint40 currentEpoch, uint256 kaId) {
         // --- 1. Author attestation verification (RFC-001) ---
         //
         // Every post-upgrade publish must carry a verified author. The author
@@ -634,11 +634,11 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
         // publish→update coherence for open-CG publishers.
         // `author` = `p.authorAddress`, the address verified by
         // `_verifyAuthorAttestation` above. The chain commits the recovered
-        // identity into KCS's parallel `merkleRootAuthors[kcId][0]` map
+        // identity into KCS's parallel `merkleRootAuthors[kaId][0]` map
         // so off-chain readers (`/api/get`, indexers) can return the
         // canonical author without re-deriving from the EIP-712
         // signature embedded in calldata.
-        kcId = kcs.createKnowledgeCollection(
+        kaId = kcs.createKnowledgeAsset(
             msg.sender,
             p.authorAddress,
             p.publishOperationId,
@@ -662,13 +662,13 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
         // `setCiphertextChunksCommitment` re-asserts the non-zero invariants
         // as a defensive crosscheck against contract-pair drift.
         if (_hasCiphertextCommitment) {
-            kcs.setCiphertextChunksCommitment(kcId, p.ciphertextChunksRoot, p.ciphertextChunkCount);
+            kcs.setCiphertextChunksCommitment(kaId, p.ciphertextChunksRoot, p.ciphertextChunkCount);
         }
 
         // --- 4. N20: atomic CG↔KC binding + CG value diff ---
 
-        // Facade write: kcToContextGraph[kcId] = cgId AND contextGraphKCList[cgId].push(kcId).
-        contextGraphs.registerKnowledgeCollection(p.contextGraphId, kcId);
+        // Facade write: kaToContextGraph[kaId] = cgId AND contextGraphKCList[cgId].push(kaId).
+        contextGraphs.registerKnowledgeAsset(p.contextGraphId, kaId);
 
         // Per-CG + global value ledger for value-weighted random challenges.
         // Uses BASE `tokenAmount` — value weighting tracks data value, not
@@ -705,18 +705,18 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
     // Lifetime Extension (V8-compatible, no ACK change needed)
     // ========================================================================
 
-    function extendKnowledgeCollectionLifetime(
+    function extendKnowledgeAssetLifetime(
         uint256 id,
         uint40 epochs,
         uint96 tokenAmount
     ) external nonReentrant {
         DKGKnowledgeAssets kcs = knowledgeAssetsStorage;
 
-        (, , , uint88 byteSize, , uint40 endEpoch, uint96 oldTokenAmount, ) = kcs.getKnowledgeCollectionMetadata(id);
+        (, , , uint88 byteSize, , uint40 endEpoch, uint96 oldTokenAmount, ) = kcs.getKnowledgeAssetMetadata(id);
 
         uint256 currentEpoch = chronos.getCurrentEpoch();
         if (currentEpoch > endEpoch) {
-            revert KnowledgeCollectionLib.KnowledgeCollectionExpired(id, currentEpoch, endEpoch);
+            revert KnowledgeAssetLib.KnowledgeAssetExpired(id, currentEpoch, endEpoch);
         }
 
         kcs.setEndEpoch(id, endEpoch + epochs);
@@ -740,7 +740,7 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
         // case we skip the CG value write so the V8 lifetime-extension path
         // keeps working unchanged.
         if (epochs > 0 && tokenAmount > 0) {
-            uint256 cgId = contextGraphStorage.kcToContextGraph(id);
+            uint256 cgId = contextGraphStorage.kaToContextGraph(id);
             if (cgId != 0) {
                 // Pin the diff over the EXTENSION window only, starting at
                 // the (old) endEpoch — the original publish window already
@@ -767,13 +767,13 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
         bytes32[] calldata vs
     ) internal view {
         if (r.length != identityIds.length || r.length != vs.length) {
-            revert KnowledgeCollectionLib.SignaturesSignersMismatch(r.length, vs.length, identityIds.length);
+            revert KnowledgeAssetLib.SignaturesSignersMismatch(r.length, vs.length, identityIds.length);
         }
 
         uint256 minSigs = parametersStorage.minimumRequiredSignatures();
 
         if (r.length < minSigs) {
-            revert KnowledgeCollectionLib.MinSignaturesRequirementNotMet(minSigs, r.length);
+            revert KnowledgeAssetLib.MinSignaturesRequirementNotMet(minSigs, r.length);
         }
 
         uint256 uniqueCount;
@@ -806,13 +806,13 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
         signer = ECDSA.tryRecover(messageHash, _r, _vs);
 
         if (signer == address(0)) {
-            revert KnowledgeCollectionLib.InvalidSignature(identityId, messageHash, _r, _vs);
+            revert KnowledgeAssetLib.InvalidSignature(identityId, messageHash, _r, _vs);
         }
 
         if (
             !identityStorage.keyHasPurpose(identityId, keccak256(abi.encodePacked(signer)), IdentityLib.OPERATIONAL_KEY)
         ) {
-            revert KnowledgeCollectionLib.SignerIsNotNodeOperator(identityId, signer);
+            revert KnowledgeAssetLib.SignerIsNotNodeOperator(identityId, signer);
         }
 
         // RFC-001 edge-publish unblocker: ACK signers must be in the active
@@ -838,7 +838,7 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
      * CG, a different content root, or a different author identity.
      *
      * One-shot consumption of `(contextGraphId, merkleRoot)` at the
-     * `KnowledgeCollectionStorage` layer is the temporal replay defense; no
+     * `DKGKnowledgeAssets` layer is the temporal replay defense; no
      * `signedAtBlock` window is included in the digest (see RFC-001 §3.2).
      */
     function _hashAuthorAttestation(
@@ -1001,7 +1001,7 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
         // update path is unaffected (pure metadata updates skip this
         // validator entirely — gated on `newByteSize > currentByteSize`).
         if (tokenAmount == 0) {
-            revert KnowledgeCollectionLib.InvalidTokenAmount(1, 0);
+            revert KnowledgeAssetLib.InvalidTokenAmount(1, 0);
         }
 
         uint256 stakeWeightedAverageAsk = askStorage.getStakeWeightedAverageAsk();
@@ -1021,7 +1021,7 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
         }
 
         if (tokenAmount < expectedTokenAmount) {
-            revert KnowledgeCollectionLib.InvalidTokenAmount(expectedTokenAmount, tokenAmount);
+            revert KnowledgeAssetLib.InvalidTokenAmount(expectedTokenAmount, tokenAmount);
         }
     }
 
@@ -1208,9 +1208,9 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
 
         // --- 1. Read current KC metadata (needed for validation + auth) ---
         //
-        // `getKnowledgeCollectionUpdateContext` is a scalar-only getter
+        // `getKnowledgeAssetUpdateContext` is a scalar-only getter
         // added for the update path specifically. The legacy
-        // `getKnowledgeCollectionMetadata` performs a full storage → memory
+        // `getKnowledgeAssetMetadata` performs a full storage → memory
         // struct copy, which walks every entry of `merkleRoots[]` and
         // `burned[]`. Both grow monotonically on every update, so calling
         // the legacy getter from the update path made gas scale (super-)
@@ -1229,16 +1229,16 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
             uint96 currentTokenAmount,
             bool isImmutable,
             uint32 ignoredPreUpdateMerkleLeafCount
-        ) = kcs.getKnowledgeCollectionUpdateContext(p.id);
+        ) = kcs.getKnowledgeAssetUpdateContext(p.id);
         ignoredPreUpdateMerkleLeafCount;
 
         if (isImmutable) {
-            revert KnowledgeCollectionLib.CannotUpdateImmutableKnowledgeCollection(p.id);
+            revert KnowledgeAssetLib.CannotUpdateImmutableKnowledgeAsset(p.id);
         }
 
         currentEpoch = uint40(chronos.getCurrentEpoch());
         if (uint256(currentEpoch) > uint256(endEpoch)) {
-            revert KnowledgeCollectionLib.KnowledgeCollectionExpired(
+            revert KnowledgeAssetLib.KnowledgeAssetExpired(
                 p.id,
                 uint256(currentEpoch),
                 uint256(endEpoch)
@@ -1255,10 +1255,10 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
 
         // --- 2. CG binding lookup (required for value delta write) ---
 
-        uint256 contextGraphId = contextGraphStorage.kcToContextGraph(p.id);
+        uint256 contextGraphId = contextGraphStorage.kaToContextGraph(p.id);
         if (contextGraphId == 0) {
-            // Post-Phase-7 invariant: publish atomically binds kcId → cgId
-            // via `contextGraphs.registerKnowledgeCollection`. Zero here
+            // Post-Phase-7 invariant: publish atomically binds kaId → cgId
+            // via `contextGraphs.registerKnowledgeAsset`. Zero here
             // means corrupt state (KC created outside publish, or Phase 7
             // migration gap). Fail loudly — silently authorizing without a
             // CG would orphan the KC from value-weighted challenges.
@@ -1392,7 +1392,7 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
 
         // --- 6. Apply storage mutation (new merkle root, bytes, tokens) ---
 
-        kcs.updateKnowledgeCollection(
+        kcs.updateKnowledgeAsset(
             msg.sender,
             p.authorAddress,
             p.id,
@@ -1507,7 +1507,7 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
         //     `deltaTokenAmount > 0 && remainingEpochs == 0` with
         //     `NoRemainingLifetimeForDelta`, and only calls `_distributeTokens`
         //     inside an `if (deltaTokenAmount > 0)` gate.
-        // No defensive re-check needed. `extendKnowledgeCollectionLifetime`
+        // No defensive re-check needed. `extendKnowledgeAssetLifetime`
         // does NOT call this helper (it hits `addTokensToEpochRange` directly).
 
         uint256 epochLengthInSeconds = chronos.epochLength();

@@ -18,7 +18,7 @@ import {
 
 test.describe.configure({ mode: 'serial' });
 
-const run: { cgId?: string; cgName?: string; label?: string; assertionName?: string; kcId?: string } = {};
+const run: { cgId?: string; cgName?: string; label?: string; assertionName?: string; kaId?: string } = {};
 
 test.beforeAll(async () => {
   test.skip(!isDevnetAvailable(1), 'Devnet node1 not running');
@@ -56,14 +56,14 @@ test.describe('WM → SWM → VM API pipeline', () => {
     expect(promote.ok).toBe(true);
   });
 
-  test('full WM → SWM → VM pipeline returns kcId', async () => {
+  test('full WM → SWM → VM pipeline returns kaId', async () => {
     const result = await runWmSwmVmPipeline({ contextGraphId: run.cgId! });
     expect(result.assertionName).toBeTruthy();
     run.label = result.label;
     run.assertionName = result.assertionName;
-    run.kcId = result.kcId;
-    if (result.kcId) {
-      expect(BigInt(result.kcId)).toBeGreaterThan(0n);
+    run.kaId = result.kaId;
+    if (result.kaId) {
+      expect(BigInt(result.kaId)).toBeGreaterThan(0n);
     }
   });
 });
@@ -87,14 +87,14 @@ test.describe('WM → SWM → VM UI verification', () => {
 });
 
 test.describe('KA update (devnet API)', () => {
-  test('update endpoint accepts quads when kcId exists from pipeline', async () => {
-    test.skip(!run.cgId || !run.kcId, 'Pipeline did not produce a kcId');
+  test('update endpoint accepts quads when kaId exists from pipeline', async () => {
+    test.skip(!run.cgId || !run.kaId, 'Pipeline did not produce a kaId');
     const stamp = Date.now();
     const res = await devnetApiFetch('/api/update', {
       method: 'POST',
       body: JSON.stringify({
         contextGraphId: run.cgId,
-        kcId: run.kcId,
+        kaId: run.kaId,
         quads: buildTestQuads(run.cgId!, stamp, `Updated ${stamp}`),
       }),
     });

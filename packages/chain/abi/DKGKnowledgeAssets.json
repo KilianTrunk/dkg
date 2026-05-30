@@ -8,7 +8,7 @@
       },
       {
         "internalType": "uint256",
-        "name": "_knowledgeCollectionMaxSize",
+        "name": "_knowledgeAssetBatchMaxSize",
         "type": "uint256"
       },
       {
@@ -184,7 +184,7 @@
         "type": "uint256"
       }
     ],
-    "name": "ExceededKnowledgeCollectionMaxSize",
+    "name": "ExceededKnowledgeAssetBatchSize",
     "type": "error"
   },
   {
@@ -284,6 +284,88 @@
         "type": "uint256"
       },
       {
+        "indexed": false,
+        "internalType": "uint256[]",
+        "name": "burned",
+        "type": "uint256[]"
+      }
+    ],
+    "name": "KnowledgeAssetBurnedUpdated",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "uint256",
+        "name": "id",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "byteSize",
+        "type": "uint256"
+      }
+    ],
+    "name": "KnowledgeAssetByteSizeUpdated",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "uint256",
+        "name": "id",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "chunksAmount",
+        "type": "uint256"
+      }
+    ],
+    "name": "KnowledgeAssetChunksAmountUpdated",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "uint256",
+        "name": "id",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "internalType": "bytes32",
+        "name": "ciphertextChunksRoot",
+        "type": "bytes32"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint32",
+        "name": "ciphertextChunkCount",
+        "type": "uint32"
+      }
+    ],
+    "name": "KnowledgeAssetCiphertextCommitmentSet",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "uint256",
+        "name": "id",
+        "type": "uint256"
+      },
+      {
         "indexed": true,
         "internalType": "address",
         "name": "author",
@@ -333,6 +415,175 @@
       }
     ],
     "name": "KnowledgeAssetCreated",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "uint256",
+        "name": "id",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "endEpoch",
+        "type": "uint256"
+      }
+    ],
+    "name": "KnowledgeAssetEndEpochUpdated",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "uint256",
+        "name": "id",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "internalType": "bytes32",
+        "name": "merkleRoot",
+        "type": "bytes32"
+      }
+    ],
+    "name": "KnowledgeAssetMerkleRootAdded",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "uint256",
+        "name": "id",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "internalType": "bytes32",
+        "name": "merkleRoot",
+        "type": "bytes32"
+      }
+    ],
+    "name": "KnowledgeAssetMerkleRootRemoved",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "uint256",
+        "name": "id",
+        "type": "uint256"
+      },
+      {
+        "components": [
+          {
+            "internalType": "address",
+            "name": "publisher",
+            "type": "address"
+          },
+          {
+            "internalType": "bytes32",
+            "name": "merkleRoot",
+            "type": "bytes32"
+          },
+          {
+            "internalType": "uint256",
+            "name": "timestamp",
+            "type": "uint256"
+          }
+        ],
+        "indexed": false,
+        "internalType": "struct KnowledgeAssetLib.MerkleRoot[]",
+        "name": "merkleRoots",
+        "type": "tuple[]"
+      }
+    ],
+    "name": "KnowledgeAssetMerkleRootsUpdated",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "uint256",
+        "name": "id",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "minted",
+        "type": "uint256"
+      }
+    ],
+    "name": "KnowledgeAssetMintedUpdated",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "uint256",
+        "name": "id",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "internalType": "address",
+        "name": "publisher",
+        "type": "address"
+      }
+    ],
+    "name": "KnowledgeAssetPublisherUpdated",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "uint256",
+        "name": "id",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "startEpoch",
+        "type": "uint256"
+      }
+    ],
+    "name": "KnowledgeAssetStartEpochUpdated",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "uint256",
+        "name": "id",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "tokenAmount",
+        "type": "uint256"
+      }
+    ],
+    "name": "KnowledgeAssetTokenAmountUpdated",
     "type": "event"
   },
   {
@@ -439,257 +690,6 @@
     "inputs": [
       {
         "indexed": true,
-        "internalType": "uint256",
-        "name": "id",
-        "type": "uint256"
-      },
-      {
-        "indexed": false,
-        "internalType": "uint256[]",
-        "name": "burned",
-        "type": "uint256[]"
-      }
-    ],
-    "name": "KnowledgeCollectionBurnedUpdated",
-    "type": "event"
-  },
-  {
-    "anonymous": false,
-    "inputs": [
-      {
-        "indexed": true,
-        "internalType": "uint256",
-        "name": "id",
-        "type": "uint256"
-      },
-      {
-        "indexed": false,
-        "internalType": "uint256",
-        "name": "byteSize",
-        "type": "uint256"
-      }
-    ],
-    "name": "KnowledgeCollectionByteSizeUpdated",
-    "type": "event"
-  },
-  {
-    "anonymous": false,
-    "inputs": [
-      {
-        "indexed": true,
-        "internalType": "uint256",
-        "name": "id",
-        "type": "uint256"
-      },
-      {
-        "indexed": false,
-        "internalType": "uint256",
-        "name": "chunksAmount",
-        "type": "uint256"
-      }
-    ],
-    "name": "KnowledgeCollectionChunksAmountUpdated",
-    "type": "event"
-  },
-  {
-    "anonymous": false,
-    "inputs": [
-      {
-        "indexed": true,
-        "internalType": "uint256",
-        "name": "id",
-        "type": "uint256"
-      },
-      {
-        "indexed": false,
-        "internalType": "bytes32",
-        "name": "ciphertextChunksRoot",
-        "type": "bytes32"
-      },
-      {
-        "indexed": false,
-        "internalType": "uint32",
-        "name": "ciphertextChunkCount",
-        "type": "uint32"
-      }
-    ],
-    "name": "KnowledgeCollectionCiphertextCommitmentSet",
-    "type": "event"
-  },
-  {
-    "anonymous": false,
-    "inputs": [
-      {
-        "indexed": true,
-        "internalType": "uint256",
-        "name": "id",
-        "type": "uint256"
-      },
-      {
-        "indexed": false,
-        "internalType": "uint256",
-        "name": "endEpoch",
-        "type": "uint256"
-      }
-    ],
-    "name": "KnowledgeCollectionEndEpochUpdated",
-    "type": "event"
-  },
-  {
-    "anonymous": false,
-    "inputs": [
-      {
-        "indexed": true,
-        "internalType": "uint256",
-        "name": "id",
-        "type": "uint256"
-      },
-      {
-        "indexed": false,
-        "internalType": "bytes32",
-        "name": "merkleRoot",
-        "type": "bytes32"
-      }
-    ],
-    "name": "KnowledgeCollectionMerkleRootAdded",
-    "type": "event"
-  },
-  {
-    "anonymous": false,
-    "inputs": [
-      {
-        "indexed": true,
-        "internalType": "uint256",
-        "name": "id",
-        "type": "uint256"
-      },
-      {
-        "indexed": false,
-        "internalType": "bytes32",
-        "name": "merkleRoot",
-        "type": "bytes32"
-      }
-    ],
-    "name": "KnowledgeCollectionMerkleRootRemoved",
-    "type": "event"
-  },
-  {
-    "anonymous": false,
-    "inputs": [
-      {
-        "indexed": true,
-        "internalType": "uint256",
-        "name": "id",
-        "type": "uint256"
-      },
-      {
-        "components": [
-          {
-            "internalType": "address",
-            "name": "publisher",
-            "type": "address"
-          },
-          {
-            "internalType": "bytes32",
-            "name": "merkleRoot",
-            "type": "bytes32"
-          },
-          {
-            "internalType": "uint256",
-            "name": "timestamp",
-            "type": "uint256"
-          }
-        ],
-        "indexed": false,
-        "internalType": "struct KnowledgeCollectionLib.MerkleRoot[]",
-        "name": "merkleRoots",
-        "type": "tuple[]"
-      }
-    ],
-    "name": "KnowledgeCollectionMerkleRootsUpdated",
-    "type": "event"
-  },
-  {
-    "anonymous": false,
-    "inputs": [
-      {
-        "indexed": true,
-        "internalType": "uint256",
-        "name": "id",
-        "type": "uint256"
-      },
-      {
-        "indexed": false,
-        "internalType": "uint256",
-        "name": "minted",
-        "type": "uint256"
-      }
-    ],
-    "name": "KnowledgeCollectionMintedUpdated",
-    "type": "event"
-  },
-  {
-    "anonymous": false,
-    "inputs": [
-      {
-        "indexed": true,
-        "internalType": "uint256",
-        "name": "id",
-        "type": "uint256"
-      },
-      {
-        "indexed": false,
-        "internalType": "address",
-        "name": "publisher",
-        "type": "address"
-      }
-    ],
-    "name": "KnowledgeCollectionPublisherUpdated",
-    "type": "event"
-  },
-  {
-    "anonymous": false,
-    "inputs": [
-      {
-        "indexed": true,
-        "internalType": "uint256",
-        "name": "id",
-        "type": "uint256"
-      },
-      {
-        "indexed": false,
-        "internalType": "uint256",
-        "name": "startEpoch",
-        "type": "uint256"
-      }
-    ],
-    "name": "KnowledgeCollectionStartEpochUpdated",
-    "type": "event"
-  },
-  {
-    "anonymous": false,
-    "inputs": [
-      {
-        "indexed": true,
-        "internalType": "uint256",
-        "name": "id",
-        "type": "uint256"
-      },
-      {
-        "indexed": false,
-        "internalType": "uint256",
-        "name": "tokenAmount",
-        "type": "uint256"
-      }
-    ],
-    "name": "KnowledgeCollectionTokenAmountUpdated",
-    "type": "event"
-  },
-  {
-    "anonymous": false,
-    "inputs": [
-      {
-        "indexed": true,
         "internalType": "address",
         "name": "custodian",
         "type": "address"
@@ -788,7 +788,7 @@
   },
   {
     "inputs": [],
-    "name": "KNOWLEDGE_COLLECTION_MAX_SIZE",
+    "name": "KNOWLEDGE_ASSET_BATCH_MAX_SIZE",
     "outputs": [
       {
         "internalType": "uint256",
@@ -955,7 +955,7 @@
         "type": "uint32"
       }
     ],
-    "name": "createKnowledgeCollection",
+    "name": "createKnowledgeAsset",
     "outputs": [
       {
         "internalType": "uint256",
@@ -1101,55 +1101,7 @@
         "type": "uint256"
       }
     ],
-    "name": "getKnowledgeAssetsAmount",
-    "outputs": [
-      {
-        "internalType": "uint256",
-        "name": "",
-        "type": "uint256"
-      }
-    ],
-    "stateMutability": "view",
-    "type": "function"
-  },
-  {
-    "inputs": [
-      {
-        "internalType": "uint256",
-        "name": "id",
-        "type": "uint256"
-      }
-    ],
-    "name": "getKnowledgeAssetsRange",
-    "outputs": [
-      {
-        "internalType": "uint256",
-        "name": "",
-        "type": "uint256"
-      },
-      {
-        "internalType": "uint256",
-        "name": "",
-        "type": "uint256"
-      },
-      {
-        "internalType": "uint256[]",
-        "name": "",
-        "type": "uint256[]"
-      }
-    ],
-    "stateMutability": "view",
-    "type": "function"
-  },
-  {
-    "inputs": [
-      {
-        "internalType": "uint256",
-        "name": "id",
-        "type": "uint256"
-      }
-    ],
-    "name": "getKnowledgeCollection",
+    "name": "getKnowledgeAsset",
     "outputs": [
       {
         "components": [
@@ -1171,7 +1123,7 @@
                 "type": "uint256"
               }
             ],
-            "internalType": "struct KnowledgeCollectionLib.MerkleRoot[]",
+            "internalType": "struct KnowledgeAssetLib.MerkleRoot[]",
             "name": "merkleRoots",
             "type": "tuple[]"
           },
@@ -1216,7 +1168,7 @@
             "type": "uint32"
           }
         ],
-        "internalType": "struct KnowledgeCollectionLib.KnowledgeCollection",
+        "internalType": "struct KnowledgeAssetLib.KnowledgeAsset",
         "name": "",
         "type": "tuple"
       }
@@ -1232,7 +1184,7 @@
         "type": "uint256"
       }
     ],
-    "name": "getKnowledgeCollectionId",
+    "name": "getKnowledgeAssetId",
     "outputs": [
       {
         "internalType": "uint256",
@@ -1251,7 +1203,7 @@
         "type": "uint256"
       }
     ],
-    "name": "getKnowledgeCollectionMetadata",
+    "name": "getKnowledgeAssetMetadata",
     "outputs": [
       {
         "components": [
@@ -1271,7 +1223,7 @@
             "type": "uint256"
           }
         ],
-        "internalType": "struct KnowledgeCollectionLib.MerkleRoot[]",
+        "internalType": "struct KnowledgeAssetLib.MerkleRoot[]",
         "name": "",
         "type": "tuple[]"
       },
@@ -1322,7 +1274,7 @@
         "type": "uint256"
       }
     ],
-    "name": "getKnowledgeCollectionUpdateContext",
+    "name": "getKnowledgeAssetUpdateContext",
     "outputs": [
       {
         "internalType": "uint256",
@@ -1371,6 +1323,54 @@
         "type": "uint256"
       }
     ],
+    "name": "getKnowledgeAssetsAmount",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "uint256",
+        "name": "id",
+        "type": "uint256"
+      }
+    ],
+    "name": "getKnowledgeAssetsRange",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256[]",
+        "name": "",
+        "type": "uint256[]"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "uint256",
+        "name": "id",
+        "type": "uint256"
+      }
+    ],
     "name": "getLatestCiphertextChunksRoot",
     "outputs": [
       {
@@ -1384,7 +1384,7 @@
   },
   {
     "inputs": [],
-    "name": "getLatestKnowledgeCollectionId",
+    "name": "getLatestKnowledgeAssetId",
     "outputs": [
       {
         "internalType": "uint256",
@@ -1461,7 +1461,7 @@
             "type": "uint256"
           }
         ],
-        "internalType": "struct KnowledgeCollectionLib.MerkleRoot",
+        "internalType": "struct KnowledgeAssetLib.MerkleRoot",
         "name": "",
         "type": "tuple"
       }
@@ -1607,7 +1607,7 @@
             "type": "uint256"
           }
         ],
-        "internalType": "struct KnowledgeCollectionLib.MerkleRoot",
+        "internalType": "struct KnowledgeAssetLib.MerkleRoot",
         "name": "",
         "type": "tuple"
       }
@@ -1691,7 +1691,7 @@
             "type": "uint256"
           }
         ],
-        "internalType": "struct KnowledgeCollectionLib.MerkleRoot[]",
+        "internalType": "struct KnowledgeAssetLib.MerkleRoot[]",
         "name": "",
         "type": "tuple[]"
       }
@@ -1845,7 +1845,7 @@
         "type": "uint256"
       }
     ],
-    "name": "isKnowledgeCollectionOwner",
+    "name": "isKnowledgeAssetOwner",
     "outputs": [
       {
         "internalType": "bool",
@@ -1869,7 +1869,7 @@
         "type": "uint256"
       }
     ],
-    "name": "isPartOfKnowledgeCollection",
+    "name": "isPartOfKnowledgeAsset",
     "outputs": [
       {
         "internalType": "bool",
@@ -1882,7 +1882,7 @@
   },
   {
     "inputs": [],
-    "name": "knowledgeCollectionMaxSize",
+    "name": "knowledgeAssetBatchMaxSize",
     "outputs": [
       {
         "internalType": "uint256",
@@ -1901,7 +1901,7 @@
         "type": "uint256"
       }
     ],
-    "name": "knowledgeCollections",
+    "name": "knowledgeAssets",
     "outputs": [
       {
         "internalType": "uint256",
@@ -2228,7 +2228,7 @@
             "type": "uint256"
           }
         ],
-        "internalType": "struct KnowledgeCollectionLib.MerkleRoot[]",
+        "internalType": "struct KnowledgeAssetLib.MerkleRoot[]",
         "name": "_merkleRoots",
         "type": "tuple[]"
       }
@@ -2484,7 +2484,7 @@
         "type": "uint32"
       }
     ],
-    "name": "updateKnowledgeCollection",
+    "name": "updateKnowledgeAsset",
     "outputs": [],
     "stateMutability": "nonpayable",
     "type": "function"

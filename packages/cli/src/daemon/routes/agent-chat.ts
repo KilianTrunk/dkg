@@ -946,11 +946,11 @@ export async function handleAgentChatRoutes(ctx: RequestContext): Promise<void> 
     return jsonResponse(res, 200, { connected: true });
   }
 
-  // POST /api/update  { kcId, contextGraphId, quads, privateQuads?, precomputedUpdateAttestation? }
+  // POST /api/update  { kaId, contextGraphId, quads, privateQuads?, precomputedUpdateAttestation? }
   if (req.method === "POST" && path === "/api/update") {
     const body = await readBody(req);
     const parsed = JSON.parse(body);
-    const { kcId, quads, privateQuads } = parsed;
+    const { kaId, quads, privateQuads } = parsed;
     const contextGraphId = parsed.contextGraphId;
     const precomputedUpdateAttestation = parsePrecomputedUpdateAttestation(
       parsed.precomputedUpdateAttestation,
@@ -959,23 +959,23 @@ export async function handleAgentChatRoutes(ctx: RequestContext): Promise<void> 
     if (parsed.precomputedUpdateAttestation != null && !precomputedUpdateAttestation) {
       return;
     }
-    if (!kcId || !contextGraphId || !quads?.length) {
+    if (!kaId || !contextGraphId || !quads?.length) {
       return jsonResponse(res, 400, {
-        error: 'Missing "kcId", "contextGraphId", or "quads"',
+        error: 'Missing "kaId", "contextGraphId", or "quads"',
       });
     }
     let kcIdBigInt: bigint;
     try {
-      kcIdBigInt = BigInt(kcId);
+      kcIdBigInt = BigInt(kaId);
     } catch {
       return jsonResponse(res, 400, {
-        error: `Invalid "kcId": ${String(kcId).slice(0, 50)}`,
+        error: `Invalid "kaId": ${String(kaId).slice(0, 50)}`,
       });
     }
     const ctx = createOperationContext("update");
     tracker.start(ctx, {
       contextGraphId: contextGraphId,
-      details: { kcId: String(kcId), tripleCount: quads.length, source: "api" },
+      details: { kaId: String(kaId), tripleCount: quads.length, source: "api" },
     });
     try {
       const result = await agent.update(
@@ -1005,16 +1005,16 @@ export async function handleAgentChatRoutes(ctx: RequestContext): Promise<void> 
         );
       }
       if (result.status === "failed") {
-        tracker.fail(ctx, new Error(`Update failed on-chain (kcId=${kcId})`));
+        tracker.fail(ctx, new Error(`Update failed on-chain (kaId=${kaId})`));
       } else {
         tracker.complete(ctx, {
           tripleCount: quads.length,
-          details: { kcId: String(result.kcId), status: result.status },
+          details: { kaId: String(result.kaId), status: result.status },
         });
       }
       const opDetail = dashDb.getOperation(ctx.operationId);
       return jsonResponse(res, 200, {
-        kcId: String(result.kcId),
+        kaId: String(result.kaId),
         status: result.status,
         kas: result.kaManifest.map((ka) => ({
           tokenId: String(ka.tokenId),

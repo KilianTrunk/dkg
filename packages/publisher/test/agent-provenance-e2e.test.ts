@@ -91,7 +91,7 @@ beforeAll(async () => {
   CONTEXT_GRAPH = String(cgId);
   GRAPH_URI = `did:dkg:context-graph:${CONTEXT_GRAPH}`;
   coreId = BigInt(ctx.coreProfileId);
-  kav10Address = await chain.getKnowledgeAssetsV10Address();
+  kav10Address = await chain.getKnowledgeAssetsLifecycleAddress();
 
   // Resolve the rest of the addresses we need for raw-contract reads.
   // The Hub keeps two registries: regular contracts (`getContractAddress`)
@@ -140,7 +140,7 @@ function makePublisher(opts: {
 }
 
 /** Read raw KCS storage to assert what the diagram says was written. */
-function kcs() {
+function kas() {
   return new ethers.Contract(
     kcsAddress,
     [
@@ -220,7 +220,7 @@ async function publishSealed(
 
 async function updateSealed(
   publisher: DKGPublisher,
-  kcId: bigint,
+  kaId: bigint,
   args: Parameters<DKGPublisher['update']>[1],
   authorKey: string = HARDHAT_KEYS.CORE_OP,
 ) {
@@ -228,7 +228,7 @@ async function updateSealed(
   // UpdateAuthorAttestation seal + supply the ACK quorum, same as publish.
   return updateSealedCore(
     publisher,
-    kcId,
+    kaId,
     args,
     new ethers.Wallet(authorKey),
     { provider, kav10Address },
@@ -258,12 +258,12 @@ describe('Diagram 1 — EOA author attestation, end-to-end on real Hardhat', () 
     expect(result.onChainResult!.txHash).toBeTruthy();
 
     // (i) chain canonical author == publisher's signer EOA
-    const kcId = result.onChainResult!.batchId;
-    const onChainAuthor: string = await kcs().getLatestMerkleRootAuthor(kcId);
+    const kaId = result.onChainResult!.batchId;
+    const onChainAuthor: string = await kas().getLatestMerkleRootAuthor(kaId);
     expect(onChainAuthor.toLowerCase()).toBe(author.address.toLowerCase());
 
     // (ii) MerkleRoot struct still has the 3 canonical fields (parallel-mapping invariant)
-    const root = await kcs().getLatestMerkleRootObject(kcId);
+    const root = await kas().getLatestMerkleRootObject(kaId);
     expect(root.publisher).toBeDefined();
     expect(root.merkleRoot).toBeTruthy();
 
@@ -301,7 +301,7 @@ describe('Diagram 2 — EIP-1271 / smart-wallet author', () => {
     // Smoke check that the V10AuthorAttestation type can carry a smart-wallet
     // author. The contract dispatches to EIP-1271 when `author.address.code.length > 0`.
     const adapter = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
-    expect(typeof adapter.createKnowledgeAssetsV10).toBe('function');
+    expect(typeof adapter.createKnowledgeAssets).toBe('function');
     expect(typeof adapter.getLatestMerkleRootAuthor).toBe('function');
   });
 });
@@ -427,12 +427,12 @@ describe('Diagram 4 — KC update writes merkleRootAuthors[len-1] unconditionall
       quads: [q(`${ENTITY}/D4`, 'http://schema.org/name', '"Original"')],
     });
     expect(created.status).toBe('confirmed');
-    const kcId = created.onChainResult!.batchId;
+    const kaId = created.onChainResult!.batchId;
 
-    const idx0Author: string = await kcs().getMerkleRootAuthorByIndex(kcId, 0);
+    const idx0Author: string = await kas().getMerkleRootAuthorByIndex(kaId, 0);
     expect(idx0Author.toLowerCase()).toBe(author.address.toLowerCase());
 
-    const updated = await updateSealed(publisher, kcId, {
+    const updated = await updateSealed(publisher, kaId, {
       contextGraphId: CONTEXT_GRAPH,
       quads: [q(`${ENTITY}/D4`, 'http://schema.org/name', '"Updated"')],
     });
@@ -442,9 +442,9 @@ describe('Diagram 4 — KC update writes merkleRootAuthors[len-1] unconditionall
     // signed UpdateAuthorAttestation, so the update path now records the
     // author at the appended index — index 1 is the update signer, not
     // address(0) as in the pre-greenfield V10.1 path.
-    expect((await kcs().getMerkleRootAuthorByIndex(kcId, 0)).toLowerCase())
+    expect((await kas().getMerkleRootAuthorByIndex(kaId, 0)).toLowerCase())
       .toBe(author.address.toLowerCase());
-    expect((await kcs().getMerkleRootAuthorByIndex(kcId, 1)).toLowerCase())
+    expect((await kas().getMerkleRootAuthorByIndex(kaId, 1)).toLowerCase())
       .toBe(author.address.toLowerCase());
   });
 });
@@ -465,10 +465,10 @@ describe('Diagram 5 — chain canonical author via DKGAgent.getKnowledgeCollecti
       contextGraphId: CONTEXT_GRAPH,
       quads: [q(`${ENTITY}/D5`, 'http://schema.org/name', '"FacadeRead"')],
     });
-    const kcId = result.onChainResult!.batchId;
+    const kaId = result.onChainResult!.batchId;
 
     const adapter = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
-    const direct = await adapter.getLatestMerkleRootAuthor!(kcId);
+    const direct = await adapter.getLatestMerkleRootAuthor!(kaId);
     expect(direct.toLowerCase()).toBe(author.address.toLowerCase());
   });
 });
@@ -626,15 +626,15 @@ describe('Diagram 8 — multi-update author array stays consistent with the cano
       contextGraphId: CONTEXT_GRAPH,
       quads: [q(`${ENTITY}/D8`, 'http://schema.org/name', '"V0"')],
     });
-    const kcId = created.onChainResult!.batchId;
+    const kaId = created.onChainResult!.batchId;
 
-    const u1 = await updateSealed(publisher, kcId, {
+    const u1 = await updateSealed(publisher, kaId, {
       contextGraphId: CONTEXT_GRAPH,
       quads: [q(`${ENTITY}/D8`, 'http://schema.org/name', '"V1"')],
     });
     expect(u1.status).toBe('confirmed');
 
-    const u2 = await updateSealed(publisher, kcId, {
+    const u2 = await updateSealed(publisher, kaId, {
       contextGraphId: CONTEXT_GRAPH,
       quads: [q(`${ENTITY}/D8`, 'http://schema.org/name', '"V2"')],
     });
@@ -644,15 +644,15 @@ describe('Diagram 8 — multi-update author array stays consistent with the cano
     // attestation, so every appended merkle root is attributed to the
     // update signer — [author, author, author] rather than the
     // pre-greenfield [author, 0, 0].
-    expect((await kcs().getMerkleRootAuthorByIndex(kcId, 0)).toLowerCase())
+    expect((await kas().getMerkleRootAuthorByIndex(kaId, 0)).toLowerCase())
       .toBe(author.address.toLowerCase());
-    expect((await kcs().getMerkleRootAuthorByIndex(kcId, 1)).toLowerCase())
+    expect((await kas().getMerkleRootAuthorByIndex(kaId, 1)).toLowerCase())
       .toBe(author.address.toLowerCase());
-    expect((await kcs().getMerkleRootAuthorByIndex(kcId, 2)).toLowerCase())
+    expect((await kas().getMerkleRootAuthorByIndex(kaId, 2)).toLowerCase())
       .toBe(author.address.toLowerCase());
 
     // Latest reader returns the most-recent slot (index 2) → update signer.
-    expect((await kcs().getLatestMerkleRootAuthor(kcId)).toLowerCase())
+    expect((await kas().getLatestMerkleRootAuthor(kaId)).toLowerCase())
       .toBe(author.address.toLowerCase());
   });
 });
@@ -742,11 +742,11 @@ describe('Diagram 11 — Phase 5 precomputedAttestation (sign-at-creation)', () 
     });
 
     expect(result.status).toBe('confirmed');
-    const kcId = result.onChainResult!.batchId;
-    const onChainAuthor: string = await kcs().getLatestMerkleRootAuthor(kcId);
+    const kaId = result.onChainResult!.batchId;
+    const onChainAuthor: string = await kas().getLatestMerkleRootAuthor(kaId);
     expect(onChainAuthor.toLowerCase()).toBe(author.address.toLowerCase());
 
-    const onChainRootObj = await kcs().getLatestMerkleRootObject(kcId);
+    const onChainRootObj = await kas().getLatestMerkleRootObject(kaId);
     expect(onChainRootObj.merkleRoot.toLowerCase()).toBe(
       ethers.hexlify(merkleRoot).toLowerCase(),
     );
@@ -783,7 +783,7 @@ describe('Diagram 11 — Phase 5 precomputedAttestation (sign-at-creation)', () 
     // try/catch). Previously it was silently downgraded to tentative
     // with an `On-chain tx failed` log line. The hard error gives the
     // daemon route a 4xx-mappable signal instead of a 200 OK +
-    // `status: tentative, kcId: 0`.
+    // `status: tentative, kaId: 0`.
     await expect(
       publisher.publish({
         contextGraphId: CONTEXT_GRAPH,

@@ -433,7 +433,7 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
       ).to.be.revertedWith('Invalid ciphertext commitment');
     });
 
-    it('emits KnowledgeCollectionCiphertextCommitmentSet with the indexed id and the (root, count) tuple', async () => {
+    it('emits KnowledgeAssetCiphertextCommitmentSet with the indexed id and the (root, count) tuple', async () => {
       // Locks the audit-trail invariant: every successful commit MUST emit
       // the event with the exact pair persisted, with the KC id indexed so
       // off-chain indexers can filter without reading every block. A
@@ -449,7 +449,7 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
           SAMPLE_CT_COUNT_A,
         ),
       )
-        .to.emit(KCSContract, 'KnowledgeCollectionCiphertextCommitmentSet')
+        .to.emit(KCSContract, 'KnowledgeAssetCiphertextCommitmentSet')
         .withArgs(kaId, SAMPLE_CT_ROOT_A, SAMPLE_CT_COUNT_A);
     });
 
@@ -513,7 +513,7 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
           SAMPLE_CT_COUNT_A,
         ),
       )
-        .to.emit(KCSContract, 'KnowledgeCollectionCiphertextCommitmentSet')
+        .to.emit(KCSContract, 'KnowledgeAssetCiphertextCommitmentSet')
         .withArgs(kaId, SAMPLE_CT_ROOT_A, SAMPLE_CT_COUNT_A);
       await expect(
         KCSContract.connect(opSigner).setCiphertextChunksCommitment(
@@ -522,7 +522,7 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
           SAMPLE_CT_COUNT_A,
         ),
       )
-        .to.emit(KCSContract, 'KnowledgeCollectionCiphertextCommitmentSet')
+        .to.emit(KCSContract, 'KnowledgeAssetCiphertextCommitmentSet')
         .withArgs(kaId, SAMPLE_CT_ROOT_A, SAMPLE_CT_COUNT_A);
     });
 

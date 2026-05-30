@@ -452,7 +452,7 @@ describe('V10 E2E Conviction System', function () {
       // sum is the canonical guard.
 
       // ---- Step 11: KC retrieval via public reader ----
-      const retrievedKc = await DKGKnowledgeAssets.getKnowledgeCollection(kaId);
+      const retrievedKc = await DKGKnowledgeAssets.getKnowledgeAsset(kaId);
       expect(retrievedKc.byteSize).to.equal(1000n);
       expect(retrievedKc.startEpoch).to.equal(currentEpoch);
       expect(retrievedKc.endEpoch).to.equal(currentEpoch + BigInt(epochs));

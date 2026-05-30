@@ -22,18 +22,8 @@ test.describe('Document preview', () => {
     await expect(page.locator('.v10-layer-expand-tab.active').filter({ hasText: 'Documents' })).toBeVisible();
   });
 
-  test('Documents tab shows empty state or document list without error', async ({ page }) => {
+  test('Documents tab shows empty state without error when no docs seeded', async ({ page }) => {
     await expect(page.locator('.v10-me-error')).toBeHidden();
-    const body = page.locator('.v10-layer-expand-body');
-    await expect(body.first()).toBeVisible();
-  });
-
-  test('clicking a document row opens preview modal when documents exist', async ({ page, filePreviewModal }) => {
-    const docRow = page.locator('.v10-item-row').filter({ hasText: /\.md|\.pdf/i });
-    const count = await docRow.count();
-    if (count === 0) return;
-    await docRow.first().click();
-    expect(await filePreviewModal.isOpen()).toBe(true);
-    await filePreviewModal.close();
+    await expect(page.getByText(/No documents in this layer yet/i)).toBeVisible();
   });
 });

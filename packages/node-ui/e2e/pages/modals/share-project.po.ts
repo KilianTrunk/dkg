@@ -49,6 +49,10 @@ export class ShareProjectModal {
     const group = this.page.locator('.v10-form-group').filter({ hasText: 'Invite Code' });
     const code = group.locator('code, textarea, input, pre').first();
     if (!(await code.isVisible().catch(() => false))) return null;
+    const tag = await code.evaluate((el) => el.tagName.toLowerCase());
+    if (tag === 'input' || tag === 'textarea') {
+      return code.inputValue();
+    }
     return code.textContent();
   }
 }

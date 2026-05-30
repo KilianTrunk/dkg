@@ -40,9 +40,8 @@ export default defineConfig({
   ],
 
   webServer: {
-    // mock-ui and devnet-ui use different server env — pick once at process
-    // start. Run them via `pnpm test:e2e` / `pnpm test:e2e:devnet`, not bare
-    // `playwright test` without a project filter (or `--ui` with both projects).
+    // Server mode follows PWTEST_DEVNET (set explicitly by package.json scripts).
+    // Do not run both projects in one process — mock-ui and devnet-ui need different backends.
     command: DEVNET_UI
       ? `cross-env DEVNET_NODE=${DEVNET_NODE} pnpm dev:ui`
       : 'cross-env DEVNET_NODE= UI_NODE_ID= pnpm dev:ui',

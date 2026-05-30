@@ -69,9 +69,14 @@ function classifySparql(sparql: string): 'wm' | 'swm' | 'vm' | 'meta' | 'other' 
   return 'other';
 }
 
-function bindingsForQuery(sparql: string, cgId: string): unknown[] {
+function bindingsForQuery(sparql: string, cgId: string, view?: string): unknown[] {
+  if (view === 'shared-working-memory') return swmBindings(cgId);
+  if (view === 'working-memory') return wmBindings(cgId);
+  if (view === 'verified-memory') return vmBindings(cgId);
   if (isProfileSelectQuery(sparql)) {
-    if (sparql.includes('SubGraphBinding')) return profileSubGraphSelectBindings(cgId);
+    if (sparql.includes('SubGraphBinding') || sparql.includes('prof:SubGraphBinding')) {
+      return profileSubGraphSelectBindings(cgId);
+    }
     return [];
   }
   switch (classifySparql(sparql)) {
@@ -139,10 +144,10 @@ export async function installRichMemoryRoutes(
       return fulfillJson(route, { contextGraphId: cgIdFromUrl(path) ?? primaryCgId, requests: [] });
     }
     if (path === '/api/query' && method === 'POST') {
-      let body: { sparql?: string; contextGraphId?: string } = {};
+      let body: { sparql?: string; contextGraphId?: string; view?: string } = {};
       try { body = route.request().postDataJSON() ?? {}; } catch { /* empty */ }
       const cgId = body.contextGraphId ?? primaryCgId;
-      return fulfillJson(route, queryResponse(bindingsForQuery(body.sparql ?? '', cgId)));
+      return fulfillJson(route, queryResponse(bindingsForQuery(body.sparql ?? '', cgId, body.view)));
     }
     if (path.startsWith('/api/events')) {
       return route.fulfill({

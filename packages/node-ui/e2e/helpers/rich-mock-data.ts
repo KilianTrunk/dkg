@@ -104,18 +104,19 @@ export function profileSubGraphSelectBindings(_cgId: string): Array<Record<strin
   ];
 }
 
-/** Legacy triple-shaped meta bindings (SELECT ?s ?p ?o paths) */
+/** Legacy triple-shaped meta bindings under `.../meta` graphs (profile parser path). */
 export function profileMetaBindings(cgId: string): SparqlBinding[] {
   const base = `did:dkg:context-graph:${cgId}`;
-  const metaGraph = `${base}/_meta`;
+  const metaGraph = `${base}/meta/profile`;
   const sg = `${base}/meta/subgraph/entities`;
+  const PROFILE = 'http://dkg.io/ontology/profile/';
   return [
-    binding(sg, RDF_TYPE, 'http://dkg.io/ontology/meta/SubGraphBinding', metaGraph),
-    binding(sg, 'http://dkg.io/ontology/meta/slug', 'entities', metaGraph, true),
-    binding(sg, 'http://dkg.io/ontology/meta/displayName', 'Entities', metaGraph, true),
-    binding(sg, 'http://dkg.io/ontology/meta/icon', '⬡', metaGraph, true),
-    binding(sg, 'http://dkg.io/ontology/meta/color', '#38bdf8', metaGraph, true),
-    binding(sg, 'http://dkg.io/ontology/meta/rank', '1', metaGraph, true),
+    binding(sg, `${PROFILE}SubGraphBinding`, `${PROFILE}SubGraphBinding`, metaGraph),
+    binding(sg, `${PROFILE}forSubGraph`, 'entities', metaGraph, true),
+    binding(sg, `${PROFILE}displayName`, 'Entities', metaGraph, true),
+    binding(sg, `${PROFILE}icon`, '⬡', metaGraph, true),
+    binding(sg, `${PROFILE}color`, '#38bdf8', metaGraph, true),
+    binding(sg, `${PROFILE}rank`, '1', metaGraph, true),
   ];
 }
 

@@ -34,15 +34,17 @@ test.describe('MCP server tools (devnet API smoke)', () => {
     const cgs = await devnetApiFetch('/api/context-graphs');
     const { contextGraphs } = (await cgs.json()) as { contextGraphs: Array<{ id: string }> };
     test.skip(contextGraphs.length === 0, 'No CGs');
+    const cgId = contextGraphs[0]!.id;
     const res = await devnetApiFetch('/api/query', {
       method: 'POST',
       body: JSON.stringify({
-        sparql: 'SELECT ?s ?p ?o WHERE { ?s ?p ?o } LIMIT 1',
-        contextGraphId: contextGraphs[0]!.id,
+        sparql: 'SELECT ?s ?p ?o WHERE { GRAPH ?g { ?s ?p ?o } } LIMIT 5',
+        contextGraphId: cgId,
       }),
     });
     expect(res.ok).toBe(true);
     const json = (await res.json()) as { result?: { bindings?: unknown[] } };
     expect(Array.isArray(json.result?.bindings)).toBe(true);
+    expect(json.result!.bindings!.length).toBeGreaterThan(0);
   });
 });

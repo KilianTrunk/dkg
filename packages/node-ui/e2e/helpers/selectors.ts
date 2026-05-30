@@ -20,6 +20,8 @@ export const sel = {
     notifItemText: '.v10-header-notif-item-text',
     notifItemTime: '.v10-header-notif-item-time',
     themeToggle: 'button[title*="Switch to"]',
+    observabilityBtn: 'button[title="Observability"]',
+    settingsBtn: 'button[title="Settings"]',
     rightPanelToggle: 'button[title="Toggle agent panel"]',
     actions: '.v10-header-actions',
   },

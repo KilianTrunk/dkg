@@ -15,7 +15,12 @@ export class BottomPanelPage {
   }
 
   async toggle() {
-    await this.toggleBtn.click();
+    const expandBtn = this.page.locator('button.v10-bottom-toggle[title="Expand"]');
+    if (await expandBtn.isVisible().catch(() => false)) {
+      await expandBtn.click();
+      return;
+    }
+    await this.page.locator('button.v10-bottom-toggle[title="Collapse"]').click();
   }
 
   async isCollapsed() {

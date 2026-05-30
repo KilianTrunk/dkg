@@ -5,6 +5,8 @@ import { dirname } from 'node:path';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const CI = !!process.env.CI;
 const PORT = 5173;
+/** Only true when launched via `pnpm test:e2e:devnet` (never inherit from shell). */
+const DEVNET_UI = process.env.PWTEST_DEVNET === '1';
 const DEVNET_NODE = process.env.DEVNET_NODE || process.env.UI_NODE_ID || '1';
 
 export default defineConfig({
@@ -25,16 +27,29 @@ export default defineConfig({
 
   projects: [
     {
-      name: 'chromium',
+      name: 'mock-ui',
       use: { ...devices['Desktop Chrome'] },
+      testIgnore: ['**/devnet/**', '**/*.devnet.spec.ts'],
+    },
+    {
+      name: 'devnet-ui',
+      use: { ...devices['Desktop Chrome'] },
+      testMatch: ['**/devnet/**', '**/*.devnet.spec.ts'],
+      timeout: CI ? 120_000 : 60_000,
+      fullyParallel: false,
     },
   ],
 
   webServer: {
-    command: `cross-env DEVNET_NODE=${DEVNET_NODE} pnpm dev:ui`,
+    // Server mode follows PWTEST_DEVNET (set explicitly by package.json scripts).
+    // Do not run both projects in one process — mock-ui and devnet-ui need different backends.
+    command: DEVNET_UI
+      ? `cross-env DEVNET_NODE=${DEVNET_NODE} pnpm dev:ui`
+      : 'cross-env DEVNET_NODE= UI_NODE_ID= pnpm dev:ui',
     cwd: __dirname,
     port: PORT,
-    reuseExistingServer: !CI,
+    // Never reuse across mock↔devnet switches; devnet must not inherit a mock-mode server.
+    reuseExistingServer: false,
     timeout: CI ? 60_000 : 30_000,
   },
 });

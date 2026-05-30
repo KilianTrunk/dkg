@@ -57,7 +57,7 @@ interface DevnetNode {
 
 interface DevnetState {
   provider: ethers.JsonRpcProvider;
-  kcs: ethers.Contract;
+  kas: ethers.Contract;
   token: ethers.Contract;
   rss: ethers.Contract;
   stakingV10: ethers.Contract;
@@ -189,7 +189,7 @@ function runDkgCli(
 async function publishViaCli(
   node: DevnetNode,
   filePath: string,
-): Promise<{ status: string; kcId?: bigint; txHash?: string }> {
+): Promise<{ status: string; kaId?: bigint; txHash?: string }> {
   const result = await runDkgCli(node, [
     'publish',
     CONTEXT_GRAPH,
@@ -206,7 +206,7 @@ async function publishViaCli(
   const txMatch = /TX hash:\s*(0x[0-9a-fA-F]+)/i.exec(result.stdout);
   return {
     status,
-    kcId: kcMatch ? BigInt(kcMatch[1]!) : undefined,
+    kaId: kcMatch ? BigInt(kcMatch[1]!) : undefined,
     txHash: txMatch ? txMatch[1] : undefined,
   };
 }
@@ -290,7 +290,7 @@ async function detectDevnet(): Promise<DevnetState | null> {
   );
   const parametersAddress = await hub.getContractAddress('ParametersStorage');
 
-  const kcs = new ethers.Contract(
+  const kas = new ethers.Contract(
     kcsAddress,
     [
       'function getLatestMerkleRootAuthor(uint256) view returns (address)',
@@ -359,7 +359,7 @@ async function detectDevnet(): Promise<DevnetState | null> {
 
   return {
     provider,
-    kcs,
+    kas,
     token,
     rss,
     stakingV10,
@@ -421,16 +421,16 @@ describe('Devnet greenfield 10min — publish, update, stake, random sampling', 
     const file = makeNquadsFile('gf10-publish', entityUri, 'v1-publish');
     const result = await publishViaCli(core1, file);
     expect(result.status.toLowerCase()).toBe('confirmed');
-    expect(result.kcId).toBeDefined();
+    expect(result.kaId).toBeDefined();
     expect(result.txHash).toMatch(/^0x[0-9a-fA-F]+$/);
 
-    run.kaId = result.kcId;
+    run.kaId = result.kaId;
     run.ual = buildKnowledgeAssetUal(
       s.chainIdLabel,
       s.dkgKaAddress,
-      result.kcId!,
+      result.kaId!,
     );
-    run.publishMerkle = await s.kcs.getLatestMerkleRoot(result.kcId!);
+    run.publishMerkle = await s.kas.getLatestMerkleRoot(result.kaId!);
     expect(run.publishMerkle).toMatch(/^0x[0-9a-fA-F]{64}$/);
     console.log(
       `phase 1 PASS: kaId=${run.kaId} ual=${run.ual} merkle=${run.publishMerkle}`,
@@ -442,7 +442,7 @@ describe('Devnet greenfield 10min — publish, update, stake, random sampling', 
     const core1 = s.nodes[1]!;
     expect(run.kaId).toBeDefined();
 
-    const onChainAuthor: string = await s.kcs.getLatestMerkleRootAuthor(run.kaId!);
+    const onChainAuthor: string = await s.kas.getLatestMerkleRootAuthor(run.kaId!);
     const authorWallet = core1.opWallets.find(
       (w) => w.address.toLowerCase() === onChainAuthor.toLowerCase(),
     );
@@ -492,7 +492,7 @@ describe('Devnet greenfield 10min — publish, update, stake, random sampling', 
           headers,
           signal: controller.signal,
           body: JSON.stringify({
-            kcId: String(run.kaId),
+            kaId: String(run.kaId),
             contextGraphId: CONTEXT_GRAPH,
             quads: updateQuads,
             precomputedUpdateAttestation: sealToApiJson(seal),
@@ -516,7 +516,7 @@ describe('Devnet greenfield 10min — publish, update, stake, random sampling', 
     expect(body.txHash).toMatch(/^0x[0-9a-fA-F]+$/);
     expect(run.ual).toBeDefined();
 
-    run.updateMerkle = await s.kcs.getLatestMerkleRoot(run.kaId!);
+    run.updateMerkle = await s.kas.getLatestMerkleRoot(run.kaId!);
     const expectedHex =
       '0x' + Buffer.from(seal.expectedNewMerkleRoot).toString('hex');
     expect(run.updateMerkle.toLowerCase()).toBe(expectedHex.toLowerCase());
@@ -655,7 +655,7 @@ describe('Devnet greenfield 10min — publish, update, stake, random sampling', 
       const rsPublish = await publishViaCli(core1, rsFile);
       expect(rsPublish.status.toLowerCase()).toBe('confirmed');
       console.log(
-        `phase 4: RS seed publish from node1 kaId=${rsPublish.kcId}`,
+        `phase 4: RS seed publish from node1 kaId=${rsPublish.kaId}`,
       );
 
       console.log(

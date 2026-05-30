@@ -55,7 +55,7 @@ const KAV10_ABI = firstExisting(
 );
 const KCS_ABI = firstExisting(
   join(ABI_DIR, 'DKGKnowledgeAssets.json'),
-  join(ABI_DIR, 'KnowledgeCollectionStorage.json'),
+  join(ABI_DIR, 'DKGKnowledgeAssets.json'),
 );
 
 function fail(msg) {
@@ -152,13 +152,13 @@ async function main() {
   // Greenfield renamed the create/update events to KnowledgeAsset{Created,Updated};
   // accept either so this works against both ABIs.
   const created = events.find(
-    (e) => e.name === 'KnowledgeAssetCreated' || e.name === 'KnowledgeCollectionCreated',
+    (e) => e.name === 'KnowledgeAssetCreated' || e.name === 'KnowledgeAssetCreated',
   );
   const updated = events.find(
-    (e) => e.name === 'KnowledgeAssetUpdated' || e.name === 'KnowledgeCollectionUpdated',
+    (e) => e.name === 'KnowledgeAssetUpdated' || e.name === 'KnowledgeAssetUpdated',
   );
-  if (!created) fail('KnowledgeAssetCreated / KnowledgeCollectionCreated event missing from storage ABI');
-  if (!updated) fail('KnowledgeAssetUpdated / KnowledgeCollectionUpdated event missing from storage ABI');
+  if (!created) fail('KnowledgeAssetCreated / KnowledgeAssetCreated event missing from storage ABI');
+  if (!updated) fail('KnowledgeAssetUpdated / KnowledgeAssetUpdated event missing from storage ABI');
   const createdHasAuthor = created.inputs.some(
     (i) => i.name === 'author' && i.indexed,
   );
@@ -187,12 +187,12 @@ async function main() {
   if (kcsCode === '0x') fail('No bytecode at DKGKnowledgeAssets / KnowledgeCollectionStorage address');
   pass('DKGKnowledgeAssets (KnowledgeCollectionStorage) has deployed bytecode');
 
-  const kcs = new ethers.Contract(kcsAddr, loadJson(KCS_ABI), provider);
+  const kas = new ethers.Contract(kcsAddr, loadJson(KCS_ABI), provider);
   try {
-    await kcs.getLatestMerkleRootAuthor(0n);
+    await kas.getLatestMerkleRootAuthor(0n);
     pass('getLatestMerkleRootAuthor callable on deployed bytecode');
   } catch (err) {
-    pass(`getLatestMerkleRootAuthor reverts on unknown kcId 0 (expected): ${err.shortMessage || err.message}`);
+    pass(`getLatestMerkleRootAuthor reverts on unknown kaId 0 (expected): ${err.shortMessage || err.message}`);
   }
 
   console.log('');

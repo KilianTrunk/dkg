@@ -195,7 +195,7 @@ export function buildPublishAckDigest(
  * Build update ACK digest. See contract `_executeUpdateCore`.
  *
  * `contextGraphId` is read by the contract from on-chain
- * `ContextGraphStorage.kcToContextGraph(id)` — the caller CANNOT override it
+ * `ContextGraphStorage.kaToContextGraph(id)` — the caller CANNOT override it
  * in the signed payload. The test fixture must therefore pass the same value
  * the contract will look up, or signature verification will fail.
  *
@@ -387,8 +387,8 @@ export async function buildPublishParams(args: {
  * Build a full `UpdateParamsStruct` for `KnowledgeAssetsLifecycle.update` / `updateDirect`.
  *
  * Requires the on-chain `contextGraphId` (read by the test from
- * `ContextGraphStorage.kcToContextGraph(id)`) and the pre-update merkle-root
- * count (read from `DKGKnowledgeAssets.getKnowledgeCollectionMetadata(id)`).
+ * `ContextGraphStorage.kaToContextGraph(id)`) and the pre-update merkle-root
+ * count (read from `DKGKnowledgeAssets.getKnowledgeAssetMetadata(id)`).
  */
 export type UpdateAuthorAttestationPayload = {
   domain: ethers.TypedDataDomain;

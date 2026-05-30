@@ -384,9 +384,9 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
     // KC records the FULL tokenAmount; only the staker-pool distribution is
     // discounted — the on-chain proof the discount branch (not direct
     // spend) executed.
-    const kcId = 1n;
+    const kaId = 1n;
     const meta =
-      await DKGKnowledgeAssets.getKnowledgeCollectionMetadata(kcId);
+      await DKGKnowledgeAssets.getKnowledgeAssetMetadata(kaId);
     expect(meta[6]).to.equal(tokenAmount);
     expect(activeSinkSum).to.be.lessThan(meta[6]);
   });
@@ -451,7 +451,7 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
 
     // Atomic rollback: the expired publish minted no knowledge collection.
     expect(
-      await DKGKnowledgeAssets.getLatestKnowledgeCollectionId(),
+      await DKGKnowledgeAssets.getLatestKnowledgeAssetId(),
     ).to.equal(0n);
   });
 });

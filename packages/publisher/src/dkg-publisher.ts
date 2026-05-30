@@ -1293,7 +1293,7 @@ export class DKGPublisher implements Publisher {
     // Per-cgId data promotion: copy quads + KA meta from the default
     // `<NAME>/data` + `<NAME>/_meta` graphs into `<NAME>/context/<cgId>/data`
     // + `<NAME>/context/<cgId>/_meta`. The RS prover's `extractV10KCFromStore`
-    // queries the per-cgId meta graph (kc-extractor.ts:154) to resolve a
+    // queries the per-cgId meta graph (ka-extractor.ts:154) to resolve a
     // KC's UAL from `dkg:batchId`, so without this promotion every published
     // KC stays invisible to random sampling and the prover loops on
     // `kc-not-synced` indefinitely.
@@ -1367,7 +1367,7 @@ export class DKGPublisher implements Publisher {
         // Data promotion: always COPY public quads to the per-cgId data
         // graph (`<NAME>/context/<cgId>/data`) — RS prover's
         // `extractV10KCFromStore` reads triples from there
-        // (`kc-extractor.ts` line ~225). On REMAP-flow publishes
+        // (`ka-extractor.ts` line ~225). On REMAP-flow publishes
         // (`publishContextGraphId` set), also delete the original copy
         // from the default data graph; on same-graph publishes, leave
         // the default copy in place so `agent.query(label)` (which

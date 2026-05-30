@@ -90,7 +90,7 @@ node_op_addr() {
   python3 -c "import json;print(json.load(open('$DEVNET_DIR/node$1/wallets.json'))['wallets'][0]['address'])" 2>/dev/null
 }
 
-# Resolve the on-chain KA owner (DKGKnowledgeAssets.ownerOf(kcId)) and return the
+# Resolve the on-chain KA owner (DKGKnowledgeAssets.ownerOf(kaId)) and return the
 # matching private key from any node's publisher-wallets.json. KC tokens are
 # minted to the EOA that submitted the on-chain publish (the daemon's publisher
 # wallet of whichever node finalized the SWM publish). Because every node has
@@ -100,7 +100,7 @@ node_op_addr() {
 # signature. This helper scans every devnet node's publisher-wallets.json plus
 # operator wallets.json[0..N] and prints "address<TAB>privateKey" for the match.
 # Returns nonzero if the owner address can't be matched against any local key.
-# Args: kcId
+# Args: kaId
 ka_owner_key() {
   local kc=$1
   local owner addr key
@@ -133,9 +133,9 @@ PY
 
 # Build POST /api/update JSON with precomputedUpdateAttestation (RC12 requires it).
 # The seal author MUST equal the on-chain KA owner (KnowledgeAssetsLifecycle._verifyUpdateAuthorAttestation
-# + the `p.authorAddress != kcs.ownerOf(p.id)` revert), so we ignore the
+# + the `p.authorAddress != kas.ownerOf(p.id)` revert), so we ignore the
 # originating node and resolve the owner key from chain state.
-# Args: node_num kcId contextGraphId quads_json_array_string
+# Args: node_num kaId contextGraphId quads_json_array_string
 build_update_body() {
   local node=$1 kc=$2 cg=$3 quads_json=$4 key seal owner_line
   owner_line=$(ka_owner_key "$kc") || return 1
@@ -149,7 +149,7 @@ if not wrap.get('ok'):
     sys.stderr.write(wrap.get('error','seal failed') + '\n')
     sys.exit(1)
 body = {
-    'kcId': sys.argv[2],
+    'kaId': sys.argv[2],
     'contextGraphId': sys.argv[3],
     'quads': json.loads(sys.argv[4]),
     'precomputedUpdateAttestation': wrap['precomputedUpdateAttestation'],
@@ -479,9 +479,9 @@ publish_one() { # idx node cgid kind
         "http://127.0.0.1:$port/api/shared-memory/publish" \
         -d "{\"contextGraphId\":\"$cgid\",\"selection\":{\"rootEntities\":[\"$root\"]},\"clearAfter\":false}")
     st=$(echo "$p" | pyf "d.get('status','')")
-    kc=$(echo "$p" | pyf "d.get('kcId','')")
+    kc=$(echo "$p" | pyf "d.get('kaId','')")
     if [ "$st" = "confirmed" ] || [ "$st" = "finalized" ]; then
-      printf '{"idx":"%s","node":%d,"cg":"%s","kind":"%s","entities":%d,"ok":true,"kcId":"%s","status":"%s","root":"%s"}\n' \
+      printf '{"idx":"%s","node":%d,"cg":"%s","kind":"%s","entities":%d,"ok":true,"kaId":"%s","status":"%s","root":"%s"}\n' \
         "$idx" "$node" "$cgid" "$kind" "$E" "$kc" "$st" "$root" >> "$METRICS_JSONL"
       return 0
     fi
@@ -604,12 +604,12 @@ seen={}; out=[]
 for l in sys.stdin:
     try: r=json.loads(l)
     except Exception: continue
-    if not r.get('kcId'): continue
+    if not r.get('kaId'): continue
     if r.get('kind') != 'public': continue
     k=r['cg']
     if seen.get(k,0) < 4:
         seen[k]=seen.get(k,0)+1
-        out.append(f\"{r['node']}|{r['cg']}|{r['kcId']}|{r['root']}\")
+        out.append(f\"{r['node']}|{r['cg']}|{r['kaId']}|{r['root']}\")
     if len(out)>=40: break
 print('\n'.join(out))")
 while IFS='|' read -r un uc ukc uroot; do
@@ -899,14 +899,14 @@ section "I. OWNERSHIP TRANSFER — transfer a KA and update as new owner"
 # node ends up owning everything because the publisher routing is sticky to
 # the node that drained SWM first). The originating node in metrics.jsonl is
 # the request initiator, NOT necessarily the on-chain owner — so we resolve
-# the real owner via DKGKnowledgeAssets.ownerOf(kcId) and pick a destination
+# the real owner via DKGKnowledgeAssets.ownerOf(kaId) and pick a destination
 # address that is provably distinct from the owner.
 OREC=$(grep '"ok":true' "$METRICS_JSONL" | python3 -c "
 import sys,json
 for l in sys.stdin:
     r=json.loads(l)
-    if r.get('kcId') and r.get('kind')=='public':
-        print(r['cg'], r['kcId'], r['root']); break")
+    if r.get('kaId') and r.get('kind')=='public':
+        print(r['cg'], r['kaId'], r['root']); break")
 if [ -n "$OREC" ]; then
   ocg=$(echo "$OREC"|awk '{print $1}'); okc=$(echo "$OREC"|awk '{print $2}'); oroot=$(echo "$OREC"|awk '{print $3}')
   KA_ABI="$REPO_ROOT/packages/evm-module/abi/DKGKnowledgeAssets.json"

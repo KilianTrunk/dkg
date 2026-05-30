@@ -275,7 +275,7 @@ describe('extractV10KCFromStore — happy path / publisher round-trip parity', (
 
   it('resolves CG names that contain "/" (v9-style <owner>/<slug> namespacing)', async () => {
     // Regression for a testnet incident where every random-sampling proof on every
-    // beacon went unsubmitted: the CG name resolver in `kc-extractor.ts` rejected
+    // beacon went unsubmitted: the CG name resolver in `ka-extractor.ts` rejected
     // any name containing "/", but real CGs were registered as
     // "0xb08…4794c/laptop-smoke" — owner-prefixed slugs. The FinalizationHandler
     // wrote canonical data under `did:dkg:context-graph:<owner>/<slug>/context/<cgId>/_meta`

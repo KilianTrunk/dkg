@@ -19,7 +19,7 @@ const HUNDRED_ETH = ethers.parseEther('100');
 // Helper functions for random sampling
 async function createMockChallenge(
   randomSampling: RandomSampling,
-  knowledgeCollectionStorage: DKGKnowledgeAssets,
+  knowledgeAssetStorage: DKGKnowledgeAssets,
   chronos: Chronos,
 ): Promise<RandomSamplingLib.ChallengeStruct> {
   const currentEpoch = await chronos.getCurrentEpoch();
@@ -30,10 +30,10 @@ async function createMockChallenge(
     await randomSampling.getActiveProofingPeriodDurationInBlocks();
 
   return {
-    knowledgeCollectionId: 1n,
+    knowledgeAssetId: 1n,
     chunkId: 1n,
-    knowledgeCollectionStorageContract:
-      await knowledgeCollectionStorage.getAddress(),
+    knowledgeAssetStorageContract:
+      await knowledgeAssetStorage.getAddress(),
     epoch: currentEpoch,
     activeProofPeriodStartBlock,
     proofingPeriodDurationInBlocks: proofingPeriodDuration,
@@ -829,8 +829,8 @@ describe('@unit RandomSamplingStorage', function () {
         publishingNodeIdentityId,
       );
 
-      expect(challenge.knowledgeCollectionId).to.be.equal(
-        MockChallenge.knowledgeCollectionId,
+      expect(challenge.knowledgeAssetId).to.be.equal(
+        MockChallenge.knowledgeAssetId,
       );
       expect(challenge.chunkId).to.be.equal(MockChallenge.chunkId);
       expect(challenge.epoch).to.be.equal(MockChallenge.epoch);
@@ -857,7 +857,7 @@ describe('@unit RandomSamplingStorage', function () {
       );
       // eslint-disable-next-line @typescript-eslint/no-unused-expressions
       expect(initialChallenge.solved).to.be.false;
-      expect(initialChallenge.knowledgeCollectionId).to.be.equal(0n);
+      expect(initialChallenge.knowledgeAssetId).to.be.equal(0n);
 
       // Set first challenge
       await RandomSamplingStorage.connect(signer).setNodeChallenge(
@@ -869,8 +869,8 @@ describe('@unit RandomSamplingStorage', function () {
       const firstChallenge = await RandomSamplingStorage.getNodeChallenge(
         publishingNodeIdentityId,
       );
-      expect(firstChallenge.knowledgeCollectionId).to.be.equal(
-        MockChallenge.knowledgeCollectionId,
+      expect(firstChallenge.knowledgeAssetId).to.be.equal(
+        MockChallenge.knowledgeAssetId,
       );
       // eslint-disable-next-line @typescript-eslint/no-unused-expressions
       expect(firstChallenge.solved).to.be.equal(MockChallenge.solved);
@@ -878,7 +878,7 @@ describe('@unit RandomSamplingStorage', function () {
       // Create and set second challenge
       const secondChallenge = {
         ...MockChallenge,
-        knowledgeCollectionId: BigInt(MockChallenge.knowledgeCollectionId) + 1n,
+        knowledgeAssetId: BigInt(MockChallenge.knowledgeAssetId) + 1n,
         solved: true,
       };
       await RandomSamplingStorage.connect(signer).setNodeChallenge(
@@ -890,8 +890,8 @@ describe('@unit RandomSamplingStorage', function () {
       const finalChallenge = await RandomSamplingStorage.getNodeChallenge(
         publishingNodeIdentityId,
       );
-      expect(finalChallenge.knowledgeCollectionId).to.be.equal(
-        secondChallenge.knowledgeCollectionId,
+      expect(finalChallenge.knowledgeAssetId).to.be.equal(
+        secondChallenge.knowledgeAssetId,
       );
       // eslint-disable-next-line @typescript-eslint/no-unused-expressions
       expect(finalChallenge.solved).to.be.true;

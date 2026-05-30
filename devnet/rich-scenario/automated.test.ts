@@ -40,7 +40,7 @@ interface DevnetNode {
 
 interface DevnetState {
   provider: ethers.JsonRpcProvider;
-  kcs: ethers.Contract;
+  kas: ethers.Contract;
   token: ethers.Contract;
   rss: ethers.Contract;
   stakingV10: ethers.Contract;
@@ -350,19 +350,19 @@ async function publishAssertionVm(
     }
     return (await res.json()) as {
       status?: string;
-      kcId?: string;
+      kaId?: string;
       txHash?: string;
     };
   };
   let j = await doPublish();
-  if (j.status === 'tentative' || j.kcId === '0') {
+  if (j.status === 'tentative' || j.kaId === '0') {
     await new Promise((r) => setTimeout(r, 2_000));
     j = await doPublish();
   }
-  if (j.status !== 'confirmed' || !j.kcId) {
+  if (j.status !== 'confirmed' || !j.kaId) {
     throw new Error(`publish ${name} not confirmed: ${JSON.stringify(j)}`);
   }
-  return BigInt(j.kcId);
+  return BigInt(j.kaId);
 }
 
 async function publishEdgeSwmVm(
@@ -411,11 +411,11 @@ async function publishEdgeSwmVm(
       `edge publish ${entity}: ${pubRes.status} ${await pubRes.text()}`,
     );
   }
-  const j = (await pubRes.json()) as { status?: string; kcId?: string };
-  if (j.status !== 'confirmed' || !j.kcId || j.kcId === '0') {
+  const j = (await pubRes.json()) as { status?: string; kaId?: string };
+  if (j.status !== 'confirmed' || !j.kaId || j.kaId === '0') {
     throw new Error(`edge publish failed: ${JSON.stringify(j)}`);
   }
-  return BigInt(j.kcId);
+  return BigInt(j.kaId);
 }
 
 function sealToApiJson(
@@ -486,7 +486,7 @@ async function detectDevnet(): Promise<DevnetState | null> {
   );
   const parametersAddress = await hub.getContractAddress('ParametersStorage');
 
-  const kcs = new ethers.Contract(
+  const kas = new ethers.Contract(
     kcsAddress,
     [
       'function getLatestMerkleRootAuthor(uint256) view returns (address)',
@@ -555,7 +555,7 @@ async function detectDevnet(): Promise<DevnetState | null> {
 
   return {
     provider,
-    kcs,
+    kas,
     token,
     rss,
     stakingV10,
@@ -767,7 +767,7 @@ describe('Devnet rich scenario (~10 min)', () => {
       });
       vmDone++;
       if (vmDone % 2 === 0 || vmDone === VM_COUNT) {
-        console.log(`phase 2: VM ${vmDone}/${VM_COUNT} (kcId=${kaId})`);
+        console.log(`phase 2: VM ${vmDone}/${VM_COUNT} (kaId=${kaId})`);
       }
       if (PUBLISH_PACE_MS > 0) {
         await new Promise((r) => setTimeout(r, PUBLISH_PACE_MS));
@@ -799,7 +799,7 @@ describe('Devnet rich scenario (~10 min)', () => {
 
     for (const rec of targets) {
       const node = s.nodes[rec.nodeNum]!;
-      const onChainAuthor: string = await s.kcs.getLatestMerkleRootAuthor(
+      const onChainAuthor: string = await s.kas.getLatestMerkleRootAuthor(
         rec.kaId,
       );
       const authorWallet = node.opWallets.find(
@@ -850,7 +850,7 @@ describe('Devnet rich scenario (~10 min)', () => {
             },
             signal: controller.signal,
             body: JSON.stringify({
-              kcId: String(rec.kaId),
+              kaId: String(rec.kaId),
               contextGraphId: rec.cgId,
               quads: updateQuads,
               precomputedUpdateAttestation: sealToApiJson(seal),
@@ -868,7 +868,7 @@ describe('Devnet rich scenario (~10 min)', () => {
       const j = (await res.json()) as { status?: string; txHash?: string };
       expect(j.status?.toLowerCase()).toBe('confirmed');
 
-      const afterRoot = await s.kcs.getLatestMerkleRoot(rec.kaId);
+      const afterRoot = await s.kas.getLatestMerkleRoot(rec.kaId);
       expect(afterRoot).toBe(
         '0x' + Buffer.from(seal.expectedNewMerkleRoot).toString('hex'),
       );

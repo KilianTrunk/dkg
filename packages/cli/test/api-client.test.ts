@@ -140,12 +140,12 @@ describe('ApiClient', () => {
     });
 
     it('publish() sends context graph id and quads', async () => {
-      const expected = { kcId: 'kc1', status: 'tentative', kas: [] };
+      const expected = { kaId: 'kc1', status: 'tentative', kas: [] };
       const { fetch, calls } = createTrackingFetch({ ok: true, status: 200, body: expected });
       globalThis.fetch = fetch;
       const quads = [{ subject: 'urn:s', predicate: 'urn:p', object: '"v"', graph: 'urn:g' }];
       const result = await client.publish('test-contextGraph', quads);
-      expect(result.kcId).toBe('kc1');
+      expect(result.kaId).toBe('kc1');
 
       const body = JSON.parse(calls[0].opts.body as string);
       expect(body.contextGraphId).toBe('test-contextGraph');

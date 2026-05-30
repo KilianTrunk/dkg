@@ -32,7 +32,7 @@ import {
   KCDataMissingError,
   KCNotFoundError,
   KCRootEntitiesNotFoundError,
-} from './kc-extractor.js';
+} from './ka-extractor.js';
 import {
   extractCiphertextChunksFromStore,
   CiphertextChunksMissingError,

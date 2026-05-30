@@ -13,7 +13,7 @@ import {ECDSA} from "solady/src/utils/ECDSA.sol";
  * @title MockReentrantPublisher
  * @notice Test-only harness for the `nonReentrant` perimeter on
  *         `KnowledgeAssetsV10.publish` / `update` /
- *         `extendKnowledgeCollectionLifetime`. The mock acts as the
+ *         `extendKnowledgeAssetLifetime`. The mock acts as the
  *         publisher (msg.sender) of a real V10 publish and re-enters the
  *         target entrypoint from inside an ERC-1155 mint callback
  *         (`onERC1155BatchReceived`) or ERC-721 mint callback

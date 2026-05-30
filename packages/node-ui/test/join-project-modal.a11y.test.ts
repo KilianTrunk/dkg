@@ -136,6 +136,10 @@ describe('JoinProjectModal — BUG-017 a11y dismiss wiring', () => {
     // click landed on the overlay itself, not on a child. A click
     // inside the dialog bubbles up to the overlay's onClick, but the
     // target/currentTarget identity check filters it out.
+    //
+    // Backdrop dismissal (`onClose` called exactly once) is covered
+    // by the dedicated test immediately below — kept separate so a
+    // broken backdrop handler cannot hide behind this negative case.
     const onClose = vi.fn();
     const container = await renderModal({ open: true, onClose });
     const dialog = container.querySelector('[role="dialog"]') as HTMLElement;

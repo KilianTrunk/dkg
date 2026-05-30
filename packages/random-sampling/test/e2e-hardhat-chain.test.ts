@@ -81,7 +81,7 @@ describe('Random Sampling E2E (Hardhat)', () => {
   const merkleLeafCount = tree.leafCount;
 
   let snapshotId: string;
-  let kcId: bigint;
+  let kaId: bigint;
   let cgId: bigint;
   let kav10Address: string;
 
@@ -90,7 +90,7 @@ describe('Random Sampling E2E (Hardhat)', () => {
     const ctx = getSharedContext();
     const provider = createProvider();
 
-    // 1. Fund the publisher (CORE_OP) — `createKnowledgeAssetsV10`
+    // 1. Fund the publisher (CORE_OP) — `createKnowledgeAssets`
     //    requires real TRAC to pay `tokenAmount`. Receivers get stake
     //    + ask through `stakeAndSetAsk` so they're in the sharding
     //    table (precondition for any of them to act as the prover).
@@ -118,7 +118,7 @@ describe('Random Sampling E2E (Hardhat)', () => {
     //    is set to 3 above (matches the receiver count). LU-2: per-CG
     //    hosting committees and quorum overrides are gone.
     const publisherAdapter = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
-    kav10Address = await publisherAdapter.getKnowledgeAssetsV10Address();
+    kav10Address = await publisherAdapter.getKnowledgeAssetsLifecycleAddress();
     // publishPolicy: 1 (open) — required for the CG to be eligible
     // for random sampling. publishPolicy: 0 means "curated" and
     // RandomSampling._isCGEligible() filters those out at draw time.
@@ -172,7 +172,7 @@ describe('Random Sampling E2E (Hardhat)', () => {
     const authorSig = ethers.Signature.from(
       await coreOpWallet.signTypedData(authorTyped.domain, authorTyped.types, authorTyped.message),
     );
-    const publishResult = await publisherAdapter.createKnowledgeAssetsV10!({
+    const publishResult = await publisherAdapter.createKnowledgeAssets!({
       publishOperationId: 'rs-e2e-publish',
       contextGraphId: cgId,
       merkleRoot,
@@ -193,8 +193,8 @@ describe('Random Sampling E2E (Hardhat)', () => {
       },
       ackSignatures,
     });
-    kcId = publishResult.batchId;
-    if (kcId === 0n) {
+    kaId = publishResult.batchId;
+    if (kaId === 0n) {
       throw new Error('Publish succeeded but batchId is 0; ABI drift?');
     }
   });
@@ -257,7 +257,7 @@ describe('Random Sampling E2E (Hardhat)', () => {
     const dataQuads: Quad[] = publishQuads.map((q) => ({ ...q, graph: dataGraph }));
     await store.insert(dataQuads);
 
-    const ual = `did:dkg:hardhat:31337/${kav10Address.toLowerCase()}/${kcId}`;
+    const ual = `did:dkg:hardhat:31337/${kav10Address.toLowerCase()}/${kaId}`;
     const kcMeta: KCMetadata = {
       ual,
       contextGraphId: `${cgName}/context/${cgIdStr}`,
@@ -279,7 +279,7 @@ describe('Random Sampling E2E (Hardhat)', () => {
       blockNumber: 1,
       blockTimestamp: Math.floor(Date.now() / 1000),
       publisherAddress: ethers.computeAddress(HARDHAT_KEYS.CORE_OP),
-      batchId: kcId,
+      batchId: kaId,
       chainId: '31337',
     };
     await store.insert(generateConfirmedFullMetadata(kcMeta, [kaMeta], provenance));
@@ -300,7 +300,7 @@ describe('Random Sampling E2E (Hardhat)', () => {
       // value and one KC inside it, the weighted draw is deterministic.
       expect(outcome.kind).toBe('submitted');
       if (outcome.kind === 'submitted') {
-        expect(outcome.kcId).toBe(kcId);
+        expect(outcome.kaId).toBe(kaId);
         expect(outcome.cgId).toBe(cgId);
         expect(typeof outcome.txHash).toBe('string');
       }

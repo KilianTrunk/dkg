@@ -106,7 +106,7 @@ export type V10ACKProvider = (
  * digest before `updateKnowledgeCollectionV10` is broadcast.
  */
 export type V10UpdateACKProvider = (
-  kcId: bigint,
+  kaId: bigint,
   newMerkleRoot: Uint8Array,
   contextGraphId: string,
   newByteSize: bigint,
@@ -304,7 +304,7 @@ export interface PublishOptions {
 }
 
 export interface PublishResult {
-  kcId: bigint;
+  kaId: bigint;
   /** The UAL assigned to this KC (tentative or confirmed). */
   ual: string;
   merkleRoot: Uint8Array;
@@ -325,7 +325,7 @@ export interface PublishResult {
 
 export interface Publisher {
   publish(options: PublishOptions): Promise<PublishResult>;
-  update(kcId: bigint, options: PublishOptions): Promise<PublishResult>;
+  update(kaId: bigint, options: PublishOptions): Promise<PublishResult>;
   autoPartition(quads: Quad[]): KAManifestEntry[];
   skolemize(rootEntity: string, quads: Quad[]): Quad[];
 }

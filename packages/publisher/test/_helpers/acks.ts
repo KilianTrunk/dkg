@@ -138,7 +138,7 @@ export function makeInMemoryV10ACKProvider(
  *   const ctx = getSharedContext();
  *   const ackProvider = makeHardhatReceiverACKProvider(
  *     ctx,
- *     await chain.getKnowledgeAssetsV10Address(),
+ *     await chain.getKnowledgeAssetsLifecycleAddress(),
  *   );
  *   publisher = await wrapPublisherWithChain(
  *     new DKGPublisher(...),
@@ -162,9 +162,9 @@ export function makeHardhatUpdateACKProvider(
     identityId: BigInt(ctx.receiverIds[i]!),
     peerId: `in-memory-rec${i + 1}`,
   }));
-  return async (kcId, newMerkleRoot, _contextGraphIdStr, newByteSize, newMerkleLeafCount) => {
+  return async (kaId, newMerkleRoot, _contextGraphIdStr, newByteSize, newMerkleLeafCount) => {
     const digest = await chain.computeV10UpdateAckDigest({
-      kcId,
+      kaId,
       newMerkleRoot,
       newByteSize,
       newMerkleLeafCount,
@@ -218,7 +218,7 @@ export function makeHardhatReceiverACKProvider(
  * Memoised per `kav10Address` so repeated calls in tight loops are
  * cheap. Caller is responsible for ensuring `kav10Address` is
  * resolved before the call (typically: `beforeAll` already awaited
- * `chain.getKnowledgeAssetsV10Address()` and stashed it).
+ * `chain.getKnowledgeAssetsLifecycleAddress()` and stashed it).
  */
 const _hardhatACKProviderCache = new Map<string, V10ACKProvider>();
 export function hardhatACKProvider(kav10Address: string): V10ACKProvider {

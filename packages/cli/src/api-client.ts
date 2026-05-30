@@ -263,7 +263,7 @@ export class ApiClient {
     allowedPeers?: string[];
     publisherNodeIdentityIdOverride?: bigint;
   }): Promise<{
-    kcId: string;
+    kaId: string;
     status: 'tentative' | 'confirmed';
     kas: Array<{ tokenId: string; rootEntity: string }>;
     txHash?: string;
@@ -331,7 +331,7 @@ export class ApiClient {
     clearAfter = true,
     options?: { subGraphName?: string; publisherNodeIdentityIdOverride?: bigint },
   ): Promise<{
-    kcId: string;
+    kaId: string;
     status: 'tentative' | 'confirmed';
     kas: Array<{ tokenId: string; rootEntity: string }>;
     txHash?: string;
@@ -488,7 +488,7 @@ export class ApiClient {
       publisherNodeIdentityIdOverride?: bigint;
     },
   ): Promise<{
-    kcId: string;
+    kaId: string;
     status: 'tentative' | 'confirmed';
     assertionUri: string;
     authorAddress: string;
@@ -533,7 +533,7 @@ export class ApiClient {
     },
   ): Promise<{
     assertionUri: string;
-    kcId: string;
+    kaId: string;
     status: 'tentative' | 'confirmed';
     authorAddress: string;
     merkleRoot: string;
@@ -571,7 +571,7 @@ export class ApiClient {
     );
     return {
       assertionUri: created.assertionUri,
-      kcId: published.kcId,
+      kaId: published.kaId,
       status: published.status,
       authorAddress: published.authorAddress,
       merkleRoot: published.merkleRoot,

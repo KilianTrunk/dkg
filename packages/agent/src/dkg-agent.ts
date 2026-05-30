@@ -1682,14 +1682,14 @@ export class DKGAgent {
             const chainIdForHandler = typeof this.chain.getEvmChainId === 'function'
               ? await this.chain.getEvmChainId()
               : undefined;
-            const kav10AddressForHandler = typeof this.chain.getKnowledgeAssetsV10Address === 'function'
-              ? await this.chain.getKnowledgeAssetsV10Address()
+            const kav10AddressForHandler = typeof this.chain.getKnowledgeAssetsLifecycleAddress === 'function'
+              ? await this.chain.getKnowledgeAssetsLifecycleAddress()
               : undefined;
             if (chainIdForHandler === undefined || kav10AddressForHandler === undefined) {
               this.log.warn(
                 attemptCtx,
                 `Skipping V10 StorageACK handler: chain adapter does not expose ` +
-                `getEvmChainId() + getKnowledgeAssetsV10Address(); handler cannot build the ` +
+                `getEvmChainId() + getKnowledgeAssetsLifecycleAddress(); handler cannot build the ` +
                 `H5-prefixed ACK digest that KnowledgeAssetsV10 verifies on-chain`,
               );
               return 'disabled';
@@ -5164,7 +5164,7 @@ export class DKGAgent {
   /**
    * Chain-confirmed verified author identity for a knowledge collection's
    * latest merkle-root entry. Reads
-   * `KnowledgeCollectionStorage.getLatestMerkleRootAuthor(kcId)` via the
+   * `KnowledgeCollectionStorage.getLatestMerkleRootAuthor(kaId)` via the
    * configured chain adapter.
    *
    * Returns:
@@ -5180,9 +5180,9 @@ export class DKGAgent {
    * "no attestation on file" from "feature unavailable" should use this
    * `null` signal — `address(0)` always means the former.
    */
-  async getKnowledgeCollectionAuthor(kcId: bigint): Promise<string | null> {
+  async getKnowledgeCollectionAuthor(kaId: bigint): Promise<string | null> {
     if (typeof this.chain.getLatestMerkleRootAuthor !== 'function') return null;
-    return this.chain.getLatestMerkleRootAuthor(kcId);
+    return this.chain.getLatestMerkleRootAuthor(kaId);
   }
 
   /** V10 Publishing Conviction NFT facade — thin chain-adapter wrappers.
@@ -7275,14 +7275,14 @@ export class DKGAgent {
   ): Promise<LiftRequestAuthorSeal | undefined> {
     if (this.chain.isV10Ready?.() !== true) return undefined;
     if (typeof this.chain.getEvmChainId !== 'function') return undefined;
-    if (typeof this.chain.getKnowledgeAssetsV10Address !== 'function') return undefined;
+    if (typeof this.chain.getKnowledgeAssetsLifecycleAddress !== 'function') return undefined;
 
     const onChainId = await this.getContextGraphOnChainId(request.contextGraphId);
     if (onChainId == null) return undefined; // CG not on-chain — publisher goes tentative
 
 
     const chainId = await this.chain.getEvmChainId();
-    const kav10Address = await this.chain.getKnowledgeAssetsV10Address();
+    const kav10Address = await this.chain.getKnowledgeAssetsLifecycleAddress();
     if (chainId === undefined || kav10Address === undefined) return undefined;
 
     const graphManager = new GraphManager(this.store);
@@ -7402,7 +7402,7 @@ export class DKGAgent {
     if (
       onChainId != null &&
       typeof this.chain.getEvmChainId === 'function' &&
-      typeof this.chain.getKnowledgeAssetsV10Address === 'function'
+      typeof this.chain.getKnowledgeAssetsLifecycleAddress === 'function'
     ) {
       try {
         precomputedAttestation = await this._buildPrecomputedAttestationForSelection(
@@ -7480,12 +7480,12 @@ export class DKGAgent {
     this.log.info(ctx, `Local publish complete, broadcasting to peers`);
     await this.broadcastPublish(contextGraphId, result, ctx);
     onPhase?.('broadcast', 'end');
-    this.log.info(ctx, `Publish complete — status=${result.status} kcId=${result.kcId}`);
+    this.log.info(ctx, `Publish complete — status=${result.status} kaId=${result.kaId}`);
     return result;
   }
 
   async update(
-    kcId: bigint, contextGraphId: string, quads: Quad[], privateQuads?: Quad[],
+    kaId: bigint, contextGraphId: string, quads: Quad[], privateQuads?: Quad[],
     opts?: {
       onPhase?: PhaseCallback;
       operationCtx?: OperationContext;
@@ -7494,8 +7494,8 @@ export class DKGAgent {
   ): Promise<PublishResult> {
     const ctx = opts?.operationCtx ?? createOperationContext('update');
     const onPhase = opts?.onPhase;
-    this.log.info(ctx, `Starting update of kcId=${kcId} in context graph "${contextGraphId}" with ${quads.length} triples`);
-    const result = await this.publisher.update(kcId, {
+    this.log.info(ctx, `Starting update of kaId=${kaId} in context graph "${contextGraphId}" with ${quads.length} triples`);
+    const result = await this.publisher.update(kaId, {
       contextGraphId,
       quads,
       privateQuads,
@@ -7516,7 +7516,7 @@ export class DKGAgent {
         const nquadsBytes = new TextEncoder().encode(nquadsStr);
         const message = encodeKAUpdateRequest({
           contextGraphId: contextGraphId,
-          batchId: kcId,
+          batchId: kaId,
           nquads: nquadsBytes,
           manifest: result.kaManifest.map((m) => ({
             rootEntity: m.rootEntity,
@@ -7533,7 +7533,7 @@ export class DKGAgent {
         });
         const topic = contextGraphUpdateTopic(contextGraphId);
         await this.gossip.publish(topic, message);
-        this.log.info(ctx, `Broadcast KA update for batchId=${kcId} on ${topic}`);
+        this.log.info(ctx, `Broadcast KA update for batchId=${kaId} on ${topic}`);
       } catch (err) {
         this.log.warn(ctx, `Failed to broadcast KA update: ${err instanceof Error ? err.message : String(err)}`);
       }
@@ -7916,15 +7916,15 @@ export class DKGAgent {
     //    `(chainId, kav10Address)` pair — both must be available.
     if (
       typeof this.chain.getEvmChainId !== 'function' ||
-      typeof this.chain.getKnowledgeAssetsV10Address !== 'function'
+      typeof this.chain.getKnowledgeAssetsLifecycleAddress !== 'function'
     ) {
       throw new Error(
         'assertionFinalize requires a V10-capable chain adapter that exposes ' +
-          'getEvmChainId() and getKnowledgeAssetsV10Address(); the current adapter does not.',
+          'getEvmChainId() and getKnowledgeAssetsLifecycleAddress(); the current adapter does not.',
       );
     }
     const chainId = await this.chain.getEvmChainId();
-    const kav10Address = await this.chain.getKnowledgeAssetsV10Address();
+    const kav10Address = await this.chain.getKnowledgeAssetsLifecycleAddress();
 
     // 6. Resolve the on-chain CG id — the EIP-712 digest binds to it.
     const onChainCgId = await this.requireOnChainContextGraphId(contextGraphId);
@@ -8155,11 +8155,11 @@ export class DKGAgent {
     }
     if (
       typeof this.chain.getEvmChainId !== 'function' ||
-      typeof this.chain.getKnowledgeAssetsV10Address !== 'function'
+      typeof this.chain.getKnowledgeAssetsLifecycleAddress !== 'function'
     ) {
       throw new Error(
         'Selection-based VM publish requires a V10-capable chain adapter that exposes ' +
-          'getEvmChainId() and getKnowledgeAssetsV10Address().',
+          'getEvmChainId() and getKnowledgeAssetsLifecycleAddress().',
       );
     }
 
@@ -8189,7 +8189,7 @@ export class DKGAgent {
     const merkleRoot = computeFlatKCRoot(allSkolemizedQuads, privateRoots);
 
     const chainId = await this.chain.getEvmChainId();
-    const kav10Address = await this.chain.getKnowledgeAssetsV10Address();
+    const kav10Address = await this.chain.getKnowledgeAssetsLifecycleAddress();
     const onChainCgId =
       opts?.targetOnChainCgId !== undefined
         ? BigInt(opts.targetOnChainCgId)
@@ -8744,10 +8744,10 @@ export class DKGAgent {
     //    rather than a tx revert.
     if (
       typeof this.chain.getEvmChainId === 'function' &&
-      typeof this.chain.getKnowledgeAssetsV10Address === 'function'
+      typeof this.chain.getKnowledgeAssetsLifecycleAddress === 'function'
     ) {
       const liveChainId = await this.chain.getEvmChainId();
-      const liveKav10 = await this.chain.getKnowledgeAssetsV10Address();
+      const liveKav10 = await this.chain.getKnowledgeAssetsLifecycleAddress();
       if (liveChainId !== seal.chainId) {
         throw new Error(
           `publishFromFinalizedAssertion: seal binds chainId=${seal.chainId.toString()} but daemon ` +
@@ -8772,7 +8772,7 @@ export class DKGAgent {
     //    publish would bundle every other promoted assertion sitting
     //    in shared memory into the same KC; the publisher's recompute
     //    would then disagree with the seal's `expectedMerkleRoot` and
-    //    flip to `tentative kcId: "0"`. The seal's rootEntities were
+    //    flip to `tentative kaId: "0"`. The seal's rootEntities were
     //    captured at finalize time from the same `autoPartition` call
     //    that drove the merkle leaves, so this selection deterministically
     //    yields the post-promote SWM slice the seal commits to.
@@ -8805,7 +8805,7 @@ export class DKGAgent {
           metaGraph,
           txHash: result.onChainResult.txHash ?? '',
           blockNumber: BigInt(result.onChainResult.blockNumber ?? 0),
-          kcId: result.onChainResult.batchId ?? 0n,
+          kaId: result.onChainResult.batchId ?? 0n,
         });
         await this.store.insert(receiptQuads);
       } catch (err) {
@@ -8914,7 +8914,7 @@ export class DKGAgent {
       !resolvedSeal &&
       onChainId != null &&
       typeof this.chain.getEvmChainId === 'function' &&
-      typeof this.chain.getKnowledgeAssetsV10Address === 'function'
+      typeof this.chain.getKnowledgeAssetsLifecycleAddress === 'function'
     ) {
       const swmQuads = await this._loadSelectedSWMQuads(
         contextGraphId,
@@ -11235,7 +11235,7 @@ export class DKGAgent {
 
   /**
    * OT-RFC-39 — resolve a numeric on-chain CG id (the form the prover
-   * sees from `createChallenge` / `getKCContextGraphId`) back to the
+   * sees from `createChallenge` / `getKAContextGraphId`) back to the
    * local cleartext id this agent registered the CG under. Scans
    * `subscribedContextGraphs` because the reverse map is keyed by the
    * wire-form `onChainHash`, not the numeric id. Returns null when
@@ -15761,7 +15761,7 @@ export class DKGAgent {
     // system param off-chain via the adapter accessor.
     //
     // FAIL-CLOSED (Codex PR #595 round-3): `chain.verify()` only calls
-    // `registerKnowledgeCollection()` — it does NOT submit the collected
+    // `registerKnowledgeAsset()` — it does NOT submit the collected
     // signatures on-chain. This local quorum check is therefore the
     // *only* enforcement gate. If the chain adapter can't tell us the
     // system minimum (RPC outage, missing method, invalid value), we
@@ -15974,8 +15974,8 @@ export class DKGAgent {
     // 7. Submit on-chain only after quorum. Partial writes above are
     // metadata-only and deliberately do not claim a transaction hash.
     let txResult: { hash: string; blockNumber: number };
-    const existingContextGraphId = typeof this.chain.getKCContextGraphId === 'function'
-      ? await this.chain.getKCContextGraphId(opts.batchId).catch(() => 0n)
+    const existingContextGraphId = typeof this.chain.getKAContextGraphId === 'function'
+      ? await this.chain.getKAContextGraphId(opts.batchId).catch(() => 0n)
       : 0n;
     if (existingContextGraphId === contextGraphIdOnChain) {
       const provenance = await this.getBatchChainProvenance(opts.contextGraphId, opts.batchId);
@@ -19303,7 +19303,7 @@ export class DKGAgent {
   private createV10ACKProvider(contextGraphId: string) {
     if (!this.router || !this.gossip) return undefined;
     // `isV10Ready()` is the authoritative V10 capability gate. Using it
-    // (instead of probing for `createKnowledgeAssetsV10`) keeps
+    // (instead of probing for `createKnowledgeAssets`) keeps
     // `NoChainAdapter` — whose stub methods throw — out of the V10 path.
     if (typeof this.chain.isV10Ready !== 'function' || !this.chain.isV10Ready()) return undefined;
     // Require on-chain identity verification to prevent accepting unverified ACKs
@@ -19316,7 +19316,7 @@ export class DKGAgent {
     // `chain.getEvmChainId is not a function`. Mirrors the guard at
     // `packages/cli/src/publisher-runner.ts:createV10ACKProviderForPublisher`.
     if (typeof this.chain.getEvmChainId !== 'function') return undefined;
-    if (typeof this.chain.getKnowledgeAssetsV10Address !== 'function') return undefined;
+    if (typeof this.chain.getKnowledgeAssetsLifecycleAddress !== 'function') return undefined;
 
     const collector = new ACKCollector({
       gossipPublish: async (topic: string, data: Uint8Array) => {
@@ -19463,9 +19463,9 @@ export class DKGAgent {
       }
       let kav10Address: string;
       try {
-        kav10Address = await chain.getKnowledgeAssetsV10Address();
+        kav10Address = await chain.getKnowledgeAssetsLifecycleAddress();
       } catch (err) {
-        throw wrapAsRpcPreconditionIfApplicable(err, 'getKnowledgeAssetsV10Address');
+        throw wrapAsRpcPreconditionIfApplicable(err, 'getKnowledgeAssetsLifecycleAddress');
       }
 
       const result = await collector.collect({

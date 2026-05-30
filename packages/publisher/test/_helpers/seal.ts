@@ -237,17 +237,17 @@ export async function publishSealed(
  */
 export async function updateSealed(
   publisher: DKGPublisher,
-  kcId: bigint,
+  kaId: bigint,
   args: PublishSealedArgs,
   author: ethers.Wallet,
   ctx: SealCtx,
   extras: { v10ACKProvider?: V10ACKProvider } = {},
 ) {
-  const sealed = await withUpdateSeal(kcId, args, author, ctx);
+  const sealed = await withUpdateSeal(kaId, args, author, ctx);
   const merged = extras.v10ACKProvider !== undefined
     ? { ...sealed, v10ACKProvider: extras.v10ACKProvider }
     : sealed;
-  return publisher.update(kcId, merged as unknown as Parameters<DKGPublisher['update']>[1]);
+  return publisher.update(kaId, merged as unknown as Parameters<DKGPublisher['update']>[1]);
 }
 
 /**
@@ -423,7 +423,7 @@ export function wrapPublisherForTest(
  */
 export async function wrapPublisherWithChain(
   publisher: DKGPublisher,
-  chain: { getProvider: () => ethers.JsonRpcProvider; getKnowledgeAssetsV10Address: () => Promise<string> },
+  chain: { getProvider: () => ethers.JsonRpcProvider; getKnowledgeAssetsLifecycleAddress: () => Promise<string> },
   authorKey: string,
   options?: { v10ACKProvider?: V10ACKProvider },
 ): Promise<DKGPublisher> {
@@ -431,7 +431,7 @@ export async function wrapPublisherWithChain(
     author: new ethers.Wallet(authorKey),
     ctx: {
       provider: chain.getProvider(),
-      kav10Address: await chain.getKnowledgeAssetsV10Address(),
+      kav10Address: await chain.getKnowledgeAssetsLifecycleAddress(),
     },
     v10ACKProvider: options?.v10ACKProvider,
   });
@@ -451,7 +451,7 @@ export function mockSealCtx(opts: {
   kav10Address?: string;
 } = {}): SealCtx {
   const chainId = opts.chainId ?? 31337n;
-  // Must match `MockChainAdapter.getKnowledgeAssetsV10Address()` exactly,
+  // Must match `MockChainAdapter.getKnowledgeAssetsLifecycleAddress()` exactly,
   // otherwise the publisher's `recoverAddress` step in the seal-integrity
   // preflight rebuilds typed data with the chain's address (not ours)
   // and the recovered signer no longer equals the recorded

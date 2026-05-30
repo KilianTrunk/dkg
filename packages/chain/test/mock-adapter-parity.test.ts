@@ -32,7 +32,7 @@
  *                 declared on `ChainAdapter`. It also pins a small set of
  *                 invariants (e.g. `isV10Ready() === true` so the V10
  *                 code paths are exercised off-line; `signMessage`
- *                 returns 32-byte r/vs; `createKnowledgeAssetsV10`
+ *                 returns 32-byte r/vs; `createKnowledgeAssets`
  *                 tolerates `cgId === 0n` on the mock even though the
  *                 real adapter rejects).
  *
@@ -136,7 +136,7 @@ const MOCK_EXEMPT_FROM_EVM = new Set<string>([
   'isContractMissingRevert',
   // KC views (Phase 1) — TS-private helpers; the five public methods
   // (getLatestMerkleRoot, getMerkleLeafCount, getLatestMerkleRootPublisher,
-  // getLatestMerkleRootAuthor, getKCContextGraphId) ARE mirrored on
+  // getLatestMerkleRootAuthor, getKAContextGraphId) ARE mirrored on
   // MockChainAdapter.
   'requireKCStorage',
   'requireContextGraphStorage',
@@ -197,8 +197,8 @@ const NO_CHAIN_EXEMPT_FROM_EVM = new Set<string>([
   // V8 staking + V9 PCA family + V9 permanent publish were archived from
   // EVMChainAdapter in `archive-non-v10-contracts`; both mock and EVM
   // dropped the surface, so they don't need parity-list entries.
-  'createKnowledgeCollection',
-  'updateKnowledgeCollection',
+  'createKnowledgeAsset',
+  'updateKnowledgeAsset',
 ]);
 
 describe('MockChainAdapter API parity with EVMChainAdapter [CH-8]', () => {
@@ -298,9 +298,9 @@ describe('MockChainAdapter API parity with EVMChainAdapter [CH-8]', () => {
     expect(id).toBeGreaterThan(0n);
   });
 
-  it('getKnowledgeAssetsV10Address returns a 20-byte hex address', async () => {
+  it('getKnowledgeAssetsLifecycleAddress returns a 20-byte hex address', async () => {
     const mock = new MockChainAdapter();
-    const addr = await mock.getKnowledgeAssetsV10Address();
+    const addr = await mock.getKnowledgeAssetsLifecycleAddress();
     expect(addr).toMatch(/^0x[0-9a-fA-F]{40}$/);
   });
 
@@ -427,10 +427,10 @@ describe('MockChainAdapter API parity with EVMChainAdapter [CH-8]', () => {
       ackSignatures: [],
     };
 
-    await expect(mock.createKnowledgeAssetsV10(params)).rejects.toThrow(/not allowed/);
+    await expect(mock.createKnowledgeAssets(params)).rejects.toThrow(/not allowed/);
 
     mock.allowPublisherAddress(otherPublisher);
-    await expect(mock.createKnowledgeAssetsV10(params)).resolves.toMatchObject({
+    await expect(mock.createKnowledgeAssets(params)).resolves.toMatchObject({
       publisherAddress: otherPublisher,
     });
   });
@@ -441,7 +441,7 @@ describe('MockChainAdapter API parity with EVMChainAdapter [CH-8]', () => {
     const delegatedPublisher = '0x2222222222222222222222222222222222222222';
     mock.allowPublisherAddress(delegatedPublisher);
 
-    const created = await mock.createKnowledgeAssetsV10({
+    const created = await mock.createKnowledgeAssets({
       publishOperationId: 'mock-v10-delegated-update',
       contextGraphId: 1n,
       publisherAddress: delegatedPublisher,
@@ -463,7 +463,7 @@ describe('MockChainAdapter API parity with EVMChainAdapter [CH-8]', () => {
 
     const newMerkleRoot = ethers.getBytes(ethers.keccak256(ethers.toUtf8Bytes('mock-v10-update')));
     const update = await mock.updateKnowledgeCollectionV10({
-      kcId: created.batchId,
+      kaId: created.batchId,
       newMerkleRoot,
       newByteSize: 2n,
       newMerkleLeafCount: 1,
@@ -501,8 +501,8 @@ describe('NoChainAdapter completeness [CH-9]', () => {
       'listenForEvents',
       'createContextGraph',
       'submitToContextGraph',
-      'createKnowledgeAssetsV10',
-      'getKnowledgeAssetsV10Address',
+      'createKnowledgeAssets',
+      'getKnowledgeAssetsLifecycleAddress',
       'getEvmChainId',
       'isV10Ready',
     ];

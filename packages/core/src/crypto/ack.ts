@@ -257,7 +257,7 @@ export function computeUpdateACKDigest(
   chainId: bigint,
   kav10Address: string,
   contextGraphId: bigint,
-  kcId: bigint,
+  kaId: bigint,
   preUpdateMerkleRootCount: bigint,
   newMerkleRoot: Uint8Array,
   newByteSize: bigint,
@@ -299,7 +299,7 @@ export function computeUpdateACKDigest(
   packed.set(uint256ToBytes(chainId), offset); offset += 32;
   packed.set(addrBytes, offset); offset += 20;
   packed.set(uint256ToBytes(contextGraphId), offset); offset += 32;
-  packed.set(uint256ToBytes(kcId), offset); offset += 32;
+  packed.set(uint256ToBytes(kaId), offset); offset += 32;
   packed.set(uint256ToBytes(preUpdateMerkleRootCount), offset); offset += 32;
   packed.set(newMerkleRoot, offset); offset += 32;
   packed.set(uint256ToBytes(newByteSize), offset); offset += 32;

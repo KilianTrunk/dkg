@@ -34,7 +34,7 @@ import {
   type OnChainPublishResult,
   type TxResult,
   type V10PublishDirectParams,
-  type V10UpdateKCParams,
+  type V10UpdateKAParams,
 } from '@origintrail-official/dkg-chain';
 import { ethers } from 'ethers';
 import { wrapPublisherForTest, mockSealCtx, updateSealed } from './_helpers/seal.js';
@@ -75,10 +75,10 @@ async function expectUalEmbedsStorageAddress(
 async function sealForWallet(
   publisher: DKGPublisher,
   wallet: ethers.Wallet,
-  chain: { getEvmChainId: () => Promise<bigint>; getKnowledgeAssetsV10Address: () => Promise<string> },
+  chain: { getEvmChainId: () => Promise<bigint>; getKnowledgeAssetsLifecycleAddress: () => Promise<string> },
 ): Promise<DKGPublisher> {
   const chainId = await chain.getEvmChainId();
-  const kav10Address = await chain.getKnowledgeAssetsV10Address();
+  const kav10Address = await chain.getKnowledgeAssetsLifecycleAddress();
   return wrapPublisherForTest(publisher, {
     author: wallet,
     ctx: mockSealCtx({ chainId, kav10Address }),
@@ -97,10 +97,10 @@ const TEST_KEY_ALT = '0x5de4111a56f4c24611d9ed4d5318a7e03f9b9a9d73f3a5f3f6324a2a
 const _SEAL_WALLET = new ethers.Wallet(TEST_KEY);
 function updS(
   publisher: DKGPublisher,
-  kcId: bigint,
+  kaId: bigint,
   args: Parameters<DKGPublisher['update']>[1],
 ) {
-  return updateSealed(publisher, kcId, args, _SEAL_WALLET, mockSealCtx());
+  return updateSealed(publisher, kaId, args, _SEAL_WALLET, mockSealCtx());
 }
 
 // Minimal stub — DKGPublisher's constructor only reads `chain.chainId`.
@@ -147,7 +147,7 @@ class AsyncAddressSigningChain implements ChainAdapter {
     return 31337n;
   }
 
-  async getKnowledgeAssetsV10Address(): Promise<string> {
+  async getKnowledgeAssetsLifecycleAddress(): Promise<string> {
     return '0x00000000000000000000000000000000000000A1';
   }
 
@@ -156,7 +156,7 @@ class AsyncAddressSigningChain implements ChainAdapter {
   // KnowledgeCollectionStorage → DKGKnowledgeAssets) when assigning the
   // confirmed UAL. Mirror MockChainAdapter and reuse the V10 address.
   async getDKGKnowledgeAssetsAddress(): Promise<string> {
-    return this.getKnowledgeAssetsV10Address();
+    return this.getKnowledgeAssetsLifecycleAddress();
   }
 
   async getSignerAddress(): Promise<string> {
@@ -179,7 +179,7 @@ class AsyncAddressSigningChain implements ChainAdapter {
     return this.wallet.signTypedData(domain, types, value);
   }
 
-  async createKnowledgeAssetsV10(params: V10PublishDirectParams): Promise<OnChainPublishResult> {
+  async createKnowledgeAssets(params: V10PublishDirectParams): Promise<OnChainPublishResult> {
     this.capturedPublisherAddress = params.publisherAddress;
     if (params.publisherAddress?.toLowerCase() !== this.wallet.address.toLowerCase()) {
       throw new Error('publisher did not await async signer address');
@@ -228,9 +228,9 @@ class LazyReadySigningChain extends AsyncAddressSigningChain {
     return 123n;
   }
 
-  override async createKnowledgeAssetsV10(params: V10PublishDirectParams): Promise<OnChainPublishResult> {
+  override async createKnowledgeAssets(params: V10PublishDirectParams): Promise<OnChainPublishResult> {
     this.capturedTokenAmount = params.tokenAmount;
-    return super.createKnowledgeAssetsV10(params);
+    return super.createKnowledgeAssets(params);
   }
 }
 
@@ -308,12 +308,12 @@ class ContextAwareAdapterSigningChain extends MockChainAdapter {
     return this.authorizedWallet.signTypedData(domain, types, value);
   }
 
-  override async createKnowledgeAssetsV10(params: Parameters<MockChainAdapter['createKnowledgeAssetsV10']>[0]) {
+  override async createKnowledgeAssets(params: Parameters<MockChainAdapter['createKnowledgeAssets']>[0]) {
     this.capturedPublisherAddress = params.publisherAddress;
     if (params.publisherAddress?.toLowerCase() !== this.authorizedWallet.address.toLowerCase()) {
       throw new Error('publish tx signer did not match resolved publisher address');
     }
-    return super.createKnowledgeAssetsV10(params);
+    return super.createKnowledgeAssets(params);
   }
 }
 
@@ -329,14 +329,14 @@ class AdapterManagedUpdateChain implements ChainAdapter {
 
   // Greenfield (PR #815): the owner-sealed update path rebuilds the
   // UpdateAuthorAttestation typed data from `getEvmChainId()` +
-  // `getKnowledgeAssetsV10Address()` to verify the seal before
+  // `getKnowledgeAssetsLifecycleAddress()` to verify the seal before
   // submitting. These values must match the `mockSealCtx()` defaults the
   // seal is signed against (chainId 31337, kav10 `0x…c10a`).
   async getEvmChainId(): Promise<bigint> {
     return 31337n;
   }
 
-  async getKnowledgeAssetsV10Address(): Promise<string> {
+  async getKnowledgeAssetsLifecycleAddress(): Promise<string> {
     return '0x000000000000000000000000000000000000c10a';
   }
 
@@ -346,7 +346,7 @@ class AdapterManagedUpdateChain implements ChainAdapter {
     return '0x000000000000000000000000000000000000c10a';
   }
 
-  async updateKnowledgeCollectionV10(params: V10UpdateKCParams): Promise<TxResult> {
+  async updateKnowledgeCollectionV10(params: V10UpdateKAParams): Promise<TxResult> {
     this.capturedPublisherAddress = params.publisherAddress;
     return {
       success: this.success,
@@ -440,7 +440,7 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
     });
     const createdAddress = created.ual.match(/^did:dkg:none\/(0x[0-9a-fA-F]{40})\/t/)?.[1];
 
-    const updated = await publisher.update(created.kcId, {
+    const updated = await publisher.update(created.kaId, {
       contextGraphId: '1',
       quads: [{
         subject: 'urn:test:no-chain-update',
@@ -622,7 +622,7 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
     const chain = {
       chainId: 'evm:31337',
       isV10Ready: () => false,
-      createKnowledgeAssetsV10: async () => {
+      createKnowledgeAssets: async () => {
         throw new Error('non-ready V10 adapter should not be called');
       },
     } as unknown as ChainAdapter;
@@ -920,7 +920,7 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
       }],
     });
 
-    const updated = await publisher.update(created.kcId, {
+    const updated = await publisher.update(created.kaId, {
       contextGraphId: '1',
       quads: [{
         subject: 'urn:test:adapter-update',

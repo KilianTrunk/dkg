@@ -27,7 +27,7 @@ import type {
   VerifyParams,
   PublishToContextGraphParams,
   V10PublishParams,
-  V10UpdateKCParams,
+  V10UpdateKAParams,
   NodeChallenge,
   ProofPeriodStatus,
   CreateChallengeResult,
@@ -136,11 +136,8 @@ const BOUND_CONTRACT_INVALIDATORS = new Map<string, (adapter: EVMChainAdapter) =
   ['AskStorage',                 (a) => { (a as any).contracts.askStorage = undefined; }],
   ['KnowledgeAssets',            (a) => { (a as any).contracts.knowledgeAssets = undefined; }],
   ['KnowledgeAssetsStorage',     (a) => { (a as any).contracts.knowledgeAssetsStorage = undefined; }],
-  ['KnowledgeAssetsV10',         (a) => { (a as any).contracts.knowledgeAssetsV10 = undefined; }],
-  ['KnowledgeAssetsLifecycle',   (a) => { (a as any).contracts.knowledgeAssetsV10 = undefined; }],
-  ['KnowledgeCollection',        (a) => { (a as any).contracts.knowledgeCollection = undefined; }],
-  ['KnowledgeCollectionStorage', (a) => { (a as any).contracts.knowledgeCollectionStorage = undefined; }],
-  ['DKGKnowledgeAssets',         (a) => { (a as any).contracts.knowledgeCollectionStorage = undefined; }],
+  ['KnowledgeAssetsLifecycle',   (a) => { (a as any).contracts.knowledgeAssetsLifecycle = undefined; }],
+  ['DKGKnowledgeAssets',         (a) => { (a as any).contracts.knowledgeAssetStorage = undefined; }],
   ['ContextGraphNameRegistry',   (a) => { (a as any).contracts.contextGraphNameRegistry = undefined; }],
   ['ContextGraphs',              (a) => { (a as any).contracts.contextGraphs = undefined; }],
   ['ContextGraphStorage',        (a) => { (a as any).contracts.contextGraphStorage = undefined; }],
@@ -166,7 +163,7 @@ export function resolveRpcUrls(rpcUrl: string, rpcUrls?: string[]): string[] {
 }
 
 /**
- * On-chain minimum the `KnowledgeAssetsV10.publish` / `update` contract
+ * On-chain minimum the `KnowledgeAssetsLifecycle.publish` / `update` contract
  * pulls via `token.transferFrom(msg.sender, CSS, fullCost)` even for
  * zero-byte / zero-value publishes — the contract rounds `fullCost` up to
  * `1` wei-TRAC. Empirically reproduced on Base Sepolia, May 2026: a
@@ -383,8 +380,8 @@ function loadAbi(contractName: string): ethers.InterfaceAbi {
 }
 
 const ERROR_ABI_CONTRACTS = [
-  'KnowledgeAssets', 'KnowledgeAssetsV10', 'KnowledgeAssetsStorage', 'KnowledgeCollection',
-  'KnowledgeCollectionStorage', 'ContextGraphs', 'ContextGraphStorage',
+  'KnowledgeAssets', 'KnowledgeAssetsLifecycle', 'KnowledgeAssetsStorage',
+  'DKGKnowledgeAssets', 'ContextGraphs', 'ContextGraphStorage',
   'ContextGraphNameRegistry', 'Profile', 'Identity', 'IdentityStorage',
   'Staking', 'StakingStorage', 'StakingV10', 'StakingKPI',
   'ConvictionStakingStorage',
@@ -543,8 +540,7 @@ interface ContractCache {
   profileStorage?: Contract;
   knowledgeAssets?: Contract;
   knowledgeAssetsStorage?: Contract;
-  knowledgeCollection?: Contract;
-  knowledgeCollectionStorage?: Contract;
+  knowledgeAssetStorage?: Contract;
   staking?: Contract;
   contextGraphNameRegistry?: Contract;
   token?: Contract;
@@ -552,7 +548,7 @@ interface ContractCache {
   askStorage?: Contract;
   contextGraphs?: Contract;
   contextGraphStorage?: Contract;
-  knowledgeAssetsV10?: Contract;
+  knowledgeAssetsLifecycle?: Contract;
   /** V10 NFT-backed PCA. Backs the PCA write surface + the publisher's
    *  `kcEpochs == lockDurationEpochs` discount check (SDK pre-coerces). */
   dkgPublishingConvictionNFT?: Contract;
@@ -683,7 +679,7 @@ export class EVMChainAdapter implements ChainAdapter {
    *
    *   - `getEvmChainId()`           (chain id, never changes after
    *                                  the JSON-RPC endpoint is configured)
-   *   - `getKnowledgeAssetsV10Address()` (KAV10 contract address —
+   *   - `getKnowledgeAssetsLifecycleAddress()` (KAV10 contract address —
    *                                  changes only on contract redeploy)
    *   - `getMinimumRequiredSignatures()` (governance parameter — changes
    *                                  only on a `ParametersStorage` write)
@@ -1321,18 +1317,9 @@ export class EVMChainAdapter implements ChainAdapter {
       // Older deployments without the relay registry surface.
     }
 
-    // V8 KnowledgeCollection is archived; tolerate missing Hub binding.
-    // KnowledgeCollectionStorage remains active and is required.
-    try {
-      this.contracts.knowledgeCollection = await this.resolveContract('KnowledgeCollection');
-    } catch {
-      // V8 KnowledgeCollection not deployed — legacy publish surface unavailable.
-    }
-    try {
-      this.contracts.knowledgeCollectionStorage = await this.resolveAssetStorage('DKGKnowledgeAssets');
-    } catch {
-      this.contracts.knowledgeCollectionStorage = await this.resolveAssetStorage('KnowledgeCollectionStorage');
-    }
+    // V10.1 KA storage. Legacy V8 KnowledgeCollection + V10.0 DKGKnowledgeAssets
+    // are deleted in the rc.12 KC->KA rename — no fallback resolution.
+    this.contracts.knowledgeAssetStorage = await this.resolveAssetStorage('DKGKnowledgeAssets');
 
     // V9 contracts (KnowledgeAssets + KnowledgeAssetsStorage) are archived
     // (PRD §4.1, deploy scripts 040+041 moved under deploy/archive). Keep
@@ -1366,13 +1353,10 @@ export class EVMChainAdapter implements ChainAdapter {
     }
 
     try {
-      this.contracts.knowledgeAssetsV10 = await this.resolveContract('KnowledgeAssetsLifecycle');
+      this.contracts.knowledgeAssetsLifecycle = await this.resolveContract('KnowledgeAssetsLifecycle');
     } catch {
-      try {
-        this.contracts.knowledgeAssetsV10 = await this.resolveContract('KnowledgeAssetsV10');
-      } catch {
-        // Lifecycle / V10 contract not deployed — createKnowledgeAssetsV10 unavailable
-      }
+      // Lifecycle not deployed — createKnowledgeAssets unavailable.
+      // V10.0 KnowledgeAssetsLifecycle fallback was removed in the rc.12 rename.
     }
 
     try {
@@ -1704,7 +1688,7 @@ export class EVMChainAdapter implements ChainAdapter {
 
   async verifyKAUpdate(txHash: string, batchId: bigint, publisherAddress: string): Promise<KAUpdateVerification> {
     await this.init();
-    if (!this.contracts.knowledgeAssetsStorage && !this.contracts.knowledgeCollectionStorage) {
+    if (!this.contracts.knowledgeAssetsStorage && !this.contracts.knowledgeAssetStorage) {
       return { verified: false };
     }
 
@@ -1730,16 +1714,16 @@ export class EVMChainAdapter implements ChainAdapter {
         }
       }
 
-      // V10: KnowledgeCollectionUpdated on KnowledgeCollectionStorage
-      if (!onChainMerkleRoot && this.contracts.knowledgeCollectionStorage) {
-        const kcs = this.contracts.knowledgeCollectionStorage;
-        const kcsAddress = (await kcs.getAddress()).toLowerCase();
+      // V10: KnowledgeAssetUpdated on DKGKnowledgeAssets
+      if (!onChainMerkleRoot && this.contracts.knowledgeAssetStorage) {
+        const kas = this.contracts.knowledgeAssetStorage;
+        const kcsAddress = (await kas.getAddress()).toLowerCase();
         for (const log of receipt.logs) {
           if (log.address.toLowerCase() !== kcsAddress) continue;
           try {
-            const parsed = kcs.interface.parseLog({ topics: [...log.topics], data: log.data });
+            const parsed = kas.interface.parseLog({ topics: [...log.topics], data: log.data });
             if (
-              (parsed?.name === 'KnowledgeCollectionUpdated' ||
+              (parsed?.name === 'KnowledgeAssetUpdated' ||
                 parsed?.name === 'KnowledgeAssetUpdated') &&
               BigInt(parsed.args.id) === batchId
             ) {
@@ -1754,9 +1738,9 @@ export class EVMChainAdapter implements ChainAdapter {
 
       // Check publisher address: try V10 storage first, then V9
       let onChainPublisher: string | undefined;
-      if (this.contracts.knowledgeCollectionStorage) {
+      if (this.contracts.knowledgeAssetStorage) {
         try {
-          onChainPublisher = await this.contracts.knowledgeCollectionStorage.getLatestMerkleRootPublisher(batchId);
+          onChainPublisher = await this.contracts.knowledgeAssetStorage.getLatestMerkleRootPublisher(batchId);
         } catch { /* not found in V10 storage */ }
       }
       if ((!onChainPublisher || onChainPublisher === ethers.ZeroAddress) && this.contracts.knowledgeAssetsStorage) {
@@ -1851,43 +1835,43 @@ export class EVMChainAdapter implements ChainAdapter {
 
       // V10 greenfield (DKGKnowledgeAssets) emits `KnowledgeAssetCreated`
       // plus a single ERC-721 `Transfer(0x0, owner, tokenId)` per publish
-      // (tokenId == kaId == kcId; no batch mint). Legacy V8/V9
-      // (KnowledgeCollectionStorage) emits `KnowledgeCollectionCreated` +
+      // (tokenId == kaId == kaId; no batch mint). Legacy V8/V9
+      // (DKGKnowledgeAssets) emits `KnowledgeAssetCreated` +
       // `KnowledgeAssetsMinted` (a start/end range + recipient). The bound
       // contract may be either ABI (see resolveAssetStorage fallback in
       // init()), so resolve the create event the contract actually exposes
       // and derive the KA range / publisher from whichever mint surface is
       // present — otherwise a greenfield node would crash here calling a
-      // non-existent `filters.KnowledgeCollectionCreated()`.
-      if (eventType === 'KCCreated' || eventType === 'KnowledgeCollectionCreated') {
-        const kcStorage = this.contracts.knowledgeCollectionStorage;
-        if (kcStorage) {
+      // non-existent `filters.KnowledgeAssetCreated()`.
+      if (eventType === 'KCCreated' || eventType === 'KnowledgeAssetCreated') {
+        const kaStorage = this.contracts.knowledgeAssetStorage;
+        if (kaStorage) {
           const fromB = filter.fromBlock ?? 0;
           const toB = filter.toBlock ?? 'latest';
 
           const hasEvent = (name: string) =>
-            kcStorage.interface.fragments.some(
+            kaStorage.interface.fragments.some(
               (f) => f.type === 'event' && (f as { name?: string }).name === name,
             );
 
           const isGreenfield = hasEvent('KnowledgeAssetCreated');
           const createEventName = isGreenfield
             ? 'KnowledgeAssetCreated'
-            : 'KnowledgeCollectionCreated';
+            : 'KnowledgeAssetCreated';
 
-          const kcFilter = kcStorage.filters[createEventName]();
-          const kcLogs = await kcStorage.queryFilter(kcFilter, fromB, toB);
+          const kcFilter = kaStorage.filters[createEventName]();
+          const kcLogs = await kaStorage.queryFilter(kcFilter, fromB, toB);
 
           // Legacy mint range. `KnowledgeAssetsMinted` is still declared on the
-          // greenfield ABI but never emitted by `createKnowledgeCollection`, so
+          // greenfield ABI but never emitted by `createKnowledgeAsset`, so
           // this map stays empty there and the per-log fallback below derives
           // the (single-KA) range + owner from the create id + Transfer.
           const mintByTx = new Map<string, { publisherAddress: string; startKAId: string; endKAId: string }>();
           if (hasEvent('KnowledgeAssetsMinted')) {
-            const mintFilter = kcStorage.filters.KnowledgeAssetsMinted();
-            const mintLogs = await kcStorage.queryFilter(mintFilter, fromB, toB);
+            const mintFilter = kaStorage.filters.KnowledgeAssetsMinted();
+            const mintLogs = await kaStorage.queryFilter(mintFilter, fromB, toB);
             for (const ml of mintLogs) {
-              const mp = kcStorage.interface.parseLog({ topics: [...ml.topics], data: ml.data });
+              const mp = kaStorage.interface.parseLog({ topics: [...ml.topics], data: ml.data });
               if (mp) {
                 mintByTx.set(ml.transactionHash, {
                   publisherAddress: mp.args.to,
@@ -1906,10 +1890,10 @@ export class EVMChainAdapter implements ChainAdapter {
           const ownerByTokenId = new Map<string, string>();
           if (isGreenfield) {
             try {
-              const transferFilter = kcStorage.filters.Transfer(ethers.ZeroAddress);
-              const transferLogs = await kcStorage.queryFilter(transferFilter, fromB, toB);
+              const transferFilter = kaStorage.filters.Transfer(ethers.ZeroAddress);
+              const transferLogs = await kaStorage.queryFilter(transferFilter, fromB, toB);
               for (const tl of transferLogs) {
-                const tp = kcStorage.interface.parseLog({ topics: [...tl.topics], data: tl.data });
+                const tp = kaStorage.interface.parseLog({ topics: [...tl.topics], data: tl.data });
                 if (tp && tp.args.tokenId != null) {
                   ownerByTokenId.set(tp.args.tokenId.toString(), String(tp.args.to));
                 }
@@ -1921,7 +1905,7 @@ export class EVMChainAdapter implements ChainAdapter {
           }
 
           for (const log of kcLogs) {
-            const parsed = kcStorage.interface.parseLog({ topics: [...log.topics], data: log.data });
+            const parsed = kaStorage.interface.parseLog({ topics: [...log.topics], data: log.data });
             if (parsed) {
               const mint = mintByTx.get(log.transactionHash);
               const idStr = parsed.args.id.toString();
@@ -1936,7 +1920,7 @@ export class EVMChainAdapter implements ChainAdapter {
                 type: 'KCCreated',
                 blockNumber: log.blockNumber,
                 data: {
-                  kcId: idStr,
+                  kaId: idStr,
                   merkleRoot: parsed.args.merkleRoot,
                   merkleRootBytes: parsed.args.merkleRoot,
                   byteSize: parsed.args.byteSize.toString(),
@@ -2246,7 +2230,7 @@ export class EVMChainAdapter implements ChainAdapter {
 
     const receipt = await this.sendContractTransaction(
       this.contracts.contextGraphs,
-      'registerKnowledgeCollection',
+      'registerKnowledgeAsset',
       [params.contextGraphId, params.batchId],
       this.signer,
       'register knowledge collection',
@@ -2341,7 +2325,7 @@ export class EVMChainAdapter implements ChainAdapter {
     // wallet that signed the V9 publisher digest above, so attribution
     // stays consistent across the legacy/canonical pair.
     const v10ChainId = (await this.provider.getNetwork()).chainId;
-    const v10KavAddress = await this.contracts.knowledgeAssetsV10!.getAddress();
+    const v10KavAddress = await this.contracts.knowledgeAssetsLifecycle!.getAddress();
     const authorTypedData = buildAuthorAttestationTypedData({
       chainId: v10ChainId,
       kav10Address: v10KavAddress,
@@ -2357,7 +2341,7 @@ export class EVMChainAdapter implements ChainAdapter {
       ),
     );
 
-    return this.createKnowledgeAssetsV10({
+    return this.createKnowledgeAssets({
       publishOperationId: ethers.hexlify(ethers.randomBytes(32)),
       contextGraphId: params.contextGraphId,
       merkleRoot: params.merkleRoot,
@@ -2387,7 +2371,7 @@ export class EVMChainAdapter implements ChainAdapter {
       const receipt = await this.getTransactionReceiptWithFailover(txHash);
       if (!receipt || receipt.status !== 1) return null;
 
-      const v10 = this.contracts.knowledgeCollectionStorage
+      const v10 = this.contracts.knowledgeAssetStorage
         ? await this.parseV10PublishReceipt(receipt)
         : null;
       if (v10) return v10;
@@ -2406,17 +2390,17 @@ export class EVMChainAdapter implements ChainAdapter {
   }
 
   // =====================================================================
-  // V10 Publish (KnowledgeAssetsV10 → KnowledgeCollectionStorage)
+  // V10 Publish (KnowledgeAssetsLifecycle → DKGKnowledgeAssets)
   // =====================================================================
 
   async getDKGKnowledgeAssetsAddress(): Promise<string> {
-    if (!this.contracts.knowledgeCollectionStorage) {
-      throw new Error('DKGKnowledgeAssets / KnowledgeCollectionStorage not deployed on this chain.');
+    if (!this.contracts.knowledgeAssetStorage) {
+      throw new Error('DKGKnowledgeAssets / DKGKnowledgeAssets not deployed on this chain.');
     }
-    return this.contracts.knowledgeCollectionStorage.target as string;
+    return this.contracts.knowledgeAssetStorage.target as string;
   }
 
-  async getKnowledgeAssetsV10Address(): Promise<string> {
+  async getKnowledgeAssetsLifecycleAddress(): Promise<string> {
     // PR3 / RC11: TTL-cached. KAV10 address only changes on a contract
     // redeploy + Hub-rotation event; 1h staleness is harmless and the
     // ACK digest mismatch the contract would surface on actually-stale
@@ -2426,10 +2410,10 @@ export class EVMChainAdapter implements ChainAdapter {
       return this.cachedKav10Address!.value;
     }
     await this.init();
-    if (!this.contracts.knowledgeAssetsV10) {
-      throw new Error('KnowledgeAssetsLifecycle / KnowledgeAssetsV10 contract not deployed on this chain.');
+    if (!this.contracts.knowledgeAssetsLifecycle) {
+      throw new Error('KnowledgeAssetsLifecycle / KnowledgeAssetsLifecycle contract not deployed on this chain.');
     }
-    const addr = await this.contracts.knowledgeAssetsV10.getAddress();
+    const addr = await this.contracts.knowledgeAssetsLifecycle.getAddress();
     this.cachedKav10Address = { value: addr, cachedAt: now };
     return addr;
   }
@@ -2468,15 +2452,15 @@ export class EVMChainAdapter implements ChainAdapter {
     }
   }
 
-  async createKnowledgeAssetsV10(params: V10PublishParams): Promise<OnChainPublishResult> {
+  async createKnowledgeAssets(params: V10PublishParams): Promise<OnChainPublishResult> {
     await this.init();
 
-    if (!this.contracts.knowledgeAssetsV10) {
-      throw new Error('KnowledgeAssetsLifecycle / KnowledgeAssetsV10 contract not deployed.');
+    if (!this.contracts.knowledgeAssetsLifecycle) {
+      throw new Error('KnowledgeAssetsLifecycle / KnowledgeAssetsLifecycle contract not deployed.');
     }
 
     // Pre-tx validation of `contextGraphId`. The V10 contract rejects
-    // `cgId == 0` at `KnowledgeAssetsV10.sol:379` with `ZeroContextGraphId`;
+    // `cgId == 0` at `KnowledgeAssetsLifecycle.sol:379` with `ZeroContextGraphId`;
     // catching this here gives a clearer error than a generic revert and
     // saves a round-trip. Reject `<= 0n` rather than `=== 0n` so that
     // `BigInt("-1") === -1n` does not slip past our fail-loud boundary and
@@ -2518,13 +2502,13 @@ export class EVMChainAdapter implements ChainAdapter {
     } else {
       txSigner = await this.nextAuthorizedSigner(params.contextGraphId);
     }
-    const ka = this.contracts.knowledgeAssetsV10.connect(txSigner) as Contract;
+    const ka = this.contracts.knowledgeAssetsLifecycle.connect(txSigner) as Contract;
     const kaAddress = await ka.getAddress();
 
     // Approval policy: always ensure the operational signer has the
     // allowance required by the configured `chain.approvalPolicy` for
     // this `tokenAmount`. RFC-001 unified `publish`/`publishDirect`
-    // (KnowledgeAssetsV10.sol): the contract auto-detects PCA discount
+    // (KnowledgeAssetsLifecycle.sol): the contract auto-detects PCA discount
     // via `agentToAccountId[msg.sender] != 0` and falls through to
     // `token.transferFrom(msg.sender, CSS, fullCost)` for the
     // direct-spend branch. A redundant allowance is cheap and idle when
@@ -2540,7 +2524,7 @@ export class EVMChainAdapter implements ChainAdapter {
     );
 
     // Build the on-chain PublishParams struct matching the field order +
-    // types in `KnowledgeAssetsV10.sol` (RFC-001 author-attestation
+    // types in `KnowledgeAssetsLifecycle.sol` (RFC-001 author-attestation
     // shape). ethers v6 encodes object literals to solidity structs
     // positionally by field name.
     // KAV10 10.1.1 strict-positive `tokenAmount` floor: the contract now
@@ -2582,7 +2566,7 @@ export class EVMChainAdapter implements ChainAdapter {
         const haveCount = typeof params.ciphertextChunkCount === 'number' && params.ciphertextChunkCount > 0;
         if (haveRoot !== haveCount) {
           throw new Error(
-            `evm-adapter.createKnowledgeAssetsV10: ciphertextChunksRoot and ciphertextChunkCount ` +
+            `evm-adapter.createKnowledgeAssets: ciphertextChunksRoot and ciphertextChunkCount ` +
             `must both be set or both omitted; got root=${haveRoot ? 'set' : 'unset'}, ` +
             `count=${haveCount ? params.ciphertextChunkCount : 'unset'}. ` +
             `An asymmetric pair would leave RandomSampling._pickWeightedChallenge unable to ` +
@@ -2647,19 +2631,19 @@ export class EVMChainAdapter implements ChainAdapter {
     const receipt = await this.sendSignedTransactionAndWait(signedTx, preBroadcastTxHash, 'V10 publish');
     if (!receipt) throw new Error('Transaction receipt is null');
 
-    let kcId = 0n;
+    let kaId = 0n;
     let startKAId = 0n;
     let endKAId = 0n;
     let publisherAddress = txSigner.address;
     let authorAddress: string | undefined;
-    const kcs = this.contracts.knowledgeCollectionStorage;
-    if (!kcs) {
+    const kas = this.contracts.knowledgeAssetStorage;
+    if (!kas) {
       throw new Error(
         `V10 publish tx ${receipt.hash} succeeded but DKGKnowledgeAssets ` +
         `contract is not available — cannot parse minted IDs from receipt`,
       );
     }
-    const storageAddress = String(kcs.target).toLowerCase();
+    const storageAddress = String(kas.target).toLowerCase();
     {
       let foundCreated = false;
       let foundLegacyMint = false;
@@ -2667,12 +2651,12 @@ export class EVMChainAdapter implements ChainAdapter {
         const logAddr = typeof log.address === 'string' ? log.address.toLowerCase() : '';
         if (logAddr !== storageAddress) continue;
         try {
-          const parsed = kcs.interface.parseLog({ topics: [...log.topics], data: log.data });
-          if (parsed?.name === 'KnowledgeAssetCreated' || parsed?.name === 'KnowledgeCollectionCreated') {
-            kcId = BigInt(parsed.args.id);
+          const parsed = kas.interface.parseLog({ topics: [...log.topics], data: log.data });
+          if (parsed?.name === 'KnowledgeAssetCreated' || parsed?.name === 'KnowledgeAssetCreated') {
+            kaId = BigInt(parsed.args.id);
             authorAddress = String(parsed.args.author);
-            startKAId = kcId;
-            endKAId = kcId;
+            startKAId = kaId;
+            endKAId = kaId;
             foundCreated = true;
           }
           if (parsed?.name === 'KnowledgeAssetsMinted') {
@@ -2686,20 +2670,20 @@ export class EVMChainAdapter implements ChainAdapter {
       if (!foundCreated) {
         throw new Error(
           `V10 publish tx ${receipt.hash} succeeded but KnowledgeAssetCreated / ` +
-          `KnowledgeCollectionCreated event not found in receipt logs — contract ABI may be stale`,
+          `KnowledgeAssetCreated event not found in receipt logs — contract ABI may be stale`,
         );
       }
       if (!foundLegacyMint && startKAId === 0n) {
-        startKAId = kcId;
-        endKAId = kcId;
+        startKAId = kaId;
+        endKAId = kaId;
       }
     }
 
     const blockTimestamp = await this.getBlockTimestamp(receipt.blockNumber);
 
     return {
-      batchId: kcId,
-      kaId: kcId,
+      batchId: kaId,
+      kaId: kaId,
       knowledgeAssetsContract: storageAddress,
       startKAId,
       endKAId,
@@ -2718,27 +2702,27 @@ export class EVMChainAdapter implements ChainAdapter {
   private async parseV10PublishReceipt(
     receipt: NonNullable<Awaited<ReturnType<typeof this.provider.getTransactionReceipt>>>,
   ): Promise<OnChainPublishResult | null> {
-    const kcs = this.contracts.knowledgeCollectionStorage;
-    if (!kcs) return null;
+    const kas = this.contracts.knowledgeAssetStorage;
+    if (!kas) return null;
 
-    let kcId = 0n;
+    let kaId = 0n;
     let startKAId = 0n;
     let endKAId = 0n;
     let publisherAddress = '';
     let authorAddress: string | undefined;
     let foundCreated = false;
-    const storageAddress = String(kcs.target).toLowerCase();
+    const storageAddress = String(kas.target).toLowerCase();
 
     for (const log of receipt.logs) {
       const logAddr = typeof log.address === 'string' ? log.address.toLowerCase() : '';
       if (logAddr !== storageAddress) continue;
       try {
-        const parsed = kcs.interface.parseLog({ topics: [...log.topics], data: log.data });
-        if (parsed?.name === 'KnowledgeAssetCreated' || parsed?.name === 'KnowledgeCollectionCreated') {
-          kcId = BigInt(parsed.args.id);
+        const parsed = kas.interface.parseLog({ topics: [...log.topics], data: log.data });
+        if (parsed?.name === 'KnowledgeAssetCreated' || parsed?.name === 'KnowledgeAssetCreated') {
+          kaId = BigInt(parsed.args.id);
           authorAddress = String(parsed.args.author);
-          startKAId = kcId;
-          endKAId = kcId;
+          startKAId = kaId;
+          endKAId = kaId;
           foundCreated = true;
         }
         if (parsed?.name === 'KnowledgeAssetsMinted') {
@@ -2760,9 +2744,9 @@ export class EVMChainAdapter implements ChainAdapter {
     const blockTimestamp = await this.getBlockTimestamp(receipt.blockNumber);
 
     return {
-      batchId: kcId,
-      kaId: kcId,
-      knowledgeAssetsContract: String(kcs.target),
+      batchId: kaId,
+      kaId: kaId,
+      knowledgeAssetsContract: String(kas.target),
       startKAId,
       endKAId,
       txHash: receipt.hash,
@@ -2818,7 +2802,7 @@ export class EVMChainAdapter implements ChainAdapter {
   }
 
   // =====================================================================
-  // V10 Update (KnowledgeAssetsV10 → KnowledgeCollectionStorage)
+  // V10 Update (KnowledgeAssetsLifecycle → DKGKnowledgeAssets)
   // =====================================================================
 
   /**
@@ -2829,7 +2813,7 @@ export class EVMChainAdapter implements ChainAdapter {
    * operational keys.
    */
   async computeV10UpdateAckDigest(params: {
-    kcId: bigint;
+    kaId: bigint;
     newMerkleRoot: Uint8Array;
     newByteSize: bigint;
     newMerkleLeafCount: number;
@@ -2840,18 +2824,18 @@ export class EVMChainAdapter implements ChainAdapter {
     newCiphertextChunkCount?: number;
   }): Promise<Uint8Array> {
     await this.init();
-    if (!this.contracts.knowledgeAssetsV10) {
-      throw new Error('KnowledgeAssetsV10 contract not deployed');
+    if (!this.contracts.knowledgeAssetsLifecycle) {
+      throw new Error('KnowledgeAssetsLifecycle contract not deployed');
     }
 
-    const kcs = this.contracts.knowledgeCollectionStorage;
-    const kav10Address = await this.contracts.knowledgeAssetsV10.getAddress();
+    const kas = this.contracts.knowledgeAssetStorage;
+    const kav10Address = await this.contracts.knowledgeAssetsLifecycle.getAddress();
     const evmChainId = BigInt((await this.provider.getNetwork()).chainId);
 
     let currentTokenAmount = 0n;
-    if (kcs) {
+    if (kas) {
       try {
-        currentTokenAmount = BigInt(await kcs.getTokenAmount(params.kcId));
+        currentTokenAmount = BigInt(await kas.getTokenAmount(params.kaId));
       } catch { /* not in KCS */ }
     }
 
@@ -2871,15 +2855,15 @@ export class EVMChainAdapter implements ChainAdapter {
     if (this.contracts.contextGraphStorage) {
       try {
         contextGraphId = BigInt(
-          await this.contracts.contextGraphStorage.kcToContextGraph(params.kcId),
+          await this.contracts.contextGraphStorage.kaToContextGraph(params.kaId),
         );
       } catch { /* use 0 */ }
     }
 
     let preUpdateMerkleRootCount = 0n;
-    if (kcs) {
+    if (kas) {
       try {
-        const roots: unknown[] = await kcs.getMerkleRoots(params.kcId);
+        const roots: unknown[] = await kas.getMerkleRoots(params.kaId);
         preUpdateMerkleRootCount = BigInt(roots.length);
       } catch { /* use 0 */ }
     }
@@ -2892,7 +2876,7 @@ export class EVMChainAdapter implements ChainAdapter {
       evmChainId,
       kav10Address,
       contextGraphId,
-      params.kcId,
+      params.kaId,
       preUpdateMerkleRootCount,
       params.newMerkleRoot,
       params.newByteSize,
@@ -2905,20 +2889,20 @@ export class EVMChainAdapter implements ChainAdapter {
     );
   }
 
-  async updateKnowledgeCollectionV10(params: V10UpdateKCParams): Promise<TxResult> {
+  async updateKnowledgeCollectionV10(params: V10UpdateKAParams): Promise<TxResult> {
     await this.init();
 
-    if (!this.contracts.knowledgeAssetsV10) {
-      throw new Error('KnowledgeAssetsV10 contract not deployed — cannot update via V10 path.');
+    if (!this.contracts.knowledgeAssetsLifecycle) {
+      throw new Error('KnowledgeAssetsLifecycle contract not deployed — cannot update via V10 path.');
     }
 
     let signer: Wallet | undefined;
 
     // Look up the on-chain publisher to select the correct signer.
-    const kcs = this.contracts.knowledgeCollectionStorage;
-    if (kcs) {
+    const kas = this.contracts.knowledgeAssetStorage;
+    if (kas) {
       try {
-        const onChainPublisher: string = await kcs.getLatestMerkleRootPublisher(params.kcId);
+        const onChainPublisher: string = await kas.getLatestMerkleRootPublisher(params.kaId);
         if (onChainPublisher && onChainPublisher !== ethers.ZeroAddress) {
           signer = this.signerPool.find(
             (s) => s.address.toLowerCase() === onChainPublisher.toLowerCase(),
@@ -2936,25 +2920,25 @@ export class EVMChainAdapter implements ChainAdapter {
     }
     if (!signer) signer = this.nextSigner();
 
-    const ka = this.contracts.knowledgeAssetsV10.connect(signer) as Contract;
+    const ka = this.contracts.knowledgeAssetsLifecycle.connect(signer) as Contract;
 
-    const kav10Address = await this.contracts.knowledgeAssetsV10.getAddress();
+    const kav10Address = await this.contracts.knowledgeAssetsLifecycle.getAddress();
     const evmChainId = (await this.provider.getNetwork()).chainId;
 
     const identityId = params.publisherNodeIdentityId ?? await this.getIdentityId();
 
     // Look up the current tokenAmount on-chain to carry it forward.
-    // V10 batches live in KnowledgeCollectionStorage; fall back to
+    // V10 batches live in DKGKnowledgeAssets; fall back to
     // KnowledgeAssetsStorage (V9) if not found.
     let currentTokenAmount = 0n;
-    if (kcs) {
+    if (kas) {
       try {
-        currentTokenAmount = BigInt(await kcs.getTokenAmount(params.kcId));
+        currentTokenAmount = BigInt(await kas.getTokenAmount(params.kaId));
       } catch { /* not in KCS */ }
     }
     if (currentTokenAmount === 0n && this.contracts.knowledgeAssetsStorage) {
       try {
-        const batch = await this.contracts.knowledgeAssetsStorage.getBatch(params.kcId);
+        const batch = await this.contracts.knowledgeAssetsStorage.getBatch(params.kaId);
         if (batch && batch.tokenAmount != null) {
           currentTokenAmount = BigInt(batch.tokenAmount);
         }
@@ -2981,7 +2965,7 @@ export class EVMChainAdapter implements ChainAdapter {
     // is already >= 1 and this clamp is a no-op. It is NOT what lets
     // metadata-only updates through: the contract skips `_validateTokenAmount`
     // entirely unless `newByteSize > currentByteSize`
-    // (KnowledgeAssetsV10.sol §"Byte-size growth cost check"), so a
+    // (KnowledgeAssetsLifecycle.sol §"Byte-size growth cost check"), so a
     // metadata-only update with delta 0 is accepted without any floor.
     //
     // The clamp would only change anything for a legacy `tokenAmount == 0`
@@ -3002,15 +2986,15 @@ export class EVMChainAdapter implements ChainAdapter {
     let contextGraphId = 0n;
     if (contextGraphStorage) {
       try {
-        contextGraphId = BigInt(await contextGraphStorage.kcToContextGraph(params.kcId));
+        contextGraphId = BigInt(await contextGraphStorage.kaToContextGraph(params.kaId));
       } catch { /* use 0 */ }
     }
 
     // Compute pre-update merkle root count (array length)
     let preUpdateMerkleRootCount = 0n;
-    if (kcs) {
+    if (kas) {
       try {
-        const roots: unknown[] = await kcs.getMerkleRoots(params.kcId);
+        const roots: unknown[] = await kas.getMerkleRoots(params.kaId);
         preUpdateMerkleRootCount = BigInt(roots.length);
       } catch { /* use 0 */ }
     }
@@ -3026,7 +3010,7 @@ export class EVMChainAdapter implements ChainAdapter {
     let ackSigs = params.ackSignatures ?? [];
     if (ackSigs.length === 0) {
       const ackDigest = await this.computeV10UpdateAckDigest({
-        kcId: params.kcId,
+        kaId: params.kaId,
         newMerkleRoot: params.newMerkleRoot,
         newByteSize: params.newByteSize,
         newMerkleLeafCount: params.newMerkleLeafCount ?? 0,
@@ -3047,7 +3031,7 @@ export class EVMChainAdapter implements ChainAdapter {
     }
 
     const updateParams = {
-      id: params.kcId,
+      id: params.kaId,
       updateOperationId: opId,
       newMerkleRoot: ethers.hexlify(params.newMerkleRoot),
       newByteSize: params.newByteSize,
@@ -3132,7 +3116,7 @@ export class EVMChainAdapter implements ChainAdapter {
    * `DKGPublishingConvictionNFT.agentToAccountId(agent)` view.
    *
    * The publisher SDK uses this to decide, BEFORE building a publish
-   * tx, whether `KnowledgeAssetsV10.publish()` will route through the
+   * tx, whether `KnowledgeAssetsLifecycle.publish()` will route through the
    * PCA discount branch — and therefore whether `publishEpochs` must
    * be coerced to the PCA's `lockDurationEpochs`. Wrong epochs do NOT
    * revert the contract any more; they just demote the publish to
@@ -3212,7 +3196,7 @@ export class EVMChainAdapter implements ChainAdapter {
    *      `requireConvictionNFT()` so the retry uses the new address.
    *
    * NOTE — rc.12 follow-up: other V10 write paths
-   * (`createKnowledgeAssetsV10`, `createContextGraph`,
+   * (`createKnowledgeAssets`, `createContextGraph`,
    * `updateKnowledgeCollectionV10`, etc.) should be wrapped with the
    * same self-heal pattern. Tracked in the broader migration to
    * `HubResolutionCache` for every boot-bound contract.
@@ -3411,7 +3395,7 @@ export class EVMChainAdapter implements ChainAdapter {
   async getMinimumRequiredSignatures(): Promise<number> {
     // PR3 / RC11: TTL-cached. Governance vote that changes
     // `minimumRequiredSignatures` propagates within 1h to the ACK
-    // collector; on-chain validation in `KnowledgeAssetsV10` would
+    // collector; on-chain validation in `KnowledgeAssetsLifecycle` would
     // reject a publish that used the stale quorum so a single
     // mis-routed retry past the boundary is the worst-case symptom.
     const now = Date.now();
@@ -3450,7 +3434,7 @@ export class EVMChainAdapter implements ChainAdapter {
 
   /**
    * Off-chain pre-flight for the V10 ACK signer gate. Mirrors the on-chain
-   * check in `KnowledgeAssetsV10._verifyACKSignature` (post-RFC-001): the
+   * check in `KnowledgeAssetsLifecycle._verifyACKSignature` (post-RFC-001): the
    * recovered signer must be a registered OPERATIONAL_KEY for the claimed
    * identity AND that identity must be in the active sharding table.
    *
@@ -3498,7 +3482,7 @@ export class EVMChainAdapter implements ChainAdapter {
 
   async verifyACKIdentity(recoveredAddress: string, claimedIdentityId: bigint): Promise<boolean> {
     // PR #711 + rc.12: delegate to the structured variant so the off-chain
-    // gate stays in lockstep with the on-chain `KnowledgeAssetsV10` ACK-
+    // gate stays in lockstep with the on-chain `KnowledgeAssetsLifecycle` ACK-
     // signer check (operational-key purpose AND sharding-table membership).
     // The legacy V10-stake / V8-stake fallback that lived inline here is
     // superseded by the ST-membership check inside
@@ -3541,7 +3525,7 @@ export class EVMChainAdapter implements ChainAdapter {
   }
 
   isV10Ready(): boolean {
-    return !!this.contracts.knowledgeAssetsV10;
+    return !!this.contracts.knowledgeAssetsLifecycle;
   }
 
   isRandomSamplingReady(): boolean {
@@ -3882,7 +3866,7 @@ export class EVMChainAdapter implements ChainAdapter {
     enrichEvmError(err);
     const msg = err.message;
     if (msg.includes('NoEligibleContextGraph')) throw new NoEligibleContextGraphError();
-    if (msg.includes('NoEligibleKnowledgeCollection')) throw new NoEligibleKnowledgeCollectionError();
+    if (msg.includes('NoEligibleKnowledgeAsset')) throw new NoEligibleKnowledgeCollectionError();
     if (msg.includes('This challenge is no longer active')) throw new ChallengeNoLongerActiveError();
     const merkleMatch = msg.match(/MerkleRootMismatchError\((0x[0-9a-fA-F]+),\s*(0x[0-9a-fA-F]+)\)/);
     if (merkleMatch) {
@@ -3895,16 +3879,16 @@ export class EVMChainAdapter implements ChainAdapter {
    * Convert the on-chain `Challenge` tuple (or struct) into our wire
    * type. The contract returns an all-zero struct when no challenge
    * exists for an identity, which we surface as `null` so callers
-   * don't have to dispatch on `kcId === 0n`.
+   * don't have to dispatch on `kaId === 0n`.
    */
   private toNodeChallenge(raw: any): NodeChallenge | null {
-    const kcId = BigInt(raw.knowledgeCollectionId ?? raw[0]);
+    const kaId = BigInt(raw.knowledgeAssetId ?? raw[0]);
     const startBlock = BigInt(raw.activeProofPeriodStartBlock ?? raw[4]);
-    if (kcId === 0n && startBlock === 0n) return null;
+    if (kaId === 0n && startBlock === 0n) return null;
     return {
-      knowledgeCollectionId: kcId,
+      knowledgeAssetId: kaId,
       chunkId: BigInt(raw.chunkId ?? raw[1]),
-      knowledgeCollectionStorageContract: String(raw.knowledgeCollectionStorageContract ?? raw[2]),
+      knowledgeAssetStorageContract: String(raw.knowledgeAssetStorageContract ?? raw[2]),
       epoch: BigInt(raw.epoch ?? raw[3]),
       activeProofPeriodStartBlock: startBlock,
       proofingPeriodDurationInBlocks: BigInt(raw.proofingPeriodDurationInBlocks ?? raw[5]),
@@ -3934,9 +3918,9 @@ export class EVMChainAdapter implements ChainAdapter {
         this.translateRandomSamplingError(err);
       }
 
-      // Decode `ChallengeGenerated(identityId, contextGraphId, kcId, chunkId, epoch, startBlock)`
+      // Decode `ChallengeGenerated(identityId, contextGraphId, kaId, chunkId, epoch, startBlock)`
       // from the receipt. cgId is indexed (topic[2]); the rest are in data
-      // but we only need cgId here — the proof builder reads kcId/chunkId
+      // but we only need cgId here — the proof builder reads kaId/chunkId
       // off the Challenge struct fetched below, so everything stays
       // consistent if the storage layout shifts.
       let contextGraphId = 0n;
@@ -4130,18 +4114,18 @@ export class EVMChainAdapter implements ChainAdapter {
   }
 
   // =====================================================================
-  // KC views (V10 KnowledgeCollectionStorage + ContextGraphStorage)
+  // KC views (V10 DKGKnowledgeAssets + ContextGraphStorage)
   // =====================================================================
 
   private requireKCStorage(): Contract {
-    const kcs = this.contracts.knowledgeCollectionStorage;
-    if (!kcs) {
+    const kas = this.contracts.knowledgeAssetStorage;
+    if (!kas) {
       throw new Error(
-        'KnowledgeCollectionStorage not deployed in this Hub. ' +
-        'V10 KC views require a Hub with KnowledgeCollectionStorage registered.',
+        'DKGKnowledgeAssets not deployed in this Hub. ' +
+        'V10 KC views require a Hub with DKGKnowledgeAssets registered.',
       );
     }
-    return kcs;
+    return kas;
   }
 
   private requireContextGraphStorage(): Contract {
@@ -4149,58 +4133,58 @@ export class EVMChainAdapter implements ChainAdapter {
     if (!cgs) {
       throw new Error(
         'ContextGraphStorage not deployed in this Hub. ' +
-        'getKCContextGraphId requires a Hub with ContextGraphStorage registered.',
+        'getKAContextGraphId requires a Hub with ContextGraphStorage registered.',
       );
     }
     return cgs;
   }
 
-  async getLatestMerkleRoot(kcId: bigint): Promise<Uint8Array> {
+  async getLatestMerkleRoot(kaId: bigint): Promise<Uint8Array> {
     await this.init();
-    const kcs = this.requireKCStorage();
-    const rootHex: string = await kcs.getLatestMerkleRoot(kcId);
+    const kas = this.requireKCStorage();
+    const rootHex: string = await kas.getLatestMerkleRoot(kaId);
     return ethers.getBytes(rootHex);
   }
 
-  async getMerkleLeafCount(kcId: bigint): Promise<number> {
+  async getMerkleLeafCount(kaId: bigint): Promise<number> {
     await this.init();
-    const kcs = this.requireKCStorage();
-    const count: bigint = BigInt(await kcs.getMerkleLeafCount(kcId));
+    const kas = this.requireKCStorage();
+    const count: bigint = BigInt(await kas.getMerkleLeafCount(kaId));
     return Number(count);
   }
 
-  async getLatestCiphertextChunksRoot(kcId: bigint): Promise<Uint8Array> {
+  async getLatestCiphertextChunksRoot(kaId: bigint): Promise<Uint8Array> {
     await this.init();
-    const kcs = this.requireKCStorage();
-    const rootHex: string = await kcs.getLatestCiphertextChunksRoot(kcId);
+    const kas = this.requireKCStorage();
+    const rootHex: string = await kas.getLatestCiphertextChunksRoot(kaId);
     return ethers.getBytes(rootHex);
   }
 
-  async getCiphertextChunkCount(kcId: bigint): Promise<number> {
+  async getCiphertextChunkCount(kaId: bigint): Promise<number> {
     await this.init();
-    const kcs = this.requireKCStorage();
-    const count: bigint = BigInt(await kcs.getCiphertextChunkCount(kcId));
+    const kas = this.requireKCStorage();
+    const count: bigint = BigInt(await kas.getCiphertextChunkCount(kaId));
     return Number(count);
   }
 
-  async getLatestMerkleRootPublisher(kcId: bigint): Promise<string> {
+  async getLatestMerkleRootPublisher(kaId: bigint): Promise<string> {
     await this.init();
-    const kcs = this.requireKCStorage();
-    const publisher: string = await kcs.getLatestMerkleRootPublisher(kcId);
+    const kas = this.requireKCStorage();
+    const publisher: string = await kas.getLatestMerkleRootPublisher(kaId);
     return publisher;
   }
 
-  async getLatestMerkleRootAuthor(kcId: bigint): Promise<string> {
+  async getLatestMerkleRootAuthor(kaId: bigint): Promise<string> {
     await this.init();
-    const kcs = this.requireKCStorage();
-    const author: string = await kcs.getLatestMerkleRootAuthor(kcId);
+    const kas = this.requireKCStorage();
+    const author: string = await kas.getLatestMerkleRootAuthor(kaId);
     return author;
   }
 
-  async getKCContextGraphId(kcId: bigint): Promise<bigint> {
+  async getKAContextGraphId(kaId: bigint): Promise<bigint> {
     await this.init();
     const cgs = this.requireContextGraphStorage();
-    const cgId: bigint = await cgs.kcToContextGraph(kcId);
+    const cgId: bigint = await cgs.kaToContextGraph(kaId);
     return BigInt(cgId);
   }
 

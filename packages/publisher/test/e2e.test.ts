@@ -63,7 +63,7 @@ describe('End-to-end: Publish → Replicate → Query', () => {
     GRAPH = `did:dkg:context-graph:${CONTEXT_GRAPH}`;
     _provider = provider;
     const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
-    _kav10Address = await chain.getKnowledgeAssetsV10Address();
+    _kav10Address = await chain.getKnowledgeAssetsLifecycleAddress();
   });
 
   afterAll(async () => {

@@ -206,20 +206,24 @@ done
 log "core nodes: 1-$NUM_CORE_NODES | edge nodes: $((NUM_CORE_NODES+1))-$NUM_NODES"
 
 # RS counters are cumulative across the daemon's lifetime. With BOOTSTRAP=0 the
-# pre-existing devnet can carry stale `submittedCount` / `failedCount` that
-# would inflate Section C's success rate without this run sampling anything.
-# Snapshot per-core RS counters BEFORE any publish; Section C subtracts these
-# baselines and reports the delta only.
-declare -a RS_BASE_SUB RS_BASE_FAIL
+# pre-existing devnet can carry stale totals that would inflate Section C's
+# success rate without this run sampling anything. Snapshot per-core counters
+# BEFORE any publish; Section C subtracts the baseline and reports the delta.
+#
+# The status route exposes `loop.totalTicks` (ticks attempted) and
+# `loop.submittedCount` (successful submissions). It does NOT expose a
+# `failedCount`, so the success rate is computed as
+# (Δsubmitted) / (Δticks_attempted), not via a failed-counter subtraction.
+declare -a RS_BASE_SUB RS_BASE_TICKS
 for n in $(seq 1 "$NUM_CORE_NODES"); do
   port="${NODE_PORT[$((n-1))]}"
   s=$(get "$port" /api/random-sampling/status 2>/dev/null || echo '{}')
   RS_BASE_SUB[$n]=$(echo "$s" | pyf "d.get('loop',{}).get('submittedCount',0)")
-  RS_BASE_FAIL[$n]=$(echo "$s" | pyf "d.get('loop',{}).get('failedCount',0)")
+  RS_BASE_TICKS[$n]=$(echo "$s" | pyf "d.get('loop',{}).get('totalTicks',0)")
   [ -z "${RS_BASE_SUB[$n]}" ] && RS_BASE_SUB[$n]=0
-  [ -z "${RS_BASE_FAIL[$n]}" ] && RS_BASE_FAIL[$n]=0
+  [ -z "${RS_BASE_TICKS[$n]}" ] && RS_BASE_TICKS[$n]=0
 done
-log "RS baseline (per-core): $(for n in $(seq 1 "$NUM_CORE_NODES"); do printf 'n%d=sub:%s/fail:%s ' "$n" "${RS_BASE_SUB[$n]}" "${RS_BASE_FAIL[$n]}"; done)"
+log "RS baseline (per-core): $(for n in $(seq 1 "$NUM_CORE_NODES"); do printf 'n%d=sub:%s/ticks:%s ' "$n" "${RS_BASE_SUB[$n]}" "${RS_BASE_TICKS[$n]}"; done)"
 
 # ── Section H: CG creation matrix + invitations ──────────────────────────────
 section "H. CONTEXT GRAPHS — create $TARGET_CGS registered CGs (public + curated) from cores & edges, with curator invites"
@@ -414,11 +418,15 @@ publish_one() { # idx node cgid kind
   # "No quads in shared memory ... matching selection". Retry the publish leg with
   # backoff. The owner-registration error ("Only the context graph owner ...") is
   # NOT retryable — the seed/register phase (H2) must have run first — so bail on it.
+  # `clearAfter` defaults to `true` on the server (memory.ts: `clearAfter ?? true`).
+  # Multiple workers publish into the same CG concurrently — letting one publish
+  # clear the SWM would wipe other in-flight roots between their write and
+  # publish steps. Force `clearAfter:false` so subset publishes are isolated.
   local attempt p st kc
   for attempt in 1 2 3 4 5; do
     p=$(curl -s --max-time 120 -H "$H" -H "Content-Type: application/json" -X POST \
         "http://127.0.0.1:$port/api/shared-memory/publish" \
-        -d "{\"contextGraphId\":\"$cgid\",\"selection\":{\"rootEntities\":[\"$root\"]}}")
+        -d "{\"contextGraphId\":\"$cgid\",\"selection\":{\"rootEntities\":[\"$root\"]},\"clearAfter\":false}")
     st=$(echo "$p" | pyf "d.get('status','')")
     kc=$(echo "$p" | pyf "d.get('kcId','')")
     if [ "$st" = "confirmed" ] || [ "$st" = "finalized" ]; then
@@ -621,11 +629,18 @@ PY
   ac_promoted=$(echo "$ac" | pyf "d.get('promotedCount',0)")
   if [ -n "$ac_uri" ] && [ "$ac_seal_ok" = "1" ] && [ "${ac_promoted:-0}" -gt 0 ] 2>/dev/null; then
     pass A2 assertion-create-finalize-promote "assertion=$ac_uri sealed and promoted (promoted=$ac_promoted)"
-    pp=$(post "$A2_PORT" /api/shared-memory/publish -d "{\"contextGraphId\":\"$A2_CG\",\"selection\":{\"rootEntities\":[\"$A2_ROOT\"]}}")
+    # Publish via the FINALIZED-ASSERTION fork (`assertionName`), not the
+    # selection fork. The selection fork mints a fresh attestation inline at
+    # the selection boundary, which would mask a regression in the stored
+    # finalize seal. The assertionName fork reads the seal from `_meta` and
+    # forwards it verbatim, so this is what exercises create→finalize→publish
+    # end-to-end. clearAfter is harmless for this one-shot path but kept
+    # false-explicit for consistency with the bulk path.
+    pp=$(post "$A2_PORT" /api/shared-memory/publish -d "{\"contextGraphId\":\"$A2_CG\",\"assertionName\":\"$A2_NAME\",\"clearAfter\":false}")
     pps=$(echo "$pp" | pyf "d.get('status','')")
     case "$pps" in
-      confirmed|finalized) pass A2 assertion-publish "VM publish via canonical path landed (status=$pps)" ;;
-      *) fail A2 assertion-publish "publish after finalize+promote returned status=$pps body: ${pp:0:160}" ;;
+      confirmed|finalized) pass A2 assertion-publish "VM publish via finalized-assertion fork landed (status=$pps)" ;;
+      *) fail A2 assertion-publish "publish via assertionName='$A2_NAME' returned status=$pps body: ${pp:0:160}" ;;
     esac
   else
     fail A2 assertion-create-finalize-promote "create+finalize+promote failed (uri=$ac_uri seal_ok=$ac_seal_ok promoted=$ac_promoted) body: ${ac:0:200}"
@@ -818,21 +833,35 @@ if [ -n "$OREC" ]; then
   xfer_ok=0
   if [ -n "$n1key" ] && [ -n "$n2addr" ]; then
     xfr=$($CHAIN_CALL DKGKnowledgeAssets safeTransferFrom --key "$n1key" --json "[\"$n1addr\",\"$n2addr\",\"$okc\"]")
-    echo "$xfr" | grep -q '"ok":true' && { xfer_ok=1; pass I ka-transfer-exec "KA token $okc transferred node1 -> node2"; } \
-      || warn I ka-transfer-exec "transfer tx: ${xfr:0:140}"
-  fi
-  # New owner (node2) updates with a seal signed by node2's operator wallet.
-  n2port="${NODE_PORT[1]}"
-  nuri="${oroot}/owner2"
-  oquads="[{\"subject\":\"$nuri\",\"predicate\":\"http://www.w3.org/1999/02/22-rdf-syntax-ns#type\",\"object\":\"http://schema.org/UpdateAction\",\"graph\":\"\"},{\"subject\":\"$nuri\",\"predicate\":\"http://schema.org/name\",\"object\":\"\\\"owner2-upd\\\"\",\"graph\":\"\"}]"
-  ob=$(build_update_body 2 "$okc" "$ocg" "$oquads" 2>/dev/null) || ob=""
-  if [ -n "$ob" ]; then
-    orr=$(post "$n2port" /api/update -d "$ob")
-    ost=$(echo "$orr" | pyf "d.get('status','')")
-    { [ "$ost" = "confirmed" ] || [ "$ost" = "finalized" ]; } && pass I new-owner-update "node2 updated KA kc=$okc after transfer (status=$ost)" \
-      || warn I new-owner-update "node2 update status=$ost: ${orr:0:120}"
+    if echo "$xfr" | grep -q '"ok":true'; then
+      xfer_ok=1
+      pass I ka-transfer-exec "KA token $okc transferred node1 -> node2"
+    else
+      # Ownership transfer is part of the required release matrix — a failed
+      # transfer must block the verdict, and the dependent "new-owner update"
+      # step makes no sense to attempt without proven ownership.
+      fail I ka-transfer-exec "transfer tx failed: ${xfr:0:160}"
+    fi
   else
-    warn I new-owner-update "could not build update seal for node2"
+    fail I ka-transfer-exec "missing node1 op key or node2 address (n1key set=$([ -n "$n1key" ] && echo 1 || echo 0) n2addr=$n2addr)"
+  fi
+  # New owner (node2) updates with a seal signed by node2's operator wallet —
+  # only meaningful AFTER the transfer landed.
+  if [ "$xfer_ok" = "1" ]; then
+    n2port="${NODE_PORT[1]}"
+    nuri="${oroot}/owner2"
+    oquads="[{\"subject\":\"$nuri\",\"predicate\":\"http://www.w3.org/1999/02/22-rdf-syntax-ns#type\",\"object\":\"http://schema.org/UpdateAction\",\"graph\":\"\"},{\"subject\":\"$nuri\",\"predicate\":\"http://schema.org/name\",\"object\":\"\\\"owner2-upd\\\"\",\"graph\":\"\"}]"
+    ob=$(build_update_body 2 "$okc" "$ocg" "$oquads" 2>/dev/null) || ob=""
+    if [ -n "$ob" ]; then
+      orr=$(post "$n2port" /api/update -d "$ob")
+      ost=$(echo "$orr" | pyf "d.get('status','')")
+      { [ "$ost" = "confirmed" ] || [ "$ost" = "finalized" ]; } && pass I new-owner-update "node2 updated KA kc=$okc after transfer (status=$ost)" \
+        || fail I new-owner-update "node2 update status=$ost: ${orr:0:120}"
+    else
+      fail I new-owner-update "could not build update seal for node2"
+    fi
+  else
+    warn I new-owner-update "skipped — transfer did not land (gated by ka-transfer-exec)"
   fi
 else
   warn I ownership "no node1 public KA available for ownership test"
@@ -915,21 +944,24 @@ while [ "$(date +%s)" -lt "$rs_end" ]; do
   sleep 20
 done
 # Read RS counters now and subtract the baseline captured in PREFLIGHT so we
-# only count the RS work generated by THIS run (BOOTSTRAP=0 carries stale
-# cumulative totals that would otherwise inflate the success rate).
+# only count the RS work generated by THIS run. Use `totalTicks` (every prover
+# tick — submitted, skipped, error) as the denominator; the route does not
+# expose a failed-count field.
 TOT_SUB=0; TOT_ATT=0
 for n in $(seq 1 "$NUM_CORE_NODES"); do
   port="${NODE_PORT[$((n-1))]}"
   s=$(get "$port" /api/random-sampling/status 2>/dev/null || echo '{}')
   sub_now=$(echo "$s" | pyf "d.get('loop',{}).get('submittedCount',0)")
-  failc_now=$(echo "$s" | pyf "d.get('loop',{}).get('failedCount',0)")
-  [ -z "$sub_now" ] && sub_now=0; [ -z "$failc_now" ] && failc_now=0
+  ticks_now=$(echo "$s" | pyf "d.get('loop',{}).get('totalTicks',0)")
+  last_outcome=$(echo "$s" | pyf "(d.get('loop',{}).get('lastOutcome') or {}).get('kind','')")
+  [ -z "$sub_now" ] && sub_now=0; [ -z "$ticks_now" ] && ticks_now=0
   sub=$(( sub_now - ${RS_BASE_SUB[$n]:-0} ))
-  failc=$(( failc_now - ${RS_BASE_FAIL[$n]:-0} ))
+  att=$(( ticks_now - ${RS_BASE_TICKS[$n]:-0} ))
   [ "$sub" -lt 0 ] && sub=0
-  [ "$failc" -lt 0 ] && failc=0
-  att=$(( sub + failc ))
-  log "  core$n: Δsubmitted=$sub Δfailed=$failc (now sub=$sub_now fail=$failc_now base sub=${RS_BASE_SUB[$n]} fail=${RS_BASE_FAIL[$n]})"
+  [ "$att" -lt 0 ] && att=0
+  # Belt-and-braces: a successful submit always counts as an attempt.
+  [ "$att" -lt "$sub" ] && att=$sub
+  log "  core$n: Δsubmitted=$sub Δticks=$att lastOutcome=$last_outcome (now sub=$sub_now ticks=$ticks_now base sub=${RS_BASE_SUB[$n]} ticks=${RS_BASE_TICKS[$n]})"
   TOT_SUB=$(( TOT_SUB + sub )); TOT_ATT=$(( TOT_ATT + att ))
 done
 if [ "$TOT_ATT" -gt 0 ]; then

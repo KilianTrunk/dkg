@@ -19,7 +19,7 @@
  * Reuse is a TWO-step probe (api.port file + tcp connect) so a stale
  * port file from a crashed daemon is correctly treated as "down".
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { connect } from 'node:net';
 import { spawn } from 'node:child_process';
 import { dirname, resolve } from 'node:path';
@@ -29,6 +29,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, '../../..');
 const DEVNET_DIR = resolve(REPO_ROOT, '.devnet');
 const NODE_NUM = process.env.DEVNET_NODE || process.env.UI_NODE_ID || '1';
+const NODE_NUM_INT = parseInt(NODE_NUM, 10) || 1;
 const NODE_DIR = resolve(DEVNET_DIR, `node${NODE_NUM}`);
 const API_PORT_FILE = resolve(NODE_DIR, 'api.port');
 const DAEMON_LOG_FILE = resolve(NODE_DIR, 'daemon.log');
@@ -39,7 +40,19 @@ const BOOTSTRAP_TIMEOUT_MS = parseInt(
   10,
 );
 
-const NUM_NODES = process.env.PLAYWRIGHT_DEVNET_NUM_NODES || '1';
+// Default node count must cover the target node — `UI_NODE_ID=5` needs ≥5 nodes.
+const NUM_NODES_INT = parseInt(
+  process.env.PLAYWRIGHT_DEVNET_NUM_NODES || String(NODE_NUM_INT),
+  10,
+) || NODE_NUM_INT;
+if (NUM_NODES_INT < NODE_NUM_INT) {
+  throw new Error(
+    `[playwright] PLAYWRIGHT_DEVNET_NUM_NODES=${NUM_NODES_INT} is less than ` +
+    `target node${NODE_NUM_INT}. Raise NUM_NODES or point UI_NODE_ID at a ` +
+    `node inside the cluster you start.`,
+  );
+}
+const NUM_NODES = String(NUM_NODES_INT);
 
 const API_PORT_BASE =
   process.env.API_PORT_BASE ||
@@ -49,6 +62,14 @@ const LIBP2P_PORT_BASE =
   process.env.LIBP2P_PORT_BASE ||
   process.env.PLAYWRIGHT_DEVNET_LIBP2P_PORT_BASE ||
   '20001';
+
+export interface PlaywrightManagedMarker {
+  startedAtMs: number;
+  nodeNum: string;
+  numNodes: string;
+  /** Nodes already reachable before this bootstrap spawned devnet.sh */
+  preExistingNodes: number[];
+}
 
 function tailFile(path: string, bytes: number): string {
   if (!existsSync(path)) return '';
@@ -72,16 +93,30 @@ function probeTcp(port: number, timeoutMs = 1500): Promise<boolean> {
   });
 }
 
-function readPortFile(): number | null {
-  if (!existsSync(API_PORT_FILE)) return null;
-  const port = parseInt(readFileSync(API_PORT_FILE, 'utf8').trim(), 10);
+function readPortFileForNode(nodeIndex: number): number | null {
+  const portFile = resolve(DEVNET_DIR, `node${nodeIndex}`, 'api.port');
+  if (!existsSync(portFile)) return null;
+  const port = parseInt(readFileSync(portFile, 'utf8').trim(), 10);
   return Number.isFinite(port) && port > 0 ? port : null;
 }
 
-async function isReachable(): Promise<{ reachable: boolean; port: number | null }> {
-  const port = readPortFile();
+async function isNodeReachable(nodeIndex: number): Promise<{ reachable: boolean; port: number | null }> {
+  const port = readPortFileForNode(nodeIndex);
   if (!port) return { reachable: false, port: null };
   return { reachable: await probeTcp(port), port };
+}
+
+async function isReachable(): Promise<{ reachable: boolean; port: number | null }> {
+  return isNodeReachable(NODE_NUM_INT);
+}
+
+async function probeExistingNodes(numNodes: number): Promise<number[]> {
+  const existing: number[] = [];
+  for (let i = 1; i <= numNodes; i++) {
+    const { reachable } = await isNodeReachable(i);
+    if (reachable) existing.push(i);
+  }
+  return existing;
 }
 
 async function waitForReady(label: string): Promise<number> {
@@ -137,6 +172,20 @@ function spawnDevnet(): Promise<SpawnResult> {
   });
 }
 
+function clearMarker(): void {
+  try { rmSync(MARKER_FILE, { force: true }); } catch { /* best-effort */ }
+}
+
+function writeMarker(preExistingNodes: number[]): void {
+  const marker: PlaywrightManagedMarker = {
+    startedAtMs: Date.now(),
+    nodeNum: NODE_NUM,
+    numNodes: NUM_NODES,
+    preExistingNodes,
+  };
+  writeFileSync(MARKER_FILE, JSON.stringify(marker, null, 2));
+}
+
 async function main(): Promise<void> {
   const initial = await isReachable();
   if (initial.reachable && initial.port) {
@@ -146,18 +195,14 @@ async function main(): Promise<void> {
     return;
   }
 
+  const preExistingNodes = await probeExistingNodes(NUM_NODES_INT);
+
   console.log(
     `[playwright] devnet node${NODE_NUM} not running -- bootstrapping ` +
     `(NUM_NODES=${NUM_NODES}, API_PORT_BASE=${API_PORT_BASE}, ` +
-    `LIBP2P_PORT_BASE=${LIBP2P_PORT_BASE})...`,
-  );
-  writeFileSync(
-    MARKER_FILE,
-    JSON.stringify(
-      { startedAtMs: Date.now(), nodeNum: NODE_NUM, numNodes: NUM_NODES },
-      null,
-      2,
-    ),
+    `LIBP2P_PORT_BASE=${LIBP2P_PORT_BASE}` +
+    (preExistingNodes.length ? `, pre-existing nodes: ${preExistingNodes.join(',')}` : '') +
+    `)...`,
   );
 
   const spawnResult = await spawnDevnet();
@@ -172,6 +217,7 @@ async function main(): Promise<void> {
   try {
     port = await waitForReady(`node${NODE_NUM}`);
   } catch (err) {
+    clearMarker();
     const tail = tailFile(DAEMON_LOG_FILE, 4096).trim();
     const detail = tail
       ? `\n\n----- last 4 KiB of ${DAEMON_LOG_FILE} -----\n${tail}\n----- end -----`
@@ -183,6 +229,10 @@ async function main(): Promise<void> {
       `NUM_NODES=${NUM_NODES}). ${(err as Error).message}${detail}`,
     );
   }
+
+  // Marker is written only after readiness is confirmed so a crashed
+  // bootstrap never leaves a stale "we own this devnet" flag behind.
+  writeMarker(preExistingNodes);
 
   if (spawnResult.exitCode !== 0) {
     console.warn(
@@ -196,6 +246,7 @@ async function main(): Promise<void> {
 }
 
 main().catch((err) => {
+  clearMarker();
   console.error('[playwright] devnet bootstrap FAILED:', err?.stack || err);
   process.exit(1);
 });

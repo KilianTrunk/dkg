@@ -97,8 +97,10 @@ test.describe('Operations / Observability', () => {
     // and uses inline styles, so we identify it by its label span.
     const legendLabel = page.locator('span', { hasText: /^Phases$/ });
     await expect(legendLabel.first()).toBeVisible();
-    // Walk to the legend container that holds the colour swatches.
-    const legend = legendLabel.first().locator('..');
+    // Legend strip is the card-adjacent div that contains the colour swatches.
+    const legend = page.locator('div').filter({
+      has: page.locator('span', { hasText: /^Prepare$/ }),
+    }).first();
     await expect(legend.locator('span', { hasText: /^Prepare$/ })).toBeVisible();
     await expect(legend.locator('span', { hasText: /^Broadcast$/ })).toBeVisible();
     await expect(legend.locator('span', { hasText: /^Verify$/ })).toBeVisible();

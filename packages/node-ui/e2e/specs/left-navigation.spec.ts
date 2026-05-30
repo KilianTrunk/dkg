@@ -1,161 +1,171 @@
 import { test, expect } from '../fixtures/base.js';
-import { sel } from '../helpers/selectors.js';
+
+// Left-panel surface in rc11:
+//   * Two top-row buttons: "+ New Context Graph" / "↗ Join Context Graph"
+//   * Two mode tabs: "Context Graphs" (default) / "Context Oracle"
+//   * Dashboard row above the collapsible peer-groups
+//   * "My Context Graphs" peer-group with a row per CG; clicking the
+//     row's header opens a project tab. The × button hides the CG from
+//     the sidebar (reversible via "↺ Show N hidden…").
+//   * Inline expand-to-see-memory-layers, demo-data CG names, the
+//     "Memory Stack" row, and the per-row asset count badge are all
+//     gone — the rewritten spec exercises only what's actually
+//     navigable.
+// Discovery flow mirrors tab-management.spec: pick the first CG that
+// the seeded devnet returns and drive everything off that name, so the
+// spec stays daemon-agnostic.
+
+async function discoverProjectName(leftPanel: any): Promise<string> {
+  await expect(async () => {
+    const names = await leftPanel.getProjectNames();
+    expect(names.length).toBeGreaterThan(0);
+  }).toPass({ timeout: 12_000, intervals: [250, 500, 1000] });
+  const names = await leftPanel.getProjectNames();
+  return names[0]!;
+}
 
 test.describe('Left Panel Navigation', () => {
   test.beforeEach(async ({ shell, page }) => {
     await shell.goto();
-    await page.locator('.v10-tree-section').first().waitFor({ state: 'visible', timeout: 10_000 });
+    await page.locator('.v10-panel-left .v10-tree-header').waitFor({ state: 'visible', timeout: 10_000 });
   });
 
-  test('PROJECTS mode is active by default', async ({ leftPanel }) => {
+  test('Context Graphs mode is active by default', async ({ leftPanel }) => {
     const mode = await leftPanel.getActiveMode();
-    expect(mode?.trim().toUpperCase()).toContain('PROJECTS');
+    expect(mode?.trim().toLowerCase()).toBe('context graphs');
   });
 
-  test('Dashboard row is visible', async ({ leftPanel }) => {
-    const dashboard = leftPanel.root.locator(sel.leftPanel.dashboard).filter({ hasText: 'Dashboard' });
+  test('top row exposes the create + join action buttons', async ({ leftPanel }) => {
+    await expect(leftPanel.newProjectBtn).toBeVisible();
+    await expect(leftPanel.joinProjectBtn).toBeVisible();
+  });
+
+  test('Dashboard row is rendered above the CG list', async ({ leftPanel }) => {
+    const dashboard = leftPanel.root.locator('.v10-tree-dashboard').filter({ hasText: 'Dashboard' });
     await expect(dashboard).toBeVisible();
   });
 
-  test('Memory Stack row is visible', async ({ leftPanel, page }) => {
-    await page.locator('.v10-tree-dashboard').filter({ hasText: 'Memory Stack' }).waitFor({ state: 'visible', timeout: 5_000 });
-    expect(await leftPanel.isMemoryStackVisible()).toBe(true);
-  });
-
-  test('three projects are listed with badges', async ({ leftPanel }) => {
-    const names = await leftPanel.getProjectNames();
-    expect(names).toContain('Pharma Drug Interactions');
-    expect(names).toContain('Climate Science');
-    expect(names).toContain('EU Supply Chain');
-    expect(names.length).toBe(3);
-  });
-
-  // Per-row asset-count badges were removed in PR8 — the count was
-  // broken (always 0) and the dashboard already surfaces this number.
-  // `fixme` so this stays visible in the test report until the broader
-  // e2e revamp picks it up (broader rot is tracked outside this PR;
-  // grep this commit for "left-navigation.spec" in the PR8 series).
-  test.fixme('project badge shows asset count', async () => {
-    // intentionally skipped — `.v10-tree-section-badge` no longer rendered.
-  });
-
-  test('expanding a project reveals memory layer items', async ({ leftPanel }) => {
-    await leftPanel.expandProject('Pharma Drug Interactions');
-    const section = leftPanel.root.locator(sel.leftPanel.section).filter({ hasText: 'Pharma Drug Interactions' });
-
-    const layerHeaders = section.locator(sel.leftPanel.layerHeader);
-    const count = await layerHeaders.count();
-    expect(count).toBe(3);
-
-    const items = section.locator(sel.leftPanel.treeItem);
-    await expect(items.first()).toBeVisible();
-  });
-
-  test('expanded project shows Working, Shared, and Verified memory sections', async ({ page, leftPanel }) => {
-    await leftPanel.expandProject('Pharma Drug Interactions');
-    const content = page.locator(sel.leftPanel.root).first();
-    await expect(content.getByText('WORKING MEMORY')).toBeVisible();
-    await expect(content.getByText('SHARED MEMORY')).toBeVisible();
-    await expect(content.getByText('VERIFIED MEMORY')).toBeVisible();
-  });
-
-  test('working memory section contains agent drafts and import link', async ({ page, leftPanel }) => {
-    await leftPanel.expandProject('Pharma Drug Interactions');
-    const section = page.locator(sel.leftPanel.root).first();
-    await expect(section.getByText('agent drafts')).toBeVisible();
-    await expect(section.getByText('Import files…')).toBeVisible();
-  });
-
-  test('clicking agent drafts opens WM tab', async ({ leftPanel, centerPanel }) => {
-    await leftPanel.expandProject('Pharma Drug Interactions');
-    await leftPanel.clickLayer('Pharma Drug Interactions', 'wm');
-    const tabs = await centerPanel.getTabNames();
-    expect(tabs.some(t => t.includes('WM'))).toBe(true);
-  });
-
-  test('clicking Import files link opens import modal', async ({ leftPanel, importFilesModal }) => {
-    await leftPanel.expandProject('Pharma Drug Interactions');
-    await leftPanel.clickLayer('Pharma Drug Interactions', 'import');
-    expect(await importFilesModal.isOpen()).toBe(true);
-  });
-
-  test('clicking team workspace opens SWM tab', async ({ leftPanel, centerPanel }) => {
-    await leftPanel.expandProject('Climate Science');
-    await leftPanel.clickLayer('Climate Science', 'swm');
-    const tabs = await centerPanel.getTabNames();
-    expect(tabs.some(t => t.includes('SWM'))).toBe(true);
-  });
-
-  test('clicking verified assets opens VM tab', async ({ leftPanel, centerPanel }) => {
-    await leftPanel.expandProject('EU Supply Chain');
-    await leftPanel.clickLayer('EU Supply Chain', 'vm');
-    const tabs = await centerPanel.getTabNames();
-    expect(tabs.some(t => t.includes('VM'))).toBe(true);
-  });
-
-  test('Context Oracle mode shows coming soon placeholder', async ({ leftPanel }) => {
-    await leftPanel.switchToMode('oracle');
-    await expect(leftPanel.oraclePlaceholder).toBeVisible();
-    const text = await leftPanel.oraclePlaceholder.textContent();
-    expect(text).toContain('coming soon');
-  });
-
-  test('expanding a project toggles chevron open class', async ({ page, leftPanel }) => {
-    const chevron = page.locator('.v10-tree-section').filter({ hasText: 'EU Supply Chain' }).locator('.v10-tree-chevron');
-    const wasClosed = !(await chevron.evaluate((el: Element) => el.classList.contains('open')));
-    expect(wasClosed).toBe(true);
-    await leftPanel.expandProject('EU Supply Chain');
-    const isOpen = await chevron.evaluate((el: Element) => el.classList.contains('open'));
-    expect(isOpen).toBe(true);
-  });
-
-  test('collapsing a project removes chevron open class', async ({ page, leftPanel }) => {
-    await leftPanel.expandProject('EU Supply Chain');
-    const chevron = page.locator('.v10-tree-section').filter({ hasText: 'EU Supply Chain' }).locator('.v10-tree-chevron');
-    expect(await chevron.evaluate((el: Element) => el.classList.contains('open'))).toBe(true);
-    await leftPanel.expandProject('EU Supply Chain');
-    expect(await chevron.evaluate((el: Element) => el.classList.contains('open'))).toBe(false);
-  });
-
-  test('multiple projects can be expanded simultaneously', async ({ page, leftPanel }) => {
-    await leftPanel.expandProject('Pharma Drug Interactions');
-    await leftPanel.expandProject('Climate Science');
-    const pharmaItems = page.locator('.v10-tree-section').filter({ hasText: 'Pharma Drug Interactions' }).locator('.v10-tree-item');
-    const climateItems = page.locator('.v10-tree-section').filter({ hasText: 'Climate Science' }).locator('.v10-tree-item');
-    expect(await pharmaItems.count()).toBeGreaterThan(0);
-    expect(await climateItems.count()).toBeGreaterThan(0);
-  });
-
-  test('switching back to Projects mode restores tree', async ({ leftPanel }) => {
-    await leftPanel.switchToMode('oracle');
-    await leftPanel.switchToMode('explorer');
-    const names = await leftPanel.getProjectNames();
-    expect(names.length).toBe(3);
-  });
-
-  test('+ New Project button opens create project modal', async ({ leftPanel, createProjectModal }) => {
-    await leftPanel.clickNewProject();
-    expect(await createProjectModal.isOpen()).toBe(true);
-  });
-
-  // The in-panel ◂ collapse button was removed in PR8 — the global
-  // header sidebar toggle is the sole control. A future spec should
-  // exercise the global toggle path (`shell.header.sidebarToggle`)
-  // instead. `fixme` so it stays visible in the test report.
-  test.fixme('collapse button hides left panel', async () => {
-    // intentionally skipped — `.v10-collapse-btn` no longer rendered.
-  });
-
-  test('clicking Dashboard row switches to dashboard view', async ({ leftPanel, centerPanel }) => {
-    await leftPanel.expandProject('Pharma Drug Interactions');
+  test('clicking the Dashboard row activates the Dashboard tab', async ({ leftPanel, centerPanel }) => {
     await leftPanel.clickDashboard();
     const active = await centerPanel.getActiveTabName();
     expect(active?.trim()).toBe('Dashboard');
   });
 
-  test('clicking Memory Stack opens Memory Stack tab', async ({ leftPanel, centerPanel }) => {
-    await leftPanel.clickMemoryStack();
-    const tabs = await centerPanel.getTabNames();
-    expect(tabs).toContain('Memory Stack');
+  test('My Context Graphs peer-group is expanded by default', async ({ page }) => {
+    const header = page
+      .locator('.v10-panel-left .v10-peer-group-header')
+      .filter({ hasText: 'My Context Graphs' })
+      .first();
+    await expect(header).toHaveAttribute('aria-expanded', 'true');
+  });
+
+  test('My Context Graphs peer-group can be collapsed and re-expanded', async ({ page }) => {
+    const header = page
+      .locator('.v10-panel-left .v10-peer-group-header')
+      .filter({ hasText: 'My Context Graphs' })
+      .first();
+    const body = page.locator('.v10-panel-left .v10-peer-group-body').first();
+    await expect(body).toBeVisible();
+    await header.click();
+    await expect(header).toHaveAttribute('aria-expanded', 'false');
+    await expect(body).toBeHidden();
+    await header.click();
+    await expect(header).toHaveAttribute('aria-expanded', 'true');
+    await expect(body).toBeVisible();
+  });
+
+  test('seeded devnet renders at least one context graph in the sidebar', async ({ leftPanel }) => {
+    const name = await discoverProjectName(leftPanel);
+    expect(name.length).toBeGreaterThan(0);
+  });
+
+  test('every CG row has a × hide button next to its label', async ({ leftPanel, page }) => {
+    await discoverProjectName(leftPanel);
+    const rows = page.locator('.v10-panel-left .v10-peer-group-body .v10-tree-section');
+    const count = await rows.count();
+    expect(count).toBeGreaterThan(0);
+    for (let i = 0; i < count; i++) {
+      const hide = rows.nth(i).locator('.v10-tree-hide-btn');
+      await expect(hide).toBeVisible();
+    }
+  });
+
+  test('clicking a CG header opens the corresponding project tab', async ({ leftPanel, centerPanel }) => {
+    const name = await discoverProjectName(leftPanel);
+    await leftPanel.clickProject(name);
+    await expect(async () => {
+      const tabs = await centerPanel.getTabNames();
+      expect(tabs.some((t) => t.trim() === name)).toBe(true);
+    }).toPass({ timeout: 5_000 });
+  });
+
+  test('the project tab opened from the sidebar is the active tab', async ({ leftPanel, centerPanel }) => {
+    const name = await discoverProjectName(leftPanel);
+    await leftPanel.clickProject(name);
+    await expect(async () => {
+      const active = await centerPanel.getActiveTabName();
+      expect(active?.trim()).toBe(name);
+    }).toPass({ timeout: 5_000 });
+  });
+
+  test('hiding a CG removes it from the sidebar and surfaces the restore button', async ({ leftPanel, page }) => {
+    const before = await leftPanel.getProjectNames();
+    test.skip(before.length < 2, 'need at least two CGs to safely hide one without losing list shape');
+    const target = before[0]!;
+    await leftPanel.hideProject(target);
+    await expect(async () => {
+      const after = await leftPanel.getProjectNames();
+      expect(after).not.toContain(target);
+    }).toPass({ timeout: 4_000 });
+    await expect(page.locator('.v10-tree-show-hidden')).toBeVisible();
+    // Restore so the suite leaves the local-storage clean for siblings.
+    await page.locator('.v10-tree-show-hidden').click();
+    await expect(async () => {
+      const restored = await leftPanel.getProjectNames();
+      expect(restored).toContain(target);
+    }).toPass({ timeout: 4_000 });
+  });
+
+  test('Context Oracle mode swaps the tree for the catalogue placeholder', async ({ leftPanel, page }) => {
+    // rc11 replaced the legacy `.v10-oracle-placeholder` "coming soon"
+    // copy with a real Context Oracle view: a list of non-joined CGs
+    // when the daemon has any, otherwise a `<p>` empty-state inviting
+    // the user to "Join Context Graph". On the seeded devnet the
+    // local agent owns its CGs, so the empty-state branch renders.
+    await leftPanel.switchToMode('oracle');
+    const oracleEmpty = page
+      .locator('.v10-panel-left p')
+      .filter({ hasText: /Join Context Graph|catalogue/i })
+      .first();
+    const oracleList = page.locator('.v10-panel-left .v10-tree-group-label').filter({ hasText: 'Context Oracle' });
+    await expect(oracleEmpty.or(oracleList)).toBeVisible({ timeout: 4_000 });
+  });
+
+  test('switching back to Context Graphs restores the CG list', async ({ leftPanel }) => {
+    // Establish a stable baseline first — the CG list async-loads via
+    // `/api/contextGraphs`, so reading `getProjectNames()` immediately
+    // after `goto` can race the round-trip and observe an empty list.
+    await discoverProjectName(leftPanel);
+    const before = await leftPanel.getProjectNames();
+    await leftPanel.switchToMode('oracle');
+    await leftPanel.switchToMode('explorer');
+    await expect(async () => {
+      const restored = await leftPanel.getProjectNames();
+      expect(restored.length).toBe(before.length);
+    }).toPass({ timeout: 4_000 });
+  });
+
+  test('+ New Context Graph button opens the create modal', async ({ leftPanel, createProjectModal }) => {
+    await leftPanel.clickNewProject();
+    await expect(createProjectModal.overlay).toBeVisible();
+  });
+
+  test('legacy inline memory-layer rows do not reappear (regression guard)', async ({ page }) => {
+    // The pre-rc11 sidebar exposed `.v10-tree-layer-header` rows under
+    // each project (agent drafts / team workspace / verified assets /
+    // import files…). The rewrite removed them — guard against
+    // regressions that re-add inline layer navigation here instead of
+    // on the project view's LayerSwitcher.
+    await expect(page.locator('.v10-panel-left .v10-tree-layer-header')).toHaveCount(0);
   });
 });

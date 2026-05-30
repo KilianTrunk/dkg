@@ -9,11 +9,12 @@
  *
  * Usage:
  *   node devnet-chain-call.mjs <Contract> <method> [--key 0x..] [--json '<args-array>']
+ *   node devnet-chain-call.mjs <Contract> <method> [--sig 'name(type,...)] [--key 0x..] [--json '<args>']
  *
  * Examples:
  *   node devnet-chain-call.mjs ParametersStorage protocolTreasury
  *   node devnet-chain-call.mjs ParametersStorage setProtocolTreasury --key 0xac09.. --json '["0xabc..."]'
- *   node devnet-chain-call.mjs Token balanceOf --json '["0xabc..."]'
+ *   node devnet-chain-call.mjs DKGKnowledgeAssets safeTransferFrom --key 0x.. --json '["0xfrom","0xto","1"]'
  *
  * Output: a single JSON line: { ok, result?, txHash?, error? }
  *   - view/pure calls populate `result` (stringified, BigInt-safe).
@@ -61,22 +62,76 @@ function out(o) {
   process.stdout.write(JSON.stringify(o, (_k, v) => (typeof v === 'bigint' ? v.toString() : v)) + '\n');
 }
 
+function parseJsonArg(label, raw) {
+  try {
+    return JSON.parse(raw);
+  } catch (e) {
+    out({ ok: false, error: `invalid ${label}: ${e?.message || String(e)}` });
+    process.exit(2);
+  }
+}
+
+function resolveFragment(iface, abi, method, args, explicitSig) {
+  if (explicitSig) {
+    try {
+      return iface.getFunction(explicitSig);
+    } catch (e) {
+      out({ ok: false, error: `invalid --sig ${explicitSig}: ${e?.shortMessage || e?.message || String(e)}` });
+      process.exit(3);
+    }
+  }
+  const sameName = abi.filter((f) => f.type === 'function' && f.name === method);
+  if (sameName.length === 0) {
+    out({ ok: false, error: `method ${method} not in ABI`, unsupported: true });
+    process.exit(3);
+  }
+  const byArity = sameName.filter((f) => f.inputs.length === args.length);
+  if (byArity.length === 1) {
+    const types = byArity[0].inputs.map((i) => i.type).join(',');
+    return iface.getFunction(`${method}(${types})`);
+  }
+  if (sameName.length === 1) {
+    return iface.getFunction(method);
+  }
+  // Disambiguate by runtime arg types (ethers v6 overload resolution).
+  try {
+    return iface.getFunction(method, args);
+  } catch {
+    out({
+      ok: false,
+      error: `ambiguous method ${method} for ${args.length} args; pass --sig 'name(type,...)'`,
+      unsupported: true,
+    });
+    process.exit(3);
+  }
+}
+
 async function main() {
   const [contractName, method] = process.argv.slice(2);
   if (!contractName || !method) {
-    out({ ok: false, error: 'usage: <Contract> <method> [--key 0x..] [--json <args>]' });
+    out({ ok: false, error: 'usage: <Contract> <method> [--sig name(type,...)] [--key 0x..] [--json <args>]' });
     process.exit(2);
   }
   let key = null;
   let args = [];
+  let explicitSig = null;
   const argv = process.argv.slice(4);
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--key') key = argv[++i];
-    else if (argv[i] === '--json') args = JSON.parse(argv[++i]);
+    else if (argv[i] === '--json') args = parseJsonArg('--json', argv[++i]);
+    else if (argv[i] === '--sig') explicitSig = argv[++i];
+  }
+
+  let deployment;
+  try {
+    deployment = parseJsonArg('deployments file', fs.readFileSync(CONTRACTS_JSON, 'utf8'));
+  } catch (e) {
+    if (e?.status === 2) throw e;
+    out({ ok: false, error: `cannot read ${CONTRACTS_JSON}: ${e?.message || String(e)}` });
+    process.exit(1);
   }
 
   const provider = new ethers.JsonRpcProvider(RPC);
-  const deployment = JSON.parse(fs.readFileSync(CONTRACTS_JSON, 'utf8'));
   const map = deployment.contracts || deployment;
   const addr = map[contractName]?.evmAddress || map[contractName]?.address;
   if (!addr) {
@@ -88,29 +143,10 @@ async function main() {
     out({ ok: false, error: `ABI not found: ${abiPath}` });
     process.exit(1);
   }
-  const abi = JSON.parse(fs.readFileSync(abiPath, 'utf8'));
+  const abi = parseJsonArg('ABI file', fs.readFileSync(abiPath, 'utf8'));
 
   const iface = new ethers.Interface(abi);
-  const sameName = abi.filter((f) => f.type === 'function' && f.name === method);
-  if (sameName.length === 0) {
-    out({ ok: false, error: `method ${method} not in ${contractName} ABI`, unsupported: true });
-    process.exit(3);
-  }
-  // Disambiguate overloaded selectors (e.g. ERC721 safeTransferFrom 3-arg vs 4-arg).
-  let fragment;
-  const byArity = sameName.filter((f) => f.inputs.length === args.length);
-  if (byArity.length === 1) {
-    fragment = iface.getFunction(byArity[0].name, byArity[0].inputs.map((i) => i.type));
-  } else if (sameName.length === 1) {
-    fragment = iface.getFunction(method);
-  } else {
-    out({
-      ok: false,
-      error: `ambiguous method ${method} for ${args.length} args; pass --sig 'name(type,...)'`,
-      unsupported: true,
-    });
-    process.exit(3);
-  }
+  const fragment = resolveFragment(iface, abi, method, args, explicitSig);
 
   const signerOrProvider = key ? new ethers.Wallet(key, provider) : provider;
   const c = new ethers.Contract(addr, abi, signerOrProvider);

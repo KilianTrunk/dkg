@@ -23,6 +23,8 @@
 #   B. KA updates across all CG variants
 #   C. Random sampling for public + private CGs (success rate)
 #   D. Staking present + conviction multiplier + reward claim/withdraw + position transfer
+#   D2. V8→V10 migration conviction credit — eligible migrants on tiers 6/12 get a
+#       fixed 60-day (2-month) shorter lock; lower tiers and ineligible get default
 #   E. Conviction-discounted vs non-conviction publish + publishing-NFT transfer
 #   F. Protocol treasury fee (treasury account receives a percentage)
 #   G. Prolonged inter-node messaging
@@ -45,6 +47,7 @@
 #   PUBLISH_CONCURRENCY=6  parallel in-flight publishes (1 per node)
 #   RESULTS_DIR=...        output dir (default .devnet/rc12-validation/<ts>)
 #   SKIP_MESSAGING_SOAK=1  skip the prolonged messaging soak
+#   SKIP_V8_MIGRATION_CREDIT=1  skip D2 (V8 eligible 6m/12m lock-shortening smoke)
 #
 set -uo pipefail
 
@@ -483,7 +486,7 @@ if [ "$CGS_WITH_KA" -ge "$TARGET_CGS" ]; then pass A cg-spread "KAs span $CGS_WI
 else warn A cg-spread "KAs span $CGS_WITH_KA CGs (< $TARGET_CGS)"; fi
 if [ "$EMIN" -ge "$MIN_ENTITIES" ] 2>/dev/null && [ "$EMAX" -le "$MAX_ENTITIES" ] 2>/dev/null && [ "$EMIN" -gt 0 ] 2>/dev/null; then
   pass A entity-range "entities per KA within [$MIN_ENTITIES,$MAX_ENTITIES] (min=$EMIN max=$EMAX avg=$EAVG)"
-else warn A entity-range "entity range min=$EMIN max=$EMAX (expected [$MIN_ENTITIES,$MAX_ENTITIES])"; fi
+else fail A entity-range "entity range min=$EMIN max=$EMAX (expected [$MIN_ENTITIES,$MAX_ENTITIES])"; fi
 # Edge-published KAs present?
 EDGE_KA=$(grep '"ok":true' "$METRICS_JSONL" | python3 -c "
 import sys,json
@@ -640,6 +643,43 @@ if [ -n "$N1_OP" ] && [ -f "$NFT_ABI" ]; then
   fi
 fi
 
+# ── Section D2: V8→V10 migration conviction credit (60-day lock on tiers 6/12) ─
+# Eligible V8 migrants (frozen V8MigrationEligibility registry) who pick the two
+# highest conviction tiers (6m / 12m) must get expiryTimestamp shortened by exactly
+# 60 days (fixed literal in StakingV10 3.1.0 — not 2×chronos.epochLength).
+# Lower tiers and ineligible delegators migrate at the default lock.
+# Exercises: synthetic registry upload+freeze, selfMigrateV8, CSS position expiry.
+section "D2. V8 MIGRATION CREDIT — eligible tier 6/12 migrants get 60-day lock discount"
+V8_CREDIT_SMOKE="$REPO_ROOT/packages/evm-module/scripts/devnet-credit-smoke.ts"
+if [ "${SKIP_V8_MIGRATION_CREDIT:-0}" = "1" ]; then
+  warn D2 v8-migration-credit "SKIP_V8_MIGRATION_CREDIT=1"
+elif [ ! -f "$CONTRACTS_JSON" ]; then
+  fail D2 v8-migration-credit "missing $CONTRACTS_JSON"
+elif ! grep -q '"V8MigrationEligibility"' "$CONTRACTS_JSON" 2>/dev/null; then
+  fail D2 v8-migration-credit "V8MigrationEligibility not in deployments map"
+elif [ ! -f "$V8_CREDIT_SMOKE" ]; then
+  fail D2 v8-migration-credit "missing $V8_CREDIT_SMOKE"
+else
+  reg_frozen=$($CHAIN_CALL V8MigrationEligibility frozen 2>/dev/null | pyf "d.get('result', False)" || echo "False")
+  if [ "$reg_frozen" = "True" ] || [ "$reg_frozen" = "true" ]; then
+    warn D2 v8-migration-credit "V8MigrationEligibility already frozen on this chain — re-bootstrap (BOOTSTRAP=1) to run the full 4-scenario matrix"
+  else
+    v8_log="$RESULTS/v8-credit-smoke.log"
+    log "  Running devnet-credit-smoke.ts (registry upload, freeze, tier 6/12 vs 3 vs ineligible)…"
+    smoke_rc=0
+    (
+      cd "$REPO_ROOT/packages/evm-module" || exit 1
+      export RPC_LOCALHOST="http://127.0.0.1:${HARDHAT_PORT}"
+      npx ts-node --esm scripts/devnet-credit-smoke.ts
+    ) >"$v8_log" 2>&1 || smoke_rc=$?
+    if [ "$smoke_rc" -eq 0 ]; then
+      pass D2 v8-migration-credit "eligible 6m/12m V8 migrants: 60-day expiryShortenedBy; tier 3 + ineligible: no credit (see $v8_log)"
+    else
+      fail D2 v8-migration-credit "devnet-credit-smoke failed rc=$smoke_rc (tail): $(tail -n 3 "$v8_log" 2>/dev/null | tr '\n' ' ')"
+    fi
+  fi
+fi
+
 # ── Section E: conviction discount vs non-conviction + publishing NFT transfer ─
 section "E. PUBLISHING PATHS — conviction discount vs non-conviction + publishing-NFT transfer surface"
 PUB_NFT_ABI="$REPO_ROOT/packages/evm-module/abi/DKGPublishingConvictionNFT.json"
@@ -700,37 +740,44 @@ section "J. MCP SERVER — tools/list + representative tool calls over stdio"
 MCP_OUT="$RESULTS/mcp.jsonl"
 if [ -f "$CLI_JS" ]; then
   python3 - "$CLI_JS" "$DEVNET_DIR/node1" "$MCP_OUT" <<'PY' >> "$LOG" 2>&1 || true
-import subprocess, json, sys, os, time
+import subprocess, json, sys, os, time, select
 cli, home, out = sys.argv[1], sys.argv[2], sys.argv[3]
 env=dict(os.environ); env["DKG_HOME"]=home
+# MCP SDK stdio transport is newline-delimited JSON-RPC (see @modelcontextprotocol/sdk shared/stdio.js).
 p=subprocess.Popen(["node",cli,"mcp","serve"],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,env=env,text=True,bufsize=1)
 def send(o):
     p.stdin.write(json.dumps(o)+"\n"); p.stdin.flush()
-def recv(timeout=15):
-    # naive read of one json line
-    p.stdout.readline  # noqa
-    import select
-    r,_,_=select.select([p.stdout],[],[],timeout)
-    if r: return p.stdout.readline()
-    return ""
+def recv_id(req_id, timeout=25):
+    deadline=time.time()+timeout
+    while time.time()<deadline:
+        rem=max(0.05, deadline-time.time())
+        r,_,_=select.select([p.stdout],[],[],rem)
+        if not r:
+            continue
+        line=p.stdout.readline()
+        if not line.strip():
+            continue
+        try:
+            d=json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if d.get("id")==req_id:
+            return d
+    return None
 results=[]
 try:
     send({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"rc12-val","version":"1"}}})
-    time.sleep(1); recv()
+    init=recv_id(1,30)
     send({"jsonrpc":"2.0","method":"notifications/initialized"})
     send({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}})
-    line=recv(20)
+    listed=recv_id(2,30)
     tools=[]
-    try:
-        d=json.loads(line); tools=[t["name"] for t in d.get("result",{}).get("tools",[])]
-    except Exception: pass
+    if listed:
+        tools=[t["name"] for t in listed.get("result",{}).get("tools",[])]
     results.append({"tools_count":len(tools),"tools":tools[:60]})
-    # call dkg_status
     send({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"dkg_status","arguments":{}}})
-    line=recv(20)
-    ok=False
-    try: ok = "result" in json.loads(line)
-    except Exception: ok=False
+    called=recv_id(3,30)
+    ok=bool(called and "result" in called)
     results.append({"dkg_status_ok":ok})
 finally:
     open(out,"w").write("\n".join(json.dumps(r) for r in results))
@@ -740,10 +787,11 @@ PY
   TOOLS_N=$(python3 -c "import json;[print(json.loads(l).get('tools_count',0)) for l in open('$MCP_OUT')][0] if __import__('os').path.exists('$MCP_OUT') else print(0)" 2>/dev/null | head -1 || echo 0)
   [ -z "$TOOLS_N" ] && TOOLS_N=0
   if [ "$TOOLS_N" -ge 10 ] 2>/dev/null; then
-    pass J mcp-tools "MCP exposed $TOOLS_N tools via stdio"
-    grep -q '"dkg_status_ok": true' "$MCP_OUT" 2>/dev/null && pass J mcp-call "dkg_status tool call returned a result" || warn J mcp-call "dkg_status call inconclusive"
+    pass J mcp-tools "MCP exposed $TOOLS_N tools via stdio (newline JSON-RPC)"
+    grep -q '"dkg_status_ok": true' "$MCP_OUT" 2>/dev/null && pass J mcp-call "dkg_status tool call returned a result" \
+      || fail J mcp-call "dkg_status tools/call did not return result (see $MCP_OUT)"
   else
-    warn J mcp-tools "MCP tools/list returned $TOOLS_N tools (stdio handshake may need tuning); daemon HTTP surface (which MCP wraps) validated in A-I"
+    fail J mcp-tools "MCP tools/list returned $TOOLS_N tools (expected >=10; see $MCP_OUT)"
   fi
 else
   warn J mcp "cli.js missing"
@@ -789,7 +837,7 @@ if [ "$TOT_SUB" -eq 0 ]; then
 elif [ "$RS_PCT" -ge "$RS_MIN_SUCCESS_PCT" ]; then
   pass C rs-success "RS success rate ${RS_PCT}% (>= ${RS_MIN_SUCCESS_PCT}%, submitted=$TOT_SUB)"
 else
-  warn C rs-success "RS success rate ${RS_PCT}% (< ${RS_MIN_SUCCESS_PCT}%, submitted=$TOT_SUB attempted=$TOT_ATT)"
+  fail C rs-success "RS success rate ${RS_PCT}% (< ${RS_MIN_SUCCESS_PCT}%, submitted=$TOT_SUB attempted=$TOT_ATT)"
 fi
 
 # ── Section G: prolonged inter-node messaging ────────────────────────────────
@@ -830,6 +878,7 @@ VERDICT="PASS"
 [ "$KA_OK" -lt "$TARGET_KAS" ] && VERDICT="PARTIAL"
 [ "$CGS_WITH_KA" -lt "$TARGET_CGS" ] && VERDICT="PARTIAL"
 { [ "$TOT_SUB" -gt 0 ] && [ "$RS_PCT" -lt "$RS_MIN_SUCCESS_PCT" ]; } && VERDICT="PARTIAL"
+{ [ "${EMIN:-0}" -lt "$MIN_ENTITIES" ] || [ "${EMAX:-0}" -gt "$MAX_ENTITIES" ]; } 2>/dev/null && VERDICT="PARTIAL"
 [ "$F" -gt 0 ] && VERDICT="FAIL"
 
 MD="$RESULTS/REPORT.md"

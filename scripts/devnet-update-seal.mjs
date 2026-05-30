@@ -98,12 +98,17 @@ async function main() {
 
   const deployment = JSON.parse(fs.readFileSync(CONTRACTS_JSON, 'utf8'));
   const map = deployment.contracts || deployment;
+  // EIP-712 UpdateAuthorAttestation domain uses the lifecycle logic contract only.
+  // DKGKnowledgeAssets is the ERC-721 storage layer — wrong verifyingContract.
   const kav10 =
     map.KnowledgeAssetsLifecycle?.evmAddress ||
-    map.DKGKnowledgeAssets?.evmAddress ||
     map.KnowledgeAssetsV10?.evmAddress;
   if (!kav10) {
-    out({ ok: false, error: 'KnowledgeAssets V10 contract not in deployment map' });
+    out({
+      ok: false,
+      error:
+        'KnowledgeAssetsLifecycle or KnowledgeAssetsV10 not in deployment map (required for update seals)',
+    });
     process.exit(1);
   }
 

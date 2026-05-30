@@ -116,6 +116,11 @@ METRICS_JSONL="$RESULTS/metrics.jsonl"
 log()  { echo "[rc12-val $(date -u +'%H:%M:%S')] $*" | tee -a "$LOG"; }
 section() { echo "" | tee -a "$LOG"; echo "━━━━━━━━━━ $* ━━━━━━━━━━" | tee -a "$LOG"; }
 
+# Portable UTC ISO-8601 from unix epoch (GNU date lacks BSD's `date -r`).
+iso_from_epoch() {
+  python3 -c "import datetime,sys; print(datetime.datetime.utcfromtimestamp(int(sys.argv[1])).strftime('%Y-%m-%dT%H:%M:%SZ'))" "$1"
+}
+
 # Per-check accounting. Each check records a line into checks.tsv:
 #   <section>\t<name>\t<PASS|WARN|FAIL>\t<detail>
 CHECKS_TSV="$RESULTS/checks.tsv"
@@ -218,9 +223,11 @@ create_curated_cg() { # node id allowedAgentsCSV
 }
 
 CG_CREATED=0
+# Non-public slots: 2 edge-curated CGs + 1 invite-flow CG. Must match loops below.
+NUM_NON_PUBLIC=3
+NUM_PUBLIC=$(( TARGET_CGS - NUM_NON_PUBLIC ))
+[ "$NUM_PUBLIC" -lt 1 ] && NUM_PUBLIC=1
 # Public CGs: spread creation across all 6 nodes (cores AND edges).
-NUM_PUBLIC=$(( TARGET_CGS - 4 ))   # reserve 4 for curated
-[ "$NUM_PUBLIC" -lt 6 ] && NUM_PUBLIC=6
 for i in $(seq 1 "$NUM_PUBLIC"); do
   node=$(( (i - 1) % NUM_NODES + 1 ))
   cgid="rc12-pub-${RUN_TAG}-${i}"
@@ -829,8 +836,8 @@ MD="$RESULTS/REPORT.md"
 {
   echo "# rc.12 release validation — comprehensive devnet report"
   echo
-  echo "- Started: $(date -u -r "$START_EPOCH" +'%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u +%FT%TZ)"
-  echo "- Ended:   $(date -u -r "$END_EPOCH" +'%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u +%FT%TZ)"
+  echo "- Started: $(iso_from_epoch "$START_EPOCH")"
+  echo "- Ended:   $(iso_from_epoch "$END_EPOCH")"
   echo "- Wall:    ${WALL}s (~$((WALL/60))m)"
   echo "- Branch:  $(cd "$REPO_ROOT" && git rev-parse --abbrev-ref HEAD) @ $(cd "$REPO_ROOT" && git rev-parse --short HEAD)"
   echo "- Topology: $NUM_NODES nodes ($NUM_CORE_NODES core / $((NUM_NODES-NUM_CORE_NODES)) edge)"
@@ -891,5 +898,9 @@ log "VERDICT: $VERDICT | KAs=$KA_OK/$TARGET_KAS CGs=$CGS_WITH_KA/$TARGET_CGS RS=
 log "Report: $MD"
 log "════════════════════════════════════════════════"
 
-[ "$VERDICT" = "FAIL" ] && exit 1
-exit 0
+# Hard metric gates (KAs, CGs, RS) downgrade to PARTIAL; operational FAILs win.
+# Both FAIL and PARTIAL must exit non-zero so CI does not treat under-target runs as green.
+case "$VERDICT" in
+  FAIL|PARTIAL) exit 1 ;;
+  *) exit 0 ;;
+esac

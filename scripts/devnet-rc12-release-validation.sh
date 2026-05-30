@@ -380,7 +380,7 @@ publish_one() { # idx node cgid kind
         -d "{\"contextGraphId\":\"$cgid\",\"selection\":{\"rootEntities\":[\"$root\"]}}")
     st=$(echo "$p" | pyf "d.get('status','')")
     kc=$(echo "$p" | pyf "d.get('kcId','')")
-    if [ "$st" = "confirmed" ] || [ "$st" = "finalized" ] || { [ -n "$kc" ] && [ "$kc" != "?" ]; }; then
+    if [ "$st" = "confirmed" ] || [ "$st" = "finalized" ]; then
       printf '{"idx":"%s","node":%d,"cg":"%s","kind":"%s","entities":%d,"ok":true,"kcId":"%s","status":"%s","root":"%s"}\n' \
         "$idx" "$node" "$cgid" "$kind" "$E" "$kc" "$st" "$root" >> "$METRICS_JSONL"
       return 0
@@ -533,14 +533,14 @@ for l in sys.stdin:
 if [ -n "$SROOT" ]; then
   sn=$(echo "$SROOT"|awk '{print $1}'); sc=$(echo "$SROOT"|awk '{print $2}'); sr=$(echo "$SROOT"|awk '{print $3}')
   sp="${NODE_PORT[$((sn-1))]}"
-  vm=$(post "$sp" /api/query -d "{\"sparql\":\"SELECT ?p WHERE { <$sr> ?p ?o } LIMIT 1\",\"contextGraphId\":\"$sc\",\"view\":\"verified-memory\"}")
+  vm=$(post "$sp" /api/query -d "{\"sparql\":\"SELECT ?p WHERE { GRAPH ?g { <$sr> ?p ?o } FILTER(CONTAINS(STR(?g),\\\"$sc\\\")) } LIMIT 1\",\"contextGraphId\":\"$sc\",\"view\":\"verified-memory\"}")
   vmb=$(echo "$vm" | pyf "len(d.get('result',{}).get('bindings',[]))")
   [ "${vmb:-0}" -gt 0 ] && pass A vm-view "published KA visible in verified-memory view" || warn A vm-view "KA not in VM view yet (got $vm | first 120: ${vm:0:120})"
   # peer replication: query another node
   pn=$(( sn % NUM_NODES + 1 )); pp="${NODE_PORT[$((pn-1))]}"
   found=0
   for _ in $(seq 1 20); do
-    rep=$(post "$pp" /api/query -d "{\"sparql\":\"SELECT ?p WHERE { <$sr> ?p ?o } LIMIT 1\",\"contextGraphId\":\"$sc\"}")
+    rep=$(post "$pp" /api/query -d "{\"sparql\":\"SELECT ?p WHERE { GRAPH ?g { <$sr> ?p ?o } FILTER(CONTAINS(STR(?g),\\\"$sc\\\")) } LIMIT 1\",\"contextGraphId\":\"$sc\"}")
     [ "$(echo "$rep" | pyf "len(d.get('result',{}).get('bindings',[]))")" -gt 0 ] 2>/dev/null && { found=1; break; }
     sleep 3
   done
@@ -554,6 +554,7 @@ section "F. PROTOCOL TREASURY FEE — set treasury + fee, publish, assert balanc
 OWNER_KEY="0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"   # hardhat acct[0] (Hub owner)
 TREASURY_ADDR="0x000000000000000000000000000000000000dEaD"
 cur_treasury=$($CHAIN_CALL ParametersStorage protocolTreasury | pyf "d.get('result','')")
+cur_fee=$($CHAIN_CALL ParametersStorage protocolTreasuryFee | pyf "d.get('result','0')")
 set_t=$($CHAIN_CALL ParametersStorage setProtocolTreasury --key "$OWNER_KEY" --json "[\"$TREASURY_ADDR\"]")
 set_f=$($CHAIN_CALL ParametersStorage setProtocolTreasuryFee --key "$OWNER_KEY" --json "[500]")   # 5%
 ok_t=$(echo "$set_t" | pyf "d.get('ok',False)"); ok_f=$(echo "$set_f" | pyf "d.get('ok',False)")
@@ -580,6 +581,7 @@ if [ "$ok_t" = "True" ] && [ "$ok_f" = "True" ]; then
   fi
   # Restore prior treasury config (best-effort).
   [ -n "$cur_treasury" ] && $CHAIN_CALL ParametersStorage setProtocolTreasury --key "$OWNER_KEY" --json "[\"$cur_treasury\"]" >/dev/null 2>&1 || true
+  [ -n "$cur_fee" ] && $CHAIN_CALL ParametersStorage setProtocolTreasuryFee --key "$OWNER_KEY" --json "[\"$cur_fee\"]" >/dev/null 2>&1 || true
 else
   warn F treasury-config "could not set treasury params (t=$set_t f=$set_f)"
 fi

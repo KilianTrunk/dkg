@@ -90,10 +90,25 @@ async function main() {
   }
   const abi = JSON.parse(fs.readFileSync(abiPath, 'utf8'));
 
-  // Verify the method exists in the ABI so callers can branch on "unsupported".
-  const hasMethod = abi.some((f) => f.type === 'function' && f.name === method);
-  if (!hasMethod) {
+  const iface = new ethers.Interface(abi);
+  const sameName = abi.filter((f) => f.type === 'function' && f.name === method);
+  if (sameName.length === 0) {
     out({ ok: false, error: `method ${method} not in ${contractName} ABI`, unsupported: true });
+    process.exit(3);
+  }
+  // Disambiguate overloaded selectors (e.g. ERC721 safeTransferFrom 3-arg vs 4-arg).
+  let fragment;
+  const byArity = sameName.filter((f) => f.inputs.length === args.length);
+  if (byArity.length === 1) {
+    fragment = iface.getFunction(byArity[0].name, byArity[0].inputs.map((i) => i.type));
+  } else if (sameName.length === 1) {
+    fragment = iface.getFunction(method);
+  } else {
+    out({
+      ok: false,
+      error: `ambiguous method ${method} for ${args.length} args; pass --sig 'name(type,...)'`,
+      unsupported: true,
+    });
     process.exit(3);
   }
 
@@ -101,12 +116,13 @@ async function main() {
   const c = new ethers.Contract(addr, abi, signerOrProvider);
 
   try {
+    const fn = c.getFunction(fragment.format());
     if (key) {
-      const tx = await c[method](...args);
+      const tx = await fn(...args);
       const receipt = await tx.wait();
       out({ ok: true, txHash: tx.hash, status: receipt.status, address: addr });
     } else {
-      const res = await c[method](...args);
+      const res = await fn(...args);
       out({ ok: true, result: res, address: addr });
     }
   } catch (e) {

@@ -1,4 +1,5 @@
 import { existsSync, readFileSync } from 'node:fs';
+import { execSync } from 'node:child_process';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
@@ -41,7 +42,16 @@ export function readDevnetNode(num = 1): DevnetNodeConfig | null {
 }
 
 export function isDevnetAvailable(num = 1): boolean {
-  return readDevnetNode(num) !== null;
+  const node = readDevnetNode(num);
+  if (!node) return false;
+  try {
+    execSync(`curl -sf --max-time 2 http://127.0.0.1:${node.apiPort}/api/status -o /dev/null`, {
+      stdio: 'ignore',
+    });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export async function devnetApiFetch(

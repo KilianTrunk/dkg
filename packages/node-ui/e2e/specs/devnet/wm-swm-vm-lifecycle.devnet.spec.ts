@@ -18,7 +18,7 @@ import {
 
 test.describe.configure({ mode: 'serial' });
 
-const run: { cgId?: string; cgName?: string; label?: string; assertionName?: string } = {};
+const run: { cgId?: string; cgName?: string; label?: string; assertionName?: string; kcId?: string } = {};
 
 test.beforeAll(async () => {
   test.skip(!isDevnetAvailable(1), 'Devnet node1 not running');
@@ -61,6 +61,7 @@ test.describe('WM → SWM → VM API pipeline', () => {
     expect(result.assertionName).toBeTruthy();
     run.label = result.label;
     run.assertionName = result.assertionName;
+    run.kcId = result.kcId;
     if (result.kcId) {
       expect(BigInt(result.kcId)).toBeGreaterThan(0n);
     }
@@ -75,12 +76,7 @@ test.describe('WM → SWM → VM UI verification', () => {
     await page.locator('[data-layer="vm"]').click();
     await page.getByRole('button', { name: 'Refresh Context Graph data' }).click();
     await page.waitForTimeout(3000);
-    const visible = await page.getByText(run.label!, { exact: false }).isVisible().catch(() => false);
-    if (!visible) {
-      await expect(page.locator('.v10-me-error')).toBeHidden();
-    } else {
-      await expect(page.getByText(run.label!, { exact: false })).toBeVisible();
-    }
+    await expect(page.getByText(run.label!, { exact: false })).toBeVisible({ timeout: 15_000 });
   });
 
   test('operations view loads after publish activity', async ({ shell, header, page }) => {
@@ -92,17 +88,16 @@ test.describe('WM → SWM → VM UI verification', () => {
 
 test.describe('KA update (devnet API)', () => {
   test('update endpoint accepts quads when kcId exists from pipeline', async () => {
-    test.skip(!run.cgId || !run.label, 'No pipeline artifact');
-    const cgs = await listContextGraphs(1);
+    test.skip(!run.cgId || !run.kcId, 'Pipeline did not produce a kcId');
     const stamp = Date.now();
     const res = await devnetApiFetch('/api/update', {
       method: 'POST',
       body: JSON.stringify({
         contextGraphId: run.cgId,
+        kcId: run.kcId,
         quads: buildTestQuads(run.cgId!, stamp, `Updated ${stamp}`),
       }),
     });
-    // Update without kcId/precomputed attestation may 400 — assert daemon responds structurally.
-    expect([200, 400, 422]).toContain(res.status);
+    expect(res.ok).toBe(true);
   });
 });

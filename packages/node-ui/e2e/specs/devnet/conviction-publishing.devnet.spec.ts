@@ -38,7 +38,7 @@ test.describe('Non-conviction publishing (baseline)', () => {
     const cgsRes = await devnetApiFetch('/api/context-graphs');
     const { contextGraphs } = (await cgsRes.json()) as { contextGraphs: Array<{ id: string }> };
     test.skip(contextGraphs.length === 0, 'No CGs');
-    const { createWmAssertion, promoteAssertion, buildTestQuads } = await import('../../helpers/devnet-publish.js');
+    const { createWmAssertion, promoteAssertion, publishToVm, buildTestQuads } = await import('../../helpers/devnet-publish.js');
     const cgId = contextGraphs[0]!.id;
     const stamp = Date.now();
     const name = `e2e-non-conviction-${stamp}`;
@@ -50,5 +50,7 @@ test.describe('Non-conviction publishing (baseline)', () => {
     expect(wm.ok).toBe(true);
     const promote = await promoteAssertion({ contextGraphId: cgId, assertionName: name });
     expect(promote.ok).toBe(true);
+    const published = await publishToVm({ contextGraphId: cgId, assertionName: name, clearAfter: true });
+    expect(published.status).toBeTruthy();
   });
 });

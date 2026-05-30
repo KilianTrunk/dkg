@@ -24,7 +24,8 @@ test.describe('CG variants — edge and core nodes', () => {
     await waitForDevnetStatus(2);
     const n1 = await listContextGraphs(1);
     const n2 = await listContextGraphs(2);
-    expect(n1.length + n2.length).toBeGreaterThan(0);
+    expect(n1.length).toBeGreaterThan(0);
+    expect(n2.length).toBeGreaterThan(0);
   });
 
   test('edge node (node5) can create WM assertion when available', async () => {

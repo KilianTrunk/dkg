@@ -54,7 +54,7 @@ export class LeftPanelPage {
   }
 
   async clickNewProject() {
-    await this.newProjectBtn.first().click();
+    await this.newProjectBtn.filter({ hasText: '+ New Context Graph' }).click();
   }
 
   async waitForProjectsLoaded() {

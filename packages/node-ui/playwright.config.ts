@@ -36,6 +36,7 @@ export default defineConfig({
       use: { ...devices['Desktop Chrome'] },
       testMatch: ['**/devnet/**', '**/*.devnet.spec.ts'],
       timeout: CI ? 120_000 : 60_000,
+      fullyParallel: false,
     },
   ],
 
@@ -47,7 +48,8 @@ export default defineConfig({
       : 'cross-env DEVNET_NODE= UI_NODE_ID= pnpm dev:ui',
     cwd: __dirname,
     port: PORT,
-    reuseExistingServer: !CI,
+    // Never reuse across mock↔devnet switches; devnet must not inherit a mock-mode server.
+    reuseExistingServer: false,
     timeout: CI ? 60_000 : 30_000,
   },
 });

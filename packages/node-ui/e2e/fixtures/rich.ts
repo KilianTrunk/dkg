@@ -1,5 +1,4 @@
 import { test as base, expect } from './base.js';
-import { installRichMemoryRoutes } from '../helpers/rich-mock-routes.js';
 import { SubGraphBarPage, StatStripPage } from '../pages/subgraph-bar.po.js';
 import { ShareProjectModal } from '../pages/modals/share-project.po.js';
 import { ProjectLayerPage } from '../pages/project-layer.po.js';
@@ -9,18 +8,9 @@ type RichFixtures = {
   statStrip: StatStripPage;
   shareProjectModal: ShareProjectModal;
   projectLayer: ProjectLayerPage;
-  seedRichMock: void;
 };
 
 export const test = base.extend<RichFixtures>({
-  seedRichMock: [
-    async ({ page }, use) => {
-      await installRichMemoryRoutes(page, { allContextGraphs: true });
-      await use();
-    },
-    { auto: true },
-  ],
-
   subgraphBar: async ({ page }, use) => {
     await use(new SubGraphBarPage(page));
   },

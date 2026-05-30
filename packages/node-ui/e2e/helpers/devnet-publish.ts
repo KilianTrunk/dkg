@@ -77,6 +77,7 @@ export async function publishToVm(opts: {
   contextGraphId: string;
   assertionName: string;
   nodeNum?: number;
+  clearAfter?: boolean;
 }): Promise<{ status?: string; kcId?: string; txHash?: string }> {
   const res = await devnetApiFetch('/api/shared-memory/publish', {
     method: 'POST',
@@ -84,7 +85,7 @@ export async function publishToVm(opts: {
     body: JSON.stringify({
       contextGraphId: opts.contextGraphId,
       assertionName: opts.assertionName,
-      clearAfter: true,
+      clearAfter: opts.clearAfter ?? false,
     }),
   });
   if (!res.ok) {

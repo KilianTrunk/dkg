@@ -31,10 +31,15 @@ vi.mock('@origintrail-official/dkg-graph-viz/react', async () => {
       // Surface the nodeColors style override so #3 polish tests
       // can assert per-URI trust-color plumbing without reaching
       // into the canvas internals.
+      // PR #818 sweep 2 — also surface the data length via
+      // `data-triple-count` so MAX_PER_CARD cap tests can assert
+      // the rendered slice length directly (would have caught
+      // the single-dominant-subject cap defect).
       const nodeColors = props.options?.style?.nodeColors ?? {};
       return React.createElement('div', {
         'data-testid': 'rdf-graph',
         'data-node-colors': JSON.stringify(nodeColors),
+        'data-triple-count': String(props.data?.length ?? 0),
       });
     },
   };
@@ -76,6 +81,27 @@ const memory = {
   layerStatus: { wm: 'ok' as const, swm: 'ok' as const, vm: 'ok' as const },
   refresh: vi.fn(),
 } as any;
+
+// RdfGraph is React.lazy'd — pump microtasks until the Suspense
+// boundary resolves and the stub renders. Sweep 1 cap tests
+// asserted against a transient Suspense fallback that shares the
+// empty-branch class; tighten by waiting for the actual graph
+// element before reading `data-triple-count`. Optional `scope`
+// restricts the lookup (e.g. to a specific card element).
+async function waitForGraph(
+  container: Element,
+  options?: { scope?: Element; maxMs?: number },
+): Promise<HTMLElement | null> {
+  const root = options?.scope ?? container;
+  const maxMs = options?.maxMs ?? 1000;
+  const start = Date.now();
+  while (Date.now() - start < maxMs) {
+    const el = root.querySelector('[data-testid="rdf-graph"]') as HTMLElement | null;
+    if (el) return el;
+    await act(async () => { await new Promise((r) => setTimeout(r, 0)); });
+  }
+  return root.querySelector('[data-testid="rdf-graph"]');
+}
 
 async function flush(): Promise<void> {
   // Two microtask drains — one for the promise the effect kicks
@@ -319,15 +345,17 @@ describe('SubGraphOverviewGrid — header subtitle anchors (PR #793 round 4.1, G
       ],
     });
     const triples = [
-      // alpha sub-graph triples
-      { subject: 'urn:e:a1', predicate: 'p', object: 'o1', subGraph: 'alpha' },
-      { subject: 'urn:e:a2', predicate: 'p', object: 'o2', subGraph: 'alpha' },
+      // alpha sub-graph triples. GH #805 — fixture now tags
+      // `layer: 'working'` so the `useLayerTriples` sum
+      // (which the subtitle now reads) admits them.
+      { subject: 'urn:e:a1', predicate: 'p', object: 'o1', subGraph: 'alpha', layer: 'working' },
+      { subject: 'urn:e:a2', predicate: 'p', object: 'o2', subGraph: 'alpha', layer: 'working' },
       // beta sub-graph triples
-      { subject: 'urn:e:b1', predicate: 'p', object: 'o3', subGraph: 'beta' },
-      { subject: 'urn:e:b2', predicate: 'p', object: 'o4', subGraph: 'beta' },
+      { subject: 'urn:e:b1', predicate: 'p', object: 'o3', subGraph: 'beta', layer: 'working' },
+      { subject: 'urn:e:b2', predicate: 'p', object: 'o4', subGraph: 'beta', layer: 'working' },
       // a root-bucket triple (no sub-graph origin) — counted by the
       // hook total but never reaches a card aggregate.
-      { subject: 'urn:e:root', predicate: 'p', object: 'o5' },
+      { subject: 'urn:e:root', predicate: 'p', object: 'o5', layer: 'working' },
     ];
     const entityList = [
       { uri: 'urn:e:a1', label: 'a1', types: [], trustLevel: 'working', layers: new Set(['working']), subGraphs: new Set(['alpha']), properties: new Map(), connections: [] },
@@ -349,7 +377,10 @@ describe('SubGraphOverviewGrid — header subtitle anchors (PR #793 round 4.1, G
 
     const sub = container.querySelector('.v10-sgov-sub');
     expect(sub).toBeTruthy();
-    expect(sub!.textContent).toContain('2 subgraphs');
+    // PR #818 sweep 2 — subtitle label is "named subgraphs" so
+    // it's honest about the count's scope (Root is a peer-but-
+    // different surface in the grid).
+    expect(sub!.textContent).toContain('2 named subgraphs');
     expect(sub!.textContent).toContain('5 entities');
     expect(sub!.textContent).toContain('5 triples');
   });
@@ -376,13 +407,15 @@ describe('SubGraphOverviewGrid — header subtitle anchors (PR #793 round 4.1, G
       { uri: 'urn:e:cross', label: 'c', types: [], trustLevel: 'working', layers: new Set(['working']), subGraphs: new Set(['alpha', 'beta']), properties: new Map(), connections: [] },
     ];
     const triples = [
-      // 4 raw triple rows even though the cross-graph SPO duplicate
-      // means distinct triples are fewer — exactly the GH #805
-      // family the subtitle now defers to.
-      { subject: 'urn:e:alpha-only', predicate: 'p', object: 'o', subGraph: 'alpha' },
-      { subject: 'urn:e:beta-only', predicate: 'p', object: 'o', subGraph: 'beta' },
-      { subject: 'urn:e:cross', predicate: 'p', object: 'o', subGraph: 'alpha' },
-      { subject: 'urn:e:cross', predicate: 'p', object: 'o', subGraph: 'beta' },
+      // 4 raw triple rows; the (urn:e:cross, p, o) SPO appears in
+      // both alpha and beta named graphs — exactly the SWM
+      // cross-graph duplication GH #805 fixes. After
+      // `useLayerTriples` SPO-dedup the layer slice carries 3
+      // distinct triples, not 4.
+      { subject: 'urn:e:alpha-only', predicate: 'p', object: 'o', subGraph: 'alpha', layer: 'working' },
+      { subject: 'urn:e:beta-only', predicate: 'p', object: 'o', subGraph: 'beta', layer: 'working' },
+      { subject: 'urn:e:cross', predicate: 'p', object: 'o', subGraph: 'alpha', layer: 'working' },
+      { subject: 'urn:e:cross', predicate: 'p', object: 'o', subGraph: 'beta', layer: 'working' },
     ];
     await renderWith({
       ...memory,
@@ -398,9 +431,988 @@ describe('SubGraphOverviewGrid — header subtitle anchors (PR #793 round 4.1, G
     // Subtitle anchors to hook total (3), NOT sum-of-cards (4).
     expect(sub!.textContent).toContain('3 entities');
     expect(sub!.textContent).not.toContain('4 entities');
-    // Subtitle anchors to allTriples.length (4), matching what the
-    // SubGraphBar `All` chip tooltip surfaces.
-    expect(sub!.textContent).toContain('4 triples');
+    // Subtitle triples now sums `useLayerTriples` per layer
+    // (GH #805): the (urn:e:cross, p, o) SPO row that appeared
+    // in both alpha and beta named graphs collapses to 1 after
+    // canonical-SPO dedup, so the 4 raw rows project down to 3
+    // distinct triples in the WM layer slice.
+    expect(sub!.textContent).toContain('3 triples');
+    // The raw `allTriples.length` (4) must NOT appear — that's
+    // the bug GH #805 fixed.
+    expect(sub!.textContent).not.toContain('4 triples');
+  });
+
+  it('subtitle drops WM residue triples whose subject has been promoted to SWM (GH #805 layer-correctness)', async () => {
+    // The other half of GH #805 — WM residue. The daemon leaves
+    // `/assertion/<addr>/<name>` graphs on disk after promote, so a
+    // promoted entity's WM-origin triples keep coming back from
+    // `wmSparql`. The entity's canonical `trustLevel` has moved to
+    // `shared`, so `useLayerTriples('wm')` drops those residue
+    // rows. Pre-#805 `allTriples.length` counted them and the
+    // subtitle disagreed with the per-layer LayerStats.
+    fetchSubGraphsMock.mockResolvedValueOnce({
+      subGraphs: [{ name: 'alpha', entityCount: 1, tripleCount: 0, description: '' }],
+    });
+    const entityList = [
+      // 1 alpha entity, canonical layer SWM (promoted out of WM).
+      { uri: 'urn:e:promoted', label: 'p', types: [], trustLevel: 'shared', layers: new Set(['working', 'shared']), subGraphs: new Set(['alpha']), properties: new Map(), connections: [] },
+    ];
+    const triples = [
+      // Honest SWM triple — kept.
+      { subject: 'urn:e:promoted', predicate: 'p', object: 'o-swm', layer: 'shared' },
+      // WM residue — same subject, but its canonical trustLevel is
+      // 'shared', so `useLayerTriples('wm')` drops this row.
+      // Pre-#805 it would have inflated the subtitle by 1.
+      { subject: 'urn:e:promoted', predicate: 'p', object: 'o-wm-residue', layer: 'working' },
+    ];
+    await renderWith({
+      ...memory,
+      entities: new Map(entityList.map(e => [e.uri, e])),
+      entityList,
+      allTriples: triples,
+      counts: { wm: 0, swm: 1, vm: 0, total: 1 },
+    });
+    await flush();
+
+    const sub = container.querySelector('.v10-sgov-sub');
+    expect(sub).toBeTruthy();
+    // Only the honest SWM triple survives — WM residue dropped by
+    // the per-layer trustLevel filter.
+    expect(sub!.textContent).toContain('1 triples');
+    // Pre-#805 raw `allTriples.length` would have shown 2.
+    expect(sub!.textContent).not.toContain('2 triples');
+  });
+});
+
+describe('SubGraphOverviewGrid — Root mini-card (GH #813)', () => {
+  // The Root mini-card mirrors SubGraphBar's Root chip on the
+  // overview surface. Synthesizes a card for the bucket of
+  // entities not in any named sub-graph; rendered LAST in the
+  // grid (mirrors the Root chip's rightmost chip-row position);
+  // carries the dashed-border `.root` chrome modifier so it
+  // reads as a synthesized bucket vs daemon-emitted cards.
+  let root: Root;
+  let container: HTMLDivElement;
+
+  // Profile fixture that mirrors useProjectProfile's
+  // ROOT_SUBGRAPH_BINDING short-circuit at `:622` so the Root card
+  // resolves to the same `⊘` / `Root` identity production renders.
+  const rootAwareProfile = {
+    ...profile,
+    forSubGraph: (slug: string) => {
+      if (slug === '__root__') {
+        return { slug: '__root__', displayName: 'Root', description: 'Entities not in any subgraph (Context Graph root)', icon: '⊘', rank: 999 };
+      }
+      return { slug, displayName: slug, color: '#38bdf8', icon: '#', rank: 0 };
+    },
+  } as any;
+
+  beforeEach(() => {
+    container = document.createElement('div');
+    document.body.appendChild(container);
+    root = createRoot(container);
+    fetchSubGraphsMock.mockReset();
+  });
+
+  afterEach(() => {
+    act(() => root.unmount());
+    container.remove();
+  });
+
+  function renderWith(memoryOverride: any) {
+    return act(async () => {
+      root.render(
+        React.createElement(ProjectProfileContext.Provider, { value: rootAwareProfile },
+          React.createElement(SubGraphOverviewGrid, {
+            contextGraphId: 'cg-test',
+            memory: memoryOverride,
+            onNodeClick: vi.fn(),
+            onSelectSubGraph: vi.fn(),
+          })),
+      );
+    });
+  }
+
+  it('renders a Root mini-card with the dashed `.root` chrome modifier', async () => {
+    fetchSubGraphsMock.mockResolvedValueOnce({
+      subGraphs: [{ name: 'alpha', entityCount: 1, tripleCount: 0, description: '' }],
+    });
+    const entityList = [
+      // 1 entity in a named sub-graph (alpha) + 1 root-bucket entity.
+      { uri: 'urn:e:alpha', label: 'a', types: [], trustLevel: 'working', layers: new Set(['working']), subGraphs: new Set(['alpha']), properties: new Map(), connections: [] },
+      { uri: 'urn:e:root', label: 'r', types: [], trustLevel: 'working', layers: new Set(['working']), subGraphs: new Set<string>(), properties: new Map(), connections: [] },
+    ];
+    await renderWith({
+      ...memory,
+      entities: new Map(entityList.map(e => [e.uri, e])),
+      entityList,
+      allTriples: [],
+      counts: { wm: 2, swm: 0, vm: 0, total: 2 },
+    });
+    await flush();
+
+    const cards = container.querySelectorAll('.v10-sgov-card');
+    // 1 named card + 1 Root card = 2 cards rendered.
+    expect(cards.length).toBe(2);
+    // Root card is LAST (mirrors chip-row position).
+    const rootCardEl = cards[cards.length - 1];
+    expect(rootCardEl.classList.contains('root')).toBe(true);
+    // Root card renders the canonical `Root` identity (icon + label).
+    expect(rootCardEl.querySelector('.v10-sgov-card-title')?.textContent).toBe('Root');
+    expect(rootCardEl.querySelector('.v10-sgov-card-icon')?.textContent).toBe('⊘');
+    // Stats reflect the 1 root-bucket entity.
+    const stats = rootCardEl.querySelector('.v10-sgov-card-stats')?.textContent ?? '';
+    expect(stats).toContain('1');
+    expect(stats).toContain('entities');
+  });
+
+  it('renders the Root mini-card even at 0 root entities (consistency with named-card empty branch)', async () => {
+    fetchSubGraphsMock.mockResolvedValueOnce({
+      subGraphs: [{ name: 'alpha', entityCount: 1, tripleCount: 0, description: '' }],
+    });
+    const entityList = [
+      // Every entity belongs to a named sub-graph — root bucket is
+      // empty. Per option (b) the card still renders, matching how
+      // named subgraphs with 0 entities render the empty branch.
+      { uri: 'urn:e:alpha', label: 'a', types: [], trustLevel: 'working', layers: new Set(['working']), subGraphs: new Set(['alpha']), properties: new Map(), connections: [] },
+    ];
+    await renderWith({
+      ...memory,
+      entities: new Map(entityList.map(e => [e.uri, e])),
+      entityList,
+      allTriples: [],
+      counts: { wm: 1, swm: 0, vm: 0, total: 1 },
+    });
+    await flush();
+
+    const cards = container.querySelectorAll('.v10-sgov-card');
+    expect(cards.length).toBe(2);
+    const rootCardEl = cards[cards.length - 1];
+    expect(rootCardEl.classList.contains('root')).toBe(true);
+    // Empty branch literal — same one named cards use.
+    expect(rootCardEl.querySelector('.v10-sgov-card-empty')?.textContent).toBe('No data yet');
+  });
+
+  it('Root card open button calls onSelectSubGraph with ROOT_SLUG_SENTINEL', async () => {
+    fetchSubGraphsMock.mockResolvedValueOnce({
+      subGraphs: [{ name: 'alpha', entityCount: 1, tripleCount: 0, description: '' }],
+    });
+    const entityList = [
+      { uri: 'urn:e:alpha', label: 'a', types: [], trustLevel: 'working', layers: new Set(['working']), subGraphs: new Set(['alpha']), properties: new Map(), connections: [] },
+      { uri: 'urn:e:root', label: 'r', types: [], trustLevel: 'working', layers: new Set(['working']), subGraphs: new Set<string>(), properties: new Map(), connections: [] },
+    ];
+    const onSelectSubGraph = vi.fn();
+    await act(async () => {
+      root.render(
+        React.createElement(ProjectProfileContext.Provider, { value: rootAwareProfile },
+          React.createElement(SubGraphOverviewGrid, {
+            contextGraphId: 'cg-test',
+            memory: {
+              ...memory,
+              entities: new Map(entityList.map(e => [e.uri, e])),
+              entityList,
+              allTriples: [],
+              counts: { wm: 2, swm: 0, vm: 0, total: 2 },
+            },
+            onNodeClick: vi.fn(),
+            onSelectSubGraph,
+          })),
+      );
+    });
+    await flush();
+
+    const cards = container.querySelectorAll('.v10-sgov-card');
+    const rootCardEl = cards[cards.length - 1];
+    const openBtn = rootCardEl.querySelector('.v10-sgov-card-open') as HTMLButtonElement;
+    expect(openBtn).toBeTruthy();
+    await act(async () => { openBtn.click(); });
+    expect(onSelectSubGraph).toHaveBeenCalledWith('__root__');
+  });
+
+  it('Root card scopes triples to untagged-recovery-only (mirrors SubGraphDetailView Root rule)', async () => {
+    // SubGraphDetailView Root branch: rule 1 "exact-tag-routing"
+    // never fires for Root (the bucket carries no tagged triples
+    // by definition); only untagged triples with an in-scope
+    // endpoint are admitted. Mini-card must mirror that — a
+    // tagged triple between two root entities must NOT appear in
+    // the Root card's graph slice (lives on the tagged
+    // sub-graph's card instead).
+    fetchSubGraphsMock.mockResolvedValueOnce({
+      subGraphs: [{ name: 'alpha', entityCount: 1, tripleCount: 1, description: '' }],
+    });
+    const entityList = [
+      { uri: 'urn:e:alpha', label: 'a', types: [], trustLevel: 'working', layers: new Set(['working']), subGraphs: new Set(['alpha']), properties: new Map(), connections: [] },
+      { uri: 'urn:e:root1', label: 'r1', types: [], trustLevel: 'working', layers: new Set(['working']), subGraphs: new Set<string>(), properties: new Map(), connections: [] },
+      { uri: 'urn:e:root2', label: 'r2', types: [], trustLevel: 'working', layers: new Set(['working']), subGraphs: new Set<string>(), properties: new Map(), connections: [] },
+    ];
+    const triples = [
+      // Tagged triple — root entity but tagged to a different
+      // sub-graph. Must NOT appear in Root's slice.
+      // PR #818 sweep 2 — fixtures tagged `layer: 'working'` so
+      // `useLayerTriples` admits them into the layer-correct
+      // universe the Root card now scopes into (GH #805 family).
+      { subject: 'urn:e:root1', predicate: 'p', object: 'urn:e:alpha', subGraph: 'alpha', layer: 'working' },
+      // Untagged triple between two root entities — admitted by
+      // the untagged-recovery branch.
+      { subject: 'urn:e:root1', predicate: 'p', object: 'urn:e:root2', layer: 'working' },
+      // Untagged triple with no endpoint in scope — must NOT
+      // appear in Root's slice.
+      { subject: 'urn:e:alpha', predicate: 'p', object: 'urn:e:somewhere-else', layer: 'working' },
+    ];
+    await renderWith({
+      ...memory,
+      entities: new Map(entityList.map(e => [e.uri, e])),
+      entityList,
+      allTriples: triples,
+      counts: { wm: 3, swm: 0, vm: 0, total: 3 },
+    });
+    await flush();
+
+    const cards = container.querySelectorAll('.v10-sgov-card');
+    const rootCardEl = cards[cards.length - 1];
+    // Root card stats: 2 root entities, 1 admitted triple (the
+    // untagged root↔root edge). Tagged + non-scoped triples
+    // dropped.
+    const stats = rootCardEl.querySelector('.v10-sgov-card-stats')?.textContent ?? '';
+    expect(stats).toContain('2 entities');
+    expect(stats).toContain('1 triples');
+  });
+
+  it('Root card canonicalizes triple endpoints + SPO dedup key (Codex sweep 1, Bug M family)', async () => {
+    // PR #818 sweep 1 — `rootEntityUris` is built from
+    // `canonicalEntityUri(e.uri)` but `t.subject` / `t.object` from
+    // `memory.allTriples` carry the daemon-emitted raw forms (often
+    // wrapped `<urn:...>`). Without canonicalisation on the
+    // consumer side:
+    //   1. The membership check fails when a wrapped endpoint's
+    //      canonical form IS in the set — the in-scope triple
+    //      gets silently dropped from the card slice.
+    //   2. The SPO-dedup key counts wrapped + bare variants of the
+    //      same (s,p,o) as distinct rows — inflates the count.
+    // The fix canonicalises subject + object once per iteration,
+    // uses canonical forms for BOTH the membership check AND the
+    // seenSpo key. Mirrors the upstream Bug M dual-key pattern.
+    fetchSubGraphsMock.mockResolvedValueOnce({
+      subGraphs: [{ name: 'alpha', entityCount: 1, tripleCount: 0, description: '' }],
+    });
+    const entityList = [
+      { uri: 'urn:e:alpha', label: 'a', types: [], trustLevel: 'working', layers: new Set(['working']), subGraphs: new Set(['alpha']), properties: new Map(), connections: [] },
+      // Root entity in canonical (unwrapped) form. `rootEntityUris`
+      // therefore contains 'urn:e:root1' only.
+      { uri: 'urn:e:root1', label: 'r1', types: [], trustLevel: 'working', layers: new Set(['working']), subGraphs: new Set<string>(), properties: new Map(), connections: [] },
+    ];
+    const triples = [
+      // Subject wrapped — pre-sweep the membership check (against
+      // the unwrapped set) failed and this triple was dropped.
+      // PR #818 sweep 2 — fixtures tagged `layer: 'working'` so
+      // `useLayerTriples` admits them (GH #805 family).
+      // PR #818 sweep 6 — Root now AND-filters via
+      // `filterTriplesToEntities`; resource-object endpoints
+      // would otherwise need to be entities. Use literal objects
+      // so admission lands solely on the canonical-URI subject
+      // check this test is actually exercising.
+      { subject: '<urn:e:root1>', predicate: 'p', object: '"o-bare"', layer: 'working' },
+      // Same SPO emitted twice — once wrapped on the object
+      // side, once bare. Pre-sweep these had distinct seenSpo
+      // keys and counted as 2. Post-sweep both map to the same
+      // canonical key and dedup to 1.
+      { subject: 'urn:e:root1', predicate: 'p', object: '"o-other"', layer: 'working' },
+      { subject: 'urn:e:root1', predicate: 'p', object: '"o-other"', layer: 'working' },
+    ];
+    await renderWith({
+      ...memory,
+      entities: new Map(entityList.map(e => [e.uri, e])),
+      entityList,
+      allTriples: triples,
+      counts: { wm: 2, swm: 0, vm: 0, total: 2 },
+    });
+    await flush();
+
+    const cards = container.querySelectorAll('.v10-sgov-card');
+    const rootCardEl = cards[cards.length - 1];
+    const stats = rootCardEl.querySelector('.v10-sgov-card-stats')?.textContent ?? '';
+    // 1 root entity, 2 distinct triples after canonical-SPO dedup
+    // (the wrapped/bare object pair collapses to 1; the wrapped-
+    // subject row is admitted via the canonicalised membership
+    // check). Pre-sweep this fixture would have rendered "1 triple"
+    // (wrapped subject dropped) OR "3 triples" (no dedup).
+    expect(stats).toContain('1 entities');
+    expect(stats).toContain('2 triples');
+  });
+
+  it('renders the Root card when the CG has zero named subgraphs but non-zero root entities (Codex sweep 1)', async () => {
+    // PR #818 sweep 1 — the teaching empty state gate previously
+    // fired on `cards.length === 0` alone. A CG with no named
+    // sub-graphs but populated root entities lost the direct Root
+    // affordance: user landed on the teaching state and had to
+    // click "View root" instead of seeing the Root card in place.
+    // Gate is now `cards.length === 0 && rootCard.entityCount === 0`,
+    // so this scenario renders only the Root card as the entire
+    // grid.
+    fetchSubGraphsMock.mockResolvedValueOnce({
+      // Zero named sub-graphs.
+      subGraphs: [],
+    });
+    const entityList = [
+      { uri: 'urn:e:root-only', label: 'r', types: [], trustLevel: 'working', layers: new Set(['working']), subGraphs: new Set<string>(), properties: new Map(), connections: [] },
+    ];
+    await renderWith({
+      ...memory,
+      entities: new Map(entityList.map(e => [e.uri, e])),
+      entityList,
+      allTriples: [],
+      counts: { wm: 1, swm: 0, vm: 0, total: 1 },
+    });
+    await flush();
+
+    // Teaching empty state must NOT render — its title is the
+    // tell.
+    expect(container.textContent ?? '').not.toContain('No subgraphs in this Context Graph yet.');
+    // PR #818 sweep 2 — subtitle reads `0 named subgraphs` here.
+    // Locks the rename: pre-sweep this said `0 subgraphs` while
+    // a Root card visibly rendered (the inconsistency Codex
+    // flagged in sweep 2 finding 3). The "named" qualifier makes
+    // the count honest about what `cards.length` covers.
+    const sub = container.querySelector('.v10-sgov-sub');
+    expect(sub?.textContent).toContain('0 named subgraphs');
+    // Exactly one card renders — the Root card.
+    const cards = container.querySelectorAll('.v10-sgov-card');
+    expect(cards.length).toBe(1);
+    expect(cards[0].classList.contains('root')).toBe(true);
+    expect(cards[0].querySelector('.v10-sgov-card-title')?.textContent).toBe('Root');
+  });
+
+  it('renders the teaching empty state when the CG has zero named subgraphs AND zero root entities (Codex sweep 1)', async () => {
+    // Companion test — the truly-empty case must keep showing the
+    // teaching empty state (unchanged behaviour). Locks against a
+    // regression where someone widens the Root card gate too far.
+    fetchSubGraphsMock.mockResolvedValueOnce({
+      subGraphs: [],
+    });
+    await renderWith({
+      ...memory,
+      entityList: [],
+      allTriples: [],
+      counts: { wm: 0, swm: 0, vm: 0, total: 0 },
+    });
+    await flush();
+
+    // Teaching empty state renders — its title is the tell.
+    expect(container.textContent ?? '').toContain('No subgraphs in this Context Graph yet.');
+    // No mini-cards.
+    expect(container.querySelectorAll('.v10-sgov-card').length).toBe(0);
+  });
+
+  it('Root card caps mini-graph triples at MAX_PER_CARD via heaviest-subjects sampling (Codex sweep 1)', async () => {
+    // PR #818 sweep 1 — earlier the Root card had no cap on the
+    // theory that the recovery slice was small. Codex flagged
+    // the counterexample: large initial seeds + agents writing
+    // without sub-graph tags can produce thousands of untagged
+    // triples touching root entities, locking RdfGraph's layout
+    // on the overview tab. Cap = 2500 (same constant as the
+    // named-card path); sampling keeps every triple for the
+    // heaviest-degree subjects so cluster topology survives.
+    //
+    // Fixture: 1 high-degree root entity with 3000 untagged
+    // triples. Without the cap the mini-graph would receive
+    // 3000 triples; with it, only the 2500-row sample
+    // (every triple stays in this case because the one heaviest
+    // subject hits the cap first, so the `kept >= MAX_PER_CARD`
+    // break trips after the first iteration and only 2500 of
+    // its rows survive the filter).
+    fetchSubGraphsMock.mockResolvedValueOnce({
+      subGraphs: [{ name: 'alpha', entityCount: 1, tripleCount: 0, description: '' }],
+    });
+    const entityList = [
+      { uri: 'urn:e:alpha', label: 'a', types: [], trustLevel: 'working', layers: new Set(['working']), subGraphs: new Set(['alpha']), properties: new Map(), connections: [] },
+      { uri: 'urn:e:heavy-root', label: 'hr', types: [], trustLevel: 'working', layers: new Set(['working']), subGraphs: new Set<string>(), properties: new Map(), connections: [] },
+    ];
+    const triples = [];
+    for (let i = 0; i < 3000; i++) {
+      // PR #818 sweep 2 — tag `layer: 'working'` so the layer-correct
+      // universe `useLayerTriples` produces (GH #805 family) admits
+      // these rows for the Root card to scope over.
+      // PR #818 sweep 6 — literal objects so AND-membership via
+      // `filterTriplesToEntities` admits them (resource-object
+      // edges would need both endpoints in the entity set).
+      triples.push({ subject: 'urn:e:heavy-root', predicate: 'p', object: `"v-${i}"`, layer: 'working' });
+    }
+    await renderWith({
+      ...memory,
+      entities: new Map(entityList.map(e => [e.uri, e])),
+      entityList,
+      allTriples: triples,
+      counts: { wm: 2, swm: 0, vm: 0, total: 2 },
+    });
+    await flush();
+
+    const cards = container.querySelectorAll('.v10-sgov-card');
+    const rootCardEl = cards[cards.length - 1];
+    // tripleCount stat reports the TRUE pre-cap distinct total
+    // (3000 — matches the named-card convention where the badge
+    // reads the daemon-reported total even when the mini-graph
+    // slice is sampled).
+    const stats = rootCardEl.querySelector('.v10-sgov-card-stats')?.textContent ?? '';
+    expect(stats).toContain('3000 triples');
+    // PR #818 sweep 2 — the rendered mini-graph slice receives
+    // the post-cap sampled rows. The RdfGraph stub exposes
+    // `data-triple-count` so we can assert the cap is honored
+    // directly. Earlier shape `expect(emptyBranch).toBeNull()`
+    // was brittle (Suspense fallback shares the empty class) AND
+    // would have missed the single-dominant-subject defect Codex
+    // surfaced in sweep 2 — assert against the cap directly now.
+    // PR #818 sweep 3 — wait for Suspense resolution before
+    // reading the data attribute so isolated runs don't race
+    // the lazy import.
+    const graphEl = await waitForGraph(container, { scope: rootCardEl });
+    expect(graphEl).toBeTruthy();
+    const renderedTripleCount = Number(graphEl!.getAttribute('data-triple-count') ?? 'NaN');
+    expect(renderedTripleCount).toBeLessThanOrEqual(2500); // MAX_PER_CARD
+    // And the cap actually fires (we're well over with 3000) —
+    // not just trivially under it because the input degraded.
+    expect(renderedTripleCount).toBeGreaterThan(0);
+  });
+
+  it('Root card retains all triples under the MAX_PER_CARD cap (no spurious sampling)', async () => {
+    // Companion test — the cap must not fire when the root
+    // triple slice is small. Fixture: 5 distinct root↔root
+    // triples → both stat AND rendered graph carry 5.
+    fetchSubGraphsMock.mockResolvedValueOnce({
+      subGraphs: [{ name: 'alpha', entityCount: 1, tripleCount: 0, description: '' }],
+    });
+    const entityList = [
+      { uri: 'urn:e:alpha', label: 'a', types: [], trustLevel: 'working', layers: new Set(['working']), subGraphs: new Set(['alpha']), properties: new Map(), connections: [] },
+      { uri: 'urn:e:r1', label: 'r1', types: [], trustLevel: 'working', layers: new Set(['working']), subGraphs: new Set<string>(), properties: new Map(), connections: [] },
+    ];
+    const triples = [
+      // PR #818 sweep 2 — `layer: 'working'` so the layer-correct
+      // universe (GH #805) admits the rows.
+      // PR #818 sweep 6 — literal objects so AND-membership
+      // admits them past `filterTriplesToEntities`.
+      { subject: 'urn:e:r1', predicate: 'p', object: '"o1"', layer: 'working' },
+      { subject: 'urn:e:r1', predicate: 'p', object: '"o2"', layer: 'working' },
+      { subject: 'urn:e:r1', predicate: 'p', object: '"o3"', layer: 'working' },
+      { subject: 'urn:e:r1', predicate: 'p', object: '"o4"', layer: 'working' },
+      { subject: 'urn:e:r1', predicate: 'p', object: '"o5"', layer: 'working' },
+    ];
+    await renderWith({
+      ...memory,
+      entities: new Map(entityList.map(e => [e.uri, e])),
+      entityList,
+      allTriples: triples,
+      counts: { wm: 2, swm: 0, vm: 0, total: 2 },
+    });
+    await flush();
+
+    const cards = container.querySelectorAll('.v10-sgov-card');
+    const rootCardEl = cards[cards.length - 1];
+    const stats = rootCardEl.querySelector('.v10-sgov-card-stats')?.textContent ?? '';
+    expect(stats).toContain('5 triples');
+    // RdfGraph renders (not the empty branch), confirming all 5
+    // triples survived to the mini-graph slice.
+    expect(rootCardEl.querySelector('[data-testid="rdf-graph"]')).toBeTruthy();
+  });
+
+  it('Root card admits WM residue alongside honest SWM rows (Codex sweep 4 revert — consistent-wrong vs named cards, fix-side scoped for GH #819)', async () => {
+    // PR #818 sweep 4 (ux-lead Finding 1 verdict A — revert).
+    // Sweep 2 added a `useLayerTriples` layer-correctness filter
+    // that dropped WM-residue rows for a promoted entity. That
+    // filter introduced two regressions of its own at the next
+    // consumer downstream (per-slice SPO-dedup race + mixed-layer
+    // edge drop) — moving the symptom rather than fixing the
+    // source. ux-lead's verdict (A): revert to the symmetric
+    // `memory.allTriples` filtered by `!t.subGraph` shape so the
+    // Root card uses the same machinery as the named cards.
+    //
+    // Post-revert: the WM residue row admits alongside the honest
+    // SWM row. Inflation is consistent across Root AND named
+    // cards (consistent-wrong is easier to reason about and to
+    // fix in one render-side follow-up than divergent-wrong).
+    // GH #819 owns the shared render-correct derivation for both
+    // surfaces.
+    fetchSubGraphsMock.mockResolvedValueOnce({
+      subGraphs: [{ name: 'alpha', entityCount: 1, tripleCount: 0, description: '' }],
+    });
+    const entityList = [
+      { uri: 'urn:e:alpha', label: 'a', types: [], trustLevel: 'working', layers: new Set(['working']), subGraphs: new Set(['alpha']), properties: new Map(), connections: [] },
+      // Root-bucket entity, canonical trustLevel is SWM (promoted
+      // past WM, but `subGraphs.size === 0` keeps it in the Root
+      // bucket).
+      { uri: 'urn:e:promoted', label: 'p', types: [], trustLevel: 'shared', layers: new Set(['working', 'shared']), subGraphs: new Set<string>(), properties: new Map(), connections: [] },
+    ];
+    const triples = [
+      // Honest SWM triple — admitted into the SWM layer slice.
+      // PR #818 sweep 6 — literal objects so AND-membership via
+      // `filterTriplesToEntities` admits them on the canonical-
+      // URI subject check (the residue/inflation semantic this
+      // test exercises is orthogonal to the resource-vs-literal
+      // distinction).
+      { subject: 'urn:e:promoted', predicate: 'p', object: '"o-swm"', layer: 'shared' },
+      // WM residue — same subject, but canonical trustLevel is
+      // 'shared', so `useLayerTriples('wm')` drops this row via
+      // the subject-trust-level filter at helpers.ts:436-437.
+      // Pre-sweep this would have inflated the Root card stat by 1.
+      { subject: 'urn:e:promoted', predicate: 'p', object: '"o-wm-residue"', layer: 'working' },
+    ];
+    await renderWith({
+      ...memory,
+      entities: new Map(entityList.map(e => [e.uri, e])),
+      entityList,
+      allTriples: triples,
+      counts: { wm: 0, swm: 1, vm: 0, total: 1 },
+    });
+    await flush();
+
+    const cards = container.querySelectorAll('.v10-sgov-card');
+    const rootCardEl = cards[cards.length - 1];
+    const stats = rootCardEl.querySelector('.v10-sgov-card-stats')?.textContent ?? '';
+    // PR #818 sweep 4 (ux-lead Finding 1 verdict A — revert): the
+    // sweep-2 layer-correctness filter has been removed; Root now
+    // mirrors the named-card pattern over `memory.allTriples`. The
+    // WM residue row admits alongside the honest SWM row — same
+    // inflation behavior as named cards (consistent-wrong rather
+    // than divergent-wrong; render-side fix is GH #819).
+    expect(stats).toContain('2 triples');
+  });
+
+  it('Root card admits SWM cross-graph SPO collision via the untagged variant (Codex sweep 4 regression — under-count prevented)', async () => {
+    // PR #818 sweep 4 (ux-lead Finding 1 verdict A — revert).
+    // The sweep-2 `useLayerTriples` derivation had a per-slice
+    // dedup race: when the SAME `(s, p, o)` shipped under BOTH
+    // the root SWM graph (untagged) AND a per-sub-graph SWM graph
+    // (tagged), the SWM layer slice's canonical-SPO dedup
+    // collapsed both rows into the one that arrived first. If
+    // the tagged row won, the Root card's `if (t.subGraph)
+    // continue` guard then dropped it — and the untagged variant
+    // never got a second chance to admit. Outcome: Root card
+    // under-counted the SPO to ZERO on the cross-graph collision
+    // shape.
+    //
+    // Post-revert: `memory.allTriples` is the input, so both the
+    // tagged and untagged variants reach the Root loop. The
+    // `!t.subGraph` filter drops the tagged row; the untagged row
+    // admits and renders. Regression-prevent: the row admits at
+    // least once — not the sweep-2 outcome of 0.
+    fetchSubGraphsMock.mockResolvedValueOnce({
+      subGraphs: [{ name: 'alpha', entityCount: 0, tripleCount: 0, description: '' }],
+    });
+    const entityList = [
+      // Single root-bucket entity at SWM.
+      { uri: 'urn:e:root-swm', label: 'rsm', types: [], trustLevel: 'shared', layers: new Set(['shared']), subGraphs: new Set<string>(), properties: new Map(), connections: [] },
+    ];
+    const triples = [
+      // The crucial cross-graph collision: the SAME SPO ships
+      // under both an untagged variant (root SWM graph) AND a
+      // tagged variant (per-sub-graph SWM graph). Sweep 2's per-
+      // layer dedup collapsed them and could drop the survivor.
+      // Post-revert the untagged row admits.
+      { subject: 'urn:e:root-swm', predicate: 'rdfs:label', object: '"r"', layer: 'shared' },
+      { subject: 'urn:e:root-swm', predicate: 'rdfs:label', object: '"r"', subGraph: 'alpha', layer: 'shared' },
+    ];
+    await renderWith({
+      ...memory,
+      entities: new Map(entityList.map(e => [e.uri, e])),
+      entityList,
+      allTriples: triples,
+      counts: { wm: 0, swm: 1, vm: 0, total: 1 },
+    });
+    await flush();
+
+    const cards = container.querySelectorAll('.v10-sgov-card');
+    const rootCardEl = cards[cards.length - 1];
+    const stats = rootCardEl.querySelector('.v10-sgov-card-stats')?.textContent ?? '';
+    // Lock-test: the cross-graph SPO admits via the untagged row.
+    // Pre-revert (sweep 2) this fixture rendered `0 triples` when
+    // the tagged row won the per-slice dedup race. Loose lower-
+    // bound rather than strict equality because the render-side
+    // inflation behavior is left for GH #819 to lock precisely;
+    // the regression-prevent contract here is "not zero".
+    expect(stats).toContain('1 entities');
+    expect(stats).not.toContain('0 triples');
+  });
+
+  it('Root card admits mixed-layer resource edges (Codex sweep 4 regression — WM→SWM cross-layer drop prevented)', async () => {
+    // PR #818 sweep 4 (ux-lead Finding 2 verdict A — revert).
+    // Sweep 2's `useLayerTriples` derivation applied a subject-
+    // trust-level residue filter inside each layer slice. For a
+    // WM root entity pointing at an SWM entity, the row's
+    // `t.layer === 'shared'` sent it to the SWM slice — but the
+    // SWM slice's residue filter drops rows whose subject's
+    // canonical trustLevel doesn't match the slice (subject is
+    // WM, slice is SWM → dropped). The row never entered any
+    // layer slice and never reached the Root card.
+    //
+    // Post-revert: `memory.allTriples` carries the row, the Root
+    // loop sees it, the untagged check passes (no subGraph), and
+    // canonical-URI membership admits because the WM subject IS
+    // in `rootEntityUris`. Lock-test: the cross-layer edge
+    // renders on the Root card.
+    fetchSubGraphsMock.mockResolvedValueOnce({
+      subGraphs: [{ name: 'alpha', entityCount: 0, tripleCount: 0, description: '' }],
+    });
+    const entityList = [
+      // WM root entity (subject of the cross-layer edge).
+      { uri: 'urn:e:wm-root', label: 'w', types: [], trustLevel: 'working', layers: new Set(['working']), subGraphs: new Set<string>(), properties: new Map(), connections: [] },
+      // SWM root entity (object of the cross-layer edge).
+      { uri: 'urn:e:swm-root', label: 's', types: [], trustLevel: 'shared', layers: new Set(['shared']), subGraphs: new Set<string>(), properties: new Map(), connections: [] },
+    ];
+    const triples = [
+      // The crucial cross-layer edge: WM subject → SWM object,
+      // row layer matches the object's (SWM). Sweep 2 dropped
+      // it; post-revert it admits.
+      { subject: 'urn:e:wm-root', predicate: 'rel', object: 'urn:e:swm-root', layer: 'shared' },
+    ];
+    await renderWith({
+      ...memory,
+      entities: new Map(entityList.map(e => [e.uri, e])),
+      entityList,
+      allTriples: triples,
+      counts: { wm: 1, swm: 1, vm: 0, total: 2 },
+    });
+    await flush();
+
+    const cards = container.querySelectorAll('.v10-sgov-card');
+    const rootCardEl = cards[cards.length - 1];
+    const stats = rootCardEl.querySelector('.v10-sgov-card-stats')?.textContent ?? '';
+    // Both endpoints are root entities; the cross-layer edge
+    // admits. Pre-revert (sweep 2) the residue filter dropped it
+    // → Root card showed `0 triples`. Post-revert it shows `1`.
+    expect(stats).toContain('2 entities');
+    expect(stats).toContain('1 triples');
+  });
+
+  it('Root card drops triples to non-root entities (Codex sweep 6 — AND-membership symmetric with named cards)', async () => {
+    // PR #818 sweep 6 — sweep 4's inline OR-membership ("admit if
+    // either endpoint is in rootEntityUris") let untagged triples
+    // from `<cg>/_shared_memory` whose SUBJECT happened to be a
+    // root entity admit even when the OBJECT was a non-root
+    // entity. User caught the bug on `ui-refresh`: entity
+    // `urn:epcis:...:gtin:50127962004651:lot:P240526X` lived in
+    // `epcis-supply-chain` (subGraphs non-empty → not in Root
+    // entity list), but the daemon ships untagged copies of its
+    // triples in `<cg>/_shared_memory` → rendered as a node in
+    // the Root mini-graph (broke the visual count check).
+    //
+    // Fix: route through `filterTriplesToEntities(candidates,
+    // rootEntityUris)` so admission is AND-membership (both
+    // endpoints must be root entities, with `rdf:type` exempted)
+    // — exactly the named-card rule.
+    fetchSubGraphsMock.mockResolvedValueOnce({
+      subGraphs: [{ name: 'alpha', entityCount: 1, tripleCount: 0, description: '' }],
+    });
+    const entityList = [
+      // Non-root entity (in a named sub-graph).
+      { uri: 'urn:e:non-root', label: 'nr', types: [], trustLevel: 'shared', layers: new Set(['shared']), subGraphs: new Set(['alpha']), properties: new Map(), connections: [] },
+      // Root-bucket entity.
+      { uri: 'urn:e:root', label: 'r', types: [], trustLevel: 'shared', layers: new Set(['shared']), subGraphs: new Set<string>(), properties: new Map(), connections: [] },
+    ];
+    const triples = [
+      // Untagged edge from root → non-root. Pre-sweep-6 OR-
+      // membership admitted this (subject IS in rootEntityUris)
+      // and `urn:e:non-root` rendered as a node in the Root
+      // mini-graph. Post-sweep-6 AND-membership drops it.
+      { subject: 'urn:e:root', predicate: 'p', object: 'urn:e:non-root', layer: 'shared' },
+    ];
+    await renderWith({
+      ...memory,
+      entities: new Map(entityList.map(e => [e.uri, e])),
+      entityList,
+      allTriples: triples,
+      counts: { wm: 0, swm: 2, vm: 0, total: 2 },
+    });
+    await flush();
+
+    const cards = container.querySelectorAll('.v10-sgov-card');
+    const rootCardEl = cards[cards.length - 1];
+    const stats = rootCardEl.querySelector('.v10-sgov-card-stats')?.textContent ?? '';
+    // 1 root entity, 0 triples — the root→non-root edge dropped
+    // by AND-filter. Pre-sweep this read `1 triples`.
+    expect(stats).toContain('1 entities');
+    expect(stats).toContain('0 triples');
+    expect(stats).not.toContain('1 triples');
+  });
+
+  it('Root card admits rdf:type edges to class URIs (Codex sweep 6 — class IRIs exempted from AND-filter)', async () => {
+    // PR #818 sweep 6 — `filterTriplesToEntities` exempts
+    // `rdf:type` from the object-side membership check because
+    // class IRIs aren't entities but the triple is needed for
+    // `classColors` styling (helpers.ts:533-535). Lock that the
+    // Root card preserves this exemption when it routes through
+    // the helper.
+    fetchSubGraphsMock.mockResolvedValueOnce({
+      subGraphs: [{ name: 'alpha', entityCount: 0, tripleCount: 0, description: '' }],
+    });
+    const entityList = [
+      // Root-bucket entity.
+      { uri: 'urn:e:root', label: 'r', types: [], trustLevel: 'shared', layers: new Set(['shared']), subGraphs: new Set<string>(), properties: new Map(), connections: [] },
+    ];
+    const triples = [
+      // rdf:type to a class IRI — admits via the exemption.
+      { subject: 'urn:e:root', predicate: 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type', object: 'urn:type:Document', layer: 'shared' },
+    ];
+    await renderWith({
+      ...memory,
+      entities: new Map(entityList.map(e => [e.uri, e])),
+      entityList,
+      allTriples: triples,
+      counts: { wm: 0, swm: 1, vm: 0, total: 1 },
+    });
+    await flush();
+
+    const cards = container.querySelectorAll('.v10-sgov-card');
+    const rootCardEl = cards[cards.length - 1];
+    const stats = rootCardEl.querySelector('.v10-sgov-card-stats')?.textContent ?? '';
+    // rdf:type row admits despite the class URI not being in
+    // rootEntityUris — the exemption preserves the type signal
+    // for classColors on the rendered mini-graph.
+    expect(stats).toContain('1 entities');
+    expect(stats).toContain('1 triples');
+  });
+
+  it('Named card drops triples to non-scoped entities (parity lock for sweep 6)', async () => {
+    // PR #818 sweep 6 — named-card path has used
+    // `filterTriplesToEntities` since the original implementation
+    // (`:4051`). This test locks the architectural symmetry that
+    // sweep 6 establishes: same input shape, same AND-membership
+    // behavior on the named-card side as the Root card side.
+    fetchSubGraphsMock.mockResolvedValueOnce({
+      subGraphs: [{ name: 'alpha', entityCount: 1, tripleCount: 0, description: '' }],
+    });
+    const entityList = [
+      // 'alpha' entity (in-scope for the alpha card).
+      { uri: 'urn:e:alpha', label: 'a', types: [], trustLevel: 'shared', layers: new Set(['shared']), subGraphs: new Set(['alpha']), properties: new Map(), connections: [] },
+      // 'beta' entity — out-of-scope for the alpha card.
+      { uri: 'urn:e:beta', label: 'b', types: [], trustLevel: 'shared', layers: new Set(['shared']), subGraphs: new Set(['beta']), properties: new Map(), connections: [] },
+    ];
+    const triples = [
+      // alpha → beta edge tagged to alpha's subgraph. Named-card
+      // admission AND-filters: subject in scope, object NOT, so
+      // the edge drops from the alpha card.
+      { subject: 'urn:e:alpha', predicate: 'p', object: 'urn:e:beta', subGraph: 'alpha', layer: 'shared' },
+    ];
+    await renderWith({
+      ...memory,
+      entities: new Map(entityList.map(e => [e.uri, e])),
+      entityList,
+      allTriples: triples,
+      counts: { wm: 0, swm: 2, vm: 0, total: 2 },
+    });
+    await flush();
+
+    // alpha card is first.
+    const cards = container.querySelectorAll('.v10-sgov-card');
+    const alphaCardEl = cards[0];
+    const stats = alphaCardEl.querySelector('.v10-sgov-card-stats')?.textContent ?? '';
+    // 1 entity (alpha), 0 triples (the edge to beta dropped by
+    // AND-filter). Locks that the Root card now mirrors this
+    // behavior post-sweep-6.
+    expect(stats).toContain('1 entities');
+    expect(stats).toContain('0 triples');
+  });
+
+  it('Root card cap honors MAX_PER_CARD even with a single dominant subject (Codex sweep 2)', async () => {
+    // PR #818 sweep 2 — sweep-1 sampling shape had a defect:
+    // `if (kept >= MAX_PER_CARD) break;` checked AFTER adding the
+    // current subject's full degree. A single dominant subject
+    // with degree > MAX_PER_CARD passed the check at `kept = 0`,
+    // got added, contributed its full row count to `kept`, then
+    // the break fired the next iteration — but `keep.has(subject)`
+    // returned every row of the dominant subject from the filter,
+    // including thousands above the cap. Fix: pre-check
+    // `kept + subjectDegree > MAX_PER_CARD` before adding +
+    // defensive `slice(0, MAX_PER_CARD)` post-filter.
+    fetchSubGraphsMock.mockResolvedValueOnce({
+      subGraphs: [{ name: 'alpha', entityCount: 1, tripleCount: 0, description: '' }],
+    });
+    const entityList = [
+      { uri: 'urn:e:alpha', label: 'a', types: [], trustLevel: 'working', layers: new Set(['working']), subGraphs: new Set(['alpha']), properties: new Map(), connections: [] },
+      // ONE dominant root entity with 5000 untagged out-edges
+      // (degree = 5000, well above MAX_PER_CARD = 2500).
+      { uri: 'urn:e:dominant', label: 'd', types: [], trustLevel: 'working', layers: new Set(['working']), subGraphs: new Set<string>(), properties: new Map(), connections: [] },
+    ];
+    const triples = [];
+    for (let i = 0; i < 5000; i++) {
+      // PR #818 sweep 6 — literal objects so AND-membership
+      // admits them past `filterTriplesToEntities` (this test
+      // exercises the cap, not endpoint admission).
+      triples.push({ subject: 'urn:e:dominant', predicate: 'p', object: `"v-${i}"`, layer: 'working' });
+    }
+    await renderWith({
+      ...memory,
+      entities: new Map(entityList.map(e => [e.uri, e])),
+      entityList,
+      allTriples: triples,
+      counts: { wm: 2, swm: 0, vm: 0, total: 2 },
+    });
+    await flush();
+
+    const cards = container.querySelectorAll('.v10-sgov-card');
+    const rootCardEl = cards[cards.length - 1];
+    // PR #818 sweep 3 — wait for Suspense resolution before
+    // reading the data attribute so isolated runs don't race
+    // the lazy import.
+    const graphEl = await waitForGraph(container, { scope: rootCardEl });
+    expect(graphEl).toBeTruthy();
+    const renderedTripleCount = Number(graphEl!.getAttribute('data-triple-count') ?? 'NaN');
+    // Pre-sweep this would have rendered 5000 (the dominant
+    // subject's full row count, since `keep.has(subject)`
+    // returned every row from the filter). Post-sweep the
+    // pre-check halts the loop before adding the dominant
+    // subject (degree 5000 > MAX_PER_CARD), so the keep set
+    // would normally be empty — but the residual fallback
+    // (`if (keep.size === 0 && order.length > 0) keep.add(order[0])`)
+    // admits that single dominant subject so the card still
+    // shows the hub, and the post-filter `slice(0, MAX_PER_CARD)`
+    // trims its long tail. Net: cap is HONORED and the user
+    // sees the dominant cluster instead of an empty card.
+    expect(renderedTripleCount).toBeLessThanOrEqual(2500); // MAX_PER_CARD
+    expect(renderedTripleCount).toBeGreaterThan(0);         // not degraded to empty
+    // And `tripleCount` stat still reports the true pre-cap
+    // total — the cap affects only the rendered mini-graph
+    // slice, not the user-visible distinct count.
+    const stats = rootCardEl.querySelector('.v10-sgov-card-stats')?.textContent ?? '';
+    expect(stats).toContain('5000 triples');
+  });
+
+  it('Named card cap honors MAX_PER_CARD even with a single dominant subject (Codex sweep 2, parity fix)', async () => {
+    // PR #818 sweep 2 — same defect exists in the named-card
+    // path at the original `triplesBySubGraph` sampling (Root
+    // inherited the pattern from there). Fix is applied at both
+    // sites so the named-card path stops smuggling dominant
+    // clusters through too. This test locks the named-card path
+    // independently of the Root card.
+    fetchSubGraphsMock.mockResolvedValueOnce({
+      subGraphs: [{ name: 'alpha', entityCount: 1, tripleCount: 5000, description: '' }],
+    });
+    const entityList = [
+      // One named-subgraph entity that's the dominant subject.
+      { uri: 'urn:e:dominant', label: 'd', types: [], trustLevel: 'working', layers: new Set(['working']), subGraphs: new Set(['alpha']), properties: new Map(), connections: [] },
+    ];
+    const triples = [];
+    for (let i = 0; i < 5000; i++) {
+      // Tag with sub-graph 'alpha' so the named-card bucket
+      // path at `triplesBySubGraph` picks them up. Use literal
+      // objects so `filterTriplesToEntities` (applied to the
+      // bucket on the named-card render path at `:4084`) admits
+      // them — resource-object edges would otherwise be dropped
+      // because `urn:e:obj-N` isn't in the entityUris set.
+      triples.push({ subject: 'urn:e:dominant', predicate: 'p', object: `"v-${i}"`, subGraph: 'alpha', layer: 'working' });
+    }
+    await renderWith({
+      ...memory,
+      entities: new Map(entityList.map(e => [e.uri, e])),
+      entityList,
+      allTriples: triples,
+      counts: { wm: 1, swm: 0, vm: 0, total: 1 },
+    });
+    await flush();
+
+    // First card is the named alpha card; Root card is last.
+    const cards = container.querySelectorAll('.v10-sgov-card');
+    const alphaCardEl = cards[0];
+    // PR #818 sweep 3 — wait for Suspense resolution before
+    // reading the data attribute so isolated runs don't race
+    // the lazy import.
+    const graphEl = await waitForGraph(container, { scope: alphaCardEl });
+    expect(graphEl).toBeTruthy();
+    const renderedTripleCount = Number(graphEl!.getAttribute('data-triple-count') ?? 'NaN');
+    // Pre-sweep: 5000 rows leaked through. Post-sweep: cap is
+    // honored, and the residual fallback keeps the dominant
+    // subject visible (same trade-off as the Root card test
+    // above).
+    expect(renderedTripleCount).toBeLessThanOrEqual(2500); // MAX_PER_CARD
+    expect(renderedTripleCount).toBeGreaterThan(0);         // dominant hub still renders
+  });
+
+  it('Root card cap densely-packs the available capacity instead of under-filling on a non-fitting subject (Codex sweep 3)', async () => {
+    // PR #818 sweep 3 — sweep-2 used `break` on a non-fitting
+    // subject, which under-filled the cap when smaller satellites
+    // would still have fit. Fixture: degrees `[2400, 200, 50, 50]`
+    // with MAX_PER_CARD = 2500.
+    //   • `break` shape: admit 2400 → reject 200 (kept+200 > 2500)
+    //     → stop. Rendered = 2400 (100 headroom unused).
+    //   • `continue` shape: admit 2400 → skip 200 → admit 50 →
+    //     admit 50. Rendered = 2500 (dense pack at the cap).
+    // The dense-pack outcome is the friendlier user-facing
+    // result.
+    fetchSubGraphsMock.mockResolvedValueOnce({
+      subGraphs: [{ name: 'alpha', entityCount: 1, tripleCount: 0, description: '' }],
+    });
+    const entityList = [
+      { uri: 'urn:e:alpha', label: 'a', types: [], trustLevel: 'working', layers: new Set(['working']), subGraphs: new Set(['alpha']), properties: new Map(), connections: [] },
+      { uri: 'urn:e:r-2400', label: 'r1', types: [], trustLevel: 'working', layers: new Set(['working']), subGraphs: new Set<string>(), properties: new Map(), connections: [] },
+      { uri: 'urn:e:r-200', label: 'r2', types: [], trustLevel: 'working', layers: new Set(['working']), subGraphs: new Set<string>(), properties: new Map(), connections: [] },
+      { uri: 'urn:e:r-50a', label: 'r3', types: [], trustLevel: 'working', layers: new Set(['working']), subGraphs: new Set<string>(), properties: new Map(), connections: [] },
+      { uri: 'urn:e:r-50b', label: 'r4', types: [], trustLevel: 'working', layers: new Set(['working']), subGraphs: new Set<string>(), properties: new Map(), connections: [] },
+    ];
+    const triples = [];
+    // PR #818 sweep 6 — literal objects so AND-membership admits
+    // them past `filterTriplesToEntities` (this test exercises
+    // dense-pack cap behavior, not endpoint admission).
+    for (let i = 0; i < 2400; i++) triples.push({ subject: 'urn:e:r-2400', predicate: 'p', object: `"v-2400-${i}"`, layer: 'working' });
+    for (let i = 0; i < 200; i++) triples.push({ subject: 'urn:e:r-200', predicate: 'p', object: `"v-200-${i}"`, layer: 'working' });
+    for (let i = 0; i < 50; i++) triples.push({ subject: 'urn:e:r-50a', predicate: 'p', object: `"v-50a-${i}"`, layer: 'working' });
+    for (let i = 0; i < 50; i++) triples.push({ subject: 'urn:e:r-50b', predicate: 'p', object: `"v-50b-${i}"`, layer: 'working' });
+    await renderWith({
+      ...memory,
+      entities: new Map(entityList.map(e => [e.uri, e])),
+      entityList,
+      allTriples: triples,
+      counts: { wm: 5, swm: 0, vm: 0, total: 5 },
+    });
+    await flush();
+
+    const cards = container.querySelectorAll('.v10-sgov-card');
+    const rootCardEl = cards[cards.length - 1];
+    const graphEl = await waitForGraph(container, { scope: rootCardEl });
+    expect(graphEl).toBeTruthy();
+    const renderedTripleCount = Number(graphEl!.getAttribute('data-triple-count') ?? 'NaN');
+    // Dense pack: 2400 + 50 + 50 = 2500 (continue skips the 200
+    // that wouldn't fit). The `break` shape would have rendered
+    // 2400 (skipping the satellites that fit). Floor at 2450
+    // catches the 2400 under-fill defect while permitting minor
+    // sampling variance in future tweaks.
+    expect(renderedTripleCount).toBeLessThanOrEqual(2500); // MAX_PER_CARD
+    expect(renderedTripleCount).toBeGreaterThanOrEqual(2450); // dense pack
+  });
+
+  it('Named card cap densely-packs the available capacity (Codex sweep 3, parity)', async () => {
+    // PR #818 sweep 3 — same defect on the named-card sampling at
+    // `:3935-3953`. Same `[2400, 200, 50, 50]` fixture shape,
+    // tagged into a single sub-graph, with literal objects so
+    // `filterTriplesToEntities` doesn't drop the resource-edge
+    // rows.
+    fetchSubGraphsMock.mockResolvedValueOnce({
+      subGraphs: [{ name: 'alpha', entityCount: 4, tripleCount: 2700, description: '' }],
+    });
+    const entityList = [
+      { uri: 'urn:e:a-2400', label: 'a1', types: [], trustLevel: 'working', layers: new Set(['working']), subGraphs: new Set(['alpha']), properties: new Map(), connections: [] },
+      { uri: 'urn:e:a-200', label: 'a2', types: [], trustLevel: 'working', layers: new Set(['working']), subGraphs: new Set(['alpha']), properties: new Map(), connections: [] },
+      { uri: 'urn:e:a-50a', label: 'a3', types: [], trustLevel: 'working', layers: new Set(['working']), subGraphs: new Set(['alpha']), properties: new Map(), connections: [] },
+      { uri: 'urn:e:a-50b', label: 'a4', types: [], trustLevel: 'working', layers: new Set(['working']), subGraphs: new Set(['alpha']), properties: new Map(), connections: [] },
+    ];
+    const triples = [];
+    for (let i = 0; i < 2400; i++) triples.push({ subject: 'urn:e:a-2400', predicate: 'p', object: `"v-2400-${i}"`, subGraph: 'alpha', layer: 'working' });
+    for (let i = 0; i < 200; i++) triples.push({ subject: 'urn:e:a-200', predicate: 'p', object: `"v-200-${i}"`, subGraph: 'alpha', layer: 'working' });
+    for (let i = 0; i < 50; i++) triples.push({ subject: 'urn:e:a-50a', predicate: 'p', object: `"v-50a-${i}"`, subGraph: 'alpha', layer: 'working' });
+    for (let i = 0; i < 50; i++) triples.push({ subject: 'urn:e:a-50b', predicate: 'p', object: `"v-50b-${i}"`, subGraph: 'alpha', layer: 'working' });
+    await renderWith({
+      ...memory,
+      entities: new Map(entityList.map(e => [e.uri, e])),
+      entityList,
+      allTriples: triples,
+      counts: { wm: 4, swm: 0, vm: 0, total: 4 },
+    });
+    await flush();
+
+    // First card is the named alpha card.
+    const cards = container.querySelectorAll('.v10-sgov-card');
+    const alphaCardEl = cards[0];
+    const graphEl = await waitForGraph(container, { scope: alphaCardEl });
+    expect(graphEl).toBeTruthy();
+    const renderedTripleCount = Number(graphEl!.getAttribute('data-triple-count') ?? 'NaN');
+    expect(renderedTripleCount).toBeLessThanOrEqual(2500); // MAX_PER_CARD
+    expect(renderedTripleCount).toBeGreaterThanOrEqual(2450); // dense pack
   });
 });
 

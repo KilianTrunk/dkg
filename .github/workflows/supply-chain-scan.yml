@@ -149,6 +149,13 @@ jobs:
         # the ignored workflows for known publishing-action markers, and
         # fails the audit if any are found.
         #
+        # Self-match protection: this step itself contains every marker as
+        # a literal string in `PATTERNS`. To avoid a false-positive when
+        # scanning `supply-chain-scan.yml`, the guard's own pattern block
+        # is bracketed with sentinel comments and stripped from the scan
+        # input via `sed` before grep runs. Any future literal-pattern
+        # additions MUST stay inside the sentinels.
+        #
         # Note: this does NOT catch cross-workflow artifact promotion via
         # `actions/upload-artifact` consumed by a separate publishing
         # workflow — that requires its own audit. For now, in-workflow
@@ -160,6 +167,7 @@ jobs:
             .github/workflows/evm-integration.yml
             .github/workflows/supply-chain-scan.yml
           )
+          # zizmor-cache-poisoning-guard-patterns-start
           # Patterns that indicate a workflow is shipping bytes to a
           # user-visible publishing surface. Keep this list synced with the
           # rationale in `.github/zizmor.yml` `cache-poisoning:` block.
@@ -175,13 +183,18 @@ jobs:
             'docker push'
             'docker buildx[^#]*--push'
           )
+          # zizmor-cache-poisoning-guard-patterns-end
           fail=0
           for wf in "${IGNORED[@]}"; do
             if [ ! -f "$wf" ]; then continue; fi
+            # Strip the guard's own PATTERNS block from the scan input so
+            # the step does not self-match on its own literal-pattern array.
+            scan_input=$(sed '/zizmor-cache-poisoning-guard-patterns-start/,/zizmor-cache-poisoning-guard-patterns-end/d' "$wf")
             for pat in "${PATTERNS[@]}"; do
-              if grep -nE "$pat" "$wf" > /dev/null 2>&1; then
+              hits=$(echo "$scan_input" | grep -nE "$pat" || true)
+              if [ -n "$hits" ]; then
                 echo "::error file=$wf::cache-poisoning exception applies to this workflow, but it now contains a publishing action (\"$pat\"). Re-evaluate the .github/zizmor.yml exception."
-                grep -nE "$pat" "$wf" || true
+                echo "$hits"
                 fail=1
               fi
             done

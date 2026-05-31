@@ -171,6 +171,22 @@ jobs:
           # Patterns that indicate a workflow is shipping bytes to a
           # user-visible publishing surface. Keep this list synced with the
           # rationale in `.github/zizmor.yml` `cache-poisoning:` block.
+          #
+          # Coverage notes:
+          # - `gh release create|upload`, `softprops/action-gh-release`,
+          #   `actions/create-release`, `actions/upload-release-asset` →
+          #   GitHub Releases (binary or tag-based).
+          # - `npm publish`, `pnpm publish`, `JS-DevTools/npm-publish` → npm.
+          # - `pypa/gh-action-pypi-publish`, `twine upload` → PyPI.
+          # - `docker push`, `docker buildx ... --push` → Docker registries
+          #   via the docker CLI.
+          # - `docker/build-push-action` → Docker registries via the
+          #   official GHA. The action is flagged regardless of `with.push`
+          #   because that input is set in a separate block grep cannot
+          #   correlate; flagging on action-use is conservative (build-only
+          #   adoption is uncommon in CI and an operator can confirm).
+          # - `goreleaser/goreleaser-action` → Go release toolchain.
+          # - `cargo publish` → crates.io.
           PATTERNS=(
             'gh release create'
             'gh release upload'
@@ -180,8 +196,13 @@ jobs:
             'JS-DevTools/npm-publish'
             'npm publish'
             'pnpm publish'
+            'pypa/gh-action-pypi-publish'
+            'twine upload'
             'docker push'
             'docker buildx[^#]*--push'
+            'docker/build-push-action'
+            'goreleaser/goreleaser-action'
+            'cargo publish'
           )
           # zizmor-cache-poisoning-guard-patterns-end
           fail=0

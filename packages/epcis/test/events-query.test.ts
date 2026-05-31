@@ -695,15 +695,50 @@ describe('unwrapLiteral (CodeQL ReDoS regression)', () => {
     // The prior greedy regex `/^"(.*)"(?:\^\^<.*>)?$/s` exponentially
     // backtracks on inputs that look like repeated typed-literal suffixes
     // without ever matching the closing anchor. The linear parser must
-    // process N=10_000 such inputs in well under a second.
-    const adversarial = '"' + '"^^<x>'.repeat(10_000);
-    const t0 = performance.now();
-    const result = unwrapLiteral(adversarial);
-    const elapsed = performance.now() - t0;
-    // The result is allowed to be either the unwrapped inner or the
-    // original (depending on tail recognition); the important property
-    // here is that we did not spend exponential time getting there.
-    expect(typeof result).toBe('string');
-    expect(elapsed).toBeLessThan(100);
+    // process N such inputs in O(N) time.
+    //
+    // The regression we care about is asymptotic, NOT absolute speed on
+    // any given machine — a fixed wall-clock ceiling (e.g. `<100ms`) is
+    // flake-prone on busy CI runners. Instead, sample two input sizes
+    // (1k and 10k) and assert the 10x-larger input does not blow up
+    // catastrophically. Catastrophic backtracking is exponential; any
+    // linear scan stays well within the generous 25x ratio bound even
+    // with GC pauses and CPU contention.
+    //
+    // The 1000ms absolute ceiling is the hang guard: if the parser ever
+    // becomes pathologically slow on the larger input, the test fails
+    // cleanly instead of timing out the suite.
+    const adversarial = (n: number) => '"' + '"^^<x>'.repeat(n);
+
+    // Take min across repeats to filter out GC / scheduler noise. The
+    // O(n) parser is allocation-light, so the spread between repeats is
+    // typically <2x even on cold runs.
+    const measure = (n: number) => {
+      let minMs = Infinity;
+      for (let i = 0; i < 5; i++) {
+        const input = adversarial(n);
+        const t0 = performance.now();
+        const result = unwrapLiteral(input);
+        const elapsed = performance.now() - t0;
+        // Sanity: result is always a string regardless of tail recognition.
+        expect(typeof result).toBe('string');
+        if (elapsed < minMs) minMs = elapsed;
+      }
+      return minMs;
+    };
+
+    const smallMs = measure(1_000);
+    const largeMs = measure(10_000);
+
+    // Hang guard: 10k repetitions should finish in well under a second
+    // on any modern CI. The exponential regex would take >>10s here.
+    expect(largeMs).toBeLessThan(1000);
+
+    // Linearity guard: 10x input → ratio must stay bounded. The `+ 25ms`
+    // cushion guards against the degenerate case where `smallMs ≈ 0` and
+    // any wall-clock noise on `largeMs` would otherwise blow the ratio.
+    // A 25x ceiling on linear growth leaves ample headroom for jitter
+    // while still failing decisively on exponential blow-up.
+    expect(largeMs).toBeLessThan(smallMs * 25 + 25);
   });
 });

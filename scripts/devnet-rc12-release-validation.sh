@@ -1036,11 +1036,25 @@ print(int(((b - d) * 10000) // b))
     # run. windowSpent > 0 in the current billing window proves Section A
     # core publishes actually drew from the conviction allowance (not just
     # that the surface exists). This is a strong end-to-end coverage check.
-    spent=$($CHAIN_CALL DKGPublishingConvictionNFT windowSpent --json "[\"$accountId\"]" 2>/dev/null | pyf "d.get('result','0')")
-    if [ -n "$spent" ] && [ "$(python3 -c "print(1 if int('$spent' or '0') > 0 else 0)")" = "1" ]; then
-      pass E conviction-allowance-consumed "account=$accountId windowSpent=$spent (Section A publishes drew from conviction allowance)"
+    #
+    # The on-chain selector is `windowSpent(uint256 accountId, uint40 w)` —
+    # the second arg is the billing-window index (0-based, anchored at
+    # `Account.createdAtTimestamp`, advancing every `Chronos.epochLength()`
+    # seconds). Resolve it via the logic contract's dedicated public view
+    # `PublishingConviction.getCurrentBillingWindow(accountId)` rather than
+    # recomputing in shell — that view caps at `lockDurationEpochs` exactly
+    # the way `coverPublishingCost` does, so a freshly-rolled-over window
+    # produces a consistent reading.
+    curWin=$($CHAIN_CALL PublishingConviction getCurrentBillingWindow --json "[\"$accountId\"]" 2>/dev/null | pyf "d.get('result','')")
+    if [ -n "$curWin" ]; then
+      spent=$($CHAIN_CALL DKGPublishingConvictionNFT windowSpent --json "[\"$accountId\",\"$curWin\"]" 2>/dev/null | pyf "d.get('result','0')")
+      if [ -n "$spent" ] && [ "$(python3 -c "print(1 if int('$spent' or '0') > 0 else 0)")" = "1" ]; then
+        pass E conviction-allowance-consumed "account=$accountId window=$curWin windowSpent=$spent (Section A publishes drew from conviction allowance)"
+      else
+        warn E conviction-allowance-consumed "account=$accountId window=$curWin windowSpent=$spent — Section A publishes may not have routed through conviction path (or spent counter resets each window)"
+      fi
     else
-      warn E conviction-allowance-consumed "account=$accountId windowSpent=$spent — Section A publishes may not have routed through conviction path (or spent counter resets each window)"
+      warn E conviction-allowance-consumed "account=$accountId could not resolve current billing window via PublishingConviction.getCurrentBillingWindow"
     fi
   else
     warn E conviction-discount-cost-diff "node1 publisher wallet ${N1_PUB_ADDR:0:10}... not registered as conviction agent (accountId=0) — bootstrap may not have set up publishing-conviction accounts"
@@ -1051,19 +1065,41 @@ fi
 
 # Real publishing-NFT transfer execution. Same rationale as Section D
 # position-transfer-exec: ABI presence is too weak a gate. Round-trip a
-# publishing-NFT token n1 op-wallet -> n5 op-wallet -> n1 op-wallet so the
-# accounting state is unchanged at the end of the test.
+# publishing-NFT token n1 op-wallet -> n5 op-wallet -> n1 op-wallet.
+#
+# CAVEAT — `DKGPublishingConvictionNFT._update()` invokes
+# `PublishingConviction.onTransfer(...)`, which calls `clearAgents(accountId)`
+# on every owner-to-owner transfer. So a naive round-trip leaves the token
+# back at node1 but ERASES every registered publisher-wallet agent (e.g.
+# the N1_PUB_ADDR registration the conviction-discount checks above depend
+# on for subsequent reruns of this harness). To keep this test truly
+# state-neutral, we:
+#
+#   1. Snapshot the registered agents BEFORE the forward transfer.
+#   2. Round-trip the NFT (n1 -> n5 -> n1).
+#   3. After the return-leg lands, re-register the snapshotted agents
+#      against the (now-restored) NFT owner.
+#
+# Re-registration is gated by `_requireOwner(accountId)` on the wrapper,
+# so the call must be signed by N1_OP (matches what we just restored).
 #
 # Holder discovery: the publishing-conviction NFT is minted to the account
 # CREATOR (typically the operator wallet that staked, not the publisher
-# wallet — the publisher wallet is the AGENT). So we query
-# tokenOfOwnerByIndex on the operator's address. If the operator owns
-# multiple tokens we pick index 0.
+# wallet — the publisher wallet is the AGENT). The tokenId equals the
+# accountId. So we query tokenOfOwnerByIndex on the operator's address.
+# If the operator owns multiple tokens we pick index 0.
 if [ -n "$N1_OP" ] && [ -n "$N5_OPADDR" ] && [ -n "$N1_OPADDR" ]; then
   pubbal=$($CHAIN_CALL DKGPublishingConvictionNFT balanceOf --json "[\"$N1_OPADDR\"]" 2>/dev/null | pyf "d.get('result','0')")
   if [ "${pubbal:-0}" -gt 0 ] 2>/dev/null; then
     pubtk=$($CHAIN_CALL DKGPublishingConvictionNFT tokenOfOwnerByIndex --json "[\"$N1_OPADDR\",\"0\"]" 2>/dev/null | pyf "d.get('result','')")
     if [ -n "$pubtk" ] && [ "$pubtk" != "0" ]; then
+      # Snapshot registered agents BEFORE the round-trip so we can restore
+      # them after the return-leg lands (see CAVEAT above). The on-chain
+      # return type is `address[]`; devnet-chain-call.mjs forwards the
+      # ethers v6 Result verbatim through `out()`, so JSON.stringify
+      # serialises it as a real array. Flatten to whitespace-separated
+      # for the bash for-loop below.
+      agents_before=$($CHAIN_CALL DKGPublishingConvictionNFT getRegisteredAgents --json "[\"$pubtk\"]" 2>/dev/null | pyf "' '.join(d.get('result') or [])")
       px1=$($CHAIN_CALL DKGPublishingConvictionNFT safeTransferFrom \
               --sig "safeTransferFrom(address,address,uint256)" \
               --key "$N1_OP" --json "[\"$N1_OPADDR\",\"$N5_OPADDR\",\"$pubtk\"]" 2>/dev/null)
@@ -1076,9 +1112,38 @@ if [ -n "$N1_OP" ] && [ -n "$N5_OPADDR" ] && [ -n "$N1_OPADDR" ]; then
                   --sig "safeTransferFrom(address,address,uint256)" \
                   --key "$N5_OP" --json "[\"$N5_OPADDR\",\"$N1_OPADDR\",\"$pubtk\"]" 2>/dev/null)
           if echo "$px2" | grep -q '"ok":true'; then
-            pass E publishing-nft-transfer-exec "publishing NFT tokenId=$pubtk round-tripped n1<->n5"
+            # Re-register the agents that the round-trip's two transfers
+            # cleared. Without this the conviction-discount section above
+            # would silently warn (accountId=0) on every subsequent
+            # harness run. Failures here are WARN, not FAIL: the token
+            # round-trip itself succeeded; an unregisterable agent is
+            # a separately fixable operational drift.
+            restored=0
+            restore_errs=""
+            if [ -n "$agents_before" ]; then
+              for ag in $agents_before; do
+                # Skip empty / zero / non-address tokens that may slip
+                # through from the json-string fallback parser above.
+                case "$ag" in
+                  0x*[0-9a-fA-F]) : ;;
+                  *) continue ;;
+                esac
+                rr=$($CHAIN_CALL DKGPublishingConvictionNFT registerAgent \
+                        --key "$N1_OP" --json "[\"$pubtk\",\"$ag\"]" 2>/dev/null)
+                if echo "$rr" | grep -q '"ok":true'; then
+                  restored=$((restored + 1))
+                else
+                  restore_errs="$restore_errs ${ag:0:10}=${rr:0:60}"
+                fi
+              done
+            fi
+            if [ -z "$restore_errs" ]; then
+              pass E publishing-nft-transfer-exec "publishing NFT tokenId=$pubtk round-tripped n1<->n5 (re-registered $restored agent(s))"
+            else
+              warn E publishing-nft-transfer-exec "publishing NFT tokenId=$pubtk round-tripped n1<->n5 but agent-restore had errors:$restore_errs"
+            fi
           else
-            fail E publishing-nft-transfer-exec "forward OK but return-trip failed (state drift! token $pubtk now stuck at ${N5_OPADDR:0:10}...): ${px2:0:160}"
+            fail E publishing-nft-transfer-exec "forward OK but return-trip failed (state drift! token $pubtk now stuck at ${N5_OPADDR:0:10}..., agents cleared): ${px2:0:160}"
           fi
         else
           fail E publishing-nft-transfer-exec "transfer tx confirmed but ownerOf=$pnewOwner expected=$N5_OPADDR"

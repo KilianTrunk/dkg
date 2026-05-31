@@ -51,7 +51,7 @@ describe('ChainEventPoller — V10-only event subscriptions', () => {
     await poller.start();
     // Give the synchronous first poll its microtask turn.
     await new Promise((r) => setTimeout(r, 50));
-    poller.stop();
+    await poller.stop();
 
     expect(filters.length).toBeGreaterThanOrEqual(1);
     for (const f of filters) {

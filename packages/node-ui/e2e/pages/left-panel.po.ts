@@ -20,12 +20,33 @@ export class LeftPanelPage {
     this.oraclePlaceholder = page.locator(sel.leftPanel.oraclePlaceholder);
   }
 
+  private myCgSections() {
+    return this.root.locator(sel.myContextGraphs.peerGroupBody).locator(sel.leftPanel.section);
+  }
+
+  private memoryStackControl() {
+    return this.root.locator(sel.leftPanel.dashboard).filter({ hasText: 'Memory Stack' });
+  }
+
   async isVisible() {
     return this.root.isVisible();
   }
 
   async clickDashboard() {
     await this.root.locator(sel.leftPanel.dashboard).filter({ hasText: 'Dashboard' }).click();
+  }
+
+  async clickMemoryStack() {
+    const sidebar = this.memoryStackControl();
+    if (await sidebar.isVisible().catch(() => false)) {
+      await sidebar.click();
+      return;
+    }
+    throw new Error('Memory Stack navigation control not found (expected .v10-tree-dashboard with "Memory Stack" label)');
+  }
+
+  async isMemoryStackVisible() {
+    return this.memoryStackControl().isVisible().catch(() => false);
   }
 
   async switchToMode(mode: 'explorer' | 'oracle') {
@@ -41,7 +62,11 @@ export class LeftPanelPage {
   }
 
   async clickNewProject() {
-    await this.newProjectBtn.first().click();
+    await this.newProjectBtn.filter({ hasText: '+ New Context Graph' }).click();
+  }
+
+  async waitForProjectsLoaded() {
+    await this.myCgSections().locator(sel.leftPanel.sectionLabel).first().waitFor({ state: 'visible', timeout: 15_000 });
   }
 
   async clickJoinProject() {
@@ -56,15 +81,23 @@ export class LeftPanelPage {
    * up the parent peer-group label or the Integrations section.
    */
   async getProjectNames() {
-    const body = this.root.locator(sel.leftPanel.peerGroupBody).first();
-    const labels = body.locator(sel.leftPanel.sectionLabel);
+    await this.waitForProjectsLoaded();
+    const labels = this.myCgSections().locator(sel.leftPanel.sectionLabel);
     const count = await labels.count();
     const names: string[] = [];
     for (let i = 0; i < count; i++) {
       const text = await labels.nth(i).textContent();
-      if (text) names.push(text.trim());
+      if (text && !text.includes('No context graphs')) names.push(text.trim());
     }
     return names;
+  }
+
+  async expandProject(name: string) {
+    await this.waitForProjectsLoaded();
+    await this.myCgSections()
+      .locator(sel.leftPanel.sectionHeader)
+      .filter({ hasText: name })
+      .click();
   }
 
   /**
@@ -88,8 +121,23 @@ export class LeftPanelPage {
     await section.locator(sel.leftPanel.sectionHeader).first().getByRole('button', { name: '×' }).click();
   }
 
+  async clickLayer(projectName: string, layer: 'wm' | 'swm' | 'vm' | 'import') {
+    await this.expandProject(projectName);
+    const tab = this.page.locator(sel.center.tab).filter({ hasText: projectName });
+    await tab.click();
+    await tab.waitFor({ state: 'visible' });
+    const root = this.page.locator('.v10-center-content .v10-memory-explorer').filter({
+      has: this.page.getByRole('button', { name: projectName }),
+    });
+    if (layer === 'import') {
+      await root.locator(sel.layer.actionBtn).filter({ hasText: /Import/i }).click();
+      return;
+    }
+    await root.locator(`${sel.layer.switchBtn}[data-layer="${layer}"]`).click();
+  }
+
   async expandIntegrations() {
-    const header = this.root.locator(sel.leftPanel.peerGroupHeader).filter({ hasText: 'Integrations' });
+    const header = this.page.locator('.v10-peer-group-header').filter({ hasText: 'Integrations' });
     await header.click();
   }
 

@@ -659,6 +659,80 @@ describe('[Q-3] resolveViewGraphs + DKGQueryEngine route working-memory', () => 
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// View routing constrains caller GRAPH variables to the selected View
+// ─────────────────────────────────────────────────────────────────────────────
+describe('DKGQueryEngine view routing constrains GRAPH variables', () => {
+  it('verified-memory with GRAPH ?g does not read SWM-only data', async () => {
+    const store = new OxigraphStore();
+    const engine = new DKGQueryEngine(store);
+
+    await store.insert([
+      quad('urn:view:swm-only', 'http://schema.org/name', '"SwmOnly"', contextGraphSharedMemoryUri(CG)),
+    ]);
+
+    const result = await engine.query(
+      'SELECT ?g ?name WHERE { GRAPH ?g { ?s <http://schema.org/name> ?name } }',
+      { contextGraphId: CG, view: 'verified-memory' },
+    );
+
+    expect(result.bindings).toEqual([]);
+  });
+
+  it('shared-working-memory with GRAPH ?g does not read verified data', async () => {
+    const store = new OxigraphStore();
+    const engine = new DKGQueryEngine(store);
+
+    await store.insert([
+      quad('urn:view:verified-only', 'http://schema.org/name', '"VerifiedOnly"', contextGraphVerifiedMemoryUri(CG, 'published')),
+    ]);
+
+    const result = await engine.query(
+      'SELECT ?g ?name WHERE { GRAPH ?g { ?s <http://schema.org/name> ?name } }',
+      { contextGraphId: CG, view: 'shared-working-memory' },
+    );
+
+    expect(result.bindings).toEqual([]);
+  });
+
+  it('working-memory with GRAPH ?g does not read another agent assertion', async () => {
+    const store = new OxigraphStore();
+    const engine = new DKGQueryEngine(store);
+    const agent = '0xAbC0000000000000000000000000000000000001';
+    const otherAgent = '0xDeAd000000000000000000000000000000000002';
+
+    await store.insert([
+      quad('urn:view:mine', 'http://schema.org/name', '"Mine"', contextGraphAssertionUri(CG, agent, 'mine')),
+      quad('urn:view:theirs', 'http://schema.org/name', '"Theirs"', contextGraphAssertionUri(CG, otherAgent, 'theirs')),
+    ]);
+
+    const result = await engine.query(
+      'SELECT ?g ?name WHERE { GRAPH ?g { ?s <http://schema.org/name> ?name } }',
+      { contextGraphId: CG, view: 'working-memory', agentAddress: agent },
+    );
+
+    expect(result.bindings.map((b) => b['name'])).toEqual(['"Mine"']);
+  });
+
+  it('verified-memory minTrust with GRAPH ?g fails closed instead of returning trusted data', async () => {
+    const store = new OxigraphStore();
+    const engine = new DKGQueryEngine(store);
+    const graph = contextGraphVerifiedMemoryUri(CG, 'trusted-graph-pattern');
+
+    await store.insert([
+      quad('urn:view:trusted', 'http://schema.org/name', '"Trusted"', graph),
+      quad('urn:view:trusted', 'http://dkg.io/ontology/trustLevel', `"${TrustLevel.ConsensusVerified}"`, graph),
+    ]);
+
+    const result = await engine.query(
+      'SELECT ?g ?name WHERE { GRAPH ?g { ?s <http://schema.org/name> ?name } }',
+      { contextGraphId: CG, view: 'verified-memory', minTrust: TrustLevel.Endorsed },
+    );
+
+    expect(result.bindings).toEqual([]);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Q-4  QueryHandler.executeSparql timeout → GAS_LIMIT_EXCEEDED
 // ─────────────────────────────────────────────────────────────────────────────
 describe('[Q-4] QueryHandler executeSparql hits the timeout path', () => {

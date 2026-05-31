@@ -9,6 +9,7 @@ import {ProfileStorage} from "./storage/ProfileStorage.sol";
 import {ShardingTableStorage} from "./storage/ShardingTableStorage.sol";
 import {StakingStorage} from "./storage/StakingStorage.sol";
 import {ConvictionStakingStorage} from "./storage/ConvictionStakingStorage.sol";
+import {V8MigrationEligibility} from "./storage/V8MigrationEligibility.sol";
 import {IdentityStorage} from "./storage/IdentityStorage.sol";
 import {RandomSamplingStorage} from "./storage/RandomSamplingStorage.sol";
 import {EpochStorage} from "./storage/EpochStorage.sol";
@@ -22,6 +23,7 @@ import {Permissions} from "./libraries/Permissions.sol";
 import {StakingLib} from "./libraries/StakingLib.sol";
 import {TokenLib} from "./libraries/TokenLib.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 /**
  * @title StakingV10
@@ -75,6 +77,8 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
  *     because relock materially changes tier / multiplier / expiry.
  */
 contract StakingV10 is INamed, IVersioned, ContractStatus, IInitializable {
+    using SafeERC20 for IERC20;
+
     // ========================================================================
     // Metadata
     // ========================================================================
@@ -111,7 +115,20 @@ contract StakingV10 is INamed, IVersioned, ContractStatus, IInitializable {
     //             `parametersStorage.stakeWithdrawalDelay` cooldown.
     //           * `stakingStorage` is retained ONLY for `_convertToNFT`'s
     //             V8→V10 drain at cutover.
-    string private constant _VERSION = "3.0.0";
+    //   3.1.0 — V8→V10 migration conviction credit (CSS v4.1.0):
+    //           * `_convertToNFT` consults the new `V8MigrationEligibility`
+    //             registry and, for migrants picking lockTier 6 or 12 who
+    //             held continuous V8 stake on the destination node for the
+    //             60 days preceding V10 launch, shortens the V10 NFT's
+    //             default `expiryTimestamp` by 2 epochs (60 days).
+    //           * Eligibility set is fixed off-chain and frozen on-chain
+    //             before migration opens; no V10 hot-path code reconstructs
+    //             V8 history.
+    //           * `convictionStorage.createPosition(...)` calls now pass the
+    //             new `expiryShortenedBy` arg (CSS v4.1.0). `stake` always
+    //             passes 0; `_convertToNFT` passes 0 except for eligible
+    //             6m/12m migrants.
+    string private constant _VERSION = "10.0.2";
 
     // ========================================================================
     // Constants
@@ -133,6 +150,11 @@ contract StakingV10 is INamed, IVersioned, ContractStatus, IInitializable {
     ///         exclusively (v4.0.0 consolidation).
     StakingStorage public stakingStorage;
     ConvictionStakingStorage public convictionStorage;
+    /// @notice v3.1.0 — frozen registry of V8 delegators eligible for the
+    ///         60-day V10 conviction-lock credit. Read by `_convertToNFT`
+    ///         on every migration to decide whether the destination NFT's
+    ///         `expiryTimestamp` is shortened by 2 epochs.
+    V8MigrationEligibility public v8MigrationEligibility;
     Chronos public chronos;
     RandomSamplingStorage public randomSamplingStorage;
     ShardingTableStorage public shardingTableStorage;
@@ -212,6 +234,7 @@ contract StakingV10 is INamed, IVersioned, ContractStatus, IInitializable {
     function initialize() external onlyHub {
         stakingStorage = StakingStorage(hub.getContractAddress("StakingStorage"));
         convictionStorage = ConvictionStakingStorage(hub.getContractAddress("ConvictionStakingStorage"));
+        v8MigrationEligibility = V8MigrationEligibility(hub.getContractAddress("V8MigrationEligibility"));
         chronos = Chronos(hub.getContractAddress("Chronos"));
         randomSamplingStorage = RandomSamplingStorage(hub.getContractAddress("RandomSamplingStorage"));
         shardingTableStorage = ShardingTableStorage(hub.getContractAddress("ShardingTableStorage"));
@@ -314,22 +337,33 @@ contract StakingV10 is INamed, IVersioned, ContractStatus, IInitializable {
         uint256 totalNodeStakeAfter = convictionStorage.getNodeStakeV10(identityId) + uint256(amount);
         if (totalNodeStakeAfter > maxStake) revert MaxStakeExceeded();
 
+        if (token.allowance(staker, address(this)) < amount) {
+            revert TokenLib.TooLowAllowance(address(token), token.allowance(staker, address(this)), amount);
+        }
+
+        if (token.balanceOf(staker) < amount) {
+            revert TokenLib.TooLowBalance(address(token), token.balanceOf(staker), amount);
+        }
+
         _prepareForStakeChangeV10(chronos.getCurrentEpoch(), tokenId, identityId);
 
         // v4.0.0 — TRAC flows into the CSS vault. CSS extends Guardian and
         // exposes `transferStake` for the withdraw outflow side. The NFT
         // wrapper never holds funds; the V8 StakingStorage is no longer in
         // the deposit path.
-        token.transferFrom(staker, address(convictionStorage), amount);
+        token.safeTransferFrom(staker, address(convictionStorage), amount);
 
         // L11 — multiplier18 is no longer passed in; CSS reads it from the
         //       tier table (single source of truth).
+        // v4.1.0 — fresh V10 stakes never receive the V8 migration credit;
+        //          `expiryShortenedBy` is therefore always 0 here.
         convictionStorage.createPosition(
             tokenId,
             identityId,
             amount,
             lockTier,
-            0 // fresh V10 stake: no migrationEpoch
+            0, // fresh V10 stake: no migrationEpoch
+            0 // fresh V10 stake: no expiry credit
         );
 
         // Sharding-table maintenance gates on the V10 canonical node stake.
@@ -870,9 +904,12 @@ contract StakingV10 is INamed, IVersioned, ContractStatus, IInitializable {
      *
      * V10-side state seed:
      *   - `cs.createPosition(tokenId, id, stakeBase + pending, lockTier,
-     *     multiplier18, migrationEpoch = currentEpoch)`. This also pushes
-     *     the tokenId into `nodeTokens[id]` and increments nodeStakeV10 +
-     *     totalStakeV10 in the same call (D5 + D15).
+     *     migrationEpoch = currentEpoch, expiryShortenedBy)`. This also
+     *     pushes the tokenId into `nodeTokens[id]` and increments
+     *     nodeStakeV10 + totalStakeV10 in the same call (D5 + D15).
+     *     `expiryShortenedBy` is the V8→V10 conviction credit
+     *     (`2 * chronos.epochLength()` for eligible 6m/12m migrants,
+     *     0 otherwise). See v3.1.0 release note above.
      *
      * Preconditions absorbed in the V10 migration simplification:
      *   - NO V8 rolling-rewards / lastClaimedEpoch precondition: D3 drops
@@ -934,13 +971,51 @@ contract StakingV10 is INamed, IVersioned, ContractStatus, IInitializable {
             if (v10NodeAfter > maxStake) revert MaxStakeExceeded();
         }
 
+        // v3.1.0 — V8→V10 conviction credit. Eligible delegators (continuous
+        // V8 stake on this node for the 60d preceding V10 launch, recorded in
+        // the frozen `V8MigrationEligibility` registry) who pick a high-
+        // conviction tier (6 or 12) get their lock shortened by a fixed
+        // 60 days. Lower tiers and ineligible migrants migrate at the
+        // default lock.
+        //
+        // Frozen-registry precondition: every migration must read against a
+        // finalised eligibility set. Without `frozen() == true`, HubOwner
+        // could still grow the set after migrations open, which would let
+        // two otherwise-identical migrants receive different lock expiries
+        // depending on tx ordering. Failing loud (vs. silently skipping the
+        // bonus) protects eligible delegators against the operator
+        // mis-ordering the runbook — they get a clean revert and can retry
+        // after `freeze()` lands, instead of paying the migration tx and
+        // losing the credit. The runbook
+        // (V8_MIGRATION_CREDIT_RUNBOOK.md) already calls `freeze()` as
+        // the last step before opening migration, so this just enforces
+        // the documented invariant on-chain.
+        uint40 expiryShortenedBy = 0;
+        if (lockTier == 6 || lockTier == 12) {
+            V8MigrationEligibility eligibility = v8MigrationEligibility;
+            require(eligibility.frozen(), "V8 eligibility not frozen");
+            if (eligibility.isEligible(identityId, delegator)) {
+                // Fixed 60-day credit, expressed in seconds. Earlier revs
+                // computed this as `chronos.epochLength() * 2` to track
+                // the "two epochs" framing, but that silently degrades on
+                // networks where `epochLength` is tuned (devnet: 1h →
+                // 2h credit; testnet: 1d → 2d credit). The off-chain
+                // eligibility window in `V8MigrationEligibility` is a
+                // fixed 60-day wall-clock window preceding V10 launch,
+                // so the credit must match — independent of the
+                // destination network's epoch tuning.
+                expiryShortenedBy = uint40(60 days);
+            }
+        }
+
         // L11 — multiplier18 is no longer passed; CSS reads it from the tier table.
         convictionStorage.createPosition(
             tokenId,
             identityId,
             total,
             lockTier,
-            uint32(currentEpoch) // D6 — retroactive claim boundary
+            uint32(currentEpoch), // D6 — retroactive claim boundary
+            expiryShortenedBy // v3.1.0 — V8→V10 conviction credit (0 if not applied)
         );
 
         // Sharding-table: V8 drain + V10 seed of the same on-node total is

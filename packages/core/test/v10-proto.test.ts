@@ -11,11 +11,21 @@ import {
   encodeGossipEnvelope,
   decodeGossipEnvelope,
   computeGossipSigningPayload,
+  computeGossipSigningPayloadV2,
+  GOSSIP_TYPE_WORKSPACE_PUBLISH,
+  GOSSIP_TYPE_WORKSPACE_PUBLISH_CHUNKED,
+  encodePublishIntent,
+  decodePublishIntent,
+  ACK_PROTOCOL_VERSION_V1_LU5,
+  ACK_PROTOCOL_VERSION_V2_LU11,
+  PROTOCOL_STORAGE_ACK,
+  PROTOCOL_STORAGE_ACK_V2,
   type VerifyProposalMsg,
   type VerifyApprovalMsg,
   type StorageACKMsg,
   type SwmShareAckMsg,
   type GossipEnvelopeMsg,
+  type PublishIntentMsg,
 } from '../src/index.js';
 
 function randomBytes(n: number): Uint8Array {
@@ -334,5 +344,151 @@ describe('binary compatibility', () => {
     const decoded = decodeVerifyProposal(encoded);
     expect(decoded.entities).toEqual([]);
     expect(decoded.contextGraphId).toBe('');
+  });
+});
+
+// ── LU-11 / RFC-39 — chunked-commitment wire-format additions ──────────
+
+describe('GossipEnvelope LU-11 — swmMessageIndex + chunked type discriminator', () => {
+  const baseEnvelope: GossipEnvelopeMsg = {
+    version: '10.0.0',
+    type: GOSSIP_TYPE_WORKSPACE_PUBLISH,
+    contextGraphId: 'cg-42',
+    agentAddress: '0xAbc123',
+    timestamp: '2026-04-02T12:00:00Z',
+    signature: randomBytes(65),
+    payload: new TextEncoder().encode('chunk-bytes'),
+  };
+
+  it('chunked vs legacy type marker are distinct strings', () => {
+    expect(GOSSIP_TYPE_WORKSPACE_PUBLISH).toBe('share-write');
+    expect(GOSSIP_TYPE_WORKSPACE_PUBLISH_CHUNKED).toBe('share-write-chunked');
+  });
+
+  it('legacy envelope round-trips with swmMessageIndex defaulting to proto3 zero', () => {
+    // proto3 elides zero/absent fields on the wire and decoders return
+    // the default (0 for uint32). That's WHY we can't use field-presence
+    // as the V1-vs-V2 discriminator — `type` is the discriminator instead.
+    const decoded = decodeGossipEnvelope(encodeGossipEnvelope(baseEnvelope));
+    expect(decoded.type).toBe(GOSSIP_TYPE_WORKSPACE_PUBLISH);
+    expect(decoded.swmMessageIndex ?? 0).toBe(0);
+  });
+
+  it('chunked envelope round-trips swmMessageIndex when present (including chunkId 0)', () => {
+    for (const chunkId of [0, 1, 42]) {
+      const decoded = decodeGossipEnvelope(
+        encodeGossipEnvelope({
+          ...baseEnvelope,
+          type: GOSSIP_TYPE_WORKSPACE_PUBLISH_CHUNKED,
+          swmMessageIndex: chunkId,
+        }),
+      );
+      expect(decoded.type).toBe(GOSSIP_TYPE_WORKSPACE_PUBLISH_CHUNKED);
+      expect(decoded.swmMessageIndex ?? 0).toBe(chunkId);
+    }
+  });
+
+  it('LU-11 envelope keeps every original field bit-identical (additive proto3 extension)', () => {
+    const encoded = encodeGossipEnvelope({
+      ...baseEnvelope,
+      type: GOSSIP_TYPE_WORKSPACE_PUBLISH_CHUNKED,
+      swmMessageIndex: 7,
+    });
+    const decoded = decodeGossipEnvelope(encoded);
+    expect(decoded.version).toBe(baseEnvelope.version);
+    expect(decoded.contextGraphId).toBe(baseEnvelope.contextGraphId);
+    expect(decoded.agentAddress).toBe(baseEnvelope.agentAddress);
+    expect(decoded.timestamp).toBe(baseEnvelope.timestamp);
+    expect(new Uint8Array(decoded.signature)).toEqual(baseEnvelope.signature);
+    expect(new Uint8Array(decoded.payload)).toEqual(baseEnvelope.payload);
+    expect(decoded.swmMessageIndex ?? 0).toBe(7);
+  });
+});
+
+describe('computeGossipSigningPayloadV2 (LU-11)', () => {
+  const payload = new TextEncoder().encode('chunk-bytes');
+
+  it('produces a different signing payload from V1 (carries swmMessageIndex)', () => {
+    const v1 = computeGossipSigningPayload('share-write', 'cg-42', '2026-04-02T12:00:00Z', payload);
+    const v2 = computeGossipSigningPayloadV2('share-write', 'cg-42', '2026-04-02T12:00:00Z', payload, 0);
+    expect(v1).not.toEqual(v2);
+  });
+
+  it('extends V1 by exactly one length-framed 4-byte big-endian uint32 field', () => {
+    const v1 = computeGossipSigningPayload('t', 'c', '1', new Uint8Array([0xde, 0xad]));
+    const v2 = computeGossipSigningPayloadV2('t', 'c', '1', new Uint8Array([0xde, 0xad]), 0);
+    // V2 == V1 || [4-byte length-prefix == 4] || [4-byte BE uint32(0)]
+    expect(v2.slice(0, v1.length)).toEqual(v1);
+    expect(Array.from(v2.slice(v1.length))).toEqual([
+      0, 0, 0, 4, // length prefix
+      0, 0, 0, 0, // BE uint32(0)
+    ]);
+  });
+
+  it('rotates with swmMessageIndex (changing the index changes the signing payload)', () => {
+    const a = computeGossipSigningPayloadV2('share-write', 'cg-42', '2026-04-02T12:00:00Z', payload, 0);
+    const b = computeGossipSigningPayloadV2('share-write', 'cg-42', '2026-04-02T12:00:00Z', payload, 1);
+    expect(a).not.toEqual(b);
+  });
+
+  it('rejects negative or non-integer swmMessageIndex', () => {
+    expect(() => computeGossipSigningPayloadV2('t', 'c', '1', payload, -1)).toThrow(/non-negative integer/);
+    expect(() => computeGossipSigningPayloadV2('t', 'c', '1', payload, 1.5)).toThrow(/non-negative integer/);
+  });
+});
+
+describe('PublishIntent — LU-11 fields (ciphertextChunksRoot, ciphertextChunkCount, ackProtocolVersion)', () => {
+  function baseIntent(): PublishIntentMsg {
+    return {
+      merkleRoot: new Uint8Array(32).fill(0xab),
+      contextGraphId: '42',
+      publisherPeerId: '12D3KooWPublisher',
+      publicByteSize: 1024,
+      isPrivate: false,
+      kaCount: 1,
+      rootEntities: ['urn:entity:root'],
+    };
+  }
+
+  it('legacy v1 intent decodes with LU-11 fields at their proto3 zero defaults', () => {
+    // proto3 elides missing scalars and bytes; decoders return defaults:
+    // - bytes → empty Uint8Array (length 0)
+    // - uint32 → 0
+    // Receivers MUST treat `ackProtocolVersion < 2` as "V1 single-blob"
+    // because field-presence isn't a reliable discriminator in proto3.
+    const decoded = decodePublishIntent(encodePublishIntent(baseIntent()));
+    expect(decoded.ciphertextChunksRoot?.length ?? 0).toBe(0);
+    expect(decoded.ciphertextChunkCount ?? 0).toBe(0);
+    expect(decoded.ackProtocolVersion ?? 0).toBe(0);
+  });
+
+  it('encode → decode round-trips the three LU-11 fields together', () => {
+    const root = new Uint8Array(32).fill(0xcd);
+    const intent: PublishIntentMsg = {
+      ...baseIntent(),
+      isEncryptedPayload: true,
+      ciphertextChunksRoot: root,
+      ciphertextChunkCount: 5,
+      ackProtocolVersion: ACK_PROTOCOL_VERSION_V2_LU11,
+    };
+    const decoded = decodePublishIntent(encodePublishIntent(intent));
+    expect(new Uint8Array(decoded.ciphertextChunksRoot!)).toEqual(root);
+    expect(decoded.ciphertextChunkCount).toBe(5);
+    expect(decoded.ackProtocolVersion).toBe(ACK_PROTOCOL_VERSION_V2_LU11);
+    // Legacy fields still round-trip verbatim.
+    expect(decoded.contextGraphId).toBe('42');
+    expect(decoded.isEncryptedPayload).toBe(true);
+    expect(decoded.kaCount).toBe(1);
+  });
+
+  it('ackProtocolVersion constants are stable wire values', () => {
+    expect(ACK_PROTOCOL_VERSION_V1_LU5).toBe(1);
+    expect(ACK_PROTOCOL_VERSION_V2_LU11).toBe(2);
+  });
+
+  it('PROTOCOL_STORAGE_ACK_V2 is a sibling of (not replacement for) V1', () => {
+    expect(PROTOCOL_STORAGE_ACK).toBe('/dkg/10.0.1/storage-ack');
+    expect(PROTOCOL_STORAGE_ACK_V2).toBe('/dkg/10.0.2/storage-ack');
+    expect(PROTOCOL_STORAGE_ACK).not.toBe(PROTOCOL_STORAGE_ACK_V2);
   });
 });

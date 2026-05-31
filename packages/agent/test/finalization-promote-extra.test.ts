@@ -116,12 +116,183 @@ describe('A-4: promoteSharedMemoryToCanonical lands data in the CANONICAL data g
   });
 });
 
+describe('PR #779: same-graph dual-write into root + per-on-chain-id partition', () => {
+  // Pin the new behaviour added to fix the v10-rc-validation §5
+  // gossip-replication regression: when the publisher kept a root copy of
+  // the canonical quads (same-graph publish, signalled on the wire by
+  // `keepRootCopyOnLabel: true`), receivers MUST also write the quads to
+  // the root `<cg>` graph alongside the per-on-chain-id partition
+  // `<cg>/context/<ctxGraphId>`. Without this, label-scoped queries
+  // (`contextGraphId=<label>` with no `/context/<num>` suffix) return 0
+  // bindings on every replica even though the data is local. CI was
+  // previously only exercising the remap branch via `e2e-context-graph`,
+  // so a regression on the new wire flag would have escaped — the
+  // automated suite now pins both branches (Codex review on PR #779 r2).
+  const cgRoot = `did:dkg:context-graph:${CONTEXT_GRAPH}`;
+  const cgPerCgId = `did:dkg:context-graph:${CONTEXT_GRAPH}/context/42`;
+
+  it('keepRootCopyOnLabel=true → quads AND meta land in BOTH root and per-cgId graphs', async () => {
+    const store = new OxigraphStore();
+    const handler = new FinalizationHandler(store, undefined);
+    const entity = 'urn:dualwrite:alice';
+    const publisher = '0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266';
+    const ual = 'did:dkg:evm:31337/0xDW/1';
+    const quads = [
+      { subject: entity, predicate: 'http://schema.org/name', object: '"DualWrite"', graph: '' },
+    ];
+
+    await (handler as any).promoteSharedMemoryToCanonical(
+      CONTEXT_GRAPH,
+      quads,
+      ual,
+      [entity],
+      publisher,
+      '0x' + '11'.repeat(32),
+      300,
+      1n, 1n, 1n,
+      createOperationContext('system'),
+      '42', // ctxGraphId — non-undefined enables per-cgId partition routing
+      undefined, // subGraphName
+      undefined, // authorAddress
+      true, // keepRootCopyOnLabel — same-graph signal from the wire
+    );
+
+    const perCgIdAsk = await store.query(
+      `ASK { GRAPH <${cgPerCgId}> { <${entity}> <http://schema.org/name> "DualWrite" } }`,
+    );
+    expect(perCgIdAsk.type).toBe('boolean');
+    if (perCgIdAsk.type === 'boolean') expect(perCgIdAsk.value).toBe(true);
+
+    const rootAsk = await store.query(
+      `ASK { GRAPH <${cgRoot}> { <${entity}> <http://schema.org/name> "DualWrite" } }`,
+    );
+    expect(rootAsk.type).toBe('boolean');
+    if (rootAsk.type === 'boolean') {
+      expect(
+        rootAsk.value,
+        'same-graph publish (keepRootCopyOnLabel=true) MUST mirror publisher dual-write so label-scoped queries find the data on replicas',
+      ).toBe(true);
+    }
+
+    // Codex r3: confirmed `_meta` must also live in BOTH root `_meta` and
+    // per-cgId `_meta` so label-only status / UAL / authoredBy lookups
+    // converge across publisher and replicas. Pin the dual-write of the
+    // confirmed status quad on both meta graphs.
+    const rootMeta = `did:dkg:context-graph:${CONTEXT_GRAPH}/_meta`;
+    const perCgIdMeta = `did:dkg:context-graph:${CONTEXT_GRAPH}/context/42/_meta`;
+    const rootMetaAsk = await store.query(
+      `ASK { GRAPH <${rootMeta}> { <${ual}> <http://dkg.io/ontology/status> "confirmed" } }`,
+    );
+    expect(rootMetaAsk.type).toBe('boolean');
+    if (rootMetaAsk.type === 'boolean') {
+      expect(
+        rootMetaAsk.value,
+        'same-graph publish must dual-write confirmed `_meta` to ROOT meta graph too — label-only meta lookups otherwise miss the KC on replicas',
+      ).toBe(true);
+    }
+    const perCgIdMetaAsk = await store.query(
+      `ASK { GRAPH <${perCgIdMeta}> { <${ual}> <http://dkg.io/ontology/status> "confirmed" } }`,
+    );
+    expect(perCgIdMetaAsk.type).toBe('boolean');
+    if (perCgIdMetaAsk.type === 'boolean') expect(perCgIdMetaAsk.value).toBe(true);
+  });
+
+  it('keepRootCopyOnLabel=false → root stays empty (remap-style publisher deleted root)', async () => {
+    const store = new OxigraphStore();
+    const handler = new FinalizationHandler(store, undefined);
+    const entity = 'urn:dualwrite:remap';
+    const publisher = '0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266';
+    const quads = [
+      { subject: entity, predicate: 'http://schema.org/name', object: '"Remap"', graph: '' },
+    ];
+
+    await (handler as any).promoteSharedMemoryToCanonical(
+      CONTEXT_GRAPH,
+      quads,
+      'did:dkg:evm:31337/0xRM/1',
+      [entity],
+      publisher,
+      '0x' + '22'.repeat(32),
+      301,
+      1n, 1n, 1n,
+      createOperationContext('system'),
+      '42', // ctxGraphId set
+      undefined, // subGraphName
+      undefined, // authorAddress
+      false, // keepRootCopyOnLabel=false — remap-style, publisher deleted root
+    );
+
+    const perCgIdAsk = await store.query(
+      `ASK { GRAPH <${cgPerCgId}> { <${entity}> <http://schema.org/name> "Remap" } }`,
+    );
+    expect(perCgIdAsk.type).toBe('boolean');
+    if (perCgIdAsk.type === 'boolean') expect(perCgIdAsk.value).toBe(true);
+
+    const rootAsk = await store.query(
+      `ASK { GRAPH <${cgRoot}> { <${entity}> <http://schema.org/name> "Remap" } }`,
+    );
+    expect(rootAsk.type).toBe('boolean');
+    if (rootAsk.type === 'boolean') {
+      expect(
+        rootAsk.value,
+        'remap-style publish (keepRootCopyOnLabel=false) MUST NOT dual-write root — receiver would re-expose KC under source CG label and double-count in unscoped queries',
+      ).toBe(false);
+    }
+  });
+
+  it('keepRootCopyOnLabel undefined (older publisher) at promote-call layer → conservative no-dual-write', async () => {
+    // Codex r5b — the receiver-side legacy-publisher fallback that
+    // earlier rounds inferred from
+    // `targetContextGraphId === local-on-chain-id` is GONE. That signal
+    // can't distinguish a legacy same-graph publish from an explicit
+    // remap-to-self (`subContextGraphId === ownCG.onChainId`), so the
+    // fallback would re-add a root copy the publisher had intentionally
+    // dropped. The new contract is simpler and unambiguous: only an
+    // explicit wire-level `keepRootCopyOnLabel === true` triggers the
+    // recipient dual-write. Anything else — `false`, `undefined`, an
+    // unknown forward-compat sentinel, a legacy message with no tag-15
+    // at all — keeps the per-cgId-only path. This test pins the
+    // `undefined` case at the lower-level promote API; the wire-flag
+    // round-trips and legacy decode behaviour are covered by
+    // `proto-finalization-edge.test.ts`.
+    const store = new OxigraphStore();
+    const handler = new FinalizationHandler(store, undefined);
+    const entity = 'urn:dualwrite:legacy';
+    const publisher = '0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266';
+    const quads = [
+      { subject: entity, predicate: 'http://schema.org/name', object: '"Legacy"', graph: '' },
+    ];
+
+    await (handler as any).promoteSharedMemoryToCanonical(
+      CONTEXT_GRAPH,
+      quads,
+      'did:dkg:evm:31337/0xLG/1',
+      [entity],
+      publisher,
+      '0x' + '33'.repeat(32),
+      302,
+      1n, 1n, 1n,
+      createOperationContext('system'),
+      '42',
+      undefined,
+      undefined,
+      undefined, // keepRootCopyOnLabel undefined at the promote layer
+    );
+
+    const rootAsk = await store.query(
+      `ASK { GRAPH <${cgRoot}> { <${entity}> <http://schema.org/name> "Legacy" } }`,
+    );
+    expect(rootAsk.type).toBe('boolean');
+    if (rootAsk.type === 'boolean') expect(rootAsk.value).toBe(false);
+  });
+});
+
 describe('Round 5 §10: replica-side dkg:Publication / dkg:authoredBy provenance', () => {
   it('emits dkg:authoredBy + dkg:Publication when authorAddress is threaded through', async () => {
     // Regression for the round-5 review finding: replicas confirming a KC via
     // FinalizationHandler used to rebuild `_meta` without `dkg:authoredBy`,
     // making author provenance inconsistent across the network. Fix threads
-    // the EIP-712-attested author from `KnowledgeCollectionCreated.author`
+    // the EIP-712-attested author from `KnowledgeAssetCreated.author`
     // into `KCMetadata` via `verifyOnChain`. This unit-level pin verifies the
     // promote-side wiring without standing up a full chain.
     const store = new OxigraphStore();
@@ -163,7 +334,7 @@ describe('Round 5 §10: replica-side dkg:Publication / dkg:authoredBy provenance
 
   it('skips Publication block when authorAddress is the unattributed sentinel (address(0))', async () => {
     // RFC-001 §3.6 unattributed-publish path on chain stores
-    // `address(0)` for `KnowledgeCollectionCreated.author`. Replicas must
+    // `address(0)` for `KnowledgeAssetCreated.author`. Replicas must
     // preserve that semantic by NOT emitting a Publication subject — the
     // legacy no-author behaviour is the contract for downstream queries
     // that treat presence of `dkg:authoredBy` as "verified author on file".
@@ -261,5 +432,54 @@ describe('A-4: e2e — agent.publish() data lands in canonical (data) view post-
       swmQr.bindings.length,
       'SWM must be cleared after confirmed publish — lingering quads indicate a failed promotion cleanup',
     ).toBe(0);
+  });
+});
+
+describe('#774 F1: registerContextGraph access-policy mismatch is rejected (Codex review on #777)', () => {
+  // Regression coverage for #774 finding #1. Before this fix, a CG
+  // created public could be registered on-chain with `accessPolicy: 1`
+  // (curated). The on-chain side ended up curated while the local
+  // ACL stayed open; the next `dkg publish` then tripped the
+  // pre-publish LU-5 guard with a mismatch error and the operator had
+  // no easy path to recover. The fix fails fast at register time with
+  // a remediation pointer. These tests pin both the rejection branch
+  // and the matching-policy branch so the half-registered state can't
+  // slip back in.
+  it('rejects register({ accessPolicy: 1 }) on a public-created CG with a remediation message', async () => {
+    // Codex r2 on #777: capture the rejection once and assert all
+    // substrings against the same error object — the previous draft
+    // invoked `registerContextGraph` twice just to match two
+    // fragments, and the new guard runs after some local metadata
+    // setup so a future refactor could make the second call land in
+    // a different state/path while the test still passes.
+    const cgId = `f1-mismatch-${ethers.hexlify(ethers.randomBytes(3)).slice(2)}`;
+    await nodeA!.createContextGraph({ id: cgId, name: 'F1 mismatch', description: '' });
+
+    let caught: Error | undefined;
+    try {
+      await nodeA!.registerContextGraph(cgId, { accessPolicy: 1 });
+    } catch (e) {
+      caught = e as Error;
+    }
+    expect(caught, 'expected register({ accessPolicy: 1 }) to reject').toBeDefined();
+    const msg = caught!.message;
+    expect(msg, 'message must surface the actual local ACL state').toMatch(
+      /local access policy=public\/open \(0\)/i,
+    );
+    expect(msg, 'message must point at the supported atomic create+register path').toMatch(
+      /dkg context-graph create.*--access-policy 1/,
+    );
+    expect(msg, 'message must mention the single-call API alternative').toMatch(
+      /POST \/api\/context-graph\/create/,
+    );
+  });
+
+  it('accepts register({ accessPolicy: 0 }) on a public-created CG (matching policy is fine)', async () => {
+    const cgId = `f1-match-${ethers.hexlify(ethers.randomBytes(3)).slice(2)}`;
+    await nodeA!.createContextGraph({ id: cgId, name: 'F1 match', description: '' });
+
+    const result = await nodeA!.registerContextGraph(cgId, { accessPolicy: 0 });
+    expect(result.onChainId).toBeDefined();
+    expect(Number(result.onChainId)).toBeGreaterThan(0);
   });
 });

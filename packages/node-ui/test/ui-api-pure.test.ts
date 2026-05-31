@@ -11,14 +11,12 @@ import {
   fetchOperationsWithPhases,
   fetchOperation,
   fetchErrorHotspots,
-  fetchLogs,
   fetchNodeLog,
   fetchConnections,
   fetchLlmSettings,
   fetchRetentionSettings,
   fetchTelemetrySettings,
   fetchCatchupStatus,
-  fetchNotifications,
   markNotificationsRead,
   fetchRpcHealth,
   fetchQueryHistory,
@@ -89,8 +87,6 @@ function startTestServer(): Promise<void> {
           res.end(JSON.stringify({ operations: [], total: 0 }));
         } else if (url.startsWith('/api/error-hotspots')) {
           res.end(JSON.stringify({ hotspots: [] }));
-        } else if (url.startsWith('/api/logs')) {
-          res.end(JSON.stringify({ logs: [], total: 0 }));
         } else if (url.startsWith('/api/node-log')) {
           res.end(JSON.stringify({ lines: [], totalSize: 0 }));
         } else if (url.startsWith('/api/sync/catchup-status')) {
@@ -272,12 +268,6 @@ describe('UI API tests', () => {
       expect(call?.url).toContain('periodMs=3600000');
     });
 
-    it('fetchLogs with params', async () => {
-      await fetchLogs({ level: 'error' });
-      const call = requestLog.find(r => r.url.includes('/api/logs'));
-      expect(call?.url).toContain('level=error');
-    });
-
     it('fetchNodeLog with lines', async () => {
       await fetchNodeLog({ lines: 100 });
       const call = requestLog.find(r => r.url.includes('/api/node-log'));
@@ -352,6 +342,53 @@ describe('UI API tests', () => {
       const call = requestLog.find(r => r.method === 'POST' && r.url.includes('/api/subscribe'));
       const body = JSON.parse(call?.body ?? '{}');
       expect(body.contextGraphId).toBe('cg-1');
+    });
+  });
+
+  // The Node UI mounts `useMemoryEntities` and `useProjectProfile` from
+  // multiple sibling views simultaneously when a project is opened
+  // (e.g. Dashboard card + ProjectView). Pre-dedup, each duplicate
+  // fan-out hit `/api/query` separately and added seconds of wall-time
+  // on a multi-GB Oxigraph store. These tests pin the contract that
+  // `executeQuery` collapses concurrent identical POSTs to one fetch
+  // while still firing fresh requests once a prior one settles.
+  describe('executeQuery in-flight dedup', () => {
+    it('coalesces concurrent identical queries to one /api/query POST', async () => {
+      const results = await Promise.all([
+        executeQuery('SELECT * WHERE { ?s ?p ?o }', 'cg-dedup'),
+        executeQuery('SELECT * WHERE { ?s ?p ?o }', 'cg-dedup'),
+        executeQuery('SELECT * WHERE { ?s ?p ?o }', 'cg-dedup'),
+        executeQuery('SELECT * WHERE { ?s ?p ?o }', 'cg-dedup'),
+        executeQuery('SELECT * WHERE { ?s ?p ?o }', 'cg-dedup'),
+      ]);
+      const queryCalls = requestLog.filter(
+        r => r.method === 'POST' && r.url.startsWith('/api/query'),
+      );
+      expect(queryCalls).toHaveLength(1);
+      expect(results).toHaveLength(5);
+      for (const r of results) {
+        expect(r).toEqual({ result: { bindings: [] } });
+      }
+    });
+
+    it('does not coalesce when args differ', async () => {
+      await Promise.all([
+        executeQuery('SELECT * WHERE { ?s ?p ?o }', 'cg-a'),
+        executeQuery('SELECT * WHERE { ?s ?p ?o }', 'cg-b'),
+      ]);
+      const queryCalls = requestLog.filter(
+        r => r.method === 'POST' && r.url.startsWith('/api/query'),
+      );
+      expect(queryCalls).toHaveLength(2);
+    });
+
+    it('issues a fresh fetch once the prior request has settled', async () => {
+      await executeQuery('SELECT * WHERE { ?s ?p ?o }', 'cg-sequential');
+      await executeQuery('SELECT * WHERE { ?s ?p ?o }', 'cg-sequential');
+      const queryCalls = requestLog.filter(
+        r => r.method === 'POST' && r.url.startsWith('/api/query'),
+      );
+      expect(queryCalls).toHaveLength(2);
     });
   });
 

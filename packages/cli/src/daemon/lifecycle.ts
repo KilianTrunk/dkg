@@ -53,9 +53,14 @@ const daemonRequire = createRequire(import.meta.url);
 
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
-import { enrichEvmError, MockChainAdapter } from '@origintrail-official/dkg-chain';
+import {
+  enrichEvmError,
+  MockChainAdapter,
+  type ApprovalPolicy,
+} from '@origintrail-official/dkg-chain';
 import { DKGAgent, loadOpWallets } from '@origintrail-official/dkg-agent';
-import { computeNetworkId, createOperationContext, DKGEvent, Logger, PayloadTooLargeError, GET_VIEWS, TrustLevel, validateSubGraphName, validateAssertionName, validateContextGraphId, isSafeIri, assertSafeIri, sparqlIri, contextGraphSharedMemoryUri, contextGraphAssertionUri, contextGraphMetaUri, DEFAULT_PROTOCOL_OUTBOX_BACKOFFS_MS, DEFAULT_PROTOCOL_OUTBOX_MAX_AGE_MS } from '@origintrail-official/dkg-core';
+import { isExternalBackend } from '@origintrail-official/dkg-storage';
+import { computeNetworkId, createOperationContext, DKGEvent, Logger, PayloadTooLargeError, GET_VIEWS, TrustLevel, validateSubGraphName, validateAssertionName, validateContextGraphId, isSafeIri, assertSafeIri, sparqlIri, contextGraphSharedMemoryUri, contextGraphAssertionUri, contextGraphMetaUri, DEFAULT_PROTOCOL_OUTBOX_BACKOFFS_MS, DEFAULT_PROTOCOL_OUTBOX_MAX_AGE_MS, pickNetworkTunables } from '@origintrail-official/dkg-core';
 import { findReservedSubjectPrefix, isSkolemizedUri } from '@origintrail-official/dkg-publisher';
 import {
   DashboardDB,
@@ -93,6 +98,7 @@ import {
   type LocalAgentIntegrationTransport,
   resolveContextGraphs,
   resolveNetworkDefaultContextGraphs,
+  resolveApprovalPolicy,
   resolveSharedMemoryTtlMs,
   repoDir,
   releasesDir,
@@ -105,6 +111,7 @@ import {
   resolveAutoUpdateSource,
   slotEntryPoint,
   CLI_NPM_PACKAGE,
+  exitOnStoreConfigErrors,
 } from '../config.js';
 import { createPublicSnapshotStore, createPublisherControlFromStore, startPublisherRuntimeIfEnabled, type PublisherRuntime } from '../publisher-runner.js';
 import { createCatchupRunner, type CatchupJobResult, type CatchupRunner } from '../catchup-runner.js';
@@ -177,6 +184,8 @@ import {
   loadMarkItDownTargets,
   getNodeVersion,
   getCurrentCommitShort,
+  loadBuildInfo,
+  detectInstallMode,
   loadSkillTemplate,
   buildSkillMd,
   skillEtag,
@@ -242,17 +251,19 @@ import {
   getCurrentCliVersion,
   type NpmVersionStatus,
   checkForNpmVersionUpdate,
-  checkForNewCommit,
-  checkForNewCommitWithStatus,
   type UpdateStatus,
   acquireUpdateLock,
   releaseUpdateLock,
-  performUpdate,
-  performUpdateWithStatus,
   performNpmUpdate,
-  checkForUpdate,
+  performNpmUpdateEdge,
 } from './auto-update.js';
-import { chainResetWipe } from './chain-reset-wipe.js';
+import { chainResetWipe, detectBackendSwitch } from './chain-reset-wipe.js';
+import {
+  checkExternalStoreReachable,
+  checkOrSetStoreIdentity,
+  formatHealthCheckFailure,
+  formatIdentityTagMismatch,
+} from './store-health-check.js';
 import { resetNatStatus, startNatStatusWatcher } from './nat-status.js';
 import {
   OPENCLAW_UI_CONNECT_TIMEOUT_MS,
@@ -304,6 +315,7 @@ import {
   verifyOpenClawAttachmentRefsProvenance,
 } from './openclaw.js';
 import { buildChatAcl } from './chat-acl.js';
+import { recordAssertionActivity, localNodeInvolvedInContextGraph } from './activity-notification.js';
 import {
   type LocalAgentIntegrationDefinition,
   type LocalAgentIntegrationRecord,
@@ -786,6 +798,36 @@ export async function runDaemonInner(
     : `v${nodeVersion}`;
   log(`Starting DKG ${role} node "${config.name}" (${versionTag})...`);
 
+  // RFC-41 §4.9 / §4.3: structured startup log lines for telemetry.
+  // The doctor's state summary correlates these with /api/status —
+  // every successful daemon start emits a parseable JSON line that
+  // an operator or CI pipeline can grep without needing the API up.
+  // Distinct tags (`dkg-build-info` + `install-mode-detected`) so a
+  // log shipper can split them into separate streams.
+  try {
+    const buildInfo = loadBuildInfo();
+    const installMode = detectInstallMode();
+    log(
+      `[dkg-build-info] ${JSON.stringify({
+        version: nodeVersion,
+        commit: buildInfo.commit,
+        commitShort: buildInfo.commitShort,
+        buildTime: buildInfo.buildTime,
+        distTag: buildInfo.distTag,
+        ciRun: buildInfo.ciRun,
+      })}`,
+    );
+    log(
+      `[install-mode-detected] ${JSON.stringify({
+        installMode,
+        nodeRole: role,
+      })}`,
+    );
+  } catch (err) {
+    // Never fail startup on a telemetry-log failure.
+    log(`[dkg-build-info] WARNING: failed to emit startup telemetry: ${String(err)}`);
+  }
+
   const network = await loadNetworkConfig();
   const syncContextGraphs = [
     ...new Set([
@@ -802,13 +844,84 @@ export async function runDaemonInner(
   // detects the change and wipes the now-orphaned chain state.
   // Operator's keystore + dashboard DB + uploaded files are preserved.
   // See docs/TESTNET_RESET.md and packages/cli/src/daemon/chain-reset-wipe.ts.
-  const wipeResult = chainResetWipe({
+  // Detect backend switch first. If the operator hand-edited
+  // store.backend between boots, refuse to start unless they opt in
+  // via DKG_ACCEPT_STORE_RESET=1. The new backend is fresh — any data
+  // held in the previous one is invisible to this boot. Booting
+  // silently would look like data loss to the operator.
+  const backendSwitch = detectBackendSwitch({
+    dataDir: dkgDir(),
+    currentBackend: config.store?.backend ?? 'oxigraph-worker',
+    acceptStoreReset: process.env.DKG_ACCEPT_STORE_RESET === '1',
+    log,
+  });
+  if (backendSwitch.aborted) {
+    process.exit(1);
+  }
+
+  // Refuse to start on invalid external-backend config (missing URL,
+  // missing blob/snapshot directory). This fires before the health
+  // check so operators see a single-line config error, not a confusing
+  // probe failure when the URL is just plain absent.
+  exitOnStoreConfigErrors(config, log);
+
+  // External triple-store backends (Blazegraph, sparql-http) get a
+  // boot-time reachability probe before anything that depends on them
+  // runs. We want operators who misconfigure the URL to see an
+  // actionable error within seconds — not a confusing failure deep in
+  // agent boot after we've already partially wiped local state.
+  //
+  // Sequencing: this fires BEFORE chainResetWipe so a marker bump
+  // against an unreachable endpoint doesn't strand the operator with
+  // wiped local files but stale remote data; we'd rather not start at
+  // all and let them fix the URL.
+  if (isExternalBackend(config.store?.backend)) {
+    const health = await checkExternalStoreReachable({
+      storeConfig: config.store,
+    });
+    if (!health.ok) {
+      log(formatHealthCheckFailure(health));
+      process.exit(1);
+    }
+    log(
+      `External triple-store reachable: ${health.backend} ${health.endpoint}`,
+    );
+
+    // Namespace identity check (RFC 120, plan PR 3 item 3). Refuses to
+    // start if another DKG node has already booted against this same
+    // namespace — without this, two daemons sharing one Blazegraph
+    // namespace silently corrupt each other. Fires BEFORE
+    // chainResetWipe so a mismatched tag never triggers a wipe of
+    // someone else's data.
+    const identity = await checkOrSetStoreIdentity({
+      storeConfig: config.store,
+      nodeName: config.name,
+    });
+    if (!identity.ok) {
+      if (identity.action === 'mismatch') {
+        log(formatIdentityTagMismatch(identity));
+      } else {
+        log(`[STORE-IDENTITY] failed to verify namespace ownership: ${identity.error}`);
+      }
+      process.exit(1);
+    }
+    if (identity.action === 'tagged') {
+      log(`Tagged triple-store namespace for node "${identity.nodeName}".`);
+    }
+  }
+
+  const wipeResult = await chainResetWipe({
     dataDir: dkgDir(),
     currentMarker: network?.chainResetMarker,
     // Honour operator's `randomSampling.walPath` override; the prover
     // writes its WAL there, so a fresh chain reset must wipe that file
     // (not the default ~/.dkg/random-sampling.wal which would be empty).
     randomSamplingWalPath: config.randomSampling?.walPath,
+    // For external triple-store backends, the wipe extends from local
+    // files to a SPARQL DROP/DELETE on the remote endpoint; otherwise
+    // operators with a chain-reset marker bump would keep stale V10 data
+    // in Blazegraph / sparql-http even after the local store.nq is gone.
+    storeConfig: config.store,
     log,
   });
   if (wipeResult.wiped) {
@@ -816,6 +929,26 @@ export async function runDaemonInner(
       `Chain-state auto-wipe complete: ${wipeResult.removedFiles.length} file(s) removed ` +
       `(prev marker: ${wipeResult.prevMarker ?? '<none>'}, now: ${network?.chainResetMarker})`,
     );
+    // A DKG-managed external wipe uses DROP ALL, which also removes the
+    // namespace ownership tag verified above. Re-tag before continuing so
+    // this daemon never runs against an unclaimed namespace.
+    if (isExternalBackend(config.store?.backend)) {
+      const identity = await checkOrSetStoreIdentity({
+        storeConfig: config.store,
+        nodeName: config.name,
+      });
+      if (!identity.ok) {
+        if (identity.action === 'mismatch') {
+          log(formatIdentityTagMismatch(identity));
+        } else {
+          log(`[STORE-IDENTITY] failed to re-tag namespace after wipe: ${identity.error}`);
+        }
+        process.exit(1);
+      }
+      if (identity.action === 'tagged') {
+        log(`Re-tagged triple-store namespace for node "${identity.nodeName}" after chain-state wipe.`);
+      }
+    }
   }
 
   // Load admin + operational wallets from ~/.dkg/wallets.json (auto-generated on first run)
@@ -990,6 +1123,8 @@ export async function runDaemonInner(
     // having to guess from contract registrations. Travels the wire
     // as libp2p's `AgentVersion` PB field (their naming, not ours).
     nodeVersion: `dkg/${nodeVersion}`,
+    ...pickNetworkTunables(config.network ?? {}),
+    agentProfileHeartbeatMs: config.network?.agentProfileHeartbeatMs,
     syncContextGraphs: syncContextGraphs,
     storeConfig: config.store ? {
       backend: config.store.backend,
@@ -998,18 +1133,21 @@ export async function runDaemonInner(
     largeLiteralStorage: config.largeLiteralStorage,
     sharedMemoryPublicSnapshotStorage: config.sharedMemoryPublicSnapshotStorage,
     syncSharedMemoryOnConnect: config.syncSharedMemoryOnConnect,
+    queryAccess: config.queryAccess,
     chainAdapter: mockChainAdapter,
     // Only forward chain to the agent when both required fields resolved.
     // resolveChainConfig() may return a partial block if neither config nor
     // network supplies one of them; the agent expects rpcUrl + hubAddress.
     chainConfig: chainBase?.rpcUrl && chainBase?.hubAddress ? {
       rpcUrl: chainBase.rpcUrl,
+      rpcUrls: chainBase.rpcUrls,
       hubAddress: chainBase.hubAddress,
       ...(opWallets.adminWallet
         ? { adminPrivateKey: opWallets.adminWallet.privateKey }
         : {}),
       operationalKeys: opWallets.wallets.map((w) => w.privateKey),
       chainId: chainBase.chainId,
+      approvalPolicy: resolveApprovalPolicy(chainBase.approvalPolicy) as ApprovalPolicy | undefined,
     } : undefined,
     sharedMemoryTtlMs: resolveSharedMemoryTtlMs(config),
     randomSamplingWalPath: config.randomSampling?.walPath,
@@ -1120,22 +1258,18 @@ export async function runDaemonInner(
       // against the `idx_chat_msgid` partial unique index — same
       // logical message arriving twice on parallel transport paths
       // (the seq=13 class from the May 2026 soak postmortem) gets
-      // silently dropped on the second insert. We distinguish three
-      // outcomes:
-      //   - `'stored'`  — fresh row written, notify + log normally.
-      //   - `'deduped'` — `INSERT OR IGNORE` dropped a duplicate row,
-      //                   skip notification (operator already saw the
-      //                   first one) but log a `(deduped)` line for
-      //                   visibility.
-      //   - `'failed'`  — `insertChatMessage` threw. The earlier shape
-      //                   of this block conflated this with `'deduped'`
-      //                   via a shared `inserted = false` sentinel,
-      //                   silently swallowing the operator notification
-      //                   for a brand-new message whenever the DB
-      //                   write failed. Codex review of PR #534
-      //                   flagged this — fix is to keep notifications
-      //                   firing on DB failure so the operator can
-      //                   still see + reply.
+      // silently dropped on the second insert. The outcome now governs
+      // LOGGING only (ADR-001 removed the bell `chat_message` notification
+      // this block used to fire — chat owns its own unread surface):
+      //   - `'stored'`  — fresh row written, log normally.
+      //   - `'deduped'` — `INSERT OR IGNORE` dropped a duplicate row; log a
+      //                   `(deduped)` line and return (operator already saw
+      //                   the first one).
+      //   - `'failed'`  — `insertChatMessage` threw. We log the failure and
+      //                   fall through to the normal CHAT IN log so the
+      //                   inbound message is still visible to the operator
+      //                   even when persistence failed (the spirit of the
+      //                   Codex PR #534 fix, minus the now-removed notify).
       let writeOutcome: 'stored' | 'deduped' | 'failed' = 'failed';
       try {
         const inserted = chatDb.insertChatMessage({
@@ -1148,7 +1282,7 @@ export async function runDaemonInner(
         writeOutcome = inserted ? 'stored' : 'deduped';
       } catch (err) {
         log(
-          `CHAT IN  [${shortId(senderPeerId)}] chat_messages persistence failed (notification still firing): ${
+          `CHAT IN  [${shortId(senderPeerId)}] chat_messages persistence failed (message still logged below): ${
             err instanceof Error ? err.message : String(err)
           }`,
         );
@@ -1158,29 +1292,11 @@ export async function runDaemonInner(
         log(`CHAT IN  [${shortId(senderPeerId)}]${cgTag} (deduped): ${text}`);
         return;
       }
-      try {
-        // Display the CG ONLY when the ACL has positively verified the
-        // claim (`scoped` / `shared-context-graph` modes). In `any` and
-        // `peer-allowlist` modes `verifiedContextGraphId` is undefined
-        // even when the sender provided a claim, because the ACL
-        // doesn't check it — surfacing the raw claim would let an
-        // authenticated sender stamp arbitrary CG ids onto operator-
-        // facing notifications and logs (Codex PR #510 round 4/5
-        // finding). Storage above already records the message itself;
-        // we don't lose data, we just don't decorate it with an
-        // attacker-controllable label.
-        const titleSuffix = verifiedContextGraphId ? ` (${shortId(verifiedContextGraphId)})` : '';
-        chatDb.insertNotification({
-          ts: Date.now(),
-          type: "chat_message",
-          title: `New message${titleSuffix}`,
-          message: `Message from ${shortId(senderPeerId)}: ${text.slice(0, 120)}`,
-          source: "peer-chat",
-          peer: senderPeerId,
-        });
-      } catch {
-        /* never crash */
-      }
+      // ADR-001: inbound peer chat no longer produces a bell notification —
+      // peer-to-peer chat is a separate surface that owns its own unread
+      // state, and these rows aren't CG-scoped. The message itself is still
+      // persisted via `insertChatMessage` above; we only drop the
+      // bell-pane `chat_message` notification.
     }
     const cgTag = verifiedContextGraphId ? ` cg=${shortId(verifiedContextGraphId)}` : '';
     log(`CHAT IN  [${shortId(senderPeerId)}]${cgTag}: ${text}`);
@@ -1274,6 +1390,18 @@ export async function runDaemonInner(
             process.exit(1);
             return;
           }
+        } else if (prereq.indeterminate) {
+          // Codex (#661#discussion_r3302752893): the DNS-rescue / warn-only
+          // path previously fell into the unconditional `OK` branch below
+          // and hid the indeterminate verdict the checker had just
+          // computed. Surface the reasons so operators see why the prereq
+          // sweep neither passed strictly nor failed; the lifecycle
+          // continues to boot since this is a soft rescue.
+          log(
+            `[CORE-PREREQ] INDETERMINATE: ${prereq.publicListenAddresses.length} ` +
+              `public-class listen address${prereq.publicListenAddresses.length === 1 ? '' : 'es'} bound. ` +
+              `reasons: ${prereq.reasons.join('; ')}.`,
+          );
         } else {
           log(
             `[CORE-PREREQ] OK: ${prereq.publicListenAddresses.length} ` +
@@ -1293,6 +1421,7 @@ export async function runDaemonInner(
   const publisherChainBase = chainBase?.rpcUrl && chainBase?.hubAddress
     ? {
         rpcUrl: chainBase.rpcUrl,
+        rpcUrls: chainBase.rpcUrls,
         hubAddress: chainBase.hubAddress,
         chainId: chainBase.chainId,
       }
@@ -1503,75 +1632,55 @@ export async function runDaemonInner(
   // omits the field (the common case after `dkg init` with default answers).
   let updateInterval: ReturnType<typeof setInterval> | null = null;
   const au = resolveAutoUpdateConfig(config, network);
-  // Honour `autoUpdate.source` override (config.ts) — explicit "npm" / "git"
-  // wins over the filesystem probe (`isStandaloneInstall()`); "auto" or omitted
-  // falls through to today's behaviour. Resolve source even when `au` is null
-  // (auto-update disabled) so local/network install-mode policy still seeds the
-  // cache for anyone else who reads `daemonState.standaloneCache` later in boot.
+  // OT-RFC-41 §4.2 / §5 PR 5: auto-update polling is npm-only.
+  // `resolveStandaloneInstall` still seeds `daemonState.standaloneCache`
+  // for `/api/status` consumers; monorepo dev daemons (standalone=false)
+  // skip the polling loop entirely — contributors update via
+  // `git pull && pnpm install && pnpm build`.
   const standalone = resolveStandaloneInstall(au?.source ?? resolveAutoUpdateSource(config, network));
-  const hasGitConfig = !!au;
 
-  if (standalone || hasGitConfig) {
+  if (standalone) {
     const checkIntervalMs = (au?.checkIntervalMinutes ?? 30) * 60_000;
     const allowPre = au?.allowPrerelease ?? true;
 
-    if (standalone) {
-      log(
-        `Auto-update (npm): ${au ? "enabled" : "disabled — version check only"} (every ${au?.checkIntervalMinutes ?? 30}min)`,
-      );
-    } else if (au) {
-      log(
-        `Auto-update enabled: ${au.repo}@${au.branch} (every ${au.checkIntervalMinutes}min)`,
-      );
-    }
+    log(
+      `Auto-update (npm): ${au ? "enabled" : "disabled — version check only"} (every ${au?.checkIntervalMinutes ?? 30}min)`,
+    );
 
     const runCheck = async () => {
-      let updateAvailable = false;
-      let targetNpmVersion = "";
-
-      if (standalone) {
-        const npmStatus = await checkForNpmVersionUpdate(log, allowPre);
-        if (npmStatus.status !== "error") {
-          daemonState.lastUpdateCheck.upToDate = npmStatus.status === "up-to-date";
-          daemonState.lastUpdateCheck.checkedAt = Date.now();
-          if (npmStatus.version)
-            daemonState.lastUpdateCheck.latestVersion = npmStatus.version;
-        }
-        if (npmStatus.status === "available" && npmStatus.version) {
-          updateAvailable = true;
-          targetNpmVersion = npmStatus.version;
-        }
-      } else if (au) {
-        const commitStatus = await checkForNewCommitWithStatus(au, log);
-        if (commitStatus.status !== "error") {
-          daemonState.lastUpdateCheck.upToDate = commitStatus.status === "up-to-date";
-          daemonState.lastUpdateCheck.checkedAt = Date.now();
-          if (commitStatus.commit)
-            daemonState.lastUpdateCheck.latestCommit = commitStatus.commit.slice(0, 8);
-        }
-        updateAvailable = commitStatus.status === "available";
+      const npmStatus = await checkForNpmVersionUpdate(log, allowPre);
+      if (npmStatus.status !== "error") {
+        daemonState.lastUpdateCheck.upToDate = npmStatus.status === "up-to-date";
+        daemonState.lastUpdateCheck.checkedAt = Date.now();
+        if (npmStatus.version)
+          daemonState.lastUpdateCheck.latestVersion = npmStatus.version;
       }
+      if (npmStatus.status !== "available" || !npmStatus.version) return;
+      if (!au) return; // version check only — no auto-apply when polling disabled
 
-      if (au && updateAvailable) {
-        daemonState.isUpdating = true;
-        let updated = false;
-        if (standalone && targetNpmVersion) {
-          const status = await performNpmUpdate(targetNpmVersion, log);
-          updated = status === "updated";
-        } else {
-          updated = await checkForUpdate(au, log);
-        }
-        daemonState.isUpdating = false;
-        if (updated) {
-          log("Auto-update: update activated; exiting for supervised restart.");
-          await shutdown(DAEMON_EXIT_CODE_RESTART);
-          return;
-        }
+      daemonState.isUpdating = true;
+      // OT-RFC-41 Bundle B1b: Edge → npm install -g, Core → slot install.
+      const role = config.nodeRole ?? "edge";
+      const status = role === "edge"
+        ? await performNpmUpdateEdge(npmStatus.version, getCurrentCliVersion(), log)
+        : await performNpmUpdate(npmStatus.version, log);
+      const updated = status === "updated";
+      daemonState.isUpdating = false;
+      if (updated) {
+        log("Auto-update: update activated; exiting for supervised restart.");
+        await shutdown(DAEMON_EXIT_CODE_RESTART);
+        return;
       }
     };
 
     setTimeout(runCheck, 15_000);
     updateInterval = setInterval(runCheck, checkIntervalMs);
+  } else if (au?.enabled) {
+    // Monorepo dev daemon with auto-update enabled in config — log
+    // once at boot so contributors understand why polling is silent.
+    log(
+      "Auto-update: skipped — monorepo checkout detected. Use `git pull && pnpm install && pnpm build` to update.",
+    );
   }
 
   // --- Dashboard DB + Metrics ---
@@ -1662,6 +1771,14 @@ export async function runDaemonInner(
       return parseRdfInt(r?.bindings?.[0]?.c);
     },
     getStoreBytes: async () => {
+      // External SPARQL backends own no local file; `null` is the
+      // correct signal here (returning 0 misleads operators into
+      // thinking the store is empty). Quad count is exposed on
+      // demand via /api/status instead — too expensive to compute
+      // on the metrics tick. (RFC 120, plan PR 1 item 2.)
+      if (isExternalBackend(config.store?.backend)) {
+        return null;
+      }
       try {
         const s = await stat(join(dkgDir(), "store.nq"));
         return s.size;
@@ -1790,58 +1907,28 @@ export async function runDaemonInner(
     });
   });
 
-  // Notify on new peer connections
-  agent.eventBus.on(DKGEvent.PEER_CONNECTED, (data: any) => {
-    try {
-      dashDb.insertNotification({
-        ts: Date.now(),
-        type: "peer_connected",
-        title: "Peer connected",
-        message: `Peer ${shortId(data.peerId)} connected`,
-        source: "network",
-        peer: data.peerId,
-      });
-    } catch {
-      /* never crash */
-    }
-  });
-
-  agent.eventBus.on(DKGEvent.PEER_DISCONNECTED, (data: any) => {
-    try {
-      dashDb.insertNotification({
-        ts: Date.now(),
-        type: "peer_disconnected",
-        title: "Peer disconnected",
-        message: `Peer ${shortId(data.peerId)} disconnected`,
-        source: "network",
-        peer: data.peerId,
-      });
-    } catch {
-      /* never crash */
-    }
-  });
+  // ADR-001 (notifications-pane redesign): peer connect/disconnect no longer
+  // produce bell notifications — pure transport churn that dominated the
+  // pane for graphs the user has nothing to do with. Connection telemetry is
+  // unaffected: the CONNECTION_OPEN handler above still records it via
+  // `tracker`. We drop the PEER_CONNECTED / PEER_DISCONNECTED notification
+  // emitters entirely (clean cut, no `category` compat flag).
 
   // Track publishes via KC_PUBLISHED event (covers GossipSub-received publishes)
   agent.eventBus.on(DKGEvent.KC_PUBLISHED, (data: any) => {
     const ctx = createOperationContext("publish");
-    const kcId = data.kcId != null ? String(data.kcId) : undefined;
+    const kaId = data.kaId != null ? String(data.kaId) : undefined;
     tracker.start(ctx, {
       contextGraphId: data.contextGraphId,
-      details: { kcId, source: "gossipsub" },
+      details: { kaId, source: "gossipsub" },
     });
     tracker.complete(ctx, { tripleCount: data.tripleCount });
     try {
-      dashDb.insertNotification({
-        ts: Date.now(),
-        type: "kc_published",
-        title: "Knowledge published",
-        message: `Knowledge collection published${data.contextGraphId ? ` on context graph ${shortId(data.contextGraphId)}` : ""}`,
-        source: "dkg",
-        meta: JSON.stringify({
-          kcId,
-          contextGraphId: data.contextGraphId,
-        }),
-      });
+      // ADR-001: the raw `kc_published` bell notification is removed — it
+      // fired for ANY CG overheard on gossip (not just the user's), the
+      // dominant pane noise. Live graph refresh below is unaffected.
+      // (ADR-002/A3 layers a MEMBERSHIP-GATED, remote-only `assertion_activity`
+      // emitter on top of this handler as the legitimate scoped replacement.)
       if (data.contextGraphId) {
         emitMemoryGraphChanged({
           contextGraphId: data.contextGraphId,
@@ -1853,6 +1940,26 @@ export async function runDaemonInner(
             triples: typeof data.tripleCount === "number" ? data.tripleCount : undefined,
           },
         });
+        // ADR-002 / CR-2: cross-node `published` activity for a collaborator's
+        // publish. REMOTE-ONLY — gate on `data.from` (the gossip payload's
+        // sender peer id, set ONLY on gossipsub-received publishes by
+        // publish-handler.ts; the LOCAL publisher emit carries no `from`).
+        // This prevents double-counting: a local publish is recorded by
+        // routes/memory.ts, a remote one here. Membership-gated so we only
+        // record activity for CGs this node is actually involved in (not
+        // every CG overheard on gossip — the dominant noise ADR-001 removed).
+        const remotePublisherPeer =
+          typeof data.from === "string" && data.from.length > 0 ? data.from : undefined;
+        if (remotePublisherPeer && localNodeInvolvedInContextGraph(dashDb, data.contextGraphId)) {
+          recordAssertionActivity(dashDb, {
+            contextGraphId: data.contextGraphId,
+            kind: "published",
+            actorAgentAddress: remotePublisherPeer,
+            ...(typeof data.subGraphName === "string" ? { subGraphName: data.subGraphName } : {}),
+            ...(typeof data.tripleCount === "number" ? { tripleCount: data.tripleCount } : {}),
+          });
+          emitNotification({ contextGraphId: data.contextGraphId, type: "assertion_activity" });
+        }
       }
     } catch {
       /* never crash */
@@ -1895,6 +2002,18 @@ export async function runDaemonInner(
       timestamp: new Date().toISOString(),
     });
   }
+  // A5: single generic `notification` SSE refresh for the bell pane. Fired
+  // once per scoped notification write (join_* + assertion_activity) so the
+  // pane re-fetches the scoped feed via ONE listener. The three legacy
+  // join-specific events still fire (other consumers — PendingJoinRequests
+  // Section, useMyContextGraphs — listen on them); this is ADDITIVE.
+  function emitNotification(event: { contextGraphId: string; type: string }) {
+    if (!event.contextGraphId) return;
+    sseBroadcast("notification", {
+      contextGraphId: event.contextGraphId,
+      type: event.type,
+    });
+  }
 
   agent.eventBus.on(DKGEvent.JOIN_REQUEST_RECEIVED, (data: any) => {
     try {
@@ -1904,6 +2023,11 @@ export async function runDaemonInner(
         title: "Join request received",
         message: `${data.agentName ?? shortId(data.agentAddress)} wants to join project ${shortId(data.contextGraphId)}`,
         source: "access-control",
+        // R2-1: the scoping key MUST be on the top-level `context_graph_id`
+        // column (not only in `meta`) — the scoped read filters on the column
+        // (getNotificationsForContextGraphs), so without this the row is NULL-
+        // scoped and dropped from the bell entirely.
+        contextGraphId: data.contextGraphId,
         meta: JSON.stringify({
           contextGraphId: data.contextGraphId,
           agentAddress: data.agentAddress,
@@ -1915,6 +2039,7 @@ export async function runDaemonInner(
         agentAddress: data.agentAddress,
         agentName: data.agentName,
       });
+      emitNotification({ contextGraphId: data.contextGraphId, type: "join_request" });
     } catch {
       /* never crash */
     }
@@ -1928,6 +2053,8 @@ export async function runDaemonInner(
         title: "Join approved",
         message: `You have been approved to join project ${shortId(data.contextGraphId)}`,
         source: "access-control",
+        // R2-1: top-level scoping column so the scoped read returns it.
+        contextGraphId: data.contextGraphId,
         meta: JSON.stringify({
           contextGraphId: data.contextGraphId,
           agentAddress: data.agentAddress,
@@ -1937,6 +2064,7 @@ export async function runDaemonInner(
         contextGraphId: data.contextGraphId,
         agentAddress: data.agentAddress,
       });
+      emitNotification({ contextGraphId: data.contextGraphId, type: "join_approved" });
     } catch {
       /* never crash */
     }
@@ -1950,6 +2078,8 @@ export async function runDaemonInner(
         title: "Join request rejected",
         message: `Your request to join project ${shortId(data.contextGraphId)} was declined by the curator.`,
         source: "access-control",
+        // R2-1: top-level scoping column so the scoped read returns it.
+        contextGraphId: data.contextGraphId,
         meta: JSON.stringify({
           contextGraphId: data.contextGraphId,
           agentAddress: data.agentAddress,
@@ -1959,6 +2089,7 @@ export async function runDaemonInner(
         contextGraphId: data.contextGraphId,
         agentAddress: data.agentAddress,
       });
+      emitNotification({ contextGraphId: data.contextGraphId, type: "join_rejected" });
     } catch {
       /* never crash */
     }
@@ -2482,6 +2613,7 @@ export async function runDaemonInner(
         apiPortRef,
         routePlugins,
         emitMemoryGraphChanged,
+        emitNotification,
       );
     } catch (err: any) {
       if (res.headersSent || res.writableEnded) return;
@@ -2510,9 +2642,13 @@ export async function runDaemonInner(
   const apiHost = config.apiHost || "127.0.0.1";
 
   // Route plugins: loaded before listen() so requests can't race the array; fail-soft per ADR 0001.
+  // OT-RFC-41 §4.6.1 / Bundle B1e: bare-name specs resolve from
+  // ~/.dkg/plugins (stable root) before the daemon-local node_modules,
+  // so plugin installs survive Core slot swaps and Edge npm reinstalls.
   const routePlugins = await loadRoutePlugins(
     config.routePlugins,
     new Logger('route-plugins'),
+    { dkgHome: dkgDir() },
   );
   // Validated count for telemetry — `configured=` is 0 for non-arrays so a typo doesn't report character count.
   const configuredCount = countConfiguredPluginSpecs(config.routePlugins);

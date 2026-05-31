@@ -10,6 +10,7 @@ import {
   decryptWorkspacePayload,
   decodeWorkspacePublishRequest,
   computeGossipSigningPayload,
+  computeGossipSigningPayloadV2,
   assertSafeIri,
   assertSafeRdfTerm,
   validateSubGraphName,
@@ -18,6 +19,7 @@ import {
   GOSSIP_ENVELOPE_VERSION,
   ENCRYPTED_WORKSPACE_ENVELOPE_TYPE,
   GOSSIP_TYPE_WORKSPACE_PUBLISH,
+  GOSSIP_TYPE_WORKSPACE_PUBLISH_CHUNKED,
   SWM_SENDER_KEY_MESSAGE_TYPE,
   assertNoUserAuthoredTrustLevelQuads,
 } from '@origintrail-official/dkg-core';
@@ -1198,6 +1200,28 @@ export class SharedMemoryHandler {
         encrypted: encryptedPayload !== undefined || senderKeyMessage !== undefined,
       };
     }
+    // OT-RFC-38 LU-11 chunked curated publish envelope. The payload is
+    // `[32-byte batchId][ciphertext]` and is NEVER a WorkspacePublishRequest
+    // — pre-LU-11 cores would (correctly) drop this in the legacy decoder.
+    // We surface it here as `signedPayload = envelope.payload` so the
+    // chunked-aware ingest path can run its own [batchId|ct] split AND so
+    // `verifyHostModeEnvelopeAuthority` can pick the V2 signing helper
+    // via the envelope's `type` discriminator. `request` stays undefined
+    // — callers MUST inspect `envelope.type` before treating
+    // `signedPayload` as a publish request.
+    if (
+      envelope?.version === GOSSIP_ENVELOPE_VERSION &&
+      envelope.type === GOSSIP_TYPE_WORKSPACE_PUBLISH_CHUNKED &&
+      envelope.payload &&
+      envelope.payload.length > 0
+    ) {
+      return {
+        request: undefined,
+        envelope,
+        signedPayload: new Uint8Array(envelope.payload),
+        encrypted: true,
+      };
+    }
     return {
       request: decodeWorkspacePublishRequest(data),
       signedPayload: data,
@@ -1334,7 +1358,16 @@ export class SharedMemoryHandler {
       return false;
     }
 
-    if (envelope.version !== GOSSIP_ENVELOPE_VERSION || envelope.type !== GOSSIP_TYPE_WORKSPACE_PUBLISH) {
+    // OT-RFC-38 LU-11: accept both the legacy single-blob type
+    // (`share-write`) and the chunked curated type (`share-write-chunked`).
+    // The chunked path uses `computeGossipSigningPayloadV2` for its
+    // signature so we dispatch the right verifier below based on the
+    // exact type string.
+    if (
+      envelope.version !== GOSSIP_ENVELOPE_VERSION
+      || (envelope.type !== GOSSIP_TYPE_WORKSPACE_PUBLISH
+        && envelope.type !== GOSSIP_TYPE_WORKSPACE_PUBLISH_CHUNKED)
+    ) {
       this.log.warn(ctx, `SWM write rejected: invalid gossip envelope type/version for context graph "${contextGraphId}"`);
       return false;
     }
@@ -1361,12 +1394,25 @@ export class SharedMemoryHandler {
     let recovered: string;
     try {
       claimedAgent = ethers.getAddress(envelope.agentAddress);
-      const signingPayload = computeGossipSigningPayload(
-        envelope.type,
-        envelope.contextGraphId,
-        envelope.timestamp,
-        payload,
-      );
+      // OT-RFC-38 LU-11: dispatch the signing helper by envelope type.
+      // Chunked envelopes MUST verify against `computeGossipSigningPayloadV2`
+      // because the publisher folded `swmMessageIndex` into the signed
+      // payload to prevent chunk-index re-attribution attacks. Falling
+      // back to V1 here would reject every legitimate chunked envelope.
+      const signingPayload = envelope.type === GOSSIP_TYPE_WORKSPACE_PUBLISH_CHUNKED
+        ? computeGossipSigningPayloadV2(
+            envelope.type,
+            envelope.contextGraphId,
+            envelope.timestamp,
+            payload,
+            typeof envelope.swmMessageIndex === 'number' ? envelope.swmMessageIndex : 0,
+          )
+        : computeGossipSigningPayload(
+            envelope.type,
+            envelope.contextGraphId,
+            envelope.timestamp,
+            payload,
+          );
       recovered = ethers.verifyMessage(signingPayload, ethers.hexlify(envelope.signature));
     } catch (err) {
       this.log.warn(ctx, `SWM write rejected: invalid agent signature (${err instanceof Error ? err.message : String(err)})`);

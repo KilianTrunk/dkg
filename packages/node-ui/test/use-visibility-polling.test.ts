@@ -142,4 +142,28 @@ describe('useVisibilityPolling (BUG-007)', () => {
     act(() => { vi.advanceTimersByTime(5000); });
     expect(cb).not.toHaveBeenCalled();
   });
+
+  it('suppresses the eager mount fire when the tab is already hidden (codex #752 — was firing once)', () => {
+    // Pre-fix: with the default `runImmediately: true`, the hook
+    // fired the callback once on mount regardless of `document.hidden`.
+    // In the "browser session restore / background tab" case every
+    // consumer still hit the daemon once on mount, leaving a chunk of
+    // the BUG-007 fan-out in place. Now the eager call must also
+    // pause until the tab becomes visible.
+    Object.defineProperty(document, 'hidden', { value: true, configurable: true });
+    const cb = vi.fn();
+    mount({ cb, intervalMs: 1000 });
+    expect(cb).not.toHaveBeenCalled();
+
+    // While hidden, the interval is also paused (existing behaviour).
+    act(() => { vi.advanceTimersByTime(5000); });
+    expect(cb).not.toHaveBeenCalled();
+
+    // On becoming visible the visibilitychange handler runs an
+    // immediate refresh AND resumes the cadence — both expected.
+    act(() => { setHidden(false); });
+    expect(cb).toHaveBeenCalledTimes(1);
+    act(() => { vi.advanceTimersByTime(1000); });
+    expect(cb).toHaveBeenCalledTimes(2);
+  });
 });

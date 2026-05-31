@@ -5,6 +5,8 @@ import { dirname, resolve } from 'node:path';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const CI = !!process.env.CI;
 const PORT = 5173;
+/** Only true when launched via `pnpm test:e2e:devnet` (never inherit from shell). */
+const DEVNET_UI = process.env.PWTEST_DEVNET === '1';
 // Default to node1 ONLY for the Vite proxy. The bootstrap chained
 // into `webServer.command` (see e2e/bootstrap-devnet.ts) is responsible
 // for ensuring `.devnet/node${DEVNET_NODE}/api.port` exists by the
@@ -50,23 +52,29 @@ export default defineConfig({
 
   projects: [
     {
-      name: 'chromium',
+      name: 'mock-ui',
       use: { ...devices['Desktop Chrome'] },
+      testIgnore: ['**/devnet/**', '**/*.devnet.spec.ts'],
+    },
+    {
+      name: 'devnet-ui',
+      use: { ...devices['Desktop Chrome'] },
+      testMatch: ['**/devnet/**', '**/*.devnet.spec.ts'],
+      timeout: CI ? 120_000 : 60_000,
+      fullyParallel: false,
     },
   ],
 
   webServer: {
-    // `bootstrap-devnet.ts` is idempotent: it reuses a running devnet
-    // (operator already had one up) or spawns a fresh one and writes
-    // an ownership marker that global-teardown.ts honours. Cold-start
-    // can take 45-90s -- the webServer timeout below has to be wide
-    // enough to cover bootstrap + Vite serving + initial proxy round
-    // trip (default 5min on CI, 3min locally).
-    command:
-      `pnpm exec tsx e2e/bootstrap-devnet.ts && cross-env DEVNET_NODE=${DEVNET_NODE} pnpm dev:ui`,
+    // mock-ui: no devnet proxy. devnet-ui: bootstrap then Vite (PWTEST_DEVNET=1).
+    // Do not run both projects in one process — mock-ui and devnet-ui need different backends.
+    command: DEVNET_UI
+      ? `pnpm exec tsx e2e/bootstrap-devnet.ts && cross-env DEVNET_NODE=${DEVNET_NODE} pnpm dev:ui`
+      : 'cross-env DEVNET_NODE= UI_NODE_ID= pnpm dev:ui',
     cwd: __dirname,
     port: PORT,
-    reuseExistingServer: !CI,
-    timeout: CI ? 300_000 : 180_000,
+    // Never reuse across mock↔devnet switches; devnet must not inherit a mock-mode server.
+    reuseExistingServer: DEVNET_UI ? false : !CI,
+    timeout: DEVNET_UI ? (CI ? 300_000 : 180_000) : (CI ? 60_000 : 30_000),
   },
 });

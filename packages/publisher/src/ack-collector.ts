@@ -1,5 +1,8 @@
 import {
   PROTOCOL_STORAGE_ACK,
+  PROTOCOL_STORAGE_ACK_V2,
+  ACK_PROTOCOL_VERSION_V1_LU5,
+  ACK_PROTOCOL_VERSION_V2_LU11,
   encodePublishIntent,
   decodeStorageACK,
   computePublishACKDigest,
@@ -13,11 +16,42 @@ import {
 import { ethers } from 'ethers';
 import { QuorumUnmetError, type PeerOutcome } from './ack-errors.js';
 
+/**
+ * Why an ACK signer pre-flight rejected a recovered signer. Mirrors
+ * `VerifyACKIdentityReason` from `@origintrail-official/dkg-chain`.
+ * Kept as a string union here to avoid a hard cross-package type dep
+ * — adapters wire concrete reasons through; legacy `boolean` callers
+ * still work and surface `undefined`.
+ */
+export type ACKVerifyReason = 'key-not-registered' | 'not-in-sharding-table' | 'rpc-error';
+
+export interface ACKVerifyResult {
+  valid: boolean;
+  reason?: ACKVerifyReason;
+}
+
 export interface ACKCollectorDeps {
   gossipPublish: (topic: string, data: Uint8Array) => Promise<void>;
   sendP2P: (peerId: string, protocol: string, data: Uint8Array) => Promise<Uint8Array>;
   getConnectedCorePeers: () => string[];
+  /**
+   * Boolean ACK signer pre-flight. Backward-compatible legacy entry
+   * point — when only this is provided the rejection log surfaces a
+   * generic "ACK rejected" line without a reason. New code should
+   * prefer `verifyIdentityDetailed`.
+   */
   verifyIdentity?: (recoveredAddress: string, claimedIdentityId: bigint) => Promise<boolean>;
+  /**
+   * Structured ACK signer pre-flight. When provided, the collector
+   * uses this in preference to `verifyIdentity` and surfaces the
+   * specific failing gate (`key-not-registered`, `not-in-sharding-
+   * table`, `rpc-error`) in the rejection log so operators can act on
+   * the actual root cause instead of guessing.
+   */
+  verifyIdentityDetailed?: (
+    recoveredAddress: string,
+    claimedIdentityId: bigint,
+  ) => Promise<ACKVerifyResult>;
   log?: (msg: string) => void;
 }
 
@@ -108,6 +142,39 @@ export class ACKCollector {
      * unchanged.
      */
     isEncryptedPayload?: boolean;
+    /**
+     * OT-RFC-38 LU-11 / OT-RFC-39. When set, the publisher has fanned
+     * per-chunk ciphertexts via SWM gossip (one envelope per chunk,
+     * carrying `swmMessageIndex` + the chunked type marker) and the
+     * ACK request goes out on `PROTOCOL_STORAGE_ACK_V2` with empty
+     * `stagingQuads` + populated `ciphertextChunksRoot` /
+     * `ciphertextChunkCount` / `ackProtocolVersion = 2`. Required
+     * when `isEncryptedPayload === true` AND chunked emission was
+     * used; mutually exclusive with non-empty `stagingQuads`.
+     *
+     * **Cluster-wide V2 requirement** (Codex review on PR #715): this
+     * collector unconditionally dispatches chunked ACK requests over
+     * `PROTOCOL_STORAGE_ACK_V2` — there is NO automatic V1 fallback
+     * for cores in the quorum target that don't advertise V2. A core
+     * that only speaks `/dkg/10.0.1/storage-ack` will surface a
+     * libp2p "could not negotiate" send error here, which counts as a
+     * peer-unreachable failure against `requiredACKs`. The
+     * mixed-rc.11-rc.12 cluster case is therefore strictly an
+     * upgrade-window concern (a rc.11 core can't decode LU-11
+     * chunked gossip envelopes either, so it would fail upstream of
+     * this collector even with a V1 fallback). The operational
+     * assumption for rc.12 — and the rc.12 release runbook — is that
+     * every quorum-target core has been upgraded to LU-11 BEFORE the
+     * curator's first chunked publish. The OT-RFC-38 §A.1 host-mode
+     * reconciler converges the cluster within the per-CG window the
+     * curator sets; operators must respect that window before
+     * issuing curated publishes. A per-peer capability probe + V1
+     * downgrade is filed as a follow-up — see TODO(rc.12.1) below.
+     */
+    chunkedCommitment?: {
+      ciphertextChunksRoot: Uint8Array;
+      ciphertextChunkCount: number;
+    };
   }): Promise<ACKCollectionResult> {
     const {
       merkleRoot, contextGraphId, contextGraphIdStr,
@@ -132,6 +199,46 @@ export class ACKCollector {
     // the ACK against. `swmGraphId` (optional) is the SOURCE graph where
     // data lives in SWM — only set when the publisher is remapping a named
     // SWM graph to a numeric on-chain id.
+    // OT-RFC-38 LU-11: chunked path requires V2 ACK protocol id and
+    // empty `stagingQuads` (chunks live on SWM, not on the ACK wire).
+    // Anything else is a programmer error in the publisher's branch
+    // selection — surface it loudly instead of silently shipping a
+    // V1 envelope that pre-LU-11 cores would still accept.
+    if (params.chunkedCommitment) {
+      if (!params.isEncryptedPayload) {
+        throw new Error(
+          'ACKCollector: chunkedCommitment requires isEncryptedPayload=true (curated-CG-only path)',
+        );
+      }
+      if (params.stagingQuads && params.stagingQuads.length > 0) {
+        throw new Error(
+          'ACKCollector: chunkedCommitment + non-empty stagingQuads is invalid — ' +
+          'on the LU-11 chunked path the ciphertext lives in SWM, not on the ACK wire',
+        );
+      }
+      if (params.chunkedCommitment.ciphertextChunkCount <= 0) {
+        throw new Error(
+          `ACKCollector: chunkedCommitment.ciphertextChunkCount must be positive; got ${params.chunkedCommitment.ciphertextChunkCount}`,
+        );
+      }
+      if (params.chunkedCommitment.ciphertextChunksRoot.length !== 32) {
+        throw new Error(
+          `ACKCollector: chunkedCommitment.ciphertextChunksRoot must be 32 bytes; got ${params.chunkedCommitment.ciphertextChunksRoot.length}`,
+        );
+      }
+    }
+    const ackProtocolVersion = params.chunkedCommitment
+      ? ACK_PROTOCOL_VERSION_V2_LU11
+      : ACK_PROTOCOL_VERSION_V1_LU5;
+    // TODO(rc.12.1, Codex review on PR #715): add per-peer capability
+    // probe so chunked publishes can opportunistically downgrade to V1
+    // for cores that don't advertise V2. Until then, chunked publishes
+    // require every quorum-target core to support V2 — see the
+    // `chunkedCommitment` field doc for the cluster-wide requirement
+    // and the rc.12 release-runbook rationale.
+    const ackProtocolId = params.chunkedCommitment
+      ? PROTOCOL_STORAGE_ACK_V2
+      : PROTOCOL_STORAGE_ACK;
     const p2pMsg: PublishIntentMsg = {
       merkleRoot,
       contextGraphId: contextGraphIdStr,
@@ -149,6 +256,9 @@ export class ACKCollector {
       subGraphName: params.subGraphName,
       merkleLeafCount: params.merkleLeafCount,
       isEncryptedPayload: params.isEncryptedPayload === true ? true : undefined,
+      ciphertextChunksRoot: params.chunkedCommitment?.ciphertextChunksRoot,
+      ciphertextChunkCount: params.chunkedCommitment?.ciphertextChunkCount,
+      ackProtocolVersion: params.chunkedCommitment ? ackProtocolVersion : undefined,
     };
     const intentBytes = encodePublishIntent(p2pMsg);
 
@@ -182,6 +292,9 @@ export class ACKCollector {
     }
     log(`[ACKCollector] Requesting ACKs from ${corePeers.length} core peers (need ${REQUIRED_ACKS})`);
 
+    const ciphertextRoot = params.chunkedCommitment?.ciphertextChunksRoot
+      ?? new Uint8Array(32);
+    const ciphertextCount = BigInt(params.chunkedCommitment?.ciphertextChunkCount ?? 0);
     const ackDigest = computePublishACKDigest(
       chainId,
       kav10Address,
@@ -192,6 +305,9 @@ export class ACKCollector {
       BigInt(params.epochs ?? 1),
       params.tokenAmount ?? 0n,
       BigInt(params.merkleLeafCount),
+      ciphertextRoot,
+      ciphertextCount,
+      false,
     );
 
     const collected: CollectedACK[] = [];
@@ -272,7 +388,7 @@ export class ACKCollector {
     const requestACK = async (peerId: string): Promise<CollectedACK | null> => {
       for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
         try {
-          const response = await this.deps.sendP2P(peerId, PROTOCOL_STORAGE_ACK, intentBytes);
+          const response = await this.deps.sendP2P(peerId, ackProtocolId, intentBytes);
           const ack: StorageACKMsg = decodeStorageACK(response);
 
           if (isStorageACKDecline(ack)) {
@@ -330,7 +446,24 @@ export class ACKCollector {
             ? BigInt(ack.nodeIdentityId)
             : BigInt(ack.nodeIdentityId.low) | (BigInt(ack.nodeIdentityId.high) << 32n);
 
-          if (this.deps.verifyIdentity) {
+          // Prefer the detailed verifier — surfaces the specific failing
+          // gate in the rejection log so operators can tell apart "this
+          // signer is genuinely not registered" (operator-side) from
+          // "the node is registered but has not crossed minimumStake"
+          // (operator-side, different action) from "we couldn't reach
+          // the chain to check" (infra-side, retryable). Pre-PR every
+          // failure surfaced as the same "not registered" string.
+          if (this.deps.verifyIdentityDetailed) {
+            const verdict = await this.deps.verifyIdentityDetailed(recoveredAddress, identityId);
+            if (!verdict.valid) {
+              const reason = verdict.reason ?? 'unknown';
+              log(
+                `[ACKCollector] ACK from ${peerId.slice(-8)} rejected: ${reason}` +
+                ` (signer=${recoveredAddress.slice(0, 10)}..., identity=${identityId})`,
+              );
+              return null;
+            }
+          } else if (this.deps.verifyIdentity) {
             const valid = await this.deps.verifyIdentity(recoveredAddress, identityId);
             if (!valid) {
               log(`[ACKCollector] Signer ${recoveredAddress.slice(0, 10)}... not registered for identity ${identityId} — rejecting ACK from ${peerId.slice(-8)}`);

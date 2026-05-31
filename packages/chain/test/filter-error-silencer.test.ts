@@ -121,6 +121,37 @@ describe('formatProviderError', () => {
     expect(formatted).toContain('"code":-32000');
     expect(formatted).toContain('eth_getFilterChanges');
   });
+
+  it('Codex #670 — preserves bigint payload fields instead of falling back to "[object Object]"', () => {
+    // Codex (#670#discussion_r3301775310): ethers error payloads commonly
+    // carry `bigint` fields (transaction values, chain ids, gas) inside
+    // the nested `info.error` / `data` blocks. The previous `JSON.stringify`
+    // call threw on these and the catch-fallback returned `String(value)`,
+    // which yields `"[object Object]"` for typical error objects —
+    // discarding the structured diagnostics this path is trying to
+    // preserve. The serializer now stringifies bigints in a replacer.
+    const err = Object.assign(new Error('insufficient funds for gas'), {
+      code: 'CALL_EXCEPTION',
+      info: {
+        error: {
+          code: -32000,
+          message: 'insufficient funds',
+          data: {
+            value: 12345678901234567890n,
+            chainId: 84532n,
+            gasLimit: 5_000_000n,
+          },
+        },
+      },
+    });
+    const formatted = formatProviderError(err);
+    expect(formatted).not.toContain('[object Object]');
+    expect(formatted).toContain('insufficient funds for gas');
+    expect(formatted).toContain('CALL_EXCEPTION');
+    expect(formatted).toContain('"value":"12345678901234567890"');
+    expect(formatted).toContain('"chainId":"84532"');
+    expect(formatted).toContain('"gasLimit":"5000000"');
+  });
 });
 
 describe('createFilterErrorSilencer', () => {

@@ -299,6 +299,39 @@ describe('handleNodeUIRequest Stage 5 memory/publication routes', () => {
   });
 });
 
+// --- /api/logs compatibility route ---
+
+describe('handleNodeUIRequest /api/logs', () => {
+  it('delegates to the DB-backed compatibility search surface', async () => {
+    const calls: any[] = [];
+    harness.setArgs([
+      {
+        searchLogs: (opts: any) => {
+          calls.push(opts);
+          return {
+            total: 1,
+            logs: [{ ts: 1234, level: 'info', module: 'Publisher', message: 'publish completed' }],
+          };
+        },
+      } as any,
+      '.', undefined, undefined, undefined, undefined, undefined,
+    ] as any);
+
+    const res = await fetch(`${baseUrl}/api/logs?q=publish&level=info&module=Publisher&limit=5&offset=2`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.total).toBe(1);
+    expect(body.logs[0].message).toBe('publish completed');
+    expect(calls[0]).toMatchObject({
+      q: 'publish',
+      level: 'info',
+      module: 'Publisher',
+      limit: 5,
+      offset: 2,
+    });
+  });
+});
+
 // --- /api/node-log tail behavior ---
 
 describe('handleNodeUIRequest /api/node-log', () => {

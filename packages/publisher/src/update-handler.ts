@@ -2,12 +2,24 @@ import type { TripleStore, Quad } from '@origintrail-official/dkg-storage';
 import { GraphManager } from '@origintrail-official/dkg-storage';
 import type { EventBus } from '@origintrail-official/dkg-core';
 import type { ChainAdapter, KAUpdateVerification } from '@origintrail-official/dkg-chain';
-import { Logger, createOperationContext, DKGEvent, sparqlInt } from '@origintrail-official/dkg-core';
+import { Logger, createOperationContext, DKGEvent, sparqlInt, contextGraphMetaUri } from '@origintrail-official/dkg-core';
 import { decodeKAUpdateRequest } from '@origintrail-official/dkg-core';
 import { parseSimpleNQuads } from './publish-handler.js';
 import { autoPartition } from './auto-partition.js';
 import { computeTripleHashV10 as computeTripleHash, computeFlatKCRootV10 as computeFlatKCRoot } from './merkle.js';
-import { updateMetaMerkleRoot } from './metadata.js';
+import {
+  promoteUpdatedKaToPerCgId,
+  resolveUalByBatchId,
+  restateLabelGraphForUpdate,
+  type MaterializedVersion,
+} from './metadata.js';
+
+/**
+ * Resolve a context-graph label/name to its on-chain id. Injected by the agent
+ * (`DKGAgent#getContextGraphOnChainId`) so the gossip receiver can promote an
+ * applied update into the per-cgId partition the RS prover reads (GH #842).
+ */
+export type ResolveOnChainCgId = (cgName: string) => Promise<string | null>;
 
 const SKOLEM_INFIX = '/.well-known/genid/';
 const EXPECTED_MERKLE_ROOT_LEN = 32;
@@ -44,17 +56,28 @@ export class UpdateHandler {
    */
   private readonly knownBatchContextGraphs: Map<string, string>;
 
+  /**
+   * Resolve a CG name to its on-chain id for GH #842 per-cgId promotion.
+   * Optional: when absent, applied updates are not promoted (RS stays
+   * `kc-not-synced` for them, exactly as before this fix).
+   */
+  private readonly resolveOnChainCgId?: ResolveOnChainCgId;
+
   constructor(
     store: TripleStore,
     chain: ChainAdapter,
     eventBus: EventBus,
-    options?: { knownBatchContextGraphs?: Map<string, string> },
+    options?: {
+      knownBatchContextGraphs?: Map<string, string>;
+      resolveOnChainCgId?: ResolveOnChainCgId;
+    },
   ) {
     this.store = store;
     this.graphManager = new GraphManager(store);
     this.chain = chain;
     this.eventBus = eventBus;
     this.knownBatchContextGraphs = options?.knownBatchContextGraphs ?? new Map();
+    this.resolveOnChainCgId = options?.resolveOnChainCgId;
   }
 
   async handle(data: Uint8Array, fromPeerId: string): Promise<void> {
@@ -171,18 +194,79 @@ export class UpdateHandler {
         return;
       }
 
-      // Apply: delete exact root + skolemized children, then insert only manifest roots' quads
-      for (const m of manifest) {
-        await this.deleteEntityTriples(dataGraph, m.rootEntity);
-      }
-
-      const authenticatedQuads: Quad[] = [];
-      for (const root of manifestRoots) {
-        for (const q of partitioned.get(root) ?? []) {
-          authenticatedQuads.push({ ...q, graph: dataGraph });
+      // Resolve the KA's UAL once — used for BOTH the label restatement and the
+      // per-cgId promotion. Prefer the meta-recorded UAL; fall back to the
+      // deterministic canonical UAL (`did:dkg:<chainId>/<kasAddress>/<batchId>`)
+      // so a receiver that hasn't yet materialised the `dkg:batchId` edge still
+      // restates/promotes instead of silently skipping (GH#842 §7.3 — the
+      // "skipped per-cgId promotion (UAL unresolved)" failure mode).
+      const labelMeta = this.graphManager.metaGraphUri(contextGraphId);
+      // Best-effort: the per-cgId promotion is RS-only sugar. A transient
+      // ontology/store error in the resolver must NOT abort the verified
+      // label-graph restatement — that's the same failure mode the agent-
+      // side `update()` already guards. We fall back to `null` (skip
+      // per-cgId promotion) and continue applying the update.
+      let cgId: string | null = null;
+      if (this.resolveOnChainCgId) {
+        try {
+          cgId = await this.resolveOnChainCgId(contextGraphId);
+        } catch (err) {
+          this.log.warn(
+            ctx,
+            `Per-cgId resolver threw for cg=${contextGraphId} — skipping per-cgId promotion: ${err instanceof Error ? err.message : String(err)}`,
+          );
+          cgId = null;
         }
       }
-      await this.store.insert(authenticatedQuads);
+      let ual = await resolveUalByBatchId(this.store, labelMeta, BigInt(batchId));
+      if (!ual && cgId) {
+        ual = await resolveUalByBatchId(this.store, contextGraphMetaUri(contextGraphId, cgId), BigInt(batchId));
+      }
+      if (!ual) {
+        ual = await this.deterministicUal(BigInt(batchId));
+      }
+
+      const updateVersion: MaterializedVersion = {
+        blockNumber: verifiedBlockNumber ?? 0,
+        txIndex: verifiedTxIndex ?? 0,
+      };
+
+      const payloadByRoot = new Map<string, Quad[]>();
+      for (const root of manifestRoots) {
+        payloadByRoot.set(root, partitioned.get(root) ?? []);
+      }
+      const privateRootByRoot = new Map<string, Uint8Array>();
+      for (const m of manifest) {
+        if (m.privateMerkleRoot && m.privateMerkleRoot.length > 0) {
+          privateRootByRoot.set(m.rootEntity, new Uint8Array(m.privateMerkleRoot));
+        }
+      }
+      const authenticatedCount = [...payloadByRoot.values()].reduce((n, qs) => n + qs.length, 0);
+
+      // Apply to the label graph with FULL restatement (GH#842 §7.1): purge the
+      // prior root entities' data (the old delete touched only the new manifest
+      // roots, leaving stale pre-update triples behind), repoint `rootEntity`,
+      // and refresh `merkleRoot`. The version guard makes a late stale
+      // re-materialisation a no-op.
+      if (ual) {
+        await restateLabelGraphForUpdate({
+          store: this.store,
+          dataGraph,
+          metaGraph: labelMeta,
+          ual,
+          merkleRoot: computedRoot,
+          payloadByRoot,
+          privateRootByRoot,
+          version: updateVersion,
+        });
+      } else {
+        // No chain address to mint a UAL: fall back to legacy apply (no
+        // prior-root purge). Should not happen on a configured chain.
+        for (const m of manifest) await this.deleteEntityTriples(dataGraph, m.rootEntity);
+        const flat: Quad[] = [];
+        for (const qs of payloadByRoot.values()) for (const q of qs) flat.push({ ...q, graph: dataGraph });
+        await this.store.insert(flat);
+      }
 
       // Record applied update for ordering + context graph binding
       if (verifiedBlockNumber !== undefined) {
@@ -195,16 +279,34 @@ export class UpdateHandler {
       // Binding was already established from a trusted source (local publish or metadata lookup).
       // Do NOT set from gossip — that would allow first-message-wins context graph spoofing.
 
-      try {
-        await updateMetaMerkleRoot(this.store, this.graphManager, contextGraphId, BigInt(batchId), computedRoot);
-      } catch (err) {
-        this.log.warn(
-          ctx,
-          `Failed to update _meta merkleRoot for batchId=${batchId}: ${err instanceof Error ? err.message : String(err)}`,
-        );
+      // GH #842: promote the applied payload into the per-cgId partition the RS
+      // prover reads, mirroring the publisher side, so receivers can also prove
+      // updated KAs. Best-effort — skip if the on-chain cgId can't be resolved
+      // (RS then stays `kc-not-synced` for this KA, no regression).
+      if (cgId && ual) {
+        try {
+          await promoteUpdatedKaToPerCgId({
+            store: this.store,
+            contextGraphId,
+            cgId,
+            ual,
+            kaId: BigInt(batchId),
+            merkleRoot: computedRoot,
+            payloadByRoot,
+            privateRootByRoot,
+            version: updateVersion,
+          });
+        } catch (err) {
+          this.log.warn(
+            ctx,
+            `GH#842 per-cgId update promotion failed for batchId=${batchId}: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      } else if (!cgId) {
+        this.log.info(ctx, `GH#842: per-cgId promotion skipped (cgId unresolved) for batchId=${batchId}`);
       }
 
-      this.log.info(ctx, `Applied KA update: ${authenticatedQuads.length} triples for batchId=${batchId}`);
+      this.log.info(ctx, `Applied KA update: ${authenticatedCount} triples for batchId=${batchId}`);
 
       this.eventBus.emit(DKGEvent.KA_UPDATED, {
         contextGraphId,
@@ -243,6 +345,25 @@ export class UpdateHandler {
       if (base.startsWith(prefix)) return base.slice(prefix.length);
     }
     return undefined;
+  }
+
+  /**
+   * Deterministic canonical UAL for a batch, matching the publisher's scheme
+   * (`did:dkg:<chainId>/<kasAddress>/<batchId>`). Used as a last-resort UAL when
+   * the `dkg:batchId` resolution edge isn't materialised yet on a receiver, so
+   * the GH#842 promotion never silently skips. Returns undefined when no chain
+   * KnowledgeAssets address is available.
+   */
+  private async deterministicUal(batchId: bigint): Promise<string | undefined> {
+    try {
+      const addr = this.chain.getDKGKnowledgeAssetsAddress
+        ? await this.chain.getDKGKnowledgeAssetsAddress()
+        : undefined;
+      if (!addr) return undefined;
+      return `did:dkg:${this.chain.chainId}/${addr.toLowerCase()}/${batchId.toString()}`;
+    } catch {
+      return undefined;
+    }
   }
 
   /**

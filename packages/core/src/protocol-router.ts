@@ -351,19 +351,30 @@ export class ProtocolRouter {
 
     const limit = this.maxReadBytes;
     libp2p.handle(protocolId, async (stream: Stream, connection) => {
+      // Codex (#669#discussion_r3302188320): cache the stopSignal once at
+      // handler entry and reuse it for every step of the inbound lifecycle.
+      // The previous code re-read `this.node.stopSignal` three times — at
+      // the initial read, in the catch-path abort check, and (implicitly)
+      // for `stream.close()` (which didn't pass it at all). If `DKGNode.stop()`
+      // fires AFTER the request has been read but before the response path
+      // finishes, the controller is cleared in `finally`, so the catch-path
+      // can see `undefined` and misclassify the shutdown as a real handler
+      // error. By caching once we make the whole handler consistently
+      // abortable, and `stream.close({ signal })` participates in shutdown.
+      const stopSignal = this.node.stopSignal;
       try {
-        const requestData = await readAllWithSignal(stream, limit, this.node.stopSignal);
+        const requestData = await readAllWithSignal(stream, limit, stopSignal);
         const peerId = {
           toString: () => connection.remotePeer.toString(),
           toBytes: () => connection.remotePeer.toMultihash().bytes,
         };
         const responseData = await handler(requestData, peerId);
         stream.send(responseData);
-        await stream.close();
+        await stream.close(stopSignal ? { signal: stopSignal } : undefined);
       } catch (err) {
-        if (this.node.stopSignal?.aborted) {
+        if (stopSignal?.aborted) {
           try {
-            stream.abort(asAbortError(this.node.stopSignal.reason));
+            stream.abort(asAbortError(stopSignal.reason));
           } catch {
             // stream already closed
           }

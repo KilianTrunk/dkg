@@ -56,7 +56,29 @@ export const PublishIntentSchema = new Type('PublishIntent')
   // encoders, but encrypted payloads are only sent over the bumped
   // `/dkg/10.0.1/storage-ack` protocol so pre-LU-5 receivers never parse
   // ciphertext as plaintext.
-  .add(new Field('isEncryptedPayload', 14, 'bool'));
+  .add(new Field('isEncryptedPayload', 14, 'bool'))
+  // OT-RFC-38 LU-11 / OT-RFC-39: per-KC ciphertext-chunks Merkle root the
+  // publisher claims for curated batches. Cores recompute the root from
+  // their locally-buffered per-chunk ciphertexts (indexed by
+  // `swmMessageIndex` on the gossip envelope) and DECLINE the ACK on
+  // mismatch. The same root lands on-chain via
+  // `KnowledgeAssetsV10.PublishParams.ciphertextChunksRoot` so RFC-39
+  // random sampling can verify against it. Empty / 32 zero bytes on
+  // pre-LU-11 traffic.
+  .add(new Field('ciphertextChunksRoot', 15, 'bytes'))
+  // OT-RFC-38 LU-11: number of per-chunk ciphertexts staged for this
+  // batch (== `(swmMessageIndex == i)` count, i in [0, count)). Cores
+  // MUST find each chunk before signing. Defaults to 0 on the wire so
+  // legacy v1 traffic decodes as "no chunks".
+  .add(new Field('ciphertextChunkCount', 16, 'uint32'))
+  // OT-RFC-38 LU-11: ACK protocol version negotiated for this publish.
+  // Absent/0 → v1 (legacy LU-5 single-blob path; cores treat
+  // `stagingQuads` as one opaque ciphertext). >= 2 → LU-11 chunked path
+  // (cores expect `ciphertextChunkCount` chunks already received via
+  // SWM gossip, verify the Merkle root, and ignore `stagingQuads`).
+  // Sent over `PROTOCOL_STORAGE_ACK_V2` so pre-LU-11 receivers never
+  // see this field and stay on v1 semantics.
+  .add(new Field('ackProtocolVersion', 17, 'uint32'));
 
 type Long = { low: number; high: number; unsigned: boolean };
 
@@ -103,7 +125,51 @@ export interface PublishIntentMsg {
    * flow that ships plaintext nquads inline keeps working unchanged.
    */
   isEncryptedPayload?: boolean;
+  /**
+   * OT-RFC-38 LU-11 / OT-RFC-39 — per-KC ciphertext-chunks Merkle root
+   * the publisher claims for curated batches. 32-byte keccak256 over
+   * `keccak256(ct_i)` leaves in `swmMessageIndex` order (see
+   * `buildCiphertextChunksRoot` in `@origintrail-official/dkg-core`).
+   *
+   * Cores recompute locally from per-chunk ciphertexts indexed under
+   * `(cgId, batchId, swmMessageIndex)` and DECLINE the ACK on mismatch
+   * before signing. The same root lands on-chain via
+   * `KnowledgeAssetsV10.PublishParams.ciphertextChunksRoot` so RFC-39
+   * random sampling has a stable commitment to verify against.
+   *
+   * Omitted/empty on pre-LU-11 traffic.
+   */
+  ciphertextChunksRoot?: Uint8Array;
+  /**
+   * OT-RFC-38 LU-11 — count of per-chunk ciphertexts staged for this
+   * batch. `swmMessageIndex` ranges over `[0, ciphertextChunkCount)`.
+   * Cores MUST hold every chunk before signing (a missing chunk is
+   * either pulled via the LU-11 sync verb or causes a DECLINE).
+   *
+   * Defaults to `0` on the wire so legacy v1 PublishIntents decode as
+   * "no chunks" and stay on the LU-5 single-blob path.
+   */
+  ciphertextChunkCount?: number;
+  /**
+   * OT-RFC-38 LU-11 — ACK protocol version negotiated for this publish.
+   *
+   * - Absent / `0` / `1` → v1 (legacy LU-5 single-blob: `stagingQuads`
+   *   carries one opaque ciphertext; `ciphertextChunksRoot` and
+   *   `ciphertextChunkCount` are unused).
+   * - `>= 2` → LU-11 chunked: cores expect `ciphertextChunkCount`
+   *   chunks already received via SWM gossip, verify the Merkle root
+   *   matches the publisher's claim, and ignore `stagingQuads`.
+   *
+   * Chunked-path PublishIntents are sent over `PROTOCOL_STORAGE_ACK_V2`
+   * so pre-LU-11 receivers (still on V1) never see this field and stay
+   * on the LU-5 path.
+   */
+  ackProtocolVersion?: number;
 }
+
+/** Sent in `ackProtocolVersion` for LU-11 chunked ACKs. */
+export const ACK_PROTOCOL_VERSION_V1_LU5 = 1;
+export const ACK_PROTOCOL_VERSION_V2_LU11 = 2;
 
 export function encodePublishIntent(msg: PublishIntentMsg): Uint8Array {
   return PublishIntentSchema.encode(

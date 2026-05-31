@@ -6,6 +6,11 @@ import {
   computePublishACKDigest,
   assertSafeIri,
   STORAGE_ACK_DECLINE_CODES,
+  ACK_PROTOCOL_VERSION_V2_LU11,
+  buildCiphertextChunksRoot,
+  ciphertextChunkStoreGraph,
+  ciphertextChunkStoreSubject,
+  CIPHERTEXT_CHUNK_PREDICATE,
 } from '@origintrail-official/dkg-core';
 import {
   computeFlatKCRootV10 as computeFlatKCRoot,
@@ -23,6 +28,17 @@ function compactDeclineText(value: string, maxChars: number): string {
   const compacted = value.replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim();
   if (compacted.length <= maxChars) return compacted;
   return `${compacted.slice(0, Math.max(0, maxChars - 3))}...`;
+}
+
+/** Public publishes omit field 15; protobuf decodes that as `bytes` length 0, not absent. */
+function ciphertextRootForAckDigest(root: Uint8Array | undefined): Uint8Array {
+  if (!root || root.length === 0) {
+    return new Uint8Array(32);
+  }
+  if (root.length !== 32) {
+    throw new Error(`ciphertextChunksRoot must be 32 bytes, got ${root.length}`);
+  }
+  return root;
 }
 
 function summarizeDeclineEntities(entities: readonly string[]): string {
@@ -153,6 +169,52 @@ export interface StorageACKHandlerConfig {
     swmGraphId?: string,
     gossipTopic?: string,
   ) => SubscriptionSource | undefined;
+  /**
+   * Codex review on PR #715: the per-CG named graph that backs the
+   * LU-11 ciphertext chunk store MUST use a CANONICAL form of the CG
+   * id so that publishers (writing `envelope.contextGraphId` from
+   * their gossip envelope) and cores (looking up by `swmGraphId` from
+   * the V2 ACK request) land on the same graph URI. Without
+   * canonicalization, the cleartext-vs-wire-hash mismatch causes
+   * lookups to miss and forces a `GRAPH ?g` wildcard scan, which in
+   * turn exposes the multi-CG identical-KC collision the bot called
+   * out on `ciphertext-chunk-store.ts`.
+   *
+   * The agent wires this to `DKGAgent.canonicalChunkStoreCgIdOrNull`
+   * (which routes 0x-hex, cleartext, and decimal-numeric ids through
+   * the local subscription map). Returning `null` is honest:
+   * "I can't safely canonicalize this id — please degrade to the
+   * legacy `GRAPH ?g` wildcard scan for this lookup." Codex review
+   * (round 2) on PR #727: the previous shape forced a
+   * `gossipWireIdFor(cgId)` even for decimal-numeric ids, which
+   * keccak'd "42" as a literal string and missed every persisted
+   * chunk — required for ACK V2 robustness when
+   * `PublishIntent.swmGraphId` is absent.
+   *
+   * Optional: handlers without this hook continue to use the raw
+   * `swmGraphId` as the graph key, which preserves the legacy
+   * (pre-fix) behaviour for any caller that doesn't yet expose a
+   * normalizer.
+   */
+  normalizeContextGraphIdForChunkStore?: (cgId: string) => string | null;
+  /**
+   * Test-only knob to shrink the V2 chunked-ACK local-wait retry
+   * budget (default 20 retries × 500ms = 10s). The defaults exist so
+   * the SWM ingest can finish persisting chunks before the ACK
+   * lookup runs on freshly-subscribed cores; production callers
+   * MUST NOT override this. Tests that exercise the deterministic
+   * MISSING_CIPHERTEXT_CHUNKS decline path use it to keep CI fast
+   * without changing the production behaviour pin.
+   *
+   * Codex review on PR #738: the prior MISSING_CHUNKS regression
+   * burned the full ~10s retry budget on every run. The injection
+   * point is intentionally narrow — only `maxRetries` and
+   * `delayMs` are tunable; the loop structure is unchanged.
+   */
+  _v2ChunkLookupRetryPolicyForTests?: {
+    maxRetries: number;
+    delayMs: number;
+  };
 }
 
 /**
@@ -238,6 +300,276 @@ export class StorageACKHandler {
     const swmGraphUri = this.config.contextGraphSharedMemoryUri(swmGraphId, subGraphName);
 
     let swmQuads: Quad[];
+
+    // OT-RFC-38 LU-11 / OT-RFC-39 — V2 chunked ACK. Publishers running
+    // the chunked emit path send `ackProtocolVersion >= 2` and ship
+    // empty `stagingQuads`; the per-chunk ciphertexts arrived on this
+    // core via the workspace SWM gossip earlier (one envelope per
+    // chunk with `type='share-write-chunked'` + `swmMessageIndex=i`),
+    // were persisted under
+    //   urn:dkg:swm:v10-publish-ciphertext-chunk/<batchId>/<i>
+    // and the V2 verifier now: (1) loads every chunk from local
+    // store, (2) rebuilds the Merkle root over `keccak256(ct_i)`
+    // leaves in index order, (3) compares to the publisher's claim,
+    // (4) signs the V10 ACK digest only on match. Curated-policy is
+    // enforced before signing — same `isCgCurated` gate the LU-5
+    // path uses, lifted up here so a publisher can't bypass it by
+    // dropping the encrypted-payload flag on the V2 wire.
+    if (
+      typeof intent.ackProtocolVersion === 'number'
+      && intent.ackProtocolVersion >= ACK_PROTOCOL_VERSION_V2_LU11
+    ) {
+      const swmGraphIdForCuration = intent.swmGraphId && intent.swmGraphId.length > 0
+        ? intent.swmGraphId
+        : undefined;
+      if (!this.config.isCgCurated) {
+        return this.encodeDecline(
+          cgId,
+          STORAGE_ACK_DECLINE_CODES.SIGNER_NOT_REGISTERED,
+          'V2 chunked ACK rejected: this core has no curation oracle wired and cannot verify the CG access policy',
+        );
+      }
+      const curationVerdict = await this.config.isCgCurated(cgId, swmGraphIdForCuration);
+      if (curationVerdict !== true) {
+        return this.encodeDecline(
+          cgId,
+          STORAGE_ACK_DECLINE_CODES.SIGNER_NOT_REGISTERED,
+          `V2 chunked ACK rejected for cg=${cgId}: local curation oracle reports ${curationVerdict === false ? 'PUBLIC (not curated)' : 'UNKNOWN'}; chunked path is curated-only`,
+        );
+      }
+      if (intent.stagingQuads && intent.stagingQuads.length > 0) {
+        return this.encodeDecline(
+          cgId,
+          STORAGE_ACK_DECLINE_CODES.MERKLE_MISMATCH_IN_SWM,
+          'V2 chunked ACK request must not carry stagingQuads — ciphertext lives in SWM, not on the ACK wire',
+        );
+      }
+      const claimedChunkCount = intent.ciphertextChunkCount ?? 0;
+      const claimedRoot = intent.ciphertextChunksRoot;
+      if (claimedChunkCount <= 0 || !claimedRoot || claimedRoot.length !== 32) {
+        return this.encodeDecline(
+          cgId,
+          STORAGE_ACK_DECLINE_CODES.MERKLE_MISMATCH_IN_SWM,
+          `V2 chunked ACK requires ciphertextChunkCount > 0 and a 32-byte ciphertextChunksRoot; got count=${claimedChunkCount}, root=${claimedRoot ? claimedRoot.length : 'missing'} bytes`,
+        );
+      }
+      const claimedByteSize = typeof intent.publicByteSize === 'number'
+        ? intent.publicByteSize
+        : Number(intent.publicByteSize);
+
+      // Load chunks 0..count-1 from local store. Each is a base64
+      // literal under the per-(batchId, chunkIndex) subject the LU-11
+      // SWM ingest writes to.
+      //
+      // Tight race window: the publisher emits the chunked SWM
+      // envelopes and the V2 ACK request back-to-back (sub-second).
+      // On a busy or freshly-subscribed core, the storage-ack
+      // handler can run before the SWM ingest finishes persisting
+      // the matching chunks. Block briefly and re-poll missing
+      // indexes a handful of times before declining — the eventual
+      // arrival is the normal happy path, and a transient decline
+      // forces the whole publish to round-trip through the
+      // publisher's retry loop for no gain. We cap the wait at
+      // ~3s total (6 retries × 500ms) so a genuinely-lost chunk
+      // still surfaces fast.
+      // Note on the persisted-vs-looked-up graph key:
+      //
+      // `ingestSwmCiphertextChunkEnvelope` in dkg-agent persists each
+      // chunk into `ciphertextChunkStoreGraph(canonical(envelope.contextGraphId))`,
+      // where `canonical()` is the curator-committed nameHash (wire
+      // form) — `DKGAgent.gossipWireIdFor` wired via
+      // `normalizeContextGraphIdForChunkStore`. Both publisher persist
+      // and ACK-side lookup canonicalize the same way, so a scoped
+      // `GRAPH <ciphertextChunkStoreGraph(canonical(swmGraphId))>`
+      // query is correct and necessary — the previous `GRAPH ?g`
+      // wildcard scan tolerated the cleartext-vs-numeric mismatch but
+      // exposed the multi-CG identical-KC collision the Codex bot
+      // called out on `ciphertext-chunk-store.ts:73`. Two CGs publishing
+      // identical KCs now stay isolated by their per-CG named graph.
+      // Legacy / no-normalizer fallback keeps the raw `swmGraphId` —
+      // matches pre-fix behaviour for tests that haven't wired the hook.
+      const chunkBytes: Uint8Array[] = new Array(claimedChunkCount);
+      let totalChunkBytes = 0;
+      // Dev-friendly default: 20 retries × 500ms = 10s. On a freshly-
+      // created curated CG the SWM host-mode subscription needs to
+      // finish the beacon-driven auto-host handshake, then the
+      // GossipSub mesh needs to ferry the chunked envelope across; on
+      // small devnets that can take a few seconds. Production cores
+      // that have been hosting the CG for ages will hit the cache on
+      // the first iteration so the extra budget is free.
+      //
+      // The optional `_v2ChunkLookupRetryPolicyForTests` config knob
+      // shrinks this for the MISSING_CIPHERTEXT_CHUNKS regression
+      // test; production callers leave it undefined and inherit the
+      // 20×500ms defaults.
+      const testRetryPolicy = this.config._v2ChunkLookupRetryPolicyForTests;
+      const MAX_LOCAL_WAIT_RETRIES = testRetryPolicy?.maxRetries ?? 20;
+      const LOCAL_WAIT_DELAY_MS = testRetryPolicy?.delayMs ?? 500;
+      const normalizeCgId = this.config.normalizeContextGraphIdForChunkStore;
+      // Codex review (round 2) on PR #727: explicitly allow the
+      // normalizer to return null — that means "can't trust a canonical
+      // form for this id, please widen the lookup". We then degrade to
+      // the wildcard `GRAPH ?g` scan, identical to the pre-fix
+      // behaviour. Required because `PublishIntent.swmGraphId` is
+      // optional on the wire (a chunked V2 intent that omits it would
+      // otherwise fall through to `cgId` — a decimal-numeric string —
+      // and the previous unconditional `gossipWireIdFor` would keccak
+      // "42" instead of resolving the curator nameHash.
+      const canonicalCgIdForChunks = normalizeCgId
+        ? normalizeCgId(swmGraphId)
+        : swmGraphId;
+      const chunkStoreGraph = canonicalCgIdForChunks
+        ? ciphertextChunkStoreGraph(canonicalCgIdForChunks)
+        : null;
+      const graphClause = chunkStoreGraph
+        ? `GRAPH <${chunkStoreGraph}>`
+        : 'GRAPH ?g';
+      const loadChunk = async (i: number): Promise<Uint8Array | null> => {
+        const subject = ciphertextChunkStoreSubject(merkleRoot, i);
+        const sparql = `SELECT ?o WHERE { ${graphClause} { <${subject}> <${CIPHERTEXT_CHUNK_PREDICATE}> ?o } } LIMIT 1`;
+        const result = await this.store.query(sparql);
+        if (result.type !== 'bindings' || result.bindings.length === 0) return null;
+        const literal = result.bindings[0]?.['o'];
+        if (typeof literal !== 'string') return null;
+        const base64 = literal.startsWith('"') && literal.endsWith('"')
+          ? literal.slice(1, -1)
+          : literal;
+        return Buffer.from(base64, 'base64');
+      };
+      let pending = Array.from({ length: claimedChunkCount }, (_, i) => i);
+      let missing: number[] = [];
+      for (let attempt = 0; attempt <= MAX_LOCAL_WAIT_RETRIES && pending.length > 0; attempt++) {
+        if (attempt > 0) {
+          await new Promise((resolve) => setTimeout(resolve, LOCAL_WAIT_DELAY_MS));
+        }
+        const stillPending: number[] = [];
+        for (const i of pending) {
+          const bytes = await loadChunk(i);
+          if (bytes === null) {
+            stillPending.push(i);
+            continue;
+          }
+          chunkBytes[i] = bytes;
+          totalChunkBytes += bytes.length;
+        }
+        pending = stillPending;
+        missing = stillPending;
+      }
+      if (missing.length > 0) {
+        const preview = missing.slice(0, 8).join(',') + (missing.length > 8 ? `,+${missing.length - 8} more` : '');
+        return this.encodeDecline(
+          cgId,
+          STORAGE_ACK_DECLINE_CODES.MISSING_CIPHERTEXT_CHUNKS,
+          `V2 chunked ACK: missing ${missing.length}/${claimedChunkCount} chunks (indexes=${preview}) under (cgId=${cgId}, batchId=${ethers.hexlify(merkleRoot).slice(0, 18)}...). Late-join sync should backfill; the publisher should retry.`,
+        );
+      }
+      if (totalChunkBytes !== claimedByteSize) {
+        return this.encodeDecline(
+          cgId,
+          STORAGE_ACK_DECLINE_CODES.MERKLE_MISMATCH_IN_SWM,
+          `V2 chunked ACK byteSize mismatch: local chunks sum to ${totalChunkBytes} bytes but publisher claims publicByteSize=${claimedByteSize}`,
+        );
+      }
+      const computed = buildCiphertextChunksRoot(chunkBytes);
+      if (computed.leafCount !== claimedChunkCount) {
+        return this.encodeDecline(
+          cgId,
+          STORAGE_ACK_DECLINE_CODES.CIPHERTEXT_ROOT_MISMATCH,
+          `V2 chunked ACK count mismatch: built tree has ${computed.leafCount} leaves but publisher claims ${claimedChunkCount}`,
+        );
+      }
+      if (!bytesEqual(computed.root, claimedRoot)) {
+        return this.encodeDecline(
+          cgId,
+          STORAGE_ACK_DECLINE_CODES.CIPHERTEXT_ROOT_MISMATCH,
+          `V2 chunked ACK root mismatch: recomputed root=${ethers.hexlify(computed.root).slice(0, 18)}... does not match publisher claim=${ethers.hexlify(claimedRoot).slice(0, 18)}...`,
+        );
+      }
+
+      // Cores can't enumerate KAs from ciphertext — use the publisher's
+      // claimed counts for the V10 digest. Same shape as the LU-5
+      // single-blob path below; deliberately repeated rather than
+      // factored out so the V2 verify slot stays self-contained and
+      // easy to audit against the spec.
+      if (!intent.kaCount || intent.kaCount <= 0) {
+        return this.encodeDecline(
+          cgId,
+          STORAGE_ACK_DECLINE_CODES.MERKLE_MISMATCH_IN_SWM,
+          `V2 chunked PublishIntent.kaCount must be positive; got ${intent.kaCount}`,
+        );
+      }
+      const claimedLeafCount = intent.merkleLeafCount == null ? 0 : Number(intent.merkleLeafCount);
+      if (claimedLeafCount < 1) {
+        return this.encodeDecline(
+          cgId,
+          STORAGE_ACK_DECLINE_CODES.MERKLE_MISMATCH_IN_SWM,
+          `V2 chunked PublishIntent.merkleLeafCount must be a positive integer; got ${claimedLeafCount}`,
+        );
+      }
+      const intentEpochs = (typeof intent.epochs === 'number' && intent.epochs > 0) ? intent.epochs : 1;
+      const intentTokenAmount = intent.tokenAmountStr ? BigInt(intent.tokenAmountStr) : 0n;
+      let contextGraphIdBigInt: bigint;
+      try {
+        contextGraphIdBigInt = BigInt(cgId);
+      } catch {
+        throw new Error(
+          `V2 chunked StorageACK: V10 publish requires a numeric on-chain context graph id; got '${cgId}'.`,
+        );
+      }
+      if (contextGraphIdBigInt <= 0n) {
+        throw new Error(
+          `V2 chunked StorageACK: V10 publish requires a positive on-chain context graph id; got ${contextGraphIdBigInt}.`,
+        );
+      }
+      const digest = computePublishACKDigest(
+        this.config.chainId,
+        this.config.kav10Address,
+        contextGraphIdBigInt,
+        merkleRoot,
+        BigInt(intent.kaCount),
+        BigInt(claimedByteSize),
+        BigInt(intentEpochs),
+        intentTokenAmount,
+        BigInt(claimedLeafCount),
+        ciphertextRootForAckDigest(intent.ciphertextChunksRoot),
+        BigInt(intent.ciphertextChunkCount ?? 0),
+        false,
+      );
+      if (this.config.isSignerRegistered) {
+        let signerRegistered: boolean | undefined;
+        try {
+          signerRegistered = await this.config.isSignerRegistered();
+        } catch (err) {
+          try { await this.config.onSignerRegistrationLookupFailed?.(err); } catch { /* swallow */ }
+          throw new Error('V2 chunked StorageACK signer registration lookup failed; refusing to sign');
+        }
+        if (signerRegistered === false) {
+          try { await this.config.onSignerUnregistered?.(); } catch { /* swallow */ }
+          return this.encodeDecline(
+            cgId,
+            STORAGE_ACK_DECLINE_CODES.SIGNER_NOT_REGISTERED,
+            'V2 chunked StorageACK signer is not confirmed on-chain as an operational wallet',
+          );
+        }
+      }
+      const signature = ethers.Signature.from(
+        await this.config.signerWallet.signMessage(digest),
+      );
+      const v2SubscriptionSource = this.config.getSubscriptionSourceForCg?.(
+        cgId,
+        swmGraphId !== cgId ? swmGraphId : undefined,
+      );
+      return encodeStorageACK({
+        merkleRoot,
+        coreNodeSignatureR: ethers.getBytes(signature.r),
+        coreNodeSignatureVS: ethers.getBytes(signature.yParityAndS),
+        contextGraphId: cgId,
+        nodeIdentityId: this.config.nodeIdentityId <= BigInt(Number.MAX_SAFE_INTEGER)
+          ? Number(this.config.nodeIdentityId)
+          : { low: Number(this.config.nodeIdentityId & 0xFFFFFFFFn), high: Number((this.config.nodeIdentityId >> 32n) & 0xFFFFFFFFn), unsigned: true },
+        ...(v2SubscriptionSource ? { subscriptionSource: v2SubscriptionSource } : {}),
+      });
+    }
 
     // OT-RFC-38 / LU-5 encrypted-payload path. For curated CGs the publisher
     // ships AEAD-encrypted nquad bytes inline so cores can store the
@@ -397,6 +729,9 @@ export class StorageACKHandler {
         BigInt(intentEpochs),
         intentTokenAmount,
         BigInt(claimedLeafCount),
+        ciphertextRootForAckDigest(intent.ciphertextChunksRoot),
+        BigInt(intent.ciphertextChunkCount ?? 0),
+        false,
       );
 
       if (this.config.isSignerRegistered) {
@@ -612,6 +947,9 @@ export class StorageACKHandler {
       BigInt(intentEpochs),
       intentTokenAmount,
       BigInt(verifiedLeafCount),
+      ciphertextRootForAckDigest(intent.ciphertextChunksRoot),
+      BigInt(intent.ciphertextChunkCount ?? 0),
+      false,
     );
     if (this.config.isSignerRegistered) {
       let signerRegistered: boolean | undefined;

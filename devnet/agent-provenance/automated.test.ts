@@ -66,7 +66,7 @@ interface DevnetNode {
 interface DevnetState {
   provider: ethers.JsonRpcProvider;
   hub: ethers.Contract;
-  kcs: ethers.Contract;
+  kas: ethers.Contract;
   nft: ethers.Contract;
   token: ethers.Contract;
   eps: ethers.Contract;
@@ -239,6 +239,37 @@ async function ensurePcaAccountForOpWallets(
   return accountId;
 }
 
+/**
+ * Zero out the TRAC balance of every op wallet on `node` via direct
+ * storage writes against the Hardhat TRAC contract. Native ETH is
+ * untouched, so the wallets keep enough gas to submit publishes.
+ *
+ * Token = `Ownable, ERC20, AccessControl` — same layout
+ * `ensurePcaAccountForOpWallets` exploits to MINT TRAC. ERC20's
+ * `_balances` mapping is at slot 1 (Ownable's `_owner` takes slot 0).
+ * Storage key for `mapping(address => uint256)`:
+ *   `keccak256(abi.encode(holder, slot))`.
+ *
+ * Used by the gas-only mode (a) variant below to construct the
+ * literal "publisher EOA has zero TRAC, only ETH for gas" precondition.
+ */
+async function drainOpWalletTrac(s: DevnetState, node: DevnetNode): Promise<void> {
+  const tokenAddress = await s.token.getAddress();
+  for (const w of node.opWallets) {
+    const slotKey = ethers.keccak256(
+      ethers.AbiCoder.defaultAbiCoder().encode(
+        ['address', 'uint256'],
+        [w.address, 1n],
+      ),
+    );
+    await s.provider.send('hardhat_setStorageAt', [
+      tokenAddress,
+      slotKey,
+      ethers.ZeroHash,
+    ]);
+  }
+}
+
 async function fetchStatus(node: DevnetNode): Promise<{ identityId: bigint; nodeRole: string }> {
   const res = await fetch(`http://127.0.0.1:${node.apiPort}/api/status`);
   if (!res.ok) {
@@ -315,13 +346,13 @@ function runDkgCli(node: DevnetNode, args: string[], timeoutMs = 60_000): Promis
   });
 }
 
-/** Run `dkg publish` and return the parsed { kcId, status, txHash } it printed. */
+/** Run `dkg publish` and return the parsed { kaId, status, txHash } it printed. */
 async function publishViaCli(
   node: DevnetNode,
   contextGraph: string,
   filePath: string,
   options: { publisherNodeIdentityId?: bigint } = {},
-): Promise<{ status: string; kcId?: bigint; txHash?: string; raw: string }> {
+): Promise<{ status: string; kaId?: bigint; txHash?: string; raw: string }> {
   const args = ['publish', contextGraph, '--file', filePath];
   if (options.publisherNodeIdentityId !== undefined) {
     args.push('--publisher-node-identity-id', String(options.publisherNodeIdentityId));
@@ -340,7 +371,7 @@ async function publishViaCli(
   const txMatch = /TX hash:\s*(0x[0-9a-fA-F]+)/i.exec(result.stdout);
   return {
     status,
-    kcId: kcMatch ? BigInt(kcMatch[1]!) : undefined,
+    kaId: kcMatch ? BigInt(kcMatch[1]!) : undefined,
     txHash: txMatch ? txMatch[1] : undefined,
     raw: result.stdout,
   };
@@ -357,7 +388,7 @@ async function loadContractAddresses(provider: ethers.JsonRpcProvider, hubAddres
   );
   return {
     hub,
-    kcsAddress: await hub.getAssetStorageAddress('KnowledgeCollectionStorage'),
+    kcsAddress: await hub.getAssetStorageAddress('DKGKnowledgeAssets'),
     nftAddress: await hub.getContractAddress('DKGPublishingConvictionNFT'),
     tokenAddress: await hub.getContractAddress('Token'),
     epsAddress: await hub.getContractAddress('EpochStorageV8'),
@@ -412,7 +443,7 @@ async function detectDevnet(): Promise<DevnetState | null> {
   const provider = new ethers.JsonRpcProvider(RPC, { chainId: 31337, name: 'localhost' });
   const addrs = await loadContractAddresses(provider, hubAddress);
 
-  const kcs = new ethers.Contract(
+  const kas = new ethers.Contract(
     addrs.kcsAddress,
     [
       'function getLatestMerkleRootAuthor(uint256) view returns (address)',
@@ -461,7 +492,7 @@ async function detectDevnet(): Promise<DevnetState | null> {
       return null;
     }
   }
-  return { provider, hub: addrs.hub as ethers.Contract, kcs, nft, token, eps, chronos, nodes };
+  return { provider, hub: addrs.hub as ethers.Contract, kas, nft, token, eps, chronos, nodes };
 }
 
 // ---- per-test fixture writes -----------------------------------------------
@@ -521,7 +552,7 @@ describe('Agent provenance — automated 5-node devnet validation', () => {
   //   3. node5 publishes to CG `devnet-test` with `--publisher-node-identity-id 1`.
   //   4. Assert:
   //      - publish status == confirmed
-  //      - kcs.getLatestMerkleRootAuthor(kcId) == node5.submitter.address
+  //      - kas.getLatestMerkleRootAuthor(kaId) == node5.submitter.address
   //      - nft.windowSpent(accountId, currentBillingWindow) increased
   //      - eps.getNodeEpochProducedKnowledgeValue(core1.id, epoch) increased
   // =========================================================================
@@ -552,10 +583,10 @@ describe('Agent provenance — automated 5-node devnet validation', () => {
     });
 
     expect(result.status.toLowerCase()).toBe('confirmed');
-    expect(result.kcId).toBeDefined();
+    expect(result.kaId).toBeDefined();
 
     // 5. On-chain assertions.
-    const onChainAuthor: string = await s.kcs.getLatestMerkleRootAuthor(result.kcId!);
+    const onChainAuthor: string = await s.kas.getLatestMerkleRootAuthor(result.kaId!);
     const matchesAnyOpWallet = edge.opWallets.some(
       (w) => w.address.toLowerCase() === onChainAuthor.toLowerCase(),
     );
@@ -576,6 +607,98 @@ describe('Agent provenance — automated 5-node devnet validation', () => {
     // Op-wallet pool TRAC must NOT decrement — PCA covered the cost.
     const afterBalance = await sumOpBalances(s.token, edge);
     expect(afterBalance).toBe(beforeBalance);
+  }, 180_000);
+
+  // =========================================================================
+  // Mode (a) — STRICT: publisher EOA holds ZERO TRAC, only gas (ETH).
+  //
+  // Tightens the cost-coverage invariant in mode (a). The plain mode (a)
+  // asserts "balance unchanged across publish"; that's necessary but
+  // doesn't pin the actual operator scenario where a publishing agent
+  // wallet is provisioned with ONLY gas tokens and never holds TRAC.
+  //
+  // Setup:
+  //   1. Reuse / create the mode (a) PCA so every edge op wallet is a
+  //      registered conviction agent (`agentToAccountId != 0`).
+  //   2. Zero the TRAC `_balances` slot for every edge op wallet via
+  //      `hardhat_setStorageAt`. ETH is untouched — daemon can still
+  //      pay gas. After this step `sumOpBalances(edge) == 0n`.
+  //
+  // Action: edge runs `dkg publish` naming core1 for attribution. The
+  // daemon will pick one of the now-zero-TRAC op wallets as `msg.sender`
+  // for `KAV10.publish()`. The conviction branch fires
+  // (`agentToAccountId[msg.sender] != 0`, `epochs == lockDurationEpochs`,
+  // not expired) → `NFT.coverPublishingCost` updates `windowSpent`
+  // without calling `transferFrom(msg.sender, ...)` for TRAC, so the
+  // publish must succeed even though the EOA's TRAC balance is zero.
+  //
+  // Assertions:
+  //   - Pre-publish `sumOpBalances(edge) == 0n` (precondition pinned).
+  //   - Publish status == confirmed.
+  //   - KC author is one of edge's op wallets.
+  //   - `NFT.windowSpent(accountId, currentBillingWindow)` grew.
+  //   - core1's `EpochStorage` publishing-value counter grew.
+  //   - Post-publish `sumOpBalances(edge) == 0n` (the agent EOA's TRAC
+  //     ledger entry was NEVER touched — strongest possible "agent only
+  //     spent gas" assertion).
+  //
+  // Side effect: edge op-wallets stay at zero TRAC for the rest of the
+  // suite. This is fine for mode (c) (the `firstOpAccount !== 0n` skip
+  // already kicks in once mode (a) has run), mode (d) (unattributed
+  // publish still covered by PCA), the unauthorized-fall-through
+  // negative case (Eps-only assertion), and mode (b) (uses core2,
+  // independent of edge wallets).
+  // =========================================================================
+  it('mode (a) strict — gas-only edge op-wallets (zero TRAC) publish via PCA', async () => {
+    const s = state.v!;
+    const core1 = s.nodes[1]!;
+    const edge = s.nodes[5]!;
+    if (core1.identityId === 0n) throw new Error('core1 has no identity');
+
+    const accountId = await ensurePcaAccountForOpWallets(s, edge);
+
+    await drainOpWalletTrac(s, edge);
+    const drainedBalance = await sumOpBalances(s.token, edge);
+    expect(drainedBalance).toBe(0n);
+
+    const epoch: bigint = await s.chronos.getCurrentEpoch();
+    const beforeWindow: bigint = BigInt(await s.nft.getCurrentBillingWindow(accountId));
+    const beforeSpent: bigint =
+      (await s.nft.windowSpent(accountId, beforeWindow)) +
+      (await s.nft.windowSpent(accountId, beforeWindow + 1n));
+    const beforeEps: bigint = await s.eps.getNodeEpochProducedKnowledgeValue(core1.identityId, epoch);
+
+    const file = makeNquadsFile('mode-a-strict');
+    const result = await publishViaCli(edge, CONTEXT_GRAPH, file, {
+      publisherNodeIdentityId: core1.identityId,
+    });
+
+    expect(result.status.toLowerCase()).toBe('confirmed');
+    expect(result.kaId).toBeDefined();
+
+    const onChainAuthor: string = await s.kas.getLatestMerkleRootAuthor(result.kaId!);
+    const matchesAnyOpWallet = edge.opWallets.some(
+      (w) => w.address.toLowerCase() === onChainAuthor.toLowerCase(),
+    );
+    expect(matchesAnyOpWallet).toBe(true);
+
+    const afterWindow: bigint = BigInt(await s.nft.getCurrentBillingWindow(accountId));
+    const afterSpent: bigint =
+      (await s.nft.windowSpent(accountId, beforeWindow)) +
+      (await s.nft.windowSpent(accountId, beforeWindow + 1n)) +
+      (afterWindow > beforeWindow + 1n
+        ? await s.nft.windowSpent(accountId, afterWindow)
+        : 0n);
+    expect(afterSpent - beforeSpent).toBeGreaterThan(0n);
+
+    const afterEps: bigint = await s.eps.getNodeEpochProducedKnowledgeValue(core1.identityId, epoch);
+    expect(afterEps).toBeGreaterThan(beforeEps);
+
+    // The strict invariant: every edge op-wallet's TRAC balance is STILL
+    // ZERO. The conviction branch never called `transferFrom` on the
+    // publishing agent's TRAC ledger entry — the EOA only spent gas.
+    const finalBalance = await sumOpBalances(s.token, edge);
+    expect(finalBalance).toBe(0n);
   }, 180_000);
 
   // =========================================================================
@@ -606,7 +729,7 @@ describe('Agent provenance — automated 5-node devnet validation', () => {
     });
 
     expect(result.status.toLowerCase()).toBe('confirmed');
-    expect(result.kcId).toBeDefined();
+    expect(result.kaId).toBeDefined();
 
     // Edge op-wallet pool TRAC MUST decrement when no PCA covers it.
     if (firstOpAccount === 0n) {
@@ -619,7 +742,7 @@ describe('Agent provenance — automated 5-node devnet validation', () => {
     expect(afterEps).toBeGreaterThan(beforeEps);
 
     // Author is one of the op wallets.
-    const onChainAuthor: string = await s.kcs.getLatestMerkleRootAuthor(result.kcId!);
+    const onChainAuthor: string = await s.kas.getLatestMerkleRootAuthor(result.kaId!);
     const matches = edge.opWallets.some(
       (w) => w.address.toLowerCase() === onChainAuthor.toLowerCase(),
     );
@@ -683,14 +806,14 @@ describe('Agent provenance — automated 5-node devnet validation', () => {
     });
 
     expect(result.status.toLowerCase()).toBe('confirmed');
-    expect(result.kcId).toBeDefined();
+    expect(result.kaId).toBeDefined();
 
     // Attribution preserved regardless of cost-coverage branch.
     const afterEps: bigint = await s.eps.getNodeEpochProducedKnowledgeValue(core1.identityId, epoch);
     expect(afterEps).toBeGreaterThan(beforeEps);
 
     // Author = one of the op wallets (msg.sender).
-    const onChainAuthor: string = await s.kcs.getLatestMerkleRootAuthor(result.kcId!);
+    const onChainAuthor: string = await s.kas.getLatestMerkleRootAuthor(result.kaId!);
     const matches = edge.opWallets.some(
       (w) => w.address.toLowerCase() === onChainAuthor.toLowerCase(),
     );
@@ -796,7 +919,7 @@ describe('Agent provenance — automated 5-node devnet validation', () => {
         headers: agentHeaders,
         body: JSON.stringify({
           contextGraphId: CONTEXT_GRAPH,
-          selection: 'all',
+          selection: { rootEntities: [subjectIri] },
           clearAfter: true,
         }),
       },
@@ -807,7 +930,7 @@ describe('Agent provenance — automated 5-node devnet validation', () => {
       );
     }
     const publishJson = (await publishRes.json()) as {
-      kcId: string;
+      kaId: string;
       status: string;
       txHash?: string;
     };
@@ -815,8 +938,8 @@ describe('Agent provenance — automated 5-node devnet validation', () => {
     expect(publishJson.txHash).toBeTruthy();
 
     // 4. On-chain assertions.
-    const kcId = BigInt(publishJson.kcId);
-    const onChainAuthor: string = await s.kcs.getLatestMerkleRootAuthor(kcId);
+    const kaId = BigInt(publishJson.kaId);
+    const onChainAuthor: string = await s.kas.getLatestMerkleRootAuthor(kaId);
     expect(onChainAuthor.toLowerCase()).toBe(agentRecord.agentAddress.toLowerCase());
 
     // Author MUST NOT be any of core2's own op wallets — that would mean we

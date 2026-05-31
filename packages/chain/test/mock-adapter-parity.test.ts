@@ -32,7 +32,7 @@
  *                 declared on `ChainAdapter`. It also pins a small set of
  *                 invariants (e.g. `isV10Ready() === true` so the V10
  *                 code paths are exercised off-line; `signMessage`
- *                 returns 32-byte r/vs; `createKnowledgeAssetsV10`
+ *                 returns 32-byte r/vs; `createKnowledgeAssets`
  *                 tolerates `cgId === 0n` on the mock even though the
  *                 real adapter rejects).
  *
@@ -76,6 +76,7 @@ const MOCK_EXEMPT_FROM_EVM = new Set<string>([
   'getContract',            // resolves a Contract from the Hub — not applicable off-chain
   'getBlockNumber',         // the mock exposes its own block counter differently (advanceBlock)
   'getProvider',            // returns a JsonRpcProvider; mock has none
+  'getReadProvider',        // returns the EVM fallback read provider; mock has no RPC provider
   'getSignerAddress',       // mock exposes `signerAddress` as a field
   'getSignerAddresses',     // pool not applicable to mock
   'getAuthorizedPublisherAddress', // pool-specific signer selection; mock has one signerAddress
@@ -96,8 +97,19 @@ const MOCK_EXEMPT_FROM_EVM = new Set<string>([
   'init',
   'requireV9',
   'getBlockTimestamp',
+  'broadcastSignedTransactionWithFailover',
+  'getTransactionReceiptWithFailover',
+  'waitForReceiptWithFailover',
+  'signPopulatedTransaction',
+  'sendSignedTransactionAndWait',
+  'sendPopulatedTransaction',
+  'sendContractTransaction',
   'parseV10PublishReceipt',
   'parseV9PublishReceipt',
+  // TS-private V10 TRAC-allowance helper backing publish/update. Encodes
+  // the `chain.approvalPolicy` dispatch and the `transferFrom(..., 1n)`
+  // floor; the mock has no ERC-20 allowance surface to mirror.
+  'ensureV10ApproveTrac',
   // Lazy-cache helpers for frequently-resolved contracts — TS-private,
   // not part of the ChainAdapter interface.
   'getIdentityStorage',
@@ -112,16 +124,19 @@ const MOCK_EXEMPT_FROM_EVM = new Set<string>([
   'translateRandomSamplingError',
   'toNodeChallenge',
   // Hub-rotation handling — adapter-internal plumbing that backs the
-  // self-refreshing RS resolution. The mock has no Hub, so no live
-  // rotation surface to mirror.
+  // self-refreshing RS resolution and the generic boot-bound contract
+  // self-refresh (rc.12 PR `feat/chain-hub-rotation-auto-recovery`).
+  // The mock has no Hub, so no live rotation surface to mirror.
   'withHubStaleRetry',
+  'withHubStaleRetryAny',
+  'invalidateAllBoundContracts',
   'startHubRotationListener',
   'invalidateRandomSamplingPair',
   'resolveAndAssignRandomSamplingPair',
   'isContractMissingRevert',
   // KC views (Phase 1) — TS-private helpers; the five public methods
   // (getLatestMerkleRoot, getMerkleLeafCount, getLatestMerkleRootPublisher,
-  // getLatestMerkleRootAuthor, getKCContextGraphId) ARE mirrored on
+  // getLatestMerkleRootAuthor, getKAContextGraphId) ARE mirrored on
   // MockChainAdapter.
   'requireKCStorage',
   'requireContextGraphStorage',
@@ -137,6 +152,25 @@ const MOCK_EXEMPT_FROM_EVM = new Set<string>([
   // round-trips to cache in the first place; a no-op shim would just
   // pad parity for no behavioural reason.
   'invalidatePublishPreflightCache',
+  // #820 (RFC-39 ciphertext/immutable ACK binding): EVM-only surfaces.
+  //  - `isContextGraphActiveOnChain` is a `ContextGraphStorage.isContextGraphActive`
+  //    read. Its sole upstream caller (dkg-agent CG-liveness probe) already
+  //    feature-detects it via `typeof === 'function'` and degrades gracefully
+  //    when absent, so the mock has no method-not-implemented surprise.
+  //  - `computeV10UpdateAckDigest` mirrors the on-chain
+  //    `KnowledgeAssetsLifecycle._executeUpdateCore` ACK-digest packing for
+  //    test helpers / ACK collectors. The mock performs no real signature
+  //    recovery (its `updateKnowledgeCollectionV10` accepts any ack), so there
+  //    is no on-chain digest to reproduce.
+  //  - `computeUpdateNewTokenAmount` (issue #831) is a private helper that
+  //    chains together `getKnowledgeCollectionUpdateContext`, `Chronos.getCurrentEpoch`,
+  //    and `AskStorage.getStakeWeightedAverageAsk` to mirror the contract's
+  //    growth-cost validator. The mock skips on-chain validation entirely, so
+  //    there's nothing to reproduce here.
+  'isContextGraphActiveOnChain',
+  'computeV10UpdateAckDigest',
+  'resolveCurrentTokenAmount',
+  'computeUpdateNewTokenAmount',
 ]);
 
 const NO_CHAIN_EXEMPT_FROM_EVM = new Set<string>([
@@ -170,8 +204,8 @@ const NO_CHAIN_EXEMPT_FROM_EVM = new Set<string>([
   // V8 staking + V9 PCA family + V9 permanent publish were archived from
   // EVMChainAdapter in `archive-non-v10-contracts`; both mock and EVM
   // dropped the surface, so they don't need parity-list entries.
-  'createKnowledgeCollection',
-  'updateKnowledgeCollection',
+  'createKnowledgeAsset',
+  'updateKnowledgeAsset',
 ]);
 
 describe('MockChainAdapter API parity with EVMChainAdapter [CH-8]', () => {
@@ -271,9 +305,9 @@ describe('MockChainAdapter API parity with EVMChainAdapter [CH-8]', () => {
     expect(id).toBeGreaterThan(0n);
   });
 
-  it('getKnowledgeAssetsV10Address returns a 20-byte hex address', async () => {
+  it('getKnowledgeAssetsLifecycleAddress returns a 20-byte hex address', async () => {
     const mock = new MockChainAdapter();
-    const addr = await mock.getKnowledgeAssetsV10Address();
+    const addr = await mock.getKnowledgeAssetsLifecycleAddress();
     expect(addr).toMatch(/^0x[0-9a-fA-F]{40}$/);
   });
 
@@ -400,10 +434,10 @@ describe('MockChainAdapter API parity with EVMChainAdapter [CH-8]', () => {
       ackSignatures: [],
     };
 
-    await expect(mock.createKnowledgeAssetsV10(params)).rejects.toThrow(/not allowed/);
+    await expect(mock.createKnowledgeAssets(params)).rejects.toThrow(/not allowed/);
 
     mock.allowPublisherAddress(otherPublisher);
-    await expect(mock.createKnowledgeAssetsV10(params)).resolves.toMatchObject({
+    await expect(mock.createKnowledgeAssets(params)).resolves.toMatchObject({
       publisherAddress: otherPublisher,
     });
   });
@@ -414,7 +448,7 @@ describe('MockChainAdapter API parity with EVMChainAdapter [CH-8]', () => {
     const delegatedPublisher = '0x2222222222222222222222222222222222222222';
     mock.allowPublisherAddress(delegatedPublisher);
 
-    const created = await mock.createKnowledgeAssetsV10({
+    const created = await mock.createKnowledgeAssets({
       publishOperationId: 'mock-v10-delegated-update',
       contextGraphId: 1n,
       publisherAddress: delegatedPublisher,
@@ -436,10 +470,13 @@ describe('MockChainAdapter API parity with EVMChainAdapter [CH-8]', () => {
 
     const newMerkleRoot = ethers.getBytes(ethers.keccak256(ethers.toUtf8Bytes('mock-v10-update')));
     const update = await mock.updateKnowledgeCollectionV10({
-      kcId: created.batchId,
+      kaId: created.batchId,
       newMerkleRoot,
       newByteSize: 2n,
       newMerkleLeafCount: 1,
+      authorAddress: delegatedPublisher,
+      authorR: new Uint8Array(32),
+      authorVS: new Uint8Array(32),
     });
 
     expect(update.publisherAddress?.toLowerCase()).toBe(delegatedPublisher.toLowerCase());
@@ -471,8 +508,8 @@ describe('NoChainAdapter completeness [CH-9]', () => {
       'listenForEvents',
       'createContextGraph',
       'submitToContextGraph',
-      'createKnowledgeAssetsV10',
-      'getKnowledgeAssetsV10Address',
+      'createKnowledgeAssets',
+      'getKnowledgeAssetsLifecycleAddress',
       'getEvmChainId',
       'isV10Ready',
     ];

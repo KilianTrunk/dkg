@@ -81,7 +81,7 @@ export interface TelemetrySettingsCallbacks {
 }
 
 /**
- * Handles all /api/metrics, /api/operations, /api/logs, /api/query-history,
+ * Handles all /api/metrics, /api/operations, /api/node-log, /api/query-history,
  * /api/saved-queries, and /ui routes. Returns true if the request was handled.
  */
 export async function handleNodeUIRequest(
@@ -258,7 +258,7 @@ export async function handleNodeUIRequest(
     return json(res, 200, spending);
   }
 
-  // --- Logs ---
+  // --- Logs (compatibility endpoint) ---
 
   if (req.method === 'GET' && path === '/api/logs') {
     const q = url.searchParams.get('q') ?? undefined;
@@ -621,27 +621,16 @@ export async function handleNodeUIRequest(
   }
 
   // --- Notifications ---
-
-  if (req.method === 'GET' && path === '/api/notifications') {
-    const since = url.searchParams.get('since');
-    const limit = url.searchParams.get('limit');
-    const data = db.getNotifications({
-      since: since ? Number(since) : undefined,
-      limit: limit ? Number(limit) : undefined,
-    });
-    return json(res, 200, data);
-  }
-
-  if (req.method === 'POST' && path === '/api/notifications/read') {
-    const body = await readBody(req);
-    let ids: number[] | undefined;
-    try {
-      const parsed = JSON.parse(body);
-      if (Array.isArray(parsed.ids)) ids = parsed.ids.map(Number);
-    } catch { /* mark all */ }
-    const count = db.markNotificationsRead(ids);
-    return json(res, 200, { marked: count });
-  }
+  //
+  // ADR-003 (notifications-pane redesign): `GET /api/notifications` and
+  // `POST /api/notifications/read` are now served by the AGENT-AWARE daemon
+  // route (`packages/cli/src/daemon/routes/notifications.ts`), which has the
+  // caller identity + `agent.listContextGraphs`/`listPendingJoinRequests`
+  // needed to scope the feed. `handleNodeUIRequest` runs before the daemon's
+  // `handleRequest`, so the legacy flat (unscoped) routes were REMOVED here
+  // (clean cut) to let the request fall through to the scoped handler. The
+  // pure scoping/digest logic lives in `scopeNotifications` (see
+  // `./notifications-scope.js`), which the daemon route calls.
 
   // --- Static UI files ---
 
@@ -769,4 +758,3 @@ function readBody(req: IncomingMessage, maxBytes?: number): Promise<string> {
     req.on('error', reject);
   });
 }
-

@@ -206,5 +206,19 @@ describe.sequential('assertion CLI smoke', () => {
     expect(promoted.stdout).toContain('Assertion promoted to shared memory:');
     expect(promoted.stdout).toContain('Triples:        14');
     expect(promoted.stdout).toContain('urn:company:acme');
+    expect(promoted.stdout).toContain('Next:           dkg shared-memory publish research --name paper');
+
+    const promotedSubgraph = await execFileAsync('node', [
+      CLI_ENTRY,
+      'assertion',
+      'promote',
+      'paper',
+      '--context-graph',
+      'research',
+      '--sub-graph-name',
+      'lab',
+    ], { env });
+
+    expect(promotedSubgraph.stdout).toContain('Next:           dkg shared-memory publish research --name paper --sub-graph-name lab');
   }, 15000);
 });

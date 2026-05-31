@@ -188,6 +188,8 @@ export function registerReadTools(
         'just write `SELECT ?d WHERE { ?d a decisions:Decision }`. Scope ' +
         'with `view` — "working-memory" (default, private), ' +
         '"shared-working-memory" (team), or "verified-memory" (on-chain). ' +
+        '`contextGraphId` and `view` are authoritative: local `GRAPH ?g` ' +
+        'patterns are constrained to that resolved graph set. ' +
         'Set `includeSharedMemory: true` alongside `view: "working-memory"` ' +
         'to query WM ∪ SWM in one call.',
       inputSchema: {

@@ -236,15 +236,10 @@ import {
   getCurrentCliVersion,
   type NpmVersionStatus,
   checkForNpmVersionUpdate,
-  checkForNewCommit,
-  checkForNewCommitWithStatus,
   type UpdateStatus,
   acquireUpdateLock,
   releaseUpdateLock,
-  performUpdate,
-  performUpdateWithStatus,
   performNpmUpdate,
-  checkForUpdate,
 } from '../auto-update.js';
 import {
   OPENCLAW_UI_CONNECT_TIMEOUT_MS,
@@ -771,7 +766,10 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
           WHERE { GRAPH ?g { ?s ?p ?o } }
           GROUP BY ?g
         `;
-        const result = await agent.query(sparql, { contextGraphId: contextGraphId! });
+        const result = await agent.query(sparql, {
+          contextGraphId: contextGraphId!,
+          includeContextGraphPartitions: true,
+        });
         const prefix = `did:dkg:context-graph:${contextGraphId}/`;
         const parseCount = (v: any) => {
           if (v === undefined || v === null) return 0;
@@ -1039,7 +1037,10 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
     try {
       const { agentAddress } = JSON.parse(body);
       if (!agentAddress) return jsonResponse(res, 400, { error: 'Missing agentAddress' });
-      await agent.rejectJoinRequest(resolvedContextGraphId, agentAddress);
+      // G1: thread the caller's agent address so rejectJoinRequest can
+      // enforce the curator-only authz check (mirrors approve-join, which
+      // passes requestAgentAddress at line ~961).
+      await agent.rejectJoinRequest(resolvedContextGraphId, agentAddress, requestAgentAddress);
       return jsonResponse(res, 200, { ok: true, status: 'rejected', agentAddress });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);

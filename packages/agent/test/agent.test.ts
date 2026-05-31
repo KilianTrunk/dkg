@@ -2,6 +2,7 @@ import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import {
   DKGAgentWallet,
   buildAgentProfile,
+  collectPublishableMultiaddrs,
   CclEvaluator,
   DiscoveryClient,
   ProfileManager,
@@ -63,10 +64,10 @@ const CCL_FACT_NS = 'https://example.org/ccl-fact#';
 async function _wrapAgentPublisherForSeal(agent: DKGAgent): Promise<void> {
   const chain = (agent as unknown as { chain: {
     getEvmChainId?: () => Promise<bigint>;
-    getKnowledgeAssetsV10Address?: () => Promise<string>;
+    getKnowledgeAssetsLifecycleAddress?: () => Promise<string>;
   } }).chain;
   const chainId = (await chain.getEvmChainId?.()) ?? 31337n;
-  const kav10Address = (await chain.getKnowledgeAssetsV10Address?.()) ?? '0x000000000000000000000000000000000000c10a';
+  const kav10Address = (await chain.getKnowledgeAssetsLifecycleAddress?.()) ?? '0x000000000000000000000000000000000000c10a';
   const wrapped = wrapPublisherForTest(agent.publisher, {
     author: ethers.Wallet.createRandom(),
     ctx: mockSealCtx({ chainId, kav10Address }),
@@ -190,12 +191,12 @@ class ContextAuthorizedPublisherChainAdapter extends MockChainAdapter {
     };
   }
 
-  override async createKnowledgeAssetsV10(params: Parameters<MockChainAdapter['createKnowledgeAssetsV10']>[0]) {
+  override async createKnowledgeAssets(params: Parameters<MockChainAdapter['createKnowledgeAssets']>[0]) {
     this.capturedPublisherAddress = params.publisherAddress;
     if (params.publisherAddress?.toLowerCase() !== this.authorizedWallet.address.toLowerCase()) {
       throw new Error('agent pinned publish to the primary operational key');
     }
-    return super.createKnowledgeAssetsV10(params);
+    return super.createKnowledgeAssets(params);
   }
 }
 
@@ -217,11 +218,17 @@ class OperationalKeyOnlyPublishChainAdapter implements ChainAdapter {
     return 31337n;
   }
 
-  async getKnowledgeAssetsV10Address(): Promise<string> {
+  async getKnowledgeAssetsLifecycleAddress(): Promise<string> {
     return '0x00000000000000000000000000000000000000A1';
   }
 
-  async createKnowledgeAssetsV10(params: V10PublishDirectParams): Promise<OnChainPublishResult> {
+  // Greenfield (PR #815): the publisher needs the DKGKnowledgeAssets address
+  // to build the KA UAL after an on-chain publish.
+  async getDKGKnowledgeAssetsAddress(): Promise<string> {
+    return '0x00000000000000000000000000000000000000A2';
+  }
+
+  async createKnowledgeAssets(params: V10PublishDirectParams): Promise<OnChainPublishResult> {
     this.capturedPublisherAddress = params.publisherAddress;
     if (params.publisherAddress.toLowerCase() !== this.wallet.address.toLowerCase()) {
       throw new Error('publisher did not use the adapter operational key fallback');
@@ -252,11 +259,17 @@ class ExternalOperationalKeyPublishChainAdapter implements ChainAdapter {
     return 31337n;
   }
 
-  async getKnowledgeAssetsV10Address(): Promise<string> {
+  async getKnowledgeAssetsLifecycleAddress(): Promise<string> {
     return '0x00000000000000000000000000000000000000A1';
   }
 
-  async createKnowledgeAssetsV10(params: V10PublishDirectParams): Promise<OnChainPublishResult> {
+  // Greenfield (PR #815): the publisher needs the DKGKnowledgeAssets address
+  // to build the KA UAL after an on-chain publish.
+  async getDKGKnowledgeAssetsAddress(): Promise<string> {
+    return '0x00000000000000000000000000000000000000A2';
+  }
+
+  async createKnowledgeAssets(params: V10PublishDirectParams): Promise<OnChainPublishResult> {
     this.capturedPublisherAddress = params.publisherAddress;
     if (params.publisherAddress.toLowerCase() !== this.expectedPublisherAddress.toLowerCase()) {
       throw new Error('publisher did not use chainConfig.operationalKeys fallback');
@@ -598,6 +611,110 @@ describe('Profile Builder', () => {
     }
   });
 
+  it('emits dkg:multiaddr triples (one per published address) and dkg:lastSeen (phonebook)', () => {
+    // PR feat/chain-agents-cg-phonebook: profile now publishes the
+    // node's dialable multiaddrs and a freshness timestamp so other
+    // peers' dial fallback can find direct addrs even after their
+    // peerStore entries age out.
+    const { quads } = buildAgentProfile({
+      peerId: 'QmPhonebook',
+      name: 'PhonebookBot',
+      skills: [],
+      multiaddrs: [
+        '/ip4/203.0.113.10/tcp/9090/p2p/QmPhonebook',
+        '/ip4/198.51.100.20/tcp/9090/p2p-circuit/p2p/QmPhonebook',
+      ],
+      lastSeen: '2026-05-26T15:00:00.000Z',
+    });
+
+    const multiQuads = quads.filter(
+      (q) => q.predicate === 'https://dkg.network/ontology#multiaddr',
+    );
+    expect(multiQuads).toHaveLength(2);
+    expect(multiQuads.map((q) => q.object)).toEqual([
+      '"/ip4/203.0.113.10/tcp/9090/p2p/QmPhonebook"',
+      '"/ip4/198.51.100.20/tcp/9090/p2p-circuit/p2p/QmPhonebook"',
+    ]);
+
+    const lastSeenQuad = quads.find(
+      (q) => q.predicate === 'https://dkg.network/ontology#lastSeen',
+    );
+    expect(lastSeenQuad?.object).toBe('"2026-05-26T15:00:00.000Z"');
+  });
+
+  it('lastSeen defaults to the current ISO timestamp when omitted', () => {
+    const before = new Date().toISOString();
+    const { quads } = buildAgentProfile({
+      peerId: 'QmDefault',
+      name: 'DefaultBot',
+      skills: [],
+    });
+    const after = new Date().toISOString();
+    const lastSeen = quads.find(
+      (q) => q.predicate === 'https://dkg.network/ontology#lastSeen',
+    )?.object.replace(/"/g, '');
+    expect(lastSeen).toBeDefined();
+    expect(lastSeen! >= before && lastSeen! <= after).toBe(true);
+  });
+
+  it('collectPublishableMultiaddrs drops non-public addresses + dedups (uses core isPublicLikeAddress)', () => {
+    // Filter must drop addresses that no remote peer could plausibly
+    // dial — loopback, link-local, unspecified bind, RFC1918, CGNAT,
+    // ULA, and DNS hostnames that resolve to local-only names.
+    // Real production addrs (public IPs + circuit forms anchored on a
+    // public relay) pass through. Duplicates from libp2p's listen /
+    // announce dedup are collapsed.
+    //
+    // Codex review of PR #700 round 2 flagged that the previous regex
+    // filter still leaked RFC1918 / CGNAT / ULA / `/dns*/localhost`
+    // into the agent profile. The fence below pins the wider drop set
+    // we now reuse from `core/src/node.ts:isPublicLikeAddress`.
+    const out = collectPublishableMultiaddrs([
+      '/ip4/127.0.0.1/tcp/9090/p2p/QmA',           // loopback
+      '/ip4/0.0.0.0/tcp/9090/p2p/QmA',             // unspecified bind
+      '/ip4/169.254.0.5/tcp/9090/p2p/QmA',         // link-local
+      '/ip4/10.0.0.5/tcp/9090/p2p/QmA',            // RFC1918 (10/8)
+      '/ip4/172.16.0.5/tcp/9090/p2p/QmA',          // RFC1918 (172.16/12)
+      '/ip4/172.31.255.255/tcp/9090/p2p/QmA',      // RFC1918 boundary
+      '/ip4/192.168.1.5/tcp/9090/p2p/QmA',         // RFC1918 (192.168/16)
+      '/ip4/100.105.212.110/tcp/9090/p2p/QmA',     // CGNAT (100.64/10)
+      '/ip6/::1/tcp/9090/p2p/QmA',                 // loopback
+      '/ip6/::/tcp/9090/p2p/QmA',                  // unspecified
+      '/ip6/fe80::1/tcp/9090/p2p/QmA',             // link-local
+      '/ip6/fc00::1/tcp/9090/p2p/QmA',             // ULA
+      '/ip6/fd12::1/tcp/9090/p2p/QmA',             // ULA
+      '/dns4/localhost/tcp/9090/p2p/QmA',          // DNS localhost
+      '/dns4/host.local/tcp/9090/p2p/QmA',         // mDNS .local
+      '/ip4/203.0.113.10/tcp/9090/p2p/QmA',        // public, keep
+      '/ip4/203.0.113.10/tcp/9090/p2p/QmA',        // duplicate of above, drop
+      '/ip4/198.51.100.20/tcp/9090/p2p-circuit/p2p/QmA', // circuit on public relay, keep
+      '/dns4/relay.origintrail.network/tcp/443/p2p/QmA', // public DNS, keep
+    ]);
+    expect(out).toEqual([
+      '/ip4/203.0.113.10/tcp/9090/p2p/QmA',
+      '/ip4/198.51.100.20/tcp/9090/p2p-circuit/p2p/QmA',
+      '/dns4/relay.origintrail.network/tcp/443/p2p/QmA',
+    ]);
+  });
+
+  it('skips malformed multiaddrs containing a literal quote (defensive)', () => {
+    // Quote characters would break the raw template-literal RDF
+    // emission and inject extra triples. Production libp2p multiaddrs
+    // never contain `"`; the guard exists for malformed test fixtures
+    // or untrusted upstream input.
+    const { quads } = buildAgentProfile({
+      peerId: 'QmGuard',
+      name: 'GuardBot',
+      skills: [],
+      multiaddrs: ['/ip4/1.2.3.4/tcp/9090', '/ip4/bad"injected/tcp/0'],
+    });
+    const multiQuads = quads.filter(
+      (q) => q.predicate === 'https://dkg.network/ontology#multiaddr',
+    );
+    expect(multiQuads).toHaveLength(1);
+    expect(multiQuads[0].object).toBe('"/ip4/1.2.3.4/tcp/9090"');
+  });
+
   it('includes hosting profile when contextGraphsServed is set', () => {
     const { quads } = buildAgentProfile({
       peerId: 'QmHost',
@@ -611,11 +728,13 @@ describe('Profile Builder', () => {
     );
     expect(hostingQuads).toHaveLength(1);
 
-    const contextGraphsQuad = quads.find(q =>
+    const contextGraphsQuads = quads.filter(q =>
       q.predicate === 'https://dkg.origintrail.io/skill#contextGraphsServed',
     );
-    expect(contextGraphsQuad).toBeDefined();
-    expect(contextGraphsQuad!.object).toContain('agent-skills,climate');
+    expect(contextGraphsQuads).toHaveLength(2);
+    const servedValues = contextGraphsQuads.map(q => q.object);
+    expect(servedValues).toContain('"agent-skills"');
+    expect(servedValues).toContain('"climate"');
   });
 
   it('omits optional fields when not provided', () => {
@@ -658,9 +777,9 @@ describe('ProfileManager', () => {
       skills: [{ skillType: 'Translation', pricePerCall: 0.3, currency: 'TRAC' }],
     });
 
-    expect(result.kcId).toBeDefined();
+    expect(result.kaId).toBeDefined();
     expect(result.kaManifest.length).toBeGreaterThan(0);
-    expect(manager.profileKcId).toBe(result.kcId);
+    expect(manager.profileKcId).toBe(result.kaId);
   });
 
   it(
@@ -1024,6 +1143,60 @@ describe('Discovery Client', () => {
     await store2.insert(q2);
     const agents2 = await discovery2.findAgents();
     expect(agents2[0].relayAddress).toBeUndefined();
+  });
+
+  it('returns agentAddress on findAgentByPeerId — keeps both discovery entrypoints in lockstep', async () => {
+    // Regression test for the #700 phonebook bug: `findAgents()` selects
+    // and returns `?agentAddress` (lines 71/78/92 of `discovery.ts`), but
+    // `findAgentByPeerId()` did NOT — its scalar SELECT omitted the
+    // column entirely. The asymmetry made
+    // `DKGAgent.drainPendingSenderKeyForPeer` (`dkg-agent.ts:6094-6102`)
+    // a permanent no-op in production: drain branches on
+    // `profile?.agentAddress` and the field was always undefined.
+    //
+    // This test pins the symmetry — once the drain feature ships, both
+    // entrypoints MUST resolve the same identity for the same peer.
+    const store = new OxigraphStore();
+    const engine = new DKGQueryEngine(store);
+    const discovery = new DiscoveryClient(engine);
+
+    const agentAddress = '0xAbCdEf0123456789AbCdEf0123456789aBcDeF01';
+    const { quads } = buildAgentProfile({
+      peerId: 'QmAgentAddrPeer',
+      name: 'AgentAddrBot',
+      agentAddress,
+      skills: [],
+    });
+
+    await store.insert(quads);
+
+    // 1. `findAgents()` already returned `agentAddress` — pin it as a
+    //    sanity reference for what the second entrypoint must match.
+    const all = await discovery.findAgents();
+    expect(all).toHaveLength(1);
+    expect(all[0].agentAddress).toBe(agentAddress.toLowerCase());
+
+    // 2. `findAgentByPeerId()` now also returns it — this is the
+    //    assertion that pins the fix.
+    const byPeerId = await discovery.findAgentByPeerId('QmAgentAddrPeer');
+    expect(byPeerId).not.toBeNull();
+    expect(byPeerId!.agentAddress).toBe(agentAddress.toLowerCase());
+
+    // 3. And: an agent profile *without* `agentAddress` must still
+    //    resolve, just with the field undefined — so legacy profiles
+    //    from older nodes don't break discovery.
+    const store2 = new OxigraphStore();
+    const engine2 = new DKGQueryEngine(store2);
+    const discovery2 = new DiscoveryClient(engine2);
+    const { quads: q2 } = buildAgentProfile({
+      peerId: 'QmNoAgentAddr',
+      name: 'NoAgentAddrBot',
+      skills: [],
+    });
+    await store2.insert(q2);
+    const byPeerId2 = await discovery2.findAgentByPeerId('QmNoAgentAddr');
+    expect(byPeerId2).not.toBeNull();
+    expect(byPeerId2!.agentAddress).toBeUndefined();
   });
 
   it('filters agents by framework', async () => {
@@ -1798,7 +1971,7 @@ describe('DKGAgent (integration)', () => {
     await agent.start();
 
     const result = await agent.publishProfile();
-    expect(result.kcId).toBeDefined();
+    expect(result.kaId).toBeDefined();
     expect(result.kaManifest.length).toBeGreaterThan(0);
 
     const agents = await agent.findAgents();
@@ -2376,6 +2549,45 @@ decisions: []
       .rejects.toThrow(/Only the context graph creator can manage peer invitations/);
     await expect(node.inviteToContextGraph('ops-multi-agent', invitePeerId, nonDefaultAddr))
       .resolves.toBeUndefined();
+
+    // --- rejectJoinRequest (G1 security fix, notifications-pane redesign) ---
+    // Before the fix, rejectJoinRequest had NO owner check while approve was
+    // gated — any local-token caller could reject a pending request. It now
+    // mirrors the same `assertContextGraphOwner` gate. Seed a pending request,
+    // then prove the same three-way owner gating + that rejected attempts do
+    // not mutate state (the authz throw happens before the store write).
+    const joinRequester = new ethers.Wallet(HARDHAT_KEYS.REC2_OP).address;
+    const requestUri = `did:dkg:join-request:ops-multi-agent:${joinRequester.toLowerCase()}`;
+    const reqStatus = async () => {
+      const r = await store.query(
+        `SELECT ?s WHERE { GRAPH <${contextGraphMetaUri('ops-multi-agent')}> { <${requestUri}> <https://dkg.network/ontology#requestStatus> ?s } }`,
+      );
+      return r.type === 'bindings' && r.bindings.length > 0
+        ? String((r.bindings[0] as Record<string, string>)['s']).replace(/^"|"(\^\^.*)?$/g, '')
+        : null;
+    };
+    await node.storePendingJoinRequest('ops-multi-agent', {
+      agentAddress: joinRequester,
+      scope: 'test-scope',
+      issuedAtMs: Date.now(),
+      delegateePeerId: invitePeerId,
+      signature: `0x${'a'.repeat(130)}`,
+    } as any, 'Requester');
+    expect(await reqStatus()).toBe('pending');
+
+    // Default-agent token (no explicit caller) — the owner is the non-default
+    // wallet, so this is NOT authorised.
+    await expect(node.rejectJoinRequest('ops-multi-agent', joinRequester))
+      .rejects.toThrow(/Only the context graph curator/);
+    // Sibling agent wallet on the same node — not the owner.
+    await expect(node.rejectJoinRequest('ops-multi-agent', joinRequester, siblingAddr))
+      .rejects.toThrow(/Only the context graph curator/);
+    // Neither rejected attempt mutated the request status.
+    expect(await reqStatus()).toBe('pending');
+    // The owning curator wallet — authorised; flips the request to rejected.
+    await expect(node.rejectJoinRequest('ops-multi-agent', joinRequester, nonDefaultAddr))
+      .resolves.toBeUndefined();
+    expect(await reqStatus()).toBe('rejected');
 
     await node.stop().catch(() => {});
   });

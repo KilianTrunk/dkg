@@ -55,8 +55,9 @@ const daemonRequire = createRequire(import.meta.url);
 
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
-import { enrichEvmError, MockChainAdapter } from '@origintrail-official/dkg-chain';
+import { enrichEvmError, MockChainAdapter, resolveRpcUrls } from '@origintrail-official/dkg-chain';
 import { DKGAgent, loadOpWallets } from '@origintrail-official/dkg-agent';
+import { isExternalBackend } from '@origintrail-official/dkg-storage';
 import { computeNetworkId, createOperationContext, DKGEvent, Logger, PayloadTooLargeError, GET_VIEWS, TrustLevel, validateSubGraphName, validateAssertionName, validateContextGraphId, isSafeIri, assertSafeIri, sparqlIri, contextGraphSharedMemoryUri, contextGraphAssertionUri, contextGraphMetaUri } from '@origintrail-official/dkg-core';
 import { findReservedSubjectPrefix, isSkolemizedUri } from '@origintrail-official/dkg-publisher';
 import {
@@ -179,6 +180,8 @@ import {
   loadMarkItDownTargets,
   getNodeVersion,
   getCurrentCommitShort,
+  loadBuildInfo,
+  detectInstallMode,
   loadSkillTemplate,
   loadImporterSkillTemplate,
   buildSkillMd,
@@ -240,15 +243,10 @@ import {
   getCurrentCliVersion,
   type NpmVersionStatus,
   checkForNpmVersionUpdate,
-  checkForNewCommit,
-  checkForNewCommitWithStatus,
   type UpdateStatus,
   acquireUpdateLock,
   releaseUpdateLock,
-  performUpdate,
-  performUpdateWithStatus,
   performNpmUpdate,
-  checkForUpdate,
 } from '../auto-update.js';
 import {
   OPENCLAW_UI_CONNECT_TIMEOUT_MS,
@@ -345,6 +343,112 @@ interface RegistryCacheSnapshot {
 
 let registryCache: RegistryCacheSnapshot | null = null;
 let registryCacheInflight: Promise<RegistryCacheSnapshot> | null = null;
+
+function routeWithTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  }) as Promise<T>;
+}
+
+async function probeRpcEndpoint(rpcUrl: string, index: number): Promise<{
+  index: number;
+  role: 'primary' | 'backup';
+  ok: boolean;
+  latencyMs: number | null;
+  blockNumber: number | null;
+  error?: string;
+}> {
+  const provider = new ethers.JsonRpcProvider(rpcUrl, undefined, { cacheTimeout: -1 });
+  const start = Date.now();
+  try {
+    const blockNumber = await routeWithTimeout(provider.getBlockNumber(), 3_000, 'RPC health probe');
+    return {
+      index,
+      role: index === 0 ? 'primary' : 'backup',
+      ok: true,
+      latencyMs: Date.now() - start,
+      blockNumber,
+    };
+  } catch (err) {
+    return {
+      index,
+      role: index === 0 ? 'primary' : 'backup',
+      ok: false,
+      latencyMs: null,
+      blockNumber: null,
+      error: err instanceof Error && err.message.includes('timed out')
+        ? 'RPC health probe timed out'
+        : 'RPC health probe failed',
+    };
+  }
+}
+
+function createRouteEvmProvider(rpcUrl: string, rpcUrls?: string[]): ethers.JsonRpcProvider | ethers.FallbackProvider {
+  const providers = resolveRpcUrls(rpcUrl, rpcUrls)
+    .map((url) => new ethers.JsonRpcProvider(url, undefined, { cacheTimeout: -1 }));
+  if (providers.length === 1) return providers[0];
+  return new ethers.FallbackProvider(
+    providers.map((provider, index) => ({
+      provider,
+      priority: index + 1,
+      stallTimeout: 4_000,
+      weight: 1,
+    })),
+    undefined,
+    { quorum: 1 },
+  );
+}
+
+// Quad-count cache for external SPARQL backends. Every /api/status hit
+// otherwise issues a `SELECT (COUNT(*))` against the remote endpoint —
+// expensive on a large namespace, and the route is polled by the
+// dashboard, telemetry, and `dkg status` operators. 30 s TTL is short
+// enough that a fresh wipe / bulk publish shows up quickly without
+// flooding Blazegraph. Local backends bypass this entirely (file-bytes
+// metric stays on the metrics collector tick).
+const STORE_QUADS_CACHE_TTL_MS = 30_000;
+let storeQuadsCache: { value: number | null; fetchedAt: number } | null = null;
+let storeQuadsInflight: Promise<number | null> | null = null;
+
+async function getCachedExternalStoreQuads(
+  agent: DKGAgent,
+  now: number,
+): Promise<number | null> {
+  if (storeQuadsCache && now - storeQuadsCache.fetchedAt < STORE_QUADS_CACHE_TTL_MS) {
+    return storeQuadsCache.value;
+  }
+  if (storeQuadsInflight) return storeQuadsInflight;
+
+  storeQuadsInflight = (async () => {
+    try {
+      const r = await agent.store.query(
+        'SELECT (COUNT(*) AS ?c) WHERE { GRAPH ?g { ?s ?p ?o } }',
+      );
+      let value: number | null = null;
+      if (r.type === 'bindings' && r.bindings.length > 0) {
+        const cell = r.bindings[0].c ?? '';
+        const digits = cell.match(/\d+/)?.[0];
+        value = digits ? parseInt(digits, 10) : 0;
+      }
+      storeQuadsCache = { value, fetchedAt: Date.now() };
+      return value;
+    } catch {
+      // Surface "unknown" rather than a stale value; operators can
+      // distinguish unreachable from genuinely-empty via storeBackend +
+      // their network logs. Cache the null briefly to avoid hammering
+      // a flapping endpoint.
+      storeQuadsCache = { value: null, fetchedAt: Date.now() };
+      return null;
+    } finally {
+      storeQuadsInflight = null;
+    }
+  })();
+  return storeQuadsInflight;
+}
 
 async function getRegistryCacheSnapshot(): Promise<RegistryCacheSnapshot> {
   const now = Date.now();
@@ -507,6 +611,9 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
     );
     const networkId = await computeNetworkId();
     const chainConf = resolveChainConfig(config, network);
+    const rpcEndpointCount = chainConf?.rpcUrl
+      ? resolveRpcUrls(chainConf.rpcUrl, chainConf.rpcUrls).length
+      : 0;
     const blockExplorerUrl =
       config.blockExplorerUrl ?? deriveBlockExplorerUrl(chainConf?.chainId);
     const identityId = agent.publisher.getIdentityId();
@@ -527,15 +634,42 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
       advertisedAddresses: agent.multiaddrs,
       configuredAnnounceAddresses: config.announceAddresses ?? [],
     });
+    // RFC-41 §4.9 + §4.3: expose build-info + installMode for
+    // doctor / agent disambiguation. loadBuildInfo() falls back to
+    // the {commit: "uncommitted", distTag: "monorepo", ...}
+    // sentinels when build-info.json is absent (monorepo / dev),
+    // so consumers can branch reliably.
+    const buildInfo = loadBuildInfo();
     return jsonResponse(res, 200, {
       name: config.name,
       version: nodeVersion,
-      commit: nodeCommit || null,
+      commit: buildInfo.commit !== "uncommitted" ? buildInfo.commit : (nodeCommit || null),
+      commitShort: buildInfo.commitShort !== "00000000"
+        ? buildInfo.commitShort
+        : (nodeCommit ? nodeCommit.slice(0, 8) : null),
+      buildTime: buildInfo.buildTime,
+      distTag: buildInfo.distTag,
+      installMode: detectInstallMode(),
       peerId: agent.peerId,
       nodeRole: config.nodeRole ?? "edge",
       networkId: networkId.slice(0, 16),
       networkName: network?.networkName ?? null,
       storeBackend: config.store?.backend ?? "oxigraph-worker",
+      // External backend visibility (RFC 120 / plan PR 1 item 3). For
+      // local backends both fields stay null so the response shape is
+      // stable across deployments.
+      storeUrl: isExternalBackend(config.store?.backend)
+        ? (() => {
+            const opts = (config.store?.options ?? {}) as Record<string, unknown>;
+            const url = typeof opts.url === 'string' ? opts.url
+              : typeof opts.queryEndpoint === 'string' ? opts.queryEndpoint
+              : null;
+            return url;
+          })()
+        : null,
+      storeQuads: isExternalBackend(config.store?.backend)
+        ? await getCachedExternalStoreQuads(agent, Date.now())
+        : null,
       uptimeMs: Date.now() - startedAt,
       connectedPeers: uniquePeers.size,
       connections: {
@@ -553,6 +687,14 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
       localAgentIntegrations,
       connectedLocalAgentIds: localAgentIntegrations.filter((integration) => integration.enabled).map((integration) => integration.id),
       autoUpdate: resolveAutoUpdateEnabled(config),
+      chain: chainConf
+        ? {
+            chainId: chainConf.chainId ?? null,
+            configured: Boolean(chainConf.rpcUrl && chainConf.hubAddress),
+            rpcEndpointCount,
+            hubConfigured: Boolean(chainConf.hubAddress),
+          }
+        : null,
       updateAvailable:
         daemonState.lastUpdateCheck.checkedAt > 0 ? !daemonState.lastUpdateCheck.upToDate : null,
       latestCommit: daemonState.lastUpdateCheck.latestCommit || null,
@@ -581,6 +723,7 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
         ? {
             chainId: chainConf.chainId ?? null,
             rpcUrl: chainConf.rpcUrl,
+            rpcUrls: chainConf.rpcUrls ?? [],
             hubAddress: chainConf.hubAddress,
           }
         : null,
@@ -748,11 +891,12 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
         balances: [],
         chainId,
         rpcUrl: rpcUrl ?? null,
+        rpcUrls: chain?.rpcUrls ?? [],
         error: !rpcUrl || !hubAddress ? "Chain not configured" : "No wallets",
       });
     }
     try {
-      const provider = new ethers.JsonRpcProvider(rpcUrl);
+      const provider = createRouteEvmProvider(rpcUrl, chain?.rpcUrls);
       const tokenAddr = chain?.tokenAddress
         ?? (await new ethers.Contract(
           hubAddress,
@@ -791,6 +935,7 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
         balances,
         chainId,
         rpcUrl,
+        rpcUrls: chain?.rpcUrls ?? [],
         symbol: tokenSymbol,
       });
     } catch (err: any) {
@@ -799,6 +944,7 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
         balances: [],
         chainId,
         rpcUrl,
+        rpcUrls: chain?.rpcUrls ?? [],
         error: err.message,
       });
     }
@@ -816,32 +962,27 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
     if (!rpcUrl) {
       return jsonResponse(res, 200, {
         ok: false,
-        rpcUrl: null,
+        configured: false,
+        rpcEndpointCount: 0,
         latencyMs: null,
         blockNumber: null,
+        rpcs: [],
         error: "Chain not configured",
       });
     }
-    try {
-      const provider = new ethers.JsonRpcProvider(rpcUrl);
-      const start = Date.now();
-      const blockNumber = await provider.getBlockNumber();
-      const latencyMs = Date.now() - start;
-      return jsonResponse(res, 200, {
-        ok: true,
-        rpcUrl,
-        latencyMs,
-        blockNumber,
-      });
-    } catch (err: any) {
-      return jsonResponse(res, 200, {
-        ok: false,
-        rpcUrl,
-        latencyMs: null,
-        blockNumber: null,
-        error: err.message,
-      });
-    }
+    const rpcUrls = resolveRpcUrls(rpcUrl, chain?.rpcUrls);
+    const rpcs = await Promise.all(rpcUrls.map((url, index) => probeRpcEndpoint(url, index)));
+    const primary = rpcs[0];
+    const healthy = rpcs.find((rpc) => rpc.ok);
+    return jsonResponse(res, 200, {
+      ok: !!healthy,
+      configured: true,
+      rpcEndpointCount: rpcUrls.length,
+      latencyMs: healthy?.latencyMs ?? null,
+      blockNumber: healthy?.blockNumber ?? null,
+      error: healthy ? undefined : (primary?.error ?? "RPC health probe failed"),
+      rpcs,
+    });
   }
 
   // GET /api/identity — current on-chain identity status
@@ -877,6 +1018,228 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
   if (req.method === 'GET' && path === '/api/random-sampling/status') {
     const status = agent.getRandomSamplingStatus();
     return jsonResponse(res, 200, status);
+  }
+
+  // POST /api/random-sampling/backfill-percgid-meta
+  //
+  // One-shot operator tool to rescue KCs that landed on a receiver core
+  // BEFORE the cd68fa689 publisher fix (or before the receiver shipped
+  // the defensive `ctxGraphId` lookup). Such KCs have their per-KC
+  // metadata sitting at the canonical `<cgName>/_meta` URI, but the RS
+  // prover's `extractV10KCFromStore` reads the per-cgId
+  // `<cgName>/context/<cgId>/_meta` graph and so sees nothing — every
+  // prover tick returns `kc-not-synced`.
+  //
+  // For each subscribed CG that has an on-chain id, we copy the
+  // per-KC subset of `<cgName>/_meta` into
+  // `<cgName>/context/<cgId>/_meta`. The "per-KC subset" matches the
+  // shape `generateKCMetadata` emits (`packages/publisher/src/metadata.ts`):
+  //   - KC UAL subjects (carry `dkg:batchId`, `dkg:merkleRoot`, `dkg:status`, …).
+  //   - KA UAL subjects (`<UAL/tokenId>`; identified by `dkg:partOf <KC>`).
+  //   - Publication URIs (`<urn:dkg:publication:opId>`; reached from a KA
+  //     via `<KA> dkg:publication <pub>`; carry `dkg:authoredBy`,
+  //     `dkg:Publication` type, etc).
+  //
+  // Granularity is PER-KC, not per-CG: each KC is gated by an
+  // independent `FILTER NOT EXISTS` against the target graph, so a
+  // mixed-state CG (some pre-fix KCs orphaned at `<cg>/_meta`, some
+  // post-fix KCs already in the per-cgId graph) gets only the missing
+  // KCs copied. Re-running the backfill after additional post-fix
+  // publishes is a no-op for KCs already present in the target.
+  //
+  // Body (all fields optional):
+  //   {
+  //     "contextGraphIds": ["foo", "bar"], // restrict to specific CG names; omit/empty for all subscribed
+  //     "dryRun": true                     // probe-only: don't write, just report what would happen
+  //   }
+  if (req.method === 'POST' && path === '/api/random-sampling/backfill-percgid-meta') {
+    const body = await readBody(req, SMALL_BODY_BYTES);
+    let parsed: { contextGraphIds?: unknown; dryRun?: unknown };
+    try {
+      parsed = body.trim() ? JSON.parse(body) : {};
+    } catch {
+      return jsonResponse(res, 400, { error: 'Invalid JSON body' });
+    }
+    const requestedIds = Array.isArray(parsed.contextGraphIds)
+      ? (parsed.contextGraphIds as unknown[]).filter((x): x is string => typeof x === 'string' && x.length > 0)
+      : [];
+    const dryRun = parsed.dryRun === true;
+
+    type CgReport = {
+      contextGraphId: string;
+      onChainId?: string;
+      status: 'backfilled' | 'already-populated' | 'no-source-meta' | 'not-on-chain' | 'failed';
+      /** Total triples written (or that would be written, in dry-run). */
+      copiedTriples?: number;
+      /** Distinct KCs that needed backfilling (rows where source had a KC absent from target). */
+      copiedKcCount?: number;
+      /** Distinct KCs present in `<cg>/_meta` regardless of target state — observability signal. */
+      sourceKcCount?: number;
+      error?: string;
+    };
+
+    const subscribed = agent.getSubscribedContextGraphs();
+    const cgEntries: Array<[string, string]> = [];
+    for (const [cgName, sub] of subscribed) {
+      if (requestedIds.length > 0 && !requestedIds.includes(cgName)) continue;
+      if (!sub.onChainId) {
+        cgEntries.push([cgName, '']);
+        continue;
+      }
+      cgEntries.push([cgName, String(sub.onChainId)]);
+    }
+
+    // Operator-typo guard: requested CG names that don't match any
+    // subscribed CG on this node are surfaced explicitly so a no-op
+    // run is diagnosable. Without this, a typo like
+    // `miles-publish-stress-26mayyy` yields `processed: 0` and looks
+    // identical to "nothing needed backfilling". (Codex review on PR
+    // #763, round 2.)
+    const subscribedNames = new Set(subscribed.keys());
+    const unknownContextGraphIds = requestedIds.filter((id) => !subscribedNames.has(id));
+
+    const DKG_BATCH_ID = 'http://dkg.io/ontology/batchId';
+    const DKG_PART_OF = 'http://dkg.io/ontology/partOf';
+    const DKG_PUBLICATION = 'http://dkg.io/ontology/publication';
+
+    const reports: CgReport[] = [];
+    for (const [cgName, onChainId] of cgEntries) {
+      if (!onChainId) {
+        reports.push({ contextGraphId: cgName, status: 'not-on-chain' });
+        continue;
+      }
+      const sourceMeta = `did:dkg:context-graph:${cgName}/_meta`;
+      const targetMeta = contextGraphMetaUri(cgName, onChainId);
+      try {
+        // Total distinct KCs present in source — observability counter.
+        // Includes both KCs that need copying and KCs already in target.
+        const sourceKcResult = await agent.store.query(
+          `SELECT (COUNT(DISTINCT ?kc) AS ?n) WHERE { GRAPH <${sourceMeta}> { ?kc <${DKG_BATCH_ID}> ?bid } }`,
+        );
+        const sourceKcCount = sourceKcResult.type === 'bindings'
+          ? Number((sourceKcResult.bindings[0]?.['n'] as string ?? '"0"').replace(/^"|".*$/g, ''))
+          : 0;
+
+        if (sourceKcCount === 0) {
+          reports.push({ contextGraphId: cgName, onChainId, status: 'no-source-meta', sourceKcCount: 0 });
+          continue;
+        }
+
+        // CONSTRUCT only the meta for KCs that are MISSING from the
+        // target per-cgId graph. Three UNION arms:
+        //   1. KC subjects (`?kc`) whose `dkg:batchId` is in source
+        //      but not in target.
+        //   2. KA subjects (`?ka`) whose parent KC is in that
+        //      missing-from-target set.
+        //   3. Publication subjects (`?pub`) reached from a KA via
+        //      `<KA> dkg:publication <pub>`. This is the actual
+        //      provenance shape `generateKCMetadata` emits — earlier
+        //      revisions of this endpoint used the wrong direction
+        //      (`<KC> dkg:authoredBy <pub>`) and silently dropped all
+        //      `dkg:Publication` / `dkg:authoredBy` triples (Codex
+        //      review on PR #763).
+        //
+        // The `FILTER NOT EXISTS` is anchored on the KC's `dkg:batchId`
+        // because every per-KC promotion writes that triple — so its
+        // presence in the target is the canonical signal that the KC
+        // (and its KAs + publication) are already there. Set semantics
+        // of `store.insert` mean accidentally re-inserting a quad is a
+        // no-op; the filter is for efficiency + clean diagnostic
+        // counts, not for correctness.
+        const constructResult = await agent.store.query(`CONSTRUCT { ?s ?p ?o } WHERE {
+          GRAPH <${sourceMeta}> {
+            {
+              ?s ?p ?o .
+              ?s <${DKG_BATCH_ID}> ?bid .
+              FILTER NOT EXISTS { GRAPH <${targetMeta}> { ?s <${DKG_BATCH_ID}> ?bidT } }
+            } UNION {
+              ?s ?p ?o .
+              ?s <${DKG_PART_OF}> ?kc .
+              ?kc <${DKG_BATCH_ID}> ?bid2 .
+              FILTER NOT EXISTS { GRAPH <${targetMeta}> { ?kc <${DKG_BATCH_ID}> ?bidT2 } }
+            } UNION {
+              ?s ?p ?o .
+              ?ka <${DKG_PUBLICATION}> ?s .
+              ?ka <${DKG_PART_OF}> ?kc3 .
+              ?kc3 <${DKG_BATCH_ID}> ?bid3 .
+              FILTER NOT EXISTS { GRAPH <${targetMeta}> { ?kc3 <${DKG_BATCH_ID}> ?bidT3 } }
+            }
+          }
+        }`);
+        const sourceQuads = constructResult.type === 'quads' ? constructResult.quads : [];
+
+        // Distinct KCs in the construct result — every backfilled KC
+        // shows up as at least one quad with itself as subject (the
+        // first UNION arm). De-duplicating by subject is the cleanest
+        // way to derive a per-KC count without a second SPARQL probe.
+        const copiedKcCount = new Set(
+          sourceQuads
+            .filter(q => sourceQuads.some(qq => qq.subject === q.subject && qq.predicate === DKG_BATCH_ID))
+            .map(q => q.subject),
+        ).size;
+
+        if (sourceQuads.length === 0) {
+          // Source has KCs but none are missing from target — fully synced.
+          reports.push({
+            contextGraphId: cgName,
+            onChainId,
+            status: 'already-populated',
+            sourceKcCount,
+            copiedKcCount: 0,
+            copiedTriples: 0,
+          });
+          continue;
+        }
+
+        if (dryRun) {
+          reports.push({
+            contextGraphId: cgName,
+            onChainId,
+            status: 'backfilled',
+            sourceKcCount,
+            copiedKcCount,
+            copiedTriples: sourceQuads.length,
+          });
+          continue;
+        }
+
+        const targeted = sourceQuads.map(q => ({ ...q, graph: targetMeta }));
+        await agent.store.insert(targeted);
+
+        reports.push({
+          contextGraphId: cgName,
+          onChainId,
+          status: 'backfilled',
+          sourceKcCount,
+          copiedKcCount,
+          copiedTriples: targeted.length,
+        });
+      } catch (err) {
+        reports.push({
+          contextGraphId: cgName,
+          onChainId,
+          status: 'failed',
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    return jsonResponse(res, 200, {
+      dryRun,
+      processed: reports.length,
+      summary: {
+        backfilled: reports.filter(r => r.status === 'backfilled').length,
+        alreadyPopulated: reports.filter(r => r.status === 'already-populated').length,
+        noSourceMeta: reports.filter(r => r.status === 'no-source-meta').length,
+        notOnChain: reports.filter(r => r.status === 'not-on-chain').length,
+        failed: reports.filter(r => r.status === 'failed').length,
+      },
+      // Always included so the script/operator can `.length > 0`-check.
+      // Empty array when no filter was supplied or every requested CG
+      // resolved against the local subscription set.
+      unknownContextGraphIds,
+      reports,
+    });
   }
 
   // POST /api/shutdown

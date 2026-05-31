@@ -37,6 +37,33 @@ suffix slug such as `team-notes` when the listed id is
 `0x.../team-notes`. Write routes reject unknown, ambiguous, or non-canonical
 targets before writing so they cannot accidentally create shadow context graphs.
 
+## 1a. Operating the node (install, update, troubleshoot)
+
+> **Before reasoning about install state, run `dkg doctor`.** Detects orphan repository clones, version skew between the daemon and the global `dkg` CLI, served-UI / source mismatch, broken plugin install roots, and other install-layout anomalies. Use `dkg doctor --json` for a machine-parsable report; the `state` field always carries the full diagnostic snapshot (daemon entry point, install mode, node role, dkg-home, current version + commit, auto-update settings) independent of any anomaly findings.
+
+**Updating DKG:**
+
+- The canonical update verb is `dkg update`. It resolves the next release from the npm registry and applies it.
+- **Do not `git pull`.** Do not clone the repository. Do not edit files under `~/.dkg/releases/` (on Core nodes — Edge nodes have no `~/.dkg/releases/` at all under RFC-41).
+- If `dkg doctor` reports orphan clones at `~/dkg/`, `~/Projects/dkg/`, or similar, ask the operator before touching them — they are not the running daemon.
+- `dkg update --check` previews the available version without applying.
+- `dkg update --allow-prerelease` follows the `next` dist-tag for pre-release builds.
+- `dkg rollback` reverts to the previous version (Edge: re-installs the prior npm version recorded in `~/.dkg/previous-version`; Core: flips the blue-green slot symlink).
+
+**Detecting current install state:**
+
+- `dkg --version` — the global CLI's version.
+- `curl http://127.0.0.1:9200/api/status | jq '{version, commit, commitShort, buildTime, distTag, installMode, nodeRole}'` — the running daemon's version, commit, and install mode. Mismatch between `dkg --version` and the daemon's version is the §1a version-skew condition; `dkg doctor` reports it explicitly.
+- `cat ~/.dkg/config.json | jq .nodeRole` — `edge` (default; daemon runs from npm-global install, no release slots) or `core` (operator opted into blue-green slots via `dkg init --role core`).
+
+**Troubleshooting common confusion:**
+
+- "There seem to be multiple DKG installations on this machine" → run `dkg doctor`; the `state.cli.globalPath`, `state.daemon.entryPoint`, and orphan-repos check together identify the canonical install and any stray clones.
+- "The UI shows an old version even after I updated" → run `dkg doctor`; the served-UI / source-mismatch check flags stale browser / PWA / service-worker caches.
+- "I ran `npm install -g @origintrail-official/dkg@latest` but the daemon still reports the old version" → on Edge nodes the daemon needs a restart to pick up the new install (`dkg restart`). On Core nodes, the slot mechanism gates the visible version on `dkg update`'s atomic swap, not on `npm install -g` directly — use `dkg update` for Core nodes.
+
+The full design rationale lives in [OT-RFC-41](https://github.com/OriginTrail/dkgv10-spec/blob/main/rfcs/OT-RFC-41-edge-node-npm-only-install-and-update.md).
+
 ## 2. Capabilities Overview
 
 > **Note:** This skill describes the full DKG V10 API surface. Some endpoints
@@ -653,6 +680,36 @@ Failure classifications you'll see in `attempt.lastError.classification`:
 | `transient` | yes (until `maxRetries=5` reached) | `fetch failed` / `ECONNRESET` / `timeout` | Wait — the worker will pick it up after backoff. |
 | `cap_exceeded` | no | `Promoted assertion too large for gossip` (10 MB) or `Request body too large` (256 KB) | Re-enqueue with a smaller `entities` slice — the queue can't subdivide on its own. |
 | `fatal` | no | Bad request, missing assertion, etc. | Inspect the error message, fix the cause, then `POST /api/assertion/promote-async/{jobId}/recover`. |
+
+### TRAC auto-approve policy (V10 publish + update)
+
+Every V10 publish or update pulls TRAC from the operational signer via `token.transferFrom(msg.sender, CSS, fullCost)`. Before that call, the EVM adapter checks the signer's allowance for the V10 KA contract and approves more if it's short. `config.chain.approvalPolicy` controls how much it approves at each top-up — a per-publish gas trade-off that's neutral on testnet (zero-cost publishes) but matters at mainnet scale.
+
+| Mode | Per-publish gas | Blast radius (compromised KA) | When to use |
+|---|---|---|---|
+| `per-publish` (default) | One `approve` tx whenever `tokenAmount` exceeds prior allowance | One publish's cost ceiling | Conservative default. Low publish volume, or operators who trust nothing. |
+| `replenishing` | One `approve` per ~`targetAllowance / avgPublishCost` publishes | Capped at `targetAllowance` (1000 TRAC default) | **Recommended for mainnet at any volume.** Predictable gas profile + bounded exposure. |
+| `unlimited` | One `approve` ever per wallet | Operational wallet's full TRAC balance | High-volume operators on a contract they trust absolutely. Matches V9 behaviour. |
+
+Configuration (defaults shown):
+
+```yaml
+chain:
+  type: evm
+  rpcUrl: https://base.llamarpc.com
+  hubAddress: '0x...'
+  approvalPolicy:
+    mode: per-publish                # 'per-publish' | 'replenishing' | 'unlimited'
+    # `replenishing` mode only:
+    targetAllowance: '1000000000000000000000'   # decimal wei-TRAC string (1000 TRAC = 10^21)
+    refillBelowFraction: 0.1                     # refill when current < target × this (default 10%)
+```
+
+`targetAllowance` is a string because YAML/JSON can't carry bigints natively — the daemon parses it into a bigint at startup, fails fast on garbage input. `refillBelowFraction` clamps to `[0, 1]`; a value of `1` means "refill on every publish" (defeats the policy) and `0` means "never refill until the publish floor (1 wei-TRAC) is breached" (which on a zero-cost CG would mean approve once then never again).
+
+The policy never approves *less* than the immediate publish needs — a too-low `targetAllowance` gets quietly raised to the publish's on-chain floor so misconfiguration can't brick a publish.
+
+This entire surface was empirically driven by [PR #720](https://github.com/OriginTrail/dkg/pull/720)'s `TooLowAllowance(token, 0, 1)` finding on the May 2026 Base Sepolia publish-stress run; see also `packages/chain/test/evm-adapter.unit.test.ts` for the policy's invariants and edge cases.
 
 ## 9. Error Reference
 

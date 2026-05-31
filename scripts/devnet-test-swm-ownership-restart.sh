@@ -50,7 +50,20 @@ require_node() {
 
 api_capture() {
   local node="$1" method="$2" path="$3" data="${4:-}" body_out="$5" code_out="$6"
-  local port token tmp code content
+  # Shadow-bug fix (#779 comprehensive devnet test follow-up): the
+  # caller `api_call` pre-declares its own `local body` and `local
+  # code` and passes the literal names "body" / "code" as `body_out`
+  # / `code_out`. If THIS function ALSO declares `local code` (or
+  # `local body`), bash's dynamic scoping makes the local declaration
+  # SHADOW the caller's variable. `printf -v "$code_out" "%s" ...`
+  # then writes to api_capture's local `code`, not api_call's. After
+  # api_capture returns, the local copy is destroyed and api_call's
+  # `code` is still empty — the `[0-9][0-9][0-9]` case in api_call
+  # falls through to the `*) code="000"` arm, every probe surfaces
+  # as HTTP 000, and the script aborts on a perfectly healthy daemon.
+  # Use `_`-prefixed local names so they cannot collide with
+  # `body_out` / `code_out` slot names the caller passes in.
+  local port token tmp _code _content
   port=$(node_port "$node")
   token=$(node_token "$node")
   tmp="$(mktemp "$TMPDIR/swm-own-response-XXXXXX")"
@@ -58,16 +71,38 @@ api_capture() {
   curl_args+=(-H "Authorization: Bearer $token" -H "Content-Type: application/json")
   [ -n "$data" ] && curl_args+=(-d "$data")
   curl_args+=("http://127.0.0.1:${port}${path}")
-  code=$(curl "${curl_args[@]}" 2>/dev/null || echo "000")
-  content="$(cat "$tmp" 2>/dev/null || true)"
+  # `set -euo pipefail` is in effect (line 22), so a bare
+  # `_code=$(curl ...) ; rc=$?` would `errexit` the whole script
+  # before `$?` is captured (Codex review on #778). Wrap the call in
+  # `if cmd; then ... else ...; fi` — that branch is one of the
+  # documented `errexit` exceptions, so a transport failure flows to
+  # the `else` arm and we get a single canonical `000` back. We also
+  # guard against `curl` exiting cleanly while emitting nothing
+  # (rare, but `-w "%{http_code}"` can yield an empty stdout if the
+  # request is aborted between connect and first byte).
+  if _code=$(curl "${curl_args[@]}" 2>/dev/null); then
+    [ -z "$_code" ] && _code="000"
+  else
+    _code="000"
+  fi
+  _content="$(cat "$tmp" 2>/dev/null || true)"
   rm -f "$tmp"
-  printf -v "$body_out" '%s' "$content"
-  printf -v "$code_out" '%s' "$code"
+  printf -v "$body_out" '%s' "$_content"
+  printf -v "$code_out" '%s' "$_code"
 }
 
 api_call() {
   local node="$1" method="$2" path="$3" data="${4:-}" body code
   api_capture "$node" "$method" "$path" "$data" body code
+  # Defensive normalization for any caller that bypasses `api_capture`
+  # — transport failures should always surface as a clean `000` so the
+  # HTTP-status arithmetic below never blows up with "integer
+  # expression expected" and obscures the real "node ack'd nothing"
+  # failure mode (#774 finding #3 fired this on every probe).
+  case "$code" in
+    [0-9][0-9][0-9]) ;;
+    *) code="000" ;;
+  esac
   if [ "$code" -lt 200 ] || [ "$code" -ge 300 ]; then
     fail "$method $path on node $node failed with HTTP $code: $body"
   fi

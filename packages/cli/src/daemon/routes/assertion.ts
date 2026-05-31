@@ -60,6 +60,7 @@ import { DKGAgent, loadOpWallets } from '@origintrail-official/dkg-agent';
 import { computeNetworkId, createOperationContext, DKGEvent, Logger, PayloadTooLargeError, GET_VIEWS, TrustLevel, validateSubGraphName, validateAssertionName, validateContextGraphId, isSafeIri, assertSafeIri, assertSafeRdfTerm, escapeDkgRdfLiteral, sparqlIri, contextGraphSharedMemoryUri, contextGraphAssertionUri, contextGraphMetaUri, assertionLifecycleUri } from '@origintrail-official/dkg-core';
 import { findReservedSubjectPrefix, isSkolemizedUri, PROMOTE_JOB_STATES, PromoteJobConflictError, type PromoteJob, type PromoteJobState, type PublishOptions } from '@origintrail-official/dkg-publisher';
 import { validatePreSignedAuthorAttestation } from './memory.js';
+import { recordAssertionActivity } from '../activity-notification.js';
 import {
   DashboardDB,
   MetricsCollector,
@@ -238,15 +239,10 @@ import {
   getCurrentCliVersion,
   type NpmVersionStatus,
   checkForNpmVersionUpdate,
-  checkForNewCommit,
-  checkForNewCommitWithStatus,
   type UpdateStatus,
   acquireUpdateLock,
   releaseUpdateLock,
-  performUpdate,
-  performUpdateWithStatus,
   performNpmUpdate,
-  checkForUpdate,
 } from '../auto-update.js';
 import {
   OPENCLAW_UI_CONNECT_TIMEOUT_MS,
@@ -1031,6 +1027,7 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
     requestToken,
     requestAgentAddress,
     emitMemoryGraphChanged,
+    emitNotification,
   } = ctx;
   const writePreflightCallerAgentAddress = requestToken
     ? agent.resolveAgentByToken(requestToken)
@@ -1326,6 +1323,21 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
         source: "api",
         counts: { triples: 0 },
       });
+      // ADR-002: scoped `created` activity row. Mirrors the moment the
+      // publisher writes `dkg:AssertionCreated` into `_meta` (inside
+      // `assertionCreate`), so the bell pane and the per-CG Overview feed
+      // agree on what "created" means. Actor = the request/author agent;
+      // the row is born CG-scoped (the caller is a writer on this CG).
+      // Never throws into the write path (helper + try/catch).
+      try {
+        recordAssertionActivity(dashDb, {
+          contextGraphId: resolvedContextGraphId,
+          kind: "created",
+          actorAgentAddress: resolvedAuthorAgentAddress ?? requestAgentAddress,
+          subGraphName,
+        });
+        emitNotification?.({ contextGraphId: resolvedContextGraphId, type: "assertion_activity" });
+      } catch { /* never break the create path */ }
       const response: Record<string, unknown> = { assertionUri };
       if (Array.isArray(quads) && quads.length > 0) {
         await agent.assertion.write(
@@ -1386,6 +1398,18 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
             source: "api",
             counts: { triples: promoteResult.promotedCount },
           });
+          // ADR-002: scoped `promoted` activity row (WM→SWM). Only when
+          // something actually promoted (promotedCount !== 0).
+          try {
+            recordAssertionActivity(dashDb, {
+              contextGraphId: resolvedContextGraphId,
+              kind: "promoted",
+              actorAgentAddress: resolvedAuthorAgentAddress ?? requestAgentAddress,
+              subGraphName,
+              tripleCount: promoteResult.promotedCount,
+            });
+            emitNotification?.({ contextGraphId: resolvedContextGraphId, type: "assertion_activity" });
+          } catch { /* never break the promote path */ }
         }
         response.promotedCount = promoteResult.promotedCount;
       }
@@ -1561,6 +1585,17 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
           source: "api",
           counts: { triples: promotedCount },
         });
+        // ADR-002: scoped `promoted` activity row (dedicated promote route).
+        try {
+          recordAssertionActivity(dashDb, {
+            contextGraphId: resolvedContextGraphId,
+            kind: "promoted",
+            actorAgentAddress: requestAgentAddress,
+            subGraphName,
+            tripleCount: promotedCount,
+          });
+          emitNotification?.({ contextGraphId: resolvedContextGraphId, type: "assertion_activity" });
+        } catch { /* never break the promote path */ }
       }
       return jsonResponse(res, 200, result);
     } catch (err: any) {
@@ -3531,10 +3566,10 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
     const idStr = decodeURIComponent(path.split('/')[3] ?? '');
     if (!/^\d+$/.test(idStr)) {
       return jsonResponse(res, 400, {
-        error: 'Invalid kcId — must be a non-negative integer',
+        error: 'Invalid kaId — must be a non-negative integer',
       });
     }
-    const kcId = BigInt(idStr);
+    const kaId = BigInt(idStr);
     try {
       const chain: any = (agent as any).chain ?? (agent as any).chainAdapter;
       if (!chain?.getLatestMerkleRoot) {
@@ -3542,29 +3577,29 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
           error: 'Chain adapter does not expose getLatestMerkleRoot',
         });
       }
-      const rootBytes: Uint8Array = await chain.getLatestMerkleRoot(kcId);
+      const rootBytes: Uint8Array = await chain.getLatestMerkleRoot(kaId);
       const rootHex = '0x' + Array.from(rootBytes).map((b: number) => b.toString(16).padStart(2, '0')).join('');
       let author: string | null = null;
       try {
         if (typeof agent.getKnowledgeCollectionAuthor === 'function') {
-          const a = await agent.getKnowledgeCollectionAuthor(kcId);
+          const a = await agent.getKnowledgeCollectionAuthor(kaId);
           if (a && a !== '0x0000000000000000000000000000000000000000') author = a;
         }
       } catch { /* attestation lookup is optional */ }
       return jsonResponse(res, 200, {
-        kcId: idStr,
+        kaId: idStr,
         merkleRoot: rootHex,
         author,
       });
     } catch (err: any) {
-      // Codex PR #609 R2 #5 — mirror the unknown-kcId mapping the
+      // Codex PR #609 R2 #5 — mirror the unknown-kaId mapping the
       // sibling `/api/kc/:id/author` route already does so callers
       // can branch on "not published yet" (404) vs. server failure
       // (500). KCS reverts on lookups for ids that don't exist;
       // matching the same regex keeps the two routes in lockstep.
       const msg = err?.message ?? String(err);
-      if (/unknown kcId|nonexistent|out-of-bounds/i.test(msg)) {
-        return jsonResponse(res, 404, { error: `Unknown kcId ${idStr}` });
+      if (/unknown kaId|nonexistent|out-of-bounds/i.test(msg)) {
+        return jsonResponse(res, 404, { error: `Unknown kaId ${idStr}` });
       }
       return jsonResponse(res, 500, { error: msg });
     }
@@ -3574,7 +3609,7 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
   // collection's latest merkle-root entry.
   //
   // Delegates to `agent.getKnowledgeCollectionAuthor`, which reads
-  // `KnowledgeCollectionStorage.getLatestMerkleRootAuthor(kcId)` via the
+  // `KnowledgeCollectionStorage.getLatestMerkleRootAuthor(kaId)` via the
   // configured chain adapter. The view returns:
   //   - the EIP-712-recovered (or EIP-1271-verified) author for V10.1+
   //     publishes, or
@@ -3585,17 +3620,17 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
   // clients don't have to know the convention. Adapters that don't
   // implement the view (no-chain mode, pre-V10.1 evm-adapter copies)
   // return 503 — this is "feature requires V10.1 chain adapter," not a
-  // 404 about the kcId.
+  // 404 about the kaId.
   if (req.method === 'GET' && /^\/api\/kc\/[^/]+\/author$/.test(path)) {
     const idStr = decodeURIComponent(path.split('/')[3] ?? '');
     if (!/^\d+$/.test(idStr)) {
       return jsonResponse(res, 400, {
-        error: 'Invalid kcId — must be a non-negative integer',
+        error: 'Invalid kaId — must be a non-negative integer',
       });
     }
-    const kcId = BigInt(idStr);
+    const kaId = BigInt(idStr);
     try {
-      const author = await agent.getKnowledgeCollectionAuthor(kcId);
+      const author = await agent.getKnowledgeCollectionAuthor(kaId);
       if (author === null) {
         return jsonResponse(res, 503, {
           error:
@@ -3606,16 +3641,16 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
       const ZERO = '0x0000000000000000000000000000000000000000';
       const attested = author.toLowerCase() !== ZERO;
       return jsonResponse(res, 200, {
-        kcId: idStr,
+        kaId: idStr,
         author: attested ? author : null,
         attested,
       });
     } catch (err: any) {
-      // KCS reverts on unknown kcId; map to 404 so callers can branch
+      // KCS reverts on unknown kaId; map to 404 so callers can branch
       // on "not published yet" vs "no attestation."
       const msg = err?.message ?? String(err);
-      if (/unknown kcId|nonexistent|out-of-bounds/i.test(msg)) {
-        return jsonResponse(res, 404, { error: `Unknown kcId ${idStr}` });
+      if (/unknown kaId|nonexistent|out-of-bounds/i.test(msg)) {
+        return jsonResponse(res, 404, { error: `Unknown kaId ${idStr}` });
       }
       throw err;
     }

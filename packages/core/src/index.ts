@@ -30,7 +30,29 @@ export {
   MAX_RELAY_RESERVATION_COUNT,
   validateRelayReservationCount,
   type RelayReservationCountValidation,
+  // Single-source-of-truth interface for the small / sparse-network
+  // tunables forwarded `DkgConfig.network` → `DKGAgentConfig` →
+  // `DKGNodeConfig`, plus the choke-point helper every forwarder
+  // calls. Exported because `cli/src/daemon/lifecycle.ts` and
+  // `agent/src/dkg-agent.ts` BOTH need to call it; centralising
+  // here keeps the field list and forwarding logic identical at
+  // every hop. Codex review of PR #698 round 3.
+  type NetworkTunables,
+  pickNetworkTunables,
+  // Public-address classifier (used by profile.ts to filter what we
+  // advertise as `dkg:multiaddr` so peers don't learn RFC1918/CGNAT
+  // entries from the phonebook).
+  isPublicLikeAddress,
+  isLocalOrInternalHostname,
 } from './node.js';
+// NOTE: `isFinitePositiveInteger`, `buildPeerStoreOverrides`, and
+// `buildKadDHTOptions` are intentionally NOT re-exported. They are
+// implementation details of `DKGNode.start()`; the wiring test in
+// `core/test/libp2p-tunables-wiring.test.ts` reaches them via
+// `../src/node.js` directly so the package root stays free of
+// internals that would otherwise commit us to a semver contract
+// for test-only surface. Codex review of PR #698 round 3 flagged
+// the prior leak.
 export {
   type Network,
   type NodeIdentity,

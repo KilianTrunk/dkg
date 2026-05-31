@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { readFileSync, statSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { isIP } from 'node:net';
+import { homedir } from 'node:os';
 import { join } from 'node:path';
 
 import { resolveHermesProfile } from '@origintrail-official/dkg-adapter-hermes';
@@ -268,31 +269,52 @@ export function buildHermesChannelHeaders(
  * Resolve the Hermes API server key for the `hermes-openai` UI-chat
  * transport. `.env` (in the stored profile's `hermesHome`) is the source of
  * truth — the same file `dkg hermes setup` provisions and the one Hermes
- * itself reads. Reads are cached by path+mtime so we don't touch disk on
- * every chat request. `DKG_HERMES_API_SERVER_KEY` overrides for remote/WSL
- * gateways whose `.env` is not on the daemon's filesystem. Returns undefined
+ * itself reads (read fresh each call so a rotated key is picked up immediately).
+ * `DKG_HERMES_API_SERVER_KEY` is the source for remote/WSL
+ * gateways ONLY (whose `.env` is not on the daemon's filesystem); for loopback
+ * the key comes exclusively from the local profile `.env`. Returns undefined
  * when no key is available (older key-less Hermes → no bearer is sent).
  */
 export function resolveHermesApiServerKey(config: DkgConfig): string | undefined {
+  const key = resolveRawHermesApiServerKey(config);
+  // A bearer can't contain CR/LF or other control characters: `fetch`/`Headers`
+  // throw on them, and Hermes' own HTTP api_server could never receive such a
+  // token either. parseDotenvValue faithfully decodes `\n`/`\t`/`\r`, so a
+  // quoted key like `"abc\n123"` would otherwise crash the request — treat a
+  // control-char key as unusable so callers surface the missing-key hint.
+  if (key && /[\u0000-\u001f\u007f]/.test(key)) return undefined;
+  return key;
+}
+
+function resolveRawHermesApiServerKey(config: DkgConfig): string | undefined {
   const override = optionalTrimmedString(process.env.DKG_HERMES_API_SERVER_KEY);
-  if (override) return override;
-  // Only the LOOPBACK api_server reads a key from a local `.env`. A remote/WSL
-  // `--gateway-url` Hermes keeps its `.env` on another host, so reading the
-  // local profile here would forward a stale, unrelated key and make remote
-  // chat fail — those setups must use DKG_HERMES_API_SERVER_KEY (handled above).
-  if (!hasLoopbackHermesOpenAiTarget(config)) return undefined;
+  // Non-loopback `--gateway-url`: the Hermes `.env` is on another host, so the
+  // explicit override is the only source.
+  if (!hasLoopbackHermesOpenAiTarget(config)) return override;
+  // Loopback decision keys off PROFILE LOCALITY, not the URL: a loopback host
+  // can be a genuinely local Hermes OR a remote/WSL2 one reached through a
+  // localhost forward. When no locally-managed profile resolves, there is no
+  // local `.env` to read (the WSL2-forward case), so honor the explicit
+  // override — otherwise that correctly-configured setup would 401 forever.
   const hermesHome = resolveHermesHomeForKey(config);
-  if (!hermesHome) return undefined;
-  return readApiServerKeyFromEnv(join(hermesHome, '.env'));
+  if (!hermesHome) return override;
+  // A locally-managed profile resolved: its `.env` is fully authoritative — a
+  // present key, an explicit blank, or no key line all stand, and the override
+  // (which targets a different/remote Hermes) must not shadow or substitute for
+  // it.
+  return readApiServerKeyFromEnv(join(hermesHome, '.env')) || undefined;
 }
 
 /**
  * Locate the Hermes profile home whose `.env` carries the key. Prefer the
- * `hermesHome` stored on the integration record, but fall back to the resolved
- * default/named profile (the same resolver `dkg hermes setup` uses) so
- * integration records that predate that metadata — or where connect was
- * skipped — can still find the `.env` setup wrote, instead of staying stuck in
- * missing-key/401 until the user reconnects.
+ * `hermesHome` stored on the integration record. When it's absent (records that
+ * predate that metadata, or where connect was skipped) fall back ONLY to an
+ * exact profile recovered from a stored `profileName`. We never guess the
+ * default profile from no metadata: a record connected to a *named* profile
+ * would then read a different profile's `.env` and forward the wrong key,
+ * causing false 401s. With no recoverable profile we return undefined, so the
+ * caller surfaces the actionable "run dkg hermes setup" missing-key hint
+ * instead of silently sending another profile's secret.
  */
 function resolveHermesHomeForKey(config: DkgConfig): string | undefined {
   const metadata = getLocalAgentIntegration(config, 'hermes')?.metadata as
@@ -300,9 +322,18 @@ function resolveHermesHomeForKey(config: DkgConfig): string | undefined {
     | undefined;
   const fromMetadata = optionalTrimmedString(metadata?.hermesHome);
   if (fromMetadata) return fromMetadata;
+  const profileName = optionalTrimmedString(metadata?.profileName);
+  if (!profileName) return undefined;
   try {
-    const profileName = optionalTrimmedString(metadata?.profileName);
-    return resolveHermesProfile(profileName ? { profileName } : {}).hermesHome;
+    // Pass an explicit hermesHome so resolution can't be swayed by a daemon-side
+    // `HERMES_HOME` pointing at a different profile (resolveHermesProfile prefers
+    // `process.env.HERMES_HOME` over the profile-derived default, which would
+    // read the wrong profile's `.env`). resolveHermesProfile still validates the
+    // profileName (rejecting path separators).
+    return resolveHermesProfile({
+      profileName,
+      hermesHome: join(homedir(), '.hermes', 'profiles', profileName),
+    }).hermesHome;
   } catch {
     return undefined;
   }
@@ -326,30 +357,37 @@ export function hermesApiServerKeyRemediation(config: DkgConfig): string {
     : 'set DKG_HERMES_API_SERVER_KEY in the daemon environment to the remote Hermes API_SERVER_KEY (setup does not modify a remote .env), then restart the daemon';
 }
 
-const apiServerKeyCache = new Map<string, { mtimeMs: number; key: string | undefined }>();
+/**
+ * Remediation when Hermes explicitly REJECTS the bearer (401/403): a key is
+ * present but wrong, so "run dkg hermes setup" is a no-op (setup never
+ * overwrites an existing API_SERVER_KEY). The fix is to realign or rotate the
+ * key so DKG forwards what the running gateway expects.
+ */
+export function hermesApiServerKeyRejectionRemediation(config: DkgConfig): string {
+  return hasLoopbackHermesOpenAiTarget(config)
+    ? 'the API_SERVER_KEY in the Hermes profile .env does not match the running gateway — align them, or clear API_SERVER_KEY and re-run "dkg hermes setup" to regenerate (setup never overwrites an existing key), then restart "hermes gateway run --replace -v"'
+    : 'set DKG_HERMES_API_SERVER_KEY in the daemon environment to the key the remote Hermes is running with, then restart the daemon';
+}
 
+// Read directly on each call (no cache). The `.env` is tiny and this runs once
+// per user-initiated chat/health request, not in a hot loop — and a path+mtime
+// cache could serve a stale key when `.env` is rewritten twice within the
+// filesystem's timestamp resolution (e.g. a quick setup rerun + key rotation).
 function readApiServerKeyFromEnv(envPath: string): string | undefined {
-  let mtimeMs: number;
-  try {
-    mtimeMs = statSync(envPath).mtimeMs;
-  } catch {
-    apiServerKeyCache.delete(envPath);
-    return undefined;
-  }
-  const cached = apiServerKeyCache.get(envPath);
-  if (cached && cached.mtimeMs === mtimeMs) return cached.key;
   let key: string | undefined;
   try {
     for (const line of readFileSync(envPath, 'utf-8').split(/\r?\n/)) {
       const match = line.match(/^\s*(?:export\s+)?API_SERVER_KEY\s*=(.*)$/);
       if (!match) continue;
-      const value = parseDotenvValue(match[1]);
-      if (value) key = value; // last uncommented assignment wins (dotenv)
+      // dotenv "last assignment wins". An assigned-but-blank line yields `''`
+      // (a present, intentionally-cleared key) which the caller treats as
+      // authoritative; `key` stays `undefined` only when NO line is present, so
+      // the caller can distinguish "cleared locally" from "absent / unreadable".
+      key = parseDotenvValue(match[1]);
     }
   } catch {
-    key = undefined;
+    return undefined;
   }
-  apiServerKeyCache.set(envPath, { mtimeMs, key });
   return key;
 }
 

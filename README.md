@@ -143,6 +143,34 @@ TOKEN=$(dkg auth show)
 curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:9200/api/agents
 ```
 
+### Updating your node
+
+To update DKG, run one command:
+
+```bash
+dkg update                  # pull the latest release from npm and restart
+dkg update --check          # check what's available without applying
+dkg update --allow-prerelease   # follow the `next` dist-tag for pre-release builds
+dkg rollback                # revert to the previous version
+```
+
+Do **not** `git pull` or clone the repository to update — `dkg update` is the canonical verb. If anything looks off (multiple repositories on disk, served UI doesn't match version, version skew between daemon and CLI), run `dkg doctor` for a structured diagnostic of the install state. See [`OT-RFC-41`](https://github.com/OriginTrail/dkgv10-spec/blob/main/rfcs/OT-RFC-41-edge-node-npm-only-install-and-update.md) for the design rationale.
+
+### Contributors / monorepo development
+
+Hacking on DKG itself? Don't go through `npm install -g`. Clone, install, and run from the workspace:
+
+```bash
+git clone https://github.com/OriginTrail/dkg.git
+cd dkg
+pnpm install
+pnpm dkg start             # or `pnpm dkg <any subcommand>`
+```
+
+Contributor state lives under `~/.dkg-dev/` (separated from `~/.dkg/` so a contributor's dev work doesn't stomp on their own Edge install). `dkg update` is intentionally disabled in monorepo-checkout mode — use `git pull && pnpm install && pnpm build` instead.
+
+The legacy `install.sh` git-checkout installer was removed in rc.12 (OT-RFC-41 §5 PR 6). If you have an existing `install.sh`-style install, run `npm install -g @origintrail-official/dkg` to take over the install; the daemon will detect the legacy `~/.dkg/releases/` tree on first start, record the active slot version into `~/.dkg/previous-version` (rollback target), and resume from the npm-global install. `dkg doctor` flags any leftover cleanable state. See [`docs/archive/MIGRATE_TO_NPM.md`](docs/archive/MIGRATE_TO_NPM.md) for historical context on the pre-rc.12 procedure.
+
 ---
 
 ## Community integrations
@@ -236,9 +264,10 @@ dkg integration list [--tier community]  # default tier filter is `verified`+
 dkg integration info <slug>              # show details for one entry
 dkg integration install <slug>           # install cli/mcp kind; --allow-community for community-tier entries
 
-# Update / rollback
-dkg update [--check] [--allow-prerelease]  # update node software
+# Update / rollback / diagnose
+dkg update [--check] [--allow-prerelease]  # update node software via npm registry
 dkg rollback                               # roll back to previous version
+dkg doctor [--json]                        # diagnostic report: install layout, version skew, orphan clones, UI mismatch, plugin root, config sanity
 ```
 
 Run `dkg <command> --help` for per-command options.
@@ -311,6 +340,109 @@ analysis reports are under `bench/results/profiles/`, including
 
 ---
 
+## Triple Store Backends
+
+A DKG node keeps every assertion in an [RDF](https://www.w3.org/RDF/) triple store. Out of the box the node runs an embedded [Oxigraph](https://github.com/oxigraph/oxigraph) instance, which is everything you need on a workstation — no extra process, no extra port, no extra config. Heavier deployments can swap in [Blazegraph](https://blazegraph.com/) (the mainnet store) or any SPARQL 1.1 server.
+
+| Backend | When to pick it |
+|---|---|
+| `oxigraph-worker` (default) | Single-operator nodes, dev, CI. No setup. File-backed, capped at process RAM. |
+| `blazegraph` | High-throughput nodes, mainnet parity, very large graphs (10M+ quads). Run as a separate daemon (Docker or `java -jar`). Shares cleanly with V6 / V8 instances — DKG scopes its writes to the `did:dkg:context-graph:` named-graph prefix. |
+| `sparql-http` | Any SPARQL 1.1 Protocol server (Fuseki, GraphDB, Stardog, Neptune…). Bring your own URL + (optional) auth header. |
+
+### Configure via `dkg init`
+
+Two paths:
+
+**1. Point at an existing Blazegraph instance:**
+
+```
+$ dkg init
+…
+Triple store backend (oxigraph / blazegraph) (oxigraph): blazegraph
+Blazegraph SPARQL endpoint URL: http://127.0.0.1:9999/bigdata/namespace/mynode/sparql
+  Store endpoint reachable: blazegraph http://127.0.0.1:9999/bigdata/namespace/mynode/sparql
+```
+
+**2. Let `dkg init` provision a Blazegraph container via Docker:**
+
+```
+$ dkg init
+…
+Triple store backend (oxigraph / blazegraph) (oxigraph): blazegraph
+Blazegraph SPARQL endpoint URL:                                    ← leave blank
+No URL provided. Provision a Blazegraph container via Docker? (y/n) (y): y
+  Starting Blazegraph in Docker (namespace: mynode)…
+  Docker available: Docker version 24.0.6, build ed223bc
+  Created container "dkg-blazegraph-mynode" on port 9999.
+  Created Blazegraph namespace "mynode".
+```
+
+The Docker provisioner pins `lyrasis/blazegraph:2.1.5` (same image and tag as mainnet and the devnet test fixture), uses `--restart unless-stopped`, auto-bumps the host port if 9999 is taken, and is idempotent — re-running `dkg init` against an already-provisioned namespace reuses the running container.
+
+The wizard validates non-Docker URLs via an `ASK { ?s ?p ?o }` probe before saving — typos or unreachable namespaces are caught at setup time, not at first boot. A 404 surfaces a specific "namespace likely doesn't exist" message rather than the generic network-failure hint.
+
+### Configure via flags (scripted setup)
+
+Every setup entry point honours `--store` / `--store-url`:
+
+```bash
+# Init only
+dkg init --store blazegraph --store-url http://127.0.0.1:9999/bigdata/namespace/mynode/sparql
+
+# Adapter setups (validated + persisted after the adapter step completes)
+dkg hermes setup    --store blazegraph --store-url http://blaze.example/sparql
+dkg openclaw setup  --store blazegraph --store-url http://blaze.example/sparql
+dkg mcp setup       --store blazegraph --store-url http://blaze.example/sparql
+```
+
+`--store oxigraph` on a previously-Blazegraph node clears the persisted block (force-fall-back to the local default).
+
+### Configure via `~/.dkg/config.json`
+
+```json
+{
+  "store": {
+    "backend": "blazegraph",
+    "options": {
+      "url": "http://127.0.0.1:9999/bigdata/namespace/mynode/sparql",
+      "managedByDkg": false
+    }
+  }
+}
+```
+
+For `sparql-http`:
+
+```json
+{
+  "store": {
+    "backend": "sparql-http",
+    "options": {
+      "queryEndpoint": "http://server.example/query",
+      "updateEndpoint": "http://server.example/update",
+      "auth": "Bearer YOUR_TOKEN"
+    }
+  }
+}
+```
+
+### What changes when you pick an external backend
+
+- **Boot-time health check**: the daemon refuses to start until the endpoint answers `ASK`. Unreachable URLs print an actionable message naming the URL — no half-broken daemon.
+- **Namespace identity tag**: on first boot the daemon writes a triple into a reserved `<urn:dkg:store-meta>` graph recording its node name. Subsequent boots verify the tag before doing any writes — two DKG nodes pointed at the same Blazegraph namespace can't silently corrupt each other any more. Mismatches print the cleanup recipe (`DELETE WHERE { ... }`).
+- **Backend-aware reset**: chain-reset (and rebooting against a different backend) scopes its `DELETE` to the `did:dkg:context-graph:` prefix, leaving any V6/V8 data on the same Blazegraph instance untouched. Docker-provisioned namespaces (`managedByDkg: true`) use the faster `DROP ALL` path.
+- **Backend-switch guard**: switching backends between boots is treated like a destructive operation. The daemon prints a multi-line warning and refuses to start unless you set `DKG_ACCEPT_STORE_RESET=1`. Reverting `store.backend` in your config recovers the previous backend's data.
+- **Metrics**: `/api/status` exposes `storeUrl` and `storeQuads` (cached for 30 s) instead of the `storeBytes` file size — quad count is what's meaningful when the store isn't a local file.
+- **Required config**: when you enable `largeLiteralStorage` or `sharedMemoryPublicSnapshotStorage` with an external backend, you must set their `directory` explicitly (no local store path to infer from). The daemon fails fast at config-load if either is missing.
+
+### Limitations
+
+- **Auth / TLS**: only the generic `sparql-http` backend accepts an `Authorization` header. For Blazegraph behind auth or HTTPS-with-custom-CA, run a reverse proxy in front of it for now.
+- **Migration tool**: there is no `dkg migrate-store` between backends. Plan a chain-reset window if you need to switch on a node that holds important non-VM state.
+
+---
+
 ## Testnet Funding
 
 A DKG testnet node needs Base Sepolia ETH (to pay gas for on-chain operations) and test TRAC (for staking and publishing). The Origin Trail testnet faucet hands out both in a single API call, so first-setup paths auto-fund the generated admin wallet plus the three operational wallets when a faucet is configured in the network config.
@@ -361,9 +493,9 @@ At a high level:
 
 A unit of published knowledge: RDF statements plus Merkle proof material and optional private sections.
 
-### Knowledge Collection (KC)
+### Knowledge Asset on-chain registration
 
-A grouped finalization of multiple Knowledge Assets — the unit that the chain sees when you publish a batch.
+Publishing mints a single Knowledge Asset as an ERC-721 NFT (`tokenId == kaId`) — the unit the chain sees. Each publish creates one Knowledge Asset; there is no multi-KA batching.
 
 ### Context Graph (project)
 

@@ -111,6 +111,26 @@ export const PROTOCOL_JOIN_REQUEST = '/dkg/10.0.1/join-request';
 export const PROTOCOL_VERIFY_PROPOSAL = '/dkg/10.0.1/verify-proposal';
 export const PROTOCOL_VERIFY_APPROVAL = '/dkg/10.0.0/verify-approval';
 export const PROTOCOL_STORAGE_ACK = '/dkg/10.0.1/storage-ack';
+/**
+ * OT-RFC-38 LU-11 / OT-RFC-39 — storage-ack protocol version that
+ * carries `ciphertextChunksRoot` + `ciphertextChunkCount` +
+ * `ackProtocolVersion` on `PublishIntent`. Pre-LU-11 nodes don't
+ * register this handler so an LU-11 publisher falls back to V1 against
+ * legacy peers (with no curated chunked-publish support there).
+ */
+export const PROTOCOL_STORAGE_ACK_V2 = '/dkg/10.0.2/storage-ack';
+
+/**
+ * OT-RFC-38 LU-11 / OT-RFC-39 — point-to-point sync verb for one
+ * curated-CG ciphertext chunk identified by (cgId, batchId,
+ * chunkIndex). Used by late-joining hosting cores (and any
+ * sharding-table member that missed the original chunked SWM
+ * gossip) to backfill the per-chunk store before the V2 ACK
+ * verifier needs the bytes. See
+ * `packages/agent/src/swm/ciphertext-chunk-catchup.ts` for the
+ * signed JSON wire format and per-pull authorization gate.
+ */
+export const PROTOCOL_GET_CIPHERTEXT_CHUNK = '/dkg/10.0.2/get-ciphertext-chunk';
 
 export const DHT_PROTOCOL = '/dkg/kad/1.0.0';
 

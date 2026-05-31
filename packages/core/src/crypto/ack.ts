@@ -121,6 +121,35 @@ function uint72ToBytes(value: bigint): Uint8Array {
 }
 
 /**
+ * Strict-positive `tokenAmount` floor applied at every off-chain boundary
+ * that hashes or sends a V10 publish/update payload.
+ *
+ * KAV10 10.1.1 added a `tokenAmount > 0` check inside `_validateTokenAmount`,
+ * so `0n` is now an unconditional contract revert. Pre-10.1.1, the contract
+ * silently rounded a 0-cost publish up to 1 wei-TRAC inside the direct-spend
+ * branch (`transferFrom(..., 1n)`); free-publish flows on devnets where
+ * `ask == 0` relied on that round-up. To keep those flows working without
+ * loosening the 10.1.1 hardening, the off-chain stack floors `tokenAmount`
+ * to `1n` at two boundaries:
+ *
+ *   1. Here, inside the canonical ACK-digest helpers, so every signer hashes
+ *      the same value the chain will later see in `_executePublishCore` /
+ *      `_executeUpdateCore`. Without the floor, an ACK signed over a `0n`
+ *      digest would be unverifiable against the on-chain payload (which
+ *      now carries `1n`).
+ *   2. Inside `evm-adapter.ts` at the publish/update struct construction
+ *      site, so the on-chain `_validateTokenAmount` floor is never tripped
+ *      by an integrator who somehow bypasses the digest helpers.
+ *
+ * The clamp is intentionally only `0n → 1n`; non-zero amounts pass through
+ * untouched so the existing `tokenAmount < expectedTokenAmount` check still
+ * fires for under-paid publishes.
+ */
+export function floorPublishTokenAmount(tokenAmount: bigint): bigint {
+  return tokenAmount > 0n ? tokenAmount : 1n;
+}
+
+/**
  * Compute the V10 publish ACK digest that each receiving core node signs.
  *
  * Layout matches `KnowledgeAssetsV10.sol` `_executePublishCore` exactly:
@@ -143,6 +172,10 @@ function uint72ToBytes(value: bigint): Uint8Array {
  * H5 closure: the leading (chainid, kav10Address) prefix pins signatures to
  * this chain and this contract. Replay across chains / forks / contract
  * redeployments is rejected at signature verification.
+ *
+ * KAV10 10.1.1: `tokenAmount` is run through {@link floorPublishTokenAmount}
+ * so a free-publish flow (`tokenAmount === 0n`) hashes the same `1n` value
+ * the adapter sends on-chain.
  */
 export function computePublishACKDigest(
   chainId: bigint,
@@ -154,13 +187,20 @@ export function computePublishACKDigest(
   epochs: bigint,
   tokenAmount: bigint,
   merkleLeafCount: bigint,
+  ciphertextChunksRoot: Uint8Array = new Uint8Array(32),
+  ciphertextChunkCount: bigint = 0n,
+  isImmutable: boolean = false,
 ): Uint8Array {
   if (merkleRoot.length !== 32) {
     throw new Error(`merkleRoot must be 32 bytes, got ${merkleRoot.length}`);
   }
+  if (ciphertextChunksRoot.length !== 32) {
+    throw new Error(`ciphertextChunksRoot must be 32 bytes, got ${ciphertextChunksRoot.length}`);
+  }
   const addrBytes = addressToBytes(kav10Address);
+  const flooredTokenAmount = floorPublishTokenAmount(tokenAmount);
 
-  const packed = new Uint8Array(276);
+  const packed = new Uint8Array(372);
   let offset = 0;
   packed.set(uint256ToBytes(chainId), offset); offset += 32;
   packed.set(addrBytes, offset); offset += 20;
@@ -169,8 +209,11 @@ export function computePublishACKDigest(
   packed.set(uint256ToBytes(kaCount), offset); offset += 32;
   packed.set(uint256ToBytes(byteSize), offset); offset += 32;
   packed.set(uint256ToBytes(epochs), offset); offset += 32;
-  packed.set(uint256ToBytes(tokenAmount), offset); offset += 32;
+  packed.set(uint256ToBytes(flooredTokenAmount), offset); offset += 32;
   packed.set(uint256ToBytes(merkleLeafCount), offset); offset += 32;
+  packed.set(ciphertextChunksRoot, offset); offset += 32;
+  packed.set(uint256ToBytes(ciphertextChunkCount), offset); offset += 32;
+  packed.set(uint256ToBytes(isImmutable ? 1n : 0n), offset); offset += 32;
 
   return keccak256(packed);
 }
@@ -214,7 +257,7 @@ export function computeUpdateACKDigest(
   chainId: bigint,
   kav10Address: string,
   contextGraphId: bigint,
-  kcId: bigint,
+  kaId: bigint,
   preUpdateMerkleRootCount: bigint,
   newMerkleRoot: Uint8Array,
   newByteSize: bigint,
@@ -222,33 +265,50 @@ export function computeUpdateACKDigest(
   mintAmount: bigint,
   burnTokenIds: bigint[],
   newMerkleLeafCount: bigint,
+  newCiphertextChunksRoot: Uint8Array = new Uint8Array(32),
+  newCiphertextChunkCount: bigint = 0n,
 ): Uint8Array {
   if (newMerkleRoot.length !== 32) {
     throw new Error(`newMerkleRoot must be 32 bytes, got ${newMerkleRoot.length}`);
   }
+  if (newCiphertextChunksRoot.length !== 32) {
+    throw new Error(`newCiphertextChunksRoot must be 32 bytes, got ${newCiphertextChunksRoot.length}`);
+  }
   const addrBytes = addressToBytes(kav10Address);
+  // KAV10 10.1.1 — kept in lockstep with the adapter's update struct so the
+  // signed digest matches the on-chain `newTokenAmount`. NOTE: this floor is
+  // redundant for any KC that can exist on a V10 chain — the publish-time
+  // floor + on-chain `_validateTokenAmount` guarantee `currentTokenAmount
+  // >= 1`, and metadata-only updates skip `_validateTokenAmount` entirely.
+  // It only changes a legacy `tokenAmount == 0` KC (which a fresh V10 chain
+  // cannot produce). Removing it is tracked as a post-testnet follow-up
+  // (#781; issue #803); see the matching note in evm-adapter.ts.
+  const flooredNewTokenAmount = floorPublishTokenAmount(newTokenAmount);
 
-  // keccak256(abi.encodePacked(burnTokenIds))
+  // keccak256(abi.encodePacked(burnTokenIds)) — empty uint256[] encodes to
+  // zero bytes, so keccak256("") matches Solidity (verified vs ethers).
   const burnPacked = new Uint8Array(burnTokenIds.length * 32);
   for (let i = 0; i < burnTokenIds.length; i++) {
     burnPacked.set(uint256ToBytes(burnTokenIds[i]), i * 32);
   }
   const burnHash = keccak256(burnPacked);
 
-  // Packed width = 32 (chainId) + 20 (addr) + 32*9 (9× uint256/bytes32 fields) = 340.
-  const packed = new Uint8Array(340);
+  // Packed width = 32 (chainId) + 20 (addr) + 32*11 fields = 404.
+  const packed = new Uint8Array(404);
   let offset = 0;
   packed.set(uint256ToBytes(chainId), offset); offset += 32;
   packed.set(addrBytes, offset); offset += 20;
   packed.set(uint256ToBytes(contextGraphId), offset); offset += 32;
-  packed.set(uint256ToBytes(kcId), offset); offset += 32;
+  packed.set(uint256ToBytes(kaId), offset); offset += 32;
   packed.set(uint256ToBytes(preUpdateMerkleRootCount), offset); offset += 32;
   packed.set(newMerkleRoot, offset); offset += 32;
   packed.set(uint256ToBytes(newByteSize), offset); offset += 32;
-  packed.set(uint256ToBytes(newTokenAmount), offset); offset += 32;
+  packed.set(uint256ToBytes(flooredNewTokenAmount), offset); offset += 32;
   packed.set(uint256ToBytes(mintAmount), offset); offset += 32;
   packed.set(burnHash, offset); offset += 32;
   packed.set(uint256ToBytes(newMerkleLeafCount), offset); offset += 32;
+  packed.set(newCiphertextChunksRoot, offset); offset += 32;
+  packed.set(uint256ToBytes(newCiphertextChunkCount), offset); offset += 32;
 
   return keccak256(packed);
 }
@@ -297,7 +357,7 @@ export function computePublishPublisherDigest(
  * `KnowledgeAssetsV10._EIP712_NAME_HASH` — any drift will produce
  * signatures the contract rejects with `InvalidAuthorSignature`.
  */
-export const AUTHOR_ATTESTATION_DOMAIN_NAME = 'KnowledgeAssetsV10';
+export const AUTHOR_ATTESTATION_DOMAIN_NAME = 'KnowledgeAssetsLifecycle';
 
 /**
  * EIP-712 domain version. Bound to the major.minor portion of the
@@ -305,7 +365,7 @@ export const AUTHOR_ATTESTATION_DOMAIN_NAME = 'KnowledgeAssetsV10';
  * this; only major.minor changes do. See
  * `KnowledgeAssetsV10._EIP712_VERSION_HASH`.
  */
-export const AUTHOR_ATTESTATION_DOMAIN_VERSION = '10.1';
+export const AUTHOR_ATTESTATION_DOMAIN_VERSION = '2.0.0';
 
 /**
  * Currently-supported `authorSchemeVersion` value. v1 is single-key
@@ -395,6 +455,65 @@ export function buildAuthorAttestationTypedData(args: {
     message: {
       contextGraphId: args.contextGraphId,
       merkleRoot: merkleRootHex,
+      authorAddress: args.authorAddress,
+      schemeVersion,
+    },
+  };
+}
+
+export const UPDATE_AUTHOR_ATTESTATION_PRIMARY_TYPE = 'UpdateAuthorAttestation';
+
+export interface UpdateAuthorAttestationTypedData {
+  domain: AuthorAttestationTypedData['domain'];
+  types: {
+    UpdateAuthorAttestation: Array<{ name: string; type: string }>;
+  };
+  primaryType: typeof UPDATE_AUTHOR_ATTESTATION_PRIMARY_TYPE;
+  message: {
+    kaId: bigint;
+    newMerkleRoot: string;
+    authorAddress: string;
+    schemeVersion: number;
+  };
+}
+
+/**
+ * EIP-712 typed data for greenfield KA updates (`UpdateAuthorAttestation`).
+ * Owner commits to `(kaId, newMerkleRoot)` before the publisher runs ACK/TRAC.
+ */
+export function buildUpdateAuthorAttestationTypedData(args: {
+  chainId: bigint;
+  kav10Address: string;
+  kaId: bigint;
+  newMerkleRoot: Uint8Array;
+  authorAddress: string;
+  schemeVersion?: number;
+}): UpdateAuthorAttestationTypedData {
+  if (args.newMerkleRoot.length !== 32) {
+    throw new Error('newMerkleRoot must be 32 bytes');
+  }
+  const toHex = (b: Uint8Array) =>
+    '0x' + Array.from(b).map((x) => x.toString(16).padStart(2, '0')).join('');
+  const schemeVersion = args.schemeVersion ?? AUTHOR_SCHEME_VERSION_V1;
+  return {
+    domain: {
+      name: AUTHOR_ATTESTATION_DOMAIN_NAME,
+      version: AUTHOR_ATTESTATION_DOMAIN_VERSION,
+      chainId: args.chainId,
+      verifyingContract: args.kav10Address,
+    },
+    types: {
+      UpdateAuthorAttestation: [
+        { name: 'kaId', type: 'uint256' },
+        { name: 'newMerkleRoot', type: 'bytes32' },
+        { name: 'authorAddress', type: 'address' },
+        { name: 'schemeVersion', type: 'uint8' },
+      ],
+    },
+    primaryType: UPDATE_AUTHOR_ATTESTATION_PRIMARY_TYPE,
+    message: {
+      kaId: args.kaId,
+      newMerkleRoot: toHex(args.newMerkleRoot),
       authorAddress: args.authorAddress,
       schemeVersion,
     },

@@ -170,12 +170,38 @@ done
 # before SIGTERMing the curator. We use the standard listing
 # endpoint and grep — keeps this self-contained (no new daemon
 # surface required).
-CG_ID_ENC=$(printf %s "$CG_ID" | sed 's/\//%2F/g')
+# Wait until M1's local CG view reports the on-chain id (set via gossip
+# of ContextGraphCreated). Tuned to 60s (was 30s pre-rc.12) so a slower
+# devnet boot doesn't false-fail before the chain event reaches M1.
+#
+# IMPORTANT: there is no `GET /api/context-graph/<id>` route — daemons
+# expose `/api/context-graph/list`, which returns every CG the node knows
+# about with onChainId populated for the registered ones. Pre-fix this
+# helper polled the non-existent per-id GET endpoint, got a 404 every
+# iteration, and reliably false-failed on every run (the 30s vs 60s
+# debate was a red herring — neither value would have helped).
+ONCHAIN_WAIT_S="${RFC38_M1_ONCHAIN_WAIT_S:-60}"
 wait_for_m1_onchain_id() {
-  for _ in $(seq 1 30); do
-    local resp; resp=$(api_call "$M1_NODE" GET "/api/context-graph/${CG_ID_ENC}" 2>/dev/null || echo "")
-    local on_chain; on_chain=$(parse_json "$resp" '.onChainId' 2>/dev/null || echo "")
-    if [ -n "$on_chain" ] && [ "$on_chain" != "null" ] && [ "$on_chain" != "0" ]; then
+  for _ in $(seq 1 "$ONCHAIN_WAIT_S"); do
+    local resp on_chain
+    resp=$(api_call "$M1_NODE" GET /api/context-graph/list 2>/dev/null || echo "")
+    on_chain=$(printf '%s' "$resp" | CG_ID="$CG_ID" node -e '
+      let d = "";
+      process.stdin.on("data", c => { d += c; });
+      process.stdin.on("end", () => {
+        try {
+          const j = JSON.parse(d);
+          const id = process.env.CG_ID;
+          const list = Array.isArray(j.contextGraphs) ? j.contextGraphs : [];
+          const hit = list.find(cg => cg && (cg.id === id || cg.uri === "did:dkg:context-graph:" + id));
+          const oc = hit && hit.onChainId;
+          if (oc != null && String(oc) !== "" && String(oc) !== "0") {
+            console.log(String(oc));
+          }
+        } catch {}
+      });
+    ' 2>/dev/null || echo "")
+    if [ -n "$on_chain" ]; then
       log "✓ M1 sees onChainId=$on_chain — safe to take curator offline"
       return 0
     fi
@@ -184,7 +210,7 @@ wait_for_m1_onchain_id() {
   return 1
 }
 if ! wait_for_m1_onchain_id; then
-  fail "M1 never observed an onChainId for $CG_ID within 30s — non-curator publish in phase 5 would fail with 'CG not registered on-chain' before the offline contract could be tested."
+  fail "M1 never observed an onChainId for $CG_ID within ${ONCHAIN_WAIT_S}s — non-curator publish in phase 5 would fail with 'CG not registered on-chain' before the offline contract could be tested."
 fi
 
 # ===========================================================================
@@ -346,11 +372,11 @@ EOF
 log "M1 publish response: $PUB_RESP"
 STATUS=$(parse_json "$PUB_RESP" '.status')
 TX=$(parse_json    "$PUB_RESP" '.txHash')
-KC=$(parse_json    "$PUB_RESP" '.kcId')
+KC=$(parse_json    "$PUB_RESP" '.kaId')
 if [ "$STATUS" != "confirmed" ] || [ -z "$TX" ]; then
   fail "non-curator publish did NOT confirm on-chain (status=$STATUS, tx=$TX) — open-publishPolicy resilience contract BROKEN"
 fi
-log "✓ M1 published to VM without curator: kcId=$KC tx=$TX"
+log "✓ M1 published to VM without curator: kaId=$KC tx=$TX"
 
 # ===========================================================================
 act "6. Outsider verifies the published KC's merkleRoot exists on chain"
@@ -374,6 +400,6 @@ log "================================================================"
 log "  Curated CG:    $CG_ID  (onChainId=$ON_CHAIN_ID, publishPolicy=open)"
 log "  Triples in:    4 (curator-written, gossiped to members)"
 log "  Curator:       SIGTERMed before publish"
-log "  M1 published:  kcId=$KC tx=$TX merkleRoot=$MERKLE_ROOT"
+log "  M1 published:  kaId=$KC tx=$TX merkleRoot=$MERKLE_ROOT"
 log "  Outsider:      observed merkleRoot on chain"
 log "================================================================"

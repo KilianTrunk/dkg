@@ -186,6 +186,58 @@ describe('loadRoutePlugins', () => {
     }
   });
 
+  it('does not fall back to a stale daemon-local package when stable-root import fails', async () => {
+    // Stable-root resolution is authoritative once it finds a package. A
+    // broken plugin under ~/.dkg/plugins must surface as broken instead of
+    // being silently rescued by an older daemon-local/global install with the
+    // same package name.
+    const pkgName = `@dkg-test/stable-root-broken-fixture-${process.pid}-${Date.now()}`;
+    const dkgHome = mkdtempSync(join(tmpdir(), 'dkg-stable-root-'));
+    const stableInstallDir = join(dkgHome, 'plugins', 'node_modules', ...pkgName.split('/'));
+    const cliInstallDir = join(resolve(__dirname, '../../node_modules'), ...pkgName.split('/'));
+    mkdirSync(stableInstallDir, { recursive: true });
+    mkdirSync(cliInstallDir, { recursive: true });
+    writeFileSync(
+      join(stableInstallDir, 'package.json'),
+      JSON.stringify({
+        name: pkgName,
+        version: '0.0.0',
+        type: 'module',
+        exports: { '.': './index.mjs' },
+      }),
+    );
+    writeFileSync(
+      join(stableInstallDir, 'index.mjs'),
+      "import helper from './missing-from-stable-root.mjs';\nexport default { name: 'stable-root-broken', handle: helper };\n",
+    );
+    writeFileSync(
+      join(cliInstallDir, 'package.json'),
+      JSON.stringify({
+        name: pkgName,
+        version: '0.0.0',
+        type: 'module',
+        exports: { '.': './index.mjs' },
+      }),
+    );
+    writeFileSync(
+      join(cliInstallDir, 'index.mjs'),
+      "export default { name: 'stale-daemon-local-plugin', handle() {} };\n",
+    );
+    try {
+      const { log, warn } = makeLogger();
+      const plugins = await loadRoutePlugins([pkgName], log, { dkgHome });
+      expect(plugins).toEqual([]);
+      expect(warn).toHaveBeenCalledTimes(1);
+      const msg = String(warn.mock.calls[0][1]);
+      expect(msg).toContain('route-plugin-load-failed');
+      expect(msg).toContain('missing-from-stable-root');
+      expect(msg).not.toContain('stale-daemon-local-plugin');
+    } finally {
+      rmSync(dkgHome, { recursive: true, force: true });
+      rmSync(cliInstallDir, { recursive: true, force: true });
+    }
+  });
+
   it('returns [] and warns once when routePlugins is a non-array string value', async () => {
     // Typo case: operator writes a bare string instead of an array. Reject with one warn, don't iterate characters.
     const { log, warn } = makeLogger();

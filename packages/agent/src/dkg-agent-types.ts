@@ -33,7 +33,7 @@ import type {
   LiftAuthorityProof,
   SharedMemoryPublicSnapshotStorageConfig,
 } from '@origintrail-official/dkg-publisher';
-import type { ChainAdapter } from '@origintrail-official/dkg-chain';
+import type { ApprovalPolicy, ChainAdapter } from '@origintrail-official/dkg-chain';
 import type { QueryAccessConfig } from '@origintrail-official/dkg-query';
 import type { SkillHandler } from './messaging.js';
 import type { CclFactResolutionMode } from './ccl-fact-resolution.js';
@@ -86,6 +86,37 @@ export type LocalSwmSenderKeyReceiveState = {
   senderSigningPublicKey: Uint8Array;
   createdAtMs: number;
   skippedChainKeys: Map<number, Uint8Array>;
+};
+
+/**
+ * A SWM sender-key package that landed in the "no advertised peerId"
+ * branch of `createAndDistributeSwmSenderKeyEpoch` and is held for
+ * delivery once we learn a peerId for the recipient agent (via
+ * connection:open or a subsequent publish that re-resolves the
+ * recipient set).
+ *
+ * Keyed in-memory by lowercased `recipientAgentAddress`. The triple
+ * `(senderAgentAddress, recipientKeyId, epochId)` dedupes within an
+ * agent's queue; newer epochs supersede older ones for the same
+ * `(senderAgentAddress, recipientAgentAddress)` pair.
+ */
+export type PendingSenderKeyEntry = {
+  /** Lower-cased EIP-55 sender agent address. */
+  senderAgentAddress: string;
+  /** Lower-cased EIP-55 recipient agent address (matches the map key). */
+  recipientAgentAddress: string;
+  recipientKeyId: string;
+  epochId: string;
+  contextGraphId: string;
+  subGraphName?: string;
+  /**
+   * Canonical encoded `SwmSenderKeyPackageMsg` wire bytes — exactly
+   * what gets passed to `messenger.sendReliable(peerId, PROTOCOL_SWM_
+   * SENDER_KEY, ...)` when the recipient becomes reachable.
+   */
+  packageBytes: Uint8Array;
+  /** Wall-clock when the row was enqueued; used for diagnostics + future TTL. */
+  createdAtMs: number;
 };
 
 export type RandomSamplingStartResult = 'started' | 'retryable' | 'disabled';
@@ -647,6 +678,25 @@ export interface DKGAgentConfig {
    */
   nodeVersion?: string;
   /**
+   * libp2p networking tunables for small / sparse networks. All three
+   * fields are optional and forwarded straight into the matching
+   * `DKGNodeConfig` slots. Omitting any field preserves the upstream
+   * default. See `packages/core/src/types.ts` for per-field semantics
+   * and the operator-facing surface in `packages/cli/src/config.ts`
+   * (`network` block).
+   */
+  peerStoreMaxAddressAgeMs?: number;
+  peerStoreMaxPeerAgeMs?: number;
+  dhtQuerySelfIntervalMs?: number;
+  /**
+   * Cadence at which the daemon re-publishes its own agent profile
+   * (PR feat/chain-agents-cg-phonebook). Forwarded straight from
+   * `DkgConfig.network.agentProfileHeartbeatMs`. Defaults to
+   * `AGENT_PROFILE_HEARTBEAT_MS` (5 min) when omitted; `0` disables
+   * the timer (the one-shot startup publish still fires).
+   */
+  agentProfileHeartbeatMs?: number;
+  /**
    * Path to the V10 Random Sampling prover write-ahead log. Core
    * nodes only; ignored on edge. When omitted, an in-memory WAL is
    * used (loses crash-recovery context on restart). Production
@@ -688,10 +738,18 @@ export interface DKGAgentConfig {
    */
   chainConfig?: {
     rpcUrl: string;
+    rpcUrls?: string[];
     hubAddress: string;
     adminPrivateKey?: string;
     operationalKeys: string[];
     chainId?: string;
+    /**
+     * Optional V10 allowance-sizing policy. Threaded straight through to
+     * the `EVMChainAdapter`; see `ApprovalPolicy` in
+     * `@origintrail-official/dkg-chain`. Omit to inherit the default
+     * (`'per-publish'`, bounded-per-publish with on-chain 1n floor).
+     */
+    approvalPolicy?: ApprovalPolicy;
   };
   /** Cross-agent query access configuration. */
   queryAccess?: QueryAccessConfig;

@@ -9,7 +9,6 @@ Web dashboard for DKG V10 nodes. Provides a browser-based UI for monitoring node
 - **SPARQL editor** - write and execute SPARQL queries with syntax highlighting and result tables
 - **Integrated-agent side panel** - connect a local agent, chat in the right rail, inspect network peers, and browse persisted sessions
 - **Metrics & telemetry** - `DashboardDB` (SQLite) for persistent metric snapshots, `MetricsCollector` for gauges and counters, `OperationTracker` for request tracing
-- **Structured logging** - `StructuredLogger` with operation context, log levels, and JSON output
 
 ## Architecture
 

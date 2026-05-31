@@ -1,7 +1,7 @@
 import {
   DKGNode, ProtocolRouter, GossipSubManager, TypedEventBus, DKGEvent,
   LibP2PNetwork, PeerResolver, StubNetworkStateRegistry,
-  PROTOCOL_ACCESS, PROTOCOL_PUBLISH, PROTOCOL_SYNC, PROTOCOL_QUERY_REMOTE, PROTOCOL_STORAGE_ACK, PROTOCOL_VERIFY_PROPOSAL, PROTOCOL_JOIN_REQUEST,
+  PROTOCOL_ACCESS, PROTOCOL_PUBLISH, PROTOCOL_SYNC, PROTOCOL_QUERY_REMOTE, PROTOCOL_STORAGE_ACK, PROTOCOL_STORAGE_ACK_V2, PROTOCOL_GET_CIPHERTEXT_CHUNK, PROTOCOL_VERIFY_PROPOSAL, PROTOCOL_JOIN_REQUEST,
   PROTOCOL_SWM_SENDER_KEY, PROTOCOL_SWM_UPDATE, PROTOCOL_SWM_SHARE_ACK, PROTOCOL_SWM_HOST_CATCHUP, PROTOCOL_MESSAGE,
   contextGraphPublishTopic, contextGraphWorkspaceTopic, contextGraphAppTopic, contextGraphUpdateTopic, contextGraphFinalizationTopic,
   contextGraphDataGraphUri, contextGraphMetaGraphUri, contextGraphWorkspaceGraphUri, contextGraphWorkspaceMetaGraphUri,
@@ -69,8 +69,16 @@ import {
   type ProtocolOutboxStore,
   type ProtocolOutboxEntry,
   encryptV10PublishPayload,
+  encryptChunked,
+  buildCiphertextChunksRoot,
+  computeGossipSigningPayloadV2,
+  GOSSIP_TYPE_WORKSPACE_PUBLISH_CHUNKED,
+  ciphertextChunkStoreGraph,
+  ciphertextChunkStoreSubject,
+  CIPHERTEXT_CHUNK_PREDICATE,
   type SubscriptionSource,
   SUBSCRIPTION_SOURCES,
+  pickNetworkTunables,
 } from '@origintrail-official/dkg-core';
 import { GraphManager, PrivateContentStore, createTripleStore, type TripleStore, type TripleStoreConfig, type Quad, type LargeLiteralStorageConfig } from '@origintrail-official/dkg-storage';
 import { EVMChainAdapter, NoChainAdapter, enrichEvmError, type EVMAdapterConfig, type ChainAdapter, type CreateContextGraphParams, type CreateOnChainContextGraphParams, type CreateOnChainContextGraphResult, type TxResult, type V10PublishingConvictionAccountInfo } from '@origintrail-official/dkg-chain';
@@ -113,7 +121,7 @@ import { ProfileManager } from './profile-manager.js';
 import { DiscoveryClient, type SkillSearchOptions, type DiscoveredAgent, type DiscoveredOffering } from './discovery.js';
 import { MessageHandler, type SkillHandler, type SkillRequest, type SkillResponse, type ChatHandler, type ChatAclCheck } from './messaging.js';
 import { ed25519ToX25519Private, ed25519ToX25519Public } from './encryption.js';
-import { AGENT_REGISTRY_CONTEXT_GRAPH, canonicalAgentDidSubject, type AgentProfileConfig } from './profile.js';
+import { AGENT_REGISTRY_CONTEXT_GRAPH, canonicalAgentDidSubject, collectPublishableMultiaddrs, type AgentProfileConfig } from './profile.js';
 import {
   signAgentDelegation,
   verifyAgentDelegation,
@@ -167,6 +175,18 @@ import {
   mintSignedCatchupRequest,
   verifySignedCatchupRequest,
 } from './swm/host-catchup-sign.js';
+import {
+  createCiphertextChunkCatchupReplayGuard,
+  decodeCiphertextChunkCatchupRequest,
+  encodeCiphertextChunkCatchupRequest,
+  encodeCiphertextChunkCatchupResponse,
+  decodeCiphertextChunkCatchupResponse,
+  mintSignedCiphertextChunkCatchupRequest,
+  verifySignedCiphertextChunkCatchupRequest,
+  CIPHERTEXT_CHUNK_CATCHUP_WIRE_VERSION,
+  type CiphertextChunkCatchupRequest,
+  type CiphertextChunkCatchupResponse,
+} from './swm/ciphertext-chunk-catchup.js';
 import { waitForPeerProtocol } from './p2p/protocol-readiness.js';
 import { orderCatchupPeers } from './p2p/peer-selection.js';
 import { fetchSyncPages, type SyncPageResult } from './sync/requester/page-fetch.js';
@@ -249,6 +269,8 @@ import {
   STORAGE_ACK_REGISTRATION_RETRY_MS,
   JOIN_APPROVAL_RETRY_TICK_MS,
   MESSAGE_OUTBOX_TICK_MS,
+  AGENT_PROFILE_HEARTBEAT_MS,
+  AGENT_PROFILE_STALE_THRESHOLD_MS,
 } from './dkg-agent-constants.js';
 import {
   ContextGraphNotFoundError,
@@ -258,6 +280,7 @@ import {
   type PreSignedAuthorAttestation,
   type LocalSwmSenderKeySendState,
   type LocalSwmSenderKeyReceiveState,
+  type PendingSenderKeyEntry,
   type RandomSamplingStartResult,
   type ACKSignerResolution,
   type SyncRequestEnvelope,
@@ -359,6 +382,33 @@ export type {
  *   const response = await agent.invokeSkill(offerings[0], inputData);
  *   await agent.stop();
  */
+/**
+ * OT-RFC-38 LU-11. Target ciphertext-chunk size on the SWM gossip
+ * wire. 32 KiB stays well under libp2p's per-message ceiling (the
+ * mesh defaults to 1 MiB) so chunks rarely fragment at the transport
+ * layer, and produces a tree shallow enough that on-chain proof
+ * verification per RFC-39 sampling tick stays cheap. The last chunk
+ * is whatever fraction remains.
+ */
+const CIPHERTEXT_CHUNK_SIZE_BYTES = 32 * 1024;
+
+/**
+ * OT-RFC-38 LU-11. Split a single plaintext buffer into the
+ * fixed-size pieces the chunked AEAD path expects. Empty input is
+ * rejected — the publisher computes `merkleRoot` from non-empty
+ * `kaCount` quads, so an empty plaintext upstream is always a bug.
+ */
+function sliceIntoCiphertextChunks(plaintext: Uint8Array): Uint8Array[] {
+  if (plaintext.length === 0) {
+    throw new Error('LU-11: sliceIntoCiphertextChunks rejects empty plaintext');
+  }
+  const chunks: Uint8Array[] = [];
+  for (let off = 0; off < plaintext.length; off += CIPHERTEXT_CHUNK_SIZE_BYTES) {
+    chunks.push(plaintext.subarray(off, Math.min(off + CIPHERTEXT_CHUNK_SIZE_BYTES, plaintext.length)));
+  }
+  return chunks;
+}
+
 export class DKGAgent {
   readonly wallet: AgentWallet;
   readonly node: DKGNode;
@@ -720,10 +770,51 @@ export class DKGAgent {
    */
   private readonly catchupReplayGuard = new CatchupReplayGuard();
   /**
+   * OT-RFC-38 LU-11 / OT-RFC-39 — separate replay LRU for the chunk
+   * sync verb. Kept distinct from the host-catchup guard so a single
+   * EOA's two concurrent streams (one for the LU-6 envelope catchup,
+   * one for per-chunk backfill) never collide on nonce uniqueness.
+   */
+  private readonly ciphertextChunkCatchupReplayGuard = createCiphertextChunkCatchupReplayGuard();
+  /**
    * OT-RFC-38 / LU-6 Phase B — periodic beacon re-announce timer
    * (curators only). See {@link beaconRegistry} jsdoc.
    */
   private beaconReannounceTimer?: ReturnType<typeof setInterval>;
+  /**
+   * PR feat/chain-agents-cg-phonebook — periodic agent-profile
+   * heartbeat. Re-publishes the profile to the `agents` Context
+   * Graph on `AGENT_PROFILE_HEARTBEAT_MS` cadence (operator
+   * override via `config.network.agentProfileHeartbeatMs`; `0`
+   * disables). Undefined until {@link start} runs and `null` after
+   * {@link stop} clears it.
+   */
+  private agentProfileHeartbeatTimer?: ReturnType<typeof setInterval>;
+  /**
+   * Heartbeat-tick coalescing flag. When a heartbeat is already
+   * in flight, the next tick logs + skips instead of queueing — this
+   * keeps the queue depth at 1 even if publish latency exceeds the
+   * heartbeat cadence (slow chain RPC, congested gossip mesh).
+   *
+   * NOT a correctness gate against concurrent `publishProfile()`
+   * callers — startup, key-rotation, and revocation also call
+   * `publishProfile()` directly, and they bypass this flag. The
+   * correctness gate is the `publishProfileTail` mutex below.
+   */
+  private agentProfileHeartbeatInFlight = false;
+  /**
+   * Serialization mutex for `publishProfile()`. Tail-promise chain:
+   * each new caller `await`s the prior call (success or failure) and
+   * only then runs its own publish. Codex review of PR #700 round 2
+   * flagged that the heartbeat-only inFlight guard left a race
+   * window between the heartbeat tick and the existing `startup` /
+   * key-rotation / revocation callers, both of which mutate
+   * `ProfileManager.currentKcId` and rewrite the registry triples
+   * on every call. Serializing inside `publishProfile()` covers
+   * every entry point at the lowest level instead of duplicating
+   * the guard at every caller.
+   */
+  private publishProfileTail: Promise<unknown> = Promise.resolve();
   /**
    * OT-RFC-38 / LU-6 Phase B — sliding-window rate-limiter applied
    * to pre-registration (beacon-discovered) ciphertext writes.
@@ -914,6 +1005,27 @@ export class DKGAgent {
   private readonly swmSenderKeySendStates = new Map<string, LocalSwmSenderKeySendState>();
   private readonly swmSenderKeyReceiveStates = new Map<string, LocalSwmSenderKeyReceiveState>();
   private swmSenderKeyStateLoaded = false;
+  /**
+   * PR-2 (SWM-fanout plan): pending sender-key package fanouts that
+   * landed in the "no advertised peerId" branch of
+   * `createAndDistributeSwmSenderKeyEpoch`. Keyed by lowercased
+   * `recipientAgentAddress` so the connection:open listener can drain
+   * by agent identity (the only handle we have when we minted the row
+   * without a peerId). Per-key triple `(senderAgentAddress,
+   * recipientKeyId, epochId)` deduplicates within an agent.
+   *
+   * In-memory only for now. Older epochs are evicted whenever a newer
+   * epoch is enqueued for the same `(sender, recipient)` pair — the
+   * supersession matches what the membership-hash flow already implies
+   * sender-side, and avoids the "queued package for epoch N replays
+   * after we've rolled to N+1" footgun.
+   *
+   * A future PR will plumb a SQLite-backed store through
+   * `config.swmSenderKeyStores?.pendingByAgent` so durability survives
+   * daemon restart. Today, restart loses pending rows and the next
+   * publish re-enqueues if the same member still has no peerId.
+   */
+  private readonly pendingSenderKeyByAgent = new Map<string, PendingSenderKeyEntry[]>();
 
   private constructor(
     config: DKGAgentConfig,
@@ -990,10 +1102,12 @@ export class DKGAgent {
     } else if (config.chainConfig && opKeys?.length) {
       const evmConfigBase = {
         rpcUrl: config.chainConfig.rpcUrl,
+        rpcUrls: config.chainConfig.rpcUrls,
         privateKey: opKeys[0],
         additionalKeys: opKeys.slice(1),
         hubAddress: config.chainConfig.hubAddress,
         chainId: config.chainConfig.chainId,
+        approvalPolicy: config.chainConfig.approvalPolicy,
       };
       if (config.chainConfig.adminPrivateKey) {
         chain = new EVMChainAdapter({ ...evmConfigBase, adminPrivateKey: config.chainConfig.adminPrivateKey });
@@ -1023,6 +1137,7 @@ export class DKGAgent {
       relayServerCapacity: config.relayServerCapacity,
       relayReservationCount: config.relayReservationCount,
       nodeVersion: config.nodeVersion,
+      ...pickNetworkTunables(config),
     };
 
     const node = new DKGNode(nodeConfig);
@@ -1192,6 +1307,25 @@ export class DKGAgent {
     }
 
     const network = new LibP2PNetwork(this.node);
+    // Local helper: race a lookup against an optional AbortSignal so
+    // an in-flight SPARQL query honours the resolver's outer deadline.
+    // Codex PR #499 round 5 race: re-check signal.aborted INSIDE the
+    // listener-attach Promise so we don't lose the one-shot 'abort'
+    // event between the early gate and addEventListener.
+    const raceAgainstAbort = <T>(lookup: Promise<T | null>, signal: AbortSignal | undefined): Promise<T | null> => {
+      if (!signal) return lookup;
+      return Promise.race<T | null>([
+        lookup,
+        new Promise<null>((resolve) => {
+          if (signal.aborted) {
+            resolve(null);
+            return;
+          }
+          signal.addEventListener('abort', () => resolve(null), { once: true });
+        }),
+      ]);
+    };
+
     const peerResolver = new PeerResolver({
       network,
       registry: new StubNetworkStateRegistry(),
@@ -1224,35 +1358,40 @@ export class DKGAgent {
           if (opts?.signal?.aborted) return null;
           const lookup = this.discovery.findAgentByPeerId(peerId)
             .then((agent) => agent?.relayAddress ?? null);
-          const signal = opts?.signal;
-          if (!signal) return lookup;
-          return Promise.race<string | null>([
-            lookup,
-            new Promise<null>((resolve) => {
-              // Codex PR #499 round 5 (dkg-agent.ts:1354): the early
-              // `signal.aborted` check above and `addEventListener`
-              // are not atomic — the signal could fire in between, and
-              // since `abort` is a one-shot event, our late listener
-              // would never see it and this Promise would hang for the
-              // full lookup duration. Re-check INSIDE the constructor
-              // before subscribing so the abort branch resolves
-              // immediately if we lost that race.
-              if (signal.aborted) {
-                resolve(null);
-                return;
-              }
-              signal.addEventListener(
-                'abort',
-                () => resolve(null),
-                { once: true },
-              );
-            }),
-          ]);
+          return raceAgainstAbort(lookup, opts?.signal);
+        },
+        // PR feat/chain-agents-cg-phonebook: richer lookup that
+        // returns direct multiaddrs + relayAddress + lastSeen so the
+        // resolver can prime the peerStore with current dialable
+        // addrs and filter by freshness. The resolver falls through
+        // to `findRelayForPeer` if this returns null.
+        findAgentDialAddresses: async (peerId, opts) => {
+          if (opts?.signal?.aborted) return null;
+          const lookup = this.discovery.findAgentByPeerId(peerId)
+            .then((agent) => {
+              if (!agent) return null;
+              const lastSeenMs = agent.lastSeen ? Date.parse(agent.lastSeen) : undefined;
+              return {
+                multiaddrs: agent.multiaddrs ?? [],
+                relayAddress: agent.relayAddress,
+                lastSeenMs: Number.isFinite(lastSeenMs) ? lastSeenMs : undefined,
+              };
+            });
+          return raceAgainstAbort(lookup, opts?.signal);
         },
       },
+      agentDirectoryStaleThresholdMs: AGENT_PROFILE_STALE_THRESHOLD_MS,
       // Bootstrap is a libp2p-startup concern (`bootstrap({ list })` in
       // peerDiscovery, see node.ts) — not a per-peer resolution concern.
       // Removed here per Codex review feedback on PR #496.
+      //
+      // Note: `defaultPerStepTimeoutMs` is intentionally NOT wired from
+      // operator config. Production callers (`connectToPeerId`, chat /
+      // routed sends) always pass an explicit `perStepTimeoutMs`
+      // derived from their own deadline budget, so any constructor
+      // default would be a silent no-op for those paths. The
+      // constructor option survives as a test-fixture surface.
+      // Codex review of PR #698 round 2 caught this.
     });
     this.peerResolver = peerResolver;
     this.router = new ProtocolRouter(this.node, { peerResolver });
@@ -1275,10 +1414,19 @@ export class DKGAgent {
       router: this.router,
       idempotencyStore,
       outboxStore,
+      // PR feat/chain-agents-cg-phonebook: stall-recovery now routes
+      // through the full PeerResolver instead of raw DHT findPeer.
+      // The dial fast-path (ProtocolRouter) already prefers
+      // PeerResolver.resolve() on every attempt, but the outbox
+      // stall-walk (`messenger.maybeScheduleDhtWalk`) was hardcoded
+      // to a DHT-only path — so an entry that timed out 5x because
+      // its addresses were stale couldn't recover by consulting
+      // agents-CG. Routing through PeerResolver picks up the
+      // phonebook fallback automatically; the raw findPeer call
+      // remains the step-2 DHT lookup inside resolve(), so we don't
+      // lose any pre-existing recovery path.
       resolvePeer: async (peerId, { signal }) => {
-        const { peerIdFromString } = await import('@libp2p/peer-id');
-        const pid = peerIdFromString(peerId);
-        await this.node.libp2p.peerRouting.findPeer(pid, { signal });
+        await peerResolver.resolve(peerId, { signal }).catch(() => undefined);
       },
     });
     this.gossip = new GossipSubManager(this.node, this.eventBus);
@@ -1415,6 +1563,14 @@ export class DKGAgent {
     // envelope versioning, idempotency cache, and `/api/slo` stats.
     this.messenger.register(PROTOCOL_SWM_HOST_CATCHUP, (data, fromPeerId) => this.handleSwmHostCatchup(data, fromPeerId));
 
+    // OT-RFC-38 LU-11 / OT-RFC-39: per-chunk ciphertext sync verb.
+    // Symmetric to PROTOCOL_SWM_HOST_CATCHUP but pulls one
+    // (cgId, batchId, chunkIndex) ciphertext at a time from the
+    // triple-store-backed chunk store the V2 ACK verifier reads
+    // against. Registered unconditionally — the handler itself
+    // gates by node role + per-CG authorization.
+    this.messenger.register(PROTOCOL_GET_CIPHERTEXT_CHUNK, (data, fromPeerId) => this.handleGetCiphertextChunk(data, fromPeerId));
+
     const effectiveRole = this.config.nodeRole ?? 'edge';
     const ackSignerCandidates = this.getACKSignerCandidateWallets(ctx);
     let onChainIdentityId = 0n;
@@ -1526,14 +1682,14 @@ export class DKGAgent {
             const chainIdForHandler = typeof this.chain.getEvmChainId === 'function'
               ? await this.chain.getEvmChainId()
               : undefined;
-            const kav10AddressForHandler = typeof this.chain.getKnowledgeAssetsV10Address === 'function'
-              ? await this.chain.getKnowledgeAssetsV10Address()
+            const kav10AddressForHandler = typeof this.chain.getKnowledgeAssetsLifecycleAddress === 'function'
+              ? await this.chain.getKnowledgeAssetsLifecycleAddress()
               : undefined;
             if (chainIdForHandler === undefined || kav10AddressForHandler === undefined) {
               this.log.warn(
                 attemptCtx,
                 `Skipping V10 StorageACK handler: chain adapter does not expose ` +
-                `getEvmChainId() + getKnowledgeAssetsV10Address(); handler cannot build the ` +
+                `getEvmChainId() + getKnowledgeAssetsLifecycleAddress(); handler cannot build the ` +
                 `H5-prefixed ACK digest that KnowledgeAssetsV10 verifies on-chain`,
               );
               return 'disabled';
@@ -1546,6 +1702,16 @@ export class DKGAgent {
               contextGraphSharedMemoryUri,
               chainId: chainIdForHandler,
               kav10Address: kav10AddressForHandler,
+              // Codex review (round 2) on PR #727: must NOT collapse to a
+              // plain `gossipWireIdFor` because `PublishIntent.swmGraphId`
+              // may be absent on a chunked V2 intent (the handler then
+              // falls back to the numeric `cgId`). Pass through
+              // `canonicalChunkStoreCgIdOrNull` so numeric ids resolve via
+              // the local on-chain map, and unknown shapes return null →
+              // handler widens to wildcard `GRAPH ?g` instead of pinning
+              // to a fabricated keccak-of-decimal-string.
+              normalizeContextGraphIdForChunkStore: (rawCgId: string) =>
+                this.canonicalChunkStoreCgIdOrNull(rawCgId),
               // Codex PR #608: independently verify the publisher's
               // `isEncryptedPayload=true` claim against this node's
               // local view of the CG. `isPrivateContextGraph()` is the
@@ -1638,6 +1804,7 @@ export class DKGAgent {
                 // router.register under the hood (see Messenger.register
                 // implementation), so router.unregister still removes it.
                 this.router.unregister(PROTOCOL_STORAGE_ACK);
+                this.router.unregister(PROTOCOL_STORAGE_ACK_V2);
                 this.log.warn(
                   attemptCtx,
                   `Unregistered V10 StorageACK handler: signer ${ackSignerWallet.address} ` +
@@ -1711,6 +1878,20 @@ export class DKGAgent {
             // messenger.register handles envelope decode + receiver
             // dedup; ackHandler's signature stays the same.
             this.messenger.register(PROTOCOL_STORAGE_ACK, async (data, peerIdStr) => {
+              const peerId = { toString: () => peerIdStr, toBytes: () => new Uint8Array() };
+              return ackHandler.handler(data, peerId);
+            });
+            // OT-RFC-38 LU-11 / OT-RFC-39 — V2 protocol id. Same
+            // handler instance, distinct libp2p protocol. Publishers
+            // running the chunked emit path negotiate V2 explicitly
+            // so pre-LU-11 cores (V1-only) never see a V2 envelope;
+            // the handler dispatches on `intent.ackProtocolVersion`
+            // internally — V2 envelopes hit the chunked verify
+            // branch, V1 envelopes (if any ever arrive on the V2
+            // protocol id, which spec-conforming clients won't send)
+            // fall through to the legacy single-blob / public-CG
+            // paths.
+            this.messenger.register(PROTOCOL_STORAGE_ACK_V2, async (data, peerIdStr) => {
               const peerId = { toString: () => peerIdStr, toBytes: () => new Uint8Array() };
               return ackHandler.handler(data, peerId);
             });
@@ -1949,6 +2130,34 @@ export class DKGAgent {
     // open during test teardown.
     if (typeof this.beaconReannounceTimer.unref === 'function') {
       this.beaconReannounceTimer.unref();
+    }
+
+    // PR feat/chain-agents-cg-phonebook: schedule the periodic
+    // profile heartbeat alongside the beacon timer. The one-shot
+    // startup publish happens in `lifecycle.ts` (setTimeout 0); this
+    // timer is the steady-state refresh that keeps `dkg:multiaddr` +
+    // `dkg:lastSeen` fresh for peers' dial fallback. Default 5 min;
+    // operator-tunable; `0` disables.
+    const heartbeatMs = this.config.agentProfileHeartbeatMs ?? AGENT_PROFILE_HEARTBEAT_MS;
+    if (Number.isFinite(heartbeatMs) && Number.isInteger(heartbeatMs) && heartbeatMs > 0) {
+      this.agentProfileHeartbeatTimer = setInterval(() => {
+        if (this.agentProfileHeartbeatInFlight) {
+          this.log.debug?.(ctx, 'Agent profile heartbeat skipped: previous publish still in flight');
+          return;
+        }
+        this.agentProfileHeartbeatInFlight = true;
+        this.publishProfile()
+          .catch((err) => {
+            const msg = err instanceof Error ? err.message : String(err);
+            this.log.warn(ctx, `Agent profile heartbeat publish failed: ${msg}`);
+          })
+          .finally(() => {
+            this.agentProfileHeartbeatInFlight = false;
+          });
+      }, heartbeatMs);
+      if (typeof this.agentProfileHeartbeatTimer.unref === 'function') {
+        this.agentProfileHeartbeatTimer.unref();
+      }
     }
 
     // Set up messaging
@@ -2397,6 +2606,19 @@ export class DKGAgent {
           const message = err instanceof Error ? err.message : String(err);
           this.log.warn(ctx, `Opportunistic Messenger-outbox retry on connect failed for ${remotePeer}: ${message}`);
         }
+        // PR-2 (SWM-fanout plan): drain pending sender-key packages
+        // that were queued because the recipient had no advertised
+        // peerId at publish time. Tolerant of profile-lookup failure
+        // (the next connection:open will retry).
+        try {
+          const drained = await this.drainPendingSenderKeyForPeer(remotePeer);
+          if (drained > 0) {
+            this.log.info(ctx, `Drained ${drained} pending SWM sender-key package(s) for ${remotePeer}`);
+          }
+        } catch (err: unknown) {
+          const message = err instanceof Error ? err.message : String(err);
+          this.log.warn(ctx, `Pending SWM sender-key drain on connect failed for ${remotePeer}: ${message}`);
+        }
       })();
 
       const now = Date.now();
@@ -2634,6 +2856,34 @@ export class DKGAgent {
         useWorkerThread: this.config.randomSamplingUseWorkerThread ?? true,
         tickIntervalMs: this.config.randomSamplingTickIntervalMs,
         log: this.randomSamplingLogger(ctx),
+        // OT-RFC-39 late-join sync — gives the prover an escape hatch
+        // when its tick fires on a curated KC whose ciphertext chunks
+        // never reached this core's local triple store (typically: the
+        // core was offline during the curator's publish, or joined the
+        // CG after the gossip envelopes rolled off the mesh). The hook
+        // pulls the missing chunks from authorized peers on demand via
+        // `PROTOCOL_GET_CIPHERTEXT_CHUNK` and persists them, after
+        // which the prover retries the extract exactly once. See
+        // `buildCiphertextChunkBackfill` for the discovery + fetch
+        // policy.
+        ciphertextChunkBackfill: this.buildCiphertextChunkBackfill(ctx),
+        // Codex review on PR #715 — let the prover's extractor pin
+        // the per-CG named graph instead of scanning `GRAPH ?g`. We
+        // chain `resolveLocalCgIdByOnChainId` (numeric → cleartext)
+        // then `gossipWireIdFor` (cleartext → curator nameHash, the
+        // wire form), matching what `ingestSwmCiphertextChunkEnvelope`
+        // and the V2 ACK loadChunk persist/look up under. Returns
+        // null when the local node doesn't have the CG metadata yet
+        // (chain replay still catching up); the extractor falls back
+        // to wildcard scanning for that tick, identical to pre-fix
+        // behaviour, so a missing local map degrades to "no
+        // cross-CG collision guard for this tick" rather than
+        // "extract fails outright".
+        canonicalCgIdForChunkStore: (cgId: bigint): string | null => {
+          const local = this.resolveLocalCgIdByOnChainId(cgId);
+          if (local === null) return null;
+          return this.gossipWireIdFor(local);
+        },
       });
       if (this.randomSamplingHandle && this.randomSamplingHandle !== handle) {
         try { await this.randomSamplingHandle.stop(); } catch { /* swallow bind replacement cleanup */ }
@@ -3850,6 +4100,24 @@ export class DKGAgent {
   }
 
   async publishProfile(): Promise<PublishResult> {
+    // Tail-chain serialization: every caller waits for the prior
+    // `publishProfile()` to settle (success or failure) before
+    // running its own publish. Prevents the startup / heartbeat /
+    // key-rotation / revocation paths from racing each other on
+    // `ProfileManager.currentKcId` and the registry triples.
+    // Codex review of PR #700 round 2.
+    const run = this.publishProfileTail
+      .catch(() => {
+        // swallow prior errors so a transient publish failure does
+        // not poison every subsequent publish for the lifetime of
+        // the agent
+      })
+      .then(() => this.publishProfileImpl());
+    this.publishProfileTail = run;
+    return run;
+  }
+
+  private async publishProfileImpl(): Promise<PublishResult> {
     const pubKeyBase64 = Buffer.from(this.wallet.keypair.publicKey).toString('base64');
     const relayAddrs = this.config.relayPeers;
     const defaultAgent = this.defaultAgentAddress ? this.localAgents.get(this.defaultAgentAddress) : undefined;
@@ -3892,6 +4160,8 @@ export class DKGAgent {
       publicKey: pubKeyBase64,
       relayAddress: relayAddrs?.[0],
       agentAddress: this.defaultAgentAddress,
+      multiaddrs: collectPublishableMultiaddrs(this.node.multiaddrs),
+      lastSeen: new Date().toISOString(),
       encryptionKeys: defaultAgent?.workspaceEncryptionKeys.map((k) => ({
         encryptionKeyAlgorithm: k.encryptionKeyAlgorithm,
         publicEncryptionKey: k.publicEncryptionKey,
@@ -4894,7 +5164,7 @@ export class DKGAgent {
   /**
    * Chain-confirmed verified author identity for a knowledge collection's
    * latest merkle-root entry. Reads
-   * `KnowledgeCollectionStorage.getLatestMerkleRootAuthor(kcId)` via the
+   * `KnowledgeCollectionStorage.getLatestMerkleRootAuthor(kaId)` via the
    * configured chain adapter.
    *
    * Returns:
@@ -4910,9 +5180,9 @@ export class DKGAgent {
    * "no attestation on file" from "feature unavailable" should use this
    * `null` signal — `address(0)` always means the former.
    */
-  async getKnowledgeCollectionAuthor(kcId: bigint): Promise<string | null> {
+  async getKnowledgeCollectionAuthor(kaId: bigint): Promise<string | null> {
     if (typeof this.chain.getLatestMerkleRootAuthor !== 'function') return null;
-    return this.chain.getLatestMerkleRootAuthor(kcId);
+    return this.chain.getLatestMerkleRootAuthor(kaId);
   }
 
   /** V10 Publishing Conviction NFT facade — thin chain-adapter wrappers.
@@ -5610,93 +5880,162 @@ export class DKGAgent {
     // (the recipient daemon has no matching local privkey for them) — that's
     // expected, not a hard error. We only abort when EVERY key for a given
     // agent failed.
-    const failuresByAgent = new Map<string, string[]>();
-    const successByAgent = new Set<string>();
-    const recordFailure = (agent: string, keyId: string, err: unknown) => {
-      const msg = err instanceof Error ? err.message : String(err);
-      const key = agent.toLowerCase();
-      const list = failuresByAgent.get(key) ?? [];
-      list.push(`${keyId}: ${msg}`);
-      failuresByAgent.set(key, list);
-    };
+    //
+    // Fanout runs in parallel via Promise.allSettled. The pre-rc.12 loop
+    // awaited each `messenger.sendReliable` sequentially, so foreground
+    // publish latency scaled as `O(n_recipients × n_keys × send_timeout)` —
+    // a single offline member paid the full per-send timeout before the
+    // loop advanced. Concurrent fanout keeps the wall-clock cost bounded
+    // by the slowest individual send (~`DEFAULT_SEND_TIMEOUT_MS`).
+    //
+    // Concurrent mutation is moot: each per-recipient async closure runs
+    // on the single JS event loop and yields only at `await` points; the
+    // aggregation maps are appended to ONLY in the post-settle pass below.
+    type PerRecipientOutcome =
+      | { kind: 'success'; agentAddress: string }
+      | { kind: 'failure'; agentAddress: string; keyId: string; error: Error };
 
-    for (const recipient of input.recipients) {
-      const recipientAgentAddress = ethers.getAddress(recipient.agentAddress);
-      const pkg = await this.createSignedSwmSenderKeyPackage({
-        state,
-        recipient,
-        senderPrivateKey: input.sender.privateKey,
-      });
+    const settled = await Promise.allSettled(
+      input.recipients.map(async (recipient): Promise<PerRecipientOutcome> => {
+        const recipientAgentAddress = ethers.getAddress(recipient.agentAddress);
+        const pkg = await this.createSignedSwmSenderKeyPackage({
+          state,
+          recipient,
+          senderPrivateKey: input.sender.privateKey,
+        });
 
-      const isLocalRecipient = this.hasLocalAgent(recipientAgentAddress);
-      if (isLocalRecipient) {
-        try {
-          await this.acceptSwmSenderKeyPackage(pkg, this.node.peerId.toString(), input.ctx);
-          successByAgent.add(recipientAgentAddress.toLowerCase());
-        } catch (err) {
-          recordFailure(recipientAgentAddress, recipient.recipientKeyId, err);
+        if (this.hasLocalAgent(recipientAgentAddress)) {
+          try {
+            await this.acceptSwmSenderKeyPackage(pkg, this.node.peerId.toString(), input.ctx);
+            return { kind: 'success', agentAddress: recipientAgentAddress };
+          } catch (err) {
+            return {
+              kind: 'failure',
+              agentAddress: recipientAgentAddress,
+              keyId: recipient.recipientKeyId,
+              error: err instanceof Error ? err : new Error(String(err)),
+            };
+          }
         }
-        continue;
-      }
 
-      if (!recipient.peerId) {
-        recordFailure(recipientAgentAddress, recipient.recipientKeyId, new Error('no advertised peerId'));
-        continue;
-      }
-
-      this.log.info(
-        input.ctx,
-        `SWM sender-key setup send: senderAgent=${senderAgentAddress} recipientAgent=${recipientAgentAddress} ` +
-        `peerId=${recipient.peerId} contextGraph=${state.contextGraphId}${state.subGraphName ? `/${state.subGraphName}` : ''} ` +
-        `epoch=${state.epochId} membershipHash=${state.membershipHash} recipientKeyId=${recipient.recipientKeyId}`,
-      );
-      try {
-        // rc.9 PR-8: route through messenger.sendReliable so
-        // sender-side idempotency + durable outbox + retry-with-
-        // backoff cover this protocol the same way they cover chat.
-        //
-        // Delivery semantics (C2 integration-pass relaxation):
-        //   • `delivered=true && ack.accepted=true`  → success.
-        //   • `delivered=true && ack.accepted=false` → HARD failure
-        //     (recipient explicitly rejected the package — bad key,
-        //     bad membership hash, etc; queuing won't help).
-        //   • `delivered=false`                      → SOFT success.
-        //     The setup-package landed in the messenger's durable
-        //     outbox and will be replayed when the recipient comes
-        //     back online. Treating this as a hard failure used to
-        //     block any open-publish-CG write whenever the curator
-        //     was offline mid-batch, breaking the "members keep
-        //     publishing under intermittent curator availability"
-        //     contract C2 exercises. The recipient still gets the
-        //     epoch + chain key eventually; the only cost is that
-        //     they can't decrypt the broadcast that immediately
-        //     follows until the queued setup catches up.
-        const sendResult = await this.messenger.sendReliable(
-          recipient.peerId,
-          PROTOCOL_SWM_SENDER_KEY,
-          encodeSwmSenderKeyPackage(pkg),
-        );
-        if (!sendResult.delivered) {
+        if (!recipient.peerId) {
+          // PR-2 (SWM-fanout plan): the recipient agent has no advertised
+          // `dkg:peerId` triple in our local store (typically because we
+          // haven't synced their profile yet, or they really were never
+          // online). Pre-PR-2 this was a HARD failure for that key, and
+          // if every key for the agent landed here the whole publish
+          // threw — turning "one never-seen member" into "publish blocked
+          // for everyone". We now match the messenger.sendReliable
+          // soft-success contract: durably remember the package and
+          // attempt delivery once the agent shows up (via the
+          // connection:open drain below).
+          this.enqueuePendingSenderKey({
+            senderAgentAddress: senderAgentAddress.toLowerCase(),
+            recipientAgentAddress: recipientAgentAddress.toLowerCase(),
+            recipientKeyId: recipient.recipientKeyId,
+            epochId: state.epochId,
+            contextGraphId: state.contextGraphId,
+            subGraphName: state.subGraphName,
+            packageBytes: encodeSwmSenderKeyPackage(pkg),
+            createdAtMs: Date.now(),
+          });
           this.log.warn(
             input.ctx,
             `SWM sender-key setup for ${recipientAgentAddress} keyId=${recipient.recipientKeyId} ` +
-            `queued (not synchronously deliverable): ${sendResult.error} — recipient will receive on next reconnect`,
+            `queued (no advertised peerId) — will deliver when recipient connects`,
           );
-          successByAgent.add(recipientAgentAddress.toLowerCase());
-          continue;
+          return { kind: 'success', agentAddress: recipientAgentAddress };
         }
-        const ack = decodeSwmSenderKeyPackageAck(sendResult.response);
-        if (
-          ack.version !== SWM_SENDER_KEY_PACKAGE_VERSION ||
-          ack.type !== SWM_SENDER_KEY_PACKAGE_ACK_TYPE ||
-          !ack.accepted
-        ) {
-          recordFailure(recipientAgentAddress, recipient.recipientKeyId, new Error(ack.reason ?? 'unknown reason'));
-        } else {
-          successByAgent.add(recipientAgentAddress.toLowerCase());
+
+        this.log.info(
+          input.ctx,
+          `SWM sender-key setup send: senderAgent=${senderAgentAddress} recipientAgent=${recipientAgentAddress} ` +
+          `peerId=${recipient.peerId} contextGraph=${state.contextGraphId}${state.subGraphName ? `/${state.subGraphName}` : ''} ` +
+          `epoch=${state.epochId} membershipHash=${state.membershipHash} recipientKeyId=${recipient.recipientKeyId}`,
+        );
+        try {
+          // rc.9 PR-8: route through messenger.sendReliable so
+          // sender-side idempotency + durable outbox + retry-with-
+          // backoff cover this protocol the same way they cover chat.
+          //
+          // Delivery semantics (C2 integration-pass relaxation):
+          //   • `delivered=true && ack.accepted=true`  → success.
+          //   • `delivered=true && ack.accepted=false` → HARD failure
+          //     (recipient explicitly rejected the package — bad key,
+          //     bad membership hash, etc; queuing won't help).
+          //   • `delivered=false`                      → SOFT success.
+          //     The setup-package landed in the messenger's durable
+          //     outbox and will be replayed when the recipient comes
+          //     back online. Treating this as a hard failure used to
+          //     block any open-publish-CG write whenever the curator
+          //     was offline mid-batch, breaking the "members keep
+          //     publishing under intermittent curator availability"
+          //     contract C2 exercises. The recipient still gets the
+          //     epoch + chain key eventually; the only cost is that
+          //     they can't decrypt the broadcast that immediately
+          //     follows until the queued setup catches up.
+          const sendResult = await this.messenger.sendReliable(
+            recipient.peerId,
+            PROTOCOL_SWM_SENDER_KEY,
+            encodeSwmSenderKeyPackage(pkg),
+          );
+          if (!sendResult.delivered) {
+            this.log.warn(
+              input.ctx,
+              `SWM sender-key setup for ${recipientAgentAddress} keyId=${recipient.recipientKeyId} ` +
+              `queued (not synchronously deliverable): ${sendResult.error} — recipient will receive on next reconnect`,
+            );
+            return { kind: 'success', agentAddress: recipientAgentAddress };
+          }
+          const ack = decodeSwmSenderKeyPackageAck(sendResult.response);
+          if (
+            ack.version !== SWM_SENDER_KEY_PACKAGE_VERSION ||
+            ack.type !== SWM_SENDER_KEY_PACKAGE_ACK_TYPE ||
+            !ack.accepted
+          ) {
+            return {
+              kind: 'failure',
+              agentAddress: recipientAgentAddress,
+              keyId: recipient.recipientKeyId,
+              error: new Error(ack.reason ?? 'unknown reason'),
+            };
+          }
+          return { kind: 'success', agentAddress: recipientAgentAddress };
+        } catch (err) {
+          return {
+            kind: 'failure',
+            agentAddress: recipientAgentAddress,
+            keyId: recipient.recipientKeyId,
+            error: err instanceof Error ? err : new Error(String(err)),
+          };
         }
-      } catch (err) {
-        recordFailure(recipientAgentAddress, recipient.recipientKeyId, err);
+      }),
+    );
+
+    const failuresByAgent = new Map<string, string[]>();
+    const successByAgent = new Set<string>();
+    for (let i = 0; i < settled.length; i++) {
+      const r = settled[i];
+      if (r.status === 'rejected') {
+        // The per-recipient closure catches all throw paths and returns a
+        // failure outcome, so a rejection here means the closure itself
+        // crashed (programmer error). Record it against the recipient so
+        // the surrounding logic doesn't lose track of the slot.
+        const recipient = input.recipients[i];
+        const agent = ethers.getAddress(recipient.agentAddress).toLowerCase();
+        const list = failuresByAgent.get(agent) ?? [];
+        list.push(`${recipient.recipientKeyId}: ${String(r.reason)}`);
+        failuresByAgent.set(agent, list);
+        continue;
+      }
+      const outcome = r.value;
+      if (outcome.kind === 'success') {
+        successByAgent.add(outcome.agentAddress.toLowerCase());
+      } else {
+        const agent = outcome.agentAddress.toLowerCase();
+        const list = failuresByAgent.get(agent) ?? [];
+        list.push(`${outcome.keyId}: ${outcome.error.message}`);
+        failuresByAgent.set(agent, list);
       }
     }
 
@@ -5720,6 +6059,100 @@ export class DKGAgent {
     }
 
     return state;
+  }
+
+  /**
+   * PR-2 (SWM-fanout plan): enqueue a sender-key package whose recipient
+   * has no advertised `dkg:peerId` (so we can't even ask the messenger
+   * to queue it). Older epochs for the same `(sender, recipient)` pair
+   * are evicted — a newer epoch supersedes them by definition.
+   *
+   * Per-key dedup: `(senderAgentAddress, recipientKeyId, epochId)`
+   * matches an existing row, we replace it (idempotent re-enqueue).
+   */
+  private enqueuePendingSenderKey(entry: PendingSenderKeyEntry): void {
+    const recipientKey = entry.recipientAgentAddress.toLowerCase();
+    const existing = this.pendingSenderKeyByAgent.get(recipientKey) ?? [];
+    // Drop older epochs for the same (sender, recipient) pair; the newer
+    // epoch's membership-hash supersedes them. Keep entries for OTHER
+    // senders / recipients unchanged.
+    const filtered = existing.filter((e) => {
+      if (e.senderAgentAddress !== entry.senderAgentAddress) return true;
+      if (e.epochId === entry.epochId) {
+        // Same epoch: dedupe by recipientKeyId — caller may re-enqueue
+        // on retry. Replace by dropping the old slot; the new one is
+        // appended below.
+        return e.recipientKeyId !== entry.recipientKeyId;
+      }
+      return false;
+    });
+    filtered.push(entry);
+    this.pendingSenderKeyByAgent.set(recipientKey, filtered);
+  }
+
+  /**
+   * Drain queued sender-key packages whose recipient agent is one of
+   * the agent addresses advertised by `peerId`. Returns the number of
+   * rows successfully delivered (acked) and removed.
+   *
+   * Fired from the `connection:open` listener — see line 2382 — so the
+   * cost lives on the cold path of "we just connected to a new peer",
+   * not on every share. Each successful `sendReliable` with
+   * `delivered=true && ack.accepted=true` deletes the row; soft
+   * (`delivered=false`) leaves it queued for the next attempt; hard
+   * negative acks also delete it (the package is permanently invalid
+   * for this recipient).
+   */
+  private async drainPendingSenderKeyForPeer(peerId: string): Promise<number> {
+    if (this.pendingSenderKeyByAgent.size === 0) return 0;
+    let drained = 0;
+    let agentAddresses: string[] = [];
+    try {
+      const profile = await this.discovery.findAgentByPeerId(peerId);
+      if (profile?.agentAddress) {
+        agentAddresses = [profile.agentAddress.toLowerCase()];
+      }
+    } catch {
+      // Resolution failure is benign — we'll try again on the next
+      // connection:open burst. Don't propagate.
+    }
+    if (agentAddresses.length === 0) return 0;
+
+    for (const recipientAgentAddress of agentAddresses) {
+      const queue = this.pendingSenderKeyByAgent.get(recipientAgentAddress);
+      if (!queue || queue.length === 0) continue;
+      const remaining: PendingSenderKeyEntry[] = [];
+      for (const entry of queue) {
+        try {
+          const sendResult = await this.messenger.sendReliable(
+            peerId,
+            PROTOCOL_SWM_SENDER_KEY,
+            entry.packageBytes,
+          );
+          if (!sendResult.delivered) {
+            // Messenger queued for retry — keep our row so the next
+            // connection:open / publish has another shot.
+            remaining.push(entry);
+            continue;
+          }
+          // Both accepted=true and accepted=false are terminal: the
+          // recipient saw the package. Don't retry — the messenger's
+          // idempotency key would block re-delivery anyway.
+          drained += 1;
+        } catch {
+          // Wire error: keep the row queued. Next connection:open
+          // attempt has its own try/catch wrapper so this never
+          // propagates out of the listener.
+          remaining.push(entry);
+        }
+      }
+      if (remaining.length === 0) {
+        this.pendingSenderKeyByAgent.delete(recipientAgentAddress);
+      } else {
+        this.pendingSenderKeyByAgent.set(recipientAgentAddress, remaining);
+      }
+    }
+    return drained;
   }
 
   private async createSignedSwmSenderKeyPackage(input: {
@@ -6842,14 +7275,14 @@ export class DKGAgent {
   ): Promise<LiftRequestAuthorSeal | undefined> {
     if (this.chain.isV10Ready?.() !== true) return undefined;
     if (typeof this.chain.getEvmChainId !== 'function') return undefined;
-    if (typeof this.chain.getKnowledgeAssetsV10Address !== 'function') return undefined;
+    if (typeof this.chain.getKnowledgeAssetsLifecycleAddress !== 'function') return undefined;
 
     const onChainId = await this.getContextGraphOnChainId(request.contextGraphId);
     if (onChainId == null) return undefined; // CG not on-chain — publisher goes tentative
 
 
     const chainId = await this.chain.getEvmChainId();
-    const kav10Address = await this.chain.getKnowledgeAssetsV10Address();
+    const kav10Address = await this.chain.getKnowledgeAssetsLifecycleAddress();
     if (chainId === undefined || kav10Address === undefined) return undefined;
 
     const graphManager = new GraphManager(this.store);
@@ -6969,7 +7402,7 @@ export class DKGAgent {
     if (
       onChainId != null &&
       typeof this.chain.getEvmChainId === 'function' &&
-      typeof this.chain.getKnowledgeAssetsV10Address === 'function'
+      typeof this.chain.getKnowledgeAssetsLifecycleAddress === 'function'
     ) {
       try {
         precomputedAttestation = await this._buildPrecomputedAttestationForSelection(
@@ -7014,6 +7447,17 @@ export class DKGAgent {
       undefined,
       onChainId ?? undefined,
     );
+    // OT-RFC-38 LU-11 — also resolve the chunked emitter for curated
+    // CGs. When set, the publisher prefers this path: chunks fan out
+    // via SWM gossip and the V2 ACK carries only the commitment.
+    // Public CGs short-circuit to `undefined` here just like the
+    // single-blob resolver above.
+    const encryptInlineChunked = await this._resolveEncryptInlineChunked(
+      contextGraphId,
+      opts?.subGraphName,
+      undefined,
+      onChainId ?? undefined,
+    );
 
     const result = await this.publisher.publish({
       contextGraphId,
@@ -7029,30 +7473,55 @@ export class DKGAgent {
       publishContextGraphId: onChainId ?? undefined,
       precomputedAttestation,
       encryptInlinePayload,
+      encryptInlineChunked,
     });
 
     onPhase?.('broadcast', 'start');
     this.log.info(ctx, `Local publish complete, broadcasting to peers`);
     await this.broadcastPublish(contextGraphId, result, ctx);
     onPhase?.('broadcast', 'end');
-    this.log.info(ctx, `Publish complete — status=${result.status} kcId=${result.kcId}`);
+    this.log.info(ctx, `Publish complete — status=${result.status} kaId=${result.kaId}`);
     return result;
   }
 
   async update(
-    kcId: bigint, contextGraphId: string, quads: Quad[], privateQuads?: Quad[],
-    opts?: { onPhase?: PhaseCallback; operationCtx?: OperationContext },
+    kaId: bigint, contextGraphId: string, quads: Quad[], privateQuads?: Quad[],
+    opts?: {
+      onPhase?: PhaseCallback;
+      operationCtx?: OperationContext;
+      precomputedUpdateAttestation?: PublishOptions['precomputedUpdateAttestation'];
+    },
   ): Promise<PublishResult> {
     const ctx = opts?.operationCtx ?? createOperationContext('update');
     const onPhase = opts?.onPhase;
-    this.log.info(ctx, `Starting update of kcId=${kcId} in context graph "${contextGraphId}" with ${quads.length} triples`);
-    const result = await this.publisher.update(kcId, {
+    this.log.info(ctx, `Starting update of kaId=${kaId} in context graph "${contextGraphId}" with ${quads.length} triples`);
+    // GH #842: thread the on-chain cgId so the publisher can promote the update
+    // payload into the per-cgId partition the RS prover reads. Without it,
+    // updated KAs stay unprovable (data-corrupted / leaf-count-mismatch).
+    // Best-effort: a store/ontology failure here must NOT abort the on-chain
+    // update — the RS sync is a downstream concern and the unguarded await
+    // would let any local lookup error tank the entire update RPC (Codex
+    // review #3 on PR #845).
+    let updateOnChainId: string | null = null;
+    try {
+      updateOnChainId = await this.getContextGraphOnChainId(contextGraphId);
+    } catch (err) {
+      this.log.warn(
+        ctx,
+        `Failed to resolve on-chain cgId for "${contextGraphId}" prior to update; per-cgId RS promotion will be skipped: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+    const result = await this.publisher.update(kaId, {
       contextGraphId,
       quads,
       privateQuads,
       publisherPeerId: this.node.peerId.toString(),
+      publishContextGraphId: updateOnChainId ?? undefined,
       operationCtx: ctx,
       onPhase,
+      precomputedUpdateAttestation: opts?.precomputedUpdateAttestation,
     });
     this.log.info(ctx, `Update complete — status=${result.status}`);
 
@@ -7066,7 +7535,7 @@ export class DKGAgent {
         const nquadsBytes = new TextEncoder().encode(nquadsStr);
         const message = encodeKAUpdateRequest({
           contextGraphId: contextGraphId,
-          batchId: kcId,
+          batchId: kaId,
           nquads: nquadsBytes,
           manifest: result.kaManifest.map((m) => ({
             rootEntity: m.rootEntity,
@@ -7083,7 +7552,7 @@ export class DKGAgent {
         });
         const topic = contextGraphUpdateTopic(contextGraphId);
         await this.gossip.publish(topic, message);
-        this.log.info(ctx, `Broadcast KA update for batchId=${kcId} on ${topic}`);
+        this.log.info(ctx, `Broadcast KA update for batchId=${kaId} on ${topic}`);
       } catch (err) {
         this.log.warn(ctx, `Failed to broadcast KA update: ${err instanceof Error ? err.message : String(err)}`);
       }
@@ -7466,15 +7935,15 @@ export class DKGAgent {
     //    `(chainId, kav10Address)` pair — both must be available.
     if (
       typeof this.chain.getEvmChainId !== 'function' ||
-      typeof this.chain.getKnowledgeAssetsV10Address !== 'function'
+      typeof this.chain.getKnowledgeAssetsLifecycleAddress !== 'function'
     ) {
       throw new Error(
         'assertionFinalize requires a V10-capable chain adapter that exposes ' +
-          'getEvmChainId() and getKnowledgeAssetsV10Address(); the current adapter does not.',
+          'getEvmChainId() and getKnowledgeAssetsLifecycleAddress(); the current adapter does not.',
       );
     }
     const chainId = await this.chain.getEvmChainId();
-    const kav10Address = await this.chain.getKnowledgeAssetsV10Address();
+    const kav10Address = await this.chain.getKnowledgeAssetsLifecycleAddress();
 
     // 6. Resolve the on-chain CG id — the EIP-712 digest binds to it.
     const onChainCgId = await this.requireOnChainContextGraphId(contextGraphId);
@@ -7705,11 +8174,11 @@ export class DKGAgent {
     }
     if (
       typeof this.chain.getEvmChainId !== 'function' ||
-      typeof this.chain.getKnowledgeAssetsV10Address !== 'function'
+      typeof this.chain.getKnowledgeAssetsLifecycleAddress !== 'function'
     ) {
       throw new Error(
         'Selection-based VM publish requires a V10-capable chain adapter that exposes ' +
-          'getEvmChainId() and getKnowledgeAssetsV10Address().',
+          'getEvmChainId() and getKnowledgeAssetsLifecycleAddress().',
       );
     }
 
@@ -7739,7 +8208,7 @@ export class DKGAgent {
     const merkleRoot = computeFlatKCRoot(allSkolemizedQuads, privateRoots);
 
     const chainId = await this.chain.getEvmChainId();
-    const kav10Address = await this.chain.getKnowledgeAssetsV10Address();
+    const kav10Address = await this.chain.getKnowledgeAssetsLifecycleAddress();
     const onChainCgId =
       opts?.targetOnChainCgId !== undefined
         ? BigInt(opts.targetOnChainCgId)
@@ -7876,33 +8345,27 @@ export class DKGAgent {
    * NO_DATA_IN_SWM (same observable as today, the §1.1 bug). The
    * agent surfaces a warn so operators see the configuration miss.
    */
-  private async _resolveEncryptInlinePayload(
+  /**
+   * Shared resolution between LU-5 (`_resolveEncryptInlinePayload`) and
+   * LU-11 (`_resolveEncryptInlineChunked`). Probes the access policy,
+   * bootstraps / rotates the swm-sender-key epoch, and returns the
+   * effective `chainKey` + AEAD CG-id binding. Returns `undefined` for
+   * public CGs so the caller stays on the plaintext-inline path.
+   *
+   * The original LU-5 method body lived inline here pre-LU-11; pulling
+   * it into a helper avoided drifting two near-identical curated-
+   * probe / epoch-rotation blocks once chunked emission joined the
+   * picture. All semantics (probe order, rotation triggers, fail-
+   * closed branches, error texts) are preserved.
+   */
+  private async _resolveCuratedChainKeyContext(
     contextGraphId: string,
-    subGraphName?: string,
-    authorAgentAddress?: string,
-    publishContextGraphId?: string,
-  ): Promise<((plaintext: Uint8Array) => Promise<Uint8Array>) | undefined> {
+    subGraphName: string | undefined,
+    authorAgentAddress: string | undefined,
+    publishContextGraphId: string | undefined,
+    logPrefix: string,
+  ): Promise<{ chainKey: Uint8Array; aeadCgId: string; senderAddress: string } | undefined> {
     const ctx = createOperationContext('publish');
-    // Codex PR #608 R4 #7375: the encryption decision must be keyed
-    // off the TARGET on-chain CG, not the source SWM graph. On remap
-    // publishes (`publishContextGraphId` differs from the local SWM
-    // `contextGraphId`), the prior source-only probe produced two
-    // distinct failure modes:
-    //
-    //   public source → curated target: skipped encryption → plaintext
-    //     leaked to the curated target's ACK peers (security).
-    //   private source → public target: applied encryption → core's
-    //     `isCgCurated` check (R3 #1325, now target-keyed) correctly
-    //     rejected the opaque ACK → publish blocked (correctness).
-    //
-    // The probe mirrors the SWM data-plane `isCgCurated` callback at
-    // line 1499: local meta-graph first (works for URL-style ids the
-    // local store knows about), then chain access-policy fallback
-    // for numeric on-chain ids (covers the C2 case where the target
-    // is just the numeric `cgId` from the publish intent and the
-    // local store has no triple keyed by that id). Numeric IDs are
-    // chain-owned; if chain truth is unavailable, return UNKNOWN and
-    // fail closed instead of silently publishing plaintext.
     const targetCgId = publishContextGraphId ?? contextGraphId;
     const probeIsCurated = async (cgId: string): Promise<boolean | null> => {
       try {
@@ -7919,10 +8382,6 @@ export class DKGAgent {
       if (numericId <= 0n) return false;
       const getAccessPolicy = this.chain.getContextGraphAccessPolicy;
       if (typeof getAccessPolicy !== 'function') {
-        // Numeric ids are chain-owned policy surfaces. If the adapter
-        // cannot expose chain truth, choosing plaintext would risk a
-        // curated-target leak, so keep the UNKNOWN path and let the
-        // caller fail closed below.
         return null;
       }
       try {
@@ -7933,7 +8392,7 @@ export class DKGAgent {
         }
         return null;
       } catch (err) {
-        this.log.warn(ctx, `_resolveEncryptInlinePayload: chain.getContextGraphAccessPolicy(${cgId}) failed — treating as UNKNOWN (fail-closed): ${err instanceof Error ? err.message : String(err)}`);
+        this.log.warn(ctx, `${logPrefix}: chain.getContextGraphAccessPolicy(${cgId}) failed — treating as UNKNOWN (fail-closed): ${err instanceof Error ? err.message : String(err)}`);
       }
       return null;
     };
@@ -7943,19 +8402,15 @@ export class DKGAgent {
       : await probeIsCurated(targetCgId);
     if (targetIsCurated == null || (targetCgId !== contextGraphId && sourceIsCurated == null)) {
       throw new Error(
-        `LU-5: publish access-policy is unknown — ` +
+        `${logPrefix}: publish access-policy is unknown — ` +
         `source CG "${contextGraphId}" curated=${sourceIsCurated ?? 'unknown'}, ` +
         `target CG "${targetCgId}" curated=${targetIsCurated ?? 'unknown'}. ` +
         `Refusing to choose plaintext vs encrypted inline payload without chain-confirmed policy.`,
       );
     }
     if (targetCgId !== contextGraphId && sourceIsCurated !== targetIsCurated) {
-      // Fail-closed: a remap publish that crosses the privacy
-      // boundary in either direction is almost certainly an
-      // operator/caller mistake. Refuse rather than silently picking
-      // one side and producing the wrong wire shape.
       throw new Error(
-        `LU-5: remap publish source/target access-policy mismatch — ` +
+        `${logPrefix}: remap publish source/target access-policy mismatch — ` +
         `source CG "${contextGraphId}" curated=${sourceIsCurated}, ` +
         `target CG "${targetCgId}" curated=${targetIsCurated}. ` +
         `Refusing to publish: encrypting against the wrong CG's policy ` +
@@ -7970,45 +8425,32 @@ export class DKGAgent {
       ?? this.defaultAgentAddress
       ?? this.peerId;
 
-    // Codex PR #608 R3 #7: mirror the rotation contract from
-    // `encryptWorkspacePayloadWithSenderKey` — always load persisted
-    // state FIRST so a daemon restart reuses the existing epoch
-    // instead of minting a new one, and ALWAYS recompute the current
-    // membership hash so an allowlist change forces an epoch
-    // rotation. The prior implementation only entered the bootstrap
-    // branch when the in-memory map happened to be empty AND never
-    // compared the current membership against the cached state, so
-    // (a) every restart silently rotated and (b) revocations /
-    // additions kept reusing a stale epoch until the next manual
-    // SWM write through `share()`.
     await this.loadSwmSenderKeyState();
     const sender = this.getLocalSigningAgentForAddress(senderAddress);
     if (!sender) {
       throw new Error(
-        `LU-5: curated CG ${contextGraphId}: cannot bootstrap swm-sender-key — ` +
+        `${logPrefix}: curated CG ${contextGraphId}: cannot bootstrap swm-sender-key — ` +
         `no local custodial signing key for agent ${senderAddress}. ` +
         `Refusing to publish curated CG payload via the plaintext-inline fallback.`,
       );
     }
     const resolution = await resolveWorkspaceAgentRecipients(this.store, { contextGraphId });
     if (!resolution.requiresEncryption) {
-      // Access policy lookup said curated, but the recipient resolver
-      // disagrees. Conservative: refuse rather than silently downgrade.
       throw new Error(
-        `LU-5: curated CG ${contextGraphId}: access-policy says curated but recipient resolver ` +
+        `${logPrefix}: curated CG ${contextGraphId}: access-policy says curated but recipient resolver ` +
         `returned no agent recipients. Refusing to publish to avoid plaintext leak.`,
       );
     }
     if (resolution.recipients.length === 0) {
       throw new Error(
-        `LU-5: curated CG ${contextGraphId}: no DKG agent recipients available — ` +
+        `${logPrefix}: curated CG ${contextGraphId}: no DKG agent recipients available — ` +
         `add at least one allowed agent before publishing.`,
       );
     }
     const recipientSet = new Set(resolution.recipients.map((r) => r.agentAddress.toLowerCase()));
     if (!recipientSet.has(ethers.getAddress(senderAddress).toLowerCase())) {
       throw new Error(
-        `LU-5: curated CG ${contextGraphId}: sender ${senderAddress} is not in the recipient set — ` +
+        `${logPrefix}: curated CG ${contextGraphId}: sender ${senderAddress} is not in the recipient set — ` +
         `add yourself to the allowedAgents before publishing.`,
       );
     }
@@ -8029,7 +8471,7 @@ export class DKGAgent {
         : `membership changed (was=${state.membershipHash} now=${membershipHash})`;
       this.log.info(
         ctx,
-        `LU-5: bootstrapping/rotating swm-sender-key epoch for curated CG ${contextGraphId} ` +
+        `${logPrefix}: bootstrapping/rotating swm-sender-key epoch for curated CG ${contextGraphId} ` +
         `(sender=${senderAddress}, recipients=${resolution.recipients.length}, reason=${reason})`,
       );
       state = await this.createAndDistributeSwmSenderKeyEpoch({
@@ -8044,21 +8486,172 @@ export class DKGAgent {
       await this.saveSwmSenderKeyState();
     }
 
-    const chainKey = state.chainKey;
-    // Codex PR #608 R2 #12: the AEAD key must be derived from the
-    // *target* on-chain CG id (the one the published KC is bound to
-    // on chain) — not the source SWM CG id. On remap publishes
-    // (where the source `contextGraphId` differs from the target
-    // `publishContextGraphId`/`onChainId`), consumers verifying the
-    // KC use the canonical on-chain id; if we derive with the
-    // source id here, every consumer's decrypt fails.
-    const aeadCgId = publishContextGraphId ?? contextGraphId;
+    return {
+      chainKey: state.chainKey,
+      aeadCgId: publishContextGraphId ?? contextGraphId,
+      senderAddress,
+    };
+  }
+
+  private async _resolveEncryptInlinePayload(
+    contextGraphId: string,
+    subGraphName?: string,
+    authorAgentAddress?: string,
+    publishContextGraphId?: string,
+  ): Promise<((plaintext: Uint8Array) => Promise<Uint8Array>) | undefined> {
+    const resolved = await this._resolveCuratedChainKeyContext(
+      contextGraphId, subGraphName, authorAgentAddress, publishContextGraphId, 'LU-5',
+    );
+    if (!resolved) return undefined;
+    const { chainKey, aeadCgId } = resolved;
     return async (plaintextNquads: Uint8Array): Promise<Uint8Array> => {
       return encryptV10PublishPayload({
         chainKey,
         contextGraphId: aeadCgId,
         plaintext: plaintextNquads,
       });
+    };
+  }
+
+  /**
+   * OT-RFC-38 LU-11 / OT-RFC-39 — produce the chunked-AEAD inline
+   * callback for curated CGs. Returns `undefined` for public CGs so
+   * the LU-5 callback (also resolved unconditionally for curated CGs)
+   * stays as the only path.
+   *
+   * The returned closure does THREE things on the publish hot path:
+   *
+   *   1. slice plaintext into `CIPHERTEXT_CHUNK_SIZE_BYTES`-sized
+   *      pieces (last chunk smaller),
+   *   2. AEAD-encrypt each chunk with a publish-operation-deterministic
+   *      nonce (`deriveChunkNonce(publishOperationId, chunkIndex)`) so
+   *      retries produce bit-identical ciphertext and idempotent SWM
+   *      writes (idempotency is the spec's only protection against double-
+   *      gossip racing the on-chain commitment), while distinct publish
+   *      attempts rotate the AEAD nonce domain even if they share the
+   *      same merkle root,
+   *   3. fan each ciphertext chunk out as a V2 SWM gossip envelope
+   *      (`type = 'share-write-chunked'`, `swmMessageIndex = i`,
+   *      payload = `[batchId(32)][ct_i]`) on the curated CG's
+   *      workspace topic — so hosting cores (RFC-38 LU-6 host-mode)
+   *      persist the bytes opaquely keyed by
+   *      `(cgId, batchId, swmMessageIndex)` and members decrypt
+   *      locally with the same chainKey they already hold.
+   *
+   * The returned `ciphertextChunksRoot` is the keccak256 root over
+   * `keccak256(ct_i)` leaves in `swmMessageIndex` order (see
+   * `buildCiphertextChunksRoot` in `@origintrail-official/dkg-core`).
+   * That same root lands on-chain via
+   * `KnowledgeAssetsV10.PublishParams.ciphertextChunksRoot` and binds
+   * the SWM-gossiped bytes to the chain commitment — RFC-39 random
+   * sampling samples `(cgId, batchId, chunkId)` against this root.
+   */
+  private async _resolveEncryptInlineChunked(
+    contextGraphId: string,
+    subGraphName?: string,
+    authorAgentAddress?: string,
+    publishContextGraphId?: string,
+  ): Promise<
+    | ((input: { plaintextNquads: Uint8Array; batchId: Uint8Array; publishOperationId: string }) => Promise<{
+        ciphertextChunksRoot: Uint8Array;
+        ciphertextChunkCount: number;
+        totalCiphertextBytes: number;
+      }>)
+    | undefined
+  > {
+    const resolved = await this._resolveCuratedChainKeyContext(
+      contextGraphId, subGraphName, authorAgentAddress, publishContextGraphId, 'LU-11',
+    );
+    if (!resolved) return undefined;
+    const { chainKey, aeadCgId } = resolved;
+    const wireCgId = this.gossipWireIdFor(contextGraphId);
+    const topic = contextGraphWorkspaceTopic(wireCgId);
+    const signer = await this.resolveWorkspaceGossipSigningAgent(contextGraphId);
+    if (!signer) {
+      throw new Error(
+        `LU-11: curated CG ${contextGraphId}: cannot resolve a workspace-gossip signing agent — ` +
+        `cores reject unsigned chunked envelopes. Add a local custodial signing key for an ` +
+        `allowed agent before publishing.`,
+      );
+    }
+    const signerWallet = new ethers.Wallet(signer.privateKey);
+    const signerAgentAddress = signer.agentAddress;
+    const log = this.log;
+    const ctx = createOperationContext('publish');
+    const gossip = this.gossip;
+
+    return async (input: { plaintextNquads: Uint8Array; batchId: Uint8Array; publishOperationId: string }): Promise<{
+      ciphertextChunksRoot: Uint8Array;
+      ciphertextChunkCount: number;
+      totalCiphertextBytes: number;
+    }> => {
+      if (input.batchId.length !== 32) {
+        throw new Error(
+          `LU-11: chunked emit requires a 32-byte batchId (V10 KC merkleRoot); got ${input.batchId.length}`,
+        );
+      }
+      if (input.publishOperationId.length === 0) {
+        throw new Error('LU-11: chunked emit requires a non-empty publishOperationId');
+      }
+      const plaintextChunks = sliceIntoCiphertextChunks(input.plaintextNquads);
+      const { ciphertextChunks } = encryptChunked({
+        chainKey,
+        contextGraphId: aeadCgId,
+        plaintextChunks,
+        publishOperationId: input.publishOperationId,
+      });
+      const { root, leafCount } = buildCiphertextChunksRoot(ciphertextChunks);
+      const batchIdHex = ethers.hexlify(input.batchId);
+      let totalCiphertextBytes = 0;
+      for (let i = 0; i < ciphertextChunks.length; i++) {
+        const ct = ciphertextChunks[i];
+        totalCiphertextBytes += ct.length;
+        const payload = new Uint8Array(input.batchId.length + ct.length);
+        payload.set(input.batchId, 0);
+        payload.set(ct, input.batchId.length);
+        const timestamp = new Date().toISOString();
+        const signingPayload = computeGossipSigningPayloadV2(
+          GOSSIP_TYPE_WORKSPACE_PUBLISH_CHUNKED,
+          contextGraphId,
+          timestamp,
+          payload,
+          i,
+        );
+        const signature = await signerWallet.signMessage(signingPayload);
+        const envelope = encodeGossipEnvelope({
+          version: GOSSIP_ENVELOPE_VERSION,
+          type: GOSSIP_TYPE_WORKSPACE_PUBLISH_CHUNKED,
+          contextGraphId,
+          agentAddress: signerAgentAddress,
+          timestamp,
+          signature: ethers.getBytes(signature),
+          payload,
+          swmMessageIndex: i,
+        });
+        try {
+          await gossip.publish(topic, envelope);
+        } catch (err) {
+          log.warn(
+            ctx,
+            `LU-11: chunked gossip publish failed for cgId=${contextGraphId} ` +
+            `batchId=${batchIdHex.slice(0, 18)}... op=${input.publishOperationId} chunkIndex=${i}: ${
+              err instanceof Error ? err.message : String(err)
+            } — cores without this chunk will DECLINE the V2 ACK; ` +
+            `late-join sync can backfill once the catchup verb lands.`,
+          );
+        }
+      }
+      log.info(
+        ctx,
+        `LU-11: emitted ${ciphertextChunks.length} ciphertext chunks ` +
+        `(${totalCiphertextBytes} bytes total) for curated CG ${contextGraphId} ` +
+        `batchId=${batchIdHex.slice(0, 18)}... op=${input.publishOperationId} on topic ${topic}`,
+      );
+      return {
+        ciphertextChunksRoot: root,
+        ciphertextChunkCount: leafCount,
+        totalCiphertextBytes,
+      };
     };
   }
 
@@ -8170,10 +8763,10 @@ export class DKGAgent {
     //    rather than a tx revert.
     if (
       typeof this.chain.getEvmChainId === 'function' &&
-      typeof this.chain.getKnowledgeAssetsV10Address === 'function'
+      typeof this.chain.getKnowledgeAssetsLifecycleAddress === 'function'
     ) {
       const liveChainId = await this.chain.getEvmChainId();
-      const liveKav10 = await this.chain.getKnowledgeAssetsV10Address();
+      const liveKav10 = await this.chain.getKnowledgeAssetsLifecycleAddress();
       if (liveChainId !== seal.chainId) {
         throw new Error(
           `publishFromFinalizedAssertion: seal binds chainId=${seal.chainId.toString()} but daemon ` +
@@ -8198,7 +8791,7 @@ export class DKGAgent {
     //    publish would bundle every other promoted assertion sitting
     //    in shared memory into the same KC; the publisher's recompute
     //    would then disagree with the seal's `expectedMerkleRoot` and
-    //    flip to `tentative kcId: "0"`. The seal's rootEntities were
+    //    flip to `tentative kaId: "0"`. The seal's rootEntities were
     //    captured at finalize time from the same `autoPartition` call
     //    that drove the merkle leaves, so this selection deterministically
     //    yields the post-promote SWM slice the seal commits to.
@@ -8231,7 +8824,7 @@ export class DKGAgent {
           metaGraph,
           txHash: result.onChainResult.txHash ?? '',
           blockNumber: BigInt(result.onChainResult.blockNumber ?? 0),
-          kcId: result.onChainResult.batchId ?? 0n,
+          kaId: result.onChainResult.batchId ?? 0n,
         });
         await this.store.insert(receiptQuads);
       } catch (err) {
@@ -8318,6 +8911,10 @@ export class DKGAgent {
   ): Promise<PublishResult> {
     const ctx = options?.operationCtx ?? createOperationContext('publishFromSWM');
     const effectiveSubCG = options?.subContextGraphId ?? options?.contextGraphId;
+    // `ctxGraphIdStr` doubles as `publishContextGraphId` for REMAP-flow
+    // publishes — the publisher uses its presence as a signal to DELETE the
+    // original copy from the default data graph. Keep it empty for non-REMAP
+    // publishes so we don't accidentally trigger the delete.
     const ctxGraphIdStr = effectiveSubCG != null ? String(effectiveSubCG) : undefined;
 
     const onChainId = ctxGraphIdStr ?? (await this.getContextGraphOnChainId(contextGraphId)) ?? undefined;
@@ -8336,7 +8933,7 @@ export class DKGAgent {
       !resolvedSeal &&
       onChainId != null &&
       typeof this.chain.getEvmChainId === 'function' &&
-      typeof this.chain.getKnowledgeAssetsV10Address === 'function'
+      typeof this.chain.getKnowledgeAssetsLifecycleAddress === 'function'
     ) {
       const swmQuads = await this._loadSelectedSWMQuads(
         contextGraphId,
@@ -8382,6 +8979,21 @@ export class DKGAgent {
     if (encryptInlinePayload) {
       this.log.info(ctx, `LU-5: curated CG ${contextGraphId} — wrapping inline ACK payload with chain-key AEAD`);
     }
+    // OT-RFC-38 LU-11 — also resolve the chunked emitter. Publisher
+    // prefers the chunked path when both are set; single-blob remains
+    // the unconditional fallback for any code path that resolves the
+    // chunked callback to `undefined` (currently impossible since
+    // both helpers share the curated probe, but kept defensively to
+    // future-proof CG types whose chunked path might lag rollout).
+    const encryptInlineChunked = await this._resolveEncryptInlineChunked(
+      contextGraphId,
+      options?.subGraphName,
+      options?.authorAgentAddress,
+      onChainId ?? undefined,
+    );
+    if (encryptInlineChunked) {
+      this.log.info(ctx, `LU-11: curated CG ${contextGraphId} — chunked path active (per-chunk SWM gossip + V2 ACK)`);
+    }
 
     const result = await this.publisher.publishFromSharedMemory(contextGraphId, selection, {
       operationCtx: ctx,
@@ -8395,17 +9007,46 @@ export class DKGAgent {
       publisherNodeIdentityIdOverride: options?.publisherNodeIdentityIdOverride,
       precomputedAttestation: resolvedSeal,
       encryptInlinePayload,
+      encryptInlineChunked,
     });
 
     if (result.status === 'confirmed' && result.onChainResult) {
       const rootEntities = result.kaManifest.map(ka => ka.rootEntity);
 
+      // Always carry the resolved on-chain CG id in the finalization gossip
+      // so receiving cores promote SWM into the per-cgId `_meta` namespace
+      // (`<cgName>/context/<cgId>/_meta`) that the RS prover reads from.
+      // Without this the prover 404'd with `KCNotFoundError` on every
+      // freshly-published KC even though the SWM payload had been
+      // replicated — see scripts/devnet-test-rfc39-comprehensive.sh
+      // Scenario A. We pass the *publisher-resolved* `onChainId` (which
+      // includes both explicit REMAP targets and the auto-lookup fallback)
+      // rather than the REMAP-only `ctxGraphIdStr`.
+      const broadcastCgId = onChainId != null ? String(onChainId) : undefined;
+      // PR #779 / #774 followup: tell receivers whether the publisher
+      // kept a root-graph copy of the canonical quads. Same-graph
+      // publishes (no explicit `subContextGraphId` / `publishContextGraphId`)
+      // dual-write to the root `<cg>` graph and the per-on-chain-id
+      // partition `<cg>/context/<ctxGraphId>` so label-scoped queries
+      // resolve. Explicit-`subContextGraphId` / remap publishes delete
+      // the root copy on purpose (`dkg-publisher.ts` ~line 1393), so
+      // receivers MUST NOT dual-write either — otherwise a remap-style
+      // KC would re-appear under the source CG's label on every replica.
+      // `ctxGraphIdStr` is the publisher-side `publishContextGraphId`
+      // (set on REMAP/explicit-subCG calls, undefined otherwise) — the
+      // exact same signal the publisher uses to gate its own root delete.
+      const keepRootCopyOnLabel = !ctxGraphIdStr;
       const msg: FinalizationMessageMsg = {
         ual: result.ual,
         contextGraphId: contextGraphId,
         kcMerkleRoot: result.merkleRoot,
         txHash: result.onChainResult.txHash ?? '',
         blockNumber: result.onChainResult.blockNumber ?? 0,
+        // GH#842: thread the real `(block, txIndex)` so receivers stamp the
+        // exact same materialised version as the local publish promotion —
+        // otherwise a same-block update vs publish would tie on the wire
+        // and the stale publish-promotion could clobber the update.
+        txIndex: result.onChainResult.txIndex ?? 0,
         batchId: result.onChainResult.batchId ?? 0n,
         startKAId: result.onChainResult.startKAId ?? 0n,
         endKAId: result.onChainResult.endKAId ?? 0n,
@@ -8413,14 +9054,15 @@ export class DKGAgent {
         rootEntities,
         timestampMs: Date.now(),
         operationId: ctx.operationId,
-        targetContextGraphId: result.contextGraphError ? undefined : ctxGraphIdStr,
+        targetContextGraphId: result.contextGraphError ? undefined : broadcastCgId,
         subGraphName: options?.subGraphName,
+        keepRootCopyOnLabel,
       };
 
       const topic = contextGraphFinalizationTopic(contextGraphId);
       try {
         await this.gossip.publish(topic, encodeFinalizationMessage(msg));
-        this.log.info(ctx, `Broadcast finalization for ${result.ual} to ${topic}${ctxGraphIdStr ? ` (contextGraph=${ctxGraphIdStr})` : ''}${result.contextGraphError ? ' (ctx-graph registration failed, omitting targetContextGraphId)' : ''}`);
+        this.log.info(ctx, `Broadcast finalization for ${result.ual} to ${topic}${broadcastCgId ? ` (contextGraph=${broadcastCgId})` : ''}${result.contextGraphError ? ' (ctx-graph registration failed, omitting targetContextGraphId)' : ''}`);
       } catch {
         this.log.warn(ctx, `No peers subscribed to ${topic} yet`);
       }
@@ -8533,6 +9175,18 @@ export class DKGAgent {
       includeSharedMemory?: boolean;
       /** @deprecated Use includeSharedMemory */
       includeWorkspace?: boolean;
+      /**
+       * Opt-in for dashboard/count queries that intentionally enumerate all
+       * registered public content partitions in a scoped `GRAPH ?g` scan.
+       */
+      includeContextGraphPartitions?: boolean;
+      /**
+       * Opt-in: allow the scoped query to reference the context graph's own
+       * `_private` partition (excluded from the scope guard's allow-set by
+       * default). Used by the EPCIS events query, whose SPARQL always names
+       * `<cg>/_private`. Does not widen access for other callers.
+       */
+      includePrivate?: boolean;
       operationCtx?: OperationContext;
       view?: GetView;
       agentAddress?: string;
@@ -8752,6 +9406,8 @@ export class DKGAgent {
       excludeGraphPrefixes,
       graphSuffix: opts.graphSuffix,
       includeSharedMemory: opts.includeSharedMemory,
+      includeContextGraphPartitions: opts.includeContextGraphPartitions,
+      includePrivate: opts.includePrivate,
       view: opts.view,
       agentAddress: agentAddressStr ?? (opts.view === 'working-memory' ? this.peerId : undefined),
       verifiedGraph: opts.verifiedGraph,
@@ -9445,6 +10101,27 @@ export class DKGAgent {
     this.swmHostModeSubscribed.set(wireCgId, source);
     this.gossip.subscribe(swmTopic);
     const handler = (_topic: string, data: Uint8Array, from: string) => {
+      // OT-RFC-38 LU-11: peek envelope type and dispatch. Chunked
+      // envelopes (`type='share-write-chunked'`) take the V2 chunk
+      // persistence path; everything else flows through the legacy
+      // host-mode store unchanged. Failed decode falls through to
+      // `ingestSwmHostModeEnvelope` which is also defensive — the
+      // dispatch here is best-effort, not a security boundary.
+      let envelopeType: string | undefined;
+      try {
+        const peek = decodeGossipEnvelope(data);
+        envelopeType = peek?.type;
+      } catch { /* drop into legacy path */ }
+      if (envelopeType === GOSSIP_TYPE_WORKSPACE_PUBLISH_CHUNKED) {
+        this.ingestSwmCiphertextChunkEnvelope(contextGraphId, data, from).catch((err: unknown) => {
+          const msg = err instanceof Error ? err.message : String(err);
+          this.log.warn(
+            createOperationContext('system'),
+            `LU-11: chunked SWM ingest failed for "${contextGraphId}": ${msg}`,
+          );
+        });
+        return;
+      }
       this.ingestSwmHostModeEnvelope(contextGraphId, data, from).catch((err: unknown) => {
         const msg = err instanceof Error ? err.message : String(err);
         this.log.warn(
@@ -9781,6 +10458,131 @@ export class DKGAgent {
   }
 
   /**
+   * OT-RFC-38 LU-11 / OT-RFC-39 — chunked-ciphertext SWM ingest.
+   * Receives per-chunk SWM gossip envelopes
+   * (`type='share-write-chunked'`) that the publisher fans out via
+   * `_resolveEncryptInlineChunked`, verifies envelope authority
+   * against the curated CG's agent allowlist (same gate as the
+   * legacy host-mode store), strips the 32-byte `batchId` prefix
+   * from the payload, and persists the remaining ciphertext bytes
+   * under the deterministic chunk-store subject so the V2 ACK
+   * verifier can recompute the publisher's claimed
+   * `ciphertextChunksRoot` keyed by `(cgId, batchId, chunkIndex)`.
+   *
+   * Persistence model: one base64-encoded literal per chunk, in the
+   * per-CG named graph `ciphertextChunkStoreGraph(cgId)` under the
+   * subject `ciphertextChunkStoreSubject(batchId, chunkIndex)`. The
+   * store insert is idempotent — the same chunk arriving twice (or
+   * out of order) overwrites the existing triple harmlessly because
+   * `subject + predicate + graph` is unique.
+   *
+   * Late-join cores that come online after a publish has finalised
+   * end up here only opportunistically (if a peer's mesh re-floods
+   * the chunked envelope), which is unreliable; commit 7 adds the
+   * `GetCiphertextChunk` sync verb that pulls missing chunks
+   * explicitly via the protocol router.
+   */
+  private async ingestSwmCiphertextChunkEnvelope(
+    contextGraphId: string,
+    data: Uint8Array,
+    fromPeerId: string,
+  ): Promise<void> {
+    if (data.length === 0) return;
+    const ctx = createOperationContext('share');
+    let envelope: GossipEnvelopeMsg | undefined;
+    try {
+      envelope = decodeGossipEnvelope(data);
+    } catch {
+      return;
+    }
+    if (!envelope || envelope.type !== GOSSIP_TYPE_WORKSPACE_PUBLISH_CHUNKED) {
+      return;
+    }
+    if (envelope.payload.length <= 32) {
+      // Chunked payload format: [32-byte batchId][ciphertext...].
+      // Anything shorter can't carry a single ciphertext byte.
+      this.log.debug(
+        ctx,
+        `LU-11: ignoring chunked envelope on cg=${contextGraphId} from=${fromPeerId} with truncated payload (${envelope.payload.length} bytes)`,
+      );
+      return;
+    }
+    if (typeof envelope.swmMessageIndex !== 'number' || envelope.swmMessageIndex < 0) {
+      this.log.debug(
+        ctx,
+        `LU-11: ignoring chunked envelope on cg=${contextGraphId} with invalid swmMessageIndex=${envelope.swmMessageIndex}`,
+      );
+      return;
+    }
+
+    // Subscription CG-id can be either cleartext (operator / member
+    // path) or wire-form hash (chain-event auto-subscribe). Compare
+    // both sides in wire-form so any combination accepts.
+    const envelopeWireId = this.gossipWireIdFor(envelope.contextGraphId);
+    const subscriptionWireId = this.gossipWireIdFor(contextGraphId);
+    if (envelopeWireId !== subscriptionWireId) return;
+    const storageCgId = envelope.contextGraphId;
+
+    // Verify envelope signature against the curated CG's agent
+    // allowlist — exactly the same authority check the host-mode
+    // store uses; without it, any topic-reachable peer could plant
+    // arbitrary ciphertext under a victim's (cgId, batchId) keys.
+    const handlerSm = this.getOrCreateSharedMemoryHandler();
+    const verdict = await handlerSm.verifyHostModeEnvelopeAuthority(data, storageCgId, fromPeerId);
+    if (!verdict.accepted) {
+      // Same transient-race classification as the LU-6 host-mode
+      // path: "no agent allowlist yet" is the post-create / pre-
+      // chain-event window; everything else is a real auth failure.
+      const isTransientRace = verdict.reason === 'no agent allowlist on context graph';
+      const logFn = isTransientRace ? this.log.debug.bind(this.log) : this.log.warn.bind(this.log);
+      logFn(
+        ctx,
+        `LU-11: chunked envelope auth ${isTransientRace ? 'deferred' : 'rejected'} for cg=${storageCgId} from=${fromPeerId} swmMessageIndex=${envelope.swmMessageIndex}: ${verdict.reason}`,
+      );
+      return;
+    }
+
+    const batchId = envelope.payload.subarray(0, 32);
+    const ciphertext = envelope.payload.subarray(32);
+    const chunkIndex = envelope.swmMessageIndex;
+    // Codex review on PR #715 (refined round 2 on PR #727): canonicalize
+    // the cgId used in the per-CG named graph via
+    // `canonicalChunkStoreCgIdOrNull` so persist (here) and lookup
+    // (`handleGetCiphertextChunk`, V2 ACK loadChunk, prover extractor)
+    // converge on the same wire-form key. The persist site falls back
+    // to the raw `storageCgId` (legacy shape) when canonicalization
+    // can't safely resolve — the gossip envelope's `contextGraphId`
+    // is typically already cleartext / wire-form, so the null path is
+    // unlikely here, but the fallback keeps insert semantics safe and
+    // mirrors the lookup-side wildcard fallback rather than
+    // fabricating a bad keccak-of-decimal-string.
+    const persistCanonical = this.canonicalChunkStoreCgIdOrNull(storageCgId);
+    const chunksGraph = ciphertextChunkStoreGraph(persistCanonical ?? storageCgId);
+    const subject = ciphertextChunkStoreSubject(batchId, chunkIndex);
+    const literal = `"${Buffer.from(ciphertext).toString('base64')}"`;
+    try {
+      await this.store.insert([{
+        subject,
+        predicate: CIPHERTEXT_CHUNK_PREDICATE,
+        object: literal,
+        graph: chunksGraph,
+      }]);
+    } catch (err) {
+      this.log.warn(
+        ctx,
+        `LU-11: failed to persist chunk cg=${storageCgId} batchId=${ethers.hexlify(batchId).slice(0, 18)}... chunkIndex=${chunkIndex}: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      return;
+    }
+    this.log.info(
+      ctx,
+      `LU-11: persisted ciphertext chunk cg=${storageCgId} batchId=${ethers.hexlify(batchId).slice(0, 18)}... chunkIndex=${chunkIndex} bytes=${ciphertext.length}`,
+    );
+  }
+
+  /**
    * OT-RFC-38 / LU-6 Phase B — curator-side: record a CG so the
    * periodic beacon timer keeps re-announcing it AND broadcast an
    * immediate first beacon. Called from {@link createContextGraph}
@@ -10110,6 +10912,483 @@ export class DKGAgent {
       truncated: truncatedByEntries || truncatedByBytes,
       entries,
     });
+  }
+
+  /**
+   * OT-RFC-38 LU-11 / OT-RFC-39 — responder for the
+   * `/dkg/10.0.2/get-ciphertext-chunk` sync verb. Loads one
+   * `(cgId, batchId, chunkIndex)` ciphertext from the local
+   * triple-store-backed chunk store and returns the base64 bytes
+   * (or a typed denial: bad signature, unauthorized, missing
+   * chunk). Authorization piggybacks on the existing LU-6
+   * UNION-of-authorities gate: any source that recognises the
+   * requester EOA accepts (on-chain participants, beacon curator,
+   * local agent gate, libp2p peer allowlist). PR-B will refine
+   * this to include a sharding-table-membership chain probe so
+   * late-joining hosting cores (which won't be on the agent
+   * allowlist) can backfill ciphertexts they need to participate
+   * in RFC-39 random sampling.
+   */
+  private async handleGetCiphertextChunk(data: Uint8Array, fromPeerId: string): Promise<Uint8Array> {
+    const ctx = createOperationContext('share');
+    let req: CiphertextChunkCatchupRequest;
+    try {
+      req = decodeCiphertextChunkCatchupRequest(data);
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      return encodeCiphertextChunkCatchupResponse({
+        version: CIPHERTEXT_CHUNK_CATCHUP_WIRE_VERSION,
+        contextGraphId: '',
+        batchIdHex: '',
+        chunkIndex: -1,
+        denied: `malformed request: ${reason}`,
+      });
+    }
+    const nowMs = Date.now();
+    const verify = verifySignedCiphertextChunkCatchupRequest(req, nowMs);
+    if (!verify.ok || !verify.recoveredSigner) {
+      this.log.info(
+        ctx,
+        `LU-11 chunk-catchup denied cg=${req.contextGraphId} from=${fromPeerId} requesterEoa=${req.requesterEoa} chunkIndex=${req.chunkIndex}: ${verify.reason}`,
+      );
+      return encodeCiphertextChunkCatchupResponse({
+        version: CIPHERTEXT_CHUNK_CATCHUP_WIRE_VERSION,
+        contextGraphId: req.contextGraphId,
+        batchIdHex: ethers.hexlify(req.batchId),
+        chunkIndex: req.chunkIndex,
+        denied: verify.reason ?? 'signature verification failed',
+      });
+    }
+    const requesterEoa = verify.recoveredSigner;
+    if (!this.ciphertextChunkCatchupReplayGuard.recordIfFresh(requesterEoa, req.nonce, req.issuedAtMs, nowMs)) {
+      return encodeCiphertextChunkCatchupResponse({
+        version: CIPHERTEXT_CHUNK_CATCHUP_WIRE_VERSION,
+        contextGraphId: req.contextGraphId,
+        batchIdHex: ethers.hexlify(req.batchId),
+        chunkIndex: req.chunkIndex,
+        denied: 'replayed chunk-catchup nonce',
+      });
+    }
+
+    // Reuse the LU-6 host-catchup authorization shape via a thin
+    // adapter — same UNION-of-authorities logic, but the chunk-catchup
+    // request payload lacks `sinceSeqno`/`maxEntries`/`maxBytes` so
+    // we pack the chunked-request fields into the shared verifier's
+    // shape with zero-defaults for the unused slots. (The shared
+    // authorization helper only reads `contextGraphId` and the EOA;
+    // the other fields are signature-digest input, not authorization
+    // input.)
+    let authOk = false;
+    let authReason: string = 'no authority source available for context graph';
+    const requesterLower = requesterEoa.toLowerCase();
+    let anyAuthorityFound = false;
+    try {
+      const chainParticipants = await this.resolveOnChainParticipantAgents(req.contextGraphId);
+      if (chainParticipants !== null) {
+        anyAuthorityFound = true;
+        if (chainParticipants.some((a) => a.toLowerCase() === requesterLower)) authOk = true;
+      }
+    } catch { /* probe failure non-fatal */ }
+    if (!authOk) {
+      try {
+        const beaconCurator = await this.resolveBeaconPinnedCuratorEoa(req.contextGraphId);
+        if (beaconCurator) {
+          anyAuthorityFound = true;
+          if (beaconCurator.toLowerCase() === requesterLower) authOk = true;
+        }
+      } catch { /* probe failure non-fatal */ }
+    }
+    if (!authOk) {
+      try {
+        const agentGate = await this.getContextGraphAgentGateAddresses(req.contextGraphId);
+        if (agentGate !== null) {
+          anyAuthorityFound = true;
+          if (agentGate.some((a) => a.toLowerCase() === requesterLower)) authOk = true;
+        }
+      } catch { /* probe failure non-fatal */ }
+    }
+    if (!authOk) {
+      try {
+        const allowedPeers = await this.getContextGraphAllowedPeers(req.contextGraphId);
+        if (allowedPeers !== null) {
+          anyAuthorityFound = true;
+          if (allowedPeers.includes(fromPeerId)) authOk = true;
+        }
+      } catch { /* probe failure non-fatal */ }
+    }
+    // OT-RFC-39 fifth authority — registered node operator.
+    //
+    // The four authorities above are MEMBER- or CURATOR-shaped: they
+    // gate "can this EOA decrypt / participate in" the CG. Curated
+    // CGs almost never list every sharding-table core in
+    // `allowedAgents` (curators only enrol agents that need to
+    // decrypt), so the existing layers deny EVERY core-to-core
+    // chunk fetch — exactly the late-join scenario OT-RFC-39 is
+    // designed to fix. Closing that gap means admitting any peer
+    // whose EOA is a registered node operator (identityId > 0n on
+    // chain). Three reasons this is safe for the CIPHERTEXT path
+    // (and not generalisable to plaintext catchup):
+    //
+    //  1. The bytes carried are AEAD-encrypted with the curator's
+    //     sender key. A node operator without the sender key gets
+    //     opaque ciphertext that is computationally indistinguishable
+    //     from random, so no decryption power leaks.
+    //
+    //  2. The on-chain `(ciphertextChunksRoot, ciphertextChunkCount)`
+    //     commitment is already public — anyone observing chain state
+    //     learns "curated KC X has N chunks of size up to S each"
+    //     without needing the wire fetch. The metadata our responder
+    //     reveals is a strict subset of what the chain already
+    //     reveals.
+    //
+    //  3. Registering an on-chain identity costs TRAC stake — it's
+    //     a Sybil-resistant credential. Pairing the EOA recovery
+    //     above (which proves the requester holds the operator key)
+    //     with a non-zero identityId restricts ciphertext fetch to
+    //     the same trust set the random-sampling picker draws from,
+    //     which is the spec-intended population for hosting.
+    //
+    // Wire effect: the late-join sync verb now succeeds for any
+    // sharding-table core requesting chunks for any curated CG. The
+    // prover's auto-backfill can complete; the missed core proves
+    // its hosting and earns rewards on the period it would otherwise
+    // forfeit.
+    if (!authOk && typeof this.chain.getIdentityIdForAddress === 'function') {
+      try {
+        const reqIdentityId = await this.chain.getIdentityIdForAddress(requesterEoa);
+        if (reqIdentityId > 0n) {
+          anyAuthorityFound = true;
+          authOk = true;
+          this.log.debug(
+            ctx,
+            `LU-11 chunk-catchup admitted via OT-RFC-39 node-operator authority cg=${req.contextGraphId} requesterEoa=${requesterEoa} identityId=${reqIdentityId.toString()}`,
+          );
+        }
+      } catch (err) {
+        this.log.debug(
+          ctx,
+          `LU-11 chunk-catchup node-operator probe failed cg=${req.contextGraphId} requesterEoa=${requesterEoa}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+    if (!authOk) {
+      authReason = anyAuthorityFound
+        ? 'requester EOA not in any of: on-chain participants, beacon curator, local agent-gate, allowedPeers, node-operator-registry'
+        : 'no authority source available for context graph';
+      this.log.info(
+        ctx,
+        `LU-11 chunk-catchup denied cg=${req.contextGraphId} from=${fromPeerId} requesterEoa=${requesterEoa} chunkIndex=${req.chunkIndex}: ${authReason}`,
+      );
+      return encodeCiphertextChunkCatchupResponse({
+        version: CIPHERTEXT_CHUNK_CATCHUP_WIRE_VERSION,
+        contextGraphId: req.contextGraphId,
+        batchIdHex: ethers.hexlify(req.batchId),
+        chunkIndex: req.chunkIndex,
+        denied: authReason,
+      });
+    }
+
+    // Locate the chunk. Codex review (round 2) on PR #727: pin to the
+    // per-CG named graph when we can safely canonicalize `req.contextGraphId`
+    // (cleartext / bare-hex / locally-registered numeric on-chain id),
+    // and fall back to the wildcard `GRAPH ?g` scan when we can't. The
+    // previous PR #715 fix would have keccak'd a literal decimal string
+    // like "42" and produced a hash that did NOT match the curator
+    // nameHash → "chunk not found" for any requester that addressed
+    // the CG by its numeric on-chain id, narrowing the public API in
+    // a way that wasn't advertised. Scoped pinning still gives us the
+    // multi-CG identical-KC isolation we wanted from PR #715 whenever
+    // canonicalization succeeds; the wildcard fallback preserves the
+    // historical responder contract for the catching-up / numeric-id
+    // cases.
+    const canonicalCgIdForChunks = this.canonicalChunkStoreCgIdOrNull(req.contextGraphId);
+    const chunksGraphForLookup = canonicalCgIdForChunks
+      ? ciphertextChunkStoreGraph(canonicalCgIdForChunks)
+      : null;
+    const graphClause = chunksGraphForLookup
+      ? `GRAPH <${chunksGraphForLookup}>`
+      : 'GRAPH ?g';
+    const subject = ciphertextChunkStoreSubject(req.batchId, req.chunkIndex);
+    const sparql = `SELECT ?o WHERE { ${graphClause} { <${subject}> <${CIPHERTEXT_CHUNK_PREDICATE}> ?o } } LIMIT 1`;
+    let result;
+    try {
+      result = await this.store.query(sparql);
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      this.log.warn(ctx, `LU-11 chunk-catchup store query failed cg=${req.contextGraphId} chunkIndex=${req.chunkIndex}: ${reason}`);
+      return encodeCiphertextChunkCatchupResponse({
+        version: CIPHERTEXT_CHUNK_CATCHUP_WIRE_VERSION,
+        contextGraphId: req.contextGraphId,
+        batchIdHex: ethers.hexlify(req.batchId),
+        chunkIndex: req.chunkIndex,
+        denied: `store error: ${reason}`,
+      });
+    }
+    if (result.type !== 'bindings' || result.bindings.length === 0) {
+      return encodeCiphertextChunkCatchupResponse({
+        version: CIPHERTEXT_CHUNK_CATCHUP_WIRE_VERSION,
+        contextGraphId: req.contextGraphId,
+        batchIdHex: ethers.hexlify(req.batchId),
+        chunkIndex: req.chunkIndex,
+        denied: 'chunk not found',
+      });
+    }
+    const literal = result.bindings[0]?.['o'];
+    if (typeof literal !== 'string') {
+      return encodeCiphertextChunkCatchupResponse({
+        version: CIPHERTEXT_CHUNK_CATCHUP_WIRE_VERSION,
+        contextGraphId: req.contextGraphId,
+        batchIdHex: ethers.hexlify(req.batchId),
+        chunkIndex: req.chunkIndex,
+        denied: 'chunk stored value malformed',
+      });
+    }
+    const ciphertextB64 = literal.startsWith('"') && literal.endsWith('"')
+      ? literal.slice(1, -1)
+      : literal;
+    this.log.debug(
+      ctx,
+      `LU-11 chunk-catchup served cg=${req.contextGraphId} from=${fromPeerId} batchId=${ethers.hexlify(req.batchId).slice(0, 18)}... chunkIndex=${req.chunkIndex} bytes=${Buffer.from(ciphertextB64, 'base64').length}`,
+    );
+    return encodeCiphertextChunkCatchupResponse({
+      version: CIPHERTEXT_CHUNK_CATCHUP_WIRE_VERSION,
+      contextGraphId: req.contextGraphId,
+      batchIdHex: ethers.hexlify(req.batchId),
+      chunkIndex: req.chunkIndex,
+      ciphertextB64,
+    });
+  }
+
+  /**
+   * OT-RFC-38 LU-11 / OT-RFC-39 — requester for the
+   * `/dkg/10.0.2/get-ciphertext-chunk` sync verb. Pulls one
+   * `(cgId, batchId, chunkIndex)` ciphertext from a known host and
+   * (when `persist === true`) writes it into the local per-chunk
+   * store so the V2 ACK verifier sees it on the next pass. Returns
+   * the raw decoded response so callers can inspect denial reasons
+   * or feed bytes to a member-side verifier.
+   *
+   * Late-joining hosting cores call this in a loop to backfill the
+   * `(cgId, batchId, 0..count-1)` set after seeing
+   * `KnowledgeCollectionCiphertextCommitmentSet` on chain or
+   * `MISSING_CIPHERTEXT_CHUNKS` from a V2 ACK request they
+   * routed forward. Loop policy + peer selection are intentionally
+   * caller-owned — this method is the single-pull primitive.
+   */
+  async fetchCiphertextChunkFromPeer(
+    remotePeerId: string,
+    contextGraphId: string,
+    batchId: Uint8Array,
+    chunkIndex: number,
+    options?: {
+      persist?: boolean;
+      /**
+       * @deprecated Reserved for a future alternate-signer plumb-through.
+       *   No-op today: the closure below always uses
+       *   `this.chain.signMessage`. Kept on the public signature so
+       *   existing TypeScript callers continue to compile through the
+       *   rc.12 line (Codex review round 2 on PR #727 flagged
+       *   removing it as a breaking API change). Will be removed in a
+       *   future intentional major-version break — either replaced by
+       *   a real signer callback (`sign?: (digest) => Promise<string>`)
+       *   or dropped entirely if no caller ever materialises.
+       */
+      signWithChainAdapter?: boolean;
+    },
+  ): Promise<CiphertextChunkCatchupResponse> {
+    if (batchId.length !== 32) {
+      throw new Error(`fetchCiphertextChunkFromPeer requires a 32-byte batchId; got ${batchId.length}`);
+    }
+    if (!Number.isInteger(chunkIndex) || chunkIndex < 0) {
+      throw new Error(`fetchCiphertextChunkFromPeer requires a non-negative chunkIndex; got ${chunkIndex}`);
+    }
+    const ctx = createOperationContext('share');
+    // Codex review on PR #715 / #717 / #727: the option above is a
+    // back-compat no-op. The implementation requires a chain adapter
+    // with `signMessage`; there is no real alternate-signer path yet,
+    // so callers must wire the chain. Honest error if absent.
+    if (typeof this.chain.signMessage !== 'function') {
+      throw new Error('fetchCiphertextChunkFromPeer: chain adapter does not expose signMessage; the LU-11 sync verb requires an operator-key signer');
+    }
+    const sign = async (digest: Uint8Array) => {
+      // Match the host-catchup pattern: chain.signMessage returns
+      // {r, vs}; re-serialise to the 65-byte EIP-191 hex shape.
+      const { r, vs } = await this.chain.signMessage!(digest);
+      const sig = ethers.Signature.from({ r: ethers.hexlify(r), yParityAndS: ethers.hexlify(vs) });
+      return sig.serialized;
+    };
+    const signedReq = await mintSignedCiphertextChunkCatchupRequest({
+      contextGraphId,
+      batchId,
+      chunkIndex,
+      sign,
+    });
+    const reqBytes = encodeCiphertextChunkCatchupRequest(signedReq);
+    const sendResult = await this.messenger.sendReliable(remotePeerId, PROTOCOL_GET_CIPHERTEXT_CHUNK, reqBytes);
+    if (!sendResult.delivered) {
+      throw new Error(`LU-11 chunk-catchup transport failed: ${sendResult.error}`);
+    }
+    const resp = decodeCiphertextChunkCatchupResponse(sendResult.response);
+    if (options?.persist && resp.ciphertextB64) {
+      const subject = ciphertextChunkStoreSubject(batchId, chunkIndex);
+      const literal = `"${resp.ciphertextB64}"`;
+      // Codex review on PR #715 (refined round 2 on PR #727): use the
+      // central canonical helper so this persist site matches the
+      // ingest persist site exactly, including the safe fallback when
+      // canonicalization can't resolve. `contextGraphId` here is the
+      // local CG id the prover-side backfill passed in (cleartext
+      // resolved via `resolveLocalCgIdByOnChainId` in
+      // `buildCiphertextChunkBackfill`), so the helper normally
+      // returns a wire hash; the null path is theoretical defense.
+      const persistCanonical = this.canonicalChunkStoreCgIdOrNull(contextGraphId);
+      const chunksGraphForPersist = ciphertextChunkStoreGraph(persistCanonical ?? contextGraphId);
+      try {
+        await this.store.insert([{
+          subject,
+          predicate: CIPHERTEXT_CHUNK_PREDICATE,
+          object: literal,
+          graph: chunksGraphForPersist,
+        }]);
+        this.log.debug(
+          ctx,
+          `LU-11 chunk-catchup persisted cg=${contextGraphId} batchId=${ethers.hexlify(batchId).slice(0, 18)}... chunkIndex=${chunkIndex} from=${remotePeerId}`,
+        );
+      } catch (err) {
+        this.log.warn(
+          ctx,
+          `LU-11 chunk-catchup persistence failed cg=${contextGraphId} batchId=${ethers.hexlify(batchId).slice(0, 18)}... chunkIndex=${chunkIndex}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+    return resp;
+  }
+
+  /**
+   * OT-RFC-39 — resolve a numeric on-chain CG id (the form the prover
+   * sees from `createChallenge` / `getKAContextGraphId`) back to the
+   * local cleartext id this agent registered the CG under. Scans
+   * `subscribedContextGraphs` because the reverse map is keyed by the
+   * wire-form `onChainHash`, not the numeric id. Returns null when
+   * this node has never seen the CG (legitimate during the chain-event
+   * replay race window after restart — caller falls back to passing
+   * the numeric id as a string, which the responder's authorization
+   * layer also resolves via on-chain participant lookup).
+   */
+  private resolveLocalCgIdByOnChainId(onChainId: bigint): string | null {
+    const target = onChainId.toString();
+    for (const [localId, sub] of this.subscribedContextGraphs) {
+      if (sub.onChainId === target) return localId;
+    }
+    return null;
+  }
+
+  /**
+   * OT-RFC-39 — build the per-tick auto-backfill closure handed to the
+   * Random Sampling prover via {@link bindRandomSampling}. The closure
+   * is invoked when `extractCiphertextChunksFromStore` reports
+   * `CiphertextChunksMissingError`; it pulls the missing chunks from
+   * authorized peers and persists them so the prover's one-shot retry
+   * can build the proof.
+   *
+   * Peer discovery uses the same source the publish path uses:
+   * `gossip.getSubscribers(contextGraphWorkspaceTopic(wireId))`. Every
+   * authorized hosting core subscribes to that topic to receive the
+   * chunked-publish gossip, so the subscriber snapshot is the natural
+   * "who can answer me right now" set. Falls back to "no peers" when
+   * the local cleartext CG id is unknown (chain replay hasn't caught
+   * up yet) — the prover then logs `kc-not-synced` and re-ticks in
+   * 30s, by which time the chain handler has populated
+   * `subscribedContextGraphs`.
+   *
+   * Authorization happens on the RESPONDER side
+   * (`handleGetCiphertextChunk`): every peer the requester contacts
+   * verifies the request's recovered EOA against the on-chain
+   * participant set / beacon curator / agent-gate / allowedPeers.
+   * Requesters that aren't in any authority set get a `denied` ACK
+   * and we skip to the next peer.
+   *
+   * Cap policy: one fetch per missing chunk per peer; iterate peers
+   * until a chunk lands or we exhaust the list. No retries inside the
+   * hook — the prover's outer 30s loop is the natural retry boundary.
+   */
+  private buildCiphertextChunkBackfill(
+    ctx: OperationContext,
+  ): (req: { cgId: bigint; batchId: Uint8Array; missingIndexes: number[] }) => Promise<{ fetched: number; failures: number; reason?: string }> {
+    return async ({ cgId, batchId, missingIndexes }) => {
+      if (missingIndexes.length === 0) return { fetched: 0, failures: 0 };
+
+      const localCgId = this.resolveLocalCgIdByOnChainId(cgId);
+      if (!localCgId) {
+        return {
+          fetched: 0,
+          failures: missingIndexes.length,
+          reason: 'cg-not-locally-registered',
+        };
+      }
+
+      const wireId = this.gossipWireIdFor(localCgId);
+      const workspaceTopic = contextGraphWorkspaceTopic(wireId);
+      let selfPeer: string | null = null;
+      try { selfPeer = this.peerId; } catch { /* pre-start */ }
+      const allSubscribers = this.gossip.getSubscribers(workspaceTopic);
+      const candidatePeers = Array.from(new Set(
+        allSubscribers.filter((p) => p && p !== selfPeer),
+      ));
+
+      if (candidatePeers.length === 0) {
+        return {
+          fetched: 0,
+          failures: missingIndexes.length,
+          reason: 'no-peers',
+        };
+      }
+
+      const batchIdHex = ethers.hexlify(batchId).slice(0, 18);
+      this.log.info(
+        ctx,
+        `LU-11 backfill start cg=${localCgId} batchId=${batchIdHex}... missing=${missingIndexes.length} peers=${candidatePeers.length}`,
+      );
+
+      let fetched = 0;
+      let failures = 0;
+      let lastDenied: string | undefined;
+      for (const idx of missingIndexes) {
+        let got = false;
+        for (const peer of candidatePeers) {
+          try {
+            const resp = await this.fetchCiphertextChunkFromPeer(peer, localCgId, batchId, idx, {
+              persist: true,
+            });
+            if (resp.denied) {
+              lastDenied = resp.denied;
+              continue;
+            }
+            if (resp.ciphertextB64) {
+              got = true;
+              break;
+            }
+          } catch (err) {
+            this.log.debug(
+              ctx,
+              `LU-11 backfill peer=${peer} chunk=${idx} cg=${localCgId} error: ${err instanceof Error ? err.message.slice(0, 200) : String(err).slice(0, 200)}`,
+            );
+          }
+        }
+        if (got) fetched++;
+        else failures++;
+      }
+
+      this.log.info(
+        ctx,
+        `LU-11 backfill done cg=${localCgId} batchId=${batchIdHex}... fetched=${fetched} failures=${failures}${lastDenied ? ` lastDenied=${lastDenied}` : ''}`,
+      );
+      return {
+        fetched,
+        failures,
+        ...(failures > 0 && fetched === 0 && lastDenied ? { reason: `all-denied: ${lastDenied}` } : {}),
+        ...(failures > 0 && fetched === 0 && !lastDenied ? { reason: 'no-responders' } : {}),
+      };
+    };
   }
 
   /**
@@ -11538,6 +12817,10 @@ export class DKGAgent {
     if (!this.updateHandler) {
       this.updateHandler = new UpdateHandler(this.store, this.chain, this.eventBus, {
         knownBatchContextGraphs: this.publisher.knownBatchContextGraphs,
+        // GH #842: let the receiver promote applied updates into the per-cgId
+        // partition the RS prover reads, so updated KAs are provable on all
+        // nodes, not just the publisher.
+        resolveOnChainCgId: (cgName: string) => this.getContextGraphOnChainId(cgName),
       });
     }
     return this.updateHandler;
@@ -11549,6 +12832,11 @@ export class DKGAgent {
         this.store,
         this.chain.chainId === 'none' ? undefined : this.chain,
         this.eventBus,
+        // Defensive: when a peer's finalization gossip omits
+        // `targetContextGraphId` (pre-cd68fa689 publisher in the mesh),
+        // resolve the on-chain id locally so per-cgId promotion still
+        // fires and the RS prover sees the KC.
+        (cgName: string) => this.getContextGraphOnChainId(cgName),
       );
     }
     return this.finalizationHandler;
@@ -12149,8 +13437,52 @@ export class DKGAgent {
     if (resolvedLocalAccessPolicy !== undefined && resolvedLocalAccessPolicy !== LOCAL_ACCESS_OPEN && resolvedLocalAccessPolicy !== LOCAL_ACCESS_CURATED) {
       throw new Error('accessPolicy must be 0 (open) or 1 (private/curated)');
     }
+    // Closes #774 finding #1 — `dkg context-graph register
+    // --access-policy 1` against a CG that was created public used to
+    // silently register on-chain as curated while the local CG stayed
+    // public. The subsequent `dkg publish my-cg` then tripped the
+    // pre-publish LU-5 guard with a CG-policy-mismatch error and the
+    // operator had no easy way to recover (the LU-5 guard is correct
+    // — encrypting against the wrong CG's policy would leak plaintext
+    // OR be rejected by cores).
+    //
+    // Fail fast at register time with a clear remediation pointer so
+    // the operator never gets into the half-registered state. The
+    // single-call API (`POST /api/context-graph/create
+    // {accessPolicy:1, register:true, allowedAgents:[…]}`) and the
+    // CLI `dkg context-graph create my-cg --access-policy 1` BOTH set
+    // the local access policy at create time — those remain the
+    // supported paths for curated CGs.
+    // `isPrivateContextGraph()` reflects the CURRENT local ACL state,
+    // not strictly the create-time policy: a CG created public can
+    // later be locked down via allowlist mutations and would then
+    // also report `actualLocalIsCurated = true`. Phrase the error in
+    // terms of the current ACL state so the message stays accurate
+    // regardless of which write flipped the local policy (Codex r2
+    // on #777). The remediation pointer covers both atomic-create
+    // paths because that is the only supported way to bring the CG
+    // out of the mismatched state.
+    const actualLocalIsCurated = await this.isPrivateContextGraph(id);
+    if (
+      resolvedLocalAccessPolicy !== undefined
+      && ((resolvedLocalAccessPolicy === LOCAL_ACCESS_CURATED) !== actualLocalIsCurated)
+    ) {
+      const localStr = actualLocalIsCurated ? 'private/curated (1)' : 'public/open (0)';
+      const requestedStr = resolvedLocalAccessPolicy === LOCAL_ACCESS_CURATED
+        ? 'private/curated (1)'
+        : 'public/open (0)';
+      throw new Error(
+        `Context graph "${id}" currently has local access policy=${localStr} but register was called with --access-policy ${requestedStr}. ` +
+        `register cannot change the local access policy — encrypting against a different policy than the CG actually has would either leak plaintext or be rejected by cores ` +
+        `(this is what the pre-publish LU-5 guard then refuses). ` +
+        `To create a curated CG atomically, use one of: ` +
+        `(a) \`dkg context-graph create <id> --access-policy 1 --allowed-agent <addr>\`, ` +
+        `(b) the single-call API \`POST /api/context-graph/create { accessPolicy: 1, register: true, allowedAgents: [...] }\`. ` +
+        `Then register without --access-policy.`,
+      );
+    }
     if (resolvedLocalAccessPolicy === undefined) {
-      resolvedLocalAccessPolicy = await this.isPrivateContextGraph(id)
+      resolvedLocalAccessPolicy = actualLocalIsCurated
         ? LOCAL_ACCESS_CURATED
         : LOCAL_ACCESS_OPEN;
     }
@@ -12229,19 +13561,49 @@ export class DKGAgent {
     // Hosts come from the sharding table at publish time; ACK quorum
     // is `parametersStorage.minimumRequiredSignatures()`.
 
-    // Check if already registered on-chain (prevents duplicate minting)
+    // Check if already registered on-chain (prevents duplicate minting).
+    // A local OnChainId triple alone is not enough — devnet restarts and
+    // partial failures can leave ontology id "1" while the chain slot is
+    // inactive, which would skip registration and strand publishes.
     const existingOnChainId = await this.getContextGraphOnChainId(id);
     if (existingOnChainId) {
-      this.log.info(ctx, `Context graph "${id}" already has on-chain ID ${existingOnChainId} — skipping chain call`);
+      let onChainLive = false;
+      const chainWithCgProbe = this.chain as ChainAdapter & {
+        isContextGraphActiveOnChain?: (id: bigint) => Promise<boolean>;
+      };
+      if (typeof chainWithCgProbe.isContextGraphActiveOnChain === 'function') {
+        try {
+          onChainLive = await chainWithCgProbe.isContextGraphActiveOnChain(BigInt(existingOnChainId));
+        } catch {
+          onChainLive = false;
+        }
+      }
+      if (onChainLive) {
+        this.log.info(ctx, `Context graph "${id}" already has on-chain ID ${existingOnChainId} — skipping chain call`);
+        await this.store.deleteByPattern({
+          graph: cgMetaGraph,
+          subject: contextGraphUri,
+          predicate: DKG_ONTOLOGY.DKG_REGISTRATION_STATUS,
+        });
+        await this.store.insert([
+          { subject: contextGraphUri, predicate: DKG_ONTOLOGY.DKG_REGISTRATION_STATUS, object: `"registered"`, graph: cgMetaGraph },
+        ]);
+        return { onChainId: existingOnChainId, txHash: undefined };
+      }
+      this.log.warn(
+        ctx,
+        `Context graph "${id}" has local on-chain id ${existingOnChainId} but it is not active on-chain — re-registering`,
+      );
+      const ontologyGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
       await this.store.deleteByPattern({
-        graph: cgMetaGraph,
+        graph: ontologyGraph,
         subject: contextGraphUri,
-        predicate: DKG_ONTOLOGY.DKG_REGISTRATION_STATUS,
+        predicate: `${DKG_ONTOLOGY.DKG_CONTEXT_GRAPH}OnChainId`,
       });
-      await this.store.insert([
-        { subject: contextGraphUri, predicate: DKG_ONTOLOGY.DKG_REGISTRATION_STATUS, object: `"registered"`, graph: cgMetaGraph },
-      ]);
-      return { onChainId: existingOnChainId, txHash: undefined };
+      const sub = this.subscribedContextGraphs.get(id);
+      if (sub) {
+        this.setContextGraphSubscription(id, { ...sub, onChainId: undefined });
+      }
     }
 
     // LU-2: edge-owned CG pattern — no `participantIdentityIds`/
@@ -13500,7 +14862,17 @@ export class DKGAgent {
   /**
    * Reject a pending join request.
    */
-  async rejectJoinRequest(contextGraphId: string, agentAddress: string): Promise<void> {
+  async rejectJoinRequest(contextGraphId: string, agentAddress: string, callerAgentAddress?: string): Promise<void> {
+    // SECURITY (G1): reject is a curator-only ACL decision. Previously this
+    // method had NO owner check while `approveJoinRequest` was gated (via
+    // `inviteAgentToContextGraph` → `assertCallerIsOwner`), so any local-token
+    // caller could reject a pending request — and the route only ran the
+    // write preflight (CG-exists/locally-writable), not a curator check.
+    // Mirror the approve path: assert the caller is the CG owner/curator
+    // BEFORE mutating state or notifying the joiner. Throws "Only the context
+    // graph curator can …" (403 at the route) for a non-curator.
+    await this.assertContextGraphOwner(contextGraphId, callerAgentAddress, 'manage join requests');
+
     const cgMetaGraph = contextGraphMetaGraphUri(contextGraphId);
     const requestUri = `did:dkg:join-request:${contextGraphId}:${agentAddress.toLowerCase()}`;
     const DKG = 'https://dkg.network/ontology#';
@@ -14433,7 +15805,7 @@ export class DKGAgent {
     // system param off-chain via the adapter accessor.
     //
     // FAIL-CLOSED (Codex PR #595 round-3): `chain.verify()` only calls
-    // `registerKnowledgeCollection()` — it does NOT submit the collected
+    // `registerKnowledgeAsset()` — it does NOT submit the collected
     // signatures on-chain. This local quorum check is therefore the
     // *only* enforcement gate. If the chain adapter can't tell us the
     // system minimum (RPC outage, missing method, invalid value), we
@@ -14646,8 +16018,8 @@ export class DKGAgent {
     // 7. Submit on-chain only after quorum. Partial writes above are
     // metadata-only and deliberately do not claim a transaction hash.
     let txResult: { hash: string; blockNumber: number };
-    const existingContextGraphId = typeof this.chain.getKCContextGraphId === 'function'
-      ? await this.chain.getKCContextGraphId(opts.batchId).catch(() => 0n)
+    const existingContextGraphId = typeof this.chain.getKAContextGraphId === 'function'
+      ? await this.chain.getKAContextGraphId(opts.batchId).catch(() => 0n)
       : 0n;
     if (existingContextGraphId === contextGraphIdOnChain) {
       const provenance = await this.getBatchChainProvenance(opts.contextGraphId, opts.batchId);
@@ -15823,6 +17195,52 @@ export class DKGAgent {
     if (sub?.onChainHash) return sub.onChainHash;
     if (/^0x[0-9a-fA-F]{64}$/.test(localId)) return localId.toLowerCase();
     return ethers.keccak256(ethers.toUtf8Bytes(localId)).toLowerCase();
+  }
+
+  /**
+   * OT-RFC-39 Codex review (round 2) on PR #727:
+   * `gossipWireIdFor(rawId)` would happily keccak a literal numeric
+   * string ("42") as if it were cleartext, producing a hash that does
+   * NOT equal the curator-committed `nameHash`. That's fine in any
+   * context where the input is guaranteed to be either cleartext or
+   * bare hex (gossip-topic construction, host-mode bookkeeping). The
+   * LU-11 ciphertext-chunk-store named graph is more sensitive: a
+   * remote requester / ACK PublishIntent may legitimately carry the
+   * numeric on-chain id, and pinning a SPARQL `GRAPH` to the wrong
+   * hash means the lookup misses every persisted chunk and declines
+   * a valid publish (Bug #4) or returns `chunk not found` (Bug #5).
+   *
+   * This helper resolves the canonical wire form for chunk-store
+   * routing OR returns null to signal "use wildcard `GRAPH ?g`
+   * fallback" — caller's responsibility. Numeric ids that can't be
+   * resolved through the local subscription map (chain replay hasn't
+   * caught up; CG isn't locally registered) return null rather than
+   * silently producing the wrong hash.
+   *
+   * Routing rules (first match wins):
+   *   1. `0x[64-hex]`             → lowercase, already wire form
+   *   2. Tracked in `subscribedContextGraphs` → `gossipWireIdFor` (returns the onChainHash)
+   *   3. Pure decimal → `resolveLocalCgIdByOnChainId` then wire-form; null if unknown
+   *   4. Everything else (cleartext) → `gossipWireIdFor` (keccak of the cleartext bytes)
+   *
+   * Rule 3 NEVER falls through to a raw keccak of the decimal string —
+   * that would reproduce the exact bug Codex called out. The caller
+   * MUST handle the null return by widening to a wildcard scan.
+   */
+  private canonicalChunkStoreCgIdOrNull(rawId: string): string | null {
+    if (typeof rawId !== 'string' || rawId.length === 0) return null;
+    if (/^0x[0-9a-fA-F]{64}$/.test(rawId)) return rawId.toLowerCase();
+    if (this.subscribedContextGraphs.has(rawId)) return this.gossipWireIdFor(rawId);
+    if (/^\d+$/.test(rawId)) {
+      try {
+        const local = this.resolveLocalCgIdByOnChainId(BigInt(rawId));
+        if (local === null) return null;
+        return this.gossipWireIdFor(local);
+      } catch {
+        return null;
+      }
+    }
+    return this.gossipWireIdFor(rawId);
   }
 
   /**
@@ -17773,7 +19191,11 @@ export class DKGAgent {
   async stop(): Promise<void> {
     if (!this.started) return;
     if (this.chainPoller) {
-      this.chainPoller.stop();
+      // Await so any in-flight poll (and its HTTP keep-alive socket) settles
+      // BEFORE we tear down the chain adapter — otherwise the RPC connection
+      // closure surfaces as an `ECONNRESET` unhandled rejection from inside
+      // ethers (the same flake that has been hitting `publisher [2/4]` in CI).
+      await this.chainPoller.stop();
       this.chainPoller = null;
     }
     if (this.swmCleanupTimer) {
@@ -17791,6 +19213,10 @@ export class DKGAgent {
     if (this.beaconReannounceTimer) {
       clearInterval(this.beaconReannounceTimer);
       this.beaconReannounceTimer = undefined;
+    }
+    if (this.agentProfileHeartbeatTimer) {
+      clearInterval(this.agentProfileHeartbeatTimer);
+      this.agentProfileHeartbeatTimer = undefined;
     }
     if (this.syncReconcilerTimer) {
       clearInterval(this.syncReconcilerTimer);
@@ -17925,7 +19351,7 @@ export class DKGAgent {
   private createV10ACKProvider(contextGraphId: string) {
     if (!this.router || !this.gossip) return undefined;
     // `isV10Ready()` is the authoritative V10 capability gate. Using it
-    // (instead of probing for `createKnowledgeAssetsV10`) keeps
+    // (instead of probing for `createKnowledgeAssets`) keeps
     // `NoChainAdapter` — whose stub methods throw — out of the V10 path.
     if (typeof this.chain.isV10Ready !== 'function' || !this.chain.isV10Ready()) return undefined;
     // Require on-chain identity verification to prevent accepting unverified ACKs
@@ -17938,7 +19364,7 @@ export class DKGAgent {
     // `chain.getEvmChainId is not a function`. Mirrors the guard at
     // `packages/cli/src/publisher-runner.ts:createV10ACKProviderForPublisher`.
     if (typeof this.chain.getEvmChainId !== 'function') return undefined;
-    if (typeof this.chain.getKnowledgeAssetsV10Address !== 'function') return undefined;
+    if (typeof this.chain.getKnowledgeAssetsLifecycleAddress !== 'function') return undefined;
 
     const collector = new ACKCollector({
       gossipPublish: async (topic: string, data: Uint8Array) => {
@@ -17979,6 +19405,20 @@ export class DKGAgent {
             }
           }
         : undefined,
+      // Surface the structured verifier when the chain adapter implements
+      // it. Translates a thrown chain-side exception into an explicit
+      // `'rpc-error'` reason so the ACKCollector can log infra failures
+      // distinctly from definitive key/stake rejections — pre-PR this
+      // try/catch swallowed RPC errors as `false`, conflating them.
+      verifyIdentityDetailed: typeof this.chain.verifyACKIdentityDetailed === 'function'
+        ? async (recoveredAddress: string, claimedIdentityId: bigint) => {
+            try {
+              return await this.chain.verifyACKIdentityDetailed!(recoveredAddress, claimedIdentityId);
+            } catch {
+              return { valid: false, reason: 'rpc-error' as const };
+            }
+          }
+        : undefined,
       log: (msg: string) => {
         const ctx = createOperationContext('publish');
         this.log.info(ctx, msg);
@@ -18000,6 +19440,14 @@ export class DKGAgent {
       subGraphName: string | undefined,
       merkleLeafCount: number,
       isEncryptedPayload?: boolean,
+      // OT-RFC-38 LU-11 — when present, the publisher's chunked
+      // emitter has already AEAD-encrypted + SWM-gossiped per-chunk
+      // ciphertexts. The collector routes through V2 ACK with empty
+      // stagingQuads and these fields populating PublishIntent.
+      chunkedCommitment?: {
+        ciphertextChunksRoot: Uint8Array;
+        ciphertextChunkCount: number;
+      },
     ) => {
       // Fail loud on non-numeric or non-positive CG ids: V10 publish requires
       // a real on-chain context graph and the contract rejects `cgId == 0`
@@ -18063,9 +19511,9 @@ export class DKGAgent {
       }
       let kav10Address: string;
       try {
-        kav10Address = await chain.getKnowledgeAssetsV10Address();
+        kav10Address = await chain.getKnowledgeAssetsLifecycleAddress();
       } catch (err) {
-        throw wrapAsRpcPreconditionIfApplicable(err, 'getKnowledgeAssetsV10Address');
+        throw wrapAsRpcPreconditionIfApplicable(err, 'getKnowledgeAssetsLifecycleAddress');
       }
 
       const result = await collector.collect({
@@ -18087,6 +19535,7 @@ export class DKGAgent {
         subGraphName,
         merkleLeafCount,
         isEncryptedPayload,
+        chunkedCommitment,
       });
       return result.acks;
     };

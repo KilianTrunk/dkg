@@ -34,6 +34,7 @@ export async function startPublisherRuntimeIfEnabled(args: {
   keypair: Ed25519Keypair;
   chainBase?: {
     rpcUrl: string;
+    rpcUrls?: string[];
     hubAddress: string;
     chainId?: string;
   };
@@ -76,6 +77,7 @@ interface PublisherRuntimeBaseArgs {
   store: TripleStore;
   chainBase?: {
     rpcUrl: string;
+    rpcUrls?: string[];
     hubAddress: string;
     chainId?: string;
   };
@@ -111,7 +113,7 @@ export async function createPublisherRuntime(args: {
   // finality but still functions).
   const merged = resolveChainConfig(args.config, network);
   const chainBase = merged?.rpcUrl && merged?.hubAddress
-    ? { rpcUrl: merged.rpcUrl, hubAddress: merged.hubAddress, chainId: merged.chainId }
+    ? { rpcUrl: merged.rpcUrl, rpcUrls: merged.rpcUrls, hubAddress: merged.hubAddress, chainId: merged.chainId }
     : undefined;
   return createPublisherRuntimeFromBase({
     dataDir: args.dataDir,
@@ -162,6 +164,7 @@ export async function createPublisherRuntimeFromAgent(args: {
   keypair: Ed25519Keypair;
   chainBase?: {
     rpcUrl: string;
+    rpcUrls?: string[];
     hubAddress: string;
     chainId?: string;
   };
@@ -201,6 +204,7 @@ async function createPublisherRuntimeFromBase(args: PublisherRuntimeBaseArgs): P
     const chain = args.chainBase
       ? new EVMChainAdapter({
           rpcUrl: args.chainBase.rpcUrl,
+          rpcUrls: args.chainBase.rpcUrls,
           privateKey: wallet.privateKey,
           hubAddress: args.chainBase.hubAddress,
           chainId: args.chainBase.chainId,
@@ -262,7 +266,7 @@ async function createPublisherRuntimeFromBase(args: PublisherRuntimeBaseArgs): P
         ? { ...publishOptions, v10ACKProvider }
         : publishOptions;
       // Capability gate: use `isV10Ready()` (the authoritative V10 runtime
-      // signal) rather than probing for `createKnowledgeAssetsV10`. Since the
+      // signal) rather than probing for `createKnowledgeAssets`. Since the
       // interface made the method required, `NoChainAdapter` now implements
       // it as a throwing stub, so a `typeof === 'function'` probe would
       // mis-route no-chain mode into the V10 ACK-gated path and crash.
@@ -309,9 +313,13 @@ function createV10ACKProviderForPublisher(
     chain?: {
       isV10Ready?: () => boolean;
       verifyACKIdentity?: (recoveredAddress: string, claimedIdentityId: bigint) => Promise<boolean>;
+      verifyACKIdentityDetailed?: (
+        recoveredAddress: string,
+        claimedIdentityId: bigint,
+      ) => Promise<{ valid: boolean; reason?: 'key-not-registered' | 'not-in-sharding-table' | 'rpc-error' }>;
       getMinimumRequiredSignatures?: () => Promise<number>;
       getEvmChainId?: () => Promise<bigint>;
-      getKnowledgeAssetsV10Address?: () => Promise<string>;
+      getKnowledgeAssetsLifecycleAddress?: () => Promise<string>;
     };
   }).chain;
   // `isV10Ready()` is the authoritative capability gate — rejects
@@ -322,13 +330,19 @@ function createV10ACKProviderForPublisher(
   // address. Without them the collector cannot build a digest that matches
   // what core-node handlers sign, so refuse to hand back a provider at all.
   if (typeof chain.getEvmChainId !== 'function') return undefined;
-  if (typeof chain.getKnowledgeAssetsV10Address !== 'function') return undefined;
+  if (typeof chain.getKnowledgeAssetsLifecycleAddress !== 'function') return undefined;
 
   const collector = new ACKCollector({
     gossipPublish: transport.gossipPublish,
     sendP2P: transport.sendP2P,
     getConnectedCorePeers: transport.getConnectedCorePeers,
     verifyIdentity: async (recoveredAddress: string, claimedIdentityId: bigint) => chain.verifyACKIdentity!(recoveredAddress, claimedIdentityId),
+    // Prefer the structured verifier when the chain adapter exposes it
+    // so the rejection log can report the specific failing gate.
+    ...(typeof chain.verifyACKIdentityDetailed === 'function' ? {
+      verifyIdentityDetailed: async (recoveredAddress: string, claimedIdentityId: bigint) =>
+        chain.verifyACKIdentityDetailed!(recoveredAddress, claimedIdentityId),
+    } : {}),
     log: transport.log,
   });
 
@@ -399,9 +413,9 @@ function createV10ACKProviderForPublisher(
     }
     let kav10Address: string;
     try {
-      kav10Address = await chain.getKnowledgeAssetsV10Address!();
+      kav10Address = await chain.getKnowledgeAssetsLifecycleAddress!();
     } catch (err) {
-      throw wrapAsRpcPreconditionIfApplicable(err, 'getKnowledgeAssetsV10Address');
+      throw wrapAsRpcPreconditionIfApplicable(err, 'getKnowledgeAssetsLifecycleAddress');
     }
     const result = await collector.collect({
       merkleRoot,

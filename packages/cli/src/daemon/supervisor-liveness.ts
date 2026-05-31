@@ -131,18 +131,34 @@ export interface LivenessWatcherOpts {
   /**
    * Optional graceful-shutdown detector. Called on every failed probe BEFORE
    * the consecutive-failure counter is incremented. If it returns truthy, the
-   * watcher disarms — the worker is in the slow tail of an intentional
-   * shutdown (e.g. `agent.stop()` / DB close after `server.close()`), and
-   * SIGKILLing now would skip the rest of teardown.
+   * watcher enters a bounded shutdown-grace window — failed probes during
+   * this window do not count toward the SIGKILL threshold so we don't
+   * SIGKILL the worker mid-teardown (e.g. `agent.stop()` / DB close after
+   * `server.close()`).
    *
    * The supervisor wires this to `existsSync(apiPortFile) === false`: the
    * worker's `shutdown()` removes `api.port` BEFORE the slow awaits, so its
    * absence is the "graceful shutdown initiated" signal the watcher needs.
-   * Without this check, a slow cleanup tail (or future `SHUTDOWN_HARD_TIMEOUT_MS`
-   * bump above ~2.5 min) would race with `consecutiveFailuresToKill * intervalMs`
-   * and SIGKILL the worker mid-teardown.
+   *
+   * Codex (#664#discussion_r3302432762): the previous implementation
+   * PERMANENTLY disarmed the watcher on the first shutdown observation.
+   * If a later teardown step hung (DB close, network shutdown, …), the
+   * supervisor could no longer SIGKILL or respawn the worker. The fix:
+   * keep probing during shutdown, but only fire SIGKILL after a bounded
+   * grace window (`shutdownGraceMs`) so the worker's own
+   * SHUTDOWN_HARD_TIMEOUT_MS gets first crack at force-exiting itself.
    */
   isShuttingDown?: () => boolean | Promise<boolean>;
+  /**
+   * Maximum time to wait after the worker enters graceful shutdown before
+   * the watcher resumes counting failures toward `consecutiveFailuresToKill`.
+   * Default is 2× `SHUTDOWN_HARD_TIMEOUT_MS` (30s) — comfortably longer than
+   * the daemon's own self-force-exit deadline so a healthy graceful shutdown
+   * finishes inside the window; only a wedged teardown reaches the SIGKILL
+   * path. Set to a negative value to disable the bounded fallback (legacy
+   * "disarm forever" behavior).
+   */
+  shutdownGraceMs?: number;
 }
 
 /**
@@ -161,10 +177,17 @@ export function startLivenessWatcher(opts: LivenessWatcherOpts): { stop(): void 
   const threshold = opts.consecutiveFailuresToKill ?? LIVENESS_CONSECUTIVE_FAILURES_TO_KILL;
   const probe = opts.probe ?? probeWorkerAlive;
   const host = opts.host ?? '127.0.0.1';
+  // Default to 2× the worker's own hard-shutdown deadline; if the worker's
+  // self-force-exit fires first the watcher never needs to kill anyway.
+  const shutdownGraceMs = opts.shutdownGraceMs ?? 2 * 15_000;
 
   let consecutiveFailures = 0;
   let probing = false;
   let stopped = false;
+  // Codex #664: track WHEN graceful shutdown was first observed so we can
+  // re-arm the SIGKILL path after `shutdownGraceMs` expires. `null` means
+  // we are not in graceful-shutdown mode yet.
+  let shutdownObservedAt: number | null = null;
 
   const tick = async () => {
     if (stopped || probing) return;
@@ -174,28 +197,47 @@ export function startLivenessWatcher(opts: LivenessWatcherOpts): { stop(): void 
       if (stopped) return;
       if (alive) {
         consecutiveFailures = 0;
+        // A successful probe AFTER shutdown was observed means the worker
+        // re-bound the listener (extremely unlikely on the shutdown path)
+        // or the file-based detector lied. Re-arm the watcher.
+        shutdownObservedAt = null;
         return;
       }
-      // Probe failed. Before counting it toward the SIGKILL threshold,
-      // ask the supervisor whether the worker is in a graceful shutdown
-      // (api.port file absent — see `LivenessWatcherOpts.isShuttingDown`).
-      // If so, disarm the watcher: SIGKILLing now would bypass `agent.stop()`,
-      // DB close, and pid cleanup, leaving local state dirty.
+      // Probe failed. Before counting toward the SIGKILL threshold, check
+      // graceful-shutdown state. We DO NOT permanently disarm here — see
+      // Codex #664#discussion_r3302432762: a watcher that stays disarmed
+      // for the whole shutdown tail can never recover the process if a
+      // later await hangs (DB close, network shutdown, …).
       if (opts.isShuttingDown) {
+        let inShutdown = false;
         try {
-          if (await opts.isShuttingDown()) {
-            stopped = true;
-            return;
-          }
+          inShutdown = !!(await opts.isShuttingDown());
         } catch {
           /* shutdown detector errors shouldn't unconditionally arm the SIGKILL path; treat as "still alive" and keep counting failures. */
+        }
+        if (inShutdown) {
+          if (shutdownObservedAt === null) {
+            shutdownObservedAt = Date.now();
+            consecutiveFailures = 0;
+          }
+          const elapsedMs = Date.now() - shutdownObservedAt;
+          // Within the grace window OR the operator opted out of the
+          // bounded fallback (`shutdownGraceMs < 0`): suppress failure
+          // counting so the worker's own graceful teardown can complete
+          // without supervisor interference.
+          if (shutdownGraceMs < 0 || elapsedMs < shutdownGraceMs) {
+            consecutiveFailures = 0;
+            return;
+          }
+          // Grace window exceeded: fall through and count this as a real
+          // failure so a wedged teardown still gets SIGKILLed + respawned.
+        } else {
+          shutdownObservedAt = null;
         }
       }
       consecutiveFailures += 1;
       opts.onFailure?.(consecutiveFailures);
       if (consecutiveFailures >= threshold) {
-        // Reset BEFORE firing the kill — otherwise a slow respawn would
-        // hit the threshold again before the new worker's listener binds.
         consecutiveFailures = 0;
         opts.onUnresponsive();
       }

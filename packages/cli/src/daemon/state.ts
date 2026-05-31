@@ -108,13 +108,21 @@ export const daemonState: {
  * stays exported (and is the underlying probe) but doesn't honour the override.
  */
 export function resolveStandaloneInstall(
-  source?: 'auto' | 'npm' | 'git',
+  source?: 'auto' | 'npm' | 'git' | 'monorepo',
 ): boolean {
   if (source === 'npm') {
     daemonState.standaloneCache = true;
     return true;
   }
-  if (source === 'git') {
+  if (source === 'git' || source === 'monorepo') {
+    // OT-RFC-41 §4.3 Bundle B1d: 'monorepo' is the new sentinel for
+    // dev checkouts (set by Bundle B's `dkg init` monorepo guard
+    // when a contributor opts in via DKG_HOME). For the
+    // standalone-vs-git probe it behaves identically to the legacy
+    // 'git' value — auto-update is monorepo-style ("git pull" in
+    // the dev tree) — until the git-build path itself is deleted
+    // in PR 5, at which point monorepo daemons stop auto-updating
+    // entirely.
     daemonState.standaloneCache = false;
     return false;
   }

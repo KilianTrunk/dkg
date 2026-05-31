@@ -53,6 +53,19 @@ export interface DaemonStatusResponse {
   relayConnected: boolean;
   multiaddrs: string[];
   relay: RelayStatusResponse;
+  chain?: {
+    chainId: string | null;
+    configured: boolean;
+    rpcEndpointCount: number;
+    hubConfigured: boolean;
+  } | null;
+  // Triple-store backend fields (RFC 120). For local backends only
+  // `storeBackend` is meaningful; external backends additionally surface
+  // `storeUrl` and a TTL-cached `storeQuads` count. `null` when local /
+  // unreachable.
+  storeBackend?: string;
+  storeUrl?: string | null;
+  storeQuads?: number | null;
 }
 
 export class ApiClient {
@@ -250,7 +263,7 @@ export class ApiClient {
     allowedPeers?: string[];
     publisherNodeIdentityIdOverride?: bigint;
   }): Promise<{
-    kcId: string;
+    kaId: string;
     status: 'tentative' | 'confirmed';
     kas: Array<{ tokenId: string; rootEntity: string }>;
     txHash?: string;
@@ -318,7 +331,7 @@ export class ApiClient {
     clearAfter = true,
     options?: { subGraphName?: string; publisherNodeIdentityIdOverride?: bigint },
   ): Promise<{
-    kcId: string;
+    kaId: string;
     status: 'tentative' | 'confirmed';
     kas: Array<{ tokenId: string; rootEntity: string }>;
     txHash?: string;
@@ -475,7 +488,7 @@ export class ApiClient {
       publisherNodeIdentityIdOverride?: bigint;
     },
   ): Promise<{
-    kcId: string;
+    kaId: string;
     status: 'tentative' | 'confirmed';
     assertionUri: string;
     authorAddress: string;
@@ -520,7 +533,7 @@ export class ApiClient {
     },
   ): Promise<{
     assertionUri: string;
-    kcId: string;
+    kaId: string;
     status: 'tentative' | 'confirmed';
     authorAddress: string;
     merkleRoot: string;
@@ -558,7 +571,7 @@ export class ApiClient {
     );
     return {
       assertionUri: created.assertionUri,
-      kcId: published.kcId,
+      kaId: published.kaId,
       status: published.status,
       authorAddress: published.authorAddress,
       merkleRoot: published.merkleRoot,
@@ -787,9 +800,9 @@ export class ApiClient {
   /**
    * Run SPARQL via the daemon. `opts` covers the full /api/query surface —
    * memory-layer routing (`view`, `graphSuffix`, `verifiedGraph`,
-   * `subGraphName`, `includeSharedMemory`, `agentAddress`,
-   * `assertionName`), and P-13's `minTrust` (only meaningful on
-   * `view: "verified-memory"`; ignored elsewhere). `contextGraphId` stays
+   * `subGraphName`, `includeSharedMemory`, `includeContextGraphPartitions`,
+   * `agentAddress`, `assertionName`), and P-13's `minTrust` (only meaningful
+   * on `view: "verified-memory"`; ignored elsewhere). `contextGraphId` stays
    * in the 2nd positional slot for backwards compatibility.
    */
   async query(
@@ -798,6 +811,7 @@ export class ApiClient {
     opts?: {
       graphSuffix?: string;
       includeSharedMemory?: boolean;
+      includeContextGraphPartitions?: boolean;
       view?: 'working-memory' | 'shared-working-memory' | 'verified-memory';
       agentAddress?: string;
       assertionName?: string;
@@ -819,6 +833,7 @@ export class ApiClient {
       contextGraphId,
       graphSuffix: opts?.graphSuffix,
       includeSharedMemory: opts?.includeSharedMemory,
+      includeContextGraphPartitions: opts?.includeContextGraphPartitions,
       view: opts?.view,
       agentAddress: opts?.agentAddress,
       assertionName: opts?.assertionName,

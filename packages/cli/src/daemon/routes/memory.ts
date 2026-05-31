@@ -57,7 +57,7 @@ const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
 import { enrichEvmError, MockChainAdapter } from '@origintrail-official/dkg-chain';
 import { DKGAgent, loadOpWallets } from '@origintrail-official/dkg-agent';
-import { computeNetworkId, createOperationContext, DKGEvent, Logger, PayloadTooLargeError, GET_VIEWS, TrustLevel, validateSubGraphName, validateAssertionName, validateContextGraphId, isSafeIri, assertSafeIri, assertSafeRdfTerm, sparqlIri, contextGraphSharedMemoryUri, contextGraphAssertionUri, contextGraphMetaUri, escapeDkgRdfLiteral } from '@origintrail-official/dkg-core';
+import { computeNetworkId, createOperationContext, DKGEvent, Logger, PayloadTooLargeError, GET_VIEWS, TrustLevel, validateSubGraphName, validateAssertionName, validateContextGraphId, isSafeIri, assertSafeIri, assertSafeRdfTerm, sparqlIri, contextGraphSharedMemoryUri, contextGraphAssertionUri, contextGraphMetaUri, escapeDkgRdfLiteral, escapeSparqlLiteral } from '@origintrail-official/dkg-core';
 import { findReservedSubjectPrefix, isSkolemizedUri, type PublishOptions } from '@origintrail-official/dkg-publisher';
 import {
   DashboardDB,
@@ -107,6 +107,7 @@ import {
 import { createPublisherControlFromStore, startPublisherRuntimeIfEnabled, type PublisherRuntime } from '../../publisher-runner.js';
 import { createCatchupRunner, type CatchupJobResult, type CatchupRunner } from '../../catchup-runner.js';
 import { loadTokens, httpAuthGuard, extractBearerToken } from '../../auth.js';
+import { recordAssertionActivity } from '../activity-notification.js';
 import { ExtractionPipelineRegistry } from '@origintrail-official/dkg-core';
 import { MarkItDownConverter, isMarkItDownAvailable, extractFromMarkdown, extractWithLlm } from '../../extraction/index.js';
 import {
@@ -237,15 +238,10 @@ import {
   getCurrentCliVersion,
   type NpmVersionStatus,
   checkForNpmVersionUpdate,
-  checkForNewCommit,
-  checkForNewCommitWithStatus,
   type UpdateStatus,
   acquireUpdateLock,
   releaseUpdateLock,
-  performUpdate,
-  performUpdateWithStatus,
   performNpmUpdate,
-  checkForUpdate,
 } from '../auto-update.js';
 import {
   OPENCLAW_UI_CONNECT_TIMEOUT_MS,
@@ -427,6 +423,7 @@ export async function handleMemoryRoutes(ctx: RequestContext): Promise<void> {
     requestToken,
     requestAgentAddress,
     emitMemoryGraphChanged,
+    emitNotification,
   } = ctx;
   const writePreflightCallerAgentAddress = requestToken
     ? agent.resolveAgentByToken(requestToken)
@@ -1218,7 +1215,7 @@ WHERE {
     }
 
     const chain: any = (agent as any).chain ?? (agent as any).chainAdapter;
-    const kavAddress = chain?.contracts?.knowledgeAssetsV10?.target?.toString()
+    const kavAddress = chain?.contracts?.knowledgeAssetsLifecycle?.target?.toString()
       ?? chain?.kavAddress
       ?? parsed.kavAddress;
     const chainId = chain?.chainId ?? parsed.chainId ?? '31337';
@@ -1239,7 +1236,7 @@ WHERE {
     // wrong-domain, with no diagnostic linking back to the actual CG.
     // Three resolution layers, all fail-closed:
     //   1. Caller-supplied `onChainContextGraphId` (explicit override).
-    //   2. Chain-truth via `chain.getKCContextGraphId(batchId)` —
+    //   2. Chain-truth via `chain.getKAContextGraphId(batchId)` —
     //      authoritative because the KC ↔ CG binding is on-chain.
     //   3. Local CG listing (last-resort, may be stale post-event-replay).
     // If none resolve, reject with 400 — minting against id=0 is never
@@ -1249,8 +1246,8 @@ WHERE {
       onChainCgId = parsed.onChainContextGraphId;
     } else {
       try {
-        if (typeof chain?.getKCContextGraphId === 'function' && /^\d+$/.test(String(batchId))) {
-          const chainCgId = await chain.getKCContextGraphId(BigInt(batchId)).catch(() => null);
+        if (typeof chain?.getKAContextGraphId === 'function' && /^\d+$/.test(String(batchId))) {
+          const chainCgId = await chain.getKAContextGraphId(BigInt(batchId)).catch(() => null);
           if (chainCgId != null && chainCgId !== 0n) {
             onChainCgId = chainCgId.toString();
           }
@@ -1635,7 +1632,7 @@ WHERE {
         tracker.complete(ctx2, { tripleCount: result.kaManifest?.length ?? 0 });
         const httpStatus = result.contextGraphError ? 207 : 200;
         return jsonResponse(res, httpStatus, {
-          kcId: String(result.kcId),
+          kaId: String(result.kaId),
           status: result.status,
           assertionUri: result.assertionUri,
           authorAddress: result.seal.authorAddress,
@@ -1849,9 +1846,26 @@ WHERE {
           triples: publicTripleCount,
         },
       });
+      // ADR-002 (CR-1): scoped `published` activity row (SWM→VM). This is the
+      // ONLY local-publish site with the author + dashDb in scope — the
+      // assertion routes have no VM-publish transition, so `published` is
+      // emitted here, not there. Cross-node publishes are handled
+      // (remote-only, membership-gated) by the KC_PUBLISHED handler in
+      // lifecycle.ts so a local publish is never double-counted.
+      try {
+        recordAssertionActivity(dashDb, {
+          contextGraphId: resolvedContextGraphId,
+          kind: "published",
+          actorAgentAddress: resolvedAuthorAgentAddress ?? requestAgentAddress,
+          subGraphName,
+          entityCount: rootCount,
+          tripleCount: publicTripleCount,
+        });
+        emitNotification?.({ contextGraphId: resolvedContextGraphId, type: "assertion_activity" });
+      } catch { /* never break the publish path */ }
       const httpStatus = result.contextGraphError ? 207 : 200;
       return jsonResponse(res, httpStatus, {
-        kcId: String(result.kcId),
+        kaId: String(result.kaId),
         status: result.status,
         kas: result.kaManifest.map((ka: any) => ({ tokenId: String(ka.tokenId), rootEntity: ka.rootEntity })),
         ...(chain && { txHash: chain.txHash, blockNumber: chain.blockNumber }),
@@ -2204,8 +2218,11 @@ WHERE {
       }
     }
 
-    // Fan-out 2: SPARQL text search (scoped to the requested CG + layers)
-    const escapedQuery = query.replace(/"/g, '\\"').toLowerCase();
+    // Fan-out 2: SPARQL text search (scoped to the requested CG + layers).
+    // escapeSparqlLiteral escapes backslashes, quotes, and CR/LF/TAB per the
+    // SPARQL STRING_LITERAL2 grammar — a simple `replace(/"/g, '\\"')` would
+    // still allow `\` to escape the closing quote and break out of the literal.
+    const escapedQuery = escapeSparqlLiteral(query.toLowerCase());
     const cgUri = `did:dkg:context-graph:${contextGraphId}`;
     const graphFilters = memoryLayers.map((l: string) => {
       if (l === 'swm') return `STRSTARTS(STR(?g), "${cgUri}/_shared_memory")`;

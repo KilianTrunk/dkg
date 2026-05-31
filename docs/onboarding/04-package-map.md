@@ -195,7 +195,7 @@ The `dkg` command-line tool. Provides commands for node lifecycle (`init`, `star
 ### @origintrail-official/dkg-node-ui
 `packages/node-ui/`
 
-A dashboard backend and React frontend for monitoring a running DKG node. The backend provides `DashboardDB` (SQLite-based metrics, operation tracking, chat history, query logs), `StructuredLogger`, `MetricsCollector`, `OperationTracker`, and OpenTelemetry integration. The frontend (built with Vite) provides a visual dashboard with charts (Recharts), a SPARQL query editor (CodeMirror), and a knowledge graph explorer (using `graph-viz`).
+A dashboard backend and React frontend for monitoring a running DKG node. The backend provides `DashboardDB` (SQLite-based metrics, operation tracking, chat history, query logs), `MetricsCollector`, `OperationTracker`, and OpenTelemetry integration. The frontend (built with Vite) provides a visual dashboard with charts (Recharts), a SPARQL query editor (CodeMirror), and a knowledge graph explorer (using `graph-viz`).
 
 **Depends on**: `core`, `graph-viz`.
 

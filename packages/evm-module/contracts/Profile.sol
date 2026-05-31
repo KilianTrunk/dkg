@@ -31,7 +31,39 @@ contract Profile is INamed, IVersioned, ContractStatus, IInitializable {
     // (testnet ProfileStorage-redeploy recovery). The id is reused so the
     // surviving staking/conviction/sharding state stays addressable. See
     // docs/adr/0001-recreate-profile-admin-only.md.
-    string private constant _VERSION = "1.3.0";
+    // Bumped 1.3.0 -> 1.4.0: recreateProfile drops the
+    // `initialOperatorFee` argument and seeds the recovered profile at
+    // fee = 0; admin sets the real fee via the cooldown-gated
+    // `updateOperatorFee` path (keeps the recovery and steady-state
+    // surfaces symmetric on the operator-fee dimension). Also adds
+    // explicit operational-key uniqueness pre-flight validation inside
+    // createProfile so collision diagnostics surface at the entrypoint
+    // instead of mid-loop inside `Identity.addOperationalWallets`.
+    // Bumped 1.4.0 -> 1.4.1: the createProfile op-wallet validation block
+    // emits distinct errors for the local collision classes
+    // (`OperationalWalletDuplicate` / `OperationalWalletAlreadyPrimary` /
+    // `OperationalWalletEqualsAdmin`) instead of overloading
+    // `OperationalKeyTaken(bytes32)`. Pure diagnostic refinement, no
+    // behaviour change for valid callers. The cross-identity (global
+    // `identityIds`) collision still surfaces as `OperationalKeyTaken`.
+    // Bumped 1.4.1 -> 1.4.2: the createProfile op-wallet validation block
+    // is removed entirely. The single source of truth moves into
+    // `Identity.addOperationalWallets`.
+    // Bumped 1.4.2 -> 1.4.3: `createProfile` may be called by either the
+    // admin wallet or the primary operational wallet. When the admin calls,
+    // `operationalWallets[0]` is the primary operational key and any
+    // additional entries are attached after identity creation.
+    // `Identity.addOperationalWallets` (Identity 1.1.0), which now
+    // disambiguates same-identity duplicates (primary added by
+    // `createIdentity` OR intra-array dup) from cross-identity
+    // collisions via the same `OperationalWalletDuplicate(wallet)` /
+    // `OperationalKeyTaken(key)` error pair. Admin/operational overlap
+    // surfaces as `KeyAlreadyAttached(key)` from Identity. Eliminates
+    // the duplicate validation pass on the happy path; atomic-revert
+    // semantics make the prior "fail-fast at the entrypoint" rationale
+    // moot. `OperationalWalletAlreadyPrimary` and
+    // `OperationalWalletEqualsAdmin` are dropped from `IdentityLib`.
+    string private constant _VERSION = "10.0.2";
 
     Ask public askContract;
     Identity public identityContract;
@@ -104,7 +136,23 @@ contract Profile is INamed, IVersioned, ContractStatus, IInitializable {
         ProfileStorage ps = profileStorage;
         Identity id = identityContract;
 
-        if (ids.getIdentityId(msg.sender) != 0) {
+        address operationalWallet;
+        if (msg.sender == adminWallet) {
+            if (operationalWallets.length == 0) {
+                revert ProfileLib.EmptyOperationalWallets();
+            }
+            operationalWallet = operationalWallets[0];
+        } else {
+            operationalWallet = msg.sender;
+        }
+
+        if (ids.getIdentityId(operationalWallet) != 0) {
+            revert ProfileLib.IdentityAlreadyExists(
+                ids.getIdentityId(operationalWallet),
+                operationalWallet
+            );
+        }
+        if (msg.sender != operationalWallet && ids.getIdentityId(msg.sender) != 0) {
             revert ProfileLib.IdentityAlreadyExists(ids.getIdentityId(msg.sender), msg.sender);
         }
         if (operationalWallets.length > parametersStorage.opWalletsLimitOnProfileCreation()) {
@@ -128,8 +176,33 @@ contract Profile is INamed, IVersioned, ContractStatus, IInitializable {
         if (initialOperatorFee > parametersStorage.maxOperatorFee()) {
             revert ProfileLib.OperatorFeeOutOfRange(initialOperatorFee);
         }
-        uint72 identityId = id.createIdentity(msg.sender, adminWallet);
-        id.addOperationalWallets(identityId, operationalWallets);
+
+        // `Identity.addOperationalWallets` (Identity 1.1.0) carries the
+        // single source of truth for the op-wallet validation suite:
+        //   - zero address                  → `OperationalAddressZero`
+        //   - intra-array dup / primary     → `OperationalWalletDuplicate(wallet)`
+        //   - cross-identity collision      → `OperationalKeyTaken(key)`
+        //   - admin/operational overlap     → `KeyAlreadyAttached(key)`
+        // Per-class diagnostics are surfaced from there, so this
+        // entrypoint no longer pays the gas of a duplicate pre-flight
+        // pass on the happy path. A failing tx reverts atomically, so
+        // there is never a partial / half-built identity to clean up.
+        uint72 identityId = id.createIdentity(operationalWallet, adminWallet);
+
+        if (msg.sender == adminWallet) {
+            if (operationalWallets.length > 1) {
+                address[] memory extraOps = new address[](operationalWallets.length - 1);
+                for (uint256 i = 1; i < operationalWallets.length; ) {
+                    extraOps[i - 1] = operationalWallets[i];
+                    unchecked {
+                        ++i;
+                    }
+                }
+                id.addOperationalWallets(identityId, extraOps);
+            }
+        } else {
+            id.addOperationalWallets(identityId, operationalWallets);
+        }
 
         ps.createProfile(identityId, nodeName, nodeId, initialOperatorFee);
     }
@@ -145,11 +218,18 @@ contract Profile is INamed, IVersioned, ContractStatus, IInitializable {
     // (a zero/unknown wallet resolves to id 0, which has no admin and
     // reverts). The identityId is reused — no new identity is minted — so
     // id-keyed staking/conviction/sharding state stays addressable.
+    //
+    // Profile 1.4.0: the `initialOperatorFee` argument is removed and the
+    // recovered profile is seeded at fee = 0. The admin sets the real
+    // value via the standard `updateOperatorFee` path, which carries the
+    // cooldown + prior-epoch-claim gate. Keeps the recovery and
+    // steady-state surfaces symmetric on the operator-fee dimension; the
+    // pre-redeploy fee history remains unrecoverable on-chain by design
+    // (testnet-only path, ADR 0001).
     function recreateProfile(
         address operationalWallet,
         string calldata nodeName,
-        bytes calldata nodeId,
-        uint16 initialOperatorFee
+        bytes calldata nodeId
     ) external onlyWhitelisted {
         uint72 identityId = identityStorage.getIdentityId(operationalWallet);
         _checkAdmin(identityId);
@@ -185,11 +265,11 @@ contract Profile is INamed, IVersioned, ContractStatus, IInitializable {
         if (ps.nodeIdsList(nodeId)) {
             revert ProfileLib.NodeIdAlreadyExists(nodeId);
         }
-        if (initialOperatorFee > parametersStorage.maxOperatorFee()) {
-            revert ProfileLib.OperatorFeeOutOfRange(initialOperatorFee);
-        }
 
-        ps.createProfile(identityId, nodeName, nodeId, initialOperatorFee);
+        // Hardcode seed fee to 0 — admin sets the real value via the
+        // standard `updateOperatorFee` path (cooldown-gated, prior-epoch
+        // settled). See the rationale block above.
+        ps.createProfile(identityId, nodeName, nodeId, 0);
 
         // ShardingTable survived a ProfileStorage-only redeploy: if this
         // node is already in the ring, Ask's active-set / pricing

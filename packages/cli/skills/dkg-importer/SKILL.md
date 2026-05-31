@@ -381,6 +381,98 @@ assertion's WM state is partial, you can either:
 - **Discard the partial assertion** with `POST /api/assertion/<name>/discard`
   and start over from your last `done` partition.
 
+### HTTP 400 on finalize/publish with `Rule 4: rootEntity ... already exists`
+
+This is the **#1 trap for "real-world" graph importers** — Wikidata, schema.org,
+Graphify-style code graphs, EPCIS event streams, anything where the same
+subject URI legitimately appears across many logical artefacts. It fires from
+the daemon's `autoPartition` step (during `finalize: true` on `create`, or as
+part of `/api/shared-memory/publish`) and looks like:
+
+```
+HTTP 400 "Rule 4 violation: rootEntity <http://www.wikidata.org/entity/Q2831>
+already exists as the root of knowledge collection 17 in context graph 4.
+Use POST /api/update to extend the existing knowledge collection."
+```
+
+**The rule**: every Knowledge Asset (KA) within a context graph has exactly
+one root entity, and a given subject URI can be the root of **at most one KA
+per CG**. Multiple KAs sharing a root would make on-chain ownership /
+attribution ambiguous, so the contract enforces uniqueness. The error
+message's `/api/update` hint is correct *if you want to extend the existing
+KA* — but for a bulk import producing many KAs that mention the same
+entities ("Michael Jackson appears in 500 of my 5,000 album KAs"), updating
+isn't what you want. You want each KA to have its own unrelated root.
+
+**The fix — partition-scoped blank-node rewrite**. Before submitting quads
+for partition `N`, rewrite every Wikidata / external URI to a partition-scoped
+blank node and anchor them under a single, unique-per-partition root:
+
+```ts
+function buildPartitionQuads(partitionIdx, rawQuads, anchorUri) {
+  // 1. Mint one partition-scoped anchor — this becomes the KA's sole root.
+  //    URI is unique per partition; blank nodes underneath it inherit
+  //    partition scope so Q2831 in partition 17 != Q2831 in partition 18
+  //    from the contract's perspective.
+  const anchor = `<${anchorUri}>`;     // e.g. urn:dkg:miles-stress:partition:17
+  const blankFor = new Map();          // subject-URI -> deterministic _:bN
+  let bnCounter = 0;
+  const blankNodeFor = (uri) => {
+    if (!blankFor.has(uri)) {
+      // Deterministic skolem-ish label keeps the rewrite repeatable across
+      // resume runs without coordinating state.
+      blankFor.set(uri, `_:p${partitionIdx}_b${bnCounter++}`);
+    }
+    return blankFor.get(uri);
+  };
+
+  // 2. Rewrite every non-anchor URI in the subject (and object, when an IRI)
+  //    position to its partition-scoped blank node.
+  //
+  // Detect IRIs generically via the RFC 3986 scheme grammar rather than
+  // hard-coding a scheme list. Earlier drafts checked only `http` / `urn:`,
+  // which silently misses valid RDF IRIs that use other schemes — `did:`,
+  // `ipfs:`, `tag:`, `file:`, plain-IRI imports etc. — and lets colliding
+  // root entities leak through to keep hitting Rule 4 on subsequent
+  // partitions. If your parser exposes `term.termType === 'NamedNode'`,
+  // prefer that over the regex.
+  const ABS_IRI = /^[A-Za-z][A-Za-z0-9+\-.]*:/;
+  const isIri = (s) => ABS_IRI.test(s);
+  const out = [];
+  for (const { s, p, o } of rawQuads) {
+    const subj = isIri(s) ? blankNodeFor(s) : s;
+    const obj  = (o.kind === 'iri' && o.value !== anchorUri)
+      ? blankNodeFor(o.value)
+      : serializeObject(o);
+    out.push(`${subj} <${p}> ${obj} .`);
+  }
+
+  // 3. Link the anchor to every rewritten root with `<anchor> stress:contains <_:bN>`
+  //    so the KA's transitive triple set is reachable from the single root.
+  for (const blank of new Set(blankFor.values())) {
+    out.push(`${anchor} <urn:dkg:stress:contains> ${blank} .`);
+  }
+  out.push(`${anchor} a <urn:dkg:stress:Partition> .`);
+  return out;
+}
+```
+
+The result: each KA has **one** root (the anchor), every Wikidata URI inside
+appears only as a blank-node label, and partitions sharing entities don't
+collide. Battle-tested in `scripts/testnet-publish-stress/publish-loop.mjs`
+(Base Sepolia, `miles-publish-stress-26may`, 5000-partition stress run); see
+that file for a full reference implementation including pace-control,
+checkpointing and retry-with-unique-name.
+
+If your data has a natural "real" root that's already unique per artefact
+(e.g. an EPCIS event ID, a GitHub PR URL, a build ID), use that as the
+anchor instead of minting a synthetic one — the blank-node rewrite still
+applies for everything *under* it.
+
+The synchronous `/api/shared-memory/publish` and the async promote queue
+both run through `autoPartition`, so this trap exists on both paths. Fix it
+at the importer level, before any quads reach the daemon.
+
 ## 6. Async promote queue
 
 As of PR #4 in the async-promote-queue series the daemon ships an in-process
@@ -522,6 +614,14 @@ promote job is queued / running.
   on-chain transition (costs TRAC, human-gated). It is **not** the
   `assertion/promote` step. Confusing the two is the most common
   "where did my money go?" mistake.
+- **Don't publish multiple KAs with overlapping subject URIs in the same CG.**
+  The contract enforces "one root per KA per CG" (Rule 4) — if your raw data
+  has subjects that recur across artefacts (very common: Wikidata, schema.org,
+  any real-world knowledge graph), apply the partition-scoped blank-node
+  rewrite in [§5 "HTTP 400 with `Rule 4`"](#http-400-on-finalizepublish-with-rule-4-rootentity--already-exists)
+  before any quads reach the daemon. The error message will tell you to use
+  `/api/update`, which is correct for "extend an existing KA" but wrong for
+  "produce many independent KAs that happen to mention the same entities".
 
 ## 8. Cheat sheet
 

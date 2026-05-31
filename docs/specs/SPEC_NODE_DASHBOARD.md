@@ -5,6 +5,34 @@
 
 ---
 
+> **2026-05 changelog — V15 of `DashboardDB`**
+>
+> The original design (below) included a `StructuredLogger` class that
+> mirrored every log line into a SQLite `logs` table + FTS5 free-text
+> index, exposed via `/api/logs?q=...`. After a production incident in
+> which the FTS5 shadow tables grew to multiple GB on a 12-day-old node
+> and corrupted the SQLite file, that path was removed:
+>
+> - `StructuredLogger` (class) — deleted; the dashboard was never wired
+>   to substitute it for `Logger` in production, so removal was a no-op
+>   for the daemon.
+> - `logs_fts` virtual table + its two triggers — dropped in the V15
+>   migration; one-shot `VACUUM` reclaims disk on upgrade.
+> - `/api/logs` and `fetchLogs()` — removed; the dashboard log viewer
+>   uses `/api/node-log` (file-tail over `daemon.log`) which has always
+>   been the file-backed read path.
+>
+> The base `logs` table itself was retained: it backs the
+> operation-correlated log lookup in `/api/operations/:id` and the
+> failed-ops list (simple `WHERE operation_id = ?` queries — no FTS5
+> involved). Retention was lowered from 90 days to 14 to bound table
+> growth in the absence of free-text search.
+>
+> Sections below describing the original FTS5/StructuredLogger design
+> are kept for historical context; treat them as superseded.
+
+---
+
 ## Overview
 
 A unified web interface for operating a DKG node — monitoring,
@@ -146,7 +174,7 @@ Visual: peer count line chart over time. World map of peer locations
 | Metric | Source | Interval |
 |--------|--------|----------|
 | Total triples | `store.countQuads()` | 60s |
-| Total KCs | SPARQL: count distinct `rdf:type dkg:KC` in meta graphs | 60s |
+| Total KCs | SPARQL: count distinct `rdf:type dkg:KA` in meta graphs | 60s |
 | Total KAs | SPARQL: count distinct `rdf:type dkg:KA` in meta graphs | 60s |
 | Triples per contextGraph | `store.countQuads(graphUri)` per contextGraph | 60s |
 | Store size on disk | Backend-dependent: `fs.stat(store.nq)` for Oxigraph, N/A for remote stores (Blazegraph) | 60s |
@@ -200,7 +228,7 @@ Powered by `@origintrail-official/dkg-graph-viz` (already in the monorepo), **as
 - Interactive force-directed 2D layout (with optional 3D via `renderer-3d`)
 - Click a node → expand its triples (fetch neighbors on demand)
 - Color-coded by `rdf:type` or contextGraph
-- Provenance overlay: show which KC/KA a triple belongs to
+- Provenance overlay: show which KA/KA a triple belongs to
 - Timeline overlay: filter by `dkg:publishedAt` date range
 - Export as SVG/PNG
 
@@ -213,7 +241,7 @@ The graph-viz package already has:
 #### ContextGraph Browser
 
 - List all contextGraphs → click to see KCs in that contextGraph
-- KC detail view: UAL, merkle root, status, publisher, timestamp, KA list
+- KA detail view: UAL, merkle root, status, publisher, timestamp, KA list
 - KA detail view: root entity, triple count, private/public flag
 - Click root entity → opens in Graph Visualization
 
@@ -316,13 +344,13 @@ Manage external adapters and extensions from the UI:
 - **Register new skill**: upload or point to a skill definition
 
 #### ContextGraph Subscriptions
-- **List subscribed contextGraphs**: name, UAL, KC count, last sync time
+- **List subscribed contextGraphs**: name, UAL, KA count, last sync time
 - **Subscribe / unsubscribe**: join or leave a contextGraph from the UI
 - **ContextGraph health**: sync lag, peer count, data freshness
 
 #### Webhooks & Events
 - **Configure outbound webhooks**: notify external systems on events
-  (new KC published, sync completed, query threshold exceeded)
+  (new KA published, sync completed, query threshold exceeded)
 - **Event log**: recent webhook deliveries with status codes
 
 ---
@@ -647,8 +675,8 @@ a lightweight charting library (e.g., Chart.js or uPlot).
 | **Knowledge Explorer** | | |
 | `/api/query` | POST | Execute SPARQL query (existing) |
 | `/api/publish` | POST | Publish triples to a contextGraph (existing) |
-| `/api/context-graphs` | GET | List subscribed contextGraphs with KC/KA counts |
-| `/api/context-graphs/:id/kcs` | GET | List KCs in a contextGraph |
+| `/api/context-graphs` | GET | List subscribed contextGraphs with KA/KA counts |
+| `/api/context-graphs/:id/kas` | GET | List KCs in a contextGraph |
 | `/api/query-history` | GET | SPARQL query history (paginated) |
 | `/api/saved-queries` | GET/POST/PUT/DELETE | Manage saved query bookmarks |
 | **Wallet & Economics** | | |

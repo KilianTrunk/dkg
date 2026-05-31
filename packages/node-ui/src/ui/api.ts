@@ -175,10 +175,11 @@ export const fetchPerTypeStats = (periodMs: number, bucketMs?: number) => {
 };
 
 // --- Logs ---
-export const fetchLogs = (params: Record<string, string> = {}) => {
-  const qs = new URLSearchParams(params).toString();
-  return get<{ logs: any[]; total: number }>(`/api/logs${qs ? '?' + qs : ''}`);
-};
+// NOTE: A `fetchLogs()` wrapper around the DB-backed /api/logs route
+// used to live here. It had no production importer (only its own unit
+// test) and the underlying route was removed in V15 of the dashboard
+// DB schema. The UI's actual log viewer uses `fetchNodeLog()` below,
+// which is file-backed.
 
 export const fetchNodeLog = (params: { lines?: number; q?: string } = {}) => {
   const qs = new URLSearchParams();
@@ -462,6 +463,46 @@ export async function importFile(
 }
 
 // --- Query ---
+
+// In-flight POST /api/query dedup. Coalesces concurrent identical
+// requests so React strict-mode double-mounts and sibling views asking
+// the same SPARQL against the same CG share one underlying fetch.
+//
+// Scope is *strictly inflight*: the entry is deleted as soon as the
+// promise settles (success OR failure), so the next call always issues
+// a fresh request. No caching, no staleness window — this is purely
+// concurrent-coalescing, drop-in safe for every existing caller.
+//
+// Motivation: opening a project on the dashboard fires `useMemoryEntities`
+// from two mounted instances (Dashboard card + ProjectView), giving 6
+// identical `/api/query` POSTs for the WM/SWM/VM fan-out against a
+// multi-GB Oxigraph store. Each duplicate adds seconds of wall time on
+// large stores. Inflight dedup collapses the dupes to one.
+const inflightQuery = new Map<string, Promise<{ result: any }>>();
+
+export function postQueryDeduped(body: Record<string, unknown>): Promise<{ result: any }> {
+  const key = JSON.stringify(body);
+  const existing = inflightQuery.get(key);
+  if (existing) return existing;
+  const promise = (async () => {
+    const res = await fetch(`${BASE}/api/query`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
+      body: key,
+    });
+    if (!res.ok) {
+      const errBody = await res.json().catch(() => ({}));
+      const msg = (errBody as { error?: string })?.error ?? `HTTP ${res.status}`;
+      throw new HttpError(res.status, msg, errBody);
+    }
+    return res.json() as Promise<{ result: any }>;
+  })().finally(() => {
+    inflightQuery.delete(key);
+  });
+  inflightQuery.set(key, promise);
+  return promise;
+}
+
 export const executeQuery = (
   sparql: string,
   contextGraphId?: string,
@@ -469,7 +510,7 @@ export const executeQuery = (
   graphSuffix?: '_shared_memory',
   view?: 'verified-memory' | 'shared-working-memory',
 ) =>
-  post<{ result: any }>('/api/query', { sparql, contextGraphId, includeSharedMemory, graphSuffix, view });
+  postQueryDeduped({ sparql, contextGraphId, includeSharedMemory, graphSuffix, view });
 
 // --- Publish (assertion-lifecycle: RFC-001 §9.x sign-at-creation) ---
 //
@@ -771,7 +812,7 @@ export async function listSwmEntities(contextGraphId: string): Promise<SwmRootEn
 }
 
 export interface PublishResult {
-  kcId: string;
+  kaId: string;
   status: string;
   kas: { tokenId: string; rootEntity: string }[];
   txHash?: string;
@@ -1896,7 +1937,22 @@ export const fetchWalletsBalances = () =>
     error?: string;
   }>('/api/wallets/balances');
 export const fetchRpcHealth = () =>
-  get<{ ok: boolean; rpcUrl: string | null; latencyMs: number | null; blockNumber: number | null; error?: string }>('/api/chain/rpc-health');
+  get<{
+    ok: boolean;
+    configured: boolean;
+    rpcEndpointCount: number;
+    latencyMs: number | null;
+    blockNumber: number | null;
+    error?: string;
+    rpcs: Array<{
+      index: number;
+      role: 'primary' | 'backup';
+      ok: boolean;
+      latencyMs: number | null;
+      blockNumber: number | null;
+      error?: string;
+    }>;
+  }>('/api/chain/rpc-health');
 
 // --- Node control ---
 export const shutdownNode = () =>
@@ -1906,29 +1962,99 @@ export const shutdownNode = () =>
 export const subscribeToContextGraph = (contextGraphId: string) =>
   post<{ subscribed: string; catchup?: { status: string; jobId: string } }>('/api/subscribe', { contextGraphId });
 
-// --- Notifications ---
+// --- Notifications (scoped pane wire contract — implementation-plan §3) ---
+//
+// The daemon now returns a caller-scoped, type-allowlisted, activity-collapsed,
+// join_request-reconciled feed. Every member of the union is one notification
+// kind; the pane never re-filters for correctness (scoping is server-side).
+// See `data-contract.md` §4 and `implementation-plan.md` §3 for the frozen
+// shape. Field names here are part of that frozen contract — daemon-engineer
+// owns the server side and flags ui-lead before any rename.
 
-export interface Notification {
-  id: number;
+/** Common envelope present on every pane notification. `contextGraphName`
+ *  is the resolved display name; the client falls back to `shortId(cgId)`
+ *  when it's absent (never blank). */
+interface NotifWireBase {
+  /** Numeric row id for persisted rows; a stable string `digestKey`
+   *  (`activity:<cgId>:<kind>:<windowBucket>`) for collapsed activity
+   *  digests. The read endpoint accepts both. */
+  id: number | string;
   ts: number;
-  type: string;
-  title: string;
-  message: string;
-  source: string | null;
-  peer: string | null;
-  read: number;
-  meta: string | null;
+  /** 0 = unread, 1 = read. */
+  read: 0 | 1;
+  contextGraphId: string;
 }
 
-export const fetchNotifications = (opts?: { since?: number; limit?: number }) => {
-  const params = new URLSearchParams();
-  if (opts?.since) params.set('since', String(opts.since));
-  if (opts?.limit) params.set('limit', String(opts.limit));
-  const qs = params.toString();
-  return get<{ notifications: Notification[]; unreadCount: number }>(`/api/notifications${qs ? `?${qs}` : ''}`);
-};
+/** Incoming join request on a CG the caller curates — actionable
+ *  (inline Approve/Deny). Emitted only on the curator's node, so the
+ *  reader's role for this kind is always curator. */
+export interface JoinRequestNotif extends NotifWireBase {
+  type: 'join_request';
+  meta: { contextGraphName?: string; agentAddress: string; agentName?: string };
+}
 
-export const markNotificationsRead = (ids?: number[]) =>
+/** Confirmation that the caller's own outbound join request was accepted.
+ *  Counts toward the unread badge (positive, opens the new CG). */
+export interface JoinApprovedNotif extends NotifWireBase {
+  type: 'join_approved';
+  meta: { contextGraphName?: string; agentAddress: string };
+}
+
+/** Confirmation that the caller's own outbound join request was declined.
+ *  Demoted: informational, never counts toward the unread badge (the daemon's
+ *  `badgeCount` already excludes it). */
+export interface JoinRejectedNotif extends NotifWireBase {
+  type: 'join_rejected';
+  meta: { contextGraphName?: string; agentAddress: string };
+}
+
+/** Collapsed activity digest — per (contextGraphId × kind × window). `id` is
+ *  the stable `digestKey`. `count` is summed over the window and INCLUDES the
+ *  caller's own events (operators want visibility into their own agents). A
+ *  sole-self digest sets `bySelf` so the row renders a "You" indicator;
+ *  `actorAgentDid` / `actorAgentName` are populated ONLY when `soleAuthor ===
+ *  true` AND it is a single OTHER author (otherwise omitted → count-only). */
+export interface AssertionActivityNotif extends NotifWireBase {
+  type: 'assertion_activity';
+  id: string;
+  meta: {
+    contextGraphName?: string;
+    kind: 'created' | 'promoted' | 'published';
+    count: number;
+    actorAgentDid?: string;
+    actorAgentName?: string;
+    soleAuthor?: boolean;
+    /** True when the sole author is the reading agent → render "You". */
+    bySelf?: boolean;
+  };
+}
+
+export type NotifWire =
+  | JoinRequestNotif
+  | JoinApprovedNotif
+  | JoinRejectedNotif
+  | AssertionActivityNotif;
+
+export interface NotificationsFeedResponse {
+  /** Already scoped, type-allowlisted, activity-collapsed, join_request
+   *  reconciled against the live pending set. Render as-is. */
+  notifications: NotifWire[];
+  /** Unread badge count over the scoped set: unread join_request +
+   *  join_approved + assertion_activity digests. EXCLUDES join_rejected. */
+  badgeCount: number;
+  /** True when caller identity is unresolved → render "Verifying access…",
+   *  never "all caught up". `notifications` is empty in that case. */
+  scopeUnknown?: boolean;
+}
+
+/** Fetch the scoped notifications feed (`GET /api/notifications`). */
+export const fetchNotificationsFeed = () =>
+  get<NotificationsFeedResponse>('/api/notifications');
+
+/** Mark notifications read by id. Accepts numeric row ids AND string
+ *  `digestKey`s (the daemon resolves a digestKey to its underlying atomic
+ *  row ids). Omit `ids` to mark every scoped row read. */
+export const markNotificationsRead = (ids?: Array<number | string>) =>
   post<{ marked: number }>('/api/notifications/read', ids ? { ids } : {});
 
 // --- Sub-graphs (lightweight list + counts for SubGraphBar) ---

@@ -1,5 +1,13 @@
 # Auto-Update Local Testing (Practical Runbook)
 
+> **rc.12 note (OT-RFC-41):** This runbook predates RFC-41 and assumes blue-green slot updates. Under rc.12+:
+>
+> - **Edge nodes** no longer use slots. To validate an Edge update locally, run `npm install -g @origintrail-official/dkg@<target>` and verify `~/.dkg/previous-version` was updated. `dkg rollback` re-installs the previous version from npm.
+> - **Core nodes** still use blue-green slots — the rest of this runbook applies as-is when you set `dkg init --role core`.
+> - **`install.sh` was removed in rc.12.** From a monorepo checkout, link the local CLI into your test home with `pnpm --filter @origintrail-official/dkg link --global` (or use `node packages/cli/dist/cli.js` directly) instead of `./install.sh`. Set `DKG_HOME` to a scratch directory so the test does not touch your real `~/.dkg/`.
+>
+> The procedure below is retained for Core operators and historical reference.
+
 This runbook is for validating blue-green auto-update on your local machine before merge.
 
 ## 0) Use an isolated DKG home

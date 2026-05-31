@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { handleEventsQuery, EpcisQueryError, toEpcisEvent } from '../src/handlers.js';
+import { handleEventsQuery, EpcisQueryError, toEpcisEvent, unwrapLiteral } from '../src/handlers.js';
 import type { QueryEngine } from '../src/types.js';
 
 const CONTEXT_GRAPH_ID = 'test-cg';
@@ -646,5 +646,64 @@ describe('handleEventsQuery — per-request sub-graph', () => {
       includePrivate: true,
     });
     expect(calls[0].opts.subGraphName).toBeUndefined();
+  });
+});
+
+// Regression coverage for the linear-scan rewrite of `unwrapLiteral`. The
+// prior greedy regex (`/^"(.*)"(?:\^\^<.*>)?$/s`) was vulnerable to
+// catastrophic backtracking on malformed inputs because triplestore-
+// controlled strings flow through this function. The linear parser must
+// stay O(n) in input length AND preserve the same observable behaviour
+// on the typed/plain/raw paths used elsewhere in handlers.ts.
+describe('unwrapLiteral (CodeQL ReDoS regression)', () => {
+  it('unwraps a plain N-Quads string literal', () => {
+    expect(unwrapLiteral('"hello"')).toBe('hello');
+  });
+
+  it('unwraps a typed N-Quads literal', () => {
+    expect(unwrapLiteral('"2024-03-01T08:00:00.000Z"^^<http://www.w3.org/2001/XMLSchema#dateTime>'))
+      .toBe('2024-03-01T08:00:00.000Z');
+  });
+
+  it('returns empty / falsy inputs unchanged', () => {
+    expect(unwrapLiteral('')).toBe('');
+    expect(unwrapLiteral(undefined as unknown as string)).toBeUndefined();
+  });
+
+  it('returns bare unquoted strings unchanged (URI bindings)', () => {
+    expect(unwrapLiteral('urn:epc:id:sgtin:001.001.001'))
+      .toBe('urn:epc:id:sgtin:001.001.001');
+    expect(unwrapLiteral('https://gs1.github.io/EPCIS/ObjectEvent'))
+      .toBe('https://gs1.github.io/EPCIS/ObjectEvent');
+  });
+
+  it('returns malformed inputs (no closing quote) unchanged', () => {
+    expect(unwrapLiteral('"missing close')).toBe('"missing close');
+  });
+
+  it('returns malformed inputs (trailing garbage after literal) unchanged', () => {
+    // `"value"trailing` is not a recognised N-Quads shape — must NOT unwrap.
+    expect(unwrapLiteral('"value"trailing')).toBe('"value"trailing');
+  });
+
+  it('honours backslash-escaped quotes inside the literal', () => {
+    // \" stays inside the literal — the closing quote is the unescaped one.
+    expect(unwrapLiteral('"foo\\"bar"')).toBe('foo\\"bar');
+  });
+
+  it('runs in linear time on adversarial inputs that broke the old regex', () => {
+    // The prior greedy regex `/^"(.*)"(?:\^\^<.*>)?$/s` exponentially
+    // backtracks on inputs that look like repeated typed-literal suffixes
+    // without ever matching the closing anchor. The linear parser must
+    // process N=10_000 such inputs in well under a second.
+    const adversarial = '"' + '"^^<x>'.repeat(10_000);
+    const t0 = performance.now();
+    const result = unwrapLiteral(adversarial);
+    const elapsed = performance.now() - t0;
+    // The result is allowed to be either the unwrapped inner or the
+    // original (depending on tail recognition); the important property
+    // here is that we did not spend exponential time getting there.
+    expect(typeof result).toBe('string');
+    expect(elapsed).toBeLessThan(100);
   });
 });

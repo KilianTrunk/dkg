@@ -103,9 +103,17 @@ describe('status route multi-RPC shape', () => {
           res.end();
         }
       } catch (err: any) {
+        // Test-harness only: emit a fixed body so the test cannot leak
+        // exception text into a CodeQL `stack-trace-exposure` /
+        // `XSS-via-error-text` alert. The route under test sets its own
+        // body upstream; this catch is purely a safety net.
+        // The thrown error is re-surfaced via console.error so the test
+        // log still has full diagnostics if a route assertion fails.
+        // eslint-disable-next-line no-console
+        console.error('[test-harness] unhandled route error:', err);
         res.statusCode = 500;
         res.setHeader('Content-Type', 'application/json');
-        res.end(JSON.stringify({ error: err?.message ?? String(err) }));
+        res.end(JSON.stringify({ error: 'internal error' }));
       }
     });
     await new Promise<void>((resolve) => server!.listen(0, '127.0.0.1', resolve));

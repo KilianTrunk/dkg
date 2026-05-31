@@ -209,7 +209,7 @@ describe('backward-compatible URL redirects (V10 consolidation)', () => {
   for (const path of ['/agent', '/explorer', '/messages', '/apps/*']) {
     it(`redirects ${path} to /`, () => {
       expect(app).toContain(`path="${path}"`);
-      const pattern = new RegExp(`path="${path.replace('*', '\\*')}".*element=\\{<Navigate to="/"`);
+      const pattern = new RegExp(`path="${path.replaceAll('*', '\\*')}".*element=\\{<Navigate to="/"`);
       expect(app).toMatch(pattern);
     });
   }

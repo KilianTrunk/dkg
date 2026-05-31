@@ -68,12 +68,36 @@ const EPCIS_TYPE_PREFIX = 'https://gs1.github.io/EPCIS/';
 /**
  * Strip N-Quads literal wrapping from a SPARQL binding value.
  * The triplestore returns string literals as '"value"' or '"value"^^<type>'.
+ *
+ * Implemented as a linear scan rather than the prior greedy regex
+ * `/^"(.*)"(?:\^\^<.*>)?$/s` — that pattern is vulnerable to catastrophic
+ * backtracking on malformed inputs (e.g. repeated typed-literal suffixes)
+ * because `(.*)` is greedy with the `s` flag and the optional trailing
+ * group forces an exponential backoff. Since the input comes from a
+ * remote triplestore, that is reachable input. The linear parser below
+ * runs in O(n) regardless of input shape.
  */
-function unwrapLiteral(value: string): string {
-  if (!value) return value;
-  // Handle typed literals: "value"^^<type>
-  const typedMatch = value.match(/^"(.*)"(?:\^\^<.*>)?$/s);
-  if (typedMatch) return typedMatch[1];
+export function unwrapLiteral(value: string): string {
+  if (!value || value.length < 2 || value.charCodeAt(0) !== 34 /* '"' */) {
+    return value;
+  }
+  // Find the closing quote, honouring backslash escapes per N-Quads.
+  let i = 1;
+  for (; i < value.length; i++) {
+    const ch = value.charCodeAt(i);
+    if (ch === 92 /* '\\' */) {
+      i++;
+      continue;
+    }
+    if (ch === 34 /* '"' */) break;
+  }
+  if (i >= value.length) return value; // no closing quote — return as-is
+  const inner = value.slice(1, i);
+  const tail = value.slice(i + 1);
+  // Tail must be empty or a typed-literal suffix `^^<...>`.
+  if (tail.length === 0) return inner;
+  if (tail.startsWith('^^<') && tail.endsWith('>')) return inner;
+  // Anything else: not a recognised literal shape — return as-is.
   return value;
 }
 

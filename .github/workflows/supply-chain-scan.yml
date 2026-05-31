@@ -137,6 +137,63 @@ jobs:
           pip install --require-hashes --no-deps -r "${RUNNER_TEMP}/zizmor-requirements.txt"
           zizmor --version
 
+      - name: Guard zizmor `cache-poisoning` exception scope
+        # The `cache-poisoning` rule in `.github/zizmor.yml` ignores entire
+        # workflow files (ci.yml, evm-integration.yml, supply-chain-scan.yml)
+        # on the rationale that they are NOT publishing surfaces — they only
+        # run tests/lints/scanners. The exception is sound for the workflows'
+        # CURRENT shape, but zizmor cannot enforce that they STAY non-
+        # publishing. If a future PR adds a publish step to any ignored
+        # workflow, the cache-poisoning risk becomes real and the exception
+        # must be re-evaluated. This step encodes that invariant: it greps
+        # the ignored workflows for known publishing-action markers, and
+        # fails the audit if any are found.
+        #
+        # Note: this does NOT catch cross-workflow artifact promotion via
+        # `actions/upload-artifact` consumed by a separate publishing
+        # workflow — that requires its own audit. For now, in-workflow
+        # publish actions are the high-confidence signal.
+        run: |
+          set -euo pipefail
+          IGNORED=(
+            .github/workflows/ci.yml
+            .github/workflows/evm-integration.yml
+            .github/workflows/supply-chain-scan.yml
+          )
+          # Patterns that indicate a workflow is shipping bytes to a
+          # user-visible publishing surface. Keep this list synced with the
+          # rationale in `.github/zizmor.yml` `cache-poisoning:` block.
+          PATTERNS=(
+            'gh release create'
+            'gh release upload'
+            'softprops/action-gh-release'
+            'actions/create-release'
+            'actions/upload-release-asset'
+            'JS-DevTools/npm-publish'
+            'npm publish'
+            'pnpm publish'
+            'docker push'
+            'docker buildx[^#]*--push'
+          )
+          fail=0
+          for wf in "${IGNORED[@]}"; do
+            if [ ! -f "$wf" ]; then continue; fi
+            for pat in "${PATTERNS[@]}"; do
+              if grep -nE "$pat" "$wf" > /dev/null 2>&1; then
+                echo "::error file=$wf::cache-poisoning exception applies to this workflow, but it now contains a publishing action (\"$pat\"). Re-evaluate the .github/zizmor.yml exception."
+                grep -nE "$pat" "$wf" || true
+                fail=1
+              fi
+            done
+          done
+          if [ "$fail" -ne 0 ]; then
+            echo
+            echo "The cache-poisoning ignore-list in .github/zizmor.yml is scoped to non-publishing CI workflows."
+            echo "One of those workflows now contains a publishing action — the exception is no longer safe."
+            echo "Either remove the publishing action, move it to a workflow not in the ignore-list, or revise the exception."
+            exit 1
+          fi
+
       - name: Resolve zizmor scan targets
         # Scan EVERYTHING under `.github/` that can land code on the runner:
         # workflows + composite actions + reusable workflows. The previous

@@ -79,7 +79,12 @@ contract DKGKnowledgeAssets is INamed, IVersioned, HubDependent, ERC721, Guardia
 
     uint256 private _knowledgeAssetsCounter;
     uint256 private _totalMintedKnowledgeAssetsCounter;
-    uint256 private _totalBurnedKnowledgeAssetsCounter;
+    // Explicit `= 0` is a no-op at runtime (Solidity zero-initializes
+    // state) but silences Slither's high-severity `uninitialized-state`
+    // alert. V10 retired burn semantics — `burnKnowledgeAssetsTokens` is
+    // a `pure` revert stub — so this counter remains permanently zero
+    // and `totalBurned()` correctly returns 0 for legacy consumers.
+    uint256 private _totalBurnedKnowledgeAssetsCounter = 0;
 
     uint96 private _totalTokenAmount;
 

@@ -72,8 +72,16 @@ describe('GET/POST /api/notifications (scoped daemon route, A4)', () => {
         await handleNotificationRoutes(ctx);
         if (!res.writableEnded) { res.statusCode = 404; res.end(); }
       } catch (err: any) {
+        // Test-harness only: emit a fixed JSON body so the test cannot
+        // leak raw exception text (CodeQL flagged the prior
+        // `err.message` echo as stack-disclosure + reinterpret-as-HTML).
+        // The route under test sets its own body upstream; this catch
+        // is a safety net. Diagnostics still surface via console.error.
+        // eslint-disable-next-line no-console
+        console.error('[test-harness] unhandled route error:', err);
         res.statusCode = 500;
-        res.end(JSON.stringify({ error: String(err?.message ?? err) }));
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ error: 'internal error' }));
       }
     });
     await new Promise<void>((resolve) => server!.listen(0, '127.0.0.1', resolve));

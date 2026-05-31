@@ -172,9 +172,15 @@ describe('POST /api/random-sampling/backfill-percgid-meta', () => {
           res.end();
         }
       } catch (err) {
+        // Test-harness only: emit a fixed body so the test cannot leak
+        // exception text into a CodeQL stack-disclosure alert. Route
+        // under test sets its own body upstream; this catch is a safety
+        // net. Diagnostics still surface via console.error.
+        // eslint-disable-next-line no-console
+        console.error('[test-harness] unhandled route error:', err);
         res.statusCode = 500;
         res.setHeader('Content-Type', 'application/json');
-        res.end(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }));
+        res.end(JSON.stringify({ error: 'internal error' }));
       }
     });
     await new Promise<void>((resolve) => server!.listen(0, '127.0.0.1', resolve));

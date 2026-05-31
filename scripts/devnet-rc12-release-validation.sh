@@ -22,10 +22,13 @@
 #   A. WM -> SWM -> VM publish for public + curated CGs, from cores AND edges
 #   B. KA updates across all CG variants
 #   C. Random sampling for public + private CGs (success rate)
-#   D. Staking present + conviction multiplier + reward claim/withdraw + position transfer
+#   D. Staking present + conviction multiplier + reward claim/withdraw +
+#      REAL staking-position ERC-721 round-trip transfer (node1 <-> node5)
 #   D2. V8→V10 migration conviction credit — eligible migrants on tiers 6/12 get a
 #       fixed 60-day (2-month) shorter lock; lower tiers and ineligible get default
-#   E. Conviction-discounted vs non-conviction publish + publishing-NFT transfer
+#   E. Conviction-discounted vs non-conviction publish, REAL discount cost-diff
+#      assertion (getDiscountedCost < base), windowSpent>0 evidence + REAL
+#      publishing-NFT ERC-721 round-trip transfer (node1 <-> node5)
 #   F. Protocol treasury fee (treasury account receives a percentage)
 #   G. Prolonged inter-node messaging
 #   H. CG invitations (edge curators invite each other + cores)
@@ -864,6 +867,70 @@ elif [ -n "$N1_OP" ]; then
   warn D reward-claim-exec "no zero-arg claimRewards entrypoint — claim is position-scoped (manual tokenId needed)"
 fi
 
+# Real staking-position transfer execution. The Section D title mentions
+# "position transfer" and ABI introspection alone is too weak: a regression
+# where ERC-721 transfer reverts unconditionally would not remove the method
+# from the ABI. Round-trip a position node1 -> node5 -> node1 so the
+# accounting state is unchanged at the end of the test.
+#
+# Behaviour notes:
+#   - DKGStakingConvictionNFT positions can be lock-restricted: contract may
+#     revert with a custom error like "TransferRestrictedWhileLocked". If
+#     that's the design choice on rc.12, the test downgrades to WARN with the
+#     revert reason — that's product information, not a release-gate failure.
+#   - Recipient is node5's op wallet (an edge node — no existing positions,
+#     so the temporary ownership swap has zero accounting side-effect).
+N5_OP=$(node_op_key 5)
+N5_OPADDR=$(node_op_addr 5)
+if [ -n "$N1_OP" ] && [ -n "$N5_OPADDR" ] && [ -n "$N1_OPADDR" ]; then
+  # Discover a tokenId owned by node1's op wallet. tokenOfOwnerByIndex throws
+  # OOB if the wallet owns no positions; the chain-call helper returns
+  # {ok:false,...} in that case and we WARN.
+  bal=$($CHAIN_CALL DKGStakingConvictionNFT balanceOf --json "[\"$N1_OPADDR\"]" 2>/dev/null | pyf "d.get('result','0')")
+  if [ "${bal:-0}" -gt 0 ] 2>/dev/null; then
+    sptk=$($CHAIN_CALL DKGStakingConvictionNFT tokenOfOwnerByIndex --json "[\"$N1_OPADDR\",\"0\"]" 2>/dev/null | pyf "d.get('result','')")
+    if [ -n "$sptk" ] && [ "$sptk" != "0" ]; then
+      xfr1=$($CHAIN_CALL DKGStakingConvictionNFT safeTransferFrom \
+              --sig "safeTransferFrom(address,address,uint256)" \
+              --key "$N1_OP" --json "[\"$N1_OPADDR\",\"$N5_OPADDR\",\"$sptk\"]" 2>/dev/null)
+      if echo "$xfr1" | grep -q '"ok":true'; then
+        newOwner=$($CHAIN_CALL DKGStakingConvictionNFT ownerOf --json "[\"$sptk\"]" 2>/dev/null | pyf "d.get('result','')")
+        newOwnerLower=$(printf '%s' "$newOwner" | tr '[:upper:]' '[:lower:]')
+        n5Lower=$(printf '%s' "$N5_OPADDR" | tr '[:upper:]' '[:lower:]')
+        if [ "$newOwnerLower" = "$n5Lower" ]; then
+          # Round-trip back so accounting is unchanged.
+          xfr2=$($CHAIN_CALL DKGStakingConvictionNFT safeTransferFrom \
+                  --sig "safeTransferFrom(address,address,uint256)" \
+                  --key "$N5_OP" --json "[\"$N5_OPADDR\",\"$N1_OPADDR\",\"$sptk\"]" 2>/dev/null)
+          if echo "$xfr2" | grep -q '"ok":true'; then
+            pass D position-transfer-exec "staking position tokenId=$sptk round-tripped n1<->n5 (ownership returned to ${N1_OPADDR:0:10}...)"
+          else
+            # Forward worked, return failed — accounting drifted. Surface as FAIL
+            # so the next bootstrap is reminded; WARN would risk a leaked state.
+            fail D position-transfer-exec "forward OK but return-trip failed (state drift! token $sptk now stuck at ${N5_OPADDR:0:10}...): ${xfr2:0:160}"
+          fi
+        else
+          fail D position-transfer-exec "transfer tx confirmed but ownerOf=$newOwner expected=$N5_OPADDR"
+        fi
+      else
+        # Best-effort error classification: if the revert string mentions
+        # locking, treat as "by design" WARN; otherwise FAIL the gate.
+        if echo "$xfr1" | grep -qiE 'lock|restricted|nontransferable|nonTransferable'; then
+          warn D position-transfer-exec "position transfer blocked by lock (likely by-design on rc.12): ${xfr1:0:160}"
+        else
+          fail D position-transfer-exec "transfer tx failed: ${xfr1:0:200}"
+        fi
+      fi
+    else
+      warn D position-transfer-exec "tokenOfOwnerByIndex(node1,0) returned empty (balance=$bal)"
+    fi
+  else
+    warn D position-transfer-exec "node1 op wallet owns zero staking positions (balance=$bal) — bootstrap may not have minted yet"
+  fi
+else
+  warn D position-transfer-exec "missing keys: N1_OP=${N1_OP:+set} N5_OPADDR=${N5_OPADDR:+set} N1_OPADDR=${N1_OPADDR:+set}"
+fi
+
 # ── Section D2: V8→V10 migration conviction credit (60-day lock on tiers 6/12) ─
 # Eligible V8 migrants (frozen V8MigrationEligibility registry) who pick the two
 # highest conviction tiers (6m / 12m) must get expiryTimestamp shortened by exactly
@@ -921,13 +988,115 @@ PUB_NFT_ABI="$REPO_ROOT/packages/evm-module/abi/DKGPublishingConvictionNFT.json"
 if [ -f "$PUB_NFT_ABI" ]; then
   pmethods=$(python3 -c "import json;print(' '.join(sorted({f['name'] for f in json.load(open('$PUB_NFT_ABI')) if f.get('type')=='function'})))")
   echo "$pmethods" | grep -qiE 'coverPublishingCost|cover' && pass E conviction-discount-surface "conviction publishing-cost entrypoint present" || warn E conviction-discount-surface "no coverPublishingCost"
-  echo "$pmethods" | grep -qiE 'transferFrom|safeTransfer' && pass E publishing-nft-transfer "publishing NFT is ERC721-transferable" || warn E publishing-nft-transfer "no transfer method"
+  echo "$pmethods" | grep -qiE 'transferFrom|safeTransfer' && pass E publishing-nft-transfer-surface "publishing NFT is ERC721-transferable" || warn E publishing-nft-transfer-surface "no transfer method"
 else
   warn E pub-nft-abi "DKGPublishingConvictionNFT ABI missing"
 fi
 # Non-conviction publish: edge nodes have no conviction account → their publishes
 # exercise the direct-spend (non-conviction) path. We already published from edges (Section A).
 if [ "${EDGE_KA:-0}" -gt 0 ]; then pass E non-conviction-publish "$EDGE_KA edge (non-conviction) publishes succeeded"; else warn E non-conviction-publish "no edge publishes to evidence non-conviction path"; fi
+
+# Real conviction-discount cost-differential assertion. ABI presence proves
+# nothing about the actual discount: a contract that hard-codes 0% discount
+# would still pass surface checks. Read the on-chain `getDiscountedCost` view
+# function for an active core's publishing-conviction account and assert the
+# returned cost is strictly LESS than the base cost — this catches regressions
+# where the discount surface exists but yields no economic benefit.
+#
+# Account discovery: the publishing-conviction "agent" is the daemon's
+# publisher wallet (see packages/evm-module/contracts/DKGPublishingConvictionNFT.sol
+# `agentToAccountId` mapping). Cores register their publisher wallets as
+# agents at devnet bootstrap; edges deliberately don't (so they fall through
+# to the direct-spend path). We probe node1's publisher wallet.
+N1_PUB_ADDR=$(python3 -c "import json;print(json.load(open('$DEVNET_DIR/node1/publisher-wallets.json'))['wallets'][0]['address'])" 2>/dev/null || echo "")
+if [ -n "$N1_PUB_ADDR" ]; then
+  accountId=$($CHAIN_CALL DKGPublishingConvictionNFT agentToAccountId --json "[\"$N1_PUB_ADDR\"]" 2>/dev/null | pyf "d.get('result','0')")
+  if [ -n "$accountId" ] && [ "$accountId" != "0" ]; then
+    # 1 TRAC base cost (1e18 wei-equivalent) is well within uint96 range and
+    # representative of a typical publish.
+    base="1000000000000000000"
+    discounted=$($CHAIN_CALL DKGPublishingConvictionNFT getDiscountedCost --json "[\"$accountId\",\"$base\"]" 2>/dev/null | pyf "d.get('result','')")
+    if [ -n "$discounted" ]; then
+      # Compare as bigints in python — bash arithmetic overflows at uint64.
+      delta_pct=$(python3 -c "
+b=int('$base'); d=int('$discounted')
+if b == 0: print(0); raise SystemExit
+print(int(((b - d) * 10000) // b))
+" 2>/dev/null || echo "0")
+      cmp=$(python3 -c "print(1 if int('$discounted') < int('$base') else 0)" 2>/dev/null || echo "0")
+      if [ "$cmp" = "1" ] && [ "${delta_pct:-0}" -gt 0 ]; then
+        pass E conviction-discount-cost-diff "account=$accountId discounted=$discounted (base=$base, savings=${delta_pct}bps)"
+      else
+        fail E conviction-discount-cost-diff "account=$accountId discount surface returned discounted=$discounted >= base=$base (no economic discount applied)"
+      fi
+    else
+      warn E conviction-discount-cost-diff "getDiscountedCost returned empty for account=$accountId (view call failed)"
+    fi
+    # Bonus signal: confirm the account actually paid into something during this
+    # run. windowSpent > 0 in the current billing window proves Section A
+    # core publishes actually drew from the conviction allowance (not just
+    # that the surface exists). This is a strong end-to-end coverage check.
+    spent=$($CHAIN_CALL DKGPublishingConvictionNFT windowSpent --json "[\"$accountId\"]" 2>/dev/null | pyf "d.get('result','0')")
+    if [ -n "$spent" ] && [ "$(python3 -c "print(1 if int('$spent' or '0') > 0 else 0)")" = "1" ]; then
+      pass E conviction-allowance-consumed "account=$accountId windowSpent=$spent (Section A publishes drew from conviction allowance)"
+    else
+      warn E conviction-allowance-consumed "account=$accountId windowSpent=$spent — Section A publishes may not have routed through conviction path (or spent counter resets each window)"
+    fi
+  else
+    warn E conviction-discount-cost-diff "node1 publisher wallet ${N1_PUB_ADDR:0:10}... not registered as conviction agent (accountId=0) — bootstrap may not have set up publishing-conviction accounts"
+  fi
+else
+  warn E conviction-discount-cost-diff "missing $DEVNET_DIR/node1/publisher-wallets.json"
+fi
+
+# Real publishing-NFT transfer execution. Same rationale as Section D
+# position-transfer-exec: ABI presence is too weak a gate. Round-trip a
+# publishing-NFT token n1 op-wallet -> n5 op-wallet -> n1 op-wallet so the
+# accounting state is unchanged at the end of the test.
+#
+# Holder discovery: the publishing-conviction NFT is minted to the account
+# CREATOR (typically the operator wallet that staked, not the publisher
+# wallet — the publisher wallet is the AGENT). So we query
+# tokenOfOwnerByIndex on the operator's address. If the operator owns
+# multiple tokens we pick index 0.
+if [ -n "$N1_OP" ] && [ -n "$N5_OPADDR" ] && [ -n "$N1_OPADDR" ]; then
+  pubbal=$($CHAIN_CALL DKGPublishingConvictionNFT balanceOf --json "[\"$N1_OPADDR\"]" 2>/dev/null | pyf "d.get('result','0')")
+  if [ "${pubbal:-0}" -gt 0 ] 2>/dev/null; then
+    pubtk=$($CHAIN_CALL DKGPublishingConvictionNFT tokenOfOwnerByIndex --json "[\"$N1_OPADDR\",\"0\"]" 2>/dev/null | pyf "d.get('result','')")
+    if [ -n "$pubtk" ] && [ "$pubtk" != "0" ]; then
+      px1=$($CHAIN_CALL DKGPublishingConvictionNFT safeTransferFrom \
+              --sig "safeTransferFrom(address,address,uint256)" \
+              --key "$N1_OP" --json "[\"$N1_OPADDR\",\"$N5_OPADDR\",\"$pubtk\"]" 2>/dev/null)
+      if echo "$px1" | grep -q '"ok":true'; then
+        pnewOwner=$($CHAIN_CALL DKGPublishingConvictionNFT ownerOf --json "[\"$pubtk\"]" 2>/dev/null | pyf "d.get('result','')")
+        pnewLower=$(printf '%s' "$pnewOwner" | tr '[:upper:]' '[:lower:]')
+        pn5Lower=$(printf '%s' "$N5_OPADDR" | tr '[:upper:]' '[:lower:]')
+        if [ "$pnewLower" = "$pn5Lower" ]; then
+          px2=$($CHAIN_CALL DKGPublishingConvictionNFT safeTransferFrom \
+                  --sig "safeTransferFrom(address,address,uint256)" \
+                  --key "$N5_OP" --json "[\"$N5_OPADDR\",\"$N1_OPADDR\",\"$pubtk\"]" 2>/dev/null)
+          if echo "$px2" | grep -q '"ok":true'; then
+            pass E publishing-nft-transfer-exec "publishing NFT tokenId=$pubtk round-tripped n1<->n5"
+          else
+            fail E publishing-nft-transfer-exec "forward OK but return-trip failed (state drift! token $pubtk now stuck at ${N5_OPADDR:0:10}...): ${px2:0:160}"
+          fi
+        else
+          fail E publishing-nft-transfer-exec "transfer tx confirmed but ownerOf=$pnewOwner expected=$N5_OPADDR"
+        fi
+      else
+        if echo "$px1" | grep -qiE 'lock|restricted|nontransferable|nonTransferable'; then
+          warn E publishing-nft-transfer-exec "publishing NFT transfer blocked by restriction (by-design?): ${px1:0:160}"
+        else
+          fail E publishing-nft-transfer-exec "transfer tx failed: ${px1:0:200}"
+        fi
+      fi
+    else
+      warn E publishing-nft-transfer-exec "tokenOfOwnerByIndex(node1,0) returned empty (balance=$pubbal)"
+    fi
+  else
+    warn E publishing-nft-transfer-exec "node1 op wallet owns zero publishing NFTs (balance=$pubbal) — Section A core publishes may not have minted yet"
+  fi
+fi
 
 # ── Section I: ownership transfer + new owner update ─────────────────────────
 section "I. OWNERSHIP TRANSFER — transfer a KA and update as new owner"

@@ -585,6 +585,12 @@ start_node() {
   local max_wait=30
   [ "$node_num" -eq 1 ] && max_wait=120
   local ready=false
+  # CRITICAL: declare loop variable `local` so we don't clobber the OUTER
+  # caller's `i` (cmd_start's `for ((i = 2; i <= NUM_NODES; i++))` calls
+  # start_node "$i", and that outer `i` would get overwritten by this inner
+  # loop, making the outer loop exit after the first iteration — only nodes
+  # 1 and 2 would ever start.
+  local i
   for i in $(seq 1 "$max_wait"); do
     if curl -sf "${auth_args[@]}" "http://127.0.0.1:$api_port/api/status" > /dev/null 2>&1; then
       log "Node $node_num ready (PID $node_pid, API http://127.0.0.1:$api_port)"

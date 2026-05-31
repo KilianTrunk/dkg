@@ -78,6 +78,10 @@ export class FinalizationHandler {
       }
 
       const blockNumber = protoToNumber(msg.blockNumber);
+      // GH#842: legacy publishers omit tag 17; protobufjs decodes that as 0,
+      // matching the pre-fix shape (no tiebreaker). New publishers carry the
+      // chain-truth `transactionIndex`.
+      const txIndex = typeof msg.txIndex === 'number' ? msg.txIndex : 0;
       const startKAId = protoToBigInt(msg.startKAId);
       const endKAId = protoToBigInt(msg.endKAId);
 
@@ -132,7 +136,7 @@ export class FinalizationHandler {
       // this KA was already updated (a newer materialisation exists) must not
       // re-materialise the pre-update state on top of the update. Skip the whole
       // promotion (data + meta, incl. any label dual-write) when stale.
-      const finalizationVersion: MaterializedVersion = { blockNumber, txIndex: 0 };
+      const finalizationVersion: MaterializedVersion = { blockNumber, txIndex };
       if (!(await shouldApplyMaterialization(this.store, targetMetaGraph, msg.ual, finalizationVersion))) {
         this.markProcessed(dedupeKey);
         this.log.info(ctx, `Finalization: a newer update is already materialised for ${msg.ual}, skipping stale publish promotion`);

@@ -1373,9 +1373,12 @@ export class DKGPublisher implements Publisher {
         // publish-promotion is stale and MUST NOT re-materialise the original
         // KA on top of it — that is exactly the race that made updated KAs
         // unprovable. Skip the whole promotion when stale.
+        // `txIndex` is the chain-truth tiebreaker — without it a same-block
+        // publish + update would tie and the stale promotion could still
+        // overwrite the update.
         const publishVersion: MaterializedVersion = {
           blockNumber: publishResult.onChainResult.blockNumber ?? 0,
-          txIndex: 0,
+          txIndex: publishResult.onChainResult.txIndex ?? 0,
         };
         const applyPromotion = await shouldApplyMaterialization(
           this.store, ctxMetaGraph, publishResult.ual, publishVersion,
@@ -2978,7 +2981,7 @@ export class DKGPublisher implements Publisher {
     // legacy update fallback was archived in
     // `archive-non-v10-contracts` (issue 0004) — adapters must now
     // provide the V10 `updateKnowledgeCollectionV10` surface.
-    let txResult: { success: boolean; hash: string; blockNumber?: number; publisherAddress?: string };
+    let txResult: { success: boolean; hash: string; blockNumber?: number; txIndex?: number; publisherAddress?: string };
     let earlyReturn: PublishResult | undefined;
     let wroteAhead = false;
     const emitWriteAheadStart = (info?: { txHash?: string }) => {
@@ -3123,10 +3126,14 @@ export class DKGPublisher implements Publisher {
       return result;
     }
 
-    // Chain version for the GH#842 last-writer-wins guard. The update's block
-    // is strictly later than its publish, so a stale publish-promotion can
-    // never overwrite this materialisation.
-    const updateVersion: MaterializedVersion = { blockNumber: txResult.blockNumber ?? 0, txIndex: 0 };
+    // Chain version for the GH#842 last-writer-wins guard. The update's
+    // `(blockNumber, txIndex)` is the on-chain ordering key — same-block
+    // publish + update are distinguished by `txIndex`, so a late stale
+    // publish-promotion can never overwrite this materialisation.
+    const updateVersion: MaterializedVersion = {
+      blockNumber: txResult.blockNumber ?? 0,
+      txIndex: txResult.txIndex ?? 0,
+    };
     await storeUpdatedQuads(updateVersion);
 
     const ual = await this.resolveKaUal(kaId);

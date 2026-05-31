@@ -9028,6 +9028,11 @@ export class DKGAgent {
         kcMerkleRoot: result.merkleRoot,
         txHash: result.onChainResult.txHash ?? '',
         blockNumber: result.onChainResult.blockNumber ?? 0,
+        // GH#842: thread the real `(block, txIndex)` so receivers stamp the
+        // exact same materialised version as the local publish promotion —
+        // otherwise a same-block update vs publish would tie on the wire
+        // and the stale publish-promotion could clobber the update.
+        txIndex: result.onChainResult.txIndex ?? 0,
         batchId: result.onChainResult.batchId ?? 0n,
         startKAId: result.onChainResult.startKAId ?? 0n,
         endKAId: result.onChainResult.endKAId ?? 0n,

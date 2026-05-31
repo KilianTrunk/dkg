@@ -1271,6 +1271,7 @@ export class EVMChainAdapter implements ChainAdapter {
     return {
       hash: receipt.hash,
       blockNumber: receipt.blockNumber,
+      txIndex: receipt.index,
       success: receipt.status === 1,
     };
   }
@@ -1718,6 +1719,7 @@ export class EVMChainAdapter implements ChainAdapter {
     return {
       hash: receipt.hash,
       blockNumber: receipt.blockNumber,
+      txIndex: receipt.index,
       success: receipt.status === 1,
       batchId,
     };
@@ -2131,6 +2133,7 @@ export class EVMChainAdapter implements ChainAdapter {
     return {
       hash: receipt.hash,
       blockNumber: receipt.blockNumber,
+      txIndex: receipt.index,
       success: true,
       contextGraphId: contextGraphIdHex ?? nameHash,
     };
@@ -2152,7 +2155,7 @@ export class EVMChainAdapter implements ChainAdapter {
       'reveal context graph metadata',
     );
     if (!receipt) throw new Error('revealContextGraphMetadata: no receipt');
-    return { hash: receipt.hash, blockNumber: receipt.blockNumber, success: true };
+    return { hash: receipt.hash, blockNumber: receipt.blockNumber, txIndex: receipt.index, success: true };
   }
 
   async listContextGraphsFromChain(fromBlock?: number): Promise<ContextGraphOnChain[]> {
@@ -2250,6 +2253,7 @@ export class EVMChainAdapter implements ChainAdapter {
       return {
         hash: receipt.hash,
         blockNumber: receipt.blockNumber,
+        txIndex: receipt.index,
         success: false,
         contextGraphId: 0n,
       };
@@ -2258,6 +2262,7 @@ export class EVMChainAdapter implements ChainAdapter {
     return {
       hash: receipt.hash,
       blockNumber: receipt.blockNumber,
+      txIndex: receipt.index,
       success: receipt.status === 1,
       contextGraphId,
     };
@@ -2280,6 +2285,7 @@ export class EVMChainAdapter implements ChainAdapter {
     return {
       hash: receipt.hash,
       blockNumber: receipt.blockNumber,
+      txIndex: receipt.index,
       success: receipt.status === 1,
     };
   }
@@ -2730,6 +2736,7 @@ export class EVMChainAdapter implements ChainAdapter {
       endKAId,
       txHash: receipt.hash,
       blockNumber: receipt.blockNumber,
+      txIndex: receipt.index,
       blockTimestamp,
       publisherAddress,
       authorAddress,
@@ -2792,6 +2799,7 @@ export class EVMChainAdapter implements ChainAdapter {
       endKAId,
       txHash: receipt.hash,
       blockNumber: receipt.blockNumber,
+      txIndex: receipt.index,
       blockTimestamp,
       publisherAddress,
       authorAddress,
@@ -2837,6 +2845,7 @@ export class EVMChainAdapter implements ChainAdapter {
       endKAId,
       txHash: receipt.hash,
       blockNumber: receipt.blockNumber,
+      txIndex: receipt.index,
       blockTimestamp,
       publisherAddress,
     };
@@ -3221,6 +3230,7 @@ export class EVMChainAdapter implements ChainAdapter {
     return {
       hash: receipt.hash,
       blockNumber: receipt.blockNumber,
+      txIndex: receipt.index,
       success: receipt.status === 1,
       publisherAddress: signer.address,
     };
@@ -3385,6 +3395,7 @@ export class EVMChainAdapter implements ChainAdapter {
         accountId,
         hash: receipt.hash,
         blockNumber: receipt.blockNumber,
+        txIndex: receipt.index,
         success: receipt.status === 1,
       };
     });
@@ -3441,7 +3452,7 @@ export class EVMChainAdapter implements ChainAdapter {
         this.signer,
         'top up publishing conviction account',
       );
-      return { hash: receipt.hash, blockNumber: receipt.blockNumber, success: receipt.status === 1 };
+      return { hash: receipt.hash, blockNumber: receipt.blockNumber, txIndex: receipt.index, success: receipt.status === 1 };
     });
   }
 
@@ -3456,7 +3467,7 @@ export class EVMChainAdapter implements ChainAdapter {
         this.signer,
         'settle publishing conviction account',
       );
-      return { hash: receipt.hash, blockNumber: receipt.blockNumber, success: receipt.status === 1 };
+      return { hash: receipt.hash, blockNumber: receipt.blockNumber, txIndex: receipt.index, success: receipt.status === 1 };
     });
   }
 
@@ -3471,7 +3482,7 @@ export class EVMChainAdapter implements ChainAdapter {
         this.signer,
         'register publishing conviction agent',
       );
-      return { hash: receipt.hash, blockNumber: receipt.blockNumber, success: receipt.status === 1 };
+      return { hash: receipt.hash, blockNumber: receipt.blockNumber, txIndex: receipt.index, success: receipt.status === 1 };
     });
   }
 
@@ -3486,7 +3497,7 @@ export class EVMChainAdapter implements ChainAdapter {
         this.signer,
         'deregister publishing conviction agent',
       );
-      return { hash: receipt.hash, blockNumber: receipt.blockNumber, success: receipt.status === 1 };
+      return { hash: receipt.hash, blockNumber: receipt.blockNumber, txIndex: receipt.index, success: receipt.status === 1 };
     });
   }
 
@@ -4075,6 +4086,7 @@ export class EVMChainAdapter implements ChainAdapter {
       return {
         hash: receipt.hash,
         blockNumber: receipt.blockNumber,
+        txIndex: receipt.index,
         success: true,
         challenge,
         contextGraphId,
@@ -4110,6 +4122,7 @@ export class EVMChainAdapter implements ChainAdapter {
       return {
         hash: receipt.hash,
         blockNumber: receipt.blockNumber,
+        txIndex: receipt.index,
         success: true,
       };
     });

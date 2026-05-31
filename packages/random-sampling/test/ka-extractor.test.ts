@@ -801,3 +801,176 @@ describe('restateLabelGraphForUpdate — label graph full restatement (GH #842 �
     expect(await labelDataSubjects()).toEqual(['urn:orig:r']);
   });
 });
+
+// GH #842 — Codex review on PR #845 surfaced three sharper bugs in the original
+// fix. These tests pin each one closed:
+//
+//  1. `txIndex` tiebreaker for SAME-block publish + update.
+//     A publish that promotes at (block=B, txIndex=2) lands AFTER an update
+//     applied at (block=B, txIndex=5) was supposed to win. With the v1 fix
+//     both compared as `(B, 0)` (txIndex was hardcoded to 0), so the stale
+//     publish-promotion clobbered the update.
+//
+//  2. Manifest root order preserved across restatement (≥10 roots).
+//     `<ual>/1`, `<ual>/2`, …, `<ual>/10` are stable token identifiers.
+//     Lex sort would put `<ual>/10` BEFORE `<ual>/2`, so the token→root
+//     binding flipped on every restatement.
+//
+//  3. Surplus kaSubjects deleted when an update SHRINKS the root count.
+//     The v1 fix only repointed `dkg:rootEntity` on retained tokens; surplus
+//     prior tokens kept their `rdf:type KnowledgeAsset` / `dkg:partOf <ual>`
+//     and showed up as phantoms in enumeration queries.
+describe('GH#842 / PR #845 — Codex review fixes', () => {
+  let store: OxigraphStore;
+  beforeEach(() => {
+    store = new OxigraphStore();
+  });
+
+  const CG_ID = 9n;
+  const CG_NAME = 'cg-9';
+  const KA_ID = 99n;
+  const UAL = 'did:dkg:hardhat:31337/0xpub/99';
+  const labelData = contextGraphDataUri(CG_NAME);
+  const labelMeta = contextGraphMetaUri(CG_NAME);
+
+  it('publish-promotion at (B, 2) is rejected when an update already materialised at (B, 5)', async () => {
+    // Update materialised first at same block, higher txIndex.
+    const ctxMeta = contextGraphMetaUri(CG_NAME, CG_ID.toString());
+    const updateTriples = [{ subject: 'urn:upd', predicate: 'urn:p', object: '"u"' }];
+    const updateRoot = new V10MerkleTree(
+      updateTriples.map((t) => hashTripleV10(t.subject, t.predicate, t.object)),
+    ).root;
+    const updatePayload = new Map<string, Quad[]>([
+      ['urn:upd', updateTriples.map((t) => ({ ...t, graph: '' }))],
+    ]);
+    expect(
+      await promoteUpdatedKaToPerCgId({
+        store, contextGraphId: CG_NAME, cgId: CG_ID.toString(), ual: UAL, kaId: KA_ID,
+        merkleRoot: updateRoot, payloadByRoot: updatePayload,
+        version: { blockNumber: 500, txIndex: 5 },
+      }),
+    ).toBe(true);
+
+    // Late, stale publish-promotion at the SAME block, earlier txIndex.
+    const origTriples = [{ subject: 'urn:orig', predicate: 'urn:p', object: '"o"' }];
+    const origRoot = new V10MerkleTree(
+      origTriples.map((t) => hashTripleV10(t.subject, t.predicate, t.object)),
+    ).root;
+    const origPayload = new Map<string, Quad[]>([
+      ['urn:orig', origTriples.map((t) => ({ ...t, graph: '' }))],
+    ]);
+    expect(
+      await promoteUpdatedKaToPerCgId({
+        store, contextGraphId: CG_NAME, cgId: CG_ID.toString(), ual: UAL, kaId: KA_ID,
+        merkleRoot: origRoot, payloadByRoot: origPayload,
+        version: { blockNumber: 500, txIndex: 2 },
+      }),
+    ).toBe(false);
+    // Materialised version is unchanged — and equals the update's.
+    expect(await readMaterializedVersion(store, ctxMeta, UAL)).toEqual({ blockNumber: 500, txIndex: 5 });
+  });
+
+  it('preserves manifest root order for ≥10 batches (Codex bug 2)', async () => {
+    // Seed a 12-batch KA in the label graph: token `<ual>/N` → root `urn:root:N`.
+    const N = 12;
+    const seedQuads: Quad[] = [
+      { subject: UAL, predicate: `${DKG}batchId`, object: `"${KA_ID}"^^<${XSD}integer>`, graph: labelMeta },
+    ];
+    for (let i = 1; i <= N; i++) {
+      seedQuads.push(
+        { subject: `${UAL}/${i}`, predicate: `${RDF}type`, object: `${DKG}KnowledgeAsset`, graph: labelMeta },
+        { subject: `${UAL}/${i}`, predicate: `${DKG}partOf`, object: UAL, graph: labelMeta },
+        { subject: `${UAL}/${i}`, predicate: `${DKG}rootEntity`, object: `urn:root:${i}`, graph: labelMeta },
+      );
+    }
+    await store.insert(seedQuads);
+
+    // Update with NEW roots in the same numeric order. The map's insertion
+    // order is the canonical "manifest" order, which restateLabelGraphForUpdate
+    // MUST preserve when re-binding tokens.
+    const payload: Map<string, Quad[]> = new Map();
+    for (let i = 1; i <= N; i++) {
+      payload.set(`urn:new:${i}`, [
+        { subject: `urn:new:${i}`, predicate: 'urn:p', object: `"v${i}"`, graph: '' },
+      ]);
+    }
+    const allTriples: { subject: string; predicate: string; object: string }[] = [];
+    for (const qs of payload.values()) for (const q of qs) allTriples.push(q);
+    const merkleRoot = new V10MerkleTree(
+      allTriples.map((t) => hashTripleV10(t.subject, t.predicate, t.object)),
+    ).root;
+
+    expect(
+      await restateLabelGraphForUpdate({
+        store, dataGraph: labelData, metaGraph: labelMeta, ual: UAL,
+        merkleRoot, payloadByRoot: payload,
+      }),
+    ).toBe(true);
+
+    // After restatement, EVERY token `<ual>/N` MUST point at `urn:new:N`.
+    // With a lex-sort regression we'd see `<ual>/10` bound to `urn:new:2` (or
+    // vice-versa) because `"urn:new:10"` lex-sorts before `"urn:new:2"`.
+    for (let i = 1; i <= N; i++) {
+      const res = await store.query(
+        `SELECT ?root WHERE { GRAPH <${labelMeta}> { <${UAL}/${i}> <${DKG}rootEntity> ?root } }`,
+      );
+      expect(res.type).toBe('bindings');
+      if (res.type === 'bindings') {
+        expect(res.bindings).toHaveLength(1);
+        expect(res.bindings[0]['root']).toBe(`urn:new:${i}`);
+      }
+    }
+  });
+
+  it('deletes surplus kaSubjects when an update shrinks the root count (Codex bug 3)', async () => {
+    // Seed a 5-batch KA, then update with 2 roots.
+    await store.insert([
+      { subject: UAL, predicate: `${DKG}batchId`, object: `"${KA_ID}"^^<${XSD}integer>`, graph: labelMeta },
+      ...[1, 2, 3, 4, 5].flatMap((i) => [
+        { subject: `${UAL}/${i}`, predicate: `${RDF}type`, object: `${DKG}KnowledgeAsset`, graph: labelMeta },
+        { subject: `${UAL}/${i}`, predicate: `${DKG}partOf`, object: UAL, graph: labelMeta },
+        { subject: `${UAL}/${i}`, predicate: `${DKG}rootEntity`, object: `urn:orig:${i}`, graph: labelMeta },
+      ] as Quad[]),
+    ]);
+
+    const updateTriples = [
+      { subject: 'urn:new:a', predicate: 'urn:p', object: '"a"' },
+      { subject: 'urn:new:b', predicate: 'urn:p', object: '"b"' },
+    ];
+    const merkleRoot = new V10MerkleTree(
+      updateTriples.map((t) => hashTripleV10(t.subject, t.predicate, t.object)),
+    ).root;
+    const payload = new Map<string, Quad[]>([
+      ['urn:new:a', [{ ...updateTriples[0], graph: '' }]],
+      ['urn:new:b', [{ ...updateTriples[1], graph: '' }]],
+    ]);
+
+    expect(
+      await restateLabelGraphForUpdate({
+        store, dataGraph: labelData, metaGraph: labelMeta, ual: UAL,
+        merkleRoot, payloadByRoot: payload,
+      }),
+    ).toBe(true);
+
+    // `<ual>/3`, `<ual>/4`, `<ual>/5` must be FULLY gone — no rdf:type, no
+    // partOf, nothing. Enumeration queries that look for KnowledgeAssets
+    // partOf <ual> should see exactly the 2 retained tokens.
+    const enumRes = await store.query(
+      `SELECT DISTINCT ?ka WHERE { GRAPH <${labelMeta}> { ?ka <${DKG}partOf> <${UAL}> ; <${RDF}type> <${DKG}KnowledgeAsset> } }`,
+    );
+    expect(enumRes.type).toBe('bindings');
+    if (enumRes.type === 'bindings') {
+      const present = enumRes.bindings.map((b) => b['ka']).sort();
+      expect(present).toEqual([`${UAL}/1`, `${UAL}/2`]);
+    }
+    // And the retained tokens point at the new roots in manifest order.
+    const r1 = await store.query(
+      `SELECT ?root WHERE { GRAPH <${labelMeta}> { <${UAL}/1> <${DKG}rootEntity> ?root } }`,
+    );
+    expect(r1.type === 'bindings' && r1.bindings[0]['root']).toBe('urn:new:a');
+    const r2 = await store.query(
+      `SELECT ?root WHERE { GRAPH <${labelMeta}> { <${UAL}/2> <${DKG}rootEntity> ?root } }`,
+    );
+    expect(r2.type === 'bindings' && r2.bindings[0]['root']).toBe('urn:new:b');
+  });
+});

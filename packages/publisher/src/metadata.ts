@@ -693,7 +693,12 @@ export async function restateKaPartition(opts: {
   if (dataQuads.length > 0) await store.insert(dataQuads);
 
   // 4. Insert fresh minimal KA meta rows.
-  const roots = [...payloadByRoot.keys()].sort();
+  //    Iterate roots in INSERTION order (= manifest/publisher order), NOT
+  //    lex order. `<ual>/1`, `<ual>/2`, ... are stable, numerically-keyed
+  //    KA identifiers; a lex sort would put `<ual>/10` before `<ual>/2` and
+  //    permute the token→root binding on every restate (Codex review on
+  //    PR #845).
+  const roots = [...payloadByRoot.keys()];
   const metaQuads: Quad[] = [];
   let tokenIdx = 1;
   for (const root of roots) {
@@ -755,7 +760,10 @@ export async function restateLabelGraphForUpdate(opts: {
     return false;
   }
 
-  const newRoots = [...payloadByRoot.keys()].sort();
+  // Preserve INSERTION order from the caller (manifest order). Lex-sorting
+  // breaks the token→root binding for KAs with ≥10 batches because
+  // `<ual>/10` sorts before `<ual>/2` (Codex review on PR #845).
+  const newRoots = [...payloadByRoot.keys()];
 
   // 1. Resolve prior KA rows (ka↔root) from the label meta.
   const priorKaRows: { ka: string; root: string }[] = [];
@@ -786,10 +794,29 @@ export async function restateLabelGraphForUpdate(opts: {
   // 3. Repoint rootEntity / privateMerkleRoot on existing KA rows (by token
   //    order), minting rows only when the update grew the KA's root count.
   //    Everything else on the ?ka subject (provenance, type, …) is preserved.
-  const kaSubjects = [...new Set(priorKaRows.map((r) => r.ka))].sort();
+  //    Sort kaSubjects by NUMERIC token suffix (`<ual>/<n>`), not lex —
+  //    otherwise `<ual>/10` sorts before `<ual>/2` and the retained tokens
+  //    get bound to the wrong roots (Codex review on PR #845).
+  const kaPrefix = `${ual}/`;
+  const kaSubjects = [...new Set(priorKaRows.map((r) => r.ka))].sort((a, b) => {
+    const na = Number(a.startsWith(kaPrefix) ? a.slice(kaPrefix.length) : NaN);
+    const nb = Number(b.startsWith(kaPrefix) ? b.slice(kaPrefix.length) : NaN);
+    if (Number.isFinite(na) && Number.isFinite(nb)) return na - nb;
+    return a.localeCompare(b);
+  });
   for (const ka of kaSubjects) {
     await store.deleteByPattern({ graph: metaGraph, subject: ka, predicate: `${DKG}rootEntity` });
     await store.deleteByPattern({ graph: metaGraph, subject: ka, predicate: `${DKG}privateMerkleRoot` });
+  }
+  // If the update SHRANK the root count, the surplus ka subjects must be
+  // removed entirely. Just dropping `dkg:rootEntity` leaves them with
+  // `rdf:type dkg:KnowledgeAsset` + `dkg:partOf <ual>` still present, so
+  // enumeration queries would keep returning phantom tokens from the prior
+  // version (Codex review on PR #845).
+  if (kaSubjects.length > newRoots.length) {
+    for (let i = newRoots.length; i < kaSubjects.length; i++) {
+      await store.deleteByPattern({ graph: metaGraph, subject: kaSubjects[i] });
+    }
   }
   const metaQuads: Quad[] = [];
   for (let i = 0; i < newRoots.length; i++) {

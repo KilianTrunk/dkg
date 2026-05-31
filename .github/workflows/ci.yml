@@ -279,8 +279,10 @@ jobs:
   #     (`application/sparql-update` / `application/sparql-query`), which
   #     is not form parsed and so has no size cap.
   #
-  # The image is the same stock `lyrasis/blazegraph:2.1.5` our node-setup
-  # wizard provisions, so this reproduces exactly what an operator runs.
+  # The image digest pins the stock `lyrasis/blazegraph:2.1.5` manifest our
+  # node-setup wizard provisions, so this reproduces exactly what an operator
+  # runs while keeping the workflow supply-chain audit immutable. Digest from
+  # Docker Hub's `docker-content-digest` header for the 2.1.5 manifest.
   # The integration suite is gated on BLAZEGRAPH_TEST_URL — without it the
   # tests `describe.skipIf`-skip, so local `pnpm test` needs no Docker.
   # ------------------------------------------------------------------
@@ -291,7 +293,7 @@ jobs:
     timeout-minutes: 10
     services:
       blazegraph:
-        image: lyrasis/blazegraph:2.1.5
+        image: lyrasis/blazegraph:2.1.5@sha256:56be5edb612e981607edcd4fe1e6d4e66ba3303efc4bb3a7c5c8e6662e598125
         ports:
           - 9999:8080
     steps:

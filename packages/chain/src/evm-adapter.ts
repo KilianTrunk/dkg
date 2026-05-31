@@ -377,6 +377,10 @@ function loadAbi(contractName: string): ethers.InterfaceAbi {
   if (existsSync(localPath)) {
     return JSON.parse(readFileSync(localPath, 'utf-8'));
   }
+  const archivedPath = join(localAbiDir, 'archive', `${contractName}.json`);
+  if (existsSync(archivedPath)) {
+    return JSON.parse(readFileSync(archivedPath, 'utf-8'));
+  }
   return require(`@origintrail-official/dkg-evm-module/abi/${contractName}.json`);
 }
 

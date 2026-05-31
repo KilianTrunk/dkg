@@ -71,35 +71,45 @@ rules:
     ignore:
       - dependabot-advisory.yml
 
-  # `cache-poisoning` — scoped exception for ci.yml on `release/*` push.
+  # `cache-poisoning` — scoped exceptions for non-publishing workflows on
+  # `release/*` push.
   #
-  # When `release/rc.12` was added to ci.yml's `on: push: branches: […]`
-  # list (so the merge-gate test suite runs on every commit that lands
-  # on the active stabilisation branch), zizmor's `cache-poisoning`
-  # audit started firing on every `actions/setup-node@… with: cache:
-  # pnpm` and every `actions/cache@…` step in that workflow. The rule's
-  # general shape is: "push trigger on a release-like ref (tags or
-  # `release/*` branches) + a runtime cache = the cache could be
-  # pre-poisoned by an earlier malicious PR, then re-read by a release
-  # publish job."
+  # When `release/rc.12` is listed under `on: push: branches: […]`,
+  # zizmor's `cache-poisoning` audit fires on `actions/setup-node@…
+  # with: cache: pnpm` and `actions/cache@…` steps. The rule's general
+  # shape is: "push trigger on a release-like ref (tags or `release/*`
+  # branches) + a runtime cache = cache contents could influence bytes
+  # later shipped by a release publish job."
   #
-  # The threat model doesn't apply to ci.yml because ci.yml does NOT
-  # publish artifacts. Every step is a test runner or a lint gate:
+  # The workflows ignored here are release-branch gates, not publishing
+  # surfaces:
   #
-  #   * `pnpm test`, `pnpm lint`, Solidity coverage shards, etc.
-  #   * No `npm publish`, no `gh release create`, no docker push, no
-  #     SARIF/artifact upload that escapes the run.
-  #   * The cache contents (pnpm-store + a few action caches) only
-  #     affect the speed of subsequent ci.yml runs, never the bytes that
-  #     escape the runner.
+  #   * `ci.yml` runs tests/lints/static analysis. It uploads a
+  #     short-lived `build-outputs` artifact only for sibling test jobs
+  #     in the same workflow, plus SARIF to Code Scanning; neither is a
+  #     package, Docker image, GitHub release asset, or input to a
+  #     publishing workflow.
+  #   * `evm-integration.yml` runs Hardhat-backed integration tests
+  #     under read-only `contents` permissions and does not upload
+  #     artifacts.
+  #   * `supply-chain-scan.yml` runs scanners/audits. It may upload
+  #     scanner SARIF/job summaries, but it does not ship package or
+  #     release artifacts.
+  #
+  # Cache contents can affect gate speed and possibly gate results, but
+  # they are not promoted into user-consumed release bytes by these
+  # workflows.
   #
   # The actual publish surfaces — `npm-publish.yml`, `release.yml` —
   # remain under the strict default rule (no `ignore:` here covers them).
-  # If a future maintainer wires a publish step into ci.yml, this
+  # If a future maintainer wires publishing, release-asset creation, or
+  # cross-workflow artifact promotion into any ignored workflow, this
   # exception MUST be re-evaluated before that PR lands.
   cache-poisoning:
     ignore:
       - ci.yml
+      - evm-integration.yml
+      - supply-chain-scan.yml
 
   # `artipacked` (deliberate non-suppression — historical note).
   #

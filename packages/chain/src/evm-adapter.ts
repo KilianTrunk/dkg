@@ -741,7 +741,29 @@ export class EVMChainAdapter implements ChainAdapter {
 
   constructor(config: EVMAdapterConfig) {
     this.rpcUrls = resolveRpcUrls(config.rpcUrl, config.rpcUrls);
-    this.providers = this.rpcUrls.map((url) => new JsonRpcProvider(url, undefined, { cacheTimeout: -1 }));
+    // BUG-022 root-cause fix: force ethers' `PollingEventSubscriber`
+    // (eth_getLogs over a sliding block window) instead of the default
+    // `FilterIdEventSubscriber` (eth_newFilter + eth_getFilterChanges).
+    //
+    // The filter-id path is unrecoverable on any RPC that GC's filters
+    // faster than the poll cadence: when `eth_getFilterChanges` returns
+    // null/non-array for a dropped filter, ethers v6.16's
+    // `subscriber-filterid.js#_emitResults` throws `TypeError: results is
+    // not iterable`, the `#poll` catch swallows it as `console.log("@TODO",
+    // err)` WITHOUT invalidating the dead filterId, and re-arms on the next
+    // `block` event — pinning the daemon at 100% CPU and starving the event
+    // loop until the API hangs (observed on a 5-node devnet: 2/5 daemons
+    // wedged after ~30-60min). The prior mitigation (filter-error-silencer)
+    // only deduped the LOG spam and never recovered the filter; worse, it
+    // didn't even match this `TypeError` variant.
+    //
+    // `polling: true` carries a small extra-RPC cost (one eth_getLogs per
+    // block per active subscription) in exchange for a stateless,
+    // self-healing subscription with no server-side filter to leak. This is
+    // ethers' own fallback path for filter-unsupported RPCs.
+    this.providers = this.rpcUrls.map(
+      (url) => new JsonRpcProvider(url, undefined, { cacheTimeout: -1, polling: true }),
+    );
     this.primaryProvider = this.providers[0];
     this.provider = this.providers.length === 1
       ? this.primaryProvider

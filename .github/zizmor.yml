@@ -71,6 +71,36 @@ rules:
     ignore:
       - dependabot-advisory.yml
 
+  # `cache-poisoning` — scoped exception for ci.yml on `release/*` push.
+  #
+  # When `release/rc.12` was added to ci.yml's `on: push: branches: […]`
+  # list (so the merge-gate test suite runs on every commit that lands
+  # on the active stabilisation branch), zizmor's `cache-poisoning`
+  # audit started firing on every `actions/setup-node@… with: cache:
+  # pnpm` and every `actions/cache@…` step in that workflow. The rule's
+  # general shape is: "push trigger on a release-like ref (tags or
+  # `release/*` branches) + a runtime cache = the cache could be
+  # pre-poisoned by an earlier malicious PR, then re-read by a release
+  # publish job."
+  #
+  # The threat model doesn't apply to ci.yml because ci.yml does NOT
+  # publish artifacts. Every step is a test runner or a lint gate:
+  #
+  #   * `pnpm test`, `pnpm lint`, Solidity coverage shards, etc.
+  #   * No `npm publish`, no `gh release create`, no docker push, no
+  #     SARIF/artifact upload that escapes the run.
+  #   * The cache contents (pnpm-store + a few action caches) only
+  #     affect the speed of subsequent ci.yml runs, never the bytes that
+  #     escape the runner.
+  #
+  # The actual publish surfaces — `npm-publish.yml`, `release.yml` —
+  # remain under the strict default rule (no `ignore:` here covers them).
+  # If a future maintainer wires a publish step into ci.yml, this
+  # exception MUST be re-evaluated before that PR lands.
+  cache-poisoning:
+    ignore:
+      - ci.yml
+
   # `artipacked` (deliberate non-suppression — historical note).
   #
   # Earlier revisions of this PR carried a global `artipacked: ignore:`

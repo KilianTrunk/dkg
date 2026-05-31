@@ -1585,6 +1585,16 @@ export class MockChainAdapter implements ChainAdapter {
     const entry = this.collections.get(kaId);
     return entry?.cgId ?? 0n;
   }
+
+  /**
+   * Parity counterpart of `EVMChainAdapter.destroy()` — a no-op for the
+   * mock since it holds no RPC connections or sockets. Present so the
+   * `mock-adapter-parity.test.ts` API audit stays green and so callers
+   * can safely call `chain.destroy()` without branching on adapter type.
+   */
+  destroy(): void {
+    /* nothing to release */
+  }
 }
 
 function toHex(bytes: Uint8Array): string {

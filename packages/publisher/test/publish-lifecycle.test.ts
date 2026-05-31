@@ -718,7 +718,7 @@ describe('Tentative data and chain event confirmation', () => {
     while (handler.hasPendingPublishes && Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 100));
     }
-    poller.stop();
+    await poller.stop();
 
     expect(handler.hasPendingPublishes).toBe(false);
   }, 10000);
@@ -756,7 +756,7 @@ describe('Tentative data and chain event confirmation', () => {
     while (received.length === 0 && Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 100));
     }
-    poller.stop();
+    await poller.stop();
 
     expect(received.length).toBeGreaterThanOrEqual(1);
     const event = received.find(e => e.contextGraphId === cgResult.contextGraphId.toString());

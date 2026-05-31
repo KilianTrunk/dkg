@@ -4375,4 +4375,28 @@ export class EVMChainAdapter implements ChainAdapter {
       return null;
     }
   }
+
+  /**
+   * Release the underlying RPC providers and any keep-alive HTTP
+   * sockets they hold open.
+   *
+   * Intended for test teardown — production daemons keep a single
+   * adapter alive for the lifetime of the process, so leaks there
+   * are bounded by SIGTERM. In tests, every `createEVMAdapter()`
+   * spawns a fresh `JsonRpcProvider`, and ethers never closes the
+   * keep-alive sockets on its own. After the test, those idle
+   * sockets surface as `TCP.onStreamRead ECONNRESET` unhandled
+   * rejections when Hardhat closes the connection (observed in
+   * `chain-event-poller-extra.test.ts` running first in CI — see
+   * the `ChainEventPoller.stop()` follow-up doc).
+   *
+   * Idempotent: calling twice is a no-op (ethers' `destroy()` is
+   * itself idempotent and additional `Wallet`s share the provider
+   * so destroying once flushes everything).
+   */
+  destroy(): void {
+    for (const provider of this.providers) {
+      try { provider.destroy(); } catch { /* already destroyed / not destroyable */ }
+    }
+  }
 }

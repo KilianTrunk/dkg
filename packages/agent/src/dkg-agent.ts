@@ -19175,7 +19175,11 @@ export class DKGAgent {
   async stop(): Promise<void> {
     if (!this.started) return;
     if (this.chainPoller) {
-      this.chainPoller.stop();
+      // Await so any in-flight poll (and its HTTP keep-alive socket) settles
+      // BEFORE we tear down the chain adapter — otherwise the RPC connection
+      // closure surfaces as an `ECONNRESET` unhandled rejection from inside
+      // ethers (the same flake that has been hitting `publisher [2/4]` in CI).
+      await this.chainPoller.stop();
       this.chainPoller = null;
     }
     if (this.swmCleanupTimer) {

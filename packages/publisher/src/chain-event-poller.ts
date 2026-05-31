@@ -95,6 +95,17 @@ export class ChainEventPoller {
   private headKnown = false;
   private timer: ReturnType<typeof setInterval> | null = null;
   private running = false;
+  /**
+   * The currently-executing `poll()` promise (or `null` when idle).
+   *
+   * `stop()` awaits this so callers can deterministically tear down
+   * the chain adapter (and the underlying HTTP keep-alive socket)
+   * without racing an in-flight RPC. In tests, this is what stops
+   * `ECONNRESET` rejections from leaking after `killHardhat()` —
+   * the in-flight RPC promise has either resolved or rejected (with
+   * the catch handler we attach) BEFORE the chain goes away.
+   */
+  private inFlightPoll: Promise<void> | null = null;
 
   /** Max blocks to scan per poll — stays within typical RPC range limits. */
   private static readonly MAX_RANGE = 9_000;
@@ -132,22 +143,59 @@ export class ChainEventPoller {
     this.log.info(ctx, `Starting chain event poller (interval=${this.intervalMs}ms)`);
 
     this.timer = setInterval(() => {
-      this.poll().catch((err) => {
-        const pollCtx = createOperationContext('system');
-        this.log.error(pollCtx, `Poll failed: ${err instanceof Error ? err.message : String(err)}`);
-      });
+      // Serialize: if the previous poll is still in flight, skip this tick.
+      // Without this guard, overlapping polls would stack up — each tick
+      // would overwrite `inFlightPoll` and orphan the previous one along
+      // with its in-flight `eth_getLogs` HTTP request. On test teardown
+      // (or any RPC connection close) those orphaned sockets surface as
+      // `TCP.onStreamRead ECONNRESET` unhandled rejections — observed as
+      // 40k+ errors per file in `chain-event-poller-extra.test.ts`. The
+      // chain is monotonic and the poll catches up via `MAX_RANGE`, so a
+      // skipped tick is functionally identical to slightly longer cadence.
+      if (this.inFlightPoll) return;
+      this.inFlightPoll = this.poll()
+        .catch((err) => {
+          const pollCtx = createOperationContext('system');
+          this.log.error(pollCtx, `Poll failed: ${err instanceof Error ? err.message : String(err)}`);
+        })
+        .finally(() => { this.inFlightPoll = null; });
     }, this.intervalMs);
 
-    // Run first poll immediately
-    this.poll().catch(() => {});
+    // Run first poll immediately, and track it so `stop()` can await it.
+    this.inFlightPoll = this.poll()
+      .catch(() => {})
+      .finally(() => { this.inFlightPoll = null; });
   }
 
-  stop(): void {
+  /**
+   * Stop the interval and wait for any in-flight poll to settle.
+   *
+   * Returns a Promise so callers can `await poller.stop()` before
+   * tearing down the chain adapter / RPC connection — without this,
+   * an in-flight `eth_getLogs` would still be holding an HTTP keep-
+   * alive socket open and a downstream `killHardhat()` (in tests) or
+   * `provider.destroy()` (in prod shutdown) would surface as an
+   * `ECONNRESET` unhandled rejection from somewhere inside ethers.
+   *
+   * Idempotent: a second `stop()` after the first has resolved is a
+   * no-op. Legacy synchronous callers may still treat the return as
+   * void; they just lose the in-flight-await guarantee.
+   */
+  async stop(): Promise<void> {
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = null;
     }
     this.running = false;
+    const pending = this.inFlightPoll;
+    if (pending) {
+      // The `.catch(() => {})` chain at the call sites already swallows
+      // rejections, but defensively guard against an externally-rejected
+      // promise here too. We just want to wait for completion. The
+      // `.finally(() => { this.inFlightPoll = null })` in start() will
+      // null out `inFlightPoll` once the await unblocks.
+      try { await pending; } catch { /* already logged or swallowed */ }
+    }
 
     const ctx = createOperationContext('system');
     this.log.info(ctx, 'Chain event poller stopped');

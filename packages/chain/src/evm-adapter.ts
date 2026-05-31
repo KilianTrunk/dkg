@@ -741,7 +741,29 @@ export class EVMChainAdapter implements ChainAdapter {
 
   constructor(config: EVMAdapterConfig) {
     this.rpcUrls = resolveRpcUrls(config.rpcUrl, config.rpcUrls);
-    this.providers = this.rpcUrls.map((url) => new JsonRpcProvider(url, undefined, { cacheTimeout: -1 }));
+    // BUG-022 root-cause fix: force ethers' `PollingEventSubscriber`
+    // (eth_getLogs over a sliding block window) instead of the default
+    // `FilterIdEventSubscriber` (eth_newFilter + eth_getFilterChanges).
+    //
+    // The filter-id path is unrecoverable on any RPC that GC's filters
+    // faster than the poll cadence: when `eth_getFilterChanges` returns
+    // null/non-array for a dropped filter, ethers v6.16's
+    // `subscriber-filterid.js#_emitResults` throws `TypeError: results is
+    // not iterable`, the `#poll` catch swallows it as `console.log("@TODO",
+    // err)` WITHOUT invalidating the dead filterId, and re-arms on the next
+    // `block` event — pinning the daemon at 100% CPU and starving the event
+    // loop until the API hangs (observed on a 5-node devnet: 2/5 daemons
+    // wedged after ~30-60min). The prior mitigation (filter-error-silencer)
+    // only deduped the LOG spam and never recovered the filter; worse, it
+    // didn't even match this `TypeError` variant.
+    //
+    // `polling: true` carries a small extra-RPC cost (one eth_getLogs per
+    // block per active subscription) in exchange for a stateless,
+    // self-healing subscription with no server-side filter to leak. This is
+    // ethers' own fallback path for filter-unsupported RPCs.
+    this.providers = this.rpcUrls.map(
+      (url) => new JsonRpcProvider(url, undefined, { cacheTimeout: -1, polling: true }),
+    );
     this.primaryProvider = this.providers[0];
     this.provider = this.providers.length === 1
       ? this.primaryProvider
@@ -1249,6 +1271,7 @@ export class EVMChainAdapter implements ChainAdapter {
     return {
       hash: receipt.hash,
       blockNumber: receipt.blockNumber,
+      txIndex: receipt.index,
       success: receipt.status === 1,
     };
   }
@@ -1696,6 +1719,7 @@ export class EVMChainAdapter implements ChainAdapter {
     return {
       hash: receipt.hash,
       blockNumber: receipt.blockNumber,
+      txIndex: receipt.index,
       success: receipt.status === 1,
       batchId,
     };
@@ -1823,6 +1847,8 @@ export class EVMChainAdapter implements ChainAdapter {
                 startKAId: parsed.args.startKAId.toString(),
                 endKAId: parsed.args.endKAId.toString(),
                 txHash: log.transactionHash,
+                // PR #845 (review #9): chain-truth tiebreaker — see KCCreated.
+                txIndex: log.transactionIndex,
               },
             };
           }
@@ -1944,6 +1970,13 @@ export class EVMChainAdapter implements ChainAdapter {
                   merkleRootBytes: parsed.args.merkleRoot,
                   byteSize: parsed.args.byteSize.toString(),
                   txHash: log.transactionHash,
+                  // PR #845 (review #9): chain-truth tiebreaker for the
+                  // last-writer-wins materialization guard. The receiver's
+                  // finalization handler must derive its version from the
+                  // verified receipt, NOT a gossip-supplied `msg.txIndex`,
+                  // because the latter is trust-based and can be inflated
+                  // to lock out a legitimate same-block update.
+                  txIndex: log.transactionIndex,
                   // Greenfield: no batch mint → publisher is the KA owner
                   // (Transfer recipient), falling back to the attested author.
                   publisherAddress: mint?.publisherAddress ?? ownerByTokenId.get(idStr) ?? author,
@@ -2109,6 +2142,7 @@ export class EVMChainAdapter implements ChainAdapter {
     return {
       hash: receipt.hash,
       blockNumber: receipt.blockNumber,
+      txIndex: receipt.index,
       success: true,
       contextGraphId: contextGraphIdHex ?? nameHash,
     };
@@ -2130,7 +2164,7 @@ export class EVMChainAdapter implements ChainAdapter {
       'reveal context graph metadata',
     );
     if (!receipt) throw new Error('revealContextGraphMetadata: no receipt');
-    return { hash: receipt.hash, blockNumber: receipt.blockNumber, success: true };
+    return { hash: receipt.hash, blockNumber: receipt.blockNumber, txIndex: receipt.index, success: true };
   }
 
   async listContextGraphsFromChain(fromBlock?: number): Promise<ContextGraphOnChain[]> {
@@ -2228,6 +2262,7 @@ export class EVMChainAdapter implements ChainAdapter {
       return {
         hash: receipt.hash,
         blockNumber: receipt.blockNumber,
+        txIndex: receipt.index,
         success: false,
         contextGraphId: 0n,
       };
@@ -2236,6 +2271,7 @@ export class EVMChainAdapter implements ChainAdapter {
     return {
       hash: receipt.hash,
       blockNumber: receipt.blockNumber,
+      txIndex: receipt.index,
       success: receipt.status === 1,
       contextGraphId,
     };
@@ -2258,6 +2294,7 @@ export class EVMChainAdapter implements ChainAdapter {
     return {
       hash: receipt.hash,
       blockNumber: receipt.blockNumber,
+      txIndex: receipt.index,
       success: receipt.status === 1,
     };
   }
@@ -2708,6 +2745,7 @@ export class EVMChainAdapter implements ChainAdapter {
       endKAId,
       txHash: receipt.hash,
       blockNumber: receipt.blockNumber,
+      txIndex: receipt.index,
       blockTimestamp,
       publisherAddress,
       authorAddress,
@@ -2770,6 +2808,7 @@ export class EVMChainAdapter implements ChainAdapter {
       endKAId,
       txHash: receipt.hash,
       blockNumber: receipt.blockNumber,
+      txIndex: receipt.index,
       blockTimestamp,
       publisherAddress,
       authorAddress,
@@ -2815,6 +2854,7 @@ export class EVMChainAdapter implements ChainAdapter {
       endKAId,
       txHash: receipt.hash,
       blockNumber: receipt.blockNumber,
+      txIndex: receipt.index,
       blockTimestamp,
       publisherAddress,
     };
@@ -3199,6 +3239,7 @@ export class EVMChainAdapter implements ChainAdapter {
     return {
       hash: receipt.hash,
       blockNumber: receipt.blockNumber,
+      txIndex: receipt.index,
       success: receipt.status === 1,
       publisherAddress: signer.address,
     };
@@ -3363,6 +3404,7 @@ export class EVMChainAdapter implements ChainAdapter {
         accountId,
         hash: receipt.hash,
         blockNumber: receipt.blockNumber,
+        txIndex: receipt.index,
         success: receipt.status === 1,
       };
     });
@@ -3419,7 +3461,7 @@ export class EVMChainAdapter implements ChainAdapter {
         this.signer,
         'top up publishing conviction account',
       );
-      return { hash: receipt.hash, blockNumber: receipt.blockNumber, success: receipt.status === 1 };
+      return { hash: receipt.hash, blockNumber: receipt.blockNumber, txIndex: receipt.index, success: receipt.status === 1 };
     });
   }
 
@@ -3434,7 +3476,7 @@ export class EVMChainAdapter implements ChainAdapter {
         this.signer,
         'settle publishing conviction account',
       );
-      return { hash: receipt.hash, blockNumber: receipt.blockNumber, success: receipt.status === 1 };
+      return { hash: receipt.hash, blockNumber: receipt.blockNumber, txIndex: receipt.index, success: receipt.status === 1 };
     });
   }
 
@@ -3449,7 +3491,7 @@ export class EVMChainAdapter implements ChainAdapter {
         this.signer,
         'register publishing conviction agent',
       );
-      return { hash: receipt.hash, blockNumber: receipt.blockNumber, success: receipt.status === 1 };
+      return { hash: receipt.hash, blockNumber: receipt.blockNumber, txIndex: receipt.index, success: receipt.status === 1 };
     });
   }
 
@@ -3464,7 +3506,7 @@ export class EVMChainAdapter implements ChainAdapter {
         this.signer,
         'deregister publishing conviction agent',
       );
-      return { hash: receipt.hash, blockNumber: receipt.blockNumber, success: receipt.status === 1 };
+      return { hash: receipt.hash, blockNumber: receipt.blockNumber, txIndex: receipt.index, success: receipt.status === 1 };
     });
   }
 
@@ -4053,6 +4095,7 @@ export class EVMChainAdapter implements ChainAdapter {
       return {
         hash: receipt.hash,
         blockNumber: receipt.blockNumber,
+        txIndex: receipt.index,
         success: true,
         challenge,
         contextGraphId,
@@ -4088,6 +4131,7 @@ export class EVMChainAdapter implements ChainAdapter {
       return {
         hash: receipt.hash,
         blockNumber: receipt.blockNumber,
+        txIndex: receipt.index,
         success: true,
       };
     });
@@ -4338,6 +4382,30 @@ export class EVMChainAdapter implements ChainAdapter {
       // Caller treats `null` as "no chain-anchored hash" and falls
       // back to the beacon path or rejects.
       return null;
+    }
+  }
+
+  /**
+   * Release the underlying RPC providers and any keep-alive HTTP
+   * sockets they hold open.
+   *
+   * Intended for test teardown — production daemons keep a single
+   * adapter alive for the lifetime of the process, so leaks there
+   * are bounded by SIGTERM. In tests, every `createEVMAdapter()`
+   * spawns a fresh `JsonRpcProvider`, and ethers never closes the
+   * keep-alive sockets on its own. After the test, those idle
+   * sockets surface as `TCP.onStreamRead ECONNRESET` unhandled
+   * rejections when Hardhat closes the connection (observed in
+   * `chain-event-poller-extra.test.ts` running first in CI — see
+   * the `ChainEventPoller.stop()` follow-up doc).
+   *
+   * Idempotent: calling twice is a no-op (ethers' `destroy()` is
+   * itself idempotent and additional `Wallet`s share the provider
+   * so destroying once flushes everything).
+   */
+  destroy(): void {
+    for (const provider of this.providers) {
+      try { provider.destroy(); } catch { /* already destroyed / not destroyable */ }
     }
   }
 }

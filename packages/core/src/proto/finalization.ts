@@ -82,7 +82,13 @@ export const FinalizationMessageSchema = new Type('FinalizationMessage')
   // `keepRootCopyOnLabel?: boolean` shape for ergonomic call sites.
   // Tag 16 wire bytes are `0x80 0x01 <value-byte>` (3 bytes when set;
   // omitted entirely when undefined / proto3 default).
-  .add(new Field('keepRootCopyOnLabelTri', 16, 'uint32'));
+  .add(new Field('keepRootCopyOnLabelTri', 16, 'uint32'))
+  // GH#842 last-writer-wins tiebreaker. Sent on the wire so receivers
+  // can stamp the materialised version as `(blockNumber, txIndex)`,
+  // preventing a stale same-block publish-promotion from clobbering an
+  // already-applied update. Legacy publishers omit the field and the
+  // receiver falls back to 0 (matching the pre-fix shape).
+  .add(new Field('txIndex', 17, 'uint32'));
 
 type Long = { low: number; high: number; unsigned: boolean };
 
@@ -134,6 +140,14 @@ export interface FinalizationMessageMsg {
    * upgrades and re-emits.
    */
   keepRootCopyOnLabel?: boolean;
+  /**
+   * Transaction index within `blockNumber`. GH#842 tiebreaker on the
+   * receiver side — combined with `blockNumber` to form the
+   * `MaterializedVersion` that the per-KA last-writer-wins guard uses.
+   * Optional for back-compat: legacy publishers omit the field and the
+   * receiver falls back to 0.
+   */
+  txIndex?: number;
 }
 
 const MAX_UINT64 = (1n << 64n) - 1n;

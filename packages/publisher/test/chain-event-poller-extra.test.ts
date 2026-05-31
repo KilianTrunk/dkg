@@ -41,12 +41,12 @@
  *   `listenForEvents` with the missing branches) cannot silently slip.
  * ======================================================================
  */
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
 import { ethers } from 'ethers';
 import { OxigraphStore } from '@origintrail-official/dkg-storage';
 import { TypedEventBus } from '@origintrail-official/dkg-core';
 import {
-  createEVMAdapter,
+  createEVMAdapter as _createEVMAdapter,
   getSharedContext,
   createProvider,
   takeSnapshot,
@@ -56,6 +56,29 @@ import {
 import { mintTokens } from '../../chain/test/hardhat-harness.js';
 import { ChainEventPoller, type CursorPersistence } from '../src/chain-event-poller.js';
 import { PublishHandler } from '../src/publish-handler.js';
+
+// Track adapters across the file so afterEach can release their HTTP
+// keep-alive sockets. Without this, every `createEVMAdapter()` leaks a
+// `JsonRpcProvider` whose idle TCP socket eventually gets reset by
+// Hardhat (during subsequent test files' load), surfacing as a
+// `TCP.onStreamRead ECONNRESET` unhandled rejection attributed back
+// to whichever test happened to be running when Node fired it. In CI
+// this manifested as 40k+ unhandled rejections per `publisher [2/4]`
+// shard. The poller-side fix (await-in-flight-poll + serialize ticks)
+// catches the on-the-wire case; this catches the "test ended, socket
+// still alive" case.
+const trackedAdapters: Array<ReturnType<typeof _createEVMAdapter>> = [];
+function createEVMAdapter(privateKey?: string): ReturnType<typeof _createEVMAdapter> {
+  const adapter = _createEVMAdapter(privateKey);
+  trackedAdapters.push(adapter);
+  return adapter;
+}
+afterEach(() => {
+  while (trackedAdapters.length > 0) {
+    const adapter = trackedAdapters.pop();
+    try { (adapter as unknown as { destroy: () => void } | undefined)?.destroy(); } catch { /* idempotent */ }
+  }
+});
 
 class InMemoryCursor implements CursorPersistence {
   public saved: number[] = [];
@@ -143,7 +166,7 @@ describe('ChainEventPoller — cursor persistence', () => {
 
     await poller.start();
     await pollOnce(poller);
-    poller.stop();
+    await poller.stop();
 
     // Our event must be among the restored-cursor scan results (other
     // tests may have created CGs too — we only care that OURS is picked).
@@ -176,7 +199,7 @@ describe('ChainEventPoller — cursor persistence', () => {
 
     await poller.start();
     await pollOnce(poller);
-    poller.stop();
+    await poller.stop();
 
     expect(cursor.saved.length).toBeGreaterThan(0);
     // Final cursor must cover the block we emitted at.
@@ -200,7 +223,7 @@ describe('ChainEventPoller — cursor persistence', () => {
     });
 
     await expect(poller.start()).resolves.toBeUndefined();
-    poller.stop();
+    await poller.stop();
   }, 15_000);
 });
 
@@ -231,7 +254,7 @@ describe('ChainEventPoller — head seeding & range capping', () => {
     // so it MUST NOT be received on the first (seeded) poll.
     await poller.start();
     await pollOnce(poller);
-    poller.stop();
+    await poller.stop();
 
     expect(received.includes(oldEventBlock), `expected block ${oldEventBlock} to be skipped (head=${head}, seed=${head - 500}); received=${received.join(',')}`).toBe(false);
   }, 45_000);
@@ -268,7 +291,7 @@ describe('ChainEventPoller — head seeding & range capping', () => {
 
     await poller.start();
     await pollOnce(poller, 500);
-    poller.stop();
+    await poller.stop();
 
     // Early event must be picked up in the first poll. Scan range is
     // [1, min(9000, head)]; earlyBlock < 9000 for a fresh Hardhat, so the
@@ -313,7 +336,7 @@ describe('ChainEventPoller — head seeding & range capping', () => {
     // Wait long enough for multiple polls (intervalMs=50, head-early > 9000
     // means at least 2 polls are required to close the gap).
     await pollOnce(poller, 1500);
-    poller.stop();
+    await poller.stop();
 
     // Both events are observed, but NOT in a single poll — the cursor
     // had to advance through the MAX_RANGE boundary first.
@@ -350,7 +373,7 @@ describe('ChainEventPoller — fault isolation & lifecycle', () => {
 
     await poller.start();
     await pollOnce(poller, 500);
-    poller.stop();
+    await poller.stop();
 
     expect(throwerCalls).toBeGreaterThanOrEqual(1);
     expect(seen).toContain(id1);
@@ -368,13 +391,13 @@ describe('ChainEventPoller — fault isolation & lifecycle', () => {
     });
 
     await poller.start();
-    poller.stop();
-    poller.stop();
+    await poller.stop();
+    await poller.stop();
 
     // Re-start succeeds without leaving ghost timers (open-handle warning
     // from vitest would fail the suite if the previous interval leaked).
     await poller.start();
-    poller.stop();
+    await poller.stop();
   }, 15_000);
 
   it('start() is idempotent (calling twice does not create two timers)', async () => {
@@ -419,7 +442,7 @@ describe('ChainEventPoller — fault isolation & lifecycle', () => {
 
     // Give the first (synchronous) poll time to complete its async work.
     await pollOnce(poller, 400);
-    poller.stop();
+    await poller.stop();
 
     // Timer handle must be unchanged after the second start() call — proof
     // that no additional setInterval was scheduled.

@@ -7495,11 +7495,30 @@ export class DKGAgent {
     const ctx = opts?.operationCtx ?? createOperationContext('update');
     const onPhase = opts?.onPhase;
     this.log.info(ctx, `Starting update of kaId=${kaId} in context graph "${contextGraphId}" with ${quads.length} triples`);
+    // GH #842: thread the on-chain cgId so the publisher can promote the update
+    // payload into the per-cgId partition the RS prover reads. Without it,
+    // updated KAs stay unprovable (data-corrupted / leaf-count-mismatch).
+    // Best-effort: a store/ontology failure here must NOT abort the on-chain
+    // update — the RS sync is a downstream concern and the unguarded await
+    // would let any local lookup error tank the entire update RPC (Codex
+    // review #3 on PR #845).
+    let updateOnChainId: string | null = null;
+    try {
+      updateOnChainId = await this.getContextGraphOnChainId(contextGraphId);
+    } catch (err) {
+      this.log.warn(
+        ctx,
+        `Failed to resolve on-chain cgId for "${contextGraphId}" prior to update; per-cgId RS promotion will be skipped: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
     const result = await this.publisher.update(kaId, {
       contextGraphId,
       quads,
       privateQuads,
       publisherPeerId: this.node.peerId.toString(),
+      publishContextGraphId: updateOnChainId ?? undefined,
       operationCtx: ctx,
       onPhase,
       precomputedUpdateAttestation: opts?.precomputedUpdateAttestation,
@@ -9023,6 +9042,11 @@ export class DKGAgent {
         kcMerkleRoot: result.merkleRoot,
         txHash: result.onChainResult.txHash ?? '',
         blockNumber: result.onChainResult.blockNumber ?? 0,
+        // GH#842: thread the real `(block, txIndex)` so receivers stamp the
+        // exact same materialised version as the local publish promotion —
+        // otherwise a same-block update vs publish would tie on the wire
+        // and the stale publish-promotion could clobber the update.
+        txIndex: result.onChainResult.txIndex ?? 0,
         batchId: result.onChainResult.batchId ?? 0n,
         startKAId: result.onChainResult.startKAId ?? 0n,
         endKAId: result.onChainResult.endKAId ?? 0n,
@@ -12793,6 +12817,10 @@ export class DKGAgent {
     if (!this.updateHandler) {
       this.updateHandler = new UpdateHandler(this.store, this.chain, this.eventBus, {
         knownBatchContextGraphs: this.publisher.knownBatchContextGraphs,
+        // GH #842: let the receiver promote applied updates into the per-cgId
+        // partition the RS prover reads, so updated KAs are provable on all
+        // nodes, not just the publisher.
+        resolveOnChainCgId: (cgName: string) => this.getContextGraphOnChainId(cgName),
       });
     }
     return this.updateHandler;
@@ -19163,7 +19191,11 @@ export class DKGAgent {
   async stop(): Promise<void> {
     if (!this.started) return;
     if (this.chainPoller) {
-      this.chainPoller.stop();
+      // Await so any in-flight poll (and its HTTP keep-alive socket) settles
+      // BEFORE we tear down the chain adapter — otherwise the RPC connection
+      // closure surfaces as an `ECONNRESET` unhandled rejection from inside
+      // ethers (the same flake that has been hitting `publisher [2/4]` in CI).
+      await this.chainPoller.stop();
       this.chainPoller = null;
     }
     if (this.swmCleanupTimer) {

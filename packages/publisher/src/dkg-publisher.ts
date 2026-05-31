@@ -28,7 +28,12 @@ import {
   generateTentativeMetadata,
   toHex,
   resolveUalByBatchId,
-  updateMetaMerkleRoot,
+  promoteUpdatedKaToPerCgId,
+  restateLabelGraphForUpdate,
+  shouldApplyMaterialization,
+  withMaterializationLock,
+  writeMaterializedVersion,
+  type MaterializedVersion,
   type KAMetadata,
 } from './metadata.js';
 import { storeWorkspaceOperationPublicQuads } from './workspace-resolution.js';
@@ -1364,6 +1369,30 @@ export class DKGPublisher implements Publisher {
         const defaultDataGraph = this.graphManager.dataGraphUri(contextGraphId);
         const defaultMetaGraph = `${defaultDataGraph.replace(/\/data$/, '')}/_meta`;
 
+        // GH#842 last-writer-wins guard: if this KA has already been updated
+        // (a newer materialisation exists in the per-cgId meta), this
+        // publish-promotion is stale and MUST NOT re-materialise the original
+        // KA on top of it — that is exactly the race that made updated KAs
+        // unprovable. Skip the whole promotion when stale.
+        // `txIndex` is the chain-truth tiebreaker — without it a same-block
+        // publish + update would tie and the stale promotion could still
+        // overwrite the update.
+        const publishVersion: MaterializedVersion = {
+          blockNumber: publishResult.onChainResult.blockNumber ?? 0,
+          txIndex: publishResult.onChainResult.txIndex ?? 0,
+        };
+        // PR #845 review: serialise the check + the entire promotion +
+        // the final version-stamp under the per-KA materialization lock,
+        // otherwise a concurrent update path's `restate*` (or another
+        // finalization) can stamp a newer version between our check and
+        // our write, and we'd resume mid-sequence and overwrite it.
+        await withMaterializationLock(ctxMetaGraph, publishResult.ual, async () => {
+        const applyPromotion = await shouldApplyMaterialization(
+          this.store, ctxMetaGraph, publishResult.ual, publishVersion,
+        );
+        if (!applyPromotion) {
+          this.log.info(ctx, `Skipped publish→per-cgId promotion for ${publishResult.ual}: a newer update is already materialised`);
+        } else {
         // Data promotion: always COPY public quads to the per-cgId data
         // graph (`<NAME>/context/<cgId>/data`) — RS prover's
         // `extractV10KCFromStore` reads triples from there
@@ -1426,7 +1455,13 @@ export class DKGPublisher implements Publisher {
           }
         }
 
+        // Stamp the publish version so a later update can compare against it
+        // (and a concurrent stale re-promote is rejected above).
+        await writeMaterializedVersion(this.store, ctxMetaGraph, publishResult.ual, publishVersion);
+
         this.log.info(ctx, `Promoted ${publishResult.kaManifest.length} KAs from default graph to context graph ${targetCgId}`);
+        }
+        });
       }
     }
 
@@ -2811,30 +2846,113 @@ export class DKGPublisher implements Publisher {
     onPhase?.('prepare:merkle', 'end');
     onPhase?.('prepare', 'end');
 
-    const storeUpdatedQuads = async (): Promise<void> => {
+    const updatePrivateRootByRoot = new Map<string, Uint8Array>();
+    for (const m of manifestEntries) {
+      if (m.privateMerkleRoot) updatePrivateRootByRoot.set(m.rootEntity, m.privateMerkleRoot);
+    }
+
+    const storeUpdatedQuads = async (version?: MaterializedVersion): Promise<void> => {
       onPhase?.('store', 'start');
-      for (const [rootEntity, publicQuads] of kaMap) {
-        await this.store.deleteByPattern({ graph: dataGraph, subject: rootEntity });
-        await this.store.deleteBySubjectPrefix(dataGraph, rootEntity + '/.well-known/genid/');
+
+      // Discover the PRIOR root entities from `_meta` BEFORE the label
+      // restatement wipes them (Codex review #2 on PR #845). When an update
+      // changes the root entity, the v1 fix only purged private triples for
+      // the NEW roots, so the prior root's private payload was left in
+      // `PrivateContentStore` (keyed by `(contextGraph, rootEntity)`) and
+      // would leak into any future KA that reused the prior root in the
+      // same context graph.
+      const DKG_ONT = 'http://dkg.io/ontology/';
+      const priorRootEntities = new Set<string>();
+      try {
+        const labelMetaForPriors = this.graphManager.metaGraphUri(contextGraphId);
+        let ualForPriors = await resolveUalByBatchId(this.store, labelMetaForPriors, kaId);
+        if (!ualForPriors) {
+          // Same local-only deterministic-UAL fallback as the restate
+          // block below (PR #845 review #8). Keeps the prior-root scan
+          // working for `NoChainAdapter` updates.
+          if (localOnlyUpdate && publisherAddress) {
+            ualForPriors = `did:dkg:${this.chain.chainId}/${publisherAddress}/${kaId}`;
+          } else {
+            ualForPriors = await this.resolveKaUal(kaId);
+          }
+        }
+        if (ualForPriors) {
+          const priorRes = await this.store.query(
+            `SELECT DISTINCT ?root WHERE { GRAPH <${labelMetaForPriors}> { ?ka <${DKG_ONT}partOf> <${ualForPriors}> ; <${DKG_ONT}rootEntity> ?root } }`,
+          );
+          if (priorRes.type === 'bindings') {
+            for (const row of priorRes.bindings) {
+              const r = row['root'];
+              if (typeof r === 'string' && r.length > 0) priorRootEntities.add(r);
+            }
+          }
+        }
+      } catch (err) {
+        this.log.warn(
+          ctx,
+          `Failed to resolve prior root entities for kaId=${kaId} private-triple purge: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+
+      // Private triples: purge BOTH prior + new roots, then store the new
+      // payload. Purging the union (and not just the new roots) is what
+      // closes the leak described above.
+      const rootsToPurge = new Set<string>(priorRootEntities);
+      for (const [rootEntity] of kaMap) rootsToPurge.add(rootEntity);
+      for (const rootEntity of rootsToPurge) {
         await this.privateStore.deletePrivateTriples(contextGraphId, rootEntity, options.subGraphName);
-
-        const normalized = publicQuads.map((q) => ({ ...q, graph: dataGraph }));
-        await this.store.insert(normalized);
-
+      }
+      for (const [rootEntity] of kaMap) {
         const entityPrivateQuads = entityPrivateMap.get(rootEntity) ?? [];
         if (entityPrivateQuads.length > 0) {
           await this.privateStore.storePrivateTriples(contextGraphId, rootEntity, entityPrivateQuads, options.subGraphName);
         }
       }
 
-      try {
-        await updateMetaMerkleRoot(this.store, this.graphManager, contextGraphId, kaId, kcMerkleRoot);
-      } catch (err) {
-        this.log.warn(
-          ctx,
-          `Failed to sync _meta merkleRoot for kaId=${kaId}: ${err instanceof Error ? err.message : String(err)}`,
-        );
+      // Public + meta: full-restate the label graph (GH#842 §7.1). The old
+      // approach deleted/inserted only the NEW payload roots, leaving the prior
+      // root entity (and its triples) behind in both label data and `_meta` —
+      // so `agent.query` returned stale+new and the per-cgId copy was built
+      // from a stale source. `restateLabelGraphForUpdate` purges the prior
+      // roots' data, repoints `rootEntity` (preserving rich provenance), and
+      // refreshes `merkleRoot`. The version guard makes a later stale
+      // re-materialisation a no-op.
+      //
+      // PR #845 review #8 (@branarakic): public restatement is the CORE
+      // write — it must NOT be swallowed. Pre-fix code wrapped this in
+      // try/catch, so a `NoChainAdapter` update (where `resolveKaUal`
+      // throws because `getDKGKnowledgeAssetsAddress` returns undefined)
+      // would report tentative/confirmed success with private triples
+      // changed but public triples STILL stale — silently breaking
+      // `agent.query` on the label graph.
+      //
+      // Fix: for the local-only path we have a deterministic UAL
+      // (`did:dkg:<chainId>/<publisherAddress>/<kaId>` — same scheme the
+      // result UAL uses at L2941), so use that as the last-resort UAL
+      // when `resolveKaUal` would throw. For the on-chain path we still
+      // let `resolveKaUal` throw (failing the update) — which is the
+      // correct behavior when chain-truth is required but unavailable.
+      const labelMeta = this.graphManager.metaGraphUri(contextGraphId);
+      let ualForRestate = await resolveUalByBatchId(this.store, labelMeta, kaId);
+      if (!ualForRestate) {
+        if (localOnlyUpdate && publisherAddress) {
+          // Mirror the `result.ual` formula below so the restated meta
+          // joins with what `update()`'s caller sees as the KA's UAL.
+          ualForRestate = `did:dkg:${this.chain.chainId}/${publisherAddress}/${kaId}`;
+        } else {
+          ualForRestate = await this.resolveKaUal(kaId);
+        }
       }
+      await restateLabelGraphForUpdate({
+        store: this.store,
+        dataGraph,
+        metaGraph: labelMeta,
+        ual: ualForRestate,
+        merkleRoot: kcMerkleRoot,
+        payloadByRoot: kaMap,
+        privateRootByRoot: updatePrivateRootByRoot,
+        version,
+      });
       onPhase?.('store', 'end');
     };
 
@@ -2934,7 +3052,7 @@ export class DKGPublisher implements Publisher {
     // legacy update fallback was archived in
     // `archive-non-v10-contracts` (issue 0004) — adapters must now
     // provide the V10 `updateKnowledgeCollectionV10` surface.
-    let txResult: { success: boolean; hash: string; blockNumber?: number; publisherAddress?: string };
+    let txResult: { success: boolean; hash: string; blockNumber?: number; txIndex?: number; publisherAddress?: string };
     let earlyReturn: PublishResult | undefined;
     let wroteAhead = false;
     const emitWriteAheadStart = (info?: { txHash?: string }) => {
@@ -3079,11 +3197,53 @@ export class DKGPublisher implements Publisher {
       return result;
     }
 
-    await storeUpdatedQuads();
+    // Chain version for the GH#842 last-writer-wins guard. The update's
+    // `(blockNumber, txIndex)` is the on-chain ordering key — same-block
+    // publish + update are distinguished by `txIndex`, so a late stale
+    // publish-promotion can never overwrite this materialisation.
+    const updateVersion: MaterializedVersion = {
+      blockNumber: txResult.blockNumber ?? 0,
+      txIndex: txResult.txIndex ?? 0,
+    };
+    await storeUpdatedQuads(updateVersion);
+
+    const ual = await this.resolveKaUal(kaId);
+
+    // GH #842: promote the update payload into the per-cgId partition that the
+    // Random Sampling prover reads (`extractV10KCFromStore`). Without this the
+    // prover keeps extracting the stale pre-update KA from the original publish
+    // promotion and every updated KA is permanently unprovable
+    // (`data-corrupted` / leaf-count-mismatch). Best-effort: skip silently when
+    // the on-chain cgId is unknown — RS behaviour is then unchanged (the KA
+    // simply stays `kc-not-synced`), so this can never regress a publish.
+    if (publisherContextGraphId !== undefined && publisherContextGraphId > 0n) {
+      try {
+        const privateRootByRoot = new Map<string, Uint8Array>();
+        for (const m of manifestEntries) {
+          if (m.privateMerkleRoot) privateRootByRoot.set(m.rootEntity, m.privateMerkleRoot);
+        }
+        await promoteUpdatedKaToPerCgId({
+          store: this.store,
+          contextGraphId,
+          cgId: publisherContextGraphId.toString(),
+          ual,
+          kaId,
+          merkleRoot: kcMerkleRoot,
+          payloadByRoot: kaMap,
+          privateRootByRoot,
+          version: updateVersion,
+        });
+      } catch (err) {
+        this.log.warn(
+          ctx,
+          `GH#842 per-cgId update promotion failed for kaId=${kaId}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
 
     const result: PublishResult = {
       kaId,
-      ual: await this.resolveKaUal(kaId),
+      ual,
       merkleRoot: kcMerkleRoot,
       kaManifest: manifestEntries,
       status: 'confirmed',

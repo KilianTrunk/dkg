@@ -1041,6 +1041,7 @@ export class MockChainAdapter implements ChainAdapter {
       endKAId: endId,
       txHash: tx.hash,
       blockNumber: tx.blockNumber,
+      txIndex: tx.txIndex,
       blockTimestamp: Math.floor(Date.now() / 1000),
       publisherAddress: this.signerAddress,
     };
@@ -1221,6 +1222,7 @@ export class MockChainAdapter implements ChainAdapter {
       endKAId,
       txHash: result.hash,
       blockNumber: result.blockNumber,
+      txIndex: result.txIndex,
       blockTimestamp: Math.floor(Date.now() / 1000),
       publisherAddress,
       // Mirror evm-adapter: surface the chain-confirmed author from the
@@ -1270,7 +1272,7 @@ export class MockChainAdapter implements ChainAdapter {
     const hash = `0x${blockNumber.toString(16).padStart(64, '0')}${txIndex.toString(16).padStart(4, '0')}`;
 
     if (this.autoMine) this.advanceBlock();
-    return { hash, blockNumber, success };
+    return { hash, blockNumber, txIndex, success };
   }
 
   /** Advance to next block, resetting the tx index counter. */
@@ -1582,6 +1584,16 @@ export class MockChainAdapter implements ChainAdapter {
   async getKAContextGraphId(kaId: bigint): Promise<bigint> {
     const entry = this.collections.get(kaId);
     return entry?.cgId ?? 0n;
+  }
+
+  /**
+   * Parity counterpart of `EVMChainAdapter.destroy()` — a no-op for the
+   * mock since it holds no RPC connections or sockets. Present so the
+   * `mock-adapter-parity.test.ts` API audit stays green and so callers
+   * can safely call `chain.destroy()` without branching on adapter type.
+   */
+  destroy(): void {
+    /* nothing to release */
   }
 }
 

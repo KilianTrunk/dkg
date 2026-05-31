@@ -107,6 +107,14 @@ export interface OnChainPublishResult {
   endKAId?: bigint;
   txHash: string;
   blockNumber: number;
+  /**
+   * Transaction index within the block. Required as the tiebreaker in the
+   * GH#842 last-writer-wins guard so a publish and a same-block update don't
+   * compare equal (which would let a late stale publish-promotion clobber the
+   * already-applied update). Optional for back-compat with adapters that
+   * don't yet populate it; callers MUST fall back to `0`.
+   */
+  txIndex?: number;
   blockTimestamp: number;
   publisherAddress: string;
   /**
@@ -144,6 +152,12 @@ export interface ExtendStorageParams {
 export interface TxResult {
   hash: string;
   blockNumber: number;
+  /**
+   * Transaction index within the block (GH#842 tiebreaker — see
+   * `OnChainPublishResult.txIndex`). Optional for adapter back-compat;
+   * callers fall back to `0`.
+   */
+  txIndex?: number;
   success: boolean;
   /**
    * Effective publisher/signing address used by update-style txs.

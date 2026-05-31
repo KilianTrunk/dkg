@@ -35,6 +35,12 @@ import {
   KCRootEntitiesNotFoundError,
   KCDataMissingError,
 } from '../src/index.js';
+import {
+  promoteUpdatedKaToPerCgId,
+  restateLabelGraphForUpdate,
+  writeMaterializedVersion,
+  readMaterializedVersion,
+} from '@origintrail-official/dkg-publisher';
 
 const DKG = 'http://dkg.io/ontology/';
 const XSD = 'http://www.w3.org/2001/XMLSchema#';
@@ -401,5 +407,570 @@ describe('extractV10KCFromStore — error paths', () => {
     const r10 = await extractV10KCFromStore(store, 1n, 10n);
     expect(r10.ual).toBe(UAL_10);
     expect(r10.rootEntities).toEqual([ROOT_10]);
+  });
+});
+
+// GH #842 — updated KAs must remain provable by Random Sampling.
+//
+// V10 treats an update as a full restatement: the chain ASSIGNS merkleRoot /
+// merkleLeafCount over the update payload. Before the fix, the update paths
+// only wrote the payload into the label data graph and never promoted it into
+// the per-cgId partition the prover reads, so `extractV10KCFromStore` kept
+// returning the STALE pre-update KA — a leaf count that can never match the
+// chain commitment (permanent `data-corrupted`). These tests pin that
+// `promoteUpdatedKaToPerCgId` makes the extract reflect EXACTLY the payload.
+describe('promoteUpdatedKaToPerCgId — updated KA stays provable (GH #842)', () => {
+  let store: OxigraphStore;
+  beforeEach(() => {
+    store = new OxigraphStore();
+  });
+
+  const CG_ID = 5n;
+  const CG_NAME = 'cg-5';
+  const KA_ID = 42n;
+  const UAL = 'did:dkg:hardhat:31337/0xpub/42';
+
+  function payloadMap(triples: { subject: string; predicate: string; object: string }[]): Map<string, Quad[]> {
+    const m = new Map<string, Quad[]>();
+    for (const t of triples) {
+      const root = t.subject.split('/.well-known/genid/')[0];
+      const arr = m.get(root) ?? [];
+      arr.push({ ...t, graph: '' });
+      m.set(root, arr);
+    }
+    return m;
+  }
+
+  it('extracts ONLY the update payload (new root) — stale original roots are purged', async () => {
+    // Original publish promotion: one root with three triples.
+    await seedKC(store, {
+      cgId: CG_ID,
+      cgName: CG_NAME,
+      kaId: KA_ID,
+      ual: UAL,
+      rootEntities: ['urn:orig:a'],
+      publicTriples: [
+        { subject: 'urn:orig:a', predicate: 'urn:p:name', object: '"orig"' },
+        { subject: 'urn:orig:a', predicate: 'urn:p:k1', object: '"1"' },
+        { subject: 'urn:orig:a', predicate: 'urn:p:k2', object: '"2"' },
+      ],
+    });
+
+    // Sanity: before the update the extract sees the original 3 triples.
+    const before = await extractV10KCFromStore(store, CG_ID, KA_ID);
+    expect(before.triples).toHaveLength(3);
+
+    // Full-restatement update to a brand-new root with two triples (mirrors the
+    // surgical RS harness's INCLUDE_UPDATED_COHORT pattern).
+    const updateTriples = [
+      { subject: 'urn:upd:b', predicate: 'urn:p:type', object: 'urn:UpdateAction' },
+      { subject: 'urn:upd:b', predicate: 'urn:p:name', object: '"updated"' },
+    ];
+    const merkleRoot = new V10MerkleTree(
+      updateTriples.map((t) => hashTripleV10(t.subject, t.predicate, t.object)),
+    ).root;
+
+    await promoteUpdatedKaToPerCgId({
+      store,
+      contextGraphId: CG_NAME,
+      cgId: CG_ID.toString(),
+      ual: UAL,
+      kaId: KA_ID,
+      merkleRoot,
+      payloadByRoot: payloadMap(updateTriples),
+    });
+
+    const after = await extractV10KCFromStore(store, CG_ID, KA_ID);
+
+    // The extract now reflects EXACTLY the payload — stale 'urn:orig:a' gone.
+    expect(after.rootEntities).toEqual(['urn:upd:b']);
+    expect(after.triples).toHaveLength(updateTriples.length);
+    expect(after.triples.every((t) => t.subject === 'urn:upd:b')).toBe(true);
+
+    // And the recomputed extract root matches what the chain committed to.
+    expect(new V10MerkleTree(after.leaves).root).toEqual(merkleRoot);
+  });
+
+  it('replaces in-place when the update keeps the same root (content swap)', async () => {
+    await seedKC(store, {
+      cgId: CG_ID,
+      cgName: CG_NAME,
+      kaId: KA_ID,
+      ual: UAL,
+      rootEntities: ['urn:e:a'],
+      publicTriples: [
+        { subject: 'urn:e:a', predicate: 'urn:p:v', object: '"old-1"' },
+        { subject: 'urn:e:a', predicate: 'urn:p:w', object: '"old-2"' },
+      ],
+    });
+
+    const updateTriples = [{ subject: 'urn:e:a', predicate: 'urn:p:v', object: '"new"' }];
+    const merkleRoot = new V10MerkleTree(
+      updateTriples.map((t) => hashTripleV10(t.subject, t.predicate, t.object)),
+    ).root;
+
+    await promoteUpdatedKaToPerCgId({
+      store,
+      contextGraphId: CG_NAME,
+      cgId: CG_ID.toString(),
+      ual: UAL,
+      kaId: KA_ID,
+      merkleRoot,
+      payloadByRoot: payloadMap(updateTriples),
+    });
+
+    const after = await extractV10KCFromStore(store, CG_ID, KA_ID);
+    expect(after.rootEntities).toEqual(['urn:e:a']);
+    expect(after.triples).toHaveLength(1);
+    expect(after.triples[0].object).toBe('"new"');
+    expect(new V10MerkleTree(after.leaves).root).toEqual(merkleRoot);
+  });
+
+  it('is idempotent on re-apply (gossip retry / duplicate delivery)', async () => {
+    await seedKC(store, {
+      cgId: CG_ID,
+      cgName: CG_NAME,
+      kaId: KA_ID,
+      ual: UAL,
+      rootEntities: ['urn:e:a'],
+      publicTriples: [{ subject: 'urn:e:a', predicate: 'urn:p:v', object: '"old"' }],
+    });
+
+    const updateTriples = [
+      { subject: 'urn:upd:x', predicate: 'urn:p:a', object: '"1"' },
+      { subject: 'urn:upd:x', predicate: 'urn:p:b', object: '"2"' },
+    ];
+    const merkleRoot = new V10MerkleTree(
+      updateTriples.map((t) => hashTripleV10(t.subject, t.predicate, t.object)),
+    ).root;
+
+    for (let i = 0; i < 2; i++) {
+      await promoteUpdatedKaToPerCgId({
+        store,
+        contextGraphId: CG_NAME,
+        cgId: CG_ID.toString(),
+        ual: UAL,
+        kaId: KA_ID,
+        merkleRoot,
+        payloadByRoot: payloadMap(updateTriples),
+      });
+    }
+
+    const after = await extractV10KCFromStore(store, CG_ID, KA_ID);
+    expect(after.rootEntities).toEqual(['urn:upd:x']);
+    expect(after.triples).toHaveLength(updateTriples.length);
+    expect(new V10MerkleTree(after.leaves).root).toEqual(merkleRoot);
+  });
+});
+
+// GH #842 — the materialization version guard (last-writer-wins by chain order).
+//
+// Several independent async writers project a KA into the per-cgId partition:
+// the publish→per-cgId promotion, the inline update promotion, and the gossip
+// FinalizationHandler. The chain orders them (publish THEN update), but locally
+// they can land in the OPPOSITE order — a late publish-promotion re-materialises
+// the pre-update KA on top of an applied update, and the prover then extracts
+// the stale state forever. The guard stamps each write with its chain version
+// (`block:txIndex`) and refuses to apply anything older. These tests pin that
+// the race is closed.
+describe('materialization version guard — stale writer cannot clobber an update (GH #842)', () => {
+  let store: OxigraphStore;
+  beforeEach(() => {
+    store = new OxigraphStore();
+  });
+
+  const CG_ID = 5n;
+  const CG_NAME = 'cg-5';
+  const KA_ID = 42n;
+  const UAL = 'did:dkg:hardhat:31337/0xpub/42';
+
+  function payloadMap(triples: { subject: string; predicate: string; object: string }[]): Map<string, Quad[]> {
+    const m = new Map<string, Quad[]>();
+    for (const t of triples) {
+      const root = t.subject.split('/.well-known/genid/')[0];
+      const arr = m.get(root) ?? [];
+      arr.push({ ...t, graph: '' });
+      m.set(root, arr);
+    }
+    return m;
+  }
+
+  const origTriples = [
+    { subject: 'urn:orig:a', predicate: 'urn:p:name', object: '"orig"' },
+    { subject: 'urn:orig:a', predicate: 'urn:p:k1', object: '"1"' },
+    { subject: 'urn:orig:a', predicate: 'urn:p:k2', object: '"2"' },
+  ];
+  const origRoot = new V10MerkleTree(
+    origTriples.map((t) => hashTripleV10(t.subject, t.predicate, t.object)),
+  ).root;
+  const updateTriples = [
+    { subject: 'urn:upd:b', predicate: 'urn:p:type', object: 'urn:UpdateAction' },
+    { subject: 'urn:upd:b', predicate: 'urn:p:name', object: '"updated"' },
+  ];
+  const updateRoot = new V10MerkleTree(
+    updateTriples.map((t) => hashTripleV10(t.subject, t.predicate, t.object)),
+  ).root;
+
+  async function seedOriginalPublish(publishBlock: number): Promise<void> {
+    // Original publish promotion: per-cgId KA materialised at `publishBlock`.
+    await seedKC(store, {
+      cgId: CG_ID, cgName: CG_NAME, kaId: KA_ID, ual: UAL,
+      rootEntities: ['urn:orig:a'],
+      publicTriples: origTriples,
+    });
+    const ctxMeta = contextGraphMetaUri(CG_NAME, CG_ID.toString());
+    await writeMaterializedVersion(store, ctxMeta, UAL, { blockNumber: publishBlock, txIndex: 0 });
+  }
+
+  it('race: a late publish-promotion (older block) is a no-op once an update is applied', async () => {
+    await seedOriginalPublish(100);
+
+    // Update lands at a strictly later block — applies.
+    const updateApplied = await promoteUpdatedKaToPerCgId({
+      store, contextGraphId: CG_NAME, cgId: CG_ID.toString(), ual: UAL, kaId: KA_ID,
+      merkleRoot: updateRoot, payloadByRoot: payloadMap(updateTriples),
+      version: { blockNumber: 200, txIndex: 0 },
+    });
+    expect(updateApplied).toBe(true);
+
+    // Late, stale publish-promotion of the ORIGINAL payload at the publish
+    // block re-arrives (the GH#842 race). It MUST be rejected.
+    const staleApplied = await promoteUpdatedKaToPerCgId({
+      store, contextGraphId: CG_NAME, cgId: CG_ID.toString(), ual: UAL, kaId: KA_ID,
+      merkleRoot: origRoot, payloadByRoot: payloadMap(origTriples),
+      version: { blockNumber: 100, txIndex: 0 },
+    });
+    expect(staleApplied).toBe(false);
+
+    // The prover still extracts EXACTLY the update — the race did not corrupt it.
+    const after = await extractV10KCFromStore(store, CG_ID, KA_ID);
+    expect(after.rootEntities).toEqual(['urn:upd:b']);
+    expect(after.triples).toHaveLength(updateTriples.length);
+    expect(new V10MerkleTree(after.leaves).root).toEqual(updateRoot);
+
+    // And the recorded version is still the update's.
+    const ctxMeta = contextGraphMetaUri(CG_NAME, CG_ID.toString());
+    expect(await readMaterializedVersion(store, ctxMeta, UAL)).toEqual({ blockNumber: 200, txIndex: 0 });
+  });
+
+  it('uses txIndex as a tiebreaker within the same block', async () => {
+    await seedOriginalPublish(200);
+    // Same block, higher txIndex → newer → applies.
+    const applied = await promoteUpdatedKaToPerCgId({
+      store, contextGraphId: CG_NAME, cgId: CG_ID.toString(), ual: UAL, kaId: KA_ID,
+      merkleRoot: updateRoot, payloadByRoot: payloadMap(updateTriples),
+      version: { blockNumber: 200, txIndex: 3 },
+    });
+    expect(applied).toBe(true);
+    // Same block, lower txIndex → older → no-op.
+    const stale = await promoteUpdatedKaToPerCgId({
+      store, contextGraphId: CG_NAME, cgId: CG_ID.toString(), ual: UAL, kaId: KA_ID,
+      merkleRoot: origRoot, payloadByRoot: payloadMap(origTriples),
+      version: { blockNumber: 200, txIndex: 1 },
+    });
+    expect(stale).toBe(false);
+    const after = await extractV10KCFromStore(store, CG_ID, KA_ID);
+    expect(after.rootEntities).toEqual(['urn:upd:b']);
+  });
+
+  it('re-applying the SAME version is idempotent (equal version allowed)', async () => {
+    await seedOriginalPublish(100);
+    const v = { blockNumber: 200, txIndex: 0 };
+    for (let i = 0; i < 2; i++) {
+      const applied = await promoteUpdatedKaToPerCgId({
+        store, contextGraphId: CG_NAME, cgId: CG_ID.toString(), ual: UAL, kaId: KA_ID,
+        merkleRoot: updateRoot, payloadByRoot: payloadMap(updateTriples), version: v,
+      });
+      expect(applied).toBe(true);
+    }
+    const after = await extractV10KCFromStore(store, CG_ID, KA_ID);
+    expect(after.rootEntities).toEqual(['urn:upd:b']);
+    expect(after.triples).toHaveLength(updateTriples.length);
+    expect(new V10MerkleTree(after.leaves).root).toEqual(updateRoot);
+  });
+
+  it('without a version, writes always apply (back-compat with un-guarded callers)', async () => {
+    await seedOriginalPublish(100);
+    // No version passed → unconditional restatement (legacy behaviour).
+    const applied = await promoteUpdatedKaToPerCgId({
+      store, contextGraphId: CG_NAME, cgId: CG_ID.toString(), ual: UAL, kaId: KA_ID,
+      merkleRoot: updateRoot, payloadByRoot: payloadMap(updateTriples),
+    });
+    expect(applied).toBe(true);
+    const after = await extractV10KCFromStore(store, CG_ID, KA_ID);
+    expect(after.rootEntities).toEqual(['urn:upd:b']);
+  });
+});
+
+// GH #842 §7.1 — the LABEL graph must be fully restated on update too.
+//
+// The label graph (`did:dkg:context-graph:<name>` + `…/_meta`) is the
+// app-facing, query-able view. The old update path deleted/inserted only the
+// NEW payload roots, so a prior root's triples lingered (stale query results)
+// and `resolveKA` still pointed at the gone root. `restateLabelGraphForUpdate`
+// purges prior roots' data, repoints `dkg:rootEntity`, and preserves the rest
+// of the KA's metadata (provenance, type).
+describe('restateLabelGraphForUpdate — label graph full restatement (GH #842 §7.1)', () => {
+  let store: OxigraphStore;
+  beforeEach(() => {
+    store = new OxigraphStore();
+  });
+
+  const CG_NAME = 'label-cg';
+  const KA_ID = 7n;
+  const UAL = 'did:dkg:hardhat:31337/0xpub/7';
+  const labelData = contextGraphDataUri(CG_NAME);
+  const labelMeta = contextGraphMetaUri(CG_NAME);
+
+  function payloadMap(triples: { subject: string; predicate: string; object: string }[]): Map<string, Quad[]> {
+    const m = new Map<string, Quad[]>();
+    for (const t of triples) {
+      const arr = m.get(t.subject) ?? [];
+      arr.push({ ...t, graph: '' });
+      m.set(t.subject, arr);
+    }
+    return m;
+  }
+
+  async function seedLabelPublish(): Promise<void> {
+    await store.insert([
+      // KC-level meta + rich KA provenance that must survive the update.
+      { subject: UAL, predicate: `${DKG}batchId`, object: `"${KA_ID}"^^<${XSD}integer>`, graph: labelMeta },
+      { subject: `${UAL}/1`, predicate: `${RDF}type`, object: `${DKG}KnowledgeAsset`, graph: labelMeta },
+      { subject: `${UAL}/1`, predicate: `${DKG}partOf`, object: UAL, graph: labelMeta },
+      { subject: `${UAL}/1`, predicate: `${DKG}rootEntity`, object: 'urn:orig:r', graph: labelMeta },
+      { subject: `${UAL}/1`, predicate: `${DKG}authoredBy`, object: '"0xauthor"', graph: labelMeta },
+      // Original public data.
+      { subject: 'urn:orig:r', predicate: 'urn:p:a', object: '"1"', graph: labelData },
+      { subject: 'urn:orig:r', predicate: 'urn:p:b', object: '"2"', graph: labelData },
+    ]);
+  }
+
+  async function labelDataSubjects(): Promise<string[]> {
+    const res = await store.query(
+      `SELECT DISTINCT ?s WHERE { GRAPH <${labelData}> { ?s ?p ?o } }`,
+    );
+    return res.type === 'bindings'
+      ? res.bindings.map((b) => b['s']).filter((s): s is string => !!s).sort()
+      : [];
+  }
+
+  it('purges the prior root data, repoints rootEntity, and preserves provenance', async () => {
+    await seedLabelPublish();
+    const updateTriples = [{ subject: 'urn:new:r', predicate: 'urn:p:x', object: '"new"' }];
+    const merkleRoot = new V10MerkleTree(
+      updateTriples.map((t) => hashTripleV10(t.subject, t.predicate, t.object)),
+    ).root;
+
+    const applied = await restateLabelGraphForUpdate({
+      store, dataGraph: labelData, metaGraph: labelMeta, ual: UAL,
+      merkleRoot, payloadByRoot: payloadMap(updateTriples),
+      version: { blockNumber: 200, txIndex: 0 },
+    });
+    expect(applied).toBe(true);
+
+    // Stale 'urn:orig:r' data is gone; only the new root remains.
+    expect(await labelDataSubjects()).toEqual(['urn:new:r']);
+
+    // rootEntity repointed on the SAME ka subject (provenance preserved).
+    const rootRes = await store.query(
+      `SELECT ?root WHERE { GRAPH <${labelMeta}> { <${UAL}/1> <${DKG}rootEntity> ?root } }`,
+    );
+    expect(rootRes.type === 'bindings' && rootRes.bindings[0]['root']).toBe('urn:new:r');
+    const authRes = await store.query(
+      `ASK { GRAPH <${labelMeta}> { <${UAL}/1> <${DKG}authoredBy> "0xauthor" } }`,
+    );
+    expect(authRes.type === 'boolean' && authRes.value).toBe(true);
+  });
+
+  it('is guarded: an older-version label restatement is a no-op', async () => {
+    await seedLabelPublish();
+    await writeMaterializedVersion(store, labelMeta, UAL, { blockNumber: 300, txIndex: 0 });
+
+    const updateTriples = [{ subject: 'urn:new:r', predicate: 'urn:p:x', object: '"new"' }];
+    const merkleRoot = new V10MerkleTree(
+      updateTriples.map((t) => hashTripleV10(t.subject, t.predicate, t.object)),
+    ).root;
+    const applied = await restateLabelGraphForUpdate({
+      store, dataGraph: labelData, metaGraph: labelMeta, ual: UAL,
+      merkleRoot, payloadByRoot: payloadMap(updateTriples),
+      version: { blockNumber: 100, txIndex: 0 },
+    });
+    expect(applied).toBe(false);
+    // Original data untouched.
+    expect(await labelDataSubjects()).toEqual(['urn:orig:r']);
+  });
+});
+
+// GH #842 — Codex review on PR #845 surfaced three sharper bugs in the original
+// fix. These tests pin each one closed:
+//
+//  1. `txIndex` tiebreaker for SAME-block publish + update.
+//     A publish that promotes at (block=B, txIndex=2) lands AFTER an update
+//     applied at (block=B, txIndex=5) was supposed to win. With the v1 fix
+//     both compared as `(B, 0)` (txIndex was hardcoded to 0), so the stale
+//     publish-promotion clobbered the update.
+//
+//  2. Manifest root order preserved across restatement (≥10 roots).
+//     `<ual>/1`, `<ual>/2`, …, `<ual>/10` are stable token identifiers.
+//     Lex sort would put `<ual>/10` BEFORE `<ual>/2`, so the token→root
+//     binding flipped on every restatement.
+//
+//  3. Surplus kaSubjects deleted when an update SHRINKS the root count.
+//     The v1 fix only repointed `dkg:rootEntity` on retained tokens; surplus
+//     prior tokens kept their `rdf:type KnowledgeAsset` / `dkg:partOf <ual>`
+//     and showed up as phantoms in enumeration queries.
+describe('GH#842 / PR #845 — Codex review fixes', () => {
+  let store: OxigraphStore;
+  beforeEach(() => {
+    store = new OxigraphStore();
+  });
+
+  const CG_ID = 9n;
+  const CG_NAME = 'cg-9';
+  const KA_ID = 99n;
+  const UAL = 'did:dkg:hardhat:31337/0xpub/99';
+  const labelData = contextGraphDataUri(CG_NAME);
+  const labelMeta = contextGraphMetaUri(CG_NAME);
+
+  it('publish-promotion at (B, 2) is rejected when an update already materialised at (B, 5)', async () => {
+    // Update materialised first at same block, higher txIndex.
+    const ctxMeta = contextGraphMetaUri(CG_NAME, CG_ID.toString());
+    const updateTriples = [{ subject: 'urn:upd', predicate: 'urn:p', object: '"u"' }];
+    const updateRoot = new V10MerkleTree(
+      updateTriples.map((t) => hashTripleV10(t.subject, t.predicate, t.object)),
+    ).root;
+    const updatePayload = new Map<string, Quad[]>([
+      ['urn:upd', updateTriples.map((t) => ({ ...t, graph: '' }))],
+    ]);
+    expect(
+      await promoteUpdatedKaToPerCgId({
+        store, contextGraphId: CG_NAME, cgId: CG_ID.toString(), ual: UAL, kaId: KA_ID,
+        merkleRoot: updateRoot, payloadByRoot: updatePayload,
+        version: { blockNumber: 500, txIndex: 5 },
+      }),
+    ).toBe(true);
+
+    // Late, stale publish-promotion at the SAME block, earlier txIndex.
+    const origTriples = [{ subject: 'urn:orig', predicate: 'urn:p', object: '"o"' }];
+    const origRoot = new V10MerkleTree(
+      origTriples.map((t) => hashTripleV10(t.subject, t.predicate, t.object)),
+    ).root;
+    const origPayload = new Map<string, Quad[]>([
+      ['urn:orig', origTriples.map((t) => ({ ...t, graph: '' }))],
+    ]);
+    expect(
+      await promoteUpdatedKaToPerCgId({
+        store, contextGraphId: CG_NAME, cgId: CG_ID.toString(), ual: UAL, kaId: KA_ID,
+        merkleRoot: origRoot, payloadByRoot: origPayload,
+        version: { blockNumber: 500, txIndex: 2 },
+      }),
+    ).toBe(false);
+    // Materialised version is unchanged — and equals the update's.
+    expect(await readMaterializedVersion(store, ctxMeta, UAL)).toEqual({ blockNumber: 500, txIndex: 5 });
+  });
+
+  it('preserves manifest root order for ≥10 batches (Codex bug 2)', async () => {
+    // Seed a 12-batch KA in the label graph: token `<ual>/N` → root `urn:root:N`.
+    const N = 12;
+    const seedQuads: Quad[] = [
+      { subject: UAL, predicate: `${DKG}batchId`, object: `"${KA_ID}"^^<${XSD}integer>`, graph: labelMeta },
+    ];
+    for (let i = 1; i <= N; i++) {
+      seedQuads.push(
+        { subject: `${UAL}/${i}`, predicate: `${RDF}type`, object: `${DKG}KnowledgeAsset`, graph: labelMeta },
+        { subject: `${UAL}/${i}`, predicate: `${DKG}partOf`, object: UAL, graph: labelMeta },
+        { subject: `${UAL}/${i}`, predicate: `${DKG}rootEntity`, object: `urn:root:${i}`, graph: labelMeta },
+      );
+    }
+    await store.insert(seedQuads);
+
+    // Update with NEW roots in the same numeric order. The map's insertion
+    // order is the canonical "manifest" order, which restateLabelGraphForUpdate
+    // MUST preserve when re-binding tokens.
+    const payload: Map<string, Quad[]> = new Map();
+    for (let i = 1; i <= N; i++) {
+      payload.set(`urn:new:${i}`, [
+        { subject: `urn:new:${i}`, predicate: 'urn:p', object: `"v${i}"`, graph: '' },
+      ]);
+    }
+    const allTriples: { subject: string; predicate: string; object: string }[] = [];
+    for (const qs of payload.values()) for (const q of qs) allTriples.push(q);
+    const merkleRoot = new V10MerkleTree(
+      allTriples.map((t) => hashTripleV10(t.subject, t.predicate, t.object)),
+    ).root;
+
+    expect(
+      await restateLabelGraphForUpdate({
+        store, dataGraph: labelData, metaGraph: labelMeta, ual: UAL,
+        merkleRoot, payloadByRoot: payload,
+      }),
+    ).toBe(true);
+
+    // After restatement, EVERY token `<ual>/N` MUST point at `urn:new:N`.
+    // With a lex-sort regression we'd see `<ual>/10` bound to `urn:new:2` (or
+    // vice-versa) because `"urn:new:10"` lex-sorts before `"urn:new:2"`.
+    for (let i = 1; i <= N; i++) {
+      const res = await store.query(
+        `SELECT ?root WHERE { GRAPH <${labelMeta}> { <${UAL}/${i}> <${DKG}rootEntity> ?root } }`,
+      );
+      expect(res.type).toBe('bindings');
+      if (res.type === 'bindings') {
+        expect(res.bindings).toHaveLength(1);
+        expect(res.bindings[0]['root']).toBe(`urn:new:${i}`);
+      }
+    }
+  });
+
+  it('deletes surplus kaSubjects when an update shrinks the root count (Codex bug 3)', async () => {
+    // Seed a 5-batch KA, then update with 2 roots.
+    await store.insert([
+      { subject: UAL, predicate: `${DKG}batchId`, object: `"${KA_ID}"^^<${XSD}integer>`, graph: labelMeta },
+      ...[1, 2, 3, 4, 5].flatMap((i) => [
+        { subject: `${UAL}/${i}`, predicate: `${RDF}type`, object: `${DKG}KnowledgeAsset`, graph: labelMeta },
+        { subject: `${UAL}/${i}`, predicate: `${DKG}partOf`, object: UAL, graph: labelMeta },
+        { subject: `${UAL}/${i}`, predicate: `${DKG}rootEntity`, object: `urn:orig:${i}`, graph: labelMeta },
+      ] as Quad[]),
+    ]);
+
+    const updateTriples = [
+      { subject: 'urn:new:a', predicate: 'urn:p', object: '"a"' },
+      { subject: 'urn:new:b', predicate: 'urn:p', object: '"b"' },
+    ];
+    const merkleRoot = new V10MerkleTree(
+      updateTriples.map((t) => hashTripleV10(t.subject, t.predicate, t.object)),
+    ).root;
+    const payload = new Map<string, Quad[]>([
+      ['urn:new:a', [{ ...updateTriples[0], graph: '' }]],
+      ['urn:new:b', [{ ...updateTriples[1], graph: '' }]],
+    ]);
+
+    expect(
+      await restateLabelGraphForUpdate({
+        store, dataGraph: labelData, metaGraph: labelMeta, ual: UAL,
+        merkleRoot, payloadByRoot: payload,
+      }),
+    ).toBe(true);
+
+    // `<ual>/3`, `<ual>/4`, `<ual>/5` must be FULLY gone — no rdf:type, no
+    // partOf, nothing. Enumeration queries that look for KnowledgeAssets
+    // partOf <ual> should see exactly the 2 retained tokens.
+    const enumRes = await store.query(
+      `SELECT DISTINCT ?ka WHERE { GRAPH <${labelMeta}> { ?ka <${DKG}partOf> <${UAL}> ; <${RDF}type> <${DKG}KnowledgeAsset> } }`,
+    );
+    expect(enumRes.type).toBe('bindings');
+    if (enumRes.type === 'bindings') {
+      const present = enumRes.bindings.map((b) => b['ka']).sort();
+      expect(present).toEqual([`${UAL}/1`, `${UAL}/2`]);
+    }
+    // And the retained tokens point at the new roots in manifest order.
+    const r1 = await store.query(
+      `SELECT ?root WHERE { GRAPH <${labelMeta}> { <${UAL}/1> <${DKG}rootEntity> ?root } }`,
+    );
+    expect(r1.type === 'bindings' && r1.bindings[0]['root']).toBe('urn:new:a');
+    const r2 = await store.query(
+      `SELECT ?root WHERE { GRAPH <${labelMeta}> { <${UAL}/2> <${DKG}rootEntity> ?root } }`,
+    );
+    expect(r2.type === 'bindings' && r2.bindings[0]['root']).toBe('urn:new:b');
   });
 });

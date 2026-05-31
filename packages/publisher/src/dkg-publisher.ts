@@ -2846,9 +2846,46 @@ export class DKGPublisher implements Publisher {
     const storeUpdatedQuads = async (version?: MaterializedVersion): Promise<void> => {
       onPhase?.('store', 'start');
 
-      // Private triples: restate per new root (delete prior copy, store new).
-      for (const [rootEntity] of kaMap) {
+      // Discover the PRIOR root entities from `_meta` BEFORE the label
+      // restatement wipes them (Codex review #2 on PR #845). When an update
+      // changes the root entity, the v1 fix only purged private triples for
+      // the NEW roots, so the prior root's private payload was left in
+      // `PrivateContentStore` (keyed by `(contextGraph, rootEntity)`) and
+      // would leak into any future KA that reused the prior root in the
+      // same context graph.
+      const DKG_ONT = 'http://dkg.io/ontology/';
+      const priorRootEntities = new Set<string>();
+      try {
+        const labelMetaForPriors = this.graphManager.metaGraphUri(contextGraphId);
+        const ualForPriors =
+          (await resolveUalByBatchId(this.store, labelMetaForPriors, kaId)) ?? await this.resolveKaUal(kaId);
+        if (ualForPriors) {
+          const priorRes = await this.store.query(
+            `SELECT DISTINCT ?root WHERE { GRAPH <${labelMetaForPriors}> { ?ka <${DKG_ONT}partOf> <${ualForPriors}> ; <${DKG_ONT}rootEntity> ?root } }`,
+          );
+          if (priorRes.type === 'bindings') {
+            for (const row of priorRes.bindings) {
+              const r = row['root'];
+              if (typeof r === 'string' && r.length > 0) priorRootEntities.add(r);
+            }
+          }
+        }
+      } catch (err) {
+        this.log.warn(
+          ctx,
+          `Failed to resolve prior root entities for kaId=${kaId} private-triple purge: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+
+      // Private triples: purge BOTH prior + new roots, then store the new
+      // payload. Purging the union (and not just the new roots) is what
+      // closes the leak described above.
+      const rootsToPurge = new Set<string>(priorRootEntities);
+      for (const [rootEntity] of kaMap) rootsToPurge.add(rootEntity);
+      for (const rootEntity of rootsToPurge) {
         await this.privateStore.deletePrivateTriples(contextGraphId, rootEntity, options.subGraphName);
+      }
+      for (const [rootEntity] of kaMap) {
         const entityPrivateQuads = entityPrivateMap.get(rootEntity) ?? [];
         if (entityPrivateQuads.length > 0) {
           await this.privateStore.storePrivateTriples(contextGraphId, rootEntity, entityPrivateQuads, options.subGraphName);

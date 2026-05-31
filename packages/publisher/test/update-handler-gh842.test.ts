@@ -13,15 +13,17 @@
  * apply + per-cgId promotion path, not on-chain submission.
  */
 import { describe, it, expect, beforeEach } from 'vitest';
-import { OxigraphStore, type Quad } from '@origintrail-official/dkg-storage';
+import { OxigraphStore, PrivateContentStore, GraphManager, type Quad } from '@origintrail-official/dkg-storage';
 import {
   TypedEventBus,
   encodeKAUpdateRequest,
   contextGraphDataUri,
   contextGraphMetaUri,
+  generateEd25519Keypair,
 } from '@origintrail-official/dkg-core';
 import type { ChainAdapter } from '@origintrail-official/dkg-chain';
-import { UpdateHandler, autoPartition, computeFlatKCRootV10 as computeFlatKCRoot } from '../src/index.js';
+import { NoChainAdapter } from '@origintrail-official/dkg-chain';
+import { DKGPublisher, UpdateHandler, autoPartition, computeFlatKCRootV10 as computeFlatKCRoot } from '../src/index.js';
 
 const DKG = 'http://dkg.io/ontology/';
 const XSD = 'http://www.w3.org/2001/XMLSchema#';
@@ -118,5 +120,88 @@ describe('UpdateHandler — GH #842 deterministic-UAL fallback (gossip receiver)
       `SELECT ?v WHERE { GRAPH <${perCgIdMeta}> { <${expectedUal}> <${DKG}materializedVersion> ?v } }`,
     );
     expect(verRes.type === 'bindings' && String(verRes.bindings[0]?.['v'])).toContain(`${BLOCK}:${TX_INDEX}`);
+  });
+});
+
+// GH #842 / PR #845 round 2 — Codex flagged that the publisher's update
+// path only purged private triples for the NEW root entities. If an update
+// changes the root entity (`urn:orig` → `urn:new`), the prior root's
+// private payload was left in `PrivateContentStore` (keyed by
+// `(contextGraph, rootEntity)`) and would leak into any future KA that
+// reused the prior root in the same context graph. The fix resolves the
+// prior roots from `_meta` and purges them too.
+describe('DKGPublisher.update — purges private triples for PRIOR roots (GH #842 round 2)', () => {
+  const PRIVATE_PRED = 'urn:p:secret';
+  const PUBLIC_PRED = 'urn:p:name';
+  const CG = 'private-leak-cg';
+  const PUBLISHER_ADDR = '0x000000000000000000000000000000000000DEAD';
+  const PRIOR_ROOT = 'urn:orig:secret';
+  const NEW_ROOT = 'urn:new:secret';
+  // Deterministic kaId for the prior+update — `localOnlyUpdate` doesn't
+  // hit a chain, so the publisher resolves UAL as
+  // `did:dkg:none/<publisher>/<kaId>`.
+  const KA_ID = 11n;
+
+  async function makePublisher(store: OxigraphStore): Promise<DKGPublisher> {
+    const keypair = await generateEd25519Keypair();
+    return new DKGPublisher({
+      store,
+      chain: new NoChainAdapter(),
+      eventBus: new TypedEventBus(),
+      keypair,
+      publisherAddress: PUBLISHER_ADDR,
+    });
+  }
+
+  it('deletes the prior root\'s private triples when the update changes root entity', async () => {
+    const store = new OxigraphStore();
+    const gm = new GraphManager(store);
+    await gm.ensureContextGraph(CG);
+    const publisher = await makePublisher(store);
+    const privateStore = new PrivateContentStore(store, gm);
+
+    // Seed the label `_meta` with the PRIOR KA pointing at `urn:orig:secret`.
+    // `storeUpdatedQuads` discovers prior roots via this exact pattern.
+    const labelMeta = gm.metaGraphUri(CG);
+    const ual = `did:dkg:none/${PUBLISHER_ADDR.toLowerCase()}/${KA_ID}`;
+    await store.insert([
+      { subject: ual, predicate: `${DKG}batchId`, object: `"${KA_ID}"^^<${XSD}integer>`, graph: labelMeta },
+      { subject: `${ual}/1`, predicate: 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type', object: `${DKG}KnowledgeAsset`, graph: labelMeta },
+      { subject: `${ual}/1`, predicate: `${DKG}partOf`, object: ual, graph: labelMeta },
+      { subject: `${ual}/1`, predicate: `${DKG}rootEntity`, object: PRIOR_ROOT, graph: labelMeta },
+    ]);
+
+    // Seed the public data graph with the prior root's triples (so the label
+    // restatement has something to delete).
+    const labelData = gm.dataGraphUri(CG);
+    await store.insert([
+      { subject: PRIOR_ROOT, predicate: PUBLIC_PRED, object: '"orig"', graph: labelData },
+    ]);
+
+    // Seed `PrivateContentStore` with the PRIOR root's private payload.
+    await privateStore.storePrivateTriples(CG, PRIOR_ROOT, [
+      q(PRIOR_ROOT, PRIVATE_PRED, '"orig-secret"'),
+    ]);
+    expect(
+      (await privateStore.getPrivateTriples(CG, PRIOR_ROOT)).length,
+    ).toBeGreaterThan(0);
+
+    // Update to a different root entity, with a new private triple.
+    const result = await publisher.update(KA_ID, {
+      contextGraphId: CG,
+      quads: [q(NEW_ROOT, PUBLIC_PRED, '"updated"')],
+      privateQuads: [q(NEW_ROOT, PRIVATE_PRED, '"new-secret"')],
+    });
+    // localOnly update returns `tentative` (no chain attribution).
+    expect(['tentative', 'confirmed']).toContain(result.status);
+
+    // The PRIOR root's private payload MUST be fully gone — otherwise a
+    // future KA that reuses `urn:orig:secret` in the same CG would silently
+    // adopt the stale secret.
+    expect(await privateStore.getPrivateTriples(CG, PRIOR_ROOT)).toEqual([]);
+    // And the NEW root's payload is in place.
+    const newSecrets = await privateStore.getPrivateTriples(CG, NEW_ROOT);
+    expect(newSecrets.length).toBeGreaterThan(0);
+    expect(newSecrets.some((t) => t.predicate === PRIVATE_PRED)).toBe(true);
   });
 });

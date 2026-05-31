@@ -7498,7 +7498,21 @@ export class DKGAgent {
     // GH #842: thread the on-chain cgId so the publisher can promote the update
     // payload into the per-cgId partition the RS prover reads. Without it,
     // updated KAs stay unprovable (data-corrupted / leaf-count-mismatch).
-    const updateOnChainId = await this.getContextGraphOnChainId(contextGraphId);
+    // Best-effort: a store/ontology failure here must NOT abort the on-chain
+    // update — the RS sync is a downstream concern and the unguarded await
+    // would let any local lookup error tank the entire update RPC (Codex
+    // review #3 on PR #845).
+    let updateOnChainId: string | null = null;
+    try {
+      updateOnChainId = await this.getContextGraphOnChainId(contextGraphId);
+    } catch (err) {
+      this.log.warn(
+        ctx,
+        `Failed to resolve on-chain cgId for "${contextGraphId}" prior to update; per-cgId RS promotion will be skipped: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
     const result = await this.publisher.update(kaId, {
       contextGraphId,
       quads,

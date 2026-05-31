@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { handleEventsQuery, EpcisQueryError, toEpcisEvent } from '../src/handlers.js';
+import { handleEventsQuery, EpcisQueryError, toEpcisEvent, unwrapLiteral } from '../src/handlers.js';
 import type { QueryEngine } from '../src/types.js';
 
 const CONTEXT_GRAPH_ID = 'test-cg';
@@ -646,5 +646,99 @@ describe('handleEventsQuery — per-request sub-graph', () => {
       includePrivate: true,
     });
     expect(calls[0].opts.subGraphName).toBeUndefined();
+  });
+});
+
+// Regression coverage for the linear-scan rewrite of `unwrapLiteral`. The
+// prior greedy regex (`/^"(.*)"(?:\^\^<.*>)?$/s`) was vulnerable to
+// catastrophic backtracking on malformed inputs because triplestore-
+// controlled strings flow through this function. The linear parser must
+// stay O(n) in input length AND preserve the same observable behaviour
+// on the typed/plain/raw paths used elsewhere in handlers.ts.
+describe('unwrapLiteral (CodeQL ReDoS regression)', () => {
+  it('unwraps a plain N-Quads string literal', () => {
+    expect(unwrapLiteral('"hello"')).toBe('hello');
+  });
+
+  it('unwraps a typed N-Quads literal', () => {
+    expect(unwrapLiteral('"2024-03-01T08:00:00.000Z"^^<http://www.w3.org/2001/XMLSchema#dateTime>'))
+      .toBe('2024-03-01T08:00:00.000Z');
+  });
+
+  it('returns empty / falsy inputs unchanged', () => {
+    expect(unwrapLiteral('')).toBe('');
+    expect(unwrapLiteral(undefined as unknown as string)).toBeUndefined();
+  });
+
+  it('returns bare unquoted strings unchanged (URI bindings)', () => {
+    expect(unwrapLiteral('urn:epc:id:sgtin:001.001.001'))
+      .toBe('urn:epc:id:sgtin:001.001.001');
+    expect(unwrapLiteral('https://gs1.github.io/EPCIS/ObjectEvent'))
+      .toBe('https://gs1.github.io/EPCIS/ObjectEvent');
+  });
+
+  it('returns malformed inputs (no closing quote) unchanged', () => {
+    expect(unwrapLiteral('"missing close')).toBe('"missing close');
+  });
+
+  it('returns malformed inputs (trailing garbage after literal) unchanged', () => {
+    // `"value"trailing` is not a recognised N-Quads shape — must NOT unwrap.
+    expect(unwrapLiteral('"value"trailing')).toBe('"value"trailing');
+  });
+
+  it('honours backslash-escaped quotes inside the literal', () => {
+    // \" stays inside the literal — the closing quote is the unescaped one.
+    expect(unwrapLiteral('"foo\\"bar"')).toBe('foo\\"bar');
+  });
+
+  it('runs in linear time on adversarial inputs that broke the old regex', () => {
+    // The prior greedy regex `/^"(.*)"(?:\^\^<.*>)?$/s` exponentially
+    // backtracks on inputs that look like repeated typed-literal suffixes
+    // without ever matching the closing anchor. The linear parser must
+    // process N such inputs in O(N) time.
+    //
+    // The regression we care about is asymptotic, NOT absolute speed on
+    // any given machine — a fixed wall-clock ceiling (e.g. `<100ms`) is
+    // flake-prone on busy CI runners. Instead, sample two input sizes
+    // (1k and 10k) and assert the 10x-larger input does not blow up
+    // catastrophically. Catastrophic backtracking is exponential; any
+    // linear scan stays well within the generous 25x ratio bound even
+    // with GC pauses and CPU contention.
+    //
+    // The 1000ms absolute ceiling is the hang guard: if the parser ever
+    // becomes pathologically slow on the larger input, the test fails
+    // cleanly instead of timing out the suite.
+    const adversarial = (n: number) => '"' + '"^^<x>'.repeat(n);
+
+    // Take min across repeats to filter out GC / scheduler noise. The
+    // O(n) parser is allocation-light, so the spread between repeats is
+    // typically <2x even on cold runs.
+    const measure = (n: number) => {
+      let minMs = Infinity;
+      for (let i = 0; i < 5; i++) {
+        const input = adversarial(n);
+        const t0 = performance.now();
+        const result = unwrapLiteral(input);
+        const elapsed = performance.now() - t0;
+        // Sanity: result is always a string regardless of tail recognition.
+        expect(typeof result).toBe('string');
+        if (elapsed < minMs) minMs = elapsed;
+      }
+      return minMs;
+    };
+
+    const smallMs = measure(1_000);
+    const largeMs = measure(10_000);
+
+    // Hang guard: 10k repetitions should finish in well under a second
+    // on any modern CI. The exponential regex would take >>10s here.
+    expect(largeMs).toBeLessThan(1000);
+
+    // Linearity guard: 10x input → ratio must stay bounded. The `+ 25ms`
+    // cushion guards against the degenerate case where `smallMs ≈ 0` and
+    // any wall-clock noise on `largeMs` would otherwise blow the ratio.
+    // A 25x ceiling on linear growth leaves ample headroom for jitter
+    // while still failing decisively on exponential blow-up.
+    expect(largeMs).toBeLessThan(smallMs * 25 + 25);
   });
 });

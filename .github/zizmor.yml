@@ -105,6 +105,14 @@ rules:
   # If a future maintainer wires publishing, release-asset creation, or
   # cross-workflow artifact promotion into any ignored workflow, this
   # exception MUST be re-evaluated before that PR lands.
+  #
+  # Defense-in-depth: the `Guard zizmor cache-poisoning exception scope`
+  # step in `supply-chain-scan.yml` greps the ignored workflows for known
+  # publishing-action markers (`gh release create`, `npm publish`,
+  # `docker push`, etc.) on every audit run and fails the gate if any are
+  # found — so the moment one of these workflows gains a publish step,
+  # this exception is forced back through review instead of silently
+  # going stale.
   cache-poisoning:
     ignore:
       - ci.yml

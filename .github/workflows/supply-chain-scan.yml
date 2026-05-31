@@ -137,6 +137,106 @@ jobs:
           pip install --require-hashes --no-deps -r "${RUNNER_TEMP}/zizmor-requirements.txt"
           zizmor --version
 
+      - name: Guard zizmor `cache-poisoning` exception scope
+        # The `cache-poisoning` rule in `.github/zizmor.yml` ignores entire
+        # workflow files (ci.yml, evm-integration.yml, supply-chain-scan.yml)
+        # on the rationale that they are NOT publishing surfaces — they only
+        # run tests/lints/scanners. The exception is sound for the workflows'
+        # CURRENT shape, but zizmor cannot enforce that they STAY non-
+        # publishing. If a future PR adds a publish step to any ignored
+        # workflow, the cache-poisoning risk becomes real and the exception
+        # must be re-evaluated. This step encodes that invariant: it greps
+        # the ignored workflows for known publishing-action markers, and
+        # fails the audit if any are found.
+        #
+        # Self-match protection: this step itself contains every marker as
+        # a literal string in `PATTERNS`. To avoid a false-positive when
+        # scanning `supply-chain-scan.yml`, the guard's own pattern block
+        # is bracketed with sentinel comments and stripped from the scan
+        # input via `sed` before grep runs. Any future literal-pattern
+        # additions MUST stay inside the sentinels.
+        #
+        # Note: this does NOT catch cross-workflow artifact promotion via
+        # `actions/upload-artifact` consumed by a separate publishing
+        # workflow — that requires its own audit. For now, in-workflow
+        # publish actions are the high-confidence signal.
+        run: |
+          set -euo pipefail
+          IGNORED=(
+            .github/workflows/ci.yml
+            .github/workflows/evm-integration.yml
+            .github/workflows/supply-chain-scan.yml
+          )
+          # zizmor-cache-poisoning-guard-patterns-start
+          # Patterns that indicate a workflow is shipping bytes to a
+          # user-visible publishing surface. Keep this list synced with the
+          # rationale in `.github/zizmor.yml` `cache-poisoning:` block.
+          #
+          # Coverage notes:
+          # - `gh release create|upload`, `softprops/action-gh-release`,
+          #   `actions/create-release`, `actions/upload-release-asset` →
+          #   GitHub Releases (binary or tag-based).
+          # - `npm publish`, `pnpm publish`, `JS-DevTools/npm-publish` → npm.
+          # - `pypa/gh-action-pypi-publish`, `twine upload` → PyPI.
+          # - `docker push`, `docker buildx ... --push` → Docker registries
+          #   via the docker CLI.
+          # - `docker/build-push-action` → Docker registries via the
+          #   official GHA. The action is flagged regardless of `with.push`
+          #   because that input is set in a separate block grep cannot
+          #   correlate; flagging on action-use is conservative (build-only
+          #   adoption is uncommon in CI and an operator can confirm).
+          # - `goreleaser/goreleaser-action` → Go release toolchain.
+          # - `cargo publish` → crates.io.
+          PATTERNS=(
+            'gh release create'
+            'gh release upload'
+            'softprops/action-gh-release'
+            'actions/create-release'
+            'actions/upload-release-asset'
+            'JS-DevTools/npm-publish'
+            'npm publish'
+            'pnpm publish'
+            'pypa/gh-action-pypi-publish'
+            'twine upload'
+            'docker push'
+            'docker buildx[^#]*--push'
+            'docker/build-push-action'
+            'goreleaser/goreleaser-action'
+            'cargo publish'
+          )
+          # zizmor-cache-poisoning-guard-patterns-end
+          fail=0
+          for wf in "${IGNORED[@]}"; do
+            if [ ! -f "$wf" ]; then continue; fi
+            # 1. Strip the guard's own PATTERNS block so the step does not
+            #    self-match on its own literal-pattern array.
+            # 2. Normalize shell backslash-continuations by joining lines
+            #    that end with `\` into a single line. Without this, the
+            #    common multi-line publish form (e.g. `docker buildx build
+            #    \<newline>  --push \<newline>  .`) escapes a single-line
+            #    grep — a future PR could add a real multi-line publish
+            #    step to an ignored workflow and silently pass this guard.
+            #    The `\` gets replaced with a single space so adjacent
+            #    tokens stay separated for the subsequent grep.
+            scan_input=$(sed '/zizmor-cache-poisoning-guard-patterns-start/,/zizmor-cache-poisoning-guard-patterns-end/d' "$wf" \
+              | awk '/\\$/ { sub(/\\$/, " "); printf "%s", $0; next } { print }')
+            for pat in "${PATTERNS[@]}"; do
+              hits=$(echo "$scan_input" | grep -nE "$pat" || true)
+              if [ -n "$hits" ]; then
+                echo "::error file=$wf::cache-poisoning exception applies to this workflow, but it now contains a publishing action (\"$pat\"). Re-evaluate the .github/zizmor.yml exception."
+                echo "$hits"
+                fail=1
+              fi
+            done
+          done
+          if [ "$fail" -ne 0 ]; then
+            echo
+            echo "The cache-poisoning ignore-list in .github/zizmor.yml is scoped to non-publishing CI workflows."
+            echo "One of those workflows now contains a publishing action — the exception is no longer safe."
+            echo "Either remove the publishing action, move it to a workflow not in the ignore-list, or revise the exception."
+            exit 1
+          fi
+
       - name: Resolve zizmor scan targets
         # Scan EVERYTHING under `.github/` that can land code on the runner:
         # workflows + composite actions + reusable workflows. The previous

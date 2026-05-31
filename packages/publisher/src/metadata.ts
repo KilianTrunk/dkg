@@ -1,6 +1,6 @@
 import type { Quad, TripleStore } from '@origintrail-official/dkg-storage';
 import { GraphManager } from '@origintrail-official/dkg-storage';
-import { validateSubGraphName, isSafeIri, assertionLifecycleUri, contextGraphAssertionUri, MemoryLayer, ASSERTION_STATE_TO_LAYER } from '@origintrail-official/dkg-core';
+import { validateSubGraphName, isSafeIri, assertionLifecycleUri, contextGraphAssertionUri, contextGraphDataUri, contextGraphMetaUri, MemoryLayer, ASSERTION_STATE_TO_LAYER } from '@origintrail-official/dkg-core';
 import type { AssertionState } from '@origintrail-official/dkg-core';
 
 const RDF = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#';
@@ -545,6 +545,145 @@ export async function updateMetaMerkleRoot(
   if (staleRootQuads.length > 0) {
     await store.delete(staleRootQuads);
   }
+}
+
+const SKOLEM_INFIX = '/.well-known/genid/';
+
+/**
+ * Make the per-cgId data + meta partition reflect EXACTLY the update payload
+ * for a knowledge asset, so the Random Sampling prover can prove updated KAs.
+ *
+ * GH #842 — why this exists.
+ * V10 treats a knowledge-asset update as a *full restatement*: the on-chain
+ * `updateKnowledgeCollection` ASSIGNS (`=`, not `+=`) `merkleRoot`,
+ * `merkleLeafCount` and `byteSize` from the update payload, and the author
+ * seal signs that payload root. So after an update the chain's view of the KA
+ * is "the update payload, nothing else".
+ *
+ * The RS prover reads ONLY the per-cgId partition
+ * (`<name>/context/<cgId>/data` + `…/_meta`) via `extractV10KCFromStore`.
+ * Publish promotes confirmed data into that partition, but the update paths
+ * (`DKGPublisher.update` and the gossip `UpdateHandler`) only wrote the payload
+ * into the label data graph (`did:dkg:context-graph:<name>`) and never touched
+ * the per-cgId partition. Result: the prover kept extracting the STALE
+ * pre-update KA from the original publish promotion, whose leaf count can never
+ * match the chain's post-update commitment — a permanent
+ * `data-corrupted` / leaf-count-mismatch that made every updated KA unprovable.
+ *
+ * This helper closes the gap: it purges the KA's prior per-cgId roots (data +
+ * meta) and writes the update payload, so the extract leaf set equals exactly
+ * what the chain committed. `trustLevel` is intentionally NOT stamped — the
+ * extractor skips those predicates, so they are not part of the leaf set.
+ *
+ * Best-effort by design: callers that cannot resolve the on-chain cgId or the
+ * UAL skip promotion, leaving behaviour exactly as before (the KA simply stays
+ * `kc-not-synced` for RS, no regression).
+ */
+export async function promoteUpdatedKaToPerCgId(opts: {
+  store: TripleStore;
+  /** CG label/name (e.g. `my-graph`), NOT the on-chain id. */
+  contextGraphId: string;
+  /** Stringified on-chain context-graph id (the `/context/<cgId>` segment). */
+  cgId: string;
+  /** Canonical UAL of the KA — used as the meta join key. */
+  ual: string;
+  /** On-chain batch id (== kaId) for the `dkg:batchId` resolution edge. */
+  kaId: bigint;
+  /** Post-update merkle root (mirrored into the per-cgId meta for parity). */
+  merkleRoot: Uint8Array;
+  /**
+   * The update payload, partitioned by public root entity. Quad `graph` is
+   * overwritten to the per-cgId data graph on insert. This MUST be the exact
+   * same quad set the chain `merkleLeafCount` was computed over.
+   */
+  payloadByRoot: Map<string, Quad[]>;
+  /** Per-root private merkle roots, when the update carried private content. */
+  privateRootByRoot?: Map<string, Uint8Array>;
+}): Promise<void> {
+  const { store, contextGraphId, cgId, ual, kaId, merkleRoot, payloadByRoot, privateRootByRoot } = opts;
+  assertSafeContextGraphIdForSparql(contextGraphId);
+  assertSafeContextGraphIdForSparql(cgId);
+  assertSafeGraphIriForSparql(ual);
+  const ctxData = contextGraphDataUri(contextGraphId, cgId);
+  const ctxMeta = contextGraphMetaUri(contextGraphId, cgId);
+  assertSafeGraphIriForSparql(ctxData);
+  assertSafeGraphIriForSparql(ctxMeta);
+
+  // 1. Discover the KA's prior root entities in the per-cgId meta so we can
+  //    purge their now-stale data (full-restatement semantics: the new payload
+  //    replaces the KA, it does not merge into it).
+  const rootsToPurge = new Set<string>(payloadByRoot.keys());
+  const priorRes = await store.query(
+    `SELECT ?root WHERE { GRAPH <${ctxMeta}> { ?ka <${DKG}partOf> <${ual}> ; <${DKG}rootEntity> ?root } }`,
+  );
+  if (priorRes.type === 'bindings') {
+    for (const row of priorRes.bindings) {
+      const r = row['root'];
+      if (r) rootsToPurge.add(r);
+    }
+  }
+
+  // 2. Delete prior + payload roots' public triples from the per-cgId data
+  //    graph (exact subject + skolemized descendants, no prefix collision).
+  for (const root of rootsToPurge) {
+    await store.deleteByPattern({ graph: ctxData, subject: root });
+    await store.deleteBySubjectPrefix(ctxData, root + SKOLEM_INFIX);
+  }
+
+  // 3. Delete the prior KA meta rows (`?ka dkg:partOf <ual>`) from the per-cgId
+  //    meta. Use store primitives, NOT a SPARQL-UPDATE via query() — the
+  //    Oxigraph adapter's `query()` only runs read queries (SELECT/CONSTRUCT/
+  //    ASK), so a `DELETE … WHERE` there silently no-ops. Keep the KC-level
+  //    `<ual>` rows; merkleRoot/batchId are refreshed in step 6.
+  const priorKaRes = await store.query(
+    `SELECT DISTINCT ?ka WHERE { GRAPH <${ctxMeta}> { ?ka <${DKG}partOf> <${ual}> } }`,
+  );
+  if (priorKaRes.type === 'bindings') {
+    for (const row of priorKaRes.bindings) {
+      const ka = row['ka'];
+      if (ka) await store.deleteByPattern({ graph: ctxMeta, subject: ka });
+    }
+  }
+
+  // 4. Insert the payload public triples into the per-cgId data graph.
+  const dataQuads: Quad[] = [];
+  for (const quads of payloadByRoot.values()) {
+    for (const q of quads) dataQuads.push({ ...q, graph: ctxData });
+  }
+  if (dataQuads.length > 0) await store.insert(dataQuads);
+
+  // 5. Insert fresh KA meta rows for each payload root (1-based token index;
+  //    the extractor only relies on the partOf↔rootEntity↔privateMerkleRoot
+  //    triples, so the exact KA URI is opaque).
+  const roots = [...payloadByRoot.keys()].sort();
+  const metaQuads: Quad[] = [];
+  let tokenIdx = 1;
+  for (const root of roots) {
+    const kaUri = `${ual}/${tokenIdx++}`;
+    metaQuads.push(
+      mq(kaUri, `${RDF}type`, `${DKG}KnowledgeAsset`, ctxMeta),
+      mq(kaUri, `${DKG}partOf`, ual, ctxMeta),
+      mq(kaUri, `${DKG}rootEntity`, root, ctxMeta),
+    );
+    const privRoot = privateRootByRoot?.get(root);
+    if (privRoot && privRoot.length > 0) {
+      metaQuads.push(mq(kaUri, `${DKG}privateMerkleRoot`, lit(toHex(privRoot)), ctxMeta));
+    }
+  }
+  if (metaQuads.length > 0) await store.insert(metaQuads);
+
+  // 6. Ensure the `<ual> dkg:batchId` resolution edge + the current merkleRoot
+  //    are present so `extractV10KCFromStore` can resolve this KA from the
+  //    per-cgId meta even on a receiver that missed the original publish.
+  //    Refresh merkleRoot (drop stale, insert current) and idempotently ensure
+  //    batchId. Store primitives only (see step 3 note on query() vs update()).
+  const batchLit = `"${kaId}"^^<${XSD}integer>`;
+  const rootLit = `"${toHex(merkleRoot)}"`;
+  await store.deleteByPattern({ graph: ctxMeta, subject: ual, predicate: `${DKG}merkleRoot` });
+  await store.insert([
+    { subject: ual, predicate: `${DKG}merkleRoot`, object: rootLit, graph: ctxMeta },
+    { subject: ual, predicate: `${DKG}batchId`, object: batchLit, graph: ctxMeta },
+  ]);
 }
 
 // ── Sub-Graph Registration Metadata ────────────────────────────────────

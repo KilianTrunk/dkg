@@ -2,12 +2,19 @@ import type { TripleStore, Quad } from '@origintrail-official/dkg-storage';
 import { GraphManager } from '@origintrail-official/dkg-storage';
 import type { EventBus } from '@origintrail-official/dkg-core';
 import type { ChainAdapter, KAUpdateVerification } from '@origintrail-official/dkg-chain';
-import { Logger, createOperationContext, DKGEvent, sparqlInt } from '@origintrail-official/dkg-core';
+import { Logger, createOperationContext, DKGEvent, sparqlInt, contextGraphMetaUri } from '@origintrail-official/dkg-core';
 import { decodeKAUpdateRequest } from '@origintrail-official/dkg-core';
 import { parseSimpleNQuads } from './publish-handler.js';
 import { autoPartition } from './auto-partition.js';
 import { computeTripleHashV10 as computeTripleHash, computeFlatKCRootV10 as computeFlatKCRoot } from './merkle.js';
-import { updateMetaMerkleRoot } from './metadata.js';
+import { updateMetaMerkleRoot, promoteUpdatedKaToPerCgId, resolveUalByBatchId } from './metadata.js';
+
+/**
+ * Resolve a context-graph label/name to its on-chain id. Injected by the agent
+ * (`DKGAgent#getContextGraphOnChainId`) so the gossip receiver can promote an
+ * applied update into the per-cgId partition the RS prover reads (GH #842).
+ */
+export type ResolveOnChainCgId = (cgName: string) => Promise<string | null>;
 
 const SKOLEM_INFIX = '/.well-known/genid/';
 const EXPECTED_MERKLE_ROOT_LEN = 32;
@@ -44,17 +51,28 @@ export class UpdateHandler {
    */
   private readonly knownBatchContextGraphs: Map<string, string>;
 
+  /**
+   * Resolve a CG name to its on-chain id for GH #842 per-cgId promotion.
+   * Optional: when absent, applied updates are not promoted (RS stays
+   * `kc-not-synced` for them, exactly as before this fix).
+   */
+  private readonly resolveOnChainCgId?: ResolveOnChainCgId;
+
   constructor(
     store: TripleStore,
     chain: ChainAdapter,
     eventBus: EventBus,
-    options?: { knownBatchContextGraphs?: Map<string, string> },
+    options?: {
+      knownBatchContextGraphs?: Map<string, string>;
+      resolveOnChainCgId?: ResolveOnChainCgId;
+    },
   ) {
     this.store = store;
     this.graphManager = new GraphManager(store);
     this.chain = chain;
     this.eventBus = eventBus;
     this.knownBatchContextGraphs = options?.knownBatchContextGraphs ?? new Map();
+    this.resolveOnChainCgId = options?.resolveOnChainCgId;
   }
 
   async handle(data: Uint8Array, fromPeerId: string): Promise<void> {
@@ -201,6 +219,50 @@ export class UpdateHandler {
         this.log.warn(
           ctx,
           `Failed to update _meta merkleRoot for batchId=${batchId}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+
+      // GH #842: promote the applied payload into the per-cgId partition the RS
+      // prover reads, mirroring the publisher side, so receivers can also prove
+      // updated KAs. Best-effort — skip if the on-chain cgId or UAL can't be
+      // resolved (RS then stays `kc-not-synced` for this KA, no regression).
+      try {
+        const cgId = this.resolveOnChainCgId ? await this.resolveOnChainCgId(contextGraphId) : null;
+        if (cgId) {
+          const labelMeta = this.graphManager.metaGraphUri(contextGraphId);
+          let ual = await resolveUalByBatchId(this.store, labelMeta, BigInt(batchId));
+          if (!ual) {
+            ual = await resolveUalByBatchId(this.store, contextGraphMetaUri(contextGraphId, cgId), BigInt(batchId));
+          }
+          if (ual) {
+            const payloadByRoot = new Map<string, Quad[]>();
+            for (const root of manifestRoots) {
+              payloadByRoot.set(root, partitioned.get(root) ?? []);
+            }
+            const privateRootByRoot = new Map<string, Uint8Array>();
+            for (const m of manifest) {
+              if (m.privateMerkleRoot && m.privateMerkleRoot.length > 0) {
+                privateRootByRoot.set(m.rootEntity, new Uint8Array(m.privateMerkleRoot));
+              }
+            }
+            await promoteUpdatedKaToPerCgId({
+              store: this.store,
+              contextGraphId,
+              cgId,
+              ual,
+              kaId: BigInt(batchId),
+              merkleRoot: computedRoot,
+              payloadByRoot,
+              privateRootByRoot,
+            });
+          } else {
+            this.log.info(ctx, `GH#842: skipped per-cgId promotion (UAL unresolved) for batchId=${batchId}`);
+          }
+        }
+      } catch (err) {
+        this.log.warn(
+          ctx,
+          `GH#842 per-cgId update promotion failed for batchId=${batchId}: ${err instanceof Error ? err.message : String(err)}`,
         );
       }
 

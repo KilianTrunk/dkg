@@ -35,6 +35,7 @@ import {
   KCRootEntitiesNotFoundError,
   KCDataMissingError,
 } from '../src/index.js';
+import { promoteUpdatedKaToPerCgId } from '@origintrail-official/dkg-publisher';
 
 const DKG = 'http://dkg.io/ontology/';
 const XSD = 'http://www.w3.org/2001/XMLSchema#';
@@ -401,5 +402,158 @@ describe('extractV10KCFromStore — error paths', () => {
     const r10 = await extractV10KCFromStore(store, 1n, 10n);
     expect(r10.ual).toBe(UAL_10);
     expect(r10.rootEntities).toEqual([ROOT_10]);
+  });
+});
+
+// GH #842 — updated KAs must remain provable by Random Sampling.
+//
+// V10 treats an update as a full restatement: the chain ASSIGNS merkleRoot /
+// merkleLeafCount over the update payload. Before the fix, the update paths
+// only wrote the payload into the label data graph and never promoted it into
+// the per-cgId partition the prover reads, so `extractV10KCFromStore` kept
+// returning the STALE pre-update KA — a leaf count that can never match the
+// chain commitment (permanent `data-corrupted`). These tests pin that
+// `promoteUpdatedKaToPerCgId` makes the extract reflect EXACTLY the payload.
+describe('promoteUpdatedKaToPerCgId — updated KA stays provable (GH #842)', () => {
+  let store: OxigraphStore;
+  beforeEach(() => {
+    store = new OxigraphStore();
+  });
+
+  const CG_ID = 5n;
+  const CG_NAME = 'cg-5';
+  const KA_ID = 42n;
+  const UAL = 'did:dkg:hardhat:31337/0xpub/42';
+
+  function payloadMap(triples: { subject: string; predicate: string; object: string }[]): Map<string, Quad[]> {
+    const m = new Map<string, Quad[]>();
+    for (const t of triples) {
+      const root = t.subject.split('/.well-known/genid/')[0];
+      const arr = m.get(root) ?? [];
+      arr.push({ ...t, graph: '' });
+      m.set(root, arr);
+    }
+    return m;
+  }
+
+  it('extracts ONLY the update payload (new root) — stale original roots are purged', async () => {
+    // Original publish promotion: one root with three triples.
+    await seedKC(store, {
+      cgId: CG_ID,
+      cgName: CG_NAME,
+      kaId: KA_ID,
+      ual: UAL,
+      rootEntities: ['urn:orig:a'],
+      publicTriples: [
+        { subject: 'urn:orig:a', predicate: 'urn:p:name', object: '"orig"' },
+        { subject: 'urn:orig:a', predicate: 'urn:p:k1', object: '"1"' },
+        { subject: 'urn:orig:a', predicate: 'urn:p:k2', object: '"2"' },
+      ],
+    });
+
+    // Sanity: before the update the extract sees the original 3 triples.
+    const before = await extractV10KCFromStore(store, CG_ID, KA_ID);
+    expect(before.triples).toHaveLength(3);
+
+    // Full-restatement update to a brand-new root with two triples (mirrors the
+    // surgical RS harness's INCLUDE_UPDATED_COHORT pattern).
+    const updateTriples = [
+      { subject: 'urn:upd:b', predicate: 'urn:p:type', object: 'urn:UpdateAction' },
+      { subject: 'urn:upd:b', predicate: 'urn:p:name', object: '"updated"' },
+    ];
+    const merkleRoot = new V10MerkleTree(
+      updateTriples.map((t) => hashTripleV10(t.subject, t.predicate, t.object)),
+    ).root;
+
+    await promoteUpdatedKaToPerCgId({
+      store,
+      contextGraphId: CG_NAME,
+      cgId: CG_ID.toString(),
+      ual: UAL,
+      kaId: KA_ID,
+      merkleRoot,
+      payloadByRoot: payloadMap(updateTriples),
+    });
+
+    const after = await extractV10KCFromStore(store, CG_ID, KA_ID);
+
+    // The extract now reflects EXACTLY the payload — stale 'urn:orig:a' gone.
+    expect(after.rootEntities).toEqual(['urn:upd:b']);
+    expect(after.triples).toHaveLength(updateTriples.length);
+    expect(after.triples.every((t) => t.subject === 'urn:upd:b')).toBe(true);
+
+    // And the recomputed extract root matches what the chain committed to.
+    expect(new V10MerkleTree(after.leaves).root).toEqual(merkleRoot);
+  });
+
+  it('replaces in-place when the update keeps the same root (content swap)', async () => {
+    await seedKC(store, {
+      cgId: CG_ID,
+      cgName: CG_NAME,
+      kaId: KA_ID,
+      ual: UAL,
+      rootEntities: ['urn:e:a'],
+      publicTriples: [
+        { subject: 'urn:e:a', predicate: 'urn:p:v', object: '"old-1"' },
+        { subject: 'urn:e:a', predicate: 'urn:p:w', object: '"old-2"' },
+      ],
+    });
+
+    const updateTriples = [{ subject: 'urn:e:a', predicate: 'urn:p:v', object: '"new"' }];
+    const merkleRoot = new V10MerkleTree(
+      updateTriples.map((t) => hashTripleV10(t.subject, t.predicate, t.object)),
+    ).root;
+
+    await promoteUpdatedKaToPerCgId({
+      store,
+      contextGraphId: CG_NAME,
+      cgId: CG_ID.toString(),
+      ual: UAL,
+      kaId: KA_ID,
+      merkleRoot,
+      payloadByRoot: payloadMap(updateTriples),
+    });
+
+    const after = await extractV10KCFromStore(store, CG_ID, KA_ID);
+    expect(after.rootEntities).toEqual(['urn:e:a']);
+    expect(after.triples).toHaveLength(1);
+    expect(after.triples[0].object).toBe('"new"');
+    expect(new V10MerkleTree(after.leaves).root).toEqual(merkleRoot);
+  });
+
+  it('is idempotent on re-apply (gossip retry / duplicate delivery)', async () => {
+    await seedKC(store, {
+      cgId: CG_ID,
+      cgName: CG_NAME,
+      kaId: KA_ID,
+      ual: UAL,
+      rootEntities: ['urn:e:a'],
+      publicTriples: [{ subject: 'urn:e:a', predicate: 'urn:p:v', object: '"old"' }],
+    });
+
+    const updateTriples = [
+      { subject: 'urn:upd:x', predicate: 'urn:p:a', object: '"1"' },
+      { subject: 'urn:upd:x', predicate: 'urn:p:b', object: '"2"' },
+    ];
+    const merkleRoot = new V10MerkleTree(
+      updateTriples.map((t) => hashTripleV10(t.subject, t.predicate, t.object)),
+    ).root;
+
+    for (let i = 0; i < 2; i++) {
+      await promoteUpdatedKaToPerCgId({
+        store,
+        contextGraphId: CG_NAME,
+        cgId: CG_ID.toString(),
+        ual: UAL,
+        kaId: KA_ID,
+        merkleRoot,
+        payloadByRoot: payloadMap(updateTriples),
+      });
+    }
+
+    const after = await extractV10KCFromStore(store, CG_ID, KA_ID);
+    expect(after.rootEntities).toEqual(['urn:upd:x']);
+    expect(after.triples).toHaveLength(updateTriples.length);
+    expect(new V10MerkleTree(after.leaves).root).toEqual(merkleRoot);
   });
 });

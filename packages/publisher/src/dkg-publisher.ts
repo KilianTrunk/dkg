@@ -29,6 +29,7 @@ import {
   toHex,
   resolveUalByBatchId,
   updateMetaMerkleRoot,
+  promoteUpdatedKaToPerCgId,
   type KAMetadata,
 } from './metadata.js';
 import { storeWorkspaceOperationPublicQuads } from './workspace-resolution.js';
@@ -3081,9 +3082,42 @@ export class DKGPublisher implements Publisher {
 
     await storeUpdatedQuads();
 
+    const ual = await this.resolveKaUal(kaId);
+
+    // GH #842: promote the update payload into the per-cgId partition that the
+    // Random Sampling prover reads (`extractV10KCFromStore`). Without this the
+    // prover keeps extracting the stale pre-update KA from the original publish
+    // promotion and every updated KA is permanently unprovable
+    // (`data-corrupted` / leaf-count-mismatch). Best-effort: skip silently when
+    // the on-chain cgId is unknown — RS behaviour is then unchanged (the KA
+    // simply stays `kc-not-synced`), so this can never regress a publish.
+    if (publisherContextGraphId !== undefined && publisherContextGraphId > 0n) {
+      try {
+        const privateRootByRoot = new Map<string, Uint8Array>();
+        for (const m of manifestEntries) {
+          if (m.privateMerkleRoot) privateRootByRoot.set(m.rootEntity, m.privateMerkleRoot);
+        }
+        await promoteUpdatedKaToPerCgId({
+          store: this.store,
+          contextGraphId,
+          cgId: publisherContextGraphId.toString(),
+          ual,
+          kaId,
+          merkleRoot: kcMerkleRoot,
+          payloadByRoot: kaMap,
+          privateRootByRoot,
+        });
+      } catch (err) {
+        this.log.warn(
+          ctx,
+          `GH#842 per-cgId update promotion failed for kaId=${kaId}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+
     const result: PublishResult = {
       kaId,
-      ual: await this.resolveKaUal(kaId),
+      ual,
       merkleRoot: kcMerkleRoot,
       kaManifest: manifestEntries,
       status: 'confirmed',

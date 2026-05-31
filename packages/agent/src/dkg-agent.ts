@@ -7495,11 +7495,16 @@ export class DKGAgent {
     const ctx = opts?.operationCtx ?? createOperationContext('update');
     const onPhase = opts?.onPhase;
     this.log.info(ctx, `Starting update of kaId=${kaId} in context graph "${contextGraphId}" with ${quads.length} triples`);
+    // GH #842: thread the on-chain cgId so the publisher can promote the update
+    // payload into the per-cgId partition the RS prover reads. Without it,
+    // updated KAs stay unprovable (data-corrupted / leaf-count-mismatch).
+    const updateOnChainId = await this.getContextGraphOnChainId(contextGraphId);
     const result = await this.publisher.update(kaId, {
       contextGraphId,
       quads,
       privateQuads,
       publisherPeerId: this.node.peerId.toString(),
+      publishContextGraphId: updateOnChainId ?? undefined,
       operationCtx: ctx,
       onPhase,
       precomputedUpdateAttestation: opts?.precomputedUpdateAttestation,
@@ -12787,6 +12792,10 @@ export class DKGAgent {
     if (!this.updateHandler) {
       this.updateHandler = new UpdateHandler(this.store, this.chain, this.eventBus, {
         knownBatchContextGraphs: this.publisher.knownBatchContextGraphs,
+        // GH #842: let the receiver promote applied updates into the per-cgId
+        // partition the RS prover reads, so updated KAs are provable on all
+        // nodes, not just the publisher.
+        resolveOnChainCgId: (cgName: string) => this.getContextGraphOnChainId(cgName),
       });
     }
     return this.updateHandler;

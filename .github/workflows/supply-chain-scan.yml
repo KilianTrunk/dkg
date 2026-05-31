@@ -208,9 +208,18 @@ jobs:
           fail=0
           for wf in "${IGNORED[@]}"; do
             if [ ! -f "$wf" ]; then continue; fi
-            # Strip the guard's own PATTERNS block from the scan input so
-            # the step does not self-match on its own literal-pattern array.
-            scan_input=$(sed '/zizmor-cache-poisoning-guard-patterns-start/,/zizmor-cache-poisoning-guard-patterns-end/d' "$wf")
+            # 1. Strip the guard's own PATTERNS block so the step does not
+            #    self-match on its own literal-pattern array.
+            # 2. Normalize shell backslash-continuations by joining lines
+            #    that end with `\` into a single line. Without this, the
+            #    common multi-line publish form (e.g. `docker buildx build
+            #    \<newline>  --push \<newline>  .`) escapes a single-line
+            #    grep — a future PR could add a real multi-line publish
+            #    step to an ignored workflow and silently pass this guard.
+            #    The `\` gets replaced with a single space so adjacent
+            #    tokens stay separated for the subsequent grep.
+            scan_input=$(sed '/zizmor-cache-poisoning-guard-patterns-start/,/zizmor-cache-poisoning-guard-patterns-end/d' "$wf" \
+              | awk '/\\$/ { sub(/\\$/, " "); printf "%s", $0; next } { print }')
             for pat in "${PATTERNS[@]}"; do
               hits=$(echo "$scan_input" | grep -nE "$pat" || true)
               if [ -n "$hits" ]; then

@@ -28,8 +28,11 @@ import {
   generateTentativeMetadata,
   toHex,
   resolveUalByBatchId,
-  updateMetaMerkleRoot,
   promoteUpdatedKaToPerCgId,
+  restateLabelGraphForUpdate,
+  shouldApplyMaterialization,
+  writeMaterializedVersion,
+  type MaterializedVersion,
   type KAMetadata,
 } from './metadata.js';
 import { storeWorkspaceOperationPublicQuads } from './workspace-resolution.js';
@@ -1365,6 +1368,21 @@ export class DKGPublisher implements Publisher {
         const defaultDataGraph = this.graphManager.dataGraphUri(contextGraphId);
         const defaultMetaGraph = `${defaultDataGraph.replace(/\/data$/, '')}/_meta`;
 
+        // GH#842 last-writer-wins guard: if this KA has already been updated
+        // (a newer materialisation exists in the per-cgId meta), this
+        // publish-promotion is stale and MUST NOT re-materialise the original
+        // KA on top of it — that is exactly the race that made updated KAs
+        // unprovable. Skip the whole promotion when stale.
+        const publishVersion: MaterializedVersion = {
+          blockNumber: publishResult.onChainResult.blockNumber ?? 0,
+          txIndex: 0,
+        };
+        const applyPromotion = await shouldApplyMaterialization(
+          this.store, ctxMetaGraph, publishResult.ual, publishVersion,
+        );
+        if (!applyPromotion) {
+          this.log.info(ctx, `Skipped publish→per-cgId promotion for ${publishResult.ual}: a newer update is already materialised`);
+        } else {
         // Data promotion: always COPY public quads to the per-cgId data
         // graph (`<NAME>/context/<cgId>/data`) — RS prover's
         // `extractV10KCFromStore` reads triples from there
@@ -1427,7 +1445,12 @@ export class DKGPublisher implements Publisher {
           }
         }
 
+        // Stamp the publish version so a later update can compare against it
+        // (and a concurrent stale re-promote is rejected above).
+        await writeMaterializedVersion(this.store, ctxMetaGraph, publishResult.ual, publishVersion);
+
         this.log.info(ctx, `Promoted ${publishResult.kaManifest.length} KAs from default graph to context graph ${targetCgId}`);
+        }
       }
     }
 
@@ -2812,28 +2835,48 @@ export class DKGPublisher implements Publisher {
     onPhase?.('prepare:merkle', 'end');
     onPhase?.('prepare', 'end');
 
-    const storeUpdatedQuads = async (): Promise<void> => {
+    const updatePrivateRootByRoot = new Map<string, Uint8Array>();
+    for (const m of manifestEntries) {
+      if (m.privateMerkleRoot) updatePrivateRootByRoot.set(m.rootEntity, m.privateMerkleRoot);
+    }
+
+    const storeUpdatedQuads = async (version?: MaterializedVersion): Promise<void> => {
       onPhase?.('store', 'start');
-      for (const [rootEntity, publicQuads] of kaMap) {
-        await this.store.deleteByPattern({ graph: dataGraph, subject: rootEntity });
-        await this.store.deleteBySubjectPrefix(dataGraph, rootEntity + '/.well-known/genid/');
+
+      // Private triples: restate per new root (delete prior copy, store new).
+      for (const [rootEntity] of kaMap) {
         await this.privateStore.deletePrivateTriples(contextGraphId, rootEntity, options.subGraphName);
-
-        const normalized = publicQuads.map((q) => ({ ...q, graph: dataGraph }));
-        await this.store.insert(normalized);
-
         const entityPrivateQuads = entityPrivateMap.get(rootEntity) ?? [];
         if (entityPrivateQuads.length > 0) {
           await this.privateStore.storePrivateTriples(contextGraphId, rootEntity, entityPrivateQuads, options.subGraphName);
         }
       }
 
+      // Public + meta: full-restate the label graph (GH#842 §7.1). The old
+      // approach deleted/inserted only the NEW payload roots, leaving the prior
+      // root entity (and its triples) behind in both label data and `_meta` —
+      // so `agent.query` returned stale+new and the per-cgId copy was built
+      // from a stale source. `restateLabelGraphForUpdate` purges the prior
+      // roots' data, repoints `rootEntity` (preserving rich provenance), and
+      // refreshes `merkleRoot`. The version guard makes a later stale
+      // re-materialisation a no-op.
       try {
-        await updateMetaMerkleRoot(this.store, this.graphManager, contextGraphId, kaId, kcMerkleRoot);
+        const labelMeta = this.graphManager.metaGraphUri(contextGraphId);
+        const ualForRestate = (await resolveUalByBatchId(this.store, labelMeta, kaId)) ?? await this.resolveKaUal(kaId);
+        await restateLabelGraphForUpdate({
+          store: this.store,
+          dataGraph,
+          metaGraph: labelMeta,
+          ual: ualForRestate,
+          merkleRoot: kcMerkleRoot,
+          payloadByRoot: kaMap,
+          privateRootByRoot: updatePrivateRootByRoot,
+          version,
+        });
       } catch (err) {
         this.log.warn(
           ctx,
-          `Failed to sync _meta merkleRoot for kaId=${kaId}: ${err instanceof Error ? err.message : String(err)}`,
+          `Failed to restate label graph for kaId=${kaId}: ${err instanceof Error ? err.message : String(err)}`,
         );
       }
       onPhase?.('store', 'end');
@@ -3080,7 +3123,11 @@ export class DKGPublisher implements Publisher {
       return result;
     }
 
-    await storeUpdatedQuads();
+    // Chain version for the GH#842 last-writer-wins guard. The update's block
+    // is strictly later than its publish, so a stale publish-promotion can
+    // never overwrite this materialisation.
+    const updateVersion: MaterializedVersion = { blockNumber: txResult.blockNumber ?? 0, txIndex: 0 };
+    await storeUpdatedQuads(updateVersion);
 
     const ual = await this.resolveKaUal(kaId);
 
@@ -3106,6 +3153,7 @@ export class DKGPublisher implements Publisher {
           merkleRoot: kcMerkleRoot,
           payloadByRoot: kaMap,
           privateRootByRoot,
+          version: updateVersion,
         });
       } catch (err) {
         this.log.warn(

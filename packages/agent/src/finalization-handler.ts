@@ -14,6 +14,8 @@ import {
   computeFlatKCRootV10 as computeFlatKCRoot, autoPartition,
   generateConfirmedFullMetadata, getTentativeStatusQuad,
   generateSubGraphRegistration,
+  shouldApplyMaterialization, writeMaterializedVersion,
+  type MaterializedVersion,
   type KCMetadata, type KAMetadata, type OnChainProvenance,
 } from '@origintrail-official/dkg-publisher';
 const DKG_NS = 'http://dkg.io/ontology/';
@@ -126,6 +128,17 @@ export class FinalizationHandler {
         return;
       }
 
+      // GH#842 last-writer-wins guard: a publish-finalization that arrives AFTER
+      // this KA was already updated (a newer materialisation exists) must not
+      // re-materialise the pre-update state on top of the update. Skip the whole
+      // promotion (data + meta, incl. any label dual-write) when stale.
+      const finalizationVersion: MaterializedVersion = { blockNumber, txIndex: 0 };
+      if (!(await shouldApplyMaterialization(this.store, targetMetaGraph, msg.ual, finalizationVersion))) {
+        this.markProcessed(dedupeKey);
+        this.log.info(ctx, `Finalization: a newer update is already materialised for ${msg.ual}, skipping stale publish promotion`);
+        return;
+      }
+
       const sharedMemoryQuads = await this.getSharedMemoryQuadsForRoots(contextGraphId, msg.rootEntities, subGraphName);
 
       if (sharedMemoryQuads.length > 0) {
@@ -170,6 +183,7 @@ export class FinalizationHandler {
               authorAddress,
               keepRootCopyOnLabel,
             );
+            await writeMaterializedVersion(this.store, targetMetaGraph, msg.ual, finalizationVersion);
             this.markProcessed(dedupeKey);
             this.log.info(ctx, `Finalization: promoted SWM snapshot to ${ctxGraphId ? `context graph ${ctxGraphId}` : 'canonical'} for ${msg.ual} (tx=${msg.txHash.slice(0, 10)}…)`);
             return;

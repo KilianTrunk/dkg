@@ -549,6 +549,276 @@ export async function updateMetaMerkleRoot(
 
 const SKOLEM_INFIX = '/.well-known/genid/';
 
+// ── GH#842 materialization version guard ───────────────────────────────
+//
+// A KA's public triples are projected into the triple store by several
+// independent, asynchronous writers (publish→per-cgId promotion, the inline
+// update promotion, and the gossip FinalizationHandler). The chain assigns a
+// strict order (publish then update), but those writers can land in the
+// OPPOSITE order locally — a late publish-promotion re-materialises the
+// pre-update KA on top of an already-applied update, with no guard, so the RS
+// prover then extracts the stale state forever (`data-corrupted`).
+//
+// The fix: stamp every materialisation with its chain version
+// (`<blockNumber>:<txIndex>`) on the KC's `<ual>` subject in the meta graph it
+// writes, and have every writer refuse to apply a state OLDER than what is
+// already materialised. This gives the projection the same ordering guarantee
+// the chain log already has, regardless of interleaving.
+const MATERIALIZED_VERSION_PRED = `${DKG}materializedVersion`;
+
+export interface MaterializedVersion {
+  blockNumber: number;
+  txIndex: number;
+}
+
+export function compareMaterializedVersion(a: MaterializedVersion, b: MaterializedVersion): number {
+  if (a.blockNumber !== b.blockNumber) return a.blockNumber < b.blockNumber ? -1 : 1;
+  if (a.txIndex !== b.txIndex) return a.txIndex < b.txIndex ? -1 : 1;
+  return 0;
+}
+
+function parseMaterializedVersion(raw: string | undefined): MaterializedVersion | null {
+  if (!raw) return null;
+  const m = /(\d+):(\d+)/.exec(raw);
+  if (!m) return null;
+  return { blockNumber: Number(m[1]), txIndex: Number(m[2]) };
+}
+
+export async function readMaterializedVersion(
+  store: TripleStore,
+  metaGraph: string,
+  ual: string,
+): Promise<MaterializedVersion | null> {
+  assertSafeGraphIriForSparql(metaGraph);
+  assertSafeGraphIriForSparql(ual);
+  const res = await store.query(
+    `SELECT ?v WHERE { GRAPH <${metaGraph}> { <${ual}> <${MATERIALIZED_VERSION_PRED}> ?v } } LIMIT 1`,
+  );
+  if (res.type !== 'bindings' || res.bindings.length === 0) return null;
+  return parseMaterializedVersion(res.bindings[0]['v']);
+}
+
+/**
+ * True when `incoming` is newer-or-equal to what's already materialised for
+ * this KA (equal allows idempotent re-apply). False means a newer state exists
+ * and the caller MUST NOT write — it would clobber an already-applied update.
+ */
+export async function shouldApplyMaterialization(
+  store: TripleStore,
+  metaGraph: string,
+  ual: string,
+  incoming: MaterializedVersion,
+): Promise<boolean> {
+  const current = await readMaterializedVersion(store, metaGraph, ual);
+  if (!current) return true;
+  return compareMaterializedVersion(incoming, current) >= 0;
+}
+
+export async function writeMaterializedVersion(
+  store: TripleStore,
+  metaGraph: string,
+  ual: string,
+  version: MaterializedVersion,
+): Promise<void> {
+  assertSafeGraphIriForSparql(metaGraph);
+  assertSafeGraphIriForSparql(ual);
+  await store.deleteByPattern({ graph: metaGraph, subject: ual, predicate: MATERIALIZED_VERSION_PRED });
+  await store.insert([{
+    subject: ual,
+    predicate: MATERIALIZED_VERSION_PRED,
+    object: lit(`${version.blockNumber}:${version.txIndex}`),
+    graph: metaGraph,
+  }]);
+}
+
+/**
+ * Full-restatement of a KA into a given data+meta partition pair, with the
+ * minimal meta shape the RS prover needs (`partOf` / `rootEntity` /
+ * `privateMerkleRoot` / `batchId` / `merkleRoot`). Used for the per-cgId
+ * partition. Returns false (no-op) when a newer version is already
+ * materialised — see {@link shouldApplyMaterialization}.
+ */
+export async function restateKaPartition(opts: {
+  store: TripleStore;
+  dataGraph: string;
+  metaGraph: string;
+  ual: string;
+  kaId: bigint;
+  merkleRoot: Uint8Array;
+  payloadByRoot: Map<string, Quad[]>;
+  privateRootByRoot?: Map<string, Uint8Array>;
+  version?: MaterializedVersion;
+}): Promise<boolean> {
+  const { store, dataGraph, metaGraph, ual, kaId, merkleRoot, payloadByRoot, privateRootByRoot, version } = opts;
+  assertSafeGraphIriForSparql(dataGraph);
+  assertSafeGraphIriForSparql(metaGraph);
+  assertSafeGraphIriForSparql(ual);
+
+  if (version && !(await shouldApplyMaterialization(store, metaGraph, ual, version))) {
+    return false;
+  }
+
+  // 1. Discover prior roots so their now-stale data is purged (restatement).
+  const rootsToPurge = new Set<string>(payloadByRoot.keys());
+  const priorRes = await store.query(
+    `SELECT ?root WHERE { GRAPH <${metaGraph}> { ?ka <${DKG}partOf> <${ual}> ; <${DKG}rootEntity> ?root } }`,
+  );
+  if (priorRes.type === 'bindings') {
+    for (const row of priorRes.bindings) {
+      const r = row['root'];
+      if (r) rootsToPurge.add(r);
+    }
+  }
+  for (const root of rootsToPurge) {
+    await store.deleteByPattern({ graph: dataGraph, subject: root });
+    await store.deleteBySubjectPrefix(dataGraph, root + SKOLEM_INFIX);
+  }
+
+  // 2. Delete prior KA meta rows (?ka partOf <ual>); KC-level <ual> rows stay.
+  const priorKaRes = await store.query(
+    `SELECT DISTINCT ?ka WHERE { GRAPH <${metaGraph}> { ?ka <${DKG}partOf> <${ual}> } }`,
+  );
+  if (priorKaRes.type === 'bindings') {
+    for (const row of priorKaRes.bindings) {
+      const ka = row['ka'];
+      if (ka) await store.deleteByPattern({ graph: metaGraph, subject: ka });
+    }
+  }
+
+  // 3. Insert payload public triples.
+  const dataQuads: Quad[] = [];
+  for (const quads of payloadByRoot.values()) {
+    for (const q of quads) dataQuads.push({ ...q, graph: dataGraph });
+  }
+  if (dataQuads.length > 0) await store.insert(dataQuads);
+
+  // 4. Insert fresh minimal KA meta rows.
+  const roots = [...payloadByRoot.keys()].sort();
+  const metaQuads: Quad[] = [];
+  let tokenIdx = 1;
+  for (const root of roots) {
+    const kaUri = `${ual}/${tokenIdx++}`;
+    metaQuads.push(
+      mq(kaUri, `${RDF}type`, `${DKG}KnowledgeAsset`, metaGraph),
+      mq(kaUri, `${DKG}partOf`, ual, metaGraph),
+      mq(kaUri, `${DKG}rootEntity`, root, metaGraph),
+    );
+    const privRoot = privateRootByRoot?.get(root);
+    if (privRoot && privRoot.length > 0) {
+      metaQuads.push(mq(kaUri, `${DKG}privateMerkleRoot`, lit(toHex(privRoot)), metaGraph));
+    }
+  }
+  if (metaQuads.length > 0) await store.insert(metaQuads);
+
+  // 5. Refresh resolution edges (batchId) + current merkleRoot.
+  const batchLit = `"${kaId}"^^<${XSD}integer>`;
+  const rootLit = `"${toHex(merkleRoot)}"`;
+  await store.deleteByPattern({ graph: metaGraph, subject: ual, predicate: `${DKG}merkleRoot` });
+  await store.insert([
+    { subject: ual, predicate: `${DKG}merkleRoot`, object: rootLit, graph: metaGraph },
+    { subject: ual, predicate: `${DKG}batchId`, object: batchLit, graph: metaGraph },
+  ]);
+
+  if (version) await writeMaterializedVersion(store, metaGraph, ual, version);
+  return true;
+}
+
+/**
+ * Full-restatement of a KA in the app-facing LABEL graph after an update.
+ *
+ * Unlike {@link restateKaPartition} (per-cgId, minimal meta), this PRESERVES
+ * the KA's rich publish metadata (type, provenance, …) and only:
+ *  - deletes the prior root entities' DATA (so `agent.query` no longer returns
+ *    stale pre-update triples — the full-restatement bug, GH#842 §7.1), and
+ *  - repoints `dkg:rootEntity` / `dkg:privateMerkleRoot` on the existing KA
+ *    rows to the new payload roots (so `resolveKA` doesn't dangle), and
+ *  - refreshes `dkg:merkleRoot`.
+ *
+ * Returns false (no-op) when a newer version is already materialised.
+ */
+export async function restateLabelGraphForUpdate(opts: {
+  store: TripleStore;
+  dataGraph: string;
+  metaGraph: string;
+  ual: string;
+  merkleRoot: Uint8Array;
+  payloadByRoot: Map<string, Quad[]>;
+  privateRootByRoot?: Map<string, Uint8Array>;
+  version?: MaterializedVersion;
+}): Promise<boolean> {
+  const { store, dataGraph, metaGraph, ual, merkleRoot, payloadByRoot, privateRootByRoot, version } = opts;
+  assertSafeGraphIriForSparql(dataGraph);
+  assertSafeGraphIriForSparql(metaGraph);
+  assertSafeGraphIriForSparql(ual);
+
+  if (version && !(await shouldApplyMaterialization(store, metaGraph, ual, version))) {
+    return false;
+  }
+
+  const newRoots = [...payloadByRoot.keys()].sort();
+
+  // 1. Resolve prior KA rows (ka↔root) from the label meta.
+  const priorKaRows: { ka: string; root: string }[] = [];
+  const priorRes = await store.query(
+    `SELECT ?ka ?root WHERE { GRAPH <${metaGraph}> { ?ka <${DKG}partOf> <${ual}> ; <${DKG}rootEntity> ?root } }`,
+  );
+  if (priorRes.type === 'bindings') {
+    for (const row of priorRes.bindings) {
+      const ka = row['ka'];
+      const root = row['root'];
+      if (ka && root) priorKaRows.push({ ka, root });
+    }
+  }
+
+  // 2. Delete prior + payload roots' data, then insert the payload.
+  const rootsToPurge = new Set<string>(newRoots);
+  for (const { root } of priorKaRows) rootsToPurge.add(root);
+  for (const root of rootsToPurge) {
+    await store.deleteByPattern({ graph: dataGraph, subject: root });
+    await store.deleteBySubjectPrefix(dataGraph, root + SKOLEM_INFIX);
+  }
+  const dataQuads: Quad[] = [];
+  for (const quads of payloadByRoot.values()) {
+    for (const q of quads) dataQuads.push({ ...q, graph: dataGraph });
+  }
+  if (dataQuads.length > 0) await store.insert(dataQuads);
+
+  // 3. Repoint rootEntity / privateMerkleRoot on existing KA rows (by token
+  //    order), minting rows only when the update grew the KA's root count.
+  //    Everything else on the ?ka subject (provenance, type, …) is preserved.
+  const kaSubjects = [...new Set(priorKaRows.map((r) => r.ka))].sort();
+  for (const ka of kaSubjects) {
+    await store.deleteByPattern({ graph: metaGraph, subject: ka, predicate: `${DKG}rootEntity` });
+    await store.deleteByPattern({ graph: metaGraph, subject: ka, predicate: `${DKG}privateMerkleRoot` });
+  }
+  const metaQuads: Quad[] = [];
+  for (let i = 0; i < newRoots.length; i++) {
+    const root = newRoots[i];
+    const existing = kaSubjects[i];
+    const ka = existing ?? `${ual}/${i + 1}`;
+    metaQuads.push(mq(ka, `${DKG}rootEntity`, root, metaGraph));
+    if (!existing) {
+      metaQuads.push(
+        mq(ka, `${RDF}type`, `${DKG}KnowledgeAsset`, metaGraph),
+        mq(ka, `${DKG}partOf`, ual, metaGraph),
+      );
+    }
+    const privRoot = privateRootByRoot?.get(root);
+    if (privRoot && privRoot.length > 0) {
+      metaQuads.push(mq(ka, `${DKG}privateMerkleRoot`, lit(toHex(privRoot)), metaGraph));
+    }
+  }
+  if (metaQuads.length > 0) await store.insert(metaQuads);
+
+  // 4. Refresh merkleRoot.
+  const rootLit = `"${toHex(merkleRoot)}"`;
+  await store.deleteByPattern({ graph: metaGraph, subject: ual, predicate: `${DKG}merkleRoot` });
+  await store.insert([{ subject: ual, predicate: `${DKG}merkleRoot`, object: rootLit, graph: metaGraph }]);
+
+  if (version) await writeMaterializedVersion(store, metaGraph, ual, version);
+  return true;
+}
+
 /**
  * Make the per-cgId data + meta partition reflect EXACTLY the update payload
  * for a knowledge asset, so the Random Sampling prover can prove updated KAs.
@@ -599,91 +869,31 @@ export async function promoteUpdatedKaToPerCgId(opts: {
   payloadByRoot: Map<string, Quad[]>;
   /** Per-root private merkle roots, when the update carried private content. */
   privateRootByRoot?: Map<string, Uint8Array>;
-}): Promise<void> {
-  const { store, contextGraphId, cgId, ual, kaId, merkleRoot, payloadByRoot, privateRootByRoot } = opts;
+  /**
+   * Chain version (block:txIndex) for the last-writer-wins guard. When set, the
+   * promotion is skipped if a newer state is already materialised — this is
+   * what stops a late publish-promotion from clobbering an applied update.
+   */
+  version?: MaterializedVersion;
+}): Promise<boolean> {
+  const { store, contextGraphId, cgId, ual, kaId, merkleRoot, payloadByRoot, privateRootByRoot, version } = opts;
   assertSafeContextGraphIdForSparql(contextGraphId);
   assertSafeContextGraphIdForSparql(cgId);
   assertSafeGraphIriForSparql(ual);
   const ctxData = contextGraphDataUri(contextGraphId, cgId);
   const ctxMeta = contextGraphMetaUri(contextGraphId, cgId);
-  assertSafeGraphIriForSparql(ctxData);
-  assertSafeGraphIriForSparql(ctxMeta);
 
-  // 1. Discover the KA's prior root entities in the per-cgId meta so we can
-  //    purge their now-stale data (full-restatement semantics: the new payload
-  //    replaces the KA, it does not merge into it).
-  const rootsToPurge = new Set<string>(payloadByRoot.keys());
-  const priorRes = await store.query(
-    `SELECT ?root WHERE { GRAPH <${ctxMeta}> { ?ka <${DKG}partOf> <${ual}> ; <${DKG}rootEntity> ?root } }`,
-  );
-  if (priorRes.type === 'bindings') {
-    for (const row of priorRes.bindings) {
-      const r = row['root'];
-      if (r) rootsToPurge.add(r);
-    }
-  }
-
-  // 2. Delete prior + payload roots' public triples from the per-cgId data
-  //    graph (exact subject + skolemized descendants, no prefix collision).
-  for (const root of rootsToPurge) {
-    await store.deleteByPattern({ graph: ctxData, subject: root });
-    await store.deleteBySubjectPrefix(ctxData, root + SKOLEM_INFIX);
-  }
-
-  // 3. Delete the prior KA meta rows (`?ka dkg:partOf <ual>`) from the per-cgId
-  //    meta. Use store primitives, NOT a SPARQL-UPDATE via query() — the
-  //    Oxigraph adapter's `query()` only runs read queries (SELECT/CONSTRUCT/
-  //    ASK), so a `DELETE … WHERE` there silently no-ops. Keep the KC-level
-  //    `<ual>` rows; merkleRoot/batchId are refreshed in step 6.
-  const priorKaRes = await store.query(
-    `SELECT DISTINCT ?ka WHERE { GRAPH <${ctxMeta}> { ?ka <${DKG}partOf> <${ual}> } }`,
-  );
-  if (priorKaRes.type === 'bindings') {
-    for (const row of priorKaRes.bindings) {
-      const ka = row['ka'];
-      if (ka) await store.deleteByPattern({ graph: ctxMeta, subject: ka });
-    }
-  }
-
-  // 4. Insert the payload public triples into the per-cgId data graph.
-  const dataQuads: Quad[] = [];
-  for (const quads of payloadByRoot.values()) {
-    for (const q of quads) dataQuads.push({ ...q, graph: ctxData });
-  }
-  if (dataQuads.length > 0) await store.insert(dataQuads);
-
-  // 5. Insert fresh KA meta rows for each payload root (1-based token index;
-  //    the extractor only relies on the partOf↔rootEntity↔privateMerkleRoot
-  //    triples, so the exact KA URI is opaque).
-  const roots = [...payloadByRoot.keys()].sort();
-  const metaQuads: Quad[] = [];
-  let tokenIdx = 1;
-  for (const root of roots) {
-    const kaUri = `${ual}/${tokenIdx++}`;
-    metaQuads.push(
-      mq(kaUri, `${RDF}type`, `${DKG}KnowledgeAsset`, ctxMeta),
-      mq(kaUri, `${DKG}partOf`, ual, ctxMeta),
-      mq(kaUri, `${DKG}rootEntity`, root, ctxMeta),
-    );
-    const privRoot = privateRootByRoot?.get(root);
-    if (privRoot && privRoot.length > 0) {
-      metaQuads.push(mq(kaUri, `${DKG}privateMerkleRoot`, lit(toHex(privRoot)), ctxMeta));
-    }
-  }
-  if (metaQuads.length > 0) await store.insert(metaQuads);
-
-  // 6. Ensure the `<ual> dkg:batchId` resolution edge + the current merkleRoot
-  //    are present so `extractV10KCFromStore` can resolve this KA from the
-  //    per-cgId meta even on a receiver that missed the original publish.
-  //    Refresh merkleRoot (drop stale, insert current) and idempotently ensure
-  //    batchId. Store primitives only (see step 3 note on query() vs update()).
-  const batchLit = `"${kaId}"^^<${XSD}integer>`;
-  const rootLit = `"${toHex(merkleRoot)}"`;
-  await store.deleteByPattern({ graph: ctxMeta, subject: ual, predicate: `${DKG}merkleRoot` });
-  await store.insert([
-    { subject: ual, predicate: `${DKG}merkleRoot`, object: rootLit, graph: ctxMeta },
-    { subject: ual, predicate: `${DKG}batchId`, object: batchLit, graph: ctxMeta },
-  ]);
+  return restateKaPartition({
+    store,
+    dataGraph: ctxData,
+    metaGraph: ctxMeta,
+    ual,
+    kaId,
+    merkleRoot,
+    payloadByRoot,
+    privateRootByRoot,
+    version,
+  });
 }
 
 // ── Sub-Graph Registration Metadata ────────────────────────────────────

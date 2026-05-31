@@ -641,6 +641,22 @@ contract PublishingConviction is INamed, IVersioned, ContractStatus, IInitializa
 
         if (uint40(acct.lastSettledWindow) >= stopAt) return;
 
+        // Slither divide-before-multiply — `committedTRAC / lockDurationEpochs`
+        // executes BEFORE `_feeOf(remainder, feeBps)`'s multiplication. The
+        // truncation here is bounded:
+        //
+        //   * per-window rounding error ≤ (lockDurationEpochs − 1) wei
+        //     because integer division truncates the remainder.
+        //   * cumulative rounding error over an entire lock cycle ≤
+        //     lockDurationEpochs² wei. For the practical maximum of
+        //     lockDurationEpochs = 365 (one-year locks), that ceiling is
+        //     365² ≈ 1.3 × 10⁵ wei = 1.3 × 10⁻¹³ TRAC. Negligible
+        //     against any plausible TRAC balance or treasury fee.
+        //
+        // Re-ordering the operations to multiply first would require
+        // widening intermediate types to uint256 and adds gas without
+        // changing the on-chain payout to any observable precision.
+        // slither-disable-next-line divide-before-multiply
         uint96 baseAllowance = acct.committedTRAC / uint96(acct.lockDurationEpochs);
 
         (address treasury, uint256 feeBps) = _treasuryParams();

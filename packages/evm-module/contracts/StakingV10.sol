@@ -351,6 +351,18 @@ contract StakingV10 is INamed, IVersioned, ContractStatus, IInitializable {
         // exposes `transferStake` for the withdraw outflow side. The NFT
         // wrapper never holds funds; the V8 StakingStorage is no longer in
         // the deposit path.
+        //
+        // Slither flags this site twice:
+        //   - `arbitrary-send-erc20`: `staker` is the `from` argument. NOT
+        //     arbitrary — the `onlyConvictionNFT` modifier restricts callers
+        //     to the convictionNFT contract, which only invokes `stake()`
+        //     for the NFT holder whose token is being created. The allowance
+        //     check at line 340 above proves the `staker` authorised this
+        //     specific transfer (or the call reverts before reaching here).
+        //   - `unchecked-transfer`: `safeTransferFrom` (SafeERC20) reverts
+        //     on failure; the false-return path Slither warns about does
+        //     not apply.
+        // slither-disable-next-line arbitrary-send-erc20,unchecked-transfer
         token.safeTransferFrom(staker, address(convictionStorage), amount);
 
         // L11 — multiplier18 is no longer passed in; CSS reads it from the

@@ -632,6 +632,58 @@ export async function writeMaterializedVersion(
 }
 
 /**
+ * In-process serialising lock keyed on `(metaGraph, ual)` so that the
+ * "read version → apply payload → stamp version" sequence used by the
+ * publish-promote / update-restate / finalization paths is effectively
+ * atomic on a single node.
+ *
+ * Why this exists (PR #845 review by @branarakic):
+ * The `shouldApplyMaterialization` check is TOCTOU against the eventual
+ * `writeMaterializedVersion`: between the read and the write, the helper
+ * performs many awaited store mutations. Three independent async writers
+ * (publishFromSharedMemory, FinalizationHandler, DKGPublisher.update +
+ * UpdateHandler via restate*) can pass the check while NO version is
+ * stamped, then one materialises a newer version, then a stale writer
+ * resumes mid-sequence and overwrites the newer payload.
+ *
+ * Solution: every check-then-write site enters this lock, so the
+ * sequence runs end-to-end without interleave. The lock is per-KA so
+ * unrelated work parallelises freely. The store layer doesn't expose
+ * a CAS primitive, and a true cross-process lock would need to be
+ * pushed into Oxigraph; per-process is sufficient because all four
+ * writers live in the same daemon for a given context graph.
+ */
+const _materializationLocks = new Map<string, Promise<unknown>>();
+
+export async function withMaterializationLock<T>(
+  metaGraph: string,
+  ual: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const key = `${metaGraph}\u0000${ual}`;
+  const prev = _materializationLocks.get(key);
+  // Build our work promise so subsequent callers can chain after us
+  // BEFORE we start awaiting prev (otherwise two near-simultaneous
+  // callers would both see `prev === undefined` and run in parallel).
+  const work = (async () => {
+    if (prev) {
+      try { await prev; } catch { /* prev's caller already handled it */ }
+    }
+    return fn();
+  })();
+  _materializationLocks.set(key, work);
+  try {
+    return await work;
+  } finally {
+    // GC: if no one else queued after us, drop the entry so the map
+    // doesn't grow unbounded across long-running daemons.
+    if (_materializationLocks.get(key) === work) {
+      _materializationLocks.delete(key);
+    }
+  }
+}
+
+/**
  * Full-restatement of a KA into a given data+meta partition pair, with the
  * minimal meta shape the RS prover needs (`partOf` / `rootEntity` /
  * `privateMerkleRoot` / `batchId` / `merkleRoot`). Used for the per-cgId
@@ -653,6 +705,28 @@ export async function restateKaPartition(opts: {
   assertSafeGraphIriForSparql(dataGraph);
   assertSafeGraphIriForSparql(metaGraph);
   assertSafeGraphIriForSparql(ual);
+
+  // PR #845 review: the version check + writes must be atomic relative
+  // to other writers on the same KA, otherwise a stale publish-promotion
+  // can interleave between the check and the final `writeMaterializedVersion`
+  // and clobber an applied update.
+  return withMaterializationLock(metaGraph, ual, () => _restateKaPartitionLocked({
+    store, dataGraph, metaGraph, ual, kaId, merkleRoot, payloadByRoot, privateRootByRoot, version,
+  }));
+}
+
+async function _restateKaPartitionLocked(opts: {
+  store: TripleStore;
+  dataGraph: string;
+  metaGraph: string;
+  ual: string;
+  kaId: bigint;
+  merkleRoot: Uint8Array;
+  payloadByRoot: Map<string, Quad[]>;
+  privateRootByRoot?: Map<string, Uint8Array>;
+  version?: MaterializedVersion;
+}): Promise<boolean> {
+  const { store, dataGraph, metaGraph, ual, kaId, merkleRoot, payloadByRoot, privateRootByRoot, version } = opts;
 
   if (version && !(await shouldApplyMaterialization(store, metaGraph, ual, version))) {
     return false;
@@ -755,6 +829,26 @@ export async function restateLabelGraphForUpdate(opts: {
   assertSafeGraphIriForSparql(dataGraph);
   assertSafeGraphIriForSparql(metaGraph);
   assertSafeGraphIriForSparql(ual);
+
+  // PR #845 review: serialise check+write so a concurrent stale writer
+  // cannot interleave between `shouldApplyMaterialization` and the final
+  // `writeMaterializedVersion` (TOCTOU). See `withMaterializationLock`.
+  return withMaterializationLock(metaGraph, ual, () => _restateLabelGraphForUpdateLocked({
+    store, dataGraph, metaGraph, ual, merkleRoot, payloadByRoot, privateRootByRoot, version,
+  }));
+}
+
+async function _restateLabelGraphForUpdateLocked(opts: {
+  store: TripleStore;
+  dataGraph: string;
+  metaGraph: string;
+  ual: string;
+  merkleRoot: Uint8Array;
+  payloadByRoot: Map<string, Quad[]>;
+  privateRootByRoot?: Map<string, Uint8Array>;
+  version?: MaterializedVersion;
+}): Promise<boolean> {
+  const { store, dataGraph, metaGraph, ual, merkleRoot, payloadByRoot, privateRootByRoot, version } = opts;
 
   if (version && !(await shouldApplyMaterialization(store, metaGraph, ual, version))) {
     return false;

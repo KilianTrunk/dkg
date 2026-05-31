@@ -31,6 +31,7 @@ import {
   promoteUpdatedKaToPerCgId,
   restateLabelGraphForUpdate,
   shouldApplyMaterialization,
+  withMaterializationLock,
   writeMaterializedVersion,
   type MaterializedVersion,
   type KAMetadata,
@@ -1380,6 +1381,12 @@ export class DKGPublisher implements Publisher {
           blockNumber: publishResult.onChainResult.blockNumber ?? 0,
           txIndex: publishResult.onChainResult.txIndex ?? 0,
         };
+        // PR #845 review: serialise the check + the entire promotion +
+        // the final version-stamp under the per-KA materialization lock,
+        // otherwise a concurrent update path's `restate*` (or another
+        // finalization) can stamp a newer version between our check and
+        // our write, and we'd resume mid-sequence and overwrite it.
+        await withMaterializationLock(ctxMetaGraph, publishResult.ual, async () => {
         const applyPromotion = await shouldApplyMaterialization(
           this.store, ctxMetaGraph, publishResult.ual, publishVersion,
         );
@@ -1454,6 +1461,7 @@ export class DKGPublisher implements Publisher {
 
         this.log.info(ctx, `Promoted ${publishResult.kaManifest.length} KAs from default graph to context graph ${targetCgId}`);
         }
+        });
       }
     }
 
@@ -2857,8 +2865,17 @@ export class DKGPublisher implements Publisher {
       const priorRootEntities = new Set<string>();
       try {
         const labelMetaForPriors = this.graphManager.metaGraphUri(contextGraphId);
-        const ualForPriors =
-          (await resolveUalByBatchId(this.store, labelMetaForPriors, kaId)) ?? await this.resolveKaUal(kaId);
+        let ualForPriors = await resolveUalByBatchId(this.store, labelMetaForPriors, kaId);
+        if (!ualForPriors) {
+          // Same local-only deterministic-UAL fallback as the restate
+          // block below (PR #845 review #8). Keeps the prior-root scan
+          // working for `NoChainAdapter` updates.
+          if (localOnlyUpdate && publisherAddress) {
+            ualForPriors = `did:dkg:${this.chain.chainId}/${publisherAddress}/${kaId}`;
+          } else {
+            ualForPriors = await this.resolveKaUal(kaId);
+          }
+        }
         if (ualForPriors) {
           const priorRes = await this.store.query(
             `SELECT DISTINCT ?root WHERE { GRAPH <${labelMetaForPriors}> { ?ka <${DKG_ONT}partOf> <${ualForPriors}> ; <${DKG_ONT}rootEntity> ?root } }`,
@@ -2900,25 +2917,42 @@ export class DKGPublisher implements Publisher {
       // roots' data, repoints `rootEntity` (preserving rich provenance), and
       // refreshes `merkleRoot`. The version guard makes a later stale
       // re-materialisation a no-op.
-      try {
-        const labelMeta = this.graphManager.metaGraphUri(contextGraphId);
-        const ualForRestate = (await resolveUalByBatchId(this.store, labelMeta, kaId)) ?? await this.resolveKaUal(kaId);
-        await restateLabelGraphForUpdate({
-          store: this.store,
-          dataGraph,
-          metaGraph: labelMeta,
-          ual: ualForRestate,
-          merkleRoot: kcMerkleRoot,
-          payloadByRoot: kaMap,
-          privateRootByRoot: updatePrivateRootByRoot,
-          version,
-        });
-      } catch (err) {
-        this.log.warn(
-          ctx,
-          `Failed to restate label graph for kaId=${kaId}: ${err instanceof Error ? err.message : String(err)}`,
-        );
+      //
+      // PR #845 review #8 (@branarakic): public restatement is the CORE
+      // write — it must NOT be swallowed. Pre-fix code wrapped this in
+      // try/catch, so a `NoChainAdapter` update (where `resolveKaUal`
+      // throws because `getDKGKnowledgeAssetsAddress` returns undefined)
+      // would report tentative/confirmed success with private triples
+      // changed but public triples STILL stale — silently breaking
+      // `agent.query` on the label graph.
+      //
+      // Fix: for the local-only path we have a deterministic UAL
+      // (`did:dkg:<chainId>/<publisherAddress>/<kaId>` — same scheme the
+      // result UAL uses at L2941), so use that as the last-resort UAL
+      // when `resolveKaUal` would throw. For the on-chain path we still
+      // let `resolveKaUal` throw (failing the update) — which is the
+      // correct behavior when chain-truth is required but unavailable.
+      const labelMeta = this.graphManager.metaGraphUri(contextGraphId);
+      let ualForRestate = await resolveUalByBatchId(this.store, labelMeta, kaId);
+      if (!ualForRestate) {
+        if (localOnlyUpdate && publisherAddress) {
+          // Mirror the `result.ual` formula below so the restated meta
+          // joins with what `update()`'s caller sees as the KA's UAL.
+          ualForRestate = `did:dkg:${this.chain.chainId}/${publisherAddress}/${kaId}`;
+        } else {
+          ualForRestate = await this.resolveKaUal(kaId);
+        }
       }
+      await restateLabelGraphForUpdate({
+        store: this.store,
+        dataGraph,
+        metaGraph: labelMeta,
+        ual: ualForRestate,
+        merkleRoot: kcMerkleRoot,
+        payloadByRoot: kaMap,
+        privateRootByRoot: updatePrivateRootByRoot,
+        version,
+      });
       onPhase?.('store', 'end');
     };
 

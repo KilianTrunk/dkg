@@ -201,7 +201,23 @@ export class UpdateHandler {
       // restates/promotes instead of silently skipping (GH#842 §7.3 — the
       // "skipped per-cgId promotion (UAL unresolved)" failure mode).
       const labelMeta = this.graphManager.metaGraphUri(contextGraphId);
-      const cgId = this.resolveOnChainCgId ? await this.resolveOnChainCgId(contextGraphId) : null;
+      // Best-effort: the per-cgId promotion is RS-only sugar. A transient
+      // ontology/store error in the resolver must NOT abort the verified
+      // label-graph restatement — that's the same failure mode the agent-
+      // side `update()` already guards. We fall back to `null` (skip
+      // per-cgId promotion) and continue applying the update.
+      let cgId: string | null = null;
+      if (this.resolveOnChainCgId) {
+        try {
+          cgId = await this.resolveOnChainCgId(contextGraphId);
+        } catch (err) {
+          this.log.warn(
+            ctx,
+            `Per-cgId resolver threw for cg=${contextGraphId} — skipping per-cgId promotion: ${err instanceof Error ? err.message : String(err)}`,
+          );
+          cgId = null;
+        }
+      }
       let ual = await resolveUalByBatchId(this.store, labelMeta, BigInt(batchId));
       if (!ual && cgId) {
         ual = await resolveUalByBatchId(this.store, contextGraphMetaUri(contextGraphId, cgId), BigInt(batchId));

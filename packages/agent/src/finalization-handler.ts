@@ -14,7 +14,7 @@ import {
   computeFlatKCRootV10 as computeFlatKCRoot, autoPartition,
   generateConfirmedFullMetadata, getTentativeStatusQuad,
   generateSubGraphRegistration,
-  shouldApplyMaterialization, writeMaterializedVersion,
+  shouldApplyMaterialization, writeMaterializedVersion, withMaterializationLock,
   type MaterializedVersion,
   type KCMetadata, type KAMetadata, type OnChainProvenance,
 } from '@origintrail-official/dkg-publisher';
@@ -78,10 +78,6 @@ export class FinalizationHandler {
       }
 
       const blockNumber = protoToNumber(msg.blockNumber);
-      // GH#842: legacy publishers omit tag 17; protobufjs decodes that as 0,
-      // matching the pre-fix shape (no tiebreaker). New publishers carry the
-      // chain-truth `transactionIndex`.
-      const txIndex = typeof msg.txIndex === 'number' ? msg.txIndex : 0;
       const startKAId = protoToBigInt(msg.startKAId);
       const endKAId = protoToBigInt(msg.endKAId);
 
@@ -132,17 +128,6 @@ export class FinalizationHandler {
         return;
       }
 
-      // GH#842 last-writer-wins guard: a publish-finalization that arrives AFTER
-      // this KA was already updated (a newer materialisation exists) must not
-      // re-materialise the pre-update state on top of the update. Skip the whole
-      // promotion (data + meta, incl. any label dual-write) when stale.
-      const finalizationVersion: MaterializedVersion = { blockNumber, txIndex };
-      if (!(await shouldApplyMaterialization(this.store, targetMetaGraph, msg.ual, finalizationVersion))) {
-        this.markProcessed(dedupeKey);
-        this.log.info(ctx, `Finalization: a newer update is already materialised for ${msg.ual}, skipping stale publish promotion`);
-        return;
-      }
-
       const sharedMemoryQuads = await this.getSharedMemoryQuadsForRoots(contextGraphId, msg.rootEntities, subGraphName);
 
       if (sharedMemoryQuads.length > 0) {
@@ -151,7 +136,13 @@ export class FinalizationHandler {
 
         if (merkleMatch) {
           const batchId = protoToBigInt(msg.batchId);
-          const { verified, authorAddress } = await this.verifyOnChain(
+          // PR #845 review #9: derive `txIndex` from the verified receipt
+          // (via `verifyOnChain`), NOT from gossip-supplied `msg.txIndex`.
+          // The latter is trust-based; a peer can forge an inflated index
+          // for a real publish `txHash` and lock out a legitimate
+          // same-block update on the receiver. The verified value comes
+          // from the on-chain log we matched (`log.transactionIndex`).
+          const { verified, authorAddress, txIndex: verifiedTxIndex } = await this.verifyOnChain(
             msg.txHash, blockNumber, msg.kcMerkleRoot,
             msg.publisherAddress, startKAId, endKAId, ctx, ctxGraphId, batchId,
           );
@@ -179,15 +170,82 @@ export class FinalizationHandler {
             // gap is bounded by the upgrade window. PR #779 has not
             // shipped to any production peer yet, so this is the right
             // moment to harden the contract.
-            const keepRootCopyOnLabel: boolean = msg.keepRootCopyOnLabel === true;
-            await this.promoteSharedMemoryToCanonical(
-              contextGraphId, sharedMemoryQuads, msg.ual, msg.rootEntities,
-              msg.publisherAddress, msg.txHash, blockNumber, startKAId, endKAId,
-              protoToBigInt(msg.batchId), ctx, ctxGraphId, subGraphName,
-              authorAddress,
-              keepRootCopyOnLabel,
-            );
-            await writeMaterializedVersion(this.store, targetMetaGraph, msg.ual, finalizationVersion);
+            const requestedKeepRootCopyOnLabel: boolean = msg.keepRootCopyOnLabel === true;
+            // PR #845 review #9: tiebreaker comes from chain-truth.
+            // verifyOnChain may not yield a txIndex if the matched event
+            // shape didn't carry it (e.g. mocks). Fall back to 0 in that
+            // case — matches pre-#845 ordering.
+            const finalizationVersion: MaterializedVersion = {
+              blockNumber,
+              txIndex: typeof verifiedTxIndex === 'number' ? verifiedTxIndex : 0,
+            };
+            // PR #845 review #10: when same-graph dual-write is requested,
+            // BOTH the per-cgId target meta and the root label meta
+            // (`<cg>/_meta`) get rewritten. The pre-#845 code only guarded
+            // the per-cgId target, so a stale finalization could pass that
+            // check while an update had already stamped a newer version in
+            // the root label meta — the dual-write then re-inserted the
+            // old root-label data + meta on top of the update. Acquire the
+            // label-meta lock too (when dual-writing), and downgrade to
+            // per-cgId-only if the label projection is newer.
+            const isDualWrite = requestedKeepRootCopyOnLabel
+              && !!ctxGraphId
+              && !subGraphName;
+            const defaultMeta = `did:dkg:context-graph:${contextGraphId}/_meta`;
+            // PR #845 review #7: TOCTOU — serialise check + promotion +
+            // version stamp under the per-KA materialization lock so a
+            // concurrent stale writer cannot interleave between our
+            // `shouldApplyMaterialization` and `writeMaterializedVersion`.
+            const promoteUnderLocks = async (): Promise<'promoted' | 'stale-target'> => {
+              if (!(await shouldApplyMaterialization(this.store, targetMetaGraph, msg.ual, finalizationVersion))) {
+                return 'stale-target';
+              }
+              let effectiveKeepRoot = isDualWrite;
+              if (isDualWrite) {
+                if (!(await shouldApplyMaterialization(this.store, defaultMeta, msg.ual, finalizationVersion))) {
+                  // Per-cgId is stale-or-equal but ROOT label has a
+                  // newer projection (an applied update). Skip the
+                  // dual-write portion so we don't clobber it.
+                  effectiveKeepRoot = false;
+                  this.log.info(
+                    ctx,
+                    `Finalization: root-label projection is newer for ${msg.ual}; downgrading to per-cgId-only promotion`,
+                  );
+                }
+              }
+              await this.promoteSharedMemoryToCanonical(
+                contextGraphId, sharedMemoryQuads, msg.ual, msg.rootEntities,
+                msg.publisherAddress, msg.txHash, blockNumber, startKAId, endKAId,
+                protoToBigInt(msg.batchId), ctx, ctxGraphId, subGraphName,
+                authorAddress,
+                effectiveKeepRoot,
+              );
+              await writeMaterializedVersion(this.store, targetMetaGraph, msg.ual, finalizationVersion);
+              if (effectiveKeepRoot) {
+                await writeMaterializedVersion(this.store, defaultMeta, msg.ual, finalizationVersion);
+              }
+              return 'promoted';
+            };
+            // Nested per-graph locks. Acquired in sorted order to prevent
+            // cross-deadlock with any other call site that might one day
+            // also lock multiple metas.
+            const lockOrder = isDualWrite
+              ? [defaultMeta, targetMetaGraph].sort()
+              : [targetMetaGraph];
+            const runUnderLocks = async (): Promise<'promoted' | 'stale-target'> => {
+              if (lockOrder.length === 1) {
+                return withMaterializationLock(lockOrder[0], msg.ual, promoteUnderLocks);
+              }
+              return withMaterializationLock(lockOrder[0], msg.ual, () =>
+                withMaterializationLock(lockOrder[1], msg.ual, promoteUnderLocks),
+              );
+            };
+            const outcome = await runUnderLocks();
+            if (outcome === 'stale-target') {
+              this.markProcessed(dedupeKey);
+              this.log.info(ctx, `Finalization: a newer update is already materialised for ${msg.ual}, skipping stale publish promotion`);
+              return;
+            }
             this.markProcessed(dedupeKey);
             this.log.info(ctx, `Finalization: promoted SWM snapshot to ${ctxGraphId ? `context graph ${ctxGraphId}` : 'canonical'} for ${msg.ual} (tx=${msg.txHash.slice(0, 10)}…)`);
             return;
@@ -345,7 +403,7 @@ export class FinalizationHandler {
     ctx: OperationContext,
     ctxGraphId?: string,
     expectedBatchId?: bigint,
-  ): Promise<{ verified: boolean; authorAddress?: string }> {
+  ): Promise<{ verified: boolean; authorAddress?: string; txIndex?: number }> {
     if (!this.chain || this.chain.chainId === 'none') return { verified: false };
     if (blockNumber <= 0) return { verified: false };
 
@@ -364,6 +422,11 @@ export class FinalizationHandler {
       // originator. `address(0)` here is the unattributed-publish sentinel
       // (RFC-001 §3.6) and is correctly preserved.
       let authorAddress: string | undefined;
+      // PR #845 review #9: capture the chain-truth `transactionIndex` from
+      // the matched event so the materialization-version guard does not
+      // have to trust the gossip-supplied `msg.txIndex` (which a peer can
+      // inflate to lock out a legitimate same-block update).
+      let verifiedTxIndex: number | undefined;
       for await (const event of this.chain.listenForEvents(batchFilter)) {
         if (event.blockNumber !== blockNumber) continue;
         if (txHash && (!event.data['txHash'] || (event.data['txHash'] as string).toLowerCase() !== txHash.toLowerCase())) {
@@ -385,6 +448,10 @@ export class FinalizationHandler {
           batchVerified = true;
           const eventAuthor = (event.data['author'] as string) ?? '';
           if (eventAuthor) authorAddress = eventAuthor;
+          const rawTxIdx = event.data['txIndex'];
+          if (typeof rawTxIdx === 'number' && Number.isFinite(rawTxIdx) && rawTxIdx >= 0) {
+            verifiedTxIndex = rawTxIdx;
+          }
           break;
         }
       }
@@ -397,7 +464,7 @@ export class FinalizationHandler {
       // above is sufficient for V10.
       if (ctxGraphId) {
         if (typeof this.chain.isV10Ready === 'function' && this.chain.isV10Ready()) {
-          return { verified: true, authorAddress };
+          return { verified: true, authorAddress, txIndex: verifiedTxIndex };
         }
         try {
           const scanWindow = 256;
@@ -413,16 +480,16 @@ export class FinalizationHandler {
             const eventCGId = String(event.data['contextGraphId'] ?? '');
             const eventBatchId = BigInt(event.data['batchId'] as string ?? '0');
             if (eventCGId === ctxGraphId && (expectedBatchId === undefined || eventBatchId === expectedBatchId)) {
-              return { verified: true, authorAddress };
+              return { verified: true, authorAddress, txIndex: verifiedTxIndex };
             }
           }
           return { verified: false };
         } catch {
-          return { verified: true, authorAddress };
+          return { verified: true, authorAddress, txIndex: verifiedTxIndex };
         }
       }
 
-      return { verified: true, authorAddress };
+      return { verified: true, authorAddress, txIndex: verifiedTxIndex };
     } catch (err) {
       this.log.info(ctx, `Finalization on-chain verification pending (RPC may be lagging): ${err instanceof Error ? err.message : String(err)}`);
     }

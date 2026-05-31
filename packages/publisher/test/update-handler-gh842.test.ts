@@ -121,6 +121,70 @@ describe('UpdateHandler — GH #842 deterministic-UAL fallback (gossip receiver)
     );
     expect(verRes.type === 'bindings' && String(verRes.bindings[0]?.['v'])).toContain(`${BLOCK}:${TX_INDEX}`);
   });
+
+  // PR #845 review bug #6 (@branarakic): a transient ontology/store error
+  // in `resolveOnChainCgId` (the on-chain CG lookup) was escaping the
+  // gossip apply path and aborting the entire update before the label
+  // graph could be restated. The fix wraps that single lookup in try/catch
+  // (matching the agent-side guard) so per-cgId promotion is best-effort
+  // and the verified label-graph restatement still happens.
+  it('still restates the label graph when resolveOnChainCgId throws', async () => {
+    const updateTriples = [
+      q('urn:upd:r2', 'urn:p:type', 'urn:UpdateAction'),
+      q('urn:upd:r2', 'urn:p:name', '"received-2"'),
+    ];
+    const labelGraph = contextGraphDataUri(CG_NAME);
+    const computedRoot = computeFlatKCRoot(
+      updateTriples.map((t) => ({ ...t, graph: labelGraph })),
+      [],
+    );
+
+    const chain = makeMockChain(computedRoot);
+    let resolverCalls = 0;
+    const handler = new UpdateHandler(store, chain, new TypedEventBus(), {
+      resolveOnChainCgId: async () => {
+        resolverCalls++;
+        throw new Error('simulated transient ontology/store error');
+      },
+    });
+
+    const msg = encodeKAUpdateRequest({
+      contextGraphId: CG_NAME,
+      batchId: BATCH_ID,
+      nquads: quadsToNQuads(updateTriples, labelGraph),
+      manifest: [{ rootEntity: 'urn:upd:r2', privateTripleCount: 0 }],
+      publisherPeerId: '12D3KooWReceiverTest',
+      publisherAddress: '0xPublisher',
+      txHash: '0xabc2',
+      blockNumber: BigInt(BLOCK),
+      newMerkleRoot: computedRoot,
+      timestampMs: BigInt(Date.now()),
+    });
+
+    await handler.handle(msg, '12D3KooWPeer');
+
+    expect(resolverCalls).toBe(1);
+
+    // Label data graph received the verified update.
+    const labelDataCount = await store.query(
+      `SELECT (COUNT(*) AS ?c) WHERE { GRAPH <${labelGraph}> { <urn:upd:r2> ?p ?o } }`,
+    );
+    const labelCount = labelDataCount.type === 'bindings'
+      ? Number(String(labelDataCount.bindings[0]['c']).match(/\d+/)?.[0] ?? 0)
+      : 0;
+    expect(labelCount).toBe(updateTriples.length);
+
+    // Per-cgId partition was skipped (resolver failed) — no leak into a
+    // partition we couldn't address.
+    const perCgIdMeta = contextGraphMetaUri(CG_NAME, CG_ON_CHAIN_ID);
+    const perCgIdRes = await store.query(
+      `SELECT (COUNT(*) AS ?c) WHERE { GRAPH <${perCgIdMeta}> { ?s ?p ?o } }`,
+    );
+    const perCgIdCount = perCgIdRes.type === 'bindings'
+      ? Number(String(perCgIdRes.bindings[0]['c']).match(/\d+/)?.[0] ?? 0)
+      : 0;
+    expect(perCgIdCount).toBe(0);
+  });
 });
 
 // GH #842 / PR #845 round 2 — Codex flagged that the publisher's update

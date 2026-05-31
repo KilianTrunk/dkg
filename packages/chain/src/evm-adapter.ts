@@ -1847,6 +1847,8 @@ export class EVMChainAdapter implements ChainAdapter {
                 startKAId: parsed.args.startKAId.toString(),
                 endKAId: parsed.args.endKAId.toString(),
                 txHash: log.transactionHash,
+                // PR #845 (review #9): chain-truth tiebreaker — see KCCreated.
+                txIndex: log.transactionIndex,
               },
             };
           }
@@ -1968,6 +1970,13 @@ export class EVMChainAdapter implements ChainAdapter {
                   merkleRootBytes: parsed.args.merkleRoot,
                   byteSize: parsed.args.byteSize.toString(),
                   txHash: log.transactionHash,
+                  // PR #845 (review #9): chain-truth tiebreaker for the
+                  // last-writer-wins materialization guard. The receiver's
+                  // finalization handler must derive its version from the
+                  // verified receipt, NOT a gossip-supplied `msg.txIndex`,
+                  // because the latter is trust-based and can be inflated
+                  // to lock out a legitimate same-block update.
+                  txIndex: log.transactionIndex,
                   // Greenfield: no batch mint → publisher is the KA owner
                   // (Transfer recipient), falling back to the attested author.
                   publisherAddress: mint?.publisherAddress ?? ownerByTokenId.get(idStr) ?? author,

@@ -17,15 +17,17 @@ describe('buildLifecycleEventsQuery — SPARQL shape', () => {
   // feed source.
   it('SELECTs the lifecycle binding set keyed by event + assertion + agent + ts + entityCount', () => {
     const q = buildLifecycleEventsQuery('cg-1');
-    // PR #694 review fix — the projection swapped `?subGraph` for
-    // `?assertionGraph` since the lifecycle writers don't emit
-    // `dkg:subGraphName`; the slug is derived client-side from the
-    // assertion-graph URI shape.
-    expect(q).toContain('SELECT ?event ?type ?assertion ?name ?agent ?ts ?assertionGraph');
+    // PR #771 (Task #18) — project `dkg:subGraphName` directly from
+    // the assertion subject (post-#770 canonical predicate).
+    // PR #839 sweep 1 — ALSO project `dkg:assertionGraph` so the
+    // reader can fall back to URI parsing for pre-#770 scoped
+    // lifecycle events that exist in users' local `_meta` graphs.
+    // Both OPTIONAL; literal preferred by the reader, URI parse as
+    // legacy fallback.
+    expect(q).toContain('SELECT ?event ?type ?assertion ?name ?agent ?ts ?subGraphName ?assertionGraph');
     expect(q).toContain('(COUNT(?root) AS ?entityCount)');
+    expect(q).toContain('OPTIONAL { ?assertion dkg:subGraphName ?subGraphName }');
     expect(q).toContain('OPTIONAL { ?assertion dkg:assertionGraph ?assertionGraph }');
-    // Guard: the dead `dkg:subGraphName` OPTIONAL must not regress.
-    expect(q).not.toContain('dkg:subGraphName');
   });
 
   it('COALESCEs created→`prov:generated` and promoted→`prov:used` (with a single outer type filter)', () => {
@@ -54,7 +56,7 @@ describe('buildLifecycleEventsQuery — SPARQL shape', () => {
 
   it('groups by all non-aggregated bindings and orders by ?ts DESC with LIMIT 5000', () => {
     const q = buildLifecycleEventsQuery('cg-1');
-    expect(q).toContain('GROUP BY ?event ?type ?assertion ?name ?agent ?ts ?assertionGraph');
+    expect(q).toContain('GROUP BY ?event ?type ?assertion ?name ?agent ?ts ?subGraphName ?assertionGraph');
     expect(q).toContain('ORDER BY DESC(?ts)');
     expect(q).toContain('LIMIT 5000');
   });
@@ -104,6 +106,13 @@ describe('useAssertionLifecycleEvents — bindings parse', () => {
     name: string;
     agent: string;
     ts: string;
+    // PR #771 (Task #18) — `subGraphName` is the post-#770 string
+    // literal binding the hook prefers.
+    subGraphName?: string;
+    // PR #839 sweep 1 — `assertionGraph` is the pre-#770 URI binding
+    // the hook falls back to when `subGraphName` is absent. Tests
+    // can populate both (post-#770 row), only assertionGraph (pre-
+    // #770 legacy row), or neither (root-bucket / sparse-meta row).
     assertionGraph?: string;
     entityCount?: number;
   }) {
@@ -117,6 +126,7 @@ describe('useAssertionLifecycleEvents — bindings parse', () => {
       name: `"${opts.name}"`,
       agent: `"${opts.agent}"`,
       ts: `"${opts.ts}"`,
+      subGraphName: opts.subGraphName ? `"${opts.subGraphName}"` : undefined,
       assertionGraph: opts.assertionGraph ? `"${opts.assertionGraph}"` : undefined,
       entityCount: opts.entityCount !== undefined
         ? `"${opts.entityCount}"^^<http://www.w3.org/2001/XMLSchema#integer>`
@@ -192,13 +202,17 @@ describe('useAssertionLifecycleEvents — bindings parse', () => {
     expect(promoted?.entityCount).toBe(12);
   });
 
-  // PR #694 review fix — the sub-graph slug is derived from
-  // `dkg:assertionGraph` (the URI shape mirrors
-  // `contextGraphAssertionUri`), not the never-emitted
-  // `dkg:subGraphName`. A sub-graph-scoped assertion URI carries
-  // the slug as its first path segment after the cgId; a
-  // root-bucket assertion has `assertion/` directly.
-  it('derives `subGraph` from `dkg:assertionGraph` for sub-graph-scoped assertions', async () => {
+  // PR #839 sweep 1 — `subGraph` derivation across the historical
+  // shapes the daemon ships. The hook prefers `dkg:subGraphName`
+  // (post-#770 canonical predicate) and falls back to URI parsing
+  // `dkg:assertionGraph` (pre-#770 legacy migration-safety) so
+  // scoped lifecycle events created before PR #770 still surface
+  // their sub-graph chip on the activity feed.
+
+  // Test 1 — Pre-#770 SCOPED assertion: only `assertionGraph` is
+  // present. URI parse recovers the slug. This is the load-bearing
+  // migration-safety property the Codex sweep 1 fix protects.
+  it('falls back to URI parsing for pre-#770 scoped assertions missing `dkg:subGraphName`', async () => {
     let latest: AssertionLifecycleEventsResult | null = null;
     function Probe({ id }: { id: string }) {
       latest = useAssertionLifecycleEvents(id);
@@ -210,23 +224,107 @@ describe('useAssertionLifecycleEvents — bindings parse', () => {
     await flush();
     pending.get('cg-A')!.resolve([
       row({
-        event: 'urn:evt:c-1', kind: 'created',
-        assertion: 'urn:assert:scoped', name: 'scoped-doc',
+        event: 'urn:evt:legacy-scoped', kind: 'created',
+        assertion: 'urn:assert:legacy-scoped', name: 'scoped-doc',
         agent: 'did:dkg:agent:alice', ts: '2026-05-20T10:00:00Z',
+        // Pre-#770 writer emitted `dkg:assertionGraph` but never
+        // `dkg:subGraphName`. The URI shape mirrors
+        // `contextGraphAssertionUri` — sub-graph slug as first
+        // path segment after the cgId.
         assertionGraph: 'did:dkg:context-graph:cg-A/research/assertion/0xabc/scoped-doc',
       }),
+    ]);
+    await flush();
+    const evt = latest!.events.find(e => e.assertionUri === 'urn:assert:legacy-scoped');
+    expect(evt?.subGraph).toBe('research');
+  });
+
+  // Test 2 — Pre-#770 ROOT-bucket assertion: only `assertionGraph`
+  // is present, URI has no sub-graph segment. URI parser returns
+  // undefined (correctly; no slug). Row admits chip-less.
+  it('treats pre-#770 root-bucket assertions as chip-less (URI parser returns undefined)', async () => {
+    let latest: AssertionLifecycleEventsResult | null = null;
+    function Probe({ id }: { id: string }) {
+      latest = useAssertionLifecycleEvents(id);
+      return null;
+    }
+    await act(async () => {
+      root.render(React.createElement(Probe, { id: 'cg-A' }));
+    });
+    await flush();
+    pending.get('cg-A')!.resolve([
       row({
-        event: 'urn:evt:c-2', kind: 'created',
-        assertion: 'urn:assert:root', name: 'root-doc',
-        agent: 'did:dkg:agent:alice', ts: '2026-05-20T11:00:00Z',
+        event: 'urn:evt:legacy-root', kind: 'created',
+        assertion: 'urn:assert:legacy-root', name: 'root-doc',
+        agent: 'did:dkg:agent:alice', ts: '2026-05-20T10:00:00Z',
+        // Pre-#770 root-bucket URI: no slug segment between cgId
+        // and `assertion/`. Parser returns undefined.
         assertionGraph: 'did:dkg:context-graph:cg-A/assertion/0xabc/root-doc',
       }),
     ]);
     await flush();
-    const scoped = latest!.events.find(e => e.assertionUri === 'urn:assert:scoped');
-    const rootBucket = latest!.events.find(e => e.assertionUri === 'urn:assert:root');
-    expect(scoped?.subGraph).toBe('research');
-    expect(rootBucket?.subGraph).toBeUndefined();
+    const evt = latest!.events.find(e => e.assertionUri === 'urn:assert:legacy-root');
+    expect(evt?.subGraph).toBeUndefined();
+    // Row admits, just chip-less — same shape as a sparse-meta row.
+    expect(evt?.assertionName).toBe('root-doc');
+  });
+
+  // Test 3 — Post-#770 scoped assertion: BOTH predicates present.
+  // Literal preferred — URI parser not consulted on this path.
+  it('reads `subGraph` directly from `dkg:subGraphName` when present (post-#770 canonical predicate)', async () => {
+    let latest: AssertionLifecycleEventsResult | null = null;
+    function Probe({ id }: { id: string }) {
+      latest = useAssertionLifecycleEvents(id);
+      return null;
+    }
+    await act(async () => {
+      root.render(React.createElement(Probe, { id: 'cg-A' }));
+    });
+    await flush();
+    pending.get('cg-A')!.resolve([
+      row({
+        event: 'urn:evt:current-scoped', kind: 'created',
+        assertion: 'urn:assert:current-scoped', name: 'scoped-doc',
+        agent: 'did:dkg:agent:alice', ts: '2026-05-20T10:00:00Z',
+        subGraphName: 'research',
+        assertionGraph: 'did:dkg:context-graph:cg-A/research/assertion/0xabc/scoped-doc',
+      }),
+    ]);
+    await flush();
+    const evt = latest!.events.find(e => e.assertionUri === 'urn:assert:current-scoped');
+    expect(evt?.subGraph).toBe('research');
+  });
+
+  // Test 4 — Defensive preference order: when BOTH bindings are
+  // present and the URI's parsed slug disagrees with the literal,
+  // the literal wins. Confirms the preference order isn't
+  // accidentally reversed (URI parse must NOT clobber the canonical
+  // predicate).
+  it('prefers `dkg:subGraphName` over a conflicting URI segment (defensive precedence lock)', async () => {
+    let latest: AssertionLifecycleEventsResult | null = null;
+    function Probe({ id }: { id: string }) {
+      latest = useAssertionLifecycleEvents(id);
+      return null;
+    }
+    await act(async () => {
+      root.render(React.createElement(Probe, { id: 'cg-A' }));
+    });
+    await flush();
+    pending.get('cg-A')!.resolve([
+      row({
+        event: 'urn:evt:conflict', kind: 'created',
+        assertion: 'urn:assert:conflict', name: 'conflict-doc',
+        agent: 'did:dkg:agent:alice', ts: '2026-05-20T10:00:00Z',
+        // Literal says `bar`; URI segment says `foo`. Hook MUST
+        // pick `bar` — the canonical predicate is authoritative,
+        // URI parser is a legacy fallback only.
+        subGraphName: 'bar',
+        assertionGraph: 'did:dkg:context-graph:cg-A/foo/assertion/0xabc/conflict-doc',
+      }),
+    ]);
+    await flush();
+    const evt = latest!.events.find(e => e.assertionUri === 'urn:assert:conflict');
+    expect(evt?.subGraph).toBe('bar');
   });
 
   // PR #694 review fix — on fetch failure, `resultContextGraphId`

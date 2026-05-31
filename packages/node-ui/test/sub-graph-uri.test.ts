@@ -2,12 +2,11 @@ import { describe, expect, it } from 'vitest';
 import { subGraphFromAssertionGraphUri } from '../src/ui/lib/sub-graph-uri.js';
 
 // Mirror of `contextGraphAssertionUri` in `packages/core/src/constants.ts`.
-// The writer's URI shape is the authoritative source for the slug; the
-// lifecycle metadata never emits `dkg:subGraphName` directly. PR #710 —
-// helper relocated from `useAssertionLifecycleEvents.ts` into `lib/` so
-// `api.ts` and the lifecycle hook can both consume it without forming
-// a module cycle.
-describe('subGraphFromAssertionGraphUri — slug parse', () => {
+// PR #839 sweep 1 — restored as a migration fallback for pre-#770
+// scoped lifecycle events that carry `dkg:assertionGraph` but not the
+// `dkg:subGraphName` predicate added by PR #770. The hook prefers the
+// new predicate when present and falls back here for legacy rows.
+describe('subGraphFromAssertionGraphUri — slug parse (pre-#770 migration fallback)', () => {
   it('returns the slug for sub-graph-scoped assertions', () => {
     const uri = 'did:dkg:context-graph:cg-1/research/assertion/0xabc/notes';
     expect(subGraphFromAssertionGraphUri(uri, 'cg-1')).toBe('research');

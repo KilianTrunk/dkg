@@ -6,10 +6,24 @@
  *   sub-graph   : `did:dkg:context-graph:<cgId>/<subGraphName>/assertion/<agent>/<name>`
  *
  * Returns the slug when present, `undefined` for root-bucket
- * assertions or any URI that doesn't match the expected shape (the
- * latter shouldn't happen in practice — `dkg:assertionGraph` is set
- * by the writer — but the parse stays defensive so a malformed URI
- * just suppresses the sub-graph filter rather than throwing).
+ * assertions or any URI that doesn't match the expected shape.
+ *
+ * PR #839 sweep 1 — kept ALIVE as a migration fallback for pre-#770
+ * scoped lifecycle events still in users' local `_meta` graphs. The
+ * publisher writers (`packages/publisher/src/metadata.ts`) never
+ * rewrite historical events, so any user who created scoped
+ * lifecycle events before PR #770 shipped has rows that carry
+ * `dkg:assertionGraph` but NO `dkg:subGraphName`. The lifecycle hook
+ * prefers the literal predicate when present and falls back to URI
+ * parsing here for those legacy rows. Without this fallback,
+ * pre-#770 scoped events would render as root-bucket activity and
+ * sub-graph filtering on the activity feed would break for the
+ * migration window.
+ *
+ * Track removal in a future migration cycle — once GH #819's render-
+ * correct derivation lands AND users have re-synced their local
+ * stores, the URI-parse path becomes dead and this helper can be
+ * deleted.
  *
  * Lives in `lib/` so both the transport layer (`api.ts`) and the
  * lifecycle hook can import it without creating a module cycle —

@@ -238,9 +238,6 @@ function processSharedMemory(wsDataQuads: Quad[], wsMetaQuads: Quad[]): SharedMe
   // BOTH `rdf:type WorkspaceOperation` AND `dkg:publishedAt` in the
   // SAME meta graph to count.
   const validOpsByMeta = new Map<string, Set<string>>();
-  // Also keep a flat union for callers (entityCreators emission below)
-  // that don't need graph-scoping — the per-entity creator mapping is
-  // first-write-wins across graphs by design.
   const validOps = new Set<string>();
   for (const [metaGraph, typedOps] of opsWithTypeByMeta) {
     const publishedOps = opsWithPublishedAtByMeta.get(metaGraph);
@@ -307,13 +304,17 @@ function processSharedMemory(wsDataQuads: Quad[], wsMetaQuads: Quad[]): SharedMe
     if (peer) opCreators.set(op, peer);
   }
 
-  const entityCreators = new Map<string, string>();
+  const entityCreators = new Map<string, { dataGraph: string; entity: string; creator: string }>();
   for (const q of wsMetaQuads) {
-    if (q.predicate === DKG_ROOT_ENTITY && validOps.has(q.subject)) {
+    const validForGraph = validOpsByMeta.get(q.graph);
+    if (q.predicate === DKG_ROOT_ENTITY && validForGraph?.has(q.subject)) {
+      if (!q.graph.endsWith(META_SUFFIX)) continue;
+      const dataGraph = q.graph.slice(0, -META_SUFFIX.length);
       const entity = q.object.startsWith('"') ? stripLiteral(q.object) : q.object;
       const creator = opCreators.get(q.subject);
-      if (creator && !entityCreators.has(entity)) {
-        entityCreators.set(entity, creator);
+      const key = `${dataGraph}\0${entity}`;
+      if (creator && !entityCreators.has(key)) {
+        entityCreators.set(key, { dataGraph, entity, creator });
       }
     }
   }
@@ -321,7 +322,7 @@ function processSharedMemory(wsDataQuads: Quad[], wsMetaQuads: Quad[]): SharedMe
   return {
     validQuads,
     dropped: wsDataQuads.length - validQuads.length,
-    entityCreators: [...entityCreators.entries()],
+    entityCreators: [...entityCreators.values()],
   };
 }
 

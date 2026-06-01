@@ -117,10 +117,15 @@ export function registerSyncHandler(params: RegisterSyncHandlerParams): void {
       // and the auto-register in
       // `FinalizationHandler.ensureContextGraphAndSubGraph`,
       // finalization-handler.ts:540). Admit only the root SWM and the
-      // SWM of registered sub-graphs of THIS CG; nested CGs that share
-      // a URI prefix have their registration in their own
-      // `<nestedPrefix>/_meta`, not the parent CG's, so they are
-      // naturally excluded.
+      // SWM of registered sub-graphs of THIS CG.
+      //
+      // Codex review round 5: a parent sub-graph and a known child CG can
+      // still collide on the exact same graph URI:
+      //   parent sub-graph "code" => <parent>/code/_shared_memory
+      //   child CG "parent/code"  => <parent>/code/_shared_memory
+      // Match dkg-query-engine's scoped allowlist and reject registered
+      // sub-graph candidates whose `<cgPrefix>/<name>` is also known as a
+      // child context graph via its own `_meta` graph.
       const cgPrefix = `did:dkg:context-graph:${contextGraphId}`;
       const cgMetaGraph = `${cgPrefix}/_meta`;
       const rootSwm = `${cgPrefix}/_shared_memory`;
@@ -138,6 +143,17 @@ export function registerSyncHandler(params: RegisterSyncHandlerParams): void {
             ?sg <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://dkg.io/ontology/SubGraph> .
             ?sg <http://schema.org/name> ?subGraphName .
             FILTER(STR(?g) = CONCAT("${cgPrefix}/", STR(?subGraphName), "${suffix}"))
+          }
+          FILTER NOT EXISTS {
+            GRAPH ?childMetaGraph {
+              {
+                ?childContextGraph <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://dkg.network/ontology#ContextGraph> .
+              } UNION {
+                ?childContextGraph <https://dkg.network/ontology#registrationStatus> ?childStatus .
+              }
+            }
+            FILTER(STR(?childContextGraph) = CONCAT("${cgPrefix}/", STR(?subGraphName)))
+            FILTER(STR(?childMetaGraph) = CONCAT(STR(?childContextGraph), "/_meta"))
           }
         }`;
       };

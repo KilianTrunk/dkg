@@ -360,6 +360,7 @@ describe('sync responder workspace branch — sub-graph SWM coverage', () => {
   describe('CG boundary tightening — nested CGs sharing a prefix do not leak (#885 Codex)', () => {
     const NESTED_CG_ID = `${CG_ID}/child`;
     const NESTED_PREFIX = `did:dkg:context-graph:${NESTED_CG_ID}`;
+    const NESTED_META = `${NESTED_PREFIX}/_meta`;
     const NESTED_ROOT_SWM = `${NESTED_PREFIX}/_shared_memory`;
     const NESTED_ROOT_SWM_META = `${NESTED_PREFIX}/_shared_memory_meta`;
     const NESTED_SUB_SWM = `${NESTED_PREFIX}/extra/_shared_memory`;
@@ -437,6 +438,69 @@ describe('sync responder workspace branch — sub-graph SWM coverage', () => {
       expect(graphs.has(ROOT_SWM_META)).toBe(true);
       expect(graphs.has(NESTED_ROOT_SWM_META)).toBe(false);
       expect(graphs.has(NESTED_SUB_SWM_META)).toBe(false);
+    });
+
+    it('rejects a parent sub-graph candidate when the same URI is a known child CG', async () => {
+      const storeCollision = new OxigraphStore();
+      const capCollision = captureHandler();
+      const NOW_ISO = '2026-06-01T00:00:00.000Z';
+
+      await storeCollision.insert([
+        { graph: ROOT_SWM, subject: ROOT_ENTITY, predicate: 'http://schema.org/n', object: '"keep-me-root"' },
+        ...workspaceOpQuads(SHARE_OP_ROOT, ROOT_ENTITY, ROOT_SWM_META, NOW_ISO),
+
+        // Parent CG registers a sub-graph named "child". That makes the
+        // graph URI below look valid as parent sub-graph SWM.
+        ...subGraphRegistrationQuads(CG_ID, 'child'),
+
+        // The same URI is also the root SWM graph for a known child CG
+        // `${CG_ID}/child`. The responder must reject this ambiguous
+        // partition during a sync of the parent CG, matching
+        // dkg-query-engine's known-child-CG exclusion.
+        { graph: NESTED_META, subject: NESTED_PREFIX, predicate: RDF_TYPE, object: 'https://dkg.network/ontology#ContextGraph' },
+        { graph: NESTED_ROOT_SWM, subject: 'urn:nested:root', predicate: 'http://schema.org/n', object: '"NESTED-COLLISION-LEAK"' },
+        { graph: NESTED_ROOT_SWM_META, subject: 'urn:dkg:share:nested-root-op', predicate: RDF_TYPE, object: `${DKG_NS}WorkspaceOperation` },
+        { graph: NESTED_ROOT_SWM_META, subject: 'urn:dkg:share:nested-root-op', predicate: `${DKG_NS}publishedAt`, object: `"${NOW_ISO}"^^<http://www.w3.org/2001/XMLSchema#dateTime>` },
+        { graph: NESTED_ROOT_SWM_META, subject: 'urn:dkg:share:nested-root-op', predicate: `${DKG_NS}rootEntity`, object: 'urn:nested:root' },
+      ]);
+
+      registerSyncHandler({
+        register: capCollision.register,
+        protocolSync: '/origintrail/dkg/sync/1.0.0',
+        syncDeniedResponse: 'sync-denied',
+        syncPageSize: 5000,
+        sharedMemoryTtlMs: 0,
+        store: storeCollision,
+        peerId: 'self-peer',
+        parseSyncRequest: (data) => JSON.parse(new TextDecoder().decode(data)) as SyncRequestEnvelope,
+        authorizeSyncRequest: async () => true,
+        logWarn: noopLog,
+        logDebug: noopLog,
+      });
+
+      const dataOut = await capCollision.invoke({
+        contextGraphId: CG_ID,
+        offset: 0,
+        limit: 5000,
+        includeSharedMemory: true,
+        phase: 'data',
+      });
+      const dataGraphs = lineGraphsFromNquads(dataOut);
+      expect(dataGraphs.has(ROOT_SWM)).toBe(true);
+      expect(dataGraphs.has(NESTED_ROOT_SWM)).toBe(false);
+      expect(dataOut).toContain('"keep-me-root"');
+      expect(dataOut).not.toContain('"NESTED-COLLISION-LEAK"');
+
+      const metaOut = await capCollision.invoke({
+        contextGraphId: CG_ID,
+        offset: 0,
+        limit: 5000,
+        includeSharedMemory: true,
+        phase: 'meta',
+      });
+      const metaGraphs = lineGraphsFromNquads(metaOut);
+      expect(metaGraphs.has(ROOT_SWM_META)).toBe(true);
+      expect(metaGraphs.has(NESTED_ROOT_SWM_META)).toBe(false);
     });
   });
 

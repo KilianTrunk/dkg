@@ -1,7 +1,6 @@
-import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { basename } from 'node:path';
-import { readApiPort, readPid, isProcessRunning, configExists, configYamlPath, loadConfig } from './config.js';
+import { readApiPort, readPid, isProcessRunning, configExists, loadConfig } from './config.js';
 import { loadTokens } from './auth.js';
 
 export type QueryResult =
@@ -80,10 +79,6 @@ function controlPlaneWarning(missingFiles: string[]): string | undefined {
   return `Warning: selected DKG home is missing control-plane file(s): ${missingFiles.join(', ')}. Using configured API port fallback.`;
 }
 
-function statusFallbackConfigExists(): boolean {
-  return configExists() || existsSync(configYamlPath());
-}
-
 function isConnectionFailure(err: unknown): boolean {
   if (!err || typeof err !== 'object') return false;
   if ('httpStatus' in err) return false;
@@ -149,7 +144,7 @@ export class ApiClient {
 
     if (!port) {
       const pid = await readPid();
-      if (opts.allowConfigFallback && !hasEnvPort && statusFallbackConfigExists()) {
+      if (opts.allowConfigFallback && !hasEnvPort && configExists()) {
         const config = await loadConfig();
         const configuredPort = Number.isFinite(config.apiPort) && config.apiPort > 0 ? config.apiPort : null;
         if (configuredPort) {

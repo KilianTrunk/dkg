@@ -2,6 +2,7 @@ import { readFile, writeFile, mkdir, symlink, rename, unlink, readlink } from 'n
 import { join, dirname, basename } from 'node:path';
 import { existsSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import yaml from 'js-yaml';
 import {
   blueGreenSlotEntryPoint,
   blueGreenSlotReady,
@@ -1093,6 +1094,10 @@ export function configPath(): string {
   return join(dkgDir(), 'config.json');
 }
 
+export function configYamlPath(): string {
+  return join(dkgDir(), 'config.yaml');
+}
+
 export function pidPath(): string {
   return join(dkgDir(), 'daemon.pid');
 }
@@ -1109,13 +1114,23 @@ export async function ensureDkgDir(): Promise<void> {
   await mkdir(dkgDir(), { recursive: true });
 }
 
+function mergePersistedConfig(raw: unknown): DkgConfig {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { ...DEFAULT_CONFIG };
+  return { ...DEFAULT_CONFIG, ...(raw as Partial<DkgConfig>) };
+}
+
 export async function loadConfig(): Promise<DkgConfig> {
   try {
     const raw = await readFile(configPath(), 'utf-8');
-    return { ...DEFAULT_CONFIG, ...JSON.parse(raw) };
-  } catch {
-    return { ...DEFAULT_CONFIG };
-  }
+    return mergePersistedConfig(JSON.parse(raw));
+  } catch { /* try YAML fallback */ }
+
+  try {
+    const raw = await readFile(configYamlPath(), 'utf-8');
+    return mergePersistedConfig(yaml.load(raw));
+  } catch { /* fall through to defaults */ }
+
+  return { ...DEFAULT_CONFIG };
 }
 
 // =====================================================================
@@ -1235,7 +1250,7 @@ export async function saveConfig(config: DkgConfig): Promise<void> {
 }
 
 export function configExists(): boolean {
-  return existsSync(configPath());
+  return existsSync(configPath()) || existsSync(configYamlPath());
 }
 
 export async function readPid(): Promise<number | null> {

@@ -188,7 +188,7 @@ The headline new feature in rc.12, and the reason for the rename: a unified, sim
 - **One KA per publish** — `publish` mints exactly one ERC-721 `DKGKnowledgeAssets` token. `knowledgeAssetsAmount == 1` is now the only valid value. ERC-1155 batching is gone.
 - **Stable UAL** — `did:dkg:{chainId}/{DKGKnowledgeAssetsAddress}/{kaId}`. `kaId` equals the ERC-721 `tokenId`. The UAL no longer changes when the KA is updated.
 - **ERC-721 minted to author at publish** — the author (recovered from EIP-712 author attestation) holds the NFT; the publisher pays TRAC.
-- **Owner-sealed updates** — only the current ERC-721 holder can update. The owner signs an EIP-712 `UpdateAuthorAttestation(kaId, newMerkleRoot, authorAddress, schemeVersion)` (domain `KnowledgeAssetsLifecycle` v2.0.0) **once**, then passes it as `precomputedUpdateAttestation` on the first `publisher.update()` call. The publisher (which can be any node operator) does the chain write; the attestation is the seal that the chain validates against `ownerOf(kaId)`.
+- **Owner-sealed updates** — only the current ERC-721 holder can update. Every update needs a fresh EIP-712 `UpdateAuthorAttestation(kaId, newMerkleRoot, authorAddress, schemeVersion)` (domain `KnowledgeAssetsLifecycle` v2.0.0), passed as `precomputedUpdateAttestation` on that same `publisher.update(kaId, options)` call. The `newMerkleRoot` is recomputed from the update's `quads` / `privateQuads`, so seals are not reusable across later updates. The publisher (which can be any node operator) does the chain write; the attestation is the seal that the chain validates against `ownerOf(kaId)`.
 - **No ERC-1155 mint/burn on update** — updates only refresh the merkle root + leaf count; the ERC-721 stays bound to the same `kaId`.
 
 ### 4.2 Code changes
@@ -209,12 +209,26 @@ const result = await publisher.publish({
 const kaId = result.kaId; // also the ERC-721 tokenId
 const ual = `did:dkg:${chainId}/${dkgKnowledgeAssetsAddress.toLowerCase()}/${kaId}`;
 
-// rc.12: updates require precomputedUpdateAttestation on the first update
-const updateResult = await publisher.update({
+// rc.12: every update requires a fresh precomputedUpdateAttestation
+const updateQuads = [
+  // ... complete replacement public quads for this KA
+];
+const updatePrivateQuads = [
+  // ... optional replacement private quads for this KA
+];
+// Your signing helper must compute expectedNewMerkleRoot over these exact
+// updateQuads/updatePrivateQuads using the publisher's V10 root rules.
+const precomputedUpdateAttestation = await signUpdateAuthorAttestation({
   kaId,
-  newMerkleRoot,
-  precomputedUpdateAttestation: eip712Sig, // signed by ownerOf(kaId)
-  // ...
+  quads: updateQuads,
+  privateQuads: updatePrivateQuads,
+  owner: ownerWallet, // current ERC-721 owner of kaId
+});
+const updateResult = await publisher.update(kaId, {
+  contextGraphId,
+  quads: updateQuads,
+  privateQuads: updatePrivateQuads,
+  precomputedUpdateAttestation, // signed by ownerOf(kaId) for these exact quads
 });
 ```
 

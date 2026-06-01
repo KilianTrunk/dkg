@@ -222,6 +222,13 @@ describe('localAgentIntegrations config round-trip', () => {
     expect(loaded.localAgentIntegrations?.openclaw?.runtime?.status).toBe('ready');
   });
 
+  it('surfaces malformed config.json instead of falling back to stale YAML', async () => {
+    await writeFile(join(tempDir, 'config.json'), '{ not valid json', 'utf8');
+    await writeFile(join(tempDir, 'config.yaml'), 'name: stale-yaml\napiPort: 9317\n', 'utf8');
+
+    await expect(loadConfig()).rejects.toThrow(SyntaxError);
+  });
+
   it('round-trips relayServerCapacity through saveConfig/loadConfig (operator override)', async () => {
     // PR #524 review (branarakic): the README documents
     // `relayServerCapacity` as a `config.json` knob, so the CLI

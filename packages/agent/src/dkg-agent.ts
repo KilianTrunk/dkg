@@ -6281,21 +6281,20 @@ export class DKGAgent {
     const existingDrain = this.pendingSenderKeyDrainByAgent.get(recipientAgentAddress);
     if (existingDrain) {
       await existingDrain;
-      return 0;
+      if (!this.pendingSenderKeyByAgent.has(recipientAgentAddress)) return 0;
+      return this.drainPendingSenderKeyQueueForPeer(input);
     }
     const drain = this.drainPendingSenderKeyQueueForPeerLocked({
       peerId: input.peerId,
       recipientAgentAddress,
       ctx: input.ctx,
-    });
-    this.pendingSenderKeyDrainByAgent.set(recipientAgentAddress, drain);
-    try {
-      return await drain;
-    } finally {
+    }).finally(() => {
       if (this.pendingSenderKeyDrainByAgent.get(recipientAgentAddress) === drain) {
         this.pendingSenderKeyDrainByAgent.delete(recipientAgentAddress);
       }
-    }
+    });
+    this.pendingSenderKeyDrainByAgent.set(recipientAgentAddress, drain);
+    return drain;
   }
 
   private async drainPendingSenderKeyQueueForPeerLocked(input: {
@@ -6401,6 +6400,7 @@ export class DKGAgent {
    * rejections are logged and deleted without counting as drained.
    */
   private async drainPendingSenderKeyForPeer(peerId: string, ctx?: OperationContext): Promise<number> {
+    await this.loadSwmSenderKeyState();
     if (this.pendingSenderKeyByAgent.size === 0) return 0;
     let drained = 0;
     let agentAddresses: string[] = [];

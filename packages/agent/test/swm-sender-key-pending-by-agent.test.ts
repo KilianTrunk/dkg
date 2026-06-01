@@ -839,6 +839,78 @@ describe('createAndDistributeSwmSenderKeyEpoch: missing-peerId soft success', ()
     expect(internals.pendingSenderKeyByAgent.size).toBe(0);
   });
 
+  it('retries a waiting drain with its own peer when the first peer leaves the row queued', async () => {
+    const boot = await bootAgent();
+    agent = boot.agent;
+    const internals = boot.internals;
+
+    installStubMessenger(internals, async () => {
+      throw new Error('initial no-peerId branch must not call sendReliable');
+    });
+    const recipient = makeFakeRecipient();
+    const sender = agentFromPrivateKey(
+      ethers.Wallet.createRandom().privateKey,
+      'sender',
+    ) as AgentKeyRecord & { privateKey: string };
+
+    await internals.createAndDistributeSwmSenderKeyEpoch({
+      contextGraphId: 'test-cg/drain-peer-race',
+      sender,
+      recipients: [recipient],
+      membershipHash: 'sha256:drain-peer-race',
+      ctx: { operationId: 'test-op', operationName: 'share' },
+    });
+    expect(internals.pendingSenderKeyByAgent.size).toBe(1);
+
+    const stalePeerId = '12D3KooWStaleDrainPeer';
+    const freshPeerId = '12D3KooWFreshDrainPeer';
+    installStubDiscovery(internals, (peerId) => {
+      if (peerId !== stalePeerId && peerId !== freshPeerId) return null;
+      return {
+        agentUri: `did:dkg:agent:${recipient.agentAddress.toLowerCase()}`,
+        name: 'drain-peer-race-target',
+        peerId,
+        agentAddress: recipient.agentAddress,
+      };
+    });
+
+    let releaseStalePeer!: () => void;
+    let markStalePeerStarted!: () => void;
+    const stalePeerReleased = new Promise<void>((resolve) => { releaseStalePeer = resolve; });
+    const stalePeerStarted = new Promise<void>((resolve) => { markStalePeerStarted = resolve; });
+    const sendCalls: string[] = [];
+    installStubMessenger(internals, async (peerId, _protocolId, _payload, opts): Promise<ReliableSendResult> => {
+      sendCalls.push(peerId);
+      if (peerId === stalePeerId) {
+        markStalePeerStarted();
+        await stalePeerReleased;
+        return {
+          delivered: false,
+          queued: true,
+          attempts: 1,
+          messageId: opts?.messageId ?? 'm-drain-peer-race',
+          error: 'stale peer did not accept the stream',
+          nextAttemptAtMs: Date.now() + 60_000,
+        };
+      }
+      return {
+        delivered: true,
+        response: senderKeyAck(true),
+        attempts: 1,
+        messageId: opts?.messageId ?? 'm-drain-peer-race',
+      };
+    });
+
+    const staleDrain = internals.drainPendingSenderKeyForPeer(stalePeerId);
+    await stalePeerStarted;
+    const freshDrain = internals.drainPendingSenderKeyForPeer(freshPeerId);
+    releaseStalePeer();
+
+    await expect(Promise.all([staleDrain, freshDrain])).resolves.toEqual([0, 1]);
+    expect(sendCalls).toEqual([stalePeerId, freshPeerId]);
+    expect(internals.pendingSenderKeyByAgent.size).toBe(0);
+  });
+
   it('surfaces non-recoverable pending drain send failures instead of re-queuing silently', async () => {
     const boot = await bootAgent();
     agent = boot.agent;
@@ -883,6 +955,61 @@ describe('createAndDistributeSwmSenderKeyEpoch: missing-peerId soft success', ()
       level: 'warn',
       message: expect.stringContaining('failed before the Messenger substrate queued a retry'),
     }));
+  });
+
+  it('loads persisted pending rows before reconnect drain after restart', async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), 'dkg-swm-sender-pending-reconnect-'));
+    tempDirs.push(dataDir);
+
+    const firstBoot = await bootAgent({ dataDir });
+    agent = firstBoot.agent;
+    const firstInternals = firstBoot.internals;
+    installStubMessenger(firstInternals, async () => {
+      throw new Error('initial no-peerId branch must not call sendReliable');
+    });
+
+    const recipient = makeFakeRecipient();
+    const sender = agentFromPrivateKey(
+      ethers.Wallet.createRandom().privateKey,
+      'sender',
+    ) as AgentKeyRecord & { privateKey: string };
+    await firstInternals.createAndDistributeSwmSenderKeyEpoch({
+      contextGraphId: 'test-cg/persisted-reconnect-drain',
+      sender,
+      recipients: [recipient],
+      membershipHash: 'sha256:persisted-reconnect-drain',
+      ctx: { operationId: 'test-op', operationName: 'share' },
+    });
+    expect(firstInternals.pendingSenderKeyByAgent.size).toBe(1);
+    await firstInternals.saveSwmSenderKeyState();
+    await agent.stop();
+    agent = null;
+
+    const secondBoot = await bootAgent({ dataDir });
+    agent = secondBoot.agent;
+    const secondInternals = secondBoot.internals;
+    const peerId = '12D3KooWPersistedReconnectDrainPeer';
+    installStubDiscovery(secondInternals, () => ({
+      agentUri: `did:dkg:agent:${recipient.agentAddress.toLowerCase()}`,
+      name: 'persisted-reconnect-drain-target',
+      peerId,
+      agentAddress: recipient.agentAddress,
+    }));
+    let sendCalls = 0;
+    installStubMessenger(secondInternals, async (): Promise<ReliableSendResult> => {
+      sendCalls += 1;
+      return {
+        delivered: true,
+        response: senderKeyAck(true),
+        attempts: 1,
+        messageId: 'm-persisted-reconnect-drain',
+      };
+    });
+
+    const drained = await secondInternals.drainPendingSenderKeyForPeer(peerId);
+    expect(drained).toBe(1);
+    expect(sendCalls).toBe(1);
+    expect(secondInternals.pendingSenderKeyByAgent.size).toBe(0);
   });
 
   it('keeps delivered stale-target rejections fatal because the package targets an obsolete key ID', async () => {

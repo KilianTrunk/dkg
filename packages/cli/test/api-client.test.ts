@@ -139,6 +139,22 @@ describe('ApiClient', () => {
       expect(existsSync(join(tempDir, 'daemon.pid'))).toBe(false);
     });
 
+    it('connect() refuses config fallback when selected home has the default node name', async () => {
+      process.env.DKG_HOME = tempDir;
+      delete process.env.DKG_API_PORT;
+      await writeFile(join(tempDir, 'config.json'), JSON.stringify({ name: 'dkg-node', apiPort: 9317 }));
+      await writeFile(join(tempDir, 'auth.token'), 'local-token\n', 'utf8');
+      const body = { name: 'dkg-node', peerId: 'peer1', uptimeMs: 1000, connectedPeers: 2, relayConnected: true, multiaddrs: [] };
+      const { fetch, calls } = createTrackingFetch({ ok: true, status: 200, body });
+      globalThis.fetch = fetch;
+
+      await expect(ApiClient.connect({ allowConfigFallback: true }))
+        .rejects.toThrow('Daemon is not running. Start it with: dkg start');
+      expect(calls).toHaveLength(0);
+      expect(existsSync(join(tempDir, 'api.port'))).toBe(false);
+      expect(existsSync(join(tempDir, 'daemon.pid'))).toBe(false);
+    });
+
     it('connect() rejects selected home config fallback when status belongs to a different node', async () => {
       process.env.DKG_HOME = tempDir;
       delete process.env.DKG_API_PORT;

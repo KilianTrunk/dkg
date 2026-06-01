@@ -2117,6 +2117,13 @@ export class DKGAgent {
               // having to round-trip it. Variadic + internal `seen` Set
               // dedups, so over-passing is cheap and order-independent.
               getSubscriptionSourceForCg: (cgId, swmGraphId) => {
+                // Phase D — this hook fires immediately before EVERY StorageACK
+                // sign (the universal pre-sign chokepoint across the plaintext /
+                // encrypted / chunked paths). Use it to record that this Core
+                // hosts the CG so the chain-driven VM reconciler fills its gaps
+                // across restarts. Best-effort + public-CG-gated inside the
+                // helper; never blocks or affects the (sync) provenance return.
+                void this.recordCoreHostedPublicCg(cgId);
                 const wireFromCgId = cgId ? this.gossipWireIdFor(cgId) : undefined;
                 const wireFromSwmGraphId = swmGraphId && swmGraphId !== cgId
                   ? this.gossipWireIdFor(swmGraphId)
@@ -2388,7 +2395,9 @@ export class DKGAgent {
               const localCgId = this.resolveLocalCgIdByOnChainId(BigInt(onChainId));
               if (!localCgId) return; // chain replay hasn't resolved the cleartext CG yet; sweep heals it
               const sub = this.subscribedContextGraphs.get(localCgId);
-              if (!sub?.subscribed) return; // only populate VM for CGs we actually subscribe to
+              // Populate VM for CGs we member-subscribe to OR (Phase D) public
+              // CGs this Core hosts — a hosted Core fills its own gaps too.
+              if (!sub?.subscribed && !sub?.coreHosted) return;
               this.log.info(ctx, `Phase B: KACG nudge cg=${onChainId} ka=${kaId} -> reconcile "${localCgId}"`);
               if (this.reconcileCoalescer) void this.reconcileCoalescer.trigger(localCgId);
             }
@@ -4187,7 +4196,11 @@ export class DKGAgent {
     const store = this.config.contextGraphSubscriptionStore;
     if (!store) return;
     const sub = this.subscribedContextGraphs.get(contextGraphId);
-    if (!sub?.subscribed) {
+    // Persist member subscriptions AND (Phase D) public CGs this Core hosts —
+    // the host-only record MUST survive restart so a Core that was offline
+    // during a publish remembers it hosts the CG and fills its gap. Drop the
+    // row only when the node neither subscribes to nor hosts the CG.
+    if (!sub?.subscribed && !sub?.coreHosted) {
       void store.delete(contextGraphId).catch((err) => {
         this.log.warn(
           createOperationContext('system'),
@@ -4206,6 +4219,7 @@ export class DKGAgent {
       onChainId: sub.onChainId,
       onChainHash: sub.onChainHash,
       lastReconciledOrdinal: sub.lastReconciledOrdinal,
+      coreHosted: sub.coreHosted,
       syncScoped: (this.config.syncContextGraphs ?? []).includes(contextGraphId),
     }).catch((err) => {
       this.log.warn(
@@ -4293,6 +4307,7 @@ export class DKGAgent {
           onChainId: row.onChainId,
           onChainHash: row.onChainHash,
           lastReconciledOrdinal: row.lastReconciledOrdinal,
+          coreHosted: row.coreHosted,
         }, { persist: false });
       }
       for (const row of rows) {
@@ -12079,6 +12094,70 @@ export class DKGAgent {
     return null;
   }
 
+  /**
+   * Phase D — resolve the on-chain access policy for a numeric CG id, public(0)
+   * / curated(1) / unknown(null). Cache-first (the StorageACK `isCgCurated`
+   * oracle seeds the same cache), single lazy chain read on miss. Never throws.
+   */
+  private async resolveAccessPolicy(numericCgId: bigint): Promise<0 | 1 | null> {
+    const key = numericCgId.toString();
+    const cached = this.onChainAccessPolicyCache.get(key);
+    if (cached === 0 || cached === 1) return cached;
+    const getAccessPolicy = this.chain.getContextGraphAccessPolicy;
+    if (typeof getAccessPolicy !== 'function') return null;
+    try {
+      const policy = await getAccessPolicy.call(this.chain, numericCgId);
+      if (policy === 0 || policy === 1) {
+        this.onChainAccessPolicyCache.set(key, policy);
+        return policy;
+      }
+    } catch { /* unknown — fall through */ }
+    return null;
+  }
+
+  /**
+   * Phase D (Cores fill their own gaps) — invoked from the StorageACK
+   * pre-sign hook. When this Core signs an ACK for a PUBLIC CG it becomes a
+   * storage node for it; mark the CG `coreHosted` (persisted) so the
+   * chain-driven VM reconciler runs for it across restarts even without a
+   * member subscription. A Core that was offline during the *next* publish
+   * then learns the missed KA from chain on restart and pulls it core-first.
+   *
+   * Public-only by design: curated CGs are hosted as opaque ciphertext, which
+   * a Core cannot promote to plaintext VM — their coverage stays on the
+   * host-mode reconciler + LU-11 chunk-backfill path. Best-effort + idempotent.
+   */
+  private async recordCoreHostedPublicCg(cgId: string): Promise<void> {
+    if (!this.vmReconcileEnabled()) return;
+    let numeric: bigint;
+    try {
+      numeric = BigInt(cgId);
+    } catch {
+      return; // non-numeric id can't be reconciled against the chain ordinal list
+    }
+    if (numeric <= 0n) return;
+
+    const policy = await this.resolveAccessPolicy(numeric);
+    if (policy !== 0) return; // curated / unknown — not the public VM-promote path
+
+    const numericStr = numeric.toString();
+    const localCgId = this.resolveLocalCgIdByOnChainId(numeric) ?? numericStr;
+    const existing = this.subscribedContextGraphs.get(localCgId);
+    if (existing?.coreHosted && existing.onChainId === numericStr) return; // already recorded
+
+    const next: ContextGraphSub = existing
+      ? { ...existing, coreHosted: true, onChainId: numericStr }
+      : { subscribed: false, synced: false, onChainId: numericStr, coreHosted: true };
+    this.setContextGraphSubscription(localCgId, next);
+    this.log.info(
+      createOperationContext('system'),
+      `Phase D: marked public cg=${numericStr} as core-hosted (will chain-reconcile to VM across restarts)`,
+    );
+    // Nudge a reconcile now so the first hosted publish lands promptly; the
+    // periodic sweep is the safety net.
+    if (this.reconcileCoalescer) void this.reconcileCoalescer.trigger(localCgId);
+  }
+
   // ===== Phase B — chain-driven VM reconciliation (B.4 agent wiring) =========
 
   /**
@@ -12135,7 +12214,8 @@ export class DKGAgent {
   private async runVmReconcileSweep(): Promise<void> {
     if (!this.vmReconcileEnabled() || !this.reconcileCoalescer) return;
     for (const [localCgId, sub] of this.subscribedContextGraphs) {
-      if (!sub.subscribed || !sub.onChainId) continue;
+      // Member subscriptions AND Phase D core-hosted public CGs get swept.
+      if ((!sub.subscribed && !sub.coreHosted) || !sub.onChainId) continue;
       void this.reconcileCoalescer.trigger(localCgId);
     }
   }
@@ -12148,7 +12228,7 @@ export class DKGAgent {
    */
   private async runVmReconcileForCg(localCgId: string): Promise<void> {
     const sub = this.subscribedContextGraphs.get(localCgId);
-    if (!sub?.subscribed || !sub.onChainId || !this.vmReconcileEnabled()) return;
+    if ((!sub?.subscribed && !sub?.coreHosted) || !sub.onChainId || !this.vmReconcileEnabled()) return;
     const onChainCgId = BigInt(sub.onChainId);
 
     let cursor = this.reconcileCursors.get(localCgId);
@@ -12198,6 +12278,19 @@ export class DKGAgent {
           toWatermark: result.watermark,
           reconciled: result.reconciled,
           pending: result.pending,
+        });
+      }
+      // Phase D — a host-only (non-member) reconcile that actually promoted KAs
+      // is a Core filling its own gap. Distinct telemetry so operators can see
+      // the Core-to-Core fill path working (success-criteria metric).
+      if (result.reconciled > 0 && sub.coreHosted && !sub.subscribed) {
+        this.emitReplication({
+          contextGraphId: localCgId,
+          onChainCgId: sub.onChainId,
+          action: 'core-fill',
+          head: result.head,
+          toWatermark: result.watermark,
+          reconciled: result.reconciled,
         });
       }
     } catch (err) {

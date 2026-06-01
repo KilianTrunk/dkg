@@ -86,7 +86,7 @@ describe('DashboardDB — metric snapshots', () => {
     raw.close();
 
     db = new DashboardDB({ dataDir: dir });
-    expect(db.db.pragma('user_version', { simple: true })).toBe(18);
+    expect(db.db.pragma('user_version', { simple: true })).toBe(19);
 
     const cols = (db.db.prepare('PRAGMA table_info(metric_snapshots)').all() as Array<{ name: string }>)
       .map((c) => c.name);
@@ -142,7 +142,7 @@ describe('DashboardDB — metric snapshots', () => {
     raw.close();
 
     db = new DashboardDB({ dataDir: dir });
-    expect(db.db.pragma('user_version', { simple: true })).toBe(18);
+    expect(db.db.pragma('user_version', { simple: true })).toBe(19);
 
     const newSnapshotCols = (db.db.prepare('PRAGMA table_info(metric_snapshots)').all() as { name: string }[])
       .map(c => c.name);
@@ -545,7 +545,7 @@ describe('DashboardDB — V15 migration: drop FTS5 logs index', () => {
 
     const upgraded = new DashboardDB({ dataDir: upgradeDir });
     try {
-      expect(upgraded.db.pragma('user_version', { simple: true })).toBe(18);
+      expect(upgraded.db.pragma('user_version', { simple: true })).toBe(19);
 
       const ftsTables = upgraded.db.prepare(
         `SELECT name FROM sqlite_master WHERE type IN ('table','view') AND name LIKE 'logs_fts%'`,
@@ -710,7 +710,7 @@ describe('DashboardDB — V17 subscription columns migration (Phase B)', () => {
     raw.close();
 
     db = new DashboardDB({ dataDir: dir });
-    expect(db.db.pragma('user_version', { simple: true })).toBe(18);
+    expect(db.db.pragma('user_version', { simple: true })).toBe(19);
 
     const cols = (db.db.prepare('PRAGMA table_info(context_graph_subscriptions)').all() as Array<{ name: string }>)
       .map((c) => c.name);
@@ -731,7 +731,101 @@ describe('DashboardDB — V17 subscription columns migration (Phase B)', () => {
       .map((c) => c.name);
     expect(cols).toContain('on_chain_hash');
     expect(cols).toContain('last_reconciled_ordinal');
-    expect(db.db.pragma('user_version', { simple: true })).toBe(18);
+    expect(db.db.pragma('user_version', { simple: true })).toBe(19);
+  });
+});
+
+describe('DashboardDB — V19 core_hosted column migration (Phase D)', () => {
+  let db: DashboardDB;
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'dkg-db-v19-test-'));
+    db = new DashboardDB({ dataDir: dir });
+  });
+
+  afterEach(() => {
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('round-trips core_hosted, defaulting to NULL', () => {
+    // Omitted → NULL (member-only / legacy subscription).
+    db.upsertContextGraphSubscription({
+      context_graph_id: 'cg-member',
+      subscribed: 1,
+      synced: 1,
+      sync_scoped: 1,
+      updated_at: 1000,
+    });
+    expect(db.listContextGraphSubscriptions()).toMatchObject([{
+      context_graph_id: 'cg-member',
+      core_hosted: null,
+    }]);
+
+    // A Core that ACKed a public CG records itself as a host (subscribed=0).
+    db.upsertContextGraphSubscription({
+      context_graph_id: '42',
+      subscribed: 0,
+      synced: 0,
+      on_chain_id: '42',
+      core_hosted: 1,
+      sync_scoped: 0,
+      updated_at: 2000,
+    });
+    const rows = db.listContextGraphSubscriptions();
+    expect(rows.find((r) => r.context_graph_id === '42')).toMatchObject({
+      subscribed: 0,
+      on_chain_id: '42',
+      core_hosted: 1,
+    });
+  });
+
+  it('surfaces core_hosted in the cursor inspector join', () => {
+    db.upsertContextGraphSubscription({
+      context_graph_id: '7',
+      subscribed: 0,
+      synced: 0,
+      on_chain_id: '7',
+      core_hosted: 1,
+      last_reconciled_ordinal: 3,
+      sync_scoped: 0,
+      updated_at: 1000,
+    });
+    const cursors = db.getReplicationCursors();
+    expect(cursors.find((c) => c.context_graph_id === '7')).toMatchObject({
+      on_chain_id: '7',
+      last_reconciled_ordinal: 3,
+      core_hosted: 1,
+    });
+  });
+
+  it('adds core_hosted when upgrading a pre-V19 DB, preserving rows', () => {
+    const dbPath = join(dir, 'node-ui.db');
+    db.close();
+
+    const raw = new Database(dbPath);
+    raw.exec('ALTER TABLE context_graph_subscriptions DROP COLUMN core_hosted;');
+    raw.prepare(
+      `INSERT INTO context_graph_subscriptions
+         (context_graph_id, name, subscribed, synced, on_chain_id, sync_scoped, updated_at)
+       VALUES ('cg-pre19', 'Pre19', 1, 1, '0xabc', 1, 1000)`,
+    ).run();
+    raw.pragma('user_version = 18');
+    raw.close();
+
+    db = new DashboardDB({ dataDir: dir });
+    expect(db.db.pragma('user_version', { simple: true })).toBe(19);
+
+    const cols = (db.db.prepare('PRAGMA table_info(context_graph_subscriptions)').all() as Array<{ name: string }>)
+      .map((c) => c.name);
+    expect(cols).toContain('core_hosted');
+
+    expect(db.listContextGraphSubscriptions()).toMatchObject([{
+      context_graph_id: 'cg-pre19',
+      on_chain_id: '0xabc',
+      core_hosted: null,
+    }]);
   });
 });
 
@@ -1089,7 +1183,7 @@ describe('DashboardDB — V11→V13 chat schema migration chain', () => {
     raw.close();
 
     db = new DashboardDB({ dataDir: dir });
-    expect(db.db.pragma('user_version', { simple: true })).toBe(18);
+    expect(db.db.pragma('user_version', { simple: true })).toBe(19);
 
     const cols = (db.db.prepare('PRAGMA table_info(chat_messages)').all() as Array<{ name: string }>)
       .map((c) => c.name);
@@ -1155,7 +1249,7 @@ describe('DashboardDB — V16 notifications.context_graph_id migration (A1)', ()
     raw.close();
 
     db = new DashboardDB({ dataDir: dir });
-    expect(db.db.pragma('user_version', { simple: true })).toBe(18);
+    expect(db.db.pragma('user_version', { simple: true })).toBe(19);
 
     const cols = (db.db.prepare('PRAGMA table_info(notifications)').all() as Array<{ name: string }>)
       .map((c) => c.name);
@@ -1184,7 +1278,7 @@ describe('DashboardDB — V16 notifications.context_graph_id migration (A1)', ()
     const cols = (db.db.prepare('PRAGMA table_info(notifications)').all() as Array<{ name: string }>)
       .map((c) => c.name);
     expect(cols).toContain('context_graph_id');
-    expect(db.db.pragma('user_version', { simple: true })).toBe(18);
+    expect(db.db.pragma('user_version', { simple: true })).toBe(19);
   });
 
   it('insertNotification writes context_graph_id to the column; omitted → NULL', () => {
@@ -1363,7 +1457,7 @@ describe('DashboardDB — replication telemetry (Phase F)', () => {
     raw.pragma('user_version = 17');
     raw.close();
     const upgraded = new DashboardDB({ dataDir: dir });
-    expect(upgraded.db.pragma('user_version', { simple: true })).toBe(18);
+    expect(upgraded.db.pragma('user_version', { simple: true })).toBe(19);
     // insert works → table exists
     upgraded.insertReplicationEvent({ ts: now, context_graph_id: 'cg', action: 'promote' });
     expect(upgraded.getReplicationSummary(60_000).promotes).toBe(1);

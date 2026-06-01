@@ -278,7 +278,7 @@ function ReplicationTab() {
           <div className="empty-state empty-state--compact"><div className="empty-state-title">No subscriptions</div></div>
         ) : (
           <table className="data-table">
-            <thead><tr><th>Context graph</th><th>On-chain id</th><th>Watermark</th><th>Chain head</th><th>Lag</th><th>Last event</th></tr></thead>
+            <thead><tr><th>Context graph</th><th>On-chain id</th><th>Role</th><th>Watermark</th><th>Chain head</th><th>Lag</th><th>Last event</th></tr></thead>
             <tbody>
               {cursors.map((c) => {
                 const wm = c.last_reconciled_ordinal ?? 0;
@@ -288,6 +288,7 @@ function ReplicationTab() {
                   <tr key={c.context_graph_id}>
                     <td className="mono">{c.context_graph_id}</td>
                     <td className="mono">{c.on_chain_id ?? '—'}</td>
+                    <td>{c.core_hosted ? <span className="badge badge-info" title="Core hosts this public CG; fills its own gaps from chain (Phase D)">host</span> : <span className="badge">member</span>}</td>
                     <td>{wm}</td>
                     <td>{head ?? '—'}</td>
                     <td>{lag == null ? '—' : <span className={`badge ${lag === 0 ? 'badge-success' : 'badge-error'}`}>{lag}</span>}</td>

@@ -1165,6 +1165,7 @@ export async function runDaemonInner(
         onChainId: row.on_chain_id ?? undefined,
         onChainHash: row.on_chain_hash ?? undefined,
         lastReconciledOrdinal: row.last_reconciled_ordinal ?? undefined,
+        coreHosted: row.core_hosted == null ? undefined : row.core_hosted === 1,
         syncScoped: row.sync_scoped === 1,
       })),
       save: async (record) => {
@@ -1178,6 +1179,7 @@ export async function runDaemonInner(
           on_chain_id: record.onChainId ?? null,
           on_chain_hash: record.onChainHash ?? null,
           last_reconciled_ordinal: record.lastReconciledOrdinal ?? null,
+          core_hosted: record.coreHosted == null ? null : record.coreHosted ? 1 : 0,
           sync_scoped: record.syncScoped ? 1 : 0,
           updated_at: Date.now(),
         });

@@ -524,6 +524,17 @@ export interface ContextGraphSub {
    * of canonical chain state.
    */
   lastReconciledOrdinal?: number;
+  /**
+   * Phase D (Cores fill their own gaps) — set on a Core when it signs a
+   * StorageACK for a *public* CG, marking the CG as one this node hosts. The
+   * chain-driven VM reconciler (sweep + KACG nudge) runs for hosted CGs even
+   * without a member subscription, so a Core that was offline during a publish
+   * learns about the missed KA from chain on restart and pulls it from another
+   * Core. Persisted (survives restart — the whole point). Only ever set for
+   * public CGs: curated/ciphertext host-mode coverage stays on the host-mode
+   * reconciler + chunk-backfill path (Cores can't promote plaintext to VM).
+   */
+  coreHosted?: boolean;
   /** Participant agent addresses (V10 agent identity model). */
   participantAgents?: string[];
   /**
@@ -556,6 +567,8 @@ export interface ContextGraphSubscriptionRecord {
   onChainHash?: string;
   /** Phase B — persisted per-CG registration-ordinal VM watermark (see ContextGraphSub). */
   lastReconciledOrdinal?: number;
+  /** Phase D — persisted "this Core hosts a public CG" flag (see ContextGraphSub). */
+  coreHosted?: boolean;
   syncScoped: boolean;
 }
 

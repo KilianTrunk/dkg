@@ -9,7 +9,7 @@ import {
   type ProtocolOutboxStore,
 } from '@origintrail-official/dkg-core';
 
-const SCHEMA_VERSION = 18;
+const SCHEMA_VERSION = 19;
 // Default operator retention. Lowered from 90 → 14 days on V15 (2026-05) after
 // a production incident in which the `logs` table + its FTS5 shadow tables
 // grew to ~9 GB on a 12-day-old node and corrupted the SQLite page (header
@@ -697,6 +697,24 @@ export class DashboardDB {
       this.db.exec(`CREATE INDEX IF NOT EXISTS idx_repl_action ON replication_events(action, ts);`);
     }
 
+    if (version < 19) {
+      // Phase D (Cores fill their own gaps): persist `core_hosted` on the
+      // subscription row. Set when a Core signs a StorageACK for a PUBLIC CG,
+      // it marks the CG as one this node hosts so the chain-driven VM
+      // reconciler runs for it across restarts even without a member
+      // subscription. Without persistence a Core that ACKed a CG, went down
+      // during the next publish, and restarted would forget it hosts the CG
+      // and never fill the gap — defeating the phase. Same additive + nullable
+      // PRAGMA-then-ALTER pattern as V17.
+      const cols = new Set(
+        (this.db.prepare('PRAGMA table_info(context_graph_subscriptions)').all() as Array<{ name: string }>)
+          .map((c) => c.name),
+      );
+      if (!cols.has('core_hosted')) {
+        this.db.exec(`ALTER TABLE context_graph_subscriptions ADD COLUMN core_hosted INTEGER;`);
+      }
+    }
+
     this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
     if (upgradedExistingDb && !this.explicitRetentionDays) {
       this.retentionDays = LEGACY_IMPLICIT_RETENTION_DAYS;
@@ -806,16 +824,17 @@ export class DashboardDB {
     on_chain_id?: string | null;
     on_chain_hash?: string | null;
     last_reconciled_ordinal?: number | null;
+    core_hosted?: number | null;
     sync_scoped: number;
     updated_at: number;
   }): void {
     this.stmt('upsertContextGraphSubscription', `
       INSERT INTO context_graph_subscriptions (
         context_graph_id, name, subscribed, synced, shared_memory_synced, meta_synced,
-        on_chain_id, on_chain_hash, last_reconciled_ordinal, sync_scoped, updated_at
+        on_chain_id, on_chain_hash, last_reconciled_ordinal, core_hosted, sync_scoped, updated_at
       ) VALUES (
         @context_graph_id, @name, @subscribed, @synced, @shared_memory_synced, @meta_synced,
-        @on_chain_id, @on_chain_hash, @last_reconciled_ordinal, @sync_scoped, @updated_at
+        @on_chain_id, @on_chain_hash, @last_reconciled_ordinal, @core_hosted, @sync_scoped, @updated_at
       )
       ON CONFLICT(context_graph_id) DO UPDATE SET
         name = excluded.name,
@@ -826,6 +845,7 @@ export class DashboardDB {
         on_chain_id = excluded.on_chain_id,
         on_chain_hash = excluded.on_chain_hash,
         last_reconciled_ordinal = excluded.last_reconciled_ordinal,
+        core_hosted = excluded.core_hosted,
         sync_scoped = excluded.sync_scoped,
         updated_at = excluded.updated_at
     `).run({
@@ -838,6 +858,7 @@ export class DashboardDB {
       on_chain_id: record.on_chain_id ?? null,
       on_chain_hash: record.on_chain_hash ?? null,
       last_reconciled_ordinal: record.last_reconciled_ordinal ?? null,
+      core_hosted: record.core_hosted ?? null,
       sync_scoped: record.sync_scoped,
       updated_at: record.updated_at,
     });
@@ -1006,6 +1027,7 @@ export class DashboardDB {
       SELECT s.context_graph_id            AS context_graph_id,
              s.on_chain_id                 AS on_chain_id,
              s.last_reconciled_ordinal     AS last_reconciled_ordinal,
+             s.core_hosted                 AS core_hosted,
              (SELECT MAX(head) FROM replication_events e
                 WHERE e.context_graph_id = s.context_graph_id) AS last_head,
              (SELECT MAX(ts) FROM replication_events e
@@ -2671,6 +2693,7 @@ export interface ContextGraphSubscriptionRow {
   on_chain_id: string | null;
   on_chain_hash: string | null;
   last_reconciled_ordinal: number | null;
+  core_hosted: number | null;
   sync_scoped: number;
   updated_at: number;
 }
@@ -2730,6 +2753,7 @@ export interface ReplicationCursorRow {
   context_graph_id: string;
   on_chain_id: string | null;
   last_reconciled_ordinal: number | null;
+  core_hosted: number | null;
   last_head: number | null;
   last_event_ts: number | null;
 }

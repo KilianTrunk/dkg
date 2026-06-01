@@ -2,9 +2,9 @@
  * Issue #872 / Codex review round 2, finding B regression tests for
  * `DKGAgent.getContextGraphOnChainPolicy`.
  *
- * The bug: the method's local-triple fallback used to read
+ * The bug: the method's local fallback used to read
  * `dkg:publishPolicy` / `dkg:accessPolicy` triples that
- * `createContextGraph` writes to `_meta` BEFORE on-chain
+ * `createContextGraph` writes BEFORE on-chain
  * registration. For a CG still in the local-only `unregistered`
  * state those triples reflect the creator's intent, not an on-chain
  * commitment — but the daemon's import-artifact read relaxation
@@ -13,9 +13,10 @@
  * The combination meant the owner-guard could be bypassed on a CG
  * the curator hadn't actually committed to making public yet.
  *
- * Fix: gate the local-triple fallback on `isContextGraphRegistered`.
- * If the CG isn't registered on-chain (or replicated from a
- * registered peer), return `{}` and let callers fail closed.
+ * Fix: gate the local access-policy fallback on
+ * `isContextGraphRegistered` and never treat the creator's stored
+ * `publishPolicy` as authorization-positive; publish policy must
+ * come from a fresh cache or a chain RPC revalidation.
  *
  * These tests bind `DKGAgent.prototype.getContextGraphOnChainPolicy`
  * to a minimal stub (same pattern as `dkg-agent-diagnostics.test.ts`)
@@ -120,22 +121,29 @@ describe('DKGAgent.getContextGraphOnChainPolicy', () => {
     expect(stub.readLocalAccessPolicyEnum).not.toHaveBeenCalled();
   });
 
-  // Companion: when the CG IS registered, the local-triple fallback
-  // still runs so creators and gossip-recipients of a registered CG
-  // get the relaxation immediately after a daemon restart (no chain
-  // RPC required). This is the original #872 fallback behaviour;
-  // round 2's gate doesn't break it for registered CGs.
-  it('falls back to local triples when the CG is registered but caches are cold', async () => {
+  // Companion: when the CG IS registered, the local fallback can
+  // still fill accessPolicy, but publishPolicy is revalidated from
+  // chain. The stored create-time publishPolicy is intentionally
+  // ignored because `updatePublishPolicy` does not update that
+  // local triple.
+  it('uses local accessPolicy and chain publishPolicy when the CG is registered but caches are cold', async () => {
+    const getContextGraphPublishPolicy = vi.fn(async () => ({
+      publishPolicy: 1,
+      publishAuthority: '0x0000000000000000000000000000000000000000',
+    }));
     const stub = makeStub({
+      subscribedContextGraphs: new Map([['cg-registered', { onChainId: '9' }]]),
       isContextGraphRegistered: vi.fn(async () => true),
       getStoredContextGraphRegistrationOptions: vi.fn(async () => ({ publishPolicy: 1 })),
       readLocalAccessPolicyEnum: vi.fn(async () => 0),
+      chain: { getContextGraphPublishPolicy },
     });
     const result = await callPolicy(stub, 'cg-registered');
     expect(result).toEqual({ accessPolicy: 0, publishPolicy: 1 });
     expect(stub.isContextGraphRegistered).toHaveBeenCalledWith('cg-registered');
-    expect(stub.getStoredContextGraphRegistrationOptions).toHaveBeenCalledWith('cg-registered');
+    expect(stub.getStoredContextGraphRegistrationOptions).not.toHaveBeenCalled();
     expect(stub.readLocalAccessPolicyEnum).toHaveBeenCalledWith('cg-registered');
+    expect(getContextGraphPublishPolicy).toHaveBeenCalledWith(9n);
   });
 
   // Defensive: `isContextGraphRegistered` failing (e.g. SPARQL
@@ -154,24 +162,27 @@ describe('DKGAgent.getContextGraphOnChainPolicy', () => {
     expect(stub.readLocalAccessPolicyEnum).not.toHaveBeenCalled();
   });
 
-  // Mixed cache hit: when only one enum is cached AND the CG is
-  // registered, the fallback fills in the missing half.
-  it('uses local triples only for the half of the answer that the cache misses (registered CG)', async () => {
+  // Mixed cache hit: when only accessPolicy is cached AND the CG is
+  // registered, the missing publishPolicy is still revalidated from
+  // chain rather than filled from the creator's stored options.
+  it('uses chain RPC for a missing publishPolicy even when accessPolicy is cached', async () => {
+    const getContextGraphPublishPolicy = vi.fn(async () => ({
+      publishPolicy: 1,
+      publishAuthority: '0x0000000000000000000000000000000000000000',
+    }));
     const stub = makeStub({
+      subscribedContextGraphs: new Map([['cg-2', { onChainId: '10' }]]),
       onChainAccessPolicyCache: new Map([['cg-2', 0]]),
       onChainPublishPolicyCache: new Map(),
       isContextGraphRegistered: vi.fn(async () => true),
       getStoredContextGraphRegistrationOptions: vi.fn(async () => ({ publishPolicy: 1 })),
       readLocalAccessPolicyEnum: vi.fn(async () => 0),
+      chain: { getContextGraphPublishPolicy },
     });
     const result = await callPolicy(stub, 'cg-2');
     expect(result).toEqual({ accessPolicy: 0, publishPolicy: 1 });
-    // Access policy was a cache hit; we still ran the registered
-    // gate then filled in publishPolicy from local triples. The
-    // access-policy local lookup may or may not run depending on
-    // ordering; the only invariant we need is that the answer is
-    // correct.
-    expect(stub.getStoredContextGraphRegistrationOptions).toHaveBeenCalled();
+    expect(stub.getStoredContextGraphRegistrationOptions).not.toHaveBeenCalled();
+    expect(getContextGraphPublishPolicy).toHaveBeenCalledWith(10n);
   });
 
   // Round 3, the regression test. Non-creator peers never receive
@@ -319,11 +330,14 @@ describe('DKGAgent.getContextGraphOnChainPolicy', () => {
     expect(stub.readLocalAccessPolicyEnum).not.toHaveBeenCalled();
   });
 
-  // Round 3 — creator's local-triple path stays fast: when local
-  // triples answer both fields, no chain RPC is issued.
-  it('does NOT make a chain RPC call when local triples cover both fields (creator path)', async () => {
+  // Codex review on #879 — creator-written `publishPolicy` in
+  // `_meta` is create-time state; `updatePublishPolicy` does not
+  // refresh it. Even on the creator path, a cached/stored "open"
+  // value must not keep relaxing the import-artifact owner guard
+  // after the curator flips the CG to curated on-chain.
+  it('ignores stored publishPolicy and revalidates from chain even on the creator path', async () => {
     const getContextGraphPublishPolicy = vi.fn(async () => ({
-      publishPolicy: 1,
+      publishPolicy: 0,
       publishAuthority: '0x0000000000000000000000000000000000000000',
     }));
     const getContextGraphAccessPolicy = vi.fn(async () => 0);
@@ -335,8 +349,9 @@ describe('DKGAgent.getContextGraphOnChainPolicy', () => {
       chain: { getContextGraphPublishPolicy, getContextGraphAccessPolicy },
     });
     const result = await callPolicy(stub, 'cg-creator');
-    expect(result).toEqual({ accessPolicy: 0, publishPolicy: 1 });
-    expect(getContextGraphPublishPolicy).not.toHaveBeenCalled();
+    expect(result).toEqual({ accessPolicy: 0, publishPolicy: 0 });
+    expect(stub.getStoredContextGraphRegistrationOptions).not.toHaveBeenCalled();
+    expect(getContextGraphPublishPolicy).toHaveBeenCalledWith(11n);
     expect(getContextGraphAccessPolicy).not.toHaveBeenCalled();
   });
 
@@ -409,11 +424,13 @@ describe('DKGAgent.getContextGraphOnChainPolicy', () => {
       onChainPublishPolicyCacheUpdatedAt: new Map([['cg-stale', Date.now() - STALE_AGE_MS]]),
       onChainAccessPolicyCache: new Map([['cg-stale', 0]]),
       isContextGraphRegistered: vi.fn(async () => true),
+      getStoredContextGraphRegistrationOptions: vi.fn(async () => ({ publishPolicy: 1 })),
       chain: { getContextGraphPublishPolicy, getContextGraphAccessPolicy },
     });
     const result = await callPolicy(stub, 'cg-stale');
     // Stale "1" was discarded; chain re-verify returned "0" (curated).
     expect(result).toEqual({ accessPolicy: 0, publishPolicy: 0 });
+    expect(stub.getStoredContextGraphRegistrationOptions).not.toHaveBeenCalled();
     expect(getContextGraphPublishPolicy).toHaveBeenCalledWith(55n);
     // Cache overwritten with the fresh chain answer keyed on
     // numericOnChainId; freshness timestamp also bumped so the

@@ -16016,17 +16016,15 @@ export class DKGAgent {
    *      passed a cleartext local id, we re-key via
    *      {@link subscribedContextGraphs} or {@link getContextGraphOnChainId}.
    *
-   *   2. Local `_meta` / ontology triple store. The CG creator
-   *      persists `dkg:publishPolicy` in `_meta` at create time and
-   *      `dkg:accessPolicy` as `"public"` / `"private"` in either the
-   *      ontology graph (open CGs) or `_meta` (curated CGs). Peers
-   *      that joined or replicated via gossip / catchup may have a
-   *      subset of these triples — notably, `dkg:publishPolicy` is
-   *      creator-only and never reaches non-creator peers via SWM.
+   *   2. Local `_meta` / ontology triple store for `accessPolicy`
+   *      only. The CG creator also persists `dkg:publishPolicy` in
+   *      `_meta` at create time, but that triple is not updated by
+   *      `updatePublishPolicy`, so it is never used as an
+   *      authorization-positive publish-policy answer here.
    *
    *   3. Direct chain RPC (Codex round-3 fix): for registered CGs
-   *      where steps 1 and 2 still leave a field undefined — the
-   *      common case for non-creator peers after a daemon restart —
+   *      where the cache leaves `publishPolicy` undefined/stale, or
+   *      where steps 1 and 2 still leave `accessPolicy` undefined,
    *      query the contract directly via
    *      `chain.getContextGraphAccessPolicy` /
    *      `chain.getContextGraphPublishPolicy`. The result populates
@@ -16035,7 +16033,7 @@ export class DKGAgent {
    * Steps 2 and 3 are GATED on {@link isContextGraphRegistered}
    * (Codex round-2 fix): unregistered locally-created CGs reflect
    * create-time *intent* via local triples, not an on-chain
-   * commitment, and the chain itself has no record. Treating either
+   * commitment, and the chain itself has no record. Treating local
    * source as authoritative pre-registration would bypass the
    * owner-guard on a CG the curator hasn't actually committed to.
    *
@@ -16087,9 +16085,9 @@ export class DKGAgent {
       }
     }
 
-    // Codex review (round 2, finding B): the local-triple fallback
-    // below reads `dkg:publishPolicy` / `dkg:accessPolicy` triples
-    // that `createContextGraph` writes synchronously — BEFORE
+    // Codex review (round 2, finding B): the local access-policy
+    // fallback below reads triples that `createContextGraph` writes
+    // synchronously — BEFORE
     // `registerContextGraph` confirms the CG on-chain. For a CG
     // that's still in the local-only `unregistered` state, those
     // triples reflect the creator's *intent*, not an on-chain
@@ -16137,13 +16135,6 @@ export class DKGAgent {
           ...(accessPolicy === 0 || accessPolicy === 1 ? { accessPolicy } : {}),
           ...(publishPolicy === 0 || publishPolicy === 1 ? { publishPolicy } : {}),
         };
-      }
-    }
-
-    if (publishPolicy === undefined) {
-      const stored: { publishPolicy?: number } = await this.getStoredContextGraphRegistrationOptions(contextGraphId).catch(() => ({}));
-      if (stored.publishPolicy === 0 || stored.publishPolicy === 1) {
-        publishPolicy = stored.publishPolicy;
       }
     }
 

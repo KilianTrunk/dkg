@@ -73,10 +73,15 @@ export interface ApiClientConnectOptions {
 }
 
 const DAEMON_NOT_RUNNING_MESSAGE = 'Daemon is not running. Start it with: dkg start';
+const DEFAULT_NODE_NAME = 'dkg-node';
 
 function controlPlaneWarning(missingFiles: string[]): string | undefined {
   if (missingFiles.length === 0) return undefined;
   return `Warning: selected DKG home is missing control-plane file(s): ${missingFiles.join(', ')}. Using configured API port fallback.`;
+}
+
+function isAmbiguousFallbackName(name: unknown): boolean {
+  return typeof name !== 'string' || name.trim() === '' || name.trim() === DEFAULT_NODE_NAME;
 }
 
 function isConnectionFailure(err: unknown): boolean {
@@ -147,7 +152,7 @@ export class ApiClient {
       if (opts.allowConfigFallback && !hasEnvPort && configExists()) {
         const config = await loadConfig();
         const configuredPort = Number.isFinite(config.apiPort) && config.apiPort > 0 ? config.apiPort : null;
-        if (configuredPort) {
+        if (configuredPort && !isAmbiguousFallbackName(config.name)) {
           const missingFiles = ['api.port', ...(pid ? [] : ['daemon.pid'])];
           port = configuredPort;
           expectedStatusName = config.name;

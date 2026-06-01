@@ -1256,7 +1256,7 @@ export async function saveConfig(config: DkgConfig): Promise<void> {
 }
 
 export function configExists(): boolean {
-  return existsSync(configPath()) || existsSync(configYamlPath());
+  return existsSync(configPath());
 }
 
 export async function readPid(): Promise<number | null> {

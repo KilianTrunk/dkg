@@ -16097,14 +16097,42 @@ export class DKGAgent {
     // relaxation kick in for a CG the curator hasn't actually
     // committed to making public, bypassing the owner guard.
     //
-    // Gate the fallback (local + chain RPC) on
-    // `isContextGraphRegistered` so only CGs confirmed on-chain (or
-    // replicated from a registered peer) contribute a policy
-    // answer. Unregistered CGs that miss the chain-event cache
-    // return `{}` and the daemon route fails closed.
+    // Codex review (round 6, line 15487 — 2026-06-01): the prior gate
+    // only consulted `dkg:registrationStatus = "registered"`, which
+    // `registerContextGraph` writes ON THE CREATOR'S NODE only. Non-
+    // creator peers bootstrap CG metadata via `ensureContextGraphLocally`
+    // with status="unregistered" and never flip it. After a daemon
+    // restart the chain-event cache loses its in-memory entries, the
+    // status check still returns false, this gate fails closed, and
+    // cross-agent reads on legitimately public+open CGs regress to
+    // 403 for non-creators.
+    //
+    // Accept any of these as proof of an on-chain commitment:
+    //   - `dkg:registrationStatus = "registered"` (creator path), OR
+    //   - a non-zero numeric `onChainId` already resolved from
+    //     subscribed state or local meta (replicator path — the
+    //     on-chain id is only ever known if the chain assigned it).
+    //
+    // An unregistered locally-created CG has neither, so the gate
+    // still fails closed for it.
     if (accessPolicy === undefined || publishPolicy === undefined) {
-      const registered = await this.isContextGraphRegistered(contextGraphId).catch(() => false);
-      if (!registered) {
+      const registeredViaStatus = await this.isContextGraphRegistered(contextGraphId).catch(() => false);
+      let registeredViaOnChainId = false;
+      if (!registeredViaStatus) {
+        if (onChainId === undefined) {
+          onChainId = this.subscribedContextGraphs.get(contextGraphId)?.onChainId
+            ?? (await this.getContextGraphOnChainId(contextGraphId).catch(() => null))
+            ?? undefined;
+        }
+        if (onChainId) {
+          try {
+            registeredViaOnChainId = BigInt(onChainId) > 0n;
+          } catch {
+            registeredViaOnChainId = false;
+          }
+        }
+      }
+      if (!registeredViaStatus && !registeredViaOnChainId) {
         return {
           ...(accessPolicy === 0 || accessPolicy === 1 ? { accessPolicy } : {}),
           ...(publishPolicy === 0 || publishPolicy === 1 ? { publishPolicy } : {}),

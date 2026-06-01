@@ -132,12 +132,7 @@ describe('PCA write methods enrich opaque custom-error reverts on rethrow (codex
       .then(() => null)
       .catch((e) => e as Error);
     expect(e1).toBeInstanceOf(Error);
-    // After main's `e3e58429` / `50089d22`, settle*-style helpers
-    // wrap per-RPC failures in an `RPC_ENDPOINTS_EXHAUSTED` error
-    // whose message embeds the original failure verbatim. Use a
-    // substring match so the assertion passes both before and after
-    // the rebase against main that picks up the wrapper.
-    expect(e1!.message).toContain('connect ECONNREFUSED 127.0.0.1:8545');
+    expect(e1!.message).toBe('connect ECONNREFUSED 127.0.0.1:8545');
 
     // (b) non-Error throw (string) — propagated as-is, not wrapped.
     const nonError = adapterWithFakeNft({

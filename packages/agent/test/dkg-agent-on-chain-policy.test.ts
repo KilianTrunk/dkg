@@ -237,23 +237,86 @@ describe('DKGAgent.getContextGraphOnChainPolicy', () => {
   });
 
   // Round 3 cross-check with round 2's gate. The unregistered case
-  // MUST NOT hit the chain — the round-2 fail-closed return short-
-  // circuits before any RPC.
-  it('does NOT make a chain RPC call when the CG is unregistered (round 2 gate still holds)', async () => {
+  // MUST NOT hit the chain — the fail-closed return short-circuits
+  // before any RPC. This pins the creator's pre-register state where
+  // `createContextGraph` has written local-intent triples but
+  // `registerContextGraph` has NOT yet been called, so neither the
+  // status flag nor an on-chain id exists locally.
+  it('does NOT make a chain RPC call when the CG is unregistered AND no on-chain id is known (round 2 gate still holds)', async () => {
     const getContextGraphPublishPolicy = vi.fn(async () => ({
       publishPolicy: 1,
       publishAuthority: '0x0000000000000000000000000000000000000000',
     }));
     const getContextGraphAccessPolicy = vi.fn(async () => 0);
     const stub = makeStub({
-      subscribedContextGraphs: new Map([['cg-unregistered', { onChainId: '99' }]]),
+      // No on-chain id — `createContextGraph` has run but
+      // `registerContextGraph` has not, so the chain hasn't assigned
+      // a numeric id yet.
+      subscribedContextGraphs: new Map(),
       isContextGraphRegistered: vi.fn(async () => false),
+      getContextGraphOnChainId: vi.fn(async () => null),
       chain: { getContextGraphPublishPolicy, getContextGraphAccessPolicy },
     });
     const result = await callPolicy(stub, 'cg-unregistered');
     expect(result).toEqual({});
     expect(getContextGraphPublishPolicy).not.toHaveBeenCalled();
     expect(getContextGraphAccessPolicy).not.toHaveBeenCalled();
+  });
+
+  // Round 6 (Codex on #879, line 15487, 2026-06-01): the round-2
+  // gate keyed on `dkg:registrationStatus = "registered"`, which
+  // ONLY the creator's `registerContextGraph` writes — non-creator
+  // peers bootstrap CG metadata via `ensureContextGraphLocally` with
+  // status="unregistered" and never flip it. After a daemon restart
+  // the in-memory chain-event cache is empty, the status check
+  // returns false, and the original gate fail-closed for legitimate
+  // public+open CGs even though the on-chain id is known. The fix
+  // accepts a non-zero numeric `onChainId` from
+  // `subscribedContextGraphs` (or the local ontology triple) as
+  // proof of an on-chain commitment, so the chain-RPC fallback can
+  // run for these peers.
+  it('falls through to the chain RPC fallback when status is "unregistered" but onChainId is known (#879 Codex round 6)', async () => {
+    const getContextGraphPublishPolicy = vi.fn(async () => ({
+      publishPolicy: 1,
+      publishAuthority: '0x0000000000000000000000000000000000000000',
+    }));
+    const getContextGraphAccessPolicy = vi.fn(async () => 0);
+    const stub = makeStub({
+      // Replicated CG: subscribed via chain event, so we have the
+      // on-chain id, but `registrationStatus` was never flipped to
+      // "registered" because that flag is creator-only.
+      subscribedContextGraphs: new Map([['cg-replicated', { onChainId: '77' }]]),
+      isContextGraphRegistered: vi.fn(async () => false),
+      // Non-creator peer: no local creator-written triples.
+      getStoredContextGraphRegistrationOptions: vi.fn(async () => ({})),
+      readLocalAccessPolicyEnum: vi.fn(async () => undefined),
+      chain: { getContextGraphPublishPolicy, getContextGraphAccessPolicy },
+    });
+    const result = await callPolicy(stub, 'cg-replicated');
+    expect(result).toEqual({ accessPolicy: 0, publishPolicy: 1 });
+    expect(getContextGraphPublishPolicy).toHaveBeenCalledWith(77n);
+    expect(getContextGraphAccessPolicy).toHaveBeenCalledWith(77n);
+  });
+
+  // Round 6 negative: a CG with NEITHER status="registered" NOR a
+  // known on-chain id stays fail-closed. This is the
+  // create-without-register state on the creator's own node — no
+  // chain commitment exists, so the local-intent triples must NOT
+  // contribute a positive policy answer.
+  it('still fails closed when neither status nor onChainId proves an on-chain commitment (#879 Codex round 6 negative)', async () => {
+    const stub = makeStub({
+      // No `subscribedContextGraphs` entry, no ontology triple.
+      subscribedContextGraphs: new Map(),
+      getContextGraphOnChainId: vi.fn(async () => null),
+      isContextGraphRegistered: vi.fn(async () => false),
+      // These would return public+open if the gate let them run.
+      getStoredContextGraphRegistrationOptions: vi.fn(async () => ({ publishPolicy: 1 })),
+      readLocalAccessPolicyEnum: vi.fn(async () => 0),
+    });
+    const result = await callPolicy(stub, 'cg-create-only');
+    expect(result).toEqual({});
+    expect(stub.getStoredContextGraphRegistrationOptions).not.toHaveBeenCalled();
+    expect(stub.readLocalAccessPolicyEnum).not.toHaveBeenCalled();
   });
 
   // Round 3 — creator's local-triple path stays fast: when local

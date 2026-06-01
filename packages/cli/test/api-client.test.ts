@@ -108,6 +108,22 @@ describe('ApiClient', () => {
       expect(existsSync(join(tempDir, 'daemon.pid'))).toBe(false);
     });
 
+    it('connect() rejects selected home config fallback when status belongs to a different node', async () => {
+      process.env.DKG_HOME = tempDir;
+      delete process.env.DKG_API_PORT;
+      await writeFile(join(tempDir, 'config.json'), JSON.stringify({ name: 'isolated', apiPort: 9317 }));
+      await writeFile(join(tempDir, 'auth.token'), 'local-token\n', 'utf8');
+      const body = { name: 'other-node', peerId: 'peer1', uptimeMs: 1000, connectedPeers: 2, relayConnected: true, multiaddrs: [] };
+      const { fetch, calls } = createTrackingFetch({ ok: true, status: 200, body });
+      globalThis.fetch = fetch;
+
+      const connected = await ApiClient.connect({ allowConfigFallback: true });
+
+      await expect(connected.status()).rejects.toThrow('expected selected home node "isolated"');
+      expect(calls).toHaveLength(1);
+      expect((calls[0].opts.headers as any).Authorization).toBeUndefined();
+    });
+
     it('agents() calls /api/agents', async () => {
       const body = { agents: [{ agentUri: 'urn:a', name: 'A', peerId: 'p1' }] };
       const { fetch } = createTrackingFetch({ ok: true, status: 200, body });

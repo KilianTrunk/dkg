@@ -4616,41 +4616,51 @@ export function SubGraphMiniCard({
             quiet case. Same conditional-when-it-has-something-to-
             say pattern as S2's `Pending join requests` empty
             state. */}
-        {/* GH #819 round 10 (Codex sweep 8 🟡 #18) — extended badge
-            matrix. Rounds 6/7 only fired the failure tooltip on
-            zero-bucket cards; a partial-layer-failure with a
-            non-zero bucket rendered the count with no disclosure
-            that some layers were unavailable. Now `isFailedOrPartial`
-            fires for ALL bucket values — when bucket > 0 the
-            tooltip prefixes the count with "{N} triples (some
-            layers unavailable; count may be incomplete)."
-            Precedence (top wins):
-              • hydrating + bucket 0  → `…` "Loading triples…"
-              • failed/partial (any bucket) → "{N} triples (some
-                layers unavailable; count may be incomplete)."
-              • stat-vs-rendered mismatch → β literal (round 8)
-              • otherwise → no tooltip
-            Failure wins over the stat-vs-rendered tooltip — once
-            layers re-hydrate the cap-truncation gap recomputes
-            correctly; the failure signal is the louder one. */}
+        {/* GH #890 round 2 (Codex sweep 1 🟡 A) — bucket-aware
+            precedence. Round 1 (#882) made `isHydrating`
+            short-circuit the entire chain, so a mixed state
+            (some layers `loading`, others `error`) on a non-zero
+            bucket rendered the optimistic "still loading; count
+            may grow" tooltip and masked the known-incomplete
+            failure. Round 2 splits the precedence so the failure
+            disclosure wins everywhere except the zero-bucket
+            initial-fetch window:
+              1. hydrating + bucket 0 → `…` "Loading triples…"
+                 (loading affordance is the priority signal when
+                 we have no count yet — preserves the round 6 #11
+                 anti-flash contract: `useMemoryEntities`
+                 initializes `allTriples = []` so a real subgraph
+                 briefly shows 0 during initial fetch)
+              2. failed/partial (any bucket) → failure tooltip
+                 (wins over hydrating on non-zero — the count is
+                 already known-incomplete because a layer errored)
+              3. hydrating + bucket > 0 (no failure) → "still
+                 loading; count may grow" (#882 wording, only
+                 fires when no failure flag is set)
+              4. stat-vs-rendered mismatch → β literal (round 8)
+              5. otherwise → no tooltip */}
         <span
           className="v10-sgov-card-stat"
           title={
             isHydrating && card.tripleCount === 0
               ? 'Loading triples for this subgraph…'
               : isFailedOrPartial
-                ? `${card.tripleCount} triples (some layers unavailable; count may be incomplete).`
-                : card.tripleCount !== card.triples.length
-                  // GH #819 round 8 (Codex sweep 6 🟡 #4 / #9 / #12,
-                  // team-lead call β) — broader wording so the
-                  // tooltip covers both causes of stat-vs-rendered
-                  // gap: (1) cross-card edges whose other endpoint
-                  // sits outside the subgraph and (2) cap-trimmed
-                  // rows in dense buckets via `applyHeaviestSubjectsCap`.
-                  // Earlier copy blamed only cause (1); Codex
-                  // re-raised the cap-trim case 5 sweeps in a row.
-                  ? `${card.tripleCount} triples in this subgraph's scope; ${card.triples.length} rendered (some in-scope edges aren't drawn — either endpoints outside this subgraph, or cap-trimmed in dense buckets).`
-                  : undefined
+                ? card.tripleCount === 0
+                  ? 'Some layers unavailable; count may be incomplete.'
+                  : `${card.tripleCount} triples (some layers unavailable; count may be incomplete).`
+                : isHydrating
+                  ? `${card.tripleCount} triples (still loading; count may grow).`
+                  : card.tripleCount !== card.triples.length
+                    // GH #819 round 8 (Codex sweep 6 🟡 #4 / #9 / #12,
+                    // team-lead call β) — broader wording so the
+                    // tooltip covers both causes of stat-vs-rendered
+                    // gap: (1) cross-card edges whose other endpoint
+                    // sits outside the subgraph and (2) cap-trimmed
+                    // rows in dense buckets via `applyHeaviestSubjectsCap`.
+                    // Earlier copy blamed only cause (1); Codex
+                    // re-raised the cap-trim case 5 sweeps in a row.
+                    ? `${card.tripleCount} triples in this subgraph's scope; ${card.triples.length} rendered (some in-scope edges aren't drawn — either endpoints outside this subgraph, or cap-trimmed in dense buckets).`
+                    : undefined
           }
         ><b>{isHydrating && card.tripleCount === 0 ? '…' : card.tripleCount}</b> triples</span>
       </div>

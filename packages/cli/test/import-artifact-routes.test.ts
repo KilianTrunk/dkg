@@ -120,6 +120,14 @@ describe('import artifact daemon routes', () => {
     publisherDiscardError?: Error;
     targetGraphExists?: boolean;
     queryQuads?: Quad[];
+    /**
+     * Issue #872 — optional on-chain policy enum pair (`accessPolicy`,
+     * `publishPolicy`) returned by the mock agent's
+     * `getContextGraphOnChainPolicy`. When omitted, the method is not
+     * exposed at all — exercising the "policy unknown, fail closed"
+     * branch that preserves the legacy owner guard.
+     */
+    onChainPolicy?: { accessPolicy?: number; publishPolicy?: number };
   }) {
     const created: Array<{
       contextGraphId: string;
@@ -147,7 +155,7 @@ describe('import artifact daemon routes', () => {
       { subject: 'urn:z', predicate: 'urn:p', object: 'urn:o' },
       { subject: 'urn:a', predicate: 'urn:p', object: '"A"' },
     ];
-    const agent = {
+    const agent: Record<string, unknown> = {
       async listContextGraphs() {
         return [{
           id: args.contextGraphId,
@@ -203,6 +211,13 @@ describe('import artifact daemon routes', () => {
           discards.push({ contextGraphId, name, agentAddress, subGraphName });
         },
       },
+      ...(args.onChainPolicy
+        ? {
+            async getContextGraphOnChainPolicy() {
+              return args.onChainPolicy ?? {};
+            },
+          }
+        : {}),
       store: {
         async hasGraph() {
           return Boolean(args.targetGraphExists);
@@ -460,6 +475,145 @@ describe('import artifact daemon routes', () => {
     expect(read.status).toBe(403);
     expect(read.body.error).toMatch(/owned by the requesting agent/);
     expect(queries).toHaveLength(0);
+  });
+
+  // Issue #872 — public + open CGs gossip their SWM triples to every
+  // subscribed peer, so the legacy owner guard at
+  // `assertImportedArtifactOwnerAddress` contradicts the curator's
+  // on-chain policy choice. The next three tests pin down the relaxed
+  // shape: cross-agent reads succeed (200) when bytes are local, fail
+  // cleanly (404) when bytes haven't been replicated, and the existing
+  // 403 path stays in force for any other policy combo (covered above).
+  it('allows non-owner reads on public + open CGs when bytes are locally available (#872)', async () => {
+    const entry = await fileStore.put(Buffer.from('# Public Imported\n'), 'text/markdown');
+    const contextGraphId = 'cg-public-open-bytes-local';
+    const assertionName = 'imported-md';
+    const assertionUri = contextGraphAssertionUri(contextGraphId, 'did:dkg:agent:source', assertionName);
+    const { agent } = makeAgent({
+      contextGraphId,
+      assertionName,
+      assertionUri,
+      fileHash: entry.keccak256,
+      markdownHash: entry.keccak256,
+      markdownForm: `urn:dkg:file:${entry.keccak256}`,
+      onChainPolicy: { accessPolicy: 0, publishPolicy: 1 },
+    });
+    await startRoutes({ agent });
+
+    const resolved = await post('/api/assertion/import-artifact/resolve', {
+      contextGraphId,
+      assertionUri,
+      fileHash: entry.keccak256,
+    });
+    expect(resolved.status).toBe(200);
+    expect(resolved.body.artifact).toMatchObject({
+      assertionUri,
+      assertionAgentAddress: 'did:dkg:agent:source',
+      markdownHash: entry.keccak256,
+      canReadMarkdown: true,
+      ownerGuardRelaxed: true,
+    });
+
+    const read = await post('/api/assertion/import-artifact/read-markdown', {
+      contextGraphId,
+      assertionUri,
+      maxBytes: 1024,
+    });
+    expect(read.status).toBe(200);
+    expect(read.body.markdown).toBe('# Public Imported\n');
+    expect(read.body.artifact.ownerGuardRelaxed).toBe(true);
+  });
+
+  it('returns 404 (not 403) for non-owner reads on public + open CGs when bytes are missing (#872)', async () => {
+    // Use a deterministic, well-formed keccak256 hash that's never been
+    // put into the test file store. The markdownForm URN matches the
+    // meta `sourceFileHash`, so the 409 markdown-mismatch path stays
+    // dormant — the only failure surface left is the file-store miss,
+    // which is exactly the path peers will hit until source-artifact
+    // bytes are gossipped (deferred follow-up for #872).
+    const markdownHash = `keccak256:${'a'.repeat(64)}`;
+    const contextGraphId = 'cg-public-open-bytes-missing';
+    const assertionName = 'imported-md';
+    const assertionUri = contextGraphAssertionUri(contextGraphId, 'did:dkg:agent:source', assertionName);
+    const { agent } = makeAgent({
+      contextGraphId,
+      assertionName,
+      assertionUri,
+      fileHash: markdownHash,
+      markdownHash,
+      markdownForm: `urn:dkg:file:${markdownHash}`,
+      onChainPolicy: { accessPolicy: 0, publishPolicy: 1 },
+    });
+    await startRoutes({ agent });
+
+    const resolved = await post('/api/assertion/import-artifact/resolve', {
+      contextGraphId,
+      assertionUri,
+    });
+    expect(resolved.status).toBe(200);
+    expect(resolved.body.artifact.ownerGuardRelaxed).toBe(true);
+
+    const read = await post('/api/assertion/import-artifact/read-markdown', {
+      contextGraphId,
+      assertionUri,
+      maxBytes: 1024,
+    });
+    expect(read.status).toBe(404);
+    expect(read.body.error).toMatch(/not replicated locally/);
+    expect(read.body.error).not.toMatch(/owned by the requesting agent/);
+    expect(read.body.artifact.ownerGuardRelaxed).toBe(true);
+  });
+
+  it('keeps the owner guard in force when a non-owner reads from a CG that is public but curators-only (#872)', async () => {
+    // Mixed policy: accessPolicy=0 (public discovery) but publishPolicy=0
+    // (curators-only). Only `accessPolicy===0 && publishPolicy===1`
+    // relaxes the guard; this combo MUST still 403.
+    const entry = await fileStore.put(Buffer.from('# Mixed Policy\n'), 'text/markdown');
+    const contextGraphId = 'cg-public-curators-only';
+    const assertionName = 'imported-md';
+    const assertionUri = contextGraphAssertionUri(contextGraphId, 'did:dkg:agent:source', assertionName);
+    const { agent, queries } = makeAgent({
+      contextGraphId,
+      assertionName,
+      assertionUri,
+      fileHash: entry.keccak256,
+      markdownHash: entry.keccak256,
+      markdownForm: `urn:dkg:file:${entry.keccak256}`,
+      onChainPolicy: { accessPolicy: 0, publishPolicy: 0 },
+    });
+    await startRoutes({ agent });
+
+    const resolved = await post('/api/assertion/import-artifact/resolve', {
+      contextGraphId,
+      assertionUri,
+    });
+    expect(resolved.status).toBe(403);
+    expect(resolved.body.error).toMatch(/owned by the requesting agent/);
+    expect(queries).toHaveLength(0);
+  });
+
+  it('does not surface ownerGuardRelaxed for owner reads on public + open CGs (#872)', async () => {
+    const entry = await fileStore.put(Buffer.from('# Owner Public\n'), 'text/markdown');
+    const contextGraphId = 'cg-public-open-owner';
+    const assertionName = 'imported-md';
+    const assertionUri = contextGraphAssertionUri(contextGraphId, 'did:dkg:agent:test', assertionName);
+    const { agent } = makeAgent({
+      contextGraphId,
+      assertionName,
+      assertionUri,
+      fileHash: entry.keccak256,
+      markdownHash: entry.keccak256,
+      markdownForm: `urn:dkg:file:${entry.keccak256}`,
+      onChainPolicy: { accessPolicy: 0, publishPolicy: 1 },
+    });
+    await startRoutes({ agent });
+
+    const resolved = await post('/api/assertion/import-artifact/resolve', {
+      contextGraphId,
+      assertionUri,
+    });
+    expect(resolved.status).toBe(200);
+    expect(resolved.body.artifact.ownerGuardRelaxed).toBeUndefined();
   });
 
   it('requires full assertionUri instead of guessing the source author from assertionName', async () => {

@@ -957,6 +957,19 @@ export class DKGAgent {
    */
   private readonly onChainAccessPolicyCache = new Map<string, number>();
   /**
+   * Issue #872 — companion cache for the per-CG `publishPolicy` enum
+   * (`0` = curators-only, `1` = open). Populated lazily by the
+   * `ContextGraphCreated` chain-event handler (the event already
+   * carries both enums; the only thing missing was the cache slot).
+   * Consumed by {@link getContextGraphOnChainPolicy} so daemon routes
+   * can decide whether to apply owner-scoped guards or relax them for
+   * public + open CGs without a per-request RPC. `undefined` means
+   * the chain answer hasn't reached this node yet — callers MUST
+   * treat that as unknown (fail-closed) rather than a positive
+   * "publish-policy is open" signal.
+   */
+  private readonly onChainPublishPolicyCache = new Map<string, number>();
+  /**
    * OT-RFC-38 / LU-6 Phase B — chain-backed participant-agent
    * allowlist cache. Keyed by `contextGraphId.toString()` (stringified
    * on-chain numeric id; the resolver normalises any cleartext form
@@ -2245,8 +2258,8 @@ export class DKGAgent {
       this.chainPoller = new ChainEventPoller({
         chain: this.chain,
         publishHandler,
-        onContextGraphCreated: async ({ contextGraphId, creator, accessPolicy, nameHash, blockNumber }) => {
-          this.log.info(ctx, `Discovered on-chain context graph ${contextGraphId.slice(0, 16)}… (block ${blockNumber}, creator ${creator.slice(0, 10)}…, policy ${accessPolicy}, nameHash ${nameHash ? nameHash.slice(0, 10) + '…' : '(opt-out)'})`);
+        onContextGraphCreated: async ({ contextGraphId, creator, accessPolicy, publishPolicy, nameHash, blockNumber }) => {
+          this.log.info(ctx, `Discovered on-chain context graph ${contextGraphId.slice(0, 16)}… (block ${blockNumber}, creator ${creator.slice(0, 10)}…, policy ${accessPolicy}, publishPolicy ${publishPolicy ?? '?'}, nameHash ${nameHash ? nameHash.slice(0, 10) + '…' : '(opt-out)'})`);
 
           // Track the numeric on-chain id for dedup.
           const alreadyKnown = this.seenOnChainIds.has(contextGraphId)
@@ -2266,6 +2279,12 @@ export class DKGAgent {
           // so the keying matches the lazy-fallback lookup below.
           if (accessPolicy === 0 || accessPolicy === 1) {
             this.onChainAccessPolicyCache.set(contextGraphId, accessPolicy);
+          }
+          // Issue #872 — same eager-cache pattern for the `publishPolicy`
+          // enum so daemon routes can recognise a public + open CG from
+          // local state and relax owner-scoped artifact-read guards.
+          if (publishPolicy === 0 || publishPolicy === 1) {
+            this.onChainPublishPolicyCache.set(contextGraphId, publishPolicy);
           }
 
           // OT-RFC-38 / LU-6 Phase B — host-mode auto-subscribe path for
@@ -15935,6 +15954,100 @@ export class DKGAgent {
     if (result.type !== 'bindings' || result.bindings.length === 0) return null;
     const value = result.bindings[0]?.['id'];
     return typeof value === 'string' ? value.replace(/^"|"$/g, '') : null;
+  }
+
+  /**
+   * Issue #872 — best-effort, no-network read of the on-chain
+   * `(accessPolicy, publishPolicy)` enum pair for a CG. Sources, in
+   * order:
+   *
+   *   1. {@link onChainAccessPolicyCache} / {@link onChainPublishPolicyCache} —
+   *      populated eagerly by the `ContextGraphCreated` chain-event
+   *      handler. The keys are the on-chain numeric ids; if the caller
+   *      passed a cleartext local id, we re-key via
+   *      {@link subscribedContextGraphs} or {@link getContextGraphOnChainId}.
+   *
+   *   2. Local `_meta` / ontology triple store. The CG creator
+   *      persists `dkg:publishPolicy` in `_meta` at create time and
+   *      `dkg:accessPolicy` as `"public"` / `"private"` in either the
+   *      ontology graph (open CGs) or `_meta` (curated CGs). Peers
+   *      that joined or replicated via gossip / catchup may have a
+   *      subset of these triples.
+   *
+   * Returns `{}` (both fields `undefined`) when neither source has an
+   * answer. Callers MUST treat `undefined` fields as unknown — fail
+   * closed for policy-gated decisions rather than assuming a
+   * permissive default. The method intentionally avoids per-request
+   * chain RPCs; the eager event-driven cache is enough for any node
+   * that's been online since the CG's create block (the only case
+   * where this gap matters is a brand-new node that joined after the
+   * chain poller's lookback window rolled past — those nodes fail
+   * closed and the existing owner-guard remains in effect).
+   */
+  async getContextGraphOnChainPolicy(contextGraphId: string): Promise<{
+    accessPolicy?: number;
+    publishPolicy?: number;
+  }> {
+    let accessPolicy = this.onChainAccessPolicyCache.get(contextGraphId);
+    let publishPolicy = this.onChainPublishPolicyCache.get(contextGraphId);
+
+    if (accessPolicy === undefined || publishPolicy === undefined) {
+      const onChainId = this.subscribedContextGraphs.get(contextGraphId)?.onChainId
+        ?? (await this.getContextGraphOnChainId(contextGraphId).catch(() => null))
+        ?? undefined;
+      if (onChainId && onChainId !== contextGraphId) {
+        if (accessPolicy === undefined) accessPolicy = this.onChainAccessPolicyCache.get(onChainId);
+        if (publishPolicy === undefined) publishPolicy = this.onChainPublishPolicyCache.get(onChainId);
+      }
+    }
+
+    if (publishPolicy === undefined) {
+      const stored: { publishPolicy?: number } = await this.getStoredContextGraphRegistrationOptions(contextGraphId).catch(() => ({}));
+      if (stored.publishPolicy === 0 || stored.publishPolicy === 1) {
+        publishPolicy = stored.publishPolicy;
+      }
+    }
+
+    if (accessPolicy === undefined) {
+      const stored = await this.readLocalAccessPolicyEnum(contextGraphId).catch(() => undefined);
+      if (stored !== undefined) accessPolicy = stored;
+    }
+
+    return {
+      ...(accessPolicy === 0 || accessPolicy === 1 ? { accessPolicy } : {}),
+      ...(publishPolicy === 0 || publishPolicy === 1 ? { publishPolicy } : {}),
+    };
+  }
+
+  /**
+   * Issue #872 — read the persisted `dkg:accessPolicy` literal from
+   * the ontology graph (open CGs) or `_meta` (curated CGs) and map it
+   * back to the on-chain enum (`"public"` → `0`, `"private"` → `1`).
+   * Returns `undefined` when no triple is present locally. Used by
+   * {@link getContextGraphOnChainPolicy} as a fallback after the
+   * chain-event cache miss.
+   */
+  private async readLocalAccessPolicyEnum(contextGraphId: string): Promise<number | undefined> {
+    if ((Object.values(SYSTEM_CONTEXT_GRAPHS) as string[]).includes(contextGraphId)) {
+      return undefined;
+    }
+    const ontologyGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
+    const cgMetaGraph = contextGraphMetaGraphUri(contextGraphId);
+    const contextGraphUri = `did:dkg:context-graph:${contextGraphId}`;
+    const result = await this.store.query(
+      `SELECT ?policy WHERE {
+        { GRAPH <${ontologyGraph}> { <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_ACCESS_POLICY}> ?policy } }
+        UNION
+        { GRAPH <${cgMetaGraph}> { <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_ACCESS_POLICY}> ?policy } }
+      } LIMIT 1`,
+    );
+    if (result.type !== 'bindings' || result.bindings.length === 0) return undefined;
+    const raw = result.bindings[0]?.['policy'];
+    if (typeof raw !== 'string') return undefined;
+    const stripped = raw.replace(/^"|"$/g, '');
+    if (stripped === 'public') return 0;
+    if (stripped === 'private') return 1;
+    return undefined;
   }
 
   /**

@@ -355,6 +355,17 @@ type ImportedArtifactResolution = {
   markdownForm?: string;
   markdownHash?: string;
   canReadMarkdown: boolean;
+  /**
+   * Issue #872 — set to `true` when the request would have been
+   * blocked by the legacy owner guard but the CG's on-chain policy
+   * (`accessPolicy === 0` AND `publishPolicy === 1`) made the guard
+   * inapplicable. The read-markdown route uses this to distinguish
+   * "owner request, missing bytes" (genuine corruption) from
+   * "cross-agent request, bytes not replicated locally" (expected
+   * until the source-artifact gossip follow-up lands). Omitted when
+   * the requester IS the assertion owner.
+   */
+  ownerGuardRelaxed?: boolean;
 };
 
 class ImportArtifactRouteError extends Error {
@@ -780,6 +791,38 @@ function assertImportedArtifactOwnerAddress(
   }
 }
 
+/**
+ * Issue #872 — public + open context graphs ship their SWM triples to
+ * every subscribed peer, so the owner-scoped artifact-read guard is
+ * the wrong policy for them: peers that legitimately replicated the
+ * triples can't even resolve metadata about the source markdown
+ * artifact, let alone fetch its bytes. This helper consults the
+ * agent's local on-chain policy cache (populated eagerly by the
+ * chain-event poller) to decide whether the guard should be relaxed.
+ *
+ * Returns `true` only when both policies are confirmed
+ * (`accessPolicy === 0` AND `publishPolicy === 1`). Any other state
+ * — including missing cache entries — yields `false`, which keeps
+ * the existing owner guard in effect (fail-closed).
+ *
+ * DEFERRED FOLLOW-UP: peers replicate SWM triples but NOT the source
+ * artifact bytes; with the guard relaxed, the read-markdown route
+ * will return 404 on every cross-agent read until byte-replication is
+ * added. Tracked in the PR body for #872.
+ */
+async function isPublicOpenContextGraph(
+  agent: { getContextGraphOnChainPolicy?: (id: string) => Promise<{ accessPolicy?: number; publishPolicy?: number }> },
+  contextGraphId: string,
+): Promise<boolean> {
+  if (typeof agent.getContextGraphOnChainPolicy !== 'function') return false;
+  try {
+    const policy = await agent.getContextGraphOnChainPolicy(contextGraphId);
+    return policy.accessPolicy === 0 && policy.publishPolicy === 1;
+  } catch {
+    return false;
+  }
+}
+
 function handleImportArtifactRouteError(res: ServerResponse, err: unknown): boolean {
   if (err instanceof ImportArtifactRouteError) {
     jsonResponse(res, err.statusCode, { error: err.message });
@@ -869,12 +912,27 @@ async function resolveImportedArtifact(
     throw new ImportArtifactRouteError(400, 'assertionUri is not in canonical assertion URI form');
   }
   const assertionUri = reconstructedAssertionUri;
+  let ownerGuardRelaxed = false;
   if (ownerGuard) {
-    assertImportedArtifactOwnerAddress(
-      parsedAssertion.assertionAgentAddress,
-      ownerGuard.requestAgentAddress,
-      ownerGuard.message,
-    );
+    // Issue #872 — drop the owner guard for public + open CGs. Their
+    // SWM triples are gossipped to every subscribed peer, so blocking
+    // cross-agent reads of the imported source artifact contradicts
+    // the very access policy the curator chose on-chain. For every
+    // other policy combo (curated, or curators-only publish), the
+    // guard stays in force.
+    const isPublicOpen = await isPublicOpenContextGraph(ctx.agent, contextGraphId);
+    if (isPublicOpen) {
+      ownerGuardRelaxed = !isSameAgentAddress(
+        parsedAssertion.assertionAgentAddress,
+        ownerGuard.requestAgentAddress,
+      );
+    } else {
+      assertImportedArtifactOwnerAddress(
+        parsedAssertion.assertionAgentAddress,
+        ownerGuard.requestAgentAddress,
+        ownerGuard.message,
+      );
+    }
   }
   if (assertionName && assertionName !== parsedAssertion.assertionName) {
     throw new ImportArtifactRouteError(400, '"assertionName" does not match assertionUri');
@@ -993,6 +1051,7 @@ async function resolveImportedArtifact(
     ...(markdownForm ? { markdownForm } : {}),
     ...(markdownHash ? { markdownHash } : {}),
     canReadMarkdown: Boolean(markdownHash),
+    ...(ownerGuardRelaxed ? { ownerGuardRelaxed: true } : {}),
   };
 }
 
@@ -1075,8 +1134,23 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
       }
       const bytes = await fileStore.get(artifact.markdownHash);
       if (!bytes) {
+        // Issue #872 — when the owner guard was relaxed (public + open
+        // CG, cross-agent request), the missing bytes are the
+        // expected outcome: peers replicate the SWM triples for the
+        // assertion but the source-artifact bytes are NOT gossipped
+        // yet. Surface that explicitly so callers can decide whether
+        // to retry against the origin agent instead of treating this
+        // as local corruption.
+        //
+        // DEFERRED FOLLOW-UP: gossip the imported-artifact bytes to
+        // peers replicating a public + open CG, so cross-agent reads
+        // can complete locally without an out-of-band fetch. Tracked
+        // in the PR body for #872.
+        const message = artifact.ownerGuardRelaxed
+          ? 'Markdown source bytes are not replicated locally on this peer; the assertion graph triples synced but the source artifact bytes were not. Fetch from the origin agent (assertionAgentAddress).'
+          : 'Markdown content is not present in the file store';
         return jsonResponse(res, 404, {
-          error: 'Markdown content is not present in the file store',
+          error: message,
           artifact,
         });
       }

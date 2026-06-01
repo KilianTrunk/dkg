@@ -72,6 +72,7 @@ export interface ImportedArtifactResolution {
   markdownForm?: string;
   markdownHash?: string;
   canReadMarkdown: boolean;
+  ownerGuardRelaxed?: boolean;
 }
 
 export interface SemanticEnrichmentWriteRequest extends ImportedArtifactRequest {

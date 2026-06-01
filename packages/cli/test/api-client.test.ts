@@ -54,6 +54,15 @@ function createTrackingFetch(response: { ok: boolean; status: number; statusText
   return { fetch: fn as typeof globalThis.fetch, calls };
 }
 
+function createRejectingFetch(error: Error): { fetch: typeof globalThis.fetch; calls: FetchCall[] } {
+  const calls: FetchCall[] = [];
+  const fn = async (url: string | URL | Request, init?: RequestInit) => {
+    calls.push({ url: String(url), opts: init as RequestInit });
+    throw error;
+  };
+  return { fetch: fn as typeof globalThis.fetch, calls };
+}
+
 describe('ApiClient', () => {
   let client: ApiClient;
   const originalFetch = globalThis.fetch;
@@ -121,6 +130,22 @@ describe('ApiClient', () => {
 
       await expect(connected.status()).rejects.toThrow('expected selected home node "isolated"');
       expect(calls).toHaveLength(1);
+      expect((calls[0].opts.headers as any).Authorization).toBeUndefined();
+    });
+
+    it('connect() reports daemon not running when selected home config fallback port is unreachable', async () => {
+      process.env.DKG_HOME = tempDir;
+      delete process.env.DKG_API_PORT;
+      await writeFile(join(tempDir, 'config.json'), JSON.stringify({ name: 'isolated', apiPort: 9317 }));
+      await writeFile(join(tempDir, 'auth.token'), 'local-token\n', 'utf8');
+      const { fetch, calls } = createRejectingFetch(new TypeError('fetch failed'));
+      globalThis.fetch = fetch;
+
+      const connected = await ApiClient.connect({ allowConfigFallback: true });
+
+      await expect(connected.status()).rejects.toThrow('Daemon is not running. Start it with: dkg start');
+      expect(calls).toHaveLength(1);
+      expect(calls[0].url).toBe('http://127.0.0.1:9317/api/status');
       expect((calls[0].opts.headers as any).Authorization).toBeUndefined();
     });
 

@@ -5826,6 +5826,19 @@ export class DKGAgent {
     const stateKey = swmSenderStateKey(input.contextGraphId, input.subGraphName, senderAddress);
     let state = this.swmSenderKeySendStates.get(stateKey);
     if (!state || state.membershipHash !== membershipHash) {
+      const pruned = this.prunePendingSenderKeysForEpochRotation({
+        contextGraphId: input.contextGraphId,
+        subGraphName: input.subGraphName,
+        senderAgentAddress: senderAddress,
+      });
+      if (pruned > 0) {
+        this.log.warn(
+          ctx,
+          `SWM sender-key epoch rotation pruned ${pruned} stale pending setup package(s) ` +
+          `for context graph "${input.contextGraphId}${input.subGraphName ? `/${input.subGraphName}` : ''}" sender ${senderAddress}`,
+        );
+        await this.saveSwmSenderKeyState();
+      }
       state = await this.createAndDistributeSwmSenderKeyEpoch({
         contextGraphId: input.contextGraphId,
         subGraphName: input.subGraphName,
@@ -6231,6 +6244,31 @@ export class DKGAgent {
     });
     filtered.push(entry);
     this.pendingSenderKeyByAgent.set(recipientKey, filtered);
+  }
+
+  private prunePendingSenderKeysForEpochRotation(input: {
+    contextGraphId: string;
+    subGraphName?: string;
+    senderAgentAddress: string;
+  }): number {
+    const senderAgentAddress = ethers.getAddress(input.senderAgentAddress).toLowerCase();
+    let removed = 0;
+    for (const [recipientKey, queue] of this.pendingSenderKeyByAgent.entries()) {
+      const kept = queue.filter((entry) => {
+        const matches =
+          entry.senderAgentAddress === senderAgentAddress &&
+          entry.contextGraphId === input.contextGraphId &&
+          (entry.subGraphName ?? undefined) === (input.subGraphName ?? undefined);
+        if (matches) removed += 1;
+        return !matches;
+      });
+      if (kept.length === 0) {
+        this.pendingSenderKeyByAgent.delete(recipientKey);
+      } else {
+        this.pendingSenderKeyByAgent.set(recipientKey, kept);
+      }
+    }
+    return removed;
   }
 
   private async drainPendingSenderKeyQueueForPeer(input: {
@@ -6862,11 +6900,24 @@ export class DKGAgent {
         );
       }
       const pendingByAgent = new Map<string, PendingSenderKeyEntry[]>();
+      let skippedPendingRows = 0;
       for (const entry of parsed.pending ?? []) {
         let pending: PendingSenderKeyEntry;
         try {
           pending = deserializePendingSenderKeyEntry(entry);
-        } catch {
+        } catch (err) {
+          skippedPendingRows += 1;
+          const raw = entry && typeof entry === 'object' ? entry as Record<string, unknown> : {};
+          const sender = typeof raw.senderAgentAddress === 'string' ? raw.senderAgentAddress : 'unknown-sender';
+          const recipient = typeof raw.recipientAgentAddress === 'string' ? raw.recipientAgentAddress : 'unknown-recipient';
+          const contextGraph = typeof raw.contextGraphId === 'string' ? raw.contextGraphId : 'unknown-context-graph';
+          const subGraph = typeof raw.subGraphName === 'string' ? `/${raw.subGraphName}` : '';
+          this.log.warn(
+            createOperationContext('share'),
+            `Skipped malformed SWM sender-key pending row #${skippedPendingRows} ` +
+            `(sender=${sender}, recipient=${recipient}, contextGraph=${contextGraph}${subGraph}): ` +
+            `${err instanceof Error ? err.message : String(err)}`,
+          );
           continue;
         }
         const recipientKey = pending.recipientAgentAddress.toLowerCase();
@@ -8731,6 +8782,19 @@ export class DKGAgent {
         `${logPrefix}: bootstrapping/rotating swm-sender-key epoch for curated CG ${contextGraphId} ` +
         `(sender=${senderAddress}, recipients=${resolution.recipients.length}, reason=${reason})`,
       );
+      const pruned = this.prunePendingSenderKeysForEpochRotation({
+        contextGraphId,
+        subGraphName,
+        senderAgentAddress: senderAddress,
+      });
+      if (pruned > 0) {
+        this.log.warn(
+          ctx,
+          `${logPrefix}: pruned ${pruned} stale pending SWM sender-key setup package(s) ` +
+          `for curated CG ${contextGraphId}${subGraphName ? `/${subGraphName}` : ''} sender ${senderAddress}`,
+        );
+        await this.saveSwmSenderKeyState();
+      }
       state = await this.createAndDistributeSwmSenderKeyEpoch({
         contextGraphId,
         subGraphName,

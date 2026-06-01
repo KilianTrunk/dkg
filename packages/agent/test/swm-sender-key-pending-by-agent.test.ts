@@ -447,10 +447,19 @@ describe('createAndDistributeSwmSenderKeyEpoch: missing-peerId soft success', ()
     internals.swmSenderKeySendStates.clear();
     internals.pendingSenderKeyByAgent.clear();
     internals.swmSenderKeyStateLoaded = false;
+    const logs: Array<{ level: string; message: string }> = [];
+    Logger.setSink((entry) => logs.push({ level: entry.level, message: entry.message }));
     await internals.loadSwmSenderKeyState();
 
     expect(internals.swmSenderKeySendStates.get(stateKey)?.epochId).toBe(sendState.epochId);
     expect(internals.pendingSenderKeyByAgent.size).toBe(0);
+    expect(logs).toContainEqual(expect.objectContaining({
+      level: 'warn',
+      message: expect.stringContaining('Skipped malformed SWM sender-key pending row #1'),
+    }));
+    const skippedLog = logs.find((entry) => entry.message.includes('Skipped malformed SWM sender-key pending row #1'));
+    expect(skippedLog?.message).toContain(sendState.contextGraphId);
+    expect(skippedLog?.message).toContain(recipient.agentAddress);
   });
 
   it('delivers pending package once the recipient peer connects', async () => {
@@ -1249,6 +1258,56 @@ describe('createAndDistributeSwmSenderKeyEpoch: missing-peerId soft success', ()
     )!;
     expect(queueAfterSecond).toHaveLength(1);
     expect(queueAfterSecond[0].epochId).not.toBe(firstEpochId);
+  });
+
+  it('prunes stale pending rows for a sender when membership rotates', async () => {
+    const boot = await bootAgent();
+    agent = boot.agent;
+    const internals = boot.internals;
+
+    const sender = agentFromPrivateKey(
+      ethers.Wallet.createRandom().privateKey,
+      'sender',
+    ) as AgentKeyRecord & { privateKey: string };
+    const otherSender = agentFromPrivateKey(
+      ethers.Wallet.createRandom().privateKey,
+      'other',
+    ) as AgentKeyRecord & { privateKey: string };
+    const removedRecipient = makeFakeRecipient();
+    const otherRecipient = makeFakeRecipient();
+
+    internals.pendingSenderKeyByAgent.set(removedRecipient.agentAddress.toLowerCase(), [{
+      senderAgentAddress: sender.agentAddress.toLowerCase(),
+      recipientAgentAddress: removedRecipient.agentAddress.toLowerCase(),
+      recipientKeyId: removedRecipient.recipientKeyId,
+      epochId: 'old-epoch',
+      contextGraphId: 'test-cg/prune',
+      packageBytes: new Uint8Array([1, 2, 3]),
+      createdAtMs: Date.now(),
+    }]);
+    internals.pendingSenderKeyByAgent.set(otherRecipient.agentAddress.toLowerCase(), [{
+      senderAgentAddress: otherSender.agentAddress.toLowerCase(),
+      recipientAgentAddress: otherRecipient.agentAddress.toLowerCase(),
+      recipientKeyId: otherRecipient.recipientKeyId,
+      epochId: 'other-epoch',
+      contextGraphId: 'test-cg/prune',
+      packageBytes: new Uint8Array([4, 5, 6]),
+      createdAtMs: Date.now(),
+    }]);
+
+    const removed = (internals as unknown as {
+      prunePendingSenderKeysForEpochRotation(input: {
+        contextGraphId: string;
+        senderAgentAddress: string;
+      }): number;
+    }).prunePendingSenderKeysForEpochRotation({
+      contextGraphId: 'test-cg/prune',
+      senderAgentAddress: sender.agentAddress,
+    });
+
+    expect(removed).toBe(1);
+    expect(internals.pendingSenderKeyByAgent.has(removedRecipient.agentAddress.toLowerCase())).toBe(false);
+    expect(internals.pendingSenderKeyByAgent.get(otherRecipient.agentAddress.toLowerCase())).toHaveLength(1);
   });
 });
 

@@ -17,6 +17,7 @@ import {
   readApiPort,
   ensureDkgDir,
   configExists,
+  readNodeRoleFromConfigSync,
   isDkgMonorepo,
   dkgDir,
   repoDir,
@@ -244,10 +245,23 @@ describe('localAgentIntegrations config round-trip', () => {
     expect((thrown as Error).name).toBe('YAMLException');
   });
 
-  it('does not treat yaml-only homes as globally initialized configs', async () => {
+  it('treats yaml-only homes as initialized configs', async () => {
     await writeFile(join(tempDir, 'config.yaml'), 'name: yaml-only\napiPort: 9317\n', 'utf8');
 
-    expect(configExists()).toBe(false);
+    expect(configExists()).toBe(true);
+  });
+
+  it('reads nodeRole from yaml-only config for sync daemon entrypoint routing', async () => {
+    await writeFile(join(tempDir, 'config.yaml'), 'name: yaml-core\nnodeRole: core\n', 'utf8');
+
+    expect(readNodeRoleFromConfigSync()).toBe('core');
+  });
+
+  it('keeps config.json precedence for sync nodeRole reads', async () => {
+    await writeFile(join(tempDir, 'config.json'), JSON.stringify({ nodeRole: 'edge' }), 'utf8');
+    await writeFile(join(tempDir, 'config.yaml'), 'nodeRole: core\n', 'utf8');
+
+    expect(readNodeRoleFromConfigSync()).toBe('edge');
   });
 
   it('round-trips relayServerCapacity through saveConfig/loadConfig (operator override)', async () => {

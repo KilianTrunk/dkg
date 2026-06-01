@@ -1729,3 +1729,255 @@ describe('ensureV10ApproveTrac — call-site invariants (publish vs update)', ()
   });
 });
 
+// -----------------------------------------------------------------------------
+// Regression tests for #870 — per-publish allowance check must target the
+// actual publish signer.
+//
+// Reported scenario: a fresh edge node reverted with
+// `TooLowAllowance(TRAC, 0, 1)` on `KnowledgeAssetsLifecycle.publish(...)`
+// even though the default `per-publish` policy should have auto-approved.
+// One candidate root cause was a wallet mismatch — the approval gate reading
+// allowance against signer A while `publishV10` later submitted from a
+// different signer B with 0 allowance.
+//
+// The tests below pin down the invariant end-to-end by driving
+// `createKnowledgeAssets` / `updateKnowledgeCollectionV10` with a multi-wallet
+// signer pool and asserting the approve sender is the wallet that goes on
+// to sign the publish / update tx. They catch any future refactor that
+// would reintroduce the mismatch — by reading allowance against `this.signer`
+// instead of `txSigner`, by rotating signers between the two steps, etc.
+// -----------------------------------------------------------------------------
+
+describe('createKnowledgeAssets / updateKnowledgeCollectionV10 — approval signer parity (#870)', () => {
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  const PARITY_KA_ADDRESS = '0x' + 'cd'.repeat(20);
+
+  function makeAllowanceByOwner(): Map<string, bigint> {
+    return new Map<string, bigint>();
+  }
+
+  function makeMultiWalletV10Adapter(allowanceByOwner: Map<string, bigint>) {
+    const a = new EVMChainAdapter(minimalConfig({
+      privateKey: DEPLOYER_PK,
+      additionalKeys: [OTHER_PK],
+    }));
+    const [walletA, walletB] = (a as any).signerPool as [ethers.Wallet, ethers.Wallet];
+
+    (a as any).initialized = true;
+
+    const tokenWithSigner = {
+      allowance: vi.fn(async (owner: string, _spender: string) => {
+        return allowanceByOwner.get(owner.toLowerCase()) ?? 0n;
+      }),
+      approve: vi.fn(),
+    };
+    (a as any).contracts.token = {
+      connect: vi.fn(() => tokenWithSigner),
+    };
+
+    const populateSpy = vi.fn(async () => ({
+      to: PARITY_KA_ADDRESS,
+      data: '0xdeadbeef',
+    }));
+    const kavContract = {
+      getAddress: vi.fn(async () => PARITY_KA_ADDRESS),
+      publish: { populateTransaction: populateSpy },
+      update: { populateTransaction: populateSpy },
+    };
+    (a as any).contracts.knowledgeAssetsLifecycle = {
+      connect: vi.fn(() => kavContract),
+      getAddress: vi.fn(async () => PARITY_KA_ADDRESS),
+    };
+
+    (a as any).contracts.contextGraphs = {
+      isAuthorizedPublisher: vi.fn(async () => true),
+    };
+
+    const sendSpy = vi.fn(async () => ({} as unknown));
+    (a as any).sendContractTransaction = sendSpy;
+
+    // Stop the publish/update flow right after the approval gate by throwing
+    // a sentinel at the signing step. We only need to observe the signer
+    // arguments at `ensureV10ApproveTrac` and `signPopulatedTransaction`.
+    const signSpy = vi.fn(async () => {
+      throw new Error('SENTINEL_STOP_AFTER_APPROVE');
+    });
+    (a as any).signPopulatedTransaction = signSpy;
+
+    return { a, walletA, walletB, tokenWithSigner, sendSpy, signSpy, populateSpy };
+  }
+
+  function makeV10PublishParams(publisherAddress?: string): any {
+    const params: any = {
+      publishOperationId: ethers.hexlify(ethers.randomBytes(32)),
+      contextGraphId: 7n,
+      merkleRoot: ethers.getBytes(ethers.keccak256(ethers.toUtf8Bytes('mr'))),
+      knowledgeAssetsAmount: 1,
+      byteSize: 100,
+      epochs: 1,
+      tokenAmount: 0n,
+      isImmutable: false,
+      merkleLeafCount: 1,
+      publisherNodeIdentityId: 0n,
+      author: {
+        address: publisherAddress ?? ethers.ZeroAddress,
+        signature: { r: new Uint8Array(32), vs: new Uint8Array(32) },
+        schemeVersion: 1,
+      },
+      ackSignatures: [],
+    };
+    if (publisherAddress) params.publisherAddress = publisherAddress;
+    return params;
+  }
+
+  it('publish path: approve fires from the wallet matching publisherAddress, NOT a sibling pool wallet with stale allowance', async () => {
+    // The exact #870 scenario:
+    //   - Pool = [walletA, walletB].
+    //   - walletA already has 10 TRAC allowance (e.g. left over from an
+    //     earlier op or another publisher in the same daemon).
+    //   - walletB has 0 allowance (fresh).
+    //   - The publisher binds the tx to walletB via `publisherAddress`.
+    //   - `ensureV10ApproveTrac` MUST read allowance(walletB, KA) and send
+    //     `approve(KA, 1n)` from walletB — NOT from walletA. The publish tx
+    //     that follows MUST also be signed by walletB.
+    //
+    // A regression that read allowance against `this.signer` (== walletA in
+    // this pool ordering) would see 10 TRAC ≥ 1n, skip approve, then submit
+    // a publish from walletB that reverts on-chain with
+    // `TooLowAllowance(TRAC, 0, 1)` — exactly the symptom in #870.
+    const allowanceByOwner = makeAllowanceByOwner();
+    const { a, walletA, walletB, tokenWithSigner, sendSpy, signSpy } =
+      makeMultiWalletV10Adapter(allowanceByOwner);
+    allowanceByOwner.set(walletA.address.toLowerCase(), 10n * 10n ** 18n);
+    allowanceByOwner.set(walletB.address.toLowerCase(), 0n);
+
+    await expect(
+      a.createKnowledgeAssets(makeV10PublishParams(walletB.address)),
+    ).rejects.toThrow('SENTINEL_STOP_AFTER_APPROVE');
+
+    expect(tokenWithSigner.allowance).toHaveBeenCalledWith(
+      walletB.address,
+      PARITY_KA_ADDRESS,
+    );
+    expect(tokenWithSigner.allowance).not.toHaveBeenCalledWith(
+      walletA.address,
+      PARITY_KA_ADDRESS,
+    );
+
+    expect(sendSpy).toHaveBeenCalledTimes(1);
+    const [, approveMethod, approveArgs, approveSender] = sendSpy.mock.calls[0];
+    expect(approveMethod).toBe('approve');
+    expect(approveArgs).toEqual([PARITY_KA_ADDRESS, 1n]);
+    expect(approveSender).toBe(walletB);
+
+    expect(signSpy).toHaveBeenCalledTimes(1);
+    expect(signSpy.mock.calls[0][0]).toBe(walletB);
+  });
+
+  it('publish path: when publisherAddress is omitted, round-robin signer is also the approve signer (no mid-flight rotation)', async () => {
+    // Without `publisherAddress`, `txSigner` is picked via
+    // `nextAuthorizedSigner` (round-robin among authorized wallets). The
+    // approval and the publish MUST target that same wallet — no signer swap
+    // between the two steps. A regression that called
+    // `nextAuthorizedSigner` again later in the flow would rotate to the
+    // next wallet and reintroduce the wallet-mismatch class of bug.
+    const allowanceByOwner = makeAllowanceByOwner();
+    const { a, walletA, tokenWithSigner, sendSpy, signSpy } =
+      makeMultiWalletV10Adapter(allowanceByOwner);
+
+    await expect(
+      a.createKnowledgeAssets(makeV10PublishParams()),
+    ).rejects.toThrow('SENTINEL_STOP_AFTER_APPROVE');
+
+    expect(tokenWithSigner.allowance).toHaveBeenCalledWith(
+      walletA.address,
+      PARITY_KA_ADDRESS,
+    );
+    const [, approveMethod, approveArgs, approveSender] = sendSpy.mock.calls[0];
+    expect(approveMethod).toBe('approve');
+    expect(approveArgs).toEqual([PARITY_KA_ADDRESS, 1n]);
+    expect(approveSender).toBe(walletA);
+    expect(signSpy.mock.calls[0][0]).toBe(walletA);
+  });
+
+  it('update path: approve fires from the on-chain publisher wallet, NOT a round-robin pick from the pool', async () => {
+    // `updateKnowledgeCollectionV10` resolves the signer by looking up
+    // `getLatestMerkleRootPublisher(kaId)` first; only if that wallet is not
+    // in the pool does it fall back to the publisherAddress hint or
+    // `nextSigner()` (round-robin). The approval gate MUST target the
+    // resolved wallet — otherwise a wallet with stale allowance from any
+    // other operation could falsely pass the gate while the actual update
+    // tx submits from a different wallet at 0 allowance.
+    const allowanceByOwner = makeAllowanceByOwner();
+    const { a, walletA, walletB, tokenWithSigner, sendSpy, signSpy } =
+      makeMultiWalletV10Adapter(allowanceByOwner);
+    // walletA — the default round-robin pick (index 0) — has plenty of
+    // allowance. walletB — the on-chain publisher of this KA — has none.
+    allowanceByOwner.set(walletA.address.toLowerCase(), 10n * 10n ** 18n);
+    allowanceByOwner.set(walletB.address.toLowerCase(), 0n);
+
+    // Mocks the update path needs in addition to the publish ones.
+    const kaId = 42n;
+    (a as any).contracts.knowledgeAssetStorage = {
+      getLatestMerkleRootPublisher: vi.fn(async () => walletB.address),
+      getMerkleRoots: vi.fn(async () => []),
+    };
+    (a as any).contracts.contextGraphStorage = {
+      kaToContextGraph: vi.fn(async () => 0n),
+    };
+    (a as any).resolveCurrentTokenAmount = vi.fn(async () => 0n);
+    (a as any).computeUpdateNewTokenAmount = vi.fn(async () => 0n);
+    (a as any).getIdentityId = vi.fn(async () => 0n);
+    // `provider.getNetwork()` is called for chainId; stub it so the update
+    // path doesn't try to hit the placeholder RPC.
+    (a as any).provider = {
+      getNetwork: vi.fn(async () => ({ chainId: 31337n })),
+    };
+
+    const updateParams: any = {
+      kaId,
+      newMerkleRoot: ethers.getBytes(ethers.keccak256(ethers.toUtf8Bytes('umr'))),
+      newByteSize: 100,
+      newMerkleLeafCount: 1,
+      newTokenAmount: 0n,
+      authorAddress: walletB.address,
+      authorR: new Uint8Array(32),
+      authorVS: new Uint8Array(32),
+      authorSchemeVersion: 1,
+      // Provide pre-signed ACKs so the update path skips the in-line
+      // `signer.signMessage(ackDigest)` step that would otherwise trip on
+      // our minimal mocking surface.
+      ackSignatures: [{
+        identityId: 1n,
+        r: new Uint8Array(32),
+        vs: new Uint8Array(32),
+      }],
+    };
+
+    await expect(
+      a.updateKnowledgeCollectionV10(updateParams),
+    ).rejects.toThrow('SENTINEL_STOP_AFTER_APPROVE');
+
+    expect(tokenWithSigner.allowance).toHaveBeenCalledWith(
+      walletB.address,
+      PARITY_KA_ADDRESS,
+    );
+    expect(tokenWithSigner.allowance).not.toHaveBeenCalledWith(
+      walletA.address,
+      PARITY_KA_ADDRESS,
+    );
+
+    expect(sendSpy).toHaveBeenCalledTimes(1);
+    const [, approveMethod, approveArgs, approveSender, approveLabel] =
+      sendSpy.mock.calls[0];
+    expect(approveMethod).toBe('approve');
+    expect(approveArgs).toEqual([PARITY_KA_ADDRESS, 1n]);
+    expect(approveSender).toBe(walletB);
+    expect(approveLabel).toBe('approve V10 update TRAC');
+
+    expect(signSpy).toHaveBeenCalledTimes(1);
+    expect(signSpy.mock.calls[0][0]).toBe(walletB);
+  });
+});
+

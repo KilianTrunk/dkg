@@ -318,6 +318,7 @@ import {
   type DurableSyncResult,
   type SharedMemorySyncResult,
   type DKGAgentConfig,
+  type ReplicationEvent,
 } from './dkg-agent-types.js';
 import {
   normalizePublishContextGraphId,
@@ -12075,6 +12076,37 @@ export class DKGAgent {
   // ===== Phase B — chain-driven VM reconciliation (B.4 agent wiring) =========
 
   /**
+   * Phase E/F — emit one reconciliation telemetry event. Logs a structured
+   * `chain-promote` line (grep surface) and forwards to the optional ops-metrics
+   * sink (Phase F). Best-effort: never throws, never awaits the sink.
+   */
+  private emitReplication(ev: Omit<ReplicationEvent, 'ts'>): void {
+    const event: ReplicationEvent = { ts: Date.now(), ...ev };
+    const parts = [
+      `chain-promote action=${event.action}`,
+      `cg=${event.contextGraphId}`,
+      event.onChainCgId ? `onChainCg=${event.onChainCgId}` : '',
+      event.ordinal !== undefined ? `ordinal=${event.ordinal}` : '',
+      event.kaId ? `ka=${event.kaId}` : '',
+      event.fromWatermark !== undefined && event.toWatermark !== undefined ? `cursor=${event.fromWatermark}->${event.toWatermark}` : '',
+      event.head !== undefined ? `head=${event.head}` : '',
+      event.reconciled !== undefined ? `reconciled=${event.reconciled}` : '',
+      event.pending !== undefined ? `pending=${event.pending}` : '',
+      event.ual ? `ual=${event.ual}` : '',
+      event.detail ? `detail="${event.detail}"` : '',
+    ].filter(Boolean);
+    this.log.info(createOperationContext('system'), parts.join(' '));
+    const sink = this.config.onReplicationEvent;
+    if (sink) {
+      try {
+        sink(event);
+      } catch (err) {
+        this.log.warn(createOperationContext('system'), `onReplicationEvent sink threw: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+  }
+
+  /**
    * True iff the chain adapter exposes the per-CG registration-ordinal reads
    * the reconciler needs. Gates the live nudge, the sweep timer, and the
    * coalescer so non-V10 / no-chain nodes pay nothing.
@@ -12134,15 +12166,34 @@ export class DKGAgent {
       persistWatermark: (lcg, watermark) => {
         const s = this.subscribedContextGraphs.get(lcg);
         if (!s) return;
+        const previous = s.lastReconciledOrdinal ?? 0;
         s.lastReconciledOrdinal = watermark;
         this.persistContextGraphSubscription(lcg);
+        this.emitReplication({
+          contextGraphId: lcg,
+          onChainCgId: s.onChainId,
+          action: 'cursor-advance',
+          fromWatermark: previous,
+          toWatermark: watermark,
+        });
       },
       confirmationDepth: DKGAgent.VM_RECONCILE_CONFIRMATION_DEPTH,
       log: (msg) => this.log.info(createOperationContext('system'), msg),
     };
 
     try {
-      await reconcileContextGraph(deps, cursor, localCgId, onChainCgId);
+      const result = await reconcileContextGraph(deps, cursor, localCgId, onChainCgId);
+      if (result.reconciled > 0 || result.pending > 0) {
+        this.emitReplication({
+          contextGraphId: localCgId,
+          onChainCgId: sub.onChainId,
+          action: 'sweep',
+          head: result.head,
+          toWatermark: result.watermark,
+          reconciled: result.reconciled,
+          pending: result.pending,
+        });
+      }
     } catch (err) {
       this.log.warn(
         createOperationContext('system'),
@@ -12210,6 +12261,10 @@ export class DKGAgent {
     if (outcome === 'no-swm') {
       // Active fetch: pull the missing snapshot core-first (selectCatchupPeers
       // already prioritises known cores + the preferred sync peer), then retry.
+      this.emitReplication({
+        contextGraphId: localCgId, onChainCgId: onChainCgId.toString(),
+        action: 'fetch', ordinal, kaId: kaId.toString(), ual,
+      });
       try {
         await this.syncContextGraphFromConnectedPeers(localCgId, { includeSharedMemory: true });
       } catch (err) {
@@ -12221,15 +12276,27 @@ export class DKGAgent {
     switch (outcome) {
       case 'promoted':
         this.recentReconciledUals.add(ual);
+        this.emitReplication({
+          contextGraphId: localCgId, onChainCgId: onChainCgId.toString(),
+          action: 'promote', ordinal, kaId: kaId.toString(), ual,
+        });
         return { status: 'reconciled', blockNumber: versionBlock };
       case 'already-confirmed':
       case 'stale-target':
         // Already in VM (or a newer update is) — done for cursor purposes.
         this.recentReconciledUals.add(ual);
+        this.emitReplication({
+          contextGraphId: localCgId, onChainCgId: onChainCgId.toString(),
+          action: 'already', ordinal, kaId: kaId.toString(), ual,
+        });
         return { status: 'already', blockNumber: versionBlock };
       case 'no-swm':
       case 'unverified':
       default:
+        this.emitReplication({
+          contextGraphId: localCgId, onChainCgId: onChainCgId.toString(),
+          action: 'defer', ordinal, kaId: kaId.toString(), ual, detail: outcome,
+        });
         return { status: 'pending' };
     }
   }

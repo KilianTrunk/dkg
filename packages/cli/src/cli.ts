@@ -1225,7 +1225,7 @@ program
   .description('Show node status')
   .action(async () => {
     try {
-      const client = await ApiClient.connect();
+      const client = await ApiClient.connect({ allowConfigFallback: true });
       const s = await client.status();
       const uptime = formatUptime(s.uptimeMs);
       console.log(`  Node:      ${s.name}`);
@@ -1249,6 +1249,7 @@ program
       } else {
         console.log(`  Store:     ${backend}`);
       }
+      if (client.controlPlaneWarning) console.warn(client.controlPlaneWarning);
     } catch (err) {
       console.error(toErrorMessage(err));
       process.exit(1);

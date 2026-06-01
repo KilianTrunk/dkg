@@ -1,6 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import { basename } from 'node:path';
-import { readApiPort, readPid, isProcessRunning } from './config.js';
+import { readApiPort, readPid, isProcessRunning, configExists, loadConfig } from './config.js';
 import { loadTokens } from './auth.js';
 
 export type QueryResult =
@@ -68,23 +68,50 @@ export interface DaemonStatusResponse {
   storeQuads?: number | null;
 }
 
+export interface ApiClientConnectOptions {
+  allowConfigFallback?: boolean;
+}
+
+function controlPlaneWarning(missingFiles: string[]): string | undefined {
+  if (missingFiles.length === 0) return undefined;
+  return `Warning: selected DKG home is missing control-plane file(s): ${missingFiles.join(', ')}. Using configured API port fallback.`;
+}
+
 export class ApiClient {
   private baseUrl: string;
   private token?: string;
+  readonly controlPlaneWarning?: string;
 
-  constructor(portOrBaseUrl: number | string, token?: string) {
+  constructor(portOrBaseUrl: number | string, token?: string, opts?: { controlPlaneWarning?: string }) {
     this.baseUrl = typeof portOrBaseUrl === 'number'
       ? `http://127.0.0.1:${portOrBaseUrl}`
       : portOrBaseUrl.replace(/\/+$/, '');
     this.token = token;
+    this.controlPlaneWarning = opts?.controlPlaneWarning;
   }
 
-  static async connect(): Promise<ApiClient> {
-    const envPort = process.env.DKG_API_PORT
-      ? parseInt(process.env.DKG_API_PORT, 10)
+  static async connect(opts: ApiClientConnectOptions = {}): Promise<ApiClient> {
+    const hasEnvPort = process.env.DKG_API_PORT !== undefined && process.env.DKG_API_PORT !== '';
+    const envPort = hasEnvPort
+      ? parseInt(process.env.DKG_API_PORT as string, 10)
       : null;
 
-    let port = envPort ?? (await readApiPort());
+    const filePort = hasEnvPort ? null : await readApiPort();
+    let port = envPort ?? filePort;
+    let warning: string | undefined;
+
+    if (!port) {
+      const pid = await readPid();
+      if (opts.allowConfigFallback && !hasEnvPort && configExists()) {
+        const config = await loadConfig();
+        const configuredPort = Number.isFinite(config.apiPort) && config.apiPort > 0 ? config.apiPort : null;
+        if (configuredPort) {
+          const missingFiles = ['api.port', ...(pid ? [] : ['daemon.pid'])];
+          port = configuredPort;
+          warning = controlPlaneWarning(missingFiles);
+        }
+      }
+    }
 
     if (!port) {
       const pid = await readPid();
@@ -96,7 +123,7 @@ export class ApiClient {
 
     const tokens = await loadTokens();
     const token = tokens.size > 0 ? tokens.values().next().value : undefined;
-    return new ApiClient(port, token);
+    return new ApiClient(port, token, { controlPlaneWarning: warning });
   }
 
   async status(): Promise<DaemonStatusResponse> {

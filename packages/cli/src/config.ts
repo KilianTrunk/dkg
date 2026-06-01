@@ -1119,11 +1119,17 @@ function mergePersistedConfig(raw: unknown): DkgConfig {
   return { ...DEFAULT_CONFIG, ...(raw as Partial<DkgConfig>) };
 }
 
+function isEnoent(err: unknown): boolean {
+  return !!err && typeof err === 'object' && (err as { code?: unknown }).code === 'ENOENT';
+}
+
 export async function loadConfig(): Promise<DkgConfig> {
   try {
     const raw = await readFile(configPath(), 'utf-8');
     return mergePersistedConfig(JSON.parse(raw));
-  } catch { /* try YAML fallback */ }
+  } catch (err) {
+    if (!isEnoent(err)) throw err;
+  }
 
   try {
     const raw = await readFile(configYamlPath(), 'utf-8');

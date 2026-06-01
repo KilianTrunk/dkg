@@ -9,7 +9,7 @@ import {
   type ProtocolOutboxStore,
 } from '@origintrail-official/dkg-core';
 
-const SCHEMA_VERSION = 17;
+const SCHEMA_VERSION = 18;
 // Default operator retention. Lowered from 90 → 14 days on V15 (2026-05) after
 // a production incident in which the `logs` table + its FTS5 shadow tables
 // grew to ~9 GB on a 12-day-old node and corrupted the SQLite page (header
@@ -667,6 +667,36 @@ export class DashboardDB {
       }
     }
 
+    if (version < 18) {
+      // Phase F (Replication observability): persist the chain-driven VM
+      // reconciliation telemetry the agent emits via `onReplicationEvent`, so
+      // the /ui/observability Replication tab can aggregate efficiently without
+      // re-parsing the daemon log. One row per decision point (sweep / fetch /
+      // promote / already / defer / cursor-advance / core-fill). Pruned by `ts`
+      // like the other event tables.
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS replication_events (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ts INTEGER NOT NULL,
+          context_graph_id TEXT NOT NULL,
+          on_chain_cg_id TEXT,
+          action TEXT NOT NULL,
+          ual TEXT,
+          ordinal INTEGER,
+          ka_id TEXT,
+          from_watermark INTEGER,
+          to_watermark INTEGER,
+          head INTEGER,
+          reconciled INTEGER,
+          pending INTEGER,
+          detail TEXT
+        );
+      `);
+      this.db.exec(`CREATE INDEX IF NOT EXISTS idx_repl_ts ON replication_events(ts);`);
+      this.db.exec(`CREATE INDEX IF NOT EXISTS idx_repl_cg ON replication_events(context_graph_id, ts);`);
+      this.db.exec(`CREATE INDEX IF NOT EXISTS idx_repl_action ON replication_events(action, ts);`);
+    }
+
     this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
     if (upgradedExistingDb && !this.explicitRetentionDays) {
       this.retentionDays = LEGACY_IMPLICIT_RETENTION_DAYS;
@@ -702,6 +732,7 @@ export class DashboardDB {
     this.db.exec(`DELETE FROM chat_messages WHERE ts < ${cutoff}`);
     this.db.exec(`DELETE FROM chat_persistence_jobs WHERE updated_at < ${cutoff} AND status IN ('stored', 'failed')`);
     this.db.exec(`DELETE FROM notifications WHERE ts < ${cutoff}`);
+    this.db.exec(`DELETE FROM replication_events WHERE ts < ${cutoff}`);
     // Universal Messenger idempotency table. Shorter TTL than the
     // operator retention: no realistic dedup window extends beyond
     // a day. The protocol_outbox table is intentionally not pruned
@@ -820,6 +851,168 @@ export class DashboardDB {
 
   deleteContextGraphSubscription(contextGraphId: string): void {
     this.stmt('deleteContextGraphSubscription', 'DELETE FROM context_graph_subscriptions WHERE context_graph_id = ?').run(contextGraphId);
+  }
+
+  // --- Phase F: chain-driven VM reconciliation telemetry ---
+
+  /**
+   * Persist one {@link ReplicationEvent} (best-effort sink target). `ordinal`,
+   * watermarks etc. are nullable per the event shape. Number-typed fields are
+   * coerced defensively so a malformed event can never abort the insert.
+   */
+  insertReplicationEvent(ev: ReplicationEventRow): void {
+    this.stmt('insertReplicationEvent', `
+      INSERT INTO replication_events (
+        ts, context_graph_id, on_chain_cg_id, action, ual, ordinal, ka_id,
+        from_watermark, to_watermark, head, reconciled, pending, detail
+      ) VALUES (
+        @ts, @context_graph_id, @on_chain_cg_id, @action, @ual, @ordinal, @ka_id,
+        @from_watermark, @to_watermark, @head, @reconciled, @pending, @detail
+      )
+    `).run({
+      ts: ev.ts,
+      context_graph_id: ev.context_graph_id,
+      on_chain_cg_id: ev.on_chain_cg_id ?? null,
+      action: ev.action,
+      ual: ev.ual ?? null,
+      ordinal: ev.ordinal ?? null,
+      ka_id: ev.ka_id ?? null,
+      from_watermark: ev.from_watermark ?? null,
+      to_watermark: ev.to_watermark ?? null,
+      head: ev.head ?? null,
+      reconciled: ev.reconciled ?? null,
+      pending: ev.pending ?? null,
+      detail: ev.detail ?? null,
+    });
+  }
+
+  /**
+   * Network-wide replication KPIs over the trailing `periodMs`:
+   *  - promotion latency (P50/P95) — fetch→promote delta per UAL.
+   *  - reconcile success rate — promote / (promote + fetch).
+   *  - raw action counts.
+   */
+  getReplicationSummary(periodMs = 24 * 86_400_000): ReplicationSummary {
+    const cutoff = Date.now() - periodMs;
+    const rows = this.db.prepare(
+      `SELECT action, COUNT(*) AS n FROM replication_events WHERE ts >= ? GROUP BY action`,
+    ).all(cutoff) as Array<{ action: string; n: number }>;
+    const counts: Record<string, number> = {};
+    for (const r of rows) counts[r.action] = r.n;
+
+    const promotes = counts['promote'] ?? 0;
+    const fetches = counts['fetch'] ?? 0;
+    const defers = counts['defer'] ?? 0;
+    // Success rate: of the publishes the engine TRIED to land this window
+    // (anything that produced a promote or a defer), how many promoted.
+    const attempts = promotes + defers;
+    const successRate = attempts > 0 ? promotes / attempts : null;
+
+    // Promotion latency: pair each `promote` with the most-recent prior
+    // `fetch` for the same UAL within the window. Promotes without a fetch
+    // (SWM already present — the fast path) contribute a 0ms latency.
+    const latencyRows = this.db.prepare(`
+      SELECT p.ts AS promote_ts,
+             (SELECT MAX(f.ts) FROM replication_events f
+                WHERE f.ual = p.ual AND f.action = 'fetch' AND f.ts <= p.ts AND f.ts >= ?) AS fetch_ts
+      FROM replication_events p
+      WHERE p.action = 'promote' AND p.ts >= ? AND p.ual IS NOT NULL
+    `).all(cutoff, cutoff) as Array<{ promote_ts: number; fetch_ts: number | null }>;
+    const latencies = latencyRows
+      .map((r) => (r.fetch_ts != null ? r.promote_ts - r.fetch_ts : 0))
+      .filter((d) => d >= 0)
+      .sort((a, b) => a - b);
+    const pct = (p: number): number | null => {
+      if (latencies.length === 0) return null;
+      const idx = Math.min(latencies.length - 1, Math.floor((p / 100) * latencies.length));
+      return latencies[idx];
+    };
+
+    return {
+      periodMs,
+      counts,
+      promotes,
+      fetches,
+      defers,
+      successRate,
+      latencyP50Ms: pct(50),
+      latencyP95Ms: pct(95),
+      totalEvents: rows.reduce((s, r) => s + r.n, 0),
+    };
+  }
+
+  /** Per-CG rollup of replication activity over the window, newest-active first. */
+  getReplicationPerCg(periodMs = 24 * 86_400_000): ReplicationPerCgRow[] {
+    const cutoff = Date.now() - periodMs;
+    return this.db.prepare(`
+      SELECT context_graph_id,
+             on_chain_cg_id,
+             SUM(CASE WHEN action = 'promote' THEN 1 ELSE 0 END) AS promotes,
+             SUM(CASE WHEN action = 'fetch'   THEN 1 ELSE 0 END) AS fetches,
+             SUM(CASE WHEN action = 'defer'   THEN 1 ELSE 0 END) AS defers,
+             SUM(CASE WHEN action = 'cursor-advance' THEN 1 ELSE 0 END) AS cursor_advances,
+             MAX(to_watermark) AS last_watermark,
+             MAX(head) AS last_head,
+             MAX(ts) AS last_event_ts
+      FROM replication_events
+      WHERE ts >= ?
+      GROUP BY context_graph_id, on_chain_cg_id
+      ORDER BY last_event_ts DESC
+    `).all(cutoff) as ReplicationPerCgRow[];
+  }
+
+  /**
+   * Time-bucketed event series for the timeline charts. When `contextGraphId`
+   * is given, the series is scoped to that CG.
+   */
+  getReplicationTimeline(opts: { periodMs: number; bucketMs: number; contextGraphId?: string }): ReplicationTimelineBucket[] {
+    const cutoff = Date.now() - opts.periodMs;
+    const bucket = Math.max(1, Math.floor(opts.bucketMs));
+    const where = opts.contextGraphId ? 'AND context_graph_id = @cg' : '';
+    return this.db.prepare(`
+      SELECT (ts / @bucket) * @bucket AS bucket,
+             SUM(CASE WHEN action = 'promote' THEN 1 ELSE 0 END) AS promotes,
+             SUM(CASE WHEN action = 'fetch'   THEN 1 ELSE 0 END) AS fetches,
+             SUM(CASE WHEN action = 'defer'   THEN 1 ELSE 0 END) AS defers,
+             COUNT(*) AS total
+      FROM replication_events
+      WHERE ts >= @cutoff ${where}
+      GROUP BY bucket
+      ORDER BY bucket ASC
+    `).all({ cutoff, bucket, cg: opts.contextGraphId ?? null }) as ReplicationTimelineBucket[];
+  }
+
+  /**
+   * Recent raw events for a CG (the per-CG timeline drawer). Newest first.
+   */
+  getReplicationEventsForCg(contextGraphId: string, limit = 100): ReplicationEventRow[] {
+    return this.db.prepare(`
+      SELECT ts, context_graph_id, on_chain_cg_id, action, ual, ordinal, ka_id,
+             from_watermark, to_watermark, head, reconciled, pending, detail
+      FROM replication_events
+      WHERE context_graph_id = ?
+      ORDER BY ts DESC
+      LIMIT ?
+    `).all(contextGraphId, Math.max(1, Math.min(1000, limit))) as ReplicationEventRow[];
+  }
+
+  /**
+   * Cursor inspector source: every subscription's persisted watermark joined
+   * with the freshest observed chain head from the event stream. This is the
+   * on-disk truth the Replication tab's cursor inspector renders.
+   */
+  getReplicationCursors(): ReplicationCursorRow[] {
+    return this.db.prepare(`
+      SELECT s.context_graph_id            AS context_graph_id,
+             s.on_chain_id                 AS on_chain_id,
+             s.last_reconciled_ordinal     AS last_reconciled_ordinal,
+             (SELECT MAX(head) FROM replication_events e
+                WHERE e.context_graph_id = s.context_graph_id) AS last_head,
+             (SELECT MAX(ts) FROM replication_events e
+                WHERE e.context_graph_id = s.context_graph_id) AS last_event_ts
+      FROM context_graph_subscriptions s
+      ORDER BY s.context_graph_id ASC
+    `).all() as ReplicationCursorRow[];
   }
 
   upsertContextGraphMember(record: {
@@ -2480,6 +2673,65 @@ export interface ContextGraphSubscriptionRow {
   last_reconciled_ordinal: number | null;
   sync_scoped: number;
   updated_at: number;
+}
+
+// --- Phase F: chain-driven VM reconciliation telemetry rows ---
+
+export interface ReplicationEventRow {
+  ts: number;
+  context_graph_id: string;
+  on_chain_cg_id?: string | null;
+  action: string;
+  ual?: string | null;
+  ordinal?: number | null;
+  ka_id?: string | null;
+  from_watermark?: number | null;
+  to_watermark?: number | null;
+  head?: number | null;
+  reconciled?: number | null;
+  pending?: number | null;
+  detail?: string | null;
+}
+
+export interface ReplicationSummary {
+  periodMs: number;
+  counts: Record<string, number>;
+  promotes: number;
+  fetches: number;
+  defers: number;
+  /** promote / (promote + defer); null when no attempts in window. */
+  successRate: number | null;
+  latencyP50Ms: number | null;
+  latencyP95Ms: number | null;
+  totalEvents: number;
+}
+
+export interface ReplicationPerCgRow {
+  context_graph_id: string;
+  on_chain_cg_id: string | null;
+  promotes: number;
+  fetches: number;
+  defers: number;
+  cursor_advances: number;
+  last_watermark: number | null;
+  last_head: number | null;
+  last_event_ts: number | null;
+}
+
+export interface ReplicationTimelineBucket {
+  bucket: number;
+  promotes: number;
+  fetches: number;
+  defers: number;
+  total: number;
+}
+
+export interface ReplicationCursorRow {
+  context_graph_id: string;
+  on_chain_id: string | null;
+  last_reconciled_ordinal: number | null;
+  last_head: number | null;
+  last_event_ts: number | null;
 }
 
 export type ContextGraphMemberPrincipalType = 'node' | 'agent' | 'identity';

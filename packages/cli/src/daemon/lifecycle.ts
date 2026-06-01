@@ -1209,6 +1209,27 @@ export async function runDaemonInner(
       idempotencyStore: messengerIdempotencyStore,
       outboxStore: messengerOutboxStore,
     },
+    // Phase F — persist chain-driven VM reconciliation telemetry so the
+    // /ui/observability Replication tab can aggregate it. Best-effort: a
+    // failed insert must never disrupt reconciliation, and the agent already
+    // guards the sink call in a try/catch.
+    onReplicationEvent: (event) => {
+      dashDb.insertReplicationEvent({
+        ts: event.ts,
+        context_graph_id: event.contextGraphId,
+        on_chain_cg_id: event.onChainCgId ?? null,
+        action: event.action,
+        ual: event.ual ?? null,
+        ordinal: event.ordinal ?? null,
+        ka_id: event.kaId ?? null,
+        from_watermark: event.fromWatermark ?? null,
+        to_watermark: event.toWatermark ?? null,
+        head: event.head ?? null,
+        reconciled: event.reconciled ?? null,
+        pending: event.pending ?? null,
+        detail: event.detail ?? null,
+      });
+    },
   });
 
   let publisherRuntime: PublisherRuntime | null = null;

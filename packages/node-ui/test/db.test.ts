@@ -86,7 +86,7 @@ describe('DashboardDB — metric snapshots', () => {
     raw.close();
 
     db = new DashboardDB({ dataDir: dir });
-    expect(db.db.pragma('user_version', { simple: true })).toBe(17);
+    expect(db.db.pragma('user_version', { simple: true })).toBe(18);
 
     const cols = (db.db.prepare('PRAGMA table_info(metric_snapshots)').all() as Array<{ name: string }>)
       .map((c) => c.name);
@@ -142,7 +142,7 @@ describe('DashboardDB — metric snapshots', () => {
     raw.close();
 
     db = new DashboardDB({ dataDir: dir });
-    expect(db.db.pragma('user_version', { simple: true })).toBe(17);
+    expect(db.db.pragma('user_version', { simple: true })).toBe(18);
 
     const newSnapshotCols = (db.db.prepare('PRAGMA table_info(metric_snapshots)').all() as { name: string }[])
       .map(c => c.name);
@@ -545,7 +545,7 @@ describe('DashboardDB — V15 migration: drop FTS5 logs index', () => {
 
     const upgraded = new DashboardDB({ dataDir: upgradeDir });
     try {
-      expect(upgraded.db.pragma('user_version', { simple: true })).toBe(17);
+      expect(upgraded.db.pragma('user_version', { simple: true })).toBe(18);
 
       const ftsTables = upgraded.db.prepare(
         `SELECT name FROM sqlite_master WHERE type IN ('table','view') AND name LIKE 'logs_fts%'`,
@@ -710,7 +710,7 @@ describe('DashboardDB — V17 subscription columns migration (Phase B)', () => {
     raw.close();
 
     db = new DashboardDB({ dataDir: dir });
-    expect(db.db.pragma('user_version', { simple: true })).toBe(17);
+    expect(db.db.pragma('user_version', { simple: true })).toBe(18);
 
     const cols = (db.db.prepare('PRAGMA table_info(context_graph_subscriptions)').all() as Array<{ name: string }>)
       .map((c) => c.name);
@@ -731,7 +731,7 @@ describe('DashboardDB — V17 subscription columns migration (Phase B)', () => {
       .map((c) => c.name);
     expect(cols).toContain('on_chain_hash');
     expect(cols).toContain('last_reconciled_ordinal');
-    expect(db.db.pragma('user_version', { simple: true })).toBe(17);
+    expect(db.db.pragma('user_version', { simple: true })).toBe(18);
   });
 });
 
@@ -1089,7 +1089,7 @@ describe('DashboardDB — V11→V13 chat schema migration chain', () => {
     raw.close();
 
     db = new DashboardDB({ dataDir: dir });
-    expect(db.db.pragma('user_version', { simple: true })).toBe(17);
+    expect(db.db.pragma('user_version', { simple: true })).toBe(18);
 
     const cols = (db.db.prepare('PRAGMA table_info(chat_messages)').all() as Array<{ name: string }>)
       .map((c) => c.name);
@@ -1155,7 +1155,7 @@ describe('DashboardDB — V16 notifications.context_graph_id migration (A1)', ()
     raw.close();
 
     db = new DashboardDB({ dataDir: dir });
-    expect(db.db.pragma('user_version', { simple: true })).toBe(17);
+    expect(db.db.pragma('user_version', { simple: true })).toBe(18);
 
     const cols = (db.db.prepare('PRAGMA table_info(notifications)').all() as Array<{ name: string }>)
       .map((c) => c.name);
@@ -1184,7 +1184,7 @@ describe('DashboardDB — V16 notifications.context_graph_id migration (A1)', ()
     const cols = (db.db.prepare('PRAGMA table_info(notifications)').all() as Array<{ name: string }>)
       .map((c) => c.name);
     expect(cols).toContain('context_graph_id');
-    expect(db.db.pragma('user_version', { simple: true })).toBe(17);
+    expect(db.db.pragma('user_version', { simple: true })).toBe(18);
   });
 
   it('insertNotification writes context_graph_id to the column; omitted → NULL', () => {
@@ -1251,5 +1251,122 @@ describe('DashboardDB — resolveActivityDigestRowIds (CR-3 digest read-marking)
     const id1 = activityRow(cgId, 'published', baseTs);
     const digestKey = buildActivityDigestKey(cgId, 'published', baseTs);
     expect(db.resolveActivityDigestRowIds(digestKey)).toEqual([id1]);
+  });
+});
+
+describe('DashboardDB — replication telemetry (Phase F)', () => {
+  let db: DashboardDB;
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'dkg-db-repl-test-'));
+    db = new DashboardDB({ dataDir: dir });
+  });
+
+  afterEach(() => {
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  const now = Date.now();
+
+  it('summary computes counts, success rate, and fetch→promote latency', () => {
+    // mfacts: fetch at T, promote 5s later (latency 5000); plus a 0-latency
+    // promote (SWM already present, no preceding fetch); plus one defer.
+    db.insertReplicationEvent({ ts: now - 10_000, context_graph_id: 'mfacts', action: 'fetch', ual: 'urn:ka:1' });
+    db.insertReplicationEvent({ ts: now - 5_000, context_graph_id: 'mfacts', action: 'promote', ual: 'urn:ka:1', ordinal: 1 });
+    db.insertReplicationEvent({ ts: now - 4_000, context_graph_id: 'mfacts', action: 'promote', ual: 'urn:ka:2', ordinal: 2 });
+    db.insertReplicationEvent({ ts: now - 3_000, context_graph_id: 'mfacts', action: 'defer', ual: 'urn:ka:3', ordinal: 3, detail: 'no-swm' });
+
+    const s = db.getReplicationSummary(60 * 60 * 1000);
+    expect(s.promotes).toBe(2);
+    expect(s.fetches).toBe(1);
+    expect(s.defers).toBe(1);
+    // promote / (promote + defer) = 2/3
+    expect(s.successRate).toBeCloseTo(2 / 3, 5);
+    // latencies: [0, 5000] → P50 index = floor(0.5*2)=1 → 5000
+    expect(s.latencyP50Ms).toBe(5000);
+    expect(s.totalEvents).toBe(4);
+  });
+
+  it('summary excludes events outside the window', () => {
+    db.insertReplicationEvent({ ts: now - 10 * 86_400_000, context_graph_id: 'old', action: 'promote', ual: 'urn:ka:x' });
+    const s = db.getReplicationSummary(60 * 60 * 1000);
+    expect(s.totalEvents).toBe(0);
+    expect(s.successRate).toBeNull();
+    expect(s.latencyP50Ms).toBeNull();
+  });
+
+  it('per-cg rollup groups and reports last watermark/head', () => {
+    db.insertReplicationEvent({ ts: now - 2_000, context_graph_id: 'cgA', on_chain_cg_id: '42', action: 'promote', ordinal: 1 });
+    db.insertReplicationEvent({ ts: now - 1_000, context_graph_id: 'cgA', on_chain_cg_id: '42', action: 'cursor-advance', from_watermark: 0, to_watermark: 1, head: 3 });
+    db.insertReplicationEvent({ ts: now - 1_500, context_graph_id: 'cgB', action: 'fetch' });
+
+    const rows = db.getReplicationPerCg(60 * 60 * 1000);
+    expect(rows.length).toBe(2);
+    const a = rows.find((r) => r.context_graph_id === 'cgA')!;
+    expect(a.promotes).toBe(1);
+    expect(a.cursor_advances).toBe(1);
+    expect(a.last_watermark).toBe(1);
+    expect(a.last_head).toBe(3);
+    // cgA most recently active → ordered first
+    expect(rows[0].context_graph_id).toBe('cgA');
+  });
+
+  it('timeline buckets events and optionally scopes to a CG', () => {
+    const bucketMs = 60_000;
+    db.insertReplicationEvent({ ts: now - 1000, context_graph_id: 'cgA', action: 'promote' });
+    db.insertReplicationEvent({ ts: now - 2000, context_graph_id: 'cgA', action: 'fetch' });
+    db.insertReplicationEvent({ ts: now - 1000, context_graph_id: 'cgB', action: 'promote' });
+
+    const all = db.getReplicationTimeline({ periodMs: 60 * 60 * 1000, bucketMs });
+    expect(all.reduce((s, b) => s + b.total, 0)).toBe(3);
+
+    const scoped = db.getReplicationTimeline({ periodMs: 60 * 60 * 1000, bucketMs, contextGraphId: 'cgA' });
+    expect(scoped.reduce((s, b) => s + b.total, 0)).toBe(2);
+    expect(scoped.reduce((s, b) => s + b.promotes, 0)).toBe(1);
+  });
+
+  it('cursors join subscriptions with observed chain head', () => {
+    db.upsertContextGraphSubscription({
+      context_graph_id: 'mfacts', name: 'Monday Fun Facts', subscribed: 1, synced: 1,
+      on_chain_id: '7', last_reconciled_ordinal: 4, sync_scoped: 1, updated_at: now,
+    });
+    db.insertReplicationEvent({ ts: now - 500, context_graph_id: 'mfacts', action: 'sweep', head: 6, to_watermark: 4 });
+
+    const cursors = db.getReplicationCursors();
+    const c = cursors.find((r) => r.context_graph_id === 'mfacts')!;
+    expect(c.last_reconciled_ordinal).toBe(4);
+    expect(c.on_chain_id).toBe('7');
+    expect(c.last_head).toBe(6);
+    // a subscription with no events still appears (head null)
+    db.upsertContextGraphSubscription({
+      context_graph_id: 'empty', subscribed: 1, synced: 0, sync_scoped: 1, updated_at: now,
+    });
+    const after = db.getReplicationCursors();
+    expect(after.find((r) => r.context_graph_id === 'empty')!.last_head).toBeNull();
+  });
+
+  it('per-cg event stream returns newest-first, capped', () => {
+    for (let i = 0; i < 5; i++) {
+      db.insertReplicationEvent({ ts: now - i * 1000, context_graph_id: 'cgA', action: 'promote', ordinal: 5 - i });
+    }
+    const events = db.getReplicationEventsForCg('cgA', 3);
+    expect(events.length).toBe(3);
+    // newest (ts = now) first
+    expect(events[0].ts).toBe(now);
+  });
+
+  it('V18 migration creates replication_events on an upgraded DB', () => {
+    db.close();
+    const raw = new Database(join(dir, 'node-ui.db'));
+    raw.pragma('user_version = 17');
+    raw.close();
+    const upgraded = new DashboardDB({ dataDir: dir });
+    expect(upgraded.db.pragma('user_version', { simple: true })).toBe(18);
+    // insert works → table exists
+    upgraded.insertReplicationEvent({ ts: now, context_graph_id: 'cg', action: 'promote' });
+    expect(upgraded.getReplicationSummary(60_000).promotes).toBe(1);
+    upgraded.close();
   });
 });

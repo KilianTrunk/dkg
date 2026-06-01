@@ -985,22 +985,24 @@ else
   warn D conviction-multiplier "ConvictionStakingStorage ABI or N1 op address missing"
 fi
 
-# Reward claim execution. V10's StakingConvictionNFT.claimRewards takes a
-# tokenId (position-scoped) — there is no zero-arg variant the harness can
-# auto-discover. We iterate up to MAX_CLAIM_PROBES of node1's positions and
-# call claimRewards(tokenId) signed by the operator on each.
+# Reward claim execution. V10's actual entrypoint is `claim(uint256 tokenId)`
+# (position-scoped), NOT `claimRewards()`. The previous harness probed for a
+# zero-arg `claimRewards()` method and WARNed every run when the autodiscovery
+# missed. The earlier "fix" in this PR's first commit also missed because it
+# hard-coded `claimRewards` as the method name — the actual ABI is just
+# `claim`. Confirmed via:
+#   python3 -c "import json;[print(f['name'])
+#                for f in json.load(open('packages/evm-module/abi/DKGStakingConvictionNFT.json'))
+#                if f.get('type')=='function']" | grep -iE 'claim|withdraw'
+# → claim, withdraw (no claimRewards).
 #
-# A revert is acceptable (typically "no claimable rewards yet" on a fresh
-# devnet where epochs haven't rolled), but at least one position must be
-# attempted for the gate to PASS as informational coverage.
-#
-# Pre-V10 behaviour was a single zero-arg call; that surface is gone, and the
-# previous harness branch (`echo "$methods" | grep -qiw claimRewards` then
-# `--json "[]"`) silently WARNed on every release run because the matched
-# method was the new position-scoped variant. Codex-style misdiagnosis: surface
-# was present but never exercised.
+# We iterate up to MAX_CLAIM_PROBES of node1's positions and call
+# `claim(tokenId)` signed by the operator on each. A revert is acceptable
+# (typically "no claimable rewards yet" on a fresh devnet where no epoch
+# boundary has rolled), but at least one position must be attempted for the
+# gate to PASS as informational coverage.
 MAX_CLAIM_PROBES="${MAX_CLAIM_PROBES:-3}"
-if [ -n "$N1_OP" ] && [ -n "$N1_OPADDR" ] && [ -n "$methods" ] && echo "$methods" | grep -qiw claimRewards; then
+if [ -n "$N1_OP" ] && [ -n "$N1_OPADDR" ] && [ -n "$methods" ] && echo "$methods" | grep -qiwE 'claim'; then
   cbal=$($CHAIN_CALL DKGStakingConvictionNFT balanceOf --json "[\"$N1_OPADDR\"]" 2>/dev/null | pyf "d.get('result','0')")
   if [ "${cbal:-0}" -gt 0 ] 2>/dev/null; then
     claim_ok=0; claim_try=0; claim_revert=0; claim_errs=""
@@ -1009,7 +1011,9 @@ if [ -n "$N1_OP" ] && [ -n "$N1_OPADDR" ] && [ -n "$methods" ] && echo "$methods
       tk=$($CHAIN_CALL DKGStakingConvictionNFT tokenOfOwnerByIndex --json "[\"$N1_OPADDR\",\"$idx\"]" 2>/dev/null | pyf "d.get('result','')")
       [ -z "$tk" ] || [ "$tk" = "0" ] && continue
       claim_try=$((claim_try + 1))
-      cr=$($CHAIN_CALL DKGStakingConvictionNFT claimRewards --key "$N1_OP" --json "[\"$tk\"]" 2>/dev/null)
+      # Explicit --sig binds the overload selector unambiguously even if
+      # future ABI additions introduce other `claim` arities.
+      cr=$($CHAIN_CALL DKGStakingConvictionNFT claim --sig "claim(uint256)" --key "$N1_OP" --json "[\"$tk\"]" 2>/dev/null)
       if echo "$cr" | grep -q '"ok":true'; then
         claim_ok=$((claim_ok + 1))
       else
@@ -1019,12 +1023,12 @@ if [ -n "$N1_OP" ] && [ -n "$N1_OPADDR" ] && [ -n "$methods" ] && echo "$methods
       fi
     done
     if [ "$claim_ok" -gt 0 ]; then
-      pass D reward-claim-exec "claimRewards(tokenId) landed on $claim_ok/$claim_try position(s) of node1 op"
+      pass D reward-claim-exec "claim(tokenId) landed on $claim_ok/$claim_try position(s) of node1 op"
     elif [ "$claim_try" -gt 0 ]; then
       # All reverts → typical on fresh devnet (no accrued rewards because no
       # epoch boundary has been crossed since stake). Informational, not a
       # regression.
-      warn D reward-claim-exec "all $claim_try claimRewards(tokenId) reverted — typical on fresh devnet (no accrued rewards yet): ${claim_errs:0:160}"
+      warn D reward-claim-exec "all $claim_try claim(tokenId) reverted — typical on fresh devnet (no accrued rewards yet): ${claim_errs:0:160}"
     else
       warn D reward-claim-exec "no valid position tokenIds discovered for node1 op (balance=$cbal)"
     fi
@@ -1032,7 +1036,7 @@ if [ -n "$N1_OP" ] && [ -n "$N1_OPADDR" ] && [ -n "$methods" ] && echo "$methods
     warn D reward-claim-exec "node1 op wallet owns zero staking positions (balance=$cbal) — bootstrap may not have minted yet"
   fi
 elif [ -n "$N1_OP" ]; then
-  warn D reward-claim-exec "claimRewards not in DKGStakingConvictionNFT ABI"
+  warn D reward-claim-exec "claim not in DKGStakingConvictionNFT ABI (entrypoint was renamed?)"
 fi
 
 # Real staking-position transfer execution. The Section D title mentions
@@ -1674,7 +1678,7 @@ MD="$RESULTS/REPORT.md"
   echo "| KAs published | $KA_OK | >= $TARGET_KAS | $([ "$KA_OK" -ge "$TARGET_KAS" ] && echo ok || echo under) |"
   echo "| CGs with KAs | $CGS_WITH_KA | >= $TARGET_CGS | $([ "$CGS_WITH_KA" -ge "$TARGET_CGS" ] && echo ok || echo under) |"
   echo "| entities/KA min..max | ${EMIN}..${EMAX} | within ${MIN_ENTITIES}..${MAX_ENTITIES} | $([ "${EMIN:-0}" -ge "$MIN_ENTITIES" ] 2>/dev/null && [ "${EMAX:-0}" -le "$MAX_ENTITIES" ] 2>/dev/null && echo ok || echo check) |"
-  echo "| RS success | ${RS_PCT}% (sub=$TOT_SUB/att=$TOT_ATT) | >= ${RS_MIN_SUCCESS_PCT}% | $([ "$RS_PCT" -ge "$RS_MIN_SUCCESS_PCT" ] 2>/dev/null && echo ok || echo under) |"
+  echo "| RS per-period success | ${RS_PCT}% (submits=${TOT_SUB:-0}/periods=${TOT_PERIODS:-0}) | >= ${RS_MIN_SUCCESS_PCT}% | $([ "${RS_PCT:-0}" -ge "$RS_MIN_SUCCESS_PCT" ] 2>/dev/null && echo ok || echo under) |"
   echo "| checks | PASS=$P WARN=$W FAIL=$F | FAIL=0 | $([ "$F" -eq 0 ] && echo ok || echo fail) |"
   echo
   echo "## Functional matrix (per-check)"

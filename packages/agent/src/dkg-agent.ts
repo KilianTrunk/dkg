@@ -5975,9 +5975,8 @@ export class DKGAgent {
           //   • `delivered=true && ack.accepted=true`  → success.
           //   • `delivered=true && ack.accepted=false` → HARD failure
           //     (recipient explicitly rejected the package — bad key,
-          //     bad membership hash, etc; queuing won't help).
-          //     Structured stale-target ACKs are the exception: they stay
-          //     queued for reconnect or later-publish retry.
+          //     bad membership hash, stale target key, etc; retrying the
+          //     same package won't help).
           //   • `delivered=false`                      → SOFT success.
           //     The setup-package landed in the messenger's durable
           //     outbox and will be replayed when the recipient comes
@@ -6187,11 +6186,11 @@ export class DKGAgent {
    * Fired from the `connection:open` listener — see line 2382 — so the
    * cost lives on the cold path of "we just connected to a new peer",
    * not on every share. Each successful `sendReliable` with
-   * `delivered=true && ack.accepted=true` deletes the row; soft
-   * (`delivered=false`) leaves it queued for the next attempt; retryable
-   * negative acks stay queued because the remote peer saw the package
-   * before its membership/key view converged; hard negative acks delete it
-   * because the package is permanently invalid for this recipient.
+   * `delivered=true && ack.accepted=true` deletes the row and counts as
+   * drained; soft (`delivered=false`) leaves it queued for the next
+   * attempt; delivered negative or malformed ACKs delete it as terminal
+   * without counting as drained, because retrying the same package is
+   * permanently invalid for this recipient.
    */
   private async drainPendingSenderKeyForPeer(peerId: string): Promise<number> {
     if (this.pendingSenderKeyByAgent.size === 0) return 0;

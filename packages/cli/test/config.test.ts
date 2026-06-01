@@ -16,6 +16,7 @@ import {
   readPid,
   readApiPort,
   ensureDkgDir,
+  configExists,
   isDkgMonorepo,
   dkgDir,
   repoDir,
@@ -227,6 +228,12 @@ describe('localAgentIntegrations config round-trip', () => {
     await writeFile(join(tempDir, 'config.yaml'), 'name: stale-yaml\napiPort: 9317\n', 'utf8');
 
     await expect(loadConfig()).rejects.toThrow(SyntaxError);
+  });
+
+  it('does not treat yaml-only homes as globally initialized configs', async () => {
+    await writeFile(join(tempDir, 'config.yaml'), 'name: yaml-only\napiPort: 9317\n', 'utf8');
+
+    expect(configExists()).toBe(false);
   });
 
   it('round-trips relayServerCapacity through saveConfig/loadConfig (operator override)', async () => {

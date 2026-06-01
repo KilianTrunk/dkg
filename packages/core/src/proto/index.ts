@@ -151,6 +151,7 @@ export {
   SWM_SENDER_KEY_AAD_DOMAIN,
   SWM_SENDER_KEY_SETUP_AAD_DOMAIN,
   SWM_SENDER_KEY_SIGNATURE_DOMAIN,
+  SWM_SENDER_KEY_PACKAGE_ACK_REASON_CODES,
   encodeSwmSenderKeyPackage,
   decodeSwmSenderKeyPackage,
   encodeSwmSenderKeyPackageAck,

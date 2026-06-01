@@ -176,10 +176,10 @@ describe('createAndDistributeSwmSenderKeyEpoch: parallel fanout latency', () => 
 
   it('aggregates per-recipient hard failures into a single throw', async () => {
     // Sanity check on the post-settle aggregation: when EVERY key for
-    // an agent fails (here the messenger always returns an "accepted=false"
-    // ack), we must surface a fatal-agents throw rather than silently
-    // returning a state. This pins the existing C2 contract through the
-    // new aggregation path.
+    // an agent fails (here the messenger always returns a terminal
+    // "accepted=false" ack), we must surface a fatal-agents throw rather
+    // than silently returning a state. This pins the existing C2 contract
+    // through the new aggregation path.
     const boot = await bootAgent();
     agent = boot.agent;
     const internals = boot.internals;
@@ -190,6 +190,7 @@ describe('createAndDistributeSwmSenderKeyEpoch: parallel fanout latency', () => 
         type: SWM_SENDER_KEY_PACKAGE_ACK_TYPE,
         accepted: false,
         reason: 'bad membership hash',
+        reasonCode: 'bad-signature',
       });
       return { delivered: true, response: ack, attempts: 1, messageId: 'm-test' };
     });
@@ -280,6 +281,7 @@ describe('createAndDistributeSwmSenderKeyEpoch: parallel fanout latency', () => 
         type: SWM_SENDER_KEY_PACKAGE_ACK_TYPE,
         accepted: false,
         reason: 'simulated per-recipient fatal',
+        reasonCode: 'bad-signature',
       });
       const isBfailure = peerId === recipientB.peerId;
       return {
@@ -406,6 +408,7 @@ describe('createAndDistributeSwmSenderKeyEpoch: parallel fanout latency', () => 
         type: SWM_SENDER_KEY_PACKAGE_ACK_TYPE,
         accepted: false,
         reason: 'simulated key-level rejection',
+        reasonCode: 'bad-signature',
       });
       callsByPeer.set(sendPeerId, (callsByPeer.get(sendPeerId) ?? 0) + 1);
 

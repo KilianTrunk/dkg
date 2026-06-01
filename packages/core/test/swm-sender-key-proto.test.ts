@@ -16,6 +16,7 @@ import {
   type SwmSenderKeyMessageMsg,
   type SwmSenderKeyPackageMsg,
 } from '../src/index.js';
+import { SwmSenderKeyPackageAckSchema } from '../src/proto/swm-sender-key.js';
 
 function bytes(length: number, fill: number): Uint8Array {
   return new Uint8Array(length).fill(fill);
@@ -116,6 +117,23 @@ describe('SWM Sender Key proto', () => {
     expect(new Uint8Array(decoded.ciphertext)).toEqual(message.ciphertext);
     expect(new Uint8Array(decoded.aadHash)).toEqual(message.aadHash);
     expect(new Uint8Array(decoded.senderKeySignature)).toEqual(message.senderKeySignature);
+  });
+
+  it('normalizes unknown ACK reason codes from the wire', () => {
+    const raw = SwmSenderKeyPackageAckSchema.encode(
+      SwmSenderKeyPackageAckSchema.create({
+        version: SWM_SENDER_KEY_PACKAGE_VERSION,
+        type: SWM_SENDER_KEY_PACKAGE_ACK_TYPE,
+        accepted: false,
+        reason: 'future receiver rejection',
+        reasonCode: 'future-reason-code',
+      }),
+    ).finish();
+
+    const ack = decodeSwmSenderKeyPackageAck(raw);
+    expect(ack.accepted).toBe(false);
+    expect(ack.reason).toBe('future receiver rejection');
+    expect(ack.reasonCode).toBe('unknown');
   });
 
   it('binds message AAD to context, subgraph, sender, epoch, membership, index, algorithm, and nonce', () => {

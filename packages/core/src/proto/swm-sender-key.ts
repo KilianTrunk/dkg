@@ -124,6 +124,22 @@ export type SwmSenderKeyPackageAckReasonCode =
   | 'not-agent-gated'
   | 'unknown';
 
+export const SWM_SENDER_KEY_PACKAGE_ACK_REASON_CODES: readonly SwmSenderKeyPackageAckReasonCode[] = [
+  'stale-target',
+  'sender-not-allowed',
+  'recipient-not-allowed',
+  'recipient-not-local',
+  'active-private-key-missing',
+  'revoked-key',
+  'bad-signature',
+  'not-agent-gated',
+  'unknown',
+];
+
+const SWM_SENDER_KEY_PACKAGE_ACK_REASON_CODE_SET = new Set<string>(
+  SWM_SENDER_KEY_PACKAGE_ACK_REASON_CODES,
+);
+
 export interface SwmSenderKeyMessageMsg {
   version: string;
   type: string;
@@ -242,13 +258,13 @@ export function encodeSwmSenderKeyPackageAck(msg: SwmSenderKeyPackageAckMsg): Ui
 
 export function decodeSwmSenderKeyPackageAck(buf: Uint8Array): SwmSenderKeyPackageAckMsg {
   const decoded = SwmSenderKeyPackageAckSchema.decode(buf) as unknown as Record<string, unknown>;
-  const reasonCode = stringField(decoded.reasonCode);
+  const reasonCode = swmSenderKeyPackageAckReasonCodeField(decoded.reasonCode);
   return {
     version: stringField(decoded.version),
     type: stringField(decoded.type),
     accepted: Boolean(decoded.accepted),
     reason: stringField(decoded.reason) || undefined,
-    reasonCode: reasonCode ? reasonCode as SwmSenderKeyPackageAckReasonCode : undefined,
+    reasonCode,
     contextGraphId: stringField(decoded.contextGraphId) || undefined,
     subGraphName: stringField(decoded.subGraphName) || undefined,
     senderAgentAddress: stringField(decoded.senderAgentAddress) || undefined,
@@ -481,6 +497,14 @@ function longLikeToBigInt(value: LongLike): bigint {
 
 function stringField(value: unknown): string {
   return typeof value === 'string' ? value : '';
+}
+
+function swmSenderKeyPackageAckReasonCodeField(value: unknown): SwmSenderKeyPackageAckReasonCode | undefined {
+  const reasonCode = stringField(value);
+  if (!reasonCode) return undefined;
+  return SWM_SENDER_KEY_PACKAGE_ACK_REASON_CODE_SET.has(reasonCode)
+    ? reasonCode as SwmSenderKeyPackageAckReasonCode
+    : 'unknown';
 }
 
 function bytesField(value: unknown): Uint8Array {

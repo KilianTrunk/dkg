@@ -5916,6 +5916,7 @@ export class DKGAgent {
           recipient,
           senderPrivateKey: input.sender.privateKey,
         });
+        const packageBytes = encodeSwmSenderKeyPackage(pkg);
 
         if (this.hasLocalAgent(recipientAgentAddress)) {
           try {
@@ -5949,7 +5950,7 @@ export class DKGAgent {
             epochId: state.epochId,
             contextGraphId: state.contextGraphId,
             subGraphName: state.subGraphName,
-            packageBytes: encodeSwmSenderKeyPackage(pkg),
+            packageBytes,
             createdAtMs: Date.now(),
           });
           this.log.warn(
@@ -5972,12 +5973,15 @@ export class DKGAgent {
           // backoff cover this protocol the same way they cover chat.
           //
           // Delivery semantics (C2 integration-pass relaxation):
-          //   • `delivered=true && ack.accepted=true`  → success.
-          //   • `delivered=true && ack.accepted=false` → HARD failure
-          //     (recipient explicitly rejected the package — bad key,
-          //     bad membership hash, stale target key, etc; retrying the
-          //     same package won't help).
-          //   • `delivered=false`                      → SOFT success.
+          //   • `delivered=true && ack.accepted=true` → success.
+          //   • `delivered=true && ack.accepted=false` with a terminal
+          //     reason (`stale-target`, `revoked-key`, `bad-signature`)
+          //     → HARD failure: retrying the same package cannot help.
+          //   • `delivered=true && ack.accepted=false` with a transient
+          //     or unknown reason → SOFT success: keep it queued so a
+          //     later reconnect/publish can retry after remote view
+          //     convergence.
+          //   • `delivered=false` → SOFT success.
           //     The setup-package landed in the messenger's durable
           //     outbox and will be replayed when the recipient comes
           //     back online. Treating this as a hard failure used to
@@ -5991,7 +5995,7 @@ export class DKGAgent {
           const sendResult = await this.messenger.sendReliable(
             recipient.peerId,
             PROTOCOL_SWM_SENDER_KEY,
-            encodeSwmSenderKeyPackage(pkg),
+            packageBytes,
           );
           if (!sendResult.delivered) {
             this.log.warn(
@@ -6015,6 +6019,24 @@ export class DKGAgent {
           }
           if (!ack.accepted) {
             const reason = ack.reason ?? 'unknown reason';
+            if (!this.isTerminalSwmSenderKeySetupAckReasonCode(ack.reasonCode)) {
+              this.enqueuePendingSenderKey({
+                senderAgentAddress: senderAgentAddress.toLowerCase(),
+                recipientAgentAddress: recipientAgentAddress.toLowerCase(),
+                recipientKeyId: recipient.recipientKeyId,
+                epochId: state.epochId,
+                contextGraphId: state.contextGraphId,
+                subGraphName: state.subGraphName,
+                packageBytes,
+                createdAtMs: Date.now(),
+              });
+              this.log.warn(
+                input.ctx,
+                `SWM sender-key setup for ${recipientAgentAddress} keyId=${recipient.recipientKeyId} ` +
+                `queued after transient rejection (${ack.reasonCode ?? 'legacy-unknown'}): ${reason}`,
+              );
+              return { kind: 'success', agentAddress: recipientAgentAddress };
+            }
             return {
               kind: 'failure',
               agentAddress: recipientAgentAddress,
@@ -6093,6 +6115,16 @@ export class DKGAgent {
     return 'unknown';
   }
 
+  private isTerminalSwmSenderKeySetupAckReasonCode(
+    reasonCode: SwmSenderKeyPackageAckReasonCode | undefined,
+  ): boolean {
+    return (
+      reasonCode === 'stale-target' ||
+      reasonCode === 'revoked-key' ||
+      reasonCode === 'bad-signature'
+    );
+  }
+
   /**
    * PR-2 (SWM-fanout plan): enqueue a sender-key package whose recipient
    * has no advertised `dkg:peerId` (so we can't even ask the messenger
@@ -6161,9 +6193,11 @@ export class DKGAgent {
         }
         if (ack.accepted) {
           drained += 1;
+        } else if (this.isTerminalSwmSenderKeySetupAckReasonCode(ack.reasonCode)) {
+          // Terminal rejection: keep it out of the queue, but do not
+          // report it as a successful drain.
         } else {
-          // Hard rejection is also terminal. Keep it out of the queue,
-          // but do not report it as a successful drain.
+          remaining.push(entry);
         }
       } catch {
         remaining.push(entry);
@@ -6187,10 +6221,9 @@ export class DKGAgent {
    * cost lives on the cold path of "we just connected to a new peer",
    * not on every share. Each successful `sendReliable` with
    * `delivered=true && ack.accepted=true` deletes the row and counts as
-   * drained; soft (`delivered=false`) leaves it queued for the next
-   * attempt; delivered negative or malformed ACKs delete it as terminal
-   * without counting as drained, because retrying the same package is
-   * permanently invalid for this recipient.
+   * drained; soft (`delivered=false`) and non-terminal delivered
+   * rejections leave it queued for the next attempt; terminal delivered
+   * rejections and malformed ACKs delete it without counting as drained.
    */
   private async drainPendingSenderKeyForPeer(peerId: string): Promise<number> {
     if (this.pendingSenderKeyByAgent.size === 0) return 0;

@@ -4543,6 +4543,33 @@ export class EVMChainAdapter implements ChainAdapter {
   }
 
   /**
+   * Issue #872 / Codex round-3 — chain-backed publish-policy oracle
+   * for non-creator peers. `ContextGraphStorage.getPublishPolicy`
+   * returns the tuple `(uint8 publishPolicy, address publishAuthority)`.
+   * `publishPolicy: 0` = curators-only, `1` = open. Unregistered ids
+   * return `(0, address(0))` from Solidity's default-zero mapping —
+   * the caller is responsible for cross-checking registration
+   * status before treating that as a positive "curators-only" signal.
+   */
+  async getContextGraphPublishPolicy(contextGraphId: bigint): Promise<{
+    publishPolicy: number;
+    publishAuthority: string;
+  }> {
+    await this.init();
+    const cgs = this.requireContextGraphStorage();
+    const result = await cgs.getPublishPolicy(contextGraphId);
+    // Ethers v6 returns named tuple as both array and object access;
+    // destructure positionally to stay robust against ABI naming
+    // changes.
+    const rawPolicy: bigint = BigInt(result[0] ?? result.publishPolicy ?? 0);
+    const rawAuthority: string = String(result[1] ?? result.publishAuthority ?? ethers.ZeroAddress);
+    return {
+      publishPolicy: Number(rawPolicy),
+      publishAuthority: ethers.getAddress(rawAuthority),
+    };
+  }
+
+  /**
    * OT-RFC-38 / LU-6 Phase B — chain-backed participant-agent
    * allowlist read. Mirrors {@link getContextGraphAccessPolicy}
    * (single eth_call, used as the authoritative oracle when the

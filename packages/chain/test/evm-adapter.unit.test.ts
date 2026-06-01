@@ -2,6 +2,7 @@
  * Unit tests for evm-adapter pure helpers and constructor-only surface (07 EVM_MODULE —
  * revert decoding used across chain operations). No live RPC / Hardhat.
  */
+import { createServer, type Server } from 'node:http';
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { Interface, ethers } from 'ethers';
 import {
@@ -334,6 +335,56 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
     expect(thrown.message).toContain('https://primary.example');
     expect(thrown.message).toContain('https://backup.example');
     expect(populateTransaction).toHaveBeenCalledTimes(2);
+    expect((a as any).signPopulatedTransaction).not.toHaveBeenCalled();
+    expect((a as any).sendSignedTransactionAndWait).not.toHaveBeenCalled();
+  });
+
+  it('single-provider exhaustion keeps the RPC_ENDPOINTS_EXHAUSTED code but preserves the original message verbatim (#895 / Codex PR #901)', async () => {
+    // One configured RPC → no failover, but downstream classifiers
+    // (`/api/context-graph/register`) still key the transient-outage 503 off
+    // the RPC_ENDPOINTS_EXHAUSTED code, so the code MUST survive. The
+    // single-endpoint case must NOT, however, rewrite the message into the
+    // multi-endpoint "failed on all configured RPC endpoints (…)" aggregate —
+    // there is no second endpoint, so the original message reads cleaner and
+    // message-inspecting callers keep seeing it unchanged.
+    const a = new EVMChainAdapter(minimalConfig({ rpcUrl: 'https://only.example' }));
+    const onlyProvider = { name: 'only' } as any;
+    const signer = new ethers.Wallet(DEPLOYER_PK, onlyProvider);
+    const populateTransaction = vi.fn(async () => {
+      throw new Error('connect ECONNREFUSED 127.0.0.1:8545');
+    });
+    const contract = {
+      connect: vi.fn(() => ({ createContextGraph: { populateTransaction } })),
+    };
+    (a as any).providers = [onlyProvider];
+    (a as any).signPopulatedTransaction = vi.fn();
+    (a as any).sendSignedTransactionAndWait = vi.fn();
+
+    let thrown: any;
+    try {
+      await (a as any).sendContractTransaction(
+        contract,
+        'createContextGraph',
+        [],
+        signer,
+        'create on-chain context graph',
+      );
+    } catch (err) {
+      thrown = err;
+    }
+
+    expect(thrown).toMatchObject({
+      code: 'RPC_ENDPOINTS_EXHAUSTED',
+      rpcUrls: ['https://only.example'],
+    });
+    // Message stays byte-identical — no "failed on all configured RPC
+    // endpoints (…)" aggregate, and the label is not prepended.
+    expect(thrown.message).toBe('connect ECONNREFUSED 127.0.0.1:8545');
+    expect(thrown.message).not.toContain('all configured RPC endpoints');
+    // The original error is preserved as the cause.
+    expect((thrown as Error).cause).toBeInstanceOf(Error);
+    expect((thrown as { cause: Error }).cause.message).toBe('connect ECONNREFUSED 127.0.0.1:8545');
+    expect(populateTransaction).toHaveBeenCalledTimes(1);
     expect((a as any).signPopulatedTransaction).not.toHaveBeenCalled();
     expect((a as any).sendSignedTransactionAndWait).not.toHaveBeenCalled();
   });
@@ -1042,6 +1093,93 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
     expect(ttlOf(aNeg)).toBe(DEFAULT_TTL_MS);
     expect(ttlOf(aDefault)).toBe(DEFAULT_TTL_MS);
   });
+});
+
+// #894 round-2 / Codex PR #901: register-503-under-RPC-outage. Uses a real
+// loopback HTTP server (not Hardhat) that returns HTTP 429 for every JSON-RPC
+// call, mirroring `daemon-http-behavior-extra.test.ts`'s `startRateLimitedRpc`.
+// ethers v6's default FetchRequest retries 429 with backoff far longer than any
+// caller timeout, so a chain read (`init()`'s Hub lookups, on the critical path
+// of `createOnChainContextGraph`) would hang for minutes. The bounded
+// `retryFunc` must make the read surface `RPC_ENDPOINTS_EXHAUSTED` in seconds so
+// `/api/context-graph/register` returns 503 (not hang / 500).
+describe('init() RPC-exhaustion bounding (perpetual 429)', () => {
+  let server: Server | null = null;
+  let url = '';
+
+  async function startRateLimited429(): Promise<string> {
+    server = createServer((_req, res) => {
+      res.writeHead(429, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32005, message: 'rate limited' } }));
+    });
+    await new Promise<void>((resolve) => server!.listen(0, '127.0.0.1', () => resolve()));
+    const addr = server.address();
+    if (!addr || typeof addr === 'string') throw new Error('mock RPC failed to bind');
+    return `http://127.0.0.1:${addr.port}`;
+  }
+
+  afterEach(async () => {
+    if (server) {
+      await new Promise<void>((resolve) => server!.close(() => resolve()));
+      server = null;
+    }
+  });
+
+  it('surfaces RPC_ENDPOINTS_EXHAUSTED from createOnChainContextGraph within a bounded time under a perpetually rate-limited RPC', async () => {
+    url = await startRateLimited429();
+    const a = new EVMChainAdapter(minimalConfig({ rpcUrl: url, rpcUrls: [] }));
+
+    const start = Date.now();
+    let thrown: any;
+    try {
+      await a.createOnChainContextGraph({ accessPolicy: 1, publishPolicy: 0 });
+    } catch (err) {
+      thrown = err;
+    }
+    const elapsed = Date.now() - start;
+
+    expect(thrown).toBeDefined();
+    expect(thrown.code).toBe('RPC_ENDPOINTS_EXHAUSTED');
+    // The classifier (`classifyRegisterContextGraphError`) maps the code → 503
+    // and surfaces `.message`; it must read as an RPC-endpoint exhaustion so the
+    // register test's `/RPC|endpoint|rate/i` body assertion holds.
+    expect(thrown.message).toMatch(/RPC|endpoint|rate/i);
+    expect(thrown.rpcUrls).toEqual([url]);
+    // Bounded: well under the daemon route / test 120s ceiling. The budget is
+    // ~6s of retry; allow generous slack for the in-flight network bootstrap.
+    expect(elapsed).toBeLessThan(45_000);
+  }, 60_000);
+
+  it('keeps the retry budget PER-REQUEST — a later request still retries (Codex PR #901 round-3 :125)', async () => {
+    // Regression guard: the budget was once a `Date.now()` deadline captured at
+    // provider construction, so after the budget elapsed (node uptime) EVERY
+    // later request lost all retries. Two sequential reads, spaced past the
+    // backoff budget, must BOTH retry the RPC multiple times.
+    let hits = 0;
+    server = createServer((_req, res) => {
+      hits += 1;
+      res.writeHead(429, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32005, message: 'rate limited' } }));
+    });
+    await new Promise<void>((resolve) => server!.listen(0, '127.0.0.1', () => resolve()));
+    const addr = server.address();
+    if (!addr || typeof addr === 'string') throw new Error('mock RPC failed to bind');
+    url = `http://127.0.0.1:${addr.port}`;
+    const a = new EVMChainAdapter(minimalConfig({ rpcUrl: url, rpcUrls: [] }));
+
+    // First read: exhaust + count its retries. >1 hit ⇒ it retried.
+    hits = 0;
+    await a.createOnChainContextGraph({ accessPolicy: 1, publishPolicy: 0 }).catch(() => {});
+    const firstRequestHits = hits;
+    expect(firstRequestHits).toBeGreaterThan(1);
+
+    // Second read (provider already "aged" past the old construction-time
+    // deadline by the first request's ~7.5s of backoff): must ALSO retry. Under
+    // the construction-time-deadline bug this would have made exactly 1 hit.
+    hits = 0;
+    await a.createOnChainContextGraph({ accessPolicy: 1, publishPolicy: 0 }).catch(() => {});
+    expect(hits).toBeGreaterThan(1);
+  }, 60_000);
 });
 
 describe('PR3 / RC11 — publish-preflight TTL cache', () => {

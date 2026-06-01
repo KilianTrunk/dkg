@@ -84,7 +84,7 @@ import {
   pickNetworkTunables,
 } from '@origintrail-official/dkg-core';
 import { GraphManager, PrivateContentStore, createTripleStore, type TripleStore, type TripleStoreConfig, type Quad, type LargeLiteralStorageConfig } from '@origintrail-official/dkg-storage';
-import { EVMChainAdapter, NoChainAdapter, enrichEvmError, type EVMAdapterConfig, type ChainAdapter, type CreateContextGraphParams, type CreateOnChainContextGraphParams, type CreateOnChainContextGraphResult, type TxResult, type V10PublishingConvictionAccountInfo } from '@origintrail-official/dkg-chain';
+import { EVMChainAdapter, NoChainAdapter, enrichEvmError, isRetryableRpcError, type EVMAdapterConfig, type ChainAdapter, type CreateContextGraphParams, type CreateOnChainContextGraphParams, type CreateOnChainContextGraphResult, type TxResult, type V10PublishingConvictionAccountInfo } from '@origintrail-official/dkg-chain';
 import {
   DKGPublisher, PublishHandler, SharedMemoryHandler, UpdateHandler, ChainEventPoller, AccessHandler, AccessClient,
   PublishJournal, StaleWriteError,
@@ -396,6 +396,93 @@ export type {
  * is whatever fraction remains.
  */
 const CIPHERTEXT_CHUNK_SIZE_BYTES = 32 * 1024;
+
+/**
+ * Upper bound on the boot-time on-chain identity resolution
+ * (`getIdentityId` / `ensureProfile`) inside `start()`. Daemon HTTP
+ * readiness MUST NOT depend on chain-RPC reachability: `start()` is awaited
+ * before the daemon binds its HTTP listener (cli lifecycle.ts), so an
+ * unreachable or rate-limited (HTTP 429) RPC — which the multi-RPC failover
+ * loop retries across endpoints — would otherwise block boot past the CLI's
+ * 45s readiness ceiling (#894). When this bound trips, identity stays
+ * unresolved (0n): the node boots, HTTP serves, and on-chain writes (e.g.
+ * context-graph register) surface their own RPC error (503) at call time
+ * rather than hanging the whole daemon. Generous enough not to false-trip a
+ * healthy-but-slow chain, far below the 45s readiness window.
+ */
+const BOOT_CHAIN_IDENTITY_TIMEOUT_MS = 20_000;
+
+/**
+ * Floor for the (public, config-settable) StorageACK registration retry
+ * interval. Guards against a 0 / negative value collapsing the retry into a
+ * tight loop that hammers the RPC and floods the log (Codex PR #901 round-4
+ * :2106). 1s is well below the 30s production default yet leaves ample spacing.
+ */
+const MIN_STORAGE_ACK_REGISTRATION_RETRY_MS = 1_000;
+
+/**
+ * Resolve `op` but reject with a `BOOT_CHAIN_TIMEOUT`-coded error if it does
+ * not settle within `ms`. The timer is `unref`'d so it never keeps the
+ * process alive on its own. Used to bound boot-time chain calls so daemon
+ * readiness stays independent of chain-RPC reachability.
+ *
+ * When the timeout wins, `op` is still pending — the multi-RPC failover loop
+ * keeps retrying and will eventually reject (e.g. `RPC_ENDPOINTS_EXHAUSTED`).
+ * That late rejection has no awaiter once the race has settled, so we attach a
+ * no-op `.catch()` to the original promise to keep it from surfacing as an
+ * `unhandledRejection` and crashing the booted daemon.
+ */
+async function raceWithBootTimeout<T>(op: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  op.catch(() => {
+    /* swallow a late rejection from the abandoned op after the race settles */
+  });
+  try {
+    return await Promise.race<T>([
+      op,
+      new Promise<T>((_, reject) => {
+        timer = setTimeout(() => {
+          const err = new Error(`${label} timed out after ${ms}ms`);
+          (err as Error & { code?: string }).code = 'BOOT_CHAIN_TIMEOUT';
+          reject(err);
+        }, ms);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/**
+ * Is a boot-time chain-identity failure TRANSIENT (RPC unreachable / slow /
+ * rate-limited — recoverable by retrying once the chain is back) versus
+ * PERMANENT/deterministic (missing admin key, insufficient funds, a contract
+ * revert)? Only transient failures should arm the StorageACK retry loop;
+ * arming it for a permanent failure would re-call `ensureProfile()` every 30s
+ * forever (Codex PR #901 round-3 :1714 / round-4 :1838).
+ *
+ * Delegates the RPC-shape recognition to the chain package's exported
+ * `isRetryableRpcError` (Codex PR #901 round-4 :459) so we reuse its full
+ * extraction — top-level AND nested `error.code` / `statusCode` /
+ * `response.status` — instead of a narrower top-level-only copy that would
+ * misclassify a 429/5xx buried in a nested field as permanent. On top we add
+ * the boot path's own `BOOT_CHAIN_TIMEOUT` (`isRetryableRpcError` doesn't know
+ * it) and an explicit permanent-exclusion guard for `admin` provisioning
+ * failures (`isRetryableRpcError` already excludes revert/insufficient-funds/
+ * nonce). Anything else — ordinary `Error`s with no RPC signature — stays
+ * permanent and disabled.
+ */
+function isTransientBootChainError(err: unknown): boolean {
+  const code = (err as { code?: unknown })?.code;
+  if (code === 'BOOT_CHAIN_TIMEOUT') return true;
+  // A missing/invalid profile admin key is a deterministic config error, not a
+  // transient RPC failure — surface it once, never retry. (The chain classifier
+  // already treats revert / insufficient-funds / nonce as non-retryable.)
+  const msg = (err instanceof Error ? err.message : String(err ?? '')).toLowerCase();
+  if (msg.includes('admin')) return false;
+  return isRetryableRpcError(err);
+}
 
 /**
  * OT-RFC-38 LU-11. Split a single plaintext buffer into the
@@ -720,6 +807,12 @@ export class DKGAgent {
   private randomSamplingBindRetryInFlight = false;
   private storageACKRegistrationRetryTimer: ReturnType<typeof setTimeout> | null = null;
   private storageACKRegistrationRetryInFlight = false;
+  // #894 / Codex PR #901 round-3 :1685: `ensureProfile()` is a mutating
+  // multi-tx flow (createProfile + stake) that can legitimately outlast the
+  // boot read-timeout. Guards against the boot path AND the StorageACK retry
+  // re-submitting `ensureProfile()` while a prior one may still be settling on
+  // chain — which would risk a duplicate profile / double-stake.
+  private profileProvisioningInFlight = false;
   private readonly config: DKGAgentConfig;
   private started = false;
   private readonly subscribedContextGraphs = new Map<string, ContextGraphSub>();
@@ -1591,6 +1684,13 @@ export class DKGAgent {
     const effectiveRole = this.config.nodeRole ?? 'edge';
     const ackSignerCandidates = this.getACKSignerCandidateWallets(ctx);
     let onChainIdentityId = 0n;
+    // #894 / Codex PR #901: distinguishes a 0n identity caused by a transient
+    // boot-time chain failure (RPC timeout/unreachable — recoverable, so the
+    // StorageACK path must keep retrying + re-resolve once RPC returns) from
+    // an intentional 0n (e.g. an edge node that never provisions on-chain — it
+    // never reaches the core-only ACK block anyway). Set when the boot
+    // identity block times out or errors below.
+    let bootChainIdentityUnresolvedTransient = false;
     const ensureACKCandidateWalletsRegistered = async (
       attemptCtx: OperationContext,
     ): Promise<boolean> => {
@@ -1629,13 +1729,28 @@ export class DKGAgent {
     // Auto-detect or register on-chain identity.
     // Edge nodes skip profile creation — they operate with agent identity only.
     if (this.chain.chainId !== 'none') {
+      // #894: bound boot-time chain identity resolution so an unreachable /
+      // rate-limited RPC (which the multi-RPC failover loop retries across
+      // endpoints) cannot block daemon HTTP readiness past the CLI's 45s
+      // ceiling. On timeout the existing catch leaves identity unresolved and
+      // boot proceeds; the node serves HTTP and on-chain writes 503 at call
+      // time. The 20s bound is well below 45s yet generous for a healthy chain.
       try {
-        onChainIdentityId = await this.chain.getIdentityId();
+        onChainIdentityId = await raceWithBootTimeout(
+          this.chain.getIdentityId(),
+          BOOT_CHAIN_IDENTITY_TIMEOUT_MS,
+          'boot getIdentityId',
+        );
         if (onChainIdentityId === 0n && effectiveRole === 'core') {
           this.log.info(ctx, `No on-chain identity found, creating profile and staking...`);
-          onChainIdentityId = await this.chain.ensureProfile({
-            nodeName: this.config.name,
-          });
+          // Codex PR #901 round-3 :1685: do NOT race `ensureProfile()` with the
+          // boot timeout — it is a mutating createProfile+stake flow that can
+          // legitimately exceed 20s while the tx settles, and abandoning a live
+          // staking tx (then re-calling it on retry) risks a duplicate profile /
+          // double-stake. The read-side `getIdentityId()` above keeps its
+          // timeout (safe to abandon); provisioning runs to completion, guarded
+          // so neither boot nor the retry re-submits while one is in flight.
+          onChainIdentityId = await this.provisionProfileGuarded(ctx);
           this.log.info(ctx, `On-chain profile created, identityId=${onChainIdentityId}`);
         } else if (onChainIdentityId === 0n) {
           this.log.info(ctx, `Edge node — skipping on-chain profile creation (agent identity only)`);
@@ -1645,11 +1760,27 @@ export class DKGAgent {
       } catch (err) {
         this.log.warn(ctx, `ensureProfile error: ${err instanceof Error ? err.message : String(err)}`);
         try {
-          onChainIdentityId = await this.chain.getIdentityId();
+          onChainIdentityId = await raceWithBootTimeout(
+            this.chain.getIdentityId(),
+            BOOT_CHAIN_IDENTITY_TIMEOUT_MS,
+            'boot getIdentityId (recovery)',
+          );
           if (onChainIdentityId > 0n) {
             this.log.info(ctx, `Recovered identityId=${onChainIdentityId} after partial failure`);
           }
-        } catch { /* ignore */ }
+        } catch { /* ignore — boot proceeds with identity unresolved */ }
+        // The boot identity block threw. If it left identity at 0n AND the
+        // failure is TRANSIENT (RPC unreachable/slow/rate-limited), flag it so
+        // the StorageACK path re-resolves and recovers once the chain is back
+        // (#894 / Codex PR #901). A node that genuinely has no identity resolves
+        // 0n on the happy path WITHOUT throwing, leaving this false. And a
+        // PERMANENT/deterministic failure (missing admin key, insufficient
+        // funds, contract revert) must NOT arm the retry — otherwise the
+        // StorageACK loop would re-call `ensureProfile()` every 30s forever
+        // (Codex PR #901 round-3 :1714). It stays disabled and surfaces once.
+        if (onChainIdentityId === 0n && isTransientBootChainError(err)) {
+          bootChainIdentityUnresolvedTransient = true;
+        }
       }
       if (onChainIdentityId > 0n) {
         if (effectiveRole === 'core') {
@@ -1673,9 +1804,79 @@ export class DKGAgent {
         let storageACKFailoverInFlight = false;
         const attemptStorageACKRegistration = async (
           attemptCtx: OperationContext,
-          options: { repairWallets?: boolean } = {},
+          options: { repairWallets?: boolean; allowChainReresolution?: boolean } = {},
         ): Promise<'registered' | 'retryable' | 'disabled'> => {
           if (storageACKProtocolRegistered) return 'registered';
+          // #894 / Codex PR #901 (round 2): background identity re-resolution.
+          // If boot left the identity unresolved because of a transient chain
+          // failure (RPC timeout/unreachable), re-probe the chain — but ONLY on
+          // the scheduled retry path (`allowChainReresolution`), never on the
+          // first attempt awaited by `start()`. The boot path already spent its
+          // chain-timeout budget resolving identity; doing another bounded
+          // chain probe here would stack a third ~20s wait onto `start()` and
+          // blow the 45s readiness ceiling this fix exists to protect (Codex
+          // :1752). On the first attempt we return 'retryable' immediately and
+          // let the unref'd retry timer do the (background) re-resolution.
+          //
+          // We do NOT re-probe on a settled 0n (the flag stays false), so an
+          // intentional no-identity node doesn't spin the chain pointlessly.
+          if (
+            onChainIdentityId === 0n
+            && bootChainIdentityUnresolvedTransient
+            && options.allowChainReresolution === true
+          ) {
+            try {
+              let reresolved = await raceWithBootTimeout(
+                this.chain.getIdentityId(),
+                BOOT_CHAIN_IDENTITY_TIMEOUT_MS,
+                'StorageACK identity re-resolution',
+              );
+              // Codex :1757: a brand-new core node may have hit the transient
+              // failure BEFORE `ensureProfile()` ever ran, so it has no profile
+              // to find. Re-probing `getIdentityId()` alone would return 0n
+              // forever and the node would never provision. Once the chain is
+              // reachable again, create the profile (core only) — mirroring the
+              // boot-time provisioning path. Codex round-3 :1685: provision via
+              // the guarded, un-raced helper so the mutating createProfile+stake
+              // tx runs to completion and is never double-submitted alongside a
+              // boot-path (or concurrent-retry) provisioning still in flight.
+              if (reresolved === 0n && effectiveRole === 'core') {
+                this.log.info(attemptCtx, `No on-chain identity after transient boot outage — creating profile and staking...`);
+                reresolved = await this.provisionProfileGuarded(attemptCtx);
+              }
+              if (reresolved > 0n) {
+                onChainIdentityId = reresolved;
+                bootChainIdentityUnresolvedTransient = false;
+                this.publisher.setIdentityId(onChainIdentityId);
+                this.log.info(
+                  attemptCtx,
+                  `Recovered on-chain identity=${onChainIdentityId} for StorageACK after a transient boot-time chain failure`,
+                );
+              }
+            } catch (err) {
+              // Codex PR #901 round-4 :1838: mirror the boot-path :1714 gate on
+              // the retry path. If the chain came back but provisioning then
+              // failed DETERMINISTICALLY (insufficient funds / revert / admin),
+              // keeping the transient flag set would re-run `ensureProfile()`
+              // every interval forever. Reclassify: permanent → clear the flag
+              // so the terminal branch below returns 'disabled' (surface once,
+              // stop scheduling); transient → keep retrying.
+              if (!isTransientBootChainError(err)) {
+                bootChainIdentityUnresolvedTransient = false;
+                this.log.warn(
+                  attemptCtx,
+                  `V10 StorageACK identity provisioning failed permanently — disabling (no further retries): ` +
+                  `${err instanceof Error ? err.message : String(err)}`,
+                );
+              } else {
+                this.log.warn(
+                  attemptCtx,
+                  `StorageACK identity re-resolution failed (chain still unreachable?), will retry: ` +
+                  `${err instanceof Error ? err.message : String(err)}`,
+                );
+              }
+            }
+          }
           if (onChainIdentityId > 0n) {
             const registrationSucceeded = options.repairWallets === false
               ? true
@@ -1919,6 +2120,15 @@ export class DKGAgent {
               `Registered V10 StorageACK handler (identity=${onChainIdentityId}, signer=${ackSignerWallet.address})`,
             );
             return 'registered';
+          } else if (bootChainIdentityUnresolvedTransient) {
+            // #894 / Codex PR #901: identity is still 0n only because the
+            // chain was unreachable at boot and the re-resolution above hasn't
+            // recovered it yet. This is recoverable, so report 'retryable' —
+            // the scheduled retry keeps re-probing and registers ACK once the
+            // RPC returns, instead of leaving a core node permanently
+            // un-advertised until restart.
+            this.log.warn(attemptCtx, `Deferring V10 StorageACK handler registration — on-chain identity not yet resolved (transient chain outage at boot); will retry`);
+            return 'retryable';
           } else {
             this.log.warn(attemptCtx, `Skipping V10 StorageACK handler registration — identity not yet provisioned`);
             return 'disabled';
@@ -1926,9 +2136,19 @@ export class DKGAgent {
           return 'disabled';
         };
 
-        const scheduleStorageACKRegistrationRetry = (options: { repairWallets?: boolean } = {}) => {
+        // Codex PR #901 round-4 :2106: `storageAckRegistrationRetryMs` is a
+        // public config field fed straight into `setTimeout`. Clamp it to a
+        // sane floor so a 0 / negative / NaN value can't collapse the retry into
+        // a tight loop that hammers the RPC and floods the log while the node is
+        // unhealthy. A non-finite or too-small value falls back to the floor.
+        const requestedRetryMs = this.config.storageAckRegistrationRetryMs;
+        const storageACKRegistrationRetryMs =
+          typeof requestedRetryMs === 'number' && Number.isFinite(requestedRetryMs)
+            ? Math.max(requestedRetryMs, MIN_STORAGE_ACK_REGISTRATION_RETRY_MS)
+            : STORAGE_ACK_REGISTRATION_RETRY_MS;
+        const scheduleStorageACKRegistrationRetry = (options: { repairWallets?: boolean; allowChainReresolution?: boolean } = {}) => {
           if (this.storageACKRegistrationRetryTimer || storageACKProtocolRegistered) return;
-          this.log.warn(ctx, `V10 StorageACK handler registration will retry every ${STORAGE_ACK_REGISTRATION_RETRY_MS}ms`);
+          this.log.warn(ctx, `V10 StorageACK handler registration will retry every ${storageACKRegistrationRetryMs}ms`);
           this.storageACKRegistrationRetryTimer = setTimeout(() => {
             this.storageACKRegistrationRetryTimer = null;
             if (!this.started || storageACKProtocolRegistered || this.storageACKRegistrationRetryInFlight) return;
@@ -1948,16 +2168,21 @@ export class DKGAgent {
               .finally(() => {
                 this.storageACKRegistrationRetryInFlight = false;
               });
-          }, STORAGE_ACK_REGISTRATION_RETRY_MS);
+          }, storageACKRegistrationRetryMs);
           if (this.storageACKRegistrationRetryTimer.unref) this.storageACKRegistrationRetryTimer.unref();
         };
 
         try {
+          // The first attempt is awaited by `start()`, so it must NOT do a
+          // blocking chain re-probe (Codex :1752). It returns 'retryable'
+          // immediately for a transient-0n identity; the scheduled retry then
+          // runs the background re-resolution (+ ensureProfile for a brand-new
+          // core node) with `allowChainReresolution: true`.
           const result = await attemptStorageACKRegistration(ctx);
-          if (result === 'retryable') scheduleStorageACKRegistrationRetry();
+          if (result === 'retryable') scheduleStorageACKRegistrationRetry({ allowChainReresolution: true });
         } catch (err) {
           this.log.warn(ctx, `Skipping V10 StorageACK handler: ${err instanceof Error ? err.message : String(err)}`);
-          scheduleStorageACKRegistrationRetry();
+          scheduleStorageACKRegistrationRetry({ allowChainReresolution: true });
         }
       } else if (typeof this.chain.signACKDigest === 'function') {
         this.log.info(ctx, `V10 StorageACK: adapter has signACKDigest but no extractable key — handler registration deferred until callback signing is supported`);
@@ -9503,6 +9728,32 @@ export class DKGAgent {
     });
     this.log.info(ctx, `addBatchToContextGraph: batch=${params.batchId} → ctxGraph=${params.contextGraphId} success=${result.success}`);
     return { success: result.success };
+  }
+
+  /**
+   * Provision the node's on-chain profile (createProfile + stake) exactly once
+   * at a time. `ensureProfile()` is a mutating multi-tx flow that can outlast
+   * the boot read-timeout, so this guards against the boot path AND the
+   * StorageACK retry both calling it while a prior submission may still be
+   * settling — which could create a duplicate profile / double-stake (Codex
+   * PR #901 round-3 :1685). It is NOT raced against a timeout: the staking tx
+   * must run to completion. While a provisioning is in flight, concurrent
+   * callers re-read the (possibly now-created) identity via `getIdentityId()`
+   * instead of submitting a second `ensureProfile()`.
+   */
+  private async provisionProfileGuarded(ctx: OperationContext): Promise<bigint> {
+    if (this.profileProvisioningInFlight) {
+      // A provisioning is already running (boot or a prior retry). Don't submit
+      // a second createProfile+stake — just read whatever identity exists now.
+      this.log.info(ctx, 'Profile provisioning already in flight — re-reading identity instead of re-submitting');
+      return this.chain.getIdentityId();
+    }
+    this.profileProvisioningInFlight = true;
+    try {
+      return await this.chain.ensureProfile({ nodeName: this.config.name });
+    } finally {
+      this.profileProvisioningInFlight = false;
+    }
   }
 
   /**

@@ -4,9 +4,9 @@
  * SWM-sender key state serialization helpers extracted from
  * `dkg-agent.ts` as part of a mechanical file-size reduction. These
  * functions are pure transformations between in-memory
- * `LocalSwmSenderKey{Send,Receive}State` (declared in
- * `dkg-agent-types.ts`) and the on-disk JSON shape persisted under
- * `data/swm-sender-state/*.json`. No `DKGAgent` dependency.
+ * `LocalSwmSenderKey{Send,Receive}State` plus pending setup retries
+ * (declared in `dkg-agent-types.ts`) and the on-disk JSON shape
+ * persisted as `swm-sender-keys.json`. No `DKGAgent` dependency.
  *
  * The `requiredString`/`optionalString`/`requiredNumber` helpers are
  * deliberately scoped to this module's deserialisers — they throw the
@@ -22,6 +22,7 @@ import {
 import type {
   LocalSwmSenderKeySendState,
   LocalSwmSenderKeyReceiveState,
+  PendingSenderKeyEntry,
 } from './dkg-agent-types.js';
 
 export function swmSenderStateKey(contextGraphId: string, subGraphName: string | undefined, senderAgentAddress: string): string {
@@ -70,6 +71,19 @@ export function serializeSwmSenderReceiveState(state: LocalSwmSenderKeyReceiveSt
   };
 }
 
+export function serializePendingSenderKeyEntry(entry: PendingSenderKeyEntry): Record<string, unknown> {
+  return {
+    senderAgentAddress: entry.senderAgentAddress,
+    recipientAgentAddress: entry.recipientAgentAddress,
+    recipientKeyId: entry.recipientKeyId,
+    epochId: entry.epochId,
+    contextGraphId: entry.contextGraphId,
+    subGraphName: entry.subGraphName,
+    packageBytes: encodeBytes(entry.packageBytes),
+    createdAtMs: entry.createdAtMs,
+  };
+}
+
 export function deserializeSwmSenderSendState(entry: Record<string, unknown>): LocalSwmSenderKeySendState {
   return {
     contextGraphId: requiredString(entry.contextGraphId, 'contextGraphId'),
@@ -109,6 +123,21 @@ export function deserializeSwmSenderReceiveState(entry: Record<string, unknown>)
   };
 }
 
+export function deserializePendingSenderKeyEntry(entry: Record<string, unknown>): PendingSenderKeyEntry {
+  const senderAgentAddress = ethers.getAddress(requiredString(entry.senderAgentAddress, 'pending.senderAgentAddress'));
+  const recipientAgentAddress = ethers.getAddress(requiredString(entry.recipientAgentAddress, 'pending.recipientAgentAddress'));
+  return {
+    senderAgentAddress: senderAgentAddress.toLowerCase(),
+    recipientAgentAddress: recipientAgentAddress.toLowerCase(),
+    recipientKeyId: requiredString(entry.recipientKeyId, 'pending.recipientKeyId'),
+    epochId: requiredString(entry.epochId, 'pending.epochId'),
+    contextGraphId: requiredString(entry.contextGraphId, 'pending.contextGraphId'),
+    subGraphName: optionalString(entry.subGraphName),
+    packageBytes: decodeBytes(requiredString(entry.packageBytes, 'pending.packageBytes')),
+    createdAtMs: requiredNumber(entry.createdAtMs, 'pending.createdAtMs'),
+  };
+}
+
 function requiredString(value: unknown, name: string): string {
   if (typeof value !== 'string' || value.length === 0) {
     throw new Error(`Invalid Sender Key state: ${name} is required`);
@@ -125,4 +154,12 @@ function requiredNumber(value: unknown, name: string): number {
     throw new Error(`Invalid Sender Key state: ${name} must be a non-negative safe integer`);
   }
   return value as number;
+}
+
+function encodeBytes(bytes: Uint8Array): string {
+  return Buffer.from(bytes).toString('base64');
+}
+
+function decodeBytes(value: string): Uint8Array {
+  return new Uint8Array(Buffer.from(value, 'base64'));
 }

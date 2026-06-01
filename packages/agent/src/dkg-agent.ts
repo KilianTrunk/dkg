@@ -337,8 +337,10 @@ import {
   swmReceiverStateKey,
   serializeSwmSenderSendState,
   serializeSwmSenderReceiveState,
+  serializePendingSenderKeyEntry,
   deserializeSwmSenderSendState,
   deserializeSwmSenderReceiveState,
+  deserializePendingSenderKeyEntry,
 } from './dkg-agent-swm-state.js';
 // Public surface re-exported so external consumers that import directly
 // from `./dkg-agent.js` keep working. The new file `dkg-agent-types.ts`
@@ -1025,16 +1027,12 @@ export class DKGAgent {
    * without a peerId). Per-key triple `(senderAgentAddress,
    * recipientKeyId, epochId)` deduplicates within an agent.
    *
-   * In-memory only for now. Older epochs are evicted whenever a newer
-   * epoch is enqueued for the same `(sender, recipient)` pair — the
-   * supersession matches what the membership-hash flow already implies
-   * sender-side, and avoids the "queued package for epoch N replays
-   * after we've rolled to N+1" footgun.
-   *
-   * A future PR will plumb a SQLite-backed store through
-   * `config.swmSenderKeyStores?.pendingByAgent` so durability survives
-   * daemon restart. Today, restart loses pending rows and the next
-   * publish re-enqueues if the same member still has no peerId.
+   * Persisted with the SWM sender-key state file when `dataDir` is
+   * configured. Older epochs are evicted whenever a newer epoch is
+   * enqueued for the same `(sender, recipient)` pair — the supersession
+   * matches what the membership-hash flow already implies sender-side,
+   * and avoids the "queued package for epoch N replays after we've
+   * rolled to N+1" footgun.
    */
   private readonly pendingSenderKeyByAgent = new Map<string, PendingSenderKeyEntry[]>();
 
@@ -5974,13 +5972,14 @@ export class DKGAgent {
           //
           // Delivery semantics (C2 integration-pass relaxation):
           //   • `delivered=true && ack.accepted=true` → success.
-          //   • `delivered=true && ack.accepted=false` with no reason code,
-          //     or with a terminal reason (`stale-target`,
-          //     `active-private-key-missing`, `revoked-key`,
-          //     `bad-signature`, `unknown`)
+          //   • `delivered=true && ack.accepted=false` with no reason code
+          //     and no retryable legacy reason text, or with a terminal
+          //     reason (`stale-target`, `active-private-key-missing`,
+          //     `revoked-key`, `bad-signature`, `unknown`)
           //     → HARD failure: retrying the same package cannot help.
-          //   • `delivered=true && ack.accepted=false` with a non-terminal
-          //     reason → SOFT success: keep it queued so a
+          //   • `delivered=true && ack.accepted=false` with a
+          //     non-terminal/future reason, or retryable legacy reason
+          //     text → SOFT success: keep it queued so a
           //     later reconnect/publish can retry after remote view
           //     convergence.
           //   • `delivered=false` → SOFT success.
@@ -6021,7 +6020,7 @@ export class DKGAgent {
           }
           if (!ack.accepted) {
             const reason = ack.reason ?? 'unknown reason';
-            if (!this.isTerminalSwmSenderKeySetupAckReasonCode(ack.reasonCode)) {
+            if (this.isRetryableSwmSenderKeySetupAckReason(ack.reasonCode, ack.reason)) {
               this.enqueuePendingSenderKey({
                 senderAgentAddress: senderAgentAddress.toLowerCase(),
                 recipientAgentAddress: recipientAgentAddress.toLowerCase(),
@@ -6130,6 +6129,25 @@ export class DKGAgent {
     );
   }
 
+  private isRetryableSwmSenderKeySetupAckReason(
+    reasonCode: SwmSenderKeyPackageAckReasonCode | undefined,
+    reason: string | undefined,
+  ): boolean {
+    if (reasonCode) {
+      return !this.isTerminalSwmSenderKeySetupAckReasonCode(reasonCode);
+    }
+    return this.isRetryableLegacySwmSenderKeySetupAckReason(reason);
+  }
+
+  private isRetryableLegacySwmSenderKeySetupAckReason(reason: string | undefined): boolean {
+    if (!reason) return false;
+    return (
+      reason.includes(' is not allowed for context graph "') ||
+      reason.includes(' is not DKG-agent gated') ||
+      reason.includes(' is not local to this node')
+    );
+  }
+
   /**
    * PR-2 (SWM-fanout plan): enqueue a sender-key package whose recipient
    * has no advertised `dkg:peerId` (so we can't even ask the messenger
@@ -6198,11 +6216,11 @@ export class DKGAgent {
         }
         if (ack.accepted) {
           drained += 1;
-        } else if (this.isTerminalSwmSenderKeySetupAckReasonCode(ack.reasonCode)) {
+        } else if (this.isRetryableSwmSenderKeySetupAckReason(ack.reasonCode, ack.reason)) {
+          remaining.push(entry);
+        } else {
           // Terminal rejection: keep it out of the queue, but do not
           // report it as a successful drain.
-        } else {
-          remaining.push(entry);
         }
       } catch {
         remaining.push(entry);
@@ -6214,6 +6232,7 @@ export class DKGAgent {
     } else {
       this.pendingSenderKeyByAgent.set(recipientAgentAddress, remaining);
     }
+    await this.saveSwmSenderKeyState();
     return drained;
   }
 
@@ -6758,6 +6777,7 @@ export class DKGAgent {
       const parsed = JSON.parse(raw) as {
         send?: Array<Record<string, unknown>>;
         receive?: Array<Record<string, unknown>>;
+        pending?: Array<Record<string, unknown>>;
       };
       for (const entry of parsed.send ?? []) {
         const state = deserializeSwmSenderSendState(entry);
@@ -6773,10 +6793,18 @@ export class DKGAgent {
           state,
         );
       }
+      for (const entry of parsed.pending ?? []) {
+        const pending = deserializePendingSenderKeyEntry(entry);
+        const recipientKey = pending.recipientAgentAddress.toLowerCase();
+        const queue = this.pendingSenderKeyByAgent.get(recipientKey) ?? [];
+        queue.push(pending);
+        this.pendingSenderKeyByAgent.set(recipientKey, queue);
+      }
     } catch {
       // No durable state yet, or a corrupt file that should not unblock startup.
       this.swmSenderKeySendStates.clear();
       this.swmSenderKeyReceiveStates.clear();
+      this.pendingSenderKeyByAgent.clear();
     }
   }
 
@@ -6790,6 +6818,8 @@ export class DKGAgent {
       version: 1,
       send: [...this.swmSenderKeySendStates.values()].map(serializeSwmSenderSendState),
       receive: [...this.swmSenderKeyReceiveStates.values()].map(serializeSwmSenderReceiveState),
+      pending: [...this.pendingSenderKeyByAgent.values()]
+        .flatMap((queue) => queue.map(serializePendingSenderKeyEntry)),
     };
     await writeFile(path, JSON.stringify(payload, null, 2), { mode: 0o600 });
     try {

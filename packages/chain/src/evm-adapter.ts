@@ -1039,6 +1039,25 @@ export class EVMChainAdapter implements ChainAdapter {
       currentAllowance,
     );
     if (needsApprove) {
+      // Surface the per-publish floor explicitly. When `tokenAmount === 0n`
+      // (zero-cost / metadata-only publishes on devnets, or pricing oracle
+      // returning 0 on mainnet), the policy floors the approval ceiling at
+      // `V10_PUBLISH_ONCHAIN_MIN_ALLOWANCE` (== 1 wei) — the #720
+      // workaround for the contract's `transferFrom(..., 1n)` minimum.
+      // Without this log, operators who manually inspect on-chain
+      // allowance see "1 wei dust" persisting after every publish and
+      // misread it as a stuck or ghosted approval (#871).
+      if (
+        targetAllowance === V10_PUBLISH_ONCHAIN_MIN_ALLOWANCE &&
+        this.approvalPolicy.mode === 'per-publish'
+      ) {
+        console.warn(
+          `[chain] V10 per-publish auto-approve floor: signer=${signer.address} ` +
+          `kav10=${kav10Address} target=1 wei (tokenAmount=${tokenAmount.toString()}, ` +
+          `currentAllowance=${currentAllowance.toString()}). This is the #720 ` +
+          `transferFrom-minimum workaround; not a stuck approval.`,
+        );
+      }
       await this.sendContractTransaction(
         tokenWithSigner,
         'approve',

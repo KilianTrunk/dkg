@@ -1123,6 +1123,26 @@ function isEnoent(err: unknown): boolean {
   return !!err && typeof err === 'object' && (err as { code?: unknown }).code === 'ENOENT';
 }
 
+function readPersistedConfigSync(): unknown {
+  if (existsSync(configPath())) {
+    return JSON.parse(readFileSync(configPath(), 'utf-8'));
+  }
+  if (existsSync(configYamlPath())) {
+    return yaml.load(readFileSync(configYamlPath(), 'utf-8'));
+  }
+  return null;
+}
+
+export function readNodeRoleFromConfigSync(): 'edge' | 'core' {
+  try {
+    const parsed = readPersistedConfigSync();
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return 'edge';
+    return (parsed as { nodeRole?: unknown }).nodeRole === 'core' ? 'core' : 'edge';
+  } catch {
+    return 'edge';
+  }
+}
+
 export async function loadConfig(): Promise<DkgConfig> {
   try {
     const raw = await readFile(configPath(), 'utf-8');
@@ -1258,7 +1278,7 @@ export async function saveConfig(config: DkgConfig): Promise<void> {
 }
 
 export function configExists(): boolean {
-  return existsSync(configPath());
+  return existsSync(configPath()) || existsSync(configYamlPath());
 }
 
 export async function readPid(): Promise<number | null> {

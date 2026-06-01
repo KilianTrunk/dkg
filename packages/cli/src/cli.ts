@@ -28,6 +28,7 @@ import {
   releasesDir, activeSlot, swapSlot,
   slotEntryPoint, isStandaloneInstall, repoDir, isDkgMonorepo,
   resolveContextGraphs, resolveNetworkDefaultContextGraphs,
+  readNodeRoleFromConfigSync,
   type AutoUpdateConfig,
 } from './config.js';
 import { ApiClient } from './api-client.js';
@@ -357,29 +358,6 @@ async function loadQuadsFromInput(
 }
 
 /**
- * Synchronous best-effort read of `~/.dkg/config.json#nodeRole`. Used
- * by {@link resolveDaemonEntryPoint} which runs from supervisor /
- * spawn paths that cannot afford an async config load.
- *
- * Returns `'edge'` on any failure (default role) so a malformed or
- * missing config does NOT silently keep Edge nodes pinned to a stale
- * blue-green slot — the worst case is "we try the npm-global entry
- * and let the daemon's own startup error out with a useful message"
- * rather than "we run rc.10 instead of rc.12 because slots survived
- * the upgrade".
- */
-function readNodeRoleSync(): 'edge' | 'core' {
-  try {
-    const configPath = join(dkgDir(), 'config.json');
-    if (!existsSync(configPath)) return 'edge';
-    const parsed = JSON.parse(readFileSync(configPath, 'utf-8')) as { nodeRole?: unknown };
-    return parsed.nodeRole === 'core' ? 'core' : 'edge';
-  } catch {
-    return 'edge';
-  }
-}
-
-/**
  * Resolve the daemon entry point passed to spawned worker processes.
  *
  * OT-RFC-41 §4.1 / Bundle B1a: Edge nodes run from the npm-global
@@ -392,7 +370,7 @@ function readNodeRoleSync(): 'edge' | 'core' {
  */
 function resolveDaemonEntryPoint(): string {
   if (process.env.DKG_NO_BLUE_GREEN) return fileURLToPath(import.meta.url);
-  if (readNodeRoleSync() === 'edge') return fileURLToPath(import.meta.url);
+  if (readNodeRoleFromConfigSync() === 'edge') return fileURLToPath(import.meta.url);
   const rDir = releasesDir();
   if (existsSync(rDir)) {
     const entry = slotEntryPoint(join(rDir, 'current'));

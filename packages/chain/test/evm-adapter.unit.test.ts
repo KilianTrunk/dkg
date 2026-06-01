@@ -244,6 +244,100 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
     expect(backup.getTransactionReceipt).not.toHaveBeenCalled();
   });
 
+  it('tries backup RPC when contract transaction population is rate-limited', async () => {
+    const a = new EVMChainAdapter(minimalConfig({
+      rpcUrl: 'https://primary.example',
+      rpcUrls: ['https://backup.example'],
+    }));
+    const primaryProvider = { name: 'primary' } as any;
+    const backupProvider = { name: 'backup' } as any;
+    const signer = new ethers.Wallet(DEPLOYER_PK, primaryProvider);
+    const receipt = { hash: '0xabc', blockNumber: 12, status: 1, logs: [] };
+    const populated = { to: '0x0000000000000000000000000000000000000001', data: '0x1234' };
+    const populateTransaction = vi.fn()
+      .mockImplementationOnce(async () => {
+        const err = new Error('429 too many requests');
+        (err as any).status = 429;
+        throw err;
+      })
+      .mockResolvedValueOnce(populated);
+    const runners: any[] = [];
+    const contract = {
+      connect: vi.fn((runner: any) => {
+        runners.push(runner);
+        return { createContextGraph: { populateTransaction } };
+      }),
+    };
+    (a as any).providers = [primaryProvider, backupProvider];
+    (a as any).signPopulatedTransaction = vi.fn(async () => ({
+      signedTx: '0xdeadbeef',
+      txHash: receipt.hash,
+    }));
+    (a as any).sendSignedTransactionAndWait = vi.fn(async () => receipt);
+
+    await expect((a as any).sendContractTransaction(
+      contract,
+      'createContextGraph',
+      [],
+      signer,
+      'create on-chain context graph',
+    )).resolves.toBe(receipt);
+
+    expect(populateTransaction).toHaveBeenCalledTimes(2);
+    expect(runners.map((runner) => runner.provider)).toEqual([primaryProvider, backupProvider]);
+    expect((a as any).signPopulatedTransaction).toHaveBeenCalledWith(
+      runners[1],
+      populated,
+    );
+  });
+
+  it('names exhausted RPC endpoints when transaction population fails everywhere', async () => {
+    const a = new EVMChainAdapter(minimalConfig({
+      rpcUrl: 'https://primary.example',
+      rpcUrls: ['https://backup.example'],
+    }));
+    const primaryProvider = { name: 'primary' } as any;
+    const backupProvider = { name: 'backup' } as any;
+    const signer = new ethers.Wallet(DEPLOYER_PK, primaryProvider);
+    const populateTransaction = vi.fn(async () => {
+      const err = new Error('429 too many requests');
+      (err as any).status = 429;
+      throw err;
+    });
+    const contract = {
+      connect: vi.fn(() => ({ createContextGraph: { populateTransaction } })),
+    };
+    (a as any).providers = [primaryProvider, backupProvider];
+    (a as any).signPopulatedTransaction = vi.fn(async () => ({
+      signedTx: '0xdeadbeef',
+      txHash: '0xabc',
+    }));
+    (a as any).sendSignedTransactionAndWait = vi.fn(async () => ({}));
+
+    let thrown: any;
+    try {
+      await (a as any).sendContractTransaction(
+        contract,
+        'createContextGraph',
+        [],
+        signer,
+        'create on-chain context graph',
+      );
+    } catch (err) {
+      thrown = err;
+    }
+
+    expect(thrown).toMatchObject({
+      code: 'RPC_ENDPOINTS_EXHAUSTED',
+      rpcUrls: ['https://primary.example', 'https://backup.example'],
+    });
+    expect(thrown.message).toContain('https://primary.example');
+    expect(thrown.message).toContain('https://backup.example');
+    expect(populateTransaction).toHaveBeenCalledTimes(2);
+    expect((a as any).signPopulatedTransaction).not.toHaveBeenCalled();
+    expect((a as any).sendSignedTransactionAndWait).not.toHaveBeenCalled();
+  });
+
   it('broadcasts the exact same signed raw transaction to backup after primary send failure', async () => {
     const a = new EVMChainAdapter(minimalConfig({
       rpcUrl: 'https://primary.example',
@@ -270,6 +364,107 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
     await expect((a as any).sendSignedTransactionAndWait(signedTx, txHash, 'unit write')).resolves.toBe(receipt);
     expect(primary.broadcastTransaction).toHaveBeenCalledWith(signedTx);
     expect(backup.broadcastTransaction).toHaveBeenCalledWith(signedTx);
+  });
+
+  it('preserves the transaction hash when post-broadcast receipt lookup exhausts RPC endpoints', async () => {
+    const a = new EVMChainAdapter(minimalConfig({
+      rpcUrl: 'https://primary.example',
+      rpcUrls: ['https://backup.example'],
+    }));
+    const signedTx = '0xdeadbeef';
+    const txHash = '0x' + '55'.repeat(32);
+    const primaryProvider = {
+      name: 'primary',
+      broadcastTransaction: vi.fn(async () => ({ hash: txHash })),
+      getTransactionReceipt: vi.fn(async () => {
+        const err = new Error('429 too many requests');
+        (err as any).status = 429;
+        throw err;
+      }),
+    };
+    const backupProvider = {
+      name: 'backup',
+      broadcastTransaction: vi.fn(async () => ({ hash: txHash })),
+      getTransactionReceipt: vi.fn(async () => {
+        const err = new Error('502 bad gateway');
+        (err as any).status = 502;
+        throw err;
+      }),
+    };
+    const signer = new ethers.Wallet(DEPLOYER_PK, primaryProvider as any);
+    const populated = { to: '0x0000000000000000000000000000000000000001', data: '0x1234' };
+    const populateTransaction = vi.fn(async () => populated);
+    const contract = {
+      connect: vi.fn(() => ({ createContextGraph: { populateTransaction } })),
+    };
+    (a as any).providers = [primaryProvider, backupProvider];
+    (a as any).signPopulatedTransaction = vi.fn(async () => ({ signedTx, txHash }));
+
+    await expect((a as any).sendContractTransaction(
+      contract,
+      'createContextGraph',
+      [],
+      signer,
+      'create on-chain context graph',
+    )).rejects.toMatchObject({
+      code: 'RPC_RECEIPT_LOOKUP_FAILED',
+      txHash,
+    });
+    expect(populateTransaction).toHaveBeenCalledTimes(1);
+    expect((a as any).signPopulatedTransaction).toHaveBeenCalledTimes(1);
+    expect(primaryProvider.broadcastTransaction).toHaveBeenCalledWith(signedTx);
+    expect(backupProvider.broadcastTransaction).not.toHaveBeenCalled();
+    expect(primaryProvider.getTransactionReceipt).toHaveBeenCalledWith(txHash);
+    expect(backupProvider.getTransactionReceipt).toHaveBeenCalledWith(txHash);
+  });
+
+  it('classifies receipt wait expiry as a timeout and preserves the transaction hash', async () => {
+    vi.useFakeTimers();
+    try {
+      const a = new EVMChainAdapter(minimalConfig());
+      const signedTx = '0xdeadbeef';
+      const txHash = '0x' + '66'.repeat(32);
+      const provider = {
+        name: 'primary',
+        broadcastTransaction: vi.fn(async () => ({ hash: txHash })),
+        getTransactionReceipt: vi.fn(async () => null),
+      };
+      const signer = new ethers.Wallet(DEPLOYER_PK, provider as any);
+      const populated = { to: '0x0000000000000000000000000000000000000001', data: '0x1234' };
+      const populateTransaction = vi.fn(async () => populated);
+      const contract = {
+        connect: vi.fn(() => ({ createContextGraph: { populateTransaction } })),
+      };
+      (a as any).providers = [provider];
+      (a as any).signPopulatedTransaction = vi.fn(async () => ({ signedTx, txHash }));
+
+      const thrown = (async () => {
+        try {
+          await (a as any).sendContractTransaction(
+            contract,
+            'createContextGraph',
+            [],
+            signer,
+            'create on-chain context graph',
+          );
+          return undefined;
+        } catch (err) {
+          return err;
+        }
+      })();
+      await vi.advanceTimersByTimeAsync(180_001);
+
+      await expect(thrown).resolves.toMatchObject({
+        code: 'TIMEOUT',
+        txHash,
+      });
+      expect(populateTransaction).toHaveBeenCalledTimes(1);
+      expect((a as any).signPopulatedTransaction).toHaveBeenCalledTimes(1);
+      expect(provider.broadcastTransaction).toHaveBeenCalledWith(signedTx);
+      expect(provider.getTransactionReceipt).toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('treats already-known transaction responses as accepted and polls receipts', async () => {
@@ -1980,4 +2175,3 @@ describe('createKnowledgeAssets / updateKnowledgeCollectionV10 — approval sign
     expect(signSpy.mock.calls[0][0]).toBe(walletB);
   });
 });
-

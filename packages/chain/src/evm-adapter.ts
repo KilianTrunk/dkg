@@ -90,6 +90,7 @@ const DURATION_PROBE_TIMEOUT_MS = 2000;
  */
 const MAX_PROBE_AGE_MS = 30_000;
 const RPC_READ_STALL_TIMEOUT_MS = 4_000;
+const RPC_TRANSACTION_POPULATION_ATTEMPT_TIMEOUT_MS = 10_000;
 const RPC_BROADCAST_ATTEMPT_TIMEOUT_MS = 10_000;
 const RPC_RECEIPT_ATTEMPT_TIMEOUT_MS = 5_000;
 const RPC_RECEIPT_POLL_INTERVAL_MS = 2_000;
@@ -932,6 +933,7 @@ export class EVMChainAdapter implements ChainAdapter {
         { cause: lastRetryable },
       );
       (err as any).code = 'RPC_RECEIPT_LOOKUP_FAILED';
+      (err as any).txHash = txHash;
       throw err;
     }
     return null;
@@ -956,11 +958,14 @@ export class EVMChainAdapter implements ChainAdapter {
       }
       await sleep(RPC_RECEIPT_POLL_INTERVAL_MS);
     }
-    throw new Error(
-      `${label} tx ${txHash} was broadcast but no receipt was found within ${RPC_RECEIPT_TIMEOUT_MS}ms` +
+    const err = new Error(
+      `${label} tx ${txHash} timed out waiting for a receipt after ${RPC_RECEIPT_TIMEOUT_MS}ms` +
       (lastError ? ` (last RPC error: ${errorMessage(lastError)})` : ''),
       { cause: lastError },
     );
+    (err as any).code = 'TIMEOUT';
+    (err as any).txHash = txHash;
+    throw err;
   }
 
   private async signPopulatedTransaction(
@@ -998,9 +1003,38 @@ export class EVMChainAdapter implements ChainAdapter {
     signer: Wallet,
     label: string,
   ): Promise<ethers.TransactionReceipt> {
-    const connected = contract.connect(signer) as any;
-    const populated = await connected[method].populateTransaction(...args);
-    return this.sendPopulatedTransaction(signer, populated, label);
+    let lastRetryable: unknown;
+    for (let i = 0; i < this.providers.length; i += 1) {
+      const rpcSigner = signer.connect(this.providers[i]);
+      let prepared: { signedTx: string; txHash: string } | undefined;
+      try {
+        const connected = contract.connect(rpcSigner) as any;
+        const populated = await withTimeout<ethers.TransactionRequest>(
+          connected[method].populateTransaction(...args) as Promise<ethers.TransactionRequest>,
+          RPC_TRANSACTION_POPULATION_ATTEMPT_TIMEOUT_MS,
+          `${label} transaction population via RPC #${i + 1}`,
+        );
+        prepared = await withTimeout(
+          this.signPopulatedTransaction(rpcSigner, populated),
+          RPC_TRANSACTION_POPULATION_ATTEMPT_TIMEOUT_MS,
+          `${label} transaction signing via RPC #${i + 1}`,
+        );
+      } catch (err) {
+        if (!isRetryableRpcError(err)) throw err;
+        lastRetryable = err;
+        continue;
+      }
+      if (!prepared) continue;
+      return this.sendSignedTransactionAndWait(prepared.signedTx, prepared.txHash, label);
+    }
+    const err = new Error(
+      `${label} transaction preparation failed on all configured RPC endpoints ` +
+      `(${this.rpcUrls.join(', ')}): ${errorMessage(lastRetryable)}`,
+      { cause: lastRetryable },
+    );
+    (err as any).code = 'RPC_ENDPOINTS_EXHAUSTED';
+    (err as any).rpcUrls = [...this.rpcUrls];
+    throw err;
   }
 
   /**

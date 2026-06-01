@@ -178,6 +178,25 @@ describe('listAssertions (WM) — URI parse + cg-scoped filter', () => {
     expect(typeof body.sparql).toBe('string');
   });
 
+  it('SPARQL gates WM membership on dkg:memoryLayer "WM" in <cg>/_meta (#898 Codex)', async () => {
+    // Codex review on #898 — `assertionPromote` empties the assertion
+    // data graph but intentionally leaves daemon-owned `urn:dkg:file:*`
+    // / `urn:dkg:extraction:*` quads behind, so a raw `GRAPH ?g { ?s ?p
+    // ?o }` count keeps returning promoted assertions. Pin the new
+    // gate: the SPARQL must JOIN against `<cg>/_meta` filtered on
+    // `dkg:memoryLayer "WM"` so promoted assertions (flipped to "SWM"
+    // by `assertionPromote`) drop out cleanly.
+    setBindings([
+      bRow('did:dkg:context-graph:cg-A/assertion/0xabc/notes', 5),
+    ]);
+    await listAssertions('cg-A', 'wm');
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(String(init.body));
+    expect(body.sparql).toContain('did:dkg:context-graph:cg-A/_meta');
+    expect(body.sparql).toContain('http://dkg.io/ontology/memoryLayer');
+    expect(body.sparql).toContain('"WM"');
+  });
+
   it('scopes the /assertion/ discriminator to the tail when cgId itself contains "/assertion/"', async () => {
     // PR #710 reviewer guard — `validateContextGraphId` permits
     // slashes, so a cgId can literally contain `/assertion/` as a

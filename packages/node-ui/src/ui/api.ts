@@ -703,7 +703,25 @@ export async function listAssertions(
   // already uses brings the assertion partitions back into `GRAPH ?g`
   // expansion. Same `/api/query` route, same `postQueryDeduped` cache,
   // same privacy/cost envelope as the dashboard counters.
-  const sparql = `SELECT DISTINCT ?g (COUNT(?s) AS ?cnt) WHERE { GRAPH ?g { ?s ?p ?o } } GROUP BY ?g`;
+  // Codex review on #898 — listing WM by raw `GRAPH ?g { ?s ?p ?o }`
+  // counts re-listed promoted assertions because `assertionPromote`
+  // intentionally leaves daemon-owned `urn:dkg:file:*` /
+  // `urn:dkg:extraction:*` quads behind in the assertion data graph
+  // (publisher Bug 8 / Round 9 Bug 25 import-bookkeeping filter), so
+  // those graphs stay non-empty after promote even though the
+  // lifecycle in `_meta` has flipped to `dkg:memoryLayer "SWM"`. The
+  // UI was therefore offering Promote on assertions that were no
+  // longer in WM. Derive WM membership from the lifecycle marker the
+  // publisher itself owns: `<assertionGraphUri> dkg:memoryLayer "WM"`
+  // in `<cg>/_meta` (set by `assertionCreate`, flipped to "SWM" by
+  // `assertionPromote`). The OPTIONAL keeps WM rows visible even when
+  // the data graph is genuinely empty (fresh create with no writes
+  // yet), matching the prior listing semantics for that case.
+  const metaGraph = `did:dkg:context-graph:${contextGraphId}/_meta`;
+  const sparql = `SELECT ?g (COUNT(?s) AS ?cnt) WHERE {
+    GRAPH <${metaGraph}> { ?g <http://dkg.io/ontology/memoryLayer> "WM" }
+    OPTIONAL { GRAPH ?g { ?s ?p ?o } }
+  } GROUP BY ?g`;
   const data = await postQueryDeduped({
     sparql,
     contextGraphId,

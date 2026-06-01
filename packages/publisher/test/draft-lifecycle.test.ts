@@ -180,6 +180,48 @@ describe('Working Memory Assertion Lifecycle', () => {
     expect(result.promotedCount).toBe(0);
   });
 
+  // Codex review on #898 — `assertionPromote` empties the assertion
+  // data graph but intentionally leaves daemon-owned `urn:dkg:file:*`
+  // / `urn:dkg:extraction:*` quads behind, AND keeps the
+  // `extractionStatus="completed"` + positive `structuralTripleCount`
+  // markers in `_meta` for audit purposes. Without the lifecycle gate
+  // (`dkg:memoryLayer "WM"`), a retry / stale double-click after a
+  // successful promote was misclassified as ASSERTION_NOT_PERSISTED.
+  // The lifecycle marker is flipped to "SWM" by `assertionPromote`, so
+  // the second promote must short-circuit cleanly to a no-op.
+  it('promote is a no-op (no AssertionNotPersistedError) when re-running after a successful promote', async () => {
+    await publisher.assertionCreate(CG_ID, ASSERTION_NAME, AGENT);
+    await publisher.assertionWrite(CG_ID, ASSERTION_NAME, AGENT, TRIPLES);
+
+    // Stamp the post-import-file extraction markers that
+    // `assertionPromote` deliberately preserves. After the success run
+    // the data graph is empty + lifecycle is "SWM", but these two
+    // markers stick around in `_meta`.
+    const graphUri = contextGraphAssertionUri(CG_ID, AGENT, ASSERTION_NAME);
+    const metaGraph = contextGraphMetaUri(CG_ID);
+    await store.insert([
+      {
+        subject: graphUri,
+        predicate: 'http://dkg.io/ontology/extractionStatus',
+        object: '"completed"',
+        graph: metaGraph,
+      },
+      {
+        subject: graphUri,
+        predicate: 'http://dkg.io/ontology/structuralTripleCount',
+        object: `"${TRIPLES.length}"^^<http://www.w3.org/2001/XMLSchema#integer>`,
+        graph: metaGraph,
+      },
+    ]);
+
+    const first = await publisher.assertionPromote(CG_ID, ASSERTION_NAME, AGENT, { publisherPeerId: PEER });
+    expect(first.promotedCount).toBeGreaterThan(0);
+
+    // Stale second click — must be a harmless no-op, not an error.
+    const second = await publisher.assertionPromote(CG_ID, ASSERTION_NAME, AGENT, { publisherPeerId: PEER });
+    expect(second.promotedCount).toBe(0);
+  });
+
   // Issue #864 — same shape as the previous test but exercises the
   // partial-metadata case: status present, count = 0 → not an
   // inconsistency, still a legitimate no-op (e.g. a Phase-1 file with

@@ -3852,10 +3852,11 @@ export class DKGPublisher implements Publisher {
     const DKG = 'http://dkg.io/ontology/';
     const metaGraph = contextGraphMetaUri(contextGraphId);
     const result = await this.store.query(
-      `SELECT ?status ?count WHERE {
+      `SELECT ?status ?count ?layer WHERE {
          GRAPH <${metaGraph}> {
            OPTIONAL { <${assertionGraph}> <${DKG}extractionStatus> ?status }
            OPTIONAL { <${assertionGraph}> <${DKG}structuralTripleCount> ?count }
+           OPTIONAL { <${assertionGraph}> <${DKG}memoryLayer> ?layer }
          }
        } LIMIT 1`,
     );
@@ -3863,6 +3864,23 @@ export class DKGPublisher implements Publisher {
     const row = result.bindings[0];
     const statusRaw = row?.['status'];
     const countRaw = row?.['count'];
+    const layerRaw = row?.['layer'];
+    // Codex review on #898 — the previous version raised
+    // `AssertionNotPersistedError` whenever `extractionStatus="completed"`
+    // + a positive `structuralTripleCount` were stamped, even after a
+    // successful promote. `assertionPromote` empties the assertion data
+    // graph as part of the WM → SWM transition (line ~4260) but
+    // intentionally leaves those two extraction markers behind in
+    // `_meta` for audit purposes. The lifecycle marker that DOES move
+    // is `dkg:memoryLayer`, set to `"WM"` by `assertionCreate` and
+    // flipped to `"SWM"` by `assertionPromote` (line ~4270). A retry /
+    // stale double-click then hits this guard with `layer="SWM"` and
+    // must be treated as a harmless no-op rather than misclassified as
+    // ASSERTION_NOT_PERSISTED.
+    if (typeof layerRaw === 'string') {
+      const layerValue = stripSparqlLiteral(layerRaw);
+      if (layerValue !== 'WM') return;
+    }
     if (typeof statusRaw !== 'string' || typeof countRaw !== 'string') return;
     const statusValue = stripSparqlLiteral(statusRaw);
     if (statusValue !== 'completed') return;

@@ -1,5 +1,5 @@
 import { createOperationContext, DKG_ONTOLOGY, MemoryLayer, type OperationContext } from '@origintrail-official/dkg-core';
-import { contextGraphDataGraphUri, contextGraphMetaGraphUri, contextGraphWorkspaceGraphUri, contextGraphWorkspaceMetaGraphUri } from '@origintrail-official/dkg-core';
+import { contextGraphDataGraphUri, contextGraphMetaGraphUri } from '@origintrail-official/dkg-core';
 import type { Quad, TripleStore } from '@origintrail-official/dkg-storage';
 import { serializeWorkspacePublicSnapshotQuads, type WorkspacePublicSnapshotStore } from '@origintrail-official/dkg-publisher';
 import type { SyncRequestEnvelope } from '../auth/request-build.js';
@@ -78,9 +78,28 @@ export function registerSyncHandler(params: RegisterSyncHandlerParams): void {
     }
 
     if (isWorkspace) {
-      const wsGraph = contextGraphWorkspaceGraphUri(contextGraphId);
-      const wsMetaGraph = contextGraphWorkspaceMetaGraphUri(contextGraphId);
       const cutoff = sharedMemoryTtlMs > 0 ? new Date(Date.now() - sharedMemoryTtlMs).toISOString() : null;
+      // SWM lives at two URI shapes per CG (see `contextGraphSharedMemoryUri`
+      // / `contextGraphSharedMemoryMetaUri` in dkg-core/constants.ts):
+      //   <cgPrefix>/_shared_memory                  (root SWM)
+      //   <cgPrefix>/<sub>/_shared_memory            (sub-graph SWM)
+      //   <cgPrefix>/_shared_memory_meta             (root SWM meta)
+      //   <cgPrefix>/<sub>/_shared_memory_meta       (sub-graph SWM meta)
+      //
+      // Pre-PR-X this branch only queried the root graphs (via
+      // `contextGraphWorkspaceGraphUri`/`...MetaGraphUri`, which are
+      // hardcoded aliases for the root). A sync requester therefore
+      // received zero bytes of any sub-graph SWM the responder had
+      // locally, so a late joiner who joined AFTER the curator had
+      // published into a sub-graph could not backfill that history
+      // through `/dkg/10.0.1/sync` — see the SWM late-joiner backfill
+      // gap (urn:dkg:finding:swm-gap-2-subgraph-blind-spot). Filter
+      // by URI shape under the CG prefix and emit `?g` per binding so
+      // the requester reconstructs the correct graph at write time.
+      // Sub-graph names cannot contain `/` and cannot start with `_`
+      // (`validateSubGraphName` in dkg-core/constants.ts), so the
+      // shape-based FILTER is exact.
+      const cgPrefix = `did:dkg:context-graph:${contextGraphId}`;
 
       if (phase === 'snapshot') {
         const snapshotRef = request.snapshotRef?.trim();
@@ -99,16 +118,20 @@ export function registerSyncHandler(params: RegisterSyncHandlerParams): void {
         logDebug(createOperationContext('sync'), `Sync responder SWM snapshot for "${contextGraphId}" ref=${snapshotRef}: auth=${authDurationMs}ms quads=${page.length}`);
       } else if (phase === 'meta') {
         const metaQuery = cutoff != null
-          ? `SELECT ?s ?p ?o WHERE {
-              GRAPH <${wsMetaGraph}> { ?s ?p ?o }
+          ? `SELECT ?s ?p ?o ?g WHERE {
+              GRAPH ?g { ?s ?p ?o }
+              FILTER(STRSTARTS(STR(?g), "${cgPrefix}/") && STRENDS(STR(?g), "/_shared_memory_meta"))
               FILTER EXISTS {
-                GRAPH <${wsMetaGraph}> {
+                GRAPH ?g {
                   ?s <http://dkg.io/ontology/publishedAt> ?ts .
                   FILTER(?ts >= "${cutoff}"^^<http://www.w3.org/2001/XMLSchema#dateTime>)
                 }
               }
-            } ORDER BY ?s ?p ?o OFFSET ${offset} LIMIT ${limit}`
-          : `SELECT ?s ?p ?o WHERE { GRAPH <${wsMetaGraph}> { ?s ?p ?o } } ORDER BY ?s ?p ?o OFFSET ${offset} LIMIT ${limit}`;
+            } ORDER BY ?g ?s ?p ?o OFFSET ${offset} LIMIT ${limit}`
+          : `SELECT ?s ?p ?o ?g WHERE {
+              GRAPH ?g { ?s ?p ?o }
+              FILTER(STRSTARTS(STR(?g), "${cgPrefix}/") && STRENDS(STR(?g), "/_shared_memory_meta"))
+            } ORDER BY ?g ?s ?p ?o OFFSET ${offset} LIMIT ${limit}`;
 
         const queryStartedAt = Date.now();
         const metaResult = await store.query(metaQuery);
@@ -117,24 +140,41 @@ export function registerSyncHandler(params: RegisterSyncHandlerParams): void {
         if (metaResult.type === 'bindings') {
           for (const b of metaResult.bindings) {
             const obj = b['o'].startsWith('"') ? b['o'] : `<${b['o']}>`;
-            nquads.push(`<${b['s']}> <${b['p']}> ${obj} <${wsMetaGraph}> .`);
+            nquads.push(`<${b['s']}> <${b['p']}> ${obj} <${b['g']}> .`);
           }
         }
         const serializeDurationMs = Date.now() - serializeStartedAt;
         logDebug(createOperationContext('sync'), `Sync responder SWM meta for "${contextGraphId}": auth=${authDurationMs}ms query=${queryDurationMs}ms serialize=${serializeDurationMs}ms`);
       } else {
+        // The TTL branch joins a WorkspaceOperation entry (in the
+        // matching `_shared_memory_meta` graph) to its root entity
+        // and skolemized children (in the same-prefix `_shared_memory`
+        // graph). Bind the two graphs together by URI structure:
+        //   STR(?gMeta) = CONCAT(STR(?g), "_meta")
+        // so a publish into sub-graph "foo" pairs ops in
+        // `<cgPrefix>/foo/_shared_memory_meta` with entities in
+        // `<cgPrefix>/foo/_shared_memory` only — without bleeding into
+        // a different sub-graph's ops or into root ops.
         const wsQuery = cutoff != null
-          ? `SELECT DISTINCT ?s ?p ?o WHERE {
-  GRAPH <${wsMetaGraph}> {
+          ? `SELECT DISTINCT ?s ?p ?o ?g WHERE {
+  GRAPH ?gMeta {
     ?op <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://dkg.io/ontology/WorkspaceOperation> .
     ?op <http://dkg.io/ontology/publishedAt> ?ts .
     ?op <http://dkg.io/ontology/rootEntity> ?re .
     FILTER(?ts >= "${cutoff}"^^<http://www.w3.org/2001/XMLSchema#dateTime>)
   }
-  GRAPH <${wsGraph}> { ?s ?p ?o }
+  GRAPH ?g { ?s ?p ?o }
+  FILTER(
+    STRSTARTS(STR(?g), "${cgPrefix}/") &&
+    STRENDS(STR(?g), "/_shared_memory") &&
+    STR(?gMeta) = CONCAT(STR(?g), "_meta")
+  )
   FILTER(?s = ?re || STRSTARTS(STR(?s), CONCAT(STR(?re), "/.well-known/genid/")))
-} ORDER BY ?s ?p ?o OFFSET ${offset} LIMIT ${limit}`
-          : `SELECT ?s ?p ?o WHERE { GRAPH <${wsGraph}> { ?s ?p ?o } } ORDER BY ?s ?p ?o OFFSET ${offset} LIMIT ${limit}`;
+} ORDER BY ?g ?s ?p ?o OFFSET ${offset} LIMIT ${limit}`
+          : `SELECT ?s ?p ?o ?g WHERE {
+              GRAPH ?g { ?s ?p ?o }
+              FILTER(STRSTARTS(STR(?g), "${cgPrefix}/") && STRENDS(STR(?g), "/_shared_memory"))
+            } ORDER BY ?g ?s ?p ?o OFFSET ${offset} LIMIT ${limit}`;
 
         const queryStartedAt = Date.now();
         const wsResult = await store.query(wsQuery);
@@ -145,7 +185,7 @@ export function registerSyncHandler(params: RegisterSyncHandlerParams): void {
         const serializeStartedAt = Date.now();
         for (const b of wsResult.bindings) {
           const obj = b['o'].startsWith('"') ? b['o'] : `<${b['o']}>`;
-          nquads.push(`<${b['s']}> <${b['p']}> ${obj} <${wsGraph}> .`);
+          nquads.push(`<${b['s']}> <${b['p']}> ${obj} <${b['g']}> .`);
         }
         const serializeDurationMs = Date.now() - serializeStartedAt;
         logDebug(createOperationContext('sync'), `Sync responder SWM data for "${contextGraphId}": auth=${authDurationMs}ms query=${queryDurationMs}ms serialize=${serializeDurationMs}ms`);

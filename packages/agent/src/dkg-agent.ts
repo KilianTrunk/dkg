@@ -2539,7 +2539,16 @@ export class DKGAgent {
             // yet at this point on multi-agent nodes).
             this.localApprovedAgentByCG.set(contextGraphId, approvedAddr.toLowerCase());
             this.log.info(createOperationContext('system'), `Join request approved for "${contextGraphId}" — auto-subscribing`);
-            this.subscribeToContextGraph(contextGraphId);
+            // Defer the SWM gossip subscribe specifically: the curator's
+            // allowlist hasn't synced into our local `_meta` yet, so a
+            // pre-meta `canReadContextGraph` check would deny and emit a
+            // misleading WARN. `runImmediatePostApprovalSync` below pulls
+            // `_meta`, then `refreshMetaSyncedFlags` (called from
+            // `runCatchupOverPeers`) re-queues the SWM gossip subscribe
+            // once the allowlist is locally visible — clean self-heal,
+            // no spurious denial. Other gossip topics (publish/app/
+            // update/finalization) wire up immediately as before.
+            this.subscribeToContextGraph(contextGraphId, { deferSharedMemoryGossipSubscribe: true });
             this.upsertContextGraphMember({
               contextGraphId,
               principalType: 'agent',
@@ -10305,14 +10314,29 @@ export class DKGAgent {
     });
   }
 
-  subscribeToContextGraph(contextGraphId: string, options?: { trackSyncScope?: boolean; persist?: boolean }): void {
+  subscribeToContextGraph(contextGraphId: string, options?: { trackSyncScope?: boolean; persist?: boolean; deferSharedMemoryGossipSubscribe?: boolean }): void {
     if (options?.trackSyncScope !== false) {
       this.trackSyncContextGraph(contextGraphId);
     }
 
+    // SWM gossip subscribe runs `canReadContextGraph` against the local
+    // `_meta` graph. On a fresh `join-approved` notification the curator
+    // has just written the allowlist into ITS _meta, but the requesting
+    // node hasn't synced that allowlist yet — so the very first SWM
+    // gossip subscribe attempt fails with `local node is not authorized`,
+    // emitting a misleading WARN. The real fix is to land the allowlist
+    // first via `runImmediatePostApprovalSync`; once `_meta` syncs,
+    // `refreshMetaSyncedFlags` re-queues the SWM gossip subscribe (line
+    // 3738) and it succeeds silently. This option lets the join-approved
+    // path opt out of the immediate SWM subscribe and rely on that
+    // self-heal — see urn:dkg:finding:swm-gap-1-initial-sync-race.
+    const deferSwmGossip = options?.deferSharedMemoryGossipSubscribe === true;
+
     // Idempotent: skip if gossip handlers already installed for this context graph.
     if (this.gossipRegistered.has(contextGraphId)) {
-      this.queueSharedMemoryGossipSubscription(contextGraphId);
+      if (!deferSwmGossip) {
+        this.queueSharedMemoryGossipSubscription(contextGraphId);
+      }
       const existing = this.subscribedContextGraphs.get(contextGraphId);
       if (!existing?.subscribed) {
         this.setContextGraphSubscription(
@@ -10343,7 +10367,9 @@ export class DKGAgent {
       await gph.handlePublishMessage(data, contextGraphId, undefined, from);
     });
 
-    this.queueSharedMemoryGossipSubscription(contextGraphId);
+    if (!deferSwmGossip) {
+      this.queueSharedMemoryGossipSubscription(contextGraphId);
+    }
 
     const updateTopic = contextGraphUpdateTopic(contextGraphId);
     this.gossip.subscribe(updateTopic);

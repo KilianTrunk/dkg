@@ -442,45 +442,62 @@ describe('SubGraphOverviewGrid — header subtitle anchors (PR #793 round 4.1, G
     expect(sub!.textContent).not.toContain('4 triples');
   });
 
-  it('subtitle drops WM residue triples whose subject has been promoted to SWM (GH #805 layer-correctness)', async () => {
-    // The other half of GH #805 — WM residue. The daemon leaves
-    // `/assertion/<addr>/<name>` graphs on disk after promote, so a
-    // promoted entity's WM-origin triples keep coming back from
-    // `wmSparql`. The entity's canonical `trustLevel` has moved to
-    // `shared`, so `useLayerTriples('wm')` drops those residue
-    // rows. Pre-#805 `allTriples.length` counted them and the
-    // subtitle disagreed with the per-layer LayerStats.
+  it('subtitle drops WM residue rows only when BOTH endpoints have moved past the row layer (GH #819 mixed-layer-preserving rule)', async () => {
+    // The residue-drop semantic shifted from PR #805's per-layer
+    // rule ("drop if subject moved") to GH #819's canonical-total
+    // rule ("drop ONLY if BOTH endpoints moved past `t.layer`").
+    // The new rule preserves legitimate mixed-layer edges — the
+    // common case after promotion where an entity moves up but
+    // still has cross-layer references.
+    //
+    // This test exercises BOTH branches:
+    //   • promoted → orphan object (literal / class IRI / non-
+    //     entity URN): orphan never "moves", so the row is not
+    //     unambiguous residue → ADMITS as a legitimate
+    //     subject-local property of the promoted entity.
+    //   • promoted → promoted (both endpoints SWM canonical) at
+    //     row layer 'working': both moved past WM → DROPS as
+    //     unambiguous residue.
     fetchSubGraphsMock.mockResolvedValueOnce({
-      subGraphs: [{ name: 'alpha', entityCount: 1, tripleCount: 0, description: '' }],
+      subGraphs: [{ name: 'alpha', entityCount: 2, tripleCount: 0, description: '' }],
     });
     const entityList = [
-      // 1 alpha entity, canonical layer SWM (promoted out of WM).
-      { uri: 'urn:e:promoted', label: 'p', types: [], trustLevel: 'shared', layers: new Set(['working', 'shared']), subGraphs: new Set(['alpha']), properties: new Map(), connections: [] },
+      // Both entities canonical layer SWM (promoted past WM).
+      { uri: 'urn:e:promoted-a', label: 'a', types: [], trustLevel: 'shared', layers: new Set(['working', 'shared']), subGraphs: new Set(['alpha']), properties: new Map(), connections: [] },
+      { uri: 'urn:e:promoted-b', label: 'b', types: [], trustLevel: 'shared', layers: new Set(['working', 'shared']), subGraphs: new Set(['alpha']), properties: new Map(), connections: [] },
     ];
     const triples = [
-      // Honest SWM triple — kept.
-      { subject: 'urn:e:promoted', predicate: 'p', object: 'o-swm', layer: 'shared' },
-      // WM residue — same subject, but its canonical trustLevel is
-      // 'shared', so `useLayerTriples('wm')` drops this row.
-      // Pre-#805 it would have inflated the subtitle by 1.
-      { subject: 'urn:e:promoted', predicate: 'p', object: 'o-wm-residue', layer: 'working' },
+      // Honest SWM triple to an orphan object — kept.
+      { subject: 'urn:e:promoted-a', predicate: 'p', object: 'o-swm', layer: 'shared' },
+      // WM row to an orphan object. Subject moved past WM but
+      // object is an orphan (no entity record), so this is NOT
+      // unambiguous residue under the canonical rule. Admits as a
+      // subject-local property (the GH #819 mixed-layer-preserving
+      // behavior the per-layer rule incorrectly dropped).
+      { subject: 'urn:e:promoted-a', predicate: 'p', object: 'o-wm-mixed', layer: 'working' },
+      // WM row between two promoted entities. BOTH endpoints
+      // moved past WM → unambiguous residue → drops.
+      { subject: 'urn:e:promoted-a', predicate: 'p', object: 'urn:e:promoted-b', layer: 'working' },
     ];
     await renderWith({
       ...memory,
       entities: new Map(entityList.map(e => [e.uri, e])),
       entityList,
       allTriples: triples,
-      counts: { wm: 0, swm: 1, vm: 0, total: 1 },
+      counts: { wm: 0, swm: 2, vm: 0, total: 2 },
     });
     await flush();
 
     const sub = container.querySelector('.v10-sgov-sub');
     expect(sub).toBeTruthy();
-    // Only the honest SWM triple survives — WM residue dropped by
-    // the per-layer trustLevel filter.
-    expect(sub!.textContent).toContain('1 triples');
-    // Pre-#805 raw `allTriples.length` would have shown 2.
-    expect(sub!.textContent).not.toContain('2 triples');
+    // 2 of 3 rows admit: the honest SWM row + the orphan-object
+    // WM row (legitimate post-promotion subject-local property).
+    // The full-residue WM row between two promoted entities drops.
+    // Pre-#819 (`useLayerTriples` per-layer rule) would have
+    // dropped both WM rows → `1 triples`. The canonical rule
+    // keeps mixed-layer.
+    expect(sub!.textContent).toContain('2 triples');
+    expect(sub!.textContent).not.toContain('3 triples');
   });
 });
 
@@ -670,12 +687,16 @@ describe('SubGraphOverviewGrid — Root mini-card (GH #813)', () => {
 
     const cards = container.querySelectorAll('.v10-sgov-card');
     const rootCardEl = cards[cards.length - 1];
-    // Root card stats: 2 root entities, 1 admitted triple (the
-    // untagged root↔root edge). Tagged + non-scoped triples
-    // dropped.
+    // Root card stats: 2 root entities. GH #819 round 11 (Codex
+    // sweep 9 🟡 #20): badge reads the PRE-filter candidate count
+    // (mirrors named-card contract). Tagged triple drops in the
+    // `!t.subGraph` filter; untagged `(alpha, p, somewhere-else)`
+    // and `(root1, p, root2)` both pass canonical admission → 2
+    // candidates. Post-AND-filter only `(root1, p, root2)`
+    // renders, so the β stat-vs-rendered tooltip fires.
     const stats = rootCardEl.querySelector('.v10-sgov-card-stats')?.textContent ?? '';
     expect(stats).toContain('2 entities');
-    expect(stats).toContain('1 triples');
+    expect(stats).toContain('2 triples');
   });
 
   it('Root card canonicalizes triple endpoints + SPO dedup key (Codex sweep 1, Bug M family)', async () => {
@@ -1124,12 +1145,22 @@ describe('SubGraphOverviewGrid — Root mini-card (GH #813)', () => {
 
     const cards = container.querySelectorAll('.v10-sgov-card');
     const rootCardEl = cards[cards.length - 1];
-    const stats = rootCardEl.querySelector('.v10-sgov-card-stats')?.textContent ?? '';
-    // 1 root entity, 0 triples — the root→non-root edge dropped
-    // by AND-filter. Pre-sweep this read `1 triples`.
+    const cardStats = rootCardEl.querySelector('.v10-sgov-card-stats');
+    const stats = cardStats?.textContent ?? '';
+    // GH #819 round 11 (Codex sweep 9 🟡 #20) — Root badge reads
+    // the PRE-`filterTriplesToEntities` candidate count, mirroring
+    // named-card contract. The untagged `(root, p, non-root)` row
+    // passes canonical admission (1 candidate) but drops in the
+    // AND-membership filter (non-root object not in rootEntityUris),
+    // so the rendered slice is empty. Stat (1) !== rendered (0) →
+    // β stat-vs-rendered tooltip fires.
     expect(stats).toContain('1 entities');
-    expect(stats).toContain('0 triples');
-    expect(stats).not.toContain('1 triples');
+    expect(stats).toContain('1 triples');
+    // β tooltip fires on the triples stat (cross-card edge cause).
+    const triplesStat = cardStats?.querySelectorAll('.v10-sgov-card-stat')[1];
+    expect(triplesStat?.getAttribute('title')).toBe(
+      `1 triples in this subgraph's scope; 0 rendered (some in-scope edges aren't drawn — either endpoints outside this subgraph, or cap-trimmed in dense buckets).`,
+    );
   });
 
   it('Root card admits rdf:type edges to class URIs (Codex sweep 6 — class IRIs exempted from AND-filter)', async () => {
@@ -1169,12 +1200,22 @@ describe('SubGraphOverviewGrid — Root mini-card (GH #813)', () => {
     expect(stats).toContain('1 triples');
   });
 
-  it('Named card drops triples to non-scoped entities (parity lock for sweep 6)', async () => {
-    // PR #818 sweep 6 — named-card path has used
-    // `filterTriplesToEntities` since the original implementation
-    // (`:4051`). This test locks the architectural symmetry that
-    // sweep 6 establishes: same input shape, same AND-membership
-    // behavior on the named-card side as the Root card side.
+  it('Named card renders the per-subgraph canonical-bucket triple count (GH #819 decoupled from AND-filtered rendered slice)', async () => {
+    // PR #818 sweep 6 + GH #819 separation of concerns:
+    //   - `tripleCount` STAT reports the canonical per-subgraph
+    //     bucket size (post-residue-filter, post-canonical-SPO-
+    //     dedup, pre-cap, pre-AND-filter). This is the "true
+    //     count" the user sees on the card chrome — agrees with
+    //     the subtitle distinct total when summed without
+    //     double-counting cross-graph duplicates.
+    //   - `triples` RENDERED slice further applies
+    //     `filterTriplesToEntities` (AND-membership +
+    //     rdf:type exemption) so non-scoped objects don't render
+    //     as phantom nodes. The two are intentionally decoupled.
+    //
+    // Pre-#819 the stat read `sg.tripleCount` (daemon-reported)
+    // which was the inflated raw count — agreed with neither the
+    // canonical universe nor the rendered slice.
     fetchSubGraphsMock.mockResolvedValueOnce({
       subGraphs: [{ name: 'alpha', entityCount: 1, tripleCount: 0, description: '' }],
     });
@@ -1185,9 +1226,12 @@ describe('SubGraphOverviewGrid — Root mini-card (GH #813)', () => {
       { uri: 'urn:e:beta', label: 'b', types: [], trustLevel: 'shared', layers: new Set(['shared']), subGraphs: new Set(['beta']), properties: new Map(), connections: [] },
     ];
     const triples = [
-      // alpha → beta edge tagged to alpha's subgraph. Named-card
-      // admission AND-filters: subject in scope, object NOT, so
-      // the edge drops from the alpha card.
+      // alpha → beta edge tagged to alpha's subgraph. The triple
+      // genuinely belongs to alpha's bucket (subGraph tag), so it
+      // counts in the alpha card's stat. The AND-filtered render
+      // slice still drops it because beta isn't in alpha's
+      // entityUris — but that's a render concern, not a count
+      // concern.
       { subject: 'urn:e:alpha', predicate: 'p', object: 'urn:e:beta', subGraph: 'alpha', layer: 'shared' },
     ];
     await renderWith({
@@ -1203,11 +1247,662 @@ describe('SubGraphOverviewGrid — Root mini-card (GH #813)', () => {
     const cards = container.querySelectorAll('.v10-sgov-card');
     const alphaCardEl = cards[0];
     const stats = alphaCardEl.querySelector('.v10-sgov-card-stats')?.textContent ?? '';
-    // 1 entity (alpha), 0 triples (the edge to beta dropped by
-    // AND-filter). Locks that the Root card now mirrors this
-    // behavior post-sweep-6.
+    // 1 entity (alpha — the only entity in alpha's subgraph),
+    // 1 triple (the alpha-tagged edge is in alpha's canonical
+    // bucket). Pre-#819 read `sg.tripleCount` (daemon 0); the
+    // canonical bucket-size lock anchors the new behavior.
     expect(stats).toContain('1 entities');
+    expect(stats).toContain('1 triples');
+
+    // GH #819 round 8 (Codex sweep 6 🟡 #4 / #9 / #12, team-lead
+    // call β) — when the in-scope canonical count differs from
+    // what actually renders on the mini-graph, the triple-count
+    // badge gets a `title` tooltip explaining the gap. Round 2
+    // locked the original wording on cross-card edges only; sweeps
+    // 1-6 re-raised the cap-trim cause (`applyHeaviestSubjectsCap`)
+    // 5 times in a row. Round 8 broadens the literal to cover both
+    // causes. Here the alpha→beta edge is in alpha's canonical
+    // bucket (count = 1) but drops from the rendered slice via
+    // `filterTriplesToEntities` (rendered = 0) — the
+    // endpoints-outside-subgraph cause.
+    const tripleStat = Array.from(alphaCardEl.querySelectorAll('.v10-sgov-card-stat'))
+      .find(el => el.textContent?.includes('triples')) as HTMLElement | undefined;
+    expect(tripleStat).toBeTruthy();
+    expect(tripleStat!.getAttribute('title')).toBe(
+      `1 triples in this subgraph's scope; 0 rendered (some in-scope edges aren't drawn — either endpoints outside this subgraph, or cap-trimmed in dense buckets).`,
+    );
+  });
+
+  it('Named card omits the stat-vs-rendered tooltip when count and rendered agree (GH #819 round 2 conditional render)', async () => {
+    // ux-lead locked the tooltip as conditional — added only when
+    // `tripleCount !== renderedTripleCount`. When equal (the
+    // common case: bucket is small, no cross-card edges, no cap),
+    // no chrome is added; the badge reads cleanly. Same
+    // visible-when-it-has-something-to-say pattern as S2's
+    // `Pending join requests` empty state.
+    fetchSubGraphsMock.mockResolvedValueOnce({
+      subGraphs: [{ name: 'alpha', entityCount: 2, tripleCount: 0, description: '' }],
+    });
+    const entityList = [
+      // Both entities in alpha's scope.
+      { uri: 'urn:e:alpha-a', label: 'aa', types: [], trustLevel: 'shared', layers: new Set(['shared']), subGraphs: new Set(['alpha']), properties: new Map(), connections: [] },
+      { uri: 'urn:e:alpha-b', label: 'ab', types: [], trustLevel: 'shared', layers: new Set(['shared']), subGraphs: new Set(['alpha']), properties: new Map(), connections: [] },
+    ];
+    const triples = [
+      // alpha-a → alpha-b edge: both endpoints in alpha's
+      // entityUris, so `filterTriplesToEntities` admits → rendered
+      // count == bucket count. No tooltip.
+      { subject: 'urn:e:alpha-a', predicate: 'p', object: 'urn:e:alpha-b', subGraph: 'alpha', layer: 'shared' },
+    ];
+    await renderWith({
+      ...memory,
+      entities: new Map(entityList.map(e => [e.uri, e])),
+      entityList,
+      allTriples: triples,
+      counts: { wm: 0, swm: 2, vm: 0, total: 2 },
+    });
+    await flush();
+
+    const cards = container.querySelectorAll('.v10-sgov-card');
+    const alphaCardEl = cards[0];
+    const tripleStat = Array.from(alphaCardEl.querySelectorAll('.v10-sgov-card-stat'))
+      .find(el => el.textContent?.includes('triples')) as HTMLElement | undefined;
+    expect(tripleStat).toBeTruthy();
+    expect(tripleStat!.textContent).toContain('1 triples');
+    // Conditional render — title attribute is absent (or empty)
+    // when stat and rendered agree.
+    expect(tripleStat!.getAttribute('title')).toBeNull();
+  });
+
+  it('Both cards surface their own scoped copy of an SPO shipped under two named subgraphs (GH #819 round 3 — Codex sweep 1 🔴 #1)', async () => {
+    // PR #847 round 3 (Codex sweep 1 🔴 #1) — `useCanonicalTriples`
+    // dedupes globally by `(canonical(s), p, canonical(o))` which
+    // is correct for the aggregate total but WRONG for per-bucket
+    // card counts: the same `(s, p, o)` legitimately shipped under
+    // two named sub-graphs (cross-membership entity referenced
+    // from both) would only survive in whichever row the canonical
+    // helper saw first, leaving the late-arrival card under-
+    // counted. Fix: `triplesBySubGraph` re-dedupes per bucket from
+    // raw `memory.allTriples`, keeping `subGraph` implicit in the
+    // bucket scope so each card keeps its own scoped copy.
+    fetchSubGraphsMock.mockResolvedValueOnce({
+      subGraphs: [
+        { name: 'alpha', entityCount: 1, tripleCount: 0, description: '' },
+        { name: 'beta', entityCount: 1, tripleCount: 0, description: '' },
+      ],
+    });
+    const entityList = [
+      // Cross-membership entity in both alpha and beta.
+      { uri: 'urn:e:cross', label: 'c', types: [], trustLevel: 'shared', layers: new Set(['shared']), subGraphs: new Set(['alpha', 'beta']), properties: new Map(), connections: [] },
+    ];
+    const triples = [
+      // Same SPO shipped under two named sub-graphs. Pre-fix
+      // canonical's global dedup collapsed both to the row that
+      // arrived first; only the first card showed the edge. Post-
+      // fix each bucket admits its own copy.
+      { subject: 'urn:e:cross', predicate: 'http://schema.org/name', object: '"C"', subGraph: 'alpha', layer: 'shared' },
+      { subject: 'urn:e:cross', predicate: 'http://schema.org/name', object: '"C"', subGraph: 'beta', layer: 'shared' },
+    ];
+    await renderWith({
+      ...memory,
+      entities: new Map(entityList.map(e => [e.uri, e])),
+      entityList,
+      allTriples: triples,
+      counts: { wm: 0, swm: 1, vm: 0, total: 1 },
+    });
+    await flush();
+
+    const cards = container.querySelectorAll('.v10-sgov-card');
+    // 2 named cards + Root card. alpha first (rank order), beta
+    // second, Root last.
+    expect(cards.length).toBeGreaterThanOrEqual(2);
+    const alphaCardEl = cards[0];
+    const betaCardEl = cards[1];
+    const alphaStats = alphaCardEl.querySelector('.v10-sgov-card-stats')?.textContent ?? '';
+    const betaStats = betaCardEl.querySelector('.v10-sgov-card-stats')?.textContent ?? '';
+    // BOTH cards show their scoped copy. Pre-fix one of them
+    // showed `0 triples`.
+    expect(alphaStats).toContain('1 triples');
+    expect(betaStats).toContain('1 triples');
+  });
+
+  it('Named card tripleCount ignores daemon sg.tripleCount under settled layer-error (GH #819 round 5+7 — Codex sweep 3 🔴 #8 + sweep 5 🔴 #14)', async () => {
+    // Round 5 (🔴 #8): drop the daemon-reported `sg.tripleCount`
+    // fallback entirely — the daemon route builds it via raw
+    // `COUNT(*)` (no SPO-dedup, no residue filter), so it's
+    // inflated, not a lower-bound.
+    // Round 7 (🔴 #14): a settled layer-error (`loading=false`,
+    // `partial=true`, `layerStatus.wm === 'error'`) is NOT a
+    // hydration race — it's a final incomplete result. Badge
+    // surfaces `0 triples` honestly with a "Some layers
+    // unavailable" tooltip; doesn't render `…` (which is
+    // reserved for the in-flight hydration window).
+    fetchSubGraphsMock.mockResolvedValueOnce({
+      // Daemon-reported (inflated, raw COUNT(*)) count.
+      subGraphs: [{ name: 'alpha', entityCount: 1, tripleCount: 42, description: '' }],
+    });
+    const entityList = [
+      { uri: 'urn:e:alpha', label: 'a', types: [], trustLevel: 'working', layers: new Set(['working']), subGraphs: new Set(['alpha']), properties: new Map(), connections: [] },
+    ];
+    await renderWith({
+      ...memory,
+      entities: new Map(entityList.map(e => [e.uri, e])),
+      entityList,
+      // Settled but incomplete: one layer errored.
+      allTriples: [],
+      counts: { wm: 1, swm: 0, vm: 0, total: 1 },
+      loading: false,
+      partial: true,
+      layerStatus: { wm: 'error', swm: 'ok', vm: 'ok' },
+    });
+    await flush();
+
+    const cards = container.querySelectorAll('.v10-sgov-card');
+    const alphaCardEl = cards[0];
+    const cardStats = alphaCardEl.querySelector('.v10-sgov-card-stats');
+    const stats = cardStats?.textContent ?? '';
+    // Combined contract: no daemon read (no 42), no `…` (this is
+    // settled failure, not in-flight hydration); honest `0 triples`
+    // surfaces with the failure tooltip.
     expect(stats).toContain('0 triples');
+    expect(stats).not.toContain('…');
+    expect(stats).not.toContain('42 triples');
+    // Tooltip surfaces the failure caveat on the triples stat.
+    const triplesStat = cardStats?.querySelectorAll('.v10-sgov-card-stat')[1];
+    expect(triplesStat?.getAttribute('title')).toBe('0 triples (some layers unavailable; count may be incomplete).');
+  });
+
+  it('Named card bucket applies canonical residue filter per scope (GH #819 round 4 — Codex sweep 2 🔴 #5)', async () => {
+    // PR #847 round 4 (🔴 #5) — round 3 per-bucket dedup correctly
+    // preserved cross-membership multiplicity but lacked the
+    // residue filter. A WM-residue resource-edge + its promoted
+    // SWM/VM copy in the same subgraph (different SPO keys) would
+    // double-count: both rows survived per-bucket SPO dedup, but
+    // the WM row is unambiguous residue (both endpoints moved).
+    // Round-4 fix: apply `applyCanonicalAdmission` per bucket so
+    // residue drops at the bucket level too.
+    fetchSubGraphsMock.mockResolvedValueOnce({
+      subGraphs: [{ name: 'alpha', entityCount: 2, tripleCount: 0, description: '' }],
+    });
+    const entityList = [
+      // Both entities promoted past WM (canonical 'shared').
+      { uri: 'urn:e:promoted-a', label: 'a', types: [], trustLevel: 'shared', layers: new Set(['working', 'shared']), subGraphs: new Set(['alpha']), properties: new Map(), connections: [] },
+      { uri: 'urn:e:promoted-b', label: 'b', types: [], trustLevel: 'shared', layers: new Set(['working', 'shared']), subGraphs: new Set(['alpha']), properties: new Map(), connections: [] },
+    ];
+    const triples = [
+      // WM residue resource-edge — both endpoints SWM canonical,
+      // row stored at WM → unambiguous residue → MUST DROP from
+      // the bucket per canonical admission.
+      { subject: 'urn:e:promoted-a', predicate: 'http://schema.org/knows', object: 'urn:e:promoted-b', subGraph: 'alpha', layer: 'working' },
+      // The honest SWM copy — admits.
+      { subject: 'urn:e:promoted-a', predicate: 'http://schema.org/knows', object: 'urn:e:promoted-b', subGraph: 'alpha', layer: 'shared' },
+    ];
+    await renderWith({
+      ...memory,
+      entities: new Map(entityList.map(e => [e.uri, e])),
+      entityList,
+      allTriples: triples,
+      counts: { wm: 0, swm: 2, vm: 0, total: 2 },
+    });
+    await flush();
+
+    const cards = container.querySelectorAll('.v10-sgov-card');
+    const alphaCardEl = cards[0];
+    const stats = alphaCardEl.querySelector('.v10-sgov-card-stats')?.textContent ?? '';
+    // 1 admitted SPO post-residue + canonical-dedup. Pre-fix the
+    // bucket counted both rows (SPO keys collapsed them, BUT the
+    // residue row would have admitted distinct copies if the
+    // objects differed). Lock the residue-drop invariant.
+    expect(stats).toContain('1 triples');
+    expect(stats).not.toContain('2 triples');
+  });
+
+  it('Named card tripleCount never reads daemon sg.tripleCount, even on partial-hydrated bucket (GH #819 round 5 — Codex sweep 3 🔴 #8)', async () => {
+    // PR #847 round 5 (🔴 #8) — earlier rounds tried to fall
+    // back to the daemon-reported `sg.tripleCount` when the
+    // canonical universe was incomplete. Codex sweep 3 flagged
+    // that the daemon route (`/api/sub-graph/list` in
+    // `packages/cli/src/daemon/routes/context-graph.ts:769-794`)
+    // builds that field via raw `COUNT(*)` grouped by named
+    // graph then summed per first-path-segment — NO SPO-dedup,
+    // NO residue filter. So `sg.tripleCount` is INFLATED by the
+    // same dupes + residue this PR removes. Round 3's `?? sg.tripleCount`
+    // and round 4's `Math.max(...)` both clamped UPWARD to an
+    // inflated value, not a lower-bound.
+    //
+    // Round-5 fix: drop the daemon read entirely. Card stat
+    // is always `tripleCountBySubGraph.get(sg.name) ?? 0` —
+    // honest client-canonical count, even when partial.
+    fetchSubGraphsMock.mockResolvedValueOnce({
+      // Daemon reports an INFLATED count (10) — raw COUNT(*) over
+      // alpha's named graphs picks up cross-graph dupes / residue.
+      subGraphs: [{ name: 'alpha', entityCount: 1, tripleCount: 10, description: '' }],
+    });
+    const entityList = [
+      { uri: 'urn:e:alpha', label: 'a', types: [], trustLevel: 'working', layers: new Set(['working']), subGraphs: new Set(['alpha']), properties: new Map(), connections: [] },
+    ];
+    // 3 partially-hydrated rows in alpha's bucket — canonical
+    // universe is partial (SWM errored), so the bucket only
+    // sees the 3 WM rows that admitted.
+    const triples = [
+      { subject: 'urn:e:alpha', predicate: 'http://schema.org/name', object: '"a-name-1"', subGraph: 'alpha', layer: 'working' },
+      { subject: 'urn:e:alpha', predicate: 'http://schema.org/name', object: '"a-name-2"', subGraph: 'alpha', layer: 'working' },
+      { subject: 'urn:e:alpha', predicate: 'http://schema.org/name', object: '"a-name-3"', subGraph: 'alpha', layer: 'working' },
+    ];
+    await renderWith({
+      ...memory,
+      entities: new Map(entityList.map(e => [e.uri, e])),
+      entityList,
+      allTriples: triples,
+      counts: { wm: 1, swm: 0, vm: 0, total: 1 },
+      loading: false,
+      partial: true,
+      // SWM errored — canonical universe is incomplete. Round-4
+      // would have Math.max-clamped to the daemon's 10; round-5
+      // renders the honest client-canonical 3.
+      layerStatus: { wm: 'ok', swm: 'error', vm: 'ok' },
+    });
+    await flush();
+
+    const cards = container.querySelectorAll('.v10-sgov-card');
+    const alphaCardEl = cards[0];
+    const stats = alphaCardEl.querySelector('.v10-sgov-card-stats')?.textContent ?? '';
+    // Round-5 contract: card never reads daemon `sg.tripleCount`.
+    // Partial canonical bucket of 3 surfaces honestly; daemon's
+    // inflated 10 is ignored.
+    expect(stats).toContain('3 triples');
+    expect(stats).not.toContain('10 triples');
+  });
+
+  it('Named card badge renders hydration affordance while canonical is incomplete and bucket is empty (GH #819 round 6 — Codex sweep 4 🔴 #11)', async () => {
+    // PR #847 round 6 (🔴 #11) — round 5 dropped the daemon
+    // fallback entirely, which was correct on the daemon-trust
+    // axis but stripped the gate that distinguished "still
+    // hydrating" from "genuine 0". `useMemoryEntities` initializes
+    // `allTriples = []` (`useMemoryEntities.ts:590`), so between
+    // `/sub-graph/list` resolve (which fills `subGraphs`) and
+    // WM/SWM/VM finishing (which fills `allTriples`), every
+    // non-empty subgraph derived `tripleCount = 0` and the badge
+    // flashed `0 triples`. Round-6 fix: revive the
+    // `canonicalIncomplete` discriminator; when it's true AND
+    // the bucket is empty, the badge renders `…` instead of `0`.
+    fetchSubGraphsMock.mockResolvedValueOnce({
+      subGraphs: [{ name: 'alpha', entityCount: 5, tripleCount: 0, description: '' }],
+    });
+    await renderWith({
+      ...memory,
+      // Mid-hydration: `/sub-graph/list` resolved but layer queries
+      // haven't finished, so `allTriples` is still its initial [].
+      entities: new Map(),
+      entityList: [],
+      allTriples: [],
+      counts: { wm: 0, swm: 0, vm: 0, total: 0 },
+      loading: true,
+    });
+    await flush();
+
+    const cards = container.querySelectorAll('.v10-sgov-card');
+    const alphaCardEl = cards[0];
+    const stats = alphaCardEl.querySelector('.v10-sgov-card-stats')?.textContent ?? '';
+    // Pre-round-6 this read `0 triples` mid-hydration. Post-fix
+    // the badge renders the affordance.
+    expect(stats).toContain('…');
+    expect(stats).not.toContain('0 triples');
+  });
+
+  it('Named card badge renders genuine 0 once canonical is fully hydrated (GH #819 round 6 — no regression on honest empty)', async () => {
+    // Round-6 regression guard — once canonical is hydrated
+    // (`loading=false`, no `partial`, all layers 'ok'), a
+    // genuinely empty subgraph must still surface `0 triples`
+    // honestly. The hydration affordance fires ONLY when the
+    // canonical universe can't be trusted; the hydrated-fully
+    // branch is unchanged from round 5.
+    fetchSubGraphsMock.mockResolvedValueOnce({
+      subGraphs: [{ name: 'empty', entityCount: 0, tripleCount: 0, description: '' }],
+    });
+    await renderWith({
+      ...memory,
+      // Fully hydrated, genuinely empty subgraph (no triples in any
+      // layer for this subgraph).
+      entities: new Map(),
+      entityList: [],
+      allTriples: [],
+      counts: { wm: 0, swm: 0, vm: 0, total: 0 },
+      loading: false,
+      partial: false,
+      layerStatus: { wm: 'ok', swm: 'ok', vm: 'ok' },
+    });
+    await flush();
+
+    const cards = container.querySelectorAll('.v10-sgov-card');
+    const emptyCardEl = cards[0];
+    const stats = emptyCardEl.querySelector('.v10-sgov-card-stats')?.textContent ?? '';
+    // Genuine 0 surfaces — no affordance, no daemon read.
+    expect(stats).toContain('0 triples');
+    expect(stats).not.toContain('…');
+  });
+
+  it('Root card badge renders hydration affordance while canonical is incomplete (GH #819 round 6 — Root parity)', async () => {
+    // Round-6 parity guard — the Root card has the same race:
+    // it derives `tripleCount = rootTriples.length` from
+    // `memory.allTriples`, which starts at []. Same gate +
+    // affordance applies, threaded via the same
+    // `canonicalIncomplete` prop on the SubGraphMiniCard.
+    fetchSubGraphsMock.mockResolvedValueOnce({
+      subGraphs: [{ name: 'alpha', entityCount: 0, tripleCount: 0, description: '' }],
+    });
+    await renderWith({
+      ...memory,
+      entities: new Map(),
+      entityList: [],
+      allTriples: [],
+      counts: { wm: 0, swm: 0, vm: 0, total: 0 },
+      loading: true,
+    });
+    await flush();
+
+    const cards = container.querySelectorAll('.v10-sgov-card');
+    // Root card is last in the grid (rank 999).
+    const rootCardEl = cards[cards.length - 1];
+    expect(rootCardEl.classList.contains('root')).toBe(true);
+    const stats = rootCardEl.querySelector('.v10-sgov-card-stats')?.textContent ?? '';
+    expect(stats).toContain('…');
+    expect(stats).not.toContain('0 triples');
+  });
+
+  it('Named card badge surfaces honest 0 with failure tooltip on memory.error (GH #819 round 7 — Codex sweep 5 🔴 #14)', async () => {
+    // Round 6 collapsed loading + error into one
+    // `canonicalIncomplete` gate; round 7 splits them. A settled
+    // `memory.error` (not loading) must NOT render the `…`
+    // affordance — that would masquerade a settled failure as
+    // in-progress hydration. Instead, render honest `0 triples`
+    // with a "Some layers unavailable" tooltip.
+    fetchSubGraphsMock.mockResolvedValueOnce({
+      subGraphs: [{ name: 'alpha', entityCount: 1, tripleCount: 0, description: '' }],
+    });
+    const entityList = [
+      { uri: 'urn:e:alpha', label: 'a', types: [], trustLevel: 'working', layers: new Set(['working']), subGraphs: new Set(['alpha']), properties: new Map(), connections: [] },
+    ];
+    await renderWith({
+      ...memory,
+      entities: new Map(entityList.map(e => [e.uri, e])),
+      entityList,
+      allTriples: [],
+      counts: { wm: 1, swm: 0, vm: 0, total: 1 },
+      // Settled error state — NOT loading.
+      loading: false,
+      error: new Error('SPARQL endpoint unavailable'),
+      layerStatus: { wm: 'ok', swm: 'ok', vm: 'ok' },
+    });
+    await flush();
+
+    const cards = container.querySelectorAll('.v10-sgov-card');
+    const alphaCardEl = cards[0];
+    const cardStats = alphaCardEl.querySelector('.v10-sgov-card-stats');
+    const stats = cardStats?.textContent ?? '';
+    // Failed/partial branch: 0 triples surfaces honestly with the
+    // failure-state tooltip, NOT the `…` affordance.
+    expect(stats).toContain('0 triples');
+    expect(stats).not.toContain('…');
+    const triplesStat = cardStats?.querySelectorAll('.v10-sgov-card-stat')[1];
+    expect(triplesStat?.getAttribute('title')).toBe('0 triples (some layers unavailable; count may be incomplete).');
+  });
+
+  it('Named card badge surfaces honest 0 with failure tooltip on memory.partial (GH #819 round 7 — Codex sweep 5 🔴 #14)', async () => {
+    // Same round-7 contract as the `error` test above, but
+    // exercising the `partial` branch instead — settled-incomplete
+    // result (some layers succeeded, some errored). Still renders
+    // honest `0 triples` with the failure tooltip; not `…`.
+    fetchSubGraphsMock.mockResolvedValueOnce({
+      subGraphs: [{ name: 'alpha', entityCount: 1, tripleCount: 0, description: '' }],
+    });
+    const entityList = [
+      { uri: 'urn:e:alpha', label: 'a', types: [], trustLevel: 'working', layers: new Set(['working']), subGraphs: new Set(['alpha']), properties: new Map(), connections: [] },
+    ];
+    await renderWith({
+      ...memory,
+      entities: new Map(entityList.map(e => [e.uri, e])),
+      entityList,
+      allTriples: [],
+      counts: { wm: 1, swm: 0, vm: 0, total: 1 },
+      loading: false,
+      partial: true,
+      // Round 7: SWM errored is a settled failure, not in-flight
+      // hydration (no layerStatus === 'loading').
+      layerStatus: { wm: 'ok', swm: 'error', vm: 'ok' },
+    });
+    await flush();
+
+    const cards = container.querySelectorAll('.v10-sgov-card');
+    const alphaCardEl = cards[0];
+    const cardStats = alphaCardEl.querySelector('.v10-sgov-card-stats');
+    const stats = cardStats?.textContent ?? '';
+    expect(stats).toContain('0 triples');
+    expect(stats).not.toContain('…');
+    const triplesStat = cardStats?.querySelectorAll('.v10-sgov-card-stat')[1];
+    expect(triplesStat?.getAttribute('title')).toBe('0 triples (some layers unavailable; count may be incomplete).');
+  });
+
+  it('Named card badge surfaces failure tooltip on non-zero bucket too (GH #819 round 10 — Codex sweep 8 🟡 #18)', async () => {
+    // Rounds 6/7 routed the failure tooltip only when the bucket
+    // was 0; a partial-layer-failure with a non-zero bucket
+    // (some layers succeeded with rows, others errored) rendered
+    // the count with no disclosure that it might be incomplete.
+    // Round 10 extends the failure-tooltip branch to ALL bucket
+    // values; the count is prefixed onto the disclosure wording.
+    fetchSubGraphsMock.mockResolvedValueOnce({
+      subGraphs: [{ name: 'alpha', entityCount: 1, tripleCount: 0, description: '' }],
+    });
+    const entityList = [
+      { uri: 'urn:e:alpha', label: 'a', types: [], trustLevel: 'working', layers: new Set(['working']), subGraphs: new Set(['alpha']), properties: new Map(), connections: [] },
+    ];
+    // 2 WM rows admit; SWM errored so the SWM contribution is
+    // missing — the rendered count is a best-effort lower bound.
+    const triples = [
+      { subject: 'urn:e:alpha', predicate: 'http://schema.org/name', object: '"alpha-1"', subGraph: 'alpha', layer: 'working' },
+      { subject: 'urn:e:alpha', predicate: 'http://schema.org/name', object: '"alpha-2"', subGraph: 'alpha', layer: 'working' },
+    ];
+    await renderWith({
+      ...memory,
+      entities: new Map(entityList.map(e => [e.uri, e])),
+      entityList,
+      allTriples: triples,
+      counts: { wm: 2, swm: 0, vm: 0, total: 1 },
+      loading: false,
+      partial: true,
+      layerStatus: { wm: 'ok', swm: 'error', vm: 'ok' },
+    });
+    await flush();
+
+    const cards = container.querySelectorAll('.v10-sgov-card');
+    const alphaCardEl = cards[0];
+    const cardStats = alphaCardEl.querySelector('.v10-sgov-card-stats');
+    const stats = cardStats?.textContent ?? '';
+    // Bucket renders the count honestly (no `…`).
+    expect(stats).toContain('2 triples');
+    expect(stats).not.toContain('…');
+    // Round-10 contract: failure tooltip fires for non-zero
+    // buckets too, with the count value prefixed.
+    const triplesStat = cardStats?.querySelectorAll('.v10-sgov-card-stat')[1];
+    expect(triplesStat?.getAttribute('title')).toBe('2 triples (some layers unavailable; count may be incomplete).');
+  });
+
+  it('Named card failure tooltip wins over stat-vs-rendered tooltip when both apply (GH #819 round 10 — precedence)', async () => {
+    // Round-10 precedence lock — when a card is both
+    // failed/partial AND has a stat-vs-rendered mismatch
+    // (cross-card edges or cap-trimmed rows), the failure
+    // tooltip wins. The cap-truncation gap recomputes correctly
+    // once layers re-hydrate; the failure signal is the louder
+    // disclosure.
+    fetchSubGraphsMock.mockResolvedValueOnce({
+      subGraphs: [{ name: 'alpha', entityCount: 1, tripleCount: 0, description: '' }],
+    });
+    const entityList = [
+      { uri: 'urn:e:alpha', label: 'a', types: [], trustLevel: 'working', layers: new Set(['working']), subGraphs: new Set(['alpha']), properties: new Map(), connections: [] },
+      // beta sits outside alpha's subgraph; the alpha→beta edge
+      // below has `card.tripleCount = 1` (in alpha's canonical
+      // scope) but `card.triples.length = 0` (dropped from the
+      // rendered slice by `filterTriplesToEntities` because beta
+      // isn't in alpha's entityUris). That difference normally
+      // triggers the β stat-vs-rendered tooltip; under round-10
+      // precedence the failure tooltip wins instead.
+      { uri: 'urn:e:beta', label: 'b', types: [], trustLevel: 'working', layers: new Set(['working']), subGraphs: new Set<string>(), properties: new Map(), connections: [] },
+    ];
+    const triples = [
+      { subject: 'urn:e:alpha', predicate: 'p', object: 'urn:e:beta', subGraph: 'alpha', layer: 'working' },
+    ];
+    await renderWith({
+      ...memory,
+      entities: new Map(entityList.map(e => [e.uri, e])),
+      entityList,
+      allTriples: triples,
+      counts: { wm: 2, swm: 0, vm: 0, total: 2 },
+      loading: false,
+      partial: true,
+      layerStatus: { wm: 'ok', swm: 'error', vm: 'ok' },
+    });
+    await flush();
+
+    const cards = container.querySelectorAll('.v10-sgov-card');
+    const alphaCardEl = cards[0];
+    const cardStats = alphaCardEl.querySelector('.v10-sgov-card-stats');
+    const triplesStat = cardStats?.querySelectorAll('.v10-sgov-card-stat')[1];
+    // Failure tooltip wins even when the β literal would also
+    // have qualified. β substrings ("in this subgraph's scope",
+    // "cap-trimmed") must NOT appear; failure tooltip is the
+    // only disclosure.
+    const title = triplesStat?.getAttribute('title') ?? '';
+    expect(title).toBe('1 triples (some layers unavailable; count may be incomplete).');
+    expect(title).not.toContain("in this subgraph's scope");
+    expect(title).not.toContain('cap-trimmed');
+  });
+
+  it('Named card recovers promoted-untagged triples via entity-scope membership (GH #819 round 11 — Codex sweep 9 🔴 #19)', async () => {
+    // After promote/publish, the daemon strips `subGraph` from
+    // triples. Pre-round-11 the bucketer filtered to tagged rows
+    // only, so a fully-promoted subgraph's mini-card regressed
+    // to `0 triples` even though the rest of the UI listed the
+    // data. The bucketer now mirrors `admitTripleForScope` —
+    // untagged rows admit to a bucket whose `entityUrisBySubGraph`
+    // contains the subject or resource-object.
+    fetchSubGraphsMock.mockResolvedValueOnce({
+      subGraphs: [{ name: 'alpha', entityCount: 1, tripleCount: 0, description: '' }],
+    });
+    const entityList = [
+      // alpha-membership entity, promoted past WM.
+      { uri: 'urn:e:alpha', label: 'a', types: [], trustLevel: 'shared', layers: new Set(['shared']), subGraphs: new Set(['alpha']), properties: new Map(), connections: [] },
+    ];
+    const triples = [
+      // Untagged literal-name row — the daemon stripped the
+      // `subGraph` tag on promote. Pre-round-11 this dropped
+      // from alpha's bucket entirely; post-fix `admitTripleForScope`
+      // recovers it (subject URI is in alpha's scoped set).
+      { subject: 'urn:e:alpha', predicate: 'http://schema.org/name', object: '"alpha-promoted"', layer: 'shared' },
+    ];
+    await renderWith({
+      ...memory,
+      entities: new Map(entityList.map(e => [e.uri, e])),
+      entityList,
+      allTriples: triples,
+      counts: { wm: 0, swm: 1, vm: 0, total: 1 },
+    });
+    await flush();
+
+    const cards = container.querySelectorAll('.v10-sgov-card');
+    const alphaCardEl = cards[0];
+    const stats = alphaCardEl.querySelector('.v10-sgov-card-stats')?.textContent ?? '';
+    // Card reports the recovered count (1), not the pre-fix 0.
+    expect(stats).toContain('1 triples');
+    expect(stats).not.toContain('0 triples');
+  });
+
+  it('Untagged row between two cross-membership entities admits in BOTH buckets (GH #819 round 11 — cross-membership preservation)', async () => {
+    // Round 3 #1 contract: a cross-membership entity (member of
+    // alpha AND beta) appearing in two subgraphs' buckets is
+    // expected behavior. Round-11 untagged-recovery must preserve
+    // that: when an untagged row's subject is a cross-membership
+    // entity, it admits to EVERY matching bucket (no inner-loop
+    // break in the recovery pass).
+    fetchSubGraphsMock.mockResolvedValueOnce({
+      subGraphs: [
+        { name: 'alpha', entityCount: 1, tripleCount: 0, description: '' },
+        { name: 'beta', entityCount: 1, tripleCount: 0, description: '' },
+      ],
+    });
+    const entityList = [
+      // Single entity that's a member of BOTH alpha and beta.
+      { uri: 'urn:e:cross', label: 'c', types: [], trustLevel: 'shared', layers: new Set(['shared']), subGraphs: new Set(['alpha', 'beta']), properties: new Map(), connections: [] },
+    ];
+    const triples = [
+      // Untagged row — `subGraph` stripped on promote. Subject is
+      // in BOTH alpha's and beta's scoped URI sets.
+      { subject: 'urn:e:cross', predicate: 'http://schema.org/name', object: '"cross-promoted"', layer: 'shared' },
+    ];
+    await renderWith({
+      ...memory,
+      entities: new Map(entityList.map(e => [e.uri, e])),
+      entityList,
+      allTriples: triples,
+      counts: { wm: 0, swm: 1, vm: 0, total: 1 },
+    });
+    await flush();
+
+    const cards = container.querySelectorAll('.v10-sgov-card');
+    // Two named cards (alpha + beta) + Root card.
+    expect(cards.length).toBe(3);
+    // Both named cards report the recovered count.
+    const alphaStats = cards[0].querySelector('.v10-sgov-card-stats')?.textContent ?? '';
+    const betaStats = cards[1].querySelector('.v10-sgov-card-stats')?.textContent ?? '';
+    expect(alphaStats).toContain('1 triples');
+    expect(betaStats).toContain('1 triples');
+  });
+
+  it('Root card keeps its scoped copy when same SPO also appears under a named subgraph (GH #819 round 4 — Codex sweep 2 🔴 #7)', async () => {
+    // PR #847 round 4 (🔴 #7) — Root card sourced from
+    // `canonicalTriples.filter(!t.subGraph)`. Global SPO dedup
+    // made this order-dependent: if a tagged copy of the same
+    // SPO arrived first, the root untagged copy lost the dedup
+    // race; `filter(!t.subGraph)` then dropped the surviving
+    // tagged entry; Root rendered 0.
+    //
+    // Round-4 fix: build Root candidates from raw root-scoped
+    // rows (`!t.subGraph`), then `applyCanonicalAdmission` with
+    // per-call dedup state. Each scope keeps its own copy.
+    fetchSubGraphsMock.mockResolvedValueOnce({
+      subGraphs: [{ name: 'alpha', entityCount: 0, tripleCount: 0, description: '' }],
+    });
+    const entityList = [
+      // Root entity (no subGraph membership).
+      { uri: 'urn:e:r', label: 'r', types: [], trustLevel: 'shared', layers: new Set(['shared']), subGraphs: new Set<string>(), properties: new Map(), connections: [] },
+    ];
+    const triples = [
+      // Same SPO shipped under named subgraph alpha — arrives
+      // first in iteration order so it wins the global SPO dedup
+      // pre-fix.
+      { subject: 'urn:e:r', predicate: 'http://schema.org/name', object: '"R"', subGraph: 'alpha', layer: 'shared' },
+      // Untagged root copy — pre-fix this lost the global SPO
+      // dedup; `filter(!t.subGraph)` then dropped the tagged
+      // survivor; Root rendered 0.
+      { subject: 'urn:e:r', predicate: 'http://schema.org/name', object: '"R"', layer: 'shared' },
+    ];
+    await renderWith({
+      ...memory,
+      entities: new Map(entityList.map(e => [e.uri, e])),
+      entityList,
+      allTriples: triples,
+      counts: { wm: 0, swm: 1, vm: 0, total: 1 },
+    });
+    await flush();
+
+    const cards = container.querySelectorAll('.v10-sgov-card');
+    // Root card is last in the grid (rank 999).
+    const rootCardEl = cards[cards.length - 1];
+    expect(rootCardEl.classList.contains('root')).toBe(true);
+    const stats = rootCardEl.querySelector('.v10-sgov-card-stats')?.textContent ?? '';
+    // Root keeps its scoped SPO copy — pre-fix this was 0
+    // (order-dependent dedup race lost).
+    expect(stats).toContain('1 triples');
+    expect(stats).not.toContain('0 triples');
   });
 
   it('Root card cap honors MAX_PER_CARD even with a single dominant subject (Codex sweep 2)', async () => {

@@ -249,9 +249,11 @@ The same floor applies to `update` and `extendKnowledgeAssetLifetime` — they e
 A governance-set bps cut (default **300 bps = 3 %**, capped at **1000 bps = 10 %**) is skimmed from the staker-bound TRAC on every paid publish, update, and lifetime-extension and routed to a treasury address.
 
 - **The publisher pays the same gross price.** The fee comes out of what would otherwise flow into the staker reward pool.
-- **Dormant by default**: `treasury == address(0)` ⇒ `fee == 0`, so a fresh deploy is unchanged until governance opts in. (`ProtocolTreasurySet` is emitted when it flips.)
+- **Dormant by default**: `treasury == address(0)` ⇒ `fee == 0`, so a fresh deploy is unchanged until governance opts in. (`ProtocolTreasurySet` is emitted when the treasury address changes.)
 - New `ParametersStorage` fields: `protocolTreasuryFee` (bps), `protocolTreasury` (address), `MAX_PROTOCOL_TREASURY_FEE` (1000 bps cap).
-- New `ParametersStorage.ProtocolTreasurySet(uint256 fee, address treasury)` event.
+- Event surface:
+  - `setProtocolTreasury(address)` emits `ParametersStorage.ProtocolTreasurySet(address indexed treasury)`.
+  - `setProtocolTreasuryFee(uint16)` still emits `ParameterChanged("protocolTreasuryFee", fee)`.
 
 If you display "estimated staker rewards" in your UI, you'll want to net out the treasury fee from the displayed reward yield once governance enables it. The fee is `0` until then.
 
@@ -328,22 +330,27 @@ Configure via `~/.dkg/config.json`:
 
 ```json
 {
-  "storage": {
+  "store": {
     "backend": "sparql-http",
-    "endpoint": "http://localhost:9999/blazegraph/namespace/kb/sparql"
+    "options": {
+      "queryEndpoint": "http://localhost:9999/blazegraph/namespace/kb/sparql",
+      "updateEndpoint": "http://localhost:9999/blazegraph/namespace/kb/sparql"
+    }
   }
 }
 ```
 
-Or use the new interactive `dkg storage` wizard (`dkg storage` on the CLI). See `docs/setup/STORAGE_SPARQL_HTTP.md` for the operator runbook.
+For a fresh config, `dkg init --store sparql-http --store-url <SPARQL_URL>` pre-fills and validates the same `store` block. Setup flows that expose `--store` / `--store-url` persist the same shape after their normal setup completes. See `docs/setup/STORAGE_SPARQL_HTTP.md` for the manual operator runbook.
+
+If you choose the Blazegraph-specific backend instead of generic `sparql-http`, the config shape is `store.backend = "blazegraph"` with `store.options.url = "<SPARQL_URL>"`.
 
 ### 8.2 `dkg doctor`
 
-A new operator command that diagnoses common install/upgrade issues. Run `dkg doctor` after upgrading to confirm the install is healthy. Six structured checks + a state-summary. Output is JSON-parseable.
+A new operator command that diagnoses common install/upgrade issues. Run `dkg doctor` after upgrading to confirm the install is healthy. The default output is human-readable; use `dkg doctor --json` when upgrade automation needs the structured six-check report + state summary.
 
-### 8.3 `dkg migrate-to-npm` (carried from rc.11, now production-ready)
+### 8.3 Legacy install migration to npm
 
-One-shot conversion from a git-checkout install (`~/dkg-v9/`) to the npm-pinned auto-update path. Dry-run by default; `--apply` to mutate. Recommended for any operator still on a git-clone install path.
+`dkg migrate-to-npm` is no longer a CLI command in rc.12. Edge nodes with a legacy `~/.dkg/releases/` tree migrate automatically on first `dkg start` and keep `~/.dkg/previous-version` populated for rollback continuity. Core operators still running from a git checkout should follow the manual path in `docs/archive/MIGRATE_TO_NPM.md`; use `dkg doctor --json` before and after the upgrade to verify the active install layout.
 
 ### 8.4 `/api/build-info` + `/api/status` `relay` block
 

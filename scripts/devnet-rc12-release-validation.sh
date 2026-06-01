@@ -63,6 +63,21 @@ API_PORT_BASE="${API_PORT_BASE:-9201}"
 NUM_NODES="${NUM_NODES:-6}"
 NUM_CORE_NODES="${NUM_CORE_NODES:-4}"
 
+# Topology guard. The harness depends on the canonical "≥3 core + ≥2 edge"
+# matrix throughout: Section H seeds two curated CGs from EDGE_A and EDGE_B
+# (= NUM_CORE_NODES+1 and +2), Section D/E round-trip an ERC-721 from
+# node1's op wallet to the first edge node's op wallet, and the conviction
+# discount/transfer checks assume at least one core node (node1) holds
+# positions. Fail fast here with a meaningful message rather than letting
+# a downstream Section choke with array-index errors that obscure the
+# real cause (caller picked an unsupported topology).
+if [ "$NUM_CORE_NODES" -lt 1 ] || [ "$NUM_NODES" -lt "$((NUM_CORE_NODES + 2))" ]; then
+  echo "FATAL: unsupported topology NUM_NODES=$NUM_NODES NUM_CORE_NODES=$NUM_CORE_NODES" >&2
+  echo "       harness requires NUM_CORE_NODES >= 1 and NUM_NODES >= NUM_CORE_NODES + 2 (>=2 edge nodes)." >&2
+  echo "       supported reference profiles: 6/4 (default) or 5/3 (memory-constrained safe profile)." >&2
+  exit 2
+fi
+
 TARGET_KAS="${TARGET_KAS:-500}"
 TARGET_CGS="${TARGET_CGS:-12}"
 MIN_ENTITIES="${MIN_ENTITIES:-50}"
@@ -385,13 +400,40 @@ else
         log "  node$n: failed to parse wallet addresses/keys — skipping"
         prov_fail=$((prov_fail+1)); continue
       fi
-      # Idempotency: if agentToAccountId is already non-zero this node was
-      # already provisioned (possibly by an earlier harness run that wasn't
-      # followed by a bootstrap-wipe). Skip cleanly.
+      # Idempotency — two-stage, because the provisioning flow is NOT
+      # atomic: a previous run can leave the operator holding a freshly
+      # minted PCA NFT even if `registerAgent` then failed (network
+      # blip, paymaster reject, deploy script crash). Re-minting via
+      # createAccount in that state would spend another PCN_COMMIT TRAC
+      # and leave a second NFT in the operator's wallet, which then
+      # shifts `tokenOfOwnerByIndex(..., 0)` and breaks the Section E
+      # transfer round-trip.
+      #
+      # Stage 1: agent already mapped → fully provisioned, skip.
       existing=$($CHAIN_CALL DKGPublishingConvictionNFT agentToAccountId --json "[\"$nPubAddr\"]" 2>/dev/null | pyf "d.get('result','0')")
       if [ "${existing:-0}" != "0" ]; then
         log "  node$n: publisher ${nPubAddr:0:10}... already registered (accountId=$existing) — skipping"
         prov_skip=$((prov_skip+1)); continue
+      fi
+      # Stage 2: operator already owns a PCA NFT but the agent mapping
+      # is missing → recover by calling registerAgent on the existing
+      # accountId instead of re-minting. tokenOfOwnerByIndex(.., 0) is
+      # the oldest token; using index 0 keeps the Section E transfer
+      # round-trip targeting the same token across reruns.
+      preBal=$($CHAIN_CALL DKGPublishingConvictionNFT balanceOf --json "[\"$nOpAddr\"]" 2>/dev/null | pyf "d.get('result','0')")
+      if [ "${preBal:-0}" -ge 1 ] 2>/dev/null; then
+        recoverAccId=$($CHAIN_CALL DKGPublishingConvictionNFT tokenOfOwnerByIndex --json "[\"$nOpAddr\",\"0\"]" 2>/dev/null | pyf "d.get('result','')")
+        if [ -n "$recoverAccId" ] && [ "$recoverAccId" != "0" ]; then
+          log "  node$n: operator ${nOpAddr:0:10}... already holds PCA NFT accountId=$recoverAccId (createAccount succeeded on a prior run, registerAgent did not) — recovering"
+          regR=$($CHAIN_CALL DKGPublishingConvictionNFT registerAgent --key "$nOpKey" --json "[\"$recoverAccId\",\"$nPubAddr\"]" 2>/dev/null)
+          if echo "$regR" | grep -q '"ok":true'; then
+            log "  node$n: recovered accountId=$recoverAccId, agent ${nPubAddr:0:10}... registered"
+            prov_ok=$((prov_ok+1)); continue
+          else
+            log "  node$n: recovery registerAgent failed: ${regR:0:160}"
+            prov_fail=$((prov_fail+1)); continue
+          fi
+        fi
       fi
       log "  node$n: provisioning publishing-conviction (publisher=${nPubAddr:0:10}..., op=${nOpAddr:0:10}..., commit=${PCN_COMMIT} wei)"
       # 1) Mint TRAC to operator.
@@ -1035,10 +1077,17 @@ if [ -n "$N1_OP" ] && [ -n "$N1_OPADDR" ] && [ -n "$methods" ] && echo "$methods
     if [ "$claim_ok" -gt 0 ]; then
       pass D reward-claim-exec "claim(tokenId) landed on $claim_ok/$claim_try position(s) of node1 op"
     elif [ "$claim_try" -gt 0 ]; then
-      # All reverts → typical on fresh devnet (no accrued rewards because no
-      # epoch boundary has been crossed since stake). Informational, not a
-      # regression.
-      pass D reward-claim-exec "claim(tokenId) surface exercised: all $claim_try attempt(s) reverted, typical on fresh devnet with no accrued rewards yet: ${claim_errs:0:160}"
+      # `claim(uint256)` in DKGStakingConvictionNFT delegates to
+      # StakingV10._claim, which RETURNS silently (no revert) when there
+      # is nothing claimable — both the `currentEpoch <= 1` and
+      # `claimFromEpoch > claimToEpoch` branches early-return. Any revert
+      # therefore implies one of NotPositionOwner / PositionNotFound /
+      # onlyConvictionNFT / gas-estimation failure — all genuine
+      # regression signals. PASS on all-reverts would mask exactly those.
+      # Surface the revert reasons so a reviewer can tell at a glance
+      # whether it's environmental noise (RPC, nonce) or a real product
+      # regression (ABI drift, ownership accounting bug, etc.).
+      warn D reward-claim-exec "claim(tokenId) reverted on all $claim_try attempt(s) — claim() should silent-return when no rewards exist, so any revert is suspect: ${claim_errs:0:240}"
     else
       warn D reward-claim-exec "no valid position tokenIds discovered for node1 op (balance=$cbal)"
     fi
@@ -1060,10 +1109,12 @@ fi
 #     revert with a custom error like "TransferRestrictedWhileLocked". If
 #     that's the design choice on rc.12, the test downgrades to WARN with the
 #     revert reason — that's product information, not a release-gate failure.
-#   - Recipient is node5's op wallet (an edge node — no existing positions,
-#     so the temporary ownership swap has zero accounting side-effect).
-N5_OP=$(node_op_key 5)
-N5_OPADDR=$(node_op_addr 5)
+#   - Recipient is the first edge node's op wallet (= $EDGE_A — no existing
+#     positions, so the temporary ownership swap has zero accounting
+#     side-effect). The N5_ prefix is preserved purely so the long-standing
+#     log lines stay greppable in the post-mortem corpus.
+N5_OP=$(node_op_key "$EDGE_A")
+N5_OPADDR=$(node_op_addr "$EDGE_A")
 if [ -n "$N1_OP" ] && [ -n "$N5_OPADDR" ] && [ -n "$N1_OPADDR" ]; then
   # Discover a tokenId owned by node1's op wallet. tokenOfOwnerByIndex throws
   # OOB if the wallet owns no positions; the chain-call helper returns
@@ -1576,10 +1627,27 @@ for n in $(seq 1 "$NUM_CORE_NODES"); do
   win_kcns=$(grep -c 'rs.tick.kc-not-synced' "$win" 2>/dev/null); win_kcns=${win_kcns:-0}
   win_dc=$(grep -c 'rs.tick.data-corrupted' "$win" 2>/dev/null); win_dc=${win_dc:-0}
   win_nocg=$(grep -c 'rs.tick.no-eligible-cg' "$win" 2>/dev/null); win_nocg=${win_nocg:-0}
-  # Terminal outcome ticks carry `periodStart`. Distinct values = distinct
-  # proof periods the prover was challenged on in this window.
-  win_periods=$(grep -E 'rs\.tick\.(submitted|already-solved|kc-not-synced|data-corrupted)' "$win" 2>/dev/null | grep -oE '"periodStart":"[0-9]+"' | sort -u | wc -l | tr -d ' ')
-  [ -z "$win_periods" ] && win_periods=0
+  win_stale=$(grep -c 'rs.tick.submit-stale' "$win" 2>/dev/null); win_stale=${win_stale:-0}
+  win_crm=$(grep -c 'rs.tick.chain-root-mismatch' "$win" 2>/dev/null); win_crm=${win_crm:-0}
+  # Terminal outcomes that DO carry `periodStart` (submitted, already-solved,
+  # kc-not-synced, data-corrupted) → dedupe by periodStart for an exact
+  # period count.
+  win_periods_ps=$(grep -E 'rs\.tick\.(submitted|already-solved|kc-not-synced|data-corrupted)' "$win" 2>/dev/null | grep -oE '"periodStart":"[0-9]+"' | sort -u | wc -l | tr -d ' ')
+  [ -z "$win_periods_ps" ] && win_periods_ps=0
+  # Terminal failures that do NOT log periodStart (submit-stale,
+  # chain-root-mismatch — see packages/random-sampling/src/prover.ts L666 and
+  # L685). Without periodStart we approximate distinct failed periods by
+  # the (kaId,cgId) pair carried on every emission: the prover handles one
+  # challenge per period, so multiple stale/mismatch retries within a
+  # single period collapse to one (kaId,cgId) and sort -u yields 1. This
+  # under-counts the rare case of the same (kaId,cgId) failing across two
+  # consecutive periods (counted as 1), and skips lines without the pair
+  # at all — both biases are dwarfed by the alternative of dropping these
+  # outcomes entirely, which leaves RS_PCT artificially high under exactly
+  # the failure modes this gate exists to catch.
+  win_periods_other=$(grep -E 'rs\.tick\.(submit-stale|chain-root-mismatch)' "$win" 2>/dev/null | grep -oE '"kaId":"[0-9]+","cgId":"[0-9]+"' | sort -u | wc -l | tr -d ' ')
+  [ -z "$win_periods_other" ] && win_periods_other=0
+  win_periods=$(( win_periods_ps + win_periods_other ))
   rm -f "$win"
 
   if [ "$win_periods" -gt 0 ]; then
@@ -1589,7 +1657,7 @@ for n in $(seq 1 "$NUM_CORE_NODES"); do
   fi
   [ "$pp" -gt 100 ] && pp=100
 
-  log "  core$n: submits=$win_sub periods=$win_periods per-period=${pp}% | already-solved=$win_solved kc-not-synced=$win_kcns data-corrupted=$win_dc no-eligible-cg=$win_nocg lastOutcome=$last_outcome (status sub=$sub_now ticks=$ticks_now)"
+  log "  core$n: submits=$win_sub periods=$win_periods per-period=${pp}% | already-solved=$win_solved kc-not-synced=$win_kcns data-corrupted=$win_dc no-eligible-cg=$win_nocg submit-stale=$win_stale chain-root-mismatch=$win_crm lastOutcome=$last_outcome (status sub=$sub_now ticks=$ticks_now)"
   if [ "$win_sub" -eq 0 ]; then
     STUCK_CORES="$STUCK_CORES core${n}(last:$last_outcome)"
   fi

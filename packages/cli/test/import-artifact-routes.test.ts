@@ -616,6 +616,92 @@ describe('import artifact daemon routes', () => {
     expect(resolved.body.artifact.ownerGuardRelaxed).toBeUndefined();
   });
 
+  // Issue #872 / Codex review finding 1: the public + open relaxation
+  // is opt-in via `relaxOnPublicOpenCg: true` and ONLY the two read
+  // routes set it. The semantic-enrichment WRITE route must continue
+  // to reject cross-agent writes regardless of the CG's on-chain
+  // policy — otherwise a non-owner peer on a public + open CG could
+  // mutate someone else's imported assertion graph.
+  it('rejects non-owner semantic enrichment writes on public + open CGs (#872 Codex finding 1)', async () => {
+    const entry = await fileStore.put(Buffer.from('# Public Imported\n'), 'text/markdown');
+    const contextGraphId = 'cg-public-open-write-rejected';
+    const assertionName = 'imported-md';
+    const assertionUri = contextGraphAssertionUri(contextGraphId, 'did:dkg:agent:source', assertionName);
+    const { agent, writes, queries } = makeAgent({
+      contextGraphId,
+      assertionName,
+      assertionUri,
+      fileHash: entry.keccak256,
+      markdownHash: entry.keccak256,
+      markdownForm: `urn:dkg:file:${entry.keccak256}`,
+      onChainPolicy: { accessPolicy: 0, publishPolicy: 1 },
+    });
+    await startRoutes({ agent });
+
+    const enriched = await post('/api/assertion/semantic-enrichment/write', {
+      contextGraphId,
+      assertionUri,
+      semanticQuads: [
+        { subject: 'urn:doc:imported', predicate: 'http://schema.org/about', object: '"Cross-agent topic"' },
+      ],
+    });
+
+    expect(enriched.status).toBe(403);
+    expect(enriched.body.error).toMatch(/owned by the requesting agent/);
+    expect(writes).toHaveLength(0);
+    // Sanity: short-circuit before any SPARQL — the strict guard
+    // fires the moment the URI is parsed, just like the legacy code
+    // path for curated CGs.
+    expect(queries).toHaveLength(0);
+  });
+
+  // Issue #872 / Codex review finding 2: legacy ownerless URIs
+  // (`.../assertion/<name>`) get canonicalized by
+  // `parseImportedAssertionUri` via the requester's agent DID, which
+  // is wrong for cross-agent peers on a public + open CG. Without
+  // explicit handling the meta lookup 404s with a confusing message;
+  // the relaxed read paths reject these up front with a clear 400
+  // pointing at the canonical URI form.
+  it('rejects legacy ownerless assertionUri form on public + open CG reads with a clear 400 (#872 Codex finding 2)', async () => {
+    const entry = await fileStore.put(Buffer.from('# Legacy Public\n'), 'text/markdown');
+    const contextGraphId = 'cg-public-open-legacy-uri-reject';
+    const assertionName = 'legacy-md';
+    const legacyAssertionUri = `did:dkg:context-graph:${contextGraphId}/assertion/${assertionName}`;
+    const canonicalAssertionUri = contextGraphAssertionUri(contextGraphId, 'did:dkg:agent:source', assertionName);
+    const { agent, queries } = makeAgent({
+      contextGraphId,
+      assertionName,
+      assertionUri: canonicalAssertionUri,
+      fileHash: entry.keccak256,
+      markdownHash: entry.keccak256,
+      markdownForm: `urn:dkg:file:${entry.keccak256}`,
+      onChainPolicy: { accessPolicy: 0, publishPolicy: 1 },
+    });
+    await startRoutes({ agent });
+
+    const read = await post('/api/assertion/import-artifact/read-markdown', {
+      contextGraphId,
+      assertionUri: legacyAssertionUri,
+      maxBytes: 1024,
+    });
+
+    expect(read.status).toBe(400);
+    expect(read.body.error).toMatch(/Legacy ownerless assertionUri form/);
+    expect(read.body.error).toMatch(/canonical assertion URI/);
+    // No SPARQL should have been issued — the legacy URI is rejected
+    // before the meta lookup that would otherwise return 404 with a
+    // misleading "no metadata" message.
+    expect(queries).toHaveLength(0);
+
+    // Sanity: the same legacy rejection applies to /resolve.
+    const resolved = await post('/api/assertion/import-artifact/resolve', {
+      contextGraphId,
+      assertionUri: legacyAssertionUri,
+    });
+    expect(resolved.status).toBe(400);
+    expect(resolved.body.error).toMatch(/Legacy ownerless assertionUri form/);
+  });
+
   it('requires full assertionUri instead of guessing the source author from assertionName', async () => {
     const entry = await fileStore.put(Buffer.from('# Imported\n'), 'text/markdown');
     const contextGraphId = 'cg-import-artifact-uri-required';

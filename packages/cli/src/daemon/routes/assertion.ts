@@ -848,6 +848,17 @@ async function resolveImportedArtifact(
   ownerGuard?: {
     requestAgentAddress: string;
     message: string;
+    /**
+     * Issue #872 / Codex review finding 1: opt-in for the public + open
+     * CG owner-guard relaxation. Only the two READ routes
+     * (`/import-artifact/resolve`, `/import-artifact/read-markdown`)
+     * set this to `true`. The semantic-enrichment WRITE route
+     * intentionally leaves it `false` (default) so the strict owner
+     * guard remains in effect regardless of the CG's on-chain policy
+     * — a non-owner peer on a public + open CG must not be allowed
+     * to mutate someone else's imported assertion.
+     */
+    relaxOnPublicOpenCg?: boolean;
   },
 ): Promise<ImportedArtifactResolution> {
   const rawContextGraphId = typeof raw.contextGraphId === 'string' ? raw.contextGraphId.trim() : '';
@@ -890,6 +901,20 @@ async function resolveImportedArtifact(
   }
 
   const inputAssertionUri = rawAssertionUri;
+  // Issue #872 Codex finding 1: only the READ routes opt into the
+  // public + open relaxation. The write callers (e.g.
+  // `/semantic-enrichment/write`) leave `relaxOnPublicOpenCg`
+  // unset/false so the strict owner guard stays in effect — a
+  // non-owner peer on a public + open CG must NOT be able to mutate
+  // someone else's imported assertion just because cross-agent READS
+  // are allowed.
+  const canRelaxGuard = Boolean(ownerGuard?.relaxOnPublicOpenCg);
+  // Probing the on-chain policy is a no-op for the write path (which
+  // never relaxes). Skip it there to keep the diff scoped and avoid
+  // adding chain-cache reads to a code path that doesn't need them.
+  const isPublicOpen = canRelaxGuard
+    ? await isPublicOpenContextGraph(ctx.agent, contextGraphId)
+    : false;
   const parsedAssertion = parseImportedAssertionUri(
     inputAssertionUri,
     contextGraphId,
@@ -897,6 +922,25 @@ async function resolveImportedArtifact(
   );
   if (!parsedAssertion) {
     throw new ImportArtifactRouteError(400, 'assertionUri is not an assertion in the supplied contextGraphId');
+  }
+  // Issue #872 Codex finding 2: a legacy ownerless URI
+  // (`.../assertion/<name>`) is canonicalized by
+  // `parseImportedAssertionUri` via the requester's agent DID
+  // because the URI itself doesn't carry an owner segment. That
+  // works for the original owner-self-read back-compat path, but on
+  // a public + open CG it silently produces the wrong canonical URI
+  // for cross-agent peers — the meta lookup then 404s with a
+  // confusing "no metadata" message instead of telling the caller
+  // their URI is ambiguous. Reject these early on the relaxed read
+  // paths so callers get a clear signal to pass the canonical form.
+  // Owner self-reads of legacy URIs on curated CGs are unaffected
+  // (canRelaxGuard is set only on read routes AND isPublicOpen has
+  // to be true), and V10 always emits canonical URIs.
+  if (parsedAssertion.legacy && canRelaxGuard && isPublicOpen) {
+    throw new ImportArtifactRouteError(
+      400,
+      'Legacy ownerless assertionUri form cannot be resolved on public + open CGs because the original owner is not encoded in the URI. Pass the canonical assertion URI: did:dkg:context-graph:<contextGraphId>/assertion/<assertionAgentAddress>/<assertionName>.',
+    );
   }
   const parsedNameValidation = validateAssertionName(parsedAssertion.assertionName);
   if (!parsedNameValidation.valid) {
@@ -918,10 +962,10 @@ async function resolveImportedArtifact(
     // SWM triples are gossipped to every subscribed peer, so blocking
     // cross-agent reads of the imported source artifact contradicts
     // the very access policy the curator chose on-chain. For every
-    // other policy combo (curated, or curators-only publish), the
-    // guard stays in force.
-    const isPublicOpen = await isPublicOpenContextGraph(ctx.agent, contextGraphId);
-    if (isPublicOpen) {
+    // other policy combo (curated, curators-only publish, or any
+    // write path), the guard stays in force regardless of the
+    // on-chain policy.
+    if (canRelaxGuard && isPublicOpen) {
       ownerGuardRelaxed = !isSameAgentAddress(
         parsedAssertion.assertionAgentAddress,
         ownerGuard.requestAgentAddress,
@@ -1106,6 +1150,9 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
       const artifact = await resolveImportedArtifact(ctx, parsed as Record<string, unknown>, {
         requestAgentAddress,
         message: 'Import artifact metadata can only be read from imported assertions owned by the requesting agent',
+        // Issue #872 — this is a read; opt into the public + open
+        // policy relaxation. The write route below does NOT set this.
+        relaxOnPublicOpenCg: true,
       });
       return jsonResponse(res, 200, { artifact });
     } catch (err) {
@@ -1124,6 +1171,8 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
       const artifact = await resolveImportedArtifact(ctx, parsed as Record<string, unknown>, {
         requestAgentAddress,
         message: 'Import artifact Markdown can only be read from imported assertions owned by the requesting agent',
+        // Issue #872 — read path; opt into the public + open relaxation.
+        relaxOnPublicOpenCg: true,
       });
       const maxBytes = normalizeMarkdownReadLimit((parsed as Record<string, unknown>).maxBytes);
       if (!artifact.markdownHash) {

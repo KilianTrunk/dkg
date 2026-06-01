@@ -74,7 +74,7 @@ describe('ApiClient', () => {
   });
 
   describe('GET endpoints', () => {
-    it('status() calls /api/status with auth header', async () => {
+    it('status() calls public /api/status without auth header', async () => {
       const body = { name: 'test', peerId: 'peer1', uptimeMs: 1000, connectedPeers: 2, relayConnected: true, multiaddrs: [] };
       const { fetch, calls } = createTrackingFetch({ ok: true, status: 200, body });
       globalThis.fetch = fetch;
@@ -83,7 +83,7 @@ describe('ApiClient', () => {
       expect(result).toEqual(body);
       expect(calls).toHaveLength(1);
       expect(calls[0].url).toBe(`http://127.0.0.1:${PORT}/api/status`);
-      expect((calls[0].opts.headers as any).Authorization).toBe('Bearer test-token');
+      expect((calls[0].opts.headers as any).Authorization).toBeUndefined();
     });
 
     it('connect() can use the selected home config for status when control-plane files are missing', async () => {
@@ -103,7 +103,7 @@ describe('ApiClient', () => {
       expect(connected.controlPlaneWarning).toContain('daemon.pid');
       expect(calls).toHaveLength(1);
       expect(calls[0].url).toBe('http://127.0.0.1:9317/api/status');
-      expect((calls[0].opts.headers as any).Authorization).toBe('Bearer local-token');
+      expect((calls[0].opts.headers as any).Authorization).toBeUndefined();
       expect(existsSync(join(tempDir, 'api.port'))).toBe(false);
       expect(existsSync(join(tempDir, 'daemon.pid'))).toBe(false);
     });

@@ -1,10 +1,13 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { existsSync } from 'node:fs';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { ApiClient } from '../src/api-client.js';
 
 const PORT = 8899;
+const originalDkgHome = process.env.DKG_HOME;
+const originalDkgApiPort = process.env.DKG_API_PORT;
 
 interface FetchCall {
   url: string;
@@ -51,6 +54,15 @@ function createTrackingFetch(response: { ok: boolean; status: number; statusText
   return { fetch: fn as typeof globalThis.fetch, calls };
 }
 
+function createRejectingFetch(error: Error): { fetch: typeof globalThis.fetch; calls: FetchCall[] } {
+  const calls: FetchCall[] = [];
+  const fn = async (url: string | URL | Request, init?: RequestInit) => {
+    calls.push({ url: String(url), opts: init as RequestInit });
+    throw error;
+  };
+  return { fetch: fn as typeof globalThis.fetch, calls };
+}
+
 describe('ApiClient', () => {
   let client: ApiClient;
   const originalFetch = globalThis.fetch;
@@ -63,11 +75,15 @@ describe('ApiClient', () => {
 
   afterEach(async () => {
     globalThis.fetch = originalFetch;
+    if (originalDkgHome === undefined) delete process.env.DKG_HOME;
+    else process.env.DKG_HOME = originalDkgHome;
+    if (originalDkgApiPort === undefined) delete process.env.DKG_API_PORT;
+    else process.env.DKG_API_PORT = originalDkgApiPort;
     await rm(tempDir, { recursive: true, force: true });
   });
 
   describe('GET endpoints', () => {
-    it('status() calls /api/status with auth header', async () => {
+    it('status() calls public /api/status without auth header', async () => {
       const body = { name: 'test', peerId: 'peer1', uptimeMs: 1000, connectedPeers: 2, relayConnected: true, multiaddrs: [] };
       const { fetch, calls } = createTrackingFetch({ ok: true, status: 200, body });
       globalThis.fetch = fetch;
@@ -76,7 +92,99 @@ describe('ApiClient', () => {
       expect(result).toEqual(body);
       expect(calls).toHaveLength(1);
       expect(calls[0].url).toBe(`http://127.0.0.1:${PORT}/api/status`);
-      expect((calls[0].opts.headers as any).Authorization).toBe('Bearer test-token');
+      expect((calls[0].opts.headers as any).Authorization).toBeUndefined();
+    });
+
+    it('connect() can use the selected home config for status when control-plane files are missing', async () => {
+      process.env.DKG_HOME = tempDir;
+      delete process.env.DKG_API_PORT;
+      await writeFile(join(tempDir, 'config.json'), JSON.stringify({ name: 'isolated', apiPort: 9317 }));
+      await writeFile(join(tempDir, 'auth.token'), 'local-token\n', 'utf8');
+      const body = { name: 'isolated', peerId: 'peer1', uptimeMs: 1000, connectedPeers: 2, relayConnected: true, multiaddrs: [] };
+      const { fetch, calls } = createTrackingFetch({ ok: true, status: 200, body });
+      globalThis.fetch = fetch;
+
+      const connected = await ApiClient.connect({ allowConfigFallback: true });
+      const result = await connected.status();
+
+      expect(result).toEqual(body);
+      expect(connected.controlPlaneWarning).toContain('api.port');
+      expect(connected.controlPlaneWarning).toContain('daemon.pid');
+      expect(calls).toHaveLength(1);
+      expect(calls[0].url).toBe('http://127.0.0.1:9317/api/status');
+      expect((calls[0].opts.headers as any).Authorization).toBeUndefined();
+      expect(existsSync(join(tempDir, 'api.port'))).toBe(false);
+      expect(existsSync(join(tempDir, 'daemon.pid'))).toBe(false);
+    });
+
+    it('connect() can use a yaml-only selected home config for status when control-plane files are missing', async () => {
+      process.env.DKG_HOME = tempDir;
+      delete process.env.DKG_API_PORT;
+      await writeFile(join(tempDir, 'config.yaml'), 'name: isolated\napiPort: 9317\n', 'utf8');
+      await writeFile(join(tempDir, 'auth.token'), 'local-token\n', 'utf8');
+      const body = { name: 'isolated', peerId: 'peer1', uptimeMs: 1000, connectedPeers: 2, relayConnected: true, multiaddrs: [] };
+      const { fetch, calls } = createTrackingFetch({ ok: true, status: 200, body });
+      globalThis.fetch = fetch;
+
+      const connected = await ApiClient.connect({ allowConfigFallback: true });
+      const result = await connected.status();
+
+      expect(result).toEqual(body);
+      expect(connected.controlPlaneWarning).toContain('api.port');
+      expect(connected.controlPlaneWarning).toContain('daemon.pid');
+      expect(calls).toHaveLength(1);
+      expect(calls[0].url).toBe('http://127.0.0.1:9317/api/status');
+      expect((calls[0].opts.headers as any).Authorization).toBeUndefined();
+      expect(existsSync(join(tempDir, 'api.port'))).toBe(false);
+      expect(existsSync(join(tempDir, 'daemon.pid'))).toBe(false);
+    });
+
+    it('connect() refuses config fallback when selected home has the default node name', async () => {
+      process.env.DKG_HOME = tempDir;
+      delete process.env.DKG_API_PORT;
+      await writeFile(join(tempDir, 'config.json'), JSON.stringify({ name: 'dkg-node', apiPort: 9317 }));
+      await writeFile(join(tempDir, 'auth.token'), 'local-token\n', 'utf8');
+      const body = { name: 'dkg-node', peerId: 'peer1', uptimeMs: 1000, connectedPeers: 2, relayConnected: true, multiaddrs: [] };
+      const { fetch, calls } = createTrackingFetch({ ok: true, status: 200, body });
+      globalThis.fetch = fetch;
+
+      await expect(ApiClient.connect({ allowConfigFallback: true }))
+        .rejects.toThrow('Daemon is not running. Start it with: dkg start');
+      expect(calls).toHaveLength(0);
+      expect(existsSync(join(tempDir, 'api.port'))).toBe(false);
+      expect(existsSync(join(tempDir, 'daemon.pid'))).toBe(false);
+    });
+
+    it('connect() rejects selected home config fallback when status belongs to a different node', async () => {
+      process.env.DKG_HOME = tempDir;
+      delete process.env.DKG_API_PORT;
+      await writeFile(join(tempDir, 'config.json'), JSON.stringify({ name: 'isolated', apiPort: 9317 }));
+      await writeFile(join(tempDir, 'auth.token'), 'local-token\n', 'utf8');
+      const body = { name: 'other-node', peerId: 'peer1', uptimeMs: 1000, connectedPeers: 2, relayConnected: true, multiaddrs: [] };
+      const { fetch, calls } = createTrackingFetch({ ok: true, status: 200, body });
+      globalThis.fetch = fetch;
+
+      const connected = await ApiClient.connect({ allowConfigFallback: true });
+
+      await expect(connected.status()).rejects.toThrow('expected selected home node "isolated"');
+      expect(calls).toHaveLength(1);
+      expect((calls[0].opts.headers as any).Authorization).toBeUndefined();
+    });
+
+    it('connect() reports daemon not running when selected home config fallback port is unreachable', async () => {
+      process.env.DKG_HOME = tempDir;
+      delete process.env.DKG_API_PORT;
+      await writeFile(join(tempDir, 'config.json'), JSON.stringify({ name: 'isolated', apiPort: 9317 }));
+      await writeFile(join(tempDir, 'auth.token'), 'local-token\n', 'utf8');
+      const { fetch, calls } = createRejectingFetch(new TypeError('fetch failed'));
+      globalThis.fetch = fetch;
+
+      const connected = await ApiClient.connect({ allowConfigFallback: true });
+
+      await expect(connected.status()).rejects.toThrow('Daemon is not running. Start it with: dkg start');
+      expect(calls).toHaveLength(1);
+      expect(calls[0].url).toBe('http://127.0.0.1:9317/api/status');
+      expect((calls[0].opts.headers as any).Authorization).toBeUndefined();
     });
 
     it('agents() calls /api/agents', async () => {
@@ -339,18 +447,18 @@ describe('ApiClient', () => {
 
   describe('auth headers', () => {
     it('includes Bearer token when set', async () => {
-      const { fetch, calls } = createTrackingFetch({ ok: true, status: 200, body: {} });
+      const { fetch, calls } = createTrackingFetch({ ok: true, status: 200, body: { agents: [] } });
       globalThis.fetch = fetch;
-      await client.status();
+      await client.agents();
 
       expect((calls[0].opts.headers as any).Authorization).toBe('Bearer test-token');
     });
 
     it('omits Authorization header when no token', async () => {
       const noTokenClient = new ApiClient(PORT);
-      const { fetch, calls } = createTrackingFetch({ ok: true, status: 200, body: {} });
+      const { fetch, calls } = createTrackingFetch({ ok: true, status: 200, body: { agents: [] } });
       globalThis.fetch = fetch;
-      await noTokenClient.status();
+      await noTokenClient.agents();
 
       expect(calls[0].opts.headers).not.toHaveProperty('Authorization');
     });

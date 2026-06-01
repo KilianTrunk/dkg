@@ -1,10 +1,13 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { existsSync } from 'node:fs';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { ApiClient } from '../src/api-client.js';
 
 const PORT = 8899;
+const originalDkgHome = process.env.DKG_HOME;
+const originalDkgApiPort = process.env.DKG_API_PORT;
 
 interface FetchCall {
   url: string;
@@ -63,6 +66,10 @@ describe('ApiClient', () => {
 
   afterEach(async () => {
     globalThis.fetch = originalFetch;
+    if (originalDkgHome === undefined) delete process.env.DKG_HOME;
+    else process.env.DKG_HOME = originalDkgHome;
+    if (originalDkgApiPort === undefined) delete process.env.DKG_API_PORT;
+    else process.env.DKG_API_PORT = originalDkgApiPort;
     await rm(tempDir, { recursive: true, force: true });
   });
 
@@ -77,6 +84,28 @@ describe('ApiClient', () => {
       expect(calls).toHaveLength(1);
       expect(calls[0].url).toBe(`http://127.0.0.1:${PORT}/api/status`);
       expect((calls[0].opts.headers as any).Authorization).toBe('Bearer test-token');
+    });
+
+    it('connect() can use the selected home config for status when control-plane files are missing', async () => {
+      process.env.DKG_HOME = tempDir;
+      delete process.env.DKG_API_PORT;
+      await writeFile(join(tempDir, 'config.json'), JSON.stringify({ name: 'isolated', apiPort: 9317 }));
+      await writeFile(join(tempDir, 'auth.token'), 'local-token\n', 'utf8');
+      const body = { name: 'isolated', peerId: 'peer1', uptimeMs: 1000, connectedPeers: 2, relayConnected: true, multiaddrs: [] };
+      const { fetch, calls } = createTrackingFetch({ ok: true, status: 200, body });
+      globalThis.fetch = fetch;
+
+      const connected = await ApiClient.connect({ allowConfigFallback: true });
+      const result = await connected.status();
+
+      expect(result).toEqual(body);
+      expect(connected.controlPlaneWarning).toContain('api.port');
+      expect(connected.controlPlaneWarning).toContain('daemon.pid');
+      expect(calls).toHaveLength(1);
+      expect(calls[0].url).toBe('http://127.0.0.1:9317/api/status');
+      expect((calls[0].opts.headers as any).Authorization).toBe('Bearer local-token');
+      expect(existsSync(join(tempDir, 'api.port'))).toBe(false);
+      expect(existsSync(join(tempDir, 'daemon.pid'))).toBe(false);
     });
 
     it('agents() calls /api/agents', async () => {

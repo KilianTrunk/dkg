@@ -117,6 +117,28 @@ describe('ApiClient', () => {
       expect(existsSync(join(tempDir, 'daemon.pid'))).toBe(false);
     });
 
+    it('connect() can use a yaml-only selected home config for status when control-plane files are missing', async () => {
+      process.env.DKG_HOME = tempDir;
+      delete process.env.DKG_API_PORT;
+      await writeFile(join(tempDir, 'config.yaml'), 'name: isolated\napiPort: 9317\n', 'utf8');
+      await writeFile(join(tempDir, 'auth.token'), 'local-token\n', 'utf8');
+      const body = { name: 'isolated', peerId: 'peer1', uptimeMs: 1000, connectedPeers: 2, relayConnected: true, multiaddrs: [] };
+      const { fetch, calls } = createTrackingFetch({ ok: true, status: 200, body });
+      globalThis.fetch = fetch;
+
+      const connected = await ApiClient.connect({ allowConfigFallback: true });
+      const result = await connected.status();
+
+      expect(result).toEqual(body);
+      expect(connected.controlPlaneWarning).toContain('api.port');
+      expect(connected.controlPlaneWarning).toContain('daemon.pid');
+      expect(calls).toHaveLength(1);
+      expect(calls[0].url).toBe('http://127.0.0.1:9317/api/status');
+      expect((calls[0].opts.headers as any).Authorization).toBeUndefined();
+      expect(existsSync(join(tempDir, 'api.port'))).toBe(false);
+      expect(existsSync(join(tempDir, 'daemon.pid'))).toBe(false);
+    });
+
     it('connect() rejects selected home config fallback when status belongs to a different node', async () => {
       process.env.DKG_HOME = tempDir;
       delete process.env.DKG_API_PORT;

@@ -5906,6 +5906,7 @@ export class DKGAgent {
       | { kind: 'success'; agentAddress: string }
       | { kind: 'failure'; agentAddress: string; keyId: string; error: Error };
 
+    let pendingSenderKeyQueued = false;
     const settled = await Promise.allSettled(
       input.recipients.map(async (recipient): Promise<PerRecipientOutcome> => {
         const recipientAgentAddress = ethers.getAddress(recipient.agentAddress);
@@ -5951,6 +5952,7 @@ export class DKGAgent {
             packageBytes,
             createdAtMs: Date.now(),
           });
+          pendingSenderKeyQueued = true;
           this.log.warn(
             input.ctx,
             `SWM sender-key setup for ${recipientAgentAddress} keyId=${recipient.recipientKeyId} ` +
@@ -6031,6 +6033,7 @@ export class DKGAgent {
                 packageBytes,
                 createdAtMs: Date.now(),
               });
+              pendingSenderKeyQueued = true;
               this.log.warn(
                 input.ctx,
                 `SWM sender-key setup for ${recipientAgentAddress} keyId=${recipient.recipientKeyId} ` +
@@ -6098,6 +6101,9 @@ export class DKGAgent {
       }
     }
     if (fatalAgents.length > 0) {
+      if (pendingSenderKeyQueued) {
+        await this.saveSwmSenderKeyState();
+      }
       throw new Error(
         `SWM Sender Key setup rejected by ${fatalAgents.length} agent(s): ${fatalAgents.join(' | ')}`,
       );
@@ -6793,11 +6799,21 @@ export class DKGAgent {
           state,
         );
       }
+      const pendingByAgent = new Map<string, PendingSenderKeyEntry[]>();
       for (const entry of parsed.pending ?? []) {
-        const pending = deserializePendingSenderKeyEntry(entry);
+        let pending: PendingSenderKeyEntry;
+        try {
+          pending = deserializePendingSenderKeyEntry(entry);
+        } catch {
+          continue;
+        }
         const recipientKey = pending.recipientAgentAddress.toLowerCase();
-        const queue = this.pendingSenderKeyByAgent.get(recipientKey) ?? [];
+        const queue = pendingByAgent.get(recipientKey) ?? [];
         queue.push(pending);
+        pendingByAgent.set(recipientKey, queue);
+      }
+      this.pendingSenderKeyByAgent.clear();
+      for (const [recipientKey, queue] of pendingByAgent.entries()) {
         this.pendingSenderKeyByAgent.set(recipientKey, queue);
       }
     } catch {

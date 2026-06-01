@@ -22,7 +22,7 @@
 //      evicts older epochs — they're superseded by definition.
 
 import { afterEach, describe, expect, it } from 'vitest';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ethers } from 'ethers';
@@ -105,6 +105,8 @@ interface PendingInternals {
     logPrefix: string,
   ): Promise<{ chainKey: Uint8Array; aeadCgId: string; senderAddress: string } | undefined>;
 }
+
+type LocalSendState = PendingInternals['swmSenderKeySendStates'] extends Map<string, infer State> ? State : never;
 
 interface FakeRecipient {
   agentAddress: string;
@@ -339,6 +341,105 @@ describe('createAndDistributeSwmSenderKeyEpoch: missing-peerId soft success', ()
     expect(queue![0].recipientKeyId).toBe(recipient.recipientKeyId);
     expect(queue![0].contextGraphId).toBe('test-cg/pending-persist');
     expect(queue![0].packageBytes.length).toBeGreaterThan(0);
+  });
+
+  it('persists queued sender-key retries before throwing aggregated setup failures', async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), 'dkg-swm-sender-pending-fatal-'));
+    tempDirs.push(dataDir);
+    const boot = await bootAgent();
+    agent = boot.agent;
+    const internals = boot.internals;
+    internals.config.dataDir = dataDir;
+
+    const retryableRecipient = makeFakeRecipient({ peerId: 'peer-retryable-rejection' });
+    const fatalRecipient = makeFakeRecipient({ peerId: 'peer-fatal-rejection' });
+    installStubMessenger(internals, async (peerId) => {
+      if (peerId === retryableRecipient.peerId) {
+        return {
+          delivered: true,
+          response: senderKeyAck(false, 'remote view has not converged yet', 'future-transient-rejection'),
+          attempts: 1,
+          messageId: 'm-persist-before-fatal-retryable',
+        };
+      }
+      return {
+        delivered: true,
+        response: senderKeyAck(false, 'package signature could not be verified', 'bad-signature'),
+        attempts: 1,
+        messageId: 'm-persist-before-fatal-terminal',
+      };
+    });
+
+    const sender = agentFromPrivateKey(
+      ethers.Wallet.createRandom().privateKey,
+      'sender',
+    ) as AgentKeyRecord & { privateKey: string };
+
+    await expect(
+      internals.createAndDistributeSwmSenderKeyEpoch({
+        contextGraphId: 'test-cg/pending-persist-before-fatal',
+        sender,
+        recipients: [retryableRecipient, fatalRecipient],
+        membershipHash: 'sha256:pending-persist-before-fatal',
+        ctx: { operationId: 'test-op', operationName: 'share' },
+      }),
+    ).rejects.toThrow('SWM Sender Key setup rejected by 1 agent(s)');
+
+    const state = JSON.parse(await readFile(join(dataDir, 'swm-sender-keys.json'), 'utf-8')) as {
+      pending?: Array<{ recipientAgentAddress?: string; recipientKeyId?: string }>;
+    };
+    expect(state.pending).toHaveLength(1);
+    expect(state.pending![0].recipientAgentAddress).toBe(retryableRecipient.agentAddress.toLowerCase());
+    expect(state.pending![0].recipientKeyId).toBe(retryableRecipient.recipientKeyId);
+  });
+
+  it('skips malformed pending rows without clearing valid sender state', async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), 'dkg-swm-sender-pending-corrupt-'));
+    tempDirs.push(dataDir);
+    const boot = await bootAgent();
+    agent = boot.agent;
+    const internals = boot.internals;
+    internals.config.dataDir = dataDir;
+
+    installStubMessenger(internals, async () => ({
+      delivered: true,
+      response: senderKeyAck(true),
+      attempts: 1,
+      messageId: 'm-pending-corrupt-preserve-send',
+    }));
+
+    const recipient = makeFakeRecipient({ peerId: 'peer-accepted' });
+    const sender = agentFromPrivateKey(
+      ethers.Wallet.createRandom().privateKey,
+      'sender',
+    ) as AgentKeyRecord & { privateKey: string };
+    const sendState = await internals.createAndDistributeSwmSenderKeyEpoch({
+      contextGraphId: 'test-cg/pending-corrupt',
+      sender,
+      recipients: [recipient],
+      membershipHash: 'sha256:pending-corrupt',
+      ctx: { operationId: 'test-op', operationName: 'share' },
+    }) as LocalSendState;
+    const stateKey = swmSenderStateKey(
+      sendState.contextGraphId,
+      sendState.subGraphName,
+      sendState.senderAgentAddress,
+    );
+    internals.swmSenderKeySendStates.set(stateKey, sendState);
+    await internals.saveSwmSenderKeyState();
+
+    const path = join(dataDir, 'swm-sender-keys.json');
+    const state = JSON.parse(await readFile(path, 'utf-8')) as Record<string, unknown>;
+    state.pending = [{ recipientAgentAddress: 7 }];
+    await writeFile(path, JSON.stringify(state, null, 2), { mode: 0o600 });
+
+    internals.swmSenderKeySendStates.clear();
+    internals.pendingSenderKeyByAgent.clear();
+    internals.swmSenderKeyStateLoaded = false;
+    await internals.loadSwmSenderKeyState();
+
+    expect(internals.swmSenderKeySendStates.get(stateKey)?.epochId).toBe(sendState.epochId);
+    expect(internals.pendingSenderKeyByAgent.size).toBe(0);
   });
 
   it('delivers pending package once the recipient peer connects', async () => {

@@ -210,6 +210,110 @@ describe('ACKCollector', () => {
     })).rejects.toThrow('storage_ack_insufficient');
   });
 
+  // #887: a freshly-created CG's first SWM gossip push to its assigned
+  // cores can land seconds after the publish ACK round starts. Cores
+  // decline NO_DATA_IN_SWM (a transient code) until the data arrives.
+  // The pre-#887 budget shared a single 3-attempt counter with transport
+  // errors (~3s), so a peer that would have ACKed a few seconds later was
+  // permanently dropped and the publish failed. These tests pin the
+  // dedicated, larger transient-decline retry budget.
+  function encodeDecline(code: string, message = 'SWM gossip catching up') {
+    return encodeStorageACK({
+      merkleRoot: new Uint8Array(),
+      coreNodeSignatureR: new Uint8Array(),
+      coreNodeSignatureVS: new Uint8Array(),
+      contextGraphId: testCGIdStr,
+      nodeIdentityId: 0,
+      declineCode: code,
+      declineMessage: message,
+    });
+  }
+
+  it('retries transient NO_DATA_IN_SWM declines past the transport budget until SWM gossip lands (#887)', async () => {
+    const callsByPeer = new Map<string, number>();
+    // 4 declines is more than the old 3-attempt cap — pre-#887 every
+    // peer would have been dropped here and quorum would never form.
+    const DECLINES_BEFORE_ACK = 4;
+    const deps: ACKCollectorDeps = {
+      gossipPublish: async () => {},
+      sleep: async () => {}, // collapse backoff so the test is instant
+      sendP2P: async (peerId) => {
+        const n = (callsByPeer.get(peerId) ?? 0) + 1;
+        callsByPeer.set(peerId, n);
+        if (n <= DECLINES_BEFORE_ACK) return encodeDecline('NO_DATA_IN_SWM');
+        const idx = parseInt(peerId.replace('peer-', ''), 10);
+        const { r, vs } = await signACK(coreWallets[idx], testCGId, merkleRoot, 1, 100n);
+        return encodeStorageACK({
+          merkleRoot,
+          coreNodeSignatureR: r,
+          coreNodeSignatureVS: vs,
+          contextGraphId: testCGIdStr,
+          nodeIdentityId: idx + 1,
+        });
+      },
+      getConnectedCorePeers: () => ['peer-0', 'peer-1', 'peer-2'],
+      log: () => {},
+    };
+
+    const collector = new ACKCollector(deps);
+    const result = await collector.collect({
+      merkleRoot,
+      contextGraphId: testCGId,
+      contextGraphIdStr: testCGIdStr,
+      publisherPeerId: 'publisher-0',
+      publicByteSize: 100n,
+      isPrivate: false,
+      kaCount: 1,
+      rootEntities: ['urn:a'],
+      chainId: TEST_CHAIN_ID,
+      kav10Address: TEST_KAV10_ADDR,
+      merkleLeafCount,
+    });
+
+    expect(result.acks).toHaveLength(3);
+    for (const peerId of ['peer-0', 'peer-1', 'peer-2']) {
+      // 4 declines + 1 successful ACK = 5 sends; impossible under the
+      // old 3-attempt budget.
+      expect(callsByPeer.get(peerId)).toBe(DECLINES_BEFORE_ACK + 1);
+    }
+  });
+
+  it('gives up on a transient decline that never clears, bounded by the retry budget (#887)', async () => {
+    const callsByPeer = new Map<string, number>();
+    const deps: ACKCollectorDeps = {
+      gossipPublish: async () => {},
+      sleep: async () => {},
+      // Never recovers — the SWM data genuinely never shows up.
+      sendP2P: async (peerId) => {
+        callsByPeer.set(peerId, (callsByPeer.get(peerId) ?? 0) + 1);
+        return encodeDecline('NO_DATA_IN_SWM');
+      },
+      getConnectedCorePeers: () => ['peer-0', 'peer-1', 'peer-2'],
+      log: () => {},
+    };
+
+    const collector = new ACKCollector(deps);
+    await expect(collector.collect({
+      merkleRoot,
+      contextGraphId: testCGId,
+      contextGraphIdStr: testCGIdStr,
+      publisherPeerId: 'publisher-0',
+      publicByteSize: 100n,
+      isPrivate: false,
+      kaCount: 1,
+      rootEntities: ['urn:a'],
+      chainId: TEST_CHAIN_ID,
+      kav10Address: TEST_KAV10_ADDR,
+      merkleLeafCount,
+    })).rejects.toThrow('storage_ack_insufficient');
+
+    for (const peerId of ['peer-0', 'peer-1', 'peer-2']) {
+      // 1 initial attempt + MAX_TRANSIENT_DECLINE_RETRIES (6) = 7 sends,
+      // then the peer is dropped. Proves the budget is bounded (no hang).
+      expect(callsByPeer.get(peerId)).toBe(7);
+    }
+  });
+
   it('rejects ACKs with wrong merkle root', async () => {
     const wrongRoot = new Uint8Array(32).fill(0xff);
     const deps: ACKCollectorDeps = {

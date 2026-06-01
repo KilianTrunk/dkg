@@ -280,6 +280,45 @@ export function computeApprovalAction(
   }
 }
 
+/**
+ * #888 — true iff `err` is the V10 publish `TooLowAllowance(TRAC, ...)`
+ * custom-error revert.
+ *
+ * The on-chain allowance read that gates the auto-approve and the
+ * `estimateGas` that ethers runs while populating the publish tx can
+ * observe a *stale* allowance on an internally load-balanced RPC: a
+ * just-consumed per-publish `1`-wei floor still reads as `1` (so the
+ * re-approve is skipped), or a freshly-sent approve has not yet
+ * propagated to the read replica. Either way the contract reverts
+ * `TooLowAllowance` during gas estimation — strictly BEFORE broadcast —
+ * and the publisher can recover by forcing a fresh approve and retrying.
+ *
+ * Matches ethers v6's decoded custom-error shape (`err.revert.name`) and
+ * falls back to string matching on the message / shortMessage / reason /
+ * nested cause so a stringified or re-wrapped revert is still caught.
+ */
+export function isTooLowAllowanceError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const e = err as {
+    revert?: { name?: unknown };
+    message?: unknown;
+    shortMessage?: unknown;
+    reason?: unknown;
+    cause?: unknown;
+  };
+  if (typeof e.revert?.name === 'string' && e.revert.name === 'TooLowAllowance') {
+    return true;
+  }
+  const causeMessage =
+    e.cause && typeof e.cause === 'object'
+      ? (e.cause as { message?: unknown }).message
+      : undefined;
+  const haystack = [e.message, e.shortMessage, e.reason, causeMessage]
+    .filter((s): s is string => typeof s === 'string')
+    .join(' ');
+  return /TooLowAllowance/i.test(haystack);
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -1060,6 +1099,11 @@ export class EVMChainAdapter implements ChainAdapter {
     kav10Address: string,
     tokenAmount: bigint,
     txLabel: string,
+    // #888: set on the retry after a `TooLowAllowance` revert. Forces a
+    // fresh approve up to the publish floor regardless of the (possibly
+    // stale) on-chain allowance read, then confirms it is visible before
+    // returning. See `isTooLowAllowanceError` / `createKnowledgeAssets`.
+    force = false,
   ): Promise<void> {
     if (!this.contracts.token) return;
     const tokenWithSigner = this.contracts.token.connect(signer) as Contract;
@@ -1072,7 +1116,12 @@ export class EVMChainAdapter implements ChainAdapter {
       tokenAmount,
       currentAllowance,
     );
-    if (needsApprove) {
+    // When forced, approve at least the publish floor even if the gating
+    // read above said `needsApprove === false` — that "false" may be a
+    // stale-high read of an allowance the prior publish already consumed.
+    const publishFloor = effectivePublishAllowance(tokenAmount);
+    const target = force && targetAllowance < publishFloor ? publishFloor : targetAllowance;
+    if (needsApprove || force) {
       // Surface the per-publish floor explicitly when (and only when) the
       // policy lifted `targetAllowance` above the caller's `tokenAmount`
       // — i.e. `tokenAmount === 0n` and the floor in
@@ -1091,7 +1140,7 @@ export class EVMChainAdapter implements ChainAdapter {
       if (
         this.approvalPolicy.mode === 'per-publish' &&
         tokenAmount === 0n &&
-        targetAllowance === V10_PUBLISH_ONCHAIN_MIN_ALLOWANCE
+        target === V10_PUBLISH_ONCHAIN_MIN_ALLOWANCE
       ) {
         console.warn(
           `[chain] V10 per-publish auto-approve floor: signer=${signer.address} ` +
@@ -1103,10 +1152,52 @@ export class EVMChainAdapter implements ChainAdapter {
       await this.sendContractTransaction(
         tokenWithSigner,
         'approve',
-        [kav10Address, targetAllowance],
+        [kav10Address, target],
         signer,
         txLabel,
       );
+      // #888: only on the forced re-approve (the retry after a
+      // `TooLowAllowance` revert) do we confirm the approve is visible on
+      // the same read path the caller's gas-estimation will use, so the
+      // retry doesn't immediately re-hit the RPC read-after-write lag
+      // that prompted it. Gated on `force` so the steady-state publish
+      // path issues exactly one allowance read + one approve (unchanged
+      // behaviour / latency); the bounded poll returns as soon as the
+      // allowance reflects the target.
+      if (force) {
+        await this.confirmAllowanceVisible(tokenWithSigner, signer.address, kav10Address, target);
+      }
+    }
+  }
+
+  /**
+   * #888 — poll `allowance(owner, spender)` until it reflects `target`,
+   * bounded by `ALLOWANCE_VISIBILITY_POLL_ATTEMPTS`. Best-effort: if the
+   * allowance still hasn't propagated after the budget, we return anyway
+   * and let the caller's gas-estimation surface a definitive revert (the
+   * `createKnowledgeAssets` retry then forces a fresh approve). Exits on
+   * the first read in the common case where the approve is immediately
+   * visible, so steady-state publish latency is unchanged.
+   */
+  private async confirmAllowanceVisible(
+    token: Contract,
+    owner: string,
+    spender: string,
+    target: bigint,
+  ): Promise<void> {
+    const POLL_ATTEMPTS = 6;
+    for (let i = 0; i < POLL_ATTEMPTS; i += 1) {
+      let current = -1n;
+      try {
+        current = (await token.allowance(owner, spender)) as bigint;
+      } catch {
+        // Transient read failure — treat as not-yet-visible and back off.
+        current = -1n;
+      }
+      if (current >= target) return;
+      if (i < POLL_ATTEMPTS - 1) {
+        await sleep(Math.min(250 * (i + 1), 1500));
+      }
     }
   }
 
@@ -2725,10 +2816,49 @@ export class EVMChainAdapter implements ChainAdapter {
     // This also gives the WAL the pre-broadcast tx hash (ethers v6
     // exposes it on the returned TransactionResponse), so recovery can
     // reconcile an in-flight tx after a daemon crash.
-    const populated = await (ka as any).publish.populateTransaction(
-      publishParamsStruct,
-    );
-    const { signedTx, txHash: preBroadcastTxHash } = await this.signPopulatedTransaction(txSigner, populated);
+    // #888: ethers estimates gas while populating the publish tx. On an
+    // internally load-balanced RPC that estimate can read a stale TRAC
+    // allowance and revert `TooLowAllowance` even though the approve
+    // above succeeded (post-approve propagation lag) or was skipped on a
+    // stale-high read of an allowance the prior publish already consumed.
+    // This happens strictly BEFORE the `onBroadcast` WAL checkpoint and
+    // the broadcast below, so on that one revert we force a fresh approve
+    // and retry the populate+sign exactly once. Any other error — or a
+    // second `TooLowAllowance` — propagates unchanged.
+    let signedTx!: string;
+    let preBroadcastTxHash!: string;
+    {
+      let forcedReapprove = false;
+      for (;;) {
+        try {
+          const populated = await (ka as any).publish.populateTransaction(
+            publishParamsStruct,
+          );
+          const signed = await this.signPopulatedTransaction(txSigner, populated);
+          signedTx = signed.signedTx;
+          preBroadcastTxHash = signed.txHash;
+          break;
+        } catch (err) {
+          if (!forcedReapprove && isTooLowAllowanceError(err)) {
+            forcedReapprove = true;
+            console.warn(
+              `[chain] V10 publish gas-estimation reverted TooLowAllowance for ` +
+              `signer=${txSigner.address} — forcing a fresh TRAC approve and ` +
+              `retrying once (likely a stale RPC allowance read, #888).`,
+            );
+            await this.ensureV10ApproveTrac(
+              txSigner,
+              kaAddress,
+              params.tokenAmount,
+              'approve V10 publish TRAC (forced re-approve, #888)',
+              true,
+            );
+            continue;
+          }
+          throw err;
+        }
+      }
+    }
     // Derive the pre-broadcast tx hash from the signed raw hex so WAL
     // consumers can log the exact identity of the tx about to hit the
     // wire. After broadcast completes, the receipt hash matches this.

@@ -1225,7 +1225,7 @@ describe('ACKCollector typed declines (#541)', () => {
     )).toBe(true);
   });
 
-  it('transient declines (NO_DATA_IN_SWM) are retried against the same peer up to MAX_RETRIES', async () => {
+  it('transient declines (NO_DATA_IN_SWM) are retried against the same peer up to the transient-decline budget (#887)', async () => {
     // Codex review on PR #559: treating NO_DATA_IN_SWM as permanent
     // shrinks the quorum pool the moment a core's SWM trails the
     // publish by even one gossip cycle. The fix is to retry transient
@@ -1249,6 +1249,9 @@ describe('ACKCollector typed declines (#541)', () => {
     const log = noop();
     const deps: ACKCollectorDeps = {
       gossipPublish: noop(),
+      // #887: collapse the (now larger) transient-decline backoff so the
+      // test exercises the retry budget without waiting real seconds.
+      sleep: async () => {},
       sendP2P: sendP2P as any,
       getConnectedCorePeers: () => ['peer-0', 'peer-1', 'peer-2'],
       log,
@@ -1259,12 +1262,13 @@ describe('ACKCollector typed declines (#541)', () => {
       collector.collect(buildCollectParams({ requiredACKs: 3 })),
     ).rejects.toThrow(/storage_ack_insufficient/);
 
-    // peer-0 was dialled 3 times (MAX_RETRIES) before giving up;
-    // every transient decline triggered another attempt. Lower bound
-    // is 2 (1 initial + ≥1 retry) so the test is robust to a future
-    // MAX_RETRIES bump; upper bound pins the current contract.
-    expect(sendCounts.get('peer-0')).toBeGreaterThanOrEqual(2);
-    expect(sendCounts.get('peer-0')).toBeLessThanOrEqual(3);
+    // #887: NO_DATA_IN_SWM is transient, so peer-0 is retried on its own
+    // (larger) decline budget — 1 initial dial + MAX_TRANSIENT_DECLINE_
+    // RETRIES (6) = 7 — before giving up. Lower bound proves we now retry
+    // PAST the old shared 3-attempt transport budget; upper bound pins
+    // the current contract.
+    expect(sendCounts.get('peer-0')).toBeGreaterThanOrEqual(4);
+    expect(sendCounts.get('peer-0')).toBeLessThanOrEqual(7);
 
     expect(log.calls.some(
       (c: unknown[]) => (c[0] as string).includes('Transient decline from peer-0')
@@ -1281,6 +1285,11 @@ describe('ACKCollector typed declines (#541)', () => {
     // sending operators down the wrong investigation path.
     const sendCounts = new Map<string, number>();
     const transportErrorMessage = 'simulated stream reset on retry';
+    // peer-1 / peer-2 ACK so quorum stays *reachable* until peer-0
+    // settles — otherwise the fast-fail (their failure already makes 3
+    // ACKs impossible) would fire before peer-0 reaches its terminal
+    // transport error, and we couldn't observe its final recorded reason.
+    const ackBuilder = buildSendP2P();
     const sendP2P = tracked(async (peerId: string) => {
       const calls = (sendCounts.get(peerId) ?? 0) + 1;
       sendCounts.set(peerId, calls);
@@ -1298,11 +1307,12 @@ describe('ACKCollector typed declines (#541)', () => {
         }
         throw new Error(transportErrorMessage);
       }
-      throw new Error('no other peers configured');
+      return ackBuilder(peerId);
     });
 
     const deps: ACKCollectorDeps = {
       gossipPublish: noop(),
+      sleep: async () => {},
       sendP2P: sendP2P as any,
       getConnectedCorePeers: () => ['peer-0', 'peer-1', 'peer-2'],
       log: noop(),
@@ -1324,7 +1334,11 @@ describe('ACKCollector typed declines (#541)', () => {
     expect(captured).not.toContain('NO_DATA_IN_SWM');
     expect(captured).not.toContain('replication lagging (stale on transport tail)');
 
-    expect(sendCounts.get('peer-0')).toBe(3);
+    // #887: call 1 is the transient decline (its own budget), then 3
+    // transport attempts (the unchanged transport `MAX_RETRIES`), the
+    // last of which is terminal — 4 dials total. The terminal reason is
+    // TRANSPORT_ERROR, not the stale NO_DATA_IN_SWM (asserted above).
+    expect(sendCounts.get('peer-0')).toBe(4);
   }, 15_000);
 
   it('a transient decline that resolves to a valid ACK on retry contributes to quorum', async () => {
@@ -1354,6 +1368,7 @@ describe('ACKCollector typed declines (#541)', () => {
 
     const deps: ACKCollectorDeps = {
       gossipPublish: noop(),
+      sleep: async () => {},
       sendP2P: sendP2P as any,
       getConnectedCorePeers: () => ['peer-0', 'peer-1', 'peer-2'],
       log: noop(),
@@ -1378,6 +1393,7 @@ describe('ACKCollector typed declines (#541)', () => {
     });
     const deps: ACKCollectorDeps = {
       gossipPublish: noop(),
+      sleep: async () => {},
       sendP2P: sendP2P as any,
       getConnectedCorePeers: () => ['peer-0', 'peer-1', 'peer-2', 'peer-3'],
       log: noop(),
@@ -1432,6 +1448,7 @@ describe('ACKCollector typed declines (#541)', () => {
     });
     const deps: ACKCollectorDeps = {
       gossipPublish: noop(),
+      sleep: async () => {},
       sendP2P: sendP2P as any,
       getConnectedCorePeers: () => ['peer-0', 'peer-1', 'peer-2'],
       log: noop(),
@@ -1463,6 +1480,7 @@ describe('ACKCollector typed declines (#541)', () => {
     const log = noop();
     const deps: ACKCollectorDeps = {
       gossipPublish: noop(),
+      sleep: async () => {},
       sendP2P: sendP2P as any,
       getConnectedCorePeers: () => ['peer-0', 'peer-1'],
       log,
@@ -1527,6 +1545,11 @@ describe('ACKCollector typed declines (#541)', () => {
     };
     const deps: ACKCollectorDeps = {
       gossipPublish: noop(),
+      // #887: collapse the transient-decline backoff. peer-0/peer-1
+      // exhaust their (now larger) NO_DATA retry budget, then the
+      // fast-fail fires the moment the still-pending pool (the lone hung
+      // peer-2) can no longer reach quorum.
+      sleep: async () => {},
       sendP2P: sendP2P as any,
       getConnectedCorePeers: () => ['peer-0', 'peer-1', 'peer-2'],
       log: noop(),
@@ -1555,10 +1578,12 @@ describe('ACKCollector typed declines (#541)', () => {
 
     // Sanity check: peer-2 was actually dialled (so the hang is real)
     // and the failure landed well below the ACK_TIMEOUT_MS budget.
-    // Floor pushed up from the original ~instant decline path now that
-    // NO_DATA_IN_SWM is a TRANSIENT decline that retries through the
-    // 1s + 2s transport backoff before settling — the fast-fail still
-    // beats the 120s ACK_TIMEOUT_MS budget by two orders of magnitude.
+    // peer-0/peer-1's NO_DATA_IN_SWM is a TRANSIENT decline that retries
+    // through the #887 transient-decline budget before settling; with
+    // the backoff collapsed here the fast-fail fires immediately once
+    // they exhaust it, far under the 120s ACK_TIMEOUT_MS budget. (In
+    // production the budget spans ~31s — still ~4x faster than waiting
+    // out ACK_TIMEOUT_MS for the hung peer.)
     expect(hung).toContain('peer-2');
     expect(elapsed).toBeLessThan(15_000);
   }, 30_000);

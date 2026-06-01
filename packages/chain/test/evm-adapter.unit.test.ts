@@ -10,6 +10,7 @@ import {
   effectivePublishAllowance,
   enrichEvmError,
   EVMChainAdapter,
+  isTooLowAllowanceError,
   resolveRpcUrls,
   V10_PUBLISH_ONCHAIN_MIN_ALLOWANCE,
   type EVMAdapterConfig,
@@ -2174,4 +2175,131 @@ describe('createKnowledgeAssets / updateKnowledgeCollectionV10 — approval sign
     expect(signSpy).toHaveBeenCalledTimes(1);
     expect(signSpy.mock.calls[0][0]).toBe(walletB);
   });
+});
+
+// -----------------------------------------------------------------------------
+// #888 — intermittent `TooLowAllowance(TRAC, 0, 1)` on consecutive zero-cost
+// publishes. The on-chain allowance read that gates the auto-approve and the
+// `estimateGas` ethers runs while populating the publish tx can observe a
+// STALE allowance on an internally load-balanced RPC: either a just-consumed
+// per-publish 1-wei floor still reads as `1` (so the re-approve is skipped) or
+// a freshly-sent approve hasn't propagated to the read replica yet. The fix:
+//   1. `isTooLowAllowanceError` classifies the revert,
+//   2. `createKnowledgeAssets` retries populate+sign once on that revert with a
+//      forced re-approve (the revert is strictly pre-broadcast, so it's safe),
+//   3. the forced re-approve approves up to the publish floor regardless of the
+//      gating read and confirms the new allowance is visible before returning.
+// -----------------------------------------------------------------------------
+
+describe('isTooLowAllowanceError (#888)', () => {
+  it('matches the ethers v6 decoded custom-error shape (revert.name)', () => {
+    expect(isTooLowAllowanceError({ revert: { name: 'TooLowAllowance' }, message: 'execution reverted' })).toBe(true);
+  });
+
+  it('matches a stringified revert in message / shortMessage / reason', () => {
+    expect(isTooLowAllowanceError(new Error('execution reverted: TooLowAllowance(0xTRAC, 0, 1)'))).toBe(true);
+    expect(isTooLowAllowanceError({ shortMessage: 'execution reverted (TooLowAllowance)' })).toBe(true);
+    expect(isTooLowAllowanceError({ reason: 'TooLowAllowance' })).toBe(true);
+  });
+
+  it('matches a nested cause.message', () => {
+    expect(isTooLowAllowanceError({ message: 'wrapped', cause: new Error('inner: TooLowAllowance(...)') })).toBe(true);
+  });
+
+  it('does not match unrelated reverts / errors', () => {
+    expect(isTooLowAllowanceError(new Error('TooLowStake(node, 0, 50000)'))).toBe(false);
+    expect(isTooLowAllowanceError({ revert: { name: 'NotBatchPublisher' }, message: 'execution reverted' })).toBe(false);
+    expect(isTooLowAllowanceError(new Error('insufficient funds for gas'))).toBe(false);
+  });
+
+  it('handles non-object / null / numeric / string inputs safely', () => {
+    expect(isTooLowAllowanceError(null)).toBe(false);
+    expect(isTooLowAllowanceError(undefined)).toBe(false);
+    expect(isTooLowAllowanceError('TooLowAllowance')).toBe(false);
+    expect(isTooLowAllowanceError(42)).toBe(false);
+  });
+});
+
+function makeV10AdapterWithAllowanceSequence(values: bigint[]) {
+  const a = new EVMChainAdapter(minimalConfig());
+  let i = 0;
+  const tokenWithSigner = {
+    allowance: vi.fn(async () => values[Math.min(i++, values.length - 1)]),
+    approve: vi.fn(),
+  };
+  const tokenRoot = { connect: vi.fn(() => tokenWithSigner) };
+  (a as any).contracts.token = tokenRoot;
+  const sendSpy = vi.fn(async () => ({} as unknown));
+  (a as any).sendContractTransaction = sendSpy;
+  const signer = new ethers.Wallet(DEPLOYER_PK);
+  return { a, signer, tokenWithSigner, sendSpy };
+}
+
+describe('ensureV10ApproveTrac — forced re-approve + visibility poll (#888)', () => {
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  it('force=true re-approves even when the gating read says the allowance is already sufficient (stale-high skip)', async () => {
+    // The "stale-high" sub-race: the per-publish 1-wei floor consumed by
+    // the previous publish still reads as `1`, so `needsApprove` is false
+    // and the un-forced path would skip the approve — but the real
+    // on-chain allowance is 0 and the publish would revert. Forcing the
+    // re-approve corrects this.
+    const { a, signer, tokenWithSigner, sendSpy } = makeV10Adapter(undefined, 1n);
+
+    await (a as any).ensureV10ApproveTrac(
+      signer,
+      V10_KA_ADDRESS,
+      0n,
+      'approve V10 publish TRAC (forced re-approve, #888)',
+      true,
+    );
+
+    const call = getApproveCallArgs(sendSpy);
+    expect(call.method).toBe('approve');
+    expect(call.args).toEqual([V10_KA_ADDRESS, 1n]);
+    // gating read (1n) + one visibility-poll read (1n ≥ target → confirmed).
+    expect(tokenWithSigner.allowance).toHaveBeenCalledTimes(2);
+  });
+
+  it('force=false with a sufficient allowance issues NO approve and NO visibility poll (steady-state unchanged)', async () => {
+    const { a, signer, tokenWithSigner, sendSpy } = makeV10Adapter(undefined, 1n);
+
+    await (a as any).ensureV10ApproveTrac(
+      signer,
+      V10_KA_ADDRESS,
+      0n,
+      'approve V10 publish TRAC',
+    );
+
+    expect(sendSpy).not.toHaveBeenCalled();
+    // Only the single gating read — the poll is gated on `force`.
+    expect(tokenWithSigner.allowance).toHaveBeenCalledTimes(1);
+  });
+
+  it('forced re-approve polls until the fresh approve becomes visible on the RPC read path', async () => {
+    const { a, signer, tokenWithSigner, sendSpy } = makeV10AdapterWithAllowanceSequence([
+      0n, // gating read → needsApprove
+      0n, // poll read 1 → approve not yet propagated to the read replica
+      1n, // poll read 2 → now visible
+    ]);
+
+    await (a as any).ensureV10ApproveTrac(signer, V10_KA_ADDRESS, 0n, 'forced', true);
+
+    expect(sendSpy).toHaveBeenCalledTimes(1); // exactly one approve
+    expect(tokenWithSigner.allowance).toHaveBeenCalledTimes(3); // gating + 2 polls
+  });
+
+  it('forced re-approve is best-effort: gives up after the bounded poll budget without throwing', async () => {
+    const { a, signer, tokenWithSigner, sendSpy } = makeV10AdapterWithAllowanceSequence([0n]); // never visible
+
+    await expect(
+      (a as any).ensureV10ApproveTrac(signer, V10_KA_ADDRESS, 0n, 'forced', true),
+    ).resolves.toBeUndefined();
+
+    expect(sendSpy).toHaveBeenCalledTimes(1);
+    // gating read + 6 bounded poll attempts. Proves the poll is bounded
+    // (no hang); the caller's gas-estimation then surfaces a definitive
+    // revert if the allowance genuinely never propagates.
+    expect(tokenWithSigner.allowance).toHaveBeenCalledTimes(7);
+  }, 15_000);
 });

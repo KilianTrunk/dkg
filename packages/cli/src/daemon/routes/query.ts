@@ -617,6 +617,13 @@ export async function handleQueryRoutes(ctx: RequestContext): Promise<void> {
       if (
         msg.startsWith("SPARQL rejected:") ||
         msg.startsWith("Parse error") ||
+        // #889: oxigraph surfaces SPARQL syntax errors as
+        // `error at <line>:<col>: expected one of ...` (e.g. a missing
+        // closing brace or an incomplete triple). These are client input
+        // errors, not server faults — classify them as 400 to match the
+        // existing `SPARQL rejected:` / `must start with ...` handling
+        // instead of letting them fall through to a 500.
+        /^error at \d+:\d+:/.test(msg) ||
         /must start with (SELECT|CONSTRUCT|ASK|DESCRIBE)/i.test(msg) ||
         msg.includes("was removed in V10") ||
         msg.includes("agentAddress is required") ||

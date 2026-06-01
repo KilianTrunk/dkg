@@ -609,6 +609,66 @@ describe('createAndDistributeSwmSenderKeyEpoch: missing-peerId soft success', ()
     expect(internals.pendingSenderKeyByAgent.size).toBe(1);
   });
 
+  it('rotates pending retry messageId after incompatible ACK version', async () => {
+    const boot = await bootAgent();
+    agent = boot.agent;
+    const internals = boot.internals;
+
+    installStubMessenger(internals, async () => {
+      throw new Error('initial no-peerId branch must not call sendReliable');
+    });
+
+    const recipient = makeFakeRecipient();
+    const sender = agentFromPrivateKey(
+      ethers.Wallet.createRandom().privateKey,
+      'sender',
+    ) as AgentKeyRecord & { privateKey: string };
+
+    await internals.createAndDistributeSwmSenderKeyEpoch({
+      contextGraphId: 'test-cg/incompatible-ack-message-id',
+      sender,
+      recipients: [recipient],
+      membershipHash: 'sha256:incompatible-ack-message-id',
+      ctx: { operationId: 'test-op', operationName: 'share' },
+    });
+
+    const knownPeerId = '12D3KooWIncompatibleAckMessageIdPeer';
+    installStubDiscovery(internals, (peerId) => {
+      if (peerId !== knownPeerId) return null;
+      return {
+        agentUri: `did:dkg:agent:${recipient.agentAddress.toLowerCase()}`,
+        name: 'incompatible-ack-message-id-target',
+        peerId,
+        agentAddress: recipient.agentAddress,
+      };
+    });
+
+    const messageIds: Array<string | undefined> = [];
+    installStubMessenger(internals, async (_peerId, _protocolId, _payload, opts) => {
+      messageIds.push(opts?.messageId);
+      return {
+        delivered: true,
+        response: encodeSwmSenderKeyPackageAck({
+          version: 'future-swm-sender-key-version',
+          type: SWM_SENDER_KEY_PACKAGE_ACK_TYPE,
+          accepted: false,
+          reason: 'future ACK version',
+        }),
+        attempts: 1,
+        messageId: opts?.messageId ?? 'missing-message-id',
+      };
+    });
+
+    expect(await internals.drainPendingSenderKeyForPeer(knownPeerId)).toBe(0);
+    expect(await internals.drainPendingSenderKeyForPeer(knownPeerId)).toBe(0);
+
+    expect(messageIds).toHaveLength(2);
+    expect(messageIds[0]).toMatch(/^swm-sender-key:[0-9a-f]{64}$/);
+    expect(messageIds[1]).toMatch(/^swm-sender-key:[0-9a-f]{64}:[0-9a-f-]{36}$/);
+    expect(messageIds[1]).not.toBe(messageIds[0]);
+    expect(internals.pendingSenderKeyByAgent.size).toBe(1);
+  });
+
   it('retries pending packages during later publishes without waiting for reconnect', async () => {
     const boot = await bootAgent();
     agent = boot.agent;
@@ -776,6 +836,38 @@ describe('createAndDistributeSwmSenderKeyEpoch: missing-peerId soft success', ()
     const queue = internals.pendingSenderKeyByAgent.get(futureReason.agentAddress.toLowerCase());
     expect(queue).toHaveLength(1);
     expect(queue![0].recipientKeyId).toBe(futureReason.recipientKeyId);
+  });
+
+  it('queues delivered malformed setup ACKs instead of failing initial setup', async () => {
+    const boot = await bootAgent();
+    agent = boot.agent;
+    const internals = boot.internals;
+
+    const sender = agentFromPrivateKey(
+      ethers.Wallet.createRandom().privateKey,
+      'sender',
+    ) as AgentKeyRecord & { privateKey: string };
+    const recipient = makeFakeRecipient({ peerId: '12D3KooWMalformedInitialAckPeer' });
+    installStubMessenger(internals, async (): Promise<ReliableSendResult> => ({
+      delivered: true,
+      response: new Uint8Array([0xff, 0x01, 0x02]),
+      attempts: 1,
+      messageId: 'm-malformed-initial-ack',
+    }));
+
+    await expect(
+      internals.createAndDistributeSwmSenderKeyEpoch({
+        contextGraphId: 'test-cg/malformed-initial-ack',
+        sender,
+        recipients: [recipient],
+        membershipHash: 'sha256:malformed-initial-ack',
+        ctx: { operationId: 'test-op', operationName: 'share' },
+      }),
+    ).resolves.toBeTruthy();
+
+    const queue = internals.pendingSenderKeyByAgent.get(recipient.agentAddress.toLowerCase());
+    expect(queue).toHaveLength(1);
+    expect(queue![0].messageId).toMatch(/^swm-sender-key:[0-9a-f]{64}:[0-9a-f-]{36}$/);
   });
 
   it('keeps structured known failures and legacy code-less hard failures fatal', async () => {

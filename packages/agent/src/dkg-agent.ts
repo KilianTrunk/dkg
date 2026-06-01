@@ -6010,17 +6010,51 @@ export class DKGAgent {
             );
             return { kind: 'success', agentAddress: recipientAgentAddress };
           }
-          const ack = decodeSwmSenderKeyPackageAck(sendResult.response);
+          let ack: ReturnType<typeof decodeSwmSenderKeyPackageAck>;
+          try {
+            ack = decodeSwmSenderKeyPackageAck(sendResult.response);
+          } catch {
+            this.enqueuePendingSenderKey({
+              senderAgentAddress: senderAgentAddress.toLowerCase(),
+              recipientAgentAddress: recipientAgentAddress.toLowerCase(),
+              recipientKeyId: recipient.recipientKeyId,
+              epochId: state.epochId,
+              contextGraphId: state.contextGraphId,
+              subGraphName: state.subGraphName,
+              packageBytes,
+              messageId: this.nextSwmSenderKeyPackageMessageId(packageBytes),
+              createdAtMs: Date.now(),
+            });
+            pendingSenderKeyQueued = true;
+            this.log.warn(
+              input.ctx,
+              `SWM sender-key setup for ${recipientAgentAddress} keyId=${recipient.recipientKeyId} ` +
+              'queued after malformed Sender Key setup ACK',
+            );
+            return { kind: 'success', agentAddress: recipientAgentAddress };
+          }
           if (
             ack.version !== SWM_SENDER_KEY_PACKAGE_VERSION ||
             ack.type !== SWM_SENDER_KEY_PACKAGE_ACK_TYPE
           ) {
-            return {
-              kind: 'failure',
-              agentAddress: recipientAgentAddress,
-              keyId: recipient.recipientKeyId,
-              error: new Error(ack.reason ?? 'invalid Sender Key setup ACK'),
-            };
+            this.enqueuePendingSenderKey({
+              senderAgentAddress: senderAgentAddress.toLowerCase(),
+              recipientAgentAddress: recipientAgentAddress.toLowerCase(),
+              recipientKeyId: recipient.recipientKeyId,
+              epochId: state.epochId,
+              contextGraphId: state.contextGraphId,
+              subGraphName: state.subGraphName,
+              packageBytes,
+              messageId: this.nextSwmSenderKeyPackageMessageId(packageBytes),
+              createdAtMs: Date.now(),
+            });
+            pendingSenderKeyQueued = true;
+            this.log.warn(
+              input.ctx,
+              `SWM sender-key setup for ${recipientAgentAddress} keyId=${recipient.recipientKeyId} ` +
+              `queued after incompatible Sender Key setup ACK version/type (${ack.version}/${ack.type})`,
+            );
+            return { kind: 'success', agentAddress: recipientAgentAddress };
           }
           if (!ack.accepted) {
             const reason = ack.reason ?? 'unknown reason';
@@ -6226,7 +6260,7 @@ export class DKGAgent {
         ) {
           // Malformed/legacy ACK: no positive acceptance yet. Keep the
           // row queued so a mixed-version rollout cannot strand the recipient.
-          remaining.push(entry);
+          remaining.push(this.rotateSwmSenderKeyPendingMessageId(entry));
           continue;
         }
         if (ack.accepted) {

@@ -113,7 +113,7 @@ export interface SwmSenderKeyPackageAckMsg {
   recipientAgentAddress?: string;
 }
 
-export type SwmSenderKeyPackageAckReasonCode =
+export type KnownSwmSenderKeyPackageAckReasonCode =
   | 'stale-target'
   | 'sender-not-allowed'
   | 'recipient-not-allowed'
@@ -124,7 +124,11 @@ export type SwmSenderKeyPackageAckReasonCode =
   | 'not-agent-gated'
   | 'unknown';
 
-export const SWM_SENDER_KEY_PACKAGE_ACK_REASON_CODES: readonly SwmSenderKeyPackageAckReasonCode[] = [
+export type SwmSenderKeyPackageAckReasonCode =
+  | KnownSwmSenderKeyPackageAckReasonCode
+  | (string & {});
+
+export const SWM_SENDER_KEY_PACKAGE_ACK_REASON_CODES: readonly KnownSwmSenderKeyPackageAckReasonCode[] = [
   'stale-target',
   'sender-not-allowed',
   'recipient-not-allowed',
@@ -135,10 +139,6 @@ export const SWM_SENDER_KEY_PACKAGE_ACK_REASON_CODES: readonly SwmSenderKeyPacka
   'not-agent-gated',
   'unknown',
 ];
-
-const SWM_SENDER_KEY_PACKAGE_ACK_REASON_CODE_SET = new Set<string>(
-  SWM_SENDER_KEY_PACKAGE_ACK_REASON_CODES,
-);
 
 export interface SwmSenderKeyMessageMsg {
   version: string;
@@ -502,9 +502,7 @@ function stringField(value: unknown): string {
 function swmSenderKeyPackageAckReasonCodeField(value: unknown): SwmSenderKeyPackageAckReasonCode | undefined {
   const reasonCode = stringField(value);
   if (!reasonCode) return undefined;
-  return SWM_SENDER_KEY_PACKAGE_ACK_REASON_CODE_SET.has(reasonCode)
-    ? reasonCode as SwmSenderKeyPackageAckReasonCode
-    : 'unknown';
+  return reasonCode as SwmSenderKeyPackageAckReasonCode;
 }
 
 function bytesField(value: unknown): Uint8Array {

@@ -472,7 +472,7 @@ describe('createAndDistributeSwmSenderKeyEpoch: missing-peerId soft success', ()
     const notAgentGated = makeFakeRecipient({ peerId: '12D3KooWNotGatedRetryPeer' });
     const recipientNotLocal = makeFakeRecipient({ peerId: '12D3KooWNotLocalRetryPeer' });
     const recipientNotAllowed = makeFakeRecipient({ peerId: '12D3KooWRecipGateRetryPeer' });
-    const legacyNoCode = makeFakeRecipient({ peerId: '12D3KooWLegacyRetryPeer' });
+    const futureReason = makeFakeRecipient({ peerId: '12D3KooWFutureReasonRetryPeer' });
 
     const rejectionByPeer = new Map<string, { reason?: string; reasonCode?: SwmSenderKeyPackageAckReasonCode }>([
       [
@@ -503,7 +503,13 @@ describe('createAndDistributeSwmSenderKeyEpoch: missing-peerId soft success', ()
           reasonCode: 'recipient-not-allowed',
         },
       ],
-      [legacyNoCode.peerId!, { reason: 'legacy receiver rejection without a reason code' }],
+      [
+        futureReason.peerId!,
+        {
+          reason: 'newer receiver returned a retryable code this sender does not know yet',
+          reasonCode: 'future-retryable-reason',
+        },
+      ],
     ]);
     installStubMessenger(internals, async (peerId): Promise<ReliableSendResult> => {
       const rejection = rejectionByPeer.get(peerId);
@@ -519,21 +525,21 @@ describe('createAndDistributeSwmSenderKeyEpoch: missing-peerId soft success', ()
       internals.createAndDistributeSwmSenderKeyEpoch({
         contextGraphId: 'test-cg/joined',
         sender,
-        recipients: [staleGate, notAgentGated, recipientNotLocal, recipientNotAllowed, legacyNoCode],
+        recipients: [staleGate, notAgentGated, recipientNotLocal, recipientNotAllowed, futureReason],
         membershipHash: 'sha256:joined-transient-rejections',
         ctx: { operationId: 'test-op', operationName: 'share' },
       }),
     ).resolves.toBeTruthy();
 
     expect(internals.pendingSenderKeyByAgent.size).toBe(5);
-    for (const recipient of [staleGate, notAgentGated, recipientNotLocal, recipientNotAllowed, legacyNoCode]) {
+    for (const recipient of [staleGate, notAgentGated, recipientNotLocal, recipientNotAllowed, futureReason]) {
       const queue = internals.pendingSenderKeyByAgent.get(recipient.agentAddress.toLowerCase());
       expect(queue).toHaveLength(1);
       expect(queue![0].recipientKeyId).toBe(recipient.recipientKeyId);
     }
   });
 
-  it('keeps active-key loss and unknown ACKs fatal', async () => {
+  it('keeps active-key loss, explicit unknown, and legacy code-less ACKs fatal', async () => {
     const boot = await bootAgent();
     agent = boot.agent;
     const internals = boot.internals;
@@ -544,8 +550,9 @@ describe('createAndDistributeSwmSenderKeyEpoch: missing-peerId soft success', ()
     ) as AgentKeyRecord & { privateKey: string };
     const activeKeyMissing = makeFakeRecipient({ peerId: '12D3KooWActiveMissingFatalPeer' });
     const unknownReason = makeFakeRecipient({ peerId: '12D3KooWUnknownFatalPeer' });
+    const legacyNoCode = makeFakeRecipient({ peerId: '12D3KooWLegacyNoCodeFatalPeer' });
 
-    const rejectionByPeer = new Map<string, { reason: string; reasonCode: SwmSenderKeyPackageAckReasonCode }>([
+    const rejectionByPeer = new Map<string, { reason: string; reasonCode?: SwmSenderKeyPackageAckReasonCode }>([
       [
         activeKeyMissing.peerId!,
         {
@@ -558,6 +565,12 @@ describe('createAndDistributeSwmSenderKeyEpoch: missing-peerId soft success', ()
         {
           reason: 'malformed package or unexpected receiver failure',
           reasonCode: 'unknown',
+        },
+      ],
+      [
+        legacyNoCode.peerId!,
+        {
+          reason: 'legacy receiver rejection without a reason code',
         },
       ],
     ]);
@@ -575,11 +588,11 @@ describe('createAndDistributeSwmSenderKeyEpoch: missing-peerId soft success', ()
       internals.createAndDistributeSwmSenderKeyEpoch({
         contextGraphId: 'test-cg/joined',
         sender,
-        recipients: [activeKeyMissing, unknownReason],
+        recipients: [activeKeyMissing, unknownReason, legacyNoCode],
         membershipHash: 'sha256:joined-terminal-rejections',
         ctx: { operationId: 'test-op', operationName: 'share' },
       }),
-    ).rejects.toThrow('SWM Sender Key setup rejected by 2 agent(s)');
+    ).rejects.toThrow('SWM Sender Key setup rejected by 3 agent(s)');
 
     expect(internals.pendingSenderKeyByAgent.size).toBe(0);
   });

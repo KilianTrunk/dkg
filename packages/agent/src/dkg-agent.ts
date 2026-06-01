@@ -5974,9 +5974,10 @@ export class DKGAgent {
           //
           // Delivery semantics (C2 integration-pass relaxation):
           //   • `delivered=true && ack.accepted=true` → success.
-          //   • `delivered=true && ack.accepted=false` with a terminal
-          //     reason (`stale-target`, `active-private-key-missing`,
-          //     `revoked-key`, `bad-signature`, `unknown`)
+          //   • `delivered=true && ack.accepted=false` with no reason code,
+          //     or with a terminal reason (`stale-target`,
+          //     `active-private-key-missing`, `revoked-key`,
+          //     `bad-signature`, `unknown`)
           //     → HARD failure: retrying the same package cannot help.
           //   • `delivered=true && ack.accepted=false` with a non-terminal
           //     reason → SOFT success: keep it queued so a
@@ -6119,6 +6120,7 @@ export class DKGAgent {
   private isTerminalSwmSenderKeySetupAckReasonCode(
     reasonCode: SwmSenderKeyPackageAckReasonCode | undefined,
   ): boolean {
+    if (!reasonCode) return true;
     return (
       reasonCode === 'stale-target' ||
       reasonCode === 'active-private-key-missing' ||

@@ -5987,22 +5987,37 @@ export class DKGAgent {
           //     convergence.
           //   • `delivered=false` → SOFT success.
           //     The setup-package landed in the messenger's durable
-          //     outbox and will be replayed when the recipient comes
-          //     back online. Treating this as a hard failure used to
-          //     block any open-publish-CG write whenever the curator
-          //     was offline mid-batch, breaking the "members keep
-          //     publishing under intermittent curator availability"
+          //     outbox, but the agent also keeps a local pending row
+          //     under the same messageId so future retries still decode
+          //     the Sender Key ACK and can rotate after delivered
+          //     malformed/retryable responses. Treating this as a hard
+          //     failure used to block any open-publish-CG write whenever
+          //     the curator was offline mid-batch, breaking the "members
+          //     keep publishing under intermittent curator availability"
           //     contract C2 exercises. The recipient still gets the
           //     epoch + chain key eventually; the only cost is that
           //     they can't decrypt the broadcast that immediately
           //     follows until the queued setup catches up.
+          const messageId = this.swmSenderKeyPackageMessageId(packageBytes);
           const sendResult = await this.messenger.sendReliable(
             recipient.peerId,
             PROTOCOL_SWM_SENDER_KEY,
             packageBytes,
-            { messageId: this.swmSenderKeyPackageMessageId(packageBytes) },
+            { messageId },
           );
           if (!sendResult.delivered) {
+            this.enqueuePendingSenderKey({
+              senderAgentAddress: senderAgentAddress.toLowerCase(),
+              recipientAgentAddress: recipientAgentAddress.toLowerCase(),
+              recipientKeyId: recipient.recipientKeyId,
+              epochId: state.epochId,
+              contextGraphId: state.contextGraphId,
+              subGraphName: state.subGraphName,
+              packageBytes,
+              messageId,
+              createdAtMs: Date.now(),
+            });
+            pendingSenderKeyQueued = true;
             this.log.warn(
               input.ctx,
               `SWM sender-key setup for ${recipientAgentAddress} keyId=${recipient.recipientKeyId} ` +

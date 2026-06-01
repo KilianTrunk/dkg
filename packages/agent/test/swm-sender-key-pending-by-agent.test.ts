@@ -17,7 +17,7 @@
 //   1. no-peerId no longer throws (publish proceeds; row enqueued).
 //   2. drain replays the queued package once we know the peerId,
 //      either through reconnect or later recipient resolution, and
-//      removes the row when the messenger confirms delivery.
+//      removes the row when the Sender Key ACK confirms acceptance.
 //   3. enqueuing a newer epoch for the same (sender, recipient)
 //      evicts older epochs — they're superseded by definition.
 
@@ -552,6 +552,74 @@ describe('createAndDistributeSwmSenderKeyEpoch: missing-peerId soft success', ()
     expect(messageIds[0]).toMatch(/^swm-sender-key:[0-9a-f]{64}$/);
     expect(messageIds[1]).toBe(messageIds[0]);
     expect(internals.pendingSenderKeyByAgent.size).toBe(1);
+  });
+
+  it('keeps transport-undelivered setup in local pending queue for ACK-aware retry', async () => {
+    const boot = await bootAgent();
+    agent = boot.agent;
+    const internals = boot.internals;
+
+    const peerId = '12D3KooWInitialTransportUndeliveredPeer';
+    const recipient = makeFakeRecipient({ peerId });
+    const sender = agentFromPrivateKey(
+      ethers.Wallet.createRandom().privateKey,
+      'sender',
+    ) as AgentKeyRecord & { privateKey: string };
+
+    const messageIds: Array<string | undefined> = [];
+    let call = 0;
+    installStubMessenger(internals, async (_peerId, _protocolId, _payload, opts) => {
+      call += 1;
+      messageIds.push(opts?.messageId);
+      if (call === 1) {
+        return {
+          delivered: false,
+          queued: true,
+          attempts: 1,
+          messageId: opts?.messageId ?? 'missing-message-id',
+          error: 'recipient temporarily offline',
+        };
+      }
+      return {
+        delivered: true,
+        response: new Uint8Array([0xff, 0x01, 0x02]),
+        attempts: 1,
+        messageId: opts?.messageId ?? 'missing-message-id',
+      };
+    });
+
+    await internals.createAndDistributeSwmSenderKeyEpoch({
+      contextGraphId: 'test-cg/initial-transport-undelivered',
+      sender,
+      recipients: [recipient],
+      membershipHash: 'sha256:initial-transport-undelivered',
+      ctx: { operationId: 'test-op', operationName: 'share' },
+    });
+
+    const initialQueue = internals.pendingSenderKeyByAgent.get(recipient.agentAddress.toLowerCase());
+    expect(initialQueue).toHaveLength(1);
+    expect(messageIds).toHaveLength(1);
+    expect(messageIds[0]).toMatch(/^swm-sender-key:[0-9a-f]{64}$/);
+    expect(initialQueue![0].messageId).toBe(messageIds[0]);
+
+    installStubDiscovery(internals, (seenPeerId) => {
+      if (seenPeerId !== peerId) return null;
+      return {
+        agentUri: `did:dkg:agent:${recipient.agentAddress.toLowerCase()}`,
+        name: 'initial-transport-undelivered-target',
+        peerId,
+        agentAddress: recipient.agentAddress,
+      };
+    });
+
+    expect(await internals.drainPendingSenderKeyForPeer(peerId)).toBe(0);
+
+    const retryQueue = internals.pendingSenderKeyByAgent.get(recipient.agentAddress.toLowerCase());
+    expect(messageIds).toHaveLength(2);
+    expect(messageIds[1]).toBe(messageIds[0]);
+    expect(retryQueue).toHaveLength(1);
+    expect(retryQueue![0].messageId).toMatch(/^swm-sender-key:[0-9a-f]{64}:[0-9a-f-]{36}$/);
+    expect(retryQueue![0].messageId).not.toBe(messageIds[0]);
   });
 
   it('rotates pending retry messageId after delivered retryable rejections', async () => {

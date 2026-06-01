@@ -1614,25 +1614,15 @@ for n in $(seq 1 "$NUM_CORE_NODES"); do
   win_nocg=$(grep -c 'rs.tick.no-eligible-cg' "$win" 2>/dev/null); win_nocg=${win_nocg:-0}
   win_stale=$(grep -c 'rs.tick.submit-stale' "$win" 2>/dev/null); win_stale=${win_stale:-0}
   win_crm=$(grep -c 'rs.tick.chain-root-mismatch' "$win" 2>/dev/null); win_crm=${win_crm:-0}
-  # Terminal outcomes that DO carry `periodStart` (submitted, already-solved,
-  # kc-not-synced, data-corrupted) → dedupe by periodStart for an exact
-  # period count.
-  win_periods_ps=$(grep -E 'rs\.tick\.(submitted|already-solved|kc-not-synced|data-corrupted)' "$win" 2>/dev/null | grep -oE '"periodStart":"[0-9]+"' | sort -u | wc -l | tr -d ' ')
-  [ -z "$win_periods_ps" ] && win_periods_ps=0
-  # Terminal failures that do NOT log periodStart (submit-stale,
-  # chain-root-mismatch — see packages/random-sampling/src/prover.ts L666 and
-  # L685). Without periodStart we approximate distinct failed periods by
-  # the (kaId,cgId) pair carried on every emission: the prover handles one
-  # challenge per period, so multiple stale/mismatch retries within a
-  # single period collapse to one (kaId,cgId) and sort -u yields 1. This
-  # under-counts the rare case of the same (kaId,cgId) failing across two
-  # consecutive periods (counted as 1), and skips lines without the pair
-  # at all — both biases are dwarfed by the alternative of dropping these
-  # outcomes entirely, which leaves RS_PCT artificially high under exactly
-  # the failure modes this gate exists to catch.
-  win_periods_other=$(grep -E 'rs\.tick\.(submit-stale|chain-root-mismatch)' "$win" 2>/dev/null | grep -oE '"kaId":"[0-9]+","cgId":"[0-9]+"' | sort -u | wc -l | tr -d ' ')
-  [ -z "$win_periods_other" ] && win_periods_other=0
-  win_periods=$(( win_periods_ps + win_periods_other ))
+  # Every terminal RS outcome carries `periodStart` as of the companion
+  # `feat(rs): log periodStart on submit-stale + chain-root-mismatch`
+  # change in packages/random-sampling/src/prover.ts. Distinct values =
+  # distinct proof periods the prover was challenged on in this window,
+  # regardless of whether they succeeded, were already-solved, or failed
+  # through any of the failure paths. This is the canonical denominator
+  # for per-period proving health.
+  win_periods=$(grep -E 'rs\.tick\.(submitted|already-solved|kc-not-synced|data-corrupted|submit-stale|chain-root-mismatch)' "$win" 2>/dev/null | grep -oE '"periodStart":"[0-9]+"' | sort -u | wc -l | tr -d ' ')
+  [ -z "$win_periods" ] && win_periods=0
   rm -f "$win"
 
   if [ "$win_periods" -gt 0 ]; then

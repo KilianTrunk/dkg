@@ -666,6 +666,7 @@ export class RandomSamplingProver {
         this.log.warn('rs.tick.submit-stale', {
           kaId: kaId.toString(),
           cgId: cgId.toString(),
+          periodStart: periodKey.periodStartBlock.toString(),
         });
         await this.wal.append(
           makeWalEntry(periodKey, 'failed', {
@@ -685,6 +686,7 @@ export class RandomSamplingProver {
         this.log.error('rs.tick.chain-root-mismatch', {
           kaId: kaId.toString(),
           cgId: cgId.toString(),
+          periodStart: periodKey.periodStartBlock.toString(),
         });
         await this.wal.append(
           makeWalEntry(periodKey, 'failed', {

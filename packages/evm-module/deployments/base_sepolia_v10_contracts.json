@@ -90,15 +90,6 @@
             "deploymentTimestamp": 1780299758505,
             "deployed": true
         },
-        "KnowledgeCollectionStorage": {
-            "evmAddress": "0x4fCA405d46ADeDD7050420C1937842D2a36a04D8",
-            "version": "1.0.0",
-            "gitBranch": "main",
-            "gitCommitHash": "aa9260311f87e9e5cf7fedea2f9c0d8aa547b641",
-            "deploymentBlock": 41978645,
-            "deploymentTimestamp": 1779725582201,
-            "deployed": false
-        },
         "PaymasterManager": {
             "evmAddress": "0x073aFC5cDf6e81d2Ccfb66d39E1F1224B39b8F15",
             "version": "1.0.0",
@@ -296,15 +287,6 @@
             "deploymentBlock": 42265770,
             "deploymentTimestamp": 1780299831101,
             "deployed": true
-        },
-        "KnowledgeAssetsV10": {
-            "evmAddress": "0x65dcDD2484F6db18c53Ea9b31541237d7E005566",
-            "version": "10.1.0",
-            "gitBranch": "main",
-            "gitCommitHash": "aa9260311f87e9e5cf7fedea2f9c0d8aa547b641",
-            "deploymentBlock": 41978681,
-            "deploymentTimestamp": 1779725653922,
-            "deployed": false
         },
         "StakingV10": {
             "evmAddress": "0xD8e0daF736e082F779e7BA62B28e8d7A38A82E7c",

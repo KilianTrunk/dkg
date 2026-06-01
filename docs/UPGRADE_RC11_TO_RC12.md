@@ -157,7 +157,7 @@ cat packages/chain/abi/ContextGraphStorage.json
 cat packages/chain/abi/ParametersStorage.json
 ```
 
-The `packages/chain/abi/abi-pinning.test.ts` pinned digests reflect the rename. If you've pinned ABI hashes downstream, regenerate them.
+The `packages/chain/test/abi-pinning.test.ts` pinned digests reflect the rename. If you've pinned ABI hashes downstream, regenerate them.
 
 ### 3.4 Storage / config renames
 

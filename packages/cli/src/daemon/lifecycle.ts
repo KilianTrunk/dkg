@@ -1163,6 +1163,8 @@ export async function runDaemonInner(
         sharedMemorySynced: row.shared_memory_synced == null ? undefined : row.shared_memory_synced === 1,
         metaSynced: row.meta_synced == null ? undefined : row.meta_synced === 1,
         onChainId: row.on_chain_id ?? undefined,
+        onChainHash: row.on_chain_hash ?? undefined,
+        lastReconciledOrdinal: row.last_reconciled_ordinal ?? undefined,
         syncScoped: row.sync_scoped === 1,
       })),
       save: async (record) => {
@@ -1174,6 +1176,8 @@ export async function runDaemonInner(
           shared_memory_synced: record.sharedMemorySynced == null ? null : record.sharedMemorySynced ? 1 : 0,
           meta_synced: record.metaSynced == null ? null : record.metaSynced ? 1 : 0,
           on_chain_id: record.onChainId ?? null,
+          on_chain_hash: record.onChainHash ?? null,
+          last_reconciled_ordinal: record.lastReconciledOrdinal ?? null,
           sync_scoped: record.syncScoped ? 1 : 0,
           updated_at: Date.now(),
         });

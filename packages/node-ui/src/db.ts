@@ -9,7 +9,7 @@ import {
   type ProtocolOutboxStore,
 } from '@origintrail-official/dkg-core';
 
-const SCHEMA_VERSION = 16;
+const SCHEMA_VERSION = 17;
 // Default operator retention. Lowered from 90 → 14 days on V15 (2026-05) after
 // a production incident in which the `logs` table + its FTS5 shadow tables
 // grew to ~9 GB on a 12-day-old node and corrupted the SQLite page (header
@@ -641,6 +641,32 @@ export class DashboardDB {
       this.db.exec(`CREATE INDEX IF NOT EXISTS idx_notif_cg ON notifications(context_graph_id);`);
     }
 
+    if (version < 17) {
+      // Phase B (chain-driven VM reconciliation): persist two fields on the
+      // subscription row.
+      //   * `on_chain_hash` — the curator-committed wire id. The type already
+      //     declared `onChainHash` (and the V8 host-recovery path needs it to
+      //     resume on the right topic after restart), but no column existed,
+      //     so it was silently dropped on persist. This adds the column and
+      //     folds in that fix.
+      //   * `last_reconciled_ordinal` — the per-CG registration-ordinal
+      //     watermark: the count of registered KAs this node has promoted to
+      //     VM contiguously. The sweep resumes from here, so it MUST survive
+      //     restarts. NULL == "never reconciled" (sweep starts at 0).
+      // Same defensive PRAGMA-then-ALTER pattern as V9/V10/V16 — additive +
+      // nullable, no data migration, safe on whatever table already exists.
+      const cols = new Set(
+        (this.db.prepare('PRAGMA table_info(context_graph_subscriptions)').all() as Array<{ name: string }>)
+          .map((c) => c.name),
+      );
+      if (!cols.has('on_chain_hash')) {
+        this.db.exec(`ALTER TABLE context_graph_subscriptions ADD COLUMN on_chain_hash TEXT;`);
+      }
+      if (!cols.has('last_reconciled_ordinal')) {
+        this.db.exec(`ALTER TABLE context_graph_subscriptions ADD COLUMN last_reconciled_ordinal INTEGER;`);
+      }
+    }
+
     this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
     if (upgradedExistingDb && !this.explicitRetentionDays) {
       this.retentionDays = LEGACY_IMPLICIT_RETENTION_DAYS;
@@ -747,16 +773,18 @@ export class DashboardDB {
     shared_memory_synced?: number | null;
     meta_synced?: number | null;
     on_chain_id?: string | null;
+    on_chain_hash?: string | null;
+    last_reconciled_ordinal?: number | null;
     sync_scoped: number;
     updated_at: number;
   }): void {
     this.stmt('upsertContextGraphSubscription', `
       INSERT INTO context_graph_subscriptions (
         context_graph_id, name, subscribed, synced, shared_memory_synced, meta_synced,
-        on_chain_id, sync_scoped, updated_at
+        on_chain_id, on_chain_hash, last_reconciled_ordinal, sync_scoped, updated_at
       ) VALUES (
         @context_graph_id, @name, @subscribed, @synced, @shared_memory_synced, @meta_synced,
-        @on_chain_id, @sync_scoped, @updated_at
+        @on_chain_id, @on_chain_hash, @last_reconciled_ordinal, @sync_scoped, @updated_at
       )
       ON CONFLICT(context_graph_id) DO UPDATE SET
         name = excluded.name,
@@ -765,6 +793,8 @@ export class DashboardDB {
         shared_memory_synced = excluded.shared_memory_synced,
         meta_synced = excluded.meta_synced,
         on_chain_id = excluded.on_chain_id,
+        on_chain_hash = excluded.on_chain_hash,
+        last_reconciled_ordinal = excluded.last_reconciled_ordinal,
         sync_scoped = excluded.sync_scoped,
         updated_at = excluded.updated_at
     `).run({
@@ -775,6 +805,8 @@ export class DashboardDB {
       shared_memory_synced: record.shared_memory_synced ?? null,
       meta_synced: record.meta_synced ?? null,
       on_chain_id: record.on_chain_id ?? null,
+      on_chain_hash: record.on_chain_hash ?? null,
+      last_reconciled_ordinal: record.last_reconciled_ordinal ?? null,
       sync_scoped: record.sync_scoped,
       updated_at: record.updated_at,
     });
@@ -2444,6 +2476,8 @@ export interface ContextGraphSubscriptionRow {
   shared_memory_synced: number | null;
   meta_synced: number | null;
   on_chain_id: string | null;
+  on_chain_hash: string | null;
+  last_reconciled_ordinal: number | null;
   sync_scoped: number;
   updated_at: number;
 }

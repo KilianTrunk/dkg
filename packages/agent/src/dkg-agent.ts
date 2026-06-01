@@ -4133,6 +4133,8 @@ export class DKGAgent {
       sharedMemorySynced: sub.sharedMemorySynced,
       metaSynced: sub.metaSynced,
       onChainId: sub.onChainId,
+      onChainHash: sub.onChainHash,
+      lastReconciledOrdinal: sub.lastReconciledOrdinal,
       syncScoped: (this.config.syncContextGraphs ?? []).includes(contextGraphId),
     }).catch((err) => {
       this.log.warn(
@@ -4218,6 +4220,8 @@ export class DKGAgent {
           sharedMemorySynced: row.sharedMemorySynced,
           metaSynced: row.metaSynced,
           onChainId: row.onChainId,
+          onChainHash: row.onChainHash,
+          lastReconciledOrdinal: row.lastReconciledOrdinal,
         }, { persist: false });
       }
       for (const row of rows) {

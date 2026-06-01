@@ -86,7 +86,7 @@ describe('DashboardDB — metric snapshots', () => {
     raw.close();
 
     db = new DashboardDB({ dataDir: dir });
-    expect(db.db.pragma('user_version', { simple: true })).toBe(16);
+    expect(db.db.pragma('user_version', { simple: true })).toBe(17);
 
     const cols = (db.db.prepare('PRAGMA table_info(metric_snapshots)').all() as Array<{ name: string }>)
       .map((c) => c.name);
@@ -142,7 +142,7 @@ describe('DashboardDB — metric snapshots', () => {
     raw.close();
 
     db = new DashboardDB({ dataDir: dir });
-    expect(db.db.pragma('user_version', { simple: true })).toBe(16);
+    expect(db.db.pragma('user_version', { simple: true })).toBe(17);
 
     const newSnapshotCols = (db.db.prepare('PRAGMA table_info(metric_snapshots)').all() as { name: string }[])
       .map(c => c.name);
@@ -545,7 +545,7 @@ describe('DashboardDB — V15 migration: drop FTS5 logs index', () => {
 
     const upgraded = new DashboardDB({ dataDir: upgradeDir });
     try {
-      expect(upgraded.db.pragma('user_version', { simple: true })).toBe(16);
+      expect(upgraded.db.pragma('user_version', { simple: true })).toBe(17);
 
       const ftsTables = upgraded.db.prepare(
         `SELECT name FROM sqlite_master WHERE type IN ('table','view') AND name LIKE 'logs_fts%'`,
@@ -645,6 +645,93 @@ describe('DashboardDB — context graph subscriptions', () => {
       shared_memory_synced: 1,
       updated_at: 2000,
     }]);
+  });
+
+  it('round-trips on_chain_hash + last_reconciled_ordinal (Phase B), defaulting to NULL', () => {
+    // Omitted → NULL (legacy / never-reconciled).
+    db.upsertContextGraphSubscription({
+      context_graph_id: 'cg-legacy',
+      subscribed: 1,
+      synced: 1,
+      sync_scoped: 1,
+      updated_at: 1000,
+    });
+    expect(db.listContextGraphSubscriptions()).toMatchObject([{
+      context_graph_id: 'cg-legacy',
+      on_chain_hash: null,
+      last_reconciled_ordinal: null,
+    }]);
+
+    // Set + advance the watermark.
+    db.upsertContextGraphSubscription({
+      context_graph_id: 'cg-legacy',
+      subscribed: 1,
+      synced: 1,
+      on_chain_hash: '0xfeed',
+      last_reconciled_ordinal: 5,
+      sync_scoped: 1,
+      updated_at: 2000,
+    });
+    expect(db.listContextGraphSubscriptions()).toMatchObject([{
+      context_graph_id: 'cg-legacy',
+      on_chain_hash: '0xfeed',
+      last_reconciled_ordinal: 5,
+    }]);
+  });
+});
+
+describe('DashboardDB — V17 subscription columns migration (Phase B)', () => {
+  let db: DashboardDB;
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'dkg-db-v17-test-'));
+    db = new DashboardDB({ dataDir: dir });
+  });
+
+  afterEach(() => {
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('adds on_chain_hash + last_reconciled_ordinal when upgrading a pre-V17 DB, preserving rows', () => {
+    const dbPath = join(dir, 'node-ui.db');
+    db.close();
+
+    const raw = new Database(dbPath);
+    raw.exec('ALTER TABLE context_graph_subscriptions DROP COLUMN on_chain_hash;');
+    raw.exec('ALTER TABLE context_graph_subscriptions DROP COLUMN last_reconciled_ordinal;');
+    raw.prepare(
+      `INSERT INTO context_graph_subscriptions
+         (context_graph_id, name, subscribed, synced, on_chain_id, sync_scoped, updated_at)
+       VALUES ('cg-pre17', 'Pre17', 1, 1, '0xabc', 1, 1000)`,
+    ).run();
+    raw.pragma('user_version = 16');
+    raw.close();
+
+    db = new DashboardDB({ dataDir: dir });
+    expect(db.db.pragma('user_version', { simple: true })).toBe(17);
+
+    const cols = (db.db.prepare('PRAGMA table_info(context_graph_subscriptions)').all() as Array<{ name: string }>)
+      .map((c) => c.name);
+    expect(cols).toContain('on_chain_hash');
+    expect(cols).toContain('last_reconciled_ordinal');
+
+    // Pre-existing row survives; new columns default to NULL.
+    expect(db.listContextGraphSubscriptions()).toMatchObject([{
+      context_graph_id: 'cg-pre17',
+      on_chain_id: '0xabc',
+      on_chain_hash: null,
+      last_reconciled_ordinal: null,
+    }]);
+  });
+
+  it('fresh install already carries the V17 columns', () => {
+    const cols = (db.db.prepare('PRAGMA table_info(context_graph_subscriptions)').all() as Array<{ name: string }>)
+      .map((c) => c.name);
+    expect(cols).toContain('on_chain_hash');
+    expect(cols).toContain('last_reconciled_ordinal');
+    expect(db.db.pragma('user_version', { simple: true })).toBe(17);
   });
 });
 
@@ -1002,7 +1089,7 @@ describe('DashboardDB — V11→V13 chat schema migration chain', () => {
     raw.close();
 
     db = new DashboardDB({ dataDir: dir });
-    expect(db.db.pragma('user_version', { simple: true })).toBe(16);
+    expect(db.db.pragma('user_version', { simple: true })).toBe(17);
 
     const cols = (db.db.prepare('PRAGMA table_info(chat_messages)').all() as Array<{ name: string }>)
       .map((c) => c.name);
@@ -1068,7 +1155,7 @@ describe('DashboardDB — V16 notifications.context_graph_id migration (A1)', ()
     raw.close();
 
     db = new DashboardDB({ dataDir: dir });
-    expect(db.db.pragma('user_version', { simple: true })).toBe(16);
+    expect(db.db.pragma('user_version', { simple: true })).toBe(17);
 
     const cols = (db.db.prepare('PRAGMA table_info(notifications)').all() as Array<{ name: string }>)
       .map((c) => c.name);
@@ -1097,7 +1184,7 @@ describe('DashboardDB — V16 notifications.context_graph_id migration (A1)', ()
     const cols = (db.db.prepare('PRAGMA table_info(notifications)').all() as Array<{ name: string }>)
       .map((c) => c.name);
     expect(cols).toContain('context_graph_id');
-    expect(db.db.pragma('user_version', { simple: true })).toBe(16);
+    expect(db.db.pragma('user_version', { simple: true })).toBe(17);
   });
 
   it('insertNotification writes context_graph_id to the column; omitted → NULL', () => {

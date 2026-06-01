@@ -506,6 +506,17 @@ export interface ContextGraphSub {
    * wire form for those — they pre-date the contract change).
    */
   onChainHash?: string;
+  /**
+   * Phase B (chain-driven VM reconciliation) — the per-CG
+   * registration-ordinal watermark: the count of KAs registered to this CG
+   * on-chain that the node has promoted to VM *contiguously* (no gaps). The
+   * reconcile sweep resumes from this ordinal and walks up to the on-chain
+   * `getContextGraphKCCount(cgId)`. Persisted (survives restarts); `undefined`
+   * means "never reconciled" and the sweep starts at 0. Advanced only behind
+   * the confirmation-depth gate so a reorg can't strand the watermark ahead
+   * of canonical chain state.
+   */
+  lastReconciledOrdinal?: number;
   /** Participant agent addresses (V10 agent identity model). */
   participantAgents?: string[];
   /**
@@ -536,6 +547,8 @@ export interface ContextGraphSubscriptionRecord {
    * on the correct topic without needing a new chain-event read.
    */
   onChainHash?: string;
+  /** Phase B — persisted per-CG registration-ordinal VM watermark (see ContextGraphSub). */
+  lastReconciledOrdinal?: number;
   syncScoped: boolean;
 }
 

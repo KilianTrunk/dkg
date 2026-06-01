@@ -72,9 +72,19 @@ export interface ApiClientConnectOptions {
   allowConfigFallback?: boolean;
 }
 
+const DAEMON_NOT_RUNNING_MESSAGE = 'Daemon is not running. Start it with: dkg start';
+
 function controlPlaneWarning(missingFiles: string[]): string | undefined {
   if (missingFiles.length === 0) return undefined;
   return `Warning: selected DKG home is missing control-plane file(s): ${missingFiles.join(', ')}. Using configured API port fallback.`;
+}
+
+function isConnectionFailure(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  if ('httpStatus' in err) return false;
+  const name = 'name' in err ? String((err as { name?: unknown }).name) : '';
+  const message = 'message' in err ? String((err as { message?: unknown }).message) : '';
+  return name === 'TypeError' && /fetch failed|ECONNREFUSED|ECONNRESET|ENOTFOUND|EAI_AGAIN|terminated/i.test(message);
 }
 
 function isDaemonStatusResponse(value: unknown): value is DaemonStatusResponse {
@@ -149,7 +159,7 @@ export class ApiClient {
     if (!port) {
       const pid = await readPid();
       if (!pid || !isProcessRunning(pid)) {
-        throw new Error('Daemon is not running. Start it with: dkg start');
+        throw new Error(DAEMON_NOT_RUNNING_MESSAGE);
       }
       throw new Error('Cannot read API port. Set DKG_API_PORT or restart: dkg stop && dkg start');
     }
@@ -160,7 +170,15 @@ export class ApiClient {
   }
 
   async status(): Promise<DaemonStatusResponse> {
-    const status = await this.get<unknown>('/api/status', { auth: false });
+    let status: unknown;
+    try {
+      status = await this.get<unknown>('/api/status', { auth: false });
+    } catch (err) {
+      if (this.expectedStatusName && isConnectionFailure(err)) {
+        throw new Error(DAEMON_NOT_RUNNING_MESSAGE);
+      }
+      throw err;
+    }
     return requireDaemonStatusResponse(status, this.expectedStatusName);
   }
 

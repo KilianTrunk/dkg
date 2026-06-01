@@ -64,6 +64,12 @@ contract ContextGraphStorage is INamed, IVersioned, Guardian, ERC721Enumerable {
     // Participant agents: EOA addresses authorised to publish into a curated
     // CG (used as an allow-list for Safe / PCA-agent flows). Insertion order
     // preserved; duplicates rejected.
+    // Slither: mappings are zero-initialized by the language (no slot is
+    // written until first key insertion). The "uninitialized-state" rule
+    // fires on declaration-without-initializer, but there is no
+    // initializer syntax for mappings — Solidity rejects it. False
+    // positive for every public/private mapping in the codebase.
+    // slither-disable-next-line uninitialized-state
     mapping(uint256 contextGraphId => address[]) private _participantAgents;
 
     // Non-zero when curator type is PCA: the DKGPublishingConvictionNFT

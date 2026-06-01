@@ -265,7 +265,11 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
     // (dropped from the running stake). All entries in `nodeExpiryTimes[id]`
     // at indices >= nodeExpiryHead[id] have timestamps strictly greater
     // than nodeLastSettledAt[id].
+    // Slither: mappings are zero-initialized by the language — see
+    // ContextGraphStorage._participantAgents for the long-form rationale.
+    // slither-disable-next-line uninitialized-state
     mapping(uint72 => uint256) public runningNodeEffectiveStake;
+    // slither-disable-next-line uninitialized-state
     mapping(uint72 => uint40) public nodeLastSettledAt;
 
     // Sorted-ascending queue of pending boost-expiry timestamps per node.
@@ -1449,6 +1453,14 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
     // ============================================================
 
     function transferStake(address receiver, uint96 stakeAmount) external onlyContracts {
+        // Slither: `safeTransfer` (SafeERC20) reverts on failure rather than
+        // returning false — the "unchecked-transfer" pattern Slither flags
+        // applies to the bare ERC20 `.transfer()` return-value path. This
+        // call site is the SAFE wrapper precisely BECAUSE the V10 design
+        // upgraded V8's bare `.transfer()` (see StakingStorage.transferStake)
+        // to SafeERC20. False positive — kept here as a directive for
+        // future maintainers debugging the report.
+        // slither-disable-next-line unchecked-transfer
         tokenContract.safeTransfer(receiver, stakeAmount);
         emit StakedTokensTransferred(receiver, stakeAmount);
     }

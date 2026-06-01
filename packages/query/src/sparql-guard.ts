@@ -26,20 +26,41 @@ const MUTATING_PATTERN = new RegExp(
   'i',
 );
 
-// Matches the query form keyword after optional PREFIX/BASE preamble.
-// `stripLiteralsAndComments` blanks IRI bodies (and the surrounding `<>`)
-// to spaces first, so this accepts both newline-separated and inline
-// declarations, e.g. `PREFIX ex: <...> SELECT`.
+// CodeQL alert #65 (js/redos) — the previous single-shot regex
+// `^\s*(?:(?:PREFIX\s+[^\s:]*:\s*)|(?:BASE\s+))*\s*(SELECT|...)\b/i`
+// has nested `*` quantifiers around `\s+` runs and the `[^\s:]*` label.
+// V8's backtracking NFA explores polynomially-many states on adversarial
+// preambles like `PREFIX a: PREFIX b: ... PREFIX z: nothing` (no terminal
+// query form). Because this regex runs on operator-supplied SPARQL
+// arriving over HTTP, the exposure is a real CPU-DoS vector.
 //
-// The prefix LABEL is matched permissively (`[^\s:]*` — any run of
-// non-whitespace, non-colon chars, including the empty default prefix
-// `PREFIX : <...>`). The previous `[A-Za-z][A-Za-z0-9_-]*` charset was
-// stricter than SPARQL's `PN_PREFIX` grammar and rejected legal labels
-// containing dots (`foaf.core:`) or non-ASCII characters, even on
-// otherwise read-only queries. The label charset is irrelevant to the
-// read-only safety decision — that is enforced separately by anchoring on
-// the SELECT/CONSTRUCT/ASK/DESCRIBE form keyword and by `MUTATING_PATTERN`.
-const READ_ONLY_FORMS = /^\s*(?:(?:PREFIX\s+[^\s:]*:\s*)|(?:BASE\s+))*\s*(SELECT|CONSTRUCT|ASK|DESCRIBE)\b/i;
+// The replacement scans the stripped query as a bounded state machine:
+//   1. consume one `PREFIX <label>:` or `BASE` declaration at a time
+//      via a small ANCHORED regex (no nested quantifiers — linear in
+//      the prefix length),
+//   2. then match the terminal query form with a separate anchored
+//      regex.
+//
+// Each individual regex has no nested quantifier and can backtrack at
+// most O(len) per failed match. Each successful preamble match consumes
+// bytes from the cursor, so total cost is O(n) where n = stripped length,
+// regardless of adversarial input shape.
+//
+// `stripLiteralsAndComments` runs upstream — it blanks IRI bodies and
+// comments to whitespace, so the preamble decls always end at `:` and
+// never need to skip across IRI angles inside this scanner.
+
+// Each anchored regex matches at most ONE declaration's KEYWORD —
+// the trailing IRI body is already blanked to whitespace by
+// `stripLiteralsAndComments` upstream, so the next iteration's `\s*`
+// consumes it transparently. `\s+` and `\s*` inside these are NOT
+// nested under another quantifier, so they cannot drive polynomial
+// backtracking. `[^\s:]*` is greedy but terminates at `:` which is
+// required to be present immediately after — failed matches are
+// O(label length), single-shot.
+const PREFIX_DECL = /^\s*PREFIX\s+[^\s:]*:/i;
+const BASE_DECL = /^\s*BASE\b/i;
+const QUERY_FORM_AT_START = /^\s*(SELECT|CONSTRUCT|ASK|DESCRIBE)\b/i;
 
 /** SPARQL query form — enough to shape a `QueryResult` correctly. */
 export type SparqlQueryForm = 'SELECT' | 'CONSTRUCT' | 'ASK' | 'DESCRIBE' | 'UNKNOWN';
@@ -64,15 +85,44 @@ export type SparqlQueryForm = 'SELECT' | 'CONSTRUCT' | 'ASK' | 'DESCRIBE' | 'UNK
  * an empty legitimate response, without breaking downstream callers
  * that branch on the presence of `quads`.
  */
-export function detectSparqlQueryForm(sparql: string): SparqlQueryForm {
-  const stripped = stripLiteralsAndComments(sparql);
-  const m = READ_ONLY_FORMS.exec(stripped);
-  if (!m) return 'UNKNOWN';
-  const kw = m[1].toUpperCase();
+/**
+ * Linear, ReDoS-safe replacement for the legacy `READ_ONLY_FORMS`
+ * regex match. Returns the form keyword that appears immediately after
+ * any PREFIX/BASE preamble, or `null` if the input is not a recognised
+ * read-only query.
+ *
+ * Total work is O(n) in the stripped-input length, regardless of how
+ * many decoy preamble decls an adversary packs in. No backtracking
+ * explosion possible because every successful preamble match advances
+ * the cursor.
+ */
+function scanReadOnlyForm(stripped: string): SparqlQueryForm {
+  let cursor = stripped;
+  while (true) {
+    const prefixHit = PREFIX_DECL.exec(cursor);
+    if (prefixHit) {
+      cursor = cursor.slice(prefixHit[0].length);
+      continue;
+    }
+    const baseHit = BASE_DECL.exec(cursor);
+    if (baseHit) {
+      cursor = cursor.slice(baseHit[0].length);
+      continue;
+    }
+    break;
+  }
+  const formHit = QUERY_FORM_AT_START.exec(cursor);
+  if (!formHit) return 'UNKNOWN';
+  const kw = formHit[1].toUpperCase();
   if (kw === 'SELECT' || kw === 'CONSTRUCT' || kw === 'ASK' || kw === 'DESCRIBE') {
     return kw;
   }
   return 'UNKNOWN';
+}
+
+export function detectSparqlQueryForm(sparql: string): SparqlQueryForm {
+  const stripped = stripLiteralsAndComments(sparql);
+  return scanReadOnlyForm(stripped);
 }
 
 /**
@@ -239,7 +289,7 @@ export interface SparqlGuardResult {
 export function validateReadOnlySparql(sparql: string): SparqlGuardResult {
   const stripped = stripLiteralsAndComments(sparql);
 
-  if (!READ_ONLY_FORMS.test(stripped)) {
+  if (scanReadOnlyForm(stripped) === 'UNKNOWN') {
     return {
       safe: false,
       reason: `Query must start with SELECT, CONSTRUCT, ASK, or DESCRIBE. ` +

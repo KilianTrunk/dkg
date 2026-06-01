@@ -9,15 +9,15 @@
 // PR-2 turns the no-peerId branch into a soft success: we durably
 // remember the package bytes in `pendingSenderKeyByAgent` (keyed by
 // lowercased recipientAgentAddress) and return success up the loop.
-// A subsequent `connection:open` event for the missing recipient
-// drives `drainPendingSenderKeyForPeer`, which resolves the peer's
-// agent address and replays each queued package via
-// `messenger.sendReliable`.
+// A subsequent `connection:open` event or later publish retry drives
+// queued-package drain and replays each queued package via
+// `messenger.sendReliable` once a peerId is known.
 //
 // Three contracts pinned here:
 //   1. no-peerId no longer throws (publish proceeds; row enqueued).
 //   2. drain replays the queued package once we know the peerId,
-//      and removes the row when the messenger confirms delivery.
+//      either through reconnect or later recipient resolution, and
+//      removes the row when the messenger confirms delivery.
 //   3. enqueuing a newer epoch for the same (sender, recipient)
 //      evicts older epochs — they're superseded by definition.
 
@@ -32,6 +32,7 @@ import {
   encodeSwmSenderKeyPackageAck,
   generateWorkspaceRecipientEncryptionKey,
   type OperationContext,
+  type SwmSenderKeyPackageAckReasonCode,
 } from '@origintrail-official/dkg-core';
 import {
   DKGAgent,
@@ -67,6 +68,7 @@ interface PendingInternals {
     ctx: OperationContext;
   }): Promise<unknown>;
   drainPendingSenderKeyForPeer(peerId: string): Promise<number>;
+  drainPendingSenderKeyForRecipients(recipients: readonly FakeRecipient[], ctx?: OperationContext): Promise<number>;
 }
 
 interface FakeRecipient {
@@ -117,12 +119,17 @@ function installStubDiscovery(
   };
 }
 
-function senderKeyAck(accepted: boolean, reason?: string): Uint8Array {
+function senderKeyAck(
+  accepted: boolean,
+  reason?: string,
+  reasonCode?: SwmSenderKeyPackageAckReasonCode,
+): Uint8Array {
   return encodeSwmSenderKeyPackageAck({
     version: SWM_SENDER_KEY_PACKAGE_VERSION,
     type: SWM_SENDER_KEY_PACKAGE_ACK_TYPE,
     accepted,
     reason,
+    reasonCode,
   });
 }
 
@@ -231,6 +238,49 @@ describe('createAndDistributeSwmSenderKeyEpoch: missing-peerId soft success', ()
     expect(internals.pendingSenderKeyByAgent.size).toBe(0);
   });
 
+  it('retries pending packages during later publishes without waiting for reconnect', async () => {
+    const boot = await bootAgent();
+    agent = boot.agent;
+    const internals = boot.internals;
+
+    const sendCalls: { peerId: string; payload: Uint8Array }[] = [];
+    installStubMessenger(internals, async (peerId, _protocolId, payload) => {
+      sendCalls.push({ peerId, payload });
+      return { delivered: true, response: senderKeyAck(true), attempts: 1, messageId: 'm-publish-drain' };
+    });
+
+    const recipient = makeFakeRecipient();
+    const sender = agentFromPrivateKey(
+      ethers.Wallet.createRandom().privateKey,
+      'sender',
+    ) as AgentKeyRecord & { privateKey: string };
+
+    await internals.createAndDistributeSwmSenderKeyEpoch({
+      contextGraphId: 'test-cg/publish-drain',
+      sender,
+      recipients: [recipient],
+      membershipHash: 'sha256:publish-drain',
+      ctx: { operationId: 'test-op', operationName: 'share' },
+    });
+
+    expect(sendCalls).toHaveLength(0);
+    expect(internals.pendingSenderKeyByAgent.size).toBe(1);
+
+    const reachableRecipient: FakeRecipient = {
+      ...recipient,
+      peerId: '12D3KooWAlreadyConnectedPublishDrain',
+    };
+    const drained = await internals.drainPendingSenderKeyForRecipients(
+      [reachableRecipient],
+      { operationId: 'test-op', operationName: 'share' },
+    );
+
+    expect(drained).toBe(1);
+    expect(sendCalls).toHaveLength(1);
+    expect(sendCalls[0].peerId).toBe(reachableRecipient.peerId);
+    expect(internals.pendingSenderKeyByAgent.size).toBe(0);
+  });
+
   it('keeps the row queued when messenger soft-queues (delivered=false)', async () => {
     // Verifies that delivered=false leaves the row in place for the next
     // drain attempt — the connection happened but the recipient still
@@ -276,7 +326,7 @@ describe('createAndDistributeSwmSenderKeyEpoch: missing-peerId soft success', ()
     expect(internals.pendingSenderKeyByAgent.size).toBe(1);
   });
 
-  it('soft-queues delivered retryable rejections from stale remote membership or keys', async () => {
+  it('soft-queues delivered rejections only when ACK reasonCode is stale-target', async () => {
     const boot = await bootAgent();
     agent = boot.agent;
     const internals = boot.internals;
@@ -285,45 +335,87 @@ describe('createAndDistributeSwmSenderKeyEpoch: missing-peerId soft success', ()
       ethers.Wallet.createRandom().privateKey,
       'sender',
     ) as AgentKeyRecord & { privateKey: string };
-    const staleGate = makeFakeRecipient({ peerId: '12D3KooWStaleGateRetryablePeer' });
-    const staleKey = makeFakeRecipient({ peerId: '12D3KooWStaleKeyRetryablePeer' });
-    const noReason = makeFakeRecipient({ peerId: '12D3KooWNoReasonRetryablePeer' });
+    const staleTarget = makeFakeRecipient({ peerId: '12D3KooWStaleTargetRetryablePeer' });
 
-    const reasonByPeer = new Map<string, string | undefined>([
-      [
-        staleGate.peerId!,
-        `Sender agent ${sender.agentAddress} is not allowed for context graph "test-cg/joined"`,
-      ],
-      [
-        staleKey.peerId!,
-        `No local X25519 private key for DKG agent ${staleKey.agentAddress} key ${staleKey.recipientKeyId}`,
-      ],
-      [noReason.peerId!, undefined],
-    ]);
     installStubMessenger(internals, async (peerId): Promise<ReliableSendResult> => ({
       delivered: true,
-      response: senderKeyAck(false, reasonByPeer.get(peerId)),
+      response: senderKeyAck(
+        false,
+        `No local X25519 private key for DKG agent ${staleTarget.agentAddress} key ${staleTarget.recipientKeyId}`,
+        'stale-target',
+      ),
       attempts: 1,
-      messageId: `m-retryable-${peerId.slice(-6)}`,
+      messageId: `m-stale-target-${peerId.slice(-6)}`,
     }));
 
     await expect(
       internals.createAndDistributeSwmSenderKeyEpoch({
         contextGraphId: 'test-cg/joined',
         sender,
-        recipients: [staleGate, staleKey, noReason],
-        membershipHash: 'sha256:joined-retryable-rejections',
+        recipients: [staleTarget],
+        membershipHash: 'sha256:joined-stale-target-rejection',
         ctx: { operationId: 'test-op', operationName: 'share' },
       }),
     ).resolves.toBeDefined();
 
-    expect(internals.pendingSenderKeyByAgent.size).toBe(3);
-    for (const recipient of [staleGate, staleKey, noReason]) {
-      const queue = internals.pendingSenderKeyByAgent.get(recipient.agentAddress.toLowerCase());
-      expect(queue).toBeDefined();
-      expect(queue!).toHaveLength(1);
-      expect(queue![0].recipientKeyId).toBe(recipient.recipientKeyId);
-    }
+    expect(internals.pendingSenderKeyByAgent.size).toBe(1);
+    const queue = internals.pendingSenderKeyByAgent.get(staleTarget.agentAddress.toLowerCase());
+    expect(queue).toBeDefined();
+    expect(queue!).toHaveLength(1);
+    expect(queue![0].recipientKeyId).toBe(staleTarget.recipientKeyId);
+  });
+
+  it('keeps auth denials, active-key loss, and legacy unknown ACKs fatal', async () => {
+    const boot = await bootAgent();
+    agent = boot.agent;
+    const internals = boot.internals;
+
+    const sender = agentFromPrivateKey(
+      ethers.Wallet.createRandom().privateKey,
+      'sender',
+    ) as AgentKeyRecord & { privateKey: string };
+    const staleGate = makeFakeRecipient({ peerId: '12D3KooWStaleGateFatalPeer' });
+    const activeKeyMissing = makeFakeRecipient({ peerId: '12D3KooWActiveMissingFatalPeer' });
+    const noReason = makeFakeRecipient({ peerId: '12D3KooWNoReasonFatalPeer' });
+
+    const rejectionByPeer = new Map<string, { reason?: string; reasonCode?: SwmSenderKeyPackageAckReasonCode }>([
+      [
+        staleGate.peerId!,
+        {
+          reason: `Sender agent ${sender.agentAddress} is not allowed for context graph "test-cg/joined"`,
+          reasonCode: 'sender-not-allowed',
+        },
+      ],
+      [
+        activeKeyMissing.peerId!,
+        {
+          reason: `No local X25519 private key for DKG agent ${activeKeyMissing.agentAddress} key ${activeKeyMissing.recipientKeyId}`,
+          reasonCode: 'active-private-key-missing',
+        },
+      ],
+      [noReason.peerId!, {}],
+    ]);
+    installStubMessenger(internals, async (peerId): Promise<ReliableSendResult> => {
+      const rejection = rejectionByPeer.get(peerId);
+      return {
+        delivered: true,
+        response: senderKeyAck(false, rejection?.reason, rejection?.reasonCode),
+        attempts: 1,
+        messageId: `m-fatal-${peerId.slice(-6)}`,
+      };
+    });
+
+    await expect(
+      internals.createAndDistributeSwmSenderKeyEpoch({
+        contextGraphId: 'test-cg/joined',
+        sender,
+        recipients: [staleGate, activeKeyMissing, noReason],
+        membershipHash: 'sha256:joined-fatal-rejections',
+        ctx: { operationId: 'test-op', operationName: 'share' },
+      }),
+    ).rejects.toThrow('SWM Sender Key setup rejected by 3 agent(s)');
+
+    expect(internals.pendingSenderKeyByAgent.size).toBe(0);
   });
 
   it('keeps retryable delivered rejections queued during pending drain', async () => {
@@ -359,7 +451,8 @@ describe('createAndDistributeSwmSenderKeyEpoch: missing-peerId soft success', ()
       delivered: true,
       response: senderKeyAck(
         false,
-        `Sender agent ${sender.agentAddress} is not allowed for context graph "test-cg/drain-retryable"`,
+        `No local X25519 private key for DKG agent ${recipient.agentAddress} key ${recipient.recipientKeyId}`,
+        'stale-target',
       ),
       attempts: 1,
       messageId: 'm-drain-retryable',

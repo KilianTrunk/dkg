@@ -137,6 +137,7 @@ export {
 export {
   type SwmSenderKeyPackageMsg,
   type SwmSenderKeyPackageAckMsg,
+  type SwmSenderKeyPackageAckReasonCode,
   type SwmSenderKeyMessageMsg,
   type SwmSenderKeySecretMsg,
   type SwmSenderKeyMessageAADFields,

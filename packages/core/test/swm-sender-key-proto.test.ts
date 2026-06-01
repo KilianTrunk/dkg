@@ -85,6 +85,7 @@ describe('SWM Sender Key proto', () => {
       type: SWM_SENDER_KEY_PACKAGE_ACK_TYPE,
       accepted: false,
       reason: 'missing key',
+      reasonCode: 'stale-target',
       contextGraphId: pkg.contextGraphId,
       subGraphName: pkg.subGraphName,
       senderAgentAddress: pkg.senderAgentAddress,
@@ -94,6 +95,7 @@ describe('SWM Sender Key proto', () => {
     }));
     expect(ack.accepted).toBe(false);
     expect(ack.reason).toBe('missing key');
+    expect(ack.reasonCode).toBe('stale-target');
     expect(ack.type).toBe(SWM_SENDER_KEY_PACKAGE_ACK_TYPE);
   });
 

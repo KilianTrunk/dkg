@@ -90,6 +90,7 @@ const DURATION_PROBE_TIMEOUT_MS = 2000;
  */
 const MAX_PROBE_AGE_MS = 30_000;
 const RPC_READ_STALL_TIMEOUT_MS = 4_000;
+const RPC_TRANSACTION_POPULATION_ATTEMPT_TIMEOUT_MS = 10_000;
 const RPC_BROADCAST_ATTEMPT_TIMEOUT_MS = 10_000;
 const RPC_RECEIPT_ATTEMPT_TIMEOUT_MS = 5_000;
 const RPC_RECEIPT_POLL_INTERVAL_MS = 2_000;
@@ -998,9 +999,35 @@ export class EVMChainAdapter implements ChainAdapter {
     signer: Wallet,
     label: string,
   ): Promise<ethers.TransactionReceipt> {
-    const connected = contract.connect(signer) as any;
-    const populated = await connected[method].populateTransaction(...args);
-    return this.sendPopulatedTransaction(signer, populated, label);
+    let lastRetryable: unknown;
+    for (let i = 0; i < this.providers.length; i += 1) {
+      const rpcSigner = signer.connect(this.providers[i]);
+      try {
+        const connected = contract.connect(rpcSigner) as any;
+        const populated = await withTimeout(
+          connected[method].populateTransaction(...args),
+          RPC_TRANSACTION_POPULATION_ATTEMPT_TIMEOUT_MS,
+          `${label} transaction population via RPC #${i + 1}`,
+        );
+        const { signedTx, txHash } = await withTimeout(
+          this.signPopulatedTransaction(rpcSigner, populated),
+          RPC_TRANSACTION_POPULATION_ATTEMPT_TIMEOUT_MS,
+          `${label} transaction signing via RPC #${i + 1}`,
+        );
+        return this.sendSignedTransactionAndWait(signedTx, txHash, label);
+      } catch (err) {
+        if (!isRetryableRpcError(err)) throw err;
+        lastRetryable = err;
+      }
+    }
+    const err = new Error(
+      `${label} transaction preparation failed on all configured RPC endpoints ` +
+      `(${this.rpcUrls.join(', ')}): ${errorMessage(lastRetryable)}`,
+      { cause: lastRetryable },
+    );
+    (err as any).code = 'RPC_TRANSACTION_PREPARATION_FAILED';
+    (err as any).rpcUrls = [...this.rpcUrls];
+    throw err;
   }
 
   /**

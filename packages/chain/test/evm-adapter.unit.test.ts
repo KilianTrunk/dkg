@@ -244,6 +244,53 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
     expect(backup.getTransactionReceipt).not.toHaveBeenCalled();
   });
 
+  it('tries backup RPC when contract transaction population is rate-limited', async () => {
+    const a = new EVMChainAdapter(minimalConfig({
+      rpcUrl: 'https://primary.example',
+      rpcUrls: ['https://backup.example'],
+    }));
+    const primaryProvider = { name: 'primary' } as any;
+    const backupProvider = { name: 'backup' } as any;
+    const signer = new ethers.Wallet(DEPLOYER_PK, primaryProvider);
+    const receipt = { hash: '0xabc', blockNumber: 12, status: 1, logs: [] };
+    const populated = { to: '0x0000000000000000000000000000000000000001', data: '0x1234' };
+    const populateTransaction = vi.fn()
+      .mockImplementationOnce(async () => {
+        const err = new Error('429 too many requests');
+        (err as any).status = 429;
+        throw err;
+      })
+      .mockResolvedValueOnce(populated);
+    const runners: any[] = [];
+    const contract = {
+      connect: vi.fn((runner: any) => {
+        runners.push(runner);
+        return { createContextGraph: { populateTransaction } };
+      }),
+    };
+    (a as any).providers = [primaryProvider, backupProvider];
+    (a as any).signPopulatedTransaction = vi.fn(async () => ({
+      signedTx: '0xdeadbeef',
+      txHash: receipt.hash,
+    }));
+    (a as any).sendSignedTransactionAndWait = vi.fn(async () => receipt);
+
+    await expect((a as any).sendContractTransaction(
+      contract,
+      'createContextGraph',
+      [],
+      signer,
+      'create on-chain context graph',
+    )).resolves.toBe(receipt);
+
+    expect(populateTransaction).toHaveBeenCalledTimes(2);
+    expect(runners.map((runner) => runner.provider)).toEqual([primaryProvider, backupProvider]);
+    expect((a as any).signPopulatedTransaction).toHaveBeenCalledWith(
+      runners[1],
+      populated,
+    );
+  });
+
   it('broadcasts the exact same signed raw transaction to backup after primary send failure', async () => {
     const a = new EVMChainAdapter(minimalConfig({
       rpcUrl: 'https://primary.example',
@@ -1674,4 +1721,3 @@ describe('ensureV10ApproveTrac — call-site invariants (publish vs update)', ()
     expect(sendSpy).not.toHaveBeenCalled();
   });
 });
-

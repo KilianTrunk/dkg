@@ -38,6 +38,7 @@ import {
   encodeWorkspaceEncryptionKey,
   workspaceAgentEncryptionKeyId,
   SWM_SENDER_KEY_PACKAGE_ACK_TYPE,
+  SWM_SENDER_KEY_PACKAGE_ACK_REASON_CODES,
   SWM_SENDER_KEY_PACKAGE_VERSION,
   computeSwmSenderKeyMembershipHash,
   computeSwmSenderKeyPackageAAD,
@@ -6126,13 +6127,7 @@ export class DKGAgent {
     reasonCode: SwmSenderKeyPackageAckReasonCode | undefined,
   ): boolean {
     if (!reasonCode) return true;
-    return (
-      reasonCode === 'stale-target' ||
-      reasonCode === 'active-private-key-missing' ||
-      reasonCode === 'revoked-key' ||
-      reasonCode === 'bad-signature' ||
-      reasonCode === 'unknown'
-    );
+    return (SWM_SENDER_KEY_PACKAGE_ACK_REASON_CODES as readonly string[]).includes(reasonCode);
   }
 
   private isRetryableSwmSenderKeySetupAckReason(
@@ -6208,16 +6203,18 @@ export class DKGAgent {
         try {
           ack = decodeSwmSenderKeyPackageAck(sendResult.response);
         } catch {
-          // Malformed/legacy ACK: terminal for this queued package, but
-          // not counted as successfully drained.
+          // Malformed/legacy ACK: no positive acceptance yet. Keep the
+          // row queued so a mixed-version rollout cannot strand the recipient.
+          remaining.push(entry);
           continue;
         }
         if (
           ack.version !== SWM_SENDER_KEY_PACKAGE_VERSION ||
           ack.type !== SWM_SENDER_KEY_PACKAGE_ACK_TYPE
         ) {
-          // Malformed/legacy ACK: terminal for this queued package, but
-          // not counted as successfully drained.
+          // Malformed/legacy ACK: no positive acceptance yet. Keep the
+          // row queued so a mixed-version rollout cannot strand the recipient.
+          remaining.push(entry);
           continue;
         }
         if (ack.accepted) {

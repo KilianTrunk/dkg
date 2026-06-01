@@ -161,5 +161,8 @@ function encodeBytes(bytes: Uint8Array): string {
 }
 
 function decodeBytes(value: string): Uint8Array {
+  if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) {
+    throw new Error('Invalid Sender Key state: packageBytes must be strict base64');
+  }
   return new Uint8Array(Buffer.from(value, 'base64'));
 }

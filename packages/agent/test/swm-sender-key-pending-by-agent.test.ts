@@ -430,7 +430,15 @@ describe('createAndDistributeSwmSenderKeyEpoch: missing-peerId soft success', ()
 
     const path = join(dataDir, 'swm-sender-keys.json');
     const state = JSON.parse(await readFile(path, 'utf-8')) as Record<string, unknown>;
-    state.pending = [{ recipientAgentAddress: 7 }];
+    state.pending = [{
+      senderAgentAddress: sender.agentAddress,
+      recipientAgentAddress: recipient.agentAddress,
+      recipientKeyId: recipient.recipientKeyId,
+      epochId: sendState.epochId,
+      contextGraphId: sendState.contextGraphId,
+      packageBytes: '%%%not-base64%%%',
+      createdAtMs: Date.now(),
+    }];
     await writeFile(path, JSON.stringify(state, null, 2), { mode: 0o600 });
 
     internals.swmSenderKeySendStates.clear();
@@ -613,7 +621,7 @@ describe('createAndDistributeSwmSenderKeyEpoch: missing-peerId soft success', ()
     expect(internals.pendingSenderKeyByAgent.size).toBe(0);
   });
 
-  it('queues convergence-style negative ACKs for later retry', async () => {
+  it('queues future and legacy retryable negative ACKs for later retry', async () => {
     const boot = await bootAgent();
     agent = boot.agent;
     const internals = boot.internals;
@@ -622,42 +630,10 @@ describe('createAndDistributeSwmSenderKeyEpoch: missing-peerId soft success', ()
       ethers.Wallet.createRandom().privateKey,
       'sender',
     ) as AgentKeyRecord & { privateKey: string };
-    const staleGate = makeFakeRecipient({ peerId: '12D3KooWStaleGateRetryPeer' });
-    const notAgentGated = makeFakeRecipient({ peerId: '12D3KooWNotGatedRetryPeer' });
-    const recipientNotLocal = makeFakeRecipient({ peerId: '12D3KooWNotLocalRetryPeer' });
-    const recipientNotAllowed = makeFakeRecipient({ peerId: '12D3KooWRecipGateRetryPeer' });
     const futureReason = makeFakeRecipient({ peerId: '12D3KooWFutureReasonRetryPeer' });
     const legacyRetryableNoCode = makeFakeRecipient({ peerId: '12D3KooWLegacyRetryablePeer' });
 
     const rejectionByPeer = new Map<string, { reason?: string; reasonCode?: SwmSenderKeyPackageAckReasonCode }>([
-      [
-        staleGate.peerId!,
-        {
-          reason: `Sender agent ${sender.agentAddress} is not allowed for context graph "test-cg/joined"`,
-          reasonCode: 'sender-not-allowed',
-        },
-      ],
-      [
-        notAgentGated.peerId!,
-        {
-          reason: 'Context graph "test-cg/joined" is not DKG-agent gated',
-          reasonCode: 'not-agent-gated',
-        },
-      ],
-      [
-        recipientNotLocal.peerId!,
-        {
-          reason: `Recipient agent ${recipientNotLocal.agentAddress} is not local to this node`,
-          reasonCode: 'recipient-not-local',
-        },
-      ],
-      [
-        recipientNotAllowed.peerId!,
-        {
-          reason: `Recipient agent ${recipientNotAllowed.agentAddress} is not allowed for context graph "test-cg/joined"`,
-          reasonCode: 'recipient-not-allowed',
-        },
-      ],
       [
         futureReason.peerId!,
         {
@@ -686,21 +662,21 @@ describe('createAndDistributeSwmSenderKeyEpoch: missing-peerId soft success', ()
       internals.createAndDistributeSwmSenderKeyEpoch({
         contextGraphId: 'test-cg/joined',
         sender,
-        recipients: [staleGate, notAgentGated, recipientNotLocal, recipientNotAllowed, futureReason, legacyRetryableNoCode],
+        recipients: [futureReason, legacyRetryableNoCode],
         membershipHash: 'sha256:joined-transient-rejections',
         ctx: { operationId: 'test-op', operationName: 'share' },
       }),
     ).resolves.toBeTruthy();
 
-    expect(internals.pendingSenderKeyByAgent.size).toBe(6);
-    for (const recipient of [staleGate, notAgentGated, recipientNotLocal, recipientNotAllowed, futureReason, legacyRetryableNoCode]) {
+    expect(internals.pendingSenderKeyByAgent.size).toBe(2);
+    for (const recipient of [futureReason, legacyRetryableNoCode]) {
       const queue = internals.pendingSenderKeyByAgent.get(recipient.agentAddress.toLowerCase());
       expect(queue).toHaveLength(1);
       expect(queue![0].recipientKeyId).toBe(recipient.recipientKeyId);
     }
   });
 
-  it('keeps active-key loss, explicit unknown, and legacy code-less ACKs fatal', async () => {
+  it('keeps structured known failures and legacy code-less hard failures fatal', async () => {
     const boot = await bootAgent();
     agent = boot.agent;
     const internals = boot.internals;
@@ -710,6 +686,10 @@ describe('createAndDistributeSwmSenderKeyEpoch: missing-peerId soft success', ()
       'sender',
     ) as AgentKeyRecord & { privateKey: string };
     const activeKeyMissing = makeFakeRecipient({ peerId: '12D3KooWActiveMissingFatalPeer' });
+    const senderNotAllowed = makeFakeRecipient({ peerId: '12D3KooWSenderNotAllowedFatalPeer' });
+    const recipientNotAllowed = makeFakeRecipient({ peerId: '12D3KooWRecipientNotAllowedFatalPeer' });
+    const recipientNotLocal = makeFakeRecipient({ peerId: '12D3KooWRecipientNotLocalFatalPeer' });
+    const notAgentGated = makeFakeRecipient({ peerId: '12D3KooWNotAgentGatedFatalPeer' });
     const unknownReason = makeFakeRecipient({ peerId: '12D3KooWUnknownFatalPeer' });
     const legacyNoCode = makeFakeRecipient({ peerId: '12D3KooWLegacyNoCodeFatalPeer' });
 
@@ -719,6 +699,34 @@ describe('createAndDistributeSwmSenderKeyEpoch: missing-peerId soft success', ()
         {
           reason: `No local X25519 private key for DKG agent ${activeKeyMissing.agentAddress} key ${activeKeyMissing.recipientKeyId}`,
           reasonCode: 'active-private-key-missing',
+        },
+      ],
+      [
+        senderNotAllowed.peerId!,
+        {
+          reason: `Sender agent ${sender.agentAddress} is not allowed for context graph "test-cg/joined"`,
+          reasonCode: 'sender-not-allowed',
+        },
+      ],
+      [
+        recipientNotAllowed.peerId!,
+        {
+          reason: `Recipient agent ${recipientNotAllowed.agentAddress} is not allowed for context graph "test-cg/joined"`,
+          reasonCode: 'recipient-not-allowed',
+        },
+      ],
+      [
+        recipientNotLocal.peerId!,
+        {
+          reason: `Recipient agent ${recipientNotLocal.agentAddress} is not local to this node`,
+          reasonCode: 'recipient-not-local',
+        },
+      ],
+      [
+        notAgentGated.peerId!,
+        {
+          reason: 'Context graph "test-cg/joined" is not DKG-agent gated',
+          reasonCode: 'not-agent-gated',
         },
       ],
       [
@@ -749,16 +757,24 @@ describe('createAndDistributeSwmSenderKeyEpoch: missing-peerId soft success', ()
       internals.createAndDistributeSwmSenderKeyEpoch({
         contextGraphId: 'test-cg/joined',
         sender,
-        recipients: [activeKeyMissing, unknownReason, legacyNoCode],
+        recipients: [
+          activeKeyMissing,
+          senderNotAllowed,
+          recipientNotAllowed,
+          recipientNotLocal,
+          notAgentGated,
+          unknownReason,
+          legacyNoCode,
+        ],
         membershipHash: 'sha256:joined-terminal-rejections',
         ctx: { operationId: 'test-op', operationName: 'share' },
       }),
-    ).rejects.toThrow('SWM Sender Key setup rejected by 3 agent(s)');
+    ).rejects.toThrow('SWM Sender Key setup rejected by 7 agent(s)');
 
     expect(internals.pendingSenderKeyByAgent.size).toBe(0);
   });
 
-  it('keeps convergence-style delivered rejections queued during pending drain', async () => {
+  it('keeps future delivered rejections queued during pending drain', async () => {
     const boot = await bootAgent();
     agent = boot.agent;
     const internals = boot.internals;
@@ -785,8 +801,8 @@ describe('createAndDistributeSwmSenderKeyEpoch: missing-peerId soft success', ()
       delivered: true,
       response: senderKeyAck(
         false,
-        `Sender agent ${sender.agentAddress} is not allowed for context graph "test-cg/drain-transient-reject"`,
-        'sender-not-allowed',
+        'receiver returned a future retryable reason code',
+        'future-retryable-reason',
       ),
       attempts: 1,
       messageId: 'm-drain-transient-reject',
@@ -923,7 +939,7 @@ describe('createAndDistributeSwmSenderKeyEpoch: missing-peerId soft success', ()
     expect(internals.pendingSenderKeyByAgent.size).toBe(0);
   });
 
-  it('removes malformed delivered ACKs during pending drain without counting them as drained', async () => {
+  it('keeps malformed delivered ACKs queued during pending drain', async () => {
     const boot = await bootAgent();
     agent = boot.agent;
     const internals = boot.internals;
@@ -961,7 +977,10 @@ describe('createAndDistributeSwmSenderKeyEpoch: missing-peerId soft success', ()
 
     const drained = await internals.drainPendingSenderKeyForPeer('12D3KooWDrainMalformedAckPeer');
     expect(drained).toBe(0);
-    expect(internals.pendingSenderKeyByAgent.size).toBe(0);
+    expect(internals.pendingSenderKeyByAgent.size).toBe(1);
+    expect(
+      internals.pendingSenderKeyByAgent.get(recipient.agentAddress.toLowerCase())?.[0].recipientKeyId,
+    ).toBe(recipient.recipientKeyId);
   });
 
   it('supersedes older epochs for the same (sender, recipient) pair', async () => {

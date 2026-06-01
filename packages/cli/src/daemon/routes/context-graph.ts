@@ -352,8 +352,21 @@ function classifyRegisterContextGraphError(err: unknown): { status: number; body
   const code = err && typeof err === 'object' && 'code' in err
     ? String((err as { code?: unknown }).code ?? '')
     : '';
+  const txHash = err && typeof err === 'object' && 'txHash' in err
+    ? String((err as { txHash?: unknown }).txHash ?? '')
+    : '';
   if (code === 'RPC_ENDPOINTS_EXHAUSTED') {
     return { status: 503, body: { error: msg || 'Configured chain RPC endpoints were exhausted.', code } };
+  }
+  if (code === 'TIMEOUT') {
+    return {
+      status: 504,
+      body: {
+        error: msg || 'Context graph registration timed out.',
+        code,
+        ...(txHash ? { txHash } : {}),
+      },
+    };
   }
   if (msg.includes('already registered')) return { status: 409, body: { error: msg } };
   if (msg.includes('does not exist')) return { status: 404, body: { error: msg } };

@@ -62,6 +62,7 @@ type StubMessenger = {
     peerId: string,
     protocolId: string,
     payload: Uint8Array,
+    opts?: { messageId?: string },
   ) => Promise<ReliableSendResult>;
 };
 
@@ -498,6 +499,61 @@ describe('createAndDistributeSwmSenderKeyEpoch: missing-peerId soft success', ()
     expect(internals.pendingSenderKeyByAgent.size).toBe(0);
   });
 
+  it('uses a stable messageId for repeated pending retry sends', async () => {
+    const boot = await bootAgent();
+    agent = boot.agent;
+    const internals = boot.internals;
+
+    installStubMessenger(internals, async () => {
+      throw new Error('initial no-peerId branch must not call sendReliable');
+    });
+
+    const recipient = makeFakeRecipient();
+    const sender = agentFromPrivateKey(
+      ethers.Wallet.createRandom().privateKey,
+      'sender',
+    ) as AgentKeyRecord & { privateKey: string };
+
+    await internals.createAndDistributeSwmSenderKeyEpoch({
+      contextGraphId: 'test-cg/stable-message-id',
+      sender,
+      recipients: [recipient],
+      membershipHash: 'sha256:stable-message-id',
+      ctx: { operationId: 'test-op', operationName: 'share' },
+    });
+
+    const knownPeerId = '12D3KooWStableMessageIdPeer';
+    installStubDiscovery(internals, (peerId) => {
+      if (peerId !== knownPeerId) return null;
+      return {
+        agentUri: `did:dkg:agent:${recipient.agentAddress.toLowerCase()}`,
+        name: 'stable-message-id-target',
+        peerId,
+        agentAddress: recipient.agentAddress,
+      };
+    });
+
+    const messageIds: Array<string | undefined> = [];
+    installStubMessenger(internals, async (_peerId, _protocolId, _payload, opts) => {
+      messageIds.push(opts?.messageId);
+      return {
+        delivered: false,
+        queued: true,
+        attempts: 1,
+        messageId: opts?.messageId ?? 'missing-message-id',
+        error: 'recipient still offline',
+      };
+    });
+
+    expect(await internals.drainPendingSenderKeyForPeer(knownPeerId)).toBe(0);
+    expect(await internals.drainPendingSenderKeyForPeer(knownPeerId)).toBe(0);
+
+    expect(messageIds).toHaveLength(2);
+    expect(messageIds[0]).toMatch(/^swm-sender-key:[0-9a-f]{64}$/);
+    expect(messageIds[1]).toBe(messageIds[0]);
+    expect(internals.pendingSenderKeyByAgent.size).toBe(1);
+  });
+
   it('retries pending packages during later publishes without waiting for reconnect', async () => {
     const boot = await bootAgent();
     agent = boot.agent;
@@ -621,7 +677,7 @@ describe('createAndDistributeSwmSenderKeyEpoch: missing-peerId soft success', ()
     expect(internals.pendingSenderKeyByAgent.size).toBe(0);
   });
 
-  it('queues future and legacy retryable negative ACKs for later retry', async () => {
+  it('queues future negative ACKs for later retry', async () => {
     const boot = await bootAgent();
     agent = boot.agent;
     const internals = boot.internals;
@@ -631,7 +687,6 @@ describe('createAndDistributeSwmSenderKeyEpoch: missing-peerId soft success', ()
       'sender',
     ) as AgentKeyRecord & { privateKey: string };
     const futureReason = makeFakeRecipient({ peerId: '12D3KooWFutureReasonRetryPeer' });
-    const legacyRetryableNoCode = makeFakeRecipient({ peerId: '12D3KooWLegacyRetryablePeer' });
 
     const rejectionByPeer = new Map<string, { reason?: string; reasonCode?: SwmSenderKeyPackageAckReasonCode }>([
       [
@@ -639,12 +694,6 @@ describe('createAndDistributeSwmSenderKeyEpoch: missing-peerId soft success', ()
         {
           reason: 'newer receiver returned a retryable code this sender does not know yet',
           reasonCode: 'future-retryable-reason',
-        },
-      ],
-      [
-        legacyRetryableNoCode.peerId!,
-        {
-          reason: `Sender agent ${sender.agentAddress} is not allowed for context graph "test-cg/joined"`,
         },
       ],
     ]);
@@ -662,18 +711,16 @@ describe('createAndDistributeSwmSenderKeyEpoch: missing-peerId soft success', ()
       internals.createAndDistributeSwmSenderKeyEpoch({
         contextGraphId: 'test-cg/joined',
         sender,
-        recipients: [futureReason, legacyRetryableNoCode],
+        recipients: [futureReason],
         membershipHash: 'sha256:joined-transient-rejections',
         ctx: { operationId: 'test-op', operationName: 'share' },
       }),
     ).resolves.toBeTruthy();
 
-    expect(internals.pendingSenderKeyByAgent.size).toBe(2);
-    for (const recipient of [futureReason, legacyRetryableNoCode]) {
-      const queue = internals.pendingSenderKeyByAgent.get(recipient.agentAddress.toLowerCase());
-      expect(queue).toHaveLength(1);
-      expect(queue![0].recipientKeyId).toBe(recipient.recipientKeyId);
-    }
+    expect(internals.pendingSenderKeyByAgent.size).toBe(1);
+    const queue = internals.pendingSenderKeyByAgent.get(futureReason.agentAddress.toLowerCase());
+    expect(queue).toHaveLength(1);
+    expect(queue![0].recipientKeyId).toBe(futureReason.recipientKeyId);
   });
 
   it('keeps structured known failures and legacy code-less hard failures fatal', async () => {

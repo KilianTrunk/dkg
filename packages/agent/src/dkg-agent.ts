@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import {
   DKGNode, ProtocolRouter, GossipSubManager, TypedEventBus, DKGEvent,
   LibP2PNetwork, PeerResolver, StubNetworkStateRegistry,
@@ -5975,15 +5976,14 @@ export class DKGAgent {
           //
           // Delivery semantics (C2 integration-pass relaxation):
           //   • `delivered=true && ack.accepted=true` → success.
-          //   • `delivered=true && ack.accepted=false` with no reason code
-          //     and no retryable legacy reason text, or with a terminal
-          //     reason (`stale-target`, `active-private-key-missing`,
-          //     `revoked-key`, `bad-signature`, `unknown`)
+          //   • `delivered=true && ack.accepted=false` with no reason code,
+          //     or with a known terminal reason (`stale-target`,
+          //     `active-private-key-missing`, `revoked-key`,
+          //     `bad-signature`, `unknown`, ACL/config failures)
           //     → HARD failure: retrying the same package cannot help.
           //   • `delivered=true && ack.accepted=false` with a
-          //     non-terminal/future reason, or retryable legacy reason
-          //     text → SOFT success: keep it queued so a
-          //     later reconnect/publish can retry after remote view
+          //     non-terminal/future reason → SOFT success: keep it queued
+          //     so a later reconnect/publish can retry after remote view
           //     convergence.
           //   • `delivered=false` → SOFT success.
           //     The setup-package landed in the messenger's durable
@@ -6000,6 +6000,7 @@ export class DKGAgent {
             recipient.peerId,
             PROTOCOL_SWM_SENDER_KEY,
             packageBytes,
+            { messageId: this.swmSenderKeyPackageMessageId(packageBytes) },
           );
           if (!sendResult.delivered) {
             this.log.warn(
@@ -6023,7 +6024,7 @@ export class DKGAgent {
           }
           if (!ack.accepted) {
             const reason = ack.reason ?? 'unknown reason';
-            if (this.isRetryableSwmSenderKeySetupAckReason(ack.reasonCode, ack.reason)) {
+            if (this.isRetryableSwmSenderKeySetupAckReason(ack.reasonCode)) {
               this.enqueuePendingSenderKey({
                 senderAgentAddress: senderAgentAddress.toLowerCase(),
                 recipientAgentAddress: recipientAgentAddress.toLowerCase(),
@@ -6132,21 +6133,15 @@ export class DKGAgent {
 
   private isRetryableSwmSenderKeySetupAckReason(
     reasonCode: SwmSenderKeyPackageAckReasonCode | undefined,
-    reason: string | undefined,
   ): boolean {
     if (reasonCode) {
       return !this.isTerminalSwmSenderKeySetupAckReasonCode(reasonCode);
     }
-    return this.isRetryableLegacySwmSenderKeySetupAckReason(reason);
+    return false;
   }
 
-  private isRetryableLegacySwmSenderKeySetupAckReason(reason: string | undefined): boolean {
-    if (!reason) return false;
-    return (
-      reason.includes(' is not allowed for context graph "') ||
-      reason.includes(' is not DKG-agent gated') ||
-      reason.includes(' is not local to this node')
-    );
+  private swmSenderKeyPackageMessageId(packageBytes: Uint8Array): string {
+    return `swm-sender-key:${createHash('sha256').update(packageBytes).digest('hex')}`;
   }
 
   /**
@@ -6194,6 +6189,7 @@ export class DKGAgent {
           input.peerId,
           PROTOCOL_SWM_SENDER_KEY,
           entry.packageBytes,
+          { messageId: this.swmSenderKeyPackageMessageId(entry.packageBytes) },
         );
         if (!sendResult.delivered) {
           remaining.push(entry);
@@ -6219,7 +6215,7 @@ export class DKGAgent {
         }
         if (ack.accepted) {
           drained += 1;
-        } else if (this.isRetryableSwmSenderKeySetupAckReason(ack.reasonCode, ack.reason)) {
+        } else if (this.isRetryableSwmSenderKeySetupAckReason(ack.reasonCode)) {
           remaining.push(entry);
         } else {
           // Terminal rejection: keep it out of the queue, but do not

@@ -5990,14 +5990,40 @@ export class DKGAgent {
           const ack = decodeSwmSenderKeyPackageAck(sendResult.response);
           if (
             ack.version !== SWM_SENDER_KEY_PACKAGE_VERSION ||
-            ack.type !== SWM_SENDER_KEY_PACKAGE_ACK_TYPE ||
-            !ack.accepted
+            ack.type !== SWM_SENDER_KEY_PACKAGE_ACK_TYPE
           ) {
             return {
               kind: 'failure',
               agentAddress: recipientAgentAddress,
               keyId: recipient.recipientKeyId,
-              error: new Error(ack.reason ?? 'unknown reason'),
+              error: new Error(ack.reason ?? 'invalid Sender Key setup ACK'),
+            };
+          }
+          if (!ack.accepted) {
+            const reason = ack.reason ?? 'unknown reason';
+            if (this.isRetryableSwmSenderKeySetupRejection(reason)) {
+              this.enqueuePendingSenderKey({
+                senderAgentAddress: senderAgentAddress.toLowerCase(),
+                recipientAgentAddress: recipientAgentAddress.toLowerCase(),
+                recipientKeyId: recipient.recipientKeyId,
+                epochId: state.epochId,
+                contextGraphId: state.contextGraphId,
+                subGraphName: state.subGraphName,
+                packageBytes: encodeSwmSenderKeyPackage(pkg),
+                createdAtMs: Date.now(),
+              });
+              this.log.warn(
+                input.ctx,
+                `SWM sender-key setup for ${recipientAgentAddress} keyId=${recipient.recipientKeyId} ` +
+                `queued after retryable rejection: ${reason} - will retry when recipient reconnects`,
+              );
+              return { kind: 'success', agentAddress: recipientAgentAddress };
+            }
+            return {
+              kind: 'failure',
+              agentAddress: recipientAgentAddress,
+              keyId: recipient.recipientKeyId,
+              error: new Error(reason),
             };
           }
           return { kind: 'success', agentAddress: recipientAgentAddress };
@@ -6061,6 +6087,15 @@ export class DKGAgent {
     return state;
   }
 
+  private isRetryableSwmSenderKeySetupRejection(reason: string): boolean {
+    const lower = reason.toLowerCase();
+    return (
+      lower.includes('is not allowed for context graph') ||
+      lower.startsWith('no local x25519 private key for dkg agent') ||
+      lower === 'unknown reason'
+    );
+  }
+
   /**
    * PR-2 (SWM-fanout plan): enqueue a sender-key package whose recipient
    * has no advertised `dkg:peerId` (so we can't even ask the messenger
@@ -6099,9 +6134,10 @@ export class DKGAgent {
    * cost lives on the cold path of "we just connected to a new peer",
    * not on every share. Each successful `sendReliable` with
    * `delivered=true && ack.accepted=true` deletes the row; soft
-   * (`delivered=false`) leaves it queued for the next attempt; hard
-   * negative acks also delete it (the package is permanently invalid
-   * for this recipient).
+   * (`delivered=false`) leaves it queued for the next attempt; retryable
+   * negative acks stay queued because the remote peer saw the package
+   * before its membership/key view converged; hard negative acks delete it
+   * because the package is permanently invalid for this recipient.
    */
   private async drainPendingSenderKeyForPeer(peerId: string): Promise<number> {
     if (this.pendingSenderKeyByAgent.size === 0) return 0;
@@ -6135,9 +6171,17 @@ export class DKGAgent {
             remaining.push(entry);
             continue;
           }
-          // Both accepted=true and accepted=false are terminal: the
-          // recipient saw the package. Don't retry — the messenger's
-          // idempotency key would block re-delivery anyway.
+          const ack = decodeSwmSenderKeyPackageAck(sendResult.response);
+          if (
+            ack.version === SWM_SENDER_KEY_PACKAGE_VERSION &&
+            ack.type === SWM_SENDER_KEY_PACKAGE_ACK_TYPE &&
+            !ack.accepted &&
+            this.isRetryableSwmSenderKeySetupRejection(ack.reason ?? 'unknown reason')
+          ) {
+            remaining.push(entry);
+            continue;
+          }
+          // Accepted or permanent-rejection responses are terminal.
           drained += 1;
         } catch {
           // Wire error: keep the row queued. Next connection:open

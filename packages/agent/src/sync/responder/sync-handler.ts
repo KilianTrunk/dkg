@@ -98,8 +98,49 @@ export function registerSyncHandler(params: RegisterSyncHandlerParams): void {
       // the requester reconstructs the correct graph at write time.
       // Sub-graph names cannot contain `/` and cannot start with `_`
       // (`validateSubGraphName` in dkg-core/constants.ts), so the
-      // shape-based FILTER is exact.
+      // segment between `<cgPrefix>/` and `/_shared_memory[_meta]` is
+      // always a single path component when it represents a sub-graph.
+      //
+      // Codex review on #885 — URI shape alone is NOT a sufficient CG
+      // boundary because `contextGraphId` itself permits `/` (wallet-
+      // scoped IDs do, e.g. `0xabc/project`, and `validateContextGraphId`
+      // accepts `/`). For a request on CG `cg-A`, the URI
+      // `<cgPrefix>/child/_shared_memory` is structurally
+      // indistinguishable from a sub-graph "child" of cg-A AND from the
+      // root SWM of a different CG `cg-A/child` — even with a tightened
+      // STRBEFORE/STRAFTER segment check that allows exactly one path
+      // segment.
+      //
+      // Disambiguate by registration: the `<cgPrefix>/_meta` graph
+      // carries the SubGraph registration triples (see
+      // `DKGPublisher.isSubGraphRegistered` in dkg-publisher.ts:3828
+      // and the auto-register in
+      // `FinalizationHandler.ensureContextGraphAndSubGraph`,
+      // finalization-handler.ts:540). Admit only the root SWM and the
+      // SWM of registered sub-graphs of THIS CG; nested CGs that share
+      // a URI prefix have their registration in their own
+      // `<nestedPrefix>/_meta`, not the parent CG's, so they are
+      // naturally excluded.
       const cgPrefix = `did:dkg:context-graph:${contextGraphId}`;
+      const cgMetaGraph = `${cgPrefix}/_meta`;
+      const rootSwm = `${cgPrefix}/_shared_memory`;
+      const rootSwmMeta = `${cgPrefix}/_shared_memory_meta`;
+      // Registered sub-graphs are identified by their schema:name
+      // literal in `<cgPrefix>/_meta`. Reconstruct the canonical
+      // SWM/SWM_meta URI from that name (matching
+      // `contextGraphSharedMemoryUri` in dkg-core/constants.ts) so
+      // sub-graph entities slated under arbitrary `<cgPrefix>/<name>/...`
+      // shapes (e.g. assertion graphs) are not accidentally admitted.
+      const registeredSubGraphSwmFilter = (forMeta: boolean) => {
+        const suffix = forMeta ? '/_shared_memory_meta' : '/_shared_memory';
+        return `EXISTS {
+          GRAPH <${cgMetaGraph}> {
+            ?sg <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://dkg.io/ontology/SubGraph> .
+            ?sg <http://schema.org/name> ?subGraphName .
+            FILTER(STR(?g) = CONCAT("${cgPrefix}/", STR(?subGraphName), "${suffix}"))
+          }
+        }`;
+      };
 
       if (phase === 'snapshot') {
         const snapshotRef = request.snapshotRef?.trim();
@@ -117,10 +158,15 @@ export function registerSyncHandler(params: RegisterSyncHandlerParams): void {
         nquads.push(serializeWorkspacePublicSnapshotQuads(page).trimEnd());
         logDebug(createOperationContext('sync'), `Sync responder SWM snapshot for "${contextGraphId}" ref=${snapshotRef}: auth=${authDurationMs}ms quads=${page.length}`);
       } else if (phase === 'meta') {
+        // Codex review on #885 — admit only the root SWM_meta + the
+        // SWM_meta of REGISTERED sub-graphs of this CG. Nested CGs
+        // sharing the prefix have their registration in their own
+        // `_meta`, not this CG's, so they are excluded.
+        const metaBoundaryFilter = `STR(?g) = "${rootSwmMeta}" || ${registeredSubGraphSwmFilter(true)}`;
         const metaQuery = cutoff != null
           ? `SELECT ?s ?p ?o ?g WHERE {
               GRAPH ?g { ?s ?p ?o }
-              FILTER(STRSTARTS(STR(?g), "${cgPrefix}/") && STRENDS(STR(?g), "/_shared_memory_meta"))
+              FILTER(${metaBoundaryFilter})
               FILTER EXISTS {
                 GRAPH ?g {
                   ?s <http://dkg.io/ontology/publishedAt> ?ts .
@@ -130,7 +176,7 @@ export function registerSyncHandler(params: RegisterSyncHandlerParams): void {
             } ORDER BY ?g ?s ?p ?o OFFSET ${offset} LIMIT ${limit}`
           : `SELECT ?s ?p ?o ?g WHERE {
               GRAPH ?g { ?s ?p ?o }
-              FILTER(STRSTARTS(STR(?g), "${cgPrefix}/") && STRENDS(STR(?g), "/_shared_memory_meta"))
+              FILTER(${metaBoundaryFilter})
             } ORDER BY ?g ?s ?p ?o OFFSET ${offset} LIMIT ${limit}`;
 
         const queryStartedAt = Date.now();
@@ -155,6 +201,12 @@ export function registerSyncHandler(params: RegisterSyncHandlerParams): void {
         // `<cgPrefix>/foo/_shared_memory_meta` with entities in
         // `<cgPrefix>/foo/_shared_memory` only — without bleeding into
         // a different sub-graph's ops or into root ops.
+        // Codex review on #885 — admit only the root SWM + the SWM of
+        // REGISTERED sub-graphs of this CG. The TTL branch still
+        // pairs `?gMeta = ?g + "_meta"` to scope op→entity matching to
+        // a single sub-graph; the registration check is what rejects
+        // nested-CG SWM that shares the URI prefix.
+        const dataBoundaryFilter = `STR(?g) = "${rootSwm}" || ${registeredSubGraphSwmFilter(false)}`;
         const wsQuery = cutoff != null
           ? `SELECT DISTINCT ?s ?p ?o ?g WHERE {
   GRAPH ?gMeta {
@@ -165,15 +217,14 @@ export function registerSyncHandler(params: RegisterSyncHandlerParams): void {
   }
   GRAPH ?g { ?s ?p ?o }
   FILTER(
-    STRSTARTS(STR(?g), "${cgPrefix}/") &&
-    STRENDS(STR(?g), "/_shared_memory") &&
+    (${dataBoundaryFilter}) &&
     STR(?gMeta) = CONCAT(STR(?g), "_meta")
   )
   FILTER(?s = ?re || STRSTARTS(STR(?s), CONCAT(STR(?re), "/.well-known/genid/")))
 } ORDER BY ?g ?s ?p ?o OFFSET ${offset} LIMIT ${limit}`
           : `SELECT ?s ?p ?o ?g WHERE {
               GRAPH ?g { ?s ?p ?o }
-              FILTER(STRSTARTS(STR(?g), "${cgPrefix}/") && STRENDS(STR(?g), "/_shared_memory"))
+              FILTER(${dataBoundaryFilter})
             } ORDER BY ?g ?s ?p ?o OFFSET ${offset} LIMIT ${limit}`;
 
         const queryStartedAt = Date.now();

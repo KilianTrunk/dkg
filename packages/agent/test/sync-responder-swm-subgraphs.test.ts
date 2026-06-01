@@ -100,6 +100,23 @@ function workspaceOpQuads(opId: string, rootEntity: string, metaGraph: string, p
   ];
 }
 
+// Sub-graph registration triples in `<cgPrefix>/_meta`. Mirrors the
+// shape that `DKGPublisher.isSubGraphRegistered` (dkg-publisher.ts:3828)
+// looks for and `FinalizationHandler.ensureContextGraphAndSubGraph`
+// (finalization-handler.ts:540) writes. The sync responder's boundary
+// check (post-#885 Codex) requires this registration to admit the
+// sub-graph SWM into a sync response, disambiguating it from a nested
+// CG that shares the same URI prefix.
+function subGraphRegistrationQuads(cgId: string, subGraphName: string) {
+  const cgMeta = `did:dkg:context-graph:${cgId}/_meta`;
+  const sgUri = `did:dkg:context-graph:${cgId}/${subGraphName}`;
+  return [
+    { graph: cgMeta, subject: sgUri, predicate: RDF_TYPE, object: `${DKG_NS}SubGraph` },
+    { graph: cgMeta, subject: sgUri, predicate: 'http://schema.org/name', object: `"${subGraphName}"` },
+    { graph: cgMeta, subject: sgUri, predicate: `${DKG_NS}createdBy`, object: '"test-creator"' },
+  ];
+}
+
 describe('sync responder workspace branch — sub-graph SWM coverage', () => {
   let store: OxigraphStore;
   let cap: ReturnType<typeof captureHandler>;
@@ -120,10 +137,12 @@ describe('sync responder workspace branch — sub-graph SWM coverage', () => {
       // --- SUB-GRAPH SWM (the gap target) ---
       { graph: SUB_SWM, subject: SUB_ROOT, predicate: 'http://schema.org/name', object: '"sub-ai-tools-payload"' },
       ...workspaceOpQuads(SHARE_OP_SUB, SUB_ROOT, SUB_SWM_META, NOW_ISO),
+      ...subGraphRegistrationQuads(CG_ID, SUB_NAME),
 
       // --- ANOTHER SUB-GRAPH (covers fan-out across multiple subs) ---
       { graph: OTHER_SUB_SWM, subject: OTHER_SUB_ROOT, predicate: 'http://schema.org/name', object: '"sub-decisions-payload"' },
       ...workspaceOpQuads(SHARE_OP_OTHER_SUB, OTHER_SUB_ROOT, OTHER_SUB_SWM_META, NOW_ISO),
+      ...subGraphRegistrationQuads(CG_ID, OTHER_SUB),
 
       // --- NOISE: durable-tier graphs that share the CG prefix but are
       //     not SWM. The shape filter must exclude these from BOTH the
@@ -279,6 +298,7 @@ describe('sync responder workspace branch — sub-graph SWM coverage', () => {
         { graph: SUB_SWM, subject: 'urn:swm:stale:sub', predicate: 'http://schema.org/n', object: '"stale-sub"' },
         ...workspaceOpQuads('op-fresh-sub', 'urn:swm:fresh:sub', SUB_SWM_META, FRESH_ISO),
         ...workspaceOpQuads('op-stale-sub', 'urn:swm:stale:sub', SUB_SWM_META, STALE_ISO),
+        ...subGraphRegistrationQuads(CG_ID, SUB_NAME),
       ]);
 
       capTtl = captureHandler();
@@ -316,6 +336,107 @@ describe('sync responder workspace branch — sub-graph SWM coverage', () => {
       const graphs = lineGraphsFromNquads(out);
       expect(graphs.has(ROOT_SWM)).toBe(true);
       expect(graphs.has(SUB_SWM)).toBe(true);
+    });
+  });
+
+  // Codex review on #885 — URI shape alone is NOT a sufficient CG
+  // boundary because `validateContextGraphId` permits `/` in the CG
+  // ID (wallet-scoped IDs do, e.g. `0xabc/project`). For a request on
+  // `cg-A`, the URI `<cgPrefix>/child/_shared_memory` is structurally
+  // indistinguishable from a sub-graph "child" of cg-A AND from the
+  // root SWM of a different CG `cg-A/child` — even with a tightened
+  // STRBEFORE/STRAFTER segment check that allows exactly one path
+  // segment.
+  //
+  // The fix: admit the CG's root SWM unconditionally and admit a
+  // sub-graph SWM only if the sub-graph is REGISTERED in this CG's
+  // `<cgPrefix>/_meta` graph (via the `<sgUri> a SubGraph; schema:name
+  // "<name>"` triples that `DKGPublisher.isSubGraphRegistered` looks
+  // for). The nested CG `cg-A/child` puts its registration in its
+  // OWN `<cg-A/child-prefix>/_meta` graph, not cg-A's, so it is
+  // naturally excluded. This test pins that contract: with no
+  // registration of "child" or "child/extra" in cg-A's `_meta`, the
+  // nested-CG SWM data and meta MUST NOT leak into a sync of cg-A.
+  describe('CG boundary tightening — nested CGs sharing a prefix do not leak (#885 Codex)', () => {
+    const NESTED_CG_ID = `${CG_ID}/child`;
+    const NESTED_PREFIX = `did:dkg:context-graph:${NESTED_CG_ID}`;
+    const NESTED_ROOT_SWM = `${NESTED_PREFIX}/_shared_memory`;
+    const NESTED_ROOT_SWM_META = `${NESTED_PREFIX}/_shared_memory_meta`;
+    const NESTED_SUB_SWM = `${NESTED_PREFIX}/extra/_shared_memory`;
+    const NESTED_SUB_SWM_META = `${NESTED_PREFIX}/extra/_shared_memory_meta`;
+
+    let storeNested: OxigraphStore;
+    let capNested: ReturnType<typeof captureHandler>;
+
+    beforeEach(async () => {
+      storeNested = new OxigraphStore();
+      const NOW_ISO = '2026-06-01T00:00:00.000Z';
+      await storeNested.insert([
+        // The CG we are syncing.
+        { graph: ROOT_SWM, subject: ROOT_ENTITY, predicate: 'http://schema.org/n', object: '"keep-me-root"' },
+        ...workspaceOpQuads(SHARE_OP_ROOT, ROOT_ENTITY, ROOT_SWM_META, NOW_ISO),
+        // A DIFFERENT CG whose ID extends the queried CG's prefix —
+        // pre-fix, this leaked because the prefix filter matched it.
+        { graph: NESTED_ROOT_SWM, subject: 'urn:nested:root', predicate: 'http://schema.org/n', object: '"NESTED-ROOT-LEAK"' },
+        { graph: NESTED_ROOT_SWM_META, subject: 'urn:dkg:share:nested-root-op', predicate: RDF_TYPE, object: `${DKG_NS}WorkspaceOperation` },
+        { graph: NESTED_ROOT_SWM_META, subject: 'urn:dkg:share:nested-root-op', predicate: `${DKG_NS}publishedAt`, object: `"${NOW_ISO}"^^<http://www.w3.org/2001/XMLSchema#dateTime>` },
+        { graph: NESTED_ROOT_SWM_META, subject: 'urn:dkg:share:nested-root-op', predicate: `${DKG_NS}rootEntity`, object: 'urn:nested:root' },
+        // Sub-graph of the OTHER CG — also must not leak.
+        { graph: NESTED_SUB_SWM, subject: 'urn:nested:sub', predicate: 'http://schema.org/n', object: '"NESTED-SUB-LEAK"' },
+        { graph: NESTED_SUB_SWM_META, subject: 'urn:dkg:share:nested-sub-op', predicate: RDF_TYPE, object: `${DKG_NS}WorkspaceOperation` },
+        { graph: NESTED_SUB_SWM_META, subject: 'urn:dkg:share:nested-sub-op', predicate: `${DKG_NS}publishedAt`, object: `"${NOW_ISO}"^^<http://www.w3.org/2001/XMLSchema#dateTime>` },
+        { graph: NESTED_SUB_SWM_META, subject: 'urn:dkg:share:nested-sub-op', predicate: `${DKG_NS}rootEntity`, object: 'urn:nested:sub' },
+      ]);
+      capNested = captureHandler();
+      registerSyncHandler({
+        register: capNested.register,
+        protocolSync: '/origintrail/dkg/sync/1.0.0',
+        syncDeniedResponse: 'sync-denied',
+        syncPageSize: 5000,
+        sharedMemoryTtlMs: 0,
+        store: storeNested,
+        peerId: 'self-peer',
+        parseSyncRequest: (data) => JSON.parse(new TextDecoder().decode(data)) as SyncRequestEnvelope,
+        authorizeSyncRequest: async () => true,
+        logWarn: noopLog,
+        logDebug: noopLog,
+      });
+    });
+
+    it('phase=data: nested-CG SWM (root and sub-graph) must NOT leak into a sync of the parent CG', async () => {
+      const out = await capNested.invoke({
+        contextGraphId: CG_ID,
+        offset: 0,
+        limit: 5000,
+        includeSharedMemory: true,
+        phase: 'data',
+      });
+
+      const graphs = lineGraphsFromNquads(out);
+      expect(graphs.has(ROOT_SWM)).toBe(true);
+      // The pre-fix regression: NESTED_ROOT_SWM and NESTED_SUB_SWM
+      // would both have appeared because their URIs start with the
+      // queried CG prefix. The tightened FILTER rejects them.
+      expect(graphs.has(NESTED_ROOT_SWM)).toBe(false);
+      expect(graphs.has(NESTED_SUB_SWM)).toBe(false);
+      expect(out).not.toContain('"NESTED-ROOT-LEAK"');
+      expect(out).not.toContain('"NESTED-SUB-LEAK"');
+      expect(out).toContain('"keep-me-root"');
+    });
+
+    it('phase=meta: nested-CG SWM meta must NOT leak into a sync of the parent CG', async () => {
+      const out = await capNested.invoke({
+        contextGraphId: CG_ID,
+        offset: 0,
+        limit: 5000,
+        includeSharedMemory: true,
+        phase: 'meta',
+      });
+
+      const graphs = lineGraphsFromNquads(out);
+      expect(graphs.has(ROOT_SWM_META)).toBe(true);
+      expect(graphs.has(NESTED_ROOT_SWM_META)).toBe(false);
+      expect(graphs.has(NESTED_SUB_SWM_META)).toBe(false);
     });
   });
 

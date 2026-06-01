@@ -196,51 +196,26 @@ export class FinalizationHandler {
             // version stamp under the per-KA materialization lock so a
             // concurrent stale writer cannot interleave between our
             // `shouldApplyMaterialization` and `writeMaterializedVersion`.
-            const promoteUnderLocks = async (): Promise<'promoted' | 'stale-target'> => {
-              if (!(await shouldApplyMaterialization(this.store, targetMetaGraph, msg.ual, finalizationVersion))) {
-                return 'stale-target';
-              }
-              let effectiveKeepRoot = isDualWrite;
-              if (isDualWrite) {
-                if (!(await shouldApplyMaterialization(this.store, defaultMeta, msg.ual, finalizationVersion))) {
-                  // Per-cgId is stale-or-equal but ROOT label has a
-                  // newer projection (an applied update). Skip the
-                  // dual-write portion so we don't clobber it.
-                  effectiveKeepRoot = false;
-                  this.log.info(
-                    ctx,
-                    `Finalization: root-label projection is newer for ${msg.ual}; downgrading to per-cgId-only promotion`,
-                  );
-                }
-              }
-              await this.promoteSharedMemoryToCanonical(
-                contextGraphId, sharedMemoryQuads, msg.ual, msg.rootEntities,
-                msg.publisherAddress, msg.txHash, blockNumber, startKAId, endKAId,
-                protoToBigInt(msg.batchId), ctx, ctxGraphId, subGraphName,
-                authorAddress,
-                effectiveKeepRoot,
-              );
-              await writeMaterializedVersion(this.store, targetMetaGraph, msg.ual, finalizationVersion);
-              if (effectiveKeepRoot) {
-                await writeMaterializedVersion(this.store, defaultMeta, msg.ual, finalizationVersion);
-              }
-              return 'promoted';
-            };
-            // Nested per-graph locks. Acquired in sorted order to prevent
-            // cross-deadlock with any other call site that might one day
-            // also lock multiple metas.
-            const lockOrder = isDualWrite
-              ? [defaultMeta, targetMetaGraph].sort()
-              : [targetMetaGraph];
-            const runUnderLocks = async (): Promise<'promoted' | 'stale-target'> => {
-              if (lockOrder.length === 1) {
-                return withMaterializationLock(lockOrder[0], msg.ual, promoteUnderLocks);
-              }
-              return withMaterializationLock(lockOrder[0], msg.ual, () =>
-                withMaterializationLock(lockOrder[1], msg.ual, promoteUnderLocks),
-              );
-            };
-            const outcome = await runUnderLocks();
+            const outcome = await this.applyVerifiedFinalization({
+              contextGraphId,
+              sharedMemoryQuads,
+              ual: msg.ual,
+              rootEntities: msg.rootEntities,
+              publisherAddress: msg.publisherAddress,
+              txHash: msg.txHash,
+              blockNumber,
+              startKAId,
+              endKAId,
+              batchId: protoToBigInt(msg.batchId),
+              ctxGraphId,
+              subGraphName,
+              authorAddress,
+              finalizationVersion,
+              targetMetaGraph,
+              defaultMeta,
+              isDualWrite,
+              ctx,
+            });
             if (outcome === 'stale-target') {
               this.markProcessed(dedupeKey);
               this.log.info(ctx, `Finalization: a newer update is already materialised for ${msg.ual}, skipping stale publish promotion`);
@@ -391,6 +366,282 @@ export class FinalizationHandler {
       }
     } catch { /* shared memory metadata may not exist */ }
     return undefined;
+  }
+
+  /**
+   * Shared SWM→VM promotion under the per-KA materialization lock(s).
+   *
+   * Extracted verbatim from the former `promoteUnderLocks`/`runUnderLocks`
+   * inline closure in `handleFinalizationMessage` (PR #845's TOCTOU-safe
+   * promotion) so BOTH the gossip path and the chain-driven reconciliation
+   * path (`handleChainReconciledKC`) share one implementation. Behavior is
+   * identical to the gossip path; the only change is that the captured locals
+   * are now explicit params.
+   *
+   * Serialises check + promotion + version stamp under the per-KA lock so a
+   * concurrent stale writer cannot interleave between `shouldApplyMaterialization`
+   * and `writeMaterializedVersion`. When dual-writing (same-graph keep-root),
+   * both the per-cgId target meta and the root-label meta are guarded; if the
+   * root label has a newer projection (an applied update), the dual-write
+   * portion is skipped so we don't clobber it.
+   */
+  private async applyVerifiedFinalization(input: {
+    contextGraphId: string;
+    sharedMemoryQuads: Quad[];
+    ual: string;
+    rootEntities: string[];
+    publisherAddress: string;
+    txHash: string;
+    blockNumber: number;
+    startKAId: bigint;
+    endKAId: bigint;
+    batchId: bigint;
+    ctxGraphId?: string;
+    subGraphName?: string;
+    authorAddress?: string;
+    finalizationVersion: MaterializedVersion;
+    targetMetaGraph: string;
+    defaultMeta: string;
+    isDualWrite: boolean;
+    ctx: OperationContext;
+  }): Promise<'promoted' | 'stale-target'> {
+    const {
+      contextGraphId, sharedMemoryQuads, ual, rootEntities, publisherAddress,
+      txHash, blockNumber, startKAId, endKAId, batchId, ctxGraphId, subGraphName,
+      authorAddress, finalizationVersion, targetMetaGraph, defaultMeta, isDualWrite, ctx,
+    } = input;
+
+    const promoteUnderLocks = async (): Promise<'promoted' | 'stale-target'> => {
+      if (!(await shouldApplyMaterialization(this.store, targetMetaGraph, ual, finalizationVersion))) {
+        return 'stale-target';
+      }
+      let effectiveKeepRoot = isDualWrite;
+      if (isDualWrite) {
+        if (!(await shouldApplyMaterialization(this.store, defaultMeta, ual, finalizationVersion))) {
+          // Per-cgId is stale-or-equal but ROOT label has a
+          // newer projection (an applied update). Skip the
+          // dual-write portion so we don't clobber it.
+          effectiveKeepRoot = false;
+          this.log.info(
+            ctx,
+            `Finalization: root-label projection is newer for ${ual}; downgrading to per-cgId-only promotion`,
+          );
+        }
+      }
+      await this.promoteSharedMemoryToCanonical(
+        contextGraphId, sharedMemoryQuads, ual, rootEntities,
+        publisherAddress, txHash, blockNumber, startKAId, endKAId,
+        batchId, ctx, ctxGraphId, subGraphName,
+        authorAddress,
+        effectiveKeepRoot,
+      );
+      await writeMaterializedVersion(this.store, targetMetaGraph, ual, finalizationVersion);
+      if (effectiveKeepRoot) {
+        await writeMaterializedVersion(this.store, defaultMeta, ual, finalizationVersion);
+      }
+      return 'promoted';
+    };
+    // Nested per-graph locks. Acquired in sorted order to prevent
+    // cross-deadlock with any other call site that might one day
+    // also lock multiple metas.
+    const lockOrder = isDualWrite
+      ? [defaultMeta, targetMetaGraph].sort()
+      : [targetMetaGraph];
+    if (lockOrder.length === 1) {
+      return withMaterializationLock(lockOrder[0], ual, promoteUnderLocks);
+    }
+    return withMaterializationLock(lockOrder[0], ual, () =>
+      withMaterializationLock(lockOrder[1], ual, promoteUnderLocks),
+    );
+  }
+
+  /**
+   * Phase B — chain-driven VM reconciliation entry point.
+   *
+   * Promotes a chain-registered KC into VM WITHOUT a gossip FinalizationMessage.
+   * The caller (the agent reconciler) has already established, from chain reads,
+   * that this KC is registered to the CG and resolved its `merkleRoot` +
+   * `publisherAddress` by kaId; it has also ensured the matching SWM snapshot is
+   * present locally (fetching from the publisher/cores first if needed).
+   *
+   * Unlike the gossip path there is no `rootEntities` on the wire, so we recover
+   * them from the local SWM meta by matching the published `merkleRoot`. We then
+   * run the SAME merkle + on-chain verification and the SAME locked promotion
+   * (`applyVerifiedFinalization`) as the gossip path. We do NOT re-broadcast on
+   * the finalization topic — the chain has spoken; gossiping adds nothing.
+   *
+   * Returns:
+   *   - `'promoted'`        — SWM snapshot verified + promoted to VM.
+   *   - `'already-confirmed'` — VM already had it (idempotent; cursor may advance).
+   *   - `'no-swm'`          — no local SWM snapshot matches the published
+   *                            merkleRoot (caller leaves the cursor; sweep retries).
+   *   - `'unverified'`      — on-chain verification didn't confirm (RPC lag /
+   *                            reorg); caller leaves cursor for the sweep.
+   *   - `'stale-target'`    — a newer update is already materialised.
+   */
+  async handleChainReconciledKC(input: {
+    /** Local CG id (topic/name), e.g. the value in `subscribedContextGraphs`. */
+    contextGraphId: string;
+    /** On-chain numeric CG id as a string, for per-cgId meta routing. */
+    onChainCgId?: string;
+    ual: string;
+    merkleRoot: Uint8Array;
+    publisherAddress: string;
+    kaId: bigint;
+    txHash: string;
+    blockNumber: number;
+    /** Optional EIP-712 author recovered from chain (KnowledgeAssetCreated.author). */
+    authorAddress?: string;
+    /** Optional sub-graph the publish targeted (defaults to root workspace). */
+    subGraphName?: string;
+  }, ctx: OperationContext): Promise<
+    'promoted' | 'already-confirmed' | 'no-swm' | 'unverified' | 'stale-target'
+  > {
+    const {
+      contextGraphId, onChainCgId, ual, merkleRoot, publisherAddress,
+      kaId, txHash, blockNumber, authorAddress, subGraphName,
+    } = input;
+
+    const ctxGraphId = onChainCgId && onChainCgId.length > 0 ? onChainCgId : undefined;
+    const targetMetaGraph = ctxGraphId
+      ? contextGraphMetaUri(contextGraphId, ctxGraphId)
+      : `did:dkg:context-graph:${contextGraphId}/_meta`;
+
+    // Idempotency — VM may already hold this (gossip beat the chain path, or a
+    // prior sweep promoted it). Treat as success so the cursor can advance.
+    if (await this.isAlreadyConfirmed(ual, targetMetaGraph)) {
+      this.log.info(ctx, `Chain-reconcile: ${ual} already confirmed in VM, skipping`);
+      return 'already-confirmed';
+    }
+
+    // Recover the published roots from the local SWM snapshot. The gossip path
+    // gets `rootEntities` from the wire; here there is no wire, and SWM meta
+    // (created at share-time, before publish) carries no merkle root — so we
+    // identify the matching WorkspaceOperation by RECOMPUTING each candidate's
+    // KC root and comparing to the chain root. This is the same flat-KC root
+    // the gossip path verifies against, so a match is an authoritative
+    // merkle verification (no separate merkle-mismatch path needed).
+    const snapshot = await this.findSwmSnapshotForMerkleRoot(contextGraphId, merkleRoot, subGraphName);
+    if (!snapshot) {
+      this.log.info(ctx, `Chain-reconcile: no local SWM snapshot matches the published merkleRoot for ${ual}; deferring to sweep retry`);
+      return 'no-swm';
+    }
+    const { rootEntities, sharedMemoryQuads } = snapshot;
+
+    // For single-KA reconciliation the KC range is the KA itself; verifyOnChain
+    // re-scans the block's events as the source of truth, so start==end==kaId is
+    // a cross-check, not an authority (B.0 spike residual, confirmed harmless).
+    const { verified, authorAddress: verifiedAuthor, txIndex } = await this.verifyOnChain(
+      txHash, blockNumber, merkleRoot, publisherAddress, kaId, kaId, ctx, ctxGraphId,
+    );
+    if (!verified) {
+      this.log.info(ctx, `Chain-reconcile: on-chain verification not yet confirmed for ${ual} (RPC lag/reorg); deferring to sweep retry`);
+      return 'unverified';
+    }
+
+    const finalizationVersion: MaterializedVersion = {
+      blockNumber,
+      txIndex: typeof txIndex === 'number' ? txIndex : 0,
+    };
+    // Chain-driven reconciliation never requests same-graph dual-write — the
+    // root-copy decision is a publisher gossip signal (`keepRootCopyOnLabel`)
+    // that has no chain equivalent. Promote per-cgId only.
+    const isDualWrite = false;
+    const defaultMeta = `did:dkg:context-graph:${contextGraphId}/_meta`;
+
+    const outcome = await this.applyVerifiedFinalization({
+      contextGraphId,
+      sharedMemoryQuads,
+      ual,
+      rootEntities,
+      publisherAddress,
+      txHash,
+      blockNumber,
+      startKAId: kaId,
+      endKAId: kaId,
+      batchId: 0n,
+      ctxGraphId,
+      subGraphName,
+      authorAddress: verifiedAuthor ?? authorAddress,
+      finalizationVersion,
+      targetMetaGraph,
+      defaultMeta,
+      isDualWrite,
+      ctx,
+    });
+
+    if (outcome === 'stale-target') {
+      this.log.info(ctx, `Chain-reconcile: a newer update is already materialised for ${ual}, skipping`);
+      return 'stale-target';
+    }
+    this.log.info(ctx, `Chain-reconcile: promoted SWM snapshot to VM for ${ual} (chain tx=${txHash.slice(0, 10)}…)`);
+    return 'promoted';
+  }
+
+  /**
+   * Find the local SWM snapshot whose KC merkle root matches the chain
+   * `merkleRoot`, returning its root entities + shared-memory quads.
+   *
+   * SWM workspace meta is written at share-time (before publish), so it carries
+   * no merkle root to look up by — only `?op a dkg:WorkspaceOperation ;
+   * dkg:rootEntity <root>`. We therefore enumerate the candidate operations,
+   * gather each one's SWM quads + private roots, recompute the flat-KC root
+   * (`computeFlatKCRoot`, the same function the gossip path verifies against),
+   * and return the first operation whose computed root equals the chain root.
+   * A match is an authoritative merkle verification.
+   *
+   * Returns `null` when no local operation matches — either the snapshot hasn't
+   * been synced yet (the caller's active-fetch missed / is in flight) or this
+   * KA belongs to a publish this node never shared. Either way the B.2 sweep
+   * retries later.
+   *
+   * Cost note: O(#WorkspaceOperations) root recomputations per call. Fine for
+   * typical CGs; if a CG grows large this can be optimised by stamping the KC
+   * merkle root onto SWM meta at publish time (a publisher-side change, out of
+   * scope here).
+   */
+  private async findSwmSnapshotForMerkleRoot(
+    contextGraphId: string,
+    merkleRoot: Uint8Array,
+    subGraphName?: string,
+  ): Promise<{ rootEntities: string[]; sharedMemoryQuads: Quad[] } | null> {
+    const graphManager = new GraphManager(this.store);
+    const wsMetaGraph = subGraphName
+      ? graphManager.sharedMemoryMetaUri(contextGraphId, subGraphName)
+      : contextGraphWorkspaceMetaGraphUri(contextGraphId);
+
+    // Group root entities by their WorkspaceOperation so each candidate KC is
+    // verified as a whole (the merkle root is over all of an op's roots).
+    const rootsByOp = new Map<string, string[]>();
+    try {
+      const result = await this.store.query(`SELECT ?op ?root WHERE {
+        GRAPH <${assertSafeIri(wsMetaGraph)}> {
+          ?op <${DKG_NS}rootEntity> ?root .
+        }
+      }`);
+      if (result.type === 'bindings') {
+        for (const row of result.bindings) {
+          const op = typeof row['op'] === 'string' ? row['op'].replace(/^<(.*)>$/, '$1') : '';
+          const root = typeof row['root'] === 'string' ? row['root'].replace(/^<(.*)>$/, '$1') : '';
+          if (!op || !isSafeIri(root)) continue;
+          const list = rootsByOp.get(op) ?? [];
+          list.push(root);
+          rootsByOp.set(op, list);
+        }
+      }
+    } catch { /* SWM meta may not exist yet */ }
+
+    if (rootsByOp.size === 0) return null;
+
+    for (const roots of rootsByOp.values()) {
+      const sharedMemoryQuads = await this.getSharedMemoryQuadsForRoots(contextGraphId, roots, subGraphName);
+      if (sharedMemoryQuads.length === 0) continue;
+      const privateRoots = await this.getPrivateRootsFromMeta(contextGraphId, roots, subGraphName);
+      if (this.verifyMerkleMatch(sharedMemoryQuads, privateRoots, merkleRoot)) {
+        return { rootEntities: roots, sharedMemoryQuads };
+      }
+    }
+    return null;
   }
 
   private async verifyOnChain(

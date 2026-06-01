@@ -1,6 +1,12 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { OxigraphStore } from '@origintrail-official/dkg-storage';
-import { encodeFinalizationMessage, type FinalizationMessageMsg, encodePublishRequest, createOperationContext } from '@origintrail-official/dkg-core';
+import {
+  encodeFinalizationMessage, type FinalizationMessageMsg, encodePublishRequest, createOperationContext,
+  contextGraphWorkspaceGraphUri, contextGraphWorkspaceMetaGraphUri,
+} from '@origintrail-official/dkg-core';
+import type { ChainAdapter, EventFilter, ChainEvent } from '@origintrail-official/dkg-chain';
+import { computeFlatKCRootV10 } from '@origintrail-official/dkg-publisher';
+import { ethers } from 'ethers';
 import { FinalizationHandler } from '../src/finalization-handler.js';
 
 const CONTEXT_GRAPH = 'test-contextGraph';
@@ -289,5 +295,122 @@ describe('FinalizationHandler', () => {
     );
     expect(perCgBindings.type).toBe('boolean');
     if (perCgBindings.type === 'boolean') expect(perCgBindings.value).toBe(true);
+  });
+});
+
+describe('FinalizationHandler.handleChainReconciledKC (Phase B)', () => {
+  const KA_ID = 7n;
+  const UAL = 'did:dkg:evm:31337/0xABC/7';
+  const PUBLISHER = '0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266';
+  const TX_HASH = '0x' + 'ab'.repeat(32);
+  const BLOCK = 100;
+  const ENTITY = 'urn:test:reconcile-entity';
+
+  /** Seed a local SWM snapshot (data + meta op→root) and return its KC root. */
+  async function seedSwmSnapshot(store: OxigraphStore): Promise<Uint8Array> {
+    const wsGraph = contextGraphWorkspaceGraphUri(CONTEXT_GRAPH);
+    const wsMetaGraph = contextGraphWorkspaceMetaGraphUri(CONTEXT_GRAPH);
+    await store.insert([
+      { subject: ENTITY, predicate: 'http://schema.org/name', object: '"Reconciled"', graph: wsGraph },
+      { subject: 'urn:dkg:share:test:op-1', predicate: 'http://dkg.io/ontology/rootEntity', object: ENTITY, graph: wsMetaGraph },
+    ]);
+    return computeFlatKCRootV10(
+      [{ subject: ENTITY, predicate: 'http://schema.org/name', object: '"Reconciled"', graph: '' }],
+      [],
+    );
+  }
+
+  /** Minimal chain that confirms one KCCreated event matching the given inputs. */
+  function makeVerifyingChain(merkleRoot: Uint8Array): ChainAdapter {
+    return {
+      chainId: 'evm:31337',
+      isV10Ready: () => true,
+      getBlockNumber: async () => BLOCK + 50,
+      // eslint-disable-next-line @typescript-eslint/require-await
+      listenForEvents: async function* (filter: EventFilter): AsyncIterable<ChainEvent> {
+        if (!filter.eventTypes.includes('KCCreated')) return;
+        yield {
+          type: 'KCCreated',
+          blockNumber: BLOCK,
+          data: {
+            merkleRoot: ethers.hexlify(merkleRoot),
+            publisherAddress: PUBLISHER,
+            startKAId: KA_ID.toString(),
+            endKAId: KA_ID.toString(),
+            txHash: TX_HASH,
+            txIndex: 0,
+          },
+        };
+      },
+    } as unknown as ChainAdapter;
+  }
+
+  function input(merkleRoot: Uint8Array) {
+    return {
+      contextGraphId: CONTEXT_GRAPH,
+      ual: UAL,
+      merkleRoot,
+      publisherAddress: PUBLISHER,
+      kaId: KA_ID,
+      txHash: TX_HASH,
+      blockNumber: BLOCK,
+    };
+  }
+
+  it('promotes a chain-registered KC when the local SWM snapshot verifies on-chain', async () => {
+    const store = new OxigraphStore();
+    const merkleRoot = await seedSwmSnapshot(store);
+    const handler = new FinalizationHandler(store, makeVerifyingChain(merkleRoot));
+
+    const outcome = await handler.handleChainReconciledKC(input(merkleRoot), createOperationContext('system'));
+    expect(outcome).toBe('promoted');
+
+    const dataGraph = `did:dkg:context-graph:${CONTEXT_GRAPH}`;
+    const promoted = await store.query(
+      `ASK { GRAPH <${dataGraph}> { <${ENTITY}> <http://schema.org/name> "Reconciled" } }`,
+    );
+    expect(promoted.type === 'boolean' && promoted.value).toBe(true);
+  });
+
+  it('returns no-swm when no local SWM snapshot matches the published merkleRoot', async () => {
+    const store = new OxigraphStore();
+    const merkleRoot = await seedSwmSnapshot(store);
+    const handler = new FinalizationHandler(store, makeVerifyingChain(merkleRoot));
+
+    // Ask for a different (unmatched) merkle root.
+    const outcome = await handler.handleChainReconciledKC(
+      input(new Uint8Array(32).fill(0xff)),
+      createOperationContext('system'),
+    );
+    expect(outcome).toBe('no-swm');
+  });
+
+  it('returns unverified when on-chain verification cannot confirm (no chain wired)', async () => {
+    const store = new OxigraphStore();
+    const merkleRoot = await seedSwmSnapshot(store);
+    const handler = new FinalizationHandler(store, undefined);
+
+    const outcome = await handler.handleChainReconciledKC(input(merkleRoot), createOperationContext('system'));
+    expect(outcome).toBe('unverified');
+
+    const dataGraph = `did:dkg:context-graph:${CONTEXT_GRAPH}`;
+    const promoted = await store.query(
+      `ASK { GRAPH <${dataGraph}> { <${ENTITY}> ?p ?o } }`,
+    );
+    expect(promoted.type === 'boolean' && promoted.value).toBe(false);
+  });
+
+  it('returns already-confirmed (idempotent) when VM already holds the KC', async () => {
+    const store = new OxigraphStore();
+    const merkleRoot = await seedSwmSnapshot(store);
+    const handler = new FinalizationHandler(store, makeVerifyingChain(merkleRoot));
+
+    const metaGraph = `did:dkg:context-graph:${CONTEXT_GRAPH}/_meta`;
+    await store.insert([
+      { subject: UAL, predicate: 'http://dkg.io/ontology/status', object: '"confirmed"', graph: metaGraph },
+    ]);
+
+    const outcome = await handler.handleChainReconciledKC(input(merkleRoot), createOperationContext('system'));
+    expect(outcome).toBe('already-confirmed');
   });
 });

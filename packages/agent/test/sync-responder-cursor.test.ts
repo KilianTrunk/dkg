@@ -1,0 +1,125 @@
+import { describe, it, expect, beforeEach } from 'vitest';
+import { OxigraphStore } from '@origintrail-official/dkg-storage';
+import { registerSyncHandler } from '../src/sync/responder/sync-handler.js';
+import type { SyncRequestEnvelope } from '../src/sync/auth/request-build.js';
+import type { OperationContext } from '@origintrail-official/dkg-core';
+
+/**
+ * Phase C — `sinceBatchId` delta sync (responder side).
+ *
+ * The durable DATA responder, when handed an (unsigned, optional) `sinceBatchId`
+ * high-water mark, must return ONLY the data triples of Knowledge Assets whose
+ * owning KC has `dkg:batchId > sinceBatchId`, while never hiding metadata or
+ * un-keyed subjects (a delta is always a safe subset). Omitting the field
+ * yields a full scan (backward-compatible with pre-Phase-C requesters).
+ */
+
+const CG_ID = 'mfacts';
+const CG_PREFIX = `did:dkg:context-graph:${CG_ID}`;
+const PER_CG_DATA = `${CG_PREFIX}/context/1`;
+const PER_CG_META = `${CG_PREFIX}/context/1/_meta`;
+const DKG_NS = 'http://dkg.io/ontology/';
+const RDF_TYPE = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type';
+const XSD_INT = 'http://www.w3.org/2001/XMLSchema#integer';
+const REMOTE_PEER_ID = '12D3KooWSmU3owJvB9sFw8uApDgKrv2VBMecsGGvgAc4Gq6hB57M';
+const noopLog = (_ctx: OperationContext, _msg: string) => {};
+
+function intLit(n: number): string {
+  return `"${n}"^^<${XSD_INT}>`;
+}
+
+function captureHandler() {
+  let captured: ((data: Uint8Array, peerId: string) => Promise<Uint8Array>) | null = null;
+  return {
+    register: (_proto: string, h: (data: Uint8Array, peerId: string) => Promise<Uint8Array>) => { captured = h; },
+    invoke: async (envelope: SyncRequestEnvelope): Promise<string> => {
+      if (!captured) throw new Error('handler not registered');
+      const out = await captured(new TextEncoder().encode(JSON.stringify(envelope)), REMOTE_PEER_ID);
+      return new TextDecoder().decode(out);
+    },
+  };
+}
+
+describe('sync responder — Phase C sinceBatchId delta filter', () => {
+  let store: OxigraphStore;
+  let cap: ReturnType<typeof captureHandler>;
+
+  beforeEach(async () => {
+    store = new OxigraphStore();
+    const quads = [] as { graph: string; subject: string; predicate: string; object: string }[];
+    // 10 KCs, batchId 1..10, each with one KA root entity carrying data.
+    for (let i = 1; i <= 10; i++) {
+      const kc = `did:dkg:evm:31337/0xkc${i}`;
+      const ka = `${kc}/1`;
+      const root = `urn:root:${i}`;
+      quads.push(
+        { graph: PER_CG_META, subject: kc, predicate: RDF_TYPE, object: `${DKG_NS}KnowledgeCollection` },
+        { graph: PER_CG_META, subject: kc, predicate: `${DKG_NS}batchId`, object: intLit(i) },
+        { graph: PER_CG_META, subject: ka, predicate: `${DKG_NS}partOf`, object: kc },
+        { graph: PER_CG_META, subject: ka, predicate: `${DKG_NS}rootEntity`, object: root },
+        { graph: PER_CG_DATA, subject: root, predicate: `${DKG_NS}label`, object: `"data-${i}"` },
+      );
+    }
+    // A skolemized child subject under root 8 — must follow its parent KA's fate.
+    quads.push({ graph: PER_CG_DATA, subject: `urn:root:8/.well-known/genid/abc`, predicate: `${DKG_NS}note`, object: '"skolem-8"' });
+    await store.insert(quads);
+
+    cap = captureHandler();
+    registerSyncHandler({
+      register: cap.register,
+      protocolSync: '/origintrail/dkg/sync/1.0.0',
+      syncDeniedResponse: 'sync-denied',
+      syncPageSize: 5000,
+      sharedMemoryTtlMs: 0,
+      store,
+      peerId: 'self-peer',
+      parseSyncRequest: (data) => JSON.parse(new TextDecoder().decode(data)) as SyncRequestEnvelope,
+      authorizeSyncRequest: async () => true,
+      logWarn: noopLog,
+      logDebug: noopLog,
+    });
+  });
+
+  it('with no sinceBatchId, returns the full data set (backward compatible)', async () => {
+    const out = await cap.invoke({ contextGraphId: CG_ID, offset: 0, limit: 5000, includeSharedMemory: false, phase: 'data' });
+    for (let i = 1; i <= 10; i++) expect(out).toContain(`"data-${i}"`);
+  });
+
+  it('with sinceBatchId=5, returns only data for KCs with batchId > 5', async () => {
+    const out = await cap.invoke({ contextGraphId: CG_ID, offset: 0, limit: 5000, includeSharedMemory: false, phase: 'data', sinceBatchId: '5' });
+    // Excluded: batchId 1..5
+    for (let i = 1; i <= 5; i++) expect(out).not.toContain(`"data-${i}"`);
+    // Included: batchId 6..10
+    for (let i = 6; i <= 10; i++) expect(out).toContain(`"data-${i}"`);
+  });
+
+  it('follows skolemized subjects to their parent KA (root 8 kept when since=5)', async () => {
+    const out = await cap.invoke({ contextGraphId: CG_ID, offset: 0, limit: 5000, includeSharedMemory: false, phase: 'data', sinceBatchId: '5' });
+    expect(out).toContain('"skolem-8"');
+  });
+
+  it('drops skolemized subjects of excluded KAs (root 8 child dropped when since=8)', async () => {
+    const out = await cap.invoke({ contextGraphId: CG_ID, offset: 0, limit: 5000, includeSharedMemory: false, phase: 'data', sinceBatchId: '8' });
+    expect(out).not.toContain('"skolem-8"');
+    expect(out).toContain('"data-9"');
+    expect(out).toContain('"data-10"');
+  });
+
+  it('never hides KC/KA metadata rows (subset is always safe)', async () => {
+    const out = await cap.invoke({ contextGraphId: CG_ID, offset: 0, limit: 5000, includeSharedMemory: false, phase: 'data', sinceBatchId: '5' });
+    // batchId meta for an EXCLUDED KC (batchId 3) is still present — meta is
+    // un-keyed by rootEntity, so the never-hide branch keeps it.
+    expect(out).toContain('0xkc3');
+    expect(out).toContain(`${DKG_NS}batchId`);
+  });
+
+  it('with sinceBatchId at/over head returns no data triples (caught up)', async () => {
+    const out = await cap.invoke({ contextGraphId: CG_ID, offset: 0, limit: 5000, includeSharedMemory: false, phase: 'data', sinceBatchId: '10' });
+    for (let i = 1; i <= 10; i++) expect(out).not.toContain(`"data-${i}"`);
+  });
+
+  it('ignores a malformed sinceBatchId (falls back to full scan)', async () => {
+    const out = await cap.invoke({ contextGraphId: CG_ID, offset: 0, limit: 5000, includeSharedMemory: false, phase: 'data', sinceBatchId: 'not-a-number' as unknown as string });
+    for (let i = 1; i <= 10; i++) expect(out).toContain(`"data-${i}"`);
+  });
+});

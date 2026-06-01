@@ -41,7 +41,14 @@ interface FetchSyncPagesParams {
   debugSyncProgress: boolean;
   protocolSync: string;
   checkpointStore: SyncCheckpointStore;
-  buildSyncRequest: (contextGraphId: string, offset: number, limit: number, includeSharedMemory: boolean, remotePeerId: string, phase?: SyncPhase, snapshotRef?: string) => Promise<Uint8Array>;
+  buildSyncRequest: (contextGraphId: string, offset: number, limit: number, includeSharedMemory: boolean, remotePeerId: string, phase?: SyncPhase, snapshotRef?: string, sinceBatchId?: string) => Promise<Uint8Array>;
+  /**
+   * Phase C — optional, gap-safe delta-sync high-water mark. Forwarded to the
+   * responder for the durable DATA phase so it returns only KAs with
+   * `dkg:batchId > sinceBatchId`. MUST originate from a CONTIGUOUS watermark
+   * (never local MAX, which would skip gaps). Omitted ⇒ full scan.
+   */
+  sinceBatchId?: string;
   parseAndFilter: (nquadsText: string, graphUri: string, contextGraphId: string) => Promise<{ quads: Quad[]; totalQuads: number }>;
   /**
    * Per-attempt send hook. The substrate-backed implementation
@@ -87,6 +94,7 @@ export async function fetchSyncPages(params: FetchSyncPagesParams): Promise<Sync
     protocolSync,
     checkpointStore,
     buildSyncRequest,
+    sinceBatchId,
     parseAndFilter,
     send,
     logWarn,
@@ -129,7 +137,7 @@ export async function fetchSyncPages(params: FetchSyncPagesParams): Promise<Sync
       // fresh-messageId-per-attempt is generated inside
       // `sendSyncRequest`. See `sendSyncRequest`'s jsdoc for the
       // full rationale (codex review on #569 follow-ups #1, #4-#8).
-      requestFactory: () => buildSyncRequest(contextGraphId, curOffset, syncPageSize, includeSharedMemory, remotePeerId, phase, snapshotRef),
+      requestFactory: () => buildSyncRequest(contextGraphId, curOffset, syncPageSize, includeSharedMemory, remotePeerId, phase, snapshotRef, sinceBatchId),
       send,
       onRetry: (attempt, delay, err) => {
         logWarn(ctx, `Sync page retry ${attempt}/${syncPageRetryAttempts} for offset ${offset} (delay ${Math.round(delay)}ms): ${err instanceof Error ? err.message : String(err)}`);

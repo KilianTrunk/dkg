@@ -3536,6 +3536,9 @@ export class DKGAgent {
     contextGraphIds: string[],
     onPhase?: PhaseCallback,
     onAccessDenied?: (contextGraphId: string) => void,
+    // Phase C — optional gap-safe per-CG delta high-water mark resolver. Backed
+    // by a CONTIGUOUS watermark when supplied; omitted ⇒ full scan (default).
+    sinceBatchIdFor?: (contextGraphId: string) => string | undefined,
   ): Promise<DurableSyncResult> {
     const ctx = createOperationContext('sync');
     return runDurableSync({
@@ -3546,6 +3549,7 @@ export class DKGAgent {
       onAccessDenied,
       createContextGraphSyncDeadline: this.createContextGraphSyncDeadline.bind(this),
       fetchSyncPages: this.fetchSyncPages.bind(this),
+      sinceBatchIdFor,
       processDurableBatchInWorker: this.processDurableBatchInWorker.bind(this),
       storeInsert: (quads) => this.store.insert(quads),
       deleteCheckpoint: (key) => this.syncCheckpoints.delete(key),
@@ -3569,6 +3573,7 @@ export class DKGAgent {
     graphUri: string,
     deadline: number,
     snapshotRef?: string,
+    sinceBatchId?: string,
   ): Promise<SyncPageResult> {
     return fetchSyncPages({
       ctx,
@@ -3578,6 +3583,7 @@ export class DKGAgent {
       phase,
       graphUri,
       snapshotRef,
+      sinceBatchId,
       deadline,
       syncPageTimeoutMs: SYNC_PAGE_TIMEOUT_MS,
       syncRouterAttempts: SYNC_ROUTER_ATTEMPTS,
@@ -17923,6 +17929,8 @@ export class DKGAgent {
         requesterAgentAddress: parsed.requesterAgentAddress,
         requesterSignatureR: parsed.requesterSignatureR,
         requesterSignatureVS: parsed.requesterSignatureVS,
+        // Phase C: unsigned delta hint. Validated/normalised in the responder.
+        sinceBatchId: typeof parsed.sinceBatchId === 'string' ? parsed.sinceBatchId : undefined,
       };
     }
 
@@ -17935,6 +17943,13 @@ export class DKGAgent {
     const includeSharedMemory = ctxGraphPart.startsWith('workspace:');
     const contextGraphId = includeSharedMemory ? ctxGraphPart.slice('workspace:'.length) : (ctxGraphPart || SYSTEM_CONTEXT_GRAPHS.AGENTS);
     const phase = normalizeSyncPhase(parts[3]);
+    // Phase C: locate a trailing `|since|<n>` keyed token (position-independent
+    // so it survives the optional phase suffix). Old encoders never emit it.
+    let sinceBatchId: string | undefined;
+    const sinceIdx = parts.indexOf('since');
+    if (sinceIdx >= 0 && sinceIdx + 1 < parts.length && /^\d+$/.test(parts[sinceIdx + 1])) {
+      sinceBatchId = parts[sinceIdx + 1];
+    }
     return {
       contextGraphId,
       offset: parseInt(parts[1], 10) || 0,
@@ -17942,6 +17957,7 @@ export class DKGAgent {
       includeSharedMemory,
       phase,
       snapshotRef: phase === 'snapshot' ? parts[4] : undefined,
+      sinceBatchId,
     };
   }
 
@@ -18016,6 +18032,7 @@ export class DKGAgent {
     responderPeerId: string,
     phase: SyncPhase = 'data',
     snapshotRef?: string,
+    sinceBatchId?: string,
   ): Promise<Uint8Array> {
     const isPrivate = await this.isPrivateContextGraph(contextGraphId);
 
@@ -18036,6 +18053,11 @@ export class DKGAgent {
       requesterPeerId: this.peerId,
       phase,
       snapshotRef,
+      // Phase C: only forwarded for the durable DATA phase — SWM has no
+      // `dkg:batchId` (pre-chain) and meta must never be narrowed. The hint
+      // is gap-safe only when it comes from a CONTIGUOUS watermark, so it is
+      // supplied explicitly by callers, never auto-derived from local MAX().
+      sinceBatchId: phase === 'data' && !includeSharedMemory ? sinceBatchId : undefined,
       needsAuth,
       computeSyncDigest: this.computeSyncDigest.bind(this),
       getIdentityId: () => this.chain.getIdentityId(),

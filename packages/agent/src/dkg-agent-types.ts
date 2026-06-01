@@ -143,6 +143,13 @@ export interface SyncRequestEnvelope {
   requesterAgentAddress?: string;
   requesterSignatureR?: string;
   requesterSignatureVS?: string;
+  /**
+   * Phase C — optional, UNSIGNED delta-sync hint (decimal `uint256` string).
+   * When set, the responder returns only KAs whose KC `dkg:batchId` is
+   * strictly greater than this. Outside `computeSyncDigest` (narrowing-only,
+   * like `phase`/`snapshotRef`), so it's additive and backward-compatible.
+   */
+  sinceBatchId?: string;
 }
 
 // ── Public error classes ────────────────────────────────────────────

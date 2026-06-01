@@ -44,7 +44,16 @@ interface DurableSyncContext {
     phase: 'data' | 'meta',
     graphUri: string,
     deadline: number,
+    snapshotRef?: string,
+    sinceBatchId?: string,
   ) => Promise<SyncPageResult>;
+  /**
+   * Phase C — optional, gap-safe per-CG delta high-water mark resolver. When it
+   * returns a value for a CG, the durable DATA fetch carries `sinceBatchId` and
+   * the responder returns only KAs with `dkg:batchId` greater than it. MUST be
+   * backed by a CONTIGUOUS watermark. Undefined ⇒ full scan (default today).
+   */
+  sinceBatchIdFor?: (contextGraphId: string) => string | undefined;
   processDurableBatchInWorker: (dataQuads: Quad[], metaQuads: Quad[], ctx: OperationContext, acceptUnverified: boolean) => Promise<{
     verifiedData: Quad[];
     verifiedMeta: Quad[];
@@ -72,6 +81,7 @@ export async function runDurableSync(context: DurableSyncContext): Promise<Durab
     onAccessDenied,
     createContextGraphSyncDeadline,
     fetchSyncPages,
+    sinceBatchIdFor,
     processDurableBatchInWorker,
     storeInsert,
     deleteCheckpoint,
@@ -112,7 +122,7 @@ export async function runDurableSync(context: DurableSyncContext): Promise<Durab
       let dataResult;
       try {
         metaResult = await fetchSyncPages(ctx, remotePeerId, pid, false, 'meta', metaGraph, deadline);
-        dataResult = await fetchSyncPages(ctx, remotePeerId, pid, false, 'data', dataGraph, deadline);
+        dataResult = await fetchSyncPages(ctx, remotePeerId, pid, false, 'data', dataGraph, deadline, undefined, sinceBatchIdFor?.(pid));
       } catch (pidErr) {
         // `runDurableSync` has a catch-all below that sets `deniedPhases`
         // when a sync is rejected, but it collapses "which CG was

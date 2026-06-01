@@ -18,21 +18,9 @@ import { listAssertions } from '../src/ui/api.js';
 // parser code-path under test verbatim. Same pattern as
 // `use-swm-attributions.test.ts` from the prior round.
 
-// #844 fix — WM listing now derives from the `<cg>/_meta` lifecycle graph
-// (filtering on `dkg:memoryLayer "WM"`) rather than enumerating data graphs,
-// because #844 gated the WM view's `GRAPH ?g` enumeration. The SPARQL applies
-// the `"WM"` filter server-side, so a mocked response represents rows the
-// daemon already filtered to WM; these fixtures exercise the JS mapping
-// (binding → {name, graphUri, subGraph}, dedup, skip-incomplete).
-//
-// Binding shape mirrors the new SELECT: ?assertion (lifecycle URN, used as
-// graphUri), ?name (dkg:assertionName), optional ?sg (dkg:subGraphName).
-function metaRow(opts: { assertion: string; name?: string; sg?: string; assertionGraph?: string }) {
-  const b: Record<string, { value: string }> = { assertion: { value: opts.assertion } };
-  if (opts.name !== undefined) b.name = { value: opts.name };
-  if (opts.sg !== undefined) b.sg = { value: opts.sg };
-  if (opts.assertionGraph !== undefined) b.assertionGraph = { value: opts.assertionGraph };
-  return b;
+function bRow(g: string, cnt: number) {
+  // Daemon's SPARQL JSON-binding shape: object with `value`.
+  return { g: { value: g }, cnt: { value: String(cnt) } };
 }
 
 function jsonResponse(body: unknown) {
@@ -43,7 +31,7 @@ function jsonResponse(body: unknown) {
   } as any;
 }
 
-describe('listAssertions (WM) — derives from _meta (memoryLayer="WM")', () => {
+describe('listAssertions (WM) — URI parse + cg-scoped filter', () => {
   let originalFetch: typeof globalThis.fetch | undefined;
   let fetchMock: ReturnType<typeof vi.fn>;
 
@@ -63,36 +51,27 @@ describe('listAssertions (WM) — derives from _meta (memoryLayer="WM")', () => 
     );
   }
 
-  it('queries the <cg>/_meta graph filtered to memoryLayer "WM"', async () => {
+  it('parses root-bucket assertion: name extracted, subGraph undefined', async () => {
     setBindings([
-      metaRow({ assertion: 'urn:dkg:assertion:cg-A:0xabc:notes', name: 'notes' }),
-    ]);
-    await listAssertions('cg-A', 'wm');
-    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
-    expect(body.sparql).toContain('did:dkg:context-graph:cg-A/_meta');
-    expect(body.sparql).toContain('memoryLayer> "WM"');
-    expect(body.sparql).toContain('assertionName');
-    // assertionGraph is bound again (pre-#710 sub-graph fallback).
-    expect(body.sparql).toContain('assertionGraph');
-  });
-
-  it('maps a root-bucket WM assertion: name + lifecycle-URN graphUri, subGraph undefined', async () => {
-    setBindings([
-      metaRow({ assertion: 'urn:dkg:assertion:cg-A:0xabc:notes', name: 'notes' }),
+      bRow('did:dkg:context-graph:cg-A/assertion/0xabc/notes', 5),
     ]);
     const out = await listAssertions('cg-A', 'wm');
     expect(out).toHaveLength(1);
     expect(out[0]).toMatchObject({
       name: 'notes',
-      graphUri: 'urn:dkg:assertion:cg-A:0xabc:notes',
+      graphUri: 'did:dkg:context-graph:cg-A/assertion/0xabc/notes',
+      tripleCount: 5,
       subGraph: undefined,
     });
   });
 
-  it('surfaces sub-graph-scoped + root rows; subGraph comes from dkg:subGraphName (#710)', async () => {
+  it('parses sub-graph-scoped + root in the same response (#706 regression guard)', async () => {
+    // Both shapes must surface. Pre-fix, the `startsWith(…/assertion/)`
+    // filter silently dropped sub-graph rows entirely; this test
+    // pins that they're surfaced AND that the slug + name parse out.
     setBindings([
-      metaRow({ assertion: 'urn:dkg:assertion:cg-A:0xabc:root-doc', name: 'root-doc' }),
-      metaRow({ assertion: 'urn:dkg:assertion:cg-A:research:0xabc:scoped-doc', name: 'scoped-doc', sg: 'research' }),
+      bRow('did:dkg:context-graph:cg-A/assertion/0xabc/root-doc', 3),
+      bRow('did:dkg:context-graph:cg-A/research/assertion/0xabc/scoped-doc', 7),
     ]);
     const out = await listAssertions('cg-A', 'wm');
     expect(out).toHaveLength(2);
@@ -100,83 +79,122 @@ describe('listAssertions (WM) — derives from _meta (memoryLayer="WM")', () => 
     const scoped = out.find(a => a.name === 'scoped-doc')!;
     expect(root.subGraph).toBeUndefined();
     expect(scoped.subGraph).toBe('research');
-    expect(scoped.graphUri).toBe('urn:dkg:assertion:cg-A:research:0xabc:scoped-doc');
+    expect(scoped.tripleCount).toBe(7);
   });
 
-  it('pre-#710 compat: derives subGraph from the assertionGraph URI when subGraphName is absent', async () => {
-    // Drafts created before #710 carry dkg:assertionGraph but NO
-    // dkg:subGraphName. The sub-graph segment must be recovered from the
-    // assertion-graph URI so promote/preview stay correctly scoped.
+  it('silently drops malformed graph URIs that lack `/assertion/`', async () => {
+    // E.g. internal meta graphs, prefix-only matches, or any future
+    // graph layout that shares the CG prefix but isn't an assertion.
     setBindings([
-      metaRow({
-        assertion: 'urn:dkg:assertion:cg-A:legacy:0xabc:old-scoped',
-        name: 'old-scoped',
-        // no `sg` — pre-#710 row
-        assertionGraph: 'did:dkg:context-graph:cg-A/legacy/assertion/0xabc/old-scoped',
-      }),
-      // Root-bucket legacy row (assertionGraph has no sub-graph segment) →
-      // stays root, NOT misparsed.
-      metaRow({
-        assertion: 'urn:dkg:assertion:cg-A:0xabc:old-root',
-        name: 'old-root',
-        assertionGraph: 'did:dkg:context-graph:cg-A/assertion/0xabc/old-root',
-      }),
-    ]);
-    const out = await listAssertions('cg-A', 'wm');
-    expect(out).toHaveLength(2);
-    const scoped = out.find(a => a.name === 'old-scoped')!;
-    const root = out.find(a => a.name === 'old-root')!;
-    expect(scoped.subGraph).toBe('legacy');
-    expect(root.subGraph).toBeUndefined();
-  });
-
-  it('prefers the explicit subGraphName literal over the assertionGraph URI parse', async () => {
-    // When both are present, the literal wins (it is authoritative and the
-    // URI parse is only the migration fallback).
-    setBindings([
-      metaRow({
-        assertion: 'urn:dkg:assertion:cg-A:research:0xabc:both',
-        name: 'both',
-        sg: 'research',
-        assertionGraph: 'did:dkg:context-graph:cg-A/research/assertion/0xabc/both',
-      }),
-    ]);
-    const out = await listAssertions('cg-A', 'wm');
-    expect(out[0].subGraph).toBe('research');
-  });
-
-  it('skips bindings missing the lifecycle URN or the name', async () => {
-    setBindings([
-      metaRow({ assertion: 'urn:dkg:assertion:cg-A:0xabc:real', name: 'real' }),
-      metaRow({ assertion: 'urn:dkg:assertion:cg-A:0xabc:noname' }), // no ?name → skipped
-      { name: { value: 'orphan' } } as any,                          // no ?assertion → skipped
+      bRow('did:dkg:context-graph:cg-A/_meta', 12),
+      bRow('did:dkg:context-graph:cg-A/research', 1),
+      bRow('did:dkg:context-graph:cg-A/assertion/0xabc/real', 4),
     ]);
     const out = await listAssertions('cg-A', 'wm');
     expect(out).toHaveLength(1);
     expect(out[0].name).toBe('real');
   });
 
-  it('dedups repeated lifecycle URNs (e.g. multiple events for one assertion) to the first', async () => {
+  it('scopes by cgPrefix — only the queried cgId surfaces', async () => {
+    // Multi-CG responses can arise if the SPARQL is run against a
+    // wider store. The `startsWith(cgPrefix)` filter must reject
+    // bindings from other CGs. Note: the prefix is
+    // `did:dkg:context-graph:cg-A/` (trailing slash); a CG named
+    // `cg-A-suffix` has prefix `…cg-A-suffix/` which does NOT
+    // startsWith the queried prefix.
     setBindings([
-      metaRow({ assertion: 'urn:dkg:assertion:cg-A:0xabc:dup', name: 'dup' }),
-      metaRow({ assertion: 'urn:dkg:assertion:cg-A:0xabc:dup', name: 'dup' }),
+      bRow('did:dkg:context-graph:cg-OTHER/assertion/0xabc/other', 2),
+      bRow('did:dkg:context-graph:cg-A/assertion/0xabc/mine', 6),
+      bRow('did:dkg:context-graph:cg-A-suffix/assertion/0xabc/foo', 1),
     ]);
     const out = await listAssertions('cg-A', 'wm');
     expect(out).toHaveLength(1);
-    expect(out[0].name).toBe('dup');
+    expect(out[0].name).toBe('mine');
   });
 
-  it('does NOT set tripleCount (renderer guards tripleCount != null; mirrors SWM)', async () => {
+  it('returns an empty list when no bindings match the cg-prefix + /assertion/ filter', async () => {
     setBindings([
-      metaRow({ assertion: 'urn:dkg:assertion:cg-A:0xabc:notes', name: 'notes' }),
+      bRow('did:dkg:context-graph:cg-B/assertion/0xabc/foo', 1),
     ]);
     const out = await listAssertions('cg-A', 'wm');
-    expect(out[0].tripleCount).toBeUndefined();
+    expect(out).toEqual([]);
   });
 
-  it('returns an empty list when _meta has no WM assertions', async () => {
-    setBindings([]);
+  it('drops bindings with 3+ segments before `assertion/` (left-side strict shape)', async () => {
+    // Reviewer-flagged case: a binding like `<cg>/foo/bar/assertion/<a>/<n>`
+    // doesn't match either accepted shape (root = 3 segs, sub-graph =
+    // 4 segs). The prior `indexOf('/assertion/')` branch admitted it
+    // as a `subGraph: undefined` row with a mis-derived name —
+    // promote/preview lookups would silently miss. Strict-shape parse
+    // drops it.
+    setBindings([
+      bRow('did:dkg:context-graph:cg-A/foo/bar/assertion/0xabc/baz', 9),
+      bRow('did:dkg:context-graph:cg-A/assertion/0xabc/keep', 1),
+    ]);
     const out = await listAssertions('cg-A', 'wm');
-    expect(out).toEqual([]);
+    expect(out).toHaveLength(1);
+    expect(out[0].name).toBe('keep');
+  });
+
+  it('drops bindings with extra segments after the name (right-side strict shape)', async () => {
+    // Pins the right-side strict-shape contract. The sub-graph branch
+    // expects exactly `<sg>/assertion/<agent>/<name>` — anything
+    // longer would mis-extract the name and orphan the row from
+    // promote/preview.
+    setBindings([
+      bRow('did:dkg:context-graph:cg-A/sg/assertion/0xabc/foo/extra', 2),
+      bRow('did:dkg:context-graph:cg-A/sg/assertion/0xabc/clean', 3),
+    ]);
+    const out = await listAssertions('cg-A', 'wm');
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({
+      name: 'clean',
+      subGraph: 'sg',
+      tripleCount: 3,
+    });
+  });
+
+  it('opts into includeContextGraphPartitions so assertion partitions show up (#864 rc.12 follow-up)', async () => {
+    // Without this flag, `DKGQueryEngine.query` constrains `GRAPH ?g`
+    // expansion to the static `{<cg>, <cg>/_meta, <cg>/_shared_memory_meta}`
+    // allow-list, hiding every assertion data partition. The
+    // bulk-promote button then sees an empty assertion list, iterates
+    // zero times, and falls into the rc.12 "0 triples promoted" no-op
+    // branch even when WM clearly contains data. Pin the request body
+    // here so any future refactor that drops the opt-in fails this
+    // test instead of silently re-breaking promote-all.
+    setBindings([
+      bRow('did:dkg:context-graph:cg-A/assertion/0xabc/notes', 5),
+    ]);
+    await listAssertions('cg-A', 'wm');
+    expect(fetchMock).toHaveBeenCalledOnce();
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(String(url)).toContain('/api/query');
+    const body = JSON.parse(String(init.body));
+    expect(body).toMatchObject({
+      contextGraphId: 'cg-A',
+      includeContextGraphPartitions: true,
+    });
+    expect(typeof body.sparql).toBe('string');
+  });
+
+  it('scopes the /assertion/ discriminator to the tail when cgId itself contains "/assertion/"', async () => {
+    // PR #710 reviewer guard — `validateContextGraphId` permits
+    // slashes, so a cgId can literally contain `/assertion/` as a
+    // substring. The prior `g.indexOf('/assertion/')` (full URI)
+    // would have hit the cgId's internal `/assertion/` and
+    // mis-sliced the name. After tail-scoping the parse, the cgId
+    // is treated as opaque and only the tail's `/assertion/`
+    // delimiter is consulted.
+    setBindings([
+      bRow('did:dkg:context-graph:weird/assertion/cg/assertion/0xabc/foo', 4),
+    ]);
+    const out = await listAssertions('weird/assertion/cg', 'wm');
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({
+      name: 'foo',
+      subGraph: undefined,
+      tripleCount: 4,
+    });
   });
 });

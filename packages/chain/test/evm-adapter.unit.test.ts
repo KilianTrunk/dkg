@@ -244,6 +244,100 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
     expect(backup.getTransactionReceipt).not.toHaveBeenCalled();
   });
 
+  it('tries backup RPC when contract transaction population is rate-limited', async () => {
+    const a = new EVMChainAdapter(minimalConfig({
+      rpcUrl: 'https://primary.example',
+      rpcUrls: ['https://backup.example'],
+    }));
+    const primaryProvider = { name: 'primary' } as any;
+    const backupProvider = { name: 'backup' } as any;
+    const signer = new ethers.Wallet(DEPLOYER_PK, primaryProvider);
+    const receipt = { hash: '0xabc', blockNumber: 12, status: 1, logs: [] };
+    const populated = { to: '0x0000000000000000000000000000000000000001', data: '0x1234' };
+    const populateTransaction = vi.fn()
+      .mockImplementationOnce(async () => {
+        const err = new Error('429 too many requests');
+        (err as any).status = 429;
+        throw err;
+      })
+      .mockResolvedValueOnce(populated);
+    const runners: any[] = [];
+    const contract = {
+      connect: vi.fn((runner: any) => {
+        runners.push(runner);
+        return { createContextGraph: { populateTransaction } };
+      }),
+    };
+    (a as any).providers = [primaryProvider, backupProvider];
+    (a as any).signPopulatedTransaction = vi.fn(async () => ({
+      signedTx: '0xdeadbeef',
+      txHash: receipt.hash,
+    }));
+    (a as any).sendSignedTransactionAndWait = vi.fn(async () => receipt);
+
+    await expect((a as any).sendContractTransaction(
+      contract,
+      'createContextGraph',
+      [],
+      signer,
+      'create on-chain context graph',
+    )).resolves.toBe(receipt);
+
+    expect(populateTransaction).toHaveBeenCalledTimes(2);
+    expect(runners.map((runner) => runner.provider)).toEqual([primaryProvider, backupProvider]);
+    expect((a as any).signPopulatedTransaction).toHaveBeenCalledWith(
+      runners[1],
+      populated,
+    );
+  });
+
+  it('names exhausted RPC endpoints when transaction population fails everywhere', async () => {
+    const a = new EVMChainAdapter(minimalConfig({
+      rpcUrl: 'https://primary.example',
+      rpcUrls: ['https://backup.example'],
+    }));
+    const primaryProvider = { name: 'primary' } as any;
+    const backupProvider = { name: 'backup' } as any;
+    const signer = new ethers.Wallet(DEPLOYER_PK, primaryProvider);
+    const populateTransaction = vi.fn(async () => {
+      const err = new Error('429 too many requests');
+      (err as any).status = 429;
+      throw err;
+    });
+    const contract = {
+      connect: vi.fn(() => ({ createContextGraph: { populateTransaction } })),
+    };
+    (a as any).providers = [primaryProvider, backupProvider];
+    (a as any).signPopulatedTransaction = vi.fn(async () => ({
+      signedTx: '0xdeadbeef',
+      txHash: '0xabc',
+    }));
+    (a as any).sendSignedTransactionAndWait = vi.fn(async () => ({}));
+
+    let thrown: any;
+    try {
+      await (a as any).sendContractTransaction(
+        contract,
+        'createContextGraph',
+        [],
+        signer,
+        'create on-chain context graph',
+      );
+    } catch (err) {
+      thrown = err;
+    }
+
+    expect(thrown).toMatchObject({
+      code: 'RPC_ENDPOINTS_EXHAUSTED',
+      rpcUrls: ['https://primary.example', 'https://backup.example'],
+    });
+    expect(thrown.message).toContain('https://primary.example');
+    expect(thrown.message).toContain('https://backup.example');
+    expect(populateTransaction).toHaveBeenCalledTimes(2);
+    expect((a as any).signPopulatedTransaction).not.toHaveBeenCalled();
+    expect((a as any).sendSignedTransactionAndWait).not.toHaveBeenCalled();
+  });
+
   it('broadcasts the exact same signed raw transaction to backup after primary send failure', async () => {
     const a = new EVMChainAdapter(minimalConfig({
       rpcUrl: 'https://primary.example',
@@ -270,6 +364,107 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
     await expect((a as any).sendSignedTransactionAndWait(signedTx, txHash, 'unit write')).resolves.toBe(receipt);
     expect(primary.broadcastTransaction).toHaveBeenCalledWith(signedTx);
     expect(backup.broadcastTransaction).toHaveBeenCalledWith(signedTx);
+  });
+
+  it('preserves the transaction hash when post-broadcast receipt lookup exhausts RPC endpoints', async () => {
+    const a = new EVMChainAdapter(minimalConfig({
+      rpcUrl: 'https://primary.example',
+      rpcUrls: ['https://backup.example'],
+    }));
+    const signedTx = '0xdeadbeef';
+    const txHash = '0x' + '55'.repeat(32);
+    const primaryProvider = {
+      name: 'primary',
+      broadcastTransaction: vi.fn(async () => ({ hash: txHash })),
+      getTransactionReceipt: vi.fn(async () => {
+        const err = new Error('429 too many requests');
+        (err as any).status = 429;
+        throw err;
+      }),
+    };
+    const backupProvider = {
+      name: 'backup',
+      broadcastTransaction: vi.fn(async () => ({ hash: txHash })),
+      getTransactionReceipt: vi.fn(async () => {
+        const err = new Error('502 bad gateway');
+        (err as any).status = 502;
+        throw err;
+      }),
+    };
+    const signer = new ethers.Wallet(DEPLOYER_PK, primaryProvider as any);
+    const populated = { to: '0x0000000000000000000000000000000000000001', data: '0x1234' };
+    const populateTransaction = vi.fn(async () => populated);
+    const contract = {
+      connect: vi.fn(() => ({ createContextGraph: { populateTransaction } })),
+    };
+    (a as any).providers = [primaryProvider, backupProvider];
+    (a as any).signPopulatedTransaction = vi.fn(async () => ({ signedTx, txHash }));
+
+    await expect((a as any).sendContractTransaction(
+      contract,
+      'createContextGraph',
+      [],
+      signer,
+      'create on-chain context graph',
+    )).rejects.toMatchObject({
+      code: 'RPC_RECEIPT_LOOKUP_FAILED',
+      txHash,
+    });
+    expect(populateTransaction).toHaveBeenCalledTimes(1);
+    expect((a as any).signPopulatedTransaction).toHaveBeenCalledTimes(1);
+    expect(primaryProvider.broadcastTransaction).toHaveBeenCalledWith(signedTx);
+    expect(backupProvider.broadcastTransaction).not.toHaveBeenCalled();
+    expect(primaryProvider.getTransactionReceipt).toHaveBeenCalledWith(txHash);
+    expect(backupProvider.getTransactionReceipt).toHaveBeenCalledWith(txHash);
+  });
+
+  it('classifies receipt wait expiry as a timeout and preserves the transaction hash', async () => {
+    vi.useFakeTimers();
+    try {
+      const a = new EVMChainAdapter(minimalConfig());
+      const signedTx = '0xdeadbeef';
+      const txHash = '0x' + '66'.repeat(32);
+      const provider = {
+        name: 'primary',
+        broadcastTransaction: vi.fn(async () => ({ hash: txHash })),
+        getTransactionReceipt: vi.fn(async () => null),
+      };
+      const signer = new ethers.Wallet(DEPLOYER_PK, provider as any);
+      const populated = { to: '0x0000000000000000000000000000000000000001', data: '0x1234' };
+      const populateTransaction = vi.fn(async () => populated);
+      const contract = {
+        connect: vi.fn(() => ({ createContextGraph: { populateTransaction } })),
+      };
+      (a as any).providers = [provider];
+      (a as any).signPopulatedTransaction = vi.fn(async () => ({ signedTx, txHash }));
+
+      const thrown = (async () => {
+        try {
+          await (a as any).sendContractTransaction(
+            contract,
+            'createContextGraph',
+            [],
+            signer,
+            'create on-chain context graph',
+          );
+          return undefined;
+        } catch (err) {
+          return err;
+        }
+      })();
+      await vi.advanceTimersByTimeAsync(180_001);
+
+      await expect(thrown).resolves.toMatchObject({
+        code: 'TIMEOUT',
+        txHash,
+      });
+      expect(populateTransaction).toHaveBeenCalledTimes(1);
+      expect((a as any).signPopulatedTransaction).toHaveBeenCalledTimes(1);
+      expect(provider.broadcastTransaction).toHaveBeenCalledWith(signedTx);
+      expect(provider.getTransactionReceipt).toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('treats already-known transaction responses as accepted and polls receipts', async () => {
@@ -1422,6 +1617,60 @@ describe('ensureV10ApproveTrac — per-publish (default) approval gate', () => {
 
     expect(sendSpy).not.toHaveBeenCalled();
   });
+
+  it('zero-cost publish (#720 floor kicked in) → emits the operator-facing warn', async () => {
+    // #871 observability: when `tokenAmount === 0n` and the policy lifts
+    // `targetAllowance` to the 1n floor, the adapter logs a single
+    // `console.warn` so operators inspecting on-chain allowance can
+    // recognise the resulting "1 wei dust" as the documented #720
+    // workaround instead of mistaking it for a stuck approval.
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { a, signer, sendSpy } = makeV10Adapter(undefined, 0n);
+
+    await (a as any).ensureV10ApproveTrac(
+      signer,
+      V10_KA_ADDRESS,
+      0n,
+      'approve V10 publish TRAC',
+    );
+
+    // Approve still fires (behaviour unchanged).
+    expect(sendSpy).toHaveBeenCalledTimes(1);
+    expect(getApproveCallArgs(sendSpy).args).toEqual([V10_KA_ADDRESS, 1n]);
+
+    // And the diagnostic warn fires exactly once with the expected wording.
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    const message = warnSpy.mock.calls[0][0] as string;
+    expect(message).toContain('V10 per-publish auto-approve floor');
+    expect(message).toContain('#720 transferFrom-minimum workaround');
+    expect(message).toContain('tokenAmount=0');
+  });
+
+  it('legitimate 1-wei publish → approves 1n WITHOUT emitting the #720 warn (Codex on PR #875)', async () => {
+    // Negative case for the warn guard. A `tokenAmount === 1n` publish
+    // produces `targetAllowance === 1n` under per-publish too, but the
+    // 1-wei is the real publish cost — NOT the #720 floor workaround.
+    // The warn line would mislead operators if it fired here, so the
+    // guard requires `tokenAmount === 0n` in addition to the
+    // `targetAllowance === 1n` check.
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { a, signer, sendSpy } = makeV10Adapter(undefined, 0n);
+
+    await (a as any).ensureV10ApproveTrac(
+      signer,
+      V10_KA_ADDRESS,
+      1n,
+      'approve V10 publish TRAC',
+    );
+
+    // Approve still fires for the genuine 1-wei publish.
+    expect(sendSpy).toHaveBeenCalledTimes(1);
+    expect(getApproveCallArgs(sendSpy).args).toEqual([V10_KA_ADDRESS, 1n]);
+
+    // But the floor-workaround warn must NOT fire (it would be a false
+    // positive — see PR #875 review thread).
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
 });
 
 describe('ensureV10ApproveTrac — replenishing policy (high-volume operator default)', () => {
@@ -1675,3 +1924,254 @@ describe('ensureV10ApproveTrac — call-site invariants (publish vs update)', ()
   });
 });
 
+// -----------------------------------------------------------------------------
+// Regression tests for #870 — per-publish allowance check must target the
+// actual publish signer.
+//
+// Reported scenario: a fresh edge node reverted with
+// `TooLowAllowance(TRAC, 0, 1)` on `KnowledgeAssetsLifecycle.publish(...)`
+// even though the default `per-publish` policy should have auto-approved.
+// One candidate root cause was a wallet mismatch — the approval gate reading
+// allowance against signer A while `publishV10` later submitted from a
+// different signer B with 0 allowance.
+//
+// The tests below pin down the invariant end-to-end by driving
+// `createKnowledgeAssets` / `updateKnowledgeCollectionV10` with a multi-wallet
+// signer pool and asserting the approve sender is the wallet that goes on
+// to sign the publish / update tx. They catch any future refactor that
+// would reintroduce the mismatch — by reading allowance against `this.signer`
+// instead of `txSigner`, by rotating signers between the two steps, etc.
+// -----------------------------------------------------------------------------
+
+describe('createKnowledgeAssets / updateKnowledgeCollectionV10 — approval signer parity (#870)', () => {
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  const PARITY_KA_ADDRESS = '0x' + 'cd'.repeat(20);
+
+  function makeAllowanceByOwner(): Map<string, bigint> {
+    return new Map<string, bigint>();
+  }
+
+  function makeMultiWalletV10Adapter(allowanceByOwner: Map<string, bigint>) {
+    const a = new EVMChainAdapter(minimalConfig({
+      privateKey: DEPLOYER_PK,
+      additionalKeys: [OTHER_PK],
+    }));
+    const [walletA, walletB] = (a as any).signerPool as [ethers.Wallet, ethers.Wallet];
+
+    (a as any).initialized = true;
+
+    const tokenWithSigner = {
+      allowance: vi.fn(async (owner: string, _spender: string) => {
+        return allowanceByOwner.get(owner.toLowerCase()) ?? 0n;
+      }),
+      approve: vi.fn(),
+    };
+    (a as any).contracts.token = {
+      connect: vi.fn(() => tokenWithSigner),
+    };
+
+    const populateSpy = vi.fn(async () => ({
+      to: PARITY_KA_ADDRESS,
+      data: '0xdeadbeef',
+    }));
+    const kavContract = {
+      getAddress: vi.fn(async () => PARITY_KA_ADDRESS),
+      publish: { populateTransaction: populateSpy },
+      update: { populateTransaction: populateSpy },
+    };
+    (a as any).contracts.knowledgeAssetsLifecycle = {
+      connect: vi.fn(() => kavContract),
+      getAddress: vi.fn(async () => PARITY_KA_ADDRESS),
+    };
+
+    (a as any).contracts.contextGraphs = {
+      isAuthorizedPublisher: vi.fn(async () => true),
+    };
+
+    const sendSpy = vi.fn(async () => ({} as unknown));
+    (a as any).sendContractTransaction = sendSpy;
+
+    // Stop the publish/update flow right after the approval gate by throwing
+    // a sentinel at the signing step. We only need to observe the signer
+    // arguments at `ensureV10ApproveTrac` and `signPopulatedTransaction`.
+    const signSpy = vi.fn(async () => {
+      throw new Error('SENTINEL_STOP_AFTER_APPROVE');
+    });
+    (a as any).signPopulatedTransaction = signSpy;
+
+    return { a, walletA, walletB, tokenWithSigner, sendSpy, signSpy, populateSpy };
+  }
+
+  function makeV10PublishParams(publisherAddress?: string): any {
+    const params: any = {
+      publishOperationId: ethers.hexlify(ethers.randomBytes(32)),
+      contextGraphId: 7n,
+      merkleRoot: ethers.getBytes(ethers.keccak256(ethers.toUtf8Bytes('mr'))),
+      knowledgeAssetsAmount: 1,
+      byteSize: 100,
+      epochs: 1,
+      tokenAmount: 0n,
+      isImmutable: false,
+      merkleLeafCount: 1,
+      publisherNodeIdentityId: 0n,
+      author: {
+        address: publisherAddress ?? ethers.ZeroAddress,
+        signature: { r: new Uint8Array(32), vs: new Uint8Array(32) },
+        schemeVersion: 1,
+      },
+      ackSignatures: [],
+    };
+    if (publisherAddress) params.publisherAddress = publisherAddress;
+    return params;
+  }
+
+  it('publish path: approve fires from the wallet matching publisherAddress, NOT a sibling pool wallet with stale allowance', async () => {
+    // The exact #870 scenario:
+    //   - Pool = [walletA, walletB].
+    //   - walletA already has 10 TRAC allowance (e.g. left over from an
+    //     earlier op or another publisher in the same daemon).
+    //   - walletB has 0 allowance (fresh).
+    //   - The publisher binds the tx to walletB via `publisherAddress`.
+    //   - `ensureV10ApproveTrac` MUST read allowance(walletB, KA) and send
+    //     `approve(KA, 1n)` from walletB — NOT from walletA. The publish tx
+    //     that follows MUST also be signed by walletB.
+    //
+    // A regression that read allowance against `this.signer` (== walletA in
+    // this pool ordering) would see 10 TRAC ≥ 1n, skip approve, then submit
+    // a publish from walletB that reverts on-chain with
+    // `TooLowAllowance(TRAC, 0, 1)` — exactly the symptom in #870.
+    const allowanceByOwner = makeAllowanceByOwner();
+    const { a, walletA, walletB, tokenWithSigner, sendSpy, signSpy } =
+      makeMultiWalletV10Adapter(allowanceByOwner);
+    allowanceByOwner.set(walletA.address.toLowerCase(), 10n * 10n ** 18n);
+    allowanceByOwner.set(walletB.address.toLowerCase(), 0n);
+
+    await expect(
+      a.createKnowledgeAssets(makeV10PublishParams(walletB.address)),
+    ).rejects.toThrow('SENTINEL_STOP_AFTER_APPROVE');
+
+    expect(tokenWithSigner.allowance).toHaveBeenCalledWith(
+      walletB.address,
+      PARITY_KA_ADDRESS,
+    );
+    expect(tokenWithSigner.allowance).not.toHaveBeenCalledWith(
+      walletA.address,
+      PARITY_KA_ADDRESS,
+    );
+
+    expect(sendSpy).toHaveBeenCalledTimes(1);
+    const [, approveMethod, approveArgs, approveSender] = sendSpy.mock.calls[0];
+    expect(approveMethod).toBe('approve');
+    expect(approveArgs).toEqual([PARITY_KA_ADDRESS, 1n]);
+    expect(approveSender).toBe(walletB);
+
+    expect(signSpy).toHaveBeenCalledTimes(1);
+    expect(signSpy.mock.calls[0][0]).toBe(walletB);
+  });
+
+  it('publish path: when publisherAddress is omitted, round-robin signer is also the approve signer (no mid-flight rotation)', async () => {
+    // Without `publisherAddress`, `txSigner` is picked via
+    // `nextAuthorizedSigner` (round-robin among authorized wallets). The
+    // approval and the publish MUST target that same wallet — no signer swap
+    // between the two steps. A regression that called
+    // `nextAuthorizedSigner` again later in the flow would rotate to the
+    // next wallet and reintroduce the wallet-mismatch class of bug.
+    const allowanceByOwner = makeAllowanceByOwner();
+    const { a, walletA, tokenWithSigner, sendSpy, signSpy } =
+      makeMultiWalletV10Adapter(allowanceByOwner);
+
+    await expect(
+      a.createKnowledgeAssets(makeV10PublishParams()),
+    ).rejects.toThrow('SENTINEL_STOP_AFTER_APPROVE');
+
+    expect(tokenWithSigner.allowance).toHaveBeenCalledWith(
+      walletA.address,
+      PARITY_KA_ADDRESS,
+    );
+    const [, approveMethod, approveArgs, approveSender] = sendSpy.mock.calls[0];
+    expect(approveMethod).toBe('approve');
+    expect(approveArgs).toEqual([PARITY_KA_ADDRESS, 1n]);
+    expect(approveSender).toBe(walletA);
+    expect(signSpy.mock.calls[0][0]).toBe(walletA);
+  });
+
+  it('update path: approve fires from the on-chain publisher wallet, NOT a round-robin pick from the pool', async () => {
+    // `updateKnowledgeCollectionV10` resolves the signer by looking up
+    // `getLatestMerkleRootPublisher(kaId)` first; only if that wallet is not
+    // in the pool does it fall back to the publisherAddress hint or
+    // `nextSigner()` (round-robin). The approval gate MUST target the
+    // resolved wallet — otherwise a wallet with stale allowance from any
+    // other operation could falsely pass the gate while the actual update
+    // tx submits from a different wallet at 0 allowance.
+    const allowanceByOwner = makeAllowanceByOwner();
+    const { a, walletA, walletB, tokenWithSigner, sendSpy, signSpy } =
+      makeMultiWalletV10Adapter(allowanceByOwner);
+    // walletA — the default round-robin pick (index 0) — has plenty of
+    // allowance. walletB — the on-chain publisher of this KA — has none.
+    allowanceByOwner.set(walletA.address.toLowerCase(), 10n * 10n ** 18n);
+    allowanceByOwner.set(walletB.address.toLowerCase(), 0n);
+
+    // Mocks the update path needs in addition to the publish ones.
+    const kaId = 42n;
+    (a as any).contracts.knowledgeAssetStorage = {
+      getLatestMerkleRootPublisher: vi.fn(async () => walletB.address),
+      getMerkleRoots: vi.fn(async () => []),
+    };
+    (a as any).contracts.contextGraphStorage = {
+      kaToContextGraph: vi.fn(async () => 0n),
+    };
+    (a as any).resolveCurrentTokenAmount = vi.fn(async () => 0n);
+    (a as any).computeUpdateNewTokenAmount = vi.fn(async () => 0n);
+    (a as any).getIdentityId = vi.fn(async () => 0n);
+    // `provider.getNetwork()` is called for chainId; stub it so the update
+    // path doesn't try to hit the placeholder RPC.
+    (a as any).provider = {
+      getNetwork: vi.fn(async () => ({ chainId: 31337n })),
+    };
+
+    const updateParams: any = {
+      kaId,
+      newMerkleRoot: ethers.getBytes(ethers.keccak256(ethers.toUtf8Bytes('umr'))),
+      newByteSize: 100,
+      newMerkleLeafCount: 1,
+      newTokenAmount: 0n,
+      authorAddress: walletB.address,
+      authorR: new Uint8Array(32),
+      authorVS: new Uint8Array(32),
+      authorSchemeVersion: 1,
+      // Provide pre-signed ACKs so the update path skips the in-line
+      // `signer.signMessage(ackDigest)` step that would otherwise trip on
+      // our minimal mocking surface.
+      ackSignatures: [{
+        identityId: 1n,
+        r: new Uint8Array(32),
+        vs: new Uint8Array(32),
+      }],
+    };
+
+    await expect(
+      a.updateKnowledgeCollectionV10(updateParams),
+    ).rejects.toThrow('SENTINEL_STOP_AFTER_APPROVE');
+
+    expect(tokenWithSigner.allowance).toHaveBeenCalledWith(
+      walletB.address,
+      PARITY_KA_ADDRESS,
+    );
+    expect(tokenWithSigner.allowance).not.toHaveBeenCalledWith(
+      walletA.address,
+      PARITY_KA_ADDRESS,
+    );
+
+    expect(sendSpy).toHaveBeenCalledTimes(1);
+    const [, approveMethod, approveArgs, approveSender, approveLabel] =
+      sendSpy.mock.calls[0];
+    expect(approveMethod).toBe('approve');
+    expect(approveArgs).toEqual([PARITY_KA_ADDRESS, 1n]);
+    expect(approveSender).toBe(walletB);
+    expect(approveLabel).toBe('approve V10 update TRAC');
+
+    expect(signSpy).toHaveBeenCalledTimes(1);
+    expect(signSpy.mock.calls[0][0]).toBe(walletB);
+  });
+});

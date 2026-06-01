@@ -18,7 +18,7 @@ import {
   useMemoryEntities,
   canonicalEntityUri,
   isFirstClassEntity,
-  type TrustLevel, type MemoryEntity, type Triple,
+  type TrustLevel, type MemoryEntity, type Triple, type LayeredTriple,
 } from '../../hooks/useMemoryEntities.js';
 import { decodeRdfStringLiteral } from '../../../rdf-literal.js';
 import {
@@ -59,7 +59,7 @@ import {
   entityAuthorUri, transitionAgentUri, transitionAtISO,
   shortType, shortPred, entityMeta,
   buildLayerGraphOptions, getDescription, neighborhoodTriples, neutraliseBuiltinNamespaces,
-  matchesSearch, humanizeLabel, layerNoun, useLayerTriples,
+  matchesSearch, humanizeLabel, layerNoun, useLayerTriples, useCanonicalTriples, applyCanonicalAdmission,
   filterTriplesToEntities, admitTripleForScope,
   entityTimestamp, formatRelativeTime, formatTimelineBucket, formatTrailTimestamp,
   type LayerView, type LayerContentTab, type KAPane,
@@ -836,30 +836,26 @@ export function ProjectOverviewCard({
           ? 'One or more layer counts are currently a lower bound.'
           : 'Canonical current-layer entity counts.';
   const totalEntitiesValue = allLayerCountsUnavailable ? 'Unavailable' : layerSum.toLocaleString();
-  // Triples: canonical layer-correct total via `useLayerTriples`
-  // summed across all three layers (§4.2.1 trap — do NOT sum
-  // per-entity tripleCount, do NOT borrow SubGraphBar's
-  // `totalTriples` which excludes the root bucket, and do NOT
-  // read `allTriples.length` directly because it skips neither
-  // SWM cross-graph SPO duplication nor WM residue from promoted
-  // entities, both of which `useLayerTriples` correctly filters).
+  // Triples: canonical project-wide total via `useCanonicalTriples`
+  // (GH #819 helper — single source of truth for all aggregate
+  // triple-count surfaces).
   //
-  // GH #805 fix: prior shape `memory.allTriples?.length ?? 0`
-  // surfaced an inflated total on any CG with published SWM (the
-  // same SPO row appears in both `<cg>/_shared_memory` and per-
-  // sub-graph `<cg>/<sg>/_shared_memory` graphs) or post-promote
-  // WM residue (assertion graphs left on disk). Summing the
-  // layer-correct slices makes the Overview "Triples" match the
-  // per-layer LayerStats by construction.
+  // §4.2.1 trap reminder: do NOT sum per-entity tripleCount, do
+  // NOT borrow SubGraphBar's `totalTriples` which excludes the
+  // root bucket, do NOT read `allTriples.length` directly (it
+  // skips neither SWM cross-graph SPO duplication nor WM residue
+  // from promoted entities). PR #818 sweep 4's interim shape
+  // (sum-across-`useLayerTriples`) was closer but still dropped
+  // mixed-layer edges where one endpoint hadn't promoted past
+  // `t.layer`. The canonical helper's "drop only when BOTH
+  // endpoints moved past" rule keeps those edges as legitimate
+  // facts.
   //
   // Codex review bug B (still applies — partial-result preserving
   // behaviour is unchanged): when a layer query fails the slice
-  // is empty; sum stays a lower bound and the '+' suffix renders
-  // via `triplesIsPartial`.
-  const wmLayerTriples = useLayerTriples(memory, 'wm');
-  const swmLayerTriples = useLayerTriples(memory, 'swm');
-  const vmLayerTriples = useLayerTriples(memory, 'vm');
-  const triplesCount = wmLayerTriples.length + swmLayerTriples.length + vmLayerTriples.length;
+  // is empty; `total` stays a lower bound and the '+' suffix
+  // renders via `triplesIsPartial`.
+  const { total: triplesCount } = useCanonicalTriples(memory);
   const triplesIsPartial = !memory.loading && (memory.partial || hasUnavailableLayer);
   const triplesValue = allLayerCountsUnavailable
     ? 'Unavailable'
@@ -3954,30 +3950,133 @@ export function SubGraphOverviewGrid({
     return () => { cancelled = true; };
   }, [contextGraphId]);
 
-  // Bucket every triple by its origin sub-graph so each mini-graph renders
-  // just its slice. We dedupe on (s,p,o) and cap per-bucket via the
-  // shared `applyHeaviestSubjectsCap` helper at module scope (see the
-  // doc block there for the sampling / dense-pack / residual-fallback
-  // rationale carried over from sweeps 1-3).
-  const triplesBySubGraph = useMemo(() => {
-    const bySg = new Map<string, Triple[]>();
-    const seen = new Map<string, Set<string>>();
+  // GH #819 — canonical triple set: single helper call surfaces
+  // both the subtitle total AND the input for `triplesBySubGraph`
+  // + Root mini-card derivations below. Lock subtitle + Overview
+  // Triples stat + named cards' `tripleCount` + Root card to one
+  // source of truth.
+  // History: GH #805 swapped subtitle from `memory.allTriples.length`
+  // to a `useLayerTriples` layer-sum; that was correct on per-layer
+  // residue + cross-graph dedup but still dropped mixed-layer
+  // edges. The canonical helper's BOTH-endpoints-moved rule keeps
+  // those mixed-layer edges as facts.
+  const { total: subtitleTripleCount } = useCanonicalTriples(memory);
+
+  // GH #819 round 7 (Codex sweep 5 🔴 #14) — split the hydration
+  // gate from the failure gate. Round 6 collapsed both into one
+  // `canonicalIncomplete` flag and rendered the "Loading…"
+  // affordance for both — so a settled error/partial result kept
+  // masquerading as in-progress hydration forever.
+  //
+  // `MemoryLayerStatus` is `'loading' | 'ok' | 'error'`
+  // (`useMemoryEntities.ts:8`). `isHydrating` covers the transient
+  // state (initial fetch in flight, or any layer's status === 'loading');
+  // `isFailedOrPartial` covers the settled-incomplete state
+  // (hard error, partial result, or any layer's status === 'error').
+  // The badge matrix at the render site routes them to different
+  // affordances: loading → `…`, failed/partial → `0 triples` with
+  // a "Some layers unavailable" tooltip.
+  const layerStatuses = Object.values(memory.layerStatus ?? {});
+  const isHydrating =
+    memory.loading || layerStatuses.some(s => s === 'loading');
+  const isFailedOrPartial =
+    memory.error !== null
+    || memory.partial
+    || layerStatuses.some(s => s === 'error');
+
+  // Task #25 (PR #677) — entity-only filter for the mini-card
+  // thumbnails. Same rule the Entities tab uses; computed per card
+  // scoped to that card's sub-graph (Codex Ev_S2): an entity that's
+  // first-class in sub-graph B but only a value/provenance object in
+  // sub-graph A must not render on A's thumbnail. Per-sub-graph scope
+  // = `memory.entityList.filter(e => e.subGraphs.has(sg.name))`.
+  //
+  // GH #819 round 11 (Codex sweep 9 🔴 #19) — also consumed by the
+  // bucketer below for promoted-untagged row recovery (via
+  // `admitTripleForScope`), so it's hoisted above the bucketer's
+  // useMemo.
+  const entityUrisBySubGraph = useMemo(() => {
+    const out = new Map<string, Set<string>>();
+    for (const e of memory.entityList) {
+      const canonical = canonicalEntityUri(e.uri);
+      for (const sg of e.subGraphs) {
+        let s = out.get(sg);
+        if (!s) { s = new Set(); out.set(sg, s); }
+        s.add(canonical);
+      }
+    }
+    return out;
+  }, [memory.entityList]);
+
+  // Bucket every triple by its origin sub-graph so each mini-graph
+  // renders just its slice. Cap per-bucket via the shared
+  // `applyHeaviestSubjectsCap` helper at module scope (see its doc
+  // block for the sampling / dense-pack / residual-fallback
+  // rationale carried over from PR #818 sweeps 1-3).
+  //
+  // GH #819 round 4 (Codex sweep 2 🔴 #5) — apply the canonical
+  // admission rule (residue filter + canonical-SPO dedup) PER
+  // BUCKET. Per-call dedup state means cross-scope SPOs each admit
+  // in their own scope (round 3 🔴 #1 property preserved).
+  //
+  // GH #819 round 11 (Codex sweep 9 🔴 #19) — recover promoted-
+  // untagged rows. After promote/publish the daemon strips
+  // `subGraph` from triples; pre-round-11 we filtered to tagged
+  // rows only, so a fully-promoted subgraph's mini-card showed
+  // `0 triples` even though deep-dive listed the data. The rest
+  // of the UI recovers via `admitTripleForScope` entity-scope
+  // membership; the bucketer now mirrors that. Pass 1 keeps tagged
+  // rows in their declared bucket; pass 2 admits each untagged row
+  // to EVERY bucket whose `entityUrisBySubGraph` contains the
+  // subject or resource-object (no inner-loop break — a cross-
+  // membership entity's untagged edges legitimately appear in
+  // multiple subgraphs, preserving the round 3 #1 contract).
+  //
+  // `tripleCountBySubGraph` carries the pre-cap distinct total so
+  // the card stat reads the true count (decoupled from the
+  // post-cap rendered slice — same convention as Root card +
+  // PR #839 sweep 2's helper-extract contract).
+  const { triplesBySubGraph, tripleCountBySubGraph } = useMemo(() => {
+    const rawBySg = new Map<string, LayeredTriple[]>();
+    // Pass 1: tagged rows route to their declared bucket.
     for (const t of memory.allTriples) {
       if (!t.subGraph) continue;
-      const key = `${t.subject}|${t.predicate}|${t.object}`;
-      let s = seen.get(t.subGraph);
-      if (!s) { s = new Set(); seen.set(t.subGraph, s); }
-      if (s.has(key)) continue;
-      s.add(key);
-      let arr = bySg.get(t.subGraph);
-      if (!arr) { arr = []; bySg.set(t.subGraph, arr); }
-      arr.push({ subject: t.subject, predicate: t.predicate, object: t.object });
+      let arr = rawBySg.get(t.subGraph);
+      if (!arr) { arr = []; rawBySg.set(t.subGraph, arr); }
+      arr.push(t);
     }
-    for (const [sg, triples] of bySg) {
-      bySg.set(sg, applyHeaviestSubjectsCap(triples));
+    // Pass 2: untagged rows recover via entity-scope membership
+    // (`admitTripleForScope` with `isRoot: false` and the bucket's
+    // scoped URI set — same rule the rest of the UI uses for
+    // sub-graph scope, PR #839 sweep 2 helper-extract).
+    for (const t of memory.allTriples) {
+      if (t.subGraph) continue;
+      for (const [sg, scopedUris] of entityUrisBySubGraph) {
+        if (admitTripleForScope(t, { slug: sg, isRoot: false, scopedUris })) {
+          let arr = rawBySg.get(sg);
+          if (!arr) { arr = []; rawBySg.set(sg, arr); }
+          arr.push(t);
+          // No break — cross-membership entity's untagged edges
+          // legitimately appear in multiple subgraphs.
+        }
+      }
     }
-    return bySg;
-  }, [memory.allTriples]);
+    // Pass 3: apply canonical admission (residue + canonical-SPO
+    // dedup) per bucket independently.
+    const bySg = new Map<string, Triple[]>();
+    const countBySg = new Map<string, number>();
+    for (const [sg, rawRows] of rawBySg) {
+      const admitted = applyCanonicalAdmission(rawRows, memory.entities);
+      const stripped = admitted.map(t => ({
+        subject: t.subject,
+        predicate: t.predicate,
+        object: t.object,
+      }));
+      countBySg.set(sg, stripped.length);
+      bySg.set(sg, applyHeaviestSubjectsCap(stripped));
+    }
+    return { triplesBySubGraph: bySg, tripleCountBySubGraph: countBySg };
+  }, [memory.allTriples, memory.entities, entityUrisBySubGraph]);
 
   // Per-sub-graph layer counts — drives the mini pyramid on each card so
   // you can see at a glance which sub-graphs are mostly verified vs still
@@ -3995,25 +4094,6 @@ export function SubGraphOverviewGrid({
         if (e.trustLevel === 'verified') counts.vm++;
         else if (e.trustLevel === 'shared') counts.swm++;
         else counts.wm++;
-      }
-    }
-    return out;
-  }, [memory.entityList]);
-
-  // Task #25 (PR #677) — entity-only filter for the mini-card
-  // thumbnails. Same rule the Entities tab uses; computed per card
-  // scoped to that card's sub-graph (Codex Ev_S2): an entity that's
-  // first-class in sub-graph B but only a value/provenance object in
-  // sub-graph A must not render on A's thumbnail. Per-sub-graph scope
-  // = `memory.entityList.filter(e => e.subGraphs.has(sg.name))`.
-  const entityUrisBySubGraph = useMemo(() => {
-    const out = new Map<string, Set<string>>();
-    for (const e of memory.entityList) {
-      const canonical = canonicalEntityUri(e.uri);
-      for (const sg of e.subGraphs) {
-        let s = out.get(sg);
-        if (!s) { s = new Set(); out.set(sg, s); }
-        s.add(canonical);
       }
     }
     return out;
@@ -4087,31 +4167,46 @@ export function SubGraphOverviewGrid({
           // membership rule. Fall back to the server count if we have no
           // client set for this sub-graph (e.g. nothing yet hydrated).
           entityCount: cardEntityUris.size > 0 ? cardEntityUris.size : sg.entityCount,
-          tripleCount: sg.tripleCount,
+          // GH #819 — `tripleCount` reads the canonical per-subgraph
+          // pre-cap distinct total (`tripleCountBySubGraph` derived
+          // from `canonicalTriples` post-residue-filter +
+          // post-dedup). Card stat now agrees with the subtitle's
+          // distinct total when summed without double-counting
+          // cross-graph duplicates. Pre-#819 this read `sg.tripleCount`
+          // (daemon-reported raw count) which inflated on CGs with
+          // cross-graph SPO duplicates.
+          //
+          // GH #819 round 3 (Codex sweep 1 🔴 #3) — fallback to the
+          // daemon-reported `sg.tripleCount` while the canonical
+          // universe is INCOMPLETE for any reason: loading, hard
+          // error, partial result (some layer query failed), or any
+          // per-layer status not yet 'ok'. Round 2 gated only on
+          // `memory.loading` which missed the post-hydration error
+          // case (`loading` flips false but the canonical universe
+          // is still incomplete because a layer query failed).
+          //
+          // GH #819 round 5 (Codex sweep 3 🔴 #8) — never read the
+          // daemon-reported `sg.tripleCount`. The daemon route
+          // (`packages/cli/src/daemon/routes/context-graph.ts:769`)
+          // builds it via raw `COUNT(*)` SPARQL grouped by named
+          // graph and sums per first-path-segment — NO SPO-dedup,
+          // NO residue filter. So `sg.tripleCount` is structurally
+          // inflated by the same cross-graph dupes + WM residue
+          // this PR is removing. Earlier rounds tried to use it as
+          // a lower-bound fallback when canonical was incomplete;
+          // that was wrong — it's an UPPER bound (inflated), not a
+          // lower one. Render the client-canonical bucket honestly,
+          // even when a layer query errored mid-hydration: missing
+          // bucket → 0 (genuine empty), partial-hydrated → the
+          // count of what we could honestly admit. No upward clamp.
+          tripleCount: tripleCountBySubGraph.get(sg.name) ?? 0,
           triples: filterTriplesToEntities(rawTriples, cardEntityUris),
           layerCounts: layerCountsBySubGraph.get(sg.name) ?? { wm: 0, swm: 0, vm: 0 },
           entityTrustByUri: cardEntityTrust,
         };
       })
       .sort((a, b) => a.rank - b.rank);
-  }, [subGraphs, profile, triplesBySubGraph, layerCountsBySubGraph, entityUrisBySubGraph, entityTrustByUriBySubGraph]);
-
-  // GH #805 — subtitle triple total swapped to the same
-  // `useLayerTriples` layer-sum derivation now used by the
-  // Overview Triples stat (`:801`). Pre-GH-#805 the subtitle
-  // read `memory.allTriples.length` directly (canonical-source
-  // discipline established by round 4.1's chip-row anchor); that
-  // anchor was correct *given* the upstream value was honest, but
-  // `allTriples` lifts SWM cross-graph SPO duplicates + WM residue,
-  // so even the chip-row-anchored value was over-counting on CGs
-  // with published SWM or promoted entities. Summing per-layer
-  // slices restores the "subtitle agrees with LayerStats" invariant
-  // round 4.1 was actually after.
-  const wmSubtitleTriples = useLayerTriples(memory, 'wm');
-  const swmSubtitleTriples = useLayerTriples(memory, 'swm');
-  const vmSubtitleTriples = useLayerTriples(memory, 'vm');
-  const subtitleTripleCount =
-    wmSubtitleTriples.length + swmSubtitleTriples.length + vmSubtitleTriples.length;
+  }, [subGraphs, profile, triplesBySubGraph, tripleCountBySubGraph, layerCountsBySubGraph, entityUrisBySubGraph, entityTrustByUriBySubGraph]);
 
   // GH #813 — Root mini-card. Synthesizes a card for the
   // "entities not in any named sub-graph" bucket so the grid
@@ -4192,37 +4287,47 @@ export function SubGraphOverviewGrid({
     // canonical-URI membership check + canonical SPO-dedup key
     // still apply on the symmetric-with-named universe.
     //
-    // PR #818 Codex sweep 6 — admission rule symmetry. Sweep 4's
-    // inline check was OR-membership ("admit if either endpoint
-    // is in rootEntityUris"), but named cards route through
-    // `filterTriplesToEntities(rawTriples, cardEntityUris)` at
-    // `:4051`, which is AND-membership with an `rdf:type`
-    // exemption. User caught the divergence on `ui-refresh`:
-    // entity `urn:epcis:...:gtin:50127962004651:lot:P240526X`
-    // lives in `epcis-supply-chain` (subGraphs non-empty → not
-    // in rootEntityUris → correctly absent from the Root entity
-    // list), but the daemon ships untagged copies of its triples
-    // in `<cg>/_shared_memory`. Pre-sweep-6 OR-membership
-    // admitted those rows because the SUBJECT was in
-    // rootEntityUris (a different entity), so the non-root
-    // object rendered as a node — Root mini-graph had more
-    // nodes than the badge claimed.
+    // PR #818 Codex sweep 6 — admission rule symmetry. Named
+    // cards route through `filterTriplesToEntities(rawTriples,
+    // cardEntityUris)` at `:4051` (AND-membership with rdf:type
+    // exemption). User caught the divergence on `ui-refresh`:
+    // pre-sweep-6 OR-membership admitted rows whose non-root
+    // object rendered as a phantom node in the Root mini-graph.
     //
-    // Fix: dedup SPO first (Bug M canonicalization preserved),
-    // then route through `filterTriplesToEntities` so admission
-    // matches the named-card rule exactly. Same machinery now
-    // includes the same AND-membership + rdf:type exemption.
-    const candidateTriples: Triple[] = [];
-    const seenSpo = new Set<string>();
-    for (const t of memory.allTriples) {
-      if (t.subGraph) continue;
-      const subjCanon = canonicalEntityUri(t.subject);
-      const objCanon = canonicalEntityUri(t.object);
-      const key = `${subjCanon}|${t.predicate}|${objCanon}`;
-      if (seenSpo.has(key)) continue;
-      seenSpo.add(key);
-      candidateTriples.push({ subject: t.subject, predicate: t.predicate, object: t.object });
-    }
+    // GH #819 round 4 (Codex sweep 2 🔴 #7) — Root candidates
+    // are root-scoped rows (`!t.subGraph`) from raw
+    // `memory.allTriples`, then passed through
+    // `applyCanonicalAdmission` for independent per-scope
+    // residue + SPO dedup. Pre-round-4 this filtered
+    // `canonicalTriples` (which had already been GLOBALLY
+    // deduped) for `!t.subGraph` rows — order-dependent: if a
+    // tagged copy of the same SPO arrived first in the global
+    // pass, the root copy lost the dedup race and `filter(!t.subGraph)`
+    // dropped the surviving entry, leaving Root showing 0.
+    // Same root-cause family as 🔴 #5 — global dedup namespace
+    // collided with per-scope needs. Per-call namespace via
+    // `applyCanonicalAdmission` fixes both.
+    //
+    // Then routed through `filterTriplesToEntities` for AND-
+    // membership + rdf:type exemption (PR #818 sweep 6
+    // admission rule preserved).
+    const rootScopedRaw = memory.allTriples.filter(t => !t.subGraph);
+    const candidateTriples = applyCanonicalAdmission(rootScopedRaw, memory.entities)
+      .map(t => ({ subject: t.subject, predicate: t.predicate, object: t.object }));
+    // GH #819 round 11 (Codex sweep 9 🟡 #20) — Root tripleCount
+    // is the PRE-`filterTriplesToEntities` candidate count, mirroring
+    // the named-card contract (`tripleCountBySubGraph` is set from
+    // `applyCanonicalAdmission` output, also pre-filter). Pre-round-11
+    // Root read `rootTriples.length` (post-AND-filter), so an
+    // untagged root-scoped edge to a non-root entity contributed to
+    // the subtitle total (canonical pass admits it) but showed as
+    // 0 on the Root card (AND-filter drops it because the non-root
+    // object isn't in `rootEntityUris`). Stat (0) === rendered (0)
+    // meant the β stat-vs-rendered tooltip never fired — no
+    // disclosure of the asymmetry. Carrying the pre-filter count
+    // restores symmetry with named cards and lets the β tooltip
+    // fire naturally when the count exceeds the rendered slice.
+    const rootTripleCount = candidateTriples.length;
     const rootTriples = filterTriplesToEntities(candidateTriples, rootEntityUris);
     // PR #818 Codex sweep 4 (finding 3) — shared cap helper. The
     // earlier inline copy duplicated the named-card sampling shape
@@ -4248,12 +4353,12 @@ export function SubGraphOverviewGrid({
       // Mirrors the named-card behaviour where `sg.tripleCount`
       // (daemon-reported) decouples the badge from the rendered
       // slice.
-      tripleCount: rootTriples.length,
+      tripleCount: rootTripleCount,
       triples: cappedRootTriples,
       layerCounts: { wm, swm, vm },
       entityTrustByUri: rootEntityTrust,
     };
-  }, [memory.entityList, memory.allTriples, profile]);
+  }, [memory.entityList, memory.allTriples, memory.entities, profile]);
 
   if (loading && cards.length === 0) {
     return (
@@ -4359,6 +4464,8 @@ export function SubGraphOverviewGrid({
           <SubGraphMiniCard
             key={card.slug}
             card={card}
+            isHydrating={isHydrating}
+            isFailedOrPartial={isFailedOrPartial}
             onNodeClick={onNodeClick}
             onOpen={() => onSelectSubGraph(card.slug)}
           />
@@ -4372,6 +4479,8 @@ export function SubGraphOverviewGrid({
         <SubGraphMiniCard
           key={ROOT_SLUG_SENTINEL}
           card={rootCard}
+          isHydrating={isHydrating}
+          isFailedOrPartial={isFailedOrPartial}
           onNodeClick={onNodeClick}
           onOpen={() => onSelectSubGraph(ROOT_SLUG_SENTINEL)}
           variant="root"
@@ -4383,6 +4492,8 @@ export function SubGraphOverviewGrid({
 
 export function SubGraphMiniCard({
   card,
+  isHydrating = false,
+  isFailedOrPartial = false,
   onNodeClick,
   onOpen,
   variant,
@@ -4394,6 +4505,17 @@ export function SubGraphMiniCard({
     layerCounts: { wm: number; swm: number; vm: number };
     entityTrustByUri: Map<string, TrustLevel>;
   };
+  // GH #819 round 7 (Codex sweep 5 🔴 #14) — split hydration vs
+  // failure flags. `isHydrating` is the transient state (still
+  // fetching, no settled result yet); the badge renders the `…`
+  // loading affordance when bucket is empty. `isFailedOrPartial`
+  // is the settled-incomplete state (hard error or partial
+  // result); the badge keeps `0 triples` but adds a tooltip so
+  // users see the result is best-effort. Both default to false
+  // so consumers that don't thread the gates render the badge
+  // exactly as before.
+  isHydrating?: boolean;
+  isFailedOrPartial?: boolean;
   onNodeClick?: (node: any) => void;
   onOpen: () => void;
   // GH #813 — `root` opts into the quieter neutral-border chrome
@@ -4481,7 +4603,66 @@ export function SubGraphMiniCard({
       </div>
       <div className="v10-sgov-card-stats">
         <span className="v10-sgov-card-stat"><b>{card.entityCount}</b> entities</span>
-        <span className="v10-sgov-card-stat"><b>{card.tripleCount}</b> triples</span>
+        {/* GH #819 round 2 — conditional stat-vs-rendered tooltip
+            (ux-lead lock, option (i) from sweep 1 yellow finding).
+            When the in-scope canonical count differs from what
+            actually renders on the mini-graph (cross-card edges
+            whose other endpoint isn't in this subgraph drop via
+            `filterTriplesToEntities`, or `applyHeaviestSubjectsCap`
+            truncated a populated bucket), surface the gap via a
+            native `title` tooltip on the badge. When equal (most
+            common — no cross-card edges + bucket under the cap),
+            no tooltip is added so we don't add chrome to the
+            quiet case. Same conditional-when-it-has-something-to-
+            say pattern as S2's `Pending join requests` empty
+            state. */}
+        {/* GH #890 round 2 (Codex sweep 1 🟡 A) — bucket-aware
+            precedence. Round 1 (#882) made `isHydrating`
+            short-circuit the entire chain, so a mixed state
+            (some layers `loading`, others `error`) on a non-zero
+            bucket rendered the optimistic "still loading; count
+            may grow" tooltip and masked the known-incomplete
+            failure. Round 2 splits the precedence so the failure
+            disclosure wins everywhere except the zero-bucket
+            initial-fetch window:
+              1. hydrating + bucket 0 → `…` "Loading triples…"
+                 (loading affordance is the priority signal when
+                 we have no count yet — preserves the round 6 #11
+                 anti-flash contract: `useMemoryEntities`
+                 initializes `allTriples = []` so a real subgraph
+                 briefly shows 0 during initial fetch)
+              2. failed/partial (any bucket) → failure tooltip
+                 (wins over hydrating on non-zero — the count is
+                 already known-incomplete because a layer errored)
+              3. hydrating + bucket > 0 (no failure) → "still
+                 loading; count may grow" (#882 wording, only
+                 fires when no failure flag is set)
+              4. stat-vs-rendered mismatch → β literal (round 8)
+              5. otherwise → no tooltip */}
+        <span
+          className="v10-sgov-card-stat"
+          title={
+            isHydrating && card.tripleCount === 0
+              ? 'Loading triples for this subgraph…'
+              : isFailedOrPartial
+                ? card.tripleCount === 0
+                  ? 'Some layers unavailable; count may be incomplete.'
+                  : `${card.tripleCount} triples (some layers unavailable; count may be incomplete).`
+                : isHydrating
+                  ? `${card.tripleCount} triples (still loading; count may grow).`
+                  : card.tripleCount !== card.triples.length
+                    // GH #819 round 8 (Codex sweep 6 🟡 #4 / #9 / #12,
+                    // team-lead call β) — broader wording so the
+                    // tooltip covers both causes of stat-vs-rendered
+                    // gap: (1) cross-card edges whose other endpoint
+                    // sits outside the subgraph and (2) cap-trimmed
+                    // rows in dense buckets via `applyHeaviestSubjectsCap`.
+                    // Earlier copy blamed only cause (1); Codex
+                    // re-raised the cap-trim case 5 sweeps in a row.
+                    ? `${card.tripleCount} triples in this subgraph's scope; ${card.triples.length} rendered (some in-scope edges aren't drawn — either endpoints outside this subgraph, or cap-trimmed in dense buckets).`
+                    : undefined
+          }
+        ><b>{isHydrating && card.tripleCount === 0 ? '…' : card.tripleCount}</b> triples</span>
       </div>
       <div className="v10-sgov-card-pyramid">
         {/* compact mode collapses the empty-counts branch to `null`

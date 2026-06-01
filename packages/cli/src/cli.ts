@@ -28,6 +28,7 @@ import {
   releasesDir, activeSlot, swapSlot,
   slotEntryPoint, isStandaloneInstall, repoDir, isDkgMonorepo,
   resolveContextGraphs, resolveNetworkDefaultContextGraphs,
+  readNodeRoleFromConfigSync,
   type AutoUpdateConfig,
 } from './config.js';
 import { ApiClient } from './api-client.js';
@@ -357,29 +358,6 @@ async function loadQuadsFromInput(
 }
 
 /**
- * Synchronous best-effort read of `~/.dkg/config.json#nodeRole`. Used
- * by {@link resolveDaemonEntryPoint} which runs from supervisor /
- * spawn paths that cannot afford an async config load.
- *
- * Returns `'edge'` on any failure (default role) so a malformed or
- * missing config does NOT silently keep Edge nodes pinned to a stale
- * blue-green slot — the worst case is "we try the npm-global entry
- * and let the daemon's own startup error out with a useful message"
- * rather than "we run rc.10 instead of rc.12 because slots survived
- * the upgrade".
- */
-function readNodeRoleSync(): 'edge' | 'core' {
-  try {
-    const configPath = join(dkgDir(), 'config.json');
-    if (!existsSync(configPath)) return 'edge';
-    const parsed = JSON.parse(readFileSync(configPath, 'utf-8')) as { nodeRole?: unknown };
-    return parsed.nodeRole === 'core' ? 'core' : 'edge';
-  } catch {
-    return 'edge';
-  }
-}
-
-/**
  * Resolve the daemon entry point passed to spawned worker processes.
  *
  * OT-RFC-41 §4.1 / Bundle B1a: Edge nodes run from the npm-global
@@ -392,7 +370,7 @@ function readNodeRoleSync(): 'edge' | 'core' {
  */
 function resolveDaemonEntryPoint(): string {
   if (process.env.DKG_NO_BLUE_GREEN) return fileURLToPath(import.meta.url);
-  if (readNodeRoleSync() === 'edge') return fileURLToPath(import.meta.url);
+  if (readNodeRoleFromConfigSync() === 'edge') return fileURLToPath(import.meta.url);
   const rDir = releasesDir();
   if (existsSync(rDir)) {
     const entry = slotEntryPoint(join(rDir, 'current'));
@@ -405,6 +383,14 @@ function probeHostForApiHost(apiHost: string | undefined): string {
   if (!apiHost || apiHost === '0.0.0.0') return '127.0.0.1';
   if (apiHost === '::') return '::1';
   return apiHost;
+}
+
+function selectedDkgHomeForEnv(env: NodeJS.ProcessEnv): string {
+  return resolveDkgConfigHome({ env, isDkgMonorepo: isDkgMonorepo() });
+}
+
+function withSelectedDkgHome(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return { ...env, DKG_HOME: selectedDkgHomeForEnv(env) };
 }
 
 /**
@@ -474,6 +460,7 @@ async function maybeStartSupervisorLivenessWatcher(
 }
 
 async function runDaemonSupervisor(): Promise<void> {
+  process.env.DKG_HOME = selectedDkgHomeForEnv(process.env);
   const maxCrashRestarts = 5;
   let crashRestartCount = 0;
 
@@ -488,7 +475,7 @@ async function runDaemonSupervisor(): Promise<void> {
       [...process.execArgv, resolveDaemonEntryPoint(), 'daemon-worker'],
       {
         stdio: ['ignore', 'ignore', 'ignore'],
-        env: process.env,
+        env: withSelectedDkgHome(process.env),
       },
     );
 
@@ -1131,7 +1118,7 @@ program
     // declaration order first.
     const relayPreferredOpt = Array.isArray(opts.relayPreferred) ? (opts.relayPreferred as string[]) : [];
     const cleanedRelayPreferred = relayPreferredOpt.map((s) => s.trim()).filter((s) => s.length > 0);
-    const daemonEnv: NodeJS.ProcessEnv = { ...process.env };
+    const daemonEnv: NodeJS.ProcessEnv = withSelectedDkgHome(process.env);
     if (cleanedRelayPreferred.length > 0) {
       daemonEnv.DKG_RELAY_PREFERRED = cleanedRelayPreferred.join(',');
       console.log(
@@ -1225,7 +1212,7 @@ program
   .description('Show node status')
   .action(async () => {
     try {
-      const client = await ApiClient.connect();
+      const client = await ApiClient.connect({ allowConfigFallback: true });
       const s = await client.status();
       const uptime = formatUptime(s.uptimeMs);
       console.log(`  Node:      ${s.name}`);
@@ -1249,6 +1236,7 @@ program
       } else {
         console.log(`  Store:     ${backend}`);
       }
+      if (client.controlPlaneWarning) console.warn(client.controlPlaneWarning);
     } catch (err) {
       console.error(toErrorMessage(err));
       process.exit(1);

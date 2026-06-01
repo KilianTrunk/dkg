@@ -110,14 +110,15 @@ ka_owner_key() {
   owner=$($CHAIN_CALL DKGKnowledgeAssets ownerOf --json "[\"$kc\"]" 2>/dev/null \
     | pyf "d.get('result','') or ''" 2>/dev/null)
   [ -z "$owner" ] && return 1
-  python3 - "$DEVNET_DIR" "$owner" <<'PY'
+  python3 - "$DEVNET_DIR" "$owner" "$NUM_NODES" <<'PY'
 import json, os, sys
 devnet_dir = sys.argv[1]
 target = sys.argv[2].lower()
+max_node = int(sys.argv[3])
 # Try publisher-wallets.json first (where KA tokens are normally minted), then
 # operator wallets.json[0..N] as a fallback for nodes that pay publishes from
 # their op wallet directly.
-for n in range(1, 7):
+for n in range(1, max_node + 1):
     for fname in ("publisher-wallets.json", "wallets.json"):
         p = os.path.join(devnet_dir, f"node{n}", fname)
         if not os.path.exists(p): continue
@@ -186,6 +187,15 @@ pass() { record "$1" "$2" PASS "${3:-}"; }
 warn() { record "$1" "$2" WARN "${3:-}"; }
 fail() { record "$1" "$2" FAIL "${3:-}"; }
 
+case "$NUM_NODES" in ''|*[!0-9]*) fail PREFLIGHT topology "NUM_NODES must be a positive integer (got '$NUM_NODES')"; exit 2;; esac
+case "$NUM_CORE_NODES" in ''|*[!0-9]*) fail PREFLIGHT topology "NUM_CORE_NODES must be a positive integer (got '$NUM_CORE_NODES')"; exit 2;; esac
+if [ "$NUM_NODES" -lt 5 ] || [ "$NUM_CORE_NODES" -lt 1 ] || [ "$NUM_CORE_NODES" -gt 4 ] || [ "$NUM_CORE_NODES" -gt $((NUM_NODES - 2)) ]; then
+  fail PREFLIGHT topology "unsupported topology NUM_NODES=$NUM_NODES NUM_CORE_NODES=$NUM_CORE_NODES; rc12 validation currently requires >=5 nodes, 1..4 cores, and at least two edge nodes (e.g. 5/3 or 6/4)"
+  exit 2
+fi
+ALL_NODES_CSV=""
+for n in $(seq 1 "$NUM_NODES"); do ALL_NODES_CSV="${ALL_NODES_CSV}${ALL_NODES_CSV:+,}$n"; done
+
 pyf() { python3 -c '
 import sys, json
 expr = sys.argv[1]
@@ -198,13 +208,18 @@ except Exception: print("")
 
 # ── Bootstrap (optional) ─────────────────────────────────────────────────────
 if [ "${BOOTSTRAP:-0}" = "1" ]; then
-  section "BOOTSTRAP — wipe + start fresh 6-node devnet (4 core / 2 edge)"
+  section "BOOTSTRAP — wipe + start fresh ${NUM_NODES}-node devnet (${NUM_CORE_NODES} core / $((NUM_NODES-NUM_CORE_NODES)) edge)"
   log "Building project (ensure latest merged rc.12 binaries)..."
   ( cd "$REPO_ROOT" && pnpm run build ) >> "$LOG" 2>&1 || { log "FATAL: build failed"; exit 2; }
   log "devnet clean..."
   ( cd "$REPO_ROOT" && ./scripts/devnet.sh clean ) >> "$LOG" 2>&1 || true
-  log "devnet start 6 (NUM_CORE_NODES=4, publisher enabled)..."
-  ( cd "$REPO_ROOT" && NUM_CORE_NODES=4 DEVNET_ENABLE_PUBLISHER=1 ./scripts/devnet.sh start 6 ) >> "$LOG" 2>&1 \
+  log "devnet start $NUM_NODES (NUM_CORE_NODES=$NUM_CORE_NODES, publisher enabled)..."
+  # Honor caller's NUM_NODES / NUM_CORE_NODES (formerly hardcoded to 6/4). This
+  # lets memory-constrained machines run a smaller 5/3 topology while still
+  # exercising the full functional matrix. NODE_OPTIONS, if set in the parent
+  # env (e.g. --max-old-space-size=768), propagates to every daemon via the
+  # subshell + child node invocations in scripts/devnet.sh.
+  ( cd "$REPO_ROOT" && NUM_CORE_NODES="$NUM_CORE_NODES" DEVNET_ENABLE_PUBLISHER=1 ./scripts/devnet.sh start "$NUM_NODES" ) >> "$LOG" 2>&1 \
     || { log "FATAL: devnet start failed"; exit 2; }
   log "Waiting 45s for identity registration + RS prover bind..."
   sleep 45
@@ -305,6 +320,156 @@ for n in $(seq 1 "$NUM_CORE_NODES"); do
 done
 log "RS baseline (per-core): $(for n in $(seq 1 "$NUM_CORE_NODES"); do printf 'n%d=sub:%s/ticks:%s ' "$n" "${RS_BASE_SUB[$n]}" "${RS_BASE_TICKS[$n]}"; done)"
 
+# ── PROVISION: publishing-conviction accounts for every core ─────────────────
+# Why this exists: scripts/devnet.sh bootstrap stakes each core via
+# DKGStakingConvictionNFT.createConviction (so nodeStakeV10 > 0), but it does
+# NOT create publishing-conviction accounts or register publisher wallets as
+# agents on DKGPublishingConvictionNFT. The two systems are independent.
+#
+# Without this provisioning step, every core's Section A publish takes the
+# direct-spend (non-conviction) path even though the cost-discount surface
+# exists, and Section E below has nothing to assert against (the previous
+# release validation reported 2 WARNs here for exactly this reason:
+# `agentToAccountId(publisherWallet) == 0` and `balanceOf(operator) == 0`).
+#
+# We provision in the harness (rather than in devnet.sh) so the change stays
+# scoped to release validation. Production nodes would normally have these
+# accounts created by the operator out-of-band.
+#
+# Per-core flow (idempotent — skips if already provisioned):
+#   1. If agentToAccountId(publisherWallet) > 0  → skip (already wired).
+#   2. Deployer (Hardhat key 0, holds MINTER_ROLE) mints SKIP_PROV_TRAC
+#      (default 50_000) TRAC to the operator wallet.
+#   3. Operator approves DKGPublishingConvictionNFT to pull that TRAC.
+#   4. Operator calls createAccount(committedTRAC) → mints PCN NFT.
+#      tokenId == new accountId per PublishingConvictionStorage._nextAccountId.
+#   5. Operator calls registerAgent(accountId, publisherWallet) → maps the
+#      publisher wallet to the account so future publishes from that wallet
+#      route through the conviction discount path.
+#
+# 50_000 TRAC matches the 6-tier ladder in libraries/PublishingMathLib so the
+# account gets the "tier 6" (20%) discount, large enough to make the cost-diff
+# assertion in Section E unambiguously non-zero.
+#
+# This block is GATED on the parent env knob SKIP_PUB_CONV_PROVISION=1 — set
+# that if a future deployment changes the bootstrap to provision these
+# accounts itself (in which case the per-core skip in step 1 already covers
+# us, but the env knob avoids the wasted CHAIN_CALLs).
+section "PROVISION — publishing-conviction accounts + agents for core nodes (release-validation setup)"
+if [ "${SKIP_PUB_CONV_PROVISION:-0}" = "1" ]; then
+  warn PROVISION publishing-conviction-bootstrap "SKIP_PUB_CONV_PROVISION=1 — assuming bootstrap already provisioned every core (Section E will surface if not)"
+else
+  PCN_ADDR=$(python3 -c "import json;print(json.load(open('$CONTRACTS_JSON'))['contracts']['DKGPublishingConvictionNFT']['evmAddress'])" 2>/dev/null || echo "")
+  if [ -z "$PCN_ADDR" ]; then
+    warn PROVISION publishing-conviction-bootstrap "DKGPublishingConvictionNFT address not in $CONTRACTS_JSON — skipping provisioning (Section E will WARN)"
+  else
+    # Hardhat signer 0 (deployer, holds MINTER_ROLE on Token per
+    # packages/evm-module/deploy/active/002_deploy_token.ts). Kept inline
+    # rather than read from devnet.sh's HARDHAT_KEYS array to avoid coupling
+    # the harness to devnet.sh internals.
+    HARDHAT_DEPLOYER_KEY="${HARDHAT_DEPLOYER_KEY:-0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80}"
+    # Default 50_000 TRAC in wei (50_000 * 1e18).
+    PCN_COMMIT="${PCN_COMMIT_WEI:-50000000000000000000000}"
+    prov_ok=0; prov_skip=0; prov_fail=0
+    for n in $(seq 1 "$NUM_CORE_NODES"); do
+      pubFile="$DEVNET_DIR/node$n/publisher-wallets.json"
+      opFile="$DEVNET_DIR/node$n/wallets.json"
+      [ -f "$pubFile" ] && [ -f "$opFile" ] || {
+        log "  node$n: wallets missing (pub=$pubFile op=$opFile) — skipping"
+        prov_fail=$((prov_fail+1)); continue
+      }
+      nPubAddr=$(python3 -c "import json;print(json.load(open('$pubFile'))['wallets'][0]['address'])" 2>/dev/null || echo "")
+      nOpAddr=$(python3 -c "import json;print(json.load(open('$opFile'))['wallets'][0]['address'])" 2>/dev/null || echo "")
+      nOpKey=$(python3 -c "import json;print(json.load(open('$opFile'))['wallets'][0]['privateKey'])" 2>/dev/null || echo "")
+      if [ -z "$nPubAddr" ] || [ -z "$nOpAddr" ] || [ -z "$nOpKey" ]; then
+        log "  node$n: failed to parse wallet addresses/keys — skipping"
+        prov_fail=$((prov_fail+1)); continue
+      fi
+      # Idempotency — two-stage, because the provisioning flow is NOT
+      # atomic: a previous run can leave the operator holding a freshly
+      # minted PCA NFT even if `registerAgent` then failed (network
+      # blip, paymaster reject, deploy script crash). Re-minting via
+      # createAccount in that state would spend another PCN_COMMIT TRAC
+      # and leave a second NFT in the operator's wallet, which then
+      # shifts `tokenOfOwnerByIndex(..., 0)` and breaks the Section E
+      # transfer round-trip.
+      #
+      # Stage 1: agent already mapped → fully provisioned, skip.
+      existing=$($CHAIN_CALL DKGPublishingConvictionNFT agentToAccountId --json "[\"$nPubAddr\"]" 2>/dev/null | pyf "d.get('result','0')")
+      if [ "${existing:-0}" != "0" ]; then
+        log "  node$n: publisher ${nPubAddr:0:10}... already registered (accountId=$existing) — skipping"
+        prov_skip=$((prov_skip+1)); continue
+      fi
+      # Stage 2: operator already owns a PCA NFT but the agent mapping
+      # is missing → recover by calling registerAgent on the existing
+      # accountId instead of re-minting. tokenOfOwnerByIndex(.., 0) is
+      # the oldest token; using index 0 keeps the Section E transfer
+      # round-trip targeting the same token across reruns.
+      preBal=$($CHAIN_CALL DKGPublishingConvictionNFT balanceOf --json "[\"$nOpAddr\"]" 2>/dev/null | pyf "d.get('result','0')")
+      if [ "${preBal:-0}" -ge 1 ] 2>/dev/null; then
+        recoverAccId=$($CHAIN_CALL DKGPublishingConvictionNFT tokenOfOwnerByIndex --json "[\"$nOpAddr\",\"0\"]" 2>/dev/null | pyf "d.get('result','')")
+        if [ -n "$recoverAccId" ] && [ "$recoverAccId" != "0" ]; then
+          log "  node$n: operator ${nOpAddr:0:10}... already holds PCA NFT accountId=$recoverAccId (createAccount succeeded on a prior run, registerAgent did not) — recovering"
+          regR=$($CHAIN_CALL DKGPublishingConvictionNFT registerAgent --key "$nOpKey" --json "[\"$recoverAccId\",\"$nPubAddr\"]" 2>/dev/null)
+          if echo "$regR" | grep -q '"ok":true'; then
+            log "  node$n: recovered accountId=$recoverAccId, agent ${nPubAddr:0:10}... registered"
+            prov_ok=$((prov_ok+1)); continue
+          else
+            log "  node$n: recovery registerAgent failed: ${regR:0:160}"
+            prov_fail=$((prov_fail+1)); continue
+          fi
+        fi
+      fi
+      log "  node$n: provisioning publishing-conviction (publisher=${nPubAddr:0:10}..., op=${nOpAddr:0:10}..., commit=${PCN_COMMIT} wei)"
+      # 1) Mint TRAC to operator.
+      mintR=$($CHAIN_CALL Token mint --key "$HARDHAT_DEPLOYER_KEY" --json "[\"$nOpAddr\",\"$PCN_COMMIT\"]" 2>/dev/null)
+      if ! echo "$mintR" | grep -q '"ok":true'; then
+        log "  node$n: mint failed: ${mintR:0:160}"; prov_fail=$((prov_fail+1)); continue
+      fi
+      # 2) Operator approves the NFT contract to pull TRAC.
+      appR=$($CHAIN_CALL Token approve --key "$nOpKey" --json "[\"$PCN_ADDR\",\"$PCN_COMMIT\"]" 2>/dev/null)
+      if ! echo "$appR" | grep -q '"ok":true'; then
+        log "  node$n: approve failed: ${appR:0:160}"; prov_fail=$((prov_fail+1)); continue
+      fi
+      # 3) Operator creates publishing-conviction account (mints NFT).
+      createR=$($CHAIN_CALL DKGPublishingConvictionNFT createAccount --key "$nOpKey" --json "[\"$PCN_COMMIT\"]" 2>/dev/null)
+      if ! echo "$createR" | grep -q '"ok":true'; then
+        log "  node$n: createAccount failed: ${createR:0:160}"; prov_fail=$((prov_fail+1)); continue
+      fi
+      # 4) Discover the just-minted accountId. On a fresh bootstrap the
+      #    operator owns exactly one NFT (the one we just created).
+      #    tokenOfOwnerByIndex(operator, balance-1) is the most defensive
+      #    way to pick the newest token regardless of any prior holdings.
+      bal=$($CHAIN_CALL DKGPublishingConvictionNFT balanceOf --json "[\"$nOpAddr\"]" 2>/dev/null | pyf "d.get('result','0')")
+      if [ "${bal:-0}" -lt 1 ]; then
+        log "  node$n: post-createAccount balance=$bal (expected >=1) — cannot resolve accountId"
+        prov_fail=$((prov_fail+1)); continue
+      fi
+      newAccId=$($CHAIN_CALL DKGPublishingConvictionNFT tokenOfOwnerByIndex --json "[\"$nOpAddr\",\"$((bal-1))\"]" 2>/dev/null | pyf "d.get('result','')")
+      if [ -z "$newAccId" ] || [ "$newAccId" = "0" ]; then
+        log "  node$n: tokenOfOwnerByIndex returned empty/0 — cannot resolve accountId"
+        prov_fail=$((prov_fail+1)); continue
+      fi
+      # 5) Register publisher wallet as agent.
+      regR=$($CHAIN_CALL DKGPublishingConvictionNFT registerAgent --key "$nOpKey" --json "[\"$newAccId\",\"$nPubAddr\"]" 2>/dev/null)
+      if echo "$regR" | grep -q '"ok":true'; then
+        log "  node$n: provisioned accountId=$newAccId, agent ${nPubAddr:0:10}... registered"
+        prov_ok=$((prov_ok+1))
+      else
+        log "  node$n: registerAgent failed: ${regR:0:160}"; prov_fail=$((prov_fail+1))
+      fi
+    done
+    total=$((prov_ok + prov_skip))
+    if [ "$total" -eq "$NUM_CORE_NODES" ] && [ "$prov_fail" -eq 0 ]; then
+      pass PROVISION publishing-conviction-bootstrap "$prov_ok newly provisioned, $prov_skip already provisioned ($NUM_CORE_NODES/$NUM_CORE_NODES cores ready for Section E + conviction-routed Section A publishes)"
+    elif [ "$total" -ge 1 ]; then
+      warn PROVISION publishing-conviction-bootstrap "$prov_ok newly provisioned, $prov_skip already provisioned, $prov_fail failed (Section E may show partial coverage)"
+    else
+      fail PROVISION publishing-conviction-bootstrap "no cores provisioned ($prov_fail failed) — Section E will WARN"
+    fi
+  fi
+fi
+
 # ── Section H: CG creation matrix + invitations ──────────────────────────────
 section "H. CONTEXT GRAPHS — create $TARGET_CGS registered CGs (public + curated) from cores & edges, with curator invites"
 RUN_TAG="${RUN_TAG:-$(date -u +%s)}"
@@ -337,7 +502,7 @@ for i in $(seq 1 "$NUM_PUBLIC"); do
   cgid="rc12-pub-${RUN_TAG}-${i}"
   res=$(create_public_cg "$node" "$cgid")
   if [ "$res" = "OK" ]; then
-    printf '%s\tpublic\t%s\t1,2,3,4,5,6\n' "$cgid" "$node" >> "$CG_LIST_FILE"
+    printf '%s\tpublic\t%s\t%s\n' "$cgid" "$node" "$ALL_NODES_CSV" >> "$CG_LIST_FILE"
     CG_CREATED=$((CG_CREATED+1))
   else
     log "  public CG create failed on node$node: ${res:0:200}"
@@ -857,14 +1022,65 @@ else
   warn D conviction-multiplier "ConvictionStakingStorage ABI or N1 op address missing"
 fi
 
-# Reward claim execution. Best-effort: semantics are NFT-gated and lock-aware,
-# so a no-op revert is acceptable, but we PASS only when the chain confirms.
-if [ -n "$N1_OP" ] && [ -n "$methods" ] && echo "$methods" | grep -qiw claimRewards; then
-  cr=$($CHAIN_CALL DKGStakingConvictionNFT claimRewards --key "$N1_OP" --json "[]" 2>/dev/null)
-  echo "$cr" | grep -q '"ok":true' && pass D reward-claim-exec "claimRewards tx landed" \
-    || warn D reward-claim-exec "claimRewards exec inconclusive: ${cr:0:140}"
+# Reward claim execution. V10's actual entrypoint is `claim(uint256 tokenId)`
+# (position-scoped), NOT `claimRewards()`. The previous harness probed for a
+# zero-arg `claimRewards()` method and WARNed every run when the autodiscovery
+# missed. The earlier "fix" in this PR's first commit also missed because it
+# hard-coded `claimRewards` as the method name — the actual ABI is just
+# `claim`. Confirmed via:
+#   python3 -c "import json;[print(f['name'])
+#                for f in json.load(open('packages/evm-module/abi/DKGStakingConvictionNFT.json'))
+#                if f.get('type')=='function']" | grep -iE 'claim|withdraw'
+# → claim, withdraw (no claimRewards).
+#
+# We iterate up to MAX_CLAIM_PROBES of node1's positions and call
+# `claim(tokenId)` signed by the operator on each. A revert is acceptable
+# (typically "no claimable rewards yet" on a fresh devnet where no epoch
+# boundary has rolled), but at least one position must be attempted for the
+# gate to PASS as informational coverage.
+MAX_CLAIM_PROBES="${MAX_CLAIM_PROBES:-3}"
+if [ -n "$N1_OP" ] && [ -n "$N1_OPADDR" ] && [ -n "$methods" ] && echo "$methods" | grep -qiwE 'claim'; then
+  cbal=$($CHAIN_CALL DKGStakingConvictionNFT balanceOf --json "[\"$N1_OPADDR\"]" 2>/dev/null | pyf "d.get('result','0')")
+  if [ "${cbal:-0}" -gt 0 ] 2>/dev/null; then
+    claim_ok=0; claim_try=0; claim_revert=0; claim_errs=""
+    cap="$cbal"; [ "$cap" -gt "$MAX_CLAIM_PROBES" ] && cap="$MAX_CLAIM_PROBES"
+    for idx in $(seq 0 $((cap - 1))); do
+      tk=$($CHAIN_CALL DKGStakingConvictionNFT tokenOfOwnerByIndex --json "[\"$N1_OPADDR\",\"$idx\"]" 2>/dev/null | pyf "d.get('result','')")
+      [ -z "$tk" ] || [ "$tk" = "0" ] && continue
+      claim_try=$((claim_try + 1))
+      # Explicit --sig binds the overload selector unambiguously even if
+      # future ABI additions introduce other `claim` arities.
+      cr=$($CHAIN_CALL DKGStakingConvictionNFT claim --sig "claim(uint256)" --key "$N1_OP" --json "[\"$tk\"]" 2>/dev/null)
+      if echo "$cr" | grep -q '"ok":true'; then
+        claim_ok=$((claim_ok + 1))
+      else
+        claim_revert=$((claim_revert + 1))
+        # Keep error excerpts tight so the report stays readable.
+        claim_errs="$claim_errs tk=$tk:${cr:0:60}"
+      fi
+    done
+    if [ "$claim_ok" -gt 0 ]; then
+      pass D reward-claim-exec "claim(tokenId) landed on $claim_ok/$claim_try position(s) of node1 op"
+    elif [ "$claim_try" -gt 0 ]; then
+      # `claim(uint256)` in DKGStakingConvictionNFT delegates to
+      # StakingV10._claim, which RETURNS silently (no revert) when there
+      # is nothing claimable — both the `currentEpoch <= 1` and
+      # `claimFromEpoch > claimToEpoch` branches early-return. Any revert
+      # therefore implies one of NotPositionOwner / PositionNotFound /
+      # onlyConvictionNFT / gas-estimation failure — all genuine
+      # regression signals. PASS on all-reverts would mask exactly those.
+      # Surface the revert reasons so a reviewer can tell at a glance
+      # whether it's environmental noise (RPC, nonce) or a real product
+      # regression (ABI drift, ownership accounting bug, etc.).
+      warn D reward-claim-exec "claim(tokenId) reverted on all $claim_try attempt(s) — claim() should silent-return when no rewards exist, so any revert is suspect: ${claim_errs:0:240}"
+    else
+      warn D reward-claim-exec "no valid position tokenIds discovered for node1 op (balance=$cbal)"
+    fi
+  else
+    warn D reward-claim-exec "node1 op wallet owns zero staking positions (balance=$cbal) — bootstrap may not have minted yet"
+  fi
 elif [ -n "$N1_OP" ]; then
-  warn D reward-claim-exec "no zero-arg claimRewards entrypoint — claim is position-scoped (manual tokenId needed)"
+  warn D reward-claim-exec "claim not in DKGStakingConvictionNFT ABI (entrypoint was renamed?)"
 fi
 
 # Real staking-position transfer execution. The Section D title mentions
@@ -878,10 +1094,12 @@ fi
 #     revert with a custom error like "TransferRestrictedWhileLocked". If
 #     that's the design choice on rc.12, the test downgrades to WARN with the
 #     revert reason — that's product information, not a release-gate failure.
-#   - Recipient is node5's op wallet (an edge node — no existing positions,
-#     so the temporary ownership swap has zero accounting side-effect).
-N5_OP=$(node_op_key 5)
-N5_OPADDR=$(node_op_addr 5)
+#   - Recipient is the first edge node's op wallet (= $EDGE_A — no existing
+#     positions, so the temporary ownership swap has zero accounting
+#     side-effect). The N5_ prefix is preserved purely so the long-standing
+#     log lines stay greppable in the post-mortem corpus.
+N5_OP=$(node_op_key "$EDGE_A")
+N5_OPADDR=$(node_op_addr "$EDGE_A")
 if [ -n "$N1_OP" ] && [ -n "$N5_OPADDR" ] && [ -n "$N1_OPADDR" ]; then
   # Discover a tokenId owned by node1's op wallet. tokenOfOwnerByIndex throws
   # OOB if the wallet owns no positions; the chain-call helper returns
@@ -1191,13 +1409,13 @@ if [ -n "$OREC" ]; then
   ownerAddr="${owner_line%%$'\t'*}"
   ownerKey="${owner_line##*$'\t'}"
   # Destination address: any node op wallet that isn't the current owner.
-  # Iterating 1..6 ensures we always find one distinct from the owner across
-  # all topologies.
+  # Iterating over the configured topology ensures we always find one distinct
+  # from the owner across all topologies.
   destAddr=""
   # macOS ships bash 3.2 which lacks `${var,,}`; use a portable tr-based
   # lowercase comparison.
   ownerLower=$(printf '%s' "$ownerAddr" | tr '[:upper:]' '[:lower:]')
-  for n in 1 2 3 4 5 6; do
+  for n in $(seq 1 "$NUM_NODES"); do
     cand=$(node_op_addr "$n")
     candLower=$(printf '%s' "$cand" | tr '[:upper:]' '[:lower:]')
     if [ -n "$cand" ] && [ "$candLower" != "$ownerLower" ]; then
@@ -1339,12 +1557,43 @@ now=$(date +%s)
 budget_left=$(( START_EPOCH + DURATION_TARGET_S - now ))
 [ "$budget_left" -lt 60 ] && budget_left=60
 [ "$RS_OBSERVE_S" -gt "$budget_left" ] && RS_OBSERVE_S=$budget_left
-log "Observing RS for ${RS_OBSERVE_S}s..."
+
+# Per-period RS success metric (rewritten — see comments below).
+#
+# The previous metric here was `submittedCount / totalTicks` from the
+# /api/random-sampling/status endpoint. That ratio is structurally capped in
+# the single digits even for a 100%-healthy prover: the prover ticks every
+# ~5s, but a node can only submit ONE proof per ~100-block (~100s) proofing
+# period; after solving a period it idles in `already-solved` for ~20 ticks
+# until the next period. submits/ticks is ~5% by construction. Every release
+# runner since rc.10 has reported "RS=4%" and treated the WARN as a real
+# issue, when the reality is the metric is wrong.
+#
+# Correct metric: per-period success = submits / distinct-proof-periods-seen,
+# parsed from each core's daemon.log `rs.tick.*` outcome events. A "submitted"
+# tick is a successful proof for one period; the period id is on every
+# submitted/already-solved tick. This matches the algorithm in
+# scripts/devnet-rs-validation.sh which was built specifically to measure RS
+# proving health.
+#
+# To keep the parsing window scoped to THIS section, record each core's
+# daemon.log byte offset BEFORE the observation sleep, then `tail -c +offset`
+# at analysis time so we only count events from this window.
+declare -a RS_LOG_OFFSET
+for n in $(seq 1 "$NUM_CORE_NODES"); do
+  f="$DEVNET_DIR/node$n/daemon.log"
+  RS_LOG_OFFSET[$n]=$( [ -f "$f" ] && wc -c < "$f" | tr -d ' ' || echo 0 )
+done
+
+log "Observing RS for ${RS_OBSERVE_S}s (~$(( RS_OBSERVE_S / 100 )) proof periods of ~100s)..."
 rs_end=$(( now + RS_OBSERVE_S ))
 while [ "$(date +%s)" -lt "$rs_end" ]; do
   sleep 20
 done
-TOT_SUB=0; TOT_ATT=0; STUCK_CORES=""
+
+TOT_SUB=0; TOT_PERIODS=0; TOT_DC=0
+PER_CORE_BELOW=""
+STUCK_CORES=""
 for n in $(seq 1 "$NUM_CORE_NODES"); do
   port="${NODE_PORT[$((n-1))]}"
   s=$(get "$port" /api/random-sampling/status 2>/dev/null || echo '{}')
@@ -1352,35 +1601,75 @@ for n in $(seq 1 "$NUM_CORE_NODES"); do
   ticks_now=$(echo "$s" | pyf "d.get('loop',{}).get('totalTicks',0)")
   last_outcome=$(echo "$s" | pyf "(d.get('loop',{}).get('lastOutcome') or {}).get('kind','')")
   [ -z "$sub_now" ] && sub_now=0; [ -z "$ticks_now" ] && ticks_now=0
-  sub=$(( sub_now - ${RS_BASE_SUB[$n]:-0} ))
-  att=$(( ticks_now - ${RS_BASE_TICKS[$n]:-0} ))
-  [ "$sub" -lt 0 ] && sub=0
-  [ "$att" -lt 0 ] && att=0
-  [ "$att" -lt "$sub" ] && att=$sub
-  log "  core$n: Δsubmitted=$sub Δticks=$att lastOutcome=$last_outcome (now sub=$sub_now ticks=$ticks_now base sub=${RS_BASE_SUB[$n]} ticks=${RS_BASE_TICKS[$n]})"
-  if [ "$sub" -eq 0 ]; then
+
+  # Slice this window's daemon.log lines and parse per-outcome counts.
+  f="$DEVNET_DIR/node$n/daemon.log"
+  off="${RS_LOG_OFFSET[$n]:-0}"
+  win=$(mktemp -t rs-win.XXXXXX)
+  if [ -f "$f" ]; then tail -c +"$((off + 1))" "$f" > "$win" 2>/dev/null; else : > "$win"; fi
+  win_sub=$(grep -c 'rs.tick.submitted' "$win" 2>/dev/null); win_sub=${win_sub:-0}
+  win_solved=$(grep -c 'rs.tick.already-solved' "$win" 2>/dev/null); win_solved=${win_solved:-0}
+  win_kcns=$(grep -c 'rs.tick.kc-not-synced' "$win" 2>/dev/null); win_kcns=${win_kcns:-0}
+  win_dc=$(grep -c 'rs.tick.data-corrupted' "$win" 2>/dev/null); win_dc=${win_dc:-0}
+  win_nocg=$(grep -c 'rs.tick.no-eligible-cg' "$win" 2>/dev/null); win_nocg=${win_nocg:-0}
+  win_stale=$(grep -c 'rs.tick.submit-stale' "$win" 2>/dev/null); win_stale=${win_stale:-0}
+  win_crm=$(grep -c 'rs.tick.chain-root-mismatch' "$win" 2>/dev/null); win_crm=${win_crm:-0}
+  # Every terminal RS outcome carries `periodStart` as of the companion
+  # `feat(rs): log periodStart on submit-stale + chain-root-mismatch`
+  # change in packages/random-sampling/src/prover.ts. Distinct values =
+  # distinct proof periods the prover was challenged on in this window,
+  # regardless of whether they succeeded, were already-solved, or failed
+  # through any of the failure paths. This is the canonical denominator
+  # for per-period proving health.
+  win_periods=$(grep -E 'rs\.tick\.(submitted|already-solved|kc-not-synced|data-corrupted|submit-stale|chain-root-mismatch)' "$win" 2>/dev/null | grep -oE '"periodStart":"[0-9]+"' | sort -u | wc -l | tr -d ' ')
+  [ -z "$win_periods" ] && win_periods=0
+  rm -f "$win"
+
+  if [ "$win_periods" -gt 0 ]; then
+    pp=$(( win_sub * 100 / win_periods ))
+  else
+    pp=0
+  fi
+  [ "$pp" -gt 100 ] && pp=100
+
+  log "  core$n: submits=$win_sub periods=$win_periods per-period=${pp}% | already-solved=$win_solved kc-not-synced=$win_kcns data-corrupted=$win_dc no-eligible-cg=$win_nocg submit-stale=$win_stale chain-root-mismatch=$win_crm lastOutcome=$last_outcome (status sub=$sub_now ticks=$ticks_now)"
+  if [ "$win_sub" -eq 0 ]; then
     STUCK_CORES="$STUCK_CORES core${n}(last:$last_outcome)"
   fi
-  TOT_SUB=$(( TOT_SUB + sub )); TOT_ATT=$(( TOT_ATT + att ))
+  if [ "$win_periods" -gt 0 ] && [ "$pp" -lt "$RS_MIN_SUCCESS_PCT" ]; then
+    PER_CORE_BELOW="$PER_CORE_BELOW core${n}(${pp}%)"
+  fi
+  TOT_SUB=$(( TOT_SUB + win_sub ))
+  TOT_PERIODS=$(( TOT_PERIODS + win_periods ))
+  TOT_DC=$(( TOT_DC + win_dc ))
 done
-if [ "$TOT_ATT" -gt 0 ]; then
-  RS_PCT=$(( TOT_SUB * 100 / TOT_ATT ))
+
+# Aggregate per-period success across cores.
+if [ "$TOT_PERIODS" -gt 0 ]; then
+  RS_PCT=$(( TOT_SUB * 100 / TOT_PERIODS ))
+  [ "$RS_PCT" -gt 100 ] && RS_PCT=100
 else
   RS_PCT=0
 fi
-log "RS aggregate: submitted=$TOT_SUB attempted=$TOT_ATT success=${RS_PCT}%"
+log "RS aggregate: submits=$TOT_SUB periods=$TOT_PERIODS per-period-success=${RS_PCT}% data-corrupted=$TOT_DC"
+
 if [ -n "$STUCK_CORES" ]; then
   fail C rs-liveness "core(s) submitted zero proofs:$STUCK_CORES"
 else
-  pass C rs-liveness "all $NUM_CORE_NODES cores submitted at least one proof (aggregate=$TOT_SUB)"
+  pass C rs-liveness "all $NUM_CORE_NODES cores submitted at least one proof (aggregate=$TOT_SUB across $TOT_PERIODS proof periods)"
+fi
+# Note: data-corrupted is EXPECTED for KAs updated in Section B (known
+# update<->RS leaf-count bug; tracked separately). We report but do not gate.
+if [ "$TOT_DC" -gt 0 ]; then
+  warn C rs-data-integrity "$TOT_DC data-corrupted ticks observed — expected for Section B updated KAs (update<->RS leaf-count regression; see scripts/devnet-rs-validation.sh INCLUDE_UPDATED_COHORT for surgical reproduction)"
 fi
 if [ "$RS_PCT" -ge "$RS_MIN_SUCCESS_PCT" ]; then
-  pass C rs-success "RS success rate ${RS_PCT}% (>= ${RS_MIN_SUCCESS_PCT}%, submitted=$TOT_SUB)"
+  pass C rs-success "RS per-period success ${RS_PCT}% (>= ${RS_MIN_SUCCESS_PCT}%, submits=$TOT_SUB across $TOT_PERIODS periods)"
 else
   if [ "${RS_MIN_SUCCESS_PCT_STRICT:-0}" = "1" ]; then
-    fail C rs-success "RS success rate ${RS_PCT}% (< ${RS_MIN_SUCCESS_PCT}%, submitted=$TOT_SUB attempted=$TOT_ATT) [strict mode]"
+    fail C rs-success "RS per-period success ${RS_PCT}% (< ${RS_MIN_SUCCESS_PCT}%, submits=$TOT_SUB periods=$TOT_PERIODS, below cores:$PER_CORE_BELOW) [strict mode]"
   else
-    warn C rs-success "RS success rate ${RS_PCT}% (< ${RS_MIN_SUCCESS_PCT}%, submitted=$TOT_SUB attempted=$TOT_ATT) — set RS_MIN_SUCCESS_PCT_STRICT=1 for long-running full validations"
+    warn C rs-success "RS per-period success ${RS_PCT}% (< ${RS_MIN_SUCCESS_PCT}%, submits=$TOT_SUB periods=$TOT_PERIODS, below cores:$PER_CORE_BELOW) — set RS_MIN_SUCCESS_PCT_STRICT=1 for long-running full validations"
   fi
 fi
 
@@ -1442,7 +1731,7 @@ MD="$RESULTS/REPORT.md"
   echo "| KAs published | $KA_OK | >= $TARGET_KAS | $([ "$KA_OK" -ge "$TARGET_KAS" ] && echo ok || echo under) |"
   echo "| CGs with KAs | $CGS_WITH_KA | >= $TARGET_CGS | $([ "$CGS_WITH_KA" -ge "$TARGET_CGS" ] && echo ok || echo under) |"
   echo "| entities/KA min..max | ${EMIN}..${EMAX} | within ${MIN_ENTITIES}..${MAX_ENTITIES} | $([ "${EMIN:-0}" -ge "$MIN_ENTITIES" ] 2>/dev/null && [ "${EMAX:-0}" -le "$MAX_ENTITIES" ] 2>/dev/null && echo ok || echo check) |"
-  echo "| RS success | ${RS_PCT}% (sub=$TOT_SUB/att=$TOT_ATT) | >= ${RS_MIN_SUCCESS_PCT}% | $([ "$RS_PCT" -ge "$RS_MIN_SUCCESS_PCT" ] 2>/dev/null && echo ok || echo under) |"
+  echo "| RS per-period success | ${RS_PCT}% (submits=${TOT_SUB:-0}/periods=${TOT_PERIODS:-0}) | >= ${RS_MIN_SUCCESS_PCT}% | $([ "${RS_PCT:-0}" -ge "$RS_MIN_SUCCESS_PCT" ] 2>/dev/null && echo ok || echo under) |"
   echo "| checks | PASS=$P WARN=$W FAIL=$F | FAIL=0 | $([ "$F" -eq 0 ] && echo ok || echo fail) |"
   echo
   echo "## Functional matrix (per-check)"
@@ -1478,7 +1767,7 @@ print(json.dumps({
   "wallSeconds":$WALL,
   "metrics":{"kasPublished":$KA_OK,"kasFailed":$KA_FAIL,"cgsWithKa":$CGS_WITH_KA,"cgCount":$CG_COUNT,
              "entitiesMin":${EMIN:-0},"entitiesMax":${EMAX:-0},"entitiesAvg":${EAVG:-0},
-             "rsSubmitted":$TOT_SUB,"rsAttempted":$TOT_ATT,"rsSuccessPct":$RS_PCT},
+             "rsSubmits":${TOT_SUB:-0},"rsPeriods":${TOT_PERIODS:-0},"rsSuccessPct":${RS_PCT:-0}},
   "targets":{"kas":$TARGET_KAS,"cgs":$TARGET_CGS,"minEntities":$MIN_ENTITIES,"maxEntities":$MAX_ENTITIES,"rsMinPct":$RS_MIN_SUCCESS_PCT},
   "totals":{"pass":$P,"warn":$W,"fail":$F},
   "checks":checks

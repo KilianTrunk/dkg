@@ -368,18 +368,18 @@ describe('ApiClient', () => {
 
   describe('auth headers', () => {
     it('includes Bearer token when set', async () => {
-      const { fetch, calls } = createTrackingFetch({ ok: true, status: 200, body: {} });
+      const { fetch, calls } = createTrackingFetch({ ok: true, status: 200, body: { agents: [] } });
       globalThis.fetch = fetch;
-      await client.status();
+      await client.agents();
 
       expect((calls[0].opts.headers as any).Authorization).toBe('Bearer test-token');
     });
 
     it('omits Authorization header when no token', async () => {
       const noTokenClient = new ApiClient(PORT);
-      const { fetch, calls } = createTrackingFetch({ ok: true, status: 200, body: {} });
+      const { fetch, calls } = createTrackingFetch({ ok: true, status: 200, body: { agents: [] } });
       globalThis.fetch = fetch;
-      await noTokenClient.status();
+      await noTokenClient.agents();
 
       expect(calls[0].opts.headers).not.toHaveProperty('Authorization');
     });

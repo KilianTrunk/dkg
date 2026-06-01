@@ -127,7 +127,7 @@ export class ApiClient {
   }
 
   async status(): Promise<DaemonStatusResponse> {
-    return this.get('/api/status');
+    return this.get('/api/status', { auth: false });
   }
 
   async agents(): Promise<{
@@ -1499,9 +1499,9 @@ export class ApiClient {
     return { Authorization: `Bearer ${this.token}` };
   }
 
-  private async get<T>(path: string): Promise<T> {
+  private async get<T>(path: string, opts: { auth?: boolean } = {}): Promise<T> {
     const res = await fetch(`${this.baseUrl}${path}`, {
-      headers: this.authHeaders(),
+      headers: opts.auth === false ? {} : this.authHeaders(),
     });
     if (!res.ok) {
       const body = await res.json().catch(() => ({ error: res.statusText }));

@@ -39,6 +39,7 @@ import {
   encodeWorkspaceEncryptionKey,
   workspaceAgentEncryptionKeyId,
   SWM_SENDER_KEY_PACKAGE_ACK_TYPE,
+  SWM_SENDER_KEY_PACKAGE_ACK_RETRYABLE_REASON_CODES,
   SWM_SENDER_KEY_PACKAGE_VERSION,
   computeSwmSenderKeyMembershipHash,
   computeSwmSenderKeyPackageAAD,
@@ -422,18 +423,6 @@ class SwmSenderKeySetupRejectionError extends Error {
     this.reasonCode = reasonCode;
   }
 }
-
-const TERMINAL_SWM_SENDER_KEY_SETUP_ACK_REASON_CODES = new Set<string>([
-  'stale-target',
-  'sender-not-allowed',
-  'recipient-not-allowed',
-  'recipient-not-local',
-  'active-private-key-missing',
-  'revoked-key',
-  'bad-signature',
-  'not-agent-gated',
-  'unknown',
-]);
 
 const SWM_SENDER_KEY_PENDING_DRAIN_LOG_CTX: OperationContext = {
   operationId: 'swm-sender-key-pending-drain',
@@ -5997,10 +5986,9 @@ export class DKGAgent {
           //     `active-private-key-missing`, `revoked-key`,
           //     `bad-signature`, `unknown`, ACL/config failures)
           //     → HARD failure: retrying the same package cannot help.
-          //   • `delivered=true && ack.accepted=false` with a
-          //     non-terminal/future reason → SOFT success: keep it queued
-          //     so a later reconnect/publish can retry after remote view
-          //     convergence.
+          //   • `delivered=true && ack.accepted=false` with an explicitly
+          //     retryable reason → SOFT success: keep it queued so a later
+          //     reconnect/publish can retry after remote view convergence.
           //   • `delivered=false` → SOFT success.
           //     The setup-package landed in the messenger's durable
           //     outbox, but the agent also keeps a local pending row
@@ -6105,7 +6093,7 @@ export class DKGAgent {
               this.log.warn(
                 input.ctx,
                 `SWM sender-key setup for ${recipientAgentAddress} keyId=${recipient.recipientKeyId} ` +
-                `queued after transient rejection (${ack.reasonCode ?? 'legacy-unknown'}): ${reason}`,
+                `queued after retryable rejection (${ack.reasonCode ?? 'legacy-unknown'}): ${reason}`,
               );
               return { kind: 'success', agentAddress: recipientAgentAddress };
             }
@@ -6190,20 +6178,11 @@ export class DKGAgent {
     return 'unknown';
   }
 
-  private isTerminalSwmSenderKeySetupAckReasonCode(
-    reasonCode: SwmSenderKeyPackageAckReasonCode | undefined,
-  ): boolean {
-    if (!reasonCode) return true;
-    return TERMINAL_SWM_SENDER_KEY_SETUP_ACK_REASON_CODES.has(reasonCode);
-  }
-
   private isRetryableSwmSenderKeySetupAckReason(
     reasonCode: SwmSenderKeyPackageAckReasonCode | undefined,
   ): boolean {
-    if (reasonCode) {
-      return !this.isTerminalSwmSenderKeySetupAckReasonCode(reasonCode);
-    }
-    return false;
+    if (!reasonCode) return false;
+    return (SWM_SENDER_KEY_PACKAGE_ACK_RETRYABLE_REASON_CODES as readonly string[]).includes(reasonCode);
   }
 
   private swmSenderKeyPackageMessageId(packageBytes: Uint8Array): string {
@@ -6334,7 +6313,7 @@ export class DKGAgent {
    * cost lives on the cold path of "we just connected to a new peer",
    * not on every share. Each successful `sendReliable` with
    * `delivered=true && ack.accepted=true` deletes the row and counts as
-   * drained; soft (`delivered=false`) and non-terminal delivered
+   * drained; soft (`delivered=false`) and explicitly retryable delivered
    * rejections leave it queued for the next attempt; terminal delivered
    * rejections are logged and deleted without counting as drained.
    */

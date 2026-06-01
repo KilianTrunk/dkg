@@ -140,6 +140,13 @@ export const SWM_SENDER_KEY_PACKAGE_ACK_REASON_CODES: readonly KnownSwmSenderKey
   'unknown',
 ];
 
+export const SWM_SENDER_KEY_PACKAGE_ACK_RETRYABLE_REASON_CODES: readonly KnownSwmSenderKeyPackageAckReasonCode[] = [];
+
+export const SWM_SENDER_KEY_PACKAGE_ACK_TERMINAL_REASON_CODES: readonly KnownSwmSenderKeyPackageAckReasonCode[] =
+  SWM_SENDER_KEY_PACKAGE_ACK_REASON_CODES.filter(
+    (code) => !SWM_SENDER_KEY_PACKAGE_ACK_RETRYABLE_REASON_CODES.includes(code),
+  );
+
 export interface SwmSenderKeyMessageMsg {
   version: string;
   type: string;

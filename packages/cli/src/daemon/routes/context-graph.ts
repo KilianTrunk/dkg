@@ -358,6 +358,16 @@ function classifyRegisterContextGraphError(err: unknown): { status: number; body
   if (code === 'RPC_ENDPOINTS_EXHAUSTED') {
     return { status: 503, body: { error: msg || 'Configured chain RPC endpoints were exhausted.', code } };
   }
+  if (code === 'RPC_RECEIPT_LOOKUP_FAILED') {
+    return {
+      status: 503,
+      body: {
+        error: msg || 'Transaction receipt lookup failed on all configured chain RPC endpoints.',
+        code,
+        ...(txHash ? { txHash } : {}),
+      },
+    };
+  }
   if (code === 'TIMEOUT') {
     return {
       status: 504,

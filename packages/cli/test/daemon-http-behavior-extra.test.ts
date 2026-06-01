@@ -889,6 +889,96 @@ describe('CLI-7 — SPARQL endpoint 4xx matrix', () => {
     }
   });
 
+  it('returns 503 with txHash when context graph register receipt lookup fails after broadcast', async () => {
+    const contextGraphId = 'receipt-lookup-register-' + Math.random().toString(36).slice(2, 8);
+    const txHash = '0x' + '88'.repeat(32);
+    const receiptLookupError = new Error(
+      `Receipt lookup for tx ${txHash} failed on all configured RPC endpoints: rate limited`,
+    );
+    (receiptLookupError as Error & { code?: string; txHash?: string }).code = 'RPC_RECEIPT_LOOKUP_FAILED';
+    (receiptLookupError as Error & { code?: string; txHash?: string }).txHash = txHash;
+
+    let routeServer: Server | null = null;
+    try {
+      routeServer = createServer(async (req, res) => {
+        const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+        const agent = {
+          listContextGraphs: async () => [{
+            id: contextGraphId,
+            uri: `did:dkg:context-graph:${contextGraphId}`,
+            subscribed: true,
+            synced: true,
+          }],
+          resolveAgentByToken: () => undefined,
+          registerContextGraph: async () => {
+            throw receiptLookupError;
+          },
+        };
+        await handleContextGraphRoutes({
+          req,
+          res,
+          agent,
+          publisherControl: {},
+          publisherRuntime: null,
+          config: {},
+          startedAt: Date.now(),
+          dashDb: {},
+          opWallets: {},
+          network: {},
+          tracker: {},
+          memoryManager: {},
+          bridgeAuthToken: undefined,
+          nodeVersion: 'test',
+          nodeCommit: 'test',
+          catchupTracker: { jobs: new Map(), latestByContextGraph: new Map() },
+          extractionRegistry: {},
+          fileStore: {},
+          extractionStatus: new Map(),
+          assertionImportLocks: new Map(),
+          vectorStore: {},
+          embeddingProvider: null,
+          validTokens: new Set(),
+          apiHost: '127.0.0.1',
+          apiPortRef: { value: 0 },
+          routePlugins: [],
+          url,
+          path: url.pathname,
+          requestToken: undefined,
+          requestAgentAddress: '0x0000000000000000000000000000000000000001',
+        } as any);
+        if (!res.writableEnded) {
+          res.statusCode = 404;
+          res.end();
+        }
+      });
+      await new Promise<void>((resolve) => routeServer!.listen(0, '127.0.0.1', resolve));
+      const address = routeServer.address();
+      if (!address || typeof address === 'string') {
+        throw new Error('context graph route test server did not bind to a TCP port');
+      }
+
+      const register = await fetch(`http://127.0.0.1:${address.port}/api/context-graph/register`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: contextGraphId }),
+      });
+
+      expect(register.status).toBe(503);
+      const body = await register.json();
+      expect(body).toMatchObject({
+        code: 'RPC_RECEIPT_LOOKUP_FAILED',
+        txHash,
+      });
+      expect(body.error).toMatch(/receipt lookup/i);
+    } finally {
+      if (routeServer) {
+        await new Promise<void>((resolve, reject) => {
+          routeServer!.close((err) => (err ? reject(err) : resolve()));
+        });
+      }
+    }
+  });
+
   // SPEC_CG_MEMORY_MODEL / Codex PR #595 round-4: per-CG hosting
   // committees and per-CG quorum overrides were removed end-to-end.
   // The on-chain contract no longer accepts those args, so silently

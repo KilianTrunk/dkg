@@ -1009,8 +1009,8 @@ export class EVMChainAdapter implements ChainAdapter {
       let prepared: { signedTx: string; txHash: string } | undefined;
       try {
         const connected = contract.connect(rpcSigner) as any;
-        const populated = await withTimeout(
-          connected[method].populateTransaction(...args),
+        const populated = await withTimeout<ethers.TransactionRequest>(
+          connected[method].populateTransaction(...args) as Promise<ethers.TransactionRequest>,
           RPC_TRANSACTION_POPULATION_ATTEMPT_TIMEOUT_MS,
           `${label} transaction population via RPC #${i + 1}`,
         );

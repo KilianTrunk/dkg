@@ -1714,7 +1714,7 @@ print(json.dumps({
   "wallSeconds":$WALL,
   "metrics":{"kasPublished":$KA_OK,"kasFailed":$KA_FAIL,"cgsWithKa":$CGS_WITH_KA,"cgCount":$CG_COUNT,
              "entitiesMin":${EMIN:-0},"entitiesMax":${EMAX:-0},"entitiesAvg":${EAVG:-0},
-             "rsSubmitted":$TOT_SUB,"rsAttempted":$TOT_ATT,"rsSuccessPct":$RS_PCT},
+             "rsSubmits":${TOT_SUB:-0},"rsPeriods":${TOT_PERIODS:-0},"rsSuccessPct":${RS_PCT:-0}},
   "targets":{"kas":$TARGET_KAS,"cgs":$TARGET_CGS,"minEntities":$MIN_ENTITIES,"maxEntities":$MAX_ENTITIES,"rsMinPct":$RS_MIN_SUCCESS_PCT},
   "totals":{"pass":$P,"warn":$W,"fail":$F},
   "checks":checks

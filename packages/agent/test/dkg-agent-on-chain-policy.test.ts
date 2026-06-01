@@ -36,6 +36,15 @@ interface ChainStub {
 interface AgentStub {
   onChainAccessPolicyCache: Map<string, number>;
   onChainPublishPolicyCache: Map<string, number>;
+  /**
+   * Codex review on #872 — companion timestamp map for {@link onChainPublishPolicyCache}.
+   * `getContextGraphOnChainPolicy` reads it to gate stale entries
+   * (`now - fetchedAt > ON_CHAIN_PUBLISH_POLICY_CACHE_TTL_MS` ⇒
+   * miss). Tests that pre-populate the publishPolicy cache to model
+   * a fresh chain-event seed must also bump the timestamp here, or
+   * the cache-hit path will fall through to the chain-RPC fallback.
+   */
+  onChainPublishPolicyCacheUpdatedAt: Map<string, number>;
   subscribedContextGraphs: Map<string, { onChainId?: string }>;
   getContextGraphOnChainId: (id: string) => Promise<string | null>;
   isContextGraphRegistered: (id: string) => Promise<boolean>;
@@ -52,6 +61,7 @@ function makeStub(overrides: Partial<AgentStub> = {}): AgentStub {
   return {
     onChainAccessPolicyCache: new Map(),
     onChainPublishPolicyCache: new Map(),
+    onChainPublishPolicyCacheUpdatedAt: new Map(),
     subscribedContextGraphs: new Map(),
     getContextGraphOnChainId: vi.fn(async () => null),
     isContextGraphRegistered: vi.fn(async () => false),
@@ -74,6 +84,10 @@ describe('DKGAgent.getContextGraphOnChainPolicy', () => {
     const stub = makeStub({
       onChainAccessPolicyCache: new Map([['cg-1', 0]]),
       onChainPublishPolicyCache: new Map([['cg-1', 1]]),
+      // Codex review on #872 — bump the publishPolicy freshness
+      // timestamp so the TTL gate (`ON_CHAIN_PUBLISH_POLICY_CACHE_TTL_MS`)
+      // treats this entry as still-fresh and the cache-hit path runs.
+      onChainPublishPolicyCacheUpdatedAt: new Map([['cg-1', Date.now()]]),
     });
     const result = await callPolicy(stub, 'cg-1');
     expect(result).toEqual({ accessPolicy: 0, publishPolicy: 1 });
@@ -304,6 +318,46 @@ describe('DKGAgent.getContextGraphOnChainPolicy', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  // Codex review on #872 — `publishPolicy` is mutable on-chain
+  // (`PublishPolicyUpdated`), but the cache is only seeded by the
+  // `ContextGraphCreated` event. Without a freshness gate, a stale
+  // `1` survives until daemon restart and keeps relaxing the
+  // import-artifact owner guard after a curator flips a CG from
+  // open → curated. Pin the TTL behaviour: a cache entry older than
+  // `ON_CHAIN_PUBLISH_POLICY_CACHE_TTL_MS` is treated as miss and
+  // the chain-RPC fallback re-verifies (and overwrites the cache
+  // with the fresh value). Same pattern works for stale `0` entries
+  // — both directions re-verify.
+  it('treats publishPolicy cache entries older than the TTL as stale and falls through to chain RPC', async () => {
+    const TTL_MS = 60_000;
+    const STALE_AGE_MS = TTL_MS + 1_000;
+    const getContextGraphPublishPolicy = vi.fn(async () => ({
+      publishPolicy: 0, // the curator just flipped open → curated
+      publishAuthority: '0x0000000000000000000000000000000000000000',
+    }));
+    const getContextGraphAccessPolicy = vi.fn(async () => 0);
+    const stub = makeStub({
+      subscribedContextGraphs: new Map([['cg-stale', { onChainId: '55' }]]),
+      // Cached value says "1" (open), seeded by an old
+      // `ContextGraphCreated` event before the curator flipped policy.
+      onChainPublishPolicyCache: new Map([['cg-stale', 1]]),
+      onChainPublishPolicyCacheUpdatedAt: new Map([['cg-stale', Date.now() - STALE_AGE_MS]]),
+      onChainAccessPolicyCache: new Map([['cg-stale', 0]]),
+      isContextGraphRegistered: vi.fn(async () => true),
+      chain: { getContextGraphPublishPolicy, getContextGraphAccessPolicy },
+    });
+    const result = await callPolicy(stub, 'cg-stale');
+    // Stale "1" was discarded; chain re-verify returned "0" (curated).
+    expect(result).toEqual({ accessPolicy: 0, publishPolicy: 0 });
+    expect(getContextGraphPublishPolicy).toHaveBeenCalledWith(55n);
+    // Cache overwritten with the fresh chain answer keyed on
+    // numericOnChainId; freshness timestamp also bumped so the
+    // next read inside the TTL window is a fast cache-hit.
+    expect(stub.onChainPublishPolicyCache.get('55')).toBe(0);
+    const newTs = stub.onChainPublishPolicyCacheUpdatedAt.get('55') ?? 0;
+    expect(Date.now() - newTs).toBeLessThan(1_000);
   });
 
   // Round 3 — degenerate state: registered locally but the on-chain

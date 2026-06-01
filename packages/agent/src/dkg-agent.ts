@@ -525,6 +525,21 @@ const SWM_SENDER_KEY_PENDING_DRAIN_LOG_CTX: OperationContext = {
  */
 const TIMEOUT_SENTINEL = Symbol('chain-rpc-fallback-timeout');
 
+/**
+ * Codex review on #872 — TTL for the eagerly-seeded `publishPolicy`
+ * cache. `publishPolicy` is mutable on-chain (`PublishPolicyUpdated`
+ * is emitted by `ContextGraphStorage.updatePublishPolicy`), but the
+ * cache is only populated by `ContextGraphCreated`, so a curator
+ * flipping a CG from open → curated would otherwise leave a stale
+ * `1` in this node's cache until restart and keep relaxing the
+ * import-artifact owner guard. The TTL bounds staleness to one
+ * window without wiring a full `PublishPolicyUpdated` event watcher
+ * through the chain-event poller. 60s is conservative because the
+ * cached value gates an authorization decision — one extra eth_call
+ * per minute per active CG is cheap.
+ */
+const ON_CHAIN_PUBLISH_POLICY_CACHE_TTL_MS = 60_000;
+
 export class DKGAgent {
   readonly wallet: AgentWallet;
   readonly node: DKGNode;
@@ -976,8 +991,32 @@ export class DKGAgent {
    * the chain answer hasn't reached this node yet — callers MUST
    * treat that as unknown (fail-closed) rather than a positive
    * "publish-policy is open" signal.
+   *
+   * Codex review on #872 — `publishPolicy` is mutable on-chain via
+   * `ContextGraphStorage.updatePublishPolicy` (which emits
+   * `PublishPolicyUpdated`), but this cache is only seeded from the
+   * `ContextGraphCreated` event. Without listening to the update event
+   * AND without a freshness check, a stale `1` survives until daemon
+   * restart and keeps `isPublicOpenContextGraph()` relaxing the
+   * import-artifact owner guard after a curator flips the CG from
+   * open → curated. The TTL companion map below stamps every cache
+   * write with `Date.now()`; reads in `getContextGraphOnChainPolicy`
+   * treat entries older than {@link ON_CHAIN_PUBLISH_POLICY_CACHE_TTL_MS}
+   * as miss and fall through to the chain-RPC fallback (which already
+   * exists for the round-3 non-creator-peer path). Stale data drifts
+   * authoritative within at most one TTL window. The bound is set
+   * conservatively because the cache gates an authorization decision —
+   * one extra eth_call per minute per active CG is cheap.
    */
   private readonly onChainPublishPolicyCache = new Map<string, number>();
+  /**
+   * Codex review on #872 — companion timestamp map for {@link onChainPublishPolicyCache}.
+   * `now - fetchedAt > ON_CHAIN_PUBLISH_POLICY_CACHE_TTL_MS` is treated
+   * as a cache miss. Kept as a sibling map (rather than refactoring the
+   * cache value to `{ value, fetchedAt }`) so existing test fixtures
+   * that read `cache.get(id)` and expect a bare number still pass.
+   */
+  private readonly onChainPublishPolicyCacheUpdatedAt = new Map<string, number>();
   /**
    * OT-RFC-38 / LU-6 Phase B — chain-backed participant-agent
    * allowlist cache. Keyed by `contextGraphId.toString()` (stringified
@@ -2294,6 +2333,7 @@ export class DKGAgent {
           // local state and relax owner-scoped artifact-read guards.
           if (publishPolicy === 0 || publishPolicy === 1) {
             this.onChainPublishPolicyCache.set(contextGraphId, publishPolicy);
+            this.onChainPublishPolicyCacheUpdatedAt.set(contextGraphId, Date.now());
           }
 
           // OT-RFC-38 / LU-6 Phase B — host-mode auto-subscribe path for
@@ -16011,7 +16051,24 @@ export class DKGAgent {
     publishPolicy?: number;
   }> {
     let accessPolicy = this.onChainAccessPolicyCache.get(contextGraphId);
-    let publishPolicy = this.onChainPublishPolicyCache.get(contextGraphId);
+    // Codex review on #872 — `publishPolicy` is mutable on-chain
+    // (`PublishPolicyUpdated`) but the cache is only seeded by
+    // `ContextGraphCreated`. Treat entries older than
+    // `ON_CHAIN_PUBLISH_POLICY_CACHE_TTL_MS` as stale so the chain-RPC
+    // fallback below re-verifies before the caller relaxes the
+    // import-artifact owner guard. The accessPolicy cache is left
+    // untouched here: it's also used by SWM gossip authorization paths
+    // (lines ~1779, ~8403, ~10073) where stale-permissive cannot
+    // escalate privilege (gossip decrypt is gated by sender-key
+    // issuance) and stale-restrictive only causes a transient deny.
+    const isPublishPolicyCacheFresh = (key: string): boolean => {
+      const fetchedAt = this.onChainPublishPolicyCacheUpdatedAt.get(key);
+      if (fetchedAt === undefined) return false;
+      return Date.now() - fetchedAt <= ON_CHAIN_PUBLISH_POLICY_CACHE_TTL_MS;
+    };
+    let publishPolicy = isPublishPolicyCacheFresh(contextGraphId)
+      ? this.onChainPublishPolicyCache.get(contextGraphId)
+      : undefined;
     // Track the resolved numeric on-chain id so we can both look it
     // up in the cache (round-2) and use it as the chain-RPC fallback
     // key (round-3). Lazily resolved — creators may pass the
@@ -16024,7 +16081,9 @@ export class DKGAgent {
         ?? undefined;
       if (onChainId && onChainId !== contextGraphId) {
         if (accessPolicy === undefined) accessPolicy = this.onChainAccessPolicyCache.get(onChainId);
-        if (publishPolicy === undefined) publishPolicy = this.onChainPublishPolicyCache.get(onChainId);
+        if (publishPolicy === undefined && isPublishPolicyCacheFresh(onChainId)) {
+          publishPolicy = this.onChainPublishPolicyCache.get(onChainId);
+        }
       }
     }
 
@@ -16146,6 +16205,7 @@ export class DKGAgent {
                 if (pp === 0 || pp === 1) {
                   publishPolicy = pp;
                   this.onChainPublishPolicyCache.set(onChainId!, pp);
+                  this.onChainPublishPolicyCacheUpdatedAt.set(onChainId!, Date.now());
                 }
               }
             } catch (err) {

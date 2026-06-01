@@ -1068,6 +1068,24 @@ async function resolveImportedArtifact(
   const markdownHash = authoritativeMarkdownHash;
   const markdownForm = markdownHash ? `urn:dkg:file:${markdownHash}` : undefined;
 
+  // Codex review on #872 — when the owner guard is relaxed for a
+  // public + open CG, replicated `_meta` may have a `markdownHash`
+  // even though the bytes were never replicated to this node's
+  // file-store (only the SWM/_meta triples gossip across peers; the
+  // raw file bytes don't auto-replicate). The previous
+  // `Boolean(markdownHash)` would have returned `canReadMarkdown:
+  // true` and then `/import-artifact/read-markdown` would
+  // deterministically 404. Derive presence from the local file-store
+  // when the relaxation is in effect so the flag is honest. Owner
+  // self-reads (no relaxation) keep the existing fast-path —
+  // `_meta` and bytes land together at import time on the importing
+  // node, so a `markdownHash` there really does mean readable.
+  const markdownAvailableLocally = markdownHash
+    ? ownerGuardRelaxed
+      ? await ctx.fileStore.has(markdownHash).catch(() => false)
+      : true
+    : false;
+
   return {
     contextGraphId,
     assertionUri,
@@ -1088,7 +1106,7 @@ async function resolveImportedArtifact(
     ...(mdIntermediateHash ? { mdIntermediateHash } : {}),
     ...(markdownForm ? { markdownForm } : {}),
     ...(markdownHash ? { markdownHash } : {}),
-    canReadMarkdown: Boolean(markdownHash),
+    canReadMarkdown: markdownAvailableLocally,
     ...(ownerGuardRelaxed ? { ownerGuardRelaxed: true } : {}),
   };
 }

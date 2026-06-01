@@ -50,7 +50,7 @@ import { existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
-import { request } from 'node:http';
+import { createServer, request, type Server } from 'node:http';
 import { ethers } from 'ethers';
 import { getSharedContext, HARDHAT_KEYS } from '../../chain/test/evm-test-context.js';
 import { ApiClient } from '../src/api-client.js';
@@ -291,6 +291,34 @@ function rawPost(d: Daemon, path: string, body: Buffer, extraHeaders: Record<str
       req.end(body);
     },
   );
+}
+
+async function startRateLimitedRpc(): Promise<{ url: string; close: () => Promise<void> }> {
+  const server: Server = createServer((_req, res) => {
+    res.writeHead(429, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      jsonrpc: '2.0',
+      id: null,
+      error: { code: -32005, message: 'rate limited' },
+    }));
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      server.off('error', reject);
+      resolve();
+    });
+  });
+  const address = server.address();
+  if (!address || typeof address === 'string') {
+    throw new Error('rate-limited RPC test server did not bind to a TCP port');
+  }
+  return {
+    url: `http://127.0.0.1:${address.port}`,
+    close: () => new Promise<void>((resolve, reject) => {
+      server.close((err) => (err ? reject(err) : resolve()));
+    }),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -727,6 +755,47 @@ describe('CLI-7 — SPARQL endpoint 4xx matrix', () => {
     // No raw revert hex / Hardhat internal frames in the surfaced
     // message — callers should see something human-readable.
     expect(body.error).not.toMatch(/^0x[0-9a-fA-F]+$/);
+  });
+
+  it('returns 503 when context graph register exhausts configured chain RPC endpoints', async () => {
+    const primaryRpc = await startRateLimitedRpc();
+    const backupRpc = await startRateLimitedRpc();
+    let badRpcDaemon: Daemon | null = null;
+    try {
+      const { hubAddress } = getSharedContext();
+      badRpcDaemon = await startDaemon({
+        authEnabled: true,
+        extraConfig: {
+          chain: {
+            type: 'evm',
+            rpcUrl: primaryRpc.url,
+            rpcUrls: [backupRpc.url],
+            hubAddress,
+            chainId: 'evm:31337',
+          },
+        },
+      });
+      const cgId = 'rpc-exhausted-register-' + Math.random().toString(36).slice(2, 8);
+      const create = await fetch(urlFor(badRpcDaemon, '/api/context-graph/create'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders(badRpcDaemon) },
+        body: JSON.stringify({ id: cgId, name: cgId }),
+      });
+      expect(create.status).toBe(200);
+
+      const register = await fetch(urlFor(badRpcDaemon, '/api/context-graph/register'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders(badRpcDaemon) },
+        body: JSON.stringify({ id: cgId }),
+      });
+      expect(register.status).toBe(503);
+      const body = await register.json();
+      expect(body.error).toMatch(/RPC|endpoint|rate/i);
+    } finally {
+      await stopDaemon(badRpcDaemon, 'SIGTERM', 10_000);
+      await primaryRpc.close().catch(() => {});
+      await backupRpc.close().catch(() => {});
+    }
   });
 
   // SPEC_CG_MEMORY_MODEL / Codex PR #595 round-4: per-CG hosting

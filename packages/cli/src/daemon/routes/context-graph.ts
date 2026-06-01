@@ -324,7 +324,7 @@ import {
 import type { RequestContext } from './context.js';
 
 /**
- * Map a `registerContextGraph` failure message to an HTTP status +
+ * Map a `registerContextGraph` failure to an HTTP status +
  * stable error body. Shared by:
  *   - POST /api/context-graph/register (standalone register call).
  *   - POST /api/context-graph/create { register: true, pcaAccountId }
@@ -343,7 +343,18 @@ import type { RequestContext } from './context.js';
  * shape) or a 200-partial-success body (combined flow's transient
  * fallback).
  */
-function classifyRegisterContextGraphError(msg: string): { status: number; body?: Record<string, unknown> } | undefined {
+function classifyRegisterContextGraphError(err: unknown): { status: number; body?: Record<string, unknown> } | undefined {
+  const msg = typeof err === 'string'
+    ? err
+    : err && typeof err === 'object' && 'message' in err
+      ? String((err as { message?: unknown }).message ?? '')
+      : '';
+  const code = err && typeof err === 'object' && 'code' in err
+    ? String((err as { code?: unknown }).code ?? '')
+    : '';
+  if (code === 'RPC_ENDPOINTS_EXHAUSTED') {
+    return { status: 503, body: { error: msg || 'Configured chain RPC endpoints were exhausted.', code } };
+  }
   if (msg.includes('already registered')) return { status: 409, body: { error: msg } };
   if (msg.includes('does not exist')) return { status: 404, body: { error: msg } };
   if (msg.includes('no known creator')) return { status: 503, body: { error: msg, hint: 'Creator not yet synced. Retry after sync completes.' } };
@@ -585,7 +596,7 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
         // surfaced as `registerErrorStatus` so SDK callers can map
         // it to the same 4xx semantics as the standalone /register
         // endpoint without changing the HTTP envelope status.
-        const classified = classifyRegisterContextGraphError(regMsg);
+        const classified = classifyRegisterContextGraphError(regErr);
         return jsonResponse(res, 200, {
           created: id,
           uri: `did:dkg:context-graph:${id}`,
@@ -653,7 +664,7 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
       });
     } catch (err: any) {
       const msg = err?.message ?? '';
-      const classified = classifyRegisterContextGraphError(msg);
+      const classified = classifyRegisterContextGraphError(err);
       if (classified) {
         return jsonResponse(res, classified.status, classified.body ?? { error: msg });
       }

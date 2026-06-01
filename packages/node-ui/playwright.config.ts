@@ -28,7 +28,7 @@ export default defineConfig({
   // is true so local runs stay quiet.
   reporter: CI
     ? [['github'], ['html', { open: 'never' }], ['junit', { outputFile: 'results.xml' }]]
-    : [['list'], ['junit', { outputFile: 'results.xml' }]],
+    : [['list'], ['html', { open: 'on-failure' }], ['junit', { outputFile: 'results.xml' }]],
 
   // globalTeardown stops the devnet ONLY if our bootstrap script
   // (chained into webServer.command below) was the one that started

@@ -31,6 +31,7 @@ import {
   DKG_ONTOLOGY,
   WORKSPACE_AGENT_ENCRYPTION_KEY_ALGORITHM_X25519,
   WORKSPACE_RECIPIENT_ENCRYPTION_KEY_PURPOSE,
+  Logger,
   SWM_SENDER_KEY_PACKAGE_VERSION,
   SWM_SENDER_KEY_PACKAGE_ACK_TYPE,
   computeSwmSenderKeyMembershipHash,
@@ -255,6 +256,7 @@ describe('createAndDistributeSwmSenderKeyEpoch: missing-peerId soft success', ()
   let agent: DKGAgent | null = null;
   const tempDirs: string[] = [];
   afterEach(async () => {
+    Logger.setSink(null);
     if (agent) {
       await agent.stop().catch(() => undefined);
       agent = null;
@@ -1196,9 +1198,17 @@ describe('createAndDistributeSwmSenderKeyEpoch: missing-peerId soft success', ()
       messageId: 'm-drain-hard-reject',
     }));
 
+    const logs: Array<{ level: string; message: string }> = [];
+    Logger.setSink((entry) => logs.push({ level: entry.level, message: entry.message }));
+
     const drained = await internals.drainPendingSenderKeyForPeer('12D3KooWDrainHardRejectPeer');
     expect(drained).toBe(0);
     expect(internals.pendingSenderKeyByAgent.size).toBe(0);
+    expect(logs).toContainEqual(expect.objectContaining({
+      level: 'warn',
+      message: expect.stringContaining('dropped after terminal rejection (stale-target)'),
+    }));
+    expect(logs[0].message).toContain(recipient.recipientKeyId);
   });
 
   it('keeps malformed delivered ACKs queued during pending drain', async () => {

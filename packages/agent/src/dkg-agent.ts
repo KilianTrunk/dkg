@@ -39,7 +39,6 @@ import {
   encodeWorkspaceEncryptionKey,
   workspaceAgentEncryptionKeyId,
   SWM_SENDER_KEY_PACKAGE_ACK_TYPE,
-  SWM_SENDER_KEY_PACKAGE_ACK_REASON_CODES,
   SWM_SENDER_KEY_PACKAGE_VERSION,
   computeSwmSenderKeyMembershipHash,
   computeSwmSenderKeyPackageAAD,
@@ -423,6 +422,23 @@ class SwmSenderKeySetupRejectionError extends Error {
     this.reasonCode = reasonCode;
   }
 }
+
+const TERMINAL_SWM_SENDER_KEY_SETUP_ACK_REASON_CODES = new Set<string>([
+  'stale-target',
+  'sender-not-allowed',
+  'recipient-not-allowed',
+  'recipient-not-local',
+  'active-private-key-missing',
+  'revoked-key',
+  'bad-signature',
+  'not-agent-gated',
+  'unknown',
+]);
+
+const SWM_SENDER_KEY_PENDING_DRAIN_LOG_CTX: OperationContext = {
+  operationId: 'swm-sender-key-pending-drain',
+  operationName: 'share',
+};
 
 export class DKGAgent {
   readonly wallet: AgentWallet;
@@ -2622,7 +2638,7 @@ export class DKGAgent {
         // peerId at publish time. Tolerant of profile-lookup failure
         // (the next connection:open will retry).
         try {
-          const drained = await this.drainPendingSenderKeyForPeer(remotePeer);
+          const drained = await this.drainPendingSenderKeyForPeer(remotePeer, ctx);
           if (drained > 0) {
             this.log.info(ctx, `Drained ${drained} pending SWM sender-key package(s) for ${remotePeer}`);
           }
@@ -6178,7 +6194,7 @@ export class DKGAgent {
     reasonCode: SwmSenderKeyPackageAckReasonCode | undefined,
   ): boolean {
     if (!reasonCode) return true;
-    return (SWM_SENDER_KEY_PACKAGE_ACK_REASON_CODES as readonly string[]).includes(reasonCode);
+    return TERMINAL_SWM_SENDER_KEY_SETUP_ACK_REASON_CODES.has(reasonCode);
   }
 
   private isRetryableSwmSenderKeySetupAckReason(
@@ -6241,6 +6257,7 @@ export class DKGAgent {
   private async drainPendingSenderKeyQueueForPeer(input: {
     peerId: string;
     recipientAgentAddress: string;
+    ctx?: OperationContext;
   }): Promise<number> {
     const recipientAgentAddress = input.recipientAgentAddress.toLowerCase();
     const queue = this.pendingSenderKeyByAgent.get(recipientAgentAddress);
@@ -6283,6 +6300,14 @@ export class DKGAgent {
         } else if (this.isRetryableSwmSenderKeySetupAckReason(ack.reasonCode)) {
           remaining.push(this.rotateSwmSenderKeyPendingMessageId(entry));
         } else {
+          const reason = ack.reason ?? 'unknown reason';
+          const reasonCode = ack.reasonCode ?? 'legacy-unknown';
+          this.log.warn(
+            input.ctx ?? SWM_SENDER_KEY_PENDING_DRAIN_LOG_CTX,
+            `SWM sender-key pending retry for ${entry.recipientAgentAddress} keyId=${entry.recipientKeyId} ` +
+            `peerId=${input.peerId} contextGraph=${entry.contextGraphId}${entry.subGraphName ? `/${entry.subGraphName}` : ''} ` +
+            `dropped after terminal rejection (${reasonCode}): ${reason}`,
+          );
           // Terminal rejection: keep it out of the queue, but do not
           // report it as a successful drain.
         }
@@ -6311,9 +6336,9 @@ export class DKGAgent {
    * `delivered=true && ack.accepted=true` deletes the row and counts as
    * drained; soft (`delivered=false`) and non-terminal delivered
    * rejections leave it queued for the next attempt; terminal delivered
-   * rejections and malformed ACKs delete it without counting as drained.
+   * rejections are logged and deleted without counting as drained.
    */
-  private async drainPendingSenderKeyForPeer(peerId: string): Promise<number> {
+  private async drainPendingSenderKeyForPeer(peerId: string, ctx?: OperationContext): Promise<number> {
     if (this.pendingSenderKeyByAgent.size === 0) return 0;
     let drained = 0;
     let agentAddresses: string[] = [];
@@ -6329,7 +6354,7 @@ export class DKGAgent {
     if (agentAddresses.length === 0) return 0;
 
     for (const recipientAgentAddress of agentAddresses) {
-      drained += await this.drainPendingSenderKeyQueueForPeer({ peerId, recipientAgentAddress });
+      drained += await this.drainPendingSenderKeyQueueForPeer({ peerId, recipientAgentAddress, ctx });
     }
     return drained;
   }
@@ -6359,7 +6384,7 @@ export class DKGAgent {
 
     let drained = 0;
     for (const [recipientAgentAddress, peerId] of peerByAgent.entries()) {
-      drained += await this.drainPendingSenderKeyQueueForPeer({ peerId, recipientAgentAddress });
+      drained += await this.drainPendingSenderKeyQueueForPeer({ peerId, recipientAgentAddress, ctx });
     }
     if (drained > 0 && ctx) {
       this.log.info(ctx, `SWM sender-key pending retry drained ${drained} queued package(s) during publish`);

@@ -84,7 +84,7 @@ import {
   pickNetworkTunables,
 } from '@origintrail-official/dkg-core';
 import { GraphManager, PrivateContentStore, createTripleStore, type TripleStore, type TripleStoreConfig, type Quad, type LargeLiteralStorageConfig } from '@origintrail-official/dkg-storage';
-import { EVMChainAdapter, NoChainAdapter, enrichEvmError, isRetryableRpcError, type EVMAdapterConfig, type ChainAdapter, type CreateContextGraphParams, type CreateOnChainContextGraphParams, type CreateOnChainContextGraphResult, type TxResult, type V10PublishingConvictionAccountInfo } from '@origintrail-official/dkg-chain';
+import { EVMChainAdapter, NoChainAdapter, enrichEvmError, isRetryableRpcError, buildKnowledgeAssetUal, type EVMAdapterConfig, type ChainAdapter, type CreateContextGraphParams, type CreateOnChainContextGraphParams, type CreateOnChainContextGraphResult, type TxResult, type V10PublishingConvictionAccountInfo } from '@origintrail-official/dkg-chain';
 import {
   DKGPublisher, PublishHandler, SharedMemoryHandler, UpdateHandler, ChainEventPoller, AccessHandler, AccessClient,
   PublishJournal, StaleWriteError,
@@ -217,6 +217,8 @@ import {
 } from './agent-keystore.js';
 import { GossipPublishHandler } from './gossip-publish-handler.js';
 import { FinalizationHandler } from './finalization-handler.js';
+import { reconcileContextGraph, ReconcileCoalescer, RecentUalSet, type ChainReconcilerDeps, type OrdinalOutcome } from './chain-reconciler.js';
+import { createCursorState, type CursorState } from './reconcile-cursor.js';
 // rc.9 PR-10: JoinApprovalRetryQueue removed — substrate outbox
 // (durable, SQLite-backed) replaces it. We keep a minimal local
 // type alias so listPendingJoinApprovalRetries() retains its old
@@ -786,9 +788,35 @@ export class DKGAgent {
    */
   private static readonly SWM_ACK_QUORUM_TICK_MS = 5_000;
 
+  /**
+   * Phase B — chain-driven VM reconciliation sweep cadence. The periodic sweep
+   * is the safety net behind the live `KnowledgeAssetRegisteredToContextGraph`
+   * nudge: it guarantees eventual reconciliation even if an event was missed or
+   * a fetch transiently failed. Env-overridable for ops tuning.
+   */
+  private static readonly VM_RECONCILE_SWEEP_INTERVAL_MS =
+    Number(process.env['DKG_VM_RECONCILE_INTERVAL_MS']) || 60_000;
+  /**
+   * Blocks a completed ordinal must be buried by before its watermark advance
+   * commits (reorg gate). The data is promoted to VM eagerly; only the cursor
+   * advance waits. Observation-block based (see `reconcileChainOrdinal`), so
+   * this is effectively "wait N blocks of chain progress after we observed the
+   * registration before trusting the watermark".
+   */
+  private static readonly VM_RECONCILE_CONFIRMATION_DEPTH =
+    Number(process.env['DKG_VM_RECONCILE_CONFIRMATION_DEPTH']) || 5;
+
   private messageHandler: MessageHandler | null = null;
   private chainPoller: ChainEventPoller | null = null;
   private swmCleanupTimer: ReturnType<typeof setInterval> | null = null;
+  /** Phase B — periodic chain-driven VM reconciliation sweep timer. */
+  private vmReconcileTimer: ReturnType<typeof setInterval> | null = null;
+  /** Phase B — per-CG single-flight coalescer for reconcile sweeps. */
+  private reconcileCoalescer?: ReconcileCoalescer;
+  /** Phase B — in-memory reconcile cursor per local CG id (watermark + `ahead`). */
+  private readonly reconcileCursors = new Map<string, CursorState>();
+  /** Phase B — bounded dedupe of recently-reconciled UALs (live-burst guard). */
+  private readonly recentReconciledUals = new RecentUalSet();
   private hostModeReconcilerTimer: ReturnType<typeof setInterval> | null = null;
   private hostModePruneTimer: ReturnType<typeof setInterval> | null = null;
   // rc.9 PR-10: joinApprovalRetryQueue + joinApprovalRetryTimer
@@ -2348,6 +2376,22 @@ export class DKGAgent {
             });
           }
         },
+        // Phase B — live VM-reconcile nudge. A `KnowledgeAssetRegisteredToContextGraph`
+        // event doesn't carry the registration ordinal (only kaId + cgId), so it is
+        // NOT a cursor position — it just triggers an immediate coalesced sweep for
+        // that CG so newly-registered KCs land in VM with low latency. The periodic
+        // sweep is the safety net if this is missed. Only wired when reconciliation
+        // is actually possible (chain + ordinal reads present).
+        onKARegisteredToContextGraph: this.vmReconcileEnabled()
+          ? async ({ contextGraphId: onChainId, kaId }) => {
+              const localCgId = this.resolveLocalCgIdByOnChainId(BigInt(onChainId));
+              if (!localCgId) return; // chain replay hasn't resolved the cleartext CG yet; sweep heals it
+              const sub = this.subscribedContextGraphs.get(localCgId);
+              if (!sub?.subscribed) return; // only populate VM for CGs we actually subscribe to
+              this.log.info(ctx, `Phase B: KACG nudge cg=${onChainId} ka=${kaId} -> reconcile "${localCgId}"`);
+              if (this.reconcileCoalescer) void this.reconcileCoalescer.trigger(localCgId);
+            }
+          : undefined,
       });
       this.chainPoller.start();
       this.log.info(ctx, `Chain event poller started`);
@@ -3024,6 +3068,26 @@ export class DKGAgent {
       runWarmCore();
       this.warmCoreTimer = setInterval(runWarmCore, WARM_CORE_RECONCILE_INTERVAL_MS);
       if (this.warmCoreTimer.unref) this.warmCoreTimer.unref();
+    }
+
+    // Phase B — chain-driven VM reconciliation. The coalescer collapses a burst
+    // of live KACG nudges for a CG into a single sweep; the periodic timer is
+    // the safety net that backfills missed events / transient fetch failures and
+    // catches up late subscribers (the "Monday Fun Facts" case). Only armed when
+    // the chain adapter exposes the per-CG registration-ordinal reads.
+    if (this.vmReconcileEnabled()) {
+      this.reconcileCoalescer = new ReconcileCoalescer((localCgId) => this.runVmReconcileForCg(localCgId));
+      const runSweep = (): void => {
+        this.runVmReconcileSweep().catch((err: unknown) => {
+          this.log.warn(ctx, `VM reconcile sweep failed: ${err instanceof Error ? err.message : String(err)}`);
+        });
+      };
+      // Prime once after startup so a late subscriber catches up immediately,
+      // then on a steady cadence.
+      runSweep();
+      this.vmReconcileTimer = setInterval(runSweep, DKGAgent.VM_RECONCILE_SWEEP_INTERVAL_MS);
+      if (this.vmReconcileTimer.unref) this.vmReconcileTimer.unref();
+      this.log.info(ctx, `Chain-driven VM reconciliation armed (sweep ${DKGAgent.VM_RECONCILE_SWEEP_INTERVAL_MS}ms, depth ${DKGAgent.VM_RECONCILE_CONFIRMATION_DEPTH})`);
     }
 
     // rc.9 PR-10: dedicated join-approval retry tick removed. The
@@ -12008,6 +12072,168 @@ export class DKGAgent {
     return null;
   }
 
+  // ===== Phase B — chain-driven VM reconciliation (B.4 agent wiring) =========
+
+  /**
+   * True iff the chain adapter exposes the per-CG registration-ordinal reads
+   * the reconciler needs. Gates the live nudge, the sweep timer, and the
+   * coalescer so non-V10 / no-chain nodes pay nothing.
+   */
+  private vmReconcileEnabled(): boolean {
+    return (
+      this.chain.chainId !== 'none' &&
+      typeof this.chain.getContextGraphKCCount === 'function' &&
+      typeof this.chain.getContextGraphKCAt === 'function' &&
+      typeof this.chain.getLatestMerkleRoot === 'function'
+    );
+  }
+
+  /**
+   * Trigger a coalesced reconcile sweep for every subscribed CG that has an
+   * on-chain id. Used by the periodic timer + the startup prime. Per-CG work is
+   * single-flighted by {@link reconcileCoalescer} so overlapping ticks (or a
+   * burst of live nudges) collapse into one sweep per CG.
+   */
+  private async runVmReconcileSweep(): Promise<void> {
+    if (!this.vmReconcileEnabled() || !this.reconcileCoalescer) return;
+    for (const [localCgId, sub] of this.subscribedContextGraphs) {
+      if (!sub.subscribed || !sub.onChainId) continue;
+      void this.reconcileCoalescer.trigger(localCgId);
+    }
+  }
+
+  /**
+   * One reconcile pass for a single CG: build the injected deps and hand off to
+   * the pure {@link reconcileContextGraph} orchestrator (which owns the cursor
+   * math + watermark persistence gate). The cursor is created lazily from the
+   * persisted `lastReconciledOrdinal` and lives in {@link reconcileCursors}.
+   */
+  private async runVmReconcileForCg(localCgId: string): Promise<void> {
+    const sub = this.subscribedContextGraphs.get(localCgId);
+    if (!sub?.subscribed || !sub.onChainId || !this.vmReconcileEnabled()) return;
+    const onChainCgId = BigInt(sub.onChainId);
+
+    let cursor = this.reconcileCursors.get(localCgId);
+    if (!cursor) {
+      cursor = createCursorState(sub.lastReconciledOrdinal ?? 0);
+      this.reconcileCursors.set(localCgId, cursor);
+    }
+
+    const deps: ChainReconcilerDeps = {
+      getKCCount: async (cg) => Number(await this.chain.getContextGraphKCCount!(cg)),
+      getHeadBlock: async () => {
+        if (typeof this.chain.getBlockNumber !== 'function') return undefined;
+        try {
+          return await this.chain.getBlockNumber();
+        } catch {
+          return undefined;
+        }
+      },
+      reconcileOrdinal: (lcg, ocg, ordinal, headBlock) =>
+        this.reconcileChainOrdinal(lcg, ocg, ordinal, headBlock),
+      persistWatermark: (lcg, watermark) => {
+        const s = this.subscribedContextGraphs.get(lcg);
+        if (!s) return;
+        s.lastReconciledOrdinal = watermark;
+        this.persistContextGraphSubscription(lcg);
+      },
+      confirmationDepth: DKGAgent.VM_RECONCILE_CONFIRMATION_DEPTH,
+      log: (msg) => this.log.info(createOperationContext('system'), msg),
+    };
+
+    try {
+      await reconcileContextGraph(deps, cursor, localCgId, onChainCgId);
+    } catch (err) {
+      this.log.warn(
+        createOperationContext('system'),
+        `VM reconcile for "${localCgId}" failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  /**
+   * Reconcile a single per-CG registration ordinal: resolve the kaId + its
+   * latest on-chain merkle root + publisher, build the UAL, and ask the
+   * finalization handler to promote the matching local SWM snapshot to VM
+   * (verifying the CG binding from chain). When no local SWM matches, run an
+   * active core-first catch-up fetch and retry once. `headBlock` is reused as
+   * the materialization version AND echoed back as the cursor observation block
+   * (reorg gate). See {@link OrdinalOutcome} for the status contract.
+   */
+  private async reconcileChainOrdinal(
+    localCgId: string,
+    onChainCgId: bigint,
+    ordinal: number,
+    headBlock: number | undefined,
+  ): Promise<OrdinalOutcome> {
+    const ctx = createOperationContext('system');
+    const versionBlock = headBlock ?? 0;
+
+    let kaId: bigint;
+    let merkleRoot: Uint8Array;
+    let publisherAddress: string;
+    let ual: string;
+    try {
+      kaId = await this.chain.getContextGraphKCAt!(onChainCgId, BigInt(ordinal));
+      const storageAddr = this.chain.getDKGKnowledgeAssetsAddress
+        ? await this.chain.getDKGKnowledgeAssetsAddress()
+        : undefined;
+      if (!storageAddr) return { status: 'skip' };
+      ual = buildKnowledgeAssetUal(this.chain.chainId, storageAddr, kaId);
+
+      // Recently reconciled (live-burst guard): treat as already-done so the
+      // cursor advances without redoing chain reads + an SWM scan.
+      if (this.recentReconciledUals.has(ual)) return { status: 'already', blockNumber: versionBlock };
+
+      merkleRoot = await this.chain.getLatestMerkleRoot!(kaId);
+      publisherAddress = (this.chain.getLatestMerkleRootPublisher
+        ? await this.chain.getLatestMerkleRootPublisher(kaId)
+        : '') ?? '';
+    } catch (err) {
+      // RPC lag / unknown kaId — leave for the next sweep.
+      this.log.info(ctx, `Phase B: ordinal ${ordinal} of cg ${onChainCgId} not resolvable yet: ${err instanceof Error ? err.message : String(err)}`);
+      return { status: 'pending' };
+    }
+
+    const fh = this.getOrCreateFinalizationHandler();
+    const reconcileInput = {
+      contextGraphId: localCgId,
+      onChainCgId: onChainCgId.toString(),
+      ual,
+      merkleRoot,
+      publisherAddress,
+      kaId,
+      versionBlock,
+    };
+
+    let outcome = await fh.handleChainReconciledKC(reconcileInput, ctx);
+    if (outcome === 'no-swm') {
+      // Active fetch: pull the missing snapshot core-first (selectCatchupPeers
+      // already prioritises known cores + the preferred sync peer), then retry.
+      try {
+        await this.syncContextGraphFromConnectedPeers(localCgId, { includeSharedMemory: true });
+      } catch (err) {
+        this.log.info(ctx, `Phase B: active fetch for "${localCgId}" (ordinal ${ordinal}) failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      outcome = await fh.handleChainReconciledKC(reconcileInput, ctx);
+    }
+
+    switch (outcome) {
+      case 'promoted':
+        this.recentReconciledUals.add(ual);
+        return { status: 'reconciled', blockNumber: versionBlock };
+      case 'already-confirmed':
+      case 'stale-target':
+        // Already in VM (or a newer update is) — done for cursor purposes.
+        this.recentReconciledUals.add(ual);
+        return { status: 'already', blockNumber: versionBlock };
+      case 'no-swm':
+      case 'unverified':
+      default:
+        return { status: 'pending' };
+    }
+  }
+
   /**
    * OT-RFC-39 — build the per-tick auto-backfill closure handed to the
    * Random Sampling prover via {@link bindRandomSampling}. The closure
@@ -20138,6 +20364,10 @@ export class DKGAgent {
     if (this.warmCoreTimer) {
       clearInterval(this.warmCoreTimer);
       this.warmCoreTimer = null;
+    }
+    if (this.vmReconcileTimer) {
+      clearInterval(this.vmReconcileTimer);
+      this.vmReconcileTimer = null;
     }
     if (this.messengerOutboxTimer) {
       clearInterval(this.messengerOutboxTimer);

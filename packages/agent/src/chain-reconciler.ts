@@ -55,8 +55,20 @@ export interface ChainReconcilerDeps {
    * completed ordinals are absorbed as soon as they're contiguous.
    */
   getHeadBlock: () => Promise<number | undefined>;
-  /** Reconcile one ordinal (chain reads + active fetch + locked promotion). */
-  reconcileOrdinal: (localCgId: string, onChainCgId: bigint, ordinal: number) => Promise<OrdinalOutcome>;
+  /**
+   * Reconcile one ordinal (chain reads + active fetch + locked promotion).
+   * `headBlock` is the chain head this sweep observed (or `undefined` with no
+   * chain) — the agent reuses it as the materialization version AND echoes it
+   * back as the completion's observation block, so the watermark only commits
+   * after `confirmationDepth` blocks of real chain progress past observation
+   * (reorg-safe without a per-ordinal registration-block lookup).
+   */
+  reconcileOrdinal: (
+    localCgId: string,
+    onChainCgId: bigint,
+    ordinal: number,
+    headBlock: number | undefined,
+  ) => Promise<OrdinalOutcome>;
   /** Persist the watermark. Called ONLY when it actually moves. */
   persistWatermark: (localCgId: string, watermark: number) => void;
   /** Confirmation depth (blocks) before a completed ordinal advances the watermark. */
@@ -95,7 +107,7 @@ export async function reconcileContextGraph(
   let reconciled = 0;
   let pending = 0;
   for (const ordinal of ordinalsToReconcile(state, head)) {
-    const outcome = await deps.reconcileOrdinal(localCgId, onChainCgId, ordinal);
+    const outcome = await deps.reconcileOrdinal(localCgId, onChainCgId, ordinal, headBlock);
     if (outcome.status === 'reconciled' || outcome.status === 'already') {
       reconciled += 1;
       // With a known head, apply the reorg-depth gate; otherwise (no chain head)

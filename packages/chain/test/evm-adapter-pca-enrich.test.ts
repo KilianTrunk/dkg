@@ -120,8 +120,10 @@ describe('PCA write methods enrich opaque custom-error reverts on rethrow (codex
     expect(caught!.message).not.toContain('unknown custom error');
   });
 
-  it('non-Error / non-custom-error throws propagate unchanged (helper must not swallow or rewrite)', async () => {
-    // (a) plain Error with no revert data — message stays byte-identical.
+  it('non-Error / non-custom-error throws are not decoded as custom-error reverts', async () => {
+    // (a) plain Error with no revert data — the transport wrapper may add
+    // operation/RPC context, but the original connection error must stay visible
+    // and must not be decoded as a custom-error revert.
     const plain = adapterWithFakeNft({
       settle: async () => {
         throw new Error('connect ECONNREFUSED 127.0.0.1:8545');
@@ -132,7 +134,9 @@ describe('PCA write methods enrich opaque custom-error reverts on rethrow (codex
       .then(() => null)
       .catch((e) => e as Error);
     expect(e1).toBeInstanceOf(Error);
-    expect(e1!.message).toBe('connect ECONNREFUSED 127.0.0.1:8545');
+    expect(e1!.message).toContain('connect ECONNREFUSED 127.0.0.1:8545');
+    expect(e1!.message).not.toContain('NotAccountOwner');
+    expect(e1!.message).not.toContain('unknown custom error');
 
     // (b) non-Error throw (string) — propagated as-is, not wrapped.
     const nonError = adapterWithFakeNft({

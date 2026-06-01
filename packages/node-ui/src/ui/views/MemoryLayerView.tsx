@@ -565,6 +565,10 @@ function PublishPanel({ contextGraphId, onPublished }: { contextGraphId: string;
 
   const handlePublishSelected = useCallback(async () => {
     if (selected.size === 0) return;
+    if (selected.size > 1) {
+      setError('V10 publish requires exactly one root entity per request. Select one root and publish again.');
+      return;
+    }
     setPublishing(true);
     setPublishResult(null);
     setError(null);
@@ -583,11 +587,15 @@ function PublishPanel({ contextGraphId, onPublished }: { contextGraphId: string;
   }, [selected, contextGraphId, refresh, onPublished]);
 
   const handlePublishAll = useCallback(async () => {
+    if (allUris.length !== 1) {
+      setError('V10 publish requires exactly one root entity per request. Select one root and publish again.');
+      return;
+    }
     setPublishing(true);
     setPublishResult(null);
     setError(null);
     try {
-      const res = await publishSharedMemory(contextGraphId);
+      const res = await publishSharedMemory(contextGraphId, allUris);
       setPublishResult(res);
       setSelected(new Set());
       refresh();
@@ -597,7 +605,7 @@ function PublishPanel({ contextGraphId, onPublished }: { contextGraphId: string;
     } finally {
       setPublishing(false);
     }
-  }, [contextGraphId, refresh, onPublished]);
+  }, [allUris, contextGraphId, refresh, onPublished]);
 
   const totalTriples = entities?.reduce((sum, e) => sum + e.tripleCount, 0) ?? 0;
   const selectedTriples = entities?.filter(e => selected.has(e.uri)).reduce((sum, e) => sum + e.tripleCount, 0) ?? 0;

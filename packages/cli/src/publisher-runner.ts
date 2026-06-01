@@ -36,6 +36,7 @@ export async function startPublisherRuntimeIfEnabled(args: {
     rpcUrl: string;
     rpcUrls?: string[];
     hubAddress: string;
+    tokenAddress?: string;
     chainId?: string;
   };
   log: (message: string) => void;
@@ -79,6 +80,7 @@ interface PublisherRuntimeBaseArgs {
     rpcUrl: string;
     rpcUrls?: string[];
     hubAddress: string;
+    tokenAddress?: string;
     chainId?: string;
   };
   pollIntervalMs?: number;
@@ -113,7 +115,7 @@ export async function createPublisherRuntime(args: {
   // finality but still functions).
   const merged = resolveChainConfig(args.config, network);
   const chainBase = merged?.rpcUrl && merged?.hubAddress
-    ? { rpcUrl: merged.rpcUrl, rpcUrls: merged.rpcUrls, hubAddress: merged.hubAddress, chainId: merged.chainId }
+    ? { rpcUrl: merged.rpcUrl, rpcUrls: merged.rpcUrls, hubAddress: merged.hubAddress, tokenAddress: merged.tokenAddress, chainId: merged.chainId }
     : undefined;
   return createPublisherRuntimeFromBase({
     dataDir: args.dataDir,
@@ -166,6 +168,7 @@ export async function createPublisherRuntimeFromAgent(args: {
     rpcUrl: string;
     rpcUrls?: string[];
     hubAddress: string;
+    tokenAddress?: string;
     chainId?: string;
   };
   pollIntervalMs?: number;
@@ -207,6 +210,7 @@ async function createPublisherRuntimeFromBase(args: PublisherRuntimeBaseArgs): P
           rpcUrls: args.chainBase.rpcUrls,
           privateKey: wallet.privateKey,
           hubAddress: args.chainBase.hubAddress,
+          tokenAddress: args.chainBase.tokenAddress,
           chainId: args.chainBase.chainId,
           allowNoAdminSigner: true,
         })

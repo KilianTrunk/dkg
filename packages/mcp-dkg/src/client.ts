@@ -878,16 +878,16 @@ export class DkgClient {
   }
 
   /**
-   * Final canonical-flow step: publish the current contents of a context
-   * graph's Shared Working Memory to Verified Memory (on-chain) and
-   * (by default) clear SWM. The daemon route accepts `selection` as
-   * either the literal `"all"` or an array of root entity URIs — this
-   * wrapper exposes the latter as `rootEntities` and translates the
-   * omit-case to `"all"` server-side.
+   * Final canonical-flow step: publish a single root from a context graph's
+   * Shared Working Memory to Verified Memory (on-chain). The daemon route
+   * accepts `selection` as either the literal `"all"` or an array of root
+   * entity URIs, but V10 synchronous publish only proceeds when that
+   * selection resolves to exactly one publishable root.
    *
    * Default `clearAfter` is `false` for subset publishes (so unpublished
-   * roots aren't dropped from SWM) and `true` for full publishes.
-   * Mirrors `packages/adapter-openclaw/src/dkg-client.ts:664-680`.
+   * roots aren't dropped from SWM) and `true` for omitted-root publishes.
+   * Omitted roots still map to `"all"` for compatibility, but the daemon
+   * rejects it when SWM contains more than one publishable root.
    */
   async publishSharedMemory(args: {
     contextGraphId: string;

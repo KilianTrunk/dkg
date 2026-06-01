@@ -758,7 +758,14 @@ export interface SwmRootEntity {
 
 /** List root entities in SWM with their triple counts. */
 export async function listSwmEntities(contextGraphId: string): Promise<SwmRootEntity[]> {
-  const sparql = `SELECT ?s (COUNT(?p) AS ?cnt) WHERE { ?s ?p ?o } GROUP BY ?s ORDER BY DESC(?cnt)`;
+  const swmGraph = `did:dkg:context-graph:${contextGraphId}/_shared_memory`;
+  const sparql = `SELECT ?s (COUNT(?p) AS ?cnt) WHERE {
+    GRAPH ?g {
+      ?s ?p ?o .
+      FILTER(STR(?g) = "${swmGraph}")
+      FILTER(?p != <http://dkg.io/ontology/workspaceOwner>)
+    }
+  } GROUP BY ?s ORDER BY DESC(?cnt)`;
   const data = await post<{ result: any }>('/api/query', { sparql, contextGraphId, view: 'shared-working-memory' });
   const bindings: any[] = data?.result?.bindings ?? [];
   return bindings.map((b) => {
@@ -782,13 +789,17 @@ export interface PublishResult {
   blockNumber?: number;
 }
 
-/** Publish SWM content on-chain (SWM -> VM). Pass rootEntities to selectively publish, or omit for all. */
-export const publishSharedMemory = (contextGraphId: string, rootEntities?: string[]) =>
-  post<PublishResult>('/api/shared-memory/publish', {
+/** Publish exactly one SWM root on-chain (SWM -> VM). */
+export const publishSharedMemory = (contextGraphId: string, rootEntities: string[]) => {
+  if (rootEntities.length !== 1) {
+    throw new Error('V10 publish requires exactly one root entity per request.');
+  }
+  return post<PublishResult>('/api/shared-memory/publish', {
     contextGraphId,
-    selection: rootEntities ?? 'all',
-    clearAfter: !rootEntities,
+    selection: rootEntities,
+    clearAfter: false,
   });
+};
 
 // --- Query history ---
 export const fetchQueryHistory = (limit = 50, offset = 0) =>

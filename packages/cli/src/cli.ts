@@ -407,6 +407,14 @@ function probeHostForApiHost(apiHost: string | undefined): string {
   return apiHost;
 }
 
+function selectedDkgHomeForEnv(env: NodeJS.ProcessEnv): string {
+  return resolveDkgConfigHome({ env, isDkgMonorepo: isDkgMonorepo() });
+}
+
+function withSelectedDkgHome(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return { ...env, DKG_HOME: selectedDkgHomeForEnv(env) };
+}
+
 /**
  * Wire up the supervisor-liveness watchdog for a spawned worker child.
  *
@@ -474,6 +482,7 @@ async function maybeStartSupervisorLivenessWatcher(
 }
 
 async function runDaemonSupervisor(): Promise<void> {
+  process.env.DKG_HOME = selectedDkgHomeForEnv(process.env);
   const maxCrashRestarts = 5;
   let crashRestartCount = 0;
 
@@ -488,7 +497,7 @@ async function runDaemonSupervisor(): Promise<void> {
       [...process.execArgv, resolveDaemonEntryPoint(), 'daemon-worker'],
       {
         stdio: ['ignore', 'ignore', 'ignore'],
-        env: process.env,
+        env: withSelectedDkgHome(process.env),
       },
     );
 
@@ -1131,7 +1140,7 @@ program
     // declaration order first.
     const relayPreferredOpt = Array.isArray(opts.relayPreferred) ? (opts.relayPreferred as string[]) : [];
     const cleanedRelayPreferred = relayPreferredOpt.map((s) => s.trim()).filter((s) => s.length > 0);
-    const daemonEnv: NodeJS.ProcessEnv = { ...process.env };
+    const daemonEnv: NodeJS.ProcessEnv = withSelectedDkgHome(process.env);
     if (cleanedRelayPreferred.length > 0) {
       daemonEnv.DKG_RELAY_PREFERRED = cleanedRelayPreferred.join(',');
       console.log(

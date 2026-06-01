@@ -1134,7 +1134,9 @@ export async function loadConfig(): Promise<DkgConfig> {
   try {
     const raw = await readFile(configYamlPath(), 'utf-8');
     return mergePersistedConfig(yaml.load(raw));
-  } catch { /* fall through to defaults */ }
+  } catch (err) {
+    if (!isEnoent(err)) throw err;
+  }
 
   return { ...DEFAULT_CONFIG };
 }

@@ -233,7 +233,15 @@ describe('localAgentIntegrations config round-trip', () => {
   it('surfaces malformed config.yaml instead of falling back to defaults', async () => {
     await writeFile(join(tempDir, 'config.yaml'), 'name: [unterminated\napiPort: 9317\n', 'utf8');
 
-    await expect(loadConfig()).rejects.toThrow();
+    let thrown: unknown;
+    try {
+      await loadConfig();
+    } catch (err) {
+      thrown = err;
+    }
+
+    expect(thrown).toBeInstanceOf(Error);
+    expect((thrown as Error).name).toBe('YAMLException');
   });
 
   it('does not treat yaml-only homes as globally initialized configs', async () => {

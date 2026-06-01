@@ -3640,6 +3640,11 @@ export class DKGAgent {
       preferredPeerId,
       isPrivateContextGraph,
     );
+    const coreCount = peers.filter((p) => this.knownCorePeerIds.has(p.toString())).length;
+    this.log.info(
+      ctx,
+      `catchup peer order for "${contextGraphId}": preferred=${preferredPeerId ?? 'none'} cores=${coreCount} total=${peers.length}`,
+    );
     return this.runCatchupOverPeers(contextGraphId, includeSharedMemory, peers);
   }
 
@@ -3934,7 +3939,7 @@ export class DKGAgent {
     preferredPeerId?: string,
     privateOnly = false,
   ): Array<{ toString(): string }> {
-    return orderCatchupPeers(peers, preferredPeerId, privateOnly);
+    return orderCatchupPeers(peers, preferredPeerId, privateOnly, this.knownCorePeerIds);
   }
 
   private async resolvePreferredSyncPeerId(contextGraphId: string): Promise<string | undefined> {
@@ -12346,7 +12351,7 @@ export class DKGAgent {
   }>> {
     const ctx = createOperationContext('share');
     const explicitPeers = options?.peers;
-    const candidates: string[] = (() => {
+    const rawCandidates: string[] = (() => {
       if (explicitPeers && explicitPeers.length > 0) return [...new Set(explicitPeers)];
       const connections = this.node.libp2p.getConnections();
       const seen = new Set<string>();
@@ -12356,6 +12361,16 @@ export class DKGAgent {
       }
       return [...seen];
     })();
+    // Contact reliable Core hosts first. This serial loop still reaches
+    // every candidate, but Cores first means faster time-to-first-data
+    // and a better resume-seqno baseline before any flaky edge is tried.
+    const candidates = orderCatchupPeers(rawCandidates, undefined, false, this.knownCorePeerIds)
+      .map((p) => p.toString());
+    const coreCount = candidates.filter((id) => this.knownCorePeerIds.has(id)).length;
+    this.log.info(
+      ctx,
+      `host-catchup peer order for "${contextGraphId}": cores=${coreCount} total=${candidates.length}`,
+    );
     const results: Array<{
       peerId: string;
       rounds: number;

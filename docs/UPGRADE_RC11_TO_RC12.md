@@ -102,12 +102,12 @@ If your codebase is small enough to risk a single pass, this regex sweep covers 
 
 ```bash
 # CASE-SENSITIVE — preserve TitleCase / camelCase / SCREAMING_SNAKE
-git grep -l 'KnowledgeCollection' | xargs sed -i '' 's/KnowledgeCollection/KnowledgeAsset/g'
-git grep -l 'knowledgeCollection' | xargs sed -i '' 's/knowledgeCollection/knowledgeAsset/g'
-git grep -l 'KNOWLEDGE_COLLECTION' | xargs sed -i '' 's/KNOWLEDGE_COLLECTION/KNOWLEDGE_ASSET/g'
-git grep -l 'kcId\b'              | xargs sed -i '' 's/\bkcId\b/kaId/g'
-git grep -l 'KCId\b'              | xargs sed -i '' 's/\bKCId\b/KAId/g'
-git grep -l 'publishedAtKcId'     | xargs sed -i '' 's/publishedAtKcId/publishedAtKaId/g'
+git grep -l 'KnowledgeCollection' | while IFS= read -r f; do perl -pi -e 's/KnowledgeCollection/KnowledgeAsset/g' "$f"; done
+git grep -l 'knowledgeCollection' | while IFS= read -r f; do perl -pi -e 's/knowledgeCollection/knowledgeAsset/g' "$f"; done
+git grep -l 'KNOWLEDGE_COLLECTION' | while IFS= read -r f; do perl -pi -e 's/KNOWLEDGE_COLLECTION/KNOWLEDGE_ASSET/g' "$f"; done
+git grep -l 'kcId'                | while IFS= read -r f; do perl -pi -e 's/\bkcId\b/kaId/g' "$f"; done
+git grep -l 'KCId'                | while IFS= read -r f; do perl -pi -e 's/\bKCId\b/KAId/g' "$f"; done
+git grep -l 'publishedAtKcId'     | while IFS= read -r f; do perl -pi -e 's/publishedAtKcId/publishedAtKaId/g' "$f"; done
 ```
 
 The legacy V10.0 fallback resolver is **gone** — if `KnowledgeAssetsLifecycle` doesn't resolve from the Hub, `EVMChainAdapter.init` now raises instead of silently trying `KnowledgeAssetsV10`. Make sure your operator Hub has the V10.1 surface registered before pointing the daemon at it (see §6).

@@ -104,6 +104,8 @@ import {
   type CollectedACK, type LiftAuthorityProof, type LiftTransitionType,
   type LiftRequest, type LiftRequestAuthorSeal,
   type WorkspaceAgentRecipient,
+  type WorkspaceAgentRecipientResolution,
+  type WorkspaceAgentRecipientResolverInput,
   type WorkspaceSenderKeyEncryptInput,
   type SharedMemoryPublicSnapshotStorageConfig, type WorkspacePublicSnapshotStore,
 } from '@origintrail-official/dkg-publisher';
@@ -1053,7 +1055,7 @@ export class DKGAgent {
     this.chain = chain;
     this.discovery = new DiscoveryClient(queryEngine);
     this.profileManager = new ProfileManager(publisher, store);
-    this.publisher.setWorkspaceAgentRecipientResolver((input) => resolveWorkspaceAgentRecipients(this.store, input));
+    this.publisher.setWorkspaceAgentRecipientResolver((input) => this.resolveWorkspaceRecipientsGated(input));
     this.publisher.setWorkspaceSenderKeyEncryptor((input) => this.encryptWorkspacePayloadWithSenderKey(input));
   }
 
@@ -5769,6 +5771,81 @@ export class DKGAgent {
     return keys;
   }
 
+  /**
+   * True iff `contextGraphId` is DEFINITIVELY public per its on-chain
+   * access policy (policy enum `0`). Gates SWM encryption: an on-chain
+   * public CG is public-readable, so its shared memory must be plaintext
+   * even when it carries a `DKG_ALLOWED_AGENT` list — on a public CG that
+   * list governs *publish authority* (`publishPolicy`), not *read access*.
+   *
+   * Encrypting a public CG's SWM would (a) bootstrap a sender-key
+   * handshake that non-gated recipients correctly reject ("not DKG-agent
+   * gated"), blocking promote/publish, and (b) diverge from the
+   * publisher's plaintext-inline path. `isPrivateContextGraph` cannot
+   * make this call on its own because its allowlist-implies-private
+   * heuristic (for invite-only CGs that carry no `accessPolicy` triple)
+   * also fires for public-with-publish-allowlist CGs — only the on-chain
+   * policy distinguishes the two.
+   *
+   * Fail-closed: returns `false` for private (`1`), unknown/unregistered,
+   * a missing chain getter, or any lookup error, so curated / invite-only
+   * CGs keep their encrypted SWM. Resolves the numeric on-chain id from
+   * the local context-graph id first; numeric/local-only ids that don't
+   * resolve return `false` and leave existing gating untouched.
+   */
+  private async isContextGraphPublicOnChain(contextGraphId: string): Promise<boolean> {
+    try {
+      if (typeof this.getContextGraphOnChainId !== 'function') return false;
+      const onChainId = await this.getContextGraphOnChainId(contextGraphId);
+      if (!onChainId) return false;
+      const cached = this.onChainAccessPolicyCache.get(onChainId);
+      if (cached !== undefined) return cached === 0;
+      let numericId: bigint;
+      try {
+        numericId = BigInt(onChainId);
+      } catch {
+        return false;
+      }
+      if (numericId <= 0n) return false;
+      const getAccessPolicy = this.chain.getContextGraphAccessPolicy;
+      if (typeof getAccessPolicy !== 'function') return false;
+      const policy = await getAccessPolicy.call(this.chain, numericId);
+      if (policy === 0 || policy === 1) {
+        this.onChainAccessPolicyCache.set(onChainId, policy);
+        return policy === 0;
+      }
+      return false;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Resolve SWM gossip recipients, gating on the CG's on-chain READ access
+   * policy. The store-only resolver (`resolveWorkspaceAgentRecipients`)
+   * flags ANY allowlisted CG as requiring encryption, but a CG that is
+   * PUBLIC on-chain has public-readable SWM — its allowedAgent list
+   * governs publish authority, not read access. Encrypting such a CG
+   * bootstraps a sender-key handshake that non-gated recipients reject
+   * ("not DKG-agent gated"), which surfaced as an HTTP 500 on WM→SWM
+   * promote.
+   *
+   * Gate BEFORE delegating to the store resolver: a public CG takes the
+   * plaintext path without resolving recipient keys at all. This also
+   * avoids the resolver's "Missing public encryption key" throw for an
+   * allowlisted agent whose key isn't locally available — irrelevant for
+   * a public CG that never encrypts. Curated / invite-only / unknown CGs
+   * fall through to the normal (encrypted) recipient resolution.
+   */
+  private async resolveWorkspaceRecipientsGated(
+    input: WorkspaceAgentRecipientResolverInput,
+  ): Promise<WorkspaceAgentRecipientResolution> {
+    if (await this.isContextGraphPublicOnChain(input.contextGraphId)) {
+      return { requiresEncryption: false, recipients: [] };
+    }
+    return resolveWorkspaceAgentRecipients(this.store, input);
+  }
+
   private async encryptWorkspacePayloadWithSenderKey(
     input: WorkspaceSenderKeyEncryptInput,
   ): Promise<Uint8Array> {
@@ -8368,6 +8445,13 @@ export class DKGAgent {
     const ctx = createOperationContext('publish');
     const targetCgId = publishContextGraphId ?? contextGraphId;
     const probeIsCurated = async (cgId: string): Promise<boolean | null> => {
+      // A CG that is PUBLIC on-chain is never curated for SWM-encryption
+      // purposes, even if it carries an allowedAgent list (publish
+      // authority). Check this FIRST so `isPrivateContextGraph`'s
+      // allowlist-implies-private heuristic doesn't force encrypted inline
+      // payloads onto a public CG (which keeps publish consistent with the
+      // plaintext SWM-gossip path).
+      if (await this.isContextGraphPublicOnChain(cgId)) return false;
       try {
         if (await this.isPrivateContextGraph(cgId)) return true;
       } catch { /* fall through to chain probe */ }

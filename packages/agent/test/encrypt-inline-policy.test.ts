@@ -28,12 +28,19 @@ function makeAgentLike(opts: {
       return opts.accessPolicy ?? 0;
     });
   }
-  return {
+  const agentLike = {
     log,
     chain,
     onChainAccessPolicyCache: new Map<string, 0 | 1>(),
     isPrivateContextGraph: vi.fn(async () => opts.isPrivate ?? false),
   } as any;
+  // `probeIsCurated` now consults the on-chain-public override first; bind
+  // the real prototype method so the harness exercises production code.
+  // It fails closed (returns false) here because this lightweight harness
+  // exposes no `getContextGraphOnChainId`, leaving the existing numeric/
+  // local probe assertions below unchanged.
+  agentLike.isContextGraphPublicOnChain = (DKGAgent.prototype as any).isContextGraphPublicOnChain;
+  return agentLike;
 }
 
 async function resolveEncryptInlinePayload(

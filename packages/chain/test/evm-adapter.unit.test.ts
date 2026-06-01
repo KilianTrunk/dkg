@@ -418,6 +418,55 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
     expect(backupProvider.getTransactionReceipt).toHaveBeenCalledWith(txHash);
   });
 
+  it('classifies receipt wait expiry as a timeout and preserves the transaction hash', async () => {
+    vi.useFakeTimers();
+    try {
+      const a = new EVMChainAdapter(minimalConfig());
+      const signedTx = '0xdeadbeef';
+      const txHash = '0x' + '66'.repeat(32);
+      const provider = {
+        name: 'primary',
+        broadcastTransaction: vi.fn(async () => ({ hash: txHash })),
+        getTransactionReceipt: vi.fn(async () => null),
+      };
+      const signer = new ethers.Wallet(DEPLOYER_PK, provider as any);
+      const populated = { to: '0x0000000000000000000000000000000000000001', data: '0x1234' };
+      const populateTransaction = vi.fn(async () => populated);
+      const contract = {
+        connect: vi.fn(() => ({ createContextGraph: { populateTransaction } })),
+      };
+      (a as any).providers = [provider];
+      (a as any).signPopulatedTransaction = vi.fn(async () => ({ signedTx, txHash }));
+
+      const thrown = (async () => {
+        try {
+          await (a as any).sendContractTransaction(
+            contract,
+            'createContextGraph',
+            [],
+            signer,
+            'create on-chain context graph',
+          );
+          return undefined;
+        } catch (err) {
+          return err;
+        }
+      })();
+      await vi.advanceTimersByTimeAsync(180_001);
+
+      await expect(thrown).resolves.toMatchObject({
+        code: 'TIMEOUT',
+        txHash,
+      });
+      expect(populateTransaction).toHaveBeenCalledTimes(1);
+      expect((a as any).signPopulatedTransaction).toHaveBeenCalledTimes(1);
+      expect(provider.broadcastTransaction).toHaveBeenCalledWith(signedTx);
+      expect(provider.getTransactionReceipt).toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('treats already-known transaction responses as accepted and polls receipts', async () => {
     const a = new EVMChainAdapter(minimalConfig({
       rpcUrl: 'https://primary.example',

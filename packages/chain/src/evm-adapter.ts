@@ -958,11 +958,14 @@ export class EVMChainAdapter implements ChainAdapter {
       }
       await sleep(RPC_RECEIPT_POLL_INTERVAL_MS);
     }
-    throw new Error(
-      `${label} tx ${txHash} was broadcast but no receipt was found within ${RPC_RECEIPT_TIMEOUT_MS}ms` +
+    const err = new Error(
+      `${label} tx ${txHash} timed out waiting for a receipt after ${RPC_RECEIPT_TIMEOUT_MS}ms` +
       (lastError ? ` (last RPC error: ${errorMessage(lastError)})` : ''),
       { cause: lastError },
     );
+    (err as any).code = 'TIMEOUT';
+    (err as any).txHash = txHash;
+    throw err;
   }
 
   private async signPopulatedTransaction(
@@ -1003,6 +1006,7 @@ export class EVMChainAdapter implements ChainAdapter {
     let lastRetryable: unknown;
     for (let i = 0; i < this.providers.length; i += 1) {
       const rpcSigner = signer.connect(this.providers[i]);
+      let prepared: { signedTx: string; txHash: string } | undefined;
       try {
         const connected = contract.connect(rpcSigner) as any;
         const populated = await withTimeout(
@@ -1010,16 +1014,18 @@ export class EVMChainAdapter implements ChainAdapter {
           RPC_TRANSACTION_POPULATION_ATTEMPT_TIMEOUT_MS,
           `${label} transaction population via RPC #${i + 1}`,
         );
-        const { signedTx, txHash } = await withTimeout(
+        prepared = await withTimeout(
           this.signPopulatedTransaction(rpcSigner, populated),
           RPC_TRANSACTION_POPULATION_ATTEMPT_TIMEOUT_MS,
           `${label} transaction signing via RPC #${i + 1}`,
         );
-        return this.sendSignedTransactionAndWait(signedTx, txHash, label);
       } catch (err) {
         if (!isRetryableRpcError(err)) throw err;
         lastRetryable = err;
+        continue;
       }
+      if (!prepared) continue;
+      return this.sendSignedTransactionAndWait(prepared.signedTx, prepared.txHash, label);
     }
     const err = new Error(
       `${label} transaction preparation failed on all configured RPC endpoints ` +

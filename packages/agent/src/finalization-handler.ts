@@ -464,32 +464,46 @@ export class FinalizationHandler {
    * `publisherAddress` by kaId; it has also ensured the matching SWM snapshot is
    * present locally (fetching from the publisher/cores first if needed).
    *
-   * Unlike the gossip path there is no `rootEntities` on the wire, so we recover
-   * them from the local SWM meta by matching the published `merkleRoot`. We then
-   * run the SAME merkle + on-chain verification and the SAME locked promotion
-   * (`applyVerifiedFinalization`) as the gossip path. We do NOT re-broadcast on
-   * the finalization topic — the chain has spoken; gossiping adds nothing.
+   * Verification differs from the gossip path because the trigger here is
+   * already chain truth, not an untrusted peer message:
+   *   - `merkleRoot` + `publisherAddress` are DIRECT chain reads keyed by kaId
+   *     (`getLatestMerkleRoot` / `getLatestMerkleRootPublisher`), so they need
+   *     no re-scan of `KCCreated` events (that re-scan exists to defend the
+   *     gossip wire, which we don't have).
+   *   - the CG binding is confirmed by a direct `getKAContextGraphId(kaId)` read
+   *     against the caller's `onChainCgId` — chain truth, no event scan, no
+   *     `txHash`/block needed (the sweep path has neither).
+   *   - integrity is the same flat-KC root recompute the gossip path verifies
+   *     against: we find the local SWM operation whose recomputed root equals
+   *     the chain `merkleRoot`.
+   *
+   * `getLatestMerkleRoot(kaId)` always returns the KA's LATEST state (after any
+   * update), so the reconcile is "as of now" — we stamp the materialization
+   * version with the current chain head block. A later real update (higher
+   * block) supersedes correctly; a stale gossip for the original publish (lower
+   * block) is correctly skipped. We do NOT re-broadcast on the finalization
+   * topic — the chain has spoken.
    *
    * Returns:
    *   - `'promoted'`        — SWM snapshot verified + promoted to VM.
    *   - `'already-confirmed'` — VM already had it (idempotent; cursor may advance).
    *   - `'no-swm'`          — no local SWM snapshot matches the published
    *                            merkleRoot (caller leaves the cursor; sweep retries).
-   *   - `'unverified'`      — on-chain verification didn't confirm (RPC lag /
-   *                            reorg); caller leaves cursor for the sweep.
+   *   - `'unverified'`      — chain couldn't confirm the CG binding (RPC lag /
+   *                            reorg / no chain wired); caller leaves cursor.
    *   - `'stale-target'`    — a newer update is already materialised.
    */
   async handleChainReconciledKC(input: {
     /** Local CG id (topic/name), e.g. the value in `subscribedContextGraphs`. */
     contextGraphId: string;
-    /** On-chain numeric CG id as a string, for per-cgId meta routing. */
-    onChainCgId?: string;
+    /** On-chain numeric CG id as a string. Required — drives the binding check + per-cgId meta routing. */
+    onChainCgId: string;
     ual: string;
     merkleRoot: Uint8Array;
     publisherAddress: string;
     kaId: bigint;
-    txHash: string;
-    blockNumber: number;
+    /** Chain head block at reconcile time — stamped as the materialization version. */
+    versionBlock: number;
     /** Optional EIP-712 author recovered from chain (KnowledgeAssetCreated.author). */
     authorAddress?: string;
     /** Optional sub-graph the publish targeted (defaults to root workspace). */
@@ -499,10 +513,10 @@ export class FinalizationHandler {
   > {
     const {
       contextGraphId, onChainCgId, ual, merkleRoot, publisherAddress,
-      kaId, txHash, blockNumber, authorAddress, subGraphName,
+      kaId, versionBlock, authorAddress, subGraphName,
     } = input;
 
-    const ctxGraphId = onChainCgId && onChainCgId.length > 0 ? onChainCgId : undefined;
+    const ctxGraphId = onChainCgId.length > 0 ? onChainCgId : undefined;
     const targetMetaGraph = ctxGraphId
       ? contextGraphMetaUri(contextGraphId, ctxGraphId)
       : `did:dkg:context-graph:${contextGraphId}/_meta`;
@@ -514,13 +528,21 @@ export class FinalizationHandler {
       return 'already-confirmed';
     }
 
+    // Confirm the CG binding from chain truth (defends against a caller passing
+    // a kaId that isn't actually registered to this CG, and against RPC lag /
+    // reorg where the binding hasn't landed yet).
+    if (!(await this.verifyChainCgBinding(kaId, onChainCgId, ctx))) {
+      this.log.info(ctx, `Chain-reconcile: chain CG binding for ${ual} (ka=${kaId}) not confirmed against cg ${onChainCgId}; deferring to sweep retry`);
+      return 'unverified';
+    }
+
     // Recover the published roots from the local SWM snapshot. The gossip path
     // gets `rootEntities` from the wire; here there is no wire, and SWM meta
     // (created at share-time, before publish) carries no merkle root — so we
     // identify the matching WorkspaceOperation by RECOMPUTING each candidate's
     // KC root and comparing to the chain root. This is the same flat-KC root
     // the gossip path verifies against, so a match is an authoritative
-    // merkle verification (no separate merkle-mismatch path needed).
+    // merkle verification.
     const snapshot = await this.findSwmSnapshotForMerkleRoot(contextGraphId, merkleRoot, subGraphName);
     if (!snapshot) {
       this.log.info(ctx, `Chain-reconcile: no local SWM snapshot matches the published merkleRoot for ${ual}; deferring to sweep retry`);
@@ -528,21 +550,7 @@ export class FinalizationHandler {
     }
     const { rootEntities, sharedMemoryQuads } = snapshot;
 
-    // For single-KA reconciliation the KC range is the KA itself; verifyOnChain
-    // re-scans the block's events as the source of truth, so start==end==kaId is
-    // a cross-check, not an authority (B.0 spike residual, confirmed harmless).
-    const { verified, authorAddress: verifiedAuthor, txIndex } = await this.verifyOnChain(
-      txHash, blockNumber, merkleRoot, publisherAddress, kaId, kaId, ctx, ctxGraphId,
-    );
-    if (!verified) {
-      this.log.info(ctx, `Chain-reconcile: on-chain verification not yet confirmed for ${ual} (RPC lag/reorg); deferring to sweep retry`);
-      return 'unverified';
-    }
-
-    const finalizationVersion: MaterializedVersion = {
-      blockNumber,
-      txIndex: typeof txIndex === 'number' ? txIndex : 0,
-    };
+    const finalizationVersion: MaterializedVersion = { blockNumber: versionBlock, txIndex: 0 };
     // Chain-driven reconciliation never requests same-graph dual-write — the
     // root-copy decision is a publisher gossip signal (`keepRootCopyOnLabel`)
     // that has no chain equivalent. Promote per-cgId only.
@@ -555,14 +563,14 @@ export class FinalizationHandler {
       ual,
       rootEntities,
       publisherAddress,
-      txHash,
-      blockNumber,
+      txHash: '',
+      blockNumber: versionBlock,
       startKAId: kaId,
       endKAId: kaId,
       batchId: 0n,
       ctxGraphId,
       subGraphName,
-      authorAddress: verifiedAuthor ?? authorAddress,
+      authorAddress,
       finalizationVersion,
       targetMetaGraph,
       defaultMeta,
@@ -574,8 +582,27 @@ export class FinalizationHandler {
       this.log.info(ctx, `Chain-reconcile: a newer update is already materialised for ${ual}, skipping`);
       return 'stale-target';
     }
-    this.log.info(ctx, `Chain-reconcile: promoted SWM snapshot to VM for ${ual} (chain tx=${txHash.slice(0, 10)}…)`);
+    this.log.info(ctx, `Chain-reconcile: promoted SWM snapshot to VM for ${ual} (ka=${kaId}, cg=${onChainCgId})`);
     return 'promoted';
+  }
+
+  /**
+   * Confirm — from chain truth — that `kaId` is registered to `onChainCgId`,
+   * via the direct `getKAContextGraphId(kaId)` storage read. Returns `false`
+   * when no chain is wired, the read is unavailable, the binding doesn't match,
+   * or the read throws (RPC lag) — all "can't confirm yet, retry later" cases.
+   */
+  private async verifyChainCgBinding(kaId: bigint, onChainCgId: string, ctx: OperationContext): Promise<boolean> {
+    if (!this.chain || this.chain.chainId === 'none' || typeof this.chain.getKAContextGraphId !== 'function') {
+      return false;
+    }
+    try {
+      const boundCg = await this.chain.getKAContextGraphId(kaId);
+      return boundCg.toString() === onChainCgId;
+    } catch (err) {
+      this.log.info(ctx, `Chain-reconcile: getKAContextGraphId(${kaId}) failed (RPC lag?): ${err instanceof Error ? err.message : String(err)}`);
+      return false;
+    }
   }
 
   /**

@@ -63,21 +63,6 @@ API_PORT_BASE="${API_PORT_BASE:-9201}"
 NUM_NODES="${NUM_NODES:-6}"
 NUM_CORE_NODES="${NUM_CORE_NODES:-4}"
 
-# Topology guard. The harness depends on the canonical "≥3 core + ≥2 edge"
-# matrix throughout: Section H seeds two curated CGs from EDGE_A and EDGE_B
-# (= NUM_CORE_NODES+1 and +2), Section D/E round-trip an ERC-721 from
-# node1's op wallet to the first edge node's op wallet, and the conviction
-# discount/transfer checks assume at least one core node (node1) holds
-# positions. Fail fast here with a meaningful message rather than letting
-# a downstream Section choke with array-index errors that obscure the
-# real cause (caller picked an unsupported topology).
-if [ "$NUM_CORE_NODES" -lt 1 ] || [ "$NUM_NODES" -lt "$((NUM_CORE_NODES + 2))" ]; then
-  echo "FATAL: unsupported topology NUM_NODES=$NUM_NODES NUM_CORE_NODES=$NUM_CORE_NODES" >&2
-  echo "       harness requires NUM_CORE_NODES >= 1 and NUM_NODES >= NUM_CORE_NODES + 2 (>=2 edge nodes)." >&2
-  echo "       supported reference profiles: 6/4 (default) or 5/3 (memory-constrained safe profile)." >&2
-  exit 2
-fi
-
 TARGET_KAS="${TARGET_KAS:-500}"
 TARGET_CGS="${TARGET_CGS:-12}"
 MIN_ENTITIES="${MIN_ENTITIES:-50}"

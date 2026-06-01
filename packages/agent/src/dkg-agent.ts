@@ -192,6 +192,7 @@ import {
 } from './swm/ciphertext-chunk-catchup.js';
 import { waitForPeerProtocol } from './p2p/protocol-readiness.js';
 import { orderCatchupPeers } from './p2p/peer-selection.js';
+import { reconcileWarmCoreConnections, type WarmCoreAgent } from './p2p/warm-core-connections.js';
 import { fetchSyncPages, type SyncPageResult } from './sync/requester/page-fetch.js';
 import { getSyncCheckpointKey } from './sync/checkpoint/state.js';
 import { runDurableSync } from './sync/requester/durable-sync.js';
@@ -274,6 +275,11 @@ import {
   MESSAGE_OUTBOX_TICK_MS,
   AGENT_PROFILE_HEARTBEAT_MS,
   AGENT_PROFILE_STALE_THRESHOLD_MS,
+  WARM_CORE_CONNECTIONS_ENABLED,
+  WARM_CORE_RECONCILE_INTERVAL_MS,
+  WARM_CORE_MAX,
+  WARM_CORE_KEEPALIVE_TAG,
+  WARM_CORE_DIAL_TIMEOUT_MS,
 } from './dkg-agent-constants.js';
 import {
   ContextGraphNotFoundError,
@@ -1099,6 +1105,8 @@ export class DKGAgent {
    */
   private readonly lastSuccessfulSyncAt = new Map<string, number>();
   private syncReconcilerTimer: ReturnType<typeof setInterval> | null = null;
+  /** A.4-lite+: periodic warm/pinned Core-connection reconcile (opt-in). */
+  private warmCoreTimer: ReturnType<typeof setInterval> | null = null;
   /**
    * v10-rc sync-refactor: per-(peer+CG) checkpoint offsets so the paged
    * sync requester in `sync/requester/page-fetch.ts` can resume where it
@@ -3001,6 +3009,23 @@ export class DKGAgent {
     }, SYNC_RECONCILER_INTERVAL_MS);
     if (this.syncReconcilerTimer.unref) this.syncReconcilerTimer.unref();
 
+    // A.4-lite+: keep a small set of Core nodes warm (connection pinned +
+    // auto-redialed by libp2p) so catch-up / chain reconciliation never pays
+    // a cold circuit-relay dial to reach a Core. Opt-in via
+    // DKG_WARM_CORE_CONNECTIONS=1. See `p2p/warm-core-connections.ts`.
+    if (WARM_CORE_CONNECTIONS_ENABLED) {
+      const runWarmCore = (): void => {
+        this.reconcileWarmCoreConnections().catch((err: unknown) => {
+          const message = err instanceof Error ? err.message : String(err);
+          this.log.warn(ctx, `Warm-core reconcile tick failed: ${message}`);
+        });
+      };
+      // Prime once now (after startup), then on a steady cadence.
+      runWarmCore();
+      this.warmCoreTimer = setInterval(runWarmCore, WARM_CORE_RECONCILE_INTERVAL_MS);
+      if (this.warmCoreTimer.unref) this.warmCoreTimer.unref();
+    }
+
     // rc.9 PR-10: dedicated join-approval retry tick removed. The
     // substrate's Messenger.processOutboxTick (set up immediately
     // below) now drives retries for /dkg/10.0.1/join-request the
@@ -3278,6 +3303,78 @@ export class DKGAgent {
         const message = err instanceof Error ? err.message : String(err);
         this.log.warn(ctx, `Sync reconciler retry failed for ${shortPeer}: ${message}`);
       });
+    }
+  }
+
+  /**
+   * A.4-lite+: discover Core nodes from the Agent Registry phonebook, gate
+   * them on on-chain ShardingTable membership, and keep a small set warm
+   * (connection pinned + auto-redialed). Best-effort; never throws into the
+   * timer. See `p2p/warm-core-connections.ts`.
+   */
+  private async reconcileWarmCoreConnections(): Promise<void> {
+    if (!this.started) return;
+    await reconcileWarmCoreConnections({
+      selfPeerId: this.node.libp2p.peerId.toString(),
+      maxCores: WARM_CORE_MAX,
+      findCoreAgents: async (): Promise<WarmCoreAgent[]> => {
+        const agents = await this.discovery.findAgents();
+        return agents.map((a) => ({
+          peerId: a.peerId,
+          nodeRole: a.nodeRole,
+          agentAddress: a.agentAddress,
+        }));
+      },
+      isShardingTableCore: (agentAddress) => this.isShardingTableCore(agentAddress),
+      isConnected: (peerId) =>
+        this.node.libp2p.getConnections().some((c) => c.remotePeer.toString() === peerId),
+      pinAndDial: (peerId, ctx) => this.pinAndDialWarmCore(peerId, ctx),
+      log: (ctx, msg) => this.log.info(ctx, msg),
+    });
+  }
+
+  /**
+   * Trust gate for warm-core pinning: only pin Cores that are members of the
+   * on-chain ShardingTable (staked nodes). Best-effort — when the chain
+   * adapter can't answer (no chain bound, optional reads absent) the gate
+   * passes so the phonebook `nodeRole='core'` alone decides. A transient
+   * RPC failure denies (we don't pin on an unverifiable gate).
+   */
+  private async isShardingTableCore(agentAddress: string | undefined): Promise<boolean> {
+    const getIdentityIdForAddress = this.chain.getIdentityIdForAddress?.bind(this.chain);
+    const isShardingTableMember = this.chain.isShardingTableMember?.bind(this.chain);
+    if (!getIdentityIdForAddress || !isShardingTableMember) return true; // gate unavailable
+    if (!agentAddress) return false; // can't resolve identity without the operational wallet
+    try {
+      const identityId = await getIdentityIdForAddress(agentAddress);
+      if (identityId === 0n) return false;
+      return await isShardingTableMember(identityId);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Tag a Core keep-alive in the peerStore — so libp2p's connection manager
+   * maintains + auto-redials it (mirrors the relay keep-alive path in
+   * `core/node.ts`) — then dial it via the existing resolve+dial path.
+   * Returns true on a successful dial.
+   */
+  private async pinAndDialWarmCore(peerIdStr: string, ctx: OperationContext): Promise<boolean> {
+    const shortPeer = peerIdStr.slice(-8);
+    try {
+      const { peerIdFromString } = await import('@libp2p/peer-id');
+      const peerId = peerIdFromString(peerIdStr);
+      await this.node.libp2p.peerStore.merge(peerId, {
+        tags: { [WARM_CORE_KEEPALIVE_TAG]: { value: 100 } },
+      });
+      await this.connectToPeerId(peerIdStr, { timeoutMs: WARM_CORE_DIAL_TIMEOUT_MS });
+      this.log.info(ctx, `warm-core: pinned + dialed ${shortPeer}`);
+      return true;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.log.info(ctx, `warm-core: pin/dial ${shortPeer} failed (retry next tick): ${message}`);
+      return false;
     }
   }
 
@@ -20033,6 +20130,10 @@ export class DKGAgent {
     if (this.syncReconcilerTimer) {
       clearInterval(this.syncReconcilerTimer);
       this.syncReconcilerTimer = null;
+    }
+    if (this.warmCoreTimer) {
+      clearInterval(this.warmCoreTimer);
+      this.warmCoreTimer = null;
     }
     if (this.messengerOutboxTimer) {
       clearInterval(this.messengerOutboxTimer);

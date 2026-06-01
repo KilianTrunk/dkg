@@ -4,44 +4,113 @@ All notable changes to the DKG V9 node are documented here. The format is based 
 
 ## [Unreleased]
 
-### Changed — Knowledge Collection → Knowledge Asset rename (BREAKING, rc.12 stack)
+_No changes yet._
 
-Clean cutover from the V8/V9/V10.0 "Knowledge Collection" terminology to the V10.1 "Knowledge Asset" terminology, both on-chain and off-chain. No compat shims, no fallback resolvers — testnet is intentionally broken by this change. Forward-only release for rc.12.
+## [10.0.0-rc.12] - 2026-06-01
 
-This ships as three stacked PRs against `release/rc.12`:
+**Cutover release.** No compatibility shims, no fallback resolvers, no backward-compatible codepaths. Testnet (Base Sepolia) and devnet are intentionally broken by this change and must be redeployed. Every package in the workspace upgrades in lockstep. This is a forward-only release.
+
+**For builders upgrading from rc.11**, see [`docs/UPGRADE_RC11_TO_RC12.md`](docs/UPGRADE_RC11_TO_RC12.md) for the focused migration guide (TS rename tables, Solidity selector changes, greenfield KA model, economic floors, agent-prompt template).
+
+### Added — Greenfield Knowledge Asset model (BREAKING)
+
+- **Greenfield KA model** (PR #815, `packages/evm-module/contracts/DKGKnowledgeAssets.sol`, `packages/evm-module/contracts/KnowledgeAssetsLifecycle.sol`, `packages/publisher/src/dkg-publisher.ts`, `packages/agent/src/dkg-agent.ts`, `packages/evm-module/docs/greenfield-ka-ual.md`): exactly **one** ERC-721 KA per publish (`knowledgeAssetsAmount == 1` is the only valid value). Stable UAL — `did:dkg:{chainId}/{DKGKnowledgeAssetsAddress}/{kaId}` — that does **not** change across merkle-root updates. ERC-721 minted to the **author** at publish (publisher pays TRAC; author holds the token). Owner-sealed updates: only the current `ownerOf(kaId)` can update, by signing an EIP-712 `UpdateAuthorAttestation(kaId, newMerkleRoot, authorAddress, schemeVersion)` once (domain `KnowledgeAssetsLifecycle` v2.0.0, kept stable for attestation continuity) and passing it as `precomputedUpdateAttestation` on the first `publisher.update()` call. The publisher (any node operator) does the chain write; the attestation is the seal the chain validates against `ownerOf`. No ERC-1155 mint/burn on update — the ERC-721 stays bound to the same `kaId`. Devnet gates: `pnpm test:devnet:greenfield-10min`, `pnpm test:devnet:rich-scenario`. Canonical UAL builder exported as `buildKnowledgeAssetUal(chainId, contract, kaId)` from `@origintrail-official/dkg-chain`. Surface reference: `packages/evm-module/docs/greenfield-ka-ual.md`.
+
+### Added — Protocol treasury fee on publish / update / extend
+
+- **Governance-set bps fee** (PR #821, `packages/evm-module/contracts/storage/ParametersStorage.sol`, `packages/evm-module/contracts/KnowledgeAssetsLifecycle.sol`, `packages/evm-module/contracts/PublishingConviction.sol`, `packages/chain/abi/ParametersStorage.json`, `packages/chain/abi/PublishingConviction.json`): skims a governance-set bps cut (default **300 bps = 3 %**, capped at **MAX_PROTOCOL_TREASURY_FEE = 1000 bps**) from the staker-bound TRAC on every paid publish/update/extend and routes it to a treasury address. **The publisher pays the same gross price** — the fee comes out of what would otherwise flow into the staker reward pool. **Dormant by default** (`treasury == address(0) ⇒ fee == 0`), so a fresh deploy is unchanged until governance opts in via the new owner-gated `setProtocolTreasury` / `setProtocolTreasuryFee` setters. New `ProtocolTreasurySet(uint256 fee, address treasury)` event. `KnowledgeAssetsLifecycle._addTokens` splits at the source (`net → CSS vault, fee → treasury`) and returns `net` so publish/update/extend distribute `net` into the pool while CG-value writes stay on gross. `PublishingConviction` skims the fee on the active sink + every passive window sweep + final dust/topUp tail, accumulates, and pays via a single `CSS.transferStake` **after** all state writes so the permissionless `settle()` stays reentrancy-safe. **Lifetime invariant**: `pool + treasury == committed + topUps`. ParametersStorage version: `1.0.0` → `1.1.0`. PublishingConviction version: `1.0.1` → `1.1.0`. `KnowledgeAssetsLifecycle` patch bump `2.0.0` → `2.0.1`; the EIP-712 domain hash is **pinned at `KnowledgeAssetsLifecycle@2.0.0`** so existing author attestations keep verifying across the patch bump.
+
+### Added — Blazegraph + SPARQL-HTTP external triple-store (RFC 120)
+
+- **External triple-store backend** (PR #766, `packages/storage/src/blazegraph-store.ts`, `packages/storage/src/sparql-http-store.ts`, `packages/cli/src/storage-wizard.ts`, `docs/setup/STORAGE_SPARQL_HTTP.md`): the daemon's persistence layer can now point at an external Blazegraph or generic SPARQL-HTTP endpoint instead of (or alongside) the embedded Oxigraph store. Configured via `storage.backend: "sparql-http"` + `storage.endpoint: "<url>"` in `~/.dkg/config.json`, or via the new interactive `dkg storage` wizard. Operator runbook at `docs/setup/STORAGE_SPARQL_HTTP.md`. Companion fixes for Blazegraph integration: (PR #782) namespace-creation 500 on first boot; (PR #810) large publishes + EPCIS private-scope queries; (PR #789) oversized literal guard.
+
+### Added — Operator tooling and observability
+
+- **`dkg doctor`** (RFC-41 Bundle A, `packages/cli/src/commands/doctor.ts`): diagnoses common install/upgrade issues. Six structured checks + a state-summary; JSON-parseable output. Run `dkg doctor` after upgrading to confirm the install is healthy.
+- **`/api/build-info`** (RFC-41 Bundle A3, `packages/cli/src/daemon/routes/status.ts`): surfaces `{ version, commit, installMode, builtAt }` so monitoring can correlate daemon behaviour with build provenance.
+- **`/api/status` `relay` block** (carried from rc.11; pinned at every node): uniform `{ isCore, reservationsHeld, reservationCapacity, activeCircuits, bytesIn, bytesOut, natStatus, listenAddresses, announcedAddresses }` so dashboards parse one schema rather than switching on `nodeRole`.
+- **RFC-41 Bundle B — Edge npm-only update path** (`packages/cli/src/daemon/auto-update.ts`, `packages/cli/src/migrate-to-npm.ts`): Edge nodes update via `npm install -g @origintrail-official/dkg` instead of git-build. Git-based updates are hard-refused at user-facing entry points for edges; Core nodes retain the git-build path for now. Includes `--role` flag on `dkg init`, monorepo guard, stable plugin install root, `installMode` telemetry, deprecation banner on `install.sh` (which has been removed).
+- **Node UI — Context Graph Overview and notifications redesign** (PR #745, #818, #811): redesigned Context Graph view with Root mini-card, cross-layer pills, mini-graph colors, count-accuracy fixes; membership-scoped notifications pane with inline join approve/deny actions.
+
+### Changed — Knowledge Collection → Knowledge Asset rename (BREAKING)
+
+Clean cutover from the V8/V9/V10.0 "Knowledge Collection" terminology to the V10.1 "Knowledge Asset" terminology, both on-chain and off-chain. No compat shims, no fallback resolvers — testnet is intentionally broken by this change.
+
+Ships as three stacked PRs:
 
 - **PR #836 (Solidity surface)** — `KnowledgeCollectionLib.sol` → `KnowledgeAssetLib.sol`, struct `KnowledgeCollection` → `KnowledgeAsset`, every `KnowledgeCollection*` error/event renamed to `KnowledgeAsset*`, every `create/update/get/isPartOf/isOwnerOf/extendKnowledgeCollection*` view/mutator renamed on `DKGKnowledgeAssets.sol` and `KnowledgeAssetsLifecycle.sol`. `ContextGraphStorage.kcToContextGraph` → `kaToContextGraph`, `registerKnowledgeCollection` → `registerKnowledgeAsset`. Legacy V10.0 contracts `KnowledgeAssetsV10.sol` and `KnowledgeCollectionStorage.sol` are deleted (they were dead code in V10.1 — the active path is `KnowledgeAssetsLifecycle` + `DKGKnowledgeAssets`). The V8 archive `KnowledgeCollection.sol` is deleted (referenced the renamed lib). `deployments/parameters.json` config block `KnowledgeCollectionStorage.knowledgeCollectionSize` → `DKGKnowledgeAssets.knowledgeAssetBatchSize`. ABIs regenerated; legacy ABIs removed from `packages/chain/abi/`.
 
 - **PR #837 (TS surface)** — `ChainAdapter.createKnowledgeAssetsV10` → `createKnowledgeAssets`, `getKnowledgeAssetsV10Address` → `getKnowledgeAssetsLifecycleAddress`, `getKCContextGraphId` → `getKAContextGraphId`. `NodeChallenge.knowledgeCollectionId` → `knowledgeAssetId`. `PublishResult.kcId` was already `kaId` in the publisher; all consumers now agree. `ASSERTION_PUBLISH_RECEIPT_PREDICATES.PUBLISHED_AT_KC_ID` → `PUBLISHED_AT_KA_ID` (predicate URI `publishedAtKcId` → `publishedAtKaId`). Adapter internal handles `knowledgeAssetsV10` → `knowledgeAssetsLifecycle`, `knowledgeCollectionStorage` → `knowledgeAssetStorage`. The legacy V10.0 fallback resolver in `EVMChainAdapter.init` is removed — when `KnowledgeAssetsLifecycle` doesn't resolve, the adapter raises rather than silently trying `KnowledgeAssetsV10`. `BOUND_CONTRACT_INVALIDATORS` and `ERROR_ABI_CONTRACTS` drop the legacy entries.
 
-- **PR #838 (docs/tests/scripts/UI) — this PR** — every remaining `kcId`/`KCId`/`KnowledgeCollection*` reference across `scripts/`, `docs/`, `demo/`, `bench/`, `devnet/`, `packages/{evm-module,cli,adapter-openclaw,adapter-elizaos,mcp-dkg,node-ui,network-sim,epcis}/{src,test}`, and the chain README. CHANGELOG entry (this entry). Prose-level term renames "Knowledge Collection" → "Knowledge Asset" / "KC" → "KA" in active docs.
+- **PR #838 (docs/tests/scripts/UI)** — every remaining `kcId`/`KCId`/`KnowledgeCollection*` reference across `scripts/`, `docs/`, `demo/`, `bench/`, `devnet/`, `packages/{evm-module,cli,adapter-openclaw,adapter-elizaos,mcp-dkg,node-ui,network-sim,epcis}/{src,test}`, and the chain README. Prose-level term renames "Knowledge Collection" → "Knowledge Asset" / "KC" → "KA" in active docs.
 
 **Migration impact** for downstream consumers (off-chain SDK callers, custom scripts, dashboards):
 
 - Solidity callers: 4-byte selectors on `DKGKnowledgeAssets` and `ContextGraphStorage` change for every renamed function. Old call data reverts; consumers must rebuild against the new ABIs in `packages/chain/abi/`.
-- TS callers: type names + property names renamed as above. The 1-pass mechanical search-and-replace (`kcId` → `kaId`, `knowledgeCollectionId` → `knowledgeAssetId`, `createKnowledgeCollection` → `createKnowledgeAsset`, etc.) covers all known consumers.
+- TS callers: type names + property names renamed as above. The 1-pass mechanical search-and-replace (`kcId` → `kaId`, `knowledgeCollectionId` → `knowledgeAssetId`, `createKnowledgeCollection` → `createKnowledgeAsset`, etc.) covers all known consumers. The `docs/UPGRADE_RC11_TO_RC12.md` guide ships the exact regex sweep.
 - ABI-pin tests: `packages/chain/test/abi-pinning.test.ts` pinned digests for `KnowledgeAssetsLifecycle`, `DKGKnowledgeAssets`, `ContextGraphs`, `ContextGraphStorage` match the rename; `KnowledgeAssetsV10` and `KnowledgeCollectionStorage` entries are dropped.
 - Hub registration: `KnowledgeAssetsLifecycle` and `DKGKnowledgeAssets` are the only V10.1 entries the daemon looks up. Hub deployments that still expose `KnowledgeAssetsV10` or `KnowledgeCollectionStorage` will silently be ignored by the rc.12 daemon — re-deploy the V10.1 surface before upgrading.
 
-## [10.0.0-rc.12] - 2026-05-29
+### Changed — V10 EVM module hardening pass (BREAKING for two surfaces)
 
-### Added
+Consistency and defense-in-depth refinements across the V10 EVM-module contracts (PR #781). No behaviour change for valid callers except where flagged BREAKING.
 
-- **Greenfield Knowledge Asset model** (see PR #815): `DKGKnowledgeAssets` + `KnowledgeAssetsLifecycle`, one ERC-721 KA per publish, stable UAL, owner-sealed updates via `precomputedUpdateAttestation`. Devnet gates: `pnpm test:devnet:greenfield-10min`, `pnpm test:devnet:rich-scenario`.
-
-### Changed — V10 EVM module hardening pass (carried from integration branch)
-
-Consistency and defense-in-depth refinements across the V10 EVM-module contracts. No behaviour change for valid callers.
-
-- **CEI ordering on `DKGStakingConvictionNFT.withdraw`.** The receipt NFT is now burned before `StakingV10.withdraw` drives the CSS teardown + TRAC payout. `StakingV10.withdraw` gates on the CSS position (`pos.identityId == 0`), not NFT existence, so the CSS teardown is unaffected.
-- **`nonReentrant` perimeter on KAV10 entrypoints.** `publish` / `update` / `extendKnowledgeAssetLifetime` now carry OZ `ReentrancyGuard.nonReentrant` as a defense-in-depth perimeter against the ERC-1155 receiver-hook callback path. ~50 gas/call overhead. KAV10 version: `10.1.0` → `10.1.1`.
-- **Strict-positive `tokenAmount` floor in KAV10 `_validateTokenAmount` AND post-discount floor in `PublishingConviction.coverPublishingCost`.** Both branches of the publish flow now charge a non-zero economic cost regardless of input rounding: direct-spend reverts `InvalidTokenAmount(1, 0)` on `tokenAmount == 0`; the conviction (PCA) branch inflates a truncated `discountedCost == 0` to `1` wei TRAC when `baseCost > 0` so the active-sink reward distribution + `windowSpent` accounting always fire. **BREAKING for any caller that previously relied on dust-CG zero-amount publishes** — the on-chain revert is the floor of truth; off-chain callers must encode `tokenAmount >= 1`. PublishingConviction version: `1.0.0` → `1.0.1`.
-- **Single source of truth for op-wallet validation in `Identity.addOperationalWallets`.** Same-identity collisions (primary added by `createIdentity` OR intra-array duplicate within the same call) surface as `OperationalWalletDuplicate(wallet)`; cross-identity collisions still fire `OperationalKeyTaken(key)`; admin/operational wallet overlap surfaces as the existing `KeyAlreadyAttached(key)`. `Profile.createProfile`'s pre-flight validation loop is removed — atomic-revert semantics make the prior "fail-fast at the entrypoint" rationale moot, and the relocation removes the duplicate validation pass on the happy path. Identity version: `1.0.0` → `1.1.0`; Profile version: `1.3.0` → `1.4.2`.
-- **`Profile.recreateProfile` signature refinement.** Drops the `uint16 initialOperatorFee` argument; the recovered profile is seeded at fee = 0 and the admin sets the real value via the cooldown-gated `updateOperatorFee` path. Keeps the recovery and steady-state surfaces symmetric on the operator-fee dimension. ADR `docs/adr/0001-recreate-profile-admin-only.md` updated.
-- **Chain-package ABI sync.** `packages/chain/abi/KnowledgeAssetsV10.json` and `packages/chain/abi/Profile.json` re-exported from the freshly regenerated `evm-module/abi/` copies so the chain adapter's error decoder (which prefers its local override over the published artifact) resolves `ReentrancyGuardReentrantCall`, `InvalidTokenAmount`, and the new Profile error surface as structured errors instead of opaque reverts.
+- **CEI ordering on `DKGStakingConvictionNFT.withdraw`.** The receipt NFT is now burned **before** `StakingV10.withdraw` drives the CSS teardown + TRAC payout. `StakingV10.withdraw` gates on the CSS position (`pos.identityId == 0`), not NFT existence, so the CSS teardown is unaffected. Same CEI-mint-last ordering applied on every ERC-721 mint path on `DKGKnowledgeAssets` (PR #681, supersedes #663).
+- **`nonReentrant` perimeter on KAV10 entrypoints.** `publish` / `update` / `extendKnowledgeAssetLifetime` now carry OZ `ReentrancyGuard.nonReentrant` as a defense-in-depth perimeter against the ERC-1155 receiver-hook callback path. ~50 gas/call overhead. KAV10 version: `10.1.0` → `10.1.1`. Surfaces as `ReentrancyGuardReentrantCall()` if a receiver hook re-enters; chain adapter decoder updated to surface it as a structured error.
+- **Strict-positive `tokenAmount` floor in `_validateTokenAmount` AND post-discount floor in `PublishingConviction.coverPublishingCost`.** Both branches of the publish flow now charge a non-zero economic cost regardless of input rounding: direct-spend reverts `InvalidTokenAmount(1, 0)` on `tokenAmount == 0`; the conviction (PCA) branch inflates a truncated `discountedCost == 0` to `1` wei TRAC when `baseCost > 0` so the active-sink reward distribution + `windowSpent` accounting always fire. **BREAKING** for any caller that previously relied on dust-CG zero-amount publishes — the on-chain revert is the floor of truth; off-chain callers MUST encode `tokenAmount >= 1`. Same floor applies to the update path (PR #831, #833): `update` and `extendKnowledgeAssetLifetime` enforce the floor in both direct-spend and conviction branches. PublishingConviction version: `1.0.0` → `1.0.1` → `1.1.0`.
+- **Single source of truth for op-wallet validation in `Identity.addOperationalWallets`.** Same-identity collisions (primary added by `createIdentity` OR intra-array duplicate within the same call) surface as `OperationalWalletDuplicate(wallet)`; cross-identity collisions still fire `OperationalKeyTaken(key)`; admin/operational wallet overlap surfaces as the existing `KeyAlreadyAttached(key)`. `Profile.createProfile`'s pre-flight validation loop is removed — atomic-revert semantics make the prior "fail-fast at the entrypoint" rationale moot. Identity version: `1.0.0` → `1.1.0`; Profile version: `1.3.0` → `1.4.2`.
+- **`Profile.recreateProfile` signature refinement (BREAKING for recovery scripts).** Drops the `uint16 initialOperatorFee` argument; the recovered profile is seeded at fee = 0 and the admin sets the real value via the cooldown-gated `updateOperatorFee` path. Keeps the recovery and steady-state surfaces symmetric on the operator-fee dimension. ADR `packages/evm-module/docs/adr/0001-recreate-profile-admin-only.md` updated.
+- **Chain-package ABI sync.** `packages/chain/abi/*.json` re-exported from the freshly regenerated `evm-module/abi/` copies so the chain adapter's error decoder (which prefers its local override over the published artifact) resolves `ReentrancyGuardReentrantCall`, `InvalidTokenAmount`, `OperationalWalletDuplicate`, and the new Profile error surface as structured errors instead of opaque reverts.
 - **Regression coverage.** New unit tests pin every new revert surface: `publish` + `extendKnowledgeAssetLifetime` revert `InvalidTokenAmount(1, 0)` on `tokenAmount == 0`; `publish` reverts `ReentrancyGuardReentrantCall()` when re-entered from the ERC-1155 mint acceptance callback (via the new `MockReentrantPublisher` test harness); `PublishingConviction.coverPublishingCost(baseCost=1, ...)` floors `discountedCost` at 1 and propagates that floor through the active-sink reward distribution + `windowSpent` accounting; `Identity.addOperationalWallets` per-class disambiguation; `Profile.createProfile` per-class diagnostics.
 
-Compatibility: `recreateProfile`'s signature is a BREAKING change for the recovery script. The `tokenAmount > 0` floor is a BREAKING change for any zero-cost publish flows. Off-chain consumers pinned to `KnowledgeAssetsV10@10.1.0` or `Profile@1.3.0` need a version bump. No storage-layout changes — KAV10's added `ReentrancyGuard` storage slot lands at the end of the inheritance chain, and V10's redeploy-and-reinit pattern doesn't preserve storage across upgrades anyway.
+Storage layout: no changes — KAV10's added `ReentrancyGuard` storage slot lands at the end of the inheritance chain, and V10's redeploy-and-reinit pattern doesn't preserve storage across upgrades anyway.
+
+### Changed — Active-sink proration + publishing discount ladder centralisation
+
+- **PCA active-sink proration math** (PR #817, multiple commits): centralised the publishing discount ladder, wired the active-sink proration helper into both the direct-publish and conviction paths, preserved final-range dust, handled empty middle and final ranges, and covered one-epoch and large-dust cases. The math is now uniform across publish and update; the previous discount-recomputation drift on update is gone.
+- **ConvictionStakingStorage added to the 052b deploy dependency graph** so the treasury-fee + active-sink rework deploys reliably from a clean Hub.
+
+### Fixed — Random Sampling on updated Knowledge Assets (GH #842)
+
+- **Updated KAs are now provable by Random Sampling** (PRs #842, #845; `packages/publisher/src/metadata.ts`, `packages/publisher/src/dkg-publisher.ts`, `packages/publisher/src/update-handler.ts`, `packages/agent/src/finalization-handler.ts`, `packages/random-sampling/test/ka-extractor.test.ts`, `packages/publisher/test/update-handler-gh842.test.ts`): every updated KA was permanently unprovable by Random Sampling pre-rc.12, producing a steady stream of `rs.tick.data-corrupted` on core nodes once any KA was updated. Root cause was a race in the daemon's local projection of the chain's ordered update log: two concurrent writers to the per-cgId materialisation partition (`publishFromSharedMemory`'s publish→per-cgId promotion and the inline update-promotion) had no version discipline, so a late publish-promotion could clobber an already-applied update with no guard. Three changes give the projection layer the same ordering guarantee the chain log already has: (1) **full label-graph restatement** on both update paths (`storeUpdatedQuads` and `UpdateHandler`) via the shared `restateLabelGraphForUpdate` helper — prior root entities' data is purged, `rootEntity` is repointed (rich provenance like `dkg:authoredBy` preserved), `merkleRoot` refreshed; (2) **a per-KA `dkg:materializedVersion` (`block:txIndex`) guard** stamped on the KC's `<ual>` in the meta graph each canonical writer touches (publisher promotion, update promotion, receiver `FinalizationHandler`) — every canonical writer now refuses to apply a state older than what's already materialised, so a late publish-promotion is a no-op; (3) **a deterministic-UAL fallback** in `UpdateHandler` (`did:dkg:<chainId>/<kasAddress>/<batchId>`, matching the publisher's own `resolveKaUal`) so a gossip receiver that hasn't yet materialised the `dkg:batchId` edge still promotes instead of silently skipping. Helpers live in `packages/publisher/src/metadata.ts`. Regression coverage drives the actual ordering (publish-promotion after update-promotion) rather than just final-state shape. Full root-cause analysis in `GH842-rs-update-race-analysis.md`.
+
+### Fixed — ERC-20 non-reverting `false` returns (PR #814)
+
+- **Staking deposits + withdrawals + operator-fee finalisation now guard against ERC-20 implementations that return `false` instead of reverting** (`packages/evm-module/contracts/StakingV10.sol`, `packages/evm-module/contracts/ConvictionStakingStorage.sol`, `packages/evm-module/contracts/Staking.sol`): every `transferFrom` / `transfer` call site that previously checked only revert behaviour now asserts the bool return, so a misbehaving (or malicious) ERC-20 cannot silently strand TRAC mid-flow. The default v9TRAC token reverts, so this is defence in depth — but it closes the surface for any token that follows the early-OpenZeppelin "return false" pattern.
+
+### Fixed — Update path token-amount floor + ACK digest alignment (PR #831, #833)
+
+- **`update` and `extendKnowledgeAssetLifetime` now pay the marginal growth cost for `byteSize` updates** so the on-chain economic floor matches the publish path (`packages/evm-module/contracts/KnowledgeAssetsLifecycle.sol`).
+- **Storage ACK digest binds the precomputed `newTokenAmount`** (`packages/chain/src/evm-adapter.ts`, `packages/publisher/src/storage-ack-handler.ts`) so ACK collectors can't be tricked into signing for a different fee than what the chain enforced. Includes epoch-boundary growth handling + mock parity exempts so the unit-tests stay deterministic.
+- **Fail-fast KA / ask / Chronos reads** in the chain adapter so a transient RPC mismatch surfaces as an explicit error rather than silently using stale data on the update path.
+
+### Fixed — Ethers `PollingEventSubscriber` CPU spin
+
+- **Forced ethers' `PollingEventSubscriber` to stop the `FilterId` CPU spin** (`packages/chain/src/evm-adapter.ts`) that was producing 100 % single-core utilization on long-uptime daemons. The subscriber was tight-looping on a stale filter id; the adapter now invalidates and reinstalls the subscription. Companion to rc.11's `createFilterErrorSilencer` work (which masked the *log* spam but not the *CPU* spin).
+
+### Fixed — Context Graph count queries, query scoping, SWM promote ownership
+
+- **RC.12 Context Graph count queries fixed** (PR #844, `packages/cli/src/daemon/routes/context-graph.ts`, `packages/node-ui/src/components/ContextGraphOverview/*`): KA URN encoding follow-ups so per-CG KA counts are accurate end-to-end.
+- **Query scoping fixes** (PRs #761, #764, #774, #776, #777, #779): structural sub-graph match, allowing same-CG `_meta` + `_shared_memory_meta` on explicit-IRI scoped queries, dropped unsafe dynamic sub-graph enumeration for wallet-scoped cgIds, gossip recipient dual-write parity, F1 mismatch regression coverage, relaxed over-strict SPARQL PREFIX validation. Net effect: `agent.query()` returns the right rows against curated sub-graphs and the workspace-scoped surface.
+- **Durable SWM promote ownership enforcement** (PR #754): a promote-to-canonical that doesn't own its source SWM is now rejected.
+- **SWM `prov:wasAttributedTo` binds to agent DID, not peer ID** (PR #756, #748): assertions in the shared sub-graph carry the canonical agent identifier so cross-node attribution stays stable across libp2p peer-id rotation.
+- **`dkg:subGraphName` emitted from assertion-lifecycle writers** (PR #696, #770): publish receipts in sub-graph contexts now carry the sub-graph label, fixing UI / query routing for sub-graph publishes.
+
+### Fixed — Misc
+
+- **Receiver defensive `cg-id` lookup + RS backfill for pre-`cd68fa689` KCs** (PR #763): cores that received gossip before the chain `cgId` materialised in their meta graph were skipping the per-cgId promotion; lookups now plumb the on-chain id end to end (PR #cd68fa68 follow-up), and a one-shot backfill walks the historical KCs.
+- **Greenfield ACK / profile / devnet fallout** (PR #820): bind ciphertext + `isImmutable` into V10 ACK digests, flexible `createProfile` caller for the rebased rc.12 baseline.
+- **Hermes `API_SERVER_KEY` forwarded** (PR #794, #795, #799): Node UI chat survives Hermes v0.15.0's auth tightening.
+- **`graph-viz` SPARQL protocol headers pin after caller headers** so callers can't accidentally override the `Accept` / `Content-Type` envelope.
+- **`graph-viz` `_triples` normalised on ingress** (PR #692, #768): `removeTriples` now round-trips across bracket styles.
+- **CLI strict-TS double-cast for doctor config overlay**; **`dkg doctor` `safe to delete releases/` advisory gated** (PR #750 follow-up); **store-wizard red-tests + sparql-http default** (PR #791 follow-up).
+- **Validate context graph write targets** (PR #761): a published assertion can no longer name a CG it doesn't belong to.
+- **Slither annotations** for the random-sampling contracts to mute the documented-safe findings in CI.
+
+### Operations — Testnet contract redeploy required
+
+- **Base Sepolia (chainId 84532)**: full V10.1 contract surface redeployed off the rc.12 commit. Hub at `0xC056e67Da4F51377Ad1B01f50F655fFdcCD809F6` and Token at `0x2A58BdD13176D85906D804cdbFFA0D9119282DC8` retain their addresses; every other contract address rotates. `chainResetMarker` bumped accordingly; first boot on rc.12 wipes per-node chain-derived state.
+- **Operator action**: bump `@origintrail-official/dkg` to `10.0.0-rc.12`, restart the daemon, run `dkg doctor` to verify. Stakers with V10 conviction NFTs are unaffected (positions live on `ConvictionStakingStorage` keyed by `identityId`, which is preserved across the contract-address rotation since identities aren't redeployed).
 
 ## [10.0.0-rc.11] - 2026-05-26
 
@@ -316,7 +385,15 @@ V10 RandomSampling + V8/V10 staking consolidation. Testnet reset required (Base 
 - **`ensureProfile` profile-without-stake on partial failure**: profile creation and staking are now in separate `try/catch` blocks so a failed stake leaves the on-chain identity intact for retry instead of leaving the operator without either.
 - **ABI pinning test drift** for V10 publish/update functions after `merkleLeafCount` was added (`abi-pinning.test.ts`): pin digests refreshed.
 
-[Unreleased]: https://github.com/OriginTrail/dkg/compare/v10.0.0-rc.3...HEAD
+[Unreleased]: https://github.com/OriginTrail/dkg/compare/v10.0.0-rc.12...HEAD
+[10.0.0-rc.12]: https://github.com/OriginTrail/dkg/releases/tag/v10.0.0-rc.12
+[10.0.0-rc.11]: https://github.com/OriginTrail/dkg/releases/tag/v10.0.0-rc.11
+[10.0.0-rc.10]: https://github.com/OriginTrail/dkg/releases/tag/v10.0.0-rc.10
+[10.0.0-rc.9]: https://github.com/OriginTrail/dkg/releases/tag/v10.0.0-rc.9
+[10.0.0-rc.8]: https://github.com/OriginTrail/dkg/releases/tag/v10.0.0-rc.8
+[10.0.0-rc.7]: https://github.com/OriginTrail/dkg/releases/tag/v10.0.0-rc.7
+[10.0.0-rc.6]: https://github.com/OriginTrail/dkg/releases/tag/v10.0.0-rc.6
+[10.0.0-rc.4]: https://github.com/OriginTrail/dkg/releases/tag/v10.0.0-rc.4
 [10.0.0-rc.3]: https://github.com/OriginTrail/dkg/releases/tag/v10.0.0-rc.3
 [10.0.0-rc.2]: https://github.com/OriginTrail/dkg/releases/tag/v10.0.0-rc.2
 [9.0.0]: https://github.com/OriginTrail/dkg-v9/releases/tag/v9.0.0

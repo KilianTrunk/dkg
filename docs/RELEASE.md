@@ -2,6 +2,14 @@
 
 This document describes how to cut a new release of the DKG V9 node so that users can install and track specific versions.
 
+## Upgrading from a prior release
+
+Each rc/stable ships a focused upgrade guide for builders that captures breaking changes, mechanical TS/Solidity rename tables, and an agent-prompt template:
+
+- **rc.11 → rc.12** — see [`docs/UPGRADE_RC11_TO_RC12.md`](./UPGRADE_RC11_TO_RC12.md).
+
+The full per-PR detail lives in [`CHANGELOG.md`](../CHANGELOG.md). The upgrade guides are the recommended starting point for builders pointing an AI agent at their codebase.
+
 ## Versioning
 
 - **Single version**: The repo uses one version for the node as a product. It is set in:

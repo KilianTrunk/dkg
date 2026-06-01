@@ -1,3 +1,5 @@
+import { subGraphFromAssertionGraphUri } from './lib/sub-graph-uri.js';
+
 const BASE = '';
 declare global {
   interface Window { __DKG_TOKEN__?: string; }
@@ -75,14 +77,10 @@ async function del<T>(path: string): Promise<T> {
 export const fetchStatus = () => get<any>('/api/status');
 
 // --- LLM Settings ---
-export interface LlmSettingsResponse {
-  configured: boolean;
-  model?: string;
-  baseURL?: string;
-}
-export const fetchLlmSettings = () => get<LlmSettingsResponse>('/api/settings/llm');
-export const updateLlmSettings = (data: { apiKey?: string; model?: string; baseURL?: string; clear?: boolean }) =>
-  put<LlmSettingsResponse & { ok: boolean }>('/api/settings/llm', data);
+// NOTE: the LLM settings CLIENT exports (fetchLlmSettings/updateLlmSettings)
+// were removed with the Settings LLM section (Settings cleanup). The daemon
+// route /api/settings/llm + llmSettings plumbing STAY — they gate import/
+// entity-extraction (routes/memory.ts, routes/epcis.ts). UI-only removal.
 export const fetchRetentionSettings = () => get<{ retentionDays: number }>('/api/settings/retention');
 export const updateRetentionSettings = (retentionDays: number) =>
   put<{ ok: boolean; retentionDays: number }>('/api/settings/retention', { retentionDays });
@@ -332,67 +330,6 @@ export const approveJoinRequest = (contextGraphId: string, agentAddress: string)
 
 export const rejectJoinRequest = (contextGraphId: string, agentAddress: string) =>
   post<{ ok: boolean; status: string; agentAddress: string }>(`/api/context-graph/${encodeURIComponent(contextGraphId)}/reject-join`, { agentAddress });
-
-// --- Catch-up sync jobs ---
-export interface CatchupStatusResponse {
-  jobId: string;
-  contextGraphId: string;
-  includeSharedMemory: boolean;
-  /**
-   * `unreachable` is the V10 terminal status emitted when the daemon
-   * subscribed and ran the catchup, but no peer could deliver the CG
-   * content (curator offline, no node holds the CG, or transport
-   * failures across the whole peer set). Distinct from `denied`
-   * (responder explicitly refused) so the UI can render targeted
-   * copy + a "send signed join request" CTA.
-   */
-  status: 'queued' | 'running' | 'done' | 'denied' | 'failed' | 'unreachable';
-  queuedAt: number;
-  startedAt?: number;
-  finishedAt?: number;
-  result?: {
-    connectedPeers: number;
-    syncCapablePeers: number;
-    peersTried: number;
-    /** See `unreachable` above; subset of `peersTried` that responded without failure or denial. */
-    peersSucceeded: number;
-    dataSynced: number;
-    sharedMemorySynced: number;
-    denied: boolean;
-    deniedPeers: number;
-    diagnostics?: {
-      noProtocolPeers: number;
-      durable: {
-        fetchedMetaTriples: number;
-        fetchedDataTriples: number;
-        insertedMetaTriples: number;
-        insertedDataTriples: number;
-        bytesReceived: number;
-        resumedPhases: number;
-        emptyResponses: number;
-        metaOnlyResponses: number;
-        dataRejectedMissingMeta: number;
-        rejectedKcs: number;
-        failedPeers: number;
-      };
-      sharedMemory: {
-        fetchedMetaTriples: number;
-        fetchedDataTriples: number;
-        insertedMetaTriples: number;
-        insertedDataTriples: number;
-        bytesReceived: number;
-        resumedPhases: number;
-        emptyResponses: number;
-        droppedDataTriples: number;
-        failedPeers: number;
-      };
-    };
-  };
-  error?: string;
-}
-
-export const fetchCatchupStatus = (contextGraphId: string) =>
-  get<CatchupStatusResponse>(`/api/sync/catchup-status?contextGraphId=${encodeURIComponent(contextGraphId)}`);
 
 // --- File import to Working Memory ---
 export interface ImportFileResult {
@@ -679,43 +616,69 @@ export async function listAssertions(
   }
 
   // layer === 'wm'
-  const sparql = `SELECT DISTINCT ?g (COUNT(?s) AS ?cnt) WHERE { GRAPH ?g { ?s ?p ?o } } GROUP BY ?g`;
+  //
+  // #844 regression fix — the prior WM listing enumerated data graphs via
+  // `SELECT DISTINCT ?g WHERE { GRAPH ?g { ?s ?p ?o } }`. Merge #844 gated
+  // that whole-store `GRAPH ?g` enumeration in the WM view behind the
+  // `includeContextGraphPartitions` flag (which `listAssertions` does not
+  // set), so the WM view returned no assertion data-graphs and the
+  // Assertions subtab went empty.
+  //
+  // Derive WM assertions from the `<cg>/_meta` lifecycle graph instead —
+  // the same source of truth the SWM branch uses (just `_meta` rather than
+  // `_shared_memory_meta`). Each WM assertion is recorded by
+  // `generateAssertionCreatedMetadata` as a `dkg:Assertion` entity carrying
+  // `dkg:assertionName`, `dkg:assertionGraph`, and a MUTABLE
+  // `dkg:memoryLayer` literal whose value is the assertion's CURRENT layer.
+  // `MemoryLayer.WorkingMemory` is `"WM"`; on promote the lifecycle writer
+  // flips it to `"SWM"` — so filtering on `dkg:memoryLayer "WM"` yields
+  // exactly the not-yet-promoted assertions (promoted ones correctly drop
+  // out of the WM list). The explicit `GRAPH <…/_meta> { … }` makes the
+  // query self-scoping (the engine's `wrapWithGraph` early-returns when the
+  // SPARQL already names a graph), so it runs raw — same shape as the SWM
+  // branch above. `graphUri` is the lifecycle URN (`?assertion`), matching
+  // the SWM branch and what promote/preview lookups key on (name + subGraph).
+  const DKG = 'http://dkg.io/ontology/';
+  const metaGraph = `did:dkg:context-graph:${contextGraphId}/_meta`;
+  const sparql = `SELECT DISTINCT ?assertion ?name ?sg ?assertionGraph WHERE {
+    GRAPH <${metaGraph}> {
+      ?assertion a <${DKG}Assertion> ;
+                 <${DKG}memoryLayer> "WM" ;
+                 <${DKG}assertionName> ?name .
+      OPTIONAL { ?assertion <${DKG}subGraphName> ?sg }
+      OPTIONAL { ?assertion <${DKG}assertionGraph> ?assertionGraph }
+    }
+  }`;
   const data = await executeQuery(sparql, contextGraphId);
   const bindings: any[] = data?.result?.bindings ?? [];
-  // #706 fix — the prior `startsWith('did:dkg:context-graph:<cg>/assertion/')`
-  // shape silently dropped sub-graph-scoped WM assertions, whose graph
-  // URI is `did:dkg:context-graph:<cg>/<sg>/assertion/<agent>/<name>`
-  // (the sub-graph segment sits between `<cg>/` and `/assertion/`).
-  // We accept exactly two shapes, post-cgPrefix:
-  //   root-bucket : ['assertion', <agent>, <name>]            (3 segs)
-  //   sub-graph   : [<subGraphName>, 'assertion', <agent>, <name>] (4 segs)
-  // Anything else (extra segments on either side, internal meta
-  // graphs sharing the prefix, etc.) is silently dropped. The parse
-  // is deliberately strict so a row never gets admitted with a
-  // mis-derived name — promote/preview lookups key on `name` and
-  // would silently miss otherwise. The cgId itself is treated as
-  // opaque (it may contain `/assertion/` as a literal substring,
-  // per `validateContextGraphId`).
-  const cgPrefix = `did:dkg:context-graph:${contextGraphId}/`;
+  const seen = new Set<string>();
   const result: AssertionInfo[] = [];
   for (const b of bindings) {
-    const g = typeof b.g === 'string' ? b.g : b.g?.value;
-    if (!g || !g.startsWith(cgPrefix)) continue;
-    const segments = g.slice(cgPrefix.length).split('/');
-    let subGraph: string | undefined;
-    let name: string;
-    if (segments.length === 3 && segments[0] === 'assertion') {
-      subGraph = undefined;
-      name = segments[2];
-    } else if (segments.length === 4 && segments[1] === 'assertion') {
-      subGraph = segments[0];
-      name = segments[3];
-    } else {
-      continue;
-    }
-    if (!name) continue;
-    const cnt = typeof b.cnt === 'string' ? parseInt(b.cnt, 10) : (b.cnt?.value ? parseInt(b.cnt.value, 10) : undefined);
-    result.push({ name, graphUri: g, tripleCount: Number.isFinite(cnt) ? cnt : undefined, subGraph });
+    const lifecycle = bv(b.assertion);
+    const name = bv(b.name);
+    if (!lifecycle || !name) continue;
+    // Sub-graph scope: prefer the explicit `dkg:subGraphName` literal
+    // (emitted by the lifecycle writer for sub-graph-scoped assertions
+    // since #710). Drafts created BEFORE #710 carry `dkg:assertionGraph`
+    // but NO `dkg:subGraphName`, so fall back to parsing the sub-graph
+    // segment out of the assertion-graph URI — same migration fallback
+    // the lifecycle hook uses (`subGraphFromAssertionGraphUri`). Without
+    // it, a pre-#710 sub-graph draft would surface as root-bucket and
+    // mis-scope promote/preview lookups.
+    const assertionGraph = bv(b.assertionGraph);
+    const subGraph =
+      bv(b.sg) ||
+      (assertionGraph
+        ? subGraphFromAssertionGraphUri(assertionGraph, contextGraphId)
+        : undefined) ||
+      undefined;
+    if (seen.has(lifecycle)) continue;
+    seen.add(lifecycle);
+    // Mirror the SWM branch: no per-assertion triple count (the data-graph
+    // COUNT was exactly the gated enumeration; the renderer already guards
+    // `tripleCount != null`, so the count chip is simply omitted for WM —
+    // consistent with SWM rows).
+    result.push({ name, graphUri: lifecycle, subGraph });
   }
   return result;
 }

@@ -4,7 +4,9 @@ All notable changes to the DKG V9 node are documented here. The format is based 
 
 ## [Unreleased]
 
-_No changes yet._
+### Added — Operator observability for per-publish 1-wei allowance floor (#871)
+
+- **Diagnostic log line in `EVMChainAdapter.ensureV10ApproveTrac`** (`packages/chain/src/evm-adapter.ts`): when the V10 publish/update path emits its per-publish floor approval (`targetAllowance == V10_PUBLISH_ONCHAIN_MIN_ALLOWANCE` and `chain.approvalPolicy.mode == 'per-publish'`), the daemon now logs a single `console.warn` line identifying that the resulting 1-wei allowance is the intentional `#720` workaround (the contract's `transferFrom(..., 1n)` minimum on zero-cost publishes) and is not a stuck or ghosted approval. This closes a reportability gap surfaced by [#871](https://github.com/OriginTrail/dkg/issues/871), where an operator manually inspected `allowance()` against the wrong (typo'd) spender address and read the daemon's pre-existing 1-wei floor as a daemon-side bug. Investigation note: [`docs/investigations/871-curator-wallet-allowance-ghosting.md`](docs/investigations/871-curator-wallet-allowance-ghosting.md). No behaviour change for any caller — only the diagnostic line is new; the underlying floor logic and the `effectivePublishAllowance` / `computeApprovalAction` invariants are unchanged.
 
 ## [10.0.0-rc.12] - 2026-06-01
 

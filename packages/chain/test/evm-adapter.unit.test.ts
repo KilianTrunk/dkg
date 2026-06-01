@@ -291,6 +291,53 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
     );
   });
 
+  it('names exhausted RPC endpoints when transaction population fails everywhere', async () => {
+    const a = new EVMChainAdapter(minimalConfig({
+      rpcUrl: 'https://primary.example',
+      rpcUrls: ['https://backup.example'],
+    }));
+    const primaryProvider = { name: 'primary' } as any;
+    const backupProvider = { name: 'backup' } as any;
+    const signer = new ethers.Wallet(DEPLOYER_PK, primaryProvider);
+    const populateTransaction = vi.fn(async () => {
+      const err = new Error('429 too many requests');
+      (err as any).status = 429;
+      throw err;
+    });
+    const contract = {
+      connect: vi.fn(() => ({ createContextGraph: { populateTransaction } })),
+    };
+    (a as any).providers = [primaryProvider, backupProvider];
+    (a as any).signPopulatedTransaction = vi.fn(async () => ({
+      signedTx: '0xdeadbeef',
+      txHash: '0xabc',
+    }));
+    (a as any).sendSignedTransactionAndWait = vi.fn(async () => ({}));
+
+    let thrown: any;
+    try {
+      await (a as any).sendContractTransaction(
+        contract,
+        'createContextGraph',
+        [],
+        signer,
+        'create on-chain context graph',
+      );
+    } catch (err) {
+      thrown = err;
+    }
+
+    expect(thrown).toMatchObject({
+      code: 'RPC_ENDPOINTS_EXHAUSTED',
+      rpcUrls: ['https://primary.example', 'https://backup.example'],
+    });
+    expect(thrown.message).toContain('https://primary.example');
+    expect(thrown.message).toContain('https://backup.example');
+    expect(populateTransaction).toHaveBeenCalledTimes(2);
+    expect((a as any).signPopulatedTransaction).not.toHaveBeenCalled();
+    expect((a as any).sendSignedTransactionAndWait).not.toHaveBeenCalled();
+  });
+
   it('broadcasts the exact same signed raw transaction to backup after primary send failure', async () => {
     const a = new EVMChainAdapter(minimalConfig({
       rpcUrl: 'https://primary.example',

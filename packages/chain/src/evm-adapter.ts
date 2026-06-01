@@ -1025,7 +1025,7 @@ export class EVMChainAdapter implements ChainAdapter {
       `(${this.rpcUrls.join(', ')}): ${errorMessage(lastRetryable)}`,
       { cause: lastRetryable },
     );
-    (err as any).code = 'RPC_TRANSACTION_PREPARATION_FAILED';
+    (err as any).code = 'RPC_ENDPOINTS_EXHAUSTED';
     (err as any).rpcUrls = [...this.rpcUrls];
     throw err;
   }

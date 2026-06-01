@@ -1039,21 +1039,29 @@ export class EVMChainAdapter implements ChainAdapter {
       currentAllowance,
     );
     if (needsApprove) {
-      // Surface the per-publish floor explicitly. When `tokenAmount === 0n`
-      // (zero-cost / metadata-only publishes on devnets, or pricing oracle
-      // returning 0 on mainnet), the policy floors the approval ceiling at
-      // `V10_PUBLISH_ONCHAIN_MIN_ALLOWANCE` (== 1 wei) — the #720
-      // workaround for the contract's `transferFrom(..., 1n)` minimum.
-      // Without this log, operators who manually inspect on-chain
-      // allowance see "1 wei dust" persisting after every publish and
-      // misread it as a stuck or ghosted approval (#871).
+      // Surface the per-publish floor explicitly when (and only when) the
+      // policy lifted `targetAllowance` above the caller's `tokenAmount`
+      // — i.e. `tokenAmount === 0n` and the floor in
+      // `effectivePublishAllowance` produced `targetAllowance === 1n`
+      // (`V10_PUBLISH_ONCHAIN_MIN_ALLOWANCE`). That's the #720 workaround
+      // for the contract's `transferFrom(..., 1n)` minimum on zero-cost
+      // publishes. Without this log, operators who manually inspect
+      // on-chain allowance see "1 wei dust" persisting after every
+      // publish and misread it as a stuck or ghosted approval (#871).
+      //
+      // The `tokenAmount === 0n` half of the guard matters: a legitimate
+      // `tokenAmount === 1n` publish ALSO produces `targetAllowance === 1n`
+      // under per-publish, but in that case the 1-wei is the real publish
+      // cost, not the workaround floor — claiming "#720 floor" there
+      // would be a false positive (Codex, PR #875).
       if (
-        targetAllowance === V10_PUBLISH_ONCHAIN_MIN_ALLOWANCE &&
-        this.approvalPolicy.mode === 'per-publish'
+        this.approvalPolicy.mode === 'per-publish' &&
+        tokenAmount === 0n &&
+        targetAllowance === V10_PUBLISH_ONCHAIN_MIN_ALLOWANCE
       ) {
         console.warn(
           `[chain] V10 per-publish auto-approve floor: signer=${signer.address} ` +
-          `kav10=${kav10Address} target=1 wei (tokenAmount=${tokenAmount.toString()}, ` +
+          `kav10=${kav10Address} target=1 wei (tokenAmount=0, ` +
           `currentAllowance=${currentAllowance.toString()}). This is the #720 ` +
           `transferFrom-minimum workaround; not a stuck approval.`,
         );

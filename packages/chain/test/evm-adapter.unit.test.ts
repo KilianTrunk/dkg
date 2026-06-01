@@ -366,6 +366,58 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
     expect(backup.broadcastTransaction).toHaveBeenCalledWith(signedTx);
   });
 
+  it('preserves the transaction hash when post-broadcast receipt lookup exhausts RPC endpoints', async () => {
+    const a = new EVMChainAdapter(minimalConfig({
+      rpcUrl: 'https://primary.example',
+      rpcUrls: ['https://backup.example'],
+    }));
+    const signedTx = '0xdeadbeef';
+    const txHash = '0x' + '55'.repeat(32);
+    const primaryProvider = {
+      name: 'primary',
+      broadcastTransaction: vi.fn(async () => ({ hash: txHash })),
+      getTransactionReceipt: vi.fn(async () => {
+        const err = new Error('429 too many requests');
+        (err as any).status = 429;
+        throw err;
+      }),
+    };
+    const backupProvider = {
+      name: 'backup',
+      broadcastTransaction: vi.fn(async () => ({ hash: txHash })),
+      getTransactionReceipt: vi.fn(async () => {
+        const err = new Error('502 bad gateway');
+        (err as any).status = 502;
+        throw err;
+      }),
+    };
+    const signer = new ethers.Wallet(DEPLOYER_PK, primaryProvider as any);
+    const populated = { to: '0x0000000000000000000000000000000000000001', data: '0x1234' };
+    const populateTransaction = vi.fn(async () => populated);
+    const contract = {
+      connect: vi.fn(() => ({ createContextGraph: { populateTransaction } })),
+    };
+    (a as any).providers = [primaryProvider, backupProvider];
+    (a as any).signPopulatedTransaction = vi.fn(async () => ({ signedTx, txHash }));
+
+    await expect((a as any).sendContractTransaction(
+      contract,
+      'createContextGraph',
+      [],
+      signer,
+      'create on-chain context graph',
+    )).rejects.toMatchObject({
+      code: 'RPC_RECEIPT_LOOKUP_FAILED',
+      txHash,
+    });
+    expect(populateTransaction).toHaveBeenCalledTimes(1);
+    expect((a as any).signPopulatedTransaction).toHaveBeenCalledTimes(1);
+    expect(primaryProvider.broadcastTransaction).toHaveBeenCalledWith(signedTx);
+    expect(backupProvider.broadcastTransaction).not.toHaveBeenCalled();
+    expect(primaryProvider.getTransactionReceipt).toHaveBeenCalledWith(txHash);
+    expect(backupProvider.getTransactionReceipt).toHaveBeenCalledWith(txHash);
+  });
+
   it('treats already-known transaction responses as accepted and polls receipts', async () => {
     const a = new EVMChainAdapter(minimalConfig({
       rpcUrl: 'https://primary.example',

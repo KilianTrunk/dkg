@@ -933,6 +933,7 @@ export class EVMChainAdapter implements ChainAdapter {
         { cause: lastRetryable },
       );
       (err as any).code = 'RPC_RECEIPT_LOOKUP_FAILED';
+      (err as any).txHash = txHash;
       throw err;
     }
     return null;

@@ -25,15 +25,23 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { ethers } from 'ethers';
 import { MockChainAdapter } from '@origintrail-official/dkg-chain';
 import {
+  DKG_ONTOLOGY,
   WORKSPACE_AGENT_ENCRYPTION_KEY_ALGORITHM_X25519,
   WORKSPACE_RECIPIENT_ENCRYPTION_KEY_PURPOSE,
   SWM_SENDER_KEY_PACKAGE_VERSION,
   SWM_SENDER_KEY_PACKAGE_ACK_TYPE,
+  computeSwmSenderKeyMembershipHash,
+  computeWorkspaceAgentEncryptionKeyProofPayload,
+  contextGraphDataUri,
+  contextGraphMetaUri,
   encodeSwmSenderKeyPackageAck,
+  encodeWorkspaceEncryptionKey,
   generateWorkspaceRecipientEncryptionKey,
+  workspaceAgentEncryptionKeyId,
   type OperationContext,
   type SwmSenderKeyPackageAckReasonCode,
 } from '@origintrail-official/dkg-core';
+import { resolveWorkspaceAgentRecipients } from '@origintrail-official/dkg-publisher';
 import {
   DKGAgent,
   agentFromPrivateKey,
@@ -42,6 +50,7 @@ import {
   type DiscoveredAgent,
   type PendingSenderKeyEntry,
 } from '../src/index.js';
+import { swmSenderStateKey } from '../src/dkg-agent-swm-state.js';
 import type { ReliableSendResult } from '../src/p2p/messenger.js';
 import type { TripleStore } from '@origintrail-official/dkg-storage';
 
@@ -59,6 +68,18 @@ interface PendingInternals {
   discovery: { findAgentByPeerId(peerId: string): Promise<DiscoveredAgent | null> };
   store: TripleStore;
   pendingSenderKeyByAgent: Map<string, PendingSenderKeyEntry[]>;
+  swmSenderKeySendStates: Map<string, {
+    contextGraphId: string;
+    subGraphName?: string;
+    senderAgentAddress: string;
+    epochId: string;
+    membershipHash: string;
+    createdAtMs: number;
+    nextMessageIndex: number;
+    chainKey: Uint8Array;
+    senderSigningPublicKey: Uint8Array;
+    senderSigningSecretKey: Uint8Array;
+  }>;
   createAndDistributeSwmSenderKeyEpoch(input: {
     contextGraphId: string;
     subGraphName?: string;
@@ -69,6 +90,13 @@ interface PendingInternals {
   }): Promise<unknown>;
   drainPendingSenderKeyForPeer(peerId: string): Promise<number>;
   drainPendingSenderKeyForRecipients(recipients: readonly FakeRecipient[], ctx?: OperationContext): Promise<number>;
+  _resolveCuratedChainKeyContext(
+    contextGraphId: string,
+    subGraphName: string | undefined,
+    authorAgentAddress: string | undefined,
+    publishContextGraphId: string | undefined,
+    logPrefix: string,
+  ): Promise<{ chainKey: Uint8Array; aeadCgId: string; senderAddress: string } | undefined>;
 }
 
 interface FakeRecipient {
@@ -95,6 +123,76 @@ function makeFakeRecipient(opts: { peerId?: string } = {}): FakeRecipient {
     purpose: WORKSPACE_RECIPIENT_ENCRYPTION_KEY_PURPOSE,
     encryptionKeyAlgorithm: WORKSPACE_AGENT_ENCRYPTION_KEY_ALGORITHM_X25519,
     publicKeyBytes: key.publicKeyBytes!,
+  };
+}
+
+function agentUri(address: string): string {
+  return `did:dkg:agent:${ethers.getAddress(address)}`;
+}
+
+async function insertAgentGate(store: TripleStore, contextGraphId: string, address: string): Promise<void> {
+  await store.insert([{
+    subject: contextGraphDataUri(contextGraphId),
+    predicate: DKG_ONTOLOGY.DKG_ALLOWED_AGENT,
+    object: `"${ethers.getAddress(address)}"`,
+    graph: contextGraphMetaUri(contextGraphId),
+  }]);
+}
+
+async function insertVerifiedAgentEncryptionKey(
+  store: TripleStore,
+  wallet: ethers.Wallet,
+  opts: { peerId?: string } = {},
+): Promise<FakeRecipient> {
+  const recipientId = agentUri(wallet.address);
+  const key = generateWorkspaceRecipientEncryptionKey(
+    recipientId,
+    `${recipientId}#test-x25519-${ethers.id(wallet.address).slice(2, 10)}`,
+  );
+  const publicKeyBytes = key.publicKeyBytes!;
+  const proofPayload = computeWorkspaceAgentEncryptionKeyProofPayload({
+    agentAddress: wallet.address,
+    encryptionKeyAlgorithm: WORKSPACE_AGENT_ENCRYPTION_KEY_ALGORITHM_X25519,
+    publicKeyBytes,
+  });
+  const proof = wallet.signingKey.sign(ethers.hashMessage(proofPayload)).serialized;
+  const quads = [
+    {
+      subject: recipientId,
+      predicate: DKG_ONTOLOGY.DKG_PUBLIC_ENCRYPTION_KEY,
+      object: `"${encodeWorkspaceEncryptionKey(publicKeyBytes)}"`,
+      graph: 'did:dkg:system/agents',
+    },
+    {
+      subject: recipientId,
+      predicate: DKG_ONTOLOGY.DKG_ENCRYPTION_KEY_ALGORITHM,
+      object: `"${WORKSPACE_AGENT_ENCRYPTION_KEY_ALGORITHM_X25519}"`,
+      graph: 'did:dkg:system/agents',
+    },
+    {
+      subject: recipientId,
+      predicate: DKG_ONTOLOGY.DKG_ENCRYPTION_KEY_PROOF,
+      object: `"${proof}"`,
+      graph: 'did:dkg:system/agents',
+    },
+  ];
+  if (opts.peerId) {
+    quads.push({
+      subject: recipientId,
+      predicate: DKG_ONTOLOGY.DKG_PEER_ID,
+      object: `"${opts.peerId}"`,
+      graph: 'did:dkg:system/agents',
+    });
+  }
+  await store.insert(quads);
+  return {
+    agentAddress: ethers.getAddress(wallet.address),
+    peerId: opts.peerId,
+    recipientId,
+    recipientKeyId: workspaceAgentEncryptionKeyId(wallet.address, publicKeyBytes),
+    purpose: WORKSPACE_RECIPIENT_ENCRYPTION_KEY_PURPOSE,
+    encryptionKeyAlgorithm: WORKSPACE_AGENT_ENCRYPTION_KEY_ALGORITHM_X25519,
+    publicKeyBytes,
   };
 }
 
@@ -373,7 +471,7 @@ describe('createAndDistributeSwmSenderKeyEpoch: missing-peerId soft success', ()
     const staleGate = makeFakeRecipient({ peerId: '12D3KooWStaleGateRetryPeer' });
     const notAgentGated = makeFakeRecipient({ peerId: '12D3KooWNotGatedRetryPeer' });
     const recipientNotLocal = makeFakeRecipient({ peerId: '12D3KooWNotLocalRetryPeer' });
-    const unknownReason = makeFakeRecipient({ peerId: '12D3KooWUnknownRetryPeer' });
+    const recipientNotAllowed = makeFakeRecipient({ peerId: '12D3KooWRecipGateRetryPeer' });
     const legacyNoCode = makeFakeRecipient({ peerId: '12D3KooWLegacyRetryPeer' });
 
     const rejectionByPeer = new Map<string, { reason?: string; reasonCode?: SwmSenderKeyPackageAckReasonCode }>([
@@ -399,10 +497,10 @@ describe('createAndDistributeSwmSenderKeyEpoch: missing-peerId soft success', ()
         },
       ],
       [
-        unknownReason.peerId!,
+        recipientNotAllowed.peerId!,
         {
-          reason: 'legacy or unclassified receiver rejection',
-          reasonCode: 'unknown',
+          reason: `Recipient agent ${recipientNotAllowed.agentAddress} is not allowed for context graph "test-cg/joined"`,
+          reasonCode: 'recipient-not-allowed',
         },
       ],
       [legacyNoCode.peerId!, { reason: 'legacy receiver rejection without a reason code' }],
@@ -421,18 +519,69 @@ describe('createAndDistributeSwmSenderKeyEpoch: missing-peerId soft success', ()
       internals.createAndDistributeSwmSenderKeyEpoch({
         contextGraphId: 'test-cg/joined',
         sender,
-        recipients: [staleGate, notAgentGated, recipientNotLocal, unknownReason, legacyNoCode],
+        recipients: [staleGate, notAgentGated, recipientNotLocal, recipientNotAllowed, legacyNoCode],
         membershipHash: 'sha256:joined-transient-rejections',
         ctx: { operationId: 'test-op', operationName: 'share' },
       }),
     ).resolves.toBeTruthy();
 
     expect(internals.pendingSenderKeyByAgent.size).toBe(5);
-    for (const recipient of [staleGate, notAgentGated, recipientNotLocal, unknownReason, legacyNoCode]) {
+    for (const recipient of [staleGate, notAgentGated, recipientNotLocal, recipientNotAllowed, legacyNoCode]) {
       const queue = internals.pendingSenderKeyByAgent.get(recipient.agentAddress.toLowerCase());
       expect(queue).toHaveLength(1);
       expect(queue![0].recipientKeyId).toBe(recipient.recipientKeyId);
     }
+  });
+
+  it('keeps active-key loss and unknown ACKs fatal', async () => {
+    const boot = await bootAgent();
+    agent = boot.agent;
+    const internals = boot.internals;
+
+    const sender = agentFromPrivateKey(
+      ethers.Wallet.createRandom().privateKey,
+      'sender',
+    ) as AgentKeyRecord & { privateKey: string };
+    const activeKeyMissing = makeFakeRecipient({ peerId: '12D3KooWActiveMissingFatalPeer' });
+    const unknownReason = makeFakeRecipient({ peerId: '12D3KooWUnknownFatalPeer' });
+
+    const rejectionByPeer = new Map<string, { reason: string; reasonCode: SwmSenderKeyPackageAckReasonCode }>([
+      [
+        activeKeyMissing.peerId!,
+        {
+          reason: `No local X25519 private key for DKG agent ${activeKeyMissing.agentAddress} key ${activeKeyMissing.recipientKeyId}`,
+          reasonCode: 'active-private-key-missing',
+        },
+      ],
+      [
+        unknownReason.peerId!,
+        {
+          reason: 'malformed package or unexpected receiver failure',
+          reasonCode: 'unknown',
+        },
+      ],
+    ]);
+    installStubMessenger(internals, async (peerId): Promise<ReliableSendResult> => {
+      const rejection = rejectionByPeer.get(peerId)!;
+      return {
+        delivered: true,
+        response: senderKeyAck(false, rejection.reason, rejection.reasonCode),
+        attempts: 1,
+        messageId: `m-terminal-${peerId.slice(-6)}`,
+      };
+    });
+
+    await expect(
+      internals.createAndDistributeSwmSenderKeyEpoch({
+        contextGraphId: 'test-cg/joined',
+        sender,
+        recipients: [activeKeyMissing, unknownReason],
+        membershipHash: 'sha256:joined-terminal-rejections',
+        ctx: { operationId: 'test-op', operationName: 'share' },
+      }),
+    ).rejects.toThrow('SWM Sender Key setup rejected by 2 agent(s)');
+
+    expect(internals.pendingSenderKeyByAgent.size).toBe(0);
   });
 
   it('keeps convergence-style delivered rejections queued during pending drain', async () => {
@@ -475,6 +624,84 @@ describe('createAndDistributeSwmSenderKeyEpoch: missing-peerId soft success', ()
     expect(
       internals.pendingSenderKeyByAgent.get(recipient.agentAddress.toLowerCase())?.[0].recipientKeyId,
     ).toBe(recipient.recipientKeyId);
+  });
+
+  it('drains pending sender keys when curated publish reuses an existing epoch', async () => {
+    const boot = await bootAgent();
+    agent = boot.agent;
+    const internals = boot.internals;
+
+    const contextGraphId = 'test-cg/curated-reuse-drain';
+    const senderWallet = ethers.Wallet.createRandom();
+    const recipientWallet = ethers.Wallet.createRandom();
+    const sender = agentFromPrivateKey(
+      senderWallet.privateKey,
+      'sender',
+    ) as AgentKeyRecord & { privateKey: string };
+    const recipientPeerId = '12D3KooWCuratedReuseDrainPeer';
+
+    await insertAgentGate(internals.store, contextGraphId, senderWallet.address);
+    await insertAgentGate(internals.store, contextGraphId, recipientWallet.address);
+    await insertVerifiedAgentEncryptionKey(internals.store, senderWallet);
+    const recipient = await insertVerifiedAgentEncryptionKey(internals.store, recipientWallet, {
+      peerId: recipientPeerId,
+    });
+
+    const resolution = await resolveWorkspaceAgentRecipients(internals.store, { contextGraphId });
+    const membershipHash = computeSwmSenderKeyMembershipHash({
+      contextGraphId,
+      members: resolution.recipients.map((r) => ({
+        agentAddress: r.agentAddress,
+        recipientKeyId: r.recipientKeyId,
+      })),
+    });
+    const chainKey = new Uint8Array(32).fill(9);
+    const stateKey = swmSenderStateKey(contextGraphId, undefined, sender.agentAddress);
+    internals.swmSenderKeySendStates.set(stateKey, {
+      contextGraphId,
+      senderAgentAddress: sender.agentAddress,
+      epochId: 'epoch-existing',
+      membershipHash,
+      createdAtMs: Date.now(),
+      nextMessageIndex: 0,
+      chainKey,
+      senderSigningPublicKey: new Uint8Array(32).fill(8),
+      senderSigningSecretKey: new Uint8Array(32).fill(7),
+    });
+    internals.pendingSenderKeyByAgent.set(recipient.agentAddress.toLowerCase(), [{
+      senderAgentAddress: sender.agentAddress.toLowerCase(),
+      recipientAgentAddress: recipient.agentAddress.toLowerCase(),
+      recipientKeyId: recipient.recipientKeyId,
+      epochId: 'epoch-existing',
+      contextGraphId,
+      packageBytes: new Uint8Array([1, 2, 3]),
+      createdAtMs: Date.now(),
+    }]);
+
+    const sendCalls: Array<{ peerId: string; payload: Uint8Array }> = [];
+    installStubMessenger(internals, async (peerId, _protocolId, payload): Promise<ReliableSendResult> => {
+      sendCalls.push({ peerId, payload });
+      return { delivered: true, response: senderKeyAck(true), attempts: 1, messageId: 'm-curated-drain' };
+    });
+    (internals as any).isPrivateContextGraph = async () => true;
+    (internals as any).loadSwmSenderKeyState = async () => {};
+    (internals as any).getLocalSigningAgentForAddress = () => sender;
+    (internals as any).createAndDistributeSwmSenderKeyEpoch = async () => {
+      throw new Error('existing membership must reuse state instead of rotating');
+    };
+
+    const resolved = await internals._resolveCuratedChainKeyContext(
+      contextGraphId,
+      undefined,
+      sender.agentAddress,
+      undefined,
+      'LU-5',
+    );
+
+    expect(resolved?.chainKey).toEqual(chainKey);
+    expect(sendCalls).toHaveLength(1);
+    expect(sendCalls[0].peerId).toBe(recipientPeerId);
+    expect(internals.pendingSenderKeyByAgent.size).toBe(0);
   });
 
   it('removes delivered terminal rejections during pending drain without counting them as drained', async () => {

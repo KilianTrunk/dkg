@@ -5975,10 +5975,11 @@ export class DKGAgent {
           // Delivery semantics (C2 integration-pass relaxation):
           //   • `delivered=true && ack.accepted=true` → success.
           //   • `delivered=true && ack.accepted=false` with a terminal
-          //     reason (`stale-target`, `revoked-key`, `bad-signature`)
+          //     reason (`stale-target`, `active-private-key-missing`,
+          //     `revoked-key`, `bad-signature`, `unknown`)
           //     → HARD failure: retrying the same package cannot help.
-          //   • `delivered=true && ack.accepted=false` with a transient
-          //     or unknown reason → SOFT success: keep it queued so a
+          //   • `delivered=true && ack.accepted=false` with a non-terminal
+          //     reason → SOFT success: keep it queued so a
           //     later reconnect/publish can retry after remote view
           //     convergence.
           //   • `delivered=false` → SOFT success.
@@ -6120,8 +6121,10 @@ export class DKGAgent {
   ): boolean {
     return (
       reasonCode === 'stale-target' ||
+      reasonCode === 'active-private-key-missing' ||
       reasonCode === 'revoked-key' ||
-      reasonCode === 'bad-signature'
+      reasonCode === 'bad-signature' ||
+      reasonCode === 'unknown'
     );
   }
 
@@ -8628,6 +8631,8 @@ export class DKGAgent {
       });
       this.swmSenderKeySendStates.set(stateKey, state);
       await this.saveSwmSenderKeyState();
+    } else {
+      await this.drainPendingSenderKeyForRecipients(resolution.recipients, ctx);
     }
 
     return {

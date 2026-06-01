@@ -923,25 +923,6 @@ async function resolveImportedArtifact(
   if (!parsedAssertion) {
     throw new ImportArtifactRouteError(400, 'assertionUri is not an assertion in the supplied contextGraphId');
   }
-  // Issue #872 Codex finding 2: a legacy ownerless URI
-  // (`.../assertion/<name>`) is canonicalized by
-  // `parseImportedAssertionUri` via the requester's agent DID
-  // because the URI itself doesn't carry an owner segment. That
-  // works for the original owner-self-read back-compat path, but on
-  // a public + open CG it silently produces the wrong canonical URI
-  // for cross-agent peers — the meta lookup then 404s with a
-  // confusing "no metadata" message instead of telling the caller
-  // their URI is ambiguous. Reject these early on the relaxed read
-  // paths so callers get a clear signal to pass the canonical form.
-  // Owner self-reads of legacy URIs on curated CGs are unaffected
-  // (canRelaxGuard is set only on read routes AND isPublicOpen has
-  // to be true), and V10 always emits canonical URIs.
-  if (parsedAssertion.legacy && canRelaxGuard && isPublicOpen) {
-    throw new ImportArtifactRouteError(
-      400,
-      'Legacy ownerless assertionUri form cannot be resolved on public + open CGs because the original owner is not encoded in the URI. Pass the canonical assertion URI: did:dkg:context-graph:<contextGraphId>/assertion/<assertionAgentAddress>/<assertionName>.',
-    );
-  }
   const parsedNameValidation = validateAssertionName(parsedAssertion.assertionName);
   if (!parsedNameValidation.valid) {
     throw new ImportArtifactRouteError(400, `Invalid assertionUri assertion name: ${parsedNameValidation.reason}`);
@@ -965,7 +946,20 @@ async function resolveImportedArtifact(
     // other policy combo (curated, curators-only publish, or any
     // write path), the guard stays in force regardless of the
     // on-chain policy.
-    if (canRelaxGuard && isPublicOpen) {
+    //
+    // Codex review (round 2, finding A): the relaxation is skipped
+    // for legacy ownerless URIs (`parsedAssertion.legacy === true`).
+    // `parseImportedAssertionUri` already canonicalizes those by
+    // defaulting the missing owner segment to `requestAgentAddress`
+    // — which is the right answer ONLY for owner self-reads. For
+    // cross-agent reads the canonical URI silently points at the
+    // wrong owner, so the meta SPARQL below misses and returns 404.
+    // Letting the strict guard run for legacy URIs preserves the
+    // owner-self-read back-compat path (the legacy default makes
+    // `assertionAgentAddress === requestAgentAddress` so the guard
+    // passes) while non-owner cross-agent reads get the same 404
+    // they got pre-PR rather than a misleading 200.
+    if (canRelaxGuard && isPublicOpen && !parsedAssertion.legacy) {
       ownerGuardRelaxed = !isSameAgentAddress(
         parsedAssertion.assertionAgentAddress,
         ownerGuard.requestAgentAddress,

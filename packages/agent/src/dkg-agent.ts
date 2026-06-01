@@ -16001,6 +16001,31 @@ export class DKGAgent {
       }
     }
 
+    // Codex review (round 2, finding B): the local-triple fallback
+    // below reads `dkg:publishPolicy` / `dkg:accessPolicy` triples
+    // that `createContextGraph` writes synchronously — BEFORE
+    // `registerContextGraph` confirms the CG on-chain. For a CG
+    // that's still in the local-only `unregistered` state, those
+    // triples reflect the creator's *intent*, not an on-chain
+    // commitment. Treating them as authoritative would let the read
+    // relaxation kick in for a CG the curator hasn't actually
+    // committed to making public, bypassing the owner guard.
+    //
+    // Gate the fallback on `isContextGraphRegistered` so only CGs
+    // confirmed on-chain (or replicated from a registered peer)
+    // contribute a local policy answer. Unregistered CGs that miss
+    // the chain-event cache return `{}` and the daemon route fails
+    // closed.
+    if (accessPolicy === undefined || publishPolicy === undefined) {
+      const registered = await this.isContextGraphRegistered(contextGraphId).catch(() => false);
+      if (!registered) {
+        return {
+          ...(accessPolicy === 0 || accessPolicy === 1 ? { accessPolicy } : {}),
+          ...(publishPolicy === 0 || publishPolicy === 1 ? { publishPolicy } : {}),
+        };
+      }
+    }
+
     if (publishPolicy === undefined) {
       const stored: { publishPolicy?: number } = await this.getStoredContextGraphRegistrationOptions(contextGraphId).catch(() => ({}));
       if (stored.publishPolicy === 0 || stored.publishPolicy === 1) {

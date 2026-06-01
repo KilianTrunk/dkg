@@ -655,20 +655,25 @@ describe('import artifact daemon routes', () => {
     expect(queries).toHaveLength(0);
   });
 
-  // Issue #872 / Codex review finding 2: legacy ownerless URIs
-  // (`.../assertion/<name>`) get canonicalized by
-  // `parseImportedAssertionUri` via the requester's agent DID, which
-  // is wrong for cross-agent peers on a public + open CG. Without
-  // explicit handling the meta lookup 404s with a confusing message;
-  // the relaxed read paths reject these up front with a clear 400
-  // pointing at the canonical URI form.
-  it('rejects legacy ownerless assertionUri form on public + open CG reads with a clear 400 (#872 Codex finding 2)', async () => {
-    const entry = await fileStore.put(Buffer.from('# Legacy Public\n'), 'text/markdown');
-    const contextGraphId = 'cg-public-open-legacy-uri-reject';
+  // Issue #872 / Codex review round 2, finding A: the round-1 fix
+  // unconditionally rejected legacy ownerless URIs on public + open
+  // CGs with 400. That broke owner self-reads — the existing legacy
+  // back-compat path canonicalizes the missing owner segment to the
+  // requester, which is correct for the owner. The round-2 fix
+  // skips the relaxation entirely for legacy URIs and lets the
+  // strict guard run; for owner self-reads the legacy fallback
+  // makes the strict guard a no-op so the read completes normally.
+  it('lets owner self-reads of legacy ownerless URIs through on public + open CGs (#872 Codex round 2 finding A)', async () => {
+    const entry = await fileStore.put(Buffer.from('# Legacy Owner Public\n'), 'text/markdown');
+    const contextGraphId = 'cg-public-open-legacy-owner-self-read';
     const assertionName = 'legacy-md';
     const legacyAssertionUri = `did:dkg:context-graph:${contextGraphId}/assertion/${assertionName}`;
-    const canonicalAssertionUri = contextGraphAssertionUri(contextGraphId, 'did:dkg:agent:source', assertionName);
-    const { agent, queries } = makeAgent({
+    // The mock's requestAgentAddress is `did:dkg:agent:test`. The
+    // legacy fallback canonicalizes the missing owner segment to
+    // that address, so the stored canonical URI is keyed by the
+    // requester (i.e. owner self-read).
+    const canonicalAssertionUri = contextGraphAssertionUri(contextGraphId, 'did:dkg:agent:test', assertionName);
+    const { agent } = makeAgent({
       contextGraphId,
       assertionName,
       assertionUri: canonicalAssertionUri,
@@ -679,27 +684,135 @@ describe('import artifact daemon routes', () => {
     });
     await startRoutes({ agent });
 
+    const resolved = await post('/api/assertion/import-artifact/resolve', {
+      contextGraphId,
+      assertionUri: legacyAssertionUri,
+    });
+    expect(resolved.status).toBe(200);
+    expect(resolved.body.artifact).toMatchObject({
+      contextGraphId,
+      assertionUri: canonicalAssertionUri,
+      assertionAgentAddress: 'did:dkg:agent:test',
+      assertionName,
+      markdownHash: entry.keccak256,
+    });
+    // Owner self-read: the relaxation does NOT apply (it's gated on
+    // `!parsedAssertion.legacy`) so `ownerGuardRelaxed` is absent.
+    expect(resolved.body.artifact.ownerGuardRelaxed).toBeUndefined();
+
+    const read = await post('/api/assertion/import-artifact/read-markdown', {
+      contextGraphId,
+      assertionUri: legacyAssertionUri,
+    });
+    expect(read.status).toBe(200);
+    expect(read.body.markdown).toBe('# Legacy Owner Public\n');
+  });
+
+  // Issue #872 / Codex review round 2, finding A — companion test
+  // for the cross-agent half. Non-owner peers sending a legacy
+  // ownerless URI on a public + open CG: the relaxation does not
+  // apply (legacy URIs always go through the strict guard); the
+  // legacy fallback canonicalizes to the requester's address, the
+  // strict guard equality check passes (requester == requester),
+  // and the meta SPARQL then misses because the actual owner is
+  // someone else. Caller gets the pre-PR 404 "no metadata"
+  // back-compat response — same as before the relaxation existed.
+  it('returns 4xx (no misleading 200) for cross-agent legacy ownerless reads on public + open CGs (#872 Codex round 2 finding A)', async () => {
+    const entry = await fileStore.put(Buffer.from('# Legacy Public\n'), 'text/markdown');
+    const contextGraphId = 'cg-public-open-legacy-cross-agent';
+    const assertionName = 'legacy-md';
+    const legacyAssertionUri = `did:dkg:context-graph:${contextGraphId}/assertion/${assertionName}`;
+    // The mock has metadata keyed by `did:dkg:agent:source`; the
+    // requester is `did:dkg:agent:test`. The legacy fallback
+    // canonicalizes to `.../assertion/did:dkg:agent:test/legacy-md`
+    // which DOES NOT match the mock's stored URI — i.e. the
+    // canonical-URI-pointing-at-wrong-owner case Codex flagged.
+    const canonicalAssertionUri = contextGraphAssertionUri(contextGraphId, 'did:dkg:agent:source', assertionName);
+    const { agent, queries } = makeAgent({
+      contextGraphId,
+      assertionName,
+      assertionUri: canonicalAssertionUri,
+      fileHash: entry.keccak256,
+      markdownHash: entry.keccak256,
+      markdownForm: `urn:dkg:file:${entry.keccak256}`,
+      onChainPolicy: { accessPolicy: 0, publishPolicy: 1 },
+    });
+
+    // Tolerate URI mismatch on the meta SPARQL: return empty
+    // bindings when the query targets a URI other than the stored
+    // one. Mirrors how the real Oxigraph store would respond.
+    const storeAny = agent.store as unknown as { query: (sparql: string) => Promise<unknown> };
+    const originalQuery = storeAny.query.bind(agent.store);
+    storeAny.query = async (sparql: string) => {
+      if (sparql.includes('SELECT ?fileHash') && !sparql.includes(canonicalAssertionUri)) {
+        queries.push(sparql);
+        return { type: 'bindings', bindings: [] } as never;
+      }
+      return originalQuery(sparql);
+    };
+
+    await startRoutes({ agent });
+
     const read = await post('/api/assertion/import-artifact/read-markdown', {
       contextGraphId,
       assertionUri: legacyAssertionUri,
       maxBytes: 1024,
     });
+    expect(read.status).toBe(404);
+    expect(read.body.error).toMatch(/No completed import metadata/);
+    // The SPARQL that ran targeted the requester-canonicalized URI,
+    // not the stored owner URI — this is what Codex flagged as
+    // "silently canonicalizes to the wrong assertion URI". The 404
+    // is the pre-PR back-compat behaviour.
+    expect(queries.some((q) => q.includes('did%3Adkg%3Aagent%3Atest') || q.includes('did:dkg:agent:test'))).toBe(true);
+  });
 
-    expect(read.status).toBe(400);
-    expect(read.body.error).toMatch(/Legacy ownerless assertionUri form/);
-    expect(read.body.error).toMatch(/canonical assertion URI/);
-    // No SPARQL should have been issued — the legacy URI is rejected
-    // before the meta lookup that would otherwise return 404 with a
-    // misleading "no metadata" message.
-    expect(queries).toHaveLength(0);
+  // Issue #872 / Codex review round 2, finding B: the dkg-agent
+  // local-policy fallback used to mark unregistered locally-created
+  // CGs as public + open by reading the create-time
+  // `dkg:publishPolicy` / `dkg:accessPolicy` triples that
+  // `createContextGraph` writes BEFORE on-chain registration. That
+  // bypassed the owner guard on CGs that hadn't actually been
+  // committed on-chain yet. The fix in `dkg-agent.ts` gates the
+  // local fallback on `isContextGraphRegistered`, so unregistered
+  // CGs return `{}` and the daemon route fails closed.
+  //
+  // This test simulates the post-fix agent contract — the mock's
+  // `getContextGraphOnChainPolicy` returns `{}` (matching what the
+  // fixed agent returns for an unregistered CG) and asserts the
+  // route preserves the strict guard for a non-owner cross-agent
+  // request. The corresponding unit test for the agent method
+  // itself lives in `packages/agent/test/dkg-agent-on-chain-policy.test.ts`.
+  it('keeps the owner guard in force when on-chain policy is unknown (e.g. CG not yet registered) (#872 Codex round 2 finding B)', async () => {
+    const entry = await fileStore.put(Buffer.from('# Unregistered\n'), 'text/markdown');
+    const contextGraphId = 'cg-locally-created-not-registered';
+    const assertionName = 'imported-md';
+    const assertionUri = contextGraphAssertionUri(contextGraphId, 'did:dkg:agent:source', assertionName);
+    const { agent, queries } = makeAgent({
+      contextGraphId,
+      assertionName,
+      assertionUri,
+      fileHash: entry.keccak256,
+      markdownHash: entry.keccak256,
+      markdownForm: `urn:dkg:file:${entry.keccak256}`,
+      // Post-fix agent contract: an unregistered CG resolves to
+      // `{}` regardless of the local create-time triples. The
+      // daemon route sees `accessPolicy=undefined,
+      // publishPolicy=undefined`, isPublicOpen evaluates to false,
+      // and the strict guard fires for the non-owner request.
+      onChainPolicy: {},
+    });
+    await startRoutes({ agent });
 
-    // Sanity: the same legacy rejection applies to /resolve.
     const resolved = await post('/api/assertion/import-artifact/resolve', {
       contextGraphId,
-      assertionUri: legacyAssertionUri,
+      assertionUri,
     });
-    expect(resolved.status).toBe(400);
-    expect(resolved.body.error).toMatch(/Legacy ownerless assertionUri form/);
+    expect(resolved.status).toBe(403);
+    expect(resolved.body.error).toMatch(/owned by the requesting agent/);
+    // The guard short-circuits before any SPARQL: no leak about
+    // the unregistered CG's contents.
+    expect(queries).toHaveLength(0);
   });
 
   it('requires full assertionUri instead of guessing the source author from assertionName', async () => {

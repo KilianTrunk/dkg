@@ -263,6 +263,49 @@ describe('DKGAgent.getContextGraphOnChainPolicy', () => {
     expect(getContextGraphAccessPolicy).not.toHaveBeenCalled();
   });
 
+  // Round 4 — the regression test for the daemon-ready hang. If
+  // the configured chain RPC stack is exhausted (every endpoint
+  // returning 429 / hanging on connect / unreachable), the
+  // fallback RPC call would block indefinitely waiting for the
+  // chain client to give up. That's catastrophic on the daemon-
+  // ready path (the CLI-7 `register exhausts configured chain RPC
+  // endpoints` test exceeds its 45s readiness budget). The fix is
+  // a bounded 2.5s per-call timeout inside the fallback: the race
+  // returns `TIMEOUT_SENTINEL`, the policy field is left
+  // undefined, a warning is logged, and the caller fails-closed.
+  it('returns undefined (with warning) when the chain-RPC fallback exceeds the bounded timeout (#872 Codex round 4)', async () => {
+    vi.useFakeTimers();
+    try {
+      // Promise that never resolves — emulates an RPC stack that
+      // hasn't given up yet because every endpoint is 429-ing.
+      const neverResolves = new Promise<{ publishPolicy: number; publishAuthority: string }>(() => {});
+      const getContextGraphPublishPolicy = vi.fn(() => neverResolves);
+      const stub = makeStub({
+        subscribedContextGraphs: new Map([['cg-slow-rpc', { onChainId: '13' }]]),
+        isContextGraphRegistered: vi.fn(async () => true),
+        // accessPolicy answered locally so the test isolates the
+        // publishPolicy timeout path.
+        readLocalAccessPolicyEnum: vi.fn(async () => 0),
+        chain: { getContextGraphPublishPolicy },
+      });
+      const promise = callPolicy(stub, 'cg-slow-rpc');
+      // Drain microtasks (so the fallback is awaiting the race)
+      // and then trip the 2.5s timer.
+      await vi.advanceTimersByTimeAsync(3_000);
+      const result = await promise;
+      expect(result).toEqual({ accessPolicy: 0 });
+      expect(getContextGraphPublishPolicy).toHaveBeenCalledWith(13n);
+      expect(stub.log.warn).toHaveBeenCalledWith(
+        expect.objectContaining({ operationId: expect.any(String) }),
+        expect.stringMatching(/getContextGraphPublishPolicy\(13\) timed out after 2500ms/),
+      );
+      // Cache MUST NOT be populated with an undefined / partial answer.
+      expect(stub.onChainPublishPolicyCache.has('13')).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   // Round 3 — degenerate state: registered locally but the on-chain
   // id resolution fails (e.g. corrupted ontology graph). We can't
   // RPC without a numeric id, so we return whatever local triples

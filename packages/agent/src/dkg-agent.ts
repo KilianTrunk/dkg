@@ -516,6 +516,15 @@ const SWM_SENDER_KEY_PENDING_DRAIN_LOG_CTX: OperationContext = {
   operationName: 'share',
 };
 
+/**
+ * Sentinel returned by the chain-RPC-fallback timeout race inside
+ * {@link DKGAgent.getContextGraphOnChainPolicy}. Distinct from
+ * `undefined` so the caller can tell a timed-out probe apart from
+ * an RPC that legitimately resolved to "no policy". Module-scoped
+ * so the inner `withTimeout` helper can reuse the same identity.
+ */
+const TIMEOUT_SENTINEL = Symbol('chain-rpc-fallback-timeout');
+
 export class DKGAgent {
   readonly wallet: AgentWallet;
   readonly node: DKGNode;
@@ -16095,15 +16104,49 @@ export class DKGAgent {
       }
       if (numericId !== undefined) {
         const rpcCtx = createOperationContext('resolve');
+        // Round-4 fix: bound each chain-RPC call so an unreachable
+        // RPC stack (every endpoint returning 429 / hanging on
+        // connect) cannot block the caller past the daemon-ready
+        // budget. The fallback is an optimisation — failing fast
+        // and returning undefined is correct (fail-closed via the
+        // strict guard at the route layer). 2.5s is tight enough
+        // to stay well under the 45s daemon-ready budget even when
+        // both fallbacks fire back-to-back, while still allowing a
+        // single slow eth_call hop to succeed under normal load.
+        const CHAIN_RPC_FALLBACK_TIMEOUT_MS = 2_500;
+        const withTimeout = <T,>(p: Promise<T>, label: string): Promise<T | typeof TIMEOUT_SENTINEL> => {
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          const timeout = new Promise<typeof TIMEOUT_SENTINEL>((resolve) => {
+            timer = setTimeout(() => {
+              this.log.warn(
+                rpcCtx,
+                `getContextGraphOnChainPolicy: chain.${label}(${onChainId}) timed out after ${CHAIN_RPC_FALLBACK_TIMEOUT_MS}ms — treating as UNKNOWN (fail-closed)`,
+              );
+              resolve(TIMEOUT_SENTINEL);
+            }, CHAIN_RPC_FALLBACK_TIMEOUT_MS);
+            // Allow node to exit even if the chain promise never
+            // settles (test scenario: dead RPC + fake daemon).
+            timer.unref?.();
+          });
+          return Promise.race([
+            p.finally(() => { if (timer) clearTimeout(timer); }),
+            timeout,
+          ]);
+        };
         if (publishPolicy === undefined) {
           const getPublishPolicy = this.chain.getContextGraphPublishPolicy;
           if (typeof getPublishPolicy === 'function') {
             try {
-              const result = await getPublishPolicy.call(this.chain, numericId);
-              const pp = result?.publishPolicy;
-              if (pp === 0 || pp === 1) {
-                publishPolicy = pp;
-                this.onChainPublishPolicyCache.set(onChainId!, pp);
+              const result = await withTimeout(
+                getPublishPolicy.call(this.chain, numericId),
+                'getContextGraphPublishPolicy',
+              );
+              if (result !== TIMEOUT_SENTINEL) {
+                const pp = result?.publishPolicy;
+                if (pp === 0 || pp === 1) {
+                  publishPolicy = pp;
+                  this.onChainPublishPolicyCache.set(onChainId!, pp);
+                }
               }
             } catch (err) {
               this.log.warn(
@@ -16117,8 +16160,11 @@ export class DKGAgent {
           const getAccessPolicy = this.chain.getContextGraphAccessPolicy;
           if (typeof getAccessPolicy === 'function') {
             try {
-              const ap = await getAccessPolicy.call(this.chain, numericId);
-              if (ap === 0 || ap === 1) {
+              const ap = await withTimeout(
+                getAccessPolicy.call(this.chain, numericId),
+                'getContextGraphAccessPolicy',
+              );
+              if (ap !== TIMEOUT_SENTINEL && (ap === 0 || ap === 1)) {
                 accessPolicy = ap;
                 this.onChainAccessPolicyCache.set(onChainId!, ap);
               }

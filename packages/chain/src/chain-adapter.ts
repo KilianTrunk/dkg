@@ -1205,6 +1205,35 @@ export interface ChainAdapter {
   getContextGraphAccessPolicy?(contextGraphId: bigint): Promise<number>;
 
   /**
+   * On-chain publish policy for `contextGraphId`. Read from
+   * `ContextGraphStorage.getPublishPolicy(uint256)`. Returns the
+   * Solidity tuple `(uint8 publishPolicy, address publishAuthority)`:
+   * - `publishPolicy`: `0` = curators-only, `1` = open.
+   * - `publishAuthority`: address authorized when the policy is
+   *   restricted (zero address when irrelevant).
+   *
+   * Issue #872 / Codex round-3 use case: non-creator peers do NOT
+   * receive `dkg:publishPolicy` triples via SWM (only the creator
+   * writes them to local `_meta`). They observe the chain event at
+   * subscribe time which populates the in-memory cache, but the
+   * cache is lost on daemon restart. To preserve the public+open
+   * read-relaxation after a restart for peers, the agent's policy
+   * resolver falls back to this RPC when the CG is confirmed
+   * registered on-chain but `publishPolicy` is still missing
+   * locally. Cheap (single eth_call); callers cache the result.
+   *
+   * Unregistered ids return `(0, address(0))` from Solidity's
+   * default-zero mapping. Callers MUST cross-check registration
+   * status before treating the answer as authoritative — a zero
+   * publish policy on an unregistered id is NOT a positive "open"
+   * signal.
+   */
+  getContextGraphPublishPolicy?(contextGraphId: bigint): Promise<{
+    publishPolicy: number;
+    publishAuthority: string;
+  }>;
+
+  /**
    * On-chain participant agent allowlist for `contextGraphId`. Read
    * from `ContextGraphStorage.getParticipantAgents(uint256)`.
    *

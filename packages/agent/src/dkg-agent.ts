@@ -15957,7 +15957,7 @@ export class DKGAgent {
   }
 
   /**
-   * Issue #872 — best-effort, no-network read of the on-chain
+   * Issue #872 — best-effort read of the on-chain
    * `(accessPolicy, publishPolicy)` enum pair for a CG. Sources, in
    * order:
    *
@@ -15972,17 +15972,30 @@ export class DKGAgent {
    *      `dkg:accessPolicy` as `"public"` / `"private"` in either the
    *      ontology graph (open CGs) or `_meta` (curated CGs). Peers
    *      that joined or replicated via gossip / catchup may have a
-   *      subset of these triples.
+   *      subset of these triples — notably, `dkg:publishPolicy` is
+   *      creator-only and never reaches non-creator peers via SWM.
+   *
+   *   3. Direct chain RPC (Codex round-3 fix): for registered CGs
+   *      where steps 1 and 2 still leave a field undefined — the
+   *      common case for non-creator peers after a daemon restart —
+   *      query the contract directly via
+   *      `chain.getContextGraphAccessPolicy` /
+   *      `chain.getContextGraphPublishPolicy`. The result populates
+   *      the in-memory cache so subsequent calls don't re-query.
+   *
+   * Steps 2 and 3 are GATED on {@link isContextGraphRegistered}
+   * (Codex round-2 fix): unregistered locally-created CGs reflect
+   * create-time *intent* via local triples, not an on-chain
+   * commitment, and the chain itself has no record. Treating either
+   * source as authoritative pre-registration would bypass the
+   * owner-guard on a CG the curator hasn't actually committed to.
    *
    * Returns `{}` (both fields `undefined`) when neither source has an
    * answer. Callers MUST treat `undefined` fields as unknown — fail
    * closed for policy-gated decisions rather than assuming a
-   * permissive default. The method intentionally avoids per-request
-   * chain RPCs; the eager event-driven cache is enough for any node
-   * that's been online since the CG's create block (the only case
-   * where this gap matters is a brand-new node that joined after the
-   * chain poller's lookback window rolled past — those nodes fail
-   * closed and the existing owner-guard remains in effect).
+   * permissive default. Failures in the chain RPC fallback (RPC
+   * unavailable, contract not deployed, transient errors) are logged
+   * and the field is left undefined.
    */
   async getContextGraphOnChainPolicy(contextGraphId: string): Promise<{
     accessPolicy?: number;
@@ -15990,9 +16003,14 @@ export class DKGAgent {
   }> {
     let accessPolicy = this.onChainAccessPolicyCache.get(contextGraphId);
     let publishPolicy = this.onChainPublishPolicyCache.get(contextGraphId);
+    // Track the resolved numeric on-chain id so we can both look it
+    // up in the cache (round-2) and use it as the chain-RPC fallback
+    // key (round-3). Lazily resolved — creators may pass the
+    // numeric id directly in which case no extra SPARQL is needed.
+    let onChainId: string | undefined;
 
     if (accessPolicy === undefined || publishPolicy === undefined) {
-      const onChainId = this.subscribedContextGraphs.get(contextGraphId)?.onChainId
+      onChainId = this.subscribedContextGraphs.get(contextGraphId)?.onChainId
         ?? (await this.getContextGraphOnChainId(contextGraphId).catch(() => null))
         ?? undefined;
       if (onChainId && onChainId !== contextGraphId) {
@@ -16011,11 +16029,11 @@ export class DKGAgent {
     // relaxation kick in for a CG the curator hasn't actually
     // committed to making public, bypassing the owner guard.
     //
-    // Gate the fallback on `isContextGraphRegistered` so only CGs
-    // confirmed on-chain (or replicated from a registered peer)
-    // contribute a local policy answer. Unregistered CGs that miss
-    // the chain-event cache return `{}` and the daemon route fails
-    // closed.
+    // Gate the fallback (local + chain RPC) on
+    // `isContextGraphRegistered` so only CGs confirmed on-chain (or
+    // replicated from a registered peer) contribute a policy
+    // answer. Unregistered CGs that miss the chain-event cache
+    // return `{}` and the daemon route fails closed.
     if (accessPolicy === undefined || publishPolicy === undefined) {
       const registered = await this.isContextGraphRegistered(contextGraphId).catch(() => false);
       if (!registered) {
@@ -16036,6 +16054,83 @@ export class DKGAgent {
     if (accessPolicy === undefined) {
       const stored = await this.readLocalAccessPolicyEnum(contextGraphId).catch(() => undefined);
       if (stored !== undefined) accessPolicy = stored;
+    }
+
+    // Codex review (round 3): non-creator peers never receive the
+    // `dkg:publishPolicy` triple — it's only written to local
+    // `_meta` on the creator's node. They observe the chain event
+    // at subscribe time which populates the in-memory caches above,
+    // but those caches are lost on daemon restart. Without a
+    // durable replicated source, `publishPolicy` permanently
+    // disappears for non-creator peers once the chain poller's
+    // replay window rolls past the create block — which makes
+    // `isPublicOpenContextGraph()` return false and cross-agent
+    // `/import-artifact/*` reads regress to 403 on legitimately
+    // public + open CGs.
+    //
+    // Fall back to a direct chain RPC for the missing fields. The
+    // fallback is gated on `registered === true` above so an
+    // unregistered local-only CG cannot poison the answer; the
+    // chain itself is the authoritative source. Failures (RPC
+    // unavailable, contract not deployed, transient errors) leave
+    // the field undefined and the daemon route falls back to the
+    // strict guard — fail-closed.
+    if (
+      (accessPolicy === undefined || publishPolicy === undefined)
+      && this.chain
+    ) {
+      if (onChainId === undefined) {
+        onChainId = this.subscribedContextGraphs.get(contextGraphId)?.onChainId
+          ?? (await this.getContextGraphOnChainId(contextGraphId).catch(() => null))
+          ?? undefined;
+      }
+      let numericId: bigint | undefined;
+      if (onChainId) {
+        try {
+          const parsed = BigInt(onChainId);
+          if (parsed > 0n) numericId = parsed;
+        } catch {
+          numericId = undefined;
+        }
+      }
+      if (numericId !== undefined) {
+        const rpcCtx = createOperationContext('resolve');
+        if (publishPolicy === undefined) {
+          const getPublishPolicy = this.chain.getContextGraphPublishPolicy;
+          if (typeof getPublishPolicy === 'function') {
+            try {
+              const result = await getPublishPolicy.call(this.chain, numericId);
+              const pp = result?.publishPolicy;
+              if (pp === 0 || pp === 1) {
+                publishPolicy = pp;
+                this.onChainPublishPolicyCache.set(onChainId!, pp);
+              }
+            } catch (err) {
+              this.log.warn(
+                rpcCtx,
+                `getContextGraphOnChainPolicy: chain.getContextGraphPublishPolicy(${onChainId}) failed — treating as UNKNOWN (fail-closed): ${err instanceof Error ? err.message : String(err)}`,
+              );
+            }
+          }
+        }
+        if (accessPolicy === undefined) {
+          const getAccessPolicy = this.chain.getContextGraphAccessPolicy;
+          if (typeof getAccessPolicy === 'function') {
+            try {
+              const ap = await getAccessPolicy.call(this.chain, numericId);
+              if (ap === 0 || ap === 1) {
+                accessPolicy = ap;
+                this.onChainAccessPolicyCache.set(onChainId!, ap);
+              }
+            } catch (err) {
+              this.log.warn(
+                rpcCtx,
+                `getContextGraphOnChainPolicy: chain.getContextGraphAccessPolicy(${onChainId}) failed — treating as UNKNOWN (fail-closed): ${err instanceof Error ? err.message : String(err)}`,
+              );
+            }
+          }
+        }
+      }
     }
 
     return {

@@ -117,7 +117,7 @@ describe('ApiClient', () => {
       expect(existsSync(join(tempDir, 'daemon.pid'))).toBe(false);
     });
 
-    it('connect() can use a yaml-only selected home config for status when control-plane files are missing', async () => {
+    it('connect() does not use yaml-only selected home config for status fallback', async () => {
       process.env.DKG_HOME = tempDir;
       delete process.env.DKG_API_PORT;
       await writeFile(join(tempDir, 'config.yaml'), 'name: isolated\napiPort: 9317\n', 'utf8');
@@ -126,15 +126,9 @@ describe('ApiClient', () => {
       const { fetch, calls } = createTrackingFetch({ ok: true, status: 200, body });
       globalThis.fetch = fetch;
 
-      const connected = await ApiClient.connect({ allowConfigFallback: true });
-      const result = await connected.status();
-
-      expect(result).toEqual(body);
-      expect(connected.controlPlaneWarning).toContain('api.port');
-      expect(connected.controlPlaneWarning).toContain('daemon.pid');
-      expect(calls).toHaveLength(1);
-      expect(calls[0].url).toBe('http://127.0.0.1:9317/api/status');
-      expect((calls[0].opts.headers as any).Authorization).toBeUndefined();
+      await expect(ApiClient.connect({ allowConfigFallback: true }))
+        .rejects.toThrow('Daemon is not running. Start it with: dkg start');
+      expect(calls).toHaveLength(0);
       expect(existsSync(join(tempDir, 'api.port'))).toBe(false);
       expect(existsSync(join(tempDir, 'daemon.pid'))).toBe(false);
     });

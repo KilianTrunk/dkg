@@ -61,7 +61,6 @@ import {
   SWM_SENDER_KEY_SKIPPED_MESSAGE_CACHE_LIMIT,
   type DKGNodeConfig, type OperationContext, type GetView, type AssertionDescriptor, type AssertionEvent, type AssertionState,
   type SwmSenderKeyMessageMsg,
-  type SwmSenderKeyPackageAckMsg,
   type SwmSenderKeyPackageAckReasonCode,
   type SwmSenderKeyPackageMsg,
   type WorkspaceRecipientEncryptionKey,
@@ -6017,29 +6016,11 @@ export class DKGAgent {
           }
           if (!ack.accepted) {
             const reason = ack.reason ?? 'unknown reason';
-            if (this.isRetryableSwmSenderKeySetupAck(ack)) {
-              this.enqueuePendingSenderKey({
-                senderAgentAddress: senderAgentAddress.toLowerCase(),
-                recipientAgentAddress: recipientAgentAddress.toLowerCase(),
-                recipientKeyId: recipient.recipientKeyId,
-                epochId: state.epochId,
-                contextGraphId: state.contextGraphId,
-                subGraphName: state.subGraphName,
-                packageBytes: encodeSwmSenderKeyPackage(pkg),
-                createdAtMs: Date.now(),
-              });
-              this.log.warn(
-                input.ctx,
-                `SWM sender-key setup for ${recipientAgentAddress} keyId=${recipient.recipientKeyId} ` +
-                `queued after retryable rejection (${ack.reasonCode}): ${reason} - will retry on reconnect or later publish`,
-              );
-              return { kind: 'success', agentAddress: recipientAgentAddress };
-            }
             return {
               kind: 'failure',
               agentAddress: recipientAgentAddress,
               keyId: recipient.recipientKeyId,
-              error: new Error(reason),
+              error: new Error(`${ack.reasonCode ? `${ack.reasonCode}: ` : ''}${reason}`),
             };
           }
           return { kind: 'success', agentAddress: recipientAgentAddress };
@@ -6103,10 +6084,6 @@ export class DKGAgent {
     return state;
   }
 
-  private isRetryableSwmSenderKeySetupAck(ack: SwmSenderKeyPackageAckMsg): boolean {
-    return ack.reasonCode === 'stale-target';
-  }
-
   private swmSenderKeySetupAckReasonCode(err: unknown): SwmSenderKeyPackageAckReasonCode {
     if (err instanceof StaleSenderKeyTargetError) {
       return 'stale-target';
@@ -6167,17 +6144,28 @@ export class DKGAgent {
           remaining.push(entry);
           continue;
         }
-        const ack = decodeSwmSenderKeyPackageAck(sendResult.response);
-        if (
-          ack.version === SWM_SENDER_KEY_PACKAGE_VERSION &&
-          ack.type === SWM_SENDER_KEY_PACKAGE_ACK_TYPE &&
-          !ack.accepted &&
-          this.isRetryableSwmSenderKeySetupAck(ack)
-        ) {
-          remaining.push(entry);
+        let ack: ReturnType<typeof decodeSwmSenderKeyPackageAck>;
+        try {
+          ack = decodeSwmSenderKeyPackageAck(sendResult.response);
+        } catch {
+          // Malformed/legacy ACK: terminal for this queued package, but
+          // not counted as successfully drained.
           continue;
         }
-        drained += 1;
+        if (
+          ack.version !== SWM_SENDER_KEY_PACKAGE_VERSION ||
+          ack.type !== SWM_SENDER_KEY_PACKAGE_ACK_TYPE
+        ) {
+          // Malformed/legacy ACK: terminal for this queued package, but
+          // not counted as successfully drained.
+          continue;
+        }
+        if (ack.accepted) {
+          drained += 1;
+        } else {
+          // Hard rejection is also terminal. Keep it out of the queue,
+          // but do not report it as a successful drain.
+        }
       } catch {
         remaining.push(entry);
       }

@@ -326,7 +326,7 @@ describe('createAndDistributeSwmSenderKeyEpoch: missing-peerId soft success', ()
     expect(internals.pendingSenderKeyByAgent.size).toBe(1);
   });
 
-  it('soft-queues delivered rejections only when ACK reasonCode is stale-target', async () => {
+  it('keeps delivered stale-target rejections fatal because the package targets an obsolete key ID', async () => {
     const boot = await bootAgent();
     agent = boot.agent;
     const internals = boot.internals;
@@ -335,7 +335,7 @@ describe('createAndDistributeSwmSenderKeyEpoch: missing-peerId soft success', ()
       ethers.Wallet.createRandom().privateKey,
       'sender',
     ) as AgentKeyRecord & { privateKey: string };
-    const staleTarget = makeFakeRecipient({ peerId: '12D3KooWStaleTargetRetryablePeer' });
+    const staleTarget = makeFakeRecipient({ peerId: '12D3KooWStaleTargetFatalPeer' });
 
     installStubMessenger(internals, async (peerId): Promise<ReliableSendResult> => ({
       delivered: true,
@@ -356,13 +356,9 @@ describe('createAndDistributeSwmSenderKeyEpoch: missing-peerId soft success', ()
         membershipHash: 'sha256:joined-stale-target-rejection',
         ctx: { operationId: 'test-op', operationName: 'share' },
       }),
-    ).resolves.toBeDefined();
+    ).rejects.toThrow('stale-target');
 
-    expect(internals.pendingSenderKeyByAgent.size).toBe(1);
-    const queue = internals.pendingSenderKeyByAgent.get(staleTarget.agentAddress.toLowerCase());
-    expect(queue).toBeDefined();
-    expect(queue!).toHaveLength(1);
-    expect(queue![0].recipientKeyId).toBe(staleTarget.recipientKeyId);
+    expect(internals.pendingSenderKeyByAgent.size).toBe(0);
   });
 
   it('keeps auth denials, active-key loss, and legacy unknown ACKs fatal', async () => {
@@ -418,7 +414,7 @@ describe('createAndDistributeSwmSenderKeyEpoch: missing-peerId soft success', ()
     expect(internals.pendingSenderKeyByAgent.size).toBe(0);
   });
 
-  it('keeps retryable delivered rejections queued during pending drain', async () => {
+  it('removes delivered hard rejections during pending drain without counting them as drained', async () => {
     const boot = await bootAgent();
     agent = boot.agent;
     const internals = boot.internals;
@@ -443,8 +439,8 @@ describe('createAndDistributeSwmSenderKeyEpoch: missing-peerId soft success', ()
 
     installStubDiscovery(internals, () => ({
       agentUri: `did:dkg:agent:${recipient.agentAddress.toLowerCase()}`,
-      name: 'drain-retryable-target',
-      peerId: '12D3KooWDrainRetryablePeer',
+      name: 'drain-hard-reject-target',
+      peerId: '12D3KooWDrainHardRejectPeer',
       agentAddress: recipient.agentAddress,
     }));
     installStubMessenger(internals, async (): Promise<ReliableSendResult> => ({
@@ -455,12 +451,53 @@ describe('createAndDistributeSwmSenderKeyEpoch: missing-peerId soft success', ()
         'stale-target',
       ),
       attempts: 1,
-      messageId: 'm-drain-retryable',
+      messageId: 'm-drain-hard-reject',
     }));
 
-    const drained = await internals.drainPendingSenderKeyForPeer('12D3KooWDrainRetryablePeer');
+    const drained = await internals.drainPendingSenderKeyForPeer('12D3KooWDrainHardRejectPeer');
     expect(drained).toBe(0);
+    expect(internals.pendingSenderKeyByAgent.size).toBe(0);
+  });
+
+  it('removes malformed delivered ACKs during pending drain without counting them as drained', async () => {
+    const boot = await bootAgent();
+    agent = boot.agent;
+    const internals = boot.internals;
+
+    const recipient = makeFakeRecipient();
+    const sender = agentFromPrivateKey(
+      ethers.Wallet.createRandom().privateKey,
+      'sender',
+    ) as AgentKeyRecord & { privateKey: string };
+
+    installStubMessenger(internals, async () => {
+      throw new Error('initial no-peerId branch must not call sendReliable');
+    });
+    await internals.createAndDistributeSwmSenderKeyEpoch({
+      contextGraphId: 'test-cg/drain-malformed-ack',
+      sender,
+      recipients: [recipient],
+      membershipHash: 'sha256:drain-malformed-ack',
+      ctx: { operationId: 'test-op', operationName: 'share' },
+    });
     expect(internals.pendingSenderKeyByAgent.size).toBe(1);
+
+    installStubDiscovery(internals, () => ({
+      agentUri: `did:dkg:agent:${recipient.agentAddress.toLowerCase()}`,
+      name: 'drain-malformed-ack-target',
+      peerId: '12D3KooWDrainMalformedAckPeer',
+      agentAddress: recipient.agentAddress,
+    }));
+    installStubMessenger(internals, async (): Promise<ReliableSendResult> => ({
+      delivered: true,
+      response: new Uint8Array([0xff, 0x01, 0x02]),
+      attempts: 1,
+      messageId: 'm-drain-malformed-ack',
+    }));
+
+    const drained = await internals.drainPendingSenderKeyForPeer('12D3KooWDrainMalformedAckPeer');
+    expect(drained).toBe(0);
+    expect(internals.pendingSenderKeyByAgent.size).toBe(0);
   });
 
   it('supersedes older epochs for the same (sender, recipient) pair', async () => {

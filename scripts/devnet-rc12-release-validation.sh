@@ -110,14 +110,15 @@ ka_owner_key() {
   owner=$($CHAIN_CALL DKGKnowledgeAssets ownerOf --json "[\"$kc\"]" 2>/dev/null \
     | pyf "d.get('result','') or ''" 2>/dev/null)
   [ -z "$owner" ] && return 1
-  python3 - "$DEVNET_DIR" "$owner" <<'PY'
+  python3 - "$DEVNET_DIR" "$owner" "$NUM_NODES" <<'PY'
 import json, os, sys
 devnet_dir = sys.argv[1]
 target = sys.argv[2].lower()
+max_node = int(sys.argv[3])
 # Try publisher-wallets.json first (where KA tokens are normally minted), then
 # operator wallets.json[0..N] as a fallback for nodes that pay publishes from
 # their op wallet directly.
-for n in range(1, 7):
+for n in range(1, max_node + 1):
     for fname in ("publisher-wallets.json", "wallets.json"):
         p = os.path.join(devnet_dir, f"node{n}", fname)
         if not os.path.exists(p): continue
@@ -185,6 +186,15 @@ record() { # section name status detail
 pass() { record "$1" "$2" PASS "${3:-}"; }
 warn() { record "$1" "$2" WARN "${3:-}"; }
 fail() { record "$1" "$2" FAIL "${3:-}"; }
+
+case "$NUM_NODES" in ''|*[!0-9]*) fail PREFLIGHT topology "NUM_NODES must be a positive integer (got '$NUM_NODES')"; exit 2;; esac
+case "$NUM_CORE_NODES" in ''|*[!0-9]*) fail PREFLIGHT topology "NUM_CORE_NODES must be a positive integer (got '$NUM_CORE_NODES')"; exit 2;; esac
+if [ "$NUM_NODES" -lt 5 ] || [ "$NUM_CORE_NODES" -lt 1 ] || [ "$NUM_CORE_NODES" -gt 4 ] || [ "$NUM_CORE_NODES" -gt $((NUM_NODES - 2)) ]; then
+  fail PREFLIGHT topology "unsupported topology NUM_NODES=$NUM_NODES NUM_CORE_NODES=$NUM_CORE_NODES; rc12 validation currently requires >=5 nodes, 1..4 cores, and at least two edge nodes (e.g. 5/3 or 6/4)"
+  exit 2
+fi
+ALL_NODES_CSV=""
+for n in $(seq 1 "$NUM_NODES"); do ALL_NODES_CSV="${ALL_NODES_CSV}${ALL_NODES_CSV:+,}$n"; done
 
 pyf() { python3 -c '
 import sys, json
@@ -465,7 +475,7 @@ for i in $(seq 1 "$NUM_PUBLIC"); do
   cgid="rc12-pub-${RUN_TAG}-${i}"
   res=$(create_public_cg "$node" "$cgid")
   if [ "$res" = "OK" ]; then
-    printf '%s\tpublic\t%s\t1,2,3,4,5,6\n' "$cgid" "$node" >> "$CG_LIST_FILE"
+    printf '%s\tpublic\t%s\t%s\n' "$cgid" "$node" "$ALL_NODES_CSV" >> "$CG_LIST_FILE"
     CG_CREATED=$((CG_CREATED+1))
   else
     log "  public CG create failed on node$node: ${res:0:200}"
@@ -1028,7 +1038,7 @@ if [ -n "$N1_OP" ] && [ -n "$N1_OPADDR" ] && [ -n "$methods" ] && echo "$methods
       # All reverts → typical on fresh devnet (no accrued rewards because no
       # epoch boundary has been crossed since stake). Informational, not a
       # regression.
-      warn D reward-claim-exec "all $claim_try claim(tokenId) reverted — typical on fresh devnet (no accrued rewards yet): ${claim_errs:0:160}"
+      pass D reward-claim-exec "claim(tokenId) surface exercised: all $claim_try attempt(s) reverted, typical on fresh devnet with no accrued rewards yet: ${claim_errs:0:160}"
     else
       warn D reward-claim-exec "no valid position tokenIds discovered for node1 op (balance=$cbal)"
     fi
@@ -1363,13 +1373,13 @@ if [ -n "$OREC" ]; then
   ownerAddr="${owner_line%%$'\t'*}"
   ownerKey="${owner_line##*$'\t'}"
   # Destination address: any node op wallet that isn't the current owner.
-  # Iterating 1..6 ensures we always find one distinct from the owner across
-  # all topologies.
+  # Iterating over the configured topology ensures we always find one distinct
+  # from the owner across all topologies.
   destAddr=""
   # macOS ships bash 3.2 which lacks `${var,,}`; use a portable tr-based
   # lowercase comparison.
   ownerLower=$(printf '%s' "$ownerAddr" | tr '[:upper:]' '[:lower:]')
-  for n in 1 2 3 4 5 6; do
+  for n in $(seq 1 "$NUM_NODES"); do
     cand=$(node_op_addr "$n")
     candLower=$(printf '%s' "$cand" | tr '[:upper:]' '[:lower:]')
     if [ -n "$cand" ] && [ "$candLower" != "$ownerLower" ]; then
@@ -1566,9 +1576,9 @@ for n in $(seq 1 "$NUM_CORE_NODES"); do
   win_kcns=$(grep -c 'rs.tick.kc-not-synced' "$win" 2>/dev/null); win_kcns=${win_kcns:-0}
   win_dc=$(grep -c 'rs.tick.data-corrupted' "$win" 2>/dev/null); win_dc=${win_dc:-0}
   win_nocg=$(grep -c 'rs.tick.no-eligible-cg' "$win" 2>/dev/null); win_nocg=${win_nocg:-0}
-  # `periodStart` appears on submitted + already-solved ticks. Distinct values
-  # = distinct proof periods the prover was challenged on in this window.
-  win_periods=$(grep -oE '"periodStart":"[0-9]+"' "$win" 2>/dev/null | sort -u | wc -l | tr -d ' ')
+  # Terminal outcome ticks carry `periodStart`. Distinct values = distinct
+  # proof periods the prover was challenged on in this window.
+  win_periods=$(grep -E 'rs\.tick\.(submitted|already-solved|kc-not-synced|data-corrupted)' "$win" 2>/dev/null | grep -oE '"periodStart":"[0-9]+"' | sort -u | wc -l | tr -d ' ')
   [ -z "$win_periods" ] && win_periods=0
   rm -f "$win"
 

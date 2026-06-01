@@ -515,6 +515,7 @@ export class RandomSamplingProver {
             this.log.warn('rs.tick.kc-not-synced', {
               kaId: kaId.toString(),
               cgId: cgId.toString(),
+              periodStart: periodKey.periodStartBlock.toString(),
               err: err.name,
               missingCount: err.missingChunkIndexes.length,
               expectedCount: err.expectedCount,
@@ -537,6 +538,7 @@ export class RandomSamplingProver {
             this.log.error('rs.tick.data-corrupted', {
               kaId: kaId.toString(),
               cgId: cgId.toString(),
+              periodStart: periodKey.periodStartBlock.toString(),
               reason: 'ciphertext-chunk-malformed',
               chunkIndex: err.chunkIndex,
             });
@@ -566,6 +568,7 @@ export class RandomSamplingProver {
           this.log.warn('rs.tick.kc-not-synced', {
             kaId: kaId.toString(),
             cgId: cgId.toString(),
+            periodStart: periodKey.periodStartBlock.toString(),
             err: (err as Error).name,
           });
           await this.wal.append(
@@ -624,6 +627,7 @@ export class RandomSamplingProver {
         this.log.error('rs.tick.data-corrupted', {
           kaId: kaId.toString(),
           cgId: cgId.toString(),
+          periodStart: periodKey.periodStartBlock.toString(),
           reason,
           err: (err as Error).name,
           ...(typeof e?.computedLeafCount === 'number' ? { computedLeafCount: e.computedLeafCount } : {}),
@@ -707,6 +711,7 @@ export class RandomSamplingProver {
       kaId: kaId.toString(),
       cgId: cgId.toString(),
       chunkId: chunkId.toString(),
+      periodStart: periodKey.periodStartBlock.toString(),
       txHash: txResult.hash,
     });
     return { kind: 'submitted', txHash: txResult.hash, kaId, cgId, chunkId };

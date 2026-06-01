@@ -77,16 +77,47 @@ function controlPlaneWarning(missingFiles: string[]): string | undefined {
   return `Warning: selected DKG home is missing control-plane file(s): ${missingFiles.join(', ')}. Using configured API port fallback.`;
 }
 
+function isDaemonStatusResponse(value: unknown): value is DaemonStatusResponse {
+  if (!value || typeof value !== 'object') return false;
+  const status = value as Record<string, unknown>;
+  return typeof status.name === 'string'
+    && typeof status.peerId === 'string'
+    && typeof status.uptimeMs === 'number'
+    && Number.isFinite(status.uptimeMs)
+    && typeof status.connectedPeers === 'number'
+    && Number.isFinite(status.connectedPeers)
+    && typeof status.relayConnected === 'boolean'
+    && Array.isArray(status.multiaddrs)
+    && status.multiaddrs.every(addr => typeof addr === 'string');
+}
+
+function requireDaemonStatusResponse(value: unknown, expectedName?: string): DaemonStatusResponse {
+  if (!isDaemonStatusResponse(value)) {
+    throw new Error('Configured API port did not return a DKG daemon status response.');
+  }
+  if (expectedName && value.name !== expectedName) {
+    throw new Error(
+      `Configured API port responded as DKG node "${value.name}", expected selected home node "${expectedName}".`,
+    );
+  }
+  return value;
+}
+
 export class ApiClient {
   private baseUrl: string;
   private token?: string;
+  private expectedStatusName?: string;
   readonly controlPlaneWarning?: string;
 
-  constructor(portOrBaseUrl: number | string, token?: string, opts?: { controlPlaneWarning?: string }) {
+  constructor(portOrBaseUrl: number | string, token?: string, opts?: {
+    controlPlaneWarning?: string;
+    expectedStatusName?: string;
+  }) {
     this.baseUrl = typeof portOrBaseUrl === 'number'
       ? `http://127.0.0.1:${portOrBaseUrl}`
       : portOrBaseUrl.replace(/\/+$/, '');
     this.token = token;
+    this.expectedStatusName = opts?.expectedStatusName;
     this.controlPlaneWarning = opts?.controlPlaneWarning;
   }
 
@@ -99,6 +130,7 @@ export class ApiClient {
     const filePort = hasEnvPort ? null : await readApiPort();
     let port = envPort ?? filePort;
     let warning: string | undefined;
+    let expectedStatusName: string | undefined;
 
     if (!port) {
       const pid = await readPid();
@@ -108,6 +140,7 @@ export class ApiClient {
         if (configuredPort) {
           const missingFiles = ['api.port', ...(pid ? [] : ['daemon.pid'])];
           port = configuredPort;
+          expectedStatusName = config.name;
           warning = controlPlaneWarning(missingFiles);
         }
       }
@@ -123,11 +156,12 @@ export class ApiClient {
 
     const tokens = await loadTokens();
     const token = tokens.size > 0 ? tokens.values().next().value : undefined;
-    return new ApiClient(port, token, { controlPlaneWarning: warning });
+    return new ApiClient(port, token, { controlPlaneWarning: warning, expectedStatusName });
   }
 
   async status(): Promise<DaemonStatusResponse> {
-    return this.get('/api/status', { auth: false });
+    const status = await this.get<unknown>('/api/status', { auth: false });
+    return requireDaemonStatusResponse(status, this.expectedStatusName);
   }
 
   async agents(): Promise<{

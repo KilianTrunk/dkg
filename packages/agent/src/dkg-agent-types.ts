@@ -115,6 +115,8 @@ export type PendingSenderKeyEntry = {
    * SENDER_KEY, ...)` when the recipient becomes reachable.
    */
   packageBytes: Uint8Array;
+  /** Stable Messenger id for the current explicit retry chain. Rotated after delivered non-acceptance. */
+  messageId?: string;
   /** Wall-clock when the row was enqueued; used for diagnostics + future TTL. */
   createdAtMs: number;
 };

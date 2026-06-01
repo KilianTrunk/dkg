@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import {
   DKGNode, ProtocolRouter, GossipSubManager, TypedEventBus, DKGEvent,
   LibP2PNetwork, PeerResolver, StubNetworkStateRegistry,
@@ -6033,6 +6033,7 @@ export class DKGAgent {
                 contextGraphId: state.contextGraphId,
                 subGraphName: state.subGraphName,
                 packageBytes,
+                messageId: this.nextSwmSenderKeyPackageMessageId(packageBytes),
                 createdAtMs: Date.now(),
               });
               pendingSenderKeyQueued = true;
@@ -6144,6 +6145,21 @@ export class DKGAgent {
     return `swm-sender-key:${createHash('sha256').update(packageBytes).digest('hex')}`;
   }
 
+  private nextSwmSenderKeyPackageMessageId(packageBytes: Uint8Array): string {
+    return `${this.swmSenderKeyPackageMessageId(packageBytes)}:${randomUUID()}`;
+  }
+
+  private swmSenderKeyPendingMessageId(entry: PendingSenderKeyEntry): string {
+    return entry.messageId ?? this.swmSenderKeyPackageMessageId(entry.packageBytes);
+  }
+
+  private rotateSwmSenderKeyPendingMessageId(entry: PendingSenderKeyEntry): PendingSenderKeyEntry {
+    return {
+      ...entry,
+      messageId: this.nextSwmSenderKeyPackageMessageId(entry.packageBytes),
+    };
+  }
+
   /**
    * PR-2 (SWM-fanout plan): enqueue a sender-key package whose recipient
    * has no advertised `dkg:peerId` (so we can't even ask the messenger
@@ -6189,7 +6205,7 @@ export class DKGAgent {
           input.peerId,
           PROTOCOL_SWM_SENDER_KEY,
           entry.packageBytes,
-          { messageId: this.swmSenderKeyPackageMessageId(entry.packageBytes) },
+          { messageId: this.swmSenderKeyPendingMessageId(entry) },
         );
         if (!sendResult.delivered) {
           remaining.push(entry);
@@ -6201,7 +6217,7 @@ export class DKGAgent {
         } catch {
           // Malformed/legacy ACK: no positive acceptance yet. Keep the
           // row queued so a mixed-version rollout cannot strand the recipient.
-          remaining.push(entry);
+          remaining.push(this.rotateSwmSenderKeyPendingMessageId(entry));
           continue;
         }
         if (
@@ -6216,7 +6232,7 @@ export class DKGAgent {
         if (ack.accepted) {
           drained += 1;
         } else if (this.isRetryableSwmSenderKeySetupAckReason(ack.reasonCode)) {
-          remaining.push(entry);
+          remaining.push(this.rotateSwmSenderKeyPendingMessageId(entry));
         } else {
           // Terminal rejection: keep it out of the queue, but do not
           // report it as a successful drain.

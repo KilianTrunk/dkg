@@ -554,6 +554,61 @@ describe('createAndDistributeSwmSenderKeyEpoch: missing-peerId soft success', ()
     expect(internals.pendingSenderKeyByAgent.size).toBe(1);
   });
 
+  it('rotates pending retry messageId after delivered retryable rejections', async () => {
+    const boot = await bootAgent();
+    agent = boot.agent;
+    const internals = boot.internals;
+
+    installStubMessenger(internals, async () => {
+      throw new Error('initial no-peerId branch must not call sendReliable');
+    });
+
+    const recipient = makeFakeRecipient();
+    const sender = agentFromPrivateKey(
+      ethers.Wallet.createRandom().privateKey,
+      'sender',
+    ) as AgentKeyRecord & { privateKey: string };
+
+    await internals.createAndDistributeSwmSenderKeyEpoch({
+      contextGraphId: 'test-cg/rotating-message-id',
+      sender,
+      recipients: [recipient],
+      membershipHash: 'sha256:rotating-message-id',
+      ctx: { operationId: 'test-op', operationName: 'share' },
+    });
+
+    const knownPeerId = '12D3KooWRotatingMessageIdPeer';
+    installStubDiscovery(internals, (peerId) => {
+      if (peerId !== knownPeerId) return null;
+      return {
+        agentUri: `did:dkg:agent:${recipient.agentAddress.toLowerCase()}`,
+        name: 'rotating-message-id-target',
+        peerId,
+        agentAddress: recipient.agentAddress,
+      };
+    });
+
+    const messageIds: Array<string | undefined> = [];
+    installStubMessenger(internals, async (_peerId, _protocolId, _payload, opts) => {
+      messageIds.push(opts?.messageId);
+      return {
+        delivered: true,
+        response: senderKeyAck(false, 'receiver returned a future retryable reason code', 'future-retryable-reason'),
+        attempts: 1,
+        messageId: opts?.messageId ?? 'missing-message-id',
+      };
+    });
+
+    expect(await internals.drainPendingSenderKeyForPeer(knownPeerId)).toBe(0);
+    expect(await internals.drainPendingSenderKeyForPeer(knownPeerId)).toBe(0);
+
+    expect(messageIds).toHaveLength(2);
+    expect(messageIds[0]).toMatch(/^swm-sender-key:[0-9a-f]{64}$/);
+    expect(messageIds[1]).toMatch(/^swm-sender-key:[0-9a-f]{64}:[0-9a-f-]{36}$/);
+    expect(messageIds[1]).not.toBe(messageIds[0]);
+    expect(internals.pendingSenderKeyByAgent.size).toBe(1);
+  });
+
   it('retries pending packages during later publishes without waiting for reconnect', async () => {
     const boot = await bootAgent();
     agent = boot.agent;

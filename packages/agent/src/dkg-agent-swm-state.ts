@@ -80,6 +80,7 @@ export function serializePendingSenderKeyEntry(entry: PendingSenderKeyEntry): Re
     contextGraphId: entry.contextGraphId,
     subGraphName: entry.subGraphName,
     packageBytes: encodeBytes(entry.packageBytes),
+    messageId: entry.messageId,
     createdAtMs: entry.createdAtMs,
   };
 }
@@ -134,6 +135,7 @@ export function deserializePendingSenderKeyEntry(entry: Record<string, unknown>)
     contextGraphId: requiredString(entry.contextGraphId, 'pending.contextGraphId'),
     subGraphName: optionalString(entry.subGraphName),
     packageBytes: decodeBytes(requiredString(entry.packageBytes, 'pending.packageBytes')),
+    messageId: optionalString(entry.messageId),
     createdAtMs: requiredNumber(entry.createdAtMs, 'pending.createdAtMs'),
   };
 }

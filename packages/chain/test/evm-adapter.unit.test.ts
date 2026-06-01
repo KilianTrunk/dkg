@@ -137,6 +137,11 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
       .toThrow('EVM adminPrivateKey must be distinct from operational keys');
   });
 
+  it('rejects invalid tokenAddress overrides', () => {
+    expect(() => new EVMChainAdapter(minimalConfig({ tokenAddress: 'not-an-address' })))
+      .toThrow('Invalid tokenAddress');
+  });
+
   it('allows missing adminPrivateKey for backwards-compatible publish/read-only adapters', () => {
     expect(() => new EVMChainAdapter({
       rpcUrl: 'http://127.0.0.1:59998',
@@ -159,6 +164,79 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
     expect(a.getProvider()).toBeDefined();
     expect(typeof a.getProvider().getBlockNumber).toBe('function');
     expect(a.getReadProvider()).toBeDefined();
+  });
+
+  it('falls back to getContextGraph when ContextGraphStorage lacks getAccessPolicy', async () => {
+    const a = new EVMChainAdapter(minimalConfig());
+    const getAccessPolicy = vi.fn(async () => {
+      const err = new Error('missing revert data');
+      (err as any).code = 'CALL_EXCEPTION';
+      throw err;
+    });
+    const getContextGraph = vi.fn(async () => ({
+      owner_: ethers.ZeroAddress,
+      participantAgents: [],
+      metadataBatchId: 0n,
+      active: true,
+      createdAt: 1n,
+      accessPolicy: 1n,
+      publishPolicy: 0n,
+      publishAuthority: ethers.ZeroAddress,
+      publishAuthorityAccountId: 0n,
+    }));
+    (a as any).init = async () => undefined;
+    (a as any).contracts.contextGraphStorage = {
+      getAccessPolicy,
+      getContextGraph,
+    };
+
+    await expect(a.getContextGraphAccessPolicy(6n)).resolves.toBe(1);
+    expect(getAccessPolicy).toHaveBeenCalledWith(6n);
+    expect(getContextGraph).toHaveBeenCalledWith(6n);
+  });
+
+  it('parses accessPolicy from tuple fallback results', async () => {
+    const a = new EVMChainAdapter(minimalConfig());
+    (a as any).init = async () => undefined;
+    (a as any).contracts.contextGraphStorage = {
+      getAccessPolicy: vi.fn(async () => {
+        throw new Error('selector unavailable');
+      }),
+      getContextGraph: vi.fn(async () => [
+        ethers.ZeroAddress,
+        [],
+        0n,
+        true,
+        1n,
+        0n,
+        1n,
+        ethers.ZeroAddress,
+        0n,
+      ]),
+    };
+
+    await expect(a.getContextGraphAccessPolicy(7n)).resolves.toBe(0);
+  });
+
+  it('uses configured tokenAddress without resolving Hub.Token during init', async () => {
+    const tokenAddress = ethers.getAddress(`0x${'22'.repeat(20)}`);
+    const contractAddress = ethers.getAddress(`0x${'11'.repeat(20)}`);
+    const assetStorageAddress = ethers.getAddress(`0x${'33'.repeat(20)}`);
+    const a = new EVMChainAdapter(minimalConfig({ tokenAddress }));
+    const getContractAddress = vi.fn(async (name: string) => {
+      if (name === 'Token') throw new Error('Hub.Token should not be resolved when tokenAddress is configured');
+      return contractAddress;
+    });
+    (a as any).contracts.hub = {
+      getContractAddress,
+      getAssetStorageAddress: vi.fn(async () => assetStorageAddress),
+      on: vi.fn(async () => undefined),
+    };
+
+    await (a as any).init();
+
+    expect(getContractAddress).not.toHaveBeenCalledWith('Token');
+    await expect((a as any).contracts.token.getAddress()).resolves.toBe(tokenAddress);
   });
 
   it('dedupes configured RPC URLs in priority order', () => {
@@ -1980,4 +2058,3 @@ describe('createKnowledgeAssets / updateKnowledgeCollectionV10 — approval sign
     expect(signSpy.mock.calls[0][0]).toBe(walletB);
   });
 });
-

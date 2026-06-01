@@ -43,6 +43,8 @@ import type { WorkspaceAgentRecipientResolver } from './workspace-agent-recipien
 
 export { RESERVED_SUBJECT_PREFIXES, findReservedSubjectPrefix, isReservedSubject } from './reserved-subjects.js';
 
+const WORKSPACE_OWNER_PREDICATE = 'http://dkg.io/ontology/workspaceOwner';
+
 export interface DKGPublisherConfig {
   store: TripleStore;
   chain: ChainAdapter;
@@ -1243,7 +1245,7 @@ export class DKGPublisher implements Publisher {
 
     const result = await this.store.query(sparql);
     const quads: Quad[] = result.type === 'quads'
-      ? result.quads.filter((q) => !isTrustLevelQuad(q))
+      ? result.quads.filter((q) => !isTrustLevelQuad(q) && q.predicate !== WORKSPACE_OWNER_PREDICATE)
       : [];
 
     if (quads.length === 0) {
@@ -1476,8 +1478,11 @@ export class DKGPublisher implements Publisher {
       for (const rootEntity of kaMap.keys()) {
         await this.store.deleteByPattern({ graph: swmGraph, subject: rootEntity });
         await this.store.deleteBySubjectPrefix(swmGraph, rootEntity + '/.well-known/genid/');
+        await this.store.deleteByPattern({
+          graph: swmGraph, subject: rootEntity, predicate: WORKSPACE_OWNER_PREDICATE,
+        });
         const ownerDeleted = await this.store.deleteByPattern({
-          graph: swmMetaGraph, subject: rootEntity, predicate: 'http://dkg.io/ontology/workspaceOwner',
+          graph: swmMetaGraph, subject: rootEntity, predicate: WORKSPACE_OWNER_PREDICATE,
         });
         ownerDeletedTotal += ownerDeleted;
         await this.deleteMetaForRoot(swmMetaGraph, rootEntity);

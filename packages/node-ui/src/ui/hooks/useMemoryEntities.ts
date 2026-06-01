@@ -266,7 +266,8 @@ function swmSparql(cgId: string) {
       STRSTARTS(STR(?g), "${cgUri}") &&
       STRENDS(STR(?g), "/_shared_memory") &&
       STR(?g) != "${cgUri}/meta/_shared_memory" &&
-      !CONTAINS(STR(?g), "/meta/")
+      !CONTAINS(STR(?g), "/meta/") &&
+      ?p != <http://dkg.io/ontology/workspaceOwner>
     )
   } LIMIT ${SWM_LIMIT}`;
 }

@@ -740,6 +740,8 @@ export interface DKGAgentConfig {
     rpcUrl: string;
     rpcUrls?: string[];
     hubAddress: string;
+    /** Optional TRAC token contract override. When omitted, the adapter resolves Hub.Token. */
+    tokenAddress?: string;
     adminPrivateKey?: string;
     operationalKeys: string[];
     chainId?: string;

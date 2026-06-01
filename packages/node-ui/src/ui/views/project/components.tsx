@@ -7,7 +7,7 @@ import { truncateMiddle } from '../../lib/truncate.js';
 import {
   listJoinRequests, approveJoinRequest, rejectJoinRequest,
   listAssertions, promoteAssertion,
-  publishSharedMemory, executeQuery,
+  publishSharedMemory, listSwmEntities, executeQuery,
   writeProfileQueryCatalog,
   fetchSubGraphs,
   type AgentIdentity, type AssertionInfo, type PendingJoinRequest, type PublishResult, type SubGraphInfo,
@@ -1787,10 +1787,24 @@ export function LayerStatsWidget({ entities, entityCount, triples, layer }: {
   );
 }
 
+function requireSinglePublishRoot(roots: string[]): string[] {
+  const uniqueRoots = [...new Set(roots.filter(Boolean))];
+  if (uniqueRoots.length !== 1) {
+    throw new Error('V10 publish requires exactly one root entity per request. Select one root and publish again.');
+  }
+  return uniqueRoots;
+}
+
+async function fetchSingleSwmRoot(contextGraphId: string): Promise<string[]> {
+  const roots = (await listSwmEntities(contextGraphId)).map((entity) => entity.uri);
+  return requireSinglePublishRoot(roots);
+}
+
 export function LayerActionsWidget({ layer, count, contextGraphId, onComplete }: {
   layer: 'wm' | 'swm';
   count: number;
   contextGraphId: string;
+  entities: MemoryEntity[];
   onComplete: () => void;
 }) {
   const [busy, setBusy] = useState(false);
@@ -1814,7 +1828,8 @@ export function LayerActionsWidget({ layer, count, contextGraphId, onComplete }:
         }
         setResult(`Promoted ${promoted} triple${promoted !== 1 ? 's' : ''} to Shared Memory`);
       } else {
-        await publishSharedMemory(contextGraphId);
+        const roots = requireSinglePublishRoot(entities.map((entity) => entity.uri));
+        await publishSharedMemory(contextGraphId, roots);
         setResult('Published to Verifiable Memory');
       }
       onComplete?.();
@@ -1823,7 +1838,7 @@ export function LayerActionsWidget({ layer, count, contextGraphId, onComplete }:
     } finally {
       setBusy(false);
     }
-  }, [isWm, contextGraphId, onComplete]);
+  }, [isWm, entities, contextGraphId, onComplete]);
 
   if (count === 0) return null;
   const color = isWm ? '#f59e0b' : '#22c55e';
@@ -1890,7 +1905,7 @@ export function LayerWidgetStrip({ layer, entities, entityCount, tripleCount, co
       </div>
       {(layer === 'wm' || layer === 'swm') && (
         <div className="v10-layer-widgets-strip-action">
-          <LayerActionsWidget layer={layer} count={entityCount} contextGraphId={contextGraphId} onComplete={onComplete} />
+          <LayerActionsWidget layer={layer} count={entityCount} entities={entities} contextGraphId={contextGraphId} onComplete={onComplete} />
         </div>
       )}
     </div>
@@ -2955,7 +2970,8 @@ export function AssertionsList({ contextGraphId, layer, onComplete, scrollKey }:
         const res = await promoteAssertion(contextGraphId, assertion.name, 'all', assertion.subGraph);
         setResult(`Promoted ${res.promotedCount} triples to Shared Memory`);
       } else {
-        await publishSharedMemory(contextGraphId);
+        const roots = await fetchSingleSwmRoot(contextGraphId);
+        await publishSharedMemory(contextGraphId, roots);
         setResult('Published to Verifiable Memory');
       }
       refresh();
@@ -2982,7 +2998,8 @@ export function AssertionsList({ contextGraphId, layer, onComplete, scrollKey }:
         }
         setResult(`Promoted ${total} triples across ${assertions.length} assertion${assertions.length !== 1 ? 's' : ''}`);
       } else {
-        await publishSharedMemory(contextGraphId);
+        const roots = await fetchSingleSwmRoot(contextGraphId);
+        await publishSharedMemory(contextGraphId, roots);
         setResult('Published all to Verifiable Memory');
       }
       refresh();

@@ -286,11 +286,23 @@ describe('UI API tests', () => {
       expect(body.contextGraphId).toBe('cg-1');
     });
 
-    it('publishSharedMemory sends contextGraphId', async () => {
-      await publishSharedMemory('cg-1');
+    it('publishSharedMemory sends one explicit root selection', async () => {
+      await publishSharedMemory('cg-1', ['urn:root']);
       const call = requestLog.find(r => r.method === 'POST' && r.url.includes('/api/shared-memory/publish'));
       const body = JSON.parse(call?.body ?? '{}');
       expect(body.contextGraphId).toBe('cg-1');
+      expect(body.selection).toEqual(['urn:root']);
+      expect(body.clearAfter).toBe(false);
+    });
+
+    it('listSwmEntities queries the shared-working-memory view', async () => {
+      await listSwmEntities('cg-1');
+      const call = requestLog.find(r => r.method === 'POST' && r.url.includes('/api/query'));
+      const body = JSON.parse(call?.body ?? '{}');
+      expect(body.contextGraphId).toBe('cg-1');
+      expect(body.view).toBe('shared-working-memory');
+      expect(body.sparql).toContain('/_shared_memory');
+      expect(body.sparql).toContain('workspaceOwner');
     });
 
     it('createSavedQuery sends POST', async () => {

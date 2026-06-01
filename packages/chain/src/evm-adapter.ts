@@ -496,6 +496,8 @@ interface EVMAdapterBaseConfig {
   /** Additional operational wallet keys for parallel transaction submission. */
   additionalKeys?: string[];
   hubAddress: string;
+  /** Optional TRAC token contract override. When omitted, resolve from Hub.Token. */
+  tokenAddress?: string;
   chainId?: string;
   /**
    * TTL (ms) for re-resolving `RandomSampling` / `RandomSamplingStorage`
@@ -610,6 +612,7 @@ export class EVMChainAdapter implements ChainAdapter {
   private signerIndex = 0;
   private signerSelectionQueue: Promise<void> = Promise.resolve();
   private readonly hubAddress: string;
+  private readonly tokenAddress?: string;
   /**
    * Operator-configured allowance sizing policy for V10 publish / update
    * auto-approve. See {@link ApprovalPolicy}. Default is `'per-publish'`,
@@ -840,6 +843,10 @@ export class EVMChainAdapter implements ChainAdapter {
       }
     }
     this.hubAddress = config.hubAddress;
+    if (config.tokenAddress && !ethers.isAddress(config.tokenAddress)) {
+      throw new Error(`Invalid tokenAddress: ${config.tokenAddress}`);
+    }
+    this.tokenAddress = config.tokenAddress ? ethers.getAddress(config.tokenAddress) : undefined;
     this.chainId = config.chainId ?? 'evm:31337';
     this.approvalPolicy = config.approvalPolicy ?? DEFAULT_APPROVAL_POLICY;
 
@@ -1446,7 +1453,7 @@ export class EVMChainAdapter implements ChainAdapter {
 
     await this.startHubRotationListener();
 
-    const tokenAddress: string = await this.contracts.hub.getContractAddress('Token');
+    const tokenAddress: string = this.tokenAddress ?? await this.contracts.hub.getContractAddress('Token');
     if (tokenAddress !== ethers.ZeroAddress) {
       this.contracts.token = new Contract(
         tokenAddress,
@@ -4370,8 +4377,27 @@ export class EVMChainAdapter implements ChainAdapter {
   async getContextGraphAccessPolicy(contextGraphId: bigint): Promise<number> {
     await this.init();
     const cgs = this.requireContextGraphStorage();
-    const raw: bigint = BigInt(await cgs.getAccessPolicy(contextGraphId));
-    return Number(raw);
+    try {
+      const raw: bigint = BigInt(await cgs.getAccessPolicy(contextGraphId));
+      return Number(raw);
+    } catch (primaryErr) {
+      try {
+        const cg = await cgs.getContextGraph(contextGraphId);
+        const raw =
+          cg?.accessPolicy
+          ?? (Array.isArray(cg) ? cg[5] : undefined);
+        if (raw === undefined || raw === null) {
+          throw new Error('ContextGraphStorage.getContextGraph returned no accessPolicy field');
+        }
+        return Number(BigInt(raw));
+      } catch (fallbackErr) {
+        throw new Error(
+          `ContextGraphStorage access-policy lookup failed via getAccessPolicy and getContextGraph fallback: ` +
+          `${primaryErr instanceof Error ? primaryErr.message : String(primaryErr)}; ` +
+          `fallback: ${fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr)}`,
+        );
+      }
+    }
   }
 
   /**

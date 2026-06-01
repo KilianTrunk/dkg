@@ -1106,6 +1106,7 @@ export class DKGAgent {
         privateKey: opKeys[0],
         additionalKeys: opKeys.slice(1),
         hubAddress: config.chainConfig.hubAddress,
+        tokenAddress: config.chainConfig.tokenAddress,
         chainId: config.chainConfig.chainId,
         approvalPolicy: config.chainConfig.approvalPolicy,
       };

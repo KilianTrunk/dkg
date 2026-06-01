@@ -58,7 +58,8 @@ const execFileAsync = promisify(execFile);
 import { enrichEvmError, MockChainAdapter } from '@origintrail-official/dkg-chain';
 import { DKGAgent, loadOpWallets } from '@origintrail-official/dkg-agent';
 import { computeNetworkId, createOperationContext, DKGEvent, Logger, PayloadTooLargeError, GET_VIEWS, TrustLevel, validateSubGraphName, validateAssertionName, validateContextGraphId, isSafeIri, assertSafeIri, assertSafeRdfTerm, sparqlIri, contextGraphSharedMemoryUri, contextGraphAssertionUri, contextGraphMetaUri, escapeDkgRdfLiteral, escapeSparqlLiteral } from '@origintrail-official/dkg-core';
-import { findReservedSubjectPrefix, isSkolemizedUri, type PublishOptions } from '@origintrail-official/dkg-publisher';
+import { autoPartition, findReservedSubjectPrefix, isSkolemizedUri, type PublishOptions, type PublishResult } from '@origintrail-official/dkg-publisher';
+import type { Quad } from '@origintrail-official/dkg-storage';
 import {
   DashboardDB,
   MetricsCollector,
@@ -347,6 +348,78 @@ type PreSignedAuthorAttestation = {
   address: string;
   signature: { r: Uint8Array; vs: Uint8Array };
 };
+
+type SharedMemoryPublishSelection = "all" | { rootEntities: string[] };
+const WORKSPACE_OWNER_PREDICATE = 'http://dkg.io/ontology/workspaceOwner';
+
+async function resolvePublishRootEntities(
+  agent: DKGAgent,
+  contextGraphId: string,
+  selection: SharedMemoryPublishSelection,
+  subGraphName?: string,
+): Promise<string[]> {
+  const swmGraph = contextGraphSharedMemoryUri(contextGraphId, subGraphName);
+
+  if (selection !== "all") {
+    const requestedRoots = [...new Set(
+      selection.rootEntities
+        .map((root) => String(root).trim())
+        .filter((root) => isSafeIri(root)),
+    )];
+    if (requestedRoots.length === 0) return [];
+
+    const values = requestedRoots.map((root) => sparqlIri(root)).join(" ");
+    const result = await agent.store.query(
+      `CONSTRUCT { ?s ?p ?o } WHERE {
+        GRAPH <${swmGraph}> {
+          VALUES ?s { ${values} }
+          ?s ?p ?o .
+          FILTER(?p != <${WORKSPACE_OWNER_PREDICATE}>)
+        }
+      }`,
+    );
+    const quads: Quad[] = result.type === "quads"
+      ? result.quads.filter((quad) => quad.predicate !== WORKSPACE_OWNER_PREDICATE)
+      : [];
+    const availableRoots = new Set(autoPartition(quads).keys());
+    return requestedRoots.filter((root) => availableRoots.has(root));
+  }
+
+  const result = await agent.store.query(
+    `CONSTRUCT { ?s ?p ?o } WHERE {
+      GRAPH <${swmGraph}> {
+        ?s ?p ?o .
+        FILTER(?p != <${WORKSPACE_OWNER_PREDICATE}>)
+      }
+    }`,
+  );
+  const quads: Quad[] = result.type === "quads"
+    ? result.quads.filter((quad) => quad.predicate !== WORKSPACE_OWNER_PREDICATE)
+    : [];
+  return [...autoPartition(quads).keys()];
+}
+
+function publishResponsePayload(
+  result: PublishResult,
+  resolvedPublishContextGraphId: string | null,
+): Record<string, unknown> {
+  const chain = result.onChainResult;
+  return {
+    kaId: String(result.kaId),
+    status: result.status,
+    kas: result.kaManifest.map((ka: any) => ({
+      tokenId: String(ka.tokenId),
+      rootEntity: ka.rootEntity,
+    })),
+    ...(chain && { txHash: chain.txHash, blockNumber: chain.blockNumber }),
+    ...(resolvedPublishContextGraphId != null
+      ? { publishContextGraphId: String(resolvedPublishContextGraphId) }
+      : {}),
+    ...(result.contextGraphError
+      ? { contextGraphError: result.contextGraphError }
+      : {}),
+  };
+}
 
 export function validatePreSignedAuthorAttestation(
   raw: unknown,
@@ -1674,6 +1747,64 @@ WHERE {
       details: { source: "api", publishContextGraphId, subGraphName },
     });
     try {
+      let resolvedPublishContextGraphId: string | null = null;
+      if (publishContextGraphId != null) {
+        const rawPublishContextGraphId = String(publishContextGraphId).trim();
+        if (/^\d+$/.test(rawPublishContextGraphId)) {
+          const numericPublishContextGraphId = BigInt(rawPublishContextGraphId);
+          if (numericPublishContextGraphId <= 0n) {
+            return jsonResponse(res, 400, {
+              error:
+                '"publishContextGraphId" must be a positive integer, canonical context graph id, or full context graph URI',
+            });
+          }
+          resolvedPublishContextGraphId = rawPublishContextGraphId;
+        } else {
+          const resolvedPublishTargetId = await resolveRequiredWriteContextGraphId(
+            agent,
+            rawPublishContextGraphId,
+            res,
+            {
+              ...writePreflightContextGraphOpts,
+              requireLocalWritable: false,
+            },
+          );
+          if (!resolvedPublishTargetId) return;
+          const onChainId = await agent.getContextGraphOnChainId(resolvedPublishTargetId);
+          if (!onChainId || !/^\d+$/.test(String(onChainId)) || BigInt(String(onChainId)) <= 0n) {
+            return jsonResponse(res, 400, {
+              code: "CONTEXT_GRAPH_NOT_REGISTERED",
+              error:
+                `publishContextGraphId "${rawPublishContextGraphId}" resolved to context graph ` +
+                `"${resolvedPublishTargetId}", but that graph has no positive on-chain id. ` +
+                `Pass a positive numeric context graph id or register the target first.`,
+            });
+          }
+          resolvedPublishContextGraphId = String(onChainId);
+        }
+      }
+
+      const sel: "all" | { rootEntities: string[] } = Array.isArray(selection)
+        ? { rootEntities: selection }
+        : selection || "all";
+      const publishRootEntities = await tracker.trackPhase(ctx, "read-shared-memory", () =>
+        resolvePublishRootEntities(agent, resolvedContextGraphId, sel, subGraphName),
+      );
+      if (publishRootEntities.length === 0) {
+        return jsonResponse(res, 400, {
+          error: `No quads in shared memory for context graph ${resolvedContextGraphId} matching selection`,
+        });
+      }
+      if (publishRootEntities.length > 1) {
+        return jsonResponse(res, 409, {
+          code: "MULTI_ROOT_PUBLISH_NOT_ATOMIC",
+          error:
+            `V10 shared-memory publish is single-root only for this synchronous endpoint. ` +
+            `Resolved ${publishRootEntities.length} root entities; select exactly one root or use a durable multi-publish flow.`,
+          rootEntities: publishRootEntities,
+        });
+      }
+
       // OT-RFC-38 LU-6 — transparent register-then-publish.
       //
       // Project creation is local-only by design (no chain
@@ -1753,64 +1884,34 @@ WHERE {
             `${regErr?.message ?? String(regErr)}`,
         });
       }
-      const sel: "all" | { rootEntities: string[] } = Array.isArray(selection)
-        ? { rootEntities: selection }
-        : selection || "all";
-      let resolvedPublishContextGraphId: string | null = null;
-      if (publishContextGraphId != null) {
-        const rawPublishContextGraphId = String(publishContextGraphId).trim();
-        if (/^\d+$/.test(rawPublishContextGraphId)) {
-          const numericPublishContextGraphId = BigInt(rawPublishContextGraphId);
-          if (numericPublishContextGraphId <= 0n) {
-            return jsonResponse(res, 400, {
-              error:
-                '"publishContextGraphId" must be a positive integer, canonical context graph id, or full context graph URI',
-            });
-          }
-          resolvedPublishContextGraphId = rawPublishContextGraphId;
-        } else {
-          const resolvedPublishTargetId = await resolveRequiredWriteContextGraphId(
-            agent,
-            rawPublishContextGraphId,
-            res,
-            {
-              ...writePreflightContextGraphOpts,
-              requireLocalWritable: false,
-            },
-          );
-          if (!resolvedPublishTargetId) return;
-          const onChainId = await agent.getContextGraphOnChainId(resolvedPublishTargetId);
-          if (!onChainId || !/^\d+$/.test(String(onChainId)) || BigInt(String(onChainId)) <= 0n) {
-            return jsonResponse(res, 400, {
-              code: "CONTEXT_GRAPH_NOT_REGISTERED",
-              error:
-                `publishContextGraphId "${rawPublishContextGraphId}" resolved to context graph ` +
-                `"${resolvedPublishTargetId}", but that graph has no positive on-chain id. ` +
-                `Pass a positive numeric context graph id or register the target first.`,
-            });
-          }
-          resolvedPublishContextGraphId = String(onChainId);
-        }
-      }
-      const result = await tracker.trackPhase(ctx, "read-shared-memory", () =>
-        agent.publishFromSharedMemory(resolvedContextGraphId, sel, {
-          clearSharedMemoryAfter: clearAfter ?? true,
-          operationCtx: ctx,
-          subGraphName,
-          ...(resolvedPublishContextGraphId != null
-            ? { contextGraphId: resolvedPublishContextGraphId }
-            : {}),
-          ...(resolvedPublisherIdentityOverride !== undefined
-            ? { publisherNodeIdentityIdOverride: resolvedPublisherIdentityOverride }
-            : {}),
-          ...(resolvedAuthorAgentAddress != null
-            ? { authorAgentAddress: resolvedAuthorAgentAddress }
-            : {}),
-          ...(resolvedPreSignedAttestation != null
-            ? { preSignedAuthorAttestation: resolvedPreSignedAttestation }
-            : {}),
-        }),
+      const basePublishOptions = {
+        operationCtx: ctx,
+        subGraphName,
+        ...(resolvedPublishContextGraphId != null
+          ? { contextGraphId: resolvedPublishContextGraphId }
+          : {}),
+        ...(resolvedPublisherIdentityOverride !== undefined
+          ? { publisherNodeIdentityIdOverride: resolvedPublisherIdentityOverride }
+          : {}),
+        ...(resolvedAuthorAgentAddress != null
+          ? { authorAgentAddress: resolvedAuthorAgentAddress }
+          : {}),
+        ...(resolvedPreSignedAttestation != null
+          ? { preSignedAuthorAttestation: resolvedPreSignedAttestation }
+          : {}),
+      };
+
+      const result = await tracker.trackPhase(ctx, "publish-root", () =>
+        agent.publishFromSharedMemory(
+          resolvedContextGraphId,
+          { rootEntities: [publishRootEntities[0]] },
+          {
+            ...basePublishOptions,
+            clearSharedMemoryAfter: clearAfter ?? true,
+          },
+        ),
       );
+
       const chain = result.onChainResult;
       if (chain) {
         tracker.setCost(ctx, {
@@ -1826,11 +1927,11 @@ WHERE {
       }
       const publicTripleCount = Array.isArray(result.publicQuads)
         ? result.publicQuads.length
-        : undefined;
+        : 0;
       const rootCount = Array.isArray(result.kaManifest)
         ? result.kaManifest.length
-        : undefined;
-      tracker.complete(ctx, { tripleCount: publicTripleCount ?? rootCount ?? 0 });
+        : 0;
+      tracker.complete(ctx, { tripleCount: publicTripleCount || rootCount });
       const clearSharedMemoryAfter = clearAfter ?? true;
       const publishedSwmCleaned = result.status === "confirmed";
       emitMemoryGraphChanged?.({
@@ -1864,18 +1965,7 @@ WHERE {
         emitNotification?.({ contextGraphId: resolvedContextGraphId, type: "assertion_activity" });
       } catch { /* never break the publish path */ }
       const httpStatus = result.contextGraphError ? 207 : 200;
-      return jsonResponse(res, httpStatus, {
-        kaId: String(result.kaId),
-        status: result.status,
-        kas: result.kaManifest.map((ka: any) => ({ tokenId: String(ka.tokenId), rootEntity: ka.rootEntity })),
-        ...(chain && { txHash: chain.txHash, blockNumber: chain.blockNumber }),
-        ...(resolvedPublishContextGraphId != null
-          ? { publishContextGraphId: String(resolvedPublishContextGraphId) }
-          : {}),
-        ...(result.contextGraphError
-          ? { contextGraphError: result.contextGraphError }
-          : {}),
-      });
+      return jsonResponse(res, httpStatus, publishResponsePayload(result, resolvedPublishContextGraphId));
     } catch (err) {
       tracker.fail(ctx, err);
       throw err;

@@ -95,6 +95,20 @@ function responseBody(ctx: RequestContext): Record<string, unknown> {
   return JSON.parse((ctx.res as unknown as { body: string }).body) as Record<string, unknown>;
 }
 
+function createSwmStore(rootEntities: string[]) {
+  return {
+    query: vi.fn(async () => ({
+      type: 'quads',
+      quads: rootEntities.map((root) => ({
+        subject: root,
+        predicate: 'urn:p',
+        object: 'urn:o',
+        graph: 'did:dkg:context-graph:project-a/_shared_memory',
+      })),
+    })),
+  };
+}
+
 describe('daemon memory_graph_changed route emissions', () => {
   it('emits metadata-only SWM refresh events after shared-memory writes', async () => {
     const emitMemoryGraphChanged = vi.fn();
@@ -395,13 +409,14 @@ describe('daemon memory_graph_changed route emissions', () => {
       ],
     });
     const getContextGraphOnChainId = vi.fn().mockResolvedValue('7');
+    const store = createSwmStore(['urn:root']);
     const ctx = createContext('/api/shared-memory/publish', {
       contextGraphId: 'project-a',
       subGraphName: 'notes',
       selection: ['urn:root'],
       clearAfter: false,
     }, {
-      agent: { publishFromSharedMemory, getContextGraphOnChainId } as unknown as RequestContext['agent'],
+      agent: { publishFromSharedMemory, getContextGraphOnChainId, store } as unknown as RequestContext['agent'],
       emitMemoryGraphChanged,
     });
 
@@ -426,6 +441,74 @@ describe('daemon memory_graph_changed route emissions', () => {
     expect(ctx.tracker.complete).toHaveBeenCalledWith(expect.anything(), { tripleCount: 2 });
   });
 
+  it('preflights explicit SWM roots and skips stale selections before publishing', async () => {
+    const store = createSwmStore(['urn:root:present']);
+    const publishFromSharedMemory = vi.fn().mockResolvedValue({
+      kaId: 'kc-1',
+      status: 'confirmed',
+      kaManifest: [{ tokenId: 1n, rootEntity: 'urn:root:present' }],
+      publicQuads: [{ subject: 'urn:root:present', predicate: 'urn:p', object: 'urn:o', graph: 'urn:g' }],
+    });
+    const getContextGraphOnChainId = vi.fn().mockResolvedValue('7');
+    const ctx = createContext('/api/shared-memory/publish', {
+      contextGraphId: 'project-a',
+      selection: ['urn:root:present', 'urn:root:missing', 'not an iri', 'urn:root:present'],
+    }, {
+      agent: { publishFromSharedMemory, getContextGraphOnChainId, store } as unknown as RequestContext['agent'],
+    });
+
+    await handleMemoryRoutes(ctx);
+
+    expect((ctx.res as unknown as { statusCode: number }).statusCode).toBe(200);
+    expect(store.query).toHaveBeenCalledTimes(1);
+    expect(publishFromSharedMemory).toHaveBeenCalledTimes(1);
+    expect(publishFromSharedMemory.mock.calls[0][1]).toEqual({ rootEntities: ['urn:root:present'] });
+  });
+
+  it('rejects multi-root synchronous SWM publishes before any root is published', async () => {
+    const store = {
+      query: vi.fn(async () => ({
+        type: 'quads',
+        quads: [
+          { subject: 'urn:root:a', predicate: 'urn:p', object: '"A"', graph: 'did:dkg:context-graph:project-a/_shared_memory' },
+          { subject: 'urn:root:b', predicate: 'urn:p', object: '"B"', graph: 'did:dkg:context-graph:project-a/_shared_memory' },
+          {
+            subject: 'urn:root:owner-only',
+            predicate: 'http://dkg.io/ontology/workspaceOwner',
+            object: '"peer-test"',
+            graph: 'did:dkg:context-graph:project-a/_shared_memory',
+          },
+        ],
+      })),
+    };
+    const publishFromSharedMemory = vi.fn();
+    const getContextGraphOnChainId = vi.fn().mockResolvedValue(null);
+    const registerContextGraph = vi.fn();
+    const ctx = createContext('/api/shared-memory/publish', {
+      contextGraphId: 'project-a',
+      selection: 'all',
+      clearAfter: true,
+    }, {
+      agent: {
+        publishFromSharedMemory,
+        getContextGraphOnChainId,
+        registerContextGraph,
+        store,
+      } as unknown as RequestContext['agent'],
+    });
+
+    await handleMemoryRoutes(ctx);
+
+    expect((ctx.res as unknown as { statusCode: number }).statusCode).toBe(409);
+    expect(getContextGraphOnChainId).not.toHaveBeenCalled();
+    expect(registerContextGraph).not.toHaveBeenCalled();
+    expect(publishFromSharedMemory).not.toHaveBeenCalled();
+    expect(responseBody(ctx)).toMatchObject({
+      code: 'MULTI_ROOT_PUBLISH_NOT_ATOMIC',
+      rootEntities: ['urn:root:a', 'urn:root:b'],
+    });
+  });
+
   it('keeps implicit same-graph publishes out of the remap path', async () => {
     const publishFromSharedMemory = vi.fn().mockResolvedValue({
       kaId: 'kc-1',
@@ -434,11 +517,12 @@ describe('daemon memory_graph_changed route emissions', () => {
       publicQuads: [{ subject: 'urn:root', predicate: 'urn:p', object: 'urn:o', graph: 'urn:g' }],
     });
     const getContextGraphOnChainId = vi.fn().mockResolvedValue('7');
+    const store = createSwmStore(['urn:root']);
     const ctx = createContext('/api/shared-memory/publish', {
       contextGraphId: 'project-a',
       selection: ['urn:root'],
     }, {
-      agent: { publishFromSharedMemory, getContextGraphOnChainId } as unknown as RequestContext['agent'],
+      agent: { publishFromSharedMemory, getContextGraphOnChainId, store } as unknown as RequestContext['agent'],
     });
 
     await handleMemoryRoutes(ctx);
@@ -456,12 +540,13 @@ describe('daemon memory_graph_changed route emissions', () => {
       publicQuads: [{ subject: 'urn:root', predicate: 'urn:p', object: 'urn:o', graph: 'urn:g' }],
     });
     const getContextGraphOnChainId = vi.fn().mockResolvedValue('7');
+    const store = createSwmStore(['urn:root']);
     const ctx = createContext('/api/shared-memory/publish', {
       contextGraphId: 'project-a',
       publishContextGraphId: '7',
       selection: ['urn:root'],
     }, {
-      agent: { publishFromSharedMemory, getContextGraphOnChainId } as unknown as RequestContext['agent'],
+      agent: { publishFromSharedMemory, getContextGraphOnChainId, store } as unknown as RequestContext['agent'],
     });
 
     await handleMemoryRoutes(ctx);
@@ -483,6 +568,7 @@ describe('daemon memory_graph_changed route emissions', () => {
     const getContextGraphOnChainId = vi.fn(async (contextGraphId: string) =>
       contextGraphId === 'target-cg' ? '42' : '7',
     );
+    const store = createSwmStore(['urn:root']);
     const listContextGraphs = vi.fn(async () => [
       { id: 'project-a', uri: 'did:dkg:context-graph:project-a', name: 'Project A', subscribed: true, synced: true },
       { id: 'target-cg', uri: 'did:dkg:context-graph:target-cg', name: 'Target CG', subscribed: true, synced: false },
@@ -496,6 +582,7 @@ describe('daemon memory_graph_changed route emissions', () => {
         publishFromSharedMemory,
         getContextGraphOnChainId,
         listContextGraphs,
+        store,
       } as unknown as RequestContext['agent'],
     });
 

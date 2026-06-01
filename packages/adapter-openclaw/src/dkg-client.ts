@@ -946,11 +946,11 @@ export class DkgDaemonClient {
   }
 
   /**
-   * Final canonical-flow step: publish the current contents of a context graph's
-   * Shared Working Memory to Verified Memory (on-chain) and clear SWM. The daemon
-   * route accepts `selection` as either the literal `"all"` or an array of root
-   * entity URIs — this wrapper exposes the latter as a friendlier `rootEntities`
-   * option and translates the omit-case to `"all"` server-side.
+   * Final canonical-flow step: publish a single root from a context graph's
+   * Shared Working Memory to Verified Memory (on-chain). The daemon route
+   * accepts `selection` as either the literal `"all"` or an array of root entity
+   * URIs, but V10 synchronous publish only proceeds when that selection resolves
+   * to exactly one publishable root.
    *
    * Returns the daemon's publish descriptor: `{ kaId, status, kas: [{tokenId, rootEntity}],
    * txHash?, blockNumber?, ... }`.
@@ -962,8 +962,9 @@ export class DkgDaemonClient {
     const cgId = normalizeContextGraphId(contextGraphId);
     // Default `clearAfter` to `false` for subset publishes so unpublished root
     // entities aren't dropped from SWM as a side-effect of publishing a few.
-    // Full-publish callers (rootEntities omitted) keep the "publish + clear"
-    // semantic. Explicit `clearAfter` on the opts always wins.
+    // Omitted rootEntities still maps to `"all"` for compatibility, but the
+    // daemon rejects it if SWM currently contains more than one publishable root.
+    // Explicit `clearAfter` on the opts always wins.
     const hasSubset = Array.isArray(opts?.rootEntities) && opts!.rootEntities!.length > 0;
     const clearAfter = opts?.clearAfter ?? !hasSubset;
     return this.post('/api/shared-memory/publish', {

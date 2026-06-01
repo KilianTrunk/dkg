@@ -1181,6 +1181,31 @@ export interface ChainAdapter {
   getKAContextGraphId?(kaId: bigint): Promise<bigint>;
 
   /**
+   * Number of Knowledge Assets registered to `contextGraphId`, sourced from
+   * `ContextGraphStorage.getContextGraphKCCount(uint256)` (the length of the
+   * ordered `_contextGraphKAList[cgId]` push-append array).
+   *
+   * This count is the **per-CG registration ordinal** — a dense, monotonic,
+   * comparable integer that the chain-driven VM reconciler uses as its cursor
+   * key (Phase B). It is the on-chain "head" for a CG: a node has reconciled
+   * up to ordinal `N` means it has promoted the first `N` registered KAs.
+   *
+   * Returns `0n` for a CG with no registered KAs (or an unknown CG — the
+   * Solidity default-zero array length). Optional so non-V10 / no-chain
+   * adapters can omit the surface.
+   */
+  getContextGraphKCCount?(contextGraphId: bigint): Promise<bigint>;
+
+  /**
+   * The `kaId` registered at ordinal `index` within `contextGraphId`, sourced
+   * from `ContextGraphStorage.getContextGraphKCAt(uint256,uint256)`. `index`
+   * is 0-based and MUST be `< getContextGraphKCCount(contextGraphId)` (the
+   * Solidity read reverts on out-of-range). Pairs with the count read to walk
+   * a CG's registration sequence ordinal-by-ordinal during a reconcile sweep.
+   */
+  getContextGraphKCAt?(contextGraphId: bigint, index: bigint): Promise<bigint>;
+
+  /**
    * On-chain access policy for `contextGraphId`. Read from
    * `ContextGraphStorage.getAccessPolicy(uint256)`. Returns the
    * Solidity enum value: `0` = public/discoverable, `1` = private/curated.

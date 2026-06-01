@@ -1391,6 +1391,22 @@ export class MockChainAdapter implements ChainAdapter {
     });
   }
 
+  /**
+   * Test helper (Phase B): emit a `KnowledgeAssetRegisteredToContextGraph`
+   * event for an already-recorded KA so the chain-driven reconciler's
+   * live-event + ordinal-sweep paths can be exercised against the mock.
+   * The KA must already exist in `collections` (via `__registerKC` /
+   * `createKnowledgeAssets`) so the ordinal reads stay coherent.
+   */
+  __emitKARegisteredToContextGraph(contextGraphId: bigint, kaId: bigint): void {
+    this.pushEvent('KnowledgeAssetRegisteredToContextGraph', {
+      contextGraphId: contextGraphId.toString(),
+      kaId: kaId.toString(),
+      txHash: `0x${kaId.toString(16).padStart(64, '0')}`,
+      txIndex: 0,
+    });
+  }
+
   /** Test helper: force the next createChallenge to revert with a typed retry-next-period error. */
   __forceNoEligible(kind: 'cg' | 'kc' | 'none'): void {
     this.rsForcedRevert = kind === 'cg' ? 'no-cg' : kind === 'kc' ? 'no-kc' : 'none';
@@ -1584,6 +1600,31 @@ export class MockChainAdapter implements ChainAdapter {
   async getKAContextGraphId(kaId: bigint): Promise<bigint> {
     const entry = this.collections.get(kaId);
     return entry?.cgId ?? 0n;
+  }
+
+  /**
+   * Per-CG registration ordinal reads (Phase B cursor key). `collections` is
+   * keyed by kaId and iterated in insertion order, so filtering by cgId
+   * reproduces the on-chain `_contextGraphKAList[cgId]` push-append order.
+   */
+  async getContextGraphKCCount(contextGraphId: bigint): Promise<bigint> {
+    let count = 0n;
+    for (const entry of this.collections.values()) {
+      if (entry.cgId === contextGraphId) count += 1n;
+    }
+    return count;
+  }
+
+  async getContextGraphKCAt(contextGraphId: bigint, index: bigint): Promise<bigint> {
+    let i = 0n;
+    for (const [kaId, entry] of this.collections.entries()) {
+      if (entry.cgId !== contextGraphId) continue;
+      if (i === index) return kaId;
+      i += 1n;
+    }
+    throw new Error(
+      `Mock: getContextGraphKCAt out of range (cg=${contextGraphId} index=${index})`,
+    );
   }
 
   /**

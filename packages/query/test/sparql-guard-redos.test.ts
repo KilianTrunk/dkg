@@ -147,18 +147,9 @@ describe('CodeQL js/redos regression: bounded runtime on adversarial preambles',
     // legitimate preambles cleanly.
     const decls = Array.from({ length: 10_000 }, (_, i) => `PREFIX p${i}: <http://x.org/${i}/>`).join('\n');
     const input = decls + '\nSELECT * WHERE { ?s ?p ?o }';
-    // 10_000 > MAX_PREAMBLE_DECLARATIONS (1024), so the scanner caps
-    // out at the limit and the SELECT after decl 1024 will not be
-    // recognised. That is the documented contract — preambles beyond
-    // the cap are an abuse pattern. Assert UNKNOWN for the adversarial
-    // ceiling case, and assert SELECT for a sub-cap repeat.
     const ms = measure(input);
     expect(ms).toBeLessThan(500);
-    expect(detectSparqlQueryForm(input)).toBe('UNKNOWN');
-
-    const inputSubCap = Array.from({ length: 100 }, (_, i) => `PREFIX p${i}: <http://x.org/${i}/>`).join('\n')
-      + '\nSELECT * WHERE { ?s ?p ?o }';
-    expect(detectSparqlQueryForm(inputSubCap)).toBe('SELECT');
+    expect(detectSparqlQueryForm(input)).toBe('SELECT');
   });
 
   it('rejects single PREFIX with unterminated label (no colon) in linear time', () => {

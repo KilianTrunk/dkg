@@ -38,23 +38,17 @@ const MUTATING_PATTERN = new RegExp(
 //   1. consume one `PREFIX <label>:` or `BASE` declaration at a time
 //      via a small ANCHORED regex (no nested quantifiers — linear in
 //      the prefix length),
-//   2. cap the declaration count at MAX_PREAMBLE_DECLARATIONS to bound
-//      total work,
-//   3. then match the terminal query form with a separate anchored
+//   2. then match the terminal query form with a separate anchored
 //      regex.
 //
 // Each individual regex has no nested quantifier and can backtrack at
-// most O(len) per failed match. Total cost: O(n) where n = stripped
-// length, regardless of adversarial input shape.
+// most O(len) per failed match. Each successful preamble match consumes
+// bytes from the cursor, so total cost is O(n) where n = stripped length,
+// regardless of adversarial input shape.
 //
 // `stripLiteralsAndComments` runs upstream — it blanks IRI bodies and
 // comments to whitespace, so the preamble decls always end at `:` and
 // never need to skip across IRI angles inside this scanner.
-
-// SPARQL queries with thousands of preamble declarations are not a
-// legitimate workload — typical queries have ≤ 20. The cap is the
-// hard upper bound on iterations of the preamble scanner.
-const MAX_PREAMBLE_DECLARATIONS = 1024;
 
 // Each anchored regex matches at most ONE declaration's KEYWORD —
 // the trailing IRI body is already blanked to whitespace by
@@ -98,12 +92,13 @@ export type SparqlQueryForm = 'SELECT' | 'CONSTRUCT' | 'ASK' | 'DESCRIBE' | 'UNK
  * read-only query.
  *
  * Total work is O(n) in the stripped-input length, regardless of how
- * many decoy preamble decls an adversary packs in (capped at
- * `MAX_PREAMBLE_DECLARATIONS`). No backtracking explosion possible.
+ * many decoy preamble decls an adversary packs in. No backtracking
+ * explosion possible because every successful preamble match advances
+ * the cursor.
  */
 function scanReadOnlyForm(stripped: string): SparqlQueryForm {
   let cursor = stripped;
-  for (let i = 0; i < MAX_PREAMBLE_DECLARATIONS; i++) {
+  while (true) {
     const prefixHit = PREFIX_DECL.exec(cursor);
     if (prefixHit) {
       cursor = cursor.slice(prefixHit[0].length);

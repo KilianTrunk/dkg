@@ -10,7 +10,7 @@ import {
   publishSharedMemory, listSwmEntities, executeQuery,
   writeProfileQueryCatalog,
   fetchSubGraphs,
-  type AgentIdentity, type AssertionInfo, type PendingJoinRequest, type PublishResult, type SubGraphInfo,
+  type AgentIdentity, type AssertionInfo, type PendingJoinRequest, type PromoteOutcome, type PublishResult, type SubGraphInfo,
 } from '../../api.js';
 import { ImportFilesModal } from '../../components/Modals/ImportFilesModal.js';
 import { ShareProjectModal } from '../../components/Modals/ShareProjectModal.js';
@@ -3336,7 +3336,14 @@ export function VerifyOnDkgButton({
 }) {
   const profile = useProjectProfileContext();
   const [busy, setBusy] = useState(false);
-  const [result, setResult] = useState<PublishResult | { promotedCount: number } | null>(null);
+  // Codex review on #874 / #898 round 2 — promote results now flow
+  // through `describePromoteResult` so a `promotedCount === 0`
+  // response surfaces the same actionable hint the WMAssertionsPane
+  // shows ("had no triples to promote …"), and `ASSERTION_NOT_PERSISTED`
+  // surfaces the typed describePromoteError message instead of the
+  // raw "409 …" backend string. The promote branch stores a
+  // `PromoteOutcome`; the publish branch stores a `PublishResult`.
+  const [result, setResult] = useState<PublishResult | PromoteOutcome | null>(null);
   const [resultKind, setResultKind] = useState<'promote' | 'publish' | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -3399,6 +3406,7 @@ export function VerifyOnDkgButton({
     setError(null);
     setResult(null);
     setResultKind(action.kind);
+    const assertionName = sgBinding?.binding.sourceAssertion ?? 'assertion';
     try {
       if (action.kind === 'promote') {
         // PR #710 — `sgBinding.sourceAssertion` is itself
@@ -3413,20 +3421,28 @@ export function VerifyOnDkgButton({
           [entity.uri],
           sgBinding!.subGraph,
         );
-        setResult(r);
+        // Issue #864 — fan the promote response through the central
+        // describe helper so 0-count returns get an actionable hint
+        // instead of the misleading "Promoted 0 triples" toast.
+        setResult(describePromoteResult(assertionName, r));
       } else {
         const r = await publishSharedMemory(contextGraphId, [entity.uri]);
         setResult(r);
       }
       onVerified();
     } catch (err: any) {
-      setError(err?.message ?? 'Action failed');
+      // Issue #864 — `ASSERTION_NOT_PERSISTED` (HTTP 409) gets a
+      // typed message that points the user at the re-import path
+      // instead of the raw backend error string.
+      const typed = action.kind === 'promote' ? describePromoteError(assertionName, err) : null;
+      setError(typed ? typed.message : (err?.message ?? 'Action failed'));
     } finally {
       setBusy(false);
     }
   };
 
   const isPublishResult = (r: typeof result): r is PublishResult => !!r && 'status' in r;
+  const isPromoteOutcome = (r: typeof result): r is PromoteOutcome => !!r && 'kind' in r;
 
   return (
     <div className={`v10-ka-verify v10-ka-verify-${action.kind}`}>
@@ -3450,7 +3466,7 @@ export function VerifyOnDkgButton({
         </button>
       )}
       {error && <div className="v10-ka-verify-err">✕ {error}</div>}
-      {result && resultKind === 'promote' && !isPublishResult(result) && (
+      {result && resultKind === 'promote' && isPromoteOutcome(result) && result.kind === 'success' && (
         <div className="v10-ka-verify-ok">
           <div className="v10-ka-verify-ok-row">
             <span className="v10-ka-verify-ok-lbl">Promoted</span>
@@ -3462,6 +3478,13 @@ export function VerifyOnDkgButton({
             Refresh the entity to see the next step appear.
           </div>
         </div>
+      )}
+      {result && resultKind === 'promote' && isPromoteOutcome(result) && result.kind !== 'success' && (
+        // 0-count or not-persisted — surface the typed message as a
+        // warning, not a faux success. Mirrors the WMAssertionsPane's
+        // describePromoteResult/describePromoteError handling so the
+        // entity-level CTA stops misreporting empty promotes as "✓".
+        <div className="v10-ka-verify-err">! {result.message}</div>
       )}
       {result && resultKind === 'publish' && isPublishResult(result) && (() => {
         // OT-RFC-38 §1.1 — a publish without a TX hash never made it to chain.

@@ -1422,6 +1422,60 @@ describe('ensureV10ApproveTrac — per-publish (default) approval gate', () => {
 
     expect(sendSpy).not.toHaveBeenCalled();
   });
+
+  it('zero-cost publish (#720 floor kicked in) → emits the operator-facing warn', async () => {
+    // #871 observability: when `tokenAmount === 0n` and the policy lifts
+    // `targetAllowance` to the 1n floor, the adapter logs a single
+    // `console.warn` so operators inspecting on-chain allowance can
+    // recognise the resulting "1 wei dust" as the documented #720
+    // workaround instead of mistaking it for a stuck approval.
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { a, signer, sendSpy } = makeV10Adapter(undefined, 0n);
+
+    await (a as any).ensureV10ApproveTrac(
+      signer,
+      V10_KA_ADDRESS,
+      0n,
+      'approve V10 publish TRAC',
+    );
+
+    // Approve still fires (behaviour unchanged).
+    expect(sendSpy).toHaveBeenCalledTimes(1);
+    expect(getApproveCallArgs(sendSpy).args).toEqual([V10_KA_ADDRESS, 1n]);
+
+    // And the diagnostic warn fires exactly once with the expected wording.
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    const message = warnSpy.mock.calls[0][0] as string;
+    expect(message).toContain('V10 per-publish auto-approve floor');
+    expect(message).toContain('#720 transferFrom-minimum workaround');
+    expect(message).toContain('tokenAmount=0');
+  });
+
+  it('legitimate 1-wei publish → approves 1n WITHOUT emitting the #720 warn (Codex on PR #875)', async () => {
+    // Negative case for the warn guard. A `tokenAmount === 1n` publish
+    // produces `targetAllowance === 1n` under per-publish too, but the
+    // 1-wei is the real publish cost — NOT the #720 floor workaround.
+    // The warn line would mislead operators if it fired here, so the
+    // guard requires `tokenAmount === 0n` in addition to the
+    // `targetAllowance === 1n` check.
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { a, signer, sendSpy } = makeV10Adapter(undefined, 0n);
+
+    await (a as any).ensureV10ApproveTrac(
+      signer,
+      V10_KA_ADDRESS,
+      1n,
+      'approve V10 publish TRAC',
+    );
+
+    // Approve still fires for the genuine 1-wei publish.
+    expect(sendSpy).toHaveBeenCalledTimes(1);
+    expect(getApproveCallArgs(sendSpy).args).toEqual([V10_KA_ADDRESS, 1n]);
+
+    // But the floor-workaround warn must NOT fire (it would be a false
+    // positive — see PR #875 review thread).
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
 });
 
 describe('ensureV10ApproveTrac — replenishing policy (high-volume operator default)', () => {

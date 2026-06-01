@@ -1040,8 +1040,9 @@ export class DKGAgent {
    * matches what the membership-hash flow already implies sender-side,
    * and avoids the "queued package for epoch N replays after we've
    * rolled to N+1" footgun.
-   */
+  */
   private readonly pendingSenderKeyByAgent = new Map<string, PendingSenderKeyEntry[]>();
+  private readonly pendingSenderKeyDrainByAgent = new Map<string, Promise<number>>();
 
   private constructor(
     config: DKGAgentConfig,
@@ -6277,12 +6278,39 @@ export class DKGAgent {
     ctx?: OperationContext;
   }): Promise<number> {
     const recipientAgentAddress = input.recipientAgentAddress.toLowerCase();
+    const existingDrain = this.pendingSenderKeyDrainByAgent.get(recipientAgentAddress);
+    if (existingDrain) {
+      await existingDrain;
+      return 0;
+    }
+    const drain = this.drainPendingSenderKeyQueueForPeerLocked({
+      peerId: input.peerId,
+      recipientAgentAddress,
+      ctx: input.ctx,
+    });
+    this.pendingSenderKeyDrainByAgent.set(recipientAgentAddress, drain);
+    try {
+      return await drain;
+    } finally {
+      if (this.pendingSenderKeyDrainByAgent.get(recipientAgentAddress) === drain) {
+        this.pendingSenderKeyDrainByAgent.delete(recipientAgentAddress);
+      }
+    }
+  }
+
+  private async drainPendingSenderKeyQueueForPeerLocked(input: {
+    peerId: string;
+    recipientAgentAddress: string;
+    ctx?: OperationContext;
+  }): Promise<number> {
+    const recipientAgentAddress = input.recipientAgentAddress;
     const queue = this.pendingSenderKeyByAgent.get(recipientAgentAddress);
     if (!queue || queue.length === 0) return 0;
 
     let drained = 0;
     const remaining: PendingSenderKeyEntry[] = [];
-    for (const entry of queue) {
+    for (let i = 0; i < queue.length; i += 1) {
+      const entry = queue[i];
       try {
         const sendResult = await this.messenger.sendReliable(
           input.peerId,
@@ -6291,8 +6319,11 @@ export class DKGAgent {
           { messageId: this.swmSenderKeyPendingMessageId(entry) },
         );
         if (!sendResult.delivered) {
-          remaining.push(entry);
-          continue;
+          if (sendResult.queued || ('inFlight' in sendResult && sendResult.inFlight)) {
+            remaining.push(entry);
+            continue;
+          }
+          throw new Error(`Unexpected undelivered Sender Key retry result: ${sendResult.error}`);
         }
         let ack: ReturnType<typeof decodeSwmSenderKeyPackageAck>;
         try {
@@ -6328,8 +6359,22 @@ export class DKGAgent {
           // Terminal rejection: keep it out of the queue, but do not
           // report it as a successful drain.
         }
-      } catch {
-        remaining.push(entry);
+      } catch (err) {
+        remaining.push(...queue.slice(i));
+        if (remaining.length === 0) {
+          this.pendingSenderKeyByAgent.delete(recipientAgentAddress);
+        } else {
+          this.pendingSenderKeyByAgent.set(recipientAgentAddress, remaining);
+        }
+        await this.saveSwmSenderKeyState();
+        const message = err instanceof Error ? err.message : String(err);
+        this.log.warn(
+          input.ctx ?? SWM_SENDER_KEY_PENDING_DRAIN_LOG_CTX,
+          `SWM sender-key pending retry for ${entry.recipientAgentAddress} keyId=${entry.recipientKeyId} ` +
+          `peerId=${input.peerId} contextGraph=${entry.contextGraphId}${entry.subGraphName ? `/${entry.subGraphName}` : ''} ` +
+          `failed before the Messenger substrate queued a retry: ${message}`,
+        );
+        throw err;
       }
     }
 

@@ -781,6 +781,110 @@ describe('createAndDistributeSwmSenderKeyEpoch: missing-peerId soft success', ()
     expect(internals.pendingSenderKeyByAgent.size).toBe(1);
   });
 
+  it('serializes concurrent pending drains for the same recipient', async () => {
+    const boot = await bootAgent();
+    agent = boot.agent;
+    const internals = boot.internals;
+
+    installStubMessenger(internals, async () => {
+      throw new Error('initial no-peerId branch must not call sendReliable');
+    });
+    const recipient = makeFakeRecipient();
+    const sender = agentFromPrivateKey(
+      ethers.Wallet.createRandom().privateKey,
+      'sender',
+    ) as AgentKeyRecord & { privateKey: string };
+
+    await internals.createAndDistributeSwmSenderKeyEpoch({
+      contextGraphId: 'test-cg/drain-serialized',
+      sender,
+      recipients: [recipient],
+      membershipHash: 'sha256:drain-serialized',
+      ctx: { operationId: 'test-op', operationName: 'share' },
+    });
+    expect(internals.pendingSenderKeyByAgent.size).toBe(1);
+
+    const peerId = '12D3KooWSerializedDrainPeer';
+    installStubDiscovery(internals, () => ({
+      agentUri: `did:dkg:agent:${recipient.agentAddress.toLowerCase()}`,
+      name: 'drain-serialized-target',
+      peerId,
+      agentAddress: recipient.agentAddress,
+    }));
+
+    let releaseSend!: () => void;
+    let markSendStarted!: () => void;
+    const sendReleased = new Promise<void>((resolve) => { releaseSend = resolve; });
+    const sendStarted = new Promise<void>((resolve) => { markSendStarted = resolve; });
+    let sendCalls = 0;
+    installStubMessenger(internals, async (_peerId, _protocolId, _payload, opts): Promise<ReliableSendResult> => {
+      sendCalls += 1;
+      markSendStarted();
+      await sendReleased;
+      return {
+        delivered: true,
+        response: senderKeyAck(true),
+        attempts: 1,
+        messageId: opts?.messageId ?? 'm-drain-serialized',
+      };
+    });
+
+    const firstDrain = internals.drainPendingSenderKeyForPeer(peerId);
+    await sendStarted;
+    const secondDrain = internals.drainPendingSenderKeyForPeer(peerId);
+    releaseSend();
+
+    await expect(Promise.all([firstDrain, secondDrain])).resolves.toEqual([1, 0]);
+    expect(sendCalls).toBe(1);
+    expect(internals.pendingSenderKeyByAgent.size).toBe(0);
+  });
+
+  it('surfaces non-recoverable pending drain send failures instead of re-queuing silently', async () => {
+    const boot = await bootAgent();
+    agent = boot.agent;
+    const internals = boot.internals;
+
+    installStubMessenger(internals, async () => {
+      throw new Error('initial no-peerId branch must not call sendReliable');
+    });
+    const recipient = makeFakeRecipient();
+    const sender = agentFromPrivateKey(
+      ethers.Wallet.createRandom().privateKey,
+      'sender',
+    ) as AgentKeyRecord & { privateKey: string };
+
+    await internals.createAndDistributeSwmSenderKeyEpoch({
+      contextGraphId: 'test-cg/drain-nonrecoverable',
+      sender,
+      recipients: [recipient],
+      membershipHash: 'sha256:drain-nonrecoverable',
+      ctx: { operationId: 'test-op', operationName: 'share' },
+    });
+    expect(internals.pendingSenderKeyByAgent.size).toBe(1);
+
+    installStubDiscovery(internals, () => ({
+      agentUri: `did:dkg:agent:${recipient.agentAddress.toLowerCase()}`,
+      name: 'drain-nonrecoverable-target',
+      peerId: '12D3KooWNonRecoverableDrainPeer',
+      agentAddress: recipient.agentAddress,
+    }));
+    installStubMessenger(internals, async () => {
+      throw new Error('messenger substrate misconfigured');
+    });
+
+    const logs: Array<{ level: string; message: string }> = [];
+    Logger.setSink((entry) => logs.push({ level: entry.level, message: entry.message }));
+
+    await expect(
+      internals.drainPendingSenderKeyForPeer('12D3KooWNonRecoverableDrainPeer'),
+    ).rejects.toThrow('messenger substrate misconfigured');
+    expect(internals.pendingSenderKeyByAgent.size).toBe(1);
+    expect(logs).toContainEqual(expect.objectContaining({
+      level: 'warn',
+      message: expect.stringContaining('failed before the Messenger substrate queued a retry'),
+    }));
+  });
+
   it('keeps delivered stale-target rejections fatal because the package targets an obsolete key ID', async () => {
     const boot = await bootAgent();
     agent = boot.agent;

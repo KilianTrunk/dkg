@@ -6,12 +6,14 @@ import { useTabsStore } from '../stores/tabs.js';
 import { useProjectsStore, type ContextGraph } from '../stores/projects.js';
 import { useMyContextGraphs } from '../hooks/useMyContextGraphs.js';
 import { useMemoryEntities } from '../hooks/useMemoryEntities.js';
+import { useMemoryCounts } from './project/helpers.js';
 import { useNodeEvents } from '../hooks/useNodeEvents.js';
 import {
   canonicalAgentDid,
   normalizeAccessPolicy,
   type AgentSidebarIdentity,
 } from '../lib/contextGraphSidebar.js';
+import { formatEth, formatEthTooltip } from '../lib/formatEth.js';
 
 // Single user-facing description shown inside the My Context Graphs
 // card (one line, no separate footnote — round-2 feedback: the split
@@ -340,15 +342,31 @@ function CgRow({
     const subjects = new Set(mem.allTriples.map((t) => t.subject)).size;
     return { wm: mem.counts.wm, swm: mem.counts.swm, vm: mem.counts.vm, total: subjects };
   }, [mem.error, mem.allTriples, mem.counts.wm, mem.counts.swm, mem.counts.vm, summaryAssets]);
-  const triples: LayerCounts = useMemo(() => {
-    let wm = 0, swm = 0, vm = 0;
-    for (const t of mem.allTriples) {
-      if (t.layer === 'working') wm++;
-      else if (t.layer === 'shared') swm++;
-      else if (t.layer === 'verified') vm++;
-    }
-    return { wm, swm, vm, total: mem.allTriples.length };
-  }, [mem.allTriples]);
+  // GH #819 — counts derive from canonical/per-layer admission rules
+  // (residue + SPO dedup) instead of raw `mem.allTriples`. Per-layer
+  // cells use the OR-rule (drop if subject OR resource-object moved
+  // past t.layer); total uses the canonical AND-rule (drop only
+  // when BOTH moved). Pre-#819 this iterated `mem.allTriples`
+  // directly and inflated both numbers via SWM cross-graph SPO
+  // duplicates + post-promote WM residue.
+  //
+  // GH #881 (post-#847) — single fused pass via `useMemoryCounts`
+  // replaces 3× `useLayerTriples` + 1× `useCanonicalTriples` (4
+  // iterations) with one. Same numbers, ~4× less work per `CgRow`
+  // — meaningful on many-CG dashboards.
+  //
+  // CONTRACT: `wm + swm + vm ≤ total` on Dashboard. The gap is the
+  // count of mixed-layer edges (one endpoint at t.layer, other
+  // moved past) that canonical keeps but per-layer slices drop.
+  // Restoring strict equality would require migrating LayerStats
+  // consumers off the OR-rule — out of GH #819 / #881 scope.
+  const memCounts = useMemoryCounts(mem);
+  const triples: LayerCounts = useMemo(() => ({
+    wm: memCounts.wm,
+    swm: memCounts.swm,
+    vm: memCounts.vm,
+    total: memCounts.canonical,
+  }), [memCounts]);
 
   const sig = [
     mem.loading ? 1 : 0, mem.error ? 1 : 0, mem.partial ? 1 : 0, agentsLoading ? 1 : 0, agentsError ? 1 : 0, isPublicCg ? 1 : 0,
@@ -782,7 +800,12 @@ export function DashboardView() {
                 <div key={b.address} className="v10-ws-wrow">
                   <span className="v10-ws-addr" title={b.address}>{shortAddr(b.address)}</span>
                   <span className="v10-ws-bal">{fmtTrac(b.trac)}</span>
-                  <span className="v10-ws-bal-sec">{b.eth}</span>
+                  {/* Route gas balance through formatEth — raw `b.eth`
+                      from the daemon is e.g. "0.040583524997839496",
+                      which crowds the column and is unreadable. The
+                      tooltip surfaces the full-precision value for
+                      anyone who actually wants the exact wei (BUG-006/009). */}
+                  <span className="v10-ws-bal-sec" title={formatEthTooltip(b.eth)}>{formatEth(b.eth)}</span>
                 </div>
               ))}
             </div>

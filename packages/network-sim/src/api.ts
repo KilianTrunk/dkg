@@ -97,7 +97,7 @@ export async function publishKA(
     },
   );
   const published = await post<{
-    kcId: string;
+    kaId: string;
     status: string;
     kas: Array<{ tokenId: string; rootEntity: string }>;
     txHash?: string;
@@ -139,11 +139,13 @@ export async function share(
 export async function publishFromSharedMemory(
   nodeId: number,
   contextGraphId: string,
+  // "all" is compatibility shorthand only; V10 synchronous publish rejects it
+  // unless the source SWM resolves to exactly one publishable root.
   selection: 'all' | { rootEntities: string[] } = 'all',
   clearAfter = true,
 ) {
   return post<{
-    kcId: string;
+    kaId: string;
     status: string;
     kas: Array<{ tokenId: string; rootEntity: string }>;
     txHash?: string;

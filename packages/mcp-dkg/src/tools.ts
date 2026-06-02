@@ -15,7 +15,7 @@
  */
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import type { DkgClient } from './client.js';
+import type { DkgClient, ProjectRow } from './client.js';
 import type { DkgConfig } from './config.js';
 import {
   NS,
@@ -26,6 +26,7 @@ import {
   escapeSparqlLiteral,
   prettyTerm,
 } from './sparql.js';
+import { EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION } from './tools/context-graph-description.js';
 
 type ToolResult = {
   content: Array<{ type: 'text'; text: string }>;
@@ -58,6 +59,21 @@ const projectErr = (): ToolResult =>
     'No project specified. Either pass `projectId` to this tool, set `DKG_PROJECT` in the environment, or pin `contextGraph:` in `.dkg/config.yaml`.',
   );
 
+function contextGraphBelongsToCaller(row: ProjectRow): boolean {
+  if (row.isSystem === true) return false;
+  if (row.callerInvolved === true) return true;
+  if (row.callerInvolved === false) return false;
+  const role = typeof row.role === 'string' ? row.role.trim().toLowerCase() : '';
+  if (['curator', 'creator', 'owner', 'participant', 'member'].includes(role)) return true;
+  // Older daemons did not include callerInvolved. Preserve compatibility by
+  // leaving those unscoped rows visible instead of hiding everything.
+  return true;
+}
+
+function filterContextGraphsForScope(rows: ProjectRow[], scope: 'mine' | 'all'): ProjectRow[] {
+  return scope === 'all' ? rows : rows.filter(contextGraphBelongsToCaller);
+}
+
 export function registerReadTools(
   server: McpServer,
   client: DkgClient,
@@ -73,15 +89,20 @@ export function registerReadTools(
       // terminology); the follow-up sentence is the existing
       // mcp-dkg per-row payload notes.
       description:
-        "List all context graphs the node knows about (called 'projects' " +
-        'in the DKG node UI). Returns id, display name, role (curator / ' +
-        'participant), and layer. The first call most agents make when ' +
-        'joining a workspace.',
-      inputSchema: {},
+        "List context graphs (called 'projects' in the DKG node UI). " +
+        "Defaults to this caller's created/joined context graphs so agents " +
+        'do not have to sift through noisy discovered public graphs. Pass ' +
+        'scope: "all" to inspect every known graph.',
+      inputSchema: {
+        scope: z
+          .enum(['mine', 'all'])
+          .optional()
+          .describe('Defaults to "mine" (created/joined context graphs for this caller). Use "all" for every known graph.'),
+      },
     },
-    async (): Promise<ToolResult> => {
+    async ({ scope = 'mine' }): Promise<ToolResult> => {
       try {
-        const rows = await client.listProjects();
+        const rows = filterContextGraphsForScope(await client.listProjects(), scope);
         if (!rows.length) return ok('No context graphs found on this DKG node.');
         const pinned = config.defaultProject;
         const table = rows
@@ -97,7 +118,8 @@ export function registerReadTools(
         const hint = pinned
           ? `\n\n★ pinned in .dkg/config.yaml — other tools default to this context graph.`
           : '';
-        return ok(`Found ${rows.length} context graph(s):\n\n${table}${hint}`);
+        const scopeLabel = scope === 'mine' ? 'created/joined' : 'known';
+        return ok(`Found ${rows.length} context graph(s) (${scopeLabel}):\n\n${table}${hint}`);
       } catch (e) {
         return err(`Failed to list context graphs: ${formatError(e)}`);
       }
@@ -115,7 +137,10 @@ export function registerReadTools(
         'to figure out what kind of knowledge the context graph exposes ' +
         'before querying.',
       inputSchema: {
-        projectId: z.string().optional().describe('contextGraphId; defaults to .dkg/config.yaml'),
+        projectId: z
+          .string()
+          .optional()
+          .describe(`${EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION} Defaults to .dkg/config.yaml.`),
       },
     },
     async ({ projectId }): Promise<ToolResult> => {
@@ -163,11 +188,16 @@ export function registerReadTools(
         'just write `SELECT ?d WHERE { ?d a decisions:Decision }`. Scope ' +
         'with `view` — "working-memory" (default, private), ' +
         '"shared-working-memory" (team), or "verified-memory" (on-chain). ' +
+        '`contextGraphId` and `view` are authoritative: local `GRAPH ?g` ' +
+        'patterns are constrained to that resolved graph set. ' +
         'Set `includeSharedMemory: true` alongside `view: "working-memory"` ' +
         'to query WM ∪ SWM in one call.',
       inputSchema: {
         sparql: z.string().describe('SPARQL query body. Prefixes are auto-injected.'),
-        projectId: z.string().optional().describe('contextGraphId; defaults to .dkg/config.yaml'),
+        projectId: z
+          .string()
+          .optional()
+          .describe(`${EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION} Defaults to .dkg/config.yaml.`),
         subGraphName: z.string().optional().describe('Limit the query to a single sub-graph'),
         view: z
           .enum(['working-memory', 'shared-working-memory', 'verified-memory'])
@@ -214,7 +244,10 @@ export function registerReadTools(
         'task, file, or PR end-to-end.',
       inputSchema: {
         uri: z.string().describe('Entity URI (e.g. urn:dkg:decision:shacl-on-vm-promotion)'),
-        projectId: z.string().optional().describe('contextGraphId; defaults to .dkg/config.yaml'),
+        projectId: z
+          .string()
+          .optional()
+          .describe(`${EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION} Defaults to .dkg/config.yaml.`),
         view: z
           .enum(['working-memory', 'shared-working-memory', 'verified-memory'])
           .optional()

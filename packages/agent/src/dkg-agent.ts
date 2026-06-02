@@ -1,7 +1,8 @@
+import { createHash, randomUUID } from 'node:crypto';
 import {
   DKGNode, ProtocolRouter, GossipSubManager, TypedEventBus, DKGEvent,
   LibP2PNetwork, PeerResolver, StubNetworkStateRegistry,
-  PROTOCOL_ACCESS, PROTOCOL_PUBLISH, PROTOCOL_SYNC, PROTOCOL_QUERY_REMOTE, PROTOCOL_STORAGE_ACK, PROTOCOL_VERIFY_PROPOSAL, PROTOCOL_JOIN_REQUEST,
+  PROTOCOL_ACCESS, PROTOCOL_PUBLISH, PROTOCOL_SYNC, PROTOCOL_QUERY_REMOTE, PROTOCOL_STORAGE_ACK, PROTOCOL_STORAGE_ACK_V2, PROTOCOL_GET_CIPHERTEXT_CHUNK, PROTOCOL_VERIFY_PROPOSAL, PROTOCOL_JOIN_REQUEST,
   PROTOCOL_SWM_SENDER_KEY, PROTOCOL_SWM_UPDATE, PROTOCOL_SWM_SHARE_ACK, PROTOCOL_SWM_HOST_CATCHUP, PROTOCOL_MESSAGE,
   contextGraphPublishTopic, contextGraphWorkspaceTopic, contextGraphAppTopic, contextGraphUpdateTopic, contextGraphFinalizationTopic,
   contextGraphDataGraphUri, contextGraphMetaGraphUri, contextGraphWorkspaceGraphUri, contextGraphWorkspaceMetaGraphUri,
@@ -38,6 +39,7 @@ import {
   encodeWorkspaceEncryptionKey,
   workspaceAgentEncryptionKeyId,
   SWM_SENDER_KEY_PACKAGE_ACK_TYPE,
+  SWM_SENDER_KEY_PACKAGE_ACK_RETRYABLE_REASON_CODES,
   SWM_SENDER_KEY_PACKAGE_VERSION,
   computeSwmSenderKeyMembershipHash,
   computeSwmSenderKeyPackageAAD,
@@ -61,6 +63,7 @@ import {
   SWM_SENDER_KEY_SKIPPED_MESSAGE_CACHE_LIMIT,
   type DKGNodeConfig, type OperationContext, type GetView, type AssertionDescriptor, type AssertionEvent, type AssertionState,
   type SwmSenderKeyMessageMsg,
+  type SwmSenderKeyPackageAckReasonCode,
   type SwmSenderKeyPackageMsg,
   type WorkspaceRecipientEncryptionKey,
   InMemoryMessageIdempotencyStore,
@@ -69,9 +72,19 @@ import {
   type ProtocolOutboxStore,
   type ProtocolOutboxEntry,
   encryptV10PublishPayload,
+  encryptChunked,
+  buildCiphertextChunksRoot,
+  computeGossipSigningPayloadV2,
+  GOSSIP_TYPE_WORKSPACE_PUBLISH_CHUNKED,
+  ciphertextChunkStoreGraph,
+  ciphertextChunkStoreSubject,
+  CIPHERTEXT_CHUNK_PREDICATE,
+  type SubscriptionSource,
+  SUBSCRIPTION_SOURCES,
+  pickNetworkTunables,
 } from '@origintrail-official/dkg-core';
 import { GraphManager, PrivateContentStore, createTripleStore, type TripleStore, type TripleStoreConfig, type Quad, type LargeLiteralStorageConfig } from '@origintrail-official/dkg-storage';
-import { EVMChainAdapter, NoChainAdapter, enrichEvmError, type EVMAdapterConfig, type ChainAdapter, type CreateContextGraphParams, type CreateOnChainContextGraphParams, type CreateOnChainContextGraphResult, type TxResult, type V10PublishingConvictionAccountInfo } from '@origintrail-official/dkg-chain';
+import { EVMChainAdapter, NoChainAdapter, enrichEvmError, isRetryableRpcError, buildKnowledgeAssetUal, type EVMAdapterConfig, type ChainAdapter, type CreateContextGraphParams, type CreateOnChainContextGraphParams, type CreateOnChainContextGraphResult, type TxResult, type V10PublishingConvictionAccountInfo } from '@origintrail-official/dkg-chain';
 import {
   DKGPublisher, PublishHandler, SharedMemoryHandler, UpdateHandler, ChainEventPoller, AccessHandler, AccessClient,
   PublishJournal, StaleWriteError,
@@ -84,12 +97,18 @@ import {
   validateLiftPublishPayload,
   subtractFinalizedExactQuads,
   TripleStoreAsyncLiftPublisher,
+  TripleStoreAsyncPromoteQueue,
   FileWorkspacePublicSnapshotStore,
   parseWorkspacePublicSnapshotNQuads,
+  type AsyncPromoteQueue, type AsyncPromoteQueueConfig,
+  type PromoteJob, type PromoteListFilter,
+  wrapAsRpcPreconditionIfApplicable,
   type PublishOptions, type PublishResult, type PhaseCallback, type KAMetadata, type CASCondition,
   type CollectedACK, type LiftAuthorityProof, type LiftTransitionType,
   type LiftRequest, type LiftRequestAuthorSeal,
   type WorkspaceAgentRecipient,
+  type WorkspaceAgentRecipientResolution,
+  type WorkspaceAgentRecipientResolverInput,
   type WorkspaceSenderKeyEncryptInput,
   type SharedMemoryPublicSnapshotStorageConfig, type WorkspacePublicSnapshotStore,
 } from '@origintrail-official/dkg-publisher';
@@ -107,7 +126,7 @@ import { ProfileManager } from './profile-manager.js';
 import { DiscoveryClient, type SkillSearchOptions, type DiscoveredAgent, type DiscoveredOffering } from './discovery.js';
 import { MessageHandler, type SkillHandler, type SkillRequest, type SkillResponse, type ChatHandler, type ChatAclCheck } from './messaging.js';
 import { ed25519ToX25519Private, ed25519ToX25519Public } from './encryption.js';
-import { AGENT_REGISTRY_CONTEXT_GRAPH, canonicalAgentDidSubject, type AgentProfileConfig } from './profile.js';
+import { AGENT_REGISTRY_CONTEXT_GRAPH, canonicalAgentDidSubject, collectPublishableMultiaddrs, type AgentProfileConfig } from './profile.js';
 import {
   signAgentDelegation,
   verifyAgentDelegation,
@@ -161,8 +180,21 @@ import {
   mintSignedCatchupRequest,
   verifySignedCatchupRequest,
 } from './swm/host-catchup-sign.js';
+import {
+  createCiphertextChunkCatchupReplayGuard,
+  decodeCiphertextChunkCatchupRequest,
+  encodeCiphertextChunkCatchupRequest,
+  encodeCiphertextChunkCatchupResponse,
+  decodeCiphertextChunkCatchupResponse,
+  mintSignedCiphertextChunkCatchupRequest,
+  verifySignedCiphertextChunkCatchupRequest,
+  CIPHERTEXT_CHUNK_CATCHUP_WIRE_VERSION,
+  type CiphertextChunkCatchupRequest,
+  type CiphertextChunkCatchupResponse,
+} from './swm/ciphertext-chunk-catchup.js';
 import { waitForPeerProtocol } from './p2p/protocol-readiness.js';
 import { orderCatchupPeers } from './p2p/peer-selection.js';
+import { reconcileWarmCoreConnections, type WarmCoreAgent } from './p2p/warm-core-connections.js';
 import { fetchSyncPages, type SyncPageResult } from './sync/requester/page-fetch.js';
 import { getSyncCheckpointKey } from './sync/checkpoint/state.js';
 import { runDurableSync } from './sync/requester/durable-sync.js';
@@ -186,7 +218,9 @@ import {
   type WorkspaceEncryptionKeyEntry,
 } from './agent-keystore.js';
 import { GossipPublishHandler } from './gossip-publish-handler.js';
-import { FinalizationHandler } from './finalization-handler.js';
+import { FinalizationHandler, KEEP_ROOT_COPY_PREDICATE } from './finalization-handler.js';
+import { reconcileContextGraph, ReconcileCoalescer, RecentUalSet, type ChainReconcilerDeps, type OrdinalOutcome } from './chain-reconciler.js';
+import { createCursorState, type CursorState } from './reconcile-cursor.js';
 // rc.9 PR-10: JoinApprovalRetryQueue removed — substrate outbox
 // (durable, SQLite-backed) replaces it. We keep a minimal local
 // type alias so listPendingJoinApprovalRetries() retains its old
@@ -243,6 +277,13 @@ import {
   STORAGE_ACK_REGISTRATION_RETRY_MS,
   JOIN_APPROVAL_RETRY_TICK_MS,
   MESSAGE_OUTBOX_TICK_MS,
+  AGENT_PROFILE_HEARTBEAT_MS,
+  AGENT_PROFILE_STALE_THRESHOLD_MS,
+  WARM_CORE_CONNECTIONS_ENABLED,
+  WARM_CORE_RECONCILE_INTERVAL_MS,
+  WARM_CORE_MAX,
+  WARM_CORE_KEEPALIVE_TAG,
+  WARM_CORE_DIAL_TIMEOUT_MS,
 } from './dkg-agent-constants.js';
 import {
   ContextGraphNotFoundError,
@@ -252,6 +293,7 @@ import {
   type PreSignedAuthorAttestation,
   type LocalSwmSenderKeySendState,
   type LocalSwmSenderKeyReceiveState,
+  type PendingSenderKeyEntry,
   type RandomSamplingStartResult,
   type ACKSignerResolution,
   type SyncRequestEnvelope,
@@ -278,6 +320,7 @@ import {
   type DurableSyncResult,
   type SharedMemorySyncResult,
   type DKGAgentConfig,
+  type ReplicationEvent,
 } from './dkg-agent-types.js';
 import {
   normalizePublishContextGraphId,
@@ -307,8 +350,10 @@ import {
   swmReceiverStateKey,
   serializeSwmSenderSendState,
   serializeSwmSenderReceiveState,
+  serializePendingSenderKeyEntry,
   deserializeSwmSenderSendState,
   deserializeSwmSenderReceiveState,
+  deserializePendingSenderKeyEntry,
 } from './dkg-agent-swm-state.js';
 // Public surface re-exported so external consumers that import directly
 // from `./dkg-agent.js` keep working. The new file `dkg-agent-types.ts`
@@ -353,6 +398,171 @@ export type {
  *   const response = await agent.invokeSkill(offerings[0], inputData);
  *   await agent.stop();
  */
+/**
+ * OT-RFC-38 LU-11. Target ciphertext-chunk size on the SWM gossip
+ * wire. 32 KiB stays well under libp2p's per-message ceiling (the
+ * mesh defaults to 1 MiB) so chunks rarely fragment at the transport
+ * layer, and produces a tree shallow enough that on-chain proof
+ * verification per RFC-39 sampling tick stays cheap. The last chunk
+ * is whatever fraction remains.
+ */
+const CIPHERTEXT_CHUNK_SIZE_BYTES = 32 * 1024;
+
+/**
+ * Upper bound on the boot-time on-chain identity resolution
+ * (`getIdentityId` / `ensureProfile`) inside `start()`. Daemon HTTP
+ * readiness MUST NOT depend on chain-RPC reachability: `start()` is awaited
+ * before the daemon binds its HTTP listener (cli lifecycle.ts), so an
+ * unreachable or rate-limited (HTTP 429) RPC — which the multi-RPC failover
+ * loop retries across endpoints — would otherwise block boot past the CLI's
+ * 45s readiness ceiling (#894). When this bound trips, identity stays
+ * unresolved (0n): the node boots, HTTP serves, and on-chain writes (e.g.
+ * context-graph register) surface their own RPC error (503) at call time
+ * rather than hanging the whole daemon. Generous enough not to false-trip a
+ * healthy-but-slow chain, far below the 45s readiness window.
+ */
+const BOOT_CHAIN_IDENTITY_TIMEOUT_MS = 20_000;
+
+/**
+ * Floor for the (public, config-settable) StorageACK registration retry
+ * interval. Guards against a 0 / negative value collapsing the retry into a
+ * tight loop that hammers the RPC and floods the log (Codex PR #901 round-4
+ * :2106). 1s is well below the 30s production default yet leaves ample spacing.
+ */
+const MIN_STORAGE_ACK_REGISTRATION_RETRY_MS = 1_000;
+
+/**
+ * Resolve `op` but reject with a `BOOT_CHAIN_TIMEOUT`-coded error if it does
+ * not settle within `ms`. The timer is `unref`'d so it never keeps the
+ * process alive on its own. Used to bound boot-time chain calls so daemon
+ * readiness stays independent of chain-RPC reachability.
+ *
+ * When the timeout wins, `op` is still pending — the multi-RPC failover loop
+ * keeps retrying and will eventually reject (e.g. `RPC_ENDPOINTS_EXHAUSTED`).
+ * That late rejection has no awaiter once the race has settled, so we attach a
+ * no-op `.catch()` to the original promise to keep it from surfacing as an
+ * `unhandledRejection` and crashing the booted daemon.
+ */
+async function raceWithBootTimeout<T>(op: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  op.catch(() => {
+    /* swallow a late rejection from the abandoned op after the race settles */
+  });
+  try {
+    return await Promise.race<T>([
+      op,
+      new Promise<T>((_, reject) => {
+        timer = setTimeout(() => {
+          const err = new Error(`${label} timed out after ${ms}ms`);
+          (err as Error & { code?: string }).code = 'BOOT_CHAIN_TIMEOUT';
+          reject(err);
+        }, ms);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/**
+ * Is a boot-time chain-identity failure TRANSIENT (RPC unreachable / slow /
+ * rate-limited — recoverable by retrying once the chain is back) versus
+ * PERMANENT/deterministic (missing admin key, insufficient funds, a contract
+ * revert)? Only transient failures should arm the StorageACK retry loop;
+ * arming it for a permanent failure would re-call `ensureProfile()` every 30s
+ * forever (Codex PR #901 round-3 :1714 / round-4 :1838).
+ *
+ * Delegates the RPC-shape recognition to the chain package's exported
+ * `isRetryableRpcError` (Codex PR #901 round-4 :459) so we reuse its full
+ * extraction — top-level AND nested `error.code` / `statusCode` /
+ * `response.status` — instead of a narrower top-level-only copy that would
+ * misclassify a 429/5xx buried in a nested field as permanent. On top we add
+ * the boot path's own `BOOT_CHAIN_TIMEOUT` (`isRetryableRpcError` doesn't know
+ * it) and an explicit permanent-exclusion guard for `admin` provisioning
+ * failures (`isRetryableRpcError` already excludes revert/insufficient-funds/
+ * nonce). Anything else — ordinary `Error`s with no RPC signature — stays
+ * permanent and disabled.
+ */
+function isTransientBootChainError(err: unknown): boolean {
+  const code = (err as { code?: unknown })?.code;
+  if (code === 'BOOT_CHAIN_TIMEOUT') return true;
+  // A missing/invalid profile admin key is a deterministic config error, not a
+  // transient RPC failure — surface it once, never retry. (The chain classifier
+  // already treats revert / insufficient-funds / nonce as non-retryable.)
+  const msg = (err instanceof Error ? err.message : String(err ?? '')).toLowerCase();
+  if (msg.includes('admin')) return false;
+  return isRetryableRpcError(err);
+}
+
+/**
+ * OT-RFC-38 LU-11. Split a single plaintext buffer into the
+ * fixed-size pieces the chunked AEAD path expects. Empty input is
+ * rejected — the publisher computes `merkleRoot` from non-empty
+ * `kaCount` quads, so an empty plaintext upstream is always a bug.
+ */
+function sliceIntoCiphertextChunks(plaintext: Uint8Array): Uint8Array[] {
+  if (plaintext.length === 0) {
+    throw new Error('LU-11: sliceIntoCiphertextChunks rejects empty plaintext');
+  }
+  const chunks: Uint8Array[] = [];
+  for (let off = 0; off < plaintext.length; off += CIPHERTEXT_CHUNK_SIZE_BYTES) {
+    chunks.push(plaintext.subarray(off, Math.min(off + CIPHERTEXT_CHUNK_SIZE_BYTES, plaintext.length)));
+  }
+  return chunks;
+}
+
+class SwmSenderKeySetupRejectionError extends Error {
+  readonly reasonCode: SwmSenderKeyPackageAckReasonCode;
+
+  constructor(reasonCode: SwmSenderKeyPackageAckReasonCode, message: string) {
+    super(message);
+    this.name = 'SwmSenderKeySetupRejectionError';
+    this.reasonCode = reasonCode;
+  }
+}
+
+const SWM_SENDER_KEY_PENDING_DRAIN_LOG_CTX: OperationContext = {
+  operationId: 'swm-sender-key-pending-drain',
+  operationName: 'share',
+};
+
+/**
+ * Sentinel returned by the chain-RPC-fallback timeout race inside
+ * {@link DKGAgent.getContextGraphOnChainPolicy}. Distinct from
+ * `undefined` so the caller can tell a timed-out probe apart from
+ * an RPC that legitimately resolved to "no policy". Module-scoped
+ * so the inner `withTimeout` helper can reuse the same identity.
+ */
+const TIMEOUT_SENTINEL = Symbol('chain-rpc-fallback-timeout');
+
+/**
+ * Codex review on #872 — TTL for the eagerly-seeded `publishPolicy`
+ * cache. `publishPolicy` is mutable on-chain (`PublishPolicyUpdated`
+ * is emitted by `ContextGraphStorage.updatePublishPolicy`), but the
+ * cache is only populated by `ContextGraphCreated`, so a curator
+ * flipping a CG from open → curated would otherwise leave a stale
+ * `1` in this node's cache until restart and keep relaxing the
+ * import-artifact owner guard. The TTL bounds staleness to one
+ * window without wiring a full `PublishPolicyUpdated` event watcher
+ * through the chain-event poller. 60s is conservative because the
+ * cached value gates an authorization decision — one extra eth_call
+ * per minute per active CG is cheap.
+ */
+const ON_CHAIN_PUBLISH_POLICY_CACHE_TTL_MS = 60_000;
+
+/**
+ * #884 review — bound the on-chain liveness / access-policy reads on the
+ * share/promote/publish hot path (`isContextGraphPublicOnChain`). Mirrors
+ * `CHAIN_RPC_FALLBACK_TIMEOUT_MS` in
+ * {@link DKGAgent.getContextGraphOnChainPolicy}: if the RPC layer HANGS
+ * (rather than rejecting), the helper must still resolve so the caller fails
+ * closed to "not public / not known" instead of blocking the request
+ * indefinitely. 2.5s stays well under the daemon-ready budget while allowing
+ * a single slow eth_call hop under normal load.
+ */
+const CHAIN_POLICY_READ_TIMEOUT_MS = 2_500;
+
 export class DKGAgent {
   readonly wallet: AgentWallet;
   readonly node: DKGNode;
@@ -361,6 +571,23 @@ export class DKGAgent {
   readonly queryEngine: DKGQueryEngine;
   readonly discovery: DiscoveryClient;
   readonly profileManager: ProfileManager;
+  /**
+   * Lazily-constructed WM→SWM async-promote queue (see
+   * `docs/specs/SPEC_ASYNC_PROMOTE_QUEUE.md`). Routes call into it via
+   * `agent.assertion.promoteAsync(...)`. PR #3 will wire an in-process
+   * worker loop that periodically calls `claimNext` + `succeed`/`fail`;
+   * for now, only the public enqueue/inspect surface is reachable. We
+   * stash the impl as `private` and expose it via the `promoteQueue`
+   * getter so the worker (a daemon-side concern) and tests can drive
+   * the queue directly without going through the assertion subsurface.
+   */
+  private _promoteQueue?: AsyncPromoteQueue;
+  /**
+   * Override for tests / future operator config. When set before
+   * `promoteQueue` is first accessed, the queue is constructed with
+   * these overrides folded into the defaults.
+   */
+  private _promoteQueueConfig?: Partial<AsyncPromoteQueueConfig>;
   gossip!: GossipSubManager;
   router!: ProtocolRouter;
   messenger!: Messenger;
@@ -399,8 +626,41 @@ export class DKGAgent {
    * Lazily constructed on first use; absent on edge nodes by default.
    */
   private swmHostModeStore?: SwmHostModeStore;
-  /** CGs we've subscribed to in host mode (cores only). */
-  private readonly swmHostModeSubscribed = new Set<string>();
+  /**
+   * CGs we've subscribed to in host mode (cores only), with the
+   * discovery-path source that caused each subscription. PR5
+   * ACK-provenance telemetry reads this map to populate the
+   * `subscriptionSource` field on every signed StorageACK.
+   *
+   * Sources track the four LU-6 Phase B discovery paths defined in
+   * `SUBSCRIPTION_SOURCES`: `chain-event`, `beacon`, `reconciler`,
+   * `manual`. Member-mode CGs are NOT in this map — the StorageACK
+   * handler routes them via `sharedMemoryGossipRegistered` (source =
+   * `member`) instead.
+   *
+   * Keys are ALWAYS the canonical wire-form id (the curator-committed
+   * `nameHash`, normalized through {@link canonicalSwmHostModeKey} /
+   * {@link gossipWireIdFor}). Phase B's four discovery paths receive
+   * the CG id in different shapes — chain-event/beacon already carry
+   * the hash, while reconciler/manual typically receive the cleartext
+   * local id or whatever string the operator POSTed — so each
+   * insert/lookup/delete site canonicalizes first. Codex PR #672
+   * review comment `id=3302086589` flagged the pre-canonicalization
+   * regression: a chain-event subscribe (hash key) followed by a
+   * manual subscribe (cleartext key) would miss `has()` and wire a
+   * second handler on the same topic, causing duplicate host-mode
+   * ingest/persistence and ambiguous provenance.
+   *
+   * On daemon restart, CGs reconstructed from `swmHostModeStore` boot
+   * back through the `reconcileSwmHostModeSubscription` periodic
+   * sweep, which defaults their source to `reconciler` (the original
+   * cause is not persisted on disk and the periodic sweep IS what
+   * restored them). Operators who need to differentiate "originally
+   * subscribed via beacon" from "restored on restart" should consult
+   * the daemon log at subscribe time, not the live `subscriptionSource`
+   * field.
+   */
+  private readonly swmHostModeSubscribed = new Map<string, SubscriptionSource>();
   /**
    * Per-CG reference to the host-mode gossip handler closure. Kept
    * so we can call `gossip.offMessage(topic, handler)` to remove
@@ -410,6 +670,9 @@ export class DKGAgent {
    * defect where both host- and member-mode handlers ran in
    * parallel after authorization flipped, causing every gossip
    * message to be both decrypted-and-applied AND opaquely appended.
+   *
+   * Keyed by the canonical wire-form id (same invariant as
+   * `swmHostModeSubscribed`); see {@link canonicalSwmHostModeKey}.
    */
   private readonly swmHostModeHandlers = new Map<string, (topic: string, data: Uint8Array, from: string) => void>();
   /** Async lock for the host-mode reconciler so simultaneous calls don't double-subscribe. */
@@ -564,9 +827,35 @@ export class DKGAgent {
    */
   private static readonly SWM_ACK_QUORUM_TICK_MS = 5_000;
 
+  /**
+   * Phase B — chain-driven VM reconciliation sweep cadence. The periodic sweep
+   * is the safety net behind the live `KnowledgeAssetRegisteredToContextGraph`
+   * nudge: it guarantees eventual reconciliation even if an event was missed or
+   * a fetch transiently failed. Env-overridable for ops tuning.
+   */
+  private static readonly VM_RECONCILE_SWEEP_INTERVAL_MS =
+    Number(process.env['DKG_VM_RECONCILE_INTERVAL_MS']) || 60_000;
+  /**
+   * Blocks a completed ordinal must be buried by before its watermark advance
+   * commits (reorg gate). The data is promoted to VM eagerly; only the cursor
+   * advance waits. Observation-block based (see `reconcileChainOrdinal`), so
+   * this is effectively "wait N blocks of chain progress after we observed the
+   * registration before trusting the watermark".
+   */
+  private static readonly VM_RECONCILE_CONFIRMATION_DEPTH =
+    Number(process.env['DKG_VM_RECONCILE_CONFIRMATION_DEPTH']) || 5;
+
   private messageHandler: MessageHandler | null = null;
   private chainPoller: ChainEventPoller | null = null;
   private swmCleanupTimer: ReturnType<typeof setInterval> | null = null;
+  /** Phase B — periodic chain-driven VM reconciliation sweep timer. */
+  private vmReconcileTimer: ReturnType<typeof setInterval> | null = null;
+  /** Phase B — per-CG single-flight coalescer for reconcile sweeps. */
+  private reconcileCoalescer?: ReconcileCoalescer;
+  /** Phase B — in-memory reconcile cursor per local CG id (watermark + `ahead`). */
+  private readonly reconcileCursors = new Map<string, CursorState>();
+  /** Phase B — bounded dedupe of recently-reconciled UALs (live-burst guard). */
+  private readonly recentReconciledUals = new RecentUalSet();
   private hostModeReconcilerTimer: ReturnType<typeof setInterval> | null = null;
   private hostModePruneTimer: ReturnType<typeof setInterval> | null = null;
   // rc.9 PR-10: joinApprovalRetryQueue + joinApprovalRetryTimer
@@ -591,6 +880,12 @@ export class DKGAgent {
   private randomSamplingBindRetryInFlight = false;
   private storageACKRegistrationRetryTimer: ReturnType<typeof setTimeout> | null = null;
   private storageACKRegistrationRetryInFlight = false;
+  // #894 / Codex PR #901 round-3 :1685: `ensureProfile()` is a mutating
+  // multi-tx flow (createProfile + stake) that can legitimately outlast the
+  // boot read-timeout. Guards against the boot path AND the StorageACK retry
+  // re-submitting `ensureProfile()` while a prior one may still be settling on
+  // chain — which would risk a duplicate profile / double-stake.
+  private profileProvisioningInFlight = false;
   private readonly config: DKGAgentConfig;
   private started = false;
   private readonly subscribedContextGraphs = new Map<string, ContextGraphSub>();
@@ -661,10 +956,51 @@ export class DKGAgent {
    */
   private readonly catchupReplayGuard = new CatchupReplayGuard();
   /**
+   * OT-RFC-38 LU-11 / OT-RFC-39 — separate replay LRU for the chunk
+   * sync verb. Kept distinct from the host-catchup guard so a single
+   * EOA's two concurrent streams (one for the LU-6 envelope catchup,
+   * one for per-chunk backfill) never collide on nonce uniqueness.
+   */
+  private readonly ciphertextChunkCatchupReplayGuard = createCiphertextChunkCatchupReplayGuard();
+  /**
    * OT-RFC-38 / LU-6 Phase B — periodic beacon re-announce timer
    * (curators only). See {@link beaconRegistry} jsdoc.
    */
   private beaconReannounceTimer?: ReturnType<typeof setInterval>;
+  /**
+   * PR feat/chain-agents-cg-phonebook — periodic agent-profile
+   * heartbeat. Re-publishes the profile to the `agents` Context
+   * Graph on `AGENT_PROFILE_HEARTBEAT_MS` cadence (operator
+   * override via `config.network.agentProfileHeartbeatMs`; `0`
+   * disables). Undefined until {@link start} runs and `null` after
+   * {@link stop} clears it.
+   */
+  private agentProfileHeartbeatTimer?: ReturnType<typeof setInterval>;
+  /**
+   * Heartbeat-tick coalescing flag. When a heartbeat is already
+   * in flight, the next tick logs + skips instead of queueing — this
+   * keeps the queue depth at 1 even if publish latency exceeds the
+   * heartbeat cadence (slow chain RPC, congested gossip mesh).
+   *
+   * NOT a correctness gate against concurrent `publishProfile()`
+   * callers — startup, key-rotation, and revocation also call
+   * `publishProfile()` directly, and they bypass this flag. The
+   * correctness gate is the `publishProfileTail` mutex below.
+   */
+  private agentProfileHeartbeatInFlight = false;
+  /**
+   * Serialization mutex for `publishProfile()`. Tail-promise chain:
+   * each new caller `await`s the prior call (success or failure) and
+   * only then runs its own publish. Codex review of PR #700 round 2
+   * flagged that the heartbeat-only inFlight guard left a race
+   * window between the heartbeat tick and the existing `startup` /
+   * key-rotation / revocation callers, both of which mutate
+   * `ProfileManager.currentKcId` and rewrite the registry triples
+   * on every call. Serializing inside `publishProfile()` covers
+   * every entry point at the lowest level instead of duplicating
+   * the guard at every caller.
+   */
+  private publishProfileTail: Promise<unknown> = Promise.resolve();
   /**
    * OT-RFC-38 / LU-6 Phase B — sliding-window rate-limiter applied
    * to pre-registration (beacon-discovered) ciphertext writes.
@@ -693,6 +1029,52 @@ export class DKGAgent {
    * positive curation signal — fall through to the chain.
    */
   private readonly onChainAccessPolicyCache = new Map<string, number>();
+  /**
+   * #884 review — one-shot guard so the "chain adapter exposes
+   * getContextGraphAccessPolicy but NOT the isContextGraphActiveOnChain
+   * liveness probe" diagnostic (emitted by {@link readLiveOnChainAccessPolicy})
+   * is logged once per process instead of on every share/publish, while still
+   * giving operators a NON-silent signal that public-on-chain CGs are being
+   * kept on the encrypted path for this adapter.
+   */
+  private warnedMissingCgLivenessProbe = false;
+  /**
+   * Issue #872 — companion cache for the per-CG `publishPolicy` enum
+   * (`0` = curators-only, `1` = open). Populated lazily by the
+   * `ContextGraphCreated` chain-event handler (the event already
+   * carries both enums; the only thing missing was the cache slot).
+   * Consumed by {@link getContextGraphOnChainPolicy} so daemon routes
+   * can decide whether to apply owner-scoped guards or relax them for
+   * public + open CGs without a per-request RPC. `undefined` means
+   * the chain answer hasn't reached this node yet — callers MUST
+   * treat that as unknown (fail-closed) rather than a positive
+   * "publish-policy is open" signal.
+   *
+   * Codex review on #872 — `publishPolicy` is mutable on-chain via
+   * `ContextGraphStorage.updatePublishPolicy` (which emits
+   * `PublishPolicyUpdated`), but this cache is only seeded from the
+   * `ContextGraphCreated` event. Without listening to the update event
+   * AND without a freshness check, a stale `1` survives until daemon
+   * restart and keeps `isPublicOpenContextGraph()` relaxing the
+   * import-artifact owner guard after a curator flips the CG from
+   * open → curated. The TTL companion map below stamps every cache
+   * write with `Date.now()`; reads in `getContextGraphOnChainPolicy`
+   * treat entries older than {@link ON_CHAIN_PUBLISH_POLICY_CACHE_TTL_MS}
+   * as miss and fall through to the chain-RPC fallback (which already
+   * exists for the round-3 non-creator-peer path). Stale data drifts
+   * authoritative within at most one TTL window. The bound is set
+   * conservatively because the cache gates an authorization decision —
+   * one extra eth_call per minute per active CG is cheap.
+   */
+  private readonly onChainPublishPolicyCache = new Map<string, number>();
+  /**
+   * Codex review on #872 — companion timestamp map for {@link onChainPublishPolicyCache}.
+   * `now - fetchedAt > ON_CHAIN_PUBLISH_POLICY_CACHE_TTL_MS` is treated
+   * as a cache miss. Kept as a sibling map (rather than refactoring the
+   * cache value to `{ value, fetchedAt }`) so existing test fixtures
+   * that read `cache.get(id)` and expect a bare number still pass.
+   */
+  private readonly onChainPublishPolicyCacheUpdatedAt = new Map<string, number>();
   /**
    * OT-RFC-38 / LU-6 Phase B — chain-backed participant-agent
    * allowlist cache. Keyed by `contextGraphId.toString()` (stringified
@@ -836,6 +1218,11 @@ export class DKGAgent {
    */
   private readonly lastSuccessfulSyncAt = new Map<string, number>();
   private syncReconcilerTimer: ReturnType<typeof setInterval> | null = null;
+  /** A.4-lite+: periodic warm/pinned Core-connection reconcile (opt-in). */
+  private warmCoreTimer: ReturnType<typeof setInterval> | null = null;
+  /** Cores keep-alive-pinned on the last warm-core pass, so the next pass can
+   *  unpin Cores that fell out of the selection (stale-pin / cap-drift guard). */
+  private warmedCores: Set<string> = new Set();
   /**
    * v10-rc sync-refactor: per-(peer+CG) checkpoint offsets so the paged
    * sync requester in `sync/requester/page-fetch.ts` can resume where it
@@ -855,6 +1242,24 @@ export class DKGAgent {
   private readonly swmSenderKeySendStates = new Map<string, LocalSwmSenderKeySendState>();
   private readonly swmSenderKeyReceiveStates = new Map<string, LocalSwmSenderKeyReceiveState>();
   private swmSenderKeyStateLoaded = false;
+  /**
+   * PR-2 (SWM-fanout plan): pending sender-key package fanouts that
+   * landed in the "no advertised peerId" branch of
+   * `createAndDistributeSwmSenderKeyEpoch`. Keyed by lowercased
+   * `recipientAgentAddress` so the connection:open listener can drain
+   * by agent identity (the only handle we have when we minted the row
+   * without a peerId). Per-key triple `(senderAgentAddress,
+   * recipientKeyId, epochId)` deduplicates within an agent.
+   *
+   * Persisted with the SWM sender-key state file when `dataDir` is
+   * configured. Older epochs are evicted whenever a newer epoch is
+   * enqueued for the same `(sender, recipient)` pair — the supersession
+   * matches what the membership-hash flow already implies sender-side,
+   * and avoids the "queued package for epoch N replays after we've
+   * rolled to N+1" footgun.
+  */
+  private readonly pendingSenderKeyByAgent = new Map<string, PendingSenderKeyEntry[]>();
+  private readonly pendingSenderKeyDrainByAgent = new Map<string, Promise<number>>();
 
   private constructor(
     config: DKGAgentConfig,
@@ -882,7 +1287,7 @@ export class DKGAgent {
     this.chain = chain;
     this.discovery = new DiscoveryClient(queryEngine);
     this.profileManager = new ProfileManager(publisher, store);
-    this.publisher.setWorkspaceAgentRecipientResolver((input) => resolveWorkspaceAgentRecipients(this.store, input));
+    this.publisher.setWorkspaceAgentRecipientResolver((input) => this.resolveWorkspaceRecipientsGated(input));
     this.publisher.setWorkspaceSenderKeyEncryptor((input) => this.encryptWorkspacePayloadWithSenderKey(input));
   }
 
@@ -931,10 +1336,13 @@ export class DKGAgent {
     } else if (config.chainConfig && opKeys?.length) {
       const evmConfigBase = {
         rpcUrl: config.chainConfig.rpcUrl,
+        rpcUrls: config.chainConfig.rpcUrls,
         privateKey: opKeys[0],
         additionalKeys: opKeys.slice(1),
         hubAddress: config.chainConfig.hubAddress,
+        tokenAddress: config.chainConfig.tokenAddress,
         chainId: config.chainConfig.chainId,
+        approvalPolicy: config.chainConfig.approvalPolicy,
       };
       if (config.chainConfig.adminPrivateKey) {
         chain = new EVMChainAdapter({ ...evmConfigBase, adminPrivateKey: config.chainConfig.adminPrivateKey });
@@ -964,6 +1372,7 @@ export class DKGAgent {
       relayServerCapacity: config.relayServerCapacity,
       relayReservationCount: config.relayReservationCount,
       nodeVersion: config.nodeVersion,
+      ...pickNetworkTunables(config),
     };
 
     const node = new DKGNode(nodeConfig);
@@ -1009,6 +1418,23 @@ export class DKGAgent {
     } catch (err) {
       const log = new Logger('DKGAgent');
       log.warn(createOperationContext('init'), `Failed to reconstruct shared memory ownership, continuing without: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    // GH #748: one-shot migration of SWM `prov:wasAttributedTo` from
+    // peer-ID string literals to agent DID URIs. Idempotent via a
+    // per-CG marker; non-fatal on failure (match the pattern above).
+    try {
+      const migrated = await publisher.migrateSwmAttributionToAgentDid();
+      if (migrated.rewritten > 0 || migrated.skipped > 0) {
+        const log = new Logger('DKGAgent');
+        log.info(
+          createOperationContext('init'),
+          `Migrated SWM attribution across ${migrated.swmMetaGraphs} SWM meta graph(s): rewrote ${migrated.rewritten} literal(s) to agent DID, ${migrated.skipped} unresolved`,
+        );
+      }
+    } catch (err) {
+      const log = new Logger('DKGAgent');
+      log.warn(createOperationContext('init'), `Failed to migrate SWM attribution to agent DID, continuing without: ${err instanceof Error ? err.message : String(err)}`);
     }
 
     const queryEngine = new DKGQueryEngine(store);
@@ -1116,6 +1542,25 @@ export class DKGAgent {
     }
 
     const network = new LibP2PNetwork(this.node);
+    // Local helper: race a lookup against an optional AbortSignal so
+    // an in-flight SPARQL query honours the resolver's outer deadline.
+    // Codex PR #499 round 5 race: re-check signal.aborted INSIDE the
+    // listener-attach Promise so we don't lose the one-shot 'abort'
+    // event between the early gate and addEventListener.
+    const raceAgainstAbort = <T>(lookup: Promise<T | null>, signal: AbortSignal | undefined): Promise<T | null> => {
+      if (!signal) return lookup;
+      return Promise.race<T | null>([
+        lookup,
+        new Promise<null>((resolve) => {
+          if (signal.aborted) {
+            resolve(null);
+            return;
+          }
+          signal.addEventListener('abort', () => resolve(null), { once: true });
+        }),
+      ]);
+    };
+
     const peerResolver = new PeerResolver({
       network,
       registry: new StubNetworkStateRegistry(),
@@ -1148,35 +1593,40 @@ export class DKGAgent {
           if (opts?.signal?.aborted) return null;
           const lookup = this.discovery.findAgentByPeerId(peerId)
             .then((agent) => agent?.relayAddress ?? null);
-          const signal = opts?.signal;
-          if (!signal) return lookup;
-          return Promise.race<string | null>([
-            lookup,
-            new Promise<null>((resolve) => {
-              // Codex PR #499 round 5 (dkg-agent.ts:1354): the early
-              // `signal.aborted` check above and `addEventListener`
-              // are not atomic — the signal could fire in between, and
-              // since `abort` is a one-shot event, our late listener
-              // would never see it and this Promise would hang for the
-              // full lookup duration. Re-check INSIDE the constructor
-              // before subscribing so the abort branch resolves
-              // immediately if we lost that race.
-              if (signal.aborted) {
-                resolve(null);
-                return;
-              }
-              signal.addEventListener(
-                'abort',
-                () => resolve(null),
-                { once: true },
-              );
-            }),
-          ]);
+          return raceAgainstAbort(lookup, opts?.signal);
+        },
+        // PR feat/chain-agents-cg-phonebook: richer lookup that
+        // returns direct multiaddrs + relayAddress + lastSeen so the
+        // resolver can prime the peerStore with current dialable
+        // addrs and filter by freshness. The resolver falls through
+        // to `findRelayForPeer` if this returns null.
+        findAgentDialAddresses: async (peerId, opts) => {
+          if (opts?.signal?.aborted) return null;
+          const lookup = this.discovery.findAgentByPeerId(peerId)
+            .then((agent) => {
+              if (!agent) return null;
+              const lastSeenMs = agent.lastSeen ? Date.parse(agent.lastSeen) : undefined;
+              return {
+                multiaddrs: agent.multiaddrs ?? [],
+                relayAddress: agent.relayAddress,
+                lastSeenMs: Number.isFinite(lastSeenMs) ? lastSeenMs : undefined,
+              };
+            });
+          return raceAgainstAbort(lookup, opts?.signal);
         },
       },
+      agentDirectoryStaleThresholdMs: AGENT_PROFILE_STALE_THRESHOLD_MS,
       // Bootstrap is a libp2p-startup concern (`bootstrap({ list })` in
       // peerDiscovery, see node.ts) — not a per-peer resolution concern.
       // Removed here per Codex review feedback on PR #496.
+      //
+      // Note: `defaultPerStepTimeoutMs` is intentionally NOT wired from
+      // operator config. Production callers (`connectToPeerId`, chat /
+      // routed sends) always pass an explicit `perStepTimeoutMs`
+      // derived from their own deadline budget, so any constructor
+      // default would be a silent no-op for those paths. The
+      // constructor option survives as a test-fixture surface.
+      // Codex review of PR #698 round 2 caught this.
     });
     this.peerResolver = peerResolver;
     this.router = new ProtocolRouter(this.node, { peerResolver });
@@ -1199,10 +1649,19 @@ export class DKGAgent {
       router: this.router,
       idempotencyStore,
       outboxStore,
+      // PR feat/chain-agents-cg-phonebook: stall-recovery now routes
+      // through the full PeerResolver instead of raw DHT findPeer.
+      // The dial fast-path (ProtocolRouter) already prefers
+      // PeerResolver.resolve() on every attempt, but the outbox
+      // stall-walk (`messenger.maybeScheduleDhtWalk`) was hardcoded
+      // to a DHT-only path — so an entry that timed out 5x because
+      // its addresses were stale couldn't recover by consulting
+      // agents-CG. Routing through PeerResolver picks up the
+      // phonebook fallback automatically; the raw findPeer call
+      // remains the step-2 DHT lookup inside resolve(), so we don't
+      // lose any pre-existing recovery path.
       resolvePeer: async (peerId, { signal }) => {
-        const { peerIdFromString } = await import('@libp2p/peer-id');
-        const pid = peerIdFromString(peerId);
-        await this.node.libp2p.peerRouting.findPeer(pid, { signal });
+        await peerResolver.resolve(peerId, { signal }).catch(() => undefined);
       },
     });
     this.gossip = new GossipSubManager(this.node, this.eventBus);
@@ -1339,9 +1798,24 @@ export class DKGAgent {
     // envelope versioning, idempotency cache, and `/api/slo` stats.
     this.messenger.register(PROTOCOL_SWM_HOST_CATCHUP, (data, fromPeerId) => this.handleSwmHostCatchup(data, fromPeerId));
 
+    // OT-RFC-38 LU-11 / OT-RFC-39: per-chunk ciphertext sync verb.
+    // Symmetric to PROTOCOL_SWM_HOST_CATCHUP but pulls one
+    // (cgId, batchId, chunkIndex) ciphertext at a time from the
+    // triple-store-backed chunk store the V2 ACK verifier reads
+    // against. Registered unconditionally — the handler itself
+    // gates by node role + per-CG authorization.
+    this.messenger.register(PROTOCOL_GET_CIPHERTEXT_CHUNK, (data, fromPeerId) => this.handleGetCiphertextChunk(data, fromPeerId));
+
     const effectiveRole = this.config.nodeRole ?? 'edge';
     const ackSignerCandidates = this.getACKSignerCandidateWallets(ctx);
     let onChainIdentityId = 0n;
+    // #894 / Codex PR #901: distinguishes a 0n identity caused by a transient
+    // boot-time chain failure (RPC timeout/unreachable — recoverable, so the
+    // StorageACK path must keep retrying + re-resolve once RPC returns) from
+    // an intentional 0n (e.g. an edge node that never provisions on-chain — it
+    // never reaches the core-only ACK block anyway). Set when the boot
+    // identity block times out or errors below.
+    let bootChainIdentityUnresolvedTransient = false;
     const ensureACKCandidateWalletsRegistered = async (
       attemptCtx: OperationContext,
     ): Promise<boolean> => {
@@ -1380,13 +1854,28 @@ export class DKGAgent {
     // Auto-detect or register on-chain identity.
     // Edge nodes skip profile creation — they operate with agent identity only.
     if (this.chain.chainId !== 'none') {
+      // #894: bound boot-time chain identity resolution so an unreachable /
+      // rate-limited RPC (which the multi-RPC failover loop retries across
+      // endpoints) cannot block daemon HTTP readiness past the CLI's 45s
+      // ceiling. On timeout the existing catch leaves identity unresolved and
+      // boot proceeds; the node serves HTTP and on-chain writes 503 at call
+      // time. The 20s bound is well below 45s yet generous for a healthy chain.
       try {
-        onChainIdentityId = await this.chain.getIdentityId();
+        onChainIdentityId = await raceWithBootTimeout(
+          this.chain.getIdentityId(),
+          BOOT_CHAIN_IDENTITY_TIMEOUT_MS,
+          'boot getIdentityId',
+        );
         if (onChainIdentityId === 0n && effectiveRole === 'core') {
           this.log.info(ctx, `No on-chain identity found, creating profile and staking...`);
-          onChainIdentityId = await this.chain.ensureProfile({
-            nodeName: this.config.name,
-          });
+          // Codex PR #901 round-3 :1685: do NOT race `ensureProfile()` with the
+          // boot timeout — it is a mutating createProfile+stake flow that can
+          // legitimately exceed 20s while the tx settles, and abandoning a live
+          // staking tx (then re-calling it on retry) risks a duplicate profile /
+          // double-stake. The read-side `getIdentityId()` above keeps its
+          // timeout (safe to abandon); provisioning runs to completion, guarded
+          // so neither boot nor the retry re-submits while one is in flight.
+          onChainIdentityId = await this.provisionProfileGuarded(ctx);
           this.log.info(ctx, `On-chain profile created, identityId=${onChainIdentityId}`);
         } else if (onChainIdentityId === 0n) {
           this.log.info(ctx, `Edge node — skipping on-chain profile creation (agent identity only)`);
@@ -1395,12 +1884,43 @@ export class DKGAgent {
         }
       } catch (err) {
         this.log.warn(ctx, `ensureProfile error: ${err instanceof Error ? err.message : String(err)}`);
-        try {
-          onChainIdentityId = await this.chain.getIdentityId();
-          if (onChainIdentityId > 0n) {
-            this.log.info(ctx, `Recovered identityId=${onChainIdentityId} after partial failure`);
-          }
-        } catch { /* ignore */ }
+        // The recovery `getIdentityId` is only useful when the original
+        // `getIdentityId` succeeded but `ensureProfile` later failed (e.g.
+        // gas exhaustion / chain revert) — in that case the chain is
+        // reachable and a fresh read may pick up a partially-created
+        // identity. When the original itself timed out (BOOT_CHAIN_TIMEOUT,
+        // see #894), the RPC is unreachable / rate-limited and a recovery
+        // attempt just doubles the boot delay (40s → past the 45s harness
+        // ceiling), surfacing as `Daemon did not become ready within 45s`
+        // in `daemon-http-behavior-extra.test.ts`. Skip the redundant retry
+        // on that path; on every other path keep the recovery behaviour.
+        const bootChainTimeout =
+          err instanceof Error &&
+          (err as Error & { code?: string }).code === 'BOOT_CHAIN_TIMEOUT';
+        if (!bootChainTimeout) {
+          try {
+            onChainIdentityId = await raceWithBootTimeout(
+              this.chain.getIdentityId(),
+              BOOT_CHAIN_IDENTITY_TIMEOUT_MS,
+              'boot getIdentityId (recovery)',
+            );
+            if (onChainIdentityId > 0n) {
+              this.log.info(ctx, `Recovered identityId=${onChainIdentityId} after partial failure`);
+            }
+          } catch { /* ignore — boot proceeds with identity unresolved */ }
+        }
+        // The boot identity block threw. If it left identity at 0n AND the
+        // failure is TRANSIENT (RPC unreachable/slow/rate-limited), flag it so
+        // the StorageACK path re-resolves and recovers once the chain is back
+        // (#894 / Codex PR #901). A node that genuinely has no identity resolves
+        // 0n on the happy path WITHOUT throwing, leaving this false. And a
+        // PERMANENT/deterministic failure (missing admin key, insufficient
+        // funds, contract revert) must NOT arm the retry — otherwise the
+        // StorageACK loop would re-call `ensureProfile()` every 30s forever
+        // (Codex PR #901 round-3 :1714). It stays disabled and surfaces once.
+        if (onChainIdentityId === 0n && isTransientBootChainError(err)) {
+          bootChainIdentityUnresolvedTransient = true;
+        }
       }
       if (onChainIdentityId > 0n) {
         if (effectiveRole === 'core') {
@@ -1424,9 +1944,79 @@ export class DKGAgent {
         let storageACKFailoverInFlight = false;
         const attemptStorageACKRegistration = async (
           attemptCtx: OperationContext,
-          options: { repairWallets?: boolean } = {},
+          options: { repairWallets?: boolean; allowChainReresolution?: boolean } = {},
         ): Promise<'registered' | 'retryable' | 'disabled'> => {
           if (storageACKProtocolRegistered) return 'registered';
+          // #894 / Codex PR #901 (round 2): background identity re-resolution.
+          // If boot left the identity unresolved because of a transient chain
+          // failure (RPC timeout/unreachable), re-probe the chain — but ONLY on
+          // the scheduled retry path (`allowChainReresolution`), never on the
+          // first attempt awaited by `start()`. The boot path already spent its
+          // chain-timeout budget resolving identity; doing another bounded
+          // chain probe here would stack a third ~20s wait onto `start()` and
+          // blow the 45s readiness ceiling this fix exists to protect (Codex
+          // :1752). On the first attempt we return 'retryable' immediately and
+          // let the unref'd retry timer do the (background) re-resolution.
+          //
+          // We do NOT re-probe on a settled 0n (the flag stays false), so an
+          // intentional no-identity node doesn't spin the chain pointlessly.
+          if (
+            onChainIdentityId === 0n
+            && bootChainIdentityUnresolvedTransient
+            && options.allowChainReresolution === true
+          ) {
+            try {
+              let reresolved = await raceWithBootTimeout(
+                this.chain.getIdentityId(),
+                BOOT_CHAIN_IDENTITY_TIMEOUT_MS,
+                'StorageACK identity re-resolution',
+              );
+              // Codex :1757: a brand-new core node may have hit the transient
+              // failure BEFORE `ensureProfile()` ever ran, so it has no profile
+              // to find. Re-probing `getIdentityId()` alone would return 0n
+              // forever and the node would never provision. Once the chain is
+              // reachable again, create the profile (core only) — mirroring the
+              // boot-time provisioning path. Codex round-3 :1685: provision via
+              // the guarded, un-raced helper so the mutating createProfile+stake
+              // tx runs to completion and is never double-submitted alongside a
+              // boot-path (or concurrent-retry) provisioning still in flight.
+              if (reresolved === 0n && effectiveRole === 'core') {
+                this.log.info(attemptCtx, `No on-chain identity after transient boot outage — creating profile and staking...`);
+                reresolved = await this.provisionProfileGuarded(attemptCtx);
+              }
+              if (reresolved > 0n) {
+                onChainIdentityId = reresolved;
+                bootChainIdentityUnresolvedTransient = false;
+                this.publisher.setIdentityId(onChainIdentityId);
+                this.log.info(
+                  attemptCtx,
+                  `Recovered on-chain identity=${onChainIdentityId} for StorageACK after a transient boot-time chain failure`,
+                );
+              }
+            } catch (err) {
+              // Codex PR #901 round-4 :1838: mirror the boot-path :1714 gate on
+              // the retry path. If the chain came back but provisioning then
+              // failed DETERMINISTICALLY (insufficient funds / revert / admin),
+              // keeping the transient flag set would re-run `ensureProfile()`
+              // every interval forever. Reclassify: permanent → clear the flag
+              // so the terminal branch below returns 'disabled' (surface once,
+              // stop scheduling); transient → keep retrying.
+              if (!isTransientBootChainError(err)) {
+                bootChainIdentityUnresolvedTransient = false;
+                this.log.warn(
+                  attemptCtx,
+                  `V10 StorageACK identity provisioning failed permanently — disabling (no further retries): ` +
+                  `${err instanceof Error ? err.message : String(err)}`,
+                );
+              } else {
+                this.log.warn(
+                  attemptCtx,
+                  `StorageACK identity re-resolution failed (chain still unreachable?), will retry: ` +
+                  `${err instanceof Error ? err.message : String(err)}`,
+                );
+              }
+            }
+          }
           if (onChainIdentityId > 0n) {
             const registrationSucceeded = options.repairWallets === false
               ? true
@@ -1450,14 +2040,14 @@ export class DKGAgent {
             const chainIdForHandler = typeof this.chain.getEvmChainId === 'function'
               ? await this.chain.getEvmChainId()
               : undefined;
-            const kav10AddressForHandler = typeof this.chain.getKnowledgeAssetsV10Address === 'function'
-              ? await this.chain.getKnowledgeAssetsV10Address()
+            const kav10AddressForHandler = typeof this.chain.getKnowledgeAssetsLifecycleAddress === 'function'
+              ? await this.chain.getKnowledgeAssetsLifecycleAddress()
               : undefined;
             if (chainIdForHandler === undefined || kav10AddressForHandler === undefined) {
               this.log.warn(
                 attemptCtx,
                 `Skipping V10 StorageACK handler: chain adapter does not expose ` +
-                `getEvmChainId() + getKnowledgeAssetsV10Address(); handler cannot build the ` +
+                `getEvmChainId() + getKnowledgeAssetsLifecycleAddress(); handler cannot build the ` +
                 `H5-prefixed ACK digest that KnowledgeAssetsV10 verifies on-chain`,
               );
               return 'disabled';
@@ -1470,6 +2060,16 @@ export class DKGAgent {
               contextGraphSharedMemoryUri,
               chainId: chainIdForHandler,
               kav10Address: kav10AddressForHandler,
+              // Codex review (round 2) on PR #727: must NOT collapse to a
+              // plain `gossipWireIdFor` because `PublishIntent.swmGraphId`
+              // may be absent on a chunked V2 intent (the handler then
+              // falls back to the numeric `cgId`). Pass through
+              // `canonicalChunkStoreCgIdOrNull` so numeric ids resolve via
+              // the local on-chain map, and unknown shapes return null →
+              // handler widens to wildcard `GRAPH ?g` instead of pinning
+              // to a fabricated keccak-of-decimal-string.
+              normalizeContextGraphIdForChunkStore: (rawCgId: string) =>
+                this.canonicalChunkStoreCgIdOrNull(rawCgId),
               // Codex PR #608: independently verify the publisher's
               // `isEncryptedPayload=true` claim against this node's
               // local view of the CG. `isPrivateContextGraph()` is the
@@ -1562,6 +2162,7 @@ export class DKGAgent {
                 // router.register under the hood (see Messenger.register
                 // implementation), so router.unregister still removes it.
                 this.router.unregister(PROTOCOL_STORAGE_ACK);
+                this.router.unregister(PROTOCOL_STORAGE_ACK_V2);
                 this.log.warn(
                   attemptCtx,
                   `Unregistered V10 StorageACK handler: signer ${ackSignerWallet.address} ` +
@@ -1595,12 +2196,67 @@ export class DKGAgent {
                   `keeping handler active: ${err instanceof Error ? err.message : String(err)}`,
                 );
               },
+              // PR5 ACK-provenance — bind to the agent's host-mode
+              // bookkeeping so every signed ACK carries which of the
+              // four LU-6 Phase B discovery paths brought this CG's
+              // hosting state up. Resolver tries each candidate id
+              // because the two consulted maps are keyed differently:
+              // `sharedMemoryGossipRegistered` (member-mode) uses the
+              // CALLER-supplied cleartext id verbatim, while
+              // `swmHostModeSubscribed` (host-mode) is canonical-keyed
+              // by the wire-form hash (see `getSwmSubscriptionSource`
+              // and `canonicalSwmHostModeKey`).
+              //
+              // PR5 (review fix #1) + PR-B Codex #672 review
+              // `id=3302086589`: `getSwmSubscriptionSource` now
+              // canonicalises each candidate internally before the
+              // host-mode lookup, so on the host-only paths a single
+              // pass through any of the four shapes (numeric / cleartext
+              // / pre-canonical / hash) lands. We still hand it both
+              // the cleartext and the pre-computed wire forms so the
+              // MEMBER-mode `has(id)` check (which keys by cleartext)
+              // gets the cleartext candidate without the canonicaliser
+              // having to round-trip it. Variadic + internal `seen` Set
+              // dedups, so over-passing is cheap and order-independent.
+              getSubscriptionSourceForCg: (cgId, swmGraphId) => {
+                // Phase D — this hook fires immediately before EVERY StorageACK
+                // sign (the universal pre-sign chokepoint across the plaintext /
+                // encrypted / chunked paths). Use it to record that this Core
+                // hosts the CG so the chain-driven VM reconciler fills its gaps
+                // across restarts. Best-effort + public-CG-gated inside the
+                // helper; never blocks or affects the (sync) provenance return.
+                void this.recordCoreHostedPublicCg(cgId, swmGraphId);
+                const wireFromCgId = cgId ? this.gossipWireIdFor(cgId) : undefined;
+                const wireFromSwmGraphId = swmGraphId && swmGraphId !== cgId
+                  ? this.gossipWireIdFor(swmGraphId)
+                  : undefined;
+                return this.getSwmSubscriptionSource(
+                  cgId,
+                  swmGraphId,
+                  wireFromCgId,
+                  wireFromSwmGraphId,
+                );
+              },
             }, this.eventBus);
             // rc.9 PR-11: migrated onto the Universal Messenger
             // substrate (wire prefix /dkg/10.0.1/storage-ack).
             // messenger.register handles envelope decode + receiver
             // dedup; ackHandler's signature stays the same.
             this.messenger.register(PROTOCOL_STORAGE_ACK, async (data, peerIdStr) => {
+              const peerId = { toString: () => peerIdStr, toBytes: () => new Uint8Array() };
+              return ackHandler.handler(data, peerId);
+            });
+            // OT-RFC-38 LU-11 / OT-RFC-39 — V2 protocol id. Same
+            // handler instance, distinct libp2p protocol. Publishers
+            // running the chunked emit path negotiate V2 explicitly
+            // so pre-LU-11 cores (V1-only) never see a V2 envelope;
+            // the handler dispatches on `intent.ackProtocolVersion`
+            // internally — V2 envelopes hit the chunked verify
+            // branch, V1 envelopes (if any ever arrive on the V2
+            // protocol id, which spec-conforming clients won't send)
+            // fall through to the legacy single-blob / public-CG
+            // paths.
+            this.messenger.register(PROTOCOL_STORAGE_ACK_V2, async (data, peerIdStr) => {
               const peerId = { toString: () => peerIdStr, toBytes: () => new Uint8Array() };
               return ackHandler.handler(data, peerId);
             });
@@ -1611,6 +2267,15 @@ export class DKGAgent {
               `Registered V10 StorageACK handler (identity=${onChainIdentityId}, signer=${ackSignerWallet.address})`,
             );
             return 'registered';
+          } else if (bootChainIdentityUnresolvedTransient) {
+            // #894 / Codex PR #901: identity is still 0n only because the
+            // chain was unreachable at boot and the re-resolution above hasn't
+            // recovered it yet. This is recoverable, so report 'retryable' —
+            // the scheduled retry keeps re-probing and registers ACK once the
+            // RPC returns, instead of leaving a core node permanently
+            // un-advertised until restart.
+            this.log.warn(attemptCtx, `Deferring V10 StorageACK handler registration — on-chain identity not yet resolved (transient chain outage at boot); will retry`);
+            return 'retryable';
           } else {
             this.log.warn(attemptCtx, `Skipping V10 StorageACK handler registration — identity not yet provisioned`);
             return 'disabled';
@@ -1618,9 +2283,19 @@ export class DKGAgent {
           return 'disabled';
         };
 
-        const scheduleStorageACKRegistrationRetry = (options: { repairWallets?: boolean } = {}) => {
+        // Codex PR #901 round-4 :2106: `storageAckRegistrationRetryMs` is a
+        // public config field fed straight into `setTimeout`. Clamp it to a
+        // sane floor so a 0 / negative / NaN value can't collapse the retry into
+        // a tight loop that hammers the RPC and floods the log while the node is
+        // unhealthy. A non-finite or too-small value falls back to the floor.
+        const requestedRetryMs = this.config.storageAckRegistrationRetryMs;
+        const storageACKRegistrationRetryMs =
+          typeof requestedRetryMs === 'number' && Number.isFinite(requestedRetryMs)
+            ? Math.max(requestedRetryMs, MIN_STORAGE_ACK_REGISTRATION_RETRY_MS)
+            : STORAGE_ACK_REGISTRATION_RETRY_MS;
+        const scheduleStorageACKRegistrationRetry = (options: { repairWallets?: boolean; allowChainReresolution?: boolean } = {}) => {
           if (this.storageACKRegistrationRetryTimer || storageACKProtocolRegistered) return;
-          this.log.warn(ctx, `V10 StorageACK handler registration will retry every ${STORAGE_ACK_REGISTRATION_RETRY_MS}ms`);
+          this.log.warn(ctx, `V10 StorageACK handler registration will retry every ${storageACKRegistrationRetryMs}ms`);
           this.storageACKRegistrationRetryTimer = setTimeout(() => {
             this.storageACKRegistrationRetryTimer = null;
             if (!this.started || storageACKProtocolRegistered || this.storageACKRegistrationRetryInFlight) return;
@@ -1640,16 +2315,21 @@ export class DKGAgent {
               .finally(() => {
                 this.storageACKRegistrationRetryInFlight = false;
               });
-          }, STORAGE_ACK_REGISTRATION_RETRY_MS);
+          }, storageACKRegistrationRetryMs);
           if (this.storageACKRegistrationRetryTimer.unref) this.storageACKRegistrationRetryTimer.unref();
         };
 
         try {
+          // The first attempt is awaited by `start()`, so it must NOT do a
+          // blocking chain re-probe (Codex :1752). It returns 'retryable'
+          // immediately for a transient-0n identity; the scheduled retry then
+          // runs the background re-resolution (+ ensureProfile for a brand-new
+          // core node) with `allowChainReresolution: true`.
           const result = await attemptStorageACKRegistration(ctx);
-          if (result === 'retryable') scheduleStorageACKRegistrationRetry();
+          if (result === 'retryable') scheduleStorageACKRegistrationRetry({ allowChainReresolution: true });
         } catch (err) {
           this.log.warn(ctx, `Skipping V10 StorageACK handler: ${err instanceof Error ? err.message : String(err)}`);
-          scheduleStorageACKRegistrationRetry();
+          scheduleStorageACKRegistrationRetry({ allowChainReresolution: true });
         }
       } else if (typeof this.chain.signACKDigest === 'function') {
         this.log.info(ctx, `V10 StorageACK: adapter has signACKDigest but no extractable key — handler registration deferred until callback signing is supported`);
@@ -1712,8 +2392,8 @@ export class DKGAgent {
       this.chainPoller = new ChainEventPoller({
         chain: this.chain,
         publishHandler,
-        onContextGraphCreated: async ({ contextGraphId, creator, accessPolicy, nameHash, blockNumber }) => {
-          this.log.info(ctx, `Discovered on-chain context graph ${contextGraphId.slice(0, 16)}… (block ${blockNumber}, creator ${creator.slice(0, 10)}…, policy ${accessPolicy}, nameHash ${nameHash ? nameHash.slice(0, 10) + '…' : '(opt-out)'})`);
+        onContextGraphCreated: async ({ contextGraphId, creator, accessPolicy, publishPolicy, nameHash, blockNumber }) => {
+          this.log.info(ctx, `Discovered on-chain context graph ${contextGraphId.slice(0, 16)}… (block ${blockNumber}, creator ${creator.slice(0, 10)}…, policy ${accessPolicy}, publishPolicy ${publishPolicy ?? '?'}, nameHash ${nameHash ? nameHash.slice(0, 10) + '…' : '(opt-out)'})`);
 
           // Track the numeric on-chain id for dedup.
           const alreadyKnown = this.seenOnChainIds.has(contextGraphId)
@@ -1733,6 +2413,13 @@ export class DKGAgent {
           // so the keying matches the lazy-fallback lookup below.
           if (accessPolicy === 0 || accessPolicy === 1) {
             this.onChainAccessPolicyCache.set(contextGraphId, accessPolicy);
+          }
+          // Issue #872 — same eager-cache pattern for the `publishPolicy`
+          // enum so daemon routes can recognise a public + open CG from
+          // local state and relax owner-scoped artifact-read guards.
+          if (publishPolicy === 0 || publishPolicy === 1) {
+            this.onChainPublishPolicyCache.set(contextGraphId, publishPolicy);
+            this.onChainPublishPolicyCacheUpdatedAt.set(contextGraphId, Date.now());
           }
 
           // OT-RFC-38 / LU-6 Phase B — host-mode auto-subscribe path for
@@ -1785,7 +2472,7 @@ export class DKGAgent {
               });
             } else {
               const existing = this.subscribedContextGraphs.get(hashLower)!;
-              existing.onChainId = contextGraphId;
+              this.bindSubscriptionOnChainId(hashLower, existing, contextGraphId);
               existing.onChainHash = hashLower;
             }
             this.recordCgWireId(hashLower, hashLower);
@@ -1795,7 +2482,10 @@ export class DKGAgent {
             // of the host-mode gossip handler. Async + best-effort:
             // the periodic reconciler covers the timer-driven fallback
             // path, so a missed event here heals on the next sweep.
-            void this.reconcileSwmHostModeSubscription(hashLower).catch((err) => {
+            void this.reconcileSwmHostModeSubscription(
+              hashLower,
+              SUBSCRIPTION_SOURCES.CHAIN_EVENT,
+            ).catch((err) => {
               this.log.warn(
                 ctx,
                 `Phase B chain-event auto-subscribe for ${hashLower.slice(0, 18)}… failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -1803,6 +2493,24 @@ export class DKGAgent {
             });
           }
         },
+        // Phase B — live VM-reconcile nudge. A `KnowledgeAssetRegisteredToContextGraph`
+        // event doesn't carry the registration ordinal (only kaId + cgId), so it is
+        // NOT a cursor position — it just triggers an immediate coalesced sweep for
+        // that CG so newly-registered KCs land in VM with low latency. The periodic
+        // sweep is the safety net if this is missed. Only wired when reconciliation
+        // is actually possible (chain + ordinal reads present).
+        onKARegisteredToContextGraph: this.vmReconcileEnabled()
+          ? async ({ contextGraphId: onChainId, kaId }) => {
+              const localCgId = this.resolveLocalCgIdByOnChainId(BigInt(onChainId));
+              if (!localCgId) return; // chain replay hasn't resolved the cleartext CG yet; sweep heals it
+              const sub = this.subscribedContextGraphs.get(localCgId);
+              // Populate VM for CGs we member-subscribe to OR (Phase D) public
+              // CGs this Core hosts — a hosted Core fills its own gaps too.
+              if (!sub?.subscribed && !sub?.coreHosted) return;
+              this.log.info(ctx, `Phase B: KACG nudge cg=${onChainId} ka=${kaId} -> reconcile "${localCgId}"`);
+              if (this.reconcileCoalescer) void this.reconcileCoalescer.trigger(localCgId);
+            }
+          : undefined,
       });
       this.chainPoller.start();
       this.log.info(ctx, `Chain event poller started`);
@@ -1836,6 +2544,34 @@ export class DKGAgent {
     // open during test teardown.
     if (typeof this.beaconReannounceTimer.unref === 'function') {
       this.beaconReannounceTimer.unref();
+    }
+
+    // PR feat/chain-agents-cg-phonebook: schedule the periodic
+    // profile heartbeat alongside the beacon timer. The one-shot
+    // startup publish happens in `lifecycle.ts` (setTimeout 0); this
+    // timer is the steady-state refresh that keeps `dkg:multiaddr` +
+    // `dkg:lastSeen` fresh for peers' dial fallback. Default 5 min;
+    // operator-tunable; `0` disables.
+    const heartbeatMs = this.config.agentProfileHeartbeatMs ?? AGENT_PROFILE_HEARTBEAT_MS;
+    if (Number.isFinite(heartbeatMs) && Number.isInteger(heartbeatMs) && heartbeatMs > 0) {
+      this.agentProfileHeartbeatTimer = setInterval(() => {
+        if (this.agentProfileHeartbeatInFlight) {
+          this.log.debug?.(ctx, 'Agent profile heartbeat skipped: previous publish still in flight');
+          return;
+        }
+        this.agentProfileHeartbeatInFlight = true;
+        this.publishProfile()
+          .catch((err) => {
+            const msg = err instanceof Error ? err.message : String(err);
+            this.log.warn(ctx, `Agent profile heartbeat publish failed: ${msg}`);
+          })
+          .finally(() => {
+            this.agentProfileHeartbeatInFlight = false;
+          });
+      }, heartbeatMs);
+      if (typeof this.agentProfileHeartbeatTimer.unref === 'function') {
+        this.agentProfileHeartbeatTimer.unref();
+      }
     }
 
     // Set up messaging
@@ -1975,7 +2711,16 @@ export class DKGAgent {
             // yet at this point on multi-agent nodes).
             this.localApprovedAgentByCG.set(contextGraphId, approvedAddr.toLowerCase());
             this.log.info(createOperationContext('system'), `Join request approved for "${contextGraphId}" — auto-subscribing`);
-            this.subscribeToContextGraph(contextGraphId);
+            // Defer the SWM gossip subscribe specifically: the curator's
+            // allowlist hasn't synced into our local `_meta` yet, so a
+            // pre-meta `canReadContextGraph` check would deny and emit a
+            // misleading WARN. `runImmediatePostApprovalSync` below pulls
+            // `_meta`, then `refreshMetaSyncedFlags` (called from
+            // `runCatchupOverPeers`) re-queues the SWM gossip subscribe
+            // once the allowlist is locally visible — clean self-heal,
+            // no spurious denial. Other gossip topics (publish/app/
+            // update/finalization) wire up immediately as before.
+            this.subscribeToContextGraph(contextGraphId, { deferSharedMemoryGossipSubscribe: true });
             this.upsertContextGraphMember({
               contextGraphId,
               principalType: 'agent',
@@ -2284,6 +3029,19 @@ export class DKGAgent {
           const message = err instanceof Error ? err.message : String(err);
           this.log.warn(ctx, `Opportunistic Messenger-outbox retry on connect failed for ${remotePeer}: ${message}`);
         }
+        // PR-2 (SWM-fanout plan): drain pending sender-key packages
+        // that were queued because the recipient had no advertised
+        // peerId at publish time. Tolerant of profile-lookup failure
+        // (the next connection:open will retry).
+        try {
+          const drained = await this.drainPendingSenderKeyForPeer(remotePeer, ctx);
+          if (drained > 0) {
+            this.log.info(ctx, `Drained ${drained} pending SWM sender-key package(s) for ${remotePeer}`);
+          }
+        } catch (err: unknown) {
+          const message = err instanceof Error ? err.message : String(err);
+          this.log.warn(ctx, `Pending SWM sender-key drain on connect failed for ${remotePeer}: ${message}`);
+        }
       })();
 
       const now = Date.now();
@@ -2423,6 +3181,54 @@ export class DKGAgent {
     }, SYNC_RECONCILER_INTERVAL_MS);
     if (this.syncReconcilerTimer.unref) this.syncReconcilerTimer.unref();
 
+    // A.4-lite+: keep a small set of Core nodes warm (connection pinned +
+    // auto-redialed by libp2p) so catch-up / chain reconciliation never pays
+    // a cold circuit-relay dial to reach a Core. Opt-in via
+    // DKG_WARM_CORE_CONNECTIONS=1. See `p2p/warm-core-connections.ts`.
+    if (WARM_CORE_CONNECTIONS_ENABLED) {
+      // Serialize passes: one reconcile can run longer than the interval
+      // (discovery + chain gate + up to WARM_CORE_MAX sequential dials, each
+      // with a 20s timeout). Without this guard, overlapping passes race on
+      // `this.warmedCores` and can unpin a Core a newer pass just selected.
+      let warmCoreInFlight = false;
+      const runWarmCore = (): void => {
+        if (warmCoreInFlight) return;
+        warmCoreInFlight = true;
+        this.reconcileWarmCoreConnections()
+          .catch((err: unknown) => {
+            const message = err instanceof Error ? err.message : String(err);
+            this.log.warn(ctx, `Warm-core reconcile tick failed: ${message}`);
+          })
+          .finally(() => {
+            warmCoreInFlight = false;
+          });
+      };
+      // Prime once now (after startup), then on a steady cadence.
+      runWarmCore();
+      this.warmCoreTimer = setInterval(runWarmCore, WARM_CORE_RECONCILE_INTERVAL_MS);
+      if (this.warmCoreTimer.unref) this.warmCoreTimer.unref();
+    }
+
+    // Phase B — chain-driven VM reconciliation. The coalescer collapses a burst
+    // of live KACG nudges for a CG into a single sweep; the periodic timer is
+    // the safety net that backfills missed events / transient fetch failures and
+    // catches up late subscribers (the "Monday Fun Facts" case). Only armed when
+    // the chain adapter exposes the per-CG registration-ordinal reads.
+    if (this.vmReconcileEnabled()) {
+      this.reconcileCoalescer = new ReconcileCoalescer((localCgId) => this.runVmReconcileForCg(localCgId));
+      const runSweep = (): void => {
+        this.runVmReconcileSweep().catch((err: unknown) => {
+          this.log.warn(ctx, `VM reconcile sweep failed: ${err instanceof Error ? err.message : String(err)}`);
+        });
+      };
+      // Prime once after startup so a late subscriber catches up immediately,
+      // then on a steady cadence.
+      runSweep();
+      this.vmReconcileTimer = setInterval(runSweep, DKGAgent.VM_RECONCILE_SWEEP_INTERVAL_MS);
+      if (this.vmReconcileTimer.unref) this.vmReconcileTimer.unref();
+      this.log.info(ctx, `Chain-driven VM reconciliation armed (sweep ${DKGAgent.VM_RECONCILE_SWEEP_INTERVAL_MS}ms, depth ${DKGAgent.VM_RECONCILE_CONFIRMATION_DEPTH})`);
+    }
+
     // rc.9 PR-10: dedicated join-approval retry tick removed. The
     // substrate's Messenger.processOutboxTick (set up immediately
     // below) now drives retries for /dkg/10.0.1/join-request the
@@ -2521,6 +3327,34 @@ export class DKGAgent {
         useWorkerThread: this.config.randomSamplingUseWorkerThread ?? true,
         tickIntervalMs: this.config.randomSamplingTickIntervalMs,
         log: this.randomSamplingLogger(ctx),
+        // OT-RFC-39 late-join sync — gives the prover an escape hatch
+        // when its tick fires on a curated KC whose ciphertext chunks
+        // never reached this core's local triple store (typically: the
+        // core was offline during the curator's publish, or joined the
+        // CG after the gossip envelopes rolled off the mesh). The hook
+        // pulls the missing chunks from authorized peers on demand via
+        // `PROTOCOL_GET_CIPHERTEXT_CHUNK` and persists them, after
+        // which the prover retries the extract exactly once. See
+        // `buildCiphertextChunkBackfill` for the discovery + fetch
+        // policy.
+        ciphertextChunkBackfill: this.buildCiphertextChunkBackfill(ctx),
+        // Codex review on PR #715 — let the prover's extractor pin
+        // the per-CG named graph instead of scanning `GRAPH ?g`. We
+        // chain `resolveLocalCgIdByOnChainId` (numeric → cleartext)
+        // then `gossipWireIdFor` (cleartext → curator nameHash, the
+        // wire form), matching what `ingestSwmCiphertextChunkEnvelope`
+        // and the V2 ACK loadChunk persist/look up under. Returns
+        // null when the local node doesn't have the CG metadata yet
+        // (chain replay still catching up); the extractor falls back
+        // to wildcard scanning for that tick, identical to pre-fix
+        // behaviour, so a missing local map degrades to "no
+        // cross-CG collision guard for this tick" rather than
+        // "extract fails outright".
+        canonicalCgIdForChunkStore: (cgId: bigint): string | null => {
+          const local = this.resolveLocalCgIdByOnChainId(cgId);
+          if (local === null) return null;
+          return this.gossipWireIdFor(local);
+        },
       });
       if (this.randomSamplingHandle && this.randomSamplingHandle !== handle) {
         try { await this.randomSamplingHandle.stop(); } catch { /* swallow bind replacement cleanup */ }
@@ -2676,6 +3510,120 @@ export class DKGAgent {
   }
 
   /**
+   * A.4-lite+: discover Core nodes from the Agent Registry phonebook, gate
+   * them on on-chain ShardingTable membership, and keep a small set warm
+   * (connection pinned + auto-redialed). Best-effort; never throws into the
+   * timer. See `p2p/warm-core-connections.ts`.
+   */
+  private async reconcileWarmCoreConnections(): Promise<void> {
+    if (!this.started) return;
+    const result = await reconcileWarmCoreConnections({
+      selfPeerId: this.node.libp2p.peerId.toString(),
+      maxCores: WARM_CORE_MAX,
+      // Drop Cores not seen within the profile-stale window before the cap, so
+      // a stale phonebook slice can't crowd out live Cores or keep redialing
+      // dead entries (reuses the directory's freshness threshold).
+      staleThresholdMs: AGENT_PROFILE_STALE_THRESHOLD_MS,
+      findCoreAgents: async (): Promise<WarmCoreAgent[]> => {
+        const agents = await this.discovery.findAgents();
+        return agents.map((a) => ({
+          peerId: a.peerId,
+          nodeRole: a.nodeRole,
+          agentAddress: a.agentAddress,
+          lastSeen: a.lastSeen,
+        }));
+      },
+      isShardingTableCore: (agentAddress) => this.isShardingTableCore(agentAddress),
+      isConnected: (peerId) =>
+        this.node.libp2p.getConnections().some((c) => c.remotePeer.toString() === peerId),
+      pin: (peerId) => this.pinWarmCore(peerId),
+      unpin: (peerId, ctx) => this.unpinWarmCore(peerId, ctx),
+      dial: (peerId, ctx) => this.dialWarmCore(peerId, ctx),
+      previouslyWarmed: this.warmedCores,
+      log: (ctx, msg) => this.log.info(ctx, msg),
+    });
+    // Carry the pinned set into the next tick so stale Cores get unpinned.
+    this.warmedCores = result.warmed;
+  }
+
+  /**
+   * Trust gate for warm-core pinning: only pin Cores that are members of the
+   * on-chain ShardingTable (staked nodes). Best-effort — when the chain
+   * adapter can't answer (no chain bound, optional reads absent) the gate
+   * passes so the phonebook `nodeRole='core'` alone decides. A transient
+   * RPC failure denies (we don't pin on an unverifiable gate).
+   */
+  private async isShardingTableCore(agentAddress: string | undefined): Promise<boolean> {
+    const getIdentityIdForAddress = this.chain.getIdentityIdForAddress?.bind(this.chain);
+    const isShardingTableMember = this.chain.isShardingTableMember?.bind(this.chain);
+    if (!getIdentityIdForAddress || !isShardingTableMember) return true; // gate unavailable
+    // A legacy/mixed-version core profile may not carry an operational wallet.
+    // Discovery elsewhere supports profiles without `agentAddress`, so treat
+    // its absence as "gate unavailable" (fall back to phonebook nodeRole)
+    // rather than a hard denial — otherwise the warm set can collapse to zero
+    // in a network with healthy but pre-agentAddress cores.
+    if (!agentAddress) return true; // gate unavailable for this profile
+    try {
+      const identityId = await getIdentityIdForAddress(agentAddress);
+      if (identityId === 0n) return false;
+      return await isShardingTableMember(identityId);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Tag a Core keep-alive in the peerStore — so libp2p's connection manager
+   * maintains + auto-redials it (mirrors the relay keep-alive path in
+   * `core/node.ts`). Idempotent; does NOT dial (see {@link dialWarmCore}).
+   */
+  private async pinWarmCore(peerIdStr: string): Promise<void> {
+    const { peerIdFromString } = await import('@libp2p/peer-id');
+    const peerId = peerIdFromString(peerIdStr);
+    await this.node.libp2p.peerStore.merge(peerId, {
+      tags: { [WARM_CORE_KEEPALIVE_TAG]: { value: 100 } },
+    });
+  }
+
+  /**
+   * Remove the warm-core keep-alive tag from a Core that fell out of the warm
+   * set, so the connection manager stops protecting/redialing it and the
+   * pinned count can't drift above WARM_CORE_MAX over time.
+   */
+  private async unpinWarmCore(peerIdStr: string, ctx: OperationContext): Promise<void> {
+    const shortPeer = peerIdStr.slice(-8);
+    try {
+      const { peerIdFromString } = await import('@libp2p/peer-id');
+      const peerId = peerIdFromString(peerIdStr);
+      // peerStore.merge deletes a tag whose value is `undefined`.
+      await this.node.libp2p.peerStore.merge(peerId, {
+        tags: { [WARM_CORE_KEEPALIVE_TAG]: undefined },
+      });
+      this.log.info(ctx, `warm-core: unpinned ${shortPeer} (no longer selected)`);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.log.info(ctx, `warm-core: unpin ${shortPeer} failed: ${message}`);
+    }
+  }
+
+  /**
+   * Dial a (pinned, not-yet-connected) Core via the existing resolve+dial
+   * path. Returns true on a successful dial.
+   */
+  private async dialWarmCore(peerIdStr: string, ctx: OperationContext): Promise<boolean> {
+    const shortPeer = peerIdStr.slice(-8);
+    try {
+      await this.connectToPeerId(peerIdStr, { timeoutMs: WARM_CORE_DIAL_TIMEOUT_MS });
+      this.log.info(ctx, `warm-core: dialed ${shortPeer}`);
+      return true;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.log.info(ctx, `warm-core: dial ${shortPeer} failed (retry next tick): ${message}`);
+      return false;
+    }
+  }
+
+  /**
    * Reconnect-on-gossip: ensure we have a live libp2p path to the sender of
    * a gossip message we just received. GossipSub delivers messages signed by
    * their original publisher, so `from` is the author regardless of how many
@@ -2768,6 +3716,9 @@ export class DKGAgent {
     contextGraphIds: string[],
     onPhase?: PhaseCallback,
     onAccessDenied?: (contextGraphId: string) => void,
+    // Phase C — optional gap-safe per-CG delta high-water mark resolver. Backed
+    // by a CONTIGUOUS watermark when supplied; omitted ⇒ full scan (default).
+    sinceBatchIdFor?: (contextGraphId: string) => string | undefined,
   ): Promise<DurableSyncResult> {
     const ctx = createOperationContext('sync');
     return runDurableSync({
@@ -2778,6 +3729,7 @@ export class DKGAgent {
       onAccessDenied,
       createContextGraphSyncDeadline: this.createContextGraphSyncDeadline.bind(this),
       fetchSyncPages: this.fetchSyncPages.bind(this),
+      sinceBatchIdFor,
       processDurableBatchInWorker: this.processDurableBatchInWorker.bind(this),
       storeInsert: (quads) => this.store.insert(quads),
       deleteCheckpoint: (key) => this.syncCheckpoints.delete(key),
@@ -2801,6 +3753,7 @@ export class DKGAgent {
     graphUri: string,
     deadline: number,
     snapshotRef?: string,
+    sinceBatchId?: string,
   ): Promise<SyncPageResult> {
     return fetchSyncPages({
       ctx,
@@ -2810,6 +3763,7 @@ export class DKGAgent {
       phase,
       graphUri,
       snapshotRef,
+      sinceBatchId,
       deadline,
       syncPageTimeoutMs: SYNC_PAGE_TIMEOUT_MS,
       syncRouterAttempts: SYNC_ROUTER_ATTEMPTS,
@@ -3033,6 +3987,11 @@ export class DKGAgent {
       ).values()],
       preferredPeerId,
       isPrivateContextGraph,
+    );
+    const coreCount = peers.filter((p) => this.knownCorePeerIds.has(p.toString())).length;
+    this.log.info(
+      ctx,
+      `catchup peer order for "${contextGraphId}": preferred=${preferredPeerId ?? 'none'} cores=${coreCount} total=${peers.length}`,
     );
     return this.runCatchupOverPeers(contextGraphId, includeSharedMemory, peers);
   }
@@ -3328,7 +4287,7 @@ export class DKGAgent {
     preferredPeerId?: string,
     privateOnly = false,
   ): Array<{ toString(): string }> {
-    return orderCatchupPeers(peers, preferredPeerId, privateOnly);
+    return orderCatchupPeers(peers, preferredPeerId, privateOnly, this.knownCorePeerIds);
   }
 
   private async resolvePreferredSyncPeerId(contextGraphId: string): Promise<string | undefined> {
@@ -3408,7 +4367,11 @@ export class DKGAgent {
     const store = this.config.contextGraphSubscriptionStore;
     if (!store) return;
     const sub = this.subscribedContextGraphs.get(contextGraphId);
-    if (!sub?.subscribed) {
+    // Persist member subscriptions AND (Phase D) public CGs this Core hosts —
+    // the host-only record MUST survive restart so a Core that was offline
+    // during a publish remembers it hosts the CG and fills its gap. Drop the
+    // row only when the node neither subscribes to nor hosts the CG.
+    if (!sub?.subscribed && !sub?.coreHosted) {
       void store.delete(contextGraphId).catch((err) => {
         this.log.warn(
           createOperationContext('system'),
@@ -3425,6 +4388,9 @@ export class DKGAgent {
       sharedMemorySynced: sub.sharedMemorySynced,
       metaSynced: sub.metaSynced,
       onChainId: sub.onChainId,
+      onChainHash: sub.onChainHash,
+      lastReconciledOrdinal: sub.lastReconciledOrdinal,
+      coreHosted: sub.coreHosted,
       syncScoped: (this.config.syncContextGraphs ?? []).includes(contextGraphId),
     }).catch((err) => {
       this.log.warn(
@@ -3510,6 +4476,9 @@ export class DKGAgent {
           sharedMemorySynced: row.sharedMemorySynced,
           metaSynced: row.metaSynced,
           onChainId: row.onChainId,
+          onChainHash: row.onChainHash,
+          lastReconciledOrdinal: row.lastReconciledOrdinal,
+          coreHosted: row.coreHosted,
         }, { persist: false });
       }
       for (const row of rows) {
@@ -3737,6 +4706,24 @@ export class DKGAgent {
   }
 
   async publishProfile(): Promise<PublishResult> {
+    // Tail-chain serialization: every caller waits for the prior
+    // `publishProfile()` to settle (success or failure) before
+    // running its own publish. Prevents the startup / heartbeat /
+    // key-rotation / revocation paths from racing each other on
+    // `ProfileManager.currentKcId` and the registry triples.
+    // Codex review of PR #700 round 2.
+    const run = this.publishProfileTail
+      .catch(() => {
+        // swallow prior errors so a transient publish failure does
+        // not poison every subsequent publish for the lifetime of
+        // the agent
+      })
+      .then(() => this.publishProfileImpl());
+    this.publishProfileTail = run;
+    return run;
+  }
+
+  private async publishProfileImpl(): Promise<PublishResult> {
     const pubKeyBase64 = Buffer.from(this.wallet.keypair.publicKey).toString('base64');
     const relayAddrs = this.config.relayPeers;
     const defaultAgent = this.defaultAgentAddress ? this.localAgents.get(this.defaultAgentAddress) : undefined;
@@ -3779,6 +4766,8 @@ export class DKGAgent {
       publicKey: pubKeyBase64,
       relayAddress: relayAddrs?.[0],
       agentAddress: this.defaultAgentAddress,
+      multiaddrs: collectPublishableMultiaddrs(this.node.multiaddrs),
+      lastSeen: new Date().toISOString(),
       encryptionKeys: defaultAgent?.workspaceEncryptionKeys.map((k) => ({
         encryptionKeyAlgorithm: k.encryptionKeyAlgorithm,
         publicEncryptionKey: k.publicEncryptionKey,
@@ -4781,7 +5770,7 @@ export class DKGAgent {
   /**
    * Chain-confirmed verified author identity for a knowledge collection's
    * latest merkle-root entry. Reads
-   * `KnowledgeCollectionStorage.getLatestMerkleRootAuthor(kcId)` via the
+   * `KnowledgeCollectionStorage.getLatestMerkleRootAuthor(kaId)` via the
    * configured chain adapter.
    *
    * Returns:
@@ -4797,9 +5786,9 @@ export class DKGAgent {
    * "no attestation on file" from "feature unavailable" should use this
    * `null` signal — `address(0)` always means the former.
    */
-  async getKnowledgeCollectionAuthor(kcId: bigint): Promise<string | null> {
+  async getKnowledgeCollectionAuthor(kaId: bigint): Promise<string | null> {
     if (typeof this.chain.getLatestMerkleRootAuthor !== 'function') return null;
-    return this.chain.getLatestMerkleRootAuthor(kcId);
+    return this.chain.getLatestMerkleRootAuthor(kaId);
   }
 
   /** V10 Publishing Conviction NFT facade — thin chain-adapter wrappers.
@@ -5386,6 +6375,508 @@ export class DKGAgent {
     return keys;
   }
 
+  /**
+   * #884 review — bound a single chain policy/liveness read on the hot path.
+   * Mirrors the `withTimeout` race in {@link getContextGraphOnChainPolicy}:
+   * resolves to {@link TIMEOUT_SENTINEL} if the underlying RPC HANGS past
+   * {@link CHAIN_POLICY_READ_TIMEOUT_MS}, so callers fail closed instead of
+   * blocking forever. The timer is `unref`'d so a dead RPC never keeps the
+   * process alive.
+   */
+  private raceChainPolicyRead<T>(p: Promise<T>): Promise<T | typeof TIMEOUT_SENTINEL> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<typeof TIMEOUT_SENTINEL>((resolve) => {
+      timer = setTimeout(() => resolve(TIMEOUT_SENTINEL), CHAIN_POLICY_READ_TIMEOUT_MS);
+      timer.unref?.();
+    });
+    return Promise.race([
+      p.finally(() => { if (timer) clearTimeout(timer); }),
+      timeout,
+    ]);
+  }
+
+  /**
+   * #884 review — LIVE-gated on-chain access-policy read for a CANDIDATE
+   * numeric on-chain id. The single trust anchor shared by every "downgrade
+   * to a less-protected path" decision (SWM-plaintext gate + publish-inline
+   * curated probe), so both branches can never diverge.
+   *
+   * Returns the access-policy enum (`0` = public, `1` = private/curated) ONLY
+   * after {@link ChainAdapter.isContextGraphActiveOnChain} proves the slot is
+   * actually live on-chain; otherwise returns `null` (= UNKNOWN, caller fails
+   * closed). This is essential because `getContextGraphAccessPolicy` returns
+   * Solidity's default `0` (= public) for UNKNOWN ids, and the local
+   * access-policy cache can be seeded by best-effort probes of arbitrary ids —
+   * so neither is trustworthy without a liveness proof. Both the liveness and
+   * the policy reads are bounded by {@link raceChainPolicyRead} so a hung RPC
+   * fails closed (`null`) instead of blocking the hot path. A genuine RPC
+   * rejection propagates to the caller (which logs + fails closed in its own
+   * idiom). `null` is returned when: the id is non-numeric/≤0, no liveness
+   * probe is implemented, the slot is not live, a read times out, or the
+   * policy getter is missing / returns an out-of-range value.
+   */
+  private async readLiveOnChainAccessPolicy(
+    onChainId: string,
+    opCtx?: OperationContext,
+  ): Promise<0 | 1 | null> {
+    let numericId: bigint;
+    try {
+      numericId = BigInt(onChainId);
+    } catch {
+      return null;
+    }
+    if (numericId <= 0n) return null;
+
+    if (typeof this.chain.isContextGraphActiveOnChain !== 'function') {
+      // #884 review (🔴 GZEqN): don't strand public CGs SILENTLY. An adapter
+      // that exposes getContextGraphAccessPolicy but NOT the liveness probe
+      // can't prove a slot live, so we fail closed (encrypted) — but emit a
+      // one-shot loud diagnostic so operators/integrators get a runtime signal
+      // that on-chain-public detection is disabled for this adapter, instead
+      // of silently keeping every public CG on the encrypted path. (The
+      // interface documents this fail-closed-on-absence contract; we can't
+      // make the probe a hard type-level requirement without breaking the many
+      // minimal publish-only ChainAdapter implementations.)
+      if (typeof this.chain.getContextGraphAccessPolicy === 'function' && !this.warnedMissingCgLivenessProbe) {
+        this.warnedMissingCgLivenessProbe = true;
+        this.log.warn(
+          opCtx ?? createOperationContext('share'),
+          `Chain adapter implements getContextGraphAccessPolicy but not isContextGraphActiveOnChain — ` +
+          `cannot PROVE on-chain context-graph liveness, so public-on-chain CGs will be kept on the ` +
+          `ENCRYPTED SWM path (fail-closed). Implement isContextGraphActiveOnChain to enable ` +
+          `public-CG plaintext detection.`,
+        );
+      }
+      return null;
+    }
+    const live = await this.raceChainPolicyRead(
+      this.chain.isContextGraphActiveOnChain(numericId),
+    );
+    if (live === TIMEOUT_SENTINEL) {
+      this.log.warn(
+        opCtx ?? createOperationContext('share'),
+        `readLiveOnChainAccessPolicy(${onChainId}): isContextGraphActiveOnChain timed out after ` +
+        `${CHAIN_POLICY_READ_TIMEOUT_MS}ms — treating on-chain access policy as UNKNOWN (fail-closed)`,
+      );
+      return null;
+    }
+    if (live !== true) return null;
+
+    // #884 review (🔴 GZEqI): the slot is LIVE, but DO NOT trust the
+    // onChainAccessPolicyCache for this security-downgrade decision. The cache
+    // is keyed by numeric on-chain id with no chain/deployment epoch, so after
+    // a devnet reset or numeric-id reuse a value cached as public (`0`) on the
+    // OLD chain would survive and force a NEW, possibly-private CG that now
+    // occupies the same slot onto the plaintext path. Always read the access
+    // policy FRESH from chain here (one bounded eth_call — correctness over a
+    // saved RPC). The cache is still WRITTEN below (a fresh, live-verified
+    // value is strictly an improvement for the other, decrypt-gated readers).
+    const getAccessPolicy = this.chain.getContextGraphAccessPolicy;
+    if (typeof getAccessPolicy !== 'function') return null;
+    const policy = await this.raceChainPolicyRead(
+      getAccessPolicy.call(this.chain, numericId),
+    );
+    if (policy === TIMEOUT_SENTINEL) {
+      this.log.warn(
+        opCtx ?? createOperationContext('share'),
+        `readLiveOnChainAccessPolicy(${onChainId}): getContextGraphAccessPolicy timed out after ` +
+        `${CHAIN_POLICY_READ_TIMEOUT_MS}ms — treating on-chain access policy as UNKNOWN (fail-closed)`,
+      );
+      return null;
+    }
+    if (policy === 0 || policy === 1) {
+      this.onChainAccessPolicyCache.set(onChainId, policy);
+      return policy;
+    }
+    return null;
+  }
+
+  /**
+   * True iff `contextGraphId` is DEFINITIVELY public per its on-chain
+   * access policy (policy enum `0`). Gates SWM encryption: an on-chain
+   * public CG is public-readable, so its shared memory must be plaintext
+   * even when it carries a `DKG_ALLOWED_AGENT` list — on a public CG that
+   * list governs *publish authority* (`publishPolicy`), not *read access*.
+   *
+   * Encrypting a public CG's SWM would (a) bootstrap a sender-key
+   * handshake that non-gated recipients correctly reject ("not DKG-agent
+   * gated"), blocking promote/publish, and (b) diverge from the
+   * publisher's plaintext-inline path. `isPrivateContextGraph` cannot
+   * make this call on its own because its allowlist-implies-private
+   * heuristic (for invite-only CGs that carry no `accessPolicy` triple)
+   * also fires for public-with-publish-allowlist CGs — only the on-chain
+   * policy distinguishes the two.
+   *
+   * A "public ⇒ plaintext" decision is gated on a LIVE on-chain proof
+   * (`isContextGraphActiveOnChain`), never on local state alone: the chain
+   * returns access-policy `0` (= public) for UNKNOWN ids, and every local
+   * signal (the access-policy cache — also seeded by best-effort probes of
+   * arbitrary ids, a rehydrated subscription `onChainId`, a persisted
+   * `...OnChainId` triple, or a local `accessPolicy` literal) can be stale or
+   * probe-poisoned after a devnet reset / partial registration.
+   *
+   * When the candidate id is resolved from a LOCAL mapping
+   * (`getContextGraphOnChainId`), the live slot is additionally IDENTITY-BOUND
+   * to this CG via its on-chain committed name-hash (#884 review): the mapping
+   * is persisted local state that survives a devnet reset, so it can point at
+   * a numeric slot now occupied by an UNRELATED CG on a fresh chain — and a
+   * liveness probe alone only proves *some* CG is live there. The on-chain
+   * name-hash is `keccak256(cleartextId)` (deterministic, write-once at
+   * registration), so a reused slot commits a DIFFERENT name; an affirmative
+   * mismatch fails closed. (When no name-hash is committed on either side we
+   * can't disprove identity, so we don't add a new failure there.)
+   *
+   * Fail-closed: returns `false` for private (`1`), unknown/unregistered/
+   * non-live, an identity mismatch, a missing chain getter, an RPC
+   * stall/timeout, or any lookup error, so curated / invite-only /
+   * pre-registration CGs keep their encrypted SWM. The optional `opCtx` tags
+   * the fail-closed diagnostic with the caller's subsystem (share vs publish).
+   */
+  private async isContextGraphPublicOnChain(
+    contextGraphId: string,
+    opCtx?: OperationContext,
+  ): Promise<boolean> {
+    try {
+      // DEFINITIVELY public iff the live-proven on-chain policy is `0`. Every
+      // other tri-state value — `1` (private), `'unregistered'` (no resolvable
+      // slot), `'unknown'` (resolvable but not live / stale mapping / missing
+      // probe / timeout) — is NOT a proof of public, so it fails closed here
+      // (the SWM-gossip caller then keeps the encrypted path). The shared
+      // resolver collapses unknown↔not-public ONLY for this boolean predicate;
+      // the publish-inline probe consumes the tri-state directly so it can
+      // REFUSE (rather than choose plaintext) on a genuine UNKNOWN.
+      return (await this.resolveOnChainAccessPolicyState(contextGraphId, opCtx)) === 0;
+    } catch (err) {
+      // Fail closed (curated/encrypted) on any lookup failure, but not
+      // silently — surface WHY the public override was skipped so operators
+      // get a diagnostic instead of a silent regression. Tag with the CALLER's
+      // operation context (share/promote vs publish-inline probe).
+      this.log.warn(
+        opCtx ?? createOperationContext('share'),
+        `isContextGraphPublicOnChain(${contextGraphId}) lookup failed — treating CG as NOT public ` +
+        `(fail-closed: SWM stays encrypted): ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return false;
+    }
+  }
+
+  /**
+   * #884 review (🔴 GZh-c) — the SINGLE tri-state on-chain access-policy
+   * resolver shared by the SWM-plaintext gate ({@link isContextGraphPublicOnChain})
+   * and the publish-inline curated probe (`probeIsCurated`). Distinguishing
+   * "definitively not public" from "could not prove" is security-relevant:
+   * the boolean gate treats both as fail-closed (encrypt), but the publish
+   * path must REFUSE on a genuine UNKNOWN instead of silently defaulting a
+   * possibly-private CG onto the plaintext-inline path. Returning a tri-state
+   * (rather than a boolean) is what lets the publish caller fail closed by
+   * THROWING while still letting a genuinely pure-local CG keep its plaintext
+   * default.
+   *
+   * Resolution mirrors the addressing rules: a local id maps through
+   * {@link getContextGraphOnChainId} (authoritative for a registered CG whose
+   * user-chosen id is itself numeric), else a bare decimal is treated as a raw
+   * on-chain slot the caller addressed directly. A locally-mapped candidate is
+   * IDENTITY-BOUND to its on-chain committed name-hash before trust (a persisted
+   * mapping survives a devnet reset and can point at a reused slot); an
+   * affirmative mismatch downgrades to `'unknown'` (fail closed), never to a
+   * clean `'unregistered'`.
+   *
+   * Returns:
+   *   - `0` / `1`        — live-proven public / private on-chain policy.
+   *   - `'unregistered'` — no resolvable on-chain slot (a pure-local CG); the
+   *                        publish path keeps its plaintext-inline default.
+   *   - `'unknown'`      — resolvable but UNPROVABLE (slot not live, stale local
+   *                        mapping, no liveness probe, or a bounded-read
+   *                        timeout) → callers fail closed.
+   * A genuine RPC REJECTION propagates (NOT swallowed) so each caller applies
+   * its own fail-closed idiom (the boolean gate logs+returns `false`; the
+   * publish probe logs+returns `null` → "access-policy is unknown" throw).
+   */
+  private async resolveOnChainAccessPolicyState(
+    contextGraphId: string,
+    opCtx?: OperationContext,
+  ): Promise<0 | 1 | 'unregistered' | 'unknown'> {
+    const trimmed = contextGraphId.trim();
+
+    // Resolve a CANDIDATE on-chain id. Local-id resolution is authoritative
+    // for ADDRESSING: getContextGraphOnChainId maps any locally-known
+    // context-graph id — including a registered CG whose user-chosen id is
+    // numeric (a CG "named 42") — to THAT graph's persisted on-chain id.
+    let onChainId: string | null = null;
+    let resolvedFromLocalCg = false;
+    if (typeof this.getContextGraphOnChainId === 'function') {
+      onChainId = await this.getContextGraphOnChainId(contextGraphId);
+      if (onChainId) resolvedFromLocalCg = true;
+    }
+    if (!onChainId && /^\d+$/.test(trimmed)) {
+      // A bare decimal that did NOT resolve to a local mapping is AMBIGUOUS
+      // (#884 review 🔴 GZumY). It is a raw on-chain slot the caller addressed
+      // directly (`share('42')`) ONLY when there is no local context graph by
+      // that id. A local CG whose canonical id is itself numeric (e.g.
+      // `createContextGraph({ id: '42' })`) that simply isn't registered
+      // on-chain yet must stay 'unregistered' (→ plaintext-inline default), not
+      // be misclassified as a raw slot. Only a SUCCESSFUL negative existence
+      // check enables the raw-slot branch.
+      if (typeof this.contextGraphExists === 'function') {
+        let localCgExists: boolean;
+        try {
+          localCgExists = await this.contextGraphExists(trimmed);
+        } catch {
+          // #884 review (🔴 GZ8L5): a flaked existence check is NOT a license
+          // to treat "42" as a raw on-chain slot — slot 42 could be a live
+          // public CG on the current chain and we'd force the WRONG graph onto
+          // plaintext. Fail closed (UNKNOWN) instead of guessing.
+          return 'unknown';
+        }
+        if (!localCgExists) onChainId = trimmed;
+        // else: a local CG named "42" exists but has no on-chain mapping → it
+        // is a pure-local (unregistered) CG; fall through to 'unregistered'.
+      } else {
+        // No local-existence oracle available (minimal adapters / harnesses):
+        // preserve the bare-numeric raw-slot addressing behavior.
+        onChainId = trimmed;
+      }
+    }
+    // No resolvable on-chain slot at all — a pure-local CG (including a
+    // numeric-named local CG not yet registered). This is NOT "unknown": there
+    // is nothing on-chain to fail closed against, so the publish path keeps its
+    // long-standing plaintext-inline default for local-only workspaces (and the
+    // boolean gate reads it as not-public).
+    if (!onChainId) return 'unregistered';
+
+    // IDENTITY BINDING (#884 review GZEqF). A candidate resolved from the
+    // LOCAL mapping must be proven to still BE this CG on the current chain
+    // before we trust its policy — `getContextGraphOnChainId` is persisted
+    // local state that survives a devnet reset, so it can point at a slot now
+    // occupied by an unrelated CG. (The bare-numeric path is the caller
+    // explicitly addressing a raw on-chain slot, so there is no local identity
+    // to re-bind.) An affirmative name-hash mismatch is a STALE mapping → treat
+    // as 'unknown' (fail closed), not 'unregistered' (which would re-enable the
+    // plaintext default for a graph we just proved we can't trust).
+    if (resolvedFromLocalCg && !(await this.localCgMatchesOnChainSlot(contextGraphId, onChainId, opCtx))) {
+      return 'unknown';
+    }
+
+    // LIVE-ON-CHAIN PROOF GATE (#884 review). A trust decision must be backed
+    // by the chain, never by local state alone — see readLiveOnChainAccessPolicy
+    // for the full rationale (default-zero access policy for unknown ids,
+    // probe-poisoned cache, stale rehydrated subscriptions / persisted
+    // mappings). It returns the policy ONLY once the slot is proven live, else
+    // null (UNKNOWN). A genuine RPC rejection propagates to the caller.
+    const policy = await this.readLiveOnChainAccessPolicy(onChainId, opCtx);
+    return policy === 0 || policy === 1 ? policy : 'unknown';
+  }
+
+  /**
+   * #884 review (GZEqF) — additive identity check binding a LOCALLY-resolved
+   * on-chain id back to `contextGraphId` before a security downgrade.
+   *
+   * `getContextGraphOnChainId` reads persisted local state that survives a
+   * devnet reset, so the mapping `localId → onChainId` can point at a numeric
+   * slot now occupied by an UNRELATED CG on a fresh chain;
+   * `isContextGraphActiveOnChain` only proves *some* CG is live at that slot.
+   * The on-chain committed name-hash is the reset-proof identity anchor,
+   * deterministic and write-once at registration. A locally-resolved id maps to
+   * it two legitimate ways (#884 review 🔴 GZumc + 🔴 GaJf_), so an
+   * AFFIRMATIVE match against EITHER clears the gate:
+   *   - a curator-created CG stores its CLEARTEXT id (even one shaped like a
+   *     0x+64-hex string) and registration commits `keccak256(utf8(cleartextId))`;
+   *   - a host-only/core subscription is keyed by the WIRE id itself (cleartext
+   *     never left the curator), so the local id already IS the committed hash —
+   *     but the verbatim form is accepted ONLY when local metadata AFFIRMATIVELY
+   *     proves the subscription is wire-id keyed (#884 review 🔴 GaZky), so a
+   *     hash-shaped cleartext id can't borrow a reused slot's commitment.
+   * A genuinely reused slot commits a DIFFERENT name that matches neither.
+   *
+   * Returns `false` (→ caller fails closed) on an AFFIRMATIVE mismatch (the
+   * committed hash matches neither derivation); whenever the hash cannot be
+   * verified once the adapter EXPOSES `getContextGraphNameHash` (RPC rejection or
+   * read timeout — #884 review 🔴 GZ8L_); AND when the slot has NO committed
+   * name-hash at all (`null` / empty — #884 review 🔴 GaZk2). A missing
+   * commitment is NOT an identity proof: a devnet-reset slot reused by a
+   * different no-commitment public CG would otherwise disable encryption for the
+   * wrong local graph, so a downgrade decision requires an affirmative binding.
+   * Returns `true` (proceed to the liveness/policy gate) where the adapter
+   * cannot supply the anchor at all (no `getContextGraphNameHash` getter), AND
+   * for a DIRECT NUMERIC SELF-ADDRESS — a local id that IS its own numeric
+   * on-chain slot (`onChainId === id`, e.g. a CG mirroring a raw slot created
+   * via the low-level `createOnChainContextGraph` path). The latter is the
+   * caller naming the slot directly, not a cleartext→numeric remapping, so it is
+   * treated like the bare-numeric raw-slot path (not identity-bound) and gated
+   * by liveness + fresh policy alone.
+   */
+  private async localCgMatchesOnChainSlot(
+    contextGraphId: string,
+    onChainId: string,
+    opCtx?: OperationContext,
+  ): Promise<boolean> {
+    const getNameHash = this.chain.getContextGraphNameHash;
+    if (typeof getNameHash !== 'function') return true;
+    let numericId: bigint;
+    try {
+      numericId = BigInt(onChainId);
+    } catch {
+      return true;
+    }
+    if (numericId <= 0n) return true;
+
+    const trimmed = contextGraphId.trim();
+    // DIRECT NUMERIC SELF-ADDRESS: a local CG whose own id IS its numeric
+    // on-chain slot (`getContextGraphOnChainId('42') === '42'` — e.g. a CG
+    // created to mirror a raw slot via the low-level createOnChainContextGraph
+    // path, whose local id is the numeric id itself) is NOT a cleartext→numeric
+    // indirection. It is the caller naming the slot directly, identical to the
+    // bare-numeric raw-slot path which is intentionally NOT identity-bound
+    // (#884 review GZEqF test). There is no separate committed cleartext name to
+    // bind against here (any curator name-hash is unrelated to the numeric id),
+    // so name-hash binding is inapplicable — defer to the liveness + fresh-policy
+    // gate. The stale-mapping risk the name-hash defends against (#884 review
+    // 🔴 GaZk2) only exists for a cleartext id that REMAPS to a different slot.
+    if (/^\d+$/.test(trimmed) && trimmed === onChainId.trim()) return true;
+    // A locally-resolved (cleartext) id can be committed two ways, and both are
+    // legitimate (#884 review 🔴 GZumc + 🔴 GaJf_), so accept a match against EITHER:
+    //   - CLEARTEXT (always): a curator-created CG stores its cleartext id (even
+    //     one that happens to look like a 0x+64-hex string), and registration
+    //     commits keccak256(utf8(cleartextId)). → keccak(utf8(trimmed)).
+    //   - WIRE-FORM (conditional): a host-only/core subscription is keyed by the
+    //     wire id ITSELF (cleartext never left the curator), so the local id
+    //     already IS the committed nameHash. → trimmed verbatim.
+    // The WIRE-FORM branch is only added when LOCAL metadata AFFIRMATIVELY proves
+    // this subscription is wire-id keyed (#884 review 🔴 GaZky). Accepting the
+    // verbatim value for EVERY 0x+64-hex id would make the gate ambiguous between
+    // a real host-mode wire id and a user-chosen cleartext id that merely looks
+    // hash-shaped — a reused/unrelated slot whose committed nameHash equalled
+    // that raw string would then falsely pass. A genuinely reused slot commits a
+    // DIFFERENT name that matches NEITHER accepted form, so this still fails
+    // closed on a true stale mapping while never forcing a wire-keyed host CG
+    // down the fail-closed path forever.
+    const acceptable = new Set<string>();
+    try {
+      acceptable.add(ethers.keccak256(ethers.toUtf8Bytes(trimmed)).toLowerCase());
+    } catch {
+      return true;
+    }
+    if (/^0x[0-9a-fA-F]{64}$/.test(trimmed) && this.isWireIdKeyedSubscription(trimmed)) {
+      acceptable.add(trimmed.toLowerCase());
+    }
+
+    let onChainHash: string | null | typeof TIMEOUT_SENTINEL;
+    try {
+      onChainHash = await this.raceChainPolicyRead(getNameHash.call(this.chain, numericId));
+    } catch (err) {
+      // #884 review (🔴 GZ8L_): the adapter EXPOSES the name-hash getter (we
+      // passed the typeof check above), so an RPC REJECTION means we cannot
+      // VERIFY that the persisted local mapping still points at THIS CG. Fail
+      // closed — a transient flake must not re-enable the plaintext downgrade
+      // for a possibly devnet-reset / reused slot. (Fail-open is reserved for
+      // the explicit opt-out `null` below, where there is no commitment to
+      // check.)
+      this.log.warn(
+        opCtx ?? createOperationContext('share'),
+        `isContextGraphPublicOnChain(${contextGraphId}): getContextGraphNameHash(${onChainId}) failed — ` +
+        `cannot verify local-mapping identity, treating CG as NOT public (fail-closed): ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return false;
+    }
+    if (onChainHash === TIMEOUT_SENTINEL) {
+      // Same as a rejection: the getter exists but the hash couldn't be read in
+      // time, so the mapping identity is UNVERIFIED → fail closed.
+      this.log.warn(
+        opCtx ?? createOperationContext('share'),
+        `isContextGraphPublicOnChain(${contextGraphId}): getContextGraphNameHash(${onChainId}) timed out after ` +
+        `${CHAIN_POLICY_READ_TIMEOUT_MS}ms — cannot verify local-mapping identity, treating CG as NOT public (fail-closed)`,
+      );
+      return false;
+    }
+    // MISSING commitment (`null` / empty): the slot has NO on-chain name-hash.
+    // This is NOT an affirmative identity proof and must NOT re-enable the
+    // plaintext downgrade (#884 review 🔴 GaZk2). After a devnet reset the
+    // persisted `localId → onChainId` mapping can point at a DIFFERENT public CG
+    // that ALSO never committed a name-hash; trusting `null` would then disable
+    // SWM encryption for the WRONG local graph. A downgrade (encrypt→plaintext)
+    // decision requires an AFFIRMATIVE binding, so a missing commitment fails
+    // closed. (Fail-open is reserved for the no-getter case above, where the
+    // adapter cannot supply the anchor at all — distinct from a present getter
+    // returning "no commitment".)
+    if (!onChainHash) {
+      this.log.warn(
+        opCtx ?? createOperationContext('share'),
+        `isContextGraphPublicOnChain(${contextGraphId}): locally-mapped on-chain id ${onChainId} has NO ` +
+        `committed name-hash — cannot affirmatively bind identity (slot reused on a fresh chain?). ` +
+        `Treating CG as NOT public (fail-closed).`,
+      );
+      return false;
+    }
+    if (acceptable.has(onChainHash.toLowerCase())) return true;
+
+    this.log.warn(
+      opCtx ?? createOperationContext('share'),
+      `isContextGraphPublicOnChain(${contextGraphId}): locally-mapped on-chain id ${onChainId} commits ` +
+      `name-hash ${onChainHash.toLowerCase()} ≠ this CG's expected wire id(s) ${[...acceptable].join(' | ')} — ` +
+      `local mapping is STALE (slot reused on a fresh chain?). Treating CG as NOT public (fail-closed).`,
+    );
+    return false;
+  }
+
+  /**
+   * #884 review (🔴 GaZky) — AFFIRMATIVE proof that a 0x+64-hex local CG id is a
+   * host-only/core subscription keyed by the WIRE id (the committed name-hash)
+   * rather than a user-chosen cleartext id that merely looks hash-shaped.
+   *
+   * Host-only auto-subscribe paths (chain-event + discovery-beacon) stage the
+   * wire id AS the local id and record `onChainHash === id` (and the reverse
+   * index `wireIdToLocalCgId[id] === id`). Only that self-referential local
+   * commitment licenses {@link localCgMatchesOnChainSlot} to accept the verbatim
+   * id against the on-chain name-hash; without it the id is treated as cleartext
+   * and must match `keccak256(utf8(id))`, so a reused slot cannot impersonate a
+   * wire-keyed CG just by sharing a hash-shaped string.
+   */
+  private isWireIdKeyedSubscription(localId: string): boolean {
+    if (!/^0x[0-9a-fA-F]{64}$/.test(localId)) return false;
+    const lower = localId.toLowerCase();
+    const sub =
+      this.subscribedContextGraphs?.get(localId) ?? this.subscribedContextGraphs?.get(lower);
+    if (sub?.onChainHash && sub.onChainHash.toLowerCase() === lower) return true;
+    const reverse = this.wireIdToLocalCgId?.get(lower);
+    return !!reverse && reverse.toLowerCase() === lower;
+  }
+
+  /**
+   * Resolve SWM gossip recipients, gating on the CG's on-chain READ access
+   * policy. The store-only resolver (`resolveWorkspaceAgentRecipients`)
+   * flags ANY allowlisted CG as requiring encryption, but a CG that is
+   * PUBLIC on-chain has public-readable SWM — its allowedAgent list
+   * governs publish authority, not read access. Encrypting such a CG
+   * bootstraps a sender-key handshake that non-gated recipients reject
+   * ("not DKG-agent gated"), which surfaced as an HTTP 500 on WM→SWM
+   * promote.
+   *
+   * Gate BEFORE delegating to the store resolver: a public CG takes the
+   * plaintext path without resolving recipient keys at all. This also
+   * avoids the resolver's "Missing public encryption key" throw for an
+   * allowlisted agent whose key isn't locally available — irrelevant for
+   * a public CG that never encrypts. Curated / invite-only / unknown CGs
+   * fall through to the normal (encrypted) recipient resolution.
+   */
+  private async resolveWorkspaceRecipientsGated(
+    input: WorkspaceAgentRecipientResolverInput,
+  ): Promise<WorkspaceAgentRecipientResolution> {
+    if (await this.isContextGraphPublicOnChain(input.contextGraphId, createOperationContext('share'))) {
+      return { requiresEncryption: false, recipients: [] };
+    }
+    // #884 review (🔴): do NOT add a local-metadata fallback here (e.g.
+    // honoring a local `accessPolicy="public"` triple). A local policy literal
+    // is intent, not authoritative on-chain state — a pre-registration graph
+    // or a stale local graph after a devnet reset would then bypass SWM
+    // encryption purely from local metadata and leak allowlisted traffic in
+    // plaintext. When the on-chain probe above cannot establish that the CG is
+    // a LIVE public slot (unknown / not live / RPC flake), fail closed: keep
+    // the encrypted path. A genuinely-public CG resolves correctly through
+    // isContextGraphPublicOnChain's live proof; a transient RPC flake yields a
+    // transient encrypted-path retry, never a plaintext leak.
+    return resolveWorkspaceAgentRecipients(this.store, input);
+  }
+
   private async encryptWorkspacePayloadWithSenderKey(
     input: WorkspaceSenderKeyEncryptInput,
   ): Promise<Uint8Array> {
@@ -5427,6 +6918,19 @@ export class DKGAgent {
     const stateKey = swmSenderStateKey(input.contextGraphId, input.subGraphName, senderAddress);
     let state = this.swmSenderKeySendStates.get(stateKey);
     if (!state || state.membershipHash !== membershipHash) {
+      const pruned = this.prunePendingSenderKeysForEpochRotation({
+        contextGraphId: input.contextGraphId,
+        subGraphName: input.subGraphName,
+        senderAgentAddress: senderAddress,
+      });
+      if (pruned > 0) {
+        this.log.warn(
+          ctx,
+          `SWM sender-key epoch rotation pruned ${pruned} stale pending setup package(s) ` +
+          `for context graph "${input.contextGraphId}${input.subGraphName ? `/${input.subGraphName}` : ''}" sender ${senderAddress}`,
+        );
+        await this.saveSwmSenderKeyState();
+      }
       state = await this.createAndDistributeSwmSenderKeyEpoch({
         contextGraphId: input.contextGraphId,
         subGraphName: input.subGraphName,
@@ -5437,6 +6941,8 @@ export class DKGAgent {
       });
       this.swmSenderKeySendStates.set(stateKey, state);
       await this.saveSwmSenderKeyState();
+    } else {
+      await this.drainPendingSenderKeyForRecipients(resolution.recipients, ctx);
     }
 
     const encrypted = await encryptSwmSenderKeyMessage({
@@ -5497,93 +7003,248 @@ export class DKGAgent {
     // (the recipient daemon has no matching local privkey for them) — that's
     // expected, not a hard error. We only abort when EVERY key for a given
     // agent failed.
-    const failuresByAgent = new Map<string, string[]>();
-    const successByAgent = new Set<string>();
-    const recordFailure = (agent: string, keyId: string, err: unknown) => {
-      const msg = err instanceof Error ? err.message : String(err);
-      const key = agent.toLowerCase();
-      const list = failuresByAgent.get(key) ?? [];
-      list.push(`${keyId}: ${msg}`);
-      failuresByAgent.set(key, list);
-    };
+    //
+    // Fanout runs in parallel via Promise.allSettled. The pre-rc.12 loop
+    // awaited each `messenger.sendReliable` sequentially, so foreground
+    // publish latency scaled as `O(n_recipients × n_keys × send_timeout)` —
+    // a single offline member paid the full per-send timeout before the
+    // loop advanced. Concurrent fanout keeps the wall-clock cost bounded
+    // by the slowest individual send (~`DEFAULT_SEND_TIMEOUT_MS`).
+    //
+    // Concurrent mutation is moot: each per-recipient async closure runs
+    // on the single JS event loop and yields only at `await` points; the
+    // aggregation maps are appended to ONLY in the post-settle pass below.
+    type PerRecipientOutcome =
+      | { kind: 'success'; agentAddress: string }
+      | { kind: 'failure'; agentAddress: string; keyId: string; error: Error };
 
-    for (const recipient of input.recipients) {
-      const recipientAgentAddress = ethers.getAddress(recipient.agentAddress);
-      const pkg = await this.createSignedSwmSenderKeyPackage({
-        state,
-        recipient,
-        senderPrivateKey: input.sender.privateKey,
-      });
+    let pendingSenderKeyQueued = false;
+    const settled = await Promise.allSettled(
+      input.recipients.map(async (recipient): Promise<PerRecipientOutcome> => {
+        const recipientAgentAddress = ethers.getAddress(recipient.agentAddress);
+        const pkg = await this.createSignedSwmSenderKeyPackage({
+          state,
+          recipient,
+          senderPrivateKey: input.sender.privateKey,
+        });
+        const packageBytes = encodeSwmSenderKeyPackage(pkg);
 
-      const isLocalRecipient = this.hasLocalAgent(recipientAgentAddress);
-      if (isLocalRecipient) {
-        try {
-          await this.acceptSwmSenderKeyPackage(pkg, this.node.peerId.toString(), input.ctx);
-          successByAgent.add(recipientAgentAddress.toLowerCase());
-        } catch (err) {
-          recordFailure(recipientAgentAddress, recipient.recipientKeyId, err);
+        if (this.hasLocalAgent(recipientAgentAddress)) {
+          try {
+            await this.acceptSwmSenderKeyPackage(pkg, this.node.peerId.toString(), input.ctx);
+            return { kind: 'success', agentAddress: recipientAgentAddress };
+          } catch (err) {
+            return {
+              kind: 'failure',
+              agentAddress: recipientAgentAddress,
+              keyId: recipient.recipientKeyId,
+              error: err instanceof Error ? err : new Error(String(err)),
+            };
+          }
         }
-        continue;
-      }
 
-      if (!recipient.peerId) {
-        recordFailure(recipientAgentAddress, recipient.recipientKeyId, new Error('no advertised peerId'));
-        continue;
-      }
-
-      this.log.info(
-        input.ctx,
-        `SWM sender-key setup send: senderAgent=${senderAgentAddress} recipientAgent=${recipientAgentAddress} ` +
-        `peerId=${recipient.peerId} contextGraph=${state.contextGraphId}${state.subGraphName ? `/${state.subGraphName}` : ''} ` +
-        `epoch=${state.epochId} membershipHash=${state.membershipHash} recipientKeyId=${recipient.recipientKeyId}`,
-      );
-      try {
-        // rc.9 PR-8: route through messenger.sendReliable so
-        // sender-side idempotency + durable outbox + retry-with-
-        // backoff cover this protocol the same way they cover chat.
-        //
-        // Delivery semantics (C2 integration-pass relaxation):
-        //   • `delivered=true && ack.accepted=true`  → success.
-        //   • `delivered=true && ack.accepted=false` → HARD failure
-        //     (recipient explicitly rejected the package — bad key,
-        //     bad membership hash, etc; queuing won't help).
-        //   • `delivered=false`                      → SOFT success.
-        //     The setup-package landed in the messenger's durable
-        //     outbox and will be replayed when the recipient comes
-        //     back online. Treating this as a hard failure used to
-        //     block any open-publish-CG write whenever the curator
-        //     was offline mid-batch, breaking the "members keep
-        //     publishing under intermittent curator availability"
-        //     contract C2 exercises. The recipient still gets the
-        //     epoch + chain key eventually; the only cost is that
-        //     they can't decrypt the broadcast that immediately
-        //     follows until the queued setup catches up.
-        const sendResult = await this.messenger.sendReliable(
-          recipient.peerId,
-          PROTOCOL_SWM_SENDER_KEY,
-          encodeSwmSenderKeyPackage(pkg),
-        );
-        if (!sendResult.delivered) {
+        if (!recipient.peerId) {
+          // PR-2 (SWM-fanout plan): the recipient agent has no advertised
+          // `dkg:peerId` triple in our local store (typically because we
+          // haven't synced their profile yet, or they really were never
+          // online). Pre-PR-2 this was a HARD failure for that key, and
+          // if every key for the agent landed here the whole publish
+          // threw — turning "one never-seen member" into "publish blocked
+          // for everyone". We now match the messenger.sendReliable
+          // soft-success contract: durably remember the package and
+          // attempt delivery once the agent shows up (via the
+          // connection:open drain below).
+          this.enqueuePendingSenderKey({
+            senderAgentAddress: senderAgentAddress.toLowerCase(),
+            recipientAgentAddress: recipientAgentAddress.toLowerCase(),
+            recipientKeyId: recipient.recipientKeyId,
+            epochId: state.epochId,
+            contextGraphId: state.contextGraphId,
+            subGraphName: state.subGraphName,
+            packageBytes,
+            createdAtMs: Date.now(),
+          });
+          pendingSenderKeyQueued = true;
           this.log.warn(
             input.ctx,
             `SWM sender-key setup for ${recipientAgentAddress} keyId=${recipient.recipientKeyId} ` +
-            `queued (not synchronously deliverable): ${sendResult.error} — recipient will receive on next reconnect`,
+            `queued (no advertised peerId) — will deliver when recipient connects`,
           );
-          successByAgent.add(recipientAgentAddress.toLowerCase());
-          continue;
+          return { kind: 'success', agentAddress: recipientAgentAddress };
         }
-        const ack = decodeSwmSenderKeyPackageAck(sendResult.response);
-        if (
-          ack.version !== SWM_SENDER_KEY_PACKAGE_VERSION ||
-          ack.type !== SWM_SENDER_KEY_PACKAGE_ACK_TYPE ||
-          !ack.accepted
-        ) {
-          recordFailure(recipientAgentAddress, recipient.recipientKeyId, new Error(ack.reason ?? 'unknown reason'));
-        } else {
-          successByAgent.add(recipientAgentAddress.toLowerCase());
+
+        this.log.info(
+          input.ctx,
+          `SWM sender-key setup send: senderAgent=${senderAgentAddress} recipientAgent=${recipientAgentAddress} ` +
+          `peerId=${recipient.peerId} contextGraph=${state.contextGraphId}${state.subGraphName ? `/${state.subGraphName}` : ''} ` +
+          `epoch=${state.epochId} membershipHash=${state.membershipHash} recipientKeyId=${recipient.recipientKeyId}`,
+        );
+        try {
+          // rc.9 PR-8: route through messenger.sendReliable so
+          // sender-side idempotency + durable outbox + retry-with-
+          // backoff cover this protocol the same way they cover chat.
+          //
+          // Delivery semantics (C2 integration-pass relaxation):
+          //   • `delivered=true && ack.accepted=true` → success.
+          //   • `delivered=true && ack.accepted=false` with no reason code,
+          //     or with a known terminal reason (`stale-target`,
+          //     `active-private-key-missing`, `revoked-key`,
+          //     `bad-signature`, `unknown`, ACL/config failures)
+          //     → HARD failure: retrying the same package cannot help.
+          //   • `delivered=true && ack.accepted=false` with an explicitly
+          //     retryable reason → SOFT success: keep it queued so a later
+          //     reconnect/publish can retry after remote view convergence.
+          //   • `delivered=false` → SOFT success.
+          //     The setup-package landed in the messenger's durable
+          //     outbox, but the agent also keeps a local pending row
+          //     under the same messageId so future retries still decode
+          //     the Sender Key ACK and can rotate after delivered
+          //     malformed/retryable responses. Treating this as a hard
+          //     failure used to block any open-publish-CG write whenever
+          //     the curator was offline mid-batch, breaking the "members
+          //     keep publishing under intermittent curator availability"
+          //     contract C2 exercises. The recipient still gets the
+          //     epoch + chain key eventually; the only cost is that
+          //     they can't decrypt the broadcast that immediately
+          //     follows until the queued setup catches up.
+          const messageId = this.swmSenderKeyPackageMessageId(packageBytes);
+          const sendResult = await this.messenger.sendReliable(
+            recipient.peerId,
+            PROTOCOL_SWM_SENDER_KEY,
+            packageBytes,
+            { messageId },
+          );
+          if (!sendResult.delivered) {
+            this.enqueuePendingSenderKey({
+              senderAgentAddress: senderAgentAddress.toLowerCase(),
+              recipientAgentAddress: recipientAgentAddress.toLowerCase(),
+              recipientKeyId: recipient.recipientKeyId,
+              epochId: state.epochId,
+              contextGraphId: state.contextGraphId,
+              subGraphName: state.subGraphName,
+              packageBytes,
+              messageId,
+              createdAtMs: Date.now(),
+            });
+            pendingSenderKeyQueued = true;
+            this.log.warn(
+              input.ctx,
+              `SWM sender-key setup for ${recipientAgentAddress} keyId=${recipient.recipientKeyId} ` +
+              `queued (not synchronously deliverable): ${sendResult.error} — recipient will receive on next reconnect`,
+            );
+            return { kind: 'success', agentAddress: recipientAgentAddress };
+          }
+          let ack: ReturnType<typeof decodeSwmSenderKeyPackageAck>;
+          try {
+            ack = decodeSwmSenderKeyPackageAck(sendResult.response);
+          } catch {
+            this.enqueuePendingSenderKey({
+              senderAgentAddress: senderAgentAddress.toLowerCase(),
+              recipientAgentAddress: recipientAgentAddress.toLowerCase(),
+              recipientKeyId: recipient.recipientKeyId,
+              epochId: state.epochId,
+              contextGraphId: state.contextGraphId,
+              subGraphName: state.subGraphName,
+              packageBytes,
+              messageId: this.nextSwmSenderKeyPackageMessageId(packageBytes),
+              createdAtMs: Date.now(),
+            });
+            pendingSenderKeyQueued = true;
+            this.log.warn(
+              input.ctx,
+              `SWM sender-key setup for ${recipientAgentAddress} keyId=${recipient.recipientKeyId} ` +
+              'queued after malformed Sender Key setup ACK',
+            );
+            return { kind: 'success', agentAddress: recipientAgentAddress };
+          }
+          if (
+            ack.version !== SWM_SENDER_KEY_PACKAGE_VERSION ||
+            ack.type !== SWM_SENDER_KEY_PACKAGE_ACK_TYPE
+          ) {
+            this.enqueuePendingSenderKey({
+              senderAgentAddress: senderAgentAddress.toLowerCase(),
+              recipientAgentAddress: recipientAgentAddress.toLowerCase(),
+              recipientKeyId: recipient.recipientKeyId,
+              epochId: state.epochId,
+              contextGraphId: state.contextGraphId,
+              subGraphName: state.subGraphName,
+              packageBytes,
+              messageId: this.nextSwmSenderKeyPackageMessageId(packageBytes),
+              createdAtMs: Date.now(),
+            });
+            pendingSenderKeyQueued = true;
+            this.log.warn(
+              input.ctx,
+              `SWM sender-key setup for ${recipientAgentAddress} keyId=${recipient.recipientKeyId} ` +
+              `queued after incompatible Sender Key setup ACK version/type (${ack.version}/${ack.type})`,
+            );
+            return { kind: 'success', agentAddress: recipientAgentAddress };
+          }
+          if (!ack.accepted) {
+            const reason = ack.reason ?? 'unknown reason';
+            if (this.isRetryableSwmSenderKeySetupAckReason(ack.reasonCode)) {
+              this.enqueuePendingSenderKey({
+                senderAgentAddress: senderAgentAddress.toLowerCase(),
+                recipientAgentAddress: recipientAgentAddress.toLowerCase(),
+                recipientKeyId: recipient.recipientKeyId,
+                epochId: state.epochId,
+                contextGraphId: state.contextGraphId,
+                subGraphName: state.subGraphName,
+                packageBytes,
+                messageId: this.nextSwmSenderKeyPackageMessageId(packageBytes),
+                createdAtMs: Date.now(),
+              });
+              pendingSenderKeyQueued = true;
+              this.log.warn(
+                input.ctx,
+                `SWM sender-key setup for ${recipientAgentAddress} keyId=${recipient.recipientKeyId} ` +
+                `queued after retryable rejection (${ack.reasonCode ?? 'legacy-unknown'}): ${reason}`,
+              );
+              return { kind: 'success', agentAddress: recipientAgentAddress };
+            }
+            return {
+              kind: 'failure',
+              agentAddress: recipientAgentAddress,
+              keyId: recipient.recipientKeyId,
+              error: new Error(`${ack.reasonCode ? `${ack.reasonCode}: ` : ''}${reason}`),
+            };
+          }
+          return { kind: 'success', agentAddress: recipientAgentAddress };
+        } catch (err) {
+          return {
+            kind: 'failure',
+            agentAddress: recipientAgentAddress,
+            keyId: recipient.recipientKeyId,
+            error: err instanceof Error ? err : new Error(String(err)),
+          };
         }
-      } catch (err) {
-        recordFailure(recipientAgentAddress, recipient.recipientKeyId, err);
+      }),
+    );
+
+    const failuresByAgent = new Map<string, string[]>();
+    const successByAgent = new Set<string>();
+    for (let i = 0; i < settled.length; i++) {
+      const r = settled[i];
+      if (r.status === 'rejected') {
+        // The per-recipient closure catches all throw paths and returns a
+        // failure outcome, so a rejection here means the closure itself
+        // crashed (programmer error). Record it against the recipient so
+        // the surrounding logic doesn't lose track of the slot.
+        const recipient = input.recipients[i];
+        const agent = ethers.getAddress(recipient.agentAddress).toLowerCase();
+        const list = failuresByAgent.get(agent) ?? [];
+        list.push(`${recipient.recipientKeyId}: ${String(r.reason)}`);
+        failuresByAgent.set(agent, list);
+        continue;
+      }
+      const outcome = r.value;
+      if (outcome.kind === 'success') {
+        successByAgent.add(outcome.agentAddress.toLowerCase());
+      } else {
+        const agent = outcome.agentAddress.toLowerCase();
+        const list = failuresByAgent.get(agent) ?? [];
+        list.push(`${outcome.keyId}: ${outcome.error.message}`);
+        failuresByAgent.set(agent, list);
       }
     }
 
@@ -5601,12 +7262,287 @@ export class DKGAgent {
       }
     }
     if (fatalAgents.length > 0) {
+      if (pendingSenderKeyQueued) {
+        await this.saveSwmSenderKeyState();
+      }
       throw new Error(
         `SWM Sender Key setup rejected by ${fatalAgents.length} agent(s): ${fatalAgents.join(' | ')}`,
       );
     }
 
     return state;
+  }
+
+  private swmSenderKeySetupAckReasonCode(err: unknown): SwmSenderKeyPackageAckReasonCode {
+    if (err instanceof StaleSenderKeyTargetError) {
+      return 'stale-target';
+    }
+    if (err instanceof SwmSenderKeySetupRejectionError) {
+      return err.reasonCode;
+    }
+    return 'unknown';
+  }
+
+  private isRetryableSwmSenderKeySetupAckReason(
+    reasonCode: SwmSenderKeyPackageAckReasonCode | undefined,
+  ): boolean {
+    if (!reasonCode) return false;
+    return (SWM_SENDER_KEY_PACKAGE_ACK_RETRYABLE_REASON_CODES as readonly string[]).includes(reasonCode);
+  }
+
+  private swmSenderKeyPackageMessageId(packageBytes: Uint8Array): string {
+    return `swm-sender-key:${createHash('sha256').update(packageBytes).digest('hex')}`;
+  }
+
+  private nextSwmSenderKeyPackageMessageId(packageBytes: Uint8Array): string {
+    return `${this.swmSenderKeyPackageMessageId(packageBytes)}:${randomUUID()}`;
+  }
+
+  private swmSenderKeyPendingMessageId(entry: PendingSenderKeyEntry): string {
+    return entry.messageId ?? this.swmSenderKeyPackageMessageId(entry.packageBytes);
+  }
+
+  private rotateSwmSenderKeyPendingMessageId(entry: PendingSenderKeyEntry): PendingSenderKeyEntry {
+    return {
+      ...entry,
+      messageId: this.nextSwmSenderKeyPackageMessageId(entry.packageBytes),
+    };
+  }
+
+  /**
+   * PR-2 (SWM-fanout plan): enqueue a sender-key package whose recipient
+   * has no advertised `dkg:peerId` (so we can't even ask the messenger
+   * to queue it). Older epochs for the same `(sender, recipient)` pair
+   * are evicted — a newer epoch supersedes them by definition.
+   *
+   * Per-key dedup: `(senderAgentAddress, recipientKeyId, epochId)`
+   * matches an existing row, we replace it (idempotent re-enqueue).
+   */
+  private enqueuePendingSenderKey(entry: PendingSenderKeyEntry): void {
+    const recipientKey = entry.recipientAgentAddress.toLowerCase();
+    const existing = this.pendingSenderKeyByAgent.get(recipientKey) ?? [];
+    // Drop older epochs for the same (sender, recipient) pair; the newer
+    // epoch's membership-hash supersedes them. Keep entries for OTHER
+    // senders / recipients unchanged.
+    const filtered = existing.filter((e) => {
+      if (e.senderAgentAddress !== entry.senderAgentAddress) return true;
+      if (e.epochId === entry.epochId) {
+        // Same epoch: dedupe by recipientKeyId — caller may re-enqueue
+        // on retry. Replace by dropping the old slot; the new one is
+        // appended below.
+        return e.recipientKeyId !== entry.recipientKeyId;
+      }
+      return false;
+    });
+    filtered.push(entry);
+    this.pendingSenderKeyByAgent.set(recipientKey, filtered);
+  }
+
+  private prunePendingSenderKeysForEpochRotation(input: {
+    contextGraphId: string;
+    subGraphName?: string;
+    senderAgentAddress: string;
+  }): number {
+    const senderAgentAddress = ethers.getAddress(input.senderAgentAddress).toLowerCase();
+    let removed = 0;
+    for (const [recipientKey, queue] of this.pendingSenderKeyByAgent.entries()) {
+      const kept = queue.filter((entry) => {
+        const matches =
+          entry.senderAgentAddress === senderAgentAddress &&
+          entry.contextGraphId === input.contextGraphId &&
+          (entry.subGraphName ?? undefined) === (input.subGraphName ?? undefined);
+        if (matches) removed += 1;
+        return !matches;
+      });
+      if (kept.length === 0) {
+        this.pendingSenderKeyByAgent.delete(recipientKey);
+      } else {
+        this.pendingSenderKeyByAgent.set(recipientKey, kept);
+      }
+    }
+    return removed;
+  }
+
+  private async drainPendingSenderKeyQueueForPeer(input: {
+    peerId: string;
+    recipientAgentAddress: string;
+    ctx?: OperationContext;
+  }): Promise<number> {
+    const recipientAgentAddress = input.recipientAgentAddress.toLowerCase();
+    const existingDrain = this.pendingSenderKeyDrainByAgent.get(recipientAgentAddress);
+    if (existingDrain) {
+      await existingDrain;
+      if (!this.pendingSenderKeyByAgent.has(recipientAgentAddress)) return 0;
+      return this.drainPendingSenderKeyQueueForPeer(input);
+    }
+    const drain = this.drainPendingSenderKeyQueueForPeerLocked({
+      peerId: input.peerId,
+      recipientAgentAddress,
+      ctx: input.ctx,
+    }).finally(() => {
+      if (this.pendingSenderKeyDrainByAgent.get(recipientAgentAddress) === drain) {
+        this.pendingSenderKeyDrainByAgent.delete(recipientAgentAddress);
+      }
+    });
+    this.pendingSenderKeyDrainByAgent.set(recipientAgentAddress, drain);
+    return drain;
+  }
+
+  private async drainPendingSenderKeyQueueForPeerLocked(input: {
+    peerId: string;
+    recipientAgentAddress: string;
+    ctx?: OperationContext;
+  }): Promise<number> {
+    const recipientAgentAddress = input.recipientAgentAddress;
+    const queue = this.pendingSenderKeyByAgent.get(recipientAgentAddress);
+    if (!queue || queue.length === 0) return 0;
+
+    let drained = 0;
+    const remaining: PendingSenderKeyEntry[] = [];
+    for (let i = 0; i < queue.length; i += 1) {
+      const entry = queue[i];
+      try {
+        const sendResult = await this.messenger.sendReliable(
+          input.peerId,
+          PROTOCOL_SWM_SENDER_KEY,
+          entry.packageBytes,
+          { messageId: this.swmSenderKeyPendingMessageId(entry) },
+        );
+        if (!sendResult.delivered) {
+          if (sendResult.queued || ('inFlight' in sendResult && sendResult.inFlight)) {
+            remaining.push(entry);
+            continue;
+          }
+          throw new Error(`Unexpected undelivered Sender Key retry result: ${sendResult.error}`);
+        }
+        let ack: ReturnType<typeof decodeSwmSenderKeyPackageAck>;
+        try {
+          ack = decodeSwmSenderKeyPackageAck(sendResult.response);
+        } catch {
+          // Malformed/legacy ACK: no positive acceptance yet. Keep the
+          // row queued so a mixed-version rollout cannot strand the recipient.
+          remaining.push(this.rotateSwmSenderKeyPendingMessageId(entry));
+          continue;
+        }
+        if (
+          ack.version !== SWM_SENDER_KEY_PACKAGE_VERSION ||
+          ack.type !== SWM_SENDER_KEY_PACKAGE_ACK_TYPE
+        ) {
+          // Malformed/legacy ACK: no positive acceptance yet. Keep the
+          // row queued so a mixed-version rollout cannot strand the recipient.
+          remaining.push(this.rotateSwmSenderKeyPendingMessageId(entry));
+          continue;
+        }
+        if (ack.accepted) {
+          drained += 1;
+        } else if (this.isRetryableSwmSenderKeySetupAckReason(ack.reasonCode)) {
+          remaining.push(this.rotateSwmSenderKeyPendingMessageId(entry));
+        } else {
+          const reason = ack.reason ?? 'unknown reason';
+          const reasonCode = ack.reasonCode ?? 'legacy-unknown';
+          this.log.warn(
+            input.ctx ?? SWM_SENDER_KEY_PENDING_DRAIN_LOG_CTX,
+            `SWM sender-key pending retry for ${entry.recipientAgentAddress} keyId=${entry.recipientKeyId} ` +
+            `peerId=${input.peerId} contextGraph=${entry.contextGraphId}${entry.subGraphName ? `/${entry.subGraphName}` : ''} ` +
+            `dropped after terminal rejection (${reasonCode}): ${reason}`,
+          );
+          // Terminal rejection: keep it out of the queue, but do not
+          // report it as a successful drain.
+        }
+      } catch (err) {
+        remaining.push(...queue.slice(i));
+        if (remaining.length === 0) {
+          this.pendingSenderKeyByAgent.delete(recipientAgentAddress);
+        } else {
+          this.pendingSenderKeyByAgent.set(recipientAgentAddress, remaining);
+        }
+        await this.saveSwmSenderKeyState();
+        const message = err instanceof Error ? err.message : String(err);
+        this.log.warn(
+          input.ctx ?? SWM_SENDER_KEY_PENDING_DRAIN_LOG_CTX,
+          `SWM sender-key pending retry for ${entry.recipientAgentAddress} keyId=${entry.recipientKeyId} ` +
+          `peerId=${input.peerId} contextGraph=${entry.contextGraphId}${entry.subGraphName ? `/${entry.subGraphName}` : ''} ` +
+          `failed before the Messenger substrate queued a retry: ${message}`,
+        );
+        throw err;
+      }
+    }
+
+    if (remaining.length === 0) {
+      this.pendingSenderKeyByAgent.delete(recipientAgentAddress);
+    } else {
+      this.pendingSenderKeyByAgent.set(recipientAgentAddress, remaining);
+    }
+    await this.saveSwmSenderKeyState();
+    return drained;
+  }
+
+  /**
+   * Drain queued sender-key packages whose recipient agent is one of
+   * the agent addresses advertised by `peerId`. Returns the number of
+   * rows successfully delivered (acked) and removed.
+   *
+   * Fired from the `connection:open` listener — see line 2382 — so the
+   * cost lives on the cold path of "we just connected to a new peer",
+   * not on every share. Each successful `sendReliable` with
+   * `delivered=true && ack.accepted=true` deletes the row and counts as
+   * drained; soft (`delivered=false`) and explicitly retryable delivered
+   * rejections leave it queued for the next attempt; terminal delivered
+   * rejections are logged and deleted without counting as drained.
+   */
+  private async drainPendingSenderKeyForPeer(peerId: string, ctx?: OperationContext): Promise<number> {
+    await this.loadSwmSenderKeyState();
+    if (this.pendingSenderKeyByAgent.size === 0) return 0;
+    let drained = 0;
+    let agentAddresses: string[] = [];
+    try {
+      const profile = await this.discovery.findAgentByPeerId(peerId);
+      if (profile?.agentAddress) {
+        agentAddresses = [profile.agentAddress.toLowerCase()];
+      }
+    } catch {
+      // Resolution failure is benign — we'll try again on the next
+      // connection:open burst. Don't propagate.
+    }
+    if (agentAddresses.length === 0) return 0;
+
+    for (const recipientAgentAddress of agentAddresses) {
+      drained += await this.drainPendingSenderKeyQueueForPeer({ peerId, recipientAgentAddress, ctx });
+    }
+    return drained;
+  }
+
+  /**
+   * Retry queued sender-key setup for recipients that are reachable in the
+   * current workspace recipient snapshot. This covers already-established
+   * connections where no fresh connection:open event will fire after the
+   * remote membership/key view converges.
+   */
+  private async drainPendingSenderKeyForRecipients(
+    recipients: readonly WorkspaceAgentRecipient[],
+    ctx?: OperationContext,
+  ): Promise<number> {
+    if (this.pendingSenderKeyByAgent.size === 0) return 0;
+
+    const peerByAgent = new Map<string, string>();
+    for (const recipient of recipients) {
+      if (!recipient.peerId) continue;
+      const recipientAgentAddress = recipient.agentAddress.toLowerCase();
+      if (!this.pendingSenderKeyByAgent.has(recipientAgentAddress)) continue;
+      if (!peerByAgent.has(recipientAgentAddress)) {
+        peerByAgent.set(recipientAgentAddress, recipient.peerId);
+      }
+    }
+    if (peerByAgent.size === 0) return 0;
+
+    let drained = 0;
+    for (const [recipientAgentAddress, peerId] of peerByAgent.entries()) {
+      drained += await this.drainPendingSenderKeyQueueForPeer({ peerId, recipientAgentAddress, ctx });
+    }
+    if (drained > 0 && ctx) {
+      this.log.info(ctx, `SWM sender-key pending retry drained ${drained} queued package(s) during publish`);
+    }
+    return drained;
   }
 
   private async createSignedSwmSenderKeyPackage(input: {
@@ -5771,6 +7707,7 @@ export class DKGAgent {
         type: SWM_SENDER_KEY_PACKAGE_ACK_TYPE,
         accepted: false,
         reason,
+        reasonCode: this.swmSenderKeySetupAckReasonCode(err),
         contextGraphId: pkg?.contextGraphId,
         subGraphName: pkg?.subGraphName,
         senderAgentAddress: pkg?.senderAgentAddress,
@@ -5793,22 +7730,37 @@ export class DKGAgent {
       ethers.hexlify(pkg.signature),
     );
     if (recovered.toLowerCase() !== senderAgentAddress.toLowerCase()) {
-      throw new Error(`Sender Key setup signature recovered ${recovered}, expected ${senderAgentAddress}`);
+      throw new SwmSenderKeySetupRejectionError(
+        'bad-signature',
+        `Sender Key setup signature recovered ${recovered}, expected ${senderAgentAddress}`,
+      );
     }
 
     const agentGateAddresses = await this.getContextGraphAgentGateAddresses(pkg.contextGraphId);
     if (!agentGateAddresses) {
-      throw new Error(`Context graph "${pkg.contextGraphId}" is not DKG-agent gated`);
+      throw new SwmSenderKeySetupRejectionError(
+        'not-agent-gated',
+        `Context graph "${pkg.contextGraphId}" is not DKG-agent gated`,
+      );
     }
     const agentGateSet = new Set(agentGateAddresses.map((agent) => agent.toLowerCase()));
     if (!agentGateSet.has(senderAgentAddress.toLowerCase())) {
-      throw new Error(`Sender agent ${senderAgentAddress} is not allowed for context graph "${pkg.contextGraphId}"`);
+      throw new SwmSenderKeySetupRejectionError(
+        'sender-not-allowed',
+        `Sender agent ${senderAgentAddress} is not allowed for context graph "${pkg.contextGraphId}"`,
+      );
     }
     if (!agentGateSet.has(recipientAgentAddress.toLowerCase())) {
-      throw new Error(`Recipient agent ${recipientAgentAddress} is not allowed for context graph "${pkg.contextGraphId}"`);
+      throw new SwmSenderKeySetupRejectionError(
+        'recipient-not-allowed',
+        `Recipient agent ${recipientAgentAddress} is not allowed for context graph "${pkg.contextGraphId}"`,
+      );
     }
     if (!this.hasLocalAgent(recipientAgentAddress)) {
-      throw new Error(`Recipient agent ${recipientAgentAddress} is not local to this node`);
+      throw new SwmSenderKeySetupRejectionError(
+        'recipient-not-local',
+        `Recipient agent ${recipientAgentAddress} is not local to this node`,
+      );
     }
 
     // `activeOnly: true` is the security gate added in Codex review of
@@ -5851,13 +7803,17 @@ export class DKGAgent {
         (entry) => entry.encryptionKeyId === pkg.recipientKeyId && !entry.revokedAt,
       );
       if (activeEntry) {
-        throw new Error(`No local X25519 private key for DKG agent ${recipientAgentAddress} key ${pkg.recipientKeyId}`);
+        throw new SwmSenderKeySetupRejectionError(
+          'active-private-key-missing',
+          `No local X25519 private key for DKG agent ${recipientAgentAddress} key ${pkg.recipientKeyId}`,
+        );
       }
       const revokedEntry = record?.workspaceEncryptionKeys.find(
         (entry) => entry.encryptionKeyId === pkg.recipientKeyId && entry.revokedAt,
       );
       if (revokedEntry) {
-        throw new Error(
+        throw new SwmSenderKeySetupRejectionError(
+          'revoked-key',
           `Recipient key ${pkg.recipientKeyId} for DKG agent ${recipientAgentAddress} ` +
           `was revoked at ${revokedEntry.revokedAt}; refusing to bootstrap a new sender-key ` +
           'epoch against a retired key. The sender must resolve the agent profile and retry ' +
@@ -6063,6 +8019,7 @@ export class DKGAgent {
       const parsed = JSON.parse(raw) as {
         send?: Array<Record<string, unknown>>;
         receive?: Array<Record<string, unknown>>;
+        pending?: Array<Record<string, unknown>>;
       };
       for (const entry of parsed.send ?? []) {
         const state = deserializeSwmSenderSendState(entry);
@@ -6078,10 +8035,41 @@ export class DKGAgent {
           state,
         );
       }
+      const pendingByAgent = new Map<string, PendingSenderKeyEntry[]>();
+      let skippedPendingRows = 0;
+      for (const entry of parsed.pending ?? []) {
+        let pending: PendingSenderKeyEntry;
+        try {
+          pending = deserializePendingSenderKeyEntry(entry);
+        } catch (err) {
+          skippedPendingRows += 1;
+          const raw = entry && typeof entry === 'object' ? entry as Record<string, unknown> : {};
+          const sender = typeof raw.senderAgentAddress === 'string' ? raw.senderAgentAddress : 'unknown-sender';
+          const recipient = typeof raw.recipientAgentAddress === 'string' ? raw.recipientAgentAddress : 'unknown-recipient';
+          const contextGraph = typeof raw.contextGraphId === 'string' ? raw.contextGraphId : 'unknown-context-graph';
+          const subGraph = typeof raw.subGraphName === 'string' ? `/${raw.subGraphName}` : '';
+          this.log.warn(
+            createOperationContext('share'),
+            `Skipped malformed SWM sender-key pending row #${skippedPendingRows} ` +
+            `(sender=${sender}, recipient=${recipient}, contextGraph=${contextGraph}${subGraph}): ` +
+            `${err instanceof Error ? err.message : String(err)}`,
+          );
+          continue;
+        }
+        const recipientKey = pending.recipientAgentAddress.toLowerCase();
+        const queue = pendingByAgent.get(recipientKey) ?? [];
+        queue.push(pending);
+        pendingByAgent.set(recipientKey, queue);
+      }
+      this.pendingSenderKeyByAgent.clear();
+      for (const [recipientKey, queue] of pendingByAgent.entries()) {
+        this.pendingSenderKeyByAgent.set(recipientKey, queue);
+      }
     } catch {
       // No durable state yet, or a corrupt file that should not unblock startup.
       this.swmSenderKeySendStates.clear();
       this.swmSenderKeyReceiveStates.clear();
+      this.pendingSenderKeyByAgent.clear();
     }
   }
 
@@ -6095,6 +8083,8 @@ export class DKGAgent {
       version: 1,
       send: [...this.swmSenderKeySendStates.values()].map(serializeSwmSenderSendState),
       receive: [...this.swmSenderKeyReceiveStates.values()].map(serializeSwmSenderReceiveState),
+      pending: [...this.pendingSenderKeyByAgent.values()]
+        .flatMap((queue) => queue.map(serializePendingSenderKeyEntry)),
     };
     await writeFile(path, JSON.stringify(payload, null, 2), { mode: 0o600 });
     try {
@@ -6671,6 +8661,7 @@ export class DKGAgent {
       accessPolicy: opts?.accessPolicy,
       allowedPeers: opts?.allowedPeers,
       entityProofs: opts?.entityProofs,
+      publishEpochs: opts?.publishEpochs,
       // Stringify bigint for JSON-safe persistence; preserve `0n` (mode d).
       publisherNodeIdentityIdOverride: opts?.publisherNodeIdentityIdOverride !== undefined
         ? (opts.publisherNodeIdentityIdOverride.toString() as `${bigint}`)
@@ -6729,14 +8720,14 @@ export class DKGAgent {
   ): Promise<LiftRequestAuthorSeal | undefined> {
     if (this.chain.isV10Ready?.() !== true) return undefined;
     if (typeof this.chain.getEvmChainId !== 'function') return undefined;
-    if (typeof this.chain.getKnowledgeAssetsV10Address !== 'function') return undefined;
+    if (typeof this.chain.getKnowledgeAssetsLifecycleAddress !== 'function') return undefined;
 
     const onChainId = await this.getContextGraphOnChainId(request.contextGraphId);
     if (onChainId == null) return undefined; // CG not on-chain — publisher goes tentative
 
 
     const chainId = await this.chain.getEvmChainId();
-    const kav10Address = await this.chain.getKnowledgeAssetsV10Address();
+    const kav10Address = await this.chain.getKnowledgeAssetsLifecycleAddress();
     if (chainId === undefined || kav10Address === undefined) return undefined;
 
     const graphManager = new GraphManager(this.store);
@@ -6856,7 +8847,7 @@ export class DKGAgent {
     if (
       onChainId != null &&
       typeof this.chain.getEvmChainId === 'function' &&
-      typeof this.chain.getKnowledgeAssetsV10Address === 'function'
+      typeof this.chain.getKnowledgeAssetsLifecycleAddress === 'function'
     ) {
       try {
         precomputedAttestation = await this._buildPrecomputedAttestationForSelection(
@@ -6901,6 +8892,17 @@ export class DKGAgent {
       undefined,
       onChainId ?? undefined,
     );
+    // OT-RFC-38 LU-11 — also resolve the chunked emitter for curated
+    // CGs. When set, the publisher prefers this path: chunks fan out
+    // via SWM gossip and the V2 ACK carries only the commitment.
+    // Public CGs short-circuit to `undefined` here just like the
+    // single-blob resolver above.
+    const encryptInlineChunked = await this._resolveEncryptInlineChunked(
+      contextGraphId,
+      opts?.subGraphName,
+      undefined,
+      onChainId ?? undefined,
+    );
 
     const result = await this.publisher.publish({
       contextGraphId,
@@ -6914,32 +8916,58 @@ export class DKGAgent {
       onPhase,
       v10ACKProvider,
       publishContextGraphId: onChainId ?? undefined,
+      publishEpochs: opts?.publishEpochs,
       precomputedAttestation,
       encryptInlinePayload,
+      encryptInlineChunked,
     });
 
     onPhase?.('broadcast', 'start');
     this.log.info(ctx, `Local publish complete, broadcasting to peers`);
     await this.broadcastPublish(contextGraphId, result, ctx);
     onPhase?.('broadcast', 'end');
-    this.log.info(ctx, `Publish complete — status=${result.status} kcId=${result.kcId}`);
+    this.log.info(ctx, `Publish complete — status=${result.status} kaId=${result.kaId}`);
     return result;
   }
 
   async update(
-    kcId: bigint, contextGraphId: string, quads: Quad[], privateQuads?: Quad[],
-    opts?: { onPhase?: PhaseCallback; operationCtx?: OperationContext },
+    kaId: bigint, contextGraphId: string, quads: Quad[], privateQuads?: Quad[],
+    opts?: {
+      onPhase?: PhaseCallback;
+      operationCtx?: OperationContext;
+      precomputedUpdateAttestation?: PublishOptions['precomputedUpdateAttestation'];
+    },
   ): Promise<PublishResult> {
     const ctx = opts?.operationCtx ?? createOperationContext('update');
     const onPhase = opts?.onPhase;
-    this.log.info(ctx, `Starting update of kcId=${kcId} in context graph "${contextGraphId}" with ${quads.length} triples`);
-    const result = await this.publisher.update(kcId, {
+    this.log.info(ctx, `Starting update of kaId=${kaId} in context graph "${contextGraphId}" with ${quads.length} triples`);
+    // GH #842: thread the on-chain cgId so the publisher can promote the update
+    // payload into the per-cgId partition the RS prover reads. Without it,
+    // updated KAs stay unprovable (data-corrupted / leaf-count-mismatch).
+    // Best-effort: a store/ontology failure here must NOT abort the on-chain
+    // update — the RS sync is a downstream concern and the unguarded await
+    // would let any local lookup error tank the entire update RPC (Codex
+    // review #3 on PR #845).
+    let updateOnChainId: string | null = null;
+    try {
+      updateOnChainId = await this.getContextGraphOnChainId(contextGraphId);
+    } catch (err) {
+      this.log.warn(
+        ctx,
+        `Failed to resolve on-chain cgId for "${contextGraphId}" prior to update; per-cgId RS promotion will be skipped: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+    const result = await this.publisher.update(kaId, {
       contextGraphId,
       quads,
       privateQuads,
       publisherPeerId: this.node.peerId.toString(),
+      publishContextGraphId: updateOnChainId ?? undefined,
       operationCtx: ctx,
       onPhase,
+      precomputedUpdateAttestation: opts?.precomputedUpdateAttestation,
     });
     this.log.info(ctx, `Update complete — status=${result.status}`);
 
@@ -6953,7 +8981,7 @@ export class DKGAgent {
         const nquadsBytes = new TextEncoder().encode(nquadsStr);
         const message = encodeKAUpdateRequest({
           contextGraphId: contextGraphId,
-          batchId: kcId,
+          batchId: kaId,
           nquads: nquadsBytes,
           manifest: result.kaManifest.map((m) => ({
             rootEntity: m.rootEntity,
@@ -6970,7 +8998,7 @@ export class DKGAgent {
         });
         const topic = contextGraphUpdateTopic(contextGraphId);
         await this.gossip.publish(topic, message);
-        this.log.info(ctx, `Broadcast KA update for batchId=${kcId} on ${topic}`);
+        this.log.info(ctx, `Broadcast KA update for batchId=${kaId} on ${topic}`);
       } catch (err) {
         this.log.warn(ctx, `Failed to broadcast KA update: ${err instanceof Error ? err.message : String(err)}`);
       }
@@ -7353,15 +9381,15 @@ export class DKGAgent {
     //    `(chainId, kav10Address)` pair — both must be available.
     if (
       typeof this.chain.getEvmChainId !== 'function' ||
-      typeof this.chain.getKnowledgeAssetsV10Address !== 'function'
+      typeof this.chain.getKnowledgeAssetsLifecycleAddress !== 'function'
     ) {
       throw new Error(
         'assertionFinalize requires a V10-capable chain adapter that exposes ' +
-          'getEvmChainId() and getKnowledgeAssetsV10Address(); the current adapter does not.',
+          'getEvmChainId() and getKnowledgeAssetsLifecycleAddress(); the current adapter does not.',
       );
     }
     const chainId = await this.chain.getEvmChainId();
-    const kav10Address = await this.chain.getKnowledgeAssetsV10Address();
+    const kav10Address = await this.chain.getKnowledgeAssetsLifecycleAddress();
 
     // 6. Resolve the on-chain CG id — the EIP-712 digest binds to it.
     const onChainCgId = await this.requireOnChainContextGraphId(contextGraphId);
@@ -7592,11 +9620,11 @@ export class DKGAgent {
     }
     if (
       typeof this.chain.getEvmChainId !== 'function' ||
-      typeof this.chain.getKnowledgeAssetsV10Address !== 'function'
+      typeof this.chain.getKnowledgeAssetsLifecycleAddress !== 'function'
     ) {
       throw new Error(
         'Selection-based VM publish requires a V10-capable chain adapter that exposes ' +
-          'getEvmChainId() and getKnowledgeAssetsV10Address().',
+          'getEvmChainId() and getKnowledgeAssetsLifecycleAddress().',
       );
     }
 
@@ -7626,7 +9654,7 @@ export class DKGAgent {
     const merkleRoot = computeFlatKCRoot(allSkolemizedQuads, privateRoots);
 
     const chainId = await this.chain.getEvmChainId();
-    const kav10Address = await this.chain.getKnowledgeAssetsV10Address();
+    const kav10Address = await this.chain.getKnowledgeAssetsLifecycleAddress();
     const onChainCgId =
       opts?.targetOnChainCgId !== undefined
         ? BigInt(opts.targetOnChainCgId)
@@ -7763,66 +9791,70 @@ export class DKGAgent {
    * NO_DATA_IN_SWM (same observable as today, the §1.1 bug). The
    * agent surfaces a warn so operators see the configuration miss.
    */
-  private async _resolveEncryptInlinePayload(
+  /**
+   * Shared resolution between LU-5 (`_resolveEncryptInlinePayload`) and
+   * LU-11 (`_resolveEncryptInlineChunked`). Probes the access policy,
+   * bootstraps / rotates the swm-sender-key epoch, and returns the
+   * effective `chainKey` + AEAD CG-id binding. Returns `undefined` for
+   * public CGs so the caller stays on the plaintext-inline path.
+   *
+   * The original LU-5 method body lived inline here pre-LU-11; pulling
+   * it into a helper avoided drifting two near-identical curated-
+   * probe / epoch-rotation blocks once chunked emission joined the
+   * picture. All semantics (probe order, rotation triggers, fail-
+   * closed branches, error texts) are preserved.
+   */
+  private async _resolveCuratedChainKeyContext(
     contextGraphId: string,
-    subGraphName?: string,
-    authorAgentAddress?: string,
-    publishContextGraphId?: string,
-  ): Promise<((plaintext: Uint8Array) => Promise<Uint8Array>) | undefined> {
+    subGraphName: string | undefined,
+    authorAgentAddress: string | undefined,
+    publishContextGraphId: string | undefined,
+    logPrefix: string,
+  ): Promise<{ chainKey: Uint8Array; aeadCgId: string; senderAddress: string } | undefined> {
     const ctx = createOperationContext('publish');
-    // Codex PR #608 R4 #7375: the encryption decision must be keyed
-    // off the TARGET on-chain CG, not the source SWM graph. On remap
-    // publishes (`publishContextGraphId` differs from the local SWM
-    // `contextGraphId`), the prior source-only probe produced two
-    // distinct failure modes:
-    //
-    //   public source → curated target: skipped encryption → plaintext
-    //     leaked to the curated target's ACK peers (security).
-    //   private source → public target: applied encryption → core's
-    //     `isCgCurated` check (R3 #1325, now target-keyed) correctly
-    //     rejected the opaque ACK → publish blocked (correctness).
-    //
-    // The probe mirrors the SWM data-plane `isCgCurated` callback at
-    // line 1499: local meta-graph first (works for URL-style ids the
-    // local store knows about), then chain access-policy fallback
-    // for numeric on-chain ids (covers the C2 case where the target
-    // is just the numeric `cgId` from the publish intent and the
-    // local store has no triple keyed by that id). Numeric IDs are
-    // chain-owned; if chain truth is unavailable, return UNKNOWN and
-    // fail closed instead of silently publishing plaintext.
     const targetCgId = publishContextGraphId ?? contextGraphId;
     const probeIsCurated = async (cgId: string): Promise<boolean | null> => {
+      // Consume the SHARED tri-state resolver (the same one behind the
+      // SWM-gossip gate) so the publish-inline path can never DIVERGE from it,
+      // and — critically (#884 review 🔴 GZh-c) — so a genuine UNKNOWN is
+      // PRESERVED here instead of collapsing to "not public ⇒ plaintext". The
+      // resolver already does the live-on-chain proof, identity binding, and
+      // bounded reads; a thrown RPC rejection is caught below and also
+      // fails closed.
+      let policyState: 0 | 1 | 'unregistered' | 'unknown';
+      try {
+        policyState = await this.resolveOnChainAccessPolicyState(cgId, ctx);
+      } catch (err) {
+        this.log.warn(ctx, `${logPrefix}: chain access-policy probe for ${cgId} failed — treating as UNKNOWN (fail-closed): ${err instanceof Error ? err.message : String(err)}`);
+        return null;
+      }
+      // PUBLIC on-chain ⇒ never curated for SWM-encryption purposes, even with
+      // an allowedAgent list (that governs publish authority). Decide this
+      // BEFORE `isPrivateContextGraph`, whose allowlist-implies-private
+      // heuristic would otherwise force encrypted inline payloads onto a public
+      // CG and diverge from the plaintext SWM-gossip path.
+      if (policyState === 0) return false;
+      // PRIVATE on-chain ⇒ curated ⇒ encrypted inline payload.
+      if (policyState === 1) return true;
+      if (policyState === 'unknown') {
+        // Resolvable on-chain but UNPROVABLE (not live / stale mapping / no
+        // liveness probe / timeout). A positive LOCAL curated signal is a safe
+        // downgrade-to-encrypted (never a leak), so honor it; otherwise keep
+        // the UNKNOWN so the caller REFUSES (throws "publish access-policy is
+        // unknown") rather than silently choosing plaintext for what may be a
+        // private CG.
+        try {
+          if (await this.isPrivateContextGraph(cgId)) return true;
+        } catch { /* can't add a positive curated signal — stay unknown */ }
+        return null;
+      }
+      // 'unregistered': no on-chain slot at all (a pure-local CG). Fall back to
+      // the local allowlist-implies-private heuristic; absent that, keep the
+      // long-standing plaintext-inline default for local-only workspaces.
       try {
         if (await this.isPrivateContextGraph(cgId)) return true;
-      } catch { /* fall through to chain probe */ }
-      const cached = this.onChainAccessPolicyCache.get(cgId);
-      if (cached !== undefined) return cached === 1;
-      let numericId: bigint;
-      try {
-        numericId = BigInt(cgId);
-      } catch {
-        return false;
-      }
-      if (numericId <= 0n) return false;
-      const getAccessPolicy = this.chain.getContextGraphAccessPolicy;
-      if (typeof getAccessPolicy !== 'function') {
-        // Numeric ids are chain-owned policy surfaces. If the adapter
-        // cannot expose chain truth, choosing plaintext would risk a
-        // curated-target leak, so keep the UNKNOWN path and let the
-        // caller fail closed below.
-        return null;
-      }
-      try {
-        const policy = await getAccessPolicy.call(this.chain, numericId);
-        if (policy === 0 || policy === 1) {
-          this.onChainAccessPolicyCache.set(cgId, policy);
-          return policy === 1;
-        }
-        return null;
-      } catch (err) {
-        this.log.warn(ctx, `_resolveEncryptInlinePayload: chain.getContextGraphAccessPolicy(${cgId}) failed — treating as UNKNOWN (fail-closed): ${err instanceof Error ? err.message : String(err)}`);
-      }
-      return null;
+      } catch { /* fall through to the plaintext-inline default */ }
+      return false;
     };
     const sourceIsCurated = await probeIsCurated(contextGraphId);
     const targetIsCurated = targetCgId === contextGraphId
@@ -7830,19 +9862,15 @@ export class DKGAgent {
       : await probeIsCurated(targetCgId);
     if (targetIsCurated == null || (targetCgId !== contextGraphId && sourceIsCurated == null)) {
       throw new Error(
-        `LU-5: publish access-policy is unknown — ` +
+        `${logPrefix}: publish access-policy is unknown — ` +
         `source CG "${contextGraphId}" curated=${sourceIsCurated ?? 'unknown'}, ` +
         `target CG "${targetCgId}" curated=${targetIsCurated ?? 'unknown'}. ` +
         `Refusing to choose plaintext vs encrypted inline payload without chain-confirmed policy.`,
       );
     }
     if (targetCgId !== contextGraphId && sourceIsCurated !== targetIsCurated) {
-      // Fail-closed: a remap publish that crosses the privacy
-      // boundary in either direction is almost certainly an
-      // operator/caller mistake. Refuse rather than silently picking
-      // one side and producing the wrong wire shape.
       throw new Error(
-        `LU-5: remap publish source/target access-policy mismatch — ` +
+        `${logPrefix}: remap publish source/target access-policy mismatch — ` +
         `source CG "${contextGraphId}" curated=${sourceIsCurated}, ` +
         `target CG "${targetCgId}" curated=${targetIsCurated}. ` +
         `Refusing to publish: encrypting against the wrong CG's policy ` +
@@ -7857,45 +9885,32 @@ export class DKGAgent {
       ?? this.defaultAgentAddress
       ?? this.peerId;
 
-    // Codex PR #608 R3 #7: mirror the rotation contract from
-    // `encryptWorkspacePayloadWithSenderKey` — always load persisted
-    // state FIRST so a daemon restart reuses the existing epoch
-    // instead of minting a new one, and ALWAYS recompute the current
-    // membership hash so an allowlist change forces an epoch
-    // rotation. The prior implementation only entered the bootstrap
-    // branch when the in-memory map happened to be empty AND never
-    // compared the current membership against the cached state, so
-    // (a) every restart silently rotated and (b) revocations /
-    // additions kept reusing a stale epoch until the next manual
-    // SWM write through `share()`.
     await this.loadSwmSenderKeyState();
     const sender = this.getLocalSigningAgentForAddress(senderAddress);
     if (!sender) {
       throw new Error(
-        `LU-5: curated CG ${contextGraphId}: cannot bootstrap swm-sender-key — ` +
+        `${logPrefix}: curated CG ${contextGraphId}: cannot bootstrap swm-sender-key — ` +
         `no local custodial signing key for agent ${senderAddress}. ` +
         `Refusing to publish curated CG payload via the plaintext-inline fallback.`,
       );
     }
     const resolution = await resolveWorkspaceAgentRecipients(this.store, { contextGraphId });
     if (!resolution.requiresEncryption) {
-      // Access policy lookup said curated, but the recipient resolver
-      // disagrees. Conservative: refuse rather than silently downgrade.
       throw new Error(
-        `LU-5: curated CG ${contextGraphId}: access-policy says curated but recipient resolver ` +
+        `${logPrefix}: curated CG ${contextGraphId}: access-policy says curated but recipient resolver ` +
         `returned no agent recipients. Refusing to publish to avoid plaintext leak.`,
       );
     }
     if (resolution.recipients.length === 0) {
       throw new Error(
-        `LU-5: curated CG ${contextGraphId}: no DKG agent recipients available — ` +
+        `${logPrefix}: curated CG ${contextGraphId}: no DKG agent recipients available — ` +
         `add at least one allowed agent before publishing.`,
       );
     }
     const recipientSet = new Set(resolution.recipients.map((r) => r.agentAddress.toLowerCase()));
     if (!recipientSet.has(ethers.getAddress(senderAddress).toLowerCase())) {
       throw new Error(
-        `LU-5: curated CG ${contextGraphId}: sender ${senderAddress} is not in the recipient set — ` +
+        `${logPrefix}: curated CG ${contextGraphId}: sender ${senderAddress} is not in the recipient set — ` +
         `add yourself to the allowedAgents before publishing.`,
       );
     }
@@ -7916,9 +9931,22 @@ export class DKGAgent {
         : `membership changed (was=${state.membershipHash} now=${membershipHash})`;
       this.log.info(
         ctx,
-        `LU-5: bootstrapping/rotating swm-sender-key epoch for curated CG ${contextGraphId} ` +
+        `${logPrefix}: bootstrapping/rotating swm-sender-key epoch for curated CG ${contextGraphId} ` +
         `(sender=${senderAddress}, recipients=${resolution.recipients.length}, reason=${reason})`,
       );
+      const pruned = this.prunePendingSenderKeysForEpochRotation({
+        contextGraphId,
+        subGraphName,
+        senderAgentAddress: senderAddress,
+      });
+      if (pruned > 0) {
+        this.log.warn(
+          ctx,
+          `${logPrefix}: pruned ${pruned} stale pending SWM sender-key setup package(s) ` +
+          `for curated CG ${contextGraphId}${subGraphName ? `/${subGraphName}` : ''} sender ${senderAddress}`,
+        );
+        await this.saveSwmSenderKeyState();
+      }
       state = await this.createAndDistributeSwmSenderKeyEpoch({
         contextGraphId,
         subGraphName,
@@ -7929,23 +9957,176 @@ export class DKGAgent {
       });
       this.swmSenderKeySendStates.set(stateKey, state);
       await this.saveSwmSenderKeyState();
+    } else {
+      await this.drainPendingSenderKeyForRecipients(resolution.recipients, ctx);
     }
 
-    const chainKey = state.chainKey;
-    // Codex PR #608 R2 #12: the AEAD key must be derived from the
-    // *target* on-chain CG id (the one the published KC is bound to
-    // on chain) — not the source SWM CG id. On remap publishes
-    // (where the source `contextGraphId` differs from the target
-    // `publishContextGraphId`/`onChainId`), consumers verifying the
-    // KC use the canonical on-chain id; if we derive with the
-    // source id here, every consumer's decrypt fails.
-    const aeadCgId = publishContextGraphId ?? contextGraphId;
+    return {
+      chainKey: state.chainKey,
+      aeadCgId: publishContextGraphId ?? contextGraphId,
+      senderAddress,
+    };
+  }
+
+  private async _resolveEncryptInlinePayload(
+    contextGraphId: string,
+    subGraphName?: string,
+    authorAgentAddress?: string,
+    publishContextGraphId?: string,
+  ): Promise<((plaintext: Uint8Array) => Promise<Uint8Array>) | undefined> {
+    const resolved = await this._resolveCuratedChainKeyContext(
+      contextGraphId, subGraphName, authorAgentAddress, publishContextGraphId, 'LU-5',
+    );
+    if (!resolved) return undefined;
+    const { chainKey, aeadCgId } = resolved;
     return async (plaintextNquads: Uint8Array): Promise<Uint8Array> => {
       return encryptV10PublishPayload({
         chainKey,
         contextGraphId: aeadCgId,
         plaintext: plaintextNquads,
       });
+    };
+  }
+
+  /**
+   * OT-RFC-38 LU-11 / OT-RFC-39 — produce the chunked-AEAD inline
+   * callback for curated CGs. Returns `undefined` for public CGs so
+   * the LU-5 callback (also resolved unconditionally for curated CGs)
+   * stays as the only path.
+   *
+   * The returned closure does THREE things on the publish hot path:
+   *
+   *   1. slice plaintext into `CIPHERTEXT_CHUNK_SIZE_BYTES`-sized
+   *      pieces (last chunk smaller),
+   *   2. AEAD-encrypt each chunk with a publish-operation-deterministic
+   *      nonce (`deriveChunkNonce(publishOperationId, chunkIndex)`) so
+   *      retries produce bit-identical ciphertext and idempotent SWM
+   *      writes (idempotency is the spec's only protection against double-
+   *      gossip racing the on-chain commitment), while distinct publish
+   *      attempts rotate the AEAD nonce domain even if they share the
+   *      same merkle root,
+   *   3. fan each ciphertext chunk out as a V2 SWM gossip envelope
+   *      (`type = 'share-write-chunked'`, `swmMessageIndex = i`,
+   *      payload = `[batchId(32)][ct_i]`) on the curated CG's
+   *      workspace topic — so hosting cores (RFC-38 LU-6 host-mode)
+   *      persist the bytes opaquely keyed by
+   *      `(cgId, batchId, swmMessageIndex)` and members decrypt
+   *      locally with the same chainKey they already hold.
+   *
+   * The returned `ciphertextChunksRoot` is the keccak256 root over
+   * `keccak256(ct_i)` leaves in `swmMessageIndex` order (see
+   * `buildCiphertextChunksRoot` in `@origintrail-official/dkg-core`).
+   * That same root lands on-chain via
+   * `KnowledgeAssetsV10.PublishParams.ciphertextChunksRoot` and binds
+   * the SWM-gossiped bytes to the chain commitment — RFC-39 random
+   * sampling samples `(cgId, batchId, chunkId)` against this root.
+   */
+  private async _resolveEncryptInlineChunked(
+    contextGraphId: string,
+    subGraphName?: string,
+    authorAgentAddress?: string,
+    publishContextGraphId?: string,
+  ): Promise<
+    | ((input: { plaintextNquads: Uint8Array; batchId: Uint8Array; publishOperationId: string }) => Promise<{
+        ciphertextChunksRoot: Uint8Array;
+        ciphertextChunkCount: number;
+        totalCiphertextBytes: number;
+      }>)
+    | undefined
+  > {
+    const resolved = await this._resolveCuratedChainKeyContext(
+      contextGraphId, subGraphName, authorAgentAddress, publishContextGraphId, 'LU-11',
+    );
+    if (!resolved) return undefined;
+    const { chainKey, aeadCgId } = resolved;
+    const wireCgId = this.gossipWireIdFor(contextGraphId);
+    const topic = contextGraphWorkspaceTopic(wireCgId);
+    const signer = await this.resolveWorkspaceGossipSigningAgent(contextGraphId);
+    if (!signer) {
+      throw new Error(
+        `LU-11: curated CG ${contextGraphId}: cannot resolve a workspace-gossip signing agent — ` +
+        `cores reject unsigned chunked envelopes. Add a local custodial signing key for an ` +
+        `allowed agent before publishing.`,
+      );
+    }
+    const signerWallet = new ethers.Wallet(signer.privateKey);
+    const signerAgentAddress = signer.agentAddress;
+    const log = this.log;
+    const ctx = createOperationContext('publish');
+    const gossip = this.gossip;
+
+    return async (input: { plaintextNquads: Uint8Array; batchId: Uint8Array; publishOperationId: string }): Promise<{
+      ciphertextChunksRoot: Uint8Array;
+      ciphertextChunkCount: number;
+      totalCiphertextBytes: number;
+    }> => {
+      if (input.batchId.length !== 32) {
+        throw new Error(
+          `LU-11: chunked emit requires a 32-byte batchId (V10 KC merkleRoot); got ${input.batchId.length}`,
+        );
+      }
+      if (input.publishOperationId.length === 0) {
+        throw new Error('LU-11: chunked emit requires a non-empty publishOperationId');
+      }
+      const plaintextChunks = sliceIntoCiphertextChunks(input.plaintextNquads);
+      const { ciphertextChunks } = encryptChunked({
+        chainKey,
+        contextGraphId: aeadCgId,
+        plaintextChunks,
+        publishOperationId: input.publishOperationId,
+      });
+      const { root, leafCount } = buildCiphertextChunksRoot(ciphertextChunks);
+      const batchIdHex = ethers.hexlify(input.batchId);
+      let totalCiphertextBytes = 0;
+      for (let i = 0; i < ciphertextChunks.length; i++) {
+        const ct = ciphertextChunks[i];
+        totalCiphertextBytes += ct.length;
+        const payload = new Uint8Array(input.batchId.length + ct.length);
+        payload.set(input.batchId, 0);
+        payload.set(ct, input.batchId.length);
+        const timestamp = new Date().toISOString();
+        const signingPayload = computeGossipSigningPayloadV2(
+          GOSSIP_TYPE_WORKSPACE_PUBLISH_CHUNKED,
+          contextGraphId,
+          timestamp,
+          payload,
+          i,
+        );
+        const signature = await signerWallet.signMessage(signingPayload);
+        const envelope = encodeGossipEnvelope({
+          version: GOSSIP_ENVELOPE_VERSION,
+          type: GOSSIP_TYPE_WORKSPACE_PUBLISH_CHUNKED,
+          contextGraphId,
+          agentAddress: signerAgentAddress,
+          timestamp,
+          signature: ethers.getBytes(signature),
+          payload,
+          swmMessageIndex: i,
+        });
+        try {
+          await gossip.publish(topic, envelope);
+        } catch (err) {
+          log.warn(
+            ctx,
+            `LU-11: chunked gossip publish failed for cgId=${contextGraphId} ` +
+            `batchId=${batchIdHex.slice(0, 18)}... op=${input.publishOperationId} chunkIndex=${i}: ${
+              err instanceof Error ? err.message : String(err)
+            } — cores without this chunk will DECLINE the V2 ACK; ` +
+            `late-join sync can backfill once the catchup verb lands.`,
+          );
+        }
+      }
+      log.info(
+        ctx,
+        `LU-11: emitted ${ciphertextChunks.length} ciphertext chunks ` +
+        `(${totalCiphertextBytes} bytes total) for curated CG ${contextGraphId} ` +
+        `batchId=${batchIdHex.slice(0, 18)}... op=${input.publishOperationId} on topic ${topic}`,
+      );
+      return {
+        ciphertextChunksRoot: root,
+        ciphertextChunkCount: leafCount,
+        totalCiphertextBytes,
+      };
     };
   }
 
@@ -8025,6 +10206,7 @@ export class DKGAgent {
       operationCtx?: OperationContext;
       onPhase?: PhaseCallback;
       publisherNodeIdentityIdOverride?: bigint;
+      publishEpochs?: number;
       clearSharedMemoryAfter?: boolean;
     },
   ): Promise<PublishResult & { assertionUri: string; seal: AssertionSeal }> {
@@ -8057,10 +10239,10 @@ export class DKGAgent {
     //    rather than a tx revert.
     if (
       typeof this.chain.getEvmChainId === 'function' &&
-      typeof this.chain.getKnowledgeAssetsV10Address === 'function'
+      typeof this.chain.getKnowledgeAssetsLifecycleAddress === 'function'
     ) {
       const liveChainId = await this.chain.getEvmChainId();
-      const liveKav10 = await this.chain.getKnowledgeAssetsV10Address();
+      const liveKav10 = await this.chain.getKnowledgeAssetsLifecycleAddress();
       if (liveChainId !== seal.chainId) {
         throw new Error(
           `publishFromFinalizedAssertion: seal binds chainId=${seal.chainId.toString()} but daemon ` +
@@ -8085,7 +10267,7 @@ export class DKGAgent {
     //    publish would bundle every other promoted assertion sitting
     //    in shared memory into the same KC; the publisher's recompute
     //    would then disagree with the seal's `expectedMerkleRoot` and
-    //    flip to `tentative kcId: "0"`. The seal's rootEntities were
+    //    flip to `tentative kaId: "0"`. The seal's rootEntities were
     //    captured at finalize time from the same `autoPartition` call
     //    that drove the merkle leaves, so this selection deterministically
     //    yields the post-promote SWM slice the seal commits to.
@@ -8097,6 +10279,7 @@ export class DKGAgent {
         onPhase: opts?.onPhase,
         subGraphName: opts?.subGraphName,
         publisherNodeIdentityIdOverride: opts?.publisherNodeIdentityIdOverride,
+        publishEpochs: opts?.publishEpochs,
         clearSharedMemoryAfter: opts?.clearSharedMemoryAfter,
         // Wired through to the inner publisher.publish() via
         // publishFromSharedMemory's `precomputedAttestation` option.
@@ -8118,7 +10301,7 @@ export class DKGAgent {
           metaGraph,
           txHash: result.onChainResult.txHash ?? '',
           blockNumber: BigInt(result.onChainResult.blockNumber ?? 0),
-          kcId: result.onChainResult.batchId ?? 0n,
+          kaId: result.onChainResult.batchId ?? 0n,
         });
         await this.store.insert(receiptQuads);
       } catch (err) {
@@ -8169,6 +10352,7 @@ export class DKGAgent {
        * used for ACK self-signing and signer resolution.
        */
       publisherNodeIdentityIdOverride?: bigint;
+      publishEpochs?: number;
       /**
        * RFC-001 §9.x — pre-computed attestation captured by
        * `agent.assertion.finalize()`. When the caller has already
@@ -8205,6 +10389,10 @@ export class DKGAgent {
   ): Promise<PublishResult> {
     const ctx = options?.operationCtx ?? createOperationContext('publishFromSWM');
     const effectiveSubCG = options?.subContextGraphId ?? options?.contextGraphId;
+    // `ctxGraphIdStr` doubles as `publishContextGraphId` for REMAP-flow
+    // publishes — the publisher uses its presence as a signal to DELETE the
+    // original copy from the default data graph. Keep it empty for non-REMAP
+    // publishes so we don't accidentally trigger the delete.
     const ctxGraphIdStr = effectiveSubCG != null ? String(effectiveSubCG) : undefined;
 
     const onChainId = ctxGraphIdStr ?? (await this.getContextGraphOnChainId(contextGraphId)) ?? undefined;
@@ -8223,7 +10411,7 @@ export class DKGAgent {
       !resolvedSeal &&
       onChainId != null &&
       typeof this.chain.getEvmChainId === 'function' &&
-      typeof this.chain.getKnowledgeAssetsV10Address === 'function'
+      typeof this.chain.getKnowledgeAssetsLifecycleAddress === 'function'
     ) {
       const swmQuads = await this._loadSelectedSWMQuads(
         contextGraphId,
@@ -8269,6 +10457,21 @@ export class DKGAgent {
     if (encryptInlinePayload) {
       this.log.info(ctx, `LU-5: curated CG ${contextGraphId} — wrapping inline ACK payload with chain-key AEAD`);
     }
+    // OT-RFC-38 LU-11 — also resolve the chunked emitter. Publisher
+    // prefers the chunked path when both are set; single-blob remains
+    // the unconditional fallback for any code path that resolves the
+    // chunked callback to `undefined` (currently impossible since
+    // both helpers share the curated probe, but kept defensively to
+    // future-proof CG types whose chunked path might lag rollout).
+    const encryptInlineChunked = await this._resolveEncryptInlineChunked(
+      contextGraphId,
+      options?.subGraphName,
+      options?.authorAgentAddress,
+      onChainId ?? undefined,
+    );
+    if (encryptInlineChunked) {
+      this.log.info(ctx, `LU-11: curated CG ${contextGraphId} — chunked path active (per-chunk SWM gossip + V2 ACK)`);
+    }
 
     const result = await this.publisher.publishFromSharedMemory(contextGraphId, selection, {
       operationCtx: ctx,
@@ -8280,19 +10483,49 @@ export class DKGAgent {
       v10ACKProvider,
       subGraphName: options?.subGraphName,
       publisherNodeIdentityIdOverride: options?.publisherNodeIdentityIdOverride,
+      publishEpochs: options?.publishEpochs,
       precomputedAttestation: resolvedSeal,
       encryptInlinePayload,
+      encryptInlineChunked,
     });
 
     if (result.status === 'confirmed' && result.onChainResult) {
       const rootEntities = result.kaManifest.map(ka => ka.rootEntity);
 
+      // Always carry the resolved on-chain CG id in the finalization gossip
+      // so receiving cores promote SWM into the per-cgId `_meta` namespace
+      // (`<cgName>/context/<cgId>/_meta`) that the RS prover reads from.
+      // Without this the prover 404'd with `KCNotFoundError` on every
+      // freshly-published KC even though the SWM payload had been
+      // replicated — see scripts/devnet-test-rfc39-comprehensive.sh
+      // Scenario A. We pass the *publisher-resolved* `onChainId` (which
+      // includes both explicit REMAP targets and the auto-lookup fallback)
+      // rather than the REMAP-only `ctxGraphIdStr`.
+      const broadcastCgId = onChainId != null ? String(onChainId) : undefined;
+      // PR #779 / #774 followup: tell receivers whether the publisher
+      // kept a root-graph copy of the canonical quads. Same-graph
+      // publishes (no explicit `subContextGraphId` / `publishContextGraphId`)
+      // dual-write to the root `<cg>` graph and the per-on-chain-id
+      // partition `<cg>/context/<ctxGraphId>` so label-scoped queries
+      // resolve. Explicit-`subContextGraphId` / remap publishes delete
+      // the root copy on purpose (`dkg-publisher.ts` ~line 1393), so
+      // receivers MUST NOT dual-write either — otherwise a remap-style
+      // KC would re-appear under the source CG's label on every replica.
+      // `ctxGraphIdStr` is the publisher-side `publishContextGraphId`
+      // (set on REMAP/explicit-subCG calls, undefined otherwise) — the
+      // exact same signal the publisher uses to gate its own root delete.
+      const keepRootCopyOnLabel = !ctxGraphIdStr;
       const msg: FinalizationMessageMsg = {
         ual: result.ual,
         contextGraphId: contextGraphId,
         kcMerkleRoot: result.merkleRoot,
         txHash: result.onChainResult.txHash ?? '',
         blockNumber: result.onChainResult.blockNumber ?? 0,
+        // GH#842: thread the real `(block, txIndex)` so receivers stamp the
+        // exact same materialised version as the local publish promotion —
+        // otherwise a same-block update vs publish would tie on the wire
+        // and the stale publish-promotion could clobber the update.
+        txIndex: result.onChainResult.txIndex ?? 0,
         batchId: result.onChainResult.batchId ?? 0n,
         startKAId: result.onChainResult.startKAId ?? 0n,
         endKAId: result.onChainResult.endKAId ?? 0n,
@@ -8300,16 +10533,49 @@ export class DKGAgent {
         rootEntities,
         timestampMs: Date.now(),
         operationId: ctx.operationId,
-        targetContextGraphId: result.contextGraphError ? undefined : ctxGraphIdStr,
+        targetContextGraphId: result.contextGraphError ? undefined : broadcastCgId,
         subGraphName: options?.subGraphName,
+        keepRootCopyOnLabel,
       };
 
       const topic = contextGraphFinalizationTopic(contextGraphId);
       try {
         await this.gossip.publish(topic, encodeFinalizationMessage(msg));
-        this.log.info(ctx, `Broadcast finalization for ${result.ual} to ${topic}${ctxGraphIdStr ? ` (contextGraph=${ctxGraphIdStr})` : ''}${result.contextGraphError ? ' (ctx-graph registration failed, omitting targetContextGraphId)' : ''}`);
+        this.log.info(ctx, `Broadcast finalization for ${result.ual} to ${topic}${broadcastCgId ? ` (contextGraph=${broadcastCgId})` : ''}${result.contextGraphError ? ' (ctx-graph registration failed, omitting targetContextGraphId)' : ''}`);
       } catch {
         this.log.warn(ctx, `No peers subscribed to ${topic} yet`);
+      }
+
+      // Durable keep-root signal. The gossip envelope's `keepRootCopyOnLabel`
+      // only reaches peers online for the broadcast; a subscriber that missed
+      // it later recovers the publish via the chain-driven reconcile sweep,
+      // which has no wire to learn the dual-write intent from. Persist the same
+      // decision per root into SWM workspace meta — co-located with the per-root
+      // `privateMerkleRoot` that already replicates to subscribers — so the
+      // reconcile path can mirror the gossip dual-write decision. Read back by
+      // `FinalizationHandler.getKeepRootCopySignal`. Updates reuse a root
+      // entity, so replace any prior value rather than accumulate.
+      try {
+        const gm = new GraphManager(this.store);
+        const wsMetaGraph = options?.subGraphName
+          ? gm.sharedMemoryMetaUri(contextGraphId, options.subGraphName)
+          : contextGraphWorkspaceMetaGraphUri(contextGraphId);
+        const keepLiteral = `"${keepRootCopyOnLabel}"`;
+        for (const root of rootEntities.filter(isSafeIri)) {
+          await this.store.deleteByPattern({
+            subject: root,
+            predicate: KEEP_ROOT_COPY_PREDICATE,
+            graph: wsMetaGraph,
+          });
+          await this.store.insert([{
+            subject: root,
+            predicate: KEEP_ROOT_COPY_PREDICATE,
+            object: keepLiteral,
+            graph: wsMetaGraph,
+          }]);
+        }
+      } catch (err) {
+        this.log.warn(ctx, `Failed to persist keepRootCopyOnLabel signal for ${result.ual}: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
 
@@ -8383,6 +10649,32 @@ export class DKGAgent {
   }
 
   /**
+   * Provision the node's on-chain profile (createProfile + stake) exactly once
+   * at a time. `ensureProfile()` is a mutating multi-tx flow that can outlast
+   * the boot read-timeout, so this guards against the boot path AND the
+   * StorageACK retry both calling it while a prior submission may still be
+   * settling — which could create a duplicate profile / double-stake (Codex
+   * PR #901 round-3 :1685). It is NOT raced against a timeout: the staking tx
+   * must run to completion. While a provisioning is in flight, concurrent
+   * callers re-read the (possibly now-created) identity via `getIdentityId()`
+   * instead of submitting a second `ensureProfile()`.
+   */
+  private async provisionProfileGuarded(ctx: OperationContext): Promise<bigint> {
+    if (this.profileProvisioningInFlight) {
+      // A provisioning is already running (boot or a prior retry). Don't submit
+      // a second createProfile+stake — just read whatever identity exists now.
+      this.log.info(ctx, 'Profile provisioning already in flight — re-reading identity instead of re-submitting');
+      return this.chain.getIdentityId();
+    }
+    this.profileProvisioningInFlight = true;
+    try {
+      return await this.chain.ensureProfile({ nodeName: this.config.name });
+    } finally {
+      this.profileProvisioningInFlight = false;
+    }
+  }
+
+  /**
    * (Re-)attempt on-chain identity registration. Safe to call multiple times.
    * Returns the identityId (>0n on success, 0n if chain is not configured).
    */
@@ -8420,6 +10712,18 @@ export class DKGAgent {
       includeSharedMemory?: boolean;
       /** @deprecated Use includeSharedMemory */
       includeWorkspace?: boolean;
+      /**
+       * Opt-in for dashboard/count queries that intentionally enumerate all
+       * registered public content partitions in a scoped `GRAPH ?g` scan.
+       */
+      includeContextGraphPartitions?: boolean;
+      /**
+       * Opt-in: allow the scoped query to reference the context graph's own
+       * `_private` partition (excluded from the scope guard's allow-set by
+       * default). Used by the EPCIS events query, whose SPARQL always names
+       * `<cg>/_private`. Does not widen access for other callers.
+       */
+      includePrivate?: boolean;
       operationCtx?: OperationContext;
       view?: GetView;
       agentAddress?: string;
@@ -8639,6 +10943,8 @@ export class DKGAgent {
       excludeGraphPrefixes,
       graphSuffix: opts.graphSuffix,
       includeSharedMemory: opts.includeSharedMemory,
+      includeContextGraphPartitions: opts.includeContextGraphPartitions,
+      includePrivate: opts.includePrivate,
       view: opts.view,
       agentAddress: agentAddressStr ?? (opts.view === 'working-memory' ? this.peerId : undefined),
       verifiedGraph: opts.verifiedGraph,
@@ -8917,14 +11223,29 @@ export class DKGAgent {
     });
   }
 
-  subscribeToContextGraph(contextGraphId: string, options?: { trackSyncScope?: boolean; persist?: boolean }): void {
+  subscribeToContextGraph(contextGraphId: string, options?: { trackSyncScope?: boolean; persist?: boolean; deferSharedMemoryGossipSubscribe?: boolean }): void {
     if (options?.trackSyncScope !== false) {
       this.trackSyncContextGraph(contextGraphId);
     }
 
+    // SWM gossip subscribe runs `canReadContextGraph` against the local
+    // `_meta` graph. On a fresh `join-approved` notification the curator
+    // has just written the allowlist into ITS _meta, but the requesting
+    // node hasn't synced that allowlist yet — so the very first SWM
+    // gossip subscribe attempt fails with `local node is not authorized`,
+    // emitting a misleading WARN. The real fix is to land the allowlist
+    // first via `runImmediatePostApprovalSync`; once `_meta` syncs,
+    // `refreshMetaSyncedFlags` re-queues the SWM gossip subscribe (line
+    // 3738) and it succeeds silently. This option lets the join-approved
+    // path opt out of the immediate SWM subscribe and rely on that
+    // self-heal — see urn:dkg:finding:swm-gap-1-initial-sync-race.
+    const deferSwmGossip = options?.deferSharedMemoryGossipSubscribe === true;
+
     // Idempotent: skip if gossip handlers already installed for this context graph.
     if (this.gossipRegistered.has(contextGraphId)) {
-      this.queueSharedMemoryGossipSubscription(contextGraphId);
+      if (!deferSwmGossip) {
+        this.queueSharedMemoryGossipSubscription(contextGraphId);
+      }
       const existing = this.subscribedContextGraphs.get(contextGraphId);
       if (!existing?.subscribed) {
         this.setContextGraphSubscription(
@@ -8955,7 +11276,9 @@ export class DKGAgent {
       await gph.handlePublishMessage(data, contextGraphId, undefined, from);
     });
 
-    this.queueSharedMemoryGossipSubscription(contextGraphId);
+    if (!deferSwmGossip) {
+      this.queueSharedMemoryGossipSubscription(contextGraphId);
+    }
 
     const updateTopic = contextGraphUpdateTopic(contextGraphId);
     this.gossip.subscribe(updateTopic);
@@ -8970,6 +11293,86 @@ export class DKGAgent {
       const fh = this.getOrCreateFinalizationHandler();
       await fh.handleFinalizationMessage(data, contextGraphId);
     });
+  }
+
+  /**
+   * Inverse of {@link subscribeToContextGraph}: drop the LIVE member
+   * subscription (publish / app / update / finalization + member-mode SWM
+   * gossip, and the sync scope) while preserving any `coreHosted` hosting
+   * obligation. After this the node no longer receives the finalization
+   * gossip fast-path, so a publish it misses can ONLY be recovered through
+   * the chain-driven `coreHosted` reconcile sweep — which is exactly the
+   * Phase D path. The persisted subscription row survives iff `coreHosted`
+   * (see {@link persistContextGraphSubscription}), so the host-only state
+   * (`subscribed=0, coreHosted=1`) is restart-safe.
+   *
+   * This is intentionally NOT a destructive teardown: it deletes no VM/SWM
+   * data and leaves SWM host-mode hosting intact (re-evaluated below). Its
+   * primary use is to manufacture a pure host-only core for validation on a
+   * devnet where storage cores otherwise auto-subscribe to everything they
+   * host, masking the host-only fill path.
+   */
+  unsubscribeFromContextGraph(contextGraphId: string): void {
+    const existing = this.subscribedContextGraphs.get(contextGraphId);
+    if (!existing) return;
+
+    // Drop from the active sync scope so background sweeps no longer treat
+    // this as a subscribed CG to keep current.
+    const syncSet = new Set<string>(this.config.syncContextGraphs ?? []);
+    if (syncSet.delete(contextGraphId)) {
+      this.config.syncContextGraphs = [...syncSet];
+    }
+
+    // Tear down the per-CG gossip topics. These four carry only the member
+    // handlers installed by `subscribeToContextGraph`, so a topic-wide
+    // `unsubscribe` is safe here (unlike the SWM topic, handled separately).
+    if (this.gossipRegistered.has(contextGraphId)) {
+      for (const topic of [
+        contextGraphPublishTopic(contextGraphId),
+        contextGraphAppTopic(contextGraphId),
+        contextGraphUpdateTopic(contextGraphId),
+        contextGraphFinalizationTopic(contextGraphId),
+      ]) {
+        try { this.gossip.unsubscribe(topic); } catch { /* best-effort */ }
+      }
+      this.gossipRegistered.delete(contextGraphId);
+    }
+
+    // Tear down member-mode SWM gossip. `gossip.unsubscribe` drops every
+    // handler on the topic (incl. any host-mode listener), so we clear the
+    // host-mode bookkeeping too and then let `reconcileSwmHostModeSubscription`
+    // re-wire the host listener if hosting is still applicable (no-op on edges
+    // and on cores with swmHostMode disabled).
+    const wireCgId = this.gossipWireIdFor(contextGraphId);
+    const swmTopic = contextGraphWorkspaceTopic(wireCgId);
+    if (this.sharedMemoryGossipRegistered.has(contextGraphId)) {
+      try { this.gossip.unsubscribe(swmTopic); } catch { /* best-effort */ }
+      this.sharedMemoryGossipRegistered.delete(contextGraphId);
+      const hostKey = this.canonicalSwmHostModeKey(contextGraphId);
+      this.swmHostModeSubscribed.delete(hostKey);
+      this.swmHostModeHandlers.delete(hostKey);
+      this.enqueueHostModePersistence(contextGraphId, false);
+    }
+
+    // Flip the live-subscription flag off, keeping `coreHosted` (and every
+    // other field) intact. Persisted: the row is kept iff `coreHosted`.
+    this.setContextGraphSubscription(
+      contextGraphId,
+      { ...existing, subscribed: false },
+      { persist: true },
+    );
+
+    void this.reconcileSwmHostModeSubscription(contextGraphId).catch((err) => {
+      this.log.warn(
+        createOperationContext('system'),
+        `SWM host-mode re-eval after unsubscribe from "${contextGraphId}" failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    });
+
+    this.log.info(
+      createOperationContext('system'),
+      `Unsubscribed from "${contextGraphId}" (coreHosted=${existing.coreHosted === true}); live gossip dropped, chain reconcile path retained if hosting`,
+    );
   }
 
   private queueSharedMemoryGossipSubscription(contextGraphId: string): void {
@@ -9026,8 +11429,14 @@ export class DKGAgent {
         // after a later "true" and re-subscribes on next boot.
         this.gossip.unsubscribe(swmTopic);
         this.sharedMemoryGossipRegistered.delete(contextGraphId);
-        this.swmHostModeSubscribed.delete(contextGraphId);
-        this.swmHostModeHandlers.delete(contextGraphId);
+        // Host-mode maps are canonical-keyed (wire-form hash); delete
+        // by canonical id so this cleanup hits the entry regardless
+        // of which discovery path wired it. Without this, the
+        // immediate `reconcileSwmHostModeSubscription()` call below
+        // would see a stale entry and early-return.
+        const hostKey = this.canonicalSwmHostModeKey(contextGraphId);
+        this.swmHostModeSubscribed.delete(hostKey);
+        this.swmHostModeHandlers.delete(hostKey);
         this.enqueueHostModePersistence(contextGraphId, false);
         this.log.warn(ctx, `SWM gossip unsubscribed for "${contextGraphId}": local node is no longer authorized`);
       } else {
@@ -9210,7 +11619,10 @@ export class DKGAgent {
    * No-op when the store isn't initialized, when the CG is system-
    * reserved, or when the node is already subscribed in member mode.
    */
-  private async reconcileSwmHostModeSubscription(contextGraphId: string): Promise<void> {
+  private async reconcileSwmHostModeSubscription(
+    contextGraphId: string,
+    source: SubscriptionSource = SUBSCRIPTION_SOURCES.RECONCILER,
+  ): Promise<void> {
     if (!this.swmHostModeStore) return;
     if ((Object.values(SYSTEM_CONTEXT_GRAPHS) as string[]).includes(contextGraphId)) return;
     if (this.sharedMemoryGossipRegistered.has(contextGraphId)) {
@@ -9218,7 +11630,7 @@ export class DKGAgent {
       // local consumption; no need to also opaquely store.
       return;
     }
-    if (this.swmHostModeSubscribed.has(contextGraphId)) {
+    if (this.swmHostModeSubscribed.has(this.canonicalSwmHostModeKey(contextGraphId))) {
       // Codex PR #610 R2: idempotent re-entry on the periodic
       // reconcile path must still re-probe on-chain registration
       // state. Without this, a core that subscribed while the CG
@@ -9226,6 +11638,11 @@ export class DKGAgent {
       // limits forever — even after the CG is registered — and
       // ciphertext gets pruned much earlier than intended.
       // Mirrors the same safeguard in `enableSwmHostModeFor`.
+      //
+      // The `has()` check goes through `canonicalSwmHostModeKey` so
+      // a reconcile call with cleartext finds an entry written by
+      // the chain-event/beacon path with the hash form (and vice
+      // versa). Codex PR #672 review `id=3302086589`.
       await this.maybeMarkRegisteredForHostMode(contextGraphId);
       return;
     }
@@ -9269,7 +11686,7 @@ export class DKGAgent {
     }
     if (!curated) return;
 
-    this.wireSwmHostModeHandler(contextGraphId);
+    this.wireSwmHostModeHandler(contextGraphId, source);
 
     await this.maybeMarkRegisteredForHostMode(contextGraphId);
 
@@ -9289,19 +11706,56 @@ export class DKGAgent {
    * `enableSwmHostModeFor` (operator-driven) funnel through here
    * so the host-mode lifecycle is in one place.
    */
-  private wireSwmHostModeHandler(contextGraphId: string): void {
-    if (this.swmHostModeHandlers.has(contextGraphId)) return;
+  private wireSwmHostModeHandler(
+    contextGraphId: string,
+    source: SubscriptionSource = SUBSCRIPTION_SOURCES.RECONCILER,
+  ): void {
     // OT-RFC-38 / LU-6 Phase B — host-mode subscribes on the wire-form
     // topic. For chain-event-driven auto-subscribe, `contextGraphId`
     // IS the wire id (the core has no cleartext to translate from).
     // For an operator-driven `enableSwmHostModeFor("cleartext-id")`
     // path on a node that's also a member, `gossipWireIdFor`
     // resolves to the curator-committed hash via the local meta.
-    const wireCgId = this.gossipWireIdFor(contextGraphId);
+    //
+    // Codex PR #672 review `id=3302086589`: canonicalize FIRST and
+    // key both bookkeeping maps off `wireCgId` so a chain-event-
+    // driven hash subscribe collides with a later manual-driven
+    // cleartext subscribe on the SAME CG and the second call is a
+    // genuine no-op (instead of silently wiring a second handler on
+    // the same topic).
+    const wireCgId = this.canonicalSwmHostModeKey(contextGraphId);
+    if (this.swmHostModeHandlers.has(wireCgId)) {
+      // Idempotent re-entry — preserve the original source. The first
+      // discovery path to wire the handler wins the provenance label;
+      // a later path covering the same CG is "also true" but the
+      // operator-meaningful answer is "which path got us here first".
+      return;
+    }
     const swmTopic = contextGraphWorkspaceTopic(wireCgId);
-    this.swmHostModeSubscribed.add(contextGraphId);
+    this.swmHostModeSubscribed.set(wireCgId, source);
     this.gossip.subscribe(swmTopic);
     const handler = (_topic: string, data: Uint8Array, from: string) => {
+      // OT-RFC-38 LU-11: peek envelope type and dispatch. Chunked
+      // envelopes (`type='share-write-chunked'`) take the V2 chunk
+      // persistence path; everything else flows through the legacy
+      // host-mode store unchanged. Failed decode falls through to
+      // `ingestSwmHostModeEnvelope` which is also defensive — the
+      // dispatch here is best-effort, not a security boundary.
+      let envelopeType: string | undefined;
+      try {
+        const peek = decodeGossipEnvelope(data);
+        envelopeType = peek?.type;
+      } catch { /* drop into legacy path */ }
+      if (envelopeType === GOSSIP_TYPE_WORKSPACE_PUBLISH_CHUNKED) {
+        this.ingestSwmCiphertextChunkEnvelope(contextGraphId, data, from).catch((err: unknown) => {
+          const msg = err instanceof Error ? err.message : String(err);
+          this.log.warn(
+            createOperationContext('system'),
+            `LU-11: chunked SWM ingest failed for "${contextGraphId}": ${msg}`,
+          );
+        });
+        return;
+      }
       this.ingestSwmHostModeEnvelope(contextGraphId, data, from).catch((err: unknown) => {
         const msg = err instanceof Error ? err.message : String(err);
         this.log.warn(
@@ -9310,7 +11764,7 @@ export class DKGAgent {
         );
       });
     };
-    this.swmHostModeHandlers.set(contextGraphId, handler);
+    this.swmHostModeHandlers.set(wireCgId, handler);
     this.gossip.onMessage(swmTopic, handler);
     // B3: persist the host-mode designation so a restart re-engages
     // this handler before the chain-event poller catches up.
@@ -9336,13 +11790,17 @@ export class DKGAgent {
    * appended opaquely. Wasted disk + apply work.
    */
   private unwireSwmHostModeHandler(contextGraphId: string): void {
-    const handler = this.swmHostModeHandlers.get(contextGraphId);
+    // Both bookkeeping maps are canonical-keyed (see
+    // {@link canonicalSwmHostModeKey}); canonicalize the input
+    // before lookup so the unwire path is shape-agnostic just like
+    // the wire path.
+    const wireCgId = this.canonicalSwmHostModeKey(contextGraphId);
+    const handler = this.swmHostModeHandlers.get(wireCgId);
     if (!handler) return;
-    const wireCgId = this.gossipWireIdFor(contextGraphId);
     const swmTopic = contextGraphWorkspaceTopic(wireCgId);
     this.gossip.offMessage(swmTopic, handler);
-    this.swmHostModeHandlers.delete(contextGraphId);
-    this.swmHostModeSubscribed.delete(contextGraphId);
+    this.swmHostModeHandlers.delete(wireCgId);
+    this.swmHostModeSubscribed.delete(wireCgId);
     // B3: clear the persisted host-mode designation so a restart
     // does NOT re-engage. Serialized via the per-CG persistence
     // queue (see `enqueueHostModePersistence` for the ordering
@@ -9634,6 +12092,131 @@ export class DKGAgent {
   }
 
   /**
+   * OT-RFC-38 LU-11 / OT-RFC-39 — chunked-ciphertext SWM ingest.
+   * Receives per-chunk SWM gossip envelopes
+   * (`type='share-write-chunked'`) that the publisher fans out via
+   * `_resolveEncryptInlineChunked`, verifies envelope authority
+   * against the curated CG's agent allowlist (same gate as the
+   * legacy host-mode store), strips the 32-byte `batchId` prefix
+   * from the payload, and persists the remaining ciphertext bytes
+   * under the deterministic chunk-store subject so the V2 ACK
+   * verifier can recompute the publisher's claimed
+   * `ciphertextChunksRoot` keyed by `(cgId, batchId, chunkIndex)`.
+   *
+   * Persistence model: one base64-encoded literal per chunk, in the
+   * per-CG named graph `ciphertextChunkStoreGraph(cgId)` under the
+   * subject `ciphertextChunkStoreSubject(batchId, chunkIndex)`. The
+   * store insert is idempotent — the same chunk arriving twice (or
+   * out of order) overwrites the existing triple harmlessly because
+   * `subject + predicate + graph` is unique.
+   *
+   * Late-join cores that come online after a publish has finalised
+   * end up here only opportunistically (if a peer's mesh re-floods
+   * the chunked envelope), which is unreliable; commit 7 adds the
+   * `GetCiphertextChunk` sync verb that pulls missing chunks
+   * explicitly via the protocol router.
+   */
+  private async ingestSwmCiphertextChunkEnvelope(
+    contextGraphId: string,
+    data: Uint8Array,
+    fromPeerId: string,
+  ): Promise<void> {
+    if (data.length === 0) return;
+    const ctx = createOperationContext('share');
+    let envelope: GossipEnvelopeMsg | undefined;
+    try {
+      envelope = decodeGossipEnvelope(data);
+    } catch {
+      return;
+    }
+    if (!envelope || envelope.type !== GOSSIP_TYPE_WORKSPACE_PUBLISH_CHUNKED) {
+      return;
+    }
+    if (envelope.payload.length <= 32) {
+      // Chunked payload format: [32-byte batchId][ciphertext...].
+      // Anything shorter can't carry a single ciphertext byte.
+      this.log.debug(
+        ctx,
+        `LU-11: ignoring chunked envelope on cg=${contextGraphId} from=${fromPeerId} with truncated payload (${envelope.payload.length} bytes)`,
+      );
+      return;
+    }
+    if (typeof envelope.swmMessageIndex !== 'number' || envelope.swmMessageIndex < 0) {
+      this.log.debug(
+        ctx,
+        `LU-11: ignoring chunked envelope on cg=${contextGraphId} with invalid swmMessageIndex=${envelope.swmMessageIndex}`,
+      );
+      return;
+    }
+
+    // Subscription CG-id can be either cleartext (operator / member
+    // path) or wire-form hash (chain-event auto-subscribe). Compare
+    // both sides in wire-form so any combination accepts.
+    const envelopeWireId = this.gossipWireIdFor(envelope.contextGraphId);
+    const subscriptionWireId = this.gossipWireIdFor(contextGraphId);
+    if (envelopeWireId !== subscriptionWireId) return;
+    const storageCgId = envelope.contextGraphId;
+
+    // Verify envelope signature against the curated CG's agent
+    // allowlist — exactly the same authority check the host-mode
+    // store uses; without it, any topic-reachable peer could plant
+    // arbitrary ciphertext under a victim's (cgId, batchId) keys.
+    const handlerSm = this.getOrCreateSharedMemoryHandler();
+    const verdict = await handlerSm.verifyHostModeEnvelopeAuthority(data, storageCgId, fromPeerId);
+    if (!verdict.accepted) {
+      // Same transient-race classification as the LU-6 host-mode
+      // path: "no agent allowlist yet" is the post-create / pre-
+      // chain-event window; everything else is a real auth failure.
+      const isTransientRace = verdict.reason === 'no agent allowlist on context graph';
+      const logFn = isTransientRace ? this.log.debug.bind(this.log) : this.log.warn.bind(this.log);
+      logFn(
+        ctx,
+        `LU-11: chunked envelope auth ${isTransientRace ? 'deferred' : 'rejected'} for cg=${storageCgId} from=${fromPeerId} swmMessageIndex=${envelope.swmMessageIndex}: ${verdict.reason}`,
+      );
+      return;
+    }
+
+    const batchId = envelope.payload.subarray(0, 32);
+    const ciphertext = envelope.payload.subarray(32);
+    const chunkIndex = envelope.swmMessageIndex;
+    // Codex review on PR #715 (refined round 2 on PR #727): canonicalize
+    // the cgId used in the per-CG named graph via
+    // `canonicalChunkStoreCgIdOrNull` so persist (here) and lookup
+    // (`handleGetCiphertextChunk`, V2 ACK loadChunk, prover extractor)
+    // converge on the same wire-form key. The persist site falls back
+    // to the raw `storageCgId` (legacy shape) when canonicalization
+    // can't safely resolve — the gossip envelope's `contextGraphId`
+    // is typically already cleartext / wire-form, so the null path is
+    // unlikely here, but the fallback keeps insert semantics safe and
+    // mirrors the lookup-side wildcard fallback rather than
+    // fabricating a bad keccak-of-decimal-string.
+    const persistCanonical = this.canonicalChunkStoreCgIdOrNull(storageCgId);
+    const chunksGraph = ciphertextChunkStoreGraph(persistCanonical ?? storageCgId);
+    const subject = ciphertextChunkStoreSubject(batchId, chunkIndex);
+    const literal = `"${Buffer.from(ciphertext).toString('base64')}"`;
+    try {
+      await this.store.insert([{
+        subject,
+        predicate: CIPHERTEXT_CHUNK_PREDICATE,
+        object: literal,
+        graph: chunksGraph,
+      }]);
+    } catch (err) {
+      this.log.warn(
+        ctx,
+        `LU-11: failed to persist chunk cg=${storageCgId} batchId=${ethers.hexlify(batchId).slice(0, 18)}... chunkIndex=${chunkIndex}: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      return;
+    }
+    this.log.info(
+      ctx,
+      `LU-11: persisted ciphertext chunk cg=${storageCgId} batchId=${ethers.hexlify(batchId).slice(0, 18)}... chunkIndex=${chunkIndex} bytes=${ciphertext.length}`,
+    );
+  }
+
+  /**
    * OT-RFC-38 / LU-6 Phase B — curator-side: record a CG so the
    * periodic beacon timer keeps re-announcing it AND broadcast an
    * immediate first beacon. Called from {@link createContextGraph}
@@ -9815,7 +12398,7 @@ export class DKGAgent {
     this.recordCgWireId(wireId, wireId);
 
     try {
-      await this.reconcileSwmHostModeSubscription(wireId);
+      await this.reconcileSwmHostModeSubscription(wireId, SUBSCRIPTION_SOURCES.BEACON);
       this.log.info(
         ctx,
         `Beacon-driven auto-host engaged for wireId=${wireId.slice(0, 12)}… (curator=${curatorEoa.slice(0, 10)}…, from=${fromPeer})`,
@@ -9963,6 +12546,864 @@ export class DKGAgent {
       truncated: truncatedByEntries || truncatedByBytes,
       entries,
     });
+  }
+
+  /**
+   * OT-RFC-38 LU-11 / OT-RFC-39 — responder for the
+   * `/dkg/10.0.2/get-ciphertext-chunk` sync verb. Loads one
+   * `(cgId, batchId, chunkIndex)` ciphertext from the local
+   * triple-store-backed chunk store and returns the base64 bytes
+   * (or a typed denial: bad signature, unauthorized, missing
+   * chunk). Authorization piggybacks on the existing LU-6
+   * UNION-of-authorities gate: any source that recognises the
+   * requester EOA accepts (on-chain participants, beacon curator,
+   * local agent gate, libp2p peer allowlist). PR-B will refine
+   * this to include a sharding-table-membership chain probe so
+   * late-joining hosting cores (which won't be on the agent
+   * allowlist) can backfill ciphertexts they need to participate
+   * in RFC-39 random sampling.
+   */
+  private async handleGetCiphertextChunk(data: Uint8Array, fromPeerId: string): Promise<Uint8Array> {
+    const ctx = createOperationContext('share');
+    let req: CiphertextChunkCatchupRequest;
+    try {
+      req = decodeCiphertextChunkCatchupRequest(data);
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      return encodeCiphertextChunkCatchupResponse({
+        version: CIPHERTEXT_CHUNK_CATCHUP_WIRE_VERSION,
+        contextGraphId: '',
+        batchIdHex: '',
+        chunkIndex: -1,
+        denied: `malformed request: ${reason}`,
+      });
+    }
+    const nowMs = Date.now();
+    const verify = verifySignedCiphertextChunkCatchupRequest(req, nowMs);
+    if (!verify.ok || !verify.recoveredSigner) {
+      this.log.info(
+        ctx,
+        `LU-11 chunk-catchup denied cg=${req.contextGraphId} from=${fromPeerId} requesterEoa=${req.requesterEoa} chunkIndex=${req.chunkIndex}: ${verify.reason}`,
+      );
+      return encodeCiphertextChunkCatchupResponse({
+        version: CIPHERTEXT_CHUNK_CATCHUP_WIRE_VERSION,
+        contextGraphId: req.contextGraphId,
+        batchIdHex: ethers.hexlify(req.batchId),
+        chunkIndex: req.chunkIndex,
+        denied: verify.reason ?? 'signature verification failed',
+      });
+    }
+    const requesterEoa = verify.recoveredSigner;
+    if (!this.ciphertextChunkCatchupReplayGuard.recordIfFresh(requesterEoa, req.nonce, req.issuedAtMs, nowMs)) {
+      return encodeCiphertextChunkCatchupResponse({
+        version: CIPHERTEXT_CHUNK_CATCHUP_WIRE_VERSION,
+        contextGraphId: req.contextGraphId,
+        batchIdHex: ethers.hexlify(req.batchId),
+        chunkIndex: req.chunkIndex,
+        denied: 'replayed chunk-catchup nonce',
+      });
+    }
+
+    // Reuse the LU-6 host-catchup authorization shape via a thin
+    // adapter — same UNION-of-authorities logic, but the chunk-catchup
+    // request payload lacks `sinceSeqno`/`maxEntries`/`maxBytes` so
+    // we pack the chunked-request fields into the shared verifier's
+    // shape with zero-defaults for the unused slots. (The shared
+    // authorization helper only reads `contextGraphId` and the EOA;
+    // the other fields are signature-digest input, not authorization
+    // input.)
+    let authOk = false;
+    let authReason: string = 'no authority source available for context graph';
+    const requesterLower = requesterEoa.toLowerCase();
+    let anyAuthorityFound = false;
+    try {
+      const chainParticipants = await this.resolveOnChainParticipantAgents(req.contextGraphId);
+      if (chainParticipants !== null) {
+        anyAuthorityFound = true;
+        if (chainParticipants.some((a) => a.toLowerCase() === requesterLower)) authOk = true;
+      }
+    } catch { /* probe failure non-fatal */ }
+    if (!authOk) {
+      try {
+        const beaconCurator = await this.resolveBeaconPinnedCuratorEoa(req.contextGraphId);
+        if (beaconCurator) {
+          anyAuthorityFound = true;
+          if (beaconCurator.toLowerCase() === requesterLower) authOk = true;
+        }
+      } catch { /* probe failure non-fatal */ }
+    }
+    if (!authOk) {
+      try {
+        const agentGate = await this.getContextGraphAgentGateAddresses(req.contextGraphId);
+        if (agentGate !== null) {
+          anyAuthorityFound = true;
+          if (agentGate.some((a) => a.toLowerCase() === requesterLower)) authOk = true;
+        }
+      } catch { /* probe failure non-fatal */ }
+    }
+    if (!authOk) {
+      try {
+        const allowedPeers = await this.getContextGraphAllowedPeers(req.contextGraphId);
+        if (allowedPeers !== null) {
+          anyAuthorityFound = true;
+          if (allowedPeers.includes(fromPeerId)) authOk = true;
+        }
+      } catch { /* probe failure non-fatal */ }
+    }
+    // OT-RFC-39 fifth authority — registered node operator.
+    //
+    // The four authorities above are MEMBER- or CURATOR-shaped: they
+    // gate "can this EOA decrypt / participate in" the CG. Curated
+    // CGs almost never list every sharding-table core in
+    // `allowedAgents` (curators only enrol agents that need to
+    // decrypt), so the existing layers deny EVERY core-to-core
+    // chunk fetch — exactly the late-join scenario OT-RFC-39 is
+    // designed to fix. Closing that gap means admitting any peer
+    // whose EOA is a registered node operator (identityId > 0n on
+    // chain). Three reasons this is safe for the CIPHERTEXT path
+    // (and not generalisable to plaintext catchup):
+    //
+    //  1. The bytes carried are AEAD-encrypted with the curator's
+    //     sender key. A node operator without the sender key gets
+    //     opaque ciphertext that is computationally indistinguishable
+    //     from random, so no decryption power leaks.
+    //
+    //  2. The on-chain `(ciphertextChunksRoot, ciphertextChunkCount)`
+    //     commitment is already public — anyone observing chain state
+    //     learns "curated KC X has N chunks of size up to S each"
+    //     without needing the wire fetch. The metadata our responder
+    //     reveals is a strict subset of what the chain already
+    //     reveals.
+    //
+    //  3. Registering an on-chain identity costs TRAC stake — it's
+    //     a Sybil-resistant credential. Pairing the EOA recovery
+    //     above (which proves the requester holds the operator key)
+    //     with a non-zero identityId restricts ciphertext fetch to
+    //     the same trust set the random-sampling picker draws from,
+    //     which is the spec-intended population for hosting.
+    //
+    // Wire effect: the late-join sync verb now succeeds for any
+    // sharding-table core requesting chunks for any curated CG. The
+    // prover's auto-backfill can complete; the missed core proves
+    // its hosting and earns rewards on the period it would otherwise
+    // forfeit.
+    if (!authOk && typeof this.chain.getIdentityIdForAddress === 'function') {
+      try {
+        const reqIdentityId = await this.chain.getIdentityIdForAddress(requesterEoa);
+        if (reqIdentityId > 0n) {
+          anyAuthorityFound = true;
+          authOk = true;
+          this.log.debug(
+            ctx,
+            `LU-11 chunk-catchup admitted via OT-RFC-39 node-operator authority cg=${req.contextGraphId} requesterEoa=${requesterEoa} identityId=${reqIdentityId.toString()}`,
+          );
+        }
+      } catch (err) {
+        this.log.debug(
+          ctx,
+          `LU-11 chunk-catchup node-operator probe failed cg=${req.contextGraphId} requesterEoa=${requesterEoa}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+    if (!authOk) {
+      authReason = anyAuthorityFound
+        ? 'requester EOA not in any of: on-chain participants, beacon curator, local agent-gate, allowedPeers, node-operator-registry'
+        : 'no authority source available for context graph';
+      this.log.info(
+        ctx,
+        `LU-11 chunk-catchup denied cg=${req.contextGraphId} from=${fromPeerId} requesterEoa=${requesterEoa} chunkIndex=${req.chunkIndex}: ${authReason}`,
+      );
+      return encodeCiphertextChunkCatchupResponse({
+        version: CIPHERTEXT_CHUNK_CATCHUP_WIRE_VERSION,
+        contextGraphId: req.contextGraphId,
+        batchIdHex: ethers.hexlify(req.batchId),
+        chunkIndex: req.chunkIndex,
+        denied: authReason,
+      });
+    }
+
+    // Locate the chunk. Codex review (round 2) on PR #727: pin to the
+    // per-CG named graph when we can safely canonicalize `req.contextGraphId`
+    // (cleartext / bare-hex / locally-registered numeric on-chain id),
+    // and fall back to the wildcard `GRAPH ?g` scan when we can't. The
+    // previous PR #715 fix would have keccak'd a literal decimal string
+    // like "42" and produced a hash that did NOT match the curator
+    // nameHash → "chunk not found" for any requester that addressed
+    // the CG by its numeric on-chain id, narrowing the public API in
+    // a way that wasn't advertised. Scoped pinning still gives us the
+    // multi-CG identical-KC isolation we wanted from PR #715 whenever
+    // canonicalization succeeds; the wildcard fallback preserves the
+    // historical responder contract for the catching-up / numeric-id
+    // cases.
+    const canonicalCgIdForChunks = this.canonicalChunkStoreCgIdOrNull(req.contextGraphId);
+    const chunksGraphForLookup = canonicalCgIdForChunks
+      ? ciphertextChunkStoreGraph(canonicalCgIdForChunks)
+      : null;
+    const graphClause = chunksGraphForLookup
+      ? `GRAPH <${chunksGraphForLookup}>`
+      : 'GRAPH ?g';
+    const subject = ciphertextChunkStoreSubject(req.batchId, req.chunkIndex);
+    const sparql = `SELECT ?o WHERE { ${graphClause} { <${subject}> <${CIPHERTEXT_CHUNK_PREDICATE}> ?o } } LIMIT 1`;
+    let result;
+    try {
+      result = await this.store.query(sparql);
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      this.log.warn(ctx, `LU-11 chunk-catchup store query failed cg=${req.contextGraphId} chunkIndex=${req.chunkIndex}: ${reason}`);
+      return encodeCiphertextChunkCatchupResponse({
+        version: CIPHERTEXT_CHUNK_CATCHUP_WIRE_VERSION,
+        contextGraphId: req.contextGraphId,
+        batchIdHex: ethers.hexlify(req.batchId),
+        chunkIndex: req.chunkIndex,
+        denied: `store error: ${reason}`,
+      });
+    }
+    if (result.type !== 'bindings' || result.bindings.length === 0) {
+      return encodeCiphertextChunkCatchupResponse({
+        version: CIPHERTEXT_CHUNK_CATCHUP_WIRE_VERSION,
+        contextGraphId: req.contextGraphId,
+        batchIdHex: ethers.hexlify(req.batchId),
+        chunkIndex: req.chunkIndex,
+        denied: 'chunk not found',
+      });
+    }
+    const literal = result.bindings[0]?.['o'];
+    if (typeof literal !== 'string') {
+      return encodeCiphertextChunkCatchupResponse({
+        version: CIPHERTEXT_CHUNK_CATCHUP_WIRE_VERSION,
+        contextGraphId: req.contextGraphId,
+        batchIdHex: ethers.hexlify(req.batchId),
+        chunkIndex: req.chunkIndex,
+        denied: 'chunk stored value malformed',
+      });
+    }
+    const ciphertextB64 = literal.startsWith('"') && literal.endsWith('"')
+      ? literal.slice(1, -1)
+      : literal;
+    this.log.debug(
+      ctx,
+      `LU-11 chunk-catchup served cg=${req.contextGraphId} from=${fromPeerId} batchId=${ethers.hexlify(req.batchId).slice(0, 18)}... chunkIndex=${req.chunkIndex} bytes=${Buffer.from(ciphertextB64, 'base64').length}`,
+    );
+    return encodeCiphertextChunkCatchupResponse({
+      version: CIPHERTEXT_CHUNK_CATCHUP_WIRE_VERSION,
+      contextGraphId: req.contextGraphId,
+      batchIdHex: ethers.hexlify(req.batchId),
+      chunkIndex: req.chunkIndex,
+      ciphertextB64,
+    });
+  }
+
+  /**
+   * OT-RFC-38 LU-11 / OT-RFC-39 — requester for the
+   * `/dkg/10.0.2/get-ciphertext-chunk` sync verb. Pulls one
+   * `(cgId, batchId, chunkIndex)` ciphertext from a known host and
+   * (when `persist === true`) writes it into the local per-chunk
+   * store so the V2 ACK verifier sees it on the next pass. Returns
+   * the raw decoded response so callers can inspect denial reasons
+   * or feed bytes to a member-side verifier.
+   *
+   * Late-joining hosting cores call this in a loop to backfill the
+   * `(cgId, batchId, 0..count-1)` set after seeing
+   * `KnowledgeCollectionCiphertextCommitmentSet` on chain or
+   * `MISSING_CIPHERTEXT_CHUNKS` from a V2 ACK request they
+   * routed forward. Loop policy + peer selection are intentionally
+   * caller-owned — this method is the single-pull primitive.
+   */
+  async fetchCiphertextChunkFromPeer(
+    remotePeerId: string,
+    contextGraphId: string,
+    batchId: Uint8Array,
+    chunkIndex: number,
+    options?: {
+      persist?: boolean;
+      /**
+       * @deprecated Reserved for a future alternate-signer plumb-through.
+       *   No-op today: the closure below always uses
+       *   `this.chain.signMessage`. Kept on the public signature so
+       *   existing TypeScript callers continue to compile through the
+       *   rc.12 line (Codex review round 2 on PR #727 flagged
+       *   removing it as a breaking API change). Will be removed in a
+       *   future intentional major-version break — either replaced by
+       *   a real signer callback (`sign?: (digest) => Promise<string>`)
+       *   or dropped entirely if no caller ever materialises.
+       */
+      signWithChainAdapter?: boolean;
+    },
+  ): Promise<CiphertextChunkCatchupResponse> {
+    if (batchId.length !== 32) {
+      throw new Error(`fetchCiphertextChunkFromPeer requires a 32-byte batchId; got ${batchId.length}`);
+    }
+    if (!Number.isInteger(chunkIndex) || chunkIndex < 0) {
+      throw new Error(`fetchCiphertextChunkFromPeer requires a non-negative chunkIndex; got ${chunkIndex}`);
+    }
+    const ctx = createOperationContext('share');
+    // Codex review on PR #715 / #717 / #727: the option above is a
+    // back-compat no-op. The implementation requires a chain adapter
+    // with `signMessage`; there is no real alternate-signer path yet,
+    // so callers must wire the chain. Honest error if absent.
+    if (typeof this.chain.signMessage !== 'function') {
+      throw new Error('fetchCiphertextChunkFromPeer: chain adapter does not expose signMessage; the LU-11 sync verb requires an operator-key signer');
+    }
+    const sign = async (digest: Uint8Array) => {
+      // Match the host-catchup pattern: chain.signMessage returns
+      // {r, vs}; re-serialise to the 65-byte EIP-191 hex shape.
+      const { r, vs } = await this.chain.signMessage!(digest);
+      const sig = ethers.Signature.from({ r: ethers.hexlify(r), yParityAndS: ethers.hexlify(vs) });
+      return sig.serialized;
+    };
+    const signedReq = await mintSignedCiphertextChunkCatchupRequest({
+      contextGraphId,
+      batchId,
+      chunkIndex,
+      sign,
+    });
+    const reqBytes = encodeCiphertextChunkCatchupRequest(signedReq);
+    const sendResult = await this.messenger.sendReliable(remotePeerId, PROTOCOL_GET_CIPHERTEXT_CHUNK, reqBytes);
+    if (!sendResult.delivered) {
+      throw new Error(`LU-11 chunk-catchup transport failed: ${sendResult.error}`);
+    }
+    const resp = decodeCiphertextChunkCatchupResponse(sendResult.response);
+    if (options?.persist && resp.ciphertextB64) {
+      const subject = ciphertextChunkStoreSubject(batchId, chunkIndex);
+      const literal = `"${resp.ciphertextB64}"`;
+      // Codex review on PR #715 (refined round 2 on PR #727): use the
+      // central canonical helper so this persist site matches the
+      // ingest persist site exactly, including the safe fallback when
+      // canonicalization can't resolve. `contextGraphId` here is the
+      // local CG id the prover-side backfill passed in (cleartext
+      // resolved via `resolveLocalCgIdByOnChainId` in
+      // `buildCiphertextChunkBackfill`), so the helper normally
+      // returns a wire hash; the null path is theoretical defense.
+      const persistCanonical = this.canonicalChunkStoreCgIdOrNull(contextGraphId);
+      const chunksGraphForPersist = ciphertextChunkStoreGraph(persistCanonical ?? contextGraphId);
+      try {
+        await this.store.insert([{
+          subject,
+          predicate: CIPHERTEXT_CHUNK_PREDICATE,
+          object: literal,
+          graph: chunksGraphForPersist,
+        }]);
+        this.log.debug(
+          ctx,
+          `LU-11 chunk-catchup persisted cg=${contextGraphId} batchId=${ethers.hexlify(batchId).slice(0, 18)}... chunkIndex=${chunkIndex} from=${remotePeerId}`,
+        );
+      } catch (err) {
+        this.log.warn(
+          ctx,
+          `LU-11 chunk-catchup persistence failed cg=${contextGraphId} batchId=${ethers.hexlify(batchId).slice(0, 18)}... chunkIndex=${chunkIndex}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+    return resp;
+  }
+
+  /**
+   * OT-RFC-39 — resolve a numeric on-chain CG id (the form the prover
+   * sees from `createChallenge` / `getKAContextGraphId`) back to the
+   * local cleartext id this agent registered the CG under. Scans
+   * `subscribedContextGraphs` because the reverse map is keyed by the
+   * wire-form `onChainHash`, not the numeric id. Returns null when
+   * this node has never seen the CG (legitimate during the chain-event
+   * replay race window after restart — caller falls back to passing
+   * the numeric id as a string, which the responder's authorization
+   * layer also resolves via on-chain participant lookup).
+   */
+  private resolveLocalCgIdByOnChainId(onChainId: bigint): string | null {
+    const target = onChainId.toString();
+    // Multiple local records can share one on-chain id: a synthetic
+    // hash-keyed host record (`subscribed: false`, minted from
+    // `ContextGraphCreated`) can coexist with the real subscribed cleartext
+    // CG. Prefer the subscribed match so live KACG nudges + reconcile target
+    // the CG a user actually reads; fall back to the first record otherwise
+    // (the host-only / post-restart replay-window case callers tolerate).
+    let fallback: string | null = null;
+    for (const [localId, sub] of this.subscribedContextGraphs) {
+      if (sub.onChainId !== target) continue;
+      if (sub.subscribed) return localId;
+      if (fallback === null) fallback = localId;
+    }
+    return fallback;
+  }
+
+  /**
+   * Bind (or rebind) a local CG to an on-chain CG id, resetting the
+   * chain-driven reconcile watermark if the bound id actually CHANGES.
+   *
+   * The persisted `lastReconciledOrdinal` is the count of contiguous KAs
+   * promoted for a *specific* on-chain graph. If the same local CG id is later
+   * repaired/recreated under a different on-chain id, that watermark no longer
+   * refers to the same chain graph — reusing it would make the sweep start at
+   * the wrong ordinal and permanently skip earlier KAs. So when the id changes
+   * we zero the watermark and drop the in-memory cursor; the reset is persisted
+   * together with the new id, keeping it restart-safe.
+   */
+  private bindSubscriptionOnChainId(localCgId: string, sub: ContextGraphSub, newOnChainId: string): void {
+    const prev = sub.onChainId;
+    sub.onChainId = newOnChainId;
+    if (!prev || prev === newOnChainId) return;
+    // The bound on-chain id actually CHANGED (repair / recreate / re-register).
+    // Any prior reconcile progress refers to the OLD chain graph and must be
+    // dropped, otherwise the sweep resumes at the wrong ordinal and skips
+    // early KAs of the new graph. Progress can hide in two places: the
+    // persisted `lastReconciledOrdinal` watermark AND an in-memory cursor that
+    // still holds `ahead` ordinals while its watermark is 0 (e.g. ordinals
+    // reconciled but waiting on confirmation depth). Reset BOTH on any id
+    // change — not only when the persisted watermark happens to be positive.
+    const hadProgress =
+      (sub.lastReconciledOrdinal ?? 0) > 0 || this.reconcileCursors.has(localCgId);
+    sub.lastReconciledOrdinal = 0;
+    this.reconcileCursors.delete(localCgId);
+    if (hadProgress) {
+      this.log.info(
+        createOperationContext('system'),
+        `VM reconcile: on-chain id for "${localCgId}" changed ${prev}->${newOnChainId}; reset reconcile watermark + cursor to 0`,
+      );
+    }
+  }
+
+  /**
+   * Phase D — resolve the on-chain access policy for a numeric CG id, public(0)
+   * / curated(1) / unknown(null). Cache-first (the StorageACK `isCgCurated`
+   * oracle seeds the same cache), single lazy chain read on miss. Never throws.
+   */
+  private async resolveAccessPolicy(numericCgId: bigint): Promise<0 | 1 | null> {
+    const key = numericCgId.toString();
+    const cached = this.onChainAccessPolicyCache.get(key);
+    if (cached === 0 || cached === 1) return cached;
+    const getAccessPolicy = this.chain.getContextGraphAccessPolicy;
+    if (typeof getAccessPolicy !== 'function') return null;
+    try {
+      const policy = await getAccessPolicy.call(this.chain, numericCgId);
+      if (policy === 0 || policy === 1) {
+        this.onChainAccessPolicyCache.set(key, policy);
+        return policy;
+      }
+    } catch { /* unknown — fall through */ }
+    return null;
+  }
+
+  /**
+   * Phase D (Cores fill their own gaps) — invoked from the StorageACK
+   * pre-sign hook. When this Core signs an ACK for a PUBLIC CG it becomes a
+   * storage node for it; mark the CG `coreHosted` (persisted) so the
+   * chain-driven VM reconciler runs for it across restarts even without a
+   * member subscription. A Core that was offline during the *next* publish
+   * then learns the missed KA from chain on restart and pulls it core-first.
+   *
+   * Public-only by design: curated CGs are hosted as opaque ciphertext, which
+   * a Core cannot promote to plaintext VM — their coverage stays on the
+   * host-mode reconciler + LU-11 chunk-backfill path. Best-effort + idempotent.
+   */
+  private async recordCoreHostedPublicCg(cgId: string, swmGraphId?: string): Promise<void> {
+    if (!this.vmReconcileEnabled()) return;
+    let numeric: bigint;
+    try {
+      numeric = BigInt(cgId);
+    } catch {
+      return; // non-numeric id can't be reconciled against the chain ordinal list
+    }
+    if (numeric <= 0n) return;
+
+    const policy = await this.resolveAccessPolicy(numeric);
+    if (policy !== 0) return; // curated / unknown — not the public VM-promote path
+
+    const numericStr = numeric.toString();
+    // Pick the local CG id to key the host-only record under. Prefer an
+    // existing local mapping; otherwise use the publisher-supplied cleartext
+    // `swmGraphId` (the local CG name for a public/cleartext publish). On the
+    // FIRST ACK for a CG we only host (never subscribed to),
+    // `resolveLocalCgIdByOnChainId()` is still empty — falling back to the
+    // numeric id would persist the row under `did:dkg:context-graph:<numeric>`,
+    // a namespace that doesn't hold the hosted SWM snapshot, so after restart
+    // the reconciler + active-fetch would sync/promote against the wrong graph
+    // and miss the KA this core already ACKed. The cleartext hint keeps the
+    // row under the same id the reconciler uses.
+    // Discard the hint ONLY when it's empty or literally the on-chain numeric
+    // id (no information) — NOT merely because it's all-digits: a public CG's
+    // local cleartext id can be numeric (e.g. "1" is a valid contextGraphId
+    // elsewhere in the repo), and rejecting it would wrongly key the row under
+    // the on-chain id and miss the hosted KA after restart.
+    const cleartextHint = swmGraphId && swmGraphId !== numericStr
+      ? swmGraphId
+      : undefined;
+    const localCgId = this.resolveLocalCgIdByOnChainId(numeric) ?? cleartextHint ?? numericStr;
+    const existing = this.subscribedContextGraphs.get(localCgId);
+    if (existing?.coreHosted && existing.onChainId === numericStr) return; // already recorded
+
+    let next: ContextGraphSub;
+    if (existing) {
+      // Rebind through the helper so a CG re-created/rebound under the same
+      // local id drops its stale reconcile watermark + in-memory cursor before
+      // we persist the new on-chain id. A bare `onChainId` overwrite would keep
+      // the old `lastReconciledOrdinal`, making the sweep resume at the prior
+      // graph's ordinal and permanently skip the new graph's early KAs.
+      this.bindSubscriptionOnChainId(localCgId, existing, numericStr);
+      existing.coreHosted = true;
+      next = existing;
+    } else {
+      next = { subscribed: false, synced: false, onChainId: numericStr, coreHosted: true };
+    }
+    this.setContextGraphSubscription(localCgId, next);
+    this.log.info(
+      createOperationContext('system'),
+      `Phase D: marked public cg=${numericStr} as core-hosted (will chain-reconcile to VM across restarts)`,
+    );
+    // Nudge a reconcile now so the first hosted publish lands promptly; the
+    // periodic sweep is the safety net.
+    if (this.reconcileCoalescer) void this.reconcileCoalescer.trigger(localCgId);
+  }
+
+  // ===== Phase B — chain-driven VM reconciliation (B.4 agent wiring) =========
+
+  /**
+   * Phase E/F — emit one reconciliation telemetry event. Logs a structured
+   * `chain-promote` line (grep surface) and forwards to the optional ops-metrics
+   * sink (Phase F). Best-effort: never throws, never awaits the sink.
+   */
+  private emitReplication(ev: Omit<ReplicationEvent, 'ts'>): void {
+    const event: ReplicationEvent = { ts: Date.now(), ...ev };
+    const parts = [
+      `chain-promote action=${event.action}`,
+      `cg=${event.contextGraphId}`,
+      event.onChainCgId ? `onChainCg=${event.onChainCgId}` : '',
+      event.ordinal !== undefined ? `ordinal=${event.ordinal}` : '',
+      event.kaId ? `ka=${event.kaId}` : '',
+      event.fromWatermark !== undefined && event.toWatermark !== undefined ? `cursor=${event.fromWatermark}->${event.toWatermark}` : '',
+      event.head !== undefined ? `head=${event.head}` : '',
+      event.reconciled !== undefined ? `reconciled=${event.reconciled}` : '',
+      event.pending !== undefined ? `pending=${event.pending}` : '',
+      event.ual ? `ual=${event.ual}` : '',
+      // JSON-encode `detail` so embedded quotes/newlines can't break the
+      // structured `key=value` log line or inject bogus key/value fragments.
+      event.detail ? `detail=${JSON.stringify(event.detail)}` : '',
+    ].filter(Boolean);
+    this.log.info(createOperationContext('system'), parts.join(' '));
+    const sink = this.config.onReplicationEvent;
+    if (sink) {
+      try {
+        sink(event);
+      } catch (err) {
+        this.log.warn(createOperationContext('system'), `onReplicationEvent sink threw: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+  }
+
+  /**
+   * True iff the chain adapter exposes the per-CG registration-ordinal reads
+   * the reconciler needs. Gates the live nudge, the sweep timer, and the
+   * coalescer so non-V10 / no-chain nodes pay nothing.
+   */
+  private vmReconcileEnabled(): boolean {
+    return (
+      this.chain.chainId !== 'none' &&
+      typeof this.chain.getContextGraphKCCount === 'function' &&
+      typeof this.chain.getContextGraphKCAt === 'function' &&
+      typeof this.chain.getLatestMerkleRoot === 'function'
+    );
+  }
+
+  /**
+   * Trigger a coalesced reconcile sweep for every subscribed CG that has an
+   * on-chain id. Used by the periodic timer + the startup prime. Per-CG work is
+   * single-flighted by {@link reconcileCoalescer} so overlapping ticks (or a
+   * burst of live nudges) collapse into one sweep per CG.
+   */
+  private async runVmReconcileSweep(): Promise<void> {
+    if (!this.vmReconcileEnabled() || !this.reconcileCoalescer) return;
+    for (const [localCgId, sub] of this.subscribedContextGraphs) {
+      // Member subscriptions AND Phase D core-hosted public CGs get swept.
+      if ((!sub.subscribed && !sub.coreHosted) || !sub.onChainId) continue;
+      void this.reconcileCoalescer.trigger(localCgId);
+    }
+  }
+
+  /**
+   * One reconcile pass for a single CG: build the injected deps and hand off to
+   * the pure {@link reconcileContextGraph} orchestrator (which owns the cursor
+   * math + watermark persistence gate). The cursor is created lazily from the
+   * persisted `lastReconciledOrdinal` and lives in {@link reconcileCursors}.
+   */
+  private async runVmReconcileForCg(localCgId: string): Promise<void> {
+    const sub = this.subscribedContextGraphs.get(localCgId);
+    if ((!sub?.subscribed && !sub?.coreHosted) || !sub.onChainId || !this.vmReconcileEnabled()) return;
+    const onChainCgId = BigInt(sub.onChainId);
+
+    let cursor = this.reconcileCursors.get(localCgId);
+    if (!cursor) {
+      cursor = createCursorState(sub.lastReconciledOrdinal ?? 0);
+      this.reconcileCursors.set(localCgId, cursor);
+    }
+
+    const deps: ChainReconcilerDeps = {
+      getKCCount: async (cg) => Number(await this.chain.getContextGraphKCCount!(cg)),
+      getHeadBlock: async () => {
+        if (typeof this.chain.getBlockNumber !== 'function') return undefined;
+        try {
+          return await this.chain.getBlockNumber();
+        } catch {
+          return undefined;
+        }
+      },
+      reconcileOrdinal: (lcg, ocg, ordinal, headBlock) =>
+        this.reconcileChainOrdinal(lcg, ocg, ordinal, headBlock),
+      persistWatermark: (lcg, watermark) => {
+        const s = this.subscribedContextGraphs.get(lcg);
+        if (!s) return;
+        const previous = s.lastReconciledOrdinal ?? 0;
+        s.lastReconciledOrdinal = watermark;
+        this.persistContextGraphSubscription(lcg);
+        this.emitReplication({
+          contextGraphId: lcg,
+          onChainCgId: s.onChainId,
+          action: 'cursor-advance',
+          fromWatermark: previous,
+          toWatermark: watermark,
+        });
+      },
+      confirmationDepth: DKGAgent.VM_RECONCILE_CONFIRMATION_DEPTH,
+      log: (msg) => this.log.info(createOperationContext('system'), msg),
+    };
+
+    try {
+      const result = await reconcileContextGraph(deps, cursor, localCgId, onChainCgId);
+      if (result.reconciled > 0 || result.pending > 0) {
+        this.emitReplication({
+          contextGraphId: localCgId,
+          onChainCgId: sub.onChainId,
+          action: 'sweep',
+          head: result.head,
+          toWatermark: result.watermark,
+          reconciled: result.reconciled,
+          pending: result.pending,
+        });
+      }
+      // Phase D — a host-only (non-member) reconcile that actually promoted KAs
+      // is a Core filling its own gap. Distinct telemetry so operators can see
+      // the Core-to-Core fill path working (success-criteria metric).
+      if (result.reconciled > 0 && sub.coreHosted && !sub.subscribed) {
+        this.emitReplication({
+          contextGraphId: localCgId,
+          onChainCgId: sub.onChainId,
+          action: 'core-fill',
+          head: result.head,
+          toWatermark: result.watermark,
+          reconciled: result.reconciled,
+        });
+      }
+    } catch (err) {
+      this.log.warn(
+        createOperationContext('system'),
+        `VM reconcile for "${localCgId}" failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  /**
+   * Reconcile a single per-CG registration ordinal: resolve the kaId + its
+   * latest on-chain merkle root + publisher, build the UAL, and ask the
+   * finalization handler to promote the matching local SWM snapshot to VM
+   * (verifying the CG binding from chain). When no local SWM matches, run an
+   * active core-first catch-up fetch and retry once. `headBlock` is reused as
+   * the materialization version AND echoed back as the cursor observation block
+   * (reorg gate). See {@link OrdinalOutcome} for the status contract.
+   */
+  private async reconcileChainOrdinal(
+    localCgId: string,
+    onChainCgId: bigint,
+    ordinal: number,
+    headBlock: number | undefined,
+  ): Promise<OrdinalOutcome> {
+    const ctx = createOperationContext('system');
+    const versionBlock = headBlock ?? 0;
+
+    let kaId: bigint;
+    let merkleRoot: Uint8Array;
+    let publisherAddress: string;
+    let ual: string;
+    try {
+      kaId = await this.chain.getContextGraphKCAt!(onChainCgId, BigInt(ordinal));
+      const storageAddr = this.chain.getDKGKnowledgeAssetsAddress
+        ? await this.chain.getDKGKnowledgeAssetsAddress()
+        : undefined;
+      if (!storageAddr) return { status: 'skip' };
+      ual = buildKnowledgeAssetUal(this.chain.chainId, storageAddr, kaId);
+
+      // Recently reconciled (live-burst guard): treat as already-done so the
+      // cursor advances without redoing chain reads + an SWM scan.
+      if (this.recentReconciledUals.has(ual)) return { status: 'already', blockNumber: versionBlock };
+
+      merkleRoot = await this.chain.getLatestMerkleRoot!(kaId);
+      publisherAddress = (this.chain.getLatestMerkleRootPublisher
+        ? await this.chain.getLatestMerkleRootPublisher(kaId)
+        : '') ?? '';
+    } catch (err) {
+      // RPC lag / unknown kaId — leave for the next sweep.
+      this.log.info(ctx, `Phase B: ordinal ${ordinal} of cg ${onChainCgId} not resolvable yet: ${err instanceof Error ? err.message : String(err)}`);
+      return { status: 'pending' };
+    }
+
+    const fh = this.getOrCreateFinalizationHandler();
+    const reconcileInput = {
+      contextGraphId: localCgId,
+      onChainCgId: onChainCgId.toString(),
+      ual,
+      merkleRoot,
+      publisherAddress,
+      kaId,
+      versionBlock,
+    };
+
+    let outcome = await fh.handleChainReconciledKC(reconcileInput, ctx);
+    if (outcome === 'no-swm') {
+      // Active fetch: pull the missing snapshot core-first (selectCatchupPeers
+      // already prioritises known cores + the preferred sync peer), then retry.
+      this.emitReplication({
+        contextGraphId: localCgId, onChainCgId: onChainCgId.toString(),
+        action: 'fetch', ordinal, kaId: kaId.toString(), ual,
+      });
+      try {
+        await this.syncContextGraphFromConnectedPeers(localCgId, { includeSharedMemory: true });
+      } catch (err) {
+        this.log.info(ctx, `Phase B: active fetch for "${localCgId}" (ordinal ${ordinal}) failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      outcome = await fh.handleChainReconciledKC(reconcileInput, ctx);
+    }
+
+    switch (outcome) {
+      case 'promoted':
+        this.recentReconciledUals.add(ual);
+        this.emitReplication({
+          contextGraphId: localCgId, onChainCgId: onChainCgId.toString(),
+          action: 'promote', ordinal, kaId: kaId.toString(), ual,
+        });
+        return { status: 'reconciled', blockNumber: versionBlock };
+      case 'already-confirmed':
+      case 'stale-target':
+        // Already in VM (or a newer update is) — done for cursor purposes.
+        this.recentReconciledUals.add(ual);
+        this.emitReplication({
+          contextGraphId: localCgId, onChainCgId: onChainCgId.toString(),
+          action: 'already', ordinal, kaId: kaId.toString(), ual,
+        });
+        return { status: 'already', blockNumber: versionBlock };
+      case 'no-swm':
+      case 'unverified':
+      default:
+        this.emitReplication({
+          contextGraphId: localCgId, onChainCgId: onChainCgId.toString(),
+          action: 'defer', ordinal, kaId: kaId.toString(), ual, detail: outcome,
+        });
+        return { status: 'pending' };
+    }
+  }
+
+  /**
+   * OT-RFC-39 — build the per-tick auto-backfill closure handed to the
+   * Random Sampling prover via {@link bindRandomSampling}. The closure
+   * is invoked when `extractCiphertextChunksFromStore` reports
+   * `CiphertextChunksMissingError`; it pulls the missing chunks from
+   * authorized peers and persists them so the prover's one-shot retry
+   * can build the proof.
+   *
+   * Peer discovery uses the same source the publish path uses:
+   * `gossip.getSubscribers(contextGraphWorkspaceTopic(wireId))`. Every
+   * authorized hosting core subscribes to that topic to receive the
+   * chunked-publish gossip, so the subscriber snapshot is the natural
+   * "who can answer me right now" set. Falls back to "no peers" when
+   * the local cleartext CG id is unknown (chain replay hasn't caught
+   * up yet) — the prover then logs `kc-not-synced` and re-ticks in
+   * 30s, by which time the chain handler has populated
+   * `subscribedContextGraphs`.
+   *
+   * Authorization happens on the RESPONDER side
+   * (`handleGetCiphertextChunk`): every peer the requester contacts
+   * verifies the request's recovered EOA against the on-chain
+   * participant set / beacon curator / agent-gate / allowedPeers.
+   * Requesters that aren't in any authority set get a `denied` ACK
+   * and we skip to the next peer.
+   *
+   * Cap policy: one fetch per missing chunk per peer; iterate peers
+   * until a chunk lands or we exhaust the list. No retries inside the
+   * hook — the prover's outer 30s loop is the natural retry boundary.
+   */
+  private buildCiphertextChunkBackfill(
+    ctx: OperationContext,
+  ): (req: { cgId: bigint; batchId: Uint8Array; missingIndexes: number[] }) => Promise<{ fetched: number; failures: number; reason?: string }> {
+    return async ({ cgId, batchId, missingIndexes }) => {
+      if (missingIndexes.length === 0) return { fetched: 0, failures: 0 };
+
+      const localCgId = this.resolveLocalCgIdByOnChainId(cgId);
+      if (!localCgId) {
+        return {
+          fetched: 0,
+          failures: missingIndexes.length,
+          reason: 'cg-not-locally-registered',
+        };
+      }
+
+      const wireId = this.gossipWireIdFor(localCgId);
+      const workspaceTopic = contextGraphWorkspaceTopic(wireId);
+      let selfPeer: string | null = null;
+      try { selfPeer = this.peerId; } catch { /* pre-start */ }
+      const allSubscribers = this.gossip.getSubscribers(workspaceTopic);
+      const candidatePeers = Array.from(new Set(
+        allSubscribers.filter((p) => p && p !== selfPeer),
+      ));
+
+      if (candidatePeers.length === 0) {
+        return {
+          fetched: 0,
+          failures: missingIndexes.length,
+          reason: 'no-peers',
+        };
+      }
+
+      const batchIdHex = ethers.hexlify(batchId).slice(0, 18);
+      this.log.info(
+        ctx,
+        `LU-11 backfill start cg=${localCgId} batchId=${batchIdHex}... missing=${missingIndexes.length} peers=${candidatePeers.length}`,
+      );
+
+      let fetched = 0;
+      let failures = 0;
+      let lastDenied: string | undefined;
+      for (const idx of missingIndexes) {
+        let got = false;
+        for (const peer of candidatePeers) {
+          try {
+            const resp = await this.fetchCiphertextChunkFromPeer(peer, localCgId, batchId, idx, {
+              persist: true,
+            });
+            if (resp.denied) {
+              lastDenied = resp.denied;
+              continue;
+            }
+            if (resp.ciphertextB64) {
+              got = true;
+              break;
+            }
+          } catch (err) {
+            this.log.debug(
+              ctx,
+              `LU-11 backfill peer=${peer} chunk=${idx} cg=${localCgId} error: ${err instanceof Error ? err.message.slice(0, 200) : String(err).slice(0, 200)}`,
+            );
+          }
+        }
+        if (got) fetched++;
+        else failures++;
+      }
+
+      this.log.info(
+        ctx,
+        `LU-11 backfill done cg=${localCgId} batchId=${batchIdHex}... fetched=${fetched} failures=${failures}${lastDenied ? ` lastDenied=${lastDenied}` : ''}`,
+      );
+      return {
+        fetched,
+        failures,
+        ...(failures > 0 && fetched === 0 && lastDenied ? { reason: `all-denied: ${lastDenied}` } : {}),
+        ...(failures > 0 && fetched === 0 && !lastDenied ? { reason: 'no-responders' } : {}),
+      };
+    };
   }
 
   /**
@@ -10300,7 +13741,7 @@ export class DKGAgent {
   }>> {
     const ctx = createOperationContext('share');
     const explicitPeers = options?.peers;
-    const candidates: string[] = (() => {
+    const rawCandidates: string[] = (() => {
       if (explicitPeers && explicitPeers.length > 0) return [...new Set(explicitPeers)];
       const connections = this.node.libp2p.getConnections();
       const seen = new Set<string>();
@@ -10310,6 +13751,16 @@ export class DKGAgent {
       }
       return [...seen];
     })();
+    // Contact reliable Core hosts first. This serial loop still reaches
+    // every candidate, but Cores first means faster time-to-first-data
+    // and a better resume-seqno baseline before any flaky edge is tried.
+    const candidates = orderCatchupPeers(rawCandidates, undefined, false, this.knownCorePeerIds)
+      .map((p) => p.toString());
+    const coreCount = candidates.filter((id) => this.knownCorePeerIds.has(id)).length;
+    this.log.info(
+      ctx,
+      `host-catchup peer order for "${contextGraphId}": cores=${coreCount} total=${candidates.length}`,
+    );
     const results: Array<{
       peerId: string;
       rounds: number;
@@ -10370,7 +13821,57 @@ export class DKGAgent {
       return { enabled: false, cgCount: 0, totalBytes: 0, totalEntries: 0, subscribedCgIds: [] };
     }
     const stats = await this.swmHostModeStore.stats();
-    return { enabled: true, ...stats, subscribedCgIds: [...this.swmHostModeSubscribed] };
+    return { enabled: true, ...stats, subscribedCgIds: [...this.swmHostModeSubscribed.keys()] };
+  }
+
+  /**
+   * PR5 — ACK-provenance lookup for the StorageACK handler. Returns
+   * which of the four LU-6 Phase B discovery paths caused this node
+   * to be hosting the CG identified by ANY of the passed candidate
+   * ids at the time of the call. `'member'` when the CG is in
+   * member-mode (decrypt+apply handler is authoritative), the
+   * recorded host-mode source when it's in host-mode, or `undefined`
+   * when neither — the latter means the core has no live subscription
+   * for the CG, which should never happen on a successful ACK code
+   * path but is plumbed through defensively so a future race doesn't
+   * crash the ACK encoder.
+   *
+   * Takes multiple candidate ids because the two consulted maps are
+   * keyed differently: `sharedMemoryGossipRegistered` (member-mode)
+   * uses the CALLER-supplied cleartext id verbatim, while
+   * `swmHostModeSubscribed` (host-mode) is canonical-keyed by the
+   * wire-form hash via {@link canonicalSwmHostModeKey}. The
+   * StorageACK handler has the numeric on-chain `cgId`, the
+   * cleartext `swmGraphId`, and may have pre-computed the wire hash;
+   * passing the full set lets us hit member-mode on any cleartext
+   * shape AND host-mode on any candidate after canonicalisation. The
+   * `seen` set dedupes both raw and canonical forms so the per-call
+   * cost stays O(distinct shapes).
+   *
+   * Public so `StorageACKHandlerConfig.getSubscriptionSourceForCg`
+   * can bind directly to it at agent wire-up time (in `lifecycle.ts`).
+   */
+  getSwmSubscriptionSource(...candidateIds: Array<string | undefined>): SubscriptionSource | undefined {
+    const seen = new Set<string>();
+    for (const id of candidateIds) {
+      if (typeof id !== 'string' || id.length === 0) continue;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      if (this.sharedMemoryGossipRegistered.has(id)) {
+        return SUBSCRIPTION_SOURCES.MEMBER;
+      }
+      // Host-mode bookkeeping is canonical-keyed (Codex PR #672
+      // review `id=3302086589`); resolve every candidate through
+      // `canonicalSwmHostModeKey` before lookup so any of the
+      // numeric / cleartext / hash shapes hits the same entry.
+      const canonical = this.canonicalSwmHostModeKey(id);
+      if (!seen.has(canonical)) {
+        seen.add(canonical);
+        const hostSource = this.swmHostModeSubscribed.get(canonical);
+        if (hostSource) return hostSource;
+      }
+    }
+    return undefined;
   }
 
   /**
@@ -10417,16 +13918,24 @@ export class DKGAgent {
       );
       return { subscribed: false, alreadySubscribed: false, hostingEnabled: true, memberMode: true };
     }
-    if (this.swmHostModeSubscribed.has(contextGraphId)) {
+    if (this.swmHostModeSubscribed.has(this.canonicalSwmHostModeKey(contextGraphId))) {
       // Idempotent re-entry: even when the subscription is already
       // active, re-probe registration state. This handles the
       // legitimate "CG was unregistered when first subscribed,
       // operator later registered it on-chain, operator re-calls
       // /host-mode/subscribe" flow without forcing a daemon restart.
+      //
+      // The `has()` check goes through `canonicalSwmHostModeKey` so
+      // a manual subscribe with the cleartext id finds an entry the
+      // chain-event/beacon path wrote with the wire-hash form (and
+      // vice versa). Codex PR #672 review `id=3302086589` — without
+      // this canonicalisation the second subscribe would wire a
+      // duplicate gossip handler on the same topic and double every
+      // host-mode ingest/persistence.
       await this.maybeMarkRegisteredForHostMode(contextGraphId);
       return { subscribed: false, alreadySubscribed: true, hostingEnabled: true };
     }
-    this.wireSwmHostModeHandler(contextGraphId);
+    this.wireSwmHostModeHandler(contextGraphId, SUBSCRIPTION_SOURCES.MANUAL);
     // Codex PR #610 R1 comment 5: a core that only knows the CG by
     // topic id (the explicit /host-mode/subscribe entrypoint) must
     // still transition the store to the registered-CG limits as
@@ -11333,6 +14842,10 @@ export class DKGAgent {
     if (!this.updateHandler) {
       this.updateHandler = new UpdateHandler(this.store, this.chain, this.eventBus, {
         knownBatchContextGraphs: this.publisher.knownBatchContextGraphs,
+        // GH #842: let the receiver promote applied updates into the per-cgId
+        // partition the RS prover reads, so updated KAs are provable on all
+        // nodes, not just the publisher.
+        resolveOnChainCgId: (cgName: string) => this.getContextGraphOnChainId(cgName),
       });
     }
     return this.updateHandler;
@@ -11344,6 +14857,11 @@ export class DKGAgent {
         this.store,
         this.chain.chainId === 'none' ? undefined : this.chain,
         this.eventBus,
+        // Defensive: when a peer's finalization gossip omits
+        // `targetContextGraphId` (pre-cd68fa689 publisher in the mesh),
+        // resolve the on-chain id locally so per-cgId promotion still
+        // fires and the RS prover sees the KC.
+        (cgName: string) => this.getContextGraphOnChainId(cgName),
       );
     }
     return this.finalizationHandler;
@@ -11944,8 +15462,52 @@ export class DKGAgent {
     if (resolvedLocalAccessPolicy !== undefined && resolvedLocalAccessPolicy !== LOCAL_ACCESS_OPEN && resolvedLocalAccessPolicy !== LOCAL_ACCESS_CURATED) {
       throw new Error('accessPolicy must be 0 (open) or 1 (private/curated)');
     }
+    // Closes #774 finding #1 — `dkg context-graph register
+    // --access-policy 1` against a CG that was created public used to
+    // silently register on-chain as curated while the local CG stayed
+    // public. The subsequent `dkg publish my-cg` then tripped the
+    // pre-publish LU-5 guard with a CG-policy-mismatch error and the
+    // operator had no easy way to recover (the LU-5 guard is correct
+    // — encrypting against the wrong CG's policy would leak plaintext
+    // OR be rejected by cores).
+    //
+    // Fail fast at register time with a clear remediation pointer so
+    // the operator never gets into the half-registered state. The
+    // single-call API (`POST /api/context-graph/create
+    // {accessPolicy:1, register:true, allowedAgents:[…]}`) and the
+    // CLI `dkg context-graph create my-cg --access-policy 1` BOTH set
+    // the local access policy at create time — those remain the
+    // supported paths for curated CGs.
+    // `isPrivateContextGraph()` reflects the CURRENT local ACL state,
+    // not strictly the create-time policy: a CG created public can
+    // later be locked down via allowlist mutations and would then
+    // also report `actualLocalIsCurated = true`. Phrase the error in
+    // terms of the current ACL state so the message stays accurate
+    // regardless of which write flipped the local policy (Codex r2
+    // on #777). The remediation pointer covers both atomic-create
+    // paths because that is the only supported way to bring the CG
+    // out of the mismatched state.
+    const actualLocalIsCurated = await this.isPrivateContextGraph(id);
+    if (
+      resolvedLocalAccessPolicy !== undefined
+      && ((resolvedLocalAccessPolicy === LOCAL_ACCESS_CURATED) !== actualLocalIsCurated)
+    ) {
+      const localStr = actualLocalIsCurated ? 'private/curated (1)' : 'public/open (0)';
+      const requestedStr = resolvedLocalAccessPolicy === LOCAL_ACCESS_CURATED
+        ? 'private/curated (1)'
+        : 'public/open (0)';
+      throw new Error(
+        `Context graph "${id}" currently has local access policy=${localStr} but register was called with --access-policy ${requestedStr}. ` +
+        `register cannot change the local access policy — encrypting against a different policy than the CG actually has would either leak plaintext or be rejected by cores ` +
+        `(this is what the pre-publish LU-5 guard then refuses). ` +
+        `To create a curated CG atomically, use one of: ` +
+        `(a) \`dkg context-graph create <id> --access-policy 1 --allowed-agent <addr>\`, ` +
+        `(b) the single-call API \`POST /api/context-graph/create { accessPolicy: 1, register: true, allowedAgents: [...] }\`. ` +
+        `Then register without --access-policy.`,
+      );
+    }
     if (resolvedLocalAccessPolicy === undefined) {
-      resolvedLocalAccessPolicy = await this.isPrivateContextGraph(id)
+      resolvedLocalAccessPolicy = actualLocalIsCurated
         ? LOCAL_ACCESS_CURATED
         : LOCAL_ACCESS_OPEN;
     }
@@ -12024,19 +15586,46 @@ export class DKGAgent {
     // Hosts come from the sharding table at publish time; ACK quorum
     // is `parametersStorage.minimumRequiredSignatures()`.
 
-    // Check if already registered on-chain (prevents duplicate minting)
+    // Check if already registered on-chain (prevents duplicate minting).
+    // A local OnChainId triple alone is not enough — devnet restarts and
+    // partial failures can leave ontology id "1" while the chain slot is
+    // inactive, which would skip registration and strand publishes.
     const existingOnChainId = await this.getContextGraphOnChainId(id);
     if (existingOnChainId) {
-      this.log.info(ctx, `Context graph "${id}" already has on-chain ID ${existingOnChainId} — skipping chain call`);
+      let onChainLive = false;
+      if (typeof this.chain.isContextGraphActiveOnChain === 'function') {
+        try {
+          onChainLive = await this.chain.isContextGraphActiveOnChain(BigInt(existingOnChainId));
+        } catch {
+          onChainLive = false;
+        }
+      }
+      if (onChainLive) {
+        this.log.info(ctx, `Context graph "${id}" already has on-chain ID ${existingOnChainId} — skipping chain call`);
+        await this.store.deleteByPattern({
+          graph: cgMetaGraph,
+          subject: contextGraphUri,
+          predicate: DKG_ONTOLOGY.DKG_REGISTRATION_STATUS,
+        });
+        await this.store.insert([
+          { subject: contextGraphUri, predicate: DKG_ONTOLOGY.DKG_REGISTRATION_STATUS, object: `"registered"`, graph: cgMetaGraph },
+        ]);
+        return { onChainId: existingOnChainId, txHash: undefined };
+      }
+      this.log.warn(
+        ctx,
+        `Context graph "${id}" has local on-chain id ${existingOnChainId} but it is not active on-chain — re-registering`,
+      );
+      const ontologyGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
       await this.store.deleteByPattern({
-        graph: cgMetaGraph,
+        graph: ontologyGraph,
         subject: contextGraphUri,
-        predicate: DKG_ONTOLOGY.DKG_REGISTRATION_STATUS,
+        predicate: `${DKG_ONTOLOGY.DKG_CONTEXT_GRAPH}OnChainId`,
       });
-      await this.store.insert([
-        { subject: contextGraphUri, predicate: DKG_ONTOLOGY.DKG_REGISTRATION_STATUS, object: `"registered"`, graph: cgMetaGraph },
-      ]);
-      return { onChainId: existingOnChainId, txHash: undefined };
+      const sub = this.subscribedContextGraphs.get(id);
+      if (sub) {
+        this.setContextGraphSubscription(id, { ...sub, onChainId: undefined });
+      }
     }
 
     // LU-2: edge-owned CG pattern — no `participantIdentityIds`/
@@ -12301,7 +15890,7 @@ export class DKGAgent {
     // Update in-memory subscription record and ensure we're subscribed
     const sub = this.subscribedContextGraphs.get(id);
     if (sub) {
-      sub.onChainId = onChainId;
+      this.bindSubscriptionOnChainId(id, sub, onChainId);
       // Keep the forward + reverse maps in lockstep so the receive
       // path can translate the wire id back to `id` (see
       // {@link recordCgWireId}).
@@ -12390,7 +15979,13 @@ export class DKGAgent {
       });
     }
 
-    // Skip if already in the allowlist (idempotent)
+    // Skip if already in the allowlist (idempotent).
+    //
+    // Codex review on #873 — the `warnIfAllowlistWriteOnPublicCg`
+    // call must come AFTER this early-return. Pre-fix, the warning
+    // ran first and logged "writing allowlist quad" even on
+    // re-invites that didn't insert anything, so operators got
+    // misleading audit trails for no-op calls.
     if (existingAllowlist?.includes(peerId)) {
       this.upsertContextGraphMember({
         contextGraphId,
@@ -12412,6 +16007,23 @@ export class DKGAgent {
     });
 
     await this.store.insert(quadsToInsert);
+
+    // Issue #865 — log a clear warning AFTER the allowlist quad has
+    // landed on a CG with an explicit `accessPolicy="public"` triple.
+    // The allowlist write is allowed (legitimate uses include
+    // populating an authorized-publisher set on a public-but-curated-
+    // publish CG), but post-#865 the publisher's
+    // `isPrivateContextGraph` no longer silently flips the CG to
+    // curated just because an allowlist was written — so the
+    // operator should know the allowlist is informational for read
+    // access on this CG.
+    //
+    // Codex review round 5 on #873 (line 17485) — call site is
+    // post-insert so the breadcrumb only fires for writes that
+    // actually hit the store. A failing `store.insert` throws to the
+    // caller before we reach this point, so the warn is a faithful
+    // record of persisted state.
+    await this.warnIfAllowlistWriteOnPublicCg(contextGraphId, ctx, 'inviteToContextGraph (peer)');
 
     if (existingAllowlist === null || existingAllowlist.length === 0) {
       this.upsertContextGraphMember({
@@ -12469,11 +16081,36 @@ export class DKGAgent {
     }
     this.assertCallerIsOwner(owner, callerAgentAddress, 'manage invitations');
 
+    const existingParticipants = await this.getPrivateContextGraphParticipants(contextGraphId);
+    const alreadyAllowed = existingParticipants?.some(
+      (a) => a.toLowerCase() === agentAddress.toLowerCase(),
+    ) ?? false;
+
+    // Codex review on #873 (line 14061) — idempotency early-return.
+    // Mirrors the peer-path branch at ~line 13967. A no-op re-invite
+    // of an agent that's already in the allowlist with no fresh
+    // delegation must not insert duplicate quads OR emit the
+    // public-CG warn — pre-fix, the warn ran on every call regardless
+    // of whether the store was about to mutate, which misled
+    // operators auditing the warn stream (empirically reproduced by
+    // @branarakic on the patched daemon at `704b49cf`).
+    if (alreadyAllowed && !delegation) {
+      this.upsertContextGraphMember({
+        contextGraphId,
+        principalType: 'agent',
+        principalId: agentAddress,
+        role: 'participant',
+        status: 'active',
+        source: 'allowed-agent',
+      });
+      this.log.info(ctx, `Agent ${agentAddress} already in allowlist for "${contextGraphId}" — skipping`);
+      return;
+    }
+
     const cgMetaGraph = contextGraphMetaGraphUri(contextGraphId);
     const contextGraphUri = contextGraphDataGraphUri(contextGraphId);
     const quadsToInsert: Quad[] = [];
 
-    const existingParticipants = await this.getPrivateContextGraphParticipants(contextGraphId);
     if ((!existingParticipants || existingParticipants.length === 0) && this.defaultAgentAddress) {
       quadsToInsert.push({
         subject: contextGraphUri,
@@ -12491,12 +16128,18 @@ export class DKGAgent {
       });
     }
 
-    quadsToInsert.push({
-      subject: contextGraphUri,
-      predicate: DKG_ONTOLOGY.DKG_ALLOWED_AGENT,
-      object: `"${agentAddress}"`,
-      graph: cgMetaGraph,
-    });
+    // Codex review on #873 — only push the bare allowlist quad when
+    // the list is actually growing. Re-approving an existing agent
+    // with a fresh delegation overwrites the delegation node (below)
+    // but must not re-insert the DKG_ALLOWED_AGENT triple.
+    if (!alreadyAllowed) {
+      quadsToInsert.push({
+        subject: contextGraphUri,
+        predicate: DKG_ONTOLOGY.DKG_ALLOWED_AGENT,
+        object: `"${agentAddress}"`,
+        graph: cgMetaGraph,
+      });
+    }
 
     // If the agent gave us a signed delegation (via the join-request
     // path), promote its delegatee identifiers into the CG's allowlist
@@ -12526,6 +16169,24 @@ export class DKGAgent {
     }
 
     await this.store.insert(quadsToInsert);
+
+    // Issue #865 — companion warning to the peer-invite path above.
+    // Allowlist writes on explicit-public CGs are allowed (the
+    // publishPolicy=curated + accessPolicy=public combination is a
+    // valid CG mode where the allowlist gates publishers, not
+    // subscribers), but the operator should know that the read-side
+    // gate stays open per the explicit `accessPolicy="public"`.
+    //
+    // Codex review round 4/5 on #873 — fires AFTER `store.insert`
+    // succeeds so the breadcrumb is a faithful record of persisted
+    // state (a failing insert throws before this point). Gated on
+    // `!alreadyAllowed` because re-approves that only refresh a
+    // delegation don't grow the allowlist, so they don't warrant
+    // the public-CG breadcrumb.
+    if (!alreadyAllowed) {
+      await this.warnIfAllowlistWriteOnPublicCg(contextGraphId, ctx, 'inviteAgentToContextGraph');
+    }
+
     this.upsertContextGraphMember({
       contextGraphId,
       principalType: 'agent',
@@ -13295,7 +16956,17 @@ export class DKGAgent {
   /**
    * Reject a pending join request.
    */
-  async rejectJoinRequest(contextGraphId: string, agentAddress: string): Promise<void> {
+  async rejectJoinRequest(contextGraphId: string, agentAddress: string, callerAgentAddress?: string): Promise<void> {
+    // SECURITY (G1): reject is a curator-only ACL decision. Previously this
+    // method had NO owner check while `approveJoinRequest` was gated (via
+    // `inviteAgentToContextGraph` → `assertCallerIsOwner`), so any local-token
+    // caller could reject a pending request — and the route only ran the
+    // write preflight (CG-exists/locally-writable), not a curator check.
+    // Mirror the approve path: assert the caller is the CG owner/curator
+    // BEFORE mutating state or notifying the joiner. Throws "Only the context
+    // graph curator can …" (403 at the route) for a non-curator.
+    await this.assertContextGraphOwner(contextGraphId, callerAgentAddress, 'manage join requests');
+
     const cgMetaGraph = contextGraphMetaGraphUri(contextGraphId);
     const requestUri = `did:dkg:join-request:${contextGraphId}:${agentAddress.toLowerCase()}`;
     const DKG = 'https://dkg.network/ontology#';
@@ -13739,6 +17410,296 @@ export class DKGAgent {
     if (result.type !== 'bindings' || result.bindings.length === 0) return null;
     const value = result.bindings[0]?.['id'];
     return typeof value === 'string' ? value.replace(/^"|"$/g, '') : null;
+  }
+
+  /**
+   * Issue #872 — best-effort read of the on-chain
+   * `(accessPolicy, publishPolicy)` enum pair for a CG. Sources, in
+   * order:
+   *
+   *   1. {@link onChainAccessPolicyCache} / {@link onChainPublishPolicyCache} —
+   *      populated eagerly by the `ContextGraphCreated` chain-event
+   *      handler. The keys are the on-chain numeric ids; if the caller
+   *      passed a cleartext local id, we re-key via
+   *      {@link subscribedContextGraphs} or {@link getContextGraphOnChainId}.
+   *
+   *   2. Local `_meta` / ontology triple store for `accessPolicy`
+   *      only. The CG creator also persists `dkg:publishPolicy` in
+   *      `_meta` at create time, but that triple is not updated by
+   *      `updatePublishPolicy`, so it is never used as an
+   *      authorization-positive publish-policy answer here.
+   *
+   *   3. Direct chain RPC (Codex round-3 fix): for registered CGs
+   *      where the cache leaves `publishPolicy` undefined/stale, or
+   *      where steps 1 and 2 still leave `accessPolicy` undefined,
+   *      query the contract directly via
+   *      `chain.getContextGraphAccessPolicy` /
+   *      `chain.getContextGraphPublishPolicy`. The result populates
+   *      the in-memory cache so subsequent calls don't re-query.
+   *
+   * Steps 2 and 3 are GATED on {@link isContextGraphRegistered}
+   * (Codex round-2 fix): unregistered locally-created CGs reflect
+   * create-time *intent* via local triples, not an on-chain
+   * commitment, and the chain itself has no record. Treating local
+   * source as authoritative pre-registration would bypass the
+   * owner-guard on a CG the curator hasn't actually committed to.
+   *
+   * Returns `{}` (both fields `undefined`) when neither source has an
+   * answer. Callers MUST treat `undefined` fields as unknown — fail
+   * closed for policy-gated decisions rather than assuming a
+   * permissive default. Failures in the chain RPC fallback (RPC
+   * unavailable, contract not deployed, transient errors) are logged
+   * and the field is left undefined.
+   */
+  async getContextGraphOnChainPolicy(contextGraphId: string): Promise<{
+    accessPolicy?: number;
+    publishPolicy?: number;
+  }> {
+    let accessPolicy = this.onChainAccessPolicyCache.get(contextGraphId);
+    // Codex review on #872 — `publishPolicy` is mutable on-chain
+    // (`PublishPolicyUpdated`) but the cache is only seeded by
+    // `ContextGraphCreated`. Treat entries older than
+    // `ON_CHAIN_PUBLISH_POLICY_CACHE_TTL_MS` as stale so the chain-RPC
+    // fallback below re-verifies before the caller relaxes the
+    // import-artifact owner guard. The accessPolicy cache is left
+    // untouched here: it's also used by SWM gossip authorization paths
+    // (lines ~1779, ~8403, ~10073) where stale-permissive cannot
+    // escalate privilege (gossip decrypt is gated by sender-key
+    // issuance) and stale-restrictive only causes a transient deny.
+    const isPublishPolicyCacheFresh = (key: string): boolean => {
+      const fetchedAt = this.onChainPublishPolicyCacheUpdatedAt.get(key);
+      if (fetchedAt === undefined) return false;
+      return Date.now() - fetchedAt <= ON_CHAIN_PUBLISH_POLICY_CACHE_TTL_MS;
+    };
+    let publishPolicy = isPublishPolicyCacheFresh(contextGraphId)
+      ? this.onChainPublishPolicyCache.get(contextGraphId)
+      : undefined;
+    // Track the resolved numeric on-chain id so we can both look it
+    // up in the cache (round-2) and use it as the chain-RPC fallback
+    // key (round-3). Lazily resolved — creators may pass the
+    // numeric id directly in which case no extra SPARQL is needed.
+    let onChainId: string | undefined;
+
+    if (accessPolicy === undefined || publishPolicy === undefined) {
+      onChainId = this.subscribedContextGraphs.get(contextGraphId)?.onChainId
+        ?? (await this.getContextGraphOnChainId(contextGraphId).catch(() => null))
+        ?? undefined;
+      if (onChainId && onChainId !== contextGraphId) {
+        if (accessPolicy === undefined) accessPolicy = this.onChainAccessPolicyCache.get(onChainId);
+        if (publishPolicy === undefined && isPublishPolicyCacheFresh(onChainId)) {
+          publishPolicy = this.onChainPublishPolicyCache.get(onChainId);
+        }
+      }
+    }
+
+    // Codex review (round 2, finding B): the local access-policy
+    // fallback below reads triples that `createContextGraph` writes
+    // synchronously — BEFORE
+    // `registerContextGraph` confirms the CG on-chain. For a CG
+    // that's still in the local-only `unregistered` state, those
+    // triples reflect the creator's *intent*, not an on-chain
+    // commitment. Treating them as authoritative would let the read
+    // relaxation kick in for a CG the curator hasn't actually
+    // committed to making public, bypassing the owner guard.
+    //
+    // Codex review (round 6, line 15487 — 2026-06-01): the prior gate
+    // only consulted `dkg:registrationStatus = "registered"`, which
+    // `registerContextGraph` writes ON THE CREATOR'S NODE only. Non-
+    // creator peers bootstrap CG metadata via `ensureContextGraphLocally`
+    // with status="unregistered" and never flip it. After a daemon
+    // restart the chain-event cache loses its in-memory entries, the
+    // status check still returns false, this gate fails closed, and
+    // cross-agent reads on legitimately public+open CGs regress to
+    // 403 for non-creators.
+    //
+    // Accept any of these as proof of an on-chain commitment:
+    //   - `dkg:registrationStatus = "registered"` (creator path), OR
+    //   - a non-zero numeric `onChainId` already resolved from
+    //     subscribed state or local meta (replicator path — the
+    //     on-chain id is only ever known if the chain assigned it).
+    //
+    // An unregistered locally-created CG has neither, so the gate
+    // still fails closed for it.
+    if (accessPolicy === undefined || publishPolicy === undefined) {
+      const registeredViaStatus = await this.isContextGraphRegistered(contextGraphId).catch(() => false);
+      let registeredViaOnChainId = false;
+      if (!registeredViaStatus) {
+        if (onChainId === undefined) {
+          onChainId = this.subscribedContextGraphs.get(contextGraphId)?.onChainId
+            ?? (await this.getContextGraphOnChainId(contextGraphId).catch(() => null))
+            ?? undefined;
+        }
+        if (onChainId) {
+          try {
+            registeredViaOnChainId = BigInt(onChainId) > 0n;
+          } catch {
+            registeredViaOnChainId = false;
+          }
+        }
+      }
+      if (!registeredViaStatus && !registeredViaOnChainId) {
+        return {
+          ...(accessPolicy === 0 || accessPolicy === 1 ? { accessPolicy } : {}),
+          ...(publishPolicy === 0 || publishPolicy === 1 ? { publishPolicy } : {}),
+        };
+      }
+    }
+
+    if (accessPolicy === undefined) {
+      const stored = await this.readLocalAccessPolicyEnum(contextGraphId).catch(() => undefined);
+      if (stored !== undefined) accessPolicy = stored;
+    }
+
+    // Codex review (round 3): non-creator peers never receive the
+    // `dkg:publishPolicy` triple — it's only written to local
+    // `_meta` on the creator's node. They observe the chain event
+    // at subscribe time which populates the in-memory caches above,
+    // but those caches are lost on daemon restart. Without a
+    // durable replicated source, `publishPolicy` permanently
+    // disappears for non-creator peers once the chain poller's
+    // replay window rolls past the create block — which makes
+    // `isPublicOpenContextGraph()` return false and cross-agent
+    // `/import-artifact/*` reads regress to 403 on legitimately
+    // public + open CGs.
+    //
+    // Fall back to a direct chain RPC for the missing fields. The
+    // fallback is gated on `registered === true` above so an
+    // unregistered local-only CG cannot poison the answer; the
+    // chain itself is the authoritative source. Failures (RPC
+    // unavailable, contract not deployed, transient errors) leave
+    // the field undefined and the daemon route falls back to the
+    // strict guard — fail-closed.
+    if (
+      (accessPolicy === undefined || publishPolicy === undefined)
+      && this.chain
+    ) {
+      if (onChainId === undefined) {
+        onChainId = this.subscribedContextGraphs.get(contextGraphId)?.onChainId
+          ?? (await this.getContextGraphOnChainId(contextGraphId).catch(() => null))
+          ?? undefined;
+      }
+      let numericId: bigint | undefined;
+      if (onChainId) {
+        try {
+          const parsed = BigInt(onChainId);
+          if (parsed > 0n) numericId = parsed;
+        } catch {
+          numericId = undefined;
+        }
+      }
+      if (numericId !== undefined) {
+        const rpcCtx = createOperationContext('resolve');
+        // Round-4 fix: bound each chain-RPC call so an unreachable
+        // RPC stack (every endpoint returning 429 / hanging on
+        // connect) cannot block the caller past the daemon-ready
+        // budget. The fallback is an optimisation — failing fast
+        // and returning undefined is correct (fail-closed via the
+        // strict guard at the route layer). 2.5s is tight enough
+        // to stay well under the 45s daemon-ready budget even when
+        // both fallbacks fire back-to-back, while still allowing a
+        // single slow eth_call hop to succeed under normal load.
+        const CHAIN_RPC_FALLBACK_TIMEOUT_MS = 2_500;
+        const withTimeout = <T,>(p: Promise<T>, label: string): Promise<T | typeof TIMEOUT_SENTINEL> => {
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          const timeout = new Promise<typeof TIMEOUT_SENTINEL>((resolve) => {
+            timer = setTimeout(() => {
+              this.log.warn(
+                rpcCtx,
+                `getContextGraphOnChainPolicy: chain.${label}(${onChainId}) timed out after ${CHAIN_RPC_FALLBACK_TIMEOUT_MS}ms — treating as UNKNOWN (fail-closed)`,
+              );
+              resolve(TIMEOUT_SENTINEL);
+            }, CHAIN_RPC_FALLBACK_TIMEOUT_MS);
+            // Allow node to exit even if the chain promise never
+            // settles (test scenario: dead RPC + fake daemon).
+            timer.unref?.();
+          });
+          return Promise.race([
+            p.finally(() => { if (timer) clearTimeout(timer); }),
+            timeout,
+          ]);
+        };
+        if (publishPolicy === undefined) {
+          const getPublishPolicy = this.chain.getContextGraphPublishPolicy;
+          if (typeof getPublishPolicy === 'function') {
+            try {
+              const result = await withTimeout(
+                getPublishPolicy.call(this.chain, numericId),
+                'getContextGraphPublishPolicy',
+              );
+              if (result !== TIMEOUT_SENTINEL) {
+                const pp = result?.publishPolicy;
+                if (pp === 0 || pp === 1) {
+                  publishPolicy = pp;
+                  this.onChainPublishPolicyCache.set(onChainId!, pp);
+                  this.onChainPublishPolicyCacheUpdatedAt.set(onChainId!, Date.now());
+                }
+              }
+            } catch (err) {
+              this.log.warn(
+                rpcCtx,
+                `getContextGraphOnChainPolicy: chain.getContextGraphPublishPolicy(${onChainId}) failed — treating as UNKNOWN (fail-closed): ${err instanceof Error ? err.message : String(err)}`,
+              );
+            }
+          }
+        }
+        if (accessPolicy === undefined) {
+          const getAccessPolicy = this.chain.getContextGraphAccessPolicy;
+          if (typeof getAccessPolicy === 'function') {
+            try {
+              const ap = await withTimeout(
+                getAccessPolicy.call(this.chain, numericId),
+                'getContextGraphAccessPolicy',
+              );
+              if (ap !== TIMEOUT_SENTINEL && (ap === 0 || ap === 1)) {
+                accessPolicy = ap;
+                this.onChainAccessPolicyCache.set(onChainId!, ap);
+              }
+            } catch (err) {
+              this.log.warn(
+                rpcCtx,
+                `getContextGraphOnChainPolicy: chain.getContextGraphAccessPolicy(${onChainId}) failed — treating as UNKNOWN (fail-closed): ${err instanceof Error ? err.message : String(err)}`,
+              );
+            }
+          }
+        }
+      }
+    }
+
+    return {
+      ...(accessPolicy === 0 || accessPolicy === 1 ? { accessPolicy } : {}),
+      ...(publishPolicy === 0 || publishPolicy === 1 ? { publishPolicy } : {}),
+    };
+  }
+
+  /**
+   * Issue #872 — read the persisted `dkg:accessPolicy` literal from
+   * the ontology graph (open CGs) or `_meta` (curated CGs) and map it
+   * back to the on-chain enum (`"public"` → `0`, `"private"` → `1`).
+   * Returns `undefined` when no triple is present locally. Used by
+   * {@link getContextGraphOnChainPolicy} as a fallback after the
+   * chain-event cache miss.
+   */
+  private async readLocalAccessPolicyEnum(contextGraphId: string): Promise<number | undefined> {
+    if ((Object.values(SYSTEM_CONTEXT_GRAPHS) as string[]).includes(contextGraphId)) {
+      return undefined;
+    }
+    const ontologyGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
+    const cgMetaGraph = contextGraphMetaGraphUri(contextGraphId);
+    const contextGraphUri = `did:dkg:context-graph:${contextGraphId}`;
+    const result = await this.store.query(
+      `SELECT ?policy WHERE {
+        { GRAPH <${ontologyGraph}> { <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_ACCESS_POLICY}> ?policy } }
+        UNION
+        { GRAPH <${cgMetaGraph}> { <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_ACCESS_POLICY}> ?policy } }
+      } LIMIT 1`,
+    );
+    if (result.type !== 'bindings' || result.bindings.length === 0) return undefined;
+    const raw = result.bindings[0]?.['policy'];
+    if (typeof raw !== 'string') return undefined;
+    const stripped = raw.replace(/^"|"$/g, '');
+    if (stripped === 'public') return 0;
+    if (stripped === 'private') return 1;
+    return undefined;
   }
 
   /**
@@ -14228,7 +18189,7 @@ export class DKGAgent {
     // system param off-chain via the adapter accessor.
     //
     // FAIL-CLOSED (Codex PR #595 round-3): `chain.verify()` only calls
-    // `registerKnowledgeCollection()` — it does NOT submit the collected
+    // `registerKnowledgeAsset()` — it does NOT submit the collected
     // signatures on-chain. This local quorum check is therefore the
     // *only* enforcement gate. If the chain adapter can't tell us the
     // system minimum (RPC outage, missing method, invalid value), we
@@ -14441,8 +18402,8 @@ export class DKGAgent {
     // 7. Submit on-chain only after quorum. Partial writes above are
     // metadata-only and deliberately do not claim a transaction hash.
     let txResult: { hash: string; blockNumber: number };
-    const existingContextGraphId = typeof this.chain.getKCContextGraphId === 'function'
-      ? await this.chain.getKCContextGraphId(opts.batchId).catch(() => 0n)
+    const existingContextGraphId = typeof this.chain.getKAContextGraphId === 'function'
+      ? await this.chain.getKAContextGraphId(opts.batchId).catch(() => 0n)
       : 0n;
     if (existingContextGraphId === contextGraphIdOnChain) {
       const provenance = await this.getBatchChainProvenance(opts.contextGraphId, opts.batchId);
@@ -15245,6 +19206,8 @@ export class DKGAgent {
         requesterAgentAddress: parsed.requesterAgentAddress,
         requesterSignatureR: parsed.requesterSignatureR,
         requesterSignatureVS: parsed.requesterSignatureVS,
+        // Phase C: unsigned delta hint. Validated/normalised in the responder.
+        sinceBatchId: typeof parsed.sinceBatchId === 'string' ? parsed.sinceBatchId : undefined,
       };
     }
 
@@ -15257,6 +19220,20 @@ export class DKGAgent {
     const includeSharedMemory = ctxGraphPart.startsWith('workspace:');
     const contextGraphId = includeSharedMemory ? ctxGraphPart.slice('workspace:'.length) : (ctxGraphPart || SYSTEM_CONTEXT_GRAPHS.AGENTS);
     const phase = normalizeSyncPhase(parts[3]);
+    // Phase C: the `|since|<n>` keyed token is ALWAYS the final two segments
+    // emitted by `buildSyncRequestEnvelope` (after the optional phase/snapshot
+    // suffix). Match only that trailing position — scanning every segment would
+    // misparse an ordinary segment literally equal to "since" (e.g. a CG or
+    // snapshotRef named "since") as a delta marker and turn a full sync into a
+    // partial response. Old encoders never emit the suffix.
+    let sinceBatchId: string | undefined;
+    if (
+      parts.length >= 2 &&
+      parts[parts.length - 2] === 'since' &&
+      /^\d+$/.test(parts[parts.length - 1])
+    ) {
+      sinceBatchId = parts[parts.length - 1];
+    }
     return {
       contextGraphId,
       offset: parseInt(parts[1], 10) || 0,
@@ -15264,6 +19241,7 @@ export class DKGAgent {
       includeSharedMemory,
       phase,
       snapshotRef: phase === 'snapshot' ? parts[4] : undefined,
+      sinceBatchId,
     };
   }
 
@@ -15338,6 +19316,7 @@ export class DKGAgent {
     responderPeerId: string,
     phase: SyncPhase = 'data',
     snapshotRef?: string,
+    sinceBatchId?: string,
   ): Promise<Uint8Array> {
     const isPrivate = await this.isPrivateContextGraph(contextGraphId);
 
@@ -15358,6 +19337,11 @@ export class DKGAgent {
       requesterPeerId: this.peerId,
       phase,
       snapshotRef,
+      // Phase C: only forwarded for the durable DATA phase — SWM has no
+      // `dkg:batchId` (pre-chain) and meta must never be narrowed. The hint
+      // is gap-safe only when it comes from a CONTIGUOUS watermark, so it is
+      // supplied explicitly by callers, never auto-derived from local MAX().
+      sinceBatchId: phase === 'data' && !includeSharedMemory ? sinceBatchId : undefined,
       needsAuth,
       computeSyncDigest: this.computeSyncDigest.bind(this),
       getIdentityId: () => this.chain.getIdentityId(),
@@ -15621,6 +19605,83 @@ export class DKGAgent {
   }
 
   /**
+   * OT-RFC-39 Codex review (round 2) on PR #727:
+   * `gossipWireIdFor(rawId)` would happily keccak a literal numeric
+   * string ("42") as if it were cleartext, producing a hash that does
+   * NOT equal the curator-committed `nameHash`. That's fine in any
+   * context where the input is guaranteed to be either cleartext or
+   * bare hex (gossip-topic construction, host-mode bookkeeping). The
+   * LU-11 ciphertext-chunk-store named graph is more sensitive: a
+   * remote requester / ACK PublishIntent may legitimately carry the
+   * numeric on-chain id, and pinning a SPARQL `GRAPH` to the wrong
+   * hash means the lookup misses every persisted chunk and declines
+   * a valid publish (Bug #4) or returns `chunk not found` (Bug #5).
+   *
+   * This helper resolves the canonical wire form for chunk-store
+   * routing OR returns null to signal "use wildcard `GRAPH ?g`
+   * fallback" — caller's responsibility. Numeric ids that can't be
+   * resolved through the local subscription map (chain replay hasn't
+   * caught up; CG isn't locally registered) return null rather than
+   * silently producing the wrong hash.
+   *
+   * Routing rules (first match wins):
+   *   1. `0x[64-hex]`             → lowercase, already wire form
+   *   2. Tracked in `subscribedContextGraphs` → `gossipWireIdFor` (returns the onChainHash)
+   *   3. Pure decimal → `resolveLocalCgIdByOnChainId` then wire-form; null if unknown
+   *   4. Everything else (cleartext) → `gossipWireIdFor` (keccak of the cleartext bytes)
+   *
+   * Rule 3 NEVER falls through to a raw keccak of the decimal string —
+   * that would reproduce the exact bug Codex called out. The caller
+   * MUST handle the null return by widening to a wildcard scan.
+   */
+  private canonicalChunkStoreCgIdOrNull(rawId: string): string | null {
+    if (typeof rawId !== 'string' || rawId.length === 0) return null;
+    if (/^0x[0-9a-fA-F]{64}$/.test(rawId)) return rawId.toLowerCase();
+    if (this.subscribedContextGraphs.has(rawId)) return this.gossipWireIdFor(rawId);
+    if (/^\d+$/.test(rawId)) {
+      try {
+        const local = this.resolveLocalCgIdByOnChainId(BigInt(rawId));
+        if (local === null) return null;
+        return this.gossipWireIdFor(local);
+      } catch {
+        return null;
+      }
+    }
+    return this.gossipWireIdFor(rawId);
+  }
+
+  /**
+   * Canonical key for the host-mode subscription bookkeeping maps
+   * (`swmHostModeSubscribed`, `swmHostModeHandlers`).
+   *
+   * Codex PR #672 review `id=3302086589`: the four LU-6 Phase B
+   * discovery paths (chain-event, beacon, reconciler, manual)
+   * deliver the same CG to host-mode wiring in different shapes —
+   * the chain-event and beacon paths already carry the curator-
+   * committed wire hash, while the reconciler and manual paths
+   * typically carry the cleartext local id (or whatever string the
+   * operator POSTed). Without a single canonical key, a later
+   * subscribe under a different shape misses `has()` and wires a
+   * second handler on the same topic, doubling ingest and
+   * persistence.
+   *
+   * We standardise on the WIRE FORM (curator-committed `nameHash`,
+   * lowercase 0x-prefixed 32-byte hex) because it's the one shape
+   * every path can reach without external lookups:
+   * {@link gossipWireIdFor} already implements the reverse
+   * cleartext→hash mapping (cache hit → on-chain hash; bare hex →
+   * lowercased; otherwise `keccak256(utf8(cleartext))`, which IS the
+   * curator-committed nameHash by definition).
+   *
+   * Thin alias today; kept as a separate method so the canonicalisation
+   * intent is callsite-obvious and any future divergence between the
+   * gossip topic key and the bookkeeping key can land in one place.
+   */
+  private canonicalSwmHostModeKey(rawCgId: string): string {
+    return this.gossipWireIdFor(rawCgId);
+  }
+
+  /**
    * Resolve the local CG id from a wire id. Used by the receive path
    * to map an envelope's `contextGraphId` (hash) back to the local id
    * used as storage/SPARQL key.
@@ -15676,11 +19737,24 @@ export class DKGAgent {
     }
   }
 
-  private async isPrivateContextGraph(contextGraphId: string): Promise<boolean> {
+  /**
+   * Issue #865 — single source of truth for "what does this CG's
+   * explicit accessPolicy say". Returns `'public'` / `'private'` if
+   * an `accessPolicy` triple is present in either the ONTOLOGY graph
+   * or this CG's `_meta` graph, otherwise `null` (no explicit
+   * policy written — fall through to callers' legacy heuristics).
+   *
+   * Extracted so `isPrivateContextGraph` (read-path routing) and
+   * `warnIfAllowlistWriteOnPublicCg` (write-path observability) can
+   * never drift on the policy-resolution rules. If we ever add a new
+   * policy value, the parsing fix lands in one place.
+   */
+  private async getExplicitAccessPolicy(
+    contextGraphId: string,
+  ): Promise<'public' | 'private' | null> {
     if ((Object.values(SYSTEM_CONTEXT_GRAPHS) as string[]).includes(contextGraphId)) {
-      return false;
+      return null;
     }
-
     const ontologyGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
     const cgMetaGraph = contextGraphMetaGraphUri(contextGraphId);
     const contextGraphUri = `did:dkg:context-graph:${contextGraphId}`;
@@ -15697,19 +19771,111 @@ export class DKGAgent {
         }
       } LIMIT 1`,
     );
+    if (result.type !== 'bindings' || result.bindings.length === 0) return null;
+    const policyValue = result.bindings[0]?.['policy'];
+    if (policyValue === '"public"') return 'public';
+    if (policyValue === '"private"') return 'private';
+    // Defensive: any unknown literal (e.g. a future policy value the
+    // older agent code doesn't recognize) is reported as `null` so
+    // callers fall through to the legacy heuristic instead of
+    // mis-routing on an opaque string.
+    return null;
+  }
 
-    if (result.type === 'bindings' && result.bindings[0]?.['policy'] === '"private"') {
-      return true;
+  /**
+   * Issue #865 — observability hook for the invite write paths. Emits a
+   * warn log when the caller writes an allowlist quad on a CG that
+   * carries an explicit `accessPolicy="public"` triple. We don't
+   * throw here:
+   *
+   *   1. `publishPolicy=curated` on a public-discoverable CG is a
+   *      legitimate combo (allowlist gates publishers, subscribers
+   *      stay public). Rejecting would break it.
+   *   2. The primary `isPrivateContextGraph` fix already prevents the
+   *      original bug (silent re-route to the curated publish path).
+   *   3. Pre-existing tests and adapter flows create CGs with no
+   *      explicit accessPolicy and then invite — those should keep
+   *      working.
+   *
+   * The warn line is the documentation: it tells the operator
+   * "your allowlist write landed but read access stays open per the
+   * explicit accessPolicy=public" so the next publisher confusion
+   * has an obvious breadcrumb. Read-only, single SELECT (delegated
+   * to `getExplicitAccessPolicy`) — does not mutate state.
+   *
+   * Codex review rounds 1, 4, and 5 on #873 — callers MUST defer
+   * this until AFTER `store.insert(quadsToInsert)` succeeds. Two
+   * constraints converge on the post-insert call site:
+   *
+   *   - Round 1 / round 4 (idempotency): logging when no quad
+   *     would be inserted (no-op re-invite) misleads operators
+   *     about which writes hit the store.
+   *   - Round 5 (state truthfulness): logging BEFORE the insert
+   *     resolves leaves a phantom breadcrumb if the insert throws.
+   *
+   * The current call sites in `inviteToContextGraph` /
+   * `inviteAgentToContextGraph` fire this AFTER the awaited insert
+   * (gated on `!alreadyAllowed` for the agent path's
+   * delegation-only refresh case), so the warn is a faithful
+   * record of persisted state and the wording is past-tense.
+   */
+  private async warnIfAllowlistWriteOnPublicCg(
+    contextGraphId: string,
+    ctx: OperationContext,
+    operation: string,
+  ): Promise<void> {
+    const policy = await this.getExplicitAccessPolicy(contextGraphId);
+    if (policy !== 'public') return;
+    this.log.warn(
+      ctx,
+      `${operation}: wrote allowlist quad on context graph "${contextGraphId}" which has explicit accessPolicy="public". ` +
+        `The persisted quad does NOT enforce read access — anyone can still subscribe. ` +
+        `Issue #865: as of this commit, the publisher no longer auto-flips public CGs to the curated publish path ` +
+        `just because an allowlist exists. If you intended to make this CG invite-only, recreate it with accessPolicy=1.`,
+    );
+  }
+
+  private async isPrivateContextGraph(contextGraphId: string): Promise<boolean> {
+    if ((Object.values(SYSTEM_CONTEXT_GRAPHS) as string[]).includes(contextGraphId)) {
+      return false;
     }
 
-    // Also treat CGs with any allowlist predicate as private, even when no
-    // explicit `accessPolicy` triple exists (e.g. `inviteToContextGraph`
-    // writes `DKG_ALLOWED_PEER` straight into `_meta` without touching the
-    // ontology's access_policy; `inviteAgentToContextGraph` does the same
-    // with `DKG_ALLOWED_AGENT`). Both the V10 agent model AND the legacy
-    // peer-ID model need to be recognized here, otherwise the store-
-    // discovery path would misclassify a freshly-invited CG as "open /
-    // discoverable only" and skip the same-connect catchup.
+    const cgMetaGraph = contextGraphMetaGraphUri(contextGraphId);
+    const contextGraphUri = `did:dkg:context-graph:${contextGraphId}`;
+
+    // Issue #865 — explicit `accessPolicy` ALWAYS wins over the allowlist
+    // heuristic below. The previous behavior fell through to the ASK
+    // check whenever `policy` was anything other than `"private"`, which
+    // silently flipped a CG the curator explicitly created with
+    // `accessPolicy="public"` into "private" the moment ANY invite landed
+    // (`DKG_ALLOWED_AGENT` / `DKG_ALLOWED_PEER` write in `_meta`). The
+    // publisher then took the LU-5 / LU-11 curated path, the publish
+    // hung waiting for V2 ACKs from invitees, and the user had no
+    // recovery path short of recreating the CG.
+    //
+    // Semantics post-#865: an allowlist on a public CG is INFORMATIONAL
+    // (matches on-chain `accessPolicy=0` which the contract does not
+    // enforce). Curator can still see "who I would have invited" in the
+    // member list, but the publisher stays on the plaintext / public
+    // path so cores can verify against SWM and the on-chain tx
+    // actually submits.
+    //
+    // Codex review on #873 — policy lookup now delegated to the
+    // shared `getExplicitAccessPolicy()` helper so this routing
+    // function and the invite-path warning helper can never drift.
+    const policy = await this.getExplicitAccessPolicy(contextGraphId);
+    if (policy === 'private') return true;
+    if (policy === 'public') return false;
+    // policy === null falls through to the legacy heuristic below.
+
+    // Legacy / discovered-CG fallback: when no explicit `accessPolicy`
+    // triple exists (e.g. an old CG materialized before the predicate
+    // was added, or a peer-only CG discovered via gossip without
+    // ontology bootstrap), treat the presence of an allowlist
+    // predicate as the curated signal. Both the V10 agent model AND
+    // the legacy peer-ID model need to be recognized here so the
+    // store-discovery path doesn't misclassify a freshly-invited CG
+    // as "open / discoverable only" and skip the same-connect catchup.
     const allowlistResult = await this.store.query(
       `ASK WHERE {
         GRAPH <${cgMetaGraph}> {
@@ -17537,7 +21703,11 @@ export class DKGAgent {
   async stop(): Promise<void> {
     if (!this.started) return;
     if (this.chainPoller) {
-      this.chainPoller.stop();
+      // Await so any in-flight poll (and its HTTP keep-alive socket) settles
+      // BEFORE we tear down the chain adapter — otherwise the RPC connection
+      // closure surfaces as an `ECONNRESET` unhandled rejection from inside
+      // ethers (the same flake that has been hitting `publisher [2/4]` in CI).
+      await this.chainPoller.stop();
       this.chainPoller = null;
     }
     if (this.swmCleanupTimer) {
@@ -17556,9 +21726,21 @@ export class DKGAgent {
       clearInterval(this.beaconReannounceTimer);
       this.beaconReannounceTimer = undefined;
     }
+    if (this.agentProfileHeartbeatTimer) {
+      clearInterval(this.agentProfileHeartbeatTimer);
+      this.agentProfileHeartbeatTimer = undefined;
+    }
     if (this.syncReconcilerTimer) {
       clearInterval(this.syncReconcilerTimer);
       this.syncReconcilerTimer = null;
+    }
+    if (this.warmCoreTimer) {
+      clearInterval(this.warmCoreTimer);
+      this.warmCoreTimer = null;
+    }
+    if (this.vmReconcileTimer) {
+      clearInterval(this.vmReconcileTimer);
+      this.vmReconcileTimer = null;
     }
     if (this.messengerOutboxTimer) {
       clearInterval(this.messengerOutboxTimer);
@@ -17689,7 +21871,7 @@ export class DKGAgent {
   private createV10ACKProvider(contextGraphId: string) {
     if (!this.router || !this.gossip) return undefined;
     // `isV10Ready()` is the authoritative V10 capability gate. Using it
-    // (instead of probing for `createKnowledgeAssetsV10`) keeps
+    // (instead of probing for `createKnowledgeAssets`) keeps
     // `NoChainAdapter` — whose stub methods throw — out of the V10 path.
     if (typeof this.chain.isV10Ready !== 'function' || !this.chain.isV10Ready()) return undefined;
     // Require on-chain identity verification to prevent accepting unverified ACKs
@@ -17702,7 +21884,7 @@ export class DKGAgent {
     // `chain.getEvmChainId is not a function`. Mirrors the guard at
     // `packages/cli/src/publisher-runner.ts:createV10ACKProviderForPublisher`.
     if (typeof this.chain.getEvmChainId !== 'function') return undefined;
-    if (typeof this.chain.getKnowledgeAssetsV10Address !== 'function') return undefined;
+    if (typeof this.chain.getKnowledgeAssetsLifecycleAddress !== 'function') return undefined;
 
     const collector = new ACKCollector({
       gossipPublish: async (topic: string, data: Uint8Array) => {
@@ -17743,6 +21925,20 @@ export class DKGAgent {
             }
           }
         : undefined,
+      // Surface the structured verifier when the chain adapter implements
+      // it. Translates a thrown chain-side exception into an explicit
+      // `'rpc-error'` reason so the ACKCollector can log infra failures
+      // distinctly from definitive key/stake rejections — pre-PR this
+      // try/catch swallowed RPC errors as `false`, conflating them.
+      verifyIdentityDetailed: typeof this.chain.verifyACKIdentityDetailed === 'function'
+        ? async (recoveredAddress: string, claimedIdentityId: bigint) => {
+            try {
+              return await this.chain.verifyACKIdentityDetailed!(recoveredAddress, claimedIdentityId);
+            } catch {
+              return { valid: false, reason: 'rpc-error' as const };
+            }
+          }
+        : undefined,
       log: (msg: string) => {
         const ctx = createOperationContext('publish');
         this.log.info(ctx, msg);
@@ -17764,6 +21960,14 @@ export class DKGAgent {
       subGraphName: string | undefined,
       merkleLeafCount: number,
       isEncryptedPayload?: boolean,
+      // OT-RFC-38 LU-11 — when present, the publisher's chunked
+      // emitter has already AEAD-encrypted + SWM-gossiped per-chunk
+      // ciphertexts. The collector routes through V2 ACK with empty
+      // stagingQuads and these fields populating PublishIntent.
+      chunkedCommitment?: {
+        ciphertextChunksRoot: Uint8Array;
+        ciphertextChunkCount: number;
+      },
     ) => {
       // Fail loud on non-numeric or non-positive CG ids: V10 publish requires
       // a real on-chain context graph and the contract rejects `cgId == 0`
@@ -17798,16 +22002,39 @@ export class DKGAgent {
         );
       }
 
-      const requiredACKs = typeof chain.getMinimumRequiredSignatures === 'function'
-        ? await chain.getMinimumRequiredSignatures()
-        : undefined;
+      // PR3: chain pre-flight reads are split into individual try/catch
+      // shells so a failure can be promoted to the typed
+      // `RpcPreconditionError` with the specific adapter method that
+      // died. Without this discriminator, dzudza-style RPC rate-limits
+      // (`-32016 over rate limit` on `eth_chainId`) get logged as the
+      // same opaque "V10 ACK collection failed" string as a peer-side
+      // QuorumUnmet — operators cannot tell whether to fix their RPC
+      // config or their network topology.
+      let requiredACKs: number | undefined;
+      if (typeof chain.getMinimumRequiredSignatures === 'function') {
+        try {
+          requiredACKs = await chain.getMinimumRequiredSignatures();
+        } catch (err) {
+          throw wrapAsRpcPreconditionIfApplicable(err, 'getMinimumRequiredSignatures');
+        }
+      }
 
       // H5 prefix inputs — both come from the chain adapter so that
       // publisher-side digest construction matches what core-node handlers
       // produced on their side. These are required for any V10 path; the
       // adapter must implement them.
-      const chainIdBig = await chain.getEvmChainId();
-      const kav10Address = await chain.getKnowledgeAssetsV10Address();
+      let chainIdBig: bigint;
+      try {
+        chainIdBig = await chain.getEvmChainId();
+      } catch (err) {
+        throw wrapAsRpcPreconditionIfApplicable(err, 'getEvmChainId');
+      }
+      let kav10Address: string;
+      try {
+        kav10Address = await chain.getKnowledgeAssetsLifecycleAddress();
+      } catch (err) {
+        throw wrapAsRpcPreconditionIfApplicable(err, 'getKnowledgeAssetsLifecycleAddress');
+      }
 
       const result = await collector.collect({
         merkleRoot,
@@ -17828,6 +22055,7 @@ export class DKGAgent {
         subGraphName,
         merkleLeafCount,
         isEncryptedPayload,
+        chunkedCommitment,
       });
       return result.acks;
     };
@@ -18074,7 +22302,72 @@ export class DKGAgent {
           events: [...eventMap.values()],
         };
       },
+
+      // ── Async promote (RFC: docs/specs/SPEC_ASYNC_PROMOTE_QUEUE.md) ──
+      //
+      // These five methods are thin pass-throughs to the queue. The
+      // worker that actually drains the queue lives in the daemon (PR
+      // #3); on this surface we only enqueue, inspect, cancel, and
+      // recover. No memoryGraphChanged event is emitted at enqueue time
+      // — emission happens when the worker reports success.
+      async promoteAsync(
+        contextGraphId: string,
+        name: string,
+        opts?: { entities?: readonly string[] | 'all'; subGraphName?: string },
+      ): Promise<{ jobId: string }> {
+        const jobId = await agent.promoteQueue.enqueue({
+          contextGraphId,
+          assertionName: name,
+          subGraphName: opts?.subGraphName,
+          entities: opts?.entities ?? 'all',
+        });
+        return { jobId };
+      },
+      async getPromoteAsyncStatus(jobId: string): Promise<PromoteJob | null> {
+        return agent.promoteQueue.getStatus(jobId);
+      },
+      async listPromoteAsyncJobs(filter?: PromoteListFilter): Promise<PromoteJob[]> {
+        return agent.promoteQueue.list(filter);
+      },
+      async cancelPromoteAsync(jobId: string): Promise<void> {
+        return agent.promoteQueue.cancel(jobId);
+      },
+      async recoverPromoteAsync(jobId: string): Promise<void> {
+        return agent.promoteQueue.recover(jobId);
+      },
     };
+  }
+
+  /**
+   * Lazily-constructed async-promote queue. First access materialises
+   * the `TripleStoreAsyncPromoteQueue` against `this.store`; subsequent
+   * accesses return the same instance. The queue's control graph
+   * (`urn:dkg:promote-queue:control-plane`) lives in the same triple
+   * store as everything else, so it survives daemon restarts.
+   *
+   * Exposed publicly so PR #3's worker loop can drive the worker-side
+   * surface (`claimNext` / `heartbeat` / `succeed` / `fail` /
+   * `recordCommitMarker` / `recoverOnStartup`) without the assertion
+   * subsurface having to leak those methods to user-facing callers.
+   */
+  get promoteQueue(): AsyncPromoteQueue {
+    if (!this._promoteQueue) {
+      this._promoteQueue = new TripleStoreAsyncPromoteQueue(this.store, this._promoteQueueConfig ?? {});
+    }
+    return this._promoteQueue;
+  }
+
+  /**
+   * Override the promote-queue config (e.g. inject deterministic
+   * `now`/`idGenerator` for tests, or tune `maxRetries`/`leaseMs` from
+   * daemon config). Must be called BEFORE the first `promoteQueue`
+   * access; throws otherwise so the override doesn't silently no-op.
+   */
+  configurePromoteQueue(config: Partial<AsyncPromoteQueueConfig>): void {
+    if (this._promoteQueue) {
+      throw new Error('configurePromoteQueue must be called before the queue is first accessed');
+    }
+    this._promoteQueueConfig = config;
   }
 
 }

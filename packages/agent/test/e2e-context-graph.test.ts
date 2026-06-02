@@ -166,7 +166,18 @@ describe('E2E: context graph publish + finalization (shared chain)', () => {
     expect(statuses.some(s => s === '"confirmed"')).toBe(true);
   }, 10_000);
 
-  it('B contextGraph data graph does NOT contain context graph data', async () => {
+  it('B contextGraph data graph does NOT contain context graph data (remap/explicit-subCG flow)', async () => {
+    // This test exercises the explicit-`subContextGraphId` publish flow
+    // (line ~115 above), which is the REMAP-style path on the publisher:
+    // `dkg-publisher.ts` ~line 1393 deletes the root copy of the
+    // canonical quads on purpose, leaving them only in the per-cgId
+    // partition `<cg>/context/<ctxGraphId>`. PR #779's recipient
+    // dual-write (which fixes the v10-rc-validation §5 same-graph
+    // gossip-replication regression) is correctly gated on the
+    // wire-level `keepRootCopyOnLabel` flag and MUST NOT fire here, so
+    // B's root stays empty, mirroring A's deliberate remap behaviour.
+    // The pure same-graph dual-write parity is covered separately by
+    // `scripts/v10-rc-validation.sh` §5 against a 6-node devnet.
     const contextGraphData = await nodeB.query(
       `SELECT ?name WHERE { <${ENTITY_CTX_1}> <http://schema.org/name> ?name }`,
       CONTEXT_GRAPH,
@@ -236,4 +247,142 @@ describe('E2E: context graph publish + finalization (shared chain)', () => {
     expect(bNames.some((n: string) => n.includes('Context Graph Entity'))).toBe(true);
     expect(bNames.some((n: string) => n.includes('Second Context Entity'))).toBe(true);
   }, 60_000);
+
+  // PR #779 — codex r3 follow-up. The describe block above only
+  // exercises the explicit-`subContextGraphId` (remap) path, which is
+  // the keepRootCopyOnLabel=false branch. Codex flagged that automated
+  // CI was missing coverage of the OPPOSITE path: a same-graph publish
+  // (no subContextGraphId) where the publisher dual-writes the
+  // canonical quads + confirmed `_meta` to BOTH the root `<cg>` graph
+  // and the per-cgId `<cg>/context/<id>` partition, and recipients
+  // mirror that dual-write so label-scoped queries on replicas
+  // converge. Pin that path here.
+  //
+  // Setup nuance: the existing tests above register their CG on-chain
+  // via the bare `registerContextGraphOnChain` path which doesn't
+  // write the `_meta.registrationStatus="registered"` binding the
+  // publisher's same-graph guard checks (the remap tests skip that
+  // guard via `subContextGraphId`/`publishContextGraphId`). To take
+  // the same-graph branch we use a fresh label and the higher-level
+  // `registerContextGraph(id)` API, which binds the label, writes the
+  // registration status, and persists the on-chain id to ontology —
+  // matching the production daemon's CG registration flow.
+  describe('same-graph publish (keepRootCopyOnLabel=true) — recipient mirrors publisher root dual-write', () => {
+    const SAMEG_LABEL = 'context-graph-e2e-sameg';
+    const ENTITY_SAMEG = 'urn:ctxgraph:entity:sameg';
+    let samegOnChainId: string;
+
+    it('registers a fresh same-graph-friendly CG and primes both nodes', async () => {
+      await nodeA.createContextGraph({ id: SAMEG_LABEL, name: 'Same-Graph E2E', description: '' });
+      await nodeB.createContextGraph({ id: SAMEG_LABEL, name: 'Same-Graph E2E', description: '' });
+      const reg = await nodeA.registerContextGraph(SAMEG_LABEL, {
+        accessPolicy: 0,
+        publishPolicy: 1,
+      });
+      samegOnChainId = String(reg.onChainId);
+      expect(Number(samegOnChainId)).toBeGreaterThan(0);
+
+      // Both nodes need to know the on-chain id so B's
+      // `resolveContextGraphOnChainId` resolves locally. The same-graph
+      // dual-write fallback path (used when older publishers don't
+      // emit `keepRootCopyOnLabel`) reads this resolution; on B the
+      // newer publisher A emits the wire bit explicitly, but priming
+      // B's ontology mirrors how production replicas come up. Use the
+      // explicit `seedContextGraphOnChainId` override on B's store.
+      await (nodeB as any).store.insert([
+        {
+          subject: `did:dkg:context-graph:${SAMEG_LABEL}`,
+          predicate: 'https://dkg.network/ontology#ContextGraphOnChainId',
+          object: `"${samegOnChainId}"`,
+          graph: 'did:dkg:context-graph:ontology',
+        },
+      ]);
+
+      nodeA.subscribeToContextGraph(SAMEG_LABEL);
+      nodeB.subscribeToContextGraph(SAMEG_LABEL);
+      await sleep(1500);
+    }, 30_000);
+
+    it('A same-graph publish; B sees data in BOTH root <cg> and per-cgId partition', async () => {
+      await nodeA.share(SAMEG_LABEL, [
+        { subject: ENTITY_SAMEG, predicate: 'http://schema.org/name', object: '"Same-Graph Entity"', graph: '' },
+      ]);
+      const wsDeadline = Date.now() + 10_000;
+      while (Date.now() < wsDeadline) {
+        const ws = await nodeB.query(
+          `SELECT ?name WHERE { <${ENTITY_SAMEG}> <http://schema.org/name> ?name }`,
+          { contextGraphId: SAMEG_LABEL, graphSuffix: '_shared_memory' },
+        );
+        if (ws.bindings.length > 0) break;
+        await sleep(500);
+      }
+
+      // No `subContextGraphId` → same-graph publish: publisher
+      // dual-writes canonical quads to BOTH `<cg>` and
+      // `<cg>/context/<id>` and emits `keepRootCopyOnLabel=true` on
+      // the wire so the recipient mirrors the dual-write.
+      const result = await nodeA.publishFromSharedMemory(
+        SAMEG_LABEL,
+        { rootEntities: [ENTITY_SAMEG] },
+        { clearSharedMemoryAfter: true },
+      );
+      expect(result.status).toBe('confirmed');
+
+      const ctxDataGraph = `did:dkg:context-graph:${SAMEG_LABEL}/context/${samegOnChainId}`;
+
+      // Wait for B's gossip recipient finalization to land.
+      const deadline = Date.now() + 25_000;
+      let bPerCgIdData: any;
+      while (Date.now() < deadline) {
+        bPerCgIdData = await nodeB.query(
+          `SELECT ?name WHERE { GRAPH <${ctxDataGraph}> { <${ENTITY_SAMEG}> <http://schema.org/name> ?name } }`,
+        );
+        if (bPerCgIdData.bindings.length > 0) break;
+        await sleep(500);
+      }
+      // Per-cgId partition copy MUST be present (the legacy
+      // single-write path was always landing here even before PR #779).
+      expect(bPerCgIdData.bindings.length).toBe(1);
+      expect(bPerCgIdData.bindings[0]['name']).toBe('"Same-Graph Entity"');
+
+      // Root <cg> copy is the PR #779 fix: label-scoped query on B (no
+      // graphSuffix, no per-cgId hint) MUST resolve too. This catches
+      // regressions in any of: wire-flag emission, decoder presence
+      // semantics, or the recipient same-graph dual-write branch.
+      const bRootData = await nodeB.query(
+        `SELECT ?name WHERE { <${ENTITY_SAMEG}> <http://schema.org/name> ?name }`,
+        SAMEG_LABEL,
+      );
+      expect(
+        bRootData.bindings.length,
+        'PR #779: same-graph publish recipient MUST mirror publisher root dual-write so label-scoped queries find the data on replicas',
+      ).toBe(1);
+      expect(bRootData.bindings[0]['name']).toBe('"Same-Graph Entity"');
+
+      // Confirmed `_meta` MUST also exist on BOTH root and per-cgId
+      // meta graphs so label-only status / UAL / authoredBy lookups
+      // converge between publisher and replicas. This is the meta
+      // dual-write addition that landed alongside the data dual-write.
+      // Use SELECT-shaped queries (the agent's `query()` API returns
+      // `{ bindings: [{ result: 'true'|'false' }] }` for ASK queries
+      // to keep the response shape uniform across the deny path —
+      // see `emptyQueryResultForKind` rationale at dkg-agent.ts
+      // ~9338).
+      const rootMeta = `did:dkg:context-graph:${SAMEG_LABEL}/_meta`;
+      const perCgIdMeta = `did:dkg:context-graph:${SAMEG_LABEL}/context/${samegOnChainId}/_meta`;
+      const rootMetaSelect = await nodeB.query(
+        `SELECT ?status WHERE { GRAPH <${rootMeta}> { <${result.ual}> <http://dkg.io/ontology/status> ?status } }`,
+      );
+      const rootStatuses = rootMetaSelect.bindings.map((b: any) => String(b['status']));
+      expect(
+        rootStatuses.some((s: string) => s === '"confirmed"'),
+        'PR #779: same-graph publish recipient MUST dual-write confirmed _meta to ROOT meta graph too',
+      ).toBe(true);
+      const perCgIdMetaSelect = await nodeB.query(
+        `SELECT ?status WHERE { GRAPH <${perCgIdMeta}> { <${result.ual}> <http://dkg.io/ontology/status> ?status } }`,
+      );
+      const perCgStatuses = perCgIdMetaSelect.bindings.map((b: any) => String(b['status']));
+      expect(perCgStatuses.some((s: string) => s === '"confirmed"')).toBe(true);
+    }, 90_000);
+  });
 });

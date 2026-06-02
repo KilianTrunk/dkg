@@ -68,12 +68,36 @@ const EPCIS_TYPE_PREFIX = 'https://gs1.github.io/EPCIS/';
 /**
  * Strip N-Quads literal wrapping from a SPARQL binding value.
  * The triplestore returns string literals as '"value"' or '"value"^^<type>'.
+ *
+ * Implemented as a linear scan rather than the prior greedy regex
+ * `/^"(.*)"(?:\^\^<.*>)?$/s` — that pattern is vulnerable to catastrophic
+ * backtracking on malformed inputs (e.g. repeated typed-literal suffixes)
+ * because `(.*)` is greedy with the `s` flag and the optional trailing
+ * group forces an exponential backoff. Since the input comes from a
+ * remote triplestore, that is reachable input. The linear parser below
+ * runs in O(n) regardless of input shape.
  */
-function unwrapLiteral(value: string): string {
-  if (!value) return value;
-  // Handle typed literals: "value"^^<type>
-  const typedMatch = value.match(/^"(.*)"(?:\^\^<.*>)?$/s);
-  if (typedMatch) return typedMatch[1];
+export function unwrapLiteral(value: string): string {
+  if (!value || value.length < 2 || value.charCodeAt(0) !== 34 /* '"' */) {
+    return value;
+  }
+  // Find the closing quote, honouring backslash escapes per N-Quads.
+  let i = 1;
+  for (; i < value.length; i++) {
+    const ch = value.charCodeAt(i);
+    if (ch === 92 /* '\\' */) {
+      i++;
+      continue;
+    }
+    if (ch === 34 /* '"' */) break;
+  }
+  if (i >= value.length) return value; // no closing quote — return as-is
+  const inner = value.slice(1, i);
+  const tail = value.slice(i + 1);
+  // Tail must be empty or a typed-literal suffix `^^<...>`.
+  if (tail.length === 0) return inner;
+  if (tail.startsWith('^^<') && tail.endsWith('>')) return inner;
+  // Anything else: not a recognised literal shape — return as-is.
   return value;
 }
 
@@ -92,6 +116,9 @@ export function toEpcisEvent(binding: Record<string, string>): Record<string, un
   // Simple string fields — unwrap N-Quads literal quoting, include only when non-empty
   const eventTime = unwrapLiteral(binding['eventTime']);
   if (eventTime) event.eventTime = eventTime;
+
+  const eventTimeZoneOffset = unwrapLiteral(binding['eventTimeZoneOffset']);
+  if (eventTimeZoneOffset) event.eventTimeZoneOffset = eventTimeZoneOffset;
 
   const action = unwrapLiteral(binding['action']);
   if (action) event.action = action;
@@ -171,7 +198,26 @@ export async function handleEventsQuery(
     { ...params, subGraphName: config.subGraphName, limit: perPage + 1, offset },
     config.contextGraphId,
   );
-  const result = await config.queryEngine.query(sparql, { contextGraphId: config.contextGraphId });
+  // The engine's scope guard rejects any explicit GRAPH IRI outside the
+  // allow-set it derives from the query options, so the options MUST match
+  // exactly the graphs `buildEpcisQuery` references for this route:
+  //   - `includePrivate`        → the `<cg>[/<sub>]/_private` partition the
+  //                               private-anchored-events branch always names.
+  //   - `subGraphName`          → reads `<cg>/<sub>` (finalized) /
+  //                               `<cg>/<sub>/_shared_memory` (SWM) plus the
+  //                               sub-graph private/meta graphs.
+  //   - `graphSuffix:'_shared_memory'` (finalized=false) → reads the SWM
+  //                               partition (`…/_shared_memory[_meta]`) instead
+  //                               of the canonical data graph.
+  // Omitting any of these makes the guard reject the query with
+  // "GRAPH <…> is outside the allowed graph set" (it fails for every
+  // sub-graph or non-finalized request, on every store backend).
+  const result = await config.queryEngine.query(sparql, {
+    contextGraphId: config.contextGraphId,
+    subGraphName: config.subGraphName,
+    graphSuffix: params.finalized === false ? '_shared_memory' : undefined,
+    includePrivate: true,
+  });
 
   const hasMore = result.bindings.length > perPage;
   const bindings = hasMore ? result.bindings.slice(0, perPage) : result.bindings;

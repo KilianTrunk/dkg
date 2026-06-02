@@ -81,7 +81,7 @@ export interface TelemetrySettingsCallbacks {
 }
 
 /**
- * Handles all /api/metrics, /api/operations, /api/logs, /api/query-history,
+ * Handles all /api/metrics, /api/operations, /api/node-log, /api/query-history,
  * /api/saved-queries, and /ui routes. Returns true if the request was handled.
  */
 export async function handleNodeUIRequest(
@@ -177,6 +177,36 @@ export async function handleNodeUIRequest(
     });
   }
 
+  // --- Replication (chain-driven VM reconciliation) — Phase F ---
+
+  if (req.method === 'GET' && path === '/api/replication/summary') {
+    const periodMs = parseInt(url.searchParams.get('periodMs') ?? String(86_400_000), 10);
+    return json(res, 200, db.getReplicationSummary(periodMs));
+  }
+
+  if (req.method === 'GET' && path === '/api/replication/per-cg') {
+    const periodMs = parseInt(url.searchParams.get('periodMs') ?? String(86_400_000), 10);
+    return json(res, 200, { rows: db.getReplicationPerCg(periodMs) });
+  }
+
+  if (req.method === 'GET' && path === '/api/replication/timeline') {
+    const periodMs = parseInt(url.searchParams.get('periodMs') ?? String(86_400_000), 10);
+    const bucketMs = parseInt(url.searchParams.get('bucketMs') ?? String(3_600_000), 10);
+    const contextGraphId = url.searchParams.get('cg') ?? undefined;
+    return json(res, 200, { buckets: db.getReplicationTimeline({ periodMs, bucketMs, contextGraphId }) });
+  }
+
+  if (req.method === 'GET' && path === '/api/replication/cursors') {
+    return json(res, 200, { cursors: db.getReplicationCursors() });
+  }
+
+  if (req.method === 'GET' && path === '/api/replication/events') {
+    const cg = url.searchParams.get('cg');
+    if (!cg) return json(res, 400, { error: 'Missing cg query param' });
+    const limit = parseInt(url.searchParams.get('limit') ?? '100', 10);
+    return json(res, 200, { events: db.getReplicationEventsForCg(cg, limit) });
+  }
+
   // --- Error hotspots ---
 
   if (req.method === 'GET' && path === '/api/error-hotspots') {
@@ -258,7 +288,7 @@ export async function handleNodeUIRequest(
     return json(res, 200, spending);
   }
 
-  // --- Logs ---
+  // --- Logs (compatibility endpoint) ---
 
   if (req.method === 'GET' && path === '/api/logs') {
     const q = url.searchParams.get('q') ?? undefined;
@@ -504,7 +534,16 @@ export async function handleNodeUIRequest(
         ...(parsedLimit != null ? { limit: parsedLimit } : {}),
         order: rawOrder,
       });
-      if (!session) return json(res, 404, { error: 'Session not found' });
+      // Returning 404 for "no history yet" was a bad UX/observability
+      // contract: the OpenClaw chat panel hits this endpoint on every
+      // page load, so a fresh node showed a red 404 line in DevTools
+      // even though the panel was working correctly. Return 200 with
+      // an empty `messages: []` envelope instead — semantically
+      // accurate (the session simply has no turns yet) and matches the
+      // shape `fetchLocalAgentHistoryBySessionId` expects (BUG-001).
+      if (!session) {
+        return json(res, 200, { session: sessionId, messages: [] });
+      }
       return json(res, 200, session);
     } catch (err: any) {
       return json(res, 500, { error: err.message ?? 'Failed to fetch session' });
@@ -612,27 +651,16 @@ export async function handleNodeUIRequest(
   }
 
   // --- Notifications ---
-
-  if (req.method === 'GET' && path === '/api/notifications') {
-    const since = url.searchParams.get('since');
-    const limit = url.searchParams.get('limit');
-    const data = db.getNotifications({
-      since: since ? Number(since) : undefined,
-      limit: limit ? Number(limit) : undefined,
-    });
-    return json(res, 200, data);
-  }
-
-  if (req.method === 'POST' && path === '/api/notifications/read') {
-    const body = await readBody(req);
-    let ids: number[] | undefined;
-    try {
-      const parsed = JSON.parse(body);
-      if (Array.isArray(parsed.ids)) ids = parsed.ids.map(Number);
-    } catch { /* mark all */ }
-    const count = db.markNotificationsRead(ids);
-    return json(res, 200, { marked: count });
-  }
+  //
+  // ADR-003 (notifications-pane redesign): `GET /api/notifications` and
+  // `POST /api/notifications/read` are now served by the AGENT-AWARE daemon
+  // route (`packages/cli/src/daemon/routes/notifications.ts`), which has the
+  // caller identity + `agent.listContextGraphs`/`listPendingJoinRequests`
+  // needed to scope the feed. `handleNodeUIRequest` runs before the daemon's
+  // `handleRequest`, so the legacy flat (unscoped) routes were REMOVED here
+  // (clean cut) to let the request fall through to the scoped handler. The
+  // pure scoping/digest logic lives in `scopeNotifications` (see
+  // `./notifications-scope.js`), which the daemon route calls.
 
   // --- Static UI files ---
 
@@ -760,4 +788,3 @@ function readBody(req: IncomingMessage, maxBytes?: number): Promise<string> {
     req.on('error', reject);
   });
 }
-

@@ -4,7 +4,7 @@ DKG V9 smart contracts and deployment scripts. Forked from the V8 `dkg-evm-modul
 
 ## Features
 
-- **Solidity contracts** — Knowledge Collection registry, contextGraph management, staking, token contracts, and access control
+- **Solidity contracts** — Knowledge Asset registry, contextGraph management, staking, token contracts, and access control
 - **ABI exports** — compiled contract ABIs available at `./abi/*.json` for use by `@origintrail-official/dkg-chain`
 - **Hardhat deployment** — deploy scripts for localhost, testnet (Base Sepolia), and other EVM chains
 - **Test suite** — unit and integration tests via Hardhat's testing framework
@@ -94,7 +94,7 @@ pnpm lint:sol:fix             # solhint --fix
 
 ### Configuration files
 
-- [`slither.config.json`](./slither.config.json) — pins solc 0.8.20 and excludes vendored deps (`contracts/.deps/`), archived contracts (`contracts/archive/`), mocks, and the standalone `tokens/` ERC1155Delta variants. **Do not** add `compile_force_framework: "hardhat"` — there's a known crytic-compile bug ([crytic/crytic-compile#570](https://github.com/crytic/crytic-compile/issues/570)) that breaks framework-forcing in projects with vendored deps.
+- [`slither.config.json`](./slither.config.json) — pins solc 0.8.20 and excludes vendored deps (`contracts/.deps/`), archived contracts (`contracts/archive/`), and mocks. **Do not** add `compile_force_framework: "hardhat"` — there's a known crytic-compile bug ([crytic/crytic-compile#570](https://github.com/crytic/crytic-compile/issues/570)) that breaks framework-forcing in projects with vendored deps.
 - [`aderyn.toml`](./aderyn.toml) — same exclude paths.
 - [`.solhint.json`](./.solhint.json) — `solhint:recommended` with `compiler-version: ^0.8.20` and a few overrides matching the V8 fork's tuning (allow inline assembly, don't warn on `block.timestamp`, etc.).
 - [`.solhintignore`](./.solhintignore) — same exclude paths plus `Identity.sol` (excluded for the same viaIR-stack-depth reason it's excluded from `solidity-coverage` instrumentation in [`.solcover.js`](./.solcover.js)).

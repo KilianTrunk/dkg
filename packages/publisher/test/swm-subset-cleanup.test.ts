@@ -8,6 +8,7 @@ import { ethers } from 'ethers';
 import { createEVMAdapter, getSharedContext, createProvider, takeSnapshot, revertSnapshot, createTestContextGraph, seedContextGraphRegistration, HARDHAT_KEYS } from '../../chain/test/evm-test-context.js';
 import { mintTokens } from '../../chain/test/hardhat-harness.js';
 import { buildSeal } from './_helpers/seal.js';
+import { hardhatACKProvider } from './_helpers/acks.js';
 
 let CONTEXT_GRAPH = 'test-swm-cleanup';
 let WORKSPACE_GRAPH = `did:dkg:context-graph:${CONTEXT_GRAPH}/_shared_memory`;
@@ -75,7 +76,7 @@ describe('SWM subset publish cleanup', () => {
     WORKSPACE_GRAPH = `did:dkg:context-graph:${CONTEXT_GRAPH}/_shared_memory`;
     WORKSPACE_META_GRAPH = `did:dkg:context-graph:${CONTEXT_GRAPH}/_shared_memory_meta`;
     DATA_GRAPH = `did:dkg:context-graph:${CONTEXT_GRAPH}`;
-    _kav10Address = await chain.getKnowledgeAssetsV10Address();
+    _kav10Address = await chain.getKnowledgeAssetsLifecycleAddress();
   });
   afterAll(async () => {
     await revertSnapshot(_fileSnapshot);
@@ -118,6 +119,7 @@ describe('SWM subset publish cleanup', () => {
     }, {
       clearSharedMemoryAfter: false,
       precomputedAttestation: await sealForRoots(allQuads, [alice]),
+      v10ACKProvider: hardhatACKProvider(_kav10Address),
     });
 
     expect(result.status).toBe('confirmed');
@@ -147,20 +149,38 @@ describe('SWM subset publish cleanup', () => {
     await publisher.publishFromSharedMemory(CONTEXT_GRAPH, { rootEntities: [alice] }, {
       clearSharedMemoryAfter: false,
       precomputedAttestation: await sealForRoots(allQuads, [alice]),
+      v10ACKProvider: hardhatACKProvider(_kav10Address),
     });
 
-    // Publish remaining (Bob + Carol) — should not fail with "already exists"
-    const remainingQuads = allQuads.filter((quad) => quad.subject !== alice);
-    const result = await publisher.publishFromSharedMemory(CONTEXT_GRAPH, 'all', {
+    // Publish the remaining entities — should not fail with "already
+    // exists". Greenfield (PR #815) allows one KA per transaction, so
+    // Bob and Carol are published in separate single-KA publishes rather
+    // than a single multi-KA `'all'` call.
+    const bobResult = await publisher.publishFromSharedMemory(CONTEXT_GRAPH, { rootEntities: [bob] }, {
+      clearSharedMemoryAfter: false,
+      precomputedAttestation: await sealForRoots(allQuads, [bob]),
+      v10ACKProvider: hardhatACKProvider(_kav10Address),
+    });
+    expect(bobResult.status).toBe('confirmed');
+    const bobRoots = bobResult.kaManifest.map((ka) => ka.rootEntity);
+    expect(bobRoots).toContain(bob);
+    expect(bobRoots).not.toContain(alice);
+
+    // Carol is the last entity left in SWM; publish it and clear.
+    const carolResult = await publisher.publishFromSharedMemory(CONTEXT_GRAPH, 'all', {
       clearSharedMemoryAfter: true,
-      precomputedAttestation: await sealForAll(remainingQuads),
+      precomputedAttestation: await sealForRoots(allQuads, [carol]),
+      v10ACKProvider: hardhatACKProvider(_kav10Address),
     });
-
-    expect(result.status).toBe('confirmed');
-    const roots = result.kaManifest.map((ka) => ka.rootEntity);
-    expect(roots).toContain(bob);
-    expect(roots).toContain(carol);
-    expect(roots).not.toContain(alice);
+    expect(carolResult.status).toBe('confirmed');
+    const carolRoots = carolResult.kaManifest.map((ka) => ka.rootEntity);
+    // The final `'all'` publish must cover exactly Carol: Alice was published
+    // first, and Bob's confirmed publish above must have removed him from SWM.
+    // Asserting only `toContain(carol)` would still pass if cleanup regressed
+    // and Bob were republished here alongside Carol — pin the exact set.
+    expect(carolRoots).toEqual([carol]);
+    expect(carolRoots).not.toContain(alice);
+    expect(carolRoots).not.toContain(bob);
 
     // SWM should be empty
     expect(await countInGraph(store, WORKSPACE_GRAPH)).toBe(0);
@@ -180,6 +200,7 @@ describe('SWM subset publish cleanup', () => {
     await publisher.publishFromSharedMemory(CONTEXT_GRAPH, { rootEntities: [alice] }, {
       clearSharedMemoryAfter: true,
       precomputedAttestation: await sealForRoots(allQuads, [alice]),
+      v10ACKProvider: hardhatACKProvider(_kav10Address),
     });
 
     expect(await countInGraph(store, WORKSPACE_GRAPH)).toBe(0);
@@ -194,6 +215,7 @@ describe('SWM subset publish cleanup', () => {
 
     await publisher.publishFromSharedMemory(CONTEXT_GRAPH, 'all', {
       precomputedAttestation: await sealForAll(allQuads),
+      v10ACKProvider: hardhatACKProvider(_kav10Address),
     });
 
     const subjects = await subjectsInGraph(store, DATA_GRAPH);
@@ -214,6 +236,7 @@ describe('SWM subset publish cleanup', () => {
     await publisher.publishFromSharedMemory(CONTEXT_GRAPH, { rootEntities: [alice] }, {
       clearSharedMemoryAfter: false,
       precomputedAttestation: await sealForRoots(allQuads, [alice]),
+      v10ACKProvider: hardhatACKProvider(_kav10Address),
     });
 
     // Alice ownership metadata should be removed

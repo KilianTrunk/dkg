@@ -129,6 +129,58 @@ export interface DKGNodeConfig {
    * `peerStore.nodeVersion`.
    */
   nodeVersion?: string;
+  /**
+   * libp2p peerStore: max age in ms before a stored multiaddr is
+   * considered expired and must be re-fetched via peer routing. Forwarded
+   * as `peerStore.maxAddressAge` into `createLibp2p`.
+   *
+   * Default: undefined → libp2p default (3_600_000 = 1h). On small
+   * networks where DHT lookups are flaky, operators may want to bump
+   * this (e.g. 24h) so direct addresses survive longer and the dial
+   * path doesn't fall back to circuit/DHT walks unnecessarily. Paired
+   * with `peerStoreMaxPeerAgeMs` — bumping only one is partial.
+   *
+   * Invalid values (0, negative, NaN, fractional, non-numeric) fall
+   * back to the upstream default with no warning (silently ignored).
+   */
+  peerStoreMaxAddressAgeMs?: number;
+  /**
+   * libp2p peerStore: max age in ms before a peer entry with no
+   * multiaddrs is evicted entirely. Forwarded as `peerStore.maxPeerAge`
+   * into `createLibp2p`.
+   *
+   * Default: undefined → libp2p default (21_600_000 = 6h). Paired
+   * with `peerStoreMaxAddressAgeMs` — without bumping this, peer
+   * entries themselves get evicted at 6h even if addresses live
+   * longer.
+   *
+   * Invalid values (0, negative, NaN, fractional, non-numeric) fall
+   * back to the upstream default with no warning.
+   */
+  peerStoreMaxPeerAgeMs?: number;
+  /**
+   * libp2p kad-DHT: how often the node queries its own PeerId to keep
+   * its KAD-routing-table view warm. Forwarded as
+   * `kadDHT.querySelfInterval` into the DHT service.
+   *
+   * Default: undefined → libp2p kad-DHT default. On small networks
+   * this also functions as the practical republish cadence: a faster
+   * interval keeps the local k-buckets fresh so other nodes' DHT
+   * lookups for us succeed even when we haven't been directly dialled
+   * in a while.
+   *
+   * Invalid values (0, negative, NaN, fractional, non-numeric) fall
+   * back to the upstream default with no warning.
+   */
+  dhtQuerySelfIntervalMs?: number;
+  // NOTE: `peerResolveTimeoutMs` was considered but intentionally NOT
+  // exposed. Production callers (`connectToPeerId`, chat / routed
+  // sends) always pass an explicit `perStepTimeoutMs` derived from
+  // their own deadline budget, so a constructor default on the
+  // `PeerResolver` would be a silent no-op for those paths. To
+  // influence dial latency on small / sparse networks, bump the
+  // caller-side timeout instead. Codex review of PR #698 rounds 1+2
+  // caught this leak.
 }
 
 export type ConnectionTransport = 'direct' | 'relayed';

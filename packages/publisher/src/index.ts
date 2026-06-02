@@ -24,10 +24,12 @@ export {
   computeKCRootV10,
 } from './merkle.js';
 export { validatePublishRequest, type ValidationResult, type ValidationOptions } from './validation.js';
-export { generateKCMetadata, generateTentativeMetadata, generateConfirmedFullMetadata, getTentativeStatusQuad, getConfirmedStatusQuad, generateOwnershipQuads, generateAuthorshipProof, generateShareTransitionMetadata, generateShareMetadata, generateWorkspaceMetadata, generateSubGraphRegistration, subGraphDeregistrationSparql, subGraphDiscoverySparql, subGraphWritersSparql, toHex, resolveUalByBatchId, updateMetaMerkleRoot, generateAssertionCreatedMetadata, generateAssertionPromotedMetadata, generateAssertionPublishedMetadata, generateAssertionDiscardedMetadata, assertionStateQuad, assertionLayerQuad, type KCMetadata, type KAMetadata, type OnChainProvenance, type AuthorshipProof, type ShareTransitionMetadata, type ShareMetadata, type WorkspaceMetadata, type SubGraphRegistration, type AssertionCreatedMeta, type AssertionPromotedMeta, type AssertionPublishedMeta, type AssertionDiscardedMeta } from './metadata.js';
+export { generateKCMetadata, generateTentativeMetadata, generateConfirmedFullMetadata, getTentativeStatusQuad, getConfirmedStatusQuad, generateOwnershipQuads, generateAuthorshipProof, generateShareTransitionMetadata, generateShareMetadata, generateWorkspaceMetadata, generateSubGraphRegistration, subGraphDeregistrationSparql, subGraphDiscoverySparql, subGraphWritersSparql, toHex, resolveUalByBatchId, updateMetaMerkleRoot, promoteUpdatedKaToPerCgId, restateKaPartition, restateLabelGraphForUpdate, readMaterializedVersion, shouldApplyMaterialization, writeMaterializedVersion, withMaterializationLock, compareMaterializedVersion, type MaterializedVersion, generateAssertionCreatedMetadata, generateAssertionPromotedMetadata, generateAssertionPublishedMetadata, generateAssertionDiscardedMetadata, assertionStateQuad, assertionLayerQuad, type KCMetadata, type KAMetadata, type OnChainProvenance, type AuthorshipProof, type ShareTransitionMetadata, type ShareMetadata, type WorkspaceMetadata, type SubGraphRegistration, type AssertionCreatedMeta, type AssertionPromotedMeta, type AssertionPublishedMeta, type AssertionDiscardedMeta } from './metadata.js';
 export {
   DKGPublisher,
   StaleWriteError,
+  AssertionNotPersistedError,
+  MultiRootPublishNotAtomicError,
   type DKGPublisherConfig,
   type WorkspaceSenderKeyEncryptInput,
   type WorkspaceSenderKeyEncryptor,
@@ -49,6 +51,17 @@ export {
   type CollectedACK,
   type ACKCollectionResult,
 } from './ack-collector.js';
+export {
+  ACKProviderError,
+  RpcPreconditionError,
+  QuorumUnmetError,
+  isACKProviderError,
+  isRpcPreconditionError,
+  isQuorumUnmetError,
+  wrapAsRpcPreconditionIfApplicable,
+  type PeerOutcome,
+  type UnwrapRpcOptions,
+} from './ack-errors.js';
 export { StorageACKHandler, type StorageACKHandlerConfig } from './storage-ack-handler.js';
 export {
   VerifyCollector,
@@ -147,6 +160,7 @@ export {
 } from './async-lift-publisher.js';
 export {
   TripleStoreAsyncPromoteQueue,
+  ASYNC_PROMOTE_QUEUE_FORMAT_VERSION,
   PROMOTE_COMMIT_MARKER_STEPS,
   PROMOTE_JOB_STATES,
   PromoteJobConflictError,

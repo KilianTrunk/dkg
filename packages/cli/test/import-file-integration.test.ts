@@ -43,7 +43,7 @@ import {
   contextGraphMetaUri,
   assertionLifecycleUri,
 } from '@origintrail-official/dkg-core';
-import { findReservedSubjectPrefix, isSkolemizedUri } from '@origintrail-official/dkg-publisher';
+import { autoPartition, findReservedSubjectPrefix, isSkolemizedUri } from '@origintrail-official/dkg-publisher';
 import { FileStore } from '../src/file-store.js';
 import type { ExtractionStatusRecord } from '../src/extraction-status.js';
 import { parseBoundary, parseMultipart } from '../src/http/multipart.js';
@@ -1295,6 +1295,27 @@ describe('import-file orchestration — happy paths', () => {
     expect(writtenTriples.some(t =>
       t.predicate === 'http://dkg.io/ontology/hasSection',
     )).toBe(true);
+    const sectionSubjectsBeforePartition = writtenTriples
+      .filter(t =>
+        t.subject.startsWith('_:dkg-md-section-') ||
+        (t.predicate === 'http://dkg.io/ontology/hasSection' && t.object.startsWith('_:dkg-md-section-')),
+      )
+      .flatMap(t => [t.subject, t.object])
+      .filter(term => term.startsWith('_:dkg-md-section-'));
+    expect(sectionSubjectsBeforePartition.length).toBeGreaterThan(0);
+    expect(sectionSubjectsBeforePartition.every(term => !term.includes('#section-'))).toBe(true);
+
+    const promotionEligible = writtenTriples
+      .filter(t => !findReservedSubjectPrefix(t.subject))
+      .map(t => ({ ...t, graph: 'did:dkg:context-graph:research-cg' }));
+    const partitioned = autoPartition(promotionEligible);
+    const selectedRootQuads = partitioned.get(result.assertionUri) ?? [];
+    expect(selectedRootQuads).toHaveLength(promotionEligible.length);
+    expect(selectedRootQuads.some(t =>
+      t.subject.startsWith(`${result.assertionUri}/.well-known/genid/dkg-md-section-`) &&
+      t.predicate === 'http://schema.org/name',
+    )).toBe(true);
+    expect([...partitioned.keys()]).toEqual([result.assertionUri]);
 
     // Status map populated
     expect(status.size).toBe(1);

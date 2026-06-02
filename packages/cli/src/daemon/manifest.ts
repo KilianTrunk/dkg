@@ -624,6 +624,138 @@ export function getCurrentCommitShort(): string {
   }
 }
 
+/**
+ * RFC-41 §4.9: bundled commit metadata in published npm artifacts.
+ *
+ * CI writes `build-info.json` into the package root before
+ * `npm publish`. It carries the full commit SHA, build timestamp,
+ * dist-tag, and the CI run identifier — exposed via `/api/status`
+ * so pre-release dist-tag testing is auditable (operators see
+ * exactly which commit they are running, not just a semver tag
+ * that may have had multiple sequential builds).
+ *
+ * Monorepo / dev fallback: when `build-info.json` is absent (which
+ * is the steady state for contributors running from `pnpm dkg start`),
+ * we return a sentinel telling the doctor / agent we're in a dev
+ * build. The fallback values are stable strings so consumers can
+ * branch reliably.
+ *
+ * Cached after first read because the file is immutable for the
+ * lifetime of a daemon process.
+ */
+export interface BuildInfo {
+  /** Full commit SHA, or "uncommitted" for monorepo / dev fallback. */
+  commit: string;
+  /** First 8 chars of commit, or "00000000" for the dev fallback. */
+  commitShort: string;
+  /** ISO 8601 timestamp of the npm publish build, or null in dev fallback. */
+  buildTime: string | null;
+  /** npm dist-tag the artifact was published under (e.g. "latest", "next"), or "monorepo" for dev. */
+  distTag: string;
+  /** CI workflow run identifier (e.g. GitHub Actions run id), or null in dev fallback. */
+  ciRun: string | null;
+}
+
+let cachedBuildInfo: BuildInfo | null = null;
+
+export function loadBuildInfo(): BuildInfo {
+  if (cachedBuildInfo) return cachedBuildInfo;
+  try {
+    const raw = readFileSync(
+      new URL("../../build-info.json", import.meta.url),
+      "utf-8",
+    );
+    const parsed = JSON.parse(raw) as Partial<BuildInfo>;
+    const commit = typeof parsed.commit === "string" && parsed.commit
+      ? parsed.commit
+      : "uncommitted";
+    cachedBuildInfo = {
+      commit,
+      commitShort:
+        typeof parsed.commitShort === "string" && parsed.commitShort
+          ? parsed.commitShort
+          : commit.slice(0, 8) || "00000000",
+      buildTime:
+        typeof parsed.buildTime === "string" && parsed.buildTime
+          ? parsed.buildTime
+          : null,
+      distTag:
+        typeof parsed.distTag === "string" && parsed.distTag
+          ? parsed.distTag
+          : "unknown",
+      ciRun:
+        typeof parsed.ciRun === "string" && parsed.ciRun ? parsed.ciRun : null,
+    };
+    return cachedBuildInfo;
+  } catch {
+    // No build-info.json — this is a monorepo / dev / `pnpm dkg
+    // start` invocation. Use stable sentinels so /api/status
+    // consumers can branch reliably.
+    cachedBuildInfo = {
+      commit: "uncommitted",
+      commitShort: "00000000",
+      buildTime: null,
+      distTag: "monorepo",
+      ciRun: null,
+    };
+    return cachedBuildInfo;
+  }
+}
+
+/**
+ * RFC-41 §4.3 / §4.7.0: detect the running daemon's install mode.
+ *
+ * The detection is local-only — there is no authoritative network
+ * source for this. We classify based on where `import.meta.url`
+ * resolves on disk:
+ *
+ *   - inside a monorepo packages/cli/dist/ → `monorepo`
+ *   - inside `/usr/local/lib/node_modules/`, `/opt/homebrew/lib/`,
+ *     `~/.nvm/`, `~/.volta/`, `~/.fnm/` → `npm-global`
+ *   - inside any other `node_modules/` → `npm-local`
+ *   - otherwise → `unknown`
+ *
+ * Cached on first read.
+ */
+export type InstallMode = "npm-global" | "npm-local" | "monorepo" | "unknown";
+
+let cachedInstallMode: InstallMode | null = null;
+
+export function detectInstallMode(): InstallMode {
+  if (cachedInstallMode) return cachedInstallMode;
+  try {
+    const cliPath = fileURLToPath(import.meta.url).replace(/\\/g, "/");
+    if (cliPath.includes("/packages/cli/dist/") || cliPath.includes("/packages/cli/src/")) {
+      cachedInstallMode = "monorepo";
+      return cachedInstallMode;
+    }
+    const globalMarkers = [
+      "/usr/local/lib/node_modules/",
+      "/opt/homebrew/lib/node_modules/",
+      "/usr/lib/node_modules/",
+      "/.nvm/",
+      "/.volta/",
+      "/.fnm/",
+      "/.asdf/installs/nodejs/",
+    ];
+    for (const marker of globalMarkers) {
+      if (cliPath.includes(marker)) {
+        cachedInstallMode = "npm-global";
+        return cachedInstallMode;
+      }
+    }
+    if (cliPath.includes("/node_modules/")) {
+      cachedInstallMode = "npm-local";
+      return cachedInstallMode;
+    }
+    cachedInstallMode = "unknown";
+    return cachedInstallMode;
+  } catch {
+    cachedInstallMode = "unknown";
+    return cachedInstallMode;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // SKILL.MD serving — Agent Skills standard (https://agentskills.io)
 // ---------------------------------------------------------------------------
@@ -636,6 +768,22 @@ export function loadSkillTemplate(): string {
   const skillPath = new URL("../../skills/dkg-node/SKILL.md", import.meta.url);
   const content = readFileSync(skillPath, "utf-8");
   cachedSkillMd = content;
+  return content;
+}
+
+// Second canonical agent-readable manual: the bulk-import skill that the
+// dkg-node skill cross-references for chunked writes, manifest resume,
+// HTTP 413 recovery, and (with PR #4 of the async-promote-queue series)
+// the async promote queue. Served at `/.well-known/skill-importer.md`
+// alongside `/.well-known/skill.md` so the cross-link in dkg-node/SKILL.md
+// is reachable for agents installed via setup flows (Codex PR #642 follow-up).
+let cachedImporterSkillMd: string | null = null;
+
+export function loadImporterSkillTemplate(): string {
+  if (cachedImporterSkillMd) return cachedImporterSkillMd;
+  const skillPath = new URL("../../skills/dkg-importer/SKILL.md", import.meta.url);
+  const content = readFileSync(skillPath, "utf-8");
+  cachedImporterSkillMd = content;
   return content;
 }
 
@@ -654,7 +802,7 @@ export function buildSkillMd(opts: {
     `- **Node role:** ${opts.nodeRole}`,
     `- **Available extraction pipelines:** ${opts.extractionPipelines.length > 0 ? opts.extractionPipelines.join(", ") : "none (install markitdown to enable document conversion)"}`,
     '',
-    'To see which context graphs (projects) are currently subscribed, call `GET /api/context-graph/list` — this returns a live list that stays current as projects are created or subscribed during the session.',
+    'If the Node UI injects a target context graph for the turn, use that target directly. If no target is injected or configured, call `GET /api/context-graph/list` / `dkg_list_context_graphs`; agent tool surfaces default that list to the caller\'s created/joined context graphs, with `scope: "all"` for every graph the node knows about.',
   ].join("\n");
 
   const staticPlaceholder =
@@ -665,7 +813,7 @@ export function buildSkillMd(opts: {
     "- **Node role:** (dynamic — `core` or `edge`)\n" +
     "- **Available extraction pipelines:** (dynamic)\n" +
     "\n" +
-    "To see which context graphs (projects) are currently subscribed, call `GET /api/context-graph/list` — this returns a live list that stays current as projects are created or subscribed during the session.";
+    "If the Node UI injects a target context graph for the turn, use that target directly. If no target is injected or configured, call `GET /api/context-graph/list` / `dkg_list_context_graphs`; agent tool surfaces default that list to the caller's created/joined context graphs, with `scope: \"all\"` for every graph the node knows about.";
 
   return template.replace(staticPlaceholder, dynamicSection);
 }

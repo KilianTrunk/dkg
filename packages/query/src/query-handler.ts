@@ -87,6 +87,7 @@ export class QueryHandler {
     try {
       const limit = Math.min(request.limit ?? DEFAULT_LIMIT, MAX_LIMIT);
       const timeout = Math.min(request.timeout ?? DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
+      const contextGraphPolicy = this.contextGraphPolicy(contextGraphId);
 
       let response: QueryResponse;
 
@@ -101,7 +102,13 @@ export class QueryHandler {
           response = await this.lookupEntityTriples(opId, contextGraphId!, request.entityUri!);
           break;
         case 'SPARQL_QUERY':
-          response = await this.executeSparql(opId, contextGraphId!, request.sparql!, limit, timeout);
+          response = await this.executeSparql(
+            opId,
+            contextGraphId!,
+            request.sparql!,
+            capByPolicy(limit, contextGraphPolicy?.sparqlMaxResults),
+            capByPolicy(timeout, contextGraphPolicy?.sparqlTimeout),
+          );
           break;
         default:
           response = errorResponse(opId, 'UNSUPPORTED_LOOKUP', `Unknown lookup type: ${request.lookupType}`);
@@ -168,6 +175,11 @@ export class QueryHandler {
     const cgConfigs = this.config.contextGraphs ?? this.config.contextGraphs;
     if (!cgConfigs) return false;
     return Object.values(cgConfigs).some(p => p.policy === 'public');
+  }
+
+  private contextGraphPolicy(contextGraphId: string | undefined): ContextGraphQueryPolicy | undefined {
+    if (!contextGraphId) return undefined;
+    return this.config.contextGraphs?.[contextGraphId];
   }
 
   private checkRateLimit(peerId: string): QueryResponse | null {
@@ -285,11 +297,11 @@ export class QueryHandler {
       return errorResponse(opId, 'ERROR', 'SERVICE clauses are not allowed in remote queries');
     }
 
-    if (/\bGRAPH\s+/i.test(stripped)) {
+    if (/\bGRAPH(?:\s+|(?=[?$<]))/i.test(stripped)) {
       return errorResponse(opId, 'ERROR', 'Explicit GRAPH clauses are not allowed in remote queries — queries are automatically scoped to the target context graph');
     }
 
-    if (/\bFROM\s+/i.test(stripped)) {
+    if (/\bFROM(?:\s+|(?=<))/i.test(stripped)) {
       return errorResponse(opId, 'ERROR', 'FROM/FROM NAMED clauses are not allowed in remote queries — queries are automatically scoped to the target context graph');
     }
 
@@ -298,7 +310,21 @@ export class QueryHandler {
       return errorResponse(opId, 'ERROR', `SPARQL rejected: ${guard.reason}`);
     }
 
-    // Execute with timeout
+    // Execute with timeout.
+    //
+    // KNOWN LIMITATION (tracked follow-up to #764): this `Promise.race`
+    // bounds the *response* latency but does not cancel the underlying
+    // SPARQL execution — the engine has no cancellation hook, so an
+    // expensive remote query keeps consuming CPU/memory in the background
+    // until it completes naturally. Likewise `limit` below is applied as a
+    // post-materialization `.slice()`, so a high-cardinality query is fully
+    // materialized before being truncated. Genuinely enforcing either bound
+    // requires threading an `AbortSignal` + result cap through
+    // `QueryEngine.query()` → storage → the oxigraph worker. Injecting a
+    // `LIMIT` into the user query here is NOT a safe shortcut: for scoped
+    // queries it would push the statement into the multi-graph
+    // solution-set-modifier rejection path (see #789), so it is
+    // deliberately left to the engine-level follow-up.
     let timer: ReturnType<typeof setTimeout> | undefined;
     const result = await Promise.race([
       this.queryEngine.query(sparql, { contextGraphId }),
@@ -347,6 +373,13 @@ function errorResponse(opId: string, status: QueryStatus, error: string): QueryR
     resultCount: 0,
     error,
   };
+}
+
+function capByPolicy(value: number, policyCap: number | undefined): number {
+  if (policyCap === undefined || !Number.isFinite(policyCap) || policyCap <= 0) {
+    return value;
+  }
+  return Math.min(value, Math.floor(policyCap));
 }
 
 function formatObject(value: string): string {

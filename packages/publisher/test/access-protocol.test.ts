@@ -43,7 +43,7 @@ describe('Access Protocol', () => {
     const cgId = await createTestContextGraph();
     CONTEXT_GRAPH = String(cgId);
     GRAPH = `did:dkg:context-graph:${CONTEXT_GRAPH}`;
-    _kav10Address = await chain.getKnowledgeAssetsV10Address();
+    _kav10Address = await chain.getKnowledgeAssetsLifecycleAddress();
   });
   afterAll(async () => {
     await revertSnapshot(_fileSnapshot);
@@ -126,7 +126,13 @@ describe('Access Protocol', () => {
     const storeA = new OxigraphStore();
     const { result, bus } = await publishWithPrivate(storeA, { publisherPeerId: nodeA.peerId });
 
-    expect(result.status).toBe('confirmed');
+    // RC11 / PR1: private-data publishes intentionally skip peer ACK
+    // collection (`dkg-publisher.ts:1937`) and the self-signed ACK
+    // fallback is deleted, so they correctly downgrade to `tentative`.
+    // The owner / non-owner access-control behaviour this test
+    // validates is local to nodeA's store + AccessHandler and is
+    // independent of on-chain confirmation.
+    expect(result.status).toBe('tentative');
     expect(result.kaManifest[0].privateTripleCount).toBe(2);
 
     const accessHandler = new AccessHandler(storeA, bus);
@@ -152,7 +158,11 @@ describe('Access Protocol', () => {
     const storeA = new OxigraphStore();
     const { result, bus } = await publishWithPrivate(storeA, { publisherPeerId: nodeB.peerId });
 
-    expect(result.status).toBe('confirmed');
+    // RC11 / PR1: see sibling test above — tentative is the honest
+    // outcome for a private-data publish now that the self-signed ACK
+    // fallback is gone. The meta-graph + access-grant assertions below
+    // do not depend on on-chain confirmation.
+    expect(result.status).toBe('tentative');
     expect(result.kaManifest[0].privateTripleCount).toBe(2);
     expect(result.kaManifest[0].privateMerkleRoot).toBeDefined();
     expect(result.kaManifest[0].privateMerkleRoot).toHaveLength(32);
@@ -300,8 +310,16 @@ describe('Access Protocol', () => {
     await storeA.delete([
       { subject: kcUal, predicate: 'http://dkg.io/ontology/accessPolicy', object: '"ownerOnly"', graph: metaGraph },
       { subject: kcUal, predicate: 'http://dkg.io/ontology/publisherPeerId', object: `"${nodeA.peerId}"`, graph: metaGraph },
-      { subject: kcUal, predicate: 'http://www.w3.org/ns/prov#wasAttributedTo', object: `"${nodeA.peerId}"`, graph: metaGraph },
     ]);
+    // GH #748: `wasAttributedTo` may be either a peer-ID literal (legacy)
+    // or a `did:dkg:agent:0x…` URI (post-fix when authorAddress is known).
+    // Drop the quad by pattern to cover both shapes for this "owner identity
+    // missing" simulation.
+    await storeA.deleteByPattern({
+      graph: metaGraph,
+      subject: kcUal,
+      predicate: 'http://www.w3.org/ns/prov#wasAttributedTo',
+    });
 
     const accessHandler = new AccessHandler(storeA, bus);
     const routerA = new ProtocolRouter(nodeA);
@@ -339,8 +357,15 @@ describe('Access Protocol', () => {
     const metaGraph = `did:dkg:context-graph:${CONTEXT_GRAPH}/_meta`;
     await storeA.delete([
       { subject: kcUal, predicate: 'http://dkg.io/ontology/publisherPeerId', object: `"${nodeA.peerId}"`, graph: metaGraph },
-      { subject: kcUal, predicate: 'http://www.w3.org/ns/prov#wasAttributedTo', object: `"${nodeA.peerId}"`, graph: metaGraph },
     ]);
+    // GH #748: `wasAttributedTo` may be either a peer-ID literal or an
+    // agent DID URI; drop by pattern to simulate the "owner identity missing"
+    // case regardless of which shape is stored.
+    await storeA.deleteByPattern({
+      graph: metaGraph,
+      subject: kcUal,
+      predicate: 'http://www.w3.org/ns/prov#wasAttributedTo',
+    });
 
     const kaUal = `${result.ual}/1`;
     const accessResult = await accessClient.requestAccess(nodeA.peerId, kaUal);

@@ -29,7 +29,8 @@ export class BlazegraphStore implements TripleStore {
 
   async insert(quads: DKGQuad[]): Promise<void> {
     if (quads.length === 0) return;
-    const nquads = quads.map(quadToNQuad).join('\n') + '\n';
+    const safe = rejectOversizedLiterals(quads, BLAZEGRAPH_MUTF8_LIMIT);
+    const nquads = safe.map(quadToNQuad).join('\n') + '\n';
     const res = await fetch(this.url, {
       method: 'POST',
       headers: { 'Content-Type': 'text/x-nquads' },
@@ -93,13 +94,20 @@ export class BlazegraphStore implements TripleStore {
       return this.queryConstruct(trimmed);
     }
 
+    // Direct POST (W3C SPARQL 1.1 Protocol): send the query as the raw
+    // request body with `application/sparql-query` rather than URL-encoded
+    // form data. Form-encoded bodies (`query=...`) are parsed by Jetty's
+    // form handler, which caps at `maxFormContentSize` (~200 KB by default
+    // on stock Blazegraph) and rejects larger payloads with HTTP 400
+    // "Unable to parse form content". The direct-POST body is not form
+    // parsed, so large queries (e.g. CONSTRUCT/VALUES) are not capped.
     const res = await fetch(this.url, {
       method: 'POST',
       headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
+        'Content-Type': 'application/sparql-query',
         Accept: 'application/sparql-results+json',
       },
-      body: `query=${encodeURIComponent(trimmed)}`,
+      body: trimmed,
     });
     if (!res.ok) {
       const text = await res.text().catch(() => '');
@@ -129,10 +137,10 @@ export class BlazegraphStore implements TripleStore {
     const res = await fetch(this.url, {
       method: 'POST',
       headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
+        'Content-Type': 'application/sparql-query',
         Accept: 'text/x-nquads, application/n-quads',
       },
-      body: `query=${encodeURIComponent(sparql)}`,
+      body: sparql,
     });
     if (!res.ok) {
       const text = await res.text().catch(() => '');
@@ -200,10 +208,17 @@ export class BlazegraphStore implements TripleStore {
   // -------------------------------------------------------------------
 
   private async sparqlUpdate(update: string): Promise<void> {
+    // Direct POST (W3C SPARQL 1.1 Protocol): send the update as the raw
+    // request body with `application/sparql-update` rather than URL-encoded
+    // form data (`update=...`). Form-encoded bodies hit Jetty's
+    // `maxFormContentSize` cap (~200 KB on stock Blazegraph) and fail with
+    // HTTP 400 "Unable to parse form content" — which broke large publishes
+    // (a publish issues a DELETE DATA / INSERT over the full quad set). The
+    // raw body is not form parsed, so large updates succeed.
     const res = await fetch(this.url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: `update=${encodeURIComponent(update)}`,
+      headers: { 'Content-Type': 'application/sparql-update' },
+      body: update,
     });
     if (!res.ok) {
       const text = await res.text().catch(() => '');
@@ -301,6 +316,81 @@ function escapeUri(uri: string): string {
 
 function escapeString(s: string): string {
   return s.replace(/[\\"]/g, '\\$&');
+}
+
+// =====================================================================
+// Oversized-literal guard
+// =====================================================================
+
+/**
+ * Java Modified UTF-8 byte length of a string.
+ *
+ * Blazegraph uses `DataOutputStream.writeUTF()` for index keys, which
+ * encodes strings in Java's Modified UTF-8 (MUTF-8).  The key
+ * differences from standard UTF-8:
+ *   - U+0000 (NUL) is encoded as 2 bytes (0xC0, 0x80) instead of 1
+ *   - Supplementary codepoints (U+10000–U+10FFFF) are encoded as a
+ *     UTF-16 surrogate pair, each surrogate taking 3 MUTF-8 bytes =
+ *     6 bytes total (vs 4 in standard UTF-8)
+ *
+ * `writeUTF()` hard-caps the encoded length at 65 535 bytes.
+ * Exceeding this triggers `java.io.UTFDataFormatException` and causes
+ * the entire batch to fail with HTTP 500.
+ */
+const BLAZEGRAPH_MUTF8_LIMIT = 65_535;
+
+function javaModifiedUtf8Length(str: string): number {
+  let len = 0;
+  for (let i = 0; i < str.length; i++) {
+    const code = str.charCodeAt(i);
+    if (code === 0) {
+      len += 2;
+    } else if (code <= 0x7f) {
+      len += 1;
+    } else if (code <= 0x7ff) {
+      len += 2;
+    } else if (code >= 0xd800 && code <= 0xdbff) {
+      // High surrogate — the low surrogate at i+1 will add another 3
+      len += 3;
+    } else {
+      len += 3;
+    }
+  }
+  return len;
+}
+
+/**
+ * Check quads for literal objects that would exceed Blazegraph's
+ * MUTF-8 index key limit.  Throws with details about the offending
+ * quads so callers know the batch was NOT fully persisted.
+ */
+function rejectOversizedLiterals(quads: DKGQuad[], maxBytes: number): DKGQuad[] {
+  const rejected: Array<{ subject: string; predicate: string; mutf8Len: number }> = [];
+  const out: DKGQuad[] = [];
+  for (const q of quads) {
+    if (q.object.startsWith('"')) {
+      const mutf8Len = javaModifiedUtf8Length(q.object);
+      if (mutf8Len > maxBytes) {
+        rejected.push({
+          subject: q.subject.slice(0, 120),
+          predicate: q.predicate.slice(0, 120),
+          mutf8Len,
+        });
+        continue;
+      }
+    }
+    out.push(q);
+  }
+  if (rejected.length > 0) {
+    const details = rejected
+      .map((r) => `  subject=${r.subject} predicate=${r.predicate} (${r.mutf8Len} MUTF-8 bytes)`)
+      .join('\n');
+    throw new Error(
+      `[BlazegraphStore] ${rejected.length} quad(s) exceed Blazegraph's ${maxBytes}-byte MUTF-8 limit ` +
+      `and would cause UTFDataFormatException. Rejected quads:\n${details}`,
+    );
+  }
+  return out;
 }
 
 // =====================================================================

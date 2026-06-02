@@ -1,9 +1,10 @@
 import React, { useState, useMemo, useCallback, lazy, Suspense } from 'react';
 import { useFetch } from '../hooks.js';
-import { executeQuery, listAssertions, promoteAssertion, publishSharedMemory, listSwmEntities, type AssertionInfo, type PublishResult, type SwmRootEntity } from '../api.js';
+import { executeQuery, listAssertions, promoteAssertion, publishSharedMemory, listSwmEntities, describePromoteResult, describePromoteError, type AssertionInfo, type PublishResult, type SwmRootEntity } from '../api.js';
 import { FilePreviewModal } from '../components/Modals/FilePreviewModal.js';
 import { useMemoryGraphEvents } from '../hooks/useNodeEvents.js';
 import { memoryGraphLabels } from '../lib/memoryLabels.js';
+import { truncateMiddle } from '../lib/truncate.js';
 
 const RdfGraph = lazy(() =>
   import('@origintrail-official/dkg-graph-viz/react').then(m => ({ default: m.RdfGraph }))
@@ -391,22 +392,57 @@ function AssertionList({ contextGraphId, onPromoted }: { contextGraphId: string;
     0
   );
   useMemoryGraphEvents(contextGraphId, refresh, { layers: ['wm'] });
+  // PR #710 Fix D — busy state keyed on `graphUri` (unique per row,
+  // produced by the daemon). `name` is no longer unique once
+  // sub-graph + root partitions share names, so a name-keyed busy
+  // would highlight two rows on a single click. `'__all__'`
+  // sentinel stays — not collidable with any graphUri.
   const [promoting, setPromoting] = useState<string | null>(null);
-  const [promoteResult, setPromoteResult] = useState<{ name: string; count: number } | null>(null);
-  const [promoteError, setPromoteError] = useState<string | null>(null);
-  const [previewName, setPreviewName] = useState<string | null>(null);
+  // PR #710 — track `subGraph` on the success state so the result
+  // copy can disambiguate which partition was promoted. Two rows
+  // labeled `draft` (one root, one sub-graph) would otherwise emit
+  // the same message and leave the user guessing.
+  // Issue #864 — render the unified `PromoteOutcome` so success, no-op,
+  // and ASSERTION_NOT_PERSISTED 409 responses each get their own
+  // contextual message, instead of the legacy "Promoted 0 triples"
+  // string that hid every failure mode behind a fake success.
+  const [promoteResult, setPromoteResult] = useState<{
+    message: string;
+    kind: 'success' | 'noop';
+    subGraph?: string;
+  } | null>(null);
+  const [promoteError, setPromoteError] = useState<{ message: string; kind: 'not-persisted' | 'other' } | null>(null);
+  // PR #710 Fix E — preview state carries the sub-graph slug too so
+  // `FilePreviewModal` can pass it through to the daemon's
+  // `/extraction-status` route. Pre-fix, clicking a sub-graph
+  // assertion's filename queried the root-bucket assertion → 404
+  // or wrong file.
+  const [preview, setPreview] = useState<{ name: string; subGraph?: string } | null>(null);
 
-  const handlePromote = useCallback(async (name: string) => {
-    setPromoting(name);
+  const handlePromote = useCallback(async (assertion: AssertionInfo) => {
+    setPromoting(assertion.graphUri);
     setPromoteResult(null);
     setPromoteError(null);
     try {
-      const res = await promoteAssertion(contextGraphId, name);
-      setPromoteResult({ name, count: res.promotedCount });
+      // PR #710 Fix A — thread `subGraph` so the daemon's
+      // `(cg, name, subGraph)` lookup hits the right partition;
+      // mirrors the AssertionsList fix in components.tsx.
+      const res = await promoteAssertion(contextGraphId, assertion.name, 'all', assertion.subGraph);
+      const outcome = describePromoteResult(assertion.name, res);
+      setPromoteResult({
+        message: outcome.message + (assertion.subGraph ? ` (in ${assertion.subGraph})` : ''),
+        kind: outcome.kind === 'success' ? 'success' : 'noop',
+        subGraph: assertion.subGraph,
+      });
       refresh();
       onPromoted();
     } catch (err: any) {
-      setPromoteError(err.message ?? 'Promote failed');
+      const typed = describePromoteError(assertion.name, err);
+      setPromoteError(
+        typed
+          ? { message: typed.message, kind: 'not-persisted' }
+          : { message: err?.message ?? 'Promote failed', kind: 'other' },
+      );
     } finally {
       setPromoting(null);
     }
@@ -418,16 +454,37 @@ function AssertionList({ contextGraphId, onPromoted }: { contextGraphId: string;
     setPromoteResult(null);
     setPromoteError(null);
     let totalPromoted = 0;
+    let noopCount = 0;
+    // Issue #864 (Codex review on #874) — capture the in-flight
+    // assertion name so a mid-loop failure surfaces "<name>: …"
+    // instead of the generic "selected assertion …". Without this,
+    // bulk promote with a 409 ASSERTION_NOT_PERSISTED on one item
+    // gave the user no way to tell which draft needs re-importing.
+    let currentAssertion: string | null = null;
     try {
       for (const a of assertions) {
-        const res = await promoteAssertion(contextGraphId, a.name);
+        currentAssertion = a.name;
+        // PR #710 — see comment on the single-row handler above.
+        const res = await promoteAssertion(contextGraphId, a.name, 'all', a.subGraph);
         totalPromoted += res.promotedCount;
+        if (res.promotedCount === 0) noopCount += 1;
       }
-      setPromoteResult({ name: 'all assertions', count: totalPromoted });
+      const tail = noopCount > 0 ? ` (${noopCount} assertion${noopCount === 1 ? '' : 's'} had nothing to promote)` : '';
+      setPromoteResult({
+        message: totalPromoted > 0
+          ? `Promoted ${totalPromoted} triple${totalPromoted === 1 ? '' : 's'} across ${assertions.length} assertion${assertions.length === 1 ? '' : 's'}.${tail}`
+          : `No triples were promoted — every assertion was already in Shared Working Memory or its content has not been committed yet.`,
+        kind: totalPromoted > 0 ? 'success' : 'noop',
+      });
       refresh();
       onPromoted();
     } catch (err: any) {
-      setPromoteError(err.message ?? 'Promote failed');
+      const typed = describePromoteError(currentAssertion ?? 'selected assertion', err);
+      setPromoteError(
+        typed
+          ? { message: typed.message, kind: 'not-persisted' }
+          : { message: err?.message ?? 'Promote failed', kind: 'other' },
+      );
     } finally {
       setPromoting(null);
     }
@@ -450,46 +507,59 @@ function AssertionList({ contextGraphId, onPromoted }: { contextGraphId: string;
       </div>
       <div className="v10-assertion-items">
         {assertions.map((a) => (
-          <div key={a.name} className="v10-assertion-item">
+          <div key={a.graphUri} className="v10-assertion-item">
             <div className="v10-assertion-item-info">
               <button
                 className="v10-assertion-item-name clickable"
                 title={a.graphUri}
-                onClick={() => setPreviewName(a.name)}
+                onClick={() => setPreview({ name: a.name, subGraph: a.subGraph })}
               >
                 {a.name}
               </button>
               {a.tripleCount != null && (
                 <span className="v10-assertion-item-count">{a.tripleCount} triples</span>
               )}
+              {a.subGraph && (
+                // PR #710 — mirror the AssertionsList chip pattern
+                // (components.tsx). Same class, same `›` glyph, same
+                // truncation, same tooltip — disambiguates rows that
+                // share a name across root/sub-graph partitions.
+                <span
+                  className="v10-item-count v10-item-subgraph"
+                  title={`In sub-graph: ${a.subGraph}`}
+                >
+                  › {truncateMiddle(a.subGraph, 18)}
+                </span>
+              )}
             </div>
             <button
               className="v10-btn-promote"
               disabled={promoting !== null}
-              onClick={() => handlePromote(a.name)}
+              onClick={() => handlePromote(a)}
               title="Copy these triples to Shared Working Memory"
             >
-              {promoting === a.name ? 'Promoting...' : '→ SWM'}
+              {promoting === a.graphUri ? 'Promoting...' : '→ SWM'}
             </button>
           </div>
         ))}
       </div>
       {promoteResult && (
-        <div className="v10-promote-result success">
-          Promoted {promoteResult.count} triples from {promoteResult.name} to Shared Working Memory.
+        <div className={promoteResult.kind === 'success' ? 'v10-promote-result success' : 'v10-promote-result info'}>
+          {promoteResult.message}
         </div>
       )}
       {promoteError && (
         <div className="v10-promote-result error">
-          {promoteError}
+          {promoteError.message}
         </div>
       )}
 
-      {previewName && (
+      {preview && (
         <FilePreviewModal
           open
-          onClose={() => setPreviewName(null)}
-          assertionName={previewName}
+          onClose={() => setPreview(null)}
+          assertionName={preview.name}
+          subGraphName={preview.subGraph}
           contextGraphId={contextGraphId}
         />
       )}
@@ -532,6 +602,10 @@ function PublishPanel({ contextGraphId, onPublished }: { contextGraphId: string;
 
   const handlePublishSelected = useCallback(async () => {
     if (selected.size === 0) return;
+    if (selected.size > 1) {
+      setError('V10 publish requires exactly one root entity per request. Select one root and publish again.');
+      return;
+    }
     setPublishing(true);
     setPublishResult(null);
     setError(null);
@@ -550,11 +624,15 @@ function PublishPanel({ contextGraphId, onPublished }: { contextGraphId: string;
   }, [selected, contextGraphId, refresh, onPublished]);
 
   const handlePublishAll = useCallback(async () => {
+    if (allUris.length !== 1) {
+      setError('V10 publish requires exactly one root entity per request. Select one root and publish again.');
+      return;
+    }
     setPublishing(true);
     setPublishResult(null);
     setError(null);
     try {
-      const res = await publishSharedMemory(contextGraphId);
+      const res = await publishSharedMemory(contextGraphId, allUris);
       setPublishResult(res);
       setSelected(new Set());
       refresh();
@@ -564,7 +642,7 @@ function PublishPanel({ contextGraphId, onPublished }: { contextGraphId: string;
     } finally {
       setPublishing(false);
     }
-  }, [contextGraphId, refresh, onPublished]);
+  }, [allUris, contextGraphId, refresh, onPublished]);
 
   const totalTriples = entities?.reduce((sum, e) => sum + e.tripleCount, 0) ?? 0;
   const selectedTriples = entities?.filter(e => selected.has(e.uri)).reduce((sum, e) => sum + e.tripleCount, 0) ?? 0;
@@ -654,10 +732,10 @@ function PublishPanel({ contextGraphId, onPublished }: { contextGraphId: string;
               </div>
             )}
             <div className="v10-publish-result-details">
-              <div><span className="v10-publish-result-label">Knowledge Collection:</span> {publishResult.kcId}</div>
+              <div><span className="v10-publish-result-label">Knowledge Asset:</span> {publishResult.kaId}</div>
               <div><span className="v10-publish-result-label">Status:</span> {publishResult.status}</div>
-              {publishResult.kas?.length > 0 && (
-                <div><span className="v10-publish-result-label">Knowledge Assets:</span> {publishResult.kas.length}</div>
+              {publishResult.kas && publishResult.kas.length > 1 && (
+                <div><span className="v10-publish-result-label">Additional KAs in batch:</span> {publishResult.kas.length - 1}</div>
               )}
               {publishResult.txHash ? (
                 <div className="v10-publish-result-tx">

@@ -11,14 +11,10 @@ import {
   fetchOperationsWithPhases,
   fetchOperation,
   fetchErrorHotspots,
-  fetchLogs,
   fetchNodeLog,
   fetchConnections,
-  fetchLlmSettings,
   fetchRetentionSettings,
   fetchTelemetrySettings,
-  fetchCatchupStatus,
-  fetchNotifications,
   markNotificationsRead,
   fetchRpcHealth,
   fetchQueryHistory,
@@ -46,6 +42,7 @@ import {
 let server: Server;
 let baseUrl: string;
 const requestLog: Array<{ url: string; method: string; body: string }> = [];
+let queryBindings: any[] = [];
 
 function startTestServer(): Promise<void> {
   return new Promise((resolve) => {
@@ -67,8 +64,6 @@ function startTestServer(): Promise<void> {
           res.end(JSON.stringify({ total_kcs: 5 }));
         } else if (url.startsWith('/api/connections')) {
           res.end(JSON.stringify({ peers: [] }));
-        } else if (url.startsWith('/api/settings/llm')) {
-          res.end(JSON.stringify({ model: 'gpt-4' }));
         } else if (url.startsWith('/api/settings/retention')) {
           res.end(JSON.stringify({ retentionDays: 30 }));
         } else if (url.startsWith('/api/settings/telemetry')) {
@@ -89,12 +84,8 @@ function startTestServer(): Promise<void> {
           res.end(JSON.stringify({ operations: [], total: 0 }));
         } else if (url.startsWith('/api/error-hotspots')) {
           res.end(JSON.stringify({ hotspots: [] }));
-        } else if (url.startsWith('/api/logs')) {
-          res.end(JSON.stringify({ logs: [], total: 0 }));
         } else if (url.startsWith('/api/node-log')) {
           res.end(JSON.stringify({ lines: [], totalSize: 0 }));
-        } else if (url.startsWith('/api/sync/catchup-status')) {
-          res.end(JSON.stringify({ jobId: 'j1', status: 'done' }));
         } else if (url.startsWith('/api/notifications')) {
           res.end(JSON.stringify({ notifications: [], ok: true }));
         } else if (url.startsWith('/api/success-rates')) {
@@ -104,7 +95,7 @@ function startTestServer(): Promise<void> {
         } else if (url.startsWith('/api/context-graph/list') || url.startsWith('/api/context-graphs')) {
           res.end(JSON.stringify({ contextGraphs: [{ id: 'cg1' }] }));
         } else if (url.startsWith('/api/query')) {
-          res.end(JSON.stringify({ result: { bindings: [] } }));
+          res.end(JSON.stringify({ result: { bindings: queryBindings } }));
         } else if (url.startsWith('/api/shared-memory')) {
           res.end(JSON.stringify({ success: true, ual: 'did:dkg:test' }));
         } else if (url.includes('/promote')) {
@@ -150,6 +141,7 @@ describe('UI API tests', () => {
 
   beforeEach(() => {
     requestLog.length = 0;
+    queryBindings = [];
   });
 
   describe('fileUrl', () => {
@@ -211,11 +203,6 @@ describe('UI API tests', () => {
       expect(requestLog.some(r => r.url.startsWith('/api/connections'))).toBe(true);
     });
 
-    it('fetchLlmSettings calls /api/settings/llm', async () => {
-      const res = await fetchLlmSettings();
-      expect(res.model).toBe('gpt-4');
-    });
-
     it('fetchRetentionSettings calls /api/settings/retention', async () => {
       const res = await fetchRetentionSettings();
       expect(res.retentionDays).toBe(30);
@@ -272,36 +259,10 @@ describe('UI API tests', () => {
       expect(call?.url).toContain('periodMs=3600000');
     });
 
-    it('fetchLogs with params', async () => {
-      await fetchLogs({ level: 'error' });
-      const call = requestLog.find(r => r.url.includes('/api/logs'));
-      expect(call?.url).toContain('level=error');
-    });
-
     it('fetchNodeLog with lines', async () => {
       await fetchNodeLog({ lines: 100 });
       const call = requestLog.find(r => r.url.includes('/api/node-log'));
       expect(call?.url).toContain('lines=100');
-    });
-
-    it('fetchCatchupStatus calls correct endpoint', async () => {
-      await fetchCatchupStatus('cg-1');
-      expect(requestLog.some(r => r.url.includes('contextGraphId=cg-1'))).toBe(true);
-    });
-
-    it('fetchCatchupStatus type accepts V10 "unreachable" terminal status', async () => {
-      // V10 introduces an `unreachable` status when the daemon ran the
-      // catchup but no peer could deliver the CG content (curator
-      // offline / no host / network failure). The UI uses it to render
-      // a dedicated "send signed join request" CTA distinct from the
-      // generic timeout copy. This test pins the type contract: the
-      // CatchupStatusResponse union must accept `'unreachable'` so the
-      // modal's terminal-state poll exit recognises it.
-      const result = await fetchCatchupStatus('cg-2');
-      const acceptedStatuses: Array<typeof result.status> = [
-        'queued', 'running', 'done', 'denied', 'failed', 'unreachable',
-      ];
-      expect(acceptedStatuses).toContain(result.status);
     });
 
     it('fetchSuccessRates calls correct endpoint', async () => {
@@ -327,11 +288,36 @@ describe('UI API tests', () => {
       expect(body.contextGraphId).toBe('cg-1');
     });
 
-    it('publishSharedMemory sends contextGraphId', async () => {
-      await publishSharedMemory('cg-1');
+    it('publishSharedMemory sends one explicit root selection', async () => {
+      await publishSharedMemory('cg-1', ['urn:root']);
       const call = requestLog.find(r => r.method === 'POST' && r.url.includes('/api/shared-memory/publish'));
       const body = JSON.parse(call?.body ?? '{}');
       expect(body.contextGraphId).toBe('cg-1');
+      expect(body.selection).toEqual(['urn:root']);
+      expect(body.clearAfter).toBe(false);
+    });
+
+    it('listSwmEntities queries the shared-working-memory view', async () => {
+      await listSwmEntities('cg-1');
+      const call = requestLog.find(r => r.method === 'POST' && r.url.includes('/api/query'));
+      const body = JSON.parse(call?.body ?? '{}');
+      expect(body.contextGraphId).toBe('cg-1');
+      expect(body.view).toBe('shared-working-memory');
+      expect(body.sparql).toContain('/_shared_memory');
+      expect(body.sparql).toContain('workspaceOwner');
+    });
+
+    it('listSwmEntities collapses skolemized section subjects into canonical roots', async () => {
+      queryBindings = [
+        { s: { value: 'https://example.org/doc/root' }, cnt: { value: '2' } },
+        { s: { value: 'https://example.org/doc/root/.well-known/genid/section-1-intro' }, cnt: { value: '3' } },
+        { s: { value: '<https://example.org/doc/child-only/.well-known/genid/section-1-only>' }, cnt: { value: '4' } },
+      ];
+
+      await expect(listSwmEntities('cg-1')).resolves.toEqual([
+        { uri: 'https://example.org/doc/root', label: 'root', tripleCount: 5 },
+        { uri: 'https://example.org/doc/child-only', label: 'child-only', tripleCount: 4 },
+      ]);
     });
 
     it('createSavedQuery sends POST', async () => {
@@ -352,6 +338,53 @@ describe('UI API tests', () => {
       const call = requestLog.find(r => r.method === 'POST' && r.url.includes('/api/subscribe'));
       const body = JSON.parse(call?.body ?? '{}');
       expect(body.contextGraphId).toBe('cg-1');
+    });
+  });
+
+  // The Node UI mounts `useMemoryEntities` and `useProjectProfile` from
+  // multiple sibling views simultaneously when a project is opened
+  // (e.g. Dashboard card + ProjectView). Pre-dedup, each duplicate
+  // fan-out hit `/api/query` separately and added seconds of wall-time
+  // on a multi-GB Oxigraph store. These tests pin the contract that
+  // `executeQuery` collapses concurrent identical POSTs to one fetch
+  // while still firing fresh requests once a prior one settles.
+  describe('executeQuery in-flight dedup', () => {
+    it('coalesces concurrent identical queries to one /api/query POST', async () => {
+      const results = await Promise.all([
+        executeQuery('SELECT * WHERE { ?s ?p ?o }', 'cg-dedup'),
+        executeQuery('SELECT * WHERE { ?s ?p ?o }', 'cg-dedup'),
+        executeQuery('SELECT * WHERE { ?s ?p ?o }', 'cg-dedup'),
+        executeQuery('SELECT * WHERE { ?s ?p ?o }', 'cg-dedup'),
+        executeQuery('SELECT * WHERE { ?s ?p ?o }', 'cg-dedup'),
+      ]);
+      const queryCalls = requestLog.filter(
+        r => r.method === 'POST' && r.url.startsWith('/api/query'),
+      );
+      expect(queryCalls).toHaveLength(1);
+      expect(results).toHaveLength(5);
+      for (const r of results) {
+        expect(r).toEqual({ result: { bindings: [] } });
+      }
+    });
+
+    it('does not coalesce when args differ', async () => {
+      await Promise.all([
+        executeQuery('SELECT * WHERE { ?s ?p ?o }', 'cg-a'),
+        executeQuery('SELECT * WHERE { ?s ?p ?o }', 'cg-b'),
+      ]);
+      const queryCalls = requestLog.filter(
+        r => r.method === 'POST' && r.url.startsWith('/api/query'),
+      );
+      expect(queryCalls).toHaveLength(2);
+    });
+
+    it('issues a fresh fetch once the prior request has settled', async () => {
+      await executeQuery('SELECT * WHERE { ?s ?p ?o }', 'cg-sequential');
+      await executeQuery('SELECT * WHERE { ?s ?p ?o }', 'cg-sequential');
+      const queryCalls = requestLog.filter(
+        r => r.method === 'POST' && r.url.startsWith('/api/query'),
+      );
+      expect(queryCalls).toHaveLength(2);
     });
   });
 

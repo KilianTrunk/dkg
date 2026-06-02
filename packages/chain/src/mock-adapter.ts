@@ -17,12 +17,13 @@ import type {
   VerifyParams,
   PublishToContextGraphParams,
   V10PublishParams,
-  V10UpdateKCParams,
+  V10UpdateKAParams,
   NodeChallenge,
   ProofPeriodStatus,
   CreateChallengeResult,
   OperationalWalletRegistrationResult,
   V10PublishingConvictionAccountInfo,
+  VerifyACKIdentityResult,
 } from './chain-adapter.js';
 import {
   NoEligibleContextGraphError,
@@ -67,7 +68,7 @@ export class MockChainAdapter implements ChainAdapter {
     kaCount: number;
     /** V10 flat-KC merkle leaf count (sorted + deduped). 0 for legacy V8 entries. */
     merkleLeafCount: number;
-    /** Publisher EOA from `createKnowledgeAssetsV10`; default to mock signer for V8 paths. */
+    /** Publisher EOA from `createKnowledgeAssets`; default to mock signer for V8 paths. */
     publisherAddress: string;
     /**
      * Verified author identity from the V10.1 author attestation, mirrored
@@ -79,6 +80,19 @@ export class MockChainAdapter implements ChainAdapter {
     authorAddress: string;
     /** On-chain context graph id (0n when the mock V8 path didn't carry one). */
     cgId: bigint;
+    /** Mock Chronos epoch where this KC became active. */
+    startEpoch: bigint;
+    /** Exclusive mock Chronos epoch where this KC expires. */
+    endEpoch: bigint;
+    /** Token amount paid for the KC lifetime. Used to model per-epoch CG value. */
+    tokenAmount: bigint;
+    /**
+     * OT-RFC-38 LU-11 / OT-RFC-39 — ciphertext-chunks commitment for
+     * curated KCs. `bytes32(0)` + 0 when omitted (default for legacy
+     * and public-CG entries; matches Solidity default-zero mapping).
+     */
+    ciphertextChunksRoot: Uint8Array;
+    ciphertextChunkCount: number;
   }>();
   private contextGraphRegistry = new Map<string, Record<string, string>>();
   private events: ChainEvent[] = [];
@@ -106,6 +120,10 @@ export class MockChainAdapter implements ChainAdapter {
     return existing ?? 0n;
   }
 
+  getRpcUrls(): string[] {
+    return [];
+  }
+
   async ensureProfile(_options?: { nodeName?: string; stakeAmount?: bigint; lockTier?: number }): Promise<bigint> {
     const existing = await this.getIdentityId();
     if (existing > 0n) return existing;
@@ -123,6 +141,28 @@ export class MockChainAdapter implements ChainAdapter {
     this.identities.set(key, id);
     this.pushEvent('IdentityRegistered', { identityId: id.toString() });
     return id;
+  }
+
+  /**
+   * OT-RFC-39 LU-11 — resolve an EOA to its on-chain identityId.
+   *
+   * Mirrors `EVMChainAdapter.getIdentityIdForAddress` so the mock-backed
+   * fifth authorization path for `PROTOCOL_GET_CIPHERTEXT_CHUNK`
+   * (registered-node-operator auth in `dkg-agent`) can be exercised
+   * offline. Address lookups try both checksum and lowercase forms
+   * because `seedIdentity` stores whatever the caller passed.
+   *
+   * Returns `0n` for non-addresses or addresses with no seeded identity
+   * — matching Solidity's zero-init mapping semantics.
+   */
+  async getIdentityIdForAddress(address: string): Promise<bigint> {
+    if (!ethers.isAddress(address)) return 0n;
+    const checksum = ethers.getAddress(address);
+    return (
+      this.identities.get(checksum) ??
+      this.identities.get(checksum.toLowerCase()) ??
+      0n
+    );
   }
 
   /**
@@ -231,7 +271,7 @@ export class MockChainAdapter implements ChainAdapter {
     if (!created) return null;
 
     return {
-      batchId: BigInt(String(created.data.kcId ?? created.data.batchId ?? '0')),
+      batchId: BigInt(String(created.data.kaId ?? created.data.batchId ?? '0')),
       startKAId: created.data.startKAId != null ? BigInt(String(created.data.startKAId)) : undefined,
       endKAId: created.data.endKAId != null ? BigInt(String(created.data.endKAId)) : undefined,
       txHash,
@@ -259,8 +299,8 @@ export class MockChainAdapter implements ChainAdapter {
     return false;
   }
 
-  async updateKnowledgeCollectionV10(params: V10UpdateKCParams): Promise<TxResult> {
-    const existing = this.batches.get(params.kcId);
+  async updateKnowledgeCollectionV10(params: V10UpdateKAParams): Promise<TxResult> {
+    const existing = this.batches.get(params.kaId);
     if (!existing) {
       return this.txResult(false);
     }
@@ -275,7 +315,7 @@ export class MockChainAdapter implements ChainAdapter {
     // `peekTxHash()` (same deterministic generator that feeds `txResult`
     // below) guarantees the pre-broadcast hash === the post-broadcast
     // hash, and naturally varies across repeated updates of the same
-    // `kcId` because `txIndexInBlock` advances per-tx.
+    // `kaId` because `txIndexInBlock` advances per-tx.
     const mockUpdateTxHash = this.peekTxHash();
     try {
       // Codex PR #241 iter-7: `await` an async WAL hook.
@@ -288,7 +328,7 @@ export class MockChainAdapter implements ChainAdapter {
     }
 
     existing.merkleRoot = params.newMerkleRoot;
-    const collection = this.collections.get(params.kcId);
+    const collection = this.collections.get(params.kaId);
     if (collection) {
       collection.merkleRoot = params.newMerkleRoot;
       collection.merkleLeafCount = params.newMerkleLeafCount;
@@ -303,7 +343,7 @@ export class MockChainAdapter implements ChainAdapter {
     const blockNumber = this.nextBlock;
     const txHash = `0x${blockNumber.toString(16).padStart(64, '0')}${txIndex.toString(16).padStart(4, '0')}`;
     this.pushEvent('KnowledgeBatchUpdated', {
-      batchId: params.kcId.toString(),
+      batchId: params.kaId.toString(),
       newMerkleRoot: toHex(params.newMerkleRoot),
       publisherAddress,
       txHash,
@@ -335,9 +375,9 @@ export class MockChainAdapter implements ChainAdapter {
 
   // --- V8 backward compatibility ---
 
-  async createKnowledgeCollection(params: CreateKCParams): Promise<TxResult> {
-    const kcId = this.nextBatchId++;
-    this.collections.set(kcId, {
+  async createKnowledgeAsset(params: CreateKCParams): Promise<TxResult> {
+    const kaId = this.nextBatchId++;
+    this.collections.set(kaId, {
       merkleRoot: params.merkleRoot,
       kaCount: params.knowledgeAssetsCount,
       merkleLeafCount: 0,
@@ -345,10 +385,15 @@ export class MockChainAdapter implements ChainAdapter {
       // Legacy V8 path — no attestation, mirror the on-chain `address(0)`.
       authorAddress: ethers.ZeroAddress,
       cgId: 0n,
+      startEpoch: this.rsEpoch,
+      endEpoch: this.rsEpoch + 1n,
+      tokenAmount: 0n,
+      ciphertextChunksRoot: new Uint8Array(32),
+      ciphertextChunkCount: 0,
     });
 
     this.pushEvent('KCCreated', {
-      kcId: kcId.toString(),
+      kaId: kaId.toString(),
       merkleRoot: toHex(params.merkleRoot),
       kaCount: params.knowledgeAssetsCount,
     });
@@ -356,15 +401,15 @@ export class MockChainAdapter implements ChainAdapter {
     return this.txResult(true);
   }
 
-  async updateKnowledgeCollection(params: UpdateKCParams): Promise<TxResult> {
-    const existing = this.collections.get(params.kcId);
+  async updateKnowledgeAsset(params: UpdateKCParams): Promise<TxResult> {
+    const existing = this.collections.get(params.kaId);
     if (!existing) {
       return this.txResult(false);
     }
 
     existing.merkleRoot = params.newMerkleRoot;
     this.pushEvent('KCUpdated', {
-      kcId: params.kcId.toString(),
+      kaId: params.kaId.toString(),
       newMerkleRoot: toHex(params.newMerkleRoot),
     });
 
@@ -405,8 +450,8 @@ export class MockChainAdapter implements ChainAdapter {
     return { ...result, contextGraphId: id };
   }
 
-  async submitToContextGraph(kcId: string, contextGraphId: string): Promise<TxResult> {
-    this.pushEvent('KCSubmittedToContextGraph', { kcId, contextGraphId });
+  async submitToContextGraph(kaId: string, contextGraphId: string): Promise<TxResult> {
+    this.pushEvent('KCSubmittedToContextGraph', { kaId, contextGraphId });
     return this.txResult(true);
   }
 
@@ -812,14 +857,27 @@ export class MockChainAdapter implements ChainAdapter {
   }
 
   async verifyACKIdentity(recoveredAddress: string, claimedIdentityId: bigint): Promise<boolean> {
-    // Strict binding: recovered address must match the identity's registered address
+    return (await this.verifyACKIdentityDetailed(recoveredAddress, claimedIdentityId)).valid;
+  }
+
+  /**
+   * Mock implementation: the harness has no separate sharding-table /
+   * stake state, so a key registered for the claimed identity is treated
+   * as both `keyHasPurpose` AND `nodeExists`. Tests that need to exercise
+   * the `'not-in-sharding-table'` branch should use the EVM adapter
+   * against a Hardhat env with a freshly-keyed but unstaked profile.
+   */
+  async verifyACKIdentityDetailed(
+    recoveredAddress: string,
+    claimedIdentityId: bigint,
+  ): Promise<VerifyACKIdentityResult> {
     const normalizedAddress = recoveredAddress.toLowerCase();
     for (const [addr, id] of this.identities) {
       if (id === claimedIdentityId && addr.toLowerCase() === normalizedAddress) {
-        return true;
+        return { valid: true };
       }
     }
-    return false;
+    return { valid: false, reason: 'key-not-registered' };
   }
 
   async isOperationalWalletRegistered(identityId: bigint, address: string): Promise<boolean> {
@@ -976,7 +1034,7 @@ export class MockChainAdapter implements ChainAdapter {
       txHash: publishTxHash,
     });
     this.pushEvent('KCCreated', {
-      kcId: batchId.toString(),
+      kaId: batchId.toString(),
       merkleRoot: toHex(params.merkleRoot),
       publisherAddress: this.signerAddress,
       startKAId: startId.toString(),
@@ -992,6 +1050,7 @@ export class MockChainAdapter implements ChainAdapter {
       endKAId: endId,
       txHash: tx.hash,
       blockNumber: tx.blockNumber,
+      txIndex: tx.txIndex,
       blockTimestamp: Math.floor(Date.now() / 1000),
       publisherAddress: this.signerAddress,
     };
@@ -1020,6 +1079,39 @@ export class MockChainAdapter implements ChainAdapter {
     if (!cg) return 0;
     const ap = (cg as { accessPolicy?: number }).accessPolicy;
     return typeof ap === 'number' ? ap : 0;
+  }
+
+  /**
+   * OT-RFC-38 / #884: chain-backed liveness oracle parity for the mock.
+   * Mirrors `ContextGraphStorage.isContextGraphActive(uint256)` — a CG is
+   * "active" on the mock chain iff it was minted via `createContextGraph`
+   * (i.e. is present in the in-memory registry). Unknown ids return `false`,
+   * matching the EVM adapter's behaviour for unregistered slots. This is the
+   * proof callers require before trusting {@link getContextGraphAccessPolicy}
+   * (which is permissively default-`0` for unknown ids).
+   */
+  async isContextGraphActiveOnChain(contextGraphId: bigint): Promise<boolean> {
+    return this.contextGraphs.has(contextGraphId);
+  }
+
+  /**
+   * Issue #872 / Codex round-3: chain-backed publish-policy oracle
+   * parity for the mock chain. Returns the same `(uint8, address)`
+   * shape the EVM adapter does. Unknown ids yield
+   * `(0, address(0))` to match the Solidity default-zero mapping.
+   */
+  async getContextGraphPublishPolicy(contextGraphId: bigint): Promise<{
+    publishPolicy: number;
+    publishAuthority: string;
+  }> {
+    const cg = this.contextGraphs.get(contextGraphId);
+    if (!cg) return { publishPolicy: 0, publishAuthority: ethers.ZeroAddress };
+    const pp = (cg as { publishPolicy?: number }).publishPolicy;
+    const pa = (cg as { publishAuthority?: string }).publishAuthority;
+    return {
+      publishPolicy: typeof pp === 'number' ? pp : 0,
+      publishAuthority: pa ? ethers.getAddress(pa) : ethers.ZeroAddress,
+    };
   }
 
   /**
@@ -1052,11 +1144,15 @@ export class MockChainAdapter implements ChainAdapter {
 
   // --- V10 Publish (KnowledgeAssetsV10 → KnowledgeCollectionStorage) ---
 
-  async getKnowledgeAssetsV10Address(): Promise<string> {
+  async getKnowledgeAssetsLifecycleAddress(): Promise<string> {
     // 20 valid hex bytes — callers use this solely to build publish digests,
     // never to send a real transaction, so any stable address works. Picked
     // to be visually distinct from `0x0...0` so log-diffing is easier.
     return '0x000000000000000000000000000000000000c10a';
+  }
+
+  async getDKGKnowledgeAssetsAddress(): Promise<string> {
+    return this.getKnowledgeAssetsLifecycleAddress();
   }
 
   async getEvmChainId(): Promise<bigint> {
@@ -1075,9 +1171,9 @@ export class MockChainAdapter implements ChainAdapter {
     return false;
   }
 
-  async createKnowledgeAssetsV10(params: V10PublishParams): Promise<OnChainPublishResult> {
+  async createKnowledgeAssets(params: V10PublishParams): Promise<OnChainPublishResult> {
     // Deliberately tolerant of `contextGraphId === 0n`. The real EVM
-    // adapter rejects that at `evm-adapter.ts:createKnowledgeAssetsV10`
+    // adapter rejects that at `evm-adapter.ts:createKnowledgeAssets`
     // pre-tx, which is the authoritative fail-loud boundary. The mock is
     // used by ~680 unit tests that publish with descriptive CG-name
     // strings and rely on the silent `0n` fallback to exercise the data
@@ -1108,7 +1204,7 @@ export class MockChainAdapter implements ChainAdapter {
       await params.onBroadcast?.({ txHash: mockPublishTxHash });
     } catch (hookErr) {
       throw new Error(
-        `chain:writeahead hook failed before createKnowledgeAssetsV10 broadcast (mock): ` +
+        `chain:writeahead hook failed before createKnowledgeAssets broadcast (mock): ` +
         `${hookErr instanceof Error ? hookErr.message : String(hookErr)}`,
       );
     }
@@ -1122,28 +1218,41 @@ export class MockChainAdapter implements ChainAdapter {
         'Allow the address first to model explicit mock support for address-specific publishing.',
       );
     }
-    const kcId = this.nextBatchId++;
-    this.collections.set(kcId, {
+    const kaId = this.nextBatchId++;
+    this.collections.set(kaId, {
       merkleRoot: params.merkleRoot,
       kaCount: params.knowledgeAssetsAmount,
       merkleLeafCount: params.merkleLeafCount,
       publisherAddress,
       authorAddress: ethers.getAddress(params.author.address),
       cgId: params.contextGraphId,
+      startEpoch: this.rsEpoch,
+      endEpoch: this.rsEpoch + BigInt(params.epochs),
+      tokenAmount: params.tokenAmount,
+      ciphertextChunksRoot: params.ciphertextChunksRoot && params.ciphertextChunksRoot.length === 32
+        ? params.ciphertextChunksRoot
+        : new Uint8Array(32),
+      ciphertextChunkCount: params.ciphertextChunkCount ?? 0,
+    });
+    this.rsKCs.set(kaId, {
+      merkleRootHex: toHex(params.merkleRoot),
+      chunks: new Map([[0n, toHex(params.merkleRoot)]]),
+      kasContract: await this.getDKGKnowledgeAssetsAddress(),
+      cgId: params.contextGraphId,
     });
     // Also store in batches so verify() can find this publish
-    this.batches.set(kcId, {
+    this.batches.set(kaId, {
       merkleRoot: params.merkleRoot,
       kaCount: params.knowledgeAssetsAmount,
       publisherAddress,
     });
 
     const txHash = this.peekTxHash();
-    const startKAId = kcId * 100n + 1n;
+    const startKAId = kaId * 100n + 1n;
     const endKAId = startKAId + BigInt(params.knowledgeAssetsAmount) - 1n;
 
     this.pushEvent('KCCreated', {
-      kcId: kcId.toString(),
+      kaId: kaId.toString(),
       publishOperationId: params.publishOperationId,
       merkleRoot: toHex(params.merkleRoot),
       byteSize: params.byteSize.toString(),
@@ -1159,11 +1268,12 @@ export class MockChainAdapter implements ChainAdapter {
 
     const result = this.txResult(true);
     return {
-      batchId: kcId,
+      batchId: kaId,
       startKAId,
       endKAId,
       txHash: result.hash,
       blockNumber: result.blockNumber,
+      txIndex: result.txIndex,
       blockTimestamp: Math.floor(Date.now() / 1000),
       publisherAddress,
       // Mirror evm-adapter: surface the chain-confirmed author from the
@@ -1180,8 +1290,8 @@ export class MockChainAdapter implements ChainAdapter {
     return this.batches.get(batchId);
   }
 
-  getCollection(kcId: bigint) {
-    return this.collections.get(kcId);
+  getCollection(kaId: bigint) {
+    return this.collections.get(kaId);
   }
 
   getIdentityIdByKey(publicKey: Uint8Array): bigint | undefined {
@@ -1213,7 +1323,7 @@ export class MockChainAdapter implements ChainAdapter {
     const hash = `0x${blockNumber.toString(16).padStart(64, '0')}${txIndex.toString(16).padStart(4, '0')}`;
 
     if (this.autoMine) this.advanceBlock();
-    return { hash, blockNumber, success };
+    return { hash, blockNumber, txIndex, success };
   }
 
   /** Advance to next block, resetting the tx index counter. */
@@ -1260,11 +1370,11 @@ export class MockChainAdapter implements ChainAdapter {
   private rsPeriodCursor = 1n;            // activeProofPeriodStartBlock
   private rsEpoch = 1n;
   private rsPeriodIsValid = true;
-  /** kcId -> {root: bytes32 hex, leaves: leafIndex -> expected bytes32 leaf (hex), kcsAddr } */
+  /** kaId -> {root: bytes32 hex, leaves: leafIndex -> expected bytes32 leaf (hex), kcsAddr } */
   private rsKCs = new Map<bigint, {
     merkleRootHex: string;
     chunks: Map<bigint, string>;
-    kcsContract: string;
+    kasContract: string;
     cgId: bigint;
   }>();
   /** identityId -> NodeChallenge */
@@ -1294,30 +1404,33 @@ export class MockChainAdapter implements ChainAdapter {
    *
    * Also mirrors the entry into `collections` so the `getLatestMerkleRoot`
    * / `getMerkleLeafCount` / `getLatestMerkleRootPublisher` /
-   * `getKCContextGraphId` view methods stay coherent with the random
+   * `getKAContextGraphId` view methods stay coherent with the random
    * sampling mock without forcing tests to publish through
-   * `createKnowledgeAssetsV10` first. `merkleLeafCount` defaults to the
+   * `createKnowledgeAssets` first. `merkleLeafCount` defaults to the
    * number of chunks supplied (one leaf per chunk), and `publisherAddress`
    * defaults to the mock signer; both can be overridden per call.
    */
   __registerKC(input: {
-    kcId: bigint;
+    kaId: bigint;
     contextGraphId: bigint;
     merkleRootHex: string;
-    knowledgeCollectionStorageContract?: string;
+    knowledgeAssetStorageContract?: string;
     chunks: Array<{ chunkId: bigint; chunk: string }>;
     merkleLeafCount?: number;
     publisherAddress?: string;
+    startEpoch?: bigint;
+    endEpoch?: bigint;
+    tokenAmount?: bigint;
   }): void {
     const chunks = new Map<bigint, string>();
     for (const c of input.chunks) chunks.set(c.chunkId, c.chunk);
-    this.rsKCs.set(input.kcId, {
+    this.rsKCs.set(input.kaId, {
       merkleRootHex: input.merkleRootHex,
       chunks,
-      kcsContract: input.knowledgeCollectionStorageContract ?? '0x' + 'aa'.repeat(20),
+      kasContract: input.knowledgeAssetStorageContract ?? '0x' + 'aa'.repeat(20),
       cgId: input.contextGraphId,
     });
-    this.collections.set(input.kcId, {
+    this.collections.set(input.kaId, {
       merkleRoot: fromHex(input.merkleRootHex),
       kaCount: input.chunks.length,
       merkleLeafCount: input.merkleLeafCount ?? input.chunks.length,
@@ -1327,6 +1440,27 @@ export class MockChainAdapter implements ChainAdapter {
       // the on-chain `address(0)` semantics for un-attested writes.
       authorAddress: ethers.ZeroAddress,
       cgId: input.contextGraphId,
+      startEpoch: input.startEpoch ?? this.rsEpoch,
+      endEpoch: input.endEpoch ?? ((input.startEpoch ?? this.rsEpoch) + 1n),
+      tokenAmount: input.tokenAmount ?? 1n,
+      ciphertextChunksRoot: new Uint8Array(32),
+      ciphertextChunkCount: 0,
+    });
+  }
+
+  /**
+   * Test helper (Phase B): emit a `KnowledgeAssetRegisteredToContextGraph`
+   * event for an already-recorded KA so the chain-driven reconciler's
+   * live-event + ordinal-sweep paths can be exercised against the mock.
+   * The KA must already exist in `collections` (via `__registerKC` /
+   * `createKnowledgeAssets`) so the ordinal reads stay coherent.
+   */
+  __emitKARegisteredToContextGraph(contextGraphId: bigint, kaId: bigint): void {
+    this.pushEvent('KnowledgeAssetRegisteredToContextGraph', {
+      contextGraphId: contextGraphId.toString(),
+      kaId: kaId.toString(),
+      txHash: `0x${kaId.toString(16).padStart(64, '0')}`,
+      txIndex: 0,
     });
   }
 
@@ -1369,9 +1503,23 @@ export class MockChainAdapter implements ChainAdapter {
       throw new Error('An unsolved challenge already exists for this node in the current proof period');
     }
 
-    // Round-robin pick over registered KCs (deterministic across runs).
-    const kcEntries = Array.from(this.rsKCs.entries());
-    const [kcId, kcEntry] = kcEntries[this.rsKCPickIndex % kcEntries.length];
+    // Round-robin pick over KCs whose context graph still has non-zero
+    // value in the current mock epoch. This mirrors the contract's
+    // ContextGraphValueStorage eligibility gate closely enough to catch
+    // lifetime/tokenAmount regressions in publisher tests.
+    const kcEntries = Array.from(this.rsKCs.entries()).filter(([kaId]) => {
+      const collection = this.collections.get(kaId);
+      if (!collection) return false;
+      if (collection.cgId <= 0n) return false;
+      if (this.rsEpoch < collection.startEpoch || this.rsEpoch >= collection.endEpoch) return false;
+      const lifetime = collection.endEpoch - collection.startEpoch;
+      if (lifetime <= 0n) return false;
+      return collection.tokenAmount / lifetime > 0n;
+    });
+    if (kcEntries.length === 0) {
+      throw new NoEligibleContextGraphError();
+    }
+    const [kaId, kcEntry] = kcEntries[this.rsKCPickIndex % kcEntries.length];
     this.rsKCPickIndex++;
 
     const chunkIds = Array.from(kcEntry.chunks.keys());
@@ -1381,9 +1529,9 @@ export class MockChainAdapter implements ChainAdapter {
     const chunkId = chunkIds[0];
 
     const challenge: NodeChallenge = {
-      knowledgeCollectionId: kcId,
+      knowledgeAssetId: kaId,
       chunkId,
-      knowledgeCollectionStorageContract: kcEntry.kcsContract,
+      knowledgeAssetStorageContract: kcEntry.kasContract,
       epoch: this.rsEpoch,
       activeProofPeriodStartBlock: this.rsPeriodCursor,
       proofingPeriodDurationInBlocks: MockChainAdapter.RS_MOCK_PERIOD_DURATION_IN_BLOCKS,
@@ -1394,7 +1542,7 @@ export class MockChainAdapter implements ChainAdapter {
     this.pushEvent('ChallengeGenerated', {
       identityId: identityId.toString(),
       contextGraphId: kcEntry.cgId.toString(),
-      knowledgeCollectionId: kcId.toString(),
+      knowledgeAssetId: kaId.toString(),
       chunkId: chunkId.toString(),
       epoch: this.rsEpoch.toString(),
       activeProofPeriodStartBlock: this.rsPeriodCursor.toString(),
@@ -1425,13 +1573,13 @@ export class MockChainAdapter implements ChainAdapter {
       throw new ChallengeNoLongerActiveError();
     }
 
-    const kcEntry = this.rsKCs.get(challenge.knowledgeCollectionId);
+    const kcEntry = this.rsKCs.get(challenge.knowledgeAssetId);
     if (!kcEntry) {
-      throw new Error(`Mock: KC ${challenge.knowledgeCollectionId} no longer registered`);
+      throw new Error(`Mock: KC ${challenge.knowledgeAssetId} no longer registered`);
     }
     const expectedLeaf = kcEntry.chunks.get(challenge.chunkId);
     if (expectedLeaf === undefined) {
-      throw new Error(`Mock: KC ${challenge.knowledgeCollectionId} has no leaf at index ${challenge.chunkId}`);
+      throw new Error(`Mock: KC ${challenge.knowledgeAssetId} has no leaf at index ${challenge.chunkId}`);
     }
     const leafHex = (typeof leaf === 'string' ? leaf : ethers.hexlify(leaf)).toLowerCase();
     if (!/^0x[0-9a-f]{64}$/.test(leafHex)) {
@@ -1481,36 +1629,83 @@ export class MockChainAdapter implements ChainAdapter {
 
   // =====================================================================
   // KC views — read from the in-memory `collections` map populated by
-  // `createKnowledgeAssetsV10` and `__registerKC`.
+  // `createKnowledgeAssets` and `__registerKC`.
   // =====================================================================
 
-  async getLatestMerkleRoot(kcId: bigint): Promise<Uint8Array> {
-    const entry = this.collections.get(kcId);
-    if (!entry) throw new Error(`Mock: unknown kcId ${kcId}`);
+  async getLatestMerkleRoot(kaId: bigint): Promise<Uint8Array> {
+    const entry = this.collections.get(kaId);
+    if (!entry) throw new Error(`Mock: unknown kaId ${kaId}`);
     return entry.merkleRoot;
   }
 
-  async getMerkleLeafCount(kcId: bigint): Promise<number> {
-    const entry = this.collections.get(kcId);
-    if (!entry) throw new Error(`Mock: unknown kcId ${kcId}`);
+  async getMerkleLeafCount(kaId: bigint): Promise<number> {
+    const entry = this.collections.get(kaId);
+    if (!entry) throw new Error(`Mock: unknown kaId ${kaId}`);
     return entry.merkleLeafCount;
   }
 
-  async getLatestMerkleRootPublisher(kcId: bigint): Promise<string> {
-    const entry = this.collections.get(kcId);
-    if (!entry) throw new Error(`Mock: unknown kcId ${kcId}`);
+  async getLatestCiphertextChunksRoot(kaId: bigint): Promise<Uint8Array> {
+    const entry = this.collections.get(kaId);
+    if (!entry) throw new Error(`Mock: unknown kaId ${kaId}`);
+    return entry.ciphertextChunksRoot;
+  }
+
+  async getCiphertextChunkCount(kaId: bigint): Promise<number> {
+    const entry = this.collections.get(kaId);
+    if (!entry) throw new Error(`Mock: unknown kaId ${kaId}`);
+    return entry.ciphertextChunkCount;
+  }
+
+  async getLatestMerkleRootPublisher(kaId: bigint): Promise<string> {
+    const entry = this.collections.get(kaId);
+    if (!entry) throw new Error(`Mock: unknown kaId ${kaId}`);
     return entry.publisherAddress;
   }
 
-  async getLatestMerkleRootAuthor(kcId: bigint): Promise<string> {
-    const entry = this.collections.get(kcId);
-    if (!entry) throw new Error(`Mock: unknown kcId ${kcId}`);
+  async getLatestMerkleRootAuthor(kaId: bigint): Promise<string> {
+    const entry = this.collections.get(kaId);
+    if (!entry) throw new Error(`Mock: unknown kaId ${kaId}`);
     return entry.authorAddress;
   }
 
-  async getKCContextGraphId(kcId: bigint): Promise<bigint> {
-    const entry = this.collections.get(kcId);
+  async getKAContextGraphId(kaId: bigint): Promise<bigint> {
+    const entry = this.collections.get(kaId);
     return entry?.cgId ?? 0n;
+  }
+
+  /**
+   * Per-CG registration ordinal reads (Phase B cursor key). `collections` is
+   * keyed by kaId and iterated in insertion order, so filtering by cgId
+   * reproduces the on-chain `_contextGraphKAList[cgId]` push-append order.
+   */
+  async getContextGraphKCCount(contextGraphId: bigint): Promise<bigint> {
+    let count = 0n;
+    for (const entry of this.collections.values()) {
+      if (entry.cgId === contextGraphId) count += 1n;
+    }
+    return count;
+  }
+
+  async getContextGraphKCAt(contextGraphId: bigint, index: bigint): Promise<bigint> {
+    let i = 0n;
+    for (const [kaId, entry] of this.collections.entries()) {
+      if (entry.cgId !== contextGraphId) continue;
+      if (i === index) return kaId;
+      i += 1n;
+    }
+    throw new Error(
+      `Mock: getContextGraphKCAt out of range (cg=${contextGraphId} index=${index})`,
+    );
+  }
+
+  /**
+   * Parity counterpart of `EVMChainAdapter.destroy()` — a no-op for the
+   * mock since it holds no RPC connections or sockets. Present so the
+   * `mock-adapter-parity.test.ts` API audit stays green and so callers
+   * can safely call `chain.destroy()` without branching on adapter type.
+   */
+  destroy(): void {
+    /* nothing to release */
   }
 }
 

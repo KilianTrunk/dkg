@@ -13,13 +13,19 @@ export const sel = {
     meta: '.v10-header-meta',
     notifWrap: '.v10-header-notif-wrap',
     notifBadge: '.v10-header-notif-badge',
-    notifDropdown: '.v10-header-notif-dropdown',
-    notifTitle: '.v10-header-notif-title',
-    notifEmpty: '.v10-header-notif-empty',
-    notifItem: '.v10-header-notif-item',
-    notifItemText: '.v10-header-notif-item-text',
-    notifItemTime: '.v10-header-notif-item-time',
+    // rc.12 refactor: the bell dropdown is now the standalone NotificationsPane
+    // (`<NotificationsBell>` → `<NotificationsPane>`), not the old inline
+    // `.v10-header-notif-*` markup. Rows are rendered by JoinRequestRow /
+    // ActivityDigestRow / ConfirmationRow (see components/Notifications/).
+    notifDropdown: '.v10-notif-pane',
+    notifTitle: '.v10-notif-pane-title',
+    notifEmpty: '.v10-notif-pane-empty',
+    notifItem: '.v10-notif-row',
+    notifItemText: '.v10-notif-row-detail',
+    notifItemTime: '.v10-notif-time',
     themeToggle: 'button[title*="Switch to"]',
+    observabilityBtn: 'button[title="Observability"]',
+    settingsBtn: 'button[title="Settings"]',
     rightPanelToggle: 'button[title="Toggle agent panel"]',
     actions: '.v10-header-actions',
   },
@@ -45,6 +51,8 @@ export const sel = {
     section: '.v10-tree-section',
     sectionHeader: '.v10-tree-section-header',
     sectionLabel: '.v10-tree-section-label',
+    hideBtn: '.v10-tree-hide-btn',
+    showHidden: '.v10-tree-show-hidden',
     treeItems: '.v10-tree-items',
     treeItem: '.v10-tree-item',
     itemLabel: '.v10-tree-item-label',
@@ -195,4 +203,77 @@ export const sel = {
   },
 
   resizeHandle: '.v10-resize-handle-h',
+
+  subgraph: {
+    bar: '.v10-subgraph-bar',
+    barLabel: '.v10-subgraph-bar-label',
+    chip: '.v10-subgraph-chip',
+    chipActive: '.v10-subgraph-chip.active',
+    chipIcon: '.v10-subgraph-chip-icon',
+    chipLabel: '.v10-subgraph-chip-label',
+    chipCount: '.v10-subgraph-chip-count',
+    chipRoot: '.v10-subgraph-chip-root',
+    detail: '.v10-subgraph-detail',
+    detailTitle: '.v10-subgraph-detail-title',
+    crossLayerStrip: '[data-testid="cross-layer-strip"]',
+    crossLayerCell: '.v10-subgraph-cross-layer-cell',
+    crossLayerCount: '.v10-subgraph-cross-layer-cell-count',
+    explorerHeader: '.v10-subgraph-explorer-header',
+    explorerTitle: '.v10-subgraph-explorer-title',
+    timeline: '.v10-subgraph-timeline',
+    timelineItem: '.v10-subgraph-timeline-item',
+    badge: '.v10-subgraph-badge',
+  },
+
+  statStrip: {
+    root: '.v10-stat-strip',
+    cell: '.v10-stat-strip-cell',
+    value: '.v10-stat-strip-value',
+    label: '.v10-stat-strip-label',
+    compact: '.v10-stat-strip.compact',
+  },
+
+  layer: {
+    switcher: '.v10-layer-switcher',
+    switchBtn: '.v10-layer-switch-btn',
+    actionBtn: '.v10-layer-action-btn',
+    detail: '.v10-layer-detail',
+    graphCanvas: '[data-testid="rdf-graph"], canvas, .rdf-graph',
+    promoteAll: 'button:has-text("Promote All")',
+    publishAll: 'button:has-text("Publish")',
+  },
+
+  shareModal: {
+    title: '.v10-modal-title',
+    inviteLabel: '.v10-form-label:has-text("Invite Code")',
+    allowedAgents: '.v10-form-label:has-text("Allowed Agents")',
+    pendingRequests: '.v10-form-label:has-text("Pending Join Requests")',
+    copyInviteBtn: 'button:has-text("Copy Invite")',
+  },
+
+  myContextGraphs: {
+    peerGroup: '.v10-peer-group',
+    peerGroupLabel: '.v10-peer-group-label',
+    peerGroupBody: '.v10-peer-group-body',
+  },
+
+  // Settings page (pages/Settings.tsx). It is NOT a `.v10-*` surface — the
+  // rewritten page uses the shared `.card`/`.settings-*` design-system classes.
+  // Opens as a closable center tab from the header gear button.
+  settings: {
+    pageTitle: '.page-title',
+    stack: '.settings-stack',
+    card: '.settings-stack .card',
+    cardTitle: '.settings-stack .card-title',
+    fieldLabel: '.settings-field-label',
+    fieldValue: '.settings-field-value',
+    onlinePill: '.settings-stack .card-body .mono',
+    telemetrySwitch: 'button[role="switch"][aria-label="Share telemetry with the network"]',
+    telemetryDialog: '[role="dialog"][aria-label="Enable Telemetry Streaming?"]',
+    retentionSelect: '#retention-select',
+    retentionConfirm: '[role="group"][aria-label="Confirm retention reduction"]',
+    rpcRevealBtn: 'button[aria-label="Reveal RPC URL"]',
+    rpcRedactBtn: 'button[aria-label="Redact RPC URL"]',
+    shutdownBtn: '.settings-stack .card button',
+  },
 } as const;

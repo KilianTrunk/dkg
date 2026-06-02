@@ -2,7 +2,7 @@ import { join } from 'node:path';
 import { DKGAgentWallet } from '@origintrail-official/dkg-agent';
 import { EVMChainAdapter, NoChainAdapter } from '@origintrail-official/dkg-chain';
 import { TypedEventBus, type Ed25519Keypair } from '@origintrail-official/dkg-core';
-import { ACKCollector, AsyncLiftRunner, DKGPublisher, FileWorkspacePublicSnapshotStore, TripleStoreAsyncLiftPublisher, type AsyncLiftPublishExecutionInput, type AsyncLiftPublisher, type AsyncLiftPublisherRecoveryResult, type LiftJobBroadcast, type LiftJobIncluded, type PublishOptions, type WorkspacePublicSnapshotStore } from '@origintrail-official/dkg-publisher';
+import { ACKCollector, AsyncLiftRunner, DKGPublisher, FileWorkspacePublicSnapshotStore, TripleStoreAsyncLiftPublisher, wrapAsRpcPreconditionIfApplicable, type AsyncLiftPublishExecutionInput, type AsyncLiftPublisher, type AsyncLiftPublisherRecoveryResult, type LiftJobBroadcast, type LiftJobIncluded, type PublishOptions, type WorkspacePublicSnapshotStore } from '@origintrail-official/dkg-publisher';
 import { createTripleStore, type TripleStore } from '@origintrail-official/dkg-storage';
 import { loadNetworkConfig, resolveChainConfig, type DkgConfig } from './config.js';
 import { loadPublisherWallets } from './publisher-wallets.js';
@@ -34,7 +34,9 @@ export async function startPublisherRuntimeIfEnabled(args: {
   keypair: Ed25519Keypair;
   chainBase?: {
     rpcUrl: string;
+    rpcUrls?: string[];
     hubAddress: string;
+    tokenAddress?: string;
     chainId?: string;
   };
   log: (message: string) => void;
@@ -76,7 +78,9 @@ interface PublisherRuntimeBaseArgs {
   store: TripleStore;
   chainBase?: {
     rpcUrl: string;
+    rpcUrls?: string[];
     hubAddress: string;
+    tokenAddress?: string;
     chainId?: string;
   };
   pollIntervalMs?: number;
@@ -111,7 +115,7 @@ export async function createPublisherRuntime(args: {
   // finality but still functions).
   const merged = resolveChainConfig(args.config, network);
   const chainBase = merged?.rpcUrl && merged?.hubAddress
-    ? { rpcUrl: merged.rpcUrl, hubAddress: merged.hubAddress, chainId: merged.chainId }
+    ? { rpcUrl: merged.rpcUrl, rpcUrls: merged.rpcUrls, hubAddress: merged.hubAddress, tokenAddress: merged.tokenAddress, chainId: merged.chainId }
     : undefined;
   return createPublisherRuntimeFromBase({
     dataDir: args.dataDir,
@@ -162,7 +166,9 @@ export async function createPublisherRuntimeFromAgent(args: {
   keypair: Ed25519Keypair;
   chainBase?: {
     rpcUrl: string;
+    rpcUrls?: string[];
     hubAddress: string;
+    tokenAddress?: string;
     chainId?: string;
   };
   pollIntervalMs?: number;
@@ -201,8 +207,10 @@ async function createPublisherRuntimeFromBase(args: PublisherRuntimeBaseArgs): P
     const chain = args.chainBase
       ? new EVMChainAdapter({
           rpcUrl: args.chainBase.rpcUrl,
+          rpcUrls: args.chainBase.rpcUrls,
           privateKey: wallet.privateKey,
           hubAddress: args.chainBase.hubAddress,
+          tokenAddress: args.chainBase.tokenAddress,
           chainId: args.chainBase.chainId,
           allowNoAdminSigner: true,
         })
@@ -262,7 +270,7 @@ async function createPublisherRuntimeFromBase(args: PublisherRuntimeBaseArgs): P
         ? { ...publishOptions, v10ACKProvider }
         : publishOptions;
       // Capability gate: use `isV10Ready()` (the authoritative V10 runtime
-      // signal) rather than probing for `createKnowledgeAssetsV10`. Since the
+      // signal) rather than probing for `createKnowledgeAssets`. Since the
       // interface made the method required, `NoChainAdapter` now implements
       // it as a throwing stub, so a `typeof === 'function'` probe would
       // mis-route no-chain mode into the V10 ACK-gated path and crash.
@@ -309,9 +317,13 @@ function createV10ACKProviderForPublisher(
     chain?: {
       isV10Ready?: () => boolean;
       verifyACKIdentity?: (recoveredAddress: string, claimedIdentityId: bigint) => Promise<boolean>;
+      verifyACKIdentityDetailed?: (
+        recoveredAddress: string,
+        claimedIdentityId: bigint,
+      ) => Promise<{ valid: boolean; reason?: 'key-not-registered' | 'not-in-sharding-table' | 'rpc-error' }>;
       getMinimumRequiredSignatures?: () => Promise<number>;
       getEvmChainId?: () => Promise<bigint>;
-      getKnowledgeAssetsV10Address?: () => Promise<string>;
+      getKnowledgeAssetsLifecycleAddress?: () => Promise<string>;
     };
   }).chain;
   // `isV10Ready()` is the authoritative capability gate — rejects
@@ -322,13 +334,19 @@ function createV10ACKProviderForPublisher(
   // address. Without them the collector cannot build a digest that matches
   // what core-node handlers sign, so refuse to hand back a provider at all.
   if (typeof chain.getEvmChainId !== 'function') return undefined;
-  if (typeof chain.getKnowledgeAssetsV10Address !== 'function') return undefined;
+  if (typeof chain.getKnowledgeAssetsLifecycleAddress !== 'function') return undefined;
 
   const collector = new ACKCollector({
     gossipPublish: transport.gossipPublish,
     sendP2P: transport.sendP2P,
     getConnectedCorePeers: transport.getConnectedCorePeers,
     verifyIdentity: async (recoveredAddress: string, claimedIdentityId: bigint) => chain.verifyACKIdentity!(recoveredAddress, claimedIdentityId),
+    // Prefer the structured verifier when the chain adapter exposes it
+    // so the rejection log can report the specific failing gate.
+    ...(typeof chain.verifyACKIdentityDetailed === 'function' ? {
+      verifyIdentityDetailed: async (recoveredAddress: string, claimedIdentityId: bigint) =>
+        chain.verifyACKIdentityDetailed!(recoveredAddress, claimedIdentityId),
+    } : {}),
     log: transport.log,
   });
 
@@ -375,14 +393,34 @@ function createV10ACKProviderForPublisher(
         'Publishers must pass the V10 flat-KC leaf count computed by V10MerkleTree.',
       );
     }
-    const requiredACKs = typeof chain.getMinimumRequiredSignatures === 'function'
-      ? await chain.getMinimumRequiredSignatures()
-      : undefined;
-    // Both values are guaranteed present here by the adapter-capability
-    // check at the top of this factory — re-resolving on every publish
-    // keeps the provider agnostic to hot adapter swaps.
-    const chainIdBig = await chain.getEvmChainId!();
-    const kav10Address = await chain.getKnowledgeAssetsV10Address!();
+    // PR3 / RC11: wrap each chain pre-flight read in its own try/catch
+    // so a failure is promoted to the typed `RpcPreconditionError`
+    // (rather than the opaque "V10 ACK collection failed" string).
+    // Mirrors the agent-side V10 ACK provider in
+    // `dkg-agent.ts:createV10ACKProvider` so the daemon log surfaces
+    // the same shape regardless of which entry point produced the
+    // publish. `wrapAsRpcPreconditionIfApplicable` is a no-op when
+    // the error is already typed.
+    let requiredACKs: number | undefined;
+    if (typeof chain.getMinimumRequiredSignatures === 'function') {
+      try {
+        requiredACKs = await chain.getMinimumRequiredSignatures();
+      } catch (err) {
+        throw wrapAsRpcPreconditionIfApplicable(err, 'getMinimumRequiredSignatures');
+      }
+    }
+    let chainIdBig: bigint;
+    try {
+      chainIdBig = await chain.getEvmChainId!();
+    } catch (err) {
+      throw wrapAsRpcPreconditionIfApplicable(err, 'getEvmChainId');
+    }
+    let kav10Address: string;
+    try {
+      kav10Address = await chain.getKnowledgeAssetsLifecycleAddress!();
+    } catch (err) {
+      throw wrapAsRpcPreconditionIfApplicable(err, 'getKnowledgeAssetsLifecycleAddress');
+    }
     const result = await collector.collect({
       merkleRoot,
       contextGraphId: cgIdBigInt,

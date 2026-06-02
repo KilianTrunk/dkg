@@ -777,15 +777,21 @@ N1_NOTIFS=$(c "http://127.0.0.1:9201/api/notifications?limit=5")
 N1_JOIN_NOTIF=$(echo "$N1_NOTIFS" | python3 -c '
 import sys,json
 d=json.load(sys.stdin)
+target_cg = sys.argv[1]
 for n in d.get("notifications",[]):
-  if n.get("type")=="join_request":
-    meta=json.loads(n.get("meta","{}")) if n.get("meta") else {}
-    if "'"$CG2_ID"'" in meta.get("contextGraphId",""):
-      print("found")
-      break
+  if n.get("type")!="join_request":
+    continue
+  meta = n.get("meta") or {}
+  if isinstance(meta, str):
+    try: meta = json.loads(meta)
+    except Exception: meta = {}
+  cg = n.get("contextGraphId") or meta.get("contextGraphId") or ""
+  if cg == target_cg:
+    print("found")
+    break
 else:
   print("missing")
-' 2>/dev/null)
+' "$CG2_ID" 2>/dev/null)
 check "Join-request notification created on Node 1" "$N1_JOIN_NOTIF" "found"
 
 echo "--- 13h: Node 1 approves Node 4 ---"
@@ -974,7 +980,7 @@ echo "--- 15a: Publish SWM data to VM on Node 1 (promote-test project) ---"
 PUBLISH=$(c -X POST "http://127.0.0.1:9201/api/shared-memory/publish" \
   -d "{\"contextGraphId\":\"$CG3_ID\",\"selection\":\"all\",\"clearAfter\":false}")
 PUB_STATUS=$(json_get "$PUBLISH" status)
-PUB_KCID=$(json_get "$PUBLISH" kcId)
+PUB_KCID=$(json_get "$PUBLISH" kaId)
 PUB_KAS=$(echo "$PUBLISH" | python3 -c '
 import sys,json
 try:
@@ -984,11 +990,11 @@ try:
 except: print("ERR")
 ' 2>/dev/null)
 PUB_TX=$(json_get "$PUBLISH" txHash)
-echo "  Publish result: status=$PUB_STATUS kcId=$PUB_KCID kas=$PUB_KAS txHash=${PUB_TX:0:20}..."
+echo "  Publish result: status=$PUB_STATUS kaId=$PUB_KCID kas=$PUB_KAS txHash=${PUB_TX:0:20}..."
 if [[ "$PUB_STATUS" == "published" || "$PUB_STATUS" == "created" || "$PUB_STATUS" == "mined" ]]; then
   ok "SWM published to VM (status=$PUB_STATUS, $PUB_KAS knowledge asset(s))"
 elif [[ "$PUB_KCID" != "__NONE__" && "$PUB_KCID" != "__ERR__" ]]; then
-  ok "SWM publish completed (kcId=$PUB_KCID, status=$PUB_STATUS)"
+  ok "SWM publish completed (kaId=$PUB_KCID, status=$PUB_STATUS)"
 else
   fail "SWM publish failed: $(echo "$PUBLISH" | head -c 300)"
 fi
@@ -1077,9 +1083,9 @@ except: print("ERR")
 if [[ "$PUB_CG1_STATUS" == "published" || "$PUB_CG1_STATUS" == "created" || "$PUB_CG1_STATUS" == "mined" ]]; then
   ok "CG1 SWM published to VM ($PUB_CG1_KAS KAs, status=$PUB_CG1_STATUS)"
 else
-  PUB_CG1_KCID=$(json_get "$PUB_CG1" kcId)
+  PUB_CG1_KCID=$(json_get "$PUB_CG1" kaId)
   if [[ "$PUB_CG1_KCID" != "__NONE__" && "$PUB_CG1_KCID" != "__ERR__" ]]; then
-    ok "CG1 SWM publish completed (kcId=$PUB_CG1_KCID, status=$PUB_CG1_STATUS)"
+    ok "CG1 SWM publish completed (kaId=$PUB_CG1_KCID, status=$PUB_CG1_STATUS)"
   else
     fail "CG1 SWM publish failed: $(echo "$PUB_CG1" | head -c 300)"
   fi

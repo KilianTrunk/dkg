@@ -8,6 +8,9 @@ import {
   fetchOperationsWithPhases, fetchOperation, fetchNodeLog,
   fetchOperationStats, fetchStatus, fetchErrorHotspots, fetchFailedOperations,
   fetchSuccessRates, fetchPerTypeStats, fetchMetricsHistory,
+  fetchReplicationSummary, fetchReplicationPerCg, fetchReplicationTimeline,
+  fetchReplicationCursors, fetchReplicationEvents,
+  type ReplicationPerCgRow,
 } from '../api.js';
 // P-1 review: shared phase palette — single source of truth for
 // phase → colour AND the Operations legend. Previously Dashboard
@@ -60,8 +63,8 @@ const OP_TYPE_COLORS: Record<string, string> = {
 };
 
 const OP_TYPE_DESCRIPTIONS: Record<string, string> = {
-  publish:        'Publish a Knowledge Collection on-chain to a context graph',
-  publishFromSWM: 'Publish a Knowledge Collection derived from Shared Working Memory',
+  publish:        'Publish a Knowledge Asset on-chain to a context graph',
+  publishFromSWM: 'Publish a Knowledge Asset derived from Shared Working Memory',
   update:         'Update an existing Knowledge Asset on-chain',
   'ka-update':    'Incremental Knowledge Asset update (ka-update path)',
   query:          'Run a SPARQL query against the knowledge graph',
@@ -153,17 +156,206 @@ function PeriodSelect({ value, onChange }: { value: string; onChange: (v: string
 }
 
 export function ObservabilitySection() {
-  const [tab, setTab] = useState<'operations' | 'hardware' | 'logs' | 'errors'>('operations');
+  const [tab, setTab] = useState<'operations' | 'replication' | 'hardware' | 'logs' | 'errors'>('operations');
 
   return (
     <div>
       <div className="tab-group" style={{ marginBottom: 16 }}>
         <button className={`tab-item ${tab === 'operations' ? 'active' : ''}`} onClick={() => setTab('operations')}>All Operations</button>
+        <button className={`tab-item ${tab === 'replication' ? 'active' : ''}`} onClick={() => setTab('replication')}>Replication</button>
         <button className={`tab-item ${tab === 'hardware' ? 'active' : ''}`} onClick={() => setTab('hardware')}>Hardware</button>
         <button className={`tab-item ${tab === 'logs' ? 'active' : ''}`} onClick={() => setTab('logs')}>Logs</button>
         <button className={`tab-item ${tab === 'errors' ? 'active' : ''}`} onClick={() => setTab('errors')}>Errors</button>
       </div>
-      {tab === 'operations' ? <OperationsTabWithStats /> : tab === 'hardware' ? <HardwareTab /> : tab === 'errors' ? <HealthTab /> : <LogsTab />}
+      {tab === 'operations' ? <OperationsTabWithStats /> : tab === 'replication' ? <ReplicationTab /> : tab === 'hardware' ? <HardwareTab /> : tab === 'errors' ? <HealthTab /> : <LogsTab />}
+    </div>
+  );
+}
+
+/* ================================================================
+   Replication Tab (chain-driven VM reconciliation) — Phase F
+   ================================================================ */
+
+function fmtMs(ms: number | null | undefined): string {
+  if (ms == null) return '—';
+  if (ms < 1000) return `${ms}ms`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
+  return `${(ms / 60_000).toFixed(1)}m`;
+}
+
+function ReplicationTab() {
+  const [period, setPeriod] = useState('24h');
+  const [selectedCg, setSelectedCg] = useState<string | null>(null);
+  const periodMs = periodToMs(period);
+
+  const { data: summary } = useFetch(() => fetchReplicationSummary(periodMs), [periodMs], 5_000);
+  const { data: perCgData } = useFetch(() => fetchReplicationPerCg(periodMs), [periodMs], 5_000);
+  const { data: cursorsData } = useFetch(() => fetchReplicationCursors(), [], 5_000);
+  const { data: timelineData } = useFetch(
+    () => fetchReplicationTimeline({ periodMs, bucketMs: Math.max(60_000, Math.floor(periodMs / 48)), cg: selectedCg ?? undefined }),
+    [periodMs, selectedCg],
+    5_000,
+  );
+  const { data: eventsData } = useFetch(
+    () => (selectedCg ? fetchReplicationEvents(selectedCg, 100) : Promise.resolve(null)),
+    [selectedCg],
+    5_000,
+  );
+
+  const perCg: ReplicationPerCgRow[] = perCgData?.rows ?? [];
+  const cursors = cursorsData?.cursors ?? [];
+  const buckets = (timelineData?.buckets ?? []).map((b) => ({ ...b, t: formatTime(b.bucket) }));
+  const events = eventsData?.events ?? [];
+
+  const successPct = summary?.successRate != null ? `${(summary.successRate * 100).toFixed(0)}%` : '—';
+
+  return (
+    <div>
+      <div className="filters" style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', marginBottom: 16 }}>
+        <PeriodSelect value={period} onChange={setPeriod} />
+        <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+          Chain-anchored publishes reconciled into Verified Memory. Auto-refreshes every 5s.
+        </span>
+      </div>
+
+      {/* KPI cards */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 12, marginBottom: 16 }}>
+        <div className="card" style={{ padding: 16 }}>
+          <div className="card-title">Promotions</div>
+          <div style={{ fontSize: 28, fontWeight: 600 }}>{summary?.promotes ?? '—'}</div>
+          <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>landed in VM this period</div>
+        </div>
+        <div className="card" style={{ padding: 16 }}>
+          <div className="card-title">Success rate</div>
+          <div style={{ fontSize: 28, fontWeight: 600 }}>{successPct}</div>
+          <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>promote / (promote + defer)</div>
+        </div>
+        <div className="card" style={{ padding: 16 }}>
+          <div className="card-title">Promotion latency</div>
+          <div style={{ fontSize: 28, fontWeight: 600 }}>{fmtMs(summary?.latencyP50Ms)}</div>
+          <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>P50 · P95 {fmtMs(summary?.latencyP95Ms)}</div>
+        </div>
+        <div className="card" style={{ padding: 16 }}>
+          <div className="card-title">Active fetches</div>
+          <div style={{ fontSize: 28, fontWeight: 600 }}>{summary?.fetches ?? '—'}</div>
+          <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>core-first catch-up pulls</div>
+        </div>
+      </div>
+
+      {/* Timeline */}
+      <div className="card" style={{ padding: 16, marginBottom: 16 }}>
+        <div className="card-title" style={{ marginBottom: 8 }}>
+          Reconciliation timeline{selectedCg ? ` — ${selectedCg}` : ' — all CGs'}
+        </div>
+        {buckets.length === 0 ? (
+          <div className="empty-state empty-state--compact">
+            <div className="empty-state-title">No reconciliation activity</div>
+            <div className="empty-state-desc">No chain-driven VM promotions recorded in this period.</div>
+          </div>
+        ) : (
+          <ResponsiveContainer width="100%" height={220}>
+            <AreaChart data={buckets}>
+              <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
+              <XAxis dataKey="t" tick={{ fontSize: 11 }} />
+              <YAxis allowDecimals={false} tick={{ fontSize: 11 }} />
+              <Tooltip />
+              <Legend />
+              <Area type="monotone" dataKey="promotes" stackId="1" stroke="#22c55e" fill="#22c55e" fillOpacity={0.5} name="promotes" />
+              <Area type="monotone" dataKey="fetches" stackId="1" stroke="#3b82f6" fill="#3b82f6" fillOpacity={0.4} name="fetches" />
+              <Area type="monotone" dataKey="defers" stackId="1" stroke="#f59e0b" fill="#f59e0b" fillOpacity={0.4} name="defers" />
+            </AreaChart>
+          </ResponsiveContainer>
+        )}
+      </div>
+
+      {/* Cursor inspector */}
+      <div className="card" style={{ padding: 16, marginBottom: 16 }}>
+        <div className="card-title" style={{ marginBottom: 8 }}>Cursor inspector</div>
+        <p style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 12 }}>
+          Per-CG persisted watermark (contiguous registration ordinal promoted to VM) vs. last observed chain head.
+        </p>
+        {cursors.length === 0 ? (
+          <div className="empty-state empty-state--compact"><div className="empty-state-title">No subscriptions</div></div>
+        ) : (
+          <table className="data-table">
+            <thead><tr><th>Context graph</th><th>On-chain id</th><th>Role</th><th>Watermark</th><th>Chain head</th><th>Lag</th><th>Last event</th></tr></thead>
+            <tbody>
+              {cursors.map((c) => {
+                const wm = c.last_reconciled_ordinal ?? 0;
+                const head = c.last_head ?? null;
+                const lag = head != null ? Math.max(0, head - wm) : null;
+                return (
+                  <tr key={c.context_graph_id}>
+                    <td className="mono">{c.context_graph_id}</td>
+                    <td className="mono">{c.on_chain_id ?? '—'}</td>
+                    <td>{c.core_hosted ? <span className="badge badge-info" title="Core hosts this public CG; fills its own gaps from chain (Phase D)">host</span> : <span className="badge">member</span>}</td>
+                    <td>{wm}</td>
+                    <td>{head ?? '—'}</td>
+                    <td>{lag == null ? '—' : <span className={`badge ${lag === 0 ? 'badge-success' : 'badge-error'}`}>{lag}</span>}</td>
+                    <td>{c.last_event_ts ? formatTime(c.last_event_ts) : '—'}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      {/* Per-CG activity */}
+      <div className="card" style={{ padding: 16, marginBottom: 16 }}>
+        <div className="card-title" style={{ marginBottom: 8 }}>Per-CG activity</div>
+        <p style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 12 }}>Click a row to scope the timeline + open its event stream.</p>
+        {perCg.length === 0 ? (
+          <div className="empty-state empty-state--compact"><div className="empty-state-title">No activity in this period</div></div>
+        ) : (
+          <table className="data-table">
+            <thead><tr><th>Context graph</th><th>Promotes</th><th>Fetches</th><th>Defers</th><th>Cursor moves</th><th>Watermark</th><th>Last event</th></tr></thead>
+            <tbody>
+              {perCg.map((r) => (
+                <tr
+                  key={r.context_graph_id}
+                  onClick={() => setSelectedCg(selectedCg === r.context_graph_id ? null : r.context_graph_id)}
+                  style={{ cursor: 'pointer', background: selectedCg === r.context_graph_id ? 'var(--bg-hover, rgba(255,255,255,0.04))' : undefined }}
+                >
+                  <td className="mono">{r.context_graph_id}</td>
+                  <td>{r.promotes}</td>
+                  <td>{r.fetches}</td>
+                  <td>{r.defers}</td>
+                  <td>{r.cursor_advances}</td>
+                  <td>{r.last_watermark ?? '—'}</td>
+                  <td>{r.last_event_ts ? formatTime(r.last_event_ts) : '—'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      {/* Event stream drawer */}
+      {selectedCg && (
+        <div className="card" style={{ padding: 16 }}>
+          <div className="card-title" style={{ marginBottom: 8 }}>Event stream — {selectedCg}</div>
+          {events.length === 0 ? (
+            <div className="empty-state empty-state--compact"><div className="empty-state-title">No events</div></div>
+          ) : (
+            <table className="data-table">
+              <thead><tr><th>Time</th><th>Action</th><th>Ordinal</th><th>Cursor</th><th>UAL</th><th>Detail</th></tr></thead>
+              <tbody>
+                {events.map((e, i) => (
+                  <tr key={i}>
+                    <td>{formatTime(e.ts)}</td>
+                    <td><span className={`badge ${e.action === 'promote' ? 'badge-success' : e.action === 'defer' ? 'badge-error' : ''}`}>{e.action}</span></td>
+                    <td>{e.ordinal ?? '—'}</td>
+                    <td className="mono">{e.from_watermark != null && e.to_watermark != null ? `${e.from_watermark}->${e.to_watermark}` : '—'}</td>
+                    <td className="mono" style={{ maxWidth: 280, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={e.ual ?? ''}>{e.ual ?? '—'}</td>
+                    <td className="mono">{e.detail ?? '—'}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -879,7 +1071,7 @@ function OperationsTab() {
                   onClick={() => setSelectedOp(op.operation_id)}
                   style={{ cursor: 'pointer', background: selectedOp === op.operation_id ? 'rgba(59,130,246,.1)' : undefined }}
                 >
-                  <td>{formatTime(op.started_at)}</td>
+                  <td title={op.started_at ? new Date(op.started_at).toLocaleString() : undefined}>{formatTime(op.started_at)}</td>
                   <td><span className="badge" title={OP_TYPE_DESCRIPTIONS[op.operation_name] ?? ''} style={{ background: `${OP_TYPE_COLORS[op.operation_name] ?? 'var(--text-muted)'}22`, color: OP_TYPE_COLORS[op.operation_name] ?? 'var(--text-muted)' }}>{op.operation_name}</span></td>
                   <td><StatusBadge status={op.status} /></td>
                   <td><MiniGantt phases={op.phases} totalMs={op.duration_ms} /></td>
@@ -1145,8 +1337,11 @@ function OperationDetail({ op, logs, phases, explorerUrl, onBack }: {
                     <StatusBadge status={p.status} />
                     <span style={{ fontSize: 11, color: 'var(--text-dim)', fontFamily: "'JetBrains Mono', monospace" }}>{formatDuration(p.duration_ms)}</span>
                     {desc && <span style={{ fontSize: 10, color: 'var(--text-dim)', fontStyle: 'italic', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{desc}</span>}
-                    <span style={{ fontSize: 10, color: 'var(--text-dim)', marginLeft: 'auto', flexShrink: 0 }}>
-                      {p.started_at ? new Date(p.started_at).toLocaleTimeString() : ''}
+                    <span
+                      style={{ fontSize: 10, color: 'var(--text-dim)', marginLeft: 'auto', flexShrink: 0 }}
+                      title={p.started_at ? new Date(p.started_at).toLocaleString() : undefined}
+                    >
+                      {p.started_at ? formatTime(p.started_at) : ''}
                     </span>
                     {p.status === 'error' && p.details && (
                       <span style={{ fontSize: 10, color: 'var(--red)', maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={p.details}>

@@ -42,6 +42,11 @@
     "type": "error"
   },
   {
+    "inputs": [],
+    "name": "EmptyOperationalWallets",
+    "type": "error"
+  },
+  {
     "inputs": [
       {
         "internalType": "uint72",
@@ -415,11 +420,6 @@
         "internalType": "bytes",
         "name": "nodeId",
         "type": "bytes"
-      },
-      {
-        "internalType": "uint16",
-        "name": "initialOperatorFee",
-        "type": "uint16"
       }
     ],
     "name": "recreateProfile",

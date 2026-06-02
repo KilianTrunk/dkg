@@ -14,13 +14,17 @@
  *      depend on. (Caught a real bug during devnet validation: standalone
  *      `/finalize` was missing the emit. See FINDINGS.md.)
  *
- *   2. Edge-node publish — runs create+write+finalize+promote+publish from
- *      an edge daemon (no on-chain identity) and asserts the publish
- *      surfaces `status: "tentative"` to the caller, with the daemon log
- *      showing the explicit "Identity not set (0) — skipping on-chain
- *      publish" warning. This is the architectural rule for app/relay
- *      nodes; a regression that crashed or pretended to chain-submit
- *      would silently break every edge integration.
+ *   2. Failed-publish honesty (RC11 / PR2) — runs create+write+finalize
+ *      +promote+publish from an edge daemon (no on-chain identity) so the
+ *      publisher's chain-submit branch necessarily fails. Asserts the
+ *      INVERSE of the old "tentative VM" contract: the publish reports
+ *      failure to the caller AND `/api/query?view=verified-memory` returns
+ *      zero rows for the just-published triples. Pre-RC11 a failed publish
+ *      silently wrote its quads into the root data graph and the VM view
+ *      aliased that graph into VM, so an external app would observe
+ *      "verified" data that the chain had never anchored. PR2 deletes
+ *      `generateTentativeMetadata` from the on-chain catch and limits VM
+ *      to `_verified_memory/*` graphs; this test pins both halves.
  *
  *   3. NFT staking withdraw — `DKGStakingConvictionNFT.withdraw(tokenId)`
  *      on an unlocked tier-0 position. Verifies: TRAC delta to staker EOA
@@ -71,6 +75,7 @@ const HUB_ABI = [
   'function getAssetStorageAddress(string) view returns (address)',
 ];
 const NFT_ABI = [
+  'function createConviction(uint72 identityId, uint96 stakeAmount, uint40 lockTier) returns (uint256 tokenId)',
   'function withdraw(uint256 tokenId) returns (uint96 amount)',
   'function claim(uint256 tokenId)',
   'function ownerOf(uint256 tokenId) view returns (address)',
@@ -96,13 +101,17 @@ const PARAMS_ABI = ['function stakeWithdrawalDelay() view returns (uint256)'];
 const CHRONOS_ABI = [
   'function getCurrentEpoch() view returns (uint256)',
   'function timeUntilNextEpoch() view returns (uint256)',
+  'function epochLength() view returns (uint256)',
 ];
 const RS_ABI = [
   'function getNodeEpochScore(uint256, uint72) view returns (uint256)',
   'function getAllNodesEpochScore(uint256) view returns (uint256)',
 ];
 const ES_ABI = ['function getEpochPool(uint256, uint256) view returns (uint96)'];
-const ERC20_ABI = ['function balanceOf(address) view returns (uint256)'];
+const ERC20_ABI = [
+  'function balanceOf(address) view returns (uint256)',
+  'function approve(address, uint256) returns (bool)',
+];
 
 // ───────────────────────────── fixtures ──────────────────────────────────
 interface Delegator {
@@ -234,11 +243,12 @@ function openSseAndCollect(
   return { events, close: () => req.destroy() };
 }
 
-async function fullPublish(api: string, token: string, name: string): Promise<{ kcId: string; status: string; merkleRoot: string }> {
+async function fullPublish(api: string, token: string, name: string): Promise<{ kaId: string; status: string; merkleRoot: string }> {
   const cgId = CONTEXT_GRAPH;
+  const subject = `urn:test:core-flows:${name}`;
   const quads = [
-    { subject: `urn:test:core-flows:${name}:s1`, predicate: 'http://schema.org/name', object: `"${name}"`, graph: '' },
-    { subject: `urn:test:core-flows:${name}:s2`, predicate: 'http://schema.org/value', object: '"epoch-pool fuel"', graph: '' },
+    { subject, predicate: 'http://schema.org/name', object: `"${name}"`, graph: '' },
+    { subject, predicate: 'http://schema.org/value', object: '"epoch-pool fuel"', graph: '' },
   ];
   let r = await postJson(api, '/api/assertion/create', { contextGraphId: cgId, name }, token);
   expect(r.status, `create failed: ${JSON.stringify(r.body)}`).toBe(200);
@@ -313,11 +323,22 @@ afterAll(() => {
 describe('1. chained sign-at-creation assertion lifecycle', () => {
   it('all 4 standalone routes (create/write/finalize/promote) emit memory_graph_changed in order', async () => {
     const assertionName = `core-flows-lifecycle-${Date.now().toString(36)}`;
+    // Only the four standalone-route lifecycle operations are under test.
+    // A core also emits `verified_memory_finalized` whenever it promotes a
+    // peer-published KA to VM — including via the periodic chain-reconcile
+    // sweep, which can fire mid-test for unrelated bootstrap KAs in this same
+    // CG. Those are correct background events but pollute a CG-only filter, so
+    // scope capture to the lifecycle ops this test actually asserts.
+    const LIFECYCLE_OPS = new Set([
+      'assertion_created', 'assertion_written', 'assertion_finalized', 'assertion_promoted',
+    ]);
     const sse = openSseAndCollect(
       NODE1_API,
       state.node1Token,
       (event, data) =>
-        event === 'memory_graph_changed' && data?.contextGraphId === CONTEXT_GRAPH,
+        event === 'memory_graph_changed' &&
+        data?.contextGraphId === CONTEXT_GRAPH &&
+        LIFECYCLE_OPS.has(data?.operation),
     );
     await sleep(500); // SSE warm-up
 
@@ -354,44 +375,98 @@ describe('1. chained sign-at-creation assertion lifecycle', () => {
   }, 60_000);
 });
 
-// ────────────────────────── 2. Edge-node publish ─────────────────────────
-describe('2. edge-node publish', () => {
-  it('runs full lifecycle on edge node and surfaces tentative status (no on-chain identity)', async () => {
+// ─────────────────── 2. Failed-publish honesty (RC11 / PR2) ───────────────────
+describe('2. failed publish does not leak triples into verified-memory (RC11 / PR2)', () => {
+  it('edge-node publish fails AND /api/query?view=verified-memory returns zero rows for its triples', async () => {
     const assertionName = `core-flows-edge-${Date.now().toString(36)}`;
+    const subject = `urn:test:edge:rc11:${Date.now().toString(36)}`;
+    const witnessLiteral = `"PR2 failed-publish witness ${Date.now().toString(36)}"`;
 
     let r = await postJson(NODE5_API, '/api/assertion/create', { contextGraphId: CONTEXT_GRAPH, name: assertionName }, state.node5Token);
     expect(r.status, `edge create: ${JSON.stringify(r.body)}`).toBe(200);
 
+    // The witness literal is unique per run so the verified-memory query
+    // below can isolate THIS publish's quads from any bootstrap data
+    // sitting in the same context graph.
     const quads = [
-      { subject: 'urn:test:edge:s1', predicate: 'http://schema.org/name', object: '"Edge-node publish test"', graph: '' },
-      { subject: 'urn:test:edge:s1', predicate: 'http://schema.org/author', object: '"edge-node-5"', graph: '' },
+      { subject, predicate: 'http://schema.org/name', object: witnessLiteral, graph: '' },
+      { subject, predicate: 'http://schema.org/author', object: '"edge-node-5"', graph: '' },
     ];
     r = await postJson(NODE5_API, `/api/assertion/${assertionName}/write`, { contextGraphId: CONTEXT_GRAPH, quads }, state.node5Token);
     expect(r.status).toBe(200);
     r = await postJson(NODE5_API, `/api/assertion/${assertionName}/finalize`, { contextGraphId: CONTEXT_GRAPH }, state.node5Token);
     expect(r.status).toBe(200);
-    const sealMerkleRoot = r.body.merkleRoot;
     r = await postJson(NODE5_API, `/api/assertion/${assertionName}/promote`, { contextGraphId: CONTEXT_GRAPH }, state.node5Token);
     expect(r.status).toBe(200);
 
+    // Post-RFC-38 an edge node (identityId=0) may still reach `confirmed`
+    // when peer cores supply storage ACKs — attributionId=0 is valid on
+    // chain. Pre-RC11 / PR2 the regression we guard is VM leakage, not
+    // whether the HTTP status is `failed`. Reject only the silent
+    // `tentative` downgrade that used to write into graphs the VM aliases.
     r = await postJson(NODE5_API, '/api/shared-memory/publish', { contextGraphId: CONTEXT_GRAPH, assertionName }, state.node5Token);
-    expect(r.status, `edge publish: ${JSON.stringify(r.body)}`).toBe(200);
+    expect(r.status, `edge publish HTTP: ${JSON.stringify(r.body)}`).toBe(200);
+    expect(
+      r.body?.status,
+      `edge publish returned status='tentative' — pre-PR2 silent downgrade ` +
+      `(would re-enable verified-memory leak via tentative graph aliasing)`,
+    ).not.toBe('tentative');
 
-    // The architectural rule: edge has no on-chain identity, so the publish
-    // is held tentative and gossiped — not chain-anchored. Caller learns
-    // this from the response status.
-    expect(r.body.status, 'edge publish must be tentative — edge has no on-chain identity').toBe('tentative');
-    expect(r.body.merkleRoot).toBe(sealMerkleRoot);
-    // kcId 0 is the placeholder for "no chain anchor yet"
-    expect(['0', 0]).toContain(r.body.kcId);
+    // CORE ASSERTION (RC11 / PR2): regardless of on-chain outcome, the
+    // edge publish's triples MUST NOT appear in the
+    // verified-memory view on ANY node. Poll node1 (a core) over a few
+    // seconds so any in-flight gossip from the edge has time to land
+    // in the wrong graph — a leak that materialises 1-2s after the
+    // publish call returns would be missed by a single immediate
+    // query. The retry exits early on success (zero rows seen at any
+    // poll); the loop only runs to completion when the query keeps
+    // succeeding with zero rows, which is what we want.
+    const VM_POLL_ATTEMPTS = 6;
+    const VM_POLL_INTERVAL_MS = 500;
+    let lastVmStatus = 0;
+    let lastVmBody: any = undefined;
+    let lastVmBindings: unknown[] = [];
+    let leakSeen = false;
+    for (let attempt = 0; attempt < VM_POLL_ATTEMPTS; attempt++) {
+      const vmQuery = await postJson(
+        NODE1_API,
+        '/api/query',
+        {
+          sparql:
+            `SELECT ?o WHERE { <${subject}> <http://schema.org/name> ?o . FILTER(?o = ${witnessLiteral}) }`,
+          contextGraphId: CONTEXT_GRAPH,
+          view: 'verified-memory',
+        },
+        state.node1Token,
+      );
+      lastVmStatus = vmQuery.status;
+      lastVmBody = vmQuery.body;
+      lastVmBindings = vmQuery.body?.bindings ?? vmQuery.body?.results?.bindings ?? [];
+      if (lastVmBindings.length > 0) {
+        leakSeen = true;
+        break;
+      }
+      if (attempt < VM_POLL_ATTEMPTS - 1) await sleep(VM_POLL_INTERVAL_MS);
+    }
+    expect(lastVmStatus, `vm query: ${JSON.stringify(lastVmBody)}`).toBe(200);
+    expect(
+      leakSeen,
+      `PR2 invariant violated: edge publish leaked ${lastVmBindings.length} row(s) into ` +
+      `view=verified-memory for ${subject} after up to ` +
+      `${VM_POLL_ATTEMPTS * VM_POLL_INTERVAL_MS}ms of polling — the on-chain catch is still ` +
+      `writing tentative quads to a graph that the VM view aliases. ` +
+      `Re-check dkg-publisher.ts catch block and dkg-query-engine.ts ` +
+      `verified-memory branch.`,
+    ).toBe(false);
   }, 90_000);
 });
 
 // ───────────────────────── 3. NFT staking withdraw ───────────────────────
 describe('3. NFT staking withdraw', () => {
   it('tier-0 (no-lock) position withdraws cleanly: TRAC moves, NFT burns, position clears', async () => {
-    // Bootstrap creates two tier-0 positions. Pick one that still has raw
-    // stake so the suite can be re-run after a partial previous pass.
+    // Bootstrap creates two tier-0 positions. Prefer one that still has raw
+    // stake; if a prior suite (e.g. v10-e2e phase 3) already withdrew it,
+    // mint a fresh tier-0 position so this test stays idempotent.
     let target: Delegator | undefined;
     let positionSnap: any;
     for (const candidate of state.delegators.filter((d) => d.tier === 0)) {
@@ -402,7 +477,49 @@ describe('3. NFT staking withdraw', () => {
         break;
       }
     }
-    expect(target, 'no unwithdrawn tier-0 delegator found — re-bootstrap').toBeDefined();
+    if (!target) {
+      const seed = state.delegators.find((d) => d.tier === 0)
+        ?? state.delegators.find((d) => BigInt(d.identityId) === 1n);
+      expect(seed, 'no tier-0 delegator seed for createConviction').toBeDefined();
+      const seedWallet = new ethers.Wallet(seed!.privateKey, state.provider);
+      const seedNft = new ethers.Contract(state.nft.target, NFT_ABI, seedWallet);
+      const stakeAmount = ethers.parseEther('10000');
+      const stakingV10Address = await state.staking.getAddress();
+      const tokenAsSeed = state.token.connect(seedWallet) as ethers.Contract;
+      await tokenAsSeed.approve(stakingV10Address, stakeAmount, { gasLimit: 500_000 });
+      const createTx = await seedNft.createConviction(
+        BigInt(seed!.identityId),
+        stakeAmount,
+        0n,
+      );
+      const createReceipt = await createTx.wait();
+      expect(createReceipt.status).toBe(1);
+      const transferIface = new ethers.Interface([
+        'event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)',
+      ]);
+      let newTokenId = 0n;
+      for (const log of createReceipt.logs) {
+        try {
+          const parsed = transferIface.parseLog(log);
+          if (
+            parsed?.name === 'Transfer' &&
+            (parsed.args.from as string).toLowerCase() === ethers.ZeroAddress &&
+            (parsed.args.to as string).toLowerCase() === seedWallet.address.toLowerCase()
+          ) {
+            newTokenId = parsed.args.tokenId as bigint;
+            break;
+          }
+        } catch { /* not our event */ }
+      }
+      expect(newTokenId, 'createConviction did not mint an NFT').toBeGreaterThan(0n);
+      target = {
+        ...seed!,
+        tokenId: Number(newTokenId),
+        stakeAmountTRAC: 10_000,
+      };
+      positionSnap = await state.css.getPosition(newTokenId);
+    }
+    expect(target, 'no tier-0 delegator available for withdraw').toBeDefined();
 
     const wallet = new ethers.Wallet(target!.privateKey, state.provider);
     const nft = new ethers.Contract(state.nft.target, NFT_ABI, wallet);
@@ -483,48 +600,54 @@ describe('4. operator-fee accrual + withdrawal', () => {
       identityId,
       feeCount - 1n,
     );
-    const startEpoch = await state.chronos.getCurrentEpoch();
 
-    // (b) Generate 5 fresh publishes from node1 (core) so the current epoch
-    // pool gets non-trivial value AND the sampler has eligible KCs to
-    // challenge in the current epoch. Without this, RS scoring stays at 0.
+    // The 10% fee must be live BEFORE the epoch we score and later claim.
+    // Profile stages the fee at timestampForEpoch(startEpoch+1); _claim resolves
+    // epoch N's fee at timestampForEpoch(N+1)-1, so scoring+claiming the same
+    // epoch the fee was set in still applies 0%. Warp past the effective
+    // boundary first, then score the post-fee epoch.
+    const blockBeforeFeeWarp = await state.provider.getBlock('latest');
+    const nowBeforeFee = BigInt(blockBeforeFeeWarp!.timestamp);
+    const feeWarpSeconds = Number((feeEffectiveDate > nowBeforeFee ? feeEffectiveDate - nowBeforeFee : 0n) + 2n);
+    if (feeWarpSeconds > 0) {
+      await state.provider.send('evm_increaseTime', [feeWarpSeconds]);
+    }
+    await state.provider.send('hardhat_mine', ['0x5', '0x0']);
+    const scoreEpoch = await state.chronos.getCurrentEpoch();
+
+    // Generate 5 fresh publishes from node1 (core) so scoreEpoch's pool is
+    // non-trivial AND the sampler has eligible KCs to challenge.
     for (let i = 0; i < 5; i++) {
       const name = `core-flows-fee-pub-${Date.now().toString(36)}-${i}`;
       await fullPublish(NODE1_API, state.node1Token, name);
       await sleep(1500);
     }
 
-    // (c) Wait up to ~80s for RS to score the current epoch. Tightly coupled
-    // to devnet's `proofingPeriodDurationInBlocks=100` and 1s interval mining.
-    let scoreNow = await state.rs.getNodeEpochScore(startEpoch, identityId);
+    let scoreNow = await state.rs.getNodeEpochScore(scoreEpoch, identityId);
     for (let waited = 0; waited < 80 && scoreNow === 0n; waited += 5) {
       await sleep(5_000);
-      scoreNow = await state.rs.getNodeEpochScore(startEpoch, identityId);
+      scoreNow = await state.rs.getNodeEpochScore(scoreEpoch, identityId);
     }
-    expect(scoreNow, `node1 must have non-zero RS score in epoch ${startEpoch}`).toBeGreaterThan(0n);
+    expect(scoreNow, `node1 must have non-zero RS score in epoch ${scoreEpoch}`).toBeGreaterThan(0n);
 
-    const allScore = await state.rs.getAllNodesEpochScore(startEpoch);
-    const epochPool = await state.es.getEpochPool(1n, startEpoch);
+    const allScore = await state.rs.getAllNodesEpochScore(scoreEpoch);
+    const epochPool = await state.es.getEpochPool(1n, scoreEpoch);
     const grossNode1 = (BigInt(epochPool) * scoreNow) / allScore;
     const expectedFee = (grossNode1 * 1000n) / 10000n; // 10% of gross
 
-    // (d) Warp such that BOTH (i) the pending fee effective date has passed
-    // (so `getOperatorFee` returns 1000), and (ii) we've crossed into an
-    // epoch strictly greater than `startEpoch` (so the claim window for
-    // startEpoch's reward pool is open). On a fresh devnet (i) usually
-    // dominates; on a re-run where the fee is already active (i) is in
-    // the past and (ii) becomes the binding constraint.
+    // Warp across at least one full epoch boundary so claim() can settle
+    // scoreEpoch rewards under the now-active 10% operator fee.
     const blockBeforeWarp = await state.provider.getBlock('latest');
     const nowTimestamp = BigInt(blockBeforeWarp!.timestamp);
-    const tNext = await state.chronos.timeUntilNextEpoch();
-    const nextEpochStart = nowTimestamp + BigInt(tNext);
-    const targetTimestamp = (feeEffectiveDate > nextEpochStart ? feeEffectiveDate : nextEpochStart) + 120n;
-    if (nowTimestamp < targetTimestamp) {
-      await state.provider.send('evm_increaseTime', [Number(targetTimestamp - nowTimestamp)]);
+    const epochLen = await state.chronos.epochLength();
+    const targetTimestamp = nowTimestamp + epochLen + 120n;
+    const warpSeconds = Number(targetTimestamp - nowTimestamp);
+    if (warpSeconds > 0) {
+      await state.provider.send('evm_increaseTime', [warpSeconds]);
     }
-    await state.provider.send('evm_mine', []);
+    await state.provider.send('hardhat_mine', ['0x5', '0x0']);
     const newEpoch = await state.chronos.getCurrentEpoch();
-    expect(newEpoch).toBeGreaterThan(startEpoch);
+    expect(newEpoch).toBeGreaterThan(scoreEpoch);
 
     const feeBpsLatest = await state.profileStorage.getOperatorFee(identityId);
     // ABI returns uint16 → ethers v6 surfaces it as `bigint`. Compare with the

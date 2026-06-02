@@ -22,6 +22,23 @@ export const SYNC_PROTOCOL_CHECK_ATTEMPTS = 3;
 export const SYNC_PROTOCOL_CHECK_DELAY_MS = 500;
 export const SYNC_AUTH_MAX_AGE_MS = 90_000;
 
+// ── Warm core connections (A.4-lite+) ─────────────────────────────────
+/**
+ * Opt-in: when set, the agent keeps a small set of Core nodes warm
+ * (connection pinned + auto-redialed by libp2p) so catch-up / chain-driven
+ * reconciliation never pays a cold circuit-relay dial to reach a Core.
+ * Conservative default (off) — flip to '1' to enable.
+ */
+export const WARM_CORE_CONNECTIONS_ENABLED = process.env.DKG_WARM_CORE_CONNECTIONS === '1';
+/** How often to refresh the warm-core set from the phonebook + redial drops. */
+export const WARM_CORE_RECONCILE_INTERVAL_MS = 90_000;
+/** Upper bound on simultaneously pinned Cores (slot-exhaustion guard). */
+export const WARM_CORE_MAX = 8;
+/** keep-alive peerStore tag for warm Cores (mirrors the relay keep-alive tag). */
+export const WARM_CORE_KEEPALIVE_TAG = 'keep-alive-dkg-core';
+/** Per-dial budget when warming a Core. */
+export const WARM_CORE_DIAL_TIMEOUT_MS = 20_000;
+
 // ── Join ──────────────────────────────────────────────────────────────
 /**
  * How long an agent's join-request delegation is valid for. The same
@@ -153,3 +170,32 @@ export const JOIN_APPROVAL_RETRY_TICK_MS = 30_000;
  * are coming from somewhere upstream of libp2p.
  */
 export const MESSAGE_OUTBOX_TICK_MS = 30_000;
+
+/**
+ * Cadence at which a daemon re-publishes its own agent profile to
+ * the `agents` Context Graph (PR feat/chain-agents-cg-phonebook).
+ *
+ * Each heartbeat refreshes the profile's `dkg:multiaddr` triples
+ * (current dialable addrs) and `dkg:lastSeen` timestamp, so other
+ * peers querying agents-CG see fresh phonebook entries even when
+ * direct connections haven't been exchanged recently. Mirrors the
+ * `beaconReannounceTimer` (5 min) cadence and the relay reservation
+ * lifecycle (~30 min default duration limit), so we publish at least
+ * a few times per reservation epoch.
+ *
+ * Tuning: lower for chatty small networks (more responsive but more
+ * gossip volume), higher for large meshes (less volume; slower
+ * propagation of stale entries). Operators override via
+ * `config.network.agentProfileHeartbeatMs`. Set to `0` to disable
+ * (the one-shot startup publish still fires).
+ */
+export const AGENT_PROFILE_HEARTBEAT_MS = 5 * 60 * 1000;
+
+/**
+ * Staleness threshold for an agents-CG profile read during dial
+ * fallback. If `dkg:lastSeen` is older than this, the profile's
+ * `dkg:multiaddr` triples are ignored (the relay address is still
+ * tried — it's the safer minimum). 24h matches the existing peer-
+ * inactivity assumption built into the soak data.
+ */
+export const AGENT_PROFILE_STALE_THRESHOLD_MS = 24 * 60 * 60 * 1000;

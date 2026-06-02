@@ -88,12 +88,16 @@ export {
 export {
   type StorageACKMsg,
   type StorageACKDeclineCode,
+  type SubscriptionSource,
   STORAGE_ACK_DECLINE_CODES,
   TRANSIENT_STORAGE_ACK_DECLINE_CODES,
+  SUBSCRIPTION_SOURCES,
+  SUBSCRIPTION_SOURCE_VALUES,
   encodeStorageACK,
   decodeStorageACK,
   isStorageACKDecline,
   isTransientStorageACKDeclineCode,
+  isSubscriptionSource,
 } from './storage-ack.js';
 
 export {
@@ -106,10 +110,12 @@ export {
   type GossipEnvelopeMsg,
   GOSSIP_ENVELOPE_VERSION,
   GOSSIP_TYPE_WORKSPACE_PUBLISH,
+  GOSSIP_TYPE_WORKSPACE_PUBLISH_CHUNKED,
   GOSSIP_ENVELOPE_FRESHNESS_MS,
   encodeGossipEnvelope,
   decodeGossipEnvelope,
   computeGossipSigningPayload,
+  computeGossipSigningPayloadV2,
 } from './gossip-envelope.js';
 
 export {
@@ -131,6 +137,7 @@ export {
 export {
   type SwmSenderKeyPackageMsg,
   type SwmSenderKeyPackageAckMsg,
+  type SwmSenderKeyPackageAckReasonCode,
   type SwmSenderKeyMessageMsg,
   type SwmSenderKeySecretMsg,
   type SwmSenderKeyMessageAADFields,
@@ -144,6 +151,9 @@ export {
   SWM_SENDER_KEY_AAD_DOMAIN,
   SWM_SENDER_KEY_SETUP_AAD_DOMAIN,
   SWM_SENDER_KEY_SIGNATURE_DOMAIN,
+  SWM_SENDER_KEY_PACKAGE_ACK_REASON_CODES,
+  SWM_SENDER_KEY_PACKAGE_ACK_RETRYABLE_REASON_CODES,
+  SWM_SENDER_KEY_PACKAGE_ACK_TERMINAL_REASON_CODES,
   encodeSwmSenderKeyPackage,
   decodeSwmSenderKeyPackage,
   encodeSwmSenderKeyPackageAck,
@@ -162,6 +172,15 @@ export {
 
 export {
   type PublishIntentMsg,
+  ACK_PROTOCOL_VERSION_V1_LU5,
+  ACK_PROTOCOL_VERSION_V2_LU11,
   encodePublishIntent,
   decodePublishIntent,
 } from './publish-intent.js';
+
+export {
+  CIPHERTEXT_CHUNK_PREDICATE,
+  ciphertextChunkStoreGraph,
+  ciphertextChunkStoreSubject,
+  ciphertextChunkStoreBatchPrefix,
+} from './ciphertext-chunk-store.js';

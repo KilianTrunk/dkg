@@ -14,7 +14,7 @@ prefer running them before falling back to the manual recipes below.
 | Suite | Scope | Runtime | Command |
 | --- | --- | --- | --- |
 | Hardhat e2e | All 10 sequence diagrams from `RFC-001-implementation-walkthrough.md` (incl. Phase 4 author override + pre-signed AuthorAttestation), run against an in-process Hardhat EVM. Covers contract correctness + publisher integration in a single process. | ~30s | `pnpm test:e2e:agent-provenance` |
-| 5-node devnet | All 4 modes (a/b/c/d) + negative case from §4 + §9.5, run against `./scripts/devnet.sh start 5`. Mode (b) registers a custodial agent on core 2 and validates `KC.author = agent.wallet` while `publisherNodeIdentityId = core2.id`. | ~35s after devnet is up | `pnpm test:devnet:agent-provenance` |
+| 5-node devnet | All 4 modes (a/b/c/d) + negative case from §4 + §9.5, run against `./scripts/devnet.sh start 5`. Mode (b) registers a custodial agent on core 2 and validates `KC.author = agent.wallet` while `publisherNodeIdentityId = core2.id`. Includes a `mode (a) strict` variant that drains edge op-wallets' TRAC to literal zero via `hardhat_setStorageAt` and asserts the publish still succeeds via the PCA — pinning the "publisher EOA holds only gas tokens, spends TRAC from PCA" operator scenario. | ~35s after devnet is up | `pnpm test:devnet:agent-provenance` |
 
 Phase 4 author override (RFC §4(b)) is now wired end-to-end via the
 agent-keystore: end-user agents register on a daemon (`POST
@@ -139,17 +139,17 @@ node5 publish <cgId> \
 
 **Assertions** (capture into the transcript):
 
-- `KnowledgeCollectionStorage.getLatestMerkleRootAuthor(kcId) ==
+- `KnowledgeCollectionStorage.getLatestMerkleRootAuthor(kaId) ==
   edge.agent.wallet.address` (matches §9.7 #1).
-- `getLatestMerkleRootPublisher(kcId) == edge.publisher` (the EOA
+- `getLatestMerkleRootPublisher(kaId) == edge.publisher` (the EOA
   that called `publish`, i.e. `msg.sender`).
-- `KnowledgeCollectionCreated(kcId, indexed author=edge.agent, ...)`
+- `KnowledgeAssetCreated(kaId, indexed author=edge.agent, ...)`
   log entry present in the receipt.
 - Core 1's PCA epoch allowance decremented by ≥ the discounted fee
   (read via `PublishingConvictionAccount.epochAllowance`).
 - `dkg:Publication` triple present in CG meta graph: `<urn:dkg:kc:N>
   dkg:authoredBy "<edge.agent.wallet.address>"`.
-- `/api/kc/<kcId>/author` returns `{author: <edge.agent.address>,
+- `/api/kc/<kaId>/author` returns `{author: <edge.agent.address>,
   attested: true}`.
 
 ### (b) Publisher-as-a-service via core 2 PCA
@@ -263,7 +263,7 @@ option — explicit `0n` proceeds on-chain.
 - No core's publishing-factor counter incremented:
   `EpochStorage.getNodeEpochProducedKnowledgeValue(coreId, epoch)` is
   unchanged across all known core identityIds.
-- `KnowledgeCollectionCreated` event has `author = edge.agent`,
+- `KnowledgeAssetCreated` event has `author = edge.agent`,
   emitted with `publisherNodeIdentityId = 0` (verifiable via the
   `merkleRoots` accessor: the on-chain attribution field is `0`).
 - `dkg publish` returns `Status: confirmed` (not `tentative`).
@@ -321,7 +321,7 @@ node1 publish smoke-test --file /tmp/smoke.nq --publisher-node-identity-id 0
 # → expect: Status: tentative (NOT confirmed; daemon log shows "Identity
 #   not set (0) — skipping on-chain publish")
 node1 publish smoke-test --file /tmp/smoke.nq
-# → expect: Status: confirmed, valid kcId, valid txHash
+# → expect: Status: confirmed, valid kaId, valid txHash
 #   (the publisher's identity was restored after the override)
 ```
 

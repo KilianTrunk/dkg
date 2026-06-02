@@ -13,6 +13,7 @@ export { StubNetworkStateRegistry } from './network-state-registry.js';
 
 export type {
   AgentDirectoryLookup,
+  AgentDirectoryDialAddresses,
   PeerResolverDeps,
   PeerResolverLogger,
   ResolveOpts,

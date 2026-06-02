@@ -4,6 +4,32 @@ import { mockApi } from './mocks/provider.js';
 let useMocks: boolean | null = null;
 let detectMockModePromise: Promise<boolean> | null = null;
 
+// Subscribers (e.g. the MockModeBanner) that want to know when the UI has
+// fallen back to fabricated demo data so they can surface a visible indicator
+// (GH #904). The previous fallback set only a `console.warn` + a
+// `window.__DKG_USING_MOCKS__` flag — nothing the operator could see.
+type MockModeListener = (usingMocks: boolean) => void;
+const mockModeListeners = new Set<MockModeListener>();
+
+/** Current mock-mode state (true once `/api/status` has failed detection). */
+export function isUsingMocks(): boolean {
+  return useMocks === true;
+}
+
+/**
+ * Subscribe to mock-mode changes; returns an unsubscribe fn. The listener is
+ * invoked immediately with the current state so a subscriber can't miss a
+ * detection that flipped `useMocks` to true between its snapshot read and this
+ * call (Codex) — there is no transition gap to lose.
+ */
+export function subscribeMockMode(listener: MockModeListener): () => void {
+  mockModeListeners.add(listener);
+  listener(useMocks === true);
+  return () => {
+    mockModeListeners.delete(listener);
+  };
+}
+
 function authHeaders(): Record<string, string> {
   if (typeof window === 'undefined') return {};
   const token = (window as any).__DKG_TOKEN__;
@@ -30,6 +56,22 @@ async function detectMockMode(): Promise<boolean> {
     } catch {
       useMocks = true;
     }
+    // Observability: surface the silent demo-data fallback so operators — and
+    // the e2e suite's mock-mode guard (fixtures/base.ts) — can tell the UI is
+    // NOT showing live node state. Without this flag the swap to fabricated
+    // fixtures is completely invisible, which is a false-positive trap for any
+    // assertion made against the rendered data.
+    if (typeof window !== 'undefined') {
+      (window as { __DKG_USING_MOCKS__?: boolean }).__DKG_USING_MOCKS__ = useMocks;
+      if (useMocks) {
+        console.warn(
+          '[dkg-ui] /api/status unreachable (timeout/5xx/network) — falling back to demo (mock) data. The UI is NOT showing live node state.',
+        );
+      }
+    }
+    // Notify React subscribers so a visible demo-data indicator can render
+    // (GH #904) — the flag/console.warn alone are invisible to the operator.
+    mockModeListeners.forEach((listener) => listener(useMocks as boolean));
     return useMocks;
   })();
   try {
@@ -55,7 +97,9 @@ export const api = {
   fetchWalletsBalances: () => withFallback(realApi.fetchWalletsBalances, mockApi.fetchWalletsBalances),
   fetchCurrentAgent: () => withFallback(realApi.fetchCurrentAgent, mockApi.fetchCurrentAgent),
   listParticipants: (id: string) => withFallback(() => realApi.listParticipants(id), () => mockApi.listParticipants(id)),
-  fetchNotifications: (p?: any) => withFallback(() => realApi.fetchNotifications(p), mockApi.fetchNotifications),
+  fetchSubGraphs: (id: string) => withFallback(() => realApi.fetchSubGraphs(id), () => mockApi.fetchSubGraphs(id)),
+  // Scoped notifications pane feed (useNotificationsFeed consumes this).
+  fetchNotificationsFeed: () => withFallback(realApi.fetchNotificationsFeed, mockApi.fetchNotificationsFeed),
   fetchNodeLog: (p?: any) => withFallback(() => realApi.fetchNodeLog(p), mockApi.fetchNodeLog),
   fetchMemorySessions: (n?: number) => withFallback(() => realApi.fetchMemorySessions(n), mockApi.fetchMemorySessions),
   markNotificationsRead: realApi.markNotificationsRead,

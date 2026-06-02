@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import Database from 'better-sqlite3';
-import { DashboardDB } from '../src/db.js';
+import { DashboardDB, buildActivityDigestKey, ACTIVITY_DIGEST_WINDOW_MS, ASSERTION_ACTIVITY_TYPE } from '../src/db.js';
 
 let db: DashboardDB;
 let dir: string;
@@ -86,7 +86,7 @@ describe('DashboardDB — metric snapshots', () => {
     raw.close();
 
     db = new DashboardDB({ dataDir: dir });
-    expect(db.db.pragma('user_version', { simple: true })).toBe(15);
+    expect(db.db.pragma('user_version', { simple: true })).toBe(20);
 
     const cols = (db.db.prepare('PRAGMA table_info(metric_snapshots)').all() as Array<{ name: string }>)
       .map((c) => c.name);
@@ -142,7 +142,7 @@ describe('DashboardDB — metric snapshots', () => {
     raw.close();
 
     db = new DashboardDB({ dataDir: dir });
-    expect(db.db.pragma('user_version', { simple: true })).toBe(15);
+    expect(db.db.pragma('user_version', { simple: true })).toBe(20);
 
     const newSnapshotCols = (db.db.prepare('PRAGMA table_info(metric_snapshots)').all() as { name: string }[])
       .map(c => c.name);
@@ -248,60 +248,47 @@ describe('DashboardDB — operations', () => {
 });
 
 describe('DashboardDB — logs', () => {
-  it('inserts and searches logs by level', () => {
-    db.insertLog({ ts: 1000, level: 'info', module: 'Agent', message: 'started' });
-    db.insertLog({ ts: 2000, level: 'error', module: 'Agent', message: 'something broke' });
-    db.insertLog({ ts: 3000, level: 'info', module: 'Publisher', message: 'published' });
+  // NOTE: V15 removed the FTS5 index, not the public search surface.
+  // `searchLogs()` now uses bounded LIKE scans over the retained base
+  // `logs` table for backwards compatibility.
 
-    const errors = db.searchLogs({ level: 'error' });
-    expect(errors.logs).toHaveLength(1);
-    expect(errors.logs[0].message).toBe('something broke');
+  it('insertLog persists the row with all columns', () => {
+    db.insertLog({
+      ts: 1000,
+      level: 'error',
+      operation_name: 'sync',
+      operation_id: 'op-1',
+      module: 'Agent',
+      message: 'something broke',
+    });
 
-    const all = db.searchLogs({});
-    expect(all.total).toBe(3);
+    const rows = db.db.prepare(`SELECT * FROM logs ORDER BY ts ASC`).all() as any[];
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      ts: 1000,
+      level: 'error',
+      operation_name: 'sync',
+      operation_id: 'op-1',
+      module: 'Agent',
+      message: 'something broke',
+    });
   });
 
-  it('searches logs by operationId', () => {
-    db.insertLog({ ts: 1000, level: 'info', operation_id: 'op-1', module: 'A', message: 'hello' });
-    db.insertLog({ ts: 2000, level: 'info', operation_id: 'op-2', module: 'A', message: 'world' });
-
-    const result = db.searchLogs({ operationId: 'op-1' });
-    expect(result.logs).toHaveLength(1);
-    expect(result.logs[0].message).toBe('hello');
+  it('insertLog tolerates null operation context', () => {
+    db.insertLog({ ts: 2000, level: 'info', module: 'Publisher', message: 'published' });
+    const row = db.db.prepare(`SELECT * FROM logs WHERE ts = 2000`).get() as any;
+    expect(row.operation_id).toBeNull();
+    expect(row.operation_name).toBeNull();
   });
 
-  it('supports full-text search', () => {
-    db.insertLog({ ts: 1000, level: 'info', module: 'A', message: 'merkle root verified successfully' });
-    db.insertLog({ ts: 2000, level: 'info', module: 'A', message: 'connection established' });
-    db.insertLog({ ts: 3000, level: 'error', module: 'A', message: 'merkle root mismatch detected' });
+  it('searchLogs keeps the non-FTS compatibility surface', () => {
+    db.insertLog({ ts: 1000, level: 'info', operation_name: 'publish', operation_id: 'op-1', module: 'Publisher', message: 'publish started' });
+    db.insertLog({ ts: 2000, level: 'error', operation_name: 'sync', operation_id: 'op-2', module: 'Agent', message: 'sync timeout' });
+    db.insertLog({ ts: 3000, level: 'info', operation_name: 'publish', operation_id: 'op-3', module: 'Publisher', message: 'publish completed 100%' });
 
-    const result = db.searchLogs({ q: 'merkle' });
-    expect(result.total).toBe(2);
-    expect(result.logs.every((l: any) => l.message.includes('merkle'))).toBe(true);
-  });
-
-  it('filters by time range', () => {
-    db.insertLog({ ts: 1000, level: 'info', module: 'A', message: 'early' });
-    db.insertLog({ ts: 5000, level: 'info', module: 'A', message: 'middle' });
-    db.insertLog({ ts: 9000, level: 'info', module: 'A', message: 'late' });
-
-    const result = db.searchLogs({ from: 4000, to: 6000 });
+    const result = db.searchLogs({ q: 'publish completed 100%', level: 'info', module: 'Publisher' });
     expect(result.total).toBe(1);
-    expect(result.logs[0].message).toBe('middle');
-  });
-
-  it('paginates with limit and offset', () => {
-    for (let i = 0; i < 20; i++) {
-      db.insertLog({ ts: i * 1000, level: 'info', module: 'A', message: `log-${i}` });
-    }
-
-    const page1 = db.searchLogs({ limit: 5, offset: 0 });
-    expect(page1.logs).toHaveLength(5);
-    expect(page1.total).toBe(20);
-
-    const page2 = db.searchLogs({ limit: 5, offset: 5 });
-    expect(page2.logs).toHaveLength(5);
-    expect(page2.logs[0].id).not.toBe(page1.logs[0].id);
+    expect(result.logs[0].operation_id).toBe('op-3');
   });
 });
 
@@ -344,6 +331,28 @@ describe('DashboardDB — saved queries', () => {
 });
 
 describe('DashboardDB — retention', () => {
+  it('uses 14 days for fresh installs', () => {
+    expect(db.getRetentionDays()).toBe(14);
+  });
+
+  it('preserves legacy implicit 90-day retention for upgraded DBs without a saved setting', () => {
+    const dbPath = join(dir, 'node-ui.db');
+    db.close();
+
+    const raw = new Database(dbPath);
+    const twentyDaysAgo = Date.now() - 20 * 86_400_000;
+    raw.prepare(
+      `INSERT INTO logs (ts, level, module, message) VALUES (?, 'info', 'test', 'legacy retained')`,
+    ).run(twentyDaysAgo);
+    raw.pragma('user_version = 14');
+    raw.close();
+
+    db = new DashboardDB({ dataDir: dir });
+    expect(db.getRetentionDays()).toBe(90);
+    const count = (db.db.prepare(`SELECT COUNT(*) AS c FROM logs`).get() as { c: number }).c;
+    expect(count).toBe(1);
+  });
+
   it('prunes data older than retention period', () => {
     const db2 = new DashboardDB({ dataDir: dir, retentionDays: 0 });
 
@@ -354,7 +363,8 @@ describe('DashboardDB — retention', () => {
     db2.prune();
 
     expect(db2.getLatestSnapshot()).toBeUndefined();
-    expect(db2.searchLogs({}).total).toBe(0);
+    const remainingLogs = (db2.db.prepare(`SELECT COUNT(*) AS c FROM logs`).get() as { c: number }).c;
+    expect(remainingLogs).toBe(0);
     expect(db2.getOperations().total).toBe(0);
 
     db2.close();
@@ -478,9 +488,122 @@ describe('DashboardDB — schema idempotency', () => {
     db.close();
     const db2 = new DashboardDB({ dataDir: dir });
     db2.insertLog({ ts: 1, level: 'info', module: 'Test', message: 'ok' });
-    expect(db2.searchLogs({}).total).toBe(1);
+    const count = (db2.db.prepare(`SELECT COUNT(*) AS c FROM logs`).get() as { c: number }).c;
+    expect(count).toBe(1);
     db2.close();
     db = new DashboardDB({ dataDir: dir });
+  });
+});
+
+describe('DashboardDB — V15 migration: drop FTS5 logs index', () => {
+  // Regression guard for the rc.11 incident
+  // (~9 GB node-ui.db, corrupt SQLite page from a runaway FTS5 index).
+  // We construct a V14-shape database by hand — virtual table + the
+  // two triggers + an actual log row that the trigger should mirror
+  // into the shadow tables — then open it through DashboardDB and
+  // confirm the migration removes the FTS5 infrastructure while
+  // preserving the base `logs` row.
+  it('drops logs_fts virtual table and its two triggers on upgrade from V14', () => {
+    const mkdtempSync = require('node:fs').mkdtempSync;
+    const { tmpdir } = require('node:os');
+    const { join } = require('node:path');
+    const Database = require('better-sqlite3');
+
+    const upgradeDir = mkdtempSync(join(tmpdir(), 'dkg-dashboard-db-v15-'));
+    const upgradeDbPath = join(upgradeDir, 'node-ui.db');
+
+    // Build a realistic V14-shape DB. We let DashboardDB create the
+    // full schema first (so prune() during the upgrade re-open won't
+    // trip on missing tables), then downgrade user_version to 14 and
+    // bolt the V14-era FTS5 infrastructure back onto `logs`. Reopening
+    // through DashboardDB exercises the real migrate() codepath.
+    const v14 = new DashboardDB({ dataDir: upgradeDir });
+    // Use a recent timestamp so the V15 default 14-day retention prune
+    // (which runs on every DashboardDB open) doesn't delete this row
+    // before the assertion can see it.
+    const recentTs = Date.now() - 60_000;
+    v14.insertLog({ ts: recentTs, level: 'info', module: 'Agent', message: 'pre-migration row' });
+    v14.close();
+
+    const downgrade = new Database(upgradeDbPath);
+    downgrade.exec(`
+      CREATE VIRTUAL TABLE logs_fts USING fts5(
+        message, content=logs, content_rowid=id
+      );
+      CREATE TRIGGER logs_ai AFTER INSERT ON logs BEGIN
+        INSERT INTO logs_fts(rowid, message) VALUES (new.id, new.message);
+      END;
+      CREATE TRIGGER logs_ad AFTER DELETE ON logs BEGIN
+        INSERT INTO logs_fts(logs_fts, rowid, message) VALUES('delete', old.id, old.message);
+      END;
+      -- Backfill the index from the existing row so the fixture matches
+      -- what a long-lived V14 DB would actually look like on disk.
+      INSERT INTO logs_fts(rowid, message) SELECT id, message FROM logs;
+    `);
+    downgrade.pragma(`user_version = 14`);
+    downgrade.close();
+
+    const upgraded = new DashboardDB({ dataDir: upgradeDir });
+    try {
+      expect(upgraded.db.pragma('user_version', { simple: true })).toBe(19);
+
+      const ftsTables = upgraded.db.prepare(
+        `SELECT name FROM sqlite_master WHERE type IN ('table','view') AND name LIKE 'logs_fts%'`,
+      ).all() as { name: string }[];
+      expect(ftsTables).toHaveLength(0);
+
+      const triggers = upgraded.db.prepare(
+        `SELECT name FROM sqlite_master WHERE type='trigger' AND name IN ('logs_ai','logs_ad')`,
+      ).all() as { name: string }[];
+      expect(triggers).toHaveLength(0);
+
+      const preserved = upgraded.db.prepare(
+        `SELECT message FROM logs ORDER BY ts ASC`,
+      ).all() as { message: string }[];
+      expect(preserved).toEqual([{ message: 'pre-migration row' }]);
+
+      // Sanity: inserts on `logs` still succeed (no orphaned trigger
+      // pointing at the deleted virtual table).
+      expect(() => upgraded.insertLog({
+        ts: 2000, level: 'warn', module: 'Agent', message: 'post-migration row',
+      })).not.toThrow();
+    } finally {
+      upgraded.close();
+    }
+  });
+
+  it('prune vacuums a large freelist even when retained logs are not deleted', () => {
+    const mkdtempSync = require('node:fs').mkdtempSync;
+    const { tmpdir } = require('node:os');
+    const { join } = require('node:path');
+
+    const vacuumDir = mkdtempSync(join(tmpdir(), 'dkg-dashboard-db-vacuum-'));
+    const vacuumDb = new DashboardDB({ dataDir: vacuumDir, retentionDays: 365 });
+
+    try {
+      // Simulate the failure mode where a migration dropped a large object
+      // (V15 drops logs_fts + its shadow tables) but retained logs are still
+      // younger than the cutoff, so logsDeleted alone would not trigger VACUUM.
+      vacuumDb.db.exec(`CREATE TABLE vacuum_fixture (payload BLOB NOT NULL);`);
+      const insert = vacuumDb.db.prepare(
+        `INSERT INTO vacuum_fixture (payload) VALUES (zeroblob(4096))`,
+      );
+      const fillFixture = vacuumDb.db.transaction(() => {
+        for (let i = 0; i < 2_000; i += 1) insert.run();
+      });
+      fillFixture();
+      vacuumDb.db.exec(`DROP TABLE vacuum_fixture;`);
+
+      const beforePrune = Number(vacuumDb.db.pragma('freelist_count', { simple: true }));
+      expect(beforePrune).toBeGreaterThan(1_000);
+
+      vacuumDb.prune();
+
+      const afterPrune = Number(vacuumDb.db.pragma('freelist_count', { simple: true }));
+      expect(afterPrune).toBeLessThan(1_000);
+    } finally {
+      vacuumDb.close();
+    }
   });
 });
 
@@ -521,6 +644,187 @@ describe('DashboardDB — context graph subscriptions', () => {
       context_graph_id: 'project-a',
       shared_memory_synced: 1,
       updated_at: 2000,
+    }]);
+  });
+
+  it('round-trips on_chain_hash + last_reconciled_ordinal (Phase B), defaulting to NULL', () => {
+    // Omitted → NULL (legacy / never-reconciled).
+    db.upsertContextGraphSubscription({
+      context_graph_id: 'cg-legacy',
+      subscribed: 1,
+      synced: 1,
+      sync_scoped: 1,
+      updated_at: 1000,
+    });
+    expect(db.listContextGraphSubscriptions()).toMatchObject([{
+      context_graph_id: 'cg-legacy',
+      on_chain_hash: null,
+      last_reconciled_ordinal: null,
+    }]);
+
+    // Set + advance the watermark.
+    db.upsertContextGraphSubscription({
+      context_graph_id: 'cg-legacy',
+      subscribed: 1,
+      synced: 1,
+      on_chain_hash: '0xfeed',
+      last_reconciled_ordinal: 5,
+      sync_scoped: 1,
+      updated_at: 2000,
+    });
+    expect(db.listContextGraphSubscriptions()).toMatchObject([{
+      context_graph_id: 'cg-legacy',
+      on_chain_hash: '0xfeed',
+      last_reconciled_ordinal: 5,
+    }]);
+  });
+});
+
+describe('DashboardDB — V17 subscription columns migration (Phase B)', () => {
+  let db: DashboardDB;
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'dkg-db-v17-test-'));
+    db = new DashboardDB({ dataDir: dir });
+  });
+
+  afterEach(() => {
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('adds on_chain_hash + last_reconciled_ordinal when upgrading a pre-V17 DB, preserving rows', () => {
+    const dbPath = join(dir, 'node-ui.db');
+    db.close();
+
+    const raw = new Database(dbPath);
+    raw.exec('ALTER TABLE context_graph_subscriptions DROP COLUMN on_chain_hash;');
+    raw.exec('ALTER TABLE context_graph_subscriptions DROP COLUMN last_reconciled_ordinal;');
+    raw.prepare(
+      `INSERT INTO context_graph_subscriptions
+         (context_graph_id, name, subscribed, synced, on_chain_id, sync_scoped, updated_at)
+       VALUES ('cg-pre17', 'Pre17', 1, 1, '0xabc', 1, 1000)`,
+    ).run();
+    raw.pragma('user_version = 16');
+    raw.close();
+
+    db = new DashboardDB({ dataDir: dir });
+    expect(db.db.pragma('user_version', { simple: true })).toBe(19);
+
+    const cols = (db.db.prepare('PRAGMA table_info(context_graph_subscriptions)').all() as Array<{ name: string }>)
+      .map((c) => c.name);
+    expect(cols).toContain('on_chain_hash');
+    expect(cols).toContain('last_reconciled_ordinal');
+
+    // Pre-existing row survives; new columns default to NULL.
+    expect(db.listContextGraphSubscriptions()).toMatchObject([{
+      context_graph_id: 'cg-pre17',
+      on_chain_id: '0xabc',
+      on_chain_hash: null,
+      last_reconciled_ordinal: null,
+    }]);
+  });
+
+  it('fresh install already carries the V17 columns', () => {
+    const cols = (db.db.prepare('PRAGMA table_info(context_graph_subscriptions)').all() as Array<{ name: string }>)
+      .map((c) => c.name);
+    expect(cols).toContain('on_chain_hash');
+    expect(cols).toContain('last_reconciled_ordinal');
+    expect(db.db.pragma('user_version', { simple: true })).toBe(19);
+  });
+});
+
+describe('DashboardDB — V19 core_hosted column migration (Phase D)', () => {
+  let db: DashboardDB;
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'dkg-db-v19-test-'));
+    db = new DashboardDB({ dataDir: dir });
+  });
+
+  afterEach(() => {
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('round-trips core_hosted, defaulting to NULL', () => {
+    // Omitted → NULL (member-only / legacy subscription).
+    db.upsertContextGraphSubscription({
+      context_graph_id: 'cg-member',
+      subscribed: 1,
+      synced: 1,
+      sync_scoped: 1,
+      updated_at: 1000,
+    });
+    expect(db.listContextGraphSubscriptions()).toMatchObject([{
+      context_graph_id: 'cg-member',
+      core_hosted: null,
+    }]);
+
+    // A Core that ACKed a public CG records itself as a host (subscribed=0).
+    db.upsertContextGraphSubscription({
+      context_graph_id: '42',
+      subscribed: 0,
+      synced: 0,
+      on_chain_id: '42',
+      core_hosted: 1,
+      sync_scoped: 0,
+      updated_at: 2000,
+    });
+    const rows = db.listContextGraphSubscriptions();
+    expect(rows.find((r) => r.context_graph_id === '42')).toMatchObject({
+      subscribed: 0,
+      on_chain_id: '42',
+      core_hosted: 1,
+    });
+  });
+
+  it('surfaces core_hosted in the cursor inspector join', () => {
+    db.upsertContextGraphSubscription({
+      context_graph_id: '7',
+      subscribed: 0,
+      synced: 0,
+      on_chain_id: '7',
+      core_hosted: 1,
+      last_reconciled_ordinal: 3,
+      sync_scoped: 0,
+      updated_at: 1000,
+    });
+    const cursors = db.getReplicationCursors();
+    expect(cursors.find((c) => c.context_graph_id === '7')).toMatchObject({
+      on_chain_id: '7',
+      last_reconciled_ordinal: 3,
+      core_hosted: 1,
+    });
+  });
+
+  it('adds core_hosted when upgrading a pre-V19 DB, preserving rows', () => {
+    const dbPath = join(dir, 'node-ui.db');
+    db.close();
+
+    const raw = new Database(dbPath);
+    raw.exec('ALTER TABLE context_graph_subscriptions DROP COLUMN core_hosted;');
+    raw.prepare(
+      `INSERT INTO context_graph_subscriptions
+         (context_graph_id, name, subscribed, synced, on_chain_id, sync_scoped, updated_at)
+       VALUES ('cg-pre19', 'Pre19', 1, 1, '0xabc', 1, 1000)`,
+    ).run();
+    raw.pragma('user_version = 18');
+    raw.close();
+
+    db = new DashboardDB({ dataDir: dir });
+    expect(db.db.pragma('user_version', { simple: true })).toBe(19);
+
+    const cols = (db.db.prepare('PRAGMA table_info(context_graph_subscriptions)').all() as Array<{ name: string }>)
+      .map((c) => c.name);
+    expect(cols).toContain('core_hosted');
+
+    expect(db.listContextGraphSubscriptions()).toMatchObject([{
+      context_graph_id: 'cg-pre19',
+      on_chain_id: '0xabc',
+      core_hosted: null,
     }]);
   });
 });
@@ -879,7 +1183,7 @@ describe('DashboardDB — V11→V13 chat schema migration chain', () => {
     raw.close();
 
     db = new DashboardDB({ dataDir: dir });
-    expect(db.db.pragma('user_version', { simple: true })).toBe(15);
+    expect(db.db.pragma('user_version', { simple: true })).toBe(20);
 
     const cols = (db.db.prepare('PRAGMA table_info(chat_messages)').all() as Array<{ name: string }>)
       .map((c) => c.name);
@@ -909,5 +1213,284 @@ describe('DashboardDB — V11→V13 chat schema migration chain', () => {
       db.insertChatMessage({ ts: 1000, direction: 'in', peer: 'alice', text: 'v11-a-dup', messageId: 'm1' }),
     ).toBe(true);
     expect(db.getChatMessages({ peer: 'alice' })).toHaveLength(3);
+  });
+});
+
+describe('DashboardDB — V16 notifications.context_graph_id migration (A1)', () => {
+  let db: DashboardDB;
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'dkg-db-v16-test-'));
+    db = new DashboardDB({ dataDir: dir });
+  });
+
+  afterEach(() => {
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('adds context_graph_id + idx_notif_cg when upgrading a pre-V16 DB, preserving rows as NULL', () => {
+    // Simulate a V15 DB: drop the new column + its index and reset
+    // user_version to 15, then reopen via DashboardDB and verify the
+    // V16 block restores them and leaves the pre-existing row's scope NULL.
+    const dbPath = join(dir, 'node-ui.db');
+    db.close();
+
+    const raw = new Database(dbPath);
+    raw.exec('DROP INDEX IF EXISTS idx_notif_cg;');
+    raw.exec('ALTER TABLE notifications DROP COLUMN context_graph_id;');
+    const legacyTs = Date.now() - 60_000;
+    raw.prepare(
+      `INSERT INTO notifications (ts, type, title, message, source, peer, read, meta)
+       VALUES (?, 'join_request', 'Legacy', 'pre-v16 row', 'access-control', NULL, 0, NULL)`,
+    ).run(legacyTs);
+    raw.pragma('user_version = 15');
+    raw.close();
+
+    db = new DashboardDB({ dataDir: dir });
+    expect(db.db.pragma('user_version', { simple: true })).toBe(19);
+
+    const cols = (db.db.prepare('PRAGMA table_info(notifications)').all() as Array<{ name: string }>)
+      .map((c) => c.name);
+    expect(cols).toContain('context_graph_id');
+
+    const indexes = (db.db.prepare(`PRAGMA index_list(notifications)`).all() as Array<{ name: string }>)
+      .map((i) => i.name);
+    expect(indexes).toContain('idx_notif_cg');
+
+    // Legacy row survives with NULL scope (treated as out-of-scope by the
+    // scoped read path; aged out by prune()).
+    const { notifications } = db.getNotifications();
+    expect(notifications).toHaveLength(1);
+    expect(notifications[0].context_graph_id).toBeNull();
+
+    // New inserts can carry a scope.
+    expect(() => db.insertNotification({
+      ts: Date.now(), type: 'join_request', title: 'X', message: 'y',
+      contextGraphId: 'cg-abc',
+    })).not.toThrow();
+    const after = db.getNotifications().notifications;
+    expect(after.find((n) => n.title === 'X')!.context_graph_id).toBe('cg-abc');
+  });
+
+  it('fresh install already carries context_graph_id (no upgrade needed)', () => {
+    const cols = (db.db.prepare('PRAGMA table_info(notifications)').all() as Array<{ name: string }>)
+      .map((c) => c.name);
+    expect(cols).toContain('context_graph_id');
+    expect(db.db.pragma('user_version', { simple: true })).toBe(19);
+  });
+
+  it('insertNotification writes context_graph_id to the column; omitted → NULL', () => {
+    db.insertNotification({ ts: 1000, type: 'assertion_activity', title: 'A', message: 'a', contextGraphId: 'cg-1' });
+    db.insertNotification({ ts: 2000, type: 'peer_connected', title: 'B', message: 'b' });
+    const { notifications } = db.getNotifications();
+    const a = notifications.find((n) => n.title === 'A')!;
+    const b = notifications.find((n) => n.title === 'B')!;
+    expect(a.context_graph_id).toBe('cg-1');
+    expect(b.context_graph_id).toBeNull();
+  });
+});
+
+describe('DashboardDB — resolveActivityDigestRowIds (CR-3 digest read-marking)', () => {
+  let db: DashboardDB;
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'dkg-db-digest-test-'));
+    db = new DashboardDB({ dataDir: dir });
+  });
+
+  afterEach(() => {
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  const activityRow = (cgId: string, kind: string, ts: number) =>
+    db.insertNotification({
+      ts,
+      type: ASSERTION_ACTIVITY_TYPE,
+      title: 'activity',
+      message: `${kind} in ${cgId}`,
+      contextGraphId: cgId,
+      meta: JSON.stringify({ contextGraphId: cgId, kind }),
+    });
+
+  it('resolves a digestKey to exactly the atomic rows in its (cg, kind, window)', () => {
+    // Anchor all rows to one window bucket so the digest key is stable.
+    const baseTs = 5 * ACTIVITY_DIGEST_WINDOW_MS + 1_000; // bucket = 5
+    const id1 = activityRow('cg-1', 'created', baseTs);
+    const id2 = activityRow('cg-1', 'created', baseTs + 1_000);
+    // Different kind, same cg+window — must NOT be included.
+    activityRow('cg-1', 'promoted', baseTs + 2_000);
+    // Different cg — must NOT be included.
+    activityRow('cg-2', 'created', baseTs + 3_000);
+    // Same cg+kind but a DIFFERENT window bucket — must NOT be included.
+    activityRow('cg-1', 'created', baseTs + ACTIVITY_DIGEST_WINDOW_MS);
+
+    const digestKey = buildActivityDigestKey('cg-1', 'created', baseTs);
+    const ids = db.resolveActivityDigestRowIds(digestKey).sort((a, b) => a - b);
+    expect(ids).toEqual([id1, id2].sort((a, b) => a - b));
+  });
+
+  it('returns [] for a malformed digest key (no-op, never throws)', () => {
+    expect(db.resolveActivityDigestRowIds('not-a-digest')).toEqual([]);
+    expect(db.resolveActivityDigestRowIds('activity:cg-1:bogus:5')).toEqual([]);
+    expect(db.resolveActivityDigestRowIds('activity:cg-1:created:notanumber')).toEqual([]);
+  });
+
+  it('handles a context graph id containing colons (URI form)', () => {
+    const cgId = 'did:dkg:context-graph:abc123';
+    const baseTs = 7 * ACTIVITY_DIGEST_WINDOW_MS + 500; // bucket = 7
+    const id1 = activityRow(cgId, 'published', baseTs);
+    const digestKey = buildActivityDigestKey(cgId, 'published', baseTs);
+    expect(db.resolveActivityDigestRowIds(digestKey)).toEqual([id1]);
+  });
+});
+
+describe('DashboardDB — replication telemetry (Phase F)', () => {
+  let db: DashboardDB;
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'dkg-db-repl-test-'));
+    db = new DashboardDB({ dataDir: dir });
+  });
+
+  afterEach(() => {
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  const now = Date.now();
+
+  it('summary computes counts, success rate, and fetch→promote latency', () => {
+    // mfacts: fetch at T, promote 5s later (latency 5000); plus a 0-latency
+    // promote (SWM already present, no preceding fetch); plus one defer.
+    db.insertReplicationEvent({ ts: now - 10_000, context_graph_id: 'mfacts', action: 'fetch', ual: 'urn:ka:1', ordinal: 1 });
+    db.insertReplicationEvent({ ts: now - 5_000, context_graph_id: 'mfacts', action: 'promote', ual: 'urn:ka:1', ordinal: 1 });
+    db.insertReplicationEvent({ ts: now - 4_000, context_graph_id: 'mfacts', action: 'promote', ual: 'urn:ka:2', ordinal: 2 });
+    db.insertReplicationEvent({ ts: now - 3_000, context_graph_id: 'mfacts', action: 'defer', ual: 'urn:ka:3', ordinal: 3, detail: 'no-swm' });
+
+    const s = db.getReplicationSummary(60 * 60 * 1000);
+    expect(s.promotes).toBe(2);
+    expect(s.fetches).toBe(1);
+    expect(s.defers).toBe(1);
+    // promote / (promote + defer) = 2/3
+    expect(s.successRate).toBeCloseTo(2 / 3, 5);
+    // latencies: [0, 5000] → P50 index = floor(0.5*2)=1 → 5000
+    expect(s.latencyP50Ms).toBe(5000);
+    expect(s.totalEvents).toBe(4);
+  });
+
+  it('summary excludes events outside the window', () => {
+    db.insertReplicationEvent({ ts: now - 10 * 86_400_000, context_graph_id: 'old', action: 'promote', ual: 'urn:ka:x' });
+    const s = db.getReplicationSummary(60 * 60 * 1000);
+    expect(s.totalEvents).toBe(0);
+    expect(s.successRate).toBeNull();
+    expect(s.latencyP50Ms).toBeNull();
+  });
+
+  it('defaults to a 24-HOUR window (not 24 days)', () => {
+    // Regression: the default was `24 * 86_400_000` (24 days). An event from
+    // 2 days ago must be EXCLUDED by the default window; a recent one included.
+    db.insertReplicationEvent({ ts: now - 2 * 86_400_000, context_graph_id: 'stale', action: 'promote' });
+    db.insertReplicationEvent({ ts: now - 1_000, context_graph_id: 'fresh', action: 'promote' });
+    const s = db.getReplicationSummary(); // default period
+    expect(s.periodMs).toBe(86_400_000);
+    expect(s.totalEvents).toBe(1);
+    expect(s.promotes).toBe(1);
+    // per-cg default window must match
+    expect(db.getReplicationPerCg().length).toBe(1);
+  });
+
+  it('pairs fetch→promote latency per VERSION (ordinal), not per UAL', () => {
+    // Regression: keying latency on UAL let a later fast-path promote (no
+    // fetch) mispair with an older fetch for a DIFFERENT version of the same
+    // KA, inflating latency. Two promotes share one UAL but distinct ordinals.
+    db.insertReplicationEvent({ ts: now - 10_000, context_graph_id: 'cg', action: 'fetch', ual: 'urn:ka:9', ordinal: 1 });
+    db.insertReplicationEvent({ ts: now - 5_000, context_graph_id: 'cg', action: 'promote', ual: 'urn:ka:9', ordinal: 1 });
+    // New version of the same KA, promoted fast-path (SWM already present): no
+    // fetch for ordinal 2 → must contribute 0ms, NOT pair with ordinal 1's fetch.
+    db.insertReplicationEvent({ ts: now - 1_000, context_graph_id: 'cg', action: 'promote', ual: 'urn:ka:9', ordinal: 2 });
+
+    const s = db.getReplicationSummary(60 * 60 * 1000);
+    // latencies: [0 (ordinal 2), 5000 (ordinal 1)]. With the old UAL-keying the
+    // fast-path promote would mispair to 9000ms, pushing P95 to 9000.
+    expect(s.latencyP50Ms).toBe(5000);
+    expect(s.latencyP95Ms).toBe(5000);
+  });
+
+  it('per-cg rollup groups and reports last watermark/head', () => {
+    db.insertReplicationEvent({ ts: now - 2_000, context_graph_id: 'cgA', on_chain_cg_id: '42', action: 'promote', ordinal: 1 });
+    db.insertReplicationEvent({ ts: now - 1_000, context_graph_id: 'cgA', on_chain_cg_id: '42', action: 'cursor-advance', from_watermark: 0, to_watermark: 1, head: 3 });
+    db.insertReplicationEvent({ ts: now - 1_500, context_graph_id: 'cgB', action: 'fetch' });
+
+    const rows = db.getReplicationPerCg(60 * 60 * 1000);
+    expect(rows.length).toBe(2);
+    const a = rows.find((r) => r.context_graph_id === 'cgA')!;
+    expect(a.promotes).toBe(1);
+    expect(a.cursor_advances).toBe(1);
+    expect(a.last_watermark).toBe(1);
+    expect(a.last_head).toBe(3);
+    // cgA most recently active → ordered first
+    expect(rows[0].context_graph_id).toBe('cgA');
+  });
+
+  it('timeline buckets events and optionally scopes to a CG', () => {
+    const bucketMs = 60_000;
+    db.insertReplicationEvent({ ts: now - 1000, context_graph_id: 'cgA', action: 'promote' });
+    db.insertReplicationEvent({ ts: now - 2000, context_graph_id: 'cgA', action: 'fetch' });
+    db.insertReplicationEvent({ ts: now - 1000, context_graph_id: 'cgB', action: 'promote' });
+
+    const all = db.getReplicationTimeline({ periodMs: 60 * 60 * 1000, bucketMs });
+    expect(all.reduce((s, b) => s + b.total, 0)).toBe(3);
+
+    const scoped = db.getReplicationTimeline({ periodMs: 60 * 60 * 1000, bucketMs, contextGraphId: 'cgA' });
+    expect(scoped.reduce((s, b) => s + b.total, 0)).toBe(2);
+    expect(scoped.reduce((s, b) => s + b.promotes, 0)).toBe(1);
+  });
+
+  it('cursors join subscriptions with observed chain head', () => {
+    db.upsertContextGraphSubscription({
+      context_graph_id: 'mfacts', name: 'Monday Fun Facts', subscribed: 1, synced: 1,
+      on_chain_id: '7', last_reconciled_ordinal: 4, sync_scoped: 1, updated_at: now,
+    });
+    db.insertReplicationEvent({ ts: now - 500, context_graph_id: 'mfacts', action: 'sweep', head: 6, to_watermark: 4 });
+
+    const cursors = db.getReplicationCursors();
+    const c = cursors.find((r) => r.context_graph_id === 'mfacts')!;
+    expect(c.last_reconciled_ordinal).toBe(4);
+    expect(c.on_chain_id).toBe('7');
+    expect(c.last_head).toBe(6);
+    // a subscription with no events still appears (head null)
+    db.upsertContextGraphSubscription({
+      context_graph_id: 'empty', subscribed: 1, synced: 0, sync_scoped: 1, updated_at: now,
+    });
+    const after = db.getReplicationCursors();
+    expect(after.find((r) => r.context_graph_id === 'empty')!.last_head).toBeNull();
+  });
+
+  it('per-cg event stream returns newest-first, capped', () => {
+    for (let i = 0; i < 5; i++) {
+      db.insertReplicationEvent({ ts: now - i * 1000, context_graph_id: 'cgA', action: 'promote', ordinal: 5 - i });
+    }
+    const events = db.getReplicationEventsForCg('cgA', 3);
+    expect(events.length).toBe(3);
+    // newest (ts = now) first
+    expect(events[0].ts).toBe(now);
+  });
+
+  it('V18 migration creates replication_events on an upgraded DB', () => {
+    db.close();
+    const raw = new Database(join(dir, 'node-ui.db'));
+    raw.pragma('user_version = 17');
+    raw.close();
+    const upgraded = new DashboardDB({ dataDir: dir });
+    expect(upgraded.db.pragma('user_version', { simple: true })).toBe(19);
+    // insert works → table exists
+    upgraded.insertReplicationEvent({ ts: now, context_graph_id: 'cg', action: 'promote' });
+    expect(upgraded.getReplicationSummary(60_000).promotes).toBe(1);
+    upgraded.close();
   });
 });

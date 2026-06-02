@@ -12,13 +12,34 @@ import type { Quad } from '@origintrail-official/dkg-storage';
 import { ethers } from 'ethers';
 import { createEVMAdapter, getSharedContext, createProvider, takeSnapshot, revertSnapshot, createTestContextGraph, seedContextGraphRegistration, HARDHAT_KEYS } from '../../chain/test/evm-test-context.js';
 import { mintTokens } from '../../chain/test/hardhat-harness.js';
-import { buildSeal } from './_helpers/seal.js';
+import { buildSeal, buildUpdateSeal, wrapPublisherForTest } from './_helpers/seal.js';
+import { makeHardhatReceiverACKProvider } from './_helpers/acks.js';
+import type { V10ACKProvider } from '../src/publisher.js';
 
 let CONTEXT_GRAPH: string;
 let GRAPH: string;
 let _kav10Address: string;
+let _dkaAddress: string;
 let _provider: ethers.JsonRpcProvider;
 const _author = new ethers.Wallet(HARDHAT_KEYS.CORE_OP);
+
+// RC11 / PR1: in-memory 3-of-N ACK provider for Hardhat publishes. Threaded
+// into the publishWS/updateWS helpers below since this test file builds
+// its publisher directly (no wrapPublisherForTest).
+let _ackProvider: V10ACKProvider | undefined;
+function getAckProvider(): V10ACKProvider {
+  if (!_ackProvider) {
+    if (!_kav10Address) {
+      throw new Error('getAckProvider() called before _kav10Address was initialized');
+    }
+    _ackProvider = makeHardhatReceiverACKProvider(
+      getSharedContext(),
+      _kav10Address,
+      [HARDHAT_KEYS.REC1_OP, HARDHAT_KEYS.REC2_OP, HARDHAT_KEYS.REC3_OP],
+    );
+  }
+  return _ackProvider;
+}
 const ENTITY = 'did:dkg:agent:QmImageBot';
 const ENTITY2 = 'did:dkg:agent:QmTextBot';
 const TEST_PUBLISHER_ADDRESS = new ethers.Wallet(HARDHAT_KEYS.CORE_OP).address;
@@ -44,7 +65,8 @@ describe('DKGPublisher', () => {
     const cgId = await createTestContextGraph(chain);
     CONTEXT_GRAPH = String(cgId);
     GRAPH = `did:dkg:context-graph:${CONTEXT_GRAPH}`;
-    _kav10Address = await chain.getKnowledgeAssetsV10Address();
+    _kav10Address = await chain.getKnowledgeAssetsLifecycleAddress();
+    _dkaAddress = (await chain.getDKGKnowledgeAssetsAddress!()).toLowerCase();
   });
 
   // Phase C made the publisher a pure transport — every on-chain test
@@ -60,17 +82,25 @@ describe('DKGPublisher', () => {
       contextGraphId: args.contextGraphId,
       ctx: { provider: _provider, kav10Address: _kav10Address },
     });
-    return publisher.publish({ ...args, precomputedAttestation: seal });
+    return publisher.publish({
+      ...args,
+      precomputedAttestation: seal,
+      v10ACKProvider: args.v10ACKProvider ?? getAckProvider(),
+    });
   }
-  async function updateWS(kcId: bigint, args: Parameters<DKGPublisher['update']>[1]) {
-    const seal = await buildSeal({
+  async function updateWS(kaId: bigint, args: Parameters<DKGPublisher['update']>[1]) {
+    const seal = await buildUpdateSeal({
+      kaId: kaId,
       quads: args.quads,
       privateQuads: args.privateQuads,
       author: _author,
-      contextGraphId: args.contextGraphId,
       ctx: { provider: _provider, kav10Address: _kav10Address },
     });
-    return publisher.update(kcId, { ...args, precomputedAttestation: seal });
+    return publisher.update(kaId, {
+      ...args,
+      precomputedUpdateAttestation: seal,
+      v10ACKProvider: args.v10ACKProvider ?? getAckProvider(),
+    });
   }
   afterAll(async () => {
     await revertSnapshot(_fileSnapshot);
@@ -90,6 +120,16 @@ describe('DKGPublisher', () => {
       keypair,
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
+    });
+    // RC11 / PR3: wrap so any direct `publisher.publishFromSharedMemory`
+    // call (e.g. the Round 12 Bug 34 internal-promote test) also gets a
+    // v10ACKProvider injected — the publish/update paths already mint
+    // their own ACK provider via `publishWS`/`updateWS`, but
+    // publishFromSharedMemory only flows through the wrapper.
+    publisher = wrapPublisherForTest(publisher, {
+      author: _author,
+      ctx: { provider: _provider, kav10Address: _kav10Address },
+      v10ACKProvider: getAckProvider(),
     });
   });
   afterEach(async () => {
@@ -129,20 +169,19 @@ describe('DKGPublisher', () => {
     expect(metaCount).toBeGreaterThan(0);
   });
 
-  it('publishes multiple KAs in one KC', async () => {
-    const result = await publishWS({
-      contextGraphId: CONTEXT_GRAPH,
-      quads: [
-        q(ENTITY, 'http://schema.org/name', '"ImageBot"'),
-        q(ENTITY2, 'http://schema.org/name', '"TextBot"'),
-      ],
-    });
-
-    expect(result.kaManifest).toHaveLength(2);
-    expect(result.kaManifest.map((m) => m.rootEntity).sort()).toEqual(
-      [ENTITY, ENTITY2].sort(),
-    );
-    expect(result.status).toBe('confirmed');
+  it('rejects publishing multiple KAs in one KC (greenfield: one KA per tx)', async () => {
+    // Greenfield KA model (PR #815): a V10 on-chain publish must carry
+    // exactly one Knowledge Asset per transaction. Publishing two root
+    // entities (ENTITY + ENTITY2) in a single call is now rejected.
+    await expect(
+      publishWS({
+        contextGraphId: CONTEXT_GRAPH,
+        quads: [
+          q(ENTITY, 'http://schema.org/name', '"ImageBot"'),
+          q(ENTITY2, 'http://schema.org/name', '"TextBot"'),
+        ],
+      }),
+    ).rejects.toThrow(/exactly one Knowledge Asset per transaction/i);
   });
 
   it('publishes with blank nodes (auto-skolemized)', async () => {
@@ -170,7 +209,7 @@ describe('DKGPublisher', () => {
     }
   });
 
-  it('publishes with private triples', async () => {
+  it('publishes with private triples (tentative under RC11 / PR1)', async () => {
     const result = await publishWS({
       contextGraphId: CONTEXT_GRAPH,
       quads: [q(ENTITY, 'http://schema.org/name', '"ImageBot"')],
@@ -181,7 +220,15 @@ describe('DKGPublisher', () => {
     expect(result.kaManifest[0].privateTripleCount).toBe(1);
     expect(result.kaManifest[0].privateMerkleRoot).toBeDefined();
     expect(result.kaManifest[0].privateMerkleRoot!).toHaveLength(32);
-    expect(result.status).toBe('confirmed');
+    // RC11 / PR1: the publisher intentionally skips peer ACK collection
+    // when the publish carries private quads (StorageACKHandler cannot
+    // recompute private merkle roots from SWM data alone, see
+    // `dkg-publisher.ts:1785-1786`). With the self-signed ACK fallback
+    // deleted, private-data publishes now correctly downgrade to
+    // `tentative` instead of confirming via a single bogus
+    // `peerId: 'self'` ACK. The private merkle/manifest accounting we
+    // actually care about above is unaffected.
+    expect(result.status).toBe('tentative');
   });
 
   it('rejects duplicate entity (exclusivity)', async () => {
@@ -204,7 +251,7 @@ describe('DKGPublisher', () => {
       quads: [q(ENTITY, 'http://schema.org/name', '"OldName"')],
     });
 
-    const updated = await updateWS(initial.kcId, {
+    const updated = await updateWS(initial.kaId, {
       contextGraphId: CONTEXT_GRAPH,
       quads: [q(ENTITY, 'http://schema.org/name', '"NewName"')],
     });
@@ -270,9 +317,10 @@ describe('DKGPublisher', () => {
     if (metaResult.type === 'bindings') {
       expect(metaResult.bindings).toHaveLength(1);
       const ual = metaResult.bindings[0]['ual'];
-      // UAL shape: did:dkg:{chainId}/{publisherAddress}/{startKAId}
+      // Greenfield UAL: did:dkg:{chainId}/{DKGKnowledgeAssets}/{kaId}
       expect(ual).toMatch(/^did:dkg:evm:31337\/0x[0-9a-fA-F]{40}\/\d+$/);
-      expect(ual).toContain(result.onChainResult!.publisherAddress);
+      expect(ual.toLowerCase()).toContain(_dkaAddress);
+      expect(ual).toContain(String(result.onChainResult!.startKAId));
     }
   });
 
@@ -448,14 +496,24 @@ describe('DKGPublisher', () => {
         { publisherPeerId: 'peer-internal', localOnly: true },
       );
       await seedContextGraphRegistration(store, CONTEXT_GRAPH);
-      // Tighten from `.resolves.toBeDefined()` (which would pass even on a
-      // silent-tentative result with zero manifest entries) to a real shape
-      // check: the internal publish must land in a valid terminal state AND
-      // surface the ENTITY we shared via at least one KA manifest entry.
-      // If the internal token bypass regresses, the reserved-namespace guard
-      // would reject publishFromSharedMemory and we'd get a throw here —
-      // still caught, but with an actual error instead of a silent pass.
-      const result = await publisher.publishFromSharedMemory(CONTEXT_GRAPH, 'all');
+      // RC11 / PR2: on-chain publishes via publishFromSharedMemory
+      // need a precomputedAttestation over the exact public-data-graph
+      // quads the publisher will select. Mint one matching the share()
+      // above.
+      const selectedQuads = [{
+        subject: ENTITY,
+        predicate: 'http://schema.org/name',
+        object: '"internal-path-test"',
+        graph: GRAPH,
+      }];
+      const result = await publisher.publishFromSharedMemory(CONTEXT_GRAPH, 'all', {
+        precomputedAttestation: await buildSeal({
+          quads: selectedQuads,
+          author: _author,
+          contextGraphId: CONTEXT_GRAPH,
+          ctx: { provider: _provider, kav10Address: _kav10Address },
+        }),
+      });
       expect(result).toBeDefined();
       expect(['tentative', 'confirmed']).toContain(result.status);
       expect(result.kaManifest.length).toBeGreaterThan(0);
@@ -471,10 +529,10 @@ describe('DKGPublisher', () => {
       // internal-token discriminator.
       //
       // We can't actually reach the on-chain part of update() in a
-      // unit test (it expects an existing kcId to update), but the
+      // unit test (it expects an existing kaId to update), but the
       // guard fires at the very top of the method BEFORE any chain
       // interaction — so the reserved-namespace rejection surfaces
-      // independently of whether the kcId exists.
+      // independently of whether the kaId exists.
       await expect(
         updateWS(0n, {
           contextGraphId: CONTEXT_GRAPH,
@@ -721,7 +779,7 @@ describe('DKGPublisher', () => {
           quads: [q('urn:dkg:filesystem:foo', 'http://schema.org/name', '"near-miss"')],
         });
         expect(result.ual).toMatch(/^did:dkg:/);
-        expect(result.kcId).toBeGreaterThan(0n);
+        expect(result.kaId).toBeGreaterThan(0n);
         expect(result.status === 'confirmed' || result.status === 'tentative').toBe(true);
       });
 
@@ -739,7 +797,7 @@ describe('DKGPublisher', () => {
           quads: [q('http://example.com/bug41-notreserved', 'http://schema.org/name', '"legit"')],
         });
         expect(result.ual).toMatch(/^did:dkg:/);
-        expect(result.kcId).toBeGreaterThan(0n);
+        expect(result.kaId).toBeGreaterThan(0n);
         expect(result.status === 'confirmed' || result.status === 'tentative').toBe(true);
       });
     });

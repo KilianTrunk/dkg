@@ -5,6 +5,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, relative, resolve, sep, isAbsolute } from 'node:path';
 import { handleNodeUIRequest } from '../src/api.js';
+import { DashboardDB } from '../src/db.js';
 
 /**
  * Boots a real Node `http.Server` whose request handler delegates to
@@ -299,6 +300,39 @@ describe('handleNodeUIRequest Stage 5 memory/publication routes', () => {
   });
 });
 
+// --- /api/logs compatibility route ---
+
+describe('handleNodeUIRequest /api/logs', () => {
+  it('delegates to the DB-backed compatibility search surface', async () => {
+    const calls: any[] = [];
+    harness.setArgs([
+      {
+        searchLogs: (opts: any) => {
+          calls.push(opts);
+          return {
+            total: 1,
+            logs: [{ ts: 1234, level: 'info', module: 'Publisher', message: 'publish completed' }],
+          };
+        },
+      } as any,
+      '.', undefined, undefined, undefined, undefined, undefined,
+    ] as any);
+
+    const res = await fetch(`${baseUrl}/api/logs?q=publish&level=info&module=Publisher&limit=5&offset=2`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.total).toBe(1);
+    expect(body.logs[0].message).toBe('publish completed');
+    expect(calls[0]).toMatchObject({
+      q: 'publish',
+      level: 'info',
+      module: 'Publisher',
+      limit: 5,
+      offset: 2,
+    });
+  });
+});
+
 // --- /api/node-log tail behavior ---
 
 describe('handleNodeUIRequest /api/node-log', () => {
@@ -559,5 +593,79 @@ describe('handleNodeUIRequest CORS origin handling', () => {
     const res = await fetch(`${baseUrl}/api/metrics`);
     expect(res.status).toBe(200);
     expect(res.headers.get('access-control-allow-origin')).toBeNull();
+  });
+});
+
+describe('handleNodeUIRequest replication routes (Phase F)', () => {
+  let db: DashboardDB;
+  let dir: string;
+  const now = Date.now();
+
+  beforeAll(() => {
+    dir = mkdtempSync(join(tmpdir(), 'dkg-repl-api-'));
+    db = new DashboardDB({ dataDir: dir });
+    db.upsertContextGraphSubscription({
+      context_graph_id: 'mfacts', name: 'Monday Fun Facts', subscribed: 1, synced: 1,
+      on_chain_id: '7', last_reconciled_ordinal: 2, sync_scoped: 1, updated_at: now,
+    });
+    db.insertReplicationEvent({ ts: now - 6000, context_graph_id: 'mfacts', on_chain_cg_id: '7', action: 'fetch', ual: 'urn:ka:1', ordinal: 1 });
+    db.insertReplicationEvent({ ts: now - 3000, context_graph_id: 'mfacts', on_chain_cg_id: '7', action: 'promote', ual: 'urn:ka:1', ordinal: 1 });
+    db.insertReplicationEvent({ ts: now - 2000, context_graph_id: 'mfacts', on_chain_cg_id: '7', action: 'cursor-advance', from_watermark: 1, to_watermark: 2, head: 4 });
+  });
+
+  afterAll(() => {
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  const args = () => [db as any, '.', undefined, undefined, undefined, undefined, undefined, undefined, undefined] as any;
+
+  it('GET /api/replication/summary returns KPIs', async () => {
+    harness.setArgs(args());
+    const res = await fetch(`${baseUrl}/api/replication/summary`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.promotes).toBe(1);
+    expect(body.fetches).toBe(1);
+    expect(body.latencyP50Ms).toBe(3000);
+  });
+
+  it('GET /api/replication/per-cg returns rows', async () => {
+    harness.setArgs(args());
+    const res = await fetch(`${baseUrl}/api/replication/per-cg`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.rows[0].context_graph_id).toBe('mfacts');
+    expect(body.rows[0].last_watermark).toBe(2);
+  });
+
+  it('GET /api/replication/cursors joins subscription watermark with head', async () => {
+    harness.setArgs(args());
+    const res = await fetch(`${baseUrl}/api/replication/cursors`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    const c = body.cursors.find((r: any) => r.context_graph_id === 'mfacts');
+    expect(c.last_reconciled_ordinal).toBe(2);
+    expect(c.last_head).toBe(4);
+  });
+
+  it('GET /api/replication/timeline buckets events', async () => {
+    harness.setArgs(args());
+    const res = await fetch(`${baseUrl}/api/replication/timeline?bucketMs=60000`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.buckets.reduce((s: number, b: any) => s + b.total, 0)).toBe(3);
+  });
+
+  it('GET /api/replication/events requires cg and returns the stream', async () => {
+    harness.setArgs(args());
+    const missing = await fetch(`${baseUrl}/api/replication/events`);
+    expect(missing.status).toBe(400);
+
+    const res = await fetch(`${baseUrl}/api/replication/events?cg=mfacts`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.events.length).toBe(3);
+    expect(body.events[0].action).toBe('cursor-advance'); // newest first
   });
 });

@@ -17,6 +17,7 @@ export {
 export {
   buildAgentProfile,
   canonicalAgentDidSubject,
+  collectPublishableMultiaddrs,
   AGENT_REGISTRY_CONTEXT_GRAPH,
   AGENT_REGISTRY_GRAPH,
   type AgentProfileConfig,
@@ -108,6 +109,7 @@ export {
   type PeerHealth,
   type CclPublishedEvaluationRecord,
   type CclPublishedResultEntry,
+  type PendingSenderKeyEntry,
 } from './dkg-agent-types.js';
 export {
   bindRandomSampling,

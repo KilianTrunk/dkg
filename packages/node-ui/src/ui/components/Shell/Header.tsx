@@ -1,11 +1,10 @@
-import React, { useEffect, useState, useRef, useCallback } from 'react';
-import { type Notification, fetchCurrentAgent, type AgentIdentity } from '../../api.js';
-import { api } from '../../api-wrapper.js';
+import React from 'react';
 import { useLayoutStore } from '../../stores/layout.js';
 import { useAgentsStore } from '../../stores/agents.js';
-import { useProjectsStore } from '../../stores/projects.js';
 import { useTabsStore } from '../../stores/tabs.js';
-import { useNodeEvents } from '../../hooks/useNodeEvents.js';
+import { useCurrentAgent } from '../../hooks/useCurrentAgent.js';
+import { NotificationsBell } from './NotificationsBell.js';
+import { formatPeerStatusTooltip } from '../../lib/formatPeerStatus.js';
 
 const GUARDIAN_LOGO_URL = new URL('../../assets/guardian-logo.svg', import.meta.url).href;
 
@@ -27,13 +26,6 @@ const ORIGINTRAIL_WORDMARK = (
       <path fillRule="evenodd" clipRule="evenodd" d="M19.781 9.94781C14.2903 9.94781 9.8385 14.4484 9.8385 20.0008C9.8385 25.5525 14.2903 30.0531 19.781 30.0531C22.833 30.0531 25.5632 28.6622 27.3869 26.4736L34.9141 32.8796C31.2855 37.2341 25.8532 40.0016 19.781 40.0016C8.85592 40.0016 0 31.0467 0 20.0008C0 8.95432 8.85592 0 19.781 0V9.94781ZM36.8737 30.0724L28.3719 25.0628C28.662 24.5606 28.9105 24.0308 29.112 23.4781L38.3464 26.9194C37.9453 28.0192 37.4508 29.0732 36.8737 30.0724ZM29.7216 20.0007H39.5609C39.5609 18.8159 39.4583 17.6554 39.2628 16.5272L29.5719 18.2549C29.6701 18.822 29.7216 19.4053 29.7216 20.0007ZM34.988 7.20831L27.425 13.5712C27.0546 13.1215 26.646 12.7054 26.2045 12.3272L32.5596 4.73338C33.4381 5.4858 34.251 6.31374 34.988 7.20831Z" fill="currentColor" />
     </svg>
   </span>
-);
-
-const BELL_ICON = (
-  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-    <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9" />
-    <path d="M13.73 21a2 2 0 0 1-3.46 0" />
-  </svg>
 );
 
 const SUN_ICON = (
@@ -79,52 +71,23 @@ const OBSERVABILITY_ICON = (
 export function Header() {
   const { theme, setTheme, leftCollapsed, toggleLeft, rightCollapsed, toggleRight } = useLayoutStore();
   const nodeStatus = useAgentsStore((s) => s.nodeStatus);
-  const [notifications, setNotifications] = useState<Notification[]>([]);
-  const [unread, setUnread] = useState(0);
-  const [showNotifs, setShowNotifs] = useState(false);
-  const notifRef = useRef<HTMLDivElement>(null);
-  const [currentAgent, setCurrentAgent] = useState<AgentIdentity | null>(null);
-  const setActiveProject = useProjectsStore((s) => s.setActiveProject);
+  // Use the deduplicating shared hook (BUG-007): every other consumer
+  // (Header, PanelRight, PanelLeft, modals, Dashboard's
+  // useMyContextGraphs) used to fire its own `fetchCurrentAgent` on
+  // mount AND poll independently. The shared hook coalesces all
+  // mounts under a single in-flight promise + 60s polling cadence,
+  // so the dashboard fan-out drops from ~14 calls in the first
+  // second to one.
+  const currentAgent = useCurrentAgent().data;
   const { openTab } = useTabsStore();
 
-  const loadNotifs = useCallback(() => {
-    api.fetchNotifications().then(({ notifications: n, unreadCount }: any) => {
-      setNotifications(n);
-      setUnread(unreadCount);
-    }).catch(() => {});
-  }, []);
-
-  useEffect(() => {
-    loadNotifs();
-    const iv = setInterval(loadNotifs, 60_000);
-    return () => clearInterval(iv);
-  }, [loadNotifs]);
-
-  useNodeEvents(useCallback((event) => {
-    if (
-      event.type === 'join_request' ||
-      event.type === 'join_approved' ||
-      event.type === 'join_rejected'
-    ) {
-      loadNotifs();
-    }
-  }, [loadNotifs]));
-
-  useEffect(() => {
-    const handler = (e: MouseEvent) => {
-      if (notifRef.current && !notifRef.current.contains(e.target as Node)) setShowNotifs(false);
-    };
-    document.addEventListener('mousedown', handler);
-    return () => document.removeEventListener('mousedown', handler);
-  }, []);
-
-  useEffect(() => {
-    fetchCurrentAgent().then(setCurrentAgent).catch(() => {});
-  }, []);
-
   const connectedPeers = nodeStatus?.connectedPeers ?? nodeStatus?.peerCount ?? 0;
+  const directConns = nodeStatus?.connections?.direct ?? 0;
+  const relayedConns = nodeStatus?.connections?.relayed ?? 0;
+  const uptimeMs = nodeStatus?.uptimeMs ?? 0;
   const statusLoaded = nodeStatus != null;
   const synced = statusLoaded && nodeStatus?.synced !== false;
+  const peerStatusLabel = formatPeerStatusTooltip(synced, connectedPeers, directConns, relayedConns, uptimeMs);
 
   return (
     <header className="v10-header">
@@ -161,7 +124,7 @@ export function Header() {
 
       <div className="v10-header-spacer" />
 
-      <div className="v10-header-meta">
+      <div className="v10-header-meta" title={peerStatusLabel}>
         <span className={`v10-header-status-dot ${synced ? 'online' : 'offline'}`} />
         <span>{synced ? 'synced' : 'syncing'}</span>
         <span className="v10-header-meta-sep">·</span>
@@ -169,52 +132,7 @@ export function Header() {
       </div>
 
       <div className="v10-header-actions">
-        <div className="v10-header-notif-wrap" ref={notifRef}>
-          <button
-            className="v10-header-icon-btn"
-            onClick={() => {
-              setShowNotifs((v) => !v);
-              if (unread > 0) api.markNotificationsRead().then(() => setUnread(0)).catch(() => {});
-            }}
-          >
-            {BELL_ICON}
-            {unread > 0 && <span className="v10-header-notif-badge">{unread}</span>}
-          </button>
-          {showNotifs && (
-            <div className="v10-header-notif-dropdown">
-              <div className="v10-header-notif-title">Notifications</div>
-              {notifications.length === 0 ? (
-                <div className="v10-header-notif-empty">No notifications</div>
-              ) : notifications.slice(0, 12).map((n, i) => {
-                const meta = n.meta ? (() => { try { return JSON.parse(n.meta); } catch { return null; } })() : null;
-                const isJoinReq = n.type === 'join_request';
-                const isJoinApproved = n.type === 'join_approved';
-                const isJoinRejected = n.type === 'join_rejected';
-                // A rejection doesn't correspond to a project the invitee
-                // has access to, so there's nothing useful to open on click.
-                const clickable = (isJoinReq || isJoinApproved) && meta?.contextGraphId;
-                return (
-                  <div
-                    key={i}
-                    className={`v10-header-notif-item ${isJoinReq ? 'v10-notif-join' : ''} ${isJoinApproved ? 'v10-notif-approved' : ''} ${isJoinRejected ? 'v10-notif-rejected' : ''} ${clickable ? 'v10-notif-clickable' : ''}`}
-                    onClick={clickable ? () => {
-                      setActiveProject(meta.contextGraphId);
-                      openTab({ id: `project:${meta.contextGraphId}`, label: meta.contextGraphId.slice(0, 16), closable: true });
-                      setShowNotifs(false);
-                    } : undefined}
-                    title={clickable ? 'Click to open project' : undefined}
-                  >
-                    {isJoinReq && <span className="v10-notif-join-icon">🔑</span>}
-                    {isJoinApproved && <span className="v10-notif-join-icon">✓</span>}
-                    {isJoinRejected && <span className="v10-notif-join-icon">✕</span>}
-                    <div className="v10-header-notif-item-text">{n.message ?? n.title ?? 'Notification'}</div>
-                    {n.ts && <div className="v10-header-notif-item-time">{new Date(n.ts).toLocaleTimeString()}</div>}
-                  </div>
-                );
-              })}
-            </div>
-          )}
-        </div>
+        <NotificationsBell />
 
         <button
           className="v10-header-icon-btn"

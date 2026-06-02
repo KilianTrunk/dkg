@@ -37,6 +37,7 @@ describe('LiftJob request and record types', () => {
       'accessPolicy',
       'allowedPeers',
       'entityProofs',
+      'publishEpochs',
       'publisherNodeIdentityIdOverride',
       'seal',
     ]);

@@ -80,16 +80,26 @@ function inMemoryQueryEngine(store: Captured[]): QueryEngine & { lastSparql?: st
     async query(sparql) {
       engine.lastSparql = sparql;
       const bindings: Record<string, string>[] = [];
-      // The real buildEpcisQuery emits `{ ?event epcis:epcList "<epc>" }`
-      // (NOT a FILTER) for the epc= param. Parse that so our fake engine
-      // actually narrows results the way the daemon would.
-      const epcListMatch = sparql.match(/\?event epcis:epcList "([^"]+)"/);
-      const wantEpc = epcListMatch?.[1];
+      // Blazegraph-compat rewrite (#789): the real buildEpcisQuery now
+      // emits a VALUES-bound predicate variable for the epc= param —
+      // `{ VALUES ?_epcPred { epcis:epcList epcis:childEPCs } ?event
+      // ?_epcPred "<epc>" . }` — instead of the old
+      // `{ ?event epcis:epcList "<epc>" }` UNION form. Parse the new
+      // shape so our fake engine narrows results the way the daemon
+      // would (match on epcList OR childEPCs, mirroring the VALUES set).
+      const epcPredMatch = sparql.match(/\?event \?_epcPred "([^"]+)"/);
+      const wantEpc = epcPredMatch?.[1];
       for (const c of store) {
         const doc = capturedDocument(c.content);
         const events = doc.epcisBody?.eventList ?? doc.eventList ?? [];
         for (const e of events) {
-          if (wantEpc && !(e.epcList ?? []).includes(wantEpc)) continue;
+          if (
+            wantEpc &&
+            !(e.epcList ?? []).includes(wantEpc) &&
+            !((e as any).childEPCs ?? []).includes(wantEpc)
+          ) {
+            continue;
+          }
 
           bindings.push({
             event: `urn:uuid:fixture-${bindings.length}`,

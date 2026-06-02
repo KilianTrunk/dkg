@@ -17,6 +17,19 @@ export interface SyncRequestEnvelope {
   requesterSignatureVS?: string;
   phase?: SyncPhase;
   snapshotRef?: string;
+  /**
+   * Phase C — optional, UNSIGNED delta-sync hint. When set, the responder
+   * returns only Knowledge Assets whose KC `dkg:batchId` is strictly greater
+   * than this value (the requester's per-CG high-water mark). Encoded as a
+   * decimal string because batchIds are `uint256` and exceed `Number`.
+   *
+   * Deliberately NOT part of `computeSyncDigest` (same treatment as
+   * `phase`/`snapshotRef`): it can only ever NARROW the result set, so a
+   * subset is always authorization-safe and needs no signed-digest version
+   * bump or negotiation. Old responders ignore the unknown field and return a
+   * full scan; new responders honor it and return a delta.
+   */
+  sinceBatchId?: string;
 }
 
 interface BuildSyncRequestParams {
@@ -28,6 +41,7 @@ interface BuildSyncRequestParams {
   requesterPeerId: string;
   phase?: SyncPhase;
   snapshotRef?: string;
+  sinceBatchId?: string;
   needsAuth: boolean;
   computeSyncDigest: (
     contextGraphId: string,
@@ -64,6 +78,7 @@ export async function buildSyncRequestEnvelope(params: BuildSyncRequestParams): 
     requesterPeerId,
     phase,
     snapshotRef,
+    sinceBatchId,
     needsAuth,
     computeSyncDigest,
     getIdentityId,
@@ -79,7 +94,9 @@ export async function buildSyncRequestEnvelope(params: BuildSyncRequestParams): 
       : phase === 'snapshot'
         ? `|snapshot|${snapshotRef ?? ''}`
         : '';
-    return new TextEncoder().encode(`${prefix}|${offset}|${limit}${phaseSuffix}`);
+    // Phase C: trailing keyed token; old responders ignore the extra parts.
+    const sinceSuffix = sinceBatchId ? `|since|${sinceBatchId}` : '';
+    return new TextEncoder().encode(`${prefix}|${offset}|${limit}${phaseSuffix}${sinceSuffix}`);
   }
 
   const request: SyncRequestEnvelope = {
@@ -94,6 +111,8 @@ export async function buildSyncRequestEnvelope(params: BuildSyncRequestParams): 
   };
   if (phase) request.phase = phase;
   if (snapshotRef) request.snapshotRef = snapshotRef;
+  // Phase C: set AFTER digest computation below — it is intentionally outside
+  // the signature (narrowing-only, see field docs).
 
   // Bind the "on behalf of" agent claim INTO the signed digest so the
   // responder's per-agent delegation lookup can't be steered by post-
@@ -114,6 +133,10 @@ export async function buildSyncRequestEnvelope(params: BuildSyncRequestParams): 
     request.issuedAtMs!,
     request.requesterAgentAddress,
   );
+
+  // Phase C: ride the envelope unsigned, after the digest (cannot influence
+  // authorization; only narrows the responder's result set).
+  if (sinceBatchId) request.sinceBatchId = sinceBatchId;
 
   const identityId = await getIdentityId();
   if (identityId > 0n && typeof signMessage === 'function') {

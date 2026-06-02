@@ -354,6 +354,78 @@ jobs:
           echo "EXTRA_TAGS=${EXTRA_TAGS}" >> "$GITHUB_OUTPUT"
           echo "Resolved dist-tags: ${NPM_TAG} ${EXTRA_TAGS:++ $EXTRA_TAGS} for ${TAG}"
 
+      - name: Generate build-info.json for published packages (RFC-41 §4.9)
+        # CI writes `build-info.json` into each public package root
+        # before `pnpm pack` runs, so the tarball — and therefore
+        # the installed npm package — carries the build's commit
+        # SHA + ISO timestamp + dist-tag + CI run id.
+        #
+        # The daemon's `loadBuildInfo()` (packages/cli/src/daemon/manifest.ts)
+        # reads this file at startup. `/api/status` exposes it as
+        # `{commit, commitShort, buildTime, distTag}`. `dkg doctor`'s
+        # §4.7.0 state summary surfaces it alongside the rest of the
+        # install context. Pre-release dist-tag testing becomes
+        # auditable: operators see exactly which commit they're
+        # running, not just a semver tag that may have multiple
+        # sequential builds.
+        #
+        # `files` field on each package.json must include
+        # `build-info.json` for it to be picked up by pnpm pack
+        # (cli has been updated; other public packages will be
+        # added on a follow-up if they also serve build-info via
+        # an HTTP route).
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          NPM_TAG: ${{ steps.dist-tag.outputs.NPM_TAG }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          VER="${TAG_NAME#v}"
+          COMMIT="${GITHUB_SHA}"
+          COMMIT_SHORT="${COMMIT:0:8}"
+          BUILD_TIME="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+          CI_RUN="${GITHUB_RUN_ID}"
+          DIST_TAG="${NPM_TAG}"
+          echo "build-info.json fields:"
+          echo "  version    = ${VER}"
+          echo "  commit     = ${COMMIT}"
+          echo "  commitShort= ${COMMIT_SHORT}"
+          echo "  buildTime  = ${BUILD_TIME}"
+          echo "  distTag    = ${DIST_TAG}"
+          echo "  ciRun      = ${CI_RUN}"
+          node -e "
+            const fs = require('fs');
+            const path = require('path');
+            const payload = {
+              version: '${VER}',
+              commit: '${COMMIT}',
+              commitShort: '${COMMIT_SHORT}',
+              buildTime: '${BUILD_TIME}',
+              distTag: '${DIST_TAG}',
+              ciRun: '${CI_RUN}',
+            };
+            const pkgsDir = path.join(process.cwd(), 'packages');
+            for (const dir of fs.readdirSync(pkgsDir)) {
+              const pkgPath = path.join(pkgsDir, dir, 'package.json');
+              if (!fs.existsSync(pkgPath)) continue;
+              const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
+              if (pkg.private) continue;
+              // Only write build-info.json into packages whose 'files'
+              // field explicitly includes it. Other packages would
+              // accept the file on disk during pack-time but the
+              // tarball pruning step (npm's standard files-list
+              // behaviour) would silently drop it. Explicit gating
+              // keeps the file's presence on a published tarball
+              // a deterministic per-package choice.
+              const files = Array.isArray(pkg.files) ? pkg.files : null;
+              if (files && !files.includes('build-info.json')) continue;
+              const outPath = path.join(pkgsDir, dir, 'build-info.json');
+              fs.writeFileSync(outPath, JSON.stringify(payload, null, 2) + '\n');
+              console.log('  wrote ' + outPath);
+            }
+          "
+
       - name: Pack public packages into tarballs
         # `pnpm pack` runs the same prepack/prepare lifecycle hooks
         # `pnpm publish` would, but EMITS A TARBALL instead of pushing

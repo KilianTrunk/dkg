@@ -34,7 +34,12 @@ export interface MetricsSource {
   getTotalKAs(): Promise<number>;
   getConfirmedKCs(): Promise<number>;
   getTentativeKCs(): Promise<number>;
-  getStoreBytes(): Promise<number>;
+  // External SPARQL backends (Blazegraph, sparql-http) own no local
+  // file, so `null` is the correct signal: collector writes a NULL into
+  // the `store_bytes` SQLite column (already nullable). Quad count for
+  // external backends is exposed on demand via `/api/status` instead of
+  // periodically snapshotted.
+  getStoreBytes(): Promise<number | null>;
   getRpcLatencyMs(): Promise<number>;
   isRpcHealthy(): Promise<boolean>;
   /**

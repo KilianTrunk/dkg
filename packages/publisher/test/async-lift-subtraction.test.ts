@@ -4,13 +4,19 @@ import { GraphManager } from '@origintrail-official/dkg-storage';
 import { EVMChainAdapter } from '@origintrail-official/dkg-chain';
 import { TypedEventBus, generateEd25519Keypair } from '@origintrail-official/dkg-core';
 import { ethers } from 'ethers';
-import { DKGPublisher, generateSubGraphRegistration } from '../src/index.js';
+import {
+  DKGPublisher,
+  generateSubGraphRegistration,
+  getConfirmedStatusQuad,
+  getTentativeStatusQuad,
+} from '../src/index.js';
 import { validateLiftPublishPayload } from '../src/async-lift-validation.js';
 import { subtractFinalizedExactQuads } from '../src/async-lift-subtraction.js';
 import type { LiftValidationInput } from '../src/async-lift-validation.js';
 import { createEVMAdapter, getSharedContext, createProvider, takeSnapshot, revertSnapshot, createTestContextGraph, HARDHAT_KEYS } from '../../chain/test/evm-test-context.js';
 import { mintTokens } from '../../chain/test/hardhat-harness.js';
 import { wrapPublisherForTest } from './_helpers/seal.js';
+import { hardhatACKProvider } from './_helpers/acks.js';
 
 describe('subtractFinalizedExactQuads', () => {
   let store: OxigraphStore;
@@ -28,6 +34,7 @@ describe('subtractFinalizedExactQuads', () => {
     return wrapPublisherForTest(new DKGPublisher(opts), {
       author: _author,
       ctx: { provider: _provider, kav10Address: _kav10Address },
+      v10ACKProvider: hardhatACKProvider(_kav10Address),
     });
   }
 
@@ -41,7 +48,7 @@ describe('subtractFinalizedExactQuads', () => {
     CONTEXT_GRAPH = cgId.toString();
     _provider = provider;
     const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
-    _kav10Address = await chain.getKnowledgeAssetsV10Address();
+    _kav10Address = await chain.getKnowledgeAssetsLifecycleAddress();
   });
   afterAll(async () => {
     await revertSnapshot(_fileSnapshot);
@@ -89,6 +96,12 @@ describe('subtractFinalizedExactQuads', () => {
         publisherPeerId: 'peer-1',
       },
     };
+  }
+
+  async function markTentativePublishConfirmed(result: { readonly ual: string; readonly status: string }): Promise<void> {
+    expect(result.status).toBe('tentative');
+    await store.delete([getTentativeStatusQuad(result.ual, CONTEXT_GRAPH)]);
+    await store.insert([getConfirmedStatusQuad(result.ual, CONTEXT_GRAPH)]);
   }
 
   it('removes only the exact finalized public quads and keeps the remainder', async () => {
@@ -154,29 +167,90 @@ describe('subtractFinalizedExactQuads', () => {
     expect(result.resolved.quads).toEqual([genreQuad]);
   });
 
-  it('removes exact finalized public and private quads and returns an empty remainder for full no-op', async () => {
-    const validated = validateLiftPublishPayload(baseInput());
-    const authoritativePublic = validated.resolved.quads;
-    const authoritativePrivate = validated.resolved.privateQuads;
+  // RC11 / PR3: private-data publishes are now routed to
+  // `finalizeIntentionalLocalPublish` (tentative status), because
+  // peers cannot see private payloads and so a V10 ACK quorum is
+  // structurally impossible. The subtraction logic gates on
+  // `?kc <dkg:status> "confirmed"`, so already-published private
+  // quads will NEVER be matched on subsequent submissions until
+  // the chain confirms them — which it can't for private-only
+  // publishes today. The public-only variant of this test
+  // ("removes only the exact finalized public quads and keeps the
+  // remainder") still passes and pins the load-bearing subtraction
+  // invariant.
+  it.skip('removes exact finalized public and private quads and returns an empty remainder for full no-op', async () => {});
 
-    await publisher.publish({
+  it('removes finalized private IRI-object quads after store round-trip normalization', async () => {
+    const input: LiftValidationInput = {
+      ...baseInput(),
+      resolved: {
+        ...baseInput().resolved,
+        privateQuads: [
+          {
+            subject: 'urn:local:/rihana',
+            predicate: 'http://schema.org/secretLink',
+            object: '<urn:secret:iri-object>',
+            graph: '',
+          },
+        ],
+      },
+    };
+    const validated = validateLiftPublishPayload(input);
+
+    const publishResult = await publisher.publish({
       contextGraphId: CONTEXT_GRAPH,
-      quads: authoritativePublic,
-      privateQuads: authoritativePrivate,
+      quads: validated.resolved.quads,
+      privateQuads: validated.resolved.privateQuads,
       publisherPeerId: 'peer-1',
     });
+    await markTentativePublishConfirmed(publishResult);
 
     const result = await subtractFinalizedExactQuads({
       store,
       graphManager,
-      request: baseInput().request,
+      request: input.request,
       validation: validated.validation,
       resolved: validated.resolved,
     });
 
-    expect(result.alreadyPublishedPublicCount).toBe(validated.resolved.quads.length);
-    expect(result.alreadyPublishedPrivateCount).toBe(validated.resolved.privateQuads?.length ?? 0);
-    expect(result.resolved.quads).toEqual([]);
+    expect(result.alreadyPublishedPrivateCount).toBe(1);
+    expect(result.resolved.privateQuads).toBeUndefined();
+  });
+
+  it('removes finalized private bare IRI-object quads after store round-trip normalization', async () => {
+    const input: LiftValidationInput = {
+      ...baseInput(),
+      resolved: {
+        ...baseInput().resolved,
+        privateQuads: [
+          {
+            subject: 'urn:local:/rihana',
+            predicate: 'http://schema.org/secretBareLink',
+            object: 'urn:secret:bare-iri-object',
+            graph: '',
+          },
+        ],
+      },
+    };
+    const validated = validateLiftPublishPayload(input);
+
+    const publishResult = await publisher.publish({
+      contextGraphId: CONTEXT_GRAPH,
+      quads: validated.resolved.quads,
+      privateQuads: validated.resolved.privateQuads,
+      publisherPeerId: 'peer-1',
+    });
+    await markTentativePublishConfirmed(publishResult);
+
+    const result = await subtractFinalizedExactQuads({
+      store,
+      graphManager,
+      request: input.request,
+      validation: validated.validation,
+      resolved: validated.resolved,
+    });
+
+    expect(result.alreadyPublishedPrivateCount).toBe(1);
     expect(result.resolved.privateQuads).toBeUndefined();
   });
 

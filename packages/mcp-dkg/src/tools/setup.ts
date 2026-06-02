@@ -18,6 +18,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import type { DkgClient } from '../client.js';
 import type { DkgConfig } from '../config.js';
+import { EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION } from './context-graph-description.js';
 
 type ToolResult = {
   content: Array<{ type: 'text'; text: string }>;
@@ -77,6 +78,9 @@ export function registerSetupTools(
         'The `id` slug is auto-derived from `name` when omitted (e.g. ' +
         '"My Research" → "my-research"); slugs must match ' +
         '/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/. ' +
+        'This create-only slug is not the same contract as existing-CG write targets: ' +
+        'after creation, pass the returned canonical `id` or full `did:dkg:context-graph:...` ' +
+        'URI to assertion, sub-graph, publish, and other write tools. ' +
         'Defaults to safe `sharing="invite-only"` + `contribution="curators-only"`; ' +
         'switch to `"open"` to make the CG publicly discoverable or to allow ' +
         'anyone to publish to Verified Memory respectively.',
@@ -87,8 +91,8 @@ export function registerSetupTools(
           .string()
           .optional()
           .describe(
-            'Optional explicit slug. Auto-derived from `name` when omitted. ' +
-              'Must match /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.',
+            'Optional explicit slug for creating a new CG. Auto-derived from `name` when omitted. ' +
+              'Must match /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/. Do not use this field as a model for existing-CG write targets; use the returned canonical id after creation.',
           ),
         sharing: z
           .enum(['open', 'invite-only'])
@@ -171,7 +175,7 @@ export function registerSetupTools(
         'pass `includeSharedMemory: false` to skip SWM sync (saves ' +
         'bandwidth when you only need on-chain data).',
       inputSchema: {
-        contextGraphId: z.string().min(1).describe('Context graph id (e.g. "my-research")'),
+        contextGraphId: z.string().min(1).describe(EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION),
         includeSharedMemory: z
           .boolean()
           .optional()
@@ -224,7 +228,7 @@ export function registerSetupTools(
         'silently reused, no error. Names must be lowercase letters, ' +
         'digits, and hyphens, and must not start with `_`.',
       inputSchema: {
-        contextGraphId: z.string().min(1).describe('Parent context graph id'),
+        contextGraphId: z.string().min(1).describe(`Parent context graph id. ${EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION}`),
         subGraphName: z
           .string()
           .min(1)
@@ -244,4 +248,26 @@ export function registerSetupTools(
       }
     },
   );
+
+  // ── dkg_request_hosting (intentionally NOT registered) ──────────
+  // OT-RFC-38 / LU-6 Phase B — `POST /api/shared-memory/host-mode/
+  // subscribe` is the operator-driven manual path (#4 of the four
+  // LU-6 discovery mechanisms). It changes WHICH NODE hosts a
+  // curated CG's opaque ciphertext, which is a trust-boundary
+  // decision the curator owns — the agent must not invoke it
+  // autonomously through an MCP tool.
+  //
+  // Codex review #672 (id=3302086584): the previous `dkg_request_
+  // hosting` MCP tool let any connected agent flip its core into a
+  // host for any curated CG by name. Removed entirely here; the
+  // route stays in place for operators who invoke it directly via
+  // `curl` or the `dkg` CLI (see
+  // `docs/runbooks/RUNBOOK_HOST_MODE_MANUAL_SUBSCRIBE.md`).
+  //
+  // The `requestHostMode` client method (`packages/mcp-dkg/src/
+  // client.ts`) stays — it's still useful inside operator scripts
+  // that wrap the daemon API for their own internal tooling, just
+  // not exposed as an MCP-discoverable tool. The drop-sweep guard
+  // in `packages/mcp-dkg/test/drop-sweep.test.ts` blocks silent
+  // re-registration.
 }

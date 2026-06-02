@@ -41,6 +41,7 @@ import { existsSync, readdirSync, readFileSync, openSync, closeSync, writeFileSy
 // below so both sites coexist without a duplicate-module import.
 import * as osModule from 'node:os';
 const { homedir } = osModule;
+const MAX_PUBLISH_EPOCHS = 0xffffffff;
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { ethers } from 'ethers';
@@ -235,15 +236,10 @@ import {
   getCurrentCliVersion,
   type NpmVersionStatus,
   checkForNpmVersionUpdate,
-  checkForNewCommit,
-  checkForNewCommitWithStatus,
   type UpdateStatus,
   acquireUpdateLock,
   releaseUpdateLock,
-  performUpdate,
-  performUpdateWithStatus,
   performNpmUpdate,
-  checkForUpdate,
 } from '../auto-update.js';
 import {
   OPENCLAW_UI_CONNECT_TIMEOUT_MS,
@@ -383,9 +379,12 @@ export async function handlePublisherRoutes(ctx: RequestContext): Promise<void> 
       accessPolicy,
       allowedPeers,
       entityProofs,
+      publishEpochs,
       publisherNodeIdentityIdOverride,
       seal,
     } = parsed;
+    const rawPublishEpochs = publishEpochs ?? parsed.epochs;
+    const publishEpochsField = publishEpochs !== undefined ? "publishEpochs" : "epochs";
     const contextGraphId = parsed.contextGraphId;
     const shareOperationId = parsed.shareOperationId;
     const swmId = parsed.swmId ?? parsed.workspaceId ?? "swm-main";
@@ -406,6 +405,27 @@ export async function handlePublisherRoutes(ctx: RequestContext): Promise<void> 
         error: "Missing required enqueue fields",
       });
     }
+    let resolvedPublishEpochs: number | undefined;
+    if (rawPublishEpochs !== undefined && rawPublishEpochs !== null) {
+      const raw = String(rawPublishEpochs).trim();
+      if (!/^[1-9]\d*$/.test(raw)) {
+        return jsonResponse(res, 400, {
+          error: `"${publishEpochsField}" must be a positive integer (string or number)`,
+        });
+      }
+      const parsedEpochs = Number(raw);
+      if (!Number.isSafeInteger(parsedEpochs)) {
+        return jsonResponse(res, 400, {
+          error: `"${publishEpochsField}" is too large to safely represent as a JavaScript integer`,
+        });
+      }
+      if (parsedEpochs > MAX_PUBLISH_EPOCHS) {
+        return jsonResponse(res, 400, {
+          error: `"${publishEpochsField}" must be less than or equal to ${MAX_PUBLISH_EPOCHS}`,
+        });
+      }
+      resolvedPublishEpochs = parsedEpochs;
+    }
     // V10 sign-at-enqueue: callers build the EIP-712 AuthorAttestation themselves and pass it as `seal`. Sealless enqueues fall back to tentative.
     const jobId = await publisherControl.lift({
       swmId,
@@ -422,6 +442,7 @@ export async function handlePublisherRoutes(ctx: RequestContext): Promise<void> 
       ...(Array.isArray(allowedPeers) && allowedPeers.length > 0 ? { allowedPeers } : {}),
       // Strict boolean — `!!"false"` is `true`, silently inverting intent.
       ...(typeof entityProofs === 'boolean' ? { entityProofs } : {}),
+      ...(resolvedPublishEpochs !== undefined ? { publishEpochs: resolvedPublishEpochs } : {}),
       ...(publisherNodeIdentityIdOverride !== undefined
         ? { publisherNodeIdentityIdOverride: String(publisherNodeIdentityIdOverride) }
         : {}),

@@ -36,6 +36,8 @@ import { existsSync, readdirSync, readFileSync, openSync, closeSync, writeFileSy
 // OpenClaw config helper (~line 2535) uses a bare `homedir()` — aliased
 // below so both sites coexist without a duplicate-module import.
 import * as osModule from 'node:os';
+import type { NetworkInterfaceInfo } from 'node:os';
+import { checkCoreRelayPrereqs } from './core-prereq-check.js';
 const { homedir } = osModule;
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
@@ -51,9 +53,14 @@ const daemonRequire = createRequire(import.meta.url);
 
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
-import { enrichEvmError, MockChainAdapter } from '@origintrail-official/dkg-chain';
+import {
+  enrichEvmError,
+  MockChainAdapter,
+  type ApprovalPolicy,
+} from '@origintrail-official/dkg-chain';
 import { DKGAgent, loadOpWallets } from '@origintrail-official/dkg-agent';
-import { computeNetworkId, createOperationContext, DKGEvent, Logger, PayloadTooLargeError, GET_VIEWS, TrustLevel, validateSubGraphName, validateAssertionName, validateContextGraphId, isSafeIri, assertSafeIri, sparqlIri, contextGraphSharedMemoryUri, contextGraphAssertionUri, contextGraphMetaUri, DEFAULT_PROTOCOL_OUTBOX_BACKOFFS_MS, DEFAULT_PROTOCOL_OUTBOX_MAX_AGE_MS } from '@origintrail-official/dkg-core';
+import { isExternalBackend } from '@origintrail-official/dkg-storage';
+import { computeNetworkId, createOperationContext, DKGEvent, Logger, PayloadTooLargeError, GET_VIEWS, TrustLevel, validateSubGraphName, validateAssertionName, validateContextGraphId, isSafeIri, assertSafeIri, sparqlIri, contextGraphSharedMemoryUri, contextGraphAssertionUri, contextGraphMetaUri, DEFAULT_PROTOCOL_OUTBOX_BACKOFFS_MS, DEFAULT_PROTOCOL_OUTBOX_MAX_AGE_MS, pickNetworkTunables } from '@origintrail-official/dkg-core';
 import { findReservedSubjectPrefix, isSkolemizedUri } from '@origintrail-official/dkg-publisher';
 import {
   DashboardDB,
@@ -91,6 +98,7 @@ import {
   type LocalAgentIntegrationTransport,
   resolveContextGraphs,
   resolveNetworkDefaultContextGraphs,
+  resolveApprovalPolicy,
   resolveSharedMemoryTtlMs,
   repoDir,
   releasesDir,
@@ -100,8 +108,10 @@ import {
   gitCommandEnv,
   gitCommandArgs,
   isStandaloneInstall,
+  resolveAutoUpdateSource,
   slotEntryPoint,
   CLI_NPM_PACKAGE,
+  exitOnStoreConfigErrors,
 } from '../config.js';
 import { createPublicSnapshotStore, createPublisherControlFromStore, startPublisherRuntimeIfEnabled, type PublisherRuntime } from '../publisher-runner.js';
 import { createCatchupRunner, type CatchupJobResult, type CatchupRunner } from '../catchup-runner.js';
@@ -145,6 +155,7 @@ import { DkgClient } from '@origintrail-official/dkg-mcp/client';
 // the project's tsconfig (`noUnusedLocals` is off).
 import {
   daemonState,
+  resolveStandaloneInstall,
   type CorsAllowlist,
 } from './state.js';
 import {
@@ -173,6 +184,8 @@ import {
   loadMarkItDownTargets,
   getNodeVersion,
   getCurrentCommitShort,
+  loadBuildInfo,
+  detectInstallMode,
   loadSkillTemplate,
   buildSkillMd,
   skillEtag,
@@ -238,17 +251,20 @@ import {
   getCurrentCliVersion,
   type NpmVersionStatus,
   checkForNpmVersionUpdate,
-  checkForNewCommit,
-  checkForNewCommitWithStatus,
   type UpdateStatus,
   acquireUpdateLock,
   releaseUpdateLock,
-  performUpdate,
-  performUpdateWithStatus,
   performNpmUpdate,
-  checkForUpdate,
+  performNpmUpdateEdge,
 } from './auto-update.js';
-import { chainResetWipe } from './chain-reset-wipe.js';
+import { chainResetWipe, detectBackendSwitch } from './chain-reset-wipe.js';
+import {
+  checkExternalStoreReachable,
+  checkOrSetStoreIdentity,
+  formatHealthCheckFailure,
+  formatIdentityTagMismatch,
+} from './store-health-check.js';
+import { resetNatStatus, startNatStatusWatcher } from './nat-status.js';
 import {
   OPENCLAW_UI_CONNECT_TIMEOUT_MS,
   OPENCLAW_UI_CONNECT_POLL_MS,
@@ -299,6 +315,7 @@ import {
   verifyOpenClawAttachmentRefsProvenance,
 } from './openclaw.js';
 import { buildChatAcl } from './chat-acl.js';
+import { recordAssertionActivity, localNodeInvolvedInContextGraph } from './activity-notification.js';
 import {
   type LocalAgentIntegrationDefinition,
   type LocalAgentIntegrationRecord,
@@ -333,6 +350,73 @@ import {
 import { handleRequest } from './handle-request.js';
 import { loadRoutePlugins, countConfiguredPluginSpecs } from './plugin-loader.js';
 import type { MemoryGraphChangedEvent, MemoryGraphLayer } from './routes/context.js';
+import {
+  createPromoteWorkerSupervisor,
+  type PromoteWorkerConfig,
+  type PromoteWorkerSupervisor,
+} from './worker/async-promote-worker.js';
+
+type MultiaddrLike = { toString: () => string };
+
+function stringifyMultiaddrList(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((ma) => {
+      try {
+        return (ma as MultiaddrLike).toString();
+      } catch {
+        return '';
+      }
+    })
+    .filter((addr) => addr.length > 0);
+}
+
+function listenerMultiaddrs(listener: unknown): string[] {
+  const candidate = listener as {
+    getAddrs?: () => unknown;
+    getMultiaddrs?: () => unknown;
+    addrs?: unknown;
+    multiaddrs?: unknown;
+  };
+  if (typeof candidate?.getAddrs === 'function') {
+    const addrs = stringifyMultiaddrList(candidate.getAddrs());
+    if (addrs.length > 0) return addrs;
+  }
+  if (typeof candidate?.getMultiaddrs === 'function') {
+    const addrs = stringifyMultiaddrList(candidate.getMultiaddrs());
+    if (addrs.length > 0) return addrs;
+  }
+  const addrs = stringifyMultiaddrList(candidate?.addrs);
+  if (addrs.length > 0) return addrs;
+  return stringifyMultiaddrList(candidate?.multiaddrs);
+}
+
+function getBoundListenMultiaddrs(libp2p: unknown): string[] | null {
+  const node = libp2p as {
+    components?: { transportManager?: unknown };
+    services?: { transportManager?: unknown };
+    transportManager?: unknown;
+    getMultiaddrs?: () => unknown;
+  };
+  const managers = [
+    node.components?.transportManager,
+    node.services?.transportManager,
+    node.transportManager,
+  ];
+  for (const manager of managers) {
+    const getListeners = (manager as { getListeners?: () => unknown } | undefined)?.getListeners;
+    if (typeof getListeners !== 'function') continue;
+    const listeners = getListeners.call(manager);
+    if (!Array.isArray(listeners)) continue;
+    const addrs = listeners.flatMap((listener) => listenerMultiaddrs(listener));
+    if (addrs.length > 0) return Array.from(new Set(addrs));
+  }
+
+  // If this libp2p shape does not expose transport listeners, prefer an
+  // indeterminate result over treating advertised self-addresses as bound
+  // listener evidence.
+  return null;
+}
 
 /**
  * Resolve the WM agentAddress the daemon hands to `ChatMemoryManager`.
@@ -379,6 +463,67 @@ export function resolveMemoryAgentAddress(agent: {
  * relays. Counts (`envCount`, `configCount`, `preferredCount`) are
  * reported back for the operator-visible startup log line.
  */
+/**
+ * PR3 / RC11 — known-public JSON-RPC hostnames that emit a startup
+ * WARN when the daemon inherits them from `network/<env>.json#chain.rpcUrl`
+ * without an explicit operator override. The list is intentionally
+ * conservative: only well-known free public endpoints make the cut, so
+ * a private RPC behind a load balancer never trips it. Match against
+ * the parsed URL's hostname (lowercased) so a private proxy URL that
+ * happens to embed a public hostname in its PATH (e.g.
+ * `https://rpc.my-company.example/proxy?url=https://sepolia.base.org/`)
+ * is never misclassified as public. The trigger is purely
+ * informational — it does NOT block startup, it only gives the
+ * operator a single prominent log line so the dzudza failure mode
+ * (silent RPC rate-limit during ACK pre-flight) becomes self-diagnostic.
+ *
+ * If the list grows out of sync with reality the cost is a noisy
+ * WARN for a private RPC whose hostname is literally one of the entries
+ * (over-warn) or a quiet false-negative on a new public endpoint
+ * (under-warn). Both are recoverable by editing this list — and an
+ * operator who reads the WARN can always suppress it by setting
+ * `chain.rpcUrl` in their config.json. The default behaviour stays
+ * correct either way.
+ */
+const KNOWN_PUBLIC_RPC_HOSTS = [
+  'sepolia.base.org',
+  'mainnet.base.org',
+  'rpc.sepolia.org',
+  'ethereum-sepolia.publicnode.com',
+  'rpc.ankr.com',
+  'eth-sepolia.public.blastapi.io',
+  'sepolia.gateway.tenderly.co',
+];
+
+export function isLikelyPublicRpc(url: string): boolean {
+  // PR3 (review fix #2): parse the URL and match against `hostname`
+  // only. The previous implementation did a `lower.includes(host)`
+  // against the full URL string, which would flag a private proxy
+  // URL like `https://rpc.my-company.example/upstream/sepolia.base.org`
+  // as public — the host substring appears in the PATH, not the host.
+  //
+  // Endpoint suffix match (`===` OR `.endsWith('.' + host)`) is the
+  // standard way to match a hostname against a known list while still
+  // matching well-known subdomains (e.g. `eu.rpc.ankr.com` for
+  // `rpc.ankr.com`). Falls back to the old substring scan if the URL
+  // is unparseable (e.g. a bare host without a scheme), so the
+  // diagnostic surface stays the same for malformed inputs an operator
+  // might still want flagged.
+  let hostname: string | undefined;
+  try {
+    hostname = new URL(url).hostname.toLowerCase();
+  } catch {
+    hostname = undefined;
+  }
+  if (hostname !== undefined) {
+    return KNOWN_PUBLIC_RPC_HOSTS.some(
+      (host) => hostname === host || hostname!.endsWith(`.${host}`),
+    );
+  }
+  const lower = url.toLowerCase();
+  return KNOWN_PUBLIC_RPC_HOSTS.some((host) => lower.includes(host));
+}
+
 export function mergePreferredRelays(input: {
   envValue: string | undefined;
   configPreferred: unknown;
@@ -418,6 +563,127 @@ export function mergePreferredRelays(input: {
     envCount: envParsed.length,
     configCount: configParsed.length,
     preferredCount: preferredInResult.length,
+  };
+}
+
+export interface PromoteWorkerDaemonLifecycle {
+  waitForStartup(): Promise<void>;
+  stop(reason?: string | null): Promise<void>;
+  getSupervisor(): PromoteWorkerSupervisor | null;
+}
+
+export function startPromoteWorkerDaemonLifecycle(input: {
+  agent: PromoteWorkerConfig['agent'];
+  log: (msg: string) => void;
+  emitMemoryGraphChanged: (event: MemoryGraphChangedEvent) => void;
+  enabled?: boolean;
+  isShuttingDown?: () => boolean;
+  workerConfig?: Omit<PromoteWorkerConfig, 'agent' | 'log' | 'emitMemoryGraphChanged'>;
+}): PromoteWorkerDaemonLifecycle {
+  let promoteWorkerSupervisor: PromoteWorkerSupervisor | null = null;
+  let promoteWorkerStartup: Promise<void> | null = null;
+  let promoteWorkerTimer: ReturnType<typeof setTimeout> | null = null;
+
+  if (input.enabled === false) {
+    daemonState.promoteWorkerAvailable = false;
+    daemonState.promoteWorkerUnavailableReason = 'disabled via config.promoteQueue.enabled=false';
+    input.log("Async promote worker disabled via config.promoteQueue.enabled=false");
+    return {
+      waitForStartup: async () => {},
+      stop: async (reason: string | null = 'disabled via config.promoteQueue.enabled=false') => {
+        daemonState.promoteWorkerAvailable = false;
+        daemonState.promoteWorkerUnavailableReason = reason;
+      },
+      getSupervisor: () => null,
+    };
+  }
+
+  promoteWorkerTimer = setTimeout(() => {
+    promoteWorkerTimer = null;
+    void (async () => {
+      if (input.isShuttingDown?.()) return;
+      // Async-promote queue worker (PR #3) — drains the queue introduced
+      // in PR #1 + #2. It is intentionally independent from async-publisher
+      // bootstrap: `/promote-async` jobs only need the agent assertion API,
+      // and should not sit queued forever if publisher wallet/chain recovery
+      // hangs.
+      const supervisor = createPromoteWorkerSupervisor({
+        ...input.workerConfig,
+        agent: input.agent,
+        log: (msg) => input.log(`[promote-worker] ${msg}`),
+        emitMemoryGraphChanged: input.emitMemoryGraphChanged,
+      });
+      promoteWorkerSupervisor = supervisor;
+      let startup!: Promise<void>;
+      startup = (async () => {
+        try {
+          await supervisor.start();
+          if (!input.isShuttingDown?.() && promoteWorkerSupervisor === supervisor) {
+            daemonState.promoteWorkerAvailable = true;
+            daemonState.promoteWorkerUnavailableReason = null;
+            input.log("[async-promote-worker] supervisor started; /promote-async accepting jobs");
+          }
+        } catch (err: any) {
+          // Codex PR #665 review (id=3300423547): a single startup
+          // failure here used to leave the queue silently dead. The
+          // route layer now gates `/promote-async` on
+          // `promoteWorkerAvailable`, so enqueue / list / status all
+          // 503 until something explicitly restarts the supervisor.
+          // The structured `[async-promote-worker]` tag makes the
+          // failure trivially greppable in operator logs alongside
+          // the daemon's other startup banners.
+          const message = err?.message ?? String(err);
+          daemonState.promoteWorkerAvailable = false;
+          daemonState.promoteWorkerUnavailableReason = message;
+          if (!input.isShuttingDown?.()) {
+            input.log(
+              `[async-promote-worker] startup failed; queue is read-only until daemon restart: ${message}`,
+            );
+          }
+          if (promoteWorkerSupervisor === supervisor) {
+            promoteWorkerSupervisor = null;
+          }
+        } finally {
+          if (promoteWorkerStartup === startup) {
+            promoteWorkerStartup = null;
+          }
+        }
+      })();
+      promoteWorkerStartup = startup;
+      await startup;
+    })();
+  }, 0);
+  if (promoteWorkerTimer.unref) promoteWorkerTimer.unref();
+
+  async function waitForStartup(): Promise<void> {
+    if (promoteWorkerTimer) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+    await promoteWorkerStartup;
+  }
+
+  async function stop(reason: string | null = null): Promise<void> {
+    if (promoteWorkerTimer) {
+      clearTimeout(promoteWorkerTimer);
+      promoteWorkerTimer = null;
+    }
+    daemonState.promoteWorkerAvailable = false;
+    daemonState.promoteWorkerUnavailableReason = reason;
+    await promoteWorkerSupervisor
+      ?.stop()
+      .catch((err: any) =>
+        input.log(`Promote worker stop error: ${err?.message ?? String(err)}`),
+      );
+    await promoteWorkerStartup
+      ?.catch((err: any) =>
+        input.log(`Promote worker startup wait error: ${err?.message ?? String(err)}`),
+      );
+  }
+
+  return {
+    waitForStartup,
+    stop,
+    getSupervisor: () => promoteWorkerSupervisor,
   };
 }
 
@@ -532,6 +798,36 @@ export async function runDaemonInner(
     : `v${nodeVersion}`;
   log(`Starting DKG ${role} node "${config.name}" (${versionTag})...`);
 
+  // RFC-41 §4.9 / §4.3: structured startup log lines for telemetry.
+  // The doctor's state summary correlates these with /api/status —
+  // every successful daemon start emits a parseable JSON line that
+  // an operator or CI pipeline can grep without needing the API up.
+  // Distinct tags (`dkg-build-info` + `install-mode-detected`) so a
+  // log shipper can split them into separate streams.
+  try {
+    const buildInfo = loadBuildInfo();
+    const installMode = detectInstallMode();
+    log(
+      `[dkg-build-info] ${JSON.stringify({
+        version: nodeVersion,
+        commit: buildInfo.commit,
+        commitShort: buildInfo.commitShort,
+        buildTime: buildInfo.buildTime,
+        distTag: buildInfo.distTag,
+        ciRun: buildInfo.ciRun,
+      })}`,
+    );
+    log(
+      `[install-mode-detected] ${JSON.stringify({
+        installMode,
+        nodeRole: role,
+      })}`,
+    );
+  } catch (err) {
+    // Never fail startup on a telemetry-log failure.
+    log(`[dkg-build-info] WARNING: failed to emit startup telemetry: ${String(err)}`);
+  }
+
   const network = await loadNetworkConfig();
   const syncContextGraphs = [
     ...new Set([
@@ -548,13 +844,84 @@ export async function runDaemonInner(
   // detects the change and wipes the now-orphaned chain state.
   // Operator's keystore + dashboard DB + uploaded files are preserved.
   // See docs/TESTNET_RESET.md and packages/cli/src/daemon/chain-reset-wipe.ts.
-  const wipeResult = chainResetWipe({
+  // Detect backend switch first. If the operator hand-edited
+  // store.backend between boots, refuse to start unless they opt in
+  // via DKG_ACCEPT_STORE_RESET=1. The new backend is fresh — any data
+  // held in the previous one is invisible to this boot. Booting
+  // silently would look like data loss to the operator.
+  const backendSwitch = detectBackendSwitch({
+    dataDir: dkgDir(),
+    currentBackend: config.store?.backend ?? 'oxigraph-worker',
+    acceptStoreReset: process.env.DKG_ACCEPT_STORE_RESET === '1',
+    log,
+  });
+  if (backendSwitch.aborted) {
+    process.exit(1);
+  }
+
+  // Refuse to start on invalid external-backend config (missing URL,
+  // missing blob/snapshot directory). This fires before the health
+  // check so operators see a single-line config error, not a confusing
+  // probe failure when the URL is just plain absent.
+  exitOnStoreConfigErrors(config, log);
+
+  // External triple-store backends (Blazegraph, sparql-http) get a
+  // boot-time reachability probe before anything that depends on them
+  // runs. We want operators who misconfigure the URL to see an
+  // actionable error within seconds — not a confusing failure deep in
+  // agent boot after we've already partially wiped local state.
+  //
+  // Sequencing: this fires BEFORE chainResetWipe so a marker bump
+  // against an unreachable endpoint doesn't strand the operator with
+  // wiped local files but stale remote data; we'd rather not start at
+  // all and let them fix the URL.
+  if (isExternalBackend(config.store?.backend)) {
+    const health = await checkExternalStoreReachable({
+      storeConfig: config.store,
+    });
+    if (!health.ok) {
+      log(formatHealthCheckFailure(health));
+      process.exit(1);
+    }
+    log(
+      `External triple-store reachable: ${health.backend} ${health.endpoint}`,
+    );
+
+    // Namespace identity check (RFC 120, plan PR 3 item 3). Refuses to
+    // start if another DKG node has already booted against this same
+    // namespace — without this, two daemons sharing one Blazegraph
+    // namespace silently corrupt each other. Fires BEFORE
+    // chainResetWipe so a mismatched tag never triggers a wipe of
+    // someone else's data.
+    const identity = await checkOrSetStoreIdentity({
+      storeConfig: config.store,
+      nodeName: config.name,
+    });
+    if (!identity.ok) {
+      if (identity.action === 'mismatch') {
+        log(formatIdentityTagMismatch(identity));
+      } else {
+        log(`[STORE-IDENTITY] failed to verify namespace ownership: ${identity.error}`);
+      }
+      process.exit(1);
+    }
+    if (identity.action === 'tagged') {
+      log(`Tagged triple-store namespace for node "${identity.nodeName}".`);
+    }
+  }
+
+  const wipeResult = await chainResetWipe({
     dataDir: dkgDir(),
     currentMarker: network?.chainResetMarker,
     // Honour operator's `randomSampling.walPath` override; the prover
     // writes its WAL there, so a fresh chain reset must wipe that file
     // (not the default ~/.dkg/random-sampling.wal which would be empty).
     randomSamplingWalPath: config.randomSampling?.walPath,
+    // For external triple-store backends, the wipe extends from local
+    // files to a SPARQL DROP/DELETE on the remote endpoint; otherwise
+    // operators with a chain-reset marker bump would keep stale V10 data
+    // in Blazegraph / sparql-http even after the local store.nq is gone.
+    storeConfig: config.store,
     log,
   });
   if (wipeResult.wiped) {
@@ -562,6 +929,26 @@ export async function runDaemonInner(
       `Chain-state auto-wipe complete: ${wipeResult.removedFiles.length} file(s) removed ` +
       `(prev marker: ${wipeResult.prevMarker ?? '<none>'}, now: ${network?.chainResetMarker})`,
     );
+    // A DKG-managed external wipe uses DROP ALL, which also removes the
+    // namespace ownership tag verified above. Re-tag before continuing so
+    // this daemon never runs against an unclaimed namespace.
+    if (isExternalBackend(config.store?.backend)) {
+      const identity = await checkOrSetStoreIdentity({
+        storeConfig: config.store,
+        nodeName: config.name,
+      });
+      if (!identity.ok) {
+        if (identity.action === 'mismatch') {
+          log(formatIdentityTagMismatch(identity));
+        } else {
+          log(`[STORE-IDENTITY] failed to re-tag namespace after wipe: ${identity.error}`);
+        }
+        process.exit(1);
+      }
+      if (identity.action === 'tagged') {
+        log(`Re-tagged triple-store namespace for node "${identity.nodeName}" after chain-state wipe.`);
+      }
+    }
   }
 
   // Load admin + operational wallets from ~/.dkg/wallets.json (auto-generated on first run)
@@ -581,6 +968,35 @@ export async function runDaemonInner(
   // Operators can override individual fields (e.g. just rpcUrl) without
   // restating the rest; missing fields fall back to the network defaults.
   const chainBase = resolveChainConfig(config, network);
+
+  // PR3 / RC11 — operator-visible WARN when the node is going to talk
+  // to the chain through a known-public, rate-limited JSON-RPC
+  // endpoint that it inherited from the network defaults. The dzudza
+  // failure (Sun 20:42 UTC) traced to a `-32016 over rate limit`
+  // error on the public Base Sepolia RPC during the V10 ACK
+  // pre-flight; without an explicit `chain.rpcUrl` override the
+  // operator never noticed they were sharing a budget with the rest
+  // of the internet. A startup WARN gives them a single, prominent
+  // line in the daemon log instead of waiting for a publish to
+  // silently fail. Skip the WARN entirely in mock mode.
+  //
+  // The "operator overrode it" detection is purposely structural —
+  // only an explicit `config.chain.rpcUrl` entry suppresses the
+  // warning; an empty `chain` block in config that inherits rpcUrl
+  // from network defaults still trips the WARN. That matches the
+  // intent: the operator knows about the rpcUrl iff they set it
+  // themselves.
+  if (chainBase?.type !== 'mock' && chainBase?.rpcUrl) {
+    const operatorSetRpc = config.chain?.rpcUrl !== undefined;
+    if (!operatorSetRpc && isLikelyPublicRpc(chainBase.rpcUrl)) {
+      log(
+        `[warn] chain.rpcUrl is using the network-default public endpoint (${chainBase.rpcUrl}). ` +
+        `Publishing nodes share a global rate-limit budget on public RPCs and may see ` +
+        `ACK pre-flight failures (RpcPreconditionError on eth_chainId, etc.). ` +
+        `Set chain.rpcUrl in ~/.dkg/config.json to a private endpoint to avoid this.`,
+      );
+    }
+  }
 
   // Relay: prefer config.relay, fall back to network testnet.json relays so
   // local nodes connect without having run init or set relay manually.
@@ -642,6 +1058,36 @@ export async function runDaemonInner(
 
   const dashDb = new DashboardDB({ dataDir: dkgDir() });
 
+  if (role === 'core' && config.core?.allowDegradedRelay === false) {
+    const hostInterfaces = Object.values(osModule.networkInterfaces())
+      .flat()
+      .filter((i): i is NetworkInterfaceInfo => i !== undefined);
+    const prereq = checkCoreRelayPrereqs({
+      listenAddresses: [`/ip4/0.0.0.0/tcp/${config.listenPort ?? 0}`],
+      hostInterfaces,
+      announceAddresses: config.announceAddresses ?? [],
+      nodeRole: 'core',
+    });
+    if (prereq.looksDegraded) {
+      log(
+        `[CORE-PREREQ] FATAL before libp2p start: this Core node looks degraded as a relay. ` +
+          `reasons: ${prereq.reasons.join('; ')}. ` +
+          `non-routable addresses: ${prereq.nonRoutableAddresses
+            .map((a) => `${a.addr} (${a.class})`)
+            .join(', ')}. ` +
+          `Set core.allowDegradedRelay: true to downgrade this to a warning.`,
+      );
+      try {
+        dashDb.close();
+      } catch (err: any) {
+        log(`Core prereq fatal DB close error: ${err?.message ?? String(err)}`);
+      }
+      await removePid().catch(() => {});
+      process.exit(1);
+      return;
+    }
+  }
+
   // Universal Messenger substrate stores (rc.9 PR-2). Wired into the
   // DKGAgent's Messenger so any caller that opts into
   // `messenger.sendReliable` gets durable receiver-side idempotency
@@ -677,6 +1123,8 @@ export async function runDaemonInner(
     // having to guess from contract registrations. Travels the wire
     // as libp2p's `AgentVersion` PB field (their naming, not ours).
     nodeVersion: `dkg/${nodeVersion}`,
+    ...pickNetworkTunables(config.network ?? {}),
+    agentProfileHeartbeatMs: config.network?.agentProfileHeartbeatMs,
     syncContextGraphs: syncContextGraphs,
     storeConfig: config.store ? {
       backend: config.store.backend,
@@ -685,18 +1133,22 @@ export async function runDaemonInner(
     largeLiteralStorage: config.largeLiteralStorage,
     sharedMemoryPublicSnapshotStorage: config.sharedMemoryPublicSnapshotStorage,
     syncSharedMemoryOnConnect: config.syncSharedMemoryOnConnect,
+    queryAccess: config.queryAccess,
     chainAdapter: mockChainAdapter,
     // Only forward chain to the agent when both required fields resolved.
     // resolveChainConfig() may return a partial block if neither config nor
     // network supplies one of them; the agent expects rpcUrl + hubAddress.
     chainConfig: chainBase?.rpcUrl && chainBase?.hubAddress ? {
       rpcUrl: chainBase.rpcUrl,
+      rpcUrls: chainBase.rpcUrls,
       hubAddress: chainBase.hubAddress,
+      tokenAddress: chainBase.tokenAddress,
       ...(opWallets.adminWallet
         ? { adminPrivateKey: opWallets.adminWallet.privateKey }
         : {}),
       operationalKeys: opWallets.wallets.map((w) => w.privateKey),
       chainId: chainBase.chainId,
+      approvalPolicy: resolveApprovalPolicy(chainBase.approvalPolicy) as ApprovalPolicy | undefined,
     } : undefined,
     sharedMemoryTtlMs: resolveSharedMemoryTtlMs(config),
     randomSamplingWalPath: config.randomSampling?.walPath,
@@ -711,6 +1163,9 @@ export async function runDaemonInner(
         sharedMemorySynced: row.shared_memory_synced == null ? undefined : row.shared_memory_synced === 1,
         metaSynced: row.meta_synced == null ? undefined : row.meta_synced === 1,
         onChainId: row.on_chain_id ?? undefined,
+        onChainHash: row.on_chain_hash ?? undefined,
+        lastReconciledOrdinal: row.last_reconciled_ordinal ?? undefined,
+        coreHosted: row.core_hosted == null ? undefined : row.core_hosted === 1,
         syncScoped: row.sync_scoped === 1,
       })),
       save: async (record) => {
@@ -722,6 +1177,9 @@ export async function runDaemonInner(
           shared_memory_synced: record.sharedMemorySynced == null ? null : record.sharedMemorySynced ? 1 : 0,
           meta_synced: record.metaSynced == null ? null : record.metaSynced ? 1 : 0,
           on_chain_id: record.onChainId ?? null,
+          on_chain_hash: record.onChainHash ?? null,
+          last_reconciled_ordinal: record.lastReconciledOrdinal ?? null,
+          core_hosted: record.coreHosted == null ? null : record.coreHosted ? 1 : 0,
           sync_scoped: record.syncScoped ? 1 : 0,
           updated_at: Date.now(),
         });
@@ -753,9 +1211,37 @@ export async function runDaemonInner(
       idempotencyStore: messengerIdempotencyStore,
       outboxStore: messengerOutboxStore,
     },
+    // Phase F — persist chain-driven VM reconciliation telemetry so the
+    // /ui/observability Replication tab can aggregate it. Best-effort: a
+    // failed insert must never disrupt reconciliation, and the agent already
+    // guards the sink call in a try/catch.
+    onReplicationEvent: (event) => {
+      dashDb.insertReplicationEvent({
+        ts: event.ts,
+        context_graph_id: event.contextGraphId,
+        on_chain_cg_id: event.onChainCgId ?? null,
+        action: event.action,
+        ual: event.ual ?? null,
+        ordinal: event.ordinal ?? null,
+        ka_id: event.kaId ?? null,
+        from_watermark: event.fromWatermark ?? null,
+        to_watermark: event.toWatermark ?? null,
+        head: event.head ?? null,
+        reconciled: event.reconciled ?? null,
+        pending: event.pending ?? null,
+        detail: event.detail ?? null,
+      });
+    },
   });
 
   let publisherRuntime: PublisherRuntime | null = null;
+  // Holds the running async-promote worker lifecycle (PR #3 of the
+  // async-promote-queue series). Initialised in `startPostApiPublishing`
+  // after the API is up so a recoverOnStartup hiccup never blocks boot;
+  // torn down in `shutdown` before `agent.stop()` so the queue store is
+  // still open when we wait for in-flight promotes to drain.
+  let promoteWorkerLifecycle: PromoteWorkerDaemonLifecycle | null = null;
+  let shuttingDown = false;
 
   const networkId = await computeNetworkId();
   const publisherControl = createPublisherControlFromStore(
@@ -800,22 +1286,18 @@ export async function runDaemonInner(
       // against the `idx_chat_msgid` partial unique index — same
       // logical message arriving twice on parallel transport paths
       // (the seq=13 class from the May 2026 soak postmortem) gets
-      // silently dropped on the second insert. We distinguish three
-      // outcomes:
-      //   - `'stored'`  — fresh row written, notify + log normally.
-      //   - `'deduped'` — `INSERT OR IGNORE` dropped a duplicate row,
-      //                   skip notification (operator already saw the
-      //                   first one) but log a `(deduped)` line for
-      //                   visibility.
-      //   - `'failed'`  — `insertChatMessage` threw. The earlier shape
-      //                   of this block conflated this with `'deduped'`
-      //                   via a shared `inserted = false` sentinel,
-      //                   silently swallowing the operator notification
-      //                   for a brand-new message whenever the DB
-      //                   write failed. Codex review of PR #534
-      //                   flagged this — fix is to keep notifications
-      //                   firing on DB failure so the operator can
-      //                   still see + reply.
+      // silently dropped on the second insert. The outcome now governs
+      // LOGGING only (ADR-001 removed the bell `chat_message` notification
+      // this block used to fire — chat owns its own unread surface):
+      //   - `'stored'`  — fresh row written, log normally.
+      //   - `'deduped'` — `INSERT OR IGNORE` dropped a duplicate row; log a
+      //                   `(deduped)` line and return (operator already saw
+      //                   the first one).
+      //   - `'failed'`  — `insertChatMessage` threw. We log the failure and
+      //                   fall through to the normal CHAT IN log so the
+      //                   inbound message is still visible to the operator
+      //                   even when persistence failed (the spirit of the
+      //                   Codex PR #534 fix, minus the now-removed notify).
       let writeOutcome: 'stored' | 'deduped' | 'failed' = 'failed';
       try {
         const inserted = chatDb.insertChatMessage({
@@ -828,7 +1310,7 @@ export async function runDaemonInner(
         writeOutcome = inserted ? 'stored' : 'deduped';
       } catch (err) {
         log(
-          `CHAT IN  [${shortId(senderPeerId)}] chat_messages persistence failed (notification still firing): ${
+          `CHAT IN  [${shortId(senderPeerId)}] chat_messages persistence failed (message still logged below): ${
             err instanceof Error ? err.message : String(err)
           }`,
         );
@@ -838,29 +1320,11 @@ export async function runDaemonInner(
         log(`CHAT IN  [${shortId(senderPeerId)}]${cgTag} (deduped): ${text}`);
         return;
       }
-      try {
-        // Display the CG ONLY when the ACL has positively verified the
-        // claim (`scoped` / `shared-context-graph` modes). In `any` and
-        // `peer-allowlist` modes `verifiedContextGraphId` is undefined
-        // even when the sender provided a claim, because the ACL
-        // doesn't check it — surfacing the raw claim would let an
-        // authenticated sender stamp arbitrary CG ids onto operator-
-        // facing notifications and logs (Codex PR #510 round 4/5
-        // finding). Storage above already records the message itself;
-        // we don't lose data, we just don't decorate it with an
-        // attacker-controllable label.
-        const titleSuffix = verifiedContextGraphId ? ` (${shortId(verifiedContextGraphId)})` : '';
-        chatDb.insertNotification({
-          ts: Date.now(),
-          type: "chat_message",
-          title: `New message${titleSuffix}`,
-          message: `Message from ${shortId(senderPeerId)}: ${text.slice(0, 120)}`,
-          source: "peer-chat",
-          peer: senderPeerId,
-        });
-      } catch {
-        /* never crash */
-      }
+      // ADR-001: inbound peer chat no longer produces a bell notification —
+      // peer-to-peer chat is a separate surface that owns its own unread
+      // state, and these rows aren't CG-scoped. The message itself is still
+      // persisted via `insertChatMessage` above; we only drop the
+      // bell-pane `chat_message` notification.
     }
     const cgTag = verifiedContextGraphId ? ` cg=${shortId(verifiedContextGraphId)}` : '';
     log(`CHAT IN  [${shortId(senderPeerId)}]${cgTag}: ${text}`);
@@ -868,10 +1332,126 @@ export async function runDaemonInner(
 
   await agent.start();
 
+  // Core-only post-start checks (PR-5 NAT-status watcher + PR-3 relay
+  // prereq sanity check). Edge nodes skip both — they don't need to be
+  // publicly reachable, and reset any stale NAT-status state.
+  //
+  // PR-5 (#668): AutoNAT-driven boot self-probe. Subscribes to libp2p's
+  // self:peer:update event and updates the module-level NAT-status
+  // cache that PR-4's /api/status relay block reads. Returns a stop()
+  // handle that the shutdown closure MUST call to remove the listener;
+  // otherwise a respawn leaks listeners (eventually libp2p logs
+  // max-listener warnings).
+  //
+  // PR-3 (#661): Core-relay capability sanity check. Runs post-start so
+  // libp2p has already expanded `0.0.0.0` to per-interface bindings.
+  // Strict `allowDegradedRelay: false` operators also get a pre-start
+  // pass above so we can refuse before binding sockets. If the node
+  // declares itself as a Core (`nodeRole: "core"`) but its
+  // actually-bound multiaddrs can't serve inbound traffic (all
+  // loopback / RFC1918 / CGNAT / IPv6 ULA — beacon-01 was the
+  // canonical Tailscale-only case), surface a structured
+  // `[CORE-PREREQ]` log so the operator sees it before any
+  // peer-discovery noise scrolls past. Behaviour gated by
+  // `config.core.allowDegradedRelay`: `true` (default) is warn-only,
+  // `false` is refuse-to-boot. Uses transport listener addresses
+  // (`getBoundListenMultiaddrs`) not `libp2p.getMultiaddrs()`: the
+  // latter is the advertised self-address set and can include public
+  // announce addrs or `/p2p-circuit` reservations.
+  let natStatusWatcherStop: (() => void) | null = null;
+  if (role === 'core') {
+    const watcher = startNatStatusWatcher({
+      node: agent.node.libp2p as unknown as {
+        addEventListener(event: 'self:peer:update', h: () => void): void;
+        removeEventListener(event: 'self:peer:update', h: () => void): void;
+        getMultiaddrs(): Array<{ toString(): string }>;
+      },
+      onClassification: (status, previous) => {
+        log(`[CORE-PREREQ] AutoNAT status transition: ${previous} → ${status}`);
+      },
+    });
+    natStatusWatcherStop = watcher.stop;
+
+    try {
+      const resolvedMultiaddrs = getBoundListenMultiaddrs(agent.node.libp2p);
+      if (resolvedMultiaddrs === null) {
+        log(
+          `[CORE-PREREQ] WARNING: could not inspect bound libp2p listener addresses; ` +
+            `skipping post-start relay prerequisite verdict.`,
+        );
+      } else {
+        const hostInterfaces = Object.values(osModule.networkInterfaces())
+          .flat()
+          .filter((i): i is NetworkInterfaceInfo => i !== undefined);
+        const prereq = checkCoreRelayPrereqs({
+          listenAddresses: resolvedMultiaddrs,
+          hostInterfaces,
+          announceAddresses: config.announceAddresses ?? [],
+          nodeRole: 'core',
+        });
+        if (prereq.looksDegraded) {
+          const allowDegraded = config.core?.allowDegradedRelay !== false;
+          const verb = allowDegraded ? 'WARNING' : 'FATAL';
+          log(
+            `[CORE-PREREQ] ${verb}: this Core node looks degraded as a relay. ` +
+              `reasons: ${prereq.reasons.join('; ')}. ` +
+              `non-routable addresses: ${prereq.nonRoutableAddresses
+                .map((a) => `${a.addr} (${a.class})`)
+                .join(', ')}. ` +
+              (allowDegraded
+                ? `Set core.allowDegradedRelay: false in ~/.dkg/config.json to refuse-to-boot on this state. ` +
+                  `See docs/specs/SPEC_RELAY_DISCOVERY.md for the full rationale.`
+                : `Refusing to boot. Set core.allowDegradedRelay: true to downgrade this to a warning.`),
+          );
+          if (!allowDegraded) {
+            natStatusWatcherStop?.();
+            resetNatStatus();
+            await agent.stop().catch((err: any) =>
+              log(`Core prereq fatal-stop error: ${err?.message ?? String(err)}`),
+            );
+            try {
+              dashDb.close();
+            } catch (err: any) {
+              log(`Core prereq fatal DB close error: ${err?.message ?? String(err)}`);
+            }
+            await removePid().catch(() => {});
+            process.exit(1);
+            return;
+          }
+        } else if (prereq.indeterminate) {
+          // Codex (#661#discussion_r3302752893): the DNS-rescue / warn-only
+          // path previously fell into the unconditional `OK` branch below
+          // and hid the indeterminate verdict the checker had just
+          // computed. Surface the reasons so operators see why the prereq
+          // sweep neither passed strictly nor failed; the lifecycle
+          // continues to boot since this is a soft rescue.
+          log(
+            `[CORE-PREREQ] INDETERMINATE: ${prereq.publicListenAddresses.length} ` +
+              `public-class listen address${prereq.publicListenAddresses.length === 1 ? '' : 'es'} bound. ` +
+              `reasons: ${prereq.reasons.join('; ')}.`,
+          );
+        } else {
+          log(
+            `[CORE-PREREQ] OK: ${prereq.publicListenAddresses.length} ` +
+              `public-class listen address${prereq.publicListenAddresses.length === 1 ? '' : 'es'} bound.`,
+          );
+        }
+      }
+    } catch (err) {
+      log(
+        `[CORE-PREREQ] check failed (continuing boot): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  } else {
+    resetNatStatus();
+  }
+
   const publisherChainBase = chainBase?.rpcUrl && chainBase?.hubAddress
     ? {
         rpcUrl: chainBase.rpcUrl,
+        rpcUrls: chainBase.rpcUrls,
         hubAddress: chainBase.hubAddress,
+        tokenAddress: chainBase.tokenAddress,
         chainId: chainBase.chainId,
       }
     : undefined;
@@ -883,72 +1463,88 @@ export async function runDaemonInner(
     }, 0);
     if (profileTimer.unref) profileTimer.unref();
 
+    const promoteWorkerConfig = config.promoteQueue;
+    promoteWorkerLifecycle = startPromoteWorkerDaemonLifecycle({
+      agent,
+      log,
+      emitMemoryGraphChanged,
+      isShuttingDown: () => shuttingDown,
+      enabled: promoteWorkerConfig?.enabled !== false,
+      workerConfig: {
+        workerConcurrency: promoteWorkerConfig?.workerConcurrency,
+        pollIntervalMs: promoteWorkerConfig?.pollIntervalMs,
+        heartbeatIntervalMs: promoteWorkerConfig?.heartbeatIntervalMs,
+        shutdownTimeoutMs: promoteWorkerConfig?.shutdownTimeoutMs,
+      },
+    });
+
     const publisherTimer = setTimeout(() => {
-      void startPublisherRuntimeIfEnabled({
-        dataDir: dkgDir(),
-        config,
-        store: agent.store,
-        keypair: agent.wallet.keypair,
-        chainBase: publisherChainBase,
-        ackTransportFactory: () => ({
-          publisherPeerId: agent.peerId,
-          gossipPublish: async (topic: string, data: Uint8Array) => {
-            await agent.gossip.publish(topic, data);
-          },
-          // Route storage-ack + verify-proposal outbound sends through
-          // the Messenger rather than directly through ProtocolRouter
-          // (rc.9 PR-2 wiring). Today this is semantically identical
-          // to the prior `agent.router.send` path — `/dkg/10.0.0/*`
-          // protocols travel `Messenger.sendToPeer` (legacy pass-
-          // through) → `ProtocolRouter.send`. The wiring matters at
-          // Milestone C PR-11 when `/storage-ack` + `/verify-proposal`
-          // migrate to `/dkg/10.0.1/*` and start using
-          // `messenger.sendReliable`, picking up the substrate's
-          // durable outbox + sender-side idempotency without
-          // touching this factory again.
-          //
-          // HIGH RISK gate (rc.9 plan): Milestone C migration of
-          // these protocols MUST include an explicit publishing-flow
-          // integration test covering ACK quorum collection + the
-          // ackTransportFactory hot path before the prefix bump
-          // lands.
-          // rc.9 PR-11: /storage-ack + /verify-proposal migrated to
-          // /dkg/10.0.1/* and now route through messenger.sendReliable
-          // (envelope wrap + sender-side idempotency + durable
-          // outbox). queued surfaces as a thrown transport error so
-          // ACKCollector's MAX_RETRIES loop + per-peer skip semantics
-          // kick in unchanged.
-          sendP2P: async (peerId: string, protocol: string, data: Uint8Array) => {
-            const sendResult = await agent.messenger.sendReliable(peerId, protocol, data);
-            if (!sendResult.delivered) {
-              throw new Error(`substrate queued (transport): ${sendResult.error}`);
-            }
-            return sendResult.response;
-          },
-          getConnectedCorePeers: () => {
-            const allPeers = agent.node.libp2p
-              .getPeers()
-              .map((p) => p.toString())
-              .filter((id) => id !== agent.peerId);
-            const knownCorePeerIds = (agent as any).knownCorePeerIds as
-              | Set<string>
-              | undefined;
-            if (knownCorePeerIds && knownCorePeerIds.size > 0) {
-              const filtered = allPeers.filter((id) => knownCorePeerIds.has(id));
-              if (filtered.length > 0) return filtered;
-            }
-            return allPeers;
-          },
-          log,
-        }),
-        log,
-      })
-        .then((runtime) => {
+      void (async () => {
+        try {
+          const runtime = await startPublisherRuntimeIfEnabled({
+            dataDir: dkgDir(),
+            config,
+            store: agent.store,
+            keypair: agent.wallet.keypair,
+            chainBase: publisherChainBase,
+            ackTransportFactory: () => ({
+              publisherPeerId: agent.peerId,
+              gossipPublish: async (topic: string, data: Uint8Array) => {
+                await agent.gossip.publish(topic, data);
+              },
+              // Route storage-ack + verify-proposal outbound sends through
+              // the Messenger rather than directly through ProtocolRouter
+              // (rc.9 PR-2 wiring). Today this is semantically identical
+              // to the prior `agent.router.send` path — `/dkg/10.0.0/*`
+              // protocols travel `Messenger.sendToPeer` (legacy pass-
+              // through) → `ProtocolRouter.send`. The wiring matters at
+              // Milestone C PR-11 when `/storage-ack` + `/verify-proposal`
+              // migrate to `/dkg/10.0.1/*` and start using
+              // `messenger.sendReliable`, picking up the substrate's
+              // durable outbox + sender-side idempotency without
+              // touching this factory again.
+              //
+              // HIGH RISK gate (rc.9 plan): Milestone C migration of
+              // these protocols MUST include an explicit publishing-flow
+              // integration test covering ACK quorum collection + the
+              // ackTransportFactory hot path before the prefix bump
+              // lands.
+              // rc.9 PR-11: /storage-ack + /verify-proposal migrated to
+              // /dkg/10.0.1/* and now route through messenger.sendReliable
+              // (envelope wrap + sender-side idempotency + durable
+              // outbox). queued surfaces as a thrown transport error so
+              // ACKCollector's MAX_RETRIES loop + per-peer skip semantics
+              // kick in unchanged.
+              sendP2P: async (peerId: string, protocol: string, data: Uint8Array) => {
+                const sendResult = await agent.messenger.sendReliable(peerId, protocol, data);
+                if (!sendResult.delivered) {
+                  throw new Error(`substrate queued (transport): ${sendResult.error}`);
+                }
+                return sendResult.response;
+              },
+              getConnectedCorePeers: () => {
+                const allPeers = agent.node.libp2p
+                  .getPeers()
+                  .map((p) => p.toString())
+                  .filter((id) => id !== agent.peerId);
+                const knownCorePeerIds = (agent as any).knownCorePeerIds as
+                  | Set<string>
+                  | undefined;
+                if (knownCorePeerIds && knownCorePeerIds.size > 0) {
+                  const filtered = allPeers.filter((id) => knownCorePeerIds.has(id));
+                  if (filtered.length > 0) return filtered;
+                }
+                return allPeers;
+              },
+              log,
+            }),
+            log,
+          });
           publisherRuntime = runtime;
-        })
-        .catch((err: any) => {
+        } catch (err: any) {
           log(`Async publisher startup failed: ${err?.message ?? String(err)}`);
-        });
+        }
+      })();
     }, 0);
     if (publisherTimer.unref) publisherTimer.unref();
   };
@@ -1065,70 +1661,55 @@ export async function runDaemonInner(
   // omits the field (the common case after `dkg init` with default answers).
   let updateInterval: ReturnType<typeof setInterval> | null = null;
   const au = resolveAutoUpdateConfig(config, network);
-  const standalone = isStandaloneInstall();
-  const hasGitConfig = !!au;
+  // OT-RFC-41 §4.2 / §5 PR 5: auto-update polling is npm-only.
+  // `resolveStandaloneInstall` still seeds `daemonState.standaloneCache`
+  // for `/api/status` consumers; monorepo dev daemons (standalone=false)
+  // skip the polling loop entirely — contributors update via
+  // `git pull && pnpm install && pnpm build`.
+  const standalone = resolveStandaloneInstall(au?.source ?? resolveAutoUpdateSource(config, network));
 
-  if (standalone || hasGitConfig) {
+  if (standalone) {
     const checkIntervalMs = (au?.checkIntervalMinutes ?? 30) * 60_000;
     const allowPre = au?.allowPrerelease ?? true;
 
-    if (standalone) {
-      log(
-        `Auto-update (npm): ${au ? "enabled" : "disabled — version check only"} (every ${au?.checkIntervalMinutes ?? 30}min)`,
-      );
-    } else if (au) {
-      log(
-        `Auto-update enabled: ${au.repo}@${au.branch} (every ${au.checkIntervalMinutes}min)`,
-      );
-    }
+    log(
+      `Auto-update (npm): ${au ? "enabled" : "disabled — version check only"} (every ${au?.checkIntervalMinutes ?? 30}min)`,
+    );
 
     const runCheck = async () => {
-      let updateAvailable = false;
-      let targetNpmVersion = "";
-
-      if (standalone) {
-        const npmStatus = await checkForNpmVersionUpdate(log, allowPre);
-        if (npmStatus.status !== "error") {
-          daemonState.lastUpdateCheck.upToDate = npmStatus.status === "up-to-date";
-          daemonState.lastUpdateCheck.checkedAt = Date.now();
-          if (npmStatus.version)
-            daemonState.lastUpdateCheck.latestVersion = npmStatus.version;
-        }
-        if (npmStatus.status === "available" && npmStatus.version) {
-          updateAvailable = true;
-          targetNpmVersion = npmStatus.version;
-        }
-      } else if (au) {
-        const commitStatus = await checkForNewCommitWithStatus(au, log);
-        if (commitStatus.status !== "error") {
-          daemonState.lastUpdateCheck.upToDate = commitStatus.status === "up-to-date";
-          daemonState.lastUpdateCheck.checkedAt = Date.now();
-          if (commitStatus.commit)
-            daemonState.lastUpdateCheck.latestCommit = commitStatus.commit.slice(0, 8);
-        }
-        updateAvailable = commitStatus.status === "available";
+      const npmStatus = await checkForNpmVersionUpdate(log, allowPre);
+      if (npmStatus.status !== "error") {
+        daemonState.lastUpdateCheck.upToDate = npmStatus.status === "up-to-date";
+        daemonState.lastUpdateCheck.checkedAt = Date.now();
+        if (npmStatus.version)
+          daemonState.lastUpdateCheck.latestVersion = npmStatus.version;
       }
+      if (npmStatus.status !== "available" || !npmStatus.version) return;
+      if (!au) return; // version check only — no auto-apply when polling disabled
 
-      if (au && updateAvailable) {
-        daemonState.isUpdating = true;
-        let updated = false;
-        if (standalone && targetNpmVersion) {
-          const status = await performNpmUpdate(targetNpmVersion, log);
-          updated = status === "updated";
-        } else {
-          updated = await checkForUpdate(au, log);
-        }
-        daemonState.isUpdating = false;
-        if (updated) {
-          log("Auto-update: update activated; exiting for supervised restart.");
-          await shutdown(DAEMON_EXIT_CODE_RESTART);
-          return;
-        }
+      daemonState.isUpdating = true;
+      // OT-RFC-41 Bundle B1b: Edge → npm install -g, Core → slot install.
+      const role = config.nodeRole ?? "edge";
+      const status = role === "edge"
+        ? await performNpmUpdateEdge(npmStatus.version, getCurrentCliVersion(), log)
+        : await performNpmUpdate(npmStatus.version, log);
+      const updated = status === "updated";
+      daemonState.isUpdating = false;
+      if (updated) {
+        log("Auto-update: update activated; exiting for supervised restart.");
+        await shutdown(DAEMON_EXIT_CODE_RESTART);
+        return;
       }
     };
 
     setTimeout(runCheck, 15_000);
     updateInterval = setInterval(runCheck, checkIntervalMs);
+  } else if (au?.enabled) {
+    // Monorepo dev daemon with auto-update enabled in config — log
+    // once at boot so contributors understand why polling is silent.
+    log(
+      "Auto-update: skipped — monorepo checkout detected. Use `git pull && pnpm install && pnpm build` to update.",
+    );
   }
 
   // --- Dashboard DB + Metrics ---
@@ -1219,6 +1800,14 @@ export async function runDaemonInner(
       return parseRdfInt(r?.bindings?.[0]?.c);
     },
     getStoreBytes: async () => {
+      // External SPARQL backends own no local file; `null` is the
+      // correct signal here (returning 0 misleads operators into
+      // thinking the store is empty). Quad count is exposed on
+      // demand via /api/status instead — too expensive to compute
+      // on the metrics tick. (RFC 120, plan PR 1 item 2.)
+      if (isExternalBackend(config.store?.backend)) {
+        return null;
+      }
       try {
         const s = await stat(join(dkgDir(), "store.nq"));
         return s.size;
@@ -1347,58 +1936,28 @@ export async function runDaemonInner(
     });
   });
 
-  // Notify on new peer connections
-  agent.eventBus.on(DKGEvent.PEER_CONNECTED, (data: any) => {
-    try {
-      dashDb.insertNotification({
-        ts: Date.now(),
-        type: "peer_connected",
-        title: "Peer connected",
-        message: `Peer ${shortId(data.peerId)} connected`,
-        source: "network",
-        peer: data.peerId,
-      });
-    } catch {
-      /* never crash */
-    }
-  });
-
-  agent.eventBus.on(DKGEvent.PEER_DISCONNECTED, (data: any) => {
-    try {
-      dashDb.insertNotification({
-        ts: Date.now(),
-        type: "peer_disconnected",
-        title: "Peer disconnected",
-        message: `Peer ${shortId(data.peerId)} disconnected`,
-        source: "network",
-        peer: data.peerId,
-      });
-    } catch {
-      /* never crash */
-    }
-  });
+  // ADR-001 (notifications-pane redesign): peer connect/disconnect no longer
+  // produce bell notifications — pure transport churn that dominated the
+  // pane for graphs the user has nothing to do with. Connection telemetry is
+  // unaffected: the CONNECTION_OPEN handler above still records it via
+  // `tracker`. We drop the PEER_CONNECTED / PEER_DISCONNECTED notification
+  // emitters entirely (clean cut, no `category` compat flag).
 
   // Track publishes via KC_PUBLISHED event (covers GossipSub-received publishes)
   agent.eventBus.on(DKGEvent.KC_PUBLISHED, (data: any) => {
     const ctx = createOperationContext("publish");
-    const kcId = data.kcId != null ? String(data.kcId) : undefined;
+    const kaId = data.kaId != null ? String(data.kaId) : undefined;
     tracker.start(ctx, {
       contextGraphId: data.contextGraphId,
-      details: { kcId, source: "gossipsub" },
+      details: { kaId, source: "gossipsub" },
     });
     tracker.complete(ctx, { tripleCount: data.tripleCount });
     try {
-      dashDb.insertNotification({
-        ts: Date.now(),
-        type: "kc_published",
-        title: "Knowledge published",
-        message: `Knowledge collection published${data.contextGraphId ? ` on context graph ${shortId(data.contextGraphId)}` : ""}`,
-        source: "dkg",
-        meta: JSON.stringify({
-          kcId,
-          contextGraphId: data.contextGraphId,
-        }),
-      });
+      // ADR-001: the raw `kc_published` bell notification is removed — it
+      // fired for ANY CG overheard on gossip (not just the user's), the
+      // dominant pane noise. Live graph refresh below is unaffected.
+      // (ADR-002/A3 layers a MEMBERSHIP-GATED, remote-only `assertion_activity`
+      // emitter on top of this handler as the legitimate scoped replacement.)
       if (data.contextGraphId) {
         emitMemoryGraphChanged({
           contextGraphId: data.contextGraphId,
@@ -1410,6 +1969,26 @@ export async function runDaemonInner(
             triples: typeof data.tripleCount === "number" ? data.tripleCount : undefined,
           },
         });
+        // ADR-002 / CR-2: cross-node `published` activity for a collaborator's
+        // publish. REMOTE-ONLY — gate on `data.from` (the gossip payload's
+        // sender peer id, set ONLY on gossipsub-received publishes by
+        // publish-handler.ts; the LOCAL publisher emit carries no `from`).
+        // This prevents double-counting: a local publish is recorded by
+        // routes/memory.ts, a remote one here. Membership-gated so we only
+        // record activity for CGs this node is actually involved in (not
+        // every CG overheard on gossip — the dominant noise ADR-001 removed).
+        const remotePublisherPeer =
+          typeof data.from === "string" && data.from.length > 0 ? data.from : undefined;
+        if (remotePublisherPeer && localNodeInvolvedInContextGraph(dashDb, data.contextGraphId)) {
+          recordAssertionActivity(dashDb, {
+            contextGraphId: data.contextGraphId,
+            kind: "published",
+            actorAgentAddress: remotePublisherPeer,
+            ...(typeof data.subGraphName === "string" ? { subGraphName: data.subGraphName } : {}),
+            ...(typeof data.tripleCount === "number" ? { tripleCount: data.tripleCount } : {}),
+          });
+          emitNotification({ contextGraphId: data.contextGraphId, type: "assertion_activity" });
+        }
       }
     } catch {
       /* never crash */
@@ -1452,6 +2031,18 @@ export async function runDaemonInner(
       timestamp: new Date().toISOString(),
     });
   }
+  // A5: single generic `notification` SSE refresh for the bell pane. Fired
+  // once per scoped notification write (join_* + assertion_activity) so the
+  // pane re-fetches the scoped feed via ONE listener. The three legacy
+  // join-specific events still fire (other consumers — PendingJoinRequests
+  // Section, useMyContextGraphs — listen on them); this is ADDITIVE.
+  function emitNotification(event: { contextGraphId: string; type: string }) {
+    if (!event.contextGraphId) return;
+    sseBroadcast("notification", {
+      contextGraphId: event.contextGraphId,
+      type: event.type,
+    });
+  }
 
   agent.eventBus.on(DKGEvent.JOIN_REQUEST_RECEIVED, (data: any) => {
     try {
@@ -1461,6 +2052,11 @@ export async function runDaemonInner(
         title: "Join request received",
         message: `${data.agentName ?? shortId(data.agentAddress)} wants to join project ${shortId(data.contextGraphId)}`,
         source: "access-control",
+        // R2-1: the scoping key MUST be on the top-level `context_graph_id`
+        // column (not only in `meta`) — the scoped read filters on the column
+        // (getNotificationsForContextGraphs), so without this the row is NULL-
+        // scoped and dropped from the bell entirely.
+        contextGraphId: data.contextGraphId,
         meta: JSON.stringify({
           contextGraphId: data.contextGraphId,
           agentAddress: data.agentAddress,
@@ -1472,6 +2068,7 @@ export async function runDaemonInner(
         agentAddress: data.agentAddress,
         agentName: data.agentName,
       });
+      emitNotification({ contextGraphId: data.contextGraphId, type: "join_request" });
     } catch {
       /* never crash */
     }
@@ -1485,6 +2082,8 @@ export async function runDaemonInner(
         title: "Join approved",
         message: `You have been approved to join project ${shortId(data.contextGraphId)}`,
         source: "access-control",
+        // R2-1: top-level scoping column so the scoped read returns it.
+        contextGraphId: data.contextGraphId,
         meta: JSON.stringify({
           contextGraphId: data.contextGraphId,
           agentAddress: data.agentAddress,
@@ -1494,6 +2093,7 @@ export async function runDaemonInner(
         contextGraphId: data.contextGraphId,
         agentAddress: data.agentAddress,
       });
+      emitNotification({ contextGraphId: data.contextGraphId, type: "join_approved" });
     } catch {
       /* never crash */
     }
@@ -1507,6 +2107,8 @@ export async function runDaemonInner(
         title: "Join request rejected",
         message: `Your request to join project ${shortId(data.contextGraphId)} was declined by the curator.`,
         source: "access-control",
+        // R2-1: top-level scoping column so the scoped read returns it.
+        contextGraphId: data.contextGraphId,
         meta: JSON.stringify({
           contextGraphId: data.contextGraphId,
           agentAddress: data.agentAddress,
@@ -1516,6 +2118,7 @@ export async function runDaemonInner(
         contextGraphId: data.contextGraphId,
         agentAddress: data.agentAddress,
       });
+      emitNotification({ contextGraphId: data.contextGraphId, type: "join_rejected" });
     } catch {
       /* never crash */
     }
@@ -2039,6 +2642,7 @@ export async function runDaemonInner(
         apiPortRef,
         routePlugins,
         emitMemoryGraphChanged,
+        emitNotification,
       );
     } catch (err: any) {
       if (res.headersSent || res.writableEnded) return;
@@ -2067,9 +2671,13 @@ export async function runDaemonInner(
   const apiHost = config.apiHost || "127.0.0.1";
 
   // Route plugins: loaded before listen() so requests can't race the array; fail-soft per ADR 0001.
+  // OT-RFC-41 §4.6.1 / Bundle B1e: bare-name specs resolve from
+  // ~/.dkg/plugins (stable root) before the daemon-local node_modules,
+  // so plugin installs survive Core slot swaps and Edge npm reinstalls.
   const routePlugins = await loadRoutePlugins(
     config.routePlugins,
     new Logger('route-plugins'),
+    { dkgHome: dkgDir() },
   );
   // Validated count for telemetry — `configured=` is 0 for non-arrays so a typo doesn't report character count.
   const configuredCount = countConfiguredPluginSpecs(config.routePlugins);
@@ -2099,12 +2707,22 @@ export async function runDaemonInner(
   // any of the cleanup awaits below (notably `agent.stop()` when in-flight sync
   // work holds libp2p reads open) cannot leave the worker process a zombie. See
   // `./shutdown.ts` for the offset-exit-code convention used to signal forced
-  // exits to the supervisor + external monitoring.
-  let shuttingDown = false;
+  // exits to the supervisor + external monitoring. (`shuttingDown` is hoisted
+  // up next to `promoteWorkerLifecycle` above so the worker-stop call inside
+  // the cleanup IIFE can read it.)
   async function shutdown(exitCode = 0) {
     if (shuttingDown) return;
     shuttingDown = true;
     log("Shutting down...");
+    // Tell the supervisor's liveness watcher (PR #664) that this is a graceful
+    // shutdown before any slow cleanup runs. The watcher reads `api.port`'s
+    // absence as "worker is intentionally going down — don't SIGKILL me
+    // mid-teardown." Idempotent with the second `removeApiPort()` below in
+    // cleanupStateFiles; if shutdown crashes here we'd be in the same state as
+    // if the late removeApiPort had failed.
+    await removeApiPort().catch((err: any) =>
+      log(`Early api.port cleanup error: ${err?.message ?? String(err)}`),
+    );
     const cleanupStateFiles = async () => {
       await removePid().catch((err: any) =>
         log(`PID cleanup error: ${err?.message ?? String(err)}`),
@@ -2121,11 +2739,19 @@ export async function runDaemonInner(
         clearInterval(pruneTimer);
         rateLimiter.destroy();
         metricsCollector.stop();
+        natStatusWatcherStop?.();
+        resetNatStatus();
         await publisherRuntime
           ?.stop()
           .catch((err: any) =>
             log(`Publisher runtime stop error: ${err?.message ?? String(err)}`),
           );
+        // Drain the async-promote worker before closing the agent — once
+        // `agent.stop()` runs the queue's underlying triple store goes
+        // away. We let in-flight promotes complete (or hit
+        // `shutdownTimeoutMs`); RFC §6.2 forbids marking `running →
+        // queued` here so the next boot's `recoverOnStartup()` decides.
+        await promoteWorkerLifecycle?.stop(shuttingDown ? 'daemon shutting down' : null);
         await daemonState.catchupRunner
           ?.close()
           .catch((err: any) =>

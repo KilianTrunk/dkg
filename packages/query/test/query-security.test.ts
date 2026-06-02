@@ -7,6 +7,7 @@
  * - FROM/FROM NAMED clauses in remote SPARQL are rejected
  * - Standard context-graph-scoped queries still work correctly
  */
+import { readFileSync } from 'node:fs';
 import { describe, it, expect, beforeEach } from 'vitest';
 import { OxigraphStore, type Quad } from '@origintrail-official/dkg-storage';
 import { DKGQueryEngine } from '../src/dkg-query-engine.js';
@@ -33,6 +34,29 @@ function makeRequest(overrides: Partial<QueryRequest> = {}): QueryRequest {
     lookupType: 'SPARQL_QUERY',
     contextGraphId: CONTEXT_GRAPH,
     ...overrides,
+  };
+}
+
+function makeNoExecuteBoundary(): { handler: QueryHandler; wasExecuted: () => boolean } {
+  let executed = false;
+  const noExecuteEngine = {
+    query: async () => {
+      executed = true;
+      return { bindings: [] };
+    },
+    resolveKA: async () => {
+      throw new Error('not used');
+    },
+  } as unknown as DKGQueryEngine;
+
+  return {
+    handler: new QueryHandler(noExecuteEngine, {
+      defaultPolicy: 'deny',
+      contextGraphs: {
+        [CONTEXT_GRAPH]: { policy: 'public', sparqlEnabled: true },
+      },
+    }),
+    wasExecuted: () => executed,
   };
 }
 
@@ -150,6 +174,21 @@ describe('I-009: SPARQL graph scope bypass prevention', () => {
     expect(response.error).toContain('GRAPH clauses are not allowed');
   });
 
+  it('rejects token-adjacent GRAPH variables before executing remote SPARQL', async () => {
+    const boundary = makeNoExecuteBoundary();
+
+    const response = await boundary.handler.handle(
+      makeRequest({
+        sparql: `SELECT ?s WHERE { GRAPH?g { ?s <${SCHEMA_NAME}> ?name } }`,
+      }),
+      'peer-attacker',
+    );
+
+    expect(response.status).toBe('ERROR');
+    expect(response.error).toContain('GRAPH clauses are not allowed');
+    expect(boundary.wasExecuted()).toBe(false);
+  });
+
   it('rejects SPARQL with GRAPH clause targeting the allowed context graph too', async () => {
     // Even queries targeting the "correct" graph should not use explicit GRAPH
     const response = await handler.handle(
@@ -173,6 +212,21 @@ describe('I-009: SPARQL graph scope bypass prevention', () => {
 
     expect(response.status).toBe('ERROR');
     expect(response.error).toContain('FROM');
+  });
+
+  it('rejects token-adjacent FROM IRIs before executing remote SPARQL', async () => {
+    const boundary = makeNoExecuteBoundary();
+
+    const response = await boundary.handler.handle(
+      makeRequest({
+        sparql: `SELECT ?name FROM<${OTHER_GRAPH}> WHERE { ?s <${SCHEMA_NAME}> ?name }`,
+      }),
+      'peer-attacker',
+    );
+
+    expect(response.status).toBe('ERROR');
+    expect(response.error).toContain('FROM');
+    expect(boundary.wasExecuted()).toBe(false);
   });
 
   it('rejects SPARQL with FROM NAMED clause', async () => {
@@ -466,5 +520,15 @@ describe('I-009: SPARQL keyword detection — no false positives on literals/com
     );
     expect(response.status).toBe('ERROR');
     expect(response.error).toContain('FROM');
+  });
+});
+
+describe('caller documentation for named graph scope', () => {
+  it('documents that local GRAPH variables stay constrained by contextGraphId and view', () => {
+    const readme = readFileSync(new URL('../README.md', import.meta.url), 'utf8');
+
+    expect(readme).toContain('contextGraphId and view are authoritative');
+    expect(readme).toContain('GRAPH ?g');
+    expect(readme).toMatch(/constrained locally/i);
   });
 });

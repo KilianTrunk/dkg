@@ -6,6 +6,7 @@ import { ethers } from 'ethers';
 import { createEVMAdapter, getSharedContext, createProvider, takeSnapshot, revertSnapshot, createTestContextGraph, HARDHAT_KEYS } from '../../chain/test/evm-test-context.js';
 import { mintTokens } from '../../chain/test/hardhat-harness.js';
 import { wrapPublisherForTest } from './_helpers/seal.js';
+import { hardhatACKProvider } from './_helpers/acks.js';
 import {
   DKGPublisher,
   TripleStoreAsyncLiftPublisher,
@@ -56,6 +57,8 @@ describe('TripleStoreAsyncLiftPublisher', () => {
     return wrapPublisherForTest(new DKGPublisher(opts), {
       author: _author,
       ctx: { provider: _provider, kav10Address: _kav10Address },
+      // RC11 / PR1: real 3-of-N ACK quorum (self-signed ACK fallback gone)
+      v10ACKProvider: hardhatACKProvider(_kav10Address),
     });
   }
 
@@ -69,7 +72,7 @@ describe('TripleStoreAsyncLiftPublisher', () => {
     CONTEXT_GRAPH = cgId.toString();
     _provider = provider;
     const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
-    _kav10Address = await chain.getKnowledgeAssetsV10Address();
+    _kav10Address = await chain.getKnowledgeAssetsLifecycleAddress();
   });
   afterAll(async () => {
     await revertSnapshot(_fileSnapshot);
@@ -511,7 +514,7 @@ describe('TripleStoreAsyncLiftPublisher', () => {
     const included = await publisher.recordPublishResult(
       jobId,
       {
-        kcId: 1n,
+        kaId: 1n,
         ual: 'did:dkg:mock:31337/0xabc/1',
         merkleRoot: new Uint8Array([0xab, 0xcd]),
         kaManifest: [],
@@ -535,7 +538,7 @@ describe('TripleStoreAsyncLiftPublisher', () => {
     expect(included.inclusion?.blockNumber).toBe(10);
 
     const finalized = await publisher.recordPublishResult(jobId, {
-      kcId: 1n,
+      kaId: 1n,
       ual: 'did:dkg:mock:31337/0xabc/1',
       merkleRoot: new Uint8Array([0xab, 0xcd]),
       kaManifest: [],
@@ -595,7 +598,7 @@ describe('TripleStoreAsyncLiftPublisher', () => {
           expect(publishOptions.quads[0]?.subject).toContain('dkg:music-social:aloha:person-profile/rihana-');
           expect(publishOptions.privateQuads?.[0]?.subject).toContain('dkg:music-social:aloha:person-profile/rihana-');
           return {
-            kcId: 1n,
+            kaId: 1n,
             ual: 'did:dkg:mock:31337/0xabc/1',
             merkleRoot: new Uint8Array([0xab, 0xcd]),
             kaManifest: [],
@@ -680,11 +683,11 @@ describe('TripleStoreAsyncLiftPublisher', () => {
     expect(processed?.failure?.code).toBe('tx_submit_timeout');
   });
 
-  it('does not invent chain metadata for tentative publish results without on-chain details', async () => {
+  it('finalizes tentative publish results without on-chain details as local completions', async () => {
     const publisher = createPublisher({
       config: {
         publishExecutor: async () => ({
-          kcId: 0n,
+          kaId: 0n,
           ual: 'did:dkg:mock:31337/0xabc/tentative',
           merkleRoot: new Uint8Array([0xab, 0xcd]),
           kaManifest: [],
@@ -712,14 +715,14 @@ describe('TripleStoreAsyncLiftPublisher', () => {
 
     const processed = await publisher.processNext('wallet-1');
 
-    expect(processed?.status).toBe('failed');
+    expect(processed?.status).toBe('finalized');
     expect(processed?.broadcast).toBeUndefined();
     expect(processed?.inclusion).toBeUndefined();
-    expect(processed?.failure?.failedFromState).toBe('broadcast');
-    expect(processed?.failure?.code).toBe('rpc_unavailable');
-    expect(processed?.failure?.retryable).toBe(true);
-    expect(processed?.failure?.resolution).toBe('reset_to_accepted');
-    expect(processed?.failure?.message).toContain('without onChainResult');
+    expect(processed?.finalization).toEqual({
+      mode: 'local',
+      ual: 'did:dkg:mock:31337/0xabc/tentative',
+    });
+    expect(processed?.failure).toBeUndefined();
   });
 
   it('persists unknown included-phase failures as terminal failed jobs', async () => {
@@ -821,7 +824,7 @@ describe('TripleStoreAsyncLiftPublisher', () => {
       expect(publishOptions.quads).toHaveLength(1);
       expect(publishOptions.quads[0]?.predicate).toBe('http://schema.org/genre');
       return {
-        kcId: 1n,
+        kaId: 1n,
         ual: 'did:dkg:mock:31337/0xabc/1',
         merkleRoot: new Uint8Array([0xab, 0xcd]),
         kaManifest: [],

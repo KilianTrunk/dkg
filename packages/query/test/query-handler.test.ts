@@ -220,6 +220,67 @@ describe('QueryHandler', () => {
     });
   });
 
+  describe('SPARQL policy limits', () => {
+    it('caps SPARQL results using the context-graph sparqlMaxResults policy', async () => {
+      const handler = new QueryHandler(engine, {
+        defaultPolicy: 'deny',
+        contextGraphs: {
+          [CONTEXT_GRAPH]: {
+            policy: 'public',
+            allowedLookupTypes: ['SPARQL_QUERY'],
+            sparqlEnabled: true,
+            sparqlMaxResults: 1,
+          },
+        },
+      });
+
+      const response = await handler.handle(
+        makeRequest({
+          lookupType: 'SPARQL_QUERY',
+          limit: 100,
+          sparql: `SELECT ?name WHERE { ?s <${SCHEMA_NAME}> ?name } ORDER BY ?name`,
+        }),
+        'peer-1',
+      );
+
+      expect(response.status).toBe('OK');
+      expect(JSON.parse(response.bindings!)).toHaveLength(1);
+      expect(response.resultCount).toBe(2);
+      expect(response.truncated).toBe(true);
+    });
+
+    it('caps SPARQL execution time using the context-graph sparqlTimeout policy', async () => {
+      const slowEngine = {
+        query: () => new Promise((resolve) => {
+          setTimeout(() => resolve({ bindings: [{ s: 'late' }] }), 50);
+        }),
+      } as unknown as DKGQueryEngine;
+      const handler = new QueryHandler(slowEngine, {
+        defaultPolicy: 'deny',
+        contextGraphs: {
+          [CONTEXT_GRAPH]: {
+            policy: 'public',
+            allowedLookupTypes: ['SPARQL_QUERY'],
+            sparqlEnabled: true,
+            sparqlTimeout: 1,
+          },
+        },
+      });
+
+      const response = await handler.handle(
+        makeRequest({
+          lookupType: 'SPARQL_QUERY',
+          timeout: 30_000,
+          sparql: `SELECT ?name WHERE { ?s <${SCHEMA_NAME}> ?name }`,
+        }),
+        'peer-1',
+      );
+
+      expect(response.status).toBe('GAS_LIMIT_EXCEEDED');
+      expect(response.error).toContain('time limit');
+    });
+  });
+
   describe('with allowList policy', () => {
     let handler: QueryHandler;
 

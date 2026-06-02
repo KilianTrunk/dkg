@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi, afterEach } from 'vitest';
 import type { DkgConfig } from '../src/config.js';
@@ -13,6 +13,7 @@ import {
   normalizeHermesChatPayload,
   normalizeHermesPersistTurnPayload,
   probeHermesChannelHealth,
+  resolveHermesApiServerKey,
 } from '../src/daemon/hermes.js';
 import {
   connectLocalAgentIntegrationFromUi,
@@ -162,8 +163,13 @@ function makeHermesRouteContext(
   };
 }
 
+const cleanupDirs: string[] = [];
+
 afterEach(() => {
   vi.unstubAllGlobals();
+  while (cleanupDirs.length) {
+    rmSync(cleanupDirs.pop()!, { recursive: true, force: true });
+  }
   disconnectHermesProfileMock.mockReset();
   resolveHermesProfileMock.mockReset();
   resolveHermesProfileMock.mockReturnValue({
@@ -453,6 +459,296 @@ describe('Hermes channel helpers', () => {
       { Accept: 'application/json' },
       'https://hermes.example.com/health',
     )).toEqual({ Accept: 'application/json' });
+  });
+
+  it('forwards Authorization: Bearer to hermes-openai targets only when a key is resolved', () => {
+    const target = {
+      name: 'gateway' as const,
+      protocol: 'hermes-openai' as const,
+      inboundUrl: 'http://127.0.0.1:8642/v1/chat/completions',
+      healthUrl: 'http://127.0.0.1:8642/health',
+    };
+    // The unauthenticated /health probe never receives the bearer, even when a
+    // key is available, so it cannot leak to health-endpoint/proxy logs.
+    expect(buildHermesChannelHeaders(
+      target,
+      'bridge-token',
+      { Accept: 'application/json' },
+      target.healthUrl,
+      'api-key-123',
+    )).toEqual({ Accept: 'application/json' });
+    // Key present → bearer added; the loopback bridge token is NOT added.
+    expect(buildHermesChannelHeaders(
+      target,
+      'bridge-token',
+      { 'Content-Type': 'application/json' },
+      target.inboundUrl,
+      'api-key-123',
+    )).toEqual({
+      'Content-Type': 'application/json',
+      Authorization: 'Bearer api-key-123',
+    });
+    // No key → behavior identical to today (no auth header), so key-less
+    // older Hermes installs keep working.
+    expect(buildHermesChannelHeaders(
+      target,
+      'bridge-token',
+      { 'Content-Type': 'application/json' },
+      target.inboundUrl,
+    )).toEqual({ 'Content-Type': 'application/json' });
+    // The api server key never leaks onto the loopback bridge transport.
+    expect(buildHermesChannelHeaders(
+      { name: 'bridge', inboundUrl: 'http://127.0.0.1:9202/send' },
+      'bridge-token',
+      { 'Content-Type': 'application/json' },
+      'http://127.0.0.1:9202/send',
+      'api-key-123',
+    )).toEqual({
+      'Content-Type': 'application/json',
+      'x-dkg-bridge-token': 'bridge-token',
+    });
+  });
+
+  it('resolves the Hermes API server key from the profile .env and DKG_HERMES_API_SERVER_KEY override', () => {
+    const home = mkdtempSync(join(tmpdir(), 'hermes-env-'));
+    cleanupDirs.push(home);
+    // Inline `#` comment on an unquoted value must be stripped (dotenv
+    // semantics) so the forwarded bearer matches the key Hermes loads.
+    writeFileSync(
+      join(home, '.env'),
+      '# managed by user\nAPI_SERVER_ENABLED=true\nAPI_SERVER_KEY=from-env-file # local dev\nOTHER=keep\n',
+    );
+    const config = makeConfig({
+      localAgentIntegrations: {
+        hermes: {
+          enabled: true,
+          transport: { kind: 'hermes-openai', gatewayUrl: 'http://127.0.0.1:8642' },
+          metadata: { hermesHome: home },
+        },
+      },
+    });
+
+    expect(resolveHermesApiServerKey(config)).toBe('from-env-file');
+
+    // A quoted value keeps an inner `#`; the last assignment wins.
+    const quotedHome = mkdtempSync(join(tmpdir(), 'hermes-env-q-'));
+    cleanupDirs.push(quotedHome);
+    writeFileSync(join(quotedHome, '.env'), 'API_SERVER_KEY="se#cret value"\n');
+    expect(resolveHermesApiServerKey(makeConfig({
+      localAgentIntegrations: {
+        hermes: {
+          enabled: true,
+          transport: { kind: 'hermes-openai', gatewayUrl: 'http://127.0.0.1:8642' },
+          metadata: { hermesHome: quotedHome },
+        },
+      },
+    }))).toBe('se#cret value');
+
+    // Loopback: the profile .env wins over a stale DKG_HERMES_API_SERVER_KEY
+    // (e.g. left set from a former remote setup) so it can't shadow the correct
+    // local key (Codex review).
+    process.env.DKG_HERMES_API_SERVER_KEY = 'stale-override';
+    try {
+      expect(resolveHermesApiServerKey(config)).toBe('from-env-file');
+    } finally {
+      delete process.env.DKG_HERMES_API_SERVER_KEY;
+    }
+
+    // Remote (non-loopback) gateway: the .env is on another host, so the
+    // explicit override is the only source and the local .env is never read.
+    const remoteConfig = makeConfig({
+      localAgentIntegrations: {
+        hermes: {
+          enabled: true,
+          transport: { kind: 'hermes-openai', gatewayUrl: 'https://hermes.example.com:8642' },
+          metadata: { hermesHome: home },
+        },
+      },
+    });
+    process.env.DKG_HERMES_API_SERVER_KEY = 'remote-override';
+    try {
+      expect(resolveHermesApiServerKey(remoteConfig)).toBe('remote-override');
+    } finally {
+      delete process.env.DKG_HERMES_API_SERVER_KEY;
+    }
+    // Remote with no override → undefined (local .env never read).
+    expect(resolveHermesApiServerKey(remoteConfig)).toBeUndefined();
+
+    // No hermesHome / no .env → undefined (older key-less Hermes: no bearer).
+    expect(resolveHermesApiServerKey(makeConfig({
+      localAgentIntegrations: {
+        hermes: { enabled: true, transport: { kind: 'hermes-openai' } },
+      },
+    }))).toBeUndefined();
+  });
+
+  it('treats a blank local .env assignment as authoritative, even over a stale override', () => {
+    const home = mkdtempSync(join(tmpdir(), 'hermes-blank-'));
+    cleanupDirs.push(home);
+    // A later blank assignment must reset an earlier value (dotenv last-wins).
+    // An explicit (even blank) local key is authoritative on loopback, so a
+    // stale DKG_HERMES_API_SERVER_KEY must NOT be forwarded (Codex review).
+    writeFileSync(join(home, '.env'), 'API_SERVER_KEY=old-key\nAPI_SERVER_KEY=\n');
+    const config = makeConfig({
+      localAgentIntegrations: {
+        hermes: {
+          enabled: true,
+          transport: { kind: 'hermes-openai', gatewayUrl: 'http://127.0.0.1:8642' },
+          metadata: { hermesHome: home },
+        },
+      },
+    });
+
+    expect(resolveHermesApiServerKey(config)).toBeUndefined();
+
+    process.env.DKG_HERMES_API_SERVER_KEY = 'stale-override';
+    try {
+      expect(resolveHermesApiServerKey(config)).toBeUndefined();
+    } finally {
+      delete process.env.DKG_HERMES_API_SERVER_KEY;
+    }
+  });
+
+  it('drops a key containing control characters (unusable as an HTTP bearer)', () => {
+    const home = mkdtempSync(join(tmpdir(), 'hermes-ctrl-'));
+    cleanupDirs.push(home);
+    // A double-quoted `\n` decodes to a real newline (python-dotenv parity), but
+    // CR/LF are illegal in HTTP header values and would crash fetch — so the
+    // resolver must drop it rather than forward an unusable bearer (Codex review).
+    writeFileSync(join(home, '.env'), 'API_SERVER_KEY="abc\\n123"\n');
+
+    expect(resolveHermesApiServerKey(makeConfig({
+      localAgentIntegrations: {
+        hermes: {
+          enabled: true,
+          transport: { kind: 'hermes-openai', gatewayUrl: 'http://127.0.0.1:8642' },
+          metadata: { hermesHome: home },
+        },
+      },
+    }))).toBeUndefined();
+  });
+
+  it('never uses the override on loopback — even with no API_SERVER_KEY line (override is remote-only)', () => {
+    const home = mkdtempSync(join(tmpdir(), 'hermes-nokeyline-'));
+    cleanupDirs.push(home);
+    writeFileSync(join(home, '.env'), 'API_SERVER_ENABLED=true\nOTHER=keep\n'); // no API_SERVER_KEY
+    const config = makeConfig({
+      localAgentIntegrations: {
+        hermes: {
+          enabled: true,
+          transport: { kind: 'hermes-openai', gatewayUrl: 'http://127.0.0.1:8642' },
+          metadata: { hermesHome: home },
+        },
+      },
+    });
+
+    expect(resolveHermesApiServerKey(config)).toBeUndefined();
+    // A locally-managed profile resolved, so its .env is authoritative — the
+    // override (which targets a different/remote Hermes) must not substitute for
+    // a local setup that simply has no key (Codex review).
+    process.env.DKG_HERMES_API_SERVER_KEY = 'remote-only-override';
+    try {
+      expect(resolveHermesApiServerKey(config)).toBeUndefined();
+    } finally {
+      delete process.env.DKG_HERMES_API_SERVER_KEY;
+    }
+  });
+
+  it('honors the override on a loopback gateway with no locally-managed profile (WSL2 localhost forward)', () => {
+    // A WSL2/remote Hermes reached via a localhost forward looks "loopback" but
+    // has no local .env on the daemon host. With no resolvable local profile,
+    // honor DKG_HERMES_API_SERVER_KEY — otherwise this correctly-configured
+    // setup would 401 forever (Codex review).
+    const config = makeConfig({
+      localAgentIntegrations: {
+        hermes: {
+          enabled: true,
+          // No metadata.hermesHome / profileName → no local profile resolves.
+          transport: { kind: 'hermes-openai', gatewayUrl: 'http://127.0.0.1:8642' },
+        },
+      },
+    });
+
+    expect(resolveHermesApiServerKey(config)).toBeUndefined();
+    process.env.DKG_HERMES_API_SERVER_KEY = 'forwarded-remote-key';
+    try {
+      expect(resolveHermesApiServerKey(config)).toBe('forwarded-remote-key');
+    } finally {
+      delete process.env.DKG_HERMES_API_SERVER_KEY;
+    }
+  });
+
+  it('falls back to an EXACT named profile when metadata.hermesHome is absent but profileName is known', () => {
+    const home = mkdtempSync(join(tmpdir(), 'hermes-fallback-'));
+    cleanupDirs.push(home);
+    writeFileSync(join(home, '.env'), 'API_SERVER_KEY=fallback-key\n');
+    // Record predates hermesHome metadata but still carries profileName, so we
+    // resolve that exact profile (never a guessed default).
+    resolveHermesProfileMock.mockReturnValue({
+      profileName: 'research',
+      hermesHome: home,
+      memoryMode: 'provider',
+    });
+
+    expect(resolveHermesApiServerKey(makeConfig({
+      localAgentIntegrations: {
+        hermes: {
+          enabled: true,
+          transport: { kind: 'hermes-openai' },
+          metadata: { profileName: 'research' },
+        },
+      },
+    }))).toBe('fallback-key');
+    // The profile is resolved with an EXPLICIT hermesHome so a daemon-side
+    // HERMES_HOME can't redirect us to a different profile's .env (Codex review).
+    expect(resolveHermesProfileMock).toHaveBeenCalledWith({
+      profileName: 'research',
+      hermesHome: join(homedir(), '.hermes', 'profiles', 'research'),
+    });
+  });
+
+  it('does NOT guess the default profile when neither hermesHome nor profileName is known', () => {
+    // Guessing the default profile here could read a *different* profile's .env
+    // and forward the wrong key (Codex review). Return undefined so the caller
+    // surfaces the "run dkg hermes setup" hint instead.
+    const home = mkdtempSync(join(tmpdir(), 'hermes-noprofile-'));
+    cleanupDirs.push(home);
+    writeFileSync(join(home, '.env'), 'API_SERVER_KEY=wrong-profile-key\n');
+    resolveHermesProfileMock.mockReturnValue({
+      profileName: undefined,
+      hermesHome: home,
+      memoryMode: 'provider',
+    });
+
+    expect(resolveHermesApiServerKey(makeConfig({
+      localAgentIntegrations: {
+        hermes: { enabled: true, transport: { kind: 'hermes-openai' } },
+      },
+    }))).toBeUndefined();
+  });
+
+  it('annotates an unreachable hermes-openai health probe with the missing-key hint', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'hermes-nokey-'));
+    cleanupDirs.push(home);
+    // .env exists but has no active API_SERVER_KEY (issue #794 shape).
+    writeFileSync(join(home, '.env'), 'API_SERVER_ENABLED=true\n# API_SERVER_KEY=disabled\n');
+    const config = makeConfig({
+      localAgentIntegrations: {
+        hermes: {
+          enabled: true,
+          transport: { kind: 'hermes-openai', gatewayUrl: 'http://127.0.0.1:8642' },
+          metadata: { hermesHome: home },
+        },
+      },
+    });
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      throw new Error('fetch failed');
+    }));
+
+    const report = await probeHermesChannelHealth(config, undefined, { timeoutMs: 50 });
+    expect(report.ok).toBe(false);
+    expect(report.error).toContain('API_SERVER_KEY');
+    expect(report.error).toContain('dkg hermes setup');
   });
 
   it('normalizes profile for send and persist payloads', () => {
@@ -1277,6 +1573,72 @@ describe('Hermes daemon routes', () => {
     expect(JSON.parse(res.body)).toMatchObject({
       code: 'INTEGRATION_DISABLED',
     });
+  });
+
+  it.each(['/api/hermes-channel/send', '/api/hermes-channel/stream'])(
+    'returns HERMES_API_KEY_REJECTED with realign guidance when a forwarded key is rejected (%s)',
+    async (path) => {
+      // A key IS resolved (present in the profile .env) → 401 means it's wrong.
+      const home = mkdtempSync(join(tmpdir(), 'hermes-401-'));
+      cleanupDirs.push(home);
+      writeFileSync(join(home, '.env'), 'API_SERVER_KEY=present-but-wrong\n');
+      const { ctx, res } = makeHermesRouteContext({
+        text: 'hello',
+        correlationId: 'corr-1',
+      }, {
+        hasChatTurn: vi.fn(async () => false),
+        storeChatExchange: vi.fn(async () => {}),
+      }, {
+        localAgentIntegrations: {
+          hermes: {
+            enabled: true,
+            capabilities: { localChat: true },
+            transport: { kind: 'hermes-openai', gatewayUrl: 'http://127.0.0.1:8642' },
+            metadata: { hermesHome: home },
+          },
+        },
+      }, path);
+      // Empty upstream body so the route surfaces our own remediation text.
+      vi.stubGlobal('fetch', vi.fn(async () => new Response('', { status: 401 })));
+
+      await handleHermesRoutes(ctx);
+
+      expect(res.statusCode).toBe(502);
+      const body = JSON.parse(res.body);
+      expect(body).toMatchObject({ code: 'HERMES_API_KEY_REJECTED' });
+      // Key present but wrong → realign/rotate guidance, NOT the missing-key
+      // "provision" path (setup never overwrites an existing key).
+      expect(body.details).toContain('does not match');
+      expect(body.details).not.toContain('provision API_SERVER_KEY');
+    },
+  );
+
+  it('returns missing-key guidance on 401 when no key was resolved/forwarded', async () => {
+    // No metadata / no resolvable key → DKG sent no bearer → 401 means MISSING,
+    // so the remediation must point to provisioning, not realigning.
+    const { ctx, res } = makeHermesRouteContext({
+      text: 'hello',
+      correlationId: 'corr-1',
+    }, {
+      hasChatTurn: vi.fn(async () => false),
+      storeChatExchange: vi.fn(async () => {}),
+    }, {
+      localAgentIntegrations: {
+        hermes: {
+          enabled: true,
+          capabilities: { localChat: true },
+          transport: { kind: 'hermes-openai', gatewayUrl: 'http://127.0.0.1:8642' },
+        },
+      },
+    }, '/api/hermes-channel/send');
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('', { status: 401 })));
+
+    await handleHermesRoutes(ctx);
+
+    expect(res.statusCode).toBe(502);
+    const body = JSON.parse(res.body);
+    expect(body.details).toContain('provision API_SERVER_KEY');
+    expect(body.details).not.toContain('does not match');
   });
 
   it('forwards attachment refs, import context, and contextGraphId to Hermes channel send', async () => {

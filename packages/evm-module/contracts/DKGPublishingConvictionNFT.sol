@@ -6,6 +6,7 @@ import {INamed} from "./interfaces/INamed.sol";
 import {IVersioned} from "./interfaces/IVersioned.sol";
 import {IInitializable} from "./interfaces/IInitializable.sol";
 import {HubDependent} from "./abstract/HubDependent.sol";
+import {PublishingMathLib} from "./libraries/PublishingMathLib.sol";
 import {PublishingConviction} from "./PublishingConviction.sol";
 import {PublishingConvictionStorage} from "./storage/PublishingConvictionStorage.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -88,7 +89,7 @@ contract DKGPublishingConvictionNFT is INamed, IVersioned, HubDependent, IInitia
     //           mint counter + TRAC-pull only. Public selectors are
     //           preserved so `IDKGPublishingConvictionNFT` consumers
     //           (`KnowledgeAssetsV10`, `ContextGraphs`) need no changes.
-    string private constant _VERSION = "3.0.0";
+    string private constant _VERSION = "10.0.2";
 
     uint256 public constant BPS_DENOMINATOR = 10_000;
 
@@ -184,34 +185,45 @@ contract DKGPublishingConvictionNFT is INamed, IVersioned, HubDependent, IInitia
      * @notice Mint a new conviction-account NFT to the caller and
      *         transfer `committedTRAC` into the V10 vault.
      *
-     * @dev    Order of operations (mirrors the legacy v2.x semantics):
+     * @dev    CEI ordering with `_mint` last:
      *           1. Allocate `accountId` from the wrapper's mint counter.
-     *           2. Mint the ERC-721 to `msg.sender` (publisher).
-     *           3. Forward to `PublishingConviction.createAccount` which
+     *           2. Forward to `PublishingConviction.createAccount` which
      *              persists the `Account` record on PCS and emits
-     *              `AccountCreated`.
-     *           4. Pull TRAC from publisher to the V10 vault. The
+     *              `AccountCreated`. Logic-side parameter validation
+     *              runs here, BEFORE any funds move.
+     *           3. Pull TRAC from publisher to the V10 vault. The
      *              wrapper holds NO TRAC — this is a direct
      *              `transferFrom(publisher, ConvictionStakingStorage,
      *              committedTRAC)`.
+     *           4. `_mint(msg.sender, accountId)` LAST. The wrapper
+     *              never observes a half-built (NFT-without-Account
+     *              -or-funding) state.
      *
-     *         The TRAC pull is intentionally LAST so a logic-side
-     *         revert (e.g. parameter validation) does not move funds.
-     *         A failed `transferFrom` reverts the whole tx — atomic,
-     *         the NFT is never minted without TRAC backing it.
+     *         `_mint` (not `_safeMint`) is intentional: contract
+     *         publishers without `IERC721Receiver` (DAO treasuries,
+     *         relayer/factory wrappers, etc.) are part of the
+     *         supported caller set.
+     *
+     *         The forward-before-pull order means a logic-side revert
+     *         does not move funds. The whole tx reverts atomically on
+     *         any failure path — the NFT is never minted without TRAC
+     *         backing it and a recorded `Account` row.
      */
     function createAccount(uint96 committedTRAC) external returns (uint256 accountId) {
         if (committedTRAC == 0) revert InvalidAmount();
 
         accountId = _nextAccountId++;
 
-        _mint(msg.sender, accountId);
-
         _publishingConviction().createAccount(msg.sender, accountId, committedTRAC);
 
+        // Direct publisher -> CSS vault transfer. Contract never holds TRAC.
+        // The TRAC sits in escrow against this account's billing windows and
+        // is accounted to the staker pool lazily via active/passive sinks.
         if (!tokenContract.transferFrom(msg.sender, stakingStorageAddress, committedTRAC)) {
             revert TokenTransferFailed();
         }
+
+        _mint(msg.sender, accountId);
     }
 
     /**
@@ -256,7 +268,7 @@ contract DKGPublishingConvictionNFT is INamed, IVersioned, HubDependent, IInitia
         uint40 kcStartEpoch,
         uint40 kcEpochs
     ) external returns (uint96 discountedCost) {
-        address kav10 = hub.getContractAddress("KnowledgeAssetsV10");
+        address kav10 = hub.getContractAddress("KnowledgeAssetsLifecycle");
         if (msg.sender != kav10) revert OnlyKnowledgeAssetsV10(msg.sender);
 
         return _publishingConviction().coverPublishingCost(publishingAgent, baseCost, kcStartEpoch, kcEpochs);
@@ -373,17 +385,10 @@ contract DKGPublishingConvictionNFT is INamed, IVersioned, HubDependent, IInitia
         return publishingConvictionStorage.isRegisteredAgent(accountId, agent);
     }
 
-    /// @notice Discrete 6-tier discount ladder. Pure helper duplicated
-    ///         on the wrapper for cheap caller-side reads. Stays in
-    ///         lockstep with `PublishingConviction.getDiscountBps`.
+    /// @notice Discrete 6-tier discount ladder. Selector-compatible
+    ///         wrapper read over the shared publishing math helper.
     function getDiscountBps(uint96 committedTRAC) public pure returns (uint256) {
-        if (committedTRAC >= 1_000_000 ether) return 7500;
-        if (committedTRAC >= 500_000 ether)   return 5000;
-        if (committedTRAC >= 250_000 ether)   return 4000;
-        if (committedTRAC >= 100_000 ether)   return 3000;
-        if (committedTRAC >= 50_000 ether)    return 2000;
-        if (committedTRAC >= 25_000 ether)    return 1000;
-        return 0;
+        return PublishingMathLib.discountBps(committedTRAC);
     }
 
     /// @notice Discount basis points fixed at creation for `accountId`.

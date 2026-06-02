@@ -65,6 +65,70 @@ export interface TripleStore {
 
 export type TripleStoreBackend = 'oxigraph' | 'oxigraph-persistent' | 'oxigraph-worker' | 'blazegraph' | 'sparql-http' | string;
 
+// Backends that talk to a remote SPARQL endpoint over HTTP rather than
+// owning local files. The local/external split governs three pieces of
+// daemon behaviour:
+//   1. Store-size metric — local backends report file bytes, external
+//      backends have no file to stat (`getStoreBytes` returns null).
+//   2. Chain-reset wipe — local backends `rm` files, external backends
+//      issue SPARQL UPDATE (scoped DELETE for operator-provided URLs to
+//      avoid clobbering V6/V8 data sharing the instance; DROP ALL only
+//      when the namespace is owned by the CLI, signalled via
+//      `storeConfig.options.managedByDkg`).
+//   3. Boot health check — for external backends, an ASK probe runs at
+//      daemon start; an unreachable endpoint exits the daemon with an
+//      actionable message rather than booting half-broken.
+const EXTERNAL_BACKENDS: ReadonlySet<string> = new Set(['blazegraph', 'sparql-http']);
+
+export function isExternalBackend(backend: string | undefined | null): boolean {
+  return typeof backend === 'string' && EXTERNAL_BACKENDS.has(backend);
+}
+
+/**
+ * Shape-normalised SPARQL endpoint extracted from a TripleStoreConfig.
+ *
+ * `blazegraph` adapters use a single `options.url`; `sparql-http`
+ * adapters use distinct `options.queryEndpoint` / `options.updateEndpoint`
+ * with an optional auth header. Callers that need to issue raw SPARQL
+ * (chain-reset wipe, boot health check, namespace identity tag) use this
+ * helper instead of duplicating the options-shape logic in three places.
+ */
+export interface SparqlEndpoint {
+  queryUrl: string;
+  updateUrl: string;
+  headers: Record<string, string>;
+}
+
+export function getSparqlEndpoint(storeConfig: TripleStoreConfig): SparqlEndpoint {
+  if (!isExternalBackend(storeConfig.backend)) {
+    throw new Error(
+      `getSparqlEndpoint called for non-external backend "${storeConfig.backend}"`,
+    );
+  }
+  const opts = (storeConfig.options ?? {}) as Record<string, unknown>;
+  if (storeConfig.backend === 'blazegraph') {
+    const url = typeof opts.url === 'string' ? opts.url : '';
+    if (!url) {
+      throw new Error('blazegraph storeConfig requires options.url');
+    }
+    return { queryUrl: url, updateUrl: url, headers: {} };
+  }
+  // sparql-http
+  const queryEndpoint = typeof opts.queryEndpoint === 'string' ? opts.queryEndpoint : '';
+  if (!queryEndpoint) {
+    throw new Error('sparql-http storeConfig requires options.queryEndpoint');
+  }
+  const updateEndpoint =
+    typeof opts.updateEndpoint === 'string' && opts.updateEndpoint
+      ? opts.updateEndpoint
+      : queryEndpoint;
+  const headers: Record<string, string> = {};
+  if (typeof opts.auth === 'string' && opts.auth) {
+    headers['Authorization'] = opts.auth;
+  }
+  return { queryUrl: queryEndpoint, updateUrl: updateEndpoint, headers };
+}
+
 export interface LargeLiteralStorageConfig {
   /** Enable large SWM literal blob storage. Defaults to true when present. */
   enabled?: boolean;

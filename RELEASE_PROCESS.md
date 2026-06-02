@@ -160,7 +160,21 @@ Then start node again:
 dkg start
 ```
 
-## 9) Promotion policy
+## 9) Builder upgrade guides (per release)
+
+Every breaking or builder-impacting release ships a focused upgrade guide alongside the CHANGELOG entry. The guide lives at `docs/UPGRADE_<PRIOR>_TO_<NEW>.md` (e.g. `docs/UPGRADE_RC11_TO_RC12.md`).
+
+A good upgrade guide:
+
+- Opens with an agent-prompt template builders can paste into Cursor / Claude Code / Codex CLI / any AGENTS.md-honouring tool to drive the migration end-to-end.
+- Includes a breaking-change matrix at the top so a reader can grep for what affects them in 30 seconds.
+- Provides mechanical search-and-replace tables for the TS and Solidity surfaces (sed / git-grep examples are fine — most rename work is regex-shaped).
+- Documents every economic / contract / wire-format change a downstream caller could trip on, with concrete `tokenAmount`, ABI, and Hub-registration steps.
+- Cross-links the relevant `CHANGELOG.md` section for per-PR detail.
+
+Cross-link the new guide from [`docs/RELEASE.md`](docs/RELEASE.md) § "Upgrading from a prior release" before tagging.
+
+## 10) Promotion policy
 
 Recommended progression:
 

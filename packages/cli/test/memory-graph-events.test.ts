@@ -49,10 +49,18 @@ function createTracker(): RequestContext['tracker'] {
 
 function createContext(path: string, body: unknown, overrides: Partial<RequestContext> = {}): RequestContext {
   const url = new URL(`http://127.0.0.1${path}`);
+  const { agent: overrideAgent, ...restOverrides } = overrides;
+  const defaultAgent = {
+    peerId: 'peer-test',
+    listContextGraphs: vi.fn(async () => [
+      { id: 'project-a', uri: 'did:dkg:context-graph:project-a', name: 'Project A', subscribed: true, synced: true },
+    ]),
+    contextGraphExists: vi.fn(async (contextGraphId: string) => contextGraphId === 'project-a'),
+  };
   return {
     req: createPostRequest(path, body),
     res: createResponse() as unknown as ServerResponse,
-    agent: {} as RequestContext['agent'],
+    agent: { ...defaultAgent, ...(overrideAgent as Record<string, unknown> | undefined) } as RequestContext['agent'],
     publisherControl: {} as RequestContext['publisherControl'],
     publisherRuntime: null,
     config: {} as RequestContext['config'],
@@ -79,12 +87,26 @@ function createContext(path: string, body: unknown, overrides: Partial<RequestCo
     path: url.pathname,
     requestToken: undefined,
     requestAgentAddress: '0x0000000000000000000000000000000000000001',
-    ...overrides,
+    ...restOverrides,
   };
 }
 
 function responseBody(ctx: RequestContext): Record<string, unknown> {
   return JSON.parse((ctx.res as unknown as { body: string }).body) as Record<string, unknown>;
+}
+
+function createSwmStore(rootEntities: string[]) {
+  return {
+    query: vi.fn(async () => ({
+      type: 'quads',
+      quads: rootEntities.map((root) => ({
+        subject: root,
+        predicate: 'urn:p',
+        object: 'urn:o',
+        graph: 'did:dkg:context-graph:project-a/_shared_memory',
+      })),
+    })),
+  };
 }
 
 describe('daemon memory_graph_changed route emissions', () => {
@@ -378,7 +400,7 @@ describe('daemon memory_graph_changed route emissions', () => {
   it('emits SWM and VM refresh events after confirmed selective publishes', async () => {
     const emitMemoryGraphChanged = vi.fn();
     const publishFromSharedMemory = vi.fn().mockResolvedValue({
-      kcId: 'kc-1',
+      kaId: 'kc-1',
       status: 'confirmed',
       kaManifest: [{ tokenId: 1n, rootEntity: 'urn:root' }],
       publicQuads: [
@@ -387,13 +409,14 @@ describe('daemon memory_graph_changed route emissions', () => {
       ],
     });
     const getContextGraphOnChainId = vi.fn().mockResolvedValue('7');
+    const store = createSwmStore(['urn:root']);
     const ctx = createContext('/api/shared-memory/publish', {
       contextGraphId: 'project-a',
       subGraphName: 'notes',
       selection: ['urn:root'],
       clearAfter: false,
     }, {
-      agent: { publishFromSharedMemory, getContextGraphOnChainId } as unknown as RequestContext['agent'],
+      agent: { publishFromSharedMemory, getContextGraphOnChainId, store } as unknown as RequestContext['agent'],
       emitMemoryGraphChanged,
     });
 
@@ -401,7 +424,7 @@ describe('daemon memory_graph_changed route emissions', () => {
 
     expect((ctx.res as unknown as { statusCode: number }).statusCode).toBe(200);
     expect(responseBody(ctx)).toMatchObject({
-      kcId: 'kc-1',
+      kaId: 'kc-1',
       status: 'confirmed',
       kas: [{ tokenId: '1', rootEntity: 'urn:root' }],
     });
@@ -418,19 +441,126 @@ describe('daemon memory_graph_changed route emissions', () => {
     expect(ctx.tracker.complete).toHaveBeenCalledWith(expect.anything(), { tripleCount: 2 });
   });
 
+  it('preflights explicit SWM roots and skips stale selections before publishing', async () => {
+    const store = createSwmStore(['urn:root:present']);
+    const publishFromSharedMemory = vi.fn().mockResolvedValue({
+      kaId: 'kc-1',
+      status: 'confirmed',
+      kaManifest: [{ tokenId: 1n, rootEntity: 'urn:root:present' }],
+      publicQuads: [{ subject: 'urn:root:present', predicate: 'urn:p', object: 'urn:o', graph: 'urn:g' }],
+    });
+    const getContextGraphOnChainId = vi.fn().mockResolvedValue('7');
+    const ctx = createContext('/api/shared-memory/publish', {
+      contextGraphId: 'project-a',
+      selection: ['urn:root:present', 'urn:root:missing', 'not an iri', 'urn:root:present'],
+    }, {
+      agent: { publishFromSharedMemory, getContextGraphOnChainId, store } as unknown as RequestContext['agent'],
+    });
+
+    await handleMemoryRoutes(ctx);
+
+    expect((ctx.res as unknown as { statusCode: number }).statusCode).toBe(200);
+    expect(store.query).toHaveBeenCalledTimes(1);
+    expect(publishFromSharedMemory).toHaveBeenCalledTimes(1);
+    expect(publishFromSharedMemory.mock.calls[0][1]).toEqual({ rootEntities: ['urn:root:present'] });
+  });
+
+  it('preflights explicit SWM roots against skolemized descendants', async () => {
+    const root = 'urn:doc:markdown';
+    const section = `${root}/.well-known/genid/section-1-intro`;
+    const store = {
+      query: vi.fn(async () => ({
+        type: 'quads',
+        quads: [
+          {
+            subject: section,
+            predicate: 'http://schema.org/name',
+            object: '"Intro"',
+            graph: 'did:dkg:context-graph:project-a/_shared_memory',
+          },
+        ],
+      })),
+    };
+    const publishFromSharedMemory = vi.fn().mockResolvedValue({
+      kaId: 'kc-1',
+      status: 'confirmed',
+      kaManifest: [{ tokenId: 1n, rootEntity: root }],
+      publicQuads: [{ subject: section, predicate: 'http://schema.org/name', object: '"Intro"', graph: 'urn:g' }],
+    });
+    const getContextGraphOnChainId = vi.fn().mockResolvedValue('7');
+    const ctx = createContext('/api/shared-memory/publish', {
+      contextGraphId: 'project-a',
+      selection: [root],
+    }, {
+      agent: { publishFromSharedMemory, getContextGraphOnChainId, store } as unknown as RequestContext['agent'],
+    });
+
+    await handleMemoryRoutes(ctx);
+
+    expect((ctx.res as unknown as { statusCode: number }).statusCode).toBe(200);
+    expect(store.query.mock.calls[0][0]).toContain('STRSTARTS(STR(?s), CONCAT(STR(?root), "/.well-known/genid/"))');
+    expect(publishFromSharedMemory).toHaveBeenCalledTimes(1);
+    expect(publishFromSharedMemory.mock.calls[0][1]).toEqual({ rootEntities: [root] });
+  });
+
+  it('rejects multi-root synchronous SWM publishes before any root is published', async () => {
+    const store = {
+      query: vi.fn(async () => ({
+        type: 'quads',
+        quads: [
+          { subject: 'urn:root:a', predicate: 'urn:p', object: '"A"', graph: 'did:dkg:context-graph:project-a/_shared_memory' },
+          { subject: 'urn:root:b', predicate: 'urn:p', object: '"B"', graph: 'did:dkg:context-graph:project-a/_shared_memory' },
+          {
+            subject: 'urn:root:owner-only',
+            predicate: 'http://dkg.io/ontology/workspaceOwner',
+            object: '"peer-test"',
+            graph: 'did:dkg:context-graph:project-a/_shared_memory',
+          },
+        ],
+      })),
+    };
+    const publishFromSharedMemory = vi.fn();
+    const getContextGraphOnChainId = vi.fn().mockResolvedValue(null);
+    const registerContextGraph = vi.fn();
+    const ctx = createContext('/api/shared-memory/publish', {
+      contextGraphId: 'project-a',
+      selection: 'all',
+      clearAfter: true,
+    }, {
+      agent: {
+        publishFromSharedMemory,
+        getContextGraphOnChainId,
+        registerContextGraph,
+        store,
+      } as unknown as RequestContext['agent'],
+    });
+
+    await handleMemoryRoutes(ctx);
+
+    expect((ctx.res as unknown as { statusCode: number }).statusCode).toBe(409);
+    expect(getContextGraphOnChainId).not.toHaveBeenCalled();
+    expect(registerContextGraph).not.toHaveBeenCalled();
+    expect(publishFromSharedMemory).not.toHaveBeenCalled();
+    expect(responseBody(ctx)).toMatchObject({
+      code: 'MULTI_ROOT_PUBLISH_NOT_ATOMIC',
+      rootEntities: ['urn:root:a', 'urn:root:b'],
+    });
+  });
+
   it('keeps implicit same-graph publishes out of the remap path', async () => {
     const publishFromSharedMemory = vi.fn().mockResolvedValue({
-      kcId: 'kc-1',
+      kaId: 'kc-1',
       status: 'confirmed',
       kaManifest: [{ tokenId: 1n, rootEntity: 'urn:root' }],
       publicQuads: [{ subject: 'urn:root', predicate: 'urn:p', object: 'urn:o', graph: 'urn:g' }],
     });
     const getContextGraphOnChainId = vi.fn().mockResolvedValue('7');
+    const store = createSwmStore(['urn:root']);
     const ctx = createContext('/api/shared-memory/publish', {
       contextGraphId: 'project-a',
       selection: ['urn:root'],
     }, {
-      agent: { publishFromSharedMemory, getContextGraphOnChainId } as unknown as RequestContext['agent'],
+      agent: { publishFromSharedMemory, getContextGraphOnChainId, store } as unknown as RequestContext['agent'],
     });
 
     await handleMemoryRoutes(ctx);
@@ -442,18 +572,19 @@ describe('daemon memory_graph_changed route emissions', () => {
 
   it('still forwards explicit publishContextGraphId as a remap request', async () => {
     const publishFromSharedMemory = vi.fn().mockResolvedValue({
-      kcId: 'kc-1',
+      kaId: 'kc-1',
       status: 'confirmed',
       kaManifest: [{ tokenId: 1n, rootEntity: 'urn:root' }],
       publicQuads: [{ subject: 'urn:root', predicate: 'urn:p', object: 'urn:o', graph: 'urn:g' }],
     });
     const getContextGraphOnChainId = vi.fn().mockResolvedValue('7');
+    const store = createSwmStore(['urn:root']);
     const ctx = createContext('/api/shared-memory/publish', {
       contextGraphId: 'project-a',
       publishContextGraphId: '7',
       selection: ['urn:root'],
     }, {
-      agent: { publishFromSharedMemory, getContextGraphOnChainId } as unknown as RequestContext['agent'],
+      agent: { publishFromSharedMemory, getContextGraphOnChainId, store } as unknown as RequestContext['agent'],
     });
 
     await handleMemoryRoutes(ctx);
@@ -463,6 +594,97 @@ describe('daemon memory_graph_changed route emissions', () => {
       contextGraphId: '7',
     });
     expect(responseBody(ctx)).toMatchObject({ publishContextGraphId: '7' });
+  });
+
+  it('forwards explicit publishEpochs to SWM publish options', async () => {
+    const publishFromSharedMemory = vi.fn().mockResolvedValue({
+      kaId: 'kc-1',
+      status: 'confirmed',
+      kaManifest: [{ tokenId: 1n, rootEntity: 'urn:root' }],
+      publicQuads: [{ subject: 'urn:root', predicate: 'urn:p', object: 'urn:o', graph: 'urn:g' }],
+    });
+    const getContextGraphOnChainId = vi.fn().mockResolvedValue('7');
+    const store = createSwmStore(['urn:root']);
+    const ctx = createContext('/api/shared-memory/publish', {
+      contextGraphId: 'project-a',
+      selection: ['urn:root'],
+      publishEpochs: '9',
+    }, {
+      agent: { publishFromSharedMemory, getContextGraphOnChainId, store } as unknown as RequestContext['agent'],
+    });
+
+    await handleMemoryRoutes(ctx);
+
+    expect((ctx.res as unknown as { statusCode: number }).statusCode).toBe(200);
+    expect(publishFromSharedMemory.mock.calls[0][2]).toMatchObject({
+      publishEpochs: 9,
+    });
+  });
+
+  it('normalizes full publishContextGraphId DIDs to a positive on-chain remap id', async () => {
+    const publishFromSharedMemory = vi.fn().mockResolvedValue({
+      kaId: 'kc-1',
+      status: 'confirmed',
+      kaManifest: [{ tokenId: 1n, rootEntity: 'urn:root' }],
+      publicQuads: [{ subject: 'urn:root', predicate: 'urn:p', object: 'urn:o', graph: 'urn:g' }],
+    });
+    const getContextGraphOnChainId = vi.fn(async (contextGraphId: string) =>
+      contextGraphId === 'target-cg' ? '42' : '7',
+    );
+    const store = createSwmStore(['urn:root']);
+    const listContextGraphs = vi.fn(async () => [
+      { id: 'project-a', uri: 'did:dkg:context-graph:project-a', name: 'Project A', subscribed: true, synced: true },
+      { id: 'target-cg', uri: 'did:dkg:context-graph:target-cg', name: 'Target CG', subscribed: true, synced: false },
+    ]);
+    const ctx = createContext('/api/shared-memory/publish', {
+      contextGraphId: 'project-a',
+      publishContextGraphId: 'did:dkg:context-graph:target-cg',
+      selection: ['urn:root'],
+    }, {
+      agent: {
+        publishFromSharedMemory,
+        getContextGraphOnChainId,
+        listContextGraphs,
+        store,
+      } as unknown as RequestContext['agent'],
+    });
+
+    await handleMemoryRoutes(ctx);
+
+    expect((ctx.res as unknown as { statusCode: number }).statusCode).toBe(200);
+    expect(getContextGraphOnChainId).toHaveBeenCalledWith('target-cg');
+    expect(publishFromSharedMemory.mock.calls[0][2]).toMatchObject({
+      contextGraphId: '42',
+    });
+    expect(responseBody(ctx)).toMatchObject({ publishContextGraphId: '42' });
+  });
+
+  it('rejects non-numeric publishContextGraphId overrides without an on-chain id', async () => {
+    const publishFromSharedMemory = vi.fn();
+    const getContextGraphOnChainId = vi.fn(async (contextGraphId: string) =>
+      contextGraphId === 'project-a' ? '7' : null,
+    );
+    const listContextGraphs = vi.fn(async () => [
+      { id: 'project-a', uri: 'did:dkg:context-graph:project-a', name: 'Project A', subscribed: true, synced: true },
+      { id: 'target-cg', uri: 'did:dkg:context-graph:target-cg', name: 'Target CG', subscribed: true, synced: false },
+    ]);
+    const ctx = createContext('/api/shared-memory/publish', {
+      contextGraphId: 'project-a',
+      publishContextGraphId: 'target-cg',
+      selection: ['urn:root'],
+    }, {
+      agent: {
+        publishFromSharedMemory,
+        getContextGraphOnChainId,
+        listContextGraphs,
+      } as unknown as RequestContext['agent'],
+    });
+
+    await handleMemoryRoutes(ctx);
+
+    expect((ctx.res as unknown as { statusCode: number }).statusCode).toBe(400);
+    expect(responseBody(ctx)).toMatchObject({ code: 'CONTEXT_GRAPH_NOT_REGISTERED' });
+    expect(publishFromSharedMemory).not.toHaveBeenCalled();
   });
 
   it('emits VM refresh events after verified-memory verification', async () => {

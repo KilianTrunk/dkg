@@ -3,7 +3,8 @@ import { GraphManager } from '@origintrail-official/dkg-storage';
 import type { QueryResult, QueryOptions, QueryEngine } from './query-engine.js';
 import {
   contextGraphDataUri, contextGraphSharedMemoryUri, contextGraphVerifiedMemoryUri, contextGraphAssertionUri,
-  contextGraphSubGraphUri,
+  contextGraphSubGraphUri, contextGraphMetaUri, contextGraphSharedMemoryMetaUri,
+  contextGraphSubGraphMetaUri, contextGraphPrivateUri, contextGraphSubGraphPrivateUri,
   assertSafeIri, escapeSparqlLiteral, validateSubGraphName,
   type GetView,
   REMOVED_VIEWS,
@@ -13,7 +14,9 @@ import {
 import {
   validateReadOnlySparql,
   emptyResultForSparql,
+  detectSparqlQueryForm,
 } from './sparql-guard.js';
+import { stripLiteralsAndComments } from './sparql-utils.js';
 
 /**
  * Result of resolving a V10 GET view to concrete graph targets.
@@ -27,6 +30,13 @@ export interface ViewResolution {
    * assertions) and verified-memory (multiple quorum graphs).
    */
   graphPrefixes: string[];
+}
+
+export class ScopedQueryViolationError extends Error {
+  constructor(message: string) {
+    super(`Scoped query violation: ${message}`);
+    this.name = 'ScopedQueryViolationError';
+  }
 }
 
 /**
@@ -111,15 +121,40 @@ export function resolveViewGraphs(
           graphPrefixes: [],
         };
       }
-      // §16.1: the root content graph `did:dkg:context-graph:{id}` IS the
-      // Verified Memory content layer (chain-confirmed data lands here after
-      // finalization).  Any quorum-specific verified-memory sub-graphs live
-      // under `_verified_memory/` and are unioned in as well.
+      // RC11 / PR-A (Codex review fix on #671, comment 3302058969):
+      // re-include the root content graph
+      // `did:dkg:context-graph:{id}` alongside the `_verified_memory/*`
+      // post-`verify` named graphs.
       //
-      // Keep all verified-memory candidate graphs in scope. Trust is
-      // determined only by explicit metadata joined into the query below.
+      // The PR2 first cut dropped the root from VM to plug the
+      // "tentative VM" leak (failed publishes used to leave triples in
+      // the root graph and surfaced via `view: 'verified-memory'`).
+      // That leak is now fixed at the publisher: the root-graph
+      // `store.insert(normalizedQuads)` was moved INSIDE the
+      // chain-success branch of `DKGPublisher.publish` (see
+      // `packages/publisher/src/dkg-publisher.ts` "RC11 / PR2: write
+      // the published public quads into the root data graph ONLY after
+      // the chain has confirmed"), so a failed on-chain publish writes
+      // nothing to the root graph. The three intentional-local
+      // branches (`no on-chain CG id`, `chain not V10-ready`,
+      // `private data — no ACKs collectable`) write through
+      // `finalizeIntentionalLocalPublish` — these are deliberate
+      // local-only publishes, not failed chain publishes, and were
+      // already part of VM pre-PR2.
+      //
+      // Dropping the root graph here was a behavioural break for
+      // existing callers (memory-search flows, the daemon's
+      // `/api/query?view=verified-memory` route after
+      // `/api/shared-memory/publish`): a successful publish would
+      // silently disappear from VM until a separate `verify()` wrote
+      // into `_verified_memory/{vmId}`. Restoring the root graph keeps
+      // confirmed publisher-side data immediately queryable via VM
+      // while `_verified_memory/*` remains the source of truth for
+      // cross-node consensus-verified data (still stamped with
+      // `dkg:trustLevel` ConsensusVerified by
+      // `DKGAgent.promoteToVerifiedMemory`).
       return {
-        graphs: [contextGraphDataUri(contextGraphId)],
+        graphs: [`did:dkg:context-graph:${contextGraphId}`],
         graphPrefixes: [`did:dkg:context-graph:${contextGraphId}/_verified_memory/`],
       };
     }
@@ -135,6 +170,9 @@ export function resolveViewGraphs(
 export class DKGQueryEngine implements QueryEngine {
   private readonly store: TripleStore;
   private readonly graphManager: GraphManager;
+  // Collapse the dashboard's parallel WM/SWM/VM count scans without retaining
+  // a completed allow-list that could miss newly-created assertion graphs.
+  private readonly scopedContentGraphAllowListInFlight = new Map<string, Promise<string[]>>();
 
   constructor(store: TripleStore) {
     this.store = store;
@@ -149,10 +187,108 @@ export class DKGQueryEngine implements QueryEngine {
 
     // ── V10 view-based routing ────────────────────────────────────────
     const effectiveContextGraphId = options?.contextGraphId;
+    if (effectiveContextGraphId) {
+      assertNoCallerDatasetClauses(sparql);
+    }
 
     if (options?.subGraphName) {
       const v = validateSubGraphName(options.subGraphName);
       if (!v.valid) throw new Error(`Invalid sub-graph name for query: ${v.reason}`);
+    }
+
+    if (effectiveContextGraphId && !options?.view) {
+      const dataGraph = options?.subGraphName
+        ? contextGraphSubGraphUri(effectiveContextGraphId, options.subGraphName)
+        : contextGraphDataUri(effectiveContextGraphId);
+      const sharedMemoryGraph = contextGraphSharedMemoryUri(effectiveContextGraphId, options?.subGraphName);
+      const allowedGraphs = options?.includeSharedMemory ?? options?.includeWorkspace
+        ? [dataGraph, sharedMemoryGraph]
+        : options?.graphSuffix === '_shared_memory'
+          ? [sharedMemoryGraph]
+          : [dataGraph];
+      // Authenticated callers that scope a query to a `contextGraphId`
+      // already have read access to that CG; refusing them visibility
+      // into the same CG's metadata graphs breaks every legitimate
+      // metadata read:
+      //   - `/_meta` — curator lookup, allowedAgent list, registration
+      //     status (invite-flow `assert_curator_triple_landed` probe,
+      //     CG Overview UI, downstream sync code)
+      //   - `/_shared_memory_meta` — workspaceOwner / promote-time
+      //     ownership metadata (devnet-test-swm-ownership-restart
+      //     `wait_for_owner_meta` probe, ACL enforcement on replicas).
+      //
+      // Privacy fence: a caller that explicitly narrowed routing to
+      // SWM-only via `graphSuffix: '_shared_memory'` does NOT gain
+      // access to the CG-level `_meta` (curator / allowedAgent /
+      // registrationStatus). They asked for SWM, they get SWM
+      // (including `_shared_memory_meta` for the workspaceOwner /
+      // ownership ACL probe). All other scoped routes expose both
+      // `_meta` and `_shared_memory_meta` for the legitimate metadata
+      // reads called out above.
+      //
+      // Sub-graph metadata uses `contextGraphSubGraphMetaUri`
+      // (`/<sub>/_meta`) — the same path the storage layer
+      // (`graph-manager.ts`) writes to — not the
+      // `/context/<sub>/_meta` shape produced by `contextGraphMetaUri`
+      // when a subGraphId is passed.
+      //
+      // Metadata graphs are always part of the scoped explicit allow-set:
+      // UI helpers enumerate sub-graph metadata with `GRAPH ?g` under a
+      // contextGraphId, while explicit GRAPH IRIs still need the same static
+      // route checks. Broader content-partition scans are handled later and
+      // require an explicit count-query opt-in.
+      const subGraphName = options?.subGraphName;
+      const isSwmOnlyRoute = options?.graphSuffix === '_shared_memory';
+      const metaAllowList = [
+        ...(isSwmOnlyRoute
+          ? []
+          : subGraphName
+            ? [
+                // Sub-graph metadata graph (`<cg>/<sub>/_meta`).
+                contextGraphSubGraphMetaUri(effectiveContextGraphId, subGraphName),
+                // Root CG metadata graph (`<cg>/_meta`). Canonical KA provenance
+                // (`rootEntity` / `partOf` / `confirmed` status) is written to the
+                // ROOT `_meta` even for sub-graph publishes — see
+                // `finalization-handler.ts` (the confirmed-meta writes hardcode
+                // `<cg>/_meta`). A sub-graph-scoped reader (e.g. the EPCIS events
+                // query) joins provenance from there, so the root `_meta` must be
+                // admitted alongside the sub-graph `_meta`. Both are within the
+                // same `contextGraphId`, so this does not cross the privacy
+                // boundary (which is the CG scope itself).
+                contextGraphMetaUri(effectiveContextGraphId),
+              ]
+            : [contextGraphMetaUri(effectiveContextGraphId)]),
+        contextGraphSharedMemoryMetaUri(effectiveContextGraphId, subGraphName),
+      ];
+      // `_private` is excluded from the allow-set by default (it is more
+      // sensitive than the `_meta` graphs above). Only callers that opt in
+      // via `includePrivate` may name the CG's own private partition — the
+      // EPCIS events query does this to surface private-anchored events to
+      // the hosting node. This stays strictly within the queried CG, so it
+      // is not a cross-CG leak, and it does not widen any other caller.
+      const privateAllowList = options?.includePrivate
+        ? [
+            subGraphName
+              ? contextGraphSubGraphPrivateUri(effectiveContextGraphId, subGraphName)
+              : contextGraphPrivateUri(effectiveContextGraphId),
+          ]
+        : [];
+      const explicitAllowedGraphs = [...allowedGraphs, ...metaAllowList, ...privateAllowList];
+      const shouldExpandGraphVariables =
+        options?.includeContextGraphPartitions === true && collectGraphVariables(sparql).length > 0;
+      const variableAllowedGraphs = shouldExpandGraphVariables
+        ? await this.resolveScopedGraphVariableAllowList(
+            effectiveContextGraphId,
+            explicitAllowedGraphs,
+            { subGraphName, isSwmOnlyRoute },
+          )
+        : explicitAllowedGraphs;
+      // Explicit GRAPH IRIs remain limited to the static route-specific
+      // allow-list. GRAPH variables only gain known same-CG content
+      // partitions for callers that explicitly opt into broad count scans;
+      // legacy scoped routes keep their selected memory-layer contract.
+      assertExplicitGraphIrisAllowed(sparql, explicitAllowedGraphs);
+      sparql = constrainGraphVariablesToAllowedSet(sparql, variableAllowedGraphs);
     }
 
     if (options?.view) {
@@ -173,7 +309,7 @@ export class DKGQueryEngine implements QueryEngine {
     // ── Legacy routing (V9 compat) ────────────────────────────────────
     let effectiveSparql = sparql;
 
-    if (effectiveContextGraphId && !sparql.toLowerCase().includes('from ')) {
+    if (effectiveContextGraphId) {
       const dataGraph = options?.subGraphName
         ? contextGraphSubGraphUri(effectiveContextGraphId, options.subGraphName)
         : contextGraphDataUri(effectiveContextGraphId);
@@ -257,6 +393,9 @@ export class DKGQueryEngine implements QueryEngine {
       return emptyResultForSparql(sparql);
     }
 
+    assertExplicitGraphIrisAllowed(sparql, allGraphs);
+    sparql = constrainGraphVariablesToAllowedSet(sparql, allGraphs);
+
     // Spec §14 trust-gradient filter — only enforced on verified-memory
     // where on-chain-anchored trust metadata is expected to live.
     // When `minTrust` (or legacy `_minTrust`) is set, rewrite the query so
@@ -311,7 +450,67 @@ export class DKGQueryEngine implements QueryEngine {
     // Build a single union query so LIMIT/ORDER BY/DISTINCT/aggregates
     // apply over the full dataset rather than per-graph.
     const unionSparql = wrapWithGraphUnion(sparql, graphs);
-    return this.execAndNormalize(unionSparql);
+    if (unionSparql !== null) {
+      return this.execAndNormalize(unionSparql);
+    }
+    // Fallback: the inner body contains a UNION so we cannot safely wrap
+    // in a single query without either crashing Blazegraph (nested
+    // UnionNode) or leaking a helper variable. Run per-graph and merge
+    // results in a FORM-AWARE way (Codex review on #789): flattening
+    // every form into `bindings` silently corrupts CONSTRUCT/DESCRIBE
+    // (drops `quads`), ASK (drops the boolean), and SELECT result sets
+    // (concatenation can't honour cross-graph LIMIT/ORDER BY/DISTINCT/
+    // aggregates). This path is rare (a user UNION over a multi-graph
+    // view), but it must not return the wrong shape.
+    const form = detectSparqlQueryForm(sparql);
+
+    if (form === 'CONSTRUCT' || form === 'DESCRIBE') {
+      // Graph-shaped results: the correct cross-graph merge is the union
+      // of the per-graph triple sets (deduped — the same triple can be
+      // constructed from multiple source graphs).
+      const merged: Quad[] = [];
+      for (const g of graphs) {
+        const r = await this.execAndNormalize(wrapWithGraph(sparql, g));
+        if (r.quads) merged.push(...r.quads);
+      }
+      return { bindings: [], quads: dedupeQuads(merged) };
+    }
+
+    if (form === 'ASK') {
+      // Boolean result: true iff the pattern matches in ANY graph.
+      // Short-circuit on the first positive graph.
+      for (const g of graphs) {
+        const r = await this.execAndNormalize(wrapWithGraph(sparql, g));
+        if (r.bindings[0]?.result === 'true') {
+          return { bindings: [{ result: 'true' }] };
+        }
+      }
+      return { bindings: [{ result: 'false' }] };
+    }
+
+    // SELECT (and UNKNOWN, which validateReadOnlySparql should already
+    // have rejected upstream). Per-graph concatenation is only correct
+    // when there are NO solution-set modifiers — DISTINCT/ORDER BY/
+    // LIMIT/OFFSET/GROUP BY/HAVING/aggregates all operate over the full
+    // solution set and cannot be reconstructed from per-graph slices.
+    // Rather than silently return duplicate / mis-ordered / over-limit
+    // rows, reject the unsupported shape explicitly so the caller gets a
+    // clear error instead of wrong data.
+    if (hasCrossGraphUnsafeModifier(sparql)) {
+      throw new Error(
+        'Multi-graph query combines an inner UNION with a solution-set ' +
+          'modifier (DISTINCT/ORDER BY/LIMIT/OFFSET/GROUP BY/aggregate). ' +
+          'This shape cannot be evaluated across graphs without corrupting ' +
+          'the modifier semantics. Scope the query to a single graph (pass ' +
+          'contextGraphId) or remove the inner UNION.',
+      );
+    }
+    const all: Record<string, string>[] = [];
+    for (const g of graphs) {
+      const r = await this.execAndNormalize(wrapWithGraph(sparql, g));
+      all.push(...r.bindings);
+    }
+    return { bindings: all };
   }
 
   private async discoverGraphsByPrefix(prefix: string): Promise<string[]> {
@@ -319,6 +518,149 @@ export class DKGQueryEngine implements QueryEngine {
     return allGraphs.filter(
       (g) => g.startsWith(prefix) && !g.includes('/_meta') && !g.includes('/staging/'),
     );
+  }
+
+  private async resolveScopedGraphVariableAllowList(
+    contextGraphId: string,
+    staticAllowedGraphs: string[],
+    opts: { subGraphName?: string; isSwmOnlyRoute: boolean },
+  ): Promise<string[]> {
+    if (opts.isSwmOnlyRoute) {
+      return staticAllowedGraphs;
+    }
+
+    const allowed = new Set(staticAllowedGraphs);
+    const scopedContentGraphs = await this.resolveScopedContentGraphAllowList(
+      contextGraphId,
+      opts.subGraphName,
+    );
+    for (const graph of scopedContentGraphs) {
+      allowed.add(graph);
+    }
+
+    return [...allowed];
+  }
+
+  private async resolveScopedContentGraphAllowList(
+    contextGraphId: string,
+    subGraphName?: string,
+  ): Promise<string[]> {
+    const key = JSON.stringify([contextGraphId, subGraphName ?? null]);
+    const cached = this.scopedContentGraphAllowListInFlight.get(key);
+    if (cached) {
+      return cached;
+    }
+
+    const promise = this.discoverScopedContentGraphAllowList(contextGraphId, subGraphName);
+    this.scopedContentGraphAllowListInFlight.set(key, promise);
+
+    try {
+      return await promise;
+    } finally {
+      if (this.scopedContentGraphAllowListInFlight.get(key) === promise) {
+        this.scopedContentGraphAllowListInFlight.delete(key);
+      }
+    }
+  }
+
+  private async discoverScopedContentGraphAllowList(
+    contextGraphId: string,
+    subGraphName?: string,
+  ): Promise<string[]> {
+    const allowed = new Set<string>();
+    const registeredSubGraphs = subGraphName
+      ? new Set([subGraphName])
+      : await this.discoverRegisteredSubGraphNames(contextGraphId);
+    const registeredAssertionGraphs = await this.discoverRegisteredAssertionGraphs(contextGraphId);
+    const knownChildContextGraphs = await this.discoverKnownChildContextGraphUris(contextGraphId);
+    const allGraphs = await this.store.listGraphs();
+
+    for (const graph of allGraphs) {
+      if (
+        isScopedContentGraph(
+          graph,
+          contextGraphId,
+          registeredSubGraphs,
+          registeredAssertionGraphs,
+          knownChildContextGraphs,
+          subGraphName,
+        )
+      ) {
+        allowed.add(graph);
+      }
+    }
+
+    return [...allowed];
+  }
+
+  private async discoverRegisteredSubGraphNames(contextGraphId: string): Promise<Set<string>> {
+    const names = new Set<string>();
+    const metaGraph = contextGraphMetaUri(contextGraphId);
+    const result = await this.store.query(
+      `SELECT ?name WHERE {
+        GRAPH <${assertSafeIri(metaGraph)}> {
+          ?subGraph a <http://dkg.io/ontology/SubGraph> ;
+                    <http://schema.org/name> ?name .
+        }
+      }`,
+    );
+    if (result.type !== 'bindings') return names;
+
+    for (const row of result.bindings) {
+      const name = stripSparqlLiteralValue(row['name']);
+      if (validateSubGraphName(name).valid) {
+        names.add(name);
+      }
+    }
+    return names;
+  }
+
+  private async discoverRegisteredAssertionGraphs(contextGraphId: string): Promise<Set<string>> {
+    const graphs = new Set<string>();
+    const metaGraph = contextGraphMetaUri(contextGraphId);
+    const result = await this.store.query(
+      `SELECT ?graph WHERE {
+        GRAPH <${assertSafeIri(metaGraph)}> {
+          ?assertion <http://dkg.io/ontology/assertionGraph> ?graph .
+        }
+      }`,
+    );
+    if (result.type !== 'bindings') return graphs;
+
+    for (const row of result.bindings) {
+      const graph = row['graph'];
+      if (typeof graph === 'string' && graph.length > 0) {
+        graphs.add(graph);
+      }
+    }
+    return graphs;
+  }
+
+  private async discoverKnownChildContextGraphUris(contextGraphId: string): Promise<Set<string>> {
+    const rootPrefix = `${contextGraphDataUri(contextGraphId)}/`;
+    const result = await this.store.query(
+      `SELECT DISTINCT ?ctxGraph WHERE {
+        GRAPH ?g {
+          {
+            ?ctxGraph <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <https://dkg.network/ontology#ContextGraph> .
+          } UNION {
+            ?ctxGraph <https://dkg.network/ontology#registrationStatus> ?status .
+          }
+        }
+        FILTER(STR(?g) = CONCAT(STR(?ctxGraph), "/_meta"))
+        FILTER(STRSTARTS(STR(?ctxGraph), "${escapeSparqlLiteral(rootPrefix)}"))
+      }`,
+    );
+    const uris = new Set<string>();
+    if (result.type !== 'bindings') return uris;
+
+    for (const row of result.bindings) {
+      const uri = row['ctxGraph'];
+      if (typeof uri === 'string' && uri.length > 0) {
+        uris.add(uri);
+      }
+    }
+    return uris;
   }
 
   private async execAndNormalize(sparql: string): Promise<QueryResult> {
@@ -412,6 +754,899 @@ export class DKGQueryEngine implements QueryEngine {
     return { bindings: allBindings };
   }
 
+}
+
+function isScopedContentGraph(
+  graph: string,
+  contextGraphId: string,
+  registeredSubGraphs: Set<string>,
+  registeredAssertionGraphs: Set<string>,
+  knownChildContextGraphs: Set<string>,
+  subGraphName?: string,
+): boolean {
+  const root = contextGraphDataUri(contextGraphId);
+  if (graph === root) return !subGraphName;
+  if (!graph.startsWith(`${root}/`)) return false;
+  if (isKnownChildContextGraphPartition(graph, knownChildContextGraphs)) return false;
+
+  const tail = graph.slice(root.length + 1);
+  if (
+    !tail ||
+    isMetadataGraphTail(tail) ||
+    isPrivateGraphTail(tail) ||
+    isRulesGraphTail(tail) ||
+    isStagingGraphTail(tail)
+  ) {
+    return false;
+  }
+
+  if (!subGraphName) {
+    if (tail === '_shared_memory') return true;
+    if (tail.startsWith('_verified_memory/')) return !isMetadataGraphTail(tail);
+    if (tail.startsWith('assertion/')) return registeredAssertionGraphs.has(graph);
+  }
+
+  const slash = tail.indexOf('/');
+  const firstSegment = slash >= 0 ? tail.slice(0, slash) : tail;
+  const remaining = slash >= 0 ? tail.slice(slash + 1) : '';
+  if (subGraphName && firstSegment !== subGraphName) return false;
+  if (!registeredSubGraphs.has(firstSegment) || !validateSubGraphName(firstSegment).valid) {
+    return false;
+  }
+
+  if (!remaining) return true;
+  if (remaining === '_shared_memory') return true;
+  if (remaining.startsWith('_verified_memory/')) return !isMetadataGraphTail(remaining);
+  if (remaining.startsWith('assertion/')) return registeredAssertionGraphs.has(graph);
+  return false;
+}
+
+function isMetadataGraphTail(tail: string): boolean {
+  return (
+    tail === '_meta' ||
+    tail === '_shared_memory_meta' ||
+    tail.endsWith('/_meta') ||
+    tail.endsWith('/_shared_memory_meta') ||
+    tail.includes('/_meta/') ||
+    tail.includes('/_shared_memory_meta/')
+  );
+}
+
+function isPrivateGraphTail(tail: string): boolean {
+  return tail === '_private' || tail.startsWith('_private/') || tail.endsWith('/_private') || tail.includes('/_private/');
+}
+
+function isRulesGraphTail(tail: string): boolean {
+  return tail === '_rules' || tail.startsWith('_rules/') || tail.endsWith('/_rules') || tail.includes('/_rules/');
+}
+
+function isKnownChildContextGraphPartition(graph: string, knownChildContextGraphs: Set<string>): boolean {
+  for (const childContextGraph of knownChildContextGraphs) {
+    if (graph === childContextGraph || graph.startsWith(`${childContextGraph}/`)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function isStagingGraphTail(tail: string): boolean {
+  return tail.startsWith('_verified_memory/staging/') || tail.includes('/_verified_memory/staging/');
+}
+
+function stripSparqlLiteralValue(value: string | undefined): string {
+  if (!value) return '';
+  return value.replace(/^"/, '').replace(/"(?:\^\^<[^>]+>|@[a-zA-Z-]+)?$/, '');
+}
+
+function assertNoCallerDatasetClauses(sparql: string): void {
+  if (hasCallerDatasetClause(sparql)) {
+    throw new ScopedQueryViolationError(
+      'FROM clauses are not allowed on scoped local queries',
+    );
+  }
+}
+
+function hasCallerDatasetClause(sparql: string): boolean {
+  const n = sparql.length;
+  let i = 0;
+
+  while (i < n) {
+    const ch = sparql[i];
+    if (ch === '#') {
+      while (i < n && sparql[i] !== '\n') i++;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      i = skipSparqlStringLiteral(sparql, i);
+      continue;
+    }
+    if (ch === '<') {
+      const end = skipSparqlIriRef(sparql, i);
+      i = end ?? i + 1;
+      continue;
+    }
+    if (isKeywordStart(sparql, i)) {
+      let j = i + 1;
+      while (j < n && isWordContinuation(sparql[j])) j++;
+      if (isSparqlKeyword(sparql, i, j, 'FROM')) {
+        return true;
+      }
+      i = j;
+      continue;
+    }
+    i++;
+  }
+
+  return false;
+}
+
+function assertExplicitGraphIrisAllowed(sparql: string, allowedGraphs: string[]): void {
+  const allowed = new Set(allowedGraphs);
+  for (const graphIri of collectExplicitGraphIris(sparql)) {
+    if (!allowed.has(graphIri)) {
+      throw new ScopedQueryViolationError(
+        `GRAPH <${graphIri}> is outside the allowed graph set`,
+      );
+    }
+  }
+}
+
+function collectPrefixDeclarations(sparql: string): Map<string, string> {
+  const prefixes = new Map<string, string>();
+  const n = sparql.length;
+  let i = 0;
+
+  while (i < n) {
+    const ch = sparql[i];
+    if (ch === '#') {
+      while (i < n && sparql[i] !== '\n') i++;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      i = skipSparqlStringLiteral(sparql, i);
+      continue;
+    }
+    if (ch === '<') {
+      const end = skipSparqlIriRef(sparql, i);
+      i = end ?? i + 1;
+      continue;
+    }
+    if (isKeywordStart(sparql, i)) {
+      let j = i + 1;
+      while (j < n && isWordContinuation(sparql[j])) j++;
+      if (isSparqlKeyword(sparql, i, j, 'PREFIX')) {
+        const prefixStart = skipSparqlSpaceAndLineComments(sparql, j);
+        const prefix = readSparqlPrefixName(sparql, prefixStart);
+        if (!prefix || prefix.local.length > 0) {
+          i = j;
+          continue;
+        }
+        const iriStart = skipSparqlSpaceAndLineComments(sparql, prefixStart + prefix.length);
+        const iriEnd = skipSparqlIriRef(sparql, iriStart);
+        if (iriEnd) {
+          prefixes.set(prefix.prefix, sparql.slice(iriStart + 1, iriEnd - 1));
+          i = iriEnd;
+          continue;
+        }
+      }
+      i = j;
+      continue;
+    }
+    i++;
+  }
+
+  return prefixes;
+}
+
+interface SparqlPrefixName {
+  prefix: string;
+  local: string;
+  length: number;
+}
+
+function readSparqlPrefixName(sparql: string, start: number): SparqlPrefixName | null {
+  let colon = start;
+  while (colon < sparql.length && isSparqlPrefixLabelChar(sparql[colon])) colon++;
+  if (sparql[colon] !== ':') return null;
+
+  let end = colon + 1;
+  while (end < sparql.length && isSparqlPrefixedLocalChar(sparql[end])) end++;
+
+  return {
+    prefix: sparql.slice(start, colon),
+    local: sparql.slice(colon + 1, end),
+    length: end - start,
+  };
+}
+
+function isSparqlPrefixLabelChar(ch: string | undefined): ch is string {
+  return !!ch && (
+    (ch >= 'A' && ch <= 'Z') ||
+    (ch >= 'a' && ch <= 'z') ||
+    (ch >= '0' && ch <= '9') ||
+    ch === '_' ||
+    ch === '-'
+  );
+}
+
+function isSparqlPrefixedLocalChar(ch: string | undefined): ch is string {
+  return !!ch && !/\s/.test(ch) && ch !== '{' && ch !== '}' && ch !== '(' && ch !== ')' && ch !== ';' && ch !== ',';
+}
+
+function resolveSparqlPrefixedName(
+  prefixedName: SparqlPrefixName,
+  prefixes: Map<string, string>,
+): string | null {
+  const base = prefixes.get(prefixedName.prefix);
+  if (base === undefined) return null;
+  return `${base}${prefixedName.local}`;
+}
+
+interface GraphTarget {
+  kind: 'variable' | 'iri';
+  iri?: string;
+  end: number;
+}
+
+function readGraphTarget(
+  sparql: string,
+  start: number,
+  prefixes: Map<string, string>,
+): GraphTarget | null {
+  const variable = readSparqlVariable(sparql, start);
+  if (variable) {
+    return { kind: 'variable', end: start + variable.length };
+  }
+
+  if (sparql[start] === '<') {
+    const iriEnd = skipSparqlIriRef(sparql, start);
+    if (!iriEnd) {
+      throw new ScopedQueryViolationError(
+        'GRAPH target must be a variable, explicit IRI, or resolvable prefixed name on scoped queries',
+      );
+    }
+    return {
+      kind: 'iri',
+      iri: sparql.slice(start + 1, iriEnd - 1),
+      end: iriEnd,
+    };
+  }
+
+  const prefixedName = readSparqlPrefixName(sparql, start);
+  if (prefixedName) {
+    const iri = resolveSparqlPrefixedName(prefixedName, prefixes);
+    if (!iri) {
+      throw new ScopedQueryViolationError(
+        `GRAPH prefixed target ${sparql.slice(start, start + prefixedName.length)} cannot be resolved from PREFIX declarations`,
+      );
+    }
+    return {
+      kind: 'iri',
+      iri,
+      end: start + prefixedName.length,
+    };
+  }
+
+  return null;
+}
+
+function constrainGraphVariablesToAllowedSet(sparql: string, allowedGraphs: string[]): string {
+  if (hasNestedSelectWithGraphVariable(sparql)) {
+    throw new ScopedQueryViolationError(
+      'GRAPH variables inside nested SELECT subqueries cannot be constrained safely',
+    );
+  }
+
+  const graphVariables = collectGraphVariables(sparql);
+  if (graphVariables.length === 0) return sparql;
+
+  const braceStart = findWhereBraceStart(sparql);
+  if (braceStart === -1) {
+    throw new ScopedQueryViolationError(
+      'GRAPH variables cannot be constrained because the WHERE block could not be located',
+    );
+  }
+  assertGraphVariablesAreTopLevel(sparql, braceStart);
+  assertNoTopLevelDefaultGraphPatternsWithGraphVariables(sparql, braceStart);
+
+  const values = allowedGraphs
+    .map((g) => `<${assertSafeIri(g)}>`)
+    .join(' ');
+  const constraints = graphVariables
+    .map((variable) => `VALUES ${variable} { ${values} }`)
+    .join(' ');
+
+  return `${sparql.slice(0, braceStart + 1)} ${constraints} ${sparql.slice(braceStart + 1)}`;
+}
+
+function assertNoTopLevelDefaultGraphPatternsWithGraphVariables(sparql: string, braceStart: number): void {
+  if (!hasTopLevelDefaultGraphPattern(sparql, braceStart)) return;
+
+  throw new ScopedQueryViolationError(
+    'GRAPH variables cannot be mixed with default-graph triple patterns on scoped local queries',
+  );
+}
+
+function hasTopLevelDefaultGraphPattern(sparql: string, braceStart: number): boolean {
+  const braceEnd = findMatchingCloseBrace(sparql, braceStart);
+  if (braceEnd === -1) return true;
+
+  const prefixes = collectPrefixDeclarations(sparql);
+  let depth = 0;
+  let i = braceStart + 1;
+
+  while (i < braceEnd) {
+    const ch = sparql[i];
+    if (ch === '#') {
+      while (i < braceEnd && sparql[i] !== '\n') i++;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      i = skipSparqlStringLiteral(sparql, i);
+      continue;
+    }
+    if (ch === '{') {
+      depth++;
+      i++;
+      continue;
+    }
+    if (ch === '}') {
+      depth = Math.max(0, depth - 1);
+      i++;
+      continue;
+    }
+    if (depth !== 0 || /\s/.test(ch) || ch === '.' || ch === ';' || ch === ',') {
+      i++;
+      continue;
+    }
+    if (ch === '<') return !!skipSparqlIriRef(sparql, i);
+    if (ch === '?' || ch === '$' || ch === '[') return true;
+    if (isKeywordStart(sparql, i)) {
+      let j = i + 1;
+      while (j < braceEnd && isWordContinuation(sparql[j])) j++;
+      if (isSparqlKeyword(sparql, i, j, 'GRAPH')) {
+        const operandStart = skipSparqlSpaceAndLineComments(sparql, j);
+        const target = readGraphTarget(sparql, operandStart, prefixes);
+        i = target && target.end <= braceEnd ? target.end : j;
+        continue;
+      }
+      if (isSparqlKeyword(sparql, i, j, 'FILTER') || isSparqlKeyword(sparql, i, j, 'BIND')) {
+        const exprStart = skipSparqlSpaceAndLineComments(sparql, j);
+        if (sparql[exprStart] === '(') {
+          const exprEnd = skipBalancedParentheses(sparql, exprStart, braceEnd);
+          i = exprEnd ?? j;
+          continue;
+        }
+      }
+      if (isSparqlKeyword(sparql, i, j, 'VALUES')) {
+        i = skipValuesClause(sparql, j, braceEnd);
+        continue;
+      }
+      if (
+        isSparqlKeyword(sparql, i, j, 'OPTIONAL') ||
+        isSparqlKeyword(sparql, i, j, 'MINUS') ||
+        isSparqlKeyword(sparql, i, j, 'SERVICE') ||
+        isSparqlKeyword(sparql, i, j, 'UNION') ||
+        isSparqlKeyword(sparql, i, j, 'SELECT')
+      ) {
+        i = j;
+        continue;
+      }
+      return true;
+    }
+    i++;
+  }
+
+  return false;
+}
+
+function assertGraphVariablesAreTopLevel(sparql: string, braceStart: number): void {
+  const braceEnd = findMatchingCloseBrace(sparql, braceStart);
+  if (braceEnd === -1) {
+    throw new ScopedQueryViolationError(
+      'GRAPH variables cannot be constrained because the WHERE block could not be located',
+    );
+  }
+
+  let depth = 0;
+  let i = braceStart + 1;
+
+  while (i < braceEnd) {
+    const ch = sparql[i];
+    if (ch === '#') {
+      while (i < braceEnd && sparql[i] !== '\n') i++;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      i = skipSparqlStringLiteral(sparql, i);
+      continue;
+    }
+    if (ch === '<') {
+      const iriEnd = skipSparqlIriRef(sparql, i);
+      i = iriEnd && iriEnd <= braceEnd ? iriEnd : i + 1;
+      continue;
+    }
+    if (ch === '{') {
+      depth++;
+      i++;
+      continue;
+    }
+    if (ch === '}') {
+      depth = Math.max(0, depth - 1);
+      i++;
+      continue;
+    }
+    if (isKeywordStart(sparql, i)) {
+      let j = i + 1;
+      while (j < braceEnd && isWordContinuation(sparql[j])) j++;
+      if (isSparqlKeyword(sparql, i, j, 'GRAPH')) {
+        const operandStart = skipSparqlSpaceAndLineComments(sparql, j);
+        if (operandStart < braceEnd && readSparqlVariable(sparql, operandStart) && depth !== 0) {
+          throw new ScopedQueryViolationError(
+            'GRAPH variables must appear at the top level of scoped local queries',
+          );
+        }
+      }
+      i = j;
+      continue;
+    }
+    i++;
+  }
+}
+
+function hasNestedSelectWithGraphVariable(sparql: string): boolean {
+  const n = sparql.length;
+  let i = 0;
+  let braceDepth = 0;
+
+  while (i < n) {
+    const ch = sparql[i];
+    if (ch === '#') {
+      while (i < n && sparql[i] !== '\n') i++;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      i = skipSparqlStringLiteral(sparql, i);
+      continue;
+    }
+    if (ch === '<') {
+      const end = skipSparqlIriRef(sparql, i);
+      i = end ?? i + 1;
+      continue;
+    }
+    if (ch === '{') {
+      braceDepth++;
+      i++;
+      continue;
+    }
+    if (ch === '}') {
+      braceDepth = Math.max(0, braceDepth - 1);
+      i++;
+      continue;
+    }
+    if (isKeywordStart(sparql, i)) {
+      let j = i + 1;
+      while (j < n && isWordContinuation(sparql[j])) j++;
+      const word = sparql.slice(i, j);
+      if (isSparqlKeyword(sparql, i, j, 'SELECT') && braceDepth > 0) {
+        const end = findNestedSelectEnd(sparql, j, braceDepth);
+        if (rangeContainsGraphVariable(sparql, j, end === -1 ? n : end)) {
+          return true;
+        }
+        i = end === -1 ? j : end + 1;
+        continue;
+      }
+      i = j;
+      continue;
+    }
+    i++;
+  }
+
+  return false;
+}
+
+function findNestedSelectEnd(sparql: string, start: number, startingDepth: number): number {
+  const n = sparql.length;
+  let depth = startingDepth;
+  let i = start;
+
+  while (i < n) {
+    const ch = sparql[i];
+    if (ch === '#') {
+      while (i < n && sparql[i] !== '\n') i++;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      i = skipSparqlStringLiteral(sparql, i);
+      continue;
+    }
+    if (ch === '<') {
+      const end = skipSparqlIriRef(sparql, i);
+      i = end ?? i + 1;
+      continue;
+    }
+    if (ch === '{') {
+      depth++;
+      i++;
+      continue;
+    }
+    if (ch === '}') {
+      depth--;
+      if (depth < startingDepth) return i;
+      if (depth < 0) return -1;
+      i++;
+      continue;
+    }
+    i++;
+  }
+
+  return -1;
+}
+
+function rangeContainsGraphVariable(sparql: string, start: number, end: number): boolean {
+  const n = Math.min(sparql.length, end);
+  let i = start;
+
+  while (i < n) {
+    const ch = sparql[i];
+    if (ch === '#') {
+      while (i < n && sparql[i] !== '\n') i++;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      i = skipSparqlStringLiteral(sparql, i);
+      continue;
+    }
+    if (ch === '<') {
+      const iriEnd = skipSparqlIriRef(sparql, i);
+      i = iriEnd && iriEnd <= n ? iriEnd : i + 1;
+      continue;
+    }
+    if (isKeywordStart(sparql, i)) {
+      let j = i + 1;
+      while (j < n && isWordContinuation(sparql[j])) j++;
+      const word = sparql.slice(i, j);
+      if (isSparqlKeyword(sparql, i, j, 'GRAPH')) {
+        const operandStart = skipSparqlSpaceAndLineComments(sparql, j);
+        if (operandStart < n && readSparqlVariable(sparql, operandStart)) {
+          return true;
+        }
+      }
+      i = j;
+      continue;
+    }
+    i++;
+  }
+
+  return false;
+}
+
+function collectExplicitGraphIris(sparql: string): string[] {
+  const iris: string[] = [];
+  const prefixes = collectPrefixDeclarations(sparql);
+  const n = sparql.length;
+  let i = 0;
+
+  while (i < n) {
+    const ch = sparql[i];
+    if (ch === '#') {
+      while (i < n && sparql[i] !== '\n') i++;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      i = skipSparqlStringLiteral(sparql, i);
+      continue;
+    }
+    if (ch === '<') {
+      const end = skipSparqlIriRef(sparql, i);
+      i = end ?? i + 1;
+      continue;
+    }
+    if (isKeywordStart(sparql, i)) {
+      let j = i + 1;
+      while (j < n && isWordContinuation(sparql[j])) j++;
+      if (isSparqlKeyword(sparql, i, j, 'GRAPH')) {
+        const operandStart = skipSparqlSpaceAndLineComments(sparql, j);
+        const target = readGraphTarget(sparql, operandStart, prefixes);
+        if (!target) {
+          throw new ScopedQueryViolationError(
+            'GRAPH target must be a variable, explicit IRI, or resolvable prefixed name on scoped queries',
+          );
+        }
+        if (target.kind === 'iri' && target.iri) iris.push(target.iri);
+        i = target.end;
+        continue;
+      }
+      i = j;
+      continue;
+    }
+    i++;
+  }
+
+  return iris;
+}
+
+function hasGraphClause(sparql: string): boolean {
+  const n = sparql.length;
+  let i = 0;
+
+  while (i < n) {
+    const ch = sparql[i];
+    if (ch === '#') {
+      while (i < n && sparql[i] !== '\n') i++;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      i = skipSparqlStringLiteral(sparql, i);
+      continue;
+    }
+    if (ch === '<') {
+      const end = skipSparqlIriRef(sparql, i);
+      i = end ?? i + 1;
+      continue;
+    }
+    if (isKeywordStart(sparql, i)) {
+      let j = i + 1;
+      while (j < n && isWordContinuation(sparql[j])) j++;
+      if (isSparqlKeyword(sparql, i, j, 'GRAPH')) {
+        return true;
+      }
+      i = j;
+      continue;
+    }
+    i++;
+  }
+
+  return false;
+}
+
+function collectGraphVariables(sparql: string): string[] {
+  const variables: string[] = [];
+  const seen = new Set<string>();
+  const n = sparql.length;
+  let i = 0;
+
+  while (i < n) {
+    const ch = sparql[i];
+    if (ch === '#') {
+      while (i < n && sparql[i] !== '\n') i++;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      i = skipSparqlStringLiteral(sparql, i);
+      continue;
+    }
+    if (ch === '<') {
+      const end = skipSparqlIriRef(sparql, i);
+      i = end ?? i + 1;
+      continue;
+    }
+    if (isKeywordStart(sparql, i)) {
+      let j = i + 1;
+      while (j < n && isWordContinuation(sparql[j])) j++;
+      const word = sparql.slice(i, j);
+      if (isSparqlKeyword(sparql, i, j, 'GRAPH')) {
+        const operandStart = skipSparqlSpaceAndLineComments(sparql, j);
+        const variable = readSparqlVariable(sparql, operandStart);
+        if (variable && !seen.has(variable)) {
+          seen.add(variable);
+          variables.push(variable);
+        }
+        i = operandStart + (variable?.length ?? 0);
+        continue;
+      }
+      i = j;
+      continue;
+    }
+    i++;
+  }
+
+  return variables;
+}
+
+function skipSparqlIriRef(sparql: string, start: number): number | null {
+  if (sparql[start] !== '<') return null;
+  const next = sparql[start + 1];
+  if (!isLikelyIriRefStart(next)) return null;
+
+  for (let i = start + 1; i < sparql.length; i++) {
+    const ch = sparql[i];
+    if (ch === '>') return i + 1;
+    if (
+      ch === '<' ||
+      ch === '"' ||
+      ch === '{' ||
+      ch === '}' ||
+      ch === '|' ||
+      ch === '\\' ||
+      ch === '^' ||
+      ch === '`' ||
+      /\s/.test(ch)
+    ) {
+      return null;
+    }
+  }
+
+  return null;
+}
+
+function isLikelyIriRefStart(ch: string | undefined): boolean {
+  return !!ch && (
+    (ch >= 'A' && ch <= 'Z') ||
+    (ch >= 'a' && ch <= 'z') ||
+    ch === '#' ||
+    ch === '_' ||
+    ch === '/' ||
+    ch === '.'
+  );
+}
+
+function readSparqlVariable(sparql: string, start: number): string | null {
+  const sigil = sparql[start];
+  if (sigil !== '?' && sigil !== '$') return null;
+  let end = start + 1;
+  const first = readCodePoint(sparql, end);
+  if (!first || !isSparqlVariableInitialCodePoint(first.codePoint)) return null;
+  end += first.width;
+
+  while (end < sparql.length) {
+    const next = readCodePoint(sparql, end);
+    if (!next || !isSparqlVariableContinuationCodePoint(next.codePoint)) break;
+    end += next.width;
+  }
+
+  return end > start + 1 ? sparql.slice(start, end) : null;
+}
+
+function readCodePoint(src: string, index: number): { codePoint: number; width: number } | null {
+  if (index >= src.length) return null;
+  const codePoint = src.codePointAt(index);
+  if (codePoint === undefined) return null;
+  return { codePoint, width: codePoint > 0xffff ? 2 : 1 };
+}
+
+function isSparqlVariableInitialCodePoint(codePoint: number): boolean {
+  return isSparqlPnCharsUCodePoint(codePoint) || isAsciiDigitCodePoint(codePoint);
+}
+
+function isSparqlVariableContinuationCodePoint(codePoint: number): boolean {
+  return (
+    isSparqlPnCharsUCodePoint(codePoint) ||
+    isAsciiDigitCodePoint(codePoint) ||
+    codePoint === 0x00b7 ||
+    (codePoint >= 0x0300 && codePoint <= 0x036f) ||
+    (codePoint >= 0x203f && codePoint <= 0x2040)
+  );
+}
+
+function isSparqlPnCharsUCodePoint(codePoint: number): boolean {
+  return (
+    codePoint === 0x5f ||
+    isAsciiAlphaCodePoint(codePoint) ||
+    (codePoint >= 0x00c0 && codePoint <= 0x00d6) ||
+    (codePoint >= 0x00d8 && codePoint <= 0x00f6) ||
+    (codePoint >= 0x00f8 && codePoint <= 0x02ff) ||
+    (codePoint >= 0x0370 && codePoint <= 0x037d) ||
+    (codePoint >= 0x037f && codePoint <= 0x1fff) ||
+    (codePoint >= 0x200c && codePoint <= 0x200d) ||
+    (codePoint >= 0x2070 && codePoint <= 0x218f) ||
+    (codePoint >= 0x2c00 && codePoint <= 0x2fef) ||
+    (codePoint >= 0x3001 && codePoint <= 0xd7ff) ||
+    (codePoint >= 0xf900 && codePoint <= 0xfdcf) ||
+    (codePoint >= 0xfdf0 && codePoint <= 0xfffd) ||
+    (codePoint >= 0x10000 && codePoint <= 0xeffff)
+  );
+}
+
+function isAsciiAlphaCodePoint(codePoint: number): boolean {
+  return (
+    (codePoint >= 0x41 && codePoint <= 0x5a) ||
+    (codePoint >= 0x61 && codePoint <= 0x7a)
+  );
+}
+
+function isAsciiDigitCodePoint(codePoint: number): boolean {
+  return codePoint >= 0x30 && codePoint <= 0x39;
+}
+
+function skipSparqlSpaceAndLineComments(sparql: string, start: number): number {
+  let i = start;
+  while (i < sparql.length) {
+    if (/\s/.test(sparql[i])) {
+      i++;
+      continue;
+    }
+    if (sparql[i] === '#') {
+      while (i < sparql.length && sparql[i] !== '\n') i++;
+      continue;
+    }
+    break;
+  }
+  return i;
+}
+
+function skipBalancedParentheses(sparql: string, start: number, limit = sparql.length): number | null {
+  if (sparql[start] !== '(') return null;
+  let depth = 1;
+  let i = start + 1;
+
+  while (i < limit) {
+    const ch = sparql[i];
+    if (ch === '#') {
+      while (i < limit && sparql[i] !== '\n') i++;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      i = skipSparqlStringLiteral(sparql, i);
+      continue;
+    }
+    if (ch === '<') {
+      const iriEnd = skipSparqlIriRef(sparql, i);
+      i = iriEnd && iriEnd <= limit ? iriEnd : i + 1;
+      continue;
+    }
+    if (ch === '(') depth++;
+    else if (ch === ')') {
+      depth--;
+      if (depth === 0) return i + 1;
+    }
+    i++;
+  }
+
+  return null;
+}
+
+function skipValuesClause(sparql: string, start: number, limit: number): number {
+  let i = start;
+  while (i < limit) {
+    const ch = sparql[i];
+    if (ch === '#') {
+      while (i < limit && sparql[i] !== '\n') i++;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      i = skipSparqlStringLiteral(sparql, i);
+      continue;
+    }
+    if (ch === '{') {
+      const end = findMatchingCloseBrace(sparql, i);
+      return end === -1 || end > limit ? i : end + 1;
+    }
+    if (ch === '.') return i + 1;
+    i++;
+  }
+  return i;
+}
+
+function isKeywordStart(src: string, idx: number): boolean {
+  const ch = src[idx];
+  if (!isWordStart(ch)) return false;
+  const prev = idx > 0 ? src[idx - 1] : '';
+  return !prev || (!isWordContinuation(prev) && prev !== '?' && prev !== '$' && prev !== ':' && prev !== '#');
+}
+
+function isSparqlKeyword(src: string, start: number, end: number, keyword: string): boolean {
+  const next = src[end];
+  return src.slice(start, end).toUpperCase() === keyword
+    && next !== ':'
+    && next !== '-'
+    && next !== '.';
+}
+
+function isWordStart(ch: string | undefined): ch is string {
+  return !!ch && (
+    (ch >= 'A' && ch <= 'Z') ||
+    (ch >= 'a' && ch <= 'z') ||
+    ch === '_'
+  );
+}
+
+function isWordContinuation(ch: string | undefined): ch is string {
+  return isWordStart(ch) || isAsciiDigitChar(ch);
+}
+
+function isAsciiDigitChar(ch: string | undefined): ch is string {
+  return !!ch && ch >= '0' && ch <= '9';
 }
 
 /**
@@ -537,6 +1772,7 @@ function findExplicitWhereTokenIdx(sparql: string): number {
   };
 
   let i = 0;
+  let braceDepth = 0;
   while (i < n) {
     const ch = sparql[i];
     if (ch === '#') {
@@ -557,6 +1793,16 @@ function findExplicitWhereTokenIdx(sparql: string): number {
       i++;
       continue;
     }
+    if (ch === '{') {
+      braceDepth++;
+      i++;
+      continue;
+    }
+    if (ch === '}') {
+      braceDepth = Math.max(0, braceDepth - 1);
+      i++;
+      continue;
+    }
     if (isWordStart(ch)) {
       // Word boundary check: previous char (if any) must NOT be a
       // word-continuation byte. The outer lexer already skipped
@@ -573,7 +1819,7 @@ function findExplicitWhereTokenIdx(sparql: string): number {
       let j = i + 1;
       while (j < n && isWordCont(sparql[j])) j++;
       const word = sparql.substring(i, j);
-      if (word.length === 5 && word.toUpperCase() === 'WHERE') {
+      if (braceDepth === 0 && word.length === 5 && word.toUpperCase() === 'WHERE') {
         return i;
       }
       i = j;
@@ -851,7 +2097,7 @@ function findMatchingCloseBrace(sparql: string, openIdx: number): number {
  * If the query already uses GRAPH patterns, returns it unchanged.
  */
 function wrapWithGraph(sparql: string, graphUri: string): string {
-  if (sparql.toLowerCase().includes('graph ')) return sparql;
+  if (hasGraphClause(sparql)) return sparql;
 
   const braceStart = findWhereBraceStart(sparql);
   if (braceStart === -1) return sparql;
@@ -892,9 +2138,15 @@ function wrapWithGraph(sparql: string, graphUri: string): string {
  * neither SELECT * leakage nor variable-name collisions can happen.
  * Single-graph views skip the UNION wrapper entirely and use a plain
  * `GRAPH <uri>` block.
+ *
+ * Returns `null` when the inner WHERE body contains a UNION — the
+ * UNION-of-GRAPHs wrapper would produce a nested UnionNode that
+ * crashes Blazegraph, and a VALUES+GRAPH fallback leaks a helper
+ * variable into the caller's scope.  The caller should fall back to
+ * per-graph execution.
  */
-function wrapWithGraphUnion(sparql: string, graphUris: string[]): string {
-  if (sparql.toLowerCase().includes('graph ')) return sparql;
+function wrapWithGraphUnion(sparql: string, graphUris: string[]): string | null {
+  if (hasGraphClause(sparql)) return sparql;
   if (graphUris.length === 0) return sparql;
 
   const braceStart = findWhereBraceStart(sparql);
@@ -911,6 +2163,16 @@ function wrapWithGraphUnion(sparql: string, graphUris: string[]): string {
 
   if (graphUris.length === 1) {
     return `${before} GRAPH <${graphUris[0]}> { ${inner} } ${after}`;
+  }
+
+  // Blazegraph crashes with "Illegal child type for union: UnionNode"
+  // when a UNION appears inside a GRAPH block that is itself a branch
+  // of an outer UNION. We cannot use VALUES+GRAPH either because the
+  // helper variable leaks into caller scope (SELECT *, name collisions).
+  // Signal the caller to fall back to per-graph execution.
+  const innerHasUnion = /\bUNION\b/i.test(inner);
+  if (innerHasUnion) {
+    return null;
   }
 
   const unionBranches = graphUris
@@ -1422,4 +2684,31 @@ function dedupeQuads(quads: Quad[]): Quad[] {
     out.push(q);
   }
   return out;
+}
+
+/**
+ * True when a SELECT carries a solution-set modifier whose semantics
+ * cannot be reconstructed from per-graph result slices: DISTINCT,
+ * ORDER BY, LIMIT, OFFSET, GROUP BY, HAVING, or an aggregate function
+ * in the projection. Used by the per-graph multi-graph fallback (the
+ * inner-UNION case in `queryMultipleGraphs`) to reject shapes that
+ * would otherwise return duplicate / mis-ordered / over-limit rows.
+ *
+ * Literals, comments, and IRI bodies are blanked first
+ * (`stripLiteralsAndComments`) so a keyword appearing inside a string
+ * literal or IRI (e.g. `"top 10 LIMIT"`) doesn't trigger a false
+ * positive. The aggregate check is intentionally broad — any of the
+ * standard SPARQL aggregate functions invalidates naive concatenation
+ * because the per-graph partial aggregates can't be combined post-hoc.
+ */
+function hasCrossGraphUnsafeModifier(sparql: string): boolean {
+  const s = stripLiteralsAndComments(sparql);
+  if (/\bDISTINCT\b/i.test(s)) return true;
+  if (/\bORDER\s+BY\b/i.test(s)) return true;
+  if (/\bGROUP\s+BY\b/i.test(s)) return true;
+  if (/\bHAVING\b/i.test(s)) return true;
+  if (/\bLIMIT\b/i.test(s)) return true;
+  if (/\bOFFSET\b/i.test(s)) return true;
+  if (/\b(COUNT|SUM|AVG|MIN|MAX|SAMPLE|GROUP_CONCAT)\s*\(/i.test(s)) return true;
+  return false;
 }

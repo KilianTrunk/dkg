@@ -33,7 +33,7 @@ import type {
   LiftAuthorityProof,
   SharedMemoryPublicSnapshotStorageConfig,
 } from '@origintrail-official/dkg-publisher';
-import type { ChainAdapter } from '@origintrail-official/dkg-chain';
+import type { ApprovalPolicy, ChainAdapter } from '@origintrail-official/dkg-chain';
 import type { QueryAccessConfig } from '@origintrail-official/dkg-query';
 import type { SkillHandler } from './messaging.js';
 import type { CclFactResolutionMode } from './ccl-fact-resolution.js';
@@ -88,6 +88,39 @@ export type LocalSwmSenderKeyReceiveState = {
   skippedChainKeys: Map<number, Uint8Array>;
 };
 
+/**
+ * A SWM sender-key package that landed in the "no advertised peerId"
+ * branch of `createAndDistributeSwmSenderKeyEpoch` and is held for
+ * delivery once we learn a peerId for the recipient agent (via
+ * connection:open or a subsequent publish that re-resolves the
+ * recipient set).
+ *
+ * Keyed in-memory by lowercased `recipientAgentAddress`. The triple
+ * `(senderAgentAddress, recipientKeyId, epochId)` dedupes within an
+ * agent's queue; newer epochs supersede older ones for the same
+ * `(senderAgentAddress, recipientAgentAddress)` pair.
+ */
+export type PendingSenderKeyEntry = {
+  /** Lower-cased EIP-55 sender agent address. */
+  senderAgentAddress: string;
+  /** Lower-cased EIP-55 recipient agent address (matches the map key). */
+  recipientAgentAddress: string;
+  recipientKeyId: string;
+  epochId: string;
+  contextGraphId: string;
+  subGraphName?: string;
+  /**
+   * Canonical encoded `SwmSenderKeyPackageMsg` wire bytes — exactly
+   * what gets passed to `messenger.sendReliable(peerId, PROTOCOL_SWM_
+   * SENDER_KEY, ...)` when the recipient becomes reachable.
+   */
+  packageBytes: Uint8Array;
+  /** Stable Messenger id for the current explicit retry chain. Rotated after delivered non-acceptance. */
+  messageId?: string;
+  /** Wall-clock when the row was enqueued; used for diagnostics + future TTL. */
+  createdAtMs: number;
+};
+
 export type RandomSamplingStartResult = 'started' | 'retryable' | 'disabled';
 
 export type ACKSignerResolution = {
@@ -110,6 +143,13 @@ export interface SyncRequestEnvelope {
   requesterAgentAddress?: string;
   requesterSignatureR?: string;
   requesterSignatureVS?: string;
+  /**
+   * Phase C — optional, UNSIGNED delta-sync hint (decimal `uint256` string).
+   * When set, the responder returns only KAs whose KC `dkg:batchId` is
+   * strictly greater than this. Outside `computeSyncDigest` (narrowing-only,
+   * like `phase`/`snapshotRef`), so it's additive and backward-compatible.
+   */
+  sinceBatchId?: string;
 }
 
 // ── Public error classes ────────────────────────────────────────────
@@ -210,6 +250,8 @@ export interface PublishOpts {
   allowedPeers?: string[];
   /** Target sub-graph within the context graph (e.g. "code", "decisions"). */
   subGraphName?: string;
+  /** Optional on-chain publish lifetime override in epochs. */
+  publishEpochs?: number;
 }
 
 export interface PublishAsyncOpts extends PublishOpts {
@@ -473,6 +515,28 @@ export interface ContextGraphSub {
    * wire form for those — they pre-date the contract change).
    */
   onChainHash?: string;
+  /**
+   * Phase B (chain-driven VM reconciliation) — the per-CG
+   * registration-ordinal watermark: the count of KAs registered to this CG
+   * on-chain that the node has promoted to VM *contiguously* (no gaps). The
+   * reconcile sweep resumes from this ordinal and walks up to the on-chain
+   * `getContextGraphKCCount(cgId)`. Persisted (survives restarts); `undefined`
+   * means "never reconciled" and the sweep starts at 0. Advanced only behind
+   * the confirmation-depth gate so a reorg can't strand the watermark ahead
+   * of canonical chain state.
+   */
+  lastReconciledOrdinal?: number;
+  /**
+   * Phase D (Cores fill their own gaps) — set on a Core when it signs a
+   * StorageACK for a *public* CG, marking the CG as one this node hosts. The
+   * chain-driven VM reconciler (sweep + KACG nudge) runs for hosted CGs even
+   * without a member subscription, so a Core that was offline during a publish
+   * learns about the missed KA from chain on restart and pulls it from another
+   * Core. Persisted (survives restart — the whole point). Only ever set for
+   * public CGs: curated/ciphertext host-mode coverage stays on the host-mode
+   * reconciler + chunk-backfill path (Cores can't promote plaintext to VM).
+   */
+  coreHosted?: boolean;
   /** Participant agent addresses (V10 agent identity model). */
   participantAgents?: string[];
   /**
@@ -503,6 +567,10 @@ export interface ContextGraphSubscriptionRecord {
    * on the correct topic without needing a new chain-event read.
    */
   onChainHash?: string;
+  /** Phase B — persisted per-CG registration-ordinal VM watermark (see ContextGraphSub). */
+  lastReconciledOrdinal?: number;
+  /** Phase D — persisted "this Core hosts a public CG" flag (see ContextGraphSub). */
+  coreHosted?: boolean;
   syncScoped: boolean;
 }
 
@@ -577,6 +645,46 @@ export interface SharedMemorySyncResult extends SharedMemorySyncDiagnostics {
 
 // ── DKGAgent configuration ──────────────────────────────────────────
 
+/**
+ * Phase E/F — a single chain-driven VM reconciliation telemetry event. Emitted
+ * by the agent at reconcile decision points; consumed by the structured logger
+ * (Phase E) and the ops metrics recorder (Phase F).
+ */
+export interface ReplicationEvent {
+  /** Epoch millis the event was emitted. */
+  ts: number;
+  /** Local CG id (topic/name), the key used everywhere in the agent. */
+  contextGraphId: string;
+  /** On-chain numeric CG id (stringified), when known. */
+  onChainCgId?: string;
+  /**
+   * Decision point:
+   *  - `sweep`          — one reconcile pass summary for a CG.
+   *  - `fetch`          — active core-first catch-up fetch kicked off (no local SWM).
+   *  - `promote`        — a KC was promoted to VM this pass.
+   *  - `already`        — a KC was already in VM (idempotent).
+   *  - `defer`          — an ordinal couldn't be reconciled yet (retry next sweep).
+   *  - `cursor-advance` — the persisted watermark moved.
+   *  - `core-fill`      — (Phase D) a Core ingested a hosted batch from another Core.
+   */
+  action: 'sweep' | 'fetch' | 'promote' | 'already' | 'defer' | 'cursor-advance' | 'core-fill';
+  ual?: string;
+  ordinal?: number;
+  kaId?: string;
+  /** Watermark before/after, for `cursor-advance`. */
+  fromWatermark?: number;
+  toWatermark?: number;
+  /** Chain-head ordinal at the time of the event. */
+  head?: number;
+  /** Reconciled / pending counts, for `sweep`. */
+  reconciled?: number;
+  pending?: number;
+  /** Free-form detail (error message, peer order summary, …). */
+  detail?: string;
+}
+
+export type ReplicationEventSink = (event: ReplicationEvent) => void;
+
 export interface DKGAgentConfig {
   name: string;
   framework?: string;
@@ -647,6 +755,25 @@ export interface DKGAgentConfig {
    */
   nodeVersion?: string;
   /**
+   * libp2p networking tunables for small / sparse networks. All three
+   * fields are optional and forwarded straight into the matching
+   * `DKGNodeConfig` slots. Omitting any field preserves the upstream
+   * default. See `packages/core/src/types.ts` for per-field semantics
+   * and the operator-facing surface in `packages/cli/src/config.ts`
+   * (`network` block).
+   */
+  peerStoreMaxAddressAgeMs?: number;
+  peerStoreMaxPeerAgeMs?: number;
+  dhtQuerySelfIntervalMs?: number;
+  /**
+   * Cadence at which the daemon re-publishes its own agent profile
+   * (PR feat/chain-agents-cg-phonebook). Forwarded straight from
+   * `DkgConfig.network.agentProfileHeartbeatMs`. Defaults to
+   * `AGENT_PROFILE_HEARTBEAT_MS` (5 min) when omitted; `0` disables
+   * the timer (the one-shot startup publish still fires).
+   */
+  agentProfileHeartbeatMs?: number;
+  /**
    * Path to the V10 Random Sampling prover write-ahead log. Core
    * nodes only; ignored on edge. When omitted, an in-memory WAL is
    * used (loses crash-recovery context on restart). Production
@@ -666,6 +793,13 @@ export interface DKGAgentConfig {
    * is safe but yields more chain reads.
    */
   randomSamplingTickIntervalMs?: number;
+  /**
+   * Interval between V10 StorageACK handler registration retries when the
+   * on-chain identity isn't yet resolved (e.g. a transient boot-time RPC
+   * outage). Defaults to `STORAGE_ACK_REGISTRATION_RETRY_MS` (30s). Lowered in
+   * tests to drive the background re-resolution path deterministically.
+   */
+  storageAckRegistrationRetryMs?: number;
   /** Pre-built chain adapter (for testing). If provided, chainConfig is ignored. */
   chainAdapter?: ChainAdapter;
   /** Private key for the V10 ACK signer. When omitted, falls back to chainConfig.operationalKeys[0]. */
@@ -688,10 +822,20 @@ export interface DKGAgentConfig {
    */
   chainConfig?: {
     rpcUrl: string;
+    rpcUrls?: string[];
     hubAddress: string;
+    /** Optional TRAC token contract override. When omitted, the adapter resolves Hub.Token. */
+    tokenAddress?: string;
     adminPrivateKey?: string;
     operationalKeys: string[];
     chainId?: string;
+    /**
+     * Optional V10 allowance-sizing policy. Threaded straight through to
+     * the `EVMChainAdapter`; see `ApprovalPolicy` in
+     * `@origintrail-official/dkg-chain`. Omit to inherit the default
+     * (`'per-publish'`, bounded-per-publish with on-chain 1n floor).
+     */
+    approvalPolicy?: ApprovalPolicy;
   };
   /** Cross-agent query access configuration. */
   queryAccess?: QueryAccessConfig;
@@ -752,6 +896,16 @@ export interface DKGAgentConfig {
    * Tests: pass `InMemoryMessageIdempotencyStore` +
    * `InMemoryProtocolOutboxStore` from `@origintrail-official/dkg-core`.
    */
+  /**
+   * Phase E/F — optional sink for chain-driven VM reconciliation telemetry.
+   * The agent emits a {@link ReplicationEvent} at each reconcile decision
+   * point (sweep summary, active fetch, promote, cursor advance). Production
+   * wires this to the ops metrics DB (Phase F `replication_events` table) so
+   * the `/ui/observability` Replication tab can aggregate; omit it and the
+   * structured `chain-promote` log line is still emitted (Phase E grep path).
+   * Best-effort: the agent never awaits or throws on the sink.
+   */
+  onReplicationEvent?: ReplicationEventSink;
   messengerStores?: {
     idempotencyStore: MessageIdempotencyStore;
     outboxStore: ProtocolOutboxStore;

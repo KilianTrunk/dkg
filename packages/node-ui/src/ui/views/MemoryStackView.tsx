@@ -17,6 +17,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { useProjectsStore, type ContextGraph } from '../stores/projects.js';
 import { useTabsStore } from '../stores/tabs.js';
 import { useMemoryEntities, type MemoryEntity, type TrustLevel } from '../hooks/useMemoryEntities.js';
+import { useMemoryCounts } from './project/helpers.js';
 import { relativeTime } from '../hooks/useProjectActivity.js';
 import { useHiddenContextGraphIds } from '../hooks/useHiddenContextGraphIds.js';
 
@@ -89,19 +90,29 @@ export function MemoryStackView() {
 function MemoryStackRow({ cg }: { cg: ContextGraph }) {
   const memory = useMemoryEntities(cg.id);
   const { openTab } = useTabsStore();
+  // GH #819 round 3 (Codex sweep 1 🔴 #2) — per-layer buckets use
+  // the OR-rule admission (drop if subject OR resource-object moved
+  // past t.layer; matches the per-layer Triples tab the layer-card
+  // buttons open by clicking). Pre-round-3 this read from canonical
+  // for per-layer cells too — which kept mixed-layer edges via the
+  // BOTH-endpoints rule, so the Memory Stack per-layer cells
+  // exceeded the layer pages they navigate to.
+  //
+  // GH #881 (post-#847) — single fused pass via `useMemoryCounts`
+  // replaces 3× `useLayerTriples` (3 iterations) with one. The
+  // helper returns counts only — this row only ever read `.length`
+  // off the per-layer arrays, so the swap is contract-identical.
+  const memCounts = useMemoryCounts(memory);
 
   // Bucket entities + triple-counts per layer in one pass.
   const byLayer = useMemo(() => {
     const buckets: Record<TrustLevel, { entities: MemoryEntity[]; tripleCount: number }> = {
-      working:  { entities: [], tripleCount: 0 },
-      shared:   { entities: [], tripleCount: 0 },
-      verified: { entities: [], tripleCount: 0 },
+      working:  { entities: [], tripleCount: memCounts.wm },
+      shared:   { entities: [], tripleCount: memCounts.swm },
+      verified: { entities: [], tripleCount: memCounts.vm },
     };
     for (const e of memory.entityList) {
       buckets[e.trustLevel].entities.push(e);
-    }
-    for (const t of memory.allTriples) {
-      buckets[t.layer].tripleCount++;
     }
     // Sort each bucket newest-first using whichever timestamp predicate
     // each entity has; undated items slide to the back.
@@ -115,7 +126,7 @@ function MemoryStackRow({ cg }: { cg: ContextGraph }) {
       });
     }
     return buckets;
-  }, [memory.entityList, memory.allTriples]);
+  }, [memory.entityList, memCounts]);
 
   const openProject = () =>
     openTab({

@@ -41,6 +41,8 @@ export interface LiftRequest {
   readonly allowedPeers?: readonly string[];
   /** V10 selective-disclosure mode; agent must sign over the same flag value. */
   readonly entityProofs?: boolean;
+  /** Optional on-chain publish lifetime override in epochs. */
+  readonly publishEpochs?: number;
   /** RFC-001 §4 attribution; stringified bigint, `'0'` = mode d (no attribution). */
   readonly publisherNodeIdentityIdOverride?: LiftJobBigInt;
   /** Agent-signed seal. Publisher rejects on-chain publish if absent on V10. */
@@ -61,6 +63,7 @@ export const LIFT_REQUEST_IMMUTABLE_FIELDS = [
   'accessPolicy',
   'allowedPeers',
   'entityProofs',
+  'publishEpochs',
   'publisherNodeIdentityIdOverride',
   'seal',
 ] as const;
@@ -152,7 +155,7 @@ export interface LiftJobInclusionMetadata {
 }
 
 export interface LiftJobFinalizationMetadata {
-  readonly mode?: 'published' | 'noop';
+  readonly mode?: 'published' | 'noop' | 'local';
   readonly txHash?: LiftJobHex;
   readonly ual?: string;
   readonly batchId?: LiftJobBigInt;
@@ -279,7 +282,17 @@ export interface LiftJobFinalizedNoop extends LiftJobBase {
   readonly failure?: undefined;
 }
 
-export type LiftJobFinalized = LiftJobFinalizedPublished | LiftJobFinalizedNoop;
+export interface LiftJobFinalizedLocal extends LiftJobBase {
+  readonly status: 'finalized';
+  readonly claim: LiftJobClaimMetadata;
+  readonly validation: LiftJobValidationMetadata;
+  readonly broadcast?: undefined;
+  readonly inclusion?: undefined;
+  readonly finalization: LiftJobFinalizationMetadata & { readonly mode: 'local' };
+  readonly failure?: undefined;
+}
+
+export type LiftJobFinalized = LiftJobFinalizedPublished | LiftJobFinalizedNoop | LiftJobFinalizedLocal;
 
 export interface LiftJobFailed extends LiftJobBase {
   readonly status: 'failed';

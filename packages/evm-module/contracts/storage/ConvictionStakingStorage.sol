@@ -10,6 +10,7 @@ import {IVersioned} from "../interfaces/IVersioned.sol";
 import {HubLib} from "../libraries/HubLib.sol";
 import {StakingLib} from "../libraries/StakingLib.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 /**
  * @title ConvictionStakingStorage
@@ -24,7 +25,7 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
  *     CSS now extends `Guardian`, so its `tokenContract` reference and
  *     `transferStake` outflow function come from the same base every V10
  *     publish/payment contract uses for vault-routed deposits. Vault-target
- *     consumers (`KnowledgeAssetsV10`, `KnowledgeCollection`, `Paymaster`,
+ *     consumers (`KnowledgeAssetsLifecycle`, `DKGKnowledgeAssets`, `Paymaster`,
  *     `PublishingConvictionAccount`, `DKGPublishingConvictionNFT`,
  *     `DKGStakingConvictionNFT`) resolve `hub.getContractAddress("ConvictionStakingStorage")`
  *     for both deposits (TRAC `transferFrom` to CSS) and withdrawals
@@ -70,6 +71,8 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
  *     consumers that need them should settle and read "current" state.
  */
 contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
+    using SafeERC20 for IERC20;
+
     string private constant _NAME = "ConvictionStakingStorage";
     // Version history:
     //   1.1.0 — split-bucket rewards, discrete tier ladder.
@@ -117,11 +120,21 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
     //             `StakingV10` admin surface can be added without further
     //             struct churn).
     //           * Vault deposits across V10 (`KnowledgeAssetsV10`,
-    //             `KnowledgeCollection`, `Paymaster`, etc.) now route TRAC
+    //             `DKGKnowledgeAssets`, `Paymaster`, etc.) now route TRAC
     //             into the CSS address. `StakingStorage` is no longer in
     //             the V10 hot path; only `StakingV10._convertToNFT` reads
     //             it (V8→V10 drain at cutover).
-    string private constant _VERSION = "4.0.0";
+    //   4.1.0 — V8→V10 migration conviction credit.
+    //           * `createPosition` gains a sixth parameter
+    //             `expiryShortenedBy` (seconds). Subtracted from the
+    //             tier-default `expiryTimestamp` after the standard
+    //             computation so callers (presently
+    //             `StakingV10._convertToNFT`) can grant a one-time time
+    //             credit to V8 delegators who held continuous stake for
+    //             the 60 days preceding V10 launch. Validated against
+    //             `_tierDuration(lockTier)` and the current block
+    //             timestamp; tier-0 callers MUST pass 0.
+    string private constant _VERSION = "10.0.2";
 
     // Multiplier scale, matches DKGStakingConvictionNFT._convictionMultiplier
     // (returns 1e18-scaled values so fractional tiers like 1.5x and 3.5x
@@ -252,7 +265,11 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
     // (dropped from the running stake). All entries in `nodeExpiryTimes[id]`
     // at indices >= nodeExpiryHead[id] have timestamps strictly greater
     // than nodeLastSettledAt[id].
+    // Slither: mappings are zero-initialized by the language — see
+    // ContextGraphStorage._participantAgents for the long-form rationale.
+    // slither-disable-next-line uninitialized-state
     mapping(uint72 => uint256) public runningNodeEffectiveStake;
+    // slither-disable-next-line uninitialized-state
     mapping(uint72 => uint40) public nodeLastSettledAt;
 
     // Sorted-ascending queue of pending boost-expiry timestamps per node.
@@ -882,12 +899,19 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
     ///         L4 — guards against pre-genesis bootstrap where
     ///         `chronos.getCurrentEpoch()` returns 0 (the `currentEpoch - 1`
     ///         arithmetic would otherwise panic).
+    /// @param  expiryShortenedBy v4.1.0 — seconds to subtract from the
+    ///         tier-default `expiryTimestamp`. Used by
+    ///         `StakingV10._convertToNFT` to grant the V8→V10 migration
+    ///         conviction credit (60 days for eligible delegators on
+    ///         tiers 6/12, 0 otherwise). Caller MUST pass 0 for tier 0
+    ///         and for fresh `stake()` calls.
     function createPosition(
         uint256 tokenId,
         uint72 identityId,
         uint96 raw,
         uint40 lockTier,
-        uint32 migrationEpoch
+        uint32 migrationEpoch,
+        uint40 expiryShortenedBy
     ) external onlyContracts {
         require(identityId != 0, "Zero node");
         require(positions[tokenId].identityId == 0, "Position exists");
@@ -901,6 +925,33 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
         require(currentEpoch >= 1, "Pre-genesis create");
         uint40 tsNow = uint40(block.timestamp);
         uint40 expiryTimestamp = _computeExpiryTimestamp(lockTier);
+
+        // v4.1.0 — apply the V8→V10 migration credit. The credit is in
+        // seconds; we subtract from the freshly-computed default expiry.
+        // Constraints:
+        //   * The credit is V8→V10 migration-exclusive — fresh `stake()`
+        //     calls (`migrationEpoch == 0`) MUST pass 0. Without this
+        //     guard, any future Hub-registered caller could mint a
+        //     fresh stake at a shortened lock just by remembering / not
+        //     to pass the bonus. Tying the credit to a non-zero
+        //     `migrationEpoch` keeps the bonus a closed eligibility set
+        //     scoped to the V8→V10 drain path.
+        //   * Tier 0 has no boost / no expiry, so any non-zero credit is
+        //     a caller bug (guard catches it explicitly).
+        //   * Credit must be strictly less than the tier duration —
+        //     equal-or-greater would land the new expiry at or before
+        //     `block.timestamp`, defeating the lock.
+        //   * After applying, the resulting expiry must still be in the
+        //     future. Belt-and-suspenders against off-by-one rounding
+        //     in the tier table.
+        if (expiryShortenedBy != 0) {
+            require(migrationEpoch != 0, "Credit requires migrationEpoch");
+            require(lockTier != 0, "Credit requires locked tier");
+            uint256 dur = _tierDuration(lockTier);
+            require(uint256(expiryShortenedBy) < dur, "Credit >= tier duration");
+            expiryTimestamp = uint40(uint256(expiryTimestamp) - uint256(expiryShortenedBy));
+            require(expiryTimestamp > tsNow, "Credit leaves no remaining lock");
+        }
 
         positions[tokenId] = Position({
             raw: raw,
@@ -1402,7 +1453,15 @@ contract ConvictionStakingStorage is INamed, IVersioned, Guardian {
     // ============================================================
 
     function transferStake(address receiver, uint96 stakeAmount) external onlyContracts {
-        tokenContract.transfer(receiver, stakeAmount);
+        // Slither: `safeTransfer` (SafeERC20) reverts on failure rather than
+        // returning false — the "unchecked-transfer" pattern Slither flags
+        // applies to the bare ERC20 `.transfer()` return-value path. This
+        // call site is the SAFE wrapper precisely BECAUSE the V10 design
+        // upgraded V8's bare `.transfer()` (see StakingStorage.transferStake)
+        // to SafeERC20. False positive — kept here as a directive for
+        // future maintainers debugging the report.
+        // slither-disable-next-line unchecked-transfer
+        tokenContract.safeTransfer(receiver, stakeAmount);
         emit StakedTokensTransferred(receiver, stakeAmount);
     }
 

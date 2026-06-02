@@ -1,4 +1,4 @@
-import { contextGraphWorkspaceGraphUri, contextGraphWorkspaceMetaGraphUri } from '@origintrail-official/dkg-core';
+import { contextGraphWorkspaceGraphUri, contextGraphWorkspaceMetaGraphUri, validateSubGraphName } from '@origintrail-official/dkg-core';
 import type { OperationContext } from '@origintrail-official/dkg-core';
 import type { Quad } from '@origintrail-official/dkg-storage';
 import { workspacePublicQuadsDigest, type WorkspacePublicSnapshotStore } from '@origintrail-official/dkg-publisher';
@@ -43,14 +43,14 @@ interface SharedMemorySyncContext {
     totalFetchedMetaQuads: number;
     droppedDataTriples: number;
     emptyResponses: number;
-    entityCreators: Array<[string, string]>;
+    entityCreators: Array<{ dataGraph: string; entity: string; creator: string }>;
   }>;
   ensureContextGraph: (contextGraphId: string) => Promise<void>;
   storeInsert: (quads: Quad[]) => Promise<void>;
   publicSnapshotStore?: WorkspacePublicSnapshotStore;
   deleteCheckpoint: (key: string) => void;
   setCheckpoint: (key: string, offset: number) => void;
-  ensureOwnedMap: (contextGraphId: string) => Map<string, string>;
+  ensureOwnedMap: (ownershipKey: string) => Map<string, string>;
   logInfo: (ctx: OperationContext, message: string) => void;
   logWarn: (ctx: OperationContext, message: string) => void;
   logDebug: (ctx: OperationContext, message: string) => void;
@@ -157,8 +157,13 @@ export async function runSharedMemorySync(context: SharedMemorySyncContext): Pro
       if (wsDataResult.completed) deleteCheckpoint(wsDataResult.checkpointKey);
       else setCheckpoint(wsDataResult.checkpointKey, wsDataResult.nextOffset);
 
-      const ownedMap = ensureOwnedMap(pid);
-      for (const [entity, creator] of processed.entityCreators) {
+      for (const { dataGraph, entity, creator } of processed.entityCreators) {
+        const ownershipKey = sharedMemoryOwnershipKeyFromGraph(pid, dataGraph);
+        if (!ownershipKey) {
+          logWarn(ctx, `SWM sync skipped ownership cache hydration for "${entity}" from unexpected graph "${dataGraph}"`);
+          continue;
+        }
+        const ownedMap = ensureOwnedMap(ownershipKey);
         if (!ownedMap.has(entity)) {
           ownedMap.set(entity, creator);
         }
@@ -185,6 +190,21 @@ export async function runSharedMemorySync(context: SharedMemorySyncContext): Pro
   }
 
   return summary;
+}
+
+function sharedMemoryOwnershipKeyFromGraph(contextGraphId: string, dataGraph: string): string | undefined {
+  const rootGraph = contextGraphWorkspaceGraphUri(contextGraphId);
+  if (dataGraph === rootGraph) return contextGraphId;
+
+  const prefix = `did:dkg:context-graph:${contextGraphId}/`;
+  const suffix = '/_shared_memory';
+  if (!dataGraph.startsWith(prefix) || !dataGraph.endsWith(suffix)) return undefined;
+
+  const subGraphName = dataGraph.slice(prefix.length, -suffix.length);
+  if (!subGraphName || subGraphName.includes('/')) return undefined;
+  if (!validateSubGraphName(subGraphName).valid) return undefined;
+
+  return `${contextGraphId}\0${subGraphName}`;
 }
 
 interface PublicSnapshotMetadata {

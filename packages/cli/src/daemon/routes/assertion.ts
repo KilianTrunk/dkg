@@ -58,8 +58,9 @@ const execFileAsync = promisify(execFile);
 import { enrichEvmError, MockChainAdapter } from '@origintrail-official/dkg-chain';
 import { DKGAgent, loadOpWallets } from '@origintrail-official/dkg-agent';
 import { computeNetworkId, createOperationContext, DKGEvent, Logger, PayloadTooLargeError, GET_VIEWS, TrustLevel, validateSubGraphName, validateAssertionName, validateContextGraphId, isSafeIri, assertSafeIri, assertSafeRdfTerm, escapeDkgRdfLiteral, sparqlIri, contextGraphSharedMemoryUri, contextGraphAssertionUri, contextGraphMetaUri, assertionLifecycleUri } from '@origintrail-official/dkg-core';
-import { findReservedSubjectPrefix, isSkolemizedUri, type PublishOptions } from '@origintrail-official/dkg-publisher';
+import { findReservedSubjectPrefix, isSkolemizedUri, PROMOTE_JOB_STATES, PromoteJobConflictError, type PromoteJob, type PromoteJobState, type PublishOptions } from '@origintrail-official/dkg-publisher';
 import { validatePreSignedAuthorAttestation } from './memory.js';
+import { recordAssertionActivity } from '../activity-notification.js';
 import {
   DashboardDB,
   MetricsCollector,
@@ -195,6 +196,8 @@ import {
   safeParseJson,
   validateOptionalSubGraphName,
   validateRequiredContextGraphId,
+  normalizeContextGraphIdOrUri,
+  resolveRequiredWriteContextGraphId,
   validateEntities,
   validateConditions,
   MAX_BODY_BYTES,
@@ -236,15 +239,10 @@ import {
   getCurrentCliVersion,
   type NpmVersionStatus,
   checkForNpmVersionUpdate,
-  checkForNewCommit,
-  checkForNewCommitWithStatus,
   type UpdateStatus,
   acquireUpdateLock,
   releaseUpdateLock,
-  performUpdate,
-  performUpdateWithStatus,
   performNpmUpdate,
-  checkForUpdate,
 } from '../auto-update.js';
 import {
   OPENCLAW_UI_CONNECT_TIMEOUT_MS,
@@ -357,6 +355,17 @@ type ImportedArtifactResolution = {
   markdownForm?: string;
   markdownHash?: string;
   canReadMarkdown: boolean;
+  /**
+   * Issue #872 — set to `true` when the request would have been
+   * blocked by the legacy owner guard but the CG's on-chain policy
+   * (`accessPolicy === 0` AND `publishPolicy === 1`) made the guard
+   * inapplicable. The read-markdown route uses this to distinguish
+   * "owner request, missing bytes" (genuine corruption) from
+   * "cross-agent request, bytes not replicated locally" (expected
+   * until the source-artifact gossip follow-up lands). Omitted when
+   * the requester IS the assertion owner.
+   */
+  ownerGuardRelaxed?: boolean;
 };
 
 class ImportArtifactRouteError extends Error {
@@ -405,6 +414,139 @@ function hashFromFileUrn(value: string | undefined): string | undefined {
 
 function validateContentHash(hash: string): boolean {
   return /^(?:sha256:|keccak256:)?[0-9a-f]{64}$/i.test(hash);
+}
+
+function validatePromoteJobId(jobId: string): { valid: true } | { valid: false; reason: string } {
+  if (!jobId) return { valid: false, reason: "jobId is required" };
+  if (jobId.length > 256) return { valid: false, reason: "jobId is too long" };
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(jobId)) {
+    return {
+      valid: false,
+      reason: "jobId may only contain letters, numbers, '.', '_', ':', and '-'",
+    };
+  }
+  return { valid: true };
+}
+
+function decodePromoteJobId(encoded: string, res: ServerResponse): string | null {
+  const jobId = safeDecodeURIComponent(encoded, res);
+  if (jobId === null) return null;
+  const validation = validatePromoteJobId(jobId);
+  if (!validation.valid) {
+    jsonResponse(res, 400, { error: `Invalid promote jobId: ${validation.reason}` });
+    return null;
+  }
+  return jobId;
+}
+
+// ── Async-promote wire schema (RFC §3.2 + §3.3) ──────────────────────────────
+//
+// The internal `PromoteJob` shape persisted by the queue carries
+// implementation details the HTTP contract is not allowed to leak:
+//   - `lease.claimToken` (opaque worker-side capability),
+//   - `lease.workerId` / heartbeat metadata,
+//   - numeric epoch timestamps,
+//   - `commitMarker` (internal idempotency bookkeeping).
+//
+// `PromoteJobView` is the documented public shape per RFC §3.2; ISO-8601
+// timestamps, a flat top level for assertion identity, and a stable
+// `lastError.code` enum mapped from the queue's failure classification.
+// The list (§3.3) and status (§3.2) endpoints share `promoteJobToView()`
+// so both surfaces stay in lockstep.
+
+export interface PromoteJobErrorView {
+  code: string;
+  message: string;
+  retryable: boolean;
+}
+
+export interface PromoteJobView {
+  jobId: string;
+  state: PromoteJobState;
+  contextGraphId: string;
+  assertionName: string;
+  subGraphName?: string;
+  entities: readonly string[] | 'all';
+  enqueuedAt: string;
+  updatedAt: string;
+  startedAt?: string;
+  finishedAt?: string;
+  entitiesPromoted?: number;
+  attempts: number;
+  maxAttempts: number;
+  nextRetryAt?: string;
+  lastError?: PromoteJobErrorView;
+  reason?: string;
+}
+
+function isoFromEpochMs(ms: number | undefined): string | undefined {
+  if (ms === undefined || ms === null) return undefined;
+  if (!Number.isFinite(ms)) return undefined;
+  return new Date(ms).toISOString();
+}
+
+export function promoteJobToView(job: PromoteJob): PromoteJobView {
+  // `startedAt` reflects the current attempt's lease acquisition; while
+  // running the lease is present, after success/failure the queue clears
+  // it so the field naturally goes away. `finishedAt` is sourced from
+  // the terminal-state evidence the queue already records:
+  // `result.succeededAt` for success and `attempt.lastError.recordedAt`
+  // for failed / failed_retrying. Cancelled jobs (no lastError, no
+  // result) fall back to `updatedAt` because that's the only durable
+  // timestamp for that transition.
+  const startedAt = isoFromEpochMs(job.lease?.acquiredAt);
+  let finishedAt: string | undefined;
+  if (job.state === 'succeeded') {
+    finishedAt = isoFromEpochMs(job.result?.succeededAt) ?? isoFromEpochMs(job.updatedAt);
+  } else if (job.state === 'failed' || job.state === 'failed_retrying') {
+    finishedAt =
+      isoFromEpochMs(job.attempt.lastError?.recordedAt) ?? isoFromEpochMs(job.updatedAt);
+  }
+
+  const lastError: PromoteJobErrorView | undefined = job.attempt.lastError
+    ? {
+        code: job.attempt.lastError.classification,
+        message: job.attempt.lastError.message,
+        retryable: job.attempt.lastError.retryable,
+      }
+    : undefined;
+
+  const view: PromoteJobView = {
+    jobId: job.jobId,
+    state: job.state,
+    contextGraphId: job.request.contextGraphId,
+    assertionName: job.request.assertionName,
+    entities: job.request.entities,
+    enqueuedAt: new Date(job.enqueuedAt).toISOString(),
+    updatedAt: new Date(job.updatedAt).toISOString(),
+    attempts: job.attempt.count,
+    maxAttempts: job.attempt.maxRetries,
+  };
+  if (job.request.subGraphName !== undefined) view.subGraphName = job.request.subGraphName;
+  if (startedAt !== undefined) view.startedAt = startedAt;
+  if (finishedAt !== undefined) view.finishedAt = finishedAt;
+  if (job.result?.promotedCount !== undefined) view.entitiesPromoted = job.result.promotedCount;
+  const nextRetryAt = isoFromEpochMs(job.attempt.nextRetryAt);
+  if (nextRetryAt !== undefined) view.nextRetryAt = nextRetryAt;
+  if (lastError !== undefined) view.lastError = lastError;
+  if (job.reason !== undefined) view.reason = job.reason;
+  return view;
+}
+
+// Helper used by the five `/promote-async` routes below to refuse work
+// when no worker is actually draining the queue (RFC §3.1 — the
+// implementation plan parks the supervisor in a follow-up PR; until then
+// `daemonState.promoteWorkerAvailable` stays `false` and we return 503
+// rather than silently accept jobs that would sit in `queued` forever).
+function asyncPromoteUnavailable(res: ServerResponse): boolean {
+  if (daemonState.promoteWorkerAvailable) return false;
+  const reason = daemonState.promoteWorkerUnavailableReason;
+  jsonResponse(res, 503, {
+    error:
+      `async-promote worker is not available` +
+      (reason ? `: ${reason}` : ''),
+  });
+  return true;
 }
 
 function parseImportedAssertionUri(
@@ -649,6 +791,38 @@ function assertImportedArtifactOwnerAddress(
   }
 }
 
+/**
+ * Issue #872 — public + open context graphs ship their SWM triples to
+ * every subscribed peer, so the owner-scoped artifact-read guard is
+ * the wrong policy for them: peers that legitimately replicated the
+ * triples can't even resolve metadata about the source markdown
+ * artifact, let alone fetch its bytes. This helper consults the
+ * agent's local on-chain policy cache (populated eagerly by the
+ * chain-event poller) to decide whether the guard should be relaxed.
+ *
+ * Returns `true` only when both policies are confirmed
+ * (`accessPolicy === 0` AND `publishPolicy === 1`). Any other state
+ * — including missing cache entries — yields `false`, which keeps
+ * the existing owner guard in effect (fail-closed).
+ *
+ * DEFERRED FOLLOW-UP: peers replicate SWM triples but NOT the source
+ * artifact bytes; with the guard relaxed, the read-markdown route
+ * will return 404 on every cross-agent read until byte-replication is
+ * added. Tracked in the PR body for #872.
+ */
+async function isPublicOpenContextGraph(
+  agent: { getContextGraphOnChainPolicy?: (id: string) => Promise<{ accessPolicy?: number; publishPolicy?: number }> },
+  contextGraphId: string,
+): Promise<boolean> {
+  if (typeof agent.getContextGraphOnChainPolicy !== 'function') return false;
+  try {
+    const policy = await agent.getContextGraphOnChainPolicy(contextGraphId);
+    return policy.accessPolicy === 0 && policy.publishPolicy === 1;
+  } catch {
+    return false;
+  }
+}
+
 function handleImportArtifactRouteError(res: ServerResponse, err: unknown): boolean {
   if (err instanceof ImportArtifactRouteError) {
     jsonResponse(res, err.statusCode, { error: err.message });
@@ -674,9 +848,21 @@ async function resolveImportedArtifact(
   ownerGuard?: {
     requestAgentAddress: string;
     message: string;
+    /**
+     * Issue #872 / Codex review finding 1: opt-in for the public + open
+     * CG owner-guard relaxation. Only the two READ routes
+     * (`/import-artifact/resolve`, `/import-artifact/read-markdown`)
+     * set this to `true`. The semantic-enrichment WRITE route
+     * intentionally leaves it `false` (default) so the strict owner
+     * guard remains in effect regardless of the CG's on-chain policy
+     * — a non-owner peer on a public + open CG must not be allowed
+     * to mutate someone else's imported assertion.
+     */
+    relaxOnPublicOpenCg?: boolean;
   },
 ): Promise<ImportedArtifactResolution> {
-  const contextGraphId = typeof raw.contextGraphId === 'string' ? raw.contextGraphId.trim() : '';
+  const rawContextGraphId = typeof raw.contextGraphId === 'string' ? raw.contextGraphId.trim() : '';
+  const contextGraphId = rawContextGraphId ? normalizeContextGraphIdOrUri(rawContextGraphId) : '';
   if (!contextGraphId) {
     throw new ImportArtifactRouteError(400, '"contextGraphId" is required');
   }
@@ -715,6 +901,20 @@ async function resolveImportedArtifact(
   }
 
   const inputAssertionUri = rawAssertionUri;
+  // Issue #872 Codex finding 1: only the READ routes opt into the
+  // public + open relaxation. The write callers (e.g.
+  // `/semantic-enrichment/write`) leave `relaxOnPublicOpenCg`
+  // unset/false so the strict owner guard stays in effect — a
+  // non-owner peer on a public + open CG must NOT be able to mutate
+  // someone else's imported assertion just because cross-agent READS
+  // are allowed.
+  const canRelaxGuard = Boolean(ownerGuard?.relaxOnPublicOpenCg);
+  // Probing the on-chain policy is a no-op for the write path (which
+  // never relaxes). Skip it there to keep the diff scoped and avoid
+  // adding chain-cache reads to a code path that doesn't need them.
+  const isPublicOpen = canRelaxGuard
+    ? await isPublicOpenContextGraph(ctx.agent, contextGraphId)
+    : false;
   const parsedAssertion = parseImportedAssertionUri(
     inputAssertionUri,
     contextGraphId,
@@ -737,12 +937,40 @@ async function resolveImportedArtifact(
     throw new ImportArtifactRouteError(400, 'assertionUri is not in canonical assertion URI form');
   }
   const assertionUri = reconstructedAssertionUri;
+  let ownerGuardRelaxed = false;
   if (ownerGuard) {
-    assertImportedArtifactOwnerAddress(
-      parsedAssertion.assertionAgentAddress,
-      ownerGuard.requestAgentAddress,
-      ownerGuard.message,
-    );
+    // Issue #872 — drop the owner guard for public + open CGs. Their
+    // SWM triples are gossipped to every subscribed peer, so blocking
+    // cross-agent reads of the imported source artifact contradicts
+    // the very access policy the curator chose on-chain. For every
+    // other policy combo (curated, curators-only publish, or any
+    // write path), the guard stays in force regardless of the
+    // on-chain policy.
+    //
+    // Codex review (round 2, finding A): the relaxation is skipped
+    // for legacy ownerless URIs (`parsedAssertion.legacy === true`).
+    // `parseImportedAssertionUri` already canonicalizes those by
+    // defaulting the missing owner segment to `requestAgentAddress`
+    // — which is the right answer ONLY for owner self-reads. For
+    // cross-agent reads the canonical URI silently points at the
+    // wrong owner, so the meta SPARQL below misses and returns 404.
+    // Letting the strict guard run for legacy URIs preserves the
+    // owner-self-read back-compat path (the legacy default makes
+    // `assertionAgentAddress === requestAgentAddress` so the guard
+    // passes) while non-owner cross-agent reads get the same 404
+    // they got pre-PR rather than a misleading 200.
+    if (canRelaxGuard && isPublicOpen && !parsedAssertion.legacy) {
+      ownerGuardRelaxed = !isSameAgentAddress(
+        parsedAssertion.assertionAgentAddress,
+        ownerGuard.requestAgentAddress,
+      );
+    } else {
+      assertImportedArtifactOwnerAddress(
+        parsedAssertion.assertionAgentAddress,
+        ownerGuard.requestAgentAddress,
+        ownerGuard.message,
+      );
+    }
   }
   if (assertionName && assertionName !== parsedAssertion.assertionName) {
     throw new ImportArtifactRouteError(400, '"assertionName" does not match assertionUri');
@@ -840,6 +1068,24 @@ async function resolveImportedArtifact(
   const markdownHash = authoritativeMarkdownHash;
   const markdownForm = markdownHash ? `urn:dkg:file:${markdownHash}` : undefined;
 
+  // Codex review on #872 — when the owner guard is relaxed for a
+  // public + open CG, replicated `_meta` may have a `markdownHash`
+  // even though the bytes were never replicated to this node's
+  // file-store (only the SWM/_meta triples gossip across peers; the
+  // raw file bytes don't auto-replicate). The previous
+  // `Boolean(markdownHash)` would have returned `canReadMarkdown:
+  // true` and then `/import-artifact/read-markdown` would
+  // deterministically 404. Derive presence from the local file-store
+  // when the relaxation is in effect so the flag is honest. Owner
+  // self-reads (no relaxation) keep the existing fast-path —
+  // `_meta` and bytes land together at import time on the importing
+  // node, so a `markdownHash` there really does mean readable.
+  const markdownAvailableLocally = markdownHash
+    ? ownerGuardRelaxed
+      ? await ctx.fileStore.has(markdownHash).catch(() => false)
+      : true
+    : false;
+
   return {
     contextGraphId,
     assertionUri,
@@ -860,7 +1106,8 @@ async function resolveImportedArtifact(
     ...(mdIntermediateHash ? { mdIntermediateHash } : {}),
     ...(markdownForm ? { markdownForm } : {}),
     ...(markdownHash ? { markdownHash } : {}),
-    canReadMarkdown: Boolean(markdownHash),
+    canReadMarkdown: markdownAvailableLocally,
+    ...(ownerGuardRelaxed ? { ownerGuardRelaxed: true } : {}),
   };
 }
 
@@ -895,7 +1142,15 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
     requestToken,
     requestAgentAddress,
     emitMemoryGraphChanged,
+    emitNotification,
   } = ctx;
+  const writePreflightCallerAgentAddress = requestToken
+    ? agent.resolveAgentByToken(requestToken)
+    : undefined;
+  const writePreflightContextGraphOpts = {
+    callerAgentAddress: writePreflightCallerAgentAddress,
+    allowLocalExactFallback: !writePreflightCallerAgentAddress,
+  };
 
   // POST /api/assertion/import-artifact/resolve
   // Resolve a completed deterministic import artifact from graph metadata.
@@ -907,6 +1162,9 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
       const artifact = await resolveImportedArtifact(ctx, parsed as Record<string, unknown>, {
         requestAgentAddress,
         message: 'Import artifact metadata can only be read from imported assertions owned by the requesting agent',
+        // Issue #872 — this is a read; opt into the public + open
+        // policy relaxation. The write route below does NOT set this.
+        relaxOnPublicOpenCg: true,
       });
       return jsonResponse(res, 200, { artifact });
     } catch (err) {
@@ -925,6 +1183,8 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
       const artifact = await resolveImportedArtifact(ctx, parsed as Record<string, unknown>, {
         requestAgentAddress,
         message: 'Import artifact Markdown can only be read from imported assertions owned by the requesting agent',
+        // Issue #872 — read path; opt into the public + open relaxation.
+        relaxOnPublicOpenCg: true,
       });
       const maxBytes = normalizeMarkdownReadLimit((parsed as Record<string, unknown>).maxBytes);
       if (!artifact.markdownHash) {
@@ -935,8 +1195,23 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
       }
       const bytes = await fileStore.get(artifact.markdownHash);
       if (!bytes) {
+        // Issue #872 — when the owner guard was relaxed (public + open
+        // CG, cross-agent request), the missing bytes are the
+        // expected outcome: peers replicate the SWM triples for the
+        // assertion but the source-artifact bytes are NOT gossipped
+        // yet. Surface that explicitly so callers can decide whether
+        // to retry against the origin agent instead of treating this
+        // as local corruption.
+        //
+        // DEFERRED FOLLOW-UP: gossip the imported-artifact bytes to
+        // peers replicating a public + open CG, so cross-agent reads
+        // can complete locally without an out-of-band fetch. Tracked
+        // in the PR body for #872.
+        const message = artifact.ownerGuardRelaxed
+          ? 'Markdown source bytes are not replicated locally on this peer; the assertion graph triples synced but the source artifact bytes were not. Fetch from the origin agent (assertionAgentAddress).'
+          : 'Markdown content is not present in the file store';
         return jsonResponse(res, 404, {
-          error: 'Markdown content is not present in the file store',
+          error: message,
           artifact,
         });
       }
@@ -967,7 +1242,7 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
     const parsed = safeParseJson(body, res);
     if (!parsed) return;
     try {
-      const record = parsed as Record<string, unknown>;
+      const record = { ...(parsed as Record<string, unknown>) };
       if (
         record.name !== undefined ||
         record.semanticAssertionName !== undefined ||
@@ -978,6 +1253,14 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
           'Semantic enrichment is written into the source import assertion; target assertion names are not supported',
         );
       }
+      const resolvedContextGraphId = await resolveRequiredWriteContextGraphId(
+        agent,
+        record.contextGraphId,
+        res,
+        writePreflightContextGraphOpts,
+      );
+      if (!resolvedContextGraphId) return;
+      record.contextGraphId = resolvedContextGraphId;
       const artifact = await resolveImportedArtifact(ctx, record, {
         requestAgentAddress,
         message: 'Semantic enrichment can only modify imported assertions owned by the requesting agent',
@@ -1079,7 +1362,13 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
       schemeVersion,
     } = parsed;
     if (!name) return jsonResponse(res, 400, { error: 'Missing "name"' });
-    if (!validateRequiredContextGraphId(contextGraphId, res)) return;
+    const resolvedContextGraphId = await resolveRequiredWriteContextGraphId(
+      agent,
+      contextGraphId,
+      res,
+      writePreflightContextGraphOpts,
+    );
+    if (!resolvedContextGraphId) return;
     if (typeof name !== "string")
       return jsonResponse(res, 400, { error: '"name" must be a string' });
     const nameVal = validateAssertionName(name);
@@ -1157,28 +1446,43 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
     }
     try {
       const assertionUri = await agent.assertion.create(
-        contextGraphId,
+        resolvedContextGraphId,
         name,
         subGraphName ? { subGraphName } : undefined,
       );
       emitMemoryGraphChanged?.({
-        contextGraphId,
+        contextGraphId: resolvedContextGraphId,
         layers: ["wm"],
         subGraphName,
         operation: "assertion_created",
         source: "api",
         counts: { triples: 0 },
       });
+      // ADR-002: scoped `created` activity row. Mirrors the moment the
+      // publisher writes `dkg:AssertionCreated` into `_meta` (inside
+      // `assertionCreate`), so the bell pane and the per-CG Overview feed
+      // agree on what "created" means. Actor = the request/author agent;
+      // the row is born CG-scoped (the caller is a writer on this CG).
+      // Never throws into the write path (helper + try/catch).
+      try {
+        recordAssertionActivity(dashDb, {
+          contextGraphId: resolvedContextGraphId,
+          kind: "created",
+          actorAgentAddress: resolvedAuthorAgentAddress ?? requestAgentAddress,
+          subGraphName,
+        });
+        emitNotification?.({ contextGraphId: resolvedContextGraphId, type: "assertion_activity" });
+      } catch { /* never break the create path */ }
       const response: Record<string, unknown> = { assertionUri };
       if (Array.isArray(quads) && quads.length > 0) {
         await agent.assertion.write(
-          contextGraphId,
+          resolvedContextGraphId,
           name,
           quads,
           subGraphName ? { subGraphName } : undefined,
         );
         emitMemoryGraphChanged?.({
-          contextGraphId,
+          contextGraphId: resolvedContextGraphId,
           layers: ["wm"],
           subGraphName,
           operation: "assertion_written",
@@ -1188,7 +1492,7 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
         response.written = quads.length;
       }
       if (shouldFinalize === true) {
-        const seal = await agent.assertion.finalize(contextGraphId, name, {
+        const seal = await agent.assertion.finalize(resolvedContextGraphId, name, {
           ...(subGraphName ? { subGraphName } : {}),
           ...(resolvedAuthorAgentAddress
             ? { authorAgentAddress: resolvedAuthorAgentAddress }
@@ -1199,7 +1503,7 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
           ...(schemeVersion != null ? { schemeVersion } : {}),
         });
         emitMemoryGraphChanged?.({
-          contextGraphId,
+          contextGraphId: resolvedContextGraphId,
           layers: ["wm"],
           subGraphName,
           operation: "assertion_finalized",
@@ -1216,19 +1520,31 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
       }
       if (shouldPromote === true) {
         const promoteResult = await agent.assertion.promote(
-          contextGraphId,
+          resolvedContextGraphId,
           name,
           subGraphName ? { subGraphName } : undefined,
         );
         if (promoteResult.promotedCount !== 0) {
           emitMemoryGraphChanged?.({
-            contextGraphId,
+            contextGraphId: resolvedContextGraphId,
             layers: ["wm", "swm"],
             subGraphName,
             operation: "assertion_promoted",
             source: "api",
             counts: { triples: promoteResult.promotedCount },
           });
+          // ADR-002: scoped `promoted` activity row (WM→SWM). Only when
+          // something actually promoted (promotedCount !== 0).
+          try {
+            recordAssertionActivity(dashDb, {
+              contextGraphId: resolvedContextGraphId,
+              kind: "promoted",
+              actorAgentAddress: resolvedAuthorAgentAddress ?? requestAgentAddress,
+              subGraphName,
+              tripleCount: promoteResult.promotedCount,
+            });
+            emitNotification?.({ contextGraphId: resolvedContextGraphId, type: "assertion_activity" });
+          } catch { /* never break the promote path */ }
         }
         response.promotedCount = promoteResult.promotedCount;
       }
@@ -1277,17 +1593,23 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
     const { contextGraphId, quads, subGraphName } = parsed;
     if (!quads?.length)
       return jsonResponse(res, 400, { error: 'Missing "quads"' });
-    if (!validateRequiredContextGraphId(contextGraphId, res)) return;
+    const resolvedContextGraphId = await resolveRequiredWriteContextGraphId(
+      agent,
+      contextGraphId,
+      res,
+      writePreflightContextGraphOpts,
+    );
+    if (!resolvedContextGraphId) return;
     if (!validateOptionalSubGraphName(subGraphName, res)) return;
     try {
       await agent.assertion.write(
-        contextGraphId,
+        resolvedContextGraphId,
         assertionName,
         quads,
         subGraphName ? { subGraphName } : undefined,
       );
       emitMemoryGraphChanged?.({
-        contextGraphId,
+        contextGraphId: resolvedContextGraphId,
         layers: ["wm"],
         subGraphName,
         operation: "assertion_written",
@@ -1331,10 +1653,11 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
     if (!parsed) return;
     const { contextGraphId, subGraphName } = parsed;
     if (!validateRequiredContextGraphId(contextGraphId, res)) return;
+    const normalizedContextGraphId = normalizeContextGraphIdOrUri(contextGraphId);
     if (!validateOptionalSubGraphName(subGraphName, res)) return;
     try {
       const quads = await agent.assertion.query(
-        contextGraphId,
+        normalizedContextGraphId,
         assertionName,
         subGraphName ? { subGraphName } : undefined,
       );
@@ -1372,34 +1695,244 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
     const parsed = safeParseJson(body, res);
     if (!parsed) return;
     const { contextGraphId, entities, subGraphName } = parsed;
-    if (!validateRequiredContextGraphId(contextGraphId, res)) return;
+    const resolvedContextGraphId = await resolveRequiredWriteContextGraphId(
+      agent,
+      contextGraphId,
+      res,
+      writePreflightContextGraphOpts,
+    );
+    if (!resolvedContextGraphId) return;
     if (!validateEntities(entities, res)) return;
     if (!validateOptionalSubGraphName(subGraphName, res)) return;
     try {
       const result = await agent.assertion.promote(
-        contextGraphId,
+        resolvedContextGraphId,
         assertionName,
         { entities: entities ?? "all", subGraphName },
       );
       const promotedCount = typeof result?.promotedCount === "number" ? result.promotedCount : undefined;
       if (promotedCount !== 0) {
         emitMemoryGraphChanged?.({
-          contextGraphId,
+          contextGraphId: resolvedContextGraphId,
           layers: ["wm", "swm"],
           subGraphName,
           operation: "assertion_promoted",
           source: "api",
           counts: { triples: promotedCount },
         });
+        // ADR-002: scoped `promoted` activity row (dedicated promote route).
+        try {
+          recordAssertionActivity(dashDb, {
+            contextGraphId: resolvedContextGraphId,
+            kind: "promoted",
+            actorAgentAddress: requestAgentAddress,
+            subGraphName,
+            tripleCount: promotedCount,
+          });
+          emitNotification?.({ contextGraphId: resolvedContextGraphId, type: "assertion_activity" });
+        } catch { /* never break the promote path */ }
       }
       return jsonResponse(res, 200, result);
     } catch (err: any) {
+      // Issue #864 — translate the publisher's typed "_meta says completed
+      // but data graph is empty" error into a 409 with a structured body
+      // the UI can pattern-match on. Keep it ahead of the generic 400
+      // branch so the more specific code wins. Duck-type the check by
+      // name + code so we don't have to import the publisher's error
+      // class into the cli package's compile graph.
+      if (err?.name === "AssertionNotPersistedError" || err?.code === "ASSERTION_NOT_PERSISTED") {
+        return jsonResponse(res, 409, {
+          error: err.message,
+          code: "ASSERTION_NOT_PERSISTED",
+          contextGraphId: err.contextGraphId,
+          assertionGraph: err.assertionGraph,
+          expectedTripleCount: err.expectedTripleCount,
+        });
+      }
       if (
         err.message?.includes("not found") ||
         err.message?.includes("Invalid") ||
         err.message?.includes("Unsafe")
       ) {
         return jsonResponse(res, 400, { error: err.message });
+      }
+      throw err;
+    }
+  }
+
+  // ── Async-promote queue (RFC: docs/specs/SPEC_ASYNC_PROMOTE_QUEUE.md) ──
+  //
+  // Five routes that mirror the sync /promote contract but enqueue work
+  // for an in-process worker (PR #3) instead of running it inline. All
+  // routes share the SMALL_BODY_BYTES cap from sync /promote — see
+  // RFC §3.1.
+  //
+  // The list/status/cancel/recover routes are unambiguous because the
+  // jobId lives in the path; the enqueue route uses `/promote-async`
+  // as the trailing segment so it doesn't conflict with assertion
+  // names containing the word "promote".
+
+  // POST /api/assertion/:name/promote-async  { contextGraphId, entities?, subGraphName? }
+  if (
+    req.method === "POST" &&
+    path.startsWith("/api/assertion/") &&
+    path.endsWith("/promote-async")
+  ) {
+    const assertionName = safeDecodeURIComponent(
+      path.slice("/api/assertion/".length, -"/promote-async".length),
+      res,
+    );
+    if (assertionName === null) return;
+    const nameVal = validateAssertionName(assertionName);
+    if (!nameVal.valid)
+      return jsonResponse(res, 400, {
+        error: `Invalid assertion name: ${nameVal.reason}`,
+      });
+    if (asyncPromoteUnavailable(res)) return;
+    const body = await readBody(req, SMALL_BODY_BYTES);
+    const parsed = safeParseJson(body, res);
+    if (!parsed) return;
+    const { contextGraphId, entities, subGraphName } = parsed;
+    const resolvedContextGraphId = await resolveRequiredWriteContextGraphId(
+      agent,
+      contextGraphId,
+      res,
+      writePreflightContextGraphOpts,
+    );
+    if (!resolvedContextGraphId) return;
+    if (!validateEntities(entities, res)) return;
+    if (!validateOptionalSubGraphName(subGraphName, res)) return;
+    try {
+      const result = await agent.assertion.promoteAsync(
+        resolvedContextGraphId,
+        assertionName,
+        { entities: entities ?? "all", subGraphName },
+      );
+      return jsonResponse(res, 200, {
+        jobId: result.jobId,
+        state: "queued",
+      });
+    } catch (err: any) {
+      if (err instanceof PromoteJobConflictError) {
+        return jsonResponse(res, 409, {
+          error: err.message,
+          existingJobId: err.existingJobId,
+        });
+      }
+      if (
+        err.message?.includes("required") ||
+        err.message?.includes("Invalid") ||
+        err.message?.includes("must be")
+      ) {
+        return jsonResponse(res, 400, { error: err.message });
+      }
+      throw err;
+    }
+  }
+
+  // GET /api/assertion/promote-async  ?contextGraphId=<cg>&state=queued,running,...&limit=<n>
+  // List jobs filtered by contextGraphId / state. Must come BEFORE the
+  // `/:jobId` route below because Node URL routing here is by `startsWith`
+  // + `endsWith` rather than a real router; an exact-prefix GET to the
+  // collection URL would otherwise be claimed by the per-job handler.
+  if (
+    req.method === "GET" &&
+    path === "/api/assertion/promote-async"
+  ) {
+    if (asyncPromoteUnavailable(res)) return;
+    const stateParam = url.searchParams.get("state");
+    const requestedStates = stateParam ? stateParam.split(",").map((s) => s.trim()) : undefined;
+    if (
+      requestedStates &&
+      (requestedStates.length === 0 ||
+        requestedStates.some((s) => !(PROMOTE_JOB_STATES as readonly string[]).includes(s)))
+    ) {
+      return jsonResponse(res, 400, {
+        error: `Invalid state filter: ${stateParam}. Allowed: ${PROMOTE_JOB_STATES.join(",")}`,
+      });
+    }
+    const stateFilter = requestedStates as PromoteJobState[] | undefined;
+    const contextGraphId = url.searchParams.get("contextGraphId") ?? undefined;
+    const limitParam = url.searchParams.get("limit");
+    if (limitParam !== null && !/^[1-9]\d*$/.test(limitParam)) {
+      return jsonResponse(res, 400, {
+        error: "limit must be a positive integer ≤ 1000",
+      });
+    }
+    const limit = limitParam !== null ? Number.parseInt(limitParam, 10) : undefined;
+    if (limit !== undefined && (!Number.isFinite(limit) || limit <= 0 || limit > 1000)) {
+      return jsonResponse(res, 400, {
+        error: "limit must be a positive integer ≤ 1000",
+      });
+    }
+    const jobs = await agent.assertion.listPromoteAsyncJobs({
+      state: stateFilter,
+      contextGraphId,
+      limit,
+    });
+    return jsonResponse(res, 200, { jobs: jobs.map(promoteJobToView) });
+  }
+
+  // GET /api/assertion/promote-async/:jobId
+  if (
+    req.method === "GET" &&
+    path.startsWith("/api/assertion/promote-async/") &&
+    !path.endsWith("/recover")
+  ) {
+    if (asyncPromoteUnavailable(res)) return;
+    const jobId = decodePromoteJobId(path.slice("/api/assertion/promote-async/".length), res);
+    if (jobId === null) return;
+    const job = await agent.assertion.getPromoteAsyncStatus(jobId);
+    if (!job) {
+      return jsonResponse(res, 404, { error: `Promote job not found: ${jobId}` });
+    }
+    return jsonResponse(res, 200, promoteJobToView(job));
+  }
+
+  // DELETE /api/assertion/promote-async/:jobId   — cancel a queued/failed_retrying job
+  if (
+    req.method === "DELETE" &&
+    path.startsWith("/api/assertion/promote-async/")
+  ) {
+    const jobId = decodePromoteJobId(path.slice("/api/assertion/promote-async/".length), res);
+    if (jobId === null) return;
+    try {
+      await agent.assertion.cancelPromoteAsync(jobId);
+      const job = await agent.assertion.getPromoteAsyncStatus(jobId);
+      return jsonResponse(res, 200, { jobId, state: job?.state ?? "failed" });
+    } catch (err: any) {
+      if (err.message?.includes("not found")) {
+        return jsonResponse(res, 404, { error: err.message });
+      }
+      // "Cannot cancel job in state 'running'" etc.
+      if (err.message?.includes("Cannot cancel")) {
+        return jsonResponse(res, 409, { error: err.message });
+      }
+      throw err;
+    }
+  }
+
+  // POST /api/assertion/promote-async/:jobId/recover   — requeue a terminal-failed job
+  if (
+    req.method === "POST" &&
+    path.startsWith("/api/assertion/promote-async/") &&
+    path.endsWith("/recover")
+  ) {
+    const jobId = decodePromoteJobId(
+      path.slice("/api/assertion/promote-async/".length, -"/recover".length),
+      res,
+    );
+    if (jobId === null) return;
+    try {
+      await agent.assertion.recoverPromoteAsync(jobId);
+      const job = await agent.assertion.getPromoteAsyncStatus(jobId);
+      return jsonResponse(res, 200, { jobId, state: job?.state ?? "queued" });
+    } catch (err: any) {
+      if (err.message?.includes("not found")) {
+        return jsonResponse(res, 404, { error: err.message });
+      }
+      if (err.message?.includes("Cannot recover")) {
+        return jsonResponse(res, 409, { error: err.message });
       }
       throw err;
     }
@@ -1444,7 +1977,13 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
       preSignedAuthorAttestation: bodyPreSignedAttestation,
       schemeVersion,
     } = parsed;
-    if (!validateRequiredContextGraphId(contextGraphId, res)) return;
+    const resolvedContextGraphId = await resolveRequiredWriteContextGraphId(
+      agent,
+      contextGraphId,
+      res,
+      writePreflightContextGraphOpts,
+    );
+    if (!resolvedContextGraphId) return;
     if (!validateOptionalSubGraphName(subGraphName, res)) return;
     if (
       bodyAuthorAgentAddress != null &&
@@ -1500,7 +2039,7 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
       });
     }
     try {
-      const seal = await agent.assertion.finalize(contextGraphId, assertionName, {
+      const seal = await agent.assertion.finalize(resolvedContextGraphId, assertionName, {
         ...(subGraphName ? { subGraphName } : {}),
         ...(resolvedAuthorAgentAddress
           ? { authorAgentAddress: resolvedAuthorAgentAddress }
@@ -1517,7 +2056,7 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
       // the standalone routes must each emit their own — otherwise a client
       // composing the chain by hand would miss the `assertion_finalized` step.
       emitMemoryGraphChanged?.({
-        contextGraphId,
+        contextGraphId: resolvedContextGraphId,
         layers: ["wm"],
         subGraphName,
         operation: "assertion_finalized",
@@ -1572,23 +2111,29 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
     const parsed = safeParseJson(body, res);
     if (!parsed) return;
     const { contextGraphId, subGraphName } = parsed;
-    if (!validateRequiredContextGraphId(contextGraphId, res)) return;
+    const resolvedContextGraphId = await resolveRequiredWriteContextGraphId(
+      agent,
+      contextGraphId,
+      res,
+      writePreflightContextGraphOpts,
+    );
+    if (!resolvedContextGraphId) return;
     if (!validateOptionalSubGraphName(subGraphName, res)) return;
     try {
       await agent.assertion.discard(
-        contextGraphId,
+        resolvedContextGraphId,
         assertionName,
         subGraphName ? { subGraphName } : undefined,
       );
       const assertionUri = contextGraphAssertionUri(
-        contextGraphId,
+        resolvedContextGraphId,
         requestAgentAddress,
         assertionName,
         subGraphName,
       );
       extractionStatus.delete(assertionUri);
       emitMemoryGraphChanged?.({
-        contextGraphId,
+        contextGraphId: resolvedContextGraphId,
         layers: ["wm"],
         subGraphName,
         operation: "assertion_discarded",
@@ -1626,6 +2171,7 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
     const qs = new URL(req.url ?? "", "http://localhost").searchParams;
     const contextGraphId = qs.get("contextGraphId");
     if (!validateRequiredContextGraphId(contextGraphId, res)) return;
+    const normalizedContextGraphId = normalizeContextGraphIdOrUri(contextGraphId!);
     const rawAgentAddress = qs.get("agentAddress") ?? undefined;
     if (rawAgentAddress && !/^[\w:.\-]+$/.test(rawAgentAddress)) {
       return jsonResponse(res, 400, { error: "Invalid agentAddress format" });
@@ -1633,7 +2179,7 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
     const subGraphName = qs.get("subGraphName") ?? undefined;
     try {
       const descriptor = await agent.assertion.history(
-        contextGraphId!,
+        normalizedContextGraphId,
         assertionName,
         { ...(rawAgentAddress ? { agentAddress: rawAgentAddress } : {}), ...(subGraphName ? { subGraphName } : {}) },
       );
@@ -1729,7 +2275,7 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
       const f = fields.find((x) => x.name === name && x.filename === undefined);
       return f ? f.content.toString("utf-8") : undefined;
     };
-    const contextGraphId = textField("contextGraphId");
+    let contextGraphId = textField("contextGraphId");
     const contentTypeOverrideRaw = textField("contentType");
     // Treat blank (`contentType=` with empty/whitespace value) as absent so we
     // fall through to the file part's own Content-Type header instead of
@@ -1742,7 +2288,14 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
     const ontologyRef = textField("ontologyRef");
     const subGraphName = textField("subGraphName");
 
-    if (!validateRequiredContextGraphId(contextGraphId, res)) return;
+    const resolvedContextGraphId = await resolveRequiredWriteContextGraphId(
+      agent,
+      contextGraphId,
+      res,
+      writePreflightContextGraphOpts,
+    );
+    if (!resolvedContextGraphId) return;
+    contextGraphId = resolvedContextGraphId;
     if (!validateOptionalSubGraphName(subGraphName, res)) return;
 
     const detectedContentType = normalizeDetectedContentType(
@@ -3081,11 +3634,12 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
       url.searchParams.get("contextGraphId") ??
       url.searchParams.get("contextGraphId");
     if (!validateRequiredContextGraphId(contextGraphId, res)) return;
+    const normalizedContextGraphId = normalizeContextGraphIdOrUri(contextGraphId!);
     const subGraphName = url.searchParams.get("subGraphName") ?? undefined;
     if (!validateOptionalSubGraphName(subGraphName, res)) return;
 
     const assertionUri = contextGraphAssertionUri(
-      contextGraphId!,
+      normalizedContextGraphId,
       requestAgentAddress,
       assertionName,
       subGraphName,
@@ -3093,7 +3647,7 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
     const record = getExtractionStatusRecord(extractionStatus, assertionUri);
     if (!record) {
       return jsonResponse(res, 404, {
-        error: `No extraction record found for assertion "${assertionName}" in context graph "${contextGraphId}"`,
+        error: `No extraction record found for assertion "${assertionName}" in context graph "${normalizedContextGraphId}"`,
       });
     }
     return jsonResponse(res, 200, {
@@ -3162,10 +3716,10 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
     const idStr = decodeURIComponent(path.split('/')[3] ?? '');
     if (!/^\d+$/.test(idStr)) {
       return jsonResponse(res, 400, {
-        error: 'Invalid kcId — must be a non-negative integer',
+        error: 'Invalid kaId — must be a non-negative integer',
       });
     }
-    const kcId = BigInt(idStr);
+    const kaId = BigInt(idStr);
     try {
       const chain: any = (agent as any).chain ?? (agent as any).chainAdapter;
       if (!chain?.getLatestMerkleRoot) {
@@ -3173,29 +3727,29 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
           error: 'Chain adapter does not expose getLatestMerkleRoot',
         });
       }
-      const rootBytes: Uint8Array = await chain.getLatestMerkleRoot(kcId);
+      const rootBytes: Uint8Array = await chain.getLatestMerkleRoot(kaId);
       const rootHex = '0x' + Array.from(rootBytes).map((b: number) => b.toString(16).padStart(2, '0')).join('');
       let author: string | null = null;
       try {
         if (typeof agent.getKnowledgeCollectionAuthor === 'function') {
-          const a = await agent.getKnowledgeCollectionAuthor(kcId);
+          const a = await agent.getKnowledgeCollectionAuthor(kaId);
           if (a && a !== '0x0000000000000000000000000000000000000000') author = a;
         }
       } catch { /* attestation lookup is optional */ }
       return jsonResponse(res, 200, {
-        kcId: idStr,
+        kaId: idStr,
         merkleRoot: rootHex,
         author,
       });
     } catch (err: any) {
-      // Codex PR #609 R2 #5 — mirror the unknown-kcId mapping the
+      // Codex PR #609 R2 #5 — mirror the unknown-kaId mapping the
       // sibling `/api/kc/:id/author` route already does so callers
       // can branch on "not published yet" (404) vs. server failure
       // (500). KCS reverts on lookups for ids that don't exist;
       // matching the same regex keeps the two routes in lockstep.
       const msg = err?.message ?? String(err);
-      if (/unknown kcId|nonexistent|out-of-bounds/i.test(msg)) {
-        return jsonResponse(res, 404, { error: `Unknown kcId ${idStr}` });
+      if (/unknown kaId|nonexistent|out-of-bounds/i.test(msg)) {
+        return jsonResponse(res, 404, { error: `Unknown kaId ${idStr}` });
       }
       return jsonResponse(res, 500, { error: msg });
     }
@@ -3205,7 +3759,7 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
   // collection's latest merkle-root entry.
   //
   // Delegates to `agent.getKnowledgeCollectionAuthor`, which reads
-  // `KnowledgeCollectionStorage.getLatestMerkleRootAuthor(kcId)` via the
+  // `KnowledgeCollectionStorage.getLatestMerkleRootAuthor(kaId)` via the
   // configured chain adapter. The view returns:
   //   - the EIP-712-recovered (or EIP-1271-verified) author for V10.1+
   //     publishes, or
@@ -3216,17 +3770,17 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
   // clients don't have to know the convention. Adapters that don't
   // implement the view (no-chain mode, pre-V10.1 evm-adapter copies)
   // return 503 — this is "feature requires V10.1 chain adapter," not a
-  // 404 about the kcId.
+  // 404 about the kaId.
   if (req.method === 'GET' && /^\/api\/kc\/[^/]+\/author$/.test(path)) {
     const idStr = decodeURIComponent(path.split('/')[3] ?? '');
     if (!/^\d+$/.test(idStr)) {
       return jsonResponse(res, 400, {
-        error: 'Invalid kcId — must be a non-negative integer',
+        error: 'Invalid kaId — must be a non-negative integer',
       });
     }
-    const kcId = BigInt(idStr);
+    const kaId = BigInt(idStr);
     try {
-      const author = await agent.getKnowledgeCollectionAuthor(kcId);
+      const author = await agent.getKnowledgeCollectionAuthor(kaId);
       if (author === null) {
         return jsonResponse(res, 503, {
           error:
@@ -3237,16 +3791,16 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
       const ZERO = '0x0000000000000000000000000000000000000000';
       const attested = author.toLowerCase() !== ZERO;
       return jsonResponse(res, 200, {
-        kcId: idStr,
+        kaId: idStr,
         author: attested ? author : null,
         attested,
       });
     } catch (err: any) {
-      // KCS reverts on unknown kcId; map to 404 so callers can branch
+      // KCS reverts on unknown kaId; map to 404 so callers can branch
       // on "not published yet" vs "no attestation."
       const msg = err?.message ?? String(err);
-      if (/unknown kcId|nonexistent|out-of-bounds/i.test(msg)) {
-        return jsonResponse(res, 404, { error: `Unknown kcId ${idStr}` });
+      if (/unknown kaId|nonexistent|out-of-bounds/i.test(msg)) {
+        return jsonResponse(res, 404, { error: `Unknown kaId ${idStr}` });
       }
       throw err;
     }

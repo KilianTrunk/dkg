@@ -1,21 +1,65 @@
 import {
   PROTOCOL_STORAGE_ACK,
+  PROTOCOL_STORAGE_ACK_V2,
+  ACK_PROTOCOL_VERSION_V1_LU5,
+  ACK_PROTOCOL_VERSION_V2_LU11,
   encodePublishIntent,
   decodeStorageACK,
   computePublishACKDigest,
   isStorageACKDecline,
   isTransientStorageACKDeclineCode,
+  isSubscriptionSource,
   type PublishIntentMsg,
   type StorageACKMsg,
+  type SubscriptionSource,
 } from '@origintrail-official/dkg-core';
 import { ethers } from 'ethers';
+import { QuorumUnmetError, type PeerOutcome } from './ack-errors.js';
+
+/**
+ * Why an ACK signer pre-flight rejected a recovered signer. Mirrors
+ * `VerifyACKIdentityReason` from `@origintrail-official/dkg-chain`.
+ * Kept as a string union here to avoid a hard cross-package type dep
+ * — adapters wire concrete reasons through; legacy `boolean` callers
+ * still work and surface `undefined`.
+ */
+export type ACKVerifyReason = 'key-not-registered' | 'not-in-sharding-table' | 'rpc-error';
+
+export interface ACKVerifyResult {
+  valid: boolean;
+  reason?: ACKVerifyReason;
+}
 
 export interface ACKCollectorDeps {
   gossipPublish: (topic: string, data: Uint8Array) => Promise<void>;
   sendP2P: (peerId: string, protocol: string, data: Uint8Array) => Promise<Uint8Array>;
   getConnectedCorePeers: () => string[];
+  /**
+   * Boolean ACK signer pre-flight. Backward-compatible legacy entry
+   * point — when only this is provided the rejection log surfaces a
+   * generic "ACK rejected" line without a reason. New code should
+   * prefer `verifyIdentityDetailed`.
+   */
   verifyIdentity?: (recoveredAddress: string, claimedIdentityId: bigint) => Promise<boolean>;
+  /**
+   * Structured ACK signer pre-flight. When provided, the collector
+   * uses this in preference to `verifyIdentity` and surfaces the
+   * specific failing gate (`key-not-registered`, `not-in-sharding-
+   * table`, `rpc-error`) in the rejection log so operators can act on
+   * the actual root cause instead of guessing.
+   */
+  verifyIdentityDetailed?: (
+    recoveredAddress: string,
+    claimedIdentityId: bigint,
+  ) => Promise<ACKVerifyResult>;
   log?: (msg: string) => void;
+  /**
+   * Backoff sleep between transport-error retries and transient
+   * SWM-decline retries (#887). Injectable so unit tests can exercise
+   * the multi-retry budget without waiting real seconds. Defaults to a
+   * real `setTimeout` delay.
+   */
+  sleep?: (ms: number) => Promise<void>;
 }
 
 export interface CollectedACK {
@@ -23,6 +67,15 @@ export interface CollectedACK {
   signatureR: Uint8Array;
   signatureVS: Uint8Array;
   nodeIdentityId: bigint;
+  /**
+   * PR5 ACK-provenance: which of the four LU-6 Phase B discovery
+   * paths the responding core reported caused it to be hosting the
+   * curated CG at ACK time. `undefined` for legacy / pre-PR5 peers
+   * (the wire field is optional). Surfaced through the publisher's
+   * per-publish ACK-provenance summary line on success and through
+   * `QuorumUnmetError.peerOutcomes` on failure.
+   */
+  subscriptionSource?: SubscriptionSource;
 }
 
 export interface ACKCollectionResult {
@@ -34,6 +87,24 @@ export interface ACKCollectionResult {
 const DEFAULT_REQUIRED_ACKS = 3;
 const ACK_TIMEOUT_MS = 120_000;
 const MAX_RETRIES = 3;
+// #887: transient declines (the core's SWM replica is still catching up
+// via gossip — NO_DATA_IN_SWM / MERKLE_MISMATCH_IN_SWM /
+// MISSING_CIPHERTEXT_CHUNKS) get their own, larger retry budget than
+// transport errors. For a freshly-created CG the publisher's ACK round
+// routinely races the very first SWM gossip push to the newly-assigned
+// core peers, and propagation can take well over the ~3s the old shared
+// 3-attempt / 1s+2s budget allowed — so a core that would have ACKed a
+// few seconds later was permanently dropped and the publish failed with
+// `storage_ack_insufficient`. The capped-exponential schedule below
+// spans ~31s across 6 retries, comfortably under `ACK_TIMEOUT_MS`, and
+// keeps quorum reachable once the data lands. Transport errors keep the
+// unchanged `MAX_RETRIES` budget (a peer that never answers shouldn't
+// hold the round open for 30s).
+const MAX_TRANSIENT_DECLINE_RETRIES = 6;
+const TRANSIENT_DECLINE_BACKOFF_CAP_MS = 8_000;
+function transientDeclineBackoffMs(retry: number): number {
+  return Math.min(1000 * 2 ** Math.max(0, retry - 1), TRANSIENT_DECLINE_BACKOFF_CAP_MS);
+}
 const MAX_DECLINE_CODE_CHARS = 64;
 const MAX_DECLINE_MESSAGE_CHARS = 240;
 
@@ -96,6 +167,39 @@ export class ACKCollector {
      * unchanged.
      */
     isEncryptedPayload?: boolean;
+    /**
+     * OT-RFC-38 LU-11 / OT-RFC-39. When set, the publisher has fanned
+     * per-chunk ciphertexts via SWM gossip (one envelope per chunk,
+     * carrying `swmMessageIndex` + the chunked type marker) and the
+     * ACK request goes out on `PROTOCOL_STORAGE_ACK_V2` with empty
+     * `stagingQuads` + populated `ciphertextChunksRoot` /
+     * `ciphertextChunkCount` / `ackProtocolVersion = 2`. Required
+     * when `isEncryptedPayload === true` AND chunked emission was
+     * used; mutually exclusive with non-empty `stagingQuads`.
+     *
+     * **Cluster-wide V2 requirement** (Codex review on PR #715): this
+     * collector unconditionally dispatches chunked ACK requests over
+     * `PROTOCOL_STORAGE_ACK_V2` — there is NO automatic V1 fallback
+     * for cores in the quorum target that don't advertise V2. A core
+     * that only speaks `/dkg/10.0.1/storage-ack` will surface a
+     * libp2p "could not negotiate" send error here, which counts as a
+     * peer-unreachable failure against `requiredACKs`. The
+     * mixed-rc.11-rc.12 cluster case is therefore strictly an
+     * upgrade-window concern (a rc.11 core can't decode LU-11
+     * chunked gossip envelopes either, so it would fail upstream of
+     * this collector even with a V1 fallback). The operational
+     * assumption for rc.12 — and the rc.12 release runbook — is that
+     * every quorum-target core has been upgraded to LU-11 BEFORE the
+     * curator's first chunked publish. The OT-RFC-38 §A.1 host-mode
+     * reconciler converges the cluster within the per-CG window the
+     * curator sets; operators must respect that window before
+     * issuing curated publishes. A per-peer capability probe + V1
+     * downgrade is filed as a follow-up — see TODO(rc.12.1) below.
+     */
+    chunkedCommitment?: {
+      ciphertextChunksRoot: Uint8Array;
+      ciphertextChunkCount: number;
+    };
   }): Promise<ACKCollectionResult> {
     const {
       merkleRoot, contextGraphId, contextGraphIdStr,
@@ -120,6 +224,46 @@ export class ACKCollector {
     // the ACK against. `swmGraphId` (optional) is the SOURCE graph where
     // data lives in SWM — only set when the publisher is remapping a named
     // SWM graph to a numeric on-chain id.
+    // OT-RFC-38 LU-11: chunked path requires V2 ACK protocol id and
+    // empty `stagingQuads` (chunks live on SWM, not on the ACK wire).
+    // Anything else is a programmer error in the publisher's branch
+    // selection — surface it loudly instead of silently shipping a
+    // V1 envelope that pre-LU-11 cores would still accept.
+    if (params.chunkedCommitment) {
+      if (!params.isEncryptedPayload) {
+        throw new Error(
+          'ACKCollector: chunkedCommitment requires isEncryptedPayload=true (curated-CG-only path)',
+        );
+      }
+      if (params.stagingQuads && params.stagingQuads.length > 0) {
+        throw new Error(
+          'ACKCollector: chunkedCommitment + non-empty stagingQuads is invalid — ' +
+          'on the LU-11 chunked path the ciphertext lives in SWM, not on the ACK wire',
+        );
+      }
+      if (params.chunkedCommitment.ciphertextChunkCount <= 0) {
+        throw new Error(
+          `ACKCollector: chunkedCommitment.ciphertextChunkCount must be positive; got ${params.chunkedCommitment.ciphertextChunkCount}`,
+        );
+      }
+      if (params.chunkedCommitment.ciphertextChunksRoot.length !== 32) {
+        throw new Error(
+          `ACKCollector: chunkedCommitment.ciphertextChunksRoot must be 32 bytes; got ${params.chunkedCommitment.ciphertextChunksRoot.length}`,
+        );
+      }
+    }
+    const ackProtocolVersion = params.chunkedCommitment
+      ? ACK_PROTOCOL_VERSION_V2_LU11
+      : ACK_PROTOCOL_VERSION_V1_LU5;
+    // TODO(rc.12.1, Codex review on PR #715): add per-peer capability
+    // probe so chunked publishes can opportunistically downgrade to V1
+    // for cores that don't advertise V2. Until then, chunked publishes
+    // require every quorum-target core to support V2 — see the
+    // `chunkedCommitment` field doc for the cluster-wide requirement
+    // and the rc.12 release-runbook rationale.
+    const ackProtocolId = params.chunkedCommitment
+      ? PROTOCOL_STORAGE_ACK_V2
+      : PROTOCOL_STORAGE_ACK;
     const p2pMsg: PublishIntentMsg = {
       merkleRoot,
       contextGraphId: contextGraphIdStr,
@@ -137,6 +281,9 @@ export class ACKCollector {
       subGraphName: params.subGraphName,
       merkleLeafCount: params.merkleLeafCount,
       isEncryptedPayload: params.isEncryptedPayload === true ? true : undefined,
+      ciphertextChunksRoot: params.chunkedCommitment?.ciphertextChunksRoot,
+      ciphertextChunkCount: params.chunkedCommitment?.ciphertextChunkCount,
+      ackProtocolVersion: params.chunkedCommitment ? ackProtocolVersion : undefined,
     };
     const intentBytes = encodePublishIntent(p2pMsg);
 
@@ -147,15 +294,32 @@ export class ACKCollector {
 
     const corePeers = this.deps.getConnectedCorePeers();
     if (corePeers.length === 0) {
-      throw new Error('ACK collection failed: no connected core peers');
+      // Pre-dial impossibility — wrap in the typed surface but preserve
+      // the legacy `ACK collection failed: no connected core peers` text
+      // so log greps + existing tests keep matching.
+      throw new QuorumUnmetError({
+        collected: 0,
+        required: REQUIRED_ACKS,
+        dialled: 0,
+        peerOutcomes: [],
+        legacyMessage: 'ACK collection failed: no connected core peers',
+      });
     }
     if (corePeers.length < REQUIRED_ACKS) {
-      throw new Error(
-        `ACK collection failed: need ${REQUIRED_ACKS} ACKs but only ${corePeers.length} core peers connected — quorum impossible`,
-      );
+      throw new QuorumUnmetError({
+        collected: 0,
+        required: REQUIRED_ACKS,
+        dialled: corePeers.length,
+        peerOutcomes: corePeers.map((peerId) => ({ peerId, reason: 'pool_below_quorum' })),
+        legacyMessage:
+          `ACK collection failed: need ${REQUIRED_ACKS} ACKs but only ${corePeers.length} core peers connected — quorum impossible`,
+      });
     }
     log(`[ACKCollector] Requesting ACKs from ${corePeers.length} core peers (need ${REQUIRED_ACKS})`);
 
+    const ciphertextRoot = params.chunkedCommitment?.ciphertextChunksRoot
+      ?? new Uint8Array(32);
+    const ciphertextCount = BigInt(params.chunkedCommitment?.ciphertextChunkCount ?? 0);
     const ackDigest = computePublishACKDigest(
       chainId,
       kav10Address,
@@ -166,6 +330,9 @@ export class ACKCollector {
       BigInt(params.epochs ?? 1),
       params.tokenAmount ?? 0n,
       BigInt(params.merkleLeafCount),
+      ciphertextRoot,
+      ciphertextCount,
+      false,
     );
 
     const collected: CollectedACK[] = [];
@@ -192,10 +359,84 @@ export class ACKCollector {
       return ` Declines: ${formatted}.`;
     };
 
+    // Build the per-peer outcome list `QuorumUnmetError` carries
+    // through to PR5 telemetry. Snapshots the collector's bookkeeping at
+    // throw time so the surface stays consistent regardless of which of
+    // the three quorum-fail throw sites fires (impossible-pool, timeout,
+    // insufficient).
+    //
+    // The `reason` field carries only the typed code (e.g.
+    // `STORAGE_ACK_DECLINE:NO_DATA_IN_SWM`) — NOT the peer-controlled
+    // human message. The legacy `Declines:` substring on the embedded
+    // `legacyMessage` already carries the operator-readable detail in
+    // its existing sanitized form, and the test
+    // `sanitizes and truncates peer-controlled decline messages` pins
+    // a per-error length bound that double-rendering would blow past.
+    const snapshotPeerOutcomes = (): PeerOutcome[] => {
+      const ackedById = new Map(collected.map(a => [a.peerId, a] as const));
+      return corePeers.map((peerId): PeerOutcome => {
+        const ack = ackedById.get(peerId);
+        if (ack) {
+          // PR5: an ACK from a peer with `source=member` or any of
+          // the four host-mode sources is, by construction, advertising
+          // host-mode (or the stronger "I'm a member, decrypt+apply
+          // handler is authoritative") for this CG. Peers that ACKed
+          // without a source field are pre-PR5; we leave
+          // `swmHostModeAdvertised` undefined rather than asserting
+          // either way.
+          const advertised = ack.subscriptionSource !== undefined ? true : undefined;
+          return {
+            peerId,
+            dialOk: true,
+            protocolSupported: true,
+            ...(advertised !== undefined ? { swmHostModeAdvertised: advertised } : {}),
+            reason: ack.subscriptionSource ? `ACK:${ack.subscriptionSource}` : 'ACK',
+          };
+        }
+        const decline = declines.get(peerId);
+        if (decline) {
+          const code = decline.code;
+          const reason = code === 'TRANSPORT_ERROR'
+            ? 'TRANSPORT_ERROR'
+            : `STORAGE_ACK_DECLINE:${code}`;
+          return {
+            peerId,
+            dialOk: code !== 'TRANSPORT_ERROR',
+            protocolSupported: code !== 'TRANSPORT_ERROR' ? true : undefined,
+            reason,
+          };
+        }
+        return { peerId, reason: 'no_response' };
+      });
+    };
+
+    // PR #896 review (🟡): once the round is decided — quorum reached, timed
+    // out, or proven impossible — any `requestACK` loop still sleeping
+    // between retries must bail on wake instead of continuing to dial. With
+    // the widened #887 transient-decline budget (~31s) a losing peer could
+    // otherwise keep retrying long after `collect()` already resolved,
+    // emitting avoidable ACK traffic and log noise. `roundSettled` is set
+    // when the outer race settles; `roundIsOver()` also treats a satisfied
+    // quorum as terminal so a peer mid-backoff bails the instant the last
+    // needed ACK lands elsewhere.
+    let roundSettled = false;
+    const roundIsOver = () => roundSettled || collected.length >= REQUIRED_ACKS;
+
+    const sleep = this.deps.sleep ?? ((ms: number) => new Promise<void>(r => setTimeout(r, ms)));
+
     const requestACK = async (peerId: string): Promise<CollectedACK | null> => {
-      for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+      // #887: transient SWM declines and transport errors now have
+      // independent retry budgets. A core whose SWM is still catching up
+      // (transient decline) is given the larger `MAX_TRANSIENT_DECLINE_
+      // RETRIES` budget below; a core that simply won't answer keeps the
+      // unchanged transport `MAX_RETRIES` budget. Mixing them in one
+      // counter (the pre-#887 behaviour) let a couple of transport blips
+      // burn the whole budget a slow-gossip core needed to ACK.
+      let transportAttempts = 0;
+      let declineRetries = 0;
+      for (;;) {
         try {
-          const response = await this.deps.sendP2P(peerId, PROTOCOL_STORAGE_ACK, intentBytes);
+          const response = await this.deps.sendP2P(peerId, ackProtocolId, intentBytes);
           const ack: StorageACKMsg = decodeStorageACK(response);
 
           if (isStorageACKDecline(ack)) {
@@ -214,20 +455,42 @@ export class ACKCollector {
             declines.set(peerId, { code, message: declineMessage });
 
             // Transient declines (SWM replication catching up via
-            // gossip) can resolve on a retry, so re-send through the
-            // same backoff as transport errors instead of permanently
-            // deselecting the peer. Codex review on PR #559 flagged
-            // the "every decline is permanent" path as a regression:
-            // a core that would have ACKed seconds later was being
-            // removed from the quorum pool the moment its SWM trailed
-            // the publish by even one gossip cycle.
-            if (isTransientStorageACKDeclineCode(code) && attempt < MAX_RETRIES - 1) {
+            // gossip) can resolve on a retry, so re-send with backoff
+            // instead of permanently deselecting the peer. Codex review
+            // on PR #559 flagged the "every decline is permanent" path
+            // as a regression: a core that would have ACKed seconds
+            // later was being removed from the quorum pool the moment
+            // its SWM trailed the publish by even one gossip cycle.
+            // #887 widened this further — the old budget shared with
+            // transport retries gave only ~3s, which a fresh CG's first
+            // gossip push to its assigned cores routinely overran.
+            if (isTransientStorageACKDeclineCode(code) && declineRetries < MAX_TRANSIENT_DECLINE_RETRIES) {
+              if (roundIsOver()) {
+                log(
+                  `[ACKCollector] Quorum already settled — abandoning transient-decline ` +
+                  `retry for ${peerId.slice(-8)} (${code})`,
+                );
+                return null;
+              }
+              declineRetries += 1;
+              const waitMs = transientDeclineBackoffMs(declineRetries);
               log(
                 `[ACKCollector] Transient decline from ${peerId.slice(-8)}: ${code}` +
                 (declineMessage ? ` — ${declineMessage}` : '') +
-                ` (retry ${attempt + 1}/${MAX_RETRIES})`,
+                ` (retry ${declineRetries}/${MAX_TRANSIENT_DECLINE_RETRIES}, waiting ${waitMs}ms for SWM gossip)`,
               );
-              await new Promise(r => setTimeout(r, (attempt + 1) * 1000));
+              await sleep(waitMs);
+              // #896 review: quorum may have settled DURING the backoff above
+              // (collect() resolves the instant the last needed ACK lands on
+              // another peer). Re-check before re-dialing so a decided round
+              // never leaks one more `sendP2P` after the caller moved on.
+              if (roundIsOver()) {
+                log(
+                  `[ACKCollector] Quorum settled during backoff — abandoning ` +
+                  `transient-decline retry for ${peerId.slice(-8)} (${code})`,
+                );
+                return null;
+              }
               continue;
             }
 
@@ -253,7 +516,24 @@ export class ACKCollector {
             ? BigInt(ack.nodeIdentityId)
             : BigInt(ack.nodeIdentityId.low) | (BigInt(ack.nodeIdentityId.high) << 32n);
 
-          if (this.deps.verifyIdentity) {
+          // Prefer the detailed verifier — surfaces the specific failing
+          // gate in the rejection log so operators can tell apart "this
+          // signer is genuinely not registered" (operator-side) from
+          // "the node is registered but has not crossed minimumStake"
+          // (operator-side, different action) from "we couldn't reach
+          // the chain to check" (infra-side, retryable). Pre-PR every
+          // failure surfaced as the same "not registered" string.
+          if (this.deps.verifyIdentityDetailed) {
+            const verdict = await this.deps.verifyIdentityDetailed(recoveredAddress, identityId);
+            if (!verdict.valid) {
+              const reason = verdict.reason ?? 'unknown';
+              log(
+                `[ACKCollector] ACK from ${peerId.slice(-8)} rejected: ${reason}` +
+                ` (signer=${recoveredAddress.slice(0, 10)}..., identity=${identityId})`,
+              );
+              return null;
+            }
+          } else if (this.deps.verifyIdentity) {
             const valid = await this.deps.verifyIdentity(recoveredAddress, identityId);
             if (!valid) {
               log(`[ACKCollector] Signer ${recoveredAddress.slice(0, 10)}... not registered for identity ${identityId} — rejecting ACK from ${peerId.slice(-8)}`);
@@ -267,39 +547,66 @@ export class ACKCollector {
           // if quorum fails for unrelated reasons.
           declines.delete(peerId);
 
-          log(`[ACKCollector] Valid ACK from ${peerId.slice(-8)} (identity=${identityId}, signer=${recoveredAddress.slice(0, 10)}...)`);
+          // PR5: capture the peer-reported ACK-provenance source if
+          // present. Pre-PR5 cores never set the field; treat any
+          // unknown / off-enum value as `undefined` (strict additive
+          // wire — only documented enum members are honoured).
+          const subscriptionSource = isSubscriptionSource(ack.subscriptionSource)
+            ? ack.subscriptionSource
+            : undefined;
+
+          const sourceTag = subscriptionSource ? ` source=${subscriptionSource}` : '';
+          log(`[ACKCollector] Valid ACK from ${peerId.slice(-8)} (identity=${identityId}, signer=${recoveredAddress.slice(0, 10)}...${sourceTag})`);
 
           return {
             peerId,
             signatureR: ack.coreNodeSignatureR,
             signatureVS: ack.coreNodeSignatureVS,
             nodeIdentityId: identityId,
+            ...(subscriptionSource ? { subscriptionSource } : {}),
           };
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
-          if (attempt < MAX_RETRIES - 1) {
-            log(`[ACKCollector] Retry ${attempt + 1}/${MAX_RETRIES} for ${peerId.slice(-8)}: ${msg}`);
-            await new Promise(r => setTimeout(r, (attempt + 1) * 1000));
-          } else {
-            // Terminal transport failure on the final attempt. If this
-            // peer transient-declined on an earlier attempt the
-            // `declines` map still holds that stale code — overwrite
-            // it with the actual terminal reason so the aggregated
-            // `storage_ack_insufficient` diagnostic reflects the last
-            // observed outcome (the codex review on PR #559 caught
-            // the original "stale decline shadows the real failure"
-            // path here).
-            if (declines.has(peerId)) {
-              declines.set(peerId, {
-                code: 'TRANSPORT_ERROR',
-                message: sanitizeDeclineField(msg, MAX_DECLINE_MESSAGE_CHARS),
-              });
+          transportAttempts += 1;
+          if (transportAttempts < MAX_RETRIES) {
+            if (roundIsOver()) {
+              log(
+                `[ACKCollector] Quorum already settled — abandoning transport retry ` +
+                `for ${peerId.slice(-8)}: ${msg}`,
+              );
+              return null;
             }
-            log(`[ACKCollector] Failed to get ACK from ${peerId.slice(-8)} after ${MAX_RETRIES} attempts: ${msg}`);
+            log(`[ACKCollector] Retry ${transportAttempts}/${MAX_RETRIES} for ${peerId.slice(-8)}: ${msg}`);
+            await sleep(transportAttempts * 1000);
+            // #896 review: re-check after the backoff too — quorum may have
+            // settled while we waited, so don't re-dial a decided round.
+            if (roundIsOver()) {
+              log(
+                `[ACKCollector] Quorum settled during backoff — abandoning ` +
+                `transport retry for ${peerId.slice(-8)}: ${msg}`,
+              );
+              return null;
+            }
+            continue;
           }
+          // Terminal transport failure on the final attempt. If this
+          // peer transient-declined on an earlier attempt the
+          // `declines` map still holds that stale code — overwrite
+          // it with the actual terminal reason so the aggregated
+          // `storage_ack_insufficient` diagnostic reflects the last
+          // observed outcome (the codex review on PR #559 caught
+          // the original "stale decline shadows the real failure"
+          // path here).
+          if (declines.has(peerId)) {
+            declines.set(peerId, {
+              code: 'TRANSPORT_ERROR',
+              message: sanitizeDeclineField(msg, MAX_DECLINE_MESSAGE_CHARS),
+            });
+          }
+          log(`[ACKCollector] Failed to get ACK from ${peerId.slice(-8)} after ${MAX_RETRIES} attempts: ${msg}`);
+          return null;
         }
       }
-      return null;
     };
 
     let quorumResolve: (() => void) | undefined;
@@ -322,49 +629,76 @@ export class ACKCollector {
       if (collected.length >= REQUIRED_ACKS) return;
       const stillPending = corePeers.length - peersSettled;
       if (collected.length + stillPending < REQUIRED_ACKS) {
-        impossibleReject?.(new Error(
-          `storage_ack_insufficient: got ${collected.length}/${REQUIRED_ACKS} valid ACKs after ` +
-          `${peersSettled}/${corePeers.length} core peer(s) settled — quorum no longer reachable.${formatDeclineDetail()}`,
-        ));
+        impossibleReject?.(new QuorumUnmetError({
+          collected: collected.length,
+          required: REQUIRED_ACKS,
+          dialled: corePeers.length,
+          peerOutcomes: snapshotPeerOutcomes(),
+          legacyMessage:
+            `storage_ack_insufficient: got ${collected.length}/${REQUIRED_ACKS} valid ACKs after ` +
+            `${peersSettled}/${corePeers.length} core peer(s) settled — quorum no longer reachable.${formatDeclineDetail()}`,
+        }));
       }
     };
 
-    await Promise.race([
-      (async () => {
-        const promises = corePeers.map(async (peerId) => {
-          if (collected.length >= REQUIRED_ACKS) {
-            settlePeer();
-            return;
-          }
-          try {
-            const ack = await requestACK(peerId);
-            if (ack && !seenPeers.has(ack.peerId) && !seenIdentityIds.has(ack.nodeIdentityId)) {
-              seenPeers.add(ack.peerId);
-              seenIdentityIds.add(ack.nodeIdentityId);
-              collected.push(ack);
-              if (collected.length >= REQUIRED_ACKS) {
-                quorumResolve?.();
-              }
+    try {
+      await Promise.race([
+        (async () => {
+          const promises = corePeers.map(async (peerId) => {
+            if (collected.length >= REQUIRED_ACKS) {
+              settlePeer();
+              return;
             }
-          } finally {
-            settlePeer();
-          }
-        });
-        await Promise.race([Promise.allSettled(promises), quorumPromise]);
-      })(),
-      impossiblePromise,
-      new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error(`storage_ack_timeout: only ${collected.length}/${REQUIRED_ACKS} ACKs received within ${ACK_TIMEOUT_MS}ms.${formatDeclineDetail()}`)),
-          ACK_TIMEOUT_MS,
+            try {
+              const ack = await requestACK(peerId);
+              if (ack && !seenPeers.has(ack.peerId) && !seenIdentityIds.has(ack.nodeIdentityId)) {
+                seenPeers.add(ack.peerId);
+                seenIdentityIds.add(ack.nodeIdentityId);
+                collected.push(ack);
+                if (collected.length >= REQUIRED_ACKS) {
+                  // Eagerly mark the round settled so any peers still mid-
+                  // backoff bail before their next dial (see `roundIsOver`).
+                  roundSettled = true;
+                  quorumResolve?.();
+                }
+              }
+            } finally {
+              settlePeer();
+            }
+          });
+          await Promise.race([Promise.allSettled(promises), quorumPromise]);
+        })(),
+        impossiblePromise,
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new QuorumUnmetError({
+            collected: collected.length,
+            required: REQUIRED_ACKS,
+            dialled: corePeers.length,
+            peerOutcomes: snapshotPeerOutcomes(),
+            legacyMessage:
+              `storage_ack_timeout: only ${collected.length}/${REQUIRED_ACKS} ACKs received within ${ACK_TIMEOUT_MS}ms.${formatDeclineDetail()}`,
+          })),
+            ACK_TIMEOUT_MS,
+          ),
         ),
-      ),
-    ]);
+      ]);
+    } finally {
+      // The round is decided (quorum, timeout, or impossible-quorum). Signal
+      // any `requestACK` loops still sleeping between retries to abandon on
+      // wake rather than keep dialing after the caller has its answer.
+      roundSettled = true;
+    }
 
     if (collected.length < REQUIRED_ACKS) {
-      throw new Error(
-        `storage_ack_insufficient: got ${collected.length}/${REQUIRED_ACKS} valid ACKs. ` +
-        `Tried ${corePeers.length} core peers.${formatDeclineDetail()}`,
-      );
+      throw new QuorumUnmetError({
+        collected: collected.length,
+        required: REQUIRED_ACKS,
+        dialled: corePeers.length,
+        peerOutcomes: snapshotPeerOutcomes(),
+        legacyMessage:
+          `storage_ack_insufficient: got ${collected.length}/${REQUIRED_ACKS} valid ACKs. ` +
+          `Tried ${corePeers.length} core peers.${formatDeclineDetail()}`,
+      });
     }
 
     log(`[ACKCollector] Collected ${collected.length} ACKs successfully`);

@@ -340,6 +340,59 @@ describe('Hermes profile setup helpers', () => {
     expect(readFileSync(join(hermesHome, 'plugins', 'dkg', '.dkg-adapter-hermes-owner.json'), 'utf-8')).toContain('@origintrail-official/dkg-adapter-hermes');
   });
 
+  it('provisions API_SERVER_KEY and API_SERVER_ENABLED in .env for the loopback hermes-openai transport', () => {
+    const hermesHome = mkdtempSync(join(tmpdir(), 'hermes-profile-'));
+    const result = setupHermesProfile({ hermesHome });
+    const envPath = join(hermesHome, '.env');
+
+    expect(existsSync(envPath)).toBe(true);
+    const env = readFileSync(envPath, 'utf-8');
+    const keyMatch = env.match(/^API_SERVER_KEY=(.+)$/m);
+    expect(keyMatch?.[1] && keyMatch[1].length).toBeGreaterThan(0);
+    expect(env).toMatch(/^API_SERVER_ENABLED=true$/m);
+    expect(result.state.apiServerKeyConfigured).toBe(true);
+
+    // Re-run is idempotent: the generated key is never regenerated/overwritten.
+    const generatedKey = keyMatch![1];
+    setupHermesProfile({ hermesHome });
+    expect(readFileSync(envPath, 'utf-8')).toContain(`API_SERVER_KEY=${generatedKey}`);
+  });
+
+  it('preserves an existing user API_SERVER_KEY (incl. inline comments) and unrelated .env lines', () => {
+    const hermesHome = mkdtempSync(join(tmpdir(), 'hermes-profile-'));
+    // Inline comments must be parsed (dotenv) so the existing key is detected
+    // (not overwritten) and an already-true API_SERVER_ENABLED is not duplicated.
+    writeFileSync(
+      join(hermesHome, '.env'),
+      'FOO=bar\nAPI_SERVER_ENABLED=true # on\nAPI_SERVER_KEY=user-secret # mine\n',
+    );
+
+    setupHermesProfile({ hermesHome });
+
+    const env = readFileSync(join(hermesHome, '.env'), 'utf-8');
+    expect(env).toContain('API_SERVER_KEY=user-secret # mine');
+    expect(env).toContain('FOO=bar');
+    expect((env.match(/^API_SERVER_ENABLED=/gm) ?? []).length).toBe(1);
+  });
+
+  it('does not write .env in dry-run but reports the provisioning action', () => {
+    const hermesHome = mkdtempSync(join(tmpdir(), 'hermes-profile-'));
+    const plan = planHermesSetup({ hermesHome, dryRun: true });
+
+    expect(existsSync(join(hermesHome, '.env'))).toBe(false);
+    const envAction = plan.actions.find((action) => action.path.endsWith('.env'));
+    // Fresh profile → the dry-run preview must say `create`, not `update`, so it
+    // is clear a brand-new secret file is about to be written.
+    expect(envAction?.type).toBe('create');
+  });
+
+  it('does not provision .env for a remote (non-loopback) gateway transport', () => {
+    const hermesHome = mkdtempSync(join(tmpdir(), 'hermes-profile-'));
+    setupHermesProfile({ hermesHome, gatewayUrl: 'https://hermes.example.com:8642' });
+
+    expect(existsSync(join(hermesHome, '.env'))).toBe(false);
+  });
+
   it('loads the installed provider from Hermes user plugin discovery path', () => {
     const hermesHome = mkdtempSync(join(tmpdir(), 'hermes-profile-'));
     setupHermesProfile({
@@ -610,6 +663,17 @@ assert config["allow_context_graph_admin_tools"] is False, config
     // throw path.
     expect(() => setupHermesProfile({ hermesHome, memoryMode: 'provider', preserveProvider: true }))
       .toThrow('memory.provider: mem0');
+  });
+
+  it('does not provision .env when setup aborts (no side effect on failure)', () => {
+    const hermesHome = mkdtempSync(join(tmpdir(), 'hermes-profile-'));
+    writeFileSync(join(hermesHome, 'config.yaml'), 'memory: # existing provider\n  provider: mem0\n');
+
+    // preserveProvider throws on the existing non-DKG provider BEFORE the
+    // (now last) .env provisioning step, so no API_SERVER_KEY is written.
+    expect(() => setupHermesProfile({ hermesHome, memoryMode: 'provider', preserveProvider: true }))
+      .toThrow('memory.provider: mem0');
+    expect(existsSync(join(hermesHome, '.env'))).toBe(false);
   });
 
   it('ignores nested memory provider blocks when managing Hermes provider config', () => {
@@ -2339,6 +2403,10 @@ client.invite_to_context_graph("cg:test", "peer")
 client.add_participant("cg:test", "agent")
 client.list_join_requests("cg:test")
 client.publish("cg:test", selection=["urn:root"], clear_after=False, sub_graph_name="sub")
+client.query("ASK {}", "did:dkg:context-graph:cg:test", view="shared-working-memory")
+client.share("did:dkg:context-graph:cg:test", [{"subject": "urn:s", "predicate": "urn:p", "object": '"o"'}])
+client.list_sub_graphs("did:dkg:context-graph:0xabc/tuesday-cg")
+client.register_context_graph("did:dkg:context-graph:ui-refresh")
 
 _VALID_ADDR_A = "0x" + "a" * 40
 _VALID_ADDR_B = "0x" + "B" * 40
@@ -2361,6 +2429,10 @@ assert calls == [
     ("POST", "/api/context-graph/cg%3Atest/add-participant", {"agentAddress": "agent"}),
     ("GET", "/api/context-graph/cg%3Atest/join-requests", {}),
     ("POST", "/api/shared-memory/publish", {"contextGraphId": "cg:test", "selection": ["urn:root"], "clearAfter": False, "subGraphName": "sub"}),
+    ("POST", "/api/query", {"sparql": "ASK {}", "contextGraphId": "cg:test", "view": "shared-working-memory"}),
+    ("POST", "/api/shared-memory/write", {"contextGraphId": "cg:test", "quads": [{"subject": "urn:s", "predicate": "urn:p", "object": '"o"'}]}),
+    ("GET", "/api/sub-graph/list?contextGraphId=0xabc%2Ftuesday-cg", {}),
+    ("POST", "/api/context-graph/register", {"id": "ui-refresh"}),
 ], calls
 
 client_identity = client_module.DKGClient("http://127.0.0.1:9200")
@@ -2525,6 +2597,53 @@ provider_existing.initialize("session-1")
 assert provider_existing._assertion_id == "memory", provider_existing._assertion_id
 assert created_assertions == [("cg:test", "memory")], created_assertions
 
+agent_context_calls = []
+
+class MissingAgentContextClient:
+    def __init__(self, base_url, **kwargs):
+        self.base_url = base_url
+        self.create_attempts = 0
+
+    def health_check(self):
+        return True
+
+    def create_assertion(self, context_graph_id, name):
+        self.create_attempts += 1
+        agent_context_calls.append(("create_assertion", context_graph_id, name))
+        if self.create_attempts == 1:
+            return {
+                "success": False,
+                "code": "CONTEXT_GRAPH_NOT_FOUND",
+                "error": 'Unknown contextGraphId "agent-context"',
+            }
+        return {"success": True, "alreadyExists": True}
+
+    def create_context_graph(self, name, description="", cg_id=None, **kwargs):
+        agent_context_calls.append(("create_context_graph", name, description, cg_id, kwargs))
+        return {"created": cg_id}
+
+provider_agent_context = module.DKGMemoryProvider()
+module._load_config = lambda: {
+    "daemon_url": "http://127.0.0.1:9200",
+    "context_graph": "agent-context",
+    "agent_name": "HermesAgent",
+}
+client_module.DKGClient = MissingAgentContextClient
+provider_agent_context._backlog_import_if_needed = lambda hermes_home: None
+provider_agent_context.initialize("session-2")
+assert provider_agent_context._assertion_id == "memory", provider_agent_context._assertion_id
+assert agent_context_calls == [
+    ("create_assertion", "agent-context", "memory"),
+    (
+        "create_context_graph",
+        "Agent Context",
+        "Chat-turn working memory for local agent integrations.",
+        "agent-context",
+        {"access_policy": 1},
+    ),
+    ("create_assertion", "agent-context", "memory"),
+], agent_context_calls
+
 class QueryClient:
     def __init__(self):
         self.queries = []
@@ -2539,6 +2658,26 @@ class QueryClient:
 provider = module.DKGMemoryProvider()
 provider._offline = False
 provider._context_graph = "default-cg"
+class ListContextGraphsClient:
+    def __init__(self):
+        self.rows = [
+            {"id": "mine", "callerInvolved": True},
+            {"id": "public-noise", "callerInvolved": False},
+        ]
+
+    def list_context_graphs(self):
+        return {"contextGraphs": self.rows}
+
+provider._client = ListContextGraphsClient()
+mine = json.loads(provider.handle_tool_call("dkg_list_context_graphs", {}))
+all_graphs = json.loads(provider.handle_tool_call("dkg_list_context_graphs", {"scope": "all"}))
+bad_scope = json.loads(provider.handle_tool_call("dkg_list_context_graphs", {"scope": "other"}))
+assert [row["id"] for row in mine["contextGraphs"]] == ["mine"], mine
+assert mine["scope"] == "mine", mine
+assert [row["id"] for row in all_graphs["contextGraphs"]] == ["mine", "public-noise"], all_graphs
+assert all_graphs["scope"] == "all", all_graphs
+assert "scope" in bad_scope["error"], bad_scope
+
 provider._client = QueryClient()
 
 for args, needle in [

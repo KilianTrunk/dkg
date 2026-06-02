@@ -2,6 +2,14 @@
 
 This document describes how to cut a new release of the DKG V9 node so that users can install and track specific versions.
 
+## Upgrading from a prior release
+
+Each rc/stable ships a focused upgrade guide for builders that captures breaking changes, mechanical TS/Solidity rename tables, and an agent-prompt template:
+
+- **rc.11 → rc.12** — see [`docs/UPGRADE_RC11_TO_RC12.md`](./UPGRADE_RC11_TO_RC12.md).
+
+The full per-PR detail lives in [`CHANGELOG.md`](../CHANGELOG.md). The upgrade guides are the recommended starting point for builders pointing an AI agent at their codebase.
+
 ## Versioning
 
 - **Single version**: The repo uses one version for the node as a product. It is set in:
@@ -17,7 +25,7 @@ This document describes how to cut a new release of the DKG V9 node so that user
 1. **From GitHub Releases**  
    Go to [Releases](https://github.com/OriginTrail/dkg-v9/releases), pick a version (e.g. v9.0.0), download "Source code (zip)" or "Source code (tar.gz)".
 
-2. **From git**  
+2. **From git** *(recommended only for development; production cores should use npm-pinned auto-updates — see [operator/MIGRATE_TO_NPM.md](operator/MIGRATE_TO_NPM.md) to convert an existing git checkout)*  
    ```bash
    git clone --depth 1 --branch v9.0.0 https://github.com/OriginTrail/dkg-v9.git
    cd dkg-v9

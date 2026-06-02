@@ -16,9 +16,13 @@ import {
   readPid,
   readApiPort,
   ensureDkgDir,
+  configExists,
+  readNodeRoleFromConfigSync,
   isDkgMonorepo,
   dkgDir,
   repoDir,
+  resolveAutoUpdateSource,
+  resolveApprovalPolicy,
   resolveChainConfig,
 } from '../src/config.js';
 
@@ -220,6 +224,46 @@ describe('localAgentIntegrations config round-trip', () => {
     expect(loaded.localAgentIntegrations?.openclaw?.runtime?.status).toBe('ready');
   });
 
+  it('surfaces malformed config.json instead of falling back to stale YAML', async () => {
+    await writeFile(join(tempDir, 'config.json'), '{ not valid json', 'utf8');
+    await writeFile(join(tempDir, 'config.yaml'), 'name: stale-yaml\napiPort: 9317\n', 'utf8');
+
+    await expect(loadConfig()).rejects.toThrow(SyntaxError);
+  });
+
+  it('surfaces malformed config.yaml instead of falling back to defaults', async () => {
+    await writeFile(join(tempDir, 'config.yaml'), 'name: [unterminated\napiPort: 9317\n', 'utf8');
+
+    let thrown: unknown;
+    try {
+      await loadConfig();
+    } catch (err) {
+      thrown = err;
+    }
+
+    expect(thrown).toBeInstanceOf(Error);
+    expect((thrown as Error).name).toBe('YAMLException');
+  });
+
+  it('treats yaml-only homes as initialized configs', async () => {
+    await writeFile(join(tempDir, 'config.yaml'), 'name: yaml-only\napiPort: 9317\n', 'utf8');
+
+    expect(configExists()).toBe(true);
+  });
+
+  it('reads nodeRole from yaml-only config for sync daemon entrypoint routing', async () => {
+    await writeFile(join(tempDir, 'config.yaml'), 'name: yaml-core\nnodeRole: core\n', 'utf8');
+
+    expect(readNodeRoleFromConfigSync()).toBe('core');
+  });
+
+  it('keeps config.json precedence for sync nodeRole reads', async () => {
+    await writeFile(join(tempDir, 'config.json'), JSON.stringify({ nodeRole: 'edge' }), 'utf8');
+    await writeFile(join(tempDir, 'config.yaml'), 'nodeRole: core\n', 'utf8');
+
+    expect(readNodeRoleFromConfigSync()).toBe('edge');
+  });
+
   it('round-trips relayServerCapacity through saveConfig/loadConfig (operator override)', async () => {
     // PR #524 review (branarakic): the README documents
     // `relayServerCapacity` as a `config.json` knob, so the CLI
@@ -284,12 +328,72 @@ describe('localAgentIntegrations config round-trip', () => {
     expect(loaded.nodeRole).toBe('core');
     expect(loaded.relayServerCapacity).toBeUndefined();
   });
+
+  it('round-trips the network.* libp2p tunables through saveConfig/loadConfig', async () => {
+    // PR feat/chain-network-libp2p-tunables: the small-network knobs
+    // are documented as `config.json` keys, so the CLI schema must
+    // persist + restore them. This guards against regressions where
+    // any field gets dropped from the DkgConfig type or stripped on
+    // serialization.
+    await saveConfig({
+      name: 'test-node',
+      apiPort: 9200,
+      listenPort: 0,
+      nodeRole: 'edge',
+      network: {
+        peerStoreMaxAddressAgeMs: 24 * 3_600_000,
+        peerStoreMaxPeerAgeMs: 7 * 24 * 3_600_000,
+        dhtQuerySelfIntervalMs: 60_000,
+      },
+    });
+
+    const loaded = await loadConfig();
+    expect(loaded.network?.peerStoreMaxAddressAgeMs).toBe(24 * 3_600_000);
+    expect(loaded.network?.peerStoreMaxPeerAgeMs).toBe(7 * 24 * 3_600_000);
+    expect(loaded.network?.dhtQuerySelfIntervalMs).toBe(60_000);
+  });
+
+  it('omits the network block entirely when not set (upstream libp2p defaults apply)', async () => {
+    await saveConfig({
+      name: 'test-node',
+      apiPort: 9200,
+      listenPort: 0,
+      nodeRole: 'edge',
+    });
+
+    const loaded = await loadConfig();
+    expect(loaded.network).toBeUndefined();
+  });
+});
+
+describe('resolveAutoUpdateSource', () => {
+  it('resolves local source independently of auto-update enabled state', () => {
+    expect(resolveAutoUpdateSource(
+      { autoUpdate: { enabled: false, source: 'npm' } },
+      { autoUpdate: { enabled: true, source: 'git' } as any },
+    )).toBe('npm');
+  });
+
+  it('falls back to the network source when local config disables polling without a source override', () => {
+    expect(resolveAutoUpdateSource(
+      { autoUpdate: { enabled: false } },
+      { autoUpdate: { enabled: false, source: 'npm' } as any },
+    )).toBe('npm');
+  });
+
+  it('returns undefined when neither source supplies an install-mode override', () => {
+    expect(resolveAutoUpdateSource(
+      { autoUpdate: { enabled: false } },
+      { autoUpdate: { enabled: false } as any },
+    )).toBeUndefined();
+  });
 });
 
 describe('resolveChainConfig (field-level merge)', () => {
   const fullNetworkChain = {
     type: 'evm' as const,
     rpcUrl: 'https://network.example/rpc',
+    rpcUrls: ['https://network-backup-1.example/rpc', 'https://network-backup-2.example/rpc'],
     hubAddress: '0xNETWORKHUB000000000000000000000000000000',
     chainId: 'base:84532',
   };
@@ -305,6 +409,7 @@ describe('resolveChainConfig (field-level merge)', () => {
     expect(merged).toEqual({
       type: 'evm',
       rpcUrl: fullNetworkChain.rpcUrl,
+      rpcUrls: fullNetworkChain.rpcUrls,
       hubAddress: fullNetworkChain.hubAddress,
       chainId: fullNetworkChain.chainId,
     });
@@ -317,6 +422,7 @@ describe('resolveChainConfig (field-level merge)', () => {
       { chain: fullNetworkChain },
     );
     expect(merged?.rpcUrl).toBe('https://my-private-rpc.example/abc');
+    expect(merged?.rpcUrls).toEqual(fullNetworkChain.rpcUrls);
     expect(merged?.hubAddress).toBe(fullNetworkChain.hubAddress);
     expect(merged?.chainId).toBe(fullNetworkChain.chainId);
     expect(merged?.type).toBe('evm');
@@ -329,7 +435,65 @@ describe('resolveChainConfig (field-level merge)', () => {
     );
     expect(merged?.hubAddress).toBe('0xOPERATORHUB0000000000000000000000000000');
     expect(merged?.rpcUrl).toBe(fullNetworkChain.rpcUrl);
+    expect(merged?.rpcUrls).toEqual(fullNetworkChain.rpcUrls);
     expect(merged?.chainId).toBe(fullNetworkChain.chainId);
+  });
+
+  it('dedupes primary + backups while preserving operator priority', () => {
+    const merged = resolveChainConfig(
+      {
+        chain: {
+          rpcUrl: 'https://operator.example/rpc',
+          rpcUrls: [
+            'https://operator.example/rpc',
+            ' https://backup-a.example/rpc ',
+            'https://backup-b.example/rpc',
+            'https://backup-a.example/rpc',
+          ],
+        },
+      },
+      { chain: fullNetworkChain },
+    );
+    expect(merged?.rpcUrl).toBe('https://operator.example/rpc');
+    expect(merged?.rpcUrls).toEqual([
+      'https://backup-a.example/rpc',
+      'https://backup-b.example/rpc',
+    ]);
+  });
+
+  it('uses operator backup list instead of network backups when set', () => {
+    const merged = resolveChainConfig(
+      { chain: { rpcUrls: ['https://operator-backup.example/rpc'] } },
+      { chain: fullNetworkChain },
+    );
+    expect(merged?.rpcUrl).toBe(fullNetworkChain.rpcUrl);
+    expect(merged?.rpcUrls).toEqual(['https://operator-backup.example/rpc']);
+  });
+
+  it('preserves an explicit empty operator backup list instead of inheriting network backups', () => {
+    const merged = resolveChainConfig(
+      { chain: { rpcUrls: [] } },
+      { chain: fullNetworkChain },
+    );
+    expect(merged?.rpcUrl).toBe(fullNetworkChain.rpcUrl);
+    expect(merged?.rpcUrls).toEqual([]);
+  });
+
+  it('strips rpcUrls under mock mode along with rpcUrl', () => {
+    const merged = resolveChainConfig(
+      {
+        chain: {
+          type: 'mock',
+          rpcUrl: 'https://stale-rpc.example',
+          rpcUrls: ['https://stale-backup.example'],
+          hubAddress: '0xDEADBEEF00000000000000000000000000000000',
+        },
+      },
+      { chain: fullNetworkChain },
+    );
+    expect(merged?.type).toBe('mock');
+    expect(merged?.rpcUrl).toBeUndefined();
+    expect(merged?.rpcUrls).toBeUndefined();
   });
 
   it('merges tokenAddress with operator override precedence', () => {
@@ -353,6 +517,7 @@ describe('resolveChainConfig (field-level merge)', () => {
       null,
     );
     expect(merged?.rpcUrl).toBe('https://standalone.example/rpc');
+    expect(merged?.rpcUrls).toBeUndefined();
     expect(merged?.hubAddress).toBeUndefined();
     expect(merged?.chainId).toBeUndefined();
     // Callers (lifecycle, publisher-runner) MUST guard for the missing
@@ -373,6 +538,7 @@ describe('resolveChainConfig (field-level merge)', () => {
     expect(merged?.type).toBe('mock');
     expect(merged?.mockIdentityId).toBe('42');
     expect(merged?.rpcUrl).toBeUndefined();
+    expect(merged?.rpcUrls).toBeUndefined();
     expect(merged?.hubAddress).toBeUndefined();
     expect(merged?.chainId).toBeUndefined();
   });
@@ -425,6 +591,7 @@ describe('resolveChainConfig (field-level merge)', () => {
       mockIdentityId: '9',
     });
     expect(merged?.rpcUrl).toBeUndefined();
+    expect(merged?.rpcUrls).toBeUndefined();
     expect(merged?.hubAddress).toBeUndefined();
   });
 
@@ -435,5 +602,91 @@ describe('resolveChainConfig (field-level merge)', () => {
     );
     expect(merged).toBeDefined();
     expect(Object.keys(merged ?? {})).toEqual(['type', 'rpcUrl']);
+  });
+});
+
+describe('resolveApprovalPolicy (YAML/JSON config → runtime ApprovalPolicy)', () => {
+  // The chain adapter's runtime API takes a bigint for targetAllowance;
+  // YAML / JSON can't carry bigints natively, so the operator-facing config
+  // accepts a decimal string. This converter pins down the contract.
+
+  it('returns undefined when the operator omitted the field (chain adapter uses its built-in default)', () => {
+    expect(resolveApprovalPolicy(undefined)).toBeUndefined();
+  });
+
+  it('passes through per-publish with no extra fields', () => {
+    expect(resolveApprovalPolicy({ mode: 'per-publish' })).toEqual({
+      mode: 'per-publish',
+      targetAllowance: undefined,
+      refillBelowFraction: undefined,
+    });
+  });
+
+  it('defaults mode to per-publish if omitted (operator could supply only fraction overrides for replenishing post-hoc)', () => {
+    expect(resolveApprovalPolicy({})).toEqual({
+      mode: 'per-publish',
+      targetAllowance: undefined,
+      refillBelowFraction: undefined,
+    });
+  });
+
+  it('converts targetAllowance string → bigint for replenishing', () => {
+    const out = resolveApprovalPolicy({
+      mode: 'replenishing',
+      targetAllowance: '1000000000000000000000', // 1000 TRAC
+      refillBelowFraction: 0.2,
+    });
+    expect(out).toEqual({
+      mode: 'replenishing',
+      targetAllowance: 10n ** 21n,
+      refillBelowFraction: 0.2,
+    });
+  });
+
+  it('accepts unlimited', () => {
+    expect(resolveApprovalPolicy({ mode: 'unlimited' })).toEqual({
+      mode: 'unlimited',
+      targetAllowance: undefined,
+      refillBelowFraction: undefined,
+    });
+  });
+
+  it('throws on unknown mode', () => {
+    expect(() => resolveApprovalPolicy({ mode: 'free-for-all' as any })).toThrow(
+      /must be one of 'per-publish' \| 'replenishing' \| 'unlimited'/,
+    );
+  });
+
+  it('throws on unparseable targetAllowance', () => {
+    expect(() =>
+      resolveApprovalPolicy({
+        mode: 'replenishing',
+        targetAllowance: 'one thousand TRAC',
+      }),
+    ).toThrow(/must be a decimal wei-TRAC bigint string/);
+  });
+
+  it('throws on negative targetAllowance', () => {
+    expect(() =>
+      resolveApprovalPolicy({
+        mode: 'replenishing',
+        targetAllowance: '-1',
+      }),
+    ).toThrow(/must be non-negative/);
+  });
+
+  it('throws on out-of-range refillBelowFraction', () => {
+    expect(() =>
+      resolveApprovalPolicy({ mode: 'replenishing', refillBelowFraction: 1.5 }),
+    ).toThrow(/must be a finite number in \[0, 1\]/);
+    expect(() =>
+      resolveApprovalPolicy({ mode: 'replenishing', refillBelowFraction: -0.1 }),
+    ).toThrow(/must be a finite number in \[0, 1\]/);
+    expect(() =>
+      resolveApprovalPolicy({
+        mode: 'replenishing',
+        refillBelowFraction: Number.NaN,
+      }),
+    ).toThrow(/must be a finite number in \[0, 1\]/);
   });
 });

@@ -1,4 +1,5 @@
 import { V10MerkleTree } from './v10-merkle.js';
+import { buildCiphertextChunksRoot } from './v10-ciphertext-merkle.js';
 
 /**
  * Bytes the off-chain Random Sampling prover must submit to
@@ -19,8 +20,8 @@ export interface V10ProofMaterial {
 
 /**
  * Expected on-chain merkle commitment, read from
- * `KnowledgeCollectionStorage.getLatestMerkleRoot(kcId)` +
- * `getMerkleLeafCount(kcId)` before building the proof.
+ * `KnowledgeCollectionStorage.getLatestMerkleRoot(kaId)` +
+ * `getMerkleLeafCount(kaId)` before building the proof.
  */
 export interface V10MerkleCommitment {
   merkleRoot: Uint8Array;
@@ -74,7 +75,7 @@ export class V10ProofLeafCountMismatchError extends Error {
  * leaf-count invariants both hold (the chain enforces
  * `chunkId = kcSeed % merkleLeafCount` in `_generateChallenge`); if it
  * fires, it indicates the caller hand-rolled a chunkId or the
- * commitment came from the wrong kcId.
+ * commitment came from the wrong kaId.
  */
 export class V10ProofChunkOutOfRangeError extends RangeError {
   readonly name = 'V10ProofChunkOutOfRangeError';
@@ -144,6 +145,58 @@ export function verifyV10ProofMaterial(
   if (material.leafCount !== expected.merkleLeafCount) return false;
   if (!bytesEqual(material.merkleRoot, expected.merkleRoot)) return false;
   return V10MerkleTree.verify(expected.merkleRoot, material.leaf, material.proof, chunkId);
+}
+
+/**
+ * OT-RFC-39 — curated counterpart of {@link buildV10ProofMaterial}.
+ *
+ * Builds the `submitProof` argument tuple from raw ciphertext chunks
+ * (in chunkId order, NOT sorted/deduped). The `V10CiphertextChunksMerkleTree`
+ * hash algorithm is identical to {@link V10MerkleTree} so the on-chain
+ * `_verifyV10MerkleProof` accepts the resulting proof verbatim; the
+ * only difference is leaf preparation:
+ *   - public:  sort + dedupe + use leaf-as-given (publisher already hashed)
+ *   - curated: keep order + keep duplicates + hash chunk bytes
+ *
+ * Same fail-fast contract as the public path:
+ *   1. recompute `tree.leafCount`; assert it equals `expected.merkleLeafCount`,
+ *   2. recompute `tree.root`; assert it equals `expected.merkleRoot`,
+ *   3. assert `chunkId < tree.leafCount`,
+ *   4. emit `(leaf, proof, root, leafCount)`.
+ *
+ * `expected.merkleRoot` here is the on-chain
+ * `KnowledgeCollectionStorage.getLatestCiphertextChunksRoot(kaId)`;
+ * `expected.merkleLeafCount` is `getCiphertextChunkCount(kaId)`.
+ *
+ * Pure: depends only on `V10CiphertextChunksMerkleTree`. No `Quad`/storage
+ * dependency lives in `dkg-core` — the boundary is owned by the
+ * `packages/random-sampling` ciphertext-chunk extractor.
+ */
+export function buildV10CiphertextChunksProofMaterial(
+  ciphertextChunks: Uint8Array[],
+  chunkId: number,
+  expected: V10MerkleCommitment,
+): V10ProofMaterial {
+  const { root, leafCount, tree } = buildCiphertextChunksRoot(ciphertextChunks);
+
+  if (leafCount !== expected.merkleLeafCount) {
+    throw new V10ProofLeafCountMismatchError(leafCount, expected.merkleLeafCount);
+  }
+
+  if (!bytesEqual(root, expected.merkleRoot)) {
+    throw new V10ProofRootMismatchError(root, expected.merkleRoot);
+  }
+
+  if (chunkId < 0 || chunkId >= leafCount) {
+    throw new V10ProofChunkOutOfRangeError(chunkId, leafCount);
+  }
+
+  return {
+    leaf: tree.leafAt(chunkId),
+    proof: tree.proof(chunkId),
+    merkleRoot: root,
+    leafCount,
+  };
 }
 
 function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {

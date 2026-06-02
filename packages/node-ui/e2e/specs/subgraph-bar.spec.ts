@@ -72,21 +72,24 @@ test.describe('SubGraph bar', () => {
   });
 
   test('Root chip appears when root-scope entities exist', async ({ subgraphBar }) => {
-    // The SubGraph bar re-renders live as node events propagate, so reading
-    // `hasRootChip()` and then `getChipLabels()` as two separate steps can race:
-    // a frame where the root chip is present but the label snapshot misses it
-    // flaked ~1/full-run under load. Poll a single combined predicate so a
-    // transient re-render can't fail the assertion — a visible root chip MUST
-    // carry a "root" label; if there is no root chip the case is vacuous.
+    // First wait for the bar's initial async paint to SETTLE (at least the "All"
+    // chip rendered). Without this, a transient empty frame would make the
+    // `hasRootChip()===false` branch below pass vacuously before the root chip
+    // ever paints (Codex) — the assertion must run against the settled bar.
     await expect
-      .poll(
-        async () => {
-          if (!(await subgraphBar.hasRootChip())) return true;
-          return (await subgraphBar.getChipLabels()).some((l) => l.toLowerCase() === 'root');
-        },
-        { timeout: 10_000 },
-      )
-      .toBe(true);
+      .poll(async () => (await subgraphBar.getChipLabels()).length, { timeout: 15_000 })
+      .toBeGreaterThan(0);
+
+    // Root-scope entities are optional in the seed, so a settled bar with no root
+    // chip is a valid (vacuous) outcome. But if a root chip IS present it MUST
+    // carry a "root" label; poll the labels so the live bar re-rendering between
+    // the presence check and the label read can't flake the assertion.
+    if (!(await subgraphBar.hasRootChip())) return;
+    await expect
+      .poll(async () => (await subgraphBar.getChipLabels()).map((l) => l.toLowerCase()), {
+        timeout: 10_000,
+      })
+      .toContain('root');
   });
 });
 

@@ -59,8 +59,12 @@ test.describe('KNOWN BUG: views stick on "Loading…" with no error state when a
     // affordance instead of pretending it is still loading forever. The brief
     // in-flight "Loading context graph…" frame is now too short to assert
     // reliably (the error resolves immediately), so we pin the end state.
+    // Match ONLY error copy here — NOT "retry"/"try again". The retry control is
+    // asserted separately below; folding it into this regex would let the error
+    // assertion pass on the button alone, so it would no longer prove an actual
+    // error message renders (Codex).
     const errorState = center.getByText(
-      /failed to load|couldn.?t load|error loading|unable to load|could not load|something went wrong|retry|try again/i,
+      /failed to load|couldn.?t load|error loading|unable to load|could not load|something went wrong/i,
     );
     await expect(
       errorState.first(),

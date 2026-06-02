@@ -40,6 +40,14 @@ describe('formatTrac (GH #915 — never render "NaN")', () => {
     expect(formatTrac(NaN)).toBe('—');
   });
 
+  it('rejects partially-numeric / non-decimal strings (strict trust boundary)', () => {
+    expect(formatTrac('12abc')).toBe('—');
+    expect(formatTrac('0x10')).toBe('—');
+    expect(formatTrac('1,234.5')).toBe('—');
+    expect(formatTrac('Infinity')).toBe('—');
+    expect(formatTrac('  ')).toBe('—');
+  });
+
   it('never returns the literal string "NaN"', () => {
     for (const v of [null, undefined, '', 'x', NaN, {}, []]) {
       expect(formatTrac(v as unknown)).not.toBe('NaN');

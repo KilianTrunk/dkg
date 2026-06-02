@@ -754,6 +754,19 @@ export function ProjectView({ contextGraphId }: ProjectViewProps) {
     <ProjectProfileContext.Provider value={profile}>
     <AgentsContext.Provider value={agentsContextValue}>
     <div className="v10-memory-explorer">
+      {/* GH #905: when a project is already open, `useFetch` keeps the
+          last-good `cgData`, so a failing 30s refresh leaves `cg` truthy and
+          the view would silently show stale data. Surface an inline,
+          non-blocking banner + retry while keeping the content visible
+          (Codex). Clears automatically once a refresh succeeds. */}
+      {cgError && (
+        <div className="v10-stale-banner" role="status">
+          <span>Couldn’t refresh context-graph data — showing last known values.</span>
+          <button type="button" className="v10-retry-btn" onClick={refreshContextGraphs}>
+            Retry
+          </button>
+        </div>
+      )}
       {/* Persistent project chrome — always visible so the user never
           loses "which project am I in" context when drilling into a
           sub-graph, a layer, or an entity detail. */}

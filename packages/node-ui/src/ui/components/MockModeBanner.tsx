@@ -17,9 +17,9 @@ export function MockModeBanner() {
   const [usingMocks, setUsingMocks] = useState<boolean>(isUsingMocks());
 
   useEffect(() => {
-    // Reconcile against any detection that completed before mount, then
-    // subscribe for the async flip when detection finishes after mount.
-    setUsingMocks(isUsingMocks());
+    // subscribeMockMode replays the current state synchronously on subscribe,
+    // so there is no race between an initial snapshot read and the listener
+    // being attached — a flip to mock mode can't slip through the gap (Codex).
     return subscribeMockMode(setUsingMocks);
   }, []);
 

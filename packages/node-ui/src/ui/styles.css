@@ -263,6 +263,21 @@ button:focus:not(:focus-visible) { outline: none; }
   background: rgba(251, 191, 36, 0.55);
 }
 
+/* ── Inline stale-refresh banner for an open project (GH #905) ── */
+.v10-stale-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 5px 12px;
+  font-size: 11px;
+  color: #7c2d12;
+  background: var(--amber-dim, rgba(251, 191, 36, 0.16));
+  border-bottom: 1px solid rgba(251, 191, 36, 0.4);
+}
+.v10-stale-banner .v10-retry-btn {
+  margin-left: auto;
+}
+
 /* ── Retry control for failed view fetches (GH #905) ── */
 .v10-retry-btn {
   font-size: 12px;

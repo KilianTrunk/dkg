@@ -16,9 +16,15 @@ export function isUsingMocks(): boolean {
   return useMocks === true;
 }
 
-/** Subscribe to mock-mode changes; returns an unsubscribe fn. */
+/**
+ * Subscribe to mock-mode changes; returns an unsubscribe fn. The listener is
+ * invoked immediately with the current state so a subscriber can't miss a
+ * detection that flipped `useMocks` to true between its snapshot read and this
+ * call (Codex) — there is no transition gap to lose.
+ */
 export function subscribeMockMode(listener: MockModeListener): () => void {
   mockModeListeners.add(listener);
+  listener(useMocks === true);
   return () => {
     mockModeListeners.delete(listener);
   };

@@ -38,8 +38,19 @@ export function formatTracSymbol(symbol: string | null | undefined, chainId: str
  * @param digits Fractional digits to display. Defaults to 2.
  */
 export function formatTrac(value: unknown, digits = 2): string {
-  if (value == null || value === '') return '—';
-  const n = typeof value === 'number' ? value : parseFloat(String(value));
+  if (value == null) return '—';
+  let n: number;
+  if (typeof value === 'number') {
+    n = value;
+  } else {
+    const s = String(value).trim();
+    // Strict decimal parse: `parseFloat` is too permissive at a trust
+    // boundary ("12abc" → 12, "0x10" → 0). Only a plain decimal number
+    // (optional sign, integer/fraction, optional exponent) is accepted;
+    // anything else falls back to the em-dash (Codex).
+    if (!/^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/.test(s)) return '—';
+    n = Number(s);
+  }
   if (!Number.isFinite(n)) return '—';
   return n.toFixed(digits);
 }

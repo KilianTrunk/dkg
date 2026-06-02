@@ -10905,6 +10905,7 @@ export class DKGAgent {
 
   private enqueueHostModePersistence(contextGraphId: string, subscribe: boolean): void {
     if (!this.swmHostModeStore) return;
+    const queueKey = this.canonicalSwmHostModeKey(contextGraphId);
     const store = this.swmHostModeStore;
     const op = subscribe ? 'mark' : 'unmark';
     const apply = async (): Promise<void> => {
@@ -10922,18 +10923,18 @@ export class DKGAgent {
         );
       }
     };
-    const prev = this.hostModePersistenceQueues.get(contextGraphId) ?? Promise.resolve();
+    const prev = this.hostModePersistenceQueues.get(queueKey) ?? Promise.resolve();
     const next = prev.then(apply, apply);
-    this.hostModePersistenceQueues.set(contextGraphId, next);
+    this.hostModePersistenceQueues.set(queueKey, next);
     void next.finally(() => {
-      if (this.hostModePersistenceQueues.get(contextGraphId) === next) {
-        this.hostModePersistenceQueues.delete(contextGraphId);
+      if (this.hostModePersistenceQueues.get(queueKey) === next) {
+        this.hostModePersistenceQueues.delete(queueKey);
       }
     });
   }
 
   private async awaitHostModePersistence(contextGraphId: string): Promise<void> {
-    const pending = this.hostModePersistenceQueues.get(contextGraphId);
+    const pending = this.hostModePersistenceQueues.get(this.canonicalSwmHostModeKey(contextGraphId));
     if (pending) await pending;
   }
 
@@ -11393,6 +11394,16 @@ export class DKGAgent {
       const msg = err instanceof Error ? err.message : String(err);
       this.log.debug(ctx, `Beacon publish for "${localCgId}" had no subscribers / failed: ${msg}`);
     }
+  }
+
+  private getBeaconCatchupSigner(contextGraphId: string): { privateKey: string } | null {
+    const wireId = this.gossipWireIdFor(contextGraphId);
+    for (const entry of this.beaconRegistry.values()) {
+      if (entry.signerPrivateKey && entry.wireId.toLowerCase() === wireId.toLowerCase()) {
+        return { privateKey: entry.signerPrivateKey };
+      }
+    }
+    return null;
   }
 
   /**
@@ -12337,7 +12348,8 @@ export class DKGAgent {
     // adapter except the EVM one. `mintSignedCatchupRequest` now
     // recovers the actual signer from the signature itself and
     // binds the digest to it — no caller-side lookup needed.
-    if (typeof this.chain.signMessage !== 'function') {
+    const beaconCatchupSigner = this.getBeaconCatchupSigner(contextGraphId);
+    if (!beaconCatchupSigner && typeof this.chain.signMessage !== 'function') {
       const reason = 'chain adapter does not implement signMessage — cannot mint signed catchup request';
       this.log.warn(ctx, `host-catchup ${reason} to=${remotePeerId} cg=${contextGraphId}`);
       return { rounds: 0, fetched: 0, applied: 0, appliedTriples: 0, skipped: 0, nextSeqno: sinceSeqno, denied: reason };
@@ -12362,6 +12374,9 @@ export class DKGAgent {
         // differ). See `MintSignedCatchupRequestInput.requesterEoa`
         // doc comment for the full rationale.
         sign: async (digest) => {
+          if (beaconCatchupSigner) {
+            return new ethers.Wallet(beaconCatchupSigner.privateKey).signMessage(digest);
+          }
           const { r, vs } = await this.chain.signMessage!(digest);
           const sig = ethers.Signature.from({ r: ethers.hexlify(r), yParityAndS: ethers.hexlify(vs) });
           return sig.serialized;

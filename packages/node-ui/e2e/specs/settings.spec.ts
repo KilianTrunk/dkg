@@ -1,6 +1,7 @@
 import { test, expect } from '../fixtures/base.js';
 import { sel } from '../helpers/selectors.js';
 import { EXPECTED_NODE_ROLE } from '../helpers/real-node.js';
+import { fetchApiInPage } from '../helpers/page-api.js';
 
 /**
  * Settings page (pages/Settings.tsx — rewritten in the rc.12 line). Driven
@@ -57,17 +58,12 @@ test.describe('Settings page (rc.12 rewrite)', () => {
   });
 
   test('Node Identity Name + Peer ID exactly match GET /api/status', async ({ settingsPage, page }) => {
-    const status = await page.evaluate(async () => {
-      // Retry a few times — under heavy parallel load the endpoint can briefly
-      // 5xx; the UI's own poll behaves the same way and recovers.
-      for (let i = 0; i < 5; i++) {
-        const r = await fetch('/api/status');
-        if (r.ok) return r.json();
-        await new Promise((res) => setTimeout(res, 500));
-      }
-      return null;
-    });
-    expect(status, '/api/status must return JSON').toBeTruthy();
+    // Authed in-page fetch (same bearer the UI uses) — a raw fetch would 401 on
+    // an auth-enabled node and falsely fail even though Settings rendered fine.
+    // Retries ride out transient 5xx under heavy parallel load, like the UI poll.
+    const res = await fetchApiInPage<{ name: string; peerId: string }>(page, '/api/status');
+    expect(res.ok, '/api/status must return JSON').toBeTruthy();
+    const status = res.json!;
     expect((await settingsPage.fieldValue('Name').first().textContent())?.trim()).toBe(status.name);
     expect((await settingsPage.fieldValue('Peer ID').first().textContent())?.trim()).toBe(status.peerId);
   });
@@ -148,17 +144,12 @@ test.describe('Settings page (rc.12 rewrite)', () => {
     await expect(settingsPage.root.getByText(/Click again to confirm/i)).toBeVisible();
 
     // Prove the daemon is still alive (the arming click had no side effect).
-    // Retry to ride out transient load-induced 5xx — the contract under test is
-    // "daemon still up", not "every single probe is instantly 200".
-    const status = await page.evaluate(async () => {
-      for (let i = 0; i < 5; i++) {
-        const s = (await fetch('/api/status')).status;
-        if (s === 200) return 200;
-        await new Promise((res) => setTimeout(res, 500));
-      }
-      return (await fetch('/api/status')).status;
-    });
-    expect(status).toBe(200);
+    // Authed in-page fetch (same bearer the UI uses) so an auth-enabled node
+    // doesn't 401 here; retries ride out transient load-induced 5xx — the
+    // contract under test is "daemon still up", not "every probe is instantly 200".
+    const res = await fetchApiInPage(page, '/api/status');
+    expect(res.ok, 'daemon must still answer /api/status after arming shutdown').toBeTruthy();
+    expect(res.status).toBe(200);
   });
 
   test('Settings tab can be closed and reopened from the header', async ({ centerPanel, header, settingsPage }) => {

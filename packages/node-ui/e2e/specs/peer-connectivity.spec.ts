@@ -2,6 +2,7 @@ import { type Page } from '@playwright/test';
 import { test, expect } from '../fixtures/base.js';
 import { sel } from '../helpers/selectors.js';
 import { EXPECTED_MIN_PEERS, IS_RELAY_HUB, NUM_NODES, UI_NODE } from '../helpers/real-node.js';
+import { fetchApiInPage } from '../helpers/page-api.js';
 
 /**
  * Peer connectivity against the real multi-node devnet.
@@ -26,15 +27,13 @@ async function readStatus(page: Page): Promise<{
   connectedPeers?: number;
   connections?: { total?: number; direct?: number; relayed?: number };
 } | null> {
-  return page.evaluate(async () => {
-    // Retry on transient 5xx — the daemon's own status poll behaves the same.
-    for (let i = 0; i < 8; i++) {
-      const r = await fetch('/api/status');
-      if (r.ok) return r.json();
-      await new Promise((res) => setTimeout(res, 500));
-    }
-    return null;
-  });
+  // Authed in-page fetch (same bearer the UI uses) so an auth-enabled node
+  // doesn't 401; retries on transient 5xx, like the daemon's own status poll.
+  const res = await fetchApiInPage<{
+    connectedPeers?: number;
+    connections?: { total?: number; direct?: number; relayed?: number };
+  }>(page, '/api/status', { retries: 8 });
+  return res.json;
 }
 
 function parsePeerCount(text: string | null): number {

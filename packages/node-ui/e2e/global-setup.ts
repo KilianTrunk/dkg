@@ -25,7 +25,7 @@
  */
 import { waitForDevnetStatus, waitForConnectedPeers } from './helpers/devnet.js';
 import { listSubGraphs, waitForContextGraph, countSeededVmRootEntities } from './helpers/devnet-publish.js';
-import { seedVmEntity, seedSubgraphEntity, PRIMARY_CG, NAMED_SUBGRAPH, UI_NODE } from './helpers/real-node.js';
+import { seedVmEntity, seedSubgraphEntity, PRIMARY_CG, NAMED_SUBGRAPH, UI_NODE, EXPECTED_MIN_PEERS } from './helpers/real-node.js';
 
 // The UI can be repointed at a non-default node via DEVNET_NODE / UI_NODE_ID
 // (see playwright.config.ts + bootstrap-devnet.ts). `UI_NODE` (from real-node.ts)
@@ -44,6 +44,14 @@ export default async function globalSetup(): Promise<void> {
   // actually existing so the strict listSubGraphs() below can't 400/throw on an
   // unregistered CG and abort the whole suite moments before it would be ready.
   await waitForContextGraph(PRIMARY_CG, UI_NODE, 120_000);
+  // Gate the WHOLE run on the mesh being SETTLED — not merely "≥1 peer". globalSetup
+  // runs in parallel with the bootstrap, so on a cold boot the UI node can be up
+  // while a peer is still dialing; starting specs then makes peer-connectivity
+  // assert against a half-formed mesh (intermittent failures) and lets a VM seed
+  // race quorum. Waiting for EXPECTED_MIN_PEERS (the settled count for the chosen
+  // UI node — N-1 for the hub, 1 for a non-hub) BEFORE the idempotency check means
+  // even a reused/already-seeded devnet is confirmed healthy before the run begins.
+  await waitForConnectedPeers(UI_NODE, EXPECTED_MIN_PEERS, 120_000);
   // Idempotency check: skip ONLY when BOTH seed artifacts the specs depend on are
   // present — they are seeded separately and a guard on just one can be satisfied
   // without the other:
@@ -76,11 +84,9 @@ export default async function globalSetup(): Promise<void> {
   console.log(
     `[global-setup] seeding ${PRIMARY_CG} on node${UI_NODE} (subGraphSeeded=${subGraphSeeded}, vmSeeded=${vmSeeded})`,
   );
-  // VM publish needs ACK quorum from a connected CORE peer, and globalSetup runs
-  // in parallel with the bootstrap (which only waits for the node's API port).
-  // Wait for at least one connected peer so the seed can't race the cold boot and
-  // fail with QuorumUnmetError.
-  await waitForConnectedPeers(UI_NODE, 1, 120_000);
+  // Mesh already confirmed settled above (waitForConnectedPeers), so the VM
+  // publish below has the connected-CORE-peer quorum it needs and can't race
+  // the cold boot into a QuorumUnmetError.
   const seeded = await seedVmEntity(PRIMARY_CG, UI_NODE);
   console.log(`[global-setup] seeded VM entity into ${PRIMARY_CG} (node${UI_NODE}): "${seeded.label}" (kaId=${seeded.kaId ?? 'n/a'})`);
   // Register + seed a named sub-graph so the SubGraphBar always has a concrete

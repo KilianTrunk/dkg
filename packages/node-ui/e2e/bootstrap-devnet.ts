@@ -24,6 +24,7 @@ import { connect } from 'node:net';
 import { spawn } from 'node:child_process';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { devnetApiFetch } from './helpers/devnet.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, '../../..');
@@ -53,6 +54,12 @@ if (NUM_NODES_INT < NODE_NUM_INT) {
   );
 }
 const NUM_NODES = String(NUM_NODES_INT);
+
+// Settled connected-peer count the UI's target node must reach. node1 is the
+// relay hub every other node dials (sees N-1); a non-hub node sees only the hub
+// (1). Mirrors EXPECTED_MIN_PEERS in helpers/real-node.ts — kept inline so this
+// pre-test bootstrap stays dependency-light (it runs before the test runner).
+const EXPECTED_MIN_PEERS = NODE_NUM_INT === 1 ? Math.max(1, NUM_NODES_INT - 1) : 1;
 
 const API_PORT_BASE =
   process.env.API_PORT_BASE ||
@@ -137,6 +144,36 @@ async function waitForMesh(numNodes: number, timeoutMs: number): Promise<number[
   return reachable;
 }
 
+/** Connected libp2p peer count node `nodeNum` reports, or -1 if unreadable. */
+async function readConnectedPeers(nodeNum: number): Promise<number> {
+  try {
+    const res = await devnetApiFetch('/api/status', { nodeNum });
+    if (!res.ok) return -1;
+    const json = (await res.json()) as { connectedPeers?: number };
+    return typeof json.connectedPeers === 'number' ? json.connectedPeers : -1;
+  } catch {
+    return -1;
+  }
+}
+
+/**
+ * Poll until node `nodeNum` reports at least `minPeers` connected peers (the
+ * libp2p mesh has settled), or the deadline passes. All daemons answering their
+ * API does NOT prove they're peered — a reused devnet can be fully API-reachable
+ * yet libp2p-partitioned. Returns the last observed count so the caller can
+ * report the gap.
+ */
+async function waitForPeers(nodeNum: number, minPeers: number, timeoutMs: number): Promise<number> {
+  const deadline = Date.now() + timeoutMs;
+  let last = -1;
+  while (Date.now() < deadline) {
+    last = await readConnectedPeers(nodeNum);
+    if (last >= minPeers) return last;
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+  return last;
+}
+
 async function waitForReady(label: string): Promise<number> {
   const deadline = Date.now() + BOOTSTRAP_TIMEOUT_MS;
   let lastLog = 0;
@@ -213,22 +250,38 @@ async function main(): Promise<void> {
     // peer-connectivity.spec expects the N-node topology).
     const reachableNodes = await probeExistingNodes(NUM_NODES_INT);
     if (reachableNodes.length >= NUM_NODES_INT) {
+      // Every daemon answers its API — but that does NOT prove libp2p is meshed.
+      // A reused devnet can be fully API-reachable yet partitioned, which would
+      // later surface as exactly the publish/peer-count failures this suite
+      // exists to prevent. Verify the selected UI node reaches its settled
+      // connected-peer count before skipping repair; poll to ride out cold-boot
+      // dialing (returns instantly on an already-settled long-running devnet).
+      const peers = await waitForPeers(NODE_NUM_INT, EXPECTED_MIN_PEERS, 60_000);
+      if (peers >= EXPECTED_MIN_PEERS) {
+        console.log(
+          `[playwright] reusing healthy ${reachableNodes.length}-node devnet ` +
+          `(node${NODE_NUM}: ${peers} connected peer(s) >= ${EXPECTED_MIN_PEERS} @ port ${initial.port})`,
+        );
+        return;
+      }
+      // Daemons up but mesh not settled — fall through to repair (and let the
+      // post-(re)start mesh check + global-setup's peer wait be the final gate).
       console.log(
-        `[playwright] reusing existing ${reachableNodes.length}-node devnet ` +
-        `(target node${NODE_NUM} @ port ${initial.port})`,
+        `[playwright] devnet daemons all reachable but node${NODE_NUM} mesh not settled ` +
+        `(${peers}/${EXPECTED_MIN_PEERS} connected peers) -- repairing via scripts/devnet.sh start...`,
       );
-      return;
+    } else {
+      // Partial cluster — e.g. node1 survived an interrupted run but a peer is
+      // down. Rather than abort and force a manual cleanup, REPAIR it: fall
+      // through to `scripts/devnet.sh start`, which is idempotent per node (it
+      // skips already-running nodes and boots only the missing peers). The
+      // post-(re)start mesh check below fails fast only if recovery still leaves
+      // the cluster incomplete.
+      console.log(
+        `[playwright] devnet partially up on node${NODE_NUM} (reachable: ${reachableNodes.join(',') || 'none'}; ` +
+        `need ${NUM_NODES_INT}) -- backfilling missing nodes via scripts/devnet.sh start...`,
+      );
     }
-    // Partial cluster — e.g. node1 survived an interrupted run but a peer is
-    // down. Rather than abort and force a manual cleanup, REPAIR it: fall
-    // through to `scripts/devnet.sh start`, which is idempotent per node (it
-    // skips already-running nodes and boots only the missing peers). The
-    // post-(re)start mesh check below fails fast only if recovery still leaves
-    // the cluster incomplete.
-    console.log(
-      `[playwright] devnet partially up on node${NODE_NUM} (reachable: ${reachableNodes.join(',') || 'none'}; ` +
-      `need ${NUM_NODES_INT}) -- backfilling missing nodes via scripts/devnet.sh start...`,
-    );
   }
 
   const preExistingNodes = await probeExistingNodes(NUM_NODES_INT);

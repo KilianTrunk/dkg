@@ -1077,6 +1077,8 @@ export class DKGAgentBase {
   */
   protected readonly pendingSenderKeyByAgent = new Map<string, PendingSenderKeyEntry[]>();
   protected readonly pendingSenderKeyDrainByAgent = new Map<string, Promise<number>>();
+  /** Per-CG serialized host-mode persistence queue (moved here from the host-mode cluster during the mixin split). */
+  protected readonly hostModePersistenceQueues = new Map<string, Promise<void>>();
 
   protected constructor(
     config: DKGAgentConfig,

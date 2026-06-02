@@ -398,18 +398,14 @@ describe('Phase D — Cores host public CGs and fill their own gaps', () => {
   }, 120_000);
 
   it('a hosting core offline during a publish fills its gap from chain on restart', async () => {
-    // Phase D targets a core that HOSTS a public CG (`core_hosted=1`). Ideally
-    // we isolate the PURE host-only case (`core_hosted=1, subscribed=0`) so the
-    // fill can ONLY come from the coreHosted reconcile path. But on this devnet
+    // Phase D targets a core that HOSTS a public CG (`core_hosted=1`). We
+    // isolate the PURE host-only case (`core_hosted=1, subscribed=0`) so the
+    // fill can ONLY come from the coreHosted reconcile path. On this devnet
     // every core that signs a StorageACK for a public CG is ALSO auto-subscribed
-    // to it, and there is no unsubscribe endpoint — so a pure host-only core
-    // does not exist here. We therefore PREFER a host-only victim when one is
-    // available and otherwise fall back to any hosting core. Either way this
-    // gates the end-to-end chain-driven fill (offline-during-publish → restart →
-    // chain reconcile delivers the missed KA, proven below by a chain-path
-    // `fetch`/`promote`/`core-fill` event pinned to that exact ka). The
-    // host-only `core-fill` LABEL itself is unit-pinned in
-    // `core-fills-gap.test.ts`, which the devnet topology can't reproduce.
+    // to it, so a host-only core doesn't occur naturally — we MANUFACTURE one by
+    // calling the unsubscribe endpoint (drops live gossip + sync scope, keeps
+    // `coreHosted`). That removes the finalization gossip fast-path, so the
+    // missed publish below can only be recovered via the chain reconcile sweep.
     const candidates = CORE_NODES.filter((n) => n !== 1);
     const picked = await waitFor(
       'a hosting core (core_hosted=1) for CONTEXT_GRAPH',
@@ -426,18 +422,31 @@ describe('Phase D — Cores host public CGs and fill their own gaps', () => {
           if (!row) continue;
           const entry = { victim: n, subscribed: row.subscribed };
           anyHost ??= entry;
-          if (row.subscribed !== 1) return entry; // pure host-only — best case
+          if (row.subscribed !== 1) return entry; // already pure host-only
         }
-        return anyHost; // fall back to a subscribed host core
+        return anyHost; // else manufacture host-only via unsubscribe below
       },
     );
     const victim = picked.victim;
     const victimNode = nodes[victim]!;
+
+    // Manufacture the pure host-only state: unsubscribe the live member
+    // subscription while keeping `coreHosted`. Poll the cursors API until it
+    // reports `subscribed=0, core_hosted=1` so we KNOW the gap can only be
+    // filled by the chain reconcile path, not the gossip fast-path.
     if (picked.subscribed === 1) {
-      console.log(
-        `Phase D: no pure host-only core on this devnet (storage cores auto-subscribe); ` +
-        `using hosting+subscribed node${victim}. Host-only 'core-fill' label is unit-tested.`,
-      );
+      const unsub = await postJson(victimNode, '/api/context-graph/unsubscribe', { contextGraphId: CONTEXT_GRAPH });
+      expect(unsub.status, `unsubscribe node${victim} failed`).toBe(200);
+      expect(unsub.body.coreHosted, 'unsubscribe must retain coreHosted').toBe(true);
+      await waitFor(`node${victim} is pure host-only (subscribed=0, core_hosted=1)`, 30_000, 2_000, async () => {
+        const cursors = await getJson(victimNode, '/api/replication/cursors');
+        if (cursors.status !== 200) return null;
+        const row = (cursors.body.cursors as any[]).find(
+          (c) => c.context_graph_id === CONTEXT_GRAPH && c.core_hosted === 1,
+        );
+        return row && row.subscribed === 0 ? true : null;
+      });
+      console.log(`Phase D: manufactured pure host-only core node${victim} via unsubscribe; gap fill must come from chain reconcile.`);
     }
 
     // 1. Take the victim core OFFLINE. Kill the real worker (daemon.pid),
@@ -480,9 +489,11 @@ describe('Phase D — Cores host public CGs and fill their own gaps', () => {
     //           KA after restart — a `fetch`/`promote`/`core-fill` replication
     //           event for this ka id, or a `chain-promote action=…` daemon.log
     //           line naming it. This rules out a coincidental non-chain path.
-    //    `already` is NOT accepted (it means the KA was present pre-restart);
-    //    on devnet cores are also subscribers, so the host-only `core-fill`
-    //    label may not fire — `fetch`/`promote` for this ka is the real signal.
+    //    `already` is NOT accepted (it means the KA was present pre-restart).
+    //    The victim was made pure host-only (subscribed=0, core_hosted=1) above,
+    //    so the coreHosted reconcile path drives the fill — `core-fill` may now
+    //    fire, but `fetch`/`promote` for this ka is equally valid chain-path
+    //    evidence (the reconciler emits the active-fetch + promote either way).
     expect(pub.kaId, 'gap publish did not report a KC ID — cannot pin chain-path evidence').toBeTruthy();
     const kaId = pub.kaId!;
     const chainActions = new Set(['fetch', 'promote', 'core-fill']);

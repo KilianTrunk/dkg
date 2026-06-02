@@ -554,30 +554,36 @@ export class FinalizationHandler {
     const resolvedSubGraphName = snapshot.subGraphName ?? subGraphName;
 
     const finalizationVersion: MaterializedVersion = { blockNumber: versionBlock, txIndex: 0 };
-    // Chain-driven reconciliation promotes per-cgId ONLY (no same-graph
-    // dual-write to the root `<cg>/_meta` label copy).
+    // Mirror the gossip-path dual-write decision
+    // (`isDualWrite = keepRootCopyOnLabel && ctxGraphId && !subGraphName`) for
+    // the chain-reconcile path. We can't read the publisher's
+    // `keepRootCopyOnLabel` wire flag here (no gossip), and it can't be
+    // persisted at share-time either — the SWM share happens BEFORE the
+    // publish, so the remap decision (`publishContextGraphId`, which sets
+    // `keepRootCopyOnLabel = !publishContextGraphId`) isn't known yet when the
+    // WorkspaceOperation meta is written. Stamping it post-publish on the
+    // publisher's local meta wouldn't reach this node anyway — the node we're
+    // serving is precisely one that MISSED the finalization gossip.
     //
-    // KNOWN LIMITATION (tracked follow-up, deliberately not fixed here):
-    // the dual-write decision is the publisher's `keepRootCopyOnLabel` gossip
-    // signal (`isDualWrite = keepRootCopyOnLabel && ctxGraphId && !subGraphName`,
-    // see the gossip branch above). That signal is NOT carried on-chain and is
-    // NOT persisted in the share-time SWM meta we recover from here, so the
-    // reconcile path can't faithfully reproduce it. Approximating it (e.g.
-    // "root-workspace publish ⇒ always dual-write") would risk double-counting
-    // the same triples across the root data graph and the per-cgId graph in
-    // unscoped queries — the exact hazard the dual-write logic guards against —
-    // so we choose the safe direction.
-    //
-    // Impact is bounded: this only affects a node that (a) MISSED the original
-    // finalization gossip for a SAME-GRAPH (root-label) publish AND (b) later
-    // recovers it purely via chain reconcile AND (c) is then read via an
-    // unscoped / root-label query rather than a `contextGraphId`-scoped one.
-    // Scoped reads (`agent.query(cg, …)` / `view=verified-memory` + cgId)
-    // resolve through the per-cgId graph and are unaffected — that is the path
-    // the late-subscriber scenario exercises. The correct fix is to persist
-    // `keepRootCopyOnLabel` in the share-time WorkspaceOperation meta
-    // (publisher-side) and mirror the gossip decision here.
-    const isDualWrite = false;
+    // Instead we DERIVE it, and the derivation is exact (not the unsafe
+    // "root-workspace publish ⇒ always dual-write" approximation):
+    //   * `keepRootCopyOnLabel` is true iff the publish was SAME-GRAPH (no
+    //     remap). A same-graph publish shares its SWM snapshot under THIS CG,
+    //     whose on-chain binding is `onChainCgId`. A REMAP publish shares its
+    //     snapshot under the SOURCE CG and registers the KA to a DIFFERENT
+    //     on-chain id — so `findSwmSnapshotForMerkleRoot(contextGraphId, …)`,
+    //     which searches only the CG resolved from `onChainCgId`, would NOT
+    //     match and we'd have returned `no-swm` above. Reaching this line with
+    //     a merkle-VERIFIED snapshot therefore proves a same-graph publish,
+    //     i.e. `keepRootCopyOnLabel === true`.
+    //   * `!!ctxGraphId` and `!resolvedSubGraphName` are the same two gates the
+    //     gossip branch applies, evaluated against the data we have in hand.
+    // The result is a node that converges to the IDENTICAL graph state as one
+    // that received the finalization gossip — no divergence, no double-count
+    // (a remap never dual-writes here because it never finds its snapshot).
+    // Tier 2 (GH#919) removes dual-write entirely by resolving label reads
+    // through the CG registry, retiring this derivation along with the rest.
+    const isDualWrite = !!ctxGraphId && !resolvedSubGraphName;
     const defaultMeta = `did:dkg:context-graph:${contextGraphId}/_meta`;
 
     const outcome = await this.applyVerifiedFinalization({

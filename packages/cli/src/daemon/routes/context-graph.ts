@@ -1616,6 +1616,32 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
     });
   }
 
+  // POST /api/context-graph/unsubscribe
+  //
+  // Inverse of subscribe: drops the LIVE member subscription (gossip topics +
+  // sync scope) while preserving any `coreHosted` hosting obligation. A core
+  // that hosts a public CG ends up `subscribed=0, coreHosted=1` — the pure
+  // host-only state that exercises the Phase D chain-driven fill path (a missed
+  // publish can then only be recovered via the chain reconcile sweep, not the
+  // finalization gossip fast-path). Does NOT delete any VM/SWM data.
+  if (
+    req.method === "POST" &&
+    (path === "/api/context-graph/unsubscribe" || path === "/api/unsubscribe")
+  ) {
+    const body = await readBody(req, SMALL_BODY_BYTES);
+    const contextGraphId = JSON.parse(body)?.contextGraphId;
+    if (!contextGraphId) {
+      return jsonResponse(res, 400, { error: 'Missing "contextGraphId"' });
+    }
+    agent.unsubscribeFromContextGraph(contextGraphId);
+    const sub = agent.getSubscribedContextGraphs()?.get(contextGraphId);
+    return jsonResponse(res, 200, {
+      unsubscribed: contextGraphId,
+      subscribed: sub?.subscribed === true,
+      coreHosted: sub?.coreHosted === true,
+    });
+  }
+
   // POST /api/context-graph/rename
   //
   // Updates the display name (schema:name) of an existing context graph

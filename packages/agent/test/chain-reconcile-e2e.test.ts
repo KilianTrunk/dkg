@@ -98,6 +98,15 @@ async function isInVm(store: OxigraphStore, entity: string, value: string): Prom
   return res.type === 'boolean' && res.value;
 }
 
+/** True when the quad landed in the root LABEL data graph (`did:dkg:context-graph:<cg>`), i.e. the same-graph dual-write fired. */
+async function isInRootLabel(store: OxigraphStore, entity: string, value: string): Promise<boolean> {
+  const rootGraph = `did:dkg:context-graph:${LOCAL_CG}`;
+  const res = await store.query(
+    `ASK { GRAPH <${rootGraph}> { <${entity}> <http://schema.org/name> "${value}" } }`,
+  );
+  return res.type === 'boolean' && res.value;
+}
+
 describe('Phase B e2e — chain registration -> VM via the sweep', () => {
   it('promotes every registered KC the node has SWM for and advances the watermark', async () => {
     const store = new OxigraphStore();
@@ -156,5 +165,31 @@ describe('Phase B e2e — chain registration -> VM via the sweep', () => {
     expect(r2.watermark).toBe(2);
     expect(persisted).toEqual([1, 2]);
     expect(await isInVm(store, 'urn:fact:1', 'Bananas are berries')).toBe(true);
+  });
+
+  it('dual-writes a same-graph reconcile to the root label graph (mirrors gossip keepRootCopyOnLabel)', async () => {
+    const store = new OxigraphStore();
+    const chain = new MockChainAdapter();
+    const fh = new FinalizationHandler(store, chain);
+
+    // A plain same-graph publish (no subGraphName): the SWM snapshot lives
+    // under THIS CG, whose chain binding is ON_CHAIN_CG. The merkle-verified
+    // match proves same-graph, so reconcile must mirror the gossip path's
+    // `keepRootCopyOnLabel` dual-write — landing the quad in BOTH the per-cgId
+    // VM graph and the root `did:dkg:context-graph:<cg>` label graph so that
+    // label-scoped (`agent.query(label)`) reads resolve on a node that only
+    // ever recovered via chain reconcile.
+    const root = await seedSwmSnapshot(store, 'urn:fact:dw', 'A bolt of lightning is hotter than the sun');
+    chain.__registerKC({ kaId: 301n, contextGraphId: ON_CHAIN_CG, merkleRootHex: ethers.hexlify(root), chunks: [] });
+
+    const persisted: number[] = [];
+    const deps = makeDeps(store, chain, fh, persisted);
+    const cursor = createCursorState(0);
+
+    const res = await reconcileContextGraph(deps, cursor, LOCAL_CG, ON_CHAIN_CG);
+
+    expect(res.reconciled).toBe(1);
+    expect(await isInVm(store, 'urn:fact:dw', 'A bolt of lightning is hotter than the sun')).toBe(true);
+    expect(await isInRootLabel(store, 'urn:fact:dw', 'A bolt of lightning is hotter than the sun')).toBe(true);
   });
 });

@@ -10715,6 +10715,86 @@ export class DKGAgent {
     });
   }
 
+  /**
+   * Inverse of {@link subscribeToContextGraph}: drop the LIVE member
+   * subscription (publish / app / update / finalization + member-mode SWM
+   * gossip, and the sync scope) while preserving any `coreHosted` hosting
+   * obligation. After this the node no longer receives the finalization
+   * gossip fast-path, so a publish it misses can ONLY be recovered through
+   * the chain-driven `coreHosted` reconcile sweep — which is exactly the
+   * Phase D path. The persisted subscription row survives iff `coreHosted`
+   * (see {@link persistContextGraphSubscription}), so the host-only state
+   * (`subscribed=0, coreHosted=1`) is restart-safe.
+   *
+   * This is intentionally NOT a destructive teardown: it deletes no VM/SWM
+   * data and leaves SWM host-mode hosting intact (re-evaluated below). Its
+   * primary use is to manufacture a pure host-only core for validation on a
+   * devnet where storage cores otherwise auto-subscribe to everything they
+   * host, masking the host-only fill path.
+   */
+  unsubscribeFromContextGraph(contextGraphId: string): void {
+    const existing = this.subscribedContextGraphs.get(contextGraphId);
+    if (!existing) return;
+
+    // Drop from the active sync scope so background sweeps no longer treat
+    // this as a subscribed CG to keep current.
+    const syncSet = new Set<string>(this.config.syncContextGraphs ?? []);
+    if (syncSet.delete(contextGraphId)) {
+      this.config.syncContextGraphs = [...syncSet];
+    }
+
+    // Tear down the per-CG gossip topics. These four carry only the member
+    // handlers installed by `subscribeToContextGraph`, so a topic-wide
+    // `unsubscribe` is safe here (unlike the SWM topic, handled separately).
+    if (this.gossipRegistered.has(contextGraphId)) {
+      for (const topic of [
+        contextGraphPublishTopic(contextGraphId),
+        contextGraphAppTopic(contextGraphId),
+        contextGraphUpdateTopic(contextGraphId),
+        contextGraphFinalizationTopic(contextGraphId),
+      ]) {
+        try { this.gossip.unsubscribe(topic); } catch { /* best-effort */ }
+      }
+      this.gossipRegistered.delete(contextGraphId);
+    }
+
+    // Tear down member-mode SWM gossip. `gossip.unsubscribe` drops every
+    // handler on the topic (incl. any host-mode listener), so we clear the
+    // host-mode bookkeeping too and then let `reconcileSwmHostModeSubscription`
+    // re-wire the host listener if hosting is still applicable (no-op on edges
+    // and on cores with swmHostMode disabled).
+    const wireCgId = this.gossipWireIdFor(contextGraphId);
+    const swmTopic = contextGraphWorkspaceTopic(wireCgId);
+    if (this.sharedMemoryGossipRegistered.has(contextGraphId)) {
+      try { this.gossip.unsubscribe(swmTopic); } catch { /* best-effort */ }
+      this.sharedMemoryGossipRegistered.delete(contextGraphId);
+      const hostKey = this.canonicalSwmHostModeKey(contextGraphId);
+      this.swmHostModeSubscribed.delete(hostKey);
+      this.swmHostModeHandlers.delete(hostKey);
+      this.enqueueHostModePersistence(contextGraphId, false);
+    }
+
+    // Flip the live-subscription flag off, keeping `coreHosted` (and every
+    // other field) intact. Persisted: the row is kept iff `coreHosted`.
+    this.setContextGraphSubscription(
+      contextGraphId,
+      { ...existing, subscribed: false },
+      { persist: true },
+    );
+
+    void this.reconcileSwmHostModeSubscription(contextGraphId).catch((err) => {
+      this.log.warn(
+        createOperationContext('system'),
+        `SWM host-mode re-eval after unsubscribe from "${contextGraphId}" failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    });
+
+    this.log.info(
+      createOperationContext('system'),
+      `Unsubscribed from "${contextGraphId}" (coreHosted=${existing.coreHosted === true}); live gossip dropped, chain reconcile path retained if hosting`,
+    );
+  }
+
   private queueSharedMemoryGossipSubscription(contextGraphId: string): void {
     void this.reconcileSharedMemoryGossipSubscription(contextGraphId).catch((err) => {
       this.log.warn(

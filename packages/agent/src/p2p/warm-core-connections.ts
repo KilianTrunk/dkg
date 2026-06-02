@@ -40,18 +40,34 @@ export interface WarmCoreAgent {
   peerId: string;
   nodeRole?: string;
   agentAddress?: string;
+  /** ISO-8601 `dkg:lastSeen` from the phonebook, when known. */
+  lastSeen?: string;
+}
+
+/** Parse an ISO-8601 `lastSeen` to epoch ms; 0 when absent/unparseable. */
+function lastSeenMs(iso?: string): number {
+  if (!iso) return 0;
+  const t = Date.parse(iso);
+  return Number.isNaN(t) ? 0 : t;
 }
 
 /**
  * From the phonebook agent list, the Cores worth warm-pinning: role
- * `core`, not ourselves, de-duplicated by peerId. Input order is preserved
- * (callers may pre-sort by `lastSeen`); the per-tick cap is applied later
- * in `reconcileWarmCoreConnections` so it counts *gated* Cores, not raw
- * candidates.
+ * `core`, not ourselves, de-duplicated by peerId.
+ *
+ * The phonebook (`discovery.findAgents()`) is unordered and freshness-blind,
+ * but `reconcileWarmCoreConnections` only pins up to `maxCores`. So this
+ * function ranks **freshest-first** by `lastSeen` and (when `staleThresholdMs`
+ * + `nowMs` are supplied) drops Cores we can prove are stale — otherwise the
+ * capped set would be an arbitrary slice that churns between ticks and keeps
+ * dialing long-dead registry entries forever. Cores without a parseable
+ * `lastSeen` are kept (freshness unknown) and, because the sort is stable,
+ * retain their relative phonebook order behind any timestamped Cores.
  */
 export function selectWarmCoreCandidates(
   agents: WarmCoreAgent[],
   selfPeerId: string,
+  opts?: { nowMs?: number; staleThresholdMs?: number },
 ): WarmCoreAgent[] {
   const seen = new Set<string>();
   const out: WarmCoreAgent[] = [];
@@ -62,7 +78,19 @@ export function selectWarmCoreCandidates(
     seen.add(agent.peerId);
     out.push(agent);
   }
-  return out;
+  const nowMs = opts?.nowMs;
+  const staleThresholdMs = opts?.staleThresholdMs;
+  const filtered =
+    nowMs !== undefined && staleThresholdMs !== undefined
+      ? out.filter((a) => {
+          const ls = lastSeenMs(a.lastSeen);
+          // ls === 0 → unknown freshness, keep it; otherwise must be recent.
+          return ls === 0 || nowMs - ls <= staleThresholdMs;
+        })
+      : out;
+  // Stable freshest-first sort (Array.prototype.sort is stable since ES2019),
+  // so equal/unknown freshness preserves phonebook order.
+  return filtered.sort((a, b) => lastSeenMs(b.lastSeen) - lastSeenMs(a.lastSeen));
 }
 
 export interface WarmCoreDeps {
@@ -73,6 +101,13 @@ export interface WarmCoreDeps {
   /** Upper bound on simultaneously pinned Cores (slot-exhaustion guard). */
   maxCores: number;
   /**
+   * When set, Cores whose `lastSeen` is older than this many ms are dropped
+   * before the `maxCores` cap, so we don't keep redialing dead registry
+   * entries. Cores without a `lastSeen` are kept. Production wires this to
+   * `AGENT_PROFILE_STALE_THRESHOLD_MS`.
+   */
+  staleThresholdMs?: number;
+  /**
    * Trust gate: resolve true if this Core may be pinned. Production wires
    * this to `getIdentityIdForAddress(addr) -> isShardingTableMember(id)`.
    * Best-effort: returns true when gating is unavailable.
@@ -81,11 +116,28 @@ export interface WarmCoreDeps {
   /** True if a live connection to this peer already exists. */
   isConnected: (peerId: string) => boolean;
   /**
-   * Tag the peer keep-alive in the peerStore and dial it. Returns true on a
-   * successful dial. Implementation lives in `DKGAgent` (peerStore.merge +
-   * libp2p.dial); errors are swallowed by the caller.
+   * Tag the peer keep-alive in the peerStore (idempotent, no dial). Called for
+   * every selected Core — including already-connected ones — so libp2p's
+   * connection manager protects + auto-redials it after a disconnect.
    */
-  pinAndDial: (peerId: string, ctx: OperationContext) => Promise<boolean>;
+  pin: (peerId: string, ctx: OperationContext) => Promise<void>;
+  /**
+   * Remove the keep-alive tag from a peer that fell out of the warm set, so
+   * the pinned count can't drift above `maxCores` over time.
+   */
+  unpin: (peerId: string, ctx: OperationContext) => Promise<void>;
+  /**
+   * Dial the peer. Returns true on a successful dial. Only called for Cores
+   * that aren't already connected. Errors are swallowed by the caller.
+   */
+  dial: (peerId: string, ctx: OperationContext) => Promise<boolean>;
+  /**
+   * The set of Cores pinned on the previous reconcile pass. Cores in here that
+   * are NOT re-selected this pass get {@link unpin}ned. The caller owns this
+   * set across ticks; {@link WarmCoreReconcileResult.warmed} is the value to
+   * carry into the next pass.
+   */
+  previouslyWarmed?: ReadonlySet<string>;
   log: (ctx: OperationContext, msg: string) => void;
 }
 
@@ -94,12 +146,15 @@ export interface WarmCoreReconcileResult {
   pinned: number;
   dialed: number;
   skippedGate: number;
+  unpinned: number;
+  /** Cores pinned this pass — feed back as `previouslyWarmed` next tick. */
+  warmed: Set<string>;
 }
 
 /**
- * One reconcile pass: discover Cores, gate them, pin+dial up to `maxCores`.
- * Idempotent — already-connected Cores are re-tagged (cheap) but not
- * re-dialed. Safe to call on a timer and once at startup.
+ * One reconcile pass: discover Cores, gate them, pin (+ dial when not yet
+ * connected) up to `maxCores`, then unpin any Core that was warm last pass but
+ * is no longer selected. Idempotent and safe to call on a timer and at startup.
  */
 export async function reconcileWarmCoreConnections(
   deps: WarmCoreDeps,
@@ -108,14 +163,17 @@ export async function reconcileWarmCoreConnections(
   // `warm-core` topic is carried in the log message itself.
   const ctx = createOperationContext('sync');
   const agents = await deps.findCoreAgents();
-  const candidates = selectWarmCoreCandidates(agents, deps.selfPeerId);
+  const candidates = selectWarmCoreCandidates(agents, deps.selfPeerId, {
+    nowMs: Date.now(),
+    staleThresholdMs: deps.staleThresholdMs,
+  });
 
-  let pinned = 0;
+  const warmed = new Set<string>();
   let dialed = 0;
   let skippedGate = 0;
 
   for (const core of candidates) {
-    if (pinned >= deps.maxCores) break;
+    if (warmed.size >= deps.maxCores) break;
 
     const allowed = await deps.isShardingTableCore(core.agentAddress).catch(() => false);
     if (!allowed) {
@@ -123,17 +181,39 @@ export async function reconcileWarmCoreConnections(
       continue;
     }
 
-    pinned += 1;
-    if (deps.isConnected(core.peerId)) continue;
+    // Pin BEFORE the connected-check so an already-connected Core still gets
+    // (and keeps) its keep-alive tag — otherwise libp2p won't auto-redial it.
+    // A pin failure (malformed peerId, peerStore.merge error) must NOT consume
+    // a warm slot or be reported as pinned: skip to the next candidate so a
+    // healthy Core can take the slot.
+    let pinOk = true;
+    await deps.pin(core.peerId, ctx).catch(() => {
+      pinOk = false;
+    });
+    if (!pinOk) continue;
+    warmed.add(core.peerId);
 
-    const ok = await deps.pinAndDial(core.peerId, ctx).catch(() => false);
+    if (deps.isConnected(core.peerId)) continue;
+    const ok = await deps.dial(core.peerId, ctx).catch(() => false);
     if (ok) dialed += 1;
+  }
+
+  // Prune: drop the keep-alive tag from Cores warmed last pass but not this
+  // one, so the pinned set tracks the live selection and never exceeds the cap.
+  let unpinned = 0;
+  if (deps.previouslyWarmed) {
+    for (const peerId of deps.previouslyWarmed) {
+      if (!warmed.has(peerId)) {
+        await deps.unpin(peerId, ctx).catch(() => {});
+        unpinned += 1;
+      }
+    }
   }
 
   deps.log(
     ctx,
-    `warm-core reconcile: candidates=${candidates.length} pinned=${pinned} dialed=${dialed} skippedGate=${skippedGate} (cap=${deps.maxCores})`,
+    `warm-core reconcile: candidates=${candidates.length} pinned=${warmed.size} dialed=${dialed} skippedGate=${skippedGate} unpinned=${unpinned} (cap=${deps.maxCores})`,
   );
 
-  return { candidates: candidates.length, pinned, dialed, skippedGate };
+  return { candidates: candidates.length, pinned: warmed.size, dialed, skippedGate, unpinned, warmed };
 }

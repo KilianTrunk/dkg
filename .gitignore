@@ -23,8 +23,11 @@ packages/evm-module/typechain/
 # state, daemon logs). Not checked in.
 .devnet/
 
-# Agent scratch (project memory across orchestrator runs). Local only.
-.ai/
+# Agent scratch (project memory across orchestrator runs). Local only,
+# except checked-in ADRs that preserve durable engineering decisions.
+.ai/*
+!.ai/adr/
+!.ai/adr/*.md
 .scratch/
 
 # WM persistence regression repro (Phase 1 of fix/graphify-import-issues).

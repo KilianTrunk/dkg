@@ -22,6 +22,10 @@
 DEVNET_PUBLISH_STATE_FILE="${DEVNET_PUBLISH_STATE_FILE:-${DEVNET_DIR:-/tmp}/.devnet-publish-state-$$.json}"
 DEVNET_PUBLISH_ALL_RESPONSES='[]'
 DEVNET_PUBLISH_ROOT_ENTITIES='[]'
+# Node that performed the last publish. KC metadata (merkleRoot, KCS records)
+# must be read from this node — late-joining/non-curator verifier peers may not
+# have materialized the batch yet, which would race verify-batch.
+DEVNET_PUBLISH_NODE=''
 
 devnet_json_field() {
   printf '%s' "$1" | node -e "
@@ -40,16 +44,17 @@ _devnet_publish_init_state_file() {
 }
 
 _devnet_publish_persist_state() {
-  local all_responses="$1" root_entities="${2:-[]}"
+  local all_responses="$1" root_entities="${2:-[]}" publish_node="${3:-}"
   node -e "
     require('fs').writeFileSync(
       process.argv[1],
       JSON.stringify({
         allResponses: JSON.parse(process.argv[2]),
         rootEntities: JSON.parse(process.argv[3]),
+        publishNode: process.argv[4],
       }),
     );
-  " "$DEVNET_PUBLISH_STATE_FILE" "$all_responses" "$root_entities"
+  " "$DEVNET_PUBLISH_STATE_FILE" "$all_responses" "$root_entities" "$publish_node"
 }
 
 devnet_publish_load_state() {
@@ -57,6 +62,7 @@ devnet_publish_load_state() {
   if [ ! -f "$DEVNET_PUBLISH_STATE_FILE" ]; then
     DEVNET_PUBLISH_ALL_RESPONSES='[]'
     DEVNET_PUBLISH_ROOT_ENTITIES='[]'
+    DEVNET_PUBLISH_NODE=''
     return 0
   fi
   DEVNET_PUBLISH_ALL_RESPONSES=$(node -e "
@@ -66,6 +72,10 @@ devnet_publish_load_state() {
   DEVNET_PUBLISH_ROOT_ENTITIES=$(node -e "
     const s = JSON.parse(require('fs').readFileSync(process.argv[1], 'utf8'));
     console.log(JSON.stringify(s.rootEntities || []));
+  " "$DEVNET_PUBLISH_STATE_FILE")
+  DEVNET_PUBLISH_NODE=$(node -e "
+    const s = JSON.parse(require('fs').readFileSync(process.argv[1], 'utf8'));
+    console.log(s.publishNode || '');
   " "$DEVNET_PUBLISH_STATE_FILE")
 }
 
@@ -92,9 +102,11 @@ devnet_publish_ka_id_at() {
 # Resolve the kaId of the batch that published a given root entity. The helper
 # preserves publish order (allResponses[i] <-> rootEntities[i]), but the
 # daemon's rootEntities order is NOT tied to the original quad order, so callers
-# must look the batch up by subject rather than positional index. For a
-# single-root (non-split) publish, rootEntities is empty and we return the only
-# batch's kaId.
+# must look the batch up by subject rather than positional index. Lookups fail
+# fast when the requested root has no recorded root->batch mapping (e.g. a typo,
+# or a single-root publish where the subject was never recorded) instead of
+# silently resolving to the wrong batch — use devnet_publish_ka_id_at for
+# positional access to a single-batch publish.
 devnet_publish_ka_id_for_root() {
   local root="$1"
   devnet_publish_load_state
@@ -103,9 +115,11 @@ devnet_publish_ka_id_for_root() {
     const roots = JSON.parse(process.env.ROOTS || "[]");
     const root = process.env.ROOT;
     if (roots.length === 0) {
-      if (!all.length) { console.error("no published batches in state"); process.exit(1); }
-      console.log(all[0].kaId);
-      process.exit(0);
+      console.error(
+        "no root->batch mapping recorded for " + root +
+        " (single-root publish records no subject; use devnet_publish_ka_id_at instead)",
+      );
+      process.exit(1);
     }
     const idx = roots.indexOf(root);
     if (idx < 0 || !all[idx]) {
@@ -142,6 +156,7 @@ const fs = require("fs"); const path = require("path");
   const provider = new ethers.JsonRpcProvider(process.env.RPC_URL);
   const contracts = JSON.parse(fs.readFileSync(process.env.CONTRACTS_JSON, "utf8")).contracts;
   const kcsAddr = contracts.DKGKnowledgeAssets?.evmAddress ?? contracts.KnowledgeCollectionStorage?.evmAddress;
+  if (!kcsAddr) throw new Error("DKGKnowledgeAssets / KnowledgeCollectionStorage not deployed");
   const kcsAbiFile = fs.existsSync(path.join(process.env.ABI_DIR, "DKGKnowledgeAssets.json"))
     ? "DKGKnowledgeAssets.json" : "DKGKnowledgeAssets.json";
   const kas = new ethers.Contract(kcsAddr,
@@ -164,20 +179,25 @@ const fs = require("fs"); const path = require("path");
   )
 }
 
-# Args: node cg quads_payload_json (stringified { contextGraphId, quads })
+# Args: node cg quads_payload_json [metadata_node]
 # Verifies each published root entity against its KC merkleRoot via verify-batch.
+# verify-batch runs on `node` (often a late-joining/non-curator peer), but the
+# expected merkleRoot is read from `metadata_node` — defaults to the node that
+# performed the publish — to avoid racing that peer's KC chain-sync.
 devnet_verify_each_published_root() {
-  local node="$1" cg="$2" quads_payload="$3"
+  local node="$1" cg="$2" quads_payload="$3" meta_node="${4:-}"
   local count i kc merkle body resp ok actual
 
   devnet_publish_load_state
+  [ -z "$meta_node" ] && meta_node="${DEVNET_PUBLISH_NODE:-$node}"
+  [ -z "$meta_node" ] && meta_node="$node"
 
   count=$(devnet_publish_root_count)
 
   i=0
   while [ "$i" -lt "$count" ]; do
     kc=$(devnet_publish_ka_id_at "$i")
-    merkle=$(devnet_kc_merkle_root "$node" "$kc")
+    merkle=$(devnet_kc_merkle_root "$meta_node" "$kc")
     body=$(QUADS_PAYLOAD="$quads_payload" ROOT_IDX="$i" ROOTS="$DEVNET_PUBLISH_ROOT_ENTITIES" CG="$cg" MERKLE="$merkle" KC="$kc" node -e '
       const genidPrefix = "/.well-known/genid/";
       const quadBelongsToRoot = (q, root) =>
@@ -227,12 +247,24 @@ devnet_publish_swm_all_roots() {
   probe=$(api_call "$node" POST /api/shared-memory/publish "$probe_body")
 
   if ! printf '%s' "$probe" | grep -q 'MULTI_ROOT_PUBLISH_NOT_ATOMIC'; then
-    local single_arr
+    local single_arr single_roots
     single_arr=$(printf '%s' "$probe" | node -e '
       let d=""; process.stdin.on("data",c=>d+=c);
       process.stdin.on("end",()=>console.log(JSON.stringify([JSON.parse(d)])));
     ')
-    _devnet_publish_persist_state "$single_arr" '[]'
+    # Record the published root subject when the response exposes it so
+    # devnet_publish_ka_id_for_root can validate single-root lookups too.
+    single_roots=$(printf '%s' "$probe" | node -e '
+      let d=""; process.stdin.on("data",c=>d+=c);
+      process.stdin.on("end",()=>{
+        try {
+          const j = JSON.parse(d);
+          const roots = j.rootEntities || j.publishedRootEntities || j.roots || [];
+          console.log(JSON.stringify(Array.isArray(roots) ? roots : []));
+        } catch { console.log("[]"); }
+      });
+    ')
+    _devnet_publish_persist_state "$single_arr" "$single_roots" "$node"
     printf '%s' "$probe"
     return 0
   fi
@@ -286,7 +318,7 @@ devnet_publish_swm_all_roots() {
     i=$((i + 1))
     sleep 1
   done
-  _devnet_publish_persist_state "$all_resps" "$roots_json"
+  _devnet_publish_persist_state "$all_resps" "$roots_json" "$node"
   printf '%s' "$last_resp"
   return 0
 }

@@ -6124,25 +6124,30 @@ export class DKGAgent {
       // the wrong graph, review round-3).
       let onChainId: string | null = null;
       const trimmed = contextGraphId.trim();
-      if (/^\d+$/.test(trimmed)) {
-        // A digit-only input is treated UNAMBIGUOUSLY as the on-chain id — it
-        // is NEVER resolved as a local context-graph id, because a local CG
-        // whose user-chosen id happens to be numeric (e.g. "42") may map to a
-        // DIFFERENT on-chain id, and silently reading that graph's policy
-        // would flip the encryption decision for the wrong graph (review
-        // round-3). Chain adapters also return access-policy 0 (= public) for
-        // UNKNOWN ids (Solidity default-zero mapping), so the numeric id is
-        // trusted ONLY when PROVEN to be a registered on-chain CG this node
-        // knows: present in the create-event policy cache, or matching a
-        // subscribed CG's onChainId (the chain only assigns that id at
-        // registration). Any unproven numeric input falls through to the
-        // fail-closed (encrypted) path below.
-        if (this.isKnownOnChainId(trimmed)) onChainId = trimmed;
-      } else if (typeof this.getContextGraphOnChainId === 'function') {
-        // Non-numeric (local) id — resolve to its persisted on-chain id. The
-        // resolver only returns an id for graphs registered on-chain, so it
-        // never invents one.
+      // 1) LOCAL-ID RESOLUTION FIRST. `getContextGraphOnChainId` maps ANY
+      //    locally-known context-graph id — including a registered CG whose
+      //    user-chosen id is numeric (a CG "named 42") — to THAT graph's
+      //    actual persisted on-chain id. Reading the access policy for the
+      //    resolved id therefore always targets the correct graph (it's the
+      //    graph the local id genuinely is on-chain, never a "wrong" graph),
+      //    and the resolver only ever returns an id for a registered CG, so
+      //    it never invents one for an unregistered local graph.
+      if (typeof this.getContextGraphOnChainId === 'function') {
         onChainId = await this.getContextGraphOnChainId(contextGraphId);
+      }
+      // 2) NUMERIC FALLBACK. If the local resolver couldn't map it AND the
+      //    caller passed a bare number, that number MAY itself be the on-chain
+      //    id — e.g. share('42', ...) for a public CG this node isn't tracking
+      //    under that local key. Chain adapters return access-policy 0
+      //    (= public) for UNKNOWN ids (Solidity default-zero mapping), so the
+      //    bare number is trusted ONLY when PROVEN to be a registered on-chain
+      //    CG this node knows: present in the create-event policy cache, or
+      //    matching a subscribed CG's onChainId (the chain only assigns that
+      //    id at registration). An unregistered local graph whose id is
+      //    numeric, or any unknown number, stays unresolved and falls through
+      //    to the fail-closed (encrypted) path below (#884).
+      if (!onChainId && /^\d+$/.test(trimmed) && this.isKnownOnChainId(trimmed)) {
+        onChainId = trimmed;
       }
       if (!onChainId) return false;
       const cached = this.onChainAccessPolicyCache.get(onChainId);

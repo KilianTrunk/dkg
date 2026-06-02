@@ -152,16 +152,17 @@ describe('DKGAgent.isContextGraphPublicOnChain', () => {
     expect(agentLike.chain.getContextGraphAccessPolicy).toHaveBeenCalledWith(7n);
   });
 
-  it('NEVER resolves a numeric id as a local context-graph id (no silent wrong-graph lookup) (#884 review round-3)', async () => {
-    // A local CG with the digit-only id "42" could map to a DIFFERENT on-chain
-    // id (here the resolver would return "99"). The helper must NOT consult
-    // the local-id resolver for a numeric input — doing so could read the
-    // wrong graph's policy and flip the encryption decision. An unproven
-    // numeric id fails closed with no resolver call and no chain read.
+  it('resolves a REGISTERED numeric-named local CG to its mapped on-chain policy (#884 review round-4)', async () => {
+    // A registered CG whose user-chosen local id happens to be numeric ("42")
+    // may map to a DIFFERENT on-chain id (here "99"). Local-id resolution runs
+    // FIRST, so the helper reads policy for the graph's ACTUAL on-chain id
+    // (99) — never bypassing a genuinely-registered graph just because its
+    // local id looks like a number. The numeric shortcut is only a fallback
+    // for ids the local resolver can't map.
     const agentLike = makeAgentLike({ onChainId: '99', accessPolicy: 0 });
-    await expect(isPublic(agentLike, '42')).resolves.toBe(false);
-    expect(agentLike.getContextGraphOnChainId).not.toHaveBeenCalled();
-    expect(agentLike.chain.getContextGraphAccessPolicy).not.toHaveBeenCalled();
+    await expect(isPublic(agentLike, '42')).resolves.toBe(true);
+    expect(agentLike.getContextGraphOnChainId).toHaveBeenCalledWith('42');
+    expect(agentLike.chain.getContextGraphAccessPolicy).toHaveBeenCalledWith(99n);
   });
 
   it('logs a diagnostic (not silent) when a lookup flakes before failing closed (#884 review round-3 🟡)', async () => {

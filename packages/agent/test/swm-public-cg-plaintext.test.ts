@@ -180,6 +180,28 @@ describe('DKGAgent.isContextGraphPublicOnChain', () => {
     expect(agentLike.chain.getContextGraphAccessPolicy).toHaveBeenCalledWith(5n);
   });
 
+  it('matches a HOST-MODE wire-id-keyed local CG whose committed hash IS the id itself (#884 review GaJf_)', async () => {
+    // Host-only/core subscriptions are keyed by the wire id (the 64-hex hash);
+    // the local id ALREADY is the committed nameHash, so it must NOT be
+    // re-hashed (that would force a legitimate public CG onto the encrypted
+    // path forever). Identity is proven via the wire-form derivation.
+    const wireKeyedId = '0x' + 'ab'.repeat(32);
+    const agentLike = makeAgentLike({ onChainId: '5', accessPolicy: 0, onChainNameHash: wireKeyedId });
+    await expect(isPublic(agentLike, wireKeyedId)).resolves.toBe(true);
+    expect(agentLike.chain.getContextGraphAccessPolicy).toHaveBeenCalledWith(5n);
+  });
+
+  it('matches a hex-SHAPED CLEARTEXT id committed as keccak256(utf8(id)) (#884 review GZumc)', async () => {
+    // A user-chosen id that merely LOOKS like 0x+64-hex is still cleartext;
+    // registration commits keccak256(utf8(id)). Identity is proven via the
+    // cleartext derivation (the other acceptable form).
+    const hexCleartext = '0x' + 'cd'.repeat(32);
+    const committed = ethers.keccak256(ethers.toUtf8Bytes(hexCleartext)).toLowerCase();
+    const agentLike = makeAgentLike({ onChainId: '5', accessPolicy: 0, onChainNameHash: committed });
+    await expect(isPublic(agentLike, hexCleartext)).resolves.toBe(true);
+    expect(agentLike.chain.getContextGraphAccessPolicy).toHaveBeenCalledWith(5n);
+  });
+
   it('fails closed when the name-hash getter is PRESENT but REJECTS — identity unverifiable (#884 review GZ8L_)', async () => {
     // The adapter exposes getContextGraphNameHash, so an RPC rejection means we
     // cannot prove the local mapping still points at this CG. A transient flake

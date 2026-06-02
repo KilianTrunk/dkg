@@ -4592,23 +4592,26 @@ export class EVMChainAdapter implements ChainAdapter {
   /**
    * OT-RFC-38 / LU-6 Phase B — read the curator-committed wire id
    * from `ContextGraphStorage.getNameHash(uint256)`. Returns `null`
-   * for unregistered ids OR for the opt-out path (curator passed
-   * `bytes32(0)` at create time); callers fall back to the discovery
-   * beacon in that case.
+   * ONLY for the no-commitment cases: an unregistered id OR the opt-out
+   * path (curator passed `bytes32(0)` at create time), both of which the
+   * Solidity getter surfaces as `bytes32(0)` (a mapping default, not a
+   * revert). A `null` therefore unambiguously means "no chain-anchored
+   * hash" so callers may fall back to the beacon path.
+   *
+   * #884 review (🔴 GaJgD): an RPC ERROR is NOT collapsed to `null` — it
+   * PROPAGATES. The identity-binding caller (`localCgMatchesOnChainSlot`)
+   * fails OPEN on `null` (treats it as a legitimate opt-out), so swallowing
+   * a transient read failure as `null` would let a stale local→onChainId
+   * mapping pass the identity gate and re-enable the plaintext downgrade for
+   * the wrong slot. Letting the error throw lets the caller fail CLOSED
+   * instead.
    */
   async getContextGraphNameHash(contextGraphId: bigint): Promise<string | null> {
     await this.init();
     const cgs = this.requireContextGraphStorage();
-    try {
-      const raw: string = await cgs.getNameHash(contextGraphId);
-      if (!raw || raw === ethers.ZeroHash) return null;
-      return raw.toLowerCase();
-    } catch (err) {
-      // Fail-closed: an RPC hiccup shouldn't leak as a positive id.
-      // Caller treats `null` as "no chain-anchored hash" and falls
-      // back to the beacon path or rejects.
-      return null;
-    }
+    const raw: string = await cgs.getNameHash(contextGraphId);
+    if (!raw || raw === ethers.ZeroHash) return null;
+    return raw.toLowerCase();
   }
 
   /**

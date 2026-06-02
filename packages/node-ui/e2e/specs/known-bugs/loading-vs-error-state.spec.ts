@@ -1,7 +1,7 @@
 /**
- * KNOWN-BUG repro — marked `test.fixme()` so it is SKIPPED (not executed) and
- * never turns the suite red. It documents a real product bug and stays disabled
- * until the linked issue is fixed; delete the `.fixme` to re-activate the repro.
+ * Regression test for GH #905 — FIXED in this PR. Was a `test.fixme()` known-bug
+ * repro; now ACTIVE and passing. It guards the fix and turns red if the bug
+ * regresses.
  *
  * GH ISSUE: https://github.com/OriginTrail/dkg/issues/905 — "Views show a
  * perpetual 'Loading…' placeholder (no error/retry) when an API fetch fails".
@@ -25,7 +25,7 @@ import { test, expect } from '../../fixtures/base.js';
 import { PRIMARY_CG } from '../../helpers/real-node.js';
 
 test.describe('KNOWN BUG: views stick on "Loading…" with no error state when a fetch fails', () => {
-  test.fixme('ProjectView shows an error/retry state (not a perpetual "Loading context graph...")', async ({
+  test('ProjectView shows an error/retry state (not a perpetual "Loading context graph...")', async ({
     page,
     shell,
     leftPanel,
@@ -54,21 +54,25 @@ test.describe('KNOWN BUG: views stick on "Loading…" with no error state when a
 
     const center = page.locator('.v10-center-content');
 
-    // The loading placeholder appears...
-    await expect(
-      center.locator('.v10-view-placeholder').filter({ hasText: /Loading context graph/i }),
-    ).toBeVisible({ timeout: 10_000 });
-
-    // ==== THE BUG ====
-    // CORRECT behavior: once the fetch has failed, the view should surface an
-    // error + retry affordance, not pretend it is still loading forever. This
-    // encodes the desired behavior and FAILS today (no error UI is rendered).
+    // ==== FIXED behavior (GH #905) ====
+    // Once the context-graph fetch fails, ProjectView surfaces an error + retry
+    // affordance instead of pretending it is still loading forever. The brief
+    // in-flight "Loading context graph…" frame is now too short to assert
+    // reliably (the error resolves immediately), so we pin the end state.
     const errorState = center.getByText(
       /failed to load|couldn.?t load|error loading|unable to load|could not load|something went wrong|retry|try again/i,
     );
     await expect(
       errorState.first(),
-      'ProjectView renders "Loading context graph..." indefinitely when /api/context-graph/list fails; it never distinguishes loading from error and offers no retry — see linked GH issue.',
+      'ProjectView must distinguish a failed /api/context-graph/list fetch from a loading state and offer a retry — see GH #905.',
     ).toBeVisible({ timeout: 12_000 });
+
+    // A retry control is offered so the user can recover without a full reload.
+    await expect(center.getByRole('button', { name: /retry|try again/i })).toBeVisible();
+
+    // ...and the view must NOT be stuck on the perpetual loading placeholder.
+    await expect(
+      center.locator('.v10-view-placeholder').filter({ hasText: /Loading context graph/i }),
+    ).toHaveCount(0);
   });
 });

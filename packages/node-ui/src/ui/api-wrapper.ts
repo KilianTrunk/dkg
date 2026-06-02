@@ -4,6 +4,26 @@ import { mockApi } from './mocks/provider.js';
 let useMocks: boolean | null = null;
 let detectMockModePromise: Promise<boolean> | null = null;
 
+// Subscribers (e.g. the MockModeBanner) that want to know when the UI has
+// fallen back to fabricated demo data so they can surface a visible indicator
+// (GH #904). The previous fallback set only a `console.warn` + a
+// `window.__DKG_USING_MOCKS__` flag — nothing the operator could see.
+type MockModeListener = (usingMocks: boolean) => void;
+const mockModeListeners = new Set<MockModeListener>();
+
+/** Current mock-mode state (true once `/api/status` has failed detection). */
+export function isUsingMocks(): boolean {
+  return useMocks === true;
+}
+
+/** Subscribe to mock-mode changes; returns an unsubscribe fn. */
+export function subscribeMockMode(listener: MockModeListener): () => void {
+  mockModeListeners.add(listener);
+  return () => {
+    mockModeListeners.delete(listener);
+  };
+}
+
 function authHeaders(): Record<string, string> {
   if (typeof window === 'undefined') return {};
   const token = (window as any).__DKG_TOKEN__;
@@ -43,6 +63,9 @@ async function detectMockMode(): Promise<boolean> {
         );
       }
     }
+    // Notify React subscribers so a visible demo-data indicator can render
+    // (GH #904) — the flag/console.warn alone are invisible to the operator.
+    mockModeListeners.forEach((listener) => listener(useMocks as boolean));
     return useMocks;
   })();
   try {

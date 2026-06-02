@@ -223,6 +223,45 @@ button:focus:not(:focus-visible) { outline: none; }
   width: 100vw;
 }
 
+/* ── Demo/mock-data fallback banner (GH #904) ── */
+.v10-mock-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 14px;
+  font-size: 12px;
+  line-height: 1.4;
+  color: #7c2d12;
+  background: var(--amber-dim, rgba(251, 191, 36, 0.18));
+  border-bottom: 1px solid rgba(251, 191, 36, 0.45);
+  z-index: 30;
+}
+.v10-mock-banner strong {
+  font-weight: 700;
+}
+.v10-mock-banner-dot {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #f59e0b;
+  box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.25);
+}
+
+/* ── Retry control for failed view fetches (GH #905) ── */
+.v10-retry-btn {
+  font-size: 12px;
+  padding: 4px 14px;
+  border-radius: 6px;
+  cursor: pointer;
+  color: var(--text-primary, #e5e7eb);
+  background: var(--bg-elevated, rgba(255, 255, 255, 0.06));
+  border: 1px solid var(--border, rgba(255, 255, 255, 0.16));
+}
+.v10-retry-btn:hover {
+  background: var(--bg-hover, rgba(255, 255, 255, 0.12));
+}
+
 /* ── Header ── */
 .v10-header {
   height: var(--header-h);

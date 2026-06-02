@@ -3778,7 +3778,7 @@ export function KADetailView({ entity, allEntities, allTriples, onNavigate, onCl
                     <tr key={i}>
                       <td title={t.subject}>{shortPred(t.subject)}</td>
                       <td title={t.predicate}>{shortPred(t.predicate)}</td>
-                      <td title={t.object}>{t.object.startsWith('"') ? t.object.replace(/^"|"$/g, '').slice(0, 60) : shortPred(t.object)}</td>
+                      <td title={t.object}>{t.object.startsWith('"') ? decodeRdfStringLiteral(t.object).slice(0, 60) : shortPred(t.object)}</td>
                     </tr>
                   ))}
                 </tbody>

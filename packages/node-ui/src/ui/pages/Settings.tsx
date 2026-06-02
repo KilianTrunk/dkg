@@ -11,7 +11,7 @@ import {
   updateTelemetrySettings,
 } from '../api.js';
 import { formatEth, formatEthTooltip } from '../lib/formatEth.js';
-import { formatTracSymbol } from '../lib/formatTrac.js';
+import { formatTracSymbol, formatTrac } from '../lib/formatTrac.js';
 import { redactRpcUrl } from '../lib/redactRpcUrl.js';
 
 function Field({ label, value, mono = false }: { label: string; value: string; mono?: boolean }) {
@@ -479,7 +479,7 @@ function GeneralSettingsTab() {
                     {formatEth(b.eth)} ETH
                   </span>
                   <span className="mono" style={{ fontSize: 11, color: 'var(--text-muted)' }} title={`Exact: ${b.trac}`}>
-                    {parseFloat(b.trac).toFixed(2)} {formatTracSymbol(b.symbol, w?.chainId)}
+                    {formatTrac(b.trac)} {formatTracSymbol(b.symbol, w?.chainId)}
                   </span>
                 </div>
               </div>

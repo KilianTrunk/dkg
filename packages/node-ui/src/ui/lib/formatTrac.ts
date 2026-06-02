@@ -23,3 +23,23 @@ export function formatTracSymbol(symbol: string | null | undefined, chainId: str
   }
   return sym;
 }
+
+/**
+ * Guarded formatter for a TRAC wallet balance (GH #915). `/api/wallets/balances`
+ * types `trac` as `string`, but a node that can't read the TRAC token balance
+ * (RPC hiccup, token contract unreachable on a fresh chain, …) returns it null
+ * or non-numeric. The previous Settings render did `parseFloat(b.trac).toFixed(2)`,
+ * and `parseFloat(null|undefined|non-numeric)` is `NaN`, so the wallet row showed
+ * the literal string "NaN" — while the sibling ETH amount was guarded via
+ * `formatEth`. This returns an em-dash for missing/non-numeric values so the two
+ * balances stay consistent and the UI never renders "NaN".
+ *
+ * @param value Raw TRAC balance (string | number); null/undefined/non-numeric → "—".
+ * @param digits Fractional digits to display. Defaults to 2.
+ */
+export function formatTrac(value: unknown, digits = 2): string {
+  if (value == null || value === '') return '—';
+  const n = typeof value === 'number' ? value : parseFloat(String(value));
+  if (!Number.isFinite(n)) return '—';
+  return n.toFixed(digits);
+}

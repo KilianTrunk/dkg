@@ -111,7 +111,15 @@ function scrollElementFor(key: string, fallback: HTMLElement | null): HTMLElemen
 }
 
 export function ProjectView({ contextGraphId }: ProjectViewProps) {
-  const { data: cgData } = useFetch(api.fetchContextGraphs, [], 30_000);
+  // GH #905: consume `error`/`loading`/`refresh` — not just `data`. Gating the
+  // render on `cgData` alone meant a failed `fetchContextGraphs` left `cg`
+  // undefined and the view stuck on "Loading context graph…" forever, with no
+  // way to tell loading from error and no retry.
+  const { data: cgData, error: cgError, loading: cgLoading, refresh: refreshContextGraphs } = useFetch(
+    api.fetchContextGraphs,
+    [],
+    30_000,
+  );
   const [showImport, setShowImport] = useState(false);
   const [showShare, setShowShare] = useState(false);
   const [activeLayer, setActiveLayer] = useState<LayerView>('overview');
@@ -689,6 +697,23 @@ export function ProjectView({ contextGraphId }: ProjectViewProps) {
   }, [openTab]);
 
   if (!cg) {
+    // GH #905: a failed fetch must surface an error + retry, not masquerade as
+    // a perpetual loading state. `useFetch` keeps last-good data, so once the
+    // list has loaded at least once `cgError` only trips on a genuine refetch
+    // failure; `cgData && !cgLoading` covers "loaded fine but this id isn't in
+    // the list" (also previously stuck on "Loading…").
+    if (cgError || (cgData && !cgLoading)) {
+      return (
+        <div className="v10-view-placeholder">
+          <p style={{ color: 'var(--text-tertiary)', fontSize: 12, marginBottom: 10 }}>
+            {cgError ? 'Failed to load context graph.' : 'Context graph not found.'}
+          </p>
+          <button type="button" className="v10-retry-btn" onClick={refreshContextGraphs}>
+            Retry
+          </button>
+        </div>
+      );
+    }
     return (
       <div className="v10-view-placeholder">
         <p style={{ color: 'var(--text-tertiary)', fontSize: 12 }}>Loading context graph...</p>

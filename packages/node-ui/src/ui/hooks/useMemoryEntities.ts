@@ -2,6 +2,7 @@ import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { postQueryDeduped } from '../api.js';
 import { useMemoryGraphEvents } from './useNodeEvents.js';
 import { MEMORY_LABEL_PREDICATES } from '../lib/memoryLabels.js';
+import { decodeRdfStringLiteral } from '../../rdf-literal.js';
 
 export type TrustLevel = 'working' | 'shared' | 'verified';
 export type MemoryLayerKey = 'wm' | 'swm' | 'vm';
@@ -107,7 +108,7 @@ export function canonicalEntityUri(uri: string): string {
 
 function shortLabel(uri: string): string {
   if (!uri) return '—';
-  if (uri.startsWith('"')) return uri.replace(/^"|"$/g, '');
+  if (uri.startsWith('"')) return decodeRdfStringLiteral(uri);
   const hash = uri.lastIndexOf('#');
   const slash = uri.lastIndexOf('/');
   const cut = Math.max(hash, slash);
@@ -487,7 +488,7 @@ export function buildEntities(layered: LayeredTriple[]): Map<string, MemoryEntit
       }
     } else {
       const existing = entity.properties.get(t.predicate) ?? [];
-      const val = t.object.startsWith('"') ? t.object.replace(/^"|"$/g, '') : t.object;
+      const val = decodeRdfStringLiteral(t.object);
       if (!existing.includes(val)) {
         existing.push(val);
         entity.properties.set(t.predicate, existing);

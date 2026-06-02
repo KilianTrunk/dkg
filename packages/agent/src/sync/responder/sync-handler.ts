@@ -245,26 +245,32 @@ export function registerSyncHandler(params: RegisterSyncHandlerParams): void {
         // the prefix prevents `mfacts` from matching `mfacts-2`.
         const metaGraphScope = (g: string): string =>
           `FILTER(STRSTARTS(STR(${g}), "${cgUriPrefix}/") && STRENDS(STR(${g}), "/_meta"))`;
+        // Bind ?bid<sfx> to the batchId of the KC owning subject ?s, tolerant of
+        // the legacy shapes the rest of the agent also falls back on (see
+        // `getBatchMerkleRoot` in dkg-agent.ts): the canonical placement on the
+        // KC (`?kc dkg:batchId`) AND a legacy placement directly on the KA
+        // (`?ka dkg:batchId`). Either typed (`"5"^^xsd:integer`) or untyped
+        // (`"5"`) literals are accepted — the comparison below coerces via
+        // xsd:integer(STR(...)) so an untyped literal isn't silently skipped by
+        // a typed `>` comparison (which would resend stale rows or, in the
+        // NOT-EXISTS arm, hide eligible ones).
+        const batchIdOfSubject = (sfx: string): string => `
+                GRAPH ?mg${sfx} {
+                  ${metaGraphScope('?mg' + sfx)}
+                  ?ka${sfx} <${DKG_NS}partOf> ?ual${sfx} ; <${DKG_NS}rootEntity> ?re${sfx} .
+                  FILTER(?re${sfx} = ?s || STRSTARTS(STR(?s), CONCAT(STR(?re${sfx}), "/.well-known/genid/")))
+                  { ?ual${sfx} <${DKG_NS}batchId> ?bid${sfx} }
+                  UNION
+                  { ?ka${sfx} <${DKG_NS}batchId> ?bid${sfx} }
+                }`;
         const deltaFilter = sinceBatchId != null
           ? `
             FILTER(
-              NOT EXISTS {
-                GRAPH ?mgAny {
-                  ${metaGraphScope('?mgAny')}
-                  ?kaAny <${DKG_NS}partOf> ?ualAny ; <${DKG_NS}rootEntity> ?reAny .
-                  ?ualAny <${DKG_NS}batchId> ?bidAny .
-                  FILTER(?reAny = ?s || STRSTARTS(STR(?s), CONCAT(STR(?reAny), "/.well-known/genid/")))
-                }
+              NOT EXISTS {${batchIdOfSubject('Any')}
               }
               ||
-              EXISTS {
-                GRAPH ?mgNew {
-                  ${metaGraphScope('?mgNew')}
-                  ?kaNew <${DKG_NS}partOf> ?ualNew ; <${DKG_NS}rootEntity> ?reNew .
-                  ?ualNew <${DKG_NS}batchId> ?bidNew .
-                  FILTER(?reNew = ?s || STRSTARTS(STR(?s), CONCAT(STR(?reNew), "/.well-known/genid/")))
-                  FILTER(?bidNew > "${sinceBatchId.toString()}"^^<http://www.w3.org/2001/XMLSchema#integer>)
-                }
+              EXISTS {${batchIdOfSubject('New')}
+                FILTER(<http://www.w3.org/2001/XMLSchema#integer>(STR(?bidNew)) > ${sinceBatchId.toString()})
               }
             )`
           : '';

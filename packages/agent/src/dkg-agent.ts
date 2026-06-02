@@ -18078,12 +18078,19 @@ export class DKGAgent {
     const includeSharedMemory = ctxGraphPart.startsWith('workspace:');
     const contextGraphId = includeSharedMemory ? ctxGraphPart.slice('workspace:'.length) : (ctxGraphPart || SYSTEM_CONTEXT_GRAPHS.AGENTS);
     const phase = normalizeSyncPhase(parts[3]);
-    // Phase C: locate a trailing `|since|<n>` keyed token (position-independent
-    // so it survives the optional phase suffix). Old encoders never emit it.
+    // Phase C: the `|since|<n>` keyed token is ALWAYS the final two segments
+    // emitted by `buildSyncRequestEnvelope` (after the optional phase/snapshot
+    // suffix). Match only that trailing position — scanning every segment would
+    // misparse an ordinary segment literally equal to "since" (e.g. a CG or
+    // snapshotRef named "since") as a delta marker and turn a full sync into a
+    // partial response. Old encoders never emit the suffix.
     let sinceBatchId: string | undefined;
-    const sinceIdx = parts.indexOf('since');
-    if (sinceIdx >= 0 && sinceIdx + 1 < parts.length && /^\d+$/.test(parts[sinceIdx + 1])) {
-      sinceBatchId = parts[sinceIdx + 1];
+    if (
+      parts.length >= 2 &&
+      parts[parts.length - 2] === 'since' &&
+      /^\d+$/.test(parts[parts.length - 1])
+    ) {
+      sinceBatchId = parts[parts.length - 1];
     }
     return {
       contextGraphId,

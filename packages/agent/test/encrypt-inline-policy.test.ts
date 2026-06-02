@@ -36,10 +36,14 @@ function makeAgentLike(opts: {
   } as any;
   // `probeIsCurated` now consults the on-chain-public override first; bind
   // the real prototype method so the harness exercises production code.
-  // It fails closed (returns false) here because this lightweight harness
-  // exposes no `getContextGraphOnChainId`, leaving the existing numeric/
-  // local probe assertions below unchanged.
   agentLike.isContextGraphPublicOnChain = (DKGAgent.prototype as any).isContextGraphPublicOnChain;
+  // #884 review round-3: the numeric branch of `isContextGraphPublicOnChain`
+  // calls `this.isKnownOnChainId(...)` to gate the on-chain-id shortcut on
+  // proven registration. Stub it so the digit-only test ids ("42") are
+  // treated as known and the assertions exercise the public-override path
+  // (chain access-policy read) rather than throwing into the fail-closed
+  // catch and silently falling back to the legacy numeric probe.
+  agentLike.isKnownOnChainId = vi.fn((id: string) => /^\d+$/.test(String(id)));
   return agentLike;
 }
 

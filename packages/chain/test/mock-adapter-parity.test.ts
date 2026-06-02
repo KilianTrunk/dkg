@@ -110,6 +110,10 @@ const MOCK_EXEMPT_FROM_EVM = new Set<string>([
   // the `chain.approvalPolicy` dispatch and the `transferFrom(..., 1n)`
   // floor; the mock has no ERC-20 allowance surface to mirror.
   'ensureV10ApproveTrac',
+  // TS-private post-approve allowance visibility poll (#888). Backs the
+  // forced re-approve retry on a stale-RPC `TooLowAllowance` revert; the
+  // mock has no ERC-20 allowance surface to mirror.
+  'confirmAllowanceVisible',
   // Lazy-cache helpers for frequently-resolved contracts — TS-private,
   // not part of the ChainAdapter interface.
   'getIdentityStorage',

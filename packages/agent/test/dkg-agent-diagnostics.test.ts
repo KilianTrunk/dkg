@@ -83,6 +83,8 @@ function makeAgentLike({
   peerStoreEntries,
   outboxEntries,
   health,
+  lastSuccessfulSyncAt,
+  syncReconcilerBackoff,
 }: {
   rawConnections: StubConnection[];
   keyedConnectionsByPeer?: Map<string, StubConnection[]>;
@@ -105,6 +107,8 @@ function makeAgentLike({
   >;
   outboxEntries?: StubOutboxEntry[];
   health?: Map<string, any>;
+  lastSuccessfulSyncAt?: Map<string, number>;
+  syncReconcilerBackoff?: Map<string, { failures: number; nextRetryAt: number }>;
 }): any {
   return {
     node: {
@@ -126,6 +130,8 @@ function makeAgentLike({
     },
     messenger: makeOutboxStub(outboxEntries ?? []),
     peerHealth: health ?? new Map(),
+    lastSuccessfulSyncAt: lastSuccessfulSyncAt ?? new Map(),
+    syncReconcilerBackoff: syncReconcilerBackoff ?? new Map(),
   };
 }
 
@@ -292,6 +298,46 @@ describe('DKGAgent.getPeerDiagnostics', () => {
       });
       expect(diag.protocols).toEqual(['/dkg/10.0.2/sync', '/dkg/10.0.1/message']);
       expect(diag.syncCapable).toBe(true);
+      expect(diag.syncStatus).toEqual({
+        capable: true,
+        lastSuccessfulSyncAt: null,
+        stale: true,
+        backoff: null,
+      });
+    });
+
+    it('surfaces raw sync status separately from substrate outbox state', async () => {
+      const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(1_000_000);
+      try {
+        const agentLike = makeAgentLike({
+          rawConnections: [],
+          peerStoreEntries: new Map([
+            [
+              PEER_A,
+              {
+                addresses: [],
+                protocols: ['/dkg/10.0.2/sync'],
+              },
+            ],
+          ]),
+          lastSuccessfulSyncAt: new Map([[PEER_A, 100_000]]),
+          syncReconcilerBackoff: new Map([[PEER_A, { failures: 3, nextRetryAt: 1_010_000 }]]),
+        });
+        const diag = await callDiagnostics(agentLike, PEER_A);
+        expect(diag.syncStatus).toEqual({
+          capable: true,
+          lastSuccessfulSyncAt: 100_000,
+          stale: true,
+          backoff: {
+            failures: 3,
+            nextRetryAt: 1_010_000,
+            retryInMs: 10_000,
+          },
+        });
+        expect(diag.outbox.byProtocol).toEqual({});
+      } finally {
+        nowSpy.mockRestore();
+      }
     });
 
     // rc.11 follow-up to the "version on the wire" gap surfaced during
@@ -546,6 +592,12 @@ describe('DKGAgent.getPeerDiagnostics', () => {
         peerStore: null,
         protocols: [],
         syncCapable: false,
+        syncStatus: {
+          capable: false,
+          lastSuccessfulSyncAt: null,
+          stale: true,
+          backoff: null,
+        },
       });
     });
 

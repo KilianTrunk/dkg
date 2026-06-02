@@ -272,6 +272,16 @@ export class ApiClient {
     remoteAddrs: Array<string | null>;
     protocols: string[];
     syncCapable: boolean;
+    syncStatus: {
+      capable: boolean;
+      lastSuccessfulSyncAt: number | null;
+      stale: boolean;
+      backoff: {
+        failures: number;
+        nextRetryAt: number;
+        retryInMs: number;
+      } | null;
+    };
     lastSeen: number | null;
     latencyMs: number | null;
   }> {

@@ -1291,6 +1291,13 @@ program
       console.log(`Connected:     ${info.connected ? 'yes' : 'no'}`);
       console.log(`Connections:   ${info.connectionCount}`);
       console.log(`Sync Capable:  ${info.syncCapable ? 'yes' : 'no'}`);
+      const syncLastOk = info.syncStatus.lastSuccessfulSyncAt
+        ? new Date(info.syncStatus.lastSuccessfulSyncAt).toISOString()
+        : 'never';
+      const syncBackoff = info.syncStatus.backoff
+        ? `, backoff failures=${info.syncStatus.backoff.failures}, retry in ${Math.round(info.syncStatus.backoff.retryInMs / 1000)}s`
+        : '';
+      console.log(`Sync Status:   ${info.syncStatus.stale ? 'stale' : 'fresh'} (last success: ${syncLastOk}${syncBackoff})`);
       if (info.transports.length > 0) console.log(`Transports:    ${info.transports.join(', ')}`);
       if (info.directions.length > 0) console.log(`Directions:    ${info.directions.join(', ')}`);
       if (info.remoteAddrs.length > 0) console.log(`Remote Addrs:  ${info.remoteAddrs.filter(Boolean).join(', ')}`);

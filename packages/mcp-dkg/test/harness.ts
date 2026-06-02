@@ -384,6 +384,12 @@ export class FakeClient {
       outbox: { pendingCount: 0, oldestFirstFailureAt: null, attempts: [], byProtocol: {} },
       protocols: [],
       syncCapable: false,
+      syncStatus: {
+        capable: false,
+        lastSuccessfulSyncAt: null,
+        stale: true,
+        backoff: null,
+      },
       lastSeen: null,
       latencyMs: null,
       health: null,

@@ -391,6 +391,45 @@ describe('DKGAgent sync retry — periodic reconciler', () => {
       await agent.stop().catch(() => {});
     }
   });
+
+  it('does not recreate backoff after the peer disconnects while an attempt is in flight', async () => {
+    const agent = await DKGAgent.create({
+      name: 'ReconcilerBackoffDisconnectRace',
+      listenHost: '127.0.0.1',
+      chainAdapter: new MockChainAdapter(),
+    });
+    try {
+      await agent.start();
+
+      const peerA = freshPeerIdString();
+      let connectedPeers = [peerIdFromString(peerA)];
+      vi.spyOn(agent.node.libp2p, 'getPeers').mockImplementation(() => connectedPeers);
+
+      let resolveAttempt!: () => void;
+      const calls: string[] = [];
+      (agent as any).trySyncFromPeer = (peerId: string) => {
+        calls.push(peerId);
+        return new Promise<void>((resolve) => {
+          resolveAttempt = resolve;
+        });
+      };
+
+      await (agent as any).reconcileSyncFromConnectedPeers();
+      await new Promise(r => setTimeout(r, 0));
+      expect(calls).toEqual([peerA]);
+
+      // Simulate connection:close winning the race before the
+      // fire-and-forget sync attempt resolves without progress.
+      connectedPeers = [];
+      (agent as any).syncReconcilerBackoff.delete(peerA);
+      resolveAttempt();
+      await new Promise(r => setTimeout(r, 50));
+
+      expect((agent as any).syncReconcilerBackoff.has(peerA)).toBe(false);
+    } finally {
+      await agent.stop().catch(() => {});
+    }
+  });
 });
 
 describe('DKGAgent sync state lifecycle', () => {

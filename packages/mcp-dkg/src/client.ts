@@ -122,8 +122,10 @@ export interface PeerInfo {
    * {@link byProtocol} (rc.9 PR-E codex follow-up #10 — daemon
    * shipped in b3dd4db4) breaks out queued entries per libp2p
    * protocol id so the per-protocol substrate-outbox state
-   * (sync, SWM, future protocols) is visible to MCP consumers.
-   * Each per-protocol summary mirrors the top-level shape.
+   * (SWM, access, future protocols) is visible to MCP consumers.
+   * Raw sync catch-up state lives in `syncStatus` because sync is
+   * off the substrate. Each per-protocol summary mirrors the
+   * top-level shape.
    */
   outbox: {
     /** Chat-protocol pending count (rc.8 contract). */
@@ -151,6 +153,16 @@ export interface PeerInfo {
   };
   protocols: string[];
   syncCapable: boolean;
+  syncStatus: {
+    capable: boolean;
+    lastSuccessfulSyncAt: number | null;
+    stale: boolean;
+    backoff: {
+      failures: number;
+      nextRetryAt: number;
+      retryInMs: number;
+    } | null;
+  };
   lastSeen: number | null;
   latencyMs: number | null;
   health: {

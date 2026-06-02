@@ -3556,6 +3556,7 @@ export class DKGAgent {
    * (`onPeerSynced`) or disconnect (`connection:close`).
    */
   private recordSyncReconcilerFailure(peerId: string): void {
+    if (!this.started || !this.isPeerConnectedForSyncBackoff(peerId)) return;
     const failures = (this.syncReconcilerBackoff.get(peerId)?.failures ?? 0) + 1;
     // Clamp the exponent so `2 ** exp` can never overflow before the cap.
     const exp = Math.min(failures - 1, 30);
@@ -3565,6 +3566,14 @@ export class DKGAgent {
       failures,
       nextRetryAt: Date.now() + jittered,
     });
+  }
+
+  private isPeerConnectedForSyncBackoff(peerId: string): boolean {
+    try {
+      return this.node.libp2p.getPeers().some((pid) => pid.toString() === peerId);
+    } catch {
+      return false;
+    }
   }
 
   /**
@@ -21410,6 +21419,12 @@ export class DKGAgent {
         health: null,
         protocols: [],
         syncCapable: false,
+        syncStatus: {
+          capable: false,
+          lastSuccessfulSyncAt: null,
+          stale: true,
+          backoff: null,
+        },
       };
     }
 
@@ -21557,6 +21572,21 @@ export class DKGAgent {
     // cutover — peers on the older `/sync` wire ID are no longer
     // compatible and intentionally report syncCapable=false.
     const syncCapable = protocols.includes(PROTOCOL_SYNC);
+    const now = Date.now();
+    const lastSuccessfulSync = this.lastSuccessfulSyncAt.get(peerKey) ?? null;
+    const backoff = this.syncReconcilerBackoff.get(peerKey) ?? null;
+    const syncStatus = {
+      capable: syncCapable,
+      lastSuccessfulSyncAt: lastSuccessfulSync,
+      stale: lastSuccessfulSync == null || (now - lastSuccessfulSync) >= SYNC_STALENESS_THRESHOLD_MS,
+      backoff: backoff
+        ? {
+            failures: backoff.failures,
+            nextRetryAt: backoff.nextRetryAt,
+            retryInMs: Math.max(0, backoff.nextRetryAt - now),
+          }
+        : null,
+    };
 
     return {
       peerId: peerKey,
@@ -21569,6 +21599,7 @@ export class DKGAgent {
       health: this.peerHealth.get(peerKey) ?? null,
       protocols,
       syncCapable,
+      syncStatus,
     };
   }
 

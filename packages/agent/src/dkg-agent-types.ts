@@ -410,9 +410,9 @@ export interface PeerDiagnostics {
    *
    * `byProtocol` (rc.9 PR-E codex follow-up #10) breaks out queued
    * entries per libp2p protocol id so post-substrate-migration
-   * traffic (sync, SWM, future protocols) is visible to operator
-   * diagnostics — without it, a peer stuck on sync catch-up reports
-   * `pendingCount=0` and looks healthy.
+   * substrate traffic (SWM, access, future protocols) is visible to
+   * operator diagnostics. Raw sync catch-up state lives in
+   * `syncStatus` because sync is no longer on the substrate.
    */
   outbox: {
     /** Pending count for the chat protocol specifically (rc.8 contract). */
@@ -442,6 +442,21 @@ export interface PeerDiagnostics {
   protocols: string[];
   /** Convenience flag — peer speaks `PROTOCOL_SYNC`. */
   syncCapable: boolean;
+  /**
+   * Raw sync catch-up health. Sync no longer lives on the messenger
+   * substrate, so stuck catch-up is exposed here instead of in
+   * `outbox.byProtocol`.
+   */
+  syncStatus: {
+    capable: boolean;
+    lastSuccessfulSyncAt: number | null;
+    stale: boolean;
+    backoff: {
+      failures: number;
+      nextRetryAt: number;
+      retryInMs: number;
+    } | null;
+  };
 }
 
 /**

@@ -11,6 +11,12 @@ import { registerHealthTools } from '../src/tools/health.js';
 import { FakeServer, FakeClient, makeConfig } from './harness.js';
 
 const PEER_A = '12D3KooWFq5KMnSMyYr8Z8t8a6Vh1Y6N6KkF5UZjLpCqUkBJsAaa';
+const STALE_SYNC_STATUS = {
+  capable: false,
+  lastSuccessfulSyncAt: null,
+  stale: true,
+  backoff: null,
+};
 
 describe('health tools', () => {
   let server: FakeServer;
@@ -54,6 +60,12 @@ describe('health tools', () => {
         outbox: { pendingCount: 0, oldestFirstFailureAt: null, attempts: [], byProtocol: {} },
         protocols: ['/dkg/10.0.2/sync'],
         syncCapable: true,
+        syncStatus: {
+          capable: true,
+          lastSuccessfulSyncAt: 1715670005000,
+          stale: false,
+          backoff: null,
+        },
         lastSeen: 1715670010000,
         latencyMs: 42,
         health: null,
@@ -69,6 +81,7 @@ describe('health tools', () => {
       expect(body).toContain(PEER_A);
       expect(body).toContain('"connected": true');
       expect(body).toContain('"getConnectionsReturnsForPeer": 1');
+      expect(body).toContain('"syncStatus"');
       // sync protocol is /dkg/10.0.2/sync (off the messenger substrate).
       expect(body).toContain('/dkg/10.0.2/sync');
     });
@@ -110,6 +123,7 @@ describe('health tools', () => {
         },
         protocols: [],
         syncCapable: false,
+        syncStatus: STALE_SYNC_STATUS,
         lastSeen: null,
         latencyMs: null,
         health: null,
@@ -170,6 +184,7 @@ describe('health tools', () => {
           outbox: { pendingCount: 0, oldestFirstFailureAt: null, attempts: [], byProtocol: {} },
           protocols: [],
           syncCapable: false,
+          syncStatus: STALE_SYNC_STATUS,
           lastSeen: null,
           latencyMs: null,
           health: null,

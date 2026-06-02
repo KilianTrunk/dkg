@@ -4,6 +4,16 @@ All notable changes to the DKG V9 node are documented here. The format is based 
 
 ## [Unreleased]
 
+### Added — Opt-in daemon-managed local Oxigraph server (Release 2, phase 2a)
+
+- **`store.backend: 'oxigraph-server'`** (`packages/cli/src/daemon/oxigraph-binary.ts`, `oxigraph-server.ts`, `oxigraph-managed.ts`): a new **opt-in** triple-store backend that runs a daemon-supervised local [Oxigraph](https://github.com/oxigraph/oxigraph) server (RocksDB-backed) instead of the embedded in-process worker. This gives **MVCC concurrent reads** (queries stop blocking on the single writer — the root cause of the slow-CG-create-under-sync-load symptom) and incremental persistence (no O(total-triples) full-dump flush), with the same engine for semantic parity.
+  - **Fetch-on-install**: the daemon downloads the pinned prebuilt `oxigraph` v0.5.8 binary for the host (`process.platform`/`process.arch`), verifies it against a baked-in SHA-256, caches it under `<DKG_HOME>/oxigraph`, marks it executable, and clears the macOS quarantine xattr. No binary is bundled in the npm package (~15–20 MB fetched once per host; the six platform variants would be ~100 MB).
+  - **Supervision**: the daemon spawns `oxigraph serve` bound to loopback (`127.0.0.1`), health-checks it before the agent boots, restarts it with capped backoff on unexpected exit, and stops it after the agent during shutdown (so no in-flight query races the kill).
+  - **Zero new downstream plumbing**: `oxigraph-server` is normalised in memory to the existing `sparql-http` backend pointing at the local server, so config validation, the boot reachability probe, namespace-identity tagging, and chain-reset wipe all reuse the external-backend path unchanged. `managedByDkg: true` is set so chain-reset wipe uses `DROP ALL` on the locally-owned RocksDB.
+  - **Enable it**: set `"store": { "backend": "oxigraph-server" }` in `~/.dkg/config.json`, pass `--store oxigraph-server` to the setup commands, or type `oxigraph-server` at the `dkg init` store prompt. Default backend is **unchanged** (`oxigraph-worker`); switching backends starts on an empty store and requires `DKG_ACCEPT_STORE_RESET=1` on first switch.
+  - **Security**: `oxigraph serve` has no native auth; the security boundary for the managed server is the loopback bind. The endpoint is never exposed off-host.
+  - **Linux caveat**: the prebuilt Linux artifacts are glibc-only (`*_linux_gnu`); musl hosts (Alpine/distroless) must use a system-provided `oxigraph` or an external `sparql-http` endpoint.
+
 ## [10.0.0-rc.13] - 2026-06-02
 
 **Off-chain stabilization release.** No Solidity changes since rc.12 — the Base Sepolia (chainId 84532) deployment in `packages/evm-module/deployments/base_sepolia_v10_contracts.json` is **unchanged**, the `chainResetMarker` stays `v10-rc12-ka-rename-2026-06-01`, and **no contract redeploy is required**. Nodes upgrade in place; no local-state wipe. This release lands the core-preferred sync + chain-driven VM reconciliation work, the Kafka route-plugin MVP, and a batch of publish/SWM runtime hardening and Node UI fixes accumulated on top of rc.12.

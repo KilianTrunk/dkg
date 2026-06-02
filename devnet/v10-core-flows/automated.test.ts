@@ -108,7 +108,10 @@ const RS_ABI = [
   'function getAllNodesEpochScore(uint256) view returns (uint256)',
 ];
 const ES_ABI = ['function getEpochPool(uint256, uint256) view returns (uint96)'];
-const ERC20_ABI = ['function balanceOf(address) view returns (uint256)'];
+const ERC20_ABI = [
+  'function balanceOf(address) view returns (uint256)',
+  'function approve(address, uint256) returns (bool)',
+];
 
 // ───────────────────────────── fixtures ──────────────────────────────────
 interface Delegator {
@@ -481,6 +484,9 @@ describe('3. NFT staking withdraw', () => {
       const seedWallet = new ethers.Wallet(seed!.privateKey, state.provider);
       const seedNft = new ethers.Contract(state.nft.target, NFT_ABI, seedWallet);
       const stakeAmount = ethers.parseEther('10000');
+      const stakingV10Address = await state.staking.getAddress();
+      const tokenAsSeed = state.token.connect(seedWallet) as ethers.Contract;
+      await tokenAsSeed.approve(stakingV10Address, stakeAmount, { gasLimit: 500_000 });
       const createTx = await seedNft.createConviction(
         BigInt(seed!.identityId),
         stakeAmount,

@@ -13015,9 +13015,19 @@ export class DKGAgent {
     const existing = this.subscribedContextGraphs.get(localCgId);
     if (existing?.coreHosted && existing.onChainId === numericStr) return; // already recorded
 
-    const next: ContextGraphSub = existing
-      ? { ...existing, coreHosted: true, onChainId: numericStr }
-      : { subscribed: false, synced: false, onChainId: numericStr, coreHosted: true };
+    let next: ContextGraphSub;
+    if (existing) {
+      // Rebind through the helper so a CG re-created/rebound under the same
+      // local id drops its stale reconcile watermark + in-memory cursor before
+      // we persist the new on-chain id. A bare `onChainId` overwrite would keep
+      // the old `lastReconciledOrdinal`, making the sweep resume at the prior
+      // graph's ordinal and permanently skip the new graph's early KAs.
+      this.bindSubscriptionOnChainId(localCgId, existing, numericStr);
+      existing.coreHosted = true;
+      next = existing;
+    } else {
+      next = { subscribed: false, synced: false, onChainId: numericStr, coreHosted: true };
+    }
     this.setContextGraphSubscription(localCgId, next);
     this.log.info(
       createOperationContext('system'),

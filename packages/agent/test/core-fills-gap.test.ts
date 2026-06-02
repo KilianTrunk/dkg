@@ -188,6 +188,30 @@ describe('Phase D — recordCoreHostedPublicCg', () => {
     expect(sub!.coreHosted).toBe(true);
     expect(sub!.lastReconciledOrdinal).toBe(3);  // watermark preserved
   });
+
+  it('resets the reconcile watermark when an existing local id rebinds to a NEW on-chain id', async () => {
+    // Regression: a hosted public CG re-created/rebound under the same local id
+    // must drop its stale `lastReconciledOrdinal`. The watermark counts
+    // contiguous KAs promoted for the OLD chain graph; reusing it would make
+    // the sweep resume at the wrong ordinal and permanently skip the new
+    // graph's early KAs. The row must route through bindSubscriptionOnChainId
+    // (which zeroes the watermark on an id change) rather than a bare overwrite.
+    const internals = await boot();
+    internals.chain.getContextGraphAccessPolicy = async () => 0; // public
+    // Existing local row bound to on-chain id 5 with reconcile progress.
+    internals.subscribedContextGraphs.set('devnet-test', {
+      subscribed: true, onChainId: '5', lastReconciledOrdinal: 3,
+    });
+
+    // Same local id ("devnet-test"), but now hosting a DIFFERENT chain graph (9).
+    await internals.recordCoreHostedPublicCg('9', 'devnet-test');
+
+    const sub = internals.subscribedContextGraphs.get('devnet-test');
+    expect(sub!.subscribed).toBe(true);            // membership preserved
+    expect(sub!.coreHosted).toBe(true);
+    expect(sub!.onChainId).toBe('9');              // rebound to the new graph
+    expect(sub!.lastReconciledOrdinal).toBe(0);    // stale watermark dropped
+  });
 });
 
 describe('Phase D — reconcile gate + core-fill telemetry', () => {

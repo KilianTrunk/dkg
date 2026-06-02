@@ -3,10 +3,11 @@ import { isUsingMocks, subscribeMockMode } from '../api-wrapper.js';
 
 /**
  * Visible indicator shown whenever the UI has silently fallen back to
- * fabricated demo data because the node is unreachable (GH #904).
+ * fabricated demo data because the node isn't responding normally (GH #904).
  *
  * `api-wrapper.detectMockMode()` swaps every endpoint to `mocks/provider.ts`
- * fixtures on a non-OK (≠401) / timeout / network error from `/api/status`.
+ * fixtures on a non-OK (≠401) / timeout / network error from `/api/status` —
+ * i.e. the daemon is down, timing out, OR reachable but returning an error.
  * Without this banner the only signals were a `console.warn` and a
  * `window.__DKG_USING_MOCKS__` flag — so a node operator whose daemon is down
  * sees a healthy-looking dashboard (synced, peers, balances) built entirely
@@ -33,8 +34,9 @@ export function MockModeBanner() {
     <div className="v10-mock-banner" role="alert" aria-live="polite">
       <span className="v10-mock-banner-dot" aria-hidden="true" />
       <span>
-        <strong>Demo data</strong> — the node is unreachable, so the UI is showing
-        example data, not live node state. Reconnect the daemon, then reload.
+        <strong>Demo data</strong> — the node isn’t responding (it may be down,
+        timing out, or returning errors), so the UI is showing example data, not
+        live node state. Check the daemon, then reload.
       </span>
       <button
         type="button"

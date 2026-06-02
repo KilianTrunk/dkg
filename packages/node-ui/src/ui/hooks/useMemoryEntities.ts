@@ -494,21 +494,25 @@ export function buildEntities(layered: LayeredTriple[]): Map<string, MemoryEntit
         });
       }
     } else {
-      // Dedupe on the DECODED display value, not the raw term. The Properties
-      // panel renders only the decoded lexical form, so two literals that share
-      // it (`"hello"@en` vs `"hello"@fr`, `"1"^^xsd:int` vs `"1"^^xsd:string`)
-      // would otherwise show as indistinguishable duplicate rows. Collapsing
-      // them keeps the panel honest until the UI can surface the datatype/lang
-      // distinction (Codex). #913 still holds — the raw `^^<…>`/`@lang` suffix
-      // never reaches the screen.
-      const decoded = decodeRdfStringLiteral(t.object);
+      // Dedupe on the RAW term, not the decoded display string. This is a
+      // deliberate data-integrity choice that has flip-flopped in review:
+      //   • `"1"^^xsd:integer` vs `"1"^^xsd:string`, and `"x"@en` vs `"x"@fr`,
+      //     are DISTINCT RDF values. Keying dedup on the decoded form collapses
+      //     them and silently drops a real value — strictly worse than showing
+      //     two look-alike rows (Codex RED). So we preserve every distinct term.
+      //   • The cost is that two literals sharing a lexical form render as
+      //     visually-similar rows. Surfacing the datatype/lang badge that would
+      //     disambiguate them is a UI enhancement tracked separately; doing it
+      //     inline would either drop data or re-leak the `^^<…>` suffix (#913).
+      // The displayed value is still the decoded lexical form, so #913 holds —
+      // the raw `^^<…>`/`@lang` suffix never reaches the screen.
       const pKeys = propertyKeys.get(entity.uri) ?? new Set<string>();
-      const displayKey = `${t.predicate}\0${decoded}`;
-      if (!pKeys.has(displayKey)) {
-        pKeys.add(displayKey);
+      const rawKey = `${t.predicate}\0${t.object}`;
+      if (!pKeys.has(rawKey)) {
+        pKeys.add(rawKey);
         propertyKeys.set(entity.uri, pKeys);
         const existing = entity.properties.get(t.predicate) ?? [];
-        existing.push(decoded);
+        existing.push(decodeRdfStringLiteral(t.object));
         entity.properties.set(t.predicate, existing);
       }
     }

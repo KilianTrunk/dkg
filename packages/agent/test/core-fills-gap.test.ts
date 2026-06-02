@@ -31,7 +31,7 @@ import type { ReplicationEvent, ContextGraphSubscriptionRecord } from '../src/dk
 import { DKGAgent } from '../src/index.js';
 
 interface AgentInternals {
-  recordCoreHostedPublicCg(cgId: string): Promise<void>;
+  recordCoreHostedPublicCg(cgId: string, swmGraphId?: string): Promise<void>;
   runVmReconcileForCg(localCgId: string): Promise<void>;
   runVmReconcileSweep(): Promise<void>;
   subscribedContextGraphs: Map<string, { subscribed: boolean; coreHosted?: boolean; onChainId?: string; lastReconciledOrdinal?: number }>;
@@ -111,6 +111,37 @@ describe('Phase D — recordCoreHostedPublicCg', () => {
     const persisted = saved.find((r) => r.id === '42');
     expect(persisted?.coreHosted).toBe(true);
     expect(persisted?.subscribed).toBe(false);
+  });
+
+  it('keys the host row under the cleartext swmGraphId (not the numeric id) on first ACK', async () => {
+    // Regression: on the first ACK for a CG we only host, there is no local
+    // mapping yet, so without the cleartext hint the row would land under the
+    // numeric id ("1") instead of the local CG name ("devnet-test"), and the
+    // reconciler would sync against the wrong namespace.
+    const internals = await boot();
+    internals.chain.getContextGraphAccessPolicy = async () => 0; // public
+
+    await internals.recordCoreHostedPublicCg('1', 'devnet-test');
+
+    // Recorded under the cleartext local id, with the numeric on-chain id bound.
+    const sub = internals.subscribedContextGraphs.get('devnet-test');
+    expect(sub).toBeDefined();
+    expect(sub!.coreHosted).toBe(true);
+    expect(sub!.onChainId).toBe('1');
+    // NOT under the numeric id.
+    expect(internals.subscribedContextGraphs.get('1')).toBeUndefined();
+    const persisted = saved.find((r) => r.id === 'devnet-test');
+    expect(persisted?.coreHosted).toBe(true);
+  });
+
+  it('ignores a numeric swmGraphId hint and falls back to the numeric id', async () => {
+    const internals = await boot();
+    internals.chain.getContextGraphAccessPolicy = async () => 0;
+
+    // A numeric (or equal-to-cgId) hint carries no cleartext info → numericStr.
+    await internals.recordCoreHostedPublicCg('8', '8');
+
+    expect(internals.subscribedContextGraphs.get('8')?.coreHosted).toBe(true);
   });
 
   it('does NOT mark a CURATED CG (Cores host curated as opaque ciphertext, not VM)', async () => {

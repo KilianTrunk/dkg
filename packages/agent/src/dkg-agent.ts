@@ -2123,7 +2123,7 @@ export class DKGAgent {
                 // hosts the CG so the chain-driven VM reconciler fills its gaps
                 // across restarts. Best-effort + public-CG-gated inside the
                 // helper; never blocks or affects the (sync) provenance return.
-                void this.recordCoreHostedPublicCg(cgId);
+                void this.recordCoreHostedPublicCg(cgId, swmGraphId);
                 const wireFromCgId = cgId ? this.gossipWireIdFor(cgId) : undefined;
                 const wireFromSwmGraphId = swmGraphId && swmGraphId !== cgId
                   ? this.gossipWireIdFor(swmGraphId)
@@ -12127,7 +12127,7 @@ export class DKGAgent {
    * a Core cannot promote to plaintext VM — their coverage stays on the
    * host-mode reconciler + LU-11 chunk-backfill path. Best-effort + idempotent.
    */
-  private async recordCoreHostedPublicCg(cgId: string): Promise<void> {
+  private async recordCoreHostedPublicCg(cgId: string, swmGraphId?: string): Promise<void> {
     if (!this.vmReconcileEnabled()) return;
     let numeric: bigint;
     try {
@@ -12141,7 +12141,21 @@ export class DKGAgent {
     if (policy !== 0) return; // curated / unknown — not the public VM-promote path
 
     const numericStr = numeric.toString();
-    const localCgId = this.resolveLocalCgIdByOnChainId(numeric) ?? numericStr;
+    // Pick the local CG id to key the host-only record under. Prefer an
+    // existing local mapping; otherwise use the publisher-supplied cleartext
+    // `swmGraphId` (the local CG name for a public/cleartext publish). On the
+    // FIRST ACK for a CG we only host (never subscribed to),
+    // `resolveLocalCgIdByOnChainId()` is still empty — falling back to the
+    // numeric id would persist the row under `did:dkg:context-graph:<numeric>`,
+    // a namespace that doesn't hold the hosted SWM snapshot, so after restart
+    // the reconciler + active-fetch would sync/promote against the wrong graph
+    // and miss the KA this core already ACKed. The cleartext hint keeps the
+    // row under the same id the reconciler uses. Numeric/empty hints are
+    // ignored (last-resort numericStr keeps legacy behaviour).
+    const cleartextHint = swmGraphId && swmGraphId !== numericStr && !/^\d+$/.test(swmGraphId)
+      ? swmGraphId
+      : undefined;
+    const localCgId = this.resolveLocalCgIdByOnChainId(numeric) ?? cleartextHint ?? numericStr;
     const existing = this.subscribedContextGraphs.get(localCgId);
     if (existing?.coreHosted && existing.onChainId === numericStr) return; // already recorded
 

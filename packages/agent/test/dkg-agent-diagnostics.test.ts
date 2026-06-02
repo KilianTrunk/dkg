@@ -18,7 +18,7 @@
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { DKGAgent } from '../src/dkg-agent.js';
-import { PROTOCOL_MESSAGE, type ProtocolOutboxEntry } from '@origintrail-official/dkg-core';
+import { PROTOCOL_MESSAGE, PROTOCOL_SYNC, type ProtocolOutboxEntry } from '@origintrail-official/dkg-core';
 
 interface StubOutboxEntry {
   peer: string;
@@ -281,7 +281,7 @@ describe('DKGAgent.getPeerDiagnostics', () => {
                 { multiaddr: { toString: () => '/ip4/1.2.3.4/tcp/4001' } },
                 { multiaddr: { toString: () => `/ip4/5.6.7.8/tcp/4001/p2p/${PEER_A}` } },
               ],
-              protocols: ['/dkg/10.0.2/sync', '/dkg/10.0.1/message'],
+              protocols: [PROTOCOL_SYNC, PROTOCOL_MESSAGE],
             },
           ],
         ]),
@@ -296,7 +296,7 @@ describe('DKGAgent.getPeerDiagnostics', () => {
         nodeVersion: null,
         protocolVersion: null,
       });
-      expect(diag.protocols).toEqual(['/dkg/10.0.2/sync', '/dkg/10.0.1/message']);
+      expect(diag.protocols).toEqual([PROTOCOL_SYNC, PROTOCOL_MESSAGE]);
       expect(diag.syncCapable).toBe(true);
       expect(diag.syncStatus).toEqual({
         capable: true,
@@ -304,6 +304,36 @@ describe('DKGAgent.getPeerDiagnostics', () => {
         stale: true,
         backoff: null,
       });
+    });
+
+    it('does not mark peers that lack the current sync protocol as stale', async () => {
+      const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(1_000_000);
+      try {
+        const agentLike = makeAgentLike({
+          rawConnections: [],
+          peerStoreEntries: new Map([
+            [
+              PEER_A,
+              {
+                addresses: [],
+                protocols: ['/dkg/10.0.1/sync'],
+              },
+            ],
+          ]),
+          syncReconcilerBackoff: new Map([[PEER_A, { failures: 2, nextRetryAt: 1_010_000 }]]),
+        });
+        const diag = await callDiagnostics(agentLike, PEER_A);
+
+        expect(diag.syncCapable).toBe(false);
+        expect(diag.syncStatus).toEqual({
+          capable: false,
+          lastSuccessfulSyncAt: null,
+          stale: false,
+          backoff: null,
+        });
+      } finally {
+        nowSpy.mockRestore();
+      }
     });
 
     it('surfaces raw sync status separately from substrate outbox state', async () => {
@@ -316,7 +346,7 @@ describe('DKGAgent.getPeerDiagnostics', () => {
               PEER_A,
               {
                 addresses: [],
-                protocols: ['/dkg/10.0.2/sync'],
+                protocols: [PROTOCOL_SYNC],
               },
             ],
           ]),
@@ -595,7 +625,7 @@ describe('DKGAgent.getPeerDiagnostics', () => {
         syncStatus: {
           capable: false,
           lastSuccessfulSyncAt: null,
-          stale: true,
+          stale: false,
           backoff: null,
         },
       });

@@ -398,6 +398,42 @@ describe('DKGAgent sync retry — periodic reconciler', () => {
     }
   });
 
+  it('does not back off a peer that still does not advertise PROTOCOL_SYNC', async () => {
+    const agent = await DKGAgent.create({
+      name: 'ReconcilerNoSyncNoBackoff',
+      listenHost: '127.0.0.1',
+      chainAdapter: new MockChainAdapter(),
+    });
+    try {
+      await agent.start();
+
+      const peerA = freshPeerIdString();
+      const origGetPeers = agent.node.libp2p.getPeers.bind(agent.node.libp2p);
+      vi.spyOn(agent.node.libp2p, 'getPeers').mockImplementation(
+        () => [...origGetPeers(), peerIdFromString(peerA)],
+      );
+      const getPeerProtocols = vi
+        .spyOn(agent as any, 'getPeerProtocols')
+        .mockResolvedValue(['/ipfs/id/1.0.0']);
+
+      const backoffMap = (agent as any).syncReconcilerBackoff as Map<
+        string,
+        { failures: number; nextRetryAt: number }
+      >;
+
+      await (agent as any).reconcileSyncFromConnectedPeers();
+      await flushMicrotasks();
+      await (agent as any).reconcileSyncFromConnectedPeers();
+      await flushMicrotasks();
+
+      expect(getPeerProtocols).toHaveBeenCalledTimes(2);
+      expect((agent as any).skippedNoSyncPeers.has(peerA)).toBe(true);
+      expect(backoffMap.has(peerA)).toBe(false);
+    } finally {
+      await agent.stop().catch(() => {});
+    }
+  });
+
   it('does not recreate backoff after the peer disconnects while an attempt is in flight', async () => {
     const agent = await DKGAgent.create({
       name: 'ReconcilerBackoffDisconnectRace',

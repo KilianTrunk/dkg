@@ -3436,11 +3436,12 @@ export class DKGAgent {
    * them into our local store. Used on peer:connect for initial catch-up,
    * with a per-peer guard to avoid overlapping sync storms.
    */
-  private async trySyncFromPeer(remotePeer: string): Promise<void> {
+  private async trySyncFromPeer(remotePeer: string): Promise<'attempted' | 'skipped-no-sync' | 'not-started'> {
     if (!this.started) {
-      return;
+      return 'not-started';
     }
-    return runSyncOnConnect({
+    let skippedNoSync = false;
+    await runSyncOnConnect({
       remotePeer,
       syncingPeers: this.syncingPeers,
       getPeerProtocols: (peerId) => this.getPeerProtocols(peerId),
@@ -3453,6 +3454,7 @@ export class DKGAgent {
       syncSharedMemoryOnConnect: this.config.syncSharedMemoryOnConnect ?? true,
       logInfo: (ctx, message) => this.log.info(ctx, message),
       onPeerSkippedNoSync: (peerId) => {
+        skippedNoSync = true;
         this.skippedNoSyncPeers.add(peerId);
       },
       onPeerSynced: (peerId) => {
@@ -3461,6 +3463,7 @@ export class DKGAgent {
         this.syncReconcilerBackoff.delete(peerId);
       },
     });
+    return skippedNoSync ? 'skipped-no-sync' : 'attempted';
   }
 
   /**
@@ -3530,11 +3533,17 @@ export class DKGAgent {
       const shortPeer = peerId.slice(-8);
       this.log.info(ctx, `Sync reconciler retrying ${shortPeer} (last success: ${lastOk == null ? 'never' : `${Math.round((now - lastOk) / 1000)}s ago`}${backoff ? `, prior failures: ${backoff.failures}` : ''})`);
       this.trySyncFromPeer(peerId)
-        .then(() => {
+        .then((outcome) => {
+          if (outcome === 'skipped-no-sync') {
+            return;
+          }
           // `onPeerSynced` clears the backoff on a real success. If the
           // attempt resolved WITHOUT advancing `lastSuccessfulSyncAt`
-          // (e.g. peer didn't advertise PROTOCOL_SYNC, or no progress),
-          // treat it as a failure so the backoff grows.
+          // (e.g. no progress), treat it as a genuine sync failure so the
+          // backoff grows. A peer that still does not advertise
+          // PROTOCOL_SYNC is handled above and remains eligible on every
+          // reconciler tick, so a missed identify update cannot stretch into
+          // a 5/10/20/60-minute delay.
           if (this.lastSuccessfulSyncAt.get(peerId) === lastOk) {
             this.recordSyncReconcilerFailure(peerId);
           }
@@ -21422,7 +21431,7 @@ export class DKGAgent {
         syncStatus: {
           capable: false,
           lastSuccessfulSyncAt: null,
-          stale: true,
+          stale: false,
           backoff: null,
         },
       };
@@ -21575,11 +21584,14 @@ export class DKGAgent {
     const now = Date.now();
     const lastSuccessfulSync = this.lastSuccessfulSyncAt.get(peerKey) ?? null;
     const backoff = this.syncReconcilerBackoff.get(peerKey) ?? null;
+    const syncStale = syncCapable && (
+      lastSuccessfulSync == null || (now - lastSuccessfulSync) >= SYNC_STALENESS_THRESHOLD_MS
+    );
     const syncStatus = {
       capable: syncCapable,
       lastSuccessfulSyncAt: lastSuccessfulSync,
-      stale: lastSuccessfulSync == null || (now - lastSuccessfulSync) >= SYNC_STALENESS_THRESHOLD_MS,
-      backoff: backoff
+      stale: syncStale,
+      backoff: syncCapable && backoff
         ? {
             failures: backoff.failures,
             nextRetryAt: backoff.nextRetryAt,

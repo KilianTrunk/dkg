@@ -6,11 +6,11 @@ import { encodeDocTabId, resolveDocRef } from '../../lib/doc-tab-id.js';
 import { truncateMiddle } from '../../lib/truncate.js';
 import {
   listJoinRequests, approveJoinRequest, rejectJoinRequest,
-  listAssertions, promoteAssertion,
-  publishSharedMemory, executeQuery,
+  listAssertions, promoteAssertion, describePromoteResult, describePromoteError,
+  publishSharedMemory, listSwmEntities, executeQuery,
   writeProfileQueryCatalog,
   fetchSubGraphs,
-  type AgentIdentity, type AssertionInfo, type PendingJoinRequest, type PublishResult, type SubGraphInfo,
+  type AgentIdentity, type AssertionInfo, type PendingJoinRequest, type PromoteOutcome, type PublishResult, type SubGraphInfo,
 } from '../../api.js';
 import { ImportFilesModal } from '../../components/Modals/ImportFilesModal.js';
 import { ShareProjectModal } from '../../components/Modals/ShareProjectModal.js';
@@ -1783,10 +1783,24 @@ export function LayerStatsWidget({ entities, entityCount, triples, layer }: {
   );
 }
 
+function requireSinglePublishRoot(roots: string[]): string[] {
+  const uniqueRoots = [...new Set(roots.filter(Boolean))];
+  if (uniqueRoots.length !== 1) {
+    throw new Error('V10 publish requires exactly one root entity per request. Select one root and publish again.');
+  }
+  return uniqueRoots;
+}
+
+async function fetchSingleSwmRoot(contextGraphId: string): Promise<string[]> {
+  const roots = (await listSwmEntities(contextGraphId)).map((entity) => entity.uri);
+  return requireSinglePublishRoot(roots);
+}
+
 export function LayerActionsWidget({ layer, count, contextGraphId, onComplete }: {
   layer: 'wm' | 'swm';
   count: number;
   contextGraphId: string;
+  entities: MemoryEntity[];
   onComplete: () => void;
 }) {
   const [busy, setBusy] = useState(false);
@@ -1798,28 +1812,45 @@ export function LayerActionsWidget({ layer, count, contextGraphId, onComplete }:
     setBusy(true);
     setError(null);
     setResult(null);
+    // Issue #864 (Codex review on #874) — track the in-flight
+    // assertion so mid-loop failures surface "<name>: …" instead of
+    // the generic "an assertion …".
+    let currentAssertion: string | null = null;
     try {
       if (isWm) {
         const assertions = await listAssertions(contextGraphId, 'wm');
         let promoted = 0;
+        let noopCount = 0;
         for (const a of assertions) {
+          currentAssertion = a.name;
           // PR #710 — thread `subGraph` so sub-graph-scoped assertions
           // hit the correct daemon lookup key `(cg, name, subGraph)`.
           const res = await promoteAssertion(contextGraphId, a.name, 'all', a.subGraph);
           promoted += res.promotedCount;
+          if (res.promotedCount === 0) noopCount += 1;
         }
-        setResult(`Promoted ${promoted} triple${promoted !== 1 ? 's' : ''} to Shared Memory`);
+        // Issue #864 — flag the "nothing was actually moved" case so
+        // users on the bulk-promote widget aren't lied to by a
+        // "Promoted 0 triples" success toast.
+        if (promoted > 0) {
+          const tail = noopCount > 0 ? ` (${noopCount} had nothing to promote)` : '';
+          setResult(`Promoted ${promoted} triple${promoted !== 1 ? 's' : ''} to Shared Memory${tail}`);
+        } else {
+          setResult('No triples were promoted — every assertion was already in Shared Memory or its content is still being committed.');
+        }
       } else {
-        await publishSharedMemory(contextGraphId);
+        const roots = requireSinglePublishRoot(entities.map((entity) => entity.uri));
+        await publishSharedMemory(contextGraphId, roots);
         setResult('Published to Verifiable Memory');
       }
       onComplete?.();
     } catch (err: any) {
-      setError(err.message ?? 'Action failed');
+      const typed = describePromoteError(currentAssertion ?? 'an assertion', err);
+      setError(typed ? typed.message : (err?.message ?? 'Action failed'));
     } finally {
       setBusy(false);
     }
-  }, [isWm, contextGraphId, onComplete]);
+  }, [isWm, entities, contextGraphId, onComplete]);
 
   if (count === 0) return null;
   const color = isWm ? '#f59e0b' : '#22c55e';
@@ -1886,7 +1917,7 @@ export function LayerWidgetStrip({ layer, entities, entityCount, tripleCount, co
       </div>
       {(layer === 'wm' || layer === 'swm') && (
         <div className="v10-layer-widgets-strip-action">
-          <LayerActionsWidget layer={layer} count={entityCount} contextGraphId={contextGraphId} onComplete={onComplete} />
+          <LayerActionsWidget layer={layer} count={entityCount} entities={entities} contextGraphId={contextGraphId} onComplete={onComplete} />
         </div>
       )}
     </div>
@@ -2949,15 +2980,21 @@ export function AssertionsList({ contextGraphId, layer, onComplete, scrollKey }:
         // sub-graph partition resolves to that partition's
         // assertion, not a same-named root one.
         const res = await promoteAssertion(contextGraphId, assertion.name, 'all', assertion.subGraph);
-        setResult(`Promoted ${res.promotedCount} triples to Shared Memory`);
+        // Issue #864 — fan the promote response through the central
+        // describe helper so 0-count returns get an actionable hint
+        // instead of the misleading "Promoted 0 triples" toast.
+        const outcome = describePromoteResult(assertion.name, res);
+        setResult(outcome.message);
       } else {
-        await publishSharedMemory(contextGraphId);
+        const roots = await fetchSingleSwmRoot(contextGraphId);
+        await publishSharedMemory(contextGraphId, roots);
         setResult('Published to Verifiable Memory');
       }
       refresh();
       onComplete();
     } catch (err: any) {
-      setError(err.message ?? 'Action failed');
+      const typed = describePromoteError(assertion.name, err);
+      setError(typed ? typed.message : (err?.message ?? 'Action failed'));
     } finally {
       setBusy(null);
     }
@@ -2968,23 +3005,39 @@ export function AssertionsList({ contextGraphId, layer, onComplete, scrollKey }:
     setBusy('__all__');
     setResult(null);
     setError(null);
+    // Issue #864 (Codex review on #874) — track the in-flight
+    // assertion so mid-loop failures surface "<name>: …" instead of
+    // "selected assertion …".
+    let currentAssertion: string | null = null;
     try {
       if (layer === 'wm') {
         let total = 0;
+        let noopCount = 0;
         for (const a of assertions) {
+          currentAssertion = a.name;
           // PR #710 — see comment on the single-row handler above.
           const res = await promoteAssertion(contextGraphId, a.name, 'all', a.subGraph);
           total += res.promotedCount;
+          if (res.promotedCount === 0) noopCount += 1;
         }
-        setResult(`Promoted ${total} triples across ${assertions.length} assertion${assertions.length !== 1 ? 's' : ''}`);
+        // Issue #864 — distinguish "some moved, some no-ops" from
+        // "literally nothing moved" so the user gets the truth.
+        if (total > 0) {
+          const tail = noopCount > 0 ? ` (${noopCount} had nothing to promote)` : '';
+          setResult(`Promoted ${total} triples across ${assertions.length} assertion${assertions.length !== 1 ? 's' : ''}${tail}`);
+        } else {
+          setResult('No triples were promoted — every assertion was already in Shared Memory or its content is still being committed.');
+        }
       } else {
-        await publishSharedMemory(contextGraphId);
+        const roots = await fetchSingleSwmRoot(contextGraphId);
+        await publishSharedMemory(contextGraphId, roots);
         setResult('Published all to Verifiable Memory');
       }
       refresh();
       onComplete();
     } catch (err: any) {
-      setError(err.message ?? 'Action failed');
+      const typed = describePromoteError(currentAssertion ?? 'selected assertion', err);
+      setError(typed ? typed.message : (err?.message ?? 'Action failed'));
     } finally {
       setBusy(null);
     }
@@ -3283,7 +3336,14 @@ export function VerifyOnDkgButton({
 }) {
   const profile = useProjectProfileContext();
   const [busy, setBusy] = useState(false);
-  const [result, setResult] = useState<PublishResult | { promotedCount: number } | null>(null);
+  // Codex review on #874 / #898 round 2 — promote results now flow
+  // through `describePromoteResult` so a `promotedCount === 0`
+  // response surfaces the same actionable hint the WMAssertionsPane
+  // shows ("had no triples to promote …"), and `ASSERTION_NOT_PERSISTED`
+  // surfaces the typed describePromoteError message instead of the
+  // raw "409 …" backend string. The promote branch stores a
+  // `PromoteOutcome`; the publish branch stores a `PublishResult`.
+  const [result, setResult] = useState<PublishResult | PromoteOutcome | null>(null);
   const [resultKind, setResultKind] = useState<'promote' | 'publish' | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -3346,6 +3406,7 @@ export function VerifyOnDkgButton({
     setError(null);
     setResult(null);
     setResultKind(action.kind);
+    const assertionName = sgBinding?.binding.sourceAssertion ?? 'assertion';
     try {
       if (action.kind === 'promote') {
         // PR #710 — `sgBinding.sourceAssertion` is itself
@@ -3360,20 +3421,28 @@ export function VerifyOnDkgButton({
           [entity.uri],
           sgBinding!.subGraph,
         );
-        setResult(r);
+        // Issue #864 — fan the promote response through the central
+        // describe helper so 0-count returns get an actionable hint
+        // instead of the misleading "Promoted 0 triples" toast.
+        setResult(describePromoteResult(assertionName, r));
       } else {
         const r = await publishSharedMemory(contextGraphId, [entity.uri]);
         setResult(r);
       }
       onVerified();
     } catch (err: any) {
-      setError(err?.message ?? 'Action failed');
+      // Issue #864 — `ASSERTION_NOT_PERSISTED` (HTTP 409) gets a
+      // typed message that points the user at the re-import path
+      // instead of the raw backend error string.
+      const typed = action.kind === 'promote' ? describePromoteError(assertionName, err) : null;
+      setError(typed ? typed.message : (err?.message ?? 'Action failed'));
     } finally {
       setBusy(false);
     }
   };
 
   const isPublishResult = (r: typeof result): r is PublishResult => !!r && 'status' in r;
+  const isPromoteOutcome = (r: typeof result): r is PromoteOutcome => !!r && 'kind' in r;
 
   return (
     <div className={`v10-ka-verify v10-ka-verify-${action.kind}`}>
@@ -3397,7 +3466,7 @@ export function VerifyOnDkgButton({
         </button>
       )}
       {error && <div className="v10-ka-verify-err">✕ {error}</div>}
-      {result && resultKind === 'promote' && !isPublishResult(result) && (
+      {result && resultKind === 'promote' && isPromoteOutcome(result) && result.kind === 'success' && (
         <div className="v10-ka-verify-ok">
           <div className="v10-ka-verify-ok-row">
             <span className="v10-ka-verify-ok-lbl">Promoted</span>
@@ -3409,6 +3478,13 @@ export function VerifyOnDkgButton({
             Refresh the entity to see the next step appear.
           </div>
         </div>
+      )}
+      {result && resultKind === 'promote' && isPromoteOutcome(result) && result.kind !== 'success' && (
+        // 0-count or not-persisted — surface the typed message as a
+        // warning, not a faux success. Mirrors the WMAssertionsPane's
+        // describePromoteResult/describePromoteError handling so the
+        // entity-level CTA stops misreporting empty promotes as "✓".
+        <div className="v10-ka-verify-err">! {result.message}</div>
       )}
       {result && resultKind === 'publish' && isPublishResult(result) && (() => {
         // OT-RFC-38 §1.1 — a publish without a TX hash never made it to chain.

@@ -115,6 +115,8 @@ export type PendingSenderKeyEntry = {
    * SENDER_KEY, ...)` when the recipient becomes reachable.
    */
   packageBytes: Uint8Array;
+  /** Stable Messenger id for the current explicit retry chain. Rotated after delivered non-acceptance. */
+  messageId?: string;
   /** Wall-clock when the row was enqueued; used for diagnostics + future TTL. */
   createdAtMs: number;
 };
@@ -716,6 +718,13 @@ export interface DKGAgentConfig {
    * is safe but yields more chain reads.
    */
   randomSamplingTickIntervalMs?: number;
+  /**
+   * Interval between V10 StorageACK handler registration retries when the
+   * on-chain identity isn't yet resolved (e.g. a transient boot-time RPC
+   * outage). Defaults to `STORAGE_ACK_REGISTRATION_RETRY_MS` (30s). Lowered in
+   * tests to drive the background re-resolution path deterministically.
+   */
+  storageAckRegistrationRetryMs?: number;
   /** Pre-built chain adapter (for testing). If provided, chainConfig is ignored. */
   chainAdapter?: ChainAdapter;
   /** Private key for the V10 ACK signer. When omitted, falls back to chainConfig.operationalKeys[0]. */
@@ -740,6 +749,8 @@ export interface DKGAgentConfig {
     rpcUrl: string;
     rpcUrls?: string[];
     hubAddress: string;
+    /** Optional TRAC token contract override. When omitted, the adapter resolves Hub.Token. */
+    tokenAddress?: string;
     adminPrivateKey?: string;
     operationalKeys: string[];
     chainId?: string;

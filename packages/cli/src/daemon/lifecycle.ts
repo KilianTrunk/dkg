@@ -1142,6 +1142,7 @@ export async function runDaemonInner(
       rpcUrl: chainBase.rpcUrl,
       rpcUrls: chainBase.rpcUrls,
       hubAddress: chainBase.hubAddress,
+      tokenAddress: chainBase.tokenAddress,
       ...(opWallets.adminWallet
         ? { adminPrivateKey: opWallets.adminWallet.privateKey }
         : {}),
@@ -1423,6 +1424,7 @@ export async function runDaemonInner(
         rpcUrl: chainBase.rpcUrl,
         rpcUrls: chainBase.rpcUrls,
         hubAddress: chainBase.hubAddress,
+        tokenAddress: chainBase.tokenAddress,
         chainId: chainBase.chainId,
       }
     : undefined;

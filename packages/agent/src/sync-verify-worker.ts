@@ -24,7 +24,7 @@ export interface SyncParseResult {
 export interface SharedMemoryProcessResult {
   validQuads: Quad[];
   dropped: number;
-  entityCreators: Array<[string, string]>;
+  entityCreators: Array<{ dataGraph: string; entity: string; creator: string }>;
 }
 
 export interface SharedMemoryBatchProcessResult {
@@ -34,7 +34,7 @@ export interface SharedMemoryBatchProcessResult {
   totalFetchedMetaQuads: number;
   droppedDataTriples: number;
   emptyResponses: number;
-  entityCreators: Array<[string, string]>;
+  entityCreators: Array<{ dataGraph: string; entity: string; creator: string }>;
 }
 
 export interface DurableBatchProcessResult {

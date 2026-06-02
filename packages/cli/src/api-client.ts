@@ -395,8 +395,9 @@ export class ApiClient {
   }
 
   /**
-   * Selection-based publish — publishes the selected SWM rootEntities
-   * (or all SWM content) to verified memory. The agent mints the
+   * Selection-based publish — publishes one selected SWM rootEntity to
+   * verified memory. Passing `"all"` is accepted only when the source
+   * SWM currently resolves to a single publishable root. The agent mints the
    * AuthorAttestation seal inline at the selection boundary using
    * the calling agent's bearer-token identity / explicit
    * `authorAgentAddress` / `preSignedAuthorAttestation`, or falls

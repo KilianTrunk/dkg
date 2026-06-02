@@ -1079,6 +1079,8 @@ export class DKGAgentBase {
   protected readonly pendingSenderKeyDrainByAgent = new Map<string, Promise<number>>();
   /** Per-CG serialized host-mode persistence queue (moved here from the host-mode cluster during the mixin split). */
   protected readonly hostModePersistenceQueues = new Map<string, Promise<void>>();
+  /** System graph holding agent-registry triples (moved here so holder classes can reference it). */
+  static readonly AGENT_SYSTEM_GRAPH = 'did:dkg:system/agents';
 
   protected constructor(
     config: DKGAgentConfig,

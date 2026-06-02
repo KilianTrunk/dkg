@@ -87,6 +87,27 @@ describe('TripleStoreAsyncPromoteQueue', () => {
     expect(job!.request).toEqual(makeRequest());
   });
 
+  it('1b. queue mutations flush the store so crash recovery sees the latest lease state', async () => {
+    let flushes = 0;
+    const originalFlush = store.flush.bind(store);
+    store.flush = async () => {
+      flushes += 1;
+      await originalFlush();
+    };
+
+    const queue = createQueue();
+    const jobId = await queue.enqueue(makeRequest());
+    expect(flushes).toBe(1);
+
+    const claimed = await queue.claimNext('worker-1');
+    expect(claimed?.jobId).toBe(jobId);
+    expect(claimed?.state).toBe('running');
+    expect(flushes).toBe(2);
+
+    await queue.recordCommitMarker(jobId, claimed!.lease!.claimToken, 'promoteStarted');
+    expect(flushes).toBe(3);
+  });
+
   it('2. enqueue() rejects an empty assertionName as a fatal validation error', async () => {
     const queue = createQueue();
     await expect(queue.enqueue(makeRequest({ assertionName: '' }))).rejects.toThrow(/assertionName/);

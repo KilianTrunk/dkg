@@ -537,6 +537,7 @@ export class TripleStoreAsyncPromoteQueue implements AsyncPromoteQueue {
   private async writeJob(job: PromoteJob): Promise<void> {
     await this.store.deleteByPattern({ subject: jobSubject(job.jobId), graph: this.graphUri });
     await this.store.insert(serializeJob(job, this.graphUri));
+    await this.store.flush?.();
   }
 
   private assertLeaseHeld(job: PromoteJob, claimToken: string): void {

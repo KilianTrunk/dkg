@@ -842,6 +842,78 @@ function handleImportArtifactRouteError(res: ServerResponse, err: unknown): bool
   return false;
 }
 
+async function resolveImportedArtifactFromSharedMemory(
+  ctx: RequestContext,
+  args: {
+    contextGraphId: string;
+    assertionUri: string;
+    assertionName: string;
+    assertionAgentAddress: string;
+    subGraphName?: string;
+    requestedFileHash?: string;
+    ownerGuardRelaxed: boolean;
+  },
+): Promise<ImportedArtifactResolution | undefined> {
+  const swmGraph = contextGraphSharedMemoryUri(args.contextGraphId, args.subGraphName);
+  const result = await ctx.agent.store.query(`
+    SELECT ?sourceFile ?contentType ?rootEntity ?markdownForm WHERE {
+      GRAPH <${swmGraph}> {
+        <${args.assertionUri}> <${DKG_ONTOLOGY}sourceFile> ?sourceFile .
+        OPTIONAL { <${args.assertionUri}> <${DKG_ONTOLOGY}sourceContentType> ?contentType }
+        OPTIONAL { <${args.assertionUri}> <${DKG_ONTOLOGY}rootEntity> ?rootEntity }
+        OPTIONAL { <${args.assertionUri}> <${DKG_ONTOLOGY}markdownForm> ?markdownForm }
+      }
+    }
+    LIMIT 1
+  `) as { type?: string; bindings?: Array<Record<string, unknown>> };
+  const binding = result.bindings?.[0];
+  if (!binding) return undefined;
+
+  const sourceFile = normalizeIriBinding(binding.sourceFile);
+  const sourceFileHash = hashFromFileUrn(sourceFile);
+  if (!sourceFileHash || !validateContentHash(sourceFileHash)) {
+    throw new ImportArtifactRouteError(409, 'Shared-memory import metadata is missing a valid source file hash');
+  }
+  if (args.requestedFileHash && args.requestedFileHash !== sourceFileHash) {
+    throw new ImportArtifactRouteError(400, 'fileHash does not match import metadata');
+  }
+
+  const durableSourceContentType = normalizeLiteralBinding(binding.contentType) || undefined;
+  const sourceContentType = normalizeDetectedContentType(durableSourceContentType);
+  const rootEntity = normalizeIriBinding(binding.rootEntity) || undefined;
+  const markdownFormValue = normalizeIriBinding(binding.markdownForm) || undefined;
+  const markdownFormHash = hashFromFileUrn(markdownFormValue);
+  if (markdownFormValue && (!markdownFormHash || !validateContentHash(markdownFormHash))) {
+    throw new ImportArtifactRouteError(409, 'Import metadata is missing a valid Markdown intermediate hash');
+  }
+  const markdownHash = markdownFormHash
+    ?? (sourceContentType === 'text/markdown' ? sourceFileHash : undefined);
+  const markdownForm = markdownHash ? `urn:dkg:file:${markdownHash}` : undefined;
+  const markdownAvailableLocally = markdownHash
+    ? await ctx.fileStore.has(markdownHash).catch(() => false)
+    : false;
+
+  return {
+    contextGraphId: args.contextGraphId,
+    assertionUri: args.assertionUri,
+    assertionName: args.assertionName,
+    assertionAgentAddress: args.assertionAgentAddress,
+    ...(args.subGraphName ? { subGraphName: args.subGraphName } : {}),
+    fileHash: sourceFileHash,
+    sourceFileHash,
+    detectedContentType: sourceContentType,
+    sourceContentType,
+    extractionStatus: 'completed',
+    extractionMethod: 'structural',
+    ...(rootEntity ? { rootEntity } : {}),
+    ...(markdownHash && markdownHash !== sourceFileHash ? { mdIntermediateHash: markdownHash } : {}),
+    ...(markdownForm ? { markdownForm } : {}),
+    ...(markdownHash ? { markdownHash } : {}),
+    canReadMarkdown: markdownAvailableLocally,
+    ...(args.ownerGuardRelaxed ? { ownerGuardRelaxed: true } : {}),
+  };
+}
+
 async function resolveImportedArtifact(
   ctx: RequestContext,
   raw: Record<string, unknown>,
@@ -1013,6 +1085,18 @@ async function resolveImportedArtifact(
   `) as { type?: string; bindings?: Array<Record<string, unknown>> };
   const metaBinding = metaResult.bindings?.[0];
   if (!metaBinding) {
+    if (ownerGuardRelaxed) {
+      const swmArtifact = await resolveImportedArtifactFromSharedMemory(ctx, {
+        contextGraphId,
+        assertionUri,
+        assertionName: parsedAssertion.assertionName,
+        assertionAgentAddress: parsedAssertion.assertionAgentAddress,
+        ...(parsedAssertion.subGraphName ? { subGraphName: parsedAssertion.subGraphName } : {}),
+        ...(requestedFileHash ? { requestedFileHash } : {}),
+        ownerGuardRelaxed,
+      });
+      if (swmArtifact) return swmArtifact;
+    }
     throw new ImportArtifactRouteError(404, 'No completed import metadata found for assertionUri');
   }
 

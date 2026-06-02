@@ -885,6 +885,7 @@ export class DKGAgent {
   private readonly beaconRegistry = new Map<string, {
     wireId: string;
     curatorEoa: string;
+    signerPrivateKey?: string;
     accessPolicy: number;
   }>();
   /**
@@ -10767,6 +10768,7 @@ export class DKGAgent {
     if (!curated) return;
 
     this.wireSwmHostModeHandler(contextGraphId, source);
+    await this.awaitHostModePersistence(contextGraphId);
 
     await this.maybeMarkRegisteredForHostMode(contextGraphId);
 
@@ -10928,6 +10930,11 @@ export class DKGAgent {
         this.hostModePersistenceQueues.delete(contextGraphId);
       }
     });
+  }
+
+  private async awaitHostModePersistence(contextGraphId: string): Promise<void> {
+    const pending = this.hostModePersistenceQueues.get(contextGraphId);
+    if (pending) await pending;
   }
 
   /**
@@ -11316,11 +11323,13 @@ export class DKGAgent {
       // specifically for curated ciphertext custody.
       return;
     }
-    const curatorEoa = await this.getRegistrationTxSignerAddress();
+    const beaconAgentSigner = this.getWorkspaceGossipSigningAgent();
+    const chainSignerEoa = beaconAgentSigner ? null : await this.getRegistrationTxSignerAddress();
+    const curatorEoa = beaconAgentSigner?.agentAddress ?? chainSignerEoa;
     if (!curatorEoa) {
       this.log.warn(
         createOperationContext('system'),
-        `Beacon registration skipped for "${localCgId}": no chain tx signer (likely a chain-disabled config); pre-registration auto-host won't run for this CG`,
+        `Beacon registration skipped for "${localCgId}": no DKG agent signer or chain tx signer; pre-registration auto-host won't run for this CG`,
       );
       return;
     }
@@ -11328,6 +11337,7 @@ export class DKGAgent {
     this.beaconRegistry.set(localCgId, {
       wireId,
       curatorEoa: curatorEoa.toLowerCase(),
+      ...(beaconAgentSigner?.privateKey ? { signerPrivateKey: beaconAgentSigner.privateKey } : {}),
       accessPolicy,
     });
     await this.broadcastCgDiscoveryBeacon(localCgId);
@@ -11351,6 +11361,9 @@ export class DKGAgent {
         accessPolicy: entry.accessPolicy,
         curatorEoa: entry.curatorEoa,
         sign: async (digest) => {
+          if (entry.signerPrivateKey) {
+            return new ethers.Wallet(entry.signerPrivateKey).signMessage(digest);
+          }
           // Chain adapter's `signMessage` returns `{r, vs}`; re-
           // serialise to the 65-byte hex shape ethers expects. The
           // EVM adapter routes through `Signer.signMessage` which
@@ -12121,7 +12134,9 @@ export class DKGAgent {
    *      explicit peer-allowlist meta (member CG context, not host-only
    *      core), require `fromPeerId ∈ allowedPeers`. Defence in depth
    *      against a signed-but-out-of-band requester.
-   *   6. Otherwise: DENY. The previous behaviour ("serve openly when
+   *   6. Ciphertext-only fallback: registered node-operator EOAs may
+   *      fetch opaque host-mode envelopes, matching LU-11 chunk catchup.
+   *   7. Otherwise: DENY. The previous behaviour ("serve openly when
    *      no authority source available") was the metadata-leak vector
    *      Codex flagged on PR #610 round-2 #6.
    *
@@ -12175,6 +12190,7 @@ export class DKGAgent {
     //   3c. locally-persisted agent-gate set (allowedAgent UNION
     //       participantAgent from _meta + subscription cache)
     //   3d. transport-layer allowedPeers (libp2p peer-id allowlist)
+    //   3e. registered node-operator EOA for ciphertext-only host catchup
     // Only if none accept do we deny.
     const requesterLower = requesterEoa.toLowerCase();
     let anyAuthoritySourceFound = false;
@@ -12236,8 +12252,32 @@ export class DKGAgent {
       // local-meta probe failure is non-fatal; the deny below still applies.
     }
 
+    // Ciphertext host-catchup parity with LU-11 chunk-catchup: the responder
+    // serves opaque SWM envelopes, not decrypted triples. A requester that can
+    // prove control of a registered node-operator EOA is allowed to fetch these
+    // bytes so host-only cores and member daemons whose operational wallet is
+    // distinct from their DKG agent address can recover missed ciphertext.
+    if (typeof this.chain.getIdentityIdForAddress === 'function') {
+      try {
+        const reqIdentityId = await this.chain.getIdentityIdForAddress(requesterEoa);
+        if (reqIdentityId > 0n) {
+          anyAuthoritySourceFound = true;
+          this.log.debug(
+            createOperationContext('share'),
+            `host-catchup admitted via node-operator authority cg=${req.contextGraphId} requesterEoa=${requesterEoa} identityId=${reqIdentityId.toString()}`,
+          );
+          return { ok: true, recoveredSigner: requesterEoa };
+        }
+      } catch (err) {
+        this.log.debug(
+          createOperationContext('share'),
+          `host-catchup node-operator probe failed cg=${req.contextGraphId} requesterEoa=${requesterEoa}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+
     const reason = anyAuthoritySourceFound
-      ? 'requester EOA not in any of: on-chain participants, beacon curator, local agent-gate, allowedPeers'
+      ? 'requester EOA not in any of: on-chain participants, beacon curator, local agent-gate, allowedPeers, node-operator-registry'
       : 'no authority source available for context graph';
     return { ok: false, reason };
   }
@@ -12625,6 +12665,7 @@ export class DKGAgent {
       return { subscribed: false, alreadySubscribed: true, hostingEnabled: true };
     }
     this.wireSwmHostModeHandler(contextGraphId, SUBSCRIPTION_SOURCES.MANUAL);
+    await this.awaitHostModePersistence(contextGraphId);
     // Codex PR #610 R1 comment 5: a core that only knows the CG by
     // topic id (the explicit /host-mode/subscribe entrypoint) must
     // still transition the store to the registered-CG limits as

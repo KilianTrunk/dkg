@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import {
   contextGraphAssertionUri,
   contextGraphMetaUri,
+  contextGraphSharedMemoryUri,
 } from '@origintrail-official/dkg-core';
 import { FileStore } from '../src/file-store.js';
 import type { ExtractionStatusRecord } from '../src/extraction-status.js';
@@ -115,6 +116,7 @@ describe('import artifact daemon routes', () => {
     omitExtractionStatus?: boolean;
     structuralTripleCount?: string;
     mdIntermediateHash?: string;
+    omitImportMeta?: boolean;
     publisherCreateError?: Error;
     publisherWriteError?: Error;
     publisherDiscardError?: Error;
@@ -230,6 +232,9 @@ describe('import artifact daemon routes', () => {
           if (sparql.includes('SELECT ?fileHash')) {
             expect(sparql).toContain(`<${contextGraphMetaUri(args.contextGraphId)}>`);
             expect(sparql).toContain(`<${args.assertionUri}> <${DKG}sourceFileHash>`);
+            if (args.omitImportMeta) {
+              return { type: 'bindings', bindings: [] };
+            }
             return {
               type: 'bindings',
               bindings: [{
@@ -242,6 +247,19 @@ describe('import artifact daemon routes', () => {
                 ...(args.omitExtractionStatus ? {} : { extractionStatus: args.extractionStatus ?? 'completed' }),
                 ...(args.mdIntermediateHash ? { mdIntermediateHash: args.mdIntermediateHash } : {}),
                 sourceFileName: 'imported.md',
+              }],
+            };
+          }
+          if (sparql.includes('SELECT ?sourceFile')) {
+            expect(sparql).toContain(`<${contextGraphSharedMemoryUri(args.contextGraphId)}>`);
+            expect(sparql).toContain(`<${args.assertionUri}> <${DKG}sourceFile>`);
+            return {
+              type: 'bindings',
+              bindings: [{
+                sourceFile: `urn:dkg:file:${args.fileHash}`,
+                ...(args.contentType !== null ? { contentType: args.contentType ?? 'text/markdown' } : {}),
+                rootEntity: args.assertionUri,
+                markdownForm: Array.isArray(args.markdownForm) ? args.markdownForm[0] : args.markdownForm,
               }],
             };
           }
@@ -552,6 +570,52 @@ describe('import artifact daemon routes', () => {
     });
     expect(resolved.status).toBe(200);
     expect(resolved.body.artifact.ownerGuardRelaxed).toBe(true);
+
+    const read = await post('/api/assertion/import-artifact/read-markdown', {
+      contextGraphId,
+      assertionUri,
+      maxBytes: 1024,
+    });
+    expect(read.status).toBe(404);
+    expect(read.body.error).toMatch(/not replicated locally/);
+    expect(read.body.error).not.toMatch(/owned by the requesting agent/);
+    expect(read.body.artifact.ownerGuardRelaxed).toBe(true);
+  });
+
+  it('derives non-owner public + open read metadata from replicated SWM linkage when _meta is absent (#872 devnet)', async () => {
+    // Devnet peers receive the promoted SWM assertion triples but do not
+    // receive the origin node's CG-root `_meta` rows. The read route should
+    // still resolve enough metadata from the promoted source-file linkage to
+    // report the policy-relaxed artifact, then honestly 404 on missing bytes.
+    const markdownHash = `keccak256:${'b'.repeat(64)}`;
+    const contextGraphId = 'cg-public-open-swm-linkage-only';
+    const assertionName = 'imported-md';
+    const assertionUri = contextGraphAssertionUri(contextGraphId, 'did:dkg:agent:source', assertionName);
+    const { agent } = makeAgent({
+      contextGraphId,
+      assertionName,
+      assertionUri,
+      fileHash: markdownHash,
+      markdownHash,
+      markdownForm: `urn:dkg:file:${markdownHash}`,
+      omitImportMeta: true,
+      onChainPolicy: { accessPolicy: 0, publishPolicy: 1 },
+    });
+    await startRoutes({ agent });
+
+    const resolved = await post('/api/assertion/import-artifact/resolve', {
+      contextGraphId,
+      assertionUri,
+    });
+    expect(resolved.status).toBe(200);
+    expect(resolved.body.artifact).toMatchObject({
+      assertionUri,
+      assertionAgentAddress: 'did:dkg:agent:source',
+      sourceFileHash: markdownHash,
+      markdownHash,
+      canReadMarkdown: false,
+      ownerGuardRelaxed: true,
+    });
 
     const read = await post('/api/assertion/import-artifact/read-markdown', {
       contextGraphId,

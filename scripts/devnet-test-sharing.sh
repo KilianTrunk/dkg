@@ -35,6 +35,19 @@ c() {
     -H "Authorization: Bearer $AUTH" -H "Content-Type: application/json" "$@"
 }
 
+# Adapter for devnet-publish-helpers.sh (node-numbered API calls).
+api_call() {
+  local node="$1" method="$2" path="$3" data="${4:-}"
+  local port=$((9200 + node))
+  if [ -n "$data" ]; then
+    c -X "$method" "http://127.0.0.1:${port}${path}" -d "$data"
+  else
+    c -X "$method" "http://127.0.0.1:${port}${path}"
+  fi
+}
+# shellcheck source=devnet-publish-helpers.sh
+source "$SCRIPT_DIR/devnet-publish-helpers.sh"
+
 ok()   { PASS=$((PASS+1)); echo "  [PASS] $1"; }
 fail() { FAIL=$((FAIL+1)); echo "  [FAIL] $1"; }
 warn() { WARN=$((WARN+1)); echo "  [WARN] $1"; }
@@ -971,8 +984,7 @@ fi
 sleep 3
 
 echo "--- 15a: Publish SWM data to VM on Node 1 (promote-test project) ---"
-PUBLISH=$(c -X POST "http://127.0.0.1:9201/api/shared-memory/publish" \
-  -d "{\"contextGraphId\":\"$CG3_ID\",\"selection\":\"all\",\"clearAfter\":false}")
+PUBLISH=$(devnet_publish_swm_all_roots 1 "$CG3_ID" false)
 PUB_STATUS=$(json_get "$PUBLISH" status)
 PUB_KCID=$(json_get "$PUBLISH" kaId)
 PUB_KAS=$(echo "$PUBLISH" | python3 -c '
@@ -1066,8 +1078,7 @@ fi
 sleep 3
 
 echo "--- 16a: Publish CG1 SWM → VM on Node 1 ---"
-PUB_CG1=$(c -X POST "http://127.0.0.1:9201/api/shared-memory/publish" \
-  -d "{\"contextGraphId\":\"$CG_ID\",\"selection\":\"all\",\"clearAfter\":false}")
+PUB_CG1=$(devnet_publish_swm_all_roots 1 "$CG_ID" false)
 PUB_CG1_STATUS=$(json_get "$PUB_CG1" status)
 PUB_CG1_KAS=$(echo "$PUB_CG1" | python3 -c '
 import sys,json
@@ -1141,8 +1152,7 @@ for port_label in "9202:Node2" "9204:Node4" "9203:Node3"; do
 done
 
 echo "--- 16f: Publish with clearAfter=true, then verify SWM is empty ---"
-PUB_CLEAR=$(c -X POST "http://127.0.0.1:9201/api/shared-memory/publish" \
-  -d "{\"contextGraphId\":\"$CG3_ID\",\"selection\":\"all\",\"clearAfter\":true}")
+PUB_CLEAR=$(devnet_publish_swm_all_roots 1 "$CG3_ID" true)
 PUB_CLEAR_STATUS=$(json_get "$PUB_CLEAR" status)
 sleep 2
 N1_SWM_CLEARED=$(c -X POST "http://127.0.0.1:9201/api/query" \

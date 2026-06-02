@@ -62,6 +62,9 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=devnet-publish-helpers.sh
+source "$SCRIPT_DIR/devnet-publish-helpers.sh"
 DEVNET_DIR="${DEVNET_DIR:-$REPO_ROOT/.devnet}"
 HARDHAT_PORT="${HARDHAT_PORT:-8545}"
 API_PORT_BASE=9201
@@ -203,10 +206,7 @@ log "✓ 12 triples written to curator's SWM (op=$(parse_json "$WRITE_RESP" '.sh
 sleep 2
 
 log "Publishing curated CG to VM..."
-PUBLISH_RESP=$(api_call "$CURATOR_NODE" POST /api/shared-memory/publish "$(cat <<EOF
-{ "contextGraphId": "$CG_ID", "selection": "all", "clearAfter": false }
-EOF
-)")
+PUBLISH_RESP=$(devnet_publish_swm_all_roots "$CURATOR_NODE" "$CG_ID" false)
 log "publish response: $PUBLISH_RESP"
 
 PUBLISH_STATUS=$(parse_json "$PUBLISH_RESP" '.status')

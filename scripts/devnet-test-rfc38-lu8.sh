@@ -24,6 +24,9 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=devnet-publish-helpers.sh
+source "$SCRIPT_DIR/devnet-publish-helpers.sh"
 DEVNET_DIR="${DEVNET_DIR:-$REPO_ROOT/.devnet}"
 API_PORT_BASE=9201
 CURATOR_NODE=5
@@ -109,10 +112,7 @@ WRITE_RESP=$(api_call "$CURATOR_NODE" POST /api/shared-memory/write "$QUADS")
 [ "$(parse_json "$WRITE_RESP" '.triplesWritten')" = "5" ] || fail "expected 5 triples written, got: $WRITE_RESP"
 
 log "Curator publishes selection to VM..."
-PUB_RESP=$(api_call "$CURATOR_NODE" POST /api/shared-memory/publish "$(cat <<EOF
-{ "contextGraphId": "$PUB_CG", "selection": "all", "epochs": 1 }
-EOF
-)")
+PUB_RESP=$(devnet_publish_swm_all_roots "$CURATOR_NODE" "$PUB_CG" false '"epochs":1')
 log "publish response: $PUB_RESP"
 TX_HASH=$(parse_json "$PUB_RESP" '.txHash')
 KC_ID=$(parse_json "$PUB_RESP" '.kaId')

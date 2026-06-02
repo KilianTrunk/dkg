@@ -8398,6 +8398,7 @@ export class DKGAgent {
       accessPolicy: opts?.accessPolicy,
       allowedPeers: opts?.allowedPeers,
       entityProofs: opts?.entityProofs,
+      publishEpochs: opts?.publishEpochs,
       // Stringify bigint for JSON-safe persistence; preserve `0n` (mode d).
       publisherNodeIdentityIdOverride: opts?.publisherNodeIdentityIdOverride !== undefined
         ? (opts.publisherNodeIdentityIdOverride.toString() as `${bigint}`)
@@ -8652,6 +8653,7 @@ export class DKGAgent {
       onPhase,
       v10ACKProvider,
       publishContextGraphId: onChainId ?? undefined,
+      publishEpochs: opts?.publishEpochs,
       precomputedAttestation,
       encryptInlinePayload,
       encryptInlineChunked,
@@ -9941,6 +9943,7 @@ export class DKGAgent {
       operationCtx?: OperationContext;
       onPhase?: PhaseCallback;
       publisherNodeIdentityIdOverride?: bigint;
+      publishEpochs?: number;
       clearSharedMemoryAfter?: boolean;
     },
   ): Promise<PublishResult & { assertionUri: string; seal: AssertionSeal }> {
@@ -10013,6 +10016,7 @@ export class DKGAgent {
         onPhase: opts?.onPhase,
         subGraphName: opts?.subGraphName,
         publisherNodeIdentityIdOverride: opts?.publisherNodeIdentityIdOverride,
+        publishEpochs: opts?.publishEpochs,
         clearSharedMemoryAfter: opts?.clearSharedMemoryAfter,
         // Wired through to the inner publisher.publish() via
         // publishFromSharedMemory's `precomputedAttestation` option.
@@ -10085,6 +10089,7 @@ export class DKGAgent {
        * used for ACK self-signing and signer resolution.
        */
       publisherNodeIdentityIdOverride?: bigint;
+      publishEpochs?: number;
       /**
        * RFC-001 §9.x — pre-computed attestation captured by
        * `agent.assertion.finalize()`. When the caller has already
@@ -10215,6 +10220,7 @@ export class DKGAgent {
       v10ACKProvider,
       subGraphName: options?.subGraphName,
       publisherNodeIdentityIdOverride: options?.publisherNodeIdentityIdOverride,
+      publishEpochs: options?.publishEpochs,
       precomputedAttestation: resolvedSeal,
       encryptInlinePayload,
       encryptInlineChunked,

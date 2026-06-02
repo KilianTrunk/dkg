@@ -72,11 +72,21 @@ test.describe('SubGraph bar', () => {
   });
 
   test('Root chip appears when root-scope entities exist', async ({ subgraphBar }) => {
-    const hasRoot = await subgraphBar.hasRootChip();
-    if (hasRoot) {
-      const labels = await subgraphBar.getChipLabels();
-      expect(labels.some((l) => l.toLowerCase() === 'root')).toBe(true);
-    }
+    // The SubGraph bar re-renders live as node events propagate, so reading
+    // `hasRootChip()` and then `getChipLabels()` as two separate steps can race:
+    // a frame where the root chip is present but the label snapshot misses it
+    // flaked ~1/full-run under load. Poll a single combined predicate so a
+    // transient re-render can't fail the assertion — a visible root chip MUST
+    // carry a "root" label; if there is no root chip the case is vacuous.
+    await expect
+      .poll(
+        async () => {
+          if (!(await subgraphBar.hasRootChip())) return true;
+          return (await subgraphBar.getChipLabels()).some((l) => l.toLowerCase() === 'root');
+        },
+        { timeout: 10_000 },
+      )
+      .toBe(true);
   });
 });
 

@@ -28,6 +28,9 @@ function makeAgentLike(opts: {
   isPrivate?: boolean;
   onChainIdError?: Error;
   subscribed?: Map<string, { onChainId?: string }>;
+  // Simulates a PERSISTED `...OnChainId` triple surviving a restart: the
+  // durable reverse-lookup in isKnownOnChainId answers a hit for this id.
+  persistedOnChainId?: string;
 } = {}) {
   const log = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
   const chain: Record<string, unknown> = {};
@@ -37,7 +40,20 @@ function makeAgentLike(opts: {
       return opts.accessPolicy ?? 0;
     });
   }
-  const storeQuery = vi.fn(async () => ({ type: 'bindings', bindings: [] as unknown[] }));
+  const storeQuery = vi.fn(async (q: unknown) => {
+    // The durable on-chain-id reverse lookup interpolates the numeric id as a
+    // STR() filter literal. Answer a single binding when it matches the
+    // configured persisted mapping; everything else returns no bindings.
+    if (
+      opts.persistedOnChainId &&
+      typeof q === 'string' &&
+      q.includes('OnChainId') &&
+      q.includes(`"${opts.persistedOnChainId}"`)
+    ) {
+      return { type: 'bindings', bindings: [{ cg: 'did:dkg:context-graph:music' }] };
+    }
+    return { type: 'bindings', bindings: [] as unknown[] };
+  });
   const agentLike: any = {
     log,
     chain,
@@ -139,6 +155,27 @@ describe('DKGAgent.isContextGraphPublicOnChain', () => {
     // id must NEVER be trusted — doing so would bypass SWM encryption.
     const agentLike = makeAgentLike({ onChainId: null, accessPolicy: 0 });
     await expect(isPublic(agentLike, '42')).resolves.toBe(false);
+    expect(agentLike.chain.getContextGraphAccessPolicy).not.toHaveBeenCalled();
+  });
+
+  it('trusts a numeric on-chain id proven by the PERSISTED mapping after a restart (#884 review durability gap)', async () => {
+    // Post-restart: in-memory cache + subscription map are empty, but the
+    // persisted `<cg> …OnChainId "42"` triple survives. The durable
+    // reverse-lookup must still recognise share('42', ...) as a registered
+    // public CG instead of falling back to the encrypted SWM path.
+    const agentLike = makeAgentLike({ onChainId: null, accessPolicy: 0, persistedOnChainId: '42' });
+    await expect(isPublic(agentLike, '42')).resolves.toBe(true);
+    expect(agentLike.store.query).toHaveBeenCalled();
+    expect(agentLike.chain.getContextGraphAccessPolicy).toHaveBeenCalledWith(42n);
+  });
+
+  it('does NOT trust a numeric id absent from BOTH memory and the persisted mapping (#884 fail-closed)', async () => {
+    // No cache, no subscription, and the durable reverse-lookup returns no
+    // binding → the numeric id is unproven and must fail closed with no chain
+    // read, even though the chain would default an unknown id to policy 0.
+    const agentLike = makeAgentLike({ onChainId: null, accessPolicy: 0 });
+    await expect(isPublic(agentLike, '999')).resolves.toBe(false);
+    expect(agentLike.store.query).toHaveBeenCalled();
     expect(agentLike.chain.getContextGraphAccessPolicy).not.toHaveBeenCalled();
   });
 

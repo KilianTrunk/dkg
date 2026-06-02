@@ -6146,7 +6146,7 @@ export class DKGAgent {
       //    id at registration). An unregistered local graph whose id is
       //    numeric, or any unknown number, stays unresolved and falls through
       //    to the fail-closed (encrypted) path below (#884).
-      if (!onChainId && /^\d+$/.test(trimmed) && this.isKnownOnChainId(trimmed)) {
+      if (!onChainId && /^\d+$/.test(trimmed) && (await this.isKnownOnChainId(trimmed))) {
         onChainId = trimmed;
       }
       if (!onChainId) return false;
@@ -6185,25 +6185,53 @@ export class DKGAgent {
 
   /**
    * #884: True iff `numericOnChainId` is a context-graph id this node KNOWS
-   * was registered on-chain — without an extra RPC. Two local proofs, both
-   * only ever populated for genuinely on-chain CGs:
+   * was registered on-chain — without an extra RPC to the chain. Three local
+   * proofs, all only ever populated/written for genuinely on-chain CGs:
    *   - present in {@link onChainAccessPolicyCache} (seeded by the
    *     `ContextGraphCreated` chain-event handler), or
    *   - matches the `onChainId` of a {@link subscribedContextGraphs} entry
    *     (the chain assigns that id at registration; members/replicators learn
-   *     it via the subscription event).
+   *     it via the subscription event), or
+   *   - matches a PERSISTED `...OnChainId` triple in the local ontology graph.
+   *
+   * The durable triple proof matters after a restart (#884 review): the two
+   * in-memory maps above are empty until re-warmed, but the persisted mapping
+   * `<did:dkg:context-graph:LOCAL> dkg:…OnChainId "<numeric>"` survives, so a
+   * `share('<numeric>', …)` by raw on-chain id would otherwise be treated as
+   * unknown and fall back to the encrypted path — reintroducing the regression
+   * this PR fixes. {@link getContextGraphOnChainId} can't cover it: that is a
+   * forward (localId → onChainId) lookup, whereas a bare numeric id needs the
+   * REVERSE lookup against the same ontology graph it reads.
    *
    * Gate for the bare-numeric `isContextGraphPublicOnChain` shortcut so an
    * unregistered local graph with a numeric id (whose chain access-policy
    * read would default to the permissive `0`) is never misclassified as
    * public.
    */
-  private isKnownOnChainId(numericOnChainId: string): boolean {
+  private async isKnownOnChainId(numericOnChainId: string): Promise<boolean> {
+    // In-memory proofs first (no I/O).
     if (this.onChainAccessPolicyCache.has(numericOnChainId)) return true;
     for (const sub of this.subscribedContextGraphs.values()) {
       if (sub?.onChainId === numericOnChainId) return true;
     }
-    return false;
+    // Durable proof: reverse-lookup the persisted on-chain-id mapping. The id
+    // is digit-only (call-site gated by `/^\d+$/`), so interpolation here is
+    // injection-safe; `STR(?id)` matches the persisted literal regardless of
+    // datatype. A hit proves a local CG was registered on-chain under this id
+    // (the triple is only written at/after registration), so an unregistered
+    // numeric local id is still never trusted.
+    try {
+      const ontologyGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
+      const predicate = `${DKG_ONTOLOGY.DKG_CONTEXT_GRAPH}OnChainId`;
+      const result = await this.store.query(
+        `SELECT ?cg WHERE { GRAPH <${ontologyGraph}> { ?cg <${predicate}> ?id . FILTER(STR(?id) = "${numericOnChainId}") } } LIMIT 1`,
+      );
+      return result.type === 'bindings' && result.bindings.length > 0;
+    } catch {
+      // Store offline / query error — fall through to "not proven known"
+      // (fail-closed: the CG stays on the encrypted path).
+      return false;
+    }
   }
 
   /**

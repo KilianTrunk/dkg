@@ -6,7 +6,7 @@
  * this helper mirrors packages/publisher/test/_helpers/seal.ts#buildUpdateSeal.
  *
  * Usage:
- *   node devnet-update-seal.mjs --key 0x... --ka-id <id> --quads-json '<quad-array>'
+ *   node devnet-update-seal.mjs --key 0x... --ka-id <id> --quads-json '<quad-array>' [--private-quads-json '<quad-array>']
  *
  * Output: one JSON line { ok, precomputedUpdateAttestation?, error? }
  *   Wire format matches agent-chat.ts parsePrecomputedUpdateAttestation.
@@ -85,11 +85,13 @@ async function main() {
   let key = null;
   let kaId = null;
   let quadsJson = null;
+  let privateQuadsJson = null;
   const argv = process.argv.slice(2);
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--key') key = argv[++i];
     else if (argv[i] === '--ka-id') kaId = argv[++i];
     else if (argv[i] === '--quads-json') quadsJson = argv[++i];
+    else if (argv[i] === '--private-quads-json') privateQuadsJson = argv[++i];
   }
   if (!key || kaId == null || !quadsJson) {
     out({ ok: false, error: 'usage: --key 0x.. --ka-id <id> --quads-json <json-array>' });
@@ -113,11 +115,20 @@ async function main() {
   }
 
   let quads;
+  let privateQuads;
   try {
     quads = JSON.parse(quadsJson);
   } catch (e) {
     out({ ok: false, error: `invalid quads JSON: ${e.message}` });
     process.exit(1);
+  }
+  if (privateQuadsJson) {
+    try {
+      privateQuads = JSON.parse(privateQuadsJson);
+    } catch (e) {
+      out({ ok: false, error: `invalid private quads JSON: ${e.message}` });
+      process.exit(1);
+    }
   }
 
   const provider = new ethers.JsonRpcProvider(RPC);
@@ -126,6 +137,7 @@ async function main() {
     const seal = await buildUpdateSeal({
       kaId,
       quads,
+      privateQuads,
       author,
       kav10Address: kav10,
       provider,

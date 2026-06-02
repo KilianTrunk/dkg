@@ -27,32 +27,39 @@ import { waitForDevnetStatus, waitForConnectedPeers } from './helpers/devnet.js'
 import { listSubGraphs } from './helpers/devnet-publish.js';
 import { seedVmEntity, seedSubgraphEntity, PRIMARY_CG, NAMED_SUBGRAPH } from './helpers/real-node.js';
 
+// The UI can be repointed at a non-default node via DEVNET_NODE / UI_NODE_ID
+// (see playwright.config.ts + bootstrap-devnet.ts). Health-check, quorum-wait,
+// idempotency-check and SEED the SAME node the browser talks to — otherwise we
+// could seed/verify node1 while the UI reads a different backend and start
+// asserting before the seeded data is visible to it.
+const UI_NODE = parseInt(process.env.DEVNET_NODE || process.env.UI_NODE_ID || '1', 10) || 1;
+
 export default async function globalSetup(): Promise<void> {
   // Intentionally NOT wrapped in try/catch — see the file header. A seed failure
   // must propagate so Playwright aborts the run at setup with the real error.
-  await waitForDevnetStatus(1, 180_000);
+  await waitForDevnetStatus(UI_NODE, 180_000);
   // Idempotency check: require the seed's FINAL artifact — the e2e-namespaced
   // NAMED_SUBGRAPH sub-graph WITH at least one entity in it. A bare registered
   // sub-graph with entityCount 0 means a prior run died mid-seed (registered the
   // sub-graph but never wrote its entity / VM seed), so we must NOT treat that as
   // "already seeded" and skip — re-seed to complete it.
-  const existing = await listSubGraphs(PRIMARY_CG);
+  const existing = await listSubGraphs(PRIMARY_CG, UI_NODE);
   if (existing.some((sg) => sg.name === NAMED_SUBGRAPH && sg.entityCount >= 1)) {
     console.log(
-      `[global-setup] ${PRIMARY_CG} already seeded (sub-graph "${NAMED_SUBGRAPH}" has entities) — skipping to avoid accreting duplicate content`,
+      `[global-setup] ${PRIMARY_CG} already seeded on node${UI_NODE} (sub-graph "${NAMED_SUBGRAPH}" has entities) — skipping to avoid accreting duplicate content`,
     );
     return;
   }
   // VM publish needs ACK quorum from a connected CORE peer, and globalSetup runs
-  // in parallel with the bootstrap (which only waits for node1's API port). Wait
-  // for at least one connected peer so the seed can't race the cold boot and fail
-  // with QuorumUnmetError.
-  await waitForConnectedPeers(1, 1, 120_000);
-  const seeded = await seedVmEntity(PRIMARY_CG);
-  console.log(`[global-setup] seeded VM entity into ${PRIMARY_CG}: "${seeded.label}" (kaId=${seeded.kaId ?? 'n/a'})`);
+  // in parallel with the bootstrap (which only waits for the node's API port).
+  // Wait for at least one connected peer so the seed can't race the cold boot and
+  // fail with QuorumUnmetError.
+  await waitForConnectedPeers(UI_NODE, 1, 120_000);
+  const seeded = await seedVmEntity(PRIMARY_CG, UI_NODE);
+  console.log(`[global-setup] seeded VM entity into ${PRIMARY_CG} (node${UI_NODE}): "${seeded.label}" (kaId=${seeded.kaId ?? 'n/a'})`);
   // Register + seed a named sub-graph so the SubGraphBar always has a concrete
   // scope chip to drive — the subgraph specs assert against this instead of
   // skipping when only the aggregate "All" chip exists.
-  const sg = await seedSubgraphEntity(PRIMARY_CG, NAMED_SUBGRAPH);
-  console.log(`[global-setup] seeded sub-graph "${NAMED_SUBGRAPH}" entity into ${PRIMARY_CG}: "${sg.label}"`);
+  const sg = await seedSubgraphEntity(PRIMARY_CG, NAMED_SUBGRAPH, UI_NODE);
+  console.log(`[global-setup] seeded sub-graph "${NAMED_SUBGRAPH}" entity into ${PRIMARY_CG} (node${UI_NODE}): "${sg.label}"`);
 }

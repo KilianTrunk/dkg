@@ -63,11 +63,18 @@ function holderStamp(): string {
  * mkdir, spins (with jitter) until free, and reclaims a crashed holder's lock so
  * the suite can't deadlock. While held, the lock's timestamp is HEARTBEATED so a
  * long-but-healthy publish is never mistaken for a dead holder and stolen.
+ *
+ * `acquireTimeoutMs` bounds how long we wait behind a LIVE (heartbeating) holder
+ * before giving up. On expiry we THROW rather than steal: a healthy holder that
+ * legitimately runs long (e.g. a slow CI publish past the default) must never be
+ * evicted mid-critical-section, or two workers would enter it concurrently and
+ * reintroduce the clearAfter/promote-publish race this mutex prevents. Tune via
+ * the option (or set it high) for environments with genuinely long publishes.
  */
 export async function withSwmLock<T>(fn: () => Promise<T>, opts: { acquireTimeoutMs?: number } = {}): Promise<T> {
-  // Generous overall give-up window. With heartbeat-based staleness a dead
-  // holder is reclaimed within STALE_MS regardless, so this only bounds the wait
-  // behind a genuinely long-running live holder.
+  // Overall give-up window for waiting behind a LIVE holder. A dead holder is
+  // reclaimed within STALE_MS regardless of this value, so this only bounds the
+  // wait behind a genuinely long-running, still-heartbeating holder.
   const acquireTimeoutMs = opts.acquireTimeoutMs ?? 120_000;
   const start = Date.now();
   // When the holder dir exists but its stamp is missing/garbage (e.g. a writer
@@ -101,11 +108,15 @@ export async function withSwmLock<T>(fn: () => Promise<T>, opts: { acquireTimeou
         }
       }
       if (Date.now() - start > acquireTimeoutMs) {
-        // Last resort: break a presumably-dead lock rather than fail the test on
-        // acquisition (itself a false negative). Reached only if a live holder
-        // genuinely ran past the whole window — far rarer than the old 30s steal.
-        await rm(LOCK_DIR, { recursive: true, force: true }).catch(() => {});
-        continue;
+        // The holder is still heartbeating (a dead one would already have been
+        // reclaimed via STALE_MS above) — it's just slow. NEVER steal a live
+        // lock: surface an acquisition-timeout instead so the slow critical
+        // section completes safely. Bump `acquireTimeoutMs` if this fires.
+        throw new Error(
+          `withSwmLock: timed out after ${acquireTimeoutMs}ms waiting for a live SWM lock holder ` +
+            `(held since stamp "${stamp}"). Refusing to steal a heartbeating lock; ` +
+            `raise acquireTimeoutMs if long publishes are expected.`,
+        );
       }
       await sleep(40 + Math.random() * 120);
     }

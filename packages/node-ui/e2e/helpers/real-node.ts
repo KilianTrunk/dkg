@@ -54,9 +54,9 @@ export interface SeededEntity {
  * specs therefore assert tolerantly ("the label I just seeded is visible",
  * "count ≥ 1") rather than against a brittle exact total.
  */
-export async function seedVmEntity(cgId: string, prefix = 'seed'): Promise<SeededEntity> {
+export async function seedVmEntity(cgId: string, nodeNum = 1): Promise<SeededEntity> {
   const stamp = Date.now();
-  const result = await runWmSwmVmPipeline({ contextGraphId: cgId, stamp });
+  const result = await runWmSwmVmPipeline({ contextGraphId: cgId, stamp, nodeNum });
   return { label: result.label, assertionName: result.assertionName, kaId: result.kaId };
 }
 
@@ -87,8 +87,9 @@ export async function seedWmEntity(cgId: string, prefix = 'wm'): Promise<SeededE
 export async function seedSubgraphEntity(
   cgId: string,
   subGraphName = NAMED_SUBGRAPH,
+  nodeNum = 1,
 ): Promise<SeededEntity> {
-  await createSubGraph({ contextGraphId: cgId, subGraphName });
+  await createSubGraph({ contextGraphId: cgId, subGraphName, nodeNum });
   const stamp = Date.now();
   const assertionName = `e2e-ui-sg-${subGraphName}-${stamp}`;
   const label = `E2E SG ${subGraphName} ${stamp}`;
@@ -98,6 +99,7 @@ export async function seedSubgraphEntity(
     quads: buildSubGraphQuads(cgId, subGraphName, stamp, label),
     subGraphName,
     promote: true,
+    nodeNum,
   });
   if (!res.ok) throw new Error(`seedSubgraphEntity failed: ${res.status} ${res.body}`);
   return { label, assertionName };

@@ -101,6 +101,28 @@ describe('DKGAgent.isContextGraphPublicOnChain', () => {
     const agentLike = makeAgentLike({ onChainIdError: new Error('store offline') });
     await expect(isPublic(agentLike)).resolves.toBe(false);
   });
+
+  it('treats a positive-integer contextGraphId as the already-resolved on-chain id (#884 numeric-id case)', async () => {
+    // `getContextGraphOnChainId` returns null for a bare numeric id (it only
+    // resolves LOCAL ids via the store / subscription map). A public
+    // registered CG addressed by its numeric on-chain id — e.g.
+    // share('42', ...) — must still be detected as public and NOT fall back
+    // to the encrypted/gated SWM path. onChainId:null here forces the
+    // resolver to be useless, so passing iff the numeric id is used directly.
+    const agentLike = makeAgentLike({ onChainId: null, accessPolicy: 0 });
+    await expect(isPublic(agentLike, '42')).resolves.toBe(true);
+    expect(agentLike.chain.getContextGraphAccessPolicy).toHaveBeenCalledWith(42n);
+    expect(agentLike.onChainAccessPolicyCache.get('42')).toBe(0);
+    // Resolved directly from the numeric id — the (null-returning) resolver
+    // was not relied upon.
+    expect(agentLike.getContextGraphOnChainId).not.toHaveBeenCalled();
+  });
+
+  it('returns false for a private CG addressed by its numeric on-chain id (#884 numeric-id, fail-closed)', async () => {
+    const agentLike = makeAgentLike({ onChainId: null, accessPolicy: 1 });
+    await expect(isPublic(agentLike, '7')).resolves.toBe(false);
+    expect(agentLike.chain.getContextGraphAccessPolicy).toHaveBeenCalledWith(7n);
+  });
 });
 
 describe('DKGAgent.resolveWorkspaceRecipientsGated (gate-before)', () => {
@@ -136,6 +158,21 @@ describe('DKGAgent.resolveWorkspaceRecipientsGated (gate-before)', () => {
       { contextGraphId: '0xCURATOR/unknown-cg' },
     );
     expect(agentLike.store.query).toHaveBeenCalled();
+  });
+
+  it('returns plaintext for a public CG addressed by its numeric on-chain id WITHOUT the store resolver (#884)', async () => {
+    // The end-to-end shape of the bug: share('42', ...) on a public
+    // registered CG must take the plaintext path. Pre-fix, the numeric id
+    // didn't resolve, isContextGraphPublicOnChain returned false, and this
+    // fell through to resolveWorkspaceAgentRecipients (the encrypted/gated
+    // path that triggered the HTTP 500).
+    const agentLike = makeAgentLike({ onChainId: null, accessPolicy: 0 });
+    const resolution = await (DKGAgent.prototype as any).resolveWorkspaceRecipientsGated.call(
+      agentLike,
+      { contextGraphId: '42' },
+    );
+    expect(resolution).toEqual({ requiresEncryption: false, recipients: [] });
+    expect(agentLike.store.query).not.toHaveBeenCalled();
   });
 });
 

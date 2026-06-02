@@ -5795,8 +5795,22 @@ export class DKGAgent {
    */
   private async isContextGraphPublicOnChain(contextGraphId: string): Promise<boolean> {
     try {
-      if (typeof this.getContextGraphOnChainId !== 'function') return false;
-      const onChainId = await this.getContextGraphOnChainId(contextGraphId);
+      // Resolve the numeric on-chain id. A caller may pass either a LOCAL
+      // context-graph id (resolved to its numeric on-chain id via the
+      // subscription map / store) OR the numeric on-chain id directly — e.g.
+      // share('42', ...). `getContextGraphOnChainId` only handles the former
+      // and returns null for a bare numeric id, so a positive-integer
+      // contextGraphId must be treated as ALREADY RESOLVED before the lookup.
+      // Without this, a public registered CG addressed by its numeric id is
+      // wrongly seen as non-public and falls back to the encrypted/gated SWM
+      // path this change removes (#884).
+      let onChainId: string | null = null;
+      const trimmed = contextGraphId.trim();
+      if (/^\d+$/.test(trimmed)) {
+        onChainId = trimmed;
+      } else if (typeof this.getContextGraphOnChainId === 'function') {
+        onChainId = await this.getContextGraphOnChainId(contextGraphId);
+      }
       if (!onChainId) return false;
       const cached = this.onChainAccessPolicyCache.get(onChainId);
       if (cached !== undefined) return cached === 0;

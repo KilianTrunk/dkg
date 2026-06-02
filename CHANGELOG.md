@@ -4,6 +4,56 @@ All notable changes to the DKG V9 node are documented here. The format is based 
 
 ## [Unreleased]
 
+## [10.0.0-rc.13] - 2026-06-02
+
+**Off-chain stabilization release.** No Solidity changes since rc.12 — the Base Sepolia (chainId 84532) deployment in `packages/evm-module/deployments/base_sepolia_v10_contracts.json` is **unchanged**, the `chainResetMarker` stays `v10-rc12-ka-rename-2026-06-01`, and **no contract redeploy is required**. Nodes upgrade in place; no local-state wipe. This release lands the core-preferred sync + chain-driven VM reconciliation work, the Kafka route-plugin MVP, and a batch of publish/SWM runtime hardening and Node UI fixes accumulated on top of rc.12.
+
+### Added — Core-preferred sync + chain-driven VM reconciliation (#927)
+
+- **Core-preferred sync + chain-driven verified-memory reconciliation** (PR #927, `packages/agent/src`, `packages/core/src`; supersedes #906/#908/#910/#911/#912/#914): the sync path now prefers Core peers and reconciles verified-memory against on-chain state, including host-mode catch-up. Closes the long-running sync/catch-up workstream tracked across the superseded PRs.
+
+### Added — Kafka route-plugin MVP (#607)
+
+- **`@origintrail-official/kafka-plugin`** (PR #607, `packages/kafka-plugin`, `demo/kafka-streams`): new route-plugin consumer package that ingests from Kafka topics into the DKG publish path. Added to `pnpm-workspace.yaml` and the runtime build set.
+
+### Changed — Default publish lifetime is now 12 epochs (#926)
+
+- **`random-sampling` default epochs** (PR #926): the default publish lifetime is set to **12 epochs**. Publishes that don't specify a lifetime now default to 12 instead of the previous default.
+
+### Fixed — Publish / SWM / sync runtime hardening
+
+- **Single-root SWM publish boundary** (PR #925, `packages/publisher/src`): enforce a single-root boundary on shared-working-memory publishes (multi-root publish flow correctness).
+- **SWM plaintext for on-chain-public CGs with an allowed-agent list** (PR #884, `packages/agent/src`): keep SWM payloads plaintext for context graphs that are on-chain-public but carry an allowed-agent list.
+- **Sub-graph SWM in catch-up + approve-time race** (PR #885, `packages/agent/src`): cover sub-graph SWM during catch-up and close a late-joiner / approve-time race (`scripts/devnet-test-swm-late-joiner-subgraph.sh`).
+- **SWM Sender Key setup after joined-CG approval** (PR #900, `packages/agent/src`): fix sender-key setup that was missed after a joined-CG approval; parallel fan-out correctness.
+- **rc.12 publish ACK / allowance races + SPARQL parse-error classifier** (PR #896, addresses #887/#888/#889): resolve publish ACK and allowance race conditions and add a SPARQL parse-error classifier.
+- **Stabilize V10 publish runtime paths** (PR #899): runtime fixes across the V10 publish path.
+- **Harden context-graph registration RPC handling** (PR #883, #883/orch): tolerate RPC 429s on context-graph register.
+- **Per-publish allowance auto-replenish** (PR #876, `packages/chain/src`): auto-replenish the per-publish allowance floor (#870).
+- **Skip recovery `getIdentityId` on boot chain-timeout** (PR #903): don't run identity recovery when the boot-time chain call times out.
+- **Artifact read-gate for public CGs** (PR #879, forward of #872).
+
+### Fixed — Forward-ports from rc.12 hotfix line
+
+- **Rich error when promote finds an empty assertion graph** (PR #898, forward-port of #874, `packages/publisher`, `packages/node-ui`).
+- **Respect explicit `accessPolicy="public"` over allowlist heuristic** (PR #897, forward-port of #873, `packages/agent`).
+
+### Fixed — Node UI
+
+- **Unified render-correct triple derivation via `useCanonicalTriples`** (PR #847, GH #819, `packages/node-ui/src`).
+- **WM Assertions subtab empty after #844** (PR #877): derive the list from `_meta`.
+- **4 QA-found UI bugs** (PR #924, addresses #904/#905/#913/#915).
+- **Markdown import root-children partitioning** (PR #920): fix markdown section root partitioning.
+- **Post-#847 follow-ups** (PR #890): GH #881 fused-counts helper + GH #882 hydrating tooltip.
+- **Settings page cleanup** (PR #855): remove stale sections, sleeker cards, accessibility fixes.
+- **Selected `DKG_HOME` daemon status detection** (PR #878, orch).
+
+### Added — Test coverage
+
+- **Node UI e2e against a real node** (PR #918, `packages/node-ui/e2e`).
+- **`core-peers-features` devnet suite** (`devnet/core-peers-features`).
+- **Build unblock**: augment `NodeJS.ProcessEnv` with `DKG_HOME` (PR #892); resolve 3 #892-surfaced test regressions (PR #901, addresses #893/#894/#895).
+
 ### Added — Operator observability for per-publish 1-wei allowance floor (#871)
 
 - **Diagnostic log line in `EVMChainAdapter.ensureV10ApproveTrac`** (`packages/chain/src/evm-adapter.ts`): when the V10 publish/update path emits its per-publish floor approval (`targetAllowance == V10_PUBLISH_ONCHAIN_MIN_ALLOWANCE` and `chain.approvalPolicy.mode == 'per-publish'`), the daemon now logs a single `console.warn` line identifying that the resulting 1-wei allowance is the intentional `#720` workaround (the contract's `transferFrom(..., 1n)` minimum on zero-cost publishes) and is not a stuck or ghosted approval. This closes a reportability gap surfaced by [#871](https://github.com/OriginTrail/dkg/issues/871), where an operator manually inspected `allowance()` against the wrong (typo'd) spender address and read the daemon's pre-existing 1-wei floor as a daemon-side bug. Investigation note: [`docs/investigations/871-curator-wallet-allowance-ghosting.md`](docs/investigations/871-curator-wallet-allowance-ghosting.md). No behaviour change for any caller — only the diagnostic line is new; the underlying floor logic and the `effectivePublishAllowance` / `computeApprovalAction` invariants are unchanged.

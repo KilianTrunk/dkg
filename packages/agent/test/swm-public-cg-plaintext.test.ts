@@ -47,15 +47,19 @@ function makeAgentLike(opts: {
   // chain.getContextGraphNameHash — the on-chain committed identity anchor used
   // by the local-mapping identity binding. When OMITTED the getter is absent
   // (binding is a no-op: identity can't be disproven → proceeds to liveness).
-  // Provide a hex string to assert a specific committed name-hash, or `null`
-  // to simulate the curator opting out of the on-chain commitment.
-  onChainNameHash?: string | null;
+  // Provide a hex string to assert a specific committed name-hash, `null` to
+  // simulate the curator opting out of the on-chain commitment, or an Error to
+  // simulate the getter rejecting.
+  onChainNameHash?: string | null | Error;
   // Whether a LOCAL context graph with the queried id exists (binds
   // this.contextGraphExists). Used to prove that a numeric-named local CG which
   // isn't registered on-chain stays 'unregistered' (plaintext) rather than
   // being misread as a raw on-chain slot. OMITTED → the getter is absent (the
   // bare-decimal raw-slot path is taken, as before).
   localCgExists?: boolean;
+  // Make this.contextGraphExists REJECT, to prove a flaked existence check
+  // fails closed (→ 'unknown') instead of being read as "no local CG".
+  localCgExistsError?: Error;
 } = {}) {
   const log = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
   const chain: Record<string, unknown> = {};
@@ -73,7 +77,10 @@ function makeAgentLike(opts: {
     });
   }
   if ('onChainNameHash' in opts) {
-    chain.getContextGraphNameHash = vi.fn(async (_id: bigint) => opts.onChainNameHash ?? null);
+    chain.getContextGraphNameHash = vi.fn(async (_id: bigint) => {
+      if (opts.onChainNameHash instanceof Error) throw opts.onChainNameHash;
+      return opts.onChainNameHash ?? null;
+    });
   }
   // The store resolver (resolveWorkspaceAgentRecipients) is the only consumer
   // of store.query on these paths; an empty result → no allowlist → it returns
@@ -92,8 +99,11 @@ function makeAgentLike(opts: {
     }),
     isPrivateContextGraph: vi.fn(async () => opts.isPrivate ?? false),
   };
-  if ('localCgExists' in opts) {
-    agentLike.contextGraphExists = vi.fn(async () => opts.localCgExists ?? false);
+  if ('localCgExists' in opts || opts.localCgExistsError) {
+    agentLike.contextGraphExists = vi.fn(async () => {
+      if (opts.localCgExistsError) throw opts.localCgExistsError;
+      return opts.localCgExists ?? false;
+    });
   }
   // Bind the prototype methods under test so `this` resolves to agentLike.
   agentLike.isContextGraphPublicOnChain = (DKGAgent.prototype as any).isContextGraphPublicOnChain;
@@ -168,6 +178,33 @@ describe('DKGAgent.isContextGraphPublicOnChain', () => {
     const agentLike = makeAgentLike({ onChainId: '5', accessPolicy: 0, onChainNameHash: null });
     await expect(isPublic(agentLike, cgId)).resolves.toBe(true);
     expect(agentLike.chain.getContextGraphAccessPolicy).toHaveBeenCalledWith(5n);
+  });
+
+  it('fails closed when the name-hash getter is PRESENT but REJECTS — identity unverifiable (#884 review GZ8L_)', async () => {
+    // The adapter exposes getContextGraphNameHash, so an RPC rejection means we
+    // cannot prove the local mapping still points at this CG. A transient flake
+    // must NOT re-enable the plaintext downgrade for a possibly reused slot →
+    // fail closed BEFORE the policy read.
+    const cgId = '0xCURATOR/experimental-music';
+    const agentLike = makeAgentLike({ onChainId: '5', accessPolicy: 0, onChainNameHash: new Error('name-hash rpc down') });
+    await expect(isPublic(agentLike, cgId)).resolves.toBe(false);
+    expect(agentLike.chain.getContextGraphAccessPolicy).not.toHaveBeenCalled();
+  });
+
+  it('fails closed when the name-hash read TIMES OUT — identity unverifiable (#884 review GZ8L_)', async () => {
+    vi.useFakeTimers();
+    try {
+      const cgId = '0xCURATOR/experimental-music';
+      const agentLike = makeAgentLike({ onChainId: '5', accessPolicy: 0, onChainNameHash: '0x' + '00'.repeat(32) });
+      // Override with a hung read so the bounded race trips the timeout path.
+      agentLike.chain.getContextGraphNameHash = vi.fn(() => new Promise(() => {}));
+      const pending = isPublic(agentLike, cgId);
+      await vi.advanceTimersByTimeAsync(3_000);
+      await expect(pending).resolves.toBe(false);
+      expect(agentLike.chain.getContextGraphAccessPolicy).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('does NOT identity-bind a BARE-NUMERIC id (caller addresses the slot directly) (#884 review GZEqF)', async () => {
@@ -449,5 +486,16 @@ describe('DKGAgent publish-inline gating respects on-chain public policy', () =>
     await expect(resolveInline(agentLike, '42')).resolves.toBeUndefined();
     expect(agentLike.chain.isContextGraphActiveOnChain).toHaveBeenCalledWith(42n);
     expect(agentLike.chain.getContextGraphAccessPolicy).toHaveBeenCalledWith(42n);
+  });
+
+  it('fails CLOSED when the local-existence check for a bare numeric id FLAKES — never the raw-slot guess (#884 review GZ8L5)', async () => {
+    // contextGraphExists('42') rejects. We must NOT fall through to the raw-slot
+    // path (slot 42 could be a live public CG and we'd force the WRONG graph
+    // onto plaintext). The publish path refuses ('unknown' → throws) rather than
+    // guessing.
+    const agentLike = makeAgentLike({ onChainId: null, accessPolicy: 0, activeOnChain: true, localCgExistsError: new Error('store offline') });
+    await expect(resolveInline(agentLike, '42')).rejects.toThrow(/publish access-policy is unknown/);
+    expect(agentLike.chain.isContextGraphActiveOnChain).not.toHaveBeenCalled();
+    expect(agentLike.chain.getContextGraphAccessPolicy).not.toHaveBeenCalled();
   });
 });

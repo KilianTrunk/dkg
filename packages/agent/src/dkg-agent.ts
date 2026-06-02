@@ -6352,12 +6352,27 @@ export class DKGAgent {
       // that id. A local CG whose canonical id is itself numeric (e.g.
       // `createContextGraph({ id: '42' })`) that simply isn't registered
       // on-chain yet must stay 'unregistered' (→ plaintext-inline default), not
-      // be misclassified as a raw slot and fail closed as 'unknown'. Only enter
-      // the raw-slot path after proving no such local CG exists.
-      const localCgExists = typeof this.contextGraphExists === 'function'
-        ? await this.contextGraphExists(trimmed).catch(() => false)
-        : false;
-      if (!localCgExists) onChainId = trimmed;
+      // be misclassified as a raw slot. Only a SUCCESSFUL negative existence
+      // check enables the raw-slot branch.
+      if (typeof this.contextGraphExists === 'function') {
+        let localCgExists: boolean;
+        try {
+          localCgExists = await this.contextGraphExists(trimmed);
+        } catch {
+          // #884 review (🔴 GZ8L5): a flaked existence check is NOT a license
+          // to treat "42" as a raw on-chain slot — slot 42 could be a live
+          // public CG on the current chain and we'd force the WRONG graph onto
+          // plaintext. Fail closed (UNKNOWN) instead of guessing.
+          return 'unknown';
+        }
+        if (!localCgExists) onChainId = trimmed;
+        // else: a local CG named "42" exists but has no on-chain mapping → it
+        // is a pure-local (unregistered) CG; fall through to 'unregistered'.
+      } else {
+        // No local-existence oracle available (minimal adapters / harnesses):
+        // preserve the bare-numeric raw-slot addressing behavior.
+        onChainId = trimmed;
+      }
     }
     // No resolvable on-chain slot at all — a pure-local CG (including a
     // numeric-named local CG not yet registered). This is NOT "unknown": there
@@ -6407,13 +6422,17 @@ export class DKGAgent {
    * deterministic, write-once at registration, and identical on every node, so
    * a reused slot commits a DIFFERENT name.
    *
-   * Returns `false` (→ caller fails closed) ONLY on an AFFIRMATIVE mismatch
-   * between the slot's committed name-hash and this CG's expected wire id.
-   * Returns `true` (proceed to the liveness/policy gate) when identity can't be
-   * disproven — no `getContextGraphNameHash` getter, the curator opted out of
-   * the on-chain commitment (`null`), an RPC stall/error, or a derivation
-   * failure — so this never strips plaintext from a case that works today; it
-   * only HARDENS against the stale/reused-slot downgrade.
+   * Returns `false` (→ caller fails closed) on an AFFIRMATIVE mismatch between
+   * the slot's committed name-hash and this CG's expected wire id, AND — once
+   * the adapter EXPOSES `getContextGraphNameHash` — whenever the hash cannot be
+   * verified (RPC rejection or read timeout): an unverifiable identity must not
+   * re-enable the plaintext downgrade for a possibly reused slot (#884 review
+   * 🔴 GZ8L_). Returns `true` (proceed to the liveness/policy gate) only where
+   * there is genuinely nothing to disprove: no `getContextGraphNameHash` getter
+   * at all, or the curator explicitly opted OUT of the on-chain commitment
+   * (`null`). So this never strips plaintext from a case with no identity
+   * commitment, while still failing closed when a present commitment can't be
+   * confirmed.
    */
   private async localCgMatchesOnChainSlot(
     contextGraphId: string,
@@ -6443,12 +6462,35 @@ export class DKGAgent {
     let onChainHash: string | null | typeof TIMEOUT_SENTINEL;
     try {
       onChainHash = await this.raceChainPolicyRead(getNameHash.call(this.chain, numericId));
-    } catch {
-      // RPC rejection — can't disprove identity; don't add a NEW failure (the
-      // liveness + fresh-policy gate still applies downstream).
-      return true;
+    } catch (err) {
+      // #884 review (🔴 GZ8L_): the adapter EXPOSES the name-hash getter (we
+      // passed the typeof check above), so an RPC REJECTION means we cannot
+      // VERIFY that the persisted local mapping still points at THIS CG. Fail
+      // closed — a transient flake must not re-enable the plaintext downgrade
+      // for a possibly devnet-reset / reused slot. (Fail-open is reserved for
+      // the explicit opt-out `null` below, where there is no commitment to
+      // check.)
+      this.log.warn(
+        opCtx ?? createOperationContext('share'),
+        `isContextGraphPublicOnChain(${contextGraphId}): getContextGraphNameHash(${onChainId}) failed — ` +
+        `cannot verify local-mapping identity, treating CG as NOT public (fail-closed): ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return false;
     }
-    if (onChainHash === TIMEOUT_SENTINEL || !onChainHash) return true;
+    if (onChainHash === TIMEOUT_SENTINEL) {
+      // Same as a rejection: the getter exists but the hash couldn't be read in
+      // time, so the mapping identity is UNVERIFIED → fail closed.
+      this.log.warn(
+        opCtx ?? createOperationContext('share'),
+        `isContextGraphPublicOnChain(${contextGraphId}): getContextGraphNameHash(${onChainId}) timed out after ` +
+        `${CHAIN_POLICY_READ_TIMEOUT_MS}ms — cannot verify local-mapping identity, treating CG as NOT public (fail-closed)`,
+      );
+      return false;
+    }
+    // Explicit opt-out (`null` / empty): the curator chose NOT to anchor
+    // identity on-chain, so there is nothing to disprove against — proceed
+    // (fail-open is correct ONLY here).
+    if (!onChainHash) return true;
     if (onChainHash.toLowerCase() === expectedWireId) return true;
 
     this.log.warn(

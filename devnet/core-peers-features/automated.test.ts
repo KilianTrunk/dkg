@@ -441,15 +441,22 @@ describe('Phase D — Cores host public CGs and fill their own gaps', () => {
       (await nodeReachable(victimNode)) ? true : null,
     );
 
-    // 4. The victim must fill its gap FROM CHAIN after restart. The headline
-    //    proof is the missed triple landing in its verified-memory (the KA it
-    //    never received over gossip while offline). We also accept the distinct
-    //    `core-fill` telemetry as a bonus signal, but on devnet the cores are
-    //    also member-subscribers, so the reconciler emits the regular
-    //    `fetch`/`promote` surface rather than the host-only `core-fill` label —
-    //    the VM witness is the authoritative end-to-end signal.
+    // 4. The victim must fill its gap FROM CHAIN after restart. We require BOTH:
+    //      (i)  the missed triple is in the victim's verified-memory (it could
+    //           NOT have received it over gossip — it was confirmed offline
+    //           during the publish), AND
+    //      (ii) chain-path evidence that the reconciler delivered THIS specific
+    //           KA after restart — a `fetch`/`promote`/`core-fill` replication
+    //           event for this ka id, or a `chain-promote action=…` daemon.log
+    //           line naming it. This rules out a coincidental non-chain path.
+    //    `already` is NOT accepted (it means the KA was present pre-restart);
+    //    on devnet cores are also subscribers, so the host-only `core-fill`
+    //    label may not fire — `fetch`/`promote` for this ka is the real signal.
+    expect(pub.kaId, 'gap publish did not report a KC ID — cannot pin chain-path evidence').toBeTruthy();
+    const kaId = pub.kaId!;
+    const chainActions = new Set(['fetch', 'promote', 'core-fill']);
     const filled = await waitFor(
-      `node${victim} fills the gap (VM witness or core-fill event)`,
+      `node${victim} fills the gap from chain (VM witness + chain-path evidence for ka=${kaId})`,
       240_000,
       5_000,
       async () => {
@@ -458,18 +465,24 @@ describe('Phase D — Cores host public CGs and fill their own gaps', () => {
           contextGraphId: CONTEXT_GRAPH,
           view: 'verified-memory',
         });
-        if (vm.status === 200 && askIsTrue(vm.body)) return { via: 'vm-witness' };
+        if (!(vm.status === 200 && askIsTrue(vm.body))) return null; // headline proof first
 
+        // Chain-path evidence pinned to THIS ka id.
         const events = await getJson(victimNode, `/api/replication/events?cg=${encodeURIComponent(CONTEXT_GRAPH)}&limit=200`);
         if (events.status === 200) {
-          const coreFill = (events.body.events as any[]).find((e) => e.action === 'core-fill');
-          if (coreFill) return { via: 'core-fill', detail: coreFill };
+          const hit = (events.body.events as any[]).find(
+            (e) => chainActions.has(e.action) && typeof e.ual === 'string' && e.ual.endsWith(`/${kaId}`),
+          );
+          if (hit) return { via: 'chain-fill', evidence: `event:${hit.action} ${hit.ual}` };
         }
+        const log = daemonLogTail(victim);
+        const m = new RegExp(`chain-promote action=(promote|fetch|core-fill)[^\\n]*\\bka=${kaId}\\b`).exec(log);
+        if (m) return { via: 'chain-fill', evidence: `log:${m[0]}` };
         return null;
       },
     );
-    expect(filled).toBeTruthy();
-    console.log(`Phase D fill-the-gap PASS via ${(filled as any).via}`);
+    expect(filled, `node${victim} VM witness landed but no chain-path evidence for ka=${kaId}`).toBeTruthy();
+    console.log(`Phase D fill-the-gap PASS via ${(filled as any).via} — ${(filled as any).evidence}`);
   }, 600_000);
 });
 

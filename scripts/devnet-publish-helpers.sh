@@ -37,6 +37,14 @@ devnet_json_field() {
   "
 }
 
+# Publish statuses the devnet harness treats as success (matches devnet-test.sh).
+_devnet_publish_status_ok() {
+  case "$1" in
+    confirmed|finalized|tentative) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # Honor an already-set DEVNET_PUBLISH_STATE_FILE; otherwise derive a
 # parent-stable path from $$ (NOT BASHPID, which changes inside subshells).
 _devnet_publish_init_state_file() {
@@ -243,10 +251,11 @@ devnet_publish_swm_all_roots() {
     console.log(JSON.stringify({ contextGraphId: cg, selection: 'all', clearAfter, ...extra }));
   " "$cg" "$clear_after" "$extra_fields")
 
-  local probe
+  local probe probe_code
   probe=$(api_call "$node" POST /api/shared-memory/publish "$probe_body")
+  probe_code=$(devnet_json_field "$probe" '.code')
 
-  if ! printf '%s' "$probe" | grep -q 'MULTI_ROOT_PUBLISH_NOT_ATOMIC'; then
+  if [ "$probe_code" != "MULTI_ROOT_PUBLISH_NOT_ATOMIC" ]; then
     local single_arr single_roots
     single_arr=$(printf '%s' "$probe" | node -e '
       let d=""; process.stdin.on("data",c=>d+=c);
@@ -305,8 +314,8 @@ devnet_publish_swm_all_roots() {
       }));
     " "$cg" "$root" "$ca" "$extra_fields")
     last_resp=$(api_call "$node" POST /api/shared-memory/publish "$last_resp")
-    st=$(printf '%s' "$last_resp" | node -e 'let d="";process.stdin.on("data",c=>d+=c);process.stdin.on("end",()=>{try{console.log(JSON.parse(d).status||"")}catch{}})' 2>/dev/null || echo "")
-    if [ "$st" != "confirmed" ] && [ "$st" != "finalized" ]; then
+    st=$(devnet_json_field "$last_resp" '.status')
+    if ! _devnet_publish_status_ok "$st"; then
       printf '%s' "$last_resp" >&2
       return 1
     fi

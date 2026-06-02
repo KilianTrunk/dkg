@@ -2,6 +2,7 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+CORE_CONSTANTS_TS="$SCRIPT_DIR/../packages/core/src/constants.ts"
 if [[ -n "${DKG_AUTH:-}" ]]; then
   AUTH="$DKG_AUTH"
 elif [[ -f "$SCRIPT_DIR/../.devnet/node1/auth.token" ]]; then
@@ -118,6 +119,11 @@ except: print('__ERR__')
 check() {
   local desc="$1" actual="$2" expected="$3"
   if [[ "$actual" == "$expected" ]]; then ok "$desc"; else fail "$desc (expected=$expected, got=$actual)"; fi
+}
+
+protocol_const() {
+  local const_name="$1"
+  sed -nE "s|^export const ${const_name} = '([^']+)';$|\1|p" "$CORE_CONSTANTS_TS" 2>/dev/null | head -n 1
 }
 
 # P1-3: Safe count helper. Replaces the pervasive
@@ -3012,27 +3018,34 @@ fi
 section_done
 
 #------------------------------------------------------------
-section_start "SECTION 33: rc.9 — substrate protocols negotiated on the wire (/dkg/10.0.1/*)"
+section_start "SECTION 33: rc.9/rc.14 — wire protocols negotiated"
 # rc.9 bumped 8+ short-message protocols from /dkg/10.0.0/* to
-# /dkg/10.0.1/*. A devnet-wide mismatch (one node still on 10.0.0)
-# would manifest as silently queued substrate messages. The peerStore
-# protocols list returned by /api/peer-info?peerId=<X> proves the
-# identify handshake advertised the rc.9 prefix on both sides.
+# /dkg/10.0.1/*; rc.14 bumps PROTOCOL_SYNC again when sync leaves the
+# messenger substrate. A devnet-wide mismatch (one node still on an
+# older wire ID) would manifest as silently queued substrate messages
+# or skipped sync. The peerStore protocols list returned by
+# /api/peer-info?peerId=<X> proves the identify handshake advertised
+# the expected protocol IDs on both sides.
 if [[ "$SKIP_RC9_SUBSTRATE" == "1" ]]; then
   skip "SECTION 33: skipped via SKIP_RC9_SUBSTRATE=1"
 elif [[ "$NUM_NODES" -lt 2 ]]; then
   skip "SECTION 33: need ≥2 nodes (have $NUM_NODES)"
 else
-  # rc.9 substrate protocol IDs we expect to see on every healthy
+  # Wire protocol IDs we expect to see on every healthy
   # peer. PROTOCOL_ACCESS (/dkg/10.0.1/private-access) is registered
   # unconditionally by DKGAgent.start() — round-3 Codex fix corrects
   # the earlier mistaken comment that claimed it was conditional.
   # /dkg/10.0.1/storage-ack is core-only — DKGAgent.start() registers
   # it under `if (effectiveRole === 'core')` (round-4 Codex fix), so
   # it's expected only when the TARGET is a core node.
+  PROTOCOL_SYNC_EXPECTED="$(protocol_const PROTOCOL_SYNC)"
+  if [[ -z "$PROTOCOL_SYNC_EXPECTED" ]]; then
+    fail "PROTOCOL_SYNC unreadable from packages/core/src/constants.ts — cannot verify sync protocol advertisement"
+    PROTOCOL_SYNC_EXPECTED="__MISSING_PROTOCOL_SYNC__"
+  fi
   EXPECTED_UNIVERSAL=(
     "/dkg/10.0.1/message"
-    "/dkg/10.0.1/sync"
+    "$PROTOCOL_SYNC_EXPECTED"
     "/dkg/10.0.1/swm-update"
     "/dkg/10.0.1/swm-share-ack"
     "/dkg/10.0.1/swm-sender-key"
@@ -3126,7 +3139,7 @@ except Exception:
         fi
       done
       if [[ ${#missing[@]} -eq 0 ]]; then
-        ok "N$((i+1)) ($observer_port) sees N$((j+1)) ($target_port, $target_role) advertising all ${#expected_for_target[@]} substrate protocols"
+        ok "N$((i+1)) ($observer_port) sees N$((j+1)) ($target_port, $target_role) advertising all ${#expected_for_target[@]} expected wire protocols"
       else
         fail "N$((i+1)) ($observer_port) does NOT see N$((j+1)) ($target_port, $target_role) advertising: ${missing[*]} (peerStore.protocols mismatch — possible wire-prefix drift)"
       fi

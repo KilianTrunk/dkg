@@ -440,7 +440,7 @@ export interface PeerDiagnostics {
   health: PeerHealth | null;
   /** Protocols this peer's identify-handshake advertised. */
   protocols: string[];
-  /** Convenience flag — peer speaks `/dkg/10.0.0/sync`. */
+  /** Convenience flag — peer speaks `PROTOCOL_SYNC`. */
   syncCapable: boolean;
 }
 

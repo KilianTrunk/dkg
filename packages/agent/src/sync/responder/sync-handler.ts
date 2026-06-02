@@ -94,7 +94,7 @@ export function registerSyncHandler(params: RegisterSyncHandlerParams): void {
       // received zero bytes of any sub-graph SWM the responder had
       // locally, so a late joiner who joined AFTER the curator had
       // published into a sub-graph could not backfill that history
-      // through `/dkg/10.0.1/sync` — see the SWM late-joiner backfill
+      // through `PROTOCOL_SYNC` — see the SWM late-joiner backfill
       // gap (urn:dkg:finding:swm-gap-2-subgraph-blind-spot). Filter
       // by URI shape under the CG prefix and emit `?g` per binding so
       // the requester reconstructs the correct graph at write time.

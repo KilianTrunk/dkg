@@ -1081,6 +1081,9 @@ export class DKGAgentBase {
   protected readonly hostModePersistenceQueues = new Map<string, Promise<void>>();
   /** System graph holding agent-registry triples (moved here so holder classes can reference it). */
   static readonly AGENT_SYSTEM_GRAPH = 'did:dkg:system/agents';
+  /** Pending chat handler/ACL captured before the messenger is wired (moved here during the mixin split). */
+  protected _pendingChatHandler: ChatHandler | null = null;
+  protected _pendingChatAcl: ChatAclCheck | null = null;
 
   protected constructor(
     config: DKGAgentConfig,

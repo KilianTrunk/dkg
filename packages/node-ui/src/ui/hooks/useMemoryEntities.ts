@@ -2,6 +2,7 @@ import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { postQueryDeduped } from '../api.js';
 import { useMemoryGraphEvents } from './useNodeEvents.js';
 import { MEMORY_LABEL_PREDICATES } from '../lib/memoryLabels.js';
+import { decodeRdfStringLiteral } from '../../rdf-literal.js';
 
 export type TrustLevel = 'working' | 'shared' | 'verified';
 export type MemoryLayerKey = 'wm' | 'swm' | 'vm';
@@ -107,7 +108,7 @@ export function canonicalEntityUri(uri: string): string {
 
 function shortLabel(uri: string): string {
   if (!uri) return '—';
-  if (uri.startsWith('"')) return uri.replace(/^"|"$/g, '');
+  if (uri.startsWith('"')) return decodeRdfStringLiteral(uri);
   const hash = uri.lastIndexOf('#');
   const slash = uri.lastIndexOf('/');
   const cut = Math.max(hash, slash);
@@ -392,6 +393,13 @@ async function queryLayer(
 export function buildEntities(layered: LayeredTriple[]): Map<string, MemoryEntity> {
   const entities = new Map<string, MemoryEntity>();
   const connectionKeys = new Map<string, Set<string>>();
+  // Per-(entity) property dedup keyed on the RAW triple object — NOT the
+  // decoded display value. Two literals that share a lexical form but differ in
+  // language/datatype (`"hello"@en` vs `"hello"@fr`, `"1"^^xsd:int` vs
+  // `"1"^^xsd:string`) decode to the same string, so deduping on the decoded
+  // value would silently drop a distinct RDF value (Codex). We display the
+  // decoded value but preserve distinctness on the raw form.
+  const propertyKeys = new Map<string, Set<string>>();
   // Per-(entity, layer) SPO-dedup keys for `tripleCount`. Mirrors
   // `useLayerTriples` + `dedupeTriplesBySpo` (`ProjectView.tsx`) so
   // the precomputed count agrees with the layer-page Triples tab.
@@ -486,10 +494,25 @@ export function buildEntities(layered: LayeredTriple[]): Map<string, MemoryEntit
         });
       }
     } else {
-      const existing = entity.properties.get(t.predicate) ?? [];
-      const val = t.object.startsWith('"') ? t.object.replace(/^"|"$/g, '') : t.object;
-      if (!existing.includes(val)) {
-        existing.push(val);
+      // Dedupe on the RAW term, not the decoded display string. This is a
+      // deliberate data-integrity choice that has flip-flopped in review:
+      //   • `"1"^^xsd:integer` vs `"1"^^xsd:string`, and `"x"@en` vs `"x"@fr`,
+      //     are DISTINCT RDF values. Keying dedup on the decoded form collapses
+      //     them and silently drops a real value — strictly worse than showing
+      //     two look-alike rows (Codex RED). So we preserve every distinct term.
+      //   • The cost is that two literals sharing a lexical form render as
+      //     visually-similar rows. Surfacing the datatype/lang badge that would
+      //     disambiguate them is a UI enhancement tracked separately; doing it
+      //     inline would either drop data or re-leak the `^^<…>` suffix (#913).
+      // The displayed value is still the decoded lexical form, so #913 holds —
+      // the raw `^^<…>`/`@lang` suffix never reaches the screen.
+      const pKeys = propertyKeys.get(entity.uri) ?? new Set<string>();
+      const rawKey = `${t.predicate}\0${t.object}`;
+      if (!pKeys.has(rawKey)) {
+        pKeys.add(rawKey);
+        propertyKeys.set(entity.uri, pKeys);
+        const existing = entity.properties.get(t.predicate) ?? [];
+        existing.push(decodeRdfStringLiteral(t.object));
         entity.properties.set(t.predicate, existing);
       }
     }

@@ -13,6 +13,9 @@ vi.mock('../src/ui/api-wrapper.js', () => ({
   api: {
     fetchStatus: vi.fn(async () => ({ synced: true, peers: 0 })),
   },
+  // AppShell now renders <MockModeBanner/>, which reads these (GH #904).
+  isUsingMocks: () => false,
+  subscribeMockMode: () => () => {},
 }));
 
 vi.mock('../src/ui/api.js', () => ({

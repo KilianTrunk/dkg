@@ -14,6 +14,7 @@ import { applyTheme } from './lib/applyTheme.js';
 import { useVisibilityPolling } from './hooks/useVisibilityPolling.js';
 import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts.js';
 import { useShellRouting } from './hooks/useShellRouting.js';
+import { MockModeBanner } from './components/MockModeBanner.js';
 
 function useLiveStatus() {
   const setNodeStatus = useAgentsStore((s) => s.setNodeStatus);
@@ -187,6 +188,7 @@ function AppShell() {
 
   return (
     <div className="v10-app">
+      <MockModeBanner />
       <Header />
       <div className="v10-app-body">
         {!leftCollapsed && (

@@ -111,7 +111,15 @@ function scrollElementFor(key: string, fallback: HTMLElement | null): HTMLElemen
 }
 
 export function ProjectView({ contextGraphId }: ProjectViewProps) {
-  const { data: cgData } = useFetch(api.fetchContextGraphs, [], 30_000);
+  // GH #905: consume `error`/`loading`/`refresh` — not just `data`. Gating the
+  // render on `cgData` alone meant a failed `fetchContextGraphs` left `cg`
+  // undefined and the view stuck on "Loading context graph…" forever, with no
+  // way to tell loading from error and no retry.
+  const { data: cgData, error: cgError, loading: cgLoading, refresh: refreshContextGraphs } = useFetch(
+    api.fetchContextGraphs,
+    [],
+    30_000,
+  );
   const [showImport, setShowImport] = useState(false);
   const [showShare, setShowShare] = useState(false);
   const [activeLayer, setActiveLayer] = useState<LayerView>('overview');
@@ -688,7 +696,40 @@ export function ProjectView({ contextGraphId }: ProjectViewProps) {
     openTab(CONTEXT_GRAPH_PRIMER_TAB);
   }, [openTab]);
 
+  // A 401 surfaces from useFetch as a specific auth-expiry message whose
+  // remediation is re-authentication (a page refresh), NOT retrying the fetch —
+  // a refetch just 401s again. Detect it so the auth copy + correct affordance
+  // isn't buried behind the generic "Failed to load" + Retry path (Codex, #905).
+  const cgAuthError = !!cgError && /authentication|unauthor|expired|sign in|log in/i.test(cgError);
+
   if (!cg) {
+    // GH #905: a failed fetch must surface an error + retry, not masquerade as
+    // a perpetual loading state. `useFetch` keeps last-good data, so once the
+    // list has loaded at least once `cgError` only trips on a genuine refetch
+    // failure; `cgData && !cgLoading` covers "loaded fine but this id isn't in
+    // the list" (also previously stuck on "Loading…").
+    if (cgError || (cgData && !cgLoading)) {
+      return (
+        <div className="v10-view-placeholder">
+          <p style={{ color: 'var(--text-tertiary)', fontSize: 12, marginBottom: 10 }}>
+            {cgError
+              ? cgAuthError
+                ? cgError
+                : 'Failed to load context graph.'
+              : 'Context graph not found.'}
+          </p>
+          {cgAuthError ? (
+            <button type="button" className="v10-retry-btn" onClick={() => window.location.reload()}>
+              Refresh page
+            </button>
+          ) : (
+            <button type="button" className="v10-retry-btn" onClick={refreshContextGraphs}>
+              Retry
+            </button>
+          )}
+        </div>
+      );
+    }
     return (
       <div className="v10-view-placeholder">
         <p style={{ color: 'var(--text-tertiary)', fontSize: 12 }}>Loading context graph...</p>
@@ -729,6 +770,30 @@ export function ProjectView({ contextGraphId }: ProjectViewProps) {
     <ProjectProfileContext.Provider value={profile}>
     <AgentsContext.Provider value={agentsContextValue}>
     <div className="v10-memory-explorer">
+      {/* GH #905: when a project is already open, `useFetch` keeps the
+          last-good `cgData`, so a failing 30s refresh leaves `cg` truthy and
+          the view would silently show stale data. Surface an inline,
+          non-blocking banner + retry while keeping the content visible
+          (Codex). Clears automatically once a refresh succeeds. */}
+      {cgError && (
+        <div className="v10-stale-banner" role="status">
+          {cgAuthError ? (
+            <>
+              <span>{cgError}</span>
+              <button type="button" className="v10-retry-btn" onClick={() => window.location.reload()}>
+                Refresh page
+              </button>
+            </>
+          ) : (
+            <>
+              <span>Couldn’t refresh context-graph data — showing last known values.</span>
+              <button type="button" className="v10-retry-btn" onClick={refreshContextGraphs}>
+                Retry
+              </button>
+            </>
+          )}
+        </div>
+      )}
       {/* Persistent project chrome — always visible so the user never
           loses "which project am I in" context when drilling into a
           sub-graph, a layer, or an entity detail. */}

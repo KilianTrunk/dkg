@@ -4,12 +4,14 @@ import { dirname, join } from 'node:path';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 
+import { PRIMARY_CG } from '../helpers/real-node.js';
+
 const __dir = dirname(fileURLToPath(import.meta.url));
 
 test.describe('Import data display', () => {
   test.beforeEach(async ({ shell, leftPanel }) => {
     await shell.goto();
-    await leftPanel.expandProject('Pharma Drug Interactions');
+    await leftPanel.expandProject(PRIMARY_CG);
   });
 
   test('header Import button opens import modal for active CG', async ({ page, importFilesModal }) => {
@@ -22,7 +24,7 @@ test.describe('Import data display', () => {
   test('import modal references active context graph name', async ({ page, importFilesModal }) => {
     await page.locator('button[title*="Import"], button[aria-label*="Import"]').first().click();
     const subtitle = page.locator('.v10-modal-subtitle');
-    await expect(subtitle).toContainText('Pharma Drug Interactions');
+    await expect(subtitle).toContainText(PRIMARY_CG);
     await importFilesModal.cancel();
   });
 
@@ -46,15 +48,8 @@ test.describe('Import data display', () => {
   });
 });
 
-test.describe('Import from dashboard quick action', () => {
-  test('Import quick action opens modal when present', async ({ shell, page, importFilesModal }) => {
-    await shell.goto();
-    const importAction = page.locator('.v10-quick-action').filter({ hasText: /Import/i });
-    if ((await importAction.count()) === 0) {
-      test.skip(true, 'Dashboard import quick action removed in rc.12 layout.');
-    }
-    await importAction.first().click();
-    expect(await importFilesModal.isOpen()).toBe(true);
-    await importFilesModal.cancel();
-  });
-});
+// (Removed) "Import from dashboard quick action": the `.v10-quick-action`
+// Import affordance was dropped from the dashboard in the rc.12 layout (only
+// orphaned CSS for the class remains — no component renders it). The header
+// Import button is the supported entry point and is covered by
+// "header Import button opens import modal for active CG" above.

@@ -9,7 +9,7 @@ const __dir = dirname(__filename);
 // rc11 entry-point change:
 //   * The legacy spec opened the modal via
 //     `leftPanel.expandProject(...) → leftPanel.clickLayer(..., 'import')`
-//     against the `Pharma Drug Interactions` demo fixture.
+//     against a demo fixture CG.
 //   * Both the inline "expand a project to see its layers" gesture and
 //     the demo fixture are gone. The modal is now reached from inside
 //     the project view, via the LayerSwitcher's

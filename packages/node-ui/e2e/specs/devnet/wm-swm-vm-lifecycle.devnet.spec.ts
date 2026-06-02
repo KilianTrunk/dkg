@@ -1,6 +1,7 @@
 /**
  * WM → SWM → VM pipeline against live devnet, with UI verification.
- * Run: `./scripts/devnet.sh start 6` then `pnpm test:e2e:devnet`
+ * Run: `pnpm test:e2e` — the Playwright webServer boots (or reuses) the devnet
+ * itself, so no manual `scripts/devnet.sh start` is needed.
  */
 import { test, expect } from '../../fixtures/base.js';
 import {
@@ -87,7 +88,7 @@ test.describe('WM → SWM → VM UI verification', () => {
 });
 
 test.describe('KA update (devnet API)', () => {
-  test('update endpoint accepts quads when kaId exists from pipeline', async () => {
+  test('update endpoint requires a precomputed attestation for on-chain update', async () => {
     test.skip(!run.cgId || !run.kaId, 'Pipeline did not produce a kaId');
     const stamp = Date.now();
     const res = await devnetApiFetch('/api/update', {
@@ -98,6 +99,14 @@ test.describe('KA update (devnet API)', () => {
         quads: buildTestQuads(run.cgId!, stamp, `Updated ${stamp}`),
       }),
     });
-    expect(res.ok).toBe(true);
+    // On-chain KA update is gated behind a signed UpdateAuthorAttestation
+    // (UpdateAuthorAttestation(kaId, newMerkleRoot, authorAddress), signed
+    // off-band). A bare quads update with no `precomputedUpdateAttestation`
+    // MUST be rejected. The previous expectation (`res.ok === true`) predated
+    // that gate and was a false positive — it would have passed even if the
+    // attestation enforcement regressed. Assert the real contract instead.
+    expect(res.ok).toBe(false);
+    const body = await res.text();
+    expect(body).toMatch(/precomputedUpdateAttestation|attestation/i);
   });
 });

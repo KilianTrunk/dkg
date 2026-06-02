@@ -1273,7 +1273,7 @@ describe('DashboardDB — replication telemetry (Phase F)', () => {
   it('summary computes counts, success rate, and fetch→promote latency', () => {
     // mfacts: fetch at T, promote 5s later (latency 5000); plus a 0-latency
     // promote (SWM already present, no preceding fetch); plus one defer.
-    db.insertReplicationEvent({ ts: now - 10_000, context_graph_id: 'mfacts', action: 'fetch', ual: 'urn:ka:1' });
+    db.insertReplicationEvent({ ts: now - 10_000, context_graph_id: 'mfacts', action: 'fetch', ual: 'urn:ka:1', ordinal: 1 });
     db.insertReplicationEvent({ ts: now - 5_000, context_graph_id: 'mfacts', action: 'promote', ual: 'urn:ka:1', ordinal: 1 });
     db.insertReplicationEvent({ ts: now - 4_000, context_graph_id: 'mfacts', action: 'promote', ual: 'urn:ka:2', ordinal: 2 });
     db.insertReplicationEvent({ ts: now - 3_000, context_graph_id: 'mfacts', action: 'defer', ual: 'urn:ka:3', ordinal: 3, detail: 'no-swm' });
@@ -1295,6 +1295,36 @@ describe('DashboardDB — replication telemetry (Phase F)', () => {
     expect(s.totalEvents).toBe(0);
     expect(s.successRate).toBeNull();
     expect(s.latencyP50Ms).toBeNull();
+  });
+
+  it('defaults to a 24-HOUR window (not 24 days)', () => {
+    // Regression: the default was `24 * 86_400_000` (24 days). An event from
+    // 2 days ago must be EXCLUDED by the default window; a recent one included.
+    db.insertReplicationEvent({ ts: now - 2 * 86_400_000, context_graph_id: 'stale', action: 'promote' });
+    db.insertReplicationEvent({ ts: now - 1_000, context_graph_id: 'fresh', action: 'promote' });
+    const s = db.getReplicationSummary(); // default period
+    expect(s.periodMs).toBe(86_400_000);
+    expect(s.totalEvents).toBe(1);
+    expect(s.promotes).toBe(1);
+    // per-cg default window must match
+    expect(db.getReplicationPerCg().length).toBe(1);
+  });
+
+  it('pairs fetch→promote latency per VERSION (ordinal), not per UAL', () => {
+    // Regression: keying latency on UAL let a later fast-path promote (no
+    // fetch) mispair with an older fetch for a DIFFERENT version of the same
+    // KA, inflating latency. Two promotes share one UAL but distinct ordinals.
+    db.insertReplicationEvent({ ts: now - 10_000, context_graph_id: 'cg', action: 'fetch', ual: 'urn:ka:9', ordinal: 1 });
+    db.insertReplicationEvent({ ts: now - 5_000, context_graph_id: 'cg', action: 'promote', ual: 'urn:ka:9', ordinal: 1 });
+    // New version of the same KA, promoted fast-path (SWM already present): no
+    // fetch for ordinal 2 → must contribute 0ms, NOT pair with ordinal 1's fetch.
+    db.insertReplicationEvent({ ts: now - 1_000, context_graph_id: 'cg', action: 'promote', ual: 'urn:ka:9', ordinal: 2 });
+
+    const s = db.getReplicationSummary(60 * 60 * 1000);
+    // latencies: [0 (ordinal 2), 5000 (ordinal 1)]. With the old UAL-keying the
+    // fast-path promote would mispair to 9000ms, pushing P95 to 9000.
+    expect(s.latencyP50Ms).toBe(5000);
+    expect(s.latencyP95Ms).toBe(5000);
   });
 
   it('per-cg rollup groups and reports last watermark/head', () => {

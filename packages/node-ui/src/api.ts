@@ -180,17 +180,17 @@ export async function handleNodeUIRequest(
   // --- Replication (chain-driven VM reconciliation) — Phase F ---
 
   if (req.method === 'GET' && path === '/api/replication/summary') {
-    const periodMs = parseInt(url.searchParams.get('periodMs') ?? String(24 * 86_400_000), 10);
+    const periodMs = parseInt(url.searchParams.get('periodMs') ?? String(86_400_000), 10);
     return json(res, 200, db.getReplicationSummary(periodMs));
   }
 
   if (req.method === 'GET' && path === '/api/replication/per-cg') {
-    const periodMs = parseInt(url.searchParams.get('periodMs') ?? String(24 * 86_400_000), 10);
+    const periodMs = parseInt(url.searchParams.get('periodMs') ?? String(86_400_000), 10);
     return json(res, 200, { rows: db.getReplicationPerCg(periodMs) });
   }
 
   if (req.method === 'GET' && path === '/api/replication/timeline') {
-    const periodMs = parseInt(url.searchParams.get('periodMs') ?? String(24 * 86_400_000), 10);
+    const periodMs = parseInt(url.searchParams.get('periodMs') ?? String(86_400_000), 10);
     const bucketMs = parseInt(url.searchParams.get('bucketMs') ?? String(3_600_000), 10);
     const contextGraphId = url.searchParams.get('cg') ?? undefined;
     return json(res, 200, { buckets: db.getReplicationTimeline({ periodMs, bucketMs, contextGraphId }) });

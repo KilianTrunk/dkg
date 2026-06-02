@@ -233,16 +233,19 @@ while :; do
   hit=$(api "$N2" GET /api/notifications | python3 -c "
 import sys,json
 d=json.load(sys.stdin)
-cg = '$CG_ID'
+cg = sys.argv[1]
 for x in d.get('notifications',[]):
-    if x.get('type')=='join_rejected':
-        meta = x.get('meta')
-        try: meta = json.loads(meta) if isinstance(meta,str) else meta
-        except: meta = {}
-        if (meta or {}).get('contextGraphId')==cg:
-            print(json.dumps({'ts':x.get('ts'),'title':x.get('title'),'message':x.get('message'),'meta':meta}))
-            break
-")
+    if x.get('type')!='join_rejected':
+        continue
+    meta = x.get('meta') or {}
+    if isinstance(meta, str):
+        try: meta = json.loads(meta)
+        except Exception: meta = {}
+    row_cg = x.get('contextGraphId') or meta.get('contextGraphId') or ''
+    if row_cg == cg:
+        print(json.dumps({'ts':x.get('ts'),'title':x.get('title'),'message':x.get('message'),'meta':meta}))
+        break
+" "$CG_ID")
   if [ -n "$hit" ]; then
     ok "N2 received join_rejected notification"
     echo "$hit" | python3 -m json.tool

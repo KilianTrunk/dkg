@@ -108,11 +108,19 @@ function devnetPortEnv(): Record<string, string> {
   };
 }
 
-function readNodePid(num: number): number | null {
-  const pidf = join(DEVNET_DIR, `node${num}`, 'devnet.pid');
-  if (!existsSync(pidf)) return null;
-  const pid = parseInt(readFileSync(pidf, 'utf8').trim(), 10);
-  return Number.isFinite(pid) ? pid : null;
+/** Every pid that belongs to a node. `devnet.pid` is just the `cli.js start`
+ *  launcher, which double-forks the real worker (`daemon.pid`, reparented to
+ *  init) and then EXITS — so killing only `devnet.pid` leaves the API serving.
+ *  Return both (daemon first) so the caller can take the node truly offline. */
+function readNodePids(num: number): number[] {
+  const pids: number[] = [];
+  for (const f of ['daemon.pid', 'devnet.pid']) {
+    const pidf = join(DEVNET_DIR, `node${num}`, f);
+    if (!existsSync(pidf)) continue;
+    const pid = parseInt(readFileSync(pidf, 'utf8').trim(), 10);
+    if (Number.isFinite(pid) && !pids.includes(pid)) pids.push(pid);
+  }
+  return pids;
 }
 
 // ───────────────────────────── HTTP helpers ──────────────────────────────
@@ -158,6 +166,21 @@ function request(
 const getJson = (node: DevnetNode, path: string) => request('GET', api(node) + path, node.authToken);
 const postJson = (node: DevnetNode, path: string, body: unknown) =>
   request('POST', api(node) + path, node.authToken, body);
+
+/** Interpret an `/api/query` ASK response across the shapes the node may emit.
+ *  The current store returns `{ result: { bindings: [{ result: "true" }] } }`;
+ *  older/simple paths use `{ boolean }` or `{ value }`. Accept all. */
+function askIsTrue(body: any): boolean {
+  if (typeof body?.boolean === 'boolean') return body.boolean;
+  if (typeof body?.value === 'boolean') return body.value;
+  const bindings = body?.result?.bindings;
+  if (Array.isArray(bindings) && bindings.length > 0) {
+    const first = bindings[0] ?? {};
+    const v = first.result ?? first.boolean ?? Object.values(first)[0];
+    return v === true || v === 'true';
+  }
+  return false;
+}
 
 async function nodeReachable(node: DevnetNode): Promise<boolean> {
   try {
@@ -393,11 +416,14 @@ describe('Phase D — Cores host public CGs and fill their own gaps', () => {
       },
     );
 
-    // 1. Take the victim core OFFLINE (kill its daemon process).
-    const pid = readNodePid(victim);
-    expect(pid, `node${victim} pid not found`).toBeTruthy();
-    try { process.kill(pid!, 'SIGKILL'); } catch { /* may already be gone */ }
-    await waitFor(`node${victim} offline`, 30_000, 1_000, async () =>
+    // 1. Take the victim core OFFLINE. Kill the real worker (daemon.pid),
+    //    not just the already-exited `cli.js start` launcher (devnet.pid).
+    const pids = readNodePids(victim);
+    expect(pids.length, `node${victim} pids not found`).toBeGreaterThan(0);
+    for (const pid of pids) {
+      try { process.kill(pid, 'SIGKILL'); } catch { /* may already be gone */ }
+    }
+    await waitFor(`node${victim} offline`, 45_000, 1_000, async () =>
       (await nodeReachable(victimNode)) ? null : true,
     );
 
@@ -415,26 +441,30 @@ describe('Phase D — Cores host public CGs and fill their own gaps', () => {
       (await nodeReachable(victimNode)) ? true : null,
     );
 
-    // 4. The victim should fill its gap from chain: either a `core-fill`
-    //    replication event for the CG, or the missed triple landing in its
-    //    verified-memory. Poll both signals.
+    // 4. The victim must fill its gap FROM CHAIN after restart. The headline
+    //    proof is the missed triple landing in its verified-memory (the KA it
+    //    never received over gossip while offline). We also accept the distinct
+    //    `core-fill` telemetry as a bonus signal, but on devnet the cores are
+    //    also member-subscribers, so the reconciler emits the regular
+    //    `fetch`/`promote` surface rather than the host-only `core-fill` label —
+    //    the VM witness is the authoritative end-to-end signal.
     const filled = await waitFor(
-      `node${victim} fills the gap (core-fill event or VM witness)`,
+      `node${victim} fills the gap (VM witness or core-fill event)`,
       240_000,
       5_000,
       async () => {
-        const events = await getJson(victimNode, `/api/replication/events?cg=${encodeURIComponent(CONTEXT_GRAPH)}&limit=200`);
-        if (events.status === 200) {
-          const coreFill = (events.body.events as any[]).find((e) => e.action === 'core-fill');
-          if (coreFill) return { via: 'core-fill', detail: coreFill };
-        }
         const vm = await postJson(victimNode, '/api/query', {
           sparql: `ASK { <${pub.subject}> <https://schema.org/name> ?o }`,
           contextGraphId: CONTEXT_GRAPH,
           view: 'verified-memory',
         });
-        const ask = vm.body?.boolean ?? vm.body?.value ?? false;
-        if (vm.status === 200 && ask === true) return { via: 'vm-witness' };
+        if (vm.status === 200 && askIsTrue(vm.body)) return { via: 'vm-witness' };
+
+        const events = await getJson(victimNode, `/api/replication/events?cg=${encodeURIComponent(CONTEXT_GRAPH)}&limit=200`);
+        if (events.status === 200) {
+          const coreFill = (events.body.events as any[]).find((e) => e.action === 'core-fill');
+          if (coreFill) return { via: 'core-fill', detail: coreFill };
+        }
         return null;
       },
     );

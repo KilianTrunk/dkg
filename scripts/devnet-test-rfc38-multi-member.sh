@@ -49,6 +49,9 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=devnet-publish-helpers.sh
+source "$SCRIPT_DIR/devnet-publish-helpers.sh"
 DEVNET_DIR="${DEVNET_DIR:-$REPO_ROOT/.devnet}"
 HARDHAT_PORT="${HARDHAT_PORT:-8545}"
 API_PORT_BASE=9201
@@ -159,10 +162,8 @@ log "✓ 6 triples written to SWM"
 
 sleep 2
 
-PUB_RESP=$(api_call "$CURATOR_NODE" POST /api/shared-memory/publish "$(cat <<EOF
-{ "contextGraphId": "$CG_ID", "selection": "all", "clearAfter": false }
-EOF
-)")
+PUB_RESP=$(devnet_publish_swm_all_roots "$CURATOR_NODE" "$CG_ID" false)
+devnet_publish_load_state
 log "publish response: $PUB_RESP"
 
 STATUS=$(parse_json "$PUB_RESP" '.status')
@@ -171,33 +172,14 @@ KC=$(parse_json    "$PUB_RESP" '.kaId')
 [ "$STATUS" = "confirmed" ] || fail "publish status=$STATUS"
 log "✓ publish: kaId=$KC tx=$TX"
 
-KC_META=$(api_call "$CURATOR_NODE" GET "/api/kc/$KC")
-MERKLE_ROOT=$(parse_json "$KC_META" '.merkleRoot')
-[[ "$MERKLE_ROOT" =~ ^0x[0-9a-fA-F]{64}$ ]] || fail "no merkleRoot from /api/kc/$KC: $KC_META"
-log "✓ merkleRoot: $MERKLE_ROOT"
-
 # ===========================================================================
 act "3. All non-curator members independently verify-batch"
 # ===========================================================================
-VERIFY_BODY=$(QUADS_PAYLOAD="$QUADS_PAYLOAD" MERKLE_ROOT="$MERKLE_ROOT" KC="$KC" node -e "
-  const p = JSON.parse(process.env.QUADS_PAYLOAD);
-  console.log(JSON.stringify({
-    contextGraphId: p.contextGraphId,
-    expectedMerkleRoot: process.env.MERKLE_ROOT,
-    batchId: process.env.KC,
-    quads: p.quads
-  }));
-")
-
 verify_on_node() {
   local node="$1" label="$2"
-  local resp; resp=$(api_call "$node" POST /api/shared-memory/verify-batch "$VERIFY_BODY")
-  log "$label verify response: $resp"
-  local ok; ok=$(parse_json "$resp" '.ok')
-  local actual; actual=$(parse_json "$resp" '.actualRoot')
-  [ "$ok" = "true" ] || fail "$label verify-batch ok=$ok"
-  [ "$actual" = "$MERKLE_ROOT" ] || fail "$label actualRoot ($actual) != expected ($MERKLE_ROOT)"
-  log "✓ $label verify-batch: ok=true actualRoot==expected"
+  devnet_verify_each_published_root "$node" "$CG_ID" "$QUADS_PAYLOAD" \
+    || fail "$label verify-batch failed for one or more roots"
+  log "✓ $label verify-batch: ok=true for all published roots"
 }
 verify_on_node "$CURATOR_NODE"     "curator"
 verify_on_node "$EDGE_MEMBER_NODE" "edge-member"
@@ -210,6 +192,8 @@ LEAF_SUBJECT="urn:mm:${STAMP}/alpha"
 LEAF_PREDICATE="http://schema.org/name"
 LEAF_OBJECT="\"alpha\""
 
+KC=$(devnet_publish_ka_id_for_root "$LEAF_SUBJECT")
+MERKLE_ROOT=$(devnet_kc_merkle_root "$CURATOR_NODE" "$KC")
 CANDIDATE_LEAF=$(cd "$REPO_ROOT/packages/core" && LEAF_SUBJECT="$LEAF_SUBJECT" LEAF_PREDICATE="$LEAF_PREDICATE" LEAF_OBJECT="$LEAF_OBJECT" node --input-type=module -e '
   const { hashTripleV10 } = await import("./dist/index.js");
   const leafBytes = hashTripleV10(process.env.LEAF_SUBJECT, process.env.LEAF_PREDICATE, process.env.LEAF_OBJECT);

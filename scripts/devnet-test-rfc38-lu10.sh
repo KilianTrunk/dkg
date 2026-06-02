@@ -38,6 +38,9 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=devnet-publish-helpers.sh
+source "$SCRIPT_DIR/devnet-publish-helpers.sh"
 DEVNET_DIR="${DEVNET_DIR:-$REPO_ROOT/.devnet}"
 HARDHAT_PORT="${HARDHAT_PORT:-8545}"
 API_PORT_BASE=9201
@@ -130,10 +133,8 @@ log "✓ 10 triples written to SWM"
 
 sleep 2
 
-PUB_RESP=$(api_call "$CURATOR_NODE" POST /api/shared-memory/publish "$(cat <<EOF
-{ "contextGraphId": "$CG_ID", "selection": "all", "clearAfter": false }
-EOF
-)")
+PUB_RESP=$(devnet_publish_swm_all_roots "$CURATOR_NODE" "$CG_ID" false)
+devnet_publish_load_state
 log "publish response: $PUB_RESP"
 
 STATUS=$(parse_json "$PUB_RESP" '.status')
@@ -143,32 +144,14 @@ KC=$(parse_json    "$PUB_RESP" '.kaId')
 [[ "$TX" =~ ^0x[0-9a-fA-F]{64}$ ]] || fail "invalid txHash '$TX'"
 log "✓ public CG publish: kaId=$KC tx=$TX"
 
-KC_META=$(api_call "$CURATOR_NODE" GET "/api/kc/$KC")
-MERKLE_ROOT=$(parse_json "$KC_META" '.merkleRoot')
-[[ "$MERKLE_ROOT" =~ ^0x[0-9a-fA-F]{64}$ ]] || fail "invalid merkleRoot from /api/kc/$KC: $KC_META"
-log "✓ chain merkleRoot: $MERKLE_ROOT"
+PUBLISH_COUNT=$(devnet_publish_root_count)
+[ "$PUBLISH_COUNT" = "5" ] || fail "expected 5 root publishes, got $PUBLISH_COUNT"
+devnet_kcs_readback_all_published 1 || fail "KCS read-back failed"
 
-# Cross-check via Hardhat KCS
-(
-cd "$REPO_ROOT/packages/evm-module" && \
-RPC_URL="http://127.0.0.1:${HARDHAT_PORT}" CONTRACTS_JSON="$CONTRACTS_JSON" ABI_DIR="$EVM_ABI_DIR" BATCH_ID="$KC" \
-node -e '
-const { ethers } = require("ethers");
-const fs = require("fs"); const path = require("path");
-(async () => {
-  const provider = new ethers.JsonRpcProvider(process.env.RPC_URL);
-  const contracts = JSON.parse(fs.readFileSync(process.env.CONTRACTS_JSON, "utf8")).contracts;
-  const kcsAddr = contracts.DKGKnowledgeAssets?.evmAddress ?? contracts.KnowledgeCollectionStorage.evmAddress;
-  const kcsAbiFile = fs.existsSync(path.join(process.env.ABI_DIR, "DKGKnowledgeAssets.json")) ? "DKGKnowledgeAssets.json" : "DKGKnowledgeAssets.json";
-  const kas = new ethers.Contract(kcsAddr,
-    JSON.parse(fs.readFileSync(path.join(process.env.ABI_DIR, kcsAbiFile), "utf8")), provider);
-  const [merkleRoots, , minted, byteSize] = await kas.getKnowledgeAssetMetadata(BigInt(process.env.BATCH_ID));
-  if (!merkleRoots || merkleRoots.length === 0) throw new Error("no merkleRoots");
-  if (minted !== 5n) throw new Error("expected 5 KAs (one per root entity), got " + minted);
-  console.log("KCS read-back OK: merkleRoots=" + merkleRoots.length + " minted=" + minted + " byteSize=" + byteSize);
-})().catch(e => { console.error(e?.message || e); process.exit(1); });
-'
-) || fail "KCS read-back failed"
+KC=$(devnet_publish_ka_id_at 0)
+MERKLE_ROOT=$(devnet_kc_merkle_root "$CURATOR_NODE" "$KC")
+[[ "$MERKLE_ROOT" =~ ^0x[0-9a-fA-F]{64}$ ]] || fail "invalid merkleRoot from /api/kc/$KC"
+log "✓ chain merkleRoot (first root): $MERKLE_ROOT"
 
 # Public publishes MUST NOT carry the curated chain-key AEAD wrap
 EDGE_LOG=$(node_log "$CURATOR_NODE")
@@ -222,27 +205,22 @@ act "3. VERIFY-BATCH SWEEP (explicit quads, public CG)"
 # ===========================================================================
 
 log "Outsider calls verify-batch with the published quads + chain merkleRoot..."
-VERIFY_OK_BODY=$(QUADS_PAYLOAD="$QUADS_PAYLOAD" MERKLE_ROOT="$MERKLE_ROOT" KC="$KC" node -e "
-  const payload = JSON.parse(process.env.QUADS_PAYLOAD);
-  console.log(JSON.stringify({
-    contextGraphId: payload.contextGraphId,
-    expectedMerkleRoot: process.env.MERKLE_ROOT,
-    batchId: process.env.KC,
-    quads: payload.quads
-  }));
-")
-VERIFY_OK=$(api_call "$OUTSIDER_NODE" POST /api/shared-memory/verify-batch "$VERIFY_OK_BODY")
-log "verify (good) response: $VERIFY_OK"
-VOK=$(parse_json "$VERIFY_OK" '.ok')
-VOK_ROOT=$(parse_json "$VERIFY_OK" '.actualRoot')
-[ "$VOK" = "true" ] || fail "outsider-side verify-batch returned ok=$VOK (expected true)"
-[ "$VOK_ROOT" = "$MERKLE_ROOT" ] || fail "outsider-side actualRoot != expectedRoot"
-log "✓ outsider verifies public batch: ok=true actualRoot==expected"
+devnet_verify_each_published_root "$OUTSIDER_NODE" "$CG_ID" "$QUADS_PAYLOAD" \
+  || fail "outsider-side verify-batch failed for one or more roots"
+log "✓ outsider verifies public batch: ok=true for all published roots"
+
+TAMPER_ROOT=$(printf '%s' "$QUADS_PAYLOAD" | node -e 'let d="";process.stdin.on("data",c=>d+=c);process.stdin.on("end",()=>console.log(JSON.parse(d).quads[0].subject))')
+KC=$(devnet_publish_ka_id_for_root "$TAMPER_ROOT")
+MERKLE_ROOT=$(devnet_kc_merkle_root "$CURATOR_NODE" "$KC")
 
 log "Outsider calls verify-batch with tampered quads..."
-VERIFY_BAD_BODY=$(QUADS_PAYLOAD="$QUADS_PAYLOAD" MERKLE_ROOT="$MERKLE_ROOT" KC="$KC" STAMP="$STAMP" node -e "
+VERIFY_BAD_BODY=$(QUADS_PAYLOAD="$QUADS_PAYLOAD" MERKLE_ROOT="$MERKLE_ROOT" KC="$KC" TAMPER_ROOT="$TAMPER_ROOT" STAMP="$STAMP" node -e "
+  const genidPrefix = '/.well-known/genid/';
+  const quadBelongsToRoot = (q, root) =>
+    q.subject === root || q.subject.startsWith(root + genidPrefix);
   const payload = JSON.parse(process.env.QUADS_PAYLOAD);
-  const tampered = [...payload.quads];
+  const root = process.env.TAMPER_ROOT;
+  const tampered = payload.quads.filter((q) => quadBelongsToRoot(q, root));
   tampered.push({ subject: 'urn:lu10:' + process.env.STAMP + '/forged', predicate: 'http://schema.org/title', object: '\"Mallory\"', graph: '' });
   console.log(JSON.stringify({
     contextGraphId: payload.contextGraphId,
@@ -266,6 +244,9 @@ act "4. ATTESTATION SWEEP (curator mints, outsider verifies)"
 LEAF_SUBJECT="urn:lu10:${STAMP}/doc-a"
 LEAF_PREDICATE="http://schema.org/title"
 LEAF_OBJECT='"Whitepaper"'
+
+KC=$(devnet_publish_ka_id_for_root "$LEAF_SUBJECT")
+MERKLE_ROOT=$(devnet_kc_merkle_root "$CURATOR_NODE" "$KC")
 
 CANDIDATE_LEAF=$(cd "$REPO_ROOT/packages/core" && LEAF_SUBJECT="$LEAF_SUBJECT" LEAF_PREDICATE="$LEAF_PREDICATE" LEAF_OBJECT="$LEAF_OBJECT" node --input-type=module -e '
   const { hashTripleV10 } = await import("./dist/index.js");

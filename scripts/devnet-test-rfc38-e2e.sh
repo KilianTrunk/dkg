@@ -62,6 +62,9 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=devnet-publish-helpers.sh
+source "$SCRIPT_DIR/devnet-publish-helpers.sh"
 DEVNET_DIR="${DEVNET_DIR:-$REPO_ROOT/.devnet}"
 HARDHAT_PORT="${HARDHAT_PORT:-8545}"
 API_PORT_BASE=9201
@@ -203,10 +206,8 @@ log "✓ 12 triples written to curator's SWM (op=$(parse_json "$WRITE_RESP" '.sh
 sleep 2
 
 log "Publishing curated CG to VM..."
-PUBLISH_RESP=$(api_call "$CURATOR_NODE" POST /api/shared-memory/publish "$(cat <<EOF
-{ "contextGraphId": "$CG_ID", "selection": "all", "clearAfter": false }
-EOF
-)")
+PUBLISH_RESP=$(devnet_publish_swm_all_roots "$CURATOR_NODE" "$CG_ID" false)
+devnet_publish_load_state
 log "publish response: $PUBLISH_RESP"
 
 PUBLISH_STATUS=$(parse_json "$PUBLISH_RESP" '.status')
@@ -217,42 +218,19 @@ PUBLISH_BLOCK=$(parse_json "$PUBLISH_RESP" '.blockNumber')
 [ "$PUBLISH_STATUS" = "confirmed" ] || fail "publish: expected status=confirmed, got '$PUBLISH_STATUS'"
 [[ "$PUBLISH_TX" =~ ^0x[0-9a-fA-F]{64}$ ]] || fail "publish: txHash '$PUBLISH_TX' not valid 32-byte hex"
 [ -n "$PUBLISH_KC" ] && [ "$PUBLISH_KC" != "0" ] || fail "publish: invalid kaId '$PUBLISH_KC'"
-log "✓ publish landed: kaId=$PUBLISH_KC tx=$PUBLISH_TX block=$PUBLISH_BLOCK"
+EXPECTED_ROOTS=6
+PUBLISH_COUNT=$(devnet_publish_root_count)
+[ "$PUBLISH_COUNT" = "$EXPECTED_ROOTS" ] || fail "expected $EXPECTED_ROOTS root publishes, got $PUBLISH_COUNT"
+log "✓ publish landed: ${PUBLISH_COUNT} root batch(es), last kaId=$PUBLISH_KC tx=$PUBLISH_TX block=$PUBLISH_BLOCK"
 
-# Read KC metadata via daemon
+PUBLISH_KC=$(devnet_publish_ka_id_at 0)
 KC_META_RESP=$(api_call "$CURATOR_NODE" GET "/api/kc/$PUBLISH_KC")
 MERKLE_ROOT=$(parse_json "$KC_META_RESP" '.merkleRoot')
 [[ "$MERKLE_ROOT" =~ ^0x[0-9a-fA-F]{64}$ ]] || fail "GET /api/kc/$PUBLISH_KC did not return a hex merkleRoot — response: $KC_META_RESP"
-log "✓ KC merkleRoot from chain: $MERKLE_ROOT"
+log "✓ first KC merkleRoot from chain: $MERKLE_ROOT"
 
-# Cross-check via Hardhat KCS read-back
-log "Cross-check: reading KC $PUBLISH_KC back from KnowledgeCollectionStorage..."
-(
-cd "$REPO_ROOT/packages/evm-module" && \
-RPC_URL="http://127.0.0.1:${HARDHAT_PORT}" \
-CONTRACTS_JSON="$CONTRACTS_JSON" \
-ABI_DIR="$EVM_ABI_DIR" \
-BATCH_ID="$PUBLISH_KC" \
-node -e '
-const { ethers } = require("ethers");
-const fs = require("fs");
-const path = require("path");
-(async () => {
-  const provider = new ethers.JsonRpcProvider(process.env.RPC_URL);
-  const contracts = JSON.parse(fs.readFileSync(process.env.CONTRACTS_JSON, "utf8")).contracts;
-  const kcsAddr = contracts.DKGKnowledgeAssets?.evmAddress ?? contracts.KnowledgeCollectionStorage?.evmAddress;
-  if (!kcsAddr) throw new Error("DKGKnowledgeAssets / KnowledgeCollectionStorage not deployed");
-  const abiFile = fs.existsSync(path.join(process.env.ABI_DIR, "DKGKnowledgeAssets.json")) ? "DKGKnowledgeAssets.json" : "DKGKnowledgeAssets.json";
-  const abi = JSON.parse(fs.readFileSync(path.join(process.env.ABI_DIR, abiFile), "utf8"));
-  const kas = new ethers.Contract(kcsAddr, abi, provider);
-  const [merkleRoots, burned, minted, byteSize, , , tokenAmount] =
-    await kas.getKnowledgeAssetMetadata(BigInt(process.env.BATCH_ID));
-  if (!merkleRoots || merkleRoots.length === 0) throw new Error("merkleRoots empty");
-  if (byteSize === 0n) throw new Error("byteSize=0");
-  console.log("KC read-back OK: merkleRoots=" + merkleRoots.length + " byteSize=" + byteSize + " minted=" + minted + " tokenAmount=" + tokenAmount);
-})().catch(e => { console.error("[kas] " + (e?.shortMessage || e?.message || e)); process.exit(1); });
-'
-) || fail "KC read-back failed"
+log "Cross-check: reading all $PUBLISH_COUNT published KCs back from KnowledgeCollectionStorage..."
+devnet_kcs_readback_all_published 1 || fail "KC read-back failed"
 
 # ===========================================================================
 # ACT 2 — Member late-joins, catches up via SWMCatchupRequest (LU-7)
@@ -353,23 +331,14 @@ act 3 "Member verifies the on-chain batch post-decrypt (LU-8)"
 # recompute would fail. Explicit-quads input is the correct
 # semantic for "member verifies decrypted batch."
 log "Member calls verify-batch with explicit decrypted quads (12 user triples)..."
-VERIFY_BODY=$(QUADS_PAYLOAD="$QUADS_PAYLOAD" MERKLE_ROOT="$MERKLE_ROOT" PUBLISH_KC="$PUBLISH_KC" node -e "
-  const payload = JSON.parse(process.env.QUADS_PAYLOAD);
-  console.log(JSON.stringify({
-    contextGraphId: payload.contextGraphId,
-    expectedMerkleRoot: process.env.MERKLE_ROOT,
-    batchId: process.env.PUBLISH_KC,
-    quads: payload.quads
-  }));
-")
-VERIFY_CURATOR=$(api_call "$MEMBER_NODE" POST /api/shared-memory/verify-batch "$VERIFY_BODY")
-log "member verify response: $VERIFY_CURATOR"
-VC_OK=$(parse_json "$VERIFY_CURATOR" '.ok')
-VC_LEAF=$(parse_json "$VERIFY_CURATOR" '.leafCount')
-VC_ACTUAL=$(parse_json "$VERIFY_CURATOR" '.actualRoot')
-[ "$VC_OK" = "true" ] || fail "member verify-batch returned ok=$VC_OK (expected true) — response: $VERIFY_CURATOR"
-[ "$VC_ACTUAL" = "$MERKLE_ROOT" ] || fail "actualRoot != expectedRoot ($VC_ACTUAL vs $MERKLE_ROOT)"
-log "✓ member verify-batch passes: leafCount=$VC_LEAF actualRoot==expected"
+devnet_verify_each_published_root "$MEMBER_NODE" "$CG_ID" "$QUADS_PAYLOAD" \
+  || fail "member verify-batch failed for one or more published roots"
+log "✓ member verify-batch passes for all published roots"
+
+# LU-9 below mints/verifies an attestation for alice's leaf, so resolve the
+# batch that published alice's root rather than assuming it is publish index 0.
+PUBLISH_KC=$(devnet_publish_ka_id_for_root "urn:e2e:${STAMP}/alice")
+MERKLE_ROOT=$(devnet_kc_merkle_root "$CURATOR_NODE" "$PUBLISH_KC")
 
 # Forge a tampered quads array — recompute against bad data must fail
 log "Building tampered quads array to provoke a root-mismatch..."

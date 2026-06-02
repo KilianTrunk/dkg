@@ -683,7 +683,7 @@ describe('TripleStoreAsyncLiftPublisher', () => {
     expect(processed?.failure?.code).toBe('tx_submit_timeout');
   });
 
-  it('does not invent chain metadata for tentative publish results without on-chain details', async () => {
+  it('finalizes tentative publish results without on-chain details as local completions', async () => {
     const publisher = createPublisher({
       config: {
         publishExecutor: async () => ({
@@ -715,14 +715,14 @@ describe('TripleStoreAsyncLiftPublisher', () => {
 
     const processed = await publisher.processNext('wallet-1');
 
-    expect(processed?.status).toBe('failed');
+    expect(processed?.status).toBe('finalized');
     expect(processed?.broadcast).toBeUndefined();
     expect(processed?.inclusion).toBeUndefined();
-    expect(processed?.failure?.failedFromState).toBe('broadcast');
-    expect(processed?.failure?.code).toBe('rpc_unavailable');
-    expect(processed?.failure?.retryable).toBe(true);
-    expect(processed?.failure?.resolution).toBe('reset_to_accepted');
-    expect(processed?.failure?.message).toContain('without onChainResult');
+    expect(processed?.finalization).toEqual({
+      mode: 'local',
+      ual: 'did:dkg:mock:31337/0xabc/tentative',
+    });
+    expect(processed?.failure).toBeUndefined();
   });
 
   it('persists unknown included-phase failures as terminal failed jobs', async () => {

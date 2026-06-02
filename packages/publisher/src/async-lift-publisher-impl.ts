@@ -338,6 +338,21 @@ export class TripleStoreAsyncLiftPublisher implements AsyncLiftPublisher {
     });
 
     let next: LiftJob = current;
+    if (mapped.status === 'finalized' && mapped.finalization.mode === 'local') {
+      next = this.mergeJob(next, 'finalized', {
+        finalization: mapped.finalization,
+      });
+      this.assertJobMatchesStatus(next);
+      await this.promoteFinalizedPrivateStaging(next);
+      await this.writeJob(next);
+      await this.syncWalletLockForJob(next);
+      return next;
+    }
+
+    if (!mapped.broadcast || !mapped.inclusion) {
+      throw new Error(`Async lift publish result ${mapped.status} is missing chain metadata`);
+    }
+
     if (current.status === 'validated') {
       next = this.mergeJob(next, 'broadcast', { broadcast: mapped.broadcast });
       this.assertJobMatchesStatus(next);
@@ -1028,7 +1043,7 @@ export class TripleStoreAsyncLiftPublisher implements AsyncLiftPublisher {
         if (!job.claim || !job.validation || !job.finalization) {
           throw new Error('Finalized LiftJob requires claim, validation, and finalization metadata');
         }
-        if (job.finalization.mode !== 'noop' && (!job.broadcast || !job.inclusion)) {
+        if (job.finalization.mode !== 'noop' && job.finalization.mode !== 'local' && (!job.broadcast || !job.inclusion)) {
           throw new Error('Published finalized LiftJob requires broadcast and inclusion metadata');
         }
         return;

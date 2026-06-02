@@ -300,6 +300,24 @@ describe('DKGAgent.resolveWorkspaceRecipientsGated (gate-before)', () => {
     expect(resolverConsulted).toBe(false);
   });
 
+  it('does NOT honor explicit-public for a NUMERIC id (avoids the ambiguity-guard bypass) (#884 review)', async () => {
+    // A bare numeric id is ambiguous: getExplicitAccessPolicy would resolve
+    // did:dkg:context-graph:42 as a LOCAL graph, which may differ from on-chain
+    // CG 42. Honoring it would bypass isContextGraphPublicOnChain's collision
+    // guard and could force plaintext for the wrong graph — so the explicit
+    // shortcut is skipped for numeric ids and we fall through to the encrypted
+    // (store-resolver) path.
+    const agentLike = makeAgentLike({ onChainId: null, explicitPolicy: 'public' });
+    await (DKGAgent.prototype as any).resolveWorkspaceRecipientsGated.call(
+      agentLike,
+      { contextGraphId: '42' },
+    );
+    const resolverConsulted = agentLike.store.query.mock.calls.some(
+      ([q]: [unknown]) => typeof q === 'string' && q.includes('?revoked'),
+    );
+    expect(resolverConsulted).toBe(true);
+  });
+
   it('still encrypts when local accessPolicy="private" and the on-chain probe misses (#884 fail-closed)', async () => {
     // Mirror of the above: an explicit PRIVATE policy must NOT take the
     // plaintext shortcut — it delegates to the store resolver (encrypted path).

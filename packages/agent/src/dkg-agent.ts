@@ -6287,12 +6287,24 @@ export class DKGAgent {
     // it only ever reads 'public' when the curator declared the CG public; a
     // curated / invite-only / unknown CG still encrypts (fail-closed:
     // getExplicitAccessPolicy returns 'private' / null).
-    try {
-      if ((await this.getExplicitAccessPolicy(input.contextGraphId)) === 'public') {
-        return { requiresEncryption: false, recipients: [] };
+    //
+    // Restrict this shortcut to UNAMBIGUOUSLY-LOCAL (non-numeric) ids.
+    // getExplicitAccessPolicy resolves `did:dkg:context-graph:<id>` as a LOCAL
+    // name, so for a bare numeric id (share('42', ...)) it could read a
+    // DIFFERENT graph than on-chain CG 42 — the exact collision the
+    // dual-resolution guard in isContextGraphPublicOnChain deliberately fails
+    // closed on. Honoring an explicit local "public" for a numeric id would
+    // bypass that guard and could force plaintext for the wrong graph (#884
+    // review). A numeric id during a transient on-chain miss simply stays
+    // fail-closed (encrypted) — correctness over availability.
+    if (!/^\d+$/.test(input.contextGraphId.trim())) {
+      try {
+        if ((await this.getExplicitAccessPolicy(input.contextGraphId)) === 'public') {
+          return { requiresEncryption: false, recipients: [] };
+        }
+      } catch {
+        // Explicit-policy read flaked too — fall through to the encrypted path.
       }
-    } catch {
-      // Explicit-policy read flaked too — fall through to the encrypted path.
     }
     return resolveWorkspaceAgentRecipients(this.store, input);
   }

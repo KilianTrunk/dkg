@@ -73,6 +73,12 @@ export interface OxigraphServerHandle {
   readonly updateEndpoint: string;
   /** Stop the server and prevent further restarts. Idempotent. */
   stop(): Promise<void>;
+  /**
+   * Synchronous best-effort SIGTERM for `process.on('exit')` handlers
+   * (which cannot await). Prevents orphaning the server when boot hits a
+   * fatal `process.exit()` after the server started. Idempotent.
+   */
+  killSync(): void;
 }
 
 const DEFAULT_HOST = '127.0.0.1';
@@ -109,8 +115,12 @@ export async function startOxigraphServer(
   const restartMax = opts.restartBackoffMaxMs ?? DEFAULT_RESTART_MAX_MS;
 
   let stopping = false;
+  let ready = false;
   let child: ChildProcess | null = null;
   let restarts = 0;
+  // Tail of the child's stderr, surfaced in the startup error so a bind
+  // failure (`Address already in use`) is visible to the operator.
+  let lastStderr = '';
 
   const spawnChild = (): ChildProcess => {
     const c = io.spawn(
@@ -120,14 +130,24 @@ export async function startOxigraphServer(
     );
     c.stderr?.on('data', (b) => {
       const line = b.toString('utf-8').trim();
-      if (line) log(`[oxigraph] ${line}`);
+      if (line) {
+        lastStderr = `${lastStderr}${line}\n`.slice(-1_000);
+        log(`[oxigraph] ${line}`);
+      }
     });
     c.once('exit', (code, signal) => {
       if (stopping) return;
-      // Unexpected exit — restart with capped exponential backoff so a
-      // crash-looping binary doesn't peg the CPU. The store will surface
-      // transient errors to callers during the gap; the agent's own
-      // retries cover the window.
+      // Startup-phase exit: do NOT restart. The most common cause is a
+      // bind failure (the port is taken by another local SPARQL server),
+      // and restarting would loop forever against a port we can't own —
+      // worse, a foreign server answering on that port could be mistaken
+      // for ours. The ready loop observes `child.exitCode !== null` and
+      // fails fast with the captured stderr.
+      if (!ready) return;
+      // Steady-state crash (after we returned a healthy handle): restart
+      // with capped exponential backoff so a crash-looping binary doesn't
+      // peg the CPU. The store surfaces transient errors during the gap;
+      // the agent's own retries cover the window.
       restarts += 1;
       const delay = Math.min(restartMax, restartBase * 2 ** (restarts - 1));
       log(
@@ -141,6 +161,9 @@ export async function startOxigraphServer(
     });
     return c;
   };
+
+  const childAlive = (): boolean =>
+    child != null && child.exitCode === null && child.signalCode === null;
 
   const probeReady = async (): Promise<boolean> => {
     try {
@@ -156,6 +179,18 @@ export async function startOxigraphServer(
       return res.ok;
     } catch {
       return false;
+    }
+  };
+
+  // Synchronous best-effort kill for process-exit handlers (which can't
+  // await): signals the child so a fatal `process.exit()` elsewhere in
+  // boot doesn't orphan the server. Safe to call alongside `stop()`.
+  const killSync = (): void => {
+    stopping = true;
+    try {
+      if (childAlive()) child!.kill('SIGTERM');
+    } catch {
+      /* best-effort */
     }
   };
 
@@ -191,15 +226,26 @@ export async function startOxigraphServer(
 
   const deadline = Date.now() + readyTimeoutMs;
   let attempt = 0;
+  let childDied = false;
   while (Date.now() < deadline) {
     attempt += 1;
-    if (await probeReady()) {
-      log(`Oxigraph server ready on ${bind} after ${attempt} probe(s).`);
-      return { host, port, queryEndpoint, updateEndpoint, stop };
+    // Our spawned child exited during startup — almost always a bind
+    // failure. Stop probing and fail fast; do NOT adopt whatever may be
+    // answering on the port (it could be a foreign SPARQL server).
+    if (!childAlive()) {
+      childDied = true;
+      break;
     }
-    // If the child already died and we're not mid-restart, bail early
-    // rather than waiting out the whole timeout on a dead process.
-    if (child && child.exitCode !== null && restarts === 0) {
+    if (await probeReady()) {
+      // Only trust a 200 if the child WE spawned is the one still alive
+      // and bound — guards the race where a foreign server answers while
+      // our child has just died on EADDRINUSE.
+      if (childAlive()) {
+        ready = true;
+        log(`Oxigraph server ready on ${bind} after ${attempt} probe(s).`);
+        return { host, port, queryEndpoint, updateEndpoint, stop, killSync };
+      }
+      childDied = true;
       break;
     }
     await sleep(readyIntervalMs);
@@ -207,8 +253,15 @@ export async function startOxigraphServer(
 
   // Never became ready — stop the child so we don't leak it, then throw.
   await stop();
+  const stderrHint = lastStderr.trim()
+    ? ` Last server output:\n${lastStderr.trim()}`
+    : '';
   throw new Error(
-    `Oxigraph server did not become ready on ${bind} within ${readyTimeoutMs}ms ` +
-      `(binary: ${opts.binaryPath}, location: ${opts.location}).`,
+    childDied
+      ? `Oxigraph server exited during startup on ${bind} ` +
+        `(binary: ${opts.binaryPath}, location: ${opts.location}). ` +
+        `The port may already be in use by another process.${stderrHint}`
+      : `Oxigraph server did not become ready on ${bind} within ${readyTimeoutMs}ms ` +
+        `(binary: ${opts.binaryPath}, location: ${opts.location}).${stderrHint}`,
   );
 }

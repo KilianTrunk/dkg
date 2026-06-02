@@ -876,9 +876,18 @@ export async function runDaemonInner(
     if (managed) {
       managedOxigraph = managed.handle;
       config.store = managed.storeConfig;
-      if (!config.largeLiteralStorage) {
-        config.largeLiteralStorage = managed.largeLiteralStorage;
-      }
+      // Always apply the (already operator-merged) largeLiteralStorage:
+      // planManagedOxigraph folds the operator's enabled/thresholdBytes
+      // onto a defaulted `directory`. The local Oxigraph backend infers a
+      // directory from `options.path`; the rewritten sparql-http backend
+      // has none, so a partial operator config (e.g. enabled + threshold,
+      // no directory) would otherwise fail exitOnStoreConfigErrors below.
+      config.largeLiteralStorage = managed.largeLiteralStorage;
+      // Every remaining fatal boot path (config validation, store health
+      // check, identity mismatch, later failures) calls process.exit(),
+      // which bypasses the graceful shutdown hook. Register a synchronous
+      // best-effort kill so none of them orphan the spawned server.
+      process.once('exit', () => managedOxigraph?.killSync());
       log(`Managed Oxigraph server backing store: ${managed.handle.queryEndpoint}`);
     }
   } catch (err) {

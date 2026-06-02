@@ -26,6 +26,9 @@ class FakeChild extends EventEmitter {
     queueMicrotask(() => this.emitExit(0, signal ?? null));
     return true;
   }
+  emitStderr(line: string) {
+    this.stderr.emit('data', Buffer.from(line));
+  }
   emitExit(code: number | null, signal: string | null) {
     if (this.exitCode !== null || this.signalCode !== null) return;
     this.exitCode = code;
@@ -34,13 +37,18 @@ class FakeChild extends EventEmitter {
   }
 }
 
-function spawnFactory() {
+/**
+ * @param onSpawn optional hook invoked with each freshly-spawned child, used
+ *   to simulate a child that dies on bind (EADDRINUSE) during startup.
+ */
+function spawnFactory(onSpawn?: (c: FakeChild) => void) {
   const children: FakeChild[] = [];
   const calls: Array<{ cmd: string; args: string[] }> = [];
   const spawn = ((cmd: string, args: string[]) => {
     calls.push({ cmd, args });
     const c = new FakeChild();
     children.push(c);
+    onSpawn?.(c);
     return c as any;
   }) as any;
   return { spawn, children, calls };
@@ -86,6 +94,46 @@ describe('startOxigraphServer', () => {
     ).rejects.toThrow(/did not become ready/);
 
     expect(children[0].killArgs.length).toBeGreaterThan(0);
+  });
+
+  it('does NOT adopt a foreign SPARQL server when the spawned child dies on bind', async () => {
+    // The child dies on EADDRINUSE during startup, but a foreign server on
+    // the same port answers the probe with 200. We must fail fast, not
+    // return a handle wired to the unrelated server.
+    const { spawn, children } = spawnFactory((c) => {
+      c.emitStderr('error: Address already in use (os error 48)');
+      queueMicrotask(() => c.emitExit(1, null));
+    });
+    const fetchMock = vi.fn(async () => new Response('', { status: 200 }));
+
+    await expect(
+      startOxigraphServer({
+        binaryPath: '/bin/oxigraph',
+        location: '/data/oxi',
+        port: 7878,
+        readyTimeoutMs: 200,
+        readyIntervalMs: 10,
+        io: { spawn, fetch: fetchMock as any },
+      }),
+    ).rejects.toThrow(/exited during startup|already in use/i);
+
+    // Exactly one spawn — a startup-phase exit must NOT trigger a restart.
+    expect(children.length).toBe(1);
+  });
+
+  it('killSync sends SIGTERM synchronously', async () => {
+    const { spawn, children } = spawnFactory();
+    const fetchMock = vi.fn(async () => new Response('', { status: 200 }));
+    const handle = await startOxigraphServer({
+      binaryPath: '/bin/oxigraph',
+      location: '/data/oxi',
+      port: 7878,
+      readyIntervalMs: 5,
+      io: { spawn, fetch: fetchMock as any },
+    });
+
+    handle.killSync();
+    expect(children[0].killArgs).toContain('SIGTERM');
   });
 
   it('stop() sends SIGTERM and resolves on exit', async () => {

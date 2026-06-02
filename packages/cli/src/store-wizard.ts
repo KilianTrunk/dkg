@@ -143,7 +143,9 @@ export async function promptStoreBackend(
       : undefined;
 
   const defaultBackend = opts.flagBackend
-    ?? (existingBackend === 'blazegraph' || existingBackend === 'sparql-http' ? existingBackend : 'oxigraph');
+    ?? (existingBackend === 'blazegraph' || existingBackend === 'sparql-http' || existingBackend === 'oxigraph-server'
+      ? existingBackend
+      : 'oxigraph');
 
   const backendChoices = ['oxigraph', 'blazegraph'] as const;
   // `sparql-http` is intentionally not listed (advanced bring-your-own-server

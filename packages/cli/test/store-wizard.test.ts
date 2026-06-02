@@ -295,6 +295,15 @@ describe('promptStoreBackend', () => {
     expect(result.storeBlock).toEqual({ backend: 'oxigraph-server', options: {} });
   });
 
+  it('preserves an existing oxigraph-server backend on Enter-through (no silent downgrade)', async () => {
+    const result = await promptStoreBackend({
+      ask: mockAsk(['']), // accept default — must resolve to oxigraph-server, not oxigraph
+      existingStore: { backend: 'oxigraph-server', options: {} },
+      log: () => {},
+    });
+    expect(result.storeBlock).toEqual({ backend: 'oxigraph-server', options: {} });
+  });
+
   it('does not offer Docker for sparql-http backend', async () => {
     let provisionCalled = false;
     const result = await promptStoreBackend({

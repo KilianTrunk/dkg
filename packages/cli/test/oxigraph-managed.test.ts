@@ -18,6 +18,7 @@ vi.mock('../src/daemon/oxigraph-server.js', () => ({
     queryEndpoint: `http://127.0.0.1:${opts.port}/query`,
     updateEndpoint: `http://127.0.0.1:${opts.port}/update`,
     stop: async () => {},
+    killSync: () => {},
   })),
 }));
 

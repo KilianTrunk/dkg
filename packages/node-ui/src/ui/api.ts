@@ -1,5 +1,3 @@
-import { subGraphFromAssertionGraphUri } from './lib/sub-graph-uri.js';
-
 const BASE = '';
 declare global {
   interface Window { __DKG_TOKEN__?: string; }
@@ -77,10 +75,14 @@ async function del<T>(path: string): Promise<T> {
 export const fetchStatus = () => get<any>('/api/status');
 
 // --- LLM Settings ---
-// NOTE: the LLM settings CLIENT exports (fetchLlmSettings/updateLlmSettings)
-// were removed with the Settings LLM section (Settings cleanup). The daemon
-// route /api/settings/llm + llmSettings plumbing STAY — they gate import/
-// entity-extraction (routes/memory.ts, routes/epcis.ts). UI-only removal.
+export interface LlmSettingsResponse {
+  configured: boolean;
+  model?: string;
+  baseURL?: string;
+}
+export const fetchLlmSettings = () => get<LlmSettingsResponse>('/api/settings/llm');
+export const updateLlmSettings = (data: { apiKey?: string; model?: string; baseURL?: string; clear?: boolean }) =>
+  put<LlmSettingsResponse & { ok: boolean }>('/api/settings/llm', data);
 export const fetchRetentionSettings = () => get<{ retentionDays: number }>('/api/settings/retention');
 export const updateRetentionSettings = (retentionDays: number) =>
   put<{ ok: boolean; retentionDays: number }>('/api/settings/retention', { retentionDays });
@@ -330,6 +332,67 @@ export const approveJoinRequest = (contextGraphId: string, agentAddress: string)
 
 export const rejectJoinRequest = (contextGraphId: string, agentAddress: string) =>
   post<{ ok: boolean; status: string; agentAddress: string }>(`/api/context-graph/${encodeURIComponent(contextGraphId)}/reject-join`, { agentAddress });
+
+// --- Catch-up sync jobs ---
+export interface CatchupStatusResponse {
+  jobId: string;
+  contextGraphId: string;
+  includeSharedMemory: boolean;
+  /**
+   * `unreachable` is the V10 terminal status emitted when the daemon
+   * subscribed and ran the catchup, but no peer could deliver the CG
+   * content (curator offline, no node holds the CG, or transport
+   * failures across the whole peer set). Distinct from `denied`
+   * (responder explicitly refused) so the UI can render targeted
+   * copy + a "send signed join request" CTA.
+   */
+  status: 'queued' | 'running' | 'done' | 'denied' | 'failed' | 'unreachable';
+  queuedAt: number;
+  startedAt?: number;
+  finishedAt?: number;
+  result?: {
+    connectedPeers: number;
+    syncCapablePeers: number;
+    peersTried: number;
+    /** See `unreachable` above; subset of `peersTried` that responded without failure or denial. */
+    peersSucceeded: number;
+    dataSynced: number;
+    sharedMemorySynced: number;
+    denied: boolean;
+    deniedPeers: number;
+    diagnostics?: {
+      noProtocolPeers: number;
+      durable: {
+        fetchedMetaTriples: number;
+        fetchedDataTriples: number;
+        insertedMetaTriples: number;
+        insertedDataTriples: number;
+        bytesReceived: number;
+        resumedPhases: number;
+        emptyResponses: number;
+        metaOnlyResponses: number;
+        dataRejectedMissingMeta: number;
+        rejectedKcs: number;
+        failedPeers: number;
+      };
+      sharedMemory: {
+        fetchedMetaTriples: number;
+        fetchedDataTriples: number;
+        insertedMetaTriples: number;
+        insertedDataTriples: number;
+        bytesReceived: number;
+        resumedPhases: number;
+        emptyResponses: number;
+        droppedDataTriples: number;
+        failedPeers: number;
+      };
+    };
+  };
+  error?: string;
+}
+
+export const fetchCatchupStatus = (contextGraphId: string) =>
+  get<CatchupStatusResponse>(`/api/sync/catchup-status?contextGraphId=${encodeURIComponent(contextGraphId)}`);
 
 // --- File import to Working Memory ---
 export interface ImportFileResult {
@@ -617,68 +680,88 @@ export async function listAssertions(
 
   // layer === 'wm'
   //
-  // #844 regression fix — the prior WM listing enumerated data graphs via
-  // `SELECT DISTINCT ?g WHERE { GRAPH ?g { ?s ?p ?o } }`. Merge #844 gated
-  // that whole-store `GRAPH ?g` enumeration in the WM view behind the
-  // `includeContextGraphPartitions` flag (which `listAssertions` does not
-  // set), so the WM view returned no assertion data-graphs and the
-  // Assertions subtab went empty.
-  //
-  // Derive WM assertions from the `<cg>/_meta` lifecycle graph instead —
-  // the same source of truth the SWM branch uses (just `_meta` rather than
-  // `_shared_memory_meta`). Each WM assertion is recorded by
-  // `generateAssertionCreatedMetadata` as a `dkg:Assertion` entity carrying
-  // `dkg:assertionName`, `dkg:assertionGraph`, and a MUTABLE
-  // `dkg:memoryLayer` literal whose value is the assertion's CURRENT layer.
-  // `MemoryLayer.WorkingMemory` is `"WM"`; on promote the lifecycle writer
-  // flips it to `"SWM"` — so filtering on `dkg:memoryLayer "WM"` yields
-  // exactly the not-yet-promoted assertions (promoted ones correctly drop
-  // out of the WM list). The explicit `GRAPH <…/_meta> { … }` makes the
-  // query self-scoping (the engine's `wrapWithGraph` early-returns when the
-  // SPARQL already names a graph), so it runs raw — same shape as the SWM
-  // branch above. `graphUri` is the lifecycle URN (`?assertion`), matching
-  // the SWM branch and what promote/preview lookups key on (name + subGraph).
-  const DKG = 'http://dkg.io/ontology/';
+  // #864 rc.12 follow-up — without `includeContextGraphPartitions`, the
+  // daemon's contextGraphId-scoped routing (DKGQueryEngine.query, the
+  // `effectiveContextGraphId && !options?.view` branch) restricts
+  // `GRAPH ?g { … }` reads to the static allow-list
+  //   { <cg>, <cg>/_meta, <cg>/_shared_memory_meta }
+  // via `constrainGraphVariablesToAllowedSet`. Every WM assertion lives
+  // in a content partition (`<cg>/assertion/<agent>/<name>` or the
+  // sub-graph variant `<cg>/<sg>/assertion/<agent>/<name>`) — none of
+  // which are in that allow-list — so this enumeration came back empty
+  // for any CG no matter how many assertions actually existed.
+  // Downstream that surfaced as:
+  //   - `AssertionsList` rendered "no assertions" right after import.
+  //   - `LayerActionsWidget` showed the correct "Promote N to SWM" badge
+  //     (the count comes from `useMemoryEntities`, which already opts
+  //     into `includeContextGraphPartitions`), but on click its
+  //     `handleAction` loop iterated zero times and hit the no-op
+  //     bulk-promote branch — the exact "0 triples promoted" symptom
+  //     the rc.12 issue reported even after the publisher-side
+  //     `AssertionNotPersistedError` fix landed.
+  // Opting into the same partition-aware scope `useMemoryEntities`
+  // already uses brings the assertion partitions back into `GRAPH ?g`
+  // expansion. Same `/api/query` route, same `postQueryDeduped` cache,
+  // same privacy/cost envelope as the dashboard counters.
+  // Codex review on #898 — listing WM by raw `GRAPH ?g { ?s ?p ?o }`
+  // counts re-listed promoted assertions because `assertionPromote`
+  // intentionally leaves daemon-owned `urn:dkg:file:*` /
+  // `urn:dkg:extraction:*` quads behind in the assertion data graph
+  // (publisher Bug 8 / Round 9 Bug 25 import-bookkeeping filter), so
+  // those graphs stay non-empty after promote even though the
+  // lifecycle in `_meta` has flipped to `dkg:memoryLayer "SWM"`. The
+  // UI was therefore offering Promote on assertions that were no
+  // longer in WM. Derive WM membership from the lifecycle marker the
+  // publisher itself owns: `<assertionGraphUri> dkg:memoryLayer "WM"`
+  // in `<cg>/_meta` (set by `assertionCreate`, flipped to "SWM" by
+  // `assertionPromote`). The OPTIONAL keeps WM rows visible even when
+  // the data graph is genuinely empty (fresh create with no writes
+  // yet), matching the prior listing semantics for that case.
   const metaGraph = `did:dkg:context-graph:${contextGraphId}/_meta`;
-  const sparql = `SELECT DISTINCT ?assertion ?name ?sg ?assertionGraph WHERE {
-    GRAPH <${metaGraph}> {
-      ?assertion a <${DKG}Assertion> ;
-                 <${DKG}memoryLayer> "WM" ;
-                 <${DKG}assertionName> ?name .
-      OPTIONAL { ?assertion <${DKG}subGraphName> ?sg }
-      OPTIONAL { ?assertion <${DKG}assertionGraph> ?assertionGraph }
-    }
-  }`;
-  const data = await executeQuery(sparql, contextGraphId);
+  const sparql = `SELECT ?g (COUNT(?s) AS ?cnt) WHERE {
+    GRAPH <${metaGraph}> { ?g <http://dkg.io/ontology/memoryLayer> "WM" }
+    OPTIONAL { GRAPH ?g { ?s ?p ?o } }
+  } GROUP BY ?g`;
+  const data = await postQueryDeduped({
+    sparql,
+    contextGraphId,
+    includeContextGraphPartitions: true,
+  });
   const bindings: any[] = data?.result?.bindings ?? [];
-  const seen = new Set<string>();
+  // #706 fix — the prior `startsWith('did:dkg:context-graph:<cg>/assertion/')`
+  // shape silently dropped sub-graph-scoped WM assertions, whose graph
+  // URI is `did:dkg:context-graph:<cg>/<sg>/assertion/<agent>/<name>`
+  // (the sub-graph segment sits between `<cg>/` and `/assertion/`).
+  // We accept exactly two shapes, post-cgPrefix:
+  //   root-bucket : ['assertion', <agent>, <name>]            (3 segs)
+  //   sub-graph   : [<subGraphName>, 'assertion', <agent>, <name>] (4 segs)
+  // Anything else (extra segments on either side, internal meta
+  // graphs sharing the prefix, etc.) is silently dropped. The parse
+  // is deliberately strict so a row never gets admitted with a
+  // mis-derived name — promote/preview lookups key on `name` and
+  // would silently miss otherwise. The cgId itself is treated as
+  // opaque (it may contain `/assertion/` as a literal substring,
+  // per `validateContextGraphId`).
+  const cgPrefix = `did:dkg:context-graph:${contextGraphId}/`;
   const result: AssertionInfo[] = [];
   for (const b of bindings) {
-    const lifecycle = bv(b.assertion);
-    const name = bv(b.name);
-    if (!lifecycle || !name) continue;
-    // Sub-graph scope: prefer the explicit `dkg:subGraphName` literal
-    // (emitted by the lifecycle writer for sub-graph-scoped assertions
-    // since #710). Drafts created BEFORE #710 carry `dkg:assertionGraph`
-    // but NO `dkg:subGraphName`, so fall back to parsing the sub-graph
-    // segment out of the assertion-graph URI — same migration fallback
-    // the lifecycle hook uses (`subGraphFromAssertionGraphUri`). Without
-    // it, a pre-#710 sub-graph draft would surface as root-bucket and
-    // mis-scope promote/preview lookups.
-    const assertionGraph = bv(b.assertionGraph);
-    const subGraph =
-      bv(b.sg) ||
-      (assertionGraph
-        ? subGraphFromAssertionGraphUri(assertionGraph, contextGraphId)
-        : undefined) ||
-      undefined;
-    if (seen.has(lifecycle)) continue;
-    seen.add(lifecycle);
-    // Mirror the SWM branch: no per-assertion triple count (the data-graph
-    // COUNT was exactly the gated enumeration; the renderer already guards
-    // `tripleCount != null`, so the count chip is simply omitted for WM —
-    // consistent with SWM rows).
-    result.push({ name, graphUri: lifecycle, subGraph });
+    const g = typeof b.g === 'string' ? b.g : b.g?.value;
+    if (!g || !g.startsWith(cgPrefix)) continue;
+    const segments = g.slice(cgPrefix.length).split('/');
+    let subGraph: string | undefined;
+    let name: string;
+    if (segments.length === 3 && segments[0] === 'assertion') {
+      subGraph = undefined;
+      name = segments[2];
+    } else if (segments.length === 4 && segments[1] === 'assertion') {
+      subGraph = segments[0];
+      name = segments[3];
+    } else {
+      continue;
+    }
+    if (!name) continue;
+    const cnt = typeof b.cnt === 'string' ? parseInt(b.cnt, 10) : (b.cnt?.value ? parseInt(b.cnt.value, 10) : undefined);
+    result.push({ name, graphUri: g, tripleCount: Number.isFinite(cnt) ? cnt : undefined, subGraph });
   }
   return result;
 }
@@ -705,6 +788,64 @@ export const promoteAssertion = (
     `/api/assertion/${encodeURIComponent(assertionName)}/promote`,
     { contextGraphId, entities, ...(subGraphName ? { subGraphName } : {}) },
   );
+
+// Issue #864 — central UI translator for `promoteAssertion` outcomes so
+// every call-site speaks the same language. Two shapes get massaged
+// here that the bare-promotedCount path used to render confusingly:
+//
+//   • `promotedCount === 0` is technically a success but normally
+//     means "the assertion graph was already empty when promote ran"
+//     (already-promoted re-click, discarded draft, or — the rc.12
+//     bug from issue #864 — a transient state where _meta indicates
+//     persistence but the data graph isn't visible yet). Surface that
+//     ambiguity instead of the misleading literal "Promoted 0 triples
+//     to Shared Memory" toast.
+//   • An HttpError with `body.code === 'ASSERTION_NOT_PERSISTED'`
+//     (the new 409 from the /promote route) means we caught the
+//     inconsistency on the daemon side. Re-render the daemon's hint
+//     as a UI-friendly sentence that includes the expected count so
+//     the user understands re-import is the recovery path.
+export type PromoteOutcome =
+  | { kind: 'success'; promotedCount: number; message: string }
+  | { kind: 'noop'; message: string }
+  | { kind: 'not-persisted'; message: string; expectedTripleCount?: number };
+
+export function describePromoteResult(
+  assertionName: string,
+  res: { promotedCount: number },
+): PromoteOutcome {
+  if (res.promotedCount > 0) {
+    return {
+      kind: 'success',
+      promotedCount: res.promotedCount,
+      message: `Promoted ${res.promotedCount} triple${res.promotedCount === 1 ? '' : 's'} from ${assertionName} to Shared Working Memory.`,
+    };
+  }
+  return {
+    kind: 'noop',
+    message: `${assertionName} had no triples to promote. It may already be in Shared Working Memory, or the extracted content is still being committed — refresh and try again.`,
+  };
+}
+
+export function describePromoteError(
+  assertionName: string,
+  err: unknown,
+): PromoteOutcome | null {
+  if (err instanceof HttpError && err.status === 409) {
+    const body = err.body as { code?: string; expectedTripleCount?: number } | undefined;
+    if (body?.code === 'ASSERTION_NOT_PERSISTED') {
+      const expected = typeof body.expectedTripleCount === 'number' ? body.expectedTripleCount : undefined;
+      return {
+        kind: 'not-persisted',
+        expectedTripleCount: expected,
+        message: expected
+          ? `${assertionName} was imported with ${expected} extracted triple${expected === 1 ? '' : 's'} but the data graph is empty. Re-import the source file (or re-write the assertion) before promoting.`
+          : `${assertionName}'s data graph is empty but its extraction metadata says it should hold content. Re-import the source file before promoting.`,
+      };
+    }
+  }
+  return null;
+}
 
 // --- File preview ---
 
@@ -758,7 +899,14 @@ export interface SwmRootEntity {
 
 /** List root entities in SWM with their triple counts. */
 export async function listSwmEntities(contextGraphId: string): Promise<SwmRootEntity[]> {
-  const sparql = `SELECT ?s (COUNT(?p) AS ?cnt) WHERE { ?s ?p ?o } GROUP BY ?s ORDER BY DESC(?cnt)`;
+  const swmGraph = `did:dkg:context-graph:${contextGraphId}/_shared_memory`;
+  const sparql = `SELECT ?s (COUNT(?p) AS ?cnt) WHERE {
+    GRAPH ?g {
+      ?s ?p ?o .
+      FILTER(STR(?g) = "${swmGraph}")
+      FILTER(?p != <http://dkg.io/ontology/workspaceOwner>)
+    }
+  } GROUP BY ?s ORDER BY DESC(?cnt)`;
   const data = await post<{ result: any }>('/api/query', { sparql, contextGraphId, view: 'shared-working-memory' });
   const bindings: any[] = data?.result?.bindings ?? [];
   return bindings.map((b) => {
@@ -782,13 +930,17 @@ export interface PublishResult {
   blockNumber?: number;
 }
 
-/** Publish SWM content on-chain (SWM -> VM). Pass rootEntities to selectively publish, or omit for all. */
-export const publishSharedMemory = (contextGraphId: string, rootEntities?: string[]) =>
-  post<PublishResult>('/api/shared-memory/publish', {
+/** Publish exactly one SWM root on-chain (SWM -> VM). */
+export const publishSharedMemory = (contextGraphId: string, rootEntities: string[]) => {
+  if (rootEntities.length !== 1) {
+    throw new Error('V10 publish requires exactly one root entity per request.');
+  }
+  return post<PublishResult>('/api/shared-memory/publish', {
     contextGraphId,
-    selection: rootEntities ?? 'all',
-    clearAfter: !rootEntities,
+    selection: rootEntities,
+    clearAfter: false,
   });
+};
 
 // --- Query history ---
 export const fetchQueryHistory = (limit = 50, offset = 0) =>

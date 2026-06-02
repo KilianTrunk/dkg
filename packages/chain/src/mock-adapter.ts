@@ -1073,6 +1073,26 @@ export class MockChainAdapter implements ChainAdapter {
   }
 
   /**
+   * Issue #872 / Codex round-3: chain-backed publish-policy oracle
+   * parity for the mock chain. Returns the same `(uint8, address)`
+   * shape the EVM adapter does. Unknown ids yield
+   * `(0, address(0))` to match the Solidity default-zero mapping.
+   */
+  async getContextGraphPublishPolicy(contextGraphId: bigint): Promise<{
+    publishPolicy: number;
+    publishAuthority: string;
+  }> {
+    const cg = this.contextGraphs.get(contextGraphId);
+    if (!cg) return { publishPolicy: 0, publishAuthority: ethers.ZeroAddress };
+    const pp = (cg as { publishPolicy?: number }).publishPolicy;
+    const pa = (cg as { publishAuthority?: string }).publishAuthority;
+    return {
+      publishPolicy: typeof pp === 'number' ? pp : 0,
+      publishAuthority: pa ? ethers.getAddress(pa) : ethers.ZeroAddress,
+    };
+  }
+
+  /**
    * OT-RFC-38 / LU-6 Phase B: chain-backed participant-agent allowlist
    * parity for the mock. Mirrors {@link getContextGraphAccessPolicy}
    * shape. Returns an empty array when the CG is unknown or has no

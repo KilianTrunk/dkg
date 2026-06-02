@@ -16,6 +16,7 @@ import {
   type SwmSenderKeyMessageMsg,
   type SwmSenderKeyPackageMsg,
 } from '../src/index.js';
+import { SwmSenderKeyPackageAckSchema } from '../src/proto/swm-sender-key.js';
 
 function bytes(length: number, fill: number): Uint8Array {
   return new Uint8Array(length).fill(fill);
@@ -85,6 +86,7 @@ describe('SWM Sender Key proto', () => {
       type: SWM_SENDER_KEY_PACKAGE_ACK_TYPE,
       accepted: false,
       reason: 'missing key',
+      reasonCode: 'stale-target',
       contextGraphId: pkg.contextGraphId,
       subGraphName: pkg.subGraphName,
       senderAgentAddress: pkg.senderAgentAddress,
@@ -94,6 +96,7 @@ describe('SWM Sender Key proto', () => {
     }));
     expect(ack.accepted).toBe(false);
     expect(ack.reason).toBe('missing key');
+    expect(ack.reasonCode).toBe('stale-target');
     expect(ack.type).toBe(SWM_SENDER_KEY_PACKAGE_ACK_TYPE);
   });
 
@@ -114,6 +117,23 @@ describe('SWM Sender Key proto', () => {
     expect(new Uint8Array(decoded.ciphertext)).toEqual(message.ciphertext);
     expect(new Uint8Array(decoded.aadHash)).toEqual(message.aadHash);
     expect(new Uint8Array(decoded.senderKeySignature)).toEqual(message.senderKeySignature);
+  });
+
+  it('preserves unrecognized ACK reason codes from the wire', () => {
+    const raw = SwmSenderKeyPackageAckSchema.encode(
+      SwmSenderKeyPackageAckSchema.create({
+        version: SWM_SENDER_KEY_PACKAGE_VERSION,
+        type: SWM_SENDER_KEY_PACKAGE_ACK_TYPE,
+        accepted: false,
+        reason: 'future receiver rejection',
+        reasonCode: 'future-reason-code',
+      }),
+    ).finish();
+
+    const ack = decodeSwmSenderKeyPackageAck(raw);
+    expect(ack.accepted).toBe(false);
+    expect(ack.reason).toBe('future receiver rejection');
+    expect(ack.reasonCode).toBe('future-reason-code');
   });
 
   it('binds message AAD to context, subgraph, sender, epoch, membership, index, algorithm, and nonce', () => {

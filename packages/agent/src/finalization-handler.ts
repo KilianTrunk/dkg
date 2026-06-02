@@ -785,6 +785,9 @@ export class FinalizationHandler {
       await this.store.deleteByPattern({ graph: sharedMemoryGraph, subject: rootEntity });
       await this.store.deleteBySubjectPrefix(sharedMemoryGraph, rootEntity + '/.well-known/genid/');
       await this.store.deleteByPattern({
+        graph: sharedMemoryGraph, subject: rootEntity, predicate: 'http://dkg.io/ontology/workspaceOwner',
+      });
+      await this.store.deleteByPattern({
         graph: swmMetaGraph, subject: rootEntity, predicate: 'http://dkg.io/ontology/workspaceOwner',
       });
       await this.deleteMetaForRoot(swmMetaGraph, rootEntity);

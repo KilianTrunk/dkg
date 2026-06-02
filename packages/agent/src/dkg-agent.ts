@@ -1,3 +1,4 @@
+import { createHash, randomUUID } from 'node:crypto';
 import {
   DKGNode, ProtocolRouter, GossipSubManager, TypedEventBus, DKGEvent,
   LibP2PNetwork, PeerResolver, StubNetworkStateRegistry,
@@ -38,6 +39,7 @@ import {
   encodeWorkspaceEncryptionKey,
   workspaceAgentEncryptionKeyId,
   SWM_SENDER_KEY_PACKAGE_ACK_TYPE,
+  SWM_SENDER_KEY_PACKAGE_ACK_RETRYABLE_REASON_CODES,
   SWM_SENDER_KEY_PACKAGE_VERSION,
   computeSwmSenderKeyMembershipHash,
   computeSwmSenderKeyPackageAAD,
@@ -61,6 +63,7 @@ import {
   SWM_SENDER_KEY_SKIPPED_MESSAGE_CACHE_LIMIT,
   type DKGNodeConfig, type OperationContext, type GetView, type AssertionDescriptor, type AssertionEvent, type AssertionState,
   type SwmSenderKeyMessageMsg,
+  type SwmSenderKeyPackageAckReasonCode,
   type SwmSenderKeyPackageMsg,
   type WorkspaceRecipientEncryptionKey,
   InMemoryMessageIdempotencyStore,
@@ -81,7 +84,7 @@ import {
   pickNetworkTunables,
 } from '@origintrail-official/dkg-core';
 import { GraphManager, PrivateContentStore, createTripleStore, type TripleStore, type TripleStoreConfig, type Quad, type LargeLiteralStorageConfig } from '@origintrail-official/dkg-storage';
-import { EVMChainAdapter, NoChainAdapter, enrichEvmError, type EVMAdapterConfig, type ChainAdapter, type CreateContextGraphParams, type CreateOnChainContextGraphParams, type CreateOnChainContextGraphResult, type TxResult, type V10PublishingConvictionAccountInfo } from '@origintrail-official/dkg-chain';
+import { EVMChainAdapter, NoChainAdapter, enrichEvmError, isRetryableRpcError, type EVMAdapterConfig, type ChainAdapter, type CreateContextGraphParams, type CreateOnChainContextGraphParams, type CreateOnChainContextGraphResult, type TxResult, type V10PublishingConvictionAccountInfo } from '@origintrail-official/dkg-chain';
 import {
   DKGPublisher, PublishHandler, SharedMemoryHandler, UpdateHandler, ChainEventPoller, AccessHandler, AccessClient,
   PublishJournal, StaleWriteError,
@@ -336,8 +339,10 @@ import {
   swmReceiverStateKey,
   serializeSwmSenderSendState,
   serializeSwmSenderReceiveState,
+  serializePendingSenderKeyEntry,
   deserializeSwmSenderSendState,
   deserializeSwmSenderReceiveState,
+  deserializePendingSenderKeyEntry,
 } from './dkg-agent-swm-state.js';
 // Public surface re-exported so external consumers that import directly
 // from `./dkg-agent.js` keep working. The new file `dkg-agent-types.ts`
@@ -393,6 +398,93 @@ export type {
 const CIPHERTEXT_CHUNK_SIZE_BYTES = 32 * 1024;
 
 /**
+ * Upper bound on the boot-time on-chain identity resolution
+ * (`getIdentityId` / `ensureProfile`) inside `start()`. Daemon HTTP
+ * readiness MUST NOT depend on chain-RPC reachability: `start()` is awaited
+ * before the daemon binds its HTTP listener (cli lifecycle.ts), so an
+ * unreachable or rate-limited (HTTP 429) RPC — which the multi-RPC failover
+ * loop retries across endpoints — would otherwise block boot past the CLI's
+ * 45s readiness ceiling (#894). When this bound trips, identity stays
+ * unresolved (0n): the node boots, HTTP serves, and on-chain writes (e.g.
+ * context-graph register) surface their own RPC error (503) at call time
+ * rather than hanging the whole daemon. Generous enough not to false-trip a
+ * healthy-but-slow chain, far below the 45s readiness window.
+ */
+const BOOT_CHAIN_IDENTITY_TIMEOUT_MS = 20_000;
+
+/**
+ * Floor for the (public, config-settable) StorageACK registration retry
+ * interval. Guards against a 0 / negative value collapsing the retry into a
+ * tight loop that hammers the RPC and floods the log (Codex PR #901 round-4
+ * :2106). 1s is well below the 30s production default yet leaves ample spacing.
+ */
+const MIN_STORAGE_ACK_REGISTRATION_RETRY_MS = 1_000;
+
+/**
+ * Resolve `op` but reject with a `BOOT_CHAIN_TIMEOUT`-coded error if it does
+ * not settle within `ms`. The timer is `unref`'d so it never keeps the
+ * process alive on its own. Used to bound boot-time chain calls so daemon
+ * readiness stays independent of chain-RPC reachability.
+ *
+ * When the timeout wins, `op` is still pending — the multi-RPC failover loop
+ * keeps retrying and will eventually reject (e.g. `RPC_ENDPOINTS_EXHAUSTED`).
+ * That late rejection has no awaiter once the race has settled, so we attach a
+ * no-op `.catch()` to the original promise to keep it from surfacing as an
+ * `unhandledRejection` and crashing the booted daemon.
+ */
+async function raceWithBootTimeout<T>(op: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  op.catch(() => {
+    /* swallow a late rejection from the abandoned op after the race settles */
+  });
+  try {
+    return await Promise.race<T>([
+      op,
+      new Promise<T>((_, reject) => {
+        timer = setTimeout(() => {
+          const err = new Error(`${label} timed out after ${ms}ms`);
+          (err as Error & { code?: string }).code = 'BOOT_CHAIN_TIMEOUT';
+          reject(err);
+        }, ms);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/**
+ * Is a boot-time chain-identity failure TRANSIENT (RPC unreachable / slow /
+ * rate-limited — recoverable by retrying once the chain is back) versus
+ * PERMANENT/deterministic (missing admin key, insufficient funds, a contract
+ * revert)? Only transient failures should arm the StorageACK retry loop;
+ * arming it for a permanent failure would re-call `ensureProfile()` every 30s
+ * forever (Codex PR #901 round-3 :1714 / round-4 :1838).
+ *
+ * Delegates the RPC-shape recognition to the chain package's exported
+ * `isRetryableRpcError` (Codex PR #901 round-4 :459) so we reuse its full
+ * extraction — top-level AND nested `error.code` / `statusCode` /
+ * `response.status` — instead of a narrower top-level-only copy that would
+ * misclassify a 429/5xx buried in a nested field as permanent. On top we add
+ * the boot path's own `BOOT_CHAIN_TIMEOUT` (`isRetryableRpcError` doesn't know
+ * it) and an explicit permanent-exclusion guard for `admin` provisioning
+ * failures (`isRetryableRpcError` already excludes revert/insufficient-funds/
+ * nonce). Anything else — ordinary `Error`s with no RPC signature — stays
+ * permanent and disabled.
+ */
+function isTransientBootChainError(err: unknown): boolean {
+  const code = (err as { code?: unknown })?.code;
+  if (code === 'BOOT_CHAIN_TIMEOUT') return true;
+  // A missing/invalid profile admin key is a deterministic config error, not a
+  // transient RPC failure — surface it once, never retry. (The chain classifier
+  // already treats revert / insufficient-funds / nonce as non-retryable.)
+  const msg = (err instanceof Error ? err.message : String(err ?? '')).toLowerCase();
+  if (msg.includes('admin')) return false;
+  return isRetryableRpcError(err);
+}
+
+/**
  * OT-RFC-38 LU-11. Split a single plaintext buffer into the
  * fixed-size pieces the chunked AEAD path expects. Empty input is
  * rejected — the publisher computes `merkleRoot` from non-empty
@@ -408,6 +500,45 @@ function sliceIntoCiphertextChunks(plaintext: Uint8Array): Uint8Array[] {
   }
   return chunks;
 }
+
+class SwmSenderKeySetupRejectionError extends Error {
+  readonly reasonCode: SwmSenderKeyPackageAckReasonCode;
+
+  constructor(reasonCode: SwmSenderKeyPackageAckReasonCode, message: string) {
+    super(message);
+    this.name = 'SwmSenderKeySetupRejectionError';
+    this.reasonCode = reasonCode;
+  }
+}
+
+const SWM_SENDER_KEY_PENDING_DRAIN_LOG_CTX: OperationContext = {
+  operationId: 'swm-sender-key-pending-drain',
+  operationName: 'share',
+};
+
+/**
+ * Sentinel returned by the chain-RPC-fallback timeout race inside
+ * {@link DKGAgent.getContextGraphOnChainPolicy}. Distinct from
+ * `undefined` so the caller can tell a timed-out probe apart from
+ * an RPC that legitimately resolved to "no policy". Module-scoped
+ * so the inner `withTimeout` helper can reuse the same identity.
+ */
+const TIMEOUT_SENTINEL = Symbol('chain-rpc-fallback-timeout');
+
+/**
+ * Codex review on #872 — TTL for the eagerly-seeded `publishPolicy`
+ * cache. `publishPolicy` is mutable on-chain (`PublishPolicyUpdated`
+ * is emitted by `ContextGraphStorage.updatePublishPolicy`), but the
+ * cache is only populated by `ContextGraphCreated`, so a curator
+ * flipping a CG from open → curated would otherwise leave a stale
+ * `1` in this node's cache until restart and keep relaxing the
+ * import-artifact owner guard. The TTL bounds staleness to one
+ * window without wiring a full `PublishPolicyUpdated` event watcher
+ * through the chain-event poller. 60s is conservative because the
+ * cached value gates an authorization decision — one extra eth_call
+ * per minute per active CG is cheap.
+ */
+const ON_CHAIN_PUBLISH_POLICY_CACHE_TTL_MS = 60_000;
 
 export class DKGAgent {
   readonly wallet: AgentWallet;
@@ -700,6 +831,12 @@ export class DKGAgent {
   private randomSamplingBindRetryInFlight = false;
   private storageACKRegistrationRetryTimer: ReturnType<typeof setTimeout> | null = null;
   private storageACKRegistrationRetryInFlight = false;
+  // #894 / Codex PR #901 round-3 :1685: `ensureProfile()` is a mutating
+  // multi-tx flow (createProfile + stake) that can legitimately outlast the
+  // boot read-timeout. Guards against the boot path AND the StorageACK retry
+  // re-submitting `ensureProfile()` while a prior one may still be settling on
+  // chain — which would risk a duplicate profile / double-stake.
+  private profileProvisioningInFlight = false;
   private readonly config: DKGAgentConfig;
   private started = false;
   private readonly subscribedContextGraphs = new Map<string, ContextGraphSub>();
@@ -843,6 +980,43 @@ export class DKGAgent {
    * positive curation signal — fall through to the chain.
    */
   private readonly onChainAccessPolicyCache = new Map<string, number>();
+  /**
+   * Issue #872 — companion cache for the per-CG `publishPolicy` enum
+   * (`0` = curators-only, `1` = open). Populated lazily by the
+   * `ContextGraphCreated` chain-event handler (the event already
+   * carries both enums; the only thing missing was the cache slot).
+   * Consumed by {@link getContextGraphOnChainPolicy} so daemon routes
+   * can decide whether to apply owner-scoped guards or relax them for
+   * public + open CGs without a per-request RPC. `undefined` means
+   * the chain answer hasn't reached this node yet — callers MUST
+   * treat that as unknown (fail-closed) rather than a positive
+   * "publish-policy is open" signal.
+   *
+   * Codex review on #872 — `publishPolicy` is mutable on-chain via
+   * `ContextGraphStorage.updatePublishPolicy` (which emits
+   * `PublishPolicyUpdated`), but this cache is only seeded from the
+   * `ContextGraphCreated` event. Without listening to the update event
+   * AND without a freshness check, a stale `1` survives until daemon
+   * restart and keeps `isPublicOpenContextGraph()` relaxing the
+   * import-artifact owner guard after a curator flips the CG from
+   * open → curated. The TTL companion map below stamps every cache
+   * write with `Date.now()`; reads in `getContextGraphOnChainPolicy`
+   * treat entries older than {@link ON_CHAIN_PUBLISH_POLICY_CACHE_TTL_MS}
+   * as miss and fall through to the chain-RPC fallback (which already
+   * exists for the round-3 non-creator-peer path). Stale data drifts
+   * authoritative within at most one TTL window. The bound is set
+   * conservatively because the cache gates an authorization decision —
+   * one extra eth_call per minute per active CG is cheap.
+   */
+  private readonly onChainPublishPolicyCache = new Map<string, number>();
+  /**
+   * Codex review on #872 — companion timestamp map for {@link onChainPublishPolicyCache}.
+   * `now - fetchedAt > ON_CHAIN_PUBLISH_POLICY_CACHE_TTL_MS` is treated
+   * as a cache miss. Kept as a sibling map (rather than refactoring the
+   * cache value to `{ value, fetchedAt }`) so existing test fixtures
+   * that read `cache.get(id)` and expect a bare number still pass.
+   */
+  private readonly onChainPublishPolicyCacheUpdatedAt = new Map<string, number>();
   /**
    * OT-RFC-38 / LU-6 Phase B — chain-backed participant-agent
    * allowlist cache. Keyed by `contextGraphId.toString()` (stringified
@@ -1014,18 +1188,15 @@ export class DKGAgent {
    * without a peerId). Per-key triple `(senderAgentAddress,
    * recipientKeyId, epochId)` deduplicates within an agent.
    *
-   * In-memory only for now. Older epochs are evicted whenever a newer
-   * epoch is enqueued for the same `(sender, recipient)` pair — the
-   * supersession matches what the membership-hash flow already implies
-   * sender-side, and avoids the "queued package for epoch N replays
-   * after we've rolled to N+1" footgun.
-   *
-   * A future PR will plumb a SQLite-backed store through
-   * `config.swmSenderKeyStores?.pendingByAgent` so durability survives
-   * daemon restart. Today, restart loses pending rows and the next
-   * publish re-enqueues if the same member still has no peerId.
-   */
+   * Persisted with the SWM sender-key state file when `dataDir` is
+   * configured. Older epochs are evicted whenever a newer epoch is
+   * enqueued for the same `(sender, recipient)` pair — the supersession
+   * matches what the membership-hash flow already implies sender-side,
+   * and avoids the "queued package for epoch N replays after we've
+   * rolled to N+1" footgun.
+  */
   private readonly pendingSenderKeyByAgent = new Map<string, PendingSenderKeyEntry[]>();
+  private readonly pendingSenderKeyDrainByAgent = new Map<string, Promise<number>>();
 
   private constructor(
     config: DKGAgentConfig,
@@ -1106,6 +1277,7 @@ export class DKGAgent {
         privateKey: opKeys[0],
         additionalKeys: opKeys.slice(1),
         hubAddress: config.chainConfig.hubAddress,
+        tokenAddress: config.chainConfig.tokenAddress,
         chainId: config.chainConfig.chainId,
         approvalPolicy: config.chainConfig.approvalPolicy,
       };
@@ -1574,6 +1746,13 @@ export class DKGAgent {
     const effectiveRole = this.config.nodeRole ?? 'edge';
     const ackSignerCandidates = this.getACKSignerCandidateWallets(ctx);
     let onChainIdentityId = 0n;
+    // #894 / Codex PR #901: distinguishes a 0n identity caused by a transient
+    // boot-time chain failure (RPC timeout/unreachable — recoverable, so the
+    // StorageACK path must keep retrying + re-resolve once RPC returns) from
+    // an intentional 0n (e.g. an edge node that never provisions on-chain — it
+    // never reaches the core-only ACK block anyway). Set when the boot
+    // identity block times out or errors below.
+    let bootChainIdentityUnresolvedTransient = false;
     const ensureACKCandidateWalletsRegistered = async (
       attemptCtx: OperationContext,
     ): Promise<boolean> => {
@@ -1612,13 +1791,28 @@ export class DKGAgent {
     // Auto-detect or register on-chain identity.
     // Edge nodes skip profile creation — they operate with agent identity only.
     if (this.chain.chainId !== 'none') {
+      // #894: bound boot-time chain identity resolution so an unreachable /
+      // rate-limited RPC (which the multi-RPC failover loop retries across
+      // endpoints) cannot block daemon HTTP readiness past the CLI's 45s
+      // ceiling. On timeout the existing catch leaves identity unresolved and
+      // boot proceeds; the node serves HTTP and on-chain writes 503 at call
+      // time. The 20s bound is well below 45s yet generous for a healthy chain.
       try {
-        onChainIdentityId = await this.chain.getIdentityId();
+        onChainIdentityId = await raceWithBootTimeout(
+          this.chain.getIdentityId(),
+          BOOT_CHAIN_IDENTITY_TIMEOUT_MS,
+          'boot getIdentityId',
+        );
         if (onChainIdentityId === 0n && effectiveRole === 'core') {
           this.log.info(ctx, `No on-chain identity found, creating profile and staking...`);
-          onChainIdentityId = await this.chain.ensureProfile({
-            nodeName: this.config.name,
-          });
+          // Codex PR #901 round-3 :1685: do NOT race `ensureProfile()` with the
+          // boot timeout — it is a mutating createProfile+stake flow that can
+          // legitimately exceed 20s while the tx settles, and abandoning a live
+          // staking tx (then re-calling it on retry) risks a duplicate profile /
+          // double-stake. The read-side `getIdentityId()` above keeps its
+          // timeout (safe to abandon); provisioning runs to completion, guarded
+          // so neither boot nor the retry re-submits while one is in flight.
+          onChainIdentityId = await this.provisionProfileGuarded(ctx);
           this.log.info(ctx, `On-chain profile created, identityId=${onChainIdentityId}`);
         } else if (onChainIdentityId === 0n) {
           this.log.info(ctx, `Edge node — skipping on-chain profile creation (agent identity only)`);
@@ -1628,11 +1822,27 @@ export class DKGAgent {
       } catch (err) {
         this.log.warn(ctx, `ensureProfile error: ${err instanceof Error ? err.message : String(err)}`);
         try {
-          onChainIdentityId = await this.chain.getIdentityId();
+          onChainIdentityId = await raceWithBootTimeout(
+            this.chain.getIdentityId(),
+            BOOT_CHAIN_IDENTITY_TIMEOUT_MS,
+            'boot getIdentityId (recovery)',
+          );
           if (onChainIdentityId > 0n) {
             this.log.info(ctx, `Recovered identityId=${onChainIdentityId} after partial failure`);
           }
-        } catch { /* ignore */ }
+        } catch { /* ignore — boot proceeds with identity unresolved */ }
+        // The boot identity block threw. If it left identity at 0n AND the
+        // failure is TRANSIENT (RPC unreachable/slow/rate-limited), flag it so
+        // the StorageACK path re-resolves and recovers once the chain is back
+        // (#894 / Codex PR #901). A node that genuinely has no identity resolves
+        // 0n on the happy path WITHOUT throwing, leaving this false. And a
+        // PERMANENT/deterministic failure (missing admin key, insufficient
+        // funds, contract revert) must NOT arm the retry — otherwise the
+        // StorageACK loop would re-call `ensureProfile()` every 30s forever
+        // (Codex PR #901 round-3 :1714). It stays disabled and surfaces once.
+        if (onChainIdentityId === 0n && isTransientBootChainError(err)) {
+          bootChainIdentityUnresolvedTransient = true;
+        }
       }
       if (onChainIdentityId > 0n) {
         if (effectiveRole === 'core') {
@@ -1656,9 +1866,79 @@ export class DKGAgent {
         let storageACKFailoverInFlight = false;
         const attemptStorageACKRegistration = async (
           attemptCtx: OperationContext,
-          options: { repairWallets?: boolean } = {},
+          options: { repairWallets?: boolean; allowChainReresolution?: boolean } = {},
         ): Promise<'registered' | 'retryable' | 'disabled'> => {
           if (storageACKProtocolRegistered) return 'registered';
+          // #894 / Codex PR #901 (round 2): background identity re-resolution.
+          // If boot left the identity unresolved because of a transient chain
+          // failure (RPC timeout/unreachable), re-probe the chain — but ONLY on
+          // the scheduled retry path (`allowChainReresolution`), never on the
+          // first attempt awaited by `start()`. The boot path already spent its
+          // chain-timeout budget resolving identity; doing another bounded
+          // chain probe here would stack a third ~20s wait onto `start()` and
+          // blow the 45s readiness ceiling this fix exists to protect (Codex
+          // :1752). On the first attempt we return 'retryable' immediately and
+          // let the unref'd retry timer do the (background) re-resolution.
+          //
+          // We do NOT re-probe on a settled 0n (the flag stays false), so an
+          // intentional no-identity node doesn't spin the chain pointlessly.
+          if (
+            onChainIdentityId === 0n
+            && bootChainIdentityUnresolvedTransient
+            && options.allowChainReresolution === true
+          ) {
+            try {
+              let reresolved = await raceWithBootTimeout(
+                this.chain.getIdentityId(),
+                BOOT_CHAIN_IDENTITY_TIMEOUT_MS,
+                'StorageACK identity re-resolution',
+              );
+              // Codex :1757: a brand-new core node may have hit the transient
+              // failure BEFORE `ensureProfile()` ever ran, so it has no profile
+              // to find. Re-probing `getIdentityId()` alone would return 0n
+              // forever and the node would never provision. Once the chain is
+              // reachable again, create the profile (core only) — mirroring the
+              // boot-time provisioning path. Codex round-3 :1685: provision via
+              // the guarded, un-raced helper so the mutating createProfile+stake
+              // tx runs to completion and is never double-submitted alongside a
+              // boot-path (or concurrent-retry) provisioning still in flight.
+              if (reresolved === 0n && effectiveRole === 'core') {
+                this.log.info(attemptCtx, `No on-chain identity after transient boot outage — creating profile and staking...`);
+                reresolved = await this.provisionProfileGuarded(attemptCtx);
+              }
+              if (reresolved > 0n) {
+                onChainIdentityId = reresolved;
+                bootChainIdentityUnresolvedTransient = false;
+                this.publisher.setIdentityId(onChainIdentityId);
+                this.log.info(
+                  attemptCtx,
+                  `Recovered on-chain identity=${onChainIdentityId} for StorageACK after a transient boot-time chain failure`,
+                );
+              }
+            } catch (err) {
+              // Codex PR #901 round-4 :1838: mirror the boot-path :1714 gate on
+              // the retry path. If the chain came back but provisioning then
+              // failed DETERMINISTICALLY (insufficient funds / revert / admin),
+              // keeping the transient flag set would re-run `ensureProfile()`
+              // every interval forever. Reclassify: permanent → clear the flag
+              // so the terminal branch below returns 'disabled' (surface once,
+              // stop scheduling); transient → keep retrying.
+              if (!isTransientBootChainError(err)) {
+                bootChainIdentityUnresolvedTransient = false;
+                this.log.warn(
+                  attemptCtx,
+                  `V10 StorageACK identity provisioning failed permanently — disabling (no further retries): ` +
+                  `${err instanceof Error ? err.message : String(err)}`,
+                );
+              } else {
+                this.log.warn(
+                  attemptCtx,
+                  `StorageACK identity re-resolution failed (chain still unreachable?), will retry: ` +
+                  `${err instanceof Error ? err.message : String(err)}`,
+                );
+              }
+            }
+          }
           if (onChainIdentityId > 0n) {
             const registrationSucceeded = options.repairWallets === false
               ? true
@@ -1902,6 +2182,15 @@ export class DKGAgent {
               `Registered V10 StorageACK handler (identity=${onChainIdentityId}, signer=${ackSignerWallet.address})`,
             );
             return 'registered';
+          } else if (bootChainIdentityUnresolvedTransient) {
+            // #894 / Codex PR #901: identity is still 0n only because the
+            // chain was unreachable at boot and the re-resolution above hasn't
+            // recovered it yet. This is recoverable, so report 'retryable' —
+            // the scheduled retry keeps re-probing and registers ACK once the
+            // RPC returns, instead of leaving a core node permanently
+            // un-advertised until restart.
+            this.log.warn(attemptCtx, `Deferring V10 StorageACK handler registration — on-chain identity not yet resolved (transient chain outage at boot); will retry`);
+            return 'retryable';
           } else {
             this.log.warn(attemptCtx, `Skipping V10 StorageACK handler registration — identity not yet provisioned`);
             return 'disabled';
@@ -1909,9 +2198,19 @@ export class DKGAgent {
           return 'disabled';
         };
 
-        const scheduleStorageACKRegistrationRetry = (options: { repairWallets?: boolean } = {}) => {
+        // Codex PR #901 round-4 :2106: `storageAckRegistrationRetryMs` is a
+        // public config field fed straight into `setTimeout`. Clamp it to a
+        // sane floor so a 0 / negative / NaN value can't collapse the retry into
+        // a tight loop that hammers the RPC and floods the log while the node is
+        // unhealthy. A non-finite or too-small value falls back to the floor.
+        const requestedRetryMs = this.config.storageAckRegistrationRetryMs;
+        const storageACKRegistrationRetryMs =
+          typeof requestedRetryMs === 'number' && Number.isFinite(requestedRetryMs)
+            ? Math.max(requestedRetryMs, MIN_STORAGE_ACK_REGISTRATION_RETRY_MS)
+            : STORAGE_ACK_REGISTRATION_RETRY_MS;
+        const scheduleStorageACKRegistrationRetry = (options: { repairWallets?: boolean; allowChainReresolution?: boolean } = {}) => {
           if (this.storageACKRegistrationRetryTimer || storageACKProtocolRegistered) return;
-          this.log.warn(ctx, `V10 StorageACK handler registration will retry every ${STORAGE_ACK_REGISTRATION_RETRY_MS}ms`);
+          this.log.warn(ctx, `V10 StorageACK handler registration will retry every ${storageACKRegistrationRetryMs}ms`);
           this.storageACKRegistrationRetryTimer = setTimeout(() => {
             this.storageACKRegistrationRetryTimer = null;
             if (!this.started || storageACKProtocolRegistered || this.storageACKRegistrationRetryInFlight) return;
@@ -1931,16 +2230,21 @@ export class DKGAgent {
               .finally(() => {
                 this.storageACKRegistrationRetryInFlight = false;
               });
-          }, STORAGE_ACK_REGISTRATION_RETRY_MS);
+          }, storageACKRegistrationRetryMs);
           if (this.storageACKRegistrationRetryTimer.unref) this.storageACKRegistrationRetryTimer.unref();
         };
 
         try {
+          // The first attempt is awaited by `start()`, so it must NOT do a
+          // blocking chain re-probe (Codex :1752). It returns 'retryable'
+          // immediately for a transient-0n identity; the scheduled retry then
+          // runs the background re-resolution (+ ensureProfile for a brand-new
+          // core node) with `allowChainReresolution: true`.
           const result = await attemptStorageACKRegistration(ctx);
-          if (result === 'retryable') scheduleStorageACKRegistrationRetry();
+          if (result === 'retryable') scheduleStorageACKRegistrationRetry({ allowChainReresolution: true });
         } catch (err) {
           this.log.warn(ctx, `Skipping V10 StorageACK handler: ${err instanceof Error ? err.message : String(err)}`);
-          scheduleStorageACKRegistrationRetry();
+          scheduleStorageACKRegistrationRetry({ allowChainReresolution: true });
         }
       } else if (typeof this.chain.signACKDigest === 'function') {
         this.log.info(ctx, `V10 StorageACK: adapter has signACKDigest but no extractable key — handler registration deferred until callback signing is supported`);
@@ -2003,8 +2307,8 @@ export class DKGAgent {
       this.chainPoller = new ChainEventPoller({
         chain: this.chain,
         publishHandler,
-        onContextGraphCreated: async ({ contextGraphId, creator, accessPolicy, nameHash, blockNumber }) => {
-          this.log.info(ctx, `Discovered on-chain context graph ${contextGraphId.slice(0, 16)}… (block ${blockNumber}, creator ${creator.slice(0, 10)}…, policy ${accessPolicy}, nameHash ${nameHash ? nameHash.slice(0, 10) + '…' : '(opt-out)'})`);
+        onContextGraphCreated: async ({ contextGraphId, creator, accessPolicy, publishPolicy, nameHash, blockNumber }) => {
+          this.log.info(ctx, `Discovered on-chain context graph ${contextGraphId.slice(0, 16)}… (block ${blockNumber}, creator ${creator.slice(0, 10)}…, policy ${accessPolicy}, publishPolicy ${publishPolicy ?? '?'}, nameHash ${nameHash ? nameHash.slice(0, 10) + '…' : '(opt-out)'})`);
 
           // Track the numeric on-chain id for dedup.
           const alreadyKnown = this.seenOnChainIds.has(contextGraphId)
@@ -2024,6 +2328,13 @@ export class DKGAgent {
           // so the keying matches the lazy-fallback lookup below.
           if (accessPolicy === 0 || accessPolicy === 1) {
             this.onChainAccessPolicyCache.set(contextGraphId, accessPolicy);
+          }
+          // Issue #872 — same eager-cache pattern for the `publishPolicy`
+          // enum so daemon routes can recognise a public + open CG from
+          // local state and relax owner-scoped artifact-read guards.
+          if (publishPolicy === 0 || publishPolicy === 1) {
+            this.onChainPublishPolicyCache.set(contextGraphId, publishPolicy);
+            this.onChainPublishPolicyCacheUpdatedAt.set(contextGraphId, Date.now());
           }
 
           // OT-RFC-38 / LU-6 Phase B — host-mode auto-subscribe path for
@@ -2297,7 +2608,16 @@ export class DKGAgent {
             // yet at this point on multi-agent nodes).
             this.localApprovedAgentByCG.set(contextGraphId, approvedAddr.toLowerCase());
             this.log.info(createOperationContext('system'), `Join request approved for "${contextGraphId}" — auto-subscribing`);
-            this.subscribeToContextGraph(contextGraphId);
+            // Defer the SWM gossip subscribe specifically: the curator's
+            // allowlist hasn't synced into our local `_meta` yet, so a
+            // pre-meta `canReadContextGraph` check would deny and emit a
+            // misleading WARN. `runImmediatePostApprovalSync` below pulls
+            // `_meta`, then `refreshMetaSyncedFlags` (called from
+            // `runCatchupOverPeers`) re-queues the SWM gossip subscribe
+            // once the allowlist is locally visible — clean self-heal,
+            // no spurious denial. Other gossip topics (publish/app/
+            // update/finalization) wire up immediately as before.
+            this.subscribeToContextGraph(contextGraphId, { deferSharedMemoryGossipSubscribe: true });
             this.upsertContextGraphMember({
               contextGraphId,
               principalType: 'agent',
@@ -2611,7 +2931,7 @@ export class DKGAgent {
         // peerId at publish time. Tolerant of profile-lookup failure
         // (the next connection:open will retry).
         try {
-          const drained = await this.drainPendingSenderKeyForPeer(remotePeer);
+          const drained = await this.drainPendingSenderKeyForPeer(remotePeer, ctx);
           if (drained > 0) {
             this.log.info(ctx, `Drained ${drained} pending SWM sender-key package(s) for ${remotePeer}`);
           }
@@ -5810,6 +6130,19 @@ export class DKGAgent {
     const stateKey = swmSenderStateKey(input.contextGraphId, input.subGraphName, senderAddress);
     let state = this.swmSenderKeySendStates.get(stateKey);
     if (!state || state.membershipHash !== membershipHash) {
+      const pruned = this.prunePendingSenderKeysForEpochRotation({
+        contextGraphId: input.contextGraphId,
+        subGraphName: input.subGraphName,
+        senderAgentAddress: senderAddress,
+      });
+      if (pruned > 0) {
+        this.log.warn(
+          ctx,
+          `SWM sender-key epoch rotation pruned ${pruned} stale pending setup package(s) ` +
+          `for context graph "${input.contextGraphId}${input.subGraphName ? `/${input.subGraphName}` : ''}" sender ${senderAddress}`,
+        );
+        await this.saveSwmSenderKeyState();
+      }
       state = await this.createAndDistributeSwmSenderKeyEpoch({
         contextGraphId: input.contextGraphId,
         subGraphName: input.subGraphName,
@@ -5820,6 +6153,8 @@ export class DKGAgent {
       });
       this.swmSenderKeySendStates.set(stateKey, state);
       await this.saveSwmSenderKeyState();
+    } else {
+      await this.drainPendingSenderKeyForRecipients(resolution.recipients, ctx);
     }
 
     const encrypted = await encryptSwmSenderKeyMessage({
@@ -5895,6 +6230,7 @@ export class DKGAgent {
       | { kind: 'success'; agentAddress: string }
       | { kind: 'failure'; agentAddress: string; keyId: string; error: Error };
 
+    let pendingSenderKeyQueued = false;
     const settled = await Promise.allSettled(
       input.recipients.map(async (recipient): Promise<PerRecipientOutcome> => {
         const recipientAgentAddress = ethers.getAddress(recipient.agentAddress);
@@ -5903,6 +6239,7 @@ export class DKGAgent {
           recipient,
           senderPrivateKey: input.sender.privateKey,
         });
+        const packageBytes = encodeSwmSenderKeyPackage(pkg);
 
         if (this.hasLocalAgent(recipientAgentAddress)) {
           try {
@@ -5936,9 +6273,10 @@ export class DKGAgent {
             epochId: state.epochId,
             contextGraphId: state.contextGraphId,
             subGraphName: state.subGraphName,
-            packageBytes: encodeSwmSenderKeyPackage(pkg),
+            packageBytes,
             createdAtMs: Date.now(),
           });
+          pendingSenderKeyQueued = true;
           this.log.warn(
             input.ctx,
             `SWM sender-key setup for ${recipientAgentAddress} keyId=${recipient.recipientKeyId} ` +
@@ -5959,27 +6297,48 @@ export class DKGAgent {
           // backoff cover this protocol the same way they cover chat.
           //
           // Delivery semantics (C2 integration-pass relaxation):
-          //   • `delivered=true && ack.accepted=true`  → success.
-          //   • `delivered=true && ack.accepted=false` → HARD failure
-          //     (recipient explicitly rejected the package — bad key,
-          //     bad membership hash, etc; queuing won't help).
-          //   • `delivered=false`                      → SOFT success.
+          //   • `delivered=true && ack.accepted=true` → success.
+          //   • `delivered=true && ack.accepted=false` with no reason code,
+          //     or with a known terminal reason (`stale-target`,
+          //     `active-private-key-missing`, `revoked-key`,
+          //     `bad-signature`, `unknown`, ACL/config failures)
+          //     → HARD failure: retrying the same package cannot help.
+          //   • `delivered=true && ack.accepted=false` with an explicitly
+          //     retryable reason → SOFT success: keep it queued so a later
+          //     reconnect/publish can retry after remote view convergence.
+          //   • `delivered=false` → SOFT success.
           //     The setup-package landed in the messenger's durable
-          //     outbox and will be replayed when the recipient comes
-          //     back online. Treating this as a hard failure used to
-          //     block any open-publish-CG write whenever the curator
-          //     was offline mid-batch, breaking the "members keep
-          //     publishing under intermittent curator availability"
+          //     outbox, but the agent also keeps a local pending row
+          //     under the same messageId so future retries still decode
+          //     the Sender Key ACK and can rotate after delivered
+          //     malformed/retryable responses. Treating this as a hard
+          //     failure used to block any open-publish-CG write whenever
+          //     the curator was offline mid-batch, breaking the "members
+          //     keep publishing under intermittent curator availability"
           //     contract C2 exercises. The recipient still gets the
           //     epoch + chain key eventually; the only cost is that
           //     they can't decrypt the broadcast that immediately
           //     follows until the queued setup catches up.
+          const messageId = this.swmSenderKeyPackageMessageId(packageBytes);
           const sendResult = await this.messenger.sendReliable(
             recipient.peerId,
             PROTOCOL_SWM_SENDER_KEY,
-            encodeSwmSenderKeyPackage(pkg),
+            packageBytes,
+            { messageId },
           );
           if (!sendResult.delivered) {
+            this.enqueuePendingSenderKey({
+              senderAgentAddress: senderAgentAddress.toLowerCase(),
+              recipientAgentAddress: recipientAgentAddress.toLowerCase(),
+              recipientKeyId: recipient.recipientKeyId,
+              epochId: state.epochId,
+              contextGraphId: state.contextGraphId,
+              subGraphName: state.subGraphName,
+              packageBytes,
+              messageId,
+              createdAtMs: Date.now(),
+            });
+            pendingSenderKeyQueued = true;
             this.log.warn(
               input.ctx,
               `SWM sender-key setup for ${recipientAgentAddress} keyId=${recipient.recipientKeyId} ` +
@@ -5987,17 +6346,79 @@ export class DKGAgent {
             );
             return { kind: 'success', agentAddress: recipientAgentAddress };
           }
-          const ack = decodeSwmSenderKeyPackageAck(sendResult.response);
+          let ack: ReturnType<typeof decodeSwmSenderKeyPackageAck>;
+          try {
+            ack = decodeSwmSenderKeyPackageAck(sendResult.response);
+          } catch {
+            this.enqueuePendingSenderKey({
+              senderAgentAddress: senderAgentAddress.toLowerCase(),
+              recipientAgentAddress: recipientAgentAddress.toLowerCase(),
+              recipientKeyId: recipient.recipientKeyId,
+              epochId: state.epochId,
+              contextGraphId: state.contextGraphId,
+              subGraphName: state.subGraphName,
+              packageBytes,
+              messageId: this.nextSwmSenderKeyPackageMessageId(packageBytes),
+              createdAtMs: Date.now(),
+            });
+            pendingSenderKeyQueued = true;
+            this.log.warn(
+              input.ctx,
+              `SWM sender-key setup for ${recipientAgentAddress} keyId=${recipient.recipientKeyId} ` +
+              'queued after malformed Sender Key setup ACK',
+            );
+            return { kind: 'success', agentAddress: recipientAgentAddress };
+          }
           if (
             ack.version !== SWM_SENDER_KEY_PACKAGE_VERSION ||
-            ack.type !== SWM_SENDER_KEY_PACKAGE_ACK_TYPE ||
-            !ack.accepted
+            ack.type !== SWM_SENDER_KEY_PACKAGE_ACK_TYPE
           ) {
+            this.enqueuePendingSenderKey({
+              senderAgentAddress: senderAgentAddress.toLowerCase(),
+              recipientAgentAddress: recipientAgentAddress.toLowerCase(),
+              recipientKeyId: recipient.recipientKeyId,
+              epochId: state.epochId,
+              contextGraphId: state.contextGraphId,
+              subGraphName: state.subGraphName,
+              packageBytes,
+              messageId: this.nextSwmSenderKeyPackageMessageId(packageBytes),
+              createdAtMs: Date.now(),
+            });
+            pendingSenderKeyQueued = true;
+            this.log.warn(
+              input.ctx,
+              `SWM sender-key setup for ${recipientAgentAddress} keyId=${recipient.recipientKeyId} ` +
+              `queued after incompatible Sender Key setup ACK version/type (${ack.version}/${ack.type})`,
+            );
+            return { kind: 'success', agentAddress: recipientAgentAddress };
+          }
+          if (!ack.accepted) {
+            const reason = ack.reason ?? 'unknown reason';
+            if (this.isRetryableSwmSenderKeySetupAckReason(ack.reasonCode)) {
+              this.enqueuePendingSenderKey({
+                senderAgentAddress: senderAgentAddress.toLowerCase(),
+                recipientAgentAddress: recipientAgentAddress.toLowerCase(),
+                recipientKeyId: recipient.recipientKeyId,
+                epochId: state.epochId,
+                contextGraphId: state.contextGraphId,
+                subGraphName: state.subGraphName,
+                packageBytes,
+                messageId: this.nextSwmSenderKeyPackageMessageId(packageBytes),
+                createdAtMs: Date.now(),
+              });
+              pendingSenderKeyQueued = true;
+              this.log.warn(
+                input.ctx,
+                `SWM sender-key setup for ${recipientAgentAddress} keyId=${recipient.recipientKeyId} ` +
+                `queued after retryable rejection (${ack.reasonCode ?? 'legacy-unknown'}): ${reason}`,
+              );
+              return { kind: 'success', agentAddress: recipientAgentAddress };
+            }
             return {
               kind: 'failure',
               agentAddress: recipientAgentAddress,
               keyId: recipient.recipientKeyId,
-              error: new Error(ack.reason ?? 'unknown reason'),
+              error: new Error(`${ack.reasonCode ? `${ack.reasonCode}: ` : ''}${reason}`),
             };
           }
           return { kind: 'success', agentAddress: recipientAgentAddress };
@@ -6053,12 +6474,51 @@ export class DKGAgent {
       }
     }
     if (fatalAgents.length > 0) {
+      if (pendingSenderKeyQueued) {
+        await this.saveSwmSenderKeyState();
+      }
       throw new Error(
         `SWM Sender Key setup rejected by ${fatalAgents.length} agent(s): ${fatalAgents.join(' | ')}`,
       );
     }
 
     return state;
+  }
+
+  private swmSenderKeySetupAckReasonCode(err: unknown): SwmSenderKeyPackageAckReasonCode {
+    if (err instanceof StaleSenderKeyTargetError) {
+      return 'stale-target';
+    }
+    if (err instanceof SwmSenderKeySetupRejectionError) {
+      return err.reasonCode;
+    }
+    return 'unknown';
+  }
+
+  private isRetryableSwmSenderKeySetupAckReason(
+    reasonCode: SwmSenderKeyPackageAckReasonCode | undefined,
+  ): boolean {
+    if (!reasonCode) return false;
+    return (SWM_SENDER_KEY_PACKAGE_ACK_RETRYABLE_REASON_CODES as readonly string[]).includes(reasonCode);
+  }
+
+  private swmSenderKeyPackageMessageId(packageBytes: Uint8Array): string {
+    return `swm-sender-key:${createHash('sha256').update(packageBytes).digest('hex')}`;
+  }
+
+  private nextSwmSenderKeyPackageMessageId(packageBytes: Uint8Array): string {
+    return `${this.swmSenderKeyPackageMessageId(packageBytes)}:${randomUUID()}`;
+  }
+
+  private swmSenderKeyPendingMessageId(entry: PendingSenderKeyEntry): string {
+    return entry.messageId ?? this.swmSenderKeyPackageMessageId(entry.packageBytes);
+  }
+
+  private rotateSwmSenderKeyPendingMessageId(entry: PendingSenderKeyEntry): PendingSenderKeyEntry {
+    return {
+      ...entry,
+      messageId: this.nextSwmSenderKeyPackageMessageId(entry.packageBytes),
+    };
   }
 
   /**
@@ -6090,6 +6550,145 @@ export class DKGAgent {
     this.pendingSenderKeyByAgent.set(recipientKey, filtered);
   }
 
+  private prunePendingSenderKeysForEpochRotation(input: {
+    contextGraphId: string;
+    subGraphName?: string;
+    senderAgentAddress: string;
+  }): number {
+    const senderAgentAddress = ethers.getAddress(input.senderAgentAddress).toLowerCase();
+    let removed = 0;
+    for (const [recipientKey, queue] of this.pendingSenderKeyByAgent.entries()) {
+      const kept = queue.filter((entry) => {
+        const matches =
+          entry.senderAgentAddress === senderAgentAddress &&
+          entry.contextGraphId === input.contextGraphId &&
+          (entry.subGraphName ?? undefined) === (input.subGraphName ?? undefined);
+        if (matches) removed += 1;
+        return !matches;
+      });
+      if (kept.length === 0) {
+        this.pendingSenderKeyByAgent.delete(recipientKey);
+      } else {
+        this.pendingSenderKeyByAgent.set(recipientKey, kept);
+      }
+    }
+    return removed;
+  }
+
+  private async drainPendingSenderKeyQueueForPeer(input: {
+    peerId: string;
+    recipientAgentAddress: string;
+    ctx?: OperationContext;
+  }): Promise<number> {
+    const recipientAgentAddress = input.recipientAgentAddress.toLowerCase();
+    const existingDrain = this.pendingSenderKeyDrainByAgent.get(recipientAgentAddress);
+    if (existingDrain) {
+      await existingDrain;
+      if (!this.pendingSenderKeyByAgent.has(recipientAgentAddress)) return 0;
+      return this.drainPendingSenderKeyQueueForPeer(input);
+    }
+    const drain = this.drainPendingSenderKeyQueueForPeerLocked({
+      peerId: input.peerId,
+      recipientAgentAddress,
+      ctx: input.ctx,
+    }).finally(() => {
+      if (this.pendingSenderKeyDrainByAgent.get(recipientAgentAddress) === drain) {
+        this.pendingSenderKeyDrainByAgent.delete(recipientAgentAddress);
+      }
+    });
+    this.pendingSenderKeyDrainByAgent.set(recipientAgentAddress, drain);
+    return drain;
+  }
+
+  private async drainPendingSenderKeyQueueForPeerLocked(input: {
+    peerId: string;
+    recipientAgentAddress: string;
+    ctx?: OperationContext;
+  }): Promise<number> {
+    const recipientAgentAddress = input.recipientAgentAddress;
+    const queue = this.pendingSenderKeyByAgent.get(recipientAgentAddress);
+    if (!queue || queue.length === 0) return 0;
+
+    let drained = 0;
+    const remaining: PendingSenderKeyEntry[] = [];
+    for (let i = 0; i < queue.length; i += 1) {
+      const entry = queue[i];
+      try {
+        const sendResult = await this.messenger.sendReliable(
+          input.peerId,
+          PROTOCOL_SWM_SENDER_KEY,
+          entry.packageBytes,
+          { messageId: this.swmSenderKeyPendingMessageId(entry) },
+        );
+        if (!sendResult.delivered) {
+          if (sendResult.queued || ('inFlight' in sendResult && sendResult.inFlight)) {
+            remaining.push(entry);
+            continue;
+          }
+          throw new Error(`Unexpected undelivered Sender Key retry result: ${sendResult.error}`);
+        }
+        let ack: ReturnType<typeof decodeSwmSenderKeyPackageAck>;
+        try {
+          ack = decodeSwmSenderKeyPackageAck(sendResult.response);
+        } catch {
+          // Malformed/legacy ACK: no positive acceptance yet. Keep the
+          // row queued so a mixed-version rollout cannot strand the recipient.
+          remaining.push(this.rotateSwmSenderKeyPendingMessageId(entry));
+          continue;
+        }
+        if (
+          ack.version !== SWM_SENDER_KEY_PACKAGE_VERSION ||
+          ack.type !== SWM_SENDER_KEY_PACKAGE_ACK_TYPE
+        ) {
+          // Malformed/legacy ACK: no positive acceptance yet. Keep the
+          // row queued so a mixed-version rollout cannot strand the recipient.
+          remaining.push(this.rotateSwmSenderKeyPendingMessageId(entry));
+          continue;
+        }
+        if (ack.accepted) {
+          drained += 1;
+        } else if (this.isRetryableSwmSenderKeySetupAckReason(ack.reasonCode)) {
+          remaining.push(this.rotateSwmSenderKeyPendingMessageId(entry));
+        } else {
+          const reason = ack.reason ?? 'unknown reason';
+          const reasonCode = ack.reasonCode ?? 'legacy-unknown';
+          this.log.warn(
+            input.ctx ?? SWM_SENDER_KEY_PENDING_DRAIN_LOG_CTX,
+            `SWM sender-key pending retry for ${entry.recipientAgentAddress} keyId=${entry.recipientKeyId} ` +
+            `peerId=${input.peerId} contextGraph=${entry.contextGraphId}${entry.subGraphName ? `/${entry.subGraphName}` : ''} ` +
+            `dropped after terminal rejection (${reasonCode}): ${reason}`,
+          );
+          // Terminal rejection: keep it out of the queue, but do not
+          // report it as a successful drain.
+        }
+      } catch (err) {
+        remaining.push(...queue.slice(i));
+        if (remaining.length === 0) {
+          this.pendingSenderKeyByAgent.delete(recipientAgentAddress);
+        } else {
+          this.pendingSenderKeyByAgent.set(recipientAgentAddress, remaining);
+        }
+        await this.saveSwmSenderKeyState();
+        const message = err instanceof Error ? err.message : String(err);
+        this.log.warn(
+          input.ctx ?? SWM_SENDER_KEY_PENDING_DRAIN_LOG_CTX,
+          `SWM sender-key pending retry for ${entry.recipientAgentAddress} keyId=${entry.recipientKeyId} ` +
+          `peerId=${input.peerId} contextGraph=${entry.contextGraphId}${entry.subGraphName ? `/${entry.subGraphName}` : ''} ` +
+          `failed before the Messenger substrate queued a retry: ${message}`,
+        );
+        throw err;
+      }
+    }
+
+    if (remaining.length === 0) {
+      this.pendingSenderKeyByAgent.delete(recipientAgentAddress);
+    } else {
+      this.pendingSenderKeyByAgent.set(recipientAgentAddress, remaining);
+    }
+    await this.saveSwmSenderKeyState();
+    return drained;
+  }
+
   /**
    * Drain queued sender-key packages whose recipient agent is one of
    * the agent addresses advertised by `peerId`. Returns the number of
@@ -6098,12 +6697,13 @@ export class DKGAgent {
    * Fired from the `connection:open` listener — see line 2382 — so the
    * cost lives on the cold path of "we just connected to a new peer",
    * not on every share. Each successful `sendReliable` with
-   * `delivered=true && ack.accepted=true` deletes the row; soft
-   * (`delivered=false`) leaves it queued for the next attempt; hard
-   * negative acks also delete it (the package is permanently invalid
-   * for this recipient).
+   * `delivered=true && ack.accepted=true` deletes the row and counts as
+   * drained; soft (`delivered=false`) and explicitly retryable delivered
+   * rejections leave it queued for the next attempt; terminal delivered
+   * rejections are logged and deleted without counting as drained.
    */
-  private async drainPendingSenderKeyForPeer(peerId: string): Promise<number> {
+  private async drainPendingSenderKeyForPeer(peerId: string, ctx?: OperationContext): Promise<number> {
+    await this.loadSwmSenderKeyState();
     if (this.pendingSenderKeyByAgent.size === 0) return 0;
     let drained = 0;
     let agentAddresses: string[] = [];
@@ -6119,38 +6719,40 @@ export class DKGAgent {
     if (agentAddresses.length === 0) return 0;
 
     for (const recipientAgentAddress of agentAddresses) {
-      const queue = this.pendingSenderKeyByAgent.get(recipientAgentAddress);
-      if (!queue || queue.length === 0) continue;
-      const remaining: PendingSenderKeyEntry[] = [];
-      for (const entry of queue) {
-        try {
-          const sendResult = await this.messenger.sendReliable(
-            peerId,
-            PROTOCOL_SWM_SENDER_KEY,
-            entry.packageBytes,
-          );
-          if (!sendResult.delivered) {
-            // Messenger queued for retry — keep our row so the next
-            // connection:open / publish has another shot.
-            remaining.push(entry);
-            continue;
-          }
-          // Both accepted=true and accepted=false are terminal: the
-          // recipient saw the package. Don't retry — the messenger's
-          // idempotency key would block re-delivery anyway.
-          drained += 1;
-        } catch {
-          // Wire error: keep the row queued. Next connection:open
-          // attempt has its own try/catch wrapper so this never
-          // propagates out of the listener.
-          remaining.push(entry);
-        }
+      drained += await this.drainPendingSenderKeyQueueForPeer({ peerId, recipientAgentAddress, ctx });
+    }
+    return drained;
+  }
+
+  /**
+   * Retry queued sender-key setup for recipients that are reachable in the
+   * current workspace recipient snapshot. This covers already-established
+   * connections where no fresh connection:open event will fire after the
+   * remote membership/key view converges.
+   */
+  private async drainPendingSenderKeyForRecipients(
+    recipients: readonly WorkspaceAgentRecipient[],
+    ctx?: OperationContext,
+  ): Promise<number> {
+    if (this.pendingSenderKeyByAgent.size === 0) return 0;
+
+    const peerByAgent = new Map<string, string>();
+    for (const recipient of recipients) {
+      if (!recipient.peerId) continue;
+      const recipientAgentAddress = recipient.agentAddress.toLowerCase();
+      if (!this.pendingSenderKeyByAgent.has(recipientAgentAddress)) continue;
+      if (!peerByAgent.has(recipientAgentAddress)) {
+        peerByAgent.set(recipientAgentAddress, recipient.peerId);
       }
-      if (remaining.length === 0) {
-        this.pendingSenderKeyByAgent.delete(recipientAgentAddress);
-      } else {
-        this.pendingSenderKeyByAgent.set(recipientAgentAddress, remaining);
-      }
+    }
+    if (peerByAgent.size === 0) return 0;
+
+    let drained = 0;
+    for (const [recipientAgentAddress, peerId] of peerByAgent.entries()) {
+      drained += await this.drainPendingSenderKeyQueueForPeer({ peerId, recipientAgentAddress, ctx });
+    }
+    if (drained > 0 && ctx) {
+      this.log.info(ctx, `SWM sender-key pending retry drained ${drained} queued package(s) during publish`);
     }
     return drained;
   }
@@ -6317,6 +6919,7 @@ export class DKGAgent {
         type: SWM_SENDER_KEY_PACKAGE_ACK_TYPE,
         accepted: false,
         reason,
+        reasonCode: this.swmSenderKeySetupAckReasonCode(err),
         contextGraphId: pkg?.contextGraphId,
         subGraphName: pkg?.subGraphName,
         senderAgentAddress: pkg?.senderAgentAddress,
@@ -6339,22 +6942,37 @@ export class DKGAgent {
       ethers.hexlify(pkg.signature),
     );
     if (recovered.toLowerCase() !== senderAgentAddress.toLowerCase()) {
-      throw new Error(`Sender Key setup signature recovered ${recovered}, expected ${senderAgentAddress}`);
+      throw new SwmSenderKeySetupRejectionError(
+        'bad-signature',
+        `Sender Key setup signature recovered ${recovered}, expected ${senderAgentAddress}`,
+      );
     }
 
     const agentGateAddresses = await this.getContextGraphAgentGateAddresses(pkg.contextGraphId);
     if (!agentGateAddresses) {
-      throw new Error(`Context graph "${pkg.contextGraphId}" is not DKG-agent gated`);
+      throw new SwmSenderKeySetupRejectionError(
+        'not-agent-gated',
+        `Context graph "${pkg.contextGraphId}" is not DKG-agent gated`,
+      );
     }
     const agentGateSet = new Set(agentGateAddresses.map((agent) => agent.toLowerCase()));
     if (!agentGateSet.has(senderAgentAddress.toLowerCase())) {
-      throw new Error(`Sender agent ${senderAgentAddress} is not allowed for context graph "${pkg.contextGraphId}"`);
+      throw new SwmSenderKeySetupRejectionError(
+        'sender-not-allowed',
+        `Sender agent ${senderAgentAddress} is not allowed for context graph "${pkg.contextGraphId}"`,
+      );
     }
     if (!agentGateSet.has(recipientAgentAddress.toLowerCase())) {
-      throw new Error(`Recipient agent ${recipientAgentAddress} is not allowed for context graph "${pkg.contextGraphId}"`);
+      throw new SwmSenderKeySetupRejectionError(
+        'recipient-not-allowed',
+        `Recipient agent ${recipientAgentAddress} is not allowed for context graph "${pkg.contextGraphId}"`,
+      );
     }
     if (!this.hasLocalAgent(recipientAgentAddress)) {
-      throw new Error(`Recipient agent ${recipientAgentAddress} is not local to this node`);
+      throw new SwmSenderKeySetupRejectionError(
+        'recipient-not-local',
+        `Recipient agent ${recipientAgentAddress} is not local to this node`,
+      );
     }
 
     // `activeOnly: true` is the security gate added in Codex review of
@@ -6397,13 +7015,17 @@ export class DKGAgent {
         (entry) => entry.encryptionKeyId === pkg.recipientKeyId && !entry.revokedAt,
       );
       if (activeEntry) {
-        throw new Error(`No local X25519 private key for DKG agent ${recipientAgentAddress} key ${pkg.recipientKeyId}`);
+        throw new SwmSenderKeySetupRejectionError(
+          'active-private-key-missing',
+          `No local X25519 private key for DKG agent ${recipientAgentAddress} key ${pkg.recipientKeyId}`,
+        );
       }
       const revokedEntry = record?.workspaceEncryptionKeys.find(
         (entry) => entry.encryptionKeyId === pkg.recipientKeyId && entry.revokedAt,
       );
       if (revokedEntry) {
-        throw new Error(
+        throw new SwmSenderKeySetupRejectionError(
+          'revoked-key',
           `Recipient key ${pkg.recipientKeyId} for DKG agent ${recipientAgentAddress} ` +
           `was revoked at ${revokedEntry.revokedAt}; refusing to bootstrap a new sender-key ` +
           'epoch against a retired key. The sender must resolve the agent profile and retry ' +
@@ -6609,6 +7231,7 @@ export class DKGAgent {
       const parsed = JSON.parse(raw) as {
         send?: Array<Record<string, unknown>>;
         receive?: Array<Record<string, unknown>>;
+        pending?: Array<Record<string, unknown>>;
       };
       for (const entry of parsed.send ?? []) {
         const state = deserializeSwmSenderSendState(entry);
@@ -6624,10 +7247,41 @@ export class DKGAgent {
           state,
         );
       }
+      const pendingByAgent = new Map<string, PendingSenderKeyEntry[]>();
+      let skippedPendingRows = 0;
+      for (const entry of parsed.pending ?? []) {
+        let pending: PendingSenderKeyEntry;
+        try {
+          pending = deserializePendingSenderKeyEntry(entry);
+        } catch (err) {
+          skippedPendingRows += 1;
+          const raw = entry && typeof entry === 'object' ? entry as Record<string, unknown> : {};
+          const sender = typeof raw.senderAgentAddress === 'string' ? raw.senderAgentAddress : 'unknown-sender';
+          const recipient = typeof raw.recipientAgentAddress === 'string' ? raw.recipientAgentAddress : 'unknown-recipient';
+          const contextGraph = typeof raw.contextGraphId === 'string' ? raw.contextGraphId : 'unknown-context-graph';
+          const subGraph = typeof raw.subGraphName === 'string' ? `/${raw.subGraphName}` : '';
+          this.log.warn(
+            createOperationContext('share'),
+            `Skipped malformed SWM sender-key pending row #${skippedPendingRows} ` +
+            `(sender=${sender}, recipient=${recipient}, contextGraph=${contextGraph}${subGraph}): ` +
+            `${err instanceof Error ? err.message : String(err)}`,
+          );
+          continue;
+        }
+        const recipientKey = pending.recipientAgentAddress.toLowerCase();
+        const queue = pendingByAgent.get(recipientKey) ?? [];
+        queue.push(pending);
+        pendingByAgent.set(recipientKey, queue);
+      }
+      this.pendingSenderKeyByAgent.clear();
+      for (const [recipientKey, queue] of pendingByAgent.entries()) {
+        this.pendingSenderKeyByAgent.set(recipientKey, queue);
+      }
     } catch {
       // No durable state yet, or a corrupt file that should not unblock startup.
       this.swmSenderKeySendStates.clear();
       this.swmSenderKeyReceiveStates.clear();
+      this.pendingSenderKeyByAgent.clear();
     }
   }
 
@@ -6641,6 +7295,8 @@ export class DKGAgent {
       version: 1,
       send: [...this.swmSenderKeySendStates.values()].map(serializeSwmSenderSendState),
       receive: [...this.swmSenderKeyReceiveStates.values()].map(serializeSwmSenderReceiveState),
+      pending: [...this.pendingSenderKeyByAgent.values()]
+        .flatMap((queue) => queue.map(serializePendingSenderKeyEntry)),
     };
     await writeFile(path, JSON.stringify(payload, null, 2), { mode: 0o600 });
     try {
@@ -8474,6 +9130,19 @@ export class DKGAgent {
         `${logPrefix}: bootstrapping/rotating swm-sender-key epoch for curated CG ${contextGraphId} ` +
         `(sender=${senderAddress}, recipients=${resolution.recipients.length}, reason=${reason})`,
       );
+      const pruned = this.prunePendingSenderKeysForEpochRotation({
+        contextGraphId,
+        subGraphName,
+        senderAgentAddress: senderAddress,
+      });
+      if (pruned > 0) {
+        this.log.warn(
+          ctx,
+          `${logPrefix}: pruned ${pruned} stale pending SWM sender-key setup package(s) ` +
+          `for curated CG ${contextGraphId}${subGraphName ? `/${subGraphName}` : ''} sender ${senderAddress}`,
+        );
+        await this.saveSwmSenderKeyState();
+      }
       state = await this.createAndDistributeSwmSenderKeyEpoch({
         contextGraphId,
         subGraphName,
@@ -8484,6 +9153,8 @@ export class DKGAgent {
       });
       this.swmSenderKeySendStates.set(stateKey, state);
       await this.saveSwmSenderKeyState();
+    } else {
+      await this.drainPendingSenderKeyForRecipients(resolution.recipients, ctx);
     }
 
     return {
@@ -9138,6 +9809,32 @@ export class DKGAgent {
   }
 
   /**
+   * Provision the node's on-chain profile (createProfile + stake) exactly once
+   * at a time. `ensureProfile()` is a mutating multi-tx flow that can outlast
+   * the boot read-timeout, so this guards against the boot path AND the
+   * StorageACK retry both calling it while a prior submission may still be
+   * settling — which could create a duplicate profile / double-stake (Codex
+   * PR #901 round-3 :1685). It is NOT raced against a timeout: the staking tx
+   * must run to completion. While a provisioning is in flight, concurrent
+   * callers re-read the (possibly now-created) identity via `getIdentityId()`
+   * instead of submitting a second `ensureProfile()`.
+   */
+  private async provisionProfileGuarded(ctx: OperationContext): Promise<bigint> {
+    if (this.profileProvisioningInFlight) {
+      // A provisioning is already running (boot or a prior retry). Don't submit
+      // a second createProfile+stake — just read whatever identity exists now.
+      this.log.info(ctx, 'Profile provisioning already in flight — re-reading identity instead of re-submitting');
+      return this.chain.getIdentityId();
+    }
+    this.profileProvisioningInFlight = true;
+    try {
+      return await this.chain.ensureProfile({ nodeName: this.config.name });
+    } finally {
+      this.profileProvisioningInFlight = false;
+    }
+  }
+
+  /**
    * (Re-)attempt on-chain identity registration. Safe to call multiple times.
    * Returns the identityId (>0n on success, 0n if chain is not configured).
    */
@@ -9686,14 +10383,29 @@ export class DKGAgent {
     });
   }
 
-  subscribeToContextGraph(contextGraphId: string, options?: { trackSyncScope?: boolean; persist?: boolean }): void {
+  subscribeToContextGraph(contextGraphId: string, options?: { trackSyncScope?: boolean; persist?: boolean; deferSharedMemoryGossipSubscribe?: boolean }): void {
     if (options?.trackSyncScope !== false) {
       this.trackSyncContextGraph(contextGraphId);
     }
 
+    // SWM gossip subscribe runs `canReadContextGraph` against the local
+    // `_meta` graph. On a fresh `join-approved` notification the curator
+    // has just written the allowlist into ITS _meta, but the requesting
+    // node hasn't synced that allowlist yet — so the very first SWM
+    // gossip subscribe attempt fails with `local node is not authorized`,
+    // emitting a misleading WARN. The real fix is to land the allowlist
+    // first via `runImmediatePostApprovalSync`; once `_meta` syncs,
+    // `refreshMetaSyncedFlags` re-queues the SWM gossip subscribe (line
+    // 3738) and it succeeds silently. This option lets the join-approved
+    // path opt out of the immediate SWM subscribe and rely on that
+    // self-heal — see urn:dkg:finding:swm-gap-1-initial-sync-race.
+    const deferSwmGossip = options?.deferSharedMemoryGossipSubscribe === true;
+
     // Idempotent: skip if gossip handlers already installed for this context graph.
     if (this.gossipRegistered.has(contextGraphId)) {
-      this.queueSharedMemoryGossipSubscription(contextGraphId);
+      if (!deferSwmGossip) {
+        this.queueSharedMemoryGossipSubscription(contextGraphId);
+      }
       const existing = this.subscribedContextGraphs.get(contextGraphId);
       if (!existing?.subscribed) {
         this.setContextGraphSubscription(
@@ -9724,7 +10436,9 @@ export class DKGAgent {
       await gph.handlePublishMessage(data, contextGraphId, undefined, from);
     });
 
-    this.queueSharedMemoryGossipSubscription(contextGraphId);
+    if (!deferSwmGossip) {
+      this.queueSharedMemoryGossipSubscription(contextGraphId);
+    }
 
     const updateTopic = contextGraphUpdateTopic(contextGraphId);
     this.gossip.subscribe(updateTopic);
@@ -13957,7 +14671,13 @@ export class DKGAgent {
       });
     }
 
-    // Skip if already in the allowlist (idempotent)
+    // Skip if already in the allowlist (idempotent).
+    //
+    // Codex review on #873 — the `warnIfAllowlistWriteOnPublicCg`
+    // call must come AFTER this early-return. Pre-fix, the warning
+    // ran first and logged "writing allowlist quad" even on
+    // re-invites that didn't insert anything, so operators got
+    // misleading audit trails for no-op calls.
     if (existingAllowlist?.includes(peerId)) {
       this.upsertContextGraphMember({
         contextGraphId,
@@ -13979,6 +14699,23 @@ export class DKGAgent {
     });
 
     await this.store.insert(quadsToInsert);
+
+    // Issue #865 — log a clear warning AFTER the allowlist quad has
+    // landed on a CG with an explicit `accessPolicy="public"` triple.
+    // The allowlist write is allowed (legitimate uses include
+    // populating an authorized-publisher set on a public-but-curated-
+    // publish CG), but post-#865 the publisher's
+    // `isPrivateContextGraph` no longer silently flips the CG to
+    // curated just because an allowlist was written — so the
+    // operator should know the allowlist is informational for read
+    // access on this CG.
+    //
+    // Codex review round 5 on #873 (line 17485) — call site is
+    // post-insert so the breadcrumb only fires for writes that
+    // actually hit the store. A failing `store.insert` throws to the
+    // caller before we reach this point, so the warn is a faithful
+    // record of persisted state.
+    await this.warnIfAllowlistWriteOnPublicCg(contextGraphId, ctx, 'inviteToContextGraph (peer)');
 
     if (existingAllowlist === null || existingAllowlist.length === 0) {
       this.upsertContextGraphMember({
@@ -14036,11 +14773,36 @@ export class DKGAgent {
     }
     this.assertCallerIsOwner(owner, callerAgentAddress, 'manage invitations');
 
+    const existingParticipants = await this.getPrivateContextGraphParticipants(contextGraphId);
+    const alreadyAllowed = existingParticipants?.some(
+      (a) => a.toLowerCase() === agentAddress.toLowerCase(),
+    ) ?? false;
+
+    // Codex review on #873 (line 14061) — idempotency early-return.
+    // Mirrors the peer-path branch at ~line 13967. A no-op re-invite
+    // of an agent that's already in the allowlist with no fresh
+    // delegation must not insert duplicate quads OR emit the
+    // public-CG warn — pre-fix, the warn ran on every call regardless
+    // of whether the store was about to mutate, which misled
+    // operators auditing the warn stream (empirically reproduced by
+    // @branarakic on the patched daemon at `704b49cf`).
+    if (alreadyAllowed && !delegation) {
+      this.upsertContextGraphMember({
+        contextGraphId,
+        principalType: 'agent',
+        principalId: agentAddress,
+        role: 'participant',
+        status: 'active',
+        source: 'allowed-agent',
+      });
+      this.log.info(ctx, `Agent ${agentAddress} already in allowlist for "${contextGraphId}" — skipping`);
+      return;
+    }
+
     const cgMetaGraph = contextGraphMetaGraphUri(contextGraphId);
     const contextGraphUri = contextGraphDataGraphUri(contextGraphId);
     const quadsToInsert: Quad[] = [];
 
-    const existingParticipants = await this.getPrivateContextGraphParticipants(contextGraphId);
     if ((!existingParticipants || existingParticipants.length === 0) && this.defaultAgentAddress) {
       quadsToInsert.push({
         subject: contextGraphUri,
@@ -14058,12 +14820,18 @@ export class DKGAgent {
       });
     }
 
-    quadsToInsert.push({
-      subject: contextGraphUri,
-      predicate: DKG_ONTOLOGY.DKG_ALLOWED_AGENT,
-      object: `"${agentAddress}"`,
-      graph: cgMetaGraph,
-    });
+    // Codex review on #873 — only push the bare allowlist quad when
+    // the list is actually growing. Re-approving an existing agent
+    // with a fresh delegation overwrites the delegation node (below)
+    // but must not re-insert the DKG_ALLOWED_AGENT triple.
+    if (!alreadyAllowed) {
+      quadsToInsert.push({
+        subject: contextGraphUri,
+        predicate: DKG_ONTOLOGY.DKG_ALLOWED_AGENT,
+        object: `"${agentAddress}"`,
+        graph: cgMetaGraph,
+      });
+    }
 
     // If the agent gave us a signed delegation (via the join-request
     // path), promote its delegatee identifiers into the CG's allowlist
@@ -14093,6 +14861,24 @@ export class DKGAgent {
     }
 
     await this.store.insert(quadsToInsert);
+
+    // Issue #865 — companion warning to the peer-invite path above.
+    // Allowlist writes on explicit-public CGs are allowed (the
+    // publishPolicy=curated + accessPolicy=public combination is a
+    // valid CG mode where the allowlist gates publishers, not
+    // subscribers), but the operator should know that the read-side
+    // gate stays open per the explicit `accessPolicy="public"`.
+    //
+    // Codex review round 4/5 on #873 — fires AFTER `store.insert`
+    // succeeds so the breadcrumb is a faithful record of persisted
+    // state (a failing insert throws before this point). Gated on
+    // `!alreadyAllowed` because re-approves that only refresh a
+    // delegation don't grow the allowlist, so they don't warrant
+    // the public-CG breadcrumb.
+    if (!alreadyAllowed) {
+      await this.warnIfAllowlistWriteOnPublicCg(contextGraphId, ctx, 'inviteAgentToContextGraph');
+    }
+
     this.upsertContextGraphMember({
       contextGraphId,
       principalType: 'agent',
@@ -15316,6 +16102,296 @@ export class DKGAgent {
     if (result.type !== 'bindings' || result.bindings.length === 0) return null;
     const value = result.bindings[0]?.['id'];
     return typeof value === 'string' ? value.replace(/^"|"$/g, '') : null;
+  }
+
+  /**
+   * Issue #872 — best-effort read of the on-chain
+   * `(accessPolicy, publishPolicy)` enum pair for a CG. Sources, in
+   * order:
+   *
+   *   1. {@link onChainAccessPolicyCache} / {@link onChainPublishPolicyCache} —
+   *      populated eagerly by the `ContextGraphCreated` chain-event
+   *      handler. The keys are the on-chain numeric ids; if the caller
+   *      passed a cleartext local id, we re-key via
+   *      {@link subscribedContextGraphs} or {@link getContextGraphOnChainId}.
+   *
+   *   2. Local `_meta` / ontology triple store for `accessPolicy`
+   *      only. The CG creator also persists `dkg:publishPolicy` in
+   *      `_meta` at create time, but that triple is not updated by
+   *      `updatePublishPolicy`, so it is never used as an
+   *      authorization-positive publish-policy answer here.
+   *
+   *   3. Direct chain RPC (Codex round-3 fix): for registered CGs
+   *      where the cache leaves `publishPolicy` undefined/stale, or
+   *      where steps 1 and 2 still leave `accessPolicy` undefined,
+   *      query the contract directly via
+   *      `chain.getContextGraphAccessPolicy` /
+   *      `chain.getContextGraphPublishPolicy`. The result populates
+   *      the in-memory cache so subsequent calls don't re-query.
+   *
+   * Steps 2 and 3 are GATED on {@link isContextGraphRegistered}
+   * (Codex round-2 fix): unregistered locally-created CGs reflect
+   * create-time *intent* via local triples, not an on-chain
+   * commitment, and the chain itself has no record. Treating local
+   * source as authoritative pre-registration would bypass the
+   * owner-guard on a CG the curator hasn't actually committed to.
+   *
+   * Returns `{}` (both fields `undefined`) when neither source has an
+   * answer. Callers MUST treat `undefined` fields as unknown — fail
+   * closed for policy-gated decisions rather than assuming a
+   * permissive default. Failures in the chain RPC fallback (RPC
+   * unavailable, contract not deployed, transient errors) are logged
+   * and the field is left undefined.
+   */
+  async getContextGraphOnChainPolicy(contextGraphId: string): Promise<{
+    accessPolicy?: number;
+    publishPolicy?: number;
+  }> {
+    let accessPolicy = this.onChainAccessPolicyCache.get(contextGraphId);
+    // Codex review on #872 — `publishPolicy` is mutable on-chain
+    // (`PublishPolicyUpdated`) but the cache is only seeded by
+    // `ContextGraphCreated`. Treat entries older than
+    // `ON_CHAIN_PUBLISH_POLICY_CACHE_TTL_MS` as stale so the chain-RPC
+    // fallback below re-verifies before the caller relaxes the
+    // import-artifact owner guard. The accessPolicy cache is left
+    // untouched here: it's also used by SWM gossip authorization paths
+    // (lines ~1779, ~8403, ~10073) where stale-permissive cannot
+    // escalate privilege (gossip decrypt is gated by sender-key
+    // issuance) and stale-restrictive only causes a transient deny.
+    const isPublishPolicyCacheFresh = (key: string): boolean => {
+      const fetchedAt = this.onChainPublishPolicyCacheUpdatedAt.get(key);
+      if (fetchedAt === undefined) return false;
+      return Date.now() - fetchedAt <= ON_CHAIN_PUBLISH_POLICY_CACHE_TTL_MS;
+    };
+    let publishPolicy = isPublishPolicyCacheFresh(contextGraphId)
+      ? this.onChainPublishPolicyCache.get(contextGraphId)
+      : undefined;
+    // Track the resolved numeric on-chain id so we can both look it
+    // up in the cache (round-2) and use it as the chain-RPC fallback
+    // key (round-3). Lazily resolved — creators may pass the
+    // numeric id directly in which case no extra SPARQL is needed.
+    let onChainId: string | undefined;
+
+    if (accessPolicy === undefined || publishPolicy === undefined) {
+      onChainId = this.subscribedContextGraphs.get(contextGraphId)?.onChainId
+        ?? (await this.getContextGraphOnChainId(contextGraphId).catch(() => null))
+        ?? undefined;
+      if (onChainId && onChainId !== contextGraphId) {
+        if (accessPolicy === undefined) accessPolicy = this.onChainAccessPolicyCache.get(onChainId);
+        if (publishPolicy === undefined && isPublishPolicyCacheFresh(onChainId)) {
+          publishPolicy = this.onChainPublishPolicyCache.get(onChainId);
+        }
+      }
+    }
+
+    // Codex review (round 2, finding B): the local access-policy
+    // fallback below reads triples that `createContextGraph` writes
+    // synchronously — BEFORE
+    // `registerContextGraph` confirms the CG on-chain. For a CG
+    // that's still in the local-only `unregistered` state, those
+    // triples reflect the creator's *intent*, not an on-chain
+    // commitment. Treating them as authoritative would let the read
+    // relaxation kick in for a CG the curator hasn't actually
+    // committed to making public, bypassing the owner guard.
+    //
+    // Codex review (round 6, line 15487 — 2026-06-01): the prior gate
+    // only consulted `dkg:registrationStatus = "registered"`, which
+    // `registerContextGraph` writes ON THE CREATOR'S NODE only. Non-
+    // creator peers bootstrap CG metadata via `ensureContextGraphLocally`
+    // with status="unregistered" and never flip it. After a daemon
+    // restart the chain-event cache loses its in-memory entries, the
+    // status check still returns false, this gate fails closed, and
+    // cross-agent reads on legitimately public+open CGs regress to
+    // 403 for non-creators.
+    //
+    // Accept any of these as proof of an on-chain commitment:
+    //   - `dkg:registrationStatus = "registered"` (creator path), OR
+    //   - a non-zero numeric `onChainId` already resolved from
+    //     subscribed state or local meta (replicator path — the
+    //     on-chain id is only ever known if the chain assigned it).
+    //
+    // An unregistered locally-created CG has neither, so the gate
+    // still fails closed for it.
+    if (accessPolicy === undefined || publishPolicy === undefined) {
+      const registeredViaStatus = await this.isContextGraphRegistered(contextGraphId).catch(() => false);
+      let registeredViaOnChainId = false;
+      if (!registeredViaStatus) {
+        if (onChainId === undefined) {
+          onChainId = this.subscribedContextGraphs.get(contextGraphId)?.onChainId
+            ?? (await this.getContextGraphOnChainId(contextGraphId).catch(() => null))
+            ?? undefined;
+        }
+        if (onChainId) {
+          try {
+            registeredViaOnChainId = BigInt(onChainId) > 0n;
+          } catch {
+            registeredViaOnChainId = false;
+          }
+        }
+      }
+      if (!registeredViaStatus && !registeredViaOnChainId) {
+        return {
+          ...(accessPolicy === 0 || accessPolicy === 1 ? { accessPolicy } : {}),
+          ...(publishPolicy === 0 || publishPolicy === 1 ? { publishPolicy } : {}),
+        };
+      }
+    }
+
+    if (accessPolicy === undefined) {
+      const stored = await this.readLocalAccessPolicyEnum(contextGraphId).catch(() => undefined);
+      if (stored !== undefined) accessPolicy = stored;
+    }
+
+    // Codex review (round 3): non-creator peers never receive the
+    // `dkg:publishPolicy` triple — it's only written to local
+    // `_meta` on the creator's node. They observe the chain event
+    // at subscribe time which populates the in-memory caches above,
+    // but those caches are lost on daemon restart. Without a
+    // durable replicated source, `publishPolicy` permanently
+    // disappears for non-creator peers once the chain poller's
+    // replay window rolls past the create block — which makes
+    // `isPublicOpenContextGraph()` return false and cross-agent
+    // `/import-artifact/*` reads regress to 403 on legitimately
+    // public + open CGs.
+    //
+    // Fall back to a direct chain RPC for the missing fields. The
+    // fallback is gated on `registered === true` above so an
+    // unregistered local-only CG cannot poison the answer; the
+    // chain itself is the authoritative source. Failures (RPC
+    // unavailable, contract not deployed, transient errors) leave
+    // the field undefined and the daemon route falls back to the
+    // strict guard — fail-closed.
+    if (
+      (accessPolicy === undefined || publishPolicy === undefined)
+      && this.chain
+    ) {
+      if (onChainId === undefined) {
+        onChainId = this.subscribedContextGraphs.get(contextGraphId)?.onChainId
+          ?? (await this.getContextGraphOnChainId(contextGraphId).catch(() => null))
+          ?? undefined;
+      }
+      let numericId: bigint | undefined;
+      if (onChainId) {
+        try {
+          const parsed = BigInt(onChainId);
+          if (parsed > 0n) numericId = parsed;
+        } catch {
+          numericId = undefined;
+        }
+      }
+      if (numericId !== undefined) {
+        const rpcCtx = createOperationContext('resolve');
+        // Round-4 fix: bound each chain-RPC call so an unreachable
+        // RPC stack (every endpoint returning 429 / hanging on
+        // connect) cannot block the caller past the daemon-ready
+        // budget. The fallback is an optimisation — failing fast
+        // and returning undefined is correct (fail-closed via the
+        // strict guard at the route layer). 2.5s is tight enough
+        // to stay well under the 45s daemon-ready budget even when
+        // both fallbacks fire back-to-back, while still allowing a
+        // single slow eth_call hop to succeed under normal load.
+        const CHAIN_RPC_FALLBACK_TIMEOUT_MS = 2_500;
+        const withTimeout = <T,>(p: Promise<T>, label: string): Promise<T | typeof TIMEOUT_SENTINEL> => {
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          const timeout = new Promise<typeof TIMEOUT_SENTINEL>((resolve) => {
+            timer = setTimeout(() => {
+              this.log.warn(
+                rpcCtx,
+                `getContextGraphOnChainPolicy: chain.${label}(${onChainId}) timed out after ${CHAIN_RPC_FALLBACK_TIMEOUT_MS}ms — treating as UNKNOWN (fail-closed)`,
+              );
+              resolve(TIMEOUT_SENTINEL);
+            }, CHAIN_RPC_FALLBACK_TIMEOUT_MS);
+            // Allow node to exit even if the chain promise never
+            // settles (test scenario: dead RPC + fake daemon).
+            timer.unref?.();
+          });
+          return Promise.race([
+            p.finally(() => { if (timer) clearTimeout(timer); }),
+            timeout,
+          ]);
+        };
+        if (publishPolicy === undefined) {
+          const getPublishPolicy = this.chain.getContextGraphPublishPolicy;
+          if (typeof getPublishPolicy === 'function') {
+            try {
+              const result = await withTimeout(
+                getPublishPolicy.call(this.chain, numericId),
+                'getContextGraphPublishPolicy',
+              );
+              if (result !== TIMEOUT_SENTINEL) {
+                const pp = result?.publishPolicy;
+                if (pp === 0 || pp === 1) {
+                  publishPolicy = pp;
+                  this.onChainPublishPolicyCache.set(onChainId!, pp);
+                  this.onChainPublishPolicyCacheUpdatedAt.set(onChainId!, Date.now());
+                }
+              }
+            } catch (err) {
+              this.log.warn(
+                rpcCtx,
+                `getContextGraphOnChainPolicy: chain.getContextGraphPublishPolicy(${onChainId}) failed — treating as UNKNOWN (fail-closed): ${err instanceof Error ? err.message : String(err)}`,
+              );
+            }
+          }
+        }
+        if (accessPolicy === undefined) {
+          const getAccessPolicy = this.chain.getContextGraphAccessPolicy;
+          if (typeof getAccessPolicy === 'function') {
+            try {
+              const ap = await withTimeout(
+                getAccessPolicy.call(this.chain, numericId),
+                'getContextGraphAccessPolicy',
+              );
+              if (ap !== TIMEOUT_SENTINEL && (ap === 0 || ap === 1)) {
+                accessPolicy = ap;
+                this.onChainAccessPolicyCache.set(onChainId!, ap);
+              }
+            } catch (err) {
+              this.log.warn(
+                rpcCtx,
+                `getContextGraphOnChainPolicy: chain.getContextGraphAccessPolicy(${onChainId}) failed — treating as UNKNOWN (fail-closed): ${err instanceof Error ? err.message : String(err)}`,
+              );
+            }
+          }
+        }
+      }
+    }
+
+    return {
+      ...(accessPolicy === 0 || accessPolicy === 1 ? { accessPolicy } : {}),
+      ...(publishPolicy === 0 || publishPolicy === 1 ? { publishPolicy } : {}),
+    };
+  }
+
+  /**
+   * Issue #872 — read the persisted `dkg:accessPolicy` literal from
+   * the ontology graph (open CGs) or `_meta` (curated CGs) and map it
+   * back to the on-chain enum (`"public"` → `0`, `"private"` → `1`).
+   * Returns `undefined` when no triple is present locally. Used by
+   * {@link getContextGraphOnChainPolicy} as a fallback after the
+   * chain-event cache miss.
+   */
+  private async readLocalAccessPolicyEnum(contextGraphId: string): Promise<number | undefined> {
+    if ((Object.values(SYSTEM_CONTEXT_GRAPHS) as string[]).includes(contextGraphId)) {
+      return undefined;
+    }
+    const ontologyGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
+    const cgMetaGraph = contextGraphMetaGraphUri(contextGraphId);
+    const contextGraphUri = `did:dkg:context-graph:${contextGraphId}`;
+    const result = await this.store.query(
+      `SELECT ?policy WHERE {
+        { GRAPH <${ontologyGraph}> { <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_ACCESS_POLICY}> ?policy } }
+        UNION
+        { GRAPH <${cgMetaGraph}> { <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_ACCESS_POLICY}> ?policy } }
+      } LIMIT 1`,
+    );
+    if (result.type !== 'bindings' || result.bindings.length === 0) return undefined;
+    const raw = result.bindings[0]?.['policy'];
+    if (typeof raw !== 'string') return undefined;
+    const stripped = raw.replace(/^"|"$/g, '');
+    if (stripped === 'public') return 0;
+    if (stripped === 'private') return 1;
+    return undefined;
   }
 
   /**
@@ -17330,11 +18406,24 @@ export class DKGAgent {
     }
   }
 
-  private async isPrivateContextGraph(contextGraphId: string): Promise<boolean> {
+  /**
+   * Issue #865 — single source of truth for "what does this CG's
+   * explicit accessPolicy say". Returns `'public'` / `'private'` if
+   * an `accessPolicy` triple is present in either the ONTOLOGY graph
+   * or this CG's `_meta` graph, otherwise `null` (no explicit
+   * policy written — fall through to callers' legacy heuristics).
+   *
+   * Extracted so `isPrivateContextGraph` (read-path routing) and
+   * `warnIfAllowlistWriteOnPublicCg` (write-path observability) can
+   * never drift on the policy-resolution rules. If we ever add a new
+   * policy value, the parsing fix lands in one place.
+   */
+  private async getExplicitAccessPolicy(
+    contextGraphId: string,
+  ): Promise<'public' | 'private' | null> {
     if ((Object.values(SYSTEM_CONTEXT_GRAPHS) as string[]).includes(contextGraphId)) {
-      return false;
+      return null;
     }
-
     const ontologyGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
     const cgMetaGraph = contextGraphMetaGraphUri(contextGraphId);
     const contextGraphUri = `did:dkg:context-graph:${contextGraphId}`;
@@ -17351,19 +18440,111 @@ export class DKGAgent {
         }
       } LIMIT 1`,
     );
+    if (result.type !== 'bindings' || result.bindings.length === 0) return null;
+    const policyValue = result.bindings[0]?.['policy'];
+    if (policyValue === '"public"') return 'public';
+    if (policyValue === '"private"') return 'private';
+    // Defensive: any unknown literal (e.g. a future policy value the
+    // older agent code doesn't recognize) is reported as `null` so
+    // callers fall through to the legacy heuristic instead of
+    // mis-routing on an opaque string.
+    return null;
+  }
 
-    if (result.type === 'bindings' && result.bindings[0]?.['policy'] === '"private"') {
-      return true;
+  /**
+   * Issue #865 — observability hook for the invite write paths. Emits a
+   * warn log when the caller writes an allowlist quad on a CG that
+   * carries an explicit `accessPolicy="public"` triple. We don't
+   * throw here:
+   *
+   *   1. `publishPolicy=curated` on a public-discoverable CG is a
+   *      legitimate combo (allowlist gates publishers, subscribers
+   *      stay public). Rejecting would break it.
+   *   2. The primary `isPrivateContextGraph` fix already prevents the
+   *      original bug (silent re-route to the curated publish path).
+   *   3. Pre-existing tests and adapter flows create CGs with no
+   *      explicit accessPolicy and then invite — those should keep
+   *      working.
+   *
+   * The warn line is the documentation: it tells the operator
+   * "your allowlist write landed but read access stays open per the
+   * explicit accessPolicy=public" so the next publisher confusion
+   * has an obvious breadcrumb. Read-only, single SELECT (delegated
+   * to `getExplicitAccessPolicy`) — does not mutate state.
+   *
+   * Codex review rounds 1, 4, and 5 on #873 — callers MUST defer
+   * this until AFTER `store.insert(quadsToInsert)` succeeds. Two
+   * constraints converge on the post-insert call site:
+   *
+   *   - Round 1 / round 4 (idempotency): logging when no quad
+   *     would be inserted (no-op re-invite) misleads operators
+   *     about which writes hit the store.
+   *   - Round 5 (state truthfulness): logging BEFORE the insert
+   *     resolves leaves a phantom breadcrumb if the insert throws.
+   *
+   * The current call sites in `inviteToContextGraph` /
+   * `inviteAgentToContextGraph` fire this AFTER the awaited insert
+   * (gated on `!alreadyAllowed` for the agent path's
+   * delegation-only refresh case), so the warn is a faithful
+   * record of persisted state and the wording is past-tense.
+   */
+  private async warnIfAllowlistWriteOnPublicCg(
+    contextGraphId: string,
+    ctx: OperationContext,
+    operation: string,
+  ): Promise<void> {
+    const policy = await this.getExplicitAccessPolicy(contextGraphId);
+    if (policy !== 'public') return;
+    this.log.warn(
+      ctx,
+      `${operation}: wrote allowlist quad on context graph "${contextGraphId}" which has explicit accessPolicy="public". ` +
+        `The persisted quad does NOT enforce read access — anyone can still subscribe. ` +
+        `Issue #865: as of this commit, the publisher no longer auto-flips public CGs to the curated publish path ` +
+        `just because an allowlist exists. If you intended to make this CG invite-only, recreate it with accessPolicy=1.`,
+    );
+  }
+
+  private async isPrivateContextGraph(contextGraphId: string): Promise<boolean> {
+    if ((Object.values(SYSTEM_CONTEXT_GRAPHS) as string[]).includes(contextGraphId)) {
+      return false;
     }
 
-    // Also treat CGs with any allowlist predicate as private, even when no
-    // explicit `accessPolicy` triple exists (e.g. `inviteToContextGraph`
-    // writes `DKG_ALLOWED_PEER` straight into `_meta` without touching the
-    // ontology's access_policy; `inviteAgentToContextGraph` does the same
-    // with `DKG_ALLOWED_AGENT`). Both the V10 agent model AND the legacy
-    // peer-ID model need to be recognized here, otherwise the store-
-    // discovery path would misclassify a freshly-invited CG as "open /
-    // discoverable only" and skip the same-connect catchup.
+    const cgMetaGraph = contextGraphMetaGraphUri(contextGraphId);
+    const contextGraphUri = `did:dkg:context-graph:${contextGraphId}`;
+
+    // Issue #865 — explicit `accessPolicy` ALWAYS wins over the allowlist
+    // heuristic below. The previous behavior fell through to the ASK
+    // check whenever `policy` was anything other than `"private"`, which
+    // silently flipped a CG the curator explicitly created with
+    // `accessPolicy="public"` into "private" the moment ANY invite landed
+    // (`DKG_ALLOWED_AGENT` / `DKG_ALLOWED_PEER` write in `_meta`). The
+    // publisher then took the LU-5 / LU-11 curated path, the publish
+    // hung waiting for V2 ACKs from invitees, and the user had no
+    // recovery path short of recreating the CG.
+    //
+    // Semantics post-#865: an allowlist on a public CG is INFORMATIONAL
+    // (matches on-chain `accessPolicy=0` which the contract does not
+    // enforce). Curator can still see "who I would have invited" in the
+    // member list, but the publisher stays on the plaintext / public
+    // path so cores can verify against SWM and the on-chain tx
+    // actually submits.
+    //
+    // Codex review on #873 — policy lookup now delegated to the
+    // shared `getExplicitAccessPolicy()` helper so this routing
+    // function and the invite-path warning helper can never drift.
+    const policy = await this.getExplicitAccessPolicy(contextGraphId);
+    if (policy === 'private') return true;
+    if (policy === 'public') return false;
+    // policy === null falls through to the legacy heuristic below.
+
+    // Legacy / discovered-CG fallback: when no explicit `accessPolicy`
+    // triple exists (e.g. an old CG materialized before the predicate
+    // was added, or a peer-only CG discovered via gossip without
+    // ontology bootstrap), treat the presence of an allowlist
+    // predicate as the curated signal. Both the V10 agent model AND
+    // the legacy peer-ID model need to be recognized here so the
+    // store-discovery path doesn't misclassify a freshly-invited CG
+    // as "open / discoverable only" and skip the same-connect catchup.
     const allowlistResult = await this.store.query(
       `ASK WHERE {
         GRAPH <${cgMetaGraph}> {

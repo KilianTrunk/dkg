@@ -545,6 +545,55 @@ export function admitTripleForScope(
  * rule WITHOUT sharing its global dedup namespace (which would
  * collide cross-scope SPOs).
  */
+/**
+ * GH #890 round 2 (Codex sweep 1 🟡 B) — row-level residue
+ * predicates shared by `useLayerTriples`, `applyCanonicalAdmission`,
+ * and `useMemoryCounts`. The triple-producing helpers and the
+ * fused counter ran three hand-rolled copies of the same logic;
+ * the #819 cycle had ~10 rule refinements and each had to be
+ * propagated to every copy. Extracting these as exported pure
+ * predicates makes the drop rule a single source of truth.
+ *
+ * `isSubjectResidue` — subject has moved past the row's layer.
+ * `isObjectResourceResidue` — object is a resource AND has moved
+ *   past the row's layer (literal objects always return false).
+ * `isPerLayerResidue` — OR-rule (matches `useLayerTriples`):
+ *   drop if either endpoint moved past `t.layer`.
+ * `isCanonicalResidue` — AND-rule (matches
+ *   `applyCanonicalAdmission`): drop only when BOTH endpoints
+ *   moved past `t.layer`. Preserves mixed-layer edges as facts.
+ */
+export function isSubjectResidue(
+  t: LayeredTriple,
+  entities: ReadonlyMap<string, MemoryEntity>,
+): boolean {
+  const subj = entities.get(canonicalEntityUri(t.subject));
+  return subj !== undefined && subj.trustLevel !== t.layer;
+}
+
+export function isObjectResourceResidue(
+  t: LayeredTriple,
+  entities: ReadonlyMap<string, MemoryEntity>,
+): boolean {
+  if (!isResourceObject(t.object)) return false;
+  const obj = entities.get(canonicalEntityUri(t.object));
+  return obj !== undefined && obj.trustLevel !== t.layer;
+}
+
+export function isPerLayerResidue(
+  t: LayeredTriple,
+  entities: ReadonlyMap<string, MemoryEntity>,
+): boolean {
+  return isSubjectResidue(t, entities) || isObjectResourceResidue(t, entities);
+}
+
+export function isCanonicalResidue(
+  t: LayeredTriple,
+  entities: ReadonlyMap<string, MemoryEntity>,
+): boolean {
+  return isSubjectResidue(t, entities) && isObjectResourceResidue(t, entities);
+}
+
 export function applyCanonicalAdmission(
   triples: readonly LayeredTriple[],
   entities: ReadonlyMap<string, MemoryEntity>,
@@ -569,20 +618,15 @@ export function applyCanonicalAdmission(
   // Losing real multi-valued facts is worse than transiently
   // double-showing single-valued ones; the round 7 logic was
   // reverted.
+  //
+  // GH #890 round 2 — uses the shared `isCanonicalResidue`
+  // predicate. Behavior identical to the prior inline check
+  // (subject moved past `t.layer` AND object is a resource that
+  // also moved past `t.layer`).
   const seen = new Set<string>();
   const out: LayeredTriple[] = [];
   for (const t of triples) {
-    const subjectEntity = entities.get(canonicalEntityUri(t.subject));
-    const subjectMoved =
-      subjectEntity !== undefined && subjectEntity.trustLevel !== t.layer;
-    let dropAsResidue = false;
-    if (subjectMoved && isResourceObject(t.object)) {
-      const objectEntity = entities.get(canonicalEntityUri(t.object));
-      if (objectEntity && objectEntity.trustLevel !== t.layer) {
-        dropAsResidue = true;
-      }
-    }
-    if (dropAsResidue) continue;
+    if (isCanonicalResidue(t, entities)) continue;
     const key = `${canonicalEntityUri(t.subject)}|${t.predicate}|${canonicalEntityUri(t.object)}`;
     if (seen.has(key)) continue;
     seen.add(key);
@@ -600,6 +644,69 @@ export function useCanonicalTriples(
   }, [memory.allTriples, memory.entities]);
 }
 
+/**
+ * GH #881 (post-#847 follow-up) — fused single-pass count helper
+ * for views that need all four counts (per-layer wm/swm/vm +
+ * canonical total) in one shot. `DashboardView`'s `CgRow` and
+ * `MemoryStackView` previously called `useLayerTriples` ×3 +
+ * `useCanonicalTriples` ×1, doing 4 separate iterations over
+ * `memory.allTriples` per row. On many-CG dashboards that adds up.
+ *
+ * Returns COUNTS only (not the underlying triple arrays); views
+ * that need the actual triples should keep using `useLayerTriples`
+ * / `useCanonicalTriples`. Inline per-bucket admission rules
+ * mirror the source helpers exactly:
+ *   - Per-layer (wm/swm/vm): only rows whose `t.layer` matches the
+ *     bucket AND whose subject hasn't moved past the bucket AND
+ *     whose resource-object (if any) hasn't moved past the bucket
+ *     (`useLayerTriples` OR-rule). Per-layer SPO dedup.
+ *   - Canonical: subject-and-object-both-moved residue drop only
+ *     (`applyCanonicalAdmission` AND-rule). Global SPO dedup
+ *     across all layers.
+ *
+ * Contract from `DashboardView.tsx`: `wm + swm + vm ≤ total`.
+ * Gap = mixed-layer edges canonical keeps but per-layer slices
+ * drop (subject moved past `t.layer`, object still at `t.layer` →
+ * canonical AND-rule keeps, per-layer OR-rule drops).
+ */
+export function useMemoryCounts(
+  memory: ReturnType<typeof useMemoryEntities>,
+): { wm: number; swm: number; vm: number; canonical: number } {
+  return useMemo(() => {
+    const seenWm = new Set<string>();
+    const seenSwm = new Set<string>();
+    const seenVm = new Set<string>();
+    const seenCanonical = new Set<string>();
+    let wm = 0, swm = 0, vm = 0, canonical = 0;
+    // GH #890 round 2 — drop predicates come from the shared
+    // helpers (`isCanonicalResidue` / `isPerLayerResidue`). Same
+    // single source of truth `applyCanonicalAdmission` and
+    // `useLayerTriples` consume.
+    for (const t of memory.allTriples) {
+      const key = `${canonicalEntityUri(t.subject)}|${t.predicate}|${canonicalEntityUri(t.object)}`;
+
+      if (!isCanonicalResidue(t, memory.entities) && !seenCanonical.has(key)) {
+        seenCanonical.add(key);
+        canonical++;
+      }
+
+      if (!isPerLayerResidue(t, memory.entities)) {
+        if (t.layer === 'working' && !seenWm.has(key)) {
+          seenWm.add(key);
+          wm++;
+        } else if (t.layer === 'shared' && !seenSwm.has(key)) {
+          seenSwm.add(key);
+          swm++;
+        } else if (t.layer === 'verified' && !seenVm.has(key)) {
+          seenVm.add(key);
+          vm++;
+        }
+      }
+    }
+    return { wm, swm, vm, canonical };
+  }, [memory.allTriples, memory.entities]);
+}
+
 export function useLayerTriples(memory: ReturnType<typeof useMemoryEntities>, layer: 'wm' | 'swm' | 'vm'): Triple[] {
   const targetLayer = LAYER_CONFIG[layer].trustLevel;
   return useMemo(() => {
@@ -607,45 +714,26 @@ export function useLayerTriples(memory: ReturnType<typeof useMemoryEntities>, la
     const out: Triple[] = [];
     for (const t of memory.allTriples) {
       if (t.layer !== targetLayer) continue;
-      // Skip residual triples for a subject that has been promoted past
-      // this layer: post-promote the daemon currently leaves the WM
-      // `/assertion/<addr>/<name>` graphs on disk, so a promoted entity's
-      // WM triples keep coming back from `wmSparql` even though the
-      // entity has logically moved to SWM. The entity's canonical layer
-      // is `trustLevel` (its highest layer); a triple whose subject has
-      // moved past `targetLayer` would otherwise be counted on the
-      // prior layer's tally. Triples whose subject has no entity record
-      // (literal orphans / class IRIs that only ever appear as objects)
-      // pass through unfiltered.
+      // GH #890 round 2 — per-layer drop check delegated to the
+      // shared `isPerLayerResidue` predicate (OR-rule: drop if
+      // subject OR resource-object has moved past `t.layer`).
+      // Since the layer-mismatch filter above already enforces
+      // `t.layer === targetLayer`, the predicate's `t.layer`
+      // comparison is equivalent to comparing against `targetLayer`.
       //
-      // R2-1 fix: `entities.get` is keyed by the canonical (trimmed,
-      // unwrapped) URI per `buildEntities`. The daemon sometimes ships
-      // subjects wrapped (`<urn:...>`) — looking them up raw misses the
-      // entity record, silently bypasses this filter, and the phantom
-      // triple returns. Canonicalise first.
-      const subjectEntity = memory.entities.get(canonicalEntityUri(t.subject));
-      if (subjectEntity && subjectEntity.trustLevel !== targetLayer) continue;
-      // Issue-A fix (object-side, asymmetric C17 form): a WM triple
-      // `wm-entity-A relatesTo swm-entity-B` (B promoted to SWM) has
-      // a WM subject but its object has moved past WM. The triple is
-      // residue — counting it on WM would inflate the count and
-      // would leak the promoted-entity URI as an object in any
-      // downstream rendering. Drop resource→resource edges whose
-      // object has been promoted past the requested layer.
-      // Literal-valued triples (labels, names, etc.) have a
-      // non-resource object so this check no-ops; they always pass.
-      //
-      // This stays in `useLayerTriples` because it's a per-LAYER
-      // correctness rule (a triple shouldn't be tallied on a layer
-      // where neither endpoint canonically lives). Entity-filtering
-      // for the graph view happens downstream in `LayerGraphPanel`
-      // via `filterTriplesToEntities` — `useLayerTriples` is the
-      // honest layer source for triple counts and VM hero stats.
-      if (isResourceObject(t.object)) {
-        const canonicalObject = canonicalEntityUri(t.object);
-        const objectEntity = memory.entities.get(canonicalObject);
-        if (objectEntity && objectEntity.trustLevel !== targetLayer) continue;
-      }
+      // Rule rationale (preserved from the prior inline checks):
+      // (1) Subject residue — post-promote the daemon leaves the
+      //     WM `/assertion/<addr>/<name>` graphs on disk so a
+      //     promoted entity's WM triples keep coming back. Drop
+      //     them on this layer's tally.
+      // (2) Object resource residue — Issue-A fix: a WM triple
+      //     `wm-A relatesTo swm-B` (B promoted) would otherwise
+      //     leak the promoted URI as a phantom node and inflate
+      //     the count.
+      // Literal orphans (no entity record) and literal objects
+      // pass through unfiltered — same behavior as the prior
+      // inline checks.
+      if (isPerLayerResidue(t, memory.entities)) continue;
       // Canonicalise the dedup key so wrapped/bare duplicates of the
       // same `(s,p,o)` collapse — mirrors `dedupeTriplesBySpo` in
       // `ProjectView.tsx` and `buildEntities`' per-entity SPO key.

@@ -152,7 +152,7 @@ export interface LiftJobInclusionMetadata {
 }
 
 export interface LiftJobFinalizationMetadata {
-  readonly mode?: 'published' | 'noop';
+  readonly mode?: 'published' | 'noop' | 'local';
   readonly txHash?: LiftJobHex;
   readonly ual?: string;
   readonly batchId?: LiftJobBigInt;
@@ -279,7 +279,17 @@ export interface LiftJobFinalizedNoop extends LiftJobBase {
   readonly failure?: undefined;
 }
 
-export type LiftJobFinalized = LiftJobFinalizedPublished | LiftJobFinalizedNoop;
+export interface LiftJobFinalizedLocal extends LiftJobBase {
+  readonly status: 'finalized';
+  readonly claim: LiftJobClaimMetadata;
+  readonly validation: LiftJobValidationMetadata;
+  readonly broadcast?: undefined;
+  readonly inclusion?: undefined;
+  readonly finalization: LiftJobFinalizationMetadata & { readonly mode: 'local' };
+  readonly failure?: undefined;
+}
+
+export type LiftJobFinalized = LiftJobFinalizedPublished | LiftJobFinalizedNoop | LiftJobFinalizedLocal;
 
 export interface LiftJobFailed extends LiftJobBase {
   readonly status: 'failed';

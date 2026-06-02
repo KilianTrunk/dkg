@@ -365,11 +365,12 @@ function discoveryQueryOptions(
   ctx: KafkaPluginCtx,
   contextGraphId: string,
   subGraphName?: string,
-): { contextGraphId: string; subGraphName?: string; callerAgentAddress: string } {
+): { contextGraphId: string; subGraphName?: string; callerAgentAddress: string; includePrivate: true } {
   return {
     contextGraphId,
     subGraphName,
     callerAgentAddress: ctx.requestAgentAddress,
+    includePrivate: true,
   };
 }
 

@@ -1,5 +1,3 @@
-import { decryptPrivateLiteral } from '@origintrail-official/dkg-storage';
-
 const DKG_STREAMS = 'https://ontology.dkg.io/streams#';
 const SCHEMA = 'https://schema.org/';
 const DKG_ONT = 'http://dkg.io/ontology/';
@@ -64,7 +62,8 @@ function registrationScopeClause(ualTerm: string, subGraphName: string | undefin
   const scope = subGraphName === undefined
     ? `FILTER NOT EXISTS { ${ualTerm} <${SUB_GRAPH_NAME}> ?_subGraphName . }`
     : `${ualTerm} <${SUB_GRAPH_NAME}> "${subGraphName}" .`;
-  return `${indent}${ualTerm} <${STATUS}> "confirmed" .
+  return `${indent}${ualTerm} <${STATUS}> ?registrationStatus .
+${indent}FILTER(?registrationStatus IN ("confirmed", "tentative"))
 ${indent}${scope}`;
 }
 
@@ -222,7 +221,7 @@ export function bindingsToKa(bindings: ReadonlyArray<BindingRow>): KafkaStreamKa
     if (ualVal && !id) id = ualVal;
     const predicate = unwrapBinding(row.p);
     const rawObject = unwrapBinding(row.o);
-    const objectRaw = rawObject === undefined ? undefined : decryptPrivateLiteral(rawObject);
+    const objectRaw = rawObject;
     if (!predicate || objectRaw === undefined) continue;
     if (predicate === PRIVATE_DATA_ANCHOR) continue;
     if (predicate === RDF_TYPE) {

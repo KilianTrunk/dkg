@@ -387,10 +387,12 @@ describe('handler — GET / (list)', () => {
     expect(query.mock.calls[0][1]).toMatchObject({
       contextGraphId: 'urn:cg:demo',
       callerAgentAddress: '0x0000000000000000000000000000000000000001',
+      includePrivate: true,
     });
     expect(query.mock.calls[1][1]).toMatchObject({
       contextGraphId: 'urn:cg:demo',
       callerAgentAddress: '0x0000000000000000000000000000000000000001',
+      includePrivate: true,
     });
     for (const call of query.mock.calls) {
       expect(call[0]).toContain('GRAPH <did:dkg:context-graph:urn:cg:demo/_meta>');
@@ -510,6 +512,7 @@ describe('handler — GET /:ual (single)', () => {
     expect(query.mock.calls[0][1]).toMatchObject({
       contextGraphId: 'urn:cg:demo',
       callerAgentAddress: '0x0000000000000000000000000000000000000001',
+      includePrivate: true,
     });
     expect(query.mock.calls[0][0]).toContain('<did:dkg:1/0xabc>');
     expect(query.mock.calls[0][0]).toContain('GRAPH <did:dkg:context-graph:urn:cg:demo/_meta>');

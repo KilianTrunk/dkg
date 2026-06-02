@@ -206,6 +206,7 @@ async function startDaemon(opts: DaemonOpts): Promise<Daemon> {
     const token = raw.split('\n').map((l) => l.trim()).find((l) => l.length > 0 && !l.startsWith('#'));
     if (!token) throw new Error('No auth token found in auth.token');
     daemon.token = token;
+    let lastPublisherProbe = '';
     for (let i = 0; i < 40; i++) {
       const probe = await fetch(`http://127.0.0.1:${apiPort}/api/kafka/streams/register`, {
         method: 'POST',
@@ -213,9 +214,13 @@ async function startDaemon(opts: DaemonOpts): Promise<Daemon> {
         body: '{}',
       });
       if (probe.status !== 503) break;
+      lastPublisherProbe = await probe.text().catch(() => '<could not read publisher readiness probe body>');
       await sleep(500);
       if (i === 39) {
-        throw new Error('Publisher runtime did not become ready within 20s');
+        throw new Error(
+          `Publisher runtime did not become ready within 20s (last probe=${lastPublisherProbe}).\n` +
+          `--- daemon stdio tail ---\n${await tail()}`,
+        );
       }
     }
     return daemon;

@@ -15,13 +15,15 @@ const STATUS = 'http://dkg.io/ontology/status';
 const SUBGRAPH_NAME = 'http://dkg.io/ontology/subGraphName';
 const PRIVATE_DATA_ANCHOR = 'http://dkg.io/ontology/privateDataAnchor';
 
-function expectConfirmedRootMetaScope(q: string): void {
-  expect(q).toContain(`?ual <${STATUS}> "confirmed" .`);
+function expectPublishableRootMetaScope(q: string): void {
+  expect(q).toContain(`?ual <${STATUS}> ?registrationStatus .`);
+  expect(q).toContain('FILTER(?registrationStatus IN ("confirmed", "tentative"))');
   expect(q).toContain(`FILTER NOT EXISTS { ?ual <${SUBGRAPH_NAME}> ?_subGraphName . }`);
 }
 
-function expectConfirmedSubgraphMetaScope(q: string): void {
-  expect(q).toContain(`?ual <${STATUS}> "confirmed" .`);
+function expectPublishableSubgraphMetaScope(q: string): void {
+  expect(q).toContain(`?ual <${STATUS}> ?registrationStatus .`);
+  expect(q).toContain('FILTER(?registrationStatus IN ("confirmed", "tentative"))');
   expect(q).toContain(`?ual <${SUBGRAPH_NAME}> "streams" .`);
   expect(q).not.toContain('FILTER NOT EXISTS');
 }
@@ -36,7 +38,8 @@ describe('discovery — buildListQuery', () => {
       GRAPH <${META_URI}> {
         ?ka <http://dkg.io/ontology/rootEntity> ?root .
         ?ka <http://dkg.io/ontology/partOf> ?ual .
-        ?ual <http://dkg.io/ontology/status> "confirmed" .
+        ?ual <http://dkg.io/ontology/status> ?registrationStatus .
+        FILTER(?registrationStatus IN ("confirmed", "tentative"))
         FILTER NOT EXISTS { ?ual <http://dkg.io/ontology/subGraphName> ?_subGraphName . }
         ?ual <http://dkg.io/ontology/publishedAt> ?receivedAt .
       }
@@ -98,18 +101,18 @@ ORDER BY DESC(?receivedAt) ?ual ?root ?p ?o`,
     expect(q).toContain(`GRAPH <${PRIVATE_URI}>`);
     expect(q).toContain(`?root <${PRIVATE_DATA_ANCHOR}> "true" .`);
   });
-  it('only lists confirmed root-graph registrations when no subGraphName is configured', () => {
+  it('lists confirmed or tentative root-graph registrations when no subGraphName is configured', () => {
     const q = buildListQuery({ contextGraphId: 'urn:cg:demo', limit: 30, offset: 0 });
-    expectConfirmedRootMetaScope(q);
+    expectPublishableRootMetaScope(q);
   });
-  it('only lists confirmed registrations for the configured subGraphName', () => {
+  it('lists confirmed or tentative registrations for the configured subGraphName', () => {
     const q = buildListQuery({
       contextGraphId: 'urn:cg:demo',
       subGraphName: 'streams',
       limit: 30,
       offset: 0,
     });
-    expectConfirmedSubgraphMetaScope(q);
+    expectPublishableSubgraphMetaScope(q);
   });
   it('keeps the outer joined rows sorted newest-first after each stream expands into triples', () => {
     const q = buildListQuery({ contextGraphId: 'urn:cg:demo', limit: 30, offset: 0 });
@@ -135,7 +138,8 @@ describe('discovery — buildCountQuery', () => {
   GRAPH <${META_URI}> {
     ?ka <http://dkg.io/ontology/rootEntity> ?root .
     ?ka <http://dkg.io/ontology/partOf> ?ual .
-    ?ual <http://dkg.io/ontology/status> "confirmed" .
+    ?ual <http://dkg.io/ontology/status> ?registrationStatus .
+    FILTER(?registrationStatus IN ("confirmed", "tentative"))
     FILTER NOT EXISTS { ?ual <http://dkg.io/ontology/subGraphName> ?_subGraphName . }
   }
   {
@@ -168,16 +172,16 @@ describe('discovery — buildCountQuery', () => {
     expect(q).toContain(`GRAPH <${DATA_URI}> { ?root <${PRIVATE_DATA_ANCHOR}> "true" . }`);
     expect(q).toContain(`GRAPH <${PRIVATE_URI}> { ?root a <https://ontology.dkg.io/streams#KafkaStream> . }`);
   });
-  it('only counts confirmed root-graph registrations when no subGraphName is configured', () => {
+  it('counts confirmed or tentative root-graph registrations when no subGraphName is configured', () => {
     const q = buildCountQuery({ contextGraphId: 'urn:cg:demo' });
-    expectConfirmedRootMetaScope(q);
+    expectPublishableRootMetaScope(q);
   });
-  it('only counts confirmed registrations for the configured subGraphName', () => {
+  it('counts confirmed or tentative registrations for the configured subGraphName', () => {
     const q = buildCountQuery({
       contextGraphId: 'urn:cg:demo',
       subGraphName: 'streams',
     });
-    expectConfirmedSubgraphMetaScope(q);
+    expectPublishableSubgraphMetaScope(q);
   });
 });
 describe('discovery — buildSingleByUalQuery', () => {
@@ -188,7 +192,8 @@ describe('discovery — buildSingleByUalQuery', () => {
   GRAPH <${META_URI}> {
     ?ka <http://dkg.io/ontology/rootEntity> ?root .
     ?ka <http://dkg.io/ontology/partOf> <did:dkg:1/0xabc> .
-    <did:dkg:1/0xabc> <http://dkg.io/ontology/status> "confirmed" .
+    <did:dkg:1/0xabc> <http://dkg.io/ontology/status> ?registrationStatus .
+    FILTER(?registrationStatus IN ("confirmed", "tentative"))
     FILTER NOT EXISTS { <did:dkg:1/0xabc> <http://dkg.io/ontology/subGraphName> ?_subGraphName . }
   }
   {
@@ -238,20 +243,22 @@ describe('discovery — buildSingleByUalQuery', () => {
     expect(q).toContain(`GRAPH <${PRIVATE_URI}>`);
     expect(q).toContain(`?root <${PRIVATE_DATA_ANCHOR}> "true" .`);
   });
-  it('only resolves confirmed root-graph registrations when no subGraphName is configured', () => {
+  it('resolves confirmed or tentative root-graph registrations when no subGraphName is configured', () => {
     const q = buildSingleByUalQuery({ contextGraphId: 'urn:cg:demo', ual: 'did:dkg:1/0xabc' });
-    expect(q).toContain(`<did:dkg:1/0xabc> <${STATUS}> "confirmed" .`);
+    expect(q).toContain(`<did:dkg:1/0xabc> <${STATUS}> ?registrationStatus .`);
+    expect(q).toContain('FILTER(?registrationStatus IN ("confirmed", "tentative"))');
     expect(q).toContain(
       `FILTER NOT EXISTS { <did:dkg:1/0xabc> <${SUBGRAPH_NAME}> ?_subGraphName . }`,
     );
   });
-  it('only resolves confirmed registrations for the configured subGraphName', () => {
+  it('resolves confirmed or tentative registrations for the configured subGraphName', () => {
     const q = buildSingleByUalQuery({
       contextGraphId: 'urn:cg:demo',
       subGraphName: 'streams',
       ual: 'did:dkg:1/0xabc',
     });
-    expect(q).toContain(`<did:dkg:1/0xabc> <${STATUS}> "confirmed" .`);
+    expect(q).toContain(`<did:dkg:1/0xabc> <${STATUS}> ?registrationStatus .`);
+    expect(q).toContain('FILTER(?registrationStatus IN ("confirmed", "tentative"))');
     expect(q).toContain(`<did:dkg:1/0xabc> <${SUBGRAPH_NAME}> "streams" .`);
     expect(q).not.toContain('FILTER NOT EXISTS');
   });

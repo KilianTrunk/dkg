@@ -6419,19 +6419,22 @@ export class DKGAgent {
    *   - a curator-created CG stores its CLEARTEXT id (even one shaped like a
    *     0x+64-hex string) and registration commits `keccak256(utf8(cleartextId))`;
    *   - a host-only/core subscription is keyed by the WIRE id itself (cleartext
-   *     never left the curator), so the local id already IS the committed hash.
+   *     never left the curator), so the local id already IS the committed hash —
+   *     but the verbatim form is accepted ONLY when local metadata AFFIRMATIVELY
+   *     proves the subscription is wire-id keyed (#884 review 🔴 GaZky), so a
+   *     hash-shaped cleartext id can't borrow a reused slot's commitment.
    * A genuinely reused slot commits a DIFFERENT name that matches neither.
    *
    * Returns `false` (→ caller fails closed) on an AFFIRMATIVE mismatch (the
-   * committed hash matches neither derivation), AND — once the adapter EXPOSES
-   * `getContextGraphNameHash` — whenever the hash cannot be verified (RPC
-   * rejection or read timeout): an unverifiable identity must not re-enable the
-   * plaintext downgrade for a possibly reused slot (#884 review 🔴 GZ8L_).
-   * Returns `true` (proceed to the liveness/policy gate) only where there is
-   * genuinely nothing to disprove: no `getContextGraphNameHash` getter at all,
-   * or the curator explicitly opted OUT of the on-chain commitment (`null` —
-   * unambiguous now that the EVM adapter propagates RPC errors instead of
-   * collapsing them to `null`, #884 review 🔴 GaJgD).
+   * committed hash matches neither derivation); whenever the hash cannot be
+   * verified once the adapter EXPOSES `getContextGraphNameHash` (RPC rejection or
+   * read timeout — #884 review 🔴 GZ8L_); AND when the slot has NO committed
+   * name-hash at all (`null` / empty — #884 review 🔴 GaZk2). A missing
+   * commitment is NOT an identity proof: a devnet-reset slot reused by a
+   * different no-commitment public CG would otherwise disable encryption for the
+   * wrong local graph, so a downgrade decision requires an affirmative binding.
+   * Returns `true` (proceed to the liveness/policy gate) ONLY where the adapter
+   * cannot supply the anchor at all (no `getContextGraphNameHash` getter).
    */
   private async localCgMatchesOnChainSlot(
     contextGraphId: string,
@@ -6451,22 +6454,28 @@ export class DKGAgent {
     const trimmed = contextGraphId.trim();
     // A locally-resolved id can be committed two ways, and both are legitimate
     // (#884 review 🔴 GZumc + 🔴 GaJf_), so accept a match against EITHER:
-    //   - CLEARTEXT: a curator-created CG stores its cleartext id (even one that
-    //     happens to look like a 0x+64-hex string), and registration commits
-    //     keccak256(utf8(cleartextId)). → keccak(utf8(trimmed)).
-    //   - WIRE-FORM: a host-only/core subscription is keyed by the wire id
-    //     ITSELF (cleartext never left the curator), so the local id already IS
-    //     the committed nameHash. → trimmed verbatim, only when 0x+64-hex.
-    // A genuinely reused/unrelated slot commits a DIFFERENT name that matches
-    // NEITHER, so this still fails closed on a true stale mapping while never
-    // forcing a hex-shaped id down the fail-closed path forever.
+    //   - CLEARTEXT (always): a curator-created CG stores its cleartext id (even
+    //     one that happens to look like a 0x+64-hex string), and registration
+    //     commits keccak256(utf8(cleartextId)). → keccak(utf8(trimmed)).
+    //   - WIRE-FORM (conditional): a host-only/core subscription is keyed by the
+    //     wire id ITSELF (cleartext never left the curator), so the local id
+    //     already IS the committed nameHash. → trimmed verbatim.
+    // The WIRE-FORM branch is only added when LOCAL metadata AFFIRMATIVELY proves
+    // this subscription is wire-id keyed (#884 review 🔴 GaZky). Accepting the
+    // verbatim value for EVERY 0x+64-hex id would make the gate ambiguous between
+    // a real host-mode wire id and a user-chosen cleartext id that merely looks
+    // hash-shaped — a reused/unrelated slot whose committed nameHash equalled
+    // that raw string would then falsely pass. A genuinely reused slot commits a
+    // DIFFERENT name that matches NEITHER accepted form, so this still fails
+    // closed on a true stale mapping while never forcing a wire-keyed host CG
+    // down the fail-closed path forever.
     const acceptable = new Set<string>();
     try {
       acceptable.add(ethers.keccak256(ethers.toUtf8Bytes(trimmed)).toLowerCase());
     } catch {
       return true;
     }
-    if (/^0x[0-9a-fA-F]{64}$/.test(trimmed)) {
+    if (/^0x[0-9a-fA-F]{64}$/.test(trimmed) && this.isWireIdKeyedSubscription(trimmed)) {
       acceptable.add(trimmed.toLowerCase());
     }
 
@@ -6498,11 +6507,25 @@ export class DKGAgent {
       );
       return false;
     }
-    // Explicit opt-out (`null` / empty): the curator chose NOT to anchor
-    // identity on-chain, so there is nothing to disprove against — proceed
-    // (fail-open is correct ONLY here; an RPC error threw above and already
-    // failed closed, so this `null` is unambiguously a no-commitment).
-    if (!onChainHash) return true;
+    // MISSING commitment (`null` / empty): the slot has NO on-chain name-hash.
+    // This is NOT an affirmative identity proof and must NOT re-enable the
+    // plaintext downgrade (#884 review 🔴 GaZk2). After a devnet reset the
+    // persisted `localId → onChainId` mapping can point at a DIFFERENT public CG
+    // that ALSO never committed a name-hash; trusting `null` would then disable
+    // SWM encryption for the WRONG local graph. A downgrade (encrypt→plaintext)
+    // decision requires an AFFIRMATIVE binding, so a missing commitment fails
+    // closed. (Fail-open is reserved for the no-getter case above, where the
+    // adapter cannot supply the anchor at all — distinct from a present getter
+    // returning "no commitment".)
+    if (!onChainHash) {
+      this.log.warn(
+        opCtx ?? createOperationContext('share'),
+        `isContextGraphPublicOnChain(${contextGraphId}): locally-mapped on-chain id ${onChainId} has NO ` +
+        `committed name-hash — cannot affirmatively bind identity (slot reused on a fresh chain?). ` +
+        `Treating CG as NOT public (fail-closed).`,
+      );
+      return false;
+    }
     if (acceptable.has(onChainHash.toLowerCase())) return true;
 
     this.log.warn(
@@ -6512,6 +6535,29 @@ export class DKGAgent {
       `local mapping is STALE (slot reused on a fresh chain?). Treating CG as NOT public (fail-closed).`,
     );
     return false;
+  }
+
+  /**
+   * #884 review (🔴 GaZky) — AFFIRMATIVE proof that a 0x+64-hex local CG id is a
+   * host-only/core subscription keyed by the WIRE id (the committed name-hash)
+   * rather than a user-chosen cleartext id that merely looks hash-shaped.
+   *
+   * Host-only auto-subscribe paths (chain-event + discovery-beacon) stage the
+   * wire id AS the local id and record `onChainHash === id` (and the reverse
+   * index `wireIdToLocalCgId[id] === id`). Only that self-referential local
+   * commitment licenses {@link localCgMatchesOnChainSlot} to accept the verbatim
+   * id against the on-chain name-hash; without it the id is treated as cleartext
+   * and must match `keccak256(utf8(id))`, so a reused slot cannot impersonate a
+   * wire-keyed CG just by sharing a hash-shaped string.
+   */
+  private isWireIdKeyedSubscription(localId: string): boolean {
+    if (!/^0x[0-9a-fA-F]{64}$/.test(localId)) return false;
+    const lower = localId.toLowerCase();
+    const sub =
+      this.subscribedContextGraphs?.get(localId) ?? this.subscribedContextGraphs?.get(lower);
+    if (sub?.onChainHash && sub.onChainHash.toLowerCase() === lower) return true;
+    const reverse = this.wireIdToLocalCgId?.get(lower);
+    return !!reverse && reverse.toLowerCase() === lower;
   }
 
   /**

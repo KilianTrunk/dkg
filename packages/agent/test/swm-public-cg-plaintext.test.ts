@@ -60,6 +60,12 @@ function makeAgentLike(opts: {
   // Make this.contextGraphExists REJECT, to prove a flaked existence check
   // fails closed (→ 'unknown') instead of being read as "no local CG".
   localCgExistsError?: Error;
+  // Stage a host-only/core wire-id-keyed subscription record (onChainHash === id
+  // + reverse index pointing the wire id at itself) so localCgMatchesOnChainSlot
+  // is licensed to accept this id's VERBATIM form against the committed
+  // name-hash (#884 review GaZky). Without it a 0x+64-hex id is treated as
+  // cleartext and must match keccak256(utf8(id)).
+  wireKeyedLocalId?: string;
 } = {}) {
   const log = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
   const chain: Record<string, unknown> = {};
@@ -86,10 +92,19 @@ function makeAgentLike(opts: {
   // of store.query on these paths; an empty result → no allowlist → it returns
   // requiresEncryption=false while still proving it WAS consulted (delegation).
   const storeQuery = vi.fn(async () => ({ type: 'bindings', bindings: [] as unknown[] }));
+  const subscribedContextGraphs = new Map<string, { onChainHash?: string }>();
+  const wireIdToLocalCgId = new Map<string, string>();
+  if (opts.wireKeyedLocalId) {
+    const lower = opts.wireKeyedLocalId.toLowerCase();
+    subscribedContextGraphs.set(opts.wireKeyedLocalId, { onChainHash: lower });
+    wireIdToLocalCgId.set(lower, opts.wireKeyedLocalId);
+  }
   const agentLike: any = {
     log,
     chain,
     store: { query: storeQuery },
+    subscribedContextGraphs,
+    wireIdToLocalCgId,
     onChainAccessPolicyCache: opts.cache ?? new Map<string, number>(),
     getContextGraphOnChainId: vi.fn(async () => {
       if (opts.onChainIdError) throw opts.onChainIdError;
@@ -109,6 +124,7 @@ function makeAgentLike(opts: {
   agentLike.isContextGraphPublicOnChain = (DKGAgent.prototype as any).isContextGraphPublicOnChain;
   agentLike.resolveOnChainAccessPolicyState = (DKGAgent.prototype as any).resolveOnChainAccessPolicyState;
   agentLike.localCgMatchesOnChainSlot = (DKGAgent.prototype as any).localCgMatchesOnChainSlot;
+  agentLike.isWireIdKeyedSubscription = (DKGAgent.prototype as any).isWireIdKeyedSubscription;
   agentLike.readLiveOnChainAccessPolicy = (DKGAgent.prototype as any).readLiveOnChainAccessPolicy;
   agentLike.raceChainPolicyRead = (DKGAgent.prototype as any).raceChainPolicyRead;
   agentLike.resolveWorkspaceRecipientsGated = (DKGAgent.prototype as any).resolveWorkspaceRecipientsGated;
@@ -171,24 +187,49 @@ describe('DKGAgent.isContextGraphPublicOnChain', () => {
     );
   });
 
-  it('proceeds (liveness-only) when the curator opted out of the on-chain name-hash (#884 review GZEqF)', async () => {
-    // No committed name-hash (null) → identity can't be disproven → additive
-    // binding does NOT add a new failure; the live public policy still wins.
+  it('fails closed when the locally-resolved slot has NO committed name-hash (#884 review GaZk2)', async () => {
+    // A locally-mapped slot with NO on-chain name commitment (null) is NOT an
+    // identity proof: after a devnet reset the persisted mapping could point at a
+    // DIFFERENT public CG that also never committed a name-hash. A downgrade
+    // (encrypt→plaintext) decision must fail closed without an affirmative
+    // binding, so the policy is never even read.
     const cgId = '0xCURATOR/experimental-music';
     const agentLike = makeAgentLike({ onChainId: '5', accessPolicy: 0, onChainNameHash: null });
-    await expect(isPublic(agentLike, cgId)).resolves.toBe(true);
+    await expect(isPublic(agentLike, cgId)).resolves.toBe(false);
+    expect(agentLike.chain.getContextGraphAccessPolicy).not.toHaveBeenCalled();
+  });
+
+  it('matches a HOST-MODE wire-id-keyed local CG whose committed hash IS the id itself (#884 review GaJf_/GaZky)', async () => {
+    // Host-only/core subscriptions are keyed by the wire id (the 64-hex hash);
+    // the local id ALREADY is the committed nameHash, so it must NOT be
+    // re-hashed (that would force a legitimate public CG onto the encrypted path
+    // forever). The verbatim form is accepted ONLY because local metadata
+    // (onChainHash === id) affirmatively proves the subscription is wire-id keyed.
+    const wireKeyedId = '0x' + 'ab'.repeat(32);
+    const agentLike = makeAgentLike({
+      onChainId: '5',
+      accessPolicy: 0,
+      onChainNameHash: wireKeyedId,
+      wireKeyedLocalId: wireKeyedId,
+    });
+    await expect(isPublic(agentLike, wireKeyedId)).resolves.toBe(true);
     expect(agentLike.chain.getContextGraphAccessPolicy).toHaveBeenCalledWith(5n);
   });
 
-  it('matches a HOST-MODE wire-id-keyed local CG whose committed hash IS the id itself (#884 review GaJf_)', async () => {
-    // Host-only/core subscriptions are keyed by the wire id (the 64-hex hash);
-    // the local id ALREADY is the committed nameHash, so it must NOT be
-    // re-hashed (that would force a legitimate public CG onto the encrypted
-    // path forever). Identity is proven via the wire-form derivation.
-    const wireKeyedId = '0x' + 'ab'.repeat(32);
-    const agentLike = makeAgentLike({ onChainId: '5', accessPolicy: 0, onChainNameHash: wireKeyedId });
-    await expect(isPublic(agentLike, wireKeyedId)).resolves.toBe(true);
-    expect(agentLike.chain.getContextGraphAccessPolicy).toHaveBeenCalledWith(5n);
+  it('fails closed for a hash-shaped id with NO wire-keyed metadata whose slot commits the verbatim hash (#884 review GaZky)', async () => {
+    // A user-chosen id that merely LOOKS 0x+64-hex is cleartext; without the
+    // affirmative wire-id-keyed signal the verbatim branch is NOT licensed, so a
+    // reused/unrelated slot whose committed nameHash equals that raw string must
+    // NOT impersonate this CG. Only keccak256(utf8(id)) is acceptable → mismatch
+    // → fail closed before reading policy.
+    const hexShaped = '0x' + 'ef'.repeat(32);
+    const agentLike = makeAgentLike({ onChainId: '5', accessPolicy: 0, onChainNameHash: hexShaped });
+    await expect(isPublic(agentLike, hexShaped)).resolves.toBe(false);
+    expect(agentLike.chain.getContextGraphAccessPolicy).not.toHaveBeenCalled();
+    expect(agentLike.log.warn).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.stringContaining('STALE'),
+    );
   });
 
   it('matches a hex-SHAPED CLEARTEXT id committed as keccak256(utf8(id)) (#884 review GZumc)', async () => {

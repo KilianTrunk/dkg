@@ -1073,6 +1073,19 @@ export class MockChainAdapter implements ChainAdapter {
   }
 
   /**
+   * OT-RFC-38 / #884: chain-backed liveness oracle parity for the mock.
+   * Mirrors `ContextGraphStorage.isContextGraphActive(uint256)` — a CG is
+   * "active" on the mock chain iff it was minted via `createContextGraph`
+   * (i.e. is present in the in-memory registry). Unknown ids return `false`,
+   * matching the EVM adapter's behaviour for unregistered slots. This is the
+   * proof callers require before trusting {@link getContextGraphAccessPolicy}
+   * (which is permissively default-`0` for unknown ids).
+   */
+  async isContextGraphActiveOnChain(contextGraphId: bigint): Promise<boolean> {
+    return this.contextGraphs.has(contextGraphId);
+  }
+
+  /**
    * Issue #872 / Codex round-3: chain-backed publish-policy oracle
    * parity for the mock chain. Returns the same `(uint8, address)`
    * shape the EVM adapter does. Unknown ids yield

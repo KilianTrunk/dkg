@@ -42,7 +42,7 @@
  */
 import { describe, it, expect, beforeAll } from 'vitest';
 import { execFileSync, spawn } from 'node:child_process';
-import { readFileSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
+import { readFileSync, existsSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import * as http from 'node:http';
 import { ethers } from 'ethers';
@@ -397,24 +397,33 @@ describe('Phase D — Cores host public CGs and fill their own gaps', () => {
     // ciphertext host-mode path), so this is also the public-detection proof.
   }, 120_000);
 
-  it('a core offline during a publish fills its gap from chain on restart (core-fill)', async () => {
-    const victim = 2; // a core node
-    const victimNode = nodes[victim]!;
-
-    // Pre-req: the victim must already host the public CG (it ACKed earlier).
-    await waitFor(
-      `node${victim} hosts CONTEXT_GRAPH before the gap`,
+  it('a HOST-ONLY core offline during a publish fills its gap from chain on restart', async () => {
+    // Phase D is specifically the case of a core that HOSTS a public CG with NO
+    // member subscription. If the victim were a member-subscriber, the missed
+    // KA could be recovered by ordinary subscriber reconciliation even with the
+    // coreHosted path broken — so the scenario would NOT gate Phase D. Pick a
+    // core that is `core_hosted=1` AND `subscribed=0` for CONTEXT_GRAPH: node1
+    // is the publisher/subscriber, the other cores only signed a StorageACK for
+    // the public CG, so they host it without subscribing.
+    const candidates = CORE_NODES.filter((n) => n !== 1);
+    const picked = await waitFor(
+      'a HOST-ONLY core (core_hosted=1, subscribed=0) for CONTEXT_GRAPH',
       90_000,
       4_000,
       async () => {
-        const cursors = await getJson(victimNode, '/api/replication/cursors');
-        if (cursors.status !== 200) return null;
-        const row = (cursors.body.cursors as any[]).find(
-          (c) => c.context_graph_id === CONTEXT_GRAPH && c.core_hosted === 1,
-        );
-        return row ? true : null;
+        for (const n of candidates) {
+          const cursors = await getJson(nodes[n]!, '/api/replication/cursors');
+          if (cursors.status !== 200) continue;
+          const row = (cursors.body.cursors as any[]).find(
+            (c) => c.context_graph_id === CONTEXT_GRAPH && c.core_hosted === 1 && c.subscribed !== 1,
+          );
+          if (row) return { victim: n };
+        }
+        return null;
       },
     );
+    const victim = picked.victim;
+    const victimNode = nodes[victim]!;
 
     // 1. Take the victim core OFFLINE. Kill the real worker (daemon.pid),
     //    not just the already-exited `cli.js start` launcher (devnet.pid).
@@ -426,6 +435,13 @@ describe('Phase D — Cores host public CGs and fill their own gaps', () => {
     await waitFor(`node${victim} offline`, 45_000, 1_000, async () =>
       (await nodeReachable(victimNode)) ? null : true,
     );
+    // Clear the now-stale pid files before restart: `devnet.pid` holds the
+    // long-exited launcher PID and `daemon.pid` the worker we just SIGKILLed.
+    // `restart-node` trusts these files, so a recycled PID could make it signal
+    // an unrelated process. Removing them forces a clean start.
+    for (const f of ['daemon.pid', 'devnet.pid']) {
+      rmSync(join(DEVNET_DIR, `node${victim}`, f), { force: true });
+    }
 
     // 2. Publish a fresh KA to the CG from node1 while the victim is down.
     const pub = await publishFromCore(nodes[1]!, 'gap');

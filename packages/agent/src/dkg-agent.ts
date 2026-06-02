@@ -1200,6 +1200,7 @@ export class DKGAgent {
   /** Cores keep-alive-pinned on the last warm-core pass, so the next pass can
    *  unpin Cores that fell out of the selection (stale-pin / cap-drift guard). */
   private warmedCores: Set<string> = new Set();
+  private warmCoreReconcileInFlight = false;
   /**
    * v10-rc sync-refactor: per-(peer+CG) checkpoint offsets so the paged
    * sync requester in `sync/requester/page-fetch.ts` can resume where it
@@ -3468,28 +3469,55 @@ export class DKGAgent {
    */
   private async reconcileWarmCoreConnections(): Promise<void> {
     if (!this.started) return;
-    const result = await reconcileWarmCoreConnections({
-      selfPeerId: this.node.libp2p.peerId.toString(),
-      maxCores: WARM_CORE_MAX,
-      findCoreAgents: async (): Promise<WarmCoreAgent[]> => {
-        const agents = await this.discovery.findAgents();
-        return agents.map((a) => ({
-          peerId: a.peerId,
-          nodeRole: a.nodeRole,
-          agentAddress: a.agentAddress,
-        }));
-      },
-      isShardingTableCore: (agentAddress) => this.isShardingTableCore(agentAddress),
-      isConnected: (peerId) =>
-        this.node.libp2p.getConnections().some((c) => c.remotePeer.toString() === peerId),
-      pin: (peerId) => this.pinWarmCore(peerId),
-      unpin: (peerId, ctx) => this.unpinWarmCore(peerId, ctx),
-      dial: (peerId, ctx) => this.dialWarmCore(peerId, ctx),
-      previouslyWarmed: this.warmedCores,
-      log: (ctx, msg) => this.log.info(ctx, msg),
-    });
-    // Carry the pinned set into the next tick so stale Cores get unpinned.
-    this.warmedCores = result.warmed;
+    // Serialize passes. One reconcile can outlast the tick interval (discovery
+    // + chain gate + up to `maxCores` sequential dials at
+    // WARM_CORE_DIAL_TIMEOUT_MS each). Overlapping passes would race on
+    // `this.warmedCores` — duplicating dials and unpinning peers that a newer
+    // pass just selected when the older promise resolves last.
+    if (this.warmCoreReconcileInFlight) return;
+    this.warmCoreReconcileInFlight = true;
+    try {
+      const result = await reconcileWarmCoreConnections({
+        selfPeerId: this.node.libp2p.peerId.toString(),
+        maxCores: WARM_CORE_MAX,
+        findCoreAgents: async (): Promise<WarmCoreAgent[]> => {
+          const agents = await this.discovery.findAgents();
+          // `selectWarmCoreCandidates` preserves input order and the cap counts
+          // *gated* cores, so freshness must be applied here: drop entries that
+          // haven't refreshed within the staleness window (stale registry rows
+          // would otherwise get dialed forever) and sort freshest-first so the
+          // `maxCores` cap is deterministic instead of arbitrary registry order.
+          const now = Date.now();
+          return agents
+            .map((a) => {
+              const seenMs = a.lastSeen ? Date.parse(a.lastSeen) : NaN;
+              return { a, seenMs: Number.isFinite(seenMs) ? seenMs : 0 };
+            })
+            // seenMs===0 → no lastSeen reported (legacy/mixed-version core):
+            // keep it (can't judge freshness) but it sorts last behind any
+            // core that does report a recent heartbeat.
+            .filter(({ seenMs }) => seenMs === 0 || now - seenMs <= AGENT_PROFILE_STALE_THRESHOLD_MS)
+            .sort((x, y) => y.seenMs - x.seenMs)
+            .map(({ a }) => ({
+              peerId: a.peerId,
+              nodeRole: a.nodeRole,
+              agentAddress: a.agentAddress,
+            }));
+        },
+        isShardingTableCore: (agentAddress) => this.isShardingTableCore(agentAddress),
+        isConnected: (peerId) =>
+          this.node.libp2p.getConnections().some((c) => c.remotePeer.toString() === peerId),
+        pin: (peerId) => this.pinWarmCore(peerId),
+        unpin: (peerId, ctx) => this.unpinWarmCore(peerId, ctx),
+        dial: (peerId, ctx) => this.dialWarmCore(peerId, ctx),
+        previouslyWarmed: this.warmedCores,
+        log: (ctx, msg) => this.log.info(ctx, msg),
+      });
+      // Carry the pinned set into the next tick so stale Cores get unpinned.
+      this.warmedCores = result.warmed;
+    } finally {
+      this.warmCoreReconcileInFlight = false;
+    }
   }
 
   /**
@@ -12222,10 +12250,18 @@ export class DKGAgent {
    */
   private resolveLocalCgIdByOnChainId(onChainId: bigint): string | null {
     const target = onChainId.toString();
+    let fallback: string | null = null;
     for (const [localId, sub] of this.subscribedContextGraphs) {
-      if (sub.onChainId === target) return localId;
+      if (sub.onChainId !== target) continue;
+      // Prefer a real subscribed cleartext CG over a synthetic host-only
+      // record (created from `ContextGraphCreated` with `subscribed:false`).
+      // Multiple local rows can share one `onChainId`; returning the synthetic
+      // one first makes a live KACG nudge exit at the next guard and become a
+      // no-op until the periodic sweep catches up.
+      if (sub.subscribed) return localId;
+      if (fallback === null) fallback = localId;
     }
-    return null;
+    return fallback;
   }
 
   /**
@@ -12284,11 +12320,13 @@ export class DKGAgent {
     // a namespace that doesn't hold the hosted SWM snapshot, so after restart
     // the reconciler + active-fetch would sync/promote against the wrong graph
     // and miss the KA this core already ACKed. The cleartext hint keeps the
-    // row under the same id the reconciler uses. Numeric/empty hints are
-    // ignored (last-resort numericStr keeps legacy behaviour).
-    const cleartextHint = swmGraphId && swmGraphId !== numericStr && !/^\d+$/.test(swmGraphId)
-      ? swmGraphId
-      : undefined;
+    // row under the same id the reconciler uses. Discard the hint ONLY when it
+    // is literally the on-chain id (`numericStr`) — that's the namespace we
+    // must avoid. A numeric-but-DIFFERENT hint (e.g. a local cleartext id "1"
+    // while the on-chain id is "42") is a legitimate local namespace and must
+    // be honoured; rejecting every all-digit hint would mis-key those CGs under
+    // the on-chain id and miss the KA after restart.
+    const cleartextHint = swmGraphId && swmGraphId !== numericStr ? swmGraphId : undefined;
     const localCgId = this.resolveLocalCgIdByOnChainId(numeric) ?? cleartextHint ?? numericStr;
     const existing = this.subscribedContextGraphs.get(localCgId);
     if (existing?.coreHosted && existing.onChainId === numericStr) return; // already recorded
@@ -12321,13 +12359,25 @@ export class DKGAgent {
   private bindSubscriptionOnChainId(localCgId: string, sub: ContextGraphSub, newOnChainId: string): void {
     const prev = sub.onChainId;
     sub.onChainId = newOnChainId;
-    if (prev && prev !== newOnChainId && (sub.lastReconciledOrdinal ?? 0) > 0) {
+    // First bind (no prior id) or no-op rebind to the same id: nothing stale.
+    if (!prev || prev === newOnChainId) return;
+
+    // The bound on-chain id actually CHANGED (repair/recreate, or a rebind
+    // after the id was cleared). ANY surviving reconcile state now points at
+    // the wrong chain graph — and that is NOT limited to a positive persisted
+    // watermark: an in-memory cursor can still hold `ahead` ordinals while the
+    // watermark is 0 (ordinals reconciled but waiting on confirmation depth).
+    // Reusing either would skip early ordinals on the new graph. So always drop
+    // the cursor AND zero the watermark whenever the id changes; the reset is
+    // persisted with the new id, keeping it restart-safe.
+    const hadState = (sub.lastReconciledOrdinal ?? 0) > 0 || this.reconcileCursors.has(localCgId);
+    sub.lastReconciledOrdinal = 0;
+    this.reconcileCursors.delete(localCgId);
+    if (hadState) {
       this.log.info(
         createOperationContext('system'),
-        `VM reconcile: on-chain id for "${localCgId}" changed ${prev}->${newOnChainId}; resetting reconcile watermark to 0`,
+        `VM reconcile: on-chain id for "${localCgId}" changed ${prev}->${newOnChainId}; cleared reconcile cursor + watermark`,
       );
-      sub.lastReconciledOrdinal = 0;
-      this.reconcileCursors.delete(localCgId);
     }
   }
 
@@ -18501,12 +18551,20 @@ export class DKGAgent {
     const includeSharedMemory = ctxGraphPart.startsWith('workspace:');
     const contextGraphId = includeSharedMemory ? ctxGraphPart.slice('workspace:'.length) : (ctxGraphPart || SYSTEM_CONTEXT_GRAPHS.AGENTS);
     const phase = normalizeSyncPhase(parts[3]);
-    // Phase C: locate a trailing `|since|<n>` keyed token (position-independent
-    // so it survives the optional phase suffix). Old encoders never emit it.
+    // Phase C: parse ONLY the trailing `|since|<n>` suffix that
+    // `buildSyncRequestEnvelope` appends last (after any phase/snapshot
+    // suffix). Scanning every segment (`indexOf('since')`) would misfire when
+    // an ordinary segment — a context-graph id or a snapshotRef literally named
+    // "since" — happens to be followed by a numeric token, turning an
+    // unfiltered sync into a partial delta response. Old encoders never emit
+    // the suffix, so the tail check simply doesn't match.
     let sinceBatchId: string | undefined;
-    const sinceIdx = parts.indexOf('since');
-    if (sinceIdx >= 0 && sinceIdx + 1 < parts.length && /^\d+$/.test(parts[sinceIdx + 1])) {
-      sinceBatchId = parts[sinceIdx + 1];
+    if (
+      parts.length >= 2 &&
+      parts[parts.length - 2] === 'since' &&
+      /^\d+$/.test(parts[parts.length - 1])
+    ) {
+      sinceBatchId = parts[parts.length - 1];
     }
     return {
       contextGraphId,

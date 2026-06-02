@@ -145,7 +145,12 @@ export async function reconcileWarmCoreConnections(
 
     // Pin BEFORE the connected-check so an already-connected Core still gets
     // (and keeps) its keep-alive tag — otherwise libp2p won't auto-redial it.
-    await deps.pin(core.peerId, ctx).catch(() => {});
+    // Only claim the slot when the pin actually succeeded: a malformed peer id
+    // or a `peerStore.merge` failure must fall through to the next healthy
+    // candidate instead of burning a `maxCores` slot on a peer we never tagged
+    // (and never dialed).
+    const pinned = await deps.pin(core.peerId, ctx).then(() => true).catch(() => false);
+    if (!pinned) continue;
     warmed.add(core.peerId);
 
     if (deps.isConnected(core.peerId)) continue;

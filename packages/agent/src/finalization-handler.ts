@@ -554,9 +554,29 @@ export class FinalizationHandler {
     const resolvedSubGraphName = snapshot.subGraphName ?? subGraphName;
 
     const finalizationVersion: MaterializedVersion = { blockNumber: versionBlock, txIndex: 0 };
-    // Chain-driven reconciliation never requests same-graph dual-write — the
-    // root-copy decision is a publisher gossip signal (`keepRootCopyOnLabel`)
-    // that has no chain equivalent. Promote per-cgId only.
+    // Chain-driven reconciliation promotes per-cgId ONLY (no same-graph
+    // dual-write to the root `<cg>/_meta` label copy).
+    //
+    // KNOWN LIMITATION (tracked follow-up, deliberately not fixed here):
+    // the dual-write decision is the publisher's `keepRootCopyOnLabel` gossip
+    // signal (`isDualWrite = keepRootCopyOnLabel && ctxGraphId && !subGraphName`,
+    // see the gossip branch above). That signal is NOT carried on-chain and is
+    // NOT persisted in the share-time SWM meta we recover from here, so the
+    // reconcile path can't faithfully reproduce it. Approximating it (e.g.
+    // "root-workspace publish ⇒ always dual-write") would risk double-counting
+    // the same triples across the root data graph and the per-cgId graph in
+    // unscoped queries — the exact hazard the dual-write logic guards against —
+    // so we choose the safe direction.
+    //
+    // Impact is bounded: this only affects a node that (a) MISSED the original
+    // finalization gossip for a SAME-GRAPH (root-label) publish AND (b) later
+    // recovers it purely via chain reconcile AND (c) is then read via an
+    // unscoped / root-label query rather than a `contextGraphId`-scoped one.
+    // Scoped reads (`agent.query(cg, …)` / `view=verified-memory` + cgId)
+    // resolve through the per-cgId graph and are unaffected — that is the path
+    // the late-subscriber scenario exercises. The correct fix is to persist
+    // `keepRootCopyOnLabel` in the share-time WorkspaceOperation meta
+    // (publisher-side) and mirror the gossip decision here.
     const isDualWrite = false;
     const defaultMeta = `did:dkg:context-graph:${contextGraphId}/_meta`;
 

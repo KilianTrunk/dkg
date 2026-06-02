@@ -188,6 +188,7 @@ export interface ReplicationCursorRow {
   on_chain_id: string | null;
   last_reconciled_ordinal: number | null;
   core_hosted: number | null;
+  subscribed: number | null;
   last_head: number | null;
   last_event_ts: number | null;
 }

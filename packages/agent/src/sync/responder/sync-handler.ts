@@ -352,6 +352,19 @@ export function registerSyncHandler(params: RegisterSyncHandlerParams): void {
         // the prefix prevents `mfacts` from matching `mfacts-2`.
         const metaGraphScope = (g: string): string =>
           `FILTER(STRSTARTS(STR(${g}), "${cgUriPrefix}/") && STRENDS(STR(${g}), "/_meta"))`;
+        // Normalise BOTH the batchId PLACEMENT and the LITERAL FORM so legacy
+        // replicated data isn't silently mis-filtered:
+        //   * Placement — newer data carries `dkg:batchId` on the KC/UAL, but
+        //     older shapes put it on the KA itself; match either via UNION, or
+        //     a KA-placed batchId would be invisible here and its rows would be
+        //     treated as un-keyed (always re-sent — safe but defeats the delta).
+        //   * Literal form — newer data is typed `xsd:integer`, legacy data is
+        //     an untyped string. A raw `?bid > "n"^^xsd:integer` errors against
+        //     an untyped `"5"`, so the row would be WRONGLY HIDDEN from the
+        //     delta. `xsd:integer(STR(?bid))` coerces both forms before compare.
+        const XSD_INT = 'http://www.w3.org/2001/XMLSchema#integer';
+        const batchIdEither = (ka: string, ual: string, bid: string): string =>
+          `{ ${ual} <${DKG_NS}batchId> ${bid} } UNION { ${ka} <${DKG_NS}batchId> ${bid} }`;
         const deltaFilter = sinceBatchId != null
           ? `
             FILTER(
@@ -359,7 +372,7 @@ export function registerSyncHandler(params: RegisterSyncHandlerParams): void {
                 GRAPH ?mgAny {
                   ${metaGraphScope('?mgAny')}
                   ?kaAny <${DKG_NS}partOf> ?ualAny ; <${DKG_NS}rootEntity> ?reAny .
-                  ?ualAny <${DKG_NS}batchId> ?bidAny .
+                  ${batchIdEither('?kaAny', '?ualAny', '?bidAny')}
                   FILTER(?reAny = ?s || STRSTARTS(STR(?s), CONCAT(STR(?reAny), "/.well-known/genid/")))
                 }
               }
@@ -368,9 +381,9 @@ export function registerSyncHandler(params: RegisterSyncHandlerParams): void {
                 GRAPH ?mgNew {
                   ${metaGraphScope('?mgNew')}
                   ?kaNew <${DKG_NS}partOf> ?ualNew ; <${DKG_NS}rootEntity> ?reNew .
-                  ?ualNew <${DKG_NS}batchId> ?bidNew .
+                  ${batchIdEither('?kaNew', '?ualNew', '?bidNew')}
                   FILTER(?reNew = ?s || STRSTARTS(STR(?s), CONCAT(STR(?reNew), "/.well-known/genid/")))
-                  FILTER(?bidNew > "${sinceBatchId.toString()}"^^<http://www.w3.org/2001/XMLSchema#integer>)
+                  FILTER(<${XSD_INT}>(STR(?bidNew)) > "${sinceBatchId.toString()}"^^<${XSD_INT}>)
                 }
               }
             )`

@@ -1036,6 +1036,7 @@ export class DashboardDB {
              s.on_chain_id                 AS on_chain_id,
              s.last_reconciled_ordinal     AS last_reconciled_ordinal,
              s.core_hosted                 AS core_hosted,
+             s.subscribed                  AS subscribed,
              (SELECT MAX(head) FROM replication_events e
                 WHERE e.context_graph_id = s.context_graph_id) AS last_head,
              (SELECT MAX(ts) FROM replication_events e
@@ -2762,6 +2763,10 @@ export interface ReplicationCursorRow {
   on_chain_id: string | null;
   last_reconciled_ordinal: number | null;
   core_hosted: number | null;
+  // 1 when this node is a member-subscriber of the CG. A row can be BOTH
+  // subscribed and core_hosted; `core_hosted=1, subscribed=0` is the pure
+  // host-only Phase D case (reconciles from chain with no member subscription).
+  subscribed: number | null;
   last_head: number | null;
   last_event_ts: number | null;
 }

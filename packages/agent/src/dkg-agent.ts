@@ -6124,6 +6124,77 @@ export class DKGAgent {
   }
 
   /**
+   * #884 review — LIVE-gated on-chain access-policy read for a CANDIDATE
+   * numeric on-chain id. The single trust anchor shared by every "downgrade
+   * to a less-protected path" decision (SWM-plaintext gate + publish-inline
+   * curated probe), so both branches can never diverge.
+   *
+   * Returns the access-policy enum (`0` = public, `1` = private/curated) ONLY
+   * after {@link ChainAdapter.isContextGraphActiveOnChain} proves the slot is
+   * actually live on-chain; otherwise returns `null` (= UNKNOWN, caller fails
+   * closed). This is essential because `getContextGraphAccessPolicy` returns
+   * Solidity's default `0` (= public) for UNKNOWN ids, and the local
+   * access-policy cache can be seeded by best-effort probes of arbitrary ids —
+   * so neither is trustworthy without a liveness proof. Both the liveness and
+   * the policy reads are bounded by {@link raceChainPolicyRead} so a hung RPC
+   * fails closed (`null`) instead of blocking the hot path. A genuine RPC
+   * rejection propagates to the caller (which logs + fails closed in its own
+   * idiom). `null` is returned when: the id is non-numeric/≤0, no liveness
+   * probe is implemented, the slot is not live, a read times out, or the
+   * policy getter is missing / returns an out-of-range value.
+   */
+  private async readLiveOnChainAccessPolicy(
+    onChainId: string,
+    opCtx?: OperationContext,
+  ): Promise<0 | 1 | null> {
+    let numericId: bigint;
+    try {
+      numericId = BigInt(onChainId);
+    } catch {
+      return null;
+    }
+    if (numericId <= 0n) return null;
+
+    if (typeof this.chain.isContextGraphActiveOnChain !== 'function') return null;
+    const live = await this.raceChainPolicyRead(
+      this.chain.isContextGraphActiveOnChain(numericId),
+    );
+    if (live === TIMEOUT_SENTINEL) {
+      this.log.warn(
+        opCtx ?? createOperationContext('share'),
+        `readLiveOnChainAccessPolicy(${onChainId}): isContextGraphActiveOnChain timed out after ` +
+        `${CHAIN_POLICY_READ_TIMEOUT_MS}ms — treating on-chain access policy as UNKNOWN (fail-closed)`,
+      );
+      return null;
+    }
+    if (live !== true) return null;
+
+    // Slot is LIVE → its access policy is authoritative. The cache is now a
+    // safe fast-path: a probe-poisoned default-0 for an unregistered id can
+    // never reach here (that id would not be live).
+    const cached = this.onChainAccessPolicyCache.get(onChainId);
+    if (cached === 0 || cached === 1) return cached;
+    const getAccessPolicy = this.chain.getContextGraphAccessPolicy;
+    if (typeof getAccessPolicy !== 'function') return null;
+    const policy = await this.raceChainPolicyRead(
+      getAccessPolicy.call(this.chain, numericId),
+    );
+    if (policy === TIMEOUT_SENTINEL) {
+      this.log.warn(
+        opCtx ?? createOperationContext('share'),
+        `readLiveOnChainAccessPolicy(${onChainId}): getContextGraphAccessPolicy timed out after ` +
+        `${CHAIN_POLICY_READ_TIMEOUT_MS}ms — treating on-chain access policy as UNKNOWN (fail-closed)`,
+      );
+      return null;
+    }
+    if (policy === 0 || policy === 1) {
+      this.onChainAccessPolicyCache.set(onChainId, policy);
+      return policy;
+    }
+    return null;
+  }
+
+  /**
    * True iff `contextGraphId` is DEFINITIVELY public per its on-chain
    * access policy (policy enum `0`). Gates SWM encryption: an on-chain
    * public CG is public-readable, so its shared memory must be plaintext
@@ -6174,69 +6245,15 @@ export class DKGAgent {
         onChainId = trimmed;
       }
       if (!onChainId) return false;
-      let numericId: bigint;
-      try {
-        numericId = BigInt(onChainId);
-      } catch {
-        return false;
-      }
-      if (numericId <= 0n) return false;
 
       // LIVE-ON-CHAIN PROOF GATE (#884 review). A "public ⇒ plaintext" decision
-      // must be backed by the chain, never by local state alone:
-      //   - chain adapters return access-policy 0 (= public) for UNKNOWN ids
-      //     (Solidity default-zero), so reading policy for an unregistered id
-      //     is silently permissive;
-      //   - onChainAccessPolicyCache is also seeded by best-effort probes of
-      //     arbitrary numeric ids (so an unregistered id can read back as 0);
-      //   - subscribedContextGraphs.onChainId is rehydrated from disk at
-      //     startup and can be stale after a devnet reset;
-      //   - a persisted ...OnChainId triple / local accessPolicy literal can
-      //     likewise be stranded (intent, not authoritative state).
-      // So trust the access policy ONLY after the chain confirms the slot is
-      // actually LIVE. Bounded by raceChainPolicyRead so a hung RPC fails
-      // closed instead of blocking the share/promote/publish hot path. Without
-      // a liveness probe, or on flake/timeout, fail closed (encrypted SWM).
-      const chainProbe = this.chain as ChainAdapter & {
-        isContextGraphActiveOnChain?: (id: bigint) => Promise<boolean>;
-      };
-      if (typeof chainProbe.isContextGraphActiveOnChain !== 'function') return false;
-      const live = await this.raceChainPolicyRead(
-        chainProbe.isContextGraphActiveOnChain(numericId),
-      );
-      if (live === TIMEOUT_SENTINEL) {
-        this.log.warn(
-          opCtx ?? createOperationContext('share'),
-          `isContextGraphPublicOnChain(${contextGraphId}): isContextGraphActiveOnChain(${onChainId}) ` +
-          `timed out after ${CHAIN_POLICY_READ_TIMEOUT_MS}ms — treating CG as NOT public (fail-closed)`,
-        );
-        return false;
-      }
-      if (live !== true) return false;
-
-      // Slot is LIVE → its access policy is authoritative. The cache is now a
-      // safe fast-path: a probe-poisoned default-0 for an unregistered id can
-      // never reach here (that id would not be live).
-      const cached = this.onChainAccessPolicyCache.get(onChainId);
-      if (cached !== undefined) return cached === 0;
-      const getAccessPolicy = this.chain.getContextGraphAccessPolicy;
-      if (typeof getAccessPolicy !== 'function') return false;
-      const policy = await this.raceChainPolicyRead(
-        getAccessPolicy.call(this.chain, numericId),
-      );
-      if (policy === TIMEOUT_SENTINEL) {
-        this.log.warn(
-          opCtx ?? createOperationContext('share'),
-          `isContextGraphPublicOnChain(${contextGraphId}): getContextGraphAccessPolicy(${onChainId}) ` +
-          `timed out after ${CHAIN_POLICY_READ_TIMEOUT_MS}ms — treating CG as NOT public (fail-closed)`,
-        );
-        return false;
-      }
-      if (policy === 0 || policy === 1) {
-        this.onChainAccessPolicyCache.set(onChainId, policy);
-        return policy === 0;
-      }
-      return false;
+      // must be backed by the chain, never by local state alone — see
+      // readLiveOnChainAccessPolicy for the full rationale (default-zero
+      // access policy for unknown ids, probe-poisoned cache, stale rehydrated
+      // subscriptions / persisted mappings). It returns the policy ONLY once
+      // the slot is proven live, else null (UNKNOWN) → fail closed here.
+      const policy = await this.readLiveOnChainAccessPolicy(onChainId, opCtx);
+      return policy === 0;
     } catch (err) {
       // Fail closed (curated/encrypted) on any lookup failure, but not
       // silently — surface WHY the public override was skipped so operators
@@ -9232,30 +9249,27 @@ export class DKGAgent {
       try {
         if (await this.isPrivateContextGraph(cgId)) return true;
       } catch { /* fall through to chain probe */ }
-      const cached = this.onChainAccessPolicyCache.get(cgId);
-      if (cached !== undefined) return cached === 1;
-      let numericId: bigint;
+      // #884 review (🔴): for a bare on-chain numeric id, read the access
+      // policy ONLY behind a LIVE proof — the same gate isContextGraphPublicOnChain
+      // uses. getContextGraphAccessPolicy returns Solidity's permissive default
+      // 0 (= public) for UNKNOWN ids, and the policy cache can be probe-poisoned
+      // for arbitrary numeric ids, so an unregistered numeric id must NOT be
+      // downgraded to the plaintext-inline path: readLiveOnChainAccessPolicy
+      // returns null (UNKNOWN) unless the slot is proven live, and a null here
+      // makes the caller fail closed (throws "publish access-policy is unknown")
+      // rather than choosing plaintext. A non-numeric local CG carries no
+      // on-chain id, so it keeps its existing plaintext-inline default.
+      // policy 1 (private/curated) ⇒ curated; 0 (public) ⇒ not curated (this
+      // branch is normally pre-empted by the public check above).
+      if (!/^\d+$/.test(cgId.trim())) return false;
       try {
-        numericId = BigInt(cgId);
-      } catch {
-        return false;
-      }
-      if (numericId <= 0n) return false;
-      const getAccessPolicy = this.chain.getContextGraphAccessPolicy;
-      if (typeof getAccessPolicy !== 'function') {
-        return null;
-      }
-      try {
-        const policy = await getAccessPolicy.call(this.chain, numericId);
-        if (policy === 0 || policy === 1) {
-          this.onChainAccessPolicyCache.set(cgId, policy);
-          return policy === 1;
-        }
-        return null;
+        const policy = await this.readLiveOnChainAccessPolicy(cgId.trim(), ctx);
+        if (policy === null) return null;
+        return policy === 1;
       } catch (err) {
-        this.log.warn(ctx, `${logPrefix}: chain.getContextGraphAccessPolicy(${cgId}) failed — treating as UNKNOWN (fail-closed): ${err instanceof Error ? err.message : String(err)}`);
+        this.log.warn(ctx, `${logPrefix}: chain access-policy probe for ${cgId} failed — treating as UNKNOWN (fail-closed): ${err instanceof Error ? err.message : String(err)}`);
+        return null;
       }
-      return null;
     };
     const sourceIsCurated = await probeIsCurated(contextGraphId);
     const targetIsCurated = targetCgId === contextGraphId
@@ -14487,12 +14501,9 @@ export class DKGAgent {
     const existingOnChainId = await this.getContextGraphOnChainId(id);
     if (existingOnChainId) {
       let onChainLive = false;
-      const chainWithCgProbe = this.chain as ChainAdapter & {
-        isContextGraphActiveOnChain?: (id: bigint) => Promise<boolean>;
-      };
-      if (typeof chainWithCgProbe.isContextGraphActiveOnChain === 'function') {
+      if (typeof this.chain.isContextGraphActiveOnChain === 'function') {
         try {
-          onChainLive = await chainWithCgProbe.isContextGraphActiveOnChain(BigInt(existingOnChainId));
+          onChainLive = await this.chain.isContextGraphActiveOnChain(BigInt(existingOnChainId));
         } catch {
           onChainLive = false;
         }

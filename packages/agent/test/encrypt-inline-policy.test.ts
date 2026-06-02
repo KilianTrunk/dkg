@@ -50,8 +50,11 @@ function makeAgentLike(opts: {
   // access-policy 0 (= public) for UNKNOWN ids, so an unregistered numeric id
   // must never be classified public. The probe above (default live) lets the
   // public-CG cases pass; the registration-proof case opts out with `false`.
-  // isContextGraphPublicOnChain wraps its chain reads in raceChainPolicyRead —
-  // bind it so `this.raceChainPolicyRead` exists.
+  // isContextGraphPublicOnChain / probeIsCurated route their chain reads
+  // through readLiveOnChainAccessPolicy (which wraps raceChainPolicyRead) —
+  // bind both so `this.readLiveOnChainAccessPolicy` / `this.raceChainPolicyRead`
+  // exist on the harness.
+  agentLike.readLiveOnChainAccessPolicy = (DKGAgent.prototype as any).readLiveOnChainAccessPolicy;
   agentLike.raceChainPolicyRead = (DKGAgent.prototype as any).raceChainPolicyRead;
   return agentLike;
 }

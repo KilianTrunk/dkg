@@ -154,10 +154,6 @@ const MOCK_EXEMPT_FROM_EVM = new Set<string>([
   // pad parity for no behavioural reason.
   'invalidatePublishPreflightCache',
   // #820 (RFC-39 ciphertext/immutable ACK binding): EVM-only surfaces.
-  //  - `isContextGraphActiveOnChain` is a `ContextGraphStorage.isContextGraphActive`
-  //    read. Its sole upstream caller (dkg-agent CG-liveness probe) already
-  //    feature-detects it via `typeof === 'function'` and degrades gracefully
-  //    when absent, so the mock has no method-not-implemented surprise.
   //  - `computeV10UpdateAckDigest` mirrors the on-chain
   //    `KnowledgeAssetsLifecycle._executeUpdateCore` ACK-digest packing for
   //    test helpers / ACK collectors. The mock performs no real signature
@@ -168,7 +164,12 @@ const MOCK_EXEMPT_FROM_EVM = new Set<string>([
   //    and `AskStorage.getStakeWeightedAverageAsk` to mirror the contract's
   //    growth-cost validator. The mock skips on-chain validation entirely, so
   //    there's nothing to reproduce here.
-  'isContextGraphActiveOnChain',
+  // NOTE: `isContextGraphActiveOnChain` was previously EVM-only here. It now
+  // has a second upstream caller — the #884 SWM-plaintext liveness gate
+  // (`isContextGraphPublicOnChain`) — so the mock MUST mirror it (otherwise
+  // mock-backed flows silently strand on-chain-public CGs on the encrypted
+  // path). MockChainAdapter now implements it (CG present in registry ⇒ live),
+  // so it is no longer exempt from parity.
   'computeV10UpdateAckDigest',
   'resolveCurrentTokenAmount',
   'computeUpdateNewTokenAmount',

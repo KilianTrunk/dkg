@@ -410,6 +410,18 @@ export class ACKCollector {
       });
     };
 
+    // PR #896 review (🟡): once the round is decided — quorum reached, timed
+    // out, or proven impossible — any `requestACK` loop still sleeping
+    // between retries must bail on wake instead of continuing to dial. With
+    // the widened #887 transient-decline budget (~31s) a losing peer could
+    // otherwise keep retrying long after `collect()` already resolved,
+    // emitting avoidable ACK traffic and log noise. `roundSettled` is set
+    // when the outer race settles; `roundIsOver()` also treats a satisfied
+    // quorum as terminal so a peer mid-backoff bails the instant the last
+    // needed ACK lands elsewhere.
+    let roundSettled = false;
+    const roundIsOver = () => roundSettled || collected.length >= REQUIRED_ACKS;
+
     const sleep = this.deps.sleep ?? ((ms: number) => new Promise<void>(r => setTimeout(r, ms)));
 
     const requestACK = async (peerId: string): Promise<CollectedACK | null> => {
@@ -453,6 +465,13 @@ export class ACKCollector {
             // transport retries gave only ~3s, which a fresh CG's first
             // gossip push to its assigned cores routinely overran.
             if (isTransientStorageACKDeclineCode(code) && declineRetries < MAX_TRANSIENT_DECLINE_RETRIES) {
+              if (roundIsOver()) {
+                log(
+                  `[ACKCollector] Quorum already settled — abandoning transient-decline ` +
+                  `retry for ${peerId.slice(-8)} (${code})`,
+                );
+                return null;
+              }
               declineRetries += 1;
               const waitMs = transientDeclineBackoffMs(declineRetries);
               log(
@@ -539,6 +558,13 @@ export class ACKCollector {
           const msg = err instanceof Error ? err.message : String(err);
           transportAttempts += 1;
           if (transportAttempts < MAX_RETRIES) {
+            if (roundIsOver()) {
+              log(
+                `[ACKCollector] Quorum already settled — abandoning transport retry ` +
+                `for ${peerId.slice(-8)}: ${msg}`,
+              );
+              return null;
+            }
             log(`[ACKCollector] Retry ${transportAttempts}/${MAX_RETRIES} for ${peerId.slice(-8)}: ${msg}`);
             await sleep(transportAttempts * 1000);
             continue;
@@ -595,43 +621,53 @@ export class ACKCollector {
       }
     };
 
-    await Promise.race([
-      (async () => {
-        const promises = corePeers.map(async (peerId) => {
-          if (collected.length >= REQUIRED_ACKS) {
-            settlePeer();
-            return;
-          }
-          try {
-            const ack = await requestACK(peerId);
-            if (ack && !seenPeers.has(ack.peerId) && !seenIdentityIds.has(ack.nodeIdentityId)) {
-              seenPeers.add(ack.peerId);
-              seenIdentityIds.add(ack.nodeIdentityId);
-              collected.push(ack);
-              if (collected.length >= REQUIRED_ACKS) {
-                quorumResolve?.();
-              }
+    try {
+      await Promise.race([
+        (async () => {
+          const promises = corePeers.map(async (peerId) => {
+            if (collected.length >= REQUIRED_ACKS) {
+              settlePeer();
+              return;
             }
-          } finally {
-            settlePeer();
-          }
-        });
-        await Promise.race([Promise.allSettled(promises), quorumPromise]);
-      })(),
-      impossiblePromise,
-      new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new QuorumUnmetError({
-          collected: collected.length,
-          required: REQUIRED_ACKS,
-          dialled: corePeers.length,
-          peerOutcomes: snapshotPeerOutcomes(),
-          legacyMessage:
-            `storage_ack_timeout: only ${collected.length}/${REQUIRED_ACKS} ACKs received within ${ACK_TIMEOUT_MS}ms.${formatDeclineDetail()}`,
-        })),
-          ACK_TIMEOUT_MS,
+            try {
+              const ack = await requestACK(peerId);
+              if (ack && !seenPeers.has(ack.peerId) && !seenIdentityIds.has(ack.nodeIdentityId)) {
+                seenPeers.add(ack.peerId);
+                seenIdentityIds.add(ack.nodeIdentityId);
+                collected.push(ack);
+                if (collected.length >= REQUIRED_ACKS) {
+                  // Eagerly mark the round settled so any peers still mid-
+                  // backoff bail before their next dial (see `roundIsOver`).
+                  roundSettled = true;
+                  quorumResolve?.();
+                }
+              }
+            } finally {
+              settlePeer();
+            }
+          });
+          await Promise.race([Promise.allSettled(promises), quorumPromise]);
+        })(),
+        impossiblePromise,
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new QuorumUnmetError({
+            collected: collected.length,
+            required: REQUIRED_ACKS,
+            dialled: corePeers.length,
+            peerOutcomes: snapshotPeerOutcomes(),
+            legacyMessage:
+              `storage_ack_timeout: only ${collected.length}/${REQUIRED_ACKS} ACKs received within ${ACK_TIMEOUT_MS}ms.${formatDeclineDetail()}`,
+          })),
+            ACK_TIMEOUT_MS,
+          ),
         ),
-      ),
-    ]);
+      ]);
+    } finally {
+      // The round is decided (quorum, timeout, or impossible-quorum). Signal
+      // any `requestACK` loops still sleeping between retries to abandon on
+      // wake rather than keep dialing after the caller has its answer.
+      roundSettled = true;
+    }
 
     if (collected.length < REQUIRED_ACKS) {
       throw new QuorumUnmetError({

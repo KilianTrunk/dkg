@@ -1094,6 +1094,59 @@ export class EVMChainAdapter implements ChainAdapter {
     return { signedTx, txHash };
   }
 
+  /**
+   * #888: populate + sign a V10 write tx with one-shot recovery for a
+   * stale-RPC `TooLowAllowance` revert, shared by BOTH V10 write paths
+   * (`createKnowledgeAssets` publish and `updateV10` — incl. metadata-only
+   * updates). ethers estimates gas while populating; on an internally
+   * load-balanced RPC that estimate can read a stale TRAC allowance and
+   * revert `TooLowAllowance` even though the approve above succeeded
+   * (post-approve propagation lag) or was skipped on a stale-high read of an
+   * allowance the prior write already consumed. This is strictly
+   * pre-broadcast (before the `onBroadcast` WAL checkpoint), so on that one
+   * revert we force a fresh approve up to the publish floor — confirming it
+   * is visible on the same read path via `ensureV10ApproveTrac(force=true)` —
+   * and retry populate+sign exactly once. Any other error, or a second
+   * `TooLowAllowance`, propagates unchanged.
+   */
+  private async populateAndSignV10WithAllowanceRecovery(
+    signer: Wallet,
+    kaContract: Contract,
+    method: 'publish' | 'update',
+    methodParams: unknown,
+    kav10Address: string,
+    tokenAmount: bigint,
+    reapproveLabel: string,
+  ): Promise<{ signedTx: string; txHash: string }> {
+    let forcedReapprove = false;
+    for (;;) {
+      try {
+        const populated = await (kaContract as any)[method].populateTransaction(
+          methodParams,
+        );
+        return await this.signPopulatedTransaction(signer, populated);
+      } catch (err) {
+        if (!forcedReapprove && isTooLowAllowanceError(err)) {
+          forcedReapprove = true;
+          console.warn(
+            `[chain] V10 ${method} gas-estimation reverted TooLowAllowance for ` +
+            `signer=${signer.address} — forcing a fresh TRAC approve and ` +
+            `retrying once (likely a stale RPC allowance read, #888).`,
+          );
+          await this.ensureV10ApproveTrac(
+            signer,
+            kav10Address,
+            tokenAmount,
+            reapproveLabel,
+            true,
+          );
+          continue;
+        }
+        throw err;
+      }
+    }
+  }
+
   private async sendSignedTransactionAndWait(
     signedTx: string,
     txHash: string,
@@ -2931,49 +2984,22 @@ export class EVMChainAdapter implements ChainAdapter {
     // This also gives the WAL the pre-broadcast tx hash (ethers v6
     // exposes it on the returned TransactionResponse), so recovery can
     // reconcile an in-flight tx after a daemon crash.
-    // #888: ethers estimates gas while populating the publish tx. On an
-    // internally load-balanced RPC that estimate can read a stale TRAC
-    // allowance and revert `TooLowAllowance` even though the approve
-    // above succeeded (post-approve propagation lag) or was skipped on a
-    // stale-high read of an allowance the prior publish already consumed.
-    // This happens strictly BEFORE the `onBroadcast` WAL checkpoint and
-    // the broadcast below, so on that one revert we force a fresh approve
-    // and retry the populate+sign exactly once. Any other error — or a
-    // second `TooLowAllowance` — propagates unchanged.
-    let signedTx!: string;
-    let preBroadcastTxHash!: string;
-    {
-      let forcedReapprove = false;
-      for (;;) {
-        try {
-          const populated = await (ka as any).publish.populateTransaction(
-            publishParamsStruct,
-          );
-          const signed = await this.signPopulatedTransaction(txSigner, populated);
-          signedTx = signed.signedTx;
-          preBroadcastTxHash = signed.txHash;
-          break;
-        } catch (err) {
-          if (!forcedReapprove && isTooLowAllowanceError(err)) {
-            forcedReapprove = true;
-            console.warn(
-              `[chain] V10 publish gas-estimation reverted TooLowAllowance for ` +
-              `signer=${txSigner.address} — forcing a fresh TRAC approve and ` +
-              `retrying once (likely a stale RPC allowance read, #888).`,
-            );
-            await this.ensureV10ApproveTrac(
-              txSigner,
-              kaAddress,
-              params.tokenAmount,
-              'approve V10 publish TRAC (forced re-approve, #888)',
-              true,
-            );
-            continue;
-          }
-          throw err;
-        }
-      }
-    }
+    // #888: populate (which gas-estimates and can revert `TooLowAllowance`
+    // on a stale RPC allowance read) + sign, with a one-shot forced-approve
+    // recovery shared with `updateV10` — see
+    // `populateAndSignV10WithAllowanceRecovery`. This runs strictly BEFORE
+    // the `onBroadcast` WAL checkpoint and the broadcast below, so the
+    // forced re-approve + single retry has no on-chain side effect.
+    const { signedTx, txHash: preBroadcastTxHash } =
+      await this.populateAndSignV10WithAllowanceRecovery(
+        txSigner,
+        ka as Contract,
+        'publish',
+        publishParamsStruct,
+        kaAddress,
+        params.tokenAmount,
+        'approve V10 publish TRAC (forced re-approve, #888)',
+      );
     // Derive the pre-broadcast tx hash from the signed raw hex so WAL
     // consumers can log the exact identity of the tx about to hit the
     // wire. After broadcast completes, the receipt hash matches this.
@@ -3526,8 +3552,21 @@ export class EVMChainAdapter implements ChainAdapter {
     // into a single entrypoint: the contract auto-detects PCA discount
     // via `agentToAccountId(msg.sender)` for any positive
     // `deltaTokenAmount`.
-    const populated = await (ka as any).update.populateTransaction(updateParams);
-    const { signedTx, txHash: preBroadcastTxHash } = await this.signPopulatedTransaction(signer, populated);
+    // #888: same stale-allowance recovery as the publish path. Metadata-only
+    // updates (`newTokenAmount === 0n`, floored to a 1-wei approve) are just
+    // as exposed to a stale `TooLowAllowance` read on a load-balanced RPC, so
+    // route both V10 write paths through the shared helper. Strictly
+    // pre-broadcast — no on-chain side effect from the forced re-approve.
+    const { signedTx, txHash: preBroadcastTxHash } =
+      await this.populateAndSignV10WithAllowanceRecovery(
+        signer,
+        ka as Contract,
+        'update',
+        updateParams,
+        kav10Address,
+        newTokenAmount,
+        'approve V10 update TRAC (forced re-approve, #888)',
+      );
     // Codex PR #241 iter-7: `await` so async WAL writes complete
     // before broadcast (see publish above for the full rationale).
     try {

@@ -314,6 +314,70 @@ describe('ACKCollector', () => {
     }
   });
 
+  // PR #896 review (🟡): the widened #887 transient-decline budget (~31s)
+  // must NOT keep a losing peer dialing after quorum has already formed
+  // elsewhere. A peer still mid-retry when the last needed ACK lands must
+  // bail on its next wake instead of burning its full budget — otherwise a
+  // successful publish leaves ~30s of avoidable ACK traffic + log noise
+  // running in the background after `collect()` returned.
+  it('abandons transient-decline retries once quorum is reached elsewhere (#896)', async () => {
+    const callsByPeer = new Map<string, number>();
+    const deps: ACKCollectorDeps = {
+      gossipPublish: async () => {},
+      // Collapse the collector's own backoff so an unfixed build would
+      // race through all 7 transient-decline sends near-instantly.
+      sleep: async () => {},
+      sendP2P: async (peerId) => {
+        callsByPeer.set(peerId, (callsByPeer.get(peerId) ?? 0) + 1);
+        if (peerId === 'peer-3') {
+          // The slow peer: its SWM is catching up, and each response
+          // arrives well after the three fast cores have already formed
+          // quorum. The real delay guarantees quorum is settled before
+          // peer-3's first decline is processed, so the bail is
+          // deterministic rather than scheduler-dependent.
+          await new Promise((r) => setTimeout(r, 25));
+          return encodeDecline('NO_DATA_IN_SWM');
+        }
+        const idx = parseInt(peerId.replace('peer-', ''), 10);
+        const { r, vs } = await signACK(coreWallets[idx], testCGId, merkleRoot, 1, 100n);
+        return encodeStorageACK({
+          merkleRoot,
+          coreNodeSignatureR: r,
+          coreNodeSignatureVS: vs,
+          contextGraphId: testCGIdStr,
+          nodeIdentityId: idx + 1,
+        });
+      },
+      getConnectedCorePeers: () => ['peer-0', 'peer-1', 'peer-2', 'peer-3'],
+      log: () => {},
+    };
+
+    const collector = new ACKCollector(deps);
+    const result = await collector.collect({
+      merkleRoot,
+      contextGraphId: testCGId,
+      contextGraphIdStr: testCGIdStr,
+      publisherPeerId: 'publisher-0',
+      publicByteSize: 100n,
+      isPrivate: false,
+      kaCount: 1,
+      rootEntities: ['urn:a'],
+      chainId: TEST_CHAIN_ID,
+      kav10Address: TEST_KAV10_ADDR,
+      merkleLeafCount,
+    });
+
+    expect(result.acks).toHaveLength(3);
+    // Let peer-3's in-flight decline resolve and the bail decision land.
+    // A budget long enough that an unfixed build (which keeps retrying
+    // after quorum) would have issued all 7 sends.
+    await new Promise((r) => setTimeout(r, 300));
+    // Fixed: peer-3 issued exactly its one in-flight dial, then bailed on
+    // wake because quorum was already settled. Unfixed: it would have run
+    // the full 1 + MAX_TRANSIENT_DECLINE_RETRIES = 7 sends.
+    expect(callsByPeer.get('peer-3')).toBe(1);
+  });
+
   it('rejects ACKs with wrong merkle root', async () => {
     const wrongRoot = new Uint8Array(32).fill(0xff);
     const deps: ACKCollectorDeps = {

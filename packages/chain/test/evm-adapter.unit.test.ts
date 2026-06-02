@@ -2519,3 +2519,88 @@ describe('ensureV10ApproveTrac — forced re-approve + visibility poll (#888)', 
     expect(tokenWithSigner.allowance).toHaveBeenCalledTimes(7);
   }, 15_000);
 });
+
+// PR #896 review (🔴): the forced-re-approve recovery was inlined in the
+// publish path only, leaving `updateV10` exposed to the same stale-allowance
+// race on metadata-only updates. The recovery now lives in a shared helper
+// (`populateAndSignV10WithAllowanceRecovery`) used by BOTH V10 write paths.
+// These tests pin that shared behaviour directly.
+function makeRecoveryAdapter() {
+  const a = new EVMChainAdapter(minimalConfig());
+  const ensureSpy = vi.fn(async () => {});
+  const signSpy = vi.fn(async () => ({ signedTx: '0xsigned', txHash: '0xhash' }));
+  (a as any).ensureV10ApproveTrac = ensureSpy;
+  (a as any).signPopulatedTransaction = signSpy;
+  return { a, ensureSpy, signSpy, signer: new ethers.Wallet(DEPLOYER_PK) };
+}
+
+const tooLowAllowanceRevert = () =>
+  new Error('execution reverted: TooLowAllowance(0xTRAC, 0, 1)');
+
+describe('populateAndSignV10WithAllowanceRecovery — shared publish/update recovery (#888/#896)', () => {
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  // The 🔴 fix: BOTH write paths recover from a pre-broadcast
+  // `TooLowAllowance` revert, not just publish.
+  it.each(['publish', 'update'] as const)(
+    'forces a fresh approve and retries populate+sign exactly once on a stale TooLowAllowance (%s)',
+    async (method) => {
+      const { a, ensureSpy, signSpy, signer } = makeRecoveryAdapter();
+      const populate = vi.fn()
+        .mockRejectedValueOnce(tooLowAllowanceRevert())
+        .mockResolvedValueOnce({ to: V10_KA_ADDRESS, data: '0xabcd' });
+      const kaContract = { [method]: { populateTransaction: populate } };
+
+      const result = await (a as any).populateAndSignV10WithAllowanceRecovery(
+        signer,
+        kaContract,
+        method,
+        { some: 'params' },
+        V10_KA_ADDRESS,
+        0n,
+        `approve V10 ${method} TRAC (forced re-approve, #888)`,
+      );
+
+      expect(result).toEqual({ signedTx: '0xsigned', txHash: '0xhash' });
+      expect(populate).toHaveBeenCalledTimes(2); // initial revert + one retry
+      expect(signSpy).toHaveBeenCalledTimes(1);  // signed only after the retry
+      // forced re-approve fired once, against the right KA + with force=true.
+      expect(ensureSpy).toHaveBeenCalledTimes(1);
+      expect(ensureSpy.mock.calls[0][0]).toBe(signer);
+      expect(ensureSpy.mock.calls[0][1]).toBe(V10_KA_ADDRESS);
+      expect(ensureSpy.mock.calls[0][4]).toBe(true);
+    },
+  );
+
+  it('propagates a SECOND consecutive TooLowAllowance (recovery is one-shot, no infinite loop)', async () => {
+    const { a, ensureSpy, signSpy, signer } = makeRecoveryAdapter();
+    const populate = vi.fn().mockRejectedValue(tooLowAllowanceRevert());
+    const kaContract = { publish: { populateTransaction: populate } };
+
+    await expect(
+      (a as any).populateAndSignV10WithAllowanceRecovery(
+        signer, kaContract, 'publish', {}, V10_KA_ADDRESS, 0n, 'label',
+      ),
+    ).rejects.toThrow('TooLowAllowance');
+
+    expect(populate).toHaveBeenCalledTimes(2); // initial + one forced retry, then give up
+    expect(ensureSpy).toHaveBeenCalledTimes(1);
+    expect(signSpy).not.toHaveBeenCalled();
+  });
+
+  it('propagates an unrelated revert immediately without forcing a re-approve', async () => {
+    const { a, ensureSpy, signSpy, signer } = makeRecoveryAdapter();
+    const populate = vi.fn().mockRejectedValue(new Error('execution reverted: NotBatchPublisher()'));
+    const kaContract = { update: { populateTransaction: populate } };
+
+    await expect(
+      (a as any).populateAndSignV10WithAllowanceRecovery(
+        signer, kaContract, 'update', {}, V10_KA_ADDRESS, 0n, 'label',
+      ),
+    ).rejects.toThrow('NotBatchPublisher');
+
+    expect(populate).toHaveBeenCalledTimes(1); // no retry on a non-allowance error
+    expect(ensureSpy).not.toHaveBeenCalled();
+    expect(signSpy).not.toHaveBeenCalled();
+  });
+});

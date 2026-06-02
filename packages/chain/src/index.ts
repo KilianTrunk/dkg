@@ -9,7 +9,6 @@ export {
   resolveRpcUrls,
   effectivePublishAllowance,
   computeApprovalAction,
-  isTooLowAllowanceError,
   V10_PUBLISH_ONCHAIN_MIN_ALLOWANCE,
 } from './evm-adapter.js';
 export { NoChainAdapter } from './no-chain-adapter.js';

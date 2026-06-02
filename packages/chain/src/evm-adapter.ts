@@ -1332,9 +1332,19 @@ export class EVMChainAdapter implements ChainAdapter {
     for (let i = 0; i < POLL_ATTEMPTS; i += 1) {
       let current = -1n;
       try {
-        current = (await token.allowance(owner, spender)) as bigint;
+        // Bound each read: a raw `token.allowance()` on a hung / read-stalled
+        // RPC would otherwise never reject and could block this "bounded"
+        // recovery poll indefinitely. `withTimeout` rejects after
+        // `RPC_READ_STALL_TIMEOUT_MS`, which the catch below treats as a
+        // not-yet-visible read and backs off (same as a thrown read error).
+        current = (await withTimeout(
+          token.allowance(owner, spender),
+          RPC_READ_STALL_TIMEOUT_MS,
+          'allowance visibility poll',
+        )) as bigint;
       } catch {
-        // Transient read failure — treat as not-yet-visible and back off.
+        // Transient read failure / stall timeout — treat as not-yet-visible
+        // and back off.
         current = -1n;
       }
       if (current >= target) return;

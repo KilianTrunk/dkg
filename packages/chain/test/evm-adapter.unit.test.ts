@@ -2518,6 +2518,34 @@ describe('ensureV10ApproveTrac — forced re-approve + visibility poll (#888)', 
     // revert if the allowance genuinely never propagates.
     expect(tokenWithSigner.allowance).toHaveBeenCalledTimes(7);
   }, 15_000);
+
+  // PR #896 review (🔴): each visibility-poll read must be bounded by a
+  // timeout. A raw `token.allowance()` on a hung / read-stalled RPC never
+  // rejects, so without `withTimeout` the supposedly-bounded recovery poll
+  // could block publish/update indefinitely. Drive the whole loop under fake
+  // timers and assert it resolves (does not hang) even when every read stalls
+  // forever.
+  it('bounds each visibility poll with a timeout so a hung RPC read cannot block the recovery (#896)', async () => {
+    vi.useFakeTimers();
+    try {
+      const a = new EVMChainAdapter(minimalConfig());
+      // allowance() returns a promise that never settles — a hung RPC read.
+      const token = { allowance: vi.fn(() => new Promise<bigint>(() => {})) };
+      const done = vi.fn();
+      const poll = (a as any)
+        .confirmAllowanceVisible(token, '0xowner', V10_KA_ADDRESS, 1n)
+        .then(done);
+      // Advance past 6 × (4s read timeout) + the capped backoff sleeps.
+      await vi.advanceTimersByTimeAsync(60_000);
+      await poll;
+      // Resolved rather than hanging, and each of the 6 bounded reads was
+      // attempted (and timed out) instead of blocking on the first one.
+      expect(done).toHaveBeenCalledTimes(1);
+      expect(token.allowance).toHaveBeenCalledTimes(6);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 // PR #896 review (🔴): the forced-re-approve recovery was inlined in the

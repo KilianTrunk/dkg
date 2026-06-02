@@ -378,6 +378,77 @@ describe('ACKCollector', () => {
     expect(callsByPeer.get('peer-3')).toBe(1);
   });
 
+  // PR #896 review (🔴): the `roundIsOver()` guard must also be checked AFTER
+  // each backoff sleep — quorum can settle WHILE a peer is mid-backoff, and
+  // without the second guard the next `continue` would still fire one more
+  // `sendP2P`. Here peer-3 declines BEFORE quorum (so the pre-sleep guard
+  // passes and it sleeps), quorum forms during that sleep, and the post-sleep
+  // guard must catch it — leaving peer-3 at exactly one dial.
+  it('abandons a retry when quorum settles DURING the backoff sleep (#896 post-sleep guard)', async () => {
+    const callsByPeer = new Map<string, number>();
+    let releaseFastPeers!: () => void;
+    const fastPeersGate = new Promise<void>((r) => { releaseFastPeers = r; });
+    let sleepCount = 0;
+
+    const deps: ACKCollectorDeps = {
+      gossipPublish: async () => {},
+      // The first sleep is peer-3's backoff. Release the three fast peers so
+      // they ACK and form quorum, then hold the sleep open long enough for
+      // their ACKs to be collected — so the round is settled by the time the
+      // sleep resolves and peer-3 re-checks `roundIsOver()` on wake.
+      sleep: async () => {
+        sleepCount += 1;
+        if (sleepCount === 1) {
+          releaseFastPeers();
+          await new Promise((r) => setTimeout(r, 100));
+        }
+      },
+      sendP2P: async (peerId) => {
+        callsByPeer.set(peerId, (callsByPeer.get(peerId) ?? 0) + 1);
+        if (peerId === 'peer-3') {
+          // Declines immediately, before any fast peer has ACKed — so the
+          // pre-sleep guard sees collected=0 and lets peer-3 sleep.
+          return encodeDecline('NO_DATA_IN_SWM');
+        }
+        await fastPeersGate;
+        const idx = parseInt(peerId.replace('peer-', ''), 10);
+        const { r, vs } = await signACK(coreWallets[idx], testCGId, merkleRoot, 1, 100n);
+        return encodeStorageACK({
+          merkleRoot,
+          coreNodeSignatureR: r,
+          coreNodeSignatureVS: vs,
+          contextGraphId: testCGIdStr,
+          nodeIdentityId: idx + 1,
+        });
+      },
+      getConnectedCorePeers: () => ['peer-0', 'peer-1', 'peer-2', 'peer-3'],
+      log: () => {},
+    };
+
+    const collector = new ACKCollector(deps);
+    const result = await collector.collect({
+      merkleRoot,
+      contextGraphId: testCGId,
+      contextGraphIdStr: testCGIdStr,
+      publisherPeerId: 'publisher-0',
+      publicByteSize: 100n,
+      isPrivate: false,
+      kaCount: 1,
+      rootEntities: ['urn:a'],
+      chainId: TEST_CHAIN_ID,
+      kav10Address: TEST_KAV10_ADDR,
+      merkleLeafCount,
+    });
+
+    expect(result.acks).toHaveLength(3);
+    // Give any (buggy) post-sleep re-dial a chance to fire before asserting.
+    await new Promise((r) => setTimeout(r, 100));
+    // Exactly one dial: declined once, slept, and bailed on wake because the
+    // round had settled. The pre-#896 (before-only) guard would have issued a
+    // second `sendP2P` here.
+    expect(callsByPeer.get('peer-3')).toBe(1);
+  });
+
   it('rejects ACKs with wrong merkle root', async () => {
     const wrongRoot = new Uint8Array(32).fill(0xff);
     const deps: ACKCollectorDeps = {

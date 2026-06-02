@@ -480,6 +480,17 @@ export class ACKCollector {
                 ` (retry ${declineRetries}/${MAX_TRANSIENT_DECLINE_RETRIES}, waiting ${waitMs}ms for SWM gossip)`,
               );
               await sleep(waitMs);
+              // #896 review: quorum may have settled DURING the backoff above
+              // (collect() resolves the instant the last needed ACK lands on
+              // another peer). Re-check before re-dialing so a decided round
+              // never leaks one more `sendP2P` after the caller moved on.
+              if (roundIsOver()) {
+                log(
+                  `[ACKCollector] Quorum settled during backoff — abandoning ` +
+                  `transient-decline retry for ${peerId.slice(-8)} (${code})`,
+                );
+                return null;
+              }
               continue;
             }
 
@@ -567,6 +578,15 @@ export class ACKCollector {
             }
             log(`[ACKCollector] Retry ${transportAttempts}/${MAX_RETRIES} for ${peerId.slice(-8)}: ${msg}`);
             await sleep(transportAttempts * 1000);
+            // #896 review: re-check after the backoff too — quorum may have
+            // settled while we waited, so don't re-dial a decided round.
+            if (roundIsOver()) {
+              log(
+                `[ACKCollector] Quorum settled during backoff — abandoning ` +
+                `transport retry for ${peerId.slice(-8)}: ${msg}`,
+              );
+              return null;
+            }
             continue;
           }
           // Terminal transport failure on the final attempt. If this

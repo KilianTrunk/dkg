@@ -281,6 +281,21 @@ export class AssertionNotPersistedError extends Error {
   }
 }
 
+export class MultiRootPublishNotAtomicError extends Error {
+  readonly code = 'MULTI_ROOT_PUBLISH_NOT_ATOMIC' as const;
+  readonly contextGraphId: string;
+  readonly rootEntities: string[];
+  constructor(contextGraphId: string, rootEntities: readonly string[]) {
+    super(
+      `V10 shared-memory publish is single-root only for this operation. ` +
+        `Resolved ${rootEntities.length} root entities; select exactly one root or use a durable multi-publish flow.`,
+    );
+    this.name = 'MultiRootPublishNotAtomicError';
+    this.contextGraphId = contextGraphId;
+    this.rootEntities = [...rootEntities];
+  }
+}
+
 // Round 12 Bug 34: module-private token proving an internal caller
 // (specifically `publishFromSharedMemory`) is the origin of a
 // `publish()` call so the reserved-namespace guard can be bypassed
@@ -1279,6 +1294,10 @@ export class DKGPublisher implements Publisher {
 
     if (quads.length === 0) {
       throw new Error(`No quads in shared memory for context graph ${contextGraphId} matching selection`);
+    }
+    const rootEntities = [...autoPartition(quads).keys()];
+    if (rootEntities.length > 1) {
+      throw new MultiRootPublishNotAtomicError(contextGraphId, rootEntities);
     }
 
     const ctxGraphId = options?.publishContextGraphId;

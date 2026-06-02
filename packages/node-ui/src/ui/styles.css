@@ -247,6 +247,21 @@ button:focus:not(:focus-visible) { outline: none; }
   background: #f59e0b;
   box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.25);
 }
+.v10-mock-banner-reload {
+  flex: 0 0 auto;
+  margin-left: auto;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 3px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+  color: #7c2d12;
+  background: rgba(251, 191, 36, 0.35);
+  border: 1px solid rgba(251, 191, 36, 0.6);
+}
+.v10-mock-banner-reload:hover {
+  background: rgba(251, 191, 36, 0.55);
+}
 
 /* ── Retry control for failed view fetches (GH #905) ── */
 .v10-retry-btn {

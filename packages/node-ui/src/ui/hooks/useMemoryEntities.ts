@@ -393,6 +393,13 @@ async function queryLayer(
 export function buildEntities(layered: LayeredTriple[]): Map<string, MemoryEntity> {
   const entities = new Map<string, MemoryEntity>();
   const connectionKeys = new Map<string, Set<string>>();
+  // Per-(entity) property dedup keyed on the RAW triple object — NOT the
+  // decoded display value. Two literals that share a lexical form but differ in
+  // language/datatype (`"hello"@en` vs `"hello"@fr`, `"1"^^xsd:int` vs
+  // `"1"^^xsd:string`) decode to the same string, so deduping on the decoded
+  // value would silently drop a distinct RDF value (Codex). We display the
+  // decoded value but preserve distinctness on the raw form.
+  const propertyKeys = new Map<string, Set<string>>();
   // Per-(entity, layer) SPO-dedup keys for `tripleCount`. Mirrors
   // `useLayerTriples` + `dedupeTriplesBySpo` (`ProjectView.tsx`) so
   // the precomputed count agrees with the layer-page Triples tab.
@@ -487,10 +494,13 @@ export function buildEntities(layered: LayeredTriple[]): Map<string, MemoryEntit
         });
       }
     } else {
-      const existing = entity.properties.get(t.predicate) ?? [];
-      const val = decodeRdfStringLiteral(t.object);
-      if (!existing.includes(val)) {
-        existing.push(val);
+      const pKeys = propertyKeys.get(entity.uri) ?? new Set<string>();
+      const rawKey = `${t.predicate}\0${t.object}`;
+      if (!pKeys.has(rawKey)) {
+        pKeys.add(rawKey);
+        propertyKeys.set(entity.uri, pKeys);
+        const existing = entity.properties.get(t.predicate) ?? [];
+        existing.push(decodeRdfStringLiteral(t.object));
         entity.properties.set(t.predicate, existing);
       }
     }

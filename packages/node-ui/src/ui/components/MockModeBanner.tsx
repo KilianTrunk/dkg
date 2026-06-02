@@ -25,13 +25,24 @@ export function MockModeBanner() {
 
   if (!usingMocks) return null;
 
+  // Mock mode is latched in api-wrapper for the lifetime of the page (it is
+  // detected once, on the first failed /api/status probe). Reconnecting the
+  // daemon alone does NOT clear it — the page must reload — so make recovery
+  // explicit/actionable rather than promising auto-recovery (Codex).
   return (
     <div className="v10-mock-banner" role="alert" aria-live="polite">
       <span className="v10-mock-banner-dot" aria-hidden="true" />
       <span>
         <strong>Demo data</strong> — the node is unreachable, so the UI is showing
-        example data, not live node state. Reconnect the daemon to see real values.
+        example data, not live node state. Reconnect the daemon, then reload.
       </span>
+      <button
+        type="button"
+        className="v10-mock-banner-reload"
+        onClick={() => window.location.reload()}
+      >
+        Reload
+      </button>
     </div>
   );
 }

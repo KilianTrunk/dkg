@@ -6338,10 +6338,7 @@ export class DKGAgent {
     // Resolve a CANDIDATE on-chain id. Local-id resolution is authoritative
     // for ADDRESSING: getContextGraphOnChainId maps any locally-known
     // context-graph id — including a registered CG whose user-chosen id is
-    // numeric (a CG "named 42") — to THAT graph's persisted on-chain id. If
-    // it doesn't resolve and the caller passed a bare decimal, treat the
-    // number itself as the candidate (share('42', ...)). Either way the
-    // candidate is only a CANDIDATE — trust comes from the live proof below.
+    // numeric (a CG "named 42") — to THAT graph's persisted on-chain id.
     let onChainId: string | null = null;
     let resolvedFromLocalCg = false;
     if (typeof this.getContextGraphOnChainId === 'function') {
@@ -6349,12 +6346,24 @@ export class DKGAgent {
       if (onChainId) resolvedFromLocalCg = true;
     }
     if (!onChainId && /^\d+$/.test(trimmed)) {
-      onChainId = trimmed;
+      // A bare decimal that did NOT resolve to a local mapping is AMBIGUOUS
+      // (#884 review 🔴 GZumY). It is a raw on-chain slot the caller addressed
+      // directly (`share('42')`) ONLY when there is no local context graph by
+      // that id. A local CG whose canonical id is itself numeric (e.g.
+      // `createContextGraph({ id: '42' })`) that simply isn't registered
+      // on-chain yet must stay 'unregistered' (→ plaintext-inline default), not
+      // be misclassified as a raw slot and fail closed as 'unknown'. Only enter
+      // the raw-slot path after proving no such local CG exists.
+      const localCgExists = typeof this.contextGraphExists === 'function'
+        ? await this.contextGraphExists(trimmed).catch(() => false)
+        : false;
+      if (!localCgExists) onChainId = trimmed;
     }
-    // No resolvable on-chain slot at all — a pure-local CG. This is NOT
-    // "unknown": there is nothing on-chain to fail closed against, so the
-    // publish path keeps its long-standing plaintext-inline default for
-    // local-only workspaces (and the boolean gate reads it as not-public).
+    // No resolvable on-chain slot at all — a pure-local CG (including a
+    // numeric-named local CG not yet registered). This is NOT "unknown": there
+    // is nothing on-chain to fail closed against, so the publish path keeps its
+    // long-standing plaintext-inline default for local-only workspaces (and the
+    // boolean gate reads it as not-public).
     if (!onChainId) return 'unregistered';
 
     // IDENTITY BINDING (#884 review GZEqF). A candidate resolved from the
@@ -6388,18 +6397,23 @@ export class DKGAgent {
    * devnet reset, so the mapping `localId → onChainId` can point at a numeric
    * slot now occupied by an UNRELATED CG on a fresh chain;
    * `isContextGraphActiveOnChain` only proves *some* CG is live at that slot.
-   * The on-chain committed name-hash is the reset-proof identity anchor: it is
-   * `keccak256(cleartextId)` (or the id itself when already a 32-byte wire
-   * hash) — deterministic, write-once at registration, identical on every
-   * node — so a reused slot commits a DIFFERENT name.
+   * The on-chain committed name-hash is the reset-proof identity anchor:
+   * registration ALWAYS commits `keccak256(utf8(cleartextId))` — including for
+   * an id that itself looks like a 32-byte hex string (the registry hashes the
+   * id verbatim, it does NOT pass a hex-shaped id through) — so the expected
+   * wire id is derived the SAME way here. (#884 review 🔴 GZumc: special-casing
+   * `0x…64-hex` ids as already-the-wire-id diverged from registration and would
+   * force a hex-named CG down the fail-closed path forever.) The hash is
+   * deterministic, write-once at registration, and identical on every node, so
+   * a reused slot commits a DIFFERENT name.
    *
    * Returns `false` (→ caller fails closed) ONLY on an AFFIRMATIVE mismatch
    * between the slot's committed name-hash and this CG's expected wire id.
    * Returns `true` (proceed to the liveness/policy gate) when identity can't be
    * disproven — no `getContextGraphNameHash` getter, the curator opted out of
-   * the on-chain commitment (`null`), an RPC stall/error, or the id isn't a
-   * cleartext/hex name — so this never strips plaintext from a case that works
-   * today; it only HARDENS against the stale/reused-slot downgrade.
+   * the on-chain commitment (`null`), an RPC stall/error, or a derivation
+   * failure — so this never strips plaintext from a case that works today; it
+   * only HARDENS against the stale/reused-slot downgrade.
    */
   private async localCgMatchesOnChainSlot(
     contextGraphId: string,
@@ -6419,9 +6433,9 @@ export class DKGAgent {
     const trimmed = contextGraphId.trim();
     let expectedWireId: string;
     try {
-      expectedWireId = /^0x[0-9a-fA-F]{64}$/.test(trimmed)
-        ? trimmed.toLowerCase()
-        : ethers.keccak256(ethers.toUtf8Bytes(trimmed)).toLowerCase();
+      // Mirror registration EXACTLY: claimName/createContextGraph commit
+      // keccak256(utf8(cleartextId)) regardless of the id's shape.
+      expectedWireId = ethers.keccak256(ethers.toUtf8Bytes(trimmed)).toLowerCase();
     } catch {
       return true;
     }

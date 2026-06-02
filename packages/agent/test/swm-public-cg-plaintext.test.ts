@@ -26,11 +26,10 @@ import { DKGAgent } from '../src/dkg-agent.js';
 type Policy = 0 | 1;
 
 // Deterministic on-chain wire id (committed name-hash) for a cleartext CG id —
-// mirrors the agent's keccak256(utf8(id)) / hex-passthrough derivation.
+// mirrors registration, which ALWAYS commits keccak256(utf8(id)) (no
+// hex-passthrough), matching the agent's localCgMatchesOnChainSlot derivation.
 const wireId = (cgId: string): string =>
-  /^0x[0-9a-fA-F]{64}$/.test(cgId)
-    ? cgId.toLowerCase()
-    : ethers.keccak256(ethers.toUtf8Bytes(cgId)).toLowerCase();
+  ethers.keccak256(ethers.toUtf8Bytes(cgId)).toLowerCase();
 
 function makeAgentLike(opts: {
   onChainId?: string | null;
@@ -51,6 +50,12 @@ function makeAgentLike(opts: {
   // Provide a hex string to assert a specific committed name-hash, or `null`
   // to simulate the curator opting out of the on-chain commitment.
   onChainNameHash?: string | null;
+  // Whether a LOCAL context graph with the queried id exists (binds
+  // this.contextGraphExists). Used to prove that a numeric-named local CG which
+  // isn't registered on-chain stays 'unregistered' (plaintext) rather than
+  // being misread as a raw on-chain slot. OMITTED → the getter is absent (the
+  // bare-decimal raw-slot path is taken, as before).
+  localCgExists?: boolean;
 } = {}) {
   const log = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
   const chain: Record<string, unknown> = {};
@@ -87,6 +92,9 @@ function makeAgentLike(opts: {
     }),
     isPrivateContextGraph: vi.fn(async () => opts.isPrivate ?? false),
   };
+  if ('localCgExists' in opts) {
+    agentLike.contextGraphExists = vi.fn(async () => opts.localCgExists ?? false);
+  }
   // Bind the prototype methods under test so `this` resolves to agentLike.
   agentLike.isContextGraphPublicOnChain = (DKGAgent.prototype as any).isContextGraphPublicOnChain;
   agentLike.resolveOnChainAccessPolicyState = (DKGAgent.prototype as any).resolveOnChainAccessPolicyState;
@@ -418,5 +426,28 @@ describe('DKGAgent publish-inline gating respects on-chain public policy', () =>
     expect(err).toBeDefined();
     expect((err as Error).message).not.toMatch(/publish access-policy is unknown/);
     expect(agentLike.isPrivateContextGraph).toHaveBeenCalled();
+  });
+
+  it('keeps a NUMERIC-named LOCAL CG that is not yet registered on the plaintext path — NOT a raw slot (#884 review GZumY)', async () => {
+    // createContextGraph({ id: "42" }) that hasn't been registered on-chain:
+    // getContextGraphOnChainId('42') → null and the slot is not live, but a
+    // LOCAL CG named "42" exists. The bare-decimal raw-slot path must NOT fire
+    // (that would yield 'unknown' → throw); local existence proves it's a pure-
+    // local CG → 'unregistered' → plaintext-inline (publish proceeds, no throw).
+    const agentLike = makeAgentLike({ onChainId: null, activeOnChain: false, localCgExists: true });
+    await expect(resolveInline(agentLike, '42')).resolves.toBeUndefined();
+    expect(agentLike.contextGraphExists).toHaveBeenCalledWith('42');
+    // It never reached the on-chain liveness/policy reads (no raw-slot probe).
+    expect(agentLike.chain.isContextGraphActiveOnChain).not.toHaveBeenCalled();
+    expect(agentLike.chain.getContextGraphAccessPolicy).not.toHaveBeenCalled();
+  });
+
+  it('still treats a bare numeric id with NO local CG as a raw on-chain slot (share(\'42\')) (#884 review GZumY)', async () => {
+    // The complementary case: no local CG named "42", so "42" IS the caller
+    // addressing on-chain slot 42 directly. A live public slot → plaintext.
+    const agentLike = makeAgentLike({ onChainId: null, accessPolicy: 0, activeOnChain: true, localCgExists: false });
+    await expect(resolveInline(agentLike, '42')).resolves.toBeUndefined();
+    expect(agentLike.chain.isContextGraphActiveOnChain).toHaveBeenCalledWith(42n);
+    expect(agentLike.chain.getContextGraphAccessPolicy).toHaveBeenCalledWith(42n);
   });
 });

@@ -1036,6 +1036,7 @@ export class DashboardDB {
              s.on_chain_id                 AS on_chain_id,
              s.last_reconciled_ordinal     AS last_reconciled_ordinal,
              s.core_hosted                 AS core_hosted,
+             s.subscribed                  AS subscribed,
              (SELECT MAX(head) FROM replication_events e
                 WHERE e.context_graph_id = s.context_graph_id) AS last_head,
              (SELECT MAX(ts) FROM replication_events e
@@ -2762,6 +2763,7 @@ export interface ReplicationCursorRow {
   on_chain_id: string | null;
   last_reconciled_ordinal: number | null;
   core_hosted: number | null;
+  subscribed: number | null;
   last_head: number | null;
   last_event_ts: number | null;
 }

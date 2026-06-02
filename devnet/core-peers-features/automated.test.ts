@@ -42,7 +42,7 @@
  */
 import { describe, it, expect, beforeAll } from 'vitest';
 import { execFileSync, spawn } from 'node:child_process';
-import { readFileSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
+import { readFileSync, existsSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import * as http from 'node:http';
 import { ethers } from 'ethers';
@@ -121,6 +121,17 @@ function readNodePids(num: number): number[] {
     if (Number.isFinite(pid) && !pids.includes(pid)) pids.push(pid);
   }
   return pids;
+}
+
+/** Remove a node's pid files. After a manual SIGKILL the files still hold the
+ *  now-dead PIDs; `devnet.sh restart-node` trusts them and could signal an
+ *  unrelated process if the OS recycled a PID before the restart. Clear them
+ *  so the restart starts from a clean slate. */
+function clearNodePidFiles(num: number): void {
+  for (const f of ['daemon.pid', 'devnet.pid']) {
+    const pidf = join(DEVNET_DIR, `node${num}`, f);
+    try { if (existsSync(pidf)) rmSync(pidf); } catch { /* best-effort */ }
+  }
 }
 
 // ───────────────────────────── HTTP helpers ──────────────────────────────
@@ -398,23 +409,29 @@ describe('Phase D — Cores host public CGs and fill their own gaps', () => {
   }, 120_000);
 
   it('a core offline during a publish fills its gap from chain on restart (core-fill)', async () => {
-    const victim = 2; // a core node
-    const victimNode = nodes[victim]!;
-
-    // Pre-req: the victim must already host the public CG (it ACKed earlier).
-    await waitFor(
-      `node${victim} hosts CONTEXT_GRAPH before the gap`,
+    // Pick a victim that HOSTS the public CG WITHOUT being member-subscribed to
+    // it (core_hosted=1 AND subscribed=0). That isolation is what makes this an
+    // end-to-end gate for the NEW Phase D path: a member-subscriber would refill
+    // the gap via its ordinary subscriber reconcile even if `coreHosted` were
+    // broken, so only a pure host proves the host-only recovery. The publishing
+    // core (node1) is the subscriber/curator; the other cores ACK as hosts.
+    const victim = await waitFor(
+      `a host-only core (core_hosted=1, subscribed=0) for CONTEXT_GRAPH`,
       90_000,
       4_000,
       async () => {
-        const cursors = await getJson(victimNode, '/api/replication/cursors');
-        if (cursors.status !== 200) return null;
-        const row = (cursors.body.cursors as any[]).find(
-          (c) => c.context_graph_id === CONTEXT_GRAPH && c.core_hosted === 1,
-        );
-        return row ? true : null;
+        for (const n of CORE_NODES) {
+          const cursors = await getJson(nodes[n]!, '/api/replication/cursors');
+          if (cursors.status !== 200) continue;
+          const row = (cursors.body.cursors as any[]).find(
+            (c) => c.context_graph_id === CONTEXT_GRAPH && c.core_hosted === 1 && c.subscribed !== 1,
+          );
+          if (row) return n;
+        }
+        return null;
       },
     );
+    const victimNode = nodes[victim]!;
 
     // 1. Take the victim core OFFLINE. Kill the real worker (daemon.pid),
     //    not just the already-exited `cli.js start` launcher (devnet.pid).
@@ -426,6 +443,9 @@ describe('Phase D — Cores host public CGs and fill their own gaps', () => {
     await waitFor(`node${victim} offline`, 45_000, 1_000, async () =>
       (await nodeReachable(victimNode)) ? null : true,
     );
+    // Stale pid files now hold dead PIDs — clear them so `restart-node` can't
+    // signal a recycled PID.
+    clearNodePidFiles(victim);
 
     // 2. Publish a fresh KA to the CG from node1 while the victim is down.
     const pub = await publishFromCore(nodes[1]!, 'gap');
@@ -441,13 +461,12 @@ describe('Phase D — Cores host public CGs and fill their own gaps', () => {
       (await nodeReachable(victimNode)) ? true : null,
     );
 
-    // 4. The victim must fill its gap FROM CHAIN after restart. The headline
-    //    proof is the missed triple landing in its verified-memory (the KA it
-    //    never received over gossip while offline). We also accept the distinct
-    //    `core-fill` telemetry as a bonus signal, but on devnet the cores are
-    //    also member-subscribers, so the reconciler emits the regular
-    //    `fetch`/`promote` surface rather than the host-only `core-fill` label —
-    //    the VM witness is the authoritative end-to-end signal.
+    // 4. The victim must fill its gap FROM CHAIN after restart. Because it is
+    //    NOT member-subscribed (subscribed=0), the missed KA can ONLY reach its
+    //    verified-memory via the Phase D host-fill path — so the VM witness here
+    //    is an authoritative end-to-end proof of the new behavior, not something
+    //    a subscriber reconcile could have produced. We still surface the
+    //    explicit `core-fill` telemetry as the headline signal when present.
     const filled = await waitFor(
       `node${victim} fills the gap (VM witness or core-fill event)`,
       240_000,

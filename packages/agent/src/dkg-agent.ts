@@ -12283,9 +12283,13 @@ export class DKGAgent {
     // a namespace that doesn't hold the hosted SWM snapshot, so after restart
     // the reconciler + active-fetch would sync/promote against the wrong graph
     // and miss the KA this core already ACKed. The cleartext hint keeps the
-    // row under the same id the reconciler uses. Numeric/empty hints are
-    // ignored (last-resort numericStr keeps legacy behaviour).
-    const cleartextHint = swmGraphId && swmGraphId !== numericStr && !/^\d+$/.test(swmGraphId)
+    // row under the same id the reconciler uses.
+    // Discard the hint ONLY when it's empty or literally the on-chain numeric
+    // id (no information) — NOT merely because it's all-digits: a public CG's
+    // local cleartext id can be numeric (e.g. "1" is a valid contextGraphId
+    // elsewhere in the repo), and rejecting it would wrongly key the row under
+    // the on-chain id and miss the hosted KA after restart.
+    const cleartextHint = swmGraphId && swmGraphId !== numericStr
       ? swmGraphId
       : undefined;
     const localCgId = this.resolveLocalCgIdByOnChainId(numeric) ?? cleartextHint ?? numericStr;

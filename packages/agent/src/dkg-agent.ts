@@ -202,7 +202,7 @@ import { runSharedMemorySync } from './sync/requester/shared-memory-sync.js';
 import { buildSyncRequestEnvelope, type SyncPhase } from './sync/auth/request-build.js';
 import { authorizePrivateSyncRequest } from './sync/auth/request-authorize.js';
 import { registerSyncHandler } from './sync/responder/sync-handler.js';
-import { runSyncOnConnect } from './sync/on-connect/sync-on-connect.js';
+import { runSyncOnConnect, type SyncOnConnectOutcome } from './sync/on-connect/sync-on-connect.js';
 import {
   generateCustodialAgent, registerSelfSovereignAgent, agentFromPrivateKey,
   ensureWorkspaceEncryptionKey,
@@ -3448,12 +3448,11 @@ export class DKGAgent {
    * them into our local store. Used on peer:connect for initial catch-up,
    * with a per-peer guard to avoid overlapping sync storms.
    */
-  private async trySyncFromPeer(remotePeer: string): Promise<'attempted' | 'skipped-no-sync' | 'not-started'> {
+  private async trySyncFromPeer(remotePeer: string): Promise<SyncOnConnectOutcome | 'not-started'> {
     if (!this.started) {
       return 'not-started';
     }
-    let skippedNoSync = false;
-    await runSyncOnConnect({
+    return runSyncOnConnect({
       remotePeer,
       syncingPeers: this.syncingPeers,
       getPeerProtocols: (peerId) => this.getPeerProtocols(peerId),
@@ -3466,7 +3465,6 @@ export class DKGAgent {
       syncSharedMemoryOnConnect: this.config.syncSharedMemoryOnConnect ?? true,
       logInfo: (ctx, message) => this.log.info(ctx, message),
       onPeerSkippedNoSync: (peerId) => {
-        skippedNoSync = true;
         this.skippedNoSyncPeers.add(peerId);
       },
       onPeerSynced: (peerId) => {
@@ -3475,7 +3473,6 @@ export class DKGAgent {
         this.syncReconcilerBackoff.delete(peerId);
       },
     });
-    return skippedNoSync ? 'skipped-no-sync' : 'attempted';
   }
 
   /**
@@ -3542,14 +3539,17 @@ export class DKGAgent {
       // peers are never delayed.
       const backoff = this.syncReconcilerBackoff.get(peerId);
       const probe = await this.getSyncReconcilerProbe(peerId);
-      if (backoff && now < backoff.nextRetryAt && !this.hasSyncReconcilerProbeChanged(backoff, probe)) {
-        continue;
+      if (backoff && now < backoff.nextRetryAt) {
+        if (!this.hasSyncReconcilerProbeChanged(backoff, probe)) {
+          continue;
+        }
+        this.syncReconcilerBackoff.delete(peerId);
       }
       const shortPeer = peerId.slice(-8);
       this.log.info(ctx, `Sync reconciler retrying ${shortPeer} (last success: ${lastOk == null ? 'never' : `${Math.round((now - lastOk) / 1000)}s ago`}${backoff ? `, prior failures: ${backoff.failures}` : ''})`);
       this.trySyncFromPeer(peerId)
         .then((outcome) => {
-          if (outcome === 'skipped-no-sync') {
+          if (outcome === 'skipped-no-sync' || outcome === 'already-syncing' || outcome === 'not-started') {
             return;
           }
           // `onPeerSynced` clears the backoff on a real success. If the

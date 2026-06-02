@@ -41,7 +41,7 @@ describe('runSyncOnConnect callbacks', () => {
     const synced: string[] = [];
     const syncFromPeer = vi.fn().mockResolvedValue(0);
 
-    await runSyncOnConnect({
+    const outcome = await runSyncOnConnect({
       remotePeer,
       syncingPeers: new Set(),
       getPeerProtocols: async () => ['/ipfs/id/1.0.0', '/meshsub/1.1.0'],
@@ -60,6 +60,7 @@ describe('runSyncOnConnect callbacks', () => {
       },
     });
 
+    expect(outcome).toBe('skipped-no-sync');
     expect(skipped).toEqual([{ peerId: remotePeer, protocols: ['/ipfs/id/1.0.0', '/meshsub/1.1.0'] }]);
     expect(synced).toEqual([]);
     expect(syncFromPeer).not.toHaveBeenCalled();
@@ -70,7 +71,7 @@ describe('runSyncOnConnect callbacks', () => {
     const skipped: string[] = [];
     const synced: string[] = [];
 
-    await runSyncOnConnect({
+    const outcome = await runSyncOnConnect({
       remotePeer,
       syncingPeers: new Set(),
       getPeerProtocols: async () => [PROTOCOL_SYNC],
@@ -85,6 +86,7 @@ describe('runSyncOnConnect callbacks', () => {
       onPeerSynced: (peerId) => synced.push(peerId),
     });
 
+    expect(outcome).toBe('synced');
     expect(skipped).toEqual([]);
     expect(synced).toEqual([remotePeer]);
   });
@@ -95,7 +97,7 @@ describe('runSyncOnConnect callbacks', () => {
     const syncSharedMemoryFromPeer = vi.fn().mockResolvedValue(11);
     const synced: string[] = [];
 
-    await runSyncOnConnect({
+    const outcome = await runSyncOnConnect({
       remotePeer,
       syncingPeers: new Set(),
       getPeerProtocols: async () => [PROTOCOL_SYNC],
@@ -110,9 +112,32 @@ describe('runSyncOnConnect callbacks', () => {
       onPeerSynced: (peerId) => synced.push(peerId),
     });
 
+    expect(outcome).toBe('synced');
     expect(syncFromPeer).toHaveBeenCalledOnce();
     expect(syncSharedMemoryFromPeer).not.toHaveBeenCalled();
     expect(synced).toEqual([remotePeer]);
+  });
+
+  it('returns already-syncing without running duplicate work', async () => {
+    const remotePeer = freshPeerIdString();
+    const syncingPeers = new Set([remotePeer]);
+    const syncFromPeer = vi.fn().mockResolvedValue(0);
+
+    const outcome = await runSyncOnConnect({
+      remotePeer,
+      syncingPeers,
+      getPeerProtocols: async () => [PROTOCOL_SYNC],
+      knownCorePeerIds: new Set(),
+      getSyncContextGraphs: () => [],
+      syncFromPeer,
+      refreshMetaSyncedFlags: async () => {},
+      discoverContextGraphsFromStore: async () => 0,
+      syncSharedMemoryFromPeer: async () => 0,
+      logInfo: noopLog,
+    });
+
+    expect(outcome).toBe('already-syncing');
+    expect(syncFromPeer).not.toHaveBeenCalled();
   });
 });
 
@@ -430,7 +455,7 @@ describe('DKGAgent sync retry — periodic reconciler', () => {
       await flushMicrotasks();
 
       expect(trySync).toHaveBeenCalledTimes(1);
-      expect(backoffMap.get(peerA)?.failures).toBe(2);
+      expect(backoffMap.get(peerA)?.failures).toBe(1);
       expect(backoffMap.get(peerA)?.protocolsKey).toBe(PROTOCOL_SYNC);
     } finally {
       await agent.stop().catch(() => {});
@@ -470,6 +495,32 @@ describe('DKGAgent sync retry — periodic reconciler', () => {
       expect(getPeerProtocols.mock.calls.length).toBeGreaterThanOrEqual(2);
       expect((agent as any).skippedNoSyncPeers.has(peerA)).toBe(true);
       expect(backoffMap.has(peerA)).toBe(false);
+    } finally {
+      await agent.stop().catch(() => {});
+    }
+  });
+
+  it('does not back off when the attempt reports already-syncing', async () => {
+    const agent = await DKGAgent.create({
+      name: 'ReconcilerAlreadySyncingNoBackoff',
+      listenHost: '127.0.0.1',
+      chainAdapter: new MockChainAdapter(),
+    });
+    try {
+      await agent.start();
+
+      const peerA = freshPeerIdString();
+      const origGetPeers = agent.node.libp2p.getPeers.bind(agent.node.libp2p);
+      vi.spyOn(agent.node.libp2p, 'getPeers').mockImplementation(
+        () => [...origGetPeers(), peerIdFromString(peerA)],
+      );
+      vi.spyOn(agent as any, 'getPeerProtocols').mockResolvedValue([PROTOCOL_SYNC]);
+      vi.spyOn(agent as any, 'trySyncFromPeer').mockResolvedValue('already-syncing');
+
+      await (agent as any).reconcileSyncFromConnectedPeers();
+      await flushMicrotasks();
+
+      expect((agent as any).syncReconcilerBackoff.has(peerA)).toBe(false);
     } finally {
       await agent.stop().catch(() => {});
     }

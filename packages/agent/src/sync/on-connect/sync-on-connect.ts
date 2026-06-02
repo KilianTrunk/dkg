@@ -35,7 +35,9 @@ interface SyncOnConnectContext {
   onPeerSynced?: (peerId: string) => void;
 }
 
-export async function runSyncOnConnect(context: SyncOnConnectContext): Promise<void> {
+export type SyncOnConnectOutcome = 'synced' | 'skipped-no-sync' | 'already-syncing';
+
+export async function runSyncOnConnect(context: SyncOnConnectContext): Promise<SyncOnConnectOutcome> {
   const {
     remotePeer,
     syncingPeers,
@@ -53,7 +55,7 @@ export async function runSyncOnConnect(context: SyncOnConnectContext): Promise<v
   const ctx = createOperationContext('sync');
   const shortPeer = remotePeer.slice(-8);
 
-  if (syncingPeers.has(remotePeer)) return;
+  if (syncingPeers.has(remotePeer)) return 'already-syncing';
   syncingPeers.add(remotePeer);
 
   try {
@@ -69,7 +71,7 @@ export async function runSyncOnConnect(context: SyncOnConnectContext): Promise<v
     if (!hasSync) {
       logInfo(ctx, `Peer ${shortPeer} does not support sync protocol (protocols: ${protocols.join(', ')})`);
       context.onPeerSkippedNoSync?.(remotePeer, protocols);
-      return;
+      return 'skipped-no-sync';
     }
 
     logInfo(ctx, `Syncing from peer ${shortPeer}...`);
@@ -104,6 +106,7 @@ export async function runSyncOnConnect(context: SyncOnConnectContext): Promise<v
     }
 
     context.onPeerSynced?.(remotePeer);
+    return 'synced';
   } finally {
     syncingPeers.delete(remotePeer);
   }

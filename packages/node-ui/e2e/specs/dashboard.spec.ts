@@ -138,17 +138,25 @@ test.describe('Dashboard (rc.12)', () => {
     for (const layer of ['WM', 'SWM', 'VM']) {
       await expect(card.getByText(layer, { exact: true })).toBeVisible();
     }
-    // Each size metric (entities + triples) renders ONE WM/SWM/VM proportion
-    // bar, and every populated bar has exactly the three layer segments. Scope
-    // the count to the metric bars (`.v10-cg-size-metric .v10-layerbar-seg`) so
-    // it can't pick up the curator/joined RoleBar in the sibling "My Context
-    // Graphs" card, which reuses `.v10-layerbar-seg` and renders 1–2 segments
-    // (that bleed-through made the old card-wide `% 3 === 0` check flaky). A
-    // populated metric bar is the real invariant: ≥3 segments, in groups of 3.
-    const segLocator = card.locator('.v10-cg-size-metric .v10-layerbar-seg');
-    await expect(segLocator.first()).toBeVisible({ timeout: 15_000 });
-    const segs = await segLocator.count();
-    expect(segs).toBeGreaterThanOrEqual(3);
-    expect(segs % 3).toBe(0);
+    // Each size metric (entities + triples) renders ONE WM/SWM/VM proportion bar,
+    // and `LayerBar` emits ONE segment per NON-ZERO layer (`pct <= 0` segments are
+    // skipped) — so a populated bar has 1–3 segments, NOT a fixed multiple of 3
+    // (the old `% 3 === 0` check was simply wrong: the VM-only seed leaves WM/SWM
+    // empty, yielding a single VM segment). Scope to the size metrics so the
+    // curator/joined RoleBar in the sibling "My Context Graphs" card — which
+    // reuses `.v10-layerbar-seg` — can't bleed in. Assert the real invariant:
+    // ≥1 metric bar exists, no bar exceeds three layer segments, and at least one
+    // bar is populated (the seeded fixture guarantees a non-zero layer).
+    const bars = card.locator('.v10-cg-size-metric .v10-layerbar');
+    await expect(bars.first()).toBeVisible({ timeout: 15_000 });
+    const barCount = await bars.count();
+    expect(barCount).toBeGreaterThanOrEqual(1);
+    let populatedBars = 0;
+    for (let i = 0; i < barCount; i++) {
+      const segCount = await bars.nth(i).locator('.v10-layerbar-seg').count();
+      expect(segCount, 'a WM/SWM/VM bar has at most one segment per layer').toBeLessThanOrEqual(3);
+      if (segCount > 0) populatedBars++;
+    }
+    expect(populatedBars, 'the seeded CG must render at least one populated layer bar').toBeGreaterThanOrEqual(1);
   });
 });

@@ -151,6 +151,34 @@ describe('DKGAgent.isContextGraphPublicOnChain', () => {
     await expect(isPublic(agentLike, '7')).resolves.toBe(false);
     expect(agentLike.chain.getContextGraphAccessPolicy).toHaveBeenCalledWith(7n);
   });
+
+  it('rejects an AMBIGUOUS numeric id that resolves to a DIFFERENT on-chain id (#884 review round-3)', async () => {
+    // A local CG with the digit-only id "42" whose registered on-chain id is
+    // actually 99. Treating "42" as a local id would silently look up policy
+    // for on-chain CG 99 — the wrong graph. The numeric input is interpreted
+    // as on-chain id 42; since it's neither known nor self-resolving, it must
+    // fail closed rather than read the wrong graph's policy.
+    const agentLike = makeAgentLike({ onChainId: '99', accessPolicy: 0 });
+    await expect(isPublic(agentLike, '42')).resolves.toBe(false);
+    expect(agentLike.chain.getContextGraphAccessPolicy).not.toHaveBeenCalled();
+  });
+
+  it('accepts a numeric local id whose resolved on-chain id is the SAME number (#884 review round-3)', async () => {
+    // Unambiguous: the local id and its registered on-chain id coincide (42).
+    const agentLike = makeAgentLike({ onChainId: '42', accessPolicy: 0 });
+    await expect(isPublic(agentLike, '42')).resolves.toBe(true);
+    expect(agentLike.chain.getContextGraphAccessPolicy).toHaveBeenCalledWith(42n);
+  });
+
+  it('logs a diagnostic (not silent) when a lookup flakes before failing closed (#884 review round-3 🟡)', async () => {
+    const agentLike = makeAgentLike({ accessPolicyError: new Error('rpc unavailable') });
+    await expect(isPublic(agentLike)).resolves.toBe(false);
+    // Operators get a signal explaining WHY the public override was skipped.
+    expect(agentLike.log.warn).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.stringContaining('isContextGraphPublicOnChain'),
+    );
+  });
 });
 
 describe('DKGAgent.resolveWorkspaceRecipientsGated (gate-before)', () => {

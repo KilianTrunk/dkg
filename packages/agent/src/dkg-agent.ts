@@ -202,7 +202,7 @@ import { runSharedMemorySync } from './sync/requester/shared-memory-sync.js';
 import { buildSyncRequestEnvelope, type SyncPhase } from './sync/auth/request-build.js';
 import { authorizePrivateSyncRequest } from './sync/auth/request-authorize.js';
 import { registerSyncHandler } from './sync/responder/sync-handler.js';
-import { runSyncOnConnect, type SyncOnConnectOutcome } from './sync/on-connect/sync-on-connect.js';
+import { runSyncOnConnect, SyncOnConnectPostSyncError, type SyncOnConnectOutcome } from './sync/on-connect/sync-on-connect.js';
 import {
   generateCustodialAgent, registerSelfSovereignAgent, agentFromPrivateKey,
   ensureWorkspaceEncryptionKey,
@@ -3564,8 +3564,12 @@ export class DKGAgent {
           }
         })
         .catch((err: unknown) => {
-          this.recordSyncReconcilerFailure(peerId, probe);
           const message = err instanceof Error ? err.message : String(err);
+          if (err instanceof SyncOnConnectPostSyncError) {
+            this.log.warn(ctx, `Sync reconciler post-sync step failed for ${shortPeer}; retrying without growing peer backoff: ${message}`);
+            return;
+          }
+          this.recordSyncReconcilerFailure(peerId, probe);
           this.log.warn(ctx, `Sync reconciler retry failed for ${shortPeer}: ${message}`);
         });
     }

@@ -153,7 +153,7 @@ export interface PeerInfo {
   };
   protocols: string[];
   syncCapable: boolean;
-  syncStatus: {
+  syncStatus?: {
     capable: boolean;
     capability?: 'supported' | 'unsupported' | 'unknown';
     lastSuccessfulSyncAt: number | null;

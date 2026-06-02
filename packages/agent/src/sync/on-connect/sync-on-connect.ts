@@ -37,6 +37,17 @@ interface SyncOnConnectContext {
 
 export type SyncOnConnectOutcome = 'synced' | 'skipped-no-sync' | 'already-syncing';
 
+export class SyncOnConnectPostSyncError extends Error {
+  readonly originalError: unknown;
+
+  constructor(remotePeer: string, originalError: unknown) {
+    const detail = originalError instanceof Error ? originalError.message : String(originalError);
+    super(`post-sync step failed for peer ${remotePeer.slice(-8)}: ${detail}`);
+    this.name = 'SyncOnConnectPostSyncError';
+    this.originalError = originalError;
+  }
+}
+
 export async function runSyncOnConnect(context: SyncOnConnectContext): Promise<SyncOnConnectOutcome> {
   const {
     remotePeer,
@@ -58,6 +69,7 @@ export async function runSyncOnConnect(context: SyncOnConnectContext): Promise<S
   if (syncingPeers.has(remotePeer)) return 'already-syncing';
   syncingPeers.add(remotePeer);
 
+  let durableSyncCompleted = false;
   try {
     const protocols = await getPeerProtocols(remotePeer);
 
@@ -77,6 +89,7 @@ export async function runSyncOnConnect(context: SyncOnConnectContext): Promise<S
     logInfo(ctx, `Syncing from peer ${shortPeer}...`);
     const knownCgsBefore = new Set(getSyncContextGraphs() ?? []);
     const synced = await syncFromPeer(remotePeer);
+    durableSyncCompleted = true;
     logInfo(ctx, `Synced ${synced} data triples from peer ${shortPeer}`);
 
     const syncScope = new Set<string>([
@@ -107,6 +120,11 @@ export async function runSyncOnConnect(context: SyncOnConnectContext): Promise<S
 
     context.onPeerSynced?.(remotePeer);
     return 'synced';
+  } catch (err) {
+    if (durableSyncCompleted) {
+      throw new SyncOnConnectPostSyncError(remotePeer, err);
+    }
+    throw err;
   } finally {
     syncingPeers.delete(remotePeer);
   }

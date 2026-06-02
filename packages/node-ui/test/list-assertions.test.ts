@@ -154,6 +154,49 @@ describe('listAssertions (WM) — URI parse + cg-scoped filter', () => {
     });
   });
 
+  it('opts into includeContextGraphPartitions so assertion partitions show up (#864 rc.12 follow-up)', async () => {
+    // Without this flag, `DKGQueryEngine.query` constrains `GRAPH ?g`
+    // expansion to the static `{<cg>, <cg>/_meta, <cg>/_shared_memory_meta}`
+    // allow-list, hiding every assertion data partition. The
+    // bulk-promote button then sees an empty assertion list, iterates
+    // zero times, and falls into the rc.12 "0 triples promoted" no-op
+    // branch even when WM clearly contains data. Pin the request body
+    // here so any future refactor that drops the opt-in fails this
+    // test instead of silently re-breaking promote-all.
+    setBindings([
+      bRow('did:dkg:context-graph:cg-A/assertion/0xabc/notes', 5),
+    ]);
+    await listAssertions('cg-A', 'wm');
+    expect(fetchMock).toHaveBeenCalledOnce();
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(String(url)).toContain('/api/query');
+    const body = JSON.parse(String(init.body));
+    expect(body).toMatchObject({
+      contextGraphId: 'cg-A',
+      includeContextGraphPartitions: true,
+    });
+    expect(typeof body.sparql).toBe('string');
+  });
+
+  it('SPARQL gates WM membership on dkg:memoryLayer "WM" in <cg>/_meta (#898 Codex)', async () => {
+    // Codex review on #898 — `assertionPromote` empties the assertion
+    // data graph but intentionally leaves daemon-owned `urn:dkg:file:*`
+    // / `urn:dkg:extraction:*` quads behind, so a raw `GRAPH ?g { ?s ?p
+    // ?o }` count keeps returning promoted assertions. Pin the new
+    // gate: the SPARQL must JOIN against `<cg>/_meta` filtered on
+    // `dkg:memoryLayer "WM"` so promoted assertions (flipped to "SWM"
+    // by `assertionPromote`) drop out cleanly.
+    setBindings([
+      bRow('did:dkg:context-graph:cg-A/assertion/0xabc/notes', 5),
+    ]);
+    await listAssertions('cg-A', 'wm');
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(String(init.body));
+    expect(body.sparql).toContain('did:dkg:context-graph:cg-A/_meta');
+    expect(body.sparql).toContain('http://dkg.io/ontology/memoryLayer');
+    expect(body.sparql).toContain('"WM"');
+  });
+
   it('scopes the /assertion/ discriminator to the tail when cgId itself contains "/assertion/"', async () => {
     // PR #710 reviewer guard — `validateContextGraphId` permits
     // slashes, so a cgId can literally contain `/assertion/` as a

@@ -137,6 +137,7 @@ export {
 export {
   type SwmSenderKeyPackageMsg,
   type SwmSenderKeyPackageAckMsg,
+  type SwmSenderKeyPackageAckReasonCode,
   type SwmSenderKeyMessageMsg,
   type SwmSenderKeySecretMsg,
   type SwmSenderKeyMessageAADFields,
@@ -150,6 +151,9 @@ export {
   SWM_SENDER_KEY_AAD_DOMAIN,
   SWM_SENDER_KEY_SETUP_AAD_DOMAIN,
   SWM_SENDER_KEY_SIGNATURE_DOMAIN,
+  SWM_SENDER_KEY_PACKAGE_ACK_REASON_CODES,
+  SWM_SENDER_KEY_PACKAGE_ACK_RETRYABLE_REASON_CODES,
+  SWM_SENDER_KEY_PACKAGE_ACK_TERMINAL_REASON_CODES,
   encodeSwmSenderKeyPackage,
   decodeSwmSenderKeyPackage,
   encodeSwmSenderKeyPackageAck,

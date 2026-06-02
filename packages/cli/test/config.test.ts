@@ -16,6 +16,8 @@ import {
   readPid,
   readApiPort,
   ensureDkgDir,
+  configExists,
+  readNodeRoleFromConfigSync,
   isDkgMonorepo,
   dkgDir,
   repoDir,
@@ -220,6 +222,46 @@ describe('localAgentIntegrations config round-trip', () => {
     expect(loaded.localAgentIntegrations?.openclaw?.transport?.gatewayUrl).toBe('http://gateway.local:3030');
     expect(loaded.localAgentIntegrations?.openclaw?.manifest?.version).toBe('2026.4.12');
     expect(loaded.localAgentIntegrations?.openclaw?.runtime?.status).toBe('ready');
+  });
+
+  it('surfaces malformed config.json instead of falling back to stale YAML', async () => {
+    await writeFile(join(tempDir, 'config.json'), '{ not valid json', 'utf8');
+    await writeFile(join(tempDir, 'config.yaml'), 'name: stale-yaml\napiPort: 9317\n', 'utf8');
+
+    await expect(loadConfig()).rejects.toThrow(SyntaxError);
+  });
+
+  it('surfaces malformed config.yaml instead of falling back to defaults', async () => {
+    await writeFile(join(tempDir, 'config.yaml'), 'name: [unterminated\napiPort: 9317\n', 'utf8');
+
+    let thrown: unknown;
+    try {
+      await loadConfig();
+    } catch (err) {
+      thrown = err;
+    }
+
+    expect(thrown).toBeInstanceOf(Error);
+    expect((thrown as Error).name).toBe('YAMLException');
+  });
+
+  it('treats yaml-only homes as initialized configs', async () => {
+    await writeFile(join(tempDir, 'config.yaml'), 'name: yaml-only\napiPort: 9317\n', 'utf8');
+
+    expect(configExists()).toBe(true);
+  });
+
+  it('reads nodeRole from yaml-only config for sync daemon entrypoint routing', async () => {
+    await writeFile(join(tempDir, 'config.yaml'), 'name: yaml-core\nnodeRole: core\n', 'utf8');
+
+    expect(readNodeRoleFromConfigSync()).toBe('core');
+  });
+
+  it('keeps config.json precedence for sync nodeRole reads', async () => {
+    await writeFile(join(tempDir, 'config.json'), JSON.stringify({ nodeRole: 'edge' }), 'utf8');
+    await writeFile(join(tempDir, 'config.yaml'), 'nodeRole: core\n', 'utf8');
+
+    expect(readNodeRoleFromConfigSync()).toBe('edge');
   });
 
   it('round-trips relayServerCapacity through saveConfig/loadConfig (operator override)', async () => {

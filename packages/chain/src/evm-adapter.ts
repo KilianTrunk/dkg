@@ -1,4 +1,4 @@
-import { ethers, JsonRpcProvider, FallbackProvider, Wallet, Contract, Interface } from 'ethers';
+import { ethers, JsonRpcProvider, FallbackProvider, Wallet, Contract, Interface, FetchRequest } from 'ethers';
 import {
   createFilterErrorSilencer,
   installFilterNotFoundConsoleSuppressor,
@@ -90,10 +90,56 @@ const DURATION_PROBE_TIMEOUT_MS = 2000;
  */
 const MAX_PROBE_AGE_MS = 30_000;
 const RPC_READ_STALL_TIMEOUT_MS = 4_000;
+const RPC_TRANSACTION_POPULATION_ATTEMPT_TIMEOUT_MS = 10_000;
 const RPC_BROADCAST_ATTEMPT_TIMEOUT_MS = 10_000;
 const RPC_RECEIPT_ATTEMPT_TIMEOUT_MS = 5_000;
 const RPC_RECEIPT_POLL_INTERVAL_MS = 2_000;
 const RPC_RECEIPT_TIMEOUT_MS = 180_000;
+
+/**
+ * Per-request retry bound for ethers' built-in `FetchRequest`. ethers v6
+ * retries HTTP 429 / 5xx responses with exponential backoff via
+ * `FetchRequest.retryFunc`; the default keeps retrying for far longer than any
+ * caller-side timeout, so a perpetually rate-limited (429) RPC makes a plain
+ * read (e.g. `Hub.getContractAddress` inside `init()`, which sits on the
+ * critical path of `createOnChainContextGraph` / context-graph register) hang
+ * for minutes — register then never returns its `RPC_ENDPOINTS_EXHAUSTED`→503
+ * in bounded time (#894 follow-up: surfaced once the boot timeout stopped the
+ * daemon hanging at startup). Bounding the retry lets a sustained RPC error
+ * surface as a normal (retryable) RPC error, so the adapter's own multi-RPC
+ * failover + `RPC_ENDPOINTS_EXHAUSTED` wrapping kick in within seconds instead
+ * of stalling. A transient single 429 is still retried (resilience preserved);
+ * only a perpetually-failing endpoint gives up fast.
+ *
+ * The bound is the per-request RETRY COUNT (`attempt`), NOT a wall-clock
+ * deadline. ethers resets `attempt` to 0 for every new top-level request and
+ * increments it per retry, so an attempt-count cap is inherently per-request —
+ * unlike a `Date.now()`-based deadline captured at provider construction, which
+ * would (once the node had been up longer than the budget) instantly disable
+ * retries for the rest of the process lifetime (Codex PR #901 round-3 :125).
+ * With the capped backoff below, `RPC_REQUEST_MAX_RETRIES` retries span roughly
+ * `RPC_REQUEST_MAX_RETRIES * backoffCap` ≈ 7.5s of wall time under a fast-
+ * failing endpoint — bounded, and well under the daemon route / test ceilings.
+ */
+const RPC_REQUEST_MAX_RETRIES = 5;
+const RPC_REQUEST_RETRY_BACKOFF_CAP_MS = 1_500;
+
+/**
+ * Build a `FetchRequest` whose retry loop gives up after
+ * `RPC_REQUEST_MAX_RETRIES` retries. A bare string URL would use ethers'
+ * unbounded default; we install a bounded `retryFunc` instead. The bound is
+ * evaluated from `attempt` (per-request), so every request — no matter how
+ * long the node has been running — gets the same fresh retry budget.
+ */
+function boundedRetryFetchRequest(url: string): FetchRequest {
+  const req = new FetchRequest(url);
+  req.retryFunc = async (_req, _response, attempt) => {
+    if (attempt >= RPC_REQUEST_MAX_RETRIES) return false;
+    await sleep(Math.min(500 * (attempt + 1), RPC_REQUEST_RETRY_BACKOFF_CAP_MS));
+    return true;
+  };
+  return req;
+}
 
 /**
  * Substrings we treat as "the Hub no longer recognises this contract
@@ -316,7 +362,17 @@ function errorStatus(err: unknown): number | undefined {
   return typeof raw === 'number' ? raw : undefined;
 }
 
-function isRetryableRpcError(err: unknown): boolean {
+/**
+ * Is `err` a transient RPC failure worth retrying / failing over (vs a
+ * deterministic chain revert / argument error)? Inspects ethers/fetch error
+ * shapes thoroughly — top-level AND nested `error.code` / `statusCode` /
+ * `response.status` / `error.status` (via `errorCode` / `errorStatus`), plus a
+ * message probe — so a 429/5xx buried in a nested field is still recognised.
+ * Exported so consumers (e.g. the agent's boot-recovery transient gate) reuse
+ * the SAME extraction instead of duplicating a narrower top-level-only subset
+ * (Codex PR #901 round-4 :459).
+ */
+export function isRetryableRpcError(err: unknown): boolean {
   if (err instanceof Error) enrichEvmError(err);
   const code = errorCode(err);
   const status = errorStatus(err);
@@ -339,10 +395,20 @@ function isRetryableRpcError(err: unknown): boolean {
   if (code === 'TIMEOUT' || code === 'TIMEOUT_ERROR' || code === 'SERVER_ERROR'
     || code === 'NETWORK_ERROR' || code === 'ECONNRESET' || code === 'ECONNREFUSED'
     || code === 'ETIMEDOUT' || code === 'ENOTFOUND' || code === 'EAI_AGAIN'
-    || code === 'UNKNOWN_ERROR' || code === 'BAD_DATA') {
+    || code === 'UNKNOWN_ERROR' || code === 'BAD_DATA'
+    // Our own synthetic "all configured RPC endpoints exhausted" code — by
+    // definition retryable, regardless of the aggregated message text.
+    || code === 'RPC_ENDPOINTS_EXHAUSTED') {
     return true;
   }
-  return /timeout|timed out|network|socket|reset|econnreset|econnrefused|etimedout|enotfound|eai_again|rate limit|too many requests|429|503|502|500|gateway|temporarily unavailable|fetch failed|connection/i
+  // `no runners?!` is ethers' FallbackProvider error (provider-fallback.js)
+  // when EVERY configured sub-provider is unavailable — i.e. all RPC endpoints
+  // are exhausted. On a multi-RPC node a perpetual 429 surfaces as this rather
+  // than a raw `429`/`SERVER_ERROR` (which is what a single-provider config
+  // throws), so classify it as retryable too — otherwise `init()`'s Hub reads
+  // would propagate it un-coded and `/api/context-graph/register` would 500
+  // instead of the bounded 503 (#894 follow-up).
+  return /timeout|timed out|network|socket|reset|econnreset|econnrefused|etimedout|enotfound|eai_again|rate limit|too many requests|429|503|502|500|gateway|temporarily unavailable|fetch failed|connection|no runners/i
     .test(msg);
 }
 
@@ -496,6 +562,8 @@ interface EVMAdapterBaseConfig {
   /** Additional operational wallet keys for parallel transaction submission. */
   additionalKeys?: string[];
   hubAddress: string;
+  /** Optional TRAC token contract override. When omitted, resolve from Hub.Token. */
+  tokenAddress?: string;
   chainId?: string;
   /**
    * TTL (ms) for re-resolving `RandomSampling` / `RandomSamplingStorage`
@@ -610,6 +678,7 @@ export class EVMChainAdapter implements ChainAdapter {
   private signerIndex = 0;
   private signerSelectionQueue: Promise<void> = Promise.resolve();
   private readonly hubAddress: string;
+  private readonly tokenAddress?: string;
   /**
    * Operator-configured allowance sizing policy for V10 publish / update
    * auto-approve. See {@link ApprovalPolicy}. Default is `'per-publish'`,
@@ -765,8 +834,13 @@ export class EVMChainAdapter implements ChainAdapter {
     // block per active subscription) in exchange for a stateless,
     // self-healing subscription with no server-side filter to leak. This is
     // ethers' own fallback path for filter-unsupported RPCs.
+    // Bound ethers' built-in per-request 429/5xx retry (see
+    // `boundedRetryFetchRequest`) so a perpetually rate-limited RPC surfaces a
+    // retryable error within seconds instead of stalling reads (e.g. `init()`'s
+    // Hub lookups) for minutes — which would otherwise make context-graph
+    // register hang past its HTTP timeout rather than returning 503.
     this.providers = this.rpcUrls.map(
-      (url) => new JsonRpcProvider(url, undefined, { cacheTimeout: -1, polling: true }),
+      (url) => new JsonRpcProvider(boundedRetryFetchRequest(url), undefined, { cacheTimeout: -1, polling: true }),
     );
     this.primaryProvider = this.providers[0];
     this.provider = this.providers.length === 1
@@ -840,6 +914,10 @@ export class EVMChainAdapter implements ChainAdapter {
       }
     }
     this.hubAddress = config.hubAddress;
+    if (config.tokenAddress && !ethers.isAddress(config.tokenAddress)) {
+      throw new Error(`Invalid tokenAddress: ${config.tokenAddress}`);
+    }
+    this.tokenAddress = config.tokenAddress ? ethers.getAddress(config.tokenAddress) : undefined;
     this.chainId = config.chainId ?? 'evm:31337';
     this.approvalPolicy = config.approvalPolicy ?? DEFAULT_APPROVAL_POLICY;
 
@@ -932,6 +1010,7 @@ export class EVMChainAdapter implements ChainAdapter {
         { cause: lastRetryable },
       );
       (err as any).code = 'RPC_RECEIPT_LOOKUP_FAILED';
+      (err as any).txHash = txHash;
       throw err;
     }
     return null;
@@ -956,11 +1035,14 @@ export class EVMChainAdapter implements ChainAdapter {
       }
       await sleep(RPC_RECEIPT_POLL_INTERVAL_MS);
     }
-    throw new Error(
-      `${label} tx ${txHash} was broadcast but no receipt was found within ${RPC_RECEIPT_TIMEOUT_MS}ms` +
+    const err = new Error(
+      `${label} tx ${txHash} timed out waiting for a receipt after ${RPC_RECEIPT_TIMEOUT_MS}ms` +
       (lastError ? ` (last RPC error: ${errorMessage(lastError)})` : ''),
       { cause: lastError },
     );
+    (err as any).code = 'TIMEOUT';
+    (err as any).txHash = txHash;
+    throw err;
   }
 
   private async signPopulatedTransaction(
@@ -998,9 +1080,51 @@ export class EVMChainAdapter implements ChainAdapter {
     signer: Wallet,
     label: string,
   ): Promise<ethers.TransactionReceipt> {
-    const connected = contract.connect(signer) as any;
-    const populated = await connected[method].populateTransaction(...args);
-    return this.sendPopulatedTransaction(signer, populated, label);
+    let lastRetryable: unknown;
+    for (let i = 0; i < this.providers.length; i += 1) {
+      const rpcSigner = signer.connect(this.providers[i]);
+      let prepared: { signedTx: string; txHash: string } | undefined;
+      try {
+        const connected = contract.connect(rpcSigner) as any;
+        const populated = await withTimeout<ethers.TransactionRequest>(
+          connected[method].populateTransaction(...args) as Promise<ethers.TransactionRequest>,
+          RPC_TRANSACTION_POPULATION_ATTEMPT_TIMEOUT_MS,
+          `${label} transaction population via RPC #${i + 1}`,
+        );
+        prepared = await withTimeout(
+          this.signPopulatedTransaction(rpcSigner, populated),
+          RPC_TRANSACTION_POPULATION_ATTEMPT_TIMEOUT_MS,
+          `${label} transaction signing via RPC #${i + 1}`,
+        );
+      } catch (err) {
+        if (!isRetryableRpcError(err)) throw err;
+        lastRetryable = err;
+        continue;
+      }
+      if (!prepared) continue;
+      return this.sendSignedTransactionAndWait(prepared.signedTx, prepared.txHash, label);
+    }
+    // A retryable error from the only configured RPC is still an "endpoints
+    // exhausted" condition: downstream classifiers (e.g.
+    // `/api/context-graph/register` → `classifyRegisterContextGraphError`)
+    // key the transient-outage 503 off the `RPC_ENDPOINTS_EXHAUSTED` code, so
+    // the code MUST be present even for a single-provider adapter (Codex
+    // PR #901). What we must NOT do for one provider is REWRITE the
+    // `.message` into the multi-endpoint "failed on all endpoints (url1,
+    // url2): ..." aggregate — there is no second endpoint, so the original
+    // message (e.g. a plain `connect ECONNREFUSED`) reads cleaner and any
+    // message-inspecting caller keeps seeing it verbatim. So: single provider
+    // → carry the code on a new error but keep the message byte-identical;
+    // multiple providers → the aggregated "all endpoints" message is
+    // meaningful and is asserted by evm-adapter.unit.test.ts.
+    const message = this.providers.length <= 1
+      ? errorMessage(lastRetryable)
+      : `${label} transaction preparation failed on all configured RPC endpoints ` +
+        `(${this.rpcUrls.join(', ')}): ${errorMessage(lastRetryable)}`;
+    const err = new Error(message, { cause: lastRetryable });
+    (err as any).code = 'RPC_ENDPOINTS_EXHAUSTED';
+    (err as any).rpcUrls = [...this.rpcUrls];
+    throw err;
   }
 
   /**
@@ -1039,6 +1163,33 @@ export class EVMChainAdapter implements ChainAdapter {
       currentAllowance,
     );
     if (needsApprove) {
+      // Surface the per-publish floor explicitly when (and only when) the
+      // policy lifted `targetAllowance` above the caller's `tokenAmount`
+      // — i.e. `tokenAmount === 0n` and the floor in
+      // `effectivePublishAllowance` produced `targetAllowance === 1n`
+      // (`V10_PUBLISH_ONCHAIN_MIN_ALLOWANCE`). That's the #720 workaround
+      // for the contract's `transferFrom(..., 1n)` minimum on zero-cost
+      // publishes. Without this log, operators who manually inspect
+      // on-chain allowance see "1 wei dust" persisting after every
+      // publish and misread it as a stuck or ghosted approval (#871).
+      //
+      // The `tokenAmount === 0n` half of the guard matters: a legitimate
+      // `tokenAmount === 1n` publish ALSO produces `targetAllowance === 1n`
+      // under per-publish, but in that case the 1-wei is the real publish
+      // cost, not the workaround floor — claiming "#720 floor" there
+      // would be a false positive (Codex, PR #875).
+      if (
+        this.approvalPolicy.mode === 'per-publish' &&
+        tokenAmount === 0n &&
+        targetAllowance === V10_PUBLISH_ONCHAIN_MIN_ALLOWANCE
+      ) {
+        console.warn(
+          `[chain] V10 per-publish auto-approve floor: signer=${signer.address} ` +
+          `kav10=${kav10Address} target=1 wei (tokenAmount=0, ` +
+          `currentAllowance=${currentAllowance.toString()}). This is the #720 ` +
+          `transferFrom-minimum workaround; not a stuck approval.`,
+        );
+      }
       await this.sendContractTransaction(
         tokenWithSigner,
         'approve',
@@ -1329,7 +1480,32 @@ export class EVMChainAdapter implements ChainAdapter {
 
   private async init(): Promise<void> {
     if (this.initialized) return;
+    try {
+      await this.initContracts();
+    } catch (err) {
+      // `init()` sits on the critical path of every chain write
+      // (`createOnChainContextGraph`, publish, verify, …). If the Hub lookups
+      // fail because the configured RPC endpoint(s) are exhausted (perpetual
+      // 429 / unreachable), surface the same `RPC_ENDPOINTS_EXHAUSTED` contract
+      // the tx-send path uses, so callers (e.g. `/api/context-graph/register`
+      // → `classifyRegisterContextGraphError`) map it to a bounded 503 instead
+      // of a generic 500 — and never hang waiting on it (#894 follow-up). A
+      // non-RPC error (e.g. a genuine "contract not in Hub" misconfig) keeps
+      // its original shape.
+      if (isRetryableRpcError(err)) {
+        const wrapped = new Error(
+          `chain initialisation failed on all configured RPC endpoints (${this.rpcUrls.join(', ')}): ${errorMessage(err)}`,
+          { cause: err },
+        );
+        (wrapped as any).code = 'RPC_ENDPOINTS_EXHAUSTED';
+        (wrapped as any).rpcUrls = [...this.rpcUrls];
+        throw wrapped;
+      }
+      throw err;
+    }
+  }
 
+  private async initContracts(): Promise<void> {
     this.contracts.identity = await this.resolveContract('Identity');
     this.contracts.profile = await this.resolveContract('Profile');
     this.contracts.parametersStorage = await this.resolveContract('ParametersStorage');
@@ -1419,7 +1595,7 @@ export class EVMChainAdapter implements ChainAdapter {
 
     await this.startHubRotationListener();
 
-    const tokenAddress: string = await this.contracts.hub.getContractAddress('Token');
+    const tokenAddress: string = this.tokenAddress ?? await this.contracts.hub.getContractAddress('Token');
     if (tokenAddress !== ethers.ZeroAddress) {
       this.contracts.token = new Contract(
         tokenAddress,
@@ -4343,8 +4519,54 @@ export class EVMChainAdapter implements ChainAdapter {
   async getContextGraphAccessPolicy(contextGraphId: bigint): Promise<number> {
     await this.init();
     const cgs = this.requireContextGraphStorage();
-    const raw: bigint = BigInt(await cgs.getAccessPolicy(contextGraphId));
-    return Number(raw);
+    try {
+      const raw: bigint = BigInt(await cgs.getAccessPolicy(contextGraphId));
+      return Number(raw);
+    } catch (primaryErr) {
+      try {
+        const cg = await cgs.getContextGraph(contextGraphId);
+        const raw =
+          cg?.accessPolicy
+          ?? (Array.isArray(cg) ? cg[5] : undefined);
+        if (raw === undefined || raw === null) {
+          throw new Error('ContextGraphStorage.getContextGraph returned no accessPolicy field');
+        }
+        return Number(BigInt(raw));
+      } catch (fallbackErr) {
+        throw new Error(
+          `ContextGraphStorage access-policy lookup failed via getAccessPolicy and getContextGraph fallback: ` +
+          `${primaryErr instanceof Error ? primaryErr.message : String(primaryErr)}; ` +
+          `fallback: ${fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr)}`,
+        );
+      }
+    }
+  }
+
+  /**
+   * Issue #872 / Codex round-3 — chain-backed publish-policy oracle
+   * for non-creator peers. `ContextGraphStorage.getPublishPolicy`
+   * returns the tuple `(uint8 publishPolicy, address publishAuthority)`.
+   * `publishPolicy: 0` = curators-only, `1` = open. Unregistered ids
+   * return `(0, address(0))` from Solidity's default-zero mapping —
+   * the caller is responsible for cross-checking registration
+   * status before treating that as a positive "curators-only" signal.
+   */
+  async getContextGraphPublishPolicy(contextGraphId: bigint): Promise<{
+    publishPolicy: number;
+    publishAuthority: string;
+  }> {
+    await this.init();
+    const cgs = this.requireContextGraphStorage();
+    const result = await cgs.getPublishPolicy(contextGraphId);
+    // Ethers v6 returns named tuple as both array and object access;
+    // destructure positionally to stay robust against ABI naming
+    // changes.
+    const rawPolicy: bigint = BigInt(result[0] ?? result.publishPolicy ?? 0);
+    const rawAuthority: string = String(result[1] ?? result.publishAuthority ?? ethers.ZeroAddress);
+    return {
+      publishPolicy: Number(rawPolicy),
+      publishAuthority: ethers.getAddress(rawAuthority),
+    };
   }
 
   /**

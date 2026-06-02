@@ -13,10 +13,8 @@ import {
   fetchErrorHotspots,
   fetchNodeLog,
   fetchConnections,
-  fetchLlmSettings,
   fetchRetentionSettings,
   fetchTelemetrySettings,
-  fetchCatchupStatus,
   markNotificationsRead,
   fetchRpcHealth,
   fetchQueryHistory,
@@ -65,8 +63,6 @@ function startTestServer(): Promise<void> {
           res.end(JSON.stringify({ total_kcs: 5 }));
         } else if (url.startsWith('/api/connections')) {
           res.end(JSON.stringify({ peers: [] }));
-        } else if (url.startsWith('/api/settings/llm')) {
-          res.end(JSON.stringify({ model: 'gpt-4' }));
         } else if (url.startsWith('/api/settings/retention')) {
           res.end(JSON.stringify({ retentionDays: 30 }));
         } else if (url.startsWith('/api/settings/telemetry')) {
@@ -89,8 +85,6 @@ function startTestServer(): Promise<void> {
           res.end(JSON.stringify({ hotspots: [] }));
         } else if (url.startsWith('/api/node-log')) {
           res.end(JSON.stringify({ lines: [], totalSize: 0 }));
-        } else if (url.startsWith('/api/sync/catchup-status')) {
-          res.end(JSON.stringify({ jobId: 'j1', status: 'done' }));
         } else if (url.startsWith('/api/notifications')) {
           res.end(JSON.stringify({ notifications: [], ok: true }));
         } else if (url.startsWith('/api/success-rates')) {
@@ -207,11 +201,6 @@ describe('UI API tests', () => {
       expect(requestLog.some(r => r.url.startsWith('/api/connections'))).toBe(true);
     });
 
-    it('fetchLlmSettings calls /api/settings/llm', async () => {
-      const res = await fetchLlmSettings();
-      expect(res.model).toBe('gpt-4');
-    });
-
     it('fetchRetentionSettings calls /api/settings/retention', async () => {
       const res = await fetchRetentionSettings();
       expect(res.retentionDays).toBe(30);
@@ -274,26 +263,6 @@ describe('UI API tests', () => {
       expect(call?.url).toContain('lines=100');
     });
 
-    it('fetchCatchupStatus calls correct endpoint', async () => {
-      await fetchCatchupStatus('cg-1');
-      expect(requestLog.some(r => r.url.includes('contextGraphId=cg-1'))).toBe(true);
-    });
-
-    it('fetchCatchupStatus type accepts V10 "unreachable" terminal status', async () => {
-      // V10 introduces an `unreachable` status when the daemon ran the
-      // catchup but no peer could deliver the CG content (curator
-      // offline / no host / network failure). The UI uses it to render
-      // a dedicated "send signed join request" CTA distinct from the
-      // generic timeout copy. This test pins the type contract: the
-      // CatchupStatusResponse union must accept `'unreachable'` so the
-      // modal's terminal-state poll exit recognises it.
-      const result = await fetchCatchupStatus('cg-2');
-      const acceptedStatuses: Array<typeof result.status> = [
-        'queued', 'running', 'done', 'denied', 'failed', 'unreachable',
-      ];
-      expect(acceptedStatuses).toContain(result.status);
-    });
-
     it('fetchSuccessRates calls correct endpoint', async () => {
       await fetchSuccessRates(60000);
       expect(requestLog.some(r => r.url.includes('periodMs=60000'))).toBe(true);
@@ -317,11 +286,23 @@ describe('UI API tests', () => {
       expect(body.contextGraphId).toBe('cg-1');
     });
 
-    it('publishSharedMemory sends contextGraphId', async () => {
-      await publishSharedMemory('cg-1');
+    it('publishSharedMemory sends one explicit root selection', async () => {
+      await publishSharedMemory('cg-1', ['urn:root']);
       const call = requestLog.find(r => r.method === 'POST' && r.url.includes('/api/shared-memory/publish'));
       const body = JSON.parse(call?.body ?? '{}');
       expect(body.contextGraphId).toBe('cg-1');
+      expect(body.selection).toEqual(['urn:root']);
+      expect(body.clearAfter).toBe(false);
+    });
+
+    it('listSwmEntities queries the shared-working-memory view', async () => {
+      await listSwmEntities('cg-1');
+      const call = requestLog.find(r => r.method === 'POST' && r.url.includes('/api/query'));
+      const body = JSON.parse(call?.body ?? '{}');
+      expect(body.contextGraphId).toBe('cg-1');
+      expect(body.view).toBe('shared-working-memory');
+      expect(body.sparql).toContain('/_shared_memory');
+      expect(body.sparql).toContain('workspaceOwner');
     });
 
     it('createSavedQuery sends POST', async () => {

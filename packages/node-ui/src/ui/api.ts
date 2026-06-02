@@ -679,8 +679,54 @@ export async function listAssertions(
   }
 
   // layer === 'wm'
-  const sparql = `SELECT DISTINCT ?g (COUNT(?s) AS ?cnt) WHERE { GRAPH ?g { ?s ?p ?o } } GROUP BY ?g`;
-  const data = await executeQuery(sparql, contextGraphId);
+  //
+  // #864 rc.12 follow-up — without `includeContextGraphPartitions`, the
+  // daemon's contextGraphId-scoped routing (DKGQueryEngine.query, the
+  // `effectiveContextGraphId && !options?.view` branch) restricts
+  // `GRAPH ?g { … }` reads to the static allow-list
+  //   { <cg>, <cg>/_meta, <cg>/_shared_memory_meta }
+  // via `constrainGraphVariablesToAllowedSet`. Every WM assertion lives
+  // in a content partition (`<cg>/assertion/<agent>/<name>` or the
+  // sub-graph variant `<cg>/<sg>/assertion/<agent>/<name>`) — none of
+  // which are in that allow-list — so this enumeration came back empty
+  // for any CG no matter how many assertions actually existed.
+  // Downstream that surfaced as:
+  //   - `AssertionsList` rendered "no assertions" right after import.
+  //   - `LayerActionsWidget` showed the correct "Promote N to SWM" badge
+  //     (the count comes from `useMemoryEntities`, which already opts
+  //     into `includeContextGraphPartitions`), but on click its
+  //     `handleAction` loop iterated zero times and hit the no-op
+  //     bulk-promote branch — the exact "0 triples promoted" symptom
+  //     the rc.12 issue reported even after the publisher-side
+  //     `AssertionNotPersistedError` fix landed.
+  // Opting into the same partition-aware scope `useMemoryEntities`
+  // already uses brings the assertion partitions back into `GRAPH ?g`
+  // expansion. Same `/api/query` route, same `postQueryDeduped` cache,
+  // same privacy/cost envelope as the dashboard counters.
+  // Codex review on #898 — listing WM by raw `GRAPH ?g { ?s ?p ?o }`
+  // counts re-listed promoted assertions because `assertionPromote`
+  // intentionally leaves daemon-owned `urn:dkg:file:*` /
+  // `urn:dkg:extraction:*` quads behind in the assertion data graph
+  // (publisher Bug 8 / Round 9 Bug 25 import-bookkeeping filter), so
+  // those graphs stay non-empty after promote even though the
+  // lifecycle in `_meta` has flipped to `dkg:memoryLayer "SWM"`. The
+  // UI was therefore offering Promote on assertions that were no
+  // longer in WM. Derive WM membership from the lifecycle marker the
+  // publisher itself owns: `<assertionGraphUri> dkg:memoryLayer "WM"`
+  // in `<cg>/_meta` (set by `assertionCreate`, flipped to "SWM" by
+  // `assertionPromote`). The OPTIONAL keeps WM rows visible even when
+  // the data graph is genuinely empty (fresh create with no writes
+  // yet), matching the prior listing semantics for that case.
+  const metaGraph = `did:dkg:context-graph:${contextGraphId}/_meta`;
+  const sparql = `SELECT ?g (COUNT(?s) AS ?cnt) WHERE {
+    GRAPH <${metaGraph}> { ?g <http://dkg.io/ontology/memoryLayer> "WM" }
+    OPTIONAL { GRAPH ?g { ?s ?p ?o } }
+  } GROUP BY ?g`;
+  const data = await postQueryDeduped({
+    sparql,
+    contextGraphId,
+    includeContextGraphPartitions: true,
+  });
   const bindings: any[] = data?.result?.bindings ?? [];
   // #706 fix — the prior `startsWith('did:dkg:context-graph:<cg>/assertion/')`
   // shape silently dropped sub-graph-scoped WM assertions, whose graph
@@ -743,6 +789,64 @@ export const promoteAssertion = (
     { contextGraphId, entities, ...(subGraphName ? { subGraphName } : {}) },
   );
 
+// Issue #864 — central UI translator for `promoteAssertion` outcomes so
+// every call-site speaks the same language. Two shapes get massaged
+// here that the bare-promotedCount path used to render confusingly:
+//
+//   • `promotedCount === 0` is technically a success but normally
+//     means "the assertion graph was already empty when promote ran"
+//     (already-promoted re-click, discarded draft, or — the rc.12
+//     bug from issue #864 — a transient state where _meta indicates
+//     persistence but the data graph isn't visible yet). Surface that
+//     ambiguity instead of the misleading literal "Promoted 0 triples
+//     to Shared Memory" toast.
+//   • An HttpError with `body.code === 'ASSERTION_NOT_PERSISTED'`
+//     (the new 409 from the /promote route) means we caught the
+//     inconsistency on the daemon side. Re-render the daemon's hint
+//     as a UI-friendly sentence that includes the expected count so
+//     the user understands re-import is the recovery path.
+export type PromoteOutcome =
+  | { kind: 'success'; promotedCount: number; message: string }
+  | { kind: 'noop'; message: string }
+  | { kind: 'not-persisted'; message: string; expectedTripleCount?: number };
+
+export function describePromoteResult(
+  assertionName: string,
+  res: { promotedCount: number },
+): PromoteOutcome {
+  if (res.promotedCount > 0) {
+    return {
+      kind: 'success',
+      promotedCount: res.promotedCount,
+      message: `Promoted ${res.promotedCount} triple${res.promotedCount === 1 ? '' : 's'} from ${assertionName} to Shared Working Memory.`,
+    };
+  }
+  return {
+    kind: 'noop',
+    message: `${assertionName} had no triples to promote. It may already be in Shared Working Memory, or the extracted content is still being committed — refresh and try again.`,
+  };
+}
+
+export function describePromoteError(
+  assertionName: string,
+  err: unknown,
+): PromoteOutcome | null {
+  if (err instanceof HttpError && err.status === 409) {
+    const body = err.body as { code?: string; expectedTripleCount?: number } | undefined;
+    if (body?.code === 'ASSERTION_NOT_PERSISTED') {
+      const expected = typeof body.expectedTripleCount === 'number' ? body.expectedTripleCount : undefined;
+      return {
+        kind: 'not-persisted',
+        expectedTripleCount: expected,
+        message: expected
+          ? `${assertionName} was imported with ${expected} extracted triple${expected === 1 ? '' : 's'} but the data graph is empty. Re-import the source file (or re-write the assertion) before promoting.`
+          : `${assertionName}'s data graph is empty but its extraction metadata says it should hold content. Re-import the source file before promoting.`,
+      };
+    }
+  }
+  return null;
+}
+
 // --- File preview ---
 
 export interface ExtractionStatus {
@@ -795,7 +899,14 @@ export interface SwmRootEntity {
 
 /** List root entities in SWM with their triple counts. */
 export async function listSwmEntities(contextGraphId: string): Promise<SwmRootEntity[]> {
-  const sparql = `SELECT ?s (COUNT(?p) AS ?cnt) WHERE { ?s ?p ?o } GROUP BY ?s ORDER BY DESC(?cnt)`;
+  const swmGraph = `did:dkg:context-graph:${contextGraphId}/_shared_memory`;
+  const sparql = `SELECT ?s (COUNT(?p) AS ?cnt) WHERE {
+    GRAPH ?g {
+      ?s ?p ?o .
+      FILTER(STR(?g) = "${swmGraph}")
+      FILTER(?p != <http://dkg.io/ontology/workspaceOwner>)
+    }
+  } GROUP BY ?s ORDER BY DESC(?cnt)`;
   const data = await post<{ result: any }>('/api/query', { sparql, contextGraphId, view: 'shared-working-memory' });
   const bindings: any[] = data?.result?.bindings ?? [];
   return bindings.map((b) => {
@@ -819,13 +930,17 @@ export interface PublishResult {
   blockNumber?: number;
 }
 
-/** Publish SWM content on-chain (SWM -> VM). Pass rootEntities to selectively publish, or omit for all. */
-export const publishSharedMemory = (contextGraphId: string, rootEntities?: string[]) =>
-  post<PublishResult>('/api/shared-memory/publish', {
+/** Publish exactly one SWM root on-chain (SWM -> VM). */
+export const publishSharedMemory = (contextGraphId: string, rootEntities: string[]) => {
+  if (rootEntities.length !== 1) {
+    throw new Error('V10 publish requires exactly one root entity per request.');
+  }
+  return post<PublishResult>('/api/shared-memory/publish', {
     contextGraphId,
-    selection: rootEntities ?? 'all',
-    clearAfter: !rootEntities,
+    selection: rootEntities,
+    clearAfter: false,
   });
+};
 
 // --- Query history ---
 export const fetchQueryHistory = (limit = 50, offset = 0) =>

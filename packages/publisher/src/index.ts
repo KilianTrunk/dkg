@@ -29,6 +29,7 @@ export {
   DKGPublisher,
   StaleWriteError,
   AssertionNotPersistedError,
+  MultiRootPublishNotAtomicError,
   type DKGPublisherConfig,
   type WorkspaceSenderKeyEncryptInput,
   type WorkspaceSenderKeyEncryptor,

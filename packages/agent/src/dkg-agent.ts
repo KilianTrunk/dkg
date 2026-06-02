@@ -542,6 +542,18 @@ const TIMEOUT_SENTINEL = Symbol('chain-rpc-fallback-timeout');
  */
 const ON_CHAIN_PUBLISH_POLICY_CACHE_TTL_MS = 60_000;
 
+/**
+ * #884 review — bound the on-chain access-policy / liveness reads on the
+ * share/promote/publish hot path (`isContextGraphPublicOnChain`,
+ * `isKnownOnChainId`). Mirrors `CHAIN_RPC_FALLBACK_TIMEOUT_MS` in
+ * {@link DKGAgent.getContextGraphOnChainPolicy}: if the RPC layer HANGS
+ * (rather than rejecting), the helper must still resolve so the caller fails
+ * closed to "not public / not known" instead of blocking the request
+ * indefinitely. 2.5s stays well under the daemon-ready budget while allowing
+ * a single slow eth_call hop under normal load.
+ */
+const CHAIN_POLICY_READ_TIMEOUT_MS = 2_500;
+
 export class DKGAgent {
   readonly wallet: AgentWallet;
   readonly node: DKGNode;
@@ -6092,6 +6104,26 @@ export class DKGAgent {
   }
 
   /**
+   * #884 review — bound a single chain policy/liveness read on the hot path.
+   * Mirrors the `withTimeout` race in {@link getContextGraphOnChainPolicy}:
+   * resolves to {@link TIMEOUT_SENTINEL} if the underlying RPC HANGS past
+   * {@link CHAIN_POLICY_READ_TIMEOUT_MS}, so callers fail closed instead of
+   * blocking forever. The timer is `unref`'d so a dead RPC never keeps the
+   * process alive.
+   */
+  private raceChainPolicyRead<T>(p: Promise<T>): Promise<T | typeof TIMEOUT_SENTINEL> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<typeof TIMEOUT_SENTINEL>((resolve) => {
+      timer = setTimeout(() => resolve(TIMEOUT_SENTINEL), CHAIN_POLICY_READ_TIMEOUT_MS);
+      timer.unref?.();
+    });
+    return Promise.race([
+      p.finally(() => { if (timer) clearTimeout(timer); }),
+      timeout,
+    ]);
+  }
+
+  /**
    * True iff `contextGraphId` is DEFINITIVELY public per its on-chain
    * access policy (policy enum `0`). Gates SWM encryption: an on-chain
    * public CG is public-readable, so its shared memory must be plaintext
@@ -6120,49 +6152,31 @@ export class DKGAgent {
     opCtx?: OperationContext,
   ): Promise<boolean> {
     try {
-      // A bare decimal `contextGraphId` is INHERENTLY ambiguous: it can be a
-      // LOCAL context-graph id (a CG the user named "42") OR an already-resolved
-      // numeric ON-CHAIN id (e.g. share('42', ...)). Reviewers have correctly
-      // flagged BOTH a strict local-first and a strict numeric-first ordering as
-      // unsafe for the opposite case, so resolve the two interpretations
-      // INDEPENDENTLY and only trust a value when they agree or only one exists.
       const trimmed = contextGraphId.trim();
+      let onChainId: string | null = null;
 
-      // (a) LOCAL-ID interpretation: map the input as a context-graph name to
-      //     its persisted on-chain id. The resolver only returns an id for a
-      //     graph registered on-chain, so it never invents one — and it covers
-      //     a registered CG whose user-chosen id happens to be numeric (a CG
-      //     "named 42" that maps to its own actual on-chain id).
-      let localResolved: string | null = null;
+      // 1) LOCAL-ID RESOLUTION IS AUTHORITATIVE. `getContextGraphOnChainId`
+      //    maps ANY locally-known context-graph id — INCLUDING a registered CG
+      //    whose user-chosen id is numeric (a CG "named 42") — to THAT graph's
+      //    actual persisted on-chain id. A concrete local graph with this
+      //    exact id is unambiguous: it IS that graph, so reading its mapped
+      //    policy always targets the correct graph. Use it whenever it
+      //    resolves; the resolver only ever returns an id for a registered CG,
+      //    so it never invents one (#884 review: a numeric-named local CG must
+      //    NOT be regressed onto the encrypted path).
       if (typeof this.getContextGraphOnChainId === 'function') {
-        localResolved = await this.getContextGraphOnChainId(contextGraphId);
+        onChainId = await this.getContextGraphOnChainId(contextGraphId);
       }
 
-      // (b) ON-CHAIN-ID interpretation: a bare decimal MAY itself be the
-      //     on-chain id. Trusted ONLY when PROVEN registered via
-      //     isKnownOnChainId (policy cache / subscribed CG / durable persisted
-      //     mapping), because chain adapters return access-policy 0 (= public)
-      //     for UNKNOWN ids (Solidity default-zero mapping).
-      let numericResolved: string | null = null;
-      if (/^\d+$/.test(trimmed) && (await this.isKnownOnChainId(trimmed))) {
-        numericResolved = trimmed;
-      }
-
-      // Reconcile. If both interpretations resolve and DISAGREE (a local CG
-      // "42" mapping to a different on-chain id, AND on-chain CG 42 is itself
-      // independently known here), we cannot safely tell which graph the
-      // caller meant — fail closed (encrypt) rather than read the wrong
-      // graph's policy and risk leaking plaintext. If they agree, or only one
-      // resolves, use it. In the common cases this satisfies BOTH review
-      // positions: a registered numeric-named local CG routes to its mapped
-      // policy (local-first concern), and a bare on-chain id with no colliding
-      // local name routes to the on-chain policy (numeric-first concern).
-      let onChainId: string | null;
-      if (localResolved && numericResolved) {
-        if (localResolved !== numericResolved) return false;
-        onChainId = localResolved;
-      } else {
-        onChainId = localResolved ?? numericResolved;
+      // 2) BARE-NUMERIC SHORTCUT — only when NO local graph with this id
+      //    exists. The caller may pass the raw on-chain id directly
+      //    (share('42', ...)) for a public CG this node isn't tracking under
+      //    that local key. Trusted ONLY when PROVEN registered & LIVE via
+      //    isKnownOnChainId, because chain adapters return access-policy 0
+      //    (= public) for UNKNOWN ids (Solidity default-zero mapping). Any
+      //    unproven number falls through to the fail-closed path below.
+      if (!onChainId && /^\d+$/.test(trimmed) && (await this.isKnownOnChainId(trimmed))) {
+        onChainId = trimmed;
       }
       if (!onChainId) return false;
       const cached = this.onChainAccessPolicyCache.get(onChainId);
@@ -6176,7 +6190,22 @@ export class DKGAgent {
       if (numericId <= 0n) return false;
       const getAccessPolicy = this.chain.getContextGraphAccessPolicy;
       if (typeof getAccessPolicy !== 'function') return false;
-      const policy = await getAccessPolicy.call(this.chain, numericId);
+      // #884 review (🔴): bound this read. It sits on the share/promote/publish
+      // hot path; unlike a thrown error, an RPC layer that HANGS would never
+      // reject and would block the request forever instead of failing closed
+      // to `false` as promised. Race it against a timeout (same pattern as
+      // getContextGraphOnChainPolicy) → a stall is treated as UNKNOWN.
+      const policy = await this.raceChainPolicyRead(
+        getAccessPolicy.call(this.chain, numericId),
+      );
+      if (policy === TIMEOUT_SENTINEL) {
+        this.log.warn(
+          opCtx ?? createOperationContext('share'),
+          `isContextGraphPublicOnChain(${contextGraphId}): getContextGraphAccessPolicy(${onChainId}) ` +
+          `timed out after ${CHAIN_POLICY_READ_TIMEOUT_MS}ms — treating CG as NOT public (fail-closed)`,
+        );
+        return false;
+      }
       if (policy === 0 || policy === 1) {
         this.onChainAccessPolicyCache.set(onChainId, policy);
         return policy === 0;
@@ -6211,7 +6240,8 @@ export class DKGAgent {
    *   - matches the `onChainId` of a {@link subscribedContextGraphs} entry
    *     (the chain assigns that id at registration; members/replicators learn
    *     it via the subscription event), or
-   *   - matches a PERSISTED `...OnChainId` triple in the local ontology graph.
+   *   - matches a PERSISTED `...OnChainId` triple in the local ontology graph
+   *     AND that id is confirmed LIVE on-chain via `isContextGraphActiveOnChain`.
    *
    * The durable triple proof matters after a restart (#884 review): the two
    * in-memory maps above are empty until re-warmed, but the persisted mapping
@@ -6220,7 +6250,10 @@ export class DKGAgent {
    * unknown and fall back to the encrypted path — reintroducing the regression
    * this PR fixes. {@link getContextGraphOnChainId} can't cover it: that is a
    * forward (localId → onChainId) lookup, whereas a bare numeric id needs the
-   * REVERSE lookup against the same ontology graph it reads.
+   * REVERSE lookup against the same ontology graph it reads. Because a
+   * persisted triple can be STALE (devnet reset / partial registration), the
+   * durable branch additionally requires a live on-chain liveness proof before
+   * trusting it — the in-memory proofs do not (they can't be stale-permissive).
    *
    * Gate for the bare-numeric `isContextGraphPublicOnChain` shortcut so an
    * unregistered local graph with a numeric id (whose chain access-policy
@@ -6236,19 +6269,46 @@ export class DKGAgent {
     // Durable proof: reverse-lookup the persisted on-chain-id mapping. The id
     // is digit-only (call-site gated by `/^\d+$/`), so interpolation here is
     // injection-safe; `STR(?id)` matches the persisted literal regardless of
-    // datatype. A hit proves a local CG was registered on-chain under this id
-    // (the triple is only written at/after registration), so an unregistered
-    // numeric local id is still never trusted.
+    // datatype.
+    let persistedMapping = false;
     try {
       const ontologyGraph = contextGraphDataGraphUri(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
       const predicate = `${DKG_ONTOLOGY.DKG_CONTEXT_GRAPH}OnChainId`;
       const result = await this.store.query(
         `SELECT ?cg WHERE { GRAPH <${ontologyGraph}> { ?cg <${predicate}> ?id . FILTER(STR(?id) = "${numericOnChainId}") } } LIMIT 1`,
       );
-      return result.type === 'bindings' && result.bindings.length > 0;
+      persistedMapping = result.type === 'bindings' && result.bindings.length > 0;
     } catch {
-      // Store offline / query error — fall through to "not proven known"
-      // (fail-closed: the CG stays on the encrypted path).
+      // Store offline / query error — fall through to "not proven known".
+      return false;
+    }
+    if (!persistedMapping) return false;
+    // #884 review (🔴): a persisted `...OnChainId` triple is NOT by itself
+    // proof the slot is still live — devnet resets / partial registration
+    // failures can strand a stale mapping (this is exactly why
+    // `registerContextGraph` re-checks liveness before skipping a mint). A
+    // stale triple + Solidity's default-zero access policy would misclassify
+    // an UNKNOWN graph as public/plaintext. So require a LIVE on-chain proof
+    // before trusting the durable mapping. Unlike the in-memory proofs above
+    // (policy cache = create-event; subscription = active), this one can lag
+    // chain truth. If the chain can't confirm liveness (probe absent, RPC
+    // flake/timeout), fail closed.
+    const chainProbe = this.chain as ChainAdapter & {
+      isContextGraphActiveOnChain?: (id: bigint) => Promise<boolean>;
+    };
+    if (typeof chainProbe.isContextGraphActiveOnChain !== 'function') return false;
+    try {
+      let numericId: bigint;
+      try {
+        numericId = BigInt(numericOnChainId);
+      } catch {
+        return false;
+      }
+      const live = await this.raceChainPolicyRead(
+        chainProbe.isContextGraphActiveOnChain(numericId),
+      );
+      return live === true;
+    } catch {
       return false;
     }
   }

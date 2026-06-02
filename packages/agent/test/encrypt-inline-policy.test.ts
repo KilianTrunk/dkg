@@ -48,6 +48,9 @@ function makeAgentLike(opts: {
   // starts trusting unregistered numeric ids would now fail a test).
   const knownOnChainIds = new Set(opts.knownOnChainIds ?? ['42']);
   agentLike.isKnownOnChainId = vi.fn((id: string) => knownOnChainIds.has(String(id)));
+  // isContextGraphPublicOnChain (bound above) now wraps the chain access-policy
+  // read in raceChainPolicyRead — bind it so `this.raceChainPolicyRead` exists.
+  agentLike.raceChainPolicyRead = (DKGAgent.prototype as any).raceChainPolicyRead;
   return agentLike;
 }
 

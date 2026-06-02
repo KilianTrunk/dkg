@@ -34,6 +34,10 @@ function makeAgentLike(opts: {
   // Simulates a creator-persisted explicit `accessPolicy` triple (the
   // getExplicitAccessPolicy fallback honored by resolveWorkspaceRecipientsGated).
   explicitPolicy?: 'public' | 'private';
+  // chain.isContextGraphActiveOnChain liveness probe (gates the durable
+  // persisted-mapping proof in isKnownOnChainId). undefined → probe absent;
+  // true/false → probe present returning that value.
+  activeOnChain?: boolean;
 } = {}) {
   const log = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
   const chain: Record<string, unknown> = {};
@@ -42,6 +46,9 @@ function makeAgentLike(opts: {
       if (opts.accessPolicyError) throw opts.accessPolicyError;
       return opts.accessPolicy ?? 0;
     });
+  }
+  if (opts.activeOnChain !== undefined) {
+    chain.isContextGraphActiveOnChain = vi.fn(async (_id: bigint) => opts.activeOnChain === true);
   }
   const storeQuery = vi.fn(async (q: unknown) => {
     const query = typeof q === 'string' ? q : '';
@@ -76,6 +83,7 @@ function makeAgentLike(opts: {
   // Bind the prototype methods under test so `this` resolves to agentLike.
   agentLike.isContextGraphPublicOnChain = (DKGAgent.prototype as any).isContextGraphPublicOnChain;
   agentLike.isKnownOnChainId = (DKGAgent.prototype as any).isKnownOnChainId;
+  agentLike.raceChainPolicyRead = (DKGAgent.prototype as any).raceChainPolicyRead;
   agentLike.getExplicitAccessPolicy = (DKGAgent.prototype as any).getExplicitAccessPolicy;
   agentLike.resolveWorkspaceRecipientsGated = (DKGAgent.prototype as any).resolveWorkspaceRecipientsGated;
   agentLike._resolveCuratedChainKeyContext = (DKGAgent.prototype as any)._resolveCuratedChainKeyContext;
@@ -164,15 +172,34 @@ describe('DKGAgent.isContextGraphPublicOnChain', () => {
     expect(agentLike.chain.getContextGraphAccessPolicy).not.toHaveBeenCalled();
   });
 
-  it('trusts a numeric on-chain id proven by the PERSISTED mapping after a restart (#884 review durability gap)', async () => {
+  it('trusts a numeric on-chain id proven by the PERSISTED mapping AND live on-chain after a restart (#884 review durability gap)', async () => {
     // Post-restart: in-memory cache + subscription map are empty, but the
     // persisted `<cg> …OnChainId "42"` triple survives. The durable
-    // reverse-lookup must still recognise share('42', ...) as a registered
-    // public CG instead of falling back to the encrypted SWM path.
-    const agentLike = makeAgentLike({ onChainId: null, accessPolicy: 0, persistedOnChainId: '42' });
+    // reverse-lookup recognises it — and the LIVE on-chain proof confirms the
+    // slot is still active — so share('42', ...) stays on the plaintext path
+    // instead of falling back to the encrypted SWM path.
+    const agentLike = makeAgentLike({ onChainId: null, accessPolicy: 0, persistedOnChainId: '42', activeOnChain: true });
     await expect(isPublic(agentLike, '42')).resolves.toBe(true);
-    expect(agentLike.store.query).toHaveBeenCalled();
+    expect(agentLike.chain.isContextGraphActiveOnChain).toHaveBeenCalledWith(42n);
     expect(agentLike.chain.getContextGraphAccessPolicy).toHaveBeenCalledWith(42n);
+  });
+
+  it('does NOT trust a persisted mapping that is STALE (not live on-chain) — fail-closed (#884 review)', async () => {
+    // A persisted `…OnChainId "42"` triple can be stranded by a devnet reset /
+    // partial registration. The liveness probe says the slot is NOT active, so
+    // the durable proof is rejected and we never read (default-zero) policy.
+    const agentLike = makeAgentLike({ onChainId: null, accessPolicy: 0, persistedOnChainId: '42', activeOnChain: false });
+    await expect(isPublic(agentLike, '42')).resolves.toBe(false);
+    expect(agentLike.chain.isContextGraphActiveOnChain).toHaveBeenCalledWith(42n);
+    expect(agentLike.chain.getContextGraphAccessPolicy).not.toHaveBeenCalled();
+  });
+
+  it('does NOT trust a persisted mapping when no liveness probe is available — fail-closed (#884 review)', async () => {
+    // chain.isContextGraphActiveOnChain absent → the durable triple cannot be
+    // proven live → fail closed rather than trust a possibly-stale mapping.
+    const agentLike = makeAgentLike({ onChainId: null, accessPolicy: 0, persistedOnChainId: '42' });
+    await expect(isPublic(agentLike, '42')).resolves.toBe(false);
+    expect(agentLike.chain.getContextGraphAccessPolicy).not.toHaveBeenCalled();
   });
 
   it('does NOT trust a numeric id absent from BOTH memory and the persisted mapping (#884 fail-closed)', async () => {
@@ -195,43 +222,17 @@ describe('DKGAgent.isContextGraphPublicOnChain', () => {
     expect(agentLike.chain.getContextGraphAccessPolicy).toHaveBeenCalledWith(7n);
   });
 
-  it('resolves a REGISTERED numeric-named local CG to its mapped on-chain policy (#884 review round-4)', async () => {
-    // A registered CG whose user-chosen local id happens to be numeric ("42")
-    // maps to a DIFFERENT on-chain id (here "99") and is NOT independently
-    // known as on-chain id "42". Only the local interpretation resolves, so
-    // the helper reads policy for the graph's ACTUAL on-chain id (99) — never
-    // bypassing a genuinely-registered graph just because its local id looks
-    // like a number.
+  it('resolves a REGISTERED numeric-named local CG to its mapped on-chain policy (#884 review)', async () => {
+    // Local-id resolution is AUTHORITATIVE: a registered CG whose user-chosen
+    // local id happens to be numeric ("42") maps to its actual on-chain id
+    // (here "99"). The helper reads policy for that mapped id and never
+    // regresses a genuinely-registered local graph onto the encrypted path
+    // just because its local id looks like a number. The bare-numeric shortcut
+    // is only used when NO local graph with that id exists.
     const agentLike = makeAgentLike({ onChainId: '99', accessPolicy: 0 });
     await expect(isPublic(agentLike, '42')).resolves.toBe(true);
     expect(agentLike.getContextGraphOnChainId).toHaveBeenCalledWith('42');
     expect(agentLike.chain.getContextGraphAccessPolicy).toHaveBeenCalledWith(99n);
-  });
-
-  it('uses the agreed on-chain id when local AND numeric interpretations match (#884 review round-5)', async () => {
-    // Local CG "42" maps to on-chain "42" AND "42" is an independently-known
-    // on-chain id — the two interpretations agree, so it's unambiguous.
-    const agentLike = makeAgentLike({
-      onChainId: '42',
-      accessPolicy: 0,
-      subscribed: new Map([['x', { onChainId: '42' }]]),
-    });
-    await expect(isPublic(agentLike, '42')).resolves.toBe(true);
-    expect(agentLike.chain.getContextGraphAccessPolicy).toHaveBeenCalledWith(42n);
-  });
-
-  it('fails closed when local and numeric interpretations DISAGREE (ambiguous collision) (#884 review round-5)', async () => {
-    // Pathological collision: a local CG named "42" maps to on-chain id "99",
-    // AND on-chain CG "42" is independently known here. We cannot tell which
-    // graph the caller meant, so reading either policy could be wrong — fail
-    // closed (encrypt) with no chain read rather than risk a plaintext leak.
-    const agentLike = makeAgentLike({
-      onChainId: '99',
-      accessPolicy: 0,
-      subscribed: new Map([['x', { onChainId: '42' }]]),
-    });
-    await expect(isPublic(agentLike, '42')).resolves.toBe(false);
-    expect(agentLike.chain.getContextGraphAccessPolicy).not.toHaveBeenCalled();
   });
 
   it('logs a diagnostic (not silent) when a lookup flakes before failing closed (#884 review round-3 🟡)', async () => {
@@ -242,6 +243,25 @@ describe('DKGAgent.isContextGraphPublicOnChain', () => {
       expect.anything(),
       expect.stringContaining('isContextGraphPublicOnChain'),
     );
+  });
+
+  it('bounds the chain access-policy read — a HUNG RPC fails closed instead of hanging (#884 review)', async () => {
+    vi.useFakeTimers();
+    try {
+      const agentLike = makeAgentLike({ onChainId: '1' });
+      // RPC layer hangs (never resolves / never rejects) instead of failing.
+      agentLike.chain.getContextGraphAccessPolicy = vi.fn(() => new Promise(() => {}));
+      const pending = isPublic(agentLike);
+      // Advance past the bounded-read timeout; the helper must resolve to false.
+      await vi.advanceTimersByTimeAsync(3_000);
+      await expect(pending).resolves.toBe(false);
+      expect(agentLike.log.warn).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.stringContaining('timed out'),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

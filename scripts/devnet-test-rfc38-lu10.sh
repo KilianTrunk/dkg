@@ -209,16 +209,17 @@ devnet_verify_each_published_root "$OUTSIDER_NODE" "$CG_ID" "$QUADS_PAYLOAD" \
   || fail "outsider-side verify-batch failed for one or more roots"
 log "✓ outsider verifies public batch: ok=true for all published roots"
 
-KC=$(devnet_publish_ka_id_at 0)
+TAMPER_ROOT=$(printf '%s' "$QUADS_PAYLOAD" | node -e 'let d="";process.stdin.on("data",c=>d+=c);process.stdin.on("end",()=>console.log(JSON.parse(d).quads[0].subject))')
+KC=$(devnet_publish_ka_id_for_root "$TAMPER_ROOT")
 MERKLE_ROOT=$(devnet_kc_merkle_root "$CURATOR_NODE" "$KC")
 
 log "Outsider calls verify-batch with tampered quads..."
-VERIFY_BAD_BODY=$(QUADS_PAYLOAD="$QUADS_PAYLOAD" MERKLE_ROOT="$MERKLE_ROOT" KC="$KC" STAMP="$STAMP" node -e "
+VERIFY_BAD_BODY=$(QUADS_PAYLOAD="$QUADS_PAYLOAD" MERKLE_ROOT="$MERKLE_ROOT" KC="$KC" TAMPER_ROOT="$TAMPER_ROOT" STAMP="$STAMP" node -e "
   const genidPrefix = '/.well-known/genid/';
   const quadBelongsToRoot = (q, root) =>
     q.subject === root || q.subject.startsWith(root + genidPrefix);
   const payload = JSON.parse(process.env.QUADS_PAYLOAD);
-  const root = payload.quads[0].subject;
+  const root = process.env.TAMPER_ROOT;
   const tampered = payload.quads.filter((q) => quadBelongsToRoot(q, root));
   tampered.push({ subject: 'urn:lu10:' + process.env.STAMP + '/forged', predicate: 'http://schema.org/title', object: '\"Mallory\"', graph: '' });
   console.log(JSON.stringify({
@@ -244,7 +245,7 @@ LEAF_SUBJECT="urn:lu10:${STAMP}/doc-a"
 LEAF_PREDICATE="http://schema.org/title"
 LEAF_OBJECT='"Whitepaper"'
 
-KC=$(devnet_publish_ka_id_at 0)
+KC=$(devnet_publish_ka_id_for_root "$LEAF_SUBJECT")
 MERKLE_ROOT=$(devnet_kc_merkle_root "$CURATOR_NODE" "$KC")
 
 CANDIDATE_LEAF=$(cd "$REPO_ROOT/packages/core" && LEAF_SUBJECT="$LEAF_SUBJECT" LEAF_PREDICATE="$LEAF_PREDICATE" LEAF_OBJECT="$LEAF_OBJECT" node --input-type=module -e '

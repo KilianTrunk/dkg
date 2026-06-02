@@ -14,10 +14,12 @@
 #
 # Command substitution runs the publish helper in a subshell, so metadata is
 # persisted to DEVNET_PUBLISH_STATE_FILE and must be loaded in the caller shell.
-# The state file is scoped to the current bash process (BASHPID) so concurrent
-# devnet scripts do not clobber each other's publish metadata.
+# The state file is scoped to the parent shell PID ($$). Unlike BASHPID, $$ is
+# stable across command-substitution subshells, so the path the helper writes
+# inside `$(...)` matches the one the parent later reads. It also keeps
+# concurrent devnet scripts from clobbering each other's publish metadata.
 #
-DEVNET_PUBLISH_STATE_FILE="${DEVNET_PUBLISH_STATE_FILE:-${DEVNET_DIR:-/tmp}/.devnet-publish-state-${BASHPID:-$$}.json}"
+DEVNET_PUBLISH_STATE_FILE="${DEVNET_PUBLISH_STATE_FILE:-${DEVNET_DIR:-/tmp}/.devnet-publish-state-$$.json}"
 DEVNET_PUBLISH_ALL_RESPONSES='[]'
 DEVNET_PUBLISH_ROOT_ENTITIES='[]'
 
@@ -31,8 +33,10 @@ devnet_json_field() {
   "
 }
 
+# Honor an already-set DEVNET_PUBLISH_STATE_FILE; otherwise derive a
+# parent-stable path from $$ (NOT BASHPID, which changes inside subshells).
 _devnet_publish_init_state_file() {
-  DEVNET_PUBLISH_STATE_FILE="${DEVNET_DIR:-/tmp}/.devnet-publish-state-${BASHPID:-$$}.json"
+  : "${DEVNET_PUBLISH_STATE_FILE:=${DEVNET_DIR:-/tmp}/.devnet-publish-state-$$.json}"
 }
 
 _devnet_publish_persist_state() {
@@ -82,6 +86,34 @@ devnet_publish_ka_id_at() {
     let d=''; process.stdin.on('data',c=>d+=c);
     process.stdin.on('end',()=>console.log(JSON.parse(d)[Number(process.argv[1])].kaId));
   " "$idx"
+}
+
+# Args: root_subject
+# Resolve the kaId of the batch that published a given root entity. The helper
+# preserves publish order (allResponses[i] <-> rootEntities[i]), but the
+# daemon's rootEntities order is NOT tied to the original quad order, so callers
+# must look the batch up by subject rather than positional index. For a
+# single-root (non-split) publish, rootEntities is empty and we return the only
+# batch's kaId.
+devnet_publish_ka_id_for_root() {
+  local root="$1"
+  devnet_publish_load_state
+  ALL="$DEVNET_PUBLISH_ALL_RESPONSES" ROOTS="$DEVNET_PUBLISH_ROOT_ENTITIES" ROOT="$root" node -e '
+    const all = JSON.parse(process.env.ALL || "[]");
+    const roots = JSON.parse(process.env.ROOTS || "[]");
+    const root = process.env.ROOT;
+    if (roots.length === 0) {
+      if (!all.length) { console.error("no published batches in state"); process.exit(1); }
+      console.log(all[0].kaId);
+      process.exit(0);
+    }
+    const idx = roots.indexOf(root);
+    if (idx < 0 || !all[idx]) {
+      console.error("no published batch for root " + root);
+      process.exit(1);
+    }
+    console.log(all[idx].kaId);
+  '
 }
 
 devnet_kc_merkle_root() {

@@ -161,7 +161,7 @@ for leaf_idx in 0 $((TRIPLE_COUNT / 4 - 1)) $((TRIPLE_COUNT / 2 - 1)); do
   LEAF_PREDICATE="http://schema.org/name"
   LEAF_OBJECT="\"Document ${leaf_idx}\""
 
-  KC=$(devnet_publish_ka_id_at "$leaf_idx")
+  KC=$(devnet_publish_ka_id_for_root "$LEAF_SUBJECT")
   MERKLE_ROOT=$(devnet_kc_merkle_root "$CURATOR_NODE" "$KC")
   CANDIDATE_LEAF=$(cd "$REPO_ROOT/packages/core" && LEAF_SUBJECT="$LEAF_SUBJECT" LEAF_PREDICATE="$LEAF_PREDICATE" LEAF_OBJECT="$LEAF_OBJECT" node --input-type=module -e '
     const { hashTripleV10 } = await import("./dist/index.js");

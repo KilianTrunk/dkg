@@ -335,7 +335,9 @@ devnet_verify_each_published_root "$MEMBER_NODE" "$CG_ID" "$QUADS_PAYLOAD" \
   || fail "member verify-batch failed for one or more published roots"
 log "✓ member verify-batch passes for all published roots"
 
-PUBLISH_KC=$(devnet_publish_ka_id_at 0)
+# LU-9 below mints/verifies an attestation for alice's leaf, so resolve the
+# batch that published alice's root rather than assuming it is publish index 0.
+PUBLISH_KC=$(devnet_publish_ka_id_for_root "urn:e2e:${STAMP}/alice")
 MERKLE_ROOT=$(devnet_kc_merkle_root "$CURATOR_NODE" "$PUBLISH_KC")
 
 # Forge a tampered quads array — recompute against bad data must fail

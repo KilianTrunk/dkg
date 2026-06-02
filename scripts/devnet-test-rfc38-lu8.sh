@@ -120,8 +120,8 @@ KC_ID=$(parse_json "$PUB_RESP" '.kaId')
 [ -n "$TX_HASH" ] || fail "no txHash in publish response — cannot proceed without on-chain anchor"
 [ -n "$KC_ID" ] || fail "no kaId in publish response — required for merkleRoot lookup"
 
-# Use the first published root for single-batch negative tests below.
-KC_ID=$(devnet_publish_ka_id_at 0)
+# Negative tests below operate on item0's batch; resolve its KC by root subject.
+KC_ID=$(devnet_publish_ka_id_for_root "urn:lu8/item0")
 log "Fetching merkleRoot from chain (KC #${KC_ID}) via daemon API..."
 KC_RESP=$(api_call "$CURATOR_NODE" GET "/api/kc/${KC_ID}")
 log "kc lookup: $KC_RESP"

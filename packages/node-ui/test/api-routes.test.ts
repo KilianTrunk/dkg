@@ -668,4 +668,24 @@ describe('handleNodeUIRequest replication routes (Phase F)', () => {
     expect(body.events.length).toBe(3);
     expect(body.events[0].action).toBe('cursor-advance'); // newest first
   });
+
+  it('GET /api/replication/summary accepts a unit-suffixed period (e.g. 24h)', async () => {
+    harness.setArgs(args());
+    // Raw parseInt('24h') === 24 (24ms window → excludes everything). parsePeriodMs
+    // must read this as 24 hours so the recent events stay in range.
+    const res = await fetch(`${baseUrl}/api/replication/summary?periodMs=24h`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.promotes).toBe(1);
+    expect(body.fetches).toBe(1);
+  });
+
+  it('GET /api/replication/events tolerates a non-numeric limit', async () => {
+    harness.setArgs(args());
+    // ?limit=foo previously bound `LIMIT NaN` and surfaced a SQLite 500.
+    const res = await fetch(`${baseUrl}/api/replication/events?cg=mfacts&limit=foo`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.events.length).toBe(3);
+  });
 });

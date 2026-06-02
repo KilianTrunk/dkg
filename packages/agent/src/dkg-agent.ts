@@ -3017,11 +3017,22 @@ export class DKGAgent {
     // a cold circuit-relay dial to reach a Core. Opt-in via
     // DKG_WARM_CORE_CONNECTIONS=1. See `p2p/warm-core-connections.ts`.
     if (WARM_CORE_CONNECTIONS_ENABLED) {
+      // Serialize passes: one reconcile can run longer than the interval
+      // (discovery + chain gate + up to WARM_CORE_MAX sequential dials, each
+      // with a 20s timeout). Without this guard, overlapping passes race on
+      // `this.warmedCores` and can unpin a Core a newer pass just selected.
+      let warmCoreInFlight = false;
       const runWarmCore = (): void => {
-        this.reconcileWarmCoreConnections().catch((err: unknown) => {
-          const message = err instanceof Error ? err.message : String(err);
-          this.log.warn(ctx, `Warm-core reconcile tick failed: ${message}`);
-        });
+        if (warmCoreInFlight) return;
+        warmCoreInFlight = true;
+        this.reconcileWarmCoreConnections()
+          .catch((err: unknown) => {
+            const message = err instanceof Error ? err.message : String(err);
+            this.log.warn(ctx, `Warm-core reconcile tick failed: ${message}`);
+          })
+          .finally(() => {
+            warmCoreInFlight = false;
+          });
       };
       // Prime once now (after startup), then on a steady cadence.
       runWarmCore();
@@ -3320,12 +3331,17 @@ export class DKGAgent {
     const result = await reconcileWarmCoreConnections({
       selfPeerId: this.node.libp2p.peerId.toString(),
       maxCores: WARM_CORE_MAX,
+      // Drop Cores not seen within the profile-stale window before the cap, so
+      // a stale phonebook slice can't crowd out live Cores or keep redialing
+      // dead entries (reuses the directory's freshness threshold).
+      staleThresholdMs: AGENT_PROFILE_STALE_THRESHOLD_MS,
       findCoreAgents: async (): Promise<WarmCoreAgent[]> => {
         const agents = await this.discovery.findAgents();
         return agents.map((a) => ({
           peerId: a.peerId,
           nodeRole: a.nodeRole,
           agentAddress: a.agentAddress,
+          lastSeen: a.lastSeen,
         }));
       },
       isShardingTableCore: (agentAddress) => this.isShardingTableCore(agentAddress),

@@ -81,11 +81,28 @@ export interface WarmCoreDeps {
   /** True if a live connection to this peer already exists. */
   isConnected: (peerId: string) => boolean;
   /**
-   * Tag the peer keep-alive in the peerStore and dial it. Returns true on a
-   * successful dial. Implementation lives in `DKGAgent` (peerStore.merge +
-   * libp2p.dial); errors are swallowed by the caller.
+   * Tag the peer keep-alive in the peerStore (idempotent, no dial). Called for
+   * every selected Core — including already-connected ones — so libp2p's
+   * connection manager protects + auto-redials it after a disconnect.
    */
-  pinAndDial: (peerId: string, ctx: OperationContext) => Promise<boolean>;
+  pin: (peerId: string, ctx: OperationContext) => Promise<void>;
+  /**
+   * Remove the keep-alive tag from a peer that fell out of the warm set, so
+   * the pinned count can't drift above `maxCores` over time.
+   */
+  unpin: (peerId: string, ctx: OperationContext) => Promise<void>;
+  /**
+   * Dial the peer. Returns true on a successful dial. Only called for Cores
+   * that aren't already connected. Errors are swallowed by the caller.
+   */
+  dial: (peerId: string, ctx: OperationContext) => Promise<boolean>;
+  /**
+   * The set of Cores pinned on the previous reconcile pass. Cores in here that
+   * are NOT re-selected this pass get {@link unpin}ned. The caller owns this
+   * set across ticks; {@link WarmCoreReconcileResult.warmed} is the value to
+   * carry into the next pass.
+   */
+  previouslyWarmed?: ReadonlySet<string>;
   log: (ctx: OperationContext, msg: string) => void;
 }
 
@@ -94,12 +111,15 @@ export interface WarmCoreReconcileResult {
   pinned: number;
   dialed: number;
   skippedGate: number;
+  unpinned: number;
+  /** Cores pinned this pass — feed back as `previouslyWarmed` next tick. */
+  warmed: Set<string>;
 }
 
 /**
- * One reconcile pass: discover Cores, gate them, pin+dial up to `maxCores`.
- * Idempotent — already-connected Cores are re-tagged (cheap) but not
- * re-dialed. Safe to call on a timer and once at startup.
+ * One reconcile pass: discover Cores, gate them, pin (+ dial when not yet
+ * connected) up to `maxCores`, then unpin any Core that was warm last pass but
+ * is no longer selected. Idempotent and safe to call on a timer and at startup.
  */
 export async function reconcileWarmCoreConnections(
   deps: WarmCoreDeps,
@@ -110,12 +130,12 @@ export async function reconcileWarmCoreConnections(
   const agents = await deps.findCoreAgents();
   const candidates = selectWarmCoreCandidates(agents, deps.selfPeerId);
 
-  let pinned = 0;
+  const warmed = new Set<string>();
   let dialed = 0;
   let skippedGate = 0;
 
   for (const core of candidates) {
-    if (pinned >= deps.maxCores) break;
+    if (warmed.size >= deps.maxCores) break;
 
     const allowed = await deps.isShardingTableCore(core.agentAddress).catch(() => false);
     if (!allowed) {
@@ -123,17 +143,32 @@ export async function reconcileWarmCoreConnections(
       continue;
     }
 
-    pinned += 1;
-    if (deps.isConnected(core.peerId)) continue;
+    // Pin BEFORE the connected-check so an already-connected Core still gets
+    // (and keeps) its keep-alive tag — otherwise libp2p won't auto-redial it.
+    await deps.pin(core.peerId, ctx).catch(() => {});
+    warmed.add(core.peerId);
 
-    const ok = await deps.pinAndDial(core.peerId, ctx).catch(() => false);
+    if (deps.isConnected(core.peerId)) continue;
+    const ok = await deps.dial(core.peerId, ctx).catch(() => false);
     if (ok) dialed += 1;
+  }
+
+  // Prune: drop the keep-alive tag from Cores warmed last pass but not this
+  // one, so the pinned set tracks the live selection and never exceeds the cap.
+  let unpinned = 0;
+  if (deps.previouslyWarmed) {
+    for (const peerId of deps.previouslyWarmed) {
+      if (!warmed.has(peerId)) {
+        await deps.unpin(peerId, ctx).catch(() => {});
+        unpinned += 1;
+      }
+    }
   }
 
   deps.log(
     ctx,
-    `warm-core reconcile: candidates=${candidates.length} pinned=${pinned} dialed=${dialed} skippedGate=${skippedGate} (cap=${deps.maxCores})`,
+    `warm-core reconcile: candidates=${candidates.length} pinned=${warmed.size} dialed=${dialed} skippedGate=${skippedGate} unpinned=${unpinned} (cap=${deps.maxCores})`,
   );
 
-  return { candidates: candidates.length, pinned, dialed, skippedGate };
+  return { candidates: candidates.length, pinned: warmed.size, dialed, skippedGate, unpinned, warmed };
 }

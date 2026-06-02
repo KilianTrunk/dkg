@@ -31,8 +31,12 @@ describe('selectWarmCoreCandidates', () => {
 function makeDeps(overrides: Partial<WarmCoreDeps> = {}): {
   deps: WarmCoreDeps;
   dialed: string[];
+  pinned: string[];
+  unpinned: string[];
 } {
   const dialed: string[] = [];
+  const pinned: string[] = [];
+  const unpinned: string[] = [];
   const deps: WarmCoreDeps = {
     selfPeerId: 'self',
     maxCores: 8,
@@ -43,22 +47,29 @@ function makeDeps(overrides: Partial<WarmCoreDeps> = {}): {
     ],
     isShardingTableCore: async () => true,
     isConnected: () => false,
-    pinAndDial: async (peerId) => {
+    pin: async (peerId) => {
+      pinned.push(peerId);
+    },
+    unpin: async (peerId) => {
+      unpinned.push(peerId);
+    },
+    dial: async (peerId) => {
       dialed.push(peerId);
       return true;
     },
     log: () => undefined,
     ...overrides,
   };
-  return { deps, dialed };
+  return { deps, dialed, pinned, unpinned };
 }
 
 describe('reconcileWarmCoreConnections', () => {
   it('pins + dials all gated cores when none are connected', async () => {
-    const { deps, dialed } = makeDeps();
+    const { deps, dialed, pinned } = makeDeps();
     const res = await reconcileWarmCoreConnections(deps);
-    expect(res).toMatchObject({ candidates: 2, pinned: 2, dialed: 2, skippedGate: 0 });
+    expect(res).toMatchObject({ candidates: 2, pinned: 2, dialed: 2, skippedGate: 0, unpinned: 0 });
     expect(dialed).toEqual(['core1', 'core2']);
+    expect(pinned).toEqual(['core1', 'core2']);
   });
 
   it('skips cores that fail the ShardingTable gate', async () => {
@@ -70,11 +81,14 @@ describe('reconcileWarmCoreConnections', () => {
     expect(dialed).toEqual(['core1']);
   });
 
-  it('pins but does not redial cores that are already connected', async () => {
-    const { deps, dialed } = makeDeps({ isConnected: (id) => id === 'core1' });
+  it('still pins (tags) an already-connected core, but does not redial it', async () => {
+    // Regression: a connected core MUST be tagged keep-alive so libp2p
+    // auto-redials it after a disconnect — the old `continue` skipped pinning.
+    const { deps, dialed, pinned } = makeDeps({ isConnected: (id) => id === 'core1' });
     const res = await reconcileWarmCoreConnections(deps);
     expect(res).toMatchObject({ pinned: 2, dialed: 1 });
-    expect(dialed).toEqual(['core2']);
+    expect(pinned).toEqual(['core1', 'core2']); // both tagged
+    expect(dialed).toEqual(['core2']); // only the disconnected one dialed
   });
 
   it('honors the maxCores cap, counting only gated cores', async () => {
@@ -103,8 +117,32 @@ describe('reconcileWarmCoreConnections', () => {
   });
 
   it('counts a failed dial as pinned-but-not-dialed', async () => {
-    const { deps } = makeDeps({ pinAndDial: async () => false });
+    const { deps } = makeDeps({ dial: async () => false });
     const res = await reconcileWarmCoreConnections(deps);
     expect(res).toMatchObject({ pinned: 2, dialed: 0 });
+  });
+
+  it('unpins cores that were warm last pass but are no longer selected', async () => {
+    // Regression: the keep-alive tag must be removed when a core drops out of
+    // the candidate/gated set, else pins leak and drift above maxCores.
+    const { deps, unpinned } = makeDeps({
+      previouslyWarmed: new Set(['core1', 'core2', 'gone1', 'gone2']),
+    });
+    const res = await reconcileWarmCoreConnections(deps);
+    expect(res.pinned).toBe(2);
+    expect(res.unpinned).toBe(2);
+    expect(unpinned.sort()).toEqual(['gone1', 'gone2']);
+    // the returned warmed set is what the caller carries into the next pass
+    expect([...res.warmed].sort()).toEqual(['core1', 'core2']);
+  });
+
+  it('unpins a core that newly fails the gate (cap-drift guard)', async () => {
+    const { deps, unpinned } = makeDeps({
+      previouslyWarmed: new Set(['core1', 'core2']),
+      isShardingTableCore: async (addr) => addr === '0x1', // core2 now ungated
+    });
+    const res = await reconcileWarmCoreConnections(deps);
+    expect(res).toMatchObject({ pinned: 1, skippedGate: 1, unpinned: 1 });
+    expect(unpinned).toEqual(['core2']);
   });
 });

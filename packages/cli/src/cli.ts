@@ -1440,6 +1440,7 @@ program
   .option('-o, --object <value>', 'Object value for simple publish')
   .option('--access-policy <policy>', 'Access policy for private triples (public|ownerOnly|allowList)')
   .option('--allowed-peer <peerId>', 'Peer ID allowed when using allowList policy', (v, prev: string[] = []) => [...prev, v], [])
+  .option('--publish-epochs <count>', 'On-chain publish lifetime in epochs (default: 12; PCA-funded publishes may coerce to PCA lock duration)')
   .option('--publisher-node-identity-id <id>', 'Override the publisherNodeIdentityId for THIS publish only (RFC §4 attribution; pass `0` for an unattributed publish)')
   .action(async (contextGraph: string, opts: ActionOpts) => {
     try {
@@ -1473,6 +1474,9 @@ program
         process.exit(1);
       }
 
+      const publishEpochs = opts.publishEpochs !== undefined
+        ? parsePositiveIntegerOption(String(opts.publishEpochs), '--publish-epochs')
+        : undefined;
       let publisherNodeIdentityIdOverride: bigint | undefined;
       if (opts.publisherNodeIdentityId !== undefined) {
         const raw = String(opts.publisherNodeIdentityId);
@@ -1485,6 +1489,7 @@ program
       const result = await client.publish(contextGraph, quads, privateQuads, {
         accessPolicy,
         allowedPeers,
+        publishEpochs,
         publisherNodeIdentityIdOverride,
       });
       console.log(`Published to context graph "${contextGraph}":`);
@@ -3126,12 +3131,16 @@ sharedMemoryCmd
   .requiredOption('--name <name>', 'Assertion name (from `dkg shared-memory write --name ...`)')
   .option('--sub-graph-name <name>', 'Optional sub-graph name')
   .option('--author-agent-address <address>', 'Override author EOA (must be a registered local agent)')
+  .option('--publish-epochs <count>', 'On-chain publish lifetime in epochs (default: 12; PCA-funded publishes may coerce to PCA lock duration)')
   .action(async (contextGraph: string | undefined, opts: ActionOpts) => {
     try {
       const targetContextGraph = contextGraph ?? 'dev-coordination';
       const assertionName = String(opts.name);
       const subGraphOption = (opts.subGraphName as string | undefined) ?? undefined;
       const authorAgentAddress = (opts.authorAgentAddress as string | undefined) ?? undefined;
+      const publishEpochs = opts.publishEpochs !== undefined
+        ? parsePositiveIntegerOption(String(opts.publishEpochs), '--publish-epochs')
+        : undefined;
       const client = await ApiClient.connect();
 
       // RFC-001 §9.x assertion lifecycle:
@@ -3153,7 +3162,12 @@ sharedMemoryCmd
       const result = await client.publishFromFinalizedAssertion(
         targetContextGraph,
         assertionName,
-        subGraphOption ? { subGraphName: subGraphOption } : undefined,
+        (subGraphOption || publishEpochs !== undefined)
+          ? {
+              ...(subGraphOption ? { subGraphName: subGraphOption } : {}),
+              ...(publishEpochs !== undefined ? { publishEpochs } : {}),
+            }
+          : undefined,
       );
       console.log(`Published WM assertion to "${targetContextGraph}":`);
       console.log(`  Assertion:    ${seal.assertionUri}`);
@@ -3466,6 +3480,7 @@ publisherCmd
   .option('--transition-type <value>', 'Transition type (CREATE|MUTATE|REVOKE)', 'CREATE')
   .option('--authority-type <value>', 'Authority type (owner|multisig|quorum|capability)', 'owner')
   .option('--prior-version <value>', 'Prior version reference for MUTATE/REVOKE flows')
+  .option('--publish-epochs <count>', 'On-chain publish lifetime in epochs (default: 12; PCA-funded publishes may coerce to PCA lock duration)')
   .action(async (contextGraph: string, opts: ActionOpts) => {
     try {
       const shareOperationId = opts.shareOperationId;
@@ -3488,6 +3503,9 @@ publisherCmd
         console.error('Invalid --authority-type. Use owner, multisig, quorum, or capability.');
         process.exit(1);
       }
+      const publishEpochs = opts.publishEpochs !== undefined
+        ? parsePositiveIntegerOption(String(opts.publishEpochs), '--publish-epochs')
+        : undefined;
 
       const enqueueFields = {
         swmId: opts.swmId ?? opts.workspaceId ?? 'swm-main',
@@ -3500,6 +3518,7 @@ publisherCmd
         authorityType: authorityType as 'owner' | 'multisig' | 'quorum' | 'capability',
         authorityProofRef: String(opts.authorityProofRef),
         priorVersion: opts.priorVersion ? String(opts.priorVersion) : undefined,
+        publishEpochs,
       };
 
       let jobId: string;

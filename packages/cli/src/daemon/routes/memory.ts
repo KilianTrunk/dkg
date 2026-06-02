@@ -41,6 +41,7 @@ import { existsSync, readdirSync, readFileSync, openSync, closeSync, writeFileSy
 // below so both sites coexist without a duplicate-module import.
 import * as osModule from 'node:os';
 const { homedir } = osModule;
+const MAX_PUBLISH_EPOCHS = 0xffffffff;
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { ethers } from 'ethers';
@@ -1546,6 +1547,8 @@ WHERE {
       preSignedAuthorAttestation: bodyPreSignedAttestation,
       assertionName: bodyAssertionName,
     } = parsed;
+    const rawPublishEpochs = parsed.publishEpochs ?? parsed.epochs;
+    const publishEpochsField = parsed.publishEpochs !== undefined ? "publishEpochs" : "epochs";
     const contextGraphId = parsed.contextGraphId;
     const resolvedContextGraphId = await resolveRequiredWriteContextGraphId(
       agent,
@@ -1570,6 +1573,27 @@ WHERE {
         });
       }
       resolvedPublisherIdentityOverride = BigInt(raw);
+    }
+    let resolvedPublishEpochs: number | undefined;
+    if (rawPublishEpochs !== undefined && rawPublishEpochs !== null) {
+      const raw = String(rawPublishEpochs).trim();
+      if (!/^[1-9]\d*$/.test(raw)) {
+        return jsonResponse(res, 400, {
+          error: `"${publishEpochsField}" must be a positive integer (string or number)`,
+        });
+      }
+      const parsedEpochs = Number(raw);
+      if (!Number.isSafeInteger(parsedEpochs)) {
+        return jsonResponse(res, 400, {
+          error: `"${publishEpochsField}" is too large to safely represent as a JavaScript integer`,
+        });
+      }
+      if (parsedEpochs > MAX_PUBLISH_EPOCHS) {
+        return jsonResponse(res, 400, {
+          error: `"${publishEpochsField}" must be less than or equal to ${MAX_PUBLISH_EPOCHS}`,
+        });
+      }
+      resolvedPublishEpochs = parsedEpochs;
     }
 
     // RFC-001 §4(b) Phase 4 — author attribution resolution.
@@ -1678,6 +1702,9 @@ WHERE {
               operationCtx: ctx2,
               ...(resolvedPublisherIdentityOverride !== undefined
                 ? { publisherNodeIdentityIdOverride: resolvedPublisherIdentityOverride }
+                : {}),
+              ...(resolvedPublishEpochs !== undefined
+                ? { publishEpochs: resolvedPublishEpochs }
                 : {}),
               // Pass `clearAfter` straight through (incl. `undefined`) so the
               // publisher's own default — `false` — applies for the named
@@ -1892,6 +1919,9 @@ WHERE {
           : {}),
         ...(resolvedPublisherIdentityOverride !== undefined
           ? { publisherNodeIdentityIdOverride: resolvedPublisherIdentityOverride }
+          : {}),
+        ...(resolvedPublishEpochs !== undefined
+          ? { publishEpochs: resolvedPublishEpochs }
           : {}),
         ...(resolvedAuthorAgentAddress != null
           ? { authorAgentAddress: resolvedAuthorAgentAddress }

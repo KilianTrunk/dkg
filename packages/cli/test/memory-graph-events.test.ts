@@ -558,6 +558,31 @@ describe('daemon memory_graph_changed route emissions', () => {
     expect(responseBody(ctx)).toMatchObject({ publishContextGraphId: '7' });
   });
 
+  it('forwards explicit publishEpochs to SWM publish options', async () => {
+    const publishFromSharedMemory = vi.fn().mockResolvedValue({
+      kaId: 'kc-1',
+      status: 'confirmed',
+      kaManifest: [{ tokenId: 1n, rootEntity: 'urn:root' }],
+      publicQuads: [{ subject: 'urn:root', predicate: 'urn:p', object: 'urn:o', graph: 'urn:g' }],
+    });
+    const getContextGraphOnChainId = vi.fn().mockResolvedValue('7');
+    const store = createSwmStore(['urn:root']);
+    const ctx = createContext('/api/shared-memory/publish', {
+      contextGraphId: 'project-a',
+      selection: ['urn:root'],
+      publishEpochs: '9',
+    }, {
+      agent: { publishFromSharedMemory, getContextGraphOnChainId, store } as unknown as RequestContext['agent'],
+    });
+
+    await handleMemoryRoutes(ctx);
+
+    expect((ctx.res as unknown as { statusCode: number }).statusCode).toBe(200);
+    expect(publishFromSharedMemory.mock.calls[0][2]).toMatchObject({
+      publishEpochs: 9,
+    });
+  });
+
   it('normalizes full publishContextGraphId DIDs to a positive on-chain remap id', async () => {
     const publishFromSharedMemory = vi.fn().mockResolvedValue({
       kaId: 'kc-1',

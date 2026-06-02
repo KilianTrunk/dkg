@@ -452,6 +452,38 @@ describe('mapLiftRequestToPublishOptions', () => {
     expect(options.entityProofs).toBe(true);
   });
 
+  it('forwards request.publishEpochs to PublishOptions', () => {
+    const options = mapLiftRequestToPublishOptions({
+      ...baseInput(),
+      request: {
+        ...baseInput().request,
+        publishEpochs: 7,
+      },
+      resolved: {
+        ...baseInput().resolved,
+        publisherPeerId: '12D3KooWPublisher',
+      },
+    });
+
+    expect(options.publishEpochs).toBe(7);
+  });
+
+  it('rejects invalid request.publishEpochs before building PublishOptions', () => {
+    expect(() =>
+      mapLiftRequestToPublishOptions({
+        ...baseInput(),
+        request: {
+          ...baseInput().request,
+          publishEpochs: 0,
+        },
+        resolved: {
+          ...baseInput().resolved,
+          publisherPeerId: '12D3KooWPublisher',
+        },
+      }),
+    ).toThrow(/request\.publishEpochs.*positive uint32 integer/);
+  });
+
   it('parses request.publisherNodeIdentityIdOverride (stringified bigint) into PublishOptions (bigint)', () => {
     // BigInt persisted as `${bigint}` for JSON safety; mapper parses back.
     const options = mapLiftRequestToPublishOptions({

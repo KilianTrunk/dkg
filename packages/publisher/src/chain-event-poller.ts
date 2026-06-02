@@ -41,6 +41,22 @@ export type OnProfileEvent = (info: {
   blockNumber: number;
 }) => Promise<void>;
 
+/**
+ * Callback for `KnowledgeAssetRegisteredToContextGraph` events — the
+ * canonical "a KA was bound to a CG" signal that drives chain-driven VM
+ * reconciliation (Phase B). Both ids are indexed on-chain. The poller is a
+ * low-latency *nudge*: the receiver runs an ordinal sweep for `contextGraphId`
+ * (the event does not carry the per-CG ordinal), so a missed event is
+ * harmless — the periodic/startup sweep fills it in.
+ */
+export type OnKARegisteredToContextGraph = (info: {
+  contextGraphId: string;
+  kaId: bigint;
+  txHash: string;
+  txIndex?: number;
+  blockNumber: number;
+}) => Promise<void>;
+
 /** Persistence interface for saving/loading the last processed block. */
 export interface CursorPersistence {
   load(): Promise<number | undefined>;
@@ -60,6 +76,8 @@ export interface ChainEventPollerConfig {
   onAllowListUpdated?: OnAllowListUpdated;
   /** Called when a ProfileCreated/Updated event is detected. */
   onProfileEvent?: OnProfileEvent;
+  /** Called when a KnowledgeAssetRegisteredToContextGraph event is detected (Phase B). */
+  onKARegisteredToContextGraph?: OnKARegisteredToContextGraph;
   /** Persistent cursor for surviving restarts. */
   cursorPersistence?: CursorPersistence;
 }
@@ -89,6 +107,7 @@ export class ChainEventPoller {
   private readonly onCollectionUpdated?: OnCollectionUpdated;
   private readonly onAllowListUpdated?: OnAllowListUpdated;
   private readonly onProfileEvent?: OnProfileEvent;
+  private readonly onKARegisteredToContextGraph?: OnKARegisteredToContextGraph;
   private readonly cursorPersistence?: CursorPersistence;
   private readonly log = new Logger('ChainEventPoller');
   private lastBlock = 0;
@@ -118,6 +137,7 @@ export class ChainEventPoller {
     this.onCollectionUpdated = config.onCollectionUpdated;
     this.onAllowListUpdated = config.onAllowListUpdated;
     this.onProfileEvent = config.onProfileEvent;
+    this.onKARegisteredToContextGraph = config.onKARegisteredToContextGraph;
     this.cursorPersistence = config.cursorPersistence;
   }
 
@@ -207,7 +227,8 @@ export class ChainEventPoller {
     const watchUpdates = !!this.onCollectionUpdated;
     const watchAllowList = !!this.onAllowListUpdated;
     const watchProfiles = !!this.onProfileEvent;
-    if (!hasPending && !watchContextGraphs && !watchUpdates && !watchAllowList && !watchProfiles) return;
+    const watchKARegistered = !!this.onKARegisteredToContextGraph;
+    if (!hasPending && !watchContextGraphs && !watchUpdates && !watchAllowList && !watchProfiles && !watchKARegistered) return;
 
     const ctx = createOperationContext('publish');
 
@@ -242,6 +263,7 @@ export class ChainEventPoller {
       eventTypes.push('ProfileCreated');
       eventTypes.push('ProfileUpdated');
     }
+    if (watchKARegistered) eventTypes.push('KnowledgeAssetRegisteredToContextGraph');
 
     const fromBlock = this.lastBlock + 1;
     const upperBound = head != null
@@ -269,6 +291,8 @@ export class ChainEventPoller {
         await this.handleAllowListUpdated(event, ctx);
       } else if (event.type === 'ProfileCreated' || event.type === 'ProfileUpdated') {
         await this.handleProfileEvent(event, ctx);
+      } else if (event.type === 'KnowledgeAssetRegisteredToContextGraph') {
+        await this.handleKARegistered(event, ctx);
       }
     }
 
@@ -406,6 +430,36 @@ export class ChainEventPoller {
       await this.onProfileEvent({ identityId, blockNumber: event.blockNumber });
     } catch (err) {
       this.log.warn(ctx, `onProfileEvent callback failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  private async handleKARegistered(event: ChainEvent, ctx: OperationContext): Promise<void> {
+    if (!this.onKARegisteredToContextGraph) return;
+    const { data } = event;
+    const contextGraphId = String(data['contextGraphId'] ?? '');
+    const kaId = BigInt((data['kaId'] as string) ?? '0');
+    const txHash = String(data['txHash'] ?? '');
+    const rawTxIndex = data['txIndex'];
+    const txIndex = typeof rawTxIndex === 'number' && Number.isFinite(rawTxIndex) && rawTxIndex >= 0
+      ? rawTxIndex
+      : undefined;
+
+    if (!contextGraphId || kaId === 0n) return;
+
+    this.log.info(ctx,
+      `Chain event: KnowledgeAssetRegisteredToContextGraph block=${event.blockNumber} cg=${contextGraphId} kaId=${kaId}`,
+    );
+
+    try {
+      await this.onKARegisteredToContextGraph({
+        contextGraphId,
+        kaId,
+        txHash,
+        txIndex,
+        blockNumber: event.blockNumber,
+      });
+    } catch (err) {
+      this.log.warn(ctx, `onKARegisteredToContextGraph callback failed: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 }

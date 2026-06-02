@@ -177,6 +177,36 @@ export async function handleNodeUIRequest(
     });
   }
 
+  // --- Replication (chain-driven VM reconciliation) — Phase F ---
+
+  if (req.method === 'GET' && path === '/api/replication/summary') {
+    const periodMs = parseInt(url.searchParams.get('periodMs') ?? String(86_400_000), 10);
+    return json(res, 200, db.getReplicationSummary(periodMs));
+  }
+
+  if (req.method === 'GET' && path === '/api/replication/per-cg') {
+    const periodMs = parseInt(url.searchParams.get('periodMs') ?? String(86_400_000), 10);
+    return json(res, 200, { rows: db.getReplicationPerCg(periodMs) });
+  }
+
+  if (req.method === 'GET' && path === '/api/replication/timeline') {
+    const periodMs = parseInt(url.searchParams.get('periodMs') ?? String(86_400_000), 10);
+    const bucketMs = parseInt(url.searchParams.get('bucketMs') ?? String(3_600_000), 10);
+    const contextGraphId = url.searchParams.get('cg') ?? undefined;
+    return json(res, 200, { buckets: db.getReplicationTimeline({ periodMs, bucketMs, contextGraphId }) });
+  }
+
+  if (req.method === 'GET' && path === '/api/replication/cursors') {
+    return json(res, 200, { cursors: db.getReplicationCursors() });
+  }
+
+  if (req.method === 'GET' && path === '/api/replication/events') {
+    const cg = url.searchParams.get('cg');
+    if (!cg) return json(res, 400, { error: 'Missing cg query param' });
+    const limit = parseInt(url.searchParams.get('limit') ?? '100', 10);
+    return json(res, 200, { events: db.getReplicationEventsForCg(cg, limit) });
+  }
+
   // --- Error hotspots ---
 
   if (req.method === 'GET' && path === '/api/error-hotspots') {

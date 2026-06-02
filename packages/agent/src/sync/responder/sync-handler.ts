@@ -67,6 +67,13 @@ export function registerSyncHandler(params: RegisterSyncHandlerParams): void {
     if (!contextGraphId || typeof contextGraphId !== 'string') {
       return new TextEncoder().encode('');
     }
+    // Phase C — validate the optional delta hint into a non-negative bigint.
+    // Anything malformed is ignored (full scan), never an error: the field is
+    // an unsigned, best-effort optimization.
+    let sinceBatchId: bigint | null = null;
+    if (request.sinceBatchId != null && /^\d+$/.test(String(request.sinceBatchId))) {
+      try { sinceBatchId = BigInt(String(request.sinceBatchId)); } catch { sinceBatchId = null; }
+    }
     const nquads: string[] = [];
 
     const authStartedAt = Date.now();
@@ -328,6 +335,52 @@ export function registerSyncHandler(params: RegisterSyncHandlerParams): void {
         // non-publisher peers received the per-cgId data but no per-cgId meta
         // and emitted `kc-not-synced` for every challenge they were assigned
         // against KCs they hadn't published themselves.
+        // Phase C delta filter (narrowing-only). When the requester sends a
+        // `sinceBatchId` high-water mark, drop DATA triples whose owning KC has
+        // `dkg:batchId <= sinceBatchId`. Subjects with NO KA→KC→batchId mapping
+        // (KC/KA meta rows, lifecycle, activity) are NEVER hidden — a delta can
+        // only ever return a subset, so re-sending un-keyed rows is correct (and
+        // keeps every responder's behavior a safe superset). Old responders that
+        // predate this field simply ignore it and return the full scan.
+        // Perf note: the EXISTS/NOT-EXISTS join only runs for delta requests,
+        // which are by definition small; full scans skip it entirely.
+        // Scope the KA→KC→batchId join to THIS context graph's meta graphs
+        // only. Without it, any other CG on the node that happens to reuse the
+        // same `rootEntity` IRI could satisfy the EXISTS/NOT-EXISTS checks and
+        // wrongly include/exclude triples. CG meta graphs are `${cgUriPrefix}/…
+        // /_meta` (top-level, per-cgId, and sub-graph); the trailing slash in
+        // the prefix prevents `mfacts` from matching `mfacts-2`.
+        const metaGraphScope = (g: string): string =>
+          `FILTER(STRSTARTS(STR(${g}), "${cgUriPrefix}/") && STRENDS(STR(${g}), "/_meta"))`;
+        // Bind ?bid<sfx> to the batchId of the KC owning subject ?s, tolerant of
+        // the legacy shapes the rest of the agent also falls back on (see
+        // `getBatchMerkleRoot` in dkg-agent.ts): the canonical placement on the
+        // KC (`?kc dkg:batchId`) AND a legacy placement directly on the KA
+        // (`?ka dkg:batchId`). Either typed (`"5"^^xsd:integer`) or untyped
+        // (`"5"`) literals are accepted — the comparison below coerces via
+        // xsd:integer(STR(...)) so an untyped literal isn't silently skipped by
+        // a typed `>` comparison (which would resend stale rows or, in the
+        // NOT-EXISTS arm, hide eligible ones).
+        const batchIdOfSubject = (sfx: string): string => `
+                GRAPH ?mg${sfx} {
+                  ${metaGraphScope('?mg' + sfx)}
+                  ?ka${sfx} <${DKG_NS}partOf> ?ual${sfx} ; <${DKG_NS}rootEntity> ?re${sfx} .
+                  FILTER(?re${sfx} = ?s || STRSTARTS(STR(?s), CONCAT(STR(?re${sfx}), "/.well-known/genid/")))
+                  { ?ual${sfx} <${DKG_NS}batchId> ?bid${sfx} }
+                  UNION
+                  { ?ka${sfx} <${DKG_NS}batchId> ?bid${sfx} }
+                }`;
+        const deltaFilter = sinceBatchId != null
+          ? `
+            FILTER(
+              NOT EXISTS {${batchIdOfSubject('Any')}
+              }
+              ||
+              EXISTS {${batchIdOfSubject('New')}
+                FILTER(<http://www.w3.org/2001/XMLSchema#integer>(STR(?bidNew)) > ${sinceBatchId.toString()})
+              }
+            )`
+          : '';
         const queryStartedAt = Date.now();
         const dataResult = await store.query(
           `SELECT ?s ?p ?o ?g WHERE {
@@ -346,7 +399,7 @@ export function registerSyncHandler(params: RegisterSyncHandlerParams): void {
                   FILTER(?layer != "${MemoryLayer.WorkingMemory}")
                 }
               }
-            )
+            )${deltaFilter}
           } ORDER BY ?g ?s ?p ?o OFFSET ${offset} LIMIT ${limit}`,
         );
         const queryDurationMs = Date.now() - queryStartedAt;

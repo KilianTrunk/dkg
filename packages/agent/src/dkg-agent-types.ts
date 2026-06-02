@@ -143,6 +143,13 @@ export interface SyncRequestEnvelope {
   requesterAgentAddress?: string;
   requesterSignatureR?: string;
   requesterSignatureVS?: string;
+  /**
+   * Phase C — optional, UNSIGNED delta-sync hint (decimal `uint256` string).
+   * When set, the responder returns only KAs whose KC `dkg:batchId` is
+   * strictly greater than this. Outside `computeSyncDigest` (narrowing-only,
+   * like `phase`/`snapshotRef`), so it's additive and backward-compatible.
+   */
+  sinceBatchId?: string;
 }
 
 // ── Public error classes ────────────────────────────────────────────
@@ -508,6 +515,28 @@ export interface ContextGraphSub {
    * wire form for those — they pre-date the contract change).
    */
   onChainHash?: string;
+  /**
+   * Phase B (chain-driven VM reconciliation) — the per-CG
+   * registration-ordinal watermark: the count of KAs registered to this CG
+   * on-chain that the node has promoted to VM *contiguously* (no gaps). The
+   * reconcile sweep resumes from this ordinal and walks up to the on-chain
+   * `getContextGraphKCCount(cgId)`. Persisted (survives restarts); `undefined`
+   * means "never reconciled" and the sweep starts at 0. Advanced only behind
+   * the confirmation-depth gate so a reorg can't strand the watermark ahead
+   * of canonical chain state.
+   */
+  lastReconciledOrdinal?: number;
+  /**
+   * Phase D (Cores fill their own gaps) — set on a Core when it signs a
+   * StorageACK for a *public* CG, marking the CG as one this node hosts. The
+   * chain-driven VM reconciler (sweep + KACG nudge) runs for hosted CGs even
+   * without a member subscription, so a Core that was offline during a publish
+   * learns about the missed KA from chain on restart and pulls it from another
+   * Core. Persisted (survives restart — the whole point). Only ever set for
+   * public CGs: curated/ciphertext host-mode coverage stays on the host-mode
+   * reconciler + chunk-backfill path (Cores can't promote plaintext to VM).
+   */
+  coreHosted?: boolean;
   /** Participant agent addresses (V10 agent identity model). */
   participantAgents?: string[];
   /**
@@ -538,6 +567,10 @@ export interface ContextGraphSubscriptionRecord {
    * on the correct topic without needing a new chain-event read.
    */
   onChainHash?: string;
+  /** Phase B — persisted per-CG registration-ordinal VM watermark (see ContextGraphSub). */
+  lastReconciledOrdinal?: number;
+  /** Phase D — persisted "this Core hosts a public CG" flag (see ContextGraphSub). */
+  coreHosted?: boolean;
   syncScoped: boolean;
 }
 
@@ -611,6 +644,46 @@ export interface SharedMemorySyncResult extends SharedMemorySyncDiagnostics {
 }
 
 // ── DKGAgent configuration ──────────────────────────────────────────
+
+/**
+ * Phase E/F — a single chain-driven VM reconciliation telemetry event. Emitted
+ * by the agent at reconcile decision points; consumed by the structured logger
+ * (Phase E) and the ops metrics recorder (Phase F).
+ */
+export interface ReplicationEvent {
+  /** Epoch millis the event was emitted. */
+  ts: number;
+  /** Local CG id (topic/name), the key used everywhere in the agent. */
+  contextGraphId: string;
+  /** On-chain numeric CG id (stringified), when known. */
+  onChainCgId?: string;
+  /**
+   * Decision point:
+   *  - `sweep`          — one reconcile pass summary for a CG.
+   *  - `fetch`          — active core-first catch-up fetch kicked off (no local SWM).
+   *  - `promote`        — a KC was promoted to VM this pass.
+   *  - `already`        — a KC was already in VM (idempotent).
+   *  - `defer`          — an ordinal couldn't be reconciled yet (retry next sweep).
+   *  - `cursor-advance` — the persisted watermark moved.
+   *  - `core-fill`      — (Phase D) a Core ingested a hosted batch from another Core.
+   */
+  action: 'sweep' | 'fetch' | 'promote' | 'already' | 'defer' | 'cursor-advance' | 'core-fill';
+  ual?: string;
+  ordinal?: number;
+  kaId?: string;
+  /** Watermark before/after, for `cursor-advance`. */
+  fromWatermark?: number;
+  toWatermark?: number;
+  /** Chain-head ordinal at the time of the event. */
+  head?: number;
+  /** Reconciled / pending counts, for `sweep`. */
+  reconciled?: number;
+  pending?: number;
+  /** Free-form detail (error message, peer order summary, …). */
+  detail?: string;
+}
+
+export type ReplicationEventSink = (event: ReplicationEvent) => void;
 
 export interface DKGAgentConfig {
   name: string;
@@ -823,6 +896,16 @@ export interface DKGAgentConfig {
    * Tests: pass `InMemoryMessageIdempotencyStore` +
    * `InMemoryProtocolOutboxStore` from `@origintrail-official/dkg-core`.
    */
+  /**
+   * Phase E/F — optional sink for chain-driven VM reconciliation telemetry.
+   * The agent emits a {@link ReplicationEvent} at each reconcile decision
+   * point (sweep summary, active fetch, promote, cursor advance). Production
+   * wires this to the ops metrics DB (Phase F `replication_events` table) so
+   * the `/ui/observability` Replication tab can aggregate; omit it and the
+   * structured `chain-promote` log line is still emitted (Phase E grep path).
+   * Best-effort: the agent never awaits or throws on the sink.
+   */
+  onReplicationEvent?: ReplicationEventSink;
   messengerStores?: {
     idempotencyStore: MessageIdempotencyStore;
     outboxStore: ProtocolOutboxStore;

@@ -1,6 +1,11 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { OxigraphStore } from '@origintrail-official/dkg-storage';
-import { encodeFinalizationMessage, type FinalizationMessageMsg, encodePublishRequest, createOperationContext } from '@origintrail-official/dkg-core';
+import { OxigraphStore, GraphManager } from '@origintrail-official/dkg-storage';
+import {
+  encodeFinalizationMessage, type FinalizationMessageMsg, encodePublishRequest, createOperationContext,
+  contextGraphWorkspaceGraphUri, contextGraphWorkspaceMetaGraphUri,
+} from '@origintrail-official/dkg-core';
+import type { ChainAdapter } from '@origintrail-official/dkg-chain';
+import { computeFlatKCRootV10 } from '@origintrail-official/dkg-publisher';
 import { FinalizationHandler } from '../src/finalization-handler.js';
 
 const CONTEXT_GRAPH = 'test-contextGraph';
@@ -289,5 +294,192 @@ describe('FinalizationHandler', () => {
     );
     expect(perCgBindings.type).toBe('boolean');
     if (perCgBindings.type === 'boolean') expect(perCgBindings.value).toBe(true);
+  });
+});
+
+describe('FinalizationHandler.handleChainReconciledKC (Phase B)', () => {
+  const KA_ID = 7n;
+  const ON_CHAIN_CG = '42';
+  const UAL = 'did:dkg:evm:31337/0xABC/7';
+  const PUBLISHER = '0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266';
+  const BLOCK = 500;
+  const ENTITY = 'urn:test:reconcile-entity';
+
+  /** Seed a local SWM snapshot (data + meta op→root) and return its KC root. */
+  async function seedSwmSnapshot(store: OxigraphStore): Promise<Uint8Array> {
+    const wsGraph = contextGraphWorkspaceGraphUri(CONTEXT_GRAPH);
+    const wsMetaGraph = contextGraphWorkspaceMetaGraphUri(CONTEXT_GRAPH);
+    await store.insert([
+      { subject: ENTITY, predicate: 'http://schema.org/name', object: '"Reconciled"', graph: wsGraph },
+      { subject: 'urn:dkg:share:test:op-1', predicate: 'http://dkg.io/ontology/rootEntity', object: ENTITY, graph: wsMetaGraph },
+    ]);
+    return computeFlatKCRootV10(
+      [{ subject: ENTITY, predicate: 'http://schema.org/name', object: '"Reconciled"', graph: '' }],
+      [],
+    );
+  }
+
+  /** Minimal chain whose getKAContextGraphId binds the KA to the given CG. */
+  function makeBindingChain(boundCg: bigint): ChainAdapter {
+    return {
+      chainId: 'evm:31337',
+      getKAContextGraphId: async (_kaId: bigint) => boundCg,
+    } as unknown as ChainAdapter;
+  }
+
+  function input(merkleRoot: Uint8Array) {
+    return {
+      contextGraphId: CONTEXT_GRAPH,
+      onChainCgId: ON_CHAIN_CG,
+      ual: UAL,
+      merkleRoot,
+      publisherAddress: PUBLISHER,
+      kaId: KA_ID,
+      versionBlock: BLOCK,
+    };
+  }
+
+  it('promotes a chain-registered KC when the CG binding + recomputed merkle match', async () => {
+    const store = new OxigraphStore();
+    const merkleRoot = await seedSwmSnapshot(store);
+    const handler = new FinalizationHandler(store, makeBindingChain(42n));
+
+    const outcome = await handler.handleChainReconciledKC(input(merkleRoot), createOperationContext('system'));
+    expect(outcome).toBe('promoted');
+
+    const perCgGraph = `did:dkg:context-graph:${CONTEXT_GRAPH}/context/${ON_CHAIN_CG}`;
+    const promoted = await store.query(
+      `ASK { GRAPH <${perCgGraph}> { <${ENTITY}> <http://schema.org/name> "Reconciled" } }`,
+    );
+    expect(promoted.type === 'boolean' && promoted.value).toBe(true);
+  });
+
+  it('mirrors the keep-root dual-write when the publisher persisted keepRootCopyOnLabel=true', async () => {
+    // Regression: a same-graph publish recovered via the chain sweep (gossip
+    // missed) must still land a root `<cg>` label copy, else label-scoped reads
+    // miss it. The durable signal lives in SWM workspace meta.
+    const store = new OxigraphStore();
+    const merkleRoot = await seedSwmSnapshot(store);
+    await store.insert([
+      { subject: ENTITY, predicate: 'http://dkg.io/ontology/keepRootCopyOnLabel', object: '"true"', graph: contextGraphWorkspaceMetaGraphUri(CONTEXT_GRAPH) },
+    ]);
+    const handler = new FinalizationHandler(store, makeBindingChain(42n));
+
+    const outcome = await handler.handleChainReconciledKC(input(merkleRoot), createOperationContext('system'));
+    expect(outcome).toBe('promoted');
+
+    const rootLabelGraph = `did:dkg:context-graph:${CONTEXT_GRAPH}`;
+    const inRootLabel = await store.query(
+      `ASK { GRAPH <${rootLabelGraph}> { <${ENTITY}> <http://schema.org/name> "Reconciled" } }`,
+    );
+    expect(inRootLabel.type === 'boolean' && inRootLabel.value).toBe(true);
+  });
+
+  it('does NOT dual-write to the root label when no keep-root signal is persisted (legacy / remap)', async () => {
+    // Absent signal → per-cgId only, so a remap publish's deliberately-dropped
+    // root copy is never re-added (data-isolation guard).
+    const store = new OxigraphStore();
+    const merkleRoot = await seedSwmSnapshot(store);
+    const handler = new FinalizationHandler(store, makeBindingChain(42n));
+
+    const outcome = await handler.handleChainReconciledKC(input(merkleRoot), createOperationContext('system'));
+    expect(outcome).toBe('promoted');
+
+    const rootLabelGraph = `did:dkg:context-graph:${CONTEXT_GRAPH}`;
+    const inRootLabel = await store.query(
+      `ASK { GRAPH <${rootLabelGraph}> { <${ENTITY}> ?p ?o } }`,
+    );
+    expect(inRootLabel.type === 'boolean' && inRootLabel.value).toBe(false);
+  });
+
+  it('returns no-swm when no local SWM snapshot matches the published merkleRoot', async () => {
+    const store = new OxigraphStore();
+    await seedSwmSnapshot(store);
+    const handler = new FinalizationHandler(store, makeBindingChain(42n));
+
+    // Ask for a different (unmatched) merkle root.
+    const outcome = await handler.handleChainReconciledKC(
+      input(new Uint8Array(32).fill(0xff)),
+      createOperationContext('system'),
+    );
+    expect(outcome).toBe('no-swm');
+  });
+
+  it('returns unverified when the chain CG binding cannot be confirmed (no chain wired)', async () => {
+    const store = new OxigraphStore();
+    const merkleRoot = await seedSwmSnapshot(store);
+    const handler = new FinalizationHandler(store, undefined);
+
+    const outcome = await handler.handleChainReconciledKC(input(merkleRoot), createOperationContext('system'));
+    expect(outcome).toBe('unverified');
+  });
+
+  it('returns unverified when the KA is bound to a DIFFERENT CG on chain', async () => {
+    const store = new OxigraphStore();
+    const merkleRoot = await seedSwmSnapshot(store);
+    const handler = new FinalizationHandler(store, makeBindingChain(999n));
+
+    const outcome = await handler.handleChainReconciledKC(input(merkleRoot), createOperationContext('system'));
+    expect(outcome).toBe('unverified');
+
+    const perCgGraph = `did:dkg:context-graph:${CONTEXT_GRAPH}/context/${ON_CHAIN_CG}`;
+    const promoted = await store.query(`ASK { GRAPH <${perCgGraph}> { <${ENTITY}> ?p ?o } }`);
+    expect(promoted.type === 'boolean' && promoted.value).toBe(false);
+  });
+
+  it('returns already-confirmed (idempotent) when VM already holds the KC', async () => {
+    const store = new OxigraphStore();
+    const merkleRoot = await seedSwmSnapshot(store);
+    const handler = new FinalizationHandler(store, makeBindingChain(42n));
+
+    const metaGraph = `did:dkg:context-graph:${CONTEXT_GRAPH}/context/${ON_CHAIN_CG}/_meta`;
+    await store.insert([
+      { subject: UAL, predicate: 'http://dkg.io/ontology/status', object: '"confirmed"', graph: metaGraph },
+    ]);
+
+    const outcome = await handler.handleChainReconciledKC(input(merkleRoot), createOperationContext('system'));
+    expect(outcome).toBe('already-confirmed');
+  });
+
+  /**
+   * Seed an SWM snapshot whose ONLY copy lives under a named sub-graph's
+   * shared-memory namespace (not the root workspace). Registers the sub-graph
+   * so it is discoverable via `listSubGraphs`.
+   */
+  async function seedSwmSnapshotInSubGraph(store: OxigraphStore, subGraphName: string): Promise<Uint8Array> {
+    const gm = new GraphManager(store);
+    await store.insert([
+      // A benign marker registers the sub-graph data graph so listSubGraphs()
+      // can discover it — distinct from ENTITY so the promotion assertion is
+      // meaningful (ENTITY must NOT already be in the sub-graph data graph).
+      { subject: 'urn:test:subgraph-marker', predicate: 'http://schema.org/name', object: '"marker"', graph: gm.subGraphUri(CONTEXT_GRAPH, subGraphName) },
+      // The SWM snapshot copy + op→root live under the sub-graph SWM namespace.
+      { subject: ENTITY, predicate: 'http://schema.org/name', object: '"Reconciled"', graph: gm.sharedMemoryUri(CONTEXT_GRAPH, subGraphName) },
+      { subject: 'urn:dkg:share:test:op-1', predicate: 'http://dkg.io/ontology/rootEntity', object: ENTITY, graph: gm.sharedMemoryMetaUri(CONTEXT_GRAPH, subGraphName) },
+    ]);
+    return computeFlatKCRootV10(
+      [{ subject: ENTITY, predicate: 'http://schema.org/name', object: '"Reconciled"', graph: '' }],
+      [],
+    );
+  }
+
+  it('falls back to sub-graph SWM namespaces when the caller supplies no subGraphName', async () => {
+    // Regression: the chain-driven path never knows the sub-graph, so a KA
+    // published into a named sub-graph used to stay no-swm forever.
+    const store = new OxigraphStore();
+    const merkleRoot = await seedSwmSnapshotInSubGraph(store, 'code');
+    const handler = new FinalizationHandler(store, makeBindingChain(42n));
+
+    const outcome = await handler.handleChainReconciledKC(input(merkleRoot), createOperationContext('system'));
+    expect(outcome).toBe('promoted');
+
+    // Promotion must land in the resolved sub-graph data graph, not the root
+    // per-cgId partition (proves we used the namespace where the snapshot lived).
+    const subGraph = `did:dkg:context-graph:${CONTEXT_GRAPH}/code`;
+    const rootCgGraph = `did:dkg:context-graph:${CONTEXT_GRAPH}/context/${ON_CHAIN_CG}`;
+    const inSub = await store.query(`ASK { GRAPH <${subGraph}> { <${ENTITY}> <http://schema.org/name> "Reconciled" } }`);
+    const inRoot = await store.query(`ASK { GRAPH <${rootCgGraph}> { <${ENTITY}> <http://schema.org/name> "Reconciled" } }`);
+    expect(inSub.type === 'boolean' && inSub.value).toBe(true);
+    expect(inRoot.type === 'boolean' && inRoot.value).toBe(false);
   });
 });

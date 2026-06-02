@@ -8,8 +8,8 @@ interface RegisterSyncHandlerParams {
   /**
    * `register` callable. In production this is bound to the RAW
    * ProtocolRouter (via an adapter that re-exposes the string `peerId`),
-   * NOT `Messenger.register`: sync runs off the Universal Messenger
-   * substrate on `/dkg/10.0.2/sync` so its large, never-reused page
+   * NOT `Messenger.register`: sync runs outside the Universal Messenger
+   * substrate as raw `/dkg/10.0.2/sync` so its large, never-reused page
    * responses are not cached in message_idempotency (the node-ui.db
    * bloat fix). The handler receives the bare payload — exactly the
    * auth envelope `parseSyncRequest` expects — and returns the response

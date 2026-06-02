@@ -3083,7 +3083,7 @@ else
     target_peer=${TARGET_PEER_IDS[$j]}
     target_role=${TARGET_NODE_ROLES[$j]}
     if [[ -z "$target_peer" || "$target_peer" == "__NONE__" || "$target_peer" == "__ERR__" ]]; then
-      fail "N$((j+1)) ($target_port) peerId unreadable via /api/info — cannot verify substrate protocol advertisements"
+      fail "N$((j+1)) ($target_port) peerId unreadable via /api/info — cannot verify wire protocol advertisements"
     fi
     if [[ -z "$target_role" || "$target_role" == "__NONE__" || "$target_role" == "__ERR__" ]]; then
       fail "N$((j+1)) ($target_port) nodeRole unreadable via /api/info — cannot decide expected core-only protocols"

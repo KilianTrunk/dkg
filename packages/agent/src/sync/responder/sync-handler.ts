@@ -237,11 +237,20 @@ export function registerSyncHandler(params: RegisterSyncHandlerParams): void {
         // predate this field simply ignore it and return the full scan.
         // Perf note: the EXISTS/NOT-EXISTS join only runs for delta requests,
         // which are by definition small; full scans skip it entirely.
+        // Scope the KA→KC→batchId join to THIS context graph's meta graphs
+        // only. Without it, any other CG on the node that happens to reuse the
+        // same `rootEntity` IRI could satisfy the EXISTS/NOT-EXISTS checks and
+        // wrongly include/exclude triples. CG meta graphs are `${cgUriPrefix}/…
+        // /_meta` (top-level, per-cgId, and sub-graph); the trailing slash in
+        // the prefix prevents `mfacts` from matching `mfacts-2`.
+        const metaGraphScope = (g: string): string =>
+          `FILTER(STRSTARTS(STR(${g}), "${cgUriPrefix}/") && STRENDS(STR(${g}), "/_meta"))`;
         const deltaFilter = sinceBatchId != null
           ? `
             FILTER(
               NOT EXISTS {
                 GRAPH ?mgAny {
+                  ${metaGraphScope('?mgAny')}
                   ?kaAny <${DKG_NS}partOf> ?ualAny ; <${DKG_NS}rootEntity> ?reAny .
                   ?ualAny <${DKG_NS}batchId> ?bidAny .
                   FILTER(?reAny = ?s || STRSTARTS(STR(?s), CONCAT(STR(?reAny), "/.well-known/genid/")))
@@ -250,6 +259,7 @@ export function registerSyncHandler(params: RegisterSyncHandlerParams): void {
               ||
               EXISTS {
                 GRAPH ?mgNew {
+                  ${metaGraphScope('?mgNew')}
                   ?kaNew <${DKG_NS}partOf> ?ualNew ; <${DKG_NS}rootEntity> ?reNew .
                   ?ualNew <${DKG_NS}batchId> ?bidNew .
                   FILTER(?reNew = ?s || STRSTARTS(STR(?s), CONCAT(STR(?reNew), "/.well-known/genid/")))

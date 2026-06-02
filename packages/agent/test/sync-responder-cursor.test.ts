@@ -122,4 +122,22 @@ describe('sync responder — Phase C sinceBatchId delta filter', () => {
     const out = await cap.invoke({ contextGraphId: CG_ID, offset: 0, limit: 5000, includeSharedMemory: false, phase: 'data', sinceBatchId: 'not-a-number' as unknown as string });
     for (let i = 1; i <= 10; i++) expect(out).toContain(`"data-${i}"`);
   });
+
+  it('does not let another CG reusing the same rootEntity IRI leak into the delta', async () => {
+    // Regression: the KA→KC→batchId join must be scoped to THIS CG's meta
+    // graphs. Pollute a DIFFERENT CG's per-cgId meta with the SAME rootEntity
+    // (urn:root:8) bound to a KC with a high batchId (99). With since=8,
+    // root:8's real batchId in mfacts is 8 (NOT > 8) so it must be excluded —
+    // the foreign batchId 99 must NOT pull root:8's data back in.
+    const OTHER_META = 'did:dkg:context-graph:other/context/1/_meta';
+    await store.insert([
+      { graph: OTHER_META, subject: 'did:dkg:evm:31337/0xother/1', predicate: `${DKG_NS}partOf`, object: 'did:dkg:evm:31337/0xother' },
+      { graph: OTHER_META, subject: 'did:dkg:evm:31337/0xother/1', predicate: `${DKG_NS}rootEntity`, object: 'urn:root:8' },
+      { graph: OTHER_META, subject: 'did:dkg:evm:31337/0xother', predicate: `${DKG_NS}batchId`, object: intLit(99) },
+    ]);
+    const out = await cap.invoke({ contextGraphId: CG_ID, offset: 0, limit: 5000, includeSharedMemory: false, phase: 'data', sinceBatchId: '8' });
+    expect(out).not.toContain('"data-8"');
+    expect(out).toContain('"data-9"');
+    expect(out).toContain('"data-10"');
+  });
 });

@@ -18,7 +18,51 @@ This skill teaches you the full node API surface so you can operate autonomously
 - **Node role:** (dynamic — `core` or `edge`)
 - **Available extraction pipelines:** (dynamic)
 
-To see which context graphs (projects) are currently subscribed, call `GET /api/context-graph/list` — this returns a live list that stays current as projects are created or subscribed during the session.
+If the Node UI injects a target context graph for the turn, use that target directly. If no target is injected or configured, call `dkg_list_context_graphs` / `GET /api/context-graph/list`; agent tool surfaces default that list to the caller's created/joined context graphs, with `scope: "all"` for every graph the node knows about.
+
+### Context Graph IDs
+
+For write or mutation routes, always pass the injected target context graph id,
+an exact existing context graph id from `dkg_list_context_graphs` /
+`GET /api/context-graph/list`, or the full `did:dkg:context-graph:<id>` URI.
+
+- A context graph created locally can have a bare canonical id, for example
+  `local-notes`, with full URI `did:dkg:context-graph:local-notes`.
+- A joined or curated context graph can have a curator-scoped canonical id, for
+  example `0x1234567890abcdef1234567890abcdef12345678/team-notes`, with full
+  URI `did:dkg:context-graph:0x1234567890abcdef1234567890abcdef12345678/team-notes`.
+
+Do not guess from the display name, shorten a curator-scoped id, or pass only a
+suffix slug such as `team-notes` when the listed id is
+`0x.../team-notes`. Write routes reject unknown, ambiguous, or non-canonical
+targets before writing so they cannot accidentally create shadow context graphs.
+
+## 1a. Operating the node (install, update, troubleshoot)
+
+> **Before reasoning about install state, run `dkg doctor`.** Detects orphan repository clones, version skew between the daemon and the global `dkg` CLI, served-UI / source mismatch, broken plugin install roots, and other install-layout anomalies. Use `dkg doctor --json` for a machine-parsable report; the `state` field always carries the full diagnostic snapshot (daemon entry point, install mode, node role, dkg-home, current version + commit, auto-update settings) independent of any anomaly findings.
+
+**Updating DKG:**
+
+- The canonical update verb is `dkg update`. It resolves the next release from the npm registry and applies it.
+- **Do not `git pull`.** Do not clone the repository. Do not edit files under `~/.dkg/releases/` (on Core nodes — Edge nodes have no `~/.dkg/releases/` at all under RFC-41).
+- If `dkg doctor` reports orphan clones at `~/dkg/`, `~/Projects/dkg/`, or similar, ask the operator before touching them — they are not the running daemon.
+- `dkg update --check` previews the available version without applying.
+- `dkg update --allow-prerelease` follows the `next` dist-tag for pre-release builds.
+- `dkg rollback` reverts to the previous version (Edge: re-installs the prior npm version recorded in `~/.dkg/previous-version`; Core: flips the blue-green slot symlink).
+
+**Detecting current install state:**
+
+- `dkg --version` — the global CLI's version.
+- `curl http://127.0.0.1:9200/api/status | jq '{version, commit, commitShort, buildTime, distTag, installMode, nodeRole}'` — the running daemon's version, commit, and install mode. Mismatch between `dkg --version` and the daemon's version is the §1a version-skew condition; `dkg doctor` reports it explicitly.
+- `cat ~/.dkg/config.json | jq .nodeRole` — `edge` (default; daemon runs from npm-global install, no release slots) or `core` (operator opted into blue-green slots via `dkg init --role core`).
+
+**Troubleshooting common confusion:**
+
+- "There seem to be multiple DKG installations on this machine" → run `dkg doctor`; the `state.cli.globalPath`, `state.daemon.entryPoint`, and orphan-repos check together identify the canonical install and any stray clones.
+- "The UI shows an old version even after I updated" → run `dkg doctor`; the served-UI / source-mismatch check flags stale browser / PWA / service-worker caches.
+- "I ran `npm install -g @origintrail-official/dkg@latest` but the daemon still reports the old version" → on Edge nodes the daemon needs a restart to pick up the new install (`dkg restart`). On Core nodes, the slot mechanism gates the visible version on `dkg update`'s atomic swap, not on `npm install -g` directly — use `dkg update` for Core nodes.
+
+The full design rationale lives in [OT-RFC-41](https://github.com/OriginTrail/dkgv10-spec/blob/main/rfcs/OT-RFC-41-edge-node-npm-only-install-and-update.md).
 
 ## 2. Capabilities Overview
 
@@ -110,7 +154,7 @@ Drop to HTTP when the operation isn't in the table — participant self-service 
 |---|---|---|
 | `dkg_status` | `GET /api/status` | Node health and subscribed CGs |
 | `dkg_wallet_balances` | `GET /api/wallets/balances` | TRAC / ETH balances |
-| `dkg_list_context_graphs` | `GET /api/context-graph/list` | List all context graphs the node knows about — each entry carries `subscribed` and `synced` flags (discovered-but-not-subscribed entries are present too) |
+| `dkg_list_context_graphs` | `GET /api/context-graph/list` | List context graphs. Tool surfaces default to caller-created/joined graphs; pass `scope: "all"` for every known graph. Entries carry `subscribed`, `synced`, and caller involvement when available |
 | `dkg_context_graph_create` | `POST /api/context-graph/create` | Create a simple context graph (tool schema accepts only `name` / `description` / `id` — no multi-sig inputs). On chain-enabled nodes the daemon may auto-register on-chain as a best-effort side-effect — see §6 for the register semantics. Multi-sig CGs are HTTP-only |
 | `dkg_subscribe` | `POST /api/context-graph/subscribe` | Subscribe + catch up an existing CG |
 | `dkg_context_graph_invite` | `POST /api/context-graph/invite` | Create a ready-to-share invite for another peer to join a context graph |
@@ -146,6 +190,8 @@ Drop to HTTP when the operation isn't in the table — participant self-service 
 
 P2P tools fail gracefully when the peer is offline. `dkg_publish` (fresh quads + write + publish, two HTTP calls) and `dkg_shared_memory_publish` (publish existing SWM, one HTTP call) differ in intent: use the two-call helper for "I have quads, publish now"; use the canonical finalizer as step 4 of the stepwise write → promote → publish flow. `dkg_share` is a direct SWM convenience helper for quick team-visible notes, not a replacement for assertion lifecycle tracking.
 
+**Bulk imports (>5,000 quads in one logical operation):** the per-call `dkg_assertion_*` loop IS the chunked-write API; there is no `/api/import/bulk`. Keep `/api/assertion/<name>/write` payloads under the 10 MB body cap, keep `/api/assertion/<name>/promote` payloads under the 256 KB body cap, and remember that promotion can still fail at the 10 MB gossip-message cap even when the HTTP body is small. For multi-part imports, write a resumable manifest in the `meta` sub-graph (`scripts/lib/manifest.mjs` is the canonical helper), promote import roots in size-aware batches, and halve/retry on 413 rather than restarting the whole import. The expanded contract — chunking budgets, manifest pattern, HTTP 413 recipes, async-promote queue (`/api/assertion/<name>/promote-async`) — is served at `GET /.well-known/skill-importer.md` (the daemon's second canonical skill endpoint, same auth-public + ETag-cacheable shape as `/.well-known/skill.md`). Source checkouts also have the same file at `packages/cli/skills/dkg-importer/SKILL.md`.
+
 ### HTTP-only operations (no tool wrapper)
 
 - **Participant self-service join/sign flow** — see §6.
@@ -173,8 +219,9 @@ before promoting it to SWM (team) or through to VM (chain-anchored).
   Body: `{ "contextGraphId": "...", "quads": [...], "subGraphName"?: "..." }`
 - `POST /api/assertion/{name}/query` — read assertion contents as quads
   Body: `{ "contextGraphId": "...", "subGraphName"?: "..." }`
-- `POST /api/assertion/{name}/promote` — promote assertion triples to SWM
+- `POST /api/assertion/{name}/promote` — promote assertion triples to SWM (synchronous; returns once SWM insert + gossip complete)
   Body: `{ "contextGraphId": "...", "entities"?: [...] | "all", "subGraphName"?: "..." }`
+- `POST /api/assertion/{name}/promote-async` — enqueue the same promote for an in-daemon worker to handle in the background. Returns `202 { jobId, state: "queued" }` immediately. Use this for bulk importers where waiting for the synchronous round-trip is the bottleneck (the Graphify import RFC `docs/specs/SPEC_ASYNC_PROMOTE_QUEUE.md` explains the motivation). See §8 "Async promote queue" for the inspection routes.
 - `POST /api/assertion/{name}/discard` — drop the assertion graph
   Body: `{ "contextGraphId": "...", "subGraphName"?: "..." }`
 - `POST /api/assertion/{name}/import-file` — import a document (multipart/form-data) — see §7
@@ -388,7 +435,7 @@ Context Graphs are scoped knowledge domains with configurable access and governa
 
 ### Routing: Turn Context Override
 
-When the chat turn includes injected context with `target_context_graph`, treat that value as BOTH:
+When the chat turn includes injected context with `target_context_graph`, treat that value as the canonical context graph id. If present, `target_context_graph_uri` is the same target as a full DID URI, and `target_context_graph_name` is display-only. Treat the target id as BOTH:
 
 1. **The authoritative target context graph for tool routing on this turn** — default all DKG reads, writes, imports, promotions, publishes, and queries in that turn to this value unless the user explicitly overrides it in the same message.
 2. **The user's currently-selected project in the UI** — when the user asks introspective questions like "which project am I on?", "what is currently selected?", "do you see that I have X selected?", answer directly from this field. Do not claim you cannot see the UI state. The field IS the UI state: the right-side panel project dropdown stamps it onto every turn envelope before the turn reaches you, so its presence means the user has that project selected and its absence means they have nothing selected.
@@ -428,11 +475,11 @@ Minimum behavior:
 
 Implications:
 
-- If `target_context_graph` is present, the user is on that project. State this explicitly when asked.
-- If it is absent, the user has no project selected. Try to deduce the target project from the conversation context (e.g., "add this to my research project" → look up "research" via `GET /api/context-graph/list`). If the project is ambiguous or you are not confident, ask the user which project to use. Only suggest the right-side panel project dropdown if the user is chatting through the DKG UI — users on other channels (Telegram, API, etc.) do not have a panel to select from. When no project can be determined, route reads and writes to `agent-context` only.
+- If `target_context_graph` is present, its value is the canonical context graph id for the turn. `target_context_graph_uri` is the same target in full DID form; `target_context_graph_name` is display-only. State the selected project explicitly when asked.
+- If it is absent, the user has no project selected. Try to deduce the target project from the conversation context (e.g., "add this to my research project" -> look up "research" via `dkg_list_context_graphs` / `GET /api/context-graph/list`, whose tool surfaces default to created/joined graphs). If the project is ambiguous or you are not confident, ask the user which project to use. Only suggest the right-side panel project dropdown if the user is chatting through the DKG UI — users on other channels (Telegram, API, etc.) do not have a panel to select from. When no project can be determined, route reads and writes to `agent-context` only.
 - Default all DKG reads, writes, imports, promotions, publishes, and queries in that turn to the injected target context graph.
 - Do not keep using an older conversational context graph when a newer injected `target_context_graph` is present.
-- If the injected value includes both display name and ID, prefer the ID when calling tools or APIs, and reference the display name when answering the user.
+- Older UI versions may inject one value containing both display name and ID. If so, prefer the ID inside parentheses when calling tools or APIs, and reference the display name when answering the user.
 - If the user explicitly says to use a different context graph in the same turn, follow the user's explicit instruction instead.
 
 ### Core CG routes
@@ -466,7 +513,7 @@ Implications:
 - `POST /api/context-graph/register` — register a previously-created local CG on-chain (two-phase creation). Body: `{ id, accessPolicy?, publishPolicy? }`, where `accessPolicy` controls public/private discovery and `publishPolicy` controls open/curated publishing. Use this to promote a free CG to an on-chain identity before publishing to Verified Memory. `revealOnChain` is deprecated and ignored on the V10 ContextGraphs path.
 - `POST /api/context-graph/rename` — rename a CG (human-readable name only; the ID is immutable). Body: `{ contextGraphId, name }`.
 - `POST /api/context-graph/subscribe` — subscribe to a context graph
-- `GET /api/context-graph/list` — list subscribed context graphs
+- `GET /api/context-graph/list` — list known context graphs; tool wrappers default to the caller's created/joined graphs and can expose all known graphs with `scope: "all"`
 - `GET /api/context-graph/exists` — check if a context graph exists
 - `GET /api/sync/catchup-status?contextGraphId=...` — poll CG sync progress after subscribing
 - 🚧 `GET /api/context-graph/{id}` — CG details *(planned)*
@@ -509,7 +556,7 @@ through the same path as `POST /api/assertion/{name}/write`.
 | Field | Required | Description |
 |---|---|---|
 | `file` | yes | Document bytes |
-| `contextGraphId` | yes | Target context graph |
+| `contextGraphId` | yes | Exact existing target context graph id, or full `did:dkg:context-graph:<id>` URI |
 | `contentType` | no | Override the file part's Content-Type |
 | `ontologyRef` | no | CG `_ontology` URI for guided extraction |
 | `subGraphName` | no | Target sub-graph, already registered |
@@ -611,6 +658,58 @@ Use the job queue for bulk or long-running publishes, publishes that must surviv
 | `POST` | `/api/publisher/cancel` | Cancel a job. Body: `{ jobId }`. |
 | `POST` | `/api/publisher/retry` | Retry a failed job. Body: `{ jobId }`. |
 | `POST` | `/api/publisher/clear` | Clear completed/failed jobs. |
+
+### Async promote queue (WM → SWM)
+
+Sibling to the publisher queue, but for the WM→SWM transition that a synchronous `POST /api/assertion/{name}/promote` would otherwise perform inline. Use it when the importer is producing assertions faster than the daemon can promote them (bulk Graphify imports, EPCIS batch loads, etc.); the synchronous route stays available for small interactive cases.
+
+The worker runs in-daemon and is **on by default**. Disable per node with `config.promoteQueue.enabled: false`; tune throughput with `workerConcurrency` (default 4), `pollIntervalMs` (default 100), `heartbeatIntervalMs` (default 60_000), `shutdownTimeoutMs` (default 30_000).
+
+| Method | Route | Purpose |
+|---|---|---|
+| `POST` | `/api/assertion/{name}/promote-async` | Enqueue a promote. Body: `{ contextGraphId, entities?: [...] \| "all", subGraphName? }`. Returns `202 { jobId, state: "queued", enqueuedAt }`. Returns `409 { existingJobId }` if there is already an active job for the same `(contextGraphId, subGraphName, name)`. |
+| `GET`  | `/api/assertion/promote-async` | List jobs. Query: `state=queued,running,failed_retrying,succeeded,failed` (comma-separated), `contextGraphId=...`, `limit=N`. Returns `{ jobs: [...] }`. |
+| `GET`  | `/api/assertion/promote-async/{jobId}` | Read one job (`state`, `attempt.count`, `commitMarker`, `result`, `attempt.lastError` with `classification: transient\|cap_exceeded\|fatal`). |
+| `DELETE` | `/api/assertion/promote-async/{jobId}` | Cancel a `queued` / `failed_retrying` job. `409` if the job is `running` (let the lease expire). |
+| `POST` | `/api/assertion/promote-async/{jobId}/recover` | Re-queue a `failed` job after the operator has fixed whatever was wrong (subdivided an over-large entity set, restarted an upstream, etc.). |
+
+Failure classifications you'll see in `attempt.lastError.classification`:
+
+| Classification | Retry? | Typical cause | Operator action |
+|---|---|---|---|
+| `transient` | yes (until `maxRetries=5` reached) | `fetch failed` / `ECONNRESET` / `timeout` | Wait — the worker will pick it up after backoff. |
+| `cap_exceeded` | no | `Promoted assertion too large for gossip` (10 MB) or `Request body too large` (256 KB) | Re-enqueue with a smaller `entities` slice — the queue can't subdivide on its own. |
+| `fatal` | no | Bad request, missing assertion, etc. | Inspect the error message, fix the cause, then `POST /api/assertion/promote-async/{jobId}/recover`. |
+
+### TRAC auto-approve policy (V10 publish + update)
+
+Every V10 publish or update pulls TRAC from the operational signer via `token.transferFrom(msg.sender, CSS, fullCost)`. Before that call, the EVM adapter checks the signer's allowance for the V10 KA contract and approves more if it's short. `config.chain.approvalPolicy` controls how much it approves at each top-up — a per-publish gas trade-off that's neutral on testnet (zero-cost publishes) but matters at mainnet scale.
+
+| Mode | Per-publish gas | Blast radius (compromised KA) | When to use |
+|---|---|---|---|
+| `per-publish` (default) | One `approve` tx whenever `tokenAmount` exceeds prior allowance | One publish's cost ceiling | Conservative default. Low publish volume, or operators who trust nothing. |
+| `replenishing` | One `approve` per ~`targetAllowance / avgPublishCost` publishes | Capped at `targetAllowance` (1000 TRAC default) | **Recommended for mainnet at any volume.** Predictable gas profile + bounded exposure. |
+| `unlimited` | One `approve` ever per wallet | Operational wallet's full TRAC balance | High-volume operators on a contract they trust absolutely. Matches V9 behaviour. |
+
+Configuration (defaults shown):
+
+```yaml
+chain:
+  type: evm
+  rpcUrl: https://base.llamarpc.com
+  hubAddress: '0x...'
+  approvalPolicy:
+    mode: per-publish                # 'per-publish' | 'replenishing' | 'unlimited'
+    # `replenishing` mode only:
+    targetAllowance: '1000000000000000000000'   # decimal wei-TRAC string (1000 TRAC = 10^21)
+    refillBelowFraction: 0.1                     # refill when current < target × this (default 10%)
+```
+
+`targetAllowance` is a string because YAML/JSON can't carry bigints natively — the daemon parses it into a bigint at startup, fails fast on garbage input. `refillBelowFraction` clamps to `[0, 1]`; a value of `1` means "refill on every publish" (defeats the policy) and `0` means "never refill until the publish floor (1 wei-TRAC) is breached" (which on a zero-cost CG would mean approve once then never again).
+
+The policy never approves *less* than the immediate publish needs — a too-low `targetAllowance` gets quietly raised to the publish's on-chain floor so misconfiguration can't brick a publish.
+
+This entire surface was empirically driven by [PR #720](https://github.com/OriginTrail/dkg/pull/720)'s `TooLowAllowance(token, 0, 1)` finding on the May 2026 Base Sepolia publish-stress run; see also `packages/chain/test/evm-adapter.unit.test.ts` for the policy's invariants and edge cases.
 
 ## 9. Error Reference
 

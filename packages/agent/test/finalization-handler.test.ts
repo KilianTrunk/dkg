@@ -207,11 +207,14 @@ describe('FinalizationHandler', () => {
       subGraphName,
     );
 
+    // GH #748: agent DID subjects are lowercased per `canonicalAgentDidSubject`
+    // so the same wallet doesn't split into multiple RDF subjects (see
+    // `agentDid()` in packages/publisher/src/metadata.ts).
     const registration = await store.query(
       `ASK { GRAPH <${metaGraph}> {
         <${subGraphUri}> a <http://dkg.io/ontology/SubGraph> ;
           <http://schema.org/name> "code" ;
-          <http://dkg.io/ontology/createdBy> <did:dkg:agent:${publisherAddress}> .
+          <http://dkg.io/ontology/createdBy> <did:dkg:agent:${publisherAddress.toLowerCase()}> .
       } }`,
     );
     expect(registration.type).toBe('boolean');
@@ -222,5 +225,69 @@ describe('FinalizationHandler', () => {
     );
     expect(canonical.type).toBe('boolean');
     if (canonical.type === 'boolean') expect(canonical.value).toBe(true);
+  });
+
+  it('legacy publisher (no tag-15 on the wire) → no root dual-write, even when targetContextGraphId === local on-chain id (Codex r5b explicit-remap-to-self regression)', async () => {
+    // Codex r5b — pin the policy that the receiver-side rolling-upgrade
+    // fallback is gone. Earlier rounds tried to infer "same-graph
+    // publish" from `targetContextGraphId === local-on-chain-id-for(
+    // contextGraphId)`. That branch was unsound: a legacy publisher
+    // could have ALSO sent that exact wire shape via an
+    // explicit-remap-to-self publish (passing `subContextGraphId =
+    // ownCG.onChainId` to deliberately drop the root copy). Mirroring
+    // such a message into root re-exposes the KC under the source
+    // label and breaks data isolation.
+    //
+    // Construct a message that hits the exact ambiguity Codex flagged:
+    //   - keepRootCopyOnLabel is OMITTED on the wire (legacy publisher).
+    //   - targetContextGraphId === '42' which the resolver maps from
+    //     `contextGraphId`, so the dropped fallback WOULD have fired.
+    // Wire a `resolveContextGraphOnChainId` that returns the matching
+    // id so any future regression that re-introduces the inference
+    // shape would match against the resolver too. Drive promote
+    // directly with the wire-decoded message's `keepRootCopyOnLabel`
+    // (= undefined) and assert root stays empty even though the
+    // resolver returns a matching local id.
+    const localStore = new OxigraphStore();
+    const resolveCtxId = async (cgId: string) =>
+      cgId === CONTEXT_GRAPH ? '42' : null;
+    const localHandler = new FinalizationHandler(
+      localStore,
+      undefined,
+      undefined,
+      resolveCtxId,
+    );
+    const entity = 'urn:remap-to-self:entity';
+    const publisher = '0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266';
+    const cgRoot = `did:dkg:context-graph:${CONTEXT_GRAPH}`;
+    const cgPerCgId = `did:dkg:context-graph:${CONTEXT_GRAPH}/context/42`;
+
+    await (localHandler as any).promoteSharedMemoryToCanonical(
+      CONTEXT_GRAPH,
+      [{ subject: entity, predicate: 'http://schema.org/name', object: '"NoMirror"', graph: '' }],
+      'did:dkg:evm:31337/0xRTS/1',
+      [entity],
+      publisher,
+      '0x' + 'cd'.repeat(32),
+      777,
+      1n, 1n, 1n,
+      createOperationContext('system'),
+      '42',
+      undefined,
+      undefined,
+      undefined,
+    );
+
+    const rootBindings = await localStore.query(
+      `ASK { GRAPH <${cgRoot}> { <${entity}> <http://schema.org/name> "NoMirror" } }`,
+    );
+    expect(rootBindings.type).toBe('boolean');
+    if (rootBindings.type === 'boolean') expect(rootBindings.value).toBe(false);
+
+    const perCgBindings = await localStore.query(
+      `ASK { GRAPH <${cgPerCgId}> { <${entity}> <http://schema.org/name> "NoMirror" } }`,
+    );
+    expect(perCgBindings.type).toBe('boolean');
+    if (perCgBindings.type === 'boolean') expect(perCgBindings.value).toBe(true);
   });
 });

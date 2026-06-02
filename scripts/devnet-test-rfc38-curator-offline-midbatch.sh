@@ -90,13 +90,36 @@ parse_json() {
 # immediately and leaves the devnet with a missing node 5.
 # Register the trap once we know which node to restart. The cleanup
 # only fires AFTER we've actually stopped the curator (CURATOR_STOPPED=1).
+#
+# Codex PR #622 follow-up: `devnet.sh restart-node` returns after
+# SPAWNING the daemon, not after it's healthy. Without a readiness
+# wait here, a CI runner that chains another devnet scenario
+# immediately after this one would inherit a half-started devnet
+# (port still opening, auth.token not yet written, etc.). Poll
+# `/api/status` for up to 60s after restart so the trap leaves the
+# devnet usable, not just respawned.
 CURATOR_STOPPED=0
+wait_for_curator_ready() {
+  local port; port=$(node_port "$CURATOR_NODE")
+  for _ in $(seq 1 60); do
+    if curl -sf --max-time 2 "http://127.0.0.1:${port}/api/status" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
 restart_curator_if_stopped() {
   if [ "$CURATOR_STOPPED" -eq 1 ]; then
     local devnet_sh="$REPO_ROOT/scripts/devnet.sh"
     if [ -x "$devnet_sh" ]; then
       log "trap: restarting curator (node $CURATOR_NODE) so the devnet stays usable…"
       "$devnet_sh" restart-node "$CURATOR_NODE" >/dev/null 2>&1 || warn "trap: devnet.sh restart-node returned non-zero — please restart node $CURATOR_NODE manually"
+      if wait_for_curator_ready; then
+        log "trap: curator (node $CURATOR_NODE) is healthy again — devnet usable"
+      else
+        warn "trap: curator (node $CURATOR_NODE) did NOT become healthy within 60s — please verify manually"
+      fi
     fi
   fi
 }
@@ -137,7 +160,58 @@ for n in "$M1_NODE" "$M2_NODE"; do
 EOF
 )" >/dev/null || true
 done
-sleep 3
+
+# Codex PR #622 follow-up: don't just `sleep 3` and hope. The
+# non-curator publish in phase 5 requires M1 to know the CG's
+# `onChainId` (otherwise the publish bounces with "Context graph
+# ... is not registered on-chain"). Gossip latency for the
+# `ContextGraphCreated` event can exceed 3s, so wait explicitly
+# for M1's local store to agree with the curator's on-chain id
+# before SIGTERMing the curator. We use the standard listing
+# endpoint and grep — keeps this self-contained (no new daemon
+# surface required).
+# Wait until M1's local CG view reports the on-chain id (set via gossip
+# of ContextGraphCreated). Tuned to 60s (was 30s pre-rc.12) so a slower
+# devnet boot doesn't false-fail before the chain event reaches M1.
+#
+# IMPORTANT: there is no `GET /api/context-graph/<id>` route — daemons
+# expose `/api/context-graph/list`, which returns every CG the node knows
+# about with onChainId populated for the registered ones. Pre-fix this
+# helper polled the non-existent per-id GET endpoint, got a 404 every
+# iteration, and reliably false-failed on every run (the 30s vs 60s
+# debate was a red herring — neither value would have helped).
+ONCHAIN_WAIT_S="${RFC38_M1_ONCHAIN_WAIT_S:-60}"
+wait_for_m1_onchain_id() {
+  for _ in $(seq 1 "$ONCHAIN_WAIT_S"); do
+    local resp on_chain
+    resp=$(api_call "$M1_NODE" GET /api/context-graph/list 2>/dev/null || echo "")
+    on_chain=$(printf '%s' "$resp" | CG_ID="$CG_ID" node -e '
+      let d = "";
+      process.stdin.on("data", c => { d += c; });
+      process.stdin.on("end", () => {
+        try {
+          const j = JSON.parse(d);
+          const id = process.env.CG_ID;
+          const list = Array.isArray(j.contextGraphs) ? j.contextGraphs : [];
+          const hit = list.find(cg => cg && (cg.id === id || cg.uri === "did:dkg:context-graph:" + id));
+          const oc = hit && hit.onChainId;
+          if (oc != null && String(oc) !== "" && String(oc) !== "0") {
+            console.log(String(oc));
+          }
+        } catch {}
+      });
+    ' 2>/dev/null || echo "")
+    if [ -n "$on_chain" ]; then
+      log "✓ M1 sees onChainId=$on_chain — safe to take curator offline"
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+if ! wait_for_m1_onchain_id; then
+  fail "M1 never observed an onChainId for $CG_ID within ${ONCHAIN_WAIT_S}s — non-curator publish in phase 5 would fail with 'CG not registered on-chain' before the offline contract could be tested."
+fi
 
 # ===========================================================================
 act "2. Curator writes 4 triples; members catch up"
@@ -298,11 +372,11 @@ EOF
 log "M1 publish response: $PUB_RESP"
 STATUS=$(parse_json "$PUB_RESP" '.status')
 TX=$(parse_json    "$PUB_RESP" '.txHash')
-KC=$(parse_json    "$PUB_RESP" '.kcId')
+KC=$(parse_json    "$PUB_RESP" '.kaId')
 if [ "$STATUS" != "confirmed" ] || [ -z "$TX" ]; then
   fail "non-curator publish did NOT confirm on-chain (status=$STATUS, tx=$TX) — open-publishPolicy resilience contract BROKEN"
 fi
-log "✓ M1 published to VM without curator: kcId=$KC tx=$TX"
+log "✓ M1 published to VM without curator: kaId=$KC tx=$TX"
 
 # ===========================================================================
 act "6. Outsider verifies the published KC's merkleRoot exists on chain"
@@ -326,6 +400,6 @@ log "================================================================"
 log "  Curated CG:    $CG_ID  (onChainId=$ON_CHAIN_ID, publishPolicy=open)"
 log "  Triples in:    4 (curator-written, gossiped to members)"
 log "  Curator:       SIGTERMed before publish"
-log "  M1 published:  kcId=$KC tx=$TX merkleRoot=$MERKLE_ROOT"
+log "  M1 published:  kaId=$KC tx=$TX merkleRoot=$MERKLE_ROOT"
 log "  Outsider:      observed merkleRoot on chain"
 log "================================================================"

@@ -127,6 +127,7 @@ class EVMChainAdapter_V8_V9_Archive {
       endKAId,
       txHash: receipt.hash,
       blockNumber: receipt.blockNumber,
+      txIndex: receipt.index,
       blockTimestamp,
       publisherAddress,
       gasUsed,
@@ -182,6 +183,7 @@ class EVMChainAdapter_V8_V9_Archive {
     return {
       hash: receipt.hash,
       blockNumber: receipt.blockNumber,
+      txIndex: receipt.index,
       success: receipt.status === 1,
       publisherAddress: signer.address,
     };
@@ -218,6 +220,7 @@ class EVMChainAdapter_V8_V9_Archive {
     return {
       hash: receipt.hash,
       blockNumber: receipt.blockNumber,
+      txIndex: receipt.index,
       success: receipt.status === 1,
     };
   }
@@ -236,6 +239,7 @@ class EVMChainAdapter_V8_V9_Archive {
     return {
       hash: receipt.hash,
       blockNumber: receipt.blockNumber,
+      txIndex: receipt.index,
       success: receipt.status === 1,
     };
   }
@@ -313,6 +317,7 @@ class EVMChainAdapter_V8_V9_Archive {
     return {
       hash: receipt.hash,
       blockNumber: receipt.blockNumber,
+      txIndex: receipt.index,
       success: receipt.status === 1,
     };
   }
@@ -366,6 +371,7 @@ class EVMChainAdapter_V8_V9_Archive {
     return {
       hash: receipt.hash,
       blockNumber: receipt.blockNumber,
+      txIndex: receipt.index,
       success: receipt.status === 1,
       accountId,
     };
@@ -394,6 +400,7 @@ class EVMChainAdapter_V8_V9_Archive {
     return {
       hash: receipt.hash,
       blockNumber: receipt.blockNumber,
+      txIndex: receipt.index,
       success: receipt.status === 1,
     };
   }
@@ -410,6 +417,7 @@ class EVMChainAdapter_V8_V9_Archive {
     return {
       hash: receipt.hash,
       blockNumber: receipt.blockNumber,
+      txIndex: receipt.index,
       success: receipt.status === 1,
     };
   }
@@ -427,6 +435,7 @@ class EVMChainAdapter_V8_V9_Archive {
     return {
       hash: receipt.hash,
       blockNumber: receipt.blockNumber,
+      txIndex: receipt.index,
       success: receipt.status === 1,
     };
   }
@@ -549,6 +558,7 @@ class EVMChainAdapter_V8_V9_Archive {
       endKAId,
       txHash: receipt.hash,
       blockNumber: receipt.blockNumber,
+      txIndex: receipt.index,
       blockTimestamp,
       publisherAddress: publishSigner.address,
       gasUsed: receipt.gasUsed ? BigInt(receipt.gasUsed) : undefined,

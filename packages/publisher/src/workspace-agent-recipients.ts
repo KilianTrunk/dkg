@@ -75,14 +75,15 @@ async function getWorkspaceAccessMetadata(
   const cgMeta = contextGraphMetaUri(contextGraphId);
   const ontologyGraph = contextGraphDataUri(SYSTEM_CONTEXT_GRAPHS.ONTOLOGY);
   const swmGraph = contextGraphSharedMemoryUri(contextGraphId);
+  // Flattened UNION: Blazegraph rejects nested UnionNode inside a
+  // GRAPH block that is itself a UNION branch. Semantically identical
+  // rewrite with one GRAPH-per-branch instead of UNION-inside-GRAPH.
   const result = await store.query(
     `SELECT ?agent ?policy ?revoked WHERE {
       {
-        GRAPH <${cgMeta}> {
-          { <${cgData}> <${DKG_ONTOLOGY.DKG_ALLOWED_AGENT}> ?agent }
-          UNION
-          { <${cgData}> <${DKG_ONTOLOGY.DKG_PARTICIPANT_AGENT}> ?agent }
-        }
+        GRAPH <${cgMeta}> { <${cgData}> <${DKG_ONTOLOGY.DKG_ALLOWED_AGENT}> ?agent }
+      } UNION {
+        GRAPH <${cgMeta}> { <${cgData}> <${DKG_ONTOLOGY.DKG_PARTICIPANT_AGENT}> ?agent }
       } UNION {
         GRAPH <${cgMeta}> { <${cgData}> <${DKG_ONTOLOGY.DKG_REVOKED_AGENT}> ?revoked }
       } UNION {

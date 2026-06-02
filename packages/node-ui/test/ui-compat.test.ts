@@ -103,46 +103,57 @@ describe('header uses live status', () => {
   });
 });
 
-describe('clickable notifications', () => {
-  const header = readFileSync(resolve(UI_DIR, 'components', 'Shell', 'Header.tsx'), 'utf-8');
+// Notifications-pane redesign (B2): the dropdown was extracted out of
+// Header.tsx into NotificationsBell + NotificationsPane + rows, fed by the
+// useNotificationsFeed hook. These structural guards assert the extraction;
+// behavioral coverage (approve/deny, read model, states, a11y) lives in the
+// dedicated component tests + the QA matrix.
+describe('notifications pane extraction', () => {
+  const header = readFile('components/Shell/Header.tsx');
+  const bell = readFile('components/Shell/NotificationsBell.tsx');
+  const pane = readFile('components/Notifications/NotificationsPane.tsx');
+  const rows = readFile('components/Notifications/rows.tsx');
 
-  it('Header has notification bell with dropdown', () => {
-    expect(header).toContain('BELL_ICON');
-    expect(header).toContain('v10-header-notif-dropdown');
-    expect(header).toContain('setShowNotifs');
+  it('Header delegates notifications to <NotificationsBell/> (no inline dropdown)', () => {
+    expect(header).toContain('<NotificationsBell');
+    // The old inline dropdown internals must be gone from Header.
+    expect(header).not.toContain('v10-header-notif-dropdown');
+    expect(header).not.toContain('setShowNotifs');
+    expect(header).not.toContain('fetchNotifications');
   });
 
-  it('notifications are fetched and displayed', () => {
-    expect(header).toContain('fetchNotifications');
-    expect(header).toContain('setNotifications');
-    expect(header).toContain('v10-header-notif-item');
+  it('bell renders the unread badge and is a disclosure', () => {
+    expect(bell).toContain('v10-header-notif-badge');
+    expect(bell).toContain('feed.unread');
+    expect(bell).toContain('aria-haspopup');
+    expect(bell).toContain('aria-expanded');
   });
 
-  it('notification dropdown shows unread badge', () => {
-    expect(header).toContain('v10-header-notif-badge');
-    expect(header).toContain('unread');
+  it('bell closes on outside click and on Escape (restoring focus)', () => {
+    expect(bell).toContain('mousedown');
+    expect(bell).toContain("e.key === 'Escape'");
+    expect(bell).toContain('bellRef.current?.focus()');
   });
 
-  it('notification dropdown closes on outside click', () => {
-    expect(header).toContain('notifRef');
-    expect(header).toContain('setShowNotifs(false)');
-    expect(header).toContain('mousedown');
+  it('pane fetches via the scoped feed hook, not the legacy endpoint', () => {
+    expect(bell).toContain('useNotificationsFeed');
+    expect(pane).not.toContain('fetchNotifications(');
   });
 
-  it('notifications are marked as read when opened', () => {
-    expect(header).toContain('markNotificationsRead');
-    expect(header).toContain('setUnread(0)');
+  it('pane renders the two sections + empty/identity-pending/error states', () => {
+    expect(pane).toContain('Needs your action');
+    expect(pane).toContain('Activity');
+    expect(pane).toContain('You’re all caught up.');
+    expect(pane).toContain('Verifying access…');
+    expect(pane).toContain('Couldn’t load notifications.');
   });
 
-  it('notification items show message and timestamp', () => {
-    expect(header).toContain('n.message');
-    expect(header).toContain('n.ts');
-    expect(header).toContain('toLocaleTimeString');
-  });
-
-  it('empty state shown when no notifications', () => {
-    expect(header).toContain('No notifications');
-    expect(header).toContain('v10-header-notif-empty');
+  it('rows cover join request, activity digest, and confirmation kinds', () => {
+    expect(rows).toContain('JoinRequestRow');
+    expect(rows).toContain('ActivityDigestRow');
+    expect(rows).toContain('ConfirmationRow');
+    // Date-aware timestamp helper still drives row times (BUG-003).
+    expect(rows).toContain('formatNotificationTimestamp');
   });
 });
 
@@ -191,10 +202,14 @@ describe('right-rail agent shell replaces Agent Hub', () => {
 describe('backward-compatible URL redirects (V10 consolidation)', () => {
   const app = readFile('App.tsx');
 
-  for (const path of ['/agent', '/explorer', '/settings', '/messages', '/apps/*']) {
+  // BUG-018: `/settings` and `/observability` are now deep-linkable —
+  // they fall through to AppShell where `useShellRouting` opens the
+  // matching centre tab. The remaining stale routes (V9 surfaces with
+  // no V10 home) still hard-redirect.
+  for (const path of ['/agent', '/explorer', '/messages', '/apps/*']) {
     it(`redirects ${path} to /`, () => {
       expect(app).toContain(`path="${path}"`);
-      const pattern = new RegExp(`path="${path.replace('*', '\\*')}".*element=\\{<Navigate to="/"`);
+      const pattern = new RegExp(`path="${path.replaceAll('*', '\\*')}".*element=\\{<Navigate to="/"`);
       expect(app).toMatch(pattern);
     });
   }
@@ -202,6 +217,22 @@ describe('backward-compatible URL redirects (V10 consolidation)', () => {
   it('uses replace to avoid pushing redirect onto history', () => {
     const redirectSection = app.slice(app.indexOf('path="/agent"'), app.indexOf('path="*"'));
     expect(redirectSection).toContain('replace');
+  });
+
+  it('does NOT redirect /settings — it must open the Settings tab via the shell router (BUG-018)', () => {
+    expect(app).not.toMatch(/path="\/settings".*element=\{<Navigate to="\/"/);
+    expect(app).toContain('useShellRouting');
+  });
+
+  it('exposes /observability as a deep-linkable path (BUG-018)', () => {
+    // The mapping table now lives in `hooks/useShellRouting.ts`; the
+    // companion behavioural tests in `use-shell-routing.test.ts`
+    // exercise the deep-link / unmapped-tab reset semantics directly.
+    const shellRouting = readFileSync(
+      resolve(__dirname, '../src/ui/hooks/useShellRouting.ts'),
+      'utf-8',
+    );
+    expect(shellRouting).toContain("'/observability'");
   });
 });
 
@@ -241,21 +272,25 @@ describe('synced status logic', () => {
   });
 });
 
-describe('notification items are non-interactive until peer chat exists', () => {
-  const header = readFileSync(resolve(UI_DIR, 'components', 'Shell', 'Header.tsx'), 'utf-8');
+// Redesign reverses the old "notifications are non-interactive" guard:
+// incoming join requests are now actionable (inline Approve/Deny) and
+// activity/approved rows open their context graph. This guard asserts the
+// new intended interactivity lives in the row components.
+describe('notification rows are actionable', () => {
+  const rows = readFile('components/Notifications/rows.tsx');
 
-  it('does not add clickable class to notification items', () => {
-    expect(header).not.toContain("'clickable'");
+  it('join request row exposes inline Approve / Deny controls', () => {
+    expect(rows).toContain('Approve');
+    expect(rows).toContain('onApprove');
+    expect(rows).toContain('onDeny');
+    // Deny is a two-tap inline confirm, never a modal.
+    expect(rows).toContain('confirming-deny');
   });
 
-  it('does not set role=button on notification items', () => {
-    expect(header).not.toMatch(/role=\{.*'button'/);
-  });
-
-  it('renders notification text and timestamp', () => {
-    expect(header).toContain('v10-header-notif-item-text');
-    expect(header).toContain('v10-header-notif-item-time');
-    expect(header).toContain('toLocaleTimeString');
+  it('activity + approved rows open their context graph; rejected is a dead-end', () => {
+    expect(rows).toContain('onOpen(item.cgId)');
+    // Rejected confirmation renders as a non-interactive row.
+    expect(rows).toContain('aria-disabled="true"');
   });
 });
 
@@ -594,10 +629,10 @@ describe.skip('ProjectView as Memory Explorer', () => {
     expect(pv).toContain('isConversationTurn(e)) continue');
   });
 
-  it('has TrustStatusBox component showing Verified/Shared/Private label', () => {
+  it('has TrustStatusBox component showing Verifiable/Shared/Private label', () => {
     expect(pv).toContain('TrustStatusBox');
     expect(pv).toContain('TRUST_LABELS');
-    expect(pv).toContain("verified: 'Verified'");
+    expect(pv).toContain("verified: 'Verifiable'");
     expect(pv).toContain("shared: 'Shared'");
     expect(pv).toContain("working: 'Private'");
     expect(pv).toContain('v10-trust-status-box');

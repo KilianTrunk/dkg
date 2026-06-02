@@ -791,6 +791,24 @@ describe('DkgNodePlugin', () => {
     expectRequired('dkg_sub_graph_list', ['context_graph_id']);
     expectRequired('dkg_shared_memory_publish', ['context_graph_id']);
 
+    for (const name of [
+      'dkg_assertion_create',
+      'dkg_assertion_write',
+      'dkg_assertion_promote',
+      'dkg_assertion_discard',
+      'dkg_assertion_import_file',
+      'dkg_assertion_query',
+      'dkg_shared_memory_publish',
+      'dkg_share',
+      'dkg_sub_graph_create',
+    ]) {
+      const description = byName.get(name)!.parameters.properties.context_graph_id.description;
+      expect(description).toContain('dkg_list_context_graphs');
+      expect(description).toContain('local-notes');
+      expect(description).toContain('<curatorAddress>/<slug>');
+      expect(description).toContain('Do not guess');
+    }
+
     // dkg_shared_memory_publish must declare `sub_graph_name` so agents that
     // create/write/promote into a sub-graph can publish the promoted data
     // through the same sub-graph instead of hitting the root SWM graph.
@@ -848,6 +866,10 @@ describe('DkgNodePlugin', () => {
 
     const addParticipantTool = byName.get('dkg_participant_add')!;
     expect(addParticipantTool.description).toMatch(/allowlisting alone is not the full UI join flow/i);
+
+    const createIdDescription = byName.get('dkg_context_graph_create')!.parameters.properties.id.description;
+    expect(createIdDescription).toContain('create-only');
+    expect(createIdDescription).toContain('returned id');
   });
 
   // ---------------------------------------------------------------------------
@@ -1350,7 +1372,7 @@ describe('DkgNodePlugin', () => {
     });
 
     it('dkg_shared_memory_publish forwards snake_case → camelCase body with selection="all" when omitted', async () => {
-      const { fetchMock, byName } = setupPluginWithFetch({ kcId: 'kc-1', status: 'ok', kas: [] });
+      const { fetchMock, byName } = setupPluginWithFetch({ kaId: 'kc-1', status: 'ok', kas: [] });
       await byName.get('dkg_shared_memory_publish')!.execute('tc', { context_graph_id: 'ctx' });
       const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
       expect(url).toBe('http://localhost:9200/api/shared-memory/publish');
@@ -1360,7 +1382,7 @@ describe('DkgNodePlugin', () => {
     });
 
     it('dkg_shared_memory_publish forwards explicit root_entities as selection array with clearAfter=false (subset safety default)', async () => {
-      const { fetchMock, byName } = setupPluginWithFetch({ kcId: 'kc-2', status: 'ok', kas: [] });
+      const { fetchMock, byName } = setupPluginWithFetch({ kaId: 'kc-2', status: 'ok', kas: [] });
       await byName.get('dkg_shared_memory_publish')!.execute('tc', {
         context_graph_id: 'ctx',
         root_entities: ['urn:a', 'urn:b'],
@@ -1372,7 +1394,7 @@ describe('DkgNodePlugin', () => {
     });
 
     it('dkg_shared_memory_publish plumbs sub_graph_name through to subGraphName for sub-graph-scoped publishes', async () => {
-      const { fetchMock, byName } = setupPluginWithFetch({ kcId: 'kc-5', status: 'ok', kas: [] });
+      const { fetchMock, byName } = setupPluginWithFetch({ kaId: 'kc-5', status: 'ok', kas: [] });
       await byName.get('dkg_shared_memory_publish')!.execute('tc', {
         context_graph_id: 'ctx',
         sub_graph_name: 'protocols',
@@ -1392,7 +1414,7 @@ describe('DkgNodePlugin', () => {
             headers: { 'Content-Type': 'application/json' },
           });
         }
-        return new Response(JSON.stringify({ kcId: 'kc-7', status: 'ok', kas: [] }), {
+        return new Response(JSON.stringify({ kaId: 'kc-7', status: 'ok', kas: [] }), {
           status: 200,
           headers: { 'Content-Type': 'application/json' },
         });
@@ -1425,7 +1447,7 @@ describe('DkgNodePlugin', () => {
       expect(fetchMock.mock.calls[1]?.[0]).toBe('http://localhost:9200/api/shared-memory/publish');
       const body = JSON.parse(result.content[0].text);
       expect(body.registration).toEqual({ registered: 'ctx', onChainId: '42', txHash: '0xabc' });
-      expect(body.kcId).toBe('kc-7');
+      expect(body.kaId).toBe('kc-7');
     });
 
     it('dkg_shared_memory_publish ignores already-registered conflicts and still publishes', async () => {
@@ -1436,7 +1458,7 @@ describe('DkgNodePlugin', () => {
             headers: { 'Content-Type': 'application/json' },
           });
         }
-        return new Response(JSON.stringify({ kcId: 'kc-8', status: 'ok', kas: [] }), {
+        return new Response(JSON.stringify({ kaId: 'kc-8', status: 'ok', kas: [] }), {
           status: 200,
           headers: { 'Content-Type': 'application/json' },
         });
@@ -1461,7 +1483,7 @@ describe('DkgNodePlugin', () => {
       expect(fetchMock).toHaveBeenCalledTimes(2);
       const body = JSON.parse(result.content[0].text);
       expect(body.registration).toBeUndefined();
-      expect(body.kcId).toBe('kc-8');
+      expect(body.kaId).toBe('kc-8');
     });
 
     it('dkg_shared_memory_publish validates register_if_needed and registration options locally', async () => {

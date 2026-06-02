@@ -240,15 +240,10 @@ import {
   getCurrentCliVersion,
   type NpmVersionStatus,
   checkForNpmVersionUpdate,
-  checkForNewCommit,
-  checkForNewCommitWithStatus,
   type UpdateStatus,
   acquireUpdateLock,
   releaseUpdateLock,
-  performUpdate,
-  performUpdateWithStatus,
   performNpmUpdate,
-  checkForUpdate,
 } from '../auto-update.js';
 import {
   OPENCLAW_UI_CONNECT_TIMEOUT_MS,
@@ -409,6 +404,7 @@ export async function handleQueryRoutes(ctx: RequestContext): Promise<void> {
     const graphSuffix = parsed.graphSuffix;
     const includeSharedMemory =
       parsed.includeSharedMemory ?? parsed.includeWorkspace;
+    const includeContextGraphPartitions = parsed.includeContextGraphPartitions === true;
     const view = parsed.view;
     const agentAddress = parsed.agentAddress;
     // the
@@ -589,6 +585,7 @@ export async function handleQueryRoutes(ctx: RequestContext): Promise<void> {
         contextGraphId,
         graphSuffix,
         includeSharedMemory,
+        includeContextGraphPartitions,
         view,
         agentAddress,
         verifiedGraph,
@@ -625,6 +622,7 @@ export async function handleQueryRoutes(ctx: RequestContext): Promise<void> {
         msg.includes("agentAddress is required") ||
         msg.includes("requires a contextGraphId") ||
         msg.includes("cannot be combined with") ||
+        msg.startsWith("Scoped query violation:") ||
         // A-1 review: DKGAgent.query throws these when the caller sends
         // a non-string `agentAddress` / `callerAgentAddress` in the
         // body. Classify as 400 so malformed input is a clean client

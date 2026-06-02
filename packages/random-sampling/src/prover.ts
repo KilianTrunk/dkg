@@ -32,7 +32,12 @@ import {
   KCDataMissingError,
   KCNotFoundError,
   KCRootEntitiesNotFoundError,
-} from './kc-extractor.js';
+} from './ka-extractor.js';
+import {
+  extractCiphertextChunksFromStore,
+  CiphertextChunksMissingError,
+  CiphertextChunksMalformedError,
+} from './ciphertext-chunks-extractor.js';
 import type { ProofBuilder } from './proof-builder.js';
 import { InProcessProofBuilder } from './proof-builder.js';
 import {
@@ -57,16 +62,16 @@ export type TickOutcome =
   | { kind: 'period-closed' }
   | { kind: 'no-challenge'; reason: 'no-eligible-cg' | 'no-eligible-kc' }
   | { kind: 'already-solved' }
-  | { kind: 'cg-not-found'; kcId: bigint }
-  | { kind: 'kc-not-synced'; kcId: bigint; cgId: bigint }
+  | { kind: 'cg-not-found'; kaId: bigint }
+  | { kind: 'kc-not-synced'; kaId: bigint; cgId: bigint }
   | {
       kind: 'data-corrupted';
-      kcId: bigint;
+      kaId: bigint;
       cgId: bigint;
       reason: 'root-mismatch' | 'leaf-count-mismatch' | 'meta-graph-bug';
     }
   | { kind: 'submit-stale' }
-  | { kind: 'submitted'; txHash: string; kcId: bigint; cgId: bigint; chunkId: bigint }
+  | { kind: 'submitted'; txHash: string; kaId: bigint; cgId: bigint; chunkId: bigint }
   | { kind: 'error'; error: Error };
 
 export interface RandomSamplingProverDeps {
@@ -78,7 +83,71 @@ export interface RandomSamplingProverDeps {
   wal?: ProverWal;
   /** Hook for observability / structured logs. Default = no-op. */
   log?: ProverLogger;
+  /**
+   * OT-RFC-39 — optional late-join auto-backfill for curated KCs. When set,
+   * the prover invokes this hook on a `CiphertextChunksMissingError` to ask
+   * the host (typically `dkg-agent`) to fetch the missing chunks from
+   * authorized peers via `PROTOCOL_GET_CIPHERTEXT_CHUNK`, then retries the
+   * extract exactly once. When unset (or the hook reports zero fetched
+   * chunks), the tick falls back to the historical `kc-not-synced` outcome.
+   *
+   * Owner-side concerns the hook MUST take care of:
+   *   - resolving `cgId` (numeric on-chain) to the contextGraphId string the
+   *     remote responder will accept for authorization (cleartext or wire
+   *     form — both work, since `handleGetCiphertextChunk` resolves
+   *     authority from on-chain participants / beacon / agent-gate);
+   *   - peer discovery (gossip subscribers of the workspace topic is the
+   *     pragmatic default — every authorized host is subscribed there);
+   *   - signing + transport (`fetchCiphertextChunkFromPeer` already does
+   *     both end-to-end);
+   *   - persistence (the hook is expected to set `persist: true` so the
+   *     retry extract finds the chunks in the local store).
+   */
+  ciphertextChunkBackfill?: CiphertextChunkBackfillFn;
+  /**
+   * Codex review on PR #715 — canonical CG-id resolver for the
+   * ciphertext-chunks named graph. Given a numeric on-chain `cgId`,
+   * returns the curator-committed `nameHash` (wire form, lowercase
+   * 0x-prefixed 32-byte hex) the agent uses when persisting chunks
+   * to `ciphertextChunkStoreGraph(canonical)`. The prover passes the
+   * result through to the extractor so its SPARQL lookup pins the
+   * correct per-CG named graph instead of scanning `GRAPH ?g`, which
+   * eliminates the multi-CG identical-KC collision the bot called
+   * out on `ciphertext-chunk-store.ts:73`.
+   *
+   * Return `null` when the local node doesn't have the CG metadata
+   * yet — the extractor will fall back to wildcard scanning for that
+   * tick (preserves correctness for the single-tenant common case,
+   * sacrifices the cross-CG isolation guard only when the local
+   * mapping hasn't caught up).
+   */
+  canonicalCgIdForChunkStore?: (cgId: bigint) => string | null;
 }
+
+export interface CiphertextChunkBackfillRequest {
+  cgId: bigint;
+  /** 32-byte V10 KC plaintext merkleRoot — doubles as the curated batchId. */
+  batchId: Uint8Array;
+  /** Indexes the local store is missing. Length > 0. */
+  missingIndexes: number[];
+}
+
+export interface CiphertextChunkBackfillResult {
+  /** Number of chunks successfully persisted to the local store. */
+  fetched: number;
+  /** Number of chunks still missing after the hook ran. */
+  failures: number;
+  /**
+   * Optional short reason for the operator log when nothing was fetched
+   * (e.g. `no-peers`, `unknown-cg`, `all-denied`). Free-form; not load
+   * bearing for control flow.
+   */
+  reason?: string;
+}
+
+export type CiphertextChunkBackfillFn = (
+  req: CiphertextChunkBackfillRequest,
+) => Promise<CiphertextChunkBackfillResult>;
 
 export interface ProverLogger {
   info(event: string, fields: Record<string, unknown>): void;
@@ -108,6 +177,8 @@ export class RandomSamplingProver {
   private readonly builder: ProofBuilder;
   private readonly wal: ProverWal;
   private readonly log: ProverLogger;
+  private readonly ciphertextChunkBackfill?: CiphertextChunkBackfillFn;
+  private readonly canonicalCgIdForChunkStore?: (cgId: bigint) => string | null;
   private inflight: Promise<TickOutcome> | null = null;
 
   constructor(deps: RandomSamplingProverDeps) {
@@ -117,6 +188,8 @@ export class RandomSamplingProver {
     this.builder = deps.builder ?? new InProcessProofBuilder();
     this.wal = deps.wal ?? new InMemoryProverWal();
     this.log = deps.log ?? noopLog;
+    this.ciphertextChunkBackfill = deps.ciphertextChunkBackfill;
+    this.canonicalCgIdForChunkStore = deps.canonicalCgIdForChunkStore;
   }
 
   /** Single-flight tick. Concurrent callers await the same result. */
@@ -190,7 +263,7 @@ export class RandomSamplingProver {
       !this.chain.getNodeChallenge ||
       !this.chain.getLatestMerkleRoot ||
       !this.chain.getMerkleLeafCount ||
-      !this.chain.getKCContextGraphId
+      !this.chain.getKAContextGraphId
     ) {
       throw new Error(
         'RandomSamplingProver: chain adapter missing required RandomSampling / KC view methods',
@@ -287,7 +360,7 @@ export class RandomSamplingProver {
     }
     if (existingIsCurrent && !existing.solved && !unsolvedStale) {
       challenge = existing;
-      cgId = await this.chain.getKCContextGraphId(challenge.knowledgeCollectionId);
+      cgId = await this.chain.getKAContextGraphId(challenge.knowledgeAssetId);
     } else {
       try {
         const created = await this.chain.createChallenge();
@@ -308,77 +381,232 @@ export class RandomSamplingProver {
 
     periodKey.epoch = challenge.epoch;
     periodKey.periodStartBlock = challenge.activeProofPeriodStartBlock;
-    const kcId = challenge.knowledgeCollectionId;
+    const kaId = challenge.knowledgeAssetId;
     const chunkId = challenge.chunkId;
 
     await this.wal.append(
       makeWalEntry(periodKey, 'challenge', {
-        kcId: kcId.toString(),
+        kaId: kaId.toString(),
         cgId: cgId.toString(),
         chunkId: chunkId.toString(),
       }),
     );
 
     if (cgId === 0n) {
-      this.log.warn('rs.tick.cg-not-found', { kcId: kcId.toString() });
+      this.log.warn('rs.tick.cg-not-found', { kaId: kaId.toString() });
       await this.wal.append(
         makeWalEntry(periodKey, 'failed', {
-          kcId: kcId.toString(),
-          error: { code: 'cg-not-found', message: 'getKCContextGraphId returned 0' },
+          kaId: kaId.toString(),
+          error: { code: 'cg-not-found', message: 'getKAContextGraphId returned 0' },
         }),
       );
-      return { kind: 'cg-not-found', kcId };
+      return { kind: 'cg-not-found', kaId };
     }
 
-    const expectedRoot = await this.chain.getLatestMerkleRoot(kcId);
-    const expectedLeafCount = await this.chain.getMerkleLeafCount(kcId);
+    // OT-RFC-39 — pick the V10 substrate the challenge was drawn against.
+    // The on-chain picker (`_pickWeightedChallenge`) reads
+    // `getCiphertextChunkCount` for curated KCs and `getMerkleLeafCount`
+    // for public KCs; the prover MUST mirror that choice or the
+    // root recomputation diverges 100% of the time. Curation status is
+    // sourced from the chain (one extra `getAccessPolicy` view call) —
+    // the local triple store is not authoritative for CGs the node
+    // didn't create or join.
+    let isCurated = false;
+    if (typeof this.chain.getContextGraphAccessPolicy === 'function') {
+      try {
+        const policy = await this.chain.getContextGraphAccessPolicy(cgId);
+        isCurated = policy === 1;
+      } catch (err) {
+        this.log.warn('rs.tick.curation-probe-failed', {
+          cgId: cgId.toString(),
+          err: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    const expectedRoot = isCurated
+      ? await this.chain.getLatestCiphertextChunksRoot!(kaId)
+      : await this.chain.getLatestMerkleRoot(kaId);
+    const expectedLeafCount = isCurated
+      ? await this.chain.getCiphertextChunkCount!(kaId)
+      : await this.chain.getMerkleLeafCount(kaId);
 
     let leaves: Uint8Array[];
-    try {
-      const extracted = await extractV10KCFromStore(this.store, cgId, kcId);
-      leaves = extracted.leaves;
-    } catch (err) {
-      if (err instanceof KCNotFoundError || err instanceof KCDataMissingError) {
-        this.log.warn('rs.tick.kc-not-synced', {
-          kcId: kcId.toString(),
-          cgId: cgId.toString(),
-          err: (err as Error).name,
-        });
-        await this.wal.append(
-          makeWalEntry(periodKey, 'failed', {
-            kcId: kcId.toString(),
-            cgId: cgId.toString(),
-            chunkId: chunkId.toString(),
-            error: {
-              code: (err as Error).name,
-              message: (err as Error).message.slice(0, 200),
-            },
-          }),
-        );
-        return { kind: 'kc-not-synced', kcId, cgId };
+    let proofKind: 'flat-kc' | 'ciphertext-chunks';
+    if (isCurated) {
+      proofKind = 'ciphertext-chunks';
+      // batchId for the curated chunk store IS the V10 KC plaintext
+      // merkleRoot — that's how the publisher deterministically derives
+      // per-chunk AEAD nonces and how the agent's
+      // `ingestSwmCiphertextChunkEnvelope` keys persisted chunks.
+      // Read it from chain on the public-merkleRoot slot (still present
+      // even on curated KCs; LU-11 added a parallel ciphertext slot,
+      // not a replacement of the plaintext one).
+      const batchId = await this.chain.getLatestMerkleRoot(kaId);
+      // Two-attempt extract loop: the first attempt reads whatever the
+      // local store already holds. If chunks are missing AND the host
+      // wired a backfill hook (OT-RFC-39 late-join sync), we ask it to
+      // pull the missing indexes from authorized peers via
+      // `PROTOCOL_GET_CIPHERTEXT_CHUNK`, then retry the extract exactly
+      // once. The cap is intentional: a single tick must not block on an
+      // unbounded peer fan-out, and the prover loop re-ticks every 30s
+      // anyway — repeated misses keep retrying naturally without
+      // burning the worker thread on a single period.
+      let curatedExtracted: { chunks: Uint8Array[] } | null = null;
+      const cgIdCanonicalForChunks = this.canonicalCgIdForChunkStore?.(cgId) ?? undefined;
+      for (let attempt = 0; attempt < 2 && !curatedExtracted; attempt++) {
+        try {
+          curatedExtracted = await extractCiphertextChunksFromStore({
+            store: this.store,
+            contextGraphId: cgId,
+            kaId,
+            batchId,
+            expectedCount: expectedLeafCount,
+            contextGraphIdCanonical: cgIdCanonicalForChunks,
+          });
+        } catch (err) {
+          if (err instanceof CiphertextChunksMissingError) {
+            if (attempt === 0 && this.ciphertextChunkBackfill) {
+              this.log.warn('rs.tick.chunk-backfill-start', {
+                kaId: kaId.toString(),
+                cgId: cgId.toString(),
+                missingCount: err.missingChunkIndexes.length,
+                expectedCount: err.expectedCount,
+              });
+              let backfill: CiphertextChunkBackfillResult;
+              try {
+                backfill = await this.ciphertextChunkBackfill({
+                  cgId,
+                  batchId,
+                  missingIndexes: err.missingChunkIndexes,
+                });
+              } catch (hookErr) {
+                this.log.warn('rs.tick.chunk-backfill-error', {
+                  kaId: kaId.toString(),
+                  cgId: cgId.toString(),
+                  err: hookErr instanceof Error ? hookErr.message.slice(0, 200) : String(hookErr).slice(0, 200),
+                });
+                backfill = { fetched: 0, failures: err.missingChunkIndexes.length, reason: 'hook-threw' };
+              }
+              this.log.info('rs.tick.chunk-backfill-result', {
+                kaId: kaId.toString(),
+                cgId: cgId.toString(),
+                fetched: backfill.fetched,
+                failures: backfill.failures,
+                ...(backfill.reason ? { reason: backfill.reason } : {}),
+              });
+              if (backfill.fetched > 0) {
+                // Retry extract — at least one chunk was newly persisted.
+                continue;
+              }
+              // Zero progress → fall through to the kc-not-synced branch
+              // (no point retrying an extract that just failed for the
+              // same reason).
+            }
+            // `backfillAttempted` is true iff we entered the inline backfill
+            // branch and it failed to make progress. When the hook isn't
+            // wired (no host-side support), or when we hit the second
+            // attempt's miss after a partial backfill that closed some but
+            // not all gaps, both surface as `false`/`true` respectively so
+            // operators can grep `kc-not-synced backfillAttempted=true` to
+            // find legitimate replication failures (vs. unwired-hook
+            // misses, which read as `backfillAttempted=false`).
+            const backfillAttempted = attempt > 0;
+            this.log.warn('rs.tick.kc-not-synced', {
+              kaId: kaId.toString(),
+              cgId: cgId.toString(),
+              periodStart: periodKey.periodStartBlock.toString(),
+              err: err.name,
+              missingCount: err.missingChunkIndexes.length,
+              expectedCount: err.expectedCount,
+              backfillAttempted,
+            });
+            await this.wal.append(
+              makeWalEntry(periodKey, 'failed', {
+                kaId: kaId.toString(),
+                cgId: cgId.toString(),
+                chunkId: chunkId.toString(),
+                error: {
+                  code: err.name,
+                  message: err.message.slice(0, 200),
+                },
+              }),
+            );
+            return { kind: 'kc-not-synced', kaId, cgId };
+          }
+          if (err instanceof CiphertextChunksMalformedError) {
+            this.log.error('rs.tick.data-corrupted', {
+              kaId: kaId.toString(),
+              cgId: cgId.toString(),
+              periodStart: periodKey.periodStartBlock.toString(),
+              reason: 'ciphertext-chunk-malformed',
+              chunkIndex: err.chunkIndex,
+            });
+            await this.wal.append(
+              makeWalEntry(periodKey, 'failed', {
+                kaId: kaId.toString(),
+                cgId: cgId.toString(),
+                chunkId: chunkId.toString(),
+                error: { code: err.name, message: err.message.slice(0, 200) },
+              }),
+            );
+            return { kind: 'data-corrupted', kaId, cgId, reason: 'meta-graph-bug' };
+          }
+          throw err;
+        }
       }
-      if (err instanceof KCRootEntitiesNotFoundError) {
-        this.log.error('rs.tick.meta-graph-bug', {
-          kcId: kcId.toString(),
-          cgId: cgId.toString(),
-          ual: err.ual,
-        });
-        await this.wal.append(
-          makeWalEntry(periodKey, 'failed', {
-            kcId: kcId.toString(),
+      // Loop invariant: either `curatedExtracted` is set, or we returned
+      // a terminal outcome from inside the catch. The `!` reflects that.
+      leaves = curatedExtracted!.chunks;
+    } else {
+      proofKind = 'flat-kc';
+      try {
+        const extracted = await extractV10KCFromStore(this.store, cgId, kaId);
+        leaves = extracted.leaves;
+      } catch (err) {
+        if (err instanceof KCNotFoundError || err instanceof KCDataMissingError) {
+          this.log.warn('rs.tick.kc-not-synced', {
+            kaId: kaId.toString(),
             cgId: cgId.toString(),
-            chunkId: chunkId.toString(),
-            error: { code: 'KCRootEntitiesNotFoundError', message: err.message.slice(0, 200) },
-          }),
-        );
-        return { kind: 'data-corrupted', kcId, cgId, reason: 'meta-graph-bug' };
+            periodStart: periodKey.periodStartBlock.toString(),
+            err: (err as Error).name,
+          });
+          await this.wal.append(
+            makeWalEntry(periodKey, 'failed', {
+              kaId: kaId.toString(),
+              cgId: cgId.toString(),
+              chunkId: chunkId.toString(),
+              error: {
+                code: (err as Error).name,
+                message: (err as Error).message.slice(0, 200),
+              },
+            }),
+          );
+          return { kind: 'kc-not-synced', kaId, cgId };
+        }
+        if (err instanceof KCRootEntitiesNotFoundError) {
+          this.log.error('rs.tick.meta-graph-bug', {
+            kaId: kaId.toString(),
+            cgId: cgId.toString(),
+            ual: err.ual,
+          });
+          await this.wal.append(
+            makeWalEntry(periodKey, 'failed', {
+              kaId: kaId.toString(),
+              cgId: cgId.toString(),
+              chunkId: chunkId.toString(),
+              error: { code: 'KCRootEntitiesNotFoundError', message: err.message.slice(0, 200) },
+            }),
+          );
+          return { kind: 'data-corrupted', kaId, cgId, reason: 'meta-graph-bug' };
+        }
+        throw err;
       }
-      throw err;
     }
 
     await this.wal.append(
       makeWalEntry(periodKey, 'extracted', {
-        kcId: kcId.toString(),
+        kaId: kaId.toString(),
         cgId: cgId.toString(),
         chunkId: chunkId.toString(),
       }),
@@ -390,14 +618,16 @@ export class RandomSamplingProver {
         leaves,
         chunkId: Number(chunkId),
         expected: { merkleRoot: expectedRoot, merkleLeafCount: expectedLeafCount },
+        kind: proofKind,
       });
     } catch (err) {
       const reason = mapBuilderError(err);
       if (reason) {
         const e = err as any;
         this.log.error('rs.tick.data-corrupted', {
-          kcId: kcId.toString(),
+          kaId: kaId.toString(),
           cgId: cgId.toString(),
+          periodStart: periodKey.periodStartBlock.toString(),
           reason,
           err: (err as Error).name,
           ...(typeof e?.computedLeafCount === 'number' ? { computedLeafCount: e.computedLeafCount } : {}),
@@ -409,20 +639,20 @@ export class RandomSamplingProver {
         });
         await this.wal.append(
           makeWalEntry(periodKey, 'failed', {
-            kcId: kcId.toString(),
+            kaId: kaId.toString(),
             cgId: cgId.toString(),
             chunkId: chunkId.toString(),
             error: { code: (err as Error).name, message: (err as Error).message.slice(0, 200) },
           }),
         );
-        return { kind: 'data-corrupted', kcId, cgId, reason };
+        return { kind: 'data-corrupted', kaId, cgId, reason };
       }
       throw err;
     }
 
     await this.wal.append(
       makeWalEntry(periodKey, 'built', {
-        kcId: kcId.toString(),
+        kaId: kaId.toString(),
         cgId: cgId.toString(),
         chunkId: chunkId.toString(),
       }),
@@ -434,12 +664,13 @@ export class RandomSamplingProver {
     } catch (err) {
       if (err instanceof ChallengeNoLongerActiveError) {
         this.log.warn('rs.tick.submit-stale', {
-          kcId: kcId.toString(),
+          kaId: kaId.toString(),
           cgId: cgId.toString(),
+          periodStart: periodKey.periodStartBlock.toString(),
         });
         await this.wal.append(
           makeWalEntry(periodKey, 'failed', {
-            kcId: kcId.toString(),
+            kaId: kaId.toString(),
             cgId: cgId.toString(),
             chunkId: chunkId.toString(),
             error: { code: 'ChallengeNoLongerActive', message: err.message.slice(0, 200) },
@@ -453,37 +684,39 @@ export class RandomSamplingProver {
         // either (a) a race against an UPDATE that flipped the root,
         // or (b) a bug. Drop the period; rebuild on the next.
         this.log.error('rs.tick.chain-root-mismatch', {
-          kcId: kcId.toString(),
+          kaId: kaId.toString(),
           cgId: cgId.toString(),
+          periodStart: periodKey.periodStartBlock.toString(),
         });
         await this.wal.append(
           makeWalEntry(periodKey, 'failed', {
-            kcId: kcId.toString(),
+            kaId: kaId.toString(),
             cgId: cgId.toString(),
             chunkId: chunkId.toString(),
             error: { code: 'MerkleRootMismatch', message: err.message.slice(0, 200) },
           }),
         );
-        return { kind: 'data-corrupted', kcId, cgId, reason: 'root-mismatch' };
+        return { kind: 'data-corrupted', kaId, cgId, reason: 'root-mismatch' };
       }
       throw err;
     }
 
     await this.wal.append(
       makeWalEntry(periodKey, 'submitted', {
-        kcId: kcId.toString(),
+        kaId: kaId.toString(),
         cgId: cgId.toString(),
         chunkId: chunkId.toString(),
         txHash: txResult.hash,
       }),
     );
     this.log.info('rs.tick.submitted', {
-      kcId: kcId.toString(),
+      kaId: kaId.toString(),
       cgId: cgId.toString(),
       chunkId: chunkId.toString(),
+      periodStart: periodKey.periodStartBlock.toString(),
       txHash: txResult.hash,
     });
-    return { kind: 'submitted', txHash: txResult.hash, kcId, cgId, chunkId };
+    return { kind: 'submitted', txHash: txResult.hash, kaId, cgId, chunkId };
   }
 }
 

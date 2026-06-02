@@ -105,6 +105,119 @@ export const DEFAULT_RELAY_RESERVATION_COUNT = 3;
 export const MAX_RELAY_RESERVATION_COUNT = 16;
 
 /**
+ * Permissive validator for the small / sparse-network tunables
+ * (`peerStoreMaxAddressAgeMs`, `peerStoreMaxPeerAgeMs`,
+ * `dhtQuerySelfIntervalMs`). Returns the
+ * value when it is a positive finite integer; returns `undefined`
+ * otherwise so callers can fall through to the upstream default
+ * silently. Unlike `validateRelayServerCapacity` these knobs are
+ * passed straight to libp2p / kad-DHT code that already validates
+ * its own input — we just defend against the obviously-wrong values
+ * (0, negative, NaN, fractional, non-numeric) without taking on a
+ * warning surface.
+ */
+export function isFinitePositiveInteger(input: unknown): input is number {
+  return (
+    typeof input === 'number' &&
+    Number.isFinite(input) &&
+    Number.isInteger(input) &&
+    input > 0
+  );
+}
+
+/**
+ * The three small / sparse-network tunables we forward end-to-end
+ * (`DkgConfig.network` → `DKGAgentConfig` → `DKGNodeConfig` →
+ * `createLibp2p` / `kadDHT`). Centralising the field list as a single
+ * named type means the forwarding hops cannot drift — `pickNetworkTunables`
+ * below is the one chokepoint they all travel through, and its return
+ * type is pinned to this interface so a missing / typo'd field in any
+ * forwarder fails at compile time. Codex review of PR #698 round 3.
+ */
+export interface NetworkTunables {
+  peerStoreMaxAddressAgeMs?: number;
+  peerStoreMaxPeerAgeMs?: number;
+  dhtQuerySelfIntervalMs?: number;
+}
+
+/**
+ * Forward exactly the three operator-tunable network fields. Used at
+ * every hop along `DkgConfig.network` → `DKGAgentConfig` →
+ * `DKGNodeConfig`, so the mapping (and any future addition to
+ * `NetworkTunables`) lives in exactly one place.
+ *
+ * The explicit field-by-field assignment is intentional: it guarantees
+ * (via the `NetworkTunables` return type) that a typo at any caller
+ * would fail to compile, and the value-preserving test in
+ * `libp2p-tunables-wiring.test.ts` catches copy-paste-cross bugs
+ * (e.g. wiring `peerStoreMaxAddressAgeMs ← source.peerStoreMaxPeerAgeMs`).
+ * Round-2 tests fence the lowest layer (`buildPeerStoreOverrides` /
+ * `buildKadDHTOptions`); this helper + its test fence the two
+ * forwarding hops above that. Codex review of PR #698 round 3.
+ */
+export function pickNetworkTunables(
+  source: Partial<NetworkTunables>,
+): NetworkTunables {
+  return {
+    peerStoreMaxAddressAgeMs: source.peerStoreMaxAddressAgeMs,
+    peerStoreMaxPeerAgeMs: source.peerStoreMaxPeerAgeMs,
+    dhtQuerySelfIntervalMs: source.dhtQuerySelfIntervalMs,
+  };
+}
+
+/**
+ * Pure builder for the libp2p `peerStore` overrides we forward into
+ * `createLibp2p`. Returns `undefined` when no operator field is valid
+ * (the canonical signal for "omit the option block entirely so libp2p
+ * keeps every upstream default"), otherwise returns an object whose
+ * shape mirrors `@libp2p/peer-store`'s `PersistentPeerStoreInit`.
+ *
+ * Extracted from `DKGNode.start()` so a regression test can assert the
+ * wiring without having to spin up a real libp2p node — Codex review
+ * of PR #698 round 2 flagged that the previous test suite only
+ * verified JSON persistence, so a typo in `maxAddressAge` /
+ * `maxPeerAge` would ship as a silent no-op while the existing tests
+ * still passed.
+ */
+export function buildPeerStoreOverrides(
+  config: Pick<DKGNodeConfig, 'peerStoreMaxAddressAgeMs' | 'peerStoreMaxPeerAgeMs'>,
+): { maxAddressAge?: number; maxPeerAge?: number } | undefined {
+  const maxAddressAge = isFinitePositiveInteger(config.peerStoreMaxAddressAgeMs)
+    ? config.peerStoreMaxAddressAgeMs
+    : undefined;
+  const maxPeerAge = isFinitePositiveInteger(config.peerStoreMaxPeerAgeMs)
+    ? config.peerStoreMaxPeerAgeMs
+    : undefined;
+  if (maxAddressAge === undefined && maxPeerAge === undefined) return undefined;
+  const out: { maxAddressAge?: number; maxPeerAge?: number } = {};
+  if (maxAddressAge !== undefined) out.maxAddressAge = maxAddressAge;
+  if (maxPeerAge !== undefined) out.maxPeerAge = maxPeerAge;
+  return out;
+}
+
+/**
+ * Pure builder for the `kadDHT()` init object. Always includes the
+ * `protocol` (the daemon never wants the upstream default protocol
+ * string); adds `querySelfInterval` only when operator config supplies
+ * a positive finite integer.
+ *
+ * Extracted so the wiring is unit-testable without spinning up a real
+ * libp2p — Codex review of PR #698 round 2 flagged the same silent-
+ * no-op risk as `buildPeerStoreOverrides` above.
+ */
+export function buildKadDHTOptions(
+  config: Pick<DKGNodeConfig, 'dhtQuerySelfIntervalMs'>,
+  protocol: string,
+): { protocol: string; querySelfInterval?: number } {
+  const querySelfInterval = isFinitePositiveInteger(config.dhtQuerySelfIntervalMs)
+    ? config.dhtQuerySelfIntervalMs
+    : undefined;
+  return querySelfInterval !== undefined
+    ? { protocol, querySelfInterval }
+    : { protocol };
+}
+
+/**
  * Validate an operator-supplied `relayReservationCount`. Same shape +
  * defensive surface as `validateRelayServerCapacity` (rejects 0,
  * negatives, NaN, Infinity, fractional, non-numbers). Additionally
@@ -405,6 +518,34 @@ export class DKGNode {
    * the config.
    */
   private relayCapacity: number | null = null;
+  /**
+   * AbortController whose signal is wired into long-await sites
+   * (currently: `ProtocolRouter.readAll` via `stopSignal` below). PR-6:
+   * `stop()` aborts this controller as its FIRST action, before
+   * `libp2p.stop()`, so any in-flight stream read can bail out
+   * immediately rather than wedge on a silent peer / dead relay.
+   *
+   * `null` before `start()` and after `stop()` finishes, so callers
+   * must always read via the `stopSignal` getter (returns `undefined`
+   * when the node isn't started, which downstream code treats as
+   * "no abort wiring available — fall back to whatever per-call
+   * timeout was supplied").
+   */
+  private stopAbortController: AbortController | null = null;
+
+  /**
+   * Public AbortSignal that fires as the first step of `stop()`.
+   * Consumers (notably `ProtocolRouter`) compose this with their own
+   * per-call signals via AbortSignal.any so a graceful shutdown
+   * cancels every in-flight network read.
+   *
+   * Returns `undefined` before `start()` and after `stop()` completes
+   * — guard for "node-stopped" cases at the call site rather than
+   * fabricating a never-aborts signal here.
+   */
+  get stopSignal(): AbortSignal | undefined {
+    return this.stopAbortController?.signal;
+  }
 
   constructor(config: DKGNodeConfig = {}) {
     this.config = config;
@@ -412,6 +553,11 @@ export class DKGNode {
 
   async start(): Promise<void> {
     if (this.node) return;
+    // PR-6: fresh AbortController per completed start cycle. Create it
+    // locally and publish it only after libp2p exists; otherwise a startup
+    // failure before `this.node` is set would leave callers composing against
+    // a stale stopSignal that stop() cannot clear.
+    const startStopAbortController = new AbortController();
 
     // Reset sticky relay state so a node restarted with a different
     // role / capacity doesn't leak the previous run's adapter or
@@ -749,7 +895,7 @@ export class DKGNode {
     const services: Record<string, any> = {
       identify: identify(),
       ping: ping(),
-      dht: kadDHT({ protocol: DHT_PROTOCOL }),
+      dht: kadDHT(buildKadDHTOptions(this.config, DHT_PROTOCOL)),
       pubsub: gossipsub({
         emitSelf: false,
         allowPublishToZeroTopicPeers: true,
@@ -885,8 +1031,34 @@ export class DKGNode {
       this.relayReservationCountTarget = 1;
     }
 
+    // Explicit field shape (NOT `Record<string, number>`) so a typo in
+    // a new key fails to compile instead of silently disabling the
+    // tunable. Mirrors `PersistentPeerStoreInit` from
+    // `@libp2p/peer-store`; if upstream adds a third knob we want to
+    // expose, the `buildPeerStoreOverrides` return type is the single
+    // place to extend. Codex review of PR #698 caught the prior loose
+    // typing; round 2 then asked for a wiring test, which lives in
+    // `core/test/libp2p-tunables-wiring.test.ts` against the same
+    // helper.
+    const peerStoreOverrides = buildPeerStoreOverrides(this.config);
+
     this.node = await createLibp2p<DKGServices>({
       privateKey,
+      ...(peerStoreOverrides !== undefined
+        ? { peerStore: peerStoreOverrides }
+        : {}),
+      // `nodeInfo.userAgent` is libp2p's only knob for the identify
+      // protocol's `agentVersion` PB field — every remote peer reads
+      // it back as `Peer.metadata.AgentVersion`. Without it, libp2p
+      // defaults to `js-libp2p/<version>`, a libp2p-toolkit version
+      // that tells a remote operator nothing about which DKG release
+      // this peer is running. The daemon (see
+      // packages/cli/src/daemon/lifecycle.ts) sets `nodeVersion` to
+      // `dkg/<semver>` so /api/peer-info can answer "which DKG release
+      // is each peer running?" from the wire.
+      ...(this.config.nodeVersion
+        ? { nodeInfo: { userAgent: this.config.nodeVersion } }
+        : {}),
       addresses: {
         listen: listenAddrs,
         ...(this.config.announceAddresses?.length
@@ -911,6 +1083,7 @@ export class DKGNode {
       // no-op metrics; the adapter is purely additive.
       ...(this.relayMetrics ? { metrics: () => this.relayMetrics! } : {}),
     } as any);
+    this.stopAbortController = startStopAbortController;
 
     this.setupConnectionObservability();
 
@@ -1336,6 +1509,14 @@ export class DKGNode {
 
   async stop(): Promise<void> {
     if (!this.node) return;
+    // PR-6: signal abort FIRST, before any cleanup. The point of
+    // the controller is to unblock long-await sites (notably the
+    // for-await loop in `protocol-router.ts:readAll`) so that
+    // libp2p's own internal teardown — which depends on streams
+    // closing — doesn't deadlock waiting for those reads to finish.
+    // Aborting + then awaiting libp2p.stop() is the graceful
+    // counterpart to PR-1's hard-timeout safety net (#655).
+    this.stopAbortController?.abort();
     if (this.relayWatchdogTimer) {
       clearTimeout(this.relayWatchdogTimer);
       this.relayWatchdogTimer = null;
@@ -1347,8 +1528,15 @@ export class DKGNode {
     this.relayMetrics = null;
     this.relayCapacity = null;
     this.relayReservationCountTarget = 1;
-    await this.node.stop();
-    this.node = null;
+    const node = this.node;
+    try {
+      await node.stop();
+    } finally {
+      if (this.node === node) {
+        this.node = null;
+      }
+      this.stopAbortController = null;
+    }
   }
 
   get peerId(): string {

@@ -20,6 +20,7 @@ import {
   type HardhatContext,
 } from '../../chain/test/hardhat-harness.js';
 import { wrapPublisherForTest } from './_helpers/seal.js';
+import { makeHardhatReceiverACKProvider } from './_helpers/acks.js';
 
 const HARDHAT_PORT = 8548;
 let CONTEXT_GRAPH: string;
@@ -65,6 +66,7 @@ describe('Publisher EVM E2E: DKGPublisher with real contracts', () => {
     const bus = new TypedEventBus();
     const keypair = await generateEd25519Keypair();
 
+    const kav10Address = await adapter.getKnowledgeAssetsLifecycleAddress();
     publisher = wrapPublisherForTest(
       new DKGPublisher({
         store,
@@ -79,8 +81,15 @@ describe('Publisher EVM E2E: DKGPublisher with real contracts', () => {
         author: new Wallet(HARDHAT_KEYS.CORE_OP),
         ctx: {
           provider: ctx.provider,
-          kav10Address: await adapter.getKnowledgeAssetsV10Address(),
+          kav10Address,
         },
+        // RC11 / PR1: real 3-of-N ACK quorum from the harness's staked
+        // REC1..REC3 receivers — the self-signed ACK fallback is gone.
+        v10ACKProvider: makeHardhatReceiverACKProvider(
+          ctx,
+          kav10Address,
+          [HARDHAT_KEYS.REC1_OP, HARDHAT_KEYS.REC2_OP, HARDHAT_KEYS.REC3_OP],
+        ),
       },
     );
   }, 120_000);
@@ -95,14 +104,17 @@ describe('Publisher EVM E2E: DKGPublisher with real contracts', () => {
 
   let firstPublishResult: Awaited<ReturnType<typeof publisher.publish>>;
 
-  it('V10 CREATE: publishes knowledge to chain with self-signed ACK', async () => {
-
+  it('V10 CREATE: publishes knowledge to chain with 3-of-N ACK quorum', async () => {
+    // V10 greenfield publish is single-KA per tx: one root subject only.
+    // Multi-root payloads are rejected by the manifest guard in
+    // dkg-publisher.ts (`requires exactly one Knowledge Asset per transaction`);
+    // a dedicated regression test below pins that behaviour.
     firstPublishResult = await publisher.publish({
       contextGraphId: CONTEXT_GRAPH,
       quads: [
         q('urn:evm-e2e:Alice', 'http://schema.org/name', '"Alice"'),
+        q('urn:evm-e2e:Alice', 'http://schema.org/jobTitle', '"Engineer"'),
         q('urn:evm-e2e:Alice', 'http://schema.org/knows', 'urn:evm-e2e:Bob'),
-        q('urn:evm-e2e:Bob', 'http://schema.org/name', '"Bob"'),
       ],
     });
 
@@ -146,9 +158,9 @@ describe('Publisher EVM E2E: DKGPublisher with real contracts', () => {
   it('V10 UPDATE: publisher.update() modifies KC on-chain', async () => {
     expect(firstPublishResult?.onChainResult).toBeDefined();
 
-    const kcId = firstPublishResult.onChainResult!.batchId;
+    const kaId = firstPublishResult.onChainResult!.batchId;
 
-    const updateResult = await publisher.update(kcId, {
+    const updateResult = await publisher.update(kaId, {
       contextGraphId: CONTEXT_GRAPH,
       quads: [
         q('urn:evm-e2e:Alice', 'http://schema.org/name', '"Alice Updated"'),
@@ -160,7 +172,7 @@ describe('Publisher EVM E2E: DKGPublisher with real contracts', () => {
     expect(updateResult.merkleRoot).toHaveLength(32);
     expect(updateResult.onChainResult).toBeDefined();
     expect(updateResult.onChainResult!.txHash).toMatch(/^0x[0-9a-f]{64}$/);
-    expect(updateResult.onChainResult!.batchId).toBe(kcId);
+    expect(updateResult.onChainResult!.batchId).toBe(kaId);
   }, 60_000);
 
   // -------------------------------------------------------------------------
@@ -198,11 +210,14 @@ describe('Publisher EVM E2E: DKGPublisher with real contracts', () => {
   }, 60_000);
 
   // -------------------------------------------------------------------------
-  // Multi-KA publish (auto-partition creates multiple KAs)
+  // Multi-KA publish — V10 greenfield rejects multi-root payloads.
+  // The legacy "multi-entity publish creates multiple KA manifest entries"
+  // case is gone: V10 enforces 1 KA per tx so the manifest count is locked
+  // at 1. This regression test pins the guard so a regression that quietly
+  // re-enables multi-root publishes can't slip through.
   // -------------------------------------------------------------------------
 
-  it('V10 CREATE: multi-entity publish creates multiple KA manifest entries', async () => {
-
+  it('V10 CREATE: multi-root publish is rejected by the 1-KA-per-tx guard', async () => {
     const entities = Array.from({ length: 5 }, (_, i) => `urn:evm-e2e:entity-${i}`);
     const quads: Quad[] = [];
     for (const entity of entities) {
@@ -210,18 +225,10 @@ describe('Publisher EVM E2E: DKGPublisher with real contracts', () => {
       quads.push(q(entity, 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type', 'http://schema.org/Thing'));
     }
 
-    const result = await publisher.publish({
-      contextGraphId: CONTEXT_GRAPH,
-      quads,
-    });
-
-    expect(result.status).toBe('confirmed');
-    expect(result.kaManifest.length).toBe(5);
-
-    for (const ka of result.kaManifest) {
-      expect(ka.rootEntity).toBeDefined();
-    }
-  }, 60_000);
+    await expect(
+      publisher.publish({ contextGraphId: CONTEXT_GRAPH, quads }),
+    ).rejects.toThrow(/exactly one Knowledge Asset per transaction \(got 5\)/);
+  }, 30_000);
 
   // -------------------------------------------------------------------------
   // Adapter-level context graph creation
@@ -325,7 +332,7 @@ describe('Publisher EVM E2E: DKGPublisher with real contracts', () => {
   }, 60_000);
 
   // -------------------------------------------------------------------------
-  // Error path: invalid kcId for update returns meaningful error
+  // Error path: invalid kaId for update returns meaningful error
   // -------------------------------------------------------------------------
 
   it('V10 UPDATE: updating non-existent KC returns failed status', async () => {

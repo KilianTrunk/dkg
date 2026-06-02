@@ -6,29 +6,34 @@ import { createInterface } from 'node:readline';
 import { spawn, execSync } from 'node:child_process';
 import { createReadStream } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { join } from 'node:path';
-import { writeFile, unlink } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
+import { readFile, writeFile, unlink, appendFile } from 'node:fs/promises';
 import { ethers } from 'ethers';
+import { resolveRpcUrls } from '@origintrail-official/dkg-chain';
 import {
   dkgAuthTokenPath,
   FAUCET_WALLETS_PER_REQUEST,
   getFundableWalletAddresses,
   requestFaucetFunding,
+  resolveDkgConfigHome,
   toErrorMessage,
   hasErrorCode,
 } from '@origintrail-official/dkg-core';
 import yaml from 'js-yaml';
 import {
   loadConfig, saveConfig, configExists, configPath,
-  readPid, readApiPort, isProcessRunning, dkgDir, logPath, ensureDkgDir,
-  loadNetworkConfig, loadProjectConfig, resolveAutoUpdateConfig, resolveChainConfig,
+  readPid, readApiPort, isProcessRunning, dkgDir, logPath, ensureDkgDir, removeApiPort,
+  apiPortPath,
+  loadNetworkConfig, loadProjectConfig, resolveAutoUpdateConfig, resolveAutoUpdateSource, resolveChainConfig,
   releasesDir, activeSlot, swapSlot,
-  slotEntryPoint, isStandaloneInstall,
+  slotEntryPoint, isStandaloneInstall, repoDir, isDkgMonorepo,
   resolveContextGraphs, resolveNetworkDefaultContextGraphs,
+  readNodeRoleFromConfigSync,
   type AutoUpdateConfig,
 } from './config.js';
 import { ApiClient } from './api-client.js';
 import { parsePositiveIntegerOption, parsePositiveMsOption } from './publisher-runner.js';
+import { promptStoreBackend, applyStoreFlagsToConfig } from './store-wizard.js';
 import { runConfiguredSourceWorker } from './source-worker-runner.js';
 
 function isDaemonUnreachable(err: unknown): boolean {
@@ -54,13 +59,20 @@ function isDaemonUnreachable(err: unknown): boolean {
 import { batchEntityQuads } from './batching.js';
 import {
   runDaemon,
-  performUpdateWithStatus,
-  checkForNewCommitWithStatus,
   checkForNpmVersionUpdate,
   performNpmUpdate,
+  performNpmUpdateEdge,
+  getCurrentCliVersion,
   DAEMON_EXIT_CODE_RESTART,
+  resolveStandaloneInstall,
+  decodeForcedExitCode,
 } from './daemon.js';
-import { migrateToBlueGreen } from './migration.js';
+import {
+  isLivenessProbeEnabled,
+  startLivenessWatcher,
+  LIVENESS_CONSECUTIVE_FAILURES_TO_KILL,
+} from './daemon/supervisor-liveness.js';
+import { migrateToBlueGreen, noteEdgeLegacyReleases } from './migration.js';
 import { ensureRollbackNodeUiBundle } from './rollback-node-ui.js';
 import { registerIntegrationCommands } from './integrations/commands.js';
 
@@ -68,6 +80,186 @@ import { registerIntegrationCommands } from './integrations/commands.js';
 type ActionOpts = Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
 const VERIFY_COLLECTION_TIMEOUT_MIN_MS = 1_000;
 const VERIFY_COLLECTION_TIMEOUT_MAX_MS = 30 * 60 * 1000;
+const CLI_RPC_READ_STALL_TIMEOUT_MS = 4_000;
+const CLI_RPC_BROADCAST_TIMEOUT_MS = 10_000;
+const CLI_RPC_RECEIPT_ATTEMPT_TIMEOUT_MS = 5_000;
+const CLI_RPC_RECEIPT_POLL_INTERVAL_MS = 2_000;
+const CLI_RPC_RECEIPT_TIMEOUT_MS = 180_000;
+
+async function appendSupervisorLog(message: string): Promise<void> {
+  await ensureDkgDir();
+  await appendFile(logPath(), `${new Date().toISOString()} ${message}\n`, 'utf-8');
+}
+
+function supervisorWarn(message: string): void {
+  console.warn(message);
+  void appendSupervisorLog(message).catch(() => {});
+}
+
+function cliSleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function cliWithTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      const err = new Error(`${label} timed out after ${ms}ms`);
+      (err as any).code = 'TIMEOUT';
+      reject(err);
+    }, ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  }) as Promise<T>;
+}
+
+function cliErrorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  try { return JSON.stringify(err); } catch { return String(err); }
+}
+
+function isCliKnownTransactionError(err: unknown): boolean {
+  const code = String((err as any)?.code ?? (err as any)?.error?.code ?? '').toUpperCase();
+  const msg = cliErrorMessage(err).toLowerCase();
+  return code === 'NONCE_EXPIRED'
+    || msg.includes('already known')
+    || msg.includes('known transaction')
+    || msg.includes('already imported')
+    || msg.includes('transaction already in mempool')
+    || msg.includes('already exists')
+    || msg.includes('nonce too low')
+    || msg.includes('duplicate transaction');
+}
+
+function isCliRetryableRpcError(err: unknown): boolean {
+  const code = String((err as any)?.code ?? (err as any)?.error?.code ?? '').toUpperCase();
+  const status =
+    (err as any)?.status ??
+    (err as any)?.statusCode ??
+    (err as any)?.response?.status ??
+    (err as any)?.error?.status;
+  const msg = cliErrorMessage(err).toLowerCase();
+  if (code === 'CALL_EXCEPTION' || code === 'INSUFFICIENT_FUNDS' || code === 'NONCE_EXPIRED'
+    || code === 'RPC_RECEIPT_LOOKUP_FAILED'
+    || code === 'REPLACEMENT_UNDERPRICED' || code === 'ACTION_REJECTED' || code === 'INVALID_ARGUMENT') {
+    return false;
+  }
+  if (msg.includes('execution reverted') || msg.includes('call exception')
+    || msg.includes('insufficient funds') || msg.includes('invalid argument')
+    || msg.includes('nonce too low') || msg.includes('replacement transaction underpriced')) {
+    return false;
+  }
+  if (status === 429 || (typeof status === 'number' && status >= 500)) return true;
+  if (code === 'TIMEOUT' || code === 'SERVER_ERROR' || code === 'NETWORK_ERROR'
+    || code === 'ECONNRESET' || code === 'ECONNREFUSED' || code === 'ETIMEDOUT'
+    || code === 'ENOTFOUND' || code === 'EAI_AGAIN' || code === 'UNKNOWN_ERROR') {
+    return true;
+  }
+  return /timeout|timed out|network|socket|reset|econnreset|econnrefused|etimedout|enotfound|rate limit|too many requests|429|503|502|500|gateway|temporarily unavailable|fetch failed|connection/i
+    .test(msg);
+}
+
+function createCliEvmProviders(rpcUrl: string, rpcUrls?: string[]): {
+  urls: string[];
+  providers: ethers.JsonRpcProvider[];
+  readProvider: ethers.JsonRpcProvider | ethers.FallbackProvider;
+} {
+  const urls = resolveRpcUrls(rpcUrl, rpcUrls);
+  const providers = urls.map((url) => new ethers.JsonRpcProvider(url, undefined, { cacheTimeout: -1 }));
+  const readProvider = providers.length === 1
+    ? providers[0]
+    : new ethers.FallbackProvider(
+      providers.map((provider, index) => ({
+        provider,
+        priority: index + 1,
+        stallTimeout: CLI_RPC_READ_STALL_TIMEOUT_MS,
+        weight: 1,
+      })),
+      undefined,
+      { quorum: 1 },
+    );
+  return { urls, providers, readProvider };
+}
+
+async function getCliReceiptWithFailover(
+  providers: ethers.JsonRpcProvider[],
+  txHash: string,
+): Promise<ethers.TransactionReceipt | null> {
+  let lastRetryable: unknown;
+  let sawNonErrorResponse = false;
+  for (let i = 0; i < providers.length; i += 1) {
+    try {
+      const receipt = await cliWithTimeout(
+        providers[i].getTransactionReceipt(txHash),
+        CLI_RPC_RECEIPT_ATTEMPT_TIMEOUT_MS,
+        `receipt lookup via RPC #${i + 1}`,
+      );
+      sawNonErrorResponse = true;
+      if (receipt) return receipt;
+    } catch (err) {
+      if (!isCliRetryableRpcError(err)) throw err;
+      lastRetryable = err;
+    }
+  }
+  if (lastRetryable && !sawNonErrorResponse) {
+    const err = new Error(
+      `Receipt lookup for transaction ${txHash} failed on all configured RPC endpoints: ${cliErrorMessage(lastRetryable)}`,
+      { cause: lastRetryable },
+    );
+    (err as any).code = 'RPC_RECEIPT_LOOKUP_FAILED';
+    throw err;
+  }
+  return null;
+}
+
+function assertCliSuccessfulReceipt(receipt: ethers.TransactionReceipt, txHash: string): void {
+  if (receipt.status !== 0) return;
+  const err = new Error(`Transaction ${txHash} was mined but reverted (status=0)`);
+  (err as any).code = 'CALL_EXCEPTION';
+  (err as any).receipt = receipt;
+  throw err;
+}
+
+async function sendCliRawTransactionWithFailover(
+  providers: ethers.JsonRpcProvider[],
+  signedTx: string,
+  txHash: string,
+): Promise<ethers.TransactionReceipt> {
+  let lastError: unknown;
+  for (let i = 0; i < providers.length; i += 1) {
+    try {
+      await cliWithTimeout(
+        providers[i].broadcastTransaction(signedTx),
+        CLI_RPC_BROADCAST_TIMEOUT_MS,
+        `broadcast via RPC #${i + 1}`,
+      );
+      lastError = undefined;
+      break;
+    } catch (err) {
+      if (isCliKnownTransactionError(err)) {
+        lastError = undefined;
+        break;
+      }
+      if (!isCliRetryableRpcError(err)) throw err;
+      lastError = err;
+    }
+  }
+  if (lastError) {
+    throw new Error(`Broadcast failed on all configured RPC endpoints: ${cliErrorMessage(lastError)}`, { cause: lastError });
+  }
+
+  const deadline = Date.now() + CLI_RPC_RECEIPT_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    const receipt = await getCliReceiptWithFailover(providers, txHash);
+    if (receipt) {
+      assertCliSuccessfulReceipt(receipt, txHash);
+      return receipt;
+    }
+    await cliSleep(CLI_RPC_RECEIPT_POLL_INTERVAL_MS);
+  }
+  throw new Error(`Transaction ${txHash} was broadcast but no receipt was found within ${CLI_RPC_RECEIPT_TIMEOUT_MS}ms`);
+}
 
 const STARTUP_BANNER = `
 \x1b[36m██████╗ ██╗  ██╗ ██████╗     ██╗   ██╗ ██╗ ██████╗
@@ -165,8 +357,20 @@ async function loadQuadsFromInput(
   process.exit(1);
 }
 
+/**
+ * Resolve the daemon entry point passed to spawned worker processes.
+ *
+ * OT-RFC-41 §4.1 / Bundle B1a: Edge nodes run from the npm-global
+ * install (`import.meta.url`). Core nodes keep using blue-green
+ * slots (`~/.dkg/releases/current`). The role gate is applied here
+ * because the supervisor spawns workers via this entry point on
+ * every restart — without the gate, an Edge node that had legacy
+ * slots from a pre-rc.12 install would keep running the stale slot
+ * forever even after `npm install -g` updated the global.
+ */
 function resolveDaemonEntryPoint(): string {
   if (process.env.DKG_NO_BLUE_GREEN) return fileURLToPath(import.meta.url);
+  if (readNodeRoleFromConfigSync() === 'edge') return fileURLToPath(import.meta.url);
   const rDir = releasesDir();
   if (existsSync(rDir)) {
     const entry = slotEntryPoint(join(rDir, 'current'));
@@ -175,31 +379,133 @@ function resolveDaemonEntryPoint(): string {
   return fileURLToPath(import.meta.url);
 }
 
+function probeHostForApiHost(apiHost: string | undefined): string {
+  if (!apiHost || apiHost === '0.0.0.0') return '127.0.0.1';
+  if (apiHost === '::') return '::1';
+  return apiHost;
+}
+
+function selectedDkgHomeForEnv(env: NodeJS.ProcessEnv): string {
+  return resolveDkgConfigHome({ env, isDkgMonorepo: isDkgMonorepo() });
+}
+
+function withSelectedDkgHome(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return { ...env, DKG_HOME: selectedDkgHomeForEnv(env) };
+}
+
+/**
+ * Wire up the supervisor-liveness watchdog for a spawned worker child.
+ *
+ * Returns a `stop()` function the supervisor must call when the child
+ * exits (cleanly or via SIGKILL). Returns a no-op if:
+ *   - The env gate is disabled (`DKG_SUPERVISOR_LIVENESS_PROBE=off`).
+ *
+ * Wraps the apiPort-read in a polling loop because the worker writes the
+ * port file midway through boot, AFTER spawn returns. The loop stays alive
+ * until the supervisor stops it; slow boots must still get liveness
+ * protection once their HTTP listener is ready.
+ */
+async function maybeStartSupervisorLivenessWatcher(
+  child: { kill(signal: 'SIGKILL'): boolean },
+): Promise<() => void> {
+  if (!isLivenessProbeEnabled(process.env.DKG_SUPERVISOR_LIVENESS_PROBE)) {
+    return () => {};
+  }
+
+  // Defer-start: keep waiting for the worker to write api.port. Some normal
+  // boots do heavy initialization before binding HTTP; a fixed cutoff would
+  // permanently disable the watchdog for those processes.
+  let cancelled = false;
+  let watcher: { stop(): void } | null = null;
+  void (async () => {
+    while (!cancelled) {
+      const port = await readApiPort().catch(() => null);
+      if (port) {
+        if (cancelled) return;
+        const config = await loadConfig().catch(() => ({ apiHost: undefined }));
+        if (cancelled) return;
+        watcher = startLivenessWatcher({
+          port,
+          host: probeHostForApiHost(config.apiHost),
+          // Graceful-shutdown disarm: the worker's `shutdown()` removes
+          // `api.port` BEFORE the slow cleanup tail (`agent.stop()`,
+          // `dashDb.close()`, …), so its absence is the unambiguous "I'm
+          // intentionally shutting down" signal. Without this the watcher
+          // would race a slow teardown and SIGKILL mid-cleanup.
+          isShuttingDown: () => !existsSync(apiPortPath()),
+          onUnresponsive: () => {
+            supervisorWarn(
+              `[supervisor] worker unresponsive after ${LIVENESS_CONSECUTIVE_FAILURES_TO_KILL} consecutive liveness probes; SIGKILL + respawn.`,
+            );
+            try {
+              child.kill('SIGKILL');
+            } catch {
+              /* child may already be exiting; ignore */
+            }
+          },
+          onFailure: (consecutive: number) => {
+            supervisorWarn(`[supervisor] liveness probe failed (${consecutive} in a row).`);
+          },
+        });
+        return;
+      }
+      await sleep(500);
+    }
+  })();
+
+  return () => {
+    cancelled = true;
+    watcher?.stop();
+  };
+}
+
 async function runDaemonSupervisor(): Promise<void> {
+  process.env.DKG_HOME = selectedDkgHomeForEnv(process.env);
   const maxCrashRestarts = 5;
   let crashRestartCount = 0;
 
   while (true) {
+    await removeApiPort().catch((err: any) => {
+      supervisorWarn(
+        `[supervisor] could not clear stale api.port before spawn: ${err?.message ?? String(err)}`,
+      );
+    });
     const child = spawn(
       process.execPath,
       [...process.execArgv, resolveDaemonEntryPoint(), 'daemon-worker'],
       {
         stdio: ['ignore', 'ignore', 'ignore'],
-        env: process.env,
+        env: withSelectedDkgHome(process.env),
       },
     );
 
-    const exitCode = await new Promise<number | null>((resolve) => {
+    // Positive-liveness watchdog. Catches the generic zombie shape (HTTP
+    // listener dead but process still alive) that the exit-watcher can't
+    // see. SIGKILL forces the child's exit, the existing respawn logic
+    // takes it from there. Gated by DKG_SUPERVISOR_LIVENESS_PROBE so
+    // tests + headless-worker scenarios can opt out. See
+    // packages/cli/src/daemon/supervisor-liveness.ts for the full rationale.
+    const stopWatcher = await maybeStartSupervisorLivenessWatcher(child);
+
+    const rawExitCode = await new Promise<number | null>((resolve) => {
       child.once('exit', (code) => resolve(code));
     });
+    stopWatcher();
+    const { forced, originalExitCode } = decodeForcedExitCode(rawExitCode);
+    if (forced) {
+      console.warn(
+        `[supervisor] previous worker forced-exited (code ${rawExitCode}; original intent ${originalExitCode}). ` +
+          `Shutdown cleanup deadlocked — see worker logs for [shutdown-timeout].`,
+      );
+    }
 
-    if (exitCode === DAEMON_EXIT_CODE_RESTART) {
+    if (originalExitCode === DAEMON_EXIT_CODE_RESTART) {
       crashRestartCount = 0;
       await sleep(250);
       continue;
     }
 
-    if (exitCode === 0) return;
+    if (originalExitCode === 0) return;
 
     crashRestartCount += 1;
     if (crashRestartCount >= maxCrashRestarts) return;
@@ -223,6 +529,12 @@ async function runForegroundSupervisor(childEnv: NodeJS.ProcessEnv = process.env
   while (true) {
     if (signalled) process.exit(0);
 
+    await removeApiPort().catch((err: any) => {
+      supervisorWarn(
+        `[supervisor] could not clear stale api.port before foreground spawn: ${err?.message ?? String(err)}`,
+      );
+    });
+
     currentChild = spawn(
       process.execPath,
       [...process.execArgv, resolveDaemonEntryPoint(), 'daemon-foreground-worker'],
@@ -232,25 +544,35 @@ async function runForegroundSupervisor(childEnv: NodeJS.ProcessEnv = process.env
       },
     );
 
-    const exitCode = await new Promise<number | null>((resolve) => {
+    const stopWatcher = await maybeStartSupervisorLivenessWatcher(currentChild);
+
+    const rawExitCode = await new Promise<number | null>((resolve) => {
       currentChild!.once('exit', (code) => resolve(code));
       currentChild!.once('error', () => resolve(1));
     });
+    stopWatcher();
     currentChild = null;
+    const { forced, originalExitCode } = decodeForcedExitCode(rawExitCode);
+    if (forced) {
+      console.warn(
+        `[supervisor] previous worker forced-exited (code ${rawExitCode}; original intent ${originalExitCode}). ` +
+          `Shutdown cleanup deadlocked — see worker logs for [shutdown-timeout].`,
+      );
+    }
 
-    if (signalled) process.exit(exitCode ?? 0);
+    if (signalled) process.exit(originalExitCode ?? 0);
 
-    if (exitCode === DAEMON_EXIT_CODE_RESTART) {
+    if (originalExitCode === DAEMON_EXIT_CODE_RESTART) {
       crashRestartCount = 0;
       await sleep(250);
       if (signalled) process.exit(0);
       continue;
     }
 
-    if (exitCode === 0) process.exit(0);
+    if (originalExitCode === 0) process.exit(0);
 
     crashRestartCount += 1;
-    if (crashRestartCount >= maxCrashRestarts) process.exit(exitCode ?? 1);
+    if (crashRestartCount >= maxCrashRestarts) process.exit(originalExitCode ?? 1);
     await sleep(1000);
     if (signalled) process.exit(0);
   }
@@ -266,8 +588,46 @@ program
 
 program
   .command('init')
-  .description('Interactive setup — set node name and relay')
-  .action(async () => {
+  .description('Interactive setup — set node name, role, and relay')
+  .option('--role <role>', "Node role: 'edge' (default; personal laptop / behind NAT) or 'core' (24/7 relay / SLA)")
+  .option(
+    '--store <backend>',
+    'Pre-fill the triple-store backend prompt (oxigraph | blazegraph | sparql-http).',
+  )
+  .option(
+    '--store-url <url>',
+    'Pre-fill the SPARQL endpoint URL prompt for external backends.',
+  )
+  .action(async (opts: ActionOpts) => {
+    // OT-RFC-41 Bundle B1c: monorepo guard. `dkg init` from a
+    // contributor checkout is almost always a mistake — the
+    // monorepo dev workflow is `pnpm dev` against the local CLI,
+    // not a globally-installed config. Surface this loudly so
+    // contributors don't accidentally write an Edge-style
+    // ~/.dkg/config.json that then disagrees with the binary on
+    // their $PATH.
+    if (isDkgMonorepo()) {
+      console.error(
+        '\n[dkg init] Refusing to run from a DKG monorepo checkout.\n' +
+          '\n' +
+          '  Detected monorepo root: ' + (repoDir() ?? '(unknown)') + '\n' +
+          '\n' +
+          "  Monorepo dev workflow uses 'pnpm dev' against the local CLI build; ~/.dkg/config.json\n" +
+          "  is for npm-installed nodes (`npm install -g @origintrail-official/dkg`). Writing one\n" +
+          '  here would diverge from how the local CLI resolves its own working state.\n' +
+          '\n' +
+          '  If you really want to bootstrap a config for testing from this checkout, set\n' +
+          '  DKG_HOME to a scratch directory:\n' +
+          '\n' +
+          '    DKG_HOME=/tmp/dkg-test dkg init\n' +
+          '\n' +
+          '  RFC: https://github.com/OriginTrail/dkgv10-spec/blob/main/rfcs/OT-RFC-41-edge-node-npm-only-install-and-update.md\n' +
+          '\n',
+      );
+      process.exit(1);
+    }
+
+
     await ensureDkgDir();
     const existing = await loadConfig();
     const network = await loadNetworkConfig();
@@ -285,9 +645,37 @@ program
     }
 
     const name = await ask('Node name', existing.name !== 'dkg-node' ? existing.name : undefined);
+    // OT-RFC-41 Bundle B1d: `--role <edge|core>` flag short-circuits
+    // the interactive role prompt. Default precedence:
+    //   1. `--role` flag (explicit operator intent)
+    //   2. existing config (re-running `dkg init` on an existing node)
+    //   3. network default (per-network preferred role)
+    //   4. 'edge' (safe default — RFC §1)
     const defaultRole = existing.nodeRole ?? network?.defaultNodeRole ?? 'edge';
-    const roleAnswer = await ask('Node role (edge / core)', defaultRole);
-    const nodeRole = roleAnswer === 'core' ? 'core' as const : 'edge' as const;
+    let nodeRole: 'edge' | 'core';
+    if (opts.role === 'edge' || opts.role === 'core') {
+      nodeRole = opts.role;
+      console.log(`Node role: ${nodeRole} (from --role flag)`);
+    } else if (opts.role !== undefined) {
+      console.error(`Invalid --role value: ${JSON.stringify(opts.role)}. Expected 'edge' or 'core'.`);
+      process.exit(1);
+    } else {
+      const roleAnswer = await ask('Node role (edge / core)', defaultRole);
+      nodeRole = roleAnswer === 'core' ? 'core' : 'edge';
+    }
+
+    // Triple-store backend (RFC 120, plan PR 2 item 1 + PR 3 Docker
+    // branch). Default: stay on local Oxigraph. Operators selecting
+    // "blazegraph" with a blank URL get the Docker convenience path
+    // (if Docker is installed) — the namespace name defaults to the
+    // node name so each operator gets their own DKG-owned namespace.
+    const { storeBlock } = await promptStoreBackend({
+      ask,
+      existingStore: existing.store,
+      flagBackend: opts.store,
+      flagUrl: opts.storeUrl,
+      nodeName: name || existing.name,
+    });
 
     // Pre-fill relay from network config if user hasn't set one.
     // Show the first relay as the default, but only persist to config if the
@@ -312,9 +700,13 @@ program
     const contextGraphs = contextGraphsStr ? contextGraphsStr.split(',').map(s => s.trim()).filter(Boolean) : [];
     const apiPort = parseInt(await ask('API port', String(existing.apiPort)), 10);
 
+    // OT-RFC-41 §4.3 Bundle B1d: post-rc.12, auto-update is npm-only.
+    // The prompt wording is updated; the persisted config carries an
+    // explicit `source: 'npm'` so the daemon's resolution is
+    // unambiguous (no implicit `isStandaloneInstall()` probe).
     const autoUpdateDefault = existing.autoUpdate?.enabled ?? network?.autoUpdate?.enabled ?? false;
     const enableAutoUpdate = (await ask(
-      'Enable git-based auto-update (y/n)',
+      'Enable auto-update (npm; y/n)',
       autoUpdateDefault ? 'y' : 'n',
     )).toLowerCase() === 'y';
 
@@ -352,6 +744,12 @@ program
 
       autoUpdate = {
         enabled: true,
+        // OT-RFC-41 Bundle B1d: explicit source. Under rc.12+, fresh
+        // installs always use the npm path (Edge: install -g; Core:
+        // slot install). The legacy 'auto'/'git' values still parse
+        // (rc.11 nodes carrying them upgrade-in-place) but the
+        // daemon dispatches them as 'npm' under §5 PR 5.
+        source: 'npm' as const,
         ...(repo && repo !== effectiveRepo ? { repo } : {}),
         ...(branch && branch !== effectiveBranch ? { branch } : {}),
         ...(allowPrerelease !== effectiveAllowPrerelease ? { allowPrerelease } : {}),
@@ -372,17 +770,22 @@ program
     // override even after `dkg init` re-prompts.
     const chainDefaults = resolveChainConfig(existing, network);
     const defaultRpcUrl = chainDefaults?.rpcUrl;
+    const defaultRpcUrls = chainDefaults?.rpcUrls?.join(', ') ?? '';
     const defaultHubAddress = chainDefaults?.hubAddress;
     const defaultChainId = chainDefaults?.chainId;
 
     console.log('\nBlockchain Configuration:');
     const rpcUrl = await ask('RPC URL', defaultRpcUrl);
+    const rpcUrlsInput = await ask('Backup RPC URLs (comma-separated, optional; type "none" to clear)', defaultRpcUrls);
+    const clearRpcUrls = rpcUrlsInput.trim().toLowerCase() === 'none';
+    const rpcUrls = clearRpcUrls ? [] : rpcUrlsInput.split(',').map((s) => s.trim()).filter(Boolean);
     const hubAddress = await ask('Hub contract address', defaultHubAddress);
     const chainIdStr = await ask('Chain ID', defaultChainId);
 
     const chainSection = rpcUrl && hubAddress ? {
       type: 'evm' as const,
       rpcUrl,
+      ...(clearRpcUrls || rpcUrls.length ? { rpcUrls } : {}),
       hubAddress,
       chainId: chainIdStr || undefined,
     } : undefined;
@@ -407,6 +810,11 @@ program
       autoUpdate: enableAutoUpdate ? autoUpdate : existing.autoUpdate,
       chain: chainSection ?? existing.chain,
       auth: { enabled: enableAuth, tokens: existing.auth?.tokens },
+      // Persist the chosen backend. `storeBlock === null` from the
+      // wizard means "use the local default" — we explicitly clear any
+      // existing block so re-running `dkg init` to switch from
+      // blazegraph back to oxigraph actually applies.
+      store: storeBlock ?? undefined,
     };
     await saveConfig(config);
 
@@ -430,6 +838,13 @@ program
     console.log(`  context graphs: ${contextGraphs.length ? contextGraphs.join(', ') : '(none)'}`);
     console.log(`  apiPort:    ${config.apiPort}`);
     console.log(`  auth:       ${enableAuth ? `enabled (token in ${dkgAuthTokenPath(dkgDir())})` : 'disabled'}`);
+    console.log(
+      `  store:      ${
+        storeBlock
+          ? `${storeBlock.backend} (${(storeBlock.options as { url: string }).url})`
+          : 'oxigraph (local default)'
+      }`,
+    );
     {
       const resolved = resolveAutoUpdateConfig(config, network);
       console.log(
@@ -447,7 +862,7 @@ program
       // who only set rpcUrl still sees the inherited hub from the network.
       const effective = resolveChainConfig(config, network);
       console.log(`  chain:      ${effective?.rpcUrl && effective?.hubAddress
-        ? `${effective.rpcUrl} (hub: ${effective.hubAddress.slice(0, 10)}...)`
+        ? `${effective.rpcUrl}${effective.rpcUrls?.length ? ` (+${effective.rpcUrls.length} backups)` : ''} (hub: ${effective.hubAddress.slice(0, 10)}...)`
         : '(not configured)'}`);
     }
     if (network) {
@@ -674,12 +1089,23 @@ program
       process.exit(1);
     }
 
-    // Keep blue-green slots initialized for both foreground and daemonized start.
+    // OT-RFC-41 §4.1 / Bundle B1a: blue-green slot initialization is
+    // a Core-only concern under rc.12+. Edge nodes run directly from
+    // the npm-global install. Pre-rc.12 Edge users may still have
+    // legacy ~/.dkg/releases/ on disk; noteEdgeLegacyReleases() records
+    // the slot version as a rollback target without auto-deleting the
+    // directory (operator owns cleanup per RFC).
     if (!process.env.DKG_NO_BLUE_GREEN) {
-      await migrateToBlueGreen((msg) => console.log(msg), {
-        allowRemoteBootstrap: false,
-        repairLiveNodeUi: true,
-      });
+      const startConfig = await loadConfig().catch(() => null);
+      const startNodeRole = startConfig?.nodeRole ?? 'edge';
+      if (startNodeRole === 'core') {
+        await migrateToBlueGreen((msg) => console.log(msg), {
+          allowRemoteBootstrap: false,
+          repairLiveNodeUi: true,
+        });
+      } else {
+        await noteEdgeLegacyReleases((msg) => console.log(msg));
+      }
     }
 
     // rc.9 PR-7: forward --relay-preferred to the spawned daemon via
@@ -692,7 +1118,7 @@ program
     // declaration order first.
     const relayPreferredOpt = Array.isArray(opts.relayPreferred) ? (opts.relayPreferred as string[]) : [];
     const cleanedRelayPreferred = relayPreferredOpt.map((s) => s.trim()).filter((s) => s.length > 0);
-    const daemonEnv: NodeJS.ProcessEnv = { ...process.env };
+    const daemonEnv: NodeJS.ProcessEnv = withSelectedDkgHome(process.env);
     if (cleanedRelayPreferred.length > 0) {
       daemonEnv.DKG_RELAY_PREFERRED = cleanedRelayPreferred.join(',');
       console.log(
@@ -786,7 +1212,7 @@ program
   .description('Show node status')
   .action(async () => {
     try {
-      const client = await ApiClient.connect();
+      const client = await ApiClient.connect({ allowConfigFallback: true });
       const s = await client.status();
       const uptime = formatUptime(s.uptimeMs);
       console.log(`  Node:      ${s.name}`);
@@ -796,6 +1222,21 @@ program
       console.log(`  Uptime:    ${uptime}`);
       console.log(`  Peers:     ${s.connectedPeers}`);
       console.log(`  Relay:     ${s.relayConnected ? 'connected' : 'not connected'}`);
+      // Backend visibility: local backends print just the name (file
+      // bytes are graphed via /api/dashboard); external backends print
+      // backend + endpoint + quad count, falling back to a clear
+      // "unreachable" signal when the daemon couldn't talk to the
+      // remote store. Quad count = null is rare in practice (cached
+      // every 30 s on the daemon side) so when it shows up the
+      // operator should treat it as an alert, not a no-op.
+      const backend = s.storeBackend ?? 'oxigraph-worker';
+      if (s.storeUrl) {
+        const quads = s.storeQuads == null ? 'UNREACHABLE' : `${s.storeQuads.toLocaleString()} quads`;
+        console.log(`  Store:     ${backend} (${s.storeUrl}) — ${quads}`);
+      } else {
+        console.log(`  Store:     ${backend}`);
+      }
+      if (client.controlPlaneWarning) console.warn(client.controlPlaneWarning);
     } catch (err) {
       console.error(toErrorMessage(err));
       process.exit(1);
@@ -1048,7 +1489,7 @@ program
       });
       console.log(`Published to context graph "${contextGraph}":`);
       console.log(`  Status:    ${result.status}`);
-      console.log(`  KC ID:     ${result.kcId}`);
+      console.log(`  KC ID:     ${result.kaId}`);
       if (result.txHash) {
         console.log(`  TX hash:   ${result.txHash}`);
         console.log(`  Block:     ${result.blockNumber}`);
@@ -1923,7 +2364,7 @@ assertionCmd
       if (Array.isArray(result.rootEntities) && result.rootEntities.length > 0) {
         console.log(`  Root entities:  ${result.rootEntities.join(', ')}`);
       }
-      console.log(`  Next:           dkg shared-memory publish ${opts.contextGraph}${opts.subGraphName ? ` --sub-graph-name ${opts.subGraphName}` : ''}`);
+      console.log(`  Next:           dkg shared-memory publish ${opts.contextGraph} --name ${name}${opts.subGraphName ? ` --sub-graph-name ${opts.subGraphName}` : ''}`);
     } catch (err) {
       console.error(toErrorMessage(err));
       process.exit(1);
@@ -1978,6 +2419,14 @@ openclawCmd
   .option('--dry-run', 'Preview changes without writing anything')
   .option('--no-fund', 'Skip wallet funding via testnet faucet')
   .option('--fund', 'Fund wallets via testnet faucet (default)')
+  .option(
+    '--store <backend>',
+    'Triple-store backend (oxigraph | blazegraph | sparql-http). Validates the URL via an ASK probe and persists the store block after setup completes.',
+  )
+  .option(
+    '--store-url <url>',
+    'SPARQL endpoint URL — required when --store is blazegraph or sparql-http.',
+  )
   .action(async (opts, command) => {
     // Dynamic import + process.exit plumbing stay here; the actual `runSetup`
     // call lives in `openclawSetupAction` so it can be unit-tested without
@@ -1996,6 +2445,14 @@ openclawCmd
     const { openclawSetupAction } = await import('./openclaw-setup.js');
     try {
       await openclawSetupAction(opts, command, { runSetup });
+      // Persist --store / --store-url after the action's ensureDkgNodeConfig
+      // has run; otherwise the config file may not exist yet on a fresh
+      // install. Validation hits the same boot-time probe used by the
+      // daemon, so an invalid URL fails here, not on the next dkg start.
+      await applyStoreFlagsToConfig({
+        storeFlag: opts.store,
+        storeUrlFlag: opts.storeUrl,
+      });
     } catch (err: any) {
       console.error(`\n[setup] ERROR: ${err?.message ?? err}\n`);
       process.exit(1);
@@ -2052,6 +2509,14 @@ mcpCmd
   .option('--force', 'Refresh every detected client regardless of current registration state')
   .option('--print-only', 'Print the canonical JSON to stdout; skip every other step')
   .option('--yes', 'Auto-confirm per-client registrations (default false: prompt interactively in TTY mode; non-TTY auto-confirms — pass `--yes` in scripts for the safer scripted-environment posture)')
+  .option(
+    '--store <backend>',
+    'Triple-store backend (oxigraph | blazegraph | sparql-http). Validates the URL and persists the store block after setup.',
+  )
+  .option(
+    '--store-url <url>',
+    'SPARQL endpoint URL — required when --store is blazegraph or sparql-http.',
+  )
   .option('--installed', 'Force installed-mode setup. Bootstrap home: `~/.dkg`. Registered binary: the running CLI (whichever invoked this command — typically the global `dkg`). Use this from a monorepo cwd when you want the global install instead of the local dist. Mutually exclusive with --monorepo.')
   .option('--monorepo', 'Force monorepo-mode setup. Bootstrap home: `~/.dkg-dev`. Registered binary: the local `<repo>/packages/cli/dist/cli.js` script (located via cwd-first walk; falls back to the running CLI dir). Errors if no DKG monorepo root is detected. Switches BOTH bootstrap home AND the registered binary, unlike --installed which only switches the home. Mutually exclusive with --installed.')
   .action(async (opts) => {
@@ -2089,6 +2554,10 @@ mcpCmd
         requestFaucetFunding: coreExports.requestFaucetFunding,
         findDkgMonorepoRoot: coreExports.findDkgMonorepoRoot,
         resolveDkgConfigHome: coreExports.resolveDkgConfigHome,
+      });
+      await applyStoreFlagsToConfig({
+        storeFlag: opts.store,
+        storeUrlFlag: opts.storeUrl,
       });
     } catch (err: any) {
       console.error(`\n[dkg mcp setup] ERROR: ${err?.message ?? err}\n`);
@@ -2175,6 +2644,14 @@ hermesCmd
     '--no-replace-provider',
     'Alias for --preserve-provider',
   )
+  .option(
+    '--store <backend>',
+    'Triple-store backend (oxigraph | blazegraph | sparql-http). Validates the URL and persists the store block after setup.',
+  )
+  .option(
+    '--store-url <url>',
+    'SPARQL endpoint URL — required when --store is blazegraph or sparql-http.',
+  )
   .action(async (opts, command) => {
     const runSetup = await loadHermesAdapterAction('setup', ['runSetup', 'setup']);
     const { hermesSetupAction } = await import('./hermes-setup.js');
@@ -2186,6 +2663,10 @@ hermesCmd
         ? { ...opts, preserveProvider: true }
         : opts;
       await hermesSetupAction(merged, command, { runSetup });
+      await applyStoreFlagsToConfig({
+        storeFlag: opts.store,
+        storeUrlFlag: opts.storeUrl,
+      });
     } catch (err: any) {
       console.error(`\n[hermes setup] ERROR: ${err?.message ?? err}\n`);
       process.exit(1);
@@ -2680,7 +3161,7 @@ sharedMemoryCmd
       console.log(`  Merkle root:  ${seal.merkleRoot}`);
       console.log(`  Promoted:     ${promoted.promotedCount ?? promoted.count ?? 0} quads`);
       console.log(`  Status:       ${result.status}`);
-      console.log(`  KC ID:        ${result.kcId}`);
+      console.log(`  KC ID:        ${result.kaId}`);
       console.log(`  KAs:          ${result.kas.length}`);
       if (subGraphOption) {
         console.log(`  Sub-graph:    ${subGraphOption}`);
@@ -3554,13 +4035,13 @@ program
       const tokenAddress = chainResolved?.tokenAddress;
       const chainId = chainResolved?.chainId ?? '(unknown)';
 
-      let provider: ethers.JsonRpcProvider | null = null;
+      let provider: ethers.JsonRpcProvider | ethers.FallbackProvider | null = null;
       let token: ethers.Contract | null = null;
       let tokenSymbol = 'TRAC';
 
       if (rpcUrl) {
         try {
-          provider = new ethers.JsonRpcProvider(rpcUrl);
+          provider = createCliEvmProviders(rpcUrl, chainResolved?.rpcUrls).readProvider;
           if (tokenAddress && tokenAddress !== ethers.ZeroAddress) {
             token = new ethers.Contract(tokenAddress, ['function balanceOf(address) view returns (uint256)', 'function symbol() view returns (string)'], provider);
             tokenSymbol = await token.symbol().catch(() => 'TRAC');
@@ -3611,6 +4092,7 @@ program
 
       console.log(`\n  Chain: ${chainId}`);
       if (rpcUrl) console.log(`  RPC:   ${rpcUrl}`);
+      if (chainResolved?.rpcUrls?.length) console.log(`  RPC backups: ${chainResolved.rpcUrls.join(', ')}`);
       console.log(`  File:  ~/.dkg/wallets.json`);
       console.log('\nFund these addresses with ETH (gas) and TRAC (staking/publishing).');
       if (opWallets.adminWallet) {
@@ -3656,17 +4138,17 @@ program
         process.exit(1);
       }
 
-      const provider = new ethers.JsonRpcProvider(rpcUrl);
-      const wallet = new ethers.Wallet(opWallets.wallets[0].privateKey, provider);
+      const { providers, readProvider } = createCliEvmProviders(rpcUrl, chainResolved?.rpcUrls);
+      const wallet = new ethers.Wallet(opWallets.wallets[0].privateKey, readProvider);
 
       const hub = new ethers.Contract(hubAddress, [
         'function getContractAddress(string) view returns (address)',
-      ], provider);
+      ], readProvider);
 
       const identityStorageAddr = await hub.getContractAddress('IdentityStorage');
       const identityStorage = new ethers.Contract(identityStorageAddr, [
         'function getIdentityId(address) view returns (uint72)',
-      ], provider);
+      ], readProvider);
 
       let identityId: bigint;
       if (opts.identity) {
@@ -3685,7 +4167,7 @@ program
       const profileStorageAddr = await hub.getContractAddress('ProfileStorage');
       const profileStorage = new ethers.Contract(profileStorageAddr, [
         'function getAsk(uint72) view returns (uint96)',
-      ], provider);
+      ], readProvider);
       const currentAsk = await profileStorage.getAsk(identityId);
 
       console.log(`  Identity:    ${identityId}`);
@@ -3703,10 +4185,13 @@ program
       ], wallet);
 
       console.log(`  Setting ask to ${amount} TRAC...`);
-      const tx = await profile.updateAsk(identityId, askWei);
-      console.log(`  TX: ${tx.hash}`);
-      const receipt = await tx.wait();
-      console.log(`  Confirmed in block ${receipt!.blockNumber}`);
+      const populated = await profile.updateAsk.populateTransaction(identityId, askWei);
+      const filled = await wallet.populateTransaction(populated);
+      const signedTx = await wallet.signTransaction(filled);
+      const txHash = ethers.Transaction.from(signedTx).hash ?? '0x';
+      console.log(`  TX: ${txHash}`);
+      const receipt = await sendCliRawTransactionWithFailover(providers, signedTx, txHash);
+      console.log(`  Confirmed in block ${receipt.blockNumber}`);
       console.log(`  New ask: ${amount} TRAC`);
     } catch (err) {
       if (hasErrorCode(err, 'CALL_EXCEPTION')) {
@@ -3884,6 +4369,14 @@ async function stopDaemonIfRunning(): Promise<boolean> {
 }
 
 // ─── dkg update ──────────────────────────────────────────────────────
+//
+// OT-RFC-41 §4.5 / §5 PR 6: `dkg migrate-to-npm` was removed.
+// Edge nodes coming from a pre-rc.12 install are migrated
+// automatically on first `dkg start` via `noteEdgeLegacyReleases`
+// (see migration.ts + cli.ts dkg start). Core node operators
+// who still hold a git-checkout install follow the manual
+// procedure documented in `docs/archive/MIGRATE_TO_NPM.md`
+// (formerly `docs/operator/MIGRATE_TO_NPM.md`).
 
 // ─── dkg query-catalog ───────────────────────────────────────────────
 
@@ -3964,9 +4457,14 @@ program
         branch: proj.defaultBranch,
         allowPrerelease: true,
         checkIntervalMinutes: 30,
+        source: undefined as 'auto' | 'npm' | 'git' | undefined,
       };
     })();
-    const standalone = isStandaloneInstall();
+    // Honour `autoUpdate.source` override so `dkg update` from a beacon-01
+    // operator with `source: "npm"` configured goes through the npm install
+    // path even if .git is still present in the working tree. See
+    // `AutoUpdateConfig.source` (config.ts) for the rationale.
+    const standalone = resolveStandaloneInstall(au.source ?? resolveAutoUpdateSource(config, net));
     const allowPre = opts.allowPrerelease === true ? true : (au.allowPrerelease ?? true);
 
     if (standalone) {
@@ -3984,6 +4482,32 @@ program
           process.exit(1);
         }
         return;
+      }
+
+      // RFC-41 §4.7.7 invocation pattern #3: before applying an update,
+      // `dkg update` MUST run the install-layout + version-skew doctor
+      // checks. If either reports an `error`, abort with a pointer at
+      // `dkg doctor --json` for full context. Warnings do not block.
+      try {
+        const { createProductionDeps, runDoctor, UPDATE_PREFLIGHT_CHECKS } =
+          await import('./doctor/index.js');
+        const preflightDeps = createProductionDeps({ apiPort: config.apiPort ?? 9200 });
+        const preflight = await runDoctor(preflightDeps, { checks: UPDATE_PREFLIGHT_CHECKS });
+        if (preflight.exitCode === 2) {
+          const errors = preflight.findings.filter((f) => f.severity === 'error');
+          console.error('\n[dkg update] Pre-flight checks failed; refusing to apply update.\n');
+          for (const f of errors) {
+            console.error(`  • [${f.check}] ${f.message}`);
+            if (f.advisory) console.error(`      → ${f.advisory}`);
+          }
+          console.error('\nRun `dkg doctor --json` for the full diagnostic report.\n');
+          process.exit(2);
+        }
+      } catch (err: any) {
+        // Pre-flight crashing should not block updates — fall through
+        // and let the real update path do its thing. Warn loudly so a
+        // recurring failure is visible.
+        process.stderr.write(`[dkg update] WARNING: pre-flight doctor check crashed (${err?.message ?? err}); continuing without it.\n`);
       }
 
       let version = versionOrRef ?? null;
@@ -4004,8 +4528,17 @@ program
         }
       }
 
-      console.log(`Updating to ${version} via NPM...`);
-      const updateStatus = await performNpmUpdate(version!, logFn);
+      // OT-RFC-41 Bundle B1b: dispatch on nodeRole. Edge runs
+      // `npm install -g` against the global install (no slots);
+      // Core continues to use the slot-based update path.
+      const npmUpdateRole = config.nodeRole ?? 'edge';
+      console.log(
+        `Updating to ${version} via NPM ` +
+          `(${npmUpdateRole === 'edge' ? 'global npm install' : 'blue-green slot'})...`,
+      );
+      const updateStatus = npmUpdateRole === 'edge'
+        ? await performNpmUpdateEdge(version!, getCurrentCliVersion(), logFn)
+        : await performNpmUpdate(version!, logFn);
       if (updateStatus === 'updated') {
         const stopped = await stopDaemonIfRunning();
         if (!stopped) {
@@ -4020,75 +4553,103 @@ program
       return;
     }
 
-    // --- Git-based update path (monorepo / install.sh installs) ---
-
-    const refOverride = versionOrRef ? normalizeVersionTagRef(versionOrRef) : undefined;
-    const verifyTagSignature = Boolean(refOverride && refOverride.startsWith('refs/tags/')) && opts.verifyTag !== false;
-
-    if (opts.check) {
-      console.log('Checking for updates...');
-      const check = await checkForNewCommitWithStatus(au, (msg) => console.log(msg), refOverride);
-      if (check.status === 'available' && check.commit) {
-        console.log(`Update available: ${check.commit.slice(0, 8)}`);
-      } else if (check.status === 'up-to-date') {
-        console.log('No updates available.');
-      } else {
-        console.error('Update check failed. See logs above for details.');
-        process.exit(1);
-      }
-      return;
-    }
-
-    await migrateToBlueGreen((msg) => console.log(msg), {
-      allowRemoteBootstrap: true,
-      repairLiveNodeUi: false,
-    });
-    console.log('Checking for updates and applying...');
-    try {
-      const updateStatus = await performUpdateWithStatus(au, (msg) => console.log(msg), {
-        refOverride,
-        allowPrerelease: opts.allowPrerelease ? true : undefined,
-        verifyTagSignature,
-      });
-      if (updateStatus === 'updated') {
-        const pid = await readPid();
-        if (pid && isProcessRunning(pid)) {
-          console.log('Stopping daemon...');
-          try {
-            process.kill(pid, 'SIGTERM');
-          } catch (err) {
-            if (!hasErrorCode(err, 'ESRCH')) throw err;
-          }
-          for (let i = 0; i < 20; i++) {
-            await sleep(500);
-            if (!isProcessRunning(pid)) break;
-          }
-          if (isProcessRunning(pid)) {
-            console.error('Update applied but daemon is still running after SIGTERM. Stop it manually before restarting.');
-            process.exit(1);
-          }
-          console.log('Update applied. Run "dkg start" to start with the new version.');
-        } else {
-          console.log('Update applied. Start the daemon with: dkg start');
-        }
-      } else if (updateStatus === 'up-to-date') {
-        console.log('No update needed — already on latest.');
-      } else {
-        console.error('Update failed before activation. Check logs and retry.');
-        process.exit(1);
-      }
-    } catch (err) {
-      console.error(`Update failed: ${toErrorMessage(err)}`);
-      process.exit(1);
-    }
+    // --- Git-based update path: hard refusal under OT-RFC-41 §4.2 / §5 PR 5 ---
+    //
+    // Bundle A shipped this branch with a deprecation warning;
+    // Bundle B converts it to a hard refusal. The npm path above
+    // is the canonical update mechanism for both Edge (`npm
+    // install -g`) and Core (`npm install` into a slot). The
+    // git-pull + build-from-source path is no longer reachable
+    // from any user-facing CLI entry point.
+    //
+    // For monorepo contributors: the canonical "update" is
+    // `git pull && pnpm install && pnpm build` from the repo
+    // root — `dkg update` is not the right tool.
+    // For pre-rc.12 `install.sh` operators: re-install via
+    // `npm install -g @origintrail-official/dkg` and let the
+    // first-start migration record `~/.dkg/previous-version`.
+    //
+    // The dead `_performUpdateInner` / `performUpdate` /
+    // `checkForUpdate` / `checkForNewCommit*` symbols stay in
+    // `daemon/auto-update.ts` for one release so a rollback to
+    // rc.11 still type-checks; a follow-up cleanup PR deletes
+    // them once Bundle B has soaked on devnet.
+    console.error(
+      '\n' +
+      '[dkg update] ERROR: git-based update is no longer supported.\n' +
+      '\n' +
+      '  Per OT-RFC-41, all DKG node updates now flow through the npm registry.\n' +
+      '\n' +
+      '  - Monorepo contributors: use `git pull && pnpm install && pnpm build`\n' +
+      '    from the repo root. `dkg update` is for npm-installed nodes only.\n' +
+      '  - install.sh-style operators: re-install via `npm install -g\n' +
+      '    @origintrail-official/dkg`. The first daemon start records\n' +
+      '    your existing slot version as the rollback target. Run\n' +
+      '    `dkg doctor --json` for a diagnostic of your current layout.\n' +
+      '  - Then re-run `dkg update` from a fresh `npm install -g\n' +
+      '    @origintrail-official/dkg` install.\n' +
+      '\n' +
+      '  RFC: https://github.com/OriginTrail/dkgv10-spec/blob/main/rfcs/OT-RFC-41-edge-node-npm-only-install-and-update.md\n' +
+      '\n',
+    );
+    process.exit(1);
   });
 
 // ─── dkg rollback ────────────────────────────────────────────────────
 
 program
   .command('rollback')
-  .description('Roll back to the previous release slot and stop the daemon')
+  .description('Roll back to the previous DKG version (Edge: npm reinstall; Core: blue-green slot flip)')
   .action(async () => {
+    // OT-RFC-41 §4.8 / Bundle B1b: Edge rollback is a pure
+    // `npm install -g @<previous>` against the npm-global install.
+    // The previous version is recorded in `~/.dkg/previous-version`
+    // by `performNpmUpdateEdge` (and by `noteEdgeLegacyReleases` on
+    // first-start under rc.12 for users coming from a slot-based
+    // install). Core continues to use the slot-flip mechanism.
+    const rollbackConfig = await loadConfig().catch(() => null);
+    const rollbackRole = rollbackConfig?.nodeRole ?? 'edge';
+
+    if (rollbackRole === 'edge') {
+      const previousVersionPath = join(dkgDir(), 'previous-version');
+      if (!existsSync(previousVersionPath)) {
+        console.error(
+          "No rollback target recorded. ~/.dkg/previous-version is absent — either this is the first install, or a previous 'dkg update' did not record a target.\n",
+        );
+        console.error(
+          'To roll back manually, run:\n' +
+            `  npm install -g @origintrail-official/dkg@<version>\n\n` +
+            'See https://www.npmjs.com/package/@origintrail-official/dkg?activeTab=versions for available versions.',
+        );
+        process.exit(1);
+      }
+      const targetVersion = readFileSync(previousVersionPath, 'utf-8').trim();
+      if (!targetVersion) {
+        console.error('~/.dkg/previous-version is empty; cannot determine rollback target.');
+        process.exit(1);
+      }
+
+      const currentVersion = getCurrentCliVersion();
+      console.log(`Rolling back from ${currentVersion} to ${targetVersion} via NPM...`);
+      const rollbackStatus = await performNpmUpdateEdge(
+        targetVersion,
+        currentVersion,
+        (msg) => console.log(msg),
+      );
+      if (rollbackStatus !== 'updated') {
+        console.error('Rollback failed. Check logs and retry.');
+        process.exit(1);
+      }
+      const stopped = await stopDaemonIfRunning();
+      if (!stopped) {
+        console.error('Rollback applied but old daemon is still running. Stop it manually and run "dkg start".');
+        process.exit(1);
+      }
+      console.log(`Rolled back to ${targetVersion}. Run "dkg start" to start with the rolled-back version.`);
+      return;
+    }
+
+    // Core path: existing slot-flip rollback (unchanged).
     const current = await activeSlot();
     if (!current) {
       console.error('Blue-green slots not initialized. Nothing to roll back.');
@@ -4163,6 +4724,48 @@ program
     }
     console.log(`Rolled back: current → slot ${target}`);
     console.log('Daemon stopped. Run "dkg start" to start with the rolled-back version.');
+  });
+
+// ─── dkg doctor ──────────────────────────────────────────────────────
+//
+// Per OT-RFC-41 §4.7. Surfaces install-layout / version-skew / orphan-clone
+// anomalies before an agent touches DKG state. Wired into SKILL.md as a
+// session-start ritual; also invoked by `dkg update`'s pre-flight check
+// (the orchestrator runs a narrow subset — install-layout + version-skew).
+
+program
+  .command('doctor')
+  .description('Diagnose install state, version skew, orphan clones, plugin root, and config sanity')
+  .option('--json', 'Emit the report as JSON instead of human-readable text')
+  .option('--no-orphan-scan', "Skip the orphan-repository home-directory scan (§4.7.1)")
+  .action(async (opts: { json?: boolean; orphanScan?: boolean }) => {
+    const { createProductionDeps, runDoctor, formatDoctorReport, ALL_CHECK_IDS } =
+      await import('./doctor/index.js');
+    const config = await loadConfig();
+    const deps = createProductionDeps({ apiPort: config.apiPort ?? 9200 });
+    // Overlay operator-configured scan roots + skipChecks from config.
+    // The doctor namespace is opt-in — absent config means defaults.
+    const doctorConfig = (config as unknown as Record<string, unknown>).doctor as
+      | { scanRoots?: unknown; skipChecks?: unknown }
+      | undefined;
+    if (doctorConfig) {
+      if (Array.isArray(doctorConfig.scanRoots)) {
+        deps.extraScanRoots = doctorConfig.scanRoots.filter((s): s is string => typeof s === 'string');
+      }
+      if (Array.isArray(doctorConfig.skipChecks)) {
+        deps.skipChecks = doctorConfig.skipChecks.filter((s): s is string => typeof s === 'string');
+      }
+    }
+    const requestedChecks = opts.orphanScan === false
+      ? ALL_CHECK_IDS.filter((id) => id !== 'orphan-repos')
+      : ALL_CHECK_IDS;
+    const report = await runDoctor(deps, { checks: requestedChecks });
+    if (opts.json) {
+      console.log(JSON.stringify(report, null, 2));
+    } else {
+      console.log(formatDoctorReport(report));
+    }
+    process.exit(report.exitCode);
   });
 
 // ─── dkg random-sampling (alias: rs) ─────────────────────────────────
@@ -4244,12 +4847,12 @@ randomSamplingCmd
           const status = String(entry.status ?? '?');
           const epoch = String(entry.epoch ?? '?');
           const periodStart = String(entry.periodStartBlock ?? '?');
-          const kcId = entry.kcId !== undefined ? `kc=${entry.kcId}` : '';
+          const kaId = entry.kaId !== undefined ? `kc=${entry.kaId}` : '';
           const tx = entry.txHash !== undefined ? ` tx=${String(entry.txHash).slice(0, 14)}…` : '';
           const errCode = entry.error && typeof entry.error === 'object'
             ? ` err=${(entry.error as { code?: string }).code ?? '?'}`
             : '';
-          console.log(`${ts}  ep=${epoch} pb=${periodStart}  ${status.padEnd(10)} ${kcId}${tx}${errCode}`);
+          console.log(`${ts}  ep=${epoch} pb=${periodStart}  ${status.padEnd(10)} ${kaId}${tx}${errCode}`);
         } catch {
           console.log(line);
         }

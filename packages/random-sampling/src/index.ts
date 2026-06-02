@@ -28,7 +28,15 @@ export {
   KCDataMissingError,
   type KCTriple,
   type KCExtractionResult,
-} from './kc-extractor.js';
+} from './ka-extractor.js';
+
+export {
+  extractCiphertextChunksFromStore,
+  CiphertextChunksMissingError,
+  CiphertextChunksMalformedError,
+  type ExtractCiphertextChunksInput,
+  type CiphertextChunksExtractionResult,
+} from './ciphertext-chunks-extractor.js';
 
 export {
   type ProofBuilder,
@@ -47,6 +55,9 @@ export {
   type RandomSamplingProverDeps,
   type ProverLogger,
   type TickOutcome,
+  type CiphertextChunkBackfillFn,
+  type CiphertextChunkBackfillRequest,
+  type CiphertextChunkBackfillResult,
 } from './prover.js';
 
 export {

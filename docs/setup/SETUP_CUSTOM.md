@@ -100,7 +100,7 @@ const result = await agent.publish('research-data', [
   { subject: 'http://ex.org/paper1', predicate: 'http://schema.org/datePublished', object: '"2025-01-15"', graph: '' },
 ]);
 
-console.log('Published KC:', result.kcId);
+console.log('Published KA:', result.kaId);
 console.log('KAs:', result.kaManifest.length);
 ```
 
@@ -280,10 +280,26 @@ await node.start();
 // Option A: Oxigraph directly
 const store = new OxigraphStore();
 
-// Option B: Any registered backend via the factory
+// Option B: Any registered backend via the factory.
+//
+// Use this when you want the same backend the daemon uses — Blazegraph
+// or any SPARQL 1.1 server (Fuseki, GraphDB, Stardog, …). The factory
+// runs whichever adapter was registered for the named backend; see the
+// "Triple Store Backends" section of the repo README for the full
+// matrix and config shapes.
+//
 // const store = await createTripleStore({
 //   backend: 'blazegraph',
 //   options: { url: 'http://127.0.0.1:9999/bigdata/namespace/mynode/sparql' },
+// });
+//
+// const store = await createTripleStore({
+//   backend: 'sparql-http',
+//   options: {
+//     queryEndpoint: 'http://server.example/query',
+//     updateEndpoint: 'http://server.example/update',
+//     auth: 'Bearer YOUR_TOKEN', // optional
+//   },
 // });
 
 const router = new ProtocolRouter(node);

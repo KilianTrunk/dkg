@@ -33,7 +33,7 @@ import type {
   LiftAuthorityProof,
   SharedMemoryPublicSnapshotStorageConfig,
 } from '@origintrail-official/dkg-publisher';
-import type { ChainAdapter } from '@origintrail-official/dkg-chain';
+import type { ApprovalPolicy, ChainAdapter } from '@origintrail-official/dkg-chain';
 import type { QueryAccessConfig } from '@origintrail-official/dkg-query';
 import type { SkillHandler } from './messaging.js';
 import type { CclFactResolutionMode } from './ccl-fact-resolution.js';
@@ -86,6 +86,39 @@ export type LocalSwmSenderKeyReceiveState = {
   senderSigningPublicKey: Uint8Array;
   createdAtMs: number;
   skippedChainKeys: Map<number, Uint8Array>;
+};
+
+/**
+ * A SWM sender-key package that landed in the "no advertised peerId"
+ * branch of `createAndDistributeSwmSenderKeyEpoch` and is held for
+ * delivery once we learn a peerId for the recipient agent (via
+ * connection:open or a subsequent publish that re-resolves the
+ * recipient set).
+ *
+ * Keyed in-memory by lowercased `recipientAgentAddress`. The triple
+ * `(senderAgentAddress, recipientKeyId, epochId)` dedupes within an
+ * agent's queue; newer epochs supersede older ones for the same
+ * `(senderAgentAddress, recipientAgentAddress)` pair.
+ */
+export type PendingSenderKeyEntry = {
+  /** Lower-cased EIP-55 sender agent address. */
+  senderAgentAddress: string;
+  /** Lower-cased EIP-55 recipient agent address (matches the map key). */
+  recipientAgentAddress: string;
+  recipientKeyId: string;
+  epochId: string;
+  contextGraphId: string;
+  subGraphName?: string;
+  /**
+   * Canonical encoded `SwmSenderKeyPackageMsg` wire bytes — exactly
+   * what gets passed to `messenger.sendReliable(peerId, PROTOCOL_SWM_
+   * SENDER_KEY, ...)` when the recipient becomes reachable.
+   */
+  packageBytes: Uint8Array;
+  /** Stable Messenger id for the current explicit retry chain. Rotated after delivered non-acceptance. */
+  messageId?: string;
+  /** Wall-clock when the row was enqueued; used for diagnostics + future TTL. */
+  createdAtMs: number;
 };
 
 export type RandomSamplingStartResult = 'started' | 'retryable' | 'disabled';
@@ -145,6 +178,37 @@ export class SyncAccessDeniedError extends Error {
     super(`Sync access denied for context graph "${contextGraphId}"`);
     this.name = 'SyncAccessDeniedError';
     this.contextGraphId = contextGraphId;
+  }
+}
+
+/**
+ * Thrown by `acceptSwmSenderKeyPackage` when an inbound sender-key
+ * setup package is targeted at a `recipientKeyId` we don't host as an
+ * active local X25519 private key. This is the routine, benign outcome
+ * when a sender fans the bootstrap out across every cached snapshot of
+ * our agent's public encryption keys (e.g. registry observations from
+ * before a rotation): one bootstrap per stale fingerprint lands here,
+ * only the bootstrap that targets the currently active key passes.
+ *
+ * Distinct from a generic `Error` so the receive handler can route this
+ * outcome to DEBUG (silenced from `daemon.log`) while leaving genuine
+ * security/protocol failures (signature mismatch, gate violation,
+ * non-local recipient, revoked-key targeting) at WARN. See PR
+ * `chore/swm-sender-key-stale-noise` for the operator-noise context.
+ *
+ * The thrown message is preserved verbatim from the original WARN so
+ * any external log scrapers that grepped for the legacy string keep
+ * matching: `No local X25519 private key for DKG agent <addr> key <id>`.
+ */
+export class StaleSenderKeyTargetError extends Error {
+  readonly code = 'StaleSenderKeyTarget';
+  readonly recipientAgentAddress: string;
+  readonly recipientKeyId: string;
+  constructor(recipientAgentAddress: string, recipientKeyId: string) {
+    super(`No local X25519 private key for DKG agent ${recipientAgentAddress} key ${recipientKeyId}`);
+    this.name = 'StaleSenderKeyTargetError';
+    this.recipientAgentAddress = recipientAgentAddress;
+    this.recipientKeyId = recipientKeyId;
   }
 }
 
@@ -306,6 +370,27 @@ export interface PeerDiagnostics {
     knownMultiaddrCount: number;
     multiaddrs: string[];
     protocols: string[];
+    /**
+     * DKG node-release string the remote peer advertised via libp2p's
+     * `identify`. DKG nodes from rc.11+ set this to `dkg/<semver>` —
+     * see `DKGNodeConfig.nodeVersion`. Pre-rc.11 peers fall through to
+     * libp2p's default (`js-libp2p/<version>`), which is itself a
+     * useful "peer hasn't adopted the version-advertisement convention
+     * yet" signal. `null` when identify hasn't completed (cold cache,
+     * never dialed).
+     *
+     * Sourced from libp2p's `Peer.metadata.AgentVersion` (their wire
+     * name); renamed here because in the DKG context "agent" already
+     * means `DKGAgent`.
+     */
+    nodeVersion: string | null;
+    /**
+     * libp2p protocol-version string from `identify` (`ProtocolVersion`
+     * on the wire). Default `ipfs/0.1.0`. Unrelated to DKG protocol
+     * versions — kept under its libp2p name because that's what it is.
+     * `null` when identify hasn't completed.
+     */
+    protocolVersion: string | null;
   } | null;
   /**
    * Pending substrate-outbox entries for this peer.
@@ -579,6 +664,41 @@ export interface DKGAgentConfig {
    */
   relayReservationCount?: number;
   /**
+   * DKG node-release identifier the underlying libp2p node advertises
+   * to peers via the `identify` protocol. Forwarded straight into
+   * `DKGNodeConfig.nodeVersion`. Convention `dkg/<semver>` (set by
+   * `packages/cli/src/daemon/lifecycle.ts`). Surfaced back to operators
+   * via `peerStore.nodeVersion` on the `PeerDiagnostics` object
+   * returned by `/api/peer-info` and MCP `dkg_peer_info`. When omitted,
+   * libp2p's default (`js-libp2p/<version>`) is broadcast.
+   *
+   * Naming note: on the wire libp2p calls this field `AgentVersion`,
+   * but inside DKG that name collides with `DKGAgent`. We carry it as
+   * `nodeVersion` everywhere we control, and only touch the libp2p
+   * name (`Peer.metadata.AgentVersion`) at the read boundary in
+   * `getPeerDiagnostics()`.
+   */
+  nodeVersion?: string;
+  /**
+   * libp2p networking tunables for small / sparse networks. All three
+   * fields are optional and forwarded straight into the matching
+   * `DKGNodeConfig` slots. Omitting any field preserves the upstream
+   * default. See `packages/core/src/types.ts` for per-field semantics
+   * and the operator-facing surface in `packages/cli/src/config.ts`
+   * (`network` block).
+   */
+  peerStoreMaxAddressAgeMs?: number;
+  peerStoreMaxPeerAgeMs?: number;
+  dhtQuerySelfIntervalMs?: number;
+  /**
+   * Cadence at which the daemon re-publishes its own agent profile
+   * (PR feat/chain-agents-cg-phonebook). Forwarded straight from
+   * `DkgConfig.network.agentProfileHeartbeatMs`. Defaults to
+   * `AGENT_PROFILE_HEARTBEAT_MS` (5 min) when omitted; `0` disables
+   * the timer (the one-shot startup publish still fires).
+   */
+  agentProfileHeartbeatMs?: number;
+  /**
    * Path to the V10 Random Sampling prover write-ahead log. Core
    * nodes only; ignored on edge. When omitted, an in-memory WAL is
    * used (loses crash-recovery context on restart). Production
@@ -598,6 +718,13 @@ export interface DKGAgentConfig {
    * is safe but yields more chain reads.
    */
   randomSamplingTickIntervalMs?: number;
+  /**
+   * Interval between V10 StorageACK handler registration retries when the
+   * on-chain identity isn't yet resolved (e.g. a transient boot-time RPC
+   * outage). Defaults to `STORAGE_ACK_REGISTRATION_RETRY_MS` (30s). Lowered in
+   * tests to drive the background re-resolution path deterministically.
+   */
+  storageAckRegistrationRetryMs?: number;
   /** Pre-built chain adapter (for testing). If provided, chainConfig is ignored. */
   chainAdapter?: ChainAdapter;
   /** Private key for the V10 ACK signer. When omitted, falls back to chainConfig.operationalKeys[0]. */
@@ -620,10 +747,20 @@ export interface DKGAgentConfig {
    */
   chainConfig?: {
     rpcUrl: string;
+    rpcUrls?: string[];
     hubAddress: string;
+    /** Optional TRAC token contract override. When omitted, the adapter resolves Hub.Token. */
+    tokenAddress?: string;
     adminPrivateKey?: string;
     operationalKeys: string[];
     chainId?: string;
+    /**
+     * Optional V10 allowance-sizing policy. Threaded straight through to
+     * the `EVMChainAdapter`; see `ApprovalPolicy` in
+     * `@origintrail-official/dkg-chain`. Omit to inherit the default
+     * (`'per-publish'`, bounded-per-publish with on-chain 1n floor).
+     */
+    approvalPolicy?: ApprovalPolicy;
   };
   /** Cross-agent query access configuration. */
   queryAccess?: QueryAccessConfig;

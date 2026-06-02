@@ -175,10 +175,11 @@ export const fetchPerTypeStats = (periodMs: number, bucketMs?: number) => {
 };
 
 // --- Logs ---
-export const fetchLogs = (params: Record<string, string> = {}) => {
-  const qs = new URLSearchParams(params).toString();
-  return get<{ logs: any[]; total: number }>(`/api/logs${qs ? '?' + qs : ''}`);
-};
+// NOTE: A `fetchLogs()` wrapper around the DB-backed /api/logs route
+// used to live here. It had no production importer (only its own unit
+// test) and the underlying route was removed in V15 of the dashboard
+// DB schema. The UI's actual log viewer uses `fetchNodeLog()` below,
+// which is file-backed.
 
 export const fetchNodeLog = (params: { lines?: number; q?: string } = {}) => {
   const qs = new URLSearchParams();
@@ -462,6 +463,46 @@ export async function importFile(
 }
 
 // --- Query ---
+
+// In-flight POST /api/query dedup. Coalesces concurrent identical
+// requests so React strict-mode double-mounts and sibling views asking
+// the same SPARQL against the same CG share one underlying fetch.
+//
+// Scope is *strictly inflight*: the entry is deleted as soon as the
+// promise settles (success OR failure), so the next call always issues
+// a fresh request. No caching, no staleness window — this is purely
+// concurrent-coalescing, drop-in safe for every existing caller.
+//
+// Motivation: opening a project on the dashboard fires `useMemoryEntities`
+// from two mounted instances (Dashboard card + ProjectView), giving 6
+// identical `/api/query` POSTs for the WM/SWM/VM fan-out against a
+// multi-GB Oxigraph store. Each duplicate adds seconds of wall time on
+// large stores. Inflight dedup collapses the dupes to one.
+const inflightQuery = new Map<string, Promise<{ result: any }>>();
+
+export function postQueryDeduped(body: Record<string, unknown>): Promise<{ result: any }> {
+  const key = JSON.stringify(body);
+  const existing = inflightQuery.get(key);
+  if (existing) return existing;
+  const promise = (async () => {
+    const res = await fetch(`${BASE}/api/query`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
+      body: key,
+    });
+    if (!res.ok) {
+      const errBody = await res.json().catch(() => ({}));
+      const msg = (errBody as { error?: string })?.error ?? `HTTP ${res.status}`;
+      throw new HttpError(res.status, msg, errBody);
+    }
+    return res.json() as Promise<{ result: any }>;
+  })().finally(() => {
+    inflightQuery.delete(key);
+  });
+  inflightQuery.set(key, promise);
+  return promise;
+}
+
 export const executeQuery = (
   sparql: string,
   contextGraphId?: string,
@@ -469,7 +510,7 @@ export const executeQuery = (
   graphSuffix?: '_shared_memory',
   view?: 'verified-memory' | 'shared-working-memory',
 ) =>
-  post<{ result: any }>('/api/query', { sparql, contextGraphId, includeSharedMemory, graphSuffix, view });
+  postQueryDeduped({ sparql, contextGraphId, includeSharedMemory, graphSuffix, view });
 
 // --- Publish (assertion-lifecycle: RFC-001 §9.x sign-at-creation) ---
 //
@@ -524,6 +565,15 @@ export interface AssertionInfo {
   name: string;
   graphUri: string;
   tripleCount?: number;
+  /**
+   * Sub-graph slug when the assertion lives in a sub-graph
+   * partition, undefined for root-bucket assertions. Lets the UI
+   * surface the structural placement inline on each row without a
+   * separate lookup. Field is uniformly populated on both WM and
+   * SWM `AssertionInfo`s so consumers don't need a layer-aware
+   * branch.
+   */
+  subGraph?: string;
 }
 
 /**
@@ -623,32 +673,179 @@ export async function listAssertions(
 
       if (seen.has(lifecycle)) continue;
       seen.add(lifecycle);
-      result.push({ name, graphUri: lifecycle });
+      result.push({ name, graphUri: lifecycle, subGraph: subGraphName });
     }
     return result;
   }
 
   // layer === 'wm'
-  const sparql = `SELECT DISTINCT ?g (COUNT(?s) AS ?cnt) WHERE { GRAPH ?g { ?s ?p ?o } } GROUP BY ?g`;
-  const data = await executeQuery(sparql, contextGraphId);
+  //
+  // #864 rc.12 follow-up — without `includeContextGraphPartitions`, the
+  // daemon's contextGraphId-scoped routing (DKGQueryEngine.query, the
+  // `effectiveContextGraphId && !options?.view` branch) restricts
+  // `GRAPH ?g { … }` reads to the static allow-list
+  //   { <cg>, <cg>/_meta, <cg>/_shared_memory_meta }
+  // via `constrainGraphVariablesToAllowedSet`. Every WM assertion lives
+  // in a content partition (`<cg>/assertion/<agent>/<name>` or the
+  // sub-graph variant `<cg>/<sg>/assertion/<agent>/<name>`) — none of
+  // which are in that allow-list — so this enumeration came back empty
+  // for any CG no matter how many assertions actually existed.
+  // Downstream that surfaced as:
+  //   - `AssertionsList` rendered "no assertions" right after import.
+  //   - `LayerActionsWidget` showed the correct "Promote N to SWM" badge
+  //     (the count comes from `useMemoryEntities`, which already opts
+  //     into `includeContextGraphPartitions`), but on click its
+  //     `handleAction` loop iterated zero times and hit the no-op
+  //     bulk-promote branch — the exact "0 triples promoted" symptom
+  //     the rc.12 issue reported even after the publisher-side
+  //     `AssertionNotPersistedError` fix landed.
+  // Opting into the same partition-aware scope `useMemoryEntities`
+  // already uses brings the assertion partitions back into `GRAPH ?g`
+  // expansion. Same `/api/query` route, same `postQueryDeduped` cache,
+  // same privacy/cost envelope as the dashboard counters.
+  // Codex review on #898 — listing WM by raw `GRAPH ?g { ?s ?p ?o }`
+  // counts re-listed promoted assertions because `assertionPromote`
+  // intentionally leaves daemon-owned `urn:dkg:file:*` /
+  // `urn:dkg:extraction:*` quads behind in the assertion data graph
+  // (publisher Bug 8 / Round 9 Bug 25 import-bookkeeping filter), so
+  // those graphs stay non-empty after promote even though the
+  // lifecycle in `_meta` has flipped to `dkg:memoryLayer "SWM"`. The
+  // UI was therefore offering Promote on assertions that were no
+  // longer in WM. Derive WM membership from the lifecycle marker the
+  // publisher itself owns: `<assertionGraphUri> dkg:memoryLayer "WM"`
+  // in `<cg>/_meta` (set by `assertionCreate`, flipped to "SWM" by
+  // `assertionPromote`). The OPTIONAL keeps WM rows visible even when
+  // the data graph is genuinely empty (fresh create with no writes
+  // yet), matching the prior listing semantics for that case.
+  const metaGraph = `did:dkg:context-graph:${contextGraphId}/_meta`;
+  const sparql = `SELECT ?g (COUNT(?s) AS ?cnt) WHERE {
+    GRAPH <${metaGraph}> { ?g <http://dkg.io/ontology/memoryLayer> "WM" }
+    OPTIONAL { GRAPH ?g { ?s ?p ?o } }
+  } GROUP BY ?g`;
+  const data = await postQueryDeduped({
+    sparql,
+    contextGraphId,
+    includeContextGraphPartitions: true,
+  });
   const bindings: any[] = data?.result?.bindings ?? [];
-  const prefix = `did:dkg:context-graph:${contextGraphId}/assertion/`;
+  // #706 fix — the prior `startsWith('did:dkg:context-graph:<cg>/assertion/')`
+  // shape silently dropped sub-graph-scoped WM assertions, whose graph
+  // URI is `did:dkg:context-graph:<cg>/<sg>/assertion/<agent>/<name>`
+  // (the sub-graph segment sits between `<cg>/` and `/assertion/`).
+  // We accept exactly two shapes, post-cgPrefix:
+  //   root-bucket : ['assertion', <agent>, <name>]            (3 segs)
+  //   sub-graph   : [<subGraphName>, 'assertion', <agent>, <name>] (4 segs)
+  // Anything else (extra segments on either side, internal meta
+  // graphs sharing the prefix, etc.) is silently dropped. The parse
+  // is deliberately strict so a row never gets admitted with a
+  // mis-derived name — promote/preview lookups key on `name` and
+  // would silently miss otherwise. The cgId itself is treated as
+  // opaque (it may contain `/assertion/` as a literal substring,
+  // per `validateContextGraphId`).
+  const cgPrefix = `did:dkg:context-graph:${contextGraphId}/`;
   const result: AssertionInfo[] = [];
   for (const b of bindings) {
     const g = typeof b.g === 'string' ? b.g : b.g?.value;
-    if (!g || !g.startsWith(prefix)) continue;
-    const tail = g.slice(prefix.length);
-    const slash = tail.indexOf('/');
-    const name = slash >= 0 ? tail.slice(slash + 1) : tail;
+    if (!g || !g.startsWith(cgPrefix)) continue;
+    const segments = g.slice(cgPrefix.length).split('/');
+    let subGraph: string | undefined;
+    let name: string;
+    if (segments.length === 3 && segments[0] === 'assertion') {
+      subGraph = undefined;
+      name = segments[2];
+    } else if (segments.length === 4 && segments[1] === 'assertion') {
+      subGraph = segments[0];
+      name = segments[3];
+    } else {
+      continue;
+    }
+    if (!name) continue;
     const cnt = typeof b.cnt === 'string' ? parseInt(b.cnt, 10) : (b.cnt?.value ? parseInt(b.cnt.value, 10) : undefined);
-    result.push({ name, graphUri: g, tripleCount: Number.isFinite(cnt) ? cnt : undefined });
+    result.push({ name, graphUri: g, tripleCount: Number.isFinite(cnt) ? cnt : undefined, subGraph });
   }
   return result;
 }
 
-/** Promote an assertion from WM to SWM. */
-export const promoteAssertion = (contextGraphId: string, assertionName: string, entities: string | string[] = 'all') =>
-  post<{ promotedCount: number }>(`/api/assertion/${encodeURIComponent(assertionName)}/promote`, { contextGraphId, entities });
+/**
+ * Promote an assertion from WM to SWM.
+ *
+ * PR #710 fix — `subGraphName` is the third part of the daemon's
+ * lookup key alongside `(contextGraphId, assertionName)`. Without
+ * it, promoting a sub-graph-scoped assertion either 404s or
+ * silently promotes a same-named root-bucket assertion. The
+ * daemon route already accepts the field
+ * (`packages/cli/src/daemon/routes/assertion.ts:820-823`); only
+ * spread it when supplied so root-bucket promotes keep the prior
+ * wire shape.
+ */
+export const promoteAssertion = (
+  contextGraphId: string,
+  assertionName: string,
+  entities: string | string[] = 'all',
+  subGraphName?: string,
+) =>
+  post<{ promotedCount: number }>(
+    `/api/assertion/${encodeURIComponent(assertionName)}/promote`,
+    { contextGraphId, entities, ...(subGraphName ? { subGraphName } : {}) },
+  );
+
+// Issue #864 — central UI translator for `promoteAssertion` outcomes so
+// every call-site speaks the same language. Two shapes get massaged
+// here that the bare-promotedCount path used to render confusingly:
+//
+//   • `promotedCount === 0` is technically a success but normally
+//     means "the assertion graph was already empty when promote ran"
+//     (already-promoted re-click, discarded draft, or — the rc.12
+//     bug from issue #864 — a transient state where _meta indicates
+//     persistence but the data graph isn't visible yet). Surface that
+//     ambiguity instead of the misleading literal "Promoted 0 triples
+//     to Shared Memory" toast.
+//   • An HttpError with `body.code === 'ASSERTION_NOT_PERSISTED'`
+//     (the new 409 from the /promote route) means we caught the
+//     inconsistency on the daemon side. Re-render the daemon's hint
+//     as a UI-friendly sentence that includes the expected count so
+//     the user understands re-import is the recovery path.
+export type PromoteOutcome =
+  | { kind: 'success'; promotedCount: number; message: string }
+  | { kind: 'noop'; message: string }
+  | { kind: 'not-persisted'; message: string; expectedTripleCount?: number };
+
+export function describePromoteResult(
+  assertionName: string,
+  res: { promotedCount: number },
+): PromoteOutcome {
+  if (res.promotedCount > 0) {
+    return {
+      kind: 'success',
+      promotedCount: res.promotedCount,
+      message: `Promoted ${res.promotedCount} triple${res.promotedCount === 1 ? '' : 's'} from ${assertionName} to Shared Working Memory.`,
+    };
+  }
+  return {
+    kind: 'noop',
+    message: `${assertionName} had no triples to promote. It may already be in Shared Working Memory, or the extracted content is still being committed — refresh and try again.`,
+  };
+}
+
+export function describePromoteError(
+  assertionName: string,
+  err: unknown,
+): PromoteOutcome | null {
+  if (err instanceof HttpError && err.status === 409) {
+    const body = err.body as { code?: string; expectedTripleCount?: number } | undefined;
+    if (body?.code === 'ASSERTION_NOT_PERSISTED') {
+      const expected = typeof body.expectedTripleCount === 'number' ? body.expectedTripleCount : undefined;
+      return {
+        kind: 'not-persisted',
+        expectedTripleCount: expected,
+        message: expected
+          ? `${assertionName} was imported with ${expected} extracted triple${expected === 1 ? '' : 's'} but the data graph is empty. Re-import the source file (or re-write the assertion) before promoting.`
+          : `${assertionName}'s data graph is empty but its extraction metadata says it should hold content. Re-import the source file before promoting.`,
+      };
+    }
+  }
+  return null;
+}
 
 // --- File preview ---
 
@@ -664,9 +861,26 @@ export interface ExtractionStatus {
   completedAt?: string;
 }
 
-/** Fetch extraction status for an assertion (includes fileHash + contentType). */
-export const fetchExtractionStatus = (assertionName: string, contextGraphId: string) =>
-  get<ExtractionStatus>(`/api/assertion/${encodeURIComponent(assertionName)}/extraction-status?contextGraphId=${encodeURIComponent(contextGraphId)}`);
+/**
+ * Fetch extraction status for an assertion (includes fileHash + contentType).
+ *
+ * PR #710 Fix E — `subGraphName` is the third part of the daemon's
+ * lookup key alongside `(contextGraphId, assertionName)`. The route
+ * already accepts the query param
+ * (`packages/cli/src/daemon/routes/assertion.ts:3364`); only set it
+ * when supplied so root-bucket calls keep the prior URL shape.
+ */
+export const fetchExtractionStatus = (
+  assertionName: string,
+  contextGraphId: string,
+  subGraphName?: string,
+) => {
+  const params = new URLSearchParams({ contextGraphId });
+  if (subGraphName) params.set('subGraphName', subGraphName);
+  return get<ExtractionStatus>(
+    `/api/assertion/${encodeURIComponent(assertionName)}/extraction-status?${params}`,
+  );
+};
 
 /** Build a URL to serve a stored file by its hash (sha256: or keccak256:). */
 export function fileUrl(hash: string, contentType?: string): string {
@@ -685,7 +899,14 @@ export interface SwmRootEntity {
 
 /** List root entities in SWM with their triple counts. */
 export async function listSwmEntities(contextGraphId: string): Promise<SwmRootEntity[]> {
-  const sparql = `SELECT ?s (COUNT(?p) AS ?cnt) WHERE { ?s ?p ?o } GROUP BY ?s ORDER BY DESC(?cnt)`;
+  const swmGraph = `did:dkg:context-graph:${contextGraphId}/_shared_memory`;
+  const sparql = `SELECT ?s (COUNT(?p) AS ?cnt) WHERE {
+    GRAPH ?g {
+      ?s ?p ?o .
+      FILTER(STR(?g) = "${swmGraph}")
+      FILTER(?p != <http://dkg.io/ontology/workspaceOwner>)
+    }
+  } GROUP BY ?s ORDER BY DESC(?cnt)`;
   const data = await post<{ result: any }>('/api/query', { sparql, contextGraphId, view: 'shared-working-memory' });
   const bindings: any[] = data?.result?.bindings ?? [];
   return bindings.map((b) => {
@@ -702,20 +923,24 @@ export async function listSwmEntities(contextGraphId: string): Promise<SwmRootEn
 }
 
 export interface PublishResult {
-  kcId: string;
+  kaId: string;
   status: string;
   kas: { tokenId: string; rootEntity: string }[];
   txHash?: string;
   blockNumber?: number;
 }
 
-/** Publish SWM content on-chain (SWM -> VM). Pass rootEntities to selectively publish, or omit for all. */
-export const publishSharedMemory = (contextGraphId: string, rootEntities?: string[]) =>
-  post<PublishResult>('/api/shared-memory/publish', {
+/** Publish exactly one SWM root on-chain (SWM -> VM). */
+export const publishSharedMemory = (contextGraphId: string, rootEntities: string[]) => {
+  if (rootEntities.length !== 1) {
+    throw new Error('V10 publish requires exactly one root entity per request.');
+  }
+  return post<PublishResult>('/api/shared-memory/publish', {
     contextGraphId,
-    selection: rootEntities ?? 'all',
-    clearAfter: !rootEntities,
+    selection: rootEntities,
+    clearAfter: false,
   });
+};
 
 // --- Query history ---
 export const fetchQueryHistory = (limit = 50, offset = 0) =>
@@ -1827,7 +2052,22 @@ export const fetchWalletsBalances = () =>
     error?: string;
   }>('/api/wallets/balances');
 export const fetchRpcHealth = () =>
-  get<{ ok: boolean; rpcUrl: string | null; latencyMs: number | null; blockNumber: number | null; error?: string }>('/api/chain/rpc-health');
+  get<{
+    ok: boolean;
+    configured: boolean;
+    rpcEndpointCount: number;
+    latencyMs: number | null;
+    blockNumber: number | null;
+    error?: string;
+    rpcs: Array<{
+      index: number;
+      role: 'primary' | 'backup';
+      ok: boolean;
+      latencyMs: number | null;
+      blockNumber: number | null;
+      error?: string;
+    }>;
+  }>('/api/chain/rpc-health');
 
 // --- Node control ---
 export const shutdownNode = () =>
@@ -1837,29 +2077,99 @@ export const shutdownNode = () =>
 export const subscribeToContextGraph = (contextGraphId: string) =>
   post<{ subscribed: string; catchup?: { status: string; jobId: string } }>('/api/subscribe', { contextGraphId });
 
-// --- Notifications ---
+// --- Notifications (scoped pane wire contract — implementation-plan §3) ---
+//
+// The daemon now returns a caller-scoped, type-allowlisted, activity-collapsed,
+// join_request-reconciled feed. Every member of the union is one notification
+// kind; the pane never re-filters for correctness (scoping is server-side).
+// See `data-contract.md` §4 and `implementation-plan.md` §3 for the frozen
+// shape. Field names here are part of that frozen contract — daemon-engineer
+// owns the server side and flags ui-lead before any rename.
 
-export interface Notification {
-  id: number;
+/** Common envelope present on every pane notification. `contextGraphName`
+ *  is the resolved display name; the client falls back to `shortId(cgId)`
+ *  when it's absent (never blank). */
+interface NotifWireBase {
+  /** Numeric row id for persisted rows; a stable string `digestKey`
+   *  (`activity:<cgId>:<kind>:<windowBucket>`) for collapsed activity
+   *  digests. The read endpoint accepts both. */
+  id: number | string;
   ts: number;
-  type: string;
-  title: string;
-  message: string;
-  source: string | null;
-  peer: string | null;
-  read: number;
-  meta: string | null;
+  /** 0 = unread, 1 = read. */
+  read: 0 | 1;
+  contextGraphId: string;
 }
 
-export const fetchNotifications = (opts?: { since?: number; limit?: number }) => {
-  const params = new URLSearchParams();
-  if (opts?.since) params.set('since', String(opts.since));
-  if (opts?.limit) params.set('limit', String(opts.limit));
-  const qs = params.toString();
-  return get<{ notifications: Notification[]; unreadCount: number }>(`/api/notifications${qs ? `?${qs}` : ''}`);
-};
+/** Incoming join request on a CG the caller curates — actionable
+ *  (inline Approve/Deny). Emitted only on the curator's node, so the
+ *  reader's role for this kind is always curator. */
+export interface JoinRequestNotif extends NotifWireBase {
+  type: 'join_request';
+  meta: { contextGraphName?: string; agentAddress: string; agentName?: string };
+}
 
-export const markNotificationsRead = (ids?: number[]) =>
+/** Confirmation that the caller's own outbound join request was accepted.
+ *  Counts toward the unread badge (positive, opens the new CG). */
+export interface JoinApprovedNotif extends NotifWireBase {
+  type: 'join_approved';
+  meta: { contextGraphName?: string; agentAddress: string };
+}
+
+/** Confirmation that the caller's own outbound join request was declined.
+ *  Demoted: informational, never counts toward the unread badge (the daemon's
+ *  `badgeCount` already excludes it). */
+export interface JoinRejectedNotif extends NotifWireBase {
+  type: 'join_rejected';
+  meta: { contextGraphName?: string; agentAddress: string };
+}
+
+/** Collapsed activity digest — per (contextGraphId × kind × window). `id` is
+ *  the stable `digestKey`. `count` is summed over the window and INCLUDES the
+ *  caller's own events (operators want visibility into their own agents). A
+ *  sole-self digest sets `bySelf` so the row renders a "You" indicator;
+ *  `actorAgentDid` / `actorAgentName` are populated ONLY when `soleAuthor ===
+ *  true` AND it is a single OTHER author (otherwise omitted → count-only). */
+export interface AssertionActivityNotif extends NotifWireBase {
+  type: 'assertion_activity';
+  id: string;
+  meta: {
+    contextGraphName?: string;
+    kind: 'created' | 'promoted' | 'published';
+    count: number;
+    actorAgentDid?: string;
+    actorAgentName?: string;
+    soleAuthor?: boolean;
+    /** True when the sole author is the reading agent → render "You". */
+    bySelf?: boolean;
+  };
+}
+
+export type NotifWire =
+  | JoinRequestNotif
+  | JoinApprovedNotif
+  | JoinRejectedNotif
+  | AssertionActivityNotif;
+
+export interface NotificationsFeedResponse {
+  /** Already scoped, type-allowlisted, activity-collapsed, join_request
+   *  reconciled against the live pending set. Render as-is. */
+  notifications: NotifWire[];
+  /** Unread badge count over the scoped set: unread join_request +
+   *  join_approved + assertion_activity digests. EXCLUDES join_rejected. */
+  badgeCount: number;
+  /** True when caller identity is unresolved → render "Verifying access…",
+   *  never "all caught up". `notifications` is empty in that case. */
+  scopeUnknown?: boolean;
+}
+
+/** Fetch the scoped notifications feed (`GET /api/notifications`). */
+export const fetchNotificationsFeed = () =>
+  get<NotificationsFeedResponse>('/api/notifications');
+
+/** Mark notifications read by id. Accepts numeric row ids AND string
+ *  `digestKey`s (the daemon resolves a digestKey to its underlying atomic
+ *  row ids). Omit `ids` to mark every scoped row read. */
+export const markNotificationsRead = (ids?: Array<number | string>) =>
   post<{ marked: number }>('/api/notifications/read', ids ? { ids } : {});
 
 // --- Sub-graphs (lightweight list + counts for SubGraphBar) ---

@@ -193,6 +193,9 @@ export class PublishHandler {
         await this.store.deleteByPattern({ graph: swmGraph, subject: rootEntity });
         await this.store.deleteBySubjectPrefix(swmGraph, rootEntity + '/.well-known/genid/');
         await this.store.deleteByPattern({
+          graph: swmGraph, subject: rootEntity, predicate: 'http://dkg.io/ontology/workspaceOwner',
+        });
+        await this.store.deleteByPattern({
           graph: swmMetaGraph, subject: rootEntity, predicate: 'http://dkg.io/ontology/workspaceOwner',
         });
       }

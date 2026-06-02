@@ -17,6 +17,7 @@ export {
 export {
   buildAgentProfile,
   canonicalAgentDidSubject,
+  collectPublishableMultiaddrs,
   AGENT_REGISTRY_CONTEXT_GRAPH,
   AGENT_REGISTRY_GRAPH,
   type AgentProfileConfig,
@@ -92,6 +93,7 @@ export {
 export {
   ContextGraphNotFoundError,
   InvalidContentError,
+  StaleSenderKeyTargetError,
   type DKGAgentConfig,
   type ContextGraphSub,
   type PublishOpts,
@@ -107,6 +109,7 @@ export {
   type PeerHealth,
   type CclPublishedEvaluationRecord,
   type CclPublishedResultEntry,
+  type PendingSenderKeyEntry,
 } from './dkg-agent-types.js';
 export {
   bindRandomSampling,

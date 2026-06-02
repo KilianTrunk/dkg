@@ -204,47 +204,117 @@ function processSharedMemory(wsDataQuads: Quad[], wsMetaQuads: Quad[]): SharedMe
   const RDF_TYPE = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type';
   const DKG_WORKSPACE_OP = 'http://dkg.io/ontology/WorkspaceOperation';
   const DKG_PUBLISHED_AT = 'http://dkg.io/ontology/publishedAt';
+  const DKG_PUBLISHER_PEER_ID = 'http://dkg.io/ontology/publisherPeerId';
   const PROV_ATTRIBUTED_TO = 'http://www.w3.org/ns/prov#wasAttributedTo';
   const SKOLEM_PREFIX = '/.well-known/genid/';
+  // SWM meta graphs are derived from data graphs by appending "_meta"
+  // (see `contextGraphSharedMemoryMetaUri` in dkg-core/constants.ts:
+  //   <cgPrefix>/_shared_memory      <-> <cgPrefix>/_shared_memory_meta
+  //   <cgPrefix>/<sub>/_shared_memory <-> <cgPrefix>/<sub>/_shared_memory_meta
+  // Stripping the suffix yields the matching data graph URI.
+  const META_SUFFIX = '_meta';
 
-  const opsWithType = new Set<string>();
-  const opsWithPublishedAt = new Set<string>();
+  // Codex review on #885 — keep validity scoped per (meta graph, op
+  // subject). Pre-fix the Sets were global, so an op subject that
+  // appeared in two `_shared_memory_meta` graphs (sub-A + sub-B) had
+  // its `rootEntity` admitted as universally valid even when only one
+  // of the graphs actually contained the matching data quads. The
+  // graph-keyed maps below preserve the responder's per-graph scoping
+  // exactly, then the data filter consults the same scope.
+  const opsWithTypeByMeta = new Map<string, Set<string>>();
+  const opsWithPublishedAtByMeta = new Map<string, Set<string>>();
   for (const q of wsMetaQuads) {
-    if (q.predicate === RDF_TYPE && q.object === DKG_WORKSPACE_OP) opsWithType.add(q.subject);
-    if (q.predicate === DKG_PUBLISHED_AT) opsWithPublishedAt.add(q.subject);
-  }
-  const validOps = new Set<string>([...opsWithType].filter((subject) => opsWithPublishedAt.has(subject)));
-
-  const allowedRoots = new Set<string>();
-  for (const q of wsMetaQuads) {
-    if (q.predicate === DKG_ROOT_ENTITY && validOps.has(q.subject)) {
-      const entity = q.object.startsWith('"') ? stripLiteral(q.object) : q.object;
-      allowedRoots.add(entity);
+    if (q.predicate === RDF_TYPE && q.object === DKG_WORKSPACE_OP) {
+      let s = opsWithTypeByMeta.get(q.graph);
+      if (!s) { s = new Set(); opsWithTypeByMeta.set(q.graph, s); }
+      s.add(q.subject);
+    } else if (q.predicate === DKG_PUBLISHED_AT) {
+      let s = opsWithPublishedAtByMeta.get(q.graph);
+      if (!s) { s = new Set(); opsWithPublishedAtByMeta.set(q.graph, s); }
+      s.add(q.subject);
     }
+  }
+  // (metaGraph → set of op subjects valid in that graph). An op needs
+  // BOTH `rdf:type WorkspaceOperation` AND `dkg:publishedAt` in the
+  // SAME meta graph to count.
+  const validOpsByMeta = new Map<string, Set<string>>();
+  const validOps = new Set<string>();
+  for (const [metaGraph, typedOps] of opsWithTypeByMeta) {
+    const publishedOps = opsWithPublishedAtByMeta.get(metaGraph);
+    if (!publishedOps) continue;
+    const valid = new Set<string>();
+    for (const op of typedOps) {
+      if (publishedOps.has(op)) {
+        valid.add(op);
+        validOps.add(op);
+      }
+    }
+    if (valid.size > 0) validOpsByMeta.set(metaGraph, valid);
+  }
+
+  // (dataGraph → set of allowed rootEntities). Derived from each meta
+  // graph by stripping the `_meta` suffix to yield the partner data
+  // graph URI. Op-meta quads from a graph that doesn't follow the
+  // suffix convention are skipped — they cannot be paired with a
+  // matching `_shared_memory` data graph and would only contribute
+  // unsoundness.
+  const allowedRootsByDataGraph = new Map<string, Set<string>>();
+  for (const q of wsMetaQuads) {
+    if (q.predicate !== DKG_ROOT_ENTITY) continue;
+    const validForGraph = validOpsByMeta.get(q.graph);
+    if (!validForGraph || !validForGraph.has(q.subject)) continue;
+    if (!q.graph.endsWith(META_SUFFIX)) continue;
+    const dataGraph = q.graph.slice(0, -META_SUFFIX.length);
+    const entity = q.object.startsWith('"') ? stripLiteral(q.object) : q.object;
+    let s = allowedRootsByDataGraph.get(dataGraph);
+    if (!s) { s = new Set(); allowedRootsByDataGraph.set(dataGraph, s); }
+    s.add(entity);
   }
 
   const validQuads = wsDataQuads.filter((q) => {
-    if (allowedRoots.has(q.subject)) return true;
-    for (const root of allowedRoots) {
+    const allowed = allowedRootsByDataGraph.get(q.graph);
+    if (!allowed) return false;
+    if (allowed.has(q.subject)) return true;
+    for (const root of allowed) {
       if (q.subject.startsWith(root + SKOLEM_PREFIX)) return true;
     }
     return false;
   });
 
-  const opCreators = new Map<string, string>();
+  // GH #748 Codex round 4: prefer the dedicated `dkg:publisherPeerId` literal
+  // for ownership-cache hydration; only fall back to `prov:wasAttributedTo`
+  // when it's a literal (the legacy shape). Post-fix `wasAttributedTo`
+  // carries an agent DID URI, and caching that as the peer-ID owner here
+  // would break first-writer/upsert recognition for follow-up writes from
+  // the same peer (the check at `_shareImpl` compares against the live
+  // `publisherPeerId` of the new write).
+  const opPeerIdField = new Map<string, string>();
+  const opAttrLiteralFallback = new Map<string, string>();
   for (const q of wsMetaQuads) {
-    if (q.predicate === PROV_ATTRIBUTED_TO && validOps.has(q.subject)) {
-      opCreators.set(q.subject, q.object.startsWith('"') ? stripLiteral(q.object) : q.object);
+    if (!validOps.has(q.subject)) continue;
+    if (q.predicate === DKG_PUBLISHER_PEER_ID) {
+      opPeerIdField.set(q.subject, q.object.startsWith('"') ? stripLiteral(q.object) : q.object);
+    } else if (q.predicate === PROV_ATTRIBUTED_TO && q.object.startsWith('"')) {
+      opAttrLiteralFallback.set(q.subject, stripLiteral(q.object));
     }
   }
+  const opCreators = new Map<string, string>();
+  for (const op of validOps) {
+    const peer = opPeerIdField.get(op) ?? opAttrLiteralFallback.get(op);
+    if (peer) opCreators.set(op, peer);
+  }
 
-  const entityCreators = new Map<string, string>();
+  const entityCreators = new Map<string, { dataGraph: string; entity: string; creator: string }>();
   for (const q of wsMetaQuads) {
-    if (q.predicate === DKG_ROOT_ENTITY && validOps.has(q.subject)) {
+    const validForGraph = validOpsByMeta.get(q.graph);
+    if (q.predicate === DKG_ROOT_ENTITY && validForGraph?.has(q.subject)) {
+      if (!q.graph.endsWith(META_SUFFIX)) continue;
+      const dataGraph = q.graph.slice(0, -META_SUFFIX.length);
       const entity = q.object.startsWith('"') ? stripLiteral(q.object) : q.object;
       const creator = opCreators.get(q.subject);
-      if (creator && !entityCreators.has(entity)) {
-        entityCreators.set(entity, creator);
+      const key = `${dataGraph}\0${entity}`;
+      if (creator && !entityCreators.has(key)) {
+        entityCreators.set(key, { dataGraph, entity, creator });
       }
     }
   }
@@ -252,7 +322,7 @@ function processSharedMemory(wsDataQuads: Quad[], wsMetaQuads: Quad[]): SharedMe
   return {
     validQuads,
     dropped: wsDataQuads.length - validQuads.length,
-    entityCreators: [...entityCreators.entries()],
+    entityCreators: [...entityCreators.values()],
   };
 }
 

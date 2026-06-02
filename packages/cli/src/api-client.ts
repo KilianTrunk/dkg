@@ -1,6 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import { basename } from 'node:path';
-import { readApiPort, readPid, isProcessRunning } from './config.js';
+import { readApiPort, readPid, isProcessRunning, configExists, loadConfig } from './config.js';
 import { loadTokens } from './auth.js';
 
 export type QueryResult =
@@ -31,48 +31,160 @@ export interface RandomSamplingStatusResponse {
   };
 }
 
+export interface RelayStatusResponse {
+  isCore: boolean;
+  reservationsHeld: number;
+  reservationCapacity: number | null;
+  activeCircuits: number | null;
+  bytesIn: string | null;
+  bytesOut: string | null;
+  natStatus: 'public' | 'private' | 'unknown';
+  advertisedAddresses: string[];
+  configuredAnnounceAddresses: string[];
+}
+
+export interface DaemonStatusResponse {
+  name: string;
+  peerId: string;
+  nodeRole?: string;
+  networkId?: string;
+  uptimeMs: number;
+  connectedPeers: number;
+  relayConnected: boolean;
+  multiaddrs: string[];
+  relay: RelayStatusResponse;
+  chain?: {
+    chainId: string | null;
+    configured: boolean;
+    rpcEndpointCount: number;
+    hubConfigured: boolean;
+  } | null;
+  // Triple-store backend fields (RFC 120). For local backends only
+  // `storeBackend` is meaningful; external backends additionally surface
+  // `storeUrl` and a TTL-cached `storeQuads` count. `null` when local /
+  // unreachable.
+  storeBackend?: string;
+  storeUrl?: string | null;
+  storeQuads?: number | null;
+}
+
+export interface ApiClientConnectOptions {
+  allowConfigFallback?: boolean;
+}
+
+const DAEMON_NOT_RUNNING_MESSAGE = 'Daemon is not running. Start it with: dkg start';
+const DEFAULT_NODE_NAME = 'dkg-node';
+
+function controlPlaneWarning(missingFiles: string[]): string | undefined {
+  if (missingFiles.length === 0) return undefined;
+  return `Warning: selected DKG home is missing control-plane file(s): ${missingFiles.join(', ')}. Using configured API port fallback.`;
+}
+
+function isAmbiguousFallbackName(name: unknown): boolean {
+  return typeof name !== 'string' || name.trim() === '' || name.trim() === DEFAULT_NODE_NAME;
+}
+
+function isConnectionFailure(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  if ('httpStatus' in err) return false;
+  const name = 'name' in err ? String((err as { name?: unknown }).name) : '';
+  const message = 'message' in err ? String((err as { message?: unknown }).message) : '';
+  return name === 'TypeError' && /fetch failed|ECONNREFUSED|ECONNRESET|ENOTFOUND|EAI_AGAIN|terminated/i.test(message);
+}
+
+function isDaemonStatusResponse(value: unknown): value is DaemonStatusResponse {
+  if (!value || typeof value !== 'object') return false;
+  const status = value as Record<string, unknown>;
+  return typeof status.name === 'string'
+    && typeof status.peerId === 'string'
+    && typeof status.uptimeMs === 'number'
+    && Number.isFinite(status.uptimeMs)
+    && typeof status.connectedPeers === 'number'
+    && Number.isFinite(status.connectedPeers)
+    && typeof status.relayConnected === 'boolean'
+    && Array.isArray(status.multiaddrs)
+    && status.multiaddrs.every(addr => typeof addr === 'string');
+}
+
+function requireDaemonStatusResponse(value: unknown, expectedName?: string): DaemonStatusResponse {
+  if (!isDaemonStatusResponse(value)) {
+    throw new Error('Configured API port did not return a DKG daemon status response.');
+  }
+  if (expectedName && value.name !== expectedName) {
+    throw new Error(
+      `Configured API port responded as DKG node "${value.name}", expected selected home node "${expectedName}".`,
+    );
+  }
+  return value;
+}
+
 export class ApiClient {
   private baseUrl: string;
   private token?: string;
+  private expectedStatusName?: string;
+  readonly controlPlaneWarning?: string;
 
-  constructor(portOrBaseUrl: number | string, token?: string) {
+  constructor(portOrBaseUrl: number | string, token?: string, opts?: {
+    controlPlaneWarning?: string;
+    expectedStatusName?: string;
+  }) {
     this.baseUrl = typeof portOrBaseUrl === 'number'
       ? `http://127.0.0.1:${portOrBaseUrl}`
       : portOrBaseUrl.replace(/\/+$/, '');
     this.token = token;
+    this.expectedStatusName = opts?.expectedStatusName;
+    this.controlPlaneWarning = opts?.controlPlaneWarning;
   }
 
-  static async connect(): Promise<ApiClient> {
-    const envPort = process.env.DKG_API_PORT
-      ? parseInt(process.env.DKG_API_PORT, 10)
+  static async connect(opts: ApiClientConnectOptions = {}): Promise<ApiClient> {
+    const hasEnvPort = process.env.DKG_API_PORT !== undefined && process.env.DKG_API_PORT !== '';
+    const envPort = hasEnvPort
+      ? parseInt(process.env.DKG_API_PORT as string, 10)
       : null;
 
-    let port = envPort ?? (await readApiPort());
+    const filePort = hasEnvPort ? null : await readApiPort();
+    let port = envPort ?? filePort;
+    let warning: string | undefined;
+    let expectedStatusName: string | undefined;
+
+    if (!port) {
+      const pid = await readPid();
+      if (opts.allowConfigFallback && !hasEnvPort && configExists()) {
+        const config = await loadConfig();
+        const configuredPort = Number.isFinite(config.apiPort) && config.apiPort > 0 ? config.apiPort : null;
+        if (configuredPort && !isAmbiguousFallbackName(config.name)) {
+          const missingFiles = ['api.port', ...(pid ? [] : ['daemon.pid'])];
+          port = configuredPort;
+          expectedStatusName = config.name;
+          warning = controlPlaneWarning(missingFiles);
+        }
+      }
+    }
 
     if (!port) {
       const pid = await readPid();
       if (!pid || !isProcessRunning(pid)) {
-        throw new Error('Daemon is not running. Start it with: dkg start');
+        throw new Error(DAEMON_NOT_RUNNING_MESSAGE);
       }
       throw new Error('Cannot read API port. Set DKG_API_PORT or restart: dkg stop && dkg start');
     }
 
     const tokens = await loadTokens();
     const token = tokens.size > 0 ? tokens.values().next().value : undefined;
-    return new ApiClient(port, token);
+    return new ApiClient(port, token, { controlPlaneWarning: warning, expectedStatusName });
   }
 
-  async status(): Promise<{
-    name: string;
-    peerId: string;
-    nodeRole?: string;
-    networkId?: string;
-    uptimeMs: number;
-    connectedPeers: number;
-    relayConnected: boolean;
-    multiaddrs: string[];
-  }> {
-    return this.get('/api/status');
+  async status(): Promise<DaemonStatusResponse> {
+    let status: unknown;
+    try {
+      status = await this.get<unknown>('/api/status', { auth: false });
+    } catch (err) {
+      if (this.expectedStatusName && isConnectionFailure(err)) {
+        throw new Error(DAEMON_NOT_RUNNING_MESSAGE);
+      }
+      throw err;
+    }
+    return requireDaemonStatusResponse(status, this.expectedStatusName);
   }
 
   async agents(): Promise<{
@@ -235,7 +347,7 @@ export class ApiClient {
     allowedPeers?: string[];
     publisherNodeIdentityIdOverride?: bigint;
   }): Promise<{
-    kcId: string;
+    kaId: string;
     status: 'tentative' | 'confirmed';
     kas: Array<{ tokenId: string; rootEntity: string }>;
     txHash?: string;
@@ -283,8 +395,9 @@ export class ApiClient {
   }
 
   /**
-   * Selection-based publish — publishes the selected SWM rootEntities
-   * (or all SWM content) to verified memory. The agent mints the
+   * Selection-based publish — publishes one selected SWM rootEntity to
+   * verified memory. Passing `"all"` is accepted only when the source
+   * SWM currently resolves to a single publishable root. The agent mints the
    * AuthorAttestation seal inline at the selection boundary using
    * the calling agent's bearer-token identity / explicit
    * `authorAgentAddress` / `preSignedAuthorAttestation`, or falls
@@ -303,7 +416,7 @@ export class ApiClient {
     clearAfter = true,
     options?: { subGraphName?: string; publisherNodeIdentityIdOverride?: bigint },
   ): Promise<{
-    kcId: string;
+    kaId: string;
     status: 'tentative' | 'confirmed';
     kas: Array<{ tokenId: string; rootEntity: string }>;
     txHash?: string;
@@ -460,7 +573,7 @@ export class ApiClient {
       publisherNodeIdentityIdOverride?: bigint;
     },
   ): Promise<{
-    kcId: string;
+    kaId: string;
     status: 'tentative' | 'confirmed';
     assertionUri: string;
     authorAddress: string;
@@ -505,7 +618,7 @@ export class ApiClient {
     },
   ): Promise<{
     assertionUri: string;
-    kcId: string;
+    kaId: string;
     status: 'tentative' | 'confirmed';
     authorAddress: string;
     merkleRoot: string;
@@ -543,7 +656,7 @@ export class ApiClient {
     );
     return {
       assertionUri: created.assertionUri,
-      kcId: published.kcId,
+      kaId: published.kaId,
       status: published.status,
       authorAddress: published.authorAddress,
       merkleRoot: published.merkleRoot,
@@ -772,9 +885,9 @@ export class ApiClient {
   /**
    * Run SPARQL via the daemon. `opts` covers the full /api/query surface —
    * memory-layer routing (`view`, `graphSuffix`, `verifiedGraph`,
-   * `subGraphName`, `includeSharedMemory`, `agentAddress`,
-   * `assertionName`), and P-13's `minTrust` (only meaningful on
-   * `view: "verified-memory"`; ignored elsewhere). `contextGraphId` stays
+   * `subGraphName`, `includeSharedMemory`, `includeContextGraphPartitions`,
+   * `agentAddress`, `assertionName`), and P-13's `minTrust` (only meaningful
+   * on `view: "verified-memory"`; ignored elsewhere). `contextGraphId` stays
    * in the 2nd positional slot for backwards compatibility.
    */
   async query(
@@ -783,6 +896,7 @@ export class ApiClient {
     opts?: {
       graphSuffix?: string;
       includeSharedMemory?: boolean;
+      includeContextGraphPartitions?: boolean;
       view?: 'working-memory' | 'shared-working-memory' | 'verified-memory';
       agentAddress?: string;
       assertionName?: string;
@@ -804,6 +918,7 @@ export class ApiClient {
       contextGraphId,
       graphSuffix: opts?.graphSuffix,
       includeSharedMemory: opts?.includeSharedMemory,
+      includeContextGraphPartitions: opts?.includeContextGraphPartitions,
       view: opts?.view,
       agentAddress: opts?.agentAddress,
       assertionName: opts?.assertionName,
@@ -1442,9 +1557,9 @@ export class ApiClient {
     return { Authorization: `Bearer ${this.token}` };
   }
 
-  private async get<T>(path: string): Promise<T> {
+  private async get<T>(path: string, opts: { auth?: boolean } = {}): Promise<T> {
     const res = await fetch(`${this.baseUrl}${path}`, {
-      headers: this.authHeaders(),
+      headers: opts.auth === false ? {} : this.authHeaders(),
     });
     if (!res.ok) {
       const body = await res.json().catch(() => ({ error: res.statusText }));

@@ -30,6 +30,19 @@ async function detectMockMode(): Promise<boolean> {
     } catch {
       useMocks = true;
     }
+    // Observability: surface the silent demo-data fallback so operators — and
+    // the e2e suite's mock-mode guard (fixtures/base.ts) — can tell the UI is
+    // NOT showing live node state. Without this flag the swap to fabricated
+    // fixtures is completely invisible, which is a false-positive trap for any
+    // assertion made against the rendered data.
+    if (typeof window !== 'undefined') {
+      (window as { __DKG_USING_MOCKS__?: boolean }).__DKG_USING_MOCKS__ = useMocks;
+      if (useMocks) {
+        console.warn(
+          '[dkg-ui] /api/status unreachable (timeout/5xx/network) — falling back to demo (mock) data. The UI is NOT showing live node state.',
+        );
+      }
+    }
     return useMocks;
   })();
   try {
@@ -55,7 +68,9 @@ export const api = {
   fetchWalletsBalances: () => withFallback(realApi.fetchWalletsBalances, mockApi.fetchWalletsBalances),
   fetchCurrentAgent: () => withFallback(realApi.fetchCurrentAgent, mockApi.fetchCurrentAgent),
   listParticipants: (id: string) => withFallback(() => realApi.listParticipants(id), () => mockApi.listParticipants(id)),
-  fetchNotifications: (p?: any) => withFallback(() => realApi.fetchNotifications(p), mockApi.fetchNotifications),
+  fetchSubGraphs: (id: string) => withFallback(() => realApi.fetchSubGraphs(id), () => mockApi.fetchSubGraphs(id)),
+  // Scoped notifications pane feed (useNotificationsFeed consumes this).
+  fetchNotificationsFeed: () => withFallback(realApi.fetchNotificationsFeed, mockApi.fetchNotificationsFeed),
   fetchNodeLog: (p?: any) => withFallback(() => realApi.fetchNodeLog(p), mockApi.fetchNodeLog),
   fetchMemorySessions: (n?: number) => withFallback(() => realApi.fetchMemorySessions(n), mockApi.fetchMemorySessions),
   markNotificationsRead: realApi.markNotificationsRead,

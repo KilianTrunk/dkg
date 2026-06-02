@@ -2,6 +2,7 @@ import { readFile, writeFile, mkdir, symlink, rename, unlink, readlink } from 'n
 import { join, dirname, basename } from 'node:path';
 import { existsSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import yaml from 'js-yaml';
 import {
   blueGreenSlotEntryPoint,
   blueGreenSlotReady,
@@ -53,6 +54,35 @@ export interface AutoUpdateConfig {
   checkIntervalMinutes?: number;
   /** Optional per-step build timeout overrides for the git-based update path. */
   buildTimeoutMs?: AutoUpdateBuildTimeouts;
+  /**
+   * Override how the daemon resolves "am I an npm-installed node or a
+   * monorepo dev checkout?" under OT-RFC-41 §4.3 / Bundle B1d.
+   *
+   *   `'npm'` (recommended; default for fresh installs from rc.12+):
+   *     Edge → `npm install -g`; Core → `npm install` into a
+   *     blue-green slot. `dkg init` writes this value explicitly
+   *     for every new node.
+   *
+   *   `'monorepo'`: dev checkout — auto-update polling is suppressed
+   *     entirely. Contributors update via `git pull && pnpm install
+   *     && pnpm build` from the repo root.
+   *
+   *   `'auto'` (legacy; pre-rc.12): probe the filesystem
+   *     (`repoDir() === null`). Treated as `'npm'` under rc.12+ via
+   *     `resolveStandaloneInstall()`.
+   *
+   *   `'git'` (legacy; pre-rc.12): the now-removed git-build update
+   *     path. Treated as `'monorepo'` under rc.12+ (the daemon does
+   *     not auto-update, no git pull/build). User-facing `dkg
+   *     update` from such a config refuses to run — see OT-RFC-41
+   *     §4.2 and `cli.ts dkg update`.
+   *
+   * Implementation: read once at boot via `resolveStandaloneInstall(source)`
+   * in `daemon/state.ts`, which writes the result into the shared
+   * `daemonState.standaloneCache` memo so every later caller (status
+   * route, `dkg update` CLI subcommand, …) sees the same answer.
+   */
+  source?: 'auto' | 'npm' | 'git' | 'monorepo';
 }
 
 /**
@@ -85,10 +115,19 @@ export interface NetworkConfig {
     sshCommand?: string;
     checkIntervalMinutes: number;
     buildTimeoutMs?: AutoUpdateBuildTimeouts;
+    /**
+     * Network-level default for `AutoUpdateConfig.source` — see the
+     * matching doc comment on that field. Lets `network/<env>.json` set the
+     * recommended source policy (e.g. testnet defaulting to `'npm'` so new
+     * Core operators don't have to know about the override). Local config
+     * still wins per field.
+     */
+    source?: 'auto' | 'npm' | 'git';
   };
   chain?: {
     type: 'evm';
     rpcUrl: string;
+    rpcUrls?: string[];
     hubAddress: string;
     tokenAddress?: string;
     chainId: string;
@@ -116,11 +155,53 @@ export interface NetworkConfig {
   chainResetMarker?: string;
 }
 
+/**
+ * Operator-facing config block for V10 TRAC allowance sizing. Mirrors
+ * `ApprovalPolicy` from `@origintrail-official/dkg-chain` but with
+ * stringly-typed numeric fields (YAML doesn't speak bigint) so YAML/JSON
+ * config can express it.
+ *
+ * Defaults match the legacy behaviour (`mode: per-publish`); operators
+ * preparing for high-volume publishing should consider `replenishing`.
+ * See `packages/cli/skills/dkg-node/SKILL.md` §8 for the operator guide.
+ */
+export interface ApprovalPolicyConfig {
+  /**
+   * Allowance sizing strategy. Defaults to `'per-publish'`:
+   *
+   *   - `per-publish` — approve exactly each publish's TRAC cost (with the
+   *     on-chain `1n` floor). Cheapest blast radius, most approve-gas at
+   *     scale. Backward-compatible.
+   *   - `replenishing` — approve a configurable ceiling (default 1000 TRAC),
+   *     refill when allowance drops below `target × refillBelowFraction`
+   *     (default 10%). One approve per ~9 publishes' worth of TRAC.
+   *     **Recommended for mainnet.**
+   *   - `unlimited` — approve `MaxUint256` once per wallet, never again.
+   *     Lowest gas, widest blast radius. Use only if you trust the V10 KA
+   *     contract absolutely.
+   */
+  mode?: 'per-publish' | 'replenishing' | 'unlimited';
+  /**
+   * `replenishing` only. TRAC amount (decimal wei-TRAC string — `1000 *
+   * 10^18 = '1000000000000000000000'` for 1000 TRAC) to approve up to.
+   * Defaults to `'1000000000000000000000'` (1000 TRAC).
+   */
+  targetAllowance?: string;
+  /**
+   * `replenishing` only. Refill when current allowance drops below
+   * `targetAllowance × refillBelowFraction`. Float between 0 and 1.
+   * Defaults to `0.1` (refill at 10% remaining).
+   */
+  refillBelowFraction?: number;
+}
+
 export interface ChainConfig {
   /** 'evm' for real blockchain, omit or 'mock' for in-memory (testing only) */
   type: 'evm' | 'mock';
   /** JSON-RPC endpoint URL */
   rpcUrl: string;
+  /** Ordered JSON-RPC backup endpoints. `rpcUrl` remains the primary endpoint. */
+  rpcUrls?: string[];
   /** Hub contract address */
   hubAddress: string;
   /** Optional token contract address override. When omitted, resolve from Hub.Token. */
@@ -132,6 +213,13 @@ export interface ChainConfig {
    * to this identity ID so private participant flows can be exercised from black-box CLI tests.
    */
   mockIdentityId?: string;
+  /**
+   * V10 TRAC auto-approve policy. Controls how the adapter sizes the
+   * allowance it requests from each operational signer before a publish or
+   * update. See {@link ApprovalPolicyConfig} for the modes and
+   * `packages/cli/skills/dkg-node/SKILL.md` §8 for the operator guide.
+   */
+  approvalPolicy?: ApprovalPolicyConfig;
 }
 
 export interface LargeLiteralStorageConfig {
@@ -246,6 +334,19 @@ export interface LocalAgentIntegrationConfig {
   updatedAt?: string;
 }
 
+export interface QueryAccessConfig {
+  defaultPolicy: 'deny' | 'public';
+  contextGraphs?: Record<string, {
+    policy: 'deny' | 'public' | 'allowList';
+    allowedPeers?: string[];
+    allowedLookupTypes?: Array<'ENTITY_BY_UAL' | 'ENTITIES_BY_TYPE' | 'ENTITY_TRIPLES' | 'SPARQL_QUERY'>;
+    sparqlEnabled?: boolean;
+    sparqlTimeout?: number;
+    sparqlMaxResults?: number;
+  }>;
+  rateLimitPerMinute?: number;
+}
+
 export interface DkgConfig {
   name: string;
   relay?: string;
@@ -254,6 +355,28 @@ export interface DkgConfig {
   apiHost?: string;
   listenPort: number;
   nodeRole: 'core' | 'edge';
+  /**
+   * Core-Node-specific operator tuning. Today only `allowDegradedRelay`;
+   * future Core-only knobs (e.g. relay-target prioritisation) belong here
+   * rather than at the top level so they stay grouped.
+   */
+  core?: {
+    /**
+     * Gate for the boot-time core-relay sanity check (`core-prereq-check.ts`).
+     *
+     *   - `true` (default): the daemon logs `[CORE-PREREQ] looks degraded`
+     *     with a structured reason if its bound multiaddrs can't serve
+     *     inbound traffic, but boots normally. Backwards-compatible — no
+     *     behaviour change for any existing operator on this PR.
+     *   - `false`: the daemon refuses to boot if the sanity check says
+     *     degraded. Opt-in for operators who want fail-loud semantics
+     *     instead of warn-and-continue.
+     *
+     * Edge nodes ignore this field — the prereq check skips the degraded
+     * verdict for `nodeRole: 'edge'`.
+     */
+    allowDegradedRelay?: boolean;
+  };
   /**
    * Core Node relay-server capacity tuning. Forwarded into the libp2p
    * relay configuration via `DKGNodeConfig.relayServerCapacity`. Sets
@@ -305,6 +428,8 @@ export interface DkgConfig {
   bootstrapPeers?: string[];
   /** V10: context graphs to subscribe. */
   contextGraphs?: string[];
+  /** Cross-agent query access policy for inbound query-remote requests. */
+  queryAccess?: QueryAccessConfig;
   autoUpdate?: AutoUpdateConfig;
   /**
    * Chain config. Field-merged on top of `network/<env>.json#chain` via
@@ -353,6 +478,27 @@ export interface DkgConfig {
     pollIntervalMs?: number;
     errorBackoffMs?: number;
     maxRetries?: number;
+  };
+  /**
+   * Async promote queue worker (WM → SWM). Unlike `publisher` which is
+   * opt-in, the promote worker is **on by default** — without it, jobs
+   * enqueued via `POST /api/assertion/{name}/promote-async` sit in
+   * `queued` forever. Set `enabled: false` to disable when running a
+   * read-only / forensic node where you don't want the worker mutating
+   * SWM. See `docs/specs/SPEC_ASYNC_PROMOTE_QUEUE.md` and the
+   * `dkg-node` skill (§8 "Async promote queue") for the full contract.
+   */
+  promoteQueue?: {
+    /** Default `true`. Set `false` to disable the in-daemon worker. */
+    enabled?: boolean;
+    /** Default 4. Number of concurrent worker slots polling the queue. */
+    workerConcurrency?: number;
+    /** Default 100ms. Polling interval per slot. */
+    pollIntervalMs?: number;
+    /** Default 60_000ms (1 min). Must be >0 and shorter than the queue's 5-min lease when enabled. */
+    heartbeatIntervalMs?: number;
+    /** Default 30_000ms. Max time `stop()` waits for in-flight promotes to drain on shutdown. */
+    shutdownTimeoutMs?: number;
   };
   /** Allowed CORS origins. Defaults to '*' when apiHost is '127.0.0.1', otherwise restrictive. */
   corsOrigins?: string | string[];
@@ -422,6 +568,47 @@ export interface DkgConfig {
   chat?: ChatConfig;
   /** Route-plugin specs (absolute paths / package names) loaded at daemon startup. ADR 0001. */
   routePlugins?: string[];
+  /**
+   * libp2p / discovery network tunables for small / sparse meshes.
+   * Forwarded through `DKGAgentConfig` and applied at `createLibp2p` /
+   * `kadDHT` construction (libp2p tunables) and to the agent-profile
+   * heartbeat timer (phonebook side). All fields optional; omitting
+   * any field preserves the built-in default. See companion knobs in
+   * `packages/core/src/types.ts` (libp2p side) +
+   * `packages/agent/src/dkg-agent-constants.ts` (agent side).
+   *
+   * Targeted at testnet / small-mesh operators where DHT lookups are
+   * flaky (sparse routing tables) and direct addresses age out before
+   * being re-discovered. Mainnet / large-mesh deployments should leave
+   * all fields unset to keep upstream defaults.
+   *
+   * Note: a per-step PeerResolver timeout knob was intentionally NOT
+   * exposed here. Production callers (`connectToPeerId`, chat /
+   * routed sends) always pass an explicit `perStepTimeoutMs` derived
+   * from their own deadline budget, so an operator default would be a
+   * silent no-op for those paths. To influence dial latency on small
+   * networks, bump the caller-side `timeoutMs` (e.g. `connectToPeerId`'s
+   * `timeoutMs` option) instead. Codex review of PR #698 caught this.
+   */
+  network?: {
+    /** libp2p `peerStore.maxAddressAge` (default 3_600_000 = 1h upstream). */
+    peerStoreMaxAddressAgeMs?: number;
+    /** libp2p `peerStore.maxPeerAge` (default 21_600_000 = 6h upstream). */
+    peerStoreMaxPeerAgeMs?: number;
+    /** libp2p `kadDHT.querySelfInterval` (default kad-DHT upstream). */
+    dhtQuerySelfIntervalMs?: number;
+    /**
+     * Cadence at which the daemon re-publishes its own profile to the
+     * `agents` Context Graph (default 5min — see
+     * `AGENT_PROFILE_HEARTBEAT_MS`). Set to `0` to disable; the
+     * one-shot startup publish still fires.
+     *
+     * Each heartbeat refreshes `dkg:multiaddr` + `dkg:lastSeen` so
+     * other peers' dial fallback can find fresh phonebook entries
+     * even when direct connections have aged out of the peerStore.
+     */
+    agentProfileHeartbeatMs?: number;
+  };
 }
 
 /**
@@ -460,6 +647,63 @@ export function resolveNetworkDefaultContextGraphs(network: NetworkConfig | null
 /** Resolve shared memory TTL from config, accepting both V10 and legacy keys. */
 export function resolveSharedMemoryTtlMs(config: DkgConfig): number | undefined {
   return config.sharedMemoryTtlMs ?? config.workspaceTtlMs;
+}
+
+/**
+ * Translates the operator-facing {@link ApprovalPolicyConfig} (YAML/JSON,
+ * string-typed numerics) into the runtime `ApprovalPolicy` shape the
+ * chain adapter expects (`bigint` for `targetAllowance`).
+ *
+ * - Returns `undefined` if the operator didn't configure a policy — lets
+ *   the chain adapter fall back to its built-in default
+ *   (`DEFAULT_APPROVAL_POLICY`, currently `per-publish`).
+ * - Throws a descriptive `Error` if the operator supplied an unparseable
+ *   `targetAllowance` (e.g. `'one thousand TRAC'`). Fails fast at startup
+ *   rather than silently falling back — config bugs are easier to find
+ *   when they don't lurk for hours.
+ */
+export function resolveApprovalPolicy(
+  policy: ApprovalPolicyConfig | undefined,
+): { mode: 'per-publish' | 'replenishing' | 'unlimited'; targetAllowance?: bigint; refillBelowFraction?: number } | undefined {
+  if (!policy) return undefined;
+  const mode = policy.mode ?? 'per-publish';
+  if (mode !== 'per-publish' && mode !== 'replenishing' && mode !== 'unlimited') {
+    throw new Error(
+      `chain.approvalPolicy.mode must be one of 'per-publish' | 'replenishing' | 'unlimited' (got: ${JSON.stringify(mode)})`,
+    );
+  }
+  let targetAllowance: bigint | undefined;
+  if (policy.targetAllowance !== undefined) {
+    try {
+      targetAllowance = BigInt(policy.targetAllowance);
+    } catch (err: any) {
+      throw new Error(
+        `chain.approvalPolicy.targetAllowance must be a decimal wei-TRAC bigint string (got: ${JSON.stringify(policy.targetAllowance)}, ${err?.message ?? err})`,
+      );
+    }
+    if (targetAllowance < 0n) {
+      throw new Error(
+        `chain.approvalPolicy.targetAllowance must be non-negative (got: ${targetAllowance})`,
+      );
+    }
+  }
+  if (policy.refillBelowFraction !== undefined) {
+    if (
+      typeof policy.refillBelowFraction !== 'number'
+      || !Number.isFinite(policy.refillBelowFraction)
+      || policy.refillBelowFraction < 0
+      || policy.refillBelowFraction > 1
+    ) {
+      throw new Error(
+        `chain.approvalPolicy.refillBelowFraction must be a finite number in [0, 1] (got: ${JSON.stringify(policy.refillBelowFraction)})`,
+      );
+    }
+  }
+  return {
+    mode,
+    targetAllowance,
+    refillBelowFraction: policy.refillBelowFraction,
+  };
 }
 
 let _networkConfig: NetworkConfig | null = null;
@@ -596,6 +840,7 @@ export function resolveAutoUpdateConfig(
   const sshKeyPath = cfg?.sshKeyPath ?? net?.sshKeyPath;
   const sshCommand = cfg?.sshCommand ?? net?.sshCommand;
   const checkIntervalMinutes = cfg?.checkIntervalMinutes ?? net?.checkIntervalMinutes ?? 30;
+  const source = cfg?.source ?? net?.source;
 
   // Merge build timeouts per-key so operators can override one step (e.g.
   // `contracts` on slow ARM hosts) without re-specifying the rest.
@@ -620,7 +865,15 @@ export function resolveAutoUpdateConfig(
     ...(sshCommand ? { sshCommand } : {}),
     checkIntervalMinutes,
     ...(buildTimeoutMs ? { buildTimeoutMs } : {}),
+    ...(source ? { source } : {}),
   };
+}
+
+export function resolveAutoUpdateSource(
+  config: Pick<DkgConfig, 'autoUpdate'> | null | undefined,
+  network: Pick<NetworkConfig, 'autoUpdate'> | null | undefined,
+): AutoUpdateConfig['source'] {
+  return config?.autoUpdate?.source ?? network?.autoUpdate?.source;
 }
 
 /**
@@ -668,8 +921,19 @@ export function resolveChainConfig(
   const merged: Partial<ChainConfig> = {
     type: cfg?.type ?? net?.type ?? 'evm',
   };
-  const rpcUrl = cfg?.rpcUrl ?? net?.rpcUrl;
-  if (rpcUrl !== undefined) merged.rpcUrl = rpcUrl;
+  const primaryRpcUrl = cfg?.rpcUrl ?? net?.rpcUrl;
+  const backupRpcUrls = cfg?.rpcUrls ?? net?.rpcUrls ?? [];
+  const orderedRpcUrls: string[] = [];
+  for (const candidate of [primaryRpcUrl, ...backupRpcUrls]) {
+    if (typeof candidate !== 'string') continue;
+    const trimmed = candidate.trim();
+    if (!trimmed || orderedRpcUrls.includes(trimmed)) continue;
+    orderedRpcUrls.push(trimmed);
+  }
+  if (orderedRpcUrls[0] !== undefined) merged.rpcUrl = orderedRpcUrls[0];
+  if (orderedRpcUrls.length > 1 || cfg?.rpcUrls !== undefined || net?.rpcUrls !== undefined) {
+    merged.rpcUrls = orderedRpcUrls.slice(1);
+  }
   const hubAddress = cfg?.hubAddress ?? net?.hubAddress;
   if (hubAddress !== undefined) merged.hubAddress = hubAddress;
   const tokenAddress = cfg?.tokenAddress ?? net?.tokenAddress;
@@ -830,6 +1094,10 @@ export function configPath(): string {
   return join(dkgDir(), 'config.json');
 }
 
+export function configYamlPath(): string {
+  return join(dkgDir(), 'config.yaml');
+}
+
 export function pidPath(): string {
   return join(dkgDir(), 'daemon.pid');
 }
@@ -846,13 +1114,162 @@ export async function ensureDkgDir(): Promise<void> {
   await mkdir(dkgDir(), { recursive: true });
 }
 
+function mergePersistedConfig(raw: unknown): DkgConfig {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { ...DEFAULT_CONFIG };
+  return { ...DEFAULT_CONFIG, ...(raw as Partial<DkgConfig>) };
+}
+
+function isEnoent(err: unknown): boolean {
+  return !!err && typeof err === 'object' && (err as { code?: unknown }).code === 'ENOENT';
+}
+
+function readPersistedConfigSync(): unknown {
+  if (existsSync(configPath())) {
+    return JSON.parse(readFileSync(configPath(), 'utf-8'));
+  }
+  if (existsSync(configYamlPath())) {
+    return yaml.load(readFileSync(configYamlPath(), 'utf-8'));
+  }
+  return null;
+}
+
+export function readNodeRoleFromConfigSync(): 'edge' | 'core' {
+  try {
+    const parsed = readPersistedConfigSync();
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return 'edge';
+    return (parsed as { nodeRole?: unknown }).nodeRole === 'core' ? 'core' : 'edge';
+  } catch {
+    return 'edge';
+  }
+}
+
 export async function loadConfig(): Promise<DkgConfig> {
   try {
     const raw = await readFile(configPath(), 'utf-8');
-    return { ...DEFAULT_CONFIG, ...JSON.parse(raw) };
-  } catch {
-    return { ...DEFAULT_CONFIG };
+    return mergePersistedConfig(JSON.parse(raw));
+  } catch (err) {
+    if (!isEnoent(err)) throw err;
   }
+
+  try {
+    const raw = await readFile(configYamlPath(), 'utf-8');
+    return mergePersistedConfig(yaml.load(raw));
+  } catch (err) {
+    if (!isEnoent(err)) throw err;
+  }
+
+  return { ...DEFAULT_CONFIG };
+}
+
+// =====================================================================
+// External-backend config validation (RFC 120, plan PR 1 item 6)
+// =====================================================================
+//
+// External triple-store backends (Blazegraph, sparql-http) impose two
+// requirements beyond the local-file default:
+//
+//   1. `store.options.url` (or `queryEndpoint`) must be set. The adapter
+//      will throw without it, but only deep inside agent boot — by which
+//      point logs already have stack traces from finalization wiring
+//      that started before the agent. Surfacing the error here at
+//      config-load time gives operators a single-line, actionable error.
+//   2. `largeLiteralStorage.directory` and
+//      `sharedMemoryPublicSnapshotStorage.directory` must be explicit
+//      when those features are enabled. The defaults derive a directory
+//      from the local triple-store's persistent path; an external
+//      backend has no such path, so without explicit directories the
+//      blob store throws when it sees its first oversized literal
+//      (potentially weeks after install).
+//
+// Returns an array of error messages — empty if config is valid. Caller
+// decides whether to log + exit (boot path) or surface as a config-save
+// rejection (future wizard path).
+const EXTERNAL_VALIDATION_PREFIX = '[config] store.backend';
+
+export interface StoreConfigValidationError {
+  /** Field path within the config that failed validation. */
+  field: string;
+  /** Human-readable error message including remediation hint. */
+  message: string;
+}
+
+export function validateStoreConfig(config: DkgConfig): StoreConfigValidationError[] {
+  const errors: StoreConfigValidationError[] = [];
+  const backend = config.store?.backend;
+  // Mirror of `isExternalBackend` from @origintrail-official/dkg-storage.
+  // Duplicated here to keep config.ts free of upward dependencies on the
+  // storage package (config.ts is leaf-imported by many other modules).
+  const isExternal = backend === 'blazegraph' || backend === 'sparql-http';
+  if (!isExternal) return errors;
+
+  const opts = (config.store?.options ?? {}) as Record<string, unknown>;
+
+  if (backend === 'blazegraph') {
+    if (typeof opts.url !== 'string' || !opts.url.trim()) {
+      errors.push({
+        field: 'store.options.url',
+        message:
+          `${EXTERNAL_VALIDATION_PREFIX} is "blazegraph" but ` +
+          `store.options.url is missing. Set it to the SPARQL endpoint URL ` +
+          `(e.g. http://127.0.0.1:9999/bigdata/namespace/mynode/sparql) or ` +
+          `switch backend to oxigraph-worker.`,
+      });
+    }
+  } else if (backend === 'sparql-http') {
+    if (typeof opts.queryEndpoint !== 'string' || !opts.queryEndpoint.trim()) {
+      errors.push({
+        field: 'store.options.queryEndpoint',
+        message:
+          `${EXTERNAL_VALIDATION_PREFIX} is "sparql-http" but ` +
+          `store.options.queryEndpoint is missing. Set it to the SPARQL query URL.`,
+      });
+    }
+  }
+
+  if (config.largeLiteralStorage?.enabled === true) {
+    const dir = config.largeLiteralStorage.directory;
+    if (typeof dir !== 'string' || !dir.trim()) {
+      errors.push({
+        field: 'largeLiteralStorage.directory',
+        message:
+          `largeLiteralStorage.enabled=true with an external store backend requires ` +
+          `largeLiteralStorage.directory to be set explicitly (no local store path ` +
+          `to infer it from). Either set the directory or disable large-literal storage.`,
+      });
+    }
+  }
+
+  if (config.sharedMemoryPublicSnapshotStorage?.enabled === true) {
+    const dir = config.sharedMemoryPublicSnapshotStorage.directory;
+    if (typeof dir !== 'string' || !dir.trim()) {
+      errors.push({
+        field: 'sharedMemoryPublicSnapshotStorage.directory',
+        message:
+          `sharedMemoryPublicSnapshotStorage.enabled=true with an external store backend ` +
+          `requires sharedMemoryPublicSnapshotStorage.directory to be set explicitly.`,
+      });
+    }
+  }
+
+  return errors;
+}
+
+/**
+ * Convenience helper: validate, log every error, exit if any. Daemon
+ * boot uses this; the future wizard path will iterate `errors` to
+ * re-prompt instead of exiting.
+ */
+export function exitOnStoreConfigErrors(
+  config: DkgConfig,
+  log: (msg: string) => void,
+): void {
+  const errors = validateStoreConfig(config);
+  if (errors.length === 0) return;
+  log(`[STORE-CONFIG] ${errors.length} validation error(s) — refusing to start.`);
+  for (const err of errors) {
+    log(`  ${err.field}: ${err.message}`);
+  }
+  process.exit(1);
 }
 
 export async function saveConfig(config: DkgConfig): Promise<void> {
@@ -861,7 +1278,7 @@ export async function saveConfig(config: DkgConfig): Promise<void> {
 }
 
 export function configExists(): boolean {
-  return existsSync(configPath());
+  return existsSync(configPath()) || existsSync(configYamlPath());
 }
 
 export async function readPid(): Promise<number | null> {

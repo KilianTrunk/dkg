@@ -96,7 +96,13 @@
 /* ══════════════════════════════════════════
    LIGHT THEME
    ══════════════════════════════════════════ */
-body.light {
+/* BUG-004: the variable overrides have to apply at the html element
+   level too, otherwise the `html { background: var(--bg-root) }` rule
+   keeps reading the dark `:root` definition and macOS rubber-band
+   overscroll flashes the dark colour in light mode. The matching
+   class is set on both html and body in App.tsx so existing
+   `body.light .foo` selectors below still work unchanged. */
+:root.light, body.light {
   --bg-root: #fafafa;
   --bg-panel: #f5f5f5;
   --bg-surface: #ffffff;
@@ -351,12 +357,21 @@ button:focus:not(:focus-visible) { outline: none; }
   justify-content: center;
   padding: 0 3px;
 }
-.v10-header-notif-dropdown {
+/* ── Notifications pane (redesign) ─────────────────────────────────────────
+   Bell dropdown surface + the two sections (pinned "Needs your action" +
+   "Activity") + the three row kinds. Reuses design tokens for dark/light,
+   the .v10-po-join-* accent palette for actions, and the activity glyph
+   colours from the per-CG feed. ~380px (wider than the old 320px to fit the
+   two-column join rows + the activity pill). */
+.v10-notif-pane {
   position: absolute;
   top: 100%;
   right: 0;
   margin-top: 8px;
-  width: 320px;
+  width: 380px;
+  max-height: min(70vh, 560px);
+  display: flex;
+  flex-direction: column;
   background: var(--bg-elevated);
   border: 1px solid var(--border-default);
   border-radius: 8px;
@@ -364,37 +379,189 @@ button:focus:not(:focus-visible) { outline: none; }
   z-index: 200;
   overflow: hidden;
 }
-.v10-header-notif-title {
+.v10-notif-pane:focus { outline: none; }
+.v10-notif-pane-titlebar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
   padding: 10px 14px;
+  border-bottom: 1px solid var(--border-subtle);
+  flex-shrink: 0;
+}
+.v10-notif-pane-title {
   font-size: 11px;
   font-weight: 600;
   letter-spacing: 0.5px;
   text-transform: uppercase;
   color: var(--text-tertiary);
-  border-bottom: 1px solid var(--border-subtle);
 }
-.v10-header-notif-empty {
-  padding: 24px 14px;
-  text-align: center;
-  color: var(--text-tertiary);
-  font-size: 12px;
-}
-.v10-header-notif-item {
-  padding: 10px 14px;
-  border-bottom: 1px solid var(--border-subtle);
+.v10-notif-pane-markread {
+  font-family: var(--font-sans);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  background: none;
+  border: none;
   cursor: pointer;
-  transition: background 0.1s;
+  padding: 0;
 }
-.v10-header-notif-item:hover { background: var(--bg-hover); }
-.v10-header-notif-item:last-child { border-bottom: none; }
-.v10-header-notif-item-text { font-size: 12px; color: var(--text-primary); }
-.v10-header-notif-item-time { font-size: 11px; color: var(--text-tertiary); margin-top: 2px; font-family: var(--font-mono); }
-.v10-notif-join { border-left: 3px solid #f59e0b; padding-left: 9px; }
-.v10-notif-approved { border-left: 3px solid #10b981; padding-left: 9px; }
-.v10-notif-rejected { border-left: 3px solid #ef4444; padding-left: 9px; }
-.v10-notif-join-icon { margin-right: 4px; }
-.v10-notif-clickable { cursor: pointer; }
-.v10-notif-clickable:hover { background: var(--bg-hover); }
+.v10-notif-pane-markread:hover { color: var(--text-primary); }
+/* Body scrolls under the sticky titlebar; the pinned action section sits
+   first in the same scroll container (never a nested scrollbar). */
+.v10-notif-pane-body { overflow-y: auto; padding: 6px 0; }
+
+/* States */
+.v10-notif-pane-state,
+.v10-notif-pane-error {
+  padding: 18px 14px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--text-tertiary);
+}
+.v10-notif-pane-error { color: var(--text-secondary); }
+.v10-notif-pane-error-inline {
+  padding: 8px 14px;
+  text-align: left;
+  font-size: 11px;
+}
+.v10-notif-pane-empty { padding: 24px 16px; text-align: center; }
+.v10-notif-pane-empty-lead { font-size: 13px; color: var(--text-secondary); margin-bottom: 4px; }
+.v10-notif-pane-empty-sub { font-size: 11px; color: var(--text-tertiary); line-height: 1.4; }
+.v10-notif-retry {
+  font-family: var(--font-sans);
+  font-size: inherit;
+  font-weight: 600;
+  color: var(--text-secondary);
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 0;
+  text-decoration: underline;
+}
+.v10-notif-retry:hover { color: var(--text-primary); }
+
+/* Sections */
+.v10-notif-section { padding: 4px 0; }
+.v10-notif-section + .v10-notif-section { border-top: 1px solid var(--border-subtle); }
+.v10-notif-section-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 14px 4px;
+}
+.v10-notif-section-label {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+}
+.v10-notif-section-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 5px;
+  border-radius: 999px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  background: rgba(245, 158, 11, 0.16);
+  color: var(--text-warning);
+  border: 1px solid rgba(245, 158, 11, 0.4);
+}
+.v10-notif-section-rows { display: flex; flex-direction: column; }
+.v10-notif-section-empty { padding: 6px 14px 10px; font-size: 11px; color: var(--text-tertiary); font-style: italic; }
+
+/* Rows (shared) */
+.v10-notif-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  width: 100%;
+  text-align: left;
+  padding: 9px 14px;
+  font-family: var(--font-sans);
+  background: none;
+  border: none;
+  border-radius: 0;
+  color: var(--text-primary);
+}
+button.v10-notif-row { cursor: pointer; transition: background 0.1s; }
+button.v10-notif-row:hover { background: var(--bg-hover); }
+.v10-notif-row[aria-disabled="true"] { opacity: 0.78; }
+.v10-notif-row-body { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1; }
+.v10-notif-row-title { font-size: 12px; font-weight: 600; color: var(--text-primary); }
+.v10-notif-row-detail { font-size: 12px; color: var(--text-secondary); line-height: 1.35; }
+.v10-notif-row-sub { display: flex; align-items: center; gap: 6px; margin-top: 1px; }
+.v10-notif-actor { font-weight: 600; color: var(--text-primary); }
+.v10-notif-cg-name { font-weight: 600; color: var(--text-primary); }
+.v10-notif-cg-link {
+  font: inherit;
+  font-weight: 600;
+  color: var(--text-primary);
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.v10-notif-cg-link:hover { color: var(--text-secondary); }
+.v10-notif-addr { font-size: 10px; font-family: var(--font-mono); color: var(--text-tertiary); }
+.v10-notif-dot { color: var(--text-tertiary); }
+.v10-notif-time { font-size: 10px; font-family: var(--font-mono); color: var(--text-tertiary); white-space: nowrap; flex-shrink: 0; }
+/* Unread accent rail — colour-not-alone is covered by the row's text + glyph;
+   this is a supplementary scan cue. */
+.v10-notif-unread { box-shadow: inset 2px 0 0 var(--accent-red); }
+
+/* Self-authored activity — the operator's OWN agent. The row text leads with
+   "You …" for the explicit signal; this faint tint is a supplementary scan cue
+   so own-agent activity is distinguishable at a glance (colour-not-alone). */
+.v10-notif-by-self { background: rgba(110, 168, 254, 0.07); }
+
+/* Glyph cell */
+.v10-notif-glyph {
+  flex-shrink: 0;
+  width: 18px;
+  text-align: center;
+  font-size: 13px;
+  line-height: 1.4;
+}
+.v10-notif-glyph-join { color: var(--text-warning); }
+.v10-notif-glyph-created { color: var(--text-tertiary); }
+.v10-notif-glyph-promoted { color: var(--text-warning); }
+.v10-notif-glyph-published { color: var(--text-success); }
+.v10-notif-glyph-approved { color: var(--text-success); }
+.v10-notif-glyph-rejected { color: var(--text-danger); }
+
+/* Join request actions */
+.v10-notif-row-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+.v10-notif-btn {
+  font-family: var(--font-sans);
+  font-size: 11px;
+  font-weight: 600;
+  padding: 4px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.v10-notif-btn:disabled { opacity: 0.5; cursor: default; }
+.v10-notif-btn-approve { background: rgba(34, 197, 94, 0.12); color: var(--text-success); border: 1px solid rgba(34, 197, 94, 0.32); }
+.v10-notif-btn-approve:hover:not(:disabled) { background: rgba(34, 197, 94, 0.2); }
+.v10-notif-btn-ghost { background: none; color: var(--text-secondary); border: 1px solid var(--border-default); }
+.v10-notif-btn-ghost:hover:not(:disabled) { background: var(--bg-hover); color: var(--text-primary); }
+.v10-notif-btn-deny { background: rgba(239, 68, 68, 0.12); color: var(--text-danger); border: 1px solid rgba(239, 68, 68, 0.32); }
+.v10-notif-btn-deny:hover:not(:disabled) { background: rgba(239, 68, 68, 0.2); }
+.v10-notif-deny-confirm { display: inline-flex; align-items: center; gap: 6px; }
+.v10-notif-deny-confirm-label { font-size: 11px; color: var(--text-danger); font-weight: 600; }
+
+/* Terminal confirmation line (post approve/deny) + inline errors */
+.v10-notif-row-terminal { align-items: center; color: var(--text-tertiary); font-size: 12px; }
+.v10-notif-row-terminal .v10-notif-glyph { color: var(--text-success); }
+.v10-notif-terminal-text { color: var(--text-secondary); }
+.v10-notif-row-error { font-size: 11px; color: var(--text-danger); margin-top: 3px; }
 
 /* ── Body ── */
 .v10-app-body {
@@ -2434,6 +2601,21 @@ button:focus:not(:focus-visible) { outline: none; }
   border: 0;
 }
 
+/* Visually-hidden utility for screen-reader-only text (notifications pane
+   in-flight announcements, glyph equivalents). Same proven pattern as
+   `.v10-md-copy-announce` above. */
+.v10-sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 .v10-chat-cursor {
   display: inline-block;
   width: 5px;
@@ -3349,6 +3531,12 @@ button:focus:not(:focus-visible) { outline: none; }
 .v10-promote-result { padding: 8px 12px; font-size: 12px; }
 .v10-promote-result.success { color: var(--text-success); background: rgba(34,197,94,.06); }
 .v10-promote-result.error { color: var(--text-danger); background: rgba(239,68,68,.06); }
+/* Issue #864 (Codex review on #874) — the `info` variant now backs
+   the no-op promote outcome ("Nothing to promote — already up to
+   date"). Without this rule the message rendered with bare base
+   styling, indistinguishable from a stray <div>. Muted grey-blue so
+   it reads as informational, not success / not error. */
+.v10-promote-result.info { color: var(--text-secondary); background: rgba(59,130,246,.06); }
 
 /* ── Publish Panel (SWM → VM) ── */
 .v10-publish-panel {
@@ -3425,6 +3613,16 @@ p { font-size: 13px; color: var(--text-secondary); line-height: 1.6; }
 .card{background:var(--bg-surface);border:1px solid var(--border-default);border-radius:12px;overflow:hidden;transition:border-color .15s}
 .card-header{padding:14px 18px;border-bottom:1px solid var(--border-default);display:flex;align-items:center;justify-content:space-between}
 .card-title{font-size:12px;font-weight:700;color:var(--text-primary);letter-spacing:.04em;text-transform:uppercase}
+
+/* ── Settings page (cleanup): the page migrates the keep-cards onto the
+   canonical .card idiom above. These add the body padding the idiom omits,
+   the single-column page stack, and token-driven field rows (replacing the
+   previously-undefined .settings-card/.settings-grid/.prov-field-* hooks). */
+.card-body{padding:14px 18px}
+.settings-stack{display:flex;flex-direction:column;gap:16px;max-width:720px}
+.settings-field-label{font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;color:var(--text-dim);margin-bottom:3px}
+.settings-field-value{font-size:12px;color:var(--text-primary);word-break:break-word}
+.settings-field-value.mono{font-family:var(--font-mono)}
 
 /* ── Observability page shared components ───────────────────────────────── */
 
@@ -4296,6 +4494,18 @@ body.light .v10-import-dropzone.drag-over { border-color: #b0b0b0; background: #
 .v10-me-loading-text { font-size: 12px; color: var(--text-tertiary); }
 
 /* ── Sub-graph Bar ── */
+/* PR #793 round 2 (ui-locked option a) — capsule chrome dropped.
+   The bar previously had a tinted background + 10px border-radius
+   that made it read as a separate widget hovering above the
+   content; on the Subgraph Explorer page where the strip sits
+   inside the page chrome, that pill-island look broke the
+   continuous strip semantics. Reduced to a single-edge bottom
+   border so the row terminates cleanly without claiming
+   container chrome.
+
+   This also kills the stale `--surface-1` and `--border-subtle`
+   rgba fallbacks that were S2 sweep regressions (undefined token
+   + dead rgba), closing the loop while in here. */
 .v10-subgraph-bar {
   display: flex;
   align-items: center;
@@ -4304,9 +4514,10 @@ body.light .v10-import-dropzone.drag-over { border-color: #b0b0b0; background: #
   flex-wrap: wrap;
   padding: 8px 12px;
   margin-bottom: 8px;
-  background: var(--surface-1, rgba(255,255,255,0.02));
-  border: 1px solid var(--border-subtle, rgba(255,255,255,0.06));
-  border-radius: 10px;
+  background: transparent;                          /* was: var(--surface-1, rgba(255,255,255,0.02)) */
+  border: 0;                                        /* was: 1px solid var(--border-subtle, ...) */
+  border-bottom: 1px solid var(--border-subtle);    /* single-edge termination */
+  border-radius: 0;                                 /* was: 10px */
 }
 .v10-subgraph-bar-label {
   font-size: 11px;
@@ -4315,6 +4526,12 @@ body.light .v10-import-dropzone.drag-over { border-color: #b0b0b0; background: #
   color: var(--text-tertiary, #94a3b8);
   padding-right: 4px;
 }
+/* PR #793 round 2 — the `.v10-subgraph-bar-hint` rule (sweep 3
+   Bug K's locked literal `+ Root, subgraphs`) was removed
+   alongside the corresponding render in SubGraphBar.tsx. Users
+   asked what the literal meant on manual test; the inline hint
+   was demoted entirely. The long-form tooltip on the All chip's
+   count badge still carries the cross-membership disclosure. */
 .v10-subgraph-chip {
   display: inline-flex;
   align-items: center;
@@ -4853,32 +5070,6 @@ body.light .v10-me-graph-legend { background: rgba(255,255,255,0.8); }
 }
 .v10-ph-agent-tool { font-size: 9px; font-weight: 500; color: var(--text-tertiary); background: var(--bg-elevated); padding: 0 5px; border-radius: 3px; }
 
-.v10-ph-join-requests { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border-subtle); }
-.v10-ph-join-badge {
-  display: inline-flex; align-items: center; justify-content: center;
-  min-width: 16px; height: 16px; border-radius: 8px; font-size: 9px; font-weight: 700;
-  background: #f59e0b; color: #000; margin-left: 6px; padding: 0 4px;
-}
-.v10-ph-join-list { display: flex; flex-direction: column; gap: 6px; }
-.v10-ph-join-item {
-  display: flex; align-items: center; justify-content: space-between;
-  padding: 6px 10px; border-radius: 8px; background: var(--bg-surface);
-  border: 1px solid #f59e0b44;
-}
-.v10-ph-join-info { display: flex; flex-direction: column; gap: 1px; }
-.v10-ph-join-name { font-size: 11px; font-weight: 600; color: var(--text-primary); }
-.v10-ph-join-addr { font-size: 9px; font-family: var(--font-mono); color: var(--text-tertiary); }
-.v10-ph-join-actions { display: flex; gap: 4px; }
-.v10-ph-join-btn {
-  border: none; border-radius: 6px; font-size: 10px; font-weight: 600; cursor: pointer;
-  padding: 4px 10px; transition: background 0.15s;
-}
-.v10-ph-join-btn.approve { background: #22c55e22; color: var(--text-success); border: 1px solid #22c55e44; }
-.v10-ph-join-btn.approve:hover { background: #22c55e44; }
-.v10-ph-join-btn.reject { background: #ef444422; color: var(--text-danger); border: 1px solid #ef444444; padding: 4px 8px; }
-.v10-ph-join-btn.reject:hover { background: #ef444444; }
-.v10-ph-join-btn:disabled { opacity: 0.5; cursor: default; }
-
 /* Lazy route spinner */
 .lazy-spinner{display:flex;align-items:center;justify-content:center;height:100%;color:var(--text-tertiary);font-size:13px}
 
@@ -5096,6 +5287,16 @@ body.light .v10-me-graph-legend { background: rgba(255,255,255,0.8); }
   border: 1px solid color-mix(in srgb, var(--v10-stat-accent) 18%, var(--border-default));
   border-radius: 8px;
   background: color-mix(in srgb, var(--v10-stat-accent) 5%, var(--bg-surface));
+  /* ui-lead item 7 — Dashboard-style hover: border tints toward
+     the layer accent (falls back to --border-strong on vanilla
+     cells) and a soft shadow rises. The M4 VM-hero gate still
+     binds — DO NOT modify cell padding, border radius, or value
+     size; only the hover-state border-color and box-shadow. */
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+.v10-stat-strip-cell:hover {
+  border-color: color-mix(in srgb, var(--v10-stat-accent) 35%, var(--border-strong));
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
 }
 .v10-stat-strip-value {
   display: block;
@@ -5159,78 +5360,252 @@ body.light .v10-me-graph-legend { background: rgba(255,255,255,0.8); }
 }
 
 /* ── Project Overview Card ── */
-.v10-po { flex-shrink: 0; padding: 16px; border-bottom: 1px solid var(--border-subtle); background: var(--bg-panel); }
-.v10-po-top { display: flex; align-items: flex-start; gap: 14px; margin-bottom: 14px; }
-.v10-po-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--text-primary); flex-shrink: 0; margin-top: 4px; }
-.v10-po-heading { flex: 1 1 auto; min-width: 0; }
-.v10-po-title { font-size: 15px; font-weight: 600; color: var(--text-primary); }
-.v10-po-desc { font-size: 11px; color: var(--text-tertiary); margin-top: 2px; line-height: 1.5; }
-.v10-po-stat-strip { margin-bottom: 12px; }
-.v10-po-stats { display: flex; gap: 20px; margin-bottom: 12px; flex-wrap: wrap; }
-.v10-po-stat { display: flex; flex-direction: column; align-items: center; gap: 1px; min-width: 50px; }
-.v10-po-stat-val { font-size: 20px; font-weight: 700; color: var(--text-primary); font-family: var(--font-mono); }
-.v10-po-stat-label { font-size: 9px; text-transform: uppercase; letter-spacing: 0.8px; color: var(--text-tertiary); font-weight: 600; }
-.v10-po-participants { margin-bottom: 12px; }
-.v10-po-participants-label { font-size: 9px; font-weight: 700; text-transform: uppercase; color: var(--text-tertiary); margin-bottom: 6px; }
-.v10-po-participants-list { display: flex; flex-wrap: wrap; gap: 6px; }
-.v10-po-participant {
-  display: inline-flex; align-items: center; gap: 5px;
-  padding: 3px 10px; border-radius: 12px; font-size: 11px; font-weight: 600;
-  background: var(--bg-surface); border: 1px solid var(--border-default); color: var(--text-primary);
-}
-.v10-po-participant-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
-.v10-po-progress { margin-bottom: 0; }
-.v10-po-progress-label { display: flex; justify-content: space-between; font-size: 10px; color: var(--text-tertiary); margin-bottom: 4px; }
-.v10-po-progress-bar { display: flex; height: 6px; border-radius: 3px; overflow: hidden; background: var(--bg-elevated); }
-.v10-po-progress-seg { min-width: 3px; transition: width 0.3s ease; }
-.v10-po-progress-seg.wm { background: #64748b; }
-.v10-po-progress-seg.swm { background: #f59e0b; }
-.v10-po-progress-seg.vm { background: #22c55e; }
-.v10-po-progress-legend { display: flex; gap: 14px; margin-top: 6px; font-size: 9px; font-family: var(--font-mono); color: var(--text-tertiary); }
-.v10-po-legend-item { display: flex; align-items: center; gap: 4px; }
-.v10-po-legend-dot { width: 6px; height: 6px; border-radius: 50%; }
-.v10-po-badges {
+.v10-po { flex-shrink: 0; padding: 16px; border-bottom: 1px solid var(--border-subtle); background: var(--bg-surface); }
+/* Identity row (S2 finalize §4.2.1) — label-pill pairs left, primer
+   link right. Name + description live in the persistent
+   ProjectHeaderStrip. The role glyph (◆) is applied here in CSS via
+   `data-role` so the data string stays semantic-free; same for the
+   curator marker on a participant row. */
+.v10-po-identity {
   display: flex;
-  flex: 0 0 auto;
   flex-wrap: wrap;
-  justify-content: flex-end;
-  gap: 6px;
-  max-width: 45%;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  margin: 0 0 14px;
+  padding: 0 0 14px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+.v10-po-identity-pairs {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 18px;
+}
+.v10-po-identity-pair {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.v10-po-identity-label {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
 }
 .v10-po-badge {
   display: inline-flex;
   align-items: center;
+  gap: 4px;
   min-height: 22px;
-  padding: 0 9px;
+  padding: 2px 10px;
   border-radius: 999px;
   border: 1px solid var(--border-default);
   background: var(--bg-surface);
-  color: var(--text-secondary);
-  font-size: 10px;
+  font-size: 11px;
   font-weight: 700;
-  text-transform: uppercase;
+  color: var(--text-primary);
+  letter-spacing: 0.01em;
 }
-.v10-po-badge.curator,
-.v10-po-badge.public {
-  border-color: rgba(34, 197, 94, 0.38);
-  background: rgba(34, 197, 94, 0.11);
+.v10-po-badge[data-role="curator"]::before {
+  content: "◆";
+  margin-right: 4px;
+  font-weight: 700;
   color: var(--text-success);
 }
-.v10-po-badge.participant,
-.v10-po-badge.curated {
+.v10-po-badge[data-role="curator"] {
+  border-color: rgba(34, 197, 94, 0.4);
+  background: rgba(34, 197, 94, 0.1);
+  color: var(--text-success);
+}
+.v10-po-badge[data-role="participant"] {
+  border-color: rgba(59, 130, 246, 0.4);
+  background: rgba(59, 130, 246, 0.1);
+  color: var(--text-primary);
+}
+.v10-po-badge[data-role="viewer"],
+.v10-po-badge[data-role="unknown"] {
+  color: var(--text-secondary);
+}
+.v10-po-badge[data-cg-type="public"] {
+  border-color: rgba(34, 197, 94, 0.4);
+  background: rgba(34, 197, 94, 0.1);
+  color: var(--text-success);
+}
+.v10-po-badge[data-cg-type="curated"] {
   border-color: rgba(245, 158, 11, 0.4);
-  background: rgba(245, 158, 11, 0.12);
+  background: rgba(245, 158, 11, 0.1);
   color: var(--text-warning);
 }
-.v10-po-badge.viewer,
-.v10-po-badge.unknown {
-  color: var(--text-tertiary);
+.v10-po-badge[data-cg-type="unknown"] {
+  color: var(--text-secondary);
 }
+.v10-po-identity-primer {
+  flex: 0 0 auto;
+  border: 1px solid var(--border-default);
+  border-radius: 6px;
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-family: var(--font-sans);
+  font-size: 11px;
+  font-weight: 600;
+  min-height: 28px;
+  padding: 0 12px;
+}
+.v10-po-identity-primer:hover {
+  border-color: var(--border-strong);
+  color: var(--text-primary);
+  background: var(--bg-hover);
+}
+.v10-po-stat-strip { margin-bottom: 12px; }
+/* ui-lead item 3 — section title above the At-a-glance grid so it
+   matches the structure of the other peer regions (Knowledge
+   Pipeline, Participant agents, Pending join requests). */
+.v10-po-stat-block { margin-bottom: 12px; }
+.v10-po-stat-block > .v10-po-section-title { margin-bottom: 8px; }
+/* Participant agents list */
+.v10-po-people { margin: 12px 0 0; padding-top: 12px; border-top: 1px solid var(--border-subtle); }
+.v10-po-people > .v10-po-section-title { margin-bottom: 8px; }
+.v10-po-people-empty {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  font-style: italic;
+}
+.v10-po-participants-list { display: flex; flex-wrap: wrap; gap: 6px; }
+.v10-po-participant {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 3px 10px; border-radius: 12px; font-size: 11px; font-weight: 600;
+  background: var(--bg-surface); border: 1px solid var(--border-default); color: var(--text-primary);
+}
+/* Glyph is rendered in CSS so the data string the test reads stays
+   unambiguous (just the suffix). Default participants get the
+   hollow ◯ glyph in `--text-secondary`. */
+.v10-po-participant::before {
+  content: "◯ ";
+  font-size: 12px;
+  line-height: 1;
+  color: var(--text-secondary);
+}
+/* §4.2.1 Delta 1 (locked) — `.is-self` carries TWO signals only:
+   weight (you-ness, paired with the ` · you` suffix in the data
+   string) + the filled ◆ glyph in `--text-info`. No border or
+   background override — three signals for one fact would be the
+   M4 VM-hero regression pattern. */
+.v10-po-participant.is-self { font-weight: 700; }
+.v10-po-participant.is-self::before {
+  content: "◆ ";
+  color: var(--text-info);
+}
+/* A non-self curator also carries the filled ◆ glyph (canonical
+   role glyph), tinted with the verified-trust color. No bold, no
+   chip-level tint — the glyph + ` · curator` suffix carry the
+   meaning. */
+.v10-po-participant.is-curator:not(.is-self)::before {
+  content: "◆ ";
+  color: var(--text-success);
+}
+/* When the current user IS the curator, success color wins over
+   info so curator role reads first. The .is-self bold is retained. */
+.v10-po-participant.is-self.is-curator::before {
+  color: var(--text-success);
+}
+.v10-po-participant-name {
+  white-space: nowrap;
+}
+/* ui-lead item 2 — suffix tags render as separate spans with a
+   CSS-driven `·` separator. Keeps the data string semantic-free
+   (the tag text is just "you" / "curator" — no glyphs or
+   punctuation in the DOM textContent). */
+.v10-po-participant-tag {
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+.v10-po-participant-tag::before {
+  content: "·";
+  margin: 0 6px;
+  color: var(--text-ghost);
+  font-weight: 400;
+}
+/* Pending join requests — peer section under Participant agents,
+   curator-only. */
+.v10-po-join { margin: 12px 0 0; padding: 12px 16px 0; border-top: 1px solid var(--border-subtle); }
+.v10-po-join-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.v10-po-join-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 6px;
+  border-radius: 999px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  background: rgba(245, 158, 11, 0.16);
+  color: var(--text-warning);
+  border: 1px solid rgba(245, 158, 11, 0.4);
+}
+.v10-po-join-count[data-empty="true"] {
+  background: var(--bg-elevated);
+  color: var(--text-tertiary);
+  border-color: var(--border-default);
+}
+.v10-po-join-empty {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  font-style: italic;
+}
+.v10-po-join-list { display: flex; flex-direction: column; gap: 6px; }
+.v10-po-join-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+}
+.v10-po-join-info { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.v10-po-join-name { font-size: 12px; font-weight: 600; color: var(--text-primary); overflow: hidden; text-overflow: ellipsis; }
+.v10-po-join-addr { font-size: 10px; font-family: var(--font-mono); color: var(--text-tertiary); }
+.v10-po-join-actions { display: flex; gap: 6px; flex-shrink: 0; }
+.v10-po-join-btn {
+  font-family: var(--font-sans);
+  font-size: 11px;
+  font-weight: 600;
+  padding: 4px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.v10-po-join-btn.approve { background: rgba(34, 197, 94, 0.12); color: var(--text-success); border: 1px solid rgba(34, 197, 94, 0.32); }
+.v10-po-join-btn.approve:hover { background: rgba(34, 197, 94, 0.2); }
+.v10-po-join-btn.reject { background: rgba(239, 68, 68, 0.12); color: var(--text-danger); border: 1px solid rgba(239, 68, 68, 0.32); padding: 4px 8px; }
+.v10-po-join-btn.reject:hover { background: rgba(239, 68, 68, 0.2); }
+.v10-po-join-btn:disabled { opacity: 0.5; cursor: default; }
 .v10-po-pipeline {
   display: flex;
   flex-direction: column;
   gap: 10px;
-  margin: 4px 0 12px;
+  margin: 12px 0 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-subtle);
+}
+/* §4.2.1 ui-lead review finding #1 — even divider rhythm across all
+   7 peer regions. The two boundaries that were previously missing
+   borders (at-a-glance ↔ pipeline above; join-requests ↔ activity
+   below) get them via `[data-section]` attribute selectors, which
+   are the stable hook regardless of inner wrapper class. */
+[data-section="activity"] {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-subtle);
 }
 .v10-po-pipeline-head {
   display: flex;
@@ -5249,24 +5624,6 @@ body.light .v10-me-graph-legend { background: rgba(255,255,255,0.8); }
   color: var(--text-secondary);
   font-size: 12px;
   line-height: 1.45;
-}
-.v10-po-primer-link {
-  flex: 0 0 auto;
-  border: 1px solid var(--border-default);
-  border-radius: 6px;
-  background: var(--bg-surface);
-  color: var(--text-secondary);
-  cursor: pointer;
-  font-family: var(--font-sans);
-  font-size: 11px;
-  font-weight: 700;
-  min-height: 30px;
-  padding: 0 12px;
-}
-.v10-po-primer-link:hover {
-  border-color: var(--border-strong);
-  color: var(--text-primary);
-  background: var(--bg-hover);
 }
 .v10-po-pipeline-track {
   display: flex;
@@ -5351,6 +5708,47 @@ body.light .v10-me-graph-legend { background: rgba(255,255,255,0.8); }
   text-align: right;
 }
 
+/* Primer footer (§4.2.1) — quiet last-row escape hatch. No card
+   chrome; sits flush in the Overview's panel padding. */
+.v10-po-primer-footer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  padding: 14px 16px;
+  margin-top: 12px;
+  border-top: 1px solid var(--border-subtle);
+  color: var(--text-tertiary);
+}
+.v10-po-primer-footer-lede {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+.v10-po-primer-footer-arrow {
+  color: var(--text-tertiary);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.v10-po-primer-footer-link {
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  color: var(--text-link);
+  font-family: var(--font-sans);
+  font-size: 12px;
+  font-weight: 650;
+}
+.v10-po-primer-footer-link:hover { text-decoration: underline; }
+.v10-po-primer-footer-sub {
+  flex: 1 0 100%;
+  margin-top: 2px;
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--text-tertiary);
+}
+
 @media (max-width: 1500px) {
   .v10-layer-switch-label-full { display: none; }
   .v10-layer-switch-label-compact { display: inline; }
@@ -5395,74 +5793,25 @@ body.light .v10-me-graph-legend { background: rgba(255,255,255,0.8); }
 }
 
 @media (max-width: 900px) {
-  .v10-po-top,
+  .v10-po-identity,
   .v10-po-pipeline-head {
     flex-direction: column;
     align-items: stretch;
   }
-  .v10-po-badges {
-    max-width: none;
-    justify-content: flex-start;
+  .v10-po-identity-pairs {
+    flex-wrap: wrap;
+  }
+  .v10-po-identity-primer {
+    align-self: flex-start;
   }
   .v10-po-pipeline-steps {
     grid-template-columns: 1fr;
   }
-  .v10-po-primer-link {
-    align-self: flex-start;
+  .v10-po-primer-footer {
+    flex-direction: row;
+    flex-wrap: wrap;
   }
 }
-
-/* ── Memory Strip ── */
-.v10-memory-strip { flex-shrink: 0; border-bottom: 1px solid var(--border-subtle); background: var(--bg-panel); }
-.v10-memory-layer {
-  display: flex; align-items: stretch; border-bottom: 1px solid var(--border-subtle); min-height: 0; cursor: pointer;
-}
-.v10-memory-layer:last-child { border-bottom: none; }
-.v10-layer-label {
-  width: 160px; flex-shrink: 0; display: flex; align-items: center;
-  gap: 8px; padding: 8px 12px;
-  border-right: 1px solid var(--border-subtle); cursor: pointer;
-  transition: background 0.15s;
-}
-.v10-layer-label:hover { background: var(--bg-hover); }
-.v10-layer-abbr { font-family: var(--font-sans); font-size: 12px; font-weight: 600; white-space: nowrap; }
-.v10-layer-count { font-family: var(--font-mono); font-size: 10px; color: var(--text-tertiary); margin-left: auto; }
-.v10-layer-items {
-  flex: 1; display: flex; align-items: center; gap: 6px;
-  padding: 5px 10px; overflow-x: auto; min-width: 0;
-}
-.v10-layer-chip {
-  flex-shrink: 0; display: flex; align-items: center; gap: 6px;
-  padding: 4px 10px; border-radius: 6px; font-size: 11px;
-  border: 1px solid var(--border-default); background: var(--bg-surface);
-  cursor: pointer; transition: all 0.15s; max-width: 260px;
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-}
-.v10-layer-chip:hover { border-color: var(--border-strong); background: var(--bg-elevated); }
-.v10-chip-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
-.v10-chip-text { color: var(--text-secondary); overflow: hidden; text-overflow: ellipsis; }
-.v10-chip-meta { font-family: var(--font-mono); font-size: 9px; color: var(--text-tertiary); flex-shrink: 0; }
-@keyframes v10-pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
-.v10-chip-activity { animation: v10-pulse 2s ease-in-out infinite; }
-.v10-memory-layer.wm { background: rgba(100,116,139,0.03); }
-.v10-memory-layer.wm .v10-layer-chip { border-style: dashed; opacity: 0.8; }
-.v10-memory-layer.wm .v10-layer-chip:hover { opacity: 1; }
-.v10-memory-layer.swm { background: rgba(245,158,11,0.02); }
-.v10-memory-layer.vm { background: rgba(34,197,94,0.02); }
-.v10-memory-layer.vm .v10-layer-chip { border-color: rgba(34,197,94,0.2); }
-.v10-layer-chevron {
-  font-size: 10px; color: var(--text-ghost); transition: transform 0.2s; margin-right: 2px;
-  flex-shrink: 0; width: 14px; text-align: center;
-}
-.v10-memory-layer.expanded .v10-layer-chevron { transform: rotate(90deg); }
-
-/* ── Expandable layer in overview ── */
-.v10-layer-expand-content {
-  max-height: 0; overflow: hidden; transition: max-height 0.3s ease;
-  background: var(--bg-root); border-bottom: 1px solid var(--border-subtle);
-  display: flex; flex-direction: column;
-}
-.v10-layer-expand-content.open { max-height: 70vh; height: 70vh; }
 
 /* Tab body fills the remaining space below the tabs strip */
 .v10-layer-expand-body {
@@ -5660,12 +6009,6 @@ body.light .v10-me-graph-legend { background: rgba(255,255,255,0.8); }
 }
 .v10-layer-expand-items .v10-item-row { padding: 6px 16px; }
 .v10-layer-expand-items .v10-item-row:last-child { border-bottom: none; }
-.v10-layer-expand-footer {
-  padding: 6px 16px 8px; display: flex; gap: 8px;
-  flex-shrink: 0;
-  border-top: 1px solid var(--border-subtle);
-  background: var(--bg-root);
-}
 .v10-layer-expand-footer-btn {
   font-size: 10px; font-weight: 600; color: var(--text-tertiary);
   padding: 4px 10px; border-radius: 5px; border: 1px solid var(--border-default);
@@ -5677,7 +6020,7 @@ body.light .v10-me-graph-legend { background: rgba(255,255,255,0.8); }
 .v10-layer-expand-footer-btn.publish { color: var(--text-success); border-color: rgba(34,197,94,0.25); }
 .v10-layer-expand-footer-btn.publish:hover { background: rgba(34,197,94,0.08); }
 
-/* ── Item rows (shared by strip and layer views) ── */
+/* ── Item rows (shared by layer views) ── */
 .v10-item-row {
   display: flex; align-items: center; gap: 10px; padding: 8px 16px;
   border-bottom: 1px solid var(--border-subtle); cursor: pointer; transition: background 0.1s;
@@ -6304,6 +6647,32 @@ body.light .v10-ka-graph-shell .v10-graph-canvas {
   transform: translateY(-1px);
   box-shadow: 0 8px 24px -12px var(--sg-color, rgba(100,116,139,0.6));
 }
+/* GH #813 — Root mini-card chrome. Solid `--border-subtle` reads
+   as a quieter daemon-emitted card vs the tinted named-subgraph
+   cards' `card.color + '55'` accent; the synthesized bucket stays
+   visually present without competing with the named cards for
+   attention.
+   Per-card `--sg-color` injection is suppressed in the JSX so the
+   gradient + hover-shadow fall through to the neutral fallback
+   (rgba(100,116,139,…)), and the icon picks up its color from
+   the inherited tertiary token instead of a per-slug accent.
+   Position: rendered last in the grid (mirrors Root chip's
+   rightmost chip-row position).
+   Round 1 visual revision (ui-lead): the original dashed +
+   `--border-strong` treatment was rejected — in this codebase
+   dashed reads as broken/disabled/drop-zone, `--border-strong`
+   is the loud active/hover token (so the Root card became the
+   LOUDEST card in the grid, opposite of intent), and dashed
+   truncates into irregular dot artifacts on the 12px
+   border-radius corners. Solid + subtle is the locked
+   treatment; base `.v10-sgov-card` rule's `border: 1px solid …`
+   cascades, so only the color token swaps here. */
+.v10-sgov-card.root {
+  border-color: var(--border-subtle);
+}
+.v10-sgov-card.root .v10-sgov-card-icon {
+  color: var(--text-tertiary);
+}
 .v10-sgov-card-head {
   display: flex; align-items: flex-start; gap: 10px;
   padding: 10px 12px 8px 12px;
@@ -6359,29 +6728,29 @@ body.light .v10-ka-graph-shell .v10-graph-canvas {
 }
 
 /* ── Mini layer pyramid (WM/SWM/VM segmented bar + legend) ── */
-.v10-minipyr {
+.v10-minibar {
   display: flex; flex-direction: column; gap: 4px;
   min-width: 0;
 }
-.v10-minipyr.compact { flex-direction: row; align-items: center; gap: 6px; }
-.v10-minipyr-empty {
+.v10-minibar.compact { flex-direction: row; align-items: center; gap: 6px; }
+.v10-minibar-empty {
   font-size: 10px; color: var(--text-tertiary); font-style: italic;
 }
-.v10-minipyr-bar {
+.v10-minibar-bar {
   display: flex; height: 6px; width: 100%;
   border-radius: 3px; overflow: hidden;
   background: rgba(255,255,255,0.04);
 }
-.v10-minipyr-seg {
+.v10-minibar-seg {
   height: 100%;
   transition: opacity 0.15s ease, filter 0.15s ease;
 }
-.v10-minipyr-seg.dim { opacity: 0.3; filter: grayscale(0.6); }
-.v10-minipyr-legend {
+.v10-minibar-seg.dim { opacity: 0.3; filter: grayscale(0.6); }
+.v10-minibar-legend {
   display: flex; gap: 4px; flex-wrap: wrap;
   align-items: center;
 }
-.v10-minipyr-chip {
+.v10-minibar-chip {
   display: inline-flex; align-items: center; gap: 4px;
   padding: 2px 7px;
   background: none;
@@ -6393,14 +6762,14 @@ body.light .v10-ka-graph-shell .v10-graph-canvas {
   cursor: default;
   transition: border-color 0.15s, color 0.15s, opacity 0.15s;
 }
-.v10-minipyr-chip.interactive { cursor: pointer; }
-.v10-minipyr-chip.interactive:hover { border-color: var(--border-strong); color: var(--text-primary); }
-.v10-minipyr-chip.dim { opacity: 0.4; }
-.v10-minipyr-dot {
+.v10-minibar-chip.interactive { cursor: pointer; }
+.v10-minibar-chip.interactive:hover { border-color: var(--border-strong); color: var(--text-primary); }
+.v10-minibar-chip.dim { opacity: 0.4; }
+.v10-minibar-dot {
   display: inline-block; width: 6px; height: 6px; border-radius: 50%;
 }
-.v10-minipyr-short { letter-spacing: 0.04em; }
-.v10-minipyr-count { font-variant-numeric: tabular-nums; color: var(--text-tertiary); }
+.v10-minibar-short { letter-spacing: 0.04em; }
+.v10-minibar-count { font-variant-numeric: tabular-nums; color: var(--text-tertiary); }
 
 /* ── Sub-graph detail view header + filters ── */
 .v10-subgraph-detail {
@@ -6419,7 +6788,18 @@ body.light .v10-ka-graph-shell .v10-graph-canvas {
 .v10-subgraph-detail-icon {
   font-size: 20px; line-height: 1;
 }
-.v10-subgraph-detail-title-wrap { flex: 1; min-width: 0; }
+.v10-subgraph-detail-title-wrap {
+  flex: 1;
+  min-width: 0;
+  /* #10a polish — reserve a consistent vertical slot for the
+     title block so 1-line and 2-line titles occupy the same
+     space. No layout shift navigating between subgraphs whose
+     descriptions differ in length. */
+  min-height: 44px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+}
 .v10-subgraph-detail-title {
   font-size: 15px; font-weight: 600; color: var(--text-primary);
 }
@@ -6648,6 +7028,182 @@ body.light .v10-ka-graph-shell .v10-graph-canvas {
 .v10-subgraph-badge-icon { font-size: 10px; line-height: 1; }
 .v10-subgraph-badge-label { text-transform: capitalize; }
 
+/* ── Subgraph Explorer page header (S3) ── */
+/* Persistent page identity + 3-sentence intro. Rendered above the
+   SubGraphBar both in the All / overview state and inside every
+   detail body so the explanatory text never disappears. */
+.v10-subgraph-explorer-header {
+  padding: 12px 16px 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.v10-subgraph-explorer-title {
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  color: var(--text-primary);
+}
+.v10-subgraph-explorer-intro {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--text-secondary);
+  max-width: 760px;
+}
+
+/* ── Subgraph Explorer Root chip (S3) ── */
+/* Quieter than named chips — it's a fallback bucket. The ⊘ glyph
+   signals "no subgraph". Sits at the end of the chip row, after
+   any named chips. */
+.v10-subgraph-chip.v10-subgraph-chip-root {
+  color: var(--text-tertiary);
+}
+.v10-subgraph-chip.v10-subgraph-chip-root .v10-subgraph-chip-icon {
+  color: var(--text-tertiary);
+}
+.v10-subgraph-chip.v10-subgraph-chip-root.active {
+  color: var(--text-primary);
+  border-color: var(--border-strong);
+  background: rgba(255,255,255,0.05);
+}
+
+/* ── Cross-layer count strip + active-layer pill (S3) ── */
+/* The count strip is the page's whole point — every subgraph is
+   cross-layer. The pill below it surfaces the active-layer scope
+   so it never silently changes meaning across a navigation
+   transition (M2 / S5 strand). */
+.v10-subgraph-cross-layer {
+  /* #11 polish (ui-locked) — `padding: 16px 16px 0` is +6px top
+     and -12px bottom vs. the prior `10px 16px 12px`. The bottom
+     padding moves into the active-layer-pill's `margin-top: 14px`,
+     so the cluster reads as a single layered breathing band (lede
+     +2px / count strip / pill +14px) instead of stacked rows with
+     bottom container padding. */
+  padding: 16px 16px 0;
+  border-bottom: 1px solid var(--border-subtle);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  background: rgba(255,255,255,0.01);
+}
+.v10-subgraph-cross-layer-lede {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  letter-spacing: 0.01em;
+  /* #11 polish (ui-locked) — +2px below the lede so the count
+     strip sits cleanly beneath. */
+  margin-bottom: 10px;
+}
+.v10-subgraph-cross-layer-strip {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.v10-subgraph-cross-layer-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--border-subtle);
+  font-size: 12px;
+  color: var(--text-primary);
+  background: var(--bg-elevated);
+  /* #6 polish — cells become interactive buttons (ui-locked).
+     The padding + negative margin pair enlarges the hit target
+     for click affordance while keeping the visual rhythm stable
+     (the negative margin negates the added padding so neighbours
+     don't shift). */
+  cursor: pointer;
+  border-radius: 6px;
+  padding: 4px 8px;
+  margin: -4px -8px;
+  transition: background 0.15s, color 0.15s, opacity 0.15s;
+  /* Native button reset so the cell inherits the rest of the
+     strip's typography rather than the UA <button> defaults. */
+  font-family: inherit;
+  text-align: left;
+}
+.v10-subgraph-cross-layer-cell:hover {
+  background: var(--bg-hover);
+}
+.v10-subgraph-cross-layer-cell[aria-pressed="false"] {
+  opacity: 0.5;
+}
+.v10-subgraph-cross-layer-cell-icon {
+  font-size: 13px;
+  line-height: 1;
+}
+.v10-subgraph-cross-layer-cell-label {
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+.v10-subgraph-cross-layer-cell-count {
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+.v10-subgraph-cross-layer-arrow {
+  color: var(--text-tertiary);
+  font-size: 12px;
+}
+/* PR #793 round 2 (ui-locked option c) — demoted from
+   clickable pill chrome to inline caption-style metadata. The
+   pill used to be dressed as a chip but didn't go anywhere;
+   the `Reset filters` button is the canonical "restore scope"
+   affordance. Reduced to a transparent text label so it reads
+   as caption metadata, not a control. */
+.v10-subgraph-active-layer-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  /* 8/12 asymmetry (ui-lead, round 3): caption reads as
+     "grouped with the strip above (tight 8px), terminated
+     from the chrome below (looser 12px)". */
+  margin-top: 8px;              /* was: 14px */
+  margin-bottom: 12px;          /* round 3: terminate before entity-tab strip */
+  padding: 0;
+  border: 0;
+  background: transparent;
+  border-radius: 0;
+  font-family: var(--font-sans); /* was: --font-mono */
+  font-size: 11px;
+  color: var(--text-tertiary);
+  cursor: default;               /* not a clickable widget */
+  transition: color 0.15s;
+}
+.v10-subgraph-active-layer-pill:hover:not(:disabled) {
+  color: var(--text-secondary);
+  border-color: transparent;
+}
+.v10-subgraph-active-layer-pill:disabled,
+.v10-subgraph-active-layer-pill.all-layers {
+  color: var(--text-tertiary);
+  opacity: 1;
+}
+.v10-subgraph-active-layer-pill-label {
+  text-transform: uppercase;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: var(--text-tertiary);
+}
+.v10-subgraph-active-layer-pill-value {
+  color: var(--text-secondary); /* was: --text-primary */
+  font-weight: 600;
+}
+
+/* PR #793 round 2 — `.v10-subgraph-swm-attribution-badge` rule
+   (sweep 0 Bug #8's "Colored by contributing agent" inline
+   badge above LayerGraphPanel) removed alongside the
+   corresponding render in SubGraphDetailView. The existing
+   SwmAttributionLegend inside LayerGraphPanel carries the
+   load-bearing disclosure; the badge added visual noise
+   without signal. The context-sensitive tooltip on the SWM
+   cross-layer cell remains as hover-only insurance. */
+
 /* ── Verify on DKG CTA (in KA detail right pane) ── */
 /* Two variants: .promote (WM -> SWM, amber) and .publish (SWM -> VM, green).
    The layer-transition icon (◈ / ◉) matches LAYER_CONFIG so the CTA
@@ -6833,13 +7389,41 @@ body.light .v10-ka-graph-shell .v10-graph-canvas {
   background: rgba(255, 255, 255, 0.015);
 }
 .v10-activity-feed-title {
+  display: flex; align-items: baseline; gap: 8px;
   font-size: 12px; font-weight: 700;
   text-transform: uppercase; letter-spacing: 0.06em;
   color: var(--text-tertiary);
 }
-.v10-empty-state.v10-activity-feed-empty-state { min-height: 96px; }
+.v10-activity-feed-title-label { flex: 0 1 auto; }
+.v10-activity-feed-title-count {
+  /* N6 polish (item 3) — total-feed count next to the heading.
+   * Same mono+tertiary treatment as `.v10-activity-feed-bucket-count`
+   * so the two read as the same kind of signal at different scopes. */
+  font-family: var(--font-mono); font-weight: 400;
+  font-size: 10px; letter-spacing: 0;
+  text-transform: none;
+  color: var(--text-tertiary);
+}
 .v10-overview-activity.v10-activity-feed-empty {
   min-height: 140px;
+}
+.v10-activity-feed-empty-hint {
+  /* N6 polish (item 2) — quieter than the prior centered/bold
+   * EmptyState primitive; recedes so the rest of the Overview
+   * stays the focal area. */
+  margin-top: 8px;
+  font-size: 12px; font-weight: 400; line-height: 1.5;
+  color: var(--text-tertiary);
+}
+.v10-activity-feed-error {
+  /* PR #694 Comment 8 — distinguishable from `.v10-activity-feed-empty-hint`
+   * so the user can tell "couldn't load" apart from "no activity
+   * yet", but still quieter than the loud `EmptyState` primitive. */
+  margin-top: 8px;
+  padding: 6px 8px;
+  border-left: 2px solid var(--accent-warn, #f59e0b);
+  font-size: 12px; font-weight: 400; line-height: 1.5;
+  color: var(--text-tertiary);
 }
 .v10-activity-feed-bucket { display: flex; flex-direction: column; gap: 4px; }
 .v10-activity-feed-bucket-head {
@@ -6878,6 +7462,19 @@ body.light .v10-ka-graph-shell .v10-graph-canvas {
   border-top: 1px solid var(--border-subtle);
   border-radius: 0;
 }
+/* Non-clickable rows — both PR #656-era stub rows (promotion of a
+ * root not in `rawMemory.entities`) and the lifecycle rows that are
+ * non-interactive by design (PR #694 Comment 12 (A) — assertion
+ * click-through lands in the S4 PR). Disabledness is signalled by
+ * `cursor: default` + `aria-disabled="true"` + the missing hover
+ * surface; the prior `opacity: 0.7` was redundant and dimmed the
+ * bulk of the feed once lifecycle rows became the dominant
+ * non-clickable kind, making the whole feed read muted vs the rest
+ * of the Overview chrome. */
+.v10-activity-feed-row-static {
+  cursor: default;
+}
+.v10-activity-feed-row-static:hover { background: none; }
 .v10-activity-feed-layer {
   font-size: 14px; line-height: 1;
   justify-self: center;
@@ -6895,7 +7492,14 @@ body.light .v10-ka-graph-shell .v10-graph-canvas {
 }
 .v10-activity-feed-type-icon { font-size: 11px; color: var(--type-color, #a855f7); }
 .v10-activity-feed-title-text {
-  font-size: 12px; font-weight: 600;
+  /* Entity / assertion name in each row (e.g.
+   * "pharmaceutical-derived-product-metadata"). Was `600` to
+   * compensate for the `.v10-activity-feed-row-static` opacity dim;
+   * with the dim gone (prior commit), `600` over-emphasised the row
+   * body relative to the surrounding chrome (`RECENT ACTIVITY · 7`
+   * title, `TODAY` bucket label, agent chips). Dropped one notch
+   * to `500` to bring it inline with the chrome's body weight. */
+  font-size: 12px; font-weight: 500;
   color: var(--text-primary);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   min-width: 0;
@@ -7332,7 +7936,15 @@ body.light .v10-ka-graph-shell .v10-graph-canvas {
     color-mix(in srgb, var(--sg-color, #a855f7) 8%, transparent) 0%,
     transparent 40%
   );
-  min-height: 34px;
+  /* PR #793 round 2 — `min-height: 44px` reserves space for the
+     fully-populated breadcrumb state (project name + `›`
+     separator + subgraph chip + description). Pre-fix the row
+     was 34px when only the project name showed (e.g. on the
+     Subgraphs / WM / SWM / VM tabs without an active subgraph)
+     and grew to ~42-44px when the breadcrumb expanded, pushing
+     the body content down on transition. Reserving the
+     expanded height at all times eliminates the layout shift. */
+  min-height: 44px;
 }
 .v10-project-strip-dot {
   width: 9px; height: 9px; border-radius: 50%;
@@ -7365,11 +7977,12 @@ body.light .v10-ka-graph-shell .v10-graph-canvas {
 }
 .v10-project-strip-sg-icon { font-size: 13px; line-height: 1; }
 .v10-project-strip-desc {
-  font-size: 11px; color: var(--text-tertiary);
+  font-size: 12px; color: var(--text-secondary);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  margin-left: auto;
-  max-width: 560px;
-  padding-left: 12px;
+  margin-left: 14px;
+  max-width: 720px;
+  padding-left: 0;
+  flex: 0 1 auto;
 }
 
 /* Context Graph primer */

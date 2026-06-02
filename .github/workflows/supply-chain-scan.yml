@@ -26,7 +26,7 @@ name: Supply chain scan
 
 on:
   pull_request:
-    branches: [main, v10-rc]
+    branches: [main, v10-rc, release/rc.12]
     paths:
       - '.github/workflows/**'
       - '.github/actions/**'
@@ -41,8 +41,19 @@ on:
       - 'pnpm-lock.yaml'
       - '**/package.json'
       - '.npmrc'
+      # The deny-list scanner's inputs: changes to the JSON list or
+      # the scanner script itself MUST re-trigger this workflow, or a
+      # PR that adds a new deny-list entry would not be exercised
+      # until the next unrelated lockfile change.
+      - '.github/dependency-deny-list.json'
+      - 'scripts/check-dependency-deny-list.mjs'
+      # Recursive filename deny-list entries that are themselves IoCs.
+      # Keep this in sync with denied_filenames[] so an IoC-only PR
+      # cannot avoid the scanner by touching no package metadata.
+      - '.cursorrules'
+      - '**/.cursorrules'
   push:
-    branches: [main, v10-rc]
+    branches: [main, v10-rc, release/rc.12]
     paths:
       - '.github/workflows/**'
       - '.github/actions/**'
@@ -51,6 +62,10 @@ on:
       - 'pnpm-lock.yaml'
       - '**/package.json'
       - '.npmrc'
+      - '.github/dependency-deny-list.json'
+      - 'scripts/check-dependency-deny-list.mjs'
+      - '.cursorrules'
+      - '**/.cursorrules'
   schedule:
     # Mondays 06:30 Europe/Belgrade ≈ 04:30 UTC. Same window as Dependabot
     # so any week-over-week drift surfaces in a single review pass.
@@ -121,6 +136,106 @@ jobs:
           REQ
           pip install --require-hashes --no-deps -r "${RUNNER_TEMP}/zizmor-requirements.txt"
           zizmor --version
+
+      - name: Guard zizmor `cache-poisoning` exception scope
+        # The `cache-poisoning` rule in `.github/zizmor.yml` ignores entire
+        # workflow files (ci.yml, evm-integration.yml, supply-chain-scan.yml)
+        # on the rationale that they are NOT publishing surfaces — they only
+        # run tests/lints/scanners. The exception is sound for the workflows'
+        # CURRENT shape, but zizmor cannot enforce that they STAY non-
+        # publishing. If a future PR adds a publish step to any ignored
+        # workflow, the cache-poisoning risk becomes real and the exception
+        # must be re-evaluated. This step encodes that invariant: it greps
+        # the ignored workflows for known publishing-action markers, and
+        # fails the audit if any are found.
+        #
+        # Self-match protection: this step itself contains every marker as
+        # a literal string in `PATTERNS`. To avoid a false-positive when
+        # scanning `supply-chain-scan.yml`, the guard's own pattern block
+        # is bracketed with sentinel comments and stripped from the scan
+        # input via `sed` before grep runs. Any future literal-pattern
+        # additions MUST stay inside the sentinels.
+        #
+        # Note: this does NOT catch cross-workflow artifact promotion via
+        # `actions/upload-artifact` consumed by a separate publishing
+        # workflow — that requires its own audit. For now, in-workflow
+        # publish actions are the high-confidence signal.
+        run: |
+          set -euo pipefail
+          IGNORED=(
+            .github/workflows/ci.yml
+            .github/workflows/evm-integration.yml
+            .github/workflows/supply-chain-scan.yml
+          )
+          # zizmor-cache-poisoning-guard-patterns-start
+          # Patterns that indicate a workflow is shipping bytes to a
+          # user-visible publishing surface. Keep this list synced with the
+          # rationale in `.github/zizmor.yml` `cache-poisoning:` block.
+          #
+          # Coverage notes:
+          # - `gh release create|upload`, `softprops/action-gh-release`,
+          #   `actions/create-release`, `actions/upload-release-asset` →
+          #   GitHub Releases (binary or tag-based).
+          # - `npm publish`, `pnpm publish`, `JS-DevTools/npm-publish` → npm.
+          # - `pypa/gh-action-pypi-publish`, `twine upload` → PyPI.
+          # - `docker push`, `docker buildx ... --push` → Docker registries
+          #   via the docker CLI.
+          # - `docker/build-push-action` → Docker registries via the
+          #   official GHA. The action is flagged regardless of `with.push`
+          #   because that input is set in a separate block grep cannot
+          #   correlate; flagging on action-use is conservative (build-only
+          #   adoption is uncommon in CI and an operator can confirm).
+          # - `goreleaser/goreleaser-action` → Go release toolchain.
+          # - `cargo publish` → crates.io.
+          PATTERNS=(
+            'gh release create'
+            'gh release upload'
+            'softprops/action-gh-release'
+            'actions/create-release'
+            'actions/upload-release-asset'
+            'JS-DevTools/npm-publish'
+            'npm publish'
+            'pnpm publish'
+            'pypa/gh-action-pypi-publish'
+            'twine upload'
+            'docker push'
+            'docker buildx[^#]*--push'
+            'docker/build-push-action'
+            'goreleaser/goreleaser-action'
+            'cargo publish'
+          )
+          # zizmor-cache-poisoning-guard-patterns-end
+          fail=0
+          for wf in "${IGNORED[@]}"; do
+            if [ ! -f "$wf" ]; then continue; fi
+            # 1. Strip the guard's own PATTERNS block so the step does not
+            #    self-match on its own literal-pattern array.
+            # 2. Normalize shell backslash-continuations by joining lines
+            #    that end with `\` into a single line. Without this, the
+            #    common multi-line publish form (e.g. `docker buildx build
+            #    \<newline>  --push \<newline>  .`) escapes a single-line
+            #    grep — a future PR could add a real multi-line publish
+            #    step to an ignored workflow and silently pass this guard.
+            #    The `\` gets replaced with a single space so adjacent
+            #    tokens stay separated for the subsequent grep.
+            scan_input=$(sed '/zizmor-cache-poisoning-guard-patterns-start/,/zizmor-cache-poisoning-guard-patterns-end/d' "$wf" \
+              | awk '/\\$/ { sub(/\\$/, " "); printf "%s", $0; next } { print }')
+            for pat in "${PATTERNS[@]}"; do
+              hits=$(echo "$scan_input" | grep -nE "$pat" || true)
+              if [ -n "$hits" ]; then
+                echo "::error file=$wf::cache-poisoning exception applies to this workflow, but it now contains a publishing action (\"$pat\"). Re-evaluate the .github/zizmor.yml exception."
+                echo "$hits"
+                fail=1
+              fi
+            done
+          done
+          if [ "$fail" -ne 0 ]; then
+            echo
+            echo "The cache-poisoning ignore-list in .github/zizmor.yml is scoped to non-publishing CI workflows."
+            echo "One of those workflows now contains a publishing action — the exception is no longer safe."
+            echo "Either remove the publishing action, move it to a workflow not in the ignore-list, or revise the exception."
+            exit 1
+          fi
 
       - name: Resolve zizmor scan targets
         # Scan EVERYTHING under `.github/` that can land code on the runner:
@@ -220,6 +335,64 @@ jobs:
           set -euo pipefail
           read -r -a TARGETS <<< "$(echo "$ZIZMOR_TARGETS" | tr '\n' ' ')"
           zizmor --persona auditor --min-severity low --config .github/zizmor.yml --format plain "${TARGETS[@]}"
+
+  dependency-deny-list:
+    name: Dependency deny-list (named-package blocklist)
+    # Hard gate. Scans `pnpm-lock.yaml` + every `package.json` in the
+    # workspace against a curated list of package names that public
+    # security research has linked to active supply-chain attacks
+    # (currently: the TrapDoor crypto stealer wave — Socket.dev, May 2026).
+    # Also fails if any path in `denied_files[]` exists at an exact
+    # repo-root-relative location, or if any file whose basename is in
+    # `denied_filenames[]` (e.g. `.cursorrules`) exists ANYWHERE in
+    # the workspace tree — the right scope for AI-injection
+    # persistence files that an attacker could plant at any depth.
+    #
+    # Why a name-based blocklist on top of the cooldown + advisory gate
+    # in `dependabot-advisory.yml`:
+    #
+    #   * The advisory gate fires when a Dependabot PR proposes a bump
+    #     to an already-flagged version. This scanner fires on EVERY
+    #     PR (including a human-authored one that adds a direct dep)
+    #     and catches the package even before the lockfile resolves.
+    #   * The cooldown delays Dependabot from proposing a fresh version
+    #     by 7 days. A name-based blocklist is the right defence for
+    #     attacks that are NOT version-specific — i.e. the package
+    #     itself is the attack surface, regardless of which version.
+    #
+    # Maintenance: add new entries to `.github/dependency-deny-list.json`
+    # with full provenance (campaign label + source URL + added date).
+    # The scanner self-validates via a lockfile sanity-check and exits 2
+    # if the scan path is broken (rather than 0 / clean) so a future
+    # refactor cannot silently turn this into a no-op.
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .nvmrc
+          # No `cache: pnpm` here — the scanner uses vanilla node:fs
+          # only, no dependency install runs, so a cache restore is
+          # pure overhead and would re-introduce a (small) cache-poison
+          # surface inside an otherwise hermetic step.
+      - name: Run dependency deny-list scanner
+        # Vanilla Node, no `pnpm install` step. The scanner reads
+        # `.github/dependency-deny-list.json` and asserts that no
+        # `denied_package_names[]` entry appears in pnpm-lock.yaml or
+        # any package.json, no `denied_files[]` path exists, and no
+        # file whose basename is in `denied_filenames[]` exists
+        # anywhere in the tree. Exit codes:
+        #   0 = clean
+        #   1 = at least one denied entry matched
+        #   2 = scanner broken (deny-list file missing / malformed
+        #       / schema-mismatched, or none of the sanity-check
+        #       anchors found in the lockfile)
+        run: node scripts/check-dependency-deny-list.mjs
 
   npm-audit:
     name: pnpm audit (informational)
@@ -596,6 +769,30 @@ jobs:
             fi
           fi
 
+          # crytic/slither-action: pinned by commit SHA in
+          # `ci.yml`'s `tornado-static-analysis` lane, with a trailing
+          # `# v<version>` comment marking which release the SHA
+          # corresponds to. Parse the comment for drift comparison.
+          # The SHA itself is the source of truth on the runner; the
+          # comment is the source of truth for THIS freshness check.
+          # Aderyn (@cyfrin/aderyn) and solhint are npm devDeps in
+          # packages/evm-module/package.json — Dependabot's npm
+          # ecosystem covers their drift, so they're intentionally
+          # not duplicated here.
+          if [ -f "${GITHUB_WORKSPACE}/.github/workflows/ci.yml" ]; then
+            SLITHER_PINNED=$(grep -oE 'crytic/slither-action@[a-f0-9]+ # v[0-9.]+' "${GITHUB_WORKSPACE}/.github/workflows/ci.yml" | head -1 | sed -E 's/.*# v//')
+            SLITHER_LATEST=$(gh api repos/crytic/slither-action/releases/latest --jq '.tag_name' | sed 's/^v//')
+            if [ -n "${SLITHER_PINNED}" ] && [ -n "${SLITHER_LATEST}" ]; then
+              if [ "${SLITHER_PINNED}" = "${SLITHER_LATEST}" ]; then
+                report 'crytic/slither-action' "${SLITHER_PINNED}" "${SLITHER_LATEST}" '✓ current'
+              else
+                report 'crytic/slither-action' "${SLITHER_PINNED}" "${SLITHER_LATEST}" '⚠ behind'
+              fi
+            else
+              report 'crytic/slither-action' "${SLITHER_PINNED:-?}" "${SLITHER_LATEST:-?}" '⚠ unable to compare'
+            fi
+          fi
+
           # shellcheck disable=SC2016
           # Backticks in the markdown string below are intentional
           # (code-fence formatting in the GitHub Step Summary), not
@@ -605,6 +802,6 @@ jobs:
             if [ "${STALE}" -eq 0 ]; then
               echo '_All scanners up to date._'
             else
-              echo '_One or more scanners are behind upstream. Open a bump PR — recompute hash pins where applicable (zizmor PyPI wheels in `supply-chain-scan.yml`, actionlint release `checksums.txt`)._'
+              echo '_One or more scanners are behind upstream. Open a bump PR — recompute hash pins where applicable (zizmor PyPI wheels in `supply-chain-scan.yml`, actionlint release `checksums.txt`, slither-action commit SHA in `ci.yml`)._'
             fi
           } >> "$GITHUB_STEP_SUMMARY"

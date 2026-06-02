@@ -15,7 +15,14 @@ export { MerkleTree, compareBytes } from './merkle.js';
 export { V10MerkleTree } from './v10-merkle.js';
 
 export {
+  V10CiphertextChunksMerkleTree,
+  buildCiphertextChunksRoot,
+  type CiphertextChunksCommitment,
+} from './v10-ciphertext-merkle.js';
+
+export {
   buildV10ProofMaterial,
+  buildV10CiphertextChunksProofMaterial,
   verifyV10ProofMaterial,
   V10ProofRootMismatchError,
   V10ProofLeafCountMismatchError,
@@ -33,10 +40,13 @@ export {
   computePublishACKDigest,
   computeUpdateACKDigest,
   computePublishPublisherDigest,
+  floorPublishTokenAmount,
   buildAuthorAttestationTypedData,
+  buildUpdateAuthorAttestationTypedData,
   AUTHOR_ATTESTATION_DOMAIN_NAME,
   AUTHOR_ATTESTATION_DOMAIN_VERSION,
   AUTHOR_ATTESTATION_PRIMARY_TYPE,
+  UPDATE_AUTHOR_ATTESTATION_PRIMARY_TYPE,
   AUTHOR_SCHEME_VERSION_V1,
   type AuthorAttestationTypedData,
   eip191Hash,
@@ -93,9 +103,16 @@ export {
   encryptV10PublishPayload,
   decryptV10PublishPayload,
   isEncryptedV10PublishPayload,
+  encryptChunked,
+  decryptChunked,
+  deriveChunkNonce,
   V10_PUBLISH_PAYLOAD_MAGIC,
   type EncryptV10PublishPayloadInput,
   type DecryptV10PublishPayloadInput,
+  type EncryptChunkedInput,
+  type EncryptChunkedResult,
+  type DecryptChunkedInput,
+  type DecryptChunkedResult,
 } from './v10-publish-payload.js';
 
 export { resolveRootEntities, type Quad as RootEntityQuad } from './root-entity.js';

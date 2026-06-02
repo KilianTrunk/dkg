@@ -57,8 +57,9 @@ const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
 import { enrichEvmError, MockChainAdapter } from '@origintrail-official/dkg-chain';
 import { DKGAgent, loadOpWallets } from '@origintrail-official/dkg-agent';
-import { computeNetworkId, createOperationContext, DKGEvent, Logger, PayloadTooLargeError, GET_VIEWS, TrustLevel, validateSubGraphName, validateAssertionName, validateContextGraphId, isSafeIri, assertSafeIri, assertSafeRdfTerm, sparqlIri, contextGraphSharedMemoryUri, contextGraphAssertionUri, contextGraphMetaUri, escapeDkgRdfLiteral } from '@origintrail-official/dkg-core';
-import { findReservedSubjectPrefix, isSkolemizedUri, type PublishOptions } from '@origintrail-official/dkg-publisher';
+import { computeNetworkId, createOperationContext, DKGEvent, Logger, PayloadTooLargeError, GET_VIEWS, TrustLevel, validateSubGraphName, validateAssertionName, validateContextGraphId, isSafeIri, assertSafeIri, assertSafeRdfTerm, sparqlIri, contextGraphSharedMemoryUri, contextGraphAssertionUri, contextGraphMetaUri, escapeDkgRdfLiteral, escapeSparqlLiteral } from '@origintrail-official/dkg-core';
+import { autoPartition, findReservedSubjectPrefix, isSkolemizedUri, type PublishOptions, type PublishResult } from '@origintrail-official/dkg-publisher';
+import type { Quad } from '@origintrail-official/dkg-storage';
 import {
   DashboardDB,
   MetricsCollector,
@@ -107,6 +108,7 @@ import {
 import { createPublisherControlFromStore, startPublisherRuntimeIfEnabled, type PublisherRuntime } from '../../publisher-runner.js';
 import { createCatchupRunner, type CatchupJobResult, type CatchupRunner } from '../../catchup-runner.js';
 import { loadTokens, httpAuthGuard, extractBearerToken } from '../../auth.js';
+import { recordAssertionActivity } from '../activity-notification.js';
 import { ExtractionPipelineRegistry } from '@origintrail-official/dkg-core';
 import { MarkItDownConverter, isMarkItDownAvailable, extractFromMarkdown, extractWithLlm } from '../../extraction/index.js';
 import {
@@ -195,6 +197,7 @@ import {
   safeParseJson,
   validateOptionalSubGraphName,
   validateRequiredContextGraphId,
+  resolveRequiredWriteContextGraphId,
   validateEntities,
   validateConditions,
   MAX_BODY_BYTES,
@@ -236,15 +239,10 @@ import {
   getCurrentCliVersion,
   type NpmVersionStatus,
   checkForNpmVersionUpdate,
-  checkForNewCommit,
-  checkForNewCommitWithStatus,
   type UpdateStatus,
   acquireUpdateLock,
   releaseUpdateLock,
-  performUpdate,
-  performUpdateWithStatus,
   performNpmUpdate,
-  checkForUpdate,
 } from '../auto-update.js';
 import {
   OPENCLAW_UI_CONNECT_TIMEOUT_MS,
@@ -351,6 +349,78 @@ type PreSignedAuthorAttestation = {
   signature: { r: Uint8Array; vs: Uint8Array };
 };
 
+type SharedMemoryPublishSelection = "all" | { rootEntities: string[] };
+const WORKSPACE_OWNER_PREDICATE = 'http://dkg.io/ontology/workspaceOwner';
+
+async function resolvePublishRootEntities(
+  agent: DKGAgent,
+  contextGraphId: string,
+  selection: SharedMemoryPublishSelection,
+  subGraphName?: string,
+): Promise<string[]> {
+  const swmGraph = contextGraphSharedMemoryUri(contextGraphId, subGraphName);
+
+  if (selection !== "all") {
+    const requestedRoots = [...new Set(
+      selection.rootEntities
+        .map((root) => String(root).trim())
+        .filter((root) => isSafeIri(root)),
+    )];
+    if (requestedRoots.length === 0) return [];
+
+    const values = requestedRoots.map((root) => sparqlIri(root)).join(" ");
+    const result = await agent.store.query(
+      `CONSTRUCT { ?s ?p ?o } WHERE {
+        GRAPH <${swmGraph}> {
+          VALUES ?s { ${values} }
+          ?s ?p ?o .
+          FILTER(?p != <${WORKSPACE_OWNER_PREDICATE}>)
+        }
+      }`,
+    );
+    const quads: Quad[] = result.type === "quads"
+      ? result.quads.filter((quad) => quad.predicate !== WORKSPACE_OWNER_PREDICATE)
+      : [];
+    const availableRoots = new Set(autoPartition(quads).keys());
+    return requestedRoots.filter((root) => availableRoots.has(root));
+  }
+
+  const result = await agent.store.query(
+    `CONSTRUCT { ?s ?p ?o } WHERE {
+      GRAPH <${swmGraph}> {
+        ?s ?p ?o .
+        FILTER(?p != <${WORKSPACE_OWNER_PREDICATE}>)
+      }
+    }`,
+  );
+  const quads: Quad[] = result.type === "quads"
+    ? result.quads.filter((quad) => quad.predicate !== WORKSPACE_OWNER_PREDICATE)
+    : [];
+  return [...autoPartition(quads).keys()];
+}
+
+function publishResponsePayload(
+  result: PublishResult,
+  resolvedPublishContextGraphId: string | null,
+): Record<string, unknown> {
+  const chain = result.onChainResult;
+  return {
+    kaId: String(result.kaId),
+    status: result.status,
+    kas: result.kaManifest.map((ka: any) => ({
+      tokenId: String(ka.tokenId),
+      rootEntity: ka.rootEntity,
+    })),
+    ...(chain && { txHash: chain.txHash, blockNumber: chain.blockNumber }),
+    ...(resolvedPublishContextGraphId != null
+      ? { publishContextGraphId: String(resolvedPublishContextGraphId) }
+      : {}),
+    ...(result.contextGraphError
+      ? { contextGraphError: result.contextGraphError }
+      : {}),
+  };
+}
+
 export function validatePreSignedAuthorAttestation(
   raw: unknown,
   res: ServerResponse,
@@ -426,7 +496,15 @@ export async function handleMemoryRoutes(ctx: RequestContext): Promise<void> {
     requestToken,
     requestAgentAddress,
     emitMemoryGraphChanged,
+    emitNotification,
   } = ctx;
+  const writePreflightCallerAgentAddress = requestToken
+    ? agent.resolveAgentByToken(requestToken)
+    : undefined;
+  const writePreflightContextGraphOpts = {
+    callerAgentAddress: writePreflightCallerAgentAddress,
+    allowLocalExactFallback: !writePreflightCallerAgentAddress,
+  };
 
 
   // POST /api/profile/query-catalog/write
@@ -441,7 +519,13 @@ export async function handleMemoryRoutes(ctx: RequestContext): Promise<void> {
     if (!parsed) return;
 
     const contextGraphId = parsed.contextGraphId;
-    if (!validateRequiredContextGraphId(contextGraphId, res)) return;
+    const resolvedContextGraphId = await resolveRequiredWriteContextGraphId(
+      agent,
+      contextGraphId,
+      res,
+      writePreflightContextGraphOpts,
+    );
+    if (!resolvedContextGraphId) return;
 
     const { quads } = parsed;
     if (!Array.isArray(quads) || quads.length === 0) {
@@ -450,7 +534,7 @@ export async function handleMemoryRoutes(ctx: RequestContext): Promise<void> {
       });
     }
 
-    const graph = `did:dkg:context-graph:${contextGraphId}/meta/query-catalog`;
+    const graph = `did:dkg:context-graph:${resolvedContextGraphId}/meta/query-catalog`;
     try {
       assertSafeIri(graph);
       const normalized = quads.map((quad: unknown, index: number) => {
@@ -487,7 +571,7 @@ export async function handleMemoryRoutes(ctx: RequestContext): Promise<void> {
       await agent.store.insert(normalized);
       return jsonResponse(res, 200, {
         ok: true,
-        contextGraphId,
+        contextGraphId: resolvedContextGraphId,
         graph,
         triplesWritten: normalized.length,
       });
@@ -1085,7 +1169,13 @@ WHERE {
     const parsed = safeParseJson(body, res);
     if (!parsed) return;
     const contextGraphId = parsed.contextGraphId;
-    if (!validateRequiredContextGraphId(contextGraphId, res)) return;
+    const resolvedContextGraphId = await resolveRequiredWriteContextGraphId(
+      agent,
+      contextGraphId,
+      res,
+      writePreflightContextGraphOpts,
+    );
+    if (!resolvedContextGraphId) return;
     const verifyResult = parsed.verifyResult;
     if (!verifyResult || verifyResult.ok !== false) {
       return jsonResponse(res, 400, {
@@ -1109,7 +1199,7 @@ WHERE {
     let record;
     try {
       record = buildBatchRejectionRecord({
-        contextGraphId,
+        contextGraphId: resolvedContextGraphId,
         batchId: parsed.batchId,
         verifyResult,
         rejectedBy,
@@ -1149,7 +1239,7 @@ WHERE {
     ];
 
     try {
-      await agent.share(contextGraphId, quads, {
+      await agent.share(resolvedContextGraphId, quads, {
         operationCtx: createOperationContext('share'),
         callerAgentAddress: requestAgentAddress,
       });
@@ -1198,7 +1288,7 @@ WHERE {
     }
 
     const chain: any = (agent as any).chain ?? (agent as any).chainAdapter;
-    const kavAddress = chain?.contracts?.knowledgeAssetsV10?.target?.toString()
+    const kavAddress = chain?.contracts?.knowledgeAssetsLifecycle?.target?.toString()
       ?? chain?.kavAddress
       ?? parsed.kavAddress;
     const chainId = chain?.chainId ?? parsed.chainId ?? '31337';
@@ -1219,7 +1309,7 @@ WHERE {
     // wrong-domain, with no diagnostic linking back to the actual CG.
     // Three resolution layers, all fail-closed:
     //   1. Caller-supplied `onChainContextGraphId` (explicit override).
-    //   2. Chain-truth via `chain.getKCContextGraphId(batchId)` —
+    //   2. Chain-truth via `chain.getKAContextGraphId(batchId)` —
     //      authoritative because the KC ↔ CG binding is on-chain.
     //   3. Local CG listing (last-resort, may be stale post-event-replay).
     // If none resolve, reject with 400 — minting against id=0 is never
@@ -1229,8 +1319,8 @@ WHERE {
       onChainCgId = parsed.onChainContextGraphId;
     } else {
       try {
-        if (typeof chain?.getKCContextGraphId === 'function' && /^\d+$/.test(String(batchId))) {
-          const chainCgId = await chain.getKCContextGraphId(BigInt(batchId)).catch(() => null);
+        if (typeof chain?.getKAContextGraphId === 'function' && /^\d+$/.test(String(batchId))) {
+          const chainCgId = await chain.getKAContextGraphId(BigInt(batchId)).catch(() => null);
           if (chainCgId != null && chainCgId !== 0n) {
             onChainCgId = chainCgId.toString();
           }
@@ -1374,11 +1464,17 @@ WHERE {
     const contextGraphId = parsed.contextGraphId;
     if (!quads?.length)
       return jsonResponse(res, 400, { error: 'Missing "quads"' });
-    if (!validateRequiredContextGraphId(contextGraphId, res)) return;
+    const resolvedContextGraphId = await resolveRequiredWriteContextGraphId(
+      agent,
+      contextGraphId,
+      res,
+      writePreflightContextGraphOpts,
+    );
+    if (!resolvedContextGraphId) return;
     if (!validateOptionalSubGraphName(subGraphName, res)) return;
     const ctx = createOperationContext("share");
     tracker.start(ctx, {
-      contextGraphId: contextGraphId,
+      contextGraphId: resolvedContextGraphId,
       details: { tripleCount: quads.length, source: "api", subGraphName },
     });
     try {
@@ -1386,7 +1482,7 @@ WHERE {
         // validation happens inside share
       });
       const result = await tracker.trackPhase(ctx, "store", () =>
-        agent.share(contextGraphId, quads, {
+        agent.share(resolvedContextGraphId, quads, {
           subGraphName,
           localOnly,
           operationCtx: ctx,
@@ -1395,7 +1491,7 @@ WHERE {
       );
       tracker.complete(ctx, { tripleCount: quads.length });
       emitMemoryGraphChanged?.({
-        contextGraphId,
+        contextGraphId: resolvedContextGraphId,
         layers: ["swm"],
         subGraphName,
         operation: "shared_memory_written",
@@ -1404,8 +1500,8 @@ WHERE {
       });
       return jsonResponse(res, 200, {
         shareOperationId: result?.shareOperationId,
-        contextGraphId,
-        graph: contextGraphSharedMemoryUri(contextGraphId, subGraphName),
+        contextGraphId: resolvedContextGraphId,
+        graph: contextGraphSharedMemoryUri(resolvedContextGraphId, subGraphName),
         triplesWritten: quads.length,
       });
     } catch (err: any) {
@@ -1451,10 +1547,13 @@ WHERE {
       assertionName: bodyAssertionName,
     } = parsed;
     const contextGraphId = parsed.contextGraphId;
-    if (!contextGraphId)
-      return jsonResponse(res, 400, {
-        error: 'Missing "contextGraphId"',
-      });
+    const resolvedContextGraphId = await resolveRequiredWriteContextGraphId(
+      agent,
+      contextGraphId,
+      res,
+      writePreflightContextGraphOpts,
+    );
+    if (!resolvedContextGraphId) return;
     if (!validateOptionalSubGraphName(subGraphName, res)) return;
     if (subGraphName && publishContextGraphId) {
       return jsonResponse(res, 400, {
@@ -1562,7 +1661,7 @@ WHERE {
       }
       const ctx2 = createOperationContext('publishFromSWM');
       tracker.start(ctx2, {
-        contextGraphId,
+        contextGraphId: resolvedContextGraphId,
         details: {
           source: 'api',
           assertionName: bodyAssertionName,
@@ -1574,7 +1673,7 @@ WHERE {
           ctx2,
           'read-shared-memory',
           () =>
-            agent.publishFromFinalizedAssertion(contextGraphId, bodyAssertionName, {
+            agent.publishFromFinalizedAssertion(resolvedContextGraphId, bodyAssertionName, {
               ...(subGraphName ? { subGraphName } : {}),
               operationCtx: ctx2,
               ...(resolvedPublisherIdentityOverride !== undefined
@@ -1606,7 +1705,7 @@ WHERE {
         tracker.complete(ctx2, { tripleCount: result.kaManifest?.length ?? 0 });
         const httpStatus = result.contextGraphError ? 207 : 200;
         return jsonResponse(res, httpStatus, {
-          kcId: String(result.kcId),
+          kaId: String(result.kaId),
           status: result.status,
           assertionUri: result.assertionUri,
           authorAddress: result.seal.authorAddress,
@@ -1644,10 +1743,68 @@ WHERE {
 
     const ctx = createOperationContext("publishFromSWM");
     tracker.start(ctx, {
-      contextGraphId: contextGraphId,
+      contextGraphId: resolvedContextGraphId,
       details: { source: "api", publishContextGraphId, subGraphName },
     });
     try {
+      let resolvedPublishContextGraphId: string | null = null;
+      if (publishContextGraphId != null) {
+        const rawPublishContextGraphId = String(publishContextGraphId).trim();
+        if (/^\d+$/.test(rawPublishContextGraphId)) {
+          const numericPublishContextGraphId = BigInt(rawPublishContextGraphId);
+          if (numericPublishContextGraphId <= 0n) {
+            return jsonResponse(res, 400, {
+              error:
+                '"publishContextGraphId" must be a positive integer, canonical context graph id, or full context graph URI',
+            });
+          }
+          resolvedPublishContextGraphId = rawPublishContextGraphId;
+        } else {
+          const resolvedPublishTargetId = await resolveRequiredWriteContextGraphId(
+            agent,
+            rawPublishContextGraphId,
+            res,
+            {
+              ...writePreflightContextGraphOpts,
+              requireLocalWritable: false,
+            },
+          );
+          if (!resolvedPublishTargetId) return;
+          const onChainId = await agent.getContextGraphOnChainId(resolvedPublishTargetId);
+          if (!onChainId || !/^\d+$/.test(String(onChainId)) || BigInt(String(onChainId)) <= 0n) {
+            return jsonResponse(res, 400, {
+              code: "CONTEXT_GRAPH_NOT_REGISTERED",
+              error:
+                `publishContextGraphId "${rawPublishContextGraphId}" resolved to context graph ` +
+                `"${resolvedPublishTargetId}", but that graph has no positive on-chain id. ` +
+                `Pass a positive numeric context graph id or register the target first.`,
+            });
+          }
+          resolvedPublishContextGraphId = String(onChainId);
+        }
+      }
+
+      const sel: "all" | { rootEntities: string[] } = Array.isArray(selection)
+        ? { rootEntities: selection }
+        : selection || "all";
+      const publishRootEntities = await tracker.trackPhase(ctx, "read-shared-memory", () =>
+        resolvePublishRootEntities(agent, resolvedContextGraphId, sel, subGraphName),
+      );
+      if (publishRootEntities.length === 0) {
+        return jsonResponse(res, 400, {
+          error: `No quads in shared memory for context graph ${resolvedContextGraphId} matching selection`,
+        });
+      }
+      if (publishRootEntities.length > 1) {
+        return jsonResponse(res, 409, {
+          code: "MULTI_ROOT_PUBLISH_NOT_ATOMIC",
+          error:
+            `V10 shared-memory publish is single-root only for this synchronous endpoint. ` +
+            `Resolved ${publishRootEntities.length} root entities; select exactly one root or use a durable multi-publish flow.`,
+          rootEntities: publishRootEntities,
+        });
+      }
+
       // OT-RFC-38 LU-6 — transparent register-then-publish.
       //
       // Project creation is local-only by design (no chain
@@ -1666,7 +1823,7 @@ WHERE {
       // project Settings to upgrade SWM host-mode quotas), this
       // is a cheap no-op probe.
       try {
-        const existingOnChainId = await agent.getContextGraphOnChainId(contextGraphId);
+        const existingOnChainId = await agent.getContextGraphOnChainId(resolvedContextGraphId);
         if (!existingOnChainId) {
           // OT-RFC-38 / LU-6 Phase B (Codex PR #610 round-2 #5):
           // cheap preflight BEFORE spending gas on registration. If
@@ -1682,12 +1839,12 @@ WHERE {
           ) {
             if (
               publishContextGraphId == null
-              && !agent.hasPendingSharedMemoryWrites(contextGraphId)
+              && !agent.hasPendingSharedMemoryWrites(resolvedContextGraphId)
             ) {
               tracker.fail(ctx, new Error('SWM empty for context graph'));
               return jsonResponse(res, 400, {
                 error:
-                  `Context graph "${contextGraphId}" has no pending shared-memory writes — `
+                  `Context graph "${resolvedContextGraphId}" has no pending shared-memory writes — `
                   + `nothing to publish to Verified Memory. Stage entities into SWM first, then retry publish.`,
               });
             }
@@ -1700,9 +1857,9 @@ WHERE {
           // coerced the policy back to the access-policy default —
           // breaking curated-access + open-contribution and PCA-
           // curated registrations.
-          const storedOpts = await agent.getStoredContextGraphRegistrationOptions(contextGraphId);
+          const storedOpts = await agent.getStoredContextGraphRegistrationOptions(resolvedContextGraphId);
           await tracker.trackPhase(ctx, "register-on-chain", () =>
-            agent.registerContextGraph(contextGraphId, {
+            agent.registerContextGraph(resolvedContextGraphId, {
               ...(resolvedAuthorAgentAddress != null
                 ? { callerAgentAddress: resolvedAuthorAgentAddress }
                 : {}),
@@ -1723,36 +1880,38 @@ WHERE {
         tracker.fail(ctx, regErr);
         return jsonResponse(res, 400, {
           error:
-            `Context graph "${contextGraphId}" could not be auto-registered on-chain before publish: ` +
+            `Context graph "${resolvedContextGraphId}" could not be auto-registered on-chain before publish: ` +
             `${regErr?.message ?? String(regErr)}`,
         });
       }
-      const sel: "all" | { rootEntities: string[] } = Array.isArray(selection)
-        ? { rootEntities: selection }
-        : selection || "all";
-      let resolvedPublishContextGraphId: string | null = null;
-      if (publishContextGraphId != null) {
-        resolvedPublishContextGraphId = String(publishContextGraphId);
-      }
-      const result = await tracker.trackPhase(ctx, "read-shared-memory", () =>
-        agent.publishFromSharedMemory(contextGraphId, sel, {
-          clearSharedMemoryAfter: clearAfter ?? true,
-          operationCtx: ctx,
-          subGraphName,
-          ...(resolvedPublishContextGraphId != null
-            ? { contextGraphId: resolvedPublishContextGraphId }
-            : {}),
-          ...(resolvedPublisherIdentityOverride !== undefined
-            ? { publisherNodeIdentityIdOverride: resolvedPublisherIdentityOverride }
-            : {}),
-          ...(resolvedAuthorAgentAddress != null
-            ? { authorAgentAddress: resolvedAuthorAgentAddress }
-            : {}),
-          ...(resolvedPreSignedAttestation != null
-            ? { preSignedAuthorAttestation: resolvedPreSignedAttestation }
-            : {}),
-        }),
+      const basePublishOptions = {
+        operationCtx: ctx,
+        subGraphName,
+        ...(resolvedPublishContextGraphId != null
+          ? { contextGraphId: resolvedPublishContextGraphId }
+          : {}),
+        ...(resolvedPublisherIdentityOverride !== undefined
+          ? { publisherNodeIdentityIdOverride: resolvedPublisherIdentityOverride }
+          : {}),
+        ...(resolvedAuthorAgentAddress != null
+          ? { authorAgentAddress: resolvedAuthorAgentAddress }
+          : {}),
+        ...(resolvedPreSignedAttestation != null
+          ? { preSignedAuthorAttestation: resolvedPreSignedAttestation }
+          : {}),
+      };
+
+      const result = await tracker.trackPhase(ctx, "publish-root", () =>
+        agent.publishFromSharedMemory(
+          resolvedContextGraphId,
+          { rootEntities: [publishRootEntities[0]] },
+          {
+            ...basePublishOptions,
+            clearSharedMemoryAfter: clearAfter ?? true,
+          },
+        ),
       );
+
       const chain = result.onChainResult;
       if (chain) {
         tracker.setCost(ctx, {
@@ -1768,15 +1927,15 @@ WHERE {
       }
       const publicTripleCount = Array.isArray(result.publicQuads)
         ? result.publicQuads.length
-        : undefined;
+        : 0;
       const rootCount = Array.isArray(result.kaManifest)
         ? result.kaManifest.length
-        : undefined;
-      tracker.complete(ctx, { tripleCount: publicTripleCount ?? rootCount ?? 0 });
+        : 0;
+      tracker.complete(ctx, { tripleCount: publicTripleCount || rootCount });
       const clearSharedMemoryAfter = clearAfter ?? true;
       const publishedSwmCleaned = result.status === "confirmed";
       emitMemoryGraphChanged?.({
-        contextGraphId,
+        contextGraphId: resolvedContextGraphId,
         layers: publishedSwmCleaned ? ["swm", "vm"] : ["vm"],
         subGraphName,
         operation: "shared_memory_published",
@@ -1788,19 +1947,25 @@ WHERE {
           triples: publicTripleCount,
         },
       });
+      // ADR-002 (CR-1): scoped `published` activity row (SWM→VM). This is the
+      // ONLY local-publish site with the author + dashDb in scope — the
+      // assertion routes have no VM-publish transition, so `published` is
+      // emitted here, not there. Cross-node publishes are handled
+      // (remote-only, membership-gated) by the KC_PUBLISHED handler in
+      // lifecycle.ts so a local publish is never double-counted.
+      try {
+        recordAssertionActivity(dashDb, {
+          contextGraphId: resolvedContextGraphId,
+          kind: "published",
+          actorAgentAddress: resolvedAuthorAgentAddress ?? requestAgentAddress,
+          subGraphName,
+          entityCount: rootCount,
+          tripleCount: publicTripleCount,
+        });
+        emitNotification?.({ contextGraphId: resolvedContextGraphId, type: "assertion_activity" });
+      } catch { /* never break the publish path */ }
       const httpStatus = result.contextGraphError ? 207 : 200;
-      return jsonResponse(res, httpStatus, {
-        kcId: String(result.kcId),
-        status: result.status,
-        kas: result.kaManifest.map((ka: any) => ({ tokenId: String(ka.tokenId), rootEntity: ka.rootEntity })),
-        ...(chain && { txHash: chain.txHash, blockNumber: chain.blockNumber }),
-        ...(resolvedPublishContextGraphId != null
-          ? { publishContextGraphId: String(resolvedPublishContextGraphId) }
-          : {}),
-        ...(result.contextGraphError
-          ? { contextGraphError: result.contextGraphError }
-          : {}),
-      });
+      return jsonResponse(res, httpStatus, publishResponsePayload(result, resolvedPublishContextGraphId));
     } catch (err) {
       tracker.fail(ctx, err);
       throw err;
@@ -1819,24 +1984,30 @@ WHERE {
     const contextGraphId = parsed.contextGraphId;
     if (!quads?.length)
       return jsonResponse(res, 400, { error: 'Missing "quads"' });
-    if (!validateRequiredContextGraphId(contextGraphId, res)) return;
+    const resolvedContextGraphId = await resolveRequiredWriteContextGraphId(
+      agent,
+      contextGraphId,
+      res,
+      writePreflightContextGraphOpts,
+    );
+    if (!resolvedContextGraphId) return;
     if (!validateConditions(conditions, res)) return;
     if (!validateOptionalSubGraphName(subGraphName, res)) return;
     const ctx = createOperationContext("share");
     tracker.start(ctx, {
-      contextGraphId: contextGraphId,
+      contextGraphId: resolvedContextGraphId,
       details: { tripleCount: quads.length, source: "api-cas", subGraphName },
     });
     try {
       const result = await agent.conditionalShare(
-        contextGraphId,
+        resolvedContextGraphId,
         quads,
         conditions,
         { subGraphName, operationCtx: ctx, callerAgentAddress: requestAgentAddress },
       );
       tracker.complete(ctx, { tripleCount: quads.length });
       emitMemoryGraphChanged?.({
-        contextGraphId,
+        contextGraphId: resolvedContextGraphId,
         layers: ["swm"],
         subGraphName,
         operation: "shared_memory_conditional_written",
@@ -1876,7 +2047,13 @@ WHERE {
     if (!markdown || typeof markdown !== 'string') {
       return jsonResponse(res, 400, { error: 'Missing or invalid "markdown" field (string)' });
     }
-    if (!validateRequiredContextGraphId(contextGraphId, res)) return;
+    const resolvedContextGraphId = await resolveRequiredWriteContextGraphId(
+      agent,
+      contextGraphId,
+      res,
+      writePreflightContextGraphOpts,
+    );
+    if (!resolvedContextGraphId) return;
     if (!validateOptionalSubGraphName(subGraphName, res)) return;
     if (sessionUri !== undefined) {
       if (typeof sessionUri !== 'string' || !isSafeIri(sessionUri)) {
@@ -1899,7 +2076,7 @@ WHERE {
     const fileUri = `urn:dkg:file:${fileEntry.keccak256}`;
 
     // Derive turn URI from agent address + timestamp for collision avoidance
-    const turnUri = `did:dkg:context-graph:${contextGraphId}/turn/${agent.peerId}-${now}`;
+    const turnUri = `did:dkg:context-graph:${resolvedContextGraphId}/turn/${agent.peerId}-${now}`;
 
     // 2. Run structural extraction
     let extractResult;
@@ -1930,8 +2107,8 @@ WHERE {
 
     // 4. Build quads for the target graph
     const targetGraph = targetLayer === 'swm'
-      ? contextGraphSharedMemoryUri(contextGraphId, subGraphName)
-      : contextGraphAssertionUri(contextGraphId, requestAgentAddress, `turn-${now}`, subGraphName);
+      ? contextGraphSharedMemoryUri(resolvedContextGraphId, subGraphName)
+      : contextGraphAssertionUri(resolvedContextGraphId, requestAgentAddress, `turn-${now}`, subGraphName);
 
     const quads: Array<{ subject: string; predicate: string; object: string; graph: string }> = [];
 
@@ -2008,10 +2185,10 @@ WHERE {
         // agent.share sets the graph field itself — pass quads with empty graph
         const shareQuads = quads.map(({ subject, predicate, object }) => ({ subject, predicate, object, graph: '' }));
         const ctx = createOperationContext('share');
-        tracker.start(ctx, { contextGraphId, details: { tripleCount: shareQuads.length, source: 'memory-turn', subGraphName } });
+        tracker.start(ctx, { contextGraphId: resolvedContextGraphId, details: { tripleCount: shareQuads.length, source: 'memory-turn', subGraphName } });
         try {
           await tracker.trackPhase(ctx, 'store', () =>
-            agent.share(contextGraphId, shareQuads, {
+            agent.share(resolvedContextGraphId, shareQuads, {
               subGraphName,
               localOnly: false,
               operationCtx: ctx,
@@ -2030,7 +2207,7 @@ WHERE {
       return jsonResponse(res, 500, { error: `Failed to write turn to ${targetLayer}: ${err.message}` });
     }
     emitMemoryGraphChanged?.({
-      contextGraphId,
+      contextGraphId: resolvedContextGraphId,
       layers: [targetLayer],
       subGraphName,
       operation: "memory_turn_written",
@@ -2048,7 +2225,7 @@ WHERE {
           embedding,
           sourceUri: fileUri,
           entityUri: turnUri,
-          contextGraphId,
+          contextGraphId: resolvedContextGraphId,
           memoryLayer: targetLayer,
           model: embeddingProvider.model,
           snippet,
@@ -2131,8 +2308,11 @@ WHERE {
       }
     }
 
-    // Fan-out 2: SPARQL text search (scoped to the requested CG + layers)
-    const escapedQuery = query.replace(/"/g, '\\"').toLowerCase();
+    // Fan-out 2: SPARQL text search (scoped to the requested CG + layers).
+    // escapeSparqlLiteral escapes backslashes, quotes, and CR/LF/TAB per the
+    // SPARQL STRING_LITERAL2 grammar — a simple `replace(/"/g, '\\"')` would
+    // still allow `\` to escape the closing quote and break out of the literal.
+    const escapedQuery = escapeSparqlLiteral(query.toLowerCase());
     const cgUri = `did:dkg:context-graph:${contextGraphId}`;
     const graphFilters = memoryLayers.map((l: string) => {
       if (l === 'swm') return `STRSTARTS(STR(?g), "${cgUri}/_shared_memory")`;

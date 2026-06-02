@@ -14,22 +14,42 @@ import {
   computeFlatKCRootV10 as computeFlatKCRoot, autoPartition,
   generateConfirmedFullMetadata, getTentativeStatusQuad,
   generateSubGraphRegistration,
+  shouldApplyMaterialization, writeMaterializedVersion, withMaterializationLock,
+  type MaterializedVersion,
   type KCMetadata, type KAMetadata, type OnChainProvenance,
 } from '@origintrail-official/dkg-publisher';
 const DKG_NS = 'http://dkg.io/ontology/';
 import { ethers } from 'ethers';
 
+/**
+ * Resolves a local context-graph id (the topic/CG name used in gossip) to
+ * its on-chain numeric id. Returns `null`/`undefined` for CGs that aren't
+ * registered on-chain. Used as a fallback when a peer-finalization gossip
+ * envelope omits `targetContextGraphId` (e.g. a pre-cd68fa689 publisher
+ * still in the mesh).
+ */
+export type ResolveContextGraphOnChainId = (
+  contextGraphId: string,
+) => Promise<string | null | undefined>;
+
 export class FinalizationHandler {
   private readonly store: TripleStore;
   private readonly chain: ChainAdapter | undefined;
   private readonly eventBus: EventBus | undefined;
+  private readonly resolveContextGraphOnChainId: ResolveContextGraphOnChainId | undefined;
   private readonly log = new Logger('FinalizationHandler');
   private readonly processedUals = new Set<string>();
 
-  constructor(store: TripleStore, chain: ChainAdapter | undefined, eventBus?: EventBus) {
+  constructor(
+    store: TripleStore,
+    chain: ChainAdapter | undefined,
+    eventBus?: EventBus,
+    resolveContextGraphOnChainId?: ResolveContextGraphOnChainId,
+  ) {
     this.store = store;
     this.chain = chain;
     this.eventBus = eventBus;
+    this.resolveContextGraphOnChainId = resolveContextGraphOnChainId;
   }
 
   async handleFinalizationMessage(data: Uint8Array, contextGraphId: string): Promise<void> {
@@ -61,7 +81,29 @@ export class FinalizationHandler {
       const startKAId = protoToBigInt(msg.startKAId);
       const endKAId = protoToBigInt(msg.endKAId);
 
-      const ctxGraphId = msg.targetContextGraphId || undefined;
+      // The publisher's `cd68fa689` fix threads the resolved on-chain CG id
+      // into `targetContextGraphId` so receivers route SWM promotion into
+      // the per-cgId `<cgName>/context/<cgId>/_meta` graph that the RS
+      // prover reads from. Pre-fix publishers (or any publisher whose
+      // `getContextGraphOnChainId` lookup returns null at gossip time) emit
+      // `targetContextGraphId: undefined`, which used to silently downgrade
+      // the receiver to legacy `<cgName>/_meta` promotion — leaving the
+      // prover stuck on `kc-not-synced` until every publisher in the mesh
+      // ships the fix. As a belt-and-braces for rolling upgrades we resolve
+      // the id locally when the wire is empty; resolver failures or
+      // not-on-chain CGs fall back to legacy behavior unchanged.
+      let ctxGraphId = msg.targetContextGraphId || undefined;
+      if (!ctxGraphId && this.resolveContextGraphOnChainId) {
+        try {
+          const resolved = await this.resolveContextGraphOnChainId(contextGraphId);
+          if (resolved !== null && resolved !== undefined && String(resolved).length > 0) {
+            ctxGraphId = String(resolved);
+            this.log.info(ctx, `Finalization: gossip omitted targetContextGraphId; resolved locally to ${ctxGraphId} (defensive lookup)`);
+          }
+        } catch (err) {
+          this.log.warn(ctx, `Finalization: defensive on-chain CG id lookup failed for ${contextGraphId}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
 
       // Validate sub-graph name from gossip — reject invalid names entirely
       let subGraphName: string | undefined;
@@ -94,18 +136,116 @@ export class FinalizationHandler {
 
         if (merkleMatch) {
           const batchId = protoToBigInt(msg.batchId);
-          const { verified, authorAddress } = await this.verifyOnChain(
+          // PR #845 review #9: derive `txIndex` from the verified receipt
+          // (via `verifyOnChain`), NOT from gossip-supplied `msg.txIndex`.
+          // The latter is trust-based; a peer can forge an inflated index
+          // for a real publish `txHash` and lock out a legitimate
+          // same-block update on the receiver. The verified value comes
+          // from the on-chain log we matched (`log.transactionIndex`).
+          const { verified, authorAddress, txIndex: verifiedTxIndex } = await this.verifyOnChain(
             msg.txHash, blockNumber, msg.kcMerkleRoot,
             msg.publisherAddress, startKAId, endKAId, ctx, ctxGraphId, batchId,
           );
 
           if (verified) {
-            await this.promoteSharedMemoryToCanonical(
-              contextGraphId, sharedMemoryQuads, msg.ual, msg.rootEntities,
-              msg.publisherAddress, msg.txHash, blockNumber, startKAId, endKAId,
-              protoToBigInt(msg.batchId), ctx, ctxGraphId, subGraphName,
-              authorAddress,
-            );
+            // Codex r5b — drop the rolling-upgrade legacy-publisher
+            // fallback. Earlier rounds inferred same-graph intent from
+            // `targetContextGraphId === local-on-chain-id-for(contextGraphId)`,
+            // but Codex r5b correctly observed that signal is ambiguous:
+            // it ALSO matches an explicit-remap-to-self publish (one where
+            // the legacy publisher passed `subContextGraphId === ownCG's
+            // own on-chain id` to deliberately drop the root copy). Both
+            // shapes hit `targetContextGraphId === local id` on the wire,
+            // so the fallback would re-add a root copy that the publisher
+            // had intentionally removed — a data-isolation regression.
+            //
+            // The cure is worse than the disease: trading a hard
+            // data-isolation bug for a soft query-discoverability gap is
+            // unacceptable. Without an unambiguous version/intent signal
+            // on the wire, a legacy publisher's same-graph publish stays
+            // queryable on receivers via per-cgId partitions but not via
+            // the bare `<cg>` label until the publisher upgrades to a
+            // tristate-emitting build and re-emits. New publishers always
+            // set the tristate (encoded with explicit KEEP/DROP) so the
+            // gap is bounded by the upgrade window. PR #779 has not
+            // shipped to any production peer yet, so this is the right
+            // moment to harden the contract.
+            const requestedKeepRootCopyOnLabel: boolean = msg.keepRootCopyOnLabel === true;
+            // PR #845 review #9: tiebreaker comes from chain-truth.
+            // verifyOnChain may not yield a txIndex if the matched event
+            // shape didn't carry it (e.g. mocks). Fall back to 0 in that
+            // case — matches pre-#845 ordering.
+            const finalizationVersion: MaterializedVersion = {
+              blockNumber,
+              txIndex: typeof verifiedTxIndex === 'number' ? verifiedTxIndex : 0,
+            };
+            // PR #845 review #10: when same-graph dual-write is requested,
+            // BOTH the per-cgId target meta and the root label meta
+            // (`<cg>/_meta`) get rewritten. The pre-#845 code only guarded
+            // the per-cgId target, so a stale finalization could pass that
+            // check while an update had already stamped a newer version in
+            // the root label meta — the dual-write then re-inserted the
+            // old root-label data + meta on top of the update. Acquire the
+            // label-meta lock too (when dual-writing), and downgrade to
+            // per-cgId-only if the label projection is newer.
+            const isDualWrite = requestedKeepRootCopyOnLabel
+              && !!ctxGraphId
+              && !subGraphName;
+            const defaultMeta = `did:dkg:context-graph:${contextGraphId}/_meta`;
+            // PR #845 review #7: TOCTOU — serialise check + promotion +
+            // version stamp under the per-KA materialization lock so a
+            // concurrent stale writer cannot interleave between our
+            // `shouldApplyMaterialization` and `writeMaterializedVersion`.
+            const promoteUnderLocks = async (): Promise<'promoted' | 'stale-target'> => {
+              if (!(await shouldApplyMaterialization(this.store, targetMetaGraph, msg.ual, finalizationVersion))) {
+                return 'stale-target';
+              }
+              let effectiveKeepRoot = isDualWrite;
+              if (isDualWrite) {
+                if (!(await shouldApplyMaterialization(this.store, defaultMeta, msg.ual, finalizationVersion))) {
+                  // Per-cgId is stale-or-equal but ROOT label has a
+                  // newer projection (an applied update). Skip the
+                  // dual-write portion so we don't clobber it.
+                  effectiveKeepRoot = false;
+                  this.log.info(
+                    ctx,
+                    `Finalization: root-label projection is newer for ${msg.ual}; downgrading to per-cgId-only promotion`,
+                  );
+                }
+              }
+              await this.promoteSharedMemoryToCanonical(
+                contextGraphId, sharedMemoryQuads, msg.ual, msg.rootEntities,
+                msg.publisherAddress, msg.txHash, blockNumber, startKAId, endKAId,
+                protoToBigInt(msg.batchId), ctx, ctxGraphId, subGraphName,
+                authorAddress,
+                effectiveKeepRoot,
+              );
+              await writeMaterializedVersion(this.store, targetMetaGraph, msg.ual, finalizationVersion);
+              if (effectiveKeepRoot) {
+                await writeMaterializedVersion(this.store, defaultMeta, msg.ual, finalizationVersion);
+              }
+              return 'promoted';
+            };
+            // Nested per-graph locks. Acquired in sorted order to prevent
+            // cross-deadlock with any other call site that might one day
+            // also lock multiple metas.
+            const lockOrder = isDualWrite
+              ? [defaultMeta, targetMetaGraph].sort()
+              : [targetMetaGraph];
+            const runUnderLocks = async (): Promise<'promoted' | 'stale-target'> => {
+              if (lockOrder.length === 1) {
+                return withMaterializationLock(lockOrder[0], msg.ual, promoteUnderLocks);
+              }
+              return withMaterializationLock(lockOrder[0], msg.ual, () =>
+                withMaterializationLock(lockOrder[1], msg.ual, promoteUnderLocks),
+              );
+            };
+            const outcome = await runUnderLocks();
+            if (outcome === 'stale-target') {
+              this.markProcessed(dedupeKey);
+              this.log.info(ctx, `Finalization: a newer update is already materialised for ${msg.ual}, skipping stale publish promotion`);
+              return;
+            }
             this.markProcessed(dedupeKey);
             this.log.info(ctx, `Finalization: promoted SWM snapshot to ${ctxGraphId ? `context graph ${ctxGraphId}` : 'canonical'} for ${msg.ual} (tx=${msg.txHash.slice(0, 10)}…)`);
             return;
@@ -221,11 +361,24 @@ export class FinalizationHandler {
 
     const values = safeRoots.map(r => `<${r}>`).join(' ');
     const PROV = 'http://www.w3.org/ns/prov#';
+    // GH #748: prefer the dedicated `dkg:publisherPeerId` field (peer-ID
+    // literal); fall back to literal-form `prov:wasAttributedTo` for legacy
+    // un-migrated SWM rows. Skip URI form — that's an agent DID, not a
+    // peer ID, and downstream dials a libp2p peer with this value.
+    //
+    // `FILTER(BOUND(?peerId))` guards the LIMIT 1: without it, an op with
+    // `rootEntity` but neither peer-ID source produces an unbound `?peerId`
+    // that LIMIT could pick. The caller's `wsPeerId || publisherAddress`
+    // fallback would then store an EVM address where a libp2p peer ID is
+    // expected. With BOUND, only ops carrying a real peer-ID match.
     const sparql = `SELECT ?peerId WHERE {
       GRAPH <${wsMetaGraph}> {
         VALUES ?root { ${values} }
         ?op <${DKG_NS}rootEntity> ?root .
-        ?op <${PROV}wasAttributedTo> ?peerId .
+        OPTIONAL { ?op <${DKG_NS}publisherPeerId> ?pidField }
+        OPTIONAL { ?op <${PROV}wasAttributedTo> ?attrField . FILTER(isLiteral(?attrField)) }
+        BIND(COALESCE(?pidField, ?attrField) AS ?peerId)
+        FILTER(BOUND(?peerId))
       }
     } LIMIT 1`;
 
@@ -250,7 +403,7 @@ export class FinalizationHandler {
     ctx: OperationContext,
     ctxGraphId?: string,
     expectedBatchId?: bigint,
-  ): Promise<{ verified: boolean; authorAddress?: string }> {
+  ): Promise<{ verified: boolean; authorAddress?: string; txIndex?: number }> {
     if (!this.chain || this.chain.chainId === 'none') return { verified: false };
     if (blockNumber <= 0) return { verified: false };
 
@@ -269,6 +422,11 @@ export class FinalizationHandler {
       // originator. `address(0)` here is the unattributed-publish sentinel
       // (RFC-001 §3.6) and is correctly preserved.
       let authorAddress: string | undefined;
+      // PR #845 review #9: capture the chain-truth `transactionIndex` from
+      // the matched event so the materialization-version guard does not
+      // have to trust the gossip-supplied `msg.txIndex` (which a peer can
+      // inflate to lock out a legitimate same-block update).
+      let verifiedTxIndex: number | undefined;
       for await (const event of this.chain.listenForEvents(batchFilter)) {
         if (event.blockNumber !== blockNumber) continue;
         if (txHash && (!event.data['txHash'] || (event.data['txHash'] as string).toLowerCase() !== txHash.toLowerCase())) {
@@ -290,6 +448,10 @@ export class FinalizationHandler {
           batchVerified = true;
           const eventAuthor = (event.data['author'] as string) ?? '';
           if (eventAuthor) authorAddress = eventAuthor;
+          const rawTxIdx = event.data['txIndex'];
+          if (typeof rawTxIdx === 'number' && Number.isFinite(rawTxIdx) && rawTxIdx >= 0) {
+            verifiedTxIndex = rawTxIdx;
+          }
           break;
         }
       }
@@ -302,7 +464,7 @@ export class FinalizationHandler {
       // above is sufficient for V10.
       if (ctxGraphId) {
         if (typeof this.chain.isV10Ready === 'function' && this.chain.isV10Ready()) {
-          return { verified: true, authorAddress };
+          return { verified: true, authorAddress, txIndex: verifiedTxIndex };
         }
         try {
           const scanWindow = 256;
@@ -318,16 +480,16 @@ export class FinalizationHandler {
             const eventCGId = String(event.data['contextGraphId'] ?? '');
             const eventBatchId = BigInt(event.data['batchId'] as string ?? '0');
             if (eventCGId === ctxGraphId && (expectedBatchId === undefined || eventBatchId === expectedBatchId)) {
-              return { verified: true, authorAddress };
+              return { verified: true, authorAddress, txIndex: verifiedTxIndex };
             }
           }
           return { verified: false };
         } catch {
-          return { verified: true, authorAddress };
+          return { verified: true, authorAddress, txIndex: verifiedTxIndex };
         }
       }
 
-      return { verified: true, authorAddress };
+      return { verified: true, authorAddress, txIndex: verifiedTxIndex };
     } catch (err) {
       this.log.info(ctx, `Finalization on-chain verification pending (RPC may be lagging): ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -349,7 +511,7 @@ export class FinalizationHandler {
     ctxGraphId?: string,
     subGraphName?: string,
     /**
-     * EIP-712-attested author recovered from `KnowledgeCollectionCreated.author`.
+     * EIP-712-attested author recovered from `KnowledgeAssetCreated.author`.
      * Round 5 review §10 — when set, the replica emits matching
      * `dkg:Publication` / `dkg:authoredBy` triples so agent-provenance via the
      * `_meta` triplestore is consistent across the originator and every replica.
@@ -357,6 +519,16 @@ export class FinalizationHandler {
      * unattributed-publish path's no-author behaviour from RFC-001 §3.6).
      */
     authorAddress?: string,
+    /**
+     * PR #779 same-graph signal: when `true` the publisher kept a root-graph
+     * copy of the canonical quads, so receivers mirror the dual-write so
+     * label-scoped queries resolve. When `false` (or omitted on older
+     * publishers) the publisher used the explicit-`subContextGraphId` /
+     * remap path and deleted its own root copy on purpose — receivers
+     * MUST NOT dual-write or they re-expose the KC under the source CG
+     * label and double-count it in unscoped queries.
+     */
+    keepRootCopyOnLabel?: boolean,
   ): Promise<void> {
     const graphManager = new GraphManager(this.store);
     await graphManager.ensureContextGraph(contextGraphId);
@@ -386,6 +558,36 @@ export class FinalizationHandler {
       : ctxGraphId
         ? contextGraphDataUri(contextGraphId, ctxGraphId)
         : graphManager.dataGraphUri(contextGraphId);
+    // Devnet test #774-followup (v10-rc-validation §5 gossip replication):
+    // when `ctxGraphId` is set on a non-sub-graph publish, the canonical
+    // data lands in the per-on-chain-id partition
+    // `<cg>/context/<ctxGraphId>` only. The publisher path
+    // (`dkg-publisher.ts` ~line 1382) intentionally ALSO writes the same
+    // quads to the root `<cg>` graph "so `agent.query(label)` (which
+    // resolves to `did:dkg:context-graph:<label>` without a
+    // `/context/<id>` suffix) still finds the just-published triples"
+    // (commit c2abbc9a). Replicas were never updated to mirror that
+    // dual-write — so a CG-scoped query against a label on a recipient
+    // node finds 0 bindings even though the data is local in
+    // `<cg>/context/<ctxGraphId>`. The query engine cannot widen its
+    // allow set to `<cg>/context/<num>` without a CG-registry lookup
+    // (id-prefix collisions, see PR #776 r6 in dkg-query-engine.ts).
+    // Mirroring the publisher's same-graph dual-write fixes the
+    // visibility asymmetry without re-introducing that ambiguity.
+    //
+    // Critical scoping (Codex review on PR #779): the recipient dual-write
+    // MUST only fire for same-graph publishes (the publisher kept the
+    // root copy too). Explicit-`subContextGraphId` / remap publishes
+    // delete the root copy on purpose (`dkg-publisher.ts` ~line 1393),
+    // and a recipient that re-adds it would re-expose the KC under the
+    // source CG's label on every replica — leaking remap intent and
+    // double-counting the same triples in unscoped queries. The
+    // publisher signals same-graph vs remap on the wire via
+    // `keepRootCopyOnLabel`; missing/false (older publishers, or any
+    // remap publish) → no dual-write.
+    const rootDataGraphForLabel = (!subGraphName && ctxGraphId && keepRootCopyOnLabel === true)
+      ? graphManager.dataGraphUri(contextGraphId)
+      : null;
 
     // Compute canonical quads now, but defer the `store.insert` until AFTER
     // the confirmed-meta write and SWM cleanup (see bottom of this method).
@@ -499,23 +701,76 @@ export class FinalizationHandler {
       chainId: this.chain?.chainId ?? 'unknown',
     };
 
-    // Remove any existing tentative status for this UAL before inserting confirmed metadata.
-    // For context-graph KCs, tentative status lives in the context-graph meta graph.
-    const tentativeQuad = getTentativeStatusQuad(ual, contextGraphId);
+    // Remove any existing tentative status for this UAL before inserting
+    // confirmed metadata. Two graph locations can carry it on this replica:
+    //   1. Root `<cg>/_meta` — gossip-publish-handler ALWAYS writes
+    //      `generateTentativeMetadata(...)` here (via `getTentativeStatusQuad`,
+    //      which hardcodes the root `_meta` graph). This applies to every
+    //      gossip-replicated KC regardless of `ctxGraphId` / dual-write mode.
+    //   2. Per-cgId `<cg>/context/<id>/_meta` — older code paths (and any
+    //      future writer that respects the same partition split as canonical
+    //      data) may park a tentative quad here when `ctxGraphId` is set.
+    //
+    // Codex r5 on PR #779: the previous form mutated `tentativeQuad.graph`
+    // to the per-cgId URI when `ctxGraphId` was set and deleted ONLY that
+    // copy. The root tentative survived. With the same-graph dual-write
+    // path (`keepRootCopyOnLabel === true`) we then re-inserted confirmed
+    // `_meta` into root `<cg>/_meta`, leaving `tentative` AND `confirmed`
+    // status quads coexisting on the same UAL in the root meta graph —
+    // label-scoped status reads were non-deterministic. Even on the
+    // `keepRootCopyOnLabel === false` path the leftover root tentative was
+    // wrong (the publisher had moved/dropped its root copy on remap).
+    //
+    // Fix: always queue the root tentative for deletion AND, when ctxGraphId
+    // is set, also queue the per-cgId variant. Single `store.delete` call so
+    // all stale tentative copies are reaped in one shot — `delete` no-ops on
+    // missing quads, so it's safe to enumerate both regardless of which
+    // writer actually populated them.
+    const rootTentativeQuad = getTentativeStatusQuad(ual, contextGraphId);
+    const tentativesToDelete = [rootTentativeQuad];
     if (ctxGraphId) {
-      tentativeQuad.graph = contextGraphMetaUri(contextGraphId, ctxGraphId);
+      tentativesToDelete.push({
+        ...rootTentativeQuad,
+        graph: contextGraphMetaUri(contextGraphId, ctxGraphId),
+      });
     }
     try {
-      await this.store.delete([tentativeQuad]);
+      await this.store.delete(tentativesToDelete);
     } catch { /* tentative status may not exist */ }
 
     let metaQuads = generateConfirmedFullMetadata(kcMeta, kaMetadata, provenance);
     if (ctxGraphId) {
       const defaultMeta = `did:dkg:context-graph:${contextGraphId}/_meta`;
       const targetMeta = contextGraphMetaUri(contextGraphId, ctxGraphId);
-      metaQuads = metaQuads.map((q) =>
-        q.graph === defaultMeta ? { ...q, graph: targetMeta } : q,
-      );
+      // Codex r3 on PR #779: the publisher's same-graph path keeps the
+      // confirmed `_meta` triples in BOTH the root `<cg>/_meta` and
+      // the per-cgId `<cg>/context/<cgId>/_meta` graphs (see the
+      // matching dual-write in `dkg-publisher.ts` ~line 1419, comment
+      // "on remap publishes the original copy at `<NAME>/_meta` is
+      // also moved; on same-graph publishes we leave the default copy
+      // in place"). Replicas were only writing the per-cgId copy, so
+      // label-only `_meta` reads (status / UAL / authoredBy lookups
+      // that don't know the on-chain id) diverged between publisher
+      // and recipients. Mirror the publisher's same-graph dual-write
+      // here too — gated on the same `keepRootCopyOnLabel` signal as
+      // the data-graph dual-write below, and folded into a single
+      // `store.insert` for the same retry-safety reason (`_meta`
+      // tentative→confirmed flip is supposed to be the durable point
+      // post-this-call; splitting the writes would re-introduce a
+      // partial-state window).
+      if (keepRootCopyOnLabel === true) {
+        const rootCopies = metaQuads
+          .filter((q) => q.graph === defaultMeta)
+          .map((q) => ({ ...q }));
+        const perCgIdCopies = metaQuads.map((q) =>
+          q.graph === defaultMeta ? { ...q, graph: targetMeta } : q,
+        );
+        metaQuads = [...perCgIdCopies, ...rootCopies];
+      } else {
+        metaQuads = metaQuads.map((q) =>
+          q.graph === defaultMeta ? { ...q, graph: targetMeta } : q,
+        );
+      }
     }
     await this.store.insert(metaQuads);
 
@@ -530,6 +785,9 @@ export class FinalizationHandler {
       await this.store.deleteByPattern({ graph: sharedMemoryGraph, subject: rootEntity });
       await this.store.deleteBySubjectPrefix(sharedMemoryGraph, rootEntity + '/.well-known/genid/');
       await this.store.deleteByPattern({
+        graph: sharedMemoryGraph, subject: rootEntity, predicate: 'http://dkg.io/ontology/workspaceOwner',
+      });
+      await this.store.deleteByPattern({
         graph: swmMetaGraph, subject: rootEntity, predicate: 'http://dkg.io/ontology/workspaceOwner',
       });
       await this.deleteMetaForRoot(swmMetaGraph, rootEntity);
@@ -539,7 +797,24 @@ export class FinalizationHandler {
     // By the time any reader observes these quads in the canonical graph,
     // `_meta` already carries `confirmed` status + chain provenance and the
     // matching SWM entries have been drained.
-    await this.store.insert(canonicalQuads);
+    //
+    // Codex r2 on PR #779: when same-graph dual-write is in play, both
+    // copies (per-cgId partition + root label graph) MUST land in a single
+    // `store.insert` so a crash or store-write failure between them
+    // cannot leave the replica with the per-cgId copy but no root copy.
+    // The previous split form would be skipped on retry by
+    // `isAlreadyConfirmed()` (`_meta` already confirmed) and the root
+    // copy would never be back-filled — a permanent label-scoped query
+    // miss on that replica. Folding both into one insert call ties their
+    // durability to the same store-write transaction (Oxigraph's `load`
+    // and SPARQL-backend bulk insert are both atomic at the call level).
+    const allCanonicalQuads = rootDataGraphForLabel
+      ? [
+          ...canonicalQuads,
+          ...canonicalQuads.map(q => ({ ...q, graph: rootDataGraphForLabel })),
+        ]
+      : canonicalQuads;
+    await this.store.insert(allCanonicalQuads);
 
     this.log.info(ctx, `Promoted ${canonicalQuads.length} quads from shared memory to canonical for ${ual}`);
     this.eventBus?.emit(DKGEvent.MEMORY_GRAPH_CHANGED, {

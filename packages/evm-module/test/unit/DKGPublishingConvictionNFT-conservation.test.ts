@@ -21,6 +21,7 @@ import {
   DKGPublishingConvictionNFT,
   EpochStorage,
   Hub,
+  PublishingConviction,
   StakingStorage,
   Token,
 } from '../../typechain';
@@ -29,6 +30,7 @@ type Fixture = {
   accounts: SignerWithAddress[];
   Hub: Hub;
   NFT: DKGPublishingConvictionNFT;
+  Logic: PublishingConviction;
   Token: Token;
   StakingStorage: StakingStorage;
   ConvictionStakingStorage: ConvictionStakingStorage;
@@ -61,12 +63,16 @@ describe('@unit DKGPublishingConvictionNFT — TRAC conservation across full lif
   let accounts: SignerWithAddress[];
   let HubContract: Hub;
   let NFT: DKGPublishingConvictionNFT;
+  let LogicContract: PublishingConviction;
   let TokenContract: Token;
   let CSS: ConvictionStakingStorage;
   let ChronosContract: Chronos;
 
   async function deployFixture(): Promise<Fixture> {
     await hre.deployments.fixture([
+      // V10 split — pull storage + logic + wrapper trio.
+      'PublishingConvictionStorage',
+      'PublishingConviction',
       'DKGPublishingConvictionNFT',
       'Token',
       'StakingStorage',
@@ -76,6 +82,7 @@ describe('@unit DKGPublishingConvictionNFT — TRAC conservation across full lif
     ]);
     const Hub = await hre.ethers.getContract<Hub>('Hub');
     const NFT = await hre.ethers.getContract<DKGPublishingConvictionNFT>('DKGPublishingConvictionNFT');
+    const Logic = await hre.ethers.getContract<PublishingConviction>('PublishingConviction');
     const Token = await hre.ethers.getContract<Token>('Token');
     const SS = await hre.ethers.getContract<StakingStorage>('StakingStorage');
     const CSS = await hre.ethers.getContract<ConvictionStakingStorage>('ConvictionStakingStorage');
@@ -88,6 +95,7 @@ describe('@unit DKGPublishingConvictionNFT — TRAC conservation across full lif
       accounts,
       Hub,
       NFT,
+      Logic,
       Token,
       StakingStorage: SS,
       ConvictionStakingStorage: CSS,
@@ -102,6 +110,7 @@ describe('@unit DKGPublishingConvictionNFT — TRAC conservation across full lif
       accounts,
       Hub: HubContract,
       NFT,
+      Logic: LogicContract,
       Token: TokenContract,
       ConvictionStakingStorage: CSS,
       Chronos: ChronosContract,
@@ -123,15 +132,19 @@ describe('@unit DKGPublishingConvictionNFT — TRAC conservation across full lif
     tx: Awaited<ReturnType<typeof NFT.settle>>,
   ): Promise<Distribution> {
     const receipt = await tx.wait();
-    const nftAddr = (await NFT.getAddress()).toLowerCase();
+    // Post-split: state-change events fire on `PublishingConviction`.
+    const logicAddr = (await LogicContract.getAddress()).toLowerCase();
     let passive = 0n;
     let active = 0n;
     let tail = 0n;
     for (const log of receipt!.logs) {
-      if (log.address.toLowerCase() !== nftAddr) continue;
-      let parsed: ReturnType<DKGPublishingConvictionNFT['interface']['parseLog']> = null;
+      if (log.address.toLowerCase() !== logicAddr) continue;
+      let parsed: ReturnType<PublishingConviction['interface']['parseLog']> = null;
       try {
-        parsed = NFT.interface.parseLog({ topics: [...log.topics], data: log.data });
+        parsed = LogicContract.interface.parseLog({
+          topics: [...log.topics],
+          data: log.data,
+        });
       } catch {
         continue;
       }
@@ -151,7 +164,7 @@ describe('@unit DKGPublishingConvictionNFT — TRAC conservation across full lif
     // ---- Setup: impersonate KAV10 and register an agent ----
     const Kav10Signer = accounts[5];
     const agent = accounts[6];
-    await HubContract.setContractAddress('KnowledgeAssetsV10', Kav10Signer.address);
+    await HubContract.setContractAddress('KnowledgeAssetsLifecycle', Kav10Signer.address);
 
     // Use committedTRAC NOT divisible by 12 to exercise the dust path.
     const committed = hre.ethers.parseEther('120000') + 7n; // 30% tier, ~10K per window
@@ -283,5 +296,76 @@ describe('@unit DKGPublishingConvictionNFT — TRAC conservation across full lif
     const txNoop = await NFT.settle(1);
     const noop = await tally(txNoop);
     expect(noop.active + noop.passive + noop.tail).to.equal(0n);
+  });
+
+  it('protocol treasury fee: skims the configured bps from passive sweeps and pays the treasury (settle() stays reentrancy-safe)', async () => {
+    const treasury = accounts[7];
+    const ParametersStorageContract =
+      await hre.ethers.getContract('ParametersStorage');
+    await HubContract.forwardCall(
+      await ParametersStorageContract.getAddress(),
+      ParametersStorageContract.interface.encodeFunctionData(
+        'setProtocolTreasury',
+        [treasury.address],
+      ),
+    );
+    expect(await ParametersStorageContract.protocolTreasuryFee()).to.equal(300n);
+
+    // committed divisible by 12 → base allowance B = 10_000 ether, dust = 0.
+    // With NO active publishes every window sweeps the full B, so the fee
+    // is B * 300 / 10_000 = 300 ether per window (exact, no rounding).
+    const committed = hre.ethers.parseEther('120000');
+    const B = committed / 12n;
+    const perWindowFee = (B * 300n) / BPS; // 300 ether
+    const expectedTotalFee = perWindowFee * 12n; // 3600 ether
+
+    await TokenContract.approve(await NFT.getAddress(), committed);
+    await NFT.createAccount(committed);
+
+    const cssAddr = await CSS.getAddress();
+    const cssBefore = await TokenContract.balanceOf(cssAddr);
+    const treasuryBefore = await TokenContract.balanceOf(treasury.address);
+
+    // Advance past expiry and settle: all 12 windows sweep B each, tail = 0.
+    const epochLength = await ChronosContract.epochLength();
+    await time.increase(epochLength * BigInt(LOCK_DURATION + 1));
+    await NFT.settle(1);
+
+    // Treasury physically receives exactly the summed per-window fee.
+    expect(
+      (await TokenContract.balanceOf(treasury.address)) - treasuryBefore,
+    ).to.equal(expectedTotalFee);
+    // Only the fee leaves the CSS vault; the net stays escrowed for stakers.
+    expect(cssBefore - (await TokenContract.balanceOf(cssAddr))).to.equal(
+      expectedTotalFee,
+    );
+
+    const info = await NFT.getAccountInfo(1);
+    expect(info.fullySwept).to.equal(true);
+
+    // Idempotency + settle() reentrancy-safety: a second settle moves no
+    // further TRAC (the cursor / fullySwept are persisted before any pay).
+    const treasuryAfterFirst = await TokenContract.balanceOf(treasury.address);
+    await NFT.settle(1);
+    expect(await TokenContract.balanceOf(treasury.address)).to.equal(
+      treasuryAfterFirst,
+    );
+  });
+
+  it('protocol treasury fee dormant by default: no treasury wired ⇒ full amount swept to the pool', async () => {
+    // No setProtocolTreasury call — default recipient is the zero address.
+    const committed = hre.ethers.parseEther('120000');
+    await TokenContract.approve(await NFT.getAddress(), committed);
+    await NFT.createAccount(committed);
+
+    const cssAddr = await CSS.getAddress();
+    const cssBefore = await TokenContract.balanceOf(cssAddr);
+
+    const epochLength = await ChronosContract.epochLength();
+    await time.increase(epochLength * BigInt(LOCK_DURATION + 1));
+    await NFT.settle(1);
+
+    // No fee leaves the vault — every wei stays escrowed for stakers.
+    expect(await TokenContract.balanceOf(cssAddr)).to.equal(cssBefore);
   });
 });

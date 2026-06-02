@@ -1,6 +1,6 @@
 // Standalone V10 Publishing Conviction NFT lifecycle: create → topUp →
 // registerAgent → deregisterAgent → settle, plus the discounted publish
-// path through a real KnowledgeAssetsV10.publish() and the post-expiry
+// path through a real KnowledgeAssetsLifecycle.publish() and the post-expiry
 // revert. Peer of test/v10-e2e-conviction.test.ts (Flow 3).
 
 import { SignerWithAddress } from '@nomicfoundation/hardhat-ethers/signers';
@@ -18,9 +18,10 @@ import {
   DKGStakingConvictionNFT,
   EpochStorage,
   Hub,
-  KnowledgeAssetsV10,
-  KnowledgeCollectionStorage,
+  KnowledgeAssetsLifecycle,
+  DKGKnowledgeAssets,
   Profile,
+  PublishingConviction,
   StakingV10,
   Token,
 } from '../typechain';
@@ -46,12 +47,13 @@ type Fixture = {
   ConvictionStakingStorage: ConvictionStakingStorage;
   StakingV10: StakingV10;
   StakingNFT: DKGStakingConvictionNFT;
-  KnowledgeAssetsV10: KnowledgeAssetsV10;
-  KnowledgeCollectionStorage: KnowledgeCollectionStorage;
+  KnowledgeAssetsLifecycle: KnowledgeAssetsLifecycle;
+  DKGKnowledgeAssets: DKGKnowledgeAssets;
   EpochStorage: EpochStorage;
   ContextGraphs: ContextGraphs;
   ContextGraphStorage: ContextGraphStorage;
   NFT: DKGPublishingConvictionNFT;
+  PublishingConviction: PublishingConviction;
 };
 
 async function deployFixture(): Promise<Fixture> {
@@ -62,7 +64,7 @@ async function deployFixture(): Promise<Fixture> {
     'Chronos',
     'Profile',
     'Identity',
-    'KnowledgeAssetsV10',
+    'KnowledgeAssetsLifecycle',
     'ContextGraphStorage',
     'ContextGraphs',
     'ContextGraphValueStorage',
@@ -89,12 +91,12 @@ async function deployFixture(): Promise<Fixture> {
     StakingNFT: await hre.ethers.getContract<DKGStakingConvictionNFT>(
       'DKGStakingConvictionNFT',
     ),
-    KnowledgeAssetsV10: await hre.ethers.getContract<KnowledgeAssetsV10>(
-      'KnowledgeAssetsV10',
+    KnowledgeAssetsLifecycle: await hre.ethers.getContract<KnowledgeAssetsLifecycle>(
+      'KnowledgeAssetsLifecycle',
     ),
-    KnowledgeCollectionStorage:
-      await hre.ethers.getContract<KnowledgeCollectionStorage>(
-        'KnowledgeCollectionStorage',
+    DKGKnowledgeAssets:
+      await hre.ethers.getContract<DKGKnowledgeAssets>(
+        'DKGKnowledgeAssets',
       ),
     EpochStorage: await hre.ethers.getContract<EpochStorage>('EpochStorageV8'),
     ContextGraphs: await hre.ethers.getContract<ContextGraphs>('ContextGraphs'),
@@ -103,6 +105,10 @@ async function deployFixture(): Promise<Fixture> {
     NFT: await hre.ethers.getContract<DKGPublishingConvictionNFT>(
       'DKGPublishingConvictionNFT',
     ),
+    PublishingConviction:
+      await hre.ethers.getContract<PublishingConviction>(
+        'PublishingConviction',
+      ),
   };
 }
 
@@ -114,12 +120,13 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
   let ConvictionStakingStorage: ConvictionStakingStorage;
   let StakingV10Contract: StakingV10;
   let StakingNFT: DKGStakingConvictionNFT;
-  let KAV10: KnowledgeAssetsV10;
-  let KnowledgeCollectionStorage: KnowledgeCollectionStorage;
+  let KAV10: KnowledgeAssetsLifecycle;
+  let DKGKnowledgeAssets: DKGKnowledgeAssets;
   let EpochStorageContract: EpochStorage;
   let CGFacade: ContextGraphs;
   let CGS: ContextGraphStorage;
   let NFT: DKGPublishingConvictionNFT;
+  let LogicContract: PublishingConviction;
 
   beforeEach(async () => {
     hre.helpers.resetDeploymentsJson();
@@ -131,12 +138,13 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
       ConvictionStakingStorage,
       StakingV10: StakingV10Contract,
       StakingNFT,
-      KnowledgeAssetsV10: KAV10,
-      KnowledgeCollectionStorage,
+      KnowledgeAssetsLifecycle: KAV10,
+      DKGKnowledgeAssets,
       EpochStorage: EpochStorageContract,
       ContextGraphs: CGFacade,
       ContextGraphStorage: CGS,
       NFT,
+      PublishingConviction: LogicContract,
     } = await loadFixture(deployFixture));
   });
 
@@ -180,7 +188,7 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
     await Token.mint(creator.address, top);
     await Token.connect(creator).approve(await NFT.getAddress(), top);
     await expect(NFT.connect(creator).topUp(accountId, top))
-      .to.emit(NFT, 'ToppedUp')
+      .to.emit(LogicContract, 'ToppedUp')
       .withArgs(accountId, top, top);
     info = await NFT.getAccountInfo(accountId);
     expect(info.topUpBuffer).to.equal(top);
@@ -194,7 +202,7 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
 
     // ---- registerAgent ----
     await expect(NFT.connect(creator).registerAgent(accountId, agent.address))
-      .to.emit(NFT, 'AgentRegistered')
+      .to.emit(LogicContract, 'AgentRegistered')
       .withArgs(accountId, agent.address);
     expect(await NFT.isAgent(accountId, agent.address)).to.equal(true);
     expect(await NFT.agentToAccountId(agent.address)).to.equal(accountId);
@@ -205,7 +213,7 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
 
     // ---- deregisterAgent ----
     await expect(NFT.connect(creator).deregisterAgent(accountId, agent.address))
-      .to.emit(NFT, 'AgentDeregistered')
+      .to.emit(LogicContract, 'AgentDeregistered')
       .withArgs(accountId, agent.address);
     expect(await NFT.isAgent(accountId, agent.address)).to.equal(false);
     expect(await NFT.agentToAccountId(agent.address)).to.equal(0n);
@@ -224,7 +232,7 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
     const lockDurationEpochs = acct[5];
     await time.increase(Number(epochLength) * (Number(lockDurationEpochs) + 1));
     await expect(NFT.connect(stranger).settle(accountId)).to.emit(
-      NFT,
+      LogicContract,
       'AccountFinalSwept',
     );
     expect((await NFT.getAccountInfo(accountId)).fullySwept).to.equal(true);
@@ -303,7 +311,7 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
   };
 
   // --------------------------------------------------------------------------
-  // 2. registered agent publishes via real KnowledgeAssetsV10.publish()
+  // 2. registered agent publishes via real KnowledgeAssetsLifecycle.publish()
   // --------------------------------------------------------------------------
   it('takes the discount branch when epochs == lockDurationEpochs and the discounted cost is asserted on chain', async () => {
     const {
@@ -333,7 +341,7 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
       author: creator,
       contextGraphId: cgId,
       merkleRoot,
-      knowledgeAssetsAmount: 10,
+      knowledgeAssetsAmount: 1,
       byteSize: 1000,
       epochs,
       tokenAmount,
@@ -376,9 +384,9 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
     // KC records the FULL tokenAmount; only the staker-pool distribution is
     // discounted — the on-chain proof the discount branch (not direct
     // spend) executed.
-    const kcId = 1n;
+    const kaId = 1n;
     const meta =
-      await KnowledgeCollectionStorage.getKnowledgeCollectionMetadata(kcId);
+      await DKGKnowledgeAssets.getKnowledgeAssetMetadata(kaId);
     expect(meta[6]).to.equal(tokenAmount);
     expect(activeSinkSum).to.be.lessThan(meta[6]);
   });
@@ -387,7 +395,7 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
   // 3. expired account: real publish() loses the discount and reverts
   // --------------------------------------------------------------------------
   //
-  // On an expired PCA `KnowledgeAssetsV10.publish()` gates the conviction
+  // On an expired PCA `KnowledgeAssetsLifecycle.publish()` gates the conviction
   // discount off (block.timestamp >= expiresAtTimestamp) and falls through
   // to the direct-spend branch — `_addTokens` pulls the FULL cost from the
   // agent. The registered agent here was only ever funded for the up-front
@@ -429,7 +437,7 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
       author: creator,
       contextGraphId: cgId,
       merkleRoot,
-      knowledgeAssetsAmount: 10,
+      knowledgeAssetsAmount: 1,
       byteSize: 1000,
       epochs,
       tokenAmount,
@@ -443,7 +451,7 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
 
     // Atomic rollback: the expired publish minted no knowledge collection.
     expect(
-      await KnowledgeCollectionStorage.getLatestKnowledgeCollectionId(),
+      await DKGKnowledgeAssets.getLatestKnowledgeAssetId(),
     ).to.equal(0n);
   });
 });

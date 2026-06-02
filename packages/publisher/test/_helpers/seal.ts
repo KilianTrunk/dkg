@@ -20,9 +20,11 @@
 import { ethers } from 'ethers';
 import type { Quad } from '@origintrail-official/dkg-storage';
 import type { DKGPublisher } from '../../src/dkg-publisher.js';
+import type { V10ACKProvider } from '../../src/publisher.js';
 import { autoPartition, computeFlatKCRootV10, computePrivateRootV10 } from '../../src/index.js';
 import {
   buildAuthorAttestationTypedData,
+  buildUpdateAuthorAttestationTypedData,
   AUTHOR_SCHEME_VERSION_V1,
 } from '@origintrail-official/dkg-core';
 
@@ -43,6 +45,13 @@ export interface BuildSealParams {
 
 export interface PrecomputedAttestation {
   expectedMerkleRoot: Uint8Array;
+  authorAddress: string;
+  signature: { r: Uint8Array; vs: Uint8Array };
+  schemeVersion: number;
+}
+
+export interface PrecomputedUpdateAttestation {
+  expectedNewMerkleRoot: Uint8Array;
   authorAddress: string;
   signature: { r: Uint8Array; vs: Uint8Array };
   schemeVersion: number;
@@ -136,18 +145,91 @@ export async function withSeal<T extends PublishSealedArgs>(
 }
 
 /**
+ * Build `precomputedUpdateAttestation` for `publisher.update(kaId, ...)`.
+ */
+export async function buildUpdateSeal(params: {
+  kaId: bigint;
+  quads: Quad[];
+  privateQuads?: Quad[];
+  author: ethers.Wallet;
+  ctx: SealCtx;
+}): Promise<PrecomputedUpdateAttestation> {
+  const kaMap = autoPartition(params.quads);
+  const allPublic = [...kaMap.values()].flat();
+  const privateRoots: Uint8Array[] = [];
+  for (const rootEntity of kaMap.keys()) {
+    const entityPrivateQuads = (params.privateQuads ?? []).filter(
+      (q) =>
+        q.subject === rootEntity ||
+        q.subject.startsWith(rootEntity + '/.well-known/genid/'),
+    );
+    if (entityPrivateQuads.length === 0) continue;
+    const root = computePrivateRootV10(entityPrivateQuads);
+    if (root) privateRoots.push(root);
+  }
+  const newMerkleRoot = computeFlatKCRootV10(allPublic, privateRoots);
+  const chainIdNum = await params.ctx.provider.getNetwork().then((n) => n.chainId);
+  const td = buildUpdateAuthorAttestationTypedData({
+    chainId: BigInt(chainIdNum),
+    kav10Address: params.ctx.kav10Address,
+    kaId: params.kaId,
+    newMerkleRoot,
+    authorAddress: params.author.address,
+  });
+  const sigHex = await params.author.signTypedData(td.domain, td.types, td.message);
+  const sig = ethers.Signature.from(sigHex);
+  return {
+    expectedNewMerkleRoot: newMerkleRoot,
+    authorAddress: params.author.address,
+    signature: {
+      r: ethers.getBytes(sig.r),
+      vs: ethers.getBytes(sig.yParityAndS),
+    },
+    schemeVersion: AUTHOR_SCHEME_VERSION_V1,
+  };
+}
+
+export async function withUpdateSeal<T extends PublishSealedArgs>(
+  kaId: bigint,
+  args: T,
+  author: ethers.Wallet,
+  ctx: SealCtx,
+): Promise<T & { precomputedUpdateAttestation: PrecomputedUpdateAttestation }> {
+  const seal = await buildUpdateSeal({
+    kaId,
+    quads: args.quads,
+    privateQuads: args.privateQuads,
+    author,
+    ctx,
+  });
+  return { ...args, precomputedUpdateAttestation: seal };
+}
+
+/**
  * Thin wrapper around `publisher.publish` that mints a CORE_OP-signed
  * seal automatically. Equivalent to `publisher.publish(await withSeal(args, author, ctx))`.
+ *
+ * RC11 / PR1: a `v10ACKProvider` may be threaded through `extras` so
+ * tests that build their publisher directly (no `wrapPublisherForTest`)
+ * still satisfy the V10 ACK quorum. Without it, the publish reaches
+ * the chain-submit branch with zero ACKs and falls back to
+ * `tentative` — fine for tests that assert that, but not for the
+ * majority of Hardhat tests that assert `confirmed`. Pass
+ * `hardhatACKProvider(kav10Address)` from `./acks.ts` for the
+ * common case.
  */
 export async function publishSealed(
   publisher: DKGPublisher,
   args: PublishSealedArgs,
   author: ethers.Wallet,
   ctx: SealCtx,
+  extras: { v10ACKProvider?: V10ACKProvider } = {},
 ) {
-  return publisher.publish(
-    (await withSeal(args, author, ctx)) as unknown as Parameters<DKGPublisher['publish']>[0],
-  );
+  const sealed = await withSeal(args, author, ctx);
+  const merged = extras.v10ACKProvider !== undefined
+    ? { ...sealed, v10ACKProvider: extras.v10ACKProvider }
+    : sealed;
+  return publisher.publish(merged as unknown as Parameters<DKGPublisher['publish']>[0]);
 }
 
 /**
@@ -155,15 +237,17 @@ export async function publishSealed(
  */
 export async function updateSealed(
   publisher: DKGPublisher,
-  kcId: bigint,
+  kaId: bigint,
   args: PublishSealedArgs,
   author: ethers.Wallet,
   ctx: SealCtx,
+  extras: { v10ACKProvider?: V10ACKProvider } = {},
 ) {
-  return publisher.update(
-    kcId,
-    (await withSeal(args, author, ctx)) as unknown as Parameters<DKGPublisher['update']>[1],
-  );
+  const sealed = await withUpdateSeal(kaId, args, author, ctx);
+  const merged = extras.v10ACKProvider !== undefined
+    ? { ...sealed, v10ACKProvider: extras.v10ACKProvider }
+    : sealed;
+  return publisher.update(kaId, merged as unknown as Parameters<DKGPublisher['update']>[1]);
 }
 
 /**
@@ -193,10 +277,25 @@ export async function updateSealed(
  * the test must build the seal over the same selection itself
  * (see `packages/publisher/test/swm-subset-cleanup.test.ts` for
  * the canonical pattern using `sealForRoots`/`sealForAll`).
+ *
+ * RC11 / PR1: also injects a default `v10ACKProvider` when one is
+ * provided via `opts.v10ACKProvider`. The publisher's self-signed
+ * ACK fallback is deleted, so Hardhat tests that go on-chain must
+ * supply real ACKs from real (sharding-table-resident) signer
+ * identities. Wiring it here keeps existing test bodies unchanged.
  */
 export interface WrapPublisherOpts {
   author: ethers.Wallet;
   ctx: SealCtx;
+  /**
+   * Optional default `V10ACKProvider`. When set, any `publish()` /
+   * `update()` call without an explicit `v10ACKProvider` in its
+   * argument bag will receive this one. Pass-through is preserved for
+   * calls that supply their own provider (e.g. tests asserting ACK
+   * collection failure semantics). Build one with
+   * `makeInMemoryV10ACKProvider` from `./acks.ts`.
+   */
+  v10ACKProvider?: V10ACKProvider;
 }
 
 export function wrapPublisherForTest(
@@ -207,11 +306,20 @@ export function wrapPublisherForTest(
     get(target, prop, receiver) {
       const orig = Reflect.get(target, prop, receiver);
       if (typeof orig !== 'function') return orig;
-      if (prop !== 'publish' && prop !== 'update') {
+      if (prop !== 'publish' && prop !== 'update' && prop !== 'publishFromSharedMemory') {
         return orig.bind(target);
       }
       return async (...args: unknown[]) => {
-        const argIdx = prop === 'update' ? 1 : 0;
+        // PR3 helper-correctness fix: `publishFromSharedMemory` takes
+        // `(contextGraphId: string, selection, options)` — the options
+        // bag is at index 2, not 0. The previous code assumed argIdx=0
+        // for all three call shapes and ended up spreading a plain
+        // string into `args[0]` (`{"0": "5"}`) when the wrapper tried
+        // to inject `v10ACKProvider`, which then surfaced inside the
+        // publisher as `did:dkg:context-graph:[object Object]/...`
+        // and a SPARQL parse failure on the next store.query.
+        const argIdx = prop === 'update' ? 1 : prop === 'publishFromSharedMemory' ? 2 : 0;
+        const kaIdForUpdate = prop === 'update' ? (args[0] as bigint) : undefined;
         const argBag = args[argIdx] as Record<string, unknown> | undefined;
         // Bind the seal to the on-chain CG id the publisher will sign
         // against (`publishContextGraphId` for remap publishes;
@@ -223,26 +331,68 @@ export function wrapPublisherForTest(
         const sealCgId =
           (argBag?.['publishContextGraphId'] as string | bigint | undefined) ??
           (argBag?.['contextGraphId'] as string | bigint | undefined);
+        // Only auto-seal for publish/update — publishFromSharedMemory
+        // selects its quads inside the publisher and the caller's args
+        // bag has none.
         if (
+          prop !== 'publishFromSharedMemory' &&
           argBag &&
-          !argBag['precomputedAttestation'] &&
           Array.isArray(argBag['quads']) &&
-          (argBag['quads'] as Quad[]).length > 0 &&
-          typeof sealCgId !== 'undefined'
+          (argBag['quads'] as Quad[]).length > 0
         ) {
           try {
-            const seal = await buildSeal({
-              quads: argBag['quads'] as Quad[],
-              privateQuads: argBag['privateQuads'] as Quad[] | undefined,
-              author: opts.author,
-              contextGraphId: sealCgId,
-              ctx: opts.ctx,
-            });
-            args[argIdx] = { ...argBag, precomputedAttestation: seal };
+            if (prop === 'update' && kaIdForUpdate !== undefined && !argBag['precomputedUpdateAttestation']) {
+              const updateSeal = await buildUpdateSeal({
+                kaId: kaIdForUpdate,
+                quads: argBag['quads'] as Quad[],
+                privateQuads: argBag['privateQuads'] as Quad[] | undefined,
+                author: opts.author,
+                ctx: opts.ctx,
+              });
+              args[argIdx] = { ...argBag, precomputedUpdateAttestation: updateSeal };
+            } else if (
+              prop !== 'update' &&
+              !argBag['precomputedAttestation'] &&
+              typeof sealCgId !== 'undefined'
+            ) {
+              const seal = await buildSeal({
+                quads: argBag['quads'] as Quad[],
+                privateQuads: argBag['privateQuads'] as Quad[] | undefined,
+                author: opts.author,
+                contextGraphId: sealCgId,
+                ctx: opts.ctx,
+              });
+              args[argIdx] = { ...argBag, precomputedAttestation: seal };
+            }
           } catch {
             // No chain configured (mock/none) — leave args unchanged
             // and let the publisher's own no-chain path handle it
             // (these tests assert tentative status anyway).
+          }
+        }
+        // RC11 / PR3: inject `v10ACKProvider` into the options bag.
+        // For `publishFromSharedMemory(contextGraphId, selection, options?)`
+        // the options bag at index 2 is OPTIONAL — many existing tests
+        // call it as `publishFromSharedMemory(cgId, selection)`. Promote
+        // an absent bag to `{}` here so the injection still lands;
+        // otherwise the wrapped publisher never sees the ACK provider
+        // and the on-chain submit fires the loud "V10 ACKs required"
+        // guard. Skip the promotion for `publish` / `update` where
+        // index 0/1 is the (required) primary argument bag — an
+        // undefined value there is a real test-author bug we want
+        // surfaced rather than silently masked.
+        if (opts.v10ACKProvider) {
+          // Spread the CURRENT args[argIdx] (which may already include
+          // the precomputedAttestation from the seal-injection block
+          // above) rather than the original `argBag` snapshot —
+          // otherwise the ACK injection wipes the seal.
+          const currentBag = args[argIdx] as Record<string, unknown> | undefined;
+          if (currentBag) {
+            if (!currentBag['v10ACKProvider']) {
+              args[argIdx] = { ...currentBag, v10ACKProvider: opts.v10ACKProvider };
+            }
+          } else if (prop === 'publishFromSharedMemory') {
+            args[argIdx] = { v10ACKProvider: opts.v10ACKProvider };
           }
         }
         return (orig as (...a: unknown[]) => unknown).apply(target, args);
@@ -262,18 +412,28 @@ export function wrapPublisherForTest(
  * Re-uses the chain's provider so tests don't have to spin up their
  * own (avoids extra RPC sockets for hardhat tests that already have
  * chains available).
+ *
+ * RC11 / PR1: an optional `v10ACKProvider` is forwarded into
+ * `wrapPublisherForTest`. Tests that want their wrapped publisher to
+ * collect real 3-of-N ACKs from in-memory core signers should build
+ * one with `makeInMemoryV10ACKProvider` from `./acks.ts` and pass it
+ * here. Tests that go off-chain (mock adapter, no chain) leave it
+ * undefined — the publisher's no-chain branch skips ACK collection
+ * entirely.
  */
 export async function wrapPublisherWithChain(
   publisher: DKGPublisher,
-  chain: { getProvider: () => ethers.JsonRpcProvider; getKnowledgeAssetsV10Address: () => Promise<string> },
+  chain: { getProvider: () => ethers.JsonRpcProvider; getKnowledgeAssetsLifecycleAddress: () => Promise<string> },
   authorKey: string,
+  options?: { v10ACKProvider?: V10ACKProvider },
 ): Promise<DKGPublisher> {
   return wrapPublisherForTest(publisher, {
     author: new ethers.Wallet(authorKey),
     ctx: {
       provider: chain.getProvider(),
-      kav10Address: await chain.getKnowledgeAssetsV10Address(),
+      kav10Address: await chain.getKnowledgeAssetsLifecycleAddress(),
     },
+    v10ACKProvider: options?.v10ACKProvider,
   });
 }
 
@@ -291,7 +451,7 @@ export function mockSealCtx(opts: {
   kav10Address?: string;
 } = {}): SealCtx {
   const chainId = opts.chainId ?? 31337n;
-  // Must match `MockChainAdapter.getKnowledgeAssetsV10Address()` exactly,
+  // Must match `MockChainAdapter.getKnowledgeAssetsLifecycleAddress()` exactly,
   // otherwise the publisher's `recoverAddress` step in the seal-integrity
   // preflight rebuilds typed data with the chain's address (not ours)
   // and the recovered signer no longer equals the recorded

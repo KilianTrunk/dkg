@@ -3,6 +3,17 @@ import { ethers, Wallet, Contract } from 'ethers';
 import { DKGAgent } from '../src/index.js';
 import { EVMChainAdapter } from '@origintrail-official/dkg-chain';
 import {
+  buildUpdateAuthorAttestationTypedData,
+  AUTHOR_SCHEME_VERSION_V1,
+  type PrecomputedUpdateAttestation,
+} from '@origintrail-official/dkg-core';
+import {
+  autoPartition,
+  computeFlatKCRootV10,
+  computePrivateRootV10,
+} from '../../publisher/src/index.js';
+import type { Quad } from '@origintrail-official/dkg-storage';
+import {
   spawnHardhatEnv,
   killHardhat,
   mintTokens,
@@ -12,6 +23,58 @@ import {
   HARDHAT_KEYS,
   type HardhatContext,
 } from '../../chain/test/hardhat-harness.js';
+
+/**
+ * V10 greenfield updates require a `precomputedUpdateAttestation` signed by
+ * the KA author (the wallet whose ACK quorum produced the original publish).
+ * The agent's `update()` does not auto-mint one — the publisher's
+ * `publish()` does have an inline mint helper, but the update path was
+ * deliberately left as caller-supplied (RFC 38 / LU-9). This local helper
+ * mirrors `buildUpdateSeal` from `packages/publisher/test/_helpers/seal.ts`,
+ * inlined here to avoid leaking publisher test helpers into agent tests.
+ */
+async function buildUpdateSeal(opts: {
+  kaId: bigint;
+  quads: Quad[];
+  privateQuads?: Quad[];
+  author: Wallet;
+  provider: ethers.JsonRpcProvider;
+  kav10Address: string;
+}): Promise<PrecomputedUpdateAttestation> {
+  const kaMap = autoPartition(opts.quads);
+  const allPublic = [...kaMap.values()].flat();
+  const privateRoots: Uint8Array[] = [];
+  for (const rootEntity of kaMap.keys()) {
+    const entityPrivateQuads = (opts.privateQuads ?? []).filter(
+      (q) =>
+        q.subject === rootEntity ||
+        q.subject.startsWith(rootEntity + '/.well-known/genid/'),
+    );
+    if (entityPrivateQuads.length === 0) continue;
+    const root = computePrivateRootV10(entityPrivateQuads);
+    if (root) privateRoots.push(root);
+  }
+  const newMerkleRoot = computeFlatKCRootV10(allPublic, privateRoots);
+  const chainId = await opts.provider.getNetwork().then((n) => n.chainId);
+  const td = buildUpdateAuthorAttestationTypedData({
+    chainId: BigInt(chainId),
+    kav10Address: opts.kav10Address,
+    kaId: opts.kaId,
+    newMerkleRoot,
+    authorAddress: opts.author.address,
+  });
+  const sigHex = await opts.author.signTypedData(td.domain, td.types, td.message);
+  const sig = ethers.Signature.from(sigHex);
+  return {
+    expectedNewMerkleRoot: newMerkleRoot,
+    authorAddress: opts.author.address,
+    signature: {
+      r: ethers.getBytes(sig.r),
+      vs: ethers.getBytes(sig.yParityAndS),
+    },
+    schemeVersion: AUTHOR_SCHEME_VERSION_V1,
+  };
+}
 
 let ctx: HardhatContext;
 const agents: DKGAgent[] = [];
@@ -65,6 +128,7 @@ describe('E2E: DKGAgent with real blockchain', () => {
   it('creates agents with real EVMChainAdapter (no mocks)', async () => {
     const agentA = await DKGAgent.create({
       name: 'ChainNodeA',
+      nodeRole: 'core',
       listenPort: 0,
       skills: [],
       chainConfig: makeChainConfig(HARDHAT_KEYS.EXTRA1, HARDHAT_KEYS.EXTRA3),
@@ -73,6 +137,7 @@ describe('E2E: DKGAgent with real blockchain', () => {
 
     const agentB = await DKGAgent.create({
       name: 'ChainNodeB',
+      nodeRole: 'core',
       listenPort: 0,
       skills: [],
       chainConfig: makeChainConfig(HARDHAT_KEYS.EXTRA2, HARDHAT_KEYS.PUBLISHER2),
@@ -188,7 +253,7 @@ describe('E2E: DKGAgent with real blockchain', () => {
 
   it('updates published knowledge on-chain and verifies new data', async () => {
 
-    const kcId = firstPublishBatchId;
+    const kaId = firstPublishBatchId;
     const updateQuads = [
       {
         subject: 'did:dkg:test:Alice',
@@ -198,7 +263,28 @@ describe('E2E: DKGAgent with real blockchain', () => {
       },
     ];
 
-    const updateResult = await agents[0].update(kcId, CONTEXT_GRAPH_ID, updateQuads);
+    // V10 greenfield: caller must supply the signed author attestation.
+    // The original publish was authored by EXTRA1 (agentA's operational
+    // key), so the update seal has to be produced by that same wallet.
+    const chainAdapter = new EVMChainAdapter(
+      makeAdapterConfig(ctx.rpcUrl, ctx.hubAddress, HARDHAT_KEYS.EXTRA1),
+    );
+    const author = new Wallet(HARDHAT_KEYS.EXTRA1, ctx.provider);
+    const precomputedUpdateAttestation = await buildUpdateSeal({
+      kaId,
+      quads: updateQuads,
+      author,
+      provider: ctx.provider,
+      kav10Address: await chainAdapter.getKnowledgeAssetsLifecycleAddress(),
+    });
+
+    const updateResult = await agents[0].update(
+      kaId,
+      CONTEXT_GRAPH_ID,
+      updateQuads,
+      undefined,
+      { precomputedUpdateAttestation },
+    );
     expect(updateResult).toBeDefined();
     expect(updateResult.merkleRoot).toHaveLength(32);
     expect(updateResult.status).toBe('confirmed');
@@ -274,11 +360,15 @@ describe('E2E: DKGAgent with real blockchain', () => {
   }, 60_000);
 
   // -------------------------------------------------------------------------
-  // Multi-entity publish
+  // Multi-entity publish — V10 greenfield rejects multi-root payloads.
+  // The legacy "publishes multiple entities and queries them individually"
+  // case is gone: V10 enforces 1 KA per tx (the publisher manifest guard at
+  // dkg-publisher.ts:`requires exactly one Knowledge Asset per transaction`).
+  // This regression test pins the guard so a regression that quietly
+  // re-enables multi-root publishes cannot slip through.
   // -------------------------------------------------------------------------
 
-  it('publishes multiple entities and queries them individually', async () => {
-
+  it('rejects multi-root publish through agent.publish (V10 1-KA-per-tx guard)', async () => {
     const entities = ['urn:agent-e2e:entity-A', 'urn:agent-e2e:entity-B', 'urn:agent-e2e:entity-C'];
     const quads = entities.flatMap((e) => [
       {
@@ -295,22 +385,10 @@ describe('E2E: DKGAgent with real blockchain', () => {
       },
     ]);
 
-    const result = await agents[0].publish(CONTEXT_GRAPH_ID, quads);
-    expect(result).toBeDefined();
-    expect(result.kaManifest.length).toBe(3);
-    expect(result.status).toBe('confirmed');
-    expect(result.onChainResult).toBeDefined();
-
-    for (const entity of entities) {
-      const queryResult = await agents[0].query(
-        `SELECT ?name WHERE { <${entity}> <http://schema.org/name> ?name }`,
-        { contextGraphId: CONTEXT_GRAPH_ID },
-      );
-      expect(queryResult).toBeDefined();
-      expect(queryResult.bindings).toBeDefined();
-      expect(queryResult.bindings.length).toBeGreaterThanOrEqual(1);
-    }
-  }, 60_000);
+    await expect(agents[0].publish(CONTEXT_GRAPH_ID, quads)).rejects.toThrow(
+      /exactly one Knowledge Asset per transaction \(got 3\)/,
+    );
+  }, 30_000);
 
   // -------------------------------------------------------------------------
   // Multi-node gossip verification

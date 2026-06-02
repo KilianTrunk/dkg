@@ -96,30 +96,33 @@ describe('buildEpcisQuery', () => {
     expect(sparql).toContain('epcis:outputEPCList "urn:epc:id:sgtin:4012345.099999.9001"');
   });
 
-  it('epc filter UNIONs epcList + childEPCs per EPCIS 2.0 Section 8.2.7.1', () => {
+  it('epc filter matches epcList + childEPCs via VALUES per EPCIS 2.0 Section 8.2.7.1', () => {
     const sparql = buildEpcisQuery({ epc: 'urn:epc:id:sgtin:4012345.011111.1001' }, CONTEXT_GRAPH_ID);
 
-    expect(sparql).toContain('UNION');
-    expect(sparql).toContain('epcis:epcList "urn:epc:id:sgtin:4012345.011111.1001"');
-    expect(sparql).toContain('epcis:childEPCs "urn:epc:id:sgtin:4012345.011111.1001"');
-    // Should NOT include other EPC fields — that's anyEPC
-    expect(sparql).not.toMatch(/epcis:inputEPCList "urn:epc:id:sgtin:4012345.011111.1001"/);
-    expect(sparql).not.toMatch(/epcis:outputEPCList "urn:epc:id:sgtin:4012345.011111.1001"/);
-    expect(sparql).not.toMatch(/epcis:parentID "urn:epc:id:sgtin:4012345.011111.1001"/);
+    // Blazegraph-compat rewrite (#789): the epc filter now uses a
+    // VALUES-bound predicate variable instead of an inner UNION so it
+    // can safely nest inside the public/private GRAPH union without
+    // tripping Blazegraph's nested-UnionNode crash.
+    expect(sparql).toContain('VALUES ?_epcPred { epcis:epcList epcis:childEPCs }');
+    expect(sparql).toContain('?event ?_epcPred "urn:epc:id:sgtin:4012345.011111.1001"');
+    // The epc filter must NOT widen to the anyEPC predicate set.
+    expect(sparql).not.toContain('epcis:inputEPCList epcis:outputEPCList');
+    expect(sparql).not.toMatch(/epcis:parentID epcis:inputEPCList/);
   });
 
-  it('anyEPC generates 5-way UNION across all EPC fields', () => {
+  it('anyEPC matches all 5 EPC fields via a single VALUES block', () => {
     const sparql = buildEpcisQuery({ anyEPC: 'urn:epc:id:sgtin:4012345.011111.1001' }, CONTEXT_GRAPH_ID);
 
-    expect(sparql).toContain('epcis:epcList "urn:epc:id:sgtin:4012345.011111.1001"');
-    expect(sparql).toContain('epcis:childEPCs "urn:epc:id:sgtin:4012345.011111.1001"');
-    expect(sparql).toContain('epcis:parentID "urn:epc:id:sgtin:4012345.011111.1001"');
-    expect(sparql).toContain('epcis:inputEPCList "urn:epc:id:sgtin:4012345.011111.1001"');
-    expect(sparql).toContain('epcis:outputEPCList "urn:epc:id:sgtin:4012345.011111.1001"');
-    // Count UNION keywords — 5 anyEPC branches = 4 UNIONs, repeated once
-    // per public/private payload branch.
-    const unions = sparql.match(/UNION/g);
-    expect(unions).toHaveLength(8);
+    // All five EPC predicates appear in one VALUES set (own variable
+    // name so it can't collide with the epc filter's predicate var).
+    expect(sparql).toContain(
+      'VALUES ?_anyEpcPred { epcis:epcList epcis:childEPCs epcis:parentID epcis:inputEPCList epcis:outputEPCList }',
+    );
+    expect(sparql).toContain('?event ?_anyEpcPred "urn:epc:id:sgtin:4012345.011111.1001"');
+    // The EPC predicate fan-out no longer emits any inner UNION
+    // keyword; only the outer public/private merge remains (lowercase
+    // `union`), so there must be zero uppercase UNION branches.
+    expect(sparql.match(/\bUNION\b/g)).toBeNull();
   });
 
   it('combines multiple filters', () => {
@@ -128,10 +131,9 @@ describe('buildEpcisQuery', () => {
       CONTEXT_GRAPH_ID,
     );
 
-    // epc now UNIONs epcList + childEPCs
-    expect(sparql).toContain('epcis:epcList "urn:test"');
-    expect(sparql).toContain('epcis:childEPCs "urn:test"');
-    expect(sparql).toContain('UNION');
+    // epc now matches epcList + childEPCs via VALUES (no inner UNION).
+    expect(sparql).toContain('VALUES ?_epcPred { epcis:epcList epcis:childEPCs }');
+    expect(sparql).toContain('?event ?_epcPred "urn:test"');
     expect(sparql).toContain('BizStep-receiving');
     expect(sparql).toContain('epcis:bizLocation <urn:loc:1>');
   });
@@ -142,14 +144,23 @@ describe('buildEpcisQuery', () => {
       CONTEXT_GRAPH_ID,
     );
 
-    expect(sparql).toContain('SELECT ?event ?eventType ?eventTime ?bizStep ?bizLocation ?disposition ?readPoint ?action ?parentID ?configurationId ?shipmentId ?ual');
+    expect(sparql).toContain('SELECT ?event ?eventType ?eventTime ?eventTimeZoneOffset ?bizStep ?bizLocation ?disposition ?readPoint ?action ?parentID ?configurationId ?shipmentId ?ual');
     expect(sparql).toContain('?event ?configurationIdPredicate ?configurationId .');
     expect(sparql).toContain('FILTER(REPLACE(STR(?configurationIdPredicate), "^.*[/#]", "") = "configurationId")');
     expect(sparql).toContain('FILTER(STR(?configurationId) = "CFG-001")');
     expect(sparql).toContain('?event ?shipmentIdPredicate ?shipmentId .');
     expect(sparql).toContain('FILTER(REPLACE(STR(?shipmentIdPredicate), "^.*[/#]", "") = "shipmentId")');
     expect(sparql).toContain('FILTER(STR(?shipmentId) = "SHIP-001")');
-    expect(sparql).toContain('GROUP BY ?event ?eventType ?eventTime ?bizStep ?bizLocation ?disposition ?readPoint ?action ?parentID ?configurationId ?shipmentId ?ual');
+    expect(sparql).toContain('GROUP BY ?event ?eventType ?eventTime ?eventTimeZoneOffset ?bizStep ?bizLocation ?disposition ?readPoint ?action ?parentID ?configurationId ?shipmentId ?ual');
+  });
+
+  it('projects optional eventTimeZoneOffset without changing eventTime ordering', () => {
+    const sparql = buildEpcisQuery({ epc: 'urn:test' }, CONTEXT_GRAPH_ID);
+
+    expect(sparql).toContain('OPTIONAL { ?event epcis:eventTimeZoneOffset ?eventTimeZoneOffset . }');
+    expect(sparql).toContain('SELECT ?event ?eventType ?eventTime ?eventTimeZoneOffset ?bizStep');
+    expect(sparql).toContain('GROUP BY ?event ?eventType ?eventTime ?eventTimeZoneOffset ?bizStep');
+    expect(sparql).toContain('ORDER BY DESC(?eventTime) ?event');
   });
 
   it('uses default pagination (limit 100, offset 0)', () => {
@@ -309,8 +320,9 @@ describe('buildEpcisQuery', () => {
 
     expect(sparql).toContain(`GRAPH <${SHARED_MEMORY_GRAPH}>`);
     expect(sparql).toContain(`GRAPH <${PRIVATE_GRAPH}>`);
-    expect(sparql).toContain('epcis:epcList "urn:epc:id:sgtin:4012345.011111.1001"');
-    expect(sparql).toContain('epcis:childEPCs "urn:epc:id:sgtin:4012345.011111.1001"');
+    // Blazegraph-compat rewrite (#789): epc filter uses VALUES, not UNION.
+    expect(sparql).toContain('VALUES ?_epcPred { epcis:epcList epcis:childEPCs }');
+    expect(sparql).toContain('?event ?_epcPred "urn:epc:id:sgtin:4012345.011111.1001"');
     expect(sparql).toContain('https://ref.gs1.org/cbv/BizStep-shipping');
     expect(sparql).toContain('xsd:dateTime("2024-01-01T00:00:00Z")');
     expect(sparql).toContain('xsd:dateTime("2024-02-01T00:00:00Z")');

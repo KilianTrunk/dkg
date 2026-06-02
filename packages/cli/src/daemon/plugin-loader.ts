@@ -1,10 +1,79 @@
 import { createRequire } from 'node:module';
-import { isAbsolute } from 'node:path';
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { isAbsolute, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { Logger, createOperationContext } from '@origintrail-official/dkg-core';
 import type { RoutePlugin } from './plugin-api.js';
 
+/**
+ * Loader's own `createRequire` anchor. Used as a fallback when no
+ * stable plugin root is supplied (back-compat for callers that
+ * predate Bundle B1e — e.g. unit tests).
+ */
 const require_ = createRequire(import.meta.url);
+
+/**
+ * Ensure `<dkgHome>/plugins/package.json` exists so the stable
+ * plugin install root has a valid `createRequire` anchor. Per
+ * OT-RFC-41 §4.6.1 / Bundle B1e this is the long-term resolution
+ * root for bare-name `routePlugins`; it survives Core slot swaps
+ * AND Edge npm reinstalls.
+ *
+ * Idempotent. Failures are non-fatal — the loader falls back to
+ * the daemon-local `import.meta.url` anchor below if the stable
+ * root is unavailable for any reason.
+ *
+ * Returns the absolute path to the materialised `package.json`,
+ * or `null` if the write failed.
+ */
+export function ensureStablePluginRoot(dkgHome: string): string | null {
+  try {
+    const pluginsDir = join(dkgHome, 'plugins');
+    if (!existsSync(pluginsDir)) mkdirSync(pluginsDir, { recursive: true });
+    const pkgPath = join(pluginsDir, 'package.json');
+    if (!existsSync(pkgPath)) {
+      writeFileSync(
+        pkgPath,
+        JSON.stringify(
+          {
+            name: 'dkg-plugin-root',
+            private: true,
+            description:
+              'Stable bare-name resolution root for DKG route plugins. ' +
+              "Run `npm install --prefix ~/.dkg/plugins <plugin>` to install. " +
+              'See OT-RFC-41 §4.6.1.',
+          },
+          null,
+          2,
+        ) + '\n',
+      );
+    }
+    return pkgPath;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Build a stable-root require resolver. Per OT-RFC-41 §4.6.1, this
+ * is the PRIMARY anchor for bare-name `routePlugins` so the resolver
+ * stays at a stable filesystem location across Core slot swaps and
+ * Edge npm reinstalls.
+ *
+ * Returns `null` if `~/.dkg/plugins/package.json` is absent and could
+ * not be materialised (extremely rare — typically a read-only home
+ * directory). Callers fall back to the daemon-local anchor in that
+ * case.
+ */
+function buildStableRootRequire(dkgHome: string): NodeJS.Require | null {
+  const pkgPath = ensureStablePluginRoot(dkgHome);
+  if (!pkgPath) return null;
+  try {
+    return createRequire(pathToFileURL(pkgPath).href);
+  } catch {
+    return null;
+  }
+}
 
 // Only retry CJS when ESM failed because no `import` condition matched; everything else (SyntaxError,
 // missing transitive `ERR_MODULE_NOT_FOUND`, ...) bubbles up so authors see the broken build.
@@ -24,7 +93,10 @@ function isResolverFailure(err: unknown): boolean {
   return RESOLVER_FAILURE_MESSAGE_PATTERNS.some((p) => p.test(message));
 }
 
-async function importSpec(spec: string): Promise<unknown> {
+async function importSpec(
+  spec: string,
+  stableRootRequire: NodeJS.Require | null,
+): Promise<unknown> {
   if (isAbsolute(spec)) {
     return import(pathToFileURL(spec).href);
   }
@@ -36,8 +108,33 @@ async function importSpec(spec: string): Promise<unknown> {
       `relative paths are not supported in routePlugins; use an absolute filesystem path or a resolvable package name (got "${spec}")`,
     );
   }
-  // Bare specifier: ESM first (honours `import`/`default` conditions), then CJS resolve only on
-  // resolver failure. Dynamic import of CJS yields { default: module.exports } for pickCandidate.
+  // Bare specifier (OT-RFC-41 §4.6.1 / Bundle B1e):
+  //   1. Resolve from ~/.dkg/plugins (stable root) if available.
+  //      This survives Core slot swaps AND Edge npm reinstalls —
+  //      both of which can change the daemon-local node_modules
+  //      under it.
+  //   2. Fall back to ESM `import(spec)` (daemon-local node_modules,
+  //      then ambient global). Preserves back-compat for plugins
+  //      installed via the legacy `npm install -g` flow.
+  //   3. On ESM resolver-shape failure, retry via the loader-local
+  //      `createRequire` (final fallback for CJS-only packages).
+  if (stableRootRequire) {
+    let resolved: string | undefined;
+    try {
+      resolved = stableRootRequire.resolve(spec);
+    } catch {
+      // Stable root either does not have the plugin installed yet
+      // or hit a resolver-shape edge case. Fall through to ESM
+      // import — the loader-level try/catch surfaces the failure
+      // with a clear spec name if both anchors miss.
+    }
+    if (resolved) {
+      // Once the stable root resolves the plugin, load/evaluation errors
+      // are authoritative and must not fall through to an older daemon-local
+      // or global install of the same package.
+      return await import(pathToFileURL(resolved).href);
+    }
+  }
   try {
     return await import(spec);
   } catch (esmErr) {
@@ -71,10 +168,22 @@ function pickCandidate(mod: unknown): unknown {
   return mod;
 }
 
+export interface LoadRoutePluginsOptions {
+  /**
+   * Path to the DKG state home (typically `~/.dkg`). When provided,
+   * bare-name plugin specs resolve from `<dkgHome>/plugins` first
+   * — the stable resolution root per OT-RFC-41 §4.6.1 / Bundle B1e.
+   * When omitted, bare-name specs resolve from the loader-local
+   * `import.meta.url` (back-compat for pre-Bundle-B callers).
+   */
+  dkgHome?: string;
+}
+
 export async function loadRoutePlugins(
   // `unknown` — caller passes raw JSON; we validate inside, fail-soft to [].
   specs: unknown,
   log: Logger,
+  opts: LoadRoutePluginsOptions = {},
 ): Promise<RoutePlugin[]> {
   const out: RoutePlugin[] = [];
   const ctx = createOperationContext('system');
@@ -88,6 +197,8 @@ export async function loadRoutePlugins(
     return out;
   }
 
+  const stableRootRequire = opts.dkgHome ? buildStableRootRequire(opts.dkgHome) : null;
+
   for (const rawSpec of specs as readonly unknown[]) {
     if (typeof rawSpec !== 'string' || rawSpec.length === 0) {
       log.warn(
@@ -98,7 +209,7 @@ export async function loadRoutePlugins(
     }
     const spec = rawSpec;
     try {
-      const mod = await importSpec(spec);
+      const mod = await importSpec(spec, stableRootRequire);
       const candidate = pickCandidate(mod);
       if (!isRoutePlugin(candidate)) {
         log.warn(ctx, `route-plugin-load-failed: ${spec}: invalid shape`);

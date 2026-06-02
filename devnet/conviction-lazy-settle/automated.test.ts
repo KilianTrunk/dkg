@@ -58,6 +58,15 @@ interface DevnetNode {
 interface Contracts {
   provider: ethers.JsonRpcProvider;
   nft: ethers.Contract;
+  // Stateless logic contract behind the V10 PCA NFT — owns the events
+  // that the lazy-settlement assertions parse out of publish / settle
+  // receipts (`AccountCreated`, `ToppedUp`, `CostCovered`,
+  // `WindowSettled`, `AccountFinalSwept`, `AgentRegistered`,
+  // `AgentDeregistered`). The NFT keeps only the ERC-721 surface and
+  // the `_nextAccountId` counter; all PCA writes flow NFT → Logic →
+  // `PublishingConvictionStorage`. See PR #650.
+  logic: ethers.Contract;
+  logicAddress: string;
   token: ethers.Contract;
   chronos: ethers.Contract;
   eps: ethers.Contract;
@@ -110,6 +119,14 @@ async function loadContracts(): Promise<Contracts> {
   // to avoid 0-block-old readbacks racing the interval miner.
   provider.pollingInterval = 250;
 
+  // ── NFT WRAPPER ──────────────────────────────────────────────────
+  // Post-PR-#650, the NFT wrapper exposes the same public surface
+  // it always did (write entry points + state-mapping forwarders),
+  // but **events were moved to the Logic contract** — see the
+  // `logic` interface below. Filtering NFT-receipt logs by NFT
+  // address would silently drop every PCA event after the split, so
+  // the assertions in steps 3-6 use `logic` for log filtering and
+  // ABI parsing while keeping the wrapper as the call entry point.
   const nft = new ethers.Contract(
     c('DKGPublishingConvictionNFT'),
     [
@@ -124,15 +141,26 @@ async function loadContracts(): Promise<Contracts> {
       'function getWindowChainEpochRange(uint256, uint40) view returns (uint40 startEp, uint40 endEp)',
       'function settle(uint256) external',
       'function topUp(uint256, uint96) external',
+    ],
+    provider,
+  );
+  // ── LOGIC CONTRACT (events live here post-PR-#650) ───────────────
+  // MUST mirror `PublishingConviction.sol`. A drift here silently
+  // turns every `parseLog({ name: 'CostCovered' })` into a parse miss
+  // in the test — the lazy-settle assertions then pass even when the
+  // distribution math is wrong. Keep these signatures in lock-step
+  // with the Logic contract events.
+  const logicAddress = c('PublishingConviction');
+  const logic = new ethers.Contract(
+    logicAddress,
+    [
       'event AccountCreated(uint256 indexed accountId, address indexed owner, uint96 committedTRAC, uint16 discountBps, uint40 createdAtEpoch, uint40 expiresAtEpoch)',
-      // MUST mirror `DKGPublishingConvictionNFT.sol` (line ~135). A drift
-      // here silently turns every `parseLog({ name: 'CostCovered' })` into
-      // a parse miss in the test — the lazy-settle assertions then pass
-      // even when the contract's distribution math is wrong. Keep the
-      // signature literal in lock-step with the contract event.
+      'event ToppedUp(uint256 indexed accountId, uint96 amount, uint96 newBalance)',
       'event CostCovered(uint256 indexed accountId, uint40 indexed epoch, uint96 baseCost, uint96 discountedCost, uint96 drawnFromEpoch, uint96 drawnFromTopUp)',
       'event WindowSettled(uint256 indexed accountId, uint40 indexed billingWindow, uint40 startEp, uint40 endEp, uint96 remainder)',
       'event AccountFinalSwept(uint256 indexed accountId, uint96 leftoverTopUp, uint96 committedDust)',
+      'event AgentRegistered(uint256 indexed accountId, address indexed agent)',
+      'event AgentDeregistered(uint256 indexed accountId, address indexed agent)',
     ],
     provider,
   );
@@ -184,6 +212,8 @@ async function loadContracts(): Promise<Contracts> {
   return {
     provider,
     nft,
+    logic,
+    logicAddress,
     token,
     chronos,
     eps,
@@ -225,7 +255,7 @@ function nquadsFile(name: string): string {
   return p;
 }
 
-async function dkgPublish(node: DevnetNode, file: string): Promise<{ kcId: bigint; txHash: string }> {
+async function dkgPublish(node: DevnetNode, file: string): Promise<{ kaId: bigint; txHash: string }> {
   return new Promise((res, rej) => {
     const child = spawn(
       process.execPath,
@@ -260,7 +290,7 @@ async function dkgPublish(node: DevnetNode, file: string): Promise<{ kcId: bigin
         rej(new Error(`could not parse publish output\n${stdout}`));
         return;
       }
-      res({ kcId: BigInt(kcMatch[1]!), txHash: txMatch[1]! });
+      res({ kaId: BigInt(kcMatch[1]!), txHash: txMatch[1]! });
     });
   });
 }
@@ -314,7 +344,7 @@ describe('V10 PCA lazy settlement — devnet validation', () => {
     state.s = await loadContracts();
     // Use a CORE node (node 2). Edge nodes don't have an on-chain identity
     // by default and `dkg publish` short-circuits to status="tentative" with
-    // kcId=0 — we need an actual on-chain confirmation to assert the active
+    // kaId=0 — we need an actual on-chain confirmation to assert the active
     // sink (the discounted cost lands in EpochStorage via the conviction
     // path). Node 1 is reserved for RS in the v10-end-to-end run; node 2
     // is the next idle core with free op wallets.
@@ -432,7 +462,7 @@ describe('V10 PCA lazy settlement — devnet validation', () => {
     let accountId = 0n;
     for (const log of receipt!.logs) {
       try {
-        const parsed = s.nft.interface.parseLog({
+        const parsed = s.logic.interface.parseLog({
           topics: log.topics as string[],
           data: log.data,
         });
@@ -440,7 +470,7 @@ describe('V10 PCA lazy settlement — devnet validation', () => {
           accountId = parsed.args.accountId as bigint;
           break;
         }
-      } catch { /* not from NFT */ }
+      } catch { /* not a Logic-contract event */ }
     }
     expect(accountId).toBeGreaterThan(0n);
     state.accountId = accountId;
@@ -514,7 +544,7 @@ describe('V10 PCA lazy settlement — devnet validation', () => {
 
     const file = nquadsFile('lazy-settle-publish');
     const result = await dkgPublish(edge, file);
-    expect(result.kcId).toBeGreaterThan(0n);
+    expect(result.kaId).toBeGreaterThan(0n);
 
     // Source of truth for the active-sink amount is the publish tx
     // receipt's `CostCovered` + `TokensAddedToEpochRange` events — not
@@ -529,11 +559,13 @@ describe('V10 PCA lazy settlement — devnet validation', () => {
     let costCoveredDiscounted = 0n;
     let costCoveredFromEpoch = 0n;
     let activeSinkFromEvents = 0n;
+    const logicAddrLc = s.logicAddress.toLowerCase();
     for (const log of receipt!.logs) {
-      // NFT-emitted `CostCovered`: deltaSpent for window 0 = drawnFromEpoch.
-      if (log.address.toLowerCase() === (await s.nft.getAddress()).toLowerCase()) {
+      // Logic-emitted `CostCovered` (post-PR-#650 — see Contracts.logic):
+      // deltaSpent for window 0 == drawnFromEpoch.
+      if (log.address.toLowerCase() === logicAddrLc) {
         try {
-          const parsed = s.nft.interface.parseLog({
+          const parsed = s.logic.interface.parseLog({
             topics: log.topics as string[],
             data: log.data,
           });
@@ -542,7 +574,7 @@ describe('V10 PCA lazy settlement — devnet validation', () => {
             costCoveredDiscounted = BigInt(parsed.args.discountedCost);
             costCoveredFromEpoch = BigInt(parsed.args.drawnFromEpoch);
           }
-        } catch { /* not from NFT */ }
+        } catch { /* not a Logic-contract event */ }
       }
       // EpochStorage-emitted `TokensAddedToEpochRange`: this is the
       // active-sink write. `coverPublishingCost` -> `_distributeProrated`
@@ -583,7 +615,7 @@ describe('V10 PCA lazy settlement — devnet validation', () => {
 
     // eslint-disable-next-line no-console
     console.log(
-      `step 3: published kcId=${result.kcId} → CostCovered.discountedCost=${ethers.formatEther(costCoveredDiscounted)} TRAC, ` +
+      `step 3: published kaId=${result.kaId} → CostCovered.discountedCost=${ethers.formatEther(costCoveredDiscounted)} TRAC, ` +
       `activeSink(from events)=${ethers.formatEther(activeSinkFromEvents)} TRAC, ` +
       `windowSpent[acct][0] += ${ethers.formatEther(spent0After - spent0Before)} TRAC`,
     );
@@ -633,15 +665,17 @@ describe('V10 PCA lazy settlement — devnet validation', () => {
     // `[w0Start..w0End]` between snapshots would fail an exact-equality
     // pool-delta assertion even when `settle()` is correct (Codex
     // round-3 finding on PR #470).
-    const nftAddr = (await s.nft.getAddress()).toLowerCase();
+    // Filter `WindowSettled` events to the Logic contract (PR #650
+    // moved them off the NFT). EPS events stay on EPS as before.
+    const logicAddrLc = s.logicAddress.toLowerCase();
     const epsAddrLc = s.epsAddress.toLowerCase();
     let sweptForWindow0 = 0n;
     let settledWindows = 0;
     let sweepDistributedFromEvents = 0n;
     for (const log of receipt!.logs) {
-      if (log.address.toLowerCase() === nftAddr) {
+      if (log.address.toLowerCase() === logicAddrLc) {
         try {
-          const parsed = s.nft.interface.parseLog({
+          const parsed = s.logic.interface.parseLog({
             topics: log.topics as string[],
             data: log.data,
           });
@@ -651,7 +685,7 @@ describe('V10 PCA lazy settlement — devnet validation', () => {
               sweptForWindow0 = BigInt(parsed.args.remainder);
             }
           }
-        } catch { /* not from NFT */ }
+        } catch { /* not a Logic-contract event */ }
       }
       if (log.address.toLowerCase() === epsAddrLc) {
         try {
@@ -676,16 +710,16 @@ describe('V10 PCA lazy settlement — devnet validation', () => {
     // depending on chain-epoch overlap (see `_sweepWindowProrated`).
     let sweptTotalFromWindows = 0n;
     for (const log of receipt!.logs) {
-      if (log.address.toLowerCase() !== nftAddr) continue;
+      if (log.address.toLowerCase() !== logicAddrLc) continue;
       try {
-        const parsed = s.nft.interface.parseLog({
+        const parsed = s.logic.interface.parseLog({
           topics: log.topics as string[],
           data: log.data,
         });
         if (parsed?.name === 'WindowSettled' && BigInt(parsed.args.accountId) === accountId) {
           sweptTotalFromWindows += BigInt(parsed.args.remainder);
         }
-      } catch { /* not from NFT */ }
+      } catch { /* not a Logic-contract event */ }
     }
     expect(sweepDistributedFromEvents).toBe(sweptTotalFromWindows);
 
@@ -721,14 +755,14 @@ describe('V10 PCA lazy settlement — devnet validation', () => {
     let windowSettledEvents = 0;
     for (const log of receipt!.logs) {
       try {
-        const parsed = s.nft.interface.parseLog({
+        const parsed = s.logic.interface.parseLog({
           topics: log.topics as string[],
           data: log.data,
         });
         if (parsed?.name === 'WindowSettled' && BigInt(parsed.args.accountId) === accountId) {
           windowSettledEvents++;
         }
-      } catch { /* not from NFT */ }
+      } catch { /* not a Logic-contract event */ }
     }
     expect(windowSettledEvents).toBe(0);
 
@@ -766,7 +800,7 @@ describe('V10 PCA lazy settlement — devnet validation', () => {
     let sweptTotal = 0n;
     for (const log of receipt!.logs) {
       try {
-        const parsed = s.nft.interface.parseLog({
+        const parsed = s.logic.interface.parseLog({
           topics: log.topics as string[],
           data: log.data,
         });
@@ -778,7 +812,7 @@ describe('V10 PCA lazy settlement — devnet validation', () => {
           windowsSettled.push(Number(parsed.args.billingWindow));
           sweptTotal += BigInt(parsed.args.remainder);
         }
-      } catch { /* not from NFT */ }
+      } catch { /* not a Logic-contract event */ }
     }
     expect(sawFinalSweep).toBe(true);
 
@@ -860,14 +894,14 @@ describe('V10 PCA lazy settlement — devnet validation', () => {
     let anyEvent = false;
     for (const log of receipt!.logs) {
       try {
-        const parsed = s.nft.interface.parseLog({
+        const parsed = s.logic.interface.parseLog({
           topics: log.topics as string[],
           data: log.data,
         });
         if (parsed && (parsed.name === 'WindowSettled' || parsed.name === 'AccountFinalSwept')) {
           if (BigInt(parsed.args.accountId) === accountId) anyEvent = true;
         }
-      } catch { /* not from NFT */ }
+      } catch { /* not a Logic-contract event */ }
     }
     expect(anyEvent).toBe(false);
   }, 60_000);

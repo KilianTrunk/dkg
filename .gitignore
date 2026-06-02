@@ -7,6 +7,7 @@ dist-ui/
 coverage/
 test-results/
 playwright-report/
+packages/node-ui/results.xml
 bench/results/
 .esbench-tmp/
 .env
@@ -22,6 +23,9 @@ packages/evm-module/typechain/
 # .devnet/ is a runtime workspace (Hardhat data dir, per-node DKG_HOME
 # state, daemon logs). Not checked in.
 .devnet/
+# .dkg-testnet-node/ is a default DKG_HOME a daemon writes into when
+# started without --data-dir against a testnet. Runtime state only.
+.dkg-testnet-node/
 
 # Agent scratch (project memory across orchestrator runs). Local only,
 # except checked-in ADRs that preserve durable engineering decisions.
@@ -43,3 +47,5 @@ packages/evm-module/deployments/hardhat_contracts.json
 packages/evm-module/deployments/localhost_contracts.json
 snapshots/_cache_phase1_neuroweb_epoch16.json
 .claude/
+.orchestrator/
+.worktrees/

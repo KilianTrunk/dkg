@@ -1,4 +1,10 @@
-import { ethers, JsonRpcProvider, Wallet, Contract, Interface } from 'ethers';
+import { ethers, JsonRpcProvider, FallbackProvider, Wallet, Contract, Interface, FetchRequest } from 'ethers';
+import {
+  createFilterErrorSilencer,
+  installFilterNotFoundConsoleSuppressor,
+  formatProviderError,
+  type FilterErrorSilencer,
+} from './filter-error-silencer.js';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
 import { existsSync, readFileSync } from 'node:fs';
@@ -21,24 +27,31 @@ import type {
   VerifyParams,
   PublishToContextGraphParams,
   V10PublishParams,
-  V10UpdateKCParams,
+  V10UpdateKAParams,
   NodeChallenge,
   ProofPeriodStatus,
   CreateChallengeResult,
   OperationalWalletRegistrationResult,
   V10PublishingConvictionAccountInfo,
+  VerifyACKIdentityResult,
+  ApprovalPolicy,
 } from './chain-adapter.js';
 import {
   NoEligibleContextGraphError,
   NoEligibleKnowledgeCollectionError,
   MerkleRootMismatchError,
   ChallengeNoLongerActiveError,
+  DEFAULT_APPROVAL_POLICY,
+  DEFAULT_REPLENISH_TARGET_ALLOWANCE,
+  DEFAULT_REFILL_BELOW_FRACTION,
 } from './chain-adapter.js';
 import { HubResolutionCache } from './hub-resolution-cache.js';
 import { PcaUnavailableError } from './pca-errors.js';
 import {
   buildAuthorAttestationTypedData,
   AUTHOR_SCHEME_VERSION_V1,
+  floorPublishTokenAmount,
+  computeUpdateACKDigest,
 } from '@origintrail-official/dkg-core';
 
 /**
@@ -76,6 +89,57 @@ const DURATION_PROBE_TIMEOUT_MS = 2000;
  * Codex round 8 on PR #369.
  */
 const MAX_PROBE_AGE_MS = 30_000;
+const RPC_READ_STALL_TIMEOUT_MS = 4_000;
+const RPC_TRANSACTION_POPULATION_ATTEMPT_TIMEOUT_MS = 10_000;
+const RPC_BROADCAST_ATTEMPT_TIMEOUT_MS = 10_000;
+const RPC_RECEIPT_ATTEMPT_TIMEOUT_MS = 5_000;
+const RPC_RECEIPT_POLL_INTERVAL_MS = 2_000;
+const RPC_RECEIPT_TIMEOUT_MS = 180_000;
+
+/**
+ * Per-request retry bound for ethers' built-in `FetchRequest`. ethers v6
+ * retries HTTP 429 / 5xx responses with exponential backoff via
+ * `FetchRequest.retryFunc`; the default keeps retrying for far longer than any
+ * caller-side timeout, so a perpetually rate-limited (429) RPC makes a plain
+ * read (e.g. `Hub.getContractAddress` inside `init()`, which sits on the
+ * critical path of `createOnChainContextGraph` / context-graph register) hang
+ * for minutes — register then never returns its `RPC_ENDPOINTS_EXHAUSTED`→503
+ * in bounded time (#894 follow-up: surfaced once the boot timeout stopped the
+ * daemon hanging at startup). Bounding the retry lets a sustained RPC error
+ * surface as a normal (retryable) RPC error, so the adapter's own multi-RPC
+ * failover + `RPC_ENDPOINTS_EXHAUSTED` wrapping kick in within seconds instead
+ * of stalling. A transient single 429 is still retried (resilience preserved);
+ * only a perpetually-failing endpoint gives up fast.
+ *
+ * The bound is the per-request RETRY COUNT (`attempt`), NOT a wall-clock
+ * deadline. ethers resets `attempt` to 0 for every new top-level request and
+ * increments it per retry, so an attempt-count cap is inherently per-request —
+ * unlike a `Date.now()`-based deadline captured at provider construction, which
+ * would (once the node had been up longer than the budget) instantly disable
+ * retries for the rest of the process lifetime (Codex PR #901 round-3 :125).
+ * With the capped backoff below, `RPC_REQUEST_MAX_RETRIES` retries span roughly
+ * `RPC_REQUEST_MAX_RETRIES * backoffCap` ≈ 7.5s of wall time under a fast-
+ * failing endpoint — bounded, and well under the daemon route / test ceilings.
+ */
+const RPC_REQUEST_MAX_RETRIES = 5;
+const RPC_REQUEST_RETRY_BACKOFF_CAP_MS = 1_500;
+
+/**
+ * Build a `FetchRequest` whose retry loop gives up after
+ * `RPC_REQUEST_MAX_RETRIES` retries. A bare string URL would use ethers'
+ * unbounded default; we install a bounded `retryFunc` instead. The bound is
+ * evaluated from `attempt` (per-request), so every request — no matter how
+ * long the node has been running — gets the same fresh retry budget.
+ */
+function boundedRetryFetchRequest(url: string): FetchRequest {
+  const req = new FetchRequest(url);
+  req.retryFunc = async (_req, _response, attempt) => {
+    if (attempt >= RPC_REQUEST_MAX_RETRIES) return false;
+    await sleep(Math.min(500 * (attempt + 1), RPC_REQUEST_RETRY_BACKOFF_CAP_MS));
+    return true;
+  };
+  return req;
+}
 
 /**
  * Substrings we treat as "the Hub no longer recognises this contract
@@ -85,10 +149,290 @@ const MAX_PROBE_AGE_MS = 30_000;
  * `UnauthorizedAccess(Only Contracts in Hub)` so we don't accidentally
  * drop the cache on an unrelated authorization failure.
  */
+/**
+ * Maps a Hub-registered contract name to the function that invalidates
+ * the corresponding boot-bound field on `EVMChainAdapter.contracts`.
+ *
+ * Used by:
+ *   1. `startHubRotationListener` — when a Hub rotation event fires
+ *      for `name`, the listener checks this allowlist, marks the
+ *      adapter uninitialised, and leaves the existing handle intact so
+ *      in-flight calls that already passed `init()` don't observe a
+ *      transient `undefined`.
+ *   2. `invalidateAllBoundContracts` — bulk drop, called by the
+ *      write-side self-heal path (`withHubStaleRetry`) when a stale
+ *      address surfaces `UnauthorizedAccess(Only Contracts in Hub)`.
+ *
+ * `RandomSampling` / `RandomSamplingStorage` are intentionally absent —
+ * they go through `randomSamplingPairCache` + `invalidateRandomSamplingPair()`
+ * which owns side-channel state (in-flight probe, ready flag) that
+ * a simple field reset wouldn't touch.
+ *
+ * Names listed here MUST match what `init()` resolves via
+ * `Hub.getContractAddress(name)` / `Hub.getAssetStorageAddress(name)`
+ * — keep these in sync when adding/removing bindings in `init()`.
+ */
+const BOUND_CONTRACT_INVALIDATORS = new Map<string, (adapter: EVMChainAdapter) => void>([
+  ['Identity',                   (a) => { (a as any).contracts.identity = undefined; }],
+  ['Profile',                    (a) => { (a as any).contracts.profile = undefined; }],
+  ['ProfileStorage',             (a) => { (a as any).contracts.profileStorage = undefined; }],
+  ['ParametersStorage',          (a) => { (a as any).contracts.parametersStorage = undefined; }],
+  ['Staking',                    (a) => { (a as any).contracts.staking = undefined; }],
+  ['Token',                      (a) => { (a as any).contracts.token = undefined; }],
+  ['AskStorage',                 (a) => { (a as any).contracts.askStorage = undefined; }],
+  ['KnowledgeAssets',            (a) => { (a as any).contracts.knowledgeAssets = undefined; }],
+  ['KnowledgeAssetsStorage',     (a) => { (a as any).contracts.knowledgeAssetsStorage = undefined; }],
+  ['KnowledgeAssetsLifecycle',   (a) => { (a as any).contracts.knowledgeAssetsLifecycle = undefined; }],
+  ['DKGKnowledgeAssets',         (a) => { (a as any).contracts.knowledgeAssetStorage = undefined; }],
+  ['ContextGraphNameRegistry',   (a) => { (a as any).contracts.contextGraphNameRegistry = undefined; }],
+  ['ContextGraphs',              (a) => { (a as any).contracts.contextGraphs = undefined; }],
+  ['ContextGraphStorage',        (a) => { (a as any).contracts.contextGraphStorage = undefined; }],
+  ['DKGPublishingConvictionNFT', (a) => { (a as any).contracts.dkgPublishingConvictionNFT = undefined; }],
+  ['Chronos',                    (a) => { (a as any).contracts.chronos = undefined; }],
+]);
+
 const HUB_STALE_ERROR_MARKERS = [
   'Only Contracts in Hub',
   'UnauthorizedAccess(Only Contracts in Hub)',
 ];
+
+export function resolveRpcUrls(rpcUrl: string, rpcUrls?: string[]): string[] {
+  const out: string[] = [];
+  for (const candidate of [rpcUrl, ...(rpcUrls ?? [])]) {
+    const trimmed = typeof candidate === 'string' ? candidate.trim() : '';
+    if (!trimmed || out.includes(trimmed)) continue;
+    out.push(trimmed);
+  }
+  if (out.length === 0) {
+    throw new Error('EVMChainAdapter requires at least one RPC URL');
+  }
+  return out;
+}
+
+/**
+ * On-chain minimum the `KnowledgeAssetsLifecycle.publish` / `update` contract
+ * pulls via `token.transferFrom(msg.sender, CSS, fullCost)` even for
+ * zero-byte / zero-value publishes — the contract rounds `fullCost` up to
+ * `1` wei-TRAC. Empirically reproduced on Base Sepolia, May 2026: a
+ * publish with JS-side `params.tokenAmount === 0n` reverted with
+ * `TooLowAllowance(token, 0, 1)` because the auto-approve path (then
+ * gated on `tokenAmount > 0n` / `currentAllowance < tokenAmount`) skipped
+ * approval entirely.
+ *
+ * On mainnet the same fires whenever the pricing oracle returns `0`
+ * (new / dust-value CGs, certain edge cases in `getRequiredPublishTokenAmount`),
+ * so we floor the approval ceiling at the on-chain minimum.
+ */
+export const V10_PUBLISH_ONCHAIN_MIN_ALLOWANCE: bigint = 1n;
+
+/**
+ * Returns the TRAC allowance ceiling required to cover one V10 publish /
+ * update. Floors at the on-chain minimum so the direct-spend branch
+ * (`token.transferFrom(..., fullCost)`) never reverts with
+ * `TooLowAllowance` when the JS-side `tokenAmount` is `0n`.
+ *
+ * This is the *building block* for the `per-publish` approval policy and
+ * the lower-bound clamp used by every other policy mode in
+ * `computeApprovalAction`. The bounded-per-publish security property of
+ * the legacy code path lives here.
+ */
+export function effectivePublishAllowance(
+  tokenAmount: bigint,
+  onChainMin: bigint = V10_PUBLISH_ONCHAIN_MIN_ALLOWANCE,
+): bigint {
+  return tokenAmount > onChainMin ? tokenAmount : onChainMin;
+}
+
+const MAX_UINT256_ALLOWANCE: bigint = (1n << 256n) - 1n;
+
+function clampApprovalFraction(value: number): number {
+  if (!Number.isFinite(value)) return DEFAULT_REFILL_BELOW_FRACTION;
+  if (value < 0) return 0;
+  if (value > 1) return 1;
+  return value;
+}
+
+/**
+ * Computes the approval action for one V10 publish / update, dispatched
+ * by `ApprovalPolicy.mode`.
+ *
+ * Contract:
+ *   - `needsApprove === true`  → caller MUST submit `approve(KA,
+ *     targetAllowance)` before the publish to satisfy
+ *     `token.transferFrom(..., fullCost)` on-chain.
+ *   - `needsApprove === false` → skip the approve; the existing allowance
+ *     already covers this publish.
+ *
+ * Invariants enforced for every mode:
+ *   - `targetAllowance >= effectivePublishAllowance(tokenAmount)` — even
+ *     a misconfigured `replenishing` target gets raised to the on-chain
+ *     minimum so the immediate publish succeeds.
+ *   - `needsApprove` is monotone in `currentAllowance` — strictly more
+ *     existing allowance never flips a `false` to `true`.
+ *
+ * See {@link ApprovalPolicy} in `chain-adapter.ts` for the mode
+ * semantics; see `evm-adapter.unit.test.ts` for the pinned-down behaviour
+ * under every combination of `(mode, tokenAmount, currentAllowance)`.
+ */
+export function computeApprovalAction(
+  policy: ApprovalPolicy,
+  tokenAmount: bigint,
+  currentAllowance: bigint,
+): { needsApprove: boolean; targetAllowance: bigint } {
+  const publishFloor = effectivePublishAllowance(tokenAmount);
+  switch (policy.mode) {
+    case 'unlimited': {
+      // Approve `MaxUint256` once per wallet. After that, currentAllowance
+      // covers any plausible tokenAmount — re-approve only if some external
+      // actor brought it back under the immediate publish's floor (manual
+      // `approve(KA, 0)`, contract upgrade, etc.).
+      return {
+        needsApprove: currentAllowance < publishFloor,
+        targetAllowance: MAX_UINT256_ALLOWANCE,
+      };
+    }
+    case 'replenishing': {
+      // Approve a configurable ceiling once, then refill when current drops
+      // below `target × fraction`. Raise the target to at least the publish
+      // floor so a misconfigured low `targetAllowance` doesn't brick the
+      // publish — the bigger of (operator's intent, what we need right now).
+      const requestedTarget =
+        policy.targetAllowance ?? DEFAULT_REPLENISH_TARGET_ALLOWANCE;
+      const target = requestedTarget > publishFloor ? requestedTarget : publishFloor;
+      const fraction = clampApprovalFraction(
+        policy.refillBelowFraction ?? DEFAULT_REFILL_BELOW_FRACTION,
+      );
+      // bigint-safe `target * fraction` via basis points so a fractional
+      // refill threshold never drifts on round-trip.
+      const fractionBp = BigInt(Math.round(fraction * 10_000));
+      let threshold = (target * fractionBp) / 10_000n;
+      // The refill threshold must cover the immediate publish's floor too —
+      // refilling below it would just let the next publish revert with
+      // `TooLowAllowance` again.
+      if (threshold < publishFloor) threshold = publishFloor;
+      return { needsApprove: currentAllowance < threshold, targetAllowance: target };
+    }
+    case 'per-publish':
+    default: {
+      // Approve exactly the publish floor. Matches the legacy bounded-
+      // per-publish behaviour (with the 1n on-chain minimum closing the
+      // gap that previously bricked zero-cost publishes).
+      return {
+        needsApprove: currentAllowance < publishFloor,
+        targetAllowance: publishFloor,
+      };
+    }
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      const err = new Error(`${label} timed out after ${ms}ms`);
+      (err as any).code = 'TIMEOUT';
+      reject(err);
+    }, ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  }) as Promise<T>;
+}
+
+function errorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  try { return JSON.stringify(err); } catch { return String(err); }
+}
+
+function errorCode(err: unknown): string {
+  return String((err as any)?.code ?? (err as any)?.error?.code ?? '').toUpperCase();
+}
+
+function errorStatus(err: unknown): number | undefined {
+  const raw =
+    (err as any)?.status ??
+    (err as any)?.statusCode ??
+    (err as any)?.response?.status ??
+    (err as any)?.error?.status ??
+    (err as any)?.error?.statusCode;
+  return typeof raw === 'number' ? raw : undefined;
+}
+
+/**
+ * Is `err` a transient RPC failure worth retrying / failing over (vs a
+ * deterministic chain revert / argument error)? Inspects ethers/fetch error
+ * shapes thoroughly — top-level AND nested `error.code` / `statusCode` /
+ * `response.status` / `error.status` (via `errorCode` / `errorStatus`), plus a
+ * message probe — so a 429/5xx buried in a nested field is still recognised.
+ * Exported so consumers (e.g. the agent's boot-recovery transient gate) reuse
+ * the SAME extraction instead of duplicating a narrower top-level-only subset
+ * (Codex PR #901 round-4 :459).
+ */
+export function isRetryableRpcError(err: unknown): boolean {
+  if (err instanceof Error) enrichEvmError(err);
+  const code = errorCode(err);
+  const status = errorStatus(err);
+  const msg = errorMessage(err).toLowerCase();
+
+  if (code === 'CALL_EXCEPTION' || code === 'INSUFFICIENT_FUNDS' || code === 'NONCE_EXPIRED'
+    || code === 'RPC_RECEIPT_LOOKUP_FAILED'
+    || code === 'REPLACEMENT_UNDERPRICED' || code === 'TRANSACTION_REPLACED'
+    || code === 'ACTION_REJECTED' || code === 'INVALID_ARGUMENT' || code === 'UNPREDICTABLE_GAS_LIMIT') {
+    return false;
+  }
+  if (msg.includes('execution reverted') || msg.includes('call exception')
+    || msg.includes('insufficient funds') || msg.includes('invalid argument')
+    || msg.includes('nonce too low') || msg.includes('replacement transaction underpriced')
+    || msg.includes('intrinsic gas too low') || msg.includes('exceeds block gas limit')) {
+    return false;
+  }
+
+  if (status === 429 || (typeof status === 'number' && status >= 500)) return true;
+  if (code === 'TIMEOUT' || code === 'TIMEOUT_ERROR' || code === 'SERVER_ERROR'
+    || code === 'NETWORK_ERROR' || code === 'ECONNRESET' || code === 'ECONNREFUSED'
+    || code === 'ETIMEDOUT' || code === 'ENOTFOUND' || code === 'EAI_AGAIN'
+    || code === 'UNKNOWN_ERROR' || code === 'BAD_DATA'
+    // Our own synthetic "all configured RPC endpoints exhausted" code — by
+    // definition retryable, regardless of the aggregated message text.
+    || code === 'RPC_ENDPOINTS_EXHAUSTED') {
+    return true;
+  }
+  // `no runners?!` is ethers' FallbackProvider error (provider-fallback.js)
+  // when EVERY configured sub-provider is unavailable — i.e. all RPC endpoints
+  // are exhausted. On a multi-RPC node a perpetual 429 surfaces as this rather
+  // than a raw `429`/`SERVER_ERROR` (which is what a single-provider config
+  // throws), so classify it as retryable too — otherwise `init()`'s Hub reads
+  // would propagate it un-coded and `/api/context-graph/register` would 500
+  // instead of the bounded 503 (#894 follow-up).
+  return /timeout|timed out|network|socket|reset|econnreset|econnrefused|etimedout|enotfound|eai_again|rate limit|too many requests|429|503|502|500|gateway|temporarily unavailable|fetch failed|connection|no runners/i
+    .test(msg);
+}
+
+function assertSuccessfulReceipt(receipt: ethers.TransactionReceipt, label: string): void {
+  if (receipt.status !== 0) return;
+  const err = new Error(`${label} tx ${receipt.hash} was mined but reverted (status=0)`);
+  (err as any).code = 'CALL_EXCEPTION';
+  (err as any).receipt = receipt;
+  throw err;
+}
+
+function isKnownTransactionError(err: unknown): boolean {
+  const code = errorCode(err);
+  const msg = errorMessage(err).toLowerCase();
+  return code === 'NONCE_EXPIRED'
+    || msg.includes('already known')
+    || msg.includes('known transaction')
+    || msg.includes('already imported')
+    || msg.includes('transaction already in mempool')
+    || msg.includes('already exists')
+    || msg.includes('already have transaction')
+    || msg.includes('nonce too low')
+    || msg.includes('duplicate transaction');
+}
 
 const require = createRequire(import.meta.url);
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -99,16 +443,25 @@ function loadAbi(contractName: string): ethers.InterfaceAbi {
   if (existsSync(localPath)) {
     return JSON.parse(readFileSync(localPath, 'utf-8'));
   }
+  const archivedPath = join(localAbiDir, 'archive', `${contractName}.json`);
+  if (existsSync(archivedPath)) {
+    return JSON.parse(readFileSync(archivedPath, 'utf-8'));
+  }
   return require(`@origintrail-official/dkg-evm-module/abi/${contractName}.json`);
 }
 
 const ERROR_ABI_CONTRACTS = [
-  'KnowledgeAssets', 'KnowledgeAssetsV10', 'KnowledgeAssetsStorage', 'KnowledgeCollection',
-  'KnowledgeCollectionStorage', 'ContextGraphs', 'ContextGraphStorage',
+  'KnowledgeAssets', 'KnowledgeAssetsLifecycle', 'KnowledgeAssetsStorage',
+  'DKGKnowledgeAssets', 'ContextGraphs', 'ContextGraphStorage',
   'ContextGraphNameRegistry', 'Profile', 'Identity', 'IdentityStorage',
   'Staking', 'StakingStorage', 'StakingV10', 'StakingKPI',
   'ConvictionStakingStorage',
   'DKGStakingConvictionNFT', 'DKGPublishingConvictionNFT',
+  // Post PR #650 split — PCA business errors are declared on the logic
+  // and storage contracts, NOT the slim wrapper. Both must be in this
+  // list so wrapper-bubbled reverts (e.g. NoConvictionAccount, AccountExpired,
+  // UnknownAccount, InvalidAmount, AgentAlreadyRegistered) decode at runtime.
+  'PublishingConviction', 'PublishingConvictionStorage',
   'Hub', 'Token', 'Ask', 'AskStorage',
   'Paymaster', 'ShardingTable', 'ParametersStorage',
   'PublishingConvictionAccount',
@@ -119,6 +472,26 @@ const ADMIN_KEY_PURPOSE = 1;
 const OPERATIONAL_KEY_PURPOSE = 2;
 
 let _errorInterface: Interface | null = null;
+let _pcaLogicInterface: Interface | null = null;
+
+/**
+ * Lazy-cached `ethers.Interface` over the `PublishingConviction` (logic)
+ * contract ABI.
+ *
+ * Post PR #650, all PCA state-change events (`AccountCreated`, `ToppedUp`,
+ * `CostCovered`, `WindowSettled`, `AccountFinalSwept`,
+ * `AgentRegistered`, `AgentDeregistered`) are emitted by the logic contract
+ * — NOT by the `DKGPublishingConvictionNFT` wrapper. Receipt-log parsing
+ * for those events MUST go through this interface; parsing through the
+ * wrapper's interface returns `null` because the wrapper ABI no longer
+ * declares those events. See `DKGPublishingConvictionNFT.sol` NatSpec
+ * "Deliberate breaks in the v2.x → v3.0.0 wrapper bump".
+ */
+function getPcaLogicInterface(): Interface {
+  if (_pcaLogicInterface) return _pcaLogicInterface;
+  _pcaLogicInterface = new Interface(loadAbi('PublishingConviction') as any[]);
+  return _pcaLogicInterface;
+}
 
 function getErrorInterface(): Interface {
   if (_errorInterface) return _errorInterface;
@@ -183,11 +556,14 @@ export function enrichEvmError(err: unknown): string | null {
 
 interface EVMAdapterBaseConfig {
   rpcUrl: string;
+  rpcUrls?: string[];
   /** Primary operational wallet key (used for identity registration, staking, etc.) */
   privateKey: string;
   /** Additional operational wallet keys for parallel transaction submission. */
   additionalKeys?: string[];
   hubAddress: string;
+  /** Optional TRAC token contract override. When omitted, resolve from Hub.Token. */
+  tokenAddress?: string;
   chainId?: string;
   /**
    * TTL (ms) for re-resolving `RandomSampling` / `RandomSamplingStorage`
@@ -204,6 +580,14 @@ interface EVMAdapterBaseConfig {
    * still effectively zero.
    */
   randomSamplingHubRefreshMs?: number;
+  /**
+   * Policy that controls how the V10 publish / update auto-approve sizes
+   * its TRAC allowance request. Defaults to {@link DEFAULT_APPROVAL_POLICY}
+   * (`per-publish`), preserving the bounded-per-publish behaviour that
+   * existed before this field landed. See {@link ApprovalPolicy} for the
+   * mode semantics.
+   */
+  approvalPolicy?: ApprovalPolicy;
 }
 
 export interface EVMAdapterConfig extends EVMAdapterBaseConfig {
@@ -229,8 +613,7 @@ interface ContractCache {
   profileStorage?: Contract;
   knowledgeAssets?: Contract;
   knowledgeAssetsStorage?: Contract;
-  knowledgeCollection?: Contract;
-  knowledgeCollectionStorage?: Contract;
+  knowledgeAssetStorage?: Contract;
   staking?: Contract;
   contextGraphNameRegistry?: Contract;
   token?: Contract;
@@ -238,12 +621,35 @@ interface ContractCache {
   askStorage?: Contract;
   contextGraphs?: Contract;
   contextGraphStorage?: Contract;
-  knowledgeAssetsV10?: Contract;
+  knowledgeAssetsLifecycle?: Contract;
   /** V10 NFT-backed PCA. Backs the PCA write surface + the publisher's
    *  `kcEpochs == lockDurationEpochs` discount check (SDK pre-coerces). */
   dkgPublishingConvictionNFT?: Contract;
   randomSampling?: Contract;
   randomSamplingStorage?: Contract;
+  identityStorage?: Contract;
+  convictionStakingStorage?: Contract;
+  stakingStorage?: Contract;
+  /**
+   * Epoch oracle used by the update path to compute `remainingEpochs`
+   * (`endEpoch - currentEpoch`) when sizing `newTokenAmount` so the
+   * daemon's pre-flight matches `KnowledgeAssetsLifecycle._validateTokenAmount`.
+   * Without this, byteSize-growth updates revert with `InvalidTokenAmount(1, 0)`
+   * because the carry-forward `currentTokenAmount` produces `deltaTokenAmount == 0`.
+   * Tracked at issue #831.
+   */
+  chronos?: Contract;
+}
+
+function formatProviderContext(config: Pick<EVMAdapterConfig, 'chainId' | 'rpcUrl'>): string {
+  let rpcHost: string;
+  try {
+    const parsed = new URL(config.rpcUrl);
+    rpcHost = parsed.host || parsed.protocol || 'unknown-rpc';
+  } catch {
+    rpcHost = 'unparseable-rpc';
+  }
+  return `chainId=${config.chainId ?? 'unknown'} rpc=${rpcHost}`;
 }
 
 /**
@@ -258,7 +664,11 @@ export class EVMChainAdapter implements ChainAdapter {
   readonly chainType = 'evm' as const;
   readonly chainId: string;
 
-  private readonly provider: JsonRpcProvider;
+  private readonly provider: JsonRpcProvider | FallbackProvider;
+  private readonly primaryProvider: JsonRpcProvider;
+  private readonly providers: JsonRpcProvider[];
+  private readonly rpcUrls: string[];
+  private readonly filterErrorSilencer: FilterErrorSilencer;
   /** Primary signer — used for identity/profile/staking operations. */
   private readonly signer: Wallet;
   /** All operational signers (includes primary). Used round-robin for publish TXs. */
@@ -268,6 +678,14 @@ export class EVMChainAdapter implements ChainAdapter {
   private signerIndex = 0;
   private signerSelectionQueue: Promise<void> = Promise.resolve();
   private readonly hubAddress: string;
+  private readonly tokenAddress?: string;
+  /**
+   * Operator-configured allowance sizing policy for V10 publish / update
+   * auto-approve. See {@link ApprovalPolicy}. Default is `'per-publish'`,
+   * preserving the bounded-per-publish behaviour from before the policy
+   * landed.
+   */
+  private readonly approvalPolicy: ApprovalPolicy;
   private contracts: ContractCache;
   private initialized = false;
   /**
@@ -294,6 +712,12 @@ export class EVMChainAdapter implements ChainAdapter {
    * `UnauthorizedAccess(Only Contracts in Hub)`.
    */
   private readonly randomSamplingPairCache: HubResolutionCache<{ rs: Contract; rss: Contract }>;
+  /**
+   * OT-RFC-39 — per-process cache for `getIdentityIdForAddress`.
+   * Only positive (non-zero) hits are memoised; see the method body
+   * for the rationale (negative-hit invalidation hazard).
+   */
+  private readonly identityIdByAddressCache: Map<string, bigint> = new Map();
   private hubRotationListenerStarted = false;
   /**
    * Single-flight guard for the best-effort
@@ -332,8 +756,151 @@ export class EVMChainAdapter implements ChainAdapter {
   private inflightDurationProbeContract: Contract | undefined;
   private inflightDurationProbeStartedAt = 0;
 
+  /**
+   * PR3 / RC11 — TTL cache for the three "publish pre-flight" reads the
+   * V10 ACK provider needs on every publish:
+   *
+   *   - `getEvmChainId()`           (chain id, never changes after
+   *                                  the JSON-RPC endpoint is configured)
+   *   - `getKnowledgeAssetsLifecycleAddress()` (KAV10 contract address —
+   *                                  changes only on contract redeploy)
+   *   - `getMinimumRequiredSignatures()` (governance parameter — changes
+   *                                  only on a `ParametersStorage` write)
+   *
+   * Pre-PR3 every publish issued three serial JSON-RPC calls before
+   * even dialling peers for ACKs. The dzudza incident (Sun 20:42 UTC,
+   * `eth_chainId` rate-limited on the public Base Sepolia RPC) is the
+   * canonical symptom: a single rate-limited pre-flight call killed
+   * the entire publish path even though the chain values themselves
+   * had never changed for the daemon's lifetime.
+   *
+   * The TTL is conservative (1h) because all three values are
+   * structurally stable. A `ParametersStorage` governance vote that
+   * changed `minimumRequiredSignatures` mid-cycle would take up to 1h
+   * to propagate to the ACK collector — acceptable, since the contract
+   * itself rejects mismatched-quorum publishes and the publisher
+   * retries on the next attempt. Chain-id and KAV10 address never
+   * change without a daemon restart in practice.
+   *
+   * Cache is keyed implicitly on `this` (per-adapter instance); a
+   * second adapter pointed at a different chain has its own cache
+   * with no cross-talk.
+   */
+  private static readonly PREFLIGHT_TTL_MS = 60 * 60 * 1000;
+  private cachedChainId: { value: bigint; cachedAt: number } | undefined;
+  private cachedKav10Address: { value: string; cachedAt: number } | undefined;
+  private cachedMinRequiredSignatures: { value: number; cachedAt: number } | undefined;
+
+  /**
+   * Reset the PR3 publish-preflight cache. Public so daemon code that
+   * knows about an external chain reconfiguration (e.g. a hot-reload
+   * of `chainRpcUrl` or a deliberate governance-vote test fixture)
+   * can flush the cache without waiting out the TTL. Tests use this
+   * to reset state between cases.
+   */
+  invalidatePublishPreflightCache(): void {
+    this.cachedChainId = undefined;
+    this.cachedKav10Address = undefined;
+    this.cachedMinRequiredSignatures = undefined;
+  }
+
+  private static preflightCacheFresh(
+    entry: { cachedAt: number } | undefined,
+    now: number,
+  ): boolean {
+    if (!entry) return false;
+    return now - entry.cachedAt < EVMChainAdapter.PREFLIGHT_TTL_MS;
+  }
+
   constructor(config: EVMAdapterConfig) {
-    this.provider = new JsonRpcProvider(config.rpcUrl, undefined, { cacheTimeout: -1 });
+    this.rpcUrls = resolveRpcUrls(config.rpcUrl, config.rpcUrls);
+    // BUG-022 root-cause fix: force ethers' `PollingEventSubscriber`
+    // (eth_getLogs over a sliding block window) instead of the default
+    // `FilterIdEventSubscriber` (eth_newFilter + eth_getFilterChanges).
+    //
+    // The filter-id path is unrecoverable on any RPC that GC's filters
+    // faster than the poll cadence: when `eth_getFilterChanges` returns
+    // null/non-array for a dropped filter, ethers v6.16's
+    // `subscriber-filterid.js#_emitResults` throws `TypeError: results is
+    // not iterable`, the `#poll` catch swallows it as `console.log("@TODO",
+    // err)` WITHOUT invalidating the dead filterId, and re-arms on the next
+    // `block` event — pinning the daemon at 100% CPU and starving the event
+    // loop until the API hangs (observed on a 5-node devnet: 2/5 daemons
+    // wedged after ~30-60min). The prior mitigation (filter-error-silencer)
+    // only deduped the LOG spam and never recovered the filter; worse, it
+    // didn't even match this `TypeError` variant.
+    //
+    // `polling: true` carries a small extra-RPC cost (one eth_getLogs per
+    // block per active subscription) in exchange for a stateless,
+    // self-healing subscription with no server-side filter to leak. This is
+    // ethers' own fallback path for filter-unsupported RPCs.
+    // Bound ethers' built-in per-request 429/5xx retry (see
+    // `boundedRetryFetchRequest`) so a perpetually rate-limited RPC surfaces a
+    // retryable error within seconds instead of stalling reads (e.g. `init()`'s
+    // Hub lookups) for minutes — which would otherwise make context-graph
+    // register hang past its HTTP timeout rather than returning 503.
+    this.providers = this.rpcUrls.map(
+      (url) => new JsonRpcProvider(boundedRetryFetchRequest(url), undefined, { cacheTimeout: -1, polling: true }),
+    );
+    this.primaryProvider = this.providers[0];
+    this.provider = this.providers.length === 1
+      ? this.primaryProvider
+      : new FallbackProvider(
+        this.providers.map((provider, index) => ({
+          provider,
+          priority: index + 1,
+          stallTimeout: RPC_READ_STALL_TIMEOUT_MS,
+          weight: 1,
+        })),
+        undefined,
+        { quorum: 1 },
+      );
+    const providerContext = formatProviderContext(config);
+    // PR-8: install the filter-not-found silencer. Without this, RPC
+    // nodes that GC filters faster than ethers' polling cadence
+    // (observed: 134 MB of daemon.log spam in 24h on beacon-01) spam
+    // the operator's logs with per-tick "filter not found" errors.
+    // The silencer dedupe-logs once per DEDUP_WINDOW_MS and lets every
+    // other provider error propagate normally. It does not recreate
+    // filters or guarantee every Hub-resolved contract handle stays
+    // fresh; only the RandomSampling pair has a TTL self-heal path.
+    // The warning text keeps the wider event-polling degradation visible.
+    this.filterErrorSilencer = createFilterErrorSilencer({
+      log: (msg) => console.warn(`${msg} (${providerContext})`),
+    });
+    // BUG-022: ethers v6 swallows `eth_getFilterChanges` "filter not
+    // found" errors with a literal `console.log("@TODO", error)` from
+    // subscriber-filterid.js — that path bypasses
+    // `provider.on('error', ...)` entirely, so the per-provider
+    // silencer above never gets a chance to suppress them. Install a
+    // process-wide `console.log` interceptor (idempotent) that catches
+    // exactly that two-arg shape and routes it through a dedicated
+    // silencer with the same dedup window. Real `console.log` calls
+    // are forwarded untouched.
+    installFilterNotFoundConsoleSuppressor();
+    const providerErrorHandler = (err: unknown) => {
+      if (this.filterErrorSilencer.handle(err)) return;
+      // Non-filter provider errors fall through to the error
+      // path so they remain visible. Operators grepping their logs
+      // for chain-provider issues still see everything they used to
+      // EXCEPT the filter-spam class.
+      console.error(`[chain] provider error (${providerContext}): ${formatProviderError(err)}`);
+    };
+    for (let i = 0; i < this.providers.length; i += 1) {
+      const provider = this.providers[i];
+      const listenerContext = `${providerContext}; rpc #${i + 1}`;
+      try {
+        void Promise.resolve(provider.on('error', providerErrorHandler)).catch((err: unknown) => {
+          console.error(
+            `[chain] provider error listener registration failed (${listenerContext}): ${formatProviderError(err)}`,
+          );
+        });
+      } catch (err) {
+        console.error(
+          `[chain] provider error listener registration failed (${listenerContext}): ${formatProviderError(err)}`,
+        );
+      }
+    }
     this.signer = new Wallet(config.privateKey, this.provider);
     this.signerPool = [this.signer];
     for (const key of config.additionalKeys ?? []) {
@@ -347,7 +914,12 @@ export class EVMChainAdapter implements ChainAdapter {
       }
     }
     this.hubAddress = config.hubAddress;
+    if (config.tokenAddress && !ethers.isAddress(config.tokenAddress)) {
+      throw new Error(`Invalid tokenAddress: ${config.tokenAddress}`);
+    }
+    this.tokenAddress = config.tokenAddress ? ethers.getAddress(config.tokenAddress) : undefined;
     this.chainId = config.chainId ?? 'evm:31337';
+    this.approvalPolicy = config.approvalPolicy ?? DEFAULT_APPROVAL_POLICY;
 
     this.contracts = {
       hub: new Contract(config.hubAddress, loadAbi('Hub'), this.signer),
@@ -385,6 +957,247 @@ export class EVMChainAdapter implements ChainAdapter {
   private findSignerByAddress(address: string): Wallet | undefined {
     const normalized = ethers.getAddress(address).toLowerCase();
     return this.signerPool.find((signer) => signer.address.toLowerCase() === normalized);
+  }
+
+  private async broadcastSignedTransactionWithFailover(
+    signedTx: string,
+    txHash: string,
+    label: string,
+  ): Promise<void> {
+    let lastRetryable: unknown;
+    for (let i = 0; i < this.providers.length; i += 1) {
+      const provider = this.providers[i];
+      try {
+        await withTimeout(
+          provider.broadcastTransaction(signedTx),
+          RPC_BROADCAST_ATTEMPT_TIMEOUT_MS,
+          `${label} broadcast via RPC #${i + 1}`,
+        );
+        return;
+      } catch (err) {
+        if (isKnownTransactionError(err)) return;
+        if (!isRetryableRpcError(err)) throw err;
+        lastRetryable = err;
+      }
+    }
+    throw new Error(
+      `${label} broadcast failed on all configured RPC endpoints for tx ${txHash}: ${errorMessage(lastRetryable)}`,
+      { cause: lastRetryable },
+    );
+  }
+
+  private async getTransactionReceiptWithFailover(txHash: string): Promise<ethers.TransactionReceipt | null> {
+    let lastRetryable: unknown;
+    let sawNonErrorResponse = false;
+    for (let i = 0; i < this.providers.length; i += 1) {
+      const provider = this.providers[i];
+      try {
+        const receipt = await withTimeout(
+          provider.getTransactionReceipt(txHash),
+          RPC_RECEIPT_ATTEMPT_TIMEOUT_MS,
+          `receipt lookup via RPC #${i + 1}`,
+        );
+        sawNonErrorResponse = true;
+        if (receipt) return receipt;
+      } catch (err) {
+        if (!isRetryableRpcError(err)) throw err;
+        lastRetryable = err;
+      }
+    }
+    if (lastRetryable && !sawNonErrorResponse) {
+      const err = new Error(
+        `Receipt lookup for tx ${txHash} failed on all configured RPC endpoints: ${errorMessage(lastRetryable)}`,
+        { cause: lastRetryable },
+      );
+      (err as any).code = 'RPC_RECEIPT_LOOKUP_FAILED';
+      (err as any).txHash = txHash;
+      throw err;
+    }
+    return null;
+  }
+
+  private async waitForReceiptWithFailover(
+    txHash: string,
+    label: string,
+  ): Promise<ethers.TransactionReceipt> {
+    const deadline = Date.now() + RPC_RECEIPT_TIMEOUT_MS;
+    let lastError: unknown;
+    while (Date.now() < deadline) {
+      try {
+        const receipt = await this.getTransactionReceiptWithFailover(txHash);
+        if (receipt) {
+          assertSuccessfulReceipt(receipt, label);
+          return receipt;
+        }
+      } catch (err) {
+        if (!isRetryableRpcError(err)) throw err;
+        lastError = err;
+      }
+      await sleep(RPC_RECEIPT_POLL_INTERVAL_MS);
+    }
+    const err = new Error(
+      `${label} tx ${txHash} timed out waiting for a receipt after ${RPC_RECEIPT_TIMEOUT_MS}ms` +
+      (lastError ? ` (last RPC error: ${errorMessage(lastError)})` : ''),
+      { cause: lastError },
+    );
+    (err as any).code = 'TIMEOUT';
+    (err as any).txHash = txHash;
+    throw err;
+  }
+
+  private async signPopulatedTransaction(
+    signer: Wallet,
+    populated: ethers.TransactionRequest,
+  ): Promise<{ signedTx: string; txHash: string }> {
+    const filled = await signer.populateTransaction(populated);
+    const signedTx = await signer.signTransaction(filled);
+    const txHash = ethers.Transaction.from(signedTx).hash ?? '0x';
+    return { signedTx, txHash };
+  }
+
+  private async sendSignedTransactionAndWait(
+    signedTx: string,
+    txHash: string,
+    label: string,
+  ): Promise<ethers.TransactionReceipt> {
+    await this.broadcastSignedTransactionWithFailover(signedTx, txHash, label);
+    return this.waitForReceiptWithFailover(txHash, label);
+  }
+
+  private async sendPopulatedTransaction(
+    signer: Wallet,
+    populated: ethers.TransactionRequest,
+    label: string,
+  ): Promise<ethers.TransactionReceipt> {
+    const { signedTx, txHash } = await this.signPopulatedTransaction(signer, populated);
+    return this.sendSignedTransactionAndWait(signedTx, txHash, label);
+  }
+
+  private async sendContractTransaction(
+    contract: Contract,
+    method: string,
+    args: readonly unknown[],
+    signer: Wallet,
+    label: string,
+  ): Promise<ethers.TransactionReceipt> {
+    let lastRetryable: unknown;
+    for (let i = 0; i < this.providers.length; i += 1) {
+      const rpcSigner = signer.connect(this.providers[i]);
+      let prepared: { signedTx: string; txHash: string } | undefined;
+      try {
+        const connected = contract.connect(rpcSigner) as any;
+        const populated = await withTimeout<ethers.TransactionRequest>(
+          connected[method].populateTransaction(...args) as Promise<ethers.TransactionRequest>,
+          RPC_TRANSACTION_POPULATION_ATTEMPT_TIMEOUT_MS,
+          `${label} transaction population via RPC #${i + 1}`,
+        );
+        prepared = await withTimeout(
+          this.signPopulatedTransaction(rpcSigner, populated),
+          RPC_TRANSACTION_POPULATION_ATTEMPT_TIMEOUT_MS,
+          `${label} transaction signing via RPC #${i + 1}`,
+        );
+      } catch (err) {
+        if (!isRetryableRpcError(err)) throw err;
+        lastRetryable = err;
+        continue;
+      }
+      if (!prepared) continue;
+      return this.sendSignedTransactionAndWait(prepared.signedTx, prepared.txHash, label);
+    }
+    // A retryable error from the only configured RPC is still an "endpoints
+    // exhausted" condition: downstream classifiers (e.g.
+    // `/api/context-graph/register` → `classifyRegisterContextGraphError`)
+    // key the transient-outage 503 off the `RPC_ENDPOINTS_EXHAUSTED` code, so
+    // the code MUST be present even for a single-provider adapter (Codex
+    // PR #901). What we must NOT do for one provider is REWRITE the
+    // `.message` into the multi-endpoint "failed on all endpoints (url1,
+    // url2): ..." aggregate — there is no second endpoint, so the original
+    // message (e.g. a plain `connect ECONNREFUSED`) reads cleaner and any
+    // message-inspecting caller keeps seeing it verbatim. So: single provider
+    // → carry the code on a new error but keep the message byte-identical;
+    // multiple providers → the aggregated "all endpoints" message is
+    // meaningful and is asserted by evm-adapter.unit.test.ts.
+    const message = this.providers.length <= 1
+      ? errorMessage(lastRetryable)
+      : `${label} transaction preparation failed on all configured RPC endpoints ` +
+        `(${this.rpcUrls.join(', ')}): ${errorMessage(lastRetryable)}`;
+    const err = new Error(message, { cause: lastRetryable });
+    (err as any).code = 'RPC_ENDPOINTS_EXHAUSTED';
+    (err as any).rpcUrls = [...this.rpcUrls];
+    throw err;
+  }
+
+  /**
+   * V10 approval gate shared by `publishV10` and `updateV10`.
+   *
+   * Reads the on-chain TRAC allowance from `signer.address` to the V10
+   * `KnowledgeAssets` contract, then dispatches through
+   * `computeApprovalAction(this.approvalPolicy, tokenAmount, current)`:
+   *   - `per-publish` (default): bounded-per-call, with a `1n` floor so
+   *     zero-cost publishes / metadata-only updates still satisfy the
+   *     contract's `transferFrom(..., 1n)` minimum (the #720 mainnet
+   *     revert we shipped a fix for).
+   *   - `replenishing`: approve a ceiling, refill at a fraction.
+   *   - `unlimited`: V9-style one-shot MaxUint256.
+   *
+   * Acts as a no-op when `this.contracts.token` is absent (read-only
+   * adapters). Extracted from the two near-identical inline blocks in
+   * `publishV10` / `updateV10` so the approve branches are exercised by
+   * a single seam in unit tests (`mock allowance() / approve()`).
+   */
+  private async ensureV10ApproveTrac(
+    signer: Wallet,
+    kav10Address: string,
+    tokenAmount: bigint,
+    txLabel: string,
+  ): Promise<void> {
+    if (!this.contracts.token) return;
+    const tokenWithSigner = this.contracts.token.connect(signer) as Contract;
+    const currentAllowance: bigint = await tokenWithSigner.allowance(
+      signer.address,
+      kav10Address,
+    );
+    const { needsApprove, targetAllowance } = computeApprovalAction(
+      this.approvalPolicy,
+      tokenAmount,
+      currentAllowance,
+    );
+    if (needsApprove) {
+      // Surface the per-publish floor explicitly when (and only when) the
+      // policy lifted `targetAllowance` above the caller's `tokenAmount`
+      // — i.e. `tokenAmount === 0n` and the floor in
+      // `effectivePublishAllowance` produced `targetAllowance === 1n`
+      // (`V10_PUBLISH_ONCHAIN_MIN_ALLOWANCE`). That's the #720 workaround
+      // for the contract's `transferFrom(..., 1n)` minimum on zero-cost
+      // publishes. Without this log, operators who manually inspect
+      // on-chain allowance see "1 wei dust" persisting after every
+      // publish and misread it as a stuck or ghosted approval (#871).
+      //
+      // The `tokenAmount === 0n` half of the guard matters: a legitimate
+      // `tokenAmount === 1n` publish ALSO produces `targetAllowance === 1n`
+      // under per-publish, but in that case the 1-wei is the real publish
+      // cost, not the workaround floor — claiming "#720 floor" there
+      // would be a false positive (Codex, PR #875).
+      if (
+        this.approvalPolicy.mode === 'per-publish' &&
+        tokenAmount === 0n &&
+        targetAllowance === V10_PUBLISH_ONCHAIN_MIN_ALLOWANCE
+      ) {
+        console.warn(
+          `[chain] V10 per-publish auto-approve floor: signer=${signer.address} ` +
+          `kav10=${kav10Address} target=1 wei (tokenAmount=0, ` +
+          `currentAllowance=${currentAllowance.toString()}). This is the #720 ` +
+          `transferFrom-minimum workaround; not a stuck approval.`,
+        );
+      }
+      await this.sendContractTransaction(
+        tokenWithSigner,
+        'approve',
+        [kav10Address, targetAllowance],
+        signer,
+        txLabel,
+      );
+    }
   }
 
   /**
@@ -447,6 +1260,31 @@ export class EVMChainAdapter implements ChainAdapter {
     return ethers.keccak256(ethers.solidityPacked(['address'], [ethers.getAddress(address)]));
   }
 
+  private async getIdentityStorage(): Promise<Contract> {
+    if (!this.contracts.identityStorage) {
+      this.contracts.identityStorage = await this.resolveContract('IdentityStorage');
+    }
+    return this.contracts.identityStorage;
+  }
+
+  private async getConvictionStakingStorage(): Promise<Contract | null> {
+    if (!this.contracts.convictionStakingStorage) {
+      try {
+        this.contracts.convictionStakingStorage = await this.resolveContract('ConvictionStakingStorage');
+      } catch { return null; }
+    }
+    return this.contracts.convictionStakingStorage;
+  }
+
+  private async getStakingStorage(): Promise<Contract | null> {
+    if (!this.contracts.stakingStorage) {
+      try {
+        this.contracts.stakingStorage = await this.resolveContract('StakingStorage');
+      } catch { return null; }
+    }
+    return this.contracts.stakingStorage;
+  }
+
   private async hasAdminPurpose(
     identityStorage: Contract,
     identityId: bigint,
@@ -473,7 +1311,7 @@ export class EVMChainAdapter implements ChainAdapter {
 
   async isOperationalWalletRegistered(identityId: bigint, address: string): Promise<boolean> {
     await this.init();
-    const identityStorage = await this.resolveContract('IdentityStorage');
+    const identityStorage = await this.getIdentityStorage();
     return this.hasOperationalPurpose(identityStorage, identityId, address);
   }
 
@@ -492,21 +1330,28 @@ export class EVMChainAdapter implements ChainAdapter {
     };
     if (identityId === 0n) return result;
 
-    const identityStorage = await this.resolveContract('IdentityStorage');
+    const identityStorage = await this.getIdentityStorage();
     const candidates = [
       ...this.signerPool.map((s) => s.address),
       ...(options?.additionalAddresses ?? []),
     ];
     const seen = new Set<string>();
-    const missing: string[] = [];
-
+    const uniqueAddresses: string[] = [];
     for (const candidate of candidates) {
       const address = ethers.getAddress(candidate);
       const key = address.toLowerCase();
       if (seen.has(key)) continue;
       seen.add(key);
+      uniqueAddresses.push(address);
+    }
 
-      const existingIdentityId = BigInt(await identityStorage.getIdentityId(address));
+    const onChainIds = await Promise.all(
+      uniqueAddresses.map((addr) => identityStorage.getIdentityId(addr).then(BigInt)),
+    );
+    const missing: string[] = [];
+    for (let i = 0; i < uniqueAddresses.length; i++) {
+      const address = uniqueAddresses[i];
+      const existingIdentityId = onChainIds[i];
       if (existingIdentityId === identityId) {
         result.alreadyRegistered.push(address);
       } else if (existingIdentityId === 0n) {
@@ -531,9 +1376,13 @@ export class EVMChainAdapter implements ChainAdapter {
       );
     }
 
-    const profile = this.contracts.profile!.connect(this.adminSigner) as Contract;
-    const tx = await profile.addOperationalWallets(identityId, missing);
-    await tx.wait();
+    await this.sendContractTransaction(
+      this.contracts.profile!,
+      'addOperationalWallets',
+      [identityId, missing],
+      this.adminSigner,
+      'addOperationalWallets',
+    );
 
     for (const address of missing) {
       if (await this.hasOperationalPurpose(identityStorage, identityId, address)) {
@@ -567,11 +1416,17 @@ export class EVMChainAdapter implements ChainAdapter {
     if (identityId === 0n) {
       throw new Error('setRelayCapable: signer has no on-chain profile (call ensureProfile first).');
     }
-    const tx = await this.contracts.profile.updateRelayCapable(identityId, relayCapable);
-    const receipt = await tx.wait();
+    const receipt = await this.sendContractTransaction(
+      this.contracts.profile,
+      'updateRelayCapable',
+      [identityId, relayCapable],
+      this.signer,
+      'updateRelayCapable',
+    );
     return {
       hash: receipt.hash,
       blockNumber: receipt.blockNumber,
+      txIndex: receipt.index,
       success: receipt.status === 1,
     };
   }
@@ -625,7 +1480,32 @@ export class EVMChainAdapter implements ChainAdapter {
 
   private async init(): Promise<void> {
     if (this.initialized) return;
+    try {
+      await this.initContracts();
+    } catch (err) {
+      // `init()` sits on the critical path of every chain write
+      // (`createOnChainContextGraph`, publish, verify, …). If the Hub lookups
+      // fail because the configured RPC endpoint(s) are exhausted (perpetual
+      // 429 / unreachable), surface the same `RPC_ENDPOINTS_EXHAUSTED` contract
+      // the tx-send path uses, so callers (e.g. `/api/context-graph/register`
+      // → `classifyRegisterContextGraphError`) map it to a bounded 503 instead
+      // of a generic 500 — and never hang waiting on it (#894 follow-up). A
+      // non-RPC error (e.g. a genuine "contract not in Hub" misconfig) keeps
+      // its original shape.
+      if (isRetryableRpcError(err)) {
+        const wrapped = new Error(
+          `chain initialisation failed on all configured RPC endpoints (${this.rpcUrls.join(', ')}): ${errorMessage(err)}`,
+          { cause: err },
+        );
+        (wrapped as any).code = 'RPC_ENDPOINTS_EXHAUSTED';
+        (wrapped as any).rpcUrls = [...this.rpcUrls];
+        throw wrapped;
+      }
+      throw err;
+    }
+  }
 
+  private async initContracts(): Promise<void> {
     this.contracts.identity = await this.resolveContract('Identity');
     this.contracts.profile = await this.resolveContract('Profile');
     this.contracts.parametersStorage = await this.resolveContract('ParametersStorage');
@@ -650,14 +1530,9 @@ export class EVMChainAdapter implements ChainAdapter {
       // Older deployments without the relay registry surface.
     }
 
-    // V8 KnowledgeCollection is archived; tolerate missing Hub binding.
-    // KnowledgeCollectionStorage remains active and is required.
-    try {
-      this.contracts.knowledgeCollection = await this.resolveContract('KnowledgeCollection');
-    } catch {
-      // V8 KnowledgeCollection not deployed — legacy publish surface unavailable.
-    }
-    this.contracts.knowledgeCollectionStorage = await this.resolveAssetStorage('KnowledgeCollectionStorage');
+    // V10.1 KA storage. Legacy V8 KnowledgeCollection + V10.0 DKGKnowledgeAssets
+    // are deleted in the rc.12 KC->KA rename — no fallback resolution.
+    this.contracts.knowledgeAssetStorage = await this.resolveAssetStorage('DKGKnowledgeAssets');
 
     // V9 contracts (KnowledgeAssets + KnowledgeAssetsStorage) are archived
     // (PRD §4.1, deploy scripts 040+041 moved under deploy/archive). Keep
@@ -691,15 +1566,25 @@ export class EVMChainAdapter implements ChainAdapter {
     }
 
     try {
-      this.contracts.knowledgeAssetsV10 = await this.resolveContract('KnowledgeAssetsV10');
+      this.contracts.knowledgeAssetsLifecycle = await this.resolveContract('KnowledgeAssetsLifecycle');
     } catch {
-      // V10 contract not deployed — createKnowledgeAssetsV10 unavailable
+      // Lifecycle not deployed — createKnowledgeAssets unavailable.
+      // V10.0 KnowledgeAssetsLifecycle fallback was removed in the rc.12 rename.
     }
 
     try {
       this.contracts.dkgPublishingConvictionNFT = await this.resolveContract('DKGPublishingConvictionNFT');
     } catch {
       // DKGPublishingConvictionNFT not deployed — V10 PCA agent-resolution unavailable
+    }
+
+    try {
+      this.contracts.chronos = await this.resolveContract('Chronos');
+    } catch {
+      // Chronos not deployed — update-path growth-cost sizing falls back to
+      // currentEpoch=0 (treats KC as having full `endEpoch` remaining lifetime).
+      // Greenfield V10 deployments always have Chronos; this catch is for older
+      // adapters bound to deploys that pre-date the Chronos registration.
     }
 
     try {
@@ -710,7 +1595,7 @@ export class EVMChainAdapter implements ChainAdapter {
 
     await this.startHubRotationListener();
 
-    const tokenAddress: string = await this.contracts.hub.getContractAddress('Token');
+    const tokenAddress: string = this.tokenAddress ?? await this.contracts.hub.getContractAddress('Token');
     if (tokenAddress !== ethers.ZeroAddress) {
       this.contracts.token = new Contract(
         tokenAddress,
@@ -746,8 +1631,32 @@ export class EVMChainAdapter implements ChainAdapter {
 
   async getIdentityId(): Promise<bigint> {
     await this.init();
-    const identityStorage = await this.resolveContract('IdentityStorage');
+    const identityStorage = await this.getIdentityStorage();
     const id: bigint = await identityStorage.getIdentityId(this.signer.address);
+    return id;
+  }
+
+  /**
+   * OT-RFC-39 — view-only address → identityId lookup. Returns 0n
+   * when the address is not registered as a node operator. Caches
+   * results per-process: `IdentityStorage.identities` is append-only
+   * (operator key rotation goes through a separate slot), so a
+   * memoised hit is safe.
+   */
+  async getIdentityIdForAddress(address: string): Promise<bigint> {
+    if (!ethers.isAddress(address)) return 0n;
+    const checksum = ethers.getAddress(address);
+    const cached = this.identityIdByAddressCache.get(checksum.toLowerCase());
+    if (cached !== undefined) return cached;
+    await this.init();
+    const identityStorage = await this.resolveContract('IdentityStorage');
+    const id: bigint = await identityStorage.getIdentityId(checksum);
+    if (id > 0n) {
+      // Only memoise positive hits — a 0n result may flip to non-zero
+      // once the operator registers, and we don't want to lock the
+      // negative answer in for the process lifetime.
+      this.identityIdByAddressCache.set(checksum.toLowerCase(), id);
+    }
     return id;
   }
 
@@ -766,14 +1675,13 @@ export class EVMChainAdapter implements ChainAdapter {
       }
       const nodeId = ethers.hexlify(ethers.randomBytes(32));
 
-      const tx = await this.contracts.profile!.createProfile(
-        this.adminSigner.address,
-        [],
-        nodeName,
-        nodeId,
-        0,
+      const receipt = await this.sendContractTransaction(
+        this.contracts.profile!,
+        'createProfile',
+        [this.adminSigner.address, [], nodeName, nodeId, 0],
+        this.signer,
+        'createProfile',
       );
-      const receipt = await tx.wait();
 
       for (const log of receipt.logs) {
         try {
@@ -817,13 +1725,23 @@ export class EVMChainAdapter implements ChainAdapter {
         if (stakingV10Addr === ethers.ZeroAddress) {
           throw new Error('StakingV10 not registered in Hub — V10 staking unavailable');
         }
-        const approveTx = await this.contracts.token.approve(stakingV10Addr, stakeAmount);
-        await approveTx.wait();
+        await this.sendContractTransaction(
+          this.contracts.token,
+          'approve',
+          [stakingV10Addr, stakeAmount],
+          this.signer,
+          'approve staking TRAC',
+        );
         // Wait an extra block for state propagation on public RPCs
         await new Promise(r => setTimeout(r, 2000));
 
-        const stakeTx = await stakingNFT.createConviction(identityId, stakeAmount, lockTier);
-        await stakeTx.wait();
+        await this.sendContractTransaction(
+          stakingNFT,
+          'createConviction',
+          [identityId, stakeAmount, lockTier],
+          this.signer,
+          'create staking conviction',
+        );
       } catch (err) {
         console.warn(
           `[ensureProfile] V10 staking failed for identity ${identityId} (profile exists, stake manually via DKGStakingConvictionNFT.createConviction): ` +
@@ -845,14 +1763,13 @@ export class EVMChainAdapter implements ChainAdapter {
     const nodeName = `node-${ethers.hexlify(ethers.randomBytes(4)).slice(2)}`;
     const nodeId = proof.publicKey.length > 0 ? proof.publicKey : ethers.randomBytes(32);
 
-    const tx = await this.contracts.profile!.createProfile(
-      this.adminSigner.address,
-      [],
-      nodeName,
-      nodeId,
-      0,
+    const receipt = await this.sendContractTransaction(
+      this.contracts.profile!,
+      'createProfile',
+      [this.adminSigner.address, [], nodeName, nodeId, 0],
+      this.signer,
+      'createProfile',
     );
-    const receipt = await tx.wait();
 
     for (const log of receipt.logs) {
       try {
@@ -889,8 +1806,13 @@ export class EVMChainAdapter implements ChainAdapter {
     await this.init();
     this.requireV9();
 
-    const tx = await this.contracts.knowledgeAssets!.reserveUALRange(count);
-    const receipt = await tx.wait();
+    const receipt = await this.sendContractTransaction(
+      this.contracts.knowledgeAssets!,
+      'reserveUALRange',
+      [count],
+      this.signer,
+      'reserveUALRange',
+    );
 
     for (const log of receipt.logs) {
       try {
@@ -924,8 +1846,13 @@ export class EVMChainAdapter implements ChainAdapter {
     if (this.contracts.token && params.tokenAmount > 0n) {
       const currentAllowance: bigint = await this.contracts.token.allowance(this.signer.address, kaAddress);
       if (currentAllowance < params.tokenAmount) {
-        const approveTx = await this.contracts.token.approve(kaAddress, ethers.MaxUint256);
-        await approveTx.wait();
+        await this.sendContractTransaction(
+          this.contracts.token,
+          'approve',
+          [kaAddress, ethers.MaxUint256],
+          this.signer,
+          'approve KA TRAC',
+        );
       }
     }
 
@@ -933,23 +1860,27 @@ export class EVMChainAdapter implements ChainAdapter {
     const rValues = params.receiverSignatures.map((s) => ethers.hexlify(s.r));
     const vsValues = params.receiverSignatures.map((s) => ethers.hexlify(s.vs));
 
-    const tx = await ka.batchMintKnowledgeAssets(
-      params.publisherNodeIdentityId,
-      ethers.hexlify(params.merkleRoot),
-      params.startKAId,
-      params.endKAId,
-      params.publicByteSize,
-      params.epochs,
-      params.tokenAmount,
-      ethers.ZeroAddress, // paymaster
-      ethers.hexlify(params.publisherSignature.r),
-      ethers.hexlify(params.publisherSignature.vs),
-      identityIds,
-      rValues,
-      vsValues,
+    const receipt = await this.sendContractTransaction(
+      ka,
+      'batchMintKnowledgeAssets',
+      [
+        params.publisherNodeIdentityId,
+        ethers.hexlify(params.merkleRoot),
+        params.startKAId,
+        params.endKAId,
+        params.publicByteSize,
+        params.epochs,
+        params.tokenAmount,
+        ethers.ZeroAddress, // paymaster
+        ethers.hexlify(params.publisherSignature.r),
+        ethers.hexlify(params.publisherSignature.vs),
+        identityIds,
+        rValues,
+        vsValues,
+      ],
+      this.signer,
+      'batchMintKnowledgeAssets',
     );
-
-    const receipt = await tx.wait();
 
     let batchId = 0n;
     for (const log of receipt.logs) {
@@ -968,6 +1899,7 @@ export class EVMChainAdapter implements ChainAdapter {
     return {
       hash: receipt.hash,
       blockNumber: receipt.blockNumber,
+      txIndex: receipt.index,
       success: receipt.status === 1,
       batchId,
     };
@@ -979,12 +1911,12 @@ export class EVMChainAdapter implements ChainAdapter {
 
   async verifyKAUpdate(txHash: string, batchId: bigint, publisherAddress: string): Promise<KAUpdateVerification> {
     await this.init();
-    if (!this.contracts.knowledgeAssetsStorage && !this.contracts.knowledgeCollectionStorage) {
+    if (!this.contracts.knowledgeAssetsStorage && !this.contracts.knowledgeAssetStorage) {
       return { verified: false };
     }
 
     try {
-      const receipt = await this.provider.getTransactionReceipt(txHash);
+      const receipt = await this.getTransactionReceiptWithFailover(txHash);
       if (!receipt || receipt.status !== 1) return { verified: false };
 
       let onChainMerkleRoot: Uint8Array | undefined;
@@ -1005,15 +1937,19 @@ export class EVMChainAdapter implements ChainAdapter {
         }
       }
 
-      // V10: KnowledgeCollectionUpdated on KnowledgeCollectionStorage
-      if (!onChainMerkleRoot && this.contracts.knowledgeCollectionStorage) {
-        const kcs = this.contracts.knowledgeCollectionStorage;
-        const kcsAddress = (await kcs.getAddress()).toLowerCase();
+      // V10: KnowledgeAssetUpdated on DKGKnowledgeAssets
+      if (!onChainMerkleRoot && this.contracts.knowledgeAssetStorage) {
+        const kas = this.contracts.knowledgeAssetStorage;
+        const kcsAddress = (await kas.getAddress()).toLowerCase();
         for (const log of receipt.logs) {
           if (log.address.toLowerCase() !== kcsAddress) continue;
           try {
-            const parsed = kcs.interface.parseLog({ topics: [...log.topics], data: log.data });
-            if (parsed?.name === 'KnowledgeCollectionUpdated' && BigInt(parsed.args.id) === batchId) {
+            const parsed = kas.interface.parseLog({ topics: [...log.topics], data: log.data });
+            if (
+              (parsed?.name === 'KnowledgeAssetUpdated' ||
+                parsed?.name === 'KnowledgeAssetUpdated') &&
+              BigInt(parsed.args.id) === batchId
+            ) {
               onChainMerkleRoot = ethers.getBytes(parsed.args.merkleRoot);
               break;
             }
@@ -1025,9 +1961,9 @@ export class EVMChainAdapter implements ChainAdapter {
 
       // Check publisher address: try V10 storage first, then V9
       let onChainPublisher: string | undefined;
-      if (this.contracts.knowledgeCollectionStorage) {
+      if (this.contracts.knowledgeAssetStorage) {
         try {
-          onChainPublisher = await this.contracts.knowledgeCollectionStorage.getLatestMerkleRootPublisher(batchId);
+          onChainPublisher = await this.contracts.knowledgeAssetStorage.getLatestMerkleRootPublisher(batchId);
         } catch { /* not found in V10 storage */ }
       }
       if ((!onChainPublisher || onChainPublisher === ethers.ZeroAddress) && this.contracts.knowledgeAssetsStorage) {
@@ -1091,6 +2027,8 @@ export class EVMChainAdapter implements ChainAdapter {
                 startKAId: parsed.args.startKAId.toString(),
                 endKAId: parsed.args.endKAId.toString(),
                 txHash: log.transactionHash,
+                // PR #845 (review #9): chain-truth tiebreaker — see KCCreated.
+                txIndex: log.transactionIndex,
               },
             };
           }
@@ -1120,53 +2058,112 @@ export class EVMChainAdapter implements ChainAdapter {
         }
       }
 
-      // V10/V8: KnowledgeCollectionStorage events
-      if (eventType === 'KCCreated' || eventType === 'KnowledgeCollectionCreated') {
-        const kcStorage = this.contracts.knowledgeCollectionStorage;
-        if (kcStorage) {
+      // V10 greenfield (DKGKnowledgeAssets) emits `KnowledgeAssetCreated`
+      // plus a single ERC-721 `Transfer(0x0, owner, tokenId)` per publish
+      // (tokenId == kaId == kaId; no batch mint). Legacy V8/V9
+      // (DKGKnowledgeAssets) emits `KnowledgeAssetCreated` +
+      // `KnowledgeAssetsMinted` (a start/end range + recipient). The bound
+      // contract may be either ABI (see resolveAssetStorage fallback in
+      // init()), so resolve the create event the contract actually exposes
+      // and derive the KA range / publisher from whichever mint surface is
+      // present — otherwise a greenfield node would crash here calling a
+      // non-existent `filters.KnowledgeAssetCreated()`.
+      if (eventType === 'KCCreated' || eventType === 'KnowledgeAssetCreated') {
+        const kaStorage = this.contracts.knowledgeAssetStorage;
+        if (kaStorage) {
           const fromB = filter.fromBlock ?? 0;
           const toB = filter.toBlock ?? 'latest';
 
-          const kcFilter = kcStorage.filters.KnowledgeCollectionCreated();
-          const kcLogs = await kcStorage.queryFilter(kcFilter, fromB, toB);
+          const hasEvent = (name: string) =>
+            kaStorage.interface.fragments.some(
+              (f) => f.type === 'event' && (f as { name?: string }).name === name,
+            );
 
-          const mintFilter = kcStorage.filters.KnowledgeAssetsMinted();
-          const mintLogs = await kcStorage.queryFilter(mintFilter, fromB, toB);
+          const isGreenfield = hasEvent('KnowledgeAssetCreated');
+          const createEventName = isGreenfield
+            ? 'KnowledgeAssetCreated'
+            : 'KnowledgeAssetCreated';
+
+          const kcFilter = kaStorage.filters[createEventName]();
+          const kcLogs = await kaStorage.queryFilter(kcFilter, fromB, toB);
+
+          // Legacy mint range. `KnowledgeAssetsMinted` is still declared on the
+          // greenfield ABI but never emitted by `createKnowledgeAsset`, so
+          // this map stays empty there and the per-log fallback below derives
+          // the (single-KA) range + owner from the create id + Transfer.
           const mintByTx = new Map<string, { publisherAddress: string; startKAId: string; endKAId: string }>();
-          for (const ml of mintLogs) {
-            const mp = kcStorage.interface.parseLog({ topics: [...ml.topics], data: ml.data });
-            if (mp) {
-              mintByTx.set(ml.transactionHash, {
-                publisherAddress: mp.args.to,
-                startKAId: mp.args.startId.toString(),
-                endKAId: (BigInt(mp.args.endId) - 1n).toString(),
-              });
+          if (hasEvent('KnowledgeAssetsMinted')) {
+            const mintFilter = kaStorage.filters.KnowledgeAssetsMinted();
+            const mintLogs = await kaStorage.queryFilter(mintFilter, fromB, toB);
+            for (const ml of mintLogs) {
+              const mp = kaStorage.interface.parseLog({ topics: [...ml.topics], data: ml.data });
+              if (mp) {
+                mintByTx.set(ml.transactionHash, {
+                  publisherAddress: mp.args.to,
+                  startKAId: mp.args.startId.toString(),
+                  endKAId: (BigInt(mp.args.endId) - 1n).toString(),
+                });
+              }
+            }
+          }
+
+          // Greenfield publisher resolution: `_safeMint(author, kaId)` emits a
+          // single ERC-721 mint `Transfer(address(0), owner, tokenId)`. The
+          // token owner is the publisher/recipient of record (mirrors the
+          // receipt-parse path). Keyed by tokenId so each KnowledgeAssetCreated
+          // id resolves its own owner.
+          const ownerByTokenId = new Map<string, string>();
+          if (isGreenfield) {
+            try {
+              const transferFilter = kaStorage.filters.Transfer(ethers.ZeroAddress);
+              const transferLogs = await kaStorage.queryFilter(transferFilter, fromB, toB);
+              for (const tl of transferLogs) {
+                const tp = kaStorage.interface.parseLog({ topics: [...tl.topics], data: tl.data });
+                if (tp && tp.args.tokenId != null) {
+                  ownerByTokenId.set(tp.args.tokenId.toString(), String(tp.args.to));
+                }
+              }
+            } catch {
+              // Best-effort — the `author` topic on the create event is the
+              // fallback when Transfer enumeration is unavailable.
             }
           }
 
           for (const log of kcLogs) {
-            const parsed = kcStorage.interface.parseLog({ topics: [...log.topics], data: log.data });
+            const parsed = kaStorage.interface.parseLog({ topics: [...log.topics], data: log.data });
             if (parsed) {
               const mint = mintByTx.get(log.transactionHash);
+              const idStr = parsed.args.id.toString();
               // V10.1: `author` is the EIP-712-attested author identity recovered
               // by `_verifyAuthorAttestation` on-chain (or `address(0)` for the
               // unattributed publish path). Surfacing it here lets replicas
               // rebuild `dkg:Publication` / `dkg:authoredBy` provenance triples
               // that match what the originating publisher emitted in
               // `generateKCMetadata` (Round 5 review §10).
+              const author = typeof parsed.args.author === 'string' ? parsed.args.author : '';
               yield {
                 type: 'KCCreated',
                 blockNumber: log.blockNumber,
                 data: {
-                  kcId: parsed.args.id.toString(),
+                  kaId: idStr,
                   merkleRoot: parsed.args.merkleRoot,
                   merkleRootBytes: parsed.args.merkleRoot,
                   byteSize: parsed.args.byteSize.toString(),
                   txHash: log.transactionHash,
-                  publisherAddress: mint?.publisherAddress ?? '',
-                  author: typeof parsed.args.author === 'string' ? parsed.args.author : '',
-                  startKAId: mint?.startKAId ?? '0',
-                  endKAId: mint?.endKAId ?? '0',
+                  // PR #845 (review #9): chain-truth tiebreaker for the
+                  // last-writer-wins materialization guard. The receiver's
+                  // finalization handler must derive its version from the
+                  // verified receipt, NOT a gossip-supplied `msg.txIndex`,
+                  // because the latter is trust-based and can be inflated
+                  // to lock out a legitimate same-block update.
+                  txIndex: log.transactionIndex,
+                  // Greenfield: no batch mint → publisher is the KA owner
+                  // (Transfer recipient), falling back to the attested author.
+                  publisherAddress: mint?.publisherAddress ?? ownerByTokenId.get(idStr) ?? author,
+                  author,
+                  // Greenfield: single KA, range collapses to [id, id].
+                  startKAId: mint?.startKAId ?? idStr,
+                  endKAId: mint?.endKAId ?? idStr,
                 },
               };
             }
@@ -1297,8 +2294,13 @@ export class EVMChainAdapter implements ChainAdapter {
     }
     const accessPolicy = params.accessPolicy ?? 0;
     const nameHash = ethers.keccak256(ethers.toUtf8Bytes(name));
-    const tx = await registry.claimName(nameHash, accessPolicy);
-    const receipt = await tx.wait();
+    const receipt = await this.sendContractTransaction(
+      registry,
+      'claimName',
+      [nameHash, accessPolicy],
+      this.signer,
+      'claim context graph name',
+    );
     if (!receipt) throw new Error('createContextGraph: no receipt');
     let contextGraphIdHex: string | undefined;
     for (const log of receipt.logs) {
@@ -1320,6 +2322,7 @@ export class EVMChainAdapter implements ChainAdapter {
     return {
       hash: receipt.hash,
       blockNumber: receipt.blockNumber,
+      txIndex: receipt.index,
       success: true,
       contextGraphId: contextGraphIdHex ?? nameHash,
     };
@@ -1333,10 +2336,15 @@ export class EVMChainAdapter implements ChainAdapter {
     await this.init();
     const registry = this.contracts.contextGraphNameRegistry;
     if (!registry) throw new Error('revealContextGraphMetadata: ContextGraphNameRegistry not available');
-    const tx = await registry.revealMetadata(contextGraphId, name, description);
-    const receipt = await tx.wait();
+    const receipt = await this.sendContractTransaction(
+      registry,
+      'revealMetadata',
+      [contextGraphId, name, description],
+      this.signer,
+      'reveal context graph metadata',
+    );
     if (!receipt) throw new Error('revealContextGraphMetadata: no receipt');
-    return { hash: receipt.hash, blockNumber: receipt.blockNumber, success: true };
+    return { hash: receipt.hash, blockNumber: receipt.blockNumber, txIndex: receipt.index, success: true };
   }
 
   async listContextGraphsFromChain(fromBlock?: number): Promise<ContextGraphOnChain[]> {
@@ -1373,6 +2381,17 @@ export class EVMChainAdapter implements ChainAdapter {
   // On-Chain Context Graphs (ContextGraphs contract)
   // =====================================================================
 
+  /** True when `contextGraphId` is an active minted CG in ContextGraphStorage. */
+  async isContextGraphActiveOnChain(contextGraphId: bigint): Promise<boolean> {
+    await this.init();
+    if (!this.contracts.contextGraphStorage) return false;
+    try {
+      return Boolean(await this.contracts.contextGraphStorage.isContextGraphActive(contextGraphId));
+    } catch {
+      return false;
+    }
+  }
+
   async createOnChainContextGraph(params: CreateOnChainContextGraphParams): Promise<CreateOnChainContextGraphResult> {
     await this.init();
     if (!this.contracts.contextGraphs || !this.contracts.contextGraphStorage) {
@@ -1385,20 +2404,25 @@ export class EVMChainAdapter implements ChainAdapter {
         'Pass both explicitly — e.g. { accessPolicy: 1, publishPolicy: 0 } for invite-only + curators-only.',
       );
     }
-    const tx = await this.contracts.contextGraphs.createContextGraph(
-      params.participantAgents ?? [],
-      params.metadataBatchId ?? 0n,
-      params.accessPolicy,
-      params.publishPolicy,
-      params.publishAuthority ?? ethers.ZeroAddress,
-      params.publishAuthorityAccountId ?? 0n,
-      // OT-RFC-38 / LU-6 Phase B — opt-in wire-id commitment. Default
-      // `bytes32(0)` opts out; the agent supplies a non-zero hash
-      // (typically `keccak256(bytes(cleartextId))`) to enable cores'
-      // chain-event-driven host-mode auto-subscribe path.
-      params.nameHash ?? ethers.ZeroHash,
+    const receipt = await this.sendContractTransaction(
+      this.contracts.contextGraphs,
+      'createContextGraph',
+      [
+        params.participantAgents ?? [],
+        params.metadataBatchId ?? 0n,
+        params.accessPolicy,
+        params.publishPolicy,
+        params.publishAuthority ?? ethers.ZeroAddress,
+        params.publishAuthorityAccountId ?? 0n,
+        // OT-RFC-38 / LU-6 Phase B — opt-in wire-id commitment. Default
+        // `bytes32(0)` opts out; the agent supplies a non-zero hash
+        // (typically `keccak256(bytes(cleartextId))`) to enable cores'
+        // chain-event-driven host-mode auto-subscribe path.
+        params.nameHash ?? ethers.ZeroHash,
+      ],
+      this.signer,
+      'create on-chain context graph',
     );
-    const receipt = await tx.wait();
 
     let contextGraphId: bigint | undefined;
     for (const log of receipt.logs) {
@@ -1418,6 +2442,7 @@ export class EVMChainAdapter implements ChainAdapter {
       return {
         hash: receipt.hash,
         blockNumber: receipt.blockNumber,
+        txIndex: receipt.index,
         success: false,
         contextGraphId: 0n,
       };
@@ -1426,6 +2451,7 @@ export class EVMChainAdapter implements ChainAdapter {
     return {
       hash: receipt.hash,
       blockNumber: receipt.blockNumber,
+      txIndex: receipt.index,
       success: receipt.status === 1,
       contextGraphId,
     };
@@ -1437,15 +2463,18 @@ export class EVMChainAdapter implements ChainAdapter {
       throw new Error('ContextGraphs contract not deployed.');
     }
 
-    const tx = await this.contracts.contextGraphs.registerKnowledgeCollection(
-      params.contextGraphId,
-      params.batchId,
+    const receipt = await this.sendContractTransaction(
+      this.contracts.contextGraphs,
+      'registerKnowledgeAsset',
+      [params.contextGraphId, params.batchId],
+      this.signer,
+      'register knowledge collection',
     );
-    const receipt = await tx.wait();
 
     return {
       hash: receipt.hash,
       blockNumber: receipt.blockNumber,
+      txIndex: receipt.index,
       success: receipt.status === 1,
     };
   }
@@ -1474,8 +2503,13 @@ export class EVMChainAdapter implements ChainAdapter {
       const token = this.contracts.token.connect(signer) as Contract;
       const currentAllowance: bigint = await token.allowance(signer.address, kaAddress);
       if (currentAllowance < params.tokenAmount) {
-        const approveTx = await token.approve(kaAddress, ethers.MaxUint256);
-        await approveTx.wait();
+        await this.sendContractTransaction(
+          token,
+          'approve',
+          [kaAddress, ethers.MaxUint256],
+          signer,
+          'approve context graph publish TRAC',
+        );
       }
     }
 
@@ -1527,7 +2561,7 @@ export class EVMChainAdapter implements ChainAdapter {
     // wallet that signed the V9 publisher digest above, so attribution
     // stays consistent across the legacy/canonical pair.
     const v10ChainId = (await this.provider.getNetwork()).chainId;
-    const v10KavAddress = await this.contracts.knowledgeAssetsV10!.getAddress();
+    const v10KavAddress = await this.contracts.knowledgeAssetsLifecycle!.getAddress();
     const authorTypedData = buildAuthorAttestationTypedData({
       chainId: v10ChainId,
       kav10Address: v10KavAddress,
@@ -1543,7 +2577,7 @@ export class EVMChainAdapter implements ChainAdapter {
       ),
     );
 
-    return this.createKnowledgeAssetsV10({
+    return this.createKnowledgeAssets({
       publishOperationId: ethers.hexlify(ethers.randomBytes(32)),
       contextGraphId: params.contextGraphId,
       merkleRoot: params.merkleRoot,
@@ -1570,10 +2604,10 @@ export class EVMChainAdapter implements ChainAdapter {
     await this.init();
 
     try {
-      const receipt = await this.provider.getTransactionReceipt(txHash);
+      const receipt = await this.getTransactionReceiptWithFailover(txHash);
       if (!receipt || receipt.status !== 1) return null;
 
-      const v10 = this.contracts.knowledgeCollectionStorage
+      const v10 = this.contracts.knowledgeAssetStorage
         ? await this.parseV10PublishReceipt(receipt)
         : null;
       if (v10) return v10;
@@ -1592,19 +2626,46 @@ export class EVMChainAdapter implements ChainAdapter {
   }
 
   // =====================================================================
-  // V10 Publish (KnowledgeAssetsV10 → KnowledgeCollectionStorage)
+  // V10 Publish (KnowledgeAssetsLifecycle → DKGKnowledgeAssets)
   // =====================================================================
 
-  async getKnowledgeAssetsV10Address(): Promise<string> {
-    await this.init();
-    if (!this.contracts.knowledgeAssetsV10) {
-      throw new Error('KnowledgeAssetsV10 contract not deployed on this chain.');
+  async getDKGKnowledgeAssetsAddress(): Promise<string> {
+    if (!this.contracts.knowledgeAssetStorage) {
+      throw new Error('DKGKnowledgeAssets / DKGKnowledgeAssets not deployed on this chain.');
     }
-    return await this.contracts.knowledgeAssetsV10.getAddress();
+    return this.contracts.knowledgeAssetStorage.target as string;
+  }
+
+  async getKnowledgeAssetsLifecycleAddress(): Promise<string> {
+    // PR3 / RC11: TTL-cached. KAV10 address only changes on a contract
+    // redeploy + Hub-rotation event; 1h staleness is harmless and the
+    // ACK digest mismatch the contract would surface on actually-stale
+    // input is loud enough that operators would notice immediately.
+    const now = Date.now();
+    if (EVMChainAdapter.preflightCacheFresh(this.cachedKav10Address, now)) {
+      return this.cachedKav10Address!.value;
+    }
+    await this.init();
+    if (!this.contracts.knowledgeAssetsLifecycle) {
+      throw new Error('KnowledgeAssetsLifecycle / KnowledgeAssetsLifecycle contract not deployed on this chain.');
+    }
+    const addr = await this.contracts.knowledgeAssetsLifecycle.getAddress();
+    this.cachedKav10Address = { value: addr, cachedAt: now };
+    return addr;
   }
 
   async getEvmChainId(): Promise<bigint> {
+    // PR3 / RC11: TTL-cached so an `eth_chainId` rate-limit on the
+    // public RPC (the dzudza failure mode) cannot kill steady-state
+    // publish traffic. Chain id is structurally immutable for a given
+    // provider — once we've read it successfully we know it can't
+    // change without a daemon restart.
+    const now = Date.now();
+    if (EVMChainAdapter.preflightCacheFresh(this.cachedChainId, now)) {
+      return this.cachedChainId!.value;
+    }
     const network = await this.provider.getNetwork();
+    this.cachedChainId = { value: network.chainId, cachedAt: now };
     return network.chainId;
   }
 
@@ -1627,15 +2688,15 @@ export class EVMChainAdapter implements ChainAdapter {
     }
   }
 
-  async createKnowledgeAssetsV10(params: V10PublishParams): Promise<OnChainPublishResult> {
+  async createKnowledgeAssets(params: V10PublishParams): Promise<OnChainPublishResult> {
     await this.init();
 
-    if (!this.contracts.knowledgeAssetsV10) {
-      throw new Error('KnowledgeAssetsV10 contract not deployed.');
+    if (!this.contracts.knowledgeAssetsLifecycle) {
+      throw new Error('KnowledgeAssetsLifecycle / KnowledgeAssetsLifecycle contract not deployed.');
     }
 
     // Pre-tx validation of `contextGraphId`. The V10 contract rejects
-    // `cgId == 0` at `KnowledgeAssetsV10.sol:379` with `ZeroContextGraphId`;
+    // `cgId == 0` at `KnowledgeAssetsLifecycle.sol:379` with `ZeroContextGraphId`;
     // catching this here gives a clearer error than a generic revert and
     // saves a round-trip. Reject `<= 0n` rather than `=== 0n` so that
     // `BigInt("-1") === -1n` does not slip past our fail-loud boundary and
@@ -1677,31 +2738,38 @@ export class EVMChainAdapter implements ChainAdapter {
     } else {
       txSigner = await this.nextAuthorizedSigner(params.contextGraphId);
     }
-    const ka = this.contracts.knowledgeAssetsV10.connect(txSigner) as Contract;
+    const ka = this.contracts.knowledgeAssetsLifecycle.connect(txSigner) as Contract;
     const kaAddress = await ka.getAddress();
 
-    // Approval policy: always approve TRAC from the operational signer.
-    //
-    // RFC-001 unified `publish`/`publishDirect` (KnowledgeAssetsV10.sol):
-    // the contract auto-detects PCA discount via
-    // `agentToAccountId[msg.sender] != 0` and falls through to
+    // Approval policy: always ensure the operational signer has the
+    // allowance required by the configured `chain.approvalPolicy` for
+    // this `tokenAmount`. RFC-001 unified `publish`/`publishDirect`
+    // (KnowledgeAssetsLifecycle.sol): the contract auto-detects PCA discount
+    // via `agentToAccountId[msg.sender] != 0` and falls through to
     // `token.transferFrom(msg.sender, CSS, fullCost)` for the
     // direct-spend branch. A redundant allowance is cheap and idle when
-    // the PCA branch covers the cost, so we always approve up to
-    // `tokenAmount` for the direct-spend ceiling.
-    if (this.contracts.token) {
-      const tokenWithSigner = this.contracts.token.connect(txSigner) as Contract;
-      const currentAllowance = await tokenWithSigner.allowance(txSigner.address, kaAddress);
-      if (currentAllowance < params.tokenAmount) {
-        const approveTx = await tokenWithSigner.approve(kaAddress, params.tokenAmount);
-        await approveTx.wait();
-      }
-    }
+    // the PCA branch covers the cost. Helper handles the
+    // `tokenAmount === 0n` floor (`transferFrom(..., 1n)` minimum), the
+    // bounded-per-publish vs replenishing vs unlimited dispatch, and the
+    // `this.contracts.token === undefined` no-op for read-only adapters.
+    await this.ensureV10ApproveTrac(
+      txSigner,
+      kaAddress,
+      params.tokenAmount,
+      'approve V10 publish TRAC',
+    );
 
     // Build the on-chain PublishParams struct matching the field order +
-    // types in `KnowledgeAssetsV10.sol` (RFC-001 author-attestation
+    // types in `KnowledgeAssetsLifecycle.sol` (RFC-001 author-attestation
     // shape). ethers v6 encodes object literals to solidity structs
     // positionally by field name.
+    // KAV10 10.1.1 strict-positive `tokenAmount` floor: the contract now
+    // reverts on `tokenAmount == 0`. Free-publish flows (devnets where
+    // `ask == 0`) used to round to 1 wei-TRAC silently inside the
+    // direct-spend branch; clamp here so they keep working. Matches the
+    // same floor inside `computePublishACKDigest`, so the on-chain ACK
+    // recovery hashes the same `tokenAmount` the contract receives.
+    const flooredTokenAmount = floorPublishTokenAmount(params.tokenAmount);
     const publishParamsStruct = {
       publishOperationId: params.publishOperationId,
       contextGraphId: params.contextGraphId,
@@ -1709,16 +2777,40 @@ export class EVMChainAdapter implements ChainAdapter {
       knowledgeAssetsAmount: params.knowledgeAssetsAmount,
       byteSize: params.byteSize,
       epochs: params.epochs,
-      tokenAmount: params.tokenAmount,
+      tokenAmount: flooredTokenAmount,
       isImmutable: params.isImmutable,
       merkleLeafCount: params.merkleLeafCount,
-      // RFC-39 Phase A.5 — ciphertext-commitment pair. Defaults to
-      // `bytes32(0)` / 0 (legacy/transitional, picker skips this KC in
-      // the curated draw). Callers that have an LU-11 commitment set
-      // both via `ciphertextChunksRoot` + `ciphertextChunkCount`.
-      ciphertextChunksRoot: params.ciphertextChunksRoot
-        ? ethers.hexlify(params.ciphertextChunksRoot)
-        : ethers.ZeroHash,
+      // RFC-39 Phase A.5 / LU-11 — ciphertext-commitment pair.
+      //
+      // The two fields MUST be set together or omitted together.
+      // - Both omitted (or root=ZeroHash + count=0) = legacy /
+      //   public-KC path: picker skips this KC in the curated draw
+      //   today (commit 8 baseline) and RFC-39 random sampling never
+      //   indexes it; safe wire-compatible default for non-chunked
+      //   callers.
+      // - Both set = LU-11 chunked publish: cores already hold the
+      //   matching per-chunk ciphertexts under
+      //   urn:dkg:swm:v10-publish-ciphertext-chunk/<batchId>/<i> and
+      //   recomputed the same root before signing the V2 ACK.
+      // Anything else is a programmer error — fail loud instead of
+      // silently defaulting one side and producing an asymmetric
+      // commitment that on-chain `_pickWeightedChallenge` would
+      // skip (count=0) or that core-side V2 verifiers would never
+      // try to satisfy (root=ZeroHash but count>0).
+      ciphertextChunksRoot: (() => {
+        const haveRoot = !!params.ciphertextChunksRoot && params.ciphertextChunksRoot.length === 32;
+        const haveCount = typeof params.ciphertextChunkCount === 'number' && params.ciphertextChunkCount > 0;
+        if (haveRoot !== haveCount) {
+          throw new Error(
+            `evm-adapter.createKnowledgeAssets: ciphertextChunksRoot and ciphertextChunkCount ` +
+            `must both be set or both omitted; got root=${haveRoot ? 'set' : 'unset'}, ` +
+            `count=${haveCount ? params.ciphertextChunkCount : 'unset'}. ` +
+            `An asymmetric pair would leave RandomSampling._pickWeightedChallenge unable to ` +
+            `verify the curated draw against off-chain ciphertext storage.`,
+          );
+        }
+        return haveRoot ? ethers.hexlify(params.ciphertextChunksRoot!) : ethers.ZeroHash;
+      })(),
       ciphertextChunkCount: params.ciphertextChunkCount ?? 0,
       publisherNodeIdentityId: params.publisherNodeIdentityId,
       authorAddress: params.author.address,
@@ -1751,12 +2843,10 @@ export class EVMChainAdapter implements ChainAdapter {
     const populated = await (ka as any).publish.populateTransaction(
       publishParamsStruct,
     );
-    const filled = await txSigner.populateTransaction(populated);
-    const signedTx = await txSigner.signTransaction(filled);
+    const { signedTx, txHash: preBroadcastTxHash } = await this.signPopulatedTransaction(txSigner, populated);
     // Derive the pre-broadcast tx hash from the signed raw hex so WAL
     // consumers can log the exact identity of the tx about to hit the
     // wire. After broadcast completes, the receipt hash matches this.
-    const preBroadcastTxHash = ethers.Transaction.from(signedTx).hash ?? '0x';
     // Codex PR #241 iter-7: `await` the hook. `onBroadcast` is typed
     // as `Promise<void> | void`, so an async WAL writer (disk flush,
     // remote gossip) must run to completion BEFORE we proceed to
@@ -1774,71 +2864,68 @@ export class EVMChainAdapter implements ChainAdapter {
         `${hookErr instanceof Error ? hookErr.message : String(hookErr)}`,
       );
     }
-    const tx = await this.provider.broadcastTransaction(signedTx);
-
-    const receipt = await tx.wait();
+    const receipt = await this.sendSignedTransactionAndWait(signedTx, preBroadcastTxHash, 'V10 publish');
     if (!receipt) throw new Error('Transaction receipt is null');
 
-    let kcId = 0n;
+    let kaId = 0n;
     let startKAId = 0n;
     let endKAId = 0n;
     let publisherAddress = txSigner.address;
     let authorAddress: string | undefined;
-    const kcs = this.contracts.knowledgeCollectionStorage;
-    if (!kcs) {
+    const kas = this.contracts.knowledgeAssetStorage;
+    if (!kas) {
       throw new Error(
-        `V10 publish tx ${receipt.hash} succeeded but KnowledgeCollectionStorage ` +
+        `V10 publish tx ${receipt.hash} succeeded but DKGKnowledgeAssets ` +
         `contract is not available — cannot parse minted IDs from receipt`,
       );
     }
+    const storageAddress = String(kas.target).toLowerCase();
     {
-      let foundKCCreated = false;
-      let foundKAMinted = false;
+      let foundCreated = false;
+      let foundLegacyMint = false;
       for (const log of receipt.logs) {
+        const logAddr = typeof log.address === 'string' ? log.address.toLowerCase() : '';
+        if (logAddr !== storageAddress) continue;
         try {
-          const parsed = kcs.interface.parseLog({ topics: [...log.topics], data: log.data });
-          if (parsed?.name === 'KnowledgeCollectionCreated') {
-            kcId = BigInt(parsed.args.id);
-            // V10.1: indexed `author` on KnowledgeCollectionCreated is the
-            // chain-confirmed author identity (post EIP-712 verification or
-            // EIP-1271 magic-value check). Carry it back so downstream
-            // metadata writers can pin `dkg:authoredBy` to chain truth
-            // rather than the local signer.
+          const parsed = kas.interface.parseLog({ topics: [...log.topics], data: log.data });
+          if (parsed?.name === 'KnowledgeAssetCreated' || parsed?.name === 'KnowledgeAssetCreated') {
+            kaId = BigInt(parsed.args.id);
             authorAddress = String(parsed.args.author);
-            foundKCCreated = true;
+            startKAId = kaId;
+            endKAId = kaId;
+            foundCreated = true;
           }
           if (parsed?.name === 'KnowledgeAssetsMinted') {
             startKAId = BigInt(parsed.args.startId);
-            // KnowledgeCollectionStorage emits exclusive endId (startId + amount);
-            // convert to inclusive for consistent UAL range representation.
             endKAId = BigInt(parsed.args.endId) - 1n;
             publisherAddress = parsed.args.to;
-            foundKAMinted = true;
+            foundLegacyMint = true;
           }
         } catch { /* not this contract */ }
       }
-      if (!foundKCCreated) {
+      if (!foundCreated) {
         throw new Error(
-          `V10 publish tx ${receipt.hash} succeeded but KnowledgeCollectionCreated event ` +
-          `not found in receipt logs — contract ABI may be stale`,
+          `V10 publish tx ${receipt.hash} succeeded but KnowledgeAssetCreated / ` +
+          `KnowledgeAssetCreated event not found in receipt logs — contract ABI may be stale`,
         );
       }
-      if (!foundKAMinted) {
-        throw new Error(
-          `V10 publish tx ${receipt.hash} succeeded but KnowledgeAssetsMinted event ` +
-          `not found in receipt logs — contract ABI may be stale`,
-        );
+      if (!foundLegacyMint && startKAId === 0n) {
+        startKAId = kaId;
+        endKAId = kaId;
       }
     }
 
     const blockTimestamp = await this.getBlockTimestamp(receipt.blockNumber);
 
     return {
-      batchId: kcId,
+      batchId: kaId,
+      kaId: kaId,
+      knowledgeAssetsContract: storageAddress,
       startKAId,
       endKAId,
       txHash: receipt.hash,
       blockNumber: receipt.blockNumber,
+      txIndex: receipt.index,
       blockTimestamp,
       publisherAddress,
       authorAddress,
@@ -1852,46 +2939,56 @@ export class EVMChainAdapter implements ChainAdapter {
   private async parseV10PublishReceipt(
     receipt: NonNullable<Awaited<ReturnType<typeof this.provider.getTransactionReceipt>>>,
   ): Promise<OnChainPublishResult | null> {
-    const kcs = this.contracts.knowledgeCollectionStorage;
-    if (!kcs) return null;
+    const kas = this.contracts.knowledgeAssetStorage;
+    if (!kas) return null;
 
-    let kcId = 0n;
+    let kaId = 0n;
     let startKAId = 0n;
     let endKAId = 0n;
     let publisherAddress = '';
     let authorAddress: string | undefined;
-    let foundKCCreated = false;
-    let foundKAMinted = false;
+    let foundCreated = false;
+    const storageAddress = String(kas.target).toLowerCase();
 
     for (const log of receipt.logs) {
+      const logAddr = typeof log.address === 'string' ? log.address.toLowerCase() : '';
+      if (logAddr !== storageAddress) continue;
       try {
-        const parsed = kcs.interface.parseLog({ topics: [...log.topics], data: log.data });
-        if (parsed?.name === 'KnowledgeCollectionCreated') {
-          kcId = BigInt(parsed.args.id);
+        const parsed = kas.interface.parseLog({ topics: [...log.topics], data: log.data });
+        if (parsed?.name === 'KnowledgeAssetCreated' || parsed?.name === 'KnowledgeAssetCreated') {
+          kaId = BigInt(parsed.args.id);
           authorAddress = String(parsed.args.author);
-          foundKCCreated = true;
+          startKAId = kaId;
+          endKAId = kaId;
+          foundCreated = true;
         }
         if (parsed?.name === 'KnowledgeAssetsMinted') {
           startKAId = BigInt(parsed.args.startId);
           endKAId = BigInt(parsed.args.endId) - 1n;
           publisherAddress = parsed.args.to;
-          foundKAMinted = true;
         }
       } catch {
         // ignore unrelated logs
       }
     }
 
-    if (!foundKCCreated || !foundKAMinted) return null;
+    if (!foundCreated) return null;
+
+    if (!publisherAddress) {
+      publisherAddress = receipt.from ?? authorAddress ?? '';
+    }
 
     const blockTimestamp = await this.getBlockTimestamp(receipt.blockNumber);
 
     return {
-      batchId: kcId,
+      batchId: kaId,
+      kaId: kaId,
+      knowledgeAssetsContract: String(kas.target),
       startKAId,
       endKAId,
       txHash: receipt.hash,
       blockNumber: receipt.blockNumber,
+      txIndex: receipt.index,
       blockTimestamp,
       publisherAddress,
       authorAddress,
@@ -1937,29 +3034,215 @@ export class EVMChainAdapter implements ChainAdapter {
       endKAId,
       txHash: receipt.hash,
       blockNumber: receipt.blockNumber,
+      txIndex: receipt.index,
       blockTimestamp,
       publisherAddress,
     };
   }
 
   // =====================================================================
-  // V10 Update (KnowledgeAssetsV10 → KnowledgeCollectionStorage)
+  // V10 Update (KnowledgeAssetsLifecycle → DKGKnowledgeAssets)
   // =====================================================================
 
-  async updateKnowledgeCollectionV10(params: V10UpdateKCParams): Promise<TxResult> {
+  /**
+   * Compute the `newTokenAmount` to submit (and bind into the ACK digest)
+   * for a V10 update, matching the contract's growth-cost validator.
+   *
+   * The contract gate (`KnowledgeAssetsLifecycle._executeUpdateCore` §"Byte-size
+   * growth cost check") only fires when `newByteSize > currentByteSize`, and
+   * then requires `deltaTokenAmount = newTokenAmount - currentTokenAmount`
+   * to be:
+   *   1) strictly positive (`tokenAmount == 0` floors `_validateTokenAmount`),
+   *   2) at least `(ask * byteSizeGrowth * remainingEpochs) / 1024`.
+   *
+   * Pre-#831 the daemon carried `newTokenAmount = currentTokenAmount`, so any
+   * growth update produced `deltaTokenAmount = 0` and reverted with
+   * `InvalidTokenAmount(1, 0)`. We now pay the exact marginal growth cost so
+   * the contract's expected-cost branch is satisfied without overshooting.
+   *
+   * Pure metadata updates (`newByteSize <= currentByteSize`) skip the
+   * validator entirely — the carry-forward `currentTokenAmount` is returned
+   * unchanged and `deltaTokenAmount == 0` is accepted.
+   *
+   * MUST be called from BOTH `computeV10UpdateAckDigest` and
+   * `updateKnowledgeCollectionV10` so the off-chain signed ACK and the
+   * on-chain submission see the same `newTokenAmount`.
+   */
+  private async resolveCurrentTokenAmount(kaId: bigint): Promise<bigint> {
+    const kas = this.contracts.knowledgeAssetStorage;
+    if (!kas) return 0n;
+    try {
+      return BigInt(await kas.getTokenAmount(kaId));
+    } catch {
+      // KA not yet in storage (would fail later on-chain anyway) — return 0.
+      return 0n;
+    }
+  }
+
+  private async computeUpdateNewTokenAmount(params: {
+    kaId: bigint;
+    newByteSize: bigint;
+    currentTokenAmount: bigint;
+    userProvidedNewTokenAmount?: bigint;
+  }): Promise<bigint> {
+    const kas = this.contracts.knowledgeAssetStorage;
+    let currentByteSize = 0n;
+    let endEpoch = 0n;
+    if (kas) {
+      try {
+        const ctx = await kas.getKnowledgeAssetUpdateContext(params.kaId);
+        // Tuple shape from `DKGKnowledgeAssets.getKnowledgeAssetUpdateContext`:
+        // (preUpdateMerkleRootCount, minted, byteSize, endEpoch, tokenAmount, isImmutable, preUpdateMerkleLeafCount)
+        currentByteSize = BigInt(ctx[2]);
+        endEpoch = BigInt(ctx[3]);
+      } catch (err) {
+        throw new Error(
+          `Failed to read KA update context for kaId ${params.kaId}: ${(err as Error).message}`,
+        );
+      }
+    }
+
+    let currentEpoch = 0n;
+    const needsGrowthSizing = params.newByteSize > currentByteSize;
+    if (needsGrowthSizing && !this.contracts.chronos) {
+      throw new Error(
+        'Chronos contract binding required for byte-size growth update tokenAmount sizing',
+      );
+    }
+    if (this.contracts.chronos) {
+      try {
+        currentEpoch = BigInt(await this.contracts.chronos.getCurrentEpoch());
+      } catch (err) {
+        throw new Error(
+          `Failed to read Chronos currentEpoch for update tokenAmount sizing: ${(err as Error).message}`,
+        );
+      }
+    }
+    const remainingEpochs = endEpoch > currentEpoch ? endEpoch - currentEpoch : 0n;
+
+    let growthCost = 0n;
+    if (params.newByteSize > currentByteSize && this.contracts.askStorage) {
+      try {
+        const ask = BigInt(await this.contracts.askStorage.getStakeWeightedAverageAsk());
+        const byteSizeGrowth = params.newByteSize - currentByteSize;
+        if (remainingEpochs > 0n) {
+          growthCost = (ask * byteSizeGrowth * remainingEpochs) / 1024n;
+        } else {
+          // Final epoch: remainingEpochs==0 but byte-size growth still needs a
+          // strict-positive delta (contract rejects deltaTokenAmount==0).
+          growthCost = 1n;
+        }
+        if (growthCost === 0n) growthCost = 1n;
+      } catch (err) {
+        throw new Error(
+          `Failed to read askStorage for byte-size growth costing: ${(err as Error).message}`,
+        );
+      }
+    }
+
+    const minimumTokenAmount = params.currentTokenAmount + growthCost;
+    const baseTokenAmount = params.userProvidedNewTokenAmount ?? minimumTokenAmount;
+    const raw = baseTokenAmount > minimumTokenAmount ? baseTokenAmount : minimumTokenAmount;
+    // Match computeUpdateACKDigest()'s floorPublishTokenAmount so ACK signatures
+    // and the on-chain submission bind the same newTokenAmount wire value.
+    return floorPublishTokenAmount(raw);
+  }
+
+  /**
+   * Canonical V10 update ACK digest — mirrors `KnowledgeAssetsLifecycle`
+   * `_executeUpdateCore` and the values `updateKnowledgeCollectionV10`
+   * submits on-chain. Test helpers and ACK collectors should call this
+   * instead of re-deriving inputs so signatures recover to the expected
+   * operational keys.
+   */
+  async computeV10UpdateAckDigest(params: {
+    kaId: bigint;
+    newMerkleRoot: Uint8Array;
+    newByteSize: bigint;
+    newMerkleLeafCount: number;
+    mintAmount?: bigint;
+    burnTokenIds?: bigint[];
+    newTokenAmount?: bigint;
+    /** When set, skip live re-derivation (binds ACK digest to tx submission). */
+    boundNewTokenAmount?: bigint;
+    newCiphertextChunksRoot?: Uint8Array;
+    newCiphertextChunkCount?: number;
+  }): Promise<Uint8Array> {
+    await this.init();
+    if (!this.contracts.knowledgeAssetsLifecycle) {
+      throw new Error('KnowledgeAssetsLifecycle contract not deployed');
+    }
+
+    const kas = this.contracts.knowledgeAssetStorage;
+    const kav10Address = await this.contracts.knowledgeAssetsLifecycle.getAddress();
+    const evmChainId = BigInt((await this.provider.getNetwork()).chainId);
+
+    const currentTokenAmount = await this.resolveCurrentTokenAmount(params.kaId);
+
+    // #831: size `newTokenAmount` against the contract's growth-cost validator
+    // (matches `KnowledgeAssetsLifecycle._validateTokenAmount` exactly). The
+    // floor that lived here is now redundant — `computeUpdateNewTokenAmount`
+    // returns `currentTokenAmount + growthCost` (with growthCost == 0 for
+    // pure metadata updates), which is always >= 1 on a V10 chain.
+    const newTokenAmount = params.boundNewTokenAmount ?? await this.computeUpdateNewTokenAmount({
+      kaId: params.kaId,
+      newByteSize: params.newByteSize,
+      currentTokenAmount,
+      userProvidedNewTokenAmount: params.newTokenAmount,
+    });
+
+    let contextGraphId = 0n;
+    if (this.contracts.contextGraphStorage) {
+      try {
+        contextGraphId = BigInt(
+          await this.contracts.contextGraphStorage.kaToContextGraph(params.kaId),
+        );
+      } catch { /* use 0 */ }
+    }
+
+    let preUpdateMerkleRootCount = 0n;
+    if (kas) {
+      try {
+        const roots: unknown[] = await kas.getMerkleRoots(params.kaId);
+        preUpdateMerkleRootCount = BigInt(roots.length);
+      } catch { /* use 0 */ }
+    }
+
+    const burnIds = params.burnTokenIds ?? [];
+    const ciphertextRoot = params.newCiphertextChunksRoot ?? new Uint8Array(32);
+    const ciphertextCount = BigInt(params.newCiphertextChunkCount ?? 0);
+
+    return computeUpdateACKDigest(
+      evmChainId,
+      kav10Address,
+      contextGraphId,
+      params.kaId,
+      preUpdateMerkleRootCount,
+      params.newMerkleRoot,
+      params.newByteSize,
+      newTokenAmount,
+      params.mintAmount ?? 0n,
+      burnIds,
+      BigInt(params.newMerkleLeafCount),
+      ciphertextRoot,
+      ciphertextCount,
+    );
+  }
+
+  async updateKnowledgeCollectionV10(params: V10UpdateKAParams): Promise<TxResult> {
     await this.init();
 
-    if (!this.contracts.knowledgeAssetsV10) {
-      throw new Error('KnowledgeAssetsV10 contract not deployed — cannot update via V10 path.');
+    if (!this.contracts.knowledgeAssetsLifecycle) {
+      throw new Error('KnowledgeAssetsLifecycle contract not deployed — cannot update via V10 path.');
     }
 
     let signer: Wallet | undefined;
 
     // Look up the on-chain publisher to select the correct signer.
-    const kcs = this.contracts.knowledgeCollectionStorage;
-    if (kcs) {
+    const kas = this.contracts.knowledgeAssetStorage;
+    if (kas) {
       try {
-        const onChainPublisher: string = await kcs.getLatestMerkleRootPublisher(params.kcId);
+        const onChainPublisher: string = await kas.getLatestMerkleRootPublisher(params.kaId);
         if (onChainPublisher && onChainPublisher !== ethers.ZeroAddress) {
           signer = this.signerPool.find(
             (s) => s.address.toLowerCase() === onChainPublisher.toLowerCase(),
@@ -1977,58 +3260,56 @@ export class EVMChainAdapter implements ChainAdapter {
     }
     if (!signer) signer = this.nextSigner();
 
-    const ka = this.contracts.knowledgeAssetsV10.connect(signer) as Contract;
+    const ka = this.contracts.knowledgeAssetsLifecycle.connect(signer) as Contract;
 
-    const kav10Address = await this.contracts.knowledgeAssetsV10.getAddress();
+    const kav10Address = await this.contracts.knowledgeAssetsLifecycle.getAddress();
     const evmChainId = (await this.provider.getNetwork()).chainId;
 
     const identityId = params.publisherNodeIdentityId ?? await this.getIdentityId();
 
-    // Look up the current tokenAmount on-chain to carry it forward.
-    // V10 batches live in KnowledgeCollectionStorage; fall back to
-    // KnowledgeAssetsStorage (V9) if not found.
-    let currentTokenAmount = 0n;
-    if (kcs) {
-      try {
-        currentTokenAmount = BigInt(await kcs.getTokenAmount(params.kcId));
-      } catch { /* not in KCS */ }
-    }
-    if (currentTokenAmount === 0n && this.contracts.knowledgeAssetsStorage) {
-      try {
-        const batch = await this.contracts.knowledgeAssetsStorage.getBatch(params.kcId);
-        if (batch && batch.tokenAmount != null) {
-          currentTokenAmount = BigInt(batch.tokenAmount);
-        }
-      } catch { /* not in KAS either */ }
-    }
+    const currentTokenAmount = await this.resolveCurrentTokenAmount(params.kaId);
 
-    // The V10 contract requires newTokenAmount >= the cost of the new byte
-    // size (ask * newByteSize / 1024). Carry forward the current amount but
-    // also ensure it covers the cost for the new payload.
-    let requiredForNewSize = 0n;
-    if (this.contracts.askStorage) {
-      try {
-        const ask = BigInt(await this.contracts.askStorage.getStakeWeightedAverageAsk());
-        requiredForNewSize = (ask * params.newByteSize * 1n) / 1024n;
-      } catch { /* use 0 */ }
-    }
-    const baseTokenAmount = params.newTokenAmount ?? currentTokenAmount;
-    const newTokenAmount = baseTokenAmount > requiredForNewSize ? baseTokenAmount : requiredForNewSize;
+    // #831: size `newTokenAmount` against the contract's growth-cost validator
+    // (matches `KnowledgeAssetsLifecycle._validateTokenAmount` exactly).
+    //
+    // The contract gate (`_executeUpdateCore` §"Byte-size growth cost check")
+    // only fires when `newByteSize > currentByteSize` and then requires
+    // `deltaTokenAmount = newTokenAmount - currentTokenAmount` to satisfy
+    // `(ask * byteSizeGrowth * remainingEpochs) / 1024` with a strict-positive
+    // floor. Pre-#831 the daemon carried `newTokenAmount = max(currentTokenAmount,
+    // ask * newByteSize / 1024)`, which on a healthy V10 KA always equals
+    // `currentTokenAmount` (carry-forward already covers the new total cost),
+    // making `deltaTokenAmount == 0` and reverting every byteSize-growth
+    // update with `InvalidTokenAmount(1, 0)`. The shared helper now pays the
+    // exact marginal growth cost so the validator's expected-cost branch is
+    // satisfied without overshooting.
+    //
+    // The old `floorPublishTokenAmount` clamp is applied INSIDE
+    // `computeUpdateNewTokenAmount` (see r5 in #833) so the ACK digest and the
+    // tx submission below bind the same wire value. Any caller passing a
+    // `boundNewTokenAmount` for an ACK already-signed digest is honoured here
+    // to keep digest-bound updates byte-identical to what the signer saw.
+    const newTokenAmount = await this.computeUpdateNewTokenAmount({
+      kaId: params.kaId,
+      newByteSize: params.newByteSize,
+      currentTokenAmount,
+      userProvidedNewTokenAmount: params.newTokenAmount,
+    });
 
     // Look up the contextGraphId for this KC
     const contextGraphStorage = this.contracts.contextGraphStorage;
     let contextGraphId = 0n;
     if (contextGraphStorage) {
       try {
-        contextGraphId = BigInt(await contextGraphStorage.kcToContextGraph(params.kcId));
+        contextGraphId = BigInt(await contextGraphStorage.kaToContextGraph(params.kaId));
       } catch { /* use 0 */ }
     }
 
     // Compute pre-update merkle root count (array length)
     let preUpdateMerkleRootCount = 0n;
-    if (kcs) {
+    if (kas) {
       try {
-        const roots: unknown[] = await kcs.getMerkleRoots(params.kcId);
+        const roots: unknown[] = await kas.getMerkleRoots(params.kaId);
         preUpdateMerkleRootCount = BigInt(roots.length);
       } catch { /* use 0 */ }
     }
@@ -2043,25 +3324,30 @@ export class EVMChainAdapter implements ChainAdapter {
 
     let ackSigs = params.ackSignatures ?? [];
     if (ackSigs.length === 0) {
-      // Update ACK digest: keccak256(abi.encodePacked(chainid, KAV10, cgId, kcId, preCount, newRoot, byteSize, tokenAmount, mintAmount, keccak256(burnIds)))
-      const burnPackedHash = ethers.keccak256(
-        burnIds.length > 0
-          ? ethers.solidityPacked(burnIds.map(() => 'uint256'), burnIds)
-          : new Uint8Array(0),
-      );
-      const newMerkleLeafCount = BigInt(params.newMerkleLeafCount ?? 0);
-      const ackDigest = ethers.getBytes(ethers.solidityPackedKeccak256(
-        ['uint256', 'address', 'uint256', 'uint256', 'uint256', 'bytes32', 'uint256', 'uint256', 'uint256', 'bytes32', 'uint256'],
-        [evmChainId, kav10Address, contextGraphId, params.kcId, preUpdateMerkleRootCount,
-         ethers.hexlify(params.newMerkleRoot), params.newByteSize, newTokenAmount,
-         BigInt(params.mintAmount ?? 0), burnPackedHash, newMerkleLeafCount],
-      ));
+      const ackDigest = await this.computeV10UpdateAckDigest({
+        kaId: params.kaId,
+        newMerkleRoot: params.newMerkleRoot,
+        newByteSize: params.newByteSize,
+        newMerkleLeafCount: params.newMerkleLeafCount ?? 0,
+        mintAmount: params.mintAmount !== undefined ? BigInt(params.mintAmount) : undefined,
+        burnTokenIds: burnIds,
+        newTokenAmount: params.newTokenAmount,
+        boundNewTokenAmount: newTokenAmount,
+        newCiphertextChunksRoot: params.newCiphertextChunksRoot,
+        newCiphertextChunkCount: params.newCiphertextChunkCount,
+      });
       const raw = ethers.Signature.from(await signer.signMessage(ackDigest));
       ackSigs = [{ identityId, r: ethers.getBytes(raw.r), vs: ethers.getBytes(raw.yParityAndS) }];
     }
 
+    if (!params.authorAddress || !params.authorR?.length || !params.authorVS?.length) {
+      throw new Error(
+        'updateKnowledgeAssets requires authorAddress, authorR, and authorVS from precomputedUpdateAttestation',
+      );
+    }
+
     const updateParams = {
-      id: params.kcId,
+      id: params.kaId,
       updateOperationId: opId,
       newMerkleRoot: ethers.hexlify(params.newMerkleRoot),
       newByteSize: params.newByteSize,
@@ -2081,18 +3367,25 @@ export class EVMChainAdapter implements ChainAdapter {
       identityIds: ackSigs.map(s => s.identityId),
       r: ackSigs.map(s => ethers.hexlify(s.r)),
       vs: ackSigs.map(s => ethers.hexlify(s.vs)),
+      authorAddress: params.authorAddress,
+      authorR: ethers.hexlify(params.authorR),
+      authorVS: ethers.hexlify(params.authorVS),
+      authorSchemeVersion: params.authorSchemeVersion ?? AUTHOR_SCHEME_VERSION_V1,
     };
 
     // Approve TRAC for the V10 update — the contract may transferFrom
     // for the newTokenAmount (same direct-spend policy as publish).
-    if (this.contracts.token && newTokenAmount > 0n) {
-      const tokenWithSigner = this.contracts.token.connect(signer) as Contract;
-      const prevAllowance = await tokenWithSigner.allowance(signer.address, kav10Address);
-      if (prevAllowance < newTokenAmount) {
-        const approveTx = await tokenWithSigner.approve(kav10Address, newTokenAmount);
-        await approveTx.wait();
-      }
-    }
+    // Shares the `ensureV10ApproveTrac` helper with the publish path so a
+    // single config knob (`chain.approvalPolicy`) controls allowance
+    // sizing for both V10 surfaces. The default `per-publish` policy
+    // floors at 1n so metadata-only updates with `newTokenAmount === 0n`
+    // still satisfy the contract's `transferFrom(..., 1n)` minimum.
+    await this.ensureV10ApproveTrac(
+      signer,
+      kav10Address,
+      newTokenAmount,
+      'approve V10 update TRAC',
+    );
 
     // P-1 review (Codex iter-5): same pattern as the publish path —
     // break the single contract call into populate / sign / hook /
@@ -2104,9 +3397,7 @@ export class EVMChainAdapter implements ChainAdapter {
     // via `agentToAccountId(msg.sender)` for any positive
     // `deltaTokenAmount`.
     const populated = await (ka as any).update.populateTransaction(updateParams);
-    const filled = await signer.populateTransaction(populated);
-    const signedTx = await signer.signTransaction(filled);
-    const preBroadcastTxHash = ethers.Transaction.from(signedTx).hash ?? '0x';
+    const { signedTx, txHash: preBroadcastTxHash } = await this.signPopulatedTransaction(signer, populated);
     // Codex PR #241 iter-7: `await` so async WAL writes complete
     // before broadcast (see publish above for the full rationale).
     try {
@@ -2117,9 +3408,7 @@ export class EVMChainAdapter implements ChainAdapter {
         `${hookErr instanceof Error ? hookErr.message : String(hookErr)}`,
       );
     }
-    const tx = await this.provider.broadcastTransaction(signedTx);
-
-    const receipt = await tx.wait();
+    const receipt = await this.sendSignedTransactionAndWait(signedTx, preBroadcastTxHash, 'V10 update');
     if (!receipt) {
       throw new Error(
         `update broadcast succeeded (txHash=${preBroadcastTxHash}) but receipt was null ` +
@@ -2130,6 +3419,7 @@ export class EVMChainAdapter implements ChainAdapter {
     return {
       hash: receipt.hash,
       blockNumber: receipt.blockNumber,
+      txIndex: receipt.index,
       success: receipt.status === 1,
       publisherAddress: signer.address,
     };
@@ -2143,7 +3433,7 @@ export class EVMChainAdapter implements ChainAdapter {
    * `DKGPublishingConvictionNFT.agentToAccountId(agent)` view.
    *
    * The publisher SDK uses this to decide, BEFORE building a publish
-   * tx, whether `KnowledgeAssetsV10.publish()` will route through the
+   * tx, whether `KnowledgeAssetsLifecycle.publish()` will route through the
    * PCA discount branch — and therefore whether `publishEpochs` must
    * be coerced to the PCA's `lockDurationEpochs`. Wrong epochs do NOT
    * revert the contract any more; they just demote the publish to
@@ -2199,15 +3489,44 @@ export class EVMChainAdapter implements ChainAdapter {
     return nft;
   }
 
-  // Opaque "unknown custom error"+data reverts carry no name; enrich so the
-  // daemon classifier matches it (mirrors isContractMissingRevert et al).
+  /**
+   * Common wrapper for every PCA (Publisher Conviction Account) write
+   * path. Two responsibilities:
+   *
+   *   1. Opaque "unknown custom error"+data reverts from the post-split
+   *      `PublishingConviction` logic contract carry no decoded name
+   *      out of ethers — `enrichEvmError` decodes them so the daemon's
+   *      error classifier can match downstream (mirrors what
+   *      `isContractMissingRevert` does for the resolution path).
+   *
+   *   2. Self-heal on a stale `DKGPublishingConvictionNFT` /
+   *      `PublishingConvictionStorage` binding. Both contracts were
+   *      redeployed for v10.0.0-rc.11 (PCA split); the wrapper NFT
+   *      lazy-resolves `PublishingConviction` on every call so a
+   *      logic rotation is handled on-chain, but a wrapper rotation
+   *      surfaces here as `UnauthorizedAccess(Only Contracts in Hub)`
+   *      on the FIRST PCA write after the Hub re-registration. The
+   *      `withHubStaleRetryAny` outer layer drops every boot-bound
+   *      handle, re-runs `init()` to repopulate from the live Hub,
+   *      and retries the closure once — `op` re-reads
+   *      `this.contracts.dkgPublishingConvictionNFT` via
+   *      `requireConvictionNFT()` so the retry uses the new address.
+   *
+   * NOTE — rc.12 follow-up: other V10 write paths
+   * (`createKnowledgeAssets`, `createContextGraph`,
+   * `updateKnowledgeCollectionV10`, etc.) should be wrapped with the
+   * same self-heal pattern. Tracked in the broader migration to
+   * `HubResolutionCache` for every boot-bound contract.
+   */
   private async pcaWrite<T>(op: () => Promise<T>): Promise<T> {
-    try {
-      return await op();
-    } catch (err) {
-      if (err instanceof Error) enrichEvmError(err);
-      throw err;
-    }
+    return this.withHubStaleRetryAny(async () => {
+      try {
+        return await op();
+      } catch (err) {
+        if (err instanceof Error) enrichEvmError(err);
+        throw err;
+      }
+    });
   }
 
   async createPublishingConvictionAccount(
@@ -2223,22 +3542,39 @@ export class EVMChainAdapter implements ChainAdapter {
       if (this.contracts.token) {
         const allowance: bigint = await this.contracts.token.allowance(this.signer.address, nftAddress);
         if (allowance < committedTRAC) {
-          await (await this.contracts.token.approve(nftAddress, ethers.MaxUint256)).wait();
+          await this.sendContractTransaction(
+            this.contracts.token,
+            'approve',
+            [nftAddress, ethers.MaxUint256],
+            this.signer,
+            'approve PCA TRAC',
+          );
         }
       }
 
-      const tx = await nft.createAccount(committedTRAC);
-      const receipt = await tx.wait();
+      const receipt = await this.sendContractTransaction(
+        nft,
+        'createAccount',
+        [committedTRAC],
+        this.signer,
+        'create publishing conviction account',
+      );
 
+      // Post PR #650 split, `AccountCreated` is emitted by
+      // `PublishingConviction` (logic), NOT by the wrapper. Parse via
+      // the logic ABI so this keeps working once `chain/abi/DKGPublishingConvictionNFT.json`
+      // is refreshed to its post-split slim surface (which no longer
+      // declares any PCA events).
+      const pcaLogic = getPcaLogicInterface();
       let accountId = 0n;
       for (const log of receipt.logs) {
         try {
-          const parsed = nft.interface.parseLog({ topics: [...log.topics], data: log.data });
+          const parsed = pcaLogic.parseLog({ topics: [...log.topics], data: log.data });
           if (parsed?.name === 'AccountCreated') {
             accountId = BigInt(parsed.args.accountId);
             break;
           }
-        } catch { /* not this contract's event */ }
+        } catch { /* not a PublishingConviction event */ }
       }
       if (accountId === 0n) {
         throw new Error('createPublishingConvictionAccount succeeded but no AccountCreated event found');
@@ -2248,6 +3584,7 @@ export class EVMChainAdapter implements ChainAdapter {
         accountId,
         hash: receipt.hash,
         blockNumber: receipt.blockNumber,
+        txIndex: receipt.index,
         success: receipt.status === 1,
       };
     });
@@ -2288,11 +3625,23 @@ export class EVMChainAdapter implements ChainAdapter {
       if (this.contracts.token) {
         const allowance: bigint = await this.contracts.token.allowance(this.signer.address, nftAddress);
         if (allowance < amount) {
-          await (await this.contracts.token.approve(nftAddress, ethers.MaxUint256)).wait();
+          await this.sendContractTransaction(
+            this.contracts.token,
+            'approve',
+            [nftAddress, ethers.MaxUint256],
+            this.signer,
+            'approve PCA top-up TRAC',
+          );
         }
       }
-      const receipt = await (await nft.topUp(accountId, amount)).wait();
-      return { hash: receipt.hash, blockNumber: receipt.blockNumber, success: receipt.status === 1 };
+      const receipt = await this.sendContractTransaction(
+        nft,
+        'topUp',
+        [accountId, amount],
+        this.signer,
+        'top up publishing conviction account',
+      );
+      return { hash: receipt.hash, blockNumber: receipt.blockNumber, txIndex: receipt.index, success: receipt.status === 1 };
     });
   }
 
@@ -2300,8 +3649,14 @@ export class EVMChainAdapter implements ChainAdapter {
     await this.init();
     return this.pcaWrite(async () => {
       const nft = this.requireConvictionNFT();
-      const receipt = await (await nft.settle(accountId)).wait();
-      return { hash: receipt.hash, blockNumber: receipt.blockNumber, success: receipt.status === 1 };
+      const receipt = await this.sendContractTransaction(
+        nft,
+        'settle',
+        [accountId],
+        this.signer,
+        'settle publishing conviction account',
+      );
+      return { hash: receipt.hash, blockNumber: receipt.blockNumber, txIndex: receipt.index, success: receipt.status === 1 };
     });
   }
 
@@ -2309,8 +3664,14 @@ export class EVMChainAdapter implements ChainAdapter {
     await this.init();
     return this.pcaWrite(async () => {
       const nft = this.requireConvictionNFT();
-      const receipt = await (await nft.registerAgent(accountId, agent)).wait();
-      return { hash: receipt.hash, blockNumber: receipt.blockNumber, success: receipt.status === 1 };
+      const receipt = await this.sendContractTransaction(
+        nft,
+        'registerAgent',
+        [accountId, agent],
+        this.signer,
+        'register publishing conviction agent',
+      );
+      return { hash: receipt.hash, blockNumber: receipt.blockNumber, txIndex: receipt.index, success: receipt.status === 1 };
     });
   }
 
@@ -2318,8 +3679,14 @@ export class EVMChainAdapter implements ChainAdapter {
     await this.init();
     return this.pcaWrite(async () => {
       const nft = this.requireConvictionNFT();
-      const receipt = await (await nft.deregisterAgent(accountId, agent)).wait();
-      return { hash: receipt.hash, blockNumber: receipt.blockNumber, success: receipt.status === 1 };
+      const receipt = await this.sendContractTransaction(
+        nft,
+        'deregisterAgent',
+        [accountId, agent],
+        this.signer,
+        'deregister publishing conviction agent',
+      );
+      return { hash: receipt.hash, blockNumber: receipt.blockNumber, txIndex: receipt.index, success: receipt.status === 1 };
     });
   }
 
@@ -2344,6 +3711,15 @@ export class EVMChainAdapter implements ChainAdapter {
   }
 
   async getMinimumRequiredSignatures(): Promise<number> {
+    // PR3 / RC11: TTL-cached. Governance vote that changes
+    // `minimumRequiredSignatures` propagates within 1h to the ACK
+    // collector; on-chain validation in `KnowledgeAssetsLifecycle` would
+    // reject a publish that used the stale quorum so a single
+    // mis-routed retry past the boundary is the worst-case symptom.
+    const now = Date.now();
+    if (EVMChainAdapter.preflightCacheFresh(this.cachedMinRequiredSignatures, now)) {
+      return this.cachedMinRequiredSignatures!.value;
+    }
     await this.init();
     // FAIL-CLOSED (Codex PR #595 round-5): the agent + publisher
     // verify paths trust whatever this method returns. A silent
@@ -2356,7 +3732,9 @@ export class EVMChainAdapter implements ChainAdapter {
         'Verify cannot enforce ACK quorum without a real chain read — fix the adapter wiring or pass an explicit override.',
       );
     }
-    return Number(await this.contracts.parametersStorage.minimumRequiredSignatures());
+    const value = Number(await this.contracts.parametersStorage.minimumRequiredSignatures());
+    this.cachedMinRequiredSignatures = { value, cachedAt: now };
+    return value;
   }
 
   async isShardingTableMember(identityId: bigint): Promise<boolean> {
@@ -2372,55 +3750,70 @@ export class EVMChainAdapter implements ChainAdapter {
     return Boolean(await storage.nodeExists(identityId));
   }
 
+  /**
+   * Off-chain pre-flight for the V10 ACK signer gate. Mirrors the on-chain
+   * check in `KnowledgeAssetsLifecycle._verifyACKSignature` (post-RFC-001): the
+   * recovered signer must be a registered OPERATIONAL_KEY for the claimed
+   * identity AND that identity must be in the active sharding table.
+   *
+   * Returns a structured reason on rejection so the ACKCollector log can
+   * distinguish operator-actionable failures (key registration, sub-
+   * `minimumStake` stake) from infrastructure failures (RPC outage). Pre-
+   * RFC-001 versions of this method gated on `getNodeStakeV10 > 0`, which
+   * let sub-`minimumStake` operators clear off-chain quorum and then revert
+   * on-chain with `"ACK signer not in sharding table"`. ST membership is
+   * updated atomically by `StakingV10` whenever a node's V10 stake crosses
+   * `minimumStake` up or down.
+   */
+  async verifyACKIdentityDetailed(
+    recoveredAddress: string,
+    claimedIdentityId: bigint,
+  ): Promise<VerifyACKIdentityResult> {
+    try {
+      await this.init();
+      const identityStorage = await this.resolveContract('IdentityStorage');
+      if (!identityStorage) return { valid: false, reason: 'rpc-error' };
+
+      const keyHash = ethers.keccak256(ethers.solidityPacked(['address'], [recoveredAddress]));
+      const hasPurpose: boolean = await identityStorage.keyHasPurpose(
+        claimedIdentityId,
+        keyHash,
+        OPERATIONAL_KEY_PURPOSE,
+      );
+      if (!hasPurpose) return { valid: false, reason: 'key-not-registered' };
+
+      const shardingTableStorage = await this.resolveContract('ShardingTableStorage');
+      if (!shardingTableStorage) return { valid: false, reason: 'rpc-error' };
+      const inST: boolean = Boolean(await shardingTableStorage.nodeExists(claimedIdentityId));
+      if (!inST) return { valid: false, reason: 'not-in-sharding-table' };
+      return { valid: true };
+    } catch {
+      // Any chain-side throw (filter expired, RPC rate-limit, contract
+      // resolution failure mid-call) is reported as `rpc-error` so the
+      // ACKCollector can log it distinctly from a definitive negative.
+      // Mirrors the existing wrapper in `dkg-agent.ts:createV10ACKProvider`
+      // which used to swallow these exceptions as `false`, conflating
+      // transient infra failures with permanent rejections.
+      return { valid: false, reason: 'rpc-error' };
+    }
+  }
+
   async verifyACKIdentity(recoveredAddress: string, claimedIdentityId: bigint): Promise<boolean> {
-    await this.init();
-    const identityStorage = await this.resolveContract('IdentityStorage');
-    if (!identityStorage) return false;
-
-    // Match on-chain verification: keyHasPurpose(identityId, keccak256(signer), OPERATIONAL_KEY)
-    const keyHash = ethers.keccak256(ethers.solidityPacked(['address'], [recoveredAddress]));
-    const hasPurpose: boolean = await identityStorage.keyHasPurpose(
-      claimedIdentityId,
-      keyHash,
-      OPERATIONAL_KEY_PURPOSE,
-    );
-    if (!hasPurpose) return false;
-
-    // Verify the identity is a staked core node (spec §9.0: "Core nodes MUST be staked").
-    // v4.0.0 — read V10 canonical stake (`ConvictionStakingStorage.getNodeStakeV10`)
-    // instead of the V8 `StakingStorage.getNodeStake` archive: under mandatory
-    // migration the V8 `nodeStake` field is unmaintained for V10 nodes and
-    // would zero-gate every legitimate V10 ACK signer (this exactly mirrors
-    // the on-chain `KnowledgeAssetsV10` ACK-signer gate, also rewired in
-    // v4.0.0). Falls back to V8 if CSS is not registered (older deploys).
-    let cs: Contract | null = null;
-    try {
-      cs = await this.resolveContract('ConvictionStakingStorage');
-    } catch {
-      cs = null;
-    }
-    if (cs) {
-      const stake: bigint = await cs.getNodeStakeV10(claimedIdentityId);
-      if (stake === 0n) return false;
-      return true;
-    }
-
-    let ss: Contract | null = null;
-    try {
-      ss = await this.resolveContract('StakingStorage');
-    } catch {
-      ss = null;
-    }
-    if (!ss) return false;
-    const v8Stake: bigint = await ss.getNodeStake(claimedIdentityId);
-    if (v8Stake === 0n) return false;
-
-    return true;
+    // PR #711 + rc.12: delegate to the structured variant so the off-chain
+    // gate stays in lockstep with the on-chain `KnowledgeAssetsLifecycle` ACK-
+    // signer check (operational-key purpose AND sharding-table membership).
+    // The legacy V10-stake / V8-stake fallback that lived inline here is
+    // superseded by the ST-membership check inside
+    // `verifyACKIdentityDetailed`, which is updated atomically by
+    // `StakingV10` whenever a node crosses `minimumStake`. PR #732's
+    // lazy-cache perf optimization is unaffected — the other call sites
+    // in this file pick up `getIdentityStorage()` via the auto-merge.
+    return (await this.verifyACKIdentityDetailed(recoveredAddress, claimedIdentityId)).valid;
   }
 
   async verifySyncIdentity(recoveredAddress: string, claimedIdentityId: bigint): Promise<boolean> {
     await this.init();
-    const identityStorage = await this.resolveContract('IdentityStorage');
+    const identityStorage = await this.getIdentityStorage();
     if (!identityStorage) return false;
 
     const keyHash = ethers.keccak256(ethers.solidityPacked(['address'], [recoveredAddress]));
@@ -2450,7 +3843,7 @@ export class EVMChainAdapter implements ChainAdapter {
   }
 
   isV10Ready(): boolean {
-    return !!this.contracts.knowledgeAssetsV10;
+    return !!this.contracts.knowledgeAssetsLifecycle;
   }
 
   isRandomSamplingReady(): boolean {
@@ -2507,7 +3900,15 @@ export class EVMChainAdapter implements ChainAdapter {
   }
 
   getProvider(): JsonRpcProvider {
+    return this.primaryProvider;
+  }
+
+  getReadProvider(): JsonRpcProvider | FallbackProvider {
     return this.provider;
+  }
+
+  getRpcUrls(): string[] {
+    return [...this.rpcUrls];
   }
 
   async getContract(name: string): Promise<Contract> {
@@ -2587,9 +3988,47 @@ export class EVMChainAdapter implements ChainAdapter {
     try {
       return await fn();
     } catch (err) {
+      if (err instanceof Error) enrichEvmError(err);
       const msg = err instanceof Error ? err.message : '';
       if (HUB_STALE_ERROR_MARKERS.some((m) => msg.includes(m))) {
         this.invalidateRandomSamplingPair();
+        return await fn();
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Like `withHubStaleRetry` but generalized for any boot-bound
+   * contract — not just the RS pair. On `UnauthorizedAccess(Only
+   * Contracts in Hub)`, drops every boot-bound `this.contracts.X`
+   * handle, re-runs `init()` to re-resolve all bindings from Hub,
+   * then retries the operation exactly once.
+   *
+   * Used at write-side call sites that touch any of the redeployable
+   * V10 contracts (PCA NFT, ContextGraphs, KnowledgeCollection, etc.)
+   * so the FIRST write after a Hub rotation self-heals even when the
+   * event listener never fired (HTTP-only RPC endpoints, dropped
+   * subscriptions, rate-limited filter installs — all of which we
+   * see in the wild on public Base Sepolia / Gnosis Chain RPCs).
+   *
+   * Idempotency note: the wrapped closure MUST be safe to call twice.
+   * That holds for our write paths because the on-chain side either
+   * (a) reverted with the marker error, meaning no state changed, or
+   * (b) succeeded, meaning no retry happens. The closure SHOULD
+   * re-read `this.contracts.X` on each invocation (don't capture the
+   * handle into a local outside the closure) so the retry uses the
+   * fresh binding.
+   */
+  private async withHubStaleRetryAny<T>(fn: () => Promise<T>): Promise<T> {
+    try {
+      return await fn();
+    } catch (err) {
+      if (err instanceof Error) enrichEvmError(err);
+      const msg = err instanceof Error ? err.message : '';
+      if (HUB_STALE_ERROR_MARKERS.some((m) => msg.includes(m))) {
+        this.invalidateAllBoundContracts();
+        await this.init();
         return await fn();
       }
       throw err;
@@ -2625,27 +4064,56 @@ export class EVMChainAdapter implements ChainAdapter {
   }
 
   /**
-   * Subscribe to Hub `ContractChanged` / `NewContract` events and
-   * invalidate the RS pair cache whenever **either** RS-side name is
-   * rotated. The pair is treated as a single coupled unit (see the
-   * `randomSamplingPairCache` field comment) — invalidating on either
-   * name forces an atomic re-resolve of both.
+   * Subscribe to Hub rotation events and invalidate the local cache for any
+   * Hub-rotated contract.
+   *
+   * Two invalidation paths, dispatched by name:
+   *
+   *   1. `RandomSampling` / `RandomSamplingStorage` → atomic pair
+   *      invalidation through `invalidateRandomSamplingPair()` so the
+   *      coupled cache + in-flight probe lifecycle stays consistent.
+   *      See the `randomSamplingPairCache` field comment for the
+   *      coupling invariants this path preserves.
+   *
+   *   2. Any other name in `BOUND_CONTRACT_INVALIDATORS` → leave the
+   *      existing `this.contracts.X` field intact but flip
+   *      `this.initialized` back to `false` so the next `await
+   *      this.init()` re-resolves every binding fresh from Hub. Keeping
+   *      the old handle until the next init pass avoids a race where an
+   *      in-flight public method already passed `init()` and then trips
+   *      over a transient `undefined` field. This is the structural fix
+   *      for the post-rotation stale-address bug on the wider V10
+   *      contract set (PCA NFT, ContextGraphs, KnowledgeCollection
+   *      family, storage contracts, etc.) — without this dispatch,
+   *      operators were silently stuck on the pre-rotation address
+   *      until a daemon restart.
+   *
+   *   3. Unknown name → ignored. We deliberately allowlist rather
+   *      than reflexively re-init on any rotation: third-party
+   *      deployments may register names we don't bind, and we don't
+   *      want a benign rotation of an unrelated contract to thrash
+   *      our cache.
    *
    * `Hub._setContractAddress` is double-tap-emitting (`Hub-extra.test.ts`
    * E-7): on the new-contract path it emits `NewContract` twice, and
    * on the update path it emits both `ContractChanged` AND
-   * `NewContract`. We listen to BOTH events so the cache invalidates
-   * regardless of which Hub variant the deployment ships, and the
-   * invalidation is idempotent so duplicate notifications are
-   * harmless.
+   * `NewContract`. Storage bindings resolved through
+   * `getAssetStorageAddress(...)` emit the parallel `AssetStorageChanged`
+   * / `NewAssetStorage` events. We listen to all four events so the cache
+   * invalidates regardless of which Hub set owns the name, and both the
+   * RS-pair invalidation and the generic boot-bound invalidation are
+   * idempotent so duplicate notifications are harmless.
    *
    * `Contract.on(...)` is async in ethers v6: a sync `try/catch` would
    * miss provider rejections (e.g. HTTP-only endpoints that can't
    * install filter subscriptions) and leave us with an unhandled
-   * rejection. We `await` both subscriptions and only set
-   * `hubRotationListenerStarted` after both succeed, so a failed
+   * rejection. We `await` every subscription and only set
+   * `hubRotationListenerStarted` after all succeed, so a failed
    * provider can be retried by a future call site if we ever need to
-   * — and meanwhile the TTL refresh path still keeps the pair fresh.
+   * — and meanwhile the TTL refresh path (for RS) and the
+   * `withHubStaleRetry` write-side fallback (for all boot-bound
+   * contracts) still keep stale bindings recoverable without a
+   * working event subscription.
    */
   private async startHubRotationListener(): Promise<void> {
     if (this.hubRotationListenerStarted) return;
@@ -2653,15 +4121,51 @@ export class EVMChainAdapter implements ChainAdapter {
       if (typeof name !== 'string') return;
       if (name === 'RandomSampling' || name === 'RandomSamplingStorage') {
         this.invalidateRandomSamplingPair();
+        return;
+      }
+      if (BOUND_CONTRACT_INVALIDATORS.has(name)) {
+        this.invalidatePublishPreflightCache();
+        // Force the next public-method entry through `init()` so it
+        // re-resolves every binding. Do not clear the current handle
+        // here: the callback can fire between a public method's
+        // `await init()` and its first `this.contracts.X` read.
+        this.initialized = false;
       }
     };
     try {
       await this.contracts.hub.on('ContractChanged', onChange);
       await this.contracts.hub.on('NewContract', onChange);
+      await this.contracts.hub.on('AssetStorageChanged', onChange);
+      await this.contracts.hub.on('NewAssetStorage', onChange);
       this.hubRotationListenerStarted = true;
     } catch {
-      /* provider doesn't support filter subscriptions — TTL refresh is the fallback */
+      /* provider doesn't support filter subscriptions — TTL refresh (RS)
+       * and `withHubStaleRetry` (writes) are the fallbacks */
     }
+  }
+
+  /**
+   * Drop every boot-bound contract handle and re-arm `init()`.
+   *
+   * Used by `withHubStaleRetry` on the write-side self-heal path when
+   * a Hub-rotated contract surfaces `UnauthorizedAccess(Only Contracts
+   * in Hub)`: the listener may have missed the rotation event (HTTP-only
+   * RPC, dropped subscription, etc.) so the failing operation can't tell
+   * which specific name was rotated. Resetting everything is the safest
+   * fallback — the next `await this.init()` re-resolves all 15+ bindings
+   * in a single pass (still under a second on a healthy RPC) and the
+   * caller's retry picks up the fresh handles.
+   *
+   * RS pair is handled separately because it owns side-channel state
+   * (in-flight probe, ready flag) that `init()` alone won't reset.
+   */
+  private invalidateAllBoundContracts(): void {
+    for (const invalidator of BOUND_CONTRACT_INVALIDATORS.values()) {
+      invalidator(this);
+    }
+    this.invalidatePublishPreflightCache();
+    this.invalidateRandomSamplingPair();
+    this.initialized = false;
   }
 
   /**
@@ -2680,7 +4184,7 @@ export class EVMChainAdapter implements ChainAdapter {
     enrichEvmError(err);
     const msg = err.message;
     if (msg.includes('NoEligibleContextGraph')) throw new NoEligibleContextGraphError();
-    if (msg.includes('NoEligibleKnowledgeCollection')) throw new NoEligibleKnowledgeCollectionError();
+    if (msg.includes('NoEligibleKnowledgeAsset')) throw new NoEligibleKnowledgeCollectionError();
     if (msg.includes('This challenge is no longer active')) throw new ChallengeNoLongerActiveError();
     const merkleMatch = msg.match(/MerkleRootMismatchError\((0x[0-9a-fA-F]+),\s*(0x[0-9a-fA-F]+)\)/);
     if (merkleMatch) {
@@ -2693,16 +4197,16 @@ export class EVMChainAdapter implements ChainAdapter {
    * Convert the on-chain `Challenge` tuple (or struct) into our wire
    * type. The contract returns an all-zero struct when no challenge
    * exists for an identity, which we surface as `null` so callers
-   * don't have to dispatch on `kcId === 0n`.
+   * don't have to dispatch on `kaId === 0n`.
    */
   private toNodeChallenge(raw: any): NodeChallenge | null {
-    const kcId = BigInt(raw.knowledgeCollectionId ?? raw[0]);
+    const kaId = BigInt(raw.knowledgeAssetId ?? raw[0]);
     const startBlock = BigInt(raw.activeProofPeriodStartBlock ?? raw[4]);
-    if (kcId === 0n && startBlock === 0n) return null;
+    if (kaId === 0n && startBlock === 0n) return null;
     return {
-      knowledgeCollectionId: kcId,
+      knowledgeAssetId: kaId,
       chunkId: BigInt(raw.chunkId ?? raw[1]),
-      knowledgeCollectionStorageContract: String(raw.knowledgeCollectionStorageContract ?? raw[2]),
+      knowledgeAssetStorageContract: String(raw.knowledgeAssetStorageContract ?? raw[2]),
       epoch: BigInt(raw.epoch ?? raw[3]),
       activeProofPeriodStartBlock: startBlock,
       proofingPeriodDurationInBlocks: BigInt(raw.proofingPeriodDurationInBlocks ?? raw[5]),
@@ -2713,7 +4217,7 @@ export class EVMChainAdapter implements ChainAdapter {
   async createChallenge(): Promise<CreateChallengeResult> {
     await this.init();
 
-    const identityStorage = await this.resolveContract('IdentityStorage');
+    const identityStorage = await this.getIdentityStorage();
     const identityId: bigint = await identityStorage.getIdentityId(this.signer.address);
 
     return this.withHubStaleRetry(async () => {
@@ -2721,15 +4225,20 @@ export class EVMChainAdapter implements ChainAdapter {
 
       let receipt: ethers.TransactionReceipt;
       try {
-        const tx = await rs.createChallenge();
-        receipt = await tx.wait();
+        receipt = await this.sendContractTransaction(
+          rs,
+          'createChallenge',
+          [],
+          this.signer,
+          'create random-sampling challenge',
+        );
       } catch (err) {
         this.translateRandomSamplingError(err);
       }
 
-      // Decode `ChallengeGenerated(identityId, contextGraphId, kcId, chunkId, epoch, startBlock)`
+      // Decode `ChallengeGenerated(identityId, contextGraphId, kaId, chunkId, epoch, startBlock)`
       // from the receipt. cgId is indexed (topic[2]); the rest are in data
-      // but we only need cgId here — the proof builder reads kcId/chunkId
+      // but we only need cgId here — the proof builder reads kaId/chunkId
       // off the Challenge struct fetched below, so everything stays
       // consistent if the storage layout shifts.
       let contextGraphId = 0n;
@@ -2766,6 +4275,7 @@ export class EVMChainAdapter implements ChainAdapter {
       return {
         hash: receipt.hash,
         blockNumber: receipt.blockNumber,
+        txIndex: receipt.index,
         success: true,
         challenge,
         contextGraphId,
@@ -2787,8 +4297,13 @@ export class EVMChainAdapter implements ChainAdapter {
 
       let receipt: ethers.TransactionReceipt;
       try {
-        const tx = await rs.submitProof(leafHex, proofHex);
-        receipt = await tx.wait();
+        receipt = await this.sendContractTransaction(
+          rs,
+          'submitProof',
+          [leafHex, proofHex],
+          this.signer,
+          'submit random-sampling proof',
+        );
       } catch (err) {
         this.translateRandomSamplingError(err);
       }
@@ -2796,6 +4311,7 @@ export class EVMChainAdapter implements ChainAdapter {
       return {
         hash: receipt.hash,
         blockNumber: receipt.blockNumber,
+        txIndex: receipt.index,
         success: true,
       };
     });
@@ -2918,18 +4434,18 @@ export class EVMChainAdapter implements ChainAdapter {
   }
 
   // =====================================================================
-  // KC views (V10 KnowledgeCollectionStorage + ContextGraphStorage)
+  // KC views (V10 DKGKnowledgeAssets + ContextGraphStorage)
   // =====================================================================
 
   private requireKCStorage(): Contract {
-    const kcs = this.contracts.knowledgeCollectionStorage;
-    if (!kcs) {
+    const kas = this.contracts.knowledgeAssetStorage;
+    if (!kas) {
       throw new Error(
-        'KnowledgeCollectionStorage not deployed in this Hub. ' +
-        'V10 KC views require a Hub with KnowledgeCollectionStorage registered.',
+        'DKGKnowledgeAssets not deployed in this Hub. ' +
+        'V10 KC views require a Hub with DKGKnowledgeAssets registered.',
       );
     }
-    return kcs;
+    return kas;
   }
 
   private requireContextGraphStorage(): Contract {
@@ -2937,44 +4453,58 @@ export class EVMChainAdapter implements ChainAdapter {
     if (!cgs) {
       throw new Error(
         'ContextGraphStorage not deployed in this Hub. ' +
-        'getKCContextGraphId requires a Hub with ContextGraphStorage registered.',
+        'getKAContextGraphId requires a Hub with ContextGraphStorage registered.',
       );
     }
     return cgs;
   }
 
-  async getLatestMerkleRoot(kcId: bigint): Promise<Uint8Array> {
+  async getLatestMerkleRoot(kaId: bigint): Promise<Uint8Array> {
     await this.init();
-    const kcs = this.requireKCStorage();
-    const rootHex: string = await kcs.getLatestMerkleRoot(kcId);
+    const kas = this.requireKCStorage();
+    const rootHex: string = await kas.getLatestMerkleRoot(kaId);
     return ethers.getBytes(rootHex);
   }
 
-  async getMerkleLeafCount(kcId: bigint): Promise<number> {
+  async getMerkleLeafCount(kaId: bigint): Promise<number> {
     await this.init();
-    const kcs = this.requireKCStorage();
-    const count: bigint = BigInt(await kcs.getMerkleLeafCount(kcId));
+    const kas = this.requireKCStorage();
+    const count: bigint = BigInt(await kas.getMerkleLeafCount(kaId));
     return Number(count);
   }
 
-  async getLatestMerkleRootPublisher(kcId: bigint): Promise<string> {
+  async getLatestCiphertextChunksRoot(kaId: bigint): Promise<Uint8Array> {
     await this.init();
-    const kcs = this.requireKCStorage();
-    const publisher: string = await kcs.getLatestMerkleRootPublisher(kcId);
+    const kas = this.requireKCStorage();
+    const rootHex: string = await kas.getLatestCiphertextChunksRoot(kaId);
+    return ethers.getBytes(rootHex);
+  }
+
+  async getCiphertextChunkCount(kaId: bigint): Promise<number> {
+    await this.init();
+    const kas = this.requireKCStorage();
+    const count: bigint = BigInt(await kas.getCiphertextChunkCount(kaId));
+    return Number(count);
+  }
+
+  async getLatestMerkleRootPublisher(kaId: bigint): Promise<string> {
+    await this.init();
+    const kas = this.requireKCStorage();
+    const publisher: string = await kas.getLatestMerkleRootPublisher(kaId);
     return publisher;
   }
 
-  async getLatestMerkleRootAuthor(kcId: bigint): Promise<string> {
+  async getLatestMerkleRootAuthor(kaId: bigint): Promise<string> {
     await this.init();
-    const kcs = this.requireKCStorage();
-    const author: string = await kcs.getLatestMerkleRootAuthor(kcId);
+    const kas = this.requireKCStorage();
+    const author: string = await kas.getLatestMerkleRootAuthor(kaId);
     return author;
   }
 
-  async getKCContextGraphId(kcId: bigint): Promise<bigint> {
+  async getKAContextGraphId(kaId: bigint): Promise<bigint> {
     await this.init();
     const cgs = this.requireContextGraphStorage();
-    const cgId: bigint = await cgs.kcToContextGraph(kcId);
+    const cgId: bigint = await cgs.kaToContextGraph(kaId);
     return BigInt(cgId);
   }
 
@@ -2989,8 +4519,54 @@ export class EVMChainAdapter implements ChainAdapter {
   async getContextGraphAccessPolicy(contextGraphId: bigint): Promise<number> {
     await this.init();
     const cgs = this.requireContextGraphStorage();
-    const raw: bigint = BigInt(await cgs.getAccessPolicy(contextGraphId));
-    return Number(raw);
+    try {
+      const raw: bigint = BigInt(await cgs.getAccessPolicy(contextGraphId));
+      return Number(raw);
+    } catch (primaryErr) {
+      try {
+        const cg = await cgs.getContextGraph(contextGraphId);
+        const raw =
+          cg?.accessPolicy
+          ?? (Array.isArray(cg) ? cg[5] : undefined);
+        if (raw === undefined || raw === null) {
+          throw new Error('ContextGraphStorage.getContextGraph returned no accessPolicy field');
+        }
+        return Number(BigInt(raw));
+      } catch (fallbackErr) {
+        throw new Error(
+          `ContextGraphStorage access-policy lookup failed via getAccessPolicy and getContextGraph fallback: ` +
+          `${primaryErr instanceof Error ? primaryErr.message : String(primaryErr)}; ` +
+          `fallback: ${fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr)}`,
+        );
+      }
+    }
+  }
+
+  /**
+   * Issue #872 / Codex round-3 — chain-backed publish-policy oracle
+   * for non-creator peers. `ContextGraphStorage.getPublishPolicy`
+   * returns the tuple `(uint8 publishPolicy, address publishAuthority)`.
+   * `publishPolicy: 0` = curators-only, `1` = open. Unregistered ids
+   * return `(0, address(0))` from Solidity's default-zero mapping —
+   * the caller is responsible for cross-checking registration
+   * status before treating that as a positive "curators-only" signal.
+   */
+  async getContextGraphPublishPolicy(contextGraphId: bigint): Promise<{
+    publishPolicy: number;
+    publishAuthority: string;
+  }> {
+    await this.init();
+    const cgs = this.requireContextGraphStorage();
+    const result = await cgs.getPublishPolicy(contextGraphId);
+    // Ethers v6 returns named tuple as both array and object access;
+    // destructure positionally to stay robust against ABI naming
+    // changes.
+    const rawPolicy: bigint = BigInt(result[0] ?? result.publishPolicy ?? 0);
+    const rawAuthority: string = String(result[1] ?? result.publishAuthority ?? ethers.ZeroAddress);
+    return {
+      publishPolicy: Number(rawPolicy),
+      publishAuthority: ethers.getAddress(rawAuthority),
+    };
   }
 
   /**
@@ -3032,6 +4608,30 @@ export class EVMChainAdapter implements ChainAdapter {
       // Caller treats `null` as "no chain-anchored hash" and falls
       // back to the beacon path or rejects.
       return null;
+    }
+  }
+
+  /**
+   * Release the underlying RPC providers and any keep-alive HTTP
+   * sockets they hold open.
+   *
+   * Intended for test teardown — production daemons keep a single
+   * adapter alive for the lifetime of the process, so leaks there
+   * are bounded by SIGTERM. In tests, every `createEVMAdapter()`
+   * spawns a fresh `JsonRpcProvider`, and ethers never closes the
+   * keep-alive sockets on its own. After the test, those idle
+   * sockets surface as `TCP.onStreamRead ECONNRESET` unhandled
+   * rejections when Hardhat closes the connection (observed in
+   * `chain-event-poller-extra.test.ts` running first in CI — see
+   * the `ChainEventPoller.stop()` follow-up doc).
+   *
+   * Idempotent: calling twice is a no-op (ethers' `destroy()` is
+   * itself idempotent and additional `Wallet`s share the provider
+   * so destroying once flushes everything).
+   */
+  destroy(): void {
+    for (const provider of this.providers) {
+      try { provider.destroy(); } catch { /* already destroyed / not destroyable */ }
     }
   }
 }

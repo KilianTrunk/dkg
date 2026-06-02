@@ -1,8 +1,12 @@
 name: CI
 
 # Trigger rules — chosen so the same SHA is never tested twice:
-#   * push to main/v10-rc : always runs (merge-gate safety net, full
-#     Solidity coverage, required status checks for protected branches).
+#   * push to main/v10-rc/release/rc.12 : always runs (merge-gate safety
+#     net, full Solidity coverage, required status checks for protected
+#     branches). `release/rc.12` is the active release-stabilisation
+#     branch that feature/fix work currently lands on (and where bugs
+#     are reproduced/fixed), so it gets the same gate as main/v10-rc —
+#     otherwise the Node test suites only run once rc.12 merges upward.
 #   * pull_request         : runs on every open/synchronize/reopen event.
 #   * No `push` trigger on feature branches (e.g. `test/**`). When a PR
 #     is open, the `pull_request` event already covers every new commit;
@@ -10,9 +14,9 @@ name: CI
 #     or trigger the workflow manually via `workflow_dispatch`.
 on:
   push:
-    branches: [main, v10-rc]
+    branches: [main, v10-rc, release/rc.12]
   pull_request:
-    branches: [main, v10-rc]
+    branches: [main, v10-rc, release/rc.12]
   workflow_dispatch:
 
 concurrency:
@@ -69,6 +73,13 @@ jobs:
               - 'packages/evm-module/scripts/**'
               - 'packages/evm-module/hardhat.*'
               - 'packages/evm-module/package.json'
+              - 'packages/evm-module/slither.config.json'
+              - 'packages/evm-module/.solhint.json'
+              - 'packages/evm-module/.solhintignore'
+              - 'packages/evm-module/aderyn.toml'
+              - 'package.json'
+              - 'pnpm-lock.yaml'
+              - 'pnpm-workspace.yaml'
               - '.github/workflows/ci.yml'
 
   # ------------------------------------------------------------------
@@ -251,6 +262,77 @@ jobs:
         run: pnpm --filter @origintrail-official/dkg-storage test
       - name: "Chain unit (46 tests)"
         run: pnpm --filter @origintrail-official/dkg-chain test
+
+  # ------------------------------------------------------------------
+  # Tornado Blazegraph integration lane — runs the storage adapter's
+  # `*.integration.test.ts` against a REAL Blazegraph (Docker service
+  # container), with no mocks. The mocked `blazegraph.unit.test.ts`
+  # (in the tornado-core lane) asserts the wire format; this lane proves
+  # the end-to-end behaviour the mocks cannot:
+  #
+  #   * Large publishes used to fail on Blazegraph with HTTP 400
+  #     "Unable to parse form content". A publish issues a single large
+  #     DELETE DATA over the full quad set; the old adapter sent it as
+  #     URL-encoded form data (`update=…`), which Jetty's form parser
+  #     caps at `maxFormContentSize` (~200 KB on the stock image). The
+  #     fix switched the transport to a W3C SPARQL 1.1 direct POST
+  #     (`application/sparql-update` / `application/sparql-query`), which
+  #     is not form parsed and so has no size cap.
+  #
+  # The image digest pins the stock `lyrasis/blazegraph:2.1.5` manifest our
+  # node-setup wizard provisions, so this reproduces exactly what an operator
+  # runs while keeping the workflow supply-chain audit immutable. Digest from
+  # Docker Hub's `docker-content-digest` header for the 2.1.5 manifest.
+  # The integration suite is gated on BLAZEGRAPH_TEST_URL — without it the
+  # tests `describe.skipIf`-skip, so local `pnpm test` needs no Docker.
+  # ------------------------------------------------------------------
+  tornado-blazegraph:
+    name: "Tornado: storage Blazegraph integration (live server)"
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      blazegraph:
+        image: lyrasis/blazegraph:2.1.5@sha256:56be5edb612e981607edcd4fe1e6d4e66ba3303efc4bb3a7c5c8e6662e598125
+        ports:
+          - 9999:8080
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: build-outputs
+          path: /tmp
+      - name: Restore build outputs
+        run: tar -xzf /tmp/build-outputs.tgz
+
+      - name: Wait for Blazegraph to be ready
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 60); do
+            if curl -sf -o /dev/null "http://127.0.0.1:9999/bigdata/status"; then
+              echo "Blazegraph ready after ${i} attempt(s)."
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::Blazegraph did not become ready within 120s"
+          exit 1
+
+      - name: "Storage Blazegraph integration tests (no mocks)"
+        env:
+          # Stock image ships the default `kb` namespace; that's all the
+          # adapter needs (it isolates per-test via unique GRAPH IRIs).
+          BLAZEGRAPH_TEST_URL: http://127.0.0.1:9999/bigdata/namespace/kb/sparql
+        run: pnpm --filter @origintrail-official/dkg-storage exec vitest run test/blazegraph.integration.test.ts
 
   # ------------------------------------------------------------------
   # Tornado publisher lane — sharded across 4 parallel runners.
@@ -448,6 +530,89 @@ jobs:
         run: tar -xzf /tmp/build-outputs.tgz
       - name: "node-ui tests"
         run: pnpm --filter @origintrail-official/dkg-node-ui test
+
+  # node-ui Playwright e2e — REAL NODE, NO MOCKS. The suite boots a live
+  # 2-node devnet (Hardhat + two DKG daemons) via Playwright's `webServer`
+  # (see `e2e/bootstrap-devnet.ts`, chained `bootstrap && pnpm dev:ui`),
+  # drives the real UI against node 1's live `/api`, and tears the devnet
+  # down in `e2e/global-teardown.ts` when the run finishes. There is no
+  # route-mock lane anymore: every test exercises real daemon round-trips.
+  #
+  # Why 2 nodes: VM publishing needs ACK quorum from a connected CORE peer.
+  # A single-node devnet fails every publish with `QuorumUnmetError`, so the
+  # WM→SWM→VM pipeline (and the data-driven UI views that depend on it) can't
+  # be exercised. Two core nodes is the minimum (see playwright.config.ts).
+  #
+  # Channel is pinned to bundled chromium in playwright.config.ts under CI
+  # (see `ciChromium`) since we only `playwright install chromium`.
+  kosava-node-ui-e2e:
+    name: "Kosava: node-ui e2e (Playwright real-node devnet)"
+    needs: build
+    runs-on: ubuntu-latest
+    # Cold devnet boot (Solidity compile + 2-node bring-up + on-chain
+    # staking/CG registration) + the full real-node suite at 1 worker with
+    # retries. Generous so a slow runner or a publish retry never flakes the
+    # whole lane on a timeout.
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: build-outputs
+          path: /tmp
+      - name: Restore build outputs
+        run: tar -xzf /tmp/build-outputs.tgz
+      # The shared `build` artifact skips the Solidity compile (DKG_SKIP_EVM_BUILD=1),
+      # so the EVM artifacts/typechain bindings the devnet's `hardhat node` +
+      # `hardhat deploy` need aren't present. Compile them HERE — in a dedicated,
+      # observable step — so the devnet boot inside Playwright's `webServer`
+      # reuses cached artifacts and stays well inside the webServer timeout
+      # (and a compile failure is localised to this step, not buried in a
+      # webServer timeout). devnet.sh shells out to the DEFAULT hardhat config
+      # (`npx hardhat node` / `hardhat deploy --network localhost`), so compile
+      # with the same default config here.
+      - name: Compile EVM contracts (for the devnet boot)
+        run: pnpm --filter @origintrail-official/dkg-evm-module exec hardhat compile
+      - name: Install Playwright Chromium
+        run: pnpm --filter @origintrail-official/dkg-node-ui exec playwright install chromium --with-deps
+      - name: "node-ui real-node Playwright e2e (boots + tears down a live devnet)"
+        run: pnpm --filter @origintrail-official/dkg-node-ui test:e2e
+      # Upload the HTML report + traces so intermittent browser/devnet failures
+      # are diagnosable from the Actions UI (Codex review on PR #832).
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: node-ui-playwright-report
+          path: |
+            packages/node-ui/playwright-report/
+            packages/node-ui/test-results/
+            packages/node-ui/results.xml
+          retention-days: 7
+          if-no-files-found: ignore
+      # On failure the daemon logs are the only window into a devnet that
+      # didn't come up. Upload them so a red run is debuggable without a
+      # local repro.
+      - name: Upload devnet logs on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: node-ui-devnet-logs
+          path: |
+            .devnet/node*/daemon.log
+            .devnet/hardhat/node.log
+            .devnet/hardhat/deploy.log
+          retention-days: 7
+          if-no-files-found: ignore
 
   kosava-supporting:
     name: "Kosava: adapters + epcis + graph-viz + mcp-server + network-sim"
@@ -745,3 +910,155 @@ jobs:
         working-directory: packages/evm-module
         env:
           NODE_OPTIONS: --max-old-space-size=8192
+
+  # ------------------------------------------------------------------
+  # Tornado static analysis lane — Slither + Aderyn + solhint, all
+  # SARIF-uploading to GitHub Code Scanning. INFORMATIONAL ONLY for
+  # the first phase: every step is `continue-on-error: true` so the
+  # job stays green regardless of findings, while the Security tab
+  # accumulates the baseline. A future PR will flip Slither to
+  # `fail-on: high` once we've triaged the existing finding set.
+  #
+  # Triggers:
+  #   * pull_request : runs only when the `changes` filter detects
+  #                    contract-touching paths (mirrors the existing
+  #                    Tornado: Solidity lane).
+  #   * push (main / v10-rc / …) : ALWAYS runs so the Security tab
+  #                    baseline refreshes after every merge. Without
+  #                    this, post-merge findings would never bubble
+  #                    up to Code Scanning even though they apply to
+  #                    the new tip — same dual-trigger reasoning as
+  #                    the solidity-coverage lane above.
+  #
+  # Why pnpm pre-compile + ignore-compile=true: the upstream
+  # crytic/slither-action defaults to running `npm install` inside
+  # the target directory. That breaks here because the evm-module
+  # package's deps include workspace-protocol entries that npm cannot
+  # resolve. We pre-compile via pnpm at workspace level, leaving
+  # `cache/solidity-files-cache.json` + `artifacts/` for Slither's
+  # crytic-compile to read directly, and pass `ignore-compile: true`
+  # to skip the action's own install/build.
+  #
+  # Aderyn ships as the @cyfrin/aderyn npm devDep (postinstall fetches
+  # the platform-specific binary; gated by `pnpm.onlyBuiltDependencies`
+  # at the repo root). solhint is also a npm devDep. Both are then
+  # pulled by the standard `pnpm install --frozen-lockfile` step,
+  # so no scanner-specific install dance is needed.
+  # ------------------------------------------------------------------
+  tornado-static-analysis:
+    name: "Tornado: static analysis (informational)"
+    needs: changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Always run on push (refreshes Code Scanning baseline). On PR,
+    # only run when contracts changed (paths-filter, see `changes`).
+    if: github.event_name != 'pull_request' || needs.changes.outputs.contracts == 'true'
+    permissions:
+      contents: read
+      # Required to upload SARIF to GitHub Code Scanning.
+      security-events: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Cache Hardhat artifacts
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          # Same shape as the Tornado: Solidity lane (no typechain —
+          # we don't need TS bindings for static analysis, and
+          # caching them caused the failures documented at line 614
+          # of this file).
+          path: |
+            packages/evm-module/artifacts
+            packages/evm-module/cache
+          key: hardhat-${{ runner.os }}-${{ hashFiles('packages/evm-module/contracts/**/*.sol', 'packages/evm-module/hardhat.node.config.ts') }}
+
+      - name: Compile contracts (Slither reads the artifacts)
+        run: npx hardhat compile --config hardhat.node.config.ts
+        working-directory: packages/evm-module
+
+      # ------- Slither -------
+      - name: Run Slither (SARIF)
+        uses: crytic/slither-action@b52cc1cbfee9ca3e8722dd5224299d16c9a6b80f # v0.4.2
+        continue-on-error: true
+        id: slither
+        with:
+          target: packages/evm-module
+          slither-config: packages/evm-module/slither.config.json
+          # Skip the action's npm-install + compile step — pnpm
+          # workspace deps can't resolve via npm. We compiled above.
+          ignore-compile: true
+          sarif: slither.sarif
+          # Keep the action green even on findings; the upload step
+          # below sends them to Code Scanning regardless.
+          fail-on: none
+          # If a smoke run reveals viaIR-related SlithIR translation
+          # issues, uncomment:
+          # slither-args: --skip-assembly
+
+      - name: Upload Slither SARIF to GitHub Code Scanning
+        # Skip the upload on forked PRs: GitHub downgrades
+        # `security-events: write` to read-only for fork PRs and the
+        # upload would 403. Mirrors the same fork guard used by the
+        # zizmor lane in supply-chain-scan.yml.
+        if: |
+          always()
+          && steps.slither.outputs.sarif != ''
+          && hashFiles('slither.sarif') != ''
+          && (github.event_name != 'pull_request'
+              || github.event.pull_request.head.repo.full_name == github.repository)
+        uses: github/codeql-action/upload-sarif@7211b7c8077ea37d8641b6271f6a365a22a5fbfa # v4.36.0
+        continue-on-error: true
+        with:
+          sarif_file: ${{ steps.slither.outputs.sarif }}
+          category: slither
+
+      # ------- Aderyn -------
+      - name: Run Aderyn (SARIF)
+        # Aderyn auto-detects Hardhat from hardhat.config.ts and uses
+        # the artifacts produced by the compile step above. Output
+        # path is relative to working-directory.
+        continue-on-error: true
+        working-directory: packages/evm-module
+        run: pnpm exec aderyn . --output aderyn.sarif
+
+      - name: Upload Aderyn SARIF to GitHub Code Scanning
+        if: |
+          always()
+          && hashFiles('packages/evm-module/aderyn.sarif') != ''
+          && (github.event_name != 'pull_request'
+              || github.event.pull_request.head.repo.full_name == github.repository)
+        uses: github/codeql-action/upload-sarif@7211b7c8077ea37d8641b6271f6a365a22a5fbfa # v4.36.0
+        continue-on-error: true
+        with:
+          sarif_file: packages/evm-module/aderyn.sarif
+          category: aderyn
+
+      # ------- solhint -------
+      - name: Run solhint (SARIF)
+        continue-on-error: true
+        working-directory: packages/evm-module
+        # `-f sarif` writes JSON to stdout. We redirect to a file so
+        # the upload step has a stable path.
+        run: pnpm exec solhint -f sarif 'contracts/**/*.sol' > solhint.sarif
+
+      - name: Upload solhint SARIF to GitHub Code Scanning
+        if: |
+          always()
+          && hashFiles('packages/evm-module/solhint.sarif') != ''
+          && (github.event_name != 'pull_request'
+              || github.event.pull_request.head.repo.full_name == github.repository)
+        uses: github/codeql-action/upload-sarif@7211b7c8077ea37d8641b6271f6a365a22a5fbfa # v4.36.0
+        continue-on-error: true
+        with:
+          sarif_file: packages/evm-module/solhint.sarif
+          category: solhint

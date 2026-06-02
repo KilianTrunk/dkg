@@ -95,7 +95,11 @@ describe('BlazegraphStore (mocked HTTP)', () => {
       expect(r.bindings[0].name).toBe('"Alice"');
     }
     const [, init] = fetchCalls[0];
-    expect(String(init?.body)).toMatch(/^query=/);
+    // Direct POST: raw query as the request body with application/sparql-query,
+    // NOT URL-encoded form data (which would hit Jetty's maxFormContentSize cap).
+    expect((init?.headers as Record<string, string>)['Content-Type']).toBe('application/sparql-query');
+    expect(String(init?.body)).toMatch(/^SELECT /);
+    expect(String(init?.body)).not.toMatch(/^query=/);
   });
 
   it('ASK query returns boolean result', async () => {
@@ -133,10 +137,12 @@ describe('BlazegraphStore (mocked HTTP)', () => {
     const s = new BlazegraphStore(baseUrl);
     await s.dropGraph('http://ex.org/g1');
     expect(fetchCalls.length).toBeGreaterThan(0);
+    // Direct POST: raw update body with application/sparql-update (not form-encoded).
     const call = fetchCalls.find((c) =>
-      String(c[1]?.body).includes('DROP%20SILENT%20GRAPH'),
+      String(c[1]?.body).includes('DROP SILENT GRAPH'),
     );
     expect(call).toBeDefined();
+    expect((call?.[1]?.headers as Record<string, string>)['Content-Type']).toBe('application/sparql-update');
   });
 
   it('delete is a no-op for empty quad list', async () => {
@@ -152,7 +158,7 @@ describe('BlazegraphStore (mocked HTTP)', () => {
       { subject: 'http://s', predicate: 'http://p', object: '"o"', graph: 'http://g' },
     ]);
     const call = fetchCalls.find((c) =>
-      decodeURIComponent(String(c[1]?.body)).includes('DELETE DATA'),
+      String(c[1]?.body).includes('DELETE DATA'),
     );
     expect(call).toBeDefined();
   });
@@ -169,7 +175,7 @@ describe('BlazegraphStore (mocked HTTP)', () => {
     let call = 0;
     setFetch(async (_url, init) => {
       const body = String(init?.body ?? '');
-      if (body.startsWith('query=')) {
+      if (body.startsWith('SELECT')) {
         call++;
         return new Response(
           JSON.stringify({
@@ -186,11 +192,31 @@ describe('BlazegraphStore (mocked HTTP)', () => {
     expect(removed).toBe(3);
   });
 
+  it('deleteByPattern count branch keyed on direct-POST SELECT body', async () => {
+    // Guards the direct-POST migration: count queries are sent as a raw
+    // SPARQL body starting with SELECT, not as `query=...` form data.
+    let sawRawSelect = false;
+    setFetch(async (_url, init) => {
+      const body = String(init?.body ?? '');
+      if (body.startsWith('SELECT')) {
+        sawRawSelect = true;
+        return new Response(
+          JSON.stringify({ head: { vars: ['c'] }, results: { bindings: [{ c: { type: 'literal', value: '1' } }] } }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        );
+      }
+      return new Response(null, { status: 200 });
+    });
+    const s = new BlazegraphStore(baseUrl);
+    await s.deleteByPattern({ graph: 'http://g', subject: 'http://s' });
+    expect(sawRawSelect).toBe(true);
+  });
+
   it('deleteBySubjectPrefix returns count delta', async () => {
     let call = 0;
     setFetch(async (_url, init) => {
       const body = String(init?.body ?? '');
-      if (body.startsWith('query=')) {
+      if (body.startsWith('SELECT')) {
         call++;
         return new Response(
           JSON.stringify({
@@ -218,7 +244,7 @@ describe('BlazegraphStore (mocked HTTP)', () => {
     const s = new BlazegraphStore(baseUrl);
     const n = await s.countQuads();
     expect(n).toBe(99);
-    const body = decodeURIComponent(String(fetchCalls[0][1]?.body));
+    const body = String(fetchCalls[0][1]?.body);
     expect(body).toContain('UNION');
   });
 
@@ -260,5 +286,41 @@ describe('BlazegraphStore (mocked HTTP)', () => {
     await expect(s.createGraph('http://any')).resolves.toBeUndefined();
     await expect(s.close()).resolves.toBeUndefined();
     expect(fetchCalls).toHaveLength(0);
+  });
+
+  it('insert throws when a literal exceeds MUTF-8 65535 limit', async () => {
+    setFetch(async () => new Response(null, { status: 200 }));
+    const s = new BlazegraphStore(baseUrl);
+    // 70 000 ASCII chars = 70 000 MUTF-8 bytes, exceeds 65 535
+    const oversized = '"' + 'x'.repeat(70_000) + '"';
+    await expect(s.insert([
+      { subject: 'http://s1', predicate: 'http://p', object: '"small"', graph: 'http://g' },
+      { subject: 'http://s2', predicate: 'http://p', object: oversized, graph: 'http://g' },
+    ])).rejects.toThrow(/MUTF-8 limit/);
+    expect(fetchCalls).toHaveLength(0);
+  });
+
+  it('insert allows 25KB ASCII literal (under MUTF-8 limit)', async () => {
+    setFetch(async () => new Response(null, { status: 200 }));
+    const s = new BlazegraphStore(baseUrl);
+    const largeButValid = '"' + 'x'.repeat(25_000) + '"';
+    await s.insert([
+      { subject: 'http://s1', predicate: 'http://p', object: largeButValid, graph: 'http://g' },
+    ]);
+    expect(fetchCalls).toHaveLength(1);
+    const body = String(fetchCalls[0][1]?.body);
+    expect(body).toContain('http://s1');
+  });
+
+  it('insert keeps non-literal quads regardless of size', async () => {
+    setFetch(async () => new Response(null, { status: 200 }));
+    const s = new BlazegraphStore(baseUrl);
+    const longUri = 'http://example.org/' + 'a'.repeat(80_000);
+    await s.insert([
+      { subject: longUri, predicate: 'http://p', object: '"o"', graph: 'http://g' },
+    ]);
+    expect(fetchCalls).toHaveLength(1);
+    const body = String(fetchCalls[0][1]?.body);
+    expect(body).toContain(longUri);
   });
 });

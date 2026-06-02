@@ -70,6 +70,14 @@ export async function runSyncOnConnect(context: SyncOnConnectContext): Promise<S
   syncingPeers.add(remotePeer);
 
   let durableSyncCompleted = false;
+  const runNonTransportStep = async <T>(step: () => Promise<T>): Promise<T> => {
+    try {
+      return await step();
+    } catch (err) {
+      throw new SyncOnConnectPostSyncError(remotePeer, err);
+    }
+  };
+
   try {
     const protocols = await getPeerProtocols(remotePeer);
 
@@ -89,7 +97,6 @@ export async function runSyncOnConnect(context: SyncOnConnectContext): Promise<S
     logInfo(ctx, `Syncing from peer ${shortPeer}...`);
     const knownCgsBefore = new Set(getSyncContextGraphs() ?? []);
     const synced = await syncFromPeer(remotePeer);
-    durableSyncCompleted = true;
     logInfo(ctx, `Synced ${synced} data triples from peer ${shortPeer}`);
 
     const syncScope = new Set<string>([
@@ -97,9 +104,9 @@ export async function runSyncOnConnect(context: SyncOnConnectContext): Promise<S
       SYSTEM_CONTEXT_GRAPHS.ONTOLOGY,
       ...(getSyncContextGraphs() ?? []),
     ]);
-    await refreshMetaSyncedFlags(syncScope);
+    await runNonTransportStep(() => refreshMetaSyncedFlags(syncScope));
 
-    await discoverContextGraphsFromStore();
+    await runNonTransportStep(() => discoverContextGraphsFromStore());
 
     const allCgsAfter = getSyncContextGraphs() ?? [];
     const newlyDiscovered = allCgsAfter.filter((id) => !knownCgsBefore.has(id));
@@ -107,9 +114,10 @@ export async function runSyncOnConnect(context: SyncOnConnectContext): Promise<S
       logInfo(ctx, `Discovered ${newlyDiscovered.length} new CG(s) — syncing durable data from ${shortPeer}`);
       const discoverSynced = await syncFromPeer(remotePeer, newlyDiscovered);
       logInfo(ctx, `Synced ${discoverSynced} durable triples for newly discovered CG(s) from ${shortPeer}`);
-      await refreshMetaSyncedFlags(newlyDiscovered);
+      await runNonTransportStep(() => refreshMetaSyncedFlags(newlyDiscovered));
     }
 
+    durableSyncCompleted = true;
     const wsContextGraphIds = getSyncContextGraphs() ?? [];
     if (syncSharedMemoryOnConnect && wsContextGraphIds.length > 0) {
       const wsSynced = await syncSharedMemoryFromPeer(remotePeer, wsContextGraphIds);
@@ -121,6 +129,9 @@ export async function runSyncOnConnect(context: SyncOnConnectContext): Promise<S
     context.onPeerSynced?.(remotePeer);
     return 'synced';
   } catch (err) {
+    if (err instanceof SyncOnConnectPostSyncError) {
+      throw err;
+    }
     if (durableSyncCompleted) {
       throw new SyncOnConnectPostSyncError(remotePeer, err);
     }

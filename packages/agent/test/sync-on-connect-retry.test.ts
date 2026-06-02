@@ -124,6 +124,41 @@ describe('runSyncOnConnect callbacks', () => {
     expect(syncingPeers.has(remotePeer)).toBe(false);
   });
 
+  it('leaves newly discovered durable sync failures eligible for peer backoff', async () => {
+    const remotePeer = freshPeerIdString();
+    let contextGraphs = ['cg-a'];
+    const secondDurableError = new Error('newly discovered durable sync failed');
+    const syncFromPeer = vi.fn()
+      .mockResolvedValueOnce(7)
+      .mockRejectedValueOnce(secondDurableError);
+    let caught: unknown;
+
+    try {
+      await runSyncOnConnect({
+        remotePeer,
+        syncingPeers: new Set(),
+        getPeerProtocols: async () => [PROTOCOL_SYNC],
+        knownCorePeerIds: new Set(),
+        getSyncContextGraphs: () => contextGraphs,
+        syncFromPeer,
+        refreshMetaSyncedFlags: async () => {},
+        discoverContextGraphsFromStore: async () => {
+          contextGraphs = ['cg-a', 'cg-b'];
+          return 1;
+        },
+        syncSharedMemoryFromPeer: async () => 0,
+        logInfo: noopLog,
+      });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).toBe(secondDurableError);
+    expect(caught).not.toBeInstanceOf(SyncOnConnectPostSyncError);
+    expect(syncFromPeer).toHaveBeenCalledWith(remotePeer);
+    expect(syncFromPeer).toHaveBeenCalledWith(remotePeer, ['cg-b']);
+  });
+
   it('can skip shared-memory catch-up on connect while still running durable sync', async () => {
     const remotePeer = freshPeerIdString();
     const syncFromPeer = vi.fn().mockResolvedValue(3);

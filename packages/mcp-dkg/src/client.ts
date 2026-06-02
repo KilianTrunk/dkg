@@ -136,8 +136,9 @@ export interface PeerInfo {
      * Per-protocol pending breakdown. Empty object when this peer
      * has no pending entries on the substrate at all.
      *
-     * Keys are libp2p protocol ids (e.g. `/dkg/10.0.1/sync`,
-     * `/dkg/10.0.1/message`).
+     * Keys are libp2p protocol ids (e.g. `/dkg/10.0.1/message`,
+     * `/dkg/10.0.1/swm-update`). Sync is off the substrate so it does
+     * not appear here.
      */
     byProtocol: Record<
       string,

@@ -262,9 +262,9 @@ describe('DKGAgent.getPeerDiagnostics', () => {
     });
 
     it('extracts multiaddrs + protocols from a populated peerStore entry', async () => {
-      // rc.9 PR-E: `syncCapable` now tracks the current PROTOCOL_SYNC
-      // wire ID (`/dkg/10.0.1/sync`), not the legacy `/dkg/10.0.0/sync`.
-      // A peer advertising the bumped protocol is reported sync-capable.
+      // `syncCapable` tracks the current PROTOCOL_SYNC wire ID
+      // (`/dkg/10.0.2/sync` after sync left the messenger substrate).
+      // A peer advertising the current protocol is reported sync-capable.
       const agentLike = makeAgentLike({
         rawConnections: [],
         peerStoreEntries: new Map([
@@ -275,7 +275,7 @@ describe('DKGAgent.getPeerDiagnostics', () => {
                 { multiaddr: { toString: () => '/ip4/1.2.3.4/tcp/4001' } },
                 { multiaddr: { toString: () => `/ip4/5.6.7.8/tcp/4001/p2p/${PEER_A}` } },
               ],
-              protocols: ['/dkg/10.0.1/sync', '/dkg/10.0.1/message'],
+              protocols: ['/dkg/10.0.2/sync', '/dkg/10.0.1/message'],
             },
           ],
         ]),
@@ -284,13 +284,13 @@ describe('DKGAgent.getPeerDiagnostics', () => {
       expect(diag.peerStore).toEqual({
         knownMultiaddrCount: 2,
         multiaddrs: ['/ip4/1.2.3.4/tcp/4001', `/ip4/5.6.7.8/tcp/4001/p2p/${PEER_A}`],
-        protocols: ['/dkg/10.0.1/sync', '/dkg/10.0.1/message'],
+        protocols: ['/dkg/10.0.2/sync', '/dkg/10.0.1/message'],
         // No `metadata` provided in the stub → identify hasn't run
         // → both version fields null (rc.11 follow-up).
         nodeVersion: null,
         protocolVersion: null,
       });
-      expect(diag.protocols).toEqual(['/dkg/10.0.1/sync', '/dkg/10.0.1/message']);
+      expect(diag.protocols).toEqual(['/dkg/10.0.2/sync', '/dkg/10.0.1/message']);
       expect(diag.syncCapable).toBe(true);
     });
 
@@ -437,11 +437,12 @@ describe('DKGAgent.getPeerDiagnostics', () => {
         // 2x chat (newer + older)
         makeOutboxEntry({ peer: PEER_A, messageId: 'chat-1', attempts: 1, firstFailureAt: 2000 }),
         makeOutboxEntry({ peer: PEER_A, messageId: 'chat-2', attempts: 2, firstFailureAt: 1000 }),
-        // 1x sync (the migration this PR ships)
+        // 1x swm-update (a protocol still carried by the substrate;
+        // sync itself is no longer on the substrate so it can't appear here)
         makeOutboxEntry({
           peer: PEER_A,
-          protocol: '/dkg/10.0.1/sync',
-          messageId: 'sync-1',
+          protocol: '/dkg/10.0.1/swm-update',
+          messageId: 'swm-update-1',
           attempts: 3,
           firstFailureAt: 1500,
         }),
@@ -456,8 +457,8 @@ describe('DKGAgent.getPeerDiagnostics', () => {
         // PEER_B entry — must NOT appear in PEER_A's per-protocol view.
         makeOutboxEntry({
           peer: PEER_B,
-          protocol: '/dkg/10.0.1/sync',
-          messageId: 'sync-other-peer',
+          protocol: '/dkg/10.0.1/swm-update',
+          messageId: 'swm-update-other-peer',
           attempts: 7,
           firstFailureAt: 100,
         }),
@@ -474,9 +475,9 @@ describe('DKGAgent.getPeerDiagnostics', () => {
       expect(Object.keys(diag.outbox.byProtocol).sort()).toEqual([
         '/dkg/10.0.1/message',
         '/dkg/10.0.1/swm-sender-key',
-        '/dkg/10.0.1/sync',
+        '/dkg/10.0.1/swm-update',
       ]);
-      expect(diag.outbox.byProtocol['/dkg/10.0.1/sync']).toEqual({
+      expect(diag.outbox.byProtocol['/dkg/10.0.1/swm-update']).toEqual({
         pendingCount: 1,
         oldestFirstFailureAt: 1500,
         attempts: [3],
@@ -491,23 +492,24 @@ describe('DKGAgent.getPeerDiagnostics', () => {
         oldestFirstFailureAt: 1000,
         attempts: [2, 1],
       });
-      // PEER_B sync entry MUST NOT bleed into PEER_A's per-protocol view.
-      expect(diag.outbox.byProtocol['/dkg/10.0.1/sync'].attempts).not.toContain(7);
+      // PEER_B entry MUST NOT bleed into PEER_A's per-protocol view.
+      expect(diag.outbox.byProtocol['/dkg/10.0.1/swm-update'].attempts).not.toContain(7);
     });
 
     /**
-     * Regression for the exact bug Codex described: "sync catch-up
-     * gets stuck and is invisible in the diagnostics surface". A peer
-     * with ONLY sync queued (no chat) used to report
-     * `outbox.pendingCount=0` and looked healthy. Now sync is visible
-     * in `byProtocol` so operators can tell the difference.
+     * Regression for the diagnostics gap Codex described: a non-chat
+     * substrate protocol stuck in the outbox used to report
+     * `outbox.pendingCount=0` and looked healthy. The per-protocol
+     * `byProtocol` view makes it visible. (Originally written for sync;
+     * sync has since left the substrate, so this uses swm-update — any
+     * substrate protocol exercises the same aggregation path.)
      */
-    it('makes a sync-only stuck peer visible in diagnostics (was invisible pre-rc.9 PR-E)', async () => {
+    it('makes a non-chat-only stuck peer visible in diagnostics', async () => {
       const outboxEntries: StubOutboxEntry[] = [
         makeOutboxEntry({
           peer: PEER_A,
-          protocol: '/dkg/10.0.1/sync',
-          messageId: 'sync-stuck',
+          protocol: '/dkg/10.0.1/swm-update',
+          messageId: 'swm-update-stuck',
           attempts: 4,
           firstFailureAt: 7000,
         }),
@@ -520,9 +522,9 @@ describe('DKGAgent.getPeerDiagnostics', () => {
       expect(diag.outbox.pendingCount).toBe(0);
       expect(diag.outbox.oldestFirstFailureAt).toBeNull();
 
-      // But the per-protocol view tells operators that sync IS stuck.
+      // But the per-protocol view tells operators the protocol IS stuck.
       expect(diag.outbox.byProtocol).toEqual({
-        '/dkg/10.0.1/sync': {
+        '/dkg/10.0.1/swm-update': {
           pendingCount: 1,
           oldestFirstFailureAt: 7000,
           attempts: [4],

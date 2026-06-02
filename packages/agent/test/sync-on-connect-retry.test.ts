@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { DKGAgent } from '../src/index.js';
 import { MockChainAdapter } from '@origintrail-official/dkg-chain';
-import { PROTOCOL_SYNC } from '@origintrail-official/dkg-core';
+import { PROTOCOL_SYNC, PROTOCOL_ACCESS } from '@origintrail-official/dkg-core';
 import { peerIdFromString } from '@libp2p/peer-id';
 import { runSyncOnConnect } from '../src/sync/on-connect/sync-on-connect.js';
 import type { OperationContext } from '@origintrail-official/dkg-core';
@@ -329,10 +329,72 @@ describe('DKGAgent sync retry — periodic reconciler', () => {
       await agent.stop().catch(() => {});
     }
   });
+
+  it('backs off a never-successful peer exponentially and skips it until the retry window elapses', async () => {
+    const agent = await DKGAgent.create({
+      name: 'ReconcilerBackoff',
+      listenHost: '127.0.0.1',
+      chainAdapter: new MockChainAdapter(),
+    });
+    try {
+      await agent.start();
+
+      const peerA = freshPeerIdString();
+      const origGetPeers = agent.node.libp2p.getPeers.bind(agent.node.libp2p);
+      vi.spyOn(agent.node.libp2p, 'getPeers').mockImplementation(
+        () => [...origGetPeers(), peerIdFromString(peerA)],
+      );
+
+      const calls: string[] = [];
+      // Resolve WITHOUT stamping lastSuccessfulSyncAt: the reconciler
+      // then treats every attempt as a failure (mirrors a dead /
+      // stream-resetting peer that never completes a sync).
+      (agent as any).trySyncFromPeer = async (peerId: string) => {
+        calls.push(peerId);
+      };
+
+      const backoffMap = (agent as any).syncReconcilerBackoff as Map<
+        string,
+        { failures: number; nextRetryAt: number }
+      >;
+
+      // Tick 1: never synced → fires once and records failure #1.
+      const t1 = Date.now();
+      await (agent as any).reconcileSyncFromConnectedPeers();
+      await new Promise(r => setTimeout(r, 50));
+      expect(calls).toEqual([peerA]);
+      const b1 = backoffMap.get(peerA)!;
+      expect(b1.failures).toBe(1);
+      const delay1 = b1.nextRetryAt - t1;
+      expect(delay1).toBeGreaterThan(0);
+
+      // Tick 2 immediately: still inside the backoff window → skipped.
+      await (agent as any).reconcileSyncFromConnectedPeers();
+      await new Promise(r => setTimeout(r, 50));
+      expect(calls).toEqual([peerA]);
+      expect(backoffMap.get(peerA)!.failures).toBe(1);
+
+      // Force the window to have elapsed, then tick again → fires and
+      // records failure #2 with a strictly larger window (exponential).
+      backoffMap.set(peerA, { failures: 1, nextRetryAt: Date.now() - 1 });
+      const t2 = Date.now();
+      await (agent as any).reconcileSyncFromConnectedPeers();
+      await new Promise(r => setTimeout(r, 50));
+      expect(calls).toEqual([peerA, peerA]);
+      const b2 = backoffMap.get(peerA)!;
+      expect(b2.failures).toBe(2);
+      const delay2 = b2.nextRetryAt - t2;
+      // failure-2 window (~10min ±25%) strictly exceeds the failure-1
+      // window (~5min ±25%) even at worst-case jitter (7.5min > 6.25min).
+      expect(delay2).toBeGreaterThan(delay1);
+    } finally {
+      await agent.stop().catch(() => {});
+    }
+  });
 });
 
 describe('DKGAgent sync state lifecycle', () => {
-  it('clears skippedNoSyncPeers and lastSuccessfulSyncAt on connection:close', async () => {
+  it('clears skippedNoSyncPeers, lastSuccessfulSyncAt and sync backoff on connection:close', async () => {
     const agent = await DKGAgent.create({
       name: 'ConnectionCloseClearsState',
       listenHost: '127.0.0.1',
@@ -344,6 +406,7 @@ describe('DKGAgent sync state lifecycle', () => {
       const remotePeer = freshPeerIdString();
       (agent as any).skippedNoSyncPeers.add(remotePeer);
       (agent as any).lastSuccessfulSyncAt.set(remotePeer, Date.now());
+      (agent as any).syncReconcilerBackoff.set(remotePeer, { failures: 3, nextRetryAt: Date.now() + 100_000 });
 
       // Stub getPeers so the close handler considers the peer fully gone.
       vi.spyOn(agent.node.libp2p, 'getPeers').mockReturnValue([]);
@@ -359,6 +422,38 @@ describe('DKGAgent sync state lifecycle', () => {
 
       expect((agent as any).skippedNoSyncPeers.has(remotePeer)).toBe(false);
       expect((agent as any).lastSuccessfulSyncAt.has(remotePeer)).toBe(false);
+      expect((agent as any).syncReconcilerBackoff.has(remotePeer)).toBe(false);
+    } finally {
+      await agent.stop().catch(() => {});
+    }
+  });
+});
+
+describe('DKGAgent sync transport — off the messenger substrate (node-ui.db bloat fix)', () => {
+  it('registers PROTOCOL_SYNC on the raw ProtocolRouter, NOT the Messenger substrate', async () => {
+    const agent = await DKGAgent.create({
+      name: 'SyncOffSubstrate',
+      listenHost: '127.0.0.1',
+      chainAdapter: new MockChainAdapter(),
+    });
+    try {
+      await agent.start();
+
+      const messengerHandlers = (agent as any).messenger.handlers as Map<string, unknown>;
+      const routerHandlers = (agent as any).router.handlers as Map<string, unknown>;
+
+      // Regression guard: routing sync through `messenger.register` /
+      // `sendReliable` is exactly what cached large, never-reused sync
+      // page responses into `message_idempotency` (the ~2.9 GB
+      // node-ui.db bloat). Sync MUST live on the raw router so no
+      // idempotency rows are ever written for it.
+      expect(messengerHandlers.has(PROTOCOL_SYNC)).toBe(false);
+      expect(routerHandlers.has(PROTOCOL_SYNC)).toBe(true);
+
+      // Sanity: a genuine substrate protocol (private-access) IS still
+      // registered through the Messenger, so the assertion above is
+      // meaningful and not vacuously true.
+      expect(messengerHandlers.has(PROTOCOL_ACCESS)).toBe(true);
     } finally {
       await agent.stop().catch(() => {});
     }

@@ -6433,8 +6433,14 @@ export class DKGAgent {
    * commitment is NOT an identity proof: a devnet-reset slot reused by a
    * different no-commitment public CG would otherwise disable encryption for the
    * wrong local graph, so a downgrade decision requires an affirmative binding.
-   * Returns `true` (proceed to the liveness/policy gate) ONLY where the adapter
-   * cannot supply the anchor at all (no `getContextGraphNameHash` getter).
+   * Returns `true` (proceed to the liveness/policy gate) where the adapter
+   * cannot supply the anchor at all (no `getContextGraphNameHash` getter), AND
+   * for a DIRECT NUMERIC SELF-ADDRESS — a local id that IS its own numeric
+   * on-chain slot (`onChainId === id`, e.g. a CG mirroring a raw slot created
+   * via the low-level `createOnChainContextGraph` path). The latter is the
+   * caller naming the slot directly, not a cleartext→numeric remapping, so it is
+   * treated like the bare-numeric raw-slot path (not identity-bound) and gated
+   * by liveness + fresh policy alone.
    */
   private async localCgMatchesOnChainSlot(
     contextGraphId: string,
@@ -6452,8 +6458,20 @@ export class DKGAgent {
     if (numericId <= 0n) return true;
 
     const trimmed = contextGraphId.trim();
-    // A locally-resolved id can be committed two ways, and both are legitimate
-    // (#884 review 🔴 GZumc + 🔴 GaJf_), so accept a match against EITHER:
+    // DIRECT NUMERIC SELF-ADDRESS: a local CG whose own id IS its numeric
+    // on-chain slot (`getContextGraphOnChainId('42') === '42'` — e.g. a CG
+    // created to mirror a raw slot via the low-level createOnChainContextGraph
+    // path, whose local id is the numeric id itself) is NOT a cleartext→numeric
+    // indirection. It is the caller naming the slot directly, identical to the
+    // bare-numeric raw-slot path which is intentionally NOT identity-bound
+    // (#884 review GZEqF test). There is no separate committed cleartext name to
+    // bind against here (any curator name-hash is unrelated to the numeric id),
+    // so name-hash binding is inapplicable — defer to the liveness + fresh-policy
+    // gate. The stale-mapping risk the name-hash defends against (#884 review
+    // 🔴 GaZk2) only exists for a cleartext id that REMAPS to a different slot.
+    if (/^\d+$/.test(trimmed) && trimmed === onChainId.trim()) return true;
+    // A locally-resolved (cleartext) id can be committed two ways, and both are
+    // legitimate (#884 review 🔴 GZumc + 🔴 GaJf_), so accept a match against EITHER:
     //   - CLEARTEXT (always): a curator-created CG stores its cleartext id (even
     //     one that happens to look like a 0x+64-hex string), and registration
     //     commits keccak256(utf8(cleartextId)). → keccak(utf8(trimmed)).

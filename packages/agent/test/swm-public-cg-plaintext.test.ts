@@ -187,7 +187,22 @@ describe('DKGAgent.isContextGraphPublicOnChain', () => {
     );
   });
 
-  it('fails closed when the locally-resolved slot has NO committed name-hash (#884 review GaZk2)', async () => {
+  it('proceeds for a DIRECT NUMERIC SELF-ADDRESS even with NO committed name-hash (#884 review GaZk2)', async () => {
+    // A local CG whose own id IS its numeric on-chain slot (onChainId === id,
+    // e.g. a CG mirroring a raw slot created via createOnChainContextGraph,
+    // which commits no name-hash) is a direct slot address, not a
+    // cleartext→numeric remapping. Name-hash binding is inapplicable, so a
+    // missing commitment does NOT fail closed — liveness + fresh public policy
+    // still win. (Regression for the e2e-chain real-blockchain publish path.)
+    const agentLike = makeAgentLike({ onChainId: '7', accessPolicy: 0, onChainNameHash: null });
+    await expect(isPublic(agentLike, '7')).resolves.toBe(true);
+    expect(agentLike.chain.getContextGraphAccessPolicy).toHaveBeenCalledWith(7n);
+    // The binding is skipped entirely for a self-address, so the name-hash getter
+    // is never even consulted.
+    expect(agentLike.chain.getContextGraphNameHash).not.toHaveBeenCalled();
+  });
+
+  it('fails closed when a CLEARTEXT-mapped slot has NO committed name-hash (#884 review GaZk2)', async () => {
     // A locally-mapped slot with NO on-chain name commitment (null) is NOT an
     // identity proof: after a devnet reset the persisted mapping could point at a
     // DIFFERENT public CG that also never committed a name-hash. A downgrade

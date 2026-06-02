@@ -549,6 +549,9 @@ export class FinalizationHandler {
       return 'no-swm';
     }
     const { rootEntities, sharedMemoryQuads } = snapshot;
+    // The snapshot may have been found in a sub-graph the caller didn't know
+    // about; promote into THAT namespace so the data lands in the right graph.
+    const resolvedSubGraphName = snapshot.subGraphName ?? subGraphName;
 
     const finalizationVersion: MaterializedVersion = { blockNumber: versionBlock, txIndex: 0 };
     // Chain-driven reconciliation never requests same-graph dual-write — the
@@ -569,7 +572,7 @@ export class FinalizationHandler {
       endKAId: kaId,
       batchId: 0n,
       ctxGraphId,
-      subGraphName,
+      subGraphName: resolvedSubGraphName,
       authorAddress,
       finalizationVersion,
       targetMetaGraph,
@@ -628,6 +631,42 @@ export class FinalizationHandler {
    * scope here).
    */
   private async findSwmSnapshotForMerkleRoot(
+    contextGraphId: string,
+    merkleRoot: Uint8Array,
+    subGraphName?: string,
+  ): Promise<{ rootEntities: string[]; sharedMemoryQuads: Quad[]; subGraphName?: string } | null> {
+    // Caller knows the exact namespace → search only that one.
+    if (subGraphName) {
+      const hit = await this.findSwmSnapshotInNamespace(contextGraphId, merkleRoot, subGraphName);
+      return hit ? { ...hit, subGraphName } : null;
+    }
+
+    // No namespace supplied (the chain-driven path never knows it). Try the
+    // root workspace first, then fall back to every registered sub-graph —
+    // otherwise a KA published into a named sub-graph would stay `no-swm`
+    // forever because its SWM snapshot lives under a sub-graph meta graph,
+    // not the root workspace meta. Return the namespace we matched in so the
+    // caller promotes into the correct data graph.
+    const rootHit = await this.findSwmSnapshotInNamespace(contextGraphId, merkleRoot, undefined);
+    if (rootHit) return { ...rootHit, subGraphName: undefined };
+
+    let subGraphNames: string[] = [];
+    try {
+      subGraphNames = await new GraphManager(this.store).listSubGraphs(contextGraphId);
+    } catch { /* no sub-graphs / store can't enumerate */ }
+    for (const sg of subGraphNames) {
+      const hit = await this.findSwmSnapshotInNamespace(contextGraphId, merkleRoot, sg);
+      if (hit) return { ...hit, subGraphName: sg };
+    }
+    return null;
+  }
+
+  /**
+   * Search a single SWM namespace (root workspace when `subGraphName` is
+   * undefined, otherwise the named sub-graph's shared-memory meta) for a
+   * WorkspaceOperation whose recomputed flat-KC root matches `merkleRoot`.
+   */
+  private async findSwmSnapshotInNamespace(
     contextGraphId: string,
     merkleRoot: Uint8Array,
     subGraphName?: string,

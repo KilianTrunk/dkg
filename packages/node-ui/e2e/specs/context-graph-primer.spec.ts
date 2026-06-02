@@ -35,14 +35,24 @@ async function expectPrimerRendered(page: Page) {
   await expect(pipeline.locator('.swm')).toHaveText('Shared Working Memory');
   await expect(pipeline.locator('.vm')).toHaveText('Verifiable Memory');
 
-  // Exactly the five primer sections, in order, each with a non-trivial body.
+  // Exactly the five primer sections, in order — the headings are the structural
+  // contract worth pinning.
   const headings = view.locator('.v10-primer-section h2');
   await expect(headings).toHaveCount(PRIMER_SECTIONS.length);
   expect((await headings.allInnerTexts()).map((t) => t.trim())).toEqual(PRIMER_SECTIONS);
-  const bodies = view.locator('.v10-primer-section p');
-  await expect(bodies).toHaveCount(PRIMER_SECTIONS.length);
+
+  // Each section must render a non-trivial body, but DON'T pin the exact <p>
+  // count: a harmless copy edit that splits one section into two paragraphs is
+  // not a behavioral regression. Assert per-section that the combined paragraph
+  // text is substantial instead.
+  const sections = view.locator('.v10-primer-section');
+  await expect(sections).toHaveCount(PRIMER_SECTIONS.length);
   for (let i = 0; i < PRIMER_SECTIONS.length; i++) {
-    expect(((await bodies.nth(i).textContent()) ?? '').trim().length).toBeGreaterThan(20);
+    const bodyText = (await sections.nth(i).locator('p').allInnerTexts()).join(' ').trim();
+    expect(
+      bodyText.length,
+      `primer section "${PRIMER_SECTIONS[i]}" must render body copy`,
+    ).toBeGreaterThan(20);
   }
 }
 

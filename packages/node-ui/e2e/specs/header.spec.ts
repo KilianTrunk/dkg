@@ -91,7 +91,11 @@ test.describe('Header', () => {
 
     if (apiCount === 0) {
       // Empty feed → the pane must show its explicit empty state, never rows.
-      await expect(page.locator(sel.header.notifEmpty)).toBeVisible();
+      // The pane first passes through loading / identity-pending before settling
+      // on the empty state, so wait for that explicit empty state (generous
+      // timeout) to confirm loading has cleared — only THEN are zero rows the
+      // steady-state truth rather than a mid-load snapshot that flakes.
+      await expect(page.locator(sel.header.notifEmpty)).toBeVisible({ timeout: 15_000 });
       expect(await header.getNotificationTexts()).toHaveLength(0);
     } else {
       // Non-empty feed → the rows MUST render once the async fetch + identity

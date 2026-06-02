@@ -34,7 +34,7 @@ export default async function globalSetup(): Promise<void> {
   // Idempotency check: the NAMED_SUBGRAPH sub-graph is the seed's final step and
   // uses an e2e-namespaced slug, so its presence means a prior run of THIS suite
   // already populated PRIMARY_CG end-to-end (VM entity + sub-graph).
-  const existing = await listSubGraphs(PRIMARY_CG).catch(() => [] as Array<{ name: string }>);
+  const existing = await listSubGraphs(PRIMARY_CG);
   if (existing.some((sg) => sg.name === NAMED_SUBGRAPH)) {
     console.log(
       `[global-setup] ${PRIMARY_CG} already seeded (sub-graph "${NAMED_SUBGRAPH}" present) — skipping to avoid accreting duplicate content`,

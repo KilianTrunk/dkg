@@ -41,8 +41,13 @@ export async function listContextGraphs(nodeNum = 1): Promise<Array<{ id: string
 /**
  * List the named sub-graphs registered in `contextGraphId` (the same endpoint the
  * SubGraphBar reads). Used by global-setup to detect an already-seeded devnet and
- * keep seeding idempotent. Best-effort: a fresh/empty CG that 404s is treated as
- * "no sub-graphs" rather than throwing, so a missing list never aborts setup.
+ * keep seeding idempotent.
+ *
+ * Only the EXPECTED "no sub-graphs yet" case (404) is mapped to an empty list. A
+ * 200 returns whatever the daemon reports (empty or populated). Every OTHER status
+ * (401/403 auth, 5xx, transport) is a real startup problem the caller must NOT
+ * mistake for "unseeded" — surface it so global-setup fails fast instead of
+ * re-publishing duplicate fixtures over a broken precondition.
  */
 export async function listSubGraphs(
   contextGraphId: string,
@@ -52,7 +57,10 @@ export async function listSubGraphs(
     `/api/sub-graph/list?contextGraphId=${encodeURIComponent(contextGraphId)}`,
     { nodeNum },
   );
-  if (!res.ok) return [];
+  if (res.status === 404) return [];
+  if (!res.ok) {
+    throw new Error(`listSubGraphs failed: ${res.status} ${await res.text()}`);
+  }
   const json = (await res.json()) as { subGraphs?: Array<{ name: string }> };
   return json.subGraphs ?? [];
 }

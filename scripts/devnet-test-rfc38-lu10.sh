@@ -134,6 +134,7 @@ log "✓ 10 triples written to SWM"
 sleep 2
 
 PUB_RESP=$(devnet_publish_swm_all_roots "$CURATOR_NODE" "$CG_ID" false)
+devnet_publish_load_state
 log "publish response: $PUB_RESP"
 
 STATUS=$(parse_json "$PUB_RESP" '.status')

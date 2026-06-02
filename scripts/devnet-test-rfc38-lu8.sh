@@ -113,6 +113,7 @@ WRITE_RESP=$(api_call "$CURATOR_NODE" POST /api/shared-memory/write "$QUADS")
 
 log "Curator publishes selection to VM..."
 PUB_RESP=$(devnet_publish_swm_all_roots "$CURATOR_NODE" "$PUB_CG" false '"epochs":1')
+devnet_publish_load_state
 log "publish response: $PUB_RESP"
 TX_HASH=$(parse_json "$PUB_RESP" '.txHash')
 KC_ID=$(parse_json "$PUB_RESP" '.kaId')
@@ -164,9 +165,13 @@ fi
 # path a member uses after catchup once they've decrypted ciphertext, and is
 # the only path that's batch-scoped for the verifier API.
 log "Calling verify-batch with explicit caller-supplied quads (member-side simulation)..."
-devnet_verify_each_published_root "$MEMBER_NODE" "$PUB_CG" "$QUADS" \
-  && log "✓ Scenario 1b: explicit-quads verify ok=true for all published roots (member can verify once it has the plaintext)" \
-  || warn "explicit-quads verify failed for one or more roots"
+if devnet_verify_each_published_root "$MEMBER_NODE" "$PUB_CG" "$QUADS"; then
+  EXPLICIT_OK=true
+  log "✓ Scenario 1b: explicit-quads verify ok=true for all published roots (member can verify once it has the plaintext)"
+else
+  EXPLICIT_OK=false
+  warn "explicit-quads verify failed for one or more roots"
+fi
 
 # ===========================================================================
 # SCENARIO 2 — Root-mismatch detection.

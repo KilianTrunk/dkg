@@ -10,13 +10,12 @@
 # Usage: source this file AFTER defining `api_call NODE METHOD PATH [DATA]`.
 #
 #   PUBLISH_RESP=$(devnet_publish_swm_all_roots "$NODE" "$CG_ID" false)
-#   PUBLISH_RESP=$(devnet_publish_swm_all_roots "$NODE" "$CG_ID" false '"epochs":1')
+#   devnet_publish_load_state
 #
-# After a call, DEVNET_PUBLISH_ALL_RESPONSES holds a JSON array of every
-# publish response (one element when the graph is single-root). When a
-# multi-root split occurred, DEVNET_PUBLISH_ROOT_ENTITIES lists the root
-# entity IRIs in publish order (same index as DEVNET_PUBLISH_ALL_RESPONSES).
+# Command substitution runs the publish helper in a subshell, so metadata is
+# persisted to DEVNET_PUBLISH_STATE_FILE and must be loaded in the caller shell.
 #
+DEVNET_PUBLISH_STATE_FILE="${DEVNET_PUBLISH_STATE_FILE:-${DEVNET_DIR:-/tmp}/.devnet-publish-state.json}"
 DEVNET_PUBLISH_ALL_RESPONSES='[]'
 DEVNET_PUBLISH_ROOT_ENTITIES='[]'
 
@@ -28,6 +27,35 @@ devnet_json_field() {
       catch { process.exit(1); }
     })
   "
+}
+
+_devnet_publish_persist_state() {
+  local all_responses="$1" root_entities="${2:-[]}"
+  node -e "
+    require('fs').writeFileSync(
+      process.argv[1],
+      JSON.stringify({
+        allResponses: JSON.parse(process.argv[2]),
+        rootEntities: JSON.parse(process.argv[3]),
+      }),
+    );
+  " "$DEVNET_PUBLISH_STATE_FILE" "$all_responses" "$root_entities"
+}
+
+devnet_publish_load_state() {
+  if [ ! -f "$DEVNET_PUBLISH_STATE_FILE" ]; then
+    DEVNET_PUBLISH_ALL_RESPONSES='[]'
+    DEVNET_PUBLISH_ROOT_ENTITIES='[]'
+    return 0
+  fi
+  DEVNET_PUBLISH_ALL_RESPONSES=$(node -e "
+    const s = JSON.parse(require('fs').readFileSync(process.argv[1], 'utf8'));
+    console.log(JSON.stringify(s.allResponses || []));
+  " "$DEVNET_PUBLISH_STATE_FILE")
+  DEVNET_PUBLISH_ROOT_ENTITIES=$(node -e "
+    const s = JSON.parse(require('fs').readFileSync(process.argv[1], 'utf8'));
+    console.log(JSON.stringify(s.rootEntities || []));
+  " "$DEVNET_PUBLISH_STATE_FILE")
 }
 
 devnet_kc_merkle_root() {
@@ -42,6 +70,8 @@ devnet_kc_merkle_root() {
 devnet_verify_each_published_root() {
   local node="$1" cg="$2" quads_payload="$3"
   local count i kc merkle body resp ok actual
+
+  devnet_publish_load_state
 
   count=$(printf '%s' "$DEVNET_PUBLISH_ROOT_ENTITIES" | node -e '
     let d=""; process.stdin.on("data",c=>d+=c);
@@ -90,9 +120,6 @@ devnet_publish_swm_all_roots() {
   local node="$1" cg="$2" clear_after="${3:-false}"
   local extra_fields="${4:-}"
 
-  DEVNET_PUBLISH_ALL_RESPONSES='[]'
-  DEVNET_PUBLISH_ROOT_ENTITIES='[]'
-
   local probe_body
   probe_body=$(node -e "
     const cg = process.argv[1];
@@ -105,10 +132,12 @@ devnet_publish_swm_all_roots() {
   probe=$(api_call "$node" POST /api/shared-memory/publish "$probe_body")
 
   if ! printf '%s' "$probe" | grep -q 'MULTI_ROOT_PUBLISH_NOT_ATOMIC'; then
-    DEVNET_PUBLISH_ALL_RESPONSES=$(printf '%s' "$probe" | node -e '
+    local single_arr
+    single_arr=$(printf '%s' "$probe" | node -e '
       let d=""; process.stdin.on("data",c=>d+=c);
       process.stdin.on("end",()=>console.log(JSON.stringify([JSON.parse(d)])));
     ')
+    _devnet_publish_persist_state "$single_arr" '[]'
     printf '%s' "$probe"
     return 0
   fi
@@ -121,7 +150,6 @@ devnet_publish_swm_all_roots() {
       catch { console.log("[]"); }
     });
   ')
-  DEVNET_PUBLISH_ROOT_ENTITIES="$roots_json"
   count=$(printf '%s' "$roots_json" | node -e 'let d="";process.stdin.on("data",c=>d+=c);process.stdin.on("end",()=>console.log(JSON.parse(d).length))')
   if [ "$count" -eq 0 ]; then
     printf '%s' "$probe" >&2
@@ -163,7 +191,7 @@ devnet_publish_swm_all_roots() {
     i=$((i + 1))
     sleep 1
   done
-  DEVNET_PUBLISH_ALL_RESPONSES="$all_resps"
+  _devnet_publish_persist_state "$all_resps" "$roots_json"
   printf '%s' "$last_resp"
   return 0
 }

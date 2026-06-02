@@ -207,6 +207,7 @@ sleep 2
 
 log "Publishing curated CG to VM..."
 PUBLISH_RESP=$(devnet_publish_swm_all_roots "$CURATOR_NODE" "$CG_ID" false)
+devnet_publish_load_state
 log "publish response: $PUBLISH_RESP"
 
 PUBLISH_STATUS=$(parse_json "$PUBLISH_RESP" '.status')

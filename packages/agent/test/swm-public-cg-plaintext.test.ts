@@ -27,6 +27,7 @@ function makeAgentLike(opts: {
   cache?: Map<string, number>;
   isPrivate?: boolean;
   onChainIdError?: Error;
+  subscribed?: Map<string, { onChainId?: string }>;
 } = {}) {
   const log = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
   const chain: Record<string, unknown> = {};
@@ -42,6 +43,7 @@ function makeAgentLike(opts: {
     chain,
     store: { query: storeQuery },
     onChainAccessPolicyCache: opts.cache ?? new Map<string, number>(),
+    subscribedContextGraphs: opts.subscribed ?? new Map<string, { onChainId?: string }>(),
     getContextGraphOnChainId: vi.fn(async () => {
       if (opts.onChainIdError) throw opts.onChainIdError;
       // `undefined` opt → default to a resolvable numeric id; explicit
@@ -52,6 +54,7 @@ function makeAgentLike(opts: {
   };
   // Bind the prototype methods under test so `this` resolves to agentLike.
   agentLike.isContextGraphPublicOnChain = (DKGAgent.prototype as any).isContextGraphPublicOnChain;
+  agentLike.isKnownOnChainId = (DKGAgent.prototype as any).isKnownOnChainId;
   agentLike.resolveWorkspaceRecipientsGated = (DKGAgent.prototype as any).resolveWorkspaceRecipientsGated;
   agentLike._resolveCuratedChainKeyContext = (DKGAgent.prototype as any)._resolveCuratedChainKeyContext;
   return agentLike;
@@ -102,24 +105,49 @@ describe('DKGAgent.isContextGraphPublicOnChain', () => {
     await expect(isPublic(agentLike)).resolves.toBe(false);
   });
 
-  it('treats a positive-integer contextGraphId as the already-resolved on-chain id (#884 numeric-id case)', async () => {
+  it('treats a KNOWN numeric on-chain id (subscribed) as resolved — public CG stays plaintext (#884 numeric-id case)', async () => {
     // `getContextGraphOnChainId` returns null for a bare numeric id (it only
-    // resolves LOCAL ids via the store / subscription map). A public
-    // registered CG addressed by its numeric on-chain id — e.g.
-    // share('42', ...) — must still be detected as public and NOT fall back
-    // to the encrypted/gated SWM path. onChainId:null here forces the
-    // resolver to be useless, so passing iff the numeric id is used directly.
-    const agentLike = makeAgentLike({ onChainId: null, accessPolicy: 0 });
+    // resolves LOCAL ids). A public registered CG addressed by its numeric
+    // on-chain id — e.g. share('42', ...) — must still be detected as public
+    // and NOT fall back to the encrypted/gated SWM path. The id is a known
+    // on-chain CG (subscription map), so the numeric shortcut is taken.
+    const agentLike = makeAgentLike({
+      onChainId: null,
+      accessPolicy: 0,
+      subscribed: new Map([['music-cg', { onChainId: '42' }]]),
+    });
     await expect(isPublic(agentLike, '42')).resolves.toBe(true);
     expect(agentLike.chain.getContextGraphAccessPolicy).toHaveBeenCalledWith(42n);
     expect(agentLike.onChainAccessPolicyCache.get('42')).toBe(0);
-    // Resolved directly from the numeric id — the (null-returning) resolver
-    // was not relied upon.
-    expect(agentLike.getContextGraphOnChainId).not.toHaveBeenCalled();
   });
 
-  it('returns false for a private CG addressed by its numeric on-chain id (#884 numeric-id, fail-closed)', async () => {
-    const agentLike = makeAgentLike({ onChainId: null, accessPolicy: 1 });
+  it('accepts a numeric id present in the create-event access-policy cache (#884)', async () => {
+    // The other registration proof: the id was seeded into the policy cache
+    // by the `ContextGraphCreated` chain-event handler. Served from cache —
+    // no extra chain RPC.
+    const cache = new Map<string, number>([['42', 0]]);
+    const agentLike = makeAgentLike({ onChainId: null, cache });
+    await expect(isPublic(agentLike, '42')).resolves.toBe(true);
+    expect(agentLike.chain.getContextGraphAccessPolicy).not.toHaveBeenCalled();
+  });
+
+  it('does NOT trust an UNKNOWN numeric id (unregistered local graph) — fail-closed, no chain read (#884 review round-2)', async () => {
+    // A local graph whose user-chosen id is numeric (e.g.
+    // createContextGraph({ id: "42", private: true })) is NOT registered:
+    // not subscribed, not in the policy cache, resolver returns null. Chain
+    // access-policy defaults to 0 (public) for unknown ids, so a bare numeric
+    // id must NEVER be trusted — doing so would bypass SWM encryption.
+    const agentLike = makeAgentLike({ onChainId: null, accessPolicy: 0 });
+    await expect(isPublic(agentLike, '42')).resolves.toBe(false);
+    expect(agentLike.chain.getContextGraphAccessPolicy).not.toHaveBeenCalled();
+  });
+
+  it('returns false for a KNOWN numeric on-chain id whose policy is private (#884 fail-closed)', async () => {
+    const agentLike = makeAgentLike({
+      onChainId: null,
+      accessPolicy: 1,
+      subscribed: new Map([['x', { onChainId: '7' }]]),
+    });
     await expect(isPublic(agentLike, '7')).resolves.toBe(false);
     expect(agentLike.chain.getContextGraphAccessPolicy).toHaveBeenCalledWith(7n);
   });
@@ -165,8 +193,12 @@ describe('DKGAgent.resolveWorkspaceRecipientsGated (gate-before)', () => {
     // registered CG must take the plaintext path. Pre-fix, the numeric id
     // didn't resolve, isContextGraphPublicOnChain returned false, and this
     // fell through to resolveWorkspaceAgentRecipients (the encrypted/gated
-    // path that triggered the HTTP 500).
-    const agentLike = makeAgentLike({ onChainId: null, accessPolicy: 0 });
+    // path that triggered the HTTP 500). The id is a known on-chain CG.
+    const agentLike = makeAgentLike({
+      onChainId: null,
+      accessPolicy: 0,
+      subscribed: new Map([['music-cg', { onChainId: '42' }]]),
+    });
     const resolution = await (DKGAgent.prototype as any).resolveWorkspaceRecipientsGated.call(
       agentLike,
       { contextGraphId: '42' },

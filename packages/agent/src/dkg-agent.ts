@@ -6118,18 +6118,28 @@ export class DKGAgent {
       // Resolve the numeric on-chain id. A caller may pass either a LOCAL
       // context-graph id (resolved to its numeric on-chain id via the
       // subscription map / store) OR the numeric on-chain id directly — e.g.
-      // share('42', ...). `getContextGraphOnChainId` only handles the former
-      // and returns null for a bare numeric id, so a positive-integer
-      // contextGraphId must be treated as ALREADY RESOLVED before the lookup.
-      // Without this, a public registered CG addressed by its numeric id is
-      // wrongly seen as non-public and falls back to the encrypted/gated SWM
-      // path this change removes (#884).
+      // share('42', ...). Prefer the local-id resolver: it only returns an id
+      // for graphs whose on-chain id was persisted at registration, so it
+      // never invents one.
       let onChainId: string | null = null;
       const trimmed = contextGraphId.trim();
-      if (/^\d+$/.test(trimmed)) {
-        onChainId = trimmed;
-      } else if (typeof this.getContextGraphOnChainId === 'function') {
+      if (typeof this.getContextGraphOnChainId === 'function') {
         onChainId = await this.getContextGraphOnChainId(contextGraphId);
+      }
+      // #884: if the resolver can't map it AND the caller passed a bare
+      // numeric id, that number MAY be the on-chain id itself — but only take
+      // that shortcut once the id is PROVEN to be a real, registered on-chain
+      // CG this node knows. Chain adapters return access-policy 0 (= public)
+      // for UNKNOWN ids (Solidity default-zero mapping), so trusting any
+      // digit-only id would misclassify (a) an unregistered local graph whose
+      // user-chosen id happens to be numeric, or (b) a numeric id that
+      // collides with some other graph's on-chain id — bypassing SWM
+      // encryption on data that must stay gated (review round-2). Proof of
+      // registration without an extra RPC: the id is present in the
+      // create-event-seeded access-policy cache, or matches the onChainId of a
+      // subscribed CG (the chain only ever assigns that id at registration).
+      if (!onChainId && /^\d+$/.test(trimmed) && this.isKnownOnChainId(trimmed)) {
+        onChainId = trimmed;
       }
       if (!onChainId) return false;
       const cached = this.onChainAccessPolicyCache.get(onChainId);
@@ -6152,6 +6162,29 @@ export class DKGAgent {
     } catch {
       return false;
     }
+  }
+
+  /**
+   * #884: True iff `numericOnChainId` is a context-graph id this node KNOWS
+   * was registered on-chain — without an extra RPC. Two local proofs, both
+   * only ever populated for genuinely on-chain CGs:
+   *   - present in {@link onChainAccessPolicyCache} (seeded by the
+   *     `ContextGraphCreated` chain-event handler), or
+   *   - matches the `onChainId` of a {@link subscribedContextGraphs} entry
+   *     (the chain assigns that id at registration; members/replicators learn
+   *     it via the subscription event).
+   *
+   * Gate for the bare-numeric `isContextGraphPublicOnChain` shortcut so an
+   * unregistered local graph with a numeric id (whose chain access-policy
+   * read would default to the permissive `0`) is never misclassified as
+   * public.
+   */
+  private isKnownOnChainId(numericOnChainId: string): boolean {
+    if (this.onChainAccessPolicyCache.has(numericOnChainId)) return true;
+    for (const sub of this.subscribedContextGraphs.values()) {
+      if (sub?.onChainId === numericOnChainId) return true;
+    }
+    return false;
   }
 
   /**

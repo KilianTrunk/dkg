@@ -119,6 +119,24 @@ async function probeExistingNodes(numNodes: number): Promise<number[]> {
   return existing;
 }
 
+/**
+ * Poll until ALL `numNodes` nodes are reachable (the full relay-hub mesh the
+ * suite needs), or the deadline passes. `scripts/devnet.sh start` waits for each
+ * node internally before returning, so this usually settles immediately; the
+ * poll just rides out a peer whose api.port lands a moment after the target.
+ * Returns the final reachable-node list so the caller can report the gap.
+ */
+async function waitForMesh(numNodes: number, timeoutMs: number): Promise<number[]> {
+  const deadline = Date.now() + timeoutMs;
+  let reachable: number[] = [];
+  while (Date.now() < deadline) {
+    reachable = await probeExistingNodes(numNodes);
+    if (reachable.length >= numNodes) return reachable;
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+  return reachable;
+}
+
 async function waitForReady(label: string): Promise<number> {
   const deadline = Date.now() + BOOTSTRAP_TIMEOUT_MS;
   let lastLog = 0;
@@ -192,32 +210,31 @@ async function main(): Promise<void> {
     // The target node being up is NOT sufficient: this suite needs the full
     // relay-hub mesh — node1 + peers — for VM-publish ACK quorum and the
     // peer-connectivity assertions (global-setup waits for connected peers;
-    // peer-connectivity.spec expects the N-node topology). A reused single-node
-    // (or under-sized) devnet would sail past this probe and only blow up deep
-    // into the run. Verify the whole cluster is reachable and FAIL FAST with a
-    // clear "need a multi-node devnet" message instead of advertising generic
-    // reuse here.
+    // peer-connectivity.spec expects the N-node topology).
     const reachableNodes = await probeExistingNodes(NUM_NODES_INT);
-    if (reachableNodes.length < NUM_NODES_INT) {
-      throw new Error(
-        `[playwright] a devnet is already running on node${NODE_NUM} (port ${initial.port}), but this suite ` +
-        `requires a ${NUM_NODES_INT}-node mesh (node1 relay hub + peers for VM-publish quorum and ` +
-        `peer-connectivity). Only node(s) ${reachableNodes.join(',') || '(none)'} are reachable. ` +
-        `Start a full devnet ( \`scripts/devnet.sh start ${NUM_NODES_INT}\` ) or stop the partial one so ` +
-        `Playwright can boot its own, or set PLAYWRIGHT_DEVNET_NUM_NODES to match the running cluster.`,
+    if (reachableNodes.length >= NUM_NODES_INT) {
+      console.log(
+        `[playwright] reusing existing ${reachableNodes.length}-node devnet ` +
+        `(target node${NODE_NUM} @ port ${initial.port})`,
       );
+      return;
     }
+    // Partial cluster — e.g. node1 survived an interrupted run but a peer is
+    // down. Rather than abort and force a manual cleanup, REPAIR it: fall
+    // through to `scripts/devnet.sh start`, which is idempotent per node (it
+    // skips already-running nodes and boots only the missing peers). The
+    // post-(re)start mesh check below fails fast only if recovery still leaves
+    // the cluster incomplete.
     console.log(
-      `[playwright] reusing existing ${reachableNodes.length}-node devnet ` +
-      `(target node${NODE_NUM} @ port ${initial.port})`,
+      `[playwright] devnet partially up on node${NODE_NUM} (reachable: ${reachableNodes.join(',') || 'none'}; ` +
+      `need ${NUM_NODES_INT}) -- backfilling missing nodes via scripts/devnet.sh start...`,
     );
-    return;
   }
 
   const preExistingNodes = await probeExistingNodes(NUM_NODES_INT);
 
   console.log(
-    `[playwright] devnet node${NODE_NUM} not running -- bootstrapping ` +
+    `[playwright] devnet node${NODE_NUM} not fully up -- bootstrapping ` +
     `(NUM_NODES=${NUM_NODES}, API_PORT_BASE=${API_PORT_BASE}, ` +
     `LIBP2P_PORT_BASE=${LIBP2P_PORT_BASE}` +
     (preExistingNodes.length ? `, pre-existing nodes: ${preExistingNodes.join(',')}` : '') +
@@ -246,6 +263,24 @@ async function main(): Promise<void> {
       `(scripts/devnet.sh exit=${spawnResult.exitCode}, ` +
       `API_PORT_BASE=${API_PORT_BASE}, LIBP2P_PORT_BASE=${LIBP2P_PORT_BASE}, ` +
       `NUM_NODES=${NUM_NODES}). ${(err as Error).message}${detail}`,
+    );
+  }
+
+  // The target node is up — but the suite needs the WHOLE mesh, so confirm every
+  // node came up (a fresh boot OR a backfilled partial cluster). Fail fast with a
+  // clear message if recovery still left the mesh incomplete, instead of letting
+  // the gap resurface later as a confusing QuorumUnmet / peer-connectivity error.
+  const meshNodes = await waitForMesh(NUM_NODES_INT, 60_000);
+  if (meshNodes.length < NUM_NODES_INT) {
+    clearMarker();
+    const tail = tailFile(DAEMON_LOG_FILE, 4096).trim();
+    const detail = tail
+      ? `\n\n----- last 4 KiB of ${DAEMON_LOG_FILE} -----\n${tail}\n----- end -----`
+      : '';
+    throw new Error(
+      `[playwright] devnet mesh incomplete after bootstrap: only node(s) ${meshNodes.join(',') || '(none)'} ` +
+      `of ${NUM_NODES_INT} are reachable (scripts/devnet.sh exit=${spawnResult.exitCode}). The suite needs ` +
+      `the full relay-hub mesh for VM-publish quorum and peer-connectivity. ${detail}`,
     );
   }
 

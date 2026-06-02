@@ -24,7 +24,7 @@
  * UI-assertion failures that are far harder to diagnose.
  */
 import { waitForDevnetStatus, waitForConnectedPeers } from './helpers/devnet.js';
-import { listSubGraphs, waitForContextGraph } from './helpers/devnet-publish.js';
+import { listSubGraphs, waitForContextGraph, countSeededVmRootEntities } from './helpers/devnet-publish.js';
 import { seedVmEntity, seedSubgraphEntity, PRIMARY_CG, NAMED_SUBGRAPH, UI_NODE } from './helpers/real-node.js';
 
 // The UI can be repointed at a non-default node via DEVNET_NODE / UI_NODE_ID
@@ -44,18 +44,38 @@ export default async function globalSetup(): Promise<void> {
   // actually existing so the strict listSubGraphs() below can't 400/throw on an
   // unregistered CG and abort the whole suite moments before it would be ready.
   await waitForContextGraph(PRIMARY_CG, UI_NODE, 120_000);
-  // Idempotency check: require the seed's FINAL artifact — the e2e-namespaced
-  // NAMED_SUBGRAPH sub-graph WITH at least one entity in it. A bare registered
-  // sub-graph with entityCount 0 means a prior run died mid-seed (registered the
-  // sub-graph but never wrote its entity / VM seed), so we must NOT treat that as
-  // "already seeded" and skip — re-seed to complete it.
+  // Idempotency check: skip ONLY when BOTH seed artifacts the specs depend on are
+  // present — they are seeded separately and a guard on just one can be satisfied
+  // without the other:
+  //   1. the e2e-namespaced NAMED_SUBGRAPH sub-graph WITH ≥1 entity (drives the
+  //      SubGraphBar's concrete scope chip), AND
+  //   2. the deterministic VM root-bucket seed (drives the layer/entity/triple
+  //      views) — verified directly, not inferred from the sub-graph.
+  // Requiring both means a reused devnet that happens to carry NAMED_SUBGRAPH for
+  // some other reason (or a prior run that died between the two seeds) does NOT
+  // trick us into skipping and leaving specs asserting against ambient data. A
+  // bare registered sub-graph with entityCount 0 likewise fails the check, so a
+  // mid-seed crash re-seeds to completion. Re-seeding is safe: specs assert ≥1 /
+  // "the label I just seeded is visible", never an exact total.
   const existing = await listSubGraphs(PRIMARY_CG, UI_NODE);
-  if (existing.some((sg) => sg.name === NAMED_SUBGRAPH && sg.entityCount >= 1)) {
+  const subGraphSeeded = existing.some((sg) => sg.name === NAMED_SUBGRAPH && sg.entityCount >= 1);
+  // A transient /api/query failure must not be mistaken for "VM seed present" and
+  // skip — treat an un-confirmable VM seed as not-seeded and (re-)seed.
+  let vmSeeded = false;
+  try {
+    vmSeeded = (await countSeededVmRootEntities(PRIMARY_CG, UI_NODE)) >= 1;
+  } catch (err) {
+    console.log(`[global-setup] could not confirm VM root seed on node${UI_NODE} (${(err as Error).message}) — will (re-)seed`);
+  }
+  if (subGraphSeeded && vmSeeded) {
     console.log(
-      `[global-setup] ${PRIMARY_CG} already seeded on node${UI_NODE} (sub-graph "${NAMED_SUBGRAPH}" has entities) — skipping to avoid accreting duplicate content`,
+      `[global-setup] ${PRIMARY_CG} already seeded on node${UI_NODE} (sub-graph "${NAMED_SUBGRAPH}" has entities AND VM root seed present) — skipping to avoid accreting duplicate content`,
     );
     return;
   }
+  console.log(
+    `[global-setup] seeding ${PRIMARY_CG} on node${UI_NODE} (subGraphSeeded=${subGraphSeeded}, vmSeeded=${vmSeeded})`,
+  );
   // VM publish needs ACK quorum from a connected CORE peer, and globalSetup runs
   // in parallel with the bootstrap (which only waits for the node's API port).
   // Wait for at least one connected peer so the seed can't race the cold boot and

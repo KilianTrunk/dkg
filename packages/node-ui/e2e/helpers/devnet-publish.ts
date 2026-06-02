@@ -12,8 +12,16 @@ export interface PublishQuads {
   graph?: string;
 }
 
+/**
+ * Subject prefix for the deterministic VM root-bucket seed published into a CG's
+ * root content graph by {@link buildTestQuads} / runWmSwmVmPipeline. Used as the
+ * idempotency probe ({@link countSeededVmRootEntities}) so global-setup can tell
+ * whether OUR VM seed exists, independent of the named sub-graph sentinel.
+ */
+export const VM_SEED_SUBJECT_PREFIX = 'urn:e2e:ui:entity:';
+
 export function buildTestQuads(cgId: string, stamp: number, label: string): PublishQuads[] {
-  const subject = `urn:e2e:ui:entity:${stamp}`;
+  const subject = `${VM_SEED_SUBJECT_PREFIX}${stamp}`;
   const graph = `did:dkg:context-graph:${cgId}`;
   return [
     {
@@ -101,6 +109,45 @@ export async function listSubGraphs(
     name: sg.name,
     entityCount: sg.entityCount ?? 0,
   }));
+}
+
+/**
+ * Count the deterministic VM root-bucket seed entities (subject prefix
+ * {@link VM_SEED_SUBJECT_PREFIX}) committed into `contextGraphId`'s root content
+ * graph. Mirrors the EXACT scope the UI's VM layer query uses (graphs under the
+ * CG, excluding `/assertion/`, `/_shared_memory`, `/meta` bookkeeping), so a
+ * non-zero result means our VM seed is genuinely visible to the data-driven
+ * views — letting global-setup verify the VM seed independently of the named
+ * sub-graph sentinel. Throws on a non-OK response (caller decides how to treat).
+ */
+export async function countSeededVmRootEntities(
+  contextGraphId: string,
+  nodeNum = 1,
+): Promise<number> {
+  const cgUri = `did:dkg:context-graph:${contextGraphId}`;
+  const sparql = `SELECT (COUNT(DISTINCT ?s) AS ?cnt) WHERE {
+    GRAPH ?g { ?s ?p ?o }
+    FILTER(
+      STRSTARTS(STR(?g), "${cgUri}") &&
+      !CONTAINS(STR(?g), "/assertion/") &&
+      !CONTAINS(STR(?g), "/_shared_memory") &&
+      !CONTAINS(STR(?g), "/meta")
+    )
+    FILTER(STRSTARTS(STR(?s), "${VM_SEED_SUBJECT_PREFIX}"))
+  }`;
+  const res = await devnetApiFetch('/api/query', {
+    method: 'POST',
+    nodeNum,
+    body: JSON.stringify({ sparql, contextGraphId, includeContextGraphPartitions: true }),
+  });
+  if (!res.ok) {
+    throw new Error(`countSeededVmRootEntities failed: ${res.status} ${await res.text()}`);
+  }
+  const json = (await res.json()) as any;
+  const bindings = json?.result?.bindings ?? json?.results?.bindings ?? [];
+  const raw = bindings[0]?.cnt;
+  const value = typeof raw === 'string' ? raw : raw?.value;
+  return Number(value) || 0;
 }
 
 /**

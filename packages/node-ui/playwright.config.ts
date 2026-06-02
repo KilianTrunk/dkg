@@ -54,11 +54,12 @@ export default defineConfig({
     : [['list'], ['html', { open: 'on-failure' }], ['junit', { outputFile: 'results.xml' }]],
 
   // globalTeardown stops the devnet ONLY if our bootstrap started it (it leaves
-  // a marker — see e2e/global-teardown.ts). A devnet an operator already had up
-  // is reused and left running — but ONLY if it's a full NUM_NODES mesh: the
-  // bootstrap fails fast with a clear error when a reused devnet has fewer nodes,
-  // since the suite needs the relay-hub mesh (VM-publish quorum + peer
-  // connectivity). Idempotent; safe to re-run.
+  // a marker — see e2e/global-teardown.ts). A full NUM_NODES devnet an operator
+  // already had up is reused and left running; a PARTIAL one (e.g. node1 up but a
+  // peer down after an interrupted run) is repaired in place — the bootstrap
+  // backfills only the missing nodes (scripts/devnet.sh start is idempotent per
+  // node) and tears down just those it added. The suite needs the relay-hub mesh
+  // (VM-publish quorum + peer connectivity). Idempotent; safe to re-run.
   //
   // We deliberately do NOT use Playwright's `globalSetup` for the bootstrap:
   // globalSetup and webServer run in PARALLEL, so Vite would race ahead of the

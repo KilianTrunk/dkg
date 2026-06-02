@@ -49,13 +49,17 @@ sys.exit(1)
 PY
 }
 
-# Args: node_num kaId contextGraphId quads_json_array_string
+# Args: node_num kaId contextGraphId quads_json_array_string [private_quads_json_array_string]
 build_update_body() {
-  local node=$1 kc=$2 cg=$3 quads_json=$4 key seal owner_line
+  local node=$1 kc=$2 cg=$3 quads_json=$4 private_quads_json="${5:-[]}" key seal owner_line seal_args
   owner_line=$(ka_owner_key "$kc") || return 1
   key="${owner_line##*$'\t'}"
   [ -z "$key" ] && return 1
-  seal=$($UPDATE_SEAL --key "$key" --ka-id "$kc" --quads-json "$quads_json") || return 1
+  seal_args=(--key "$key" --ka-id "$kc" --quads-json "$quads_json")
+  if [ "$private_quads_json" != "[]" ] && [ -n "$private_quads_json" ]; then
+    seal_args+=(--private-quads-json "$private_quads_json")
+  fi
+  seal=$($UPDATE_SEAL "${seal_args[@]}") || return 1
   python3 -c "
 import json, sys
 wrap = json.loads(sys.argv[1])
@@ -68,6 +72,9 @@ body = {
     'quads': json.loads(sys.argv[4]),
     'precomputedUpdateAttestation': wrap['precomputedUpdateAttestation'],
 }
+private_quads = json.loads(sys.argv[5])
+if private_quads:
+    body['privateQuads'] = private_quads
 print(json.dumps(body))
-" "$seal" "$kc" "$cg" "$quads_json"
+" "$seal" "$kc" "$cg" "$quads_json" "$private_quads_json"
 }

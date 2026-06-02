@@ -210,21 +210,19 @@ if [ "$PUB_STATUS" = "confirmed" ] || [ "$PUB_STATUS" = "finalized" ]; then
 ]
 JSON
 )
-  UPD_BODY=$(build_update_body 1 "$PUB_KCID" "$CG" "$QUADS_JSON") || UPD_BODY=""
+  PRIVATE_QUADS_JSON=$(node -e "
+    const s = process.argv[1];
+    console.log(JSON.stringify([
+      { subject: s, predicate: 'http://schema.org/email', object: '\"bob@secret.test\"', graph: '' },
+      { subject: s, predicate: 'http://schema.org/telephone', object: '\"+1-555-PRIVATE\"', graph: '' },
+    ]));
+  " "$BOB_URI")
+  UPD_BODY=$(build_update_body 1 "$PUB_KCID" "$CG" "$QUADS_JSON" "$PRIVATE_QUADS_JSON") || UPD_BODY=""
   if [ -z "$UPD_BODY" ]; then
     fail "Private update: could not build precomputedUpdateAttestation for kaId=$PUB_KCID (is Hardhat up and contracts deployed?)"
     PRIV_RESULT=""
   else
-    PRIV_PAYLOAD=$(node -e "
-      const body = JSON.parse(process.argv[1]);
-      const s = process.argv[2];
-      body.privateQuads = [
-        { subject: s, predicate: 'http://schema.org/email', object: '\"bob@secret.test\"', graph: '' },
-        { subject: s, predicate: 'http://schema.org/telephone', object: '\"+1-555-PRIVATE\"', graph: '' },
-      ];
-      console.log(JSON.stringify(body));
-    " "$UPD_BODY" "$BOB_URI")
-    PRIV_RESULT=$(post 9201 /api/update -H "Content-Type: application/json" -d "$PRIV_PAYLOAD")
+    PRIV_RESULT=$(post 9201 /api/update -H "Content-Type: application/json" -d "$UPD_BODY")
   fi
   PRIV_STATUS=$(echo "$PRIV_RESULT" | pyfield "d.get('status','?')")
   if [ "$PRIV_STATUS" = "confirmed" ] || [ "$PRIV_STATUS" = "finalized" ]; then

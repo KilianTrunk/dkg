@@ -1,6 +1,7 @@
 /**
- * Devnet-backed UI tests — require `./scripts/devnet.sh start 6` and
- * `pnpm test:e2e:devnet` (starts Vite with DEVNET_NODE=1).
+ * Devnet-backed UI tests — run with `pnpm test:e2e`. The Playwright webServer
+ * boots (or reuses) the devnet and starts Vite with DEVNET_NODE=1, so no manual
+ * `scripts/devnet.sh start` is required.
  */
 import { test, expect } from '../../fixtures/base.js';
 import { isDevnetAvailable, devnetApiFetch, waitForDevnetStatus } from '../../helpers/devnet.js';

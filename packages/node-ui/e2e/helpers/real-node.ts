@@ -20,6 +20,35 @@ export const SECONDARY_CG = 'devnet-isolation';
 export const SEEDED_CGS = [PRIMARY_CG, SECONDARY_CG] as const;
 
 /**
+ * Devnet TOPOLOGY the suite drives — derived from the SAME env vars
+ * `playwright.config.ts` / `bootstrap-devnet.ts` read, with identical defaults,
+ * so the test-runner process agrees with the webServer on which node the UI
+ * targets and how the mesh is shaped. The config only force-sets these on the
+ * webServer subprocesses, but when an operator exports `UI_NODE_ID`/`DEVNET_NODE`
+ * (or `PLAYWRIGHT_DEVNET_NUM_NODES`) before invoking the runner, the runner
+ * inherits them and stays in sync; otherwise everything falls back to node1 +
+ * a 3-node mesh (the CI default), so these constants don't bake in a topology
+ * that contradicts the advertised `UI_NODE_ID`/`DEVNET_NODE` overrides.
+ *
+ * `scripts/devnet.sh` makes node1 the relay HUB: every other node boots with
+ * `relay = node1's multiaddr` and dials node1, so node1 reports N-1 connected
+ * peers while a non-hub node only holds its single link to the hub. The first
+ * `NUM_CORE_NODES` nodes boot as `core`; the rest are `edge`.
+ */
+export const UI_NODE = Number(process.env.DEVNET_NODE || process.env.UI_NODE_ID) || 1;
+export const NUM_NODES = Number(process.env.PLAYWRIGHT_DEVNET_NUM_NODES) || 3;
+export const NUM_CORE_NODES = Number(process.env.NUM_CORE_NODES) || 4;
+/** node1 is the relay hub every other node dials. */
+export const IS_RELAY_HUB = UI_NODE === 1;
+/**
+ * Connected-peer count the UI's target node must reach once the mesh settles:
+ * the hub sees every other node (N-1); a non-hub node sees only the hub (1).
+ */
+export const EXPECTED_MIN_PEERS = IS_RELAY_HUB ? Math.max(1, NUM_NODES - 1) : 1;
+/** Role the UI's target node reports in Settings — core for node ≤ NUM_CORE_NODES, else edge. */
+export const EXPECTED_NODE_ROLE: 'core' | 'edge' = UI_NODE <= NUM_CORE_NODES ? 'core' : 'edge';
+
+/**
  * A named sub-graph that `global-setup.ts` registers + seeds inside PRIMARY_CG.
  * Its presence guarantees the SubGraphBar renders a concrete (non-"All") scope
  * chip on EVERY layer page — the bar derives its chips from the project-wide

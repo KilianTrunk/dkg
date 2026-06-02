@@ -1,6 +1,7 @@
 /**
  * WM → SWM → VM pipeline against live devnet, with UI verification.
- * Run: `./scripts/devnet.sh start 6` then `pnpm test:e2e:devnet`
+ * Run: `pnpm test:e2e` — the Playwright webServer boots (or reuses) the devnet
+ * itself, so no manual `scripts/devnet.sh start` is needed.
  */
 import { test, expect } from '../../fixtures/base.js';
 import {

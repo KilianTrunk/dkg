@@ -24,20 +24,26 @@
  * UI-assertion failures that are far harder to diagnose.
  */
 import { waitForDevnetStatus, waitForConnectedPeers } from './helpers/devnet.js';
-import { listSubGraphs } from './helpers/devnet-publish.js';
-import { seedVmEntity, seedSubgraphEntity, PRIMARY_CG, NAMED_SUBGRAPH } from './helpers/real-node.js';
+import { listSubGraphs, waitForContextGraph } from './helpers/devnet-publish.js';
+import { seedVmEntity, seedSubgraphEntity, PRIMARY_CG, NAMED_SUBGRAPH, UI_NODE } from './helpers/real-node.js';
 
 // The UI can be repointed at a non-default node via DEVNET_NODE / UI_NODE_ID
-// (see playwright.config.ts + bootstrap-devnet.ts). Health-check, quorum-wait,
+// (see playwright.config.ts + bootstrap-devnet.ts). `UI_NODE` (from real-node.ts)
+// is derived from the same env vars, so we health-check, quorum-wait,
 // idempotency-check and SEED the SAME node the browser talks to — otherwise we
 // could seed/verify node1 while the UI reads a different backend and start
 // asserting before the seeded data is visible to it.
-const UI_NODE = parseInt(process.env.DEVNET_NODE || process.env.UI_NODE_ID || '1', 10) || 1;
 
 export default async function globalSetup(): Promise<void> {
   // Intentionally NOT wrapped in try/catch — see the file header. A seed failure
   // must propagate so Playwright aborts the run at setup with the real error.
   await waitForDevnetStatus(UI_NODE, 180_000);
+  // `/api/status` answering does NOT mean the seeded context graphs are
+  // registered yet — on a cold boot scripts/devnet.sh is still registering
+  // `devnet-test` for a few seconds after the API port opens. Gate on the CG
+  // actually existing so the strict listSubGraphs() below can't 400/throw on an
+  // unregistered CG and abort the whole suite moments before it would be ready.
+  await waitForContextGraph(PRIMARY_CG, UI_NODE, 120_000);
   // Idempotency check: require the seed's FINAL artifact — the e2e-namespaced
   // NAMED_SUBGRAPH sub-graph WITH at least one entity in it. A bare registered
   // sub-graph with entityCount 0 means a prior run died mid-seed (registered the

@@ -1,5 +1,6 @@
 import { test, expect } from '../fixtures/base.js';
 import { sel } from '../helpers/selectors.js';
+import { EXPECTED_NODE_ROLE } from '../helpers/real-node.js';
 
 /**
  * Settings page (pages/Settings.tsx — rewritten in the rc.12 line). Driven
@@ -45,8 +46,12 @@ test.describe('Settings page (rc.12 rewrite)', () => {
       expect(value.length, `${label} should render a real value`).toBeGreaterThan(0);
       expect(value, `${label} should not be the "not loaded" placeholder`).not.toBe('—');
     }
-    // Devnet core node identity is deterministic.
-    expect((await settingsPage.fieldValue('Role').first().textContent())?.trim()).toBe('core');
+    // Devnet node role is deterministic but node-dependent: scripts/devnet.sh
+    // boots the first NUM_CORE_NODES nodes as `core` and the rest as `edge`, so
+    // assert against the role derived for the UI's target node rather than a
+    // hard-coded `core` (which would falsely fail when repointed at an edge node
+    // via UI_NODE_ID). Default CI run targets node1 → core.
+    expect((await settingsPage.fieldValue('Role').first().textContent())?.trim()).toBe(EXPECTED_NODE_ROLE);
     // libp2p peer ids are base58 starting 12D3Koo… — catches a truncated/garbled id.
     expect((await settingsPage.fieldValue('Peer ID').first().textContent())?.trim()).toMatch(/^12D3Koo\w{20,}$/);
   });

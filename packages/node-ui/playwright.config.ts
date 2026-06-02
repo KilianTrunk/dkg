@@ -55,7 +55,10 @@ export default defineConfig({
 
   // globalTeardown stops the devnet ONLY if our bootstrap started it (it leaves
   // a marker — see e2e/global-teardown.ts). A devnet an operator already had up
-  // is reused and left running. Idempotent; safe to re-run.
+  // is reused and left running — but ONLY if it's a full NUM_NODES mesh: the
+  // bootstrap fails fast with a clear error when a reused devnet has fewer nodes,
+  // since the suite needs the relay-hub mesh (VM-publish quorum + peer
+  // connectivity). Idempotent; safe to re-run.
   //
   // We deliberately do NOT use Playwright's `globalSetup` for the bootstrap:
   // globalSetup and webServer run in PARALLEL, so Vite would race ahead of the

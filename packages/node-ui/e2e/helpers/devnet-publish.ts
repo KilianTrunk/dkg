@@ -39,6 +39,39 @@ export async function listContextGraphs(nodeNum = 1): Promise<Array<{ id: string
 }
 
 /**
+ * Poll until `contextGraphId` is registered on `nodeNum`.
+ *
+ * `waitForDevnetStatus()` only proves `/api/status` is answering; on a COLD boot
+ * `scripts/devnet.sh` is still registering `devnet-test` for a few seconds after
+ * that point. Calling `listSubGraphs(PRIMARY_CG)` in that window can 400/throw
+ * ("unknown context graph") and abort the whole suite even though bootstrap
+ * finishes moments later. Gate setup on the CG actually existing before treating
+ * any sub-graph-endpoint error as fatal. Transient errors WHILE polling (5xx /
+ * transport / not-yet-registered) are swallowed; only a timeout throws.
+ */
+export async function waitForContextGraph(
+  contextGraphId: string,
+  nodeNum = 1,
+  timeoutMs = 120_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  let lastErr = 'context graph never appeared';
+  while (Date.now() < deadline) {
+    try {
+      const cgs = await listContextGraphs(nodeNum);
+      if (cgs.some((cg) => cg.id === contextGraphId || cg.name === contextGraphId)) return;
+      lastErr = `registered: [${cgs.map((c) => c.name || c.id).join(', ') || 'none'}]`;
+    } catch (err) {
+      lastErr = (err as Error).message;
+    }
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+  throw new Error(
+    `waitForContextGraph: "${contextGraphId}" not registered on node${nodeNum} within ${timeoutMs}ms (${lastErr})`,
+  );
+}
+
+/**
  * List the named sub-graphs registered in `contextGraphId` (the same endpoint the
  * SubGraphBar reads). Used by global-setup to detect an already-seeded devnet and
  * keep seeding idempotent.

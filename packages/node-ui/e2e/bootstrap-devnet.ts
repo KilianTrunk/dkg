@@ -189,8 +189,27 @@ function writeMarker(preExistingNodes: number[]): void {
 async function main(): Promise<void> {
   const initial = await isReachable();
   if (initial.reachable && initial.port) {
+    // The target node being up is NOT sufficient: this suite needs the full
+    // relay-hub mesh — node1 + peers — for VM-publish ACK quorum and the
+    // peer-connectivity assertions (global-setup waits for connected peers;
+    // peer-connectivity.spec expects the N-node topology). A reused single-node
+    // (or under-sized) devnet would sail past this probe and only blow up deep
+    // into the run. Verify the whole cluster is reachable and FAIL FAST with a
+    // clear "need a multi-node devnet" message instead of advertising generic
+    // reuse here.
+    const reachableNodes = await probeExistingNodes(NUM_NODES_INT);
+    if (reachableNodes.length < NUM_NODES_INT) {
+      throw new Error(
+        `[playwright] a devnet is already running on node${NODE_NUM} (port ${initial.port}), but this suite ` +
+        `requires a ${NUM_NODES_INT}-node mesh (node1 relay hub + peers for VM-publish quorum and ` +
+        `peer-connectivity). Only node(s) ${reachableNodes.join(',') || '(none)'} are reachable. ` +
+        `Start a full devnet ( \`scripts/devnet.sh start ${NUM_NODES_INT}\` ) or stop the partial one so ` +
+        `Playwright can boot its own, or set PLAYWRIGHT_DEVNET_NUM_NODES to match the running cluster.`,
+      );
+    }
     console.log(
-      `[playwright] reusing existing devnet on node${NODE_NUM} @ port ${initial.port}`,
+      `[playwright] reusing existing ${reachableNodes.length}-node devnet ` +
+      `(target node${NODE_NUM} @ port ${initial.port})`,
     );
     return;
   }

@@ -1,23 +1,26 @@
 import { type Page } from '@playwright/test';
 import { test, expect } from '../fixtures/base.js';
 import { sel } from '../helpers/selectors.js';
+import { EXPECTED_MIN_PEERS, IS_RELAY_HUB, NUM_NODES, UI_NODE } from '../helpers/real-node.js';
 
 /**
  * Peer connectivity against the real multi-node devnet.
  *
  * Topology (scripts/devnet.sh): node1 is the relay HUB and every other node is
- * booted with `relay = node1's multiaddr`, so each one dials node1. The UI talks
- * to node1, which therefore reports exactly N-1 connected peers. The suite boots
- * 3 nodes (playwright.config `PLAYWRIGHT_DEVNET_NUM_NODES` default), so node1
- * MUST show >= 2 connected peers — the degenerate "1 peer" reading means a peer
- * failed to dial or the relay broke, which is precisely the regression this spec
- * is here to catch.
+ * booted with `relay = node1's multiaddr`, so each one dials node1. The node the
+ * UI talks to therefore reports a DIFFERENT settled peer count depending on
+ * which node it is: the hub (node1) sees every other node (N-1), a non-hub node
+ * sees only the hub (1). We assert against `EXPECTED_MIN_PEERS`, derived from
+ * the SAME env vars that pick the UI node + mesh size, so the spec stays correct
+ * across the default node1/3-node CI run AND a `UI_NODE_ID`-repointed run instead
+ * of baking in node1's `N-1 = 2`. Falling below that count means a peer failed to
+ * dial or the relay broke — the regression this spec is here to catch.
  *
  * Counts are polled (not read once) to ride out libp2p dial timing on a cold
  * boot; on the persistent/reused devnet the mesh is already settled, so this is
  * effectively instant there.
  */
-const MIN_PEERS = 2;
+const MIN_PEERS = EXPECTED_MIN_PEERS;
 
 async function readStatus(page: Page): Promise<{
   connectedPeers?: number;
@@ -47,11 +50,14 @@ test.describe('Peer connectivity (multi-node devnet)', () => {
     await shell.goto();
   });
 
-  test('node1 reports more than one connected peer (full devnet mesh)', async ({ page }) => {
+  test(`the UI node reports its expected connected-peer count (>= ${MIN_PEERS}) for the devnet mesh`, async ({ page }) => {
     await expect
       .poll(
         async () => (await readStatus(page))?.connectedPeers ?? -1,
-        { timeout: 30_000, message: 'connectedPeers never reached the expected devnet mesh size (>1)' },
+        {
+          timeout: 30_000,
+          message: `connectedPeers never reached the expected devnet mesh size (>= ${MIN_PEERS} for node${UI_NODE}, ${IS_RELAY_HUB ? `relay hub of ${NUM_NODES} nodes` : 'non-hub: dials only the hub'})`,
+        },
       )
       .toBeGreaterThanOrEqual(MIN_PEERS);
   });
@@ -75,15 +81,15 @@ test.describe('Peer connectivity (multi-node devnet)', () => {
     expect(total).toBeGreaterThanOrEqual(peers);
   });
 
-  test('the header renders the live peer count, and it is > 1', async ({ page }) => {
+  test(`the header renders the live peer count, matching the devnet mesh (>= ${MIN_PEERS})`, async ({ page }) => {
     // The header reads `connectedPeers` straight off /api/status, so its rendered
-    // "N peers" must reach the same multi-peer value once the mesh settles.
+    // "N peers" must reach the same settled mesh value once the mesh settles.
     const meta = page.locator(sel.header.meta);
     await expect(meta).toBeVisible();
     await expect
       .poll(async () => parsePeerCount(await meta.textContent()), {
         timeout: 30_000,
-        message: 'header peer count never rendered > 1',
+        message: `header peer count never rendered the expected mesh size (>= ${MIN_PEERS})`,
       })
       .toBeGreaterThanOrEqual(MIN_PEERS);
   });
@@ -101,7 +107,7 @@ test.describe('Peer connectivity (multi-node devnet)', () => {
     await expect
       .poll(async () => parsePeerCount(await peerStat.textContent()), {
         timeout: 30_000,
-        message: 'right-panel Network summary never showed > 1 peer',
+        message: `right-panel Network summary never showed the expected mesh size (>= ${MIN_PEERS})`,
       })
       .toBeGreaterThanOrEqual(MIN_PEERS);
   });

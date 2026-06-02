@@ -52,7 +52,7 @@ export async function listContextGraphs(nodeNum = 1): Promise<Array<{ id: string
 export async function listSubGraphs(
   contextGraphId: string,
   nodeNum = 1,
-): Promise<Array<{ name: string }>> {
+): Promise<Array<{ name: string; entityCount: number }>> {
   const res = await devnetApiFetch(
     `/api/sub-graph/list?contextGraphId=${encodeURIComponent(contextGraphId)}`,
     { nodeNum },
@@ -61,8 +61,13 @@ export async function listSubGraphs(
   if (!res.ok) {
     throw new Error(`listSubGraphs failed: ${res.status} ${await res.text()}`);
   }
-  const json = (await res.json()) as { subGraphs?: Array<{ name: string }> };
-  return json.subGraphs ?? [];
+  const json = (await res.json()) as {
+    subGraphs?: Array<{ name: string; entityCount?: number }>;
+  };
+  return (json.subGraphs ?? []).map((sg) => ({
+    name: sg.name,
+    entityCount: sg.entityCount ?? 0,
+  }));
 }
 
 /**

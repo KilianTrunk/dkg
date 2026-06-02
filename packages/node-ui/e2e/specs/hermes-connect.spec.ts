@@ -24,8 +24,15 @@ import { test, expect } from '../fixtures/base.js';
  */
 
 test.describe('Local-agent connect surface (real node)', () => {
-  test.beforeEach(async ({ shell }) => {
+  test.beforeEach(async ({ shell, page }) => {
     await shell.goto();
+    // On a reused operator-owned devnet, OpenClaw/Hermes may already be connected,
+    // in which case PanelRight auto-selects that agent's chat tab and the "Connect
+    // Another Agent" surface is NOT the default view. Explicitly select the "+"
+    // add-agent tab so these specs assert the connect surface deterministically
+    // regardless of pre-existing local-agent state.
+    const addTab = page.getByRole('tab', { name: 'Add another integrated agent' });
+    await addTab.click({ timeout: 15_000 });
   });
 
   test('the "Connect Another Agent" surface lists the bundled integrations', async ({ page }) => {

@@ -1,211 +1,61 @@
 import { test, expect } from '../fixtures/base.js';
 
 /**
- * S3 / issue #386 — UI Connect Hermes click-to-chat-ready spec.
+ * S3 / issue #386 — Hermes / local-agent connect surface, real-node edition.
  *
- * Two cases share the post-condition (Connect button → connecting →
- * chat-ready) but differ in pre-conditions:
+ * The previous version of this spec intercepted `/api/local-agent-integrations`,
+ * `/api/hermes-channel/health` and `/api/local-agent-integrations/connect` to
+ * fake a live Hermes gateway and assert the terminal "chat-ready" state. That
+ * is a mock, and it asserted a state the node can't actually reach in CI.
  *
- * - H-AC-06 (fresh user): no stored Hermes integration. The first
- *   `/api/local-agent-integrations` GET returns Hermes in 'available'
- *   state. Click Connect, daemon transitions to 'connecting', polling
- *   refresh transitions to 'chat_ready' once setup completes.
+ * This suite runs against the real devnet node with NO route interception. It
+ * verifies the real, deterministic, side-effect-free contract:
+ *   - the right panel's "Connect Another Agent" surface lists the bundled
+ *     integrations (OpenClaw + Hermes) returned by the live daemon registry;
+ *   - each integration renders its real Connect affordance — both OpenClaw and
+ *     Hermes ship with `capabilities.connectFromUi: true`, so both buttons
+ *     render deterministically on a real node.
  *
- * - H-AC-11 (existing user): Hermes is already configured (enabled, with
- *   stored transport, runtime: ready). The user opens Node UI and the
- *   Hermes tab is already chat-ready without needing Connect.
- *
- * Per execution-plan.md §4: this spec uses API route interception so
- * CI does not need to spawn a real daemon + chain. The companion
- * `agent-docs/hermes-parity/manual-sanity-checks.md` documents the
- * full live-daemon path that QA drives during release-readiness.
+ * It deliberately does NOT click "Connect Hermes": the node-ui connect path
+ * runs `connectLocalAgentIntegrationFromUi`, which kicks off a real Hermes
+ * install/spawn that cannot reach chat-ready without a live Hermes gateway.
+ * The full click-to-chat-ready journey is covered by the live-daemon manual
+ * sanity checks (`agent-docs/hermes-parity/manual-sanity-checks.md`).
  */
 
-const HERMES_NAME = 'Hermes';
-
-type Runtime = {
-  status: 'disconnected' | 'configured' | 'connecting' | 'ready' | 'degraded' | 'error';
-  ready: boolean;
-  lastError?: string | null;
-  updatedAt?: string;
-};
-
-type IntegrationRecord = {
-  id: string;
-  name: string;
-  description: string;
-  enabled: boolean;
-  capabilities: {
-    localChat: boolean;
-    connectFromUi: boolean;
-    chatAttachments?: boolean;
-    installNode?: boolean;
-    dkgPrimaryMemory?: boolean;
-    nodeServedSkill?: boolean;
-  };
-  transport: { kind: string; gatewayUrl?: string; bridgeUrl?: string; healthUrl?: string };
-  runtime: Runtime;
-  metadata?: Record<string, unknown>;
-  manifest?: { packageName?: string; setupEntry?: string };
-};
-
-function hermesRecord(overrides: Partial<IntegrationRecord> = {}): IntegrationRecord {
-  return {
-    id: 'hermes',
-    name: HERMES_NAME,
-    description: 'Connect a local Hermes agent through the DKG node.',
-    enabled: false,
-    capabilities: {
-      localChat: true,
-      connectFromUi: true,
-      chatAttachments: true,
-    },
-    transport: { kind: 'hermes-openai' },
-    runtime: { status: 'disconnected', ready: false, lastError: null },
-    metadata: {},
-    ...overrides,
-  };
-}
-
-function openClawAvailable(): IntegrationRecord {
-  return {
-    id: 'openclaw',
-    name: 'OpenClaw',
-    description: 'Local OpenClaw bridge.',
-    enabled: false,
-    capabilities: {
-      localChat: true,
-      connectFromUi: true,
-      chatAttachments: true,
-    },
-    transport: { kind: 'openclaw-channel' },
-    runtime: { status: 'disconnected', ready: false, lastError: null },
-    metadata: {},
-  };
-}
-
-test.describe('Hermes Connect — click-to-chat-ready', () => {
-  test('H-AC-06: fresh user can Connect Hermes from the right panel and reach chat-ready', async ({ page, shell }) => {
-    let connectCalled = false;
-
-    // Intercept the integrations registry — first GET returns
-    // available; after the Connect POST + daemon setup completes,
-    // subsequent GETs return chat_ready.
-    await page.route('**/api/local-agent-integrations', async (route, request) => {
-      if (request.method() !== 'GET') return route.fallback();
-      const integrations = connectCalled
-        ? [
-            openClawAvailable(),
-            hermesRecord({
-              enabled: true,
-              transport: { kind: 'hermes-openai', gatewayUrl: 'http://127.0.0.1:8642' },
-              runtime: { status: 'ready', ready: true, lastError: null },
-            }),
-          ]
-        : [openClawAvailable(), hermesRecord()];
-      await route.fulfill({ json: { integrations } });
-    });
-
-    // Hermes channel health endpoint — the api.ts mapper calls this
-    // when computing chatReady. Returning ok lets the UI render the
-    // chat-ready chip.
-    await page.route('**/api/hermes-channel/health', async (route) => {
-      await route.fulfill({
-        json: connectCalled
-          ? { ok: true, target: 'gateway', gateway: { ok: true } }
-          : { ok: false, error: 'offline' },
-      });
-    });
-
-    // OpenClaw health stays offline — keep the OpenClaw tab quiet so
-    // we're not asserting against incidental behavior from the other
-    // adapter.
-    await page.route('**/api/openclaw-channel/health', async (route) => {
-      await route.fulfill({ json: { ok: false, error: 'offline' } });
-    });
-
-    // The Connect POST: synchronously flips connectCalled so the next
-    // poll-driven GET sees the chat-ready record. Mirrors the daemon
-    // sequence: Connect returns 'connecting' synchronously, attach job
-    // settles to ready in the background, polling refresh observes it.
-    await page.route('**/api/local-agent-integrations/connect', async (route, request) => {
-      if (request.method() !== 'POST') return route.fallback();
-      connectCalled = true;
-      await route.fulfill({
-        json: {
-          ok: true,
-          notice: 'Hermes setup started. This chat tab will come online automatically once Hermes finishes setting up.',
-          integration: hermesRecord({
-            enabled: true,
-            runtime: { status: 'connecting', ready: false, lastError: null },
-          }),
-        },
-      });
-    });
-
+test.describe('Local-agent connect surface (real node)', () => {
+  test.beforeEach(async ({ shell }) => {
     await shell.goto();
-
-    const connectBtn = page.getByRole('button', { name: /Connect Hermes/i });
-    await expect(connectBtn).toBeVisible();
-    await connectBtn.click();
-
-    // Post-condition: the right panel swaps from the "Connect Another
-    // Agent" add surface into the persistent chat shell for Hermes —
-    // the durable, user-visible signal is the composer textbox plus the
-    // chat-ready empty-state copy. The legacy "Hermes connected"
-    // toolbar label is only rendered inside the AgentTabMenu popover
-    // (kebab → status row), which doesn't open on its own.
-    await expect(page.getByRole('textbox', { name: /Message Hermes/i })).toBeVisible({ timeout: 15_000 });
-    await expect(page.getByText(/Start a conversation with Hermes/i)).toBeVisible();
   });
 
-  test('H-AC-11: existing user with stored Hermes profile lands chat-ready without re-Connect', async ({ page, shell }) => {
-    // Pre-seed: integrations registry already has Hermes enabled +
-    // stored transport + runtime: ready. No Connect call is needed.
-    await page.route('**/api/local-agent-integrations', async (route, request) => {
-      if (request.method() !== 'GET') return route.fallback();
-      await route.fulfill({
-        json: {
-          integrations: [
-            openClawAvailable(),
-            hermesRecord({
-              enabled: true,
-              transport: { kind: 'hermes-openai', gatewayUrl: 'http://127.0.0.1:8642' },
-              runtime: { status: 'ready', ready: true, lastError: null },
-              metadata: { profileName: 'default', hermesHome: 'C:\\Hermes\\default' },
-            }),
-          ],
-        },
-      });
-    });
+  test('the "Connect Another Agent" surface lists the bundled integrations', async ({ page }) => {
+    await expect(page.getByText('Connect Another Agent')).toBeVisible();
+    const list = page.locator('.v10-local-agent-list');
+    await expect(list).toBeVisible();
+    // The daemon ships OpenClaw + Hermes as default integrations.
+    await expect(list.locator('.v10-local-agent-title').filter({ hasText: 'OpenClaw' })).toBeVisible();
+    await expect(list.locator('.v10-local-agent-title').filter({ hasText: 'Hermes' })).toBeVisible();
+  });
 
-    await page.route('**/api/hermes-channel/health', async (route) => {
-      await route.fulfill({ json: { ok: true, target: 'gateway', gateway: { ok: true } } });
-    });
+  test('OpenClaw exposes a real Connect affordance', async ({ page }) => {
+    const connectBtn = page.getByRole('button', { name: /Connect OpenClaw/i });
+    await expect(connectBtn).toBeVisible();
+    await expect(connectBtn).toBeEnabled();
+  });
 
-    await page.route('**/api/openclaw-channel/health', async (route) => {
-      await route.fulfill({ json: { ok: false, error: 'offline' } });
-    });
+  test('Hermes is listed and exposes a real Connect affordance', async ({ page }) => {
+    const hermesDetail = page
+      .locator('.v10-local-agent-detail')
+      .filter({ has: page.locator('.v10-local-agent-title', { hasText: 'Hermes' }) });
+    await expect(hermesDetail).toBeVisible();
 
-    // Connect should NOT be called in this scenario — the integration
-    // is already chat-ready on first paint. Fail loudly if a Connect
-    // POST does happen.
-    await page.route('**/api/local-agent-integrations/connect', async (route) => {
-      await route.fulfill({ status: 500, json: { error: 'Connect should not be called for an already-ready integration' } });
-    });
-
-    await shell.goto();
-
-    // Same post-condition as H-AC-06: Hermes tab is chat-ready without
-    // any user interaction. Anchor on the composer + empty-state copy
-    // — the AgentTabMenu's "Hermes connected" toolbar label is hidden
-    // behind a kebab popover that we don't open here.
-    await expect(page.getByRole('textbox', { name: /Message Hermes/i })).toBeVisible({ timeout: 15_000 });
-    await expect(page.getByText(/Start a conversation with Hermes/i)).toBeVisible();
-
-    // Connect Hermes button should NOT be visible — Hermes is already in
-    // the connected-agents persistent-chat surface, not the
-    // 'Connect Another Agent' add tab.
-    await expect(page.getByRole('button', { name: /Connect Hermes/i })).toHaveCount(0);
+    // The bundled Hermes adapter ships with `capabilities.connectFromUi: true`
+    // (verified against the live daemon's `/api/local-agent-integrations`), so
+    // the "Connect Hermes" button renders deterministically on a real node.
+    // We assert it directly — we do NOT click it (that kicks off a real Hermes
+    // install/spawn that needs a live gateway; see the file header).
+    const connectBtn = page.getByRole('button', { name: /Connect Hermes/i });
+    await expect(connectBtn).toBeVisible();
+    await expect(connectBtn).toBeEnabled();
   });
 });

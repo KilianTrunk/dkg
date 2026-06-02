@@ -18,6 +18,11 @@ export class SubGraphBarPage {
 
   async waitForBar(timeout = 15_000) {
     await this.bar.waitFor({ state: 'visible', timeout });
+    // Chips render asynchronously after the bar mounts (the bar fetches
+    // `/api/sub-graph/list` on mount, then paints the "All" + per-scope chips).
+    // Every caller reads chips right after this, so wait for the first chip to
+    // exist — otherwise a count/label read can race the paint and see 0.
+    await this.chips.first().waitFor({ state: 'visible', timeout });
   }
 
   async getChipLabels(): Promise<string[]> {
@@ -44,6 +49,23 @@ export class SubGraphBarPage {
 
   async clickChip(label: string | RegExp) {
     await this.chips.filter({ hasText: label }).click();
+  }
+
+  /**
+   * Click the first concrete scope chip — i.e. the first chip that is NOT the
+   * aggregate "All" chip. On a real node the scopes are whatever the daemon has
+   * registered (named sub-graphs and/or the Root bucket), so specs select "the
+   * first real scope" rather than a hard-coded mock sub-graph name.
+   *
+   * NB: a chip's textContent is `${icon}${label}${count}` (e.g. "⊚All31"), so
+   * an anchored `/^All/` regex never matches and would wrongly let the All chip
+   * through. Match the label substring instead — the All chip is the only chip
+   * whose label is "All".
+   */
+  async clickFirstScopeChip() {
+    const scope = this.chips.filter({ hasNotText: 'All' }).first();
+    await scope.waitFor({ state: 'visible', timeout: 15_000 });
+    await scope.click();
   }
 
   async getActiveChipLabel(): Promise<string | null> {

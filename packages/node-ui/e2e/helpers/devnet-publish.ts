@@ -3,6 +3,7 @@
  * Mirrors patterns from `devnet/rich-scenario/automated.test.ts`.
  */
 import { devnetApiFetch, readDevnetNode } from './devnet.js';
+import { withSwmLock } from './swm-lock.js';
 
 export interface PublishQuads {
   subject: string;
@@ -37,11 +38,62 @@ export async function listContextGraphs(nodeNum = 1): Promise<Array<{ id: string
   return json.contextGraphs ?? [];
 }
 
+/**
+ * Register a named sub-graph in `contextGraphId`. Idempotent for our purposes:
+ * a duplicate registration just returns the existing one (or a benign error we
+ * swallow), so callers can register-then-seed without a pre-check.
+ */
+export async function createSubGraph(opts: {
+  contextGraphId: string;
+  subGraphName: string;
+  nodeNum?: number;
+}): Promise<void> {
+  const res = await devnetApiFetch('/api/sub-graph/create', {
+    method: 'POST',
+    nodeNum: opts.nodeNum ?? 1,
+    body: JSON.stringify({
+      contextGraphId: opts.contextGraphId,
+      subGraphName: opts.subGraphName,
+    }),
+  });
+  // 200 (created) or a "already registered" style 4xx are both fine — the
+  // sub-graph exists either way. Surface only unexpected (5xx) failures.
+  if (!res.ok && res.status >= 500) {
+    throw new Error(`createSubGraph failed: ${res.status} ${await res.text()}`);
+  }
+}
+
+/** Quads targeting a NAMED sub-graph's data graph (`<cg>/<subGraph>`). */
+export function buildSubGraphQuads(
+  cgId: string,
+  subGraphName: string,
+  stamp: number,
+  label: string,
+): PublishQuads[] {
+  const subject = `urn:e2e:ui:sg:${subGraphName}:${stamp}`;
+  const graph = `did:dkg:context-graph:${cgId}/${subGraphName}`;
+  return [
+    {
+      subject,
+      predicate: 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type',
+      object: 'http://dkg.io/ontology/core/Entity',
+      graph,
+    },
+    {
+      subject,
+      predicate: 'http://www.w3.org/2000/01/rdf-schema#label',
+      object: `"${label}"`,
+      graph,
+    },
+  ];
+}
+
 export async function createWmAssertion(opts: {
   contextGraphId: string;
   name: string;
   quads: PublishQuads[];
   promote?: boolean;
+  subGraphName?: string;
   nodeNum?: number;
 }): Promise<{ ok: boolean; status: number; body: string }> {
   const res = await devnetApiFetch('/api/assertion/create', {
@@ -53,6 +105,7 @@ export async function createWmAssertion(opts: {
       quads: opts.quads,
       finalize: true,
       promote: opts.promote ?? false,
+      ...(opts.subGraphName ? { subGraphName: opts.subGraphName } : {}),
     }),
   });
   return { ok: res.ok, status: res.status, body: await res.text() };
@@ -104,31 +157,38 @@ export async function runWmSwmVmPipeline(opts: {
   const label = `E2E Pipeline ${stamp}`;
   const quads = buildTestQuads(opts.contextGraphId, stamp, label);
 
-  const wm = await createWmAssertion({
-    contextGraphId: opts.contextGraphId,
-    name: assertionName,
-    quads,
-    promote: false,
-    nodeNum: opts.nodeNum,
-  });
-  if (!wm.ok) throw new Error(`WM create failed: ${wm.status} ${wm.body}`);
+  // Hold the SWM mutation lock across promote→publish so a concurrent
+  // `clearAfter: true` from another spec can't wipe this CG's shared memory
+  // between our promote and publish (see swm-lock.ts). The WM create is inside
+  // the lock too, keeping the assertion's whole WM→SWM→VM lifecycle atomic
+  // relative to other mutators.
+  return withSwmLock(async () => {
+    const wm = await createWmAssertion({
+      contextGraphId: opts.contextGraphId,
+      name: assertionName,
+      quads,
+      promote: false,
+      nodeNum: opts.nodeNum,
+    });
+    if (!wm.ok) throw new Error(`WM create failed: ${wm.status} ${wm.body}`);
 
-  const promoteRes = await promoteAssertion({
-    contextGraphId: opts.contextGraphId,
-    assertionName,
-    nodeNum: opts.nodeNum,
-  });
-  if (!promoteRes.ok) {
-    throw new Error(`SWM promote failed: ${promoteRes.status} ${await promoteRes.text()}`);
-  }
+    const promoteRes = await promoteAssertion({
+      contextGraphId: opts.contextGraphId,
+      assertionName,
+      nodeNum: opts.nodeNum,
+    });
+    if (!promoteRes.ok) {
+      throw new Error(`SWM promote failed: ${promoteRes.status} ${await promoteRes.text()}`);
+    }
 
-  const vm = await publishToVm({
-    contextGraphId: opts.contextGraphId,
-    assertionName,
-    nodeNum: opts.nodeNum,
-  });
+    const vm = await publishToVm({
+      contextGraphId: opts.contextGraphId,
+      assertionName,
+      nodeNum: opts.nodeNum,
+    });
 
-  return { assertionName, label, kaId: vm.kaId };
+    return { assertionName, label, kaId: vm.kaId };
+  });
 }
 
 export async function registerAgent(nodeNum: number, label: string): Promise<{ agentAddress: string; authToken: string }> {

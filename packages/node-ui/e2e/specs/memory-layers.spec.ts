@@ -1,17 +1,18 @@
 import { test, expect } from '../fixtures/rich.js';
 import { sel } from '../helpers/selectors.js';
+import { PRIMARY_CG, SECONDARY_CG } from '../helpers/real-node.js';
 
 test.describe('Memory Layer Views (rc.12 project layer switcher)', () => {
   test.describe('Working Memory', () => {
     test.beforeEach(async ({ shell, leftPanel }) => {
       await shell.goto();
-      await leftPanel.expandProject('Pharma Drug Interactions');
-      await leftPanel.clickLayer('Pharma Drug Interactions', 'wm');
+      await leftPanel.expandProject(PRIMARY_CG);
+      await leftPanel.clickLayer(PRIMARY_CG, 'wm');
     });
 
-    test('opens project tab for Pharma Drug Interactions', async ({ centerPanel }) => {
+    test('opens project tab for the primary context graph', async ({ centerPanel }) => {
       const tabs = await centerPanel.getTabNames();
-      expect(tabs.some((t) => t.includes('Pharma'))).toBe(true);
+      expect(tabs.some((t) => t.includes(PRIMARY_CG))).toBe(true);
     });
 
     test('WM layer switch button is active', async ({ page }) => {
@@ -31,8 +32,8 @@ test.describe('Memory Layer Views (rc.12 project layer switcher)', () => {
   test.describe('Shared Working Memory', () => {
     test.beforeEach(async ({ shell, leftPanel }) => {
       await shell.goto();
-      await leftPanel.expandProject('Climate Science');
-      await leftPanel.clickLayer('Climate Science', 'swm');
+      await leftPanel.expandProject(SECONDARY_CG);
+      await leftPanel.clickLayer(SECONDARY_CG, 'swm');
     });
 
     test('SWM layer switch is reachable', async ({ page }) => {
@@ -47,8 +48,8 @@ test.describe('Memory Layer Views (rc.12 project layer switcher)', () => {
   test.describe('Verified Memory', () => {
     test.beforeEach(async ({ shell, leftPanel }) => {
       await shell.goto();
-      await leftPanel.expandProject('EU Supply Chain');
-      await leftPanel.clickLayer('EU Supply Chain', 'vm');
+      await leftPanel.expandProject(PRIMARY_CG);
+      await leftPanel.clickLayer(PRIMARY_CG, 'vm');
     });
 
     test('VM layer switch is reachable', async ({ page }) => {

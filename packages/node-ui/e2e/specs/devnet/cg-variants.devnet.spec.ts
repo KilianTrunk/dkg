@@ -18,9 +18,10 @@ async function nodeRole(nodeNum: number): Promise<string> {
   return json.nodeRole ?? 'unknown';
 }
 
-test.describe('CG variants — edge and core nodes', () => {
+test.describe('CG variants — core nodes', () => {
   test('node1 and node2 both expose context graphs', async () => {
-    test.skip(!isDevnetAvailable(2), 'Need 6-node devnet for core/edge matrix');
+    // The real-node UI suite always boots a 2-node core devnet (node2 is part
+    // of the harness, not optional), so assert directly instead of skipping.
     await waitForDevnetStatus(2);
     const n1 = await listContextGraphs(1);
     const n2 = await listContextGraphs(2);
@@ -28,21 +29,12 @@ test.describe('CG variants — edge and core nodes', () => {
     expect(n2.length).toBeGreaterThan(0);
   });
 
-  test('edge node (node5) can create WM assertion when available', async () => {
-    test.skip(!isDevnetAvailable(5), 'Devnet node5 (edge) not running');
-    await waitForDevnetStatus(5);
-    const cgs = await listContextGraphs(5);
-    test.skip(cgs.length === 0, 'No CGs on edge node');
-    const cgId = cgs[0]!.id;
-    const stamp = Date.now();
-    const res = await createWmAssertion({
-      contextGraphId: cgId,
-      name: `e2e-edge-wm-${stamp}`,
-      quads: buildTestQuads(cgId, stamp, `Edge WM ${stamp}`),
-      nodeNum: 5,
-    });
-    expect(res.ok).toBe(true);
-  });
+  // (Removed) "edge node (node5) can create WM assertion": the UI suite runs a
+  // 2-node CORE devnet — there is no edge node to drive, so this test could
+  // only ever skip here. Edge/core role coverage lives in the dedicated
+  // multi-node devnet suites (run with `devnet.sh start 6`), not in the UI e2e
+  // lane. The WM-assertion create path is still exercised by the core-node
+  // test below.
 
   test('core node (node1) can create WM assertion', async () => {
     const cgs = await listContextGraphs(1);

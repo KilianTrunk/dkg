@@ -60,7 +60,13 @@ export class DashboardPage {
     const stats: Array<{ label: string; value: string }> = [];
     for (let i = 0; i < count; i++) {
       const label = await cards.nth(i).locator(sel.dashboard.statLabel).textContent() ?? '';
-      const value = await cards.nth(i).locator(sel.dashboard.statValue).textContent() ?? '';
+      // `.stat-value` is conditionally rendered (DashboardView only emits it for
+      // a non-empty scalar value) — the "Context Graph Size" card uses a custom
+      // body (`.v10-cg-size-*` + layer bar) with NO `.stat-value`. Probe for the
+      // node before reading it so this never hangs waiting for an element that
+      // legitimately doesn't exist.
+      const valueEl = cards.nth(i).locator(sel.dashboard.statValue);
+      const value = (await valueEl.count()) > 0 ? (await valueEl.first().textContent()) ?? '' : '';
       stats.push({ label: label.trim(), value: value.trim() });
     }
     return stats;
@@ -96,6 +102,24 @@ export class DashboardPage {
     // Preserve the original locator-error if neither path resolves so a
     // future regression doesn't silently no-op.
     await direct.click();
+  }
+
+  /**
+   * Wait until the My-Context-Graphs list has rendered AND every row's size
+   * cell has resolved (each row shows "loading…" while its per-CG entity/triple
+   * count is fetched). Without this, row-content assertions race the async
+   * count fetch and read "loading…" / an empty list.
+   */
+  async waitForCgRowsLoaded(timeout = 15_000) {
+    await this.cgRows.first().waitFor({ state: 'visible', timeout });
+    await this.page.waitForFunction(
+      () => {
+        const rows = Array.from(document.querySelectorAll('.v10-cg-list .v10-cg-row'));
+        return rows.length > 0 && rows.every((r) => !/loading/i.test(r.textContent || ''));
+      },
+      undefined,
+      { timeout },
+    );
   }
 
   async getCgNames(): Promise<string[]> {

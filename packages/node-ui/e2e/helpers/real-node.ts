@@ -1,0 +1,98 @@
+/**
+ * Shared constants + seeding helpers for the real-node Playwright suite.
+ *
+ * There are NO mocks: every spec drives the real UI against a live devnet that
+ * `e2e/bootstrap-devnet.ts` boots (and `e2e/global-teardown.ts` tears down).
+ * `scripts/devnet.sh` seeds two open context graphs on every boot — these are
+ * the deterministic anchors specs assert against instead of the old mock CGs.
+ */
+import {
+  runWmSwmVmPipeline,
+  createWmAssertion,
+  buildTestQuads,
+  createSubGraph,
+  buildSubGraphQuads,
+} from './devnet-publish.js';
+
+/** Context graphs `scripts/devnet.sh` registers on-chain on every boot. */
+export const PRIMARY_CG = 'devnet-test';
+export const SECONDARY_CG = 'devnet-isolation';
+export const SEEDED_CGS = [PRIMARY_CG, SECONDARY_CG] as const;
+
+/**
+ * A named sub-graph that `global-setup.ts` registers + seeds inside PRIMARY_CG.
+ * Its presence guarantees the SubGraphBar renders a concrete (non-"All") scope
+ * chip on EVERY layer page — the bar derives its chips from the project-wide
+ * `/api/sub-graph/list`, so a single registered sub-graph means specs never hit
+ * the "only the aggregate All chip exists" degenerate case (which previously
+ * forced conditional `test.skip`s and made the WM-layer bar flaky/empty).
+ */
+export const NAMED_SUBGRAPH = 'people';
+
+export interface SeededEntity {
+  /** rdfs:label of the published entity — assert this appears in the VM layer. */
+  label: string;
+  /** The WM/SWM/VM assertion name used (handy for follow-up promote/publish). */
+  assertionName: string;
+  /** kaId returned by the VM publish, when the pipeline reached VM. */
+  kaId?: string;
+}
+
+/**
+ * Publish ONE deterministic entity through the full WM → SWM → VM pipeline into
+ * `cgId`, so layer/entity/triple views have real, verifiable content to render.
+ * Returns the entity label so the caller can assert it surfaces in the UI.
+ *
+ * Used from each rich-content spec's `beforeAll`. Each call mints a fresh
+ * timestamped URI, so repeated runs accumulate entities rather than colliding —
+ * specs therefore assert tolerantly ("the label I just seeded is visible",
+ * "count ≥ 1") rather than against a brittle exact total.
+ */
+export async function seedVmEntity(cgId: string, prefix = 'seed'): Promise<SeededEntity> {
+  const stamp = Date.now();
+  const result = await runWmSwmVmPipeline({ contextGraphId: cgId, stamp });
+  return { label: result.label, assertionName: result.assertionName, kaId: result.kaId };
+}
+
+/**
+ * Seed a WM-only (un-promoted) assertion so the Working-Memory layer has staged
+ * content. Returns the label to assert against.
+ */
+export async function seedWmEntity(cgId: string, prefix = 'wm'): Promise<SeededEntity> {
+  const stamp = Date.now();
+  const assertionName = `e2e-ui-${prefix}-${stamp}`;
+  const label = `E2E WM ${stamp}`;
+  const res = await createWmAssertion({
+    contextGraphId: cgId,
+    name: assertionName,
+    quads: buildTestQuads(cgId, stamp, label),
+    promote: false,
+  });
+  if (!res.ok) throw new Error(`seedWmEntity failed: ${res.status} ${res.body}`);
+  return { label, assertionName };
+}
+
+/**
+ * Register `subGraphName` in `cgId` (idempotent) and publish ONE finalized,
+ * promoted entity into it, so `/api/sub-graph/list` reports a real named
+ * sub-graph with ≥1 entity. This makes the SubGraphBar render a concrete scope
+ * chip on every layer deterministically (see {@link NAMED_SUBGRAPH}).
+ */
+export async function seedSubgraphEntity(
+  cgId: string,
+  subGraphName = NAMED_SUBGRAPH,
+): Promise<SeededEntity> {
+  await createSubGraph({ contextGraphId: cgId, subGraphName });
+  const stamp = Date.now();
+  const assertionName = `e2e-ui-sg-${subGraphName}-${stamp}`;
+  const label = `E2E SG ${subGraphName} ${stamp}`;
+  const res = await createWmAssertion({
+    contextGraphId: cgId,
+    name: assertionName,
+    quads: buildSubGraphQuads(cgId, subGraphName, stamp, label),
+    subGraphName,
+    promote: true,
+  });
+  if (!res.ok) throw new Error(`seedSubgraphEntity failed: ${res.status} ${res.body}`);
+  return { label, assertionName };
+}

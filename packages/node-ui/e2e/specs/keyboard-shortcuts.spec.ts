@@ -43,13 +43,6 @@ test.describe('Keyboard Shortcuts', () => {
   });
 
   test('shortcuts are suppressed when textarea is focused', async ({ page, leftPanel, createProjectModal }) => {
-    await page.route('**/api/agent/identity', (route) =>
-      route.fulfill({
-        status: 200,
-        contentType: 'application/json',
-        body: JSON.stringify({ agentAddress: '0x1111111111111111111111111111111111111111' }),
-      }),
-    );
     await leftPanel.clickNewProject();
     await expect(createProjectModal.overlay).toBeVisible();
     await createProjectModal.descriptionInput.focus();

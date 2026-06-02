@@ -1,15 +1,6 @@
 import { test, expect } from '../fixtures/base.js';
 import { sel } from '../helpers/selectors.js';
 
-const mockAgentRoute = (page: import('@playwright/test').Page) =>
-  page.route('**/api/agent/identity', (route) =>
-    route.fulfill({
-      status: 200,
-      contentType: 'application/json',
-      body: JSON.stringify({ agentAddress: '0x1111111111111111111111111111111111111111' }),
-    }),
-  );
-
 test.describe('Accessibility', () => {
   test.beforeEach(async ({ shell }) => {
     await shell.goto();
@@ -36,7 +27,6 @@ test.describe('Accessibility', () => {
   });
 
   test('modal inputs have form labels', async ({ leftPanel, createProjectModal, page }) => {
-    await mockAgentRoute(page);
     await leftPanel.clickNewProject();
     await expect(createProjectModal.overlay).toBeVisible();
     const labels = page.locator(sel.modal.formLabel);
@@ -44,7 +34,6 @@ test.describe('Accessibility', () => {
   });
 
   test('modal overlay uses fixed positioning', async ({ leftPanel, createProjectModal, page }) => {
-    await mockAgentRoute(page);
     await leftPanel.clickNewProject();
     await expect(createProjectModal.overlay).toBeVisible();
     const style = await page.locator(sel.modal.overlay).evaluate(el => {
@@ -75,8 +64,7 @@ test.describe('Accessibility', () => {
     await expect(header.notifDropdown).toBeVisible();
   });
 
-  test('create project modal name input has placeholder', async ({ leftPanel, createProjectModal, page }) => {
-    await mockAgentRoute(page);
+  test('create project modal name input has placeholder', async ({ leftPanel, createProjectModal }) => {
     await leftPanel.clickNewProject();
     const placeholder = await createProjectModal.nameInput.getAttribute('placeholder');
     expect(placeholder).toBeTruthy();

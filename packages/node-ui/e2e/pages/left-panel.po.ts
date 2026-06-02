@@ -62,7 +62,20 @@ export class LeftPanelPage {
   }
 
   async clickNewProject() {
-    await this.newProjectBtn.filter({ hasText: '+ New Context Graph' }).click();
+    const btn = this.newProjectBtn.filter({ hasText: '+ New Context Graph' });
+    await btn.waitFor({ state: 'visible', timeout: 10_000 });
+    await btn.click();
+    // The modal mounts via a layout-store update. If the click lands while the
+    // left panel is still re-rendering from its async context-graphs fetch, the
+    // onClick can be missed and the overlay never appears. Verify the overlay
+    // opened and retry once — keeps the open deterministic instead of flaky.
+    const overlay = this.page.locator(sel.modal.overlay);
+    try {
+      await overlay.waitFor({ state: 'visible', timeout: 2_000 });
+    } catch {
+      await btn.click();
+      await overlay.waitFor({ state: 'visible', timeout: 5_000 });
+    }
   }
 
   async waitForProjectsLoaded() {
@@ -98,6 +111,23 @@ export class LeftPanelPage {
       .locator(sel.leftPanel.sectionHeader)
       .filter({ hasText: name })
       .click();
+    // Clicking the CG row opens its project tab, but the ProjectView BODY
+    // (`.v10-memory-explorer` — the project strip + dot, layer switcher,
+    // overview card, …) only mounts AFTER ProjectView's async
+    // `fetchContextGraphs` resolves and the CG appears in the list; until then
+    // the centre shows a "Loading context graph..." placeholder. Nearly every
+    // caller immediately asserts on a body element, often with the default 5s
+    // `expect` timeout, which races that cold fetch under heavy parallel load
+    // against the single shared devnet node (e.g. `.v10-project-strip-dot`
+    // "element(s) not found"). Wait for the body to actually mount here so every
+    // caller starts from a fully-loaded project — a real load wait, not a
+    // masked assertion (if the project never loads in 30s that's a genuine
+    // failure worth surfacing).
+    await this.page
+      .locator('.v10-center-content .v10-memory-explorer')
+      .filter({ has: this.page.getByRole('button', { name }) })
+      .first()
+      .waitFor({ state: 'visible', timeout: 30_000 });
   }
 
   /**
@@ -121,6 +151,16 @@ export class LeftPanelPage {
     await section.locator(sel.leftPanel.sectionHeader).first().getByRole('button', { name: '×' }).click();
   }
 
+  /** The "↺ Show N hidden context graphs" restore button (only present while ≥1 is hidden). */
+  get showHiddenButton() {
+    return this.root.locator(sel.leftPanel.showHidden).first();
+  }
+
+  /** Restore every CG dismissed from the sidebar (calls the shared `unhideAll`). */
+  async showHiddenProjects() {
+    await this.showHiddenButton.click();
+  }
+
   async clickLayer(projectName: string, layer: 'wm' | 'swm' | 'vm' | 'import') {
     await this.expandProject(projectName);
     const tab = this.page.locator(sel.center.tab).filter({ hasText: projectName });
@@ -129,6 +169,15 @@ export class LeftPanelPage {
     const root = this.page.locator('.v10-center-content .v10-memory-explorer').filter({
       has: this.page.getByRole('button', { name: projectName }),
     });
+    // ProjectView renders "Loading context graph..." (a `.v10-view-placeholder`,
+    // NOT the explorer) until its async `fetchContextGraphs` resolves and the CG
+    // appears in the list — only then does `.v10-memory-explorer` (and the layer
+    // switcher inside it) mount. Under heavy parallel load that cold fetch can
+    // take longer than a click's default 10s actionability wait, so clicking the
+    // layer button straight away races the loading spinner and times out — a
+    // false negative, not a real UI defect (the same path passes once warm).
+    // Wait for the explorer to actually mount (poll interval is 30s) first.
+    await root.waitFor({ state: 'visible', timeout: 30_000 });
     if (layer === 'import') {
       await root.locator(sel.layer.actionBtn).filter({ hasText: /Import/i }).click();
       return;

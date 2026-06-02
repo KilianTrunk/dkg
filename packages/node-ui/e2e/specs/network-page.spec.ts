@@ -76,22 +76,27 @@ test.describe('Network Debug Page (/ui/network)', () => {
     await expect(empty.or(table).first()).toBeVisible();
   });
 
-  test('Active Connections empty state explains the surface', async ({ page }) => {
-    // Only assert when the empty-state branch is actually rendered —
-    // skip cleanly if the daemon happens to surface a connection.
-    const desc = page.getByText(/Connections will appear here/i);
-    if ((await desc.count()) === 0) {
-      test.skip(true, 'devnet surfaced a real connection; empty-state copy not rendered');
-    }
-    await expect(desc).toBeVisible();
+  test('Active Connections card shows either the explanatory empty state or a connections table', async ({ page }) => {
+    // On a 2-node devnet node1↔node2 may or may not have dialled by the time
+    // this loads, so the card resolves to one of two valid shapes: the
+    // explanatory empty-state copy ("Connections will appear here…") OR a
+    // populated `.data-table`. Assert the union so the test always runs and
+    // still catches a card that renders NEITHER (the real regression).
+    const card = page
+      .locator('.card')
+      .filter({ has: page.locator('.card-title', { hasText: 'Active Connections' }) });
+    const desc = card.getByText(/Connections will appear here/i);
+    const table = card.locator('table.data-table');
+    await expect(desc.or(table).first()).toBeVisible();
   });
 
-  test('Discovered Agents empty state explains the surface', async ({ page }) => {
-    const desc = page.getByText(/Agents will be listed here/i);
-    if ((await desc.count()) === 0) {
-      test.skip(true, 'devnet surfaced a discovered agent; empty-state copy not rendered');
-    }
-    await expect(desc).toBeVisible();
+  test('Discovered Agents card shows either the explanatory empty state or an agents table', async ({ page }) => {
+    const card = page
+      .locator('.card')
+      .filter({ has: page.locator('.card-title', { hasText: 'Discovered Agents' }) });
+    const desc = card.getByText(/Agents will be listed here/i);
+    const table = card.locator('table.data-table');
+    await expect(desc.or(table).first()).toBeVisible();
   });
 
   test('the page is unframed (no AppShell sidebar / header)', async ({ page }) => {

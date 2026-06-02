@@ -4,8 +4,8 @@ import { PRIMARY_CG, NAMED_SUBGRAPH } from '../helpers/real-node.js';
 
 // `global-setup.ts` registers + seeds the `NAMED_SUBGRAPH` sub-graph inside
 // PRIMARY_CG (plus a root-bucket VM entity), so the SubGraphBar deterministically
-// renders an "All" chip + at least one concrete scope chip ("people", and "Root"
-// when root entities are in scope) on EVERY layer page. That guarantee is what
+// renders an "All" chip + at least one concrete scope chip (NAMED_SUBGRAPH, and
+// "Root" when root entities are in scope) on EVERY layer page. That guarantee is what
 // lets these specs assert directly instead of skipping on the degenerate
 // "only All exists" case. We don't re-seed per-describe — parallel on-chain
 // publishes from multiple beforeAll hooks contend on the 2-node devnet.
@@ -132,7 +132,7 @@ test.describe('SubGraph bar on memory layer pages', () => {
     // `null` unless the CG has a user-facing named sub-graph OR the current
     // layer holds root-bucket entities (SubGraphBar.tsx: `merged.length === 0
     // && !showRootChip → return null`). `merged` derives from the project-wide
-    // `/api/sub-graph/list`. The seeded `people` sub-graph lives in PRIMARY_CG,
+    // `/api/sub-graph/list`. The seeded NAMED_SUBGRAPH sub-graph lives in PRIMARY_CG,
     // so the bar deterministically renders on EVERY layer there. devnet-isolation
     // has no named sub-graph, so the bar appears only if its SWM happens to hold
     // promoted entities — and the conviction baseline's `clearAfter: true` wipes

@@ -22,8 +22,20 @@
 import { mkdir, rm, writeFile, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
+import { createHash } from 'node:crypto';
+import { readDevnetNode } from './devnet.js';
 
-const LOCK_DIR = path.join(os.tmpdir(), 'dkg-e2e-swm-lock');
+// Namespace the lock by the devnet it actually protects. This mutex guards ONE
+// devnet's shared memory, so two unrelated node-ui runs (different checkouts, or
+// different devnets on the same host) must NOT share a single `/tmp` lock dir —
+// otherwise one run would needlessly block, or even steal, the other's lock.
+// Keying on node1's home path isolates per-devnet, while two runs targeting the
+// SAME devnet still share the lock (correct — they DO contend on the same SWM).
+const LOCK_NS = createHash('sha1')
+  .update(readDevnetNode(1)?.home ?? process.cwd())
+  .digest('hex')
+  .slice(0, 12);
+const LOCK_DIR = path.join(os.tmpdir(), `dkg-e2e-swm-lock-${LOCK_NS}`);
 const HOLDER_FILE = path.join(LOCK_DIR, 'holder');
 
 function sleep(ms: number) {

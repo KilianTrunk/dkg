@@ -26,8 +26,14 @@ export const SEEDED_CGS = [PRIMARY_CG, SECONDARY_CG] as const;
  * `/api/sub-graph/list`, so a single registered sub-graph means specs never hit
  * the "only the aggregate All chip exists" degenerate case (which previously
  * forced conditional `test.skip`s and made the WM-layer bar flaky/empty).
+ *
+ * The slug is deliberately e2e-namespaced (NOT a generic name like "people")
+ * because `global-setup.ts` uses its presence as the "this devnet was already
+ * seeded by us" sentinel to keep seeding idempotent. A generic name could
+ * pre-exist on a reused operator devnet and trick setup into skipping the seed,
+ * leaving specs asserting against ambient cluster data instead of our fixtures.
  */
-export const NAMED_SUBGRAPH = 'people';
+export const NAMED_SUBGRAPH = 'e2e-seed-people';
 
 export interface SeededEntity {
   /** rdfs:label of the published entity — assert this appears in the VM layer. */

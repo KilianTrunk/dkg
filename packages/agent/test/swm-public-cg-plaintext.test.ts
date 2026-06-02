@@ -31,6 +31,9 @@ function makeAgentLike(opts: {
   // Simulates a PERSISTED `...OnChainId` triple surviving a restart: the
   // durable reverse-lookup in isKnownOnChainId answers a hit for this id.
   persistedOnChainId?: string;
+  // Simulates a creator-persisted explicit `accessPolicy` triple (the
+  // getExplicitAccessPolicy fallback honored by resolveWorkspaceRecipientsGated).
+  explicitPolicy?: 'public' | 'private';
 } = {}) {
   const log = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
   const chain: Record<string, unknown> = {};
@@ -41,17 +44,19 @@ function makeAgentLike(opts: {
     });
   }
   const storeQuery = vi.fn(async (q: unknown) => {
-    // The durable on-chain-id reverse lookup interpolates the numeric id as a
-    // STR() filter literal. Answer a single binding when it matches the
-    // configured persisted mapping; everything else returns no bindings.
-    if (
-      opts.persistedOnChainId &&
-      typeof q === 'string' &&
-      q.includes('OnChainId') &&
-      q.includes(`"${opts.persistedOnChainId}"`)
-    ) {
+    const query = typeof q === 'string' ? q : '';
+    // (1) Durable on-chain-id reverse lookup (isKnownOnChainId): interpolates
+    //     the numeric id as a STR() filter literal under the OnChainId
+    //     predicate. Answer a binding when it matches the persisted mapping.
+    if (opts.persistedOnChainId && query.includes('OnChainId') && query.includes(`"${opts.persistedOnChainId}"`)) {
       return { type: 'bindings', bindings: [{ cg: 'did:dkg:context-graph:music' }] };
     }
+    // (2) Explicit access-policy lookup (getExplicitAccessPolicy): SELECT
+    //     ?policy with no ?agent/?revoked. Answer the configured policy.
+    if (opts.explicitPolicy && query.includes('?policy') && !query.includes('?agent') && !query.includes('OnChainId')) {
+      return { type: 'bindings', bindings: [{ policy: `"${opts.explicitPolicy}"` }] };
+    }
+    // Everything else (incl. the store resolver's ?agent/?revoked query) → none.
     return { type: 'bindings', bindings: [] as unknown[] };
   });
   const agentLike: any = {
@@ -71,6 +76,7 @@ function makeAgentLike(opts: {
   // Bind the prototype methods under test so `this` resolves to agentLike.
   agentLike.isContextGraphPublicOnChain = (DKGAgent.prototype as any).isContextGraphPublicOnChain;
   agentLike.isKnownOnChainId = (DKGAgent.prototype as any).isKnownOnChainId;
+  agentLike.getExplicitAccessPolicy = (DKGAgent.prototype as any).getExplicitAccessPolicy;
   agentLike.resolveWorkspaceRecipientsGated = (DKGAgent.prototype as any).resolveWorkspaceRecipientsGated;
   agentLike._resolveCuratedChainKeyContext = (DKGAgent.prototype as any)._resolveCuratedChainKeyContext;
   return agentLike;
@@ -191,15 +197,41 @@ describe('DKGAgent.isContextGraphPublicOnChain', () => {
 
   it('resolves a REGISTERED numeric-named local CG to its mapped on-chain policy (#884 review round-4)', async () => {
     // A registered CG whose user-chosen local id happens to be numeric ("42")
-    // may map to a DIFFERENT on-chain id (here "99"). Local-id resolution runs
-    // FIRST, so the helper reads policy for the graph's ACTUAL on-chain id
-    // (99) — never bypassing a genuinely-registered graph just because its
-    // local id looks like a number. The numeric shortcut is only a fallback
-    // for ids the local resolver can't map.
+    // maps to a DIFFERENT on-chain id (here "99") and is NOT independently
+    // known as on-chain id "42". Only the local interpretation resolves, so
+    // the helper reads policy for the graph's ACTUAL on-chain id (99) — never
+    // bypassing a genuinely-registered graph just because its local id looks
+    // like a number.
     const agentLike = makeAgentLike({ onChainId: '99', accessPolicy: 0 });
     await expect(isPublic(agentLike, '42')).resolves.toBe(true);
     expect(agentLike.getContextGraphOnChainId).toHaveBeenCalledWith('42');
     expect(agentLike.chain.getContextGraphAccessPolicy).toHaveBeenCalledWith(99n);
+  });
+
+  it('uses the agreed on-chain id when local AND numeric interpretations match (#884 review round-5)', async () => {
+    // Local CG "42" maps to on-chain "42" AND "42" is an independently-known
+    // on-chain id — the two interpretations agree, so it's unambiguous.
+    const agentLike = makeAgentLike({
+      onChainId: '42',
+      accessPolicy: 0,
+      subscribed: new Map([['x', { onChainId: '42' }]]),
+    });
+    await expect(isPublic(agentLike, '42')).resolves.toBe(true);
+    expect(agentLike.chain.getContextGraphAccessPolicy).toHaveBeenCalledWith(42n);
+  });
+
+  it('fails closed when local and numeric interpretations DISAGREE (ambiguous collision) (#884 review round-5)', async () => {
+    // Pathological collision: a local CG named "42" maps to on-chain id "99",
+    // AND on-chain CG "42" is independently known here. We cannot tell which
+    // graph the caller meant, so reading either policy could be wrong — fail
+    // closed (encrypt) with no chain read rather than risk a plaintext leak.
+    const agentLike = makeAgentLike({
+      onChainId: '99',
+      accessPolicy: 0,
+      subscribed: new Map([['x', { onChainId: '42' }]]),
+    });
+    await expect(isPublic(agentLike, '42')).resolves.toBe(false);
+    expect(agentLike.chain.getContextGraphAccessPolicy).not.toHaveBeenCalled();
   });
 
   it('logs a diagnostic (not silent) when a lookup flakes before failing closed (#884 review round-3 🟡)', async () => {
@@ -246,6 +278,40 @@ describe('DKGAgent.resolveWorkspaceRecipientsGated (gate-before)', () => {
       { contextGraphId: '0xCURATOR/unknown-cg' },
     );
     expect(agentLike.store.query).toHaveBeenCalled();
+  });
+
+  it('honors an explicit local accessPolicy="public" when the on-chain probe MISSES (#884 review transient flake)', async () => {
+    // On-chain id unresolvable (probe miss — cold cache / flaky RPC), but the
+    // curator persisted accessPolicy="public" locally. The gated resolver must
+    // take the plaintext path instead of delegating to the store resolver,
+    // which flags the allowlist as requiresEncryption and re-triggers the
+    // promote/share 500 this PR fixes.
+    const agentLike = makeAgentLike({ onChainId: null, explicitPolicy: 'public' });
+    const resolution = await (DKGAgent.prototype as any).resolveWorkspaceRecipientsGated.call(
+      agentLike,
+      { contextGraphId: '0xCURATOR/explicit-public' },
+    );
+    expect(resolution).toEqual({ requiresEncryption: false, recipients: [] });
+    // The encrypt-prone store resolver (its query SELECTs ?revoked) must never
+    // be consulted — the explicit-public override short-circuits before it.
+    const resolverConsulted = agentLike.store.query.mock.calls.some(
+      ([q]: [unknown]) => typeof q === 'string' && q.includes('?revoked'),
+    );
+    expect(resolverConsulted).toBe(false);
+  });
+
+  it('still encrypts when local accessPolicy="private" and the on-chain probe misses (#884 fail-closed)', async () => {
+    // Mirror of the above: an explicit PRIVATE policy must NOT take the
+    // plaintext shortcut — it delegates to the store resolver (encrypted path).
+    const agentLike = makeAgentLike({ onChainId: null, explicitPolicy: 'private' });
+    await (DKGAgent.prototype as any).resolveWorkspaceRecipientsGated.call(
+      agentLike,
+      { contextGraphId: '0xCURATOR/explicit-private' },
+    );
+    const resolverConsulted = agentLike.store.query.mock.calls.some(
+      ([q]: [unknown]) => typeof q === 'string' && q.includes('?revoked'),
+    );
+    expect(resolverConsulted).toBe(true);
   });
 
   it('returns plaintext for a public CG addressed by its numeric on-chain id WITHOUT the store resolver (#884)', async () => {

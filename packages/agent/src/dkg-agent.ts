@@ -6109,45 +6109,60 @@ export class DKGAgent {
    *
    * Fail-closed: returns `false` for private (`1`), unknown/unregistered,
    * a missing chain getter, or any lookup error, so curated / invite-only
-   * CGs keep their encrypted SWM. Resolves the numeric on-chain id from
-   * the local context-graph id first; numeric/local-only ids that don't
-   * resolve return `false` and leave existing gating untouched.
+   * CGs keep their encrypted SWM. A bare decimal id is resolved BOTH as a
+   * local context-graph name and (when proven registered) as a raw on-chain
+   * id; on a genuine collision between the two it also fails closed. The
+   * optional `opCtx` tags the fail-closed diagnostic with the caller's
+   * subsystem (share vs publish).
    */
-  private async isContextGraphPublicOnChain(contextGraphId: string): Promise<boolean> {
+  private async isContextGraphPublicOnChain(
+    contextGraphId: string,
+    opCtx?: OperationContext,
+  ): Promise<boolean> {
     try {
-      // Resolve the numeric on-chain id. A caller may pass either the numeric
-      // on-chain id directly (e.g. share('42', ...)) or a LOCAL context-graph
-      // id (a name) that maps to one. These two ID spaces overlap for
-      // digit-only inputs, so a numeric input is treated UNAMBIGUOUSLY as the
-      // on-chain id — never silently resolved as a local id that might map to
-      // a DIFFERENT on-chain CG (which would flip the encryption decision for
-      // the wrong graph, review round-3).
-      let onChainId: string | null = null;
+      // A bare decimal `contextGraphId` is INHERENTLY ambiguous: it can be a
+      // LOCAL context-graph id (a CG the user named "42") OR an already-resolved
+      // numeric ON-CHAIN id (e.g. share('42', ...)). Reviewers have correctly
+      // flagged BOTH a strict local-first and a strict numeric-first ordering as
+      // unsafe for the opposite case, so resolve the two interpretations
+      // INDEPENDENTLY and only trust a value when they agree or only one exists.
       const trimmed = contextGraphId.trim();
-      // 1) LOCAL-ID RESOLUTION FIRST. `getContextGraphOnChainId` maps ANY
-      //    locally-known context-graph id — including a registered CG whose
-      //    user-chosen id is numeric (a CG "named 42") — to THAT graph's
-      //    actual persisted on-chain id. Reading the access policy for the
-      //    resolved id therefore always targets the correct graph (it's the
-      //    graph the local id genuinely is on-chain, never a "wrong" graph),
-      //    and the resolver only ever returns an id for a registered CG, so
-      //    it never invents one for an unregistered local graph.
+
+      // (a) LOCAL-ID interpretation: map the input as a context-graph name to
+      //     its persisted on-chain id. The resolver only returns an id for a
+      //     graph registered on-chain, so it never invents one — and it covers
+      //     a registered CG whose user-chosen id happens to be numeric (a CG
+      //     "named 42" that maps to its own actual on-chain id).
+      let localResolved: string | null = null;
       if (typeof this.getContextGraphOnChainId === 'function') {
-        onChainId = await this.getContextGraphOnChainId(contextGraphId);
+        localResolved = await this.getContextGraphOnChainId(contextGraphId);
       }
-      // 2) NUMERIC FALLBACK. If the local resolver couldn't map it AND the
-      //    caller passed a bare number, that number MAY itself be the on-chain
-      //    id — e.g. share('42', ...) for a public CG this node isn't tracking
-      //    under that local key. Chain adapters return access-policy 0
-      //    (= public) for UNKNOWN ids (Solidity default-zero mapping), so the
-      //    bare number is trusted ONLY when PROVEN to be a registered on-chain
-      //    CG this node knows: present in the create-event policy cache, or
-      //    matching a subscribed CG's onChainId (the chain only assigns that
-      //    id at registration). An unregistered local graph whose id is
-      //    numeric, or any unknown number, stays unresolved and falls through
-      //    to the fail-closed (encrypted) path below (#884).
-      if (!onChainId && /^\d+$/.test(trimmed) && (await this.isKnownOnChainId(trimmed))) {
-        onChainId = trimmed;
+
+      // (b) ON-CHAIN-ID interpretation: a bare decimal MAY itself be the
+      //     on-chain id. Trusted ONLY when PROVEN registered via
+      //     isKnownOnChainId (policy cache / subscribed CG / durable persisted
+      //     mapping), because chain adapters return access-policy 0 (= public)
+      //     for UNKNOWN ids (Solidity default-zero mapping).
+      let numericResolved: string | null = null;
+      if (/^\d+$/.test(trimmed) && (await this.isKnownOnChainId(trimmed))) {
+        numericResolved = trimmed;
+      }
+
+      // Reconcile. If both interpretations resolve and DISAGREE (a local CG
+      // "42" mapping to a different on-chain id, AND on-chain CG 42 is itself
+      // independently known here), we cannot safely tell which graph the
+      // caller meant — fail closed (encrypt) rather than read the wrong
+      // graph's policy and risk leaking plaintext. If they agree, or only one
+      // resolves, use it. In the common cases this satisfies BOTH review
+      // positions: a registered numeric-named local CG routes to its mapped
+      // policy (local-first concern), and a bare on-chain id with no colliding
+      // local name routes to the on-chain policy (numeric-first concern).
+      let onChainId: string | null;
+      if (localResolved && numericResolved) {
+        if (localResolved !== numericResolved) return false;
+        onChainId = localResolved;
+      } else {
+        onChainId = localResolved ?? numericResolved;
       }
       if (!onChainId) return false;
       const cached = this.onChainAccessPolicyCache.get(onChainId);
@@ -6175,7 +6190,11 @@ export class DKGAgent {
       // this fix targets. Surface WHY the public override was skipped so
       // operators get a diagnostic instead of a silent regression.
       this.log.warn(
-        createOperationContext('share'),
+        // #884 review (🟡): tag with the CALLER's operation context — this
+        // helper runs on both the share/promote path and the publish-inline
+        // probe, so a hard-coded 'share' would point operators at the wrong
+        // subsystem when the publish path hits this branch.
+        opCtx ?? createOperationContext('share'),
         `isContextGraphPublicOnChain(${contextGraphId}) lookup failed — treating CG as NOT public ` +
         `(fail-closed: SWM stays encrypted): ${err instanceof Error ? err.message : String(err)}`,
       );
@@ -6254,8 +6273,26 @@ export class DKGAgent {
   private async resolveWorkspaceRecipientsGated(
     input: WorkspaceAgentRecipientResolverInput,
   ): Promise<WorkspaceAgentRecipientResolution> {
-    if (await this.isContextGraphPublicOnChain(input.contextGraphId)) {
+    if (await this.isContextGraphPublicOnChain(input.contextGraphId, createOperationContext('share'))) {
       return { requiresEncryption: false, recipients: [] };
+    }
+    // #884 review (🔴): the on-chain probe above can MISS transiently — a cold
+    // cache is re-read from chain, but a flaky chain/store read fails closed
+    // (returns false). Before delegating to the store resolver — which flags
+    // ANY allowlisted CG as requiresEncryption=true and would put a
+    // public+allowlist CG back onto the sender-key path, reproducing the
+    // promote/share 500 this PR fixes — honor an EXPLICIT, creator-persisted
+    // `accessPolicy="public"` triple. This is the SAME authoritative signal
+    // `isPrivateContextGraph` already trusts for read-path routing (#865), so
+    // it only ever reads 'public' when the curator declared the CG public; a
+    // curated / invite-only / unknown CG still encrypts (fail-closed:
+    // getExplicitAccessPolicy returns 'private' / null).
+    try {
+      if ((await this.getExplicitAccessPolicy(input.contextGraphId)) === 'public') {
+        return { requiresEncryption: false, recipients: [] };
+      }
+    } catch {
+      // Explicit-policy read flaked too — fall through to the encrypted path.
     }
     return resolveWorkspaceAgentRecipients(this.store, input);
   }
@@ -9201,7 +9238,7 @@ export class DKGAgent {
       // allowlist-implies-private heuristic doesn't force encrypted inline
       // payloads onto a public CG (which keeps publish consistent with the
       // plaintext SWM-gossip path).
-      if (await this.isContextGraphPublicOnChain(cgId)) return false;
+      if (await this.isContextGraphPublicOnChain(cgId, ctx)) return false;
       try {
         if (await this.isPrivateContextGraph(cgId)) return true;
       } catch { /* fall through to chain probe */ }

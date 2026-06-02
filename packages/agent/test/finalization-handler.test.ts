@@ -354,6 +354,44 @@ describe('FinalizationHandler.handleChainReconciledKC (Phase B)', () => {
     expect(promoted.type === 'boolean' && promoted.value).toBe(true);
   });
 
+  it('mirrors the keep-root dual-write when the publisher persisted keepRootCopyOnLabel=true', async () => {
+    // Regression: a same-graph publish recovered via the chain sweep (gossip
+    // missed) must still land a root `<cg>` label copy, else label-scoped reads
+    // miss it. The durable signal lives in SWM workspace meta.
+    const store = new OxigraphStore();
+    const merkleRoot = await seedSwmSnapshot(store);
+    await store.insert([
+      { subject: ENTITY, predicate: 'http://dkg.io/ontology/keepRootCopyOnLabel', object: '"true"', graph: contextGraphWorkspaceMetaGraphUri(CONTEXT_GRAPH) },
+    ]);
+    const handler = new FinalizationHandler(store, makeBindingChain(42n));
+
+    const outcome = await handler.handleChainReconciledKC(input(merkleRoot), createOperationContext('system'));
+    expect(outcome).toBe('promoted');
+
+    const rootLabelGraph = `did:dkg:context-graph:${CONTEXT_GRAPH}`;
+    const inRootLabel = await store.query(
+      `ASK { GRAPH <${rootLabelGraph}> { <${ENTITY}> <http://schema.org/name> "Reconciled" } }`,
+    );
+    expect(inRootLabel.type === 'boolean' && inRootLabel.value).toBe(true);
+  });
+
+  it('does NOT dual-write to the root label when no keep-root signal is persisted (legacy / remap)', async () => {
+    // Absent signal → per-cgId only, so a remap publish's deliberately-dropped
+    // root copy is never re-added (data-isolation guard).
+    const store = new OxigraphStore();
+    const merkleRoot = await seedSwmSnapshot(store);
+    const handler = new FinalizationHandler(store, makeBindingChain(42n));
+
+    const outcome = await handler.handleChainReconciledKC(input(merkleRoot), createOperationContext('system'));
+    expect(outcome).toBe('promoted');
+
+    const rootLabelGraph = `did:dkg:context-graph:${CONTEXT_GRAPH}`;
+    const inRootLabel = await store.query(
+      `ASK { GRAPH <${rootLabelGraph}> { <${ENTITY}> ?p ?o } }`,
+    );
+    expect(inRootLabel.type === 'boolean' && inRootLabel.value).toBe(false);
+  });
+
   it('returns no-swm when no local SWM snapshot matches the published merkleRoot', async () => {
     const store = new OxigraphStore();
     await seedSwmSnapshot(store);

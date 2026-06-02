@@ -216,7 +216,7 @@ import {
   type WorkspaceEncryptionKeyEntry,
 } from './agent-keystore.js';
 import { GossipPublishHandler } from './gossip-publish-handler.js';
-import { FinalizationHandler } from './finalization-handler.js';
+import { FinalizationHandler, KEEP_ROOT_COPY_PREDICATE } from './finalization-handler.js';
 import { reconcileContextGraph, ReconcileCoalescer, RecentUalSet, type ChainReconcilerDeps, type OrdinalOutcome } from './chain-reconciler.js';
 import { createCursorState, type CursorState } from './reconcile-cursor.js';
 // rc.9 PR-10: JoinApprovalRetryQueue removed — substrate outbox
@@ -9886,6 +9886,38 @@ export class DKGAgent {
       } catch {
         this.log.warn(ctx, `No peers subscribed to ${topic} yet`);
       }
+
+      // Durable keep-root signal. The gossip envelope's `keepRootCopyOnLabel`
+      // only reaches peers online for the broadcast; a subscriber that missed
+      // it later recovers the publish via the chain-driven reconcile sweep,
+      // which has no wire to learn the dual-write intent from. Persist the same
+      // decision per root into SWM workspace meta — co-located with the per-root
+      // `privateMerkleRoot` that already replicates to subscribers — so the
+      // reconcile path can mirror the gossip dual-write decision. Read back by
+      // `FinalizationHandler.getKeepRootCopySignal`. Updates reuse a root
+      // entity, so replace any prior value rather than accumulate.
+      try {
+        const gm = new GraphManager(this.store);
+        const wsMetaGraph = options?.subGraphName
+          ? gm.sharedMemoryMetaUri(contextGraphId, options.subGraphName)
+          : contextGraphWorkspaceMetaGraphUri(contextGraphId);
+        const keepLiteral = `"${keepRootCopyOnLabel}"`;
+        for (const root of rootEntities.filter(isSafeIri)) {
+          await this.store.deleteByPattern({
+            subject: root,
+            predicate: KEEP_ROOT_COPY_PREDICATE,
+            graph: wsMetaGraph,
+          });
+          await this.store.insert([{
+            subject: root,
+            predicate: KEEP_ROOT_COPY_PREDICATE,
+            object: keepLiteral,
+            graph: wsMetaGraph,
+          }]);
+        }
+      } catch (err) {
+        this.log.warn(ctx, `Failed to persist keepRootCopyOnLabel signal for ${result.ual}: ${err instanceof Error ? err.message : String(err)}`);
+      }
     }
 
     return result;
@@ -12122,10 +12154,19 @@ export class DKGAgent {
    */
   private resolveLocalCgIdByOnChainId(onChainId: bigint): string | null {
     const target = onChainId.toString();
+    // Multiple local records can share one on-chain id: a synthetic
+    // hash-keyed host record (`subscribed: false`, minted from
+    // `ContextGraphCreated`) can coexist with the real subscribed cleartext
+    // CG. Prefer the subscribed match so live KACG nudges + reconcile target
+    // the CG a user actually reads; fall back to the first record otherwise
+    // (the host-only / post-restart replay-window case callers tolerate).
+    let fallback: string | null = null;
     for (const [localId, sub] of this.subscribedContextGraphs) {
-      if (sub.onChainId === target) return localId;
+      if (sub.onChainId !== target) continue;
+      if (sub.subscribed) return localId;
+      if (fallback === null) fallback = localId;
     }
-    return null;
+    return fallback;
   }
 
   /**
@@ -12143,13 +12184,24 @@ export class DKGAgent {
   private bindSubscriptionOnChainId(localCgId: string, sub: ContextGraphSub, newOnChainId: string): void {
     const prev = sub.onChainId;
     sub.onChainId = newOnChainId;
-    if (prev && prev !== newOnChainId && (sub.lastReconciledOrdinal ?? 0) > 0) {
+    if (!prev || prev === newOnChainId) return;
+    // The bound on-chain id actually CHANGED (repair / recreate / re-register).
+    // Any prior reconcile progress refers to the OLD chain graph and must be
+    // dropped, otherwise the sweep resumes at the wrong ordinal and skips
+    // early KAs of the new graph. Progress can hide in two places: the
+    // persisted `lastReconciledOrdinal` watermark AND an in-memory cursor that
+    // still holds `ahead` ordinals while its watermark is 0 (e.g. ordinals
+    // reconciled but waiting on confirmation depth). Reset BOTH on any id
+    // change — not only when the persisted watermark happens to be positive.
+    const hadProgress =
+      (sub.lastReconciledOrdinal ?? 0) > 0 || this.reconcileCursors.has(localCgId);
+    sub.lastReconciledOrdinal = 0;
+    this.reconcileCursors.delete(localCgId);
+    if (hadProgress) {
       this.log.info(
         createOperationContext('system'),
-        `VM reconcile: on-chain id for "${localCgId}" changed ${prev}->${newOnChainId}; resetting reconcile watermark to 0`,
+        `VM reconcile: on-chain id for "${localCgId}" changed ${prev}->${newOnChainId}; reset reconcile watermark + cursor to 0`,
       );
-      sub.lastReconciledOrdinal = 0;
-      this.reconcileCursors.delete(localCgId);
     }
   }
 

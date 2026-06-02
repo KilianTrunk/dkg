@@ -119,6 +119,8 @@ KC_ID=$(parse_json "$PUB_RESP" '.kaId')
 [ -n "$TX_HASH" ] || fail "no txHash in publish response — cannot proceed without on-chain anchor"
 [ -n "$KC_ID" ] || fail "no kaId in publish response — required for merkleRoot lookup"
 
+# Use the first published root for single-batch negative tests below.
+KC_ID=$(printf '%s' "$DEVNET_PUBLISH_ALL_RESPONSES" | node -e 'let d="";process.stdin.on("data",c=>d+=c);process.stdin.on("end",()=>console.log(JSON.parse(d)[0].kaId))')
 log "Fetching merkleRoot from chain (KC #${KC_ID}) via daemon API..."
 KC_RESP=$(api_call "$CURATOR_NODE" GET "/api/kc/${KC_ID}")
 log "kc lookup: $KC_RESP"
@@ -162,30 +164,9 @@ fi
 # path a member uses after catchup once they've decrypted ciphertext, and is
 # the only path that's batch-scoped for the verifier API.
 log "Calling verify-batch with explicit caller-supplied quads (member-side simulation)..."
-EXPLICIT_QUADS=$(node -e "
-  const quads = [];
-  for (let i = 0; i < 5; i++) {
-    quads.push({
-      subject: 'urn:lu8/item' + i,
-      predicate: 'http://schema.org/name',
-      object: '\"Item' + i + '\"',
-      graph: ''
-    });
-  }
-  console.log(JSON.stringify({
-    contextGraphId: '$PUB_CG',
-    expectedMerkleRoot: '$MERKLE_ROOT',
-    quads
-  }));
-")
-VERIFY_EXPLICIT=$(api_call "$MEMBER_NODE" POST /api/shared-memory/verify-batch "$EXPLICIT_QUADS")
-log "verify-batch explicit: $VERIFY_EXPLICIT"
-EXPLICIT_OK=$(parse_json "$VERIFY_EXPLICIT" '.ok')
-if [ "$EXPLICIT_OK" = "true" ]; then
-  log "✓ Scenario 1b: explicit-quads verify ok=true (member can verify once it has the plaintext)"
-else
-  warn "explicit-quads verify returned ok=$EXPLICIT_OK (expected true)"
-fi
+devnet_verify_each_published_root "$MEMBER_NODE" "$PUB_CG" "$QUADS" \
+  && log "✓ Scenario 1b: explicit-quads verify ok=true for all published roots (member can verify once it has the plaintext)" \
+  || warn "explicit-quads verify failed for one or more roots"
 
 # ===========================================================================
 # SCENARIO 2 — Root-mismatch detection.
@@ -198,25 +179,13 @@ log "================================================================"
 
 log "Member calls verify-batch with forged quads (extra injected triple)..."
 FORGED_QUADS=$(node -e "
-  const quads = [];
-  for (let i = 0; i < 5; i++) {
-    quads.push({
-      subject: 'urn:lu8/item' + i,
-      predicate: 'http://schema.org/name',
-      object: '\"Item' + i + '\"',
-      graph: ''
-    });
-  }
-  quads.push({
-    subject: 'urn:lu8/injected',
-    predicate: 'http://schema.org/name',
-    object: '\"Mallory\"',
-    graph: ''
-  });
   console.log(JSON.stringify({
     contextGraphId: '$PUB_CG',
     expectedMerkleRoot: '$MERKLE_ROOT',
-    quads,
+    quads: [
+      { subject: 'urn:lu8/item0', predicate: 'http://schema.org/name', object: '\"Item0\"', graph: '' },
+      { subject: 'urn:lu8/injected', predicate: 'http://schema.org/name', object: '\"Mallory\"', graph: '' },
+    ],
     batchId: 'lu8-forged-${STAMP}'
   }));
 ")

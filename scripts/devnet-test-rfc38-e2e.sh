@@ -353,23 +353,12 @@ act 3 "Member verifies the on-chain batch post-decrypt (LU-8)"
 # recompute would fail. Explicit-quads input is the correct
 # semantic for "member verifies decrypted batch."
 log "Member calls verify-batch with explicit decrypted quads (12 user triples)..."
-VERIFY_BODY=$(QUADS_PAYLOAD="$QUADS_PAYLOAD" MERKLE_ROOT="$MERKLE_ROOT" PUBLISH_KC="$PUBLISH_KC" node -e "
-  const payload = JSON.parse(process.env.QUADS_PAYLOAD);
-  console.log(JSON.stringify({
-    contextGraphId: payload.contextGraphId,
-    expectedMerkleRoot: process.env.MERKLE_ROOT,
-    batchId: process.env.PUBLISH_KC,
-    quads: payload.quads
-  }));
-")
-VERIFY_CURATOR=$(api_call "$MEMBER_NODE" POST /api/shared-memory/verify-batch "$VERIFY_BODY")
-log "member verify response: $VERIFY_CURATOR"
-VC_OK=$(parse_json "$VERIFY_CURATOR" '.ok')
-VC_LEAF=$(parse_json "$VERIFY_CURATOR" '.leafCount')
-VC_ACTUAL=$(parse_json "$VERIFY_CURATOR" '.actualRoot')
-[ "$VC_OK" = "true" ] || fail "member verify-batch returned ok=$VC_OK (expected true) — response: $VERIFY_CURATOR"
-[ "$VC_ACTUAL" = "$MERKLE_ROOT" ] || fail "actualRoot != expectedRoot ($VC_ACTUAL vs $MERKLE_ROOT)"
-log "✓ member verify-batch passes: leafCount=$VC_LEAF actualRoot==expected"
+devnet_verify_each_published_root "$MEMBER_NODE" "$CG_ID" "$QUADS_PAYLOAD" \
+  || fail "member verify-batch failed for one or more published roots"
+log "✓ member verify-batch passes for all published roots"
+
+PUBLISH_KC=$(printf '%s' "$DEVNET_PUBLISH_ALL_RESPONSES" | node -e 'let d="";process.stdin.on("data",c=>d+=c);process.stdin.on("end",()=>console.log(JSON.parse(d)[0].kaId))')
+MERKLE_ROOT=$(devnet_kc_merkle_root "$CURATOR_NODE" "$PUBLISH_KC")
 
 # Forge a tampered quads array — recompute against bad data must fail
 log "Building tampered quads array to provoke a root-mismatch..."

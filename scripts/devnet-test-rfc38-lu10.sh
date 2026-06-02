@@ -222,27 +222,18 @@ act "3. VERIFY-BATCH SWEEP (explicit quads, public CG)"
 # ===========================================================================
 
 log "Outsider calls verify-batch with the published quads + chain merkleRoot..."
-VERIFY_OK_BODY=$(QUADS_PAYLOAD="$QUADS_PAYLOAD" MERKLE_ROOT="$MERKLE_ROOT" KC="$KC" node -e "
-  const payload = JSON.parse(process.env.QUADS_PAYLOAD);
-  console.log(JSON.stringify({
-    contextGraphId: payload.contextGraphId,
-    expectedMerkleRoot: process.env.MERKLE_ROOT,
-    batchId: process.env.KC,
-    quads: payload.quads
-  }));
-")
-VERIFY_OK=$(api_call "$OUTSIDER_NODE" POST /api/shared-memory/verify-batch "$VERIFY_OK_BODY")
-log "verify (good) response: $VERIFY_OK"
-VOK=$(parse_json "$VERIFY_OK" '.ok')
-VOK_ROOT=$(parse_json "$VERIFY_OK" '.actualRoot')
-[ "$VOK" = "true" ] || fail "outsider-side verify-batch returned ok=$VOK (expected true)"
-[ "$VOK_ROOT" = "$MERKLE_ROOT" ] || fail "outsider-side actualRoot != expectedRoot"
-log "✓ outsider verifies public batch: ok=true actualRoot==expected"
+devnet_verify_each_published_root "$OUTSIDER_NODE" "$CG_ID" "$QUADS_PAYLOAD" \
+  || fail "outsider-side verify-batch failed for one or more roots"
+log "✓ outsider verifies public batch: ok=true for all published roots"
+
+KC=$(printf '%s' "$DEVNET_PUBLISH_ALL_RESPONSES" | node -e 'let d="";process.stdin.on("data",c=>d+=c);process.stdin.on("end",()=>console.log(JSON.parse(d)[0].kaId))')
+MERKLE_ROOT=$(devnet_kc_merkle_root "$CURATOR_NODE" "$KC")
 
 log "Outsider calls verify-batch with tampered quads..."
 VERIFY_BAD_BODY=$(QUADS_PAYLOAD="$QUADS_PAYLOAD" MERKLE_ROOT="$MERKLE_ROOT" KC="$KC" STAMP="$STAMP" node -e "
   const payload = JSON.parse(process.env.QUADS_PAYLOAD);
-  const tampered = [...payload.quads];
+  const root = payload.quads[0].subject;
+  const tampered = payload.quads.filter((q) => q.subject === root || q.subject.startsWith(root + '/'));
   tampered.push({ subject: 'urn:lu10:' + process.env.STAMP + '/forged', predicate: 'http://schema.org/title', object: '\"Mallory\"', graph: '' });
   console.log(JSON.stringify({
     contextGraphId: payload.contextGraphId,
@@ -266,6 +257,9 @@ act "4. ATTESTATION SWEEP (curator mints, outsider verifies)"
 LEAF_SUBJECT="urn:lu10:${STAMP}/doc-a"
 LEAF_PREDICATE="http://schema.org/title"
 LEAF_OBJECT='"Whitepaper"'
+
+KC=$(printf '%s' "$DEVNET_PUBLISH_ALL_RESPONSES" | node -e 'let d="";process.stdin.on("data",c=>d+=c);process.stdin.on("end",()=>console.log(JSON.parse(d)[0].kaId))')
+MERKLE_ROOT=$(devnet_kc_merkle_root "$CURATOR_NODE" "$KC")
 
 CANDIDATE_LEAF=$(cd "$REPO_ROOT/packages/core" && LEAF_SUBJECT="$LEAF_SUBJECT" LEAF_PREDICATE="$LEAF_PREDICATE" LEAF_OBJECT="$LEAF_OBJECT" node --input-type=module -e '
   const { hashTripleV10 } = await import("./dist/index.js");

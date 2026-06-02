@@ -135,19 +135,15 @@ TX=$(parse_json    "$PUB_RESP" '.txHash')
 KC=$(parse_json    "$PUB_RESP" '.kaId')
 [ "$STATUS" = "confirmed" ] || fail "publish status=$STATUS"
 [[ "$TX" =~ ^0x[0-9a-fA-F]{64}$ ]] || fail "invalid txHash"
-log "✓ publish: kaId=$KC tx=$TX"
+PUBLISH_COUNT=$(printf '%s' "$DEVNET_PUBLISH_ROOT_ENTITIES" | node -e 'let d="";process.stdin.on("data",c=>d+=c);process.stdin.on("end",()=>console.log(JSON.parse(d).length||1))')
+log "✓ publish: ${PUBLISH_COUNT} root batch(es), last kaId=$KC tx=$TX"
 
-KC_META=$(api_call "$CURATOR_NODE" GET "/api/kc/$KC")
-MERKLE_ROOT=$(parse_json "$KC_META" '.merkleRoot')
-[[ "$MERKLE_ROOT" =~ ^0x[0-9a-fA-F]{64}$ ]] || fail "no merkleRoot: $KC_META"
-log "✓ merkleRoot: $MERKLE_ROOT"
-
-# Cross-check via KCS: minted should equal TRIPLE_COUNT / 2 (one KA per
-# root entity).
+# Cross-check each KC via KCS: rc.12+ publishes one root entity per KC.
 EXPECTED_MINTED=$((TRIPLE_COUNT / 2))
 (
 cd "$REPO_ROOT/packages/evm-module" && \
-RPC_URL="http://127.0.0.1:${HARDHAT_PORT}" CONTRACTS_JSON="$CONTRACTS_JSON" ABI_DIR="$EVM_ABI_DIR" BATCH_ID="$KC" EXPECTED_MINTED="$EXPECTED_MINTED" \
+RPC_URL="http://127.0.0.1:${HARDHAT_PORT}" CONTRACTS_JSON="$CONTRACTS_JSON" ABI_DIR="$EVM_ABI_DIR" \
+ALL_KCS="$DEVNET_PUBLISH_ALL_RESPONSES" EXPECTED_MINTED="1" \
 node -e '
 const { ethers } = require("ethers");
 const fs = require("fs"); const path = require("path");
@@ -158,36 +154,26 @@ const fs = require("fs"); const path = require("path");
   const kcsAbiFile = fs.existsSync(path.join(process.env.ABI_DIR, "DKGKnowledgeAssets.json")) ? "DKGKnowledgeAssets.json" : "DKGKnowledgeAssets.json";
   const kas = new ethers.Contract(kcsAddr,
     JSON.parse(fs.readFileSync(path.join(process.env.ABI_DIR, kcsAbiFile), "utf8")), provider);
-  const [merkleRoots, , minted, byteSize] = await kas.getKnowledgeAssetMetadata(BigInt(process.env.BATCH_ID));
-  if (!merkleRoots || merkleRoots.length === 0) throw new Error("no merkleRoots");
+  const kcs = JSON.parse(process.env.ALL_KCS);
   const expectedMinted = BigInt(process.env.EXPECTED_MINTED);
-  if (minted !== expectedMinted) throw new Error("expected " + expectedMinted + " KAs minted, got " + minted);
-  console.log("✓ KCS: merkleRoots=" + merkleRoots.length + " minted=" + minted + " byteSize=" + byteSize);
+  for (const pub of kcs) {
+    const batchId = pub.kaId;
+    const [merkleRoots, , minted] = await kas.getKnowledgeAssetMetadata(BigInt(batchId));
+    if (!merkleRoots || merkleRoots.length === 0) throw new Error("no merkleRoots for kaId=" + batchId);
+    if (minted !== expectedMinted) throw new Error("kaId=" + batchId + ": expected " + expectedMinted + " KAs minted, got " + minted);
+  }
+  console.log("✓ KCS: " + kcs.length + " KC(s) each minted=" + expectedMinted);
 })().catch(e => { console.error(e?.message || e); process.exit(1); });
 '
 ) || fail "KCS read-back failed"
+[ "$PUBLISH_COUNT" = "$EXPECTED_MINTED" ] || fail "expected $EXPECTED_MINTED publishes, got $PUBLISH_COUNT"
 
 # ===========================================================================
 act "4. Member verify-batch over all $TRIPLE_COUNT decrypted quads"
 # ===========================================================================
-VERIFY_BODY=$(QUADS_PAYLOAD="$QUADS_PAYLOAD" MERKLE_ROOT="$MERKLE_ROOT" KC="$KC" node -e "
-  const p = JSON.parse(process.env.QUADS_PAYLOAD);
-  console.log(JSON.stringify({
-    contextGraphId: p.contextGraphId,
-    expectedMerkleRoot: process.env.MERKLE_ROOT,
-    batchId: process.env.KC,
-    quads: p.quads
-  }));
-")
-VERIFY=$(api_call "$MEMBER_NODE" POST /api/shared-memory/verify-batch "$VERIFY_BODY")
-log "verify response: $VERIFY"
-V_OK=$(parse_json "$VERIFY" '.ok')
-V_LEAF=$(parse_json "$VERIFY" '.leafCount')
-V_ACTUAL=$(parse_json "$VERIFY" '.actualRoot')
-[ "$V_OK" = "true" ] || fail "verify-batch ok=$V_OK ($VERIFY)"
-[ "$V_LEAF" = "$TRIPLE_COUNT" ] || fail "expected leafCount=$TRIPLE_COUNT, got $V_LEAF"
-[ "$V_ACTUAL" = "$MERKLE_ROOT" ] || fail "actualRoot != expectedRoot"
-log "✓ verify-batch passes over $V_LEAF decrypted leaves"
+devnet_verify_each_published_root "$MEMBER_NODE" "$CG_ID" "$QUADS_PAYLOAD" \
+  || fail "verify-batch failed for one or more published roots"
+log "✓ verify-batch passes for all $PUBLISH_COUNT published root(s)"
 
 # ===========================================================================
 act "5. Mint + verify 3 attestations across the batch"
@@ -199,6 +185,11 @@ for leaf_idx in 0 $((TRIPLE_COUNT / 4 - 1)) $((TRIPLE_COUNT / 2 - 1)); do
   LEAF_PREDICATE="http://schema.org/name"
   LEAF_OBJECT="\"Document ${leaf_idx}\""
 
+  KC=$(printf '%s' "$DEVNET_PUBLISH_ALL_RESPONSES" | node -e "
+    let d=''; process.stdin.on('data',c=>d+=c);
+    process.stdin.on('end',()=>console.log(JSON.parse(d)[Number(process.argv[1])].kaId));
+  " "$leaf_idx")
+  MERKLE_ROOT=$(devnet_kc_merkle_root "$CURATOR_NODE" "$KC")
   CANDIDATE_LEAF=$(cd "$REPO_ROOT/packages/core" && LEAF_SUBJECT="$LEAF_SUBJECT" LEAF_PREDICATE="$LEAF_PREDICATE" LEAF_OBJECT="$LEAF_OBJECT" node --input-type=module -e '
     const { hashTripleV10 } = await import("./dist/index.js");
     const leafBytes = hashTripleV10(process.env.LEAF_SUBJECT, process.env.LEAF_PREDICATE, process.env.LEAF_OBJECT);
@@ -239,9 +230,8 @@ log "================================================================"
 log "  Curated CG:    $CG_ID  (onChainId=$ON_CHAIN_ID)"
 log "  Triples:       $TRIPLE_COUNT"
 log "  KAs minted:    $EXPECTED_MINTED"
-log "  KC published:  $KC"
+log "  KCs published: $PUBLISH_COUNT"
 log "  TX:            $TX"
-log "  MerkleRoot:    $MERKLE_ROOT"
-log "  verify-batch:  ok=true leafCount=$V_LEAF"
+log "  verify-batch:  ok=true for all roots"
 log "  Attestations:  3 of 3 verified"
 log "================================================================"

@@ -42,6 +42,7 @@ import {
 let server: Server;
 let baseUrl: string;
 const requestLog: Array<{ url: string; method: string; body: string }> = [];
+let queryBindings: any[] = [];
 
 function startTestServer(): Promise<void> {
   return new Promise((resolve) => {
@@ -94,7 +95,7 @@ function startTestServer(): Promise<void> {
         } else if (url.startsWith('/api/context-graph/list') || url.startsWith('/api/context-graphs')) {
           res.end(JSON.stringify({ contextGraphs: [{ id: 'cg1' }] }));
         } else if (url.startsWith('/api/query')) {
-          res.end(JSON.stringify({ result: { bindings: [] } }));
+          res.end(JSON.stringify({ result: { bindings: queryBindings } }));
         } else if (url.startsWith('/api/shared-memory')) {
           res.end(JSON.stringify({ success: true, ual: 'did:dkg:test' }));
         } else if (url.includes('/promote')) {
@@ -140,6 +141,7 @@ describe('UI API tests', () => {
 
   beforeEach(() => {
     requestLog.length = 0;
+    queryBindings = [];
   });
 
   describe('fileUrl', () => {
@@ -303,6 +305,19 @@ describe('UI API tests', () => {
       expect(body.view).toBe('shared-working-memory');
       expect(body.sparql).toContain('/_shared_memory');
       expect(body.sparql).toContain('workspaceOwner');
+    });
+
+    it('listSwmEntities collapses skolemized section subjects into canonical roots', async () => {
+      queryBindings = [
+        { s: { value: 'https://example.org/doc/root' }, cnt: { value: '2' } },
+        { s: { value: 'https://example.org/doc/root/.well-known/genid/section-1-intro' }, cnt: { value: '3' } },
+        { s: { value: '<https://example.org/doc/child-only/.well-known/genid/section-1-only>' }, cnt: { value: '4' } },
+      ];
+
+      await expect(listSwmEntities('cg-1')).resolves.toEqual([
+        { uri: 'https://example.org/doc/root', label: 'root', tripleCount: 5 },
+        { uri: 'https://example.org/doc/child-only', label: 'child-only', tripleCount: 4 },
+      ]);
     });
 
     it('createSavedQuery sends POST', async () => {

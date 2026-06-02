@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { buildEntities, type LayeredTriple, type TrustLevel } from '../src/ui/hooks/useMemoryEntities.js';
+import {
+  buildEntities,
+  canonicalEntityUri,
+  isFirstClassEntity,
+  type LayeredTriple,
+  type TrustLevel,
+} from '../src/ui/hooks/useMemoryEntities.js';
 
 const RDF_TYPE = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type';
 
@@ -243,5 +249,26 @@ describe('buildEntities — MemoryEntity.tripleCount', () => {
     // (which we don't surface via `tripleCount` for an SWM-canonical
     // entity).
     expect(dual.tripleCount).toBe(1);
+  });
+
+  it('collapses skolemized section subjects without rewriting literals containing the marker', () => {
+    const root = 'urn:doc:markdown';
+    const section = `${root}/.well-known/genid/section-1-intro`;
+    const literal = '"see /.well-known/genid/a"';
+
+    expect(canonicalEntityUri(section)).toBe(root);
+    expect(canonicalEntityUri(literal)).toBe(literal);
+
+    const entities = buildEntities([
+      triple(root, 'http://dkg.io/ontology/hasSection', section, 'shared'),
+      triple(section, 'http://schema.org/name', '"Intro"', 'shared'),
+      triple(section, 'http://schema.org/description', literal, 'shared'),
+    ]);
+
+    const entity = entities.get(root);
+    expect(entity).toBeDefined();
+    expect(entities.has(section)).toBe(false);
+    expect(isFirstClassEntity(entity!)).toBe(true);
+    expect(entity?.properties.get('http://schema.org/description')).toEqual(['see /.well-known/genid/a']);
   });
 });

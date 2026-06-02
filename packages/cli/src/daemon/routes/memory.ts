@@ -351,6 +351,11 @@ type PreSignedAuthorAttestation = {
 
 type SharedMemoryPublishSelection = "all" | { rootEntities: string[] };
 const WORKSPACE_OWNER_PREDICATE = 'http://dkg.io/ontology/workspaceOwner';
+const SKOLEM_GENID_SEGMENT = '/.well-known/genid/';
+
+function subjectMatchesPublishRoot(subject: string, root: string): boolean {
+  return subject === root || (isSkolemizedUri(subject) && subject.startsWith(`${root}${SKOLEM_GENID_SEGMENT}`));
+}
 
 async function resolvePublishRootEntities(
   agent: DKGAgent,
@@ -372,16 +377,24 @@ async function resolvePublishRootEntities(
     const result = await agent.store.query(
       `CONSTRUCT { ?s ?p ?o } WHERE {
         GRAPH <${swmGraph}> {
-          VALUES ?s { ${values} }
+          VALUES ?root { ${values} }
           ?s ?p ?o .
           FILTER(?p != <${WORKSPACE_OWNER_PREDICATE}>)
+          FILTER(?s = ?root || STRSTARTS(STR(?s), CONCAT(STR(?root), "${SKOLEM_GENID_SEGMENT}")))
         }
       }`,
     );
     const quads: Quad[] = result.type === "quads"
       ? result.quads.filter((quad) => quad.predicate !== WORKSPACE_OWNER_PREDICATE)
       : [];
-    const availableRoots = new Set(autoPartition(quads).keys());
+    const availableRoots = new Set<string>();
+    for (const quad of quads) {
+      for (const root of requestedRoots) {
+        if (subjectMatchesPublishRoot(quad.subject, root)) {
+          availableRoots.add(root);
+        }
+      }
+    }
     return requestedRoots.filter((root) => availableRoots.has(root));
   }
 

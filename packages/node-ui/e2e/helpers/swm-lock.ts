@@ -30,36 +30,68 @@ function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// The holder REFRESHES its timestamp on this cadence for the whole critical
+// section, so a LIVE holder's stamp is never older than ~HEARTBEAT_MS.
+const HEARTBEAT_MS = 5_000;
+// A held lock is only "stale" (owner presumed crashed) once its stamp hasn't
+// advanced in > STALE_MS. Because a live holder heartbeats every HEARTBEAT_MS,
+// STALE_MS only needs to exceed that with margin — crucially it does NOT need to
+// exceed the worst-case critical section. This is the fix for the old single-
+// timestamp scheme, where a `publishToVm` legitimately running longer than the
+// (fixed) stale window had its still-live lock stolen, reintroducing the exact
+// SWM interleaving the mutex exists to prevent.
+const STALE_MS = 20_000;
+
+function holderStamp(): string {
+  return `${process.pid}:${Date.now()}`;
+}
+
 /**
  * Run `fn` while holding the global SWM mutation lock. Acquires via atomic
- * mkdir, spins (with jitter) until free, and includes a stale-lock breaker so a
- * crashed holder can't deadlock the suite. Critical sections here take ~1s, so
- * the default 60s acquire window is comfortably generous.
+ * mkdir, spins (with jitter) until free, and reclaims a crashed holder's lock so
+ * the suite can't deadlock. While held, the lock's timestamp is HEARTBEATED so a
+ * long-but-healthy publish is never mistaken for a dead holder and stolen.
  */
 export async function withSwmLock<T>(fn: () => Promise<T>, opts: { acquireTimeoutMs?: number } = {}): Promise<T> {
-  const acquireTimeoutMs = opts.acquireTimeoutMs ?? 60_000;
-  // If a holder dir has existed unchanged for longer than this, assume the
-  // owning worker crashed mid-section and steal the lock.
-  const staleMs = 30_000;
+  // Generous overall give-up window. With heartbeat-based staleness a dead
+  // holder is reclaimed within STALE_MS regardless, so this only bounds the wait
+  // behind a genuinely long-running live holder.
+  const acquireTimeoutMs = opts.acquireTimeoutMs ?? 120_000;
   const start = Date.now();
+  // When the holder dir exists but its stamp is missing/garbage (e.g. a writer
+  // crashed between mkdir and the first writeFile), reclaim it only after we've
+  // observed the missing stamp for STALE_MS — never race a holder mid-acquire.
+  let missingHolderSince = 0;
 
   for (;;) {
     try {
       await mkdir(LOCK_DIR);
-      await writeFile(HOLDER_FILE, `${process.pid}:${Date.now()}`).catch(() => {});
+      await writeFile(HOLDER_FILE, holderStamp()).catch(() => {});
       break;
     } catch (err) {
       if ((err as NodeJS.ErrnoException)?.code !== 'EEXIST') throw err;
-      // Lock held by someone else. Check for a stale holder before waiting.
+      // Lock held by someone else. Reclaim ONLY a demonstrably-dead holder.
       const stamp = await readFile(HOLDER_FILE, 'utf8').catch(() => '');
       const heldAt = Number(stamp.split(':')[1] ?? '0');
-      if (heldAt && Date.now() - heldAt > staleMs) {
-        await rm(LOCK_DIR, { recursive: true, force: true }).catch(() => {});
-        continue;
+      if (heldAt) {
+        missingHolderSince = 0;
+        // A live holder heartbeats, so a fresh stamp means "still working" — wait.
+        // Only a stamp older than STALE_MS signals a crashed owner.
+        if (Date.now() - heldAt > STALE_MS) {
+          await rm(LOCK_DIR, { recursive: true, force: true }).catch(() => {});
+          continue;
+        }
+      } else {
+        if (!missingHolderSince) missingHolderSince = Date.now();
+        else if (Date.now() - missingHolderSince > STALE_MS) {
+          await rm(LOCK_DIR, { recursive: true, force: true }).catch(() => {});
+          continue;
+        }
       }
       if (Date.now() - start > acquireTimeoutMs) {
-        // Last resort: break a presumably-dead lock rather than fail the test
-        // on lock acquisition (which would itself be a false negative).
+        // Last resort: break a presumably-dead lock rather than fail the test on
+        // acquisition (itself a false negative). Reached only if a live holder
+        // genuinely ran past the whole window — far rarer than the old 30s steal.
         await rm(LOCK_DIR, { recursive: true, force: true }).catch(() => {});
         continue;
       }
@@ -67,9 +99,18 @@ export async function withSwmLock<T>(fn: () => Promise<T>, opts: { acquireTimeou
     }
   }
 
+  // Keep the holder timestamp fresh for the entire critical section, so a slow
+  // (but alive) promote→publish→clear is never reclaimed out from under us.
+  const heartbeat = setInterval(() => {
+    void writeFile(HOLDER_FILE, holderStamp()).catch(() => {});
+  }, HEARTBEAT_MS);
+  // Don't let the heartbeat timer keep the process alive on its own.
+  (heartbeat as unknown as { unref?: () => void }).unref?.();
+
   try {
     return await fn();
   } finally {
+    clearInterval(heartbeat);
     await rm(LOCK_DIR, { recursive: true, force: true }).catch(() => {});
   }
 }

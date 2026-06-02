@@ -8,60 +8,32 @@
  * is reachable (the chained bootstrap brings it up), then publishes one entity
  * through the full WM → SWM → VM pipeline into the primary seeded context graph.
  *
- * IMPORTANT — only seed devnets WE bootstrapped. When `webServer` reuses an
- * operator's pre-existing devnet, `globalTeardown` intentionally leaves it
- * running, so seeding into it would permanently pollute that operator's
- * `devnet-test` graph (a fresh assertion + sub-graph on every local run). We
- * therefore seed only when the bootstrap wrote its managed-devnet marker (i.e.
- * Playwright spawned the cluster and node1 is freshly started, to be torn down
- * at the end). On a reused devnet we skip seeding entirely.
+ * IDEMPOTENT seed. Several specs (subgraph-bar, dashboard, triple-counts, …) hard-
+ * require the seeded VM entity + NAMED_SUBGRAPH sub-graph, so the supported "reuse
+ * an operator-owned devnet" flow needs them present too — skipping the seed there
+ * would fail those specs even on a healthy UI. But re-seeding on every run would
+ * accrete assertions on a reused cluster. So we seed only when the devnet isn't
+ * seeded yet (detected by the absence of the NAMED_SUBGRAPH sub-graph in
+ * PRIMARY_CG): a fresh CI devnet — or a never-seeded operator devnet — gets seeded
+ * once; subsequent runs against an already-seeded devnet are a no-op.
  *
- * Seeding is best-effort: if the devnet never comes up — or was reused — the
- * specs that depend on content assert tolerantly / skip, so a seeding miss
- * degrades gracefully rather than failing the whole run at setup time.
+ * Seeding is best-effort: if the devnet never comes up the specs that depend on
+ * content assert tolerantly, so a seeding miss degrades gracefully rather than
+ * failing the whole run at setup time.
  */
-import { existsSync, readFileSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { waitForDevnetStatus } from './helpers/devnet.js';
+import { listSubGraphs } from './helpers/devnet-publish.js';
 import { seedVmEntity, seedSubgraphEntity, PRIMARY_CG, NAMED_SUBGRAPH } from './helpers/real-node.js';
-import type { PlaywrightManagedMarker } from './bootstrap-devnet.js';
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const MARKER_FILE = resolve(__dirname, '../../..', '.devnet', '.playwright-managed');
-
-function readMarker(): PlaywrightManagedMarker | null {
-  if (!existsSync(MARKER_FILE)) return null;
-  try {
-    return JSON.parse(readFileSync(MARKER_FILE, 'utf8')) as PlaywrightManagedMarker;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * True only when THIS Playwright run bootstrapped node1 (so seeding it is safe —
- * it gets torn down at the end). The marker is written by bootstrap-devnet.ts the
- * instant node1 becomes reachable, which is also when `waitForDevnetStatus`
- * resolves, so a single read can race the write — poll briefly. No marker after
- * the grace window ⇒ the devnet was reused and must not be polluted.
- */
-async function playwrightBootstrappedNode1(graceMs = 10_000): Promise<boolean> {
-  const deadline = Date.now() + graceMs;
-  do {
-    const marker = readMarker();
-    if (marker) return !(marker.preExistingNodes ?? []).includes(1);
-    await new Promise((r) => setTimeout(r, 500));
-  } while (Date.now() < deadline);
-  return false;
-}
 
 export default async function globalSetup(): Promise<void> {
   try {
     await waitForDevnetStatus(1, 180_000);
-    if (!(await playwrightBootstrappedNode1())) {
+    // Idempotency check: the NAMED_SUBGRAPH sub-graph is the seed's final step, so
+    // its presence means a prior run already populated PRIMARY_CG end-to-end.
+    const existing = await listSubGraphs(PRIMARY_CG).catch(() => [] as Array<{ name: string }>);
+    if (existing.some((sg) => sg.name === NAMED_SUBGRAPH)) {
       console.log(
-        '[global-setup] devnet was reused (no managed-devnet marker) — skipping seed to avoid polluting an operator-owned graph',
+        `[global-setup] ${PRIMARY_CG} already seeded (sub-graph "${NAMED_SUBGRAPH}" present) — skipping to avoid accreting duplicate content`,
       );
       return;
     }

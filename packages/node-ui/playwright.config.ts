@@ -97,8 +97,13 @@ export default defineConfig({
       `cross-env DEVNET_NODE=${DEVNET_NODE} pnpm dev:ui`,
     cwd: __dirname,
     port: PORT,
-    // Reuse a running Vite locally (keeps iteration fast); always start fresh on CI.
-    reuseExistingServer: !CI,
+    // Never reuse a server already listening on :5173. `webServer.command` is the
+    // ONLY place that boots/validates the real devnet (the chained bootstrap), so
+    // reusing a stray `pnpm dev:ui` — which may proxy at the wrong backend, or no
+    // devnet at all — would silently produce false passes/failures. Always running
+    // the command guarantees the devnet is pinned; the bootstrap itself reuses an
+    // already-running devnet cheaply, so a fresh Vite restart is the only cost.
+    reuseExistingServer: false,
     // Cold boot = Hardhat (+ Solidity compile when artifacts aren't cached) + 2
     // nodes + on-chain identity/stake/ask + CG registration + cross-node
     // propagation, THEN Vite. Locally (artifacts cached, devnet often reused)

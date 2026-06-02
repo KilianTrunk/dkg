@@ -39,6 +39,25 @@ export async function listContextGraphs(nodeNum = 1): Promise<Array<{ id: string
 }
 
 /**
+ * List the named sub-graphs registered in `contextGraphId` (the same endpoint the
+ * SubGraphBar reads). Used by global-setup to detect an already-seeded devnet and
+ * keep seeding idempotent. Best-effort: a fresh/empty CG that 404s is treated as
+ * "no sub-graphs" rather than throwing, so a missing list never aborts setup.
+ */
+export async function listSubGraphs(
+  contextGraphId: string,
+  nodeNum = 1,
+): Promise<Array<{ name: string }>> {
+  const res = await devnetApiFetch(
+    `/api/sub-graph/list?contextGraphId=${encodeURIComponent(contextGraphId)}`,
+    { nodeNum },
+  );
+  if (!res.ok) return [];
+  const json = (await res.json()) as { subGraphs?: Array<{ name: string }> };
+  return json.subGraphs ?? [];
+}
+
+/**
  * Register a named sub-graph in `contextGraphId`. Idempotent for our purposes:
  * a duplicate registration just returns the existing one (or a benign error we
  * swallow), so callers can register-then-seed without a pre-check.

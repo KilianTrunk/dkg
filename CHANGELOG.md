@@ -4,6 +4,10 @@ All notable changes to the DKG V9 node are documented here. The format is based 
 
 ## [Unreleased]
 
+### Fixed — Chain RPC read path
+
+- **Disable ethers JSON-RPC request batching on the chain provider** (`packages/chain/src/evm-adapter.ts`): under RPC rate limiting a *batched* `eth_getLogs` response is a single whole-batch JSON-RPC error, and ethers' coalesce path rejected on the un-awaited batch-drain promise — surfacing as ~30k unhandled `could not coalesce error` / `over rate limit` process rejections under a gossip/finalization on-chain-verification storm (issue #939). Constructing providers with `batchMaxCount: 1` makes each read its own awaited request whose rejection is caught by the existing `verifyOnChain` try/catch. Transport-only change; the number of `eth_getLogs` operations issued is unchanged.
+
 ## [10.0.0-rc.13] - 2026-06-02
 
 **Off-chain stabilization release.** No Solidity changes since rc.12 — the Base Sepolia (chainId 84532) deployment in `packages/evm-module/deployments/base_sepolia_v10_contracts.json` is **unchanged**, the `chainResetMarker` stays `v10-rc12-ka-rename-2026-06-01`, and **no contract redeploy is required**. Nodes upgrade in place; no local-state wipe. This release lands the core-preferred sync + chain-driven VM reconciliation work, the Kafka route-plugin MVP, and a batch of publish/SWM runtime hardening and Node UI fixes accumulated on top of rc.12.

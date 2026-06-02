@@ -84,7 +84,7 @@ import {
   pickNetworkTunables,
 } from '@origintrail-official/dkg-core';
 import { GraphManager, PrivateContentStore, createTripleStore, type TripleStore, type TripleStoreConfig, type Quad, type LargeLiteralStorageConfig } from '@origintrail-official/dkg-storage';
-import { EVMChainAdapter, NoChainAdapter, enrichEvmError, isRetryableRpcError, buildKnowledgeAssetUal, type EVMAdapterConfig, type ChainAdapter, type CreateContextGraphParams, type CreateOnChainContextGraphParams, type CreateOnChainContextGraphResult, type TxResult, type V10PublishingConvictionAccountInfo } from '@origintrail-official/dkg-chain';
+import { EVMChainAdapter, NoChainAdapter, enrichEvmError, buildKnowledgeAssetUal, type EVMAdapterConfig, type ChainAdapter, type CreateContextGraphParams, type CreateOnChainContextGraphParams, type CreateOnChainContextGraphResult, type TxResult, type V10PublishingConvictionAccountInfo } from '@origintrail-official/dkg-chain';
 import {
   DKGPublisher, PublishHandler, SharedMemoryHandler, UpdateHandler, ChainEventPoller, AccessHandler, AccessClient,
   PublishJournal, StaleWriteError,
@@ -284,11 +284,20 @@ import {
   WARM_CORE_MAX,
   WARM_CORE_KEEPALIVE_TAG,
   WARM_CORE_DIAL_TIMEOUT_MS,
+  CIPHERTEXT_CHUNK_SIZE_BYTES,
+  BOOT_CHAIN_IDENTITY_TIMEOUT_MS,
+  MIN_STORAGE_ACK_REGISTRATION_RETRY_MS,
+  TIMEOUT_SENTINEL,
+  ON_CHAIN_PUBLISH_POLICY_CACHE_TTL_MS,
+  CHAIN_POLICY_READ_TIMEOUT_MS,
+  SWM_SENDER_KEY_PENDING_DRAIN_LOG_CTX,
 } from './dkg-agent-constants.js';
+import { raceWithBootTimeout, isTransientBootChainError } from './dkg-agent-boot.js';
 import {
   ContextGraphNotFoundError,
   InvalidContentError,
   StaleSenderKeyTargetError,
+  SwmSenderKeySetupRejectionError,
   SyncAccessDeniedError,
   type PreSignedAuthorAttestation,
   type LocalSwmSenderKeySendState,
@@ -344,6 +353,7 @@ import {
   createPublicSnapshotStore,
   applyDefaultLargeLiteralStorage,
   isLocalOxigraphConfig,
+  sliceIntoCiphertextChunks,
 } from './dkg-agent-helpers.js';
 import {
   swmSenderStateKey,
@@ -398,171 +408,6 @@ export type {
  *   const response = await agent.invokeSkill(offerings[0], inputData);
  *   await agent.stop();
  */
-/**
- * OT-RFC-38 LU-11. Target ciphertext-chunk size on the SWM gossip
- * wire. 32 KiB stays well under libp2p's per-message ceiling (the
- * mesh defaults to 1 MiB) so chunks rarely fragment at the transport
- * layer, and produces a tree shallow enough that on-chain proof
- * verification per RFC-39 sampling tick stays cheap. The last chunk
- * is whatever fraction remains.
- */
-const CIPHERTEXT_CHUNK_SIZE_BYTES = 32 * 1024;
-
-/**
- * Upper bound on the boot-time on-chain identity resolution
- * (`getIdentityId` / `ensureProfile`) inside `start()`. Daemon HTTP
- * readiness MUST NOT depend on chain-RPC reachability: `start()` is awaited
- * before the daemon binds its HTTP listener (cli lifecycle.ts), so an
- * unreachable or rate-limited (HTTP 429) RPC — which the multi-RPC failover
- * loop retries across endpoints — would otherwise block boot past the CLI's
- * 45s readiness ceiling (#894). When this bound trips, identity stays
- * unresolved (0n): the node boots, HTTP serves, and on-chain writes (e.g.
- * context-graph register) surface their own RPC error (503) at call time
- * rather than hanging the whole daemon. Generous enough not to false-trip a
- * healthy-but-slow chain, far below the 45s readiness window.
- */
-const BOOT_CHAIN_IDENTITY_TIMEOUT_MS = 20_000;
-
-/**
- * Floor for the (public, config-settable) StorageACK registration retry
- * interval. Guards against a 0 / negative value collapsing the retry into a
- * tight loop that hammers the RPC and floods the log (Codex PR #901 round-4
- * :2106). 1s is well below the 30s production default yet leaves ample spacing.
- */
-const MIN_STORAGE_ACK_REGISTRATION_RETRY_MS = 1_000;
-
-/**
- * Resolve `op` but reject with a `BOOT_CHAIN_TIMEOUT`-coded error if it does
- * not settle within `ms`. The timer is `unref`'d so it never keeps the
- * process alive on its own. Used to bound boot-time chain calls so daemon
- * readiness stays independent of chain-RPC reachability.
- *
- * When the timeout wins, `op` is still pending — the multi-RPC failover loop
- * keeps retrying and will eventually reject (e.g. `RPC_ENDPOINTS_EXHAUSTED`).
- * That late rejection has no awaiter once the race has settled, so we attach a
- * no-op `.catch()` to the original promise to keep it from surfacing as an
- * `unhandledRejection` and crashing the booted daemon.
- */
-async function raceWithBootTimeout<T>(op: Promise<T>, ms: number, label: string): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  op.catch(() => {
-    /* swallow a late rejection from the abandoned op after the race settles */
-  });
-  try {
-    return await Promise.race<T>([
-      op,
-      new Promise<T>((_, reject) => {
-        timer = setTimeout(() => {
-          const err = new Error(`${label} timed out after ${ms}ms`);
-          (err as Error & { code?: string }).code = 'BOOT_CHAIN_TIMEOUT';
-          reject(err);
-        }, ms);
-        timer.unref?.();
-      }),
-    ]);
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
-}
-
-/**
- * Is a boot-time chain-identity failure TRANSIENT (RPC unreachable / slow /
- * rate-limited — recoverable by retrying once the chain is back) versus
- * PERMANENT/deterministic (missing admin key, insufficient funds, a contract
- * revert)? Only transient failures should arm the StorageACK retry loop;
- * arming it for a permanent failure would re-call `ensureProfile()` every 30s
- * forever (Codex PR #901 round-3 :1714 / round-4 :1838).
- *
- * Delegates the RPC-shape recognition to the chain package's exported
- * `isRetryableRpcError` (Codex PR #901 round-4 :459) so we reuse its full
- * extraction — top-level AND nested `error.code` / `statusCode` /
- * `response.status` — instead of a narrower top-level-only copy that would
- * misclassify a 429/5xx buried in a nested field as permanent. On top we add
- * the boot path's own `BOOT_CHAIN_TIMEOUT` (`isRetryableRpcError` doesn't know
- * it) and an explicit permanent-exclusion guard for `admin` provisioning
- * failures (`isRetryableRpcError` already excludes revert/insufficient-funds/
- * nonce). Anything else — ordinary `Error`s with no RPC signature — stays
- * permanent and disabled.
- */
-function isTransientBootChainError(err: unknown): boolean {
-  const code = (err as { code?: unknown })?.code;
-  if (code === 'BOOT_CHAIN_TIMEOUT') return true;
-  // A missing/invalid profile admin key is a deterministic config error, not a
-  // transient RPC failure — surface it once, never retry. (The chain classifier
-  // already treats revert / insufficient-funds / nonce as non-retryable.)
-  const msg = (err instanceof Error ? err.message : String(err ?? '')).toLowerCase();
-  if (msg.includes('admin')) return false;
-  return isRetryableRpcError(err);
-}
-
-/**
- * OT-RFC-38 LU-11. Split a single plaintext buffer into the
- * fixed-size pieces the chunked AEAD path expects. Empty input is
- * rejected — the publisher computes `merkleRoot` from non-empty
- * `kaCount` quads, so an empty plaintext upstream is always a bug.
- */
-function sliceIntoCiphertextChunks(plaintext: Uint8Array): Uint8Array[] {
-  if (plaintext.length === 0) {
-    throw new Error('LU-11: sliceIntoCiphertextChunks rejects empty plaintext');
-  }
-  const chunks: Uint8Array[] = [];
-  for (let off = 0; off < plaintext.length; off += CIPHERTEXT_CHUNK_SIZE_BYTES) {
-    chunks.push(plaintext.subarray(off, Math.min(off + CIPHERTEXT_CHUNK_SIZE_BYTES, plaintext.length)));
-  }
-  return chunks;
-}
-
-class SwmSenderKeySetupRejectionError extends Error {
-  readonly reasonCode: SwmSenderKeyPackageAckReasonCode;
-
-  constructor(reasonCode: SwmSenderKeyPackageAckReasonCode, message: string) {
-    super(message);
-    this.name = 'SwmSenderKeySetupRejectionError';
-    this.reasonCode = reasonCode;
-  }
-}
-
-const SWM_SENDER_KEY_PENDING_DRAIN_LOG_CTX: OperationContext = {
-  operationId: 'swm-sender-key-pending-drain',
-  operationName: 'share',
-};
-
-/**
- * Sentinel returned by the chain-RPC-fallback timeout race inside
- * {@link DKGAgent.getContextGraphOnChainPolicy}. Distinct from
- * `undefined` so the caller can tell a timed-out probe apart from
- * an RPC that legitimately resolved to "no policy". Module-scoped
- * so the inner `withTimeout` helper can reuse the same identity.
- */
-const TIMEOUT_SENTINEL = Symbol('chain-rpc-fallback-timeout');
-
-/**
- * Codex review on #872 — TTL for the eagerly-seeded `publishPolicy`
- * cache. `publishPolicy` is mutable on-chain (`PublishPolicyUpdated`
- * is emitted by `ContextGraphStorage.updatePublishPolicy`), but the
- * cache is only populated by `ContextGraphCreated`, so a curator
- * flipping a CG from open → curated would otherwise leave a stale
- * `1` in this node's cache until restart and keep relaxing the
- * import-artifact owner guard. The TTL bounds staleness to one
- * window without wiring a full `PublishPolicyUpdated` event watcher
- * through the chain-event poller. 60s is conservative because the
- * cached value gates an authorization decision — one extra eth_call
- * per minute per active CG is cheap.
- */
-const ON_CHAIN_PUBLISH_POLICY_CACHE_TTL_MS = 60_000;
-
-/**
- * #884 review — bound the on-chain liveness / access-policy reads on the
- * share/promote/publish hot path (`isContextGraphPublicOnChain`). Mirrors
- * `CHAIN_RPC_FALLBACK_TIMEOUT_MS` in
- * {@link DKGAgent.getContextGraphOnChainPolicy}: if the RPC layer HANGS
- * (rather than rejecting), the helper must still resolve so the caller fails
- * closed to "not public / not known" instead of blocking the request
- * indefinitely. 2.5s stays well under the daemon-ready budget while allowing
- * a single slow eth_call hop under normal load.
- */
-const CHAIN_POLICY_READ_TIMEOUT_MS = 2_500;
-
 export class DKGAgent {
   readonly wallet: AgentWallet;
   readonly node: DKGNode;

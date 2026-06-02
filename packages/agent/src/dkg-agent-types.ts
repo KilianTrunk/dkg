@@ -26,6 +26,7 @@ import type {
   AuthorAttestationTypedData,
   MessageIdempotencyStore,
   ProtocolOutboxStore,
+  SwmSenderKeyPackageAckReasonCode,
 } from '@origintrail-official/dkg-core';
 import type {
   PhaseCallback,
@@ -216,6 +217,22 @@ export class StaleSenderKeyTargetError extends Error {
     this.name = 'StaleSenderKeyTargetError';
     this.recipientAgentAddress = recipientAgentAddress;
     this.recipientKeyId = recipientKeyId;
+  }
+}
+
+/**
+ * Thrown internally while setting up / distributing an SWM sender-key
+ * epoch when a recipient rejects the package. Carries the wire-level
+ * `reasonCode` so the caller can decide whether the rejection is
+ * retryable.
+ */
+export class SwmSenderKeySetupRejectionError extends Error {
+  readonly reasonCode: SwmSenderKeyPackageAckReasonCode;
+
+  constructor(reasonCode: SwmSenderKeyPackageAckReasonCode, message: string) {
+    super(message);
+    this.name = 'SwmSenderKeySetupRejectionError';
+    this.reasonCode = reasonCode;
   }
 }
 

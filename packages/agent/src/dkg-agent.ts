@@ -1884,16 +1884,31 @@ export class DKGAgent {
         }
       } catch (err) {
         this.log.warn(ctx, `ensureProfile error: ${err instanceof Error ? err.message : String(err)}`);
-        try {
-          onChainIdentityId = await raceWithBootTimeout(
-            this.chain.getIdentityId(),
-            BOOT_CHAIN_IDENTITY_TIMEOUT_MS,
-            'boot getIdentityId (recovery)',
-          );
-          if (onChainIdentityId > 0n) {
-            this.log.info(ctx, `Recovered identityId=${onChainIdentityId} after partial failure`);
-          }
-        } catch { /* ignore — boot proceeds with identity unresolved */ }
+        // The recovery `getIdentityId` is only useful when the original
+        // `getIdentityId` succeeded but `ensureProfile` later failed (e.g.
+        // gas exhaustion / chain revert) — in that case the chain is
+        // reachable and a fresh read may pick up a partially-created
+        // identity. When the original itself timed out (BOOT_CHAIN_TIMEOUT,
+        // see #894), the RPC is unreachable / rate-limited and a recovery
+        // attempt just doubles the boot delay (40s → past the 45s harness
+        // ceiling), surfacing as `Daemon did not become ready within 45s`
+        // in `daemon-http-behavior-extra.test.ts`. Skip the redundant retry
+        // on that path; on every other path keep the recovery behaviour.
+        const bootChainTimeout =
+          err instanceof Error &&
+          (err as Error & { code?: string }).code === 'BOOT_CHAIN_TIMEOUT';
+        if (!bootChainTimeout) {
+          try {
+            onChainIdentityId = await raceWithBootTimeout(
+              this.chain.getIdentityId(),
+              BOOT_CHAIN_IDENTITY_TIMEOUT_MS,
+              'boot getIdentityId (recovery)',
+            );
+            if (onChainIdentityId > 0n) {
+              this.log.info(ctx, `Recovered identityId=${onChainIdentityId} after partial failure`);
+            }
+          } catch { /* ignore — boot proceeds with identity unresolved */ }
+        }
         // The boot identity block threw. If it left identity at 0n AND the
         // failure is TRANSIENT (RPC unreachable/slow/rate-limited), flag it so
         // the StorageACK path re-resolves and recovers once the chain is back

@@ -75,6 +75,7 @@ const HUB_ABI = [
   'function getAssetStorageAddress(string) view returns (address)',
 ];
 const NFT_ABI = [
+  'function createConviction(uint72 identityId, uint96 stakeAmount, uint40 lockTier) returns (uint256 tokenId)',
   'function withdraw(uint256 tokenId) returns (uint96 amount)',
   'function claim(uint256 tokenId)',
   'function ownerOf(uint256 tokenId) view returns (address)',
@@ -107,7 +108,10 @@ const RS_ABI = [
   'function getAllNodesEpochScore(uint256) view returns (uint256)',
 ];
 const ES_ABI = ['function getEpochPool(uint256, uint256) view returns (uint96)'];
-const ERC20_ABI = ['function balanceOf(address) view returns (uint256)'];
+const ERC20_ABI = [
+  'function balanceOf(address) view returns (uint256)',
+  'function approve(address, uint256) returns (bool)',
+];
 
 // ───────────────────────────── fixtures ──────────────────────────────────
 interface Delegator {
@@ -460,8 +464,9 @@ describe('2. failed publish does not leak triples into verified-memory (RC11 / P
 // ───────────────────────── 3. NFT staking withdraw ───────────────────────
 describe('3. NFT staking withdraw', () => {
   it('tier-0 (no-lock) position withdraws cleanly: TRAC moves, NFT burns, position clears', async () => {
-    // Bootstrap creates two tier-0 positions. Pick one that still has raw
-    // stake so the suite can be re-run after a partial previous pass.
+    // Bootstrap creates two tier-0 positions. Prefer one that still has raw
+    // stake; if a prior suite (e.g. v10-e2e phase 3) already withdrew it,
+    // mint a fresh tier-0 position so this test stays idempotent.
     let target: Delegator | undefined;
     let positionSnap: any;
     for (const candidate of state.delegators.filter((d) => d.tier === 0)) {
@@ -472,7 +477,49 @@ describe('3. NFT staking withdraw', () => {
         break;
       }
     }
-    expect(target, 'no unwithdrawn tier-0 delegator found — re-bootstrap').toBeDefined();
+    if (!target) {
+      const seed = state.delegators.find((d) => d.tier === 0)
+        ?? state.delegators.find((d) => BigInt(d.identityId) === 1n);
+      expect(seed, 'no tier-0 delegator seed for createConviction').toBeDefined();
+      const seedWallet = new ethers.Wallet(seed!.privateKey, state.provider);
+      const seedNft = new ethers.Contract(state.nft.target, NFT_ABI, seedWallet);
+      const stakeAmount = ethers.parseEther('10000');
+      const stakingV10Address = await state.staking.getAddress();
+      const tokenAsSeed = state.token.connect(seedWallet) as ethers.Contract;
+      await tokenAsSeed.approve(stakingV10Address, stakeAmount, { gasLimit: 500_000 });
+      const createTx = await seedNft.createConviction(
+        BigInt(seed!.identityId),
+        stakeAmount,
+        0n,
+      );
+      const createReceipt = await createTx.wait();
+      expect(createReceipt.status).toBe(1);
+      const transferIface = new ethers.Interface([
+        'event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)',
+      ]);
+      let newTokenId = 0n;
+      for (const log of createReceipt.logs) {
+        try {
+          const parsed = transferIface.parseLog(log);
+          if (
+            parsed?.name === 'Transfer' &&
+            (parsed.args.from as string).toLowerCase() === ethers.ZeroAddress &&
+            (parsed.args.to as string).toLowerCase() === seedWallet.address.toLowerCase()
+          ) {
+            newTokenId = parsed.args.tokenId as bigint;
+            break;
+          }
+        } catch { /* not our event */ }
+      }
+      expect(newTokenId, 'createConviction did not mint an NFT').toBeGreaterThan(0n);
+      target = {
+        ...seed!,
+        tokenId: Number(newTokenId),
+        stakeAmountTRAC: 10_000,
+      };
+      positionSnap = await state.css.getPosition(newTokenId);
+    }
+    expect(target, 'no tier-0 delegator available for withdraw').toBeDefined();
 
     const wallet = new ethers.Wallet(target!.privateKey, state.provider);
     const nft = new ethers.Contract(state.nft.target, NFT_ABI, wallet);
@@ -553,46 +600,54 @@ describe('4. operator-fee accrual + withdrawal', () => {
       identityId,
       feeCount - 1n,
     );
-    const startEpoch = await state.chronos.getCurrentEpoch();
 
-    // (b) Generate 5 fresh publishes from node1 (core) so the current epoch
-    // pool gets non-trivial value AND the sampler has eligible KCs to
-    // challenge in the current epoch. Without this, RS scoring stays at 0.
+    // The 10% fee must be live BEFORE the epoch we score and later claim.
+    // Profile stages the fee at timestampForEpoch(startEpoch+1); _claim resolves
+    // epoch N's fee at timestampForEpoch(N+1)-1, so scoring+claiming the same
+    // epoch the fee was set in still applies 0%. Warp past the effective
+    // boundary first, then score the post-fee epoch.
+    const blockBeforeFeeWarp = await state.provider.getBlock('latest');
+    const nowBeforeFee = BigInt(blockBeforeFeeWarp!.timestamp);
+    const feeWarpSeconds = Number((feeEffectiveDate > nowBeforeFee ? feeEffectiveDate - nowBeforeFee : 0n) + 2n);
+    if (feeWarpSeconds > 0) {
+      await state.provider.send('evm_increaseTime', [feeWarpSeconds]);
+    }
+    await state.provider.send('hardhat_mine', ['0x5', '0x0']);
+    const scoreEpoch = await state.chronos.getCurrentEpoch();
+
+    // Generate 5 fresh publishes from node1 (core) so scoreEpoch's pool is
+    // non-trivial AND the sampler has eligible KCs to challenge.
     for (let i = 0; i < 5; i++) {
       const name = `core-flows-fee-pub-${Date.now().toString(36)}-${i}`;
       await fullPublish(NODE1_API, state.node1Token, name);
       await sleep(1500);
     }
 
-    // (c) Wait up to ~80s for RS to score the current epoch. Tightly coupled
-    // to devnet's `proofingPeriodDurationInBlocks=100` and 1s interval mining.
-    let scoreNow = await state.rs.getNodeEpochScore(startEpoch, identityId);
+    let scoreNow = await state.rs.getNodeEpochScore(scoreEpoch, identityId);
     for (let waited = 0; waited < 80 && scoreNow === 0n; waited += 5) {
       await sleep(5_000);
-      scoreNow = await state.rs.getNodeEpochScore(startEpoch, identityId);
+      scoreNow = await state.rs.getNodeEpochScore(scoreEpoch, identityId);
     }
-    expect(scoreNow, `node1 must have non-zero RS score in epoch ${startEpoch}`).toBeGreaterThan(0n);
+    expect(scoreNow, `node1 must have non-zero RS score in epoch ${scoreEpoch}`).toBeGreaterThan(0n);
 
-    const allScore = await state.rs.getAllNodesEpochScore(startEpoch);
-    const epochPool = await state.es.getEpochPool(1n, startEpoch);
+    const allScore = await state.rs.getAllNodesEpochScore(scoreEpoch);
+    const epochPool = await state.es.getEpochPool(1n, scoreEpoch);
     const grossNode1 = (BigInt(epochPool) * scoreNow) / allScore;
     const expectedFee = (grossNode1 * 1000n) / 10000n; // 10% of gross
 
-    // (d) Warp past the pending fee effective date AND across at least one
-    // full epoch boundary so `claim()` can settle `startEpoch` rewards.
-    // Devnet Chronos uses a 30-day `epochLength`; `timeUntilNextEpoch()`
-    // is not a reliable warp target on Hardhat.
+    // Warp across at least one full epoch boundary so claim() can settle
+    // scoreEpoch rewards under the now-active 10% operator fee.
     const blockBeforeWarp = await state.provider.getBlock('latest');
     const nowTimestamp = BigInt(blockBeforeWarp!.timestamp);
     const epochLen = await state.chronos.epochLength();
-    const targetTimestamp = (feeEffectiveDate > nowTimestamp ? feeEffectiveDate : nowTimestamp) + epochLen + 120n;
+    const targetTimestamp = nowTimestamp + epochLen + 120n;
     const warpSeconds = Number(targetTimestamp - nowTimestamp);
     if (warpSeconds > 0) {
       await state.provider.send('evm_increaseTime', [warpSeconds]);
     }
     await state.provider.send('hardhat_mine', ['0x5', '0x0']);
     const newEpoch = await state.chronos.getCurrentEpoch();
-    expect(newEpoch).toBeGreaterThan(startEpoch);
+    expect(newEpoch).toBeGreaterThan(scoreEpoch);
 
     const feeBpsLatest = await state.profileStorage.getOperatorFee(identityId);
     // ABI returns uint16 → ethers v6 surfaces it as `bigint`. Compare with the

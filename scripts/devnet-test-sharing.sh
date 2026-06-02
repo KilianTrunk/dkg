@@ -790,15 +790,21 @@ N1_NOTIFS=$(c "http://127.0.0.1:9201/api/notifications?limit=5")
 N1_JOIN_NOTIF=$(echo "$N1_NOTIFS" | python3 -c '
 import sys,json
 d=json.load(sys.stdin)
+target_cg = sys.argv[1]
 for n in d.get("notifications",[]):
-  if n.get("type")=="join_request":
-    meta=json.loads(n.get("meta","{}")) if n.get("meta") else {}
-    if "'"$CG2_ID"'" in meta.get("contextGraphId",""):
-      print("found")
-      break
+  if n.get("type")!="join_request":
+    continue
+  meta = n.get("meta") or {}
+  if isinstance(meta, str):
+    try: meta = json.loads(meta)
+    except Exception: meta = {}
+  cg = n.get("contextGraphId") or meta.get("contextGraphId") or ""
+  if cg == target_cg:
+    print("found")
+    break
 else:
   print("missing")
-' 2>/dev/null)
+' "$CG2_ID" 2>/dev/null)
 check "Join-request notification created on Node 1" "$N1_JOIN_NOTIF" "found"
 
 echo "--- 13h: Node 1 approves Node 4 ---"

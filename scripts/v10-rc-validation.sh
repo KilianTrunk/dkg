@@ -30,7 +30,11 @@ set -uo pipefail
 # work only by accident (and fail loudly with 401s on every POST after a
 # clean restart, which is exactly the trap this fallback path avoids).
 REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DEVNET_DIR="${DEVNET_DIR:-$REPO_ROOT/.devnet}"
+NUM_NODES="${NUM_NODES:-6}"
+# shellcheck source=devnet-update-helpers.sh
+source "$SCRIPT_DIR/devnet-update-helpers.sh"
 if [ -n "${DKG_AUTH:-}" ]; then
   AUTH="$DKG_AUTH"
 elif [ -n "${AUTH_TOKEN:-}" ]; then
@@ -199,22 +203,27 @@ section "4. PUBLISH WITH PRIVATE TRIPLES (via /api/update)"
 
 if [ "$PUB_STATUS" = "confirmed" ] || [ "$PUB_STATUS" = "finalized" ]; then
   BOB_URI="urn:v10:bob-$RUN_TAG"
-  UPD_BODY=$(cat <<JSON
-{
-  "kaId": "$PUB_KCID",
-  "contextGraphId": "$CG",
-  "quads": [
-    $(q "$BOB_URI" "http://www.w3.org/1999/02/22-rdf-syntax-ns#type" "http://schema.org/Person"),
-    $(ql "$BOB_URI" "http://schema.org/name" "Bob V10 $RUN_TAG")
-  ],
-  "privateQuads": [
-    $(ql "$BOB_URI" "http://schema.org/email" "bob@secret.test"),
-    $(ql "$BOB_URI" "http://schema.org/telephone" "+1-555-PRIVATE")
-  ]
-}
+  QUADS_JSON=$(cat <<JSON
+[
+  $(q "$BOB_URI" "http://www.w3.org/1999/02/22-rdf-syntax-ns#type" "http://schema.org/Person"),
+  $(ql "$BOB_URI" "http://schema.org/name" "Bob V10 $RUN_TAG")
+]
 JSON
 )
-  PRIV_RESULT=$(post 9201 /api/update -H "Content-Type: application/json" -d "$UPD_BODY")
+  PRIVATE_QUADS_JSON=$(node -e "
+    const s = process.argv[1];
+    console.log(JSON.stringify([
+      { subject: s, predicate: 'http://schema.org/email', object: '\"bob@secret.test\"', graph: '' },
+      { subject: s, predicate: 'http://schema.org/telephone', object: '\"+1-555-PRIVATE\"', graph: '' },
+    ]));
+  " "$BOB_URI")
+  UPD_BODY=$(build_update_body 1 "$PUB_KCID" "$CG" "$QUADS_JSON" "$PRIVATE_QUADS_JSON") || UPD_BODY=""
+  if [ -z "$UPD_BODY" ]; then
+    fail "Private update: could not build precomputedUpdateAttestation for kaId=$PUB_KCID (is Hardhat up and contracts deployed?)"
+    PRIV_RESULT=""
+  else
+    PRIV_RESULT=$(post 9201 /api/update -H "Content-Type: application/json" -d "$UPD_BODY")
+  fi
   PRIV_STATUS=$(echo "$PRIV_RESULT" | pyfield "d.get('status','?')")
   if [ "$PRIV_STATUS" = "confirmed" ] || [ "$PRIV_STATUS" = "finalized" ]; then
     ok "Update with private triples confirmed, status=$PRIV_STATUS"

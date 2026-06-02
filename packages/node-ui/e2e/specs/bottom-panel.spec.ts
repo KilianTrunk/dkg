@@ -96,15 +96,29 @@ test.describe('Bottom Panel', () => {
     expect(await bottomPanel.isCollapsed()).toBe(true);
   });
 
-  test.skip('log filter input filters log lines by text', async ({ bottomPanel, page }) => {
-    // BUG: Log filter input does not actually filter the displayed log lines
+  test('log filter input filters the displayed log lines (server-side q)', async ({ bottomPanel, page }) => {
+    // The Node Log filter is applied SERVER-SIDE: typing re-fetches
+    // `/api/node-log?q=<filter>` and the daemon returns only matching lines
+    // (see NodeLogContent.load). The old "BUG: filter doesn't filter" note was
+    // a mock-era artifact — the stub ignored `q`. Against the real daemon the
+    // filter works.
+    //
+    // Comparing line counts before/after a substring filter is racy on a live
+    // daemon (dozens of lines/sec keep arriving). Instead filter by a token
+    // that CANNOT appear in any log line and assert the view collapses to the
+    // deliberate empty state — deterministic proof the `q` round-trip filtered.
     await bottomPanel.toggle();
-    await page.locator('.v10-log-line').first().waitFor({ state: 'visible', timeout: 5_000 });
-    const totalBefore = await bottomPanel.getLogLineCount();
-    await bottomPanel.filterLogs('DEBUG');
-    await page.waitForTimeout(500);
-    const totalAfter = await bottomPanel.getLogLineCount();
-    expect(totalAfter).toBeLessThan(totalBefore);
+    await page.locator('.v10-log-line').first().waitFor({ state: 'visible', timeout: 15_000 });
+    await bottomPanel.filterLogs('zzz-no-log-line-can-ever-contain-this-token-zzz');
+    // The filter change triggers a refetch; poll for the empty-state line.
+    await expect(page.getByText('No log output', { exact: true })).toBeVisible({ timeout: 10_000 });
+
+    // Clearing the filter must restore real log lines (the round-trip is
+    // reversible, not a one-way dead end). The empty-state placeholder is
+    // itself a `.v10-log-line`, so assert the placeholder is GONE rather than
+    // counting lines.
+    await bottomPanel.filterLogs('');
+    await expect(page.getByText('No log output', { exact: true })).toBeHidden({ timeout: 10_000 });
   });
 
   test('log lines come from the real daemon (non-empty + tail keeps appending)', async ({ bottomPanel, page }) => {

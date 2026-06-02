@@ -39,18 +39,26 @@ test.describe('Non-conviction publishing (baseline)', () => {
     const { contextGraphs } = (await cgsRes.json()) as { contextGraphs: Array<{ id: string }> };
     test.skip(contextGraphs.length === 0, 'No CGs');
     const { createWmAssertion, promoteAssertion, publishToVm, buildTestQuads } = await import('../../helpers/devnet-publish.js');
+    const { withSwmLock } = await import('../../helpers/swm-lock.js');
     const cgId = contextGraphs[0]!.id;
     const stamp = Date.now();
     const name = `e2e-non-conviction-${stamp}`;
-    const wm = await createWmAssertion({
-      contextGraphId: cgId,
-      name,
-      quads: buildTestQuads(cgId, stamp, `Non-conviction ${stamp}`),
+    // This is the ONE spec that publishes with `clearAfter: true` — a CG-wide
+    // shared-memory wipe. Hold the SWM mutation lock across the whole
+    // create→promote→publish(clear) so the wipe can never land between another
+    // parallel pipeline's promote and publish (which would 500 that pipeline
+    // with "No quads in shared memory ... matching selection"). See swm-lock.ts.
+    await withSwmLock(async () => {
+      const wm = await createWmAssertion({
+        contextGraphId: cgId,
+        name,
+        quads: buildTestQuads(cgId, stamp, `Non-conviction ${stamp}`),
+      });
+      expect(wm.ok).toBe(true);
+      const promote = await promoteAssertion({ contextGraphId: cgId, assertionName: name });
+      expect(promote.ok).toBe(true);
+      const published = await publishToVm({ contextGraphId: cgId, assertionName: name, clearAfter: true });
+      expect(published.status).toBeTruthy();
     });
-    expect(wm.ok).toBe(true);
-    const promote = await promoteAssertion({ contextGraphId: cgId, assertionName: name });
-    expect(promote.ok).toBe(true);
-    const published = await publishToVm({ contextGraphId: cgId, assertionName: name, clearAfter: true });
-    expect(published.status).toBeTruthy();
   });
 });

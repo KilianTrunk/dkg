@@ -1,20 +1,13 @@
 import { test, expect } from '../fixtures/base.js';
 
-const MOCK_AGENT = {
-  agentAddress: '0x1111111111111111111111111111111111111111',
-  agentDid: 'did:dkg:agent:0x1111111111111111111111111111111111111111',
-  name: 'mock-node-agent',
-};
-
 test.describe('Create Context Graph Modal (rc.12)', () => {
-  test.beforeEach(async ({ shell, leftPanel, createProjectModal, page }) => {
-    await page.route('**/api/agent/identity', (route) =>
-      route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(MOCK_AGENT) }),
-    );
+  test.beforeEach(async ({ shell, leftPanel, createProjectModal }) => {
     await shell.goto();
     await leftPanel.clickNewProject();
     await expect(createProjectModal.overlay).toBeVisible();
-    await expect(createProjectModal.submitBtn).not.toHaveText(/Loading agent|Agent unavailable/);
+    // The real node resolves its agent identity from /api/agent/identity, so
+    // the submit button must leave the loading/unavailable state on its own.
+    await expect(createProjectModal.submitBtn).not.toHaveText(/Loading agent|Agent unavailable/, { timeout: 15_000 });
   });
 
   test('modal title is "Create New Context Graph"', async ({ createProjectModal }) => {
@@ -42,9 +35,9 @@ test.describe('Create Context Graph Modal (rc.12)', () => {
   });
 
   test('name and description inputs accept text', async ({ createProjectModal }) => {
-    await createProjectModal.fill('Drug Interactions', 'Track pharmaceutical compound interactions');
-    expect(await createProjectModal.getNameValue()).toBe('Drug Interactions');
-    expect(await createProjectModal.descriptionInput.inputValue()).toBe('Track pharmaceutical compound interactions');
+    await createProjectModal.fill('My Knowledge Graph', 'Track structured project memory');
+    expect(await createProjectModal.getNameValue()).toBe('My Knowledge Graph');
+    expect(await createProjectModal.descriptionInput.inputValue()).toBe('Track structured project memory');
   });
 
   test('Cancel button closes the modal', async ({ createProjectModal }) => {

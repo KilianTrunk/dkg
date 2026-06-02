@@ -30,6 +30,19 @@ async function detectMockMode(): Promise<boolean> {
     } catch {
       useMocks = true;
     }
+    // Observability: surface the silent demo-data fallback so operators — and
+    // the e2e suite's mock-mode guard (fixtures/base.ts) — can tell the UI is
+    // NOT showing live node state. Without this flag the swap to fabricated
+    // fixtures is completely invisible, which is a false-positive trap for any
+    // assertion made against the rendered data.
+    if (typeof window !== 'undefined') {
+      (window as { __DKG_USING_MOCKS__?: boolean }).__DKG_USING_MOCKS__ = useMocks;
+      if (useMocks) {
+        console.warn(
+          '[dkg-ui] /api/status unreachable (timeout/5xx/network) — falling back to demo (mock) data. The UI is NOT showing live node state.',
+        );
+      }
+    }
     return useMocks;
   })();
   try {

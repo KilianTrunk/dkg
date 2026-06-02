@@ -18,6 +18,11 @@ export class SubGraphBarPage {
 
   async waitForBar(timeout = 15_000) {
     await this.bar.waitFor({ state: 'visible', timeout });
+    // Chips render asynchronously after the bar mounts (the bar fetches
+    // `/api/sub-graph/list` on mount, then paints the "All" + per-scope chips).
+    // Every caller reads chips right after this, so wait for the first chip to
+    // exist — otherwise a count/label read can race the paint and see 0.
+    await this.chips.first().waitFor({ state: 'visible', timeout });
   }
 
   async getChipLabels(): Promise<string[]> {
@@ -44,6 +49,33 @@ export class SubGraphBarPage {
 
   async clickChip(label: string | RegExp) {
     await this.chips.filter({ hasText: label }).click();
+  }
+
+  /**
+   * Click the first concrete scope chip — i.e. the first chip that is NOT the
+   * aggregate "All" chip. On a real node the scopes are whatever the daemon has
+   * registered (named sub-graphs and/or the Root bucket), so specs select "the
+   * first real scope" rather than a hard-coded mock sub-graph name.
+   *
+   * NB: a chip's textContent is `${icon}${label}${count}` (e.g. "⊚All31"), so we
+   * can't filter on the whole chip text — `hasNotText: 'All'` would also exclude
+   * legitimate scopes whose LABEL merely contains that substring (`Allergens`,
+   * `Allocate`, …) and could skip the first real scope or find none. Instead read
+   * each chip's dedicated label element and exact-match it against "All", so only
+   * the aggregate chip (label === "All") is excluded.
+   */
+  async clickFirstScopeChip() {
+    await this.chips.first().waitFor({ state: 'visible', timeout: 15_000 });
+    const count = await this.chips.count();
+    for (let i = 0; i < count; i++) {
+      const chip = this.chips.nth(i);
+      const label = (await chip.locator(sel.subgraph.chipLabel).textContent())?.trim();
+      if (label && label !== 'All') {
+        await chip.click();
+        return;
+      }
+    }
+    throw new Error('no concrete sub-graph scope chip found (only the aggregate "All" chip is present)');
   }
 
   async getActiveChipLabel(): Promise<string | null> {

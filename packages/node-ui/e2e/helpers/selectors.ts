@@ -13,12 +13,16 @@ export const sel = {
     meta: '.v10-header-meta',
     notifWrap: '.v10-header-notif-wrap',
     notifBadge: '.v10-header-notif-badge',
-    notifDropdown: '.v10-header-notif-dropdown',
-    notifTitle: '.v10-header-notif-title',
-    notifEmpty: '.v10-header-notif-empty',
-    notifItem: '.v10-header-notif-item',
-    notifItemText: '.v10-header-notif-item-text',
-    notifItemTime: '.v10-header-notif-item-time',
+    // rc.12 refactor: the bell dropdown is now the standalone NotificationsPane
+    // (`<NotificationsBell>` → `<NotificationsPane>`), not the old inline
+    // `.v10-header-notif-*` markup. Rows are rendered by JoinRequestRow /
+    // ActivityDigestRow / ConfirmationRow (see components/Notifications/).
+    notifDropdown: '.v10-notif-pane',
+    notifTitle: '.v10-notif-pane-title',
+    notifEmpty: '.v10-notif-pane-empty',
+    notifItem: '.v10-notif-row',
+    notifItemText: '.v10-notif-row-detail',
+    notifItemTime: '.v10-notif-time',
     themeToggle: 'button[title*="Switch to"]',
     observabilityBtn: 'button[title="Observability"]',
     settingsBtn: 'button[title="Settings"]',
@@ -47,6 +51,8 @@ export const sel = {
     section: '.v10-tree-section',
     sectionHeader: '.v10-tree-section-header',
     sectionLabel: '.v10-tree-section-label',
+    hideBtn: '.v10-tree-hide-btn',
+    showHidden: '.v10-tree-show-hidden',
     treeItems: '.v10-tree-items',
     treeItem: '.v10-tree-item',
     itemLabel: '.v10-tree-item-label',
@@ -249,5 +255,25 @@ export const sel = {
     peerGroup: '.v10-peer-group',
     peerGroupLabel: '.v10-peer-group-label',
     peerGroupBody: '.v10-peer-group-body',
+  },
+
+  // Settings page (pages/Settings.tsx). It is NOT a `.v10-*` surface — the
+  // rewritten page uses the shared `.card`/`.settings-*` design-system classes.
+  // Opens as a closable center tab from the header gear button.
+  settings: {
+    pageTitle: '.page-title',
+    stack: '.settings-stack',
+    card: '.settings-stack .card',
+    cardTitle: '.settings-stack .card-title',
+    fieldLabel: '.settings-field-label',
+    fieldValue: '.settings-field-value',
+    onlinePill: '.settings-stack .card-body .mono',
+    telemetrySwitch: 'button[role="switch"][aria-label="Share telemetry with the network"]',
+    telemetryDialog: '[role="dialog"][aria-label="Enable Telemetry Streaming?"]',
+    retentionSelect: '#retention-select',
+    retentionConfirm: '[role="group"][aria-label="Confirm retention reduction"]',
+    rpcRevealBtn: 'button[aria-label="Reveal RPC URL"]',
+    rpcRedactBtn: 'button[aria-label="Redact RPC URL"]',
+    shutdownBtn: '.settings-stack .card button',
   },
 } as const;

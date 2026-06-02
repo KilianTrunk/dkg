@@ -61,14 +61,29 @@ test.describe('Operations View (rc.12 Observability)', () => {
   });
 
   test('PHASES section lists operation phases', async ({ page }) => {
-    await expect(page.getByText('Phases', { exact: true })).toBeVisible();
-    await expect(page.getByText('Prepare', { exact: true })).toBeVisible();
-    await expect(page.getByText('Broadcast', { exact: true })).toBeVisible();
-    await expect(page.getByText('Verify', { exact: true })).toBeVisible();
+    // The "Phases" legend (a flex row of phase labels) is distinct from the
+    // operations table's "Phases" column <th>, which only renders once real
+    // operations exist. Scope to the legend (the only "Phases" <span>) so the
+    // assertion is stable regardless of how many operations the node recorded.
+    const legend = page.locator('span').filter({ hasText: /^Phases$/ }).locator('xpath=..');
+    await expect(legend).toBeVisible();
+    await expect(legend.getByText('Prepare', { exact: true })).toBeVisible();
+    await expect(legend.getByText('Broadcast', { exact: true })).toBeVisible();
+    await expect(legend.getByText('Verify', { exact: true })).toBeVisible();
   });
 
-  test('empty state message when no operations', async ({ page }) => {
-    await expect(page.getByText('No operations recorded')).toBeVisible();
+  test('operations list renders rows or an empty state', async ({ page }) => {
+    // A live devnet records real operations (publish/query/sync/gossip), so the
+    // panel may show rows OR — on a very quiet node — the empty state. Both are
+    // valid; assert the All-Operations surface resolves to one of them.
+    const empty = page.getByText('No operations recorded');
+    const rows = page.locator('.v10-op-row, [data-op-row], table tbody tr');
+    await expect
+      .poll(async () =>
+        (await empty.isVisible().catch(() => false)) ||
+        (await rows.first().isVisible().catch(() => false)),
+      )
+      .toBe(true);
   });
 
   test('switching to Hardware sub-tab shows hardware metrics shell', async ({ page }) => {
@@ -78,8 +93,17 @@ test.describe('Operations View (rc.12 Observability)', () => {
 
   test('switching to Logs sub-tab shows log viewer controls', async ({ page }) => {
     await page.locator('button').filter({ hasText: 'Logs' }).click();
+    // The `daemon.log` header control is always present.
     await expect(page.getByText('daemon.log')).toBeVisible();
-    await expect(page.getByText('No log lines found')).toBeVisible();
+    // A live node writes a real daemon log, so the viewer must render tail
+    // lines and NOT the empty state. We can't anchor on a fixed mock line
+    // (the network/timestamps are environment-specific), so assert the
+    // wired-up contract: the empty state is absent and the viewer header
+    // reports a positive line count. A broken /api/node-log surfaces here.
+    await expect(page.getByText('No log lines found')).toHaveCount(0);
+    // The viewer header renders "<N> lines" in a <span>. Scope to span so the
+    // assertion doesn't match the tail-size <option>200 lines</option> control.
+    await expect(page.locator('span').filter({ hasText: /^\d+ lines\b/ }).first()).toBeVisible({ timeout: 15_000 });
   });
 
   test('Logs sub-tab has level filter dropdown', async ({ page }) => {
@@ -94,9 +118,12 @@ test.describe('Operations View (rc.12 Observability)', () => {
     await expect(page.getByRole('button', { name: 'Refresh', exact: true })).toBeVisible();
   });
 
-  test('switching to Errors sub-tab shows success message', async ({ page }) => {
+  test('switching to Errors sub-tab renders the errors surface', async ({ page }) => {
     await page.locator('button').filter({ hasText: 'Errors' }).click();
-    await expect(page.getByText('No errors in this period')).toBeVisible();
+    // A real node may or may not have logged errors in the window, so accept
+    // either the no-errors message or a rendered error list — the durable
+    // contract is that the Errors surface (Error Hotspots) renders.
+    await expect(page.getByText('Error Hotspots')).toBeVisible();
   });
 
   test('Errors sub-tab has time range selector', async ({ page }) => {
@@ -104,8 +131,9 @@ test.describe('Operations View (rc.12 Observability)', () => {
     await expect(page.getByText('Error Hotspots')).toBeVisible();
   });
 
-  test('shows "0 total" operations count', async ({ page }) => {
-    await expect(page.getByText('0 total')).toBeVisible();
+  test('shows an operations total count', async ({ page }) => {
+    // Live node → the total is whatever has been recorded (≥ 0), not a fixed 0.
+    await expect(page.getByText(/\d+ total/).first()).toBeVisible();
   });
 
   test('Observability tab is closable', async ({ centerPanel }) => {

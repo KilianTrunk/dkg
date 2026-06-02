@@ -2058,6 +2058,35 @@ export class EVMChainAdapter implements ChainAdapter {
         }
       }
 
+      // Phase B (chain-driven VM reconciliation): the canonical
+      // "a KA was bound to a CG" signal. Both `contextGraphId` and `kaId`
+      // are indexed, so the poller can subscribe with a topic filter on its
+      // subscribed CG ids (no global firehose). Emitted by
+      // `registerKnowledgeAssetToContextGraph` in the V10 publish flow.
+      if (eventType === 'KnowledgeAssetRegisteredToContextGraph') {
+        const cgStorage = this.contracts.contextGraphStorage;
+        if (cgStorage) {
+          const eventFilter = cgStorage.filters.KnowledgeAssetRegisteredToContextGraph();
+          const logs = await cgStorage.queryFilter(eventFilter, filter.fromBlock ?? 0, filter.toBlock);
+
+          for (const log of logs) {
+            const parsed = cgStorage.interface.parseLog({ topics: [...log.topics], data: log.data });
+            if (parsed) {
+              yield {
+                type: 'KnowledgeAssetRegisteredToContextGraph',
+                blockNumber: log.blockNumber,
+                data: {
+                  contextGraphId: parsed.args.contextGraphId.toString(),
+                  kaId: parsed.args.kaId.toString(),
+                  txHash: log.transactionHash,
+                  txIndex: log.transactionIndex,
+                },
+              };
+            }
+          }
+        }
+      }
+
       // V10 greenfield (DKGKnowledgeAssets) emits `KnowledgeAssetCreated`
       // plus a single ERC-721 `Transfer(0x0, owner, tokenId)` per publish
       // (tokenId == kaId == kaId; no batch mint). Legacy V8/V9
@@ -4506,6 +4535,20 @@ export class EVMChainAdapter implements ChainAdapter {
     const cgs = this.requireContextGraphStorage();
     const cgId: bigint = await cgs.kaToContextGraph(kaId);
     return BigInt(cgId);
+  }
+
+  async getContextGraphKCCount(contextGraphId: bigint): Promise<bigint> {
+    await this.init();
+    const cgs = this.requireContextGraphStorage();
+    const count: bigint = await cgs.getContextGraphKCCount(contextGraphId);
+    return BigInt(count);
+  }
+
+  async getContextGraphKCAt(contextGraphId: bigint, index: bigint): Promise<bigint> {
+    await this.init();
+    const cgs = this.requireContextGraphStorage();
+    const kaId: bigint = await cgs.getContextGraphKCAt(contextGraphId, index);
+    return BigInt(kaId);
   }
 
   /**

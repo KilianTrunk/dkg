@@ -1163,6 +1163,9 @@ export async function runDaemonInner(
         sharedMemorySynced: row.shared_memory_synced == null ? undefined : row.shared_memory_synced === 1,
         metaSynced: row.meta_synced == null ? undefined : row.meta_synced === 1,
         onChainId: row.on_chain_id ?? undefined,
+        onChainHash: row.on_chain_hash ?? undefined,
+        lastReconciledOrdinal: row.last_reconciled_ordinal ?? undefined,
+        coreHosted: row.core_hosted == null ? undefined : row.core_hosted === 1,
         syncScoped: row.sync_scoped === 1,
       })),
       save: async (record) => {
@@ -1174,6 +1177,9 @@ export async function runDaemonInner(
           shared_memory_synced: record.sharedMemorySynced == null ? null : record.sharedMemorySynced ? 1 : 0,
           meta_synced: record.metaSynced == null ? null : record.metaSynced ? 1 : 0,
           on_chain_id: record.onChainId ?? null,
+          on_chain_hash: record.onChainHash ?? null,
+          last_reconciled_ordinal: record.lastReconciledOrdinal ?? null,
+          core_hosted: record.coreHosted == null ? null : record.coreHosted ? 1 : 0,
           sync_scoped: record.syncScoped ? 1 : 0,
           updated_at: Date.now(),
         });
@@ -1204,6 +1210,27 @@ export async function runDaemonInner(
     messengerStores: {
       idempotencyStore: messengerIdempotencyStore,
       outboxStore: messengerOutboxStore,
+    },
+    // Phase F — persist chain-driven VM reconciliation telemetry so the
+    // /ui/observability Replication tab can aggregate it. Best-effort: a
+    // failed insert must never disrupt reconciliation, and the agent already
+    // guards the sink call in a try/catch.
+    onReplicationEvent: (event) => {
+      dashDb.insertReplicationEvent({
+        ts: event.ts,
+        context_graph_id: event.contextGraphId,
+        on_chain_cg_id: event.onChainCgId ?? null,
+        action: event.action,
+        ual: event.ual ?? null,
+        ordinal: event.ordinal ?? null,
+        ka_id: event.kaId ?? null,
+        from_watermark: event.fromWatermark ?? null,
+        to_watermark: event.toWatermark ?? null,
+        head: event.head ?? null,
+        reconciled: event.reconciled ?? null,
+        pending: event.pending ?? null,
+        detail: event.detail ?? null,
+      });
     },
   });
 

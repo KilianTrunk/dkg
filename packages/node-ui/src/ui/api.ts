@@ -153,6 +153,76 @@ export const fetchFailedOperations = (params: { phase?: string; operationName?: 
   return get<{ operations: any[] }>(`/api/failed-operations${q ? '?' + q : ''}`);
 };
 
+// --- Replication (chain-driven VM reconciliation) — Phase F ---
+export interface ReplicationSummary {
+  periodMs: number;
+  counts: Record<string, number>;
+  promotes: number;
+  fetches: number;
+  defers: number;
+  successRate: number | null;
+  latencyP50Ms: number | null;
+  latencyP95Ms: number | null;
+  totalEvents: number;
+}
+export interface ReplicationPerCgRow {
+  context_graph_id: string;
+  on_chain_cg_id: string | null;
+  promotes: number;
+  fetches: number;
+  defers: number;
+  cursor_advances: number;
+  last_watermark: number | null;
+  last_head: number | null;
+  last_event_ts: number | null;
+}
+export interface ReplicationTimelineBucket {
+  bucket: number;
+  promotes: number;
+  fetches: number;
+  defers: number;
+  total: number;
+}
+export interface ReplicationCursorRow {
+  context_graph_id: string;
+  on_chain_id: string | null;
+  last_reconciled_ordinal: number | null;
+  core_hosted: number | null;
+  last_head: number | null;
+  last_event_ts: number | null;
+}
+export interface ReplicationEventRow {
+  ts: number;
+  context_graph_id: string;
+  on_chain_cg_id: string | null;
+  action: string;
+  ual: string | null;
+  ordinal: number | null;
+  ka_id: string | null;
+  from_watermark: number | null;
+  to_watermark: number | null;
+  head: number | null;
+  reconciled: number | null;
+  pending: number | null;
+  detail: string | null;
+}
+export const fetchReplicationSummary = (periodMs?: number) =>
+  get<ReplicationSummary>(`/api/replication/summary${periodMs ? `?periodMs=${periodMs}` : ''}`);
+export const fetchReplicationPerCg = (periodMs?: number) =>
+  get<{ rows: ReplicationPerCgRow[] }>(`/api/replication/per-cg${periodMs ? `?periodMs=${periodMs}` : ''}`);
+export const fetchReplicationTimeline = (params: { periodMs?: number; bucketMs?: number; cg?: string } = {}) => {
+  const qs = new URLSearchParams();
+  if (params.periodMs) qs.set('periodMs', String(params.periodMs));
+  if (params.bucketMs) qs.set('bucketMs', String(params.bucketMs));
+  if (params.cg) qs.set('cg', params.cg);
+  const q = qs.toString();
+  return get<{ buckets: ReplicationTimelineBucket[] }>(`/api/replication/timeline${q ? '?' + q : ''}`);
+};
+export const fetchReplicationCursors = () =>
+  get<{ cursors: ReplicationCursorRow[] }>(`/api/replication/cursors`);
+export const fetchReplicationEvents = (cg: string, limit = 100) =>
+  get<{ events: ReplicationEventRow[] }>(`/api/replication/events?cg=${encodeURIComponent(cg)}&limit=${limit}`);
+
 // --- Operation stats ---
 export const fetchOperationStats = (params: { name?: string; periodMs?: number } = {}) => {
   const qs = new URLSearchParams();

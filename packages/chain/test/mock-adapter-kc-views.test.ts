@@ -100,6 +100,46 @@ describe('MockChainAdapter KC views — createKnowledgeAssets path', () => {
   });
 });
 
+describe('MockChainAdapter — per-CG registration ordinal reads (Phase B cursor key)', () => {
+  it('counts registered KAs per CG and walks them in registration order', async () => {
+    const adapter = new MockChainAdapter();
+    // Interleave two CGs so we exercise the per-CG filter + ordering.
+    adapter.__registerKC({ kaId: 10n, contextGraphId: 1n, merkleRootHex: ROOT_HEX, chunks: [{ chunkId: 0n, chunk: LEAF0 }] });
+    adapter.__registerKC({ kaId: 20n, contextGraphId: 2n, merkleRootHex: ROOT_HEX, chunks: [{ chunkId: 0n, chunk: LEAF0 }] });
+    adapter.__registerKC({ kaId: 11n, contextGraphId: 1n, merkleRootHex: ROOT_HEX, chunks: [{ chunkId: 0n, chunk: LEAF0 }] });
+    adapter.__registerKC({ kaId: 12n, contextGraphId: 1n, merkleRootHex: ROOT_HEX, chunks: [{ chunkId: 0n, chunk: LEAF0 }] });
+
+    expect(await adapter.getContextGraphKCCount(1n)).toBe(3n);
+    expect(await adapter.getContextGraphKCCount(2n)).toBe(1n);
+
+    expect(await adapter.getContextGraphKCAt(1n, 0n)).toBe(10n);
+    expect(await adapter.getContextGraphKCAt(1n, 1n)).toBe(11n);
+    expect(await adapter.getContextGraphKCAt(1n, 2n)).toBe(12n);
+    expect(await adapter.getContextGraphKCAt(2n, 0n)).toBe(20n);
+  });
+
+  it('returns 0n count for an unknown CG and reverts on out-of-range index', async () => {
+    const adapter = new MockChainAdapter();
+    expect(await adapter.getContextGraphKCCount(999n)).toBe(0n);
+    await expect(adapter.getContextGraphKCAt(999n, 0n)).rejects.toThrow(/out of range/);
+  });
+
+  it('surfaces a KnowledgeAssetRegisteredToContextGraph event for the live-nudge path', async () => {
+    const adapter = new MockChainAdapter();
+    adapter.__registerKC({ kaId: 5n, contextGraphId: 8n, merkleRootHex: ROOT_HEX, chunks: [{ chunkId: 0n, chunk: LEAF0 }] });
+    adapter.__emitKARegisteredToContextGraph(8n, 5n);
+
+    const seen: Array<{ cg: string; kaId: string }> = [];
+    for await (const evt of adapter.listenForEvents({
+      eventTypes: ['KnowledgeAssetRegisteredToContextGraph'],
+      fromBlock: 0,
+    })) {
+      seen.push({ cg: String(evt.data.contextGraphId), kaId: String(evt.data.kaId) });
+    }
+    expect(seen).toEqual([{ cg: '8', kaId: '5' }]);
+  });
+});
+
 describe('MockChainAdapter KC views — error / default behaviour', () => {
   it('throws on unknown kaId for the four required-data views', async () => {
     const adapter = new MockChainAdapter();

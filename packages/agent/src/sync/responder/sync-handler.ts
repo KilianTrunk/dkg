@@ -67,6 +67,13 @@ export function registerSyncHandler(params: RegisterSyncHandlerParams): void {
     if (!contextGraphId || typeof contextGraphId !== 'string') {
       return new TextEncoder().encode('');
     }
+    // Phase C — validate the optional delta hint into a non-negative bigint.
+    // Anything malformed is ignored (full scan), never an error: the field is
+    // an unsigned, best-effort optimization.
+    let sinceBatchId: bigint | null = null;
+    if (request.sinceBatchId != null && /^\d+$/.test(String(request.sinceBatchId))) {
+      try { sinceBatchId = BigInt(String(request.sinceBatchId)); } catch { sinceBatchId = null; }
+    }
     const nquads: string[] = [];
 
     const authStartedAt = Date.now();
@@ -328,6 +335,36 @@ export function registerSyncHandler(params: RegisterSyncHandlerParams): void {
         // non-publisher peers received the per-cgId data but no per-cgId meta
         // and emitted `kc-not-synced` for every challenge they were assigned
         // against KCs they hadn't published themselves.
+        // Phase C delta filter (narrowing-only). When the requester sends a
+        // `sinceBatchId` high-water mark, drop DATA triples whose owning KC has
+        // `dkg:batchId <= sinceBatchId`. Subjects with NO KA→KC→batchId mapping
+        // (KC/KA meta rows, lifecycle, activity) are NEVER hidden — a delta can
+        // only ever return a subset, so re-sending un-keyed rows is correct (and
+        // keeps every responder's behavior a safe superset). Old responders that
+        // predate this field simply ignore it and return the full scan.
+        // Perf note: the EXISTS/NOT-EXISTS join only runs for delta requests,
+        // which are by definition small; full scans skip it entirely.
+        const deltaFilter = sinceBatchId != null
+          ? `
+            FILTER(
+              NOT EXISTS {
+                GRAPH ?mgAny {
+                  ?kaAny <${DKG_NS}partOf> ?ualAny ; <${DKG_NS}rootEntity> ?reAny .
+                  ?ualAny <${DKG_NS}batchId> ?bidAny .
+                  FILTER(?reAny = ?s || STRSTARTS(STR(?s), CONCAT(STR(?reAny), "/.well-known/genid/")))
+                }
+              }
+              ||
+              EXISTS {
+                GRAPH ?mgNew {
+                  ?kaNew <${DKG_NS}partOf> ?ualNew ; <${DKG_NS}rootEntity> ?reNew .
+                  ?ualNew <${DKG_NS}batchId> ?bidNew .
+                  FILTER(?reNew = ?s || STRSTARTS(STR(?s), CONCAT(STR(?reNew), "/.well-known/genid/")))
+                  FILTER(?bidNew > "${sinceBatchId.toString()}"^^<http://www.w3.org/2001/XMLSchema#integer>)
+                }
+              }
+            )`
+          : '';
         const queryStartedAt = Date.now();
         const dataResult = await store.query(
           `SELECT ?s ?p ?o ?g WHERE {
@@ -346,7 +383,7 @@ export function registerSyncHandler(params: RegisterSyncHandlerParams): void {
                   FILTER(?layer != "${MemoryLayer.WorkingMemory}")
                 }
               }
-            )
+            )${deltaFilter}
           } ORDER BY ?g ?s ?p ?o OFFSET ${offset} LIMIT ${limit}`,
         );
         const queryDurationMs = Date.now() - queryStartedAt;

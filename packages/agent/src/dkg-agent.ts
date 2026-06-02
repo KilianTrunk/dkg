@@ -84,7 +84,7 @@ import {
   pickNetworkTunables,
 } from '@origintrail-official/dkg-core';
 import { GraphManager, PrivateContentStore, createTripleStore, type TripleStore, type TripleStoreConfig, type Quad, type LargeLiteralStorageConfig } from '@origintrail-official/dkg-storage';
-import { EVMChainAdapter, NoChainAdapter, enrichEvmError, isRetryableRpcError, type EVMAdapterConfig, type ChainAdapter, type CreateContextGraphParams, type CreateOnChainContextGraphParams, type CreateOnChainContextGraphResult, type TxResult, type V10PublishingConvictionAccountInfo } from '@origintrail-official/dkg-chain';
+import { EVMChainAdapter, NoChainAdapter, enrichEvmError, isRetryableRpcError, buildKnowledgeAssetUal, type EVMAdapterConfig, type ChainAdapter, type CreateContextGraphParams, type CreateOnChainContextGraphParams, type CreateOnChainContextGraphResult, type TxResult, type V10PublishingConvictionAccountInfo } from '@origintrail-official/dkg-chain';
 import {
   DKGPublisher, PublishHandler, SharedMemoryHandler, UpdateHandler, ChainEventPoller, AccessHandler, AccessClient,
   PublishJournal, StaleWriteError,
@@ -192,6 +192,7 @@ import {
 } from './swm/ciphertext-chunk-catchup.js';
 import { waitForPeerProtocol } from './p2p/protocol-readiness.js';
 import { orderCatchupPeers } from './p2p/peer-selection.js';
+import { reconcileWarmCoreConnections, type WarmCoreAgent } from './p2p/warm-core-connections.js';
 import { fetchSyncPages, type SyncPageResult } from './sync/requester/page-fetch.js';
 import { getSyncCheckpointKey } from './sync/checkpoint/state.js';
 import { runDurableSync } from './sync/requester/durable-sync.js';
@@ -216,6 +217,8 @@ import {
 } from './agent-keystore.js';
 import { GossipPublishHandler } from './gossip-publish-handler.js';
 import { FinalizationHandler } from './finalization-handler.js';
+import { reconcileContextGraph, ReconcileCoalescer, RecentUalSet, type ChainReconcilerDeps, type OrdinalOutcome } from './chain-reconciler.js';
+import { createCursorState, type CursorState } from './reconcile-cursor.js';
 // rc.9 PR-10: JoinApprovalRetryQueue removed — substrate outbox
 // (durable, SQLite-backed) replaces it. We keep a minimal local
 // type alias so listPendingJoinApprovalRetries() retains its old
@@ -274,6 +277,11 @@ import {
   MESSAGE_OUTBOX_TICK_MS,
   AGENT_PROFILE_HEARTBEAT_MS,
   AGENT_PROFILE_STALE_THRESHOLD_MS,
+  WARM_CORE_CONNECTIONS_ENABLED,
+  WARM_CORE_RECONCILE_INTERVAL_MS,
+  WARM_CORE_MAX,
+  WARM_CORE_KEEPALIVE_TAG,
+  WARM_CORE_DIAL_TIMEOUT_MS,
 } from './dkg-agent-constants.js';
 import {
   ContextGraphNotFoundError,
@@ -310,6 +318,7 @@ import {
   type DurableSyncResult,
   type SharedMemorySyncResult,
   type DKGAgentConfig,
+  type ReplicationEvent,
 } from './dkg-agent-types.js';
 import {
   normalizePublishContextGraphId,
@@ -804,9 +813,35 @@ export class DKGAgent {
    */
   private static readonly SWM_ACK_QUORUM_TICK_MS = 5_000;
 
+  /**
+   * Phase B — chain-driven VM reconciliation sweep cadence. The periodic sweep
+   * is the safety net behind the live `KnowledgeAssetRegisteredToContextGraph`
+   * nudge: it guarantees eventual reconciliation even if an event was missed or
+   * a fetch transiently failed. Env-overridable for ops tuning.
+   */
+  private static readonly VM_RECONCILE_SWEEP_INTERVAL_MS =
+    Number(process.env['DKG_VM_RECONCILE_INTERVAL_MS']) || 60_000;
+  /**
+   * Blocks a completed ordinal must be buried by before its watermark advance
+   * commits (reorg gate). The data is promoted to VM eagerly; only the cursor
+   * advance waits. Observation-block based (see `reconcileChainOrdinal`), so
+   * this is effectively "wait N blocks of chain progress after we observed the
+   * registration before trusting the watermark".
+   */
+  private static readonly VM_RECONCILE_CONFIRMATION_DEPTH =
+    Number(process.env['DKG_VM_RECONCILE_CONFIRMATION_DEPTH']) || 5;
+
   private messageHandler: MessageHandler | null = null;
   private chainPoller: ChainEventPoller | null = null;
   private swmCleanupTimer: ReturnType<typeof setInterval> | null = null;
+  /** Phase B — periodic chain-driven VM reconciliation sweep timer. */
+  private vmReconcileTimer: ReturnType<typeof setInterval> | null = null;
+  /** Phase B — per-CG single-flight coalescer for reconcile sweeps. */
+  private reconcileCoalescer?: ReconcileCoalescer;
+  /** Phase B — in-memory reconcile cursor per local CG id (watermark + `ahead`). */
+  private readonly reconcileCursors = new Map<string, CursorState>();
+  /** Phase B — bounded dedupe of recently-reconciled UALs (live-burst guard). */
+  private readonly recentReconciledUals = new RecentUalSet();
   private hostModeReconcilerTimer: ReturnType<typeof setInterval> | null = null;
   private hostModePruneTimer: ReturnType<typeof setInterval> | null = null;
   // rc.9 PR-10: joinApprovalRetryQueue + joinApprovalRetryTimer
@@ -1160,6 +1195,8 @@ export class DKGAgent {
    */
   private readonly lastSuccessfulSyncAt = new Map<string, number>();
   private syncReconcilerTimer: ReturnType<typeof setInterval> | null = null;
+  /** A.4-lite+: periodic warm/pinned Core-connection reconcile (opt-in). */
+  private warmCoreTimer: ReturnType<typeof setInterval> | null = null;
   /**
    * v10-rc sync-refactor: per-(peer+CG) checkpoint offsets so the paged
    * sync requester in `sync/requester/page-fetch.ts` can resume where it
@@ -2141,6 +2178,13 @@ export class DKGAgent {
               // having to round-trip it. Variadic + internal `seen` Set
               // dedups, so over-passing is cheap and order-independent.
               getSubscriptionSourceForCg: (cgId, swmGraphId) => {
+                // Phase D — this hook fires immediately before EVERY StorageACK
+                // sign (the universal pre-sign chokepoint across the plaintext /
+                // encrypted / chunked paths). Use it to record that this Core
+                // hosts the CG so the chain-driven VM reconciler fills its gaps
+                // across restarts. Best-effort + public-CG-gated inside the
+                // helper; never blocks or affects the (sync) provenance return.
+                void this.recordCoreHostedPublicCg(cgId, swmGraphId);
                 const wireFromCgId = cgId ? this.gossipWireIdFor(cgId) : undefined;
                 const wireFromSwmGraphId = swmGraphId && swmGraphId !== cgId
                   ? this.gossipWireIdFor(swmGraphId)
@@ -2408,6 +2452,24 @@ export class DKGAgent {
             });
           }
         },
+        // Phase B — live VM-reconcile nudge. A `KnowledgeAssetRegisteredToContextGraph`
+        // event doesn't carry the registration ordinal (only kaId + cgId), so it is
+        // NOT a cursor position — it just triggers an immediate coalesced sweep for
+        // that CG so newly-registered KCs land in VM with low latency. The periodic
+        // sweep is the safety net if this is missed. Only wired when reconciliation
+        // is actually possible (chain + ordinal reads present).
+        onKARegisteredToContextGraph: this.vmReconcileEnabled()
+          ? async ({ contextGraphId: onChainId, kaId }) => {
+              const localCgId = this.resolveLocalCgIdByOnChainId(BigInt(onChainId));
+              if (!localCgId) return; // chain replay hasn't resolved the cleartext CG yet; sweep heals it
+              const sub = this.subscribedContextGraphs.get(localCgId);
+              // Populate VM for CGs we member-subscribe to OR (Phase D) public
+              // CGs this Core hosts — a hosted Core fills its own gaps too.
+              if (!sub?.subscribed && !sub?.coreHosted) return;
+              this.log.info(ctx, `Phase B: KACG nudge cg=${onChainId} ka=${kaId} -> reconcile "${localCgId}"`);
+              if (this.reconcileCoalescer) void this.reconcileCoalescer.trigger(localCgId);
+            }
+          : undefined,
       });
       this.chainPoller.start();
       this.log.info(ctx, `Chain event poller started`);
@@ -3078,6 +3140,43 @@ export class DKGAgent {
     }, SYNC_RECONCILER_INTERVAL_MS);
     if (this.syncReconcilerTimer.unref) this.syncReconcilerTimer.unref();
 
+    // A.4-lite+: keep a small set of Core nodes warm (connection pinned +
+    // auto-redialed by libp2p) so catch-up / chain reconciliation never pays
+    // a cold circuit-relay dial to reach a Core. Opt-in via
+    // DKG_WARM_CORE_CONNECTIONS=1. See `p2p/warm-core-connections.ts`.
+    if (WARM_CORE_CONNECTIONS_ENABLED) {
+      const runWarmCore = (): void => {
+        this.reconcileWarmCoreConnections().catch((err: unknown) => {
+          const message = err instanceof Error ? err.message : String(err);
+          this.log.warn(ctx, `Warm-core reconcile tick failed: ${message}`);
+        });
+      };
+      // Prime once now (after startup), then on a steady cadence.
+      runWarmCore();
+      this.warmCoreTimer = setInterval(runWarmCore, WARM_CORE_RECONCILE_INTERVAL_MS);
+      if (this.warmCoreTimer.unref) this.warmCoreTimer.unref();
+    }
+
+    // Phase B — chain-driven VM reconciliation. The coalescer collapses a burst
+    // of live KACG nudges for a CG into a single sweep; the periodic timer is
+    // the safety net that backfills missed events / transient fetch failures and
+    // catches up late subscribers (the "Monday Fun Facts" case). Only armed when
+    // the chain adapter exposes the per-CG registration-ordinal reads.
+    if (this.vmReconcileEnabled()) {
+      this.reconcileCoalescer = new ReconcileCoalescer((localCgId) => this.runVmReconcileForCg(localCgId));
+      const runSweep = (): void => {
+        this.runVmReconcileSweep().catch((err: unknown) => {
+          this.log.warn(ctx, `VM reconcile sweep failed: ${err instanceof Error ? err.message : String(err)}`);
+        });
+      };
+      // Prime once after startup so a late subscriber catches up immediately,
+      // then on a steady cadence.
+      runSweep();
+      this.vmReconcileTimer = setInterval(runSweep, DKGAgent.VM_RECONCILE_SWEEP_INTERVAL_MS);
+      if (this.vmReconcileTimer.unref) this.vmReconcileTimer.unref();
+      this.log.info(ctx, `Chain-driven VM reconciliation armed (sweep ${DKGAgent.VM_RECONCILE_SWEEP_INTERVAL_MS}ms, depth ${DKGAgent.VM_RECONCILE_CONFIRMATION_DEPTH})`);
+    }
+
     // rc.9 PR-10: dedicated join-approval retry tick removed. The
     // substrate's Messenger.processOutboxTick (set up immediately
     // below) now drives retries for /dkg/10.0.1/join-request the
@@ -3359,6 +3458,78 @@ export class DKGAgent {
   }
 
   /**
+   * A.4-lite+: discover Core nodes from the Agent Registry phonebook, gate
+   * them on on-chain ShardingTable membership, and keep a small set warm
+   * (connection pinned + auto-redialed). Best-effort; never throws into the
+   * timer. See `p2p/warm-core-connections.ts`.
+   */
+  private async reconcileWarmCoreConnections(): Promise<void> {
+    if (!this.started) return;
+    await reconcileWarmCoreConnections({
+      selfPeerId: this.node.libp2p.peerId.toString(),
+      maxCores: WARM_CORE_MAX,
+      findCoreAgents: async (): Promise<WarmCoreAgent[]> => {
+        const agents = await this.discovery.findAgents();
+        return agents.map((a) => ({
+          peerId: a.peerId,
+          nodeRole: a.nodeRole,
+          agentAddress: a.agentAddress,
+        }));
+      },
+      isShardingTableCore: (agentAddress) => this.isShardingTableCore(agentAddress),
+      isConnected: (peerId) =>
+        this.node.libp2p.getConnections().some((c) => c.remotePeer.toString() === peerId),
+      pinAndDial: (peerId, ctx) => this.pinAndDialWarmCore(peerId, ctx),
+      log: (ctx, msg) => this.log.info(ctx, msg),
+    });
+  }
+
+  /**
+   * Trust gate for warm-core pinning: only pin Cores that are members of the
+   * on-chain ShardingTable (staked nodes). Best-effort — when the chain
+   * adapter can't answer (no chain bound, optional reads absent) the gate
+   * passes so the phonebook `nodeRole='core'` alone decides. A transient
+   * RPC failure denies (we don't pin on an unverifiable gate).
+   */
+  private async isShardingTableCore(agentAddress: string | undefined): Promise<boolean> {
+    const getIdentityIdForAddress = this.chain.getIdentityIdForAddress?.bind(this.chain);
+    const isShardingTableMember = this.chain.isShardingTableMember?.bind(this.chain);
+    if (!getIdentityIdForAddress || !isShardingTableMember) return true; // gate unavailable
+    if (!agentAddress) return false; // can't resolve identity without the operational wallet
+    try {
+      const identityId = await getIdentityIdForAddress(agentAddress);
+      if (identityId === 0n) return false;
+      return await isShardingTableMember(identityId);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Tag a Core keep-alive in the peerStore — so libp2p's connection manager
+   * maintains + auto-redials it (mirrors the relay keep-alive path in
+   * `core/node.ts`) — then dial it via the existing resolve+dial path.
+   * Returns true on a successful dial.
+   */
+  private async pinAndDialWarmCore(peerIdStr: string, ctx: OperationContext): Promise<boolean> {
+    const shortPeer = peerIdStr.slice(-8);
+    try {
+      const { peerIdFromString } = await import('@libp2p/peer-id');
+      const peerId = peerIdFromString(peerIdStr);
+      await this.node.libp2p.peerStore.merge(peerId, {
+        tags: { [WARM_CORE_KEEPALIVE_TAG]: { value: 100 } },
+      });
+      await this.connectToPeerId(peerIdStr, { timeoutMs: WARM_CORE_DIAL_TIMEOUT_MS });
+      this.log.info(ctx, `warm-core: pinned + dialed ${shortPeer}`);
+      return true;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.log.info(ctx, `warm-core: pin/dial ${shortPeer} failed (retry next tick): ${message}`);
+      return false;
+    }
+  }
+
+  /**
    * Reconnect-on-gossip: ensure we have a live libp2p path to the sender of
    * a gossip message we just received. GossipSub delivers messages signed by
    * their original publisher, so `from` is the author regardless of how many
@@ -3451,6 +3622,9 @@ export class DKGAgent {
     contextGraphIds: string[],
     onPhase?: PhaseCallback,
     onAccessDenied?: (contextGraphId: string) => void,
+    // Phase C — optional gap-safe per-CG delta high-water mark resolver. Backed
+    // by a CONTIGUOUS watermark when supplied; omitted ⇒ full scan (default).
+    sinceBatchIdFor?: (contextGraphId: string) => string | undefined,
   ): Promise<DurableSyncResult> {
     const ctx = createOperationContext('sync');
     return runDurableSync({
@@ -3461,6 +3635,7 @@ export class DKGAgent {
       onAccessDenied,
       createContextGraphSyncDeadline: this.createContextGraphSyncDeadline.bind(this),
       fetchSyncPages: this.fetchSyncPages.bind(this),
+      sinceBatchIdFor,
       processDurableBatchInWorker: this.processDurableBatchInWorker.bind(this),
       storeInsert: (quads) => this.store.insert(quads),
       deleteCheckpoint: (key) => this.syncCheckpoints.delete(key),
@@ -3484,6 +3659,7 @@ export class DKGAgent {
     graphUri: string,
     deadline: number,
     snapshotRef?: string,
+    sinceBatchId?: string,
   ): Promise<SyncPageResult> {
     return fetchSyncPages({
       ctx,
@@ -3493,6 +3669,7 @@ export class DKGAgent {
       phase,
       graphUri,
       snapshotRef,
+      sinceBatchId,
       deadline,
       syncPageTimeoutMs: SYNC_PAGE_TIMEOUT_MS,
       syncRouterAttempts: SYNC_ROUTER_ATTEMPTS,
@@ -3716,6 +3893,11 @@ export class DKGAgent {
       ).values()],
       preferredPeerId,
       isPrivateContextGraph,
+    );
+    const coreCount = peers.filter((p) => this.knownCorePeerIds.has(p.toString())).length;
+    this.log.info(
+      ctx,
+      `catchup peer order for "${contextGraphId}": preferred=${preferredPeerId ?? 'none'} cores=${coreCount} total=${peers.length}`,
     );
     return this.runCatchupOverPeers(contextGraphId, includeSharedMemory, peers);
   }
@@ -4011,7 +4193,7 @@ export class DKGAgent {
     preferredPeerId?: string,
     privateOnly = false,
   ): Array<{ toString(): string }> {
-    return orderCatchupPeers(peers, preferredPeerId, privateOnly);
+    return orderCatchupPeers(peers, preferredPeerId, privateOnly, this.knownCorePeerIds);
   }
 
   private async resolvePreferredSyncPeerId(contextGraphId: string): Promise<string | undefined> {
@@ -4091,7 +4273,11 @@ export class DKGAgent {
     const store = this.config.contextGraphSubscriptionStore;
     if (!store) return;
     const sub = this.subscribedContextGraphs.get(contextGraphId);
-    if (!sub?.subscribed) {
+    // Persist member subscriptions AND (Phase D) public CGs this Core hosts —
+    // the host-only record MUST survive restart so a Core that was offline
+    // during a publish remembers it hosts the CG and fills its gap. Drop the
+    // row only when the node neither subscribes to nor hosts the CG.
+    if (!sub?.subscribed && !sub?.coreHosted) {
       void store.delete(contextGraphId).catch((err) => {
         this.log.warn(
           createOperationContext('system'),
@@ -4108,6 +4294,9 @@ export class DKGAgent {
       sharedMemorySynced: sub.sharedMemorySynced,
       metaSynced: sub.metaSynced,
       onChainId: sub.onChainId,
+      onChainHash: sub.onChainHash,
+      lastReconciledOrdinal: sub.lastReconciledOrdinal,
+      coreHosted: sub.coreHosted,
       syncScoped: (this.config.syncContextGraphs ?? []).includes(contextGraphId),
     }).catch((err) => {
       this.log.warn(
@@ -4193,6 +4382,9 @@ export class DKGAgent {
           sharedMemorySynced: row.sharedMemorySynced,
           metaSynced: row.metaSynced,
           onChainId: row.onChainId,
+          onChainHash: row.onChainHash,
+          lastReconciledOrdinal: row.lastReconciledOrdinal,
+          coreHosted: row.coreHosted,
         }, { persist: false });
       }
       for (const row of rows) {
@@ -11997,6 +12189,326 @@ export class DKGAgent {
   }
 
   /**
+   * Phase D — resolve the on-chain access policy for a numeric CG id, public(0)
+   * / curated(1) / unknown(null). Cache-first (the StorageACK `isCgCurated`
+   * oracle seeds the same cache), single lazy chain read on miss. Never throws.
+   */
+  private async resolveAccessPolicy(numericCgId: bigint): Promise<0 | 1 | null> {
+    const key = numericCgId.toString();
+    const cached = this.onChainAccessPolicyCache.get(key);
+    if (cached === 0 || cached === 1) return cached;
+    const getAccessPolicy = this.chain.getContextGraphAccessPolicy;
+    if (typeof getAccessPolicy !== 'function') return null;
+    try {
+      const policy = await getAccessPolicy.call(this.chain, numericCgId);
+      if (policy === 0 || policy === 1) {
+        this.onChainAccessPolicyCache.set(key, policy);
+        return policy;
+      }
+    } catch { /* unknown — fall through */ }
+    return null;
+  }
+
+  /**
+   * Phase D (Cores fill their own gaps) — invoked from the StorageACK
+   * pre-sign hook. When this Core signs an ACK for a PUBLIC CG it becomes a
+   * storage node for it; mark the CG `coreHosted` (persisted) so the
+   * chain-driven VM reconciler runs for it across restarts even without a
+   * member subscription. A Core that was offline during the *next* publish
+   * then learns the missed KA from chain on restart and pulls it core-first.
+   *
+   * Public-only by design: curated CGs are hosted as opaque ciphertext, which
+   * a Core cannot promote to plaintext VM — their coverage stays on the
+   * host-mode reconciler + LU-11 chunk-backfill path. Best-effort + idempotent.
+   */
+  private async recordCoreHostedPublicCg(cgId: string, swmGraphId?: string): Promise<void> {
+    if (!this.vmReconcileEnabled()) return;
+    let numeric: bigint;
+    try {
+      numeric = BigInt(cgId);
+    } catch {
+      return; // non-numeric id can't be reconciled against the chain ordinal list
+    }
+    if (numeric <= 0n) return;
+
+    const policy = await this.resolveAccessPolicy(numeric);
+    if (policy !== 0) return; // curated / unknown — not the public VM-promote path
+
+    const numericStr = numeric.toString();
+    // Pick the local CG id to key the host-only record under. Prefer an
+    // existing local mapping; otherwise use the publisher-supplied cleartext
+    // `swmGraphId` (the local CG name for a public/cleartext publish). On the
+    // FIRST ACK for a CG we only host (never subscribed to),
+    // `resolveLocalCgIdByOnChainId()` is still empty — falling back to the
+    // numeric id would persist the row under `did:dkg:context-graph:<numeric>`,
+    // a namespace that doesn't hold the hosted SWM snapshot, so after restart
+    // the reconciler + active-fetch would sync/promote against the wrong graph
+    // and miss the KA this core already ACKed. The cleartext hint keeps the
+    // row under the same id the reconciler uses. Numeric/empty hints are
+    // ignored (last-resort numericStr keeps legacy behaviour).
+    const cleartextHint = swmGraphId && swmGraphId !== numericStr && !/^\d+$/.test(swmGraphId)
+      ? swmGraphId
+      : undefined;
+    const localCgId = this.resolveLocalCgIdByOnChainId(numeric) ?? cleartextHint ?? numericStr;
+    const existing = this.subscribedContextGraphs.get(localCgId);
+    if (existing?.coreHosted && existing.onChainId === numericStr) return; // already recorded
+
+    const next: ContextGraphSub = existing
+      ? { ...existing, coreHosted: true, onChainId: numericStr }
+      : { subscribed: false, synced: false, onChainId: numericStr, coreHosted: true };
+    this.setContextGraphSubscription(localCgId, next);
+    this.log.info(
+      createOperationContext('system'),
+      `Phase D: marked public cg=${numericStr} as core-hosted (will chain-reconcile to VM across restarts)`,
+    );
+    // Nudge a reconcile now so the first hosted publish lands promptly; the
+    // periodic sweep is the safety net.
+    if (this.reconcileCoalescer) void this.reconcileCoalescer.trigger(localCgId);
+  }
+
+  // ===== Phase B — chain-driven VM reconciliation (B.4 agent wiring) =========
+
+  /**
+   * Phase E/F — emit one reconciliation telemetry event. Logs a structured
+   * `chain-promote` line (grep surface) and forwards to the optional ops-metrics
+   * sink (Phase F). Best-effort: never throws, never awaits the sink.
+   */
+  private emitReplication(ev: Omit<ReplicationEvent, 'ts'>): void {
+    const event: ReplicationEvent = { ts: Date.now(), ...ev };
+    const parts = [
+      `chain-promote action=${event.action}`,
+      `cg=${event.contextGraphId}`,
+      event.onChainCgId ? `onChainCg=${event.onChainCgId}` : '',
+      event.ordinal !== undefined ? `ordinal=${event.ordinal}` : '',
+      event.kaId ? `ka=${event.kaId}` : '',
+      event.fromWatermark !== undefined && event.toWatermark !== undefined ? `cursor=${event.fromWatermark}->${event.toWatermark}` : '',
+      event.head !== undefined ? `head=${event.head}` : '',
+      event.reconciled !== undefined ? `reconciled=${event.reconciled}` : '',
+      event.pending !== undefined ? `pending=${event.pending}` : '',
+      event.ual ? `ual=${event.ual}` : '',
+      event.detail ? `detail="${event.detail}"` : '',
+    ].filter(Boolean);
+    this.log.info(createOperationContext('system'), parts.join(' '));
+    const sink = this.config.onReplicationEvent;
+    if (sink) {
+      try {
+        sink(event);
+      } catch (err) {
+        this.log.warn(createOperationContext('system'), `onReplicationEvent sink threw: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+  }
+
+  /**
+   * True iff the chain adapter exposes the per-CG registration-ordinal reads
+   * the reconciler needs. Gates the live nudge, the sweep timer, and the
+   * coalescer so non-V10 / no-chain nodes pay nothing.
+   */
+  private vmReconcileEnabled(): boolean {
+    return (
+      this.chain.chainId !== 'none' &&
+      typeof this.chain.getContextGraphKCCount === 'function' &&
+      typeof this.chain.getContextGraphKCAt === 'function' &&
+      typeof this.chain.getLatestMerkleRoot === 'function'
+    );
+  }
+
+  /**
+   * Trigger a coalesced reconcile sweep for every subscribed CG that has an
+   * on-chain id. Used by the periodic timer + the startup prime. Per-CG work is
+   * single-flighted by {@link reconcileCoalescer} so overlapping ticks (or a
+   * burst of live nudges) collapse into one sweep per CG.
+   */
+  private async runVmReconcileSweep(): Promise<void> {
+    if (!this.vmReconcileEnabled() || !this.reconcileCoalescer) return;
+    for (const [localCgId, sub] of this.subscribedContextGraphs) {
+      // Member subscriptions AND Phase D core-hosted public CGs get swept.
+      if ((!sub.subscribed && !sub.coreHosted) || !sub.onChainId) continue;
+      void this.reconcileCoalescer.trigger(localCgId);
+    }
+  }
+
+  /**
+   * One reconcile pass for a single CG: build the injected deps and hand off to
+   * the pure {@link reconcileContextGraph} orchestrator (which owns the cursor
+   * math + watermark persistence gate). The cursor is created lazily from the
+   * persisted `lastReconciledOrdinal` and lives in {@link reconcileCursors}.
+   */
+  private async runVmReconcileForCg(localCgId: string): Promise<void> {
+    const sub = this.subscribedContextGraphs.get(localCgId);
+    if ((!sub?.subscribed && !sub?.coreHosted) || !sub.onChainId || !this.vmReconcileEnabled()) return;
+    const onChainCgId = BigInt(sub.onChainId);
+
+    let cursor = this.reconcileCursors.get(localCgId);
+    if (!cursor) {
+      cursor = createCursorState(sub.lastReconciledOrdinal ?? 0);
+      this.reconcileCursors.set(localCgId, cursor);
+    }
+
+    const deps: ChainReconcilerDeps = {
+      getKCCount: async (cg) => Number(await this.chain.getContextGraphKCCount!(cg)),
+      getHeadBlock: async () => {
+        if (typeof this.chain.getBlockNumber !== 'function') return undefined;
+        try {
+          return await this.chain.getBlockNumber();
+        } catch {
+          return undefined;
+        }
+      },
+      reconcileOrdinal: (lcg, ocg, ordinal, headBlock) =>
+        this.reconcileChainOrdinal(lcg, ocg, ordinal, headBlock),
+      persistWatermark: (lcg, watermark) => {
+        const s = this.subscribedContextGraphs.get(lcg);
+        if (!s) return;
+        const previous = s.lastReconciledOrdinal ?? 0;
+        s.lastReconciledOrdinal = watermark;
+        this.persistContextGraphSubscription(lcg);
+        this.emitReplication({
+          contextGraphId: lcg,
+          onChainCgId: s.onChainId,
+          action: 'cursor-advance',
+          fromWatermark: previous,
+          toWatermark: watermark,
+        });
+      },
+      confirmationDepth: DKGAgent.VM_RECONCILE_CONFIRMATION_DEPTH,
+      log: (msg) => this.log.info(createOperationContext('system'), msg),
+    };
+
+    try {
+      const result = await reconcileContextGraph(deps, cursor, localCgId, onChainCgId);
+      if (result.reconciled > 0 || result.pending > 0) {
+        this.emitReplication({
+          contextGraphId: localCgId,
+          onChainCgId: sub.onChainId,
+          action: 'sweep',
+          head: result.head,
+          toWatermark: result.watermark,
+          reconciled: result.reconciled,
+          pending: result.pending,
+        });
+      }
+      // Phase D — a host-only (non-member) reconcile that actually promoted KAs
+      // is a Core filling its own gap. Distinct telemetry so operators can see
+      // the Core-to-Core fill path working (success-criteria metric).
+      if (result.reconciled > 0 && sub.coreHosted && !sub.subscribed) {
+        this.emitReplication({
+          contextGraphId: localCgId,
+          onChainCgId: sub.onChainId,
+          action: 'core-fill',
+          head: result.head,
+          toWatermark: result.watermark,
+          reconciled: result.reconciled,
+        });
+      }
+    } catch (err) {
+      this.log.warn(
+        createOperationContext('system'),
+        `VM reconcile for "${localCgId}" failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  /**
+   * Reconcile a single per-CG registration ordinal: resolve the kaId + its
+   * latest on-chain merkle root + publisher, build the UAL, and ask the
+   * finalization handler to promote the matching local SWM snapshot to VM
+   * (verifying the CG binding from chain). When no local SWM matches, run an
+   * active core-first catch-up fetch and retry once. `headBlock` is reused as
+   * the materialization version AND echoed back as the cursor observation block
+   * (reorg gate). See {@link OrdinalOutcome} for the status contract.
+   */
+  private async reconcileChainOrdinal(
+    localCgId: string,
+    onChainCgId: bigint,
+    ordinal: number,
+    headBlock: number | undefined,
+  ): Promise<OrdinalOutcome> {
+    const ctx = createOperationContext('system');
+    const versionBlock = headBlock ?? 0;
+
+    let kaId: bigint;
+    let merkleRoot: Uint8Array;
+    let publisherAddress: string;
+    let ual: string;
+    try {
+      kaId = await this.chain.getContextGraphKCAt!(onChainCgId, BigInt(ordinal));
+      const storageAddr = this.chain.getDKGKnowledgeAssetsAddress
+        ? await this.chain.getDKGKnowledgeAssetsAddress()
+        : undefined;
+      if (!storageAddr) return { status: 'skip' };
+      ual = buildKnowledgeAssetUal(this.chain.chainId, storageAddr, kaId);
+
+      // Recently reconciled (live-burst guard): treat as already-done so the
+      // cursor advances without redoing chain reads + an SWM scan.
+      if (this.recentReconciledUals.has(ual)) return { status: 'already', blockNumber: versionBlock };
+
+      merkleRoot = await this.chain.getLatestMerkleRoot!(kaId);
+      publisherAddress = (this.chain.getLatestMerkleRootPublisher
+        ? await this.chain.getLatestMerkleRootPublisher(kaId)
+        : '') ?? '';
+    } catch (err) {
+      // RPC lag / unknown kaId — leave for the next sweep.
+      this.log.info(ctx, `Phase B: ordinal ${ordinal} of cg ${onChainCgId} not resolvable yet: ${err instanceof Error ? err.message : String(err)}`);
+      return { status: 'pending' };
+    }
+
+    const fh = this.getOrCreateFinalizationHandler();
+    const reconcileInput = {
+      contextGraphId: localCgId,
+      onChainCgId: onChainCgId.toString(),
+      ual,
+      merkleRoot,
+      publisherAddress,
+      kaId,
+      versionBlock,
+    };
+
+    let outcome = await fh.handleChainReconciledKC(reconcileInput, ctx);
+    if (outcome === 'no-swm') {
+      // Active fetch: pull the missing snapshot core-first (selectCatchupPeers
+      // already prioritises known cores + the preferred sync peer), then retry.
+      this.emitReplication({
+        contextGraphId: localCgId, onChainCgId: onChainCgId.toString(),
+        action: 'fetch', ordinal, kaId: kaId.toString(), ual,
+      });
+      try {
+        await this.syncContextGraphFromConnectedPeers(localCgId, { includeSharedMemory: true });
+      } catch (err) {
+        this.log.info(ctx, `Phase B: active fetch for "${localCgId}" (ordinal ${ordinal}) failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      outcome = await fh.handleChainReconciledKC(reconcileInput, ctx);
+    }
+
+    switch (outcome) {
+      case 'promoted':
+        this.recentReconciledUals.add(ual);
+        this.emitReplication({
+          contextGraphId: localCgId, onChainCgId: onChainCgId.toString(),
+          action: 'promote', ordinal, kaId: kaId.toString(), ual,
+        });
+        return { status: 'reconciled', blockNumber: versionBlock };
+      case 'already-confirmed':
+      case 'stale-target':
+        // Already in VM (or a newer update is) — done for cursor purposes.
+        this.recentReconciledUals.add(ual);
+        this.emitReplication({
+          contextGraphId: localCgId, onChainCgId: onChainCgId.toString(),
+          action: 'already', ordinal, kaId: kaId.toString(), ual,
+        });
+        return { status: 'already', blockNumber: versionBlock };
+      case 'no-swm':
+      case 'unverified':
+      default:
+        this.emitReplication({
+          contextGraphId: localCgId, onChainCgId: onChainCgId.toString(),
+          action: 'defer', ordinal, kaId: kaId.toString(), ual, detail: outcome,
+        });
+        return { status: 'pending' };
+    }
+  }
+
+  /**
    * OT-RFC-39 — build the per-tick auto-backfill closure handed to the
    * Random Sampling prover via {@link bindRandomSampling}. The closure
    * is invoked when `extractCiphertextChunksFromStore` reports
@@ -12440,7 +12952,7 @@ export class DKGAgent {
   }>> {
     const ctx = createOperationContext('share');
     const explicitPeers = options?.peers;
-    const candidates: string[] = (() => {
+    const rawCandidates: string[] = (() => {
       if (explicitPeers && explicitPeers.length > 0) return [...new Set(explicitPeers)];
       const connections = this.node.libp2p.getConnections();
       const seen = new Set<string>();
@@ -12450,6 +12962,16 @@ export class DKGAgent {
       }
       return [...seen];
     })();
+    // Contact reliable Core hosts first. This serial loop still reaches
+    // every candidate, but Cores first means faster time-to-first-data
+    // and a better resume-seqno baseline before any flaky edge is tried.
+    const candidates = orderCatchupPeers(rawCandidates, undefined, false, this.knownCorePeerIds)
+      .map((p) => p.toString());
+    const coreCount = candidates.filter((id) => this.knownCorePeerIds.has(id)).length;
+    this.log.info(
+      ctx,
+      `host-catchup peer order for "${contextGraphId}": cores=${coreCount} total=${candidates.length}`,
+    );
     const results: Array<{
       peerId: string;
       rounds: number;
@@ -17898,6 +18420,8 @@ export class DKGAgent {
         requesterAgentAddress: parsed.requesterAgentAddress,
         requesterSignatureR: parsed.requesterSignatureR,
         requesterSignatureVS: parsed.requesterSignatureVS,
+        // Phase C: unsigned delta hint. Validated/normalised in the responder.
+        sinceBatchId: typeof parsed.sinceBatchId === 'string' ? parsed.sinceBatchId : undefined,
       };
     }
 
@@ -17910,6 +18434,13 @@ export class DKGAgent {
     const includeSharedMemory = ctxGraphPart.startsWith('workspace:');
     const contextGraphId = includeSharedMemory ? ctxGraphPart.slice('workspace:'.length) : (ctxGraphPart || SYSTEM_CONTEXT_GRAPHS.AGENTS);
     const phase = normalizeSyncPhase(parts[3]);
+    // Phase C: locate a trailing `|since|<n>` keyed token (position-independent
+    // so it survives the optional phase suffix). Old encoders never emit it.
+    let sinceBatchId: string | undefined;
+    const sinceIdx = parts.indexOf('since');
+    if (sinceIdx >= 0 && sinceIdx + 1 < parts.length && /^\d+$/.test(parts[sinceIdx + 1])) {
+      sinceBatchId = parts[sinceIdx + 1];
+    }
     return {
       contextGraphId,
       offset: parseInt(parts[1], 10) || 0,
@@ -17917,6 +18448,7 @@ export class DKGAgent {
       includeSharedMemory,
       phase,
       snapshotRef: phase === 'snapshot' ? parts[4] : undefined,
+      sinceBatchId,
     };
   }
 
@@ -17991,6 +18523,7 @@ export class DKGAgent {
     responderPeerId: string,
     phase: SyncPhase = 'data',
     snapshotRef?: string,
+    sinceBatchId?: string,
   ): Promise<Uint8Array> {
     const isPrivate = await this.isPrivateContextGraph(contextGraphId);
 
@@ -18011,6 +18544,11 @@ export class DKGAgent {
       requesterPeerId: this.peerId,
       phase,
       snapshotRef,
+      // Phase C: only forwarded for the durable DATA phase — SWM has no
+      // `dkg:batchId` (pre-chain) and meta must never be narrowed. The hint
+      // is gap-safe only when it comes from a CONTIGUOUS watermark, so it is
+      // supplied explicitly by callers, never auto-derived from local MAX().
+      sinceBatchId: phase === 'data' && !includeSharedMemory ? sinceBatchId : undefined,
       needsAuth,
       computeSyncDigest: this.computeSyncDigest.bind(this),
       getIdentityId: () => this.chain.getIdentityId(),
@@ -20402,6 +20940,14 @@ export class DKGAgent {
     if (this.syncReconcilerTimer) {
       clearInterval(this.syncReconcilerTimer);
       this.syncReconcilerTimer = null;
+    }
+    if (this.warmCoreTimer) {
+      clearInterval(this.warmCoreTimer);
+      this.warmCoreTimer = null;
+    }
+    if (this.vmReconcileTimer) {
+      clearInterval(this.vmReconcileTimer);
+      this.vmReconcileTimer = null;
     }
     if (this.messengerOutboxTimer) {
       clearInterval(this.messengerOutboxTimer);

@@ -55,6 +55,7 @@ function makeAgentLike(opts: {
   // bind both so `this.readLiveOnChainAccessPolicy` / `this.raceChainPolicyRead`
   // exist on the harness.
   agentLike.readLiveOnChainAccessPolicy = (DKGAgent.prototype as any).readLiveOnChainAccessPolicy;
+  agentLike.localCgMatchesOnChainSlot = (DKGAgent.prototype as any).localCgMatchesOnChainSlot;
   agentLike.raceChainPolicyRead = (DKGAgent.prototype as any).raceChainPolicyRead;
   return agentLike;
 }

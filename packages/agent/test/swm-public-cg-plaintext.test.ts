@@ -20,9 +20,17 @@
  * probe-poisoned after a devnet reset / partial registration.
  */
 import { describe, it, expect, vi } from 'vitest';
+import { ethers } from 'ethers';
 import { DKGAgent } from '../src/dkg-agent.js';
 
 type Policy = 0 | 1;
+
+// Deterministic on-chain wire id (committed name-hash) for a cleartext CG id —
+// mirrors the agent's keccak256(utf8(id)) / hex-passthrough derivation.
+const wireId = (cgId: string): string =>
+  /^0x[0-9a-fA-F]{64}$/.test(cgId)
+    ? cgId.toLowerCase()
+    : ethers.keccak256(ethers.toUtf8Bytes(cgId)).toLowerCase();
 
 function makeAgentLike(opts: {
   onChainId?: string | null;
@@ -37,6 +45,12 @@ function makeAgentLike(opts: {
   // is registered & live; `false` → unknown / stale / not live; `'absent'` →
   // the probe isn't implemented (older chain adapter); Error → the probe throws.
   activeOnChain?: boolean | 'absent' | Error;
+  // chain.getContextGraphNameHash — the on-chain committed identity anchor used
+  // by the local-mapping identity binding. When OMITTED the getter is absent
+  // (binding is a no-op: identity can't be disproven → proceeds to liveness).
+  // Provide a hex string to assert a specific committed name-hash, or `null`
+  // to simulate the curator opting out of the on-chain commitment.
+  onChainNameHash?: string | null;
 } = {}) {
   const log = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
   const chain: Record<string, unknown> = {};
@@ -52,6 +66,9 @@ function makeAgentLike(opts: {
       // Default true: a registered, live slot. Tests opt out with `false`.
       return opts.activeOnChain ?? true;
     });
+  }
+  if ('onChainNameHash' in opts) {
+    chain.getContextGraphNameHash = vi.fn(async (_id: bigint) => opts.onChainNameHash ?? null);
   }
   // The store resolver (resolveWorkspaceAgentRecipients) is the only consumer
   // of store.query on these paths; an empty result → no allowlist → it returns
@@ -72,6 +89,7 @@ function makeAgentLike(opts: {
   };
   // Bind the prototype methods under test so `this` resolves to agentLike.
   agentLike.isContextGraphPublicOnChain = (DKGAgent.prototype as any).isContextGraphPublicOnChain;
+  agentLike.localCgMatchesOnChainSlot = (DKGAgent.prototype as any).localCgMatchesOnChainSlot;
   agentLike.readLiveOnChainAccessPolicy = (DKGAgent.prototype as any).readLiveOnChainAccessPolicy;
   agentLike.raceChainPolicyRead = (DKGAgent.prototype as any).raceChainPolicyRead;
   agentLike.resolveWorkspaceRecipientsGated = (DKGAgent.prototype as any).resolveWorkspaceRecipientsGated;
@@ -97,15 +115,59 @@ describe('DKGAgent.isContextGraphPublicOnChain', () => {
     expect(agentLike.onChainAccessPolicyCache.get('1')).toBe(1);
   });
 
-  it('uses the cached policy without an extra access-policy RPC (still proves liveness)', async () => {
-    // The cache only short-circuits the POLICY read; the live-on-chain proof
-    // always runs first, so a probe-poisoned default-0 for an unregistered id
-    // can never be served from cache (that id would not be live).
+  it('does NOT trust a stale access-policy cache for the downgrade — reads FRESH (#884 review GZEqI)', async () => {
+    // A value cached as public (0) on a prior devnet must NOT force a CG that
+    // is now private onto the plaintext path. After the liveness proof the
+    // policy is read FRESH from chain: cache says 0, chain says 1 (private) →
+    // fail closed. The fresh value also replaces the stale cache entry.
     const cache = new Map<string, number>([['1', 0]]);
     const agentLike = makeAgentLike({ onChainId: '1', cache, accessPolicy: 1 });
-    await expect(isPublic(agentLike)).resolves.toBe(true);
+    await expect(isPublic(agentLike)).resolves.toBe(false);
     expect(agentLike.chain.isContextGraphActiveOnChain).toHaveBeenCalledWith(1n);
+    expect(agentLike.chain.getContextGraphAccessPolicy).toHaveBeenCalledWith(1n);
+    expect(agentLike.onChainAccessPolicyCache.get('1')).toBe(1);
+  });
+
+  it('IDENTITY-BINDS a locally-resolved id: on-chain name-hash MATCHES → public (#884 review GZEqF)', async () => {
+    // The local mapping resolves cgId → on-chain id 5; the slot's committed
+    // name-hash matches this CG's deterministic wire id, proving slot 5 still
+    // IS this CG, so the live public policy is honored.
+    const cgId = '0xCURATOR/experimental-music';
+    const agentLike = makeAgentLike({ onChainId: '5', accessPolicy: 0, onChainNameHash: wireId(cgId) });
+    await expect(isPublic(agentLike, cgId)).resolves.toBe(true);
+    expect(agentLike.chain.getContextGraphNameHash).toHaveBeenCalledWith(5n);
+  });
+
+  it('fails closed when the locally-resolved slot commits a DIFFERENT name-hash (stale/reused slot) (#884 review GZEqF)', async () => {
+    // After a devnet reset, the persisted mapping cgId → 5 points at a slot now
+    // occupied by an UNRELATED public CG. Its committed name-hash differs from
+    // this CG's wire id → stale mapping → fail closed BEFORE reading policy.
+    const cgId = '0xCURATOR/experimental-music';
+    const agentLike = makeAgentLike({ onChainId: '5', accessPolicy: 0, onChainNameHash: wireId('0xOTHER/unrelated-cg') });
+    await expect(isPublic(agentLike, cgId)).resolves.toBe(false);
     expect(agentLike.chain.getContextGraphAccessPolicy).not.toHaveBeenCalled();
+    expect(agentLike.log.warn).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.stringContaining('STALE'),
+    );
+  });
+
+  it('proceeds (liveness-only) when the curator opted out of the on-chain name-hash (#884 review GZEqF)', async () => {
+    // No committed name-hash (null) → identity can't be disproven → additive
+    // binding does NOT add a new failure; the live public policy still wins.
+    const cgId = '0xCURATOR/experimental-music';
+    const agentLike = makeAgentLike({ onChainId: '5', accessPolicy: 0, onChainNameHash: null });
+    await expect(isPublic(agentLike, cgId)).resolves.toBe(true);
+    expect(agentLike.chain.getContextGraphAccessPolicy).toHaveBeenCalledWith(5n);
+  });
+
+  it('does NOT identity-bind a BARE-NUMERIC id (caller addresses the slot directly) (#884 review GZEqF)', async () => {
+    // share('42') is the caller explicitly naming on-chain slot 42 — there is
+    // no local CG identity to re-bind, so name-hash binding is skipped even if
+    // a (mismatching) commitment exists. Liveness + fresh policy still gate it.
+    const agentLike = makeAgentLike({ onChainId: null, accessPolicy: 0, onChainNameHash: wireId('mismatch') });
+    await expect(isPublic(agentLike, '42')).resolves.toBe(true);
+    expect(agentLike.chain.getContextGraphNameHash).not.toHaveBeenCalled();
   });
 
   it('fails closed (false) when the on-chain id cannot be resolved', async () => {

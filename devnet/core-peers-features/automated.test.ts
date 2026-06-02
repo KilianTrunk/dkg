@@ -123,6 +123,17 @@ function readNodePids(num: number): number[] {
   return pids;
 }
 
+/** Remove a node's pid files. After a manual SIGKILL the files still hold the
+ *  now-dead PIDs; `devnet.sh restart-node` trusts them and could signal an
+ *  unrelated process if the OS recycled a PID before the restart. Clear them
+ *  so the restart starts from a clean slate. */
+function clearNodePidFiles(num: number): void {
+  for (const f of ['daemon.pid', 'devnet.pid']) {
+    const pidf = join(DEVNET_DIR, `node${num}`, f);
+    try { if (existsSync(pidf)) rmSync(pidf); } catch { /* best-effort */ }
+  }
+}
+
 // ───────────────────────────── HTTP helpers ──────────────────────────────
 function request(
   method: 'GET' | 'POST',
@@ -397,15 +408,18 @@ describe('Phase D — Cores host public CGs and fill their own gaps', () => {
     // ciphertext host-mode path), so this is also the public-detection proof.
   }, 120_000);
 
-  it('a hosting core offline during a publish fills its gap from chain on restart', async () => {
-    // Phase D targets a core that HOSTS a public CG (`core_hosted=1`). We
-    // isolate the PURE host-only case (`core_hosted=1, subscribed=0`) so the
-    // fill can ONLY come from the coreHosted reconcile path. On this devnet
-    // every core that signs a StorageACK for a public CG is ALSO auto-subscribed
-    // to it, so a host-only core doesn't occur naturally — we MANUFACTURE one by
-    // calling the unsubscribe endpoint (drops live gossip + sync scope, keeps
-    // `coreHosted`). That removes the finalization gossip fast-path, so the
-    // missed publish below can only be recovered via the chain reconcile sweep.
+  it('a core offline during a publish fills its gap from chain on restart (core-fill)', async () => {
+    // Phase D needs a PURE host-only victim (`core_hosted=1, subscribed=0`) so
+    // the fill can ONLY come from the coreHosted reconcile path — a member-
+    // subscriber would refill via its ordinary subscriber reconcile even if
+    // `coreHosted` were broken, so only a pure host proves the host-only
+    // recovery. On this devnet every core that signs a StorageACK for a public
+    // CG is ALSO auto-subscribed to it, so a host-only core doesn't occur
+    // naturally — we MANUFACTURE one by calling the unsubscribe endpoint (drops
+    // live gossip + sync scope, keeps `coreHosted`). That removes the
+    // finalization gossip fast-path, so the missed publish below can only be
+    // recovered via the chain reconcile sweep. (node1 is the publisher/curator;
+    // the other cores ACK as hosts.)
     const candidates = CORE_NODES.filter((n) => n !== 1);
     const picked = await waitFor(
       'a hosting core (core_hosted=1) for CONTEXT_GRAPH',
@@ -459,13 +473,9 @@ describe('Phase D — Cores host public CGs and fill their own gaps', () => {
     await waitFor(`node${victim} offline`, 45_000, 1_000, async () =>
       (await nodeReachable(victimNode)) ? null : true,
     );
-    // Clear the now-stale pid files before restart: `devnet.pid` holds the
-    // long-exited launcher PID and `daemon.pid` the worker we just SIGKILLed.
-    // `restart-node` trusts these files, so a recycled PID could make it signal
-    // an unrelated process. Removing them forces a clean start.
-    for (const f of ['daemon.pid', 'devnet.pid']) {
-      rmSync(join(DEVNET_DIR, `node${victim}`, f), { force: true });
-    }
+    // Stale pid files now hold dead PIDs — clear them so `restart-node` can't
+    // signal a recycled PID.
+    clearNodePidFiles(victim);
 
     // 2. Publish a fresh KA to the CG from node1 while the victim is down.
     const pub = await publishFromCore(nodes[1]!, 'gap');
@@ -481,19 +491,16 @@ describe('Phase D — Cores host public CGs and fill their own gaps', () => {
       (await nodeReachable(victimNode)) ? true : null,
     );
 
-    // 4. The victim must fill its gap FROM CHAIN after restart. We require BOTH:
-    //      (i)  the missed triple is in the victim's verified-memory (it could
-    //           NOT have received it over gossip — it was confirmed offline
-    //           during the publish), AND
+    // 4. The victim must fill its gap FROM CHAIN after restart. Because it was
+    //    made pure host-only (subscribed=0, core_hosted=1) above, the missed KA
+    //    can ONLY reach its verified-memory via the Phase D host-fill path — a
+    //    subscriber reconcile could not have produced it. We require BOTH:
+    //      (i)  the missed triple is in the victim's verified-memory, AND
     //      (ii) chain-path evidence that the reconciler delivered THIS specific
     //           KA after restart — a `fetch`/`promote`/`core-fill` replication
     //           event for this ka id, or a `chain-promote action=…` daemon.log
     //           line naming it. This rules out a coincidental non-chain path.
     //    `already` is NOT accepted (it means the KA was present pre-restart).
-    //    The victim was made pure host-only (subscribed=0, core_hosted=1) above,
-    //    so the coreHosted reconcile path drives the fill — `core-fill` may now
-    //    fire, but `fetch`/`promote` for this ka is equally valid chain-path
-    //    evidence (the reconciler emits the active-fetch + promote either way).
     expect(pub.kaId, 'gap publish did not report a KC ID — cannot pin chain-path evidence').toBeTruthy();
     const kaId = pub.kaId!;
     const chainActions = new Set(['fetch', 'promote', 'core-fill']);

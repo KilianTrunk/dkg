@@ -352,39 +352,32 @@ export function registerSyncHandler(params: RegisterSyncHandlerParams): void {
         // the prefix prevents `mfacts` from matching `mfacts-2`.
         const metaGraphScope = (g: string): string =>
           `FILTER(STRSTARTS(STR(${g}), "${cgUriPrefix}/") && STRENDS(STR(${g}), "/_meta"))`;
-        // Normalise BOTH the batchId PLACEMENT and the LITERAL FORM so legacy
-        // replicated data isn't silently mis-filtered:
-        //   * Placement — newer data carries `dkg:batchId` on the KC/UAL, but
-        //     older shapes put it on the KA itself; match either via UNION, or
-        //     a KA-placed batchId would be invisible here and its rows would be
-        //     treated as un-keyed (always re-sent — safe but defeats the delta).
-        //   * Literal form — newer data is typed `xsd:integer`, legacy data is
-        //     an untyped string. A raw `?bid > "n"^^xsd:integer` errors against
-        //     an untyped `"5"`, so the row would be WRONGLY HIDDEN from the
-        //     delta. `xsd:integer(STR(?bid))` coerces both forms before compare.
-        const XSD_INT = 'http://www.w3.org/2001/XMLSchema#integer';
-        const batchIdEither = (ka: string, ual: string, bid: string): string =>
-          `{ ${ual} <${DKG_NS}batchId> ${bid} } UNION { ${ka} <${DKG_NS}batchId> ${bid} }`;
+        // Bind ?bid<sfx> to the batchId of the KC owning subject ?s, tolerant of
+        // the legacy shapes the rest of the agent also falls back on (see
+        // `getBatchMerkleRoot` in dkg-agent.ts): the canonical placement on the
+        // KC (`?kc dkg:batchId`) AND a legacy placement directly on the KA
+        // (`?ka dkg:batchId`). Either typed (`"5"^^xsd:integer`) or untyped
+        // (`"5"`) literals are accepted — the comparison below coerces via
+        // xsd:integer(STR(...)) so an untyped literal isn't silently skipped by
+        // a typed `>` comparison (which would resend stale rows or, in the
+        // NOT-EXISTS arm, hide eligible ones).
+        const batchIdOfSubject = (sfx: string): string => `
+                GRAPH ?mg${sfx} {
+                  ${metaGraphScope('?mg' + sfx)}
+                  ?ka${sfx} <${DKG_NS}partOf> ?ual${sfx} ; <${DKG_NS}rootEntity> ?re${sfx} .
+                  FILTER(?re${sfx} = ?s || STRSTARTS(STR(?s), CONCAT(STR(?re${sfx}), "/.well-known/genid/")))
+                  { ?ual${sfx} <${DKG_NS}batchId> ?bid${sfx} }
+                  UNION
+                  { ?ka${sfx} <${DKG_NS}batchId> ?bid${sfx} }
+                }`;
         const deltaFilter = sinceBatchId != null
           ? `
             FILTER(
-              NOT EXISTS {
-                GRAPH ?mgAny {
-                  ${metaGraphScope('?mgAny')}
-                  ?kaAny <${DKG_NS}partOf> ?ualAny ; <${DKG_NS}rootEntity> ?reAny .
-                  ${batchIdEither('?kaAny', '?ualAny', '?bidAny')}
-                  FILTER(?reAny = ?s || STRSTARTS(STR(?s), CONCAT(STR(?reAny), "/.well-known/genid/")))
-                }
+              NOT EXISTS {${batchIdOfSubject('Any')}
               }
               ||
-              EXISTS {
-                GRAPH ?mgNew {
-                  ${metaGraphScope('?mgNew')}
-                  ?kaNew <${DKG_NS}partOf> ?ualNew ; <${DKG_NS}rootEntity> ?reNew .
-                  ${batchIdEither('?kaNew', '?ualNew', '?bidNew')}
-                  FILTER(?reNew = ?s || STRSTARTS(STR(?s), CONCAT(STR(?reNew), "/.well-known/genid/")))
-                  FILTER(<${XSD_INT}>(STR(?bidNew)) > "${sinceBatchId.toString()}"^^<${XSD_INT}>)
-                }
+              EXISTS {${batchIdOfSubject('New')}
+                FILTER(<http://www.w3.org/2001/XMLSchema#integer>(STR(?bidNew)) > ${sinceBatchId.toString()})
               }
             )`
           : '';

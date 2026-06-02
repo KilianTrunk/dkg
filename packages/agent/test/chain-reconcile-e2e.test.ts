@@ -44,6 +44,21 @@ async function seedSwmSnapshot(store: OxigraphStore, entity: string, value: stri
   );
 }
 
+/**
+ * Seed the durable per-root `keepRootCopyOnLabel` signal the publisher writes
+ * into SWM workspace meta at publish time (the chain-driven path's equivalent
+ * of the gossip envelope flag). `FinalizationHandler.getKeepRootCopySignal`
+ * reads it back to decide the same-graph dual-write during reconcile.
+ */
+async function seedKeepRootSignal(store: OxigraphStore, entity: string, keep: boolean): Promise<void> {
+  await store.insert([{
+    subject: entity,
+    predicate: 'http://dkg.io/ontology/keepRootCopyOnLabel',
+    object: `"${keep}"`,
+    graph: contextGraphWorkspaceMetaGraphUri(LOCAL_CG),
+  }]);
+}
+
 /** Faithful mirror of DKGAgent.reconcileChainOrdinal (minus the active fetch). */
 function makeReconcileOrdinal(
   store: OxigraphStore,
@@ -167,19 +182,21 @@ describe('Phase B e2e — chain registration -> VM via the sweep', () => {
     expect(await isInVm(store, 'urn:fact:1', 'Bananas are berries')).toBe(true);
   });
 
-  it('dual-writes a same-graph reconcile to the root label graph (mirrors gossip keepRootCopyOnLabel)', async () => {
+  it('dual-writes a same-graph reconcile to the root label graph when keepRootCopyOnLabel is persisted', async () => {
     const store = new OxigraphStore();
     const chain = new MockChainAdapter();
     const fh = new FinalizationHandler(store, chain);
 
-    // A plain same-graph publish (no subGraphName): the SWM snapshot lives
-    // under THIS CG, whose chain binding is ON_CHAIN_CG. The merkle-verified
-    // match proves same-graph, so reconcile must mirror the gossip path's
-    // `keepRootCopyOnLabel` dual-write — landing the quad in BOTH the per-cgId
-    // VM graph and the root `did:dkg:context-graph:<cg>` label graph so that
-    // label-scoped (`agent.query(label)`) reads resolve on a node that only
-    // ever recovered via chain reconcile.
-    const root = await seedSwmSnapshot(store, 'urn:fact:dw', 'A bolt of lightning is hotter than the sun');
+    // A plain same-graph publish (no subGraphName) that persisted the durable
+    // `keepRootCopyOnLabel=true` signal into SWM workspace meta. The reconcile
+    // sweep recovers that signal and mirrors the gossip path's dual-write —
+    // landing the quad in BOTH the per-cgId VM graph and the root
+    // `did:dkg:context-graph:<cg>` label graph so label-scoped
+    // (`agent.query(label)`) reads resolve on a node that only ever recovered
+    // via chain reconcile.
+    const value = 'A bolt of lightning is hotter than the sun';
+    const root = await seedSwmSnapshot(store, 'urn:fact:dw', value);
+    await seedKeepRootSignal(store, 'urn:fact:dw', true);
     chain.__registerKC({ kaId: 301n, contextGraphId: ON_CHAIN_CG, merkleRootHex: ethers.hexlify(root), chunks: [] });
 
     const persisted: number[] = [];
@@ -189,7 +206,31 @@ describe('Phase B e2e — chain registration -> VM via the sweep', () => {
     const res = await reconcileContextGraph(deps, cursor, LOCAL_CG, ON_CHAIN_CG);
 
     expect(res.reconciled).toBe(1);
-    expect(await isInVm(store, 'urn:fact:dw', 'A bolt of lightning is hotter than the sun')).toBe(true);
-    expect(await isInRootLabel(store, 'urn:fact:dw', 'A bolt of lightning is hotter than the sun')).toBe(true);
+    expect(await isInVm(store, 'urn:fact:dw', value)).toBe(true);
+    expect(await isInRootLabel(store, 'urn:fact:dw', value)).toBe(true);
+  });
+
+  it('does NOT dual-write to the root label graph when no keep-root signal is persisted', async () => {
+    const store = new OxigraphStore();
+    const chain = new MockChainAdapter();
+    const fh = new FinalizationHandler(store, chain);
+
+    // Same shape as above but WITHOUT the persisted signal (legacy publish /
+    // remap). The reconcile path must stay per-cgId only — never re-add a root
+    // copy a remap deliberately dropped — so the VM graph holds the KA while
+    // the root label graph does not.
+    const value = 'Octopuses have three hearts';
+    const root = await seedSwmSnapshot(store, 'urn:fact:nodw', value);
+    chain.__registerKC({ kaId: 302n, contextGraphId: ON_CHAIN_CG, merkleRootHex: ethers.hexlify(root), chunks: [] });
+
+    const persisted: number[] = [];
+    const deps = makeDeps(store, chain, fh, persisted);
+    const cursor = createCursorState(0);
+
+    const res = await reconcileContextGraph(deps, cursor, LOCAL_CG, ON_CHAIN_CG);
+
+    expect(res.reconciled).toBe(1);
+    expect(await isInVm(store, 'urn:fact:nodw', value)).toBe(true);
+    expect(await isInRootLabel(store, 'urn:fact:nodw', value)).toBe(false);
   });
 });

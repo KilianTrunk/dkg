@@ -40,18 +40,34 @@ export interface WarmCoreAgent {
   peerId: string;
   nodeRole?: string;
   agentAddress?: string;
+  /** ISO-8601 `dkg:lastSeen` from the phonebook, when known. */
+  lastSeen?: string;
+}
+
+/** Parse an ISO-8601 `lastSeen` to epoch ms; 0 when absent/unparseable. */
+function lastSeenMs(iso?: string): number {
+  if (!iso) return 0;
+  const t = Date.parse(iso);
+  return Number.isNaN(t) ? 0 : t;
 }
 
 /**
  * From the phonebook agent list, the Cores worth warm-pinning: role
- * `core`, not ourselves, de-duplicated by peerId. Input order is preserved
- * (callers may pre-sort by `lastSeen`); the per-tick cap is applied later
- * in `reconcileWarmCoreConnections` so it counts *gated* Cores, not raw
- * candidates.
+ * `core`, not ourselves, de-duplicated by peerId.
+ *
+ * The phonebook (`discovery.findAgents()`) is unordered and freshness-blind,
+ * but `reconcileWarmCoreConnections` only pins up to `maxCores`. So this
+ * function ranks **freshest-first** by `lastSeen` and (when `staleThresholdMs`
+ * + `nowMs` are supplied) drops Cores we can prove are stale — otherwise the
+ * capped set would be an arbitrary slice that churns between ticks and keeps
+ * dialing long-dead registry entries forever. Cores without a parseable
+ * `lastSeen` are kept (freshness unknown) and, because the sort is stable,
+ * retain their relative phonebook order behind any timestamped Cores.
  */
 export function selectWarmCoreCandidates(
   agents: WarmCoreAgent[],
   selfPeerId: string,
+  opts?: { nowMs?: number; staleThresholdMs?: number },
 ): WarmCoreAgent[] {
   const seen = new Set<string>();
   const out: WarmCoreAgent[] = [];
@@ -62,7 +78,19 @@ export function selectWarmCoreCandidates(
     seen.add(agent.peerId);
     out.push(agent);
   }
-  return out;
+  const nowMs = opts?.nowMs;
+  const staleThresholdMs = opts?.staleThresholdMs;
+  const filtered =
+    nowMs !== undefined && staleThresholdMs !== undefined
+      ? out.filter((a) => {
+          const ls = lastSeenMs(a.lastSeen);
+          // ls === 0 → unknown freshness, keep it; otherwise must be recent.
+          return ls === 0 || nowMs - ls <= staleThresholdMs;
+        })
+      : out;
+  // Stable freshest-first sort (Array.prototype.sort is stable since ES2019),
+  // so equal/unknown freshness preserves phonebook order.
+  return filtered.sort((a, b) => lastSeenMs(b.lastSeen) - lastSeenMs(a.lastSeen));
 }
 
 export interface WarmCoreDeps {
@@ -72,6 +100,13 @@ export interface WarmCoreDeps {
   selfPeerId: string;
   /** Upper bound on simultaneously pinned Cores (slot-exhaustion guard). */
   maxCores: number;
+  /**
+   * When set, Cores whose `lastSeen` is older than this many ms are dropped
+   * before the `maxCores` cap, so we don't keep redialing dead registry
+   * entries. Cores without a `lastSeen` are kept. Production wires this to
+   * `AGENT_PROFILE_STALE_THRESHOLD_MS`.
+   */
+  staleThresholdMs?: number;
   /**
    * Trust gate: resolve true if this Core may be pinned. Production wires
    * this to `getIdentityIdForAddress(addr) -> isShardingTableMember(id)`.
@@ -128,7 +163,10 @@ export async function reconcileWarmCoreConnections(
   // `warm-core` topic is carried in the log message itself.
   const ctx = createOperationContext('sync');
   const agents = await deps.findCoreAgents();
-  const candidates = selectWarmCoreCandidates(agents, deps.selfPeerId);
+  const candidates = selectWarmCoreCandidates(agents, deps.selfPeerId, {
+    nowMs: Date.now(),
+    staleThresholdMs: deps.staleThresholdMs,
+  });
 
   const warmed = new Set<string>();
   let dialed = 0;
@@ -145,12 +183,14 @@ export async function reconcileWarmCoreConnections(
 
     // Pin BEFORE the connected-check so an already-connected Core still gets
     // (and keeps) its keep-alive tag — otherwise libp2p won't auto-redial it.
-    // Only claim the slot when the pin actually succeeded: a malformed peer id
-    // or a `peerStore.merge` failure must fall through to the next healthy
-    // candidate instead of burning a `maxCores` slot on a peer we never tagged
-    // (and never dialed).
-    const pinned = await deps.pin(core.peerId, ctx).then(() => true).catch(() => false);
-    if (!pinned) continue;
+    // A pin failure (malformed peerId, peerStore.merge error) must NOT consume
+    // a warm slot or be reported as pinned: skip to the next candidate so a
+    // healthy Core can take the slot.
+    let pinOk = true;
+    await deps.pin(core.peerId, ctx).catch(() => {
+      pinOk = false;
+    });
+    if (!pinOk) continue;
     warmed.add(core.peerId);
 
     if (deps.isConnected(core.peerId)) continue;

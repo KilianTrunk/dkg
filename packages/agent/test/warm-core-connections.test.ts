@@ -25,6 +25,36 @@ describe('selectWarmCoreCandidates', () => {
   it('returns empty when there are no cores', () => {
     expect(selectWarmCoreCandidates([{ peerId: 'e', nodeRole: 'edge' }], 'self')).toEqual([]);
   });
+
+  it('ranks freshest-first by lastSeen; unknown freshness sorts last (stable)', () => {
+    const now = Date.parse('2026-06-02T00:00:00Z');
+    const agents: WarmCoreAgent[] = [
+      { peerId: 'old', nodeRole: 'core', lastSeen: '2026-06-01T06:00:00Z' },
+      { peerId: 'noTs', nodeRole: 'core' }, // unknown freshness
+      { peerId: 'fresh', nodeRole: 'core', lastSeen: '2026-06-01T23:00:00Z' },
+    ];
+    expect(
+      selectWarmCoreCandidates(agents, 'self', {
+        nowMs: now,
+        staleThresholdMs: 24 * 60 * 60 * 1000,
+      }).map((a) => a.peerId),
+    ).toEqual(['fresh', 'old', 'noTs']);
+  });
+
+  it('drops cores staler than the threshold but keeps those without a lastSeen', () => {
+    const now = Date.parse('2026-06-02T00:00:00Z');
+    const agents: WarmCoreAgent[] = [
+      { peerId: 'stale', nodeRole: 'core', lastSeen: '2026-05-01T00:00:00Z' }, // ~1mo old
+      { peerId: 'noTs', nodeRole: 'core' },
+      { peerId: 'fresh', nodeRole: 'core', lastSeen: '2026-06-01T23:00:00Z' },
+    ];
+    expect(
+      selectWarmCoreCandidates(agents, 'self', {
+        nowMs: now,
+        staleThresholdMs: 24 * 60 * 60 * 1000,
+      }).map((a) => a.peerId),
+    ).toEqual(['fresh', 'noTs']);
+  });
 });
 
 /** Build deps with sensible spies; override per test. */
@@ -120,6 +150,29 @@ describe('reconcileWarmCoreConnections', () => {
     const { deps } = makeDeps({ dial: async () => false });
     const res = await reconcileWarmCoreConnections(deps);
     expect(res).toMatchObject({ pinned: 2, dialed: 0 });
+  });
+
+  it('does not consume a slot for a core whose pin throws; frees it for the next', async () => {
+    // Regression: a pin failure (malformed peerId / peerStore.merge error) must
+    // not be counted as pinned or eat a maxCores slot — a healthy core takes it.
+    const localPinned: string[] = [];
+    const { deps, dialed } = makeDeps({
+      maxCores: 2,
+      findCoreAgents: async () => [
+        { peerId: 'bad', nodeRole: 'core', agentAddress: '0x1' },
+        { peerId: 'core2', nodeRole: 'core', agentAddress: '0x2' },
+        { peerId: 'core3', nodeRole: 'core', agentAddress: '0x3' },
+      ],
+      pin: async (peerId) => {
+        if (peerId === 'bad') throw new Error('peerStore.merge failed');
+        localPinned.push(peerId);
+      },
+    });
+    const res = await reconcileWarmCoreConnections(deps);
+    expect(res.pinned).toBe(2); // 'bad' not counted; core2 + core3 fill the 2 slots
+    expect(localPinned).toEqual(['core2', 'core3']);
+    expect(dialed).toEqual(['core2', 'core3']); // 'bad' never dialed
+    expect([...res.warmed].sort()).toEqual(['core2', 'core3']);
   });
 
   it('unpins cores that were warm last pass but are no longer selected', async () => {

@@ -22,6 +22,14 @@ const DKG_NS = 'http://dkg.io/ontology/';
 import { ethers } from 'ethers';
 
 /**
+ * Predicate for the durable per-root keep-root-copy signal the publisher
+ * persists into SWM workspace meta at publish time (the chain-driven
+ * reconcile path's equivalent of the gossip envelope's `keepRootCopyOnLabel`).
+ * Shared with `DKGAgent` so the write and read sites can't drift.
+ */
+export const KEEP_ROOT_COPY_PREDICATE = `${DKG_NS}keepRootCopyOnLabel`;
+
+/**
  * Resolves a local context-graph id (the topic/CG name used in gossip) to
  * its on-chain numeric id. Returns `null`/`undefined` for CGs that aren't
  * registered on-chain. Used as a fallback when a peer-finalization gossip
@@ -326,6 +334,53 @@ export class FinalizationHandler {
     return roots;
   }
 
+  /**
+   * Recover the publisher's `keepRootCopyOnLabel` decision for these roots from
+   * SWM workspace meta. The publisher persists `<root> dkg:keepRootCopyOnLabel
+   * "true"|"false"` at publish time — the durable equivalent of the gossip
+   * envelope flag — and it replicates to subscribers alongside the per-root
+   * `privateMerkleRoot`. Returns:
+   *   - `true`      — a matched root explicitly kept the root-label copy,
+   *   - `false`     — explicitly dropped (remap / explicit-subCG publish),
+   *   - `undefined` — no signal persisted (legacy publish); the caller defaults
+   *                   to per-cgId-only so a dropped root copy is never re-added.
+   * An explicit `true` wins over `false` across the matched roots: a same-graph
+   * publish demands the root copy exist.
+   */
+  private async getKeepRootCopySignal(
+    contextGraphId: string,
+    rootEntities: string[],
+    subGraphName?: string,
+  ): Promise<boolean | undefined> {
+    const graphManager = new GraphManager(this.store);
+    const wsMetaGraph = subGraphName
+      ? graphManager.sharedMemoryMetaUri(contextGraphId, subGraphName)
+      : contextGraphWorkspaceMetaGraphUri(contextGraphId);
+    const safeRoots = rootEntities.filter(isSafeIri);
+    if (safeRoots.length === 0) return undefined;
+
+    const values = safeRoots.map(r => `<${r}>`).join(' ');
+    const sparql = `SELECT ?v WHERE {
+      GRAPH <${assertSafeIri(wsMetaGraph)}> {
+        VALUES ?root { ${values} }
+        ?root <${KEEP_ROOT_COPY_PREDICATE}> ?v .
+      }
+    }`;
+    try {
+      const result = await this.store.query(sparql);
+      if (result.type !== 'bindings' || result.bindings.length === 0) return undefined;
+      let sawFalse = false;
+      for (const row of result.bindings) {
+        const v = String(row['v']).replace(/^"(.*)".*$/, '$1');
+        if (v === 'true') return true;
+        if (v === 'false') sawFalse = true;
+      }
+      return sawFalse ? false : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
   private async getPublisherPeerIdFromMeta(contextGraphId: string, rootEntities: string[], subGraphName?: string): Promise<string | undefined> {
     const graphManager = new GraphManager(this.store);
     const wsMetaGraph = subGraphName
@@ -554,36 +609,19 @@ export class FinalizationHandler {
     const resolvedSubGraphName = snapshot.subGraphName ?? subGraphName;
 
     const finalizationVersion: MaterializedVersion = { blockNumber: versionBlock, txIndex: 0 };
-    // Mirror the gossip-path dual-write decision
-    // (`isDualWrite = keepRootCopyOnLabel && ctxGraphId && !subGraphName`) for
-    // the chain-reconcile path. We can't read the publisher's
-    // `keepRootCopyOnLabel` wire flag here (no gossip), and it can't be
-    // persisted at share-time either — the SWM share happens BEFORE the
-    // publish, so the remap decision (`publishContextGraphId`, which sets
-    // `keepRootCopyOnLabel = !publishContextGraphId`) isn't known yet when the
-    // WorkspaceOperation meta is written. Stamping it post-publish on the
-    // publisher's local meta wouldn't reach this node anyway — the node we're
-    // serving is precisely one that MISSED the finalization gossip.
-    //
-    // Instead we DERIVE it, and the derivation is exact (not the unsafe
-    // "root-workspace publish ⇒ always dual-write" approximation):
-    //   * `keepRootCopyOnLabel` is true iff the publish was SAME-GRAPH (no
-    //     remap). A same-graph publish shares its SWM snapshot under THIS CG,
-    //     whose on-chain binding is `onChainCgId`. A REMAP publish shares its
-    //     snapshot under the SOURCE CG and registers the KA to a DIFFERENT
-    //     on-chain id — so `findSwmSnapshotForMerkleRoot(contextGraphId, …)`,
-    //     which searches only the CG resolved from `onChainCgId`, would NOT
-    //     match and we'd have returned `no-swm` above. Reaching this line with
-    //     a merkle-VERIFIED snapshot therefore proves a same-graph publish,
-    //     i.e. `keepRootCopyOnLabel === true`.
-    //   * `!!ctxGraphId` and `!resolvedSubGraphName` are the same two gates the
-    //     gossip branch applies, evaluated against the data we have in hand.
-    // The result is a node that converges to the IDENTICAL graph state as one
-    // that received the finalization gossip — no divergence, no double-count
-    // (a remap never dual-writes here because it never finds its snapshot).
-    // Tier 2 (GH#919) removes dual-write entirely by resolving label reads
-    // through the CG registry, retiring this derivation along with the rest.
-    const isDualWrite = !!ctxGraphId && !resolvedSubGraphName;
+    // Same-graph publishes dual-write the root `<cg>` label copy so label-scoped
+    // reads (`agent.query(<cg label>)`) resolve. The gossip path learns this
+    // from `keepRootCopyOnLabel` on the wire; the chain-driven path has no wire,
+    // so the publisher persists the same decision into SWM workspace meta (which
+    // replicates to subscribers alongside `privateMerkleRoot`). Recover it here
+    // and mirror the gossip dual-write decision, so a subscriber that missed the
+    // broadcast and recovers via the sweep still gets the root-label copy.
+    // Absent (legacy publish, no persisted signal) → false: stay per-cgId only,
+    // so a remap publish's deliberately-dropped root copy is never re-added.
+    const keepRootCopyOnLabel = await this.getKeepRootCopySignal(
+      contextGraphId, rootEntities, resolvedSubGraphName,
+    );
+    const isDualWrite = keepRootCopyOnLabel === true && !!ctxGraphId && !resolvedSubGraphName;
     const defaultMeta = `did:dkg:context-graph:${contextGraphId}/_meta`;
 
     const outcome = await this.applyVerifiedFinalization({

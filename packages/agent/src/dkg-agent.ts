@@ -12093,7 +12093,9 @@ export class DKGAgent {
       event.reconciled !== undefined ? `reconciled=${event.reconciled}` : '',
       event.pending !== undefined ? `pending=${event.pending}` : '',
       event.ual ? `ual=${event.ual}` : '',
-      event.detail ? `detail="${event.detail}"` : '',
+      // JSON-encode `detail` so embedded quotes/newlines can't break the
+      // structured `key=value` log line or inject bogus key/value fragments.
+      event.detail ? `detail=${JSON.stringify(event.detail)}` : '',
     ].filter(Boolean);
     this.log.info(createOperationContext('system'), parts.join(' '));
     const sink = this.config.onReplicationEvent;

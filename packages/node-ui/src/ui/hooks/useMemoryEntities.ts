@@ -79,7 +79,6 @@ export interface MemoryData {
 }
 
 const RDF_TYPE = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type';
-const SKOLEM_GENID_SEGMENT = '/.well-known/genid/';
 
 function bv(v: unknown): string | undefined {
   if (v == null) return undefined;
@@ -103,9 +102,7 @@ function isUri(s: string): boolean {
 export function canonicalEntityUri(uri: string): string {
   const trimmed = uri.trim();
   if (trimmed.startsWith('"')) return trimmed;
-  const unwrapped = trimmed.startsWith('<') && trimmed.endsWith('>') ? trimmed.slice(1, -1) : trimmed;
-  const skolemIndex = unwrapped.indexOf(SKOLEM_GENID_SEGMENT);
-  return skolemIndex === -1 ? unwrapped : unwrapped.slice(0, skolemIndex);
+  return trimmed.startsWith('<') && trimmed.endsWith('>') ? trimmed.slice(1, -1) : trimmed;
 }
 
 function shortLabel(uri: string): string {

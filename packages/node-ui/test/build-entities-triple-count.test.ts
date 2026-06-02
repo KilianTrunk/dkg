@@ -251,12 +251,12 @@ describe('buildEntities — MemoryEntity.tripleCount', () => {
     expect(dual.tripleCount).toBe(1);
   });
 
-  it('collapses skolemized section subjects without rewriting literals containing the marker', () => {
+  it('keeps skolemized child resources inspectable without rewriting marker literals', () => {
     const root = 'urn:doc:markdown';
     const section = `${root}/.well-known/genid/section-1-intro`;
     const literal = '"see /.well-known/genid/a"';
 
-    expect(canonicalEntityUri(section)).toBe(root);
+    expect(canonicalEntityUri(section)).toBe(section);
     expect(canonicalEntityUri(literal)).toBe(literal);
 
     const entities = buildEntities([
@@ -265,10 +265,12 @@ describe('buildEntities — MemoryEntity.tripleCount', () => {
       triple(section, 'http://schema.org/description', literal, 'shared'),
     ]);
 
-    const entity = entities.get(root);
-    expect(entity).toBeDefined();
-    expect(entities.has(section)).toBe(false);
-    expect(isFirstClassEntity(entity!)).toBe(true);
-    expect(entity?.properties.get('http://schema.org/description')).toEqual(['see /.well-known/genid/a']);
+    const rootEntity = entities.get(root);
+    const sectionEntity = entities.get(section);
+    expect(rootEntity).toBeDefined();
+    expect(sectionEntity).toBeDefined();
+    expect(isFirstClassEntity(rootEntity!)).toBe(true);
+    expect(isFirstClassEntity(sectionEntity!)).toBe(true);
+    expect(sectionEntity?.properties.get('http://schema.org/description')).toEqual(['see /.well-known/genid/a']);
   });
 });

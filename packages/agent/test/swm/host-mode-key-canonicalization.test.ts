@@ -86,6 +86,10 @@ interface AgentInternals {
   swmHostModeStore?: SwmHostModeStore;
   swmHostModeSubscribed: Map<string, string>;
   swmHostModeHandlers: Map<string, unknown>;
+  wireIdToLocalCgId: Map<string, string>;
+  enqueueHostModePersistence(contextGraphId: string, subscribe: boolean): void;
+  awaitHostModePersistence(contextGraphId: string): Promise<void>;
+  hostModePersistenceStoreKey(rawCgId: string): string;
 }
 
 async function installHostModeStore(core: DKGAgent, dataDir: string): Promise<SwmHostModeStore> {
@@ -207,5 +211,68 @@ describe('host-mode bookkeeping key canonicalisation', () => {
 
     expect(internals.swmHostModeSubscribed.size).toBe(0);
     expect(internals.swmHostModeHandlers.size).toBe(0);
+  });
+
+  // PR #916 Codex review (commit `445a852`): the in-memory maps above
+  // canonicalize to the wire hash, but the PERSISTED `hostModeSubscribed`
+  // flag in the SwmHostModeStore is keyed by the CLEARTEXT id — the same
+  // form `append` / `markRegistered` / catchup use (see the
+  // `ingestSwmHostModeEnvelope` design note). `enqueueHostModePersistence`
+  // used to forward the raw caller id straight to
+  // `markHostModeSubscribed/Unsubscribed`, so a `mark` taken in one shape
+  // and an `unmark` in the other landed in different `.meta` files and
+  // the flag was never cleared — re-engaging a torn-down CG on restart.
+  // The fix resolves the store key to cleartext via the
+  // `wireIdToLocalCgId` reverse index while keeping the queue key
+  // wire-canonical for ordering.
+
+  it('hostModePersistenceStoreKey maps a known wire-hash to cleartext and leaves cleartext / unmapped hashes alone', async () => {
+    const { core } = await makeCore();
+    const internals = core as unknown as AgentInternals;
+    const cleartext = 'persist-key-unit-cg';
+    const wireHash = ethers.keccak256(ethers.toUtf8Bytes(cleartext)).toLowerCase();
+    internals.wireIdToLocalCgId.set(wireHash, cleartext);
+
+    expect(internals.hostModePersistenceStoreKey(wireHash)).toBe(cleartext);
+    expect(internals.hostModePersistenceStoreKey(cleartext)).toBe(cleartext);
+    // A valid wire-hash with no reverse-index entry falls back to a
+    // lowercased copy of itself (stable key for the pre-cleartext window).
+    const orphanHash = '0x' + 'AB'.repeat(32);
+    expect(internals.hostModePersistenceStoreKey(orphanHash)).toBe(orphanHash.toLowerCase());
+  });
+
+  it('persisted host-mode flag: mark by wire-hash then unmark by cleartext collapse onto one record', async () => {
+    const { core } = await makeCore();
+    const internals = core as unknown as AgentInternals;
+    const cleartext = 'persist-wire-then-clear-cg';
+    const wireHash = ethers.keccak256(ethers.toUtf8Bytes(cleartext)).toLowerCase();
+    internals.wireIdToLocalCgId.set(wireHash, cleartext);
+
+    // Beacon/chain auto-host engages by wire-hash.
+    internals.enqueueHostModePersistence(wireHash, true);
+    await internals.awaitHostModePersistence(wireHash);
+    expect(await internals.swmHostModeStore!.listHostModeSubscribedCgs()).toEqual([cleartext]);
+
+    // Promoted-to-member / revoke unwire arrives in cleartext — must
+    // clear the SAME record, not write an orphan one.
+    internals.enqueueHostModePersistence(cleartext, false);
+    await internals.awaitHostModePersistence(cleartext);
+    expect(await internals.swmHostModeStore!.listHostModeSubscribedCgs()).toEqual([]);
+  });
+
+  it('persisted host-mode flag: mark by cleartext then unmark by wire-hash collapse onto one record', async () => {
+    const { core } = await makeCore();
+    const internals = core as unknown as AgentInternals;
+    const cleartext = 'persist-clear-then-wire-cg';
+    const wireHash = ethers.keccak256(ethers.toUtf8Bytes(cleartext)).toLowerCase();
+    internals.wireIdToLocalCgId.set(wireHash, cleartext);
+
+    internals.enqueueHostModePersistence(cleartext, true);
+    await internals.awaitHostModePersistence(cleartext);
+    expect(await internals.swmHostModeStore!.listHostModeSubscribedCgs()).toEqual([cleartext]);
+
+    internals.enqueueHostModePersistence(wireHash, false);
+    await internals.awaitHostModePersistence(wireHash);
+    expect(await internals.swmHostModeStore!.listHostModeSubscribedCgs()).toEqual([]);
   });
 });

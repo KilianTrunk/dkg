@@ -10932,23 +10932,52 @@ export class DKGAgent {
    */
   private readonly hostModePersistenceQueues = new Map<string, Promise<void>>();
 
+  /**
+   * Resolve the on-disk store key for a host-mode persistence
+   * mutation. The {@link SwmHostModeStore} is cleartext-keyed by
+   * design (`append` / `iterate` / `markRegistered` all key off the
+   * cleartext id the gossip envelope carries — see
+   * {@link ingestSwmHostModeEnvelope}). The persisted
+   * `hostModeSubscribed` flag MUST use that same cleartext key so a
+   * `mark` taken in one id shape and a later `unmark` in the other
+   * (e.g. beacon/chain auto-host engages by wire-hash, then a
+   * promoted-to-member or curator-revoke unwire arrives in cleartext)
+   * collapse onto a single `.meta` file instead of leaving the flag
+   * stuck under an orphan key — which would re-engage a torn-down CG
+   * on the next restart. Wire-form (0x-hash) inputs are translated
+   * back through the {@link wireIdToLocalCgId} reverse index; an
+   * as-yet-unmapped hash falls back to itself.
+   */
+  private hostModePersistenceStoreKey(rawCgId: string): string {
+    if (/^0x[0-9a-fA-F]{64}$/.test(rawCgId)) {
+      const lower = rawCgId.toLowerCase();
+      return this.wireIdToLocalCgId.get(lower) ?? lower;
+    }
+    return rawCgId;
+  }
+
   private enqueueHostModePersistence(contextGraphId: string, subscribe: boolean): void {
     if (!this.swmHostModeStore) return;
+    // The in-memory queue stays wire-keyed so ordering dedups across
+    // id shapes (cleartext vs wire-hash for the same CG); the store
+    // mutation itself is cleartext-keyed via
+    // {@link hostModePersistenceStoreKey}.
     const queueKey = this.canonicalSwmHostModeKey(contextGraphId);
+    const storeCgId = this.hostModePersistenceStoreKey(contextGraphId);
     const store = this.swmHostModeStore;
     const op = subscribe ? 'mark' : 'unmark';
     const apply = async (): Promise<void> => {
       try {
         if (subscribe) {
-          await store.markHostModeSubscribed(contextGraphId);
+          await store.markHostModeSubscribed(storeCgId);
         } else {
-          await store.markHostModeUnsubscribed(contextGraphId);
+          await store.markHostModeUnsubscribed(storeCgId);
         }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         this.log.debug(
           createOperationContext('system'),
-          `Host-mode persistence (${op}) failed for "${contextGraphId}": ${msg}`,
+          `Host-mode persistence (${op}) failed for "${storeCgId}": ${msg}`,
         );
       }
     };

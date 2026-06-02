@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { DKGAgent } from '../src/index.js';
 import { MockChainAdapter } from '@origintrail-official/dkg-chain';
-import { PROTOCOL_SYNC, PROTOCOL_ACCESS } from '@origintrail-official/dkg-core';
+import { createOperationContext, PROTOCOL_SYNC, PROTOCOL_ACCESS } from '@origintrail-official/dkg-core';
 import { peerIdFromString } from '@libp2p/peer-id';
 import { runSyncOnConnect } from '../src/sync/on-connect/sync-on-connect.js';
 import type { OperationContext } from '@origintrail-official/dkg-core';
@@ -27,6 +27,12 @@ function freshPeerIdString(): string {
 }
 
 const noopLog = (_ctx: OperationContext, _message: string) => {};
+
+async function flushMicrotasks(): Promise<void> {
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+}
 
 describe('runSyncOnConnect callbacks', () => {
   it('fires onPeerSkippedNoSync when the peer does not advertise PROTOCOL_SYNC', async () => {
@@ -253,7 +259,7 @@ describe('DKGAgent sync retry — periodic reconciler', () => {
 
       await (agent as any).reconcileSyncFromConnectedPeers();
       // trySyncFromPeer is fire-and-forget inside the reconciler.
-      await new Promise(r => setTimeout(r, 50));
+      await flushMicrotasks();
 
       expect(calls.sort()).toEqual([peerA, peerB].sort());
     } finally {
@@ -289,7 +295,7 @@ describe('DKGAgent sync retry — periodic reconciler', () => {
       };
 
       await (agent as any).reconcileSyncFromConnectedPeers();
-      await new Promise(r => setTimeout(r, 50));
+      await flushMicrotasks();
 
       expect(calls).toEqual([stalePeer]);
     } finally {
@@ -322,7 +328,7 @@ describe('DKGAgent sync retry — periodic reconciler', () => {
       };
 
       await (agent as any).reconcileSyncFromConnectedPeers();
-      await new Promise(r => setTimeout(r, 50));
+      await flushMicrotasks();
 
       expect(calls).toEqual([]);
     } finally {
@@ -361,7 +367,7 @@ describe('DKGAgent sync retry — periodic reconciler', () => {
       // Tick 1: never synced → fires once and records failure #1.
       const t1 = Date.now();
       await (agent as any).reconcileSyncFromConnectedPeers();
-      await new Promise(r => setTimeout(r, 50));
+      await flushMicrotasks();
       expect(calls).toEqual([peerA]);
       const b1 = backoffMap.get(peerA)!;
       expect(b1.failures).toBe(1);
@@ -370,7 +376,7 @@ describe('DKGAgent sync retry — periodic reconciler', () => {
 
       // Tick 2 immediately: still inside the backoff window → skipped.
       await (agent as any).reconcileSyncFromConnectedPeers();
-      await new Promise(r => setTimeout(r, 50));
+      await flushMicrotasks();
       expect(calls).toEqual([peerA]);
       expect(backoffMap.get(peerA)!.failures).toBe(1);
 
@@ -379,7 +385,7 @@ describe('DKGAgent sync retry — periodic reconciler', () => {
       backoffMap.set(peerA, { failures: 1, nextRetryAt: Date.now() - 1 });
       const t2 = Date.now();
       await (agent as any).reconcileSyncFromConnectedPeers();
-      await new Promise(r => setTimeout(r, 50));
+      await flushMicrotasks();
       expect(calls).toEqual([peerA, peerA]);
       const b2 = backoffMap.get(peerA)!;
       expect(b2.failures).toBe(2);
@@ -415,7 +421,7 @@ describe('DKGAgent sync retry — periodic reconciler', () => {
       };
 
       await (agent as any).reconcileSyncFromConnectedPeers();
-      await new Promise(r => setTimeout(r, 0));
+      await flushMicrotasks();
       expect(calls).toEqual([peerA]);
 
       // Simulate connection:close winning the race before the
@@ -423,7 +429,7 @@ describe('DKGAgent sync retry — periodic reconciler', () => {
       connectedPeers = [];
       (agent as any).syncReconcilerBackoff.delete(peerA);
       resolveAttempt();
-      await new Promise(r => setTimeout(r, 50));
+      await flushMicrotasks();
 
       expect((agent as any).syncReconcilerBackoff.has(peerA)).toBe(false);
     } finally {
@@ -493,6 +499,39 @@ describe('DKGAgent sync transport — off the messenger substrate (node-ui.db bl
       // registered through the Messenger, so the assertion above is
       // meaningful and not vacuously true.
       expect(messengerHandlers.has(PROTOCOL_ACCESS)).toBe(true);
+    } finally {
+      await agent.stop().catch(() => {});
+    }
+  });
+
+  it('fetches sync pages via sendToPeer and never sendReliable', async () => {
+    const agent = await DKGAgent.create({
+      name: 'SyncRequesterOffSubstrate',
+      listenHost: '127.0.0.1',
+      chainAdapter: new MockChainAdapter(),
+    });
+    try {
+      const sendToPeer = vi.fn(async () => new Uint8Array(0));
+      const sendReliable = vi.fn(async () => {
+        throw new Error('sync requester must not use sendReliable');
+      });
+      (agent as any).messenger = { sendToPeer, sendReliable };
+      (agent as any).buildSyncRequest = vi.fn(async () => new Uint8Array([1, 2, 3]));
+
+      const result = await (agent as any).fetchSyncPages(
+        createOperationContext('sync'),
+        freshPeerIdString(),
+        'sync-requester-transport',
+        false,
+        'data',
+        'urn:dkg:test:data',
+        Date.now() + 5000,
+      );
+
+      expect(result.quads).toEqual([]);
+      expect(sendToPeer).toHaveBeenCalledTimes(1);
+      expect(sendToPeer.mock.calls[0][1]).toBe(PROTOCOL_SYNC);
+      expect(sendReliable).not.toHaveBeenCalled();
     } finally {
       await agent.stop().catch(() => {});
     }

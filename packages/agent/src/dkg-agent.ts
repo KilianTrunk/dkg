@@ -1197,6 +1197,9 @@ export class DKGAgent {
   private syncReconcilerTimer: ReturnType<typeof setInterval> | null = null;
   /** A.4-lite+: periodic warm/pinned Core-connection reconcile (opt-in). */
   private warmCoreTimer: ReturnType<typeof setInterval> | null = null;
+  /** Cores keep-alive-pinned on the last warm-core pass, so the next pass can
+   *  unpin Cores that fell out of the selection (stale-pin / cap-drift guard). */
+  private warmedCores: Set<string> = new Set();
   /**
    * v10-rc sync-refactor: per-(peer+CG) checkpoint offsets so the paged
    * sync requester in `sync/requester/page-fetch.ts` can resume where it
@@ -3465,7 +3468,7 @@ export class DKGAgent {
    */
   private async reconcileWarmCoreConnections(): Promise<void> {
     if (!this.started) return;
-    await reconcileWarmCoreConnections({
+    const result = await reconcileWarmCoreConnections({
       selfPeerId: this.node.libp2p.peerId.toString(),
       maxCores: WARM_CORE_MAX,
       findCoreAgents: async (): Promise<WarmCoreAgent[]> => {
@@ -3479,9 +3482,14 @@ export class DKGAgent {
       isShardingTableCore: (agentAddress) => this.isShardingTableCore(agentAddress),
       isConnected: (peerId) =>
         this.node.libp2p.getConnections().some((c) => c.remotePeer.toString() === peerId),
-      pinAndDial: (peerId, ctx) => this.pinAndDialWarmCore(peerId, ctx),
+      pin: (peerId) => this.pinWarmCore(peerId),
+      unpin: (peerId, ctx) => this.unpinWarmCore(peerId, ctx),
+      dial: (peerId, ctx) => this.dialWarmCore(peerId, ctx),
+      previouslyWarmed: this.warmedCores,
       log: (ctx, msg) => this.log.info(ctx, msg),
     });
+    // Carry the pinned set into the next tick so stale Cores get unpinned.
+    this.warmedCores = result.warmed;
   }
 
   /**
@@ -3495,7 +3503,12 @@ export class DKGAgent {
     const getIdentityIdForAddress = this.chain.getIdentityIdForAddress?.bind(this.chain);
     const isShardingTableMember = this.chain.isShardingTableMember?.bind(this.chain);
     if (!getIdentityIdForAddress || !isShardingTableMember) return true; // gate unavailable
-    if (!agentAddress) return false; // can't resolve identity without the operational wallet
+    // A legacy/mixed-version core profile may not carry an operational wallet.
+    // Discovery elsewhere supports profiles without `agentAddress`, so treat
+    // its absence as "gate unavailable" (fall back to phonebook nodeRole)
+    // rather than a hard denial — otherwise the warm set can collapse to zero
+    // in a network with healthy but pre-agentAddress cores.
+    if (!agentAddress) return true; // gate unavailable for this profile
     try {
       const identityId = await getIdentityIdForAddress(agentAddress);
       if (identityId === 0n) return false;
@@ -3508,23 +3521,50 @@ export class DKGAgent {
   /**
    * Tag a Core keep-alive in the peerStore — so libp2p's connection manager
    * maintains + auto-redials it (mirrors the relay keep-alive path in
-   * `core/node.ts`) — then dial it via the existing resolve+dial path.
-   * Returns true on a successful dial.
+   * `core/node.ts`). Idempotent; does NOT dial (see {@link dialWarmCore}).
    */
-  private async pinAndDialWarmCore(peerIdStr: string, ctx: OperationContext): Promise<boolean> {
+  private async pinWarmCore(peerIdStr: string): Promise<void> {
+    const { peerIdFromString } = await import('@libp2p/peer-id');
+    const peerId = peerIdFromString(peerIdStr);
+    await this.node.libp2p.peerStore.merge(peerId, {
+      tags: { [WARM_CORE_KEEPALIVE_TAG]: { value: 100 } },
+    });
+  }
+
+  /**
+   * Remove the warm-core keep-alive tag from a Core that fell out of the warm
+   * set, so the connection manager stops protecting/redialing it and the
+   * pinned count can't drift above WARM_CORE_MAX over time.
+   */
+  private async unpinWarmCore(peerIdStr: string, ctx: OperationContext): Promise<void> {
     const shortPeer = peerIdStr.slice(-8);
     try {
       const { peerIdFromString } = await import('@libp2p/peer-id');
       const peerId = peerIdFromString(peerIdStr);
+      // peerStore.merge deletes a tag whose value is `undefined`.
       await this.node.libp2p.peerStore.merge(peerId, {
-        tags: { [WARM_CORE_KEEPALIVE_TAG]: { value: 100 } },
+        tags: { [WARM_CORE_KEEPALIVE_TAG]: undefined },
       });
+      this.log.info(ctx, `warm-core: unpinned ${shortPeer} (no longer selected)`);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.log.info(ctx, `warm-core: unpin ${shortPeer} failed: ${message}`);
+    }
+  }
+
+  /**
+   * Dial a (pinned, not-yet-connected) Core via the existing resolve+dial
+   * path. Returns true on a successful dial.
+   */
+  private async dialWarmCore(peerIdStr: string, ctx: OperationContext): Promise<boolean> {
+    const shortPeer = peerIdStr.slice(-8);
+    try {
       await this.connectToPeerId(peerIdStr, { timeoutMs: WARM_CORE_DIAL_TIMEOUT_MS });
-      this.log.info(ctx, `warm-core: pinned + dialed ${shortPeer}`);
+      this.log.info(ctx, `warm-core: dialed ${shortPeer}`);
       return true;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      this.log.info(ctx, `warm-core: pin/dial ${shortPeer} failed (retry next tick): ${message}`);
+      this.log.info(ctx, `warm-core: dial ${shortPeer} failed (retry next tick): ${message}`);
       return false;
     }
   }

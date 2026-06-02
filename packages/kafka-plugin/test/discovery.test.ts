@@ -7,10 +7,13 @@ import {
 } from '../src/discovery.js';
 const META_URI = 'did:dkg:context-graph:urn:cg:demo/_meta';
 const DATA_URI = 'did:dkg:context-graph:urn:cg:demo';
+const PRIVATE_URI = 'did:dkg:context-graph:urn:cg:demo/_private';
 const SUBGRAPH_META_URI = 'did:dkg:context-graph:urn:cg:demo/streams/_meta';
 const SUBGRAPH_DATA_URI = 'did:dkg:context-graph:urn:cg:demo/streams';
+const SUBGRAPH_PRIVATE_URI = 'did:dkg:context-graph:urn:cg:demo/streams/_private';
 const STATUS = 'http://dkg.io/ontology/status';
 const SUBGRAPH_NAME = 'http://dkg.io/ontology/subGraphName';
+const PRIVATE_DATA_ANCHOR = 'http://dkg.io/ontology/privateDataAnchor';
 
 function expectConfirmedRootMetaScope(q: string): void {
   expect(q).toContain(`?ual <${STATUS}> "confirmed" .`);
@@ -37,14 +40,37 @@ describe('discovery — buildListQuery', () => {
         FILTER NOT EXISTS { ?ual <http://dkg.io/ontology/subGraphName> ?_subGraphName . }
         ?ual <http://dkg.io/ontology/publishedAt> ?receivedAt .
       }
-      GRAPH <${DATA_URI}> {
-        ?root a <https://ontology.dkg.io/streams#KafkaStream> .
+      {
+        GRAPH <${DATA_URI}> {
+          ?root a <https://ontology.dkg.io/streams#KafkaStream> .
+        }
+      }
+      UNION
+      {
+        GRAPH <${DATA_URI}> {
+          ?root <http://dkg.io/ontology/privateDataAnchor> "true" .
+        }
+        GRAPH <${PRIVATE_URI}> {
+          ?root a <https://ontology.dkg.io/streams#KafkaStream> .
+        }
       }
     }
     ORDER BY DESC(?receivedAt)
     LIMIT 30 OFFSET 0
   }
-  GRAPH <${DATA_URI}> { ?root ?p ?o . }
+  {
+    GRAPH <${DATA_URI}> {
+      ?root a <https://ontology.dkg.io/streams#KafkaStream> .
+      ?root ?p ?o .
+    }
+  }
+  UNION
+  {
+    GRAPH <${DATA_URI}> {
+      ?root <http://dkg.io/ontology/privateDataAnchor> "true" .
+    }
+    GRAPH <${PRIVATE_URI}> { ?root ?p ?o . }
+  }
 }
 ORDER BY DESC(?receivedAt) ?ual ?root ?p ?o`,
     );
@@ -62,7 +88,15 @@ ORDER BY DESC(?receivedAt) ?ual ?root ?p ?o`,
     });
     expect(q).toContain(`GRAPH <${META_URI}>`);
     expect(q).toContain(`GRAPH <${SUBGRAPH_DATA_URI}>`);
+    expect(q).toContain(`GRAPH <${SUBGRAPH_PRIVATE_URI}>`);
     expect(q).not.toContain(`GRAPH <${SUBGRAPH_META_URI}>`);
+    expect(q).not.toContain(`GRAPH <${PRIVATE_URI}>`);
+  });
+  it('lists private-default streams by joining public anchors to the private payload graph', () => {
+    const q = buildListQuery({ contextGraphId: 'urn:cg:demo', limit: 30, offset: 0 });
+    expect(q).toContain(`GRAPH <${DATA_URI}>`);
+    expect(q).toContain(`GRAPH <${PRIVATE_URI}>`);
+    expect(q).toContain(`?root <${PRIVATE_DATA_ANCHOR}> "true" .`);
   });
   it('only lists confirmed root-graph registrations when no subGraphName is configured', () => {
     const q = buildListQuery({ contextGraphId: 'urn:cg:demo', limit: 30, offset: 0 });
@@ -104,7 +138,14 @@ describe('discovery — buildCountQuery', () => {
     ?ual <http://dkg.io/ontology/status> "confirmed" .
     FILTER NOT EXISTS { ?ual <http://dkg.io/ontology/subGraphName> ?_subGraphName . }
   }
-  GRAPH <${DATA_URI}> { ?root a <https://ontology.dkg.io/streams#KafkaStream> . }
+  {
+    GRAPH <${DATA_URI}> { ?root a <https://ontology.dkg.io/streams#KafkaStream> . }
+  }
+  UNION
+  {
+    GRAPH <${DATA_URI}> { ?root <http://dkg.io/ontology/privateDataAnchor> "true" . }
+    GRAPH <${PRIVATE_URI}> { ?root a <https://ontology.dkg.io/streams#KafkaStream> . }
+  }
 }`,
     );
   });
@@ -118,7 +159,14 @@ describe('discovery — buildCountQuery', () => {
     });
     expect(q).toContain(`GRAPH <${META_URI}>`);
     expect(q).toContain(`GRAPH <${SUBGRAPH_DATA_URI}>`);
+    expect(q).toContain(`GRAPH <${SUBGRAPH_PRIVATE_URI}>`);
     expect(q).not.toContain(`GRAPH <${SUBGRAPH_META_URI}>`);
+    expect(q).not.toContain(`GRAPH <${PRIVATE_URI}>`);
+  });
+  it('counts private-default streams by joining public anchors to the private payload graph', () => {
+    const q = buildCountQuery({ contextGraphId: 'urn:cg:demo' });
+    expect(q).toContain(`GRAPH <${DATA_URI}> { ?root <${PRIVATE_DATA_ANCHOR}> "true" . }`);
+    expect(q).toContain(`GRAPH <${PRIVATE_URI}> { ?root a <https://ontology.dkg.io/streams#KafkaStream> . }`);
   });
   it('only counts confirmed root-graph registrations when no subGraphName is configured', () => {
     const q = buildCountQuery({ contextGraphId: 'urn:cg:demo' });
@@ -143,9 +191,21 @@ describe('discovery — buildSingleByUalQuery', () => {
     <did:dkg:1/0xabc> <http://dkg.io/ontology/status> "confirmed" .
     FILTER NOT EXISTS { <did:dkg:1/0xabc> <http://dkg.io/ontology/subGraphName> ?_subGraphName . }
   }
-  GRAPH <${DATA_URI}> {
-    ?root a <https://ontology.dkg.io/streams#KafkaStream> .
-    ?root ?p ?o .
+  {
+    GRAPH <${DATA_URI}> {
+      ?root a <https://ontology.dkg.io/streams#KafkaStream> .
+      ?root ?p ?o .
+    }
+  }
+  UNION
+  {
+    GRAPH <${DATA_URI}> {
+      ?root <http://dkg.io/ontology/privateDataAnchor> "true" .
+    }
+    GRAPH <${PRIVATE_URI}> {
+      ?root a <https://ontology.dkg.io/streams#KafkaStream> .
+      ?root ?p ?o .
+    }
   }
 }`,
     );
@@ -168,7 +228,15 @@ describe('discovery — buildSingleByUalQuery', () => {
     });
     expect(q).toContain(`GRAPH <${META_URI}>`);
     expect(q).toContain(`GRAPH <${SUBGRAPH_DATA_URI}>`);
+    expect(q).toContain(`GRAPH <${SUBGRAPH_PRIVATE_URI}>`);
     expect(q).not.toContain(`GRAPH <${SUBGRAPH_META_URI}>`);
+    expect(q).not.toContain(`GRAPH <${PRIVATE_URI}>`);
+  });
+  it('resolves private-default streams by joining public anchors to the private payload graph', () => {
+    const q = buildSingleByUalQuery({ contextGraphId: 'urn:cg:demo', ual: 'did:dkg:1/0xabc' });
+    expect(q).toContain(`GRAPH <${DATA_URI}>`);
+    expect(q).toContain(`GRAPH <${PRIVATE_URI}>`);
+    expect(q).toContain(`?root <${PRIVATE_DATA_ANCHOR}> "true" .`);
   });
   it('only resolves confirmed root-graph registrations when no subGraphName is configured', () => {
     const q = buildSingleByUalQuery({ contextGraphId: 'urn:cg:demo', ual: 'did:dkg:1/0xabc' });
@@ -259,6 +327,15 @@ describe('discovery — bindingsToKa decodes real N-Quads literal binding values
       { ual: 'did:dkg:1/0xabc', root: 'urn:entity:internal', p: 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type', o: 'https://ontology.dkg.io/streams#KafkaStream' },
     ]);
     expect(ka!['@id']).toBe('did:dkg:1/0xabc');
+  });
+  it('omits the internal private-data anchor marker from API JSON-LD', () => {
+    const ka = bindingsToKa([
+      { ual: 'did:dkg:1/0xabc', root: 'urn:entity:1', p: 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type', o: 'https://ontology.dkg.io/streams#KafkaStream' },
+      { ual: 'did:dkg:1/0xabc', root: 'urn:entity:1', p: PRIVATE_DATA_ANCHOR, o: '"true"' },
+      { ual: 'did:dkg:1/0xabc', root: 'urn:entity:1', p: 'https://schema.org/name', o: '"demo"' },
+    ]);
+    expect(ka!['schema:name']).toBe('demo');
+    expect(ka).not.toHaveProperty('dkg:privateDataAnchor');
   });
 });
 describe('discovery — bindingsToKa basics', () => {

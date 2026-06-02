@@ -552,6 +552,9 @@ importers:
       '@origintrail-official/dkg':
         specifier: workspace:*
         version: link:../cli
+      '@origintrail-official/dkg-storage':
+        specifier: workspace:*
+        version: link:../storage
       zod:
         specifier: ^3.25.76
         version: 3.25.76

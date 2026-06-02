@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@origintrail-official/dkg": "workspace:*",
+    "@origintrail-official/dkg-storage": "workspace:*",
     "zod": "^3.25.76"
   },
   "devDependencies": {

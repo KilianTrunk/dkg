@@ -1,3 +1,5 @@
+import { decryptPrivateLiteral } from '@origintrail-official/dkg-storage';
+
 const DKG_STREAMS = 'https://ontology.dkg.io/streams#';
 const SCHEMA = 'https://schema.org/';
 const DKG_ONT = 'http://dkg.io/ontology/';
@@ -6,6 +8,7 @@ const PART_OF = `${DKG_ONT}partOf`;
 const PUBLISHED_AT = `${DKG_ONT}publishedAt`;
 const STATUS = `${DKG_ONT}status`;
 const SUB_GRAPH_NAME = `${DKG_ONT}subGraphName`;
+const PRIVATE_DATA_ANCHOR = `${DKG_ONT}privateDataAnchor`;
 const RDF_TYPE = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type';
 const KAFKA_STREAM_TYPE = `${DKG_STREAMS}KafkaStream`;
 const XSD = 'http://www.w3.org/2001/XMLSchema#';
@@ -23,6 +26,12 @@ function dataUri(contextGraphId: string, subGraphName?: string): string {
   return subGraphName
     ? `did:dkg:context-graph:${contextGraphId}/${subGraphName}`
     : `did:dkg:context-graph:${contextGraphId}`;
+}
+
+function privateUri(contextGraphId: string, subGraphName?: string): string {
+  return subGraphName
+    ? `did:dkg:context-graph:${contextGraphId}/${subGraphName}/_private`
+    : `did:dkg:context-graph:${contextGraphId}/_private`;
 }
 
 function assertSafeCgId(cgId: string): void {
@@ -82,6 +91,7 @@ export function buildListQuery({ contextGraphId, subGraphName, limit, offset }: 
   if (subGraphName !== undefined) assertSafeSubGraphName(subGraphName);
   const meta = metaUri(contextGraphId);
   const data = dataUri(contextGraphId, subGraphName);
+  const privateGraph = privateUri(contextGraphId, subGraphName);
   return `SELECT ?ual ?root ?receivedAt ?p ?o WHERE {
   {
     SELECT DISTINCT ?ual ?root ?receivedAt WHERE {
@@ -91,14 +101,37 @@ export function buildListQuery({ contextGraphId, subGraphName, limit, offset }: 
 ${registrationScopeClause('?ual', subGraphName, '        ')}
         ?ual <${PUBLISHED_AT}> ?receivedAt .
       }
-      GRAPH <${data}> {
-        ?root a <${KAFKA_STREAM_TYPE}> .
+      {
+        GRAPH <${data}> {
+          ?root a <${KAFKA_STREAM_TYPE}> .
+        }
+      }
+      UNION
+      {
+        GRAPH <${data}> {
+          ?root <${PRIVATE_DATA_ANCHOR}> "true" .
+        }
+        GRAPH <${privateGraph}> {
+          ?root a <${KAFKA_STREAM_TYPE}> .
+        }
       }
     }
     ORDER BY DESC(?receivedAt)
     LIMIT ${limit} OFFSET ${offset}
   }
-  GRAPH <${data}> { ?root ?p ?o . }
+  {
+    GRAPH <${data}> {
+      ?root a <${KAFKA_STREAM_TYPE}> .
+      ?root ?p ?o .
+    }
+  }
+  UNION
+  {
+    GRAPH <${data}> {
+      ?root <${PRIVATE_DATA_ANCHOR}> "true" .
+    }
+    GRAPH <${privateGraph}> { ?root ?p ?o . }
+  }
 }
 ORDER BY DESC(?receivedAt) ?ual ?root ?p ?o`;
 }
@@ -108,13 +141,21 @@ export function buildCountQuery({ contextGraphId, subGraphName }: CountQueryPara
   if (subGraphName !== undefined) assertSafeSubGraphName(subGraphName);
   const meta = metaUri(contextGraphId);
   const data = dataUri(contextGraphId, subGraphName);
+  const privateGraph = privateUri(contextGraphId, subGraphName);
   return `SELECT (COUNT(DISTINCT ?ual) AS ?count) WHERE {
   GRAPH <${meta}> {
     ?ka <${ROOT_ENTITY}> ?root .
     ?ka <${PART_OF}> ?ual .
 ${registrationScopeClause('?ual', subGraphName, '    ')}
   }
-  GRAPH <${data}> { ?root a <${KAFKA_STREAM_TYPE}> . }
+  {
+    GRAPH <${data}> { ?root a <${KAFKA_STREAM_TYPE}> . }
+  }
+  UNION
+  {
+    GRAPH <${data}> { ?root <${PRIVATE_DATA_ANCHOR}> "true" . }
+    GRAPH <${privateGraph}> { ?root a <${KAFKA_STREAM_TYPE}> . }
+  }
 }`;
 }
 
@@ -124,15 +165,28 @@ export function buildSingleByUalQuery({ contextGraphId, subGraphName, ual }: Sin
   assertSafeUal(ual);
   const meta = metaUri(contextGraphId);
   const data = dataUri(contextGraphId, subGraphName);
+  const privateGraph = privateUri(contextGraphId, subGraphName);
   return `SELECT ?root ?p ?o WHERE {
   GRAPH <${meta}> {
     ?ka <${ROOT_ENTITY}> ?root .
     ?ka <${PART_OF}> <${ual}> .
 ${registrationScopeClause(`<${ual}>`, subGraphName, '    ')}
   }
-  GRAPH <${data}> {
-    ?root a <${KAFKA_STREAM_TYPE}> .
-    ?root ?p ?o .
+  {
+    GRAPH <${data}> {
+      ?root a <${KAFKA_STREAM_TYPE}> .
+      ?root ?p ?o .
+    }
+  }
+  UNION
+  {
+    GRAPH <${data}> {
+      ?root <${PRIVATE_DATA_ANCHOR}> "true" .
+    }
+    GRAPH <${privateGraph}> {
+      ?root a <${KAFKA_STREAM_TYPE}> .
+      ?root ?p ?o .
+    }
   }
 }`;
 }
@@ -167,8 +221,10 @@ export function bindingsToKa(bindings: ReadonlyArray<BindingRow>): KafkaStreamKa
     const ualVal = unwrapBinding(row.ual);
     if (ualVal && !id) id = ualVal;
     const predicate = unwrapBinding(row.p);
-    const objectRaw = unwrapBinding(row.o);
+    const rawObject = unwrapBinding(row.o);
+    const objectRaw = rawObject === undefined ? undefined : decryptPrivateLiteral(rawObject);
     if (!predicate || objectRaw === undefined) continue;
+    if (predicate === PRIVATE_DATA_ANCHOR) continue;
     if (predicate === RDF_TYPE) {
       const typeIri = stripIriQuoting(objectRaw);
       const compacted = compactIriWithCtx(typeIri, ctx, namespaceToPrefix);

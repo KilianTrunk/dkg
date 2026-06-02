@@ -156,7 +156,7 @@ async function handlePostRegister(
       unknown
     >;
   }
-  const publishContent = { public: ka } as unknown as Record<string, unknown>;
+  const publishContent = { private: ka } as unknown as Record<string, unknown>;
   let publishResult: { captureID: string };
   try {
     publishResult = await ctx.agent.publishAsync(cgId, publishContent, opts.publishOptions);

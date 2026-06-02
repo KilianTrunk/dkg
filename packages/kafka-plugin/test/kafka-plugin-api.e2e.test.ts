@@ -385,7 +385,7 @@ describe('kafka-plugin live daemon E2E — bare baseline', () => {
     expect(typeof final.ual).toBe('string');
     bareUal = final.ual;
   });
-  it('GET /api/kafka/streams returns the registered KA (public-partition regression)', async () => {
+  it('GET /api/kafka/streams returns the private-default registered KA', async () => {
     expect(bareUal).toBeTruthy();
     const res = await authed(daemon!, 'GET', '/api/kafka/streams');
     expect(res.status).toBe(200);
@@ -394,6 +394,11 @@ describe('kafka-plugin live daemon E2E — bare baseline', () => {
     expect(typeof body.total).toBe('number');
     const found = body.items.find((it: any) => it['@id'] === bareUal);
     expect(found).toBeDefined();
+    expect(found['@type']).toBe('dkg-streams:KafkaStream');
+    expect(found['dkg-streams:kafkaBootstrapUrl']).toBe(BARE_BODY.kafkaBootstrapUrl);
+    expect(found['dkg-streams:kafkaTopicName']).toBe(BARE_BODY.kafkaTopicName);
+    expect(found['schema:name']).toBe(BARE_BODY.name);
+    expect(found).not.toHaveProperty('dkg:privateDataAnchor');
   });
   it('GET /api/kafka/streams/:ual returns the same KA', async () => {
     expect(bareUal).toBeTruthy();
@@ -405,6 +410,7 @@ describe('kafka-plugin live daemon E2E — bare baseline', () => {
     expect(ka['dkg-streams:kafkaBootstrapUrl']).toBe(BARE_BODY.kafkaBootstrapUrl);
     expect(ka['dkg-streams:kafkaTopicName']).toBe(BARE_BODY.kafkaTopicName);
     expect(ka['schema:name']).toBe(BARE_BODY.name);
+    expect(ka).not.toHaveProperty('dkg:privateDataAnchor');
   });
   it('POST with missing required field returns 400 InvalidContent', async () => {
     const res = await authed(daemon!, 'POST', '/api/kafka/streams/register', {

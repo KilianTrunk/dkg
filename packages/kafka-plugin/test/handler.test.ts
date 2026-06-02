@@ -90,9 +90,9 @@ describe('handler — POST /register happy path', () => {
     expect(publishAsync).toHaveBeenCalledTimes(1);
     const [cgId, content] = publishAsync.mock.calls[0];
     expect(cgId).toBe('urn:cg:demo');
-    expect(content).toHaveProperty('public');
-    expect(content.public['@type']).toBe('dkg-streams:KafkaStream');
-    expect(content).not.toHaveProperty('private');
+    expect(content).toHaveProperty('private');
+    expect(content.private['@type']).toBe('dkg-streams:KafkaStream');
+    expect(content).not.toHaveProperty('public');
     expect(captured.body).toMatchObject({
       captureID: 'cap-123',
       contextGraphId: 'urn:cg:demo',
@@ -610,7 +610,7 @@ describe('handler — discovery query failures', () => {
   });
 });
 describe('handler — register-to-discovery regression', () => {
-  it('publishes KafkaStream KAs to the same public partition discovery queries', async () => {
+  it('publishes KafkaStream KAs private by default and discovery queries follow the public anchor', async () => {
     const cgId = 'urn:cg:demo';
     const { req, res, captured } = mockReqRes('POST', '/api/kafka/streams/register', validBody);
     const { ctx, publishAsync } = mockCtx();
@@ -618,12 +618,15 @@ describe('handler — register-to-discovery regression', () => {
     await handler({ ...ctx, req, res, path: '/api/kafka/streams/register' });
     expect(captured.statusCode).toBe(202);
     const [, content] = publishAsync.mock.calls[0];
-    expect(content).toHaveProperty('public');
-    expect(content).not.toHaveProperty('private');
-    expect((content.public as Record<string, unknown>)['@type']).toBe('dkg-streams:KafkaStream');
+    expect(content).toHaveProperty('private');
+    expect(content).not.toHaveProperty('public');
+    expect((content.private as Record<string, unknown>)['@type']).toBe('dkg-streams:KafkaStream');
     const expectedPublicGraph = `GRAPH <did:dkg:context-graph:${cgId}>`;
+    const expectedPrivateGraph = `GRAPH <did:dkg:context-graph:${cgId}/_private>`;
     expect(buildListQuery({ contextGraphId: cgId, limit: 30, offset: 0 })).toContain(expectedPublicGraph);
+    expect(buildListQuery({ contextGraphId: cgId, limit: 30, offset: 0 })).toContain(expectedPrivateGraph);
     expect(buildSingleByUalQuery({ contextGraphId: cgId, ual: 'did:dkg:1/0xabc' })).toContain(expectedPublicGraph);
+    expect(buildSingleByUalQuery({ contextGraphId: cgId, ual: 'did:dkg:1/0xabc' })).toContain(expectedPrivateGraph);
   });
 });
 import { z } from 'zod';
@@ -652,9 +655,9 @@ describe('handler — POST /register with extension', () => {
     expect(captured.statusCode).toBe(202);
     expect(publishAsync).toHaveBeenCalledTimes(1);
     const [, content] = publishAsync.mock.calls[0];
-    expect(content).toHaveProperty('public');
-    expect(content).not.toHaveProperty('private');
-    const ka = content.public as Record<string, unknown>;
+    expect(content).toHaveProperty('private');
+    expect(content).not.toHaveProperty('public');
+    const ka = content.private as Record<string, unknown>;
     expect(ka['@type']).toBe('dkg-streams:KafkaStream');
     expect(ka['schema:name']).toBe('demo');
     expect(ka['dkg-streams:kafkaBootstrapUrl']).toBe('kafka://broker:9092');
@@ -750,7 +753,7 @@ describe('handler — extension runtime collision (one warn per unique key acros
       await handler({ ...ctx, req, res, path: '/api/kafka/streams/register' });
     }
     for (const { publishAsync } of ctxs) {
-      const ka = publishAsync.mock.calls[0][1].public as Record<string, unknown>;
+      const ka = publishAsync.mock.calls[0][1].private as Record<string, unknown>;
       expect(ka['schema:name']).toBe('demo');
       expect(ka['dkg-streams:kafkaTopicName']).toBe('demo-topic');
       expect(ka['vendor:ok']).toBe('ok');

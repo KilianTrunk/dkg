@@ -465,6 +465,44 @@ describe('daemon memory_graph_changed route emissions', () => {
     expect(publishFromSharedMemory.mock.calls[0][1]).toEqual({ rootEntities: ['urn:root:present'] });
   });
 
+  it('preflights explicit SWM roots against skolemized descendants', async () => {
+    const root = 'urn:doc:markdown';
+    const section = `${root}/.well-known/genid/section-1-intro`;
+    const store = {
+      query: vi.fn(async () => ({
+        type: 'quads',
+        quads: [
+          {
+            subject: section,
+            predicate: 'http://schema.org/name',
+            object: '"Intro"',
+            graph: 'did:dkg:context-graph:project-a/_shared_memory',
+          },
+        ],
+      })),
+    };
+    const publishFromSharedMemory = vi.fn().mockResolvedValue({
+      kaId: 'kc-1',
+      status: 'confirmed',
+      kaManifest: [{ tokenId: 1n, rootEntity: root }],
+      publicQuads: [{ subject: section, predicate: 'http://schema.org/name', object: '"Intro"', graph: 'urn:g' }],
+    });
+    const getContextGraphOnChainId = vi.fn().mockResolvedValue('7');
+    const ctx = createContext('/api/shared-memory/publish', {
+      contextGraphId: 'project-a',
+      selection: [root],
+    }, {
+      agent: { publishFromSharedMemory, getContextGraphOnChainId, store } as unknown as RequestContext['agent'],
+    });
+
+    await handleMemoryRoutes(ctx);
+
+    expect((ctx.res as unknown as { statusCode: number }).statusCode).toBe(200);
+    expect(store.query.mock.calls[0][0]).toContain('STRSTARTS(STR(?s), CONCAT(STR(?root), "/.well-known/genid/"))');
+    expect(publishFromSharedMemory).toHaveBeenCalledTimes(1);
+    expect(publishFromSharedMemory.mock.calls[0][1]).toEqual({ rootEntities: [root] });
+  });
+
   it('rejects multi-root synchronous SWM publishes before any root is published', async () => {
     const store = {
       query: vi.fn(async () => ({

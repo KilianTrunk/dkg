@@ -2355,7 +2355,7 @@ export class DKGAgent {
               });
             } else {
               const existing = this.subscribedContextGraphs.get(hashLower)!;
-              existing.onChainId = contextGraphId;
+              this.bindSubscriptionOnChainId(hashLower, existing, contextGraphId);
               existing.onChainHash = hashLower;
             }
             this.recordCgWireId(hashLower, hashLower);
@@ -12072,6 +12072,31 @@ export class DKGAgent {
     return null;
   }
 
+  /**
+   * Bind (or rebind) a local CG to an on-chain CG id, resetting the
+   * chain-driven reconcile watermark if the bound id actually CHANGES.
+   *
+   * The persisted `lastReconciledOrdinal` is the count of contiguous KAs
+   * promoted for a *specific* on-chain graph. If the same local CG id is later
+   * repaired/recreated under a different on-chain id, that watermark no longer
+   * refers to the same chain graph — reusing it would make the sweep start at
+   * the wrong ordinal and permanently skip earlier KAs. So when the id changes
+   * we zero the watermark and drop the in-memory cursor; the reset is persisted
+   * together with the new id, keeping it restart-safe.
+   */
+  private bindSubscriptionOnChainId(localCgId: string, sub: ContextGraphSub, newOnChainId: string): void {
+    const prev = sub.onChainId;
+    sub.onChainId = newOnChainId;
+    if (prev && prev !== newOnChainId && (sub.lastReconciledOrdinal ?? 0) > 0) {
+      this.log.info(
+        createOperationContext('system'),
+        `VM reconcile: on-chain id for "${localCgId}" changed ${prev}->${newOnChainId}; resetting reconcile watermark to 0`,
+      );
+      sub.lastReconciledOrdinal = 0;
+      this.reconcileCursors.delete(localCgId);
+    }
+  }
+
   // ===== Phase B — chain-driven VM reconciliation (B.4 agent wiring) =========
 
   /**
@@ -14830,7 +14855,7 @@ export class DKGAgent {
     // Update in-memory subscription record and ensure we're subscribed
     const sub = this.subscribedContextGraphs.get(id);
     if (sub) {
-      sub.onChainId = onChainId;
+      this.bindSubscriptionOnChainId(id, sub, onChainId);
       // Keep the forward + reverse maps in lockstep so the receive
       // path can translate the wire id back to `id` (see
       // {@link recordCgWireId}).

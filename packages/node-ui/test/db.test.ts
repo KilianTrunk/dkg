@@ -1481,6 +1481,19 @@ describe('DashboardDB — replication telemetry (Phase F)', () => {
     expect(events[0].ts).toBe(now);
   });
 
+  it('per-cg event stream coerces a non-finite limit to the default (no LIMIT NaN)', () => {
+    // ?limit=foo → parseInt → NaN. Math.min/max propagate NaN, so binding it
+    // straight into `LIMIT ?` made SQLite throw. The limit must fall back safely.
+    for (let i = 0; i < 3; i++) {
+      db.insertReplicationEvent({ ts: now - i * 1000, context_graph_id: 'cgN', action: 'promote', ordinal: 3 - i });
+    }
+    expect(() => db.getReplicationEventsForCg('cgN', NaN)).not.toThrow();
+    expect(db.getReplicationEventsForCg('cgN', NaN).length).toBe(3);
+    // Out-of-range values are clamped, not rejected.
+    expect(db.getReplicationEventsForCg('cgN', 0).length).toBe(1);
+    expect(db.getReplicationEventsForCg('cgN', 99_999).length).toBe(3);
+  });
+
   it('V18 migration creates replication_events on an upgraded DB', () => {
     db.close();
     const raw = new Database(join(dir, 'node-ui.db'));

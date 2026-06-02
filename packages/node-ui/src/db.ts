@@ -1015,6 +1015,11 @@ export class DashboardDB {
    * Recent raw events for a CG (the per-CG timeline drawer). Newest first.
    */
   getReplicationEventsForCg(contextGraphId: string, limit = 100): ReplicationEventRow[] {
+    // Guard against a non-finite limit (e.g. ?limit=foo → NaN upstream): Math.min/max
+    // propagate NaN, which would bind `LIMIT NaN` and make SQLite throw a 500.
+    const safeLimit = Number.isFinite(limit)
+      ? Math.max(1, Math.min(1000, Math.trunc(limit)))
+      : 100;
     return this.db.prepare(`
       SELECT ts, context_graph_id, on_chain_cg_id, action, ual, ordinal, ka_id,
              from_watermark, to_watermark, head, reconciled, pending, detail
@@ -1022,7 +1027,7 @@ export class DashboardDB {
       WHERE context_graph_id = ?
       ORDER BY ts DESC
       LIMIT ?
-    `).all(contextGraphId, Math.max(1, Math.min(1000, limit))) as ReplicationEventRow[];
+    `).all(contextGraphId, safeLimit) as ReplicationEventRow[];
   }
 
   /**

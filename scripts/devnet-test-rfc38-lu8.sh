@@ -121,7 +121,7 @@ KC_ID=$(parse_json "$PUB_RESP" '.kaId')
 [ -n "$KC_ID" ] || fail "no kaId in publish response — required for merkleRoot lookup"
 
 # Use the first published root for single-batch negative tests below.
-KC_ID=$(printf '%s' "$DEVNET_PUBLISH_ALL_RESPONSES" | node -e 'let d="";process.stdin.on("data",c=>d+=c);process.stdin.on("end",()=>console.log(JSON.parse(d)[0].kaId))')
+KC_ID=$(devnet_publish_ka_id_at 0)
 log "Fetching merkleRoot from chain (KC #${KC_ID}) via daemon API..."
 KC_RESP=$(api_call "$CURATOR_NODE" GET "/api/kc/${KC_ID}")
 log "kc lookup: $KC_RESP"

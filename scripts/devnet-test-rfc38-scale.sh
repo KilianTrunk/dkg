@@ -136,37 +136,12 @@ TX=$(parse_json    "$PUB_RESP" '.txHash')
 KC=$(parse_json    "$PUB_RESP" '.kaId')
 [ "$STATUS" = "confirmed" ] || fail "publish status=$STATUS"
 [[ "$TX" =~ ^0x[0-9a-fA-F]{64}$ ]] || fail "invalid txHash"
-PUBLISH_COUNT=$(printf '%s' "$DEVNET_PUBLISH_ROOT_ENTITIES" | node -e 'let d="";process.stdin.on("data",c=>d+=c);process.stdin.on("end",()=>console.log(JSON.parse(d).length||1))')
+PUBLISH_COUNT=$(devnet_publish_root_count)
 log "✓ publish: ${PUBLISH_COUNT} root batch(es), last kaId=$KC tx=$TX"
 
 # Cross-check each KC via KCS: rc.12+ publishes one root entity per KC.
 EXPECTED_MINTED=$((TRIPLE_COUNT / 2))
-(
-cd "$REPO_ROOT/packages/evm-module" && \
-RPC_URL="http://127.0.0.1:${HARDHAT_PORT}" CONTRACTS_JSON="$CONTRACTS_JSON" ABI_DIR="$EVM_ABI_DIR" \
-ALL_KCS="$DEVNET_PUBLISH_ALL_RESPONSES" EXPECTED_MINTED="1" \
-node -e '
-const { ethers } = require("ethers");
-const fs = require("fs"); const path = require("path");
-(async () => {
-  const provider = new ethers.JsonRpcProvider(process.env.RPC_URL);
-  const contracts = JSON.parse(fs.readFileSync(process.env.CONTRACTS_JSON, "utf8")).contracts;
-  const kcsAddr = contracts.DKGKnowledgeAssets?.evmAddress ?? contracts.KnowledgeCollectionStorage.evmAddress;
-  const kcsAbiFile = fs.existsSync(path.join(process.env.ABI_DIR, "DKGKnowledgeAssets.json")) ? "DKGKnowledgeAssets.json" : "DKGKnowledgeAssets.json";
-  const kas = new ethers.Contract(kcsAddr,
-    JSON.parse(fs.readFileSync(path.join(process.env.ABI_DIR, kcsAbiFile), "utf8")), provider);
-  const kcs = JSON.parse(process.env.ALL_KCS);
-  const expectedMinted = BigInt(process.env.EXPECTED_MINTED);
-  for (const pub of kcs) {
-    const batchId = pub.kaId;
-    const [merkleRoots, , minted] = await kas.getKnowledgeAssetMetadata(BigInt(batchId));
-    if (!merkleRoots || merkleRoots.length === 0) throw new Error("no merkleRoots for kaId=" + batchId);
-    if (minted !== expectedMinted) throw new Error("kaId=" + batchId + ": expected " + expectedMinted + " KAs minted, got " + minted);
-  }
-  console.log("✓ KCS: " + kcs.length + " KC(s) each minted=" + expectedMinted);
-})().catch(e => { console.error(e?.message || e); process.exit(1); });
-'
-) || fail "KCS read-back failed"
+devnet_kcs_readback_all_published 1 || fail "KCS read-back failed"
 [ "$PUBLISH_COUNT" = "$EXPECTED_MINTED" ] || fail "expected $EXPECTED_MINTED publishes, got $PUBLISH_COUNT"
 
 # ===========================================================================
@@ -186,10 +161,7 @@ for leaf_idx in 0 $((TRIPLE_COUNT / 4 - 1)) $((TRIPLE_COUNT / 2 - 1)); do
   LEAF_PREDICATE="http://schema.org/name"
   LEAF_OBJECT="\"Document ${leaf_idx}\""
 
-  KC=$(printf '%s' "$DEVNET_PUBLISH_ALL_RESPONSES" | node -e "
-    let d=''; process.stdin.on('data',c=>d+=c);
-    process.stdin.on('end',()=>console.log(JSON.parse(d)[Number(process.argv[1])].kaId));
-  " "$leaf_idx")
+  KC=$(devnet_publish_ka_id_at "$leaf_idx")
   MERKLE_ROOT=$(devnet_kc_merkle_root "$CURATOR_NODE" "$KC")
   CANDIDATE_LEAF=$(cd "$REPO_ROOT/packages/core" && LEAF_SUBJECT="$LEAF_SUBJECT" LEAF_PREDICATE="$LEAF_PREDICATE" LEAF_OBJECT="$LEAF_OBJECT" node --input-type=module -e '
     const { hashTripleV10 } = await import("./dist/index.js");

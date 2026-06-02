@@ -144,32 +144,14 @@ KC=$(parse_json    "$PUB_RESP" '.kaId')
 [[ "$TX" =~ ^0x[0-9a-fA-F]{64}$ ]] || fail "invalid txHash '$TX'"
 log "✓ public CG publish: kaId=$KC tx=$TX"
 
-KC_META=$(api_call "$CURATOR_NODE" GET "/api/kc/$KC")
-MERKLE_ROOT=$(parse_json "$KC_META" '.merkleRoot')
-[[ "$MERKLE_ROOT" =~ ^0x[0-9a-fA-F]{64}$ ]] || fail "invalid merkleRoot from /api/kc/$KC: $KC_META"
-log "✓ chain merkleRoot: $MERKLE_ROOT"
+PUBLISH_COUNT=$(devnet_publish_root_count)
+[ "$PUBLISH_COUNT" = "5" ] || fail "expected 5 root publishes, got $PUBLISH_COUNT"
+devnet_kcs_readback_all_published 1 || fail "KCS read-back failed"
 
-# Cross-check via Hardhat KCS
-(
-cd "$REPO_ROOT/packages/evm-module" && \
-RPC_URL="http://127.0.0.1:${HARDHAT_PORT}" CONTRACTS_JSON="$CONTRACTS_JSON" ABI_DIR="$EVM_ABI_DIR" BATCH_ID="$KC" \
-node -e '
-const { ethers } = require("ethers");
-const fs = require("fs"); const path = require("path");
-(async () => {
-  const provider = new ethers.JsonRpcProvider(process.env.RPC_URL);
-  const contracts = JSON.parse(fs.readFileSync(process.env.CONTRACTS_JSON, "utf8")).contracts;
-  const kcsAddr = contracts.DKGKnowledgeAssets?.evmAddress ?? contracts.KnowledgeCollectionStorage.evmAddress;
-  const kcsAbiFile = fs.existsSync(path.join(process.env.ABI_DIR, "DKGKnowledgeAssets.json")) ? "DKGKnowledgeAssets.json" : "DKGKnowledgeAssets.json";
-  const kas = new ethers.Contract(kcsAddr,
-    JSON.parse(fs.readFileSync(path.join(process.env.ABI_DIR, kcsAbiFile), "utf8")), provider);
-  const [merkleRoots, , minted, byteSize] = await kas.getKnowledgeAssetMetadata(BigInt(process.env.BATCH_ID));
-  if (!merkleRoots || merkleRoots.length === 0) throw new Error("no merkleRoots");
-  if (minted !== 5n) throw new Error("expected 5 KAs (one per root entity), got " + minted);
-  console.log("KCS read-back OK: merkleRoots=" + merkleRoots.length + " minted=" + minted + " byteSize=" + byteSize);
-})().catch(e => { console.error(e?.message || e); process.exit(1); });
-'
-) || fail "KCS read-back failed"
+KC=$(devnet_publish_ka_id_at 0)
+MERKLE_ROOT=$(devnet_kc_merkle_root "$CURATOR_NODE" "$KC")
+[[ "$MERKLE_ROOT" =~ ^0x[0-9a-fA-F]{64}$ ]] || fail "invalid merkleRoot from /api/kc/$KC"
+log "✓ chain merkleRoot (first root): $MERKLE_ROOT"
 
 # Public publishes MUST NOT carry the curated chain-key AEAD wrap
 EDGE_LOG=$(node_log "$CURATOR_NODE")
@@ -227,14 +209,17 @@ devnet_verify_each_published_root "$OUTSIDER_NODE" "$CG_ID" "$QUADS_PAYLOAD" \
   || fail "outsider-side verify-batch failed for one or more roots"
 log "✓ outsider verifies public batch: ok=true for all published roots"
 
-KC=$(printf '%s' "$DEVNET_PUBLISH_ALL_RESPONSES" | node -e 'let d="";process.stdin.on("data",c=>d+=c);process.stdin.on("end",()=>console.log(JSON.parse(d)[0].kaId))')
+KC=$(devnet_publish_ka_id_at 0)
 MERKLE_ROOT=$(devnet_kc_merkle_root "$CURATOR_NODE" "$KC")
 
 log "Outsider calls verify-batch with tampered quads..."
 VERIFY_BAD_BODY=$(QUADS_PAYLOAD="$QUADS_PAYLOAD" MERKLE_ROOT="$MERKLE_ROOT" KC="$KC" STAMP="$STAMP" node -e "
+  const genidPrefix = '/.well-known/genid/';
+  const quadBelongsToRoot = (q, root) =>
+    q.subject === root || q.subject.startsWith(root + genidPrefix);
   const payload = JSON.parse(process.env.QUADS_PAYLOAD);
   const root = payload.quads[0].subject;
-  const tampered = payload.quads.filter((q) => q.subject === root || q.subject.startsWith(root + '/'));
+  const tampered = payload.quads.filter((q) => quadBelongsToRoot(q, root));
   tampered.push({ subject: 'urn:lu10:' + process.env.STAMP + '/forged', predicate: 'http://schema.org/title', object: '\"Mallory\"', graph: '' });
   console.log(JSON.stringify({
     contextGraphId: payload.contextGraphId,
@@ -259,7 +244,7 @@ LEAF_SUBJECT="urn:lu10:${STAMP}/doc-a"
 LEAF_PREDICATE="http://schema.org/title"
 LEAF_OBJECT='"Whitepaper"'
 
-KC=$(printf '%s' "$DEVNET_PUBLISH_ALL_RESPONSES" | node -e 'let d="";process.stdin.on("data",c=>d+=c);process.stdin.on("end",()=>console.log(JSON.parse(d)[0].kaId))')
+KC=$(devnet_publish_ka_id_at 0)
 MERKLE_ROOT=$(devnet_kc_merkle_root "$CURATOR_NODE" "$KC")
 
 CANDIDATE_LEAF=$(cd "$REPO_ROOT/packages/core" && LEAF_SUBJECT="$LEAF_SUBJECT" LEAF_PREDICATE="$LEAF_PREDICATE" LEAF_OBJECT="$LEAF_OBJECT" node --input-type=module -e '

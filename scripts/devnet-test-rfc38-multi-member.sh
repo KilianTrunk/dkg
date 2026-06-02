@@ -192,7 +192,7 @@ LEAF_SUBJECT="urn:mm:${STAMP}/alpha"
 LEAF_PREDICATE="http://schema.org/name"
 LEAF_OBJECT="\"alpha\""
 
-KC=$(printf '%s' "$DEVNET_PUBLISH_ALL_RESPONSES" | node -e 'let d="";process.stdin.on("data",c=>d+=c);process.stdin.on("end",()=>console.log(JSON.parse(d)[0].kaId))')
+KC=$(devnet_publish_ka_id_at 0)
 MERKLE_ROOT=$(devnet_kc_merkle_root "$CURATOR_NODE" "$KC")
 CANDIDATE_LEAF=$(cd "$REPO_ROOT/packages/core" && LEAF_SUBJECT="$LEAF_SUBJECT" LEAF_PREDICATE="$LEAF_PREDICATE" LEAF_OBJECT="$LEAF_OBJECT" node --input-type=module -e '
   const { hashTripleV10 } = await import("./dist/index.js");

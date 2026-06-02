@@ -14,8 +14,10 @@
 #
 # Command substitution runs the publish helper in a subshell, so metadata is
 # persisted to DEVNET_PUBLISH_STATE_FILE and must be loaded in the caller shell.
+# The state file is scoped to the current bash process (BASHPID) so concurrent
+# devnet scripts do not clobber each other's publish metadata.
 #
-DEVNET_PUBLISH_STATE_FILE="${DEVNET_PUBLISH_STATE_FILE:-${DEVNET_DIR:-/tmp}/.devnet-publish-state.json}"
+DEVNET_PUBLISH_STATE_FILE="${DEVNET_PUBLISH_STATE_FILE:-${DEVNET_DIR:-/tmp}/.devnet-publish-state-${BASHPID:-$$}.json}"
 DEVNET_PUBLISH_ALL_RESPONSES='[]'
 DEVNET_PUBLISH_ROOT_ENTITIES='[]'
 
@@ -27,6 +29,10 @@ devnet_json_field() {
       catch { process.exit(1); }
     })
   "
+}
+
+_devnet_publish_init_state_file() {
+  DEVNET_PUBLISH_STATE_FILE="${DEVNET_DIR:-/tmp}/.devnet-publish-state-${BASHPID:-$$}.json"
 }
 
 _devnet_publish_persist_state() {
@@ -43,6 +49,7 @@ _devnet_publish_persist_state() {
 }
 
 devnet_publish_load_state() {
+  _devnet_publish_init_state_file
   if [ ! -f "$DEVNET_PUBLISH_STATE_FILE" ]; then
     DEVNET_PUBLISH_ALL_RESPONSES='[]'
     DEVNET_PUBLISH_ROOT_ENTITIES='[]'
@@ -58,11 +65,71 @@ devnet_publish_load_state() {
   " "$DEVNET_PUBLISH_STATE_FILE")
 }
 
+# Echo the number of root-entity publishes in the last devnet_publish_swm_all_roots call.
+devnet_publish_root_count() {
+  devnet_publish_load_state
+  printf '%s' "$DEVNET_PUBLISH_ROOT_ENTITIES" | node -e '
+    let d=""; process.stdin.on("data",c=>d+=c);
+    process.stdin.on("end",()=>{ try { const n=JSON.parse(d).length; console.log(n > 0 ? n : 1); } catch { console.log(1); } });
+  '
+}
+
+# Args: zero-based index into the last publish batch list.
+devnet_publish_ka_id_at() {
+  local idx="$1"
+  devnet_publish_load_state
+  printf '%s' "$DEVNET_PUBLISH_ALL_RESPONSES" | node -e "
+    let d=''; process.stdin.on('data',c=>d+=c);
+    process.stdin.on('end',()=>console.log(JSON.parse(d)[Number(process.argv[1])].kaId));
+  " "$idx"
+}
+
 devnet_kc_merkle_root() {
   local node="$1" kc="$2"
   local meta
   meta=$(api_call "$node" GET "/api/kc/$kc")
   devnet_json_field "$meta" '.merkleRoot'
+}
+
+# Args: expected_minted_per_kc (default 1)
+# Requires REPO_ROOT, HARDHAT_PORT, CONTRACTS_JSON, EVM_ABI_DIR in caller env.
+devnet_kcs_readback_all_published() {
+  local expected_minted="${1:-1}"
+  devnet_publish_load_state
+  (
+    cd "${REPO_ROOT:?REPO_ROOT must be set}/packages/evm-module" && \
+    RPC_URL="http://127.0.0.1:${HARDHAT_PORT:-8545}" \
+    CONTRACTS_JSON="${CONTRACTS_JSON:?CONTRACTS_JSON must be set}" \
+    ABI_DIR="${EVM_ABI_DIR:?EVM_ABI_DIR must be set}" \
+    ALL_KCS="$DEVNET_PUBLISH_ALL_RESPONSES" \
+    EXPECTED_MINTED="$expected_minted" \
+    node -e '
+const { ethers } = require("ethers");
+const fs = require("fs"); const path = require("path");
+(async () => {
+  const provider = new ethers.JsonRpcProvider(process.env.RPC_URL);
+  const contracts = JSON.parse(fs.readFileSync(process.env.CONTRACTS_JSON, "utf8")).contracts;
+  const kcsAddr = contracts.DKGKnowledgeAssets?.evmAddress ?? contracts.KnowledgeCollectionStorage?.evmAddress;
+  const kcsAbiFile = fs.existsSync(path.join(process.env.ABI_DIR, "DKGKnowledgeAssets.json"))
+    ? "DKGKnowledgeAssets.json" : "DKGKnowledgeAssets.json";
+  const kas = new ethers.Contract(kcsAddr,
+    JSON.parse(fs.readFileSync(path.join(process.env.ABI_DIR, kcsAbiFile), "utf8")), provider);
+  const kcs = JSON.parse(process.env.ALL_KCS);
+  const expectedMinted = BigInt(process.env.EXPECTED_MINTED);
+  if (!kcs.length) throw new Error("no published KC responses in state");
+  for (const pub of kcs) {
+    const batchId = pub.kaId;
+    const [merkleRoots, , minted, byteSize] = await kas.getKnowledgeAssetMetadata(BigInt(batchId));
+    if (!merkleRoots || merkleRoots.length === 0) throw new Error("no merkleRoots for kaId=" + batchId);
+    if (byteSize === 0n) throw new Error("byteSize=0 for kaId=" + batchId);
+    if (minted !== expectedMinted) {
+      throw new Error("kaId=" + batchId + ": expected " + expectedMinted + " KAs minted, got " + minted);
+    }
+  }
+  console.log("✓ KCS: " + kcs.length + " KC(s) each minted=" + expectedMinted);
+})().catch(e => { console.error(e?.message || e); process.exit(1); });
+    '
+  )
 }
 
 # Args: node cg quads_payload_json (stringified { contextGraphId, quads })
@@ -73,29 +140,23 @@ devnet_verify_each_published_root() {
 
   devnet_publish_load_state
 
-  count=$(printf '%s' "$DEVNET_PUBLISH_ROOT_ENTITIES" | node -e '
-    let d=""; process.stdin.on("data",c=>d+=c);
-    process.stdin.on("end",()=>{ try { console.log(JSON.parse(d).length); } catch { console.log(0); } });
-  ')
-  if [ "$count" -eq 0 ]; then
-    count=1
-  fi
+  count=$(devnet_publish_root_count)
 
   i=0
   while [ "$i" -lt "$count" ]; do
-    kc=$(printf '%s' "$DEVNET_PUBLISH_ALL_RESPONSES" | node -e "
-      let d=''; process.stdin.on('data',c=>d+=c);
-      process.stdin.on('end',()=>console.log(JSON.parse(d)[Number(process.argv[1])].kaId));
-    " "$i")
+    kc=$(devnet_publish_ka_id_at "$i")
     merkle=$(devnet_kc_merkle_root "$node" "$kc")
     body=$(QUADS_PAYLOAD="$quads_payload" ROOT_IDX="$i" ROOTS="$DEVNET_PUBLISH_ROOT_ENTITIES" CG="$cg" MERKLE="$merkle" KC="$kc" node -e '
+      const genidPrefix = "/.well-known/genid/";
+      const quadBelongsToRoot = (q, root) =>
+        q.subject === root || q.subject.startsWith(root + genidPrefix);
       const roots = JSON.parse(process.env.ROOTS || "[]");
       const rootIdx = Number(process.env.ROOT_IDX);
       const payload = JSON.parse(process.env.QUADS_PAYLOAD);
       let quads = payload.quads;
       if (roots.length > 0) {
         const root = roots[rootIdx];
-        quads = quads.filter((q) => q.subject === root || q.subject.startsWith(root + "/"));
+        quads = quads.filter((q) => quadBelongsToRoot(q, root));
       }
       console.log(JSON.stringify({
         contextGraphId: process.env.CG,
@@ -119,6 +180,8 @@ devnet_verify_each_published_root() {
 devnet_publish_swm_all_roots() {
   local node="$1" cg="$2" clear_after="${3:-false}"
   local extra_fields="${4:-}"
+
+  _devnet_publish_init_state_file
 
   local probe_body
   probe_body=$(node -e "
@@ -194,4 +257,17 @@ devnet_publish_swm_all_roots() {
   _devnet_publish_persist_state "$all_resps" "$roots_json"
   printf '%s' "$last_resp"
   return 0
+}
+
+# Filter quads to those belonging to a published root entity (matches publisher selection).
+devnet_quads_for_root_json() {
+  local quads_payload="$1" root="$2"
+  QUADS_PAYLOAD="$quads_payload" ROOT="$root" node -e '
+    const genidPrefix = "/.well-known/genid/";
+    const quadBelongsToRoot = (q, root) =>
+      q.subject === root || q.subject.startsWith(root + genidPrefix);
+    const payload = JSON.parse(process.env.QUADS_PAYLOAD);
+    const quads = payload.quads.filter((q) => quadBelongsToRoot(q, process.env.ROOT));
+    console.log(JSON.stringify(quads));
+  '
 }

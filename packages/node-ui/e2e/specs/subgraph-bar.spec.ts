@@ -72,26 +72,15 @@ test.describe('SubGraph bar', () => {
   });
 
   test('Root chip appears when root-scope entities exist', async ({ subgraphBar }) => {
-    // Give the Root chip a BOUNDED chance to paint before concluding it's
-    // absent. Waiting for "any chip" is not enough — the always-present "All"
-    // chip paints first, so an early read could take the vacuous branch while
-    // the Root chip is still rendering (Codex). A bounded poll distinguishes
-    // "root not rendered yet" from "root absent"; root-scope entities are
-    // optional in the seed, so a genuine timeout here is a valid no-root outcome.
-    let hasRoot = false;
-    try {
-      await expect.poll(() => subgraphBar.hasRootChip(), { timeout: 8_000 }).toBe(true);
-      hasRoot = true;
-    } catch {
-      hasRoot = false;
-    }
-    if (!hasRoot) return;
-
-    // A visible Root chip MUST carry a "root" label; poll the labels so a live
-    // re-render between the presence check and the label read can't flake it.
+    // global-setup deterministically seeds a root-bucket VM entity (see file
+    // header), so the Root chip MUST render on the Subgraphs view. Assert it
+    // directly — an early-return on "no root chip" would make the test vacuous
+    // and silently mask a regression where the chip fails to paint (Codex).
+    // Poll the chip labels (the bar re-renders live as node events arrive) until
+    // the root chip's label appears; this also closes the original two-step race.
     await expect
       .poll(async () => (await subgraphBar.getChipLabels()).map((l) => l.toLowerCase()), {
-        timeout: 10_000,
+        timeout: 15_000,
       })
       .toContain('root');
   });

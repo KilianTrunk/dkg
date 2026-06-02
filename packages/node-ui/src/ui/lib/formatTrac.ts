@@ -54,3 +54,15 @@ export function formatTrac(value: unknown, digits = 2): string {
   if (!Number.isFinite(n)) return '—';
   return n.toFixed(digits);
 }
+
+/**
+ * Tooltip companion to {@link formatTrac}: the exact raw balance, but ONLY when
+ * it's a real number. When the daemon returns null/undefined/empty/non-numeric
+ * the visible cell already falls back to an em-dash, so the `title` tooltip must
+ * not leak the raw "null"/"NaN"/junk either (Codex) — return undefined so no
+ * tooltip renders. Reuses formatTrac's validation to stay in lockstep.
+ */
+export function formatTracTooltip(value: unknown): string | undefined {
+  if (formatTrac(value) === '—') return undefined;
+  return `Exact: ${value}`;
+}

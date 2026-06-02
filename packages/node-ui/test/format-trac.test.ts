@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { formatTracSymbol, formatTrac } from '../src/ui/lib/formatTrac.js';
+import { formatTracSymbol, formatTrac, formatTracTooltip } from '../src/ui/lib/formatTrac.js';
 
 describe('formatTracSymbol (BUG-013)', () => {
   it('returns "TRAC" for empty/null/undefined symbol', () => {
@@ -60,5 +60,22 @@ describe('formatTrac (GH #915 — never render "NaN")', () => {
     expect(formatTrac('0')).toBe('0.00');
     expect(formatTrac(1234.567)).toBe('1234.57');
     expect(formatTrac(42)).toBe('42.00');
+  });
+});
+
+describe('formatTracTooltip (GH #915 — tooltip must not leak bad values)', () => {
+  it('returns undefined for missing/non-numeric balances (so no tooltip renders)', () => {
+    expect(formatTracTooltip(null)).toBeUndefined();
+    expect(formatTracTooltip(undefined)).toBeUndefined();
+    expect(formatTracTooltip('')).toBeUndefined();
+    expect(formatTracTooltip('NaN')).toBeUndefined();
+    expect(formatTracTooltip(NaN)).toBeUndefined();
+    expect(formatTracTooltip('12abc')).toBeUndefined();
+  });
+
+  it('shows the exact raw value only when it is a real number', () => {
+    expect(formatTracTooltip('123.456789')).toBe('Exact: 123.456789');
+    expect(formatTracTooltip(0)).toBe('Exact: 0');
+    expect(formatTracTooltip('42')).toBe('Exact: 42');
   });
 });

@@ -1297,8 +1297,11 @@ program
       const syncBackoff = info.syncStatus.backoff
         ? `, backoff failures=${info.syncStatus.backoff.failures}, retry in ${Math.round(info.syncStatus.backoff.retryInMs / 1000)}s`
         : '';
-      const syncState = info.syncStatus.capable
+      const syncCapability = info.syncStatus.capability ?? (info.syncStatus.capable ? 'supported' : 'unsupported');
+      const syncState = syncCapability === 'supported'
         ? (info.syncStatus.stale ? 'stale' : 'fresh')
+        : syncCapability === 'unknown'
+          ? (info.syncStatus.stale ? 'unknown/stale' : 'unknown')
         : 'unsupported';
       console.log(`Sync Status:   ${syncState} (last success: ${syncLastOk}${syncBackoff})`);
       if (info.transports.length > 0) console.log(`Transports:    ${info.transports.join(', ')}`);

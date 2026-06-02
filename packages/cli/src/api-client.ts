@@ -274,6 +274,7 @@ export class ApiClient {
     syncCapable: boolean;
     syncStatus: {
       capable: boolean;
+      capability?: 'supported' | 'unsupported' | 'unknown';
       lastSuccessfulSyncAt: number | null;
       stale: boolean;
       backoff: {

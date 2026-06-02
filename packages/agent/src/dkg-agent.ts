@@ -390,6 +390,18 @@ export type {
   DKGAgentConfig,
 };
 
+type SyncReconcilerBackoff = {
+  failures: number;
+  nextRetryAt: number;
+  protocolsKey?: string | null;
+  connectionKey?: string | null;
+};
+
+type SyncReconcilerProbe = {
+  protocolsKey: string | null;
+  connectionKey: string | null;
+};
+
 /**
  * High-level facade that ties together all DKG agent capabilities:
  * identity, networking, publishing, querying, discovery, and messaging.
@@ -1229,7 +1241,7 @@ export class DKGAgent {
    * `connection:close`. Bounded by the connected-peer set (one entry per
    * peer, cleared on disconnect). See `SYNC_BACKOFF_BASE_MS`.
    */
-  private readonly syncReconcilerBackoff = new Map<string, { failures: number; nextRetryAt: number }>();
+  private readonly syncReconcilerBackoff = new Map<string, SyncReconcilerBackoff>();
   private syncReconcilerTimer: ReturnType<typeof setInterval> | null = null;
   /** A.4-lite+: periodic warm/pinned Core-connection reconcile (opt-in). */
   private warmCoreTimer: ReturnType<typeof setInterval> | null = null;
@@ -3529,7 +3541,10 @@ export class DKGAgent {
       // peer:update still fire an immediate attempt, so newly-reachable
       // peers are never delayed.
       const backoff = this.syncReconcilerBackoff.get(peerId);
-      if (backoff && now < backoff.nextRetryAt) continue;
+      const probe = await this.getSyncReconcilerProbe(peerId);
+      if (backoff && now < backoff.nextRetryAt && !this.hasSyncReconcilerProbeChanged(backoff, probe)) {
+        continue;
+      }
       const shortPeer = peerId.slice(-8);
       this.log.info(ctx, `Sync reconciler retrying ${shortPeer} (last success: ${lastOk == null ? 'never' : `${Math.round((now - lastOk) / 1000)}s ago`}${backoff ? `, prior failures: ${backoff.failures}` : ''})`);
       this.trySyncFromPeer(peerId)
@@ -3545,11 +3560,11 @@ export class DKGAgent {
           // reconciler tick, so a missed identify update cannot stretch into
           // a 5/10/20/60-minute delay.
           if (this.lastSuccessfulSyncAt.get(peerId) === lastOk) {
-            this.recordSyncReconcilerFailure(peerId);
+            this.recordSyncReconcilerFailure(peerId, probe);
           }
         })
         .catch((err: unknown) => {
-          this.recordSyncReconcilerFailure(peerId);
+          this.recordSyncReconcilerFailure(peerId, probe);
           const message = err instanceof Error ? err.message : String(err);
           this.log.warn(ctx, `Sync reconciler retry failed for ${shortPeer}: ${message}`);
         });
@@ -3564,7 +3579,41 @@ export class DKGAgent {
    * de-correlate retries across peers. Reset to absent on success
    * (`onPeerSynced`) or disconnect (`connection:close`).
    */
-  private recordSyncReconcilerFailure(peerId: string): void {
+  private async getSyncReconcilerProbe(peerId: string): Promise<SyncReconcilerProbe> {
+    let protocolsKey: string | null = null;
+    try {
+      const protocols = await this.getPeerProtocols(peerId);
+      protocolsKey = [...protocols].sort().join('\n');
+    } catch {
+      protocolsKey = null;
+    }
+    return {
+      protocolsKey,
+      connectionKey: this.getSyncReconcilerConnectionKey(peerId),
+    };
+  }
+
+  private getSyncReconcilerConnectionKey(peerId: string): string | null {
+    try {
+      const entries = this.node.libp2p.getConnections()
+        .filter((conn) => conn.remotePeer?.toString?.() === peerId)
+        .map((conn) => [
+          conn.direction,
+          conn.timeline?.open ?? 0,
+          conn.remoteAddr?.toString?.() ?? '',
+        ].join(':'))
+        .sort();
+      return entries.length > 0 ? entries.join('|') : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private hasSyncReconcilerProbeChanged(backoff: SyncReconcilerBackoff, probe: SyncReconcilerProbe): boolean {
+    return backoff.protocolsKey !== probe.protocolsKey || backoff.connectionKey !== probe.connectionKey;
+  }
+
+  private recordSyncReconcilerFailure(peerId: string, probe: SyncReconcilerProbe): void {
     if (!this.started || !this.isPeerConnectedForSyncBackoff(peerId)) return;
     const failures = (this.syncReconcilerBackoff.get(peerId)?.failures ?? 0) + 1;
     // Clamp the exponent so `2 ** exp` can never overflow before the cap.
@@ -3574,6 +3623,8 @@ export class DKGAgent {
     this.syncReconcilerBackoff.set(peerId, {
       failures,
       nextRetryAt: Date.now() + jittered,
+      protocolsKey: probe.protocolsKey,
+      connectionKey: probe.connectionKey,
     });
   }
 
@@ -21430,6 +21481,7 @@ export class DKGAgent {
         syncCapable: false,
         syncStatus: {
           capable: false,
+          capability: 'unknown',
           lastSuccessfulSyncAt: null,
           stale: false,
           backoff: null,
@@ -21465,6 +21517,7 @@ export class DKGAgent {
     } catch {
       rawConns = [];
     }
+    const connected = rawConns.length > 0;
 
     // libp2p's peerId-keyed lookup. See `getConnectionsReturnsForPeer`
     // JSDoc — divergence from `rawConns.length` is the Window D signature.
@@ -21581,17 +21634,26 @@ export class DKGAgent {
     // cutover — peers on the older `/sync` wire ID are no longer
     // compatible and intentionally report syncCapable=false.
     const syncCapable = protocols.includes(PROTOCOL_SYNC);
+    const syncCapability: PeerDiagnostics['syncStatus']['capability'] = peerStoreSnapshot == null
+      ? 'unknown'
+      : syncCapable
+        ? 'supported'
+        : 'unsupported';
     const now = Date.now();
     const lastSuccessfulSync = this.lastSuccessfulSyncAt.get(peerKey) ?? null;
     const backoff = this.syncReconcilerBackoff.get(peerKey) ?? null;
-    const syncStale = syncCapable && (
-      lastSuccessfulSync == null || (now - lastSuccessfulSync) >= SYNC_STALENESS_THRESHOLD_MS
+    const syncHealthObservable = connected && (syncCapability === 'supported' || syncCapability === 'unknown');
+    const syncStale = syncHealthObservable && (
+      backoff != null ||
+      lastSuccessfulSync == null ||
+      (now - lastSuccessfulSync) >= SYNC_STALENESS_THRESHOLD_MS
     );
     const syncStatus = {
       capable: syncCapable,
+      capability: syncCapability,
       lastSuccessfulSyncAt: lastSuccessfulSync,
       stale: syncStale,
-      backoff: syncCapable && backoff
+      backoff: syncHealthObservable && backoff
         ? {
             failures: backoff.failures,
             nextRetryAt: backoff.nextRetryAt,
@@ -21602,7 +21664,7 @@ export class DKGAgent {
 
     return {
       peerId: peerKey,
-      connected: rawConns.length > 0,
+      connected,
       rawConnectionCount: rawConns.length,
       getConnectionsReturnsForPeer: keyedConns.length,
       connections,

@@ -13,6 +13,7 @@ import { FakeServer, FakeClient, makeConfig } from './harness.js';
 const PEER_A = '12D3KooWFq5KMnSMyYr8Z8t8a6Vh1Y6N6KkF5UZjLpCqUkBJsAaa';
 const STALE_SYNC_STATUS = {
   capable: false,
+  capability: 'unknown' as const,
   lastSuccessfulSyncAt: null,
   stale: true,
   backoff: null,
@@ -62,6 +63,7 @@ describe('health tools', () => {
         syncCapable: true,
         syncStatus: {
           capable: true,
+          capability: 'supported',
           lastSuccessfulSyncAt: 1715670005000,
           stale: false,
           backoff: null,

@@ -398,6 +398,45 @@ describe('DKGAgent sync retry — periodic reconciler', () => {
     }
   });
 
+  it('bypasses pending backoff when the live protocol fingerprint changes', async () => {
+    const agent = await DKGAgent.create({
+      name: 'ReconcilerBackoffFingerprint',
+      listenHost: '127.0.0.1',
+      chainAdapter: new MockChainAdapter(),
+    });
+    try {
+      await agent.start();
+
+      const peerA = freshPeerIdString();
+      const origGetPeers = agent.node.libp2p.getPeers.bind(agent.node.libp2p);
+      vi.spyOn(agent.node.libp2p, 'getPeers').mockImplementation(
+        () => [...origGetPeers(), peerIdFromString(peerA)],
+      );
+      vi.spyOn(agent as any, 'getPeerProtocols').mockResolvedValue([PROTOCOL_SYNC]);
+      const trySync = vi.spyOn(agent as any, 'trySyncFromPeer').mockResolvedValue(undefined);
+
+      const backoffMap = (agent as any).syncReconcilerBackoff as Map<
+        string,
+        { failures: number; nextRetryAt: number; protocolsKey?: string | null; connectionKey?: string | null }
+      >;
+      backoffMap.set(peerA, {
+        failures: 1,
+        nextRetryAt: Date.now() + 100_000,
+        protocolsKey: '/dkg/old/sync',
+        connectionKey: null,
+      });
+
+      await (agent as any).reconcileSyncFromConnectedPeers();
+      await flushMicrotasks();
+
+      expect(trySync).toHaveBeenCalledTimes(1);
+      expect(backoffMap.get(peerA)?.failures).toBe(2);
+      expect(backoffMap.get(peerA)?.protocolsKey).toBe(PROTOCOL_SYNC);
+    } finally {
+      await agent.stop().catch(() => {});
+    }
+  });
+
   it('does not back off a peer that still does not advertise PROTOCOL_SYNC', async () => {
     const agent = await DKGAgent.create({
       name: 'ReconcilerNoSyncNoBackoff',
@@ -415,6 +454,7 @@ describe('DKGAgent sync retry — periodic reconciler', () => {
       const getPeerProtocols = vi
         .spyOn(agent as any, 'getPeerProtocols')
         .mockResolvedValue(['/ipfs/id/1.0.0']);
+      const trySync = vi.spyOn(agent as any, 'trySyncFromPeer');
 
       const backoffMap = (agent as any).syncReconcilerBackoff as Map<
         string,
@@ -426,7 +466,8 @@ describe('DKGAgent sync retry — periodic reconciler', () => {
       await (agent as any).reconcileSyncFromConnectedPeers();
       await flushMicrotasks();
 
-      expect(getPeerProtocols).toHaveBeenCalledTimes(2);
+      expect(trySync).toHaveBeenCalledTimes(2);
+      expect(getPeerProtocols.mock.calls.length).toBeGreaterThanOrEqual(2);
       expect((agent as any).skippedNoSyncPeers.has(peerA)).toBe(true);
       expect(backoffMap.has(peerA)).toBe(false);
     } finally {

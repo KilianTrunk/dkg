@@ -6274,46 +6274,15 @@ export class DKGAgent {
     opCtx?: OperationContext,
   ): Promise<boolean> {
     try {
-      const trimmed = contextGraphId.trim();
-
-      // Resolve a CANDIDATE on-chain id. Local-id resolution is authoritative
-      // for ADDRESSING: getContextGraphOnChainId maps any locally-known
-      // context-graph id — including a registered CG whose user-chosen id is
-      // numeric (a CG "named 42") — to THAT graph's persisted on-chain id. If
-      // it doesn't resolve and the caller passed a bare decimal, treat the
-      // number itself as the candidate (share('42', ...)). Either way the
-      // candidate is only a CANDIDATE — trust comes from the live proof below.
-      let onChainId: string | null = null;
-      let resolvedFromLocalCg = false;
-      if (typeof this.getContextGraphOnChainId === 'function') {
-        onChainId = await this.getContextGraphOnChainId(contextGraphId);
-        if (onChainId) resolvedFromLocalCg = true;
-      }
-      if (!onChainId && /^\d+$/.test(trimmed)) {
-        onChainId = trimmed;
-      }
-      if (!onChainId) return false;
-
-      // IDENTITY BINDING (#884 review GZEqF). A candidate resolved from the
-      // LOCAL mapping must be proven to still BE this CG on the current chain
-      // before we downgrade its SWM to plaintext — `getContextGraphOnChainId`
-      // is persisted local state that survives a devnet reset, so it can point
-      // at a slot now occupied by an unrelated CG. (The bare-numeric path is
-      // the caller explicitly addressing a raw on-chain slot, so there is no
-      // local identity to re-bind.) Additive hardening: only an AFFIRMATIVE
-      // name-hash mismatch fails closed here.
-      if (resolvedFromLocalCg && !(await this.localCgMatchesOnChainSlot(contextGraphId, onChainId, opCtx))) {
-        return false;
-      }
-
-      // LIVE-ON-CHAIN PROOF GATE (#884 review). A "public ⇒ plaintext" decision
-      // must be backed by the chain, never by local state alone — see
-      // readLiveOnChainAccessPolicy for the full rationale (default-zero
-      // access policy for unknown ids, probe-poisoned cache, stale rehydrated
-      // subscriptions / persisted mappings). It returns the policy ONLY once
-      // the slot is proven live, else null (UNKNOWN) → fail closed here.
-      const policy = await this.readLiveOnChainAccessPolicy(onChainId, opCtx);
-      return policy === 0;
+      // DEFINITIVELY public iff the live-proven on-chain policy is `0`. Every
+      // other tri-state value — `1` (private), `'unregistered'` (no resolvable
+      // slot), `'unknown'` (resolvable but not live / stale mapping / missing
+      // probe / timeout) — is NOT a proof of public, so it fails closed here
+      // (the SWM-gossip caller then keeps the encrypted path). The shared
+      // resolver collapses unknown↔not-public ONLY for this boolean predicate;
+      // the publish-inline probe consumes the tri-state directly so it can
+      // REFUSE (rather than choose plaintext) on a genuine UNKNOWN.
+      return (await this.resolveOnChainAccessPolicyState(contextGraphId, opCtx)) === 0;
     } catch (err) {
       // Fail closed (curated/encrypted) on any lookup failure, but not
       // silently — surface WHY the public override was skipped so operators
@@ -6326,6 +6295,89 @@ export class DKGAgent {
       );
       return false;
     }
+  }
+
+  /**
+   * #884 review (🔴 GZh-c) — the SINGLE tri-state on-chain access-policy
+   * resolver shared by the SWM-plaintext gate ({@link isContextGraphPublicOnChain})
+   * and the publish-inline curated probe (`probeIsCurated`). Distinguishing
+   * "definitively not public" from "could not prove" is security-relevant:
+   * the boolean gate treats both as fail-closed (encrypt), but the publish
+   * path must REFUSE on a genuine UNKNOWN instead of silently defaulting a
+   * possibly-private CG onto the plaintext-inline path. Returning a tri-state
+   * (rather than a boolean) is what lets the publish caller fail closed by
+   * THROWING while still letting a genuinely pure-local CG keep its plaintext
+   * default.
+   *
+   * Resolution mirrors the addressing rules: a local id maps through
+   * {@link getContextGraphOnChainId} (authoritative for a registered CG whose
+   * user-chosen id is itself numeric), else a bare decimal is treated as a raw
+   * on-chain slot the caller addressed directly. A locally-mapped candidate is
+   * IDENTITY-BOUND to its on-chain committed name-hash before trust (a persisted
+   * mapping survives a devnet reset and can point at a reused slot); an
+   * affirmative mismatch downgrades to `'unknown'` (fail closed), never to a
+   * clean `'unregistered'`.
+   *
+   * Returns:
+   *   - `0` / `1`        — live-proven public / private on-chain policy.
+   *   - `'unregistered'` — no resolvable on-chain slot (a pure-local CG); the
+   *                        publish path keeps its plaintext-inline default.
+   *   - `'unknown'`      — resolvable but UNPROVABLE (slot not live, stale local
+   *                        mapping, no liveness probe, or a bounded-read
+   *                        timeout) → callers fail closed.
+   * A genuine RPC REJECTION propagates (NOT swallowed) so each caller applies
+   * its own fail-closed idiom (the boolean gate logs+returns `false`; the
+   * publish probe logs+returns `null` → "access-policy is unknown" throw).
+   */
+  private async resolveOnChainAccessPolicyState(
+    contextGraphId: string,
+    opCtx?: OperationContext,
+  ): Promise<0 | 1 | 'unregistered' | 'unknown'> {
+    const trimmed = contextGraphId.trim();
+
+    // Resolve a CANDIDATE on-chain id. Local-id resolution is authoritative
+    // for ADDRESSING: getContextGraphOnChainId maps any locally-known
+    // context-graph id — including a registered CG whose user-chosen id is
+    // numeric (a CG "named 42") — to THAT graph's persisted on-chain id. If
+    // it doesn't resolve and the caller passed a bare decimal, treat the
+    // number itself as the candidate (share('42', ...)). Either way the
+    // candidate is only a CANDIDATE — trust comes from the live proof below.
+    let onChainId: string | null = null;
+    let resolvedFromLocalCg = false;
+    if (typeof this.getContextGraphOnChainId === 'function') {
+      onChainId = await this.getContextGraphOnChainId(contextGraphId);
+      if (onChainId) resolvedFromLocalCg = true;
+    }
+    if (!onChainId && /^\d+$/.test(trimmed)) {
+      onChainId = trimmed;
+    }
+    // No resolvable on-chain slot at all — a pure-local CG. This is NOT
+    // "unknown": there is nothing on-chain to fail closed against, so the
+    // publish path keeps its long-standing plaintext-inline default for
+    // local-only workspaces (and the boolean gate reads it as not-public).
+    if (!onChainId) return 'unregistered';
+
+    // IDENTITY BINDING (#884 review GZEqF). A candidate resolved from the
+    // LOCAL mapping must be proven to still BE this CG on the current chain
+    // before we trust its policy — `getContextGraphOnChainId` is persisted
+    // local state that survives a devnet reset, so it can point at a slot now
+    // occupied by an unrelated CG. (The bare-numeric path is the caller
+    // explicitly addressing a raw on-chain slot, so there is no local identity
+    // to re-bind.) An affirmative name-hash mismatch is a STALE mapping → treat
+    // as 'unknown' (fail closed), not 'unregistered' (which would re-enable the
+    // plaintext default for a graph we just proved we can't trust).
+    if (resolvedFromLocalCg && !(await this.localCgMatchesOnChainSlot(contextGraphId, onChainId, opCtx))) {
+      return 'unknown';
+    }
+
+    // LIVE-ON-CHAIN PROOF GATE (#884 review). A trust decision must be backed
+    // by the chain, never by local state alone — see readLiveOnChainAccessPolicy
+    // for the full rationale (default-zero access policy for unknown ids,
+    // probe-poisoned cache, stale rehydrated subscriptions / persisted
+    // mappings). It returns the policy ONLY once the slot is proven live, else
+    // null (UNKNOWN). A genuine RPC rejection propagates to the caller.
+    const policy = await this.readLiveOnChainAccessPolicy(onChainId, opCtx);
+    return policy === 0 || policy === 1 ? policy : 'unknown';
   }
 
   /**
@@ -9365,37 +9417,47 @@ export class DKGAgent {
     const ctx = createOperationContext('publish');
     const targetCgId = publishContextGraphId ?? contextGraphId;
     const probeIsCurated = async (cgId: string): Promise<boolean | null> => {
-      // A CG that is PUBLIC on-chain is never curated for SWM-encryption
-      // purposes, even if it carries an allowedAgent list (publish
-      // authority). Check this FIRST so `isPrivateContextGraph`'s
-      // allowlist-implies-private heuristic doesn't force encrypted inline
-      // payloads onto a public CG (which keeps publish consistent with the
-      // plaintext SWM-gossip path).
-      if (await this.isContextGraphPublicOnChain(cgId, ctx)) return false;
+      // Consume the SHARED tri-state resolver (the same one behind the
+      // SWM-gossip gate) so the publish-inline path can never DIVERGE from it,
+      // and — critically (#884 review 🔴 GZh-c) — so a genuine UNKNOWN is
+      // PRESERVED here instead of collapsing to "not public ⇒ plaintext". The
+      // resolver already does the live-on-chain proof, identity binding, and
+      // bounded reads; a thrown RPC rejection is caught below and also
+      // fails closed.
+      let policyState: 0 | 1 | 'unregistered' | 'unknown';
       try {
-        if (await this.isPrivateContextGraph(cgId)) return true;
-      } catch { /* fall through to chain probe */ }
-      // #884 review (🔴): for a bare on-chain numeric id, read the access
-      // policy ONLY behind a LIVE proof — the same gate isContextGraphPublicOnChain
-      // uses. getContextGraphAccessPolicy returns Solidity's permissive default
-      // 0 (= public) for UNKNOWN ids, and the policy cache can be probe-poisoned
-      // for arbitrary numeric ids, so an unregistered numeric id must NOT be
-      // downgraded to the plaintext-inline path: readLiveOnChainAccessPolicy
-      // returns null (UNKNOWN) unless the slot is proven live, and a null here
-      // makes the caller fail closed (throws "publish access-policy is unknown")
-      // rather than choosing plaintext. A non-numeric local CG carries no
-      // on-chain id, so it keeps its existing plaintext-inline default.
-      // policy 1 (private/curated) ⇒ curated; 0 (public) ⇒ not curated (this
-      // branch is normally pre-empted by the public check above).
-      if (!/^\d+$/.test(cgId.trim())) return false;
-      try {
-        const policy = await this.readLiveOnChainAccessPolicy(cgId.trim(), ctx);
-        if (policy === null) return null;
-        return policy === 1;
+        policyState = await this.resolveOnChainAccessPolicyState(cgId, ctx);
       } catch (err) {
         this.log.warn(ctx, `${logPrefix}: chain access-policy probe for ${cgId} failed — treating as UNKNOWN (fail-closed): ${err instanceof Error ? err.message : String(err)}`);
         return null;
       }
+      // PUBLIC on-chain ⇒ never curated for SWM-encryption purposes, even with
+      // an allowedAgent list (that governs publish authority). Decide this
+      // BEFORE `isPrivateContextGraph`, whose allowlist-implies-private
+      // heuristic would otherwise force encrypted inline payloads onto a public
+      // CG and diverge from the plaintext SWM-gossip path.
+      if (policyState === 0) return false;
+      // PRIVATE on-chain ⇒ curated ⇒ encrypted inline payload.
+      if (policyState === 1) return true;
+      if (policyState === 'unknown') {
+        // Resolvable on-chain but UNPROVABLE (not live / stale mapping / no
+        // liveness probe / timeout). A positive LOCAL curated signal is a safe
+        // downgrade-to-encrypted (never a leak), so honor it; otherwise keep
+        // the UNKNOWN so the caller REFUSES (throws "publish access-policy is
+        // unknown") rather than silently choosing plaintext for what may be a
+        // private CG.
+        try {
+          if (await this.isPrivateContextGraph(cgId)) return true;
+        } catch { /* can't add a positive curated signal — stay unknown */ }
+        return null;
+      }
+      // 'unregistered': no on-chain slot at all (a pure-local CG). Fall back to
+      // the local allowlist-implies-private heuristic; absent that, keep the
+      // long-standing plaintext-inline default for local-only workspaces.
+      try {
+        if (await this.isPrivateContextGraph(cgId)) return true;
+      } catch { /* fall through to the plaintext-inline default */ }
+      return false;
     };
     const sourceIsCurated = await probeIsCurated(contextGraphId);
     const targetIsCurated = targetCgId === contextGraphId

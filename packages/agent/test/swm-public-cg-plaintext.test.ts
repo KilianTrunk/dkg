@@ -89,6 +89,7 @@ function makeAgentLike(opts: {
   };
   // Bind the prototype methods under test so `this` resolves to agentLike.
   agentLike.isContextGraphPublicOnChain = (DKGAgent.prototype as any).isContextGraphPublicOnChain;
+  agentLike.resolveOnChainAccessPolicyState = (DKGAgent.prototype as any).resolveOnChainAccessPolicyState;
   agentLike.localCgMatchesOnChainSlot = (DKGAgent.prototype as any).localCgMatchesOnChainSlot;
   agentLike.readLiveOnChainAccessPolicy = (DKGAgent.prototype as any).readLiveOnChainAccessPolicy;
   agentLike.raceChainPolicyRead = (DKGAgent.prototype as any).raceChainPolicyRead;
@@ -384,5 +385,38 @@ describe('DKGAgent publish-inline gating respects on-chain public policy', () =>
     const agentLike = makeAgentLike({ onChainId: '1', accessPolicy: 0, isPrivate: true });
     await expect(resolveInline(agentLike, '0xCURATOR/experimental-music')).resolves.toBeUndefined();
     expect(agentLike.isPrivateContextGraph).not.toHaveBeenCalled();
+  });
+
+  it('a REGISTERED local CG whose liveness cannot be proven fails CLOSED (throws) — not plaintext (#884 review GZh-c)', async () => {
+    // getContextGraphOnChainId resolves the CG → slot 5 (it IS registered),
+    // but the liveness probe reports not-live (devnet flake / mid-reset). The
+    // shared resolver returns 'unknown' (NOT 'unregistered'), and with no local
+    // curated signal the publish path must REFUSE rather than silently emit
+    // plaintext for a CG that may be private on-chain. Pre-fix, the boolean
+    // gate collapsed this UNKNOWN to "not public" and the non-numeric branch
+    // defaulted to the plaintext-inline path.
+    const agentLike = makeAgentLike({ onChainId: '5', accessPolicy: 1, activeOnChain: false, isPrivate: false });
+    await expect(resolveInline(agentLike, '0xCURATOR/experimental-music')).rejects.toThrow(
+      /publish access-policy is unknown/,
+    );
+  });
+
+  it('a REGISTERED local CG with an UNKNOWN policy but a positive local curated signal stays curated (safe) (#884 review GZh-c)', async () => {
+    // Same unprovable-liveness case, but the local allowlist-implies-private
+    // heuristic fires. Encrypting is never a leak, so probeIsCurated returns
+    // curated=true instead of refusing — proving 'unknown' does NOT blanket-
+    // reject when a safe positive signal exists. It then proceeds PAST the
+    // policy probe into the sender-key bootstrap, which this lightweight
+    // harness doesn't stub, so it rejects with a NON-"unknown" error.
+    const agentLike = makeAgentLike({ onChainId: '5', activeOnChain: false, isPrivate: true });
+    let err: unknown;
+    try {
+      await resolveInline(agentLike, '0xCURATOR/experimental-music');
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeDefined();
+    expect((err as Error).message).not.toMatch(/publish access-policy is unknown/);
+    expect(agentLike.isPrivateContextGraph).toHaveBeenCalled();
   });
 });

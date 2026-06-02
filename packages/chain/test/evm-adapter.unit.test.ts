@@ -11,6 +11,7 @@ import {
   effectivePublishAllowance,
   enrichEvmError,
   EVMChainAdapter,
+  isTooLowAllowanceError,
   resolveRpcUrls,
   V10_PUBLISH_ONCHAIN_MIN_ALLOWANCE,
   type EVMAdapterConfig,
@@ -2389,5 +2390,245 @@ describe('createKnowledgeAssets / updateKnowledgeCollectionV10 — approval sign
 
     expect(signSpy).toHaveBeenCalledTimes(1);
     expect(signSpy.mock.calls[0][0]).toBe(walletB);
+  });
+});
+
+// -----------------------------------------------------------------------------
+// #888 — intermittent `TooLowAllowance(TRAC, 0, 1)` on consecutive zero-cost
+// publishes. The on-chain allowance read that gates the auto-approve and the
+// `estimateGas` ethers runs while populating the publish tx can observe a
+// STALE allowance on an internally load-balanced RPC: either a just-consumed
+// per-publish 1-wei floor still reads as `1` (so the re-approve is skipped) or
+// a freshly-sent approve hasn't propagated to the read replica yet. The fix:
+//   1. `isTooLowAllowanceError` classifies the revert,
+//   2. `createKnowledgeAssets` retries populate+sign once on that revert with a
+//      forced re-approve (the revert is strictly pre-broadcast, so it's safe),
+//   3. the forced re-approve approves up to the publish floor regardless of the
+//      gating read and confirms the new allowance is visible before returning.
+// -----------------------------------------------------------------------------
+
+describe('isTooLowAllowanceError (#888)', () => {
+  it('matches the ethers v6 decoded custom-error shape (revert.name)', () => {
+    expect(isTooLowAllowanceError({ revert: { name: 'TooLowAllowance' }, message: 'execution reverted' })).toBe(true);
+  });
+
+  it('matches a stringified revert in message / shortMessage / reason', () => {
+    expect(isTooLowAllowanceError(new Error('execution reverted: TooLowAllowance(0xTRAC, 0, 1)'))).toBe(true);
+    expect(isTooLowAllowanceError({ shortMessage: 'execution reverted (TooLowAllowance)' })).toBe(true);
+    expect(isTooLowAllowanceError({ reason: 'TooLowAllowance' })).toBe(true);
+  });
+
+  it('matches a nested cause.message', () => {
+    expect(isTooLowAllowanceError({ message: 'wrapped', cause: new Error('inner: TooLowAllowance(...)') })).toBe(true);
+  });
+
+  it('does not match unrelated reverts / errors', () => {
+    expect(isTooLowAllowanceError(new Error('TooLowStake(node, 0, 50000)'))).toBe(false);
+    expect(isTooLowAllowanceError({ revert: { name: 'NotBatchPublisher' }, message: 'execution reverted' })).toBe(false);
+    expect(isTooLowAllowanceError(new Error('insufficient funds for gas'))).toBe(false);
+  });
+
+  it('handles non-object / null / numeric / string inputs safely', () => {
+    expect(isTooLowAllowanceError(null)).toBe(false);
+    expect(isTooLowAllowanceError(undefined)).toBe(false);
+    expect(isTooLowAllowanceError('TooLowAllowance')).toBe(false);
+    expect(isTooLowAllowanceError(42)).toBe(false);
+  });
+});
+
+function makeV10AdapterWithAllowanceSequence(values: bigint[]) {
+  const a = new EVMChainAdapter(minimalConfig());
+  let i = 0;
+  const tokenWithSigner = {
+    allowance: vi.fn(async () => values[Math.min(i++, values.length - 1)]),
+    approve: vi.fn(),
+  };
+  const tokenRoot = { connect: vi.fn(() => tokenWithSigner) };
+  (a as any).contracts.token = tokenRoot;
+  const sendSpy = vi.fn(async () => ({} as unknown));
+  (a as any).sendContractTransaction = sendSpy;
+  const signer = new ethers.Wallet(DEPLOYER_PK);
+  return { a, signer, tokenWithSigner, sendSpy };
+}
+
+describe('ensureV10ApproveTrac — forced re-approve + visibility poll (#888)', () => {
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  it('force=true re-approves even when the gating read says the allowance is already sufficient (stale-high skip)', async () => {
+    // The "stale-high" sub-race: the per-publish 1-wei floor consumed by
+    // the previous publish still reads as `1`, so `needsApprove` is false
+    // and the un-forced path would skip the approve — but the real
+    // on-chain allowance is 0 and the publish would revert. Forcing the
+    // re-approve corrects this.
+    const { a, signer, tokenWithSigner, sendSpy } = makeV10Adapter(undefined, 1n);
+
+    await (a as any).ensureV10ApproveTrac(
+      signer,
+      V10_KA_ADDRESS,
+      0n,
+      'approve V10 publish TRAC (forced re-approve, #888)',
+      true,
+    );
+
+    const call = getApproveCallArgs(sendSpy);
+    expect(call.method).toBe('approve');
+    expect(call.args).toEqual([V10_KA_ADDRESS, 1n]);
+    // gating read (1n) + one visibility-poll read (1n ≥ target → confirmed).
+    expect(tokenWithSigner.allowance).toHaveBeenCalledTimes(2);
+  });
+
+  it('force=false with a sufficient allowance issues NO approve and NO visibility poll (steady-state unchanged)', async () => {
+    const { a, signer, tokenWithSigner, sendSpy } = makeV10Adapter(undefined, 1n);
+
+    await (a as any).ensureV10ApproveTrac(
+      signer,
+      V10_KA_ADDRESS,
+      0n,
+      'approve V10 publish TRAC',
+    );
+
+    expect(sendSpy).not.toHaveBeenCalled();
+    // Only the single gating read — the poll is gated on `force`.
+    expect(tokenWithSigner.allowance).toHaveBeenCalledTimes(1);
+  });
+
+  it('forced re-approve polls until the fresh approve becomes visible on the RPC read path', async () => {
+    const { a, signer, tokenWithSigner, sendSpy } = makeV10AdapterWithAllowanceSequence([
+      0n, // gating read → needsApprove
+      0n, // poll read 1 → approve not yet propagated to the read replica
+      1n, // poll read 2 → now visible
+    ]);
+
+    await (a as any).ensureV10ApproveTrac(signer, V10_KA_ADDRESS, 0n, 'forced', true);
+
+    expect(sendSpy).toHaveBeenCalledTimes(1); // exactly one approve
+    expect(tokenWithSigner.allowance).toHaveBeenCalledTimes(3); // gating + 2 polls
+  });
+
+  it('forced re-approve is best-effort: gives up after the bounded poll budget without throwing', async () => {
+    const { a, signer, tokenWithSigner, sendSpy } = makeV10AdapterWithAllowanceSequence([0n]); // never visible
+
+    await expect(
+      (a as any).ensureV10ApproveTrac(signer, V10_KA_ADDRESS, 0n, 'forced', true),
+    ).resolves.toBeUndefined();
+
+    expect(sendSpy).toHaveBeenCalledTimes(1);
+    // gating read + 6 bounded poll attempts. Proves the poll is bounded
+    // (no hang); the caller's gas-estimation then surfaces a definitive
+    // revert if the allowance genuinely never propagates.
+    expect(tokenWithSigner.allowance).toHaveBeenCalledTimes(7);
+  }, 15_000);
+
+  // PR #896 review (🔴): each visibility-poll read must be bounded by a
+  // timeout. A raw `token.allowance()` on a hung / read-stalled RPC never
+  // rejects, so without `withTimeout` the supposedly-bounded recovery poll
+  // could block publish/update indefinitely. Drive the whole loop under fake
+  // timers and assert it resolves (does not hang) even when every read stalls
+  // forever.
+  it('bounds each visibility poll with a timeout so a hung RPC read cannot block the recovery (#896)', async () => {
+    vi.useFakeTimers();
+    try {
+      const a = new EVMChainAdapter(minimalConfig());
+      // allowance() returns a promise that never settles — a hung RPC read.
+      const token = { allowance: vi.fn(() => new Promise<bigint>(() => {})) };
+      const done = vi.fn();
+      const poll = (a as any)
+        .confirmAllowanceVisible(token, '0xowner', V10_KA_ADDRESS, 1n)
+        .then(done);
+      // Advance past 6 × (4s read timeout) + the capped backoff sleeps.
+      await vi.advanceTimersByTimeAsync(60_000);
+      await poll;
+      // Resolved rather than hanging, and each of the 6 bounded reads was
+      // attempted (and timed out) instead of blocking on the first one.
+      expect(done).toHaveBeenCalledTimes(1);
+      expect(token.allowance).toHaveBeenCalledTimes(6);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+// PR #896 review (🔴): the forced-re-approve recovery was inlined in the
+// publish path only, leaving `updateV10` exposed to the same stale-allowance
+// race on metadata-only updates. The recovery now lives in a shared helper
+// (`populateAndSignV10WithAllowanceRecovery`) used by BOTH V10 write paths.
+// These tests pin that shared behaviour directly.
+function makeRecoveryAdapter() {
+  const a = new EVMChainAdapter(minimalConfig());
+  const ensureSpy = vi.fn(async () => {});
+  const signSpy = vi.fn(async () => ({ signedTx: '0xsigned', txHash: '0xhash' }));
+  (a as any).ensureV10ApproveTrac = ensureSpy;
+  (a as any).signPopulatedTransaction = signSpy;
+  return { a, ensureSpy, signSpy, signer: new ethers.Wallet(DEPLOYER_PK) };
+}
+
+const tooLowAllowanceRevert = () =>
+  new Error('execution reverted: TooLowAllowance(0xTRAC, 0, 1)');
+
+describe('populateAndSignV10WithAllowanceRecovery — shared publish/update recovery (#888/#896)', () => {
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  // The 🔴 fix: BOTH write paths recover from a pre-broadcast
+  // `TooLowAllowance` revert, not just publish.
+  it.each(['publish', 'update'] as const)(
+    'forces a fresh approve and retries populate+sign exactly once on a stale TooLowAllowance (%s)',
+    async (method) => {
+      const { a, ensureSpy, signSpy, signer } = makeRecoveryAdapter();
+      const populate = vi.fn()
+        .mockRejectedValueOnce(tooLowAllowanceRevert())
+        .mockResolvedValueOnce({ to: V10_KA_ADDRESS, data: '0xabcd' });
+      const kaContract = { [method]: { populateTransaction: populate } };
+
+      const result = await (a as any).populateAndSignV10WithAllowanceRecovery(
+        signer,
+        kaContract,
+        method,
+        { some: 'params' },
+        V10_KA_ADDRESS,
+        0n,
+        `approve V10 ${method} TRAC (forced re-approve, #888)`,
+      );
+
+      expect(result).toEqual({ signedTx: '0xsigned', txHash: '0xhash' });
+      expect(populate).toHaveBeenCalledTimes(2); // initial revert + one retry
+      expect(signSpy).toHaveBeenCalledTimes(1);  // signed only after the retry
+      // forced re-approve fired once, against the right KA + with force=true.
+      expect(ensureSpy).toHaveBeenCalledTimes(1);
+      expect(ensureSpy.mock.calls[0][0]).toBe(signer);
+      expect(ensureSpy.mock.calls[0][1]).toBe(V10_KA_ADDRESS);
+      expect(ensureSpy.mock.calls[0][4]).toBe(true);
+    },
+  );
+
+  it('propagates a SECOND consecutive TooLowAllowance (recovery is one-shot, no infinite loop)', async () => {
+    const { a, ensureSpy, signSpy, signer } = makeRecoveryAdapter();
+    const populate = vi.fn().mockRejectedValue(tooLowAllowanceRevert());
+    const kaContract = { publish: { populateTransaction: populate } };
+
+    await expect(
+      (a as any).populateAndSignV10WithAllowanceRecovery(
+        signer, kaContract, 'publish', {}, V10_KA_ADDRESS, 0n, 'label',
+      ),
+    ).rejects.toThrow('TooLowAllowance');
+
+    expect(populate).toHaveBeenCalledTimes(2); // initial + one forced retry, then give up
+    expect(ensureSpy).toHaveBeenCalledTimes(1);
+    expect(signSpy).not.toHaveBeenCalled();
+  });
+
+  it('propagates an unrelated revert immediately without forcing a re-approve', async () => {
+    const { a, ensureSpy, signSpy, signer } = makeRecoveryAdapter();
+    const populate = vi.fn().mockRejectedValue(new Error('execution reverted: NotBatchPublisher()'));
+    const kaContract = { update: { populateTransaction: populate } };
+
+    await expect(
+      (a as any).populateAndSignV10WithAllowanceRecovery(
+        signer, kaContract, 'update', {}, V10_KA_ADDRESS, 0n, 'label',
+      ),
+    ).rejects.toThrow('NotBatchPublisher');
+
+    expect(populate).toHaveBeenCalledTimes(1); // no retry on a non-allowance error
+    expect(ensureSpy).not.toHaveBeenCalled();
+    expect(signSpy).not.toHaveBeenCalled();
   });
 });

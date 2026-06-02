@@ -608,7 +608,7 @@ describe('handleNodeUIRequest replication routes (Phase F)', () => {
       context_graph_id: 'mfacts', name: 'Monday Fun Facts', subscribed: 1, synced: 1,
       on_chain_id: '7', last_reconciled_ordinal: 2, sync_scoped: 1, updated_at: now,
     });
-    db.insertReplicationEvent({ ts: now - 6000, context_graph_id: 'mfacts', on_chain_cg_id: '7', action: 'fetch', ual: 'urn:ka:1' });
+    db.insertReplicationEvent({ ts: now - 6000, context_graph_id: 'mfacts', on_chain_cg_id: '7', action: 'fetch', ual: 'urn:ka:1', ordinal: 1 });
     db.insertReplicationEvent({ ts: now - 3000, context_graph_id: 'mfacts', on_chain_cg_id: '7', action: 'promote', ual: 'urn:ka:1', ordinal: 1 });
     db.insertReplicationEvent({ ts: now - 2000, context_graph_id: 'mfacts', on_chain_cg_id: '7', action: 'cursor-advance', from_watermark: 1, to_watermark: 2, head: 4 });
   });

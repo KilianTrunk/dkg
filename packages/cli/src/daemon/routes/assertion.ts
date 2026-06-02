@@ -394,6 +394,19 @@ function normalizeIriBinding(cell: unknown): string {
   return bindingCellValue(cell).replace(/^<|>$/g, '').trim();
 }
 
+function singletonMetadataBinding(
+  bindings: Array<Record<string, unknown>>,
+  key: string,
+  normalize: (cell: unknown) => string,
+  label: string,
+): string {
+  const values = [...new Set(bindings.map((binding) => normalize(binding[key])).filter(Boolean))];
+  if (values.length > 1) {
+    throw new ImportArtifactRouteError(409, `Import metadata contains conflicting ${label} values`);
+  }
+  return values[0] ?? '';
+}
+
 function optionalPositiveInteger(cell: unknown): number | undefined {
   return parseOpenClawAttachmentTripleCount(bindingCellValue(cell));
 }
@@ -864,12 +877,11 @@ async function resolveImportedArtifactFromSharedMemory(
         OPTIONAL { <${args.assertionUri}> <${DKG_ONTOLOGY}markdownForm> ?markdownForm }
       }
     }
-    LIMIT 1
   `) as { type?: string; bindings?: Array<Record<string, unknown>> };
-  const binding = result.bindings?.[0];
-  if (!binding) return undefined;
+  const bindings = result.bindings ?? [];
+  if (bindings.length === 0) return undefined;
 
-  const sourceFile = normalizeIriBinding(binding.sourceFile);
+  const sourceFile = singletonMetadataBinding(bindings, 'sourceFile', normalizeIriBinding, 'source file');
   const sourceFileHash = hashFromFileUrn(sourceFile);
   if (!sourceFileHash || !validateContentHash(sourceFileHash)) {
     throw new ImportArtifactRouteError(409, 'Shared-memory import metadata is missing a valid source file hash');
@@ -878,10 +890,15 @@ async function resolveImportedArtifactFromSharedMemory(
     throw new ImportArtifactRouteError(400, 'fileHash does not match import metadata');
   }
 
-  const durableSourceContentType = normalizeLiteralBinding(binding.contentType) || undefined;
+  const durableSourceContentType = singletonMetadataBinding(
+    bindings,
+    'contentType',
+    normalizeLiteralBinding,
+    'source content type',
+  ) || undefined;
   const sourceContentType = normalizeDetectedContentType(durableSourceContentType);
-  const rootEntity = normalizeIriBinding(binding.rootEntity) || undefined;
-  const markdownFormValue = normalizeIriBinding(binding.markdownForm) || undefined;
+  const rootEntity = singletonMetadataBinding(bindings, 'rootEntity', normalizeIriBinding, 'root entity') || undefined;
+  const markdownFormValue = singletonMetadataBinding(bindings, 'markdownForm', normalizeIriBinding, 'Markdown form') || undefined;
   const markdownFormHash = hashFromFileUrn(markdownFormValue);
   if (markdownFormValue && (!markdownFormHash || !validateContentHash(markdownFormHash))) {
     throw new ImportArtifactRouteError(409, 'Import metadata is missing a valid Markdown intermediate hash');

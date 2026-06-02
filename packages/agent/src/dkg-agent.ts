@@ -11396,11 +11396,20 @@ export class DKGAgent {
     }
   }
 
-  private getBeaconCatchupSigner(contextGraphId: string): { privateKey: string } | null {
+  private async getWorkspaceCatchupSigner(contextGraphId: string): Promise<{ privateKey: string } | null> {
     const wireId = this.gossipWireIdFor(contextGraphId);
     for (const entry of this.beaconRegistry.values()) {
       if (entry.signerPrivateKey && entry.wireId.toLowerCase() === wireId.toLowerCase()) {
         return { privateKey: entry.signerPrivateKey };
+      }
+    }
+
+    const allowedAgents = await this.getContextGraphAgentGateAddresses(contextGraphId).catch(() => null);
+    if (!allowedAgents || allowedAgents.length === 0) return null;
+    const allowedSet = new Set(allowedAgents.map((agent) => agent.toLowerCase()));
+    for (const record of this.localAgents.values()) {
+      if (record.privateKey && allowedSet.has(record.agentAddress.toLowerCase())) {
+        return { privateKey: record.privateKey };
       }
     }
     return null;
@@ -12337,19 +12346,20 @@ export class DKGAgent {
     const maxEntries = options?.maxEntriesPerRound ?? SWM_HOST_CATCHUP_DEFAULT_MAX_ENTRIES;
     const maxBytes = SWM_HOST_CATCHUP_DEFAULT_MAX_BYTES;
     // OT-RFC-38 LU-6 B1 — every catchup request is signed by the
-    // requesting agent's chain EOA so the host can authenticate via
-    // on-chain participant set without trusting the libp2p peer-id.
+    // requesting participant key so the host can authenticate via
+    // on-chain / agent-gated membership without trusting the libp2p
+    // peer-id.
     //
     // Codex PR #618 R2: we deliberately do NOT pre-compute the
     // requester EOA from `getRegistrationTxSignerAddress()`. The
     // chain adapter's tx-signer can differ from its message-signer
-    // (per the helper's own doc-comment), and binding the two
-    // independently produced "signer mismatch" rejections in every
-    // adapter except the EVM one. `mintSignedCatchupRequest` now
-    // recovers the actual signer from the signature itself and
-    // binds the digest to it — no caller-side lookup needed.
-    const beaconCatchupSigner = this.getBeaconCatchupSigner(contextGraphId);
-    if (!beaconCatchupSigner && typeof this.chain.signMessage !== 'function') {
+    // (per the helper's own doc-comment), and workspace-agent
+    // deployments can sign with a local custodial agent key instead.
+    // `mintSignedCatchupRequest` recovers the actual signer from
+    // the signature itself and binds the digest to it — no caller-
+    // side lookup needed.
+    const workspaceCatchupSigner = await this.getWorkspaceCatchupSigner(contextGraphId);
+    if (!workspaceCatchupSigner && typeof this.chain.signMessage !== 'function') {
       const reason = 'chain adapter does not implement signMessage — cannot mint signed catchup request';
       this.log.warn(ctx, `host-catchup ${reason} to=${remotePeerId} cg=${contextGraphId}`);
       return { rounds: 0, fetched: 0, applied: 0, appliedTriples: 0, skipped: 0, nextSeqno: sinceSeqno, denied: reason };
@@ -12374,8 +12384,8 @@ export class DKGAgent {
         // differ). See `MintSignedCatchupRequestInput.requesterEoa`
         // doc comment for the full rationale.
         sign: async (digest) => {
-          if (beaconCatchupSigner) {
-            return new ethers.Wallet(beaconCatchupSigner.privateKey).signMessage(digest);
+          if (workspaceCatchupSigner) {
+            return new ethers.Wallet(workspaceCatchupSigner.privateKey).signMessage(digest);
           }
           const { r, vs } = await this.chain.signMessage!(digest);
           const sig = ethers.Signature.from({ r: ethers.hexlify(r), yParityAndS: ethers.hexlify(vs) });

@@ -696,6 +696,12 @@ export function ProjectView({ contextGraphId }: ProjectViewProps) {
     openTab(CONTEXT_GRAPH_PRIMER_TAB);
   }, [openTab]);
 
+  // A 401 surfaces from useFetch as a specific auth-expiry message whose
+  // remediation is re-authentication (a page refresh), NOT retrying the fetch —
+  // a refetch just 401s again. Detect it so the auth copy + correct affordance
+  // isn't buried behind the generic "Failed to load" + Retry path (Codex, #905).
+  const cgAuthError = !!cgError && /authentication|unauthor|expired|sign in|log in/i.test(cgError);
+
   if (!cg) {
     // GH #905: a failed fetch must surface an error + retry, not masquerade as
     // a perpetual loading state. `useFetch` keeps last-good data, so once the
@@ -706,11 +712,21 @@ export function ProjectView({ contextGraphId }: ProjectViewProps) {
       return (
         <div className="v10-view-placeholder">
           <p style={{ color: 'var(--text-tertiary)', fontSize: 12, marginBottom: 10 }}>
-            {cgError ? 'Failed to load context graph.' : 'Context graph not found.'}
+            {cgError
+              ? cgAuthError
+                ? cgError
+                : 'Failed to load context graph.'
+              : 'Context graph not found.'}
           </p>
-          <button type="button" className="v10-retry-btn" onClick={refreshContextGraphs}>
-            Retry
-          </button>
+          {cgAuthError ? (
+            <button type="button" className="v10-retry-btn" onClick={() => window.location.reload()}>
+              Refresh page
+            </button>
+          ) : (
+            <button type="button" className="v10-retry-btn" onClick={refreshContextGraphs}>
+              Retry
+            </button>
+          )}
         </div>
       );
     }
@@ -761,10 +777,21 @@ export function ProjectView({ contextGraphId }: ProjectViewProps) {
           (Codex). Clears automatically once a refresh succeeds. */}
       {cgError && (
         <div className="v10-stale-banner" role="status">
-          <span>Couldn’t refresh context-graph data — showing last known values.</span>
-          <button type="button" className="v10-retry-btn" onClick={refreshContextGraphs}>
-            Retry
-          </button>
+          {cgAuthError ? (
+            <>
+              <span>{cgError}</span>
+              <button type="button" className="v10-retry-btn" onClick={() => window.location.reload()}>
+                Refresh page
+              </button>
+            </>
+          ) : (
+            <>
+              <span>Couldn’t refresh context-graph data — showing last known values.</span>
+              <button type="button" className="v10-retry-btn" onClick={refreshContextGraphs}>
+                Retry
+              </button>
+            </>
+          )}
         </div>
       )}
       {/* Persistent project chrome — always visible so the user never

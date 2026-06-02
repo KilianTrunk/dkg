@@ -494,13 +494,21 @@ export function buildEntities(layered: LayeredTriple[]): Map<string, MemoryEntit
         });
       }
     } else {
+      // Dedupe on the DECODED display value, not the raw term. The Properties
+      // panel renders only the decoded lexical form, so two literals that share
+      // it (`"hello"@en` vs `"hello"@fr`, `"1"^^xsd:int` vs `"1"^^xsd:string`)
+      // would otherwise show as indistinguishable duplicate rows. Collapsing
+      // them keeps the panel honest until the UI can surface the datatype/lang
+      // distinction (Codex). #913 still holds — the raw `^^<…>`/`@lang` suffix
+      // never reaches the screen.
+      const decoded = decodeRdfStringLiteral(t.object);
       const pKeys = propertyKeys.get(entity.uri) ?? new Set<string>();
-      const rawKey = `${t.predicate}\0${t.object}`;
-      if (!pKeys.has(rawKey)) {
-        pKeys.add(rawKey);
+      const displayKey = `${t.predicate}\0${decoded}`;
+      if (!pKeys.has(displayKey)) {
+        pKeys.add(displayKey);
         propertyKeys.set(entity.uri, pKeys);
         const existing = entity.properties.get(t.predicate) ?? [];
-        existing.push(decodeRdfStringLiteral(t.object));
+        existing.push(decoded);
         entity.properties.set(t.predicate, existing);
       }
     }

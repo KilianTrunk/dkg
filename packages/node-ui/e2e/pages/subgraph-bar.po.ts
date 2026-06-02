@@ -57,15 +57,25 @@ export class SubGraphBarPage {
    * registered (named sub-graphs and/or the Root bucket), so specs select "the
    * first real scope" rather than a hard-coded mock sub-graph name.
    *
-   * NB: a chip's textContent is `${icon}${label}${count}` (e.g. "⊚All31"), so
-   * an anchored `/^All/` regex never matches and would wrongly let the All chip
-   * through. Match the label substring instead — the All chip is the only chip
-   * whose label is "All".
+   * NB: a chip's textContent is `${icon}${label}${count}` (e.g. "⊚All31"), so we
+   * can't filter on the whole chip text — `hasNotText: 'All'` would also exclude
+   * legitimate scopes whose LABEL merely contains that substring (`Allergens`,
+   * `Allocate`, …) and could skip the first real scope or find none. Instead read
+   * each chip's dedicated label element and exact-match it against "All", so only
+   * the aggregate chip (label === "All") is excluded.
    */
   async clickFirstScopeChip() {
-    const scope = this.chips.filter({ hasNotText: 'All' }).first();
-    await scope.waitFor({ state: 'visible', timeout: 15_000 });
-    await scope.click();
+    await this.chips.first().waitFor({ state: 'visible', timeout: 15_000 });
+    const count = await this.chips.count();
+    for (let i = 0; i < count; i++) {
+      const chip = this.chips.nth(i);
+      const label = (await chip.locator(sel.subgraph.chipLabel).textContent())?.trim();
+      if (label && label !== 'All') {
+        await chip.click();
+        return;
+      }
+    }
+    throw new Error('no concrete sub-graph scope chip found (only the aggregate "All" chip is present)');
   }
 
   async getActiveChipLabel(): Promise<string | null> {

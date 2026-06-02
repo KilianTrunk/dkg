@@ -35,9 +35,17 @@ export default defineConfig({
   fullyParallel: true,
   forbidOnly: CI,
   retries: CI ? 2 : 0,
-  // One worker on CI keeps the shared-node contention deterministic; locally we
-  // let Playwright pick (reads tolerate concurrency, mutations are serialised).
-  workers: CI ? 1 : undefined,
+  // The ENTIRE suite drives ONE shared devnet node. CI pins a single worker to
+  // keep contention deterministic. Locally Playwright used to default to
+  // ~cores/2 workers (e.g. 5 on a 10-core box) — but ~5 workers firing cold
+  // `/api` fetches at the one node simultaneously starves each test's
+  // context-graph / observability load past its 15–30s setup wait, producing
+  // mass timeouts in the shared helpers (`waitForProjectsLoaded`,
+  // `openObservability`) that are pure contention, NOT real failures. This bit
+  // hard when the suite was launched via `--ui` (which honours this default).
+  // Pin a node-friendly local default (serial, like CI); crank it deliberately
+  // with `PW_WORKERS=N` once you know the node can take the load.
+  workers: CI ? 1 : Number(process.env.PW_WORKERS) || 1,
   // Real-node round-trips (UI boot + live API) are far slower than the old
   // mock lane, which ran in 15–30s. Give every test room to talk to the daemon.
   timeout: CI ? 120_000 : 60_000,

@@ -56,10 +56,20 @@ export async function createSubGraph(opts: {
       subGraphName: opts.subGraphName,
     }),
   });
-  // 200 (created) or a "already registered" style 4xx are both fine — the
-  // sub-graph exists either way. Surface only unexpected (5xx) failures.
-  if (!res.ok && res.status >= 500) {
-    throw new Error(`createSubGraph failed: ${res.status} ${await res.text()}`);
+  if (!res.ok) {
+    const body = await res.text();
+    // Idempotency: the ONLY benign client error is a duplicate registration —
+    // the sub-graph already exists, so a register-then-seed caller can proceed.
+    // A 409 Conflict or an "already exists/registered" message both signal that.
+    // Every OTHER 4xx (invalid `subGraphName`, unknown context graph, malformed
+    // body, …) is a genuine setup regression that would leave seedSubgraphEntity()
+    // running from a broken precondition — surface it rather than swallow it. 5xx
+    // always throws.
+    const alreadyExists =
+      res.status === 409 || /already\s+(exist|exists|registered|present)/i.test(body);
+    if (!alreadyExists) {
+      throw new Error(`createSubGraph failed: ${res.status} ${body}`);
+    }
   }
 }
 

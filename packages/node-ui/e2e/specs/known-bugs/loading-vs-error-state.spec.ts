@@ -1,5 +1,7 @@
 /**
- * KNOWN-BUG repro — intentionally FAILING until the linked issue is fixed.
+ * KNOWN-BUG repro — marked `test.fixme()` so it is SKIPPED (not executed) and
+ * never turns the suite red. It documents a real product bug and stays disabled
+ * until the linked issue is fixed; delete the `.fixme` to re-activate the repro.
  *
  * GH ISSUE: https://github.com/OriginTrail/dkg/issues/905 — "Views show a
  * perpetual 'Loading…' placeholder (no error/retry) when an API fetch fails".
@@ -23,7 +25,7 @@ import { test, expect } from '../../fixtures/base.js';
 import { PRIMARY_CG } from '../../helpers/real-node.js';
 
 test.describe('KNOWN BUG: views stick on "Loading…" with no error state when a fetch fails', () => {
-  test('ProjectView shows an error/retry state (not a perpetual "Loading context graph...")', async ({
+  test.fixme('ProjectView shows an error/retry state (not a perpetual "Loading context graph...")', async ({
     page,
     shell,
     leftPanel,

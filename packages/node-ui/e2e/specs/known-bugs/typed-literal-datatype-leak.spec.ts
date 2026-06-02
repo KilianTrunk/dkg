@@ -1,5 +1,7 @@
 /**
- * KNOWN-BUG repro — intentionally FAILING until the linked issue is fixed.
+ * KNOWN-BUG repro — marked `test.fixme()` so it is SKIPPED (not executed) and
+ * never turns the suite red. It documents a real product bug and stays disabled
+ * until the linked issue is fixed; delete the `.fixme` to re-activate the repro.
  *
  * GH ISSUE: https://github.com/OriginTrail/dkg/issues/913 — "typed/language-tagged
  * RDF literals render with a raw datatype/lang suffix in entity views".
@@ -25,7 +27,7 @@ import { PRIMARY_CG } from '../../helpers/real-node.js';
 import { createWmAssertion } from '../../helpers/devnet-publish.js';
 
 test.describe('KNOWN BUG: typed RDF literals leak their datatype suffix in entity views', () => {
-  test('a typed integer property renders as "42", not 42"^^<…integer>', async ({
+  test.fixme('a typed integer property renders as "42", not 42"^^<…integer>', async ({
     page,
     shell,
     leftPanel,

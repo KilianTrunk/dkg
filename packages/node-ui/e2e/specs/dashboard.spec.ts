@@ -138,10 +138,16 @@ test.describe('Dashboard (rc.12)', () => {
     for (const layer of ['WM', 'SWM', 'VM']) {
       await expect(card.getByText(layer, { exact: true })).toBeVisible();
     }
-    // The card stacks one layer bar per metric (entities + triples), each with
-    // a WM/SWM/VM segment — so the segment count is a non-zero multiple of 3.
-    await expect(card.locator('.v10-layerbar-seg').first()).toBeVisible({ timeout: 15_000 });
-    const segs = await card.locator('.v10-layerbar-seg').count();
+    // Each size metric (entities + triples) renders ONE WM/SWM/VM proportion
+    // bar, and every populated bar has exactly the three layer segments. Scope
+    // the count to the metric bars (`.v10-cg-size-metric .v10-layerbar-seg`) so
+    // it can't pick up the curator/joined RoleBar in the sibling "My Context
+    // Graphs" card, which reuses `.v10-layerbar-seg` and renders 1–2 segments
+    // (that bleed-through made the old card-wide `% 3 === 0` check flaky). A
+    // populated metric bar is the real invariant: ≥3 segments, in groups of 3.
+    const segLocator = card.locator('.v10-cg-size-metric .v10-layerbar-seg');
+    await expect(segLocator.first()).toBeVisible({ timeout: 15_000 });
+    const segs = await segLocator.count();
     expect(segs).toBeGreaterThanOrEqual(3);
     expect(segs % 3).toBe(0);
   });

@@ -1796,7 +1796,7 @@ async function fetchSingleSwmRoot(contextGraphId: string): Promise<string[]> {
   return requireSinglePublishRoot(roots);
 }
 
-export function LayerActionsWidget({ layer, count, contextGraphId, onComplete }: {
+export function LayerActionsWidget({ layer, count, contextGraphId, entities, onComplete }: {
   layer: 'wm' | 'swm';
   count: number;
   contextGraphId: string;

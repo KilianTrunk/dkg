@@ -913,7 +913,7 @@ export class DashboardDB {
    *  - reconcile success rate — promote / (promote + fetch).
    *  - raw action counts.
    */
-  getReplicationSummary(periodMs = 24 * 86_400_000): ReplicationSummary {
+  getReplicationSummary(periodMs = 86_400_000): ReplicationSummary {
     const cutoff = Date.now() - periodMs;
     const rows = this.db.prepare(
       `SELECT action, COUNT(*) AS n FROM replication_events WHERE ts >= ? GROUP BY action`,
@@ -930,14 +930,22 @@ export class DashboardDB {
     const successRate = attempts > 0 ? promotes / attempts : null;
 
     // Promotion latency: pair each `promote` with the most-recent prior
-    // `fetch` for the same UAL within the window. Promotes without a fetch
-    // (SWM already present — the fast path) contribute a 0ms latency.
+    // `fetch` for the SAME VERSION within the window. The pairing key is the
+    // per-CG registration `ordinal` (+ CG), NOT the UAL: every update of a KA
+    // reuses the same UAL, so keying on UAL would let a later fast-path
+    // promote (no fetch) mispair with an older fetch for a different version
+    // and inflate the reported latency. fetch/promote for one version always
+    // share the same ordinal, so this pairs them exactly; a fast-path promote
+    // with no fetch for its ordinal correctly contributes a 0ms latency.
     const latencyRows = this.db.prepare(`
       SELECT p.ts AS promote_ts,
              (SELECT MAX(f.ts) FROM replication_events f
-                WHERE f.ual = p.ual AND f.action = 'fetch' AND f.ts <= p.ts AND f.ts >= ?) AS fetch_ts
+                WHERE f.action = 'fetch'
+                  AND f.context_graph_id = p.context_graph_id
+                  AND f.ordinal = p.ordinal
+                  AND f.ts <= p.ts AND f.ts >= ?) AS fetch_ts
       FROM replication_events p
-      WHERE p.action = 'promote' AND p.ts >= ? AND p.ual IS NOT NULL
+      WHERE p.action = 'promote' AND p.ts >= ? AND p.ordinal IS NOT NULL
     `).all(cutoff, cutoff) as Array<{ promote_ts: number; fetch_ts: number | null }>;
     const latencies = latencyRows
       .map((r) => (r.fetch_ts != null ? r.promote_ts - r.fetch_ts : 0))
@@ -963,7 +971,7 @@ export class DashboardDB {
   }
 
   /** Per-CG rollup of replication activity over the window, newest-active first. */
-  getReplicationPerCg(periodMs = 24 * 86_400_000): ReplicationPerCgRow[] {
+  getReplicationPerCg(periodMs = 86_400_000): ReplicationPerCgRow[] {
     const cutoff = Date.now() - periodMs;
     return this.db.prepare(`
       SELECT context_graph_id,

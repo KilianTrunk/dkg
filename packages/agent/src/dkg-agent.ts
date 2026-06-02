@@ -216,7 +216,7 @@ import {
   type WorkspaceEncryptionKeyEntry,
 } from './agent-keystore.js';
 import { GossipPublishHandler } from './gossip-publish-handler.js';
-import { FinalizationHandler } from './finalization-handler.js';
+import { FinalizationHandler, KEEP_ROOT_COPY_PREDICATE } from './finalization-handler.js';
 import { reconcileContextGraph, ReconcileCoalescer, RecentUalSet, type ChainReconcilerDeps, type OrdinalOutcome } from './chain-reconciler.js';
 import { createCursorState, type CursorState } from './reconcile-cursor.js';
 // rc.9 PR-10: JoinApprovalRetryQueue removed — substrate outbox
@@ -1136,6 +1136,9 @@ export class DKGAgent {
   private syncReconcilerTimer: ReturnType<typeof setInterval> | null = null;
   /** A.4-lite+: periodic warm/pinned Core-connection reconcile (opt-in). */
   private warmCoreTimer: ReturnType<typeof setInterval> | null = null;
+  /** Cores keep-alive-pinned on the last warm-core pass, so the next pass can
+   *  unpin Cores that fell out of the selection (stale-pin / cap-drift guard). */
+  private warmedCores: Set<string> = new Set();
   /**
    * v10-rc sync-refactor: per-(peer+CG) checkpoint offsets so the paged
    * sync requester in `sync/requester/page-fetch.ts` can resume where it
@@ -2363,7 +2366,7 @@ export class DKGAgent {
               });
             } else {
               const existing = this.subscribedContextGraphs.get(hashLower)!;
-              existing.onChainId = contextGraphId;
+              this.bindSubscriptionOnChainId(hashLower, existing, contextGraphId);
               existing.onChainHash = hashLower;
             }
             this.recordCgWireId(hashLower, hashLower);
@@ -3068,11 +3071,22 @@ export class DKGAgent {
     // a cold circuit-relay dial to reach a Core. Opt-in via
     // DKG_WARM_CORE_CONNECTIONS=1. See `p2p/warm-core-connections.ts`.
     if (WARM_CORE_CONNECTIONS_ENABLED) {
+      // Serialize passes: one reconcile can run longer than the interval
+      // (discovery + chain gate + up to WARM_CORE_MAX sequential dials, each
+      // with a 20s timeout). Without this guard, overlapping passes race on
+      // `this.warmedCores` and can unpin a Core a newer pass just selected.
+      let warmCoreInFlight = false;
       const runWarmCore = (): void => {
-        this.reconcileWarmCoreConnections().catch((err: unknown) => {
-          const message = err instanceof Error ? err.message : String(err);
-          this.log.warn(ctx, `Warm-core reconcile tick failed: ${message}`);
-        });
+        if (warmCoreInFlight) return;
+        warmCoreInFlight = true;
+        this.reconcileWarmCoreConnections()
+          .catch((err: unknown) => {
+            const message = err instanceof Error ? err.message : String(err);
+            this.log.warn(ctx, `Warm-core reconcile tick failed: ${message}`);
+          })
+          .finally(() => {
+            warmCoreInFlight = false;
+          });
       };
       // Prime once now (after startup), then on a steady cadence.
       runWarmCore();
@@ -3388,23 +3402,33 @@ export class DKGAgent {
    */
   private async reconcileWarmCoreConnections(): Promise<void> {
     if (!this.started) return;
-    await reconcileWarmCoreConnections({
+    const result = await reconcileWarmCoreConnections({
       selfPeerId: this.node.libp2p.peerId.toString(),
       maxCores: WARM_CORE_MAX,
+      // Drop Cores not seen within the profile-stale window before the cap, so
+      // a stale phonebook slice can't crowd out live Cores or keep redialing
+      // dead entries (reuses the directory's freshness threshold).
+      staleThresholdMs: AGENT_PROFILE_STALE_THRESHOLD_MS,
       findCoreAgents: async (): Promise<WarmCoreAgent[]> => {
         const agents = await this.discovery.findAgents();
         return agents.map((a) => ({
           peerId: a.peerId,
           nodeRole: a.nodeRole,
           agentAddress: a.agentAddress,
+          lastSeen: a.lastSeen,
         }));
       },
       isShardingTableCore: (agentAddress) => this.isShardingTableCore(agentAddress),
       isConnected: (peerId) =>
         this.node.libp2p.getConnections().some((c) => c.remotePeer.toString() === peerId),
-      pinAndDial: (peerId, ctx) => this.pinAndDialWarmCore(peerId, ctx),
+      pin: (peerId) => this.pinWarmCore(peerId),
+      unpin: (peerId, ctx) => this.unpinWarmCore(peerId, ctx),
+      dial: (peerId, ctx) => this.dialWarmCore(peerId, ctx),
+      previouslyWarmed: this.warmedCores,
       log: (ctx, msg) => this.log.info(ctx, msg),
     });
+    // Carry the pinned set into the next tick so stale Cores get unpinned.
+    this.warmedCores = result.warmed;
   }
 
   /**
@@ -3418,7 +3442,12 @@ export class DKGAgent {
     const getIdentityIdForAddress = this.chain.getIdentityIdForAddress?.bind(this.chain);
     const isShardingTableMember = this.chain.isShardingTableMember?.bind(this.chain);
     if (!getIdentityIdForAddress || !isShardingTableMember) return true; // gate unavailable
-    if (!agentAddress) return false; // can't resolve identity without the operational wallet
+    // A legacy/mixed-version core profile may not carry an operational wallet.
+    // Discovery elsewhere supports profiles without `agentAddress`, so treat
+    // its absence as "gate unavailable" (fall back to phonebook nodeRole)
+    // rather than a hard denial — otherwise the warm set can collapse to zero
+    // in a network with healthy but pre-agentAddress cores.
+    if (!agentAddress) return true; // gate unavailable for this profile
     try {
       const identityId = await getIdentityIdForAddress(agentAddress);
       if (identityId === 0n) return false;
@@ -3431,23 +3460,50 @@ export class DKGAgent {
   /**
    * Tag a Core keep-alive in the peerStore — so libp2p's connection manager
    * maintains + auto-redials it (mirrors the relay keep-alive path in
-   * `core/node.ts`) — then dial it via the existing resolve+dial path.
-   * Returns true on a successful dial.
+   * `core/node.ts`). Idempotent; does NOT dial (see {@link dialWarmCore}).
    */
-  private async pinAndDialWarmCore(peerIdStr: string, ctx: OperationContext): Promise<boolean> {
+  private async pinWarmCore(peerIdStr: string): Promise<void> {
+    const { peerIdFromString } = await import('@libp2p/peer-id');
+    const peerId = peerIdFromString(peerIdStr);
+    await this.node.libp2p.peerStore.merge(peerId, {
+      tags: { [WARM_CORE_KEEPALIVE_TAG]: { value: 100 } },
+    });
+  }
+
+  /**
+   * Remove the warm-core keep-alive tag from a Core that fell out of the warm
+   * set, so the connection manager stops protecting/redialing it and the
+   * pinned count can't drift above WARM_CORE_MAX over time.
+   */
+  private async unpinWarmCore(peerIdStr: string, ctx: OperationContext): Promise<void> {
     const shortPeer = peerIdStr.slice(-8);
     try {
       const { peerIdFromString } = await import('@libp2p/peer-id');
       const peerId = peerIdFromString(peerIdStr);
+      // peerStore.merge deletes a tag whose value is `undefined`.
       await this.node.libp2p.peerStore.merge(peerId, {
-        tags: { [WARM_CORE_KEEPALIVE_TAG]: { value: 100 } },
+        tags: { [WARM_CORE_KEEPALIVE_TAG]: undefined },
       });
+      this.log.info(ctx, `warm-core: unpinned ${shortPeer} (no longer selected)`);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.log.info(ctx, `warm-core: unpin ${shortPeer} failed: ${message}`);
+    }
+  }
+
+  /**
+   * Dial a (pinned, not-yet-connected) Core via the existing resolve+dial
+   * path. Returns true on a successful dial.
+   */
+  private async dialWarmCore(peerIdStr: string, ctx: OperationContext): Promise<boolean> {
+    const shortPeer = peerIdStr.slice(-8);
+    try {
       await this.connectToPeerId(peerIdStr, { timeoutMs: WARM_CORE_DIAL_TIMEOUT_MS });
-      this.log.info(ctx, `warm-core: pinned + dialed ${shortPeer}`);
+      this.log.info(ctx, `warm-core: dialed ${shortPeer}`);
       return true;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      this.log.info(ctx, `warm-core: pin/dial ${shortPeer} failed (retry next tick): ${message}`);
+      this.log.info(ctx, `warm-core: dial ${shortPeer} failed (retry next tick): ${message}`);
       return false;
     }
   }
@@ -9852,6 +9908,38 @@ export class DKGAgent {
       } catch {
         this.log.warn(ctx, `No peers subscribed to ${topic} yet`);
       }
+
+      // Durable keep-root signal. The gossip envelope's `keepRootCopyOnLabel`
+      // only reaches peers online for the broadcast; a subscriber that missed
+      // it later recovers the publish via the chain-driven reconcile sweep,
+      // which has no wire to learn the dual-write intent from. Persist the same
+      // decision per root into SWM workspace meta — co-located with the per-root
+      // `privateMerkleRoot` that already replicates to subscribers — so the
+      // reconcile path can mirror the gossip dual-write decision. Read back by
+      // `FinalizationHandler.getKeepRootCopySignal`. Updates reuse a root
+      // entity, so replace any prior value rather than accumulate.
+      try {
+        const gm = new GraphManager(this.store);
+        const wsMetaGraph = options?.subGraphName
+          ? gm.sharedMemoryMetaUri(contextGraphId, options.subGraphName)
+          : contextGraphWorkspaceMetaGraphUri(contextGraphId);
+        const keepLiteral = `"${keepRootCopyOnLabel}"`;
+        for (const root of rootEntities.filter(isSafeIri)) {
+          await this.store.deleteByPattern({
+            subject: root,
+            predicate: KEEP_ROOT_COPY_PREDICATE,
+            graph: wsMetaGraph,
+          });
+          await this.store.insert([{
+            subject: root,
+            predicate: KEEP_ROOT_COPY_PREDICATE,
+            object: keepLiteral,
+            graph: wsMetaGraph,
+          }]);
+        }
+      } catch (err) {
+        this.log.warn(ctx, `Failed to persist keepRootCopyOnLabel signal for ${result.ual}: ${err instanceof Error ? err.message : String(err)}`);
+      }
     }
 
     return result;
@@ -12088,10 +12176,55 @@ export class DKGAgent {
    */
   private resolveLocalCgIdByOnChainId(onChainId: bigint): string | null {
     const target = onChainId.toString();
+    // Multiple local records can share one on-chain id: a synthetic
+    // hash-keyed host record (`subscribed: false`, minted from
+    // `ContextGraphCreated`) can coexist with the real subscribed cleartext
+    // CG. Prefer the subscribed match so live KACG nudges + reconcile target
+    // the CG a user actually reads; fall back to the first record otherwise
+    // (the host-only / post-restart replay-window case callers tolerate).
+    let fallback: string | null = null;
     for (const [localId, sub] of this.subscribedContextGraphs) {
-      if (sub.onChainId === target) return localId;
+      if (sub.onChainId !== target) continue;
+      if (sub.subscribed) return localId;
+      if (fallback === null) fallback = localId;
     }
-    return null;
+    return fallback;
+  }
+
+  /**
+   * Bind (or rebind) a local CG to an on-chain CG id, resetting the
+   * chain-driven reconcile watermark if the bound id actually CHANGES.
+   *
+   * The persisted `lastReconciledOrdinal` is the count of contiguous KAs
+   * promoted for a *specific* on-chain graph. If the same local CG id is later
+   * repaired/recreated under a different on-chain id, that watermark no longer
+   * refers to the same chain graph — reusing it would make the sweep start at
+   * the wrong ordinal and permanently skip earlier KAs. So when the id changes
+   * we zero the watermark and drop the in-memory cursor; the reset is persisted
+   * together with the new id, keeping it restart-safe.
+   */
+  private bindSubscriptionOnChainId(localCgId: string, sub: ContextGraphSub, newOnChainId: string): void {
+    const prev = sub.onChainId;
+    sub.onChainId = newOnChainId;
+    if (!prev || prev === newOnChainId) return;
+    // The bound on-chain id actually CHANGED (repair / recreate / re-register).
+    // Any prior reconcile progress refers to the OLD chain graph and must be
+    // dropped, otherwise the sweep resumes at the wrong ordinal and skips
+    // early KAs of the new graph. Progress can hide in two places: the
+    // persisted `lastReconciledOrdinal` watermark AND an in-memory cursor that
+    // still holds `ahead` ordinals while its watermark is 0 (e.g. ordinals
+    // reconciled but waiting on confirmation depth). Reset BOTH on any id
+    // change — not only when the persisted watermark happens to be positive.
+    const hadProgress =
+      (sub.lastReconciledOrdinal ?? 0) > 0 || this.reconcileCursors.has(localCgId);
+    sub.lastReconciledOrdinal = 0;
+    this.reconcileCursors.delete(localCgId);
+    if (hadProgress) {
+      this.log.info(
+        createOperationContext('system'),
+        `VM reconcile: on-chain id for "${localCgId}" changed ${prev}->${newOnChainId}; reset reconcile watermark + cursor to 0`,
+      );
+    }
   }
 
   /**
@@ -12192,7 +12325,9 @@ export class DKGAgent {
       event.reconciled !== undefined ? `reconciled=${event.reconciled}` : '',
       event.pending !== undefined ? `pending=${event.pending}` : '',
       event.ual ? `ual=${event.ual}` : '',
-      event.detail ? `detail="${event.detail}"` : '',
+      // JSON-encode `detail` so embedded quotes/newlines can't break the
+      // structured `key=value` log line or inject bogus key/value fragments.
+      event.detail ? `detail=${JSON.stringify(event.detail)}` : '',
     ].filter(Boolean);
     this.log.info(createOperationContext('system'), parts.join(' '));
     const sink = this.config.onReplicationEvent;
@@ -15010,7 +15145,7 @@ export class DKGAgent {
     // Update in-memory subscription record and ensure we're subscribed
     const sub = this.subscribedContextGraphs.get(id);
     if (sub) {
-      sub.onChainId = onChainId;
+      this.bindSubscriptionOnChainId(id, sub, onChainId);
       // Keep the forward + reverse maps in lockstep so the receive
       // path can translate the wire id back to `id` (see
       // {@link recordCgWireId}).
@@ -18050,12 +18185,19 @@ export class DKGAgent {
     const includeSharedMemory = ctxGraphPart.startsWith('workspace:');
     const contextGraphId = includeSharedMemory ? ctxGraphPart.slice('workspace:'.length) : (ctxGraphPart || SYSTEM_CONTEXT_GRAPHS.AGENTS);
     const phase = normalizeSyncPhase(parts[3]);
-    // Phase C: locate a trailing `|since|<n>` keyed token (position-independent
-    // so it survives the optional phase suffix). Old encoders never emit it.
+    // Phase C: the `|since|<n>` keyed token is ALWAYS the final two segments
+    // emitted by `buildSyncRequestEnvelope` (after the optional phase/snapshot
+    // suffix). Match only that trailing position — scanning every segment would
+    // misparse an ordinary segment literally equal to "since" (e.g. a CG or
+    // snapshotRef named "since") as a delta marker and turn a full sync into a
+    // partial response. Old encoders never emit the suffix.
     let sinceBatchId: string | undefined;
-    const sinceIdx = parts.indexOf('since');
-    if (sinceIdx >= 0 && sinceIdx + 1 < parts.length && /^\d+$/.test(parts[sinceIdx + 1])) {
-      sinceBatchId = parts[sinceIdx + 1];
+    if (
+      parts.length >= 2 &&
+      parts[parts.length - 2] === 'since' &&
+      /^\d+$/.test(parts[parts.length - 1])
+    ) {
+      sinceBatchId = parts[parts.length - 1];
     }
     return {
       contextGraphId,

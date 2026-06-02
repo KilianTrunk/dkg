@@ -122,4 +122,61 @@ describe('sync responder — Phase C sinceBatchId delta filter', () => {
     const out = await cap.invoke({ contextGraphId: CG_ID, offset: 0, limit: 5000, includeSharedMemory: false, phase: 'data', sinceBatchId: 'not-a-number' as unknown as string });
     for (let i = 1; i <= 10; i++) expect(out).toContain(`"data-${i}"`);
   });
+
+  it('honors an UNTYPED batchId literal (legacy shape) in the delta comparison', async () => {
+    // Legacy replicated data may carry batchId as a plain string literal, not
+    // xsd:integer. A typed `>` comparison would error/skip it; the numeric
+    // coercion must place it correctly relative to sinceBatchId.
+    const kc = 'did:dkg:evm:31337/0xkcU';
+    const ka = `${kc}/1`;
+    const root = 'urn:root:U';
+    await store.insert([
+      { graph: PER_CG_META, subject: kc, predicate: RDF_TYPE, object: `${DKG_NS}KnowledgeCollection` },
+      { graph: PER_CG_META, subject: kc, predicate: `${DKG_NS}batchId`, object: '"12"' },
+      { graph: PER_CG_META, subject: ka, predicate: `${DKG_NS}partOf`, object: kc },
+      { graph: PER_CG_META, subject: ka, predicate: `${DKG_NS}rootEntity`, object: root },
+      { graph: PER_CG_DATA, subject: root, predicate: `${DKG_NS}label`, object: '"data-U"' },
+    ]);
+    const included = await cap.invoke({ contextGraphId: CG_ID, offset: 0, limit: 5000, includeSharedMemory: false, phase: 'data', sinceBatchId: '11' });
+    expect(included).toContain('"data-U"');
+    const excluded = await cap.invoke({ contextGraphId: CG_ID, offset: 0, limit: 5000, includeSharedMemory: false, phase: 'data', sinceBatchId: '12' });
+    expect(excluded).not.toContain('"data-U"');
+  });
+
+  it('honors a legacy batchId placed directly on the KA (not the KC)', async () => {
+    // Some legacy shapes attach `dkg:batchId` to the KA subject rather than its
+    // owning KC; the join must accept either placement.
+    const kc = 'did:dkg:evm:31337/0xkcK';
+    const ka = `${kc}/1`;
+    const root = 'urn:root:K';
+    await store.insert([
+      { graph: PER_CG_META, subject: kc, predicate: RDF_TYPE, object: `${DKG_NS}KnowledgeCollection` },
+      { graph: PER_CG_META, subject: ka, predicate: `${DKG_NS}partOf`, object: kc },
+      { graph: PER_CG_META, subject: ka, predicate: `${DKG_NS}rootEntity`, object: root },
+      { graph: PER_CG_META, subject: ka, predicate: `${DKG_NS}batchId`, object: intLit(13) },
+      { graph: PER_CG_DATA, subject: root, predicate: `${DKG_NS}label`, object: '"data-K"' },
+    ]);
+    const included = await cap.invoke({ contextGraphId: CG_ID, offset: 0, limit: 5000, includeSharedMemory: false, phase: 'data', sinceBatchId: '5' });
+    expect(included).toContain('"data-K"');
+    const excluded = await cap.invoke({ contextGraphId: CG_ID, offset: 0, limit: 5000, includeSharedMemory: false, phase: 'data', sinceBatchId: '13' });
+    expect(excluded).not.toContain('"data-K"');
+  });
+
+  it('does not let another CG reusing the same rootEntity IRI leak into the delta', async () => {
+    // Regression: the KA→KC→batchId join must be scoped to THIS CG's meta
+    // graphs. Pollute a DIFFERENT CG's per-cgId meta with the SAME rootEntity
+    // (urn:root:8) bound to a KC with a high batchId (99). With since=8,
+    // root:8's real batchId in mfacts is 8 (NOT > 8) so it must be excluded —
+    // the foreign batchId 99 must NOT pull root:8's data back in.
+    const OTHER_META = 'did:dkg:context-graph:other/context/1/_meta';
+    await store.insert([
+      { graph: OTHER_META, subject: 'did:dkg:evm:31337/0xother/1', predicate: `${DKG_NS}partOf`, object: 'did:dkg:evm:31337/0xother' },
+      { graph: OTHER_META, subject: 'did:dkg:evm:31337/0xother/1', predicate: `${DKG_NS}rootEntity`, object: 'urn:root:8' },
+      { graph: OTHER_META, subject: 'did:dkg:evm:31337/0xother', predicate: `${DKG_NS}batchId`, object: intLit(99) },
+    ]);
+    const out = await cap.invoke({ contextGraphId: CG_ID, offset: 0, limit: 5000, includeSharedMemory: false, phase: 'data', sinceBatchId: '8' });
+    expect(out).not.toContain('"data-8"');
+    expect(out).toContain('"data-9"');
+    expect(out).toContain('"data-10"');
+  });
 });

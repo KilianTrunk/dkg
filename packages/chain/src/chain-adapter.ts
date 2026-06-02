@@ -1205,6 +1205,28 @@ export interface ChainAdapter {
   getContextGraphAccessPolicy?(contextGraphId: bigint): Promise<number>;
 
   /**
+   * On-chain liveness probe for `contextGraphId`. Read from
+   * `ContextGraphStorage.isContextGraphActive(uint256)`. Returns `true`
+   * only when the id is a currently-minted/active context graph on chain.
+   *
+   * Why a SEPARATE call from {@link getContextGraphAccessPolicy}: the access
+   * policy getter returns Solidity's default `0` (= public) for UNKNOWN /
+   * unregistered ids, so it is silently permissive. Any decision that
+   * downgrades a CG to a less-protected path (e.g. SWM plaintext for an
+   * "on-chain public" CG) MUST first prove the slot is live with this probe —
+   * otherwise an unregistered numeric id, or stale local/cached state after a
+   * devnet reset, would be misclassified as public. Callers pair the two:
+   * `isContextGraphActiveOnChain(id) && getContextGraphAccessPolicy(id) === 0`.
+   *
+   * Optional so non-V10 / no-chain adapters can stub the surface. NOTE:
+   * absence is treated as fail-closed by callers (a CG cannot be PROVEN live,
+   * so the protected/encrypted path is kept). Adapters that implement
+   * `getContextGraphAccessPolicy` SHOULD also implement this so they don't
+   * silently strand on-chain-public CGs on the encrypted path.
+   */
+  isContextGraphActiveOnChain?(contextGraphId: bigint): Promise<boolean>;
+
+  /**
    * On-chain publish policy for `contextGraphId`. Read from
    * `ContextGraphStorage.getPublishPolicy(uint256)`. Returns the
    * Solidity tuple `(uint8 publishPolicy, address publishAuthority)`:

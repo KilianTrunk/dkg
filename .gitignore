@@ -27,8 +27,11 @@ packages/evm-module/typechain/
 # started without --data-dir against a testnet. Runtime state only.
 .dkg-testnet-node/
 
-# Agent scratch (project memory across orchestrator runs). Local only.
-.ai/
+# Agent scratch (project memory across orchestrator runs). Local only,
+# except checked-in ADRs that preserve durable engineering decisions.
+.ai/*
+!.ai/adr/
+!.ai/adr/*.md
 .scratch/
 
 # WM persistence regression repro (Phase 1 of fix/graphify-import-issues).

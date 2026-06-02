@@ -111,6 +111,14 @@ const MOCK_EXEMPT_FROM_EVM = new Set<string>([
   // the `chain.approvalPolicy` dispatch and the `transferFrom(..., 1n)`
   // floor; the mock has no ERC-20 allowance surface to mirror.
   'ensureV10ApproveTrac',
+  // TS-private post-approve allowance visibility poll (#888). Backs the
+  // forced re-approve retry on a stale-RPC `TooLowAllowance` revert; the
+  // mock has no ERC-20 allowance surface to mirror.
+  'confirmAllowanceVisible',
+  // TS-private populate+sign helper with shared stale-allowance recovery
+  // (#888) backing both V10 write paths (publish + update); the mock has no
+  // populate/gas-estimation surface to mirror.
+  'populateAndSignV10WithAllowanceRecovery',
   // Lazy-cache helpers for frequently-resolved contracts — TS-private,
   // not part of the ChainAdapter interface.
   'getIdentityStorage',
@@ -154,10 +162,6 @@ const MOCK_EXEMPT_FROM_EVM = new Set<string>([
   // pad parity for no behavioural reason.
   'invalidatePublishPreflightCache',
   // #820 (RFC-39 ciphertext/immutable ACK binding): EVM-only surfaces.
-  //  - `isContextGraphActiveOnChain` is a `ContextGraphStorage.isContextGraphActive`
-  //    read. Its sole upstream caller (dkg-agent CG-liveness probe) already
-  //    feature-detects it via `typeof === 'function'` and degrades gracefully
-  //    when absent, so the mock has no method-not-implemented surprise.
   //  - `computeV10UpdateAckDigest` mirrors the on-chain
   //    `KnowledgeAssetsLifecycle._executeUpdateCore` ACK-digest packing for
   //    test helpers / ACK collectors. The mock performs no real signature
@@ -168,7 +172,12 @@ const MOCK_EXEMPT_FROM_EVM = new Set<string>([
   //    and `AskStorage.getStakeWeightedAverageAsk` to mirror the contract's
   //    growth-cost validator. The mock skips on-chain validation entirely, so
   //    there's nothing to reproduce here.
-  'isContextGraphActiveOnChain',
+  // NOTE: `isContextGraphActiveOnChain` was previously EVM-only here. It now
+  // has a second upstream caller — the #884 SWM-plaintext liveness gate
+  // (`isContextGraphPublicOnChain`) — so the mock MUST mirror it (otherwise
+  // mock-backed flows silently strand on-chain-public CGs on the encrypted
+  // path). MockChainAdapter now implements it (CG present in registry ⇒ live),
+  // so it is no longer exempt from parity.
   'computeV10UpdateAckDigest',
   'resolveCurrentTokenAmount',
   'computeUpdateNewTokenAmount',

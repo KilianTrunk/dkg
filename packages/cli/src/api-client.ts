@@ -345,6 +345,7 @@ export class ApiClient {
   }>, options?: {
     accessPolicy?: 'public' | 'ownerOnly' | 'allowList';
     allowedPeers?: string[];
+    publishEpochs?: number;
     publisherNodeIdentityIdOverride?: bigint;
   }): Promise<{
     kaId: string;
@@ -364,6 +365,9 @@ export class ApiClient {
     }
     const autoName = `cli-publish-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     return this.publishAssertion(contextGraphId, autoName, quads, {
+      ...(options?.publishEpochs !== undefined
+        ? { publishEpochs: options.publishEpochs }
+        : {}),
       ...(options?.publisherNodeIdentityIdOverride !== undefined
         ? { publisherNodeIdentityIdOverride: options.publisherNodeIdentityIdOverride }
         : {}),
@@ -414,7 +418,7 @@ export class ApiClient {
     contextGraphId: string,
     selection: 'all' | { rootEntities: string[] } = 'all',
     clearAfter = true,
-    options?: { subGraphName?: string; publisherNodeIdentityIdOverride?: bigint },
+    options?: { subGraphName?: string; publishEpochs?: number; publisherNodeIdentityIdOverride?: bigint },
   ): Promise<{
     kaId: string;
     status: 'tentative' | 'confirmed';
@@ -427,6 +431,7 @@ export class ApiClient {
       selection,
       clearAfter,
       ...(options?.subGraphName ? { subGraphName: options.subGraphName } : {}),
+      ...(options?.publishEpochs !== undefined ? { publishEpochs: options.publishEpochs } : {}),
       ...(options?.publisherNodeIdentityIdOverride !== undefined
         ? { publisherNodeIdentityIdOverride: options.publisherNodeIdentityIdOverride.toString() }
         : {}),
@@ -570,6 +575,7 @@ export class ApiClient {
     options?: {
       subGraphName?: string;
       clearAfter?: boolean;
+      publishEpochs?: number;
       publisherNodeIdentityIdOverride?: bigint;
     },
   ): Promise<{
@@ -588,6 +594,7 @@ export class ApiClient {
       assertionName,
       ...(options?.subGraphName ? { subGraphName: options.subGraphName } : {}),
       ...(options?.clearAfter !== undefined ? { clearAfter: options.clearAfter } : {}),
+      ...(options?.publishEpochs !== undefined ? { publishEpochs: options.publishEpochs } : {}),
       ...(options?.publisherNodeIdentityIdOverride !== undefined
         ? { publisherNodeIdentityIdOverride: options.publisherNodeIdentityIdOverride.toString() }
         : {}),
@@ -614,6 +621,7 @@ export class ApiClient {
       };
       schemeVersion?: number;
       clearAfter?: boolean;
+      publishEpochs?: number;
       publisherNodeIdentityIdOverride?: bigint;
     },
   ): Promise<{
@@ -648,6 +656,9 @@ export class ApiClient {
         ...(options?.subGraphName ? { subGraphName: options.subGraphName } : {}),
         ...(options?.clearAfter !== undefined
           ? { clearAfter: options.clearAfter }
+          : {}),
+        ...(options?.publishEpochs !== undefined
+          ? { publishEpochs: options.publishEpochs }
           : {}),
         ...(options?.publisherNodeIdentityIdOverride !== undefined
           ? { publisherNodeIdentityIdOverride: options.publisherNodeIdentityIdOverride }
@@ -759,6 +770,7 @@ export class ApiClient {
     allowedPeers?: string[];
     // V10 sign-at-enqueue. Absent `seal` → tentative; supply for on-chain attestation.
     entityProofs?: boolean;
+    publishEpochs?: number;
     /** Stringified bigint; `'0'` = mode d (no attribution) per RFC-001 §4. */
     publisherNodeIdentityIdOverride?: string;
     seal?: {

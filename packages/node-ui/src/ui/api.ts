@@ -897,6 +897,22 @@ export interface SwmRootEntity {
   tripleCount: number;
 }
 
+const SKOLEM_GENID_SEGMENT = '/.well-known/genid/';
+
+function canonicalSwmRootUri(uri: string): string {
+  const trimmed = uri.trim();
+  const unwrapped = trimmed.startsWith('<') && trimmed.endsWith('>') ? trimmed.slice(1, -1) : trimmed;
+  const idx = unwrapped.indexOf(SKOLEM_GENID_SEGMENT);
+  return idx === -1 ? unwrapped : unwrapped.slice(0, idx);
+}
+
+function labelFromUri(uri: string): string {
+  const hash = uri.lastIndexOf('#');
+  const slash = uri.lastIndexOf('/');
+  const cut = Math.max(hash, slash);
+  return cut >= 0 ? uri.slice(cut + 1) : uri;
+}
+
 /** List root entities in SWM with their triple counts. */
 export async function listSwmEntities(contextGraphId: string): Promise<SwmRootEntity[]> {
   const swmGraph = `did:dkg:context-graph:${contextGraphId}/_shared_memory`;
@@ -909,17 +925,19 @@ export async function listSwmEntities(contextGraphId: string): Promise<SwmRootEn
   } GROUP BY ?s ORDER BY DESC(?cnt)`;
   const data = await post<{ result: any }>('/api/query', { sparql, contextGraphId, view: 'shared-working-memory' });
   const bindings: any[] = data?.result?.bindings ?? [];
-  return bindings.map((b) => {
+  const countsByRoot = new Map<string, number>();
+  for (const b of bindings) {
     const uri = typeof b.s === 'string' ? b.s : b.s?.value ?? '';
     const cntRaw = typeof b.cnt === 'string' ? b.cnt : b.cnt?.value ?? '0';
     const m = cntRaw.match(/^"?(\d+)/);
     const tripleCount = m ? parseInt(m[1], 10) : 0;
-    const hash = uri.lastIndexOf('#');
-    const slash = uri.lastIndexOf('/');
-    const cut = Math.max(hash, slash);
-    const label = cut >= 0 ? uri.slice(cut + 1) : uri;
-    return { uri, label, tripleCount };
-  });
+    const rootUri = canonicalSwmRootUri(uri);
+    if (!rootUri) continue;
+    countsByRoot.set(rootUri, (countsByRoot.get(rootUri) ?? 0) + tripleCount);
+  }
+  return [...countsByRoot.entries()]
+    .map(([uri, tripleCount]) => ({ uri, label: labelFromUri(uri), tripleCount }))
+    .sort((a, b) => b.tripleCount - a.tripleCount || a.label.localeCompare(b.label));
 }
 
 export interface PublishResult {

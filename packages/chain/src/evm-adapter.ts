@@ -325,6 +325,45 @@ export function computeApprovalAction(
   }
 }
 
+/**
+ * #888 — true iff `err` is the V10 publish `TooLowAllowance(TRAC, ...)`
+ * custom-error revert.
+ *
+ * The on-chain allowance read that gates the auto-approve and the
+ * `estimateGas` that ethers runs while populating the publish tx can
+ * observe a *stale* allowance on an internally load-balanced RPC: a
+ * just-consumed per-publish `1`-wei floor still reads as `1` (so the
+ * re-approve is skipped), or a freshly-sent approve has not yet
+ * propagated to the read replica. Either way the contract reverts
+ * `TooLowAllowance` during gas estimation — strictly BEFORE broadcast —
+ * and the publisher can recover by forcing a fresh approve and retrying.
+ *
+ * Matches ethers v6's decoded custom-error shape (`err.revert.name`) and
+ * falls back to string matching on the message / shortMessage / reason /
+ * nested cause so a stringified or re-wrapped revert is still caught.
+ */
+export function isTooLowAllowanceError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const e = err as {
+    revert?: { name?: unknown };
+    message?: unknown;
+    shortMessage?: unknown;
+    reason?: unknown;
+    cause?: unknown;
+  };
+  if (typeof e.revert?.name === 'string' && e.revert.name === 'TooLowAllowance') {
+    return true;
+  }
+  const causeMessage =
+    e.cause && typeof e.cause === 'object'
+      ? (e.cause as { message?: unknown }).message
+      : undefined;
+  const haystack = [e.message, e.shortMessage, e.reason, causeMessage]
+    .filter((s): s is string => typeof s === 'string')
+    .join(' ');
+  return /TooLowAllowance/i.test(haystack);
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -1055,6 +1094,59 @@ export class EVMChainAdapter implements ChainAdapter {
     return { signedTx, txHash };
   }
 
+  /**
+   * #888: populate + sign a V10 write tx with one-shot recovery for a
+   * stale-RPC `TooLowAllowance` revert, shared by BOTH V10 write paths
+   * (`createKnowledgeAssets` publish and `updateV10` — incl. metadata-only
+   * updates). ethers estimates gas while populating; on an internally
+   * load-balanced RPC that estimate can read a stale TRAC allowance and
+   * revert `TooLowAllowance` even though the approve above succeeded
+   * (post-approve propagation lag) or was skipped on a stale-high read of an
+   * allowance the prior write already consumed. This is strictly
+   * pre-broadcast (before the `onBroadcast` WAL checkpoint), so on that one
+   * revert we force a fresh approve up to the publish floor — confirming it
+   * is visible on the same read path via `ensureV10ApproveTrac(force=true)` —
+   * and retry populate+sign exactly once. Any other error, or a second
+   * `TooLowAllowance`, propagates unchanged.
+   */
+  private async populateAndSignV10WithAllowanceRecovery(
+    signer: Wallet,
+    kaContract: Contract,
+    method: 'publish' | 'update',
+    methodParams: unknown,
+    kav10Address: string,
+    tokenAmount: bigint,
+    reapproveLabel: string,
+  ): Promise<{ signedTx: string; txHash: string }> {
+    let forcedReapprove = false;
+    for (;;) {
+      try {
+        const populated = await (kaContract as any)[method].populateTransaction(
+          methodParams,
+        );
+        return await this.signPopulatedTransaction(signer, populated);
+      } catch (err) {
+        if (!forcedReapprove && isTooLowAllowanceError(err)) {
+          forcedReapprove = true;
+          console.warn(
+            `[chain] V10 ${method} gas-estimation reverted TooLowAllowance for ` +
+            `signer=${signer.address} — forcing a fresh TRAC approve and ` +
+            `retrying once (likely a stale RPC allowance read, #888).`,
+          );
+          await this.ensureV10ApproveTrac(
+            signer,
+            kav10Address,
+            tokenAmount,
+            reapproveLabel,
+            true,
+          );
+          continue;
+        }
+        throw err;
+      }
+    }
+  }
+
   private async sendSignedTransactionAndWait(
     signedTx: string,
     txHash: string,
@@ -1150,6 +1242,11 @@ export class EVMChainAdapter implements ChainAdapter {
     kav10Address: string,
     tokenAmount: bigint,
     txLabel: string,
+    // #888: set on the retry after a `TooLowAllowance` revert. Forces a
+    // fresh approve up to the publish floor regardless of the (possibly
+    // stale) on-chain allowance read, then confirms it is visible before
+    // returning. See `isTooLowAllowanceError` / `createKnowledgeAssets`.
+    force = false,
   ): Promise<void> {
     if (!this.contracts.token) return;
     const tokenWithSigner = this.contracts.token.connect(signer) as Contract;
@@ -1162,7 +1259,12 @@ export class EVMChainAdapter implements ChainAdapter {
       tokenAmount,
       currentAllowance,
     );
-    if (needsApprove) {
+    // When forced, approve at least the publish floor even if the gating
+    // read above said `needsApprove === false` — that "false" may be a
+    // stale-high read of an allowance the prior publish already consumed.
+    const publishFloor = effectivePublishAllowance(tokenAmount);
+    const target = force && targetAllowance < publishFloor ? publishFloor : targetAllowance;
+    if (needsApprove || force) {
       // Surface the per-publish floor explicitly when (and only when) the
       // policy lifted `targetAllowance` above the caller's `tokenAmount`
       // — i.e. `tokenAmount === 0n` and the floor in
@@ -1181,7 +1283,7 @@ export class EVMChainAdapter implements ChainAdapter {
       if (
         this.approvalPolicy.mode === 'per-publish' &&
         tokenAmount === 0n &&
-        targetAllowance === V10_PUBLISH_ONCHAIN_MIN_ALLOWANCE
+        target === V10_PUBLISH_ONCHAIN_MIN_ALLOWANCE
       ) {
         console.warn(
           `[chain] V10 per-publish auto-approve floor: signer=${signer.address} ` +
@@ -1193,10 +1295,62 @@ export class EVMChainAdapter implements ChainAdapter {
       await this.sendContractTransaction(
         tokenWithSigner,
         'approve',
-        [kav10Address, targetAllowance],
+        [kav10Address, target],
         signer,
         txLabel,
       );
+      // #888: only on the forced re-approve (the retry after a
+      // `TooLowAllowance` revert) do we confirm the approve is visible on
+      // the same read path the caller's gas-estimation will use, so the
+      // retry doesn't immediately re-hit the RPC read-after-write lag
+      // that prompted it. Gated on `force` so the steady-state publish
+      // path issues exactly one allowance read + one approve (unchanged
+      // behaviour / latency); the bounded poll returns as soon as the
+      // allowance reflects the target.
+      if (force) {
+        await this.confirmAllowanceVisible(tokenWithSigner, signer.address, kav10Address, target);
+      }
+    }
+  }
+
+  /**
+   * #888 — poll `allowance(owner, spender)` until it reflects `target`,
+   * bounded by `ALLOWANCE_VISIBILITY_POLL_ATTEMPTS`. Best-effort: if the
+   * allowance still hasn't propagated after the budget, we return anyway
+   * and let the caller's gas-estimation surface a definitive revert (the
+   * `createKnowledgeAssets` retry then forces a fresh approve). Exits on
+   * the first read in the common case where the approve is immediately
+   * visible, so steady-state publish latency is unchanged.
+   */
+  private async confirmAllowanceVisible(
+    token: Contract,
+    owner: string,
+    spender: string,
+    target: bigint,
+  ): Promise<void> {
+    const POLL_ATTEMPTS = 6;
+    for (let i = 0; i < POLL_ATTEMPTS; i += 1) {
+      let current = -1n;
+      try {
+        // Bound each read: a raw `token.allowance()` on a hung / read-stalled
+        // RPC would otherwise never reject and could block this "bounded"
+        // recovery poll indefinitely. `withTimeout` rejects after
+        // `RPC_READ_STALL_TIMEOUT_MS`, which the catch below treats as a
+        // not-yet-visible read and backs off (same as a thrown read error).
+        current = (await withTimeout(
+          token.allowance(owner, spender),
+          RPC_READ_STALL_TIMEOUT_MS,
+          'allowance visibility poll',
+        )) as bigint;
+      } catch {
+        // Transient read failure / stall timeout — treat as not-yet-visible
+        // and back off.
+        current = -1n;
+      }
+      if (current >= target) return;
+      if (i < POLL_ATTEMPTS - 1) {
+        await sleep(Math.min(250 * (i + 1), 1500));
+      }
     }
   }
 
@@ -2840,10 +2994,22 @@ export class EVMChainAdapter implements ChainAdapter {
     // This also gives the WAL the pre-broadcast tx hash (ethers v6
     // exposes it on the returned TransactionResponse), so recovery can
     // reconcile an in-flight tx after a daemon crash.
-    const populated = await (ka as any).publish.populateTransaction(
-      publishParamsStruct,
-    );
-    const { signedTx, txHash: preBroadcastTxHash } = await this.signPopulatedTransaction(txSigner, populated);
+    // #888: populate (which gas-estimates and can revert `TooLowAllowance`
+    // on a stale RPC allowance read) + sign, with a one-shot forced-approve
+    // recovery shared with `updateV10` — see
+    // `populateAndSignV10WithAllowanceRecovery`. This runs strictly BEFORE
+    // the `onBroadcast` WAL checkpoint and the broadcast below, so the
+    // forced re-approve + single retry has no on-chain side effect.
+    const { signedTx, txHash: preBroadcastTxHash } =
+      await this.populateAndSignV10WithAllowanceRecovery(
+        txSigner,
+        ka as Contract,
+        'publish',
+        publishParamsStruct,
+        kaAddress,
+        params.tokenAmount,
+        'approve V10 publish TRAC (forced re-approve, #888)',
+      );
     // Derive the pre-broadcast tx hash from the signed raw hex so WAL
     // consumers can log the exact identity of the tx about to hit the
     // wire. After broadcast completes, the receipt hash matches this.
@@ -3396,8 +3562,21 @@ export class EVMChainAdapter implements ChainAdapter {
     // into a single entrypoint: the contract auto-detects PCA discount
     // via `agentToAccountId(msg.sender)` for any positive
     // `deltaTokenAmount`.
-    const populated = await (ka as any).update.populateTransaction(updateParams);
-    const { signedTx, txHash: preBroadcastTxHash } = await this.signPopulatedTransaction(signer, populated);
+    // #888: same stale-allowance recovery as the publish path. Metadata-only
+    // updates (`newTokenAmount === 0n`, floored to a 1-wei approve) are just
+    // as exposed to a stale `TooLowAllowance` read on a load-balanced RPC, so
+    // route both V10 write paths through the shared helper. Strictly
+    // pre-broadcast — no on-chain side effect from the forced re-approve.
+    const { signedTx, txHash: preBroadcastTxHash } =
+      await this.populateAndSignV10WithAllowanceRecovery(
+        signer,
+        ka as Contract,
+        'update',
+        updateParams,
+        kav10Address,
+        newTokenAmount,
+        'approve V10 update TRAC (forced re-approve, #888)',
+      );
     // Codex PR #241 iter-7: `await` so async WAL writes complete
     // before broadcast (see publish above for the full rationale).
     try {
@@ -4592,23 +4771,26 @@ export class EVMChainAdapter implements ChainAdapter {
   /**
    * OT-RFC-38 / LU-6 Phase B — read the curator-committed wire id
    * from `ContextGraphStorage.getNameHash(uint256)`. Returns `null`
-   * for unregistered ids OR for the opt-out path (curator passed
-   * `bytes32(0)` at create time); callers fall back to the discovery
-   * beacon in that case.
+   * ONLY for the no-commitment cases: an unregistered id OR the opt-out
+   * path (curator passed `bytes32(0)` at create time), both of which the
+   * Solidity getter surfaces as `bytes32(0)` (a mapping default, not a
+   * revert). A `null` therefore unambiguously means "no chain-anchored
+   * hash" so callers may fall back to the beacon path.
+   *
+   * #884 review (🔴 GaJgD): an RPC ERROR is NOT collapsed to `null` — it
+   * PROPAGATES. The identity-binding caller (`localCgMatchesOnChainSlot`)
+   * fails OPEN on `null` (treats it as a legitimate opt-out), so swallowing
+   * a transient read failure as `null` would let a stale local→onChainId
+   * mapping pass the identity gate and re-enable the plaintext downgrade for
+   * the wrong slot. Letting the error throw lets the caller fail CLOSED
+   * instead.
    */
   async getContextGraphNameHash(contextGraphId: bigint): Promise<string | null> {
     await this.init();
     const cgs = this.requireContextGraphStorage();
-    try {
-      const raw: string = await cgs.getNameHash(contextGraphId);
-      if (!raw || raw === ethers.ZeroHash) return null;
-      return raw.toLowerCase();
-    } catch (err) {
-      // Fail-closed: an RPC hiccup shouldn't leak as a positive id.
-      // Caller treats `null` as "no chain-anchored hash" and falls
-      // back to the beacon path or rejects.
-      return null;
-    }
+    const raw: string = await cgs.getNameHash(contextGraphId);
+    if (!raw || raw === ethers.ZeroHash) return null;
+    return raw.toLowerCase();
   }
 
   /**

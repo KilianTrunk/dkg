@@ -50,6 +50,7 @@ const SCHEMA_KEYWORDS = 'http://schema.org/keywords';
 const DKG_HAS_SECTION = 'http://dkg.io/ontology/hasSection';
 const DKG_SOURCE_FILE = 'http://dkg.io/ontology/sourceFile';
 const DKG_ROOT_ENTITY = 'http://dkg.io/ontology/rootEntity';
+const MARKDOWN_SECTION_BLANK_PREFIX = '_:dkg-md-section-';
 const XSD_BOOLEAN = 'http://www.w3.org/2001/XMLSchema#boolean';
 const XSD_DATE = 'http://www.w3.org/2001/XMLSchema#date';
 const XSD_DATE_TIME = 'http://www.w3.org/2001/XMLSchema#dateTime';
@@ -180,7 +181,7 @@ function findFirstH1(body: string): string | null {
 }
 
 /**
- * Slugify a string for use in an IRI fragment. Keeps alphanumerics and hyphens.
+ * Slugify a string for use in a generated child IRI. Keeps alphanumerics and hyphens.
  */
 function slugify(input: string): string {
   const slug = input
@@ -194,6 +195,10 @@ function slugify(input: string): string {
 
 function shortHash(input: string): string {
   return createHash('sha256').update(input).digest('hex').slice(0, 12);
+}
+
+function markdownSectionBlankNode(subject: string, index: number, headingText: string): string {
+  return `${MARKDOWN_SECTION_BLANK_PREFIX}${shortHash(subject)}-${index}-${slugify(headingText)}`;
 }
 
 // Issue #123 / Round 11 Bug 33 follow-up: user-content extraction paths
@@ -474,7 +479,7 @@ export function extractFromMarkdown(input: MarkdownExtractInput): MarkdownExtrac
   for (const heading of extractHeadings(body)) {
     if (heading.level === 1) continue; // H1 is the document title, not a section
     sectionIndex += 1;
-    const sectionIri = `${subject}#section-${sectionIndex}-${slugify(heading.text)}`;
+    const sectionIri = markdownSectionBlankNode(subject, sectionIndex, heading.text);
     while (sectionStack.length > 0 && sectionStack[sectionStack.length - 1]!.level >= heading.level) {
       sectionStack.pop();
     }

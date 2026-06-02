@@ -89,4 +89,44 @@ describe('handleQueryRoutes /api/query', () => {
     expect(res.statusCode).toBe(400);
     expect(JSON.parse(res.body).error).toBe(error.message);
   });
+
+  it('maps oxigraph SPARQL syntax errors ("error at L:C: ...") to HTTP 400, not 500 (#889)', async () => {
+    // Reproduces the rc.12 finding: a malformed query (missing closing
+    // brace / incomplete triple) makes oxigraph throw
+    // `error at <line>:<col>: expected one of ...`. Before the fix this
+    // fell through to the top-level 500 handler; it must be a 400.
+    const error = new Error(
+      'error at 1:27: expected one of ",", ".", ";", "{", "}", ...',
+    );
+    const agent = {
+      resolveAgentByToken: vi.fn(),
+      query: vi.fn().mockRejectedValue(error),
+    };
+    const { ctx, res } = makeCtx(agent, {
+      sparql: 'SELECT ?s WHERE { ?s ?p ?o',
+      contextGraphId: 'all',
+    });
+
+    await handleQueryRoutes(ctx);
+
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toBe(error.message);
+  });
+
+  it('still surfaces genuine server-side errors as 500 (not misclassified as 400)', async () => {
+    // Guard: the #889 widening must not swallow real server faults whose
+    // message happens to differ from the parser-error shape.
+    const error = new Error('Database connection lost');
+    const agent = {
+      resolveAgentByToken: vi.fn(),
+      query: vi.fn().mockRejectedValue(error),
+    };
+    const { ctx, res } = makeCtx(agent, {
+      sparql: 'SELECT ?s WHERE { GRAPH ?g { ?s ?p ?o } } LIMIT 1',
+      contextGraphId: 'all',
+    });
+
+    await expect(handleQueryRoutes(ctx)).rejects.toThrow('Database connection lost');
+    expect(res.statusCode).not.toBe(400);
+  });
 });

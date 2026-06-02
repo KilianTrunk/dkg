@@ -2,6 +2,10 @@ import type { Quad } from '@origintrail-official/dkg-storage';
 import type { OnChainPublishResult } from '@origintrail-official/dkg-chain';
 import type { OperationContext } from '@origintrail-official/dkg-core';
 
+export const DEFAULT_PUBLISH_EPOCHS = 12;
+/** PublishIntent encodes epochs as uint32; reject larger overrides before wire encoding. */
+export const MAX_PUBLISH_EPOCHS = 0xffffffff;
+
 export interface KAManifestEntry {
   tokenId: bigint;
   rootEntity: string;
@@ -231,6 +235,12 @@ export interface PublishOptions {
   }>;
   /** When true, the KC was created via V10 and updates should use the V10 path. */
   v10Origin?: boolean;
+  /**
+   * On-chain publish lifetime in epochs. Omitted ordinary publishes use
+   * {@link DEFAULT_PUBLISH_EPOCHS}; PCA-funded publishes with no explicit
+   * override are coerced to the PCA lockDurationEpochs for discount parity.
+   */
+  publishEpochs?: number;
   /**
    * Per-publish override for the on-chain `PublishParams.publisherNodeIdentityId`
    * attribution field (RFC-001 §4 attribution control).

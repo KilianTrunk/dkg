@@ -50,6 +50,7 @@ describe('publisher routes with disk public snapshot refs', () => {
       scope: 'person-profile',
       transitionType: 'CREATE',
       authorityProofRef: 'proof:owner:route',
+      publishEpochs: '9',
     }, publisherControl);
 
     await handlePublisherRoutes(enqueue);
@@ -61,8 +62,14 @@ describe('publisher routes with disk public snapshot refs', () => {
 
     expect(responseStatus(payloadCtx)).toBe(200);
     const body = responseBody(payloadCtx) as {
-      payload?: { publishOptions?: { quads?: Array<{ subject: string; predicate: string; object: string }> } };
+      payload?: {
+        publishOptions?: {
+          quads?: Array<{ subject: string; predicate: string; object: string }>;
+          publishEpochs?: number;
+        };
+      };
     };
+    expect(body.payload?.publishOptions?.publishEpochs).toBe(9);
     expect(body.payload?.publishOptions?.quads).toEqual([
       expect.objectContaining({
         subject: expect.stringMatching(/^dkg:publisher-route-snapshot:aloha:person-profile\/entity-/),

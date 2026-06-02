@@ -1,8 +1,11 @@
 import { describe, it, expect } from 'vitest';
+import { createHash } from 'node:crypto';
+import { autoPartition } from '@origintrail-official/dkg-publisher';
 import { extractFromMarkdown } from '../src/extraction/markdown-extractor.js';
 
 const AGENT = 'did:dkg:agent:0xAbC123';
 const FILE_URI = 'urn:dkg:file:keccak256:1111111111111111111111111111111111111111111111111111111111111111';
+const GRAPH = 'did:dkg:context-graph:test';
 
 const RDF_TYPE = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type';
 const SCHEMA_NAME = 'http://schema.org/name';
@@ -20,6 +23,18 @@ const XSD_DATE = 'http://www.w3.org/2001/XMLSchema#date';
 const XSD_DATE_TIME = 'http://www.w3.org/2001/XMLSchema#dateTime';
 const XSD_DECIMAL = 'http://www.w3.org/2001/XMLSchema#decimal';
 const XSD_INTEGER = 'http://www.w3.org/2001/XMLSchema#integer';
+
+function shortHash(input: string): string {
+  return createHash('sha256').update(input).digest('hex').slice(0, 12);
+}
+
+function sectionIri(subjectIri: string, index: number, slug: string): string {
+  return `_:dkg-md-section-${shortHash(subjectIri)}-${index}-${slug}`;
+}
+
+function skolemizedSectionIri(subjectIri: string, index: number, slug: string): string {
+  return `${subjectIri}/.well-known/genid/dkg-md-section-${shortHash(subjectIri)}-${index}-${slug}`;
+}
 
 describe('extractFromMarkdown - frontmatter', () => {
   it('extracts rdf:type from frontmatter `type` key (schema.org convention)', () => {
@@ -357,33 +372,90 @@ describe('extractFromMarkdown - headings', () => {
     const rootSections = triples.filter(t => t.subject === subjectIri && t.predicate === DKG_HAS_SECTION);
     expect(rootSections).toHaveLength(2);
     expect(rootSections.map(t => t.object)).toEqual([
-      `${subjectIri}#section-1-intro`,
-      `${subjectIri}#section-2-methods`,
+      sectionIri(subjectIri, 1, 'intro'),
+      sectionIri(subjectIri, 2, 'methods'),
     ]);
     expect(triples).toContainEqual({
-      subject: `${subjectIri}#section-2-methods`,
+      subject: sectionIri(subjectIri, 2, 'methods'),
       predicate: DKG_HAS_SECTION,
-      object: `${subjectIri}#section-3-sub-method`,
+      object: sectionIri(subjectIri, 3, 'sub-method'),
     });
     for (const section of [...rootSections, {
-      subject: `${subjectIri}#section-2-methods`,
+      subject: sectionIri(subjectIri, 2, 'methods'),
       predicate: DKG_HAS_SECTION,
-      object: `${subjectIri}#section-3-sub-method`,
+      object: sectionIri(subjectIri, 3, 'sub-method'),
     }]) {
       expect(triples.some(t => t.subject === section.object && t.predicate === SCHEMA_NAME)).toBe(true);
     }
   });
 
-  it('disambiguates repeated headings by prefixing a stable section index', () => {
+  it('disambiguates repeated headings by prefixing a stable section index in markdown-owned blank nodes', () => {
     const { triples, subjectIri } = extractFromMarkdown({
       markdown: `# Title\n\n## Overview\n\nText.\n\n## Overview\n\nMore text.\n`,
       agentDid: AGENT,
     });
     const sections = triples.filter(t => t.predicate === DKG_HAS_SECTION).map(t => t.object);
     expect(sections).toEqual([
-      `${subjectIri}#section-1-overview`,
-      `${subjectIri}#section-2-overview`,
+      sectionIri(subjectIri, 1, 'overview'),
+      sectionIri(subjectIri, 2, 'overview'),
     ]);
+  });
+
+  it('keeps markdown section blank nodes as skolemized children, not standalone autoPartition roots', () => {
+    const { triples, subjectIri } = extractFromMarkdown({
+      markdown: `# Title\n\n## Intro\n\n### Detail\n`,
+      agentDid: AGENT,
+    });
+    const quads = triples.map((triple) => ({ ...triple, graph: GRAPH }));
+
+    const partitioned = autoPartition(quads);
+    expect([...partitioned.keys()]).toEqual([subjectIri]);
+
+    const selectedRootQuads = partitioned.get(subjectIri) ?? [];
+    expect(selectedRootQuads).toHaveLength(quads.length);
+    expect(selectedRootQuads).toContainEqual({
+      subject: skolemizedSectionIri(subjectIri, 1, 'intro'),
+      predicate: DKG_HAS_SECTION,
+      object: skolemizedSectionIri(subjectIri, 2, 'detail'),
+      graph: GRAPH,
+    });
+    expect(selectedRootQuads).toContainEqual({
+      subject: skolemizedSectionIri(subjectIri, 2, 'detail'),
+      predicate: SCHEMA_NAME,
+      object: '"Detail"',
+      graph: GRAPH,
+    });
+  });
+
+  it('does not collide with existing blank nodes when markdown sections are skolemized', () => {
+    const documentIri = 'urn:dkg:md:collision';
+    const { triples } = extractFromMarkdown({
+      markdown: `# Title\n\n## Intro\n`,
+      agentDid: AGENT,
+      documentIri,
+    });
+    const realBlankNode = '_:section-1-intro';
+    const quads = [
+      ...triples.map((triple) => ({ ...triple, graph: GRAPH })),
+      { subject: documentIri, predicate: 'http://schema.org/about', object: realBlankNode, graph: GRAPH },
+      { subject: realBlankNode, predicate: SCHEMA_NAME, object: '"Existing blank node"', graph: GRAPH },
+    ];
+
+    const selectedRootQuads = autoPartition(quads).get(documentIri) ?? [];
+
+    expect(selectedRootQuads).toContainEqual({
+      subject: skolemizedSectionIri(documentIri, 1, 'intro'),
+      predicate: SCHEMA_NAME,
+      object: '"Intro"',
+      graph: GRAPH,
+    });
+    expect(selectedRootQuads).toContainEqual({
+      subject: `${documentIri}/.well-known/genid/section-1-intro`,
+      predicate: SCHEMA_NAME,
+      object: '"Existing blank node"',
+      graph: GRAPH,
+    });
+    expect(skolemizedSectionIri(documentIri, 1, 'intro')).not.toBe(`${documentIri}/.well-known/genid/section-1-intro`);
   });
 
   it('H1 promotes to schema:name on the document subject', () => {
@@ -448,7 +520,9 @@ describe('extractFromMarkdown - subject IRI resolution', () => {
     const mentions = triples.filter(t => t.predicate === SCHEMA_MENTIONS).map(t => t.object);
     expect(mentions).toEqual([expect.stringMatching(/^urn:dkg:md:hash-[0-9a-f]{12}$/)]);
     const sections = triples.filter(t => t.predicate === DKG_HAS_SECTION).map(t => t.object);
-    expect(sections).toEqual([expect.stringMatching(new RegExp(`^${subjectIri.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}#section-1-hash-[0-9a-f]{12}$`))]);
+    expect(sections).toEqual([
+      expect.stringMatching(/^_:dkg-md-section-[0-9a-f]{12}-1-hash-[0-9a-f]{12}$/),
+    ]);
   });
 
   it('produces a stable anonymous fallback when there is no title', () => {
@@ -734,8 +808,8 @@ Our method relies on [[SPARQL]] queries.
     // Sections
     const sections = triples.filter(t => t.predicate === DKG_HAS_SECTION).map(t => t.object);
     expect(sections).toEqual([
-      `${subjectIri}#section-1-background`,
-      `${subjectIri}#section-2-methods`,
+      sectionIri(subjectIri, 1, 'background'),
+      sectionIri(subjectIri, 2, 'methods'),
     ]);
 
     // Section 10.1 linkage present: rows 1 (sourceFile) and 3 (rootEntity).

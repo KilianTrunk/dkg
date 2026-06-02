@@ -4,6 +4,7 @@ export default defineConfig({
   test: {
     include: [
       'test/trust-metadata.test.ts',
+      'test/shared-memory-publish-boundary.test.ts',
       'test/storage-ack-roster-and-verify-mofn-extra.test.ts',
       'test/verification-metadata.test.ts',
       'test/verify-collector.test.ts',

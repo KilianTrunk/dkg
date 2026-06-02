@@ -3,6 +3,9 @@
   "version": "10.0.0-rc.10",
   "private": true,
   "type": "module",
+  "scripts": {
+    "test": "node --test kafka-streams/test/*.mjs"
+  },
   "dependencies": {
     "@multiformats/multiaddr": "^13.0.3",
     "@origintrail-official/dkg-agent": "workspace:*",

@@ -4,7 +4,7 @@ import { enrichEvmError } from '@origintrail-official/dkg-chain';
 import type { EventBus, OperationContext } from '@origintrail-official/dkg-core';
 import { DKGEvent, Logger, createOperationContext, sha256, encodeWorkspacePublishRequest, encodeEncryptedWorkspacePayload, encryptWorkspacePayload, contextGraphDataUri, contextGraphDataGraphUri, contextGraphMetaUri, contextGraphAssertionUri, assertionLifecycleUri, contextGraphSubGraphUri, contextGraphSubGraphMetaUri, SYSTEM_CONTEXT_GRAPHS, validateSubGraphName, isSafeIri, assertSafeIri, assertSafeRdfTerm, DKG_GOSSIP_MAX_MESSAGE_BYTES, type Ed25519Keypair, buildAuthorAttestationTypedData, buildUpdateAuthorAttestationTypedData, AUTHOR_SCHEME_VERSION_V1, TrustLevel, TRUST_LEVEL_PREDICATE, assertNoUserAuthoredTrustLevelQuads, buildTrustLevelQuads, isTrustLevelQuad } from '@origintrail-official/dkg-core';
 import { GraphManager, PrivateContentStore } from '@origintrail-official/dkg-storage';
-import type { Publisher, PublishOptions, PublishResult, KAManifestEntry, PhaseCallback, V10CoreNodeACK } from './publisher.js';
+import { DEFAULT_PUBLISH_EPOCHS, MAX_PUBLISH_EPOCHS, type Publisher, type PublishOptions, type PublishResult, type KAManifestEntry, type PhaseCallback, type V10CoreNodeACK } from './publisher.js';
 import { autoPartition } from './auto-partition.js';
 import { canonicalPublishPayload } from './canonical-publish-payload.js';
 import { RESERVED_SUBJECT_PREFIXES, findReservedSubjectPrefix, isReservedSubject } from './reserved-subjects.js';
@@ -119,6 +119,14 @@ function normalizePublisherAddress(address: string | undefined): string | undefi
     throw new Error('Invalid publisherAddress: zero address is not a valid publisher');
   }
   return normalized;
+}
+
+function resolvePublishEpochsOverride(value: number | undefined): number | undefined {
+  if (value === undefined) return undefined;
+  if (!Number.isSafeInteger(value) || value < 1 || value > MAX_PUBLISH_EPOCHS) {
+    throw new Error(`publishEpochs must be a positive uint32 integer, got ${String(value)}`);
+  }
+  return value;
 }
 
 function coercePublisherAddress(value: unknown): string | undefined {
@@ -278,6 +286,21 @@ export class AssertionNotPersistedError extends Error {
     this.contextGraphId = args.contextGraphId;
     this.assertionGraph = args.assertionGraph;
     this.expectedTripleCount = args.expectedTripleCount;
+  }
+}
+
+export class MultiRootPublishNotAtomicError extends Error {
+  readonly code = 'MULTI_ROOT_PUBLISH_NOT_ATOMIC' as const;
+  readonly contextGraphId: string;
+  readonly rootEntities: string[];
+  constructor(contextGraphId: string, rootEntities: readonly string[]) {
+    super(
+      `V10 shared-memory publish is single-root only for this operation. ` +
+        `Resolved ${rootEntities.length} root entities; select exactly one root or use a durable multi-publish flow.`,
+    );
+    this.name = 'MultiRootPublishNotAtomicError';
+    this.contextGraphId = contextGraphId;
+    this.rootEntities = [...rootEntities];
   }
 }
 
@@ -1204,6 +1227,8 @@ export class DKGPublisher implements Publisher {
        * semantics.
        */
       encryptInlineChunked?: PublishOptions['encryptInlineChunked'];
+      /** Per-publish on-chain lifetime override in epochs. */
+      publishEpochs?: number;
     },
   ): Promise<PublishResult> {
     const ctx = options?.operationCtx ?? createOperationContext('publishFromSWM');
@@ -1280,6 +1305,10 @@ export class DKGPublisher implements Publisher {
     if (quads.length === 0) {
       throw new Error(`No quads in shared memory for context graph ${contextGraphId} matching selection`);
     }
+    const rootEntities = [...autoPartition(quads).keys()];
+    if (rootEntities.length > 1) {
+      throw new MultiRootPublishNotAtomicError(contextGraphId, rootEntities);
+    }
 
     const ctxGraphId = options?.publishContextGraphId;
     const chainCgId = options?.onChainContextGraphId ?? ctxGraphId;
@@ -1322,6 +1351,7 @@ export class DKGPublisher implements Publisher {
       precomputedAttestation: options?.precomputedAttestation,
       encryptInlinePayload: options?.encryptInlinePayload,
       encryptInlineChunked: options?.encryptInlineChunked,
+      publishEpochs: options?.publishEpochs,
       [INTERNAL_ORIGIN_TOKEN]: true,
     };
     const publishResult = await this.publish(internalPublishOptions);
@@ -1648,6 +1678,8 @@ export class DKGPublisher implements Publisher {
   }
 
   async publish(options: PublishOptions): Promise<PublishResult> {
+    const explicitPublishEpochs = resolvePublishEpochsOverride(options.publishEpochs);
+
     // Sub-graph routing: data triples go to `did:dkg:context-graph:{id}/{subGraph}`.
     // KC metadata (status, authorship proofs) stays in the root `_meta` graph so that
     // AccessHandler.lookupKAMeta() and DKGQueryEngine.resolveKA() can still discover
@@ -1968,10 +2000,12 @@ export class DKGPublisher implements Publisher {
     // through to direct spend at FULL price. To make sure registered
     // agents actually get the discount they paid for, we probe for the
     // PCA mapping and snap `publishEpochs` to the PCA's
-    // `lockDurationEpochs` when one is found. Wallets without a PCA
-    // (direct-spend branch) keep the default lifetime of `1` epoch.
-    let publishEpochs = 1;
+    // `lockDurationEpochs` when one is found AND the caller did not
+    // explicitly override the publish lifetime. Wallets without a PCA
+    // (direct-spend branch) use the ordinary default lifetime.
+    let publishEpochs = explicitPublishEpochs ?? DEFAULT_PUBLISH_EPOCHS;
     if (
+      explicitPublishEpochs === undefined &&
       canAttemptOnChainPublish &&
       publisherSigner !== undefined &&
       typeof this.chain.getConvictionAgentAccountId === 'function' &&
@@ -1991,7 +2025,7 @@ export class DKGPublisher implements Publisher {
         }
       } catch (err) {
         // PCA probe is best-effort. On any RPC hiccup we keep the
-        // default `publishEpochs=1`. The contract is still the source
+        // already-resolved publish lifetime. The contract is still the source
         // of truth: if the signer turns out to be a PCA agent but
         // `p.epochs != lockDurationEpochs`, the publish silently
         // falls through to direct spend at full price (no revert).
@@ -2000,7 +2034,7 @@ export class DKGPublisher implements Publisher {
         // `CostCovered` event on the receipt.
         this.log.warn(
           ctx,
-          `PCA epochs probe failed — falling back to publishEpochs=1: ` +
+          `PCA epochs probe failed — falling back to publishEpochs=${publishEpochs}: ` +
           `${err instanceof Error ? err.message : String(err)}`,
         );
       }
@@ -2010,13 +2044,14 @@ export class DKGPublisher implements Publisher {
     // ciphertext byte count; for public publishes it stays as plaintext
     // bytes. Single source of truth so ACK pricing == chain tx pricing.
     const effectiveByteSize = useEncryptedInline ? stagingByteSize : publicByteSize;
-    let precomputedTokenAmount = 0n;
+    let precomputedTokenAmount = canAttemptOnChainPublish ? BigInt(publishEpochs) : 0n;
     if (canAttemptOnChainPublish && typeof this.chain.getRequiredPublishTokenAmount === 'function') {
       try {
         precomputedTokenAmount = await this.chain.getRequiredPublishTokenAmount(effectiveByteSize, publishEpochs);
-        if (precomputedTokenAmount <= 0n) {
-          this.log.warn(ctx, `getRequiredPublishTokenAmount returned ${precomputedTokenAmount} for byteSize=${effectiveByteSize} — using 1n as minimum`);
-          precomputedTokenAmount = 1n;
+        const minTokenAmount = BigInt(publishEpochs);
+        if (precomputedTokenAmount < minTokenAmount) {
+          this.log.warn(ctx, `getRequiredPublishTokenAmount returned ${precomputedTokenAmount} for byteSize=${effectiveByteSize}, epochs=${publishEpochs} — using ${minTokenAmount} as minimum so per-epoch CG value stays non-zero`);
+          precomputedTokenAmount = minTokenAmount;
         }
       } catch (err) {
         this.log.warn(

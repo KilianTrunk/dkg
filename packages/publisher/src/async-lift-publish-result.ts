@@ -8,12 +8,25 @@ import {
   type LiftJobTimeoutMetadata,
 } from './lift-job.js';
 
-export interface AsyncLiftPublishSuccess {
-  readonly status: 'included' | 'finalized';
-  readonly broadcast: LiftJobBroadcastMetadata;
-  readonly inclusion: LiftJobInclusionMetadata;
-  readonly finalization?: LiftJobFinalizationMetadata & { readonly mode?: 'published' };
-}
+export type AsyncLiftPublishSuccess =
+  | {
+      readonly status: 'included';
+      readonly broadcast: LiftJobBroadcastMetadata;
+      readonly inclusion: LiftJobInclusionMetadata;
+      readonly finalization?: undefined;
+    }
+  | {
+      readonly status: 'finalized';
+      readonly broadcast: LiftJobBroadcastMetadata;
+      readonly inclusion: LiftJobInclusionMetadata;
+      readonly finalization: LiftJobFinalizationMetadata & { readonly mode?: 'published' };
+    }
+  | {
+      readonly status: 'finalized';
+      readonly broadcast?: undefined;
+      readonly inclusion?: undefined;
+      readonly finalization: LiftJobFinalizationMetadata & { readonly mode: 'local' };
+    };
 
 export interface AsyncLiftPublishFailureInput {
   readonly error: unknown;
@@ -40,6 +53,15 @@ export function mapPublishResultToLiftJobSuccess(params: {
   }
 
   if (!onChain) {
+    if (publishResult.status === 'tentative') {
+      return {
+        status: 'finalized',
+        finalization: {
+          mode: 'local',
+          ual: publishResult.ual,
+        },
+      };
+    }
     throw new Error(
       `Canonical publish returned ${publishResult.status} without onChainResult. Async lift cannot mark chain inclusion without a real transaction hash.`,
     );

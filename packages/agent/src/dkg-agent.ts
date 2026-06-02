@@ -5885,6 +5885,35 @@ export class DKGAgent {
     return fallback;
   }
 
+  /**
+   * Codex review on PR #916 (`a15f25d` round 3) — return the local
+   * agent record that matches `targetAddress`, or null if none of
+   * `localAgents` is registered for that address (or has no
+   * private key). Distinct from {@link getWorkspaceGossipSigningAgent}
+   * which always picks the default/first available agent.
+   *
+   * Used by the beacon-registration path to honour
+   * `createContextGraph(opts.callerAgentAddress)` on multi-agent
+   * nodes: if the caller specified the curator address explicitly,
+   * the beacon must be signed by THAT agent so the wireId-pinned
+   * curator EOA matches whatever signer the host-catchup path
+   * later recovers (which uses the same lookup tied to the
+   * `beaconRegistry` entry for this CG).
+   */
+  private getWorkspaceSigningAgentForAddress(
+    targetAddress: string | undefined,
+  ): (AgentKeyRecord & { privateKey: string }) | null {
+    if (!targetAddress) return null;
+    const target = targetAddress.toLowerCase();
+    for (const record of this.localAgents.values()) {
+      if (!record.privateKey) continue;
+      if (record.agentAddress.toLowerCase() === target) {
+        return { ...record, privateKey: record.privateKey };
+      }
+    }
+    return null;
+  }
+
   private async getContextGraphAgentGateAddresses(contextGraphId: string): Promise<string[] | null> {
     const seen = new Set<string>();
     const agents: string[] = [];
@@ -11316,7 +11345,22 @@ export class DKGAgent {
    * auto-subscribe path on register, which still works for cores
    * that come online after registration.
    */
-  private async registerCgForBeaconAnnouncement(localCgId: string, accessPolicy: number): Promise<void> {
+  /**
+   * @param curatorAgentAddress
+   *   Optional explicit curator agent address (typically the
+   *   `opts.callerAgentAddress` resolved from the create-CG token).
+   *   When provided AND a matching workspace agent has a private
+   *   key, the beacon is signed by THAT agent so the wireId-pinned
+   *   `curatorEoa` matches what host-catchup envelopes will recover.
+   *   Without this, multi-agent nodes silently default to the first
+   *   workspace agent and the catchup path can authorize the wrong
+   *   identity. Codex review on PR #916.
+   */
+  private async registerCgForBeaconAnnouncement(
+    localCgId: string,
+    accessPolicy: number,
+    curatorAgentAddress?: string,
+  ): Promise<void> {
     if (accessPolicy !== BEACON_ACCESS_POLICY_CURATED) {
       // Public CGs don't need pre-registration auto-host: their
       // SWM substrate carries plaintext that any core can apply
@@ -11324,7 +11368,26 @@ export class DKGAgent {
       // specifically for curated ciphertext custody.
       return;
     }
-    const beaconAgentSigner = this.getWorkspaceGossipSigningAgent();
+    // Prefer the caller-specified curator agent on multi-agent
+    // nodes; only fall back to the default workspace agent when
+    // the caller didn't pin one.
+    const callerScopedSigner = this.getWorkspaceSigningAgentForAddress(curatorAgentAddress);
+    if (curatorAgentAddress && !callerScopedSigner) {
+      // The caller pinned a curator that isn't in `localAgents`
+      // with a privateKey. Defaulting to another agent here would
+      // mint a beacon whose `curatorEoa` doesn't match what the
+      // host-catchup path later recovers — silently pinning the
+      // wrong identity is worse than skipping the beacon. Drop
+      // the registration and log; the chain-event auto-subscribe
+      // path on register still works for cores that come online
+      // after registration.
+      this.log.warn(
+        createOperationContext('system'),
+        `Beacon registration skipped for "${localCgId}": caller curator ${curatorAgentAddress} has no local signer; would pin wrong curator EOA`,
+      );
+      return;
+    }
+    const beaconAgentSigner = callerScopedSigner ?? this.getWorkspaceGossipSigningAgent();
     const chainSignerEoa = beaconAgentSigner ? null : await this.getRegistrationTxSignerAddress();
     const curatorEoa = beaconAgentSigner?.agentAddress ?? chainSignerEoa;
     if (!curatorEoa) {
@@ -14023,7 +14086,11 @@ export class DKGAgent {
     // listening before the curator pays gas can already start
     // hosting.
     if (isCurated && !opts.private) {
-      this.registerCgForBeaconAnnouncement(opts.id, BEACON_ACCESS_POLICY_CURATED).catch((err) => {
+      this.registerCgForBeaconAnnouncement(
+        opts.id,
+        BEACON_ACCESS_POLICY_CURATED,
+        opts.callerAgentAddress,
+      ).catch((err) => {
         const msg = err instanceof Error ? err.message : String(err);
         this.log.warn(ctx, `Beacon registration for "${opts.id}" failed: ${msg}`);
       });

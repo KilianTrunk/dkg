@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import { createHash } from 'node:crypto';
 import { autoPartition } from '@origintrail-official/dkg-publisher';
 import { extractFromMarkdown } from '../src/extraction/markdown-extractor.js';
 
@@ -23,8 +24,16 @@ const XSD_DATE_TIME = 'http://www.w3.org/2001/XMLSchema#dateTime';
 const XSD_DECIMAL = 'http://www.w3.org/2001/XMLSchema#decimal';
 const XSD_INTEGER = 'http://www.w3.org/2001/XMLSchema#integer';
 
+function shortHash(input: string): string {
+  return createHash('sha256').update(input).digest('hex').slice(0, 12);
+}
+
 function sectionIri(subjectIri: string, index: number, slug: string): string {
-  return `${subjectIri}/.well-known/genid/section-${index}-${slug}`;
+  return `_:dkg-md-section-${shortHash(subjectIri)}-${index}-${slug}`;
+}
+
+function skolemizedSectionIri(subjectIri: string, index: number, slug: string): string {
+  return `${subjectIri}/.well-known/genid/dkg-md-section-${shortHash(subjectIri)}-${index}-${slug}`;
 }
 
 describe('extractFromMarkdown - frontmatter', () => {
@@ -380,7 +389,7 @@ describe('extractFromMarkdown - headings', () => {
     }
   });
 
-  it('disambiguates repeated headings by prefixing a stable section index under the document genid path', () => {
+  it('disambiguates repeated headings by prefixing a stable section index in markdown-owned blank nodes', () => {
     const { triples, subjectIri } = extractFromMarkdown({
       markdown: `# Title\n\n## Overview\n\nText.\n\n## Overview\n\nMore text.\n`,
       agentDid: AGENT,
@@ -392,7 +401,7 @@ describe('extractFromMarkdown - headings', () => {
     ]);
   });
 
-  it('keeps markdown sections as skolemized children, not standalone autoPartition roots', () => {
+  it('keeps markdown section blank nodes as skolemized children, not standalone autoPartition roots', () => {
     const { triples, subjectIri } = extractFromMarkdown({
       markdown: `# Title\n\n## Intro\n\n### Detail\n`,
       agentDid: AGENT,
@@ -402,24 +411,51 @@ describe('extractFromMarkdown - headings', () => {
     const partitioned = autoPartition(quads);
     expect([...partitioned.keys()]).toEqual([subjectIri]);
 
-    const selectedRootQuads = quads.filter(
-      (quad) =>
-        quad.subject === subjectIri ||
-        quad.subject.startsWith(`${subjectIri}/.well-known/genid/`),
-    );
+    const selectedRootQuads = partitioned.get(subjectIri) ?? [];
     expect(selectedRootQuads).toHaveLength(quads.length);
     expect(selectedRootQuads).toContainEqual({
-      subject: sectionIri(subjectIri, 1, 'intro'),
+      subject: skolemizedSectionIri(subjectIri, 1, 'intro'),
       predicate: DKG_HAS_SECTION,
-      object: sectionIri(subjectIri, 2, 'detail'),
+      object: skolemizedSectionIri(subjectIri, 2, 'detail'),
       graph: GRAPH,
     });
     expect(selectedRootQuads).toContainEqual({
-      subject: sectionIri(subjectIri, 2, 'detail'),
+      subject: skolemizedSectionIri(subjectIri, 2, 'detail'),
       predicate: SCHEMA_NAME,
       object: '"Detail"',
       graph: GRAPH,
     });
+  });
+
+  it('does not collide with existing blank nodes when markdown sections are skolemized', () => {
+    const documentIri = 'urn:dkg:md:collision';
+    const { triples } = extractFromMarkdown({
+      markdown: `# Title\n\n## Intro\n`,
+      agentDid: AGENT,
+      documentIri,
+    });
+    const realBlankNode = '_:section-1-intro';
+    const quads = [
+      ...triples.map((triple) => ({ ...triple, graph: GRAPH })),
+      { subject: documentIri, predicate: 'http://schema.org/about', object: realBlankNode, graph: GRAPH },
+      { subject: realBlankNode, predicate: SCHEMA_NAME, object: '"Existing blank node"', graph: GRAPH },
+    ];
+
+    const selectedRootQuads = autoPartition(quads).get(documentIri) ?? [];
+
+    expect(selectedRootQuads).toContainEqual({
+      subject: skolemizedSectionIri(documentIri, 1, 'intro'),
+      predicate: SCHEMA_NAME,
+      object: '"Intro"',
+      graph: GRAPH,
+    });
+    expect(selectedRootQuads).toContainEqual({
+      subject: `${documentIri}/.well-known/genid/section-1-intro`,
+      predicate: SCHEMA_NAME,
+      object: '"Existing blank node"',
+      graph: GRAPH,
+    });
+    expect(skolemizedSectionIri(documentIri, 1, 'intro')).not.toBe(`${documentIri}/.well-known/genid/section-1-intro`);
   });
 
   it('H1 promotes to schema:name on the document subject', () => {
@@ -484,7 +520,9 @@ describe('extractFromMarkdown - subject IRI resolution', () => {
     const mentions = triples.filter(t => t.predicate === SCHEMA_MENTIONS).map(t => t.object);
     expect(mentions).toEqual([expect.stringMatching(/^urn:dkg:md:hash-[0-9a-f]{12}$/)]);
     const sections = triples.filter(t => t.predicate === DKG_HAS_SECTION).map(t => t.object);
-    expect(sections).toEqual([expect.stringMatching(new RegExp(`^${subjectIri.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/\\.well-known/genid/section-1-hash-[0-9a-f]{12}$`))]);
+    expect(sections).toEqual([
+      expect.stringMatching(/^_:dkg-md-section-[0-9a-f]{12}-1-hash-[0-9a-f]{12}$/),
+    ]);
   });
 
   it('produces a stable anonymous fallback when there is no title', () => {

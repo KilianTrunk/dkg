@@ -1295,29 +1295,27 @@ describe('import-file orchestration — happy paths', () => {
     expect(writtenTriples.some(t =>
       t.predicate === 'http://dkg.io/ontology/hasSection',
     )).toBe(true);
-    const sectionSubjects = writtenTriples
+    const sectionSubjectsBeforePartition = writtenTriples
       .filter(t =>
-        t.subject.startsWith(`${result.assertionUri}/.well-known/genid/`) ||
-        (t.predicate === 'http://dkg.io/ontology/hasSection' && t.object.startsWith(`${result.assertionUri}/.well-known/genid/`)),
+        t.subject.startsWith('_:dkg-md-section-') ||
+        (t.predicate === 'http://dkg.io/ontology/hasSection' && t.object.startsWith('_:dkg-md-section-')),
       )
       .flatMap(t => [t.subject, t.object])
-      .filter(term => term.startsWith(`${result.assertionUri}/.well-known/genid/`));
-    expect(sectionSubjects.length).toBeGreaterThan(0);
-    expect(sectionSubjects.every(term => !term.includes('#section-'))).toBe(true);
+      .filter(term => term.startsWith('_:dkg-md-section-'));
+    expect(sectionSubjectsBeforePartition.length).toBeGreaterThan(0);
+    expect(sectionSubjectsBeforePartition.every(term => !term.includes('#section-'))).toBe(true);
 
     const promotionEligible = writtenTriples
       .filter(t => !findReservedSubjectPrefix(t.subject))
       .map(t => ({ ...t, graph: 'did:dkg:context-graph:research-cg' }));
-    const selectedRootQuads = promotionEligible.filter(t =>
-      t.subject === result.assertionUri ||
-      t.subject.startsWith(`${result.assertionUri}/.well-known/genid/`),
-    );
-    expect(selectedRootQuads).toEqual(promotionEligible);
+    const partitioned = autoPartition(promotionEligible);
+    const selectedRootQuads = partitioned.get(result.assertionUri) ?? [];
+    expect(selectedRootQuads).toHaveLength(promotionEligible.length);
     expect(selectedRootQuads.some(t =>
-      t.subject.startsWith(`${result.assertionUri}/.well-known/genid/`) &&
+      t.subject.startsWith(`${result.assertionUri}/.well-known/genid/dkg-md-section-`) &&
       t.predicate === 'http://schema.org/name',
     )).toBe(true);
-    expect([...autoPartition(selectedRootQuads).keys()]).toEqual([result.assertionUri]);
+    expect([...partitioned.keys()]).toEqual([result.assertionUri]);
 
     // Status map populated
     expect(status.size).toBe(1);

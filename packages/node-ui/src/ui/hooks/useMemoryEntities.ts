@@ -101,8 +101,8 @@ function isUri(s: string): boolean {
 // would miss the entity record.
 export function canonicalEntityUri(uri: string): string {
   const trimmed = uri.trim();
-  if (trimmed.startsWith('<') && trimmed.endsWith('>')) return trimmed.slice(1, -1);
-  return trimmed;
+  if (trimmed.startsWith('"')) return trimmed;
+  return trimmed.startsWith('<') && trimmed.endsWith('>') ? trimmed.slice(1, -1) : trimmed;
 }
 
 function shortLabel(uri: string): string {

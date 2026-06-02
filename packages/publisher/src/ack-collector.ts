@@ -53,6 +53,13 @@ export interface ACKCollectorDeps {
     claimedIdentityId: bigint,
   ) => Promise<ACKVerifyResult>;
   log?: (msg: string) => void;
+  /**
+   * Backoff sleep between transport-error retries and transient
+   * SWM-decline retries (#887). Injectable so unit tests can exercise
+   * the multi-retry budget without waiting real seconds. Defaults to a
+   * real `setTimeout` delay.
+   */
+  sleep?: (ms: number) => Promise<void>;
 }
 
 export interface CollectedACK {
@@ -80,6 +87,24 @@ export interface ACKCollectionResult {
 const DEFAULT_REQUIRED_ACKS = 3;
 const ACK_TIMEOUT_MS = 120_000;
 const MAX_RETRIES = 3;
+// #887: transient declines (the core's SWM replica is still catching up
+// via gossip — NO_DATA_IN_SWM / MERKLE_MISMATCH_IN_SWM /
+// MISSING_CIPHERTEXT_CHUNKS) get their own, larger retry budget than
+// transport errors. For a freshly-created CG the publisher's ACK round
+// routinely races the very first SWM gossip push to the newly-assigned
+// core peers, and propagation can take well over the ~3s the old shared
+// 3-attempt / 1s+2s budget allowed — so a core that would have ACKed a
+// few seconds later was permanently dropped and the publish failed with
+// `storage_ack_insufficient`. The capped-exponential schedule below
+// spans ~31s across 6 retries, comfortably under `ACK_TIMEOUT_MS`, and
+// keeps quorum reachable once the data lands. Transport errors keep the
+// unchanged `MAX_RETRIES` budget (a peer that never answers shouldn't
+// hold the round open for 30s).
+const MAX_TRANSIENT_DECLINE_RETRIES = 6;
+const TRANSIENT_DECLINE_BACKOFF_CAP_MS = 8_000;
+function transientDeclineBackoffMs(retry: number): number {
+  return Math.min(1000 * 2 ** Math.max(0, retry - 1), TRANSIENT_DECLINE_BACKOFF_CAP_MS);
+}
 const MAX_DECLINE_CODE_CHARS = 64;
 const MAX_DECLINE_MESSAGE_CHARS = 240;
 
@@ -385,8 +410,31 @@ export class ACKCollector {
       });
     };
 
+    // PR #896 review (🟡): once the round is decided — quorum reached, timed
+    // out, or proven impossible — any `requestACK` loop still sleeping
+    // between retries must bail on wake instead of continuing to dial. With
+    // the widened #887 transient-decline budget (~31s) a losing peer could
+    // otherwise keep retrying long after `collect()` already resolved,
+    // emitting avoidable ACK traffic and log noise. `roundSettled` is set
+    // when the outer race settles; `roundIsOver()` also treats a satisfied
+    // quorum as terminal so a peer mid-backoff bails the instant the last
+    // needed ACK lands elsewhere.
+    let roundSettled = false;
+    const roundIsOver = () => roundSettled || collected.length >= REQUIRED_ACKS;
+
+    const sleep = this.deps.sleep ?? ((ms: number) => new Promise<void>(r => setTimeout(r, ms)));
+
     const requestACK = async (peerId: string): Promise<CollectedACK | null> => {
-      for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+      // #887: transient SWM declines and transport errors now have
+      // independent retry budgets. A core whose SWM is still catching up
+      // (transient decline) is given the larger `MAX_TRANSIENT_DECLINE_
+      // RETRIES` budget below; a core that simply won't answer keeps the
+      // unchanged transport `MAX_RETRIES` budget. Mixing them in one
+      // counter (the pre-#887 behaviour) let a couple of transport blips
+      // burn the whole budget a slow-gossip core needed to ACK.
+      let transportAttempts = 0;
+      let declineRetries = 0;
+      for (;;) {
         try {
           const response = await this.deps.sendP2P(peerId, ackProtocolId, intentBytes);
           const ack: StorageACKMsg = decodeStorageACK(response);
@@ -407,20 +455,42 @@ export class ACKCollector {
             declines.set(peerId, { code, message: declineMessage });
 
             // Transient declines (SWM replication catching up via
-            // gossip) can resolve on a retry, so re-send through the
-            // same backoff as transport errors instead of permanently
-            // deselecting the peer. Codex review on PR #559 flagged
-            // the "every decline is permanent" path as a regression:
-            // a core that would have ACKed seconds later was being
-            // removed from the quorum pool the moment its SWM trailed
-            // the publish by even one gossip cycle.
-            if (isTransientStorageACKDeclineCode(code) && attempt < MAX_RETRIES - 1) {
+            // gossip) can resolve on a retry, so re-send with backoff
+            // instead of permanently deselecting the peer. Codex review
+            // on PR #559 flagged the "every decline is permanent" path
+            // as a regression: a core that would have ACKed seconds
+            // later was being removed from the quorum pool the moment
+            // its SWM trailed the publish by even one gossip cycle.
+            // #887 widened this further — the old budget shared with
+            // transport retries gave only ~3s, which a fresh CG's first
+            // gossip push to its assigned cores routinely overran.
+            if (isTransientStorageACKDeclineCode(code) && declineRetries < MAX_TRANSIENT_DECLINE_RETRIES) {
+              if (roundIsOver()) {
+                log(
+                  `[ACKCollector] Quorum already settled — abandoning transient-decline ` +
+                  `retry for ${peerId.slice(-8)} (${code})`,
+                );
+                return null;
+              }
+              declineRetries += 1;
+              const waitMs = transientDeclineBackoffMs(declineRetries);
               log(
                 `[ACKCollector] Transient decline from ${peerId.slice(-8)}: ${code}` +
                 (declineMessage ? ` — ${declineMessage}` : '') +
-                ` (retry ${attempt + 1}/${MAX_RETRIES})`,
+                ` (retry ${declineRetries}/${MAX_TRANSIENT_DECLINE_RETRIES}, waiting ${waitMs}ms for SWM gossip)`,
               );
-              await new Promise(r => setTimeout(r, (attempt + 1) * 1000));
+              await sleep(waitMs);
+              // #896 review: quorum may have settled DURING the backoff above
+              // (collect() resolves the instant the last needed ACK lands on
+              // another peer). Re-check before re-dialing so a decided round
+              // never leaks one more `sendP2P` after the caller moved on.
+              if (roundIsOver()) {
+                log(
+                  `[ACKCollector] Quorum settled during backoff — abandoning ` +
+                  `transient-decline retry for ${peerId.slice(-8)} (${code})`,
+                );
+                return null;
+              }
               continue;
             }
 
@@ -497,29 +567,46 @@ export class ACKCollector {
           };
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
-          if (attempt < MAX_RETRIES - 1) {
-            log(`[ACKCollector] Retry ${attempt + 1}/${MAX_RETRIES} for ${peerId.slice(-8)}: ${msg}`);
-            await new Promise(r => setTimeout(r, (attempt + 1) * 1000));
-          } else {
-            // Terminal transport failure on the final attempt. If this
-            // peer transient-declined on an earlier attempt the
-            // `declines` map still holds that stale code — overwrite
-            // it with the actual terminal reason so the aggregated
-            // `storage_ack_insufficient` diagnostic reflects the last
-            // observed outcome (the codex review on PR #559 caught
-            // the original "stale decline shadows the real failure"
-            // path here).
-            if (declines.has(peerId)) {
-              declines.set(peerId, {
-                code: 'TRANSPORT_ERROR',
-                message: sanitizeDeclineField(msg, MAX_DECLINE_MESSAGE_CHARS),
-              });
+          transportAttempts += 1;
+          if (transportAttempts < MAX_RETRIES) {
+            if (roundIsOver()) {
+              log(
+                `[ACKCollector] Quorum already settled — abandoning transport retry ` +
+                `for ${peerId.slice(-8)}: ${msg}`,
+              );
+              return null;
             }
-            log(`[ACKCollector] Failed to get ACK from ${peerId.slice(-8)} after ${MAX_RETRIES} attempts: ${msg}`);
+            log(`[ACKCollector] Retry ${transportAttempts}/${MAX_RETRIES} for ${peerId.slice(-8)}: ${msg}`);
+            await sleep(transportAttempts * 1000);
+            // #896 review: re-check after the backoff too — quorum may have
+            // settled while we waited, so don't re-dial a decided round.
+            if (roundIsOver()) {
+              log(
+                `[ACKCollector] Quorum settled during backoff — abandoning ` +
+                `transport retry for ${peerId.slice(-8)}: ${msg}`,
+              );
+              return null;
+            }
+            continue;
           }
+          // Terminal transport failure on the final attempt. If this
+          // peer transient-declined on an earlier attempt the
+          // `declines` map still holds that stale code — overwrite
+          // it with the actual terminal reason so the aggregated
+          // `storage_ack_insufficient` diagnostic reflects the last
+          // observed outcome (the codex review on PR #559 caught
+          // the original "stale decline shadows the real failure"
+          // path here).
+          if (declines.has(peerId)) {
+            declines.set(peerId, {
+              code: 'TRANSPORT_ERROR',
+              message: sanitizeDeclineField(msg, MAX_DECLINE_MESSAGE_CHARS),
+            });
+          }
+          log(`[ACKCollector] Failed to get ACK from ${peerId.slice(-8)} after ${MAX_RETRIES} attempts: ${msg}`);
+          return null;
         }
       }
-      return null;
     };
 
     let quorumResolve: (() => void) | undefined;
@@ -554,43 +641,53 @@ export class ACKCollector {
       }
     };
 
-    await Promise.race([
-      (async () => {
-        const promises = corePeers.map(async (peerId) => {
-          if (collected.length >= REQUIRED_ACKS) {
-            settlePeer();
-            return;
-          }
-          try {
-            const ack = await requestACK(peerId);
-            if (ack && !seenPeers.has(ack.peerId) && !seenIdentityIds.has(ack.nodeIdentityId)) {
-              seenPeers.add(ack.peerId);
-              seenIdentityIds.add(ack.nodeIdentityId);
-              collected.push(ack);
-              if (collected.length >= REQUIRED_ACKS) {
-                quorumResolve?.();
-              }
+    try {
+      await Promise.race([
+        (async () => {
+          const promises = corePeers.map(async (peerId) => {
+            if (collected.length >= REQUIRED_ACKS) {
+              settlePeer();
+              return;
             }
-          } finally {
-            settlePeer();
-          }
-        });
-        await Promise.race([Promise.allSettled(promises), quorumPromise]);
-      })(),
-      impossiblePromise,
-      new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new QuorumUnmetError({
-          collected: collected.length,
-          required: REQUIRED_ACKS,
-          dialled: corePeers.length,
-          peerOutcomes: snapshotPeerOutcomes(),
-          legacyMessage:
-            `storage_ack_timeout: only ${collected.length}/${REQUIRED_ACKS} ACKs received within ${ACK_TIMEOUT_MS}ms.${formatDeclineDetail()}`,
-        })),
-          ACK_TIMEOUT_MS,
+            try {
+              const ack = await requestACK(peerId);
+              if (ack && !seenPeers.has(ack.peerId) && !seenIdentityIds.has(ack.nodeIdentityId)) {
+                seenPeers.add(ack.peerId);
+                seenIdentityIds.add(ack.nodeIdentityId);
+                collected.push(ack);
+                if (collected.length >= REQUIRED_ACKS) {
+                  // Eagerly mark the round settled so any peers still mid-
+                  // backoff bail before their next dial (see `roundIsOver`).
+                  roundSettled = true;
+                  quorumResolve?.();
+                }
+              }
+            } finally {
+              settlePeer();
+            }
+          });
+          await Promise.race([Promise.allSettled(promises), quorumPromise]);
+        })(),
+        impossiblePromise,
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new QuorumUnmetError({
+            collected: collected.length,
+            required: REQUIRED_ACKS,
+            dialled: corePeers.length,
+            peerOutcomes: snapshotPeerOutcomes(),
+            legacyMessage:
+              `storage_ack_timeout: only ${collected.length}/${REQUIRED_ACKS} ACKs received within ${ACK_TIMEOUT_MS}ms.${formatDeclineDetail()}`,
+          })),
+            ACK_TIMEOUT_MS,
+          ),
         ),
-      ),
-    ]);
+      ]);
+    } finally {
+      // The round is decided (quorum, timeout, or impossible-quorum). Signal
+      // any `requestACK` loops still sleeping between retries to abandon on
+      // wake rather than keep dialing after the caller has its answer.
+      roundSettled = true;
+    }
 
     if (collected.length < REQUIRED_ACKS) {
       throw new QuorumUnmetError({

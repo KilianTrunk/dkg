@@ -14,6 +14,11 @@ function makeAgentLike(opts: {
   accessPolicy?: 0 | 1;
   accessPolicyError?: Error;
   exposeAccessPolicy?: boolean;
+  // chain.isContextGraphActiveOnChain liveness probe — the gate the numeric
+  // branch of isContextGraphPublicOnChain now depends on. `true` (default) →
+  // the slot is registered & live; `false` → unknown / not live; `'absent'` →
+  // the probe isn't implemented.
+  activeOnChain?: boolean | 'absent';
 } = {}) {
   const log = {
     info: vi.fn(),
@@ -28,12 +33,32 @@ function makeAgentLike(opts: {
       return opts.accessPolicy ?? 0;
     });
   }
-  return {
+  if (opts.activeOnChain !== 'absent') {
+    chain.isContextGraphActiveOnChain = vi.fn(async () => opts.activeOnChain ?? true);
+  }
+  const agentLike = {
     log,
     chain,
     onChainAccessPolicyCache: new Map<string, 0 | 1>(),
     isPrivateContextGraph: vi.fn(async () => opts.isPrivate ?? false),
   } as any;
+  // `probeIsCurated` now consults the on-chain-public override first; bind
+  // the real prototype method so the harness exercises production code.
+  agentLike.isContextGraphPublicOnChain = (DKGAgent.prototype as any).isContextGraphPublicOnChain;
+  // #884 review: a bare-numeric id is trusted as public ONLY after a LIVE
+  // on-chain proof (isContextGraphActiveOnChain) — the chain returns
+  // access-policy 0 (= public) for UNKNOWN ids, so an unregistered numeric id
+  // must never be classified public. The probe above (default live) lets the
+  // public-CG cases pass; the registration-proof case opts out with `false`.
+  // isContextGraphPublicOnChain / probeIsCurated route their chain reads
+  // through readLiveOnChainAccessPolicy (which wraps raceChainPolicyRead) —
+  // bind both so `this.readLiveOnChainAccessPolicy` / `this.raceChainPolicyRead`
+  // exist on the harness.
+  agentLike.readLiveOnChainAccessPolicy = (DKGAgent.prototype as any).readLiveOnChainAccessPolicy;
+  agentLike.resolveOnChainAccessPolicyState = (DKGAgent.prototype as any).resolveOnChainAccessPolicyState;
+  agentLike.localCgMatchesOnChainSlot = (DKGAgent.prototype as any).localCgMatchesOnChainSlot;
+  agentLike.raceChainPolicyRead = (DKGAgent.prototype as any).raceChainPolicyRead;
+  return agentLike;
 }
 
 async function resolveEncryptInlinePayload(
@@ -98,6 +123,19 @@ describe('DKGAgent._resolveEncryptInlinePayload policy lookup', () => {
     await expect(resolveEncryptInlinePayload(agentLike, '42')).rejects.toThrow(
       /publish access-policy is unknown/,
     );
+  });
+
+  it('does NOT classify an UNREGISTERED (not live) numeric id as public (liveness gate) (#884 review)', async () => {
+    // The liveness probe reports slot 999 NOT active. Even though the chain
+    // getter would return the permissive default (0) for an unknown id, the
+    // gate must short-circuit isContextGraphPublicOnChain to false BEFORE any
+    // access-policy read — proving the suite exercises the live-on-chain proof
+    // rather than blanket-trusting numeric strings.
+    const agentLike = makeAgentLike({ accessPolicy: 0, activeOnChain: false });
+    await expect(
+      (DKGAgent.prototype as any).isContextGraphPublicOnChain.call(agentLike, '999'),
+    ).resolves.toBe(false);
+    expect(agentLike.chain.getContextGraphAccessPolicy).not.toHaveBeenCalled();
   });
 
   it('fails closed when a remap target numeric CG policy cannot be resolved', async () => {

@@ -159,6 +159,8 @@ describe('V10 remap wire (PublishIntent.swmGraphId + subGraphName)', () => {
     expect(decoded.swmGraphId).toBe(SOURCE_SWM_GRAPH_ID);
     expect(decoded.subGraphName).toBe(SUB_GRAPH_NAME);
     expect(decoded.kaCount).toBe(KA_COUNT);
+    expect(decoded.epochs).toBe(Number(EPOCHS));
+    expect(decoded.tokenAmountStr).toBe(TOKEN_AMOUNT.toString());
 
     // Per-ACK crypto verification. `toHaveLength(3)` alone would be
     // satisfied by three OPAQUE ACKs, including ones forged against
@@ -267,6 +269,8 @@ describe('V10 remap wire (PublishIntent.swmGraphId + subGraphName)', () => {
     // could be mistaken for a non-trivial remap source.
     expect(decoded.swmGraphId ?? '').toBe('');
     expect(decoded.subGraphName ?? '').toBe('');
+    expect(decoded.epochs).toBe(Number(EPOCHS));
+    expect(decoded.tokenAmountStr).toBe(TOKEN_AMOUNT.toString());
   });
 
   it('StorageACKHandler resolves SWM via (swmGraphId, subGraphName) and signs the target digest', async () => {

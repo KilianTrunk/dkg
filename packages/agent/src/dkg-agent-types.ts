@@ -250,6 +250,8 @@ export interface PublishOpts {
   allowedPeers?: string[];
   /** Target sub-graph within the context graph (e.g. "code", "decisions"). */
   subGraphName?: string;
+  /** Optional on-chain publish lifetime override in epochs. */
+  publishEpochs?: number;
 }
 
 export interface PublishAsyncOpts extends PublishOpts {

@@ -80,6 +80,12 @@ export class MockChainAdapter implements ChainAdapter {
     authorAddress: string;
     /** On-chain context graph id (0n when the mock V8 path didn't carry one). */
     cgId: bigint;
+    /** Mock Chronos epoch where this KC became active. */
+    startEpoch: bigint;
+    /** Exclusive mock Chronos epoch where this KC expires. */
+    endEpoch: bigint;
+    /** Token amount paid for the KC lifetime. Used to model per-epoch CG value. */
+    tokenAmount: bigint;
     /**
      * OT-RFC-38 LU-11 / OT-RFC-39 — ciphertext-chunks commitment for
      * curated KCs. `bytes32(0)` + 0 when omitted (default for legacy
@@ -379,6 +385,9 @@ export class MockChainAdapter implements ChainAdapter {
       // Legacy V8 path — no attestation, mirror the on-chain `address(0)`.
       authorAddress: ethers.ZeroAddress,
       cgId: 0n,
+      startEpoch: this.rsEpoch,
+      endEpoch: this.rsEpoch + 1n,
+      tokenAmount: 0n,
       ciphertextChunksRoot: new Uint8Array(32),
       ciphertextChunkCount: 0,
     });
@@ -1073,6 +1082,19 @@ export class MockChainAdapter implements ChainAdapter {
   }
 
   /**
+   * OT-RFC-38 / #884: chain-backed liveness oracle parity for the mock.
+   * Mirrors `ContextGraphStorage.isContextGraphActive(uint256)` — a CG is
+   * "active" on the mock chain iff it was minted via `createContextGraph`
+   * (i.e. is present in the in-memory registry). Unknown ids return `false`,
+   * matching the EVM adapter's behaviour for unregistered slots. This is the
+   * proof callers require before trusting {@link getContextGraphAccessPolicy}
+   * (which is permissively default-`0` for unknown ids).
+   */
+  async isContextGraphActiveOnChain(contextGraphId: bigint): Promise<boolean> {
+    return this.contextGraphs.has(contextGraphId);
+  }
+
+  /**
    * Issue #872 / Codex round-3: chain-backed publish-policy oracle
    * parity for the mock chain. Returns the same `(uint8, address)`
    * shape the EVM adapter does. Unknown ids yield
@@ -1204,10 +1226,19 @@ export class MockChainAdapter implements ChainAdapter {
       publisherAddress,
       authorAddress: ethers.getAddress(params.author.address),
       cgId: params.contextGraphId,
+      startEpoch: this.rsEpoch,
+      endEpoch: this.rsEpoch + BigInt(params.epochs),
+      tokenAmount: params.tokenAmount,
       ciphertextChunksRoot: params.ciphertextChunksRoot && params.ciphertextChunksRoot.length === 32
         ? params.ciphertextChunksRoot
         : new Uint8Array(32),
       ciphertextChunkCount: params.ciphertextChunkCount ?? 0,
+    });
+    this.rsKCs.set(kaId, {
+      merkleRootHex: toHex(params.merkleRoot),
+      chunks: new Map([[0n, toHex(params.merkleRoot)]]),
+      kasContract: await this.getDKGKnowledgeAssetsAddress(),
+      cgId: params.contextGraphId,
     });
     // Also store in batches so verify() can find this publish
     this.batches.set(kaId, {
@@ -1387,6 +1418,9 @@ export class MockChainAdapter implements ChainAdapter {
     chunks: Array<{ chunkId: bigint; chunk: string }>;
     merkleLeafCount?: number;
     publisherAddress?: string;
+    startEpoch?: bigint;
+    endEpoch?: bigint;
+    tokenAmount?: bigint;
   }): void {
     const chunks = new Map<bigint, string>();
     for (const c of input.chunks) chunks.set(c.chunkId, c.chunk);
@@ -1406,6 +1440,9 @@ export class MockChainAdapter implements ChainAdapter {
       // the on-chain `address(0)` semantics for un-attested writes.
       authorAddress: ethers.ZeroAddress,
       cgId: input.contextGraphId,
+      startEpoch: input.startEpoch ?? this.rsEpoch,
+      endEpoch: input.endEpoch ?? ((input.startEpoch ?? this.rsEpoch) + 1n),
+      tokenAmount: input.tokenAmount ?? 1n,
       ciphertextChunksRoot: new Uint8Array(32),
       ciphertextChunkCount: 0,
     });
@@ -1466,8 +1503,22 @@ export class MockChainAdapter implements ChainAdapter {
       throw new Error('An unsolved challenge already exists for this node in the current proof period');
     }
 
-    // Round-robin pick over registered KCs (deterministic across runs).
-    const kcEntries = Array.from(this.rsKCs.entries());
+    // Round-robin pick over KCs whose context graph still has non-zero
+    // value in the current mock epoch. This mirrors the contract's
+    // ContextGraphValueStorage eligibility gate closely enough to catch
+    // lifetime/tokenAmount regressions in publisher tests.
+    const kcEntries = Array.from(this.rsKCs.entries()).filter(([kaId]) => {
+      const collection = this.collections.get(kaId);
+      if (!collection) return false;
+      if (collection.cgId <= 0n) return false;
+      if (this.rsEpoch < collection.startEpoch || this.rsEpoch >= collection.endEpoch) return false;
+      const lifetime = collection.endEpoch - collection.startEpoch;
+      if (lifetime <= 0n) return false;
+      return collection.tokenAmount / lifetime > 0n;
+    });
+    if (kcEntries.length === 0) {
+      throw new NoEligibleContextGraphError();
+    }
     const [kaId, kcEntry] = kcEntries[this.rsKCPickIndex % kcEntries.length];
     this.rsKCPickIndex++;
 

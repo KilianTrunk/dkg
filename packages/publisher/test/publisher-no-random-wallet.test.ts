@@ -25,6 +25,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import { DKGPublisher } from '../src/dkg-publisher.js';
+import { DEFAULT_PUBLISH_EPOCHS, type V10ACKProvider } from '../src/publisher.js';
 import { generateConfirmedFullMetadata } from '../src/metadata.js';
 import { OxigraphStore } from '@origintrail-official/dkg-storage';
 import { TypedEventBus, generateEd25519Keypair } from '@origintrail-official/dkg-core';
@@ -131,6 +132,54 @@ class AdapterSigningChain extends MockChainAdapter {
   ): Promise<string> {
     return this.wallet.signTypedData(domain, types, value);
   }
+}
+
+class EpochCapturingChain extends AdapterSigningChain {
+  capturedCreateParams?: V10PublishDirectParams;
+  pcaLockDurationEpochs?: number;
+
+  override async createKnowledgeAssets(params: V10PublishDirectParams): Promise<OnChainPublishResult> {
+    this.capturedCreateParams = params;
+    return super.createKnowledgeAssets(params);
+  }
+
+  override async getConvictionAccountLockDurationEpochs(accountId: bigint): Promise<number> {
+    return this.pcaLockDurationEpochs ?? super.getConvictionAccountLockDurationEpochs(accountId);
+  }
+}
+
+interface AckEpochCapture {
+  epochs?: number;
+  tokenAmount?: bigint;
+}
+
+function captureACKInputs(capture: AckEpochCapture): V10ACKProvider {
+  const provider = mockChainStubACKProvider();
+  return async (...args: Parameters<V10ACKProvider>) => {
+    capture.epochs = args[6];
+    capture.tokenAmount = args[7];
+    return provider(...args);
+  };
+}
+
+async function makeEpochPublisher(chain: EpochCapturingChain, wallet: ethers.Wallet): Promise<DKGPublisher> {
+  const keypair = await generateEd25519Keypair();
+  return sealForWallet(new DKGPublisher({
+    store: new OxigraphStore(),
+    chain,
+    eventBus: new TypedEventBus(),
+    keypair,
+    publisherNodeIdentityId: 1n,
+  }), wallet, chain);
+}
+
+function epochTestQuads(label: string) {
+  return [{
+    subject: `urn:test:${label}`,
+    predicate: 'http://schema.org/name',
+    object: `"${label}"`,
+    graph: 'did:dkg:context-graph:1',
+  }];
 }
 
 class AsyncAddressSigningChain implements ChainAdapter {
@@ -828,6 +877,96 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
 
     expect(result.status).toBe('confirmed');
     expect(chain.capturedTokenAmount).toBe(123n);
+  });
+
+  it('uses the default publish lifetime for direct publishes and keeps random sampling eligible after epoch rollover', async () => {
+    const wallet = new ethers.Wallet(TEST_KEY);
+    const chain = new EpochCapturingChain(wallet);
+    const publisher = await makeEpochPublisher(chain, wallet);
+    const ack: AckEpochCapture = {};
+
+    const result = await publisher.publish({
+      contextGraphId: '1',
+      quads: epochTestQuads('default-publish-epochs'),
+      v10ACKProvider: captureACKInputs(ack),
+    });
+
+    expect(result.status).toBe('confirmed');
+    expect(ack.epochs).toBe(DEFAULT_PUBLISH_EPOCHS);
+    expect(ack.tokenAmount).toBe(BigInt(DEFAULT_PUBLISH_EPOCHS));
+    expect(chain.capturedCreateParams?.epochs).toBe(DEFAULT_PUBLISH_EPOCHS);
+    expect(chain.capturedCreateParams?.tokenAmount).toBe(BigInt(DEFAULT_PUBLISH_EPOCHS));
+
+    chain.__advanceEpoch();
+    chain.__advanceProofPeriod();
+    const challenge = await chain.createChallenge();
+    expect(challenge.contextGraphId).toBe(1n);
+    expect(challenge.challenge.knowledgeAssetId).toBe(result.kaId);
+  });
+
+  it('respects an explicit publishEpochs override in ACK intent and createKnowledgeAssets params', async () => {
+    const wallet = new ethers.Wallet(TEST_KEY);
+    const chain = new EpochCapturingChain(wallet);
+    const publisher = await makeEpochPublisher(chain, wallet);
+    const ack: AckEpochCapture = {};
+
+    const result = await publisher.publish({
+      contextGraphId: '1',
+      quads: epochTestQuads('explicit-publish-epochs'),
+      publishEpochs: 5,
+      v10ACKProvider: captureACKInputs(ack),
+    });
+
+    expect(result.status).toBe('confirmed');
+    expect(ack.epochs).toBe(5);
+    expect(ack.tokenAmount).toBe(5n);
+    expect(chain.capturedCreateParams?.epochs).toBe(5);
+    expect(chain.capturedCreateParams?.tokenAmount).toBe(5n);
+  });
+
+  it('coerces omitted PCA-funded publish lifetime to the PCA lock duration', async () => {
+    const wallet = new ethers.Wallet(TEST_KEY);
+    const chain = new EpochCapturingChain(wallet);
+    chain.pcaLockDurationEpochs = 24;
+    const { accountId } = await chain.createPublishingConvictionAccount(ethers.parseEther('10000'));
+    await chain.registerPublishingConvictionAgent(accountId, wallet.address);
+    const publisher = await makeEpochPublisher(chain, wallet);
+    const ack: AckEpochCapture = {};
+
+    const result = await publisher.publish({
+      contextGraphId: '1',
+      quads: epochTestQuads('pca-default-publish-epochs'),
+      v10ACKProvider: captureACKInputs(ack),
+    });
+
+    expect(result.status).toBe('confirmed');
+    expect(ack.epochs).toBe(24);
+    expect(ack.tokenAmount).toBe(24n);
+    expect(chain.capturedCreateParams?.epochs).toBe(24);
+    expect(chain.capturedCreateParams?.tokenAmount).toBe(24n);
+  });
+
+  it('keeps explicit publishEpochs when the publisher is also a PCA agent', async () => {
+    const wallet = new ethers.Wallet(TEST_KEY);
+    const chain = new EpochCapturingChain(wallet);
+    chain.pcaLockDurationEpochs = 24;
+    const { accountId } = await chain.createPublishingConvictionAccount(ethers.parseEther('10000'));
+    await chain.registerPublishingConvictionAgent(accountId, wallet.address);
+    const publisher = await makeEpochPublisher(chain, wallet);
+    const ack: AckEpochCapture = {};
+
+    const result = await publisher.publish({
+      contextGraphId: '1',
+      quads: epochTestQuads('pca-explicit-publish-epochs'),
+      publishEpochs: 5,
+      v10ACKProvider: captureACKInputs(ack),
+    });
+
+    expect(result.status).toBe('confirmed');
+    expect(ack.epochs).toBe(5);
+    expect(ack.tokenAmount).toBe(5n);
+    expect(chain.capturedCreateParams?.epochs).toBe(5);
+    expect(chain.capturedCreateParams?.tokenAmount).toBe(5n);
   });
 
   it('initializes V10 readiness before resolving adapter-backed signer addresses', async () => {

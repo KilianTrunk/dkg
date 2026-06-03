@@ -134,4 +134,33 @@ describe('POST /api/update — kaId response contract (KC→KA)', () => {
     expect(JSON.parse(res.body).error).toMatch(/Invalid "kaId"/);
     expect(update).not.toHaveBeenCalled();
   });
+
+  it('rejects the parseable-but-invalid kaId "0" with 400 before calling agent.update', async () => {
+    // "0" is a TRUTHY string (slips past `!kaId`) and `BigInt("0") === 0n`
+    // parses fine — without an explicit positivity guard the route would
+    // forward 0n to agent.update and only fail with a cryptic on-chain revert.
+    const update = vi.fn();
+    const { res, done } = runUpdate(
+      { kaId: '0', contextGraphId: 'project-a', quads: QUADS },
+      { update },
+    );
+    await done;
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toMatch(/Invalid "kaId"/);
+    expect(update).not.toHaveBeenCalled();
+  });
+
+  it('rejects a negative kaId with 400 before calling agent.update', async () => {
+    // `BigInt("-1") === -1n` also parses; a negative decimal must not leak
+    // through to the agent / on-chain encoder.
+    const update = vi.fn();
+    const { res, done } = runUpdate(
+      { kaId: '-1', contextGraphId: 'project-a', quads: QUADS },
+      { update },
+    );
+    await done;
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toMatch(/Invalid "kaId"/);
+    expect(update).not.toHaveBeenCalled();
+  });
 });

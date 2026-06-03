@@ -87,10 +87,18 @@ devnet_publish_load_state() {
   " "$DEVNET_PUBLISH_STATE_FILE")
 }
 
-# Echo the number of root-entity publishes in the last devnet_publish_swm_all_roots call.
+# Echo the number of publishes recorded by the last devnet_publish_swm_all_roots
+# call. This counts `allResponses` (one entry per confirmed publish), NOT
+# `rootEntities`: the single-root path persists 1 response but `[]` root
+# subjects (the `/api/shared-memory/publish` success body carries no
+# `rootEntities`), so counting rootEntities would report 0 for a perfectly good
+# one-root publish and make `devnet_verify_each_published_root` reject it. The
+# verify loop indexes `allResponses[i]` via `devnet_publish_ka_id_at`, so this
+# count must track `allResponses`. rootEntities is supplementary (per-root quad
+# filtering, guarded by `roots.length > 0`).
 devnet_publish_root_count() {
   devnet_publish_load_state
-  printf '%s' "$DEVNET_PUBLISH_ROOT_ENTITIES" | node -e '
+  printf '%s' "$DEVNET_PUBLISH_ALL_RESPONSES" | node -e '
     let d=""; process.stdin.on("data",c=>d+=c);
     process.stdin.on("end",()=>{
       try {

@@ -3007,12 +3007,9 @@ export class EVMChainAdapter implements ChainAdapter {
     // `tokenAmount === 0n` floor (`transferFrom(..., 1n)` minimum), the
     // bounded-per-publish vs replenishing vs unlimited dispatch, and the
     // `this.contracts.token === undefined` no-op for read-only adapters.
-    await this.ensureV10ApproveTrac(
-      txSigner,
-      kaAddress,
-      params.tokenAmount,
-      'approve V10 publish TRAC',
-    );
+    // #953: the approve runs INSIDE the per-wallet serialized window below
+    // (it sends its own tx on `txSigner`), not here — see the buildSignedTx
+    // closure passed to `dispatchSerializedV10Write`.
 
     // Build the on-chain PublishParams struct matching the field order +
     // types in `KnowledgeAssetsLifecycle.sol` (RFC-001 author-attestation
@@ -3111,8 +3108,19 @@ export class EVMChainAdapter implements ChainAdapter {
       txSigner,
       'publish',
       params.onBroadcast,
-      () =>
-        this.populateAndSignV10WithAllowanceRecovery(
+      async () => {
+        // #953: the initial allowance approve sends its OWN tx on `txSigner`,
+        // so it must run INSIDE the per-wallet lock too. If it stayed before
+        // the lock, two concurrent same-wallet publishes starting from
+        // insufficient allowance would race on the approve nonce and the
+        // second would revert `Nonce too low` before the publish even began.
+        await this.ensureV10ApproveTrac(
+          txSigner,
+          kaAddress,
+          params.tokenAmount,
+          'approve V10 publish TRAC',
+        );
+        return this.populateAndSignV10WithAllowanceRecovery(
           txSigner,
           ka as Contract,
           'publish',
@@ -3120,7 +3128,8 @@ export class EVMChainAdapter implements ChainAdapter {
           kaAddress,
           params.tokenAmount,
           'approve V10 publish TRAC (forced re-approve, #888)',
-        ),
+        );
+      },
       () => {
         throw new Error('Transaction receipt is null');
       },
@@ -3639,12 +3648,9 @@ export class EVMChainAdapter implements ChainAdapter {
     // sizing for both V10 surfaces. The default `per-publish` policy
     // floors at 1n so metadata-only updates with `newTokenAmount === 0n`
     // still satisfy the contract's `transferFrom(..., 1n)` minimum.
-    await this.ensureV10ApproveTrac(
-      signer,
-      kav10Address,
-      newTokenAmount,
-      'approve V10 update TRAC',
-    );
+    // #953: the approve runs INSIDE the per-wallet serialized window below
+    // (it sends its own tx on `signer`), not here — see the buildSignedTx
+    // closure passed to `dispatchSerializedV10Write`.
 
     // P-1 review (Codex iter-5): same pattern as the publish path —
     // break the single contract call into populate / sign / hook /
@@ -3668,8 +3674,17 @@ export class EVMChainAdapter implements ChainAdapter {
       signer,
       'update',
       params.onBroadcast,
-      () =>
-        this.populateAndSignV10WithAllowanceRecovery(
+      async () => {
+        // #953: approve INSIDE the per-wallet lock (it sends its own tx on
+        // `signer`) so a concurrent same-wallet update/publish can't race on
+        // the approve nonce.
+        await this.ensureV10ApproveTrac(
+          signer,
+          kav10Address,
+          newTokenAmount,
+          'approve V10 update TRAC',
+        );
+        return this.populateAndSignV10WithAllowanceRecovery(
           signer,
           ka as Contract,
           'update',
@@ -3677,7 +3692,8 @@ export class EVMChainAdapter implements ChainAdapter {
           kav10Address,
           newTokenAmount,
           'approve V10 update TRAC (forced re-approve, #888)',
-        ),
+        );
+      },
       (preBroadcastTxHash) => {
         throw new Error(
           `update broadcast succeeded (txHash=${preBroadcastTxHash}) but receipt was null ` +

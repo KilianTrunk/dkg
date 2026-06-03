@@ -37,6 +37,29 @@ const neverNull = (): never => {
 const fakeReceipt = (hash: string) =>
   ({ hash, blockNumber: 1, index: 0, status: 1, logs: [] }) as unknown as ethers.TransactionReceipt;
 
+// Minimal V10 publish params that survive `createKnowledgeAssets`'s struct
+// building so execution reaches the allowance-approve step.
+function minimalPublishParams(): any {
+  return {
+    publishOperationId: 'op-953-wiring',
+    contextGraphId: 1n,
+    merkleRoot: new Uint8Array(32),
+    knowledgeAssetsAmount: 1,
+    byteSize: 1n,
+    epochs: 1,
+    tokenAmount: 1n,
+    isImmutable: false,
+    merkleLeafCount: 1,
+    publisherNodeIdentityId: 1n,
+    author: {
+      address: '0x1111111111111111111111111111111111111111',
+      signature: { r: new Uint8Array(32), vs: new Uint8Array(32) },
+      schemeVersion: 1,
+    },
+    ackSignatures: [],
+  };
+}
+
 describe('dispatchSerializedV10Write — per-wallet nonce serialization (#953)', () => {
   it('serializes concurrent writes routed to the SAME wallet (no overlapping send windows)', async () => {
     const a = new EVMChainAdapter(minimalConfig());
@@ -120,6 +143,79 @@ describe('dispatchSerializedV10Write — per-wallet nonce serialization (#953)',
 
     expect(receipts.map((r) => r.hash)).toEqual(['0', '1', '2']);
     expect(pending).toBe(3);
+  });
+
+  it('serializes an approve-then-publish build so the approve nonce cannot race (#953, zero-allowance path)', async () => {
+    // When allowance is insufficient each write first sends an `approve` tx on
+    // the SAME wallet, then the publish tx — both consume nonces. The approve
+    // now runs inside `buildSignedTx` (i.e. inside the per-wallet lock), so
+    // this models the whole approve→publish sequence going through the seam.
+    // Without serialization the two approves both read pending=0 and the
+    // second throws "Nonce too low" before any publish happens.
+    const a = new EVMChainAdapter(minimalConfig());
+    const signer = new ethers.Wallet(DEPLOYER_PK);
+    let pending = 0;
+    const consume = async (kind: string) => {
+      const nonce = pending;
+      await tick(5);
+      if (nonce !== pending) {
+        throw new Error(`Nonce too low (${kind}): expected ${pending} but got ${nonce}`);
+      }
+      pending += 1;
+      return nonce;
+    };
+    const build = () => async () => {
+      await consume('approve'); // the allowance approve tx
+      const publishNonce = pending; // then read pending for the publish tx
+      await tick(5);
+      return { signedTx: String(publishNonce), txHash: `0x${publishNonce}` };
+    };
+    (a as any).sendSignedTransactionAndWait = vi.fn(async (signedTx: string) => {
+      const nonce = Number(signedTx);
+      await tick(5);
+      if (nonce !== pending) {
+        throw new Error(`Nonce too low (publish): expected ${pending} but got ${nonce}`);
+      }
+      pending += 1;
+      return fakeReceipt(signedTx);
+    });
+
+    const receipts = await Promise.all([
+      (a as any).dispatchSerializedV10Write(signer, 'publish', undefined, build(), neverNull),
+      (a as any).dispatchSerializedV10Write(signer, 'publish', undefined, build(), neverNull),
+    ]);
+
+    // 2 writes × (approve, publish) → nonces 0,1,2,3; the publish nonces are 1 and 3.
+    expect(receipts.map((r) => r.hash)).toEqual(['1', '3']);
+    expect(pending).toBe(4);
+  });
+
+  it('createKnowledgeAssets runs the allowance approve INSIDE the per-wallet lock (#953 wiring guard)', async () => {
+    // If the initial `ensureV10ApproveTrac` ran BEFORE entering the serializer
+    // (as it did originally), concurrent same-wallet publishes would race on
+    // the approve nonce. Prove the wiring: the serializer lock is entered
+    // before the approve fires. If someone moves the approve back outside the
+    // lock, `run` is never reached and this turns red.
+    const a = new EVMChainAdapter(minimalConfig());
+    (a as any).initialized = true;
+    (a as any).contracts = {
+      knowledgeAssetsLifecycle: {
+        connect: () => ({
+          getAddress: async () => '0x0000000000000000000000000000000000000005',
+        }),
+      },
+    };
+    const runSpy = vi.spyOn((a as any).signerTxSerializer, 'run');
+    const SENTINEL = 'APPROVE_REACHED_INSIDE_LOCK';
+    (a as any).ensureV10ApproveTrac = vi.fn(async () => {
+      throw new Error(SENTINEL);
+    });
+
+    await expect(a.createKnowledgeAssets(minimalPublishParams())).rejects.toThrow(SENTINEL);
+
+    // The lock was entered (run called) AND the approve was reached from inside it.
+    expect(runSpy).toHaveBeenCalledTimes(1);
+    expect((a as any).ensureV10ApproveTrac).toHaveBeenCalledTimes(1);
   });
 
   it('fails closed when the WAL onBroadcast hook throws — never broadcasts', async () => {

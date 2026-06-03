@@ -284,13 +284,28 @@ async function dkgPublish(node: DevnetNode, file: string): Promise<{ kaId: bigin
         rej(new Error(`dkg publish exit=${code}\nstdout: ${stdout}\nstderr: ${stderr}`));
         return;
       }
+      const status = /Status:\s*(\w+)/i.exec(stdout)?.[1]?.toLowerCase() ?? 'unknown';
       const kcMatch = /KC ID:\s*(\d+)/i.exec(stdout);
       const txMatch = /TX hash:\s*(0x[0-9a-fA-F]+)/i.exec(stdout);
       if (!kcMatch || !txMatch) {
         rej(new Error(`could not parse publish output\n${stdout}`));
         return;
       }
-      res({ kaId: BigInt(kcMatch[1]!), txHash: txMatch[1]! });
+      // Greedy publish-outcome gate: exit 0 is not proof of a real publish.
+      // Require a known success status and a positive kaId so a failed/tentative
+      // publish (whose receipt could otherwise drive the CostCovered / lazy-settle
+      // assertions against the wrong tx) is rejected here, not silently accepted.
+      const publishOk = ['confirmed', 'finalized', 'tentative'];
+      if (!publishOk.includes(status)) {
+        rej(new Error(`dkg publish status="${status}", expected one of ${publishOk.join('/')}\n${stdout}`));
+        return;
+      }
+      const kaId = BigInt(kcMatch[1]!);
+      if (kaId <= 0n) {
+        rej(new Error(`dkg publish surfaced non-positive kaId=${kaId}\n${stdout}`));
+        return;
+      }
+      res({ kaId, txHash: txMatch[1]! });
     });
   });
 }

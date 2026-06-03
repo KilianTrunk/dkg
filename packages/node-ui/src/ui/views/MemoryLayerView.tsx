@@ -149,7 +149,14 @@ export function MemoryLayerView({ layer, contextGraphId, externalQuery, external
   // `GRAPH ?g { ?s ?p ?o }` enumeration resolves against only
   // { <cg>, <cg>/_meta, <cg>/_shared_memory_meta } and renders empty. SWM/VM
   // use their own `view`-routed scopes and don't need it.
-  const includePartitions = layer === 'wm';
+  //
+  // Scope the opt-in to the *built-in* WM query only (`sparql === defaultSparql`):
+  // that query constrains `?g` to WM-marked graphs via the `_meta` join, so the
+  // widened allow-list stays layer-correct. A custom query typed into the WM tab
+  // must NOT get the opt-in — otherwise an advanced `GRAPH ?g { … }` could
+  // enumerate SWM/VM/meta partitions and silently escape the WM scope. Custom
+  // queries fall back to the daemon's default static allow-list.
+  const includePartitions = layer === 'wm' && sparql === defaultSparql;
 
   const { data, loading, error, refresh } = useFetch(
     () => executeQuery(sparql, contextGraphId, includeShared, graphSuffix, queryView, includePartitions),

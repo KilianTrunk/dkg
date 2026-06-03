@@ -472,6 +472,11 @@ describe('memory layer custom query execution', () => {
     //     top-level `GRAPH ?g { ?s ?p ?o }`.
     expect(memoryLayerView).toContain('<http://dkg.io/ontology/memoryLayer> "WM"');
     expect(memoryLayerView).toContain('GRAPH ?g { ?s ?p ?o }');
+    //  3. The partition opt-in must be gated to the built-in WM query only.
+    //     If it leaked to custom queries (just `layer === 'wm'`), an advanced
+    //     `GRAPH ?g` typed into the WM tab could enumerate SWM/VM/meta
+    //     partitions and escape the WM scope.
+    expect(memoryLayerView).toContain("layer === 'wm' && sparql === defaultSparql");
   });
 });
 

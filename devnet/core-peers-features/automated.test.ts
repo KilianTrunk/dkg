@@ -269,6 +269,18 @@ async function publishFromCore(node: DevnetNode, name: string): Promise<{ subjec
   }
   const status = /Status:\s*(\w+)/i.exec(result.stdout)?.[1]?.toLowerCase() ?? 'unknown';
   const kaId = /KC ID:\s*(\d+)/i.exec(result.stdout)?.[1];
+  // Greedy publish-outcome gate: exit 0 is not proof of a real publish. Pin a
+  // known success status and a positive kaId so a failed/'unknown' status or a
+  // missing "KC ID:" line fails here instead of passing as a green publish.
+  const publishOk = ['confirmed', 'finalized', 'tentative'];
+  expect(
+    publishOk,
+    `publish status="${status}", expected one of ${publishOk.join('/')}\n${result.stdout}`,
+  ).toContain(status);
+  expect(
+    BigInt(kaId ?? '0'),
+    `publish surfaced no positive "KC ID:" (kaId="${kaId}")\n${result.stdout}`,
+  ).toBeGreaterThan(0n);
   return { subject: witness.subject, literal: witness.literal, kaId, status };
 }
 

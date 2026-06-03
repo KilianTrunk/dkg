@@ -33,7 +33,7 @@
  * consumers (publisher, agent, cli) also need to regenerate their ABIs.
  */
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 
@@ -314,4 +314,34 @@ describe('ABI content sanity — required event/error surfaces are present [CH-5
     // vNext when updates start signing the EIP-712 envelope too.
     expect(types).toEqual(['uint256', 'address', 'string', 'bytes32', 'uint256', 'uint96']);
   });
+});
+
+describe('ABI dir reflects the KC→KA rename — retired ABIs gone, renamed ABIs present [rc.12]', () => {
+  // The greenfield rename (rc.12) replaced the V10.0 logic/storage pair
+  // `KnowledgeAssetsV10` + `KnowledgeCollectionStorage` with
+  // `KnowledgeAssetsLifecycle` + `DKGKnowledgeAssets`, and moved the V8
+  // `KnowledgeCollection` ABI under `abi/archive/`. `EVMChainAdapter` loads
+  // ABIs by bare filename from this dir (`readContractAbi`), so a retired ABI
+  // silently re-surfacing at the top level is exactly the drift the rename
+  // was meant to eliminate — a consumer could bind to a stale contract
+  // surface. The digest pins above only cover files that still exist; this
+  // block pins the directory SHAPE so a regenerate/copy mistake that brings
+  // an old ABI back turns the lane red.
+  const retired = [
+    'KnowledgeAssetsV10',
+    'KnowledgeCollectionStorage',
+    'KnowledgeCollection',
+  ];
+  for (const name of retired) {
+    it(`retired ABI abi/${name}.json is NOT present at the top level`, () => {
+      expect(existsSync(join(ABI_DIR, `${name}.json`))).toBe(false);
+    });
+  }
+
+  const active = ['KnowledgeAssetsLifecycle', 'DKGKnowledgeAssets'];
+  for (const name of active) {
+    it(`renamed ABI abi/${name}.json IS present`, () => {
+      expect(existsSync(join(ABI_DIR, `${name}.json`))).toBe(true);
+    });
+  }
 });

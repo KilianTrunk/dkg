@@ -297,9 +297,25 @@ async function publishViaCli(
   const status = /Status:\s*(\w+)/i.exec(result.stdout)?.[1] ?? 'unknown';
   const kcMatch = /KC ID:\s*(\d+)/i.exec(result.stdout);
   const txMatch = /TX hash:\s*(0x[0-9a-fA-F]+)/i.exec(result.stdout);
+  const kaId = kcMatch ? BigInt(kcMatch[1]!) : undefined;
+  // Greedy publish-outcome gate (mirrors the devnet shell _devnet_publish_status_ok
+  // contract): a CLI exit code of 0 is NOT proof of a real publish. Pin the
+  // status to a known success value and require a positive on-chain kaId so an
+  // 'unknown'/failed status — or a missing id (e.g. a "KC ID:" → "KA ID:" output
+  // rename that drifts past this regex after the KC→KA transition) — fails
+  // loudly here instead of slipping through every caller as a green publish.
+  const publishOk = ['confirmed', 'finalized', 'tentative'];
+  expect(
+    publishOk,
+    `dkg publish status="${status}", expected one of ${publishOk.join('/')}\n${result.stdout}`,
+  ).toContain(status.toLowerCase());
+  expect(
+    kaId,
+    `dkg publish surfaced no positive "KC ID:" (kaId=${kaId})\n${result.stdout}`,
+  ).toBeGreaterThan(0n);
   return {
     status,
-    kaId: kcMatch ? BigInt(kcMatch[1]!) : undefined,
+    kaId,
     txHash: txMatch ? txMatch[1] : undefined,
     raw: result.stdout,
   };

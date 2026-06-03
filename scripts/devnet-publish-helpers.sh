@@ -87,12 +87,31 @@ devnet_publish_load_state() {
   " "$DEVNET_PUBLISH_STATE_FILE")
 }
 
-# Echo the number of root-entity publishes in the last devnet_publish_swm_all_roots call.
+# Echo the number of publishes recorded by the last devnet_publish_swm_all_roots
+# call. This counts `allResponses` (one entry per confirmed publish), NOT
+# `rootEntities`: the single-root path persists 1 response but `[]` root
+# subjects (the `/api/shared-memory/publish` success body carries no
+# `rootEntities`), so counting rootEntities would report 0 for a perfectly good
+# one-root publish and make `devnet_verify_each_published_root` reject it. The
+# verify loop indexes `allResponses[i]` via `devnet_publish_ka_id_at`, so this
+# count must track `allResponses`. rootEntities is supplementary (per-root quad
+# filtering, guarded by `roots.length > 0`).
 devnet_publish_root_count() {
   devnet_publish_load_state
-  printf '%s' "$DEVNET_PUBLISH_ROOT_ENTITIES" | node -e '
+  printf '%s' "$DEVNET_PUBLISH_ALL_RESPONSES" | node -e '
     let d=""; process.stdin.on("data",c=>d+=c);
-    process.stdin.on("end",()=>{ try { const n=JSON.parse(d).length; console.log(n > 0 ? n : 1); } catch { console.log(1); } });
+    process.stdin.on("end",()=>{
+      try {
+        const arr = JSON.parse(d);
+        // Honest count — never fabricate 1. An empty batch (0 roots) and a
+        // corrupt/unparseable state file are real failures the caller must
+        // see, not silently paper over with a phantom single root (same
+        // class as the publish-status-gating fix).
+        console.log(Array.isArray(arr) ? arr.length : "PARSE_ERR");
+      } catch {
+        console.log("PARSE_ERR");
+      }
+    });
   '
 }
 
@@ -201,6 +220,14 @@ devnet_verify_each_published_root() {
   [ -z "$meta_node" ] && meta_node="$node"
 
   count=$(devnet_publish_root_count)
+  # A non-positive / unparseable count means the publish state file recorded
+  # no roots (or is corrupt). The verify loop below would otherwise execute
+  # zero iterations and return success — silently "passing" a publish that
+  # never landed (the bug class fixed in devnet_publish_swm_all_roots).
+  if ! [[ "$count" =~ ^[0-9]+$ ]] || [ "$count" -lt 1 ]; then
+    echo "devnet_verify_each_published_root: no published roots to verify (count=$count) — publish state missing/corrupt" >&2
+    return 1
+  fi
 
   i=0
   while [ "$i" -lt "$count" ]; do

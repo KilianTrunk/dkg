@@ -812,9 +812,13 @@ echo "--- 14c: Query the assertion ---"
 ASSERT_QUERY=$(c -X POST "http://127.0.0.1:9201/api/assertion/devnet-draft/query" -d "{
   \"contextGraphId\":\"$ASSERT_CG\"
 }")
-ASSERT_Q_CT=$(echo "$ASSERT_QUERY" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(len(d.get("quads",d.get("result",[]))))' 2>/dev/null || echo "0")
-echo "  Assertion has $ASSERT_Q_CT quads"
-[[ "$ASSERT_Q_CT" -ge 1 ]] && ok "Assertion query returned $ASSERT_Q_CT quads" || fail "Assertion query returned 0 quads"
+ASSERT_Q_CT=$(safe_quads_count "$ASSERT_QUERY")
+if [[ "$ASSERT_Q_CT" == "PARSE_ERR" ]]; then
+  fail "Assertion query returned unparseable response: ${ASSERT_QUERY:0:200}"
+else
+  echo "  Assertion has $ASSERT_Q_CT quads"
+  [[ "$ASSERT_Q_CT" -ge 1 ]] && ok "Assertion query returned $ASSERT_Q_CT quads" || fail "Assertion query returned 0 quads"
+fi
 
 echo "--- 14d: Promote the assertion to SWM ---"
 ASSERT_PROMOTE=$(c -X POST "http://127.0.0.1:9201/api/assertion/devnet-draft/promote" -d "{
@@ -831,8 +835,12 @@ SWM_CHECK=$(c -X POST "http://127.0.0.1:9201/api/query" -d "{
   \"contextGraphId\":\"$ASSERT_CG\",
   \"graphSuffix\":\"_shared_memory\"
 }")
-SWM_CT=$(echo "$SWM_CHECK" | python3 -c 'import sys,json;print(len(json.load(sys.stdin).get("result",{}).get("bindings",[])))' 2>/dev/null || echo "0")
-[[ "$SWM_CT" -ge 1 ]] && ok "Promoted data visible in SWM" || fail "Promoted data not in SWM ($SWM_CT)"
+SWM_CT=$(safe_bindings_count "$SWM_CHECK")
+if [[ "$SWM_CT" == "PARSE_ERR" ]]; then
+  fail "Promoted-data SWM query returned unparseable response: ${SWM_CHECK:0:200}"
+else
+  [[ "$SWM_CT" -ge 1 ]] && ok "Promoted data visible in SWM" || fail "Promoted data not in SWM ($SWM_CT)"
+fi
 
 echo "--- 14f: Create and immediately discard another assertion ---"
 c -X POST "http://127.0.0.1:9201/api/assertion/create" -d "{\"contextGraphId\":\"$ASSERT_CG\",\"name\":\"discard-me\"}" > /dev/null
@@ -846,12 +854,19 @@ echo "$DISCARD_RESP" | grep -qi "error" && fail "Discard failed: $DISCARD_RESP" 
 echo "--- 14g: Promoted assertion gossips to other nodes ---"
 sleep 4
 for p in 9202 9203 9204; do
-  GOS_CT=$(c -X POST "http://127.0.0.1:$p/api/query" -d "{
+  GOS_RESP=$(c -X POST "http://127.0.0.1:$p/api/query" -d "{
     \"sparql\":\"SELECT ?name WHERE { <urn:devnet:assert:entity1> <http://schema.org/name> ?name }\",
     \"contextGraphId\":\"$ASSERT_CG\",
     \"graphSuffix\":\"_shared_memory\"
-  }" | python3 -c 'import sys,json;print(len(json.load(sys.stdin).get("result",{}).get("bindings",[])))' 2>/dev/null || echo "0")
-  [[ "$GOS_CT" -ge 1 ]] && ok "Promoted data gossiped to Node $p" || warn "Promoted data not on Node $p ($GOS_CT)"
+  }")
+  GOS_CT=$(safe_bindings_count "$GOS_RESP")
+  if [[ "$GOS_CT" == "PARSE_ERR" ]]; then
+    warn "Promoted-data gossip query to Node $p returned unparseable response: ${GOS_RESP:0:120}"
+  elif [[ "$GOS_CT" -ge 1 ]]; then
+    ok "Promoted data gossiped to Node $p"
+  else
+    warn "Promoted data not on Node $p ($GOS_CT)"
+  fi
 done
 
 #------------------------------------------------------------
@@ -940,8 +955,14 @@ SG_GOS=$(c -X POST "http://127.0.0.1:9203/api/query" -d "{
   \"subGraphName\":\"test-assertions\",
   \"graphSuffix\":\"_shared_memory\"
 }")
-SG_GOS_CT=$(echo "$SG_GOS" | python3 -c 'import sys,json;print(len(json.load(sys.stdin).get("result",{}).get("bindings",[])))' 2>/dev/null || echo "0")
-[[ "$SG_GOS_CT" -ge 1 ]] && ok "Sub-graph assertion gossiped to Node3" || warn "Sub-graph assertion not on Node3 ($SG_GOS_CT)"
+SG_GOS_CT=$(safe_bindings_count "$SG_GOS")
+if [[ "$SG_GOS_CT" == "PARSE_ERR" ]]; then
+  warn "Sub-graph gossip query to Node3 returned unparseable response: ${SG_GOS:0:120}"
+elif [[ "$SG_GOS_CT" -ge 1 ]]; then
+  ok "Sub-graph assertion gossiped to Node3"
+else
+  warn "Sub-graph assertion not on Node3 ($SG_GOS_CT)"
+fi
 
 #------------------------------------------------------------
 echo ""

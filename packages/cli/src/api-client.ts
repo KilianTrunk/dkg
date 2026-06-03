@@ -8,6 +8,35 @@ export type QueryResult =
   | { type: 'boolean'; value: boolean }
   | { type?: undefined; [key: string]: unknown };
 
+export interface PreSignedAuthorAttestationPayload {
+  address: string;
+  signature: { r: string; vs: string };
+}
+
+export interface KnowledgeAssetFinalizedPublishOptions {
+  /**
+   * SDK-friendly spelling for the finalized publish cleanup flag. The
+   * knowledge-assets daemon route forwards `clearSharedMemoryAfter` to
+   * `publishFromFinalizedAssertion`, so the client translates before POST.
+   */
+  clearAfter?: boolean;
+  publishEpochs?: number;
+  publisherNodeIdentityIdOverride?: bigint;
+}
+
+function finalizedPublishOptionsPayload(
+  options?: KnowledgeAssetFinalizedPublishOptions,
+): Record<string, unknown> | undefined {
+  if (!options) return undefined;
+  const payload: Record<string, unknown> = {};
+  if (options.clearAfter !== undefined) payload.clearSharedMemoryAfter = options.clearAfter;
+  if (options.publishEpochs !== undefined) payload.publishEpochs = options.publishEpochs;
+  if (options.publisherNodeIdentityIdOverride !== undefined) {
+    payload.publisherNodeIdentityIdOverride = options.publisherNodeIdentityIdOverride.toString();
+  }
+  return Object.keys(payload).length > 0 ? payload : undefined;
+}
+
 /**
  * Response shape for `/api/random-sampling/status`. Mirrors
  * `RandomSamplingStatus` from `@origintrail-official/dkg-agent` but
@@ -472,11 +501,17 @@ export class ApiClient {
       subGraphName?: string;
       quads?: Array<{ subject: string; predicate: string; object: string; graph: string }>;
       authorAgentAddress?: string;
+      preSignedAuthorAttestation?: PreSignedAuthorAttestationPayload;
+      schemeVersion?: number;
       alsoShareSwm?: boolean;
-      alsoPublishVm?: boolean | { epochs?: number; tokenAmount?: string };
+      alsoPublishVm?: boolean | KnowledgeAssetFinalizedPublishOptions;
     },
   ): Promise<Record<string, unknown>> {
-    return this.post('/api/knowledge-assets', { contextGraphId, name, ...(options ?? {}) });
+    const payload: Record<string, unknown> = { contextGraphId, name, ...(options ?? {}) };
+    if (options?.alsoPublishVm && typeof options.alsoPublishVm === 'object') {
+      payload.alsoPublishVm = finalizedPublishOptionsPayload(options.alsoPublishVm) ?? {};
+    }
+    return this.post('/api/knowledge-assets', payload);
   }
 
   /** GET a KA's lifecycle state by name. */
@@ -499,7 +534,12 @@ export class ApiClient {
   async knowledgeAssetFinalize(
     contextGraphId: string,
     name: string,
-    options?: { subGraphName?: string; authorAgentAddress?: string },
+    options?: {
+      subGraphName?: string;
+      authorAgentAddress?: string;
+      preSignedAuthorAttestation?: PreSignedAuthorAttestationPayload;
+      schemeVersion?: number;
+    },
   ): Promise<{ merkleRoot: string; eip712Digest: string }> {
     return this.post(`/api/knowledge-assets/${encodeURIComponent(name)}/wm/finalize`, { contextGraphId, ...(options ?? {}) });
   }
@@ -532,9 +572,14 @@ export class ApiClient {
   async knowledgeAssetPublish(
     contextGraphId: string,
     name: string,
-    options?: { subGraphName?: string; options?: Record<string, unknown> },
+    options?: { subGraphName?: string } & KnowledgeAssetFinalizedPublishOptions,
   ): Promise<Record<string, unknown>> {
-    return this.post(`/api/knowledge-assets/${encodeURIComponent(name)}/vm/publish`, { contextGraphId, ...(options ?? {}) });
+    const publishOptions = finalizedPublishOptionsPayload(options);
+    return this.post(`/api/knowledge-assets/${encodeURIComponent(name)}/vm/publish`, {
+      contextGraphId,
+      ...(options?.subGraphName ? { subGraphName: options.subGraphName } : {}),
+      ...(publishOptions ? { options: publishOptions } : {}),
+    });
   }
 
   async createAssertion(
@@ -546,10 +591,7 @@ export class ApiClient {
       finalize?: boolean;
       promote?: boolean;
       authorAgentAddress?: string;
-      preSignedAuthorAttestation?: {
-        address: string;
-        signature: { r: string; vs: string };
-      };
+      preSignedAuthorAttestation?: PreSignedAuthorAttestationPayload;
       schemeVersion?: number;
     },
   ): Promise<{
@@ -615,10 +657,7 @@ export class ApiClient {
     options?: {
       subGraphName?: string;
       authorAgentAddress?: string;
-      preSignedAuthorAttestation?: {
-        address: string;
-        signature: { r: string; vs: string };
-      };
+      preSignedAuthorAttestation?: PreSignedAuthorAttestationPayload;
       schemeVersion?: number;
     },
   ): Promise<{
@@ -704,10 +743,7 @@ export class ApiClient {
     options?: {
       subGraphName?: string;
       authorAgentAddress?: string;
-      preSignedAuthorAttestation?: {
-        address: string;
-        signature: { r: string; vs: string };
-      };
+      preSignedAuthorAttestation?: PreSignedAuthorAttestationPayload;
       schemeVersion?: number;
       clearAfter?: boolean;
       publishEpochs?: number;

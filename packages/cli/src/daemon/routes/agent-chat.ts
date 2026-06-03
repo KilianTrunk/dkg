@@ -669,6 +669,7 @@ export async function handleAgentChatRoutes(ctx: RequestContext): Promise<void> 
       // `health` for callers that want the typed snapshot.
       protocols: diag.protocols,
       syncCapable: diag.syncCapable,
+      syncStatus: diag.syncStatus,
       lastSeen: diag.health?.lastSeen ?? null,
       latencyMs: diag.health?.latencyMs ?? null,
       health: diag.health,

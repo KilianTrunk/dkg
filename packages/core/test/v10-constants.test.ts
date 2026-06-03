@@ -66,7 +66,6 @@ describe('V10 protocol stream IDs', () => {
   // follow-up signal, not a synchronous request.
   it('substrate-migrated protocols use /dkg/10.0.1/ prefix', () => {
     expect(PROTOCOL_MESSAGE).toBe('/dkg/10.0.1/message');
-    expect(PROTOCOL_SYNC).toBe('/dkg/10.0.1/sync');
     expect(PROTOCOL_ACCESS).toBe('/dkg/10.0.1/private-access');
     expect(PROTOCOL_QUERY_REMOTE).toBe('/dkg/10.0.1/query-remote');
     expect(PROTOCOL_SWM_SENDER_KEY).toBe('/dkg/10.0.1/swm-sender-key');
@@ -75,6 +74,10 @@ describe('V10 protocol stream IDs', () => {
     expect(PROTOCOL_VERIFY_PROPOSAL).toBe('/dkg/10.0.1/verify-proposal');
     expect(PROTOCOL_VERIFY_APPROVAL).toBe('/dkg/10.0.0/verify-approval');
     expect(PROTOCOL_STORAGE_ACK).toBe('/dkg/10.0.1/storage-ack');
+  });
+
+  it('sync uses the /dkg/10.0.2/ prefix (taken back OFF the messenger substrate)', () => {
+    expect(PROTOCOL_SYNC).toBe('/dkg/10.0.2/sync');
   });
 
   it('DHT protocol is unchanged', () => {

@@ -54,20 +54,30 @@ function mockAsk(scriptedAnswers: string[]): (q: string, def?: string) => Promis
 // ---------------------------------------------------------------------
 
 describe('promptStoreBackend', () => {
-  it('returns no store block when operator accepts the oxigraph default', async () => {
+  it('defaults to oxigraph-server when the operator accepts the default', async () => {
     const { fn, calls } = mockFetch(() => new Response(null, { status: 200 }));
     const result = await promptStoreBackend({
-      ask: mockAsk(['']), // accept default ("oxigraph")
+      ask: mockAsk(['']), // accept default — now the managed local server
       fetch: fn,
       log: () => {},
     });
-    expect(result.storeBlock).toBeNull();
-    expect(calls).toHaveLength(0); // no URL probe issued for local
+    expect(result.storeBlock).toEqual({ backend: 'oxigraph-server', options: {} });
+    expect(calls).toHaveLength(0); // no URL probe issued for a local backend
   });
 
-  it('returns no store block when operator types "oxigraph" explicitly', async () => {
+  it('returns no store block (embedded worker) when operator picks "oxigraph" by name', async () => {
     const result = await promptStoreBackend({
       ask: mockAsk(['oxigraph']),
+      log: () => {},
+    });
+    expect(result.storeBlock).toBeNull();
+  });
+
+  it('returns no store block (embedded worker) when operator picks the worker by number', async () => {
+    // Menu is now `1) oxigraph-server  2) oxigraph  3) blazegraph` — picking
+    // option 2 must opt down to the embedded in-process worker (no block).
+    const result = await promptStoreBackend({
+      ask: mockAsk(['2']),
       log: () => {},
     });
     expect(result.storeBlock).toBeNull();

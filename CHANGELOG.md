@@ -4,6 +4,12 @@ All notable changes to the DKG V9 node are documented here. The format is based 
 
 ## [Unreleased]
 
+### Changed — `oxigraph-server` is now the default triple-store backend for new installs
+
+- **`dkg init` defaults to `oxigraph-server`** (`packages/cli/src/store-wizard.ts`): the store-backend menu now lists `oxigraph-server` (daemon-managed local RocksDB server) as the first, recommended option and the default answer; the embedded in-process worker (`oxigraph`) moves to option 2 for minimal-footprint / single-reader nodes. A fresh `dkg init` — or one that accepts the default — writes an explicit `"store": { "backend": "oxigraph-server" }` block, so new nodes get MVCC concurrent reads + incremental persistence out of the box.
+- **The existing fleet is unaffected on auto-update.** The runtime fallback for a config with **no** `store` block stays `oxigraph-worker`, and auto-update never re-runs `dkg init` — so existing nodes keep booting on the embedded worker unchanged. Only an explicit re-init flips a node, and the daemon's `STORE-SWITCH` guard makes that an opt-in (it refuses to start until `DKG_ACCEPT_STORE_RESET=1`) rather than a silent store reset.
+- **Platform note:** new installs fetch the prebuilt `oxigraph` v0.5.8 binary on first boot. The Linux artifacts are glibc-only, so musl hosts (Alpine/distroless) should pick option 2 (`oxigraph`) or an external `sparql-http` endpoint at the `dkg init` prompt.
+
 ## [10.0.0-rc.14] - 2026-06-02
 
 **Off-chain runtime release.** No Solidity changes since rc.13 — the Base Sepolia (chainId 84532) deployment is **unchanged**, the `chainResetMarker` stays `v10-rc12-ka-rename-2026-06-01`, and **no contract redeploy is required**. Nodes upgrade in place; no local-state wipe. This release fixes the multi-GB `node-ui.db` bloat by taking the sync RPC off the Universal Messenger substrate, adds per-peer exponential backoff to the sync reconciler, adds an **opt-in** daemon-managed local Oxigraph server backend (Release 2, phase 2a), and stops `eth_getLogs` rate-limit failures from surfacing as unhandled process rejections under gossip/finalization verification storms.

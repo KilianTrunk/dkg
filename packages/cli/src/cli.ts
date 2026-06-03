@@ -665,7 +665,8 @@ program
     }
 
     // Triple-store backend (RFC 120, plan PR 2 item 1 + PR 3 Docker
-    // branch). Default: stay on local Oxigraph. Operators selecting
+    // branch). Default: the daemon-managed local Oxigraph server
+    // (`oxigraph-server`) — see promptStoreBackend. Operators selecting
     // "blazegraph" with a blank URL get the Docker convenience path
     // (if Docker is installed) — the namespace name defaults to the
     // node name so each operator gets their own DKG-owned namespace.

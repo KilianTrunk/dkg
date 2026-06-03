@@ -146,14 +146,28 @@ export async function promptStoreBackend(
   const defaultBackend = opts.flagBackend
     ?? (existingBackend === 'blazegraph' || existingBackend === 'sparql-http' || existingBackend === 'oxigraph-server'
       ? existingBackend
-      : 'oxigraph');
+      : 'oxigraph-server');
 
-  const backendChoices = ['oxigraph', 'blazegraph'] as const;
+  // `oxigraph-server` (daemon-managed local RocksDB server) is the default
+  // local backend: it gives MVCC concurrent reads + incremental persistence,
+  // whereas `oxigraph` (the embedded in-process worker) rewrites the whole
+  // N-Quads dump on every flush. The in-process worker stays available as a
+  // minimal-footprint / single-reader option. NOTE: this only changes what a
+  // *fresh / block-less* `dkg init` writes — the runtime fallback for configs
+  // with no `store` block stays `oxigraph-worker`, so the existing fleet keeps
+  // booting unchanged on auto-update (only an explicit re-init flips a node,
+  // and the daemon's STORE-SWITCH guard makes that an opt-in, not silent).
+  const backendChoices = ['oxigraph-server', 'oxigraph', 'blazegraph'] as const;
+  const backendLabels: Record<string, string> = {
+    'oxigraph-server': 'oxigraph-server  (managed local server — recommended)',
+    'oxigraph': 'oxigraph         (embedded in-process worker)',
+    'blazegraph': 'blazegraph       (external SPARQL endpoint)',
+  };
   // `sparql-http` is intentionally not listed (advanced bring-your-own-server
   // option) but is still accepted when typed or inherited from an existing
   // config / `--store` flag. Resolve the default *answer* by name for unlisted
   // backends so pressing Enter on a node already configured for `sparql-http`
-  // preserves it instead of silently downgrading to oxigraph (option 1).
+  // preserves it instead of silently downgrading (option 1).
   const defaultIsListed = (backendChoices as readonly string[]).includes(defaultBackend);
   const defaultIdx = defaultIsListed
     ? backendChoices.indexOf(defaultBackend as typeof backendChoices[number])
@@ -161,7 +175,8 @@ export async function promptStoreBackend(
   const defaultAnswer = defaultIsListed ? String(defaultIdx + 1) : defaultBackend;
   log('  Triple store backend:');
   for (let i = 0; i < backendChoices.length; i++) {
-    log(`    ${i + 1}) ${backendChoices[i]}`);
+    const choice = backendChoices[i];
+    log(`    ${i + 1}) ${backendLabels[choice] ?? choice}`);
   }
   // When the inherited/flagged backend isn't one of the numbered choices
   // (e.g. `sparql-http`), spell out that pressing Enter keeps it and that a
@@ -180,9 +195,9 @@ export async function promptStoreBackend(
     ? (backendChoices[parseInt(backendInput, 10) - 1] ?? 'oxigraph')
     : backendInput.toLowerCase();
 
-  // `oxigraph-server` (daemon-managed local server) is accepted by name
-  // (like `sparql-http`, it's not a numbered choice). No URL prompt or
-  // probe: the endpoint doesn't exist until the daemon spawns it at boot.
+  // `oxigraph-server` (daemon-managed local server) is the default numbered
+  // choice and is also accepted by name. No URL prompt or probe: the endpoint
+  // doesn't exist until the daemon spawns it at boot.
   if (backendAnswer === 'oxigraph-server') {
     log('  Using a daemon-managed local Oxigraph server (started on first daemon boot).');
     // Preserve existing managed-server overrides (port/location/cacheDir) on an

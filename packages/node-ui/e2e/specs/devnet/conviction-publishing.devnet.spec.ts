@@ -3,12 +3,12 @@
  * Full conviction discount flows live in devnet/conviction-lazy-settle/.
  */
 import { test, expect } from '../../fixtures/base.js';
-import { isDevnetAvailable, devnetApiFetch, waitForDevnetStatus, requireDevnetPrecondition } from '../../helpers/devnet.js';
+import { devnetApiFetch, waitForDevnetStatus, requireDevnetPrecondition, requireDevnetNode } from '../../helpers/devnet.js';
 
 test.describe.configure({ mode: 'serial' });
 
 test.beforeAll(async () => {
-  requireDevnetPrecondition(test, !isDevnetAvailable(1), 'Devnet node1 not running');
+  await requireDevnetNode(test, 1);
   await waitForDevnetStatus(1);
 });
 

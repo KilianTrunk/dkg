@@ -2,13 +2,13 @@
  * Context graph variant matrix on devnet — edge vs core node roles.
  */
 import { test, expect } from '../../fixtures/base.js';
-import { isDevnetAvailable, waitForDevnetStatus, devnetApiFetch, requireDevnetPrecondition } from '../../helpers/devnet.js';
+import { isDevnetAvailable, waitForDevnetStatus, devnetApiFetch, requireDevnetPrecondition, requireDevnetNode } from '../../helpers/devnet.js';
 import { listContextGraphs, buildTestQuads, createWmAssertion } from '../../helpers/devnet-publish.js';
 
 test.describe.configure({ mode: 'serial' });
 
 test.beforeAll(async () => {
-  requireDevnetPrecondition(test, !isDevnetAvailable(1), 'Devnet node1 not running');
+  await requireDevnetNode(test, 1);
   await waitForDevnetStatus(1);
 });
 

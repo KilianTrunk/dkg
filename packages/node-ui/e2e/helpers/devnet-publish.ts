@@ -253,7 +253,7 @@ export async function publishToVm(opts: {
   assertionName: string;
   nodeNum?: number;
   clearAfter?: boolean;
-}): Promise<{ status?: string; kaId?: string; txHash?: string }> {
+}): Promise<{ httpStatus: number; status?: string; kaId?: string; txHash?: string; contextGraphError?: string }> {
   const res = await devnetApiFetch('/api/shared-memory/publish', {
     method: 'POST',
     nodeNum: opts.nodeNum ?? 1,
@@ -266,14 +266,20 @@ export async function publishToVm(opts: {
   if (!res.ok) {
     throw new Error(`publish failed: ${res.status} ${await res.text()}`);
   }
-  return (await res.json()) as { status?: string; kaId?: string; txHash?: string };
+  // NB: `res.ok` is true for 207 too. The daemon returns 207 when the SWM/VM
+  // publish itself succeeded but the context-graph mirror failed
+  // (`result.contextGraphError`) — a PARTIAL publish. We surface both the raw
+  // http status and the error string so callers that care (the full-pipeline
+  // verifier) can reject a 207 instead of treating it as a clean pass.
+  const body = (await res.json()) as { status?: string; kaId?: string; txHash?: string; contextGraphError?: string };
+  return { httpStatus: res.status, ...body };
 }
 
 export async function runWmSwmVmPipeline(opts: {
   contextGraphId: string;
   stamp?: number;
   nodeNum?: number;
-}): Promise<{ assertionName: string; label: string; kaId?: string }> {
+}): Promise<{ assertionName: string; label: string; kaId?: string; httpStatus?: number; contextGraphError?: string }> {
   const stamp = opts.stamp ?? Date.now();
   const assertionName = `e2e-ui-pipeline-${stamp}`;
   const label = `E2E Pipeline ${stamp}`;
@@ -309,7 +315,7 @@ export async function runWmSwmVmPipeline(opts: {
       nodeNum: opts.nodeNum,
     });
 
-    return { assertionName, label, kaId: vm.kaId };
+    return { assertionName, label, kaId: vm.kaId, httpStatus: vm.httpStatus, contextGraphError: vm.contextGraphError };
   });
 }
 

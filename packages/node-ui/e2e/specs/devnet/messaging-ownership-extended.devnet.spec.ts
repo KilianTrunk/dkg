@@ -3,10 +3,10 @@
  */
 import { test, expect } from '../../fixtures/base.js';
 import {
-  isDevnetAvailable,
   devnetApiFetch,
   waitForDevnetStatus,
   requireDevnetPrecondition,
+  requireDevnetNode,
 } from '../../helpers/devnet.js';
 import {
   listContextGraphs,
@@ -17,13 +17,13 @@ import {
 test.describe.configure({ mode: 'serial' });
 
 test.beforeAll(async () => {
-  requireDevnetPrecondition(test, !isDevnetAvailable(1), 'Devnet node1 not running');
+  await requireDevnetNode(test, 1);
   await waitForDevnetStatus(1);
 });
 
 test.describe('Prolonged inter-node messaging soak', () => {
   test('agents peer count stable over 30s polling window', async () => {
-    requireDevnetPrecondition(test, !isDevnetAvailable(2), 'Devnet node2 not running');
+    await requireDevnetNode(test, 2);
     const samples: number[] = [];
     let okResponses = 0;
     for (let i = 0; i < 15; i++) {
@@ -41,7 +41,7 @@ test.describe('Prolonged inter-node messaging soak', () => {
 
   test('status endpoint stays healthy across nodes during soak', async () => {
     for (const nodeNum of [1, 2]) {
-      requireDevnetPrecondition(test, !isDevnetAvailable(nodeNum), `Devnet node${nodeNum} not running`);
+      await requireDevnetNode(test, nodeNum);
       const res = await devnetApiFetch('/api/status', { nodeNum });
       expect(res.ok).toBe(true);
     }
@@ -74,7 +74,7 @@ test.describe('Ownership transfer + delegated KA update (API)', () => {
   });
 
   test('second agent registration succeeds on devnet node2', async () => {
-    requireDevnetPrecondition(test, !isDevnetAvailable(2), 'Devnet node2 not running');
+    await requireDevnetNode(test, 2);
     const { registerAgent } = await import('../../helpers/devnet-publish.js');
     const agent = await registerAgent(2, 'delegated');
     expect(agent.agentAddress).toMatch(/^0x[a-fA-F0-9]{40}$/);

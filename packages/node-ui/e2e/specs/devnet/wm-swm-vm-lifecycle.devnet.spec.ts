@@ -8,6 +8,7 @@ import {
   isDevnetAvailable,
   waitForDevnetStatus,
   devnetApiFetch,
+  requireDevnetPrecondition,
 } from '../../helpers/devnet.js';
 import {
   listContextGraphs,
@@ -22,10 +23,10 @@ test.describe.configure({ mode: 'serial' });
 const run: { cgId?: string; cgName?: string; label?: string; assertionName?: string; kaId?: string } = {};
 
 test.beforeAll(async () => {
-  test.skip(!isDevnetAvailable(1), 'Devnet node1 not running');
+  requireDevnetPrecondition(test, !isDevnetAvailable(1), 'Devnet node1 not running');
   await waitForDevnetStatus(1);
   const cgs = await listContextGraphs(1);
-  test.skip(cgs.length === 0, 'No context graphs on devnet');
+  requireDevnetPrecondition(test, cgs.length === 0, 'No context graphs on devnet');
   run.cgId = cgs[0]!.id;
   run.cgName = cgs[0]!.name;
 });
@@ -63,9 +64,14 @@ test.describe('WM → SWM → VM API pipeline', () => {
     run.label = result.label;
     run.assertionName = result.assertionName;
     run.kaId = result.kaId;
-    if (result.kaId) {
-      expect(BigInt(result.kaId)).toBeGreaterThan(0n);
-    }
+    // A successful VM publish (HTTP 200) ALWAYS carries a kaId — the daemon's
+    // publishResponsePayload returns `kaId: String(result.kaId)` and publishToVm
+    // throws on any non-2xx. So this is an unconditional contract, NOT a soft
+    // "assert only if present" check: a 200 with a missing/zero kaId means the
+    // on-chain KA mint silently regressed, which is exactly what this test exists
+    // to catch. The previous `if (result.kaId)` guard let that slip through green.
+    expect(result.kaId, 'VM publish returned 200 but minted no on-chain kaId').toBeTruthy();
+    expect(BigInt(result.kaId!)).toBeGreaterThan(0n);
   });
 });
 

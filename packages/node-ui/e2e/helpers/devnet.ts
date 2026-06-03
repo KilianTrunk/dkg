@@ -132,7 +132,44 @@ export async function waitForConnectedPeers(
   );
 }
 
+const IS_CI = !!process.env.CI;
+
+type SkippableTest = { skip: (condition: boolean, description: string) => void };
+
+/**
+ * Gate a devnet spec on a precondition (node reachable, ≥1 context graph, …).
+ *
+ * These preconditions are genuinely OPTIONAL for a local run with no devnet up —
+ * there we just skip so `pnpm test:e2e` stays usable without a cluster. But in
+ * CI the devnet is bootstrapped by `bootstrap-devnet.ts` and gated to a SETTLED
+ * mesh + a registered PRIMARY_CG by `global-setup.ts` BEFORE any spec runs. So a
+ * failing precondition in CI is NOT "not applicable" — it's a real, currently
+ * MASKED failure (a flaked node, a partitioned mesh, a dropped CG). Skipping it
+ * would turn a broken devnet into a false green on the most valuable protocol
+ * tests. So in CI we THROW (turning the lane red) instead of skipping.
+ *
+ * Use this for environment/setup preconditions only. Genuine run-state guards
+ * (e.g. "a prior serial test in this file didn't produce data") should keep
+ * using `test.skip(...)` directly — the upstream failure is already red, and the
+ * dependent skip just avoids cascading noise.
+ */
+export function requireDevnetPrecondition(test: SkippableTest, unmet: boolean, description: string): void {
+  if (!unmet) return;
+  if (IS_CI) {
+    throw new Error(
+      `[devnet-precondition] ${description}. In CI the devnet is bootstrapped and gated ` +
+        `by global-setup before any spec runs, so an unmet precondition here is a real ` +
+        `failure (flaked node / partitioned mesh / missing context graph), not a skip.`,
+    );
+  }
+  test.skip(true, description);
+}
+
 /** Skip helper for devnet-only specs — call at start of test. */
-export function skipUnlessDevnet(test: { skip: (condition: boolean, description: string) => void }, nodeNum = 1) {
-  test.skip(!isDevnetAvailable(nodeNum), `Devnet node${nodeNum} not running — start with ./scripts/devnet.sh start 6`);
+export function skipUnlessDevnet(test: SkippableTest, nodeNum = 1) {
+  requireDevnetPrecondition(
+    test,
+    !isDevnetAvailable(nodeNum),
+    `Devnet node${nodeNum} not running — start with ./scripts/devnet.sh start 6`,
+  );
 }

@@ -818,6 +818,12 @@ export async function listAssertions(
   //     the allow-list to the assertion partitions so these counts populate.
   // Counts are merged by graph URI; a WM graph with no count row simply
   // renders without a triple badge (the badge is `!= null`-guarded).
+  // The two queries fire in parallel, but the count is BEST-EFFORT: it feeds
+  // only the triple-count badge, so a count failure (timeout, a future
+  // scoped-query edge case) must not reject the whole listing and regress the
+  // promote flow back to "no assertions". Its rejection is swallowed to `null`
+  // (rows then render with `tripleCount: undefined`); the membership query
+  // stays authoritative and its rejection still propagates.
   const listSparql = `SELECT ?g WHERE {
     GRAPH <${metaGraph}> { ?g <http://dkg.io/ontology/memoryLayer> "WM" }
   }`;
@@ -827,7 +833,8 @@ export async function listAssertions(
   } GROUP BY ?g`;
   const [listData, countData] = await Promise.all([
     postQueryDeduped({ sparql: listSparql, contextGraphId, includeContextGraphPartitions: true }),
-    postQueryDeduped({ sparql: countSparql, contextGraphId, includeContextGraphPartitions: true }),
+    postQueryDeduped({ sparql: countSparql, contextGraphId, includeContextGraphPartitions: true })
+      .catch(() => null),
   ]);
   const bindings: any[] = listData?.result?.bindings ?? [];
   const countByGraph = new Map<string, number>();

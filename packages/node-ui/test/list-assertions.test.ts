@@ -218,6 +218,20 @@ describe('listAssertions (WM) — URI parse + cg-scoped filter', () => {
     expect(countBody.sparql).toContain('COUNT');
   });
 
+  it('still lists WM assertions when the (best-effort) count query fails', async () => {
+    // Codex #944 — the triple-count query feeds only the badge, so a count
+    // failure must NOT drop the whole WM list and regress promote to "no
+    // assertions". The membership query (call[0]) resolves; the count query
+    // (call[1]) rejects. Rows must still surface, with tripleCount undefined.
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({ result: { bindings: [bRow('did:dkg:context-graph:cg-A/assertion/0xabc/notes', 5)] } }),
+    );
+    fetchMock.mockRejectedValueOnce(new Error('count query timed out'));
+    const out = await listAssertions('cg-A', 'wm');
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({ name: 'notes', tripleCount: undefined });
+  });
+
   it('scopes the /assertion/ discriminator to the tail when cgId itself contains "/assertion/"', async () => {
     // PR #710 reviewer guard — `validateContextGraphId` permits
     // slashes, so a cgId can literally contain `/assertion/` as a

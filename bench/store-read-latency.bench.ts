@@ -14,7 +14,8 @@ import { benchAsyncWithHooks } from './support/esbench-case-hooks.ts';
  * It exercises the REAL Oxigraph triple store and measures the two read
  * shapes that hung on the live node when the daemon was saturated:
  *   - a trivial `LIMIT 1` scan (the UI's "is the store responsive?" probe), and
- *   - a `COUNT(*)` aggregate (the 30s metrics-collector cross-graph count).
+ *   - the production `getTotalTriples` `COUNT(*)` aggregate the 30s metrics
+ *     collector runs (`packages/cli/src/daemon/lifecycle.ts`).
  *
  * Each is measured both on an idle store and while a sustained background
  * writer churns inserts/deletes — modelling the single-writer contention that
@@ -44,7 +45,12 @@ interface ReadStore {
 
 const GRAPH = 'http://bench.dkg/g/store-read';
 const READ_LIMIT1 = `SELECT ?s WHERE { GRAPH <${GRAPH}> { ?s ?p ?o } } LIMIT 1`;
-const READ_COUNT = `SELECT (COUNT(*) AS ?c) WHERE { GRAPH <${GRAPH}> { ?s ?p ?o } }`;
+// Mirror the production `getTotalTriples` aggregate the 30s metrics collector
+// runs (`packages/cli/src/daemon/lifecycle.ts`) VERBATIM — default graph UNION
+// all named graphs — so the benchmark measures the real read shape rather than
+// a graph-scoped approximation. The synthetic data lives in a named graph, so
+// the `GRAPH ?g` branch carries the scan.
+const READ_TOTAL_TRIPLES = 'SELECT (COUNT(*) AS ?c) WHERE { { ?s ?p ?o } UNION { GRAPH ?g { ?s ?p ?o } } }';
 
 // Bounded write churn: the background writer repeatedly inserts then deletes a
 // fixed batch in a region disjoint from the pre-populated base, so it generates
@@ -55,6 +61,10 @@ const CHURN_OFFSET = 1_000_000_000;
 
 const STORE_SIZES: Record<string, number> = { '1k': 1_000, '10k': 10_000, '50k': 50_000, '200k': 200_000 };
 const INSERT_CHUNK = 1_000;
+
+function errorText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
 
 function makeQuads(count: number, offset: number): Quad[] {
   const quads: Quad[] = new Array(count);
@@ -124,11 +134,37 @@ export default defineSuite({
     const quadCount = STORE_SIZES[sizeLabel];
 
     const store = createStore(backend);
+
+    const churn = makeQuads(CHURN_BATCH, CHURN_OFFSET);
+    let writerActive = false;
+    let writerDone: Promise<void> | undefined;
+    let writerError: unknown;
+
+    const stopWriter = async (): Promise<void> => {
+      if (!writerDone) return;
+      writerActive = false;
+      const done = writerDone;
+      writerDone = undefined;
+      // The loop captures its own failures into `writerError` (surfaced by the
+      // workload / `startWriter`), so awaiting here never rejects.
+      await done;
+    };
+
+    // ONE ordered teardown for the scene: stop the writer and await its loop
+    // BEFORE closing the store, so an in-flight insert/delete can never race a
+    // closed store/worker. esbench may run scene teardown hooks concurrently,
+    // so all ordering lives inside this single callback. Registered up-front so
+    // the store is still closed (and any worker thread terminated) even if the
+    // population below throws.
     scene.teardown(async () => {
       try {
-        await store.close();
-      } catch {
-        /* best-effort teardown */
+        await stopWriter();
+      } finally {
+        try {
+          await store.close();
+        } catch {
+          /* best-effort close */
+        }
       }
     });
 
@@ -137,23 +173,24 @@ export default defineSuite({
       await store.insert(makeQuads(Math.min(INSERT_CHUNK, quadCount - inserted), inserted));
     }
 
-    // Background writer for the `(under write load)` cases. It is scoped to
-    // each loaded iteration rather than relying on case-execution order, so a
-    // reordered or newly-inserted case can never start the writer during an
-    // `(idle)` measurement and poison the baseline:
-    //   - `beforeIteration` starts the writer and AWAITS one full insert/delete
-    //     cycle, so writes are provably in flight before the measured read
-    //     begins. This matters most for the `worker` backend, where an insert
-    //     is only *queued* to another thread — a synchronous start could let
-    //     the read complete before the first write was ever applied.
-    //   - `afterIteration` stops it.
+    // Background writer for the `(under write load)` cases, scoped to each
+    // loaded iteration (not to case-execution order) so a reordered or
+    // newly-inserted case can never start it during an `(idle)` measurement:
+    //   - `beforeIteration` (startWriter) AWAITS one full insert/delete cycle,
+    //     so writes are provably in flight before the measured read begins
+    //     (critical for the `worker` backend, where an insert is only queued to
+    //     another thread).
+    //   - a writer that dies is recorded in `writerError` and surfaced as a
+    //     FAILED case — startWriter throws if it died before the first cycle,
+    //     and the workload throws if it died mid-measurement — so a broken
+    //     writer can never silently degrade an `(under write load)` case into a
+    //     misleading idle read.
+    //   - `afterIteration` (stopWriter) stops it.
     // The `(idle)` cases register no writer at all.
-    const churn = makeQuads(CHURN_BATCH, CHURN_OFFSET);
-    let writerActive = false;
-    let writerDone: Promise<void> | undefined;
     const startWriter = async (): Promise<void> => {
       if (writerActive) return;
       writerActive = true;
+      writerError = undefined;
       let signalFirstCycle!: () => void;
       const firstCycle = new Promise<void>((resolve) => { signalFirstCycle = resolve; });
       writerDone = (async () => {
@@ -164,41 +201,40 @@ export default defineSuite({
             await store.delete(churn);
             if (!signalled) { signalled = true; signalFirstCycle(); }
           }
+        } catch (err) {
+          writerError = err;
         } finally {
           // Unblock the barrier even if the first cycle threw, so a writer
-          // failure degrades the measurement instead of hanging it.
+          // failure surfaces (below) instead of hanging the benchmark.
           signalFirstCycle();
         }
       })();
       await firstCycle;
-    };
-    const stopWriter = async (): Promise<void> => {
-      if (!writerDone) return;
-      writerActive = false;
-      const done = writerDone;
-      writerDone = undefined;
-      try {
-        await done;
-      } catch {
-        /* writer errors are not the measurement */
+      if (writerError !== undefined) {
+        throw new Error(`background writer failed before its first write cycle: ${errorText(writerError)}`);
       }
     };
-    scene.teardown(stopWriter);
 
     benchAsyncWithHooks(scene, 'read LIMIT 1 (idle)', async () => {
       await store.query(READ_LIMIT1);
     }, {});
 
-    benchAsyncWithHooks(scene, 'read COUNT(*) (idle)', async () => {
-      await store.query(READ_COUNT);
+    benchAsyncWithHooks(scene, 'read getTotalTriples (idle)', async () => {
+      await store.query(READ_TOTAL_TRIPLES);
     }, {});
 
     benchAsyncWithHooks(scene, 'read LIMIT 1 (under write load)', async () => {
       await store.query(READ_LIMIT1);
+      if (writerError !== undefined) {
+        throw new Error(`background writer died during the measurement: ${errorText(writerError)}`);
+      }
     }, { beforeIteration: startWriter, afterIteration: stopWriter });
 
-    benchAsyncWithHooks(scene, 'read COUNT(*) (under write load)', async () => {
-      await store.query(READ_COUNT);
+    benchAsyncWithHooks(scene, 'read getTotalTriples (under write load)', async () => {
+      await store.query(READ_TOTAL_TRIPLES);
+      if (writerError !== undefined) {
+        throw new Error(`background writer died during the measurement: ${errorText(writerError)}`);
+      }
     }, { beforeIteration: startWriter, afterIteration: stopWriter });
   },
 });

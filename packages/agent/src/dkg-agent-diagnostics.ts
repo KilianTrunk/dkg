@@ -17,7 +17,8 @@ import { createOperationContext, PROTOCOL_MESSAGE, PROTOCOL_SYNC } from '@origin
 import type { DKGNode, Logger } from '@origintrail-official/dkg-core';
 import type { SharedMemoryHandler } from '@origintrail-official/dkg-publisher';
 import type { Messenger } from './p2p/messenger.js';
-import type { PeerHealth, PeerDiagnostics, PeerConnectionSnapshot } from './dkg-agent-types.js';
+import type { PeerHealth, PeerDiagnostics, PeerConnectionSnapshot, SyncReconcilerBackoff } from './dkg-agent-types.js';
+import { SYNC_STALENESS_THRESHOLD_MS } from './dkg-agent-constants.js';
 
 export async function getPeerProtocols(node: DKGNode, peerId: string): Promise<string[]> {
   try {
@@ -83,7 +84,13 @@ export function getSwmHandlerStats(handler: SharedMemoryHandler | undefined): {
  * particular.
  */
 export async function getPeerDiagnostics(
-  deps: { node: DKGNode; messenger: Messenger; peerHealth: ReadonlyMap<string, PeerHealth> },
+  deps: {
+    node: DKGNode;
+    messenger: Messenger;
+    peerHealth: ReadonlyMap<string, PeerHealth>;
+    lastSuccessfulSyncAt: ReadonlyMap<string, number>;
+    syncReconcilerBackoff: ReadonlyMap<string, SyncReconcilerBackoff>;
+  },
   peerId: string,
 ): Promise<PeerDiagnostics> {
   const libp2p = deps.node.libp2p;
@@ -115,6 +122,13 @@ export async function getPeerDiagnostics(
       health: null,
       protocols: [],
       syncCapable: false,
+      syncStatus: {
+        capable: false,
+        capability: 'unknown',
+        lastSuccessfulSyncAt: null,
+        stale: false,
+        backoff: null,
+      },
     };
   }
 
@@ -155,6 +169,14 @@ export async function getPeerDiagnostics(
   } catch {
     keyedConns = [];
   }
+
+  let peerListHasPeer = false;
+  try {
+    peerListHasPeer = libp2p.getPeers().some((p: unknown) => (p as { toString?: () => string })?.toString?.() === peerKey);
+  } catch {
+    peerListHasPeer = false;
+  }
+  const connected = rawConns.length > 0 || keyedConns.length > 0 || peerListHasPeer;
 
   const connections: PeerConnectionSnapshot[] = rawConns.map((c) => {
     const remoteAddr = c.remoteAddr?.toString() ?? null;
@@ -257,17 +279,43 @@ export async function getPeerDiagnostics(
   };
 
   const protocols = peerStoreSnapshot?.protocols ?? [];
-  // rc.9 PR-E: tracks the active `PROTOCOL_SYNC` constant rather
-  // than the literal `/dkg/10.0.0/sync`, so a node running rc.9+
-  // (advertising `/dkg/10.0.1/sync`) is correctly reported as
-  // sync-capable. Hard cutover — legacy `/dkg/10.0.0/sync`-only
-  // peers are no longer compatible and intentionally report
-  // syncCapable=false.
+  // Tracks the active `PROTOCOL_SYNC` constant (now `/dkg/10.0.2/sync`
+  // after sync moved off the messenger substrate), so a node
+  // advertising the current protocol is reported sync-capable. Hard
+  // cutover — peers on the older `/sync` wire ID are no longer
+  // compatible and intentionally report syncCapable=false.
   const syncCapable = protocols.includes(PROTOCOL_SYNC);
+  const syncCapability: PeerDiagnostics['syncStatus']['capability'] = peerStoreSnapshot == null
+    ? 'unknown'
+    : syncCapable
+      ? 'supported'
+      : 'unsupported';
+  const now = Date.now();
+  const lastSuccessfulSync = deps.lastSuccessfulSyncAt.get(peerKey) ?? null;
+  const backoff = deps.syncReconcilerBackoff.get(peerKey) ?? null;
+  const syncHealthObservable = connected && (syncCapability === 'supported' || syncCapability === 'unknown');
+  const syncStale = syncHealthObservable && (
+    backoff != null ||
+    lastSuccessfulSync == null ||
+    (now - lastSuccessfulSync) >= SYNC_STALENESS_THRESHOLD_MS
+  );
+  const syncStatus = {
+    capable: syncCapable,
+    capability: syncCapability,
+    lastSuccessfulSyncAt: lastSuccessfulSync,
+    stale: syncStale,
+    backoff: syncHealthObservable && backoff
+      ? {
+          failures: backoff.failures,
+          nextRetryAt: backoff.nextRetryAt,
+          retryInMs: Math.max(0, backoff.nextRetryAt - now),
+        }
+      : null,
+  };
 
   return {
     peerId: peerKey,
-    connected: rawConns.length > 0,
+    connected,
     rawConnectionCount: rawConns.length,
     getConnectionsReturnsForPeer: keyedConns.length,
     connections,
@@ -276,6 +324,7 @@ export async function getPeerDiagnostics(
     health: deps.peerHealth.get(peerKey) ?? null,
     protocols,
     syncCapable,
+    syncStatus,
   };
 }
 

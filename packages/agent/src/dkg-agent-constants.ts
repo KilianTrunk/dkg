@@ -135,6 +135,22 @@ export const SYNC_RECONCILER_INTERVAL_MS = 5 * 60_000;
  * the event-driven path time to win the race in the common case.
  */
 export const SYNC_STALENESS_THRESHOLD_MS = 10 * 60_000;
+/**
+ * Per-peer exponential backoff for the sync reconciler. Without it, a
+ * peer that can never be synced (dead, NAT-stuck, or persistently
+ * stream-resetting) is retried on EVERY reconciler tick forever:
+ * `lastSuccessfulSyncAt` never gets stamped, so the peer reads as
+ * perpetually stale and is dialed every `SYNC_RECONCILER_INTERVAL_MS`.
+ * The backoff grows the per-peer retry gap as
+ * `SYNC_BACKOFF_BASE_MS * 2^(failures-1)` (capped at
+ * `SYNC_BACKOFF_MAX_MS`, ±`SYNC_BACKOFF_JITTER` to de-correlate peers)
+ * and resets the instant a sync succeeds. Only the periodic reconciler
+ * is gated — connection:open and peer:update still trigger an immediate
+ * attempt, so new information is never delayed.
+ */
+export const SYNC_BACKOFF_BASE_MS = 5 * 60_000;
+export const SYNC_BACKOFF_MAX_MS = 60 * 60_000;
+export const SYNC_BACKOFF_JITTER = 0.25;
 export const RANDOM_SAMPLING_BIND_RETRY_MS = 30_000;
 export const STORAGE_ACK_REGISTRATION_RETRY_MS = 30_000;
 

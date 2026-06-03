@@ -427,9 +427,9 @@ export interface PeerDiagnostics {
    *
    * `byProtocol` (rc.9 PR-E codex follow-up #10) breaks out queued
    * entries per libp2p protocol id so post-substrate-migration
-   * traffic (sync, SWM, future protocols) is visible to operator
-   * diagnostics — without it, a peer stuck on sync catch-up reports
-   * `pendingCount=0` and looks healthy.
+   * substrate traffic (SWM, access, future protocols) is visible to
+   * operator diagnostics. Raw sync catch-up state lives in
+   * `syncStatus` because sync is no longer on the substrate.
    */
   outbox: {
     /** Pending count for the chat protocol specifically (rc.8 contract). */
@@ -457,9 +457,49 @@ export interface PeerDiagnostics {
   health: PeerHealth | null;
   /** Protocols this peer's identify-handshake advertised. */
   protocols: string[];
-  /** Convenience flag — peer speaks `/dkg/10.0.0/sync`. */
+  /** Convenience flag — peer speaks `PROTOCOL_SYNC`. */
   syncCapable: boolean;
+  /**
+   * Raw sync catch-up health. Sync no longer lives on the messenger
+   * substrate, so stuck catch-up is exposed here instead of in
+   * `outbox.byProtocol`.
+   */
+  syncStatus: {
+    capable: boolean;
+    capability: 'supported' | 'unsupported' | 'unknown';
+    lastSuccessfulSyncAt: number | null;
+    stale: boolean;
+    backoff: {
+      failures: number;
+      nextRetryAt: number;
+      retryInMs: number;
+    } | null;
+  };
 }
+
+/**
+ * Per-peer sync-reconciler backoff state. `failures` is the count of
+ * consecutive reconciler attempts that did NOT produce a successful sync;
+ * `nextRetryAt` is the epoch-ms before which the reconciler skips this peer.
+ * Reset on a successful sync (`onPeerSynced`) and on `connection:close`.
+ * See `SYNC_BACKOFF_BASE_MS`.
+ */
+export type SyncReconcilerBackoff = {
+  failures: number;
+  nextRetryAt: number;
+  protocolsKey?: string | null;
+  connectionKey?: string | null;
+};
+
+/**
+ * Snapshot of a peer's reachability signals (advertised protocols +
+ * connection identity) used to decide whether a backed-off peer is worth
+ * re-probing before `nextRetryAt`.
+ */
+export type SyncReconcilerProbe = {
+  protocolsKey: string | null;
+  connectionKey: string | null;
+};
 
 /**
  * Caller-visible result of `DKGAgent.sendChat`. Backwards-compatible

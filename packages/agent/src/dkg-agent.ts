@@ -815,7 +815,13 @@ export class DKGAgent extends DKGAgentBase {
 
   async getPeerDiagnostics(peerId: string): Promise<PeerDiagnostics> {
     return diagnostics.getPeerDiagnostics(
-      { node: this.node, messenger: this.messenger, peerHealth: this.peerHealth },
+      {
+        node: this.node,
+        messenger: this.messenger,
+        peerHealth: this.peerHealth,
+        lastSuccessfulSyncAt: this.lastSuccessfulSyncAt,
+        syncReconcilerBackoff: this.syncReconcilerBackoff,
+      },
       peerId,
     );
   }

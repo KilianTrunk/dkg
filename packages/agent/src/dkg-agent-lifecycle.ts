@@ -212,7 +212,7 @@ import { runSharedMemorySync } from './sync/requester/shared-memory-sync.js';
 import { buildSyncRequestEnvelope, type SyncPhase } from './sync/auth/request-build.js';
 import { authorizePrivateSyncRequest } from './sync/auth/request-authorize.js';
 import { registerSyncHandler } from './sync/responder/sync-handler.js';
-import { runSyncOnConnect } from './sync/on-connect/sync-on-connect.js';
+import { runSyncOnConnect, SyncOnConnectPostSyncError, type SyncOnConnectOutcome } from './sync/on-connect/sync-on-connect.js';
 import {
   generateCustodialAgent, registerSelfSovereignAgent, agentFromPrivateKey,
   ensureWorkspaceEncryptionKey,
@@ -283,6 +283,9 @@ import {
   CATCHUP_ON_CONNECT_COOLDOWN_MS,
   SYNC_RECONCILER_INTERVAL_MS,
   SYNC_STALENESS_THRESHOLD_MS,
+  SYNC_BACKOFF_BASE_MS,
+  SYNC_BACKOFF_MAX_MS,
+  SYNC_BACKOFF_JITTER,
   RANDOM_SAMPLING_BIND_RETRY_MS,
   STORAGE_ACK_REGISTRATION_RETRY_MS,
   JOIN_APPROVAL_RETRY_TICK_MS,
@@ -341,6 +344,8 @@ import {
   type SharedMemorySyncResult,
   type DKGAgentConfig,
   type ReplicationEvent,
+  type SyncReconcilerProbe,
+  type SyncReconcilerBackoff,
 } from './dkg-agent-types.js';
 import {
   normalizePublishContextGraphId,
@@ -1501,14 +1506,17 @@ export class LifecycleSyncMethods extends DKGAgentBase {
       }
     }
 
-    // rc.9 PR-E: bind to messenger.register so the /dkg/10.0.1/sync
-    // handler receives envelope-unwrapped payload + benefits from
-    // receiver-side idempotency dedup. Pre-PR-E this registered on
-    // the raw router, so the constant bump on its own (commit at
-    // PROTOCOL_SYNC declaration) gave the new protocol ID none of
-    // the substrate semantics — Codex review #569 caught the gap.
+    // Sync registers on the RAW ProtocolRouter (not messenger.register):
+    // /dkg/10.0.2/sync is deliberately off the Universal Messenger
+    // substrate so its large, never-reused page responses are not cached
+    // in message_idempotency (the ~2.9 GB node-ui.db bloat). The raw
+    // router passes the bare payload — exactly the auth envelope
+    // parseSyncRequest expects — and the adapter re-exposes the string
+    // peerId contract registerSyncHandler relies on. (Reverts rc.9 PR-E
+    // for sync only; other substrate protocols keep their dedup.)
     registerSyncHandler({
-      register: this.messenger.register.bind(this.messenger),
+      register: (protocol, handler) =>
+        this.router.register(protocol, (data, peerIdObj) => handler(data, peerIdObj.toString())),
       protocolSync: PROTOCOL_SYNC,
       syncDeniedResponse: SYNC_DENIED_RESPONSE,
       syncPageSize: SYNC_PAGE_SIZE,
@@ -1947,6 +1955,7 @@ export class LifecycleSyncMethods extends DKGAgentBase {
       this.catchupOnConnectAt.delete(remotePeer);
       this.skippedNoSyncPeers.delete(remotePeer);
       this.lastSuccessfulSyncAt.delete(remotePeer);
+      this.syncReconcilerBackoff.delete(remotePeer);
     });
 
     // Event-driven sync-retry: libp2p emits `peer:update` whenever a
@@ -2281,9 +2290,9 @@ export class LifecycleSyncMethods extends DKGAgentBase {
    * them into our local store. Used on peer:connect for initial catch-up,
    * with a per-peer guard to avoid overlapping sync storms.
    */
-  async trySyncFromPeer(this: DKGAgent, remotePeer: string): Promise<void> {
+  async trySyncFromPeer(this: DKGAgent, remotePeer: string): Promise<SyncOnConnectOutcome | 'not-started'> {
     if (!this.started) {
-      return;
+      return 'not-started';
     }
     return runSyncOnConnect({
       remotePeer,
@@ -2303,6 +2312,7 @@ export class LifecycleSyncMethods extends DKGAgentBase {
       onPeerSynced: (peerId) => {
         this.lastSuccessfulSyncAt.set(peerId, Date.now());
         this.skippedNoSyncPeers.delete(peerId);
+        this.syncReconcilerBackoff.delete(peerId);
       },
     });
   }
@@ -2362,12 +2372,122 @@ export class LifecycleSyncMethods extends DKGAgentBase {
       const lastOk = this.lastSuccessfulSyncAt.get(peerId);
       const stale = lastOk == null || (now - lastOk) >= SYNC_STALENESS_THRESHOLD_MS;
       if (!stale) continue;
+      // Per-peer exponential backoff: a peer that can never be synced
+      // (dead / NAT-stuck / persistently stream-resetting) never stamps
+      // `lastSuccessfulSyncAt`, so it reads as perpetually stale. Without
+      // this gate it would be dialed on every tick forever. The gate
+      // applies ONLY to the periodic reconciler — connection:open and
+      // peer:update still fire an immediate attempt, so newly-reachable
+      // peers are never delayed.
+      const backoff = this.syncReconcilerBackoff.get(peerId);
+      const probe = await this.getSyncReconcilerProbe(peerId);
+      if (backoff && now < backoff.nextRetryAt) {
+        if (!this.hasSyncReconcilerProbeChanged(backoff, probe)) {
+          continue;
+        }
+        this.syncReconcilerBackoff.delete(peerId);
+      }
       const shortPeer = peerId.slice(-8);
-      this.log.info(ctx, `Sync reconciler retrying ${shortPeer} (last success: ${lastOk == null ? 'never' : `${Math.round((now - lastOk) / 1000)}s ago`})`);
-      this.trySyncFromPeer(peerId).catch((err: unknown) => {
-        const message = err instanceof Error ? err.message : String(err);
-        this.log.warn(ctx, `Sync reconciler retry failed for ${shortPeer}: ${message}`);
-      });
+      this.log.info(ctx, `Sync reconciler retrying ${shortPeer} (last success: ${lastOk == null ? 'never' : `${Math.round((now - lastOk) / 1000)}s ago`}${backoff ? `, prior failures: ${backoff.failures}` : ''})`);
+      this.trySyncFromPeer(peerId)
+        .then((outcome) => {
+          if (outcome === 'skipped-no-sync' || outcome === 'already-syncing' || outcome === 'not-started') {
+            return;
+          }
+          // `onPeerSynced` clears the backoff on a real success. If the
+          // attempt resolved WITHOUT advancing `lastSuccessfulSyncAt`
+          // (e.g. no progress), treat it as a genuine sync failure so the
+          // backoff grows. A peer that still does not advertise
+          // PROTOCOL_SYNC is handled above and remains eligible on every
+          // reconciler tick, so a missed identify update cannot stretch into
+          // a 5/10/20/60-minute delay.
+          if (this.lastSuccessfulSyncAt.get(peerId) === lastOk) {
+            this.recordSyncReconcilerFailure(peerId, probe);
+          }
+        })
+        .catch((err: unknown) => {
+          const message = err instanceof Error ? err.message : String(err);
+          if (err instanceof SyncOnConnectPostSyncError) {
+            if (err.backoffEligible) {
+              this.recordSyncReconcilerFailure(peerId, probe);
+            }
+            const backoffNote = err.backoffEligible ? 'growing peer backoff' : 'retrying without growing peer backoff';
+            this.log.warn(ctx, `Sync reconciler post-sync step failed for ${shortPeer}; ${backoffNote}: ${message}`);
+            return;
+          }
+          this.recordSyncReconcilerFailure(peerId, probe);
+          this.log.warn(ctx, `Sync reconciler retry failed for ${shortPeer}: ${message}`);
+        });
+    }
+  }
+
+  /**
+   * Snapshot a peer's reachability signals (advertised protocols +
+   * connection identity) used to decide whether a backed-off peer is worth
+   * re-probing before `nextRetryAt`.
+   */
+  async getSyncReconcilerProbe(this: DKGAgent, peerId: string): Promise<SyncReconcilerProbe> {
+    let protocolsKey: string | null = null;
+    try {
+      const protocols = await this.getPeerProtocols(peerId);
+      protocolsKey = [...protocols].sort().join('\n');
+    } catch {
+      protocolsKey = null;
+    }
+    return {
+      protocolsKey,
+      connectionKey: this.getSyncReconcilerConnectionKey(peerId),
+    };
+  }
+
+  getSyncReconcilerConnectionKey(this: DKGAgent, peerId: string): string | null {
+    try {
+      const entries = this.node.libp2p.getConnections()
+        .filter((conn) => conn.remotePeer?.toString?.() === peerId)
+        .map((conn) => [
+          conn.direction,
+          conn.timeline?.open ?? 0,
+          conn.remoteAddr?.toString?.() ?? '',
+        ].join(':'))
+        .sort();
+      return entries.length > 0 ? entries.join('|') : null;
+    } catch {
+      return null;
+    }
+  }
+
+  hasSyncReconcilerProbeChanged(this: DKGAgent, backoff: SyncReconcilerBackoff, probe: SyncReconcilerProbe): boolean {
+    return backoff.protocolsKey !== probe.protocolsKey || backoff.connectionKey !== probe.connectionKey;
+  }
+
+  /**
+   * Grow the per-peer sync-reconciler backoff after an attempt that did
+   * not produce a successful sync. `nextRetryAt` advances by
+   * `SYNC_BACKOFF_BASE_MS * 2^(failures-1)` (capped at
+   * `SYNC_BACKOFF_MAX_MS`) with ±`SYNC_BACKOFF_JITTER` randomisation to
+   * de-correlate retries across peers. Reset to absent on success
+   * (`onPeerSynced`) or disconnect (`connection:close`).
+   */
+  recordSyncReconcilerFailure(this: DKGAgent, peerId: string, probe: SyncReconcilerProbe): void {
+    if (!this.started || !this.isPeerConnectedForSyncBackoff(peerId)) return;
+    const failures = (this.syncReconcilerBackoff.get(peerId)?.failures ?? 0) + 1;
+    // Clamp the exponent so `2 ** exp` can never overflow before the cap.
+    const exp = Math.min(failures - 1, 30);
+    const delay = Math.min(SYNC_BACKOFF_BASE_MS * 2 ** exp, SYNC_BACKOFF_MAX_MS);
+    const jittered = delay * (1 + (Math.random() * 2 - 1) * SYNC_BACKOFF_JITTER);
+    this.syncReconcilerBackoff.set(peerId, {
+      failures,
+      nextRetryAt: Date.now() + jittered,
+      protocolsKey: probe.protocolsKey,
+      connectionKey: probe.connectionKey,
+    });
+  }
+
+  isPeerConnectedForSyncBackoff(this: DKGAgent, peerId: string): boolean {
+    try {
+      return this.node.libp2p.getPeers().some((pid) => pid.toString() === peerId);
+    } catch {
+      return false;
     }
   }
 
@@ -2651,68 +2771,20 @@ export class LifecycleSyncMethods extends DKGAgentBase {
         }
         return this.getOrCreateSyncVerifyWorker().parseAndFilter(nquadsText, targetGraphUri, targetContextGraphId);
       },
-      // rc.9 PR-E: route page fetches through `messenger.sendReliable`
-      // so the sync RPC gets the same ReliableEnvelope wrapping +
-      // outbox + (best-effort) sender-side idempotency cache as the
-      // other migrated protocols (chat, access, query-remote,
-      // storage-ack, verify-proposal, join-request). Pre-PR-E this
-      // used `messenger.sendToPeer` — the raw pass-through — which
-      // gave the new /dkg/10.0.1/sync wire ID none of the substrate
-      // semantics it was named for.
-      //
-      // Sync RPC is synchronous-by-contract: the caller needs the
-      // page bytes back NOW to advance pagination. `queued=true`
-      // means the request landed in the durable outbox but no
-      // response is available yet — the page-fetch layer treats
-      // that as a hard failure for this attempt; the surrounding
-      // `withRetry` (in sync-transport.ts) handles the retry +
-      // backoff loop.
-      //
-      // `messageId` is freshly minted on every retry attempt by
-      // sync-transport.ts (codex review on #569 follow-ups #1-#8
-      // explored stable messageIds and found that every variant
-      // either defeated dedup OR enabled silent replay of stale
-      // responses past sync's app-layer freshness gate; fresh
-      // per-attempt is the only design that holds under all timing
-      // scenarios). The trade-off is no sender-side dedup of
-      // retry-storms — the responder may run a SPARQL page query
-      // up to `syncPageRetryAttempts` times if all attempts
-      // succeed at the receiver but the responses are lost in
-      // transit. Bounded waste, app-layer idempotent, acceptable.
-      //
-      // Known residual concern (codex review #569 follow-up #10,
-      // deferred): recoverable sync send failures land in the
-      // Messenger's shared outbox with the default 24h max-age.
-      // Sync envelopes carry their own 90s freshness TTL
-      // (`SYNC_AUTH_MAX_AGE_MS`), so any outbox-delivered envelope
-      // past that window is denied by the receiver — wasted tick
-      // work, but NOT a correctness problem because fresh
-      // messageIds prevent the cached denial from ever replaying
-      // onto a different attempt. A per-call `maxAgeMs` was
-      // explored, but `Messenger.sendReliable`'s
-      // `enqueueFailure` path doesn't currently read
-      // `opts.maxAgeMs` (only the instance-wide setting at
-      // construction time), so wiring it through is out of scope
-      // for this PR. Also out of scope: extending
-      // `getPeerDiagnostics()` to include per-protocol queued
-      // counts so stuck sync catch-up is observable in the MCP
-      // health endpoint (today only `PROTOCOL_MESSAGE` queued
-      // entries are reported there). Both follow-ups are tracked
-      // for rc.10.
-      send: async (peerId, protocolId, data, sendTimeoutMs, messageId) => {
-        const result = await this.messenger.sendReliable(peerId, protocolId, data, {
-          timeoutMs: sendTimeoutMs,
-          messageId,
-        });
-        if (!result.delivered) {
-          throw new Error(
-            `Sync send to ${peerId} ${
-              result.queued ? 'queued (not synchronously deliverable)' : 'failed'
-            }: ${result.error ?? 'unknown'}`,
-          );
-        }
-        return result.response;
-      },
+      // Sync sends via the raw `messenger.sendToPeer` pass-through
+      // (ProtocolRouter.send), NOT `sendReliable`: /dkg/10.0.2/sync is
+      // off the Universal Messenger substrate so its large, never-reused
+      // page responses are not cached in message_idempotency (the
+      // ~2.9 GB node-ui.db bloat — see PROTOCOL_SYNC declaration). Sync
+      // RPC is synchronous-by-contract (the caller needs the page bytes
+      // back NOW to advance pagination); `sendToPeer` returns the
+      // response bytes directly, and sync's own `withRetry`
+      // (sync-transport.ts) handles retry + backoff. The per-attempt
+      // `messageId` minted by sync-transport.ts is now unused by this
+      // adapter — harmless, left in place to keep the transport surface
+      // stable (reverts rc.9 PR-E for sync only).
+      send: async (peerId, protocolId, data, sendTimeoutMs, _messageId) =>
+        this.messenger.sendToPeer(peerId, protocolId, data, { timeoutMs: sendTimeoutMs }),
       logWarn: (opCtx, message) => this.log.warn(opCtx, message),
       logInfo: (opCtx, message) => this.log.info(opCtx, message),
       logDebug: (opCtx, message) => this.log.debug(opCtx, message),

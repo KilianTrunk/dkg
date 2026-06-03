@@ -342,6 +342,7 @@ import {
   type SharedMemorySyncResult,
   type DKGAgentConfig,
   type ReplicationEvent,
+  type SyncReconcilerBackoff,
 } from './dkg-agent-types.js';
 import {
   normalizePublishContextGraphId,
@@ -1034,6 +1035,15 @@ export class DKGAgentBase {
    * connected peer.
    */
   protected readonly lastSuccessfulSyncAt = new Map<string, number>();
+  /**
+   * Per-peer sync-reconciler backoff. `failures` is the count of
+   * consecutive reconciler attempts that did NOT produce a successful
+   * sync; `nextRetryAt` is the epoch-ms before which the reconciler
+   * skips this peer. Reset on a successful sync (`onPeerSynced`) and on
+   * `connection:close`. Bounded by the connected-peer set (one entry per
+   * peer, cleared on disconnect). See `SYNC_BACKOFF_BASE_MS`.
+   */
+  protected readonly syncReconcilerBackoff = new Map<string, SyncReconcilerBackoff>();
   protected syncReconcilerTimer: ReturnType<typeof setInterval> | null = null;
   /** A.4-lite+: periodic warm/pinned Core-connection reconcile (opt-in). */
   protected warmCoreTimer: ReturnType<typeof setInterval> | null = null;

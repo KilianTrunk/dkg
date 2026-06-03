@@ -5,11 +5,11 @@
  * whose `execute` callbacks delegate to the plugin's `handle*` methods. To
  * keep those definitions in cohesive sibling modules without coupling them to
  * the full `DkgNodePlugin` class, each builder receives a `DkgToolHost` — the
- * structural subset of `DkgNodePlugin` it actually calls. `DkgNodePlugin`
- * implements this surface (the `handle*` methods are widened from `private`
- * to effectively-internal public so the builders, which live outside the
- * class, can reference them). No behavior change: builders simply forward to
- * the same handler methods the inline definitions used to call.
+ * structural subset of `DkgNodePlugin` it actually calls. The `handle*` methods
+ * stay `private` on `DkgNodePlugin` (so they are not part of its public/exported
+ * type surface); `DkgNodePlugin.toolHost()` builds a bound object implementing
+ * this interface and passes it to the builders. No behavior change: builders
+ * simply forward to the same handler methods the inline definitions used to call.
  */
 import type { OpenClawToolResult } from '../types.js';
 

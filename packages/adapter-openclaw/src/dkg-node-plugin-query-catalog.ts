@@ -195,7 +195,17 @@ export function readOnlySparqlOperation(sparql: string): string | null {
     .filter((line) => !line.trimStart().startsWith('#'))
     .join('\n')
     .trim();
-  const match = normalized.match(/^(?:(?:PREFIX\s+\S+\s*<[^>]+>|BASE\s+<[^>]+>)\s*)*(SELECT|ASK|CONSTRUCT|DESCRIBE)\b/i);
+  // Strip leading PREFIX/BASE prologue declarations one at a time with an
+  // anchored, unambiguous pattern. The previous single regex nested `\s*` inside
+  // a `(?:…)*` group, which CodeQL flagged for catastrophic backtracking; the
+  // iterative form below is linear. (`[^\s<]+` for the prefix label cannot
+  // overlap the following `<…>`, removing the remaining ambiguity.)
+  const prologueDecl = /^(?:PREFIX\s+[^\s<]+\s*<[^>]+>|BASE\s+<[^>]+>)\s*/i;
+  let rest = normalized;
+  for (let m = rest.match(prologueDecl); m && m[0].length > 0; m = rest.match(prologueDecl)) {
+    rest = rest.slice(m[0].length);
+  }
+  const match = rest.match(/^(SELECT|ASK|CONSTRUCT|DESCRIBE)\b/i);
   return match?.[1]?.toUpperCase() ?? null;
 }
 

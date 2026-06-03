@@ -91,6 +91,7 @@ import {
   STATE_DIR_SOURCE_PRIORITY,
   type ChatTurnWriterStateDirSource,
 } from './dkg-node-plugin-constants.js';
+import type { DkgToolHost } from './tools/tool-host.js';
 import { buildNodeTools } from './tools/node-tools.js';
 import { buildContextGraphTools } from './tools/context-graph-tools.js';
 import { buildQueryTools } from './tools/query-tools.js';
@@ -2381,17 +2382,65 @@ export class DkgNodePlugin {
   // Tools
   // ---------------------------------------------------------------------------
 
+  /**
+   * Exposes the tool-handler surface to the out-of-class `build*Tools` helpers
+   * without leaking the handlers into the public `DkgNodePlugin` type. The
+   * `handle*` methods stay `private`; this returns bound references that the
+   * builders delegate to via the {@link DkgToolHost} structural contract.
+   */
+  private toolHost(): DkgToolHost {
+    return {
+      handleStatus: this.handleStatus.bind(this),
+      handleWalletBalances: this.handleWalletBalances.bind(this),
+      handleListContextGraphs: this.handleListContextGraphs.bind(this),
+      handleContextGraphCreate: this.handleContextGraphCreate.bind(this),
+      handleContextGraphInvite: this.handleContextGraphInvite.bind(this),
+      handleParticipantAdd: this.handleParticipantAdd.bind(this),
+      handleParticipantRemove: this.handleParticipantRemove.bind(this),
+      handleParticipantList: this.handleParticipantList.bind(this),
+      handleJoinRequestList: this.handleJoinRequestList.bind(this),
+      handleJoinRequestApprove: this.handleJoinRequestApprove.bind(this),
+      handleJoinRequestReject: this.handleJoinRequestReject.bind(this),
+      handleSubscribe: this.handleSubscribe.bind(this),
+      handlePublish: this.handlePublish.bind(this),
+      handleQuery: this.handleQuery.bind(this),
+      handleQueryCatalogList: this.handleQueryCatalogList.bind(this),
+      handleQueryCatalogRun: this.handleQueryCatalogRun.bind(this),
+      handleQueryCatalogSave: this.handleQueryCatalogSave.bind(this),
+      handleFindAgents: this.handleFindAgents.bind(this),
+      handleSendMessage: this.handleSendMessage.bind(this),
+      handleReadMessages: this.handleReadMessages.bind(this),
+      handleInvokeSkill: this.handleInvokeSkill.bind(this),
+      handleAssertionCreate: this.handleAssertionCreate.bind(this),
+      handleAssertionWrite: this.handleAssertionWrite.bind(this),
+      handleAssertionPromote: this.handleAssertionPromote.bind(this),
+      handleAssertionDiscard: this.handleAssertionDiscard.bind(this),
+      handleAssertionImportFile: this.handleAssertionImportFile.bind(this),
+      handleAssertionQuery: this.handleAssertionQuery.bind(this),
+      handleImportArtifactResolve: this.handleImportArtifactResolve.bind(this),
+      handleImportArtifactReadMarkdown: this.handleImportArtifactReadMarkdown.bind(this),
+      handleSemanticEnrichmentWrite: this.handleSemanticEnrichmentWrite.bind(this),
+      handleAssertionHistory: this.handleAssertionHistory.bind(this),
+      handleSubGraphCreate: this.handleSubGraphCreate.bind(this),
+      handleSubGraphList: this.handleSubGraphList.bind(this),
+      handleSharedMemoryPublish: this.handleSharedMemoryPublish.bind(this),
+      handleShare: this.handleShare.bind(this),
+      handleMemorySearch: this.handleMemorySearch.bind(this),
+    };
+  }
+
   private tools(): OpenClawTool[] {
     // Tool definitions are grouped into cohesive `build*Tools` modules under
     // `./tools/`. Order is load-bearing (some hosts surface tools in array
     // order), so the spreads below preserve the original sequence exactly.
+    const host = this.toolHost();
     return [
-      ...buildNodeTools(this),
-      ...buildContextGraphTools(this),
-      ...buildQueryTools(this),
-      ...buildMessagingTools(this),
-      ...buildAssertionTools(this),
-      ...buildMemoryTools(this),
+      ...buildNodeTools(host),
+      ...buildContextGraphTools(host),
+      ...buildQueryTools(host),
+      ...buildMessagingTools(host),
+      ...buildAssertionTools(host),
+      ...buildMemoryTools(host),
     ];
   }
 
@@ -2399,7 +2448,7 @@ export class DkgNodePlugin {
   // Handlers — all route through DkgDaemonClient → daemon HTTP API
   // ---------------------------------------------------------------------------
 
-  /** @internal */ async handleStatus(): Promise<OpenClawToolResult> {
+  private async handleStatus(): Promise<OpenClawToolResult> {
     try {
       const [status, wallets] = await Promise.all([
         this.client.getFullStatus(),
@@ -2564,7 +2613,7 @@ export class DkgNodePlugin {
    * (agent-context WM/SWM/VM + project CG WM/SWM/VM when resolved) via
    * `DkgMemorySearchManager`, returns trust-weighted ranked hits.
    */
-  /** @internal */ async handleMemorySearch(args: Record<string, unknown>): Promise<OpenClawToolResult> {
+  private async handleMemorySearch(args: Record<string, unknown>): Promise<OpenClawToolResult> {
     if (!this.memoryPlugin) {
       return this.error('memory_search unavailable: memory module is disabled in adapter config');
     }
@@ -2639,7 +2688,7 @@ export class DkgNodePlugin {
     }
   }
 
-  /** @internal */ async handleListContextGraphs(args: Record<string, unknown>): Promise<OpenClawToolResult> {
+  private async handleListContextGraphs(args: Record<string, unknown>): Promise<OpenClawToolResult> {
     try {
       const scope = typeof args.scope === 'string' && args.scope.trim() ? args.scope.trim() : 'mine';
       if (scope !== 'mine' && scope !== 'all') {
@@ -2653,7 +2702,7 @@ export class DkgNodePlugin {
     }
   }
 
-  /** @internal */ async handlePublish(args: Record<string, unknown>): Promise<OpenClawToolResult> {
+  private async handlePublish(args: Record<string, unknown>): Promise<OpenClawToolResult> {
     try {
       const contextGraphId = typeof args.context_graph_id === 'string' ? args.context_graph_id.trim() : '';
       if (!contextGraphId) {
@@ -2672,7 +2721,7 @@ export class DkgNodePlugin {
     }
   }
 
-  /** @internal */ async handleQuery(args: Record<string, unknown>): Promise<OpenClawToolResult> {
+  private async handleQuery(args: Record<string, unknown>): Promise<OpenClawToolResult> {
     try {
       const sparql = String(args.sparql);
       // V10 is the first product launch — no v9 back-compat. Reject `contextGraph_id`
@@ -2817,7 +2866,7 @@ export class DkgNodePlugin {
     }
   }
 
-  /** @internal */ async handleQueryCatalogList(args: Record<string, unknown>): Promise<OpenClawToolResult> {
+  private async handleQueryCatalogList(args: Record<string, unknown>): Promise<OpenClawToolResult> {
     try {
       const contextGraphId = normalizeContextGraphId(String(args.context_graph_id ?? ''));
       if (!contextGraphId) return this.error('"context_graph_id" is required.');
@@ -2833,7 +2882,7 @@ export class DkgNodePlugin {
     }
   }
 
-  /** @internal */ async handleQueryCatalogRun(args: Record<string, unknown>): Promise<OpenClawToolResult> {
+  private async handleQueryCatalogRun(args: Record<string, unknown>): Promise<OpenClawToolResult> {
     try {
       const contextGraphId = normalizeContextGraphId(String(args.context_graph_id ?? ''));
       const selector = String(args.query ?? '').trim();
@@ -2877,7 +2926,7 @@ export class DkgNodePlugin {
     }
   }
 
-  /** @internal */ async handleQueryCatalogSave(args: Record<string, unknown>): Promise<OpenClawToolResult> {
+  private async handleQueryCatalogSave(args: Record<string, unknown>): Promise<OpenClawToolResult> {
     try {
       const contextGraphId = normalizeContextGraphId(String(args.context_graph_id ?? ''));
       const name = String(args.name ?? '').trim();
@@ -2926,7 +2975,7 @@ export class DkgNodePlugin {
     }
   }
 
-  /** @internal */ async handleFindAgents(args: Record<string, unknown>): Promise<OpenClawToolResult> {
+  private async handleFindAgents(args: Record<string, unknown>): Promise<OpenClawToolResult> {
     try {
       const filter: { framework?: string; skill_type?: string } = {};
       if (args.framework) filter.framework = String(args.framework);
@@ -2938,7 +2987,7 @@ export class DkgNodePlugin {
     }
   }
 
-  /** @internal */ async handleSendMessage(args: Record<string, unknown>): Promise<OpenClawToolResult> {
+  private async handleSendMessage(args: Record<string, unknown>): Promise<OpenClawToolResult> {
     try {
       const result = await this.client.sendChat(String(args.peer_id), String(args.text));
       return this.json(result);
@@ -2947,7 +2996,7 @@ export class DkgNodePlugin {
     }
   }
 
-  /** @internal */ async handleReadMessages(args: Record<string, unknown>): Promise<OpenClawToolResult> {
+  private async handleReadMessages(args: Record<string, unknown>): Promise<OpenClawToolResult> {
     try {
       const opts: { peer?: string; limit?: number; since?: number } = {};
       if (args.peer) opts.peer = String(args.peer);
@@ -2966,7 +3015,7 @@ export class DkgNodePlugin {
     }
   }
 
-  /** @internal */ async handleInvokeSkill(args: Record<string, unknown>): Promise<OpenClawToolResult> {
+  private async handleInvokeSkill(args: Record<string, unknown>): Promise<OpenClawToolResult> {
     try {
       const result = await this.client.invokeSkill(
         String(args.peer_id),
@@ -2979,7 +3028,7 @@ export class DkgNodePlugin {
     }
   }
 
-  /** @internal */ async handleContextGraphCreate(args: Record<string, unknown>): Promise<OpenClawToolResult> {
+  private async handleContextGraphCreate(args: Record<string, unknown>): Promise<OpenClawToolResult> {
     try {
       const name = String(args.name ?? '').trim();
       if (!name) {
@@ -3070,7 +3119,7 @@ export class DkgNodePlugin {
     }
   }
 
-  /** @internal */ async handleContextGraphInvite(args: Record<string, unknown>): Promise<OpenClawToolResult> {
+  private async handleContextGraphInvite(args: Record<string, unknown>): Promise<OpenClawToolResult> {
     try {
       const contextGraphId = typeof args.context_graph_id === 'string' ? args.context_graph_id.trim() : '';
       const peerId = typeof args.peer_id === 'string' ? args.peer_id.trim() : '';
@@ -3096,7 +3145,7 @@ export class DkgNodePlugin {
     }
   }
 
-  /** @internal */ async handleParticipantAdd(args: Record<string, unknown>): Promise<OpenClawToolResult> {
+  private async handleParticipantAdd(args: Record<string, unknown>): Promise<OpenClawToolResult> {
     try {
       const contextGraphId = typeof args.context_graph_id === 'string' ? args.context_graph_id.trim() : '';
       const agentAddress = typeof args.agent_address === 'string' ? args.agent_address.trim() : '';
@@ -3108,7 +3157,7 @@ export class DkgNodePlugin {
     }
   }
 
-  /** @internal */ async handleParticipantRemove(args: Record<string, unknown>): Promise<OpenClawToolResult> {
+  private async handleParticipantRemove(args: Record<string, unknown>): Promise<OpenClawToolResult> {
     try {
       const contextGraphId = typeof args.context_graph_id === 'string' ? args.context_graph_id.trim() : '';
       const agentAddress = typeof args.agent_address === 'string' ? args.agent_address.trim() : '';
@@ -3120,7 +3169,7 @@ export class DkgNodePlugin {
     }
   }
 
-  /** @internal */ async handleParticipantList(args: Record<string, unknown>): Promise<OpenClawToolResult> {
+  private async handleParticipantList(args: Record<string, unknown>): Promise<OpenClawToolResult> {
     try {
       const contextGraphId = typeof args.context_graph_id === 'string' ? args.context_graph_id.trim() : '';
       if (!contextGraphId) return this.error('"context_graph_id" is required.');
@@ -3130,7 +3179,7 @@ export class DkgNodePlugin {
     }
   }
 
-  /** @internal */ async handleJoinRequestList(args: Record<string, unknown>): Promise<OpenClawToolResult> {
+  private async handleJoinRequestList(args: Record<string, unknown>): Promise<OpenClawToolResult> {
     try {
       const contextGraphId = typeof args.context_graph_id === 'string' ? args.context_graph_id.trim() : '';
       if (!contextGraphId) return this.error('"context_graph_id" is required.');
@@ -3140,7 +3189,7 @@ export class DkgNodePlugin {
     }
   }
 
-  /** @internal */ async handleJoinRequestApprove(args: Record<string, unknown>): Promise<OpenClawToolResult> {
+  private async handleJoinRequestApprove(args: Record<string, unknown>): Promise<OpenClawToolResult> {
     try {
       const contextGraphId = typeof args.context_graph_id === 'string' ? args.context_graph_id.trim() : '';
       const agentAddress = typeof args.agent_address === 'string' ? args.agent_address.trim() : '';
@@ -3152,7 +3201,7 @@ export class DkgNodePlugin {
     }
   }
 
-  /** @internal */ async handleJoinRequestReject(args: Record<string, unknown>): Promise<OpenClawToolResult> {
+  private async handleJoinRequestReject(args: Record<string, unknown>): Promise<OpenClawToolResult> {
     try {
       const contextGraphId = typeof args.context_graph_id === 'string' ? args.context_graph_id.trim() : '';
       const agentAddress = typeof args.agent_address === 'string' ? args.agent_address.trim() : '';
@@ -3164,7 +3213,7 @@ export class DkgNodePlugin {
     }
   }
 
-  /** @internal */ async handleSubscribe(args: Record<string, unknown>): Promise<OpenClawToolResult> {
+  private async handleSubscribe(args: Record<string, unknown>): Promise<OpenClawToolResult> {
     try {
       const contextGraphId = typeof args.context_graph_id === 'string' ? args.context_graph_id.trim() : '';
       if (!contextGraphId) {
@@ -3189,7 +3238,7 @@ export class DkgNodePlugin {
     }
   }
 
-  /** @internal */ async handleWalletBalances(): Promise<OpenClawToolResult> {
+  private async handleWalletBalances(): Promise<OpenClawToolResult> {
     try {
       const result = await this.client.getWalletBalances();
       return this.json(result);
@@ -3339,7 +3388,7 @@ export class DkgNodePlugin {
 
   // ── Assertion lifecycle handlers ────────────────────────────────────────
 
-  /** @internal */ async handleAssertionCreate(args: Record<string, unknown>): Promise<OpenClawToolResult> {
+  private async handleAssertionCreate(args: Record<string, unknown>): Promise<OpenClawToolResult> {
     try {
       const contextGraphId = String(args.context_graph_id ?? '').trim();
       const name = String(args.name ?? '').trim();
@@ -3357,7 +3406,7 @@ export class DkgNodePlugin {
     }
   }
 
-  /** @internal */ async handleAssertionWrite(args: Record<string, unknown>): Promise<OpenClawToolResult> {
+  private async handleAssertionWrite(args: Record<string, unknown>): Promise<OpenClawToolResult> {
     try {
       const contextGraphId = String(args.context_graph_id ?? '').trim();
       const name = String(args.name ?? '').trim();
@@ -3381,7 +3430,7 @@ export class DkgNodePlugin {
     }
   }
 
-  /** @internal */ async handleAssertionPromote(args: Record<string, unknown>): Promise<OpenClawToolResult> {
+  private async handleAssertionPromote(args: Record<string, unknown>): Promise<OpenClawToolResult> {
     try {
       const contextGraphId = String(args.context_graph_id ?? '').trim();
       const name = String(args.name ?? '').trim();
@@ -3413,7 +3462,7 @@ export class DkgNodePlugin {
     }
   }
 
-  /** @internal */ async handleAssertionDiscard(args: Record<string, unknown>): Promise<OpenClawToolResult> {
+  private async handleAssertionDiscard(args: Record<string, unknown>): Promise<OpenClawToolResult> {
     try {
       const contextGraphId = String(args.context_graph_id ?? '').trim();
       const name = String(args.name ?? '').trim();
@@ -3431,7 +3480,7 @@ export class DkgNodePlugin {
     }
   }
 
-  /** @internal */ async handleAssertionImportFile(args: Record<string, unknown>): Promise<OpenClawToolResult> {
+  private async handleAssertionImportFile(args: Record<string, unknown>): Promise<OpenClawToolResult> {
     try {
       const contextGraphId = String(args.context_graph_id ?? '').trim();
       const name = String(args.name ?? '').trim();
@@ -3475,7 +3524,7 @@ export class DkgNodePlugin {
     }
   }
 
-  /** @internal */ async handleAssertionQuery(args: Record<string, unknown>): Promise<OpenClawToolResult> {
+  private async handleAssertionQuery(args: Record<string, unknown>): Promise<OpenClawToolResult> {
     try {
       const contextGraphId = String(args.context_graph_id ?? '').trim();
       const name = String(args.name ?? '').trim();
@@ -3489,7 +3538,7 @@ export class DkgNodePlugin {
     }
   }
 
-  /** @internal */ async handleImportArtifactResolve(args: Record<string, unknown>): Promise<OpenClawToolResult> {
+  private async handleImportArtifactResolve(args: Record<string, unknown>): Promise<OpenClawToolResult> {
     try {
       const contextGraphId = String(args.context_graph_id ?? '').trim();
       if (!contextGraphId) return this.error('"context_graph_id" is required.');
@@ -3509,7 +3558,7 @@ export class DkgNodePlugin {
     }
   }
 
-  /** @internal */ async handleImportArtifactReadMarkdown(args: Record<string, unknown>): Promise<OpenClawToolResult> {
+  private async handleImportArtifactReadMarkdown(args: Record<string, unknown>): Promise<OpenClawToolResult> {
     try {
       const contextGraphId = String(args.context_graph_id ?? '').trim();
       if (!contextGraphId) return this.error('"context_graph_id" is required.');
@@ -3540,7 +3589,7 @@ export class DkgNodePlugin {
     }
   }
 
-  /** @internal */ async handleSemanticEnrichmentWrite(args: Record<string, unknown>): Promise<OpenClawToolResult> {
+  private async handleSemanticEnrichmentWrite(args: Record<string, unknown>): Promise<OpenClawToolResult> {
     try {
       const contextGraphId = String(args.context_graph_id ?? '').trim();
       if (!contextGraphId) return this.error('"context_graph_id" is required.');
@@ -3573,7 +3622,7 @@ export class DkgNodePlugin {
     }
   }
 
-  /** @internal */ async handleAssertionHistory(args: Record<string, unknown>): Promise<OpenClawToolResult> {
+  private async handleAssertionHistory(args: Record<string, unknown>): Promise<OpenClawToolResult> {
     try {
       const contextGraphId = String(args.context_graph_id ?? '').trim();
       const name = String(args.name ?? '').trim();
@@ -3588,7 +3637,7 @@ export class DkgNodePlugin {
     }
   }
 
-  /** @internal */ async handleSubGraphCreate(args: Record<string, unknown>): Promise<OpenClawToolResult> {
+  private async handleSubGraphCreate(args: Record<string, unknown>): Promise<OpenClawToolResult> {
     try {
       const contextGraphId = String(args.context_graph_id ?? '').trim();
       const subGraphName = String(args.sub_graph_name ?? '').trim();
@@ -3601,7 +3650,7 @@ export class DkgNodePlugin {
     }
   }
 
-  /** @internal */ async handleSubGraphList(args: Record<string, unknown>): Promise<OpenClawToolResult> {
+  private async handleSubGraphList(args: Record<string, unknown>): Promise<OpenClawToolResult> {
     try {
       const contextGraphId = String(args.context_graph_id ?? '').trim();
       if (!contextGraphId) return this.error('"context_graph_id" is required.');
@@ -3612,7 +3661,7 @@ export class DkgNodePlugin {
     }
   }
 
-  /** @internal */ async handleSharedMemoryPublish(args: Record<string, unknown>): Promise<OpenClawToolResult> {
+  private async handleSharedMemoryPublish(args: Record<string, unknown>): Promise<OpenClawToolResult> {
     try {
       const contextGraphId = String(args.context_graph_id ?? '').trim();
       if (!contextGraphId) return this.error('"context_graph_id" is required.');
@@ -3659,7 +3708,7 @@ export class DkgNodePlugin {
     }
   }
 
-  /** @internal */ async handleShare(args: Record<string, unknown>): Promise<OpenClawToolResult> {
+  private async handleShare(args: Record<string, unknown>): Promise<OpenClawToolResult> {
     try {
       // Type-validate at the runtime boundary. Without this, a malformed MCP
       // call passing `content: {}` or `false` would coerce via String(...) to

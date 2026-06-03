@@ -24,10 +24,13 @@ export function channelConfigFingerprint(config: DkgOpenClawConfig['channel']): 
 
 /** Convert a human-readable name into a URL-safe slug (e.g. "My Research Context Graph" → "my-research-context-graph"). */
 export function slugify(name: string): string {
-  return name
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')  // replace non-alphanumeric runs with a single hyphen
-    .replace(/^-+|-+$/g, '');      // strip leading/trailing hyphens
+  const collapsed = name.toLowerCase().replace(/[^a-z0-9]+/g, '-'); // non-alphanumeric runs → single hyphen
+  // Trim leading/trailing hyphens with a linear scan (avoids backtracking-prone `^-+|-+$`).
+  let start = 0;
+  let end = collapsed.length;
+  while (start < end && collapsed[start] === '-') start += 1;
+  while (end > start && collapsed[end - 1] === '-') end -= 1;
+  return collapsed.slice(start, end);
 }
 
 export function pickShareableMultiaddr(addrs: string[]): string | null {

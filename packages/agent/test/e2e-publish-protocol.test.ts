@@ -292,10 +292,10 @@ describe('E2E: Design B — multi-entity file publishes as one KA, ACKed cross-n
     expect(result.onChainResult!.batchId).toBeGreaterThan(0n);
 
     // One UAL + one batchId for the whole 3-entity file = ONE Knowledge Asset
-    // (Design B: 1 KA, N entities — not 3 KAs). The "one KA node with N
-    // dkg:rootEntity members" metadata shape is asserted directly in the
-    // publisher unit test (metadata.test.ts). Here we assert the end-to-end
-    // result is a single KA carrying all three entities.
+    // (Design B: 1 KA, N entities — not 3 KAs). The compatibility label
+    // metadata shape is asserted directly in the publisher unit test
+    // (metadata.test.ts). Here we assert the end-to-end result is a single KA
+    // carrying all three entities.
     expect(typeof result.ual).toBe('string');
     const aData = await nodeA.query(
       `SELECT ?e WHERE { ?e <http://schema.org/name> ?name FILTER(?e IN (<${ENTITY_1}>,<${ENTITY_2}>,<${ENTITY_3}>)) }`,

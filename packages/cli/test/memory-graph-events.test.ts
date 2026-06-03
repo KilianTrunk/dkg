@@ -549,12 +549,12 @@ describe('daemon memory_graph_changed route emissions', () => {
 
     await handleMemoryRoutes(ctx);
 
-    // OT-RFC-44 / Design B: a multi-root SWM selection publishes as ONE KA. The
-    // route no longer returns 409 MULTI_ROOT_PUBLISH_NOT_ATOMIC; it proceeds to
-    // publish both roots in a single atomic call.
-    expect((ctx.res as unknown as { statusCode: number }).statusCode).not.toBe(409);
-    expect(responseBody(ctx)).not.toMatchObject({ code: 'MULTI_ROOT_PUBLISH_NOT_ATOMIC' });
-    expect(publishFromSharedMemory).toHaveBeenCalledTimes(1);
+    expect((ctx.res as unknown as { statusCode: number }).statusCode).toBe(409);
+    expect(responseBody(ctx)).toMatchObject({
+      code: 'MULTI_ROOT_PUBLISH_NOT_ATOMIC',
+      rootEntities: ['urn:root:a', 'urn:root:b'],
+    });
+    expect(publishFromSharedMemory).not.toHaveBeenCalled();
   });
 
   it('keeps implicit same-graph publishes out of the remap path', async () => {

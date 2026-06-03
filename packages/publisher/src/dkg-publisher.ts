@@ -1732,14 +1732,12 @@ export class DKGPublisher implements Publisher {
 
     onPhase?.('prepare:manifest', 'start');
     // OT-RFC-44 / Design B: one file/lifecycle = ONE Knowledge Asset, however
-    // many entities it contains. Every entity is a *member* of the single KA,
-    // so they all share the one KA's tokenId (1) — we do NOT mint one KA per
-    // entity. `manifestEntries`/`kaMetadata` still enumerate every entity (the
-    // entity list drives validation, the seal, the SWM gather and the RS
-    // prover); `generateKCMetadata` groups them into a single KA node with N
-    // `dkg:rootEntity` members. See docs/rfcs/OT-RFC-44-file-equals-ka.md §2-3
-    // and OT-RFC-43 §7 ("what lands in the triple store at each step").
+    // many entities it contains. The consensus manifest keeps every member on
+    // tokenId 1, so the chain and ACK digest see one KA. Label metadata keeps
+    // stable per-root rows for the current update/private-access paths, which
+    // still resolve <ual>/1, <ual>/2, ... by root.
     const KA_TOKEN_ID = 1n;
+    let metadataTokenId = 1n;
     for (const entry of canonical.manifestEntries) {
       manifestEntries.push({
         tokenId: KA_TOKEN_ID,
@@ -1751,7 +1749,7 @@ export class DKGPublisher implements Publisher {
       kaMetadata.push({
         rootEntity: entry.rootEntity,
         kcUal: '',
-        tokenId: KA_TOKEN_ID,
+        tokenId: metadataTokenId++,
         publicTripleCount: entry.publicTripleCount,
         privateTripleCount: entry.privateTripleCount,
         privateMerkleRoot: entry.privateMerkleRoot,
@@ -2597,7 +2595,6 @@ export class DKGPublisher implements Publisher {
 
         for (const km of kaMetadata) {
           km.kcUal = ual;
-          km.tokenId = kaId;
         }
         let confirmedQuads = generateConfirmedFullMetadata(
           {

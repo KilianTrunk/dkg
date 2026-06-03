@@ -1835,10 +1835,15 @@ WHERE {
           error: `No quads in shared memory for context graph ${resolvedContextGraphId} matching selection`,
         });
       }
-      // OT-RFC-44 / Design B: N selected root entities publish as ONE Knowledge
-      // Asset in a single transaction (atomic by construction). The old
-      // single-root 409 ("MULTI_ROOT_PUBLISH_NOT_ATOMIC") conflated entity count
-      // with KA count and blocked multi-entity files; it is removed.
+      if (publishRootEntities.length > 1) {
+        return jsonResponse(res, 409, {
+          code: "MULTI_ROOT_PUBLISH_NOT_ATOMIC",
+          error:
+            `V10 shared-memory publish is single-root only for this synchronous endpoint. ` +
+            `Resolved ${publishRootEntities.length} root entities; select exactly one root or use a durable multi-publish flow.`,
+          rootEntities: publishRootEntities,
+        });
+      }
 
       // OT-RFC-38 LU-6 — transparent register-then-publish.
       //

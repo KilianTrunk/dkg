@@ -286,7 +286,7 @@ export class PublishHandler {
       const kaMetadata: KAMetadata[] = manifest.map((m, i) => ({
         rootEntity: m.rootEntity,
         kcUal: request.ual,
-        tokenId: m.tokenId,
+        tokenId: BigInt(i + 1),
         publicTripleCount: (partitioned.get(m.rootEntity) ?? []).length,
         privateTripleCount: m.privateTripleCount ?? 0,
         privateMerkleRoot: request.kas[i].privateMerkleRoot?.length
@@ -299,7 +299,7 @@ export class PublishHandler {
           ual: request.ual,
           contextGraphId,
           merkleRoot: computedMerkleRoot,
-          kaCount: manifest.length,
+          kaCount: kaMetadata.length > 0 ? 1 : 0,
           publisherPeerId: fromPeerId,
           timestamp: new Date(),
         },

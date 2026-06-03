@@ -1023,7 +1023,7 @@ export class FinalizationHandler {
       kaMetadata.push({
         rootEntity,
         kcUal: ual,
-        tokenId: startKAId + BigInt(tokenIdx),
+        tokenId: BigInt(tokenIdx + 1),
         publicTripleCount: entityQuads.length,
         privateTripleCount: 0,
         privateMerkleRoot: undefined,
@@ -1055,7 +1055,7 @@ export class FinalizationHandler {
       ual,
       contextGraphId,
       merkleRoot,
-      kaCount: kaMetadata.length,
+      kaCount: kaMetadata.length > 0 ? 1 : 0,
       publisherPeerId: wsPeerId || publisherAddress,
       timestamp: new Date(),
       subGraphName,

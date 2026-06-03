@@ -309,13 +309,18 @@ export class GossipPublishHandler {
         const partitioned = autoPartition(normalized);
         const kaMetadata: KAMetadata[] = [];
 
-        for (const [rootEntity, entityQuads] of partitioned) {
+        let metadataTokenId = 1n;
+        const metadataRootOrder = request.kas?.length
+          ? request.kas.map((ka) => ka.rootEntity)
+          : [...partitioned.keys()];
+        for (const rootEntity of metadataRootOrder) {
+          const entityQuads = partitioned.get(rootEntity);
+          if (!entityQuads) continue;
           const kaEntry = request.kas?.find((ka) => ka.rootEntity === rootEntity);
-          const tokenId = kaEntry ? protoToNumber(kaEntry.tokenId) : 0;
           kaMetadata.push({
             rootEntity,
             kcUal: request.ual,
-            tokenId: BigInt(tokenId),
+            tokenId: metadataTokenId++,
             publicTripleCount: entityQuads.length,
             privateTripleCount: kaEntry?.privateTripleCount ?? 0,
             privateMerkleRoot: kaEntry?.privateMerkleRoot?.length
@@ -327,7 +332,7 @@ export class GossipPublishHandler {
           ual: request.ual,
           contextGraphId: request.contextGraphId,
           merkleRoot,
-          kaCount: kaMetadata.length,
+          kaCount: kaMetadata.length > 0 ? 1 : 0,
           publisherPeerId: request.publisherAddress || 'unknown',
           timestamp: new Date(),
           subGraphName,

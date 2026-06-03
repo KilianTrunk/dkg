@@ -95,10 +95,11 @@ export type ExternalStoreBlock =
     }
   // Daemon-managed local Oxigraph server (Release 2 opt-in). No URL: the
   // daemon fetches the binary, spawns a loopback server, and derives the
-  // endpoints at boot. Carries no options the operator needs to fill in.
+  // endpoints at boot. Operator-set overrides (`port`/`location`/`cacheDir`)
+  // that planManagedOxigraph reads at boot are carried through unchanged.
   | {
       backend: 'oxigraph-server';
-      options: Record<string, never>;
+      options: Record<string, unknown>;
     };
 
 function externalStoreBlock(
@@ -184,7 +185,15 @@ export async function promptStoreBackend(
   // probe: the endpoint doesn't exist until the daemon spawns it at boot.
   if (backendAnswer === 'oxigraph-server') {
     log('  Using a daemon-managed local Oxigraph server (started on first daemon boot).');
-    return { storeBlock: { backend: 'oxigraph-server', options: {} } };
+    // Preserve existing managed-server overrides (port/location/cacheDir) on an
+    // Enter-through: `dkg init` persists this block, so returning empty options
+    // would silently reset a custom port/RocksDB path on the next boot — the
+    // same hazard applyStoreFlagsToConfig guards against on the `--store` path.
+    const prevOptions =
+      existingBackend === 'oxigraph-server' && opts.existingStore?.options
+        ? opts.existingStore.options
+        : {};
+    return { storeBlock: { backend: 'oxigraph-server', options: prevOptions } };
   }
 
   if (backendAnswer !== 'blazegraph' && backendAnswer !== 'sparql-http') {

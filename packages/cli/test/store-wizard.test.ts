@@ -304,6 +304,23 @@ describe('promptStoreBackend', () => {
     expect(result.storeBlock).toEqual({ backend: 'oxigraph-server', options: {} });
   });
 
+  it('preserves existing oxigraph-server overrides on an interactive Enter-through', async () => {
+    const result = await promptStoreBackend({
+      ask: mockAsk(['']), // Enter keeps the managed backend
+      existingStore: {
+        backend: 'oxigraph-server',
+        options: { port: 9999, location: '/data/oxi' },
+      },
+      log: () => {},
+    });
+    // port/location overrides (read by planManagedOxigraph at boot) survive —
+    // dkg init persisting an empty block would silently reset them.
+    expect(result.storeBlock).toEqual({
+      backend: 'oxigraph-server',
+      options: { port: 9999, location: '/data/oxi' },
+    });
+  });
+
   it('does not offer Docker for sparql-http backend', async () => {
     let provisionCalled = false;
     const result = await promptStoreBackend({

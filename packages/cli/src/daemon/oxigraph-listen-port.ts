@@ -40,9 +40,12 @@ async function lsofShowsPidListening(pid: number, port: number): Promise<boolean
 
 async function ssShowsPidListening(pid: number, port: number): Promise<boolean> {
   try {
+    // `-p` is required for the `users:(("proc",pid=N,fd=M))` process column;
+    // without it `ss` never emits `pid=` and this probe is dead code. Our own
+    // child runs as the same user, so no elevation is needed to see its pid.
     const { stdout } = await execFileAsync(
       'ss',
-      ['-ltnH', `sport = :${port}`],
+      ['-ltnpH', `sport = :${port}`],
       { timeout: 2_000 },
     );
     for (const line of stdout.split('\n')) {

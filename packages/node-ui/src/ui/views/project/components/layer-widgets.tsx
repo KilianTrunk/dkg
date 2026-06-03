@@ -99,17 +99,20 @@ export function LayerStatsWidget({ entities, entityCount, triples, layer }: {
   );
 }
 
-function requireSinglePublishRoot(roots: string[]): string[] {
+// OT-RFC-44 / Design B: a publish may include any number of root entities;
+// they become the member entities of ONE Knowledge Asset. (Previously this
+// forced exactly one root — the entity-count == KA-count conflation.)
+function collectPublishRoots(roots: string[]): string[] {
   const uniqueRoots = [...new Set(roots.filter(Boolean))];
-  if (uniqueRoots.length !== 1) {
-    throw new Error('V10 publish requires exactly one root entity per request. Select one root and publish again.');
+  if (uniqueRoots.length < 1) {
+    throw new Error('Publish requires at least one root entity. Select one or more roots and publish again.');
   }
   return uniqueRoots;
 }
 
-async function fetchSingleSwmRoot(contextGraphId: string): Promise<string[]> {
+async function fetchSwmPublishRoots(contextGraphId: string): Promise<string[]> {
   const roots = (await listSwmEntities(contextGraphId)).map((entity) => entity.uri);
-  return requireSinglePublishRoot(roots);
+  return collectPublishRoots(roots);
 }
 
 export function LayerActionsWidget({ layer, count, contextGraphId, entities, onComplete }: {
@@ -155,7 +158,7 @@ export function LayerActionsWidget({ layer, count, contextGraphId, entities, onC
           setResult('No triples were promoted — every assertion was already in Shared Memory or its content is still being committed.');
         }
       } else {
-        const roots = requireSinglePublishRoot(entities.map((entity) => entity.uri));
+        const roots = collectPublishRoots(entities.map((entity) => entity.uri));
         await publishSharedMemory(contextGraphId, roots);
         setResult('Published to Verifiable Memory');
       }

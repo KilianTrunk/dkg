@@ -794,17 +794,31 @@ export class StorageACKHandler {
         throw new Error('stagingQuads present but contained no parseable N-Quads');
       }
 
-      // Validate kaCount matches the number of declared root entities.
-      // Exclude skolemized blank node children (/.well-known/genid/) from the count
-      // since those are internal sub-nodes of a single KA, not separate entities.
+      // OT-RFC-44 / Design B: a publish is exactly ONE Knowledge Asset whose
+      // member entities are all the root subjects (any count). `kaCount` is the
+      // KA count (must be 1) — NOT the entity count. The pre-Design-B check
+      // `rootSubjects.size === intent.kaCount` conflated the two and made a
+      // receiving node REFUSE to ACK any multi-entity KA (the silent cross-node
+      // failure in OT-RFC-43 §2.7 / the §11.2 canary). We instead assert the KA
+      // count is 1 and that the declared entity list is a bijection with the
+      // actual root subjects (the per-entity presence check at lines below
+      // covers declared ⊆ actual; this size equality closes actual ⊆ declared).
+      // Exclude skolemized blank-node children (/.well-known/genid/) — those are
+      // internal sub-nodes of a single entity, not separate entities.
       const uniqueSubjects = new Set(parsed.map(q => q.subject));
       const rootSubjects = new Set(
         [...uniqueSubjects].filter(s => !s.includes('/.well-known/genid/')),
       );
-      if (intent.kaCount > 0 && rootSubjects.size !== intent.kaCount) {
+      if (intent.kaCount !== 1) {
         throw new Error(
-          `kaCount mismatch: intent claims ${intent.kaCount} KAs but staging quads have ` +
-          `${rootSubjects.size} root entities (${uniqueSubjects.size} total subjects)`,
+          `Design B: a publish must declare exactly one Knowledge Asset (kaCount=1); got ${intent.kaCount}`,
+        );
+      }
+      const declaredEntityCount = intent.rootEntities?.length ?? rootSubjects.size;
+      if (rootSubjects.size !== declaredEntityCount) {
+        throw new Error(
+          `entity-count mismatch: intent declares ${declaredEntityCount} member entit${declaredEntityCount === 1 ? 'y' : 'ies'} but staging quads have ` +
+          `${rootSubjects.size} root subjects (${uniqueSubjects.size} total subjects)`,
         );
       }
 

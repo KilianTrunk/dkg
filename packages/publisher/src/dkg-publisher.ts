@@ -1728,10 +1728,18 @@ export class DKGPublisher implements Publisher {
     const kaMetadata: KAMetadata[] = [];
 
     onPhase?.('prepare:manifest', 'start');
-    let tokenCounter = 1n;
+    // OT-RFC-44 / Design B: one file/lifecycle = ONE Knowledge Asset, however
+    // many entities it contains. Every entity is a *member* of the single KA,
+    // so they all share the one KA's tokenId (1) — we do NOT mint one KA per
+    // entity. `manifestEntries`/`kaMetadata` still enumerate every entity (the
+    // entity list drives validation, the seal, the SWM gather and the RS
+    // prover); `generateKCMetadata` groups them into a single KA node with N
+    // `dkg:rootEntity` members. See docs/rfcs/OT-RFC-44-file-equals-ka.md §2-3
+    // and OT-RFC-43 §7 ("what lands in the triple store at each step").
+    const KA_TOKEN_ID = 1n;
     for (const entry of canonical.manifestEntries) {
       manifestEntries.push({
-        tokenId: tokenCounter,
+        tokenId: KA_TOKEN_ID,
         rootEntity: entry.rootEntity,
         privateMerkleRoot: entry.privateMerkleRoot,
         privateTripleCount: entry.privateTripleCount,
@@ -1740,13 +1748,11 @@ export class DKGPublisher implements Publisher {
       kaMetadata.push({
         rootEntity: entry.rootEntity,
         kcUal: '',
-        tokenId: tokenCounter,
+        tokenId: KA_TOKEN_ID,
         publicTripleCount: entry.publicTripleCount,
         privateTripleCount: entry.privateTripleCount,
         privateMerkleRoot: entry.privateMerkleRoot,
       });
-
-      tokenCounter++;
     }
 
     const allSkolemizedQuads = canonical.skolemizedPublicQuads;
@@ -1769,12 +1775,18 @@ export class DKGPublisher implements Publisher {
       throw new Error(`V10 merkleLeafCount exceeds uint32: ${kcMerkleLeafCount}`);
     }
     this.log.info(ctx, `Computed kcMerkleRoot (flat) over ${allSkolemizedQuads.length} triple hashes + ${privateRoots.length} private root(s), leafCount=${kcMerkleLeafCount}`);
-    const kaCount = manifestEntries.length;
-    if (chainV10Ready && kaCount !== 1) {
-      throw new Error(
-        `V10 greenfield publish requires exactly one Knowledge Asset per transaction (got ${kaCount})`,
-      );
+    // Design B: a publish mints exactly ONE KA regardless of entity count.
+    // `entityCount` is informational; `kaCount` is what goes on chain as
+    // `knowledgeAssetsAmount` (the contract requires == 1) and into the ACK
+    // digest. The old `kaCount = manifestEntries.length` + `kaCount !== 1`
+    // guard conflated entity count with KA count and blocked multi-entity
+    // files; that conflation is the bug OT-RFC-44 removes.
+    const entityCount = manifestEntries.length;
+    const kaCount = 1;
+    if (entityCount < 1) {
+      throw new Error('V10 publish requires at least one entity');
     }
+    this.log.info(ctx, `Design B: publishing 1 KA with ${entityCount} member entit${entityCount === 1 ? 'y' : 'ies'}`);
     onPhase?.('prepare:merkle', 'end');
 
     onPhase?.('prepare', 'end');

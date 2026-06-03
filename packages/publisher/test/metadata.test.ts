@@ -122,6 +122,40 @@ describe('generateKCMetadata', () => {
     expect(kaSubjects.size).toBe(2);
   });
 
+  it('Design B: N entities sharing one tokenId form ONE KA node with N member entities (OT-RFC-44)', () => {
+    // One file = one KA, however many entities. All entities share the single
+    // KA's tokenId; generateKCMetadata must emit ONE KnowledgeAsset node with N
+    // dkg:rootEntity members and a summed publicTripleCount — not one node per
+    // entity. See docs/rfcs/OT-RFC-44 §2-3 and OT-RFC-43 §7.
+    const kas = [
+      makeKA({ tokenId: 1n, rootEntity: 'did:dkg:entity:alice', publicTripleCount: 5 }),
+      makeKA({ tokenId: 1n, rootEntity: 'did:dkg:entity:bob', publicTripleCount: 3 }),
+      makeKA({ tokenId: 1n, rootEntity: 'did:dkg:entity:carol', publicTripleCount: 2 }),
+    ];
+    const quads = generateKCMetadata(makeMeta({ kaCount: 1 }), kas);
+    const kaUri = `${UAL}/1`;
+
+    // Exactly ONE KA node, addressed as <UAL>/1.
+    const kaSubjects = new Set(
+      quads.filter(q => q.predicate === RDF_TYPE && q.object === `${DKG}KnowledgeAsset`).map(q => q.subject),
+    );
+    expect(kaSubjects.size).toBe(1);
+    expect(kaSubjects.has(kaUri)).toBe(true);
+
+    // All three entities are members of that one node.
+    const members = quads
+      .filter(q => q.subject === kaUri && q.predicate === `${DKG}rootEntity`)
+      .map(q => q.object);
+    expect(new Set(members)).toEqual(
+      new Set(['did:dkg:entity:alice', 'did:dkg:entity:bob', 'did:dkg:entity:carol']),
+    );
+
+    // Exactly one tokenId triple; publicTripleCount is summed (5+3+2 = 10).
+    expect(quads.filter(q => q.subject === kaUri && q.predicate === `${DKG}tokenId`)).toHaveLength(1);
+    const publicCount = quads.find(q => q.subject === kaUri && q.predicate === `${DKG}publicTripleCount`);
+    expect(publicCount?.object).toContain('10');
+  });
+
   it('GH #748 fallback: attribution is the peer-ID literal when neither agentAddress nor authorAddress is supplied', () => {
     const quads = generateKCMetadata(makeMeta(), [makeKA()]);
     const attribution = quads.find(q => q.subject === UAL && q.predicate === `${PROV}wasAttributedTo`);

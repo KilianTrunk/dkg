@@ -149,40 +149,46 @@ export function generateKCMetadata(
     }
   }
 
-  // KA metadata
+  // KA metadata — OT-RFC-44 / Design B: one file = ONE Knowledge Asset whose
+  // member entities are all the entities in the assertion. `kaEntries` carries
+  // one record per entity (each enumerating its own `rootEntity`), but they all
+  // share the one KA's `tokenId`, so we GROUP by KA URI and emit a single KA
+  // node with N `dkg:rootEntity` members + summed triple counts — not one KA
+  // node per entity. (Pre-Design-B single-entity publishes group to exactly one
+  // member, so behavior is unchanged for them.) See OT-RFC-43 §7.
+  const kaUriFor = (ka: KAMetadata): string =>
+    ka.kcUal.includes(`/${ka.tokenId}`) ? ka.kcUal : `${ka.kcUal}/${ka.tokenId}`;
+  const kaGroups = new Map<string, { kcUal: string; tokenId: bigint; members: KAMetadata[] }>();
   for (const ka of kaEntries) {
-    const kaUri = ka.kcUal.includes(`/${ka.tokenId}`) ? ka.kcUal : `${ka.kcUal}/${ka.tokenId}`;
+    const kaUri = kaUriFor(ka);
+    const g = kaGroups.get(kaUri) ?? { kcUal: ka.kcUal, tokenId: ka.tokenId, members: [] };
+    g.members.push(ka);
+    kaGroups.set(kaUri, g);
+  }
+
+  for (const [kaUri, group] of kaGroups) {
+    const publicTripleCount = group.members.reduce((s, m) => s + m.publicTripleCount, 0);
+    const privateTripleCount = group.members.reduce((s, m) => s + m.privateTripleCount, 0);
     quads.push(
       mq(kaUri, `${RDF}type`, `${DKG}KnowledgeAsset`, metaGraph),
-      mq(kaUri, `${DKG}rootEntity`, ka.rootEntity, metaGraph),
-      mq(kaUri, `${DKG}partOf`, ka.kcUal, metaGraph),
-      mq(kaUri, `${DKG}tokenId`, intLit(ka.tokenId), metaGraph),
-      mq(
-        kaUri,
-        `${DKG}publicTripleCount`,
-        intLit(ka.publicTripleCount),
-        metaGraph,
-      ),
+      mq(kaUri, `${DKG}partOf`, group.kcUal, metaGraph),
+      mq(kaUri, `${DKG}tokenId`, intLit(group.tokenId), metaGraph),
+      mq(kaUri, `${DKG}publicTripleCount`, intLit(publicTripleCount), metaGraph),
     );
-
-    if (ka.privateTripleCount > 0) {
-      quads.push(
-        mq(
-          kaUri,
-          `${DKG}privateTripleCount`,
-          intLit(ka.privateTripleCount),
-          metaGraph,
-        ),
-      );
-      if (ka.privateMerkleRoot) {
-        quads.push(
-          mq(
-            kaUri,
-            `${DKG}privateMerkleRoot`,
-            lit(toHex(ka.privateMerkleRoot)),
-            metaGraph,
-          ),
-        );
+    // One member-entity triple per entity in the KA (the scoping key for the
+    // KA's triples; renamed to dkg:entity in OT-RFC-43 §10.1 / Plan A3).
+    for (const m of group.members) {
+      quads.push(mq(kaUri, `${DKG}rootEntity`, m.rootEntity, metaGraph));
+    }
+    if (privateTripleCount > 0) {
+      quads.push(mq(kaUri, `${DKG}privateTripleCount`, intLit(privateTripleCount), metaGraph));
+      // Per-entity private roots attach to the single KA node (one
+      // dkg:privateMerkleRoot per entity that has private data). Consensus is
+      // unaffected — the flat KC merkle already covers every private root.
+      for (const m of group.members) {
+        if (m.privateMerkleRoot) {
+          quads.push(mq(kaUri, `${DKG}privateMerkleRoot`, lit(toHex(m.privateMerkleRoot)), metaGraph));
+        }
       }
     }
   }
@@ -200,8 +206,7 @@ export function generateKCMetadata(
       mq(publicationUri, `${DKG}merkleRoot`, hexLit(toHex(meta.merkleRoot)), metaGraph),
       mq(publicationUri, `${DKG}authoredBy`, lit(meta.authorAddress), metaGraph),
     );
-    for (const ka of kaEntries) {
-      const kaUri = ka.kcUal.includes(`/${ka.tokenId}`) ? ka.kcUal : `${ka.kcUal}/${ka.tokenId}`;
+    for (const kaUri of kaGroups.keys()) {
       quads.push(mq(kaUri, `${DKG}publication`, publicationUri, metaGraph));
     }
   }

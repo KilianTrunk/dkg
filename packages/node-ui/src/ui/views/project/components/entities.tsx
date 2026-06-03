@@ -430,7 +430,7 @@ export function AssertionsList({ contextGraphId, layer, onComplete, scrollKey }:
         const outcome = describePromoteResult(assertion.name, res);
         setResult(outcome.message);
       } else {
-        const roots = await fetchSingleSwmRoot(contextGraphId);
+        const roots = await fetchSwmPublishRoots(contextGraphId);
         await publishSharedMemory(contextGraphId, roots);
         setResult('Published to Verifiable Memory');
       }
@@ -473,7 +473,7 @@ export function AssertionsList({ contextGraphId, layer, onComplete, scrollKey }:
           setResult('No triples were promoted — every assertion was already in Shared Memory or its content is still being committed.');
         }
       } else {
-        const roots = await fetchSingleSwmRoot(contextGraphId);
+        const roots = await fetchSwmPublishRoots(contextGraphId);
         await publishSharedMemory(contextGraphId, roots);
         setResult('Published all to Verifiable Memory');
       }

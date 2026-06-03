@@ -3,18 +3,23 @@
 export const PROTOCOL_PUBLISH = '/dkg/10.0.0/publish';
 export const PROTOCOL_QUERY = '/dkg/10.0.0/query';
 export const PROTOCOL_DISCOVER = '/dkg/10.0.0/discover';
-// rc.9 PR-E (SWM reliable fan-out plan, Step 2): bumped from
-// /dkg/10.0.0/sync to /dkg/10.0.1/sync. The sync RPC is the eventual-
-// consistency safety net for SWM share delivery (runSyncOnConnect →
-// syncSharedMemoryFromPeer when peers reconnect). Pre-rc.9 the
-// safety net itself ran over an un-migrated transport: no envelope
-// versioning, no idempotency, no durable outbox — a stream reset
-// mid-sync was unrecoverable except by the next reconnect. Bumping
-// onto the /dkg/10.0.1/ prefix gives the safety net the same
-// reliability primitives as chat / access / query-remote / etc.
-// Hard cutover, consistent with the rc.9 protocol migration model:
-// rc.8 nodes cannot sync from rc.9 nodes and vice versa.
-export const PROTOCOL_SYNC = '/dkg/10.0.1/sync';
+// Bumped /dkg/10.0.1/sync -> /dkg/10.0.2/sync: sync is taken BACK OFF
+// the Universal Messenger substrate (raw ProtocolRouter register/send,
+// no ReliableEnvelope, no idempotency, no outbox). rc.9 PR-E had routed
+// sync through the substrate "for receiver-side dedup", but the sync
+// requester mints a fresh messageId per attempt, so the dedup key never
+// repeats — the cache hit rate is structurally zero while every large,
+// never-reused page response was cached on both sides of
+// message_idempotency (the ~2.9 GB node-ui.db bloat). Sync already has
+// its own retry (withRetry), 90s auth-freshness TTL, and per-requestId
+// replay protection, so it needs none of the substrate's machinery.
+// Going raw changes the wire bytes (bare auth-envelope vs
+// ReliableEnvelope), so the protocol ID MUST bump or mixed-version peers
+// mis-decode. Hard cutover, consistent with the rc.9 migration model:
+// mixed-version peers cleanly skip each other via waitForSyncProtocol
+// (sync is a self-healing catch-up net, so the brief mixed-version
+// window during auto-update is no-data-loss).
+export const PROTOCOL_SYNC = '/dkg/10.0.2/sync';
 // Universal Messenger pilot protocol (rc.9 PR-3). Bumped from
 // /dkg/10.0.0/message to /dkg/10.0.1/message to opt into the
 // reliability substrate (ReliableEnvelope wrapper, sender +

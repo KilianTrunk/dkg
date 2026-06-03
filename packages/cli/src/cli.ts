@@ -1291,6 +1291,26 @@ program
       console.log(`Connected:     ${info.connected ? 'yes' : 'no'}`);
       console.log(`Connections:   ${info.connectionCount}`);
       console.log(`Sync Capable:  ${info.syncCapable ? 'yes' : 'no'}`);
+      const syncStatus = info.syncStatus ?? {
+        capable: info.syncCapable,
+        capability: info.syncCapable ? 'supported' as const : 'unknown' as const,
+        lastSuccessfulSyncAt: null,
+        stale: false,
+        backoff: null,
+      };
+      const syncLastOk = syncStatus.lastSuccessfulSyncAt
+        ? new Date(syncStatus.lastSuccessfulSyncAt).toISOString()
+        : 'never';
+      const syncBackoff = syncStatus.backoff
+        ? `, backoff failures=${syncStatus.backoff.failures}, retry in ${Math.round(syncStatus.backoff.retryInMs / 1000)}s`
+        : '';
+      const syncCapability = syncStatus.capability ?? (syncStatus.capable ? 'supported' : 'unsupported');
+      const syncState = syncCapability === 'supported'
+        ? (syncStatus.stale ? 'stale' : 'fresh')
+        : syncCapability === 'unknown'
+          ? (syncStatus.stale ? 'unknown/stale' : 'unknown')
+        : 'unsupported';
+      console.log(`Sync Status:   ${syncState} (last success: ${syncLastOk}${syncBackoff})`);
       if (info.transports.length > 0) console.log(`Transports:    ${info.transports.join(', ')}`);
       if (info.directions.length > 0) console.log(`Directions:    ${info.directions.join(', ')}`);
       if (info.remoteAddrs.length > 0) console.log(`Remote Addrs:  ${info.remoteAddrs.filter(Boolean).join(', ')}`);

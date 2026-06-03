@@ -4,9 +4,23 @@ All notable changes to the DKG V9 node are documented here. The format is based 
 
 ## [Unreleased]
 
-### Fixed — Chain RPC read path
+## [10.0.0-rc.14] - 2026-06-02
 
-- **Disable ethers JSON-RPC request batching on the chain provider** (`packages/chain/src/evm-adapter.ts`): under RPC rate limiting a *batched* `eth_getLogs` response is a single whole-batch JSON-RPC error, and ethers' coalesce path rejected on the un-awaited batch-drain promise — surfacing as ~30k unhandled `could not coalesce error` / `over rate limit` process rejections under a gossip/finalization on-chain-verification storm (issue #939). Constructing providers with `batchMaxCount: 1` makes each read its own awaited request whose rejection is caught by the existing `verifyOnChain` try/catch. Transport-only change; the number of `eth_getLogs` operations issued is unchanged.
+**Off-chain runtime release.** No Solidity changes since rc.13 — the Base Sepolia (chainId 84532) deployment is **unchanged**, the `chainResetMarker` stays `v10-rc12-ka-rename-2026-06-01`, and **no contract redeploy is required**. Nodes upgrade in place; no local-state wipe. This release fixes the multi-GB `node-ui.db` bloat by taking the sync RPC off the Universal Messenger substrate, adds per-peer exponential backoff to the sync reconciler, and stops `eth_getLogs` rate-limit failures from surfacing as unhandled process rejections under gossip/finalization verification storms.
+
+> **Wire-compatibility note (hard cutover):** the sync protocol ID is bumped `/dkg/10.0.1/sync` → `/dkg/10.0.2/sync`. An rc.14 node will **not** sync with an rc.13 (or earlier) node and vice versa — mixed-version peers cleanly skip each other (`waitForSyncProtocol`). Because sync is a self-healing eventual-consistency catch-up net (not a primary data path), the brief mixed-version window during a network rollout is **no-data-loss**: once both ends are on rc.14 the next reconnect/reconciler tick backfills.
+
+### Fixed — `node-ui.db` bloat: sync RPC taken off the Universal Messenger substrate
+
+- **Sync no longer writes to `message_idempotency`** (`packages/agent/src/dkg-agent.ts`, `packages/agent/src/sync/responder/sync-handler.ts`, `packages/core/src/constants.ts`). rc.9 PR-E had routed sync through the Universal Messenger substrate "for receiver-side dedup", but the sync requester mints a **fresh `messageId` per attempt**, so the dedup key never repeats — the cache-hit rate is structurally zero while every large, never-reused sync page response was being cached on **both** sides of the `message_idempotency` table. On a long-lived node this grew `node-ui.db` to multiple GB (≈3.1 GB observed, plus a same-size WAL). The responder now registers on the **raw `ProtocolRouter`** and the requester sends via `messenger.sendToPeer` (raw pass-through) instead of `messenger.sendReliable`. Sync already carries its own `withRetry`, a 90s auth-freshness TTL, and per-`requestId` replay protection, so it needs none of the substrate's idempotency/outbox machinery. A regression test pins that `PROTOCOL_SYNC` is registered off the substrate.
+
+### Added — Per-peer exponential backoff for the sync reconciler
+
+- **Sync reconciler backoff** (`packages/agent/src/dkg-agent.ts`, `packages/agent/src/dkg-agent-constants.ts`): a peer that can never be synced (dead, NAT-stuck, or persistently stream-resetting) never stamps `lastSuccessfulSyncAt`, so it read as perpetually stale and was dialed on **every** reconciler tick forever. The reconciler now applies per-peer exponential backoff — `SYNC_BACKOFF_BASE_MS * 2^(failures-1)`, capped at `SYNC_BACKOFF_MAX_MS`, with ±`SYNC_BACKOFF_JITTER` randomisation — that resets the instant a sync succeeds and is cleared on `connection:close`. Only the **periodic reconciler** is gated; `connection:open` and `peer:update` still trigger an immediate attempt, so a newly-reachable peer is never delayed.
+
+### Fixed — Chain RPC read path (`eth_getLogs` rate-limit storm)
+
+- **Disable ethers JSON-RPC request batching on the chain provider** (`packages/chain/src/evm-adapter.ts`, PR #940): under RPC rate limiting a *batched* `eth_getLogs` response is a single whole-batch JSON-RPC error, and ethers' coalesce path rejected on the un-awaited batch-drain promise — surfacing as ~30k unhandled `could not coalesce error` / `over rate limit` process rejections under a gossip/finalization on-chain-verification storm (issue #939). Constructing providers with `batchMaxCount: 1` makes each read its own awaited request whose rejection is caught by the existing `verifyOnChain` try/catch. Transport-only change; the number of `eth_getLogs` operations issued is unchanged.
 
 ## [10.0.0-rc.13] - 2026-06-02
 

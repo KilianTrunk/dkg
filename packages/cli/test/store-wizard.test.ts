@@ -83,6 +83,30 @@ describe('promptStoreBackend', () => {
     expect(result.storeBlock).toBeNull();
   });
 
+  it('preserves an explicit embedded backend on Enter-through (no silent flip to oxigraph-server)', async () => {
+    // Codex #946 — only a *block-less* config should fall through to the new
+    // oxigraph-server default. A node that explicitly chose a local worker
+    // variant must keep it on a re-init Enter-through.
+    for (const backend of ['oxigraph', 'oxigraph-worker', 'oxigraph-persistent'] as const) {
+      const result = await promptStoreBackend({
+        ask: mockAsk(['']), // Enter
+        existingStore: { backend },
+        log: () => {},
+      });
+      expect(result.storeBlock).toBeNull();
+    }
+  });
+
+  it('falls back to the recommended default (oxigraph-server) on an out-of-range number', async () => {
+    // Codex #946 — a typo'd digit ("9") must not silently downgrade a fresh
+    // install to the embedded worker; it resolves to defaultBackend (option 1).
+    const result = await promptStoreBackend({
+      ask: mockAsk(['9']),
+      log: () => {},
+    });
+    expect(result.storeBlock).toEqual({ backend: 'oxigraph-server', options: {} });
+  });
+
   it('persists Blazegraph + reachable URL with managedByDkg=false', async () => {
     const { fn, calls } = mockFetch(
       () => new Response(JSON.stringify({ boolean: true }), { status: 200 }),

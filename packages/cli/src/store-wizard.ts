@@ -143,11 +143,6 @@ export async function promptStoreBackend(
       ? (opts.existingStore?.options?.updateEndpoint as string)
       : undefined;
 
-  const defaultBackend = opts.flagBackend
-    ?? (existingBackend === 'blazegraph' || existingBackend === 'sparql-http' || existingBackend === 'oxigraph-server'
-      ? existingBackend
-      : 'oxigraph-server');
-
   // `oxigraph-server` (daemon-managed local RocksDB server) is the default
   // local backend: it gives MVCC concurrent reads + incremental persistence,
   // whereas `oxigraph` (the embedded in-process worker) rewrites the whole
@@ -157,6 +152,17 @@ export async function promptStoreBackend(
   // with no `store` block stays `oxigraph-worker`, so the existing fleet keeps
   // booting unchanged on auto-update (only an explicit re-init flips a node,
   // and the daemon's STORE-SWITCH guard makes that an opt-in, not silent).
+  const defaultBackend = opts.flagBackend
+    ?? (existingBackend === 'blazegraph' || existingBackend === 'sparql-http' || existingBackend === 'oxigraph-server'
+      ? existingBackend
+      // Preserve an *explicit* embedded/local backend on Enter-through —
+      // normalise the worker variants onto the `oxigraph` menu choice so a
+      // re-init doesn't silently flip a node that deliberately chose the
+      // in-process store. Only a truly absent store config (fresh install /
+      // block-less node) falls through to the new `oxigraph-server` default.
+      : existingBackend === 'oxigraph' || existingBackend === 'oxigraph-worker' || existingBackend === 'oxigraph-persistent'
+        ? 'oxigraph'
+        : 'oxigraph-server');
   const backendChoices = ['oxigraph-server', 'oxigraph', 'blazegraph'] as const;
   const backendLabels: Record<string, string> = {
     'oxigraph-server': 'oxigraph-server  (managed local server — recommended)',
@@ -190,9 +196,13 @@ export async function promptStoreBackend(
     defaultAnswer,
   )).trim();
 
-  // Accept both the number ("1", "2") and the name ("blazegraph")
+  // Accept both the number ("1"-"3") and the name ("blazegraph"). An
+  // out-of-range number (typo like "4") falls back to `defaultBackend` —
+  // i.e. the recommended option shown to the operator — rather than a
+  // hard-coded `oxigraph`, so a fat-fingered digit on a fresh install no
+  // longer silently downgrades the node to the embedded worker.
   const backendAnswer = /^\d+$/.test(backendInput)
-    ? (backendChoices[parseInt(backendInput, 10) - 1] ?? 'oxigraph')
+    ? (backendChoices[parseInt(backendInput, 10) - 1] ?? defaultBackend)
     : backendInput.toLowerCase();
 
   // `oxigraph-server` (daemon-managed local server) is the default numbered

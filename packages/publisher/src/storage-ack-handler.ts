@@ -795,16 +795,22 @@ export class StorageACKHandler {
       }
 
       // OT-RFC-44 / Design B: a publish is exactly ONE Knowledge Asset whose
-      // member entities are all the root subjects (any count). `kaCount` is the
-      // KA count (must be 1) — NOT the entity count. The pre-Design-B check
+      // member entities are the root subjects (any count). `kaCount` is the KA
+      // count (must be 1) — NOT the entity count. The pre-Design-B check
       // `rootSubjects.size === intent.kaCount` conflated the two and made a
       // receiving node REFUSE to ACK any multi-entity KA (the silent cross-node
-      // failure in OT-RFC-43 §2.7 / the §11.2 canary). We instead assert the KA
-      // count is 1 and that the declared entity list is a bijection with the
-      // actual root subjects (the per-entity presence check at lines below
-      // covers declared ⊆ actual; this size equality closes actual ⊆ declared).
-      // Exclude skolemized blank-node children (/.well-known/genid/) — those are
-      // internal sub-nodes of a single entity, not separate entities.
+      // failure in OT-RFC-43 §2.7 / the §11.2 canary). Under Design B we assert
+      // only the KA-count invariant here; data integrity (that these quads are
+      // exactly what the publisher committed to) is guaranteed by the Merkle
+      // check below, not by counting subjects.
+      //
+      // We deliberately do NOT require a count bijection between `rootEntities`
+      // and the payload's root subjects. `rootEntities` is a *selection*, not a
+      // complete enumeration: in the SWM-fallback branch it is the entity filter
+      // passed to `loadSWMQuads`, so a caller may legitimately declare a subset
+      // of the subjects present. The per-entity presence loop below still pins
+      // the one direction that matters for a receiver — every entity the caller
+      // names must actually be in the payload (declared ⊆ actual).
       const uniqueSubjects = new Set(parsed.map(q => q.subject));
       const rootSubjects = new Set(
         [...uniqueSubjects].filter(s => !s.includes('/.well-known/genid/')),
@@ -814,15 +820,11 @@ export class StorageACKHandler {
           `Design B: a publish must declare exactly one Knowledge Asset (kaCount=1); got ${intent.kaCount}`,
         );
       }
-      const declaredEntityCount = intent.rootEntities?.length ?? rootSubjects.size;
-      if (rootSubjects.size !== declaredEntityCount) {
-        throw new Error(
-          `entity-count mismatch: intent declares ${declaredEntityCount} member entit${declaredEntityCount === 1 ? 'y' : 'ies'} but staging quads have ` +
-          `${rootSubjects.size} root subjects (${uniqueSubjects.size} total subjects)`,
-        );
-      }
 
-      // Validate rootEntities match actual root subjects in the payload
+      // Validate that every declared rootEntity is actually present in the
+      // payload (declared ⊆ actual). Skolemized blank-node children
+      // (/.well-known/genid/) are excluded from `rootSubjects` above — they are
+      // internal sub-nodes of a single entity, not separate root entities.
       if (intent.rootEntities && intent.rootEntities.length > 0) {
         for (const entity of intent.rootEntities) {
           if (!rootSubjects.has(entity)) {

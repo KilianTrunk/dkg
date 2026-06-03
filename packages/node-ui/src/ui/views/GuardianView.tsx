@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState, lazy, Suspense } from 'react';
 import {
   AlertTriangle,
   Bot,
@@ -6,29 +6,189 @@ import {
   Copy,
   DatabaseZap,
   FileWarning,
+  Flag,
   Globe2,
   KeyRound,
+  Network,
   PackageSearch,
   RefreshCw,
   ShieldCheck,
   Sparkles,
   X,
 } from 'lucide-react';
+
+const RdfGraph = lazy(() =>
+  import('@origintrail-official/dkg-graph-viz/react').then(m => ({ default: m.RdfGraph }))
+);
 import {
+  endorseGuardianThreat,
+  flagGuardianThreatFalsePositive,
   fetchGuardianEvents,
   fetchGuardianFindings,
   fetchGuardianSummary,
+  fetchGuardianThreats,
   generateGuardianFixPrompt,
   runGuardianDependencyAudit,
+  seedGuardianThreats,
   type GuardianDependencyIntel,
   type GuardianEvent,
   type GuardianFinding,
   type GuardianGraphSync,
+  type GuardianPublicThreat,
   type GuardianSeverity,
   type GuardianSummary,
 } from '../api.js';
 import { useProjectsStore } from '../stores/projects.js';
 import { useTabsStore } from '../stores/tabs.js';
+
+const PUBLIC_THREAT_CG = 'guardian-vulnerability-intel';
+const UMANITEK_LOGO_URL = new URL('../assets/umanitek-icon.svg', import.meta.url).href;
+
+const G = 'http://umanitek.ai/ontology/guardian/';
+const SCHEMA = 'http://schema.org/';
+const RDF_TYPE = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type';
+
+// Hub node URIs — shared by multiple threats, creating the clustering edges
+const HUBS = {
+  dependency: 'urn:guardian:hub:supply-chain',
+  injection:  'urn:guardian:hub:prompt-injection',
+  escalation: 'urn:guardian:hub:privilege-escalation',
+  unknown:    'urn:guardian:hub:other',
+  critical:   'urn:guardian:hub:sev-critical',
+  high:       'urn:guardian:hub:sev-high',
+  medium:     'urn:guardian:hub:sev-medium',
+  low:        'urn:guardian:hub:sev-low',
+  umanitek:   'urn:guardian:curator:umanitek',
+  npm:        'urn:guardian:ecosystem:npm',
+  pypi:       'urn:guardian:ecosystem:pypi',
+};
+
+const THREAT_GRAPH_VIEW_CONFIG = {
+  name: 'guardian-threats',
+  // focal makes the Umanitek node large with the logo — the only reliable
+  // sizeMultiplier path in applyViewConfig (nodeTypes.sizeMultiplier is not applied)
+  focal: {
+    uri: HUBS.umanitek,
+    image: UMANITEK_LOGO_URL,
+    sizeMultiplier: 4,
+  },
+  nodeTypes: {
+    [`${G}Curator`]: {
+      icon: UMANITEK_LOGO_URL,
+      shape: 'circle' as const,
+    },
+  },
+};
+
+const THREAT_GRAPH_OPTIONS = {
+  labelMode: 'humanized' as const,
+  renderer: '2d' as const,
+  labels: {
+    predicates: [
+      `${SCHEMA}name`,
+      `${G}severity`,
+      `${G}category`,
+    ],
+  },
+  style: {
+    classColors: {
+      [`${G}Threat`]:              '#ef4444',   // red   — individual threat
+      [`${G}ThreatCategory`]:      '#6366f1',   // indigo — type hub
+      [`${G}SeverityLevel`]:       '#f97316',   // orange — severity hub
+      [`${G}Curator`]:             '#111111',   // dark bg — white flag logo shows clearly
+      [`${G}Ecosystem`]:           '#a3e635',   // lime  — npm / PyPI
+      [`${G}Endorsement`]:         '#22c55e',   // green — endorsement
+    },
+    defaultNodeColor: '#64748b',
+    defaultEdgeColor: '#334155',
+    edgeWidth: 1.2,
+    borderWidth: 0,
+  },
+  hexagon: { baseSize: 4, minSize: 2.5, maxSize: 7, scaleWithDegree: true },
+  focus: { maxNodes: 500, hops: 3 },
+  // Cool down simulation quickly — graph settles in ~3s then stays still.
+  // User can still zoom + pan freely after it freezes.
+  simulation: {
+    cooldownTime: 3000,
+    d3AlphaDecay: 0.04,
+    d3VelocityDecay: 0.35,
+  },
+};
+
+/** Build graph triples from clean PublicThreat objects — avoids raw URI slugs and
+ *  adds shared hub nodes so every threat has 3–5 edges, making the graph connected. */
+function buildThreatGraphTriples(
+  threats: GuardianPublicThreat[],
+): Array<{ subject: string; predicate: string; object: string }> {
+  const triples: Array<{ subject: string; predicate: string; object: string }> = [];
+  const lit = (v: string) => `"${v.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+  const t = (s: string, p: string, o: string) => triples.push({ subject: s, predicate: p, object: o });
+
+  // Define hub nodes
+  const hubDefs: Array<{ uri: string; label: string; type: string }> = [
+    { uri: HUBS.dependency,  label: 'Supply Chain',        type: `${G}ThreatCategory` },
+    { uri: HUBS.injection,   label: 'Prompt Injection',    type: `${G}ThreatCategory` },
+    { uri: HUBS.escalation,  label: 'Privilege Escalation',type: `${G}ThreatCategory` },
+    { uri: HUBS.critical,    label: 'Critical',            type: `${G}SeverityLevel` },
+    { uri: HUBS.high,        label: 'High',                type: `${G}SeverityLevel` },
+    { uri: HUBS.medium,      label: 'Medium',              type: `${G}SeverityLevel` },
+    { uri: HUBS.low,         label: 'Low',                 type: `${G}SeverityLevel` },
+    { uri: HUBS.umanitek,    label: 'Umanitek',            type: `${G}Curator` },
+    { uri: HUBS.npm,         label: 'npm',                 type: `${G}Ecosystem` },
+    { uri: HUBS.pypi,        label: 'PyPI',                type: `${G}Ecosystem` },
+  ];
+  // Only emit hubs that are actually used (prune unused to keep graph clean)
+  const usedHubs = new Set<string>();
+  for (const threat of threats) {
+    usedHubs.add(HUBS[threat.type as keyof typeof HUBS] ?? HUBS.unknown);
+    usedHubs.add(HUBS[threat.severity as keyof typeof HUBS] ?? '');
+    if (threat.curated) usedHubs.add(HUBS.umanitek);
+    if (threat.type === 'dependency') {
+      const id = threat.identifier;
+      if (id.startsWith('dep:npm:')) usedHubs.add(HUBS.npm);
+      if (id.startsWith('dep:pypi:')) usedHubs.add(HUBS.pypi);
+    }
+  }
+
+  for (const hub of hubDefs) {
+    if (!usedHubs.has(hub.uri)) continue;
+    t(hub.uri, RDF_TYPE, hub.type);
+    t(hub.uri, `${SCHEMA}name`, lit(hub.label));
+  }
+
+  for (const threat of threats) {
+    const uri = `urn:guardian:threat:${threat.identifier.toLowerCase().replace(/[^a-z0-9]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '')}`;
+
+    t(uri, RDF_TYPE, `${G}Threat`);
+    t(uri, `${SCHEMA}name`, lit(threat.title));
+    t(uri, `${G}severity`, lit(threat.severity));
+
+    // Hub edges — these are what make the graph connected
+    const typeHub = HUBS[threat.type as keyof typeof HUBS] ?? HUBS.unknown;
+    t(uri, `${G}category`, typeHub);
+
+    const sevHub = HUBS[threat.severity as keyof typeof HUBS];
+    if (sevHub) t(uri, `${G}hasSeverityLevel`, sevHub);
+
+    if (threat.curated) t(uri, `${G}curatedBy`, HUBS.umanitek);
+
+    if (threat.type === 'dependency') {
+      const ecoHub = threat.identifier.startsWith('dep:npm:') ? HUBS.npm
+        : threat.identifier.startsWith('dep:pypi:') ? HUBS.pypi
+        : null;
+      if (ecoHub) t(uri, `${G}inEcosystem`, ecoHub);
+    }
+
+    // Endorsement nodes (one per endorser, shown as small green nodes)
+    for (let i = 0; i < threat.endorsementCount; i++) {
+      const eUri = `urn:guardian:endorsement:${threat.identifier.replace(/[^a-z0-9]/gi, '-')}-${i}`;
+      t(eUri, RDF_TYPE, `${G}Endorsement`);
+      t(eUri, `${SCHEMA}name`, lit('Endorsed'));
+      t(eUri, `${G}endorses`, uri);
+    }
+  }
+  return triples;
+}
 
 const SEVERITY_ORDER: GuardianSeverity[] = ['critical', 'high', 'medium', 'low', 'info'];
 type JsonRecord = Record<string, unknown>;
@@ -429,6 +589,18 @@ export function GuardianView() {
   const [events, setEvents] = useState<GuardianEvent[]>([]);
   const [findings, setFindings] = useState<GuardianFinding[]>([]);
   const [dependencyIntel, setDependencyIntel] = useState<GuardianDependencyIntel[]>([]);
+  const [publicThreats, setPublicThreats] = useState<GuardianPublicThreat[]>([]);
+  const [endorsingId, setEndorsingId] = useState<string | null>(null);
+  const [flaggingId, setFlaggingId] = useState<string | null>(null);
+  const [flaggedIds, setFlaggedIds] = useState<Set<string>>(new Set());
+  const [seedingThreats, setSeedingThreats] = useState(false);
+  const [graphActive, setGraphActive] = useState(false);
+  const graphContainerRef = useRef<HTMLDivElement>(null);
+  // Stable triples — only rebuild when identifiers or endorsement counts actually
+  // change, not on every 5s poll that returns the same data (new array reference).
+  const [stableTriples, setStableTriples] = useState<Array<{ subject: string; predicate: string; object: string }>>([]);
+  const threatDataKeyRef = useRef('');
+  const [threatTriplesLoading] = useState(false);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -441,21 +613,79 @@ export function GuardianView() {
     else setLoading(true);
     setError(null);
     try {
-      const [summaryRes, eventsRes, findingsRes] = await Promise.all([
+      const [summaryRes, eventsRes, findingsRes, threatsRes] = await Promise.all([
         fetchGuardianSummary(),
         fetchGuardianEvents({ limit: 100 }),
         fetchGuardianFindings({ status: 'open', limit: 50 }),
+        fetchGuardianThreats(50).catch(() => ({ threats: [] as GuardianPublicThreat[] })),
       ]);
       setSummary(summaryRes.summary);
       setDependencyIntel(summaryRes.dependencyIntel);
       setEvents(eventsRes.events);
       setFindings(findingsRes.findings);
+      setPublicThreats(threatsRes.threats ?? []);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setLoading(false);
       setRefreshing(false);
     }
+  }, []);
+
+  // Derive graph triples — only recompute when content changes, not on every poll.
+  // The key compares identifier + endorsement count so the graph freezes in place
+  // during idle polling and only re-lays-out when something actually changed.
+  useEffect(() => {
+    if (publicThreats.length === 0) return;
+    const key = publicThreats.map(t => `${t.identifier}:${t.endorsementCount}`).join('|');
+    if (key === threatDataKeyRef.current) return;
+    threatDataKeyRef.current = key;
+    setStableTriples(buildThreatGraphTriples(publicThreats));
+  }, [publicThreats]);
+  const threatTriples = stableTriples;
+
+  const handleFlagFalse = useCallback(async (identifier: string) => {
+    setFlaggingId(identifier);
+    try {
+      await flagGuardianThreatFalsePositive(identifier);
+      setFlaggedIds((prev) => new Set([...prev, identifier]));
+    } catch (err) {
+      setError(err instanceof Error ? `Flag failed: ${err.message}` : `Flag failed: ${String(err)}`);
+    } finally {
+      setFlaggingId(null);
+    }
+  }, []);
+
+  const handleEndorse = useCallback(async (identifier: string) => {
+    setEndorsingId(identifier);
+    try {
+      const res = await endorseGuardianThreat(identifier);
+      setPublicThreats((prev) => prev.map((t) =>
+        t.identifier === identifier ? { ...t, endorsementCount: res.endorsementCount } : t,
+      ));
+    } catch (err) {
+      setError(err instanceof Error ? `Endorse failed: ${err.message}` : `Endorse failed: ${String(err)}`);
+    } finally {
+      setEndorsingId(null);
+    }
+  }, []);
+
+  // Deactivate graph when clicking outside it or pressing Escape
+  useEffect(() => {
+    const onMouseDown = (e: MouseEvent) => {
+      if (graphContainerRef.current && !graphContainerRef.current.contains(e.target as Node)) {
+        setGraphActive(false);
+      }
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setGraphActive(false);
+    };
+    document.addEventListener('mousedown', onMouseDown);
+    document.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.removeEventListener('mousedown', onMouseDown);
+      document.removeEventListener('keydown', onKeyDown);
+    };
   }, []);
 
   useEffect(() => {
@@ -579,6 +809,115 @@ export function GuardianView() {
         <StatTile label="Agent Events" value={summary?.totals.events ?? 0} detail="Hermes and OpenClaw" icon={<Bot size={18} />} />
         <StatTile label="Sensitive Access" value={summary?.totals.sensitivePathFindings ?? 0} detail="outside normal workspace" icon={<FileWarning size={18} />} tone={(summary?.totals.sensitivePathFindings ?? 0) > 0 ? 'warn' : 'good'} />
         <StatTile label="Dependency Intel" value={summary?.totals.vulnerableDependencies ?? 0} detail="OSV, EPSS, KEV facts" icon={<DatabaseZap size={18} />} />
+      </section>
+
+      <section className="guardian-panel guardian-panel-threats">
+        <div className="guardian-panel-head">
+          <h2>Public Threat Graph</h2>
+          <span>{publicThreats.length} threats</span>
+        </div>
+
+        {publicThreats.length === 0 ? (
+          <div className="guardian-empty">
+            <span>No public threats yet. Seed the curated set or wait for peer publishes.</span>
+            <button
+              type="button"
+              className="guardian-button"
+              disabled={seedingThreats}
+              onClick={async () => {
+                setSeedingThreats(true);
+                try {
+                  await seedGuardianThreats();
+                  await load(true);
+                } catch (err) {
+                  setError(err instanceof Error ? `Seed failed: ${err.message}` : `Seed failed: ${String(err)}`);
+                } finally {
+                  setSeedingThreats(false);
+                }
+              }}
+            >
+              <Sparkles size={14} /> {seedingThreats ? 'Seeding...' : 'Seed curated threats'}
+            </button>
+          </div>
+        ) : (
+          <div className="guardian-threat-split">
+            {/* Left: sidebar list with endorse */}
+            <div className="guardian-threat-sidebar">
+              {publicThreats.map((threat) => (
+                <div key={threat.identifier} className="guardian-threat-sidebar-row">
+                  <div className="guardian-threat-sidebar-head">
+                    <span className={`guardian-pill ${severityClass(threat.severity)}`}>{threat.severity}</span>
+                  </div>
+                  <div className="guardian-threat-sidebar-title">{threat.title}</div>
+                  <div className="guardian-row-meta" style={{ marginTop: 2 }}>
+                    <span>{threat.type}</span>
+                  </div>
+                  <div className="guardian-threat-actions">
+                    <button
+                      type="button"
+                      className="guardian-button guardian-threat-endorse-btn"
+                      disabled={endorsingId === threat.identifier}
+                      onClick={() => handleEndorse(threat.identifier)}
+                      title="Corroborate this threat"
+                    >
+                      <CheckCircle2 size={14} />
+                      {threat.endorsementCount > 0 && <span>{threat.endorsementCount}</span>}
+                      <span>{endorsingId === threat.identifier ? 'endorsing...' : 'endorse'}</span>
+                    </button>
+                    <button
+                      type="button"
+                      className={`guardian-button guardian-threat-false-btn${flaggedIds.has(threat.identifier) ? ' guardian-threat-false-flagged' : ''}`}
+                      title={flaggedIds.has(threat.identifier) ? 'Flagged as false positive' : 'Flag as false positive'}
+                      disabled={flaggingId === threat.identifier || flaggedIds.has(threat.identifier)}
+                      onClick={() => handleFlagFalse(threat.identifier)}
+                    >
+                      <Flag size={14} />
+                      <span>{flaggingId === threat.identifier ? 'flagging...' : flaggedIds.has(threat.identifier) ? 'flagged' : 'false'}</span>
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            {/* Right: DKG knowledge graph */}
+            <div
+              ref={graphContainerRef}
+              className={`guardian-threat-graph-canvas${graphActive ? ' guardian-graph-active' : ''}`}
+              onClick={() => setGraphActive(true)}
+            >
+              {!graphActive && (
+                <div className="guardian-graph-overlay" aria-hidden="true">
+                  <span>Click to pan &amp; zoom</span>
+                </div>
+              )}
+              <div style={{ width: '100%', height: '100%', pointerEvents: graphActive ? 'auto' : 'none' }}>
+              {threatTriplesLoading ? (
+                <div className="guardian-graph-placeholder">
+                  <Network size={32} style={{ opacity: 0.3 }} />
+                  <span>Loading graph...</span>
+                </div>
+              ) : threatTriples.length === 0 ? (
+                <div className="guardian-graph-placeholder">
+                  <Network size={32} style={{ opacity: 0.2 }} />
+                  <span>Graph data loading...</span>
+                </div>
+              ) : (
+                <Suspense fallback={<div className="guardian-graph-placeholder"><Network size={32} style={{ opacity: 0.3 }} /><span>Loading renderer...</span></div>}>
+                  <RdfGraph
+                    data={threatTriples}
+                    format="triples"
+                    options={THREAT_GRAPH_OPTIONS}
+                    viewConfig={THREAT_GRAPH_VIEW_CONFIG}
+                    style={{ width: '100%', height: '100%' }}
+                    initialFit
+                  />
+                </Suspense>
+              )}
+              </div>{/* end pointer-events wrapper */}
+            </div>{/* end graph-canvas */}
+
+          </div>
+        )}
       </section>
 
       <section className="guardian-grid guardian-grid-top">

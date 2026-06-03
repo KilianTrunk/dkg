@@ -279,6 +279,28 @@ export const runGuardianDependencyAudit = (components?: Array<{ ecosystem: strin
 export const generateGuardianFixPrompt = () =>
   post<{ ok: boolean; prompt: string; findingCount: number }>('/api/guardian/fix-prompt', {});
 
+export interface GuardianPublicThreat {
+  identifier: string;
+  type: 'dependency' | 'injection' | 'escalation' | 'unknown';
+  severity: GuardianSeverity;
+  title: string;
+  summary: string;
+  curated: boolean;
+  endorsementCount: number;
+}
+
+export const fetchGuardianThreats = (limit = 50) =>
+  get<{ threats: GuardianPublicThreat[] }>(`/api/guardian/threats?limit=${limit}`);
+
+export const endorseGuardianThreat = (identifier: string) =>
+  post<{ ok: boolean; identifier: string; endorsementCount: number }>('/api/guardian/threats/endorse', { identifier });
+
+export const flagGuardianThreatFalsePositive = (identifier: string) =>
+  post<{ ok: boolean; identifier: string; flagged: boolean }>('/api/guardian/threats/false-positive', { identifier });
+
+export const seedGuardianThreats = () =>
+  post<{ ok: boolean; published: number; identifiers: string[] }>('/api/guardian/seed-threats', {});
+
 // --- Replication (chain-driven VM reconciliation) — Phase F ---
 export interface ReplicationSummary {
   periodMs: number;

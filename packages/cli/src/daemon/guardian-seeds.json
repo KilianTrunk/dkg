@@ -1,0 +1,92 @@
+{
+  "version": 1,
+  "description": "Curated seed for the Umanitek public threat graph. Published with curated=true.",
+  "dependencies": [
+    {
+      "ecosystem": "npm",
+      "name": "event-stream",
+      "version": "3.3.6",
+      "advisoryId": "GHSA-mh6f-8j2x-4483",
+      "severity": "critical",
+      "summary": "Backdoored release that exfiltrated bitcoin wallet credentials via the flatmap-stream dependency."
+    },
+    {
+      "ecosystem": "npm",
+      "name": "ua-parser-js",
+      "version": "0.7.29",
+      "advisoryId": "GHSA-pjwm-rvh2-c87w",
+      "severity": "critical",
+      "summary": "Compromised release that shipped cryptominers and credential stealers; affected 0.7.29, 0.8.0, 1.0.0."
+    },
+    {
+      "ecosystem": "npm",
+      "name": "colors",
+      "version": "1.4.1",
+      "advisoryId": "GHSA-2qrg-x229-3v8q",
+      "severity": "high",
+      "summary": "Maintainer-introduced infinite loop in 1.4.1 that crashes downstream consumers (also affects faker@6.6.6)."
+    },
+    {
+      "ecosystem": "npm",
+      "name": "node-ipc",
+      "version": "10.1.1",
+      "advisoryId": "GHSA-97m3-w2cp-4xx6",
+      "severity": "critical",
+      "summary": "Maintainer-injected wiper targeting Russian and Belarusian IP geolocations."
+    },
+    {
+      "ecosystem": "PyPI",
+      "name": "ctx",
+      "version": "0.2.2",
+      "advisoryId": "PYSEC-2022-200",
+      "severity": "high",
+      "summary": "Hijacked release that exfiltrated environment variables to an external endpoint."
+    }
+  ],
+  "injection": [
+    {
+      "pattern": "ignore (?:all )?(?:previous|prior|above|system|developer) instructions",
+      "severity": "high",
+      "title": "Instruction override: ignore previous instructions",
+      "summary": "Classic prompt-injection lead used to overwrite system or developer prompts.",
+      "owaspCategory": "LLM01"
+    },
+    {
+      "pattern": "reveal (?:the )?(?:system|developer|hidden) prompt",
+      "severity": "high",
+      "title": "System prompt disclosure attempt",
+      "summary": "Attempts to coax the model into emitting its system or developer prompt.",
+      "owaspCategory": "LLM01"
+    },
+    {
+      "pattern": "you are now (?:in )?(?:developer|system|admin|root) mode",
+      "severity": "high",
+      "title": "Role override: developer/admin mode",
+      "summary": "Tries to switch the assistant into an elevated role with relaxed safety boundaries.",
+      "owaspCategory": "LLM01"
+    },
+    {
+      "pattern": "exfiltrat(?:e|ion)|steal (?:the )?(?:secret|token|key|credential)",
+      "severity": "critical",
+      "title": "Credential exfiltration intent",
+      "summary": "Direct request to siphon secrets, tokens, or credentials out of the context.",
+      "owaspCategory": "LLM06"
+    }
+  ],
+  "escalation": [
+    {
+      "toolName": "shell",
+      "argShape": "remote-script-pipe",
+      "severity": "critical",
+      "title": "Remote script piped to a shell",
+      "summary": "Agent invoked curl/wget piped directly into bash/sh/python — no integrity check, no inspection."
+    },
+    {
+      "toolName": "shell",
+      "argShape": "rm-rf-system-paths",
+      "severity": "critical",
+      "title": "Destructive recursive remove against system paths",
+      "summary": "Agent issued rm -rf against /etc, /usr, /var, or the user home — high blast radius."
+    }
+  ]
+}

@@ -465,6 +465,48 @@ export function buildFixPrompt(findings: GuardianFindingRecord[]): string {
   return lines.join('\n');
 }
 
+/**
+ * Umanitek Guardian ontology IRIs. Shared by every quad builder so the public
+ * threat graph speaks one vocabulary across detectors and lookup queries.
+ */
+export const GUARDIAN_ONTOLOGY = 'http://umanitek.ai/ontology/guardian/';
+export const GUARDIAN_THREAT_TYPE_IRI = `${GUARDIAN_ONTOLOGY}Threat`;
+export const GUARDIAN_DEP_THREAT_TYPE_IRI = `${GUARDIAN_ONTOLOGY}VulnerabilityAdvisory`;
+export const GUARDIAN_INJECTION_THREAT_TYPE_IRI = `${GUARDIAN_ONTOLOGY}PromptInjectionThreat`;
+export const GUARDIAN_ESCALATION_THREAT_TYPE_IRI = `${GUARDIAN_ONTOLOGY}EscalationThreat`;
+export const GUARDIAN_IDENTIFIER_PRED = `${GUARDIAN_ONTOLOGY}identifier`;
+export const GUARDIAN_CURATED_PRED = `${GUARDIAN_ONTOLOGY}curated`;
+export const GUARDIAN_SEVERITY_PRED = `${GUARDIAN_ONTOLOGY}severity`;
+export const GUARDIAN_PATTERN_PRED = `${GUARDIAN_ONTOLOGY}pattern`;
+export const GUARDIAN_TOOL_NAME_PRED = `${GUARDIAN_ONTOLOGY}toolName`;
+export const GUARDIAN_ARG_SHAPE_PRED = `${GUARDIAN_ONTOLOGY}argShape`;
+export const GUARDIAN_OWASP_CATEGORY_PRED = `${GUARDIAN_ONTOLOGY}owaspCategory`;
+export const GUARDIAN_ENDORSES_PRED = `${GUARDIAN_ONTOLOGY}endorses`;
+export const GUARDIAN_ENDORSER_PRED = `${GUARDIAN_ONTOLOGY}endorser`;
+export const GUARDIAN_ENDORSEMENT_TYPE_IRI = `${GUARDIAN_ONTOLOGY}Endorsement`;
+export const GUARDIAN_PUBLIC_THREAT_GRAPH_ID = 'guardian-vulnerability-intel';
+
+const RDF_TYPE = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type';
+
+/**
+ * Deterministic identifier so two nodes computing the same identifier converge
+ * on the same Threat KA. Lookup queries (`graphLookupThreat`) match on this
+ * string. The shape is `<type>:<key>` so SPARQL filters can pivot on prefix.
+ */
+export function threatIdentifierFor(args:
+  | { type: 'dependency'; ecosystem: string; name: string; version: string }
+  | { type: 'injection'; pattern: string }
+  | { type: 'escalation'; toolName: string; argShape: string }
+): string {
+  if (args.type === 'dependency') {
+    return `dep:${args.ecosystem.toLowerCase()}:${args.name.toLowerCase()}@${args.version}`;
+  }
+  if (args.type === 'injection') {
+    return `injection:${stableHash(args.pattern, 24)}`;
+  }
+  return `escalation:${args.toolName.toLowerCase()}::${stableHash(args.argShape, 24)}`;
+}
+
 export function buildPrivateAuditQuads(
   event: GuardianEventRecord,
   findings: GuardianFindingRecord[],
@@ -497,37 +539,153 @@ export function buildPrivateAuditQuads(
 
 export function buildPublicDependencyQuads(
   intel: GuardianDependencyIntelRecord,
-  contextGraphId = 'guardian-vulnerability-intel',
+  contextGraphId = GUARDIAN_PUBLIC_THREAT_GRAPH_ID,
+  opts: { curated?: boolean } = {},
 ): Array<{ subject: string; predicate: string; object: string; graph: string }> {
   const graph = `did:dkg:context-graph:${contextGraphId}`;
-  const pkgUri = `urn:guardian:package:${slug(intel.ecosystem)}:${slug(intel.package_name)}:${slug(intel.package_version)}`;
-  const advisoryUri = `urn:guardian:advisory:${slug(intel.advisory_id)}`;
+  const identifier = threatIdentifierFor({
+    type: 'dependency',
+    ecosystem: intel.ecosystem,
+    name: intel.package_name,
+    version: intel.package_version,
+  });
+  // Use threatUriFor so all threat types share a consistent URI scheme
+  // and endorsements can always link via threatUriFor(identifier).
+  const threatUri = threatUriFor(identifier);
   const cves = parseStringArray(intel.cve_ids_json);
   const refs = parseStringArray(intel.references_json);
   const out = [
-    q(pkgUri, 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type', 'http://umanitek.ai/ontology/guardian/PackageVersion', graph),
-    q(pkgUri, 'http://schema.org/name', literal(intel.package_name), graph),
-    q(pkgUri, 'http://schema.org/softwareVersion', literal(intel.package_version), graph),
-    q(pkgUri, 'http://schema.org/applicationCategory', literal(intel.ecosystem), graph),
-    q(advisoryUri, 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type', 'http://umanitek.ai/ontology/guardian/VulnerabilityAdvisory', graph),
-    q(advisoryUri, 'http://schema.org/identifier', literal(intel.advisory_id), graph),
-    q(advisoryUri, 'http://schema.org/name', literal(intel.advisory_id), graph),
-    q(advisoryUri, 'http://schema.org/description', literal(intel.summary || intel.advisory_id), graph),
-    q(advisoryUri, 'http://umanitek.ai/ontology/guardian/severity', literal(intel.severity), graph),
-    q(pkgUri, 'http://umanitek.ai/ontology/guardian/affectedBy', advisoryUri, graph),
-    q(advisoryUri, 'http://umanitek.ai/ontology/guardian/knownExploited', literal(String(Boolean(intel.known_exploited))), graph),
-    q(advisoryUri, 'http://schema.org/dateModified', literalIso(intel.updated_at), graph),
+    q(threatUri, RDF_TYPE, GUARDIAN_DEP_THREAT_TYPE_IRI, graph),
+    q(threatUri, RDF_TYPE, GUARDIAN_THREAT_TYPE_IRI, graph),
+    q(threatUri, GUARDIAN_IDENTIFIER_PRED, literal(identifier), graph),
+    q(threatUri, GUARDIAN_CURATED_PRED, literal(opts.curated ? 'true' : 'false'), graph),
+    q(threatUri, 'http://schema.org/identifier', literal(intel.advisory_id), graph),
+    q(threatUri, 'http://schema.org/name', literal(intel.advisory_id), graph),
+    q(threatUri, 'http://schema.org/description', literal(intel.summary || intel.advisory_id), graph),
+    q(threatUri, GUARDIAN_SEVERITY_PRED, literal(intel.severity), graph),
+    q(threatUri, 'http://umanitek.ai/ontology/guardian/packageName', literal(intel.package_name), graph),
+    q(threatUri, 'http://umanitek.ai/ontology/guardian/packageVersion', literal(intel.package_version), graph),
+    q(threatUri, 'http://umanitek.ai/ontology/guardian/packageEcosystem', literal(intel.ecosystem), graph),
+    q(threatUri, 'http://umanitek.ai/ontology/guardian/knownExploited', literal(String(Boolean(intel.known_exploited))), graph),
+    q(threatUri, 'http://schema.org/dateModified', literalIso(intel.updated_at), graph),
   ];
-  if (intel.exploited_at) out.push(q(advisoryUri, 'http://umanitek.ai/ontology/guardian/exploitedAt', literal(intel.exploited_at), graph));
-  if (intel.epss_score != null) out.push(q(advisoryUri, 'http://umanitek.ai/ontology/guardian/epssScore', literal(String(intel.epss_score)), graph));
-  if (intel.epss_percentile != null) out.push(q(advisoryUri, 'http://umanitek.ai/ontology/guardian/epssPercentile', literal(String(intel.epss_percentile)), graph));
-  if (intel.epss_date) out.push(q(advisoryUri, 'http://umanitek.ai/ontology/guardian/epssDate', literal(intel.epss_date), graph));
-  for (const cve of cves) out.push(q(advisoryUri, 'http://umanitek.ai/ontology/guardian/alias', literal(cve), graph));
-  for (const ref of refs.slice(0, 20)) out.push(q(advisoryUri, 'http://schema.org/url', literal(ref), graph));
+  if (intel.exploited_at) out.push(q(threatUri, 'http://umanitek.ai/ontology/guardian/exploitedAt', literal(intel.exploited_at), graph));
+  if (intel.epss_score != null) out.push(q(threatUri, 'http://umanitek.ai/ontology/guardian/epssScore', literal(String(intel.epss_score)), graph));
+  if (intel.epss_percentile != null) out.push(q(threatUri, 'http://umanitek.ai/ontology/guardian/epssPercentile', literal(String(intel.epss_percentile)), graph));
+  if (intel.epss_date) out.push(q(threatUri, 'http://umanitek.ai/ontology/guardian/epssDate', literal(intel.epss_date), graph));
+  for (const cve of cves) out.push(q(threatUri, 'http://umanitek.ai/ontology/guardian/alias', literal(cve), graph));
+  for (const ref of refs.slice(0, 20)) out.push(q(threatUri, 'http://schema.org/url', literal(ref), graph));
   for (const fixed of parseStringArray(intel.fixed_versions_json)) {
-    out.push(q(advisoryUri, 'http://umanitek.ai/ontology/guardian/fixedVersion', literal(fixed), graph));
+    out.push(q(threatUri, 'http://umanitek.ai/ontology/guardian/fixedVersion', literal(fixed), graph));
   }
   return out;
+}
+
+/**
+ * Build public Threat quads for an observed prompt-injection pattern. The
+ * `pattern` argument is the regex source (or a normalized template) that
+ * matched — the identifier is computed deterministically from it so two nodes
+ * publishing the same signature converge on the same Threat KA.
+ */
+export function buildPublicInjectionThreatQuads(
+  args: {
+    pattern: string;
+    severity: GuardianSeverity;
+    title: string;
+    summary: string;
+    owaspCategory?: string | null;
+    ts?: number;
+  },
+  contextGraphId = GUARDIAN_PUBLIC_THREAT_GRAPH_ID,
+  opts: { curated?: boolean } = {},
+): Array<{ subject: string; predicate: string; object: string; graph: string }> {
+  const graph = `did:dkg:context-graph:${contextGraphId}`;
+  const identifier = threatIdentifierFor({ type: 'injection', pattern: args.pattern });
+  const subj = `urn:guardian:threat:${slug(identifier)}`;
+  const out = [
+    q(subj, RDF_TYPE, GUARDIAN_INJECTION_THREAT_TYPE_IRI, graph),
+    q(subj, RDF_TYPE, GUARDIAN_THREAT_TYPE_IRI, graph),
+    q(subj, GUARDIAN_IDENTIFIER_PRED, literal(identifier), graph),
+    q(subj, GUARDIAN_CURATED_PRED, literal(opts.curated ? 'true' : 'false'), graph),
+    q(subj, GUARDIAN_SEVERITY_PRED, literal(args.severity), graph),
+    q(subj, GUARDIAN_PATTERN_PRED, literal(args.pattern), graph),
+    q(subj, 'http://schema.org/name', literal(args.title), graph),
+    q(subj, 'http://schema.org/description', literal(args.summary), graph),
+    q(subj, 'http://schema.org/dateModified', literalIso(args.ts ?? Date.now()), graph),
+  ];
+  if (args.owaspCategory) {
+    out.push(q(subj, GUARDIAN_OWASP_CATEGORY_PRED, literal(args.owaspCategory), graph));
+  }
+  return out;
+}
+
+/**
+ * Build public Threat quads for a dangerous tool-call shape. `argShape` is the
+ * signature your detector computes (e.g. `curl | sh`, `rm -rf /etc`) — kept
+ * normalized so identifiers are stable across reporters.
+ */
+export function buildPublicEscalationThreatQuads(
+  args: {
+    toolName: string;
+    argShape: string;
+    severity: GuardianSeverity;
+    title: string;
+    summary: string;
+    ts?: number;
+  },
+  contextGraphId = GUARDIAN_PUBLIC_THREAT_GRAPH_ID,
+  opts: { curated?: boolean } = {},
+): Array<{ subject: string; predicate: string; object: string; graph: string }> {
+  const graph = `did:dkg:context-graph:${contextGraphId}`;
+  const identifier = threatIdentifierFor({
+    type: 'escalation',
+    toolName: args.toolName,
+    argShape: args.argShape,
+  });
+  const subj = `urn:guardian:threat:${slug(identifier)}`;
+  return [
+    q(subj, RDF_TYPE, GUARDIAN_ESCALATION_THREAT_TYPE_IRI, graph),
+    q(subj, RDF_TYPE, GUARDIAN_THREAT_TYPE_IRI, graph),
+    q(subj, GUARDIAN_IDENTIFIER_PRED, literal(identifier), graph),
+    q(subj, GUARDIAN_CURATED_PRED, literal(opts.curated ? 'true' : 'false'), graph),
+    q(subj, GUARDIAN_SEVERITY_PRED, literal(args.severity), graph),
+    q(subj, GUARDIAN_TOOL_NAME_PRED, literal(args.toolName), graph),
+    q(subj, GUARDIAN_ARG_SHAPE_PRED, literal(args.argShape), graph),
+    q(subj, 'http://schema.org/name', literal(args.title), graph),
+    q(subj, 'http://schema.org/description', literal(args.summary), graph),
+    q(subj, 'http://schema.org/dateModified', literalIso(args.ts ?? Date.now()), graph),
+  ];
+}
+
+/** Stable URI for a Threat with the given identifier — used by lookup + endorse. */
+export function threatUriFor(identifier: string): string {
+  return `urn:guardian:threat:${slug(identifier)}`;
+}
+
+/**
+ * Build endorsement quads — each endorser publishes one of these into the
+ * public threat CG to corroborate a Threat. Counts are derived at query time
+ * via SPARQL `COUNT(DISTINCT ?endorser)`, so there is no central counter to
+ * race on or rewrite.
+ */
+export function buildEndorsementQuads(args: {
+  threatIdentifier: string;
+  endorserAddress: string;
+  ts?: number;
+}, contextGraphId = GUARDIAN_PUBLIC_THREAT_GRAPH_ID): Array<{ subject: string; predicate: string; object: string; graph: string }> {
+  const graph = `did:dkg:context-graph:${contextGraphId}`;
+  const threatUri = threatUriFor(args.threatIdentifier);
+  const ts = args.ts ?? Date.now();
+  const endorsementUri = `urn:guardian:endorsement:${stableHash({
+    threat: args.threatIdentifier,
+    endorser: args.endorserAddress.toLowerCase(),
+  }, 24)}`;
+  return [
+    q(endorsementUri, RDF_TYPE, GUARDIAN_ENDORSEMENT_TYPE_IRI, graph),
+    q(endorsementUri, GUARDIAN_ENDORSES_PRED, threatUri, graph),
+    q(endorsementUri, GUARDIAN_ENDORSER_PRED, literal(args.endorserAddress.toLowerCase()), graph),
+    q(endorsementUri, 'http://schema.org/dateCreated', literalIso(ts), graph),
+  ];
 }
 
 export function guardianDependencyIntelId(component: GuardianDependencyComponent, advisoryId: string): string {

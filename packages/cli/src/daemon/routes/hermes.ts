@@ -10,6 +10,7 @@ import {
 } from '../http-utils.js';
 import { daemonState } from '../state.js';
 import { hasConfiguredLocalAgentChat } from '../local-agents.js';
+import { recordGuardianEvent } from './guardian.js';
 import type { OpenClawAttachmentRef } from '../openclaw.js';
 import {
   HERMES_CHANNEL_RESPONSE_TIMEOUT_MS,
@@ -817,6 +818,31 @@ async function persistHermesTurnUnlocked(
     );
     if (payload.persistenceState === 'stored') {
       await importHermesAssistantReply(agent, payload.sessionId, payload.turnId, payload.assistantReply);
+    }
+    // Fan out to the Guardian pipeline so injection / escalation / dependency
+    // detectors see Hermes turns. Mirrors what adapter-openclaw does via HTTP;
+    // doing it in-process avoids the round-trip. Failures are swallowed —
+    // Guardian is observational and must never break a Hermes turn.
+    try {
+      await recordGuardianEvent(ctx, {
+        type: 'llm_turn',
+        sourceAgent: { framework: 'hermes', name: 'Hermes' },
+        sessionId: payload.sessionId,
+        idempotencyKey: `hermes:turn:${payload.sessionId}:${payload.turnId}`,
+        title: 'Hermes turn observed',
+        summary: 'Hermes persisted a chat turn through the DKG adapter.',
+        data: {
+          turnId: payload.turnId,
+          userMessage: payload.userMessage,
+          assistantReply: payload.assistantReply,
+          toolCalls: payload.toolCalls,
+          attachmentRefs: verifiedAttachmentRefs,
+          persistenceState: payload.persistenceState,
+          failureReason: payload.failureReason,
+        },
+      });
+    } catch {
+      // Guardian is observational; never break the Hermes turn persistence.
     }
     return { statusCode: 200, body: { ok: true, turnId: payload.turnId } };
   } catch (err: any) {

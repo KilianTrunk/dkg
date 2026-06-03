@@ -29,6 +29,7 @@ import { useDropzone } from 'react-dropzone';
 import { ArrowDown, ArrowUp, Ban, ChevronDown, ChevronRight, Folder, Loader2, MoreHorizontal, Paperclip, Square, Upload, X } from 'lucide-react';
 import { Select } from '../common/Select.js';
 import { MarkdownMessage } from '../chat/MarkdownMessage.js';
+import { useTabsStore } from '../../stores/tabs.js';
 import { computeSelectableProjects, toSidebarIdentity } from '../../lib/contextGraphSidebar.js';
 import { useCurrentAgent as useSharedCurrentAgentRaw } from '../../hooks/useCurrentAgent.js';
 import { useVisibilityPolling } from '../../hooks/useVisibilityPolling.js';
@@ -147,7 +148,7 @@ interface LocalAgentSessionSummary {
 const OPENCLAW_DOCS_URL = 'https://docs.openclaw.ai/';
 const OPENCLAW_RELEASE_URL = 'https://github.com/openclaw/openclaw/releases';
 const ADD_AGENT_TAB_ID = '__add_agent__';
-const STATIC_DEFAULT_LOCAL_AGENT_HISTORY_INTEGRATIONS = ['openclaw'] as const;
+const STATIC_DEFAULT_LOCAL_AGENT_HISTORY_INTEGRATIONS = ['hermes', 'openclaw'] as const;
 
 let localMessageId = 0;
 
@@ -2158,9 +2159,13 @@ export function PanelRight() {
   const currentAgent = useSharedCurrentAgent();
 
   const [integrations, setIntegrations] = useState<LocalAgentIntegration[]>([]);
-  const [selectedIntegrationId, setSelectedIntegrationId] = useState('openclaw');
+  // Default to Hermes when the user lands on the Guardian tab — Guardian
+  // observes Hermes turns first-class, and OpenClaw integration is staged for
+  // a later milestone. Falls back to OpenClaw on any other initial tab.
+  const initialIntegrationId = useTabsStore.getState().activeTabId === 'guardian' ? 'hermes' : 'openclaw';
+  const [selectedIntegrationId, setSelectedIntegrationId] = useState(initialIntegrationId);
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(
-    () => getDefaultLocalAgentSessionId('openclaw'),
+    () => getDefaultLocalAgentSessionId(initialIntegrationId),
   );
   const [connectBusyId, setConnectBusyId] = useState<string | null>(null);
   const [connectNotice, setConnectNotice] = useState<string | null>(null);
@@ -2184,8 +2189,8 @@ export function PanelRight() {
   const localChatEndRef = useRef<HTMLDivElement>(null);
   const memorySessionsRef = useRef<MemorySession[]>([]);
   const localMessagesByConversationRef = useRef<Record<string, LocalAgentMessage[]>>({});
-  const selectedIntegrationIdRef = useRef('openclaw');
-  const selectedSessionIdRef = useRef<string | null>(getDefaultLocalAgentSessionId('openclaw'));
+  const selectedIntegrationIdRef = useRef(initialIntegrationId);
+  const selectedSessionIdRef = useRef<string | null>(getDefaultLocalAgentSessionId(initialIntegrationId));
   const availableProjects = useProjectsStore((state) => state.contextGraphs);
   const projectsLoading = useProjectsStore((state) => state.loading);
   const activeProjectId = useProjectsStore((state) => state.activeProjectId);

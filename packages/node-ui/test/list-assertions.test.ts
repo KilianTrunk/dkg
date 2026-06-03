@@ -207,6 +207,15 @@ describe('listAssertions (WM) — URI parse + cg-scoped filter', () => {
     expect(body.sparql).toContain('did:dkg:context-graph:cg-A/_meta');
     expect(body.sparql).toContain('http://dkg.io/ontology/memoryLayer');
     expect(body.sparql).toContain('"WM"');
+    // The count query (call[1]) must ALSO gate on the `_meta` WM marker —
+    // counting only WM-marked partitions instead of scanning every graph
+    // under the CG (SWM/VM/meta included). Pins the Codex #944 perf fix.
+    const [, countInit] = fetchMock.mock.calls[1] as [string, RequestInit];
+    const countBody = JSON.parse(String(countInit.body));
+    expect(countBody.sparql).toContain('did:dkg:context-graph:cg-A/_meta');
+    expect(countBody.sparql).toContain('http://dkg.io/ontology/memoryLayer');
+    expect(countBody.sparql).toContain('"WM"');
+    expect(countBody.sparql).toContain('COUNT');
   });
 
   it('scopes the /assertion/ discriminator to the tail when cgId itself contains "/assertion/"', async () => {

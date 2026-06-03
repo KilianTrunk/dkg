@@ -580,8 +580,15 @@ export const executeQuery = (
   includeSharedMemory?: boolean,
   graphSuffix?: '_shared_memory',
   view?: 'verified-memory' | 'shared-working-memory',
+  // Opt the CG-scoped allow-list into the assertion partitions. Without it the
+  // daemon restricts `GRAPH ?g { … }` to the static set
+  // { <cg>, <cg>/_meta, <cg>/_shared_memory_meta } (see the long note on
+  // `listWmAssertions`), so a `GRAPH ?g` enumeration of WM content comes back
+  // empty. Callers that read raw partition triples (e.g. the WM layer view)
+  // pass `true`.
+  includeContextGraphPartitions?: boolean,
 ) =>
-  postQueryDeduped({ sparql, contextGraphId, includeSharedMemory, graphSuffix, view });
+  postQueryDeduped({ sparql, contextGraphId, includeSharedMemory, graphSuffix, view, includeContextGraphPartitions });
 
 // --- Publish (assertion-lifecycle: RFC-001 §9.x sign-at-creation) ---
 //
@@ -801,16 +808,22 @@ export async function listAssertions(
   //     whose data partition is still empty (fresh create, no writes),
   //     preserving the prior listing semantics the OPTIONAL existed for.
   //   • `countSparql` — per-partition triple counts with the GRAPH
-  //     variable at the top level (guard-safe). In the UI
-  //     `includeContextGraphPartitions: true` expands the allow-list to
-  //     the assertion partitions so these counts populate.
+  //     variable at the top level (guard-safe). Both GRAPH clauses are
+  //     siblings at the top of the WHERE block, so the `?g` variable
+  //     stays top-level and the guard passes. The leading fixed-graph
+  //     join restricts counting to the WM-marked assertion graphs only —
+  //     without it the count fanned out over *every* partition under the
+  //     CG (SWM/VM/meta included), turning a small WM listing into a full
+  //     CG scan. In the UI `includeContextGraphPartitions: true` expands
+  //     the allow-list to the assertion partitions so these counts populate.
   // Counts are merged by graph URI; a WM graph with no count row simply
   // renders without a triple badge (the badge is `!= null`-guarded).
   const listSparql = `SELECT ?g WHERE {
     GRAPH <${metaGraph}> { ?g <http://dkg.io/ontology/memoryLayer> "WM" }
   }`;
   const countSparql = `SELECT ?g (COUNT(*) AS ?cnt) WHERE {
-    GRAPH ?g { ?s ?p ?o } FILTER(STRSTARTS(STR(?g), "${cgPrefix}"))
+    GRAPH <${metaGraph}> { ?g <http://dkg.io/ontology/memoryLayer> "WM" }
+    GRAPH ?g { ?s ?p ?o }
   } GROUP BY ?g`;
   const [listData, countData] = await Promise.all([
     postQueryDeduped({ sparql: listSparql, contextGraphId, includeContextGraphPartitions: true }),

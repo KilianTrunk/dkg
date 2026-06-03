@@ -138,10 +138,16 @@ export function MemoryLayerView({ layer, contextGraphId, externalQuery, external
   const graphSuffix = layer === 'swm' ? '_shared_memory' as const : undefined;
   const includeShared = layer === 'swm';
   const queryView = layer === 'vm' ? 'verified-memory' as const : undefined;
+  // WM content lives in the CG's assertion partitions, which sit outside the
+  // daemon's static `GRAPH ?g` allow-list. Without this opt-in the WM view's
+  // `GRAPH ?g { ?s ?p ?o }` enumeration resolves against only
+  // { <cg>, <cg>/_meta, <cg>/_shared_memory_meta } and renders empty. SWM/VM
+  // use their own `view`-routed scopes and don't need it.
+  const includePartitions = layer === 'wm';
 
   const { data, loading, error, refresh } = useFetch(
-    () => executeQuery(sparql, contextGraphId, includeShared, graphSuffix, queryView),
-    [sparql, contextGraphId, includeShared, graphSuffix, queryView],
+    () => executeQuery(sparql, contextGraphId, includeShared, graphSuffix, queryView, includePartitions),
+    [sparql, contextGraphId, includeShared, graphSuffix, queryView, includePartitions],
     0
   );
   useMemoryGraphEvents(contextGraphId, refresh, { layers: [layer] });

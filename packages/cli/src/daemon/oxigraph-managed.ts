@@ -114,7 +114,12 @@ export function planManagedOxigraph(
     typeof options.location === 'string' && options.location.trim()
       ? options.location
       : join(dataDir, 'oxigraph-data');
-  const cacheDir = join(dataDir, 'oxigraph');
+  // Honour an operator `cacheDir` override (preserved by the wizard/flag flow)
+  // the same way `location` is; fall back to the default binary cache dir.
+  const cacheDir =
+    typeof options.cacheDir === 'string' && options.cacheDir.trim()
+      ? options.cacheDir
+      : join(dataDir, 'oxigraph');
 
   const largeLiteralStorage = {
     enabled: config.largeLiteralStorage?.enabled ?? true,

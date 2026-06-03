@@ -56,13 +56,19 @@ describe('planManagedOxigraph', () => {
     });
   });
 
-  it('honours operator overrides for port and location', () => {
+  it('honours operator overrides for port, location and cacheDir', () => {
     const plan = planManagedOxigraph(
-      { store: { backend: MANAGED_OXIGRAPH_BACKEND, options: { port: 9999, location: '/mnt/oxi' } } },
+      {
+        store: {
+          backend: MANAGED_OXIGRAPH_BACKEND,
+          options: { port: 9999, location: '/mnt/oxi', cacheDir: '/mnt/oxi-bin' },
+        },
+      },
       '/data',
     );
     expect(plan!.port).toBe(9999);
     expect(plan!.location).toBe('/mnt/oxi');
+    expect(plan!.cacheDir).toBe('/mnt/oxi-bin');
   });
 
   it('resolveManagedOxigraphPort rejects out-of-range values', () => {

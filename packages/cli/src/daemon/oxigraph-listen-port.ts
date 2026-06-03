@@ -15,11 +15,13 @@ import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
 
-/** Hex port token as it appears in `/proc/net/tcp` (little-endian). */
+/**
+ * Hex port token as it appears in the `local_address` field of
+ * `/proc/net/tcp`. Only the IPv4 address is byte-swapped there; the port is
+ * printed in normal big-endian hex (e.g. 8080 → `1F90`, 7878 → `1EC6`).
+ */
 export function procNetLocalPortHex(port: number): string {
-  const hi = (port >> 8) & 0xff;
-  const lo = port & 0xff;
-  return ((lo << 8) | hi).toString(16).toUpperCase().padStart(4, '0');
+  return port.toString(16).toUpperCase().padStart(4, '0');
 }
 
 async function lsofShowsPidListening(pid: number, port: number): Promise<boolean> {

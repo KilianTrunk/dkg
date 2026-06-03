@@ -137,31 +137,53 @@ export default defineSuite({
       await store.insert(makeQuads(Math.min(INSERT_CHUNK, quadCount - inserted), inserted));
     }
 
-    // Background writer for the `(under write load)` cases. Started lazily on
-    // the first under-load iteration and stopped in teardown, so it runs
-    // continuously across those iterations (sustained contention) while the
-    // `(idle)` cases — registered and run first — see a quiet store.
+    // Background writer for the `(under write load)` cases. It is scoped to
+    // each loaded iteration rather than relying on case-execution order, so a
+    // reordered or newly-inserted case can never start the writer during an
+    // `(idle)` measurement and poison the baseline:
+    //   - `beforeIteration` starts the writer and AWAITS one full insert/delete
+    //     cycle, so writes are provably in flight before the measured read
+    //     begins. This matters most for the `worker` backend, where an insert
+    //     is only *queued* to another thread — a synchronous start could let
+    //     the read complete before the first write was ever applied.
+    //   - `afterIteration` stops it.
+    // The `(idle)` cases register no writer at all.
     const churn = makeQuads(CHURN_BATCH, CHURN_OFFSET);
     let writerActive = false;
     let writerDone: Promise<void> | undefined;
-    const startWriter = (): void => {
+    const startWriter = async (): Promise<void> => {
       if (writerActive) return;
       writerActive = true;
+      let signalFirstCycle!: () => void;
+      const firstCycle = new Promise<void>((resolve) => { signalFirstCycle = resolve; });
       writerDone = (async () => {
-        while (writerActive) {
-          await store.insert(churn);
-          await store.delete(churn);
+        try {
+          let signalled = false;
+          while (writerActive) {
+            await store.insert(churn);
+            await store.delete(churn);
+            if (!signalled) { signalled = true; signalFirstCycle(); }
+          }
+        } finally {
+          // Unblock the barrier even if the first cycle threw, so a writer
+          // failure degrades the measurement instead of hanging it.
+          signalFirstCycle();
         }
       })();
+      await firstCycle;
     };
-    scene.teardown(async () => {
+    const stopWriter = async (): Promise<void> => {
+      if (!writerDone) return;
       writerActive = false;
+      const done = writerDone;
+      writerDone = undefined;
       try {
-        await writerDone;
+        await done;
       } catch {
         /* writer errors are not the measurement */
       }
-    });
+    };
+    scene.teardown(stopWriter);
 
     benchAsyncWithHooks(scene, 'read LIMIT 1 (idle)', async () => {
       await store.query(READ_LIMIT1);
@@ -173,10 +195,10 @@ export default defineSuite({
 
     benchAsyncWithHooks(scene, 'read LIMIT 1 (under write load)', async () => {
       await store.query(READ_LIMIT1);
-    }, { beforeIteration: startWriter });
+    }, { beforeIteration: startWriter, afterIteration: stopWriter });
 
     benchAsyncWithHooks(scene, 'read COUNT(*) (under write load)', async () => {
       await store.query(READ_COUNT);
-    }, { beforeIteration: startWriter });
+    }, { beforeIteration: startWriter, afterIteration: stopWriter });
   },
 });

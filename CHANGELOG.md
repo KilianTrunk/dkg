@@ -4,6 +4,10 @@ All notable changes to the DKG V9 node are documented here. The format is based 
 
 ## [Unreleased]
 
+### Added — Store read-latency benchmark (regression guard for #939)
+
+- **`bench/store-read-latency.bench.ts`** — a new esbench suite that measures real Oxigraph read latency for the two shapes that hung on a saturated node (issue #939): a trivial `SELECT … LIMIT 1` scan and the production `getTotalTriples` `COUNT(*)` aggregate, on an idle store. On the embedded **`worker` backend** (the single-writer store) it additionally measures those reads **under concurrent write load**, quantifying the read-starvation that drove the rc.13 regression and giving a baseline to measure the MVCC `oxigraph-server` backend (now the default for new installs) against. Contention is worker-only by design — the in-process store is single-threaded/synchronous and cannot exhibit true read/write overlap, so it runs the idle baselines only. Backends via `DKG_BENCH_STORE_BACKENDS` (`inprocess` always; `worker` auto-added when its compiled artefact is built, e.g. in CI), sizes via `DKG_BENCH_STORE_SIZES`. Run with `pnpm bench:store-read`; participates in `pnpm bench` / `bench:baseline` / `bench:compare` like the existing suites.
+
 ### Changed — `oxigraph-server` is now the default triple-store backend for new installs
 
 - **`dkg init` defaults to `oxigraph-server`** (`packages/cli/src/store-wizard.ts`): the store-backend menu now lists `oxigraph-server` (daemon-managed local RocksDB server) as the first, recommended option and the default answer; the embedded in-process worker (`oxigraph`) moves to option 2 for minimal-footprint / single-reader nodes. A fresh `dkg init` — or one that accepts the default — writes an explicit `"store": { "backend": "oxigraph-server" }` block, so new nodes get MVCC concurrent reads + incremental persistence out of the box.

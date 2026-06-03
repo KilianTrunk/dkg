@@ -4,6 +4,10 @@ All notable changes to the DKG V9 node are documented here. The format is based 
 
 ## [Unreleased]
 
+### Added — Store read-latency benchmark (regression guard for #939)
+
+- **`bench/store-read-latency.bench.ts`** — a new esbench suite that measures real Oxigraph read latency for the two shapes that hung on a saturated node (issue #939): a trivial `SELECT … LIMIT 1` scan and a `COUNT(*)` aggregate, each on an idle store **and** while a background writer churns inserts/deletes. The `(under write load)` cases quantify the single-writer read-starvation that drove the rc.13 regression — on an in-process store the trivial read inflates ~22× under contention — and give a baseline to measure the opt-in MVCC server (Release 2) against. Backends are selectable via `DKG_BENCH_STORE_BACKENDS` (`inprocess` default; `worker` opt-in, requires the storage build) and sizes via `DKG_BENCH_STORE_SIZES`. Run with `pnpm bench:store-read`; participates in `pnpm bench` / `bench:baseline` / `bench:compare` like the existing suites.
+
 ## [10.0.0-rc.14] - 2026-06-02
 
 **Off-chain runtime release.** No Solidity changes since rc.13 — the Base Sepolia (chainId 84532) deployment is **unchanged**, the `chainResetMarker` stays `v10-rc12-ka-rename-2026-06-01`, and **no contract redeploy is required**. Nodes upgrade in place; no local-state wipe. This release fixes the multi-GB `node-ui.db` bloat by taking the sync RPC off the Universal Messenger substrate, adds per-peer exponential backoff to the sync reconciler, adds an **opt-in** daemon-managed local Oxigraph server backend (Release 2, phase 2a), and stops `eth_getLogs` rate-limit failures from surfacing as unhandled process rejections under gossip/finalization verification storms.

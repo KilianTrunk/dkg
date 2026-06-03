@@ -100,6 +100,22 @@ describe('promptStoreBackend', () => {
     }
   });
 
+  it('switches to the default embedded worker when an oxigraph-persistent node EXPLICITLY picks oxigraph', async () => {
+    // Codex #946 — preservation must be gated on a true keep. An operator who
+    // explicitly selects option `2` / "oxigraph" to move a worker/persistent
+    // node back to the plain embedded default must NOT have the old backend +
+    // options silently retained. Both the numeric and named selection switch.
+    const existingStore = { backend: 'oxigraph-persistent', options: { path: '/custom/store' } };
+    for (const answer of ['2', 'oxigraph']) {
+      const result = await promptStoreBackend({
+        ask: mockAsk([answer]),
+        existingStore,
+        log: () => {},
+      });
+      expect(result.storeBlock).toBeNull();
+    }
+  });
+
   it('falls back to the recommended default (oxigraph-server) on an out-of-range number', async () => {
     // Codex #946 — a typo'd digit ("9") must not silently downgrade a fresh
     // install to the embedded worker; it resolves to defaultBackend (option 1).

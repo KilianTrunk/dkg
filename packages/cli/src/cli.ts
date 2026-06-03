@@ -842,13 +842,15 @@ program
     console.log(
       `  store:      ${
         storeBlock
-          // Only URL-backed backends (blazegraph/sparql-http) carry a `url`;
-          // oxigraph-server and a preserved local block don't, so guard the cast.
-          ? `${storeBlock.backend}${
-              (storeBlock.options as { url?: string } | undefined)?.url
-                ? ` (${(storeBlock.options as { url: string }).url})`
-                : ''
-            }`
+          // Endpoint shape varies by backend: blazegraph uses `options.url`,
+          // sparql-http uses `options.queryEndpoint`, and oxigraph-server / a
+          // preserved local block have no endpoint — render the backend name
+          // alone in that case rather than dropping the configured endpoint.
+          ? (() => {
+              const o = storeBlock.options as { url?: string; queryEndpoint?: string } | undefined;
+              const endpoint = o?.url ?? o?.queryEndpoint;
+              return `${storeBlock.backend}${endpoint ? ` (${endpoint})` : ''}`;
+            })()
           : 'oxigraph (local default)'
       }`,
     );

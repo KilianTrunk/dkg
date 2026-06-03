@@ -807,8 +807,17 @@ export class DashboardDB {
             `(log=${checkpoint.log}, checkpointed=${checkpoint.checkpointed}); retried next prune`,
         );
       }
-    } catch {
-      // The pragma itself throwing is unexpected; never block prune.
+    } catch (err) {
+      // Reaching here means the pragma threw, which is distinct from the
+      // handled busy case above: contention surfaces as busy>0, not an
+      // exception. Log it (don't swallow) so that if a future SQLite /
+      // better-sqlite3 change turns lock or I/O errors into throws, the
+      // stalled WAL reclaim is visible in the daemon log instead of only
+      // showing up later as unexplained disk growth. Never block prune.
+      console.warn(
+        `[DashboardDB] wal_checkpoint(TRUNCATE) failed — WAL not reclaimed this prune: ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
     }
   }
 

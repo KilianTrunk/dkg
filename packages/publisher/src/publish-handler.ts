@@ -21,7 +21,7 @@ import {
   getConfirmedStatusQuad,
   type KAMetadata,
 } from './metadata.js';
-import { autoPartition } from './auto-partition.js';
+import { skolemizeByEntity } from './auto-partition.js';
 import { PublishJournal, type JournalEntry } from './publish-journal.js';
 
 interface PendingPublish {
@@ -242,7 +242,7 @@ export class PublishHandler {
         .map(ka => new Uint8Array(ka.privateMerkleRoot));
       const computedMerkleRoot = computeFlatKCRoot(quads, privateRoots);
 
-      const partitioned = autoPartition(quads);
+      const partitioned = skolemizeByEntity(quads);
 
       // ── UAL consistency ──
       const startKAId = protoToBigInt(request.startKAId);

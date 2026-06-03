@@ -5,7 +5,7 @@ import type { ChainAdapter, KAUpdateVerification } from '@origintrail-official/d
 import { Logger, createOperationContext, DKGEvent, sparqlInt, contextGraphMetaUri } from '@origintrail-official/dkg-core';
 import { decodeKAUpdateRequest } from '@origintrail-official/dkg-core';
 import { parseSimpleNQuads } from './publish-handler.js';
-import { autoPartition } from './auto-partition.js';
+import { skolemizeByEntity } from './auto-partition.js';
 import { computeTripleHashV10 as computeTripleHash, computeFlatKCRootV10 as computeFlatKCRoot } from './merkle.js';
 import {
   promoteUpdatedKaToPerCgId,
@@ -174,7 +174,7 @@ export class UpdateHandler {
         .map((r) => new Uint8Array(r));
       const computedRoot = computeFlatKCRoot(quads, privateRoots);
 
-      const partitioned = autoPartition(quads);
+      const partitioned = skolemizeByEntity(quads);
       const manifestRoots = new Set(manifest.map((m) => m.rootEntity));
       for (const payloadRoot of partitioned.keys()) {
         if (!manifestRoots.has(payloadRoot)) {

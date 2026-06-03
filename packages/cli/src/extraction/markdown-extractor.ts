@@ -82,7 +82,7 @@ export interface MarkdownExtractInput {
    * blank-node subjects. See `19_MARKDOWN_CONTENT_TYPE.md §10.2` for the
    * normative rule and spec-engineer's reconciled ruling on Codex Bug 8
    * for the history (Round 3 tried blank nodes; Round 4 reverted to URI
-   * subjects + promote-time filter after an `autoPartition` audit showed
+   * subjects + promote-time filter after an `skolemizeByEntity` audit showed
    * the blank-node approach silently drops the ExtractionProvenance
    * block, which is a correctness smell).
    */
@@ -529,9 +529,9 @@ function frontmatterKeyToPredicate(key: string): string | null {
  * Cross-assertion promote contention on that subject is prevented by a
  * subject-prefix filter in `packages/publisher/src/dkg-publisher.ts`
  * `assertionPromote` that excludes `urn:dkg:file:` and `urn:dkg:extraction:`
- * subjects from the partition before `autoPartition` runs. See Codex
+ * subjects from the partition before `skolemizeByEntity` runs. See Codex
  * Bug 8 Round 4 reconciled ruling for the history — Round 3 tried blank
- * nodes but an `autoPartition` audit showed they silently drop the
+ * nodes but an `skolemizeByEntity` audit showed they silently drop the
  * ExtractionProvenance block on promote, which was a correctness smell.
  *
  * `resolvedRootEntity` follows the §19.10.1:508 precedence rules:

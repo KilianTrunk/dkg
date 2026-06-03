@@ -9,7 +9,7 @@ import {
 import { GraphManager, type TripleStore, type Quad } from '@origintrail-official/dkg-storage';
 import { type ChainAdapter, type EventFilter } from '@origintrail-official/dkg-chain';
 import {
-  computeTripleHashV10 as computeTripleHash, computeFlatKCRootV10 as computeFlatKCRoot, autoPartition,
+  computeTripleHashV10 as computeTripleHash, computeFlatKCRootV10 as computeFlatKCRoot, skolemizeByEntity,
   generateTentativeMetadata, getTentativeStatusQuad, getConfirmedStatusQuad,
   validatePublishRequest, parseSimpleNQuads, generateSubGraphRegistration,
   type KAMetadata,
@@ -306,7 +306,7 @@ export class GossipPublishHandler {
           .map(ka => new Uint8Array(ka.privateMerkleRoot));
         const merkleRoot = computeFlatKCRoot(normalized, privateRoots);
 
-        const partitioned = autoPartition(normalized);
+        const partitioned = skolemizeByEntity(normalized);
         const kaMetadata: KAMetadata[] = [];
 
         let metadataTokenId = 1n;

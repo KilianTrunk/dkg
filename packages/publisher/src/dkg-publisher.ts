@@ -5,7 +5,7 @@ import type { EventBus, OperationContext } from '@origintrail-official/dkg-core'
 import { DKGEvent, Logger, createOperationContext, sha256, encodeWorkspacePublishRequest, encodeEncryptedWorkspacePayload, encryptWorkspacePayload, contextGraphDataUri, contextGraphDataGraphUri, contextGraphMetaUri, contextGraphAssertionUri, assertionLifecycleUri, contextGraphSubGraphUri, contextGraphSubGraphMetaUri, SYSTEM_CONTEXT_GRAPHS, validateSubGraphName, isSafeIri, assertSafeIri, assertSafeRdfTerm, DKG_GOSSIP_MAX_MESSAGE_BYTES, type Ed25519Keypair, buildAuthorAttestationTypedData, buildUpdateAuthorAttestationTypedData, AUTHOR_SCHEME_VERSION_V1, TrustLevel, TRUST_LEVEL_PREDICATE, assertNoUserAuthoredTrustLevelQuads, buildTrustLevelQuads, isTrustLevelQuad } from '@origintrail-official/dkg-core';
 import { GraphManager, PrivateContentStore } from '@origintrail-official/dkg-storage';
 import { DEFAULT_PUBLISH_EPOCHS, MAX_PUBLISH_EPOCHS, type Publisher, type PublishOptions, type PublishResult, type KAManifestEntry, type PhaseCallback, type V10CoreNodeACK } from './publisher.js';
-import { autoPartition } from './auto-partition.js';
+import { skolemizeByEntity } from './auto-partition.js';
 import { canonicalPublishPayload } from './canonical-publish-payload.js';
 import { RESERVED_SUBJECT_PREFIXES, findReservedSubjectPrefix, isReservedSubject } from './reserved-subjects.js';
 import { skolemize } from './skolemize.js';
@@ -799,7 +799,7 @@ export class DKGPublisher implements Publisher {
 
     await this.graphManager.ensureContextGraph(contextGraphId);
 
-    const kaMap = autoPartition(quads);
+    const kaMap = skolemizeByEntity(quads);
     const manifestEntries: { rootEntity: string; privateMerkleRoot?: Uint8Array; privateTripleCount: number }[] = [];
     for (const [rootEntity, publicQuads] of kaMap) {
       const privRoot = undefined;
@@ -1223,7 +1223,7 @@ export class DKGPublisher implements Publisher {
     // that payload may contain N root entities and still publish as ONE KA in a
     // single transaction. Higher-level selection endpoints keep their
     // unrelated-root guard until they can identify that one lifecycle boundary.
-    const rootEntities = [...autoPartition(quads).keys()];
+    const rootEntities = [...skolemizeByEntity(quads).keys()];
 
     const ctxGraphId = options?.publishContextGraphId;
     const chainCgId = options?.onChainContextGraphId ?? ctxGraphId;
@@ -1447,7 +1447,7 @@ export class DKGPublisher implements Publisher {
     if (publishResult.status === 'confirmed') {
       const swmMetaGraph = this.graphManager.sharedMemoryMetaUri(contextGraphId, options?.subGraphName);
       const swmOwnershipKey = options?.subGraphName ? `${contextGraphId}\0${options.subGraphName}` : contextGraphId;
-      const kaMap = autoPartition(quads);
+      const kaMap = skolemizeByEntity(quads);
       let ownerDeletedTotal = 0;
       for (const rootEntity of kaMap.keys()) {
         await this.store.deleteByPattern({ graph: swmGraph, subject: rootEntity });
@@ -2801,7 +2801,7 @@ export class DKGPublisher implements Publisher {
 
     onPhase?.('prepare', 'start');
     onPhase?.('prepare:partition', 'start');
-    const kaMap = autoPartition(quads);
+    const kaMap = skolemizeByEntity(quads);
     onPhase?.('prepare:partition', 'end');
 
     onPhase?.('prepare:manifest', 'start');
@@ -3261,8 +3261,8 @@ export class DKGPublisher implements Publisher {
     return this.publisherNodeIdentityId;
   }
 
-  autoPartition(quads: Quad[]): KAManifestEntry[] {
-    const kaMap = autoPartition(quads);
+  skolemizeByEntity(quads: Quad[]): KAManifestEntry[] {
+    const kaMap = skolemizeByEntity(quads);
     let tokenId = 1n;
     return [...kaMap.keys()].map((rootEntity) => ({
       tokenId: tokenId++,
@@ -4055,7 +4055,7 @@ export class DKGPublisher implements Publisher {
     // §10.2 linkage table) and the `<urn:dkg:extraction:<uuid>>`
     // ExtractionProvenance block (rows 9-13) are subordinate metadata
     // about the extraction RUN, not semantic knowledge about an Entity.
-    // Without this filter, `autoPartition` below would treat
+    // Without this filter, `skolemizeByEntity` below would treat
     // `<urn:dkg:file:keccak256:abc>` as a root entity and cross-assertion
     // ownership would contend when two different assertions reference
     // the same file content (same keccak256 → same URN → same
@@ -4077,7 +4077,7 @@ export class DKGPublisher implements Publisher {
     //
     // See `19_MARKDOWN_CONTENT_TYPE.md §10.2` for the normative rule
     // and Codex Bug 8 Round 4 reconciled ruling for the history (Round
-    // 3 tried blank-node subjects but an `autoPartition` audit showed
+    // 3 tried blank-node subjects but an `skolemizeByEntity` audit showed
     // they silently drop rows 9-13 on promote, which was worse).
     // Round 12 Bug 35: source the prefix list from `RESERVED_SUBJECT_PREFIXES`
     // instead of hardcoding the two literals inline. If the reserved
@@ -4112,7 +4112,7 @@ export class DKGPublisher implements Publisher {
     const operationId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 
     // Skolemize blank nodes so local SWM and gossip peers store identical data.
-    const kaMap = autoPartition(quadsToPromote);
+    const kaMap = skolemizeByEntity(quadsToPromote);
     if (kaMap.size === 0) {
       throw new Error(
         'Cannot promote assertion: no root entities found. ' +

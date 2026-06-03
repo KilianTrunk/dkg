@@ -3084,11 +3084,11 @@ export async function handleAssertionRoutes(ctx: RequestContext): Promise<void> 
       // root entity is prevented by a subject-prefix filter in
       // `packages/publisher/src/dkg-publisher.ts` `assertionPromote` that
       // excludes both `urn:dkg:file:` and `urn:dkg:extraction:` subjects
-      // from the partition before `autoPartition` runs. Row 1 (whose
+      // from the partition before `skolemizeByEntity` runs. Row 1 (whose
       // subject is the doc entity, not the file URN) is preserved through
       // promote; rows 4-13 are WM-only by design. See Codex Bug 8 Round 4
       // reconciled ruling — Round 3 tried blank-node subjects, but an
-      // `autoPartition` audit showed they silently drop the prov block on
+      // `skolemizeByEntity` audit showed they silently drop the prov block on
       // promote, which was a correctness smell. See `19_MARKDOWN_CONTENT_TYPE.md
       // §10.2` for the normative rule.
       const fileUri = `urn:dkg:file:${fileStoreEntry.keccak256}`;

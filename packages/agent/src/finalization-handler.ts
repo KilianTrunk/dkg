@@ -11,7 +11,7 @@ import {
 import { GraphManager, type TripleStore, type Quad } from '@origintrail-official/dkg-storage';
 import { type ChainAdapter, type EventFilter } from '@origintrail-official/dkg-chain';
 import {
-  computeFlatKCRootV10 as computeFlatKCRoot, autoPartition,
+  computeFlatKCRootV10 as computeFlatKCRoot, skolemizeByEntity,
   generateConfirmedFullMetadata, getTentativeStatusQuad,
   generateSubGraphRegistration,
   shouldApplyMaterialization, writeMaterializedVersion, withMaterializationLock,
@@ -999,7 +999,7 @@ export class FinalizationHandler {
     const privateRoots = await this.getPrivateRootsFromMeta(contextGraphId, msgRootEntities, subGraphName);
     const merkleRoot = computeFlatKCRoot(canonicalQuads, privateRoots);
 
-    const partitioned = autoPartition(canonicalQuads);
+    const partitioned = skolemizeByEntity(canonicalQuads);
     const localRootSet = new Set(partitioned.keys());
 
     const rootEntities = msgRootEntities.length > 0

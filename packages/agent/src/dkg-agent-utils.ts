@@ -19,7 +19,7 @@ import type { Quad } from '@origintrail-official/dkg-storage';
 import type { Logger, OperationContext } from '@origintrail-official/dkg-core';
 import {
   computeFlatKCRootV10 as computeFlatKCRoot,
-  autoPartition,
+  skolemizeByEntity,
 } from '@origintrail-official/dkg-publisher';
 
 export type JsonLdDocument = Record<string, unknown> | Record<string, unknown>[];
@@ -120,7 +120,7 @@ export async function getJsonld() {
  * Replace blank node identifiers with deterministic uuid: URIs.
  *
  * JSON-LD documents without explicit @id produce blank nodes (_:b0, _:b1, etc.)
- * which autoPartition cannot use as root entities. This function assigns a stable
+ * which skolemizeByEntity cannot use as root entities. This function assigns a stable
  * uuid: URI to each unique blank node, matching dkg.js v8's generateMissingIdsForBlankNodes.
  *
  * Mutates the array in place.
@@ -292,7 +292,7 @@ export function verifySyncedData(
   }
 
   // Partition data triples by root entity
-  const partitioned = autoPartition(dataQuads);
+  const partitioned = skolemizeByEntity(dataQuads);
 
   // Verify each KC
   const verifiedKcUals = new Set<string>();

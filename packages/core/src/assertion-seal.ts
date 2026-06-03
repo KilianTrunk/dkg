@@ -49,7 +49,7 @@ export const ASSERTION_SEAL_PREDICATES = {
    * time so that `publishFromFinalizedAssertion` can scope the SWM
    * SPARQL CONSTRUCT to exactly this assertion's quads instead of
    * bundling everything currently in shared memory. The set is
-   * derived from `autoPartition(filteredQuads).keys()` over the same
+   * derived from `skolemizeByEntity(filteredQuads).keys()` over the same
    * reserved-subject-filtered quads `assertionPromote` writes, so the
    * post-promote SWM lookup produces the same merkle leaves the seal
    * was signed over. IRI literal — emitted as `<rootEntity>` (object

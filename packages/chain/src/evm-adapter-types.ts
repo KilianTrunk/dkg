@@ -1,0 +1,107 @@
+// SPDX-License-Identifier: Apache-2.0
+
+/**
+ * Configuration + contract-cache shapes for the EVM chain adapter,
+ * plus the `formatProviderContext` log-context helper, extracted from
+ * evm-adapter.ts. Bodies are a 1:1 move from the original module.
+ */
+import { Contract } from 'ethers';
+import type { ApprovalPolicy } from './chain-adapter.js';
+
+export interface EVMAdapterBaseConfig {
+  rpcUrl: string;
+  rpcUrls?: string[];
+  /** Primary operational wallet key (used for identity registration, staking, etc.) */
+  privateKey: string;
+  /** Additional operational wallet keys for parallel transaction submission. */
+  additionalKeys?: string[];
+  hubAddress: string;
+  /** Optional TRAC token contract override. When omitted, resolve from Hub.Token. */
+  tokenAddress?: string;
+  chainId?: string;
+  /**
+   * TTL (ms) for re-resolving `RandomSampling` / `RandomSamplingStorage`
+   * addresses from the Hub. Defaults to 5 minutes. Values `<= 0` are
+   * treated as "use default" and intentionally NOT supported as a
+   * "disable periodic refresh" mode: even with the Hub event listener
+   * and the `Only Contracts in Hub` retry wrapper, a missed event on
+   * a read-only path (e.g. `getActiveProofPeriodStatus`,
+   * `getNodeChallenge`) would leave the adapter pinned to a stale
+   * address until restart, exactly the failure mode this cache exists
+   * to prevent. The TTL is a backstop, not the primary refresh
+   * mechanism — keep it short enough that a missed rotation
+   * self-heals within minutes and the steady-state RPC overhead is
+   * still effectively zero.
+   */
+  randomSamplingHubRefreshMs?: number;
+  /**
+   * Policy that controls how the V10 publish / update auto-approve sizes
+   * its TRAC allowance request. Defaults to {@link DEFAULT_APPROVAL_POLICY}
+   * (`per-publish`), preserving the bounded-per-publish behaviour that
+   * existed before this field landed. See {@link ApprovalPolicy} for the
+   * mode semantics.
+   */
+  approvalPolicy?: ApprovalPolicy;
+}
+
+export interface EVMAdapterConfig extends EVMAdapterBaseConfig {
+  /** Admin wallet key used for profile/key-management transactions. */
+  adminPrivateKey?: string;
+  /**
+   * Documents that this adapter is intentionally running without admin
+   * authority. Missing admin keys are still accepted for backwards-compatible
+   * publish/read-only usage; admin-only operations fail when invoked.
+   */
+  allowNoAdminSigner?: boolean;
+}
+
+export interface ContractCache {
+  hub: Contract;
+  identity?: Contract;
+  profile?: Contract;
+  /**
+   * RFC 04 v0.3 — read getRelayCapable and listen for RelayCapabilityUpdated
+   * events from here. Profile.sol is the only writer (via onlyContracts) but
+   * the storage contract owns both the view surface and the event surface.
+   */
+  profileStorage?: Contract;
+  knowledgeAssets?: Contract;
+  knowledgeAssetsStorage?: Contract;
+  knowledgeAssetStorage?: Contract;
+  staking?: Contract;
+  contextGraphNameRegistry?: Contract;
+  token?: Contract;
+  parametersStorage?: Contract;
+  askStorage?: Contract;
+  contextGraphs?: Contract;
+  contextGraphStorage?: Contract;
+  knowledgeAssetsLifecycle?: Contract;
+  /** V10 NFT-backed PCA. Backs the PCA write surface + the publisher's
+   *  `kcEpochs == lockDurationEpochs` discount check (SDK pre-coerces). */
+  dkgPublishingConvictionNFT?: Contract;
+  randomSampling?: Contract;
+  randomSamplingStorage?: Contract;
+  identityStorage?: Contract;
+  convictionStakingStorage?: Contract;
+  stakingStorage?: Contract;
+  /**
+   * Epoch oracle used by the update path to compute `remainingEpochs`
+   * (`endEpoch - currentEpoch`) when sizing `newTokenAmount` so the
+   * daemon's pre-flight matches `KnowledgeAssetsLifecycle._validateTokenAmount`.
+   * Without this, byteSize-growth updates revert with `InvalidTokenAmount(1, 0)`
+   * because the carry-forward `currentTokenAmount` produces `deltaTokenAmount == 0`.
+   * Tracked at issue #831.
+   */
+  chronos?: Contract;
+}
+
+export function formatProviderContext(config: Pick<EVMAdapterConfig, 'chainId' | 'rpcUrl'>): string {
+  let rpcHost: string;
+  try {
+    const parsed = new URL(config.rpcUrl);
+    rpcHost = parsed.host || parsed.protocol || 'unknown-rpc';
+  } catch {
+    rpcHost = 'unparseable-rpc';
+  }
+  return `chainId=${config.chainId ?? 'unknown'} rpc=${rpcHost}`;
+}

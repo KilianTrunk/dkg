@@ -1,14 +1,10 @@
-import { ethers, JsonRpcProvider, FallbackProvider, Wallet, Contract, Interface, FetchRequest } from 'ethers';
+import { ethers, JsonRpcProvider, FallbackProvider, Wallet, Contract } from 'ethers';
 import {
   createFilterErrorSilencer,
   installFilterNotFoundConsoleSuppressor,
   formatProviderError,
   type FilterErrorSilencer,
 } from './filter-error-silencer.js';
-import { createRequire } from 'node:module';
-import { dirname, join } from 'node:path';
-import { existsSync, readFileSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
 import type {
   ChainAdapter,
   IdentityProof,
@@ -42,8 +38,6 @@ import {
   MerkleRootMismatchError,
   ChallengeNoLongerActiveError,
   DEFAULT_APPROVAL_POLICY,
-  DEFAULT_REPLENISH_TARGET_ALLOWANCE,
-  DEFAULT_REFILL_BELOW_FRACTION,
 } from './chain-adapter.js';
 import { HubResolutionCache } from './hub-resolution-cache.js';
 import { PcaUnavailableError } from './pca-errors.js';
@@ -53,6 +47,56 @@ import {
   floorPublishTokenAmount,
   computeUpdateACKDigest,
 } from '@origintrail-official/dkg-core';
+
+// --- Focused sibling modules (structural split of this file). The free
+// functions / constants / interfaces formerly declared here now live in
+// these modules; the class imports back what it uses and the previously
+// exported symbols are re-exported below so the public API remains
+// importable from './evm-adapter.js' unchanged. ---
+import { loadAbi } from './evm-adapter-abi.js';
+import {
+  enrichEvmError,
+  errorMessage,
+  getPcaLogicInterface,
+  isTooLowAllowanceError,
+  HUB_STALE_ERROR_MARKERS,
+} from './evm-adapter-errors.js';
+import {
+  sleep,
+  withTimeout,
+  resolveRpcUrls,
+  boundedRetryFetchRequest,
+  isRetryableRpcError,
+  assertSuccessfulReceipt,
+  isKnownTransactionError,
+} from './evm-adapter-rpc.js';
+import {
+  computeApprovalAction,
+  effectivePublishAllowance,
+  V10_PUBLISH_ONCHAIN_MIN_ALLOWANCE,
+} from './evm-adapter-allowance.js';
+import {
+  formatProviderContext,
+  type EVMAdapterConfig,
+  type ContractCache,
+} from './evm-adapter-types.js';
+
+// Re-exports preserving the previously module-local public API.
+export {
+  decodeEvmError,
+  enrichEvmError,
+  isTooLowAllowanceError,
+} from './evm-adapter-errors.js';
+export {
+  resolveRpcUrls,
+  isRetryableRpcError,
+} from './evm-adapter-rpc.js';
+export {
+  computeApprovalAction,
+  effectivePublishAllowance,
+  V10_PUBLISH_ONCHAIN_MIN_ALLOWANCE,
+} from './evm-adapter-allowance.js';
+export type { EVMAdapterConfig } from './evm-adapter-types.js';
 
 /**
  * Default TTL for re-resolving `RandomSampling` / `RandomSamplingStorage`
@@ -97,59 +141,6 @@ const RPC_RECEIPT_POLL_INTERVAL_MS = 2_000;
 const RPC_RECEIPT_TIMEOUT_MS = 180_000;
 
 /**
- * Per-request retry bound for ethers' built-in `FetchRequest`. ethers v6
- * retries HTTP 429 / 5xx responses with exponential backoff via
- * `FetchRequest.retryFunc`; the default keeps retrying for far longer than any
- * caller-side timeout, so a perpetually rate-limited (429) RPC makes a plain
- * read (e.g. `Hub.getContractAddress` inside `init()`, which sits on the
- * critical path of `createOnChainContextGraph` / context-graph register) hang
- * for minutes — register then never returns its `RPC_ENDPOINTS_EXHAUSTED`→503
- * in bounded time (#894 follow-up: surfaced once the boot timeout stopped the
- * daemon hanging at startup). Bounding the retry lets a sustained RPC error
- * surface as a normal (retryable) RPC error, so the adapter's own multi-RPC
- * failover + `RPC_ENDPOINTS_EXHAUSTED` wrapping kick in within seconds instead
- * of stalling. A transient single 429 is still retried (resilience preserved);
- * only a perpetually-failing endpoint gives up fast.
- *
- * The bound is the per-request RETRY COUNT (`attempt`), NOT a wall-clock
- * deadline. ethers resets `attempt` to 0 for every new top-level request and
- * increments it per retry, so an attempt-count cap is inherently per-request —
- * unlike a `Date.now()`-based deadline captured at provider construction, which
- * would (once the node had been up longer than the budget) instantly disable
- * retries for the rest of the process lifetime (Codex PR #901 round-3 :125).
- * With the capped backoff below, `RPC_REQUEST_MAX_RETRIES` retries span roughly
- * `RPC_REQUEST_MAX_RETRIES * backoffCap` ≈ 7.5s of wall time under a fast-
- * failing endpoint — bounded, and well under the daemon route / test ceilings.
- */
-const RPC_REQUEST_MAX_RETRIES = 5;
-const RPC_REQUEST_RETRY_BACKOFF_CAP_MS = 1_500;
-
-/**
- * Build a `FetchRequest` whose retry loop gives up after
- * `RPC_REQUEST_MAX_RETRIES` retries. A bare string URL would use ethers'
- * unbounded default; we install a bounded `retryFunc` instead. The bound is
- * evaluated from `attempt` (per-request), so every request — no matter how
- * long the node has been running — gets the same fresh retry budget.
- */
-function boundedRetryFetchRequest(url: string): FetchRequest {
-  const req = new FetchRequest(url);
-  req.retryFunc = async (_req, _response, attempt) => {
-    if (attempt >= RPC_REQUEST_MAX_RETRIES) return false;
-    await sleep(Math.min(500 * (attempt + 1), RPC_REQUEST_RETRY_BACKOFF_CAP_MS));
-    return true;
-  };
-  return req;
-}
-
-/**
- * Substrings we treat as "the Hub no longer recognises this contract
- * as a registered participant" — i.e. the cached address is stale and
- * the next call should re-resolve from the Hub. Conservative match on
- * the canonical revert wording from `ContractStatus.onlyContracts` /
- * `UnauthorizedAccess(Only Contracts in Hub)` so we don't accidentally
- * drop the cache on an unrelated authorization failure.
- */
-/**
  * Maps a Hub-registered contract name to the function that invalidates
  * the corresponding boot-bound field on `EVMChainAdapter.contracts`.
  *
@@ -191,505 +182,8 @@ const BOUND_CONTRACT_INVALIDATORS = new Map<string, (adapter: EVMChainAdapter) =
   ['Chronos',                    (a) => { (a as any).contracts.chronos = undefined; }],
 ]);
 
-const HUB_STALE_ERROR_MARKERS = [
-  'Only Contracts in Hub',
-  'UnauthorizedAccess(Only Contracts in Hub)',
-];
-
-export function resolveRpcUrls(rpcUrl: string, rpcUrls?: string[]): string[] {
-  const out: string[] = [];
-  for (const candidate of [rpcUrl, ...(rpcUrls ?? [])]) {
-    const trimmed = typeof candidate === 'string' ? candidate.trim() : '';
-    if (!trimmed || out.includes(trimmed)) continue;
-    out.push(trimmed);
-  }
-  if (out.length === 0) {
-    throw new Error('EVMChainAdapter requires at least one RPC URL');
-  }
-  return out;
-}
-
-/**
- * On-chain minimum the `KnowledgeAssetsLifecycle.publish` / `update` contract
- * pulls via `token.transferFrom(msg.sender, CSS, fullCost)` even for
- * zero-byte / zero-value publishes — the contract rounds `fullCost` up to
- * `1` wei-TRAC. Empirically reproduced on Base Sepolia, May 2026: a
- * publish with JS-side `params.tokenAmount === 0n` reverted with
- * `TooLowAllowance(token, 0, 1)` because the auto-approve path (then
- * gated on `tokenAmount > 0n` / `currentAllowance < tokenAmount`) skipped
- * approval entirely.
- *
- * On mainnet the same fires whenever the pricing oracle returns `0`
- * (new / dust-value CGs, certain edge cases in `getRequiredPublishTokenAmount`),
- * so we floor the approval ceiling at the on-chain minimum.
- */
-export const V10_PUBLISH_ONCHAIN_MIN_ALLOWANCE: bigint = 1n;
-
-/**
- * Returns the TRAC allowance ceiling required to cover one V10 publish /
- * update. Floors at the on-chain minimum so the direct-spend branch
- * (`token.transferFrom(..., fullCost)`) never reverts with
- * `TooLowAllowance` when the JS-side `tokenAmount` is `0n`.
- *
- * This is the *building block* for the `per-publish` approval policy and
- * the lower-bound clamp used by every other policy mode in
- * `computeApprovalAction`. The bounded-per-publish security property of
- * the legacy code path lives here.
- */
-export function effectivePublishAllowance(
-  tokenAmount: bigint,
-  onChainMin: bigint = V10_PUBLISH_ONCHAIN_MIN_ALLOWANCE,
-): bigint {
-  return tokenAmount > onChainMin ? tokenAmount : onChainMin;
-}
-
-const MAX_UINT256_ALLOWANCE: bigint = (1n << 256n) - 1n;
-
-function clampApprovalFraction(value: number): number {
-  if (!Number.isFinite(value)) return DEFAULT_REFILL_BELOW_FRACTION;
-  if (value < 0) return 0;
-  if (value > 1) return 1;
-  return value;
-}
-
-/**
- * Computes the approval action for one V10 publish / update, dispatched
- * by `ApprovalPolicy.mode`.
- *
- * Contract:
- *   - `needsApprove === true`  → caller MUST submit `approve(KA,
- *     targetAllowance)` before the publish to satisfy
- *     `token.transferFrom(..., fullCost)` on-chain.
- *   - `needsApprove === false` → skip the approve; the existing allowance
- *     already covers this publish.
- *
- * Invariants enforced for every mode:
- *   - `targetAllowance >= effectivePublishAllowance(tokenAmount)` — even
- *     a misconfigured `replenishing` target gets raised to the on-chain
- *     minimum so the immediate publish succeeds.
- *   - `needsApprove` is monotone in `currentAllowance` — strictly more
- *     existing allowance never flips a `false` to `true`.
- *
- * See {@link ApprovalPolicy} in `chain-adapter.ts` for the mode
- * semantics; see `evm-adapter.unit.test.ts` for the pinned-down behaviour
- * under every combination of `(mode, tokenAmount, currentAllowance)`.
- */
-export function computeApprovalAction(
-  policy: ApprovalPolicy,
-  tokenAmount: bigint,
-  currentAllowance: bigint,
-): { needsApprove: boolean; targetAllowance: bigint } {
-  const publishFloor = effectivePublishAllowance(tokenAmount);
-  switch (policy.mode) {
-    case 'unlimited': {
-      // Approve `MaxUint256` once per wallet. After that, currentAllowance
-      // covers any plausible tokenAmount — re-approve only if some external
-      // actor brought it back under the immediate publish's floor (manual
-      // `approve(KA, 0)`, contract upgrade, etc.).
-      return {
-        needsApprove: currentAllowance < publishFloor,
-        targetAllowance: MAX_UINT256_ALLOWANCE,
-      };
-    }
-    case 'replenishing': {
-      // Approve a configurable ceiling once, then refill when current drops
-      // below `target × fraction`. Raise the target to at least the publish
-      // floor so a misconfigured low `targetAllowance` doesn't brick the
-      // publish — the bigger of (operator's intent, what we need right now).
-      const requestedTarget =
-        policy.targetAllowance ?? DEFAULT_REPLENISH_TARGET_ALLOWANCE;
-      const target = requestedTarget > publishFloor ? requestedTarget : publishFloor;
-      const fraction = clampApprovalFraction(
-        policy.refillBelowFraction ?? DEFAULT_REFILL_BELOW_FRACTION,
-      );
-      // bigint-safe `target * fraction` via basis points so a fractional
-      // refill threshold never drifts on round-trip.
-      const fractionBp = BigInt(Math.round(fraction * 10_000));
-      let threshold = (target * fractionBp) / 10_000n;
-      // The refill threshold must cover the immediate publish's floor too —
-      // refilling below it would just let the next publish revert with
-      // `TooLowAllowance` again.
-      if (threshold < publishFloor) threshold = publishFloor;
-      return { needsApprove: currentAllowance < threshold, targetAllowance: target };
-    }
-    case 'per-publish':
-    default: {
-      // Approve exactly the publish floor. Matches the legacy bounded-
-      // per-publish behaviour (with the 1n on-chain minimum closing the
-      // gap that previously bricked zero-cost publishes).
-      return {
-        needsApprove: currentAllowance < publishFloor,
-        targetAllowance: publishFloor,
-      };
-    }
-  }
-}
-
-/**
- * #888 — true iff `err` is the V10 publish `TooLowAllowance(TRAC, ...)`
- * custom-error revert.
- *
- * The on-chain allowance read that gates the auto-approve and the
- * `estimateGas` that ethers runs while populating the publish tx can
- * observe a *stale* allowance on an internally load-balanced RPC: a
- * just-consumed per-publish `1`-wei floor still reads as `1` (so the
- * re-approve is skipped), or a freshly-sent approve has not yet
- * propagated to the read replica. Either way the contract reverts
- * `TooLowAllowance` during gas estimation — strictly BEFORE broadcast —
- * and the publisher can recover by forcing a fresh approve and retrying.
- *
- * Matches ethers v6's decoded custom-error shape (`err.revert.name`) and
- * falls back to string matching on the message / shortMessage / reason /
- * nested cause so a stringified or re-wrapped revert is still caught.
- */
-export function isTooLowAllowanceError(err: unknown): boolean {
-  if (!err || typeof err !== 'object') return false;
-  const e = err as {
-    revert?: { name?: unknown };
-    message?: unknown;
-    shortMessage?: unknown;
-    reason?: unknown;
-    cause?: unknown;
-  };
-  if (typeof e.revert?.name === 'string' && e.revert.name === 'TooLowAllowance') {
-    return true;
-  }
-  const causeMessage =
-    e.cause && typeof e.cause === 'object'
-      ? (e.cause as { message?: unknown }).message
-      : undefined;
-  const haystack = [e.message, e.shortMessage, e.reason, causeMessage]
-    .filter((s): s is string => typeof s === 'string')
-    .join(' ');
-  return /TooLowAllowance/i.test(haystack);
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
-  let timer: NodeJS.Timeout | undefined;
-  const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => {
-      const err = new Error(`${label} timed out after ${ms}ms`);
-      (err as any).code = 'TIMEOUT';
-      reject(err);
-    }, ms);
-  });
-  return Promise.race([promise, timeout]).finally(() => {
-    if (timer) clearTimeout(timer);
-  }) as Promise<T>;
-}
-
-function errorMessage(err: unknown): string {
-  if (err instanceof Error) return err.message;
-  try { return JSON.stringify(err); } catch { return String(err); }
-}
-
-function errorCode(err: unknown): string {
-  return String((err as any)?.code ?? (err as any)?.error?.code ?? '').toUpperCase();
-}
-
-function errorStatus(err: unknown): number | undefined {
-  const raw =
-    (err as any)?.status ??
-    (err as any)?.statusCode ??
-    (err as any)?.response?.status ??
-    (err as any)?.error?.status ??
-    (err as any)?.error?.statusCode;
-  return typeof raw === 'number' ? raw : undefined;
-}
-
-/**
- * Is `err` a transient RPC failure worth retrying / failing over (vs a
- * deterministic chain revert / argument error)? Inspects ethers/fetch error
- * shapes thoroughly — top-level AND nested `error.code` / `statusCode` /
- * `response.status` / `error.status` (via `errorCode` / `errorStatus`), plus a
- * message probe — so a 429/5xx buried in a nested field is still recognised.
- * Exported so consumers (e.g. the agent's boot-recovery transient gate) reuse
- * the SAME extraction instead of duplicating a narrower top-level-only subset
- * (Codex PR #901 round-4 :459).
- */
-export function isRetryableRpcError(err: unknown): boolean {
-  if (err instanceof Error) enrichEvmError(err);
-  const code = errorCode(err);
-  const status = errorStatus(err);
-  const msg = errorMessage(err).toLowerCase();
-
-  if (code === 'CALL_EXCEPTION' || code === 'INSUFFICIENT_FUNDS' || code === 'NONCE_EXPIRED'
-    || code === 'RPC_RECEIPT_LOOKUP_FAILED'
-    || code === 'REPLACEMENT_UNDERPRICED' || code === 'TRANSACTION_REPLACED'
-    || code === 'ACTION_REJECTED' || code === 'INVALID_ARGUMENT' || code === 'UNPREDICTABLE_GAS_LIMIT') {
-    return false;
-  }
-  if (msg.includes('execution reverted') || msg.includes('call exception')
-    || msg.includes('insufficient funds') || msg.includes('invalid argument')
-    || msg.includes('nonce too low') || msg.includes('replacement transaction underpriced')
-    || msg.includes('intrinsic gas too low') || msg.includes('exceeds block gas limit')) {
-    return false;
-  }
-
-  if (status === 429 || (typeof status === 'number' && status >= 500)) return true;
-  if (code === 'TIMEOUT' || code === 'TIMEOUT_ERROR' || code === 'SERVER_ERROR'
-    || code === 'NETWORK_ERROR' || code === 'ECONNRESET' || code === 'ECONNREFUSED'
-    || code === 'ETIMEDOUT' || code === 'ENOTFOUND' || code === 'EAI_AGAIN'
-    || code === 'UNKNOWN_ERROR' || code === 'BAD_DATA'
-    // Our own synthetic "all configured RPC endpoints exhausted" code — by
-    // definition retryable, regardless of the aggregated message text.
-    || code === 'RPC_ENDPOINTS_EXHAUSTED') {
-    return true;
-  }
-  // `no runners?!` is ethers' FallbackProvider error (provider-fallback.js)
-  // when EVERY configured sub-provider is unavailable — i.e. all RPC endpoints
-  // are exhausted. On a multi-RPC node a perpetual 429 surfaces as this rather
-  // than a raw `429`/`SERVER_ERROR` (which is what a single-provider config
-  // throws), so classify it as retryable too — otherwise `init()`'s Hub reads
-  // would propagate it un-coded and `/api/context-graph/register` would 500
-  // instead of the bounded 503 (#894 follow-up).
-  return /timeout|timed out|network|socket|reset|econnreset|econnrefused|etimedout|enotfound|eai_again|rate limit|too many requests|429|503|502|500|gateway|temporarily unavailable|fetch failed|connection|no runners/i
-    .test(msg);
-}
-
-function assertSuccessfulReceipt(receipt: ethers.TransactionReceipt, label: string): void {
-  if (receipt.status !== 0) return;
-  const err = new Error(`${label} tx ${receipt.hash} was mined but reverted (status=0)`);
-  (err as any).code = 'CALL_EXCEPTION';
-  (err as any).receipt = receipt;
-  throw err;
-}
-
-function isKnownTransactionError(err: unknown): boolean {
-  const code = errorCode(err);
-  const msg = errorMessage(err).toLowerCase();
-  return code === 'NONCE_EXPIRED'
-    || msg.includes('already known')
-    || msg.includes('known transaction')
-    || msg.includes('already imported')
-    || msg.includes('transaction already in mempool')
-    || msg.includes('already exists')
-    || msg.includes('already have transaction')
-    || msg.includes('nonce too low')
-    || msg.includes('duplicate transaction');
-}
-
-const require = createRequire(import.meta.url);
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const localAbiDir = join(__dirname, '..', 'abi');
-
-function loadAbi(contractName: string): ethers.InterfaceAbi {
-  const localPath = join(localAbiDir, `${contractName}.json`);
-  if (existsSync(localPath)) {
-    return JSON.parse(readFileSync(localPath, 'utf-8'));
-  }
-  const archivedPath = join(localAbiDir, 'archive', `${contractName}.json`);
-  if (existsSync(archivedPath)) {
-    return JSON.parse(readFileSync(archivedPath, 'utf-8'));
-  }
-  return require(`@origintrail-official/dkg-evm-module/abi/${contractName}.json`);
-}
-
-const ERROR_ABI_CONTRACTS = [
-  'KnowledgeAssets', 'KnowledgeAssetsLifecycle', 'KnowledgeAssetsStorage',
-  'DKGKnowledgeAssets', 'ContextGraphs', 'ContextGraphStorage',
-  'ContextGraphNameRegistry', 'Profile', 'Identity', 'IdentityStorage',
-  'Staking', 'StakingStorage', 'StakingV10', 'StakingKPI',
-  'ConvictionStakingStorage',
-  'DKGStakingConvictionNFT', 'DKGPublishingConvictionNFT',
-  // Post PR #650 split — PCA business errors are declared on the logic
-  // and storage contracts, NOT the slim wrapper. Both must be in this
-  // list so wrapper-bubbled reverts (e.g. NoConvictionAccount, AccountExpired,
-  // UnknownAccount, InvalidAmount, AgentAlreadyRegistered) decode at runtime.
-  'PublishingConviction', 'PublishingConvictionStorage',
-  'Hub', 'Token', 'Ask', 'AskStorage',
-  'Paymaster', 'ShardingTable', 'ParametersStorage',
-  'PublishingConvictionAccount',
-  'RandomSampling', 'RandomSamplingStorage',
-];
-
 const ADMIN_KEY_PURPOSE = 1;
 const OPERATIONAL_KEY_PURPOSE = 2;
-
-let _errorInterface: Interface | null = null;
-let _pcaLogicInterface: Interface | null = null;
-
-/**
- * Lazy-cached `ethers.Interface` over the `PublishingConviction` (logic)
- * contract ABI.
- *
- * Post PR #650, all PCA state-change events (`AccountCreated`, `ToppedUp`,
- * `CostCovered`, `WindowSettled`, `AccountFinalSwept`,
- * `AgentRegistered`, `AgentDeregistered`) are emitted by the logic contract
- * — NOT by the `DKGPublishingConvictionNFT` wrapper. Receipt-log parsing
- * for those events MUST go through this interface; parsing through the
- * wrapper's interface returns `null` because the wrapper ABI no longer
- * declares those events. See `DKGPublishingConvictionNFT.sol` NatSpec
- * "Deliberate breaks in the v2.x → v3.0.0 wrapper bump".
- */
-function getPcaLogicInterface(): Interface {
-  if (_pcaLogicInterface) return _pcaLogicInterface;
-  _pcaLogicInterface = new Interface(loadAbi('PublishingConviction') as any[]);
-  return _pcaLogicInterface;
-}
-
-function getErrorInterface(): Interface {
-  if (_errorInterface) return _errorInterface;
-  const errorFragments: string[] = [];
-  for (const name of ERROR_ABI_CONTRACTS) {
-    try {
-      const abi = loadAbi(name) as any[];
-      for (const entry of abi) {
-        if (entry.type === 'error') {
-          const params = (entry.inputs ?? []).map((i: any) => `${i.type} ${i.name}`).join(', ');
-          errorFragments.push(`error ${entry.name}(${params})`);
-        }
-      }
-    } catch { /* ABI not available */ }
-  }
-  _errorInterface = new Interface([...new Set(errorFragments)]);
-  return _errorInterface;
-}
-
-/**
- * Decode an EVM custom error selector into a human-readable string.
- * Returns null if the selector doesn't match any known contract error.
- */
-export function decodeEvmError(data: string | Uint8Array): { name: string; args: ethers.Result } | null {
-  try {
-    const hex = typeof data === 'string' ? data : ethers.hexlify(data);
-    if (hex.length < 10) return null;
-    const parsed = getErrorInterface().parseError(hex);
-    return parsed ? { name: parsed.name, args: parsed.args } : null;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Enrich a caught EVM error with a decoded custom error name.
- * Modifies the error message in-place and returns the decoded name (if any).
- */
-export function enrichEvmError(err: unknown): string | null {
-  if (!(err instanceof Error)) return null;
-  // Match the revert-data hex across the RPC-shape variants we see in the
-  // wild. CH-10:
-  //   - Hardhat:        ... data="0x..."             (key="value", quoted)
-  //   - Geth:           ... data: "0x..."            (key: value, JS-object)
-  //   - Geth no-quote:  ... data=0x...               (key=value, unquoted)
-  //   - Infura/Alchemy: ... errorData="0x..."        (errorData= prefix)
-  //   - JSON body:      ... "data":"0x..."           (JSON-encoded provider error)
-  // Leading non-letter (or string start) ensures `errorData` doesn't match
-  // as `data`. Separator class accepts any combination of `=`, `:`, `"`,
-  // `'`, whitespace.
-  const match = err.message.match(
-    /(?:^|[^a-zA-Z])(?:errorData|data)["':=\s]+(0x[0-9a-fA-F]+)/,
-  );
-  if (!match) return null;
-  const decoded = decodeEvmError(match[1]);
-  if (!decoded) return null;
-  const argsStr = decoded.args.length > 0 ? `(${decoded.args.join(', ')})` : '';
-  const decodedStr = `${decoded.name}${argsStr}`;
-  err.message = err.message.replace('unknown custom error', decodedStr);
-  return decoded.name;
-}
-
-interface EVMAdapterBaseConfig {
-  rpcUrl: string;
-  rpcUrls?: string[];
-  /** Primary operational wallet key (used for identity registration, staking, etc.) */
-  privateKey: string;
-  /** Additional operational wallet keys for parallel transaction submission. */
-  additionalKeys?: string[];
-  hubAddress: string;
-  /** Optional TRAC token contract override. When omitted, resolve from Hub.Token. */
-  tokenAddress?: string;
-  chainId?: string;
-  /**
-   * TTL (ms) for re-resolving `RandomSampling` / `RandomSamplingStorage`
-   * addresses from the Hub. Defaults to 5 minutes. Values `<= 0` are
-   * treated as "use default" and intentionally NOT supported as a
-   * "disable periodic refresh" mode: even with the Hub event listener
-   * and the `Only Contracts in Hub` retry wrapper, a missed event on
-   * a read-only path (e.g. `getActiveProofPeriodStatus`,
-   * `getNodeChallenge`) would leave the adapter pinned to a stale
-   * address until restart, exactly the failure mode this cache exists
-   * to prevent. The TTL is a backstop, not the primary refresh
-   * mechanism — keep it short enough that a missed rotation
-   * self-heals within minutes and the steady-state RPC overhead is
-   * still effectively zero.
-   */
-  randomSamplingHubRefreshMs?: number;
-  /**
-   * Policy that controls how the V10 publish / update auto-approve sizes
-   * its TRAC allowance request. Defaults to {@link DEFAULT_APPROVAL_POLICY}
-   * (`per-publish`), preserving the bounded-per-publish behaviour that
-   * existed before this field landed. See {@link ApprovalPolicy} for the
-   * mode semantics.
-   */
-  approvalPolicy?: ApprovalPolicy;
-}
-
-export interface EVMAdapterConfig extends EVMAdapterBaseConfig {
-  /** Admin wallet key used for profile/key-management transactions. */
-  adminPrivateKey?: string;
-  /**
-   * Documents that this adapter is intentionally running without admin
-   * authority. Missing admin keys are still accepted for backwards-compatible
-   * publish/read-only usage; admin-only operations fail when invoked.
-   */
-  allowNoAdminSigner?: boolean;
-}
-
-interface ContractCache {
-  hub: Contract;
-  identity?: Contract;
-  profile?: Contract;
-  /**
-   * RFC 04 v0.3 — read getRelayCapable and listen for RelayCapabilityUpdated
-   * events from here. Profile.sol is the only writer (via onlyContracts) but
-   * the storage contract owns both the view surface and the event surface.
-   */
-  profileStorage?: Contract;
-  knowledgeAssets?: Contract;
-  knowledgeAssetsStorage?: Contract;
-  knowledgeAssetStorage?: Contract;
-  staking?: Contract;
-  contextGraphNameRegistry?: Contract;
-  token?: Contract;
-  parametersStorage?: Contract;
-  askStorage?: Contract;
-  contextGraphs?: Contract;
-  contextGraphStorage?: Contract;
-  knowledgeAssetsLifecycle?: Contract;
-  /** V10 NFT-backed PCA. Backs the PCA write surface + the publisher's
-   *  `kcEpochs == lockDurationEpochs` discount check (SDK pre-coerces). */
-  dkgPublishingConvictionNFT?: Contract;
-  randomSampling?: Contract;
-  randomSamplingStorage?: Contract;
-  identityStorage?: Contract;
-  convictionStakingStorage?: Contract;
-  stakingStorage?: Contract;
-  /**
-   * Epoch oracle used by the update path to compute `remainingEpochs`
-   * (`endEpoch - currentEpoch`) when sizing `newTokenAmount` so the
-   * daemon's pre-flight matches `KnowledgeAssetsLifecycle._validateTokenAmount`.
-   * Without this, byteSize-growth updates revert with `InvalidTokenAmount(1, 0)`
-   * because the carry-forward `currentTokenAmount` produces `deltaTokenAmount == 0`.
-   * Tracked at issue #831.
-   */
-  chronos?: Contract;
-}
-
-function formatProviderContext(config: Pick<EVMAdapterConfig, 'chainId' | 'rpcUrl'>): string {
-  let rpcHost: string;
-  try {
-    const parsed = new URL(config.rpcUrl);
-    rpcHost = parsed.host || parsed.protocol || 'unknown-rpc';
-  } catch {
-    rpcHost = 'unparseable-rpc';
-  }
-  return `chainId=${config.chainId ?? 'unknown'} rpc=${rpcHost}`;
-}
 
 /**
  * EVM chain adapter implementing the V9 ChainAdapter interface.

@@ -41,7 +41,9 @@
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
+  access,
   chmod,
+  constants,
   mkdir,
   readFile,
   rename,
@@ -143,6 +145,7 @@ export interface OxigraphBinaryIo {
   rename: typeof rename;
   rm: typeof rm;
   stat: typeof stat;
+  access: typeof access;
   /** Clear the macOS quarantine xattr; best-effort, never throws. */
   clearQuarantine: (path: string) => Promise<void>;
 }
@@ -170,6 +173,7 @@ function defaultIo(): OxigraphBinaryIo {
     rename,
     rm,
     stat,
+    access,
     clearQuarantine: defaultClearQuarantine,
   };
 }
@@ -196,14 +200,6 @@ function sha256Hex(bytes: Uint8Array): string {
 }
 
 /**
- * Look for an operator-installed `oxigraph` executable on `PATH`. Used as a
- * fallback for platforms we don't publish a pinned binary for (musl, win-arm,
- * …) so `store.backend: 'oxigraph-server'` still works there — matching the
- * remediation in resolveOxigraphAsset's error. We can't checksum a binary we
- * didn't pin, so integrity is the operator's responsibility (they installed
- * it). Returns the absolute path, or null if not found.
- */
-/**
  * Heuristic musl detection on Linux: the published Oxigraph binaries are
  * glibc-linked, so on Alpine/musl hosts the pinned `linux-x64`/`linux-arm64`
  * asset still "resolves" but won't actually run. Probing for the musl dynamic
@@ -225,6 +221,14 @@ async function isMuslLinux(io: OxigraphBinaryIo): Promise<boolean> {
   return false;
 }
 
+/**
+ * Look for an operator-installed `oxigraph` executable on `PATH`. Used as a
+ * fallback for platforms we don't publish a pinned binary for (musl, win-arm,
+ * …) so `store.backend: 'oxigraph-server'` still works there — matching the
+ * remediation in resolveOxigraphAsset's error. We can't checksum a binary we
+ * didn't pin, so integrity is the operator's responsibility (they installed
+ * it). Returns the absolute path, or null if not found.
+ */
 async function resolveSystemOxigraphOnPath(
   io: OxigraphBinaryIo,
   platform: NodeJS.Platform,
@@ -239,9 +243,11 @@ async function resolveSystemOxigraphOnPath(
       const candidate = join(dir, name);
       try {
         const s = await io.stat(candidate);
-        if (s.isFile()) return candidate;
+        if (!s.isFile()) continue;
+        await io.access(candidate, constants.X_OK);
+        return candidate;
       } catch {
-        // Not in this dir — keep scanning.
+        // Not executable in this dir — keep scanning.
       }
     }
   }

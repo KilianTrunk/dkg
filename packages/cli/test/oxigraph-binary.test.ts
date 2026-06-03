@@ -92,6 +92,7 @@ function makeIo(overrides: Partial<OxigraphBinaryIo> = {}): {
       renames.push({ from: String(from), to: String(to) });
     }) as any,
     rm: (async () => undefined) as any,
+    access: (async () => undefined) as any,
     clearQuarantine: async (p: string) => {
       quarantineCleared.push(p);
     },
@@ -181,7 +182,11 @@ describe('ensureOxigraphBinary', () => {
         cacheDir: '/cache',
         platform: 'freebsd' as NodeJS.Platform,
         arch: 'x64',
-        io: { stat: statMock as any, fetch: fetchMock as any },
+        io: {
+          stat: statMock as any,
+          fetch: fetchMock as any,
+          access: (async () => undefined) as any,
+        },
       });
       expect(path).toBe('/usr/local/bin/oxigraph');
       // System binary: no download, no checksum (operator-provided).
@@ -231,10 +236,40 @@ describe('ensureOxigraphBinary', () => {
         cacheDir: '/cache',
         platform: 'linux',
         arch: 'x64',
-        io: { stat: statMock as any, fetch: fetchMock as any },
+        io: {
+          stat: statMock as any,
+          fetch: fetchMock as any,
+          access: (async () => undefined) as any,
+        },
       });
       expect(path).toBe('/usr/local/bin/oxigraph');
       expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      process.env.PATH = prevPath;
+    }
+  });
+
+  it('skips a non-executable oxigraph on PATH and keeps scanning', async () => {
+    const prevPath = process.env.PATH;
+    process.env.PATH = '/opt/bin:/usr/local/bin';
+    try {
+      const statMock = vi.fn(async (p: string) => {
+        const s = String(p);
+        if (s === '/opt/bin/oxigraph' || s === '/usr/local/bin/oxigraph') {
+          return { isFile: () => true } as any;
+        }
+        throw new Error('ENOENT');
+      });
+      const accessMock = vi.fn(async (p: string) => {
+        if (String(p) === '/opt/bin/oxigraph') throw new Error('EACCES');
+      });
+      const path = await ensureOxigraphBinary({
+        cacheDir: '/cache',
+        platform: 'freebsd' as NodeJS.Platform,
+        arch: 'x64',
+        io: { stat: statMock as any, access: accessMock as any },
+      });
+      expect(path).toBe('/usr/local/bin/oxigraph');
     } finally {
       process.env.PATH = prevPath;
     }

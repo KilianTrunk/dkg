@@ -36,11 +36,9 @@
  * `spawn`/`fetch` are injectable so unit tests exercise ready-polling,
  * crash-restart, and shutdown without launching a real binary.
  */
-import { execFile, spawn, type ChildProcess } from 'node:child_process';
-import { promisify } from 'node:util';
+import { spawn, type ChildProcess } from 'node:child_process';
+import { childOwnsListenPort } from './oxigraph-listen-port.js';
 import { invalidateExternalStoreQuadsCache } from './routes/status.js';
-
-const execFileAsync = promisify(execFile);
 
 export interface OxigraphServerIo {
   spawn: typeof spawn;
@@ -54,33 +52,6 @@ export interface OxigraphServerIo {
     port: number,
     host: string,
   ) => Promise<boolean>;
-}
-
-/** Default: `lsof` on Unix; on Windows fall back to child-alive only. */
-async function defaultChildOwnsListenPort(
-  child: ChildProcess,
-  port: number,
-  host: string,
-): Promise<boolean> {
-  if (!child.pid || child.exitCode !== null || child.signalCode !== null) {
-    return false;
-  }
-  if (host !== '127.0.0.1' && host !== 'localhost') return true;
-  if (process.platform === 'win32') return true;
-  try {
-    const { stdout } = await execFileAsync(
-      'lsof',
-      ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN'],
-      { timeout: 2_000 },
-    );
-    const pid = child.pid;
-    return stdout.split('\n').some((line) => {
-      const parts = line.trim().split(/\s+/);
-      return parts.length >= 2 && Number(parts[1]) === pid;
-    });
-  } catch {
-    return false;
-  }
 }
 
 export interface StartOxigraphServerOptions {
@@ -143,7 +114,7 @@ export async function startOxigraphServer(
   const io: OxigraphServerIo = {
     spawn,
     fetch: globalThis.fetch,
-    childOwnsListenPort: defaultChildOwnsListenPort,
+    childOwnsListenPort,
     ...opts.io,
   };
   const markStoreDown = (): void => {
@@ -241,7 +212,7 @@ export async function startOxigraphServer(
         signal: AbortSignal.timeout(readyIntervalMs + 1_000),
       });
       if (!res.ok) return false;
-      const ownsPort = await (io.childOwnsListenPort ?? defaultChildOwnsListenPort)(
+      const ownsPort = await (io.childOwnsListenPort ?? childOwnsListenPort)(
         c,
         port,
         host,

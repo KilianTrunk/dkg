@@ -863,8 +863,8 @@ export async function runDaemonInner(
 
   // Managed local Oxigraph server (`store.backend: 'oxigraph-server'`,
   // Release 2 opt-in). Fetch/verify the pinned binary, spawn a loopback
-  // `oxigraph serve` child, and rewrite `config.store` to the equivalent
-  // `sparql-http` backend pointing at it — so every downstream step
+  // `oxigraph serve` child, and expose a runtime `sparql-http` view (without
+  // mutating persisted `config.store`) so every downstream step
   // (config validation, health check, identity tag, chain-reset wipe,
   // the adapter) reuses the existing external-backend path unchanged.
   // Runs AFTER detectBackendSwitch (which persisted the raw

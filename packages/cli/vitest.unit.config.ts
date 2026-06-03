@@ -47,6 +47,7 @@ export default defineConfig({
           // Release 2 — managed local Oxigraph server (opt-in). Pure logic
           // + injected fetch/spawn/fs; no network, no real binary.
           'test/oxigraph-binary.test.ts',
+          'test/oxigraph-listen-port.test.ts',
           'test/oxigraph-server.test.ts',
           'test/oxigraph-managed.test.ts',
           // Opt-in via BLAZEGRAPH_INTEGRATION_TEST=1. Skips silently

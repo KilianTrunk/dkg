@@ -9,6 +9,25 @@ const DKG = 'http://dkg.io/ontology/';
 const PROV = 'http://www.w3.org/ns/prov#';
 const XSD = 'http://www.w3.org/2001/XMLSchema#';
 
+// OT-RFC-43 §10.1 / OT-RFC-44 §4 — entity-list predicate rename migration.
+// The predicates were misnamed: they hold graph ENTITIES, not Merkle roots.
+//   dkg:rootEntity          -> dkg:entity
+//   dkg:assertionRootEntity -> dkg:assertionEntity
+// Migration is dual-write + dual-read: every emitter writes BOTH names so a
+// mixed fleet (and pre-rename data) keeps resolving; readers accept either
+// (see ENTITY_PRED_ALT / isEntityPredicate in ./entity-predicate.js). The
+// legacy predicate is dropped only in a later release, after all nodes
+// dual-read.
+const DKG_ENTITY = `${DKG}entity`;
+const DKG_ROOT_ENTITY_LEGACY = `${DKG}rootEntity`;
+/** Emit the entity-member predicate under BOTH the new and legacy names. */
+function entityMemberQuads(subject: string, entity: string, graph: string): Quad[] {
+  return [
+    mq(subject, DKG_ROOT_ENTITY_LEGACY, entity, graph), // legacy (dropped in a later release)
+    mq(subject, DKG_ENTITY, entity, graph),             // new (OT-RFC-43 §10.1)
+  ];
+}
+
 export function toHex(bytes: Uint8Array): string {
   return Array.from(bytes)
     .map((b) => b.toString(16).padStart(2, '0'))
@@ -158,7 +177,10 @@ export function generateKCMetadata(
     const kaUri = kaUriFor(ka);
     quads.push(
       mq(kaUri, `${RDF}type`, `${DKG}KnowledgeAsset`, metaGraph),
-      mq(kaUri, `${DKG}rootEntity`, ka.rootEntity, metaGraph),
+      // OT-RFC-43 §10.1 — dual-WRITE the member-entity predicate (legacy
+      // dkg:rootEntity + new dkg:entity) on the per-root label so the rename is
+      // forward-compatible ahead of the reader migration.
+      ...entityMemberQuads(kaUri, ka.rootEntity, metaGraph),
       mq(kaUri, `${DKG}partOf`, ka.kcUal, metaGraph),
       mq(kaUri, `${DKG}tokenId`, intLit(ka.tokenId), metaGraph),
       mq(
@@ -453,6 +475,7 @@ export function generateShareMetadata(
   for (const rootEntity of meta.rootEntities) {
     quads.push(
       mq(subject, `${DKG}rootEntity`, rootEntity, swmMetaGraph),
+      mq(subject, `${DKG}entity`, rootEntity, swmMetaGraph), // OT-RFC-43 §10.1 dual-write
     );
   }
 
@@ -785,6 +808,7 @@ async function _restateKaPartitionLocked(opts: {
       mq(kaUri, `${RDF}type`, `${DKG}KnowledgeAsset`, metaGraph),
       mq(kaUri, `${DKG}partOf`, ual, metaGraph),
       mq(kaUri, `${DKG}rootEntity`, root, metaGraph),
+      mq(kaUri, `${DKG}entity`, root, metaGraph), // OT-RFC-43 §10.1 dual-write
     );
     const privRoot = privateRootByRoot?.get(root);
     if (privRoot && privRoot.length > 0) {
@@ -904,6 +928,7 @@ async function _restateLabelGraphForUpdateLocked(opts: {
   });
   for (const ka of kaSubjects) {
     await store.deleteByPattern({ graph: metaGraph, subject: ka, predicate: `${DKG}rootEntity` });
+    await store.deleteByPattern({ graph: metaGraph, subject: ka, predicate: `${DKG}entity` }); // OT-RFC-43 §10.1 dual-write cleanup
     await store.deleteByPattern({ graph: metaGraph, subject: ka, predicate: `${DKG}privateMerkleRoot` });
   }
   // If the update SHRANK the root count, the surplus ka subjects must be
@@ -921,7 +946,7 @@ async function _restateLabelGraphForUpdateLocked(opts: {
     const root = newRoots[i];
     const existing = kaSubjects[i];
     const ka = existing ?? `${ual}/${i + 1}`;
-    metaQuads.push(mq(ka, `${DKG}rootEntity`, root, metaGraph));
+    metaQuads.push(...entityMemberQuads(ka, root, metaGraph));
     if (!existing) {
       metaQuads.push(
         mq(ka, `${RDF}type`, `${DKG}KnowledgeAsset`, metaGraph),
@@ -1210,7 +1235,7 @@ export function generateAssertionPromotedMetadata(meta: AssertionPromotedMeta): 
     mq(eventUri, `${DKG}shareOperationId`, lit(meta.shareOperationId), metaGraph),
   ];
   for (const entity of meta.rootEntities) {
-    ins.push(mq(eventUri, `${DKG}rootEntity`, entity, metaGraph));
+    ins.push(...entityMemberQuads(eventUri, entity, metaGraph));
   }
   if (meta.subGraphName) {
     ins.push(mq(subject, `${DKG}subGraphName`, lit(meta.subGraphName), metaGraph));

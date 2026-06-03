@@ -110,6 +110,15 @@ export class DashboardDB {
     this.db = new Database(dbPath);
     this.db.pragma('journal_mode = WAL');
     this.db.pragma('synchronous = NORMAL');
+    // Cap the persisted WAL file. A PASSIVE autocheckpoint resets WAL
+    // frames but leaves the -wal file at its high-water mark, so a node
+    // that once took a heavy write burst (e.g. the pre-rc.14 sync-page
+    // idempotency firehose) keeps a multi-GB -wal on disk forever. With
+    // journal_size_limit set, checkpoints truncate the file back to this
+    // cap. Per-connection setting (not persisted), so it is re-applied on
+    // every open. 64 MiB leaves headroom above the ~4 MiB default
+    // autocheckpoint while bounding the worst case.
+    this.db.pragma('journal_size_limit = 67108864');
     this.migrate();
     this.loadRetentionSetting();
     this.prune();
@@ -772,6 +781,20 @@ export class DashboardDB {
         // VACUUM requires an exclusive lock. If another connection is
         // holding the DB open we skip and retry on the next prune.
       }
+    }
+
+    // Return the WAL file itself to the OS. journal_size_limit bounds it
+    // in steady state, but a TRUNCATE checkpoint here shrinks it promptly
+    // on the prune cadence (~6h) and immediately after the VACUUM above,
+    // which rewrites the whole DB through the WAL and momentarily grows
+    // it. Runs unconditionally — independent of the VACUUM gate — because
+    // an idle node still wants its -wal reclaimed. Best-effort: a
+    // concurrent reader can leave the checkpoint `busy` (no truncate),
+    // which is harmless and retried on the next prune.
+    try {
+      this.db.pragma('wal_checkpoint(TRUNCATE)');
+    } catch {
+      // Same rationale as the VACUUM skip above — never block prune.
     }
   }
 

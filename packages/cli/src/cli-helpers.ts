@@ -194,15 +194,34 @@ async function loadQuadsFromInput(
  * slots from a pre-rc.12 install would keep running the stale slot
  * forever even after `npm install -g` updated the global.
  */
+/**
+ * Absolute path to THIS CLI's own entrypoint module, used to respawn the
+ * daemon worker. `resolveDaemonEntryPoint` lives in `cli-helpers`, a sibling
+ * of the entry module (`cli.ts` → `cli.js` after `tsc`), so the entry is
+ * resolved relative to this file and the extension that actually exists is
+ * picked: a built install runs `cli.js`, while running from source (tsx /
+ * ts-node) runs `cli.ts`. Hardcoding `.js` would respawn a nonexistent
+ * `src/cli.js` under source mode (#962 review). This mirrors the pre-split
+ * behavior where the helper lived in `cli.ts` and returned its own
+ * `import.meta.url` — i.e. the real current entrypoint in either mode.
+ */
+function cliEntryPointPath(): string {
+  const builtEntry = fileURLToPath(new URL('./cli.js', import.meta.url));
+  if (existsSync(builtEntry)) return builtEntry;
+  const sourceEntry = fileURLToPath(new URL('./cli.ts', import.meta.url));
+  if (existsSync(sourceEntry)) return sourceEntry;
+  return builtEntry;
+}
+
 function resolveDaemonEntryPoint(): string {
-  if (process.env.DKG_NO_BLUE_GREEN) return fileURLToPath(new URL('./cli.js', import.meta.url));
-  if (readNodeRoleFromConfigSync() === 'edge') return fileURLToPath(new URL('./cli.js', import.meta.url));
+  if (process.env.DKG_NO_BLUE_GREEN) return cliEntryPointPath();
+  if (readNodeRoleFromConfigSync() === 'edge') return cliEntryPointPath();
   const rDir = releasesDir();
   if (existsSync(rDir)) {
     const entry = slotEntryPoint(join(rDir, 'current'));
     if (entry) return entry;
   }
-  return fileURLToPath(new URL('./cli.js', import.meta.url));
+  return cliEntryPointPath();
 }
 
 function probeHostForApiHost(apiHost: string | undefined): string {

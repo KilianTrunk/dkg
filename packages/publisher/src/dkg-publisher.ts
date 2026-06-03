@@ -3270,6 +3270,14 @@ export class DKGPublisher implements Publisher {
     }));
   }
 
+  /**
+   * @deprecated Use {@link skolemizeByEntity}. Kept as a one-release
+   * compatibility alias for callers that use the public instance method.
+   */
+  autoPartition(quads: Quad[]): KAManifestEntry[] {
+    return this.skolemizeByEntity(quads);
+  }
+
   skolemize(rootEntity: string, quads: Quad[]): Quad[] {
     return skolemize(rootEntity, quads);
   }

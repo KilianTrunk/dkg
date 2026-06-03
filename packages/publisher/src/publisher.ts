@@ -337,5 +337,7 @@ export interface Publisher {
   publish(options: PublishOptions): Promise<PublishResult>;
   update(kaId: bigint, options: PublishOptions): Promise<PublishResult>;
   skolemizeByEntity(quads: Quad[]): KAManifestEntry[];
+  /** @deprecated Use skolemizeByEntity. */
+  autoPartition(quads: Quad[]): KAManifestEntry[];
   skolemize(rootEntity: string, quads: Quad[]): Quad[];
 }

@@ -5,6 +5,7 @@ import {
   OxigraphStore,
   OxigraphWorkerStore,
   type Quad,
+  type QueryResult,
 } from '../packages/storage/src/index.ts';
 import { benchAsyncWithHooks } from './support/esbench-case-hooks.ts';
 
@@ -46,7 +47,7 @@ type Backend = 'inprocess' | 'worker';
 interface ReadStore {
   insert(quads: Quad[]): Promise<void>;
   delete(quads: Quad[]): Promise<void>;
-  query(sparql: string): Promise<unknown>;
+  query(sparql: string): Promise<QueryResult>;
   close(): Promise<void>;
 }
 
@@ -71,6 +72,25 @@ const INSERT_CHUNK = 1_000;
 
 function errorText(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+// Result-shape guards so the benchmark FAILS (rather than reporting a healthy
+// latency) if setup regressed and the store is empty or the read path changed.
+function assertNonEmptySelect(result: QueryResult, label: string): void {
+  if (result.type !== 'bindings' || result.bindings.length === 0) {
+    throw new Error(`${label} returned no bindings — store empty or read path regressed`);
+  }
+}
+
+function assertCountAtLeast(result: QueryResult, min: number, label: string): void {
+  if (result.type !== 'bindings' || result.bindings.length === 0) {
+    throw new Error(`${label} returned no count row — read path regressed`);
+  }
+  // Count comes back as an RDF integer literal, e.g. `"1000"^^<…#integer>`.
+  const count = Number.parseInt(String(result.bindings[0]['c'] ?? '').replace(/^"/, ''), 10);
+  if (!Number.isFinite(count) || count < min) {
+    throw new Error(`${label} count ${count} below expected minimum ${min} — store under-populated or read path regressed`);
+  }
 }
 
 function makeQuads(count: number, offset: number): Quad[] {
@@ -100,7 +120,16 @@ function workerArtifactAvailable(): boolean {
 function resolveBackends(): Backend[] {
   const raw = process.env.DKG_BENCH_STORE_BACKENDS?.trim();
   if (!raw) {
-    return workerArtifactAvailable() ? ['inprocess', 'worker'] : ['inprocess'];
+    if (workerArtifactAvailable()) return ['inprocess', 'worker'];
+    // Loud, because the worker backend is the one this regression is about — a
+    // silent inprocess-only run would look like it measured the production path.
+    console.warn(
+      '[store-read-latency] worker backend SKIPPED (compiled adapter missing) — ' +
+        'measuring `inprocess` idle read latency ONLY, NOT the production write-contention path. ' +
+        'Run `pnpm --filter @origintrail-official/dkg-storage build` (or `pnpm bench:store-read`, ' +
+        'which builds it) to include the worker backend.',
+    );
+    return ['inprocess'];
   }
   const known = new Set<Backend>(['inprocess', 'worker']);
   const requested = raw.split(',').map((p) => p.trim().toLowerCase()).filter(Boolean);
@@ -193,15 +222,22 @@ export default defineSuite({
     // store is still closed (and any worker thread terminated) even if the
     // population below throws.
     scene.teardown(async () => {
+      let stopErr: unknown;
       try {
         await stopWriter();
-      } finally {
-        try {
-          await store.close();
-        } catch {
-          /* best-effort close */
-        }
+      } catch (err) {
+        stopErr = err; // capture; still close the store below
       }
+      // `close()` is the only place the worker thread is joined, so a failure
+      // here is a real teardown bug — surface it (log + reject) rather than
+      // swallow it and let a broken worker benchmark look green.
+      try {
+        await store.close();
+      } catch (closeErr) {
+        console.error(`[store-read-latency] store.close() failed (worker thread may not have joined): ${errorText(closeErr)}`);
+        throw closeErr;
+      }
+      if (stopErr !== undefined) throw stopErr;
     });
 
     // Pre-populate the base graph the reads scan.
@@ -210,11 +246,11 @@ export default defineSuite({
     }
 
     benchAsyncWithHooks(scene, 'read LIMIT 1 (idle)', async () => {
-      await store.query(READ_LIMIT1);
+      assertNonEmptySelect(await store.query(READ_LIMIT1), 'read LIMIT 1');
     }, {});
 
     benchAsyncWithHooks(scene, 'read getTotalTriples (idle)', async () => {
-      await store.query(READ_TOTAL_TRIPLES);
+      assertCountAtLeast(await store.query(READ_TOTAL_TRIPLES), quadCount, 'read getTotalTriples');
     }, {});
 
     // Contention is meaningful only on the worker backend (see file docstring):
@@ -262,14 +298,14 @@ export default defineSuite({
     };
 
     benchAsyncWithHooks(scene, 'read LIMIT 1 (under write load)', async () => {
-      await store.query(READ_LIMIT1);
+      assertNonEmptySelect(await store.query(READ_LIMIT1), 'read LIMIT 1');
       if (writerError !== undefined) {
         throw new Error(`background writer died during the measurement: ${errorText(writerError)}`);
       }
     }, { beforeIteration: startWriter, afterIteration: stopWriter });
 
     benchAsyncWithHooks(scene, 'read getTotalTriples (under write load)', async () => {
-      await store.query(READ_TOTAL_TRIPLES);
+      assertCountAtLeast(await store.query(READ_TOTAL_TRIPLES), quadCount, 'read getTotalTriples');
       if (writerError !== undefined) {
         throw new Error(`background writer died during the measurement: ${errorText(writerError)}`);
       }

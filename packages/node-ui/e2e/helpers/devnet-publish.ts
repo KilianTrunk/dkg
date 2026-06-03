@@ -253,6 +253,14 @@ export async function publishToVm(opts: {
   assertionName: string;
   nodeNum?: number;
   clearAfter?: boolean;
+  /**
+   * Tolerate a 207 partial publish (SWM/VM landed but the context-graph mirror
+   * failed). OFF by default — see the 207 handling below. No current caller
+   * needs this; it exists as a deliberate, greppable escape hatch so a future
+   * spec that specifically exercises the partial-publish path can opt in rather
+   * than silently inheriting it.
+   */
+  allowPartial?: boolean;
 }): Promise<{ httpStatus: number; status?: string; kaId?: string; txHash?: string; contextGraphError?: string }> {
   const res = await devnetApiFetch('/api/shared-memory/publish', {
     method: 'POST',
@@ -266,12 +274,20 @@ export async function publishToVm(opts: {
   if (!res.ok) {
     throw new Error(`publish failed: ${res.status} ${await res.text()}`);
   }
-  // NB: `res.ok` is true for 207 too. The daemon returns 207 when the SWM/VM
-  // publish itself succeeded but the context-graph mirror failed
-  // (`result.contextGraphError`) — a PARTIAL publish. We surface both the raw
-  // http status and the error string so callers that care (the full-pipeline
-  // verifier) can reject a 207 instead of treating it as a clean pass.
   const body = (await res.json()) as { status?: string; kaId?: string; txHash?: string; contextGraphError?: string };
+  // `res.ok` is true for 207 too. The daemon returns 207 when the SWM/VM publish
+  // itself succeeded but the context-graph mirror failed (`contextGraphError`) —
+  // a PARTIAL publish. That is exactly the kind of false-green this lane is meant
+  // to catch, so REJECT it here by default: a centralized throw protects every
+  // caller (the global-setup VM seed, the conviction + messaging specs, …) at
+  // once, instead of relying on each one to remember to inspect `httpStatus`.
+  // Callers that genuinely want a partial publish pass `allowPartial: true`.
+  if (res.status === 207 && !opts.allowPartial) {
+    throw new Error(
+      `publish partial (HTTP 207) — SWM/VM publish landed but the context-graph ` +
+        `mirror failed: ${body.contextGraphError ?? 'unknown contextGraphError'}`,
+    );
+  }
   return { httpStatus: res.status, ...body };
 }
 

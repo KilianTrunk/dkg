@@ -66,9 +66,11 @@ test.describe('WM → SWM → VM API pipeline', () => {
     run.kaId = result.kaId;
 
     // 207 = the SWM/VM publish landed but the context-graph mirror failed
-    // (`contextGraphError`) — a PARTIAL publish. publishToVm only gates on
-    // `res.ok`, which is true for 207 too, so without this the full-pipeline
-    // verifier would treat a partial publish as a clean pass.
+    // (`contextGraphError`) — a PARTIAL publish. publishToVm now REJECTS a 207 by
+    // default (it would have thrown above before returning), so reaching this
+    // point already guarantees a clean publish. We assert it here too as an
+    // explicit, readable contract for this headline pipeline test — and as a
+    // tripwire if anyone ever flips the helper's default to tolerate partials.
     expect(result.contextGraphError, `VM publish was partial (HTTP ${result.httpStatus}): ${result.contextGraphError}`).toBeFalsy();
     expect(result.httpStatus, 'VM publish should be a clean 200, not a 207 partial').toBe(200);
 

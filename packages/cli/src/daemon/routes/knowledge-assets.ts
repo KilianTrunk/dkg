@@ -151,13 +151,21 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
       }
       if (verb === "pull-from") {
         // Net-new primitive (the git-checkout equivalent): seed a fresh WM
-        // draft from the current SWM or VM state, with onConflict semantics
-        // for a dirty draft. Implemented in a focused follow-up — it needs the
-        // per-layer entity-scoped gather + conflict handling (OT-RFC-43 §10.5.3).
-        return jsonResponse(res, 501, {
-          error: "wm/pull-from is not implemented yet (OT-RFC-43 §10.5.3 — follow-up)",
-          layer: parsed.layer,
-        });
+        // draft from the current SWM or VM state (OT-RFC-43 §10.5.3).
+        const sourceLayer = parsed.layer;
+        if (sourceLayer !== "swm" && sourceLayer !== "vm") {
+          return jsonResponse(res, 400, { error: 'pull-from requires "layer": "swm" | "vm"' });
+        }
+        const onConflict = parsed.onConflict === "replace" ? "replace" : "reject";
+        try {
+          const result = await agent.assertion.pullFrom(contextGraphId, name, sourceLayer, { subGraphName, onConflict });
+          return jsonResponse(res, 200, { wmDraft: "open", seededFrom: { layer: sourceLayer }, ...result });
+        } catch (e: any) {
+          if (e?.code === "WM_DRAFT_CONFLICT") {
+            return jsonResponse(res, 409, { code: "WM_DRAFT_CONFLICT", error: e.message });
+          }
+          throw e; // -> outer catch -> 500
+        }
       }
     }
 

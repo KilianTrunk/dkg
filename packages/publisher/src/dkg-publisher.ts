@@ -3985,6 +3985,90 @@ export class DKGPublisher implements Publisher {
     return result.type === 'quads' ? result.quads : [];
   }
 
+  /**
+   * OT-RFC-43 §10.5.3 — `wm/pull-from`: seed a fresh WM draft from this file's
+   * current SWM or VM state (the `git checkout origin/<branch>` equivalent).
+   *
+   * WM is the only writable surface; to edit content that already lives in SWM
+   * or VM you pull it into a new WM draft, edit, then re-share / re-publish.
+   * The file's entity set is read from the assertion seal (on the lifecycle
+   * URN); the source layer's quads for those entities (+ their skolemized
+   * children) are gathered and written into a fresh WM draft.
+   *
+   * `onConflict` applies only when the WM draft already holds content:
+   *   - 'reject' (default): throw `WM_DRAFT_CONFLICT` — the caller decides.
+   *   - 'replace': discard the open draft, then seed fresh (git force-checkout).
+   */
+  async assertionPullFrom(
+    contextGraphId: string,
+    name: string,
+    agentAddress: string,
+    sourceLayer: 'swm' | 'vm',
+    opts?: { subGraphName?: string; onConflict?: 'reject' | 'replace' },
+  ): Promise<{ seeded: number; fromLayer: 'swm' | 'vm'; entities: number }> {
+    DKGPublisher.validateOptionalSubGraph(opts?.subGraphName);
+    const subGraphName = opts?.subGraphName;
+    const wmGraph = contextGraphAssertionUri(contextGraphId, agentAddress, name, subGraphName);
+    const metaGraph = contextGraphMetaUri(contextGraphId);
+    const lifecycleSubject = assertionLifecycleUri(contextGraphId, agentAddress, name, subGraphName);
+    const sourceGraph = sourceLayer === 'swm'
+      ? this.graphManager.sharedMemoryUri(contextGraphId, subGraphName)
+      : this.graphManager.dataGraphUri(contextGraphId);
+
+    // onConflict: refuse to clobber a dirty WM draft unless told to replace it.
+    const draftProbe = await this.store.query(`ASK { GRAPH <${wmGraph}> { ?s ?p ?o } }`);
+    const hasDraft = draftProbe.type === 'boolean' && draftProbe.value === true;
+    if (hasDraft) {
+      const onConflict = opts?.onConflict ?? 'reject';
+      if (onConflict === 'reject') {
+        throw Object.assign(
+          new Error(`A WM draft already exists for "${name}" in context graph "${contextGraphId}"; pass onConflict:"replace" to overwrite it.`),
+          { code: 'WM_DRAFT_CONFLICT' },
+        );
+      }
+      await this.store.dropGraph(wmGraph); // 'replace' — git force-checkout
+    }
+
+    // Resolve the file's member entities from the seal (dual-read the predicate
+    // rename: dkg:assertionRootEntity OR dkg:assertionEntity, OT-RFC-43 §10.1).
+    const entityRes = await this.store.query(
+      `SELECT DISTINCT ?e WHERE { GRAPH <${metaGraph}> {
+         <${lifecycleSubject}> (<http://dkg.io/ontology/assertionRootEntity>|<http://dkg.io/ontology/assertionEntity>) ?e .
+       } }`,
+    );
+    const entities = entityRes.type === 'bindings'
+      ? [...new Set(entityRes.bindings.map((b) => b['e']).filter(Boolean) as string[])]
+      : [];
+    if (entities.length === 0) {
+      throw new Error(
+        `No sealed entity list for "${name}" in context graph "${contextGraphId}" — pull-from `
+        + `requires a finalized assertion (its seal records the member entities).`,
+      );
+    }
+
+    // Gather the source-layer quads scoped to the entity set + skolem children
+    // (same filter the publish gather / RS prover use), minus trust/ownership
+    // bookkeeping that never belongs in a working draft.
+    const values = entities.map((e) => `<${e}>`).join(' ');
+    const gather = await this.store.query(
+      `CONSTRUCT { ?s ?p ?o } WHERE { GRAPH <${sourceGraph}> {
+         VALUES ?root { ${values} }
+         ?s ?p ?o .
+         FILTER(?s = ?root || STRSTARTS(STR(?s), CONCAT(STR(?root), "/.well-known/genid/")))
+       } }`,
+    );
+    const gathered = gather.type === 'quads'
+      ? gather.quads.filter((q) => !isTrustLevelQuad(q) && q.predicate !== WORKSPACE_OWNER_PREDICATE)
+      : [];
+
+    // Open a fresh WM draft (clears stale lifecycle/seal) and seed it.
+    await this.assertionCreate(contextGraphId, name, agentAddress, subGraphName);
+    if (gathered.length > 0) {
+      await this.assertionWrite(contextGraphId, name, agentAddress, gathered, subGraphName);
+    }
+    return { seeded: gathered.length, fromLayer: sourceLayer, entities: entities.length };
+  }
+
   async assertionPromote(
     contextGraphId: string,
     name: string,

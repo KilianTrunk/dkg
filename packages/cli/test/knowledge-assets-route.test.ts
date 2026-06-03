@@ -91,6 +91,7 @@ function makeAssertionAgent(over: Record<string, any> = {}) {
     promote: vi.fn(async () => ({ promotedCount: 3 })),
     discard: vi.fn(async () => undefined),
     history: vi.fn(async () => ({ state: 'created', memoryLayer: 'WorkingMemory' })),
+    pullFrom: vi.fn(async () => ({ seeded: 5, fromLayer: 'vm', entities: 2 })),
     ...(assertionOver ?? {}),
   };
   return {
@@ -186,11 +187,32 @@ describe('GitHub-shaped /api/knowledge-assets routes (OT-RFC-43 §10.5)', () => 
     expect(body(ctx)).toMatchObject({ state: 'created', memoryLayer: 'WorkingMemory' });
   });
 
-  it('POST .../:name/wm/pull-from is 501 (net-new, follow-up)', async () => {
+  it('POST .../:name/wm/pull-from seeds a draft from the given layer', async () => {
     const agent = makeAssertionAgent();
     const ctx = ctxFor('POST', '/api/knowledge-assets/f/wm/pull-from', { contextGraphId: 'cg', layer: 'vm' }, agent);
     await handleKnowledgeAssetsRoutes(ctx);
-    expect(status(ctx)).toBe(501);
+    expect(status(ctx)).toBe(200);
+    expect(body(ctx)).toMatchObject({ wmDraft: 'open', seededFrom: { layer: 'vm' }, seeded: 5 });
+    expect(agent.assertion.pullFrom).toHaveBeenCalledWith('cg', 'f', 'vm', { subGraphName: undefined, onConflict: 'reject' });
+  });
+
+  it('POST .../:name/wm/pull-from requires a valid layer', async () => {
+    const agent = makeAssertionAgent();
+    const ctx = ctxFor('POST', '/api/knowledge-assets/f/wm/pull-from', { contextGraphId: 'cg' }, agent);
+    await handleKnowledgeAssetsRoutes(ctx);
+    expect(status(ctx)).toBe(400);
+  });
+
+  it('POST .../:name/wm/pull-from maps a dirty-draft conflict to 409', async () => {
+    const agent = makeAssertionAgent({
+      assertion: {
+        pullFrom: vi.fn(async () => { throw Object.assign(new Error('draft exists'), { code: 'WM_DRAFT_CONFLICT' }); }),
+      },
+    });
+    const ctx = ctxFor('POST', '/api/knowledge-assets/f/wm/pull-from', { contextGraphId: 'cg', layer: 'swm' }, agent);
+    await handleKnowledgeAssetsRoutes(ctx);
+    expect(status(ctx)).toBe(409);
+    expect(body(ctx)).toMatchObject({ code: 'WM_DRAFT_CONFLICT' });
   });
 
   it('ignores non-/api/knowledge-assets paths', async () => {

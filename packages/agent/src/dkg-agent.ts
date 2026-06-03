@@ -1520,6 +1520,15 @@ export class DKGAgent extends DKGAgentBase {
       async query(contextGraphId: string, name: string, opts?: { subGraphName?: string }): Promise<import('@origintrail-official/dkg-storage').Quad[]> {
         return agent.publisher.assertionQuery(contextGraphId, name, agentAddress, opts?.subGraphName);
       },
+      /** OT-RFC-43 §10.5.3 — seed a fresh WM draft from this file's SWM/VM state. */
+      async pullFrom(
+        contextGraphId: string,
+        name: string,
+        sourceLayer: 'swm' | 'vm',
+        opts?: { subGraphName?: string; onConflict?: 'reject' | 'replace' },
+      ): Promise<{ seeded: number; fromLayer: 'swm' | 'vm'; entities: number }> {
+        return agent.publisher.assertionPullFrom(contextGraphId, name, agentAddress, sourceLayer, opts);
+      },
       async promote(contextGraphId: string, name: string, opts?: { entities?: string[] | 'all'; subGraphName?: string }): Promise<{ promotedCount: number }> {
         // Resolve the gossip signer up-front (mirrors `share()` /
         // `conditionalShare()` patterns) so the publisher can wrap the

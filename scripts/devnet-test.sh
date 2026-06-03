@@ -2,6 +2,7 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+CORE_CONSTANTS_TS="$SCRIPT_DIR/../packages/core/src/constants.ts"
 if [[ -n "${DKG_AUTH:-}" ]]; then
   AUTH="$DKG_AUTH"
 elif [[ -f "$SCRIPT_DIR/../.devnet/node1/auth.token" ]]; then
@@ -118,6 +119,11 @@ except: print('__ERR__')
 check() {
   local desc="$1" actual="$2" expected="$3"
   if [[ "$actual" == "$expected" ]]; then ok "$desc"; else fail "$desc (expected=$expected, got=$actual)"; fi
+}
+
+protocol_const() {
+  local const_name="$1"
+  sed -nE "s|^export const ${const_name} = '([^']+)';$|\1|p" "$CORE_CONSTANTS_TS" 2>/dev/null | head -n 1
 }
 
 # P1-3: Safe count helper. Replaces the pervasive
@@ -806,9 +812,13 @@ echo "--- 14c: Query the assertion ---"
 ASSERT_QUERY=$(c -X POST "http://127.0.0.1:9201/api/assertion/devnet-draft/query" -d "{
   \"contextGraphId\":\"$ASSERT_CG\"
 }")
-ASSERT_Q_CT=$(echo "$ASSERT_QUERY" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(len(d.get("quads",d.get("result",[]))))' 2>/dev/null || echo "0")
-echo "  Assertion has $ASSERT_Q_CT quads"
-[[ "$ASSERT_Q_CT" -ge 1 ]] && ok "Assertion query returned $ASSERT_Q_CT quads" || fail "Assertion query returned 0 quads"
+ASSERT_Q_CT=$(safe_quads_count "$ASSERT_QUERY")
+if [[ "$ASSERT_Q_CT" == "PARSE_ERR" ]]; then
+  fail "Assertion query returned unparseable response: ${ASSERT_QUERY:0:200}"
+else
+  echo "  Assertion has $ASSERT_Q_CT quads"
+  [[ "$ASSERT_Q_CT" -ge 1 ]] && ok "Assertion query returned $ASSERT_Q_CT quads" || fail "Assertion query returned 0 quads"
+fi
 
 echo "--- 14d: Promote the assertion to SWM ---"
 ASSERT_PROMOTE=$(c -X POST "http://127.0.0.1:9201/api/assertion/devnet-draft/promote" -d "{
@@ -825,8 +835,12 @@ SWM_CHECK=$(c -X POST "http://127.0.0.1:9201/api/query" -d "{
   \"contextGraphId\":\"$ASSERT_CG\",
   \"graphSuffix\":\"_shared_memory\"
 }")
-SWM_CT=$(echo "$SWM_CHECK" | python3 -c 'import sys,json;print(len(json.load(sys.stdin).get("result",{}).get("bindings",[])))' 2>/dev/null || echo "0")
-[[ "$SWM_CT" -ge 1 ]] && ok "Promoted data visible in SWM" || fail "Promoted data not in SWM ($SWM_CT)"
+SWM_CT=$(safe_bindings_count "$SWM_CHECK")
+if [[ "$SWM_CT" == "PARSE_ERR" ]]; then
+  fail "Promoted-data SWM query returned unparseable response: ${SWM_CHECK:0:200}"
+else
+  [[ "$SWM_CT" -ge 1 ]] && ok "Promoted data visible in SWM" || fail "Promoted data not in SWM ($SWM_CT)"
+fi
 
 echo "--- 14f: Create and immediately discard another assertion ---"
 c -X POST "http://127.0.0.1:9201/api/assertion/create" -d "{\"contextGraphId\":\"$ASSERT_CG\",\"name\":\"discard-me\"}" > /dev/null
@@ -840,12 +854,19 @@ echo "$DISCARD_RESP" | grep -qi "error" && fail "Discard failed: $DISCARD_RESP" 
 echo "--- 14g: Promoted assertion gossips to other nodes ---"
 sleep 4
 for p in 9202 9203 9204; do
-  GOS_CT=$(c -X POST "http://127.0.0.1:$p/api/query" -d "{
+  GOS_RESP=$(c -X POST "http://127.0.0.1:$p/api/query" -d "{
     \"sparql\":\"SELECT ?name WHERE { <urn:devnet:assert:entity1> <http://schema.org/name> ?name }\",
     \"contextGraphId\":\"$ASSERT_CG\",
     \"graphSuffix\":\"_shared_memory\"
-  }" | python3 -c 'import sys,json;print(len(json.load(sys.stdin).get("result",{}).get("bindings",[])))' 2>/dev/null || echo "0")
-  [[ "$GOS_CT" -ge 1 ]] && ok "Promoted data gossiped to Node $p" || warn "Promoted data not on Node $p ($GOS_CT)"
+  }")
+  GOS_CT=$(safe_bindings_count "$GOS_RESP")
+  if [[ "$GOS_CT" == "PARSE_ERR" ]]; then
+    warn "Promoted-data gossip query to Node $p returned unparseable response: ${GOS_RESP:0:120}"
+  elif [[ "$GOS_CT" -ge 1 ]]; then
+    ok "Promoted data gossiped to Node $p"
+  else
+    warn "Promoted data not on Node $p ($GOS_CT)"
+  fi
 done
 
 #------------------------------------------------------------
@@ -934,8 +955,14 @@ SG_GOS=$(c -X POST "http://127.0.0.1:9203/api/query" -d "{
   \"subGraphName\":\"test-assertions\",
   \"graphSuffix\":\"_shared_memory\"
 }")
-SG_GOS_CT=$(echo "$SG_GOS" | python3 -c 'import sys,json;print(len(json.load(sys.stdin).get("result",{}).get("bindings",[])))' 2>/dev/null || echo "0")
-[[ "$SG_GOS_CT" -ge 1 ]] && ok "Sub-graph assertion gossiped to Node3" || warn "Sub-graph assertion not on Node3 ($SG_GOS_CT)"
+SG_GOS_CT=$(safe_bindings_count "$SG_GOS")
+if [[ "$SG_GOS_CT" == "PARSE_ERR" ]]; then
+  warn "Sub-graph gossip query to Node3 returned unparseable response: ${SG_GOS:0:120}"
+elif [[ "$SG_GOS_CT" -ge 1 ]]; then
+  ok "Sub-graph assertion gossiped to Node3"
+else
+  warn "Sub-graph assertion not on Node3 ($SG_GOS_CT)"
+fi
 
 #------------------------------------------------------------
 echo ""
@@ -3012,27 +3039,34 @@ fi
 section_done
 
 #------------------------------------------------------------
-section_start "SECTION 33: rc.9 — substrate protocols negotiated on the wire (/dkg/10.0.1/*)"
+section_start "SECTION 33: rc.9/rc.14 — wire protocols negotiated"
 # rc.9 bumped 8+ short-message protocols from /dkg/10.0.0/* to
-# /dkg/10.0.1/*. A devnet-wide mismatch (one node still on 10.0.0)
-# would manifest as silently queued substrate messages. The peerStore
-# protocols list returned by /api/peer-info?peerId=<X> proves the
-# identify handshake advertised the rc.9 prefix on both sides.
+# /dkg/10.0.1/*; rc.14 bumps PROTOCOL_SYNC again when sync leaves the
+# messenger substrate. A devnet-wide mismatch (one node still on an
+# older wire ID) would manifest as silently queued substrate messages
+# or skipped sync. The peerStore protocols list returned by
+# /api/peer-info?peerId=<X> proves the identify handshake advertised
+# the expected protocol IDs on both sides.
 if [[ "$SKIP_RC9_SUBSTRATE" == "1" ]]; then
   skip "SECTION 33: skipped via SKIP_RC9_SUBSTRATE=1"
 elif [[ "$NUM_NODES" -lt 2 ]]; then
   skip "SECTION 33: need ≥2 nodes (have $NUM_NODES)"
 else
-  # rc.9 substrate protocol IDs we expect to see on every healthy
+  # Wire protocol IDs we expect to see on every healthy
   # peer. PROTOCOL_ACCESS (/dkg/10.0.1/private-access) is registered
   # unconditionally by DKGAgent.start() — round-3 Codex fix corrects
   # the earlier mistaken comment that claimed it was conditional.
   # /dkg/10.0.1/storage-ack is core-only — DKGAgent.start() registers
   # it under `if (effectiveRole === 'core')` (round-4 Codex fix), so
   # it's expected only when the TARGET is a core node.
+  PROTOCOL_SYNC_EXPECTED="$(protocol_const PROTOCOL_SYNC)"
+  if [[ -z "$PROTOCOL_SYNC_EXPECTED" ]]; then
+    fail "PROTOCOL_SYNC unreadable from packages/core/src/constants.ts — cannot verify sync protocol advertisement"
+    PROTOCOL_SYNC_EXPECTED="__MISSING_PROTOCOL_SYNC__"
+  fi
   EXPECTED_UNIVERSAL=(
     "/dkg/10.0.1/message"
-    "/dkg/10.0.1/sync"
+    "$PROTOCOL_SYNC_EXPECTED"
     "/dkg/10.0.1/swm-update"
     "/dkg/10.0.1/swm-share-ack"
     "/dkg/10.0.1/swm-sender-key"
@@ -3070,7 +3104,7 @@ else
     target_peer=${TARGET_PEER_IDS[$j]}
     target_role=${TARGET_NODE_ROLES[$j]}
     if [[ -z "$target_peer" || "$target_peer" == "__NONE__" || "$target_peer" == "__ERR__" ]]; then
-      fail "N$((j+1)) ($target_port) peerId unreadable via /api/info — cannot verify substrate protocol advertisements"
+      fail "N$((j+1)) ($target_port) peerId unreadable via /api/info — cannot verify wire protocol advertisements"
     fi
     if [[ -z "$target_role" || "$target_role" == "__NONE__" || "$target_role" == "__ERR__" ]]; then
       fail "N$((j+1)) ($target_port) nodeRole unreadable via /api/info — cannot decide expected core-only protocols"
@@ -3126,7 +3160,7 @@ except Exception:
         fi
       done
       if [[ ${#missing[@]} -eq 0 ]]; then
-        ok "N$((i+1)) ($observer_port) sees N$((j+1)) ($target_port, $target_role) advertising all ${#expected_for_target[@]} substrate protocols"
+        ok "N$((i+1)) ($observer_port) sees N$((j+1)) ($target_port, $target_role) advertising all ${#expected_for_target[@]} expected wire protocols"
       else
         fail "N$((i+1)) ($observer_port) does NOT see N$((j+1)) ($target_port, $target_role) advertising: ${missing[*]} (peerStore.protocols mismatch — possible wire-prefix drift)"
       fi

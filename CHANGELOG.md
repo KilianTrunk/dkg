@@ -4,6 +4,123 @@ All notable changes to the DKG V9 node are documented here. The format is based 
 
 ## [Unreleased]
 
+### Fixed — `dkg init` on monorepo checkouts + oxigraph-server default for adapter/MCP setups (#960)
+
+- **`dkg init` runs from a monorepo / checkout clone again** (`packages/cli/src/cli.ts`). PR #753 (RFC-41 Bundle B1c) hard-refused `dkg init` from a monorepo checkout; that was over-strict — the CLI's home resolver (`dkgDir()` → `resolveDkgConfigHome`) already routes a clone to `~/.dkg-dev` (kept separate from an npm install's `~/.dkg`), the same home the local dev daemon resolves, so there was no real risk of divergence. The hard refusal (and its non-functional `DKG_HOME` escape) is replaced by a one-line notice showing which home is being written. Restores the pre-#753 dev workflow: a clone runs `dkg init` exactly like an npm install, differing only in the home directory.
+- **OpenClaw / Hermes / MCP setups now seed the `oxigraph-server` default on a fresh node** (`packages/core/src/ensure-dkg-node-config.ts`). The rc.15 `oxigraph-server` default previously reached only nodes set up via the `dkg init` store-wizard; the shared `ensureDkgNodeConfig` helper (used by `dkg openclaw/hermes/mcp setup`) left `store` unset, so those nodes fell back to `oxigraph-worker`. It now adopts `oxigraph-server` on a **fresh** install (no existing config) with no explicit store — matching the wizard default — while never rewriting an existing node's backend (which would force a store reset) and preserving any explicit `store` block.
+
+## [10.0.0-rc.15] - 2026-06-03
+
+**Off-chain runtime release.** No Solidity changes since rc.13 — the Base Sepolia (chainId 84532) deployment is **unchanged**, the `chainResetMarker` stays `v10-rc12-ka-rename-2026-06-01`, and **no contract redeploy is required**. The sync protocol ID is **unchanged** (`/dkg/10.0.2/sync`), so rc.15 nodes interoperate with rc.14 peers — nodes upgrade in place with **no local-state wipe**. This release makes `oxigraph-server` the default store backend for **new** installs, fixes the Node UI Working-Memory scoped-query violation (and the SWM/VM bleed + reserved-meta false-positives it surfaced), reclaims the `node-ui.db` WAL on a running node, splits the `DKGAgent` god class into subsystem mixin holders, and lands typed publisher errors plus CI/bench hardening.
+
+### Changed — `oxigraph-server` is now the default triple-store backend for new installs
+
+- **`dkg init` defaults to `oxigraph-server`** (PR #946, `packages/cli/src/store-wizard.ts`): the store-backend menu now lists `oxigraph-server` (daemon-managed local RocksDB server) as the first, recommended option and the default answer; the embedded in-process worker (`oxigraph`) moves to option 2 for minimal-footprint / single-reader nodes. A fresh `dkg init` — or one that accepts the default — writes an explicit `"store": { "backend": "oxigraph-server" }` block, so new nodes get MVCC concurrent reads + incremental persistence out of the box.
+- **The existing fleet is unaffected on auto-update.** The runtime fallback for a config with **no** `store` block stays `oxigraph-worker`, and auto-update never re-runs `dkg init` — so existing nodes keep booting on the embedded worker unchanged. A re-init only flips a **block-less** node (an explicitly-chosen local backend — `oxigraph` / `oxigraph-worker` / `oxigraph-persistent` — is preserved on Enter-through), and even then the daemon's `STORE-SWITCH` guard makes the switch an opt-in (it refuses to start until `DKG_ACCEPT_STORE_RESET=1`) rather than a silent store reset.
+- **Platform note:** new installs fetch the prebuilt `oxigraph` v0.5.8 binary on first boot. The Linux artifacts are glibc-only, so musl hosts (Alpine/distroless) should pick option 2 (`oxigraph`) or an external `sparql-http` endpoint at the `dkg init` prompt.
+
+### Fixed — Node UI Working-Memory layer scoped-query violation
+
+- **Keep scoped `GRAPH` variables top-level in WM layer queries** (PR #944, `packages/node-ui/src/ui/api.ts`, `views/MemoryLayerView.tsx`): the WM layer view and `listWmAssertions` nested `GRAPH ?g` inside a `UNION`, which the scoped local-query guard (PR #749, `constrainGraphVariablesToAllowedSet`) rejects with "GRAPH variables must appear at the top level of scoped local queries". Surfaced as a *"Scoped query violation"* during WM→SWM promotion. The queries now keep both `GRAPH` clauses as top-level WHERE-block siblings and opt into the CG-scoped assertion partitions via `includeContextGraphPartitions`.
+- **No SWM/VM bleed into the WM tab**: widening the allow-list to the assertion partitions also exposes `/_shared_memory` and `/_verified_memory/*`, so `?g` is gated on the `<cg>/_meta` `dkg:memoryLayer "WM"` lifecycle marker (the same authority `listWmAssertions` uses), and the partition opt-in is scoped to the built-in WM query only — not user-typed custom SPARQL.
+- **WM triple-count is best-effort**: a failing count query no longer collapses the whole assertion list to "no assertions"; counts degrade independently.
+- **Match the reserved meta bucket by path shape, not `/_meta` suffix** (PR #948, follow-up to #944): exclude UI-config drafts via `FILTER(!CONTAINS(STR(?g), "/meta/assertion/"))` (plus a parser-level guard) so a legitimate user assertion *named* `_meta` is no longer dropped.
+
+### Fixed — Reclaim `node-ui.db` WAL on a running node
+
+- **WAL reclaim** (PR #945, `packages/node-ui/src/db.ts`): the multi-GB `node-ui.db` WAL left behind by the pre-rc.14 messenger-substrate sync bloat is now reclaimed on a running node, complementing the rc.14 fix that stopped the growth at the source.
+
+### Changed — Internal refactors (no behavior change)
+
+- **`DKGAgent` god class split into subsystem mixin holders** (PR #941, `packages/agent/src/dkg-agent-*.ts`): the monolithic `dkg-agent.ts` is decomposed into per-subsystem mixin modules (boot, lifecycle, publish, query, join, registry, crypto, diagnostics, …) applied via `dkg-agent-apply-mixins.ts`. Pure structural refactor; runtime behavior unchanged.
+- **Typed publisher errors** (PR #949, `packages/publisher/src/errors.ts`): publisher error classes extracted into a dedicated `errors.ts` module.
+
+### Added — Store read-latency benchmark (regression guard for #939)
+
+- **`bench/store-read-latency.bench.ts`** (PR #943) — a new esbench suite that measures real Oxigraph read latency for the two shapes that hung on a saturated node (issue #939): a trivial `SELECT … LIMIT 1` scan and the production `getTotalTriples` `COUNT(*)` aggregate, on an idle store. On the embedded **`worker` backend** (the single-writer store) it additionally measures those reads **under concurrent write load**, quantifying the read-starvation that drove the rc.13 regression and giving a baseline to measure the MVCC `oxigraph-server` backend (now the default for new installs) against. Contention is worker-only by design — the in-process store is single-threaded/synchronous and cannot exhibit true read/write overlap, so it runs the idle baselines only. Backends via `DKG_BENCH_STORE_BACKENDS` (`inprocess` always; `worker` auto-added when its compiled artefact is built, e.g. in CI), sizes via `DKG_BENCH_STORE_SIZES`. Run with `pnpm bench:store-read`; participates in `pnpm bench` / `bench:baseline` / `bench:compare` like the existing suites.
+
+### Changed — Test / CI hardening
+
+- **e2e devnet preconditions fail in CI instead of skipping** (PR #942, `packages/node-ui/e2e`): missing devnet preconditions now fail the job rather than silently skipping, and the suite rejects a 207 partial VM publish by default.
+
+## [10.0.0-rc.14] - 2026-06-02
+
+**Off-chain runtime release.** No Solidity changes since rc.13 — the Base Sepolia (chainId 84532) deployment is **unchanged**, the `chainResetMarker` stays `v10-rc12-ka-rename-2026-06-01`, and **no contract redeploy is required**. Nodes upgrade in place; no local-state wipe. This release fixes the multi-GB `node-ui.db` bloat by taking the sync RPC off the Universal Messenger substrate, adds per-peer exponential backoff to the sync reconciler, adds an **opt-in** daemon-managed local Oxigraph server backend (Release 2, phase 2a), and stops `eth_getLogs` rate-limit failures from surfacing as unhandled process rejections under gossip/finalization verification storms.
+
+> **Wire-compatibility note (hard cutover):** the sync protocol ID is bumped `/dkg/10.0.1/sync` → `/dkg/10.0.2/sync`. An rc.14 node will **not** sync with an rc.13 (or earlier) node and vice versa — mixed-version peers cleanly skip each other (`waitForSyncProtocol`). Because sync is a self-healing eventual-consistency catch-up net (not a primary data path), the brief mixed-version window during a network rollout is **no-data-loss**: once both ends are on rc.14 the next reconnect/reconciler tick backfills.
+
+### Fixed — `node-ui.db` bloat: sync RPC taken off the Universal Messenger substrate
+
+- **Sync no longer writes to `message_idempotency`** (`packages/agent/src/dkg-agent.ts`, `packages/agent/src/sync/responder/sync-handler.ts`, `packages/core/src/constants.ts`). rc.9 PR-E had routed sync through the Universal Messenger substrate "for receiver-side dedup", but the sync requester mints a **fresh `messageId` per attempt**, so the dedup key never repeats — the cache-hit rate is structurally zero while every large, never-reused sync page response was being cached on **both** sides of the `message_idempotency` table. On a long-lived node this grew `node-ui.db` to multiple GB (≈3.1 GB observed, plus a same-size WAL). The responder now registers on the **raw `ProtocolRouter`** and the requester sends via `messenger.sendToPeer` (raw pass-through) instead of `messenger.sendReliable`. Sync already carries its own `withRetry`, a 90s auth-freshness TTL, and per-`requestId` replay protection, so it needs none of the substrate's idempotency/outbox machinery. A regression test pins that `PROTOCOL_SYNC` is registered off the substrate.
+
+### Added — Per-peer exponential backoff for the sync reconciler
+
+- **Sync reconciler backoff** (`packages/agent/src/dkg-agent.ts`, `packages/agent/src/dkg-agent-constants.ts`): a peer that can never be synced (dead, NAT-stuck, or persistently stream-resetting) never stamps `lastSuccessfulSyncAt`, so it read as perpetually stale and was dialed on **every** reconciler tick forever. The reconciler now applies per-peer exponential backoff — `SYNC_BACKOFF_BASE_MS * 2^(failures-1)`, capped at `SYNC_BACKOFF_MAX_MS`, with ±`SYNC_BACKOFF_JITTER` randomisation — that resets the instant a sync succeeds and is cleared on `connection:close`. Only the **periodic reconciler** is gated; `connection:open` and `peer:update` still trigger an immediate attempt, so a newly-reachable peer is never delayed. The failure-record path is guarded against re-creating backoff for a peer that disconnected mid-attempt, and the per-peer backoff/`lastSuccessfulSyncAt` state is surfaced in node diagnostics.
+
+### Added — Opt-in daemon-managed local Oxigraph server (Release 2, phase 2a)
+
+- **`store.backend: 'oxigraph-server'`** (`packages/cli/src/daemon/oxigraph-binary.ts`, `oxigraph-server.ts`, `oxigraph-managed.ts`): a new **opt-in** triple-store backend that runs a daemon-supervised local [Oxigraph](https://github.com/oxigraph/oxigraph) server (RocksDB-backed) instead of the embedded in-process worker. This gives **MVCC concurrent reads** (queries stop blocking on the single writer — the root cause of the slow-CG-create-under-sync-load symptom) and incremental persistence (no O(total-triples) full-dump flush), with the same engine for semantic parity.
+  - **Fetch-on-install**: the daemon downloads the pinned prebuilt `oxigraph` v0.5.8 binary for the host (`process.platform`/`process.arch`), verifies it against a baked-in SHA-256, caches it under `<DKG_HOME>/oxigraph`, marks it executable, and clears the macOS quarantine xattr. No binary is bundled in the npm package (~15–20 MB fetched once per host; the six platform variants would be ~100 MB).
+  - **Supervision**: the daemon spawns `oxigraph serve` bound to loopback (`127.0.0.1`), health-checks it before the agent boots (verifies the spawned child's PID owns the listen port, not merely that something answers HTTP 200), restarts it with capped backoff on unexpected exit, and stops it after the agent during shutdown — with a synchronous best-effort kill registered on process exit so no fatal boot path orphans the server.
+  - **Zero new downstream plumbing**: boot uses a runtime `sparql-http` view of the managed server (the persisted config stays `oxigraph-server`), so config validation, the boot reachability probe, namespace-identity tagging, and chain-reset wipe all reuse the external-backend path unchanged. `managedByDkg: true` is set so chain-reset wipe uses `DROP ALL` on the locally-owned RocksDB.
+  - **Enable it**: set `"store": { "backend": "oxigraph-server" }` in `~/.dkg/config.json`, pass `--store oxigraph-server` to the setup commands, or type `oxigraph-server` at the `dkg init` store prompt. Default backend is **unchanged** (`oxigraph-worker`); switching backends starts on an empty store and requires `DKG_ACCEPT_STORE_RESET=1` on first switch.
+  - **Security**: `oxigraph serve` has no native auth; the security boundary for the managed server is the loopback bind. The endpoint is never exposed off-host.
+  - **Linux caveat**: the prebuilt Linux artifacts are glibc-only (`*_linux_gnu`); musl hosts (Alpine/distroless) must use a system-provided `oxigraph` or an external `sparql-http` endpoint.
+
+### Fixed — Chain RPC read path (`eth_getLogs` rate-limit storm)
+
+- **Disable ethers JSON-RPC request batching on the chain provider** (`packages/chain/src/evm-adapter.ts`, PR #940): under RPC rate limiting a *batched* `eth_getLogs` response is a single whole-batch JSON-RPC error, and ethers' coalesce path rejected on the un-awaited batch-drain promise — surfacing as ~30k unhandled `could not coalesce error` / `over rate limit` process rejections under a gossip/finalization on-chain-verification storm (issue #939). Constructing providers with `batchMaxCount: 1` makes each read its own awaited request whose rejection is caught by the existing `verifyOnChain` try/catch. Transport-only change; the number of `eth_getLogs` operations issued is unchanged.
+
+## [10.0.0-rc.13] - 2026-06-02
+
+**Off-chain stabilization release.** No Solidity changes since rc.12 — the Base Sepolia (chainId 84532) deployment in `packages/evm-module/deployments/base_sepolia_v10_contracts.json` is **unchanged**, the `chainResetMarker` stays `v10-rc12-ka-rename-2026-06-01`, and **no contract redeploy is required**. Nodes upgrade in place; no local-state wipe. This release lands the core-preferred sync + chain-driven VM reconciliation work, the Kafka route-plugin MVP, and a batch of publish/SWM runtime hardening and Node UI fixes accumulated on top of rc.12.
+
+### Added — Core-preferred sync + chain-driven VM reconciliation (#927)
+
+- **Core-preferred sync + chain-driven verified-memory reconciliation** (PR #927, `packages/agent/src`, `packages/core/src`; supersedes #906/#908/#910/#911/#912/#914): the sync path now prefers Core peers and reconciles verified-memory against on-chain state, including host-mode catch-up. Closes the long-running sync/catch-up workstream tracked across the superseded PRs.
+
+### Added — Kafka route-plugin MVP (#607)
+
+- **`@origintrail-official/kafka-plugin`** (PR #607, `packages/kafka-plugin`, `demo/kafka-streams`): new route-plugin consumer package that ingests from Kafka topics into the DKG publish path. Added to `pnpm-workspace.yaml` and the runtime build set.
+
+### Changed — Default publish lifetime is now 12 epochs (#926)
+
+- **`random-sampling` default epochs** (PR #926): the default publish lifetime is set to **12 epochs**. Publishes that don't specify a lifetime now default to 12 instead of the previous default.
+
+### Fixed — Publish / SWM / sync runtime hardening
+
+- **Single-root SWM publish boundary** (PR #925, `packages/publisher/src`): enforce a single-root boundary on shared-working-memory publishes (multi-root publish flow correctness).
+- **SWM plaintext for on-chain-public CGs with an allowed-agent list** (PR #884, `packages/agent/src`): keep SWM payloads plaintext for context graphs that are on-chain-public but carry an allowed-agent list.
+- **Sub-graph SWM in catch-up + approve-time race** (PR #885, `packages/agent/src`): cover sub-graph SWM during catch-up and close a late-joiner / approve-time race (`scripts/devnet-test-swm-late-joiner-subgraph.sh`).
+- **SWM Sender Key setup after joined-CG approval** (PR #900, `packages/agent/src`): fix sender-key setup that was missed after a joined-CG approval; parallel fan-out correctness.
+- **rc.12 publish ACK / allowance races + SPARQL parse-error classifier** (PR #896, addresses #887/#888/#889): resolve publish ACK and allowance race conditions and add a SPARQL parse-error classifier.
+- **Stabilize V10 publish runtime paths** (PR #899): runtime fixes across the V10 publish path.
+- **Harden context-graph registration RPC handling** (PR #883, #883/orch): tolerate RPC 429s on context-graph register.
+- **Per-publish allowance auto-replenish** (PR #876, `packages/chain/src`): auto-replenish the per-publish allowance floor (#870).
+- **Skip recovery `getIdentityId` on boot chain-timeout** (PR #903): don't run identity recovery when the boot-time chain call times out.
+- **Artifact read-gate for public CGs** (PR #879, forward of #872).
+
+### Fixed — Forward-ports from rc.12 hotfix line
+
+- **Rich error when promote finds an empty assertion graph** (PR #898, forward-port of #874, `packages/publisher`, `packages/node-ui`).
+- **Respect explicit `accessPolicy="public"` over allowlist heuristic** (PR #897, forward-port of #873, `packages/agent`).
+
+### Fixed — Node UI
+
+- **Unified render-correct triple derivation via `useCanonicalTriples`** (PR #847, GH #819, `packages/node-ui/src`).
+- **WM Assertions subtab empty after #844** (PR #877): derive the list from `_meta`.
+- **4 QA-found UI bugs** (PR #924, addresses #904/#905/#913/#915).
+- **Markdown import root-children partitioning** (PR #920): fix markdown section root partitioning.
+- **Post-#847 follow-ups** (PR #890): GH #881 fused-counts helper + GH #882 hydrating tooltip.
+- **Settings page cleanup** (PR #855): remove stale sections, sleeker cards, accessibility fixes.
+- **Selected `DKG_HOME` daemon status detection** (PR #878, orch).
+
+### Added — Test coverage
+
+- **Node UI e2e against a real node** (PR #918, `packages/node-ui/e2e`).
+- **`core-peers-features` devnet suite** (`devnet/core-peers-features`).
+- **Build unblock**: augment `NodeJS.ProcessEnv` with `DKG_HOME` (PR #892); resolve 3 #892-surfaced test regressions (PR #901, addresses #893/#894/#895).
+
 ### Added — Operator observability for per-publish 1-wei allowance floor (#871)
 
 - **Diagnostic log line in `EVMChainAdapter.ensureV10ApproveTrac`** (`packages/chain/src/evm-adapter.ts`): when the V10 publish/update path emits its per-publish floor approval (`targetAllowance == V10_PUBLISH_ONCHAIN_MIN_ALLOWANCE` and `chain.approvalPolicy.mode == 'per-publish'`), the daemon now logs a single `console.warn` line identifying that the resulting 1-wei allowance is the intentional `#720` workaround (the contract's `transferFrom(..., 1n)` minimum on zero-cost publishes) and is not a stuck or ghosted approval. This closes a reportability gap surfaced by [#871](https://github.com/OriginTrail/dkg/issues/871), where an operator manually inspected `allowance()` against the wrong (typo'd) spender address and read the daemon's pre-existing 1-wei floor as a daemon-side bug. Investigation note: [`docs/investigations/871-curator-wallet-allowance-ghosting.md`](docs/investigations/871-curator-wallet-allowance-ghosting.md). No behaviour change for any caller — only the diagnostic line is new; the underlying floor logic and the `effectivePublishAllowance` / `computeApprovalAction` invariants are unchanged.

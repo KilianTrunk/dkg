@@ -28,8 +28,8 @@ const DIAGNOSTIC_LOG_PATTERNS = [
   { name: 'syncingFromPeer', text: 'Syncing from peer' },
   { name: 'syncTimeout', text: 'Sync timeout' },
   { name: 'syncFailed', text: 'Sync from ' },
-  // rc.9 PR-E: sync protocol bumped /dkg/10.0.0/sync → /dkg/10.0.1/sync.
-  { name: 'protocolSyncSend', text: 'send /dkg/10.0.1/sync' },
+  // sync protocol is /dkg/10.0.2/sync (off the messenger substrate).
+  { name: 'protocolSyncSend', text: 'send /dkg/10.0.2/sync' },
   { name: 'skippedSwmSync', text: 'Skipping shared memory sync' },
   { name: 'rsTick', text: '[rs.tick' },
   { name: 'rsLoopError', text: '[rs.loop.tick-threw]' },

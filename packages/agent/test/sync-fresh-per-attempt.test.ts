@@ -26,7 +26,7 @@ import type { OperationContext } from '@origintrail-official/dkg-core';
 const REMOTE_PEER_ID = '12D3KooWSmU3owJvB9sFw8uApDgKrv2VBMecsGGvgAc4Gq6hB57M';
 const CG_ID = 'urn:test:cg';
 const GRAPH_URI = `urn:test:cg/graph`;
-const PROTOCOL_ID = '/dkg/10.0.1/sync';
+const PROTOCOL_ID = '/dkg/10.0.2/sync';
 
 function noopLog(): void {}
 function makeCtx(): OperationContext {

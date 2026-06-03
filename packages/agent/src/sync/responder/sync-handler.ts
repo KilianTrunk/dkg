@@ -6,23 +6,18 @@ import type { SyncRequestEnvelope } from '../auth/request-build.js';
 
 interface RegisterSyncHandlerParams {
   /**
-   * Substrate `register` callable. In production this is bound to
-   * `Messenger.register`, so the wrapped handler receives an
-   * envelope-unwrapped payload + a string `peerId` and benefits from
-   * receiver-side idempotency dedup + envelope versioning (rc.9
-   * PR-E migration to `/dkg/10.0.1/sync`).
+   * `register` callable. In production this is bound to the RAW
+   * ProtocolRouter (via an adapter that re-exposes the string `peerId`),
+   * NOT `Messenger.register`: sync runs outside the Universal Messenger
+   * substrate as raw `/dkg/10.0.2/sync` so its large, never-reused page
+   * responses are not cached in message_idempotency (the node-ui.db
+   * bloat fix). The handler receives the bare payload — exactly the
+   * auth envelope `parseSyncRequest` expects — and returns the response
+   * bytes for the router to send.
    *
    * In tests this can be any callable matching the signature; the
    * caller doesn't need to provide a real ProtocolRouter or full
    * Messenger.
-   *
-   * Before PR-E this was `router: { register }` with a peerId
-   * `{ toString(): string }` object — Codex caught that bumping the
-   * advertised `/sync` protocol ID without also moving the sender/
-   * receiver onto the substrate left the new ID without
-   * ReliableEnvelope/dedup/outbox semantics. Migrating the handler
-   * here is half of the fix (the other half is the requester-side
-   * `sendReliable` swap in dkg-agent.ts:fetchSyncPages).
    */
   register: (
     protocolId: string,
@@ -99,7 +94,7 @@ export function registerSyncHandler(params: RegisterSyncHandlerParams): void {
       // received zero bytes of any sub-graph SWM the responder had
       // locally, so a late joiner who joined AFTER the curator had
       // published into a sub-graph could not backfill that history
-      // through `/dkg/10.0.1/sync` — see the SWM late-joiner backfill
+      // through `PROTOCOL_SYNC` — see the SWM late-joiner backfill
       // gap (urn:dkg:finding:swm-gap-2-subgraph-blind-spot). Filter
       // by URI shape under the CG prefix and emit `?g` per binding so
       // the requester reconstructs the correct graph at write time.

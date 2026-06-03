@@ -119,6 +119,11 @@ const MOCK_EXEMPT_FROM_EVM = new Set<string>([
   // (#888) backing both V10 write paths (publish + update); the mock has no
   // populate/gas-estimation surface to mirror.
   'populateAndSignV10WithAllowanceRecovery',
+  // TS-private shared dispatch for the two V10 write paths (#953). Serializes
+  // the populate→sign→broadcast→confirm nonce window per operational wallet
+  // via KeyedSerializer. The mock has no nonce/broadcast surface to mirror —
+  // its writes return typed results directly without populating a tx.
+  'dispatchSerializedV10Write',
   // Lazy-cache helpers for frequently-resolved contracts — TS-private,
   // not part of the ChainAdapter interface.
   'getIdentityStorage',

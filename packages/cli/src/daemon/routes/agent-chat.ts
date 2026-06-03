@@ -669,6 +669,7 @@ export async function handleAgentChatRoutes(ctx: RequestContext): Promise<void> 
       // `health` for callers that want the typed snapshot.
       protocols: diag.protocols,
       syncCapable: diag.syncCapable,
+      syncStatus: diag.syncStatus,
       lastSeen: diag.health?.lastSeen ?? null,
       latencyMs: diag.health?.latencyMs ?? null,
       health: diag.health,
@@ -970,6 +971,17 @@ export async function handleAgentChatRoutes(ctx: RequestContext): Promise<void> 
     } catch {
       return jsonResponse(res, 400, {
         error: `Invalid "kaId": ${String(kaId).slice(0, 50)}`,
+      });
+    }
+    // A Knowledge Asset id is a positive token id. `BigInt("0")` and
+    // `BigInt("-1")` parse fine and the truthy-string `"0"` slips past the
+    // `!kaId` check above, so a corrupt `"0"`/negative id would otherwise be
+    // forwarded to `agent.update` (and only fail with a cryptic on-chain
+    // revert). Fail loud at the boundary instead — mirrors the
+    // `contextGraphId <= 0n` guard in the chain adapter.
+    if (kcIdBigInt <= 0n) {
+      return jsonResponse(res, 400, {
+        error: `Invalid "kaId": ${String(kaId).slice(0, 50)} — must be a positive integer`,
       });
     }
     const ctx = createOperationContext("update");

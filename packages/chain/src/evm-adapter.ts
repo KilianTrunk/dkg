@@ -47,6 +47,7 @@ import {
 } from './chain-adapter.js';
 import { HubResolutionCache } from './hub-resolution-cache.js';
 import { PcaUnavailableError } from './pca-errors.js';
+import { KeyedSerializer } from './keyed-mutex.js';
 import {
   buildAuthorAttestationTypedData,
   AUTHOR_SCHEME_VERSION_V1,
@@ -716,6 +717,15 @@ export class EVMChainAdapter implements ChainAdapter {
   private readonly adminSigner?: Wallet;
   private signerIndex = 0;
   private signerSelectionQueue: Promise<void> = Promise.resolve();
+  /**
+   * Serializes the nonce-critical send window (populate → sign → broadcast →
+   * confirm) per operational wallet. The round-robin pool can route two
+   * concurrent writes to the same wallet; without this they each read the
+   * same `pending` nonce before either broadcasts and the second reverts
+   * `Nonce too low` (OriginTrail/dkg#953). Cross-wallet concurrency is
+   * preserved.
+   */
+  private readonly signerTxSerializer = new KeyedSerializer();
   private readonly hubAddress: string;
   private readonly tokenAddress?: string;
   /**
@@ -878,8 +888,24 @@ export class EVMChainAdapter implements ChainAdapter {
     // retryable error within seconds instead of stalling reads (e.g. `init()`'s
     // Hub lookups) for minutes — which would otherwise make context-graph
     // register hang past its HTTP timeout rather than returning 503.
+    // Disable ethers' JSON-RPC request batching (default `batchMaxCount` = 100).
+    // Under RPC rate limiting a *batched* `eth_getLogs` response is a single
+    // JSON-RPC error covering the whole batch; ethers' coalesce path then
+    // rejects on the un-awaited batch-drain promise rather than the per-request
+    // promise the caller awaits, so the failure escapes as an UNHANDLED "could
+    // not coalesce error" rejection (~30k observed on a live node under a
+    // gossip/finalization on-chain-verification storm — see issue #939). With
+    // `batchMaxCount: 1` each read is its own request whose rejection attaches
+    // to the awaited promise and is caught by the caller's existing try/catch
+    // (gossip-publish-handler / finalization-handler `verifyOnChain`). Batching
+    // is a transport optimisation only — disabling it is semantically inert and
+    // does not change the number of `eth_getLogs` operations issued.
     this.providers = this.rpcUrls.map(
-      (url) => new JsonRpcProvider(boundedRetryFetchRequest(url), undefined, { cacheTimeout: -1, polling: true }),
+      (url) => new JsonRpcProvider(boundedRetryFetchRequest(url), undefined, {
+        cacheTimeout: -1,
+        polling: true,
+        batchMaxCount: 1,
+      }),
     );
     this.primaryProvider = this.providers[0];
     this.provider = this.providers.length === 1
@@ -1154,6 +1180,52 @@ export class EVMChainAdapter implements ChainAdapter {
   ): Promise<ethers.TransactionReceipt> {
     await this.broadcastSignedTransactionWithFailover(signedTx, txHash, label);
     return this.waitForReceiptWithFailover(txHash, label);
+  }
+
+  /**
+   * Shared dispatch for the two V10 write paths (`publishToContextGraph`,
+   * `updateKnowledgeCollectionV10`). Serializes the nonce-critical window
+   * (populate → sign → WAL checkpoint → broadcast → confirm) PER operational
+   * wallet.
+   *
+   * #953: the round-robin signer pool can route two concurrent writes to the
+   * SAME wallet. Without serialization both `populateTransaction` calls read
+   * the same `pending` nonce before either is broadcast, so the second tx
+   * reverts `Nonce too low` on chain and the publish degrades to a tentative
+   * `kaId:0`. Holding the per-wallet lock until the prior tx is mined keeps
+   * the nonce monotonic; cross-wallet writes are unaffected (different keys
+   * run concurrently).
+   *
+   * `buildSignedTx` runs INSIDE the lock so the nonce read can't race a
+   * concurrent same-wallet send. `onBroadcast` is the durable WAL checkpoint:
+   * it `await`s before broadcast and a throw fails closed (the signed tx is
+   * still local, never sent, so the caller can retry with no on-chain effect).
+   */
+  private async dispatchSerializedV10Write(
+    signer: Wallet,
+    label: 'publish' | 'update',
+    onBroadcast: ((info: { txHash: string }) => Promise<void> | void) | undefined,
+    buildSignedTx: () => Promise<{ signedTx: string; txHash: string }>,
+    onNullReceipt: (preBroadcastTxHash: string) => never,
+  ): Promise<ethers.TransactionReceipt> {
+    return this.signerTxSerializer.run(signer.address, async () => {
+      const { signedTx, txHash: preBroadcastTxHash } = await buildSignedTx();
+      try {
+        await onBroadcast?.({ txHash: preBroadcastTxHash });
+      } catch (hookErr) {
+        throw new Error(
+          `chain:writeahead hook failed before ${label} broadcast: ` +
+          `${hookErr instanceof Error ? hookErr.message : String(hookErr)}`,
+        );
+      }
+      const receipt = await this.sendSignedTransactionAndWait(
+        signedTx,
+        preBroadcastTxHash,
+        `V10 ${label}`,
+      );
+      if (!receipt) onNullReceipt(preBroadcastTxHash);
+      return receipt;
+    });
   }
 
   private async sendPopulatedTransaction(
@@ -2935,12 +3007,9 @@ export class EVMChainAdapter implements ChainAdapter {
     // `tokenAmount === 0n` floor (`transferFrom(..., 1n)` minimum), the
     // bounded-per-publish vs replenishing vs unlimited dispatch, and the
     // `this.contracts.token === undefined` no-op for read-only adapters.
-    await this.ensureV10ApproveTrac(
-      txSigner,
-      kaAddress,
-      params.tokenAmount,
-      'approve V10 publish TRAC',
-    );
+    // #953: the approve runs INSIDE the per-wallet serialized window below
+    // (it sends its own tx on `txSigner`), not here — see the buildSignedTx
+    // closure passed to `dispatchSerializedV10Write`.
 
     // Build the on-chain PublishParams struct matching the field order +
     // types in `KnowledgeAssetsLifecycle.sol` (RFC-001 author-attestation
@@ -3029,38 +3098,42 @@ export class EVMChainAdapter implements ChainAdapter {
     // `populateAndSignV10WithAllowanceRecovery`. This runs strictly BEFORE
     // the `onBroadcast` WAL checkpoint and the broadcast below, so the
     // forced re-approve + single retry has no on-chain side effect.
-    const { signedTx, txHash: preBroadcastTxHash } =
-      await this.populateAndSignV10WithAllowanceRecovery(
-        txSigner,
-        ka as Contract,
-        'publish',
-        publishParamsStruct,
-        kaAddress,
-        params.tokenAmount,
-        'approve V10 publish TRAC (forced re-approve, #888)',
-      );
-    // Derive the pre-broadcast tx hash from the signed raw hex so WAL
-    // consumers can log the exact identity of the tx about to hit the
-    // wire. After broadcast completes, the receipt hash matches this.
-    // Codex PR #241 iter-7: `await` the hook. `onBroadcast` is typed
-    // as `Promise<void> | void`, so an async WAL writer (disk flush,
-    // remote gossip) must run to completion BEFORE we proceed to
-    // `broadcastTransaction`. Without `await`, a synchronous
-    // `try/catch` here would silently let the broadcast race the
-    // still-unresolved WAL promise and break the fail-closed contract.
-    try {
-      await params.onBroadcast?.({ txHash: preBroadcastTxHash });
-    } catch (hookErr) {
-      // Fail closed: the signed tx is still in this function's local
-      // scope — it has not been sent. Surface the hook error to the
-      // caller so they know WAL persistence failed BEFORE broadcast.
-      throw new Error(
-        `chain:writeahead hook failed before publish broadcast: ` +
-        `${hookErr instanceof Error ? hookErr.message : String(hookErr)}`,
-      );
-    }
-    const receipt = await this.sendSignedTransactionAndWait(signedTx, preBroadcastTxHash, 'V10 publish');
-    if (!receipt) throw new Error('Transaction receipt is null');
+    // #888 + #953: populate (gas-estimates; can revert `TooLowAllowance` on a
+    // stale RPC allowance read) + sign with a one-shot forced-approve recovery,
+    // then WAL-checkpoint + broadcast — the whole nonce-critical window is
+    // serialized per operational wallet by `dispatchSerializedV10Write`. The
+    // forced re-approve + single retry runs strictly before the broadcast, so
+    // it has no on-chain side effect.
+    const receipt = await this.dispatchSerializedV10Write(
+      txSigner,
+      'publish',
+      params.onBroadcast,
+      async () => {
+        // #953: the initial allowance approve sends its OWN tx on `txSigner`,
+        // so it must run INSIDE the per-wallet lock too. If it stayed before
+        // the lock, two concurrent same-wallet publishes starting from
+        // insufficient allowance would race on the approve nonce and the
+        // second would revert `Nonce too low` before the publish even began.
+        await this.ensureV10ApproveTrac(
+          txSigner,
+          kaAddress,
+          params.tokenAmount,
+          'approve V10 publish TRAC',
+        );
+        return this.populateAndSignV10WithAllowanceRecovery(
+          txSigner,
+          ka as Contract,
+          'publish',
+          publishParamsStruct,
+          kaAddress,
+          params.tokenAmount,
+          'approve V10 publish TRAC (forced re-approve, #888)',
+        );
+      },
+      () => {
+        throw new Error('Transaction receipt is null');
+      },
+    );
 
     let kaId = 0n;
     let startKAId = 0n;
@@ -3575,12 +3648,9 @@ export class EVMChainAdapter implements ChainAdapter {
     // sizing for both V10 surfaces. The default `per-publish` policy
     // floors at 1n so metadata-only updates with `newTokenAmount === 0n`
     // still satisfy the contract's `transferFrom(..., 1n)` minimum.
-    await this.ensureV10ApproveTrac(
-      signer,
-      kav10Address,
-      newTokenAmount,
-      'approve V10 update TRAC',
-    );
+    // #953: the approve runs INSIDE the per-wallet serialized window below
+    // (it sends its own tx on `signer`), not here — see the buildSignedTx
+    // closure passed to `dispatchSerializedV10Write`.
 
     // P-1 review (Codex iter-5): same pattern as the publish path —
     // break the single contract call into populate / sign / hook /
@@ -3596,33 +3666,41 @@ export class EVMChainAdapter implements ChainAdapter {
     // as exposed to a stale `TooLowAllowance` read on a load-balanced RPC, so
     // route both V10 write paths through the shared helper. Strictly
     // pre-broadcast — no on-chain side effect from the forced re-approve.
-    const { signedTx, txHash: preBroadcastTxHash } =
-      await this.populateAndSignV10WithAllowanceRecovery(
-        signer,
-        ka as Contract,
-        'update',
-        updateParams,
-        kav10Address,
-        newTokenAmount,
-        'approve V10 update TRAC (forced re-approve, #888)',
-      );
-    // Codex PR #241 iter-7: `await` so async WAL writes complete
-    // before broadcast (see publish above for the full rationale).
-    try {
-      await params.onBroadcast?.({ txHash: preBroadcastTxHash });
-    } catch (hookErr) {
-      throw new Error(
-        `chain:writeahead hook failed before update broadcast: ` +
-        `${hookErr instanceof Error ? hookErr.message : String(hookErr)}`,
-      );
-    }
-    const receipt = await this.sendSignedTransactionAndWait(signedTx, preBroadcastTxHash, 'V10 update');
-    if (!receipt) {
-      throw new Error(
-        `update broadcast succeeded (txHash=${preBroadcastTxHash}) but receipt was null ` +
-        `— the tx was likely replaced or dropped before confirmation`,
-      );
-    }
+    // #888 + #953: same shared dispatch as the publish path — populate+sign
+    // with one-shot allowance recovery, WAL checkpoint, broadcast, all
+    // serialized per operational wallet so concurrent same-wallet writes
+    // can't collide on the `pending` nonce.
+    const receipt = await this.dispatchSerializedV10Write(
+      signer,
+      'update',
+      params.onBroadcast,
+      async () => {
+        // #953: approve INSIDE the per-wallet lock (it sends its own tx on
+        // `signer`) so a concurrent same-wallet update/publish can't race on
+        // the approve nonce.
+        await this.ensureV10ApproveTrac(
+          signer,
+          kav10Address,
+          newTokenAmount,
+          'approve V10 update TRAC',
+        );
+        return this.populateAndSignV10WithAllowanceRecovery(
+          signer,
+          ka as Contract,
+          'update',
+          updateParams,
+          kav10Address,
+          newTokenAmount,
+          'approve V10 update TRAC (forced re-approve, #888)',
+        );
+      },
+      (preBroadcastTxHash) => {
+        throw new Error(
+          `update broadcast succeeded (txHash=${preBroadcastTxHash}) but receipt was null ` +
+          `— the tx was likely replaced or dropped before confirmation`,
+        );
+      },
+    );
 
     return {
       hash: receipt.hash,

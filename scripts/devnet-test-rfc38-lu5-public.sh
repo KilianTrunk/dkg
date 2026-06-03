@@ -16,6 +16,9 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=devnet-publish-helpers.sh
+source "$SCRIPT_DIR/devnet-publish-helpers.sh"
 DEVNET_DIR="${DEVNET_DIR:-$REPO_ROOT/.devnet}"
 HARDHAT_PORT="${HARDHAT_PORT:-8545}"
 API_PORT_BASE=9201
@@ -74,10 +77,7 @@ printf '%s' "$WRITE_RESP" | grep -qE '"triplesWritten":[1-9]' || fail "public SW
 sleep 2
 
 log "Publishing public CG to VM..."
-PUBLISH_RESP=$(api_call "$EDGE_CURATOR_NODE" POST /api/shared-memory/publish "$(cat <<EOF
-{ "contextGraphId": "${CG_LOCAL_ID}", "selection": "all", "clearAfter": false }
-EOF
-)")
+PUBLISH_RESP=$(devnet_publish_swm_all_roots "$EDGE_CURATOR_NODE" "${CG_LOCAL_ID}" false)
 log "publish response: $PUBLISH_RESP"
 
 parse_json() { printf '%s' "$1" | node -e "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{try{const j=JSON.parse(d);const v=j$2;console.log(v==null?'':v)}catch(e){process.exit(1)}})"; }

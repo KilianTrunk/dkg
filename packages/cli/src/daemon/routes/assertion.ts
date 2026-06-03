@@ -394,6 +394,19 @@ function normalizeIriBinding(cell: unknown): string {
   return bindingCellValue(cell).replace(/^<|>$/g, '').trim();
 }
 
+function singletonMetadataBinding(
+  bindings: Array<Record<string, unknown>>,
+  key: string,
+  normalize: (cell: unknown) => string,
+  label: string,
+): string {
+  const values = [...new Set(bindings.map((binding) => normalize(binding[key])).filter(Boolean))];
+  if (values.length > 1) {
+    throw new ImportArtifactRouteError(409, `Import metadata contains conflicting ${label} values`);
+  }
+  return values[0] ?? '';
+}
+
 function optionalPositiveInteger(cell: unknown): number | undefined {
   return parseOpenClawAttachmentTripleCount(bindingCellValue(cell));
 }
@@ -842,6 +855,82 @@ function handleImportArtifactRouteError(res: ServerResponse, err: unknown): bool
   return false;
 }
 
+async function resolveImportedArtifactFromSharedMemory(
+  ctx: RequestContext,
+  args: {
+    contextGraphId: string;
+    assertionUri: string;
+    assertionName: string;
+    assertionAgentAddress: string;
+    subGraphName?: string;
+    requestedFileHash?: string;
+    ownerGuardRelaxed: boolean;
+  },
+): Promise<ImportedArtifactResolution | undefined> {
+  const swmGraph = contextGraphSharedMemoryUri(args.contextGraphId, args.subGraphName);
+  const result = await ctx.agent.store.query(`
+    SELECT ?sourceFile ?contentType ?rootEntity ?markdownForm WHERE {
+      GRAPH <${swmGraph}> {
+        <${args.assertionUri}> <${DKG_ONTOLOGY}sourceFile> ?sourceFile .
+        OPTIONAL { <${args.assertionUri}> <${DKG_ONTOLOGY}sourceContentType> ?contentType }
+        OPTIONAL { <${args.assertionUri}> <${DKG_ONTOLOGY}rootEntity> ?rootEntity }
+        OPTIONAL { <${args.assertionUri}> <${DKG_ONTOLOGY}markdownForm> ?markdownForm }
+      }
+    }
+  `) as { type?: string; bindings?: Array<Record<string, unknown>> };
+  const bindings = result.bindings ?? [];
+  if (bindings.length === 0) return undefined;
+
+  const sourceFile = singletonMetadataBinding(bindings, 'sourceFile', normalizeIriBinding, 'source file');
+  const sourceFileHash = hashFromFileUrn(sourceFile);
+  if (!sourceFileHash || !validateContentHash(sourceFileHash)) {
+    throw new ImportArtifactRouteError(409, 'Shared-memory import metadata is missing a valid source file hash');
+  }
+  if (args.requestedFileHash && args.requestedFileHash !== sourceFileHash) {
+    throw new ImportArtifactRouteError(400, 'fileHash does not match import metadata');
+  }
+
+  const durableSourceContentType = singletonMetadataBinding(
+    bindings,
+    'contentType',
+    normalizeLiteralBinding,
+    'source content type',
+  ) || undefined;
+  const sourceContentType = normalizeDetectedContentType(durableSourceContentType);
+  const rootEntity = singletonMetadataBinding(bindings, 'rootEntity', normalizeIriBinding, 'root entity') || undefined;
+  const markdownFormValue = singletonMetadataBinding(bindings, 'markdownForm', normalizeIriBinding, 'Markdown form') || undefined;
+  const markdownFormHash = hashFromFileUrn(markdownFormValue);
+  if (markdownFormValue && (!markdownFormHash || !validateContentHash(markdownFormHash))) {
+    throw new ImportArtifactRouteError(409, 'Import metadata is missing a valid Markdown intermediate hash');
+  }
+  const markdownHash = markdownFormHash
+    ?? (sourceContentType === 'text/markdown' ? sourceFileHash : undefined);
+  const markdownForm = markdownHash ? `urn:dkg:file:${markdownHash}` : undefined;
+  const markdownAvailableLocally = markdownHash
+    ? await ctx.fileStore.has(markdownHash).catch(() => false)
+    : false;
+
+  return {
+    contextGraphId: args.contextGraphId,
+    assertionUri: args.assertionUri,
+    assertionName: args.assertionName,
+    assertionAgentAddress: args.assertionAgentAddress,
+    ...(args.subGraphName ? { subGraphName: args.subGraphName } : {}),
+    fileHash: sourceFileHash,
+    sourceFileHash,
+    detectedContentType: sourceContentType,
+    sourceContentType,
+    extractionStatus: 'completed',
+    extractionMethod: 'structural',
+    ...(rootEntity ? { rootEntity } : {}),
+    ...(markdownHash && markdownHash !== sourceFileHash ? { mdIntermediateHash: markdownHash } : {}),
+    ...(markdownForm ? { markdownForm } : {}),
+    ...(markdownHash ? { markdownHash } : {}),
+    canReadMarkdown: markdownAvailableLocally,
+    ...(args.ownerGuardRelaxed ? { ownerGuardRelaxed: true } : {}),
+  };
+}
+
 async function resolveImportedArtifact(
   ctx: RequestContext,
   raw: Record<string, unknown>,
@@ -1013,6 +1102,18 @@ async function resolveImportedArtifact(
   `) as { type?: string; bindings?: Array<Record<string, unknown>> };
   const metaBinding = metaResult.bindings?.[0];
   if (!metaBinding) {
+    if (ownerGuardRelaxed) {
+      const swmArtifact = await resolveImportedArtifactFromSharedMemory(ctx, {
+        contextGraphId,
+        assertionUri,
+        assertionName: parsedAssertion.assertionName,
+        assertionAgentAddress: parsedAssertion.assertionAgentAddress,
+        ...(parsedAssertion.subGraphName ? { subGraphName: parsedAssertion.subGraphName } : {}),
+        ...(requestedFileHash ? { requestedFileHash } : {}),
+        ownerGuardRelaxed,
+      });
+      if (swmArtifact) return swmArtifact;
+    }
     throw new ImportArtifactRouteError(404, 'No completed import metadata found for assertionUri');
   }
 

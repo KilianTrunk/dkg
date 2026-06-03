@@ -24,6 +24,9 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=devnet-publish-helpers.sh
+source "$SCRIPT_DIR/devnet-publish-helpers.sh"
 DEVNET_DIR="${DEVNET_DIR:-$REPO_ROOT/.devnet}"
 API_PORT_BASE=9201
 CURATOR_NODE=5
@@ -109,16 +112,16 @@ WRITE_RESP=$(api_call "$CURATOR_NODE" POST /api/shared-memory/write "$QUADS")
 [ "$(parse_json "$WRITE_RESP" '.triplesWritten')" = "5" ] || fail "expected 5 triples written, got: $WRITE_RESP"
 
 log "Curator publishes selection to VM..."
-PUB_RESP=$(api_call "$CURATOR_NODE" POST /api/shared-memory/publish "$(cat <<EOF
-{ "contextGraphId": "$PUB_CG", "selection": "all", "epochs": 1 }
-EOF
-)")
+PUB_RESP=$(devnet_publish_swm_all_roots "$CURATOR_NODE" "$PUB_CG" false '"epochs":1')
+devnet_publish_load_state
 log "publish response: $PUB_RESP"
 TX_HASH=$(parse_json "$PUB_RESP" '.txHash')
 KC_ID=$(parse_json "$PUB_RESP" '.kaId')
 [ -n "$TX_HASH" ] || fail "no txHash in publish response — cannot proceed without on-chain anchor"
 [ -n "$KC_ID" ] || fail "no kaId in publish response — required for merkleRoot lookup"
 
+# Negative tests below operate on item0's batch; resolve its KC by root subject.
+KC_ID=$(devnet_publish_ka_id_for_root "urn:lu8/item0")
 log "Fetching merkleRoot from chain (KC #${KC_ID}) via daemon API..."
 KC_RESP=$(api_call "$CURATOR_NODE" GET "/api/kc/${KC_ID}")
 log "kc lookup: $KC_RESP"
@@ -162,29 +165,12 @@ fi
 # path a member uses after catchup once they've decrypted ciphertext, and is
 # the only path that's batch-scoped for the verifier API.
 log "Calling verify-batch with explicit caller-supplied quads (member-side simulation)..."
-EXPLICIT_QUADS=$(node -e "
-  const quads = [];
-  for (let i = 0; i < 5; i++) {
-    quads.push({
-      subject: 'urn:lu8/item' + i,
-      predicate: 'http://schema.org/name',
-      object: '\"Item' + i + '\"',
-      graph: ''
-    });
-  }
-  console.log(JSON.stringify({
-    contextGraphId: '$PUB_CG',
-    expectedMerkleRoot: '$MERKLE_ROOT',
-    quads
-  }));
-")
-VERIFY_EXPLICIT=$(api_call "$MEMBER_NODE" POST /api/shared-memory/verify-batch "$EXPLICIT_QUADS")
-log "verify-batch explicit: $VERIFY_EXPLICIT"
-EXPLICIT_OK=$(parse_json "$VERIFY_EXPLICIT" '.ok')
-if [ "$EXPLICIT_OK" = "true" ]; then
-  log "✓ Scenario 1b: explicit-quads verify ok=true (member can verify once it has the plaintext)"
+if devnet_verify_each_published_root "$MEMBER_NODE" "$PUB_CG" "$QUADS"; then
+  EXPLICIT_OK=true
+  log "✓ Scenario 1b: explicit-quads verify ok=true for all published roots (member can verify once it has the plaintext)"
 else
-  warn "explicit-quads verify returned ok=$EXPLICIT_OK (expected true)"
+  EXPLICIT_OK=false
+  warn "explicit-quads verify failed for one or more roots"
 fi
 
 # ===========================================================================
@@ -198,25 +184,13 @@ log "================================================================"
 
 log "Member calls verify-batch with forged quads (extra injected triple)..."
 FORGED_QUADS=$(node -e "
-  const quads = [];
-  for (let i = 0; i < 5; i++) {
-    quads.push({
-      subject: 'urn:lu8/item' + i,
-      predicate: 'http://schema.org/name',
-      object: '\"Item' + i + '\"',
-      graph: ''
-    });
-  }
-  quads.push({
-    subject: 'urn:lu8/injected',
-    predicate: 'http://schema.org/name',
-    object: '\"Mallory\"',
-    graph: ''
-  });
   console.log(JSON.stringify({
     contextGraphId: '$PUB_CG',
     expectedMerkleRoot: '$MERKLE_ROOT',
-    quads,
+    quads: [
+      { subject: 'urn:lu8/item0', predicate: 'http://schema.org/name', object: '\"Item0\"', graph: '' },
+      { subject: 'urn:lu8/injected', predicate: 'http://schema.org/name', object: '\"Mallory\"', graph: '' },
+    ],
     batchId: 'lu8-forged-${STAMP}'
   }));
 ")

@@ -14,6 +14,7 @@ import {
   type ServerResponse,
 } from "node:http";
 import { createHash, randomUUID } from "node:crypto";
+import { GET_TOTAL_TRIPLES_SPARQL, parseRdfInt } from "./metrics-queries.js";
 import {
   appendFile,
   chmod,
@@ -264,6 +265,8 @@ import {
   formatHealthCheckFailure,
   formatIdentityTagMismatch,
 } from './store-health-check.js';
+import { startManagedOxigraph } from './oxigraph-managed.js';
+import type { OxigraphServerHandle } from './oxigraph-server.js';
 import { resetNatStatus, startNatStatusWatcher } from './nat-status.js';
 import {
   OPENCLAW_UI_CONNECT_TIMEOUT_MS,
@@ -859,11 +862,71 @@ export async function runDaemonInner(
     process.exit(1);
   }
 
+  // Managed local Oxigraph server (`store.backend: 'oxigraph-server'`,
+  // Release 2 opt-in). Fetch/verify the pinned binary, spawn a loopback
+  // `oxigraph serve` child, and expose a runtime `sparql-http` view (without
+  // mutating persisted `config.store`) so every downstream step
+  // (config validation, health check, identity tag, chain-reset wipe,
+  // the adapter) reuses the existing external-backend path unchanged.
+  // Runs AFTER detectBackendSwitch (which persisted the raw
+  // 'oxigraph-server' value) and BEFORE exitOnStoreConfigErrors so the
+  // normalised config is what gets validated and probed.
+  let managedOxigraph: OxigraphServerHandle | null = null;
+  let managed: Awaited<ReturnType<typeof startManagedOxigraph>> = null;
+  try {
+    managed = await startManagedOxigraph({ config, dataDir: dkgDir(), log });
+    if (managed) {
+      managedOxigraph = managed.handle;
+      // Every remaining fatal boot path (config validation, store health
+      // check, identity mismatch, later failures) calls process.exit(),
+      // which bypasses the graceful shutdown hook. Register a synchronous
+      // best-effort kill so none of them orphan the spawned server.
+      process.once('exit', () => managedOxigraph?.killSync());
+      log(`Managed Oxigraph server backing store: ${managed.handle.queryEndpoint}`);
+    }
+  } catch (err) {
+    log(
+      `[STORE] failed to start managed Oxigraph server: ${(err as Error).message}\n` +
+        `Fix the cause, or switch \`store.backend\` to oxigraph-worker (embedded) or ` +
+        `sparql-http (operator-managed endpoint) in ~/.dkg/config.json.`,
+    );
+    process.exit(1);
+  }
+
+  // Runtime store view for the managed Oxigraph server. We deliberately do
+  // NOT mutate `config.store` to the loopback `sparql-http` shape: `config`
+  // is the persisted/operator-facing object, and every later
+  // `saveConfig(config)` would otherwise write the ephemeral loopback
+  // endpoints to disk (breaking the next boot, which would no longer spawn
+  // the managed server) and `/api/status` would report `sparql-http` instead
+  // of the configured `oxigraph-server`. Instead the boot steps that talk to
+  // the live store (validation, reachability, identity, chain-reset wipe, the
+  // agent) read these runtime values, while `config` keeps `oxigraph-server`.
+  // For the directory-backed blob/snapshot stores we use the managed
+  // defaults (the rewritten sparql-http backend has no `options.path` to
+  // infer a directory from, unlike the local Oxigraph backend).
+  const runtimeStore = managed?.storeConfig ?? config.store;
+  const runtimeLargeLiteralStorage =
+    managed?.largeLiteralStorage ?? config.largeLiteralStorage;
+  const runtimeSnapshotStorage =
+    managed?.sharedMemoryPublicSnapshotStorage ?? config.sharedMemoryPublicSnapshotStorage;
+  // Config view used only for the boot-time store validation/health steps
+  // below: same as `config` but with the runtime store/blob/snapshot values
+  // swapped in, so a managed config validates against what actually runs.
+  const runtimeStoreConfig: DkgConfig = managed
+    ? {
+        ...config,
+        store: runtimeStore,
+        largeLiteralStorage: runtimeLargeLiteralStorage,
+        sharedMemoryPublicSnapshotStorage: runtimeSnapshotStorage,
+      }
+    : config;
+
   // Refuse to start on invalid external-backend config (missing URL,
   // missing blob/snapshot directory). This fires before the health
   // check so operators see a single-line config error, not a confusing
   // probe failure when the URL is just plain absent.
-  exitOnStoreConfigErrors(config, log);
+  exitOnStoreConfigErrors(runtimeStoreConfig, log);
 
   // External triple-store backends (Blazegraph, sparql-http) get a
   // boot-time reachability probe before anything that depends on them
@@ -875,9 +938,9 @@ export async function runDaemonInner(
   // against an unreachable endpoint doesn't strand the operator with
   // wiped local files but stale remote data; we'd rather not start at
   // all and let them fix the URL.
-  if (isExternalBackend(config.store?.backend)) {
+  if (isExternalBackend(runtimeStore?.backend)) {
     const health = await checkExternalStoreReachable({
-      storeConfig: config.store,
+      storeConfig: runtimeStore,
     });
     if (!health.ok) {
       log(formatHealthCheckFailure(health));
@@ -894,7 +957,7 @@ export async function runDaemonInner(
     // chainResetWipe so a mismatched tag never triggers a wipe of
     // someone else's data.
     const identity = await checkOrSetStoreIdentity({
-      storeConfig: config.store,
+      storeConfig: runtimeStore,
       nodeName: config.name,
     });
     if (!identity.ok) {
@@ -921,7 +984,7 @@ export async function runDaemonInner(
     // files to a SPARQL DROP/DELETE on the remote endpoint; otherwise
     // operators with a chain-reset marker bump would keep stale V10 data
     // in Blazegraph / sparql-http even after the local store.nq is gone.
-    storeConfig: config.store,
+    storeConfig: runtimeStore,
     log,
   });
   if (wipeResult.wiped) {
@@ -932,9 +995,9 @@ export async function runDaemonInner(
     // A DKG-managed external wipe uses DROP ALL, which also removes the
     // namespace ownership tag verified above. Re-tag before continuing so
     // this daemon never runs against an unclaimed namespace.
-    if (isExternalBackend(config.store?.backend)) {
+    if (isExternalBackend(runtimeStore?.backend)) {
       const identity = await checkOrSetStoreIdentity({
-        storeConfig: config.store,
+        storeConfig: runtimeStore,
         nodeName: config.name,
       });
       if (!identity.ok) {
@@ -1126,12 +1189,12 @@ export async function runDaemonInner(
     ...pickNetworkTunables(config.network ?? {}),
     agentProfileHeartbeatMs: config.network?.agentProfileHeartbeatMs,
     syncContextGraphs: syncContextGraphs,
-    storeConfig: config.store ? {
-      backend: config.store.backend,
-      options: config.store.options,
+    storeConfig: runtimeStore ? {
+      backend: runtimeStore.backend,
+      options: runtimeStore.options,
     } : undefined,
-    largeLiteralStorage: config.largeLiteralStorage,
-    sharedMemoryPublicSnapshotStorage: config.sharedMemoryPublicSnapshotStorage,
+    largeLiteralStorage: runtimeLargeLiteralStorage,
+    sharedMemoryPublicSnapshotStorage: runtimeSnapshotStorage,
     syncSharedMemoryOnConnect: config.syncSharedMemoryOnConnect,
     queryAccess: config.queryAccess,
     chainAdapter: mockChainAdapter,
@@ -1734,14 +1797,6 @@ export async function runDaemonInner(
   });
 
   // Extract the plain value from an RDF typed literal like "6"^^<xsd:integer>
-  function parseRdfInt(raw: string | undefined): number {
-    if (!raw) return 0;
-    const m = raw.match(/^"?(\d+)"?\^?\^/);
-    if (m) return parseInt(m[1], 10);
-    const n = parseInt(raw, 10);
-    return isNaN(n) ? 0 : n;
-  }
-
   const metricsSource: MetricsSource = {
     getPeerCount: () =>
       new Set(
@@ -1770,9 +1825,7 @@ export async function runDaemonInner(
     },
     getContextGraphCount: async () => (await agent.listContextGraphs()).length,
     getTotalTriples: async () => {
-      const r = await agent.query(
-        "SELECT (COUNT(*) AS ?c) WHERE { { ?s ?p ?o } UNION { GRAPH ?g { ?s ?p ?o } } }",
-      );
+      const r = await agent.query(GET_TOTAL_TRIPLES_SPARQL);
       return parseRdfInt(r?.bindings?.[0]?.c);
     },
     getTotalKCs: async () => {
@@ -1804,8 +1857,10 @@ export async function runDaemonInner(
       // correct signal here (returning 0 misleads operators into
       // thinking the store is empty). Quad count is exposed on
       // demand via /api/status instead — too expensive to compute
-      // on the metrics tick. (RFC 120, plan PR 1 item 2.)
-      if (isExternalBackend(config.store?.backend)) {
+      // on the metrics tick. (RFC 120, plan PR 1 item 2.) A managed
+      // oxigraph-server keeps its data in RocksDB (no store.nq), so it
+      // takes the same null path via the runtime sparql-http view.
+      if (isExternalBackend(runtimeStore?.backend)) {
         return null;
       }
       try {
@@ -2759,6 +2814,14 @@ export async function runDaemonInner(
           );
         server.close();
         await agent.stop();
+        // Stop the managed Oxigraph child AFTER the agent has stopped
+        // issuing store queries, so an in-flight SPARQL request never
+        // races the killed server. No-op when not using oxigraph-server.
+        await managedOxigraph
+          ?.stop()
+          .catch((err: any) =>
+            log(`Managed Oxigraph stop error: ${err?.message ?? String(err)}`),
+          );
         dashDb.close();
         log("Stopped.");
       } finally {

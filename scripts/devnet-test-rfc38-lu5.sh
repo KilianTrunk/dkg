@@ -27,6 +27,9 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=devnet-publish-helpers.sh
+source "$SCRIPT_DIR/devnet-publish-helpers.sh"
 DEVNET_DIR="${DEVNET_DIR:-$REPO_ROOT/.devnet}"
 HARDHAT_PORT="${HARDHAT_PORT:-8545}"
 API_PORT_BASE=9201
@@ -153,14 +156,7 @@ sleep 2  # let SWM gossip settle
 # --- 5. Publish SWM → VM ----------------------------------------------------
 
 log "Publishing curated CG to VM..."
-PUBLISH_RESP=$(api_call "$EDGE_CURATOR_NODE" POST /api/shared-memory/publish "$(cat <<EOF
-{
-  "contextGraphId": "${CG_URI}",
-  "selection": "all",
-  "clearAfter": false
-}
-EOF
-)")
+PUBLISH_RESP=$(devnet_publish_swm_all_roots "$EDGE_CURATOR_NODE" "${CG_URI}" false)
 log "publish response: $PUBLISH_RESP"
 
 # Use jq-equivalent via node for portability.

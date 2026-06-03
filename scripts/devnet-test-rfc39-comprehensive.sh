@@ -52,6 +52,9 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=devnet-publish-helpers.sh
+source "$SCRIPT_DIR/devnet-publish-helpers.sh"
 DEVNET_DIR="${DEVNET_DIR:-$REPO_ROOT/.devnet}"
 HARDHAT_PORT="${HARDHAT_PORT:-8545}"
 API_PORT_BASE="${API_PORT_BASE:-9201}"
@@ -362,14 +365,7 @@ EOF
 
   log "Publishing $visibility_label CG to VM..."
   local publish_resp
-  publish_resp=$(api_call "$EDGE_CURATOR_NODE" POST /api/shared-memory/publish "$(cat <<EOF
-{
-  "contextGraphId": "${cg_uri}",
-  "selection": "all",
-  "clearAfter": false
-}
-EOF
-)")
+  publish_resp=$(devnet_publish_swm_all_roots "$EDGE_CURATOR_NODE" "${cg_uri}" false)
   local publish_status publish_tx publish_kc publish_block
   publish_status=$(printf '%s' "$publish_resp" | node -e 'let d="";process.stdin.on("data",c=>d+=c);process.stdin.on("end",()=>{try{console.log(JSON.parse(d).status||"")}catch(e){console.log("")}})')
   publish_tx=$(printf '%s' "$publish_resp" | node -e 'let d="";process.stdin.on("data",c=>d+=c);process.stdin.on("end",()=>{try{console.log(JSON.parse(d).txHash||"")}catch(e){console.log("")}})')
@@ -586,14 +582,7 @@ EOF
 
   log "Publishing curated CG to VM (only nodes ${sibling_nodes[*]} are listening)..."
   local publish_resp publish_status publish_tx publish_kc
-  publish_resp=$(api_call "$EDGE_CURATOR_NODE" POST /api/shared-memory/publish "$(cat <<EOF
-{
-  "contextGraphId": "${cg_uri}",
-  "selection": "all",
-  "clearAfter": false
-}
-EOF
-)")
+  publish_resp=$(devnet_publish_swm_all_roots "$EDGE_CURATOR_NODE" "${cg_uri}" false)
   publish_status=$(printf '%s' "$publish_resp" | node -e 'let d="";process.stdin.on("data",c=>d+=c);process.stdin.on("end",()=>{try{console.log(JSON.parse(d).status||"")}catch(e){console.log("")}})')
   publish_tx=$(printf '%s' "$publish_resp" | node -e 'let d="";process.stdin.on("data",c=>d+=c);process.stdin.on("end",()=>{try{console.log(JSON.parse(d).txHash||"")}catch(e){console.log("")}})')
   publish_kc=$(printf '%s' "$publish_resp" | node -e 'let d="";process.stdin.on("data",c=>d+=c);process.stdin.on("end",()=>{try{console.log(JSON.parse(d).kaId||"")}catch(e){console.log("")}})')

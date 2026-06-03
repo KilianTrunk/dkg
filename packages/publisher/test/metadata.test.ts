@@ -152,6 +152,16 @@ describe('generateKCMetadata', () => {
       [`${UAL}/2`, '"3"^^<http://www.w3.org/2001/XMLSchema#integer>'],
       [`${UAL}/3`, '"2"^^<http://www.w3.org/2001/XMLSchema#integer>'],
     ]);
+
+    // OT-RFC-43 §10.1 dual-write: each per-root label ALSO carries the new
+    // dkg:entity predicate alongside the legacy dkg:rootEntity (readers still
+    // resolve via the legacy name until the reader migration lands).
+    expect(quads.find(q => q.subject === `${UAL}/1` && q.predicate === `${DKG}entity`)?.object)
+      .toBe('did:dkg:entity:alice');
+    expect(quads.find(q => q.subject === `${UAL}/2` && q.predicate === `${DKG}entity`)?.object)
+      .toBe('did:dkg:entity:bob');
+    expect(quads.find(q => q.subject === `${UAL}/3` && q.predicate === `${DKG}entity`)?.object)
+      .toBe('did:dkg:entity:carol');
   });
 
   it('GH #748 fallback: attribution is the peer-ID literal when neither agentAddress nor authorAddress is supplied', () => {

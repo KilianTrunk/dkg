@@ -92,6 +92,14 @@ export type ExternalStoreBlock =
         updateEndpoint: string;
         managedByDkg: boolean;
       };
+    }
+  // Daemon-managed local Oxigraph server (Release 2 opt-in). No URL: the
+  // daemon fetches the binary, spawns a loopback server, and derives the
+  // endpoints at boot. Operator-set overrides (`port`/`location`/`cacheDir`)
+  // that planManagedOxigraph reads at boot are carried through unchanged.
+  | {
+      backend: 'oxigraph-server';
+      options: Record<string, unknown>;
     };
 
 function externalStoreBlock(
@@ -136,7 +144,9 @@ export async function promptStoreBackend(
       : undefined;
 
   const defaultBackend = opts.flagBackend
-    ?? (existingBackend === 'blazegraph' || existingBackend === 'sparql-http' ? existingBackend : 'oxigraph');
+    ?? (existingBackend === 'blazegraph' || existingBackend === 'sparql-http' || existingBackend === 'oxigraph-server'
+      ? existingBackend
+      : 'oxigraph');
 
   const backendChoices = ['oxigraph', 'blazegraph'] as const;
   // `sparql-http` is intentionally not listed (advanced bring-your-own-server
@@ -169,6 +179,22 @@ export async function promptStoreBackend(
   const backendAnswer = /^\d+$/.test(backendInput)
     ? (backendChoices[parseInt(backendInput, 10) - 1] ?? 'oxigraph')
     : backendInput.toLowerCase();
+
+  // `oxigraph-server` (daemon-managed local server) is accepted by name
+  // (like `sparql-http`, it's not a numbered choice). No URL prompt or
+  // probe: the endpoint doesn't exist until the daemon spawns it at boot.
+  if (backendAnswer === 'oxigraph-server') {
+    log('  Using a daemon-managed local Oxigraph server (started on first daemon boot).');
+    // Preserve existing managed-server overrides (port/location/cacheDir) on an
+    // Enter-through: `dkg init` persists this block, so returning empty options
+    // would silently reset a custom port/RocksDB path on the next boot — the
+    // same hazard applyStoreFlagsToConfig guards against on the `--store` path.
+    const prevOptions =
+      existingBackend === 'oxigraph-server' && opts.existingStore?.options
+        ? opts.existingStore.options
+        : {};
+    return { storeBlock: { backend: 'oxigraph-server', options: prevOptions } };
+  }
 
   if (backendAnswer !== 'blazegraph' && backendAnswer !== 'sparql-http') {
     return { storeBlock: null };
@@ -330,9 +356,25 @@ export async function applyStoreFlagsToConfig(
     return;
   }
 
+  // Daemon-managed local Oxigraph server: no URL to validate (the daemon
+  // brings it up at boot). Write the block and return.
+  if (backend === 'oxigraph-server') {
+    const existing = await load();
+    // Preserve any existing managed-server overrides (port/location/cacheDir)
+    // that planManagedOxigraph reads at boot — re-running setup with
+    // `--store oxigraph-server` must not silently reset them to defaults.
+    const prevOptions =
+      existing.store?.backend === 'oxigraph-server' && existing.store.options
+        ? existing.store.options
+        : {};
+    await save({ ...existing, store: { backend: 'oxigraph-server', options: prevOptions } });
+    log('  Store configured: oxigraph-server (daemon-managed local server).');
+    return;
+  }
+
   if (backend !== 'blazegraph' && backend !== 'sparql-http') {
     throw new Error(
-      `--store must be one of: oxigraph, blazegraph, sparql-http (got "${backend}")`,
+      `--store must be one of: oxigraph, blazegraph, sparql-http, oxigraph-server (got "${backend}")`,
     );
   }
 

@@ -515,3 +515,57 @@ describe('ApiClient', () => {
     });
   });
 });
+
+describe('ApiClient — GitHub-shaped knowledge-assets SDK (OT-RFC-43 §10.5)', () => {
+  const originalFetch = globalThis.fetch;
+  let client: ApiClient;
+  const base = `http://127.0.0.1:${PORT}`;
+  beforeEach(() => { client = new ApiClient(PORT, 'test-token'); });
+  afterEach(() => { globalThis.fetch = originalFetch; });
+
+  function track(body: unknown = { ok: true }) {
+    const { fetch, calls } = createTrackingFetch({ ok: true, status: 200, body });
+    globalThis.fetch = fetch;
+    return calls;
+  }
+
+  it('createKnowledgeAsset POSTs to /api/knowledge-assets', async () => {
+    const calls = track({ name: 'f', status: 'wm-sealed' });
+    await client.createKnowledgeAsset('cg', 'f', { quads: [{ subject: 's', predicate: 'p', object: 'o', graph: '' }], alsoShareSwm: true });
+    expect(calls[0].url).toBe(`${base}/api/knowledge-assets`);
+    expect(calls[0].opts.method).toBe('POST');
+    const sent = JSON.parse(calls[0].opts.body as string);
+    expect(sent).toMatchObject({ contextGraphId: 'cg', name: 'f', alsoShareSwm: true });
+    expect(sent.quads).toHaveLength(1);
+  });
+
+  it('knowledgeAssetWrite POSTs to .../:name/wm/write (name URL-encoded)', async () => {
+    const calls = track({ written: 1 });
+    await client.knowledgeAssetWrite('cg', 'meeting notes', [{ subject: 's', predicate: 'p', object: 'o', graph: '' }]);
+    expect(calls[0].url).toBe(`${base}/api/knowledge-assets/meeting%20notes/wm/write`);
+    expect(JSON.parse(calls[0].opts.body as string)).toMatchObject({ contextGraphId: 'cg' });
+  });
+
+  it('knowledgeAssetShare → swm/share, knowledgeAssetPublish → vm/publish', async () => {
+    let calls = track({ swmShared: true, promotedCount: 2 });
+    await client.knowledgeAssetShare('cg', 'f');
+    expect(calls[0].url).toBe(`${base}/api/knowledge-assets/f/swm/share`);
+
+    calls = track({ kaId: '7', status: 'confirmed' });
+    await client.knowledgeAssetPublish('cg', 'f');
+    expect(calls[0].url).toBe(`${base}/api/knowledge-assets/f/vm/publish`);
+  });
+
+  it('knowledgeAssetPullFrom sends layer + onConflict', async () => {
+    const calls = track({ wmDraft: 'open' });
+    await client.knowledgeAssetPullFrom('cg', 'f', 'vm', { onConflict: 'replace' });
+    expect(calls[0].url).toBe(`${base}/api/knowledge-assets/f/wm/pull-from`);
+    expect(JSON.parse(calls[0].opts.body as string)).toMatchObject({ contextGraphId: 'cg', layer: 'vm', onConflict: 'replace' });
+  });
+
+  it('getKnowledgeAsset GETs .../:name?contextGraphId=', async () => {
+    const calls = track({ state: 'created' });
+    await client.getKnowledgeAsset('cg', 'f');
+    expect(calls[0].url).toBe(`${base}/api/knowledge-assets/f?contextGraphId=cg`);
+  });
+});

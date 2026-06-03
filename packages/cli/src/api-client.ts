@@ -459,6 +459,84 @@ export class ApiClient {
    * went through the legacy `/api/shared-memory/write` (now removed)
    * use this method instead.
    */
+  // ── OT-RFC-43 §10.5 — GitHub-shaped Knowledge Asset SDK ──────────────────
+  // Layer-explicit wrappers over /api/knowledge-assets/... (the new clean
+  // surface). The legacy assertion/* + shared-memory/* methods below remain
+  // for back-compat during the migration window.
+
+  /** Create a KA + open a WM draft (atomic: pass `quads` to auto write+finalize). */
+  async createKnowledgeAsset(
+    contextGraphId: string,
+    name: string,
+    options?: {
+      subGraphName?: string;
+      quads?: Array<{ subject: string; predicate: string; object: string; graph: string }>;
+      authorAgentAddress?: string;
+      alsoShareSwm?: boolean;
+      alsoPublishVm?: boolean | { epochs?: number; tokenAmount?: string };
+    },
+  ): Promise<Record<string, unknown>> {
+    return this.post('/api/knowledge-assets', { contextGraphId, name, ...(options ?? {}) });
+  }
+
+  /** GET a KA's lifecycle state by name. */
+  async getKnowledgeAsset(contextGraphId: string, name: string, subGraphName?: string): Promise<Record<string, unknown>> {
+    const qs = new URLSearchParams({ contextGraphId, ...(subGraphName ? { subGraphName } : {}) }).toString();
+    return this.get(`/api/knowledge-assets/${encodeURIComponent(name)}?${qs}`);
+  }
+
+  /** Append quads to the KA's WM draft. */
+  async knowledgeAssetWrite(
+    contextGraphId: string,
+    name: string,
+    quads: Array<{ subject: string; predicate: string; object: string; graph: string }>,
+    options?: { subGraphName?: string },
+  ): Promise<{ written: number }> {
+    return this.post(`/api/knowledge-assets/${encodeURIComponent(name)}/wm/write`, { contextGraphId, quads, ...(options ?? {}) });
+  }
+
+  /** Seal the WM draft (git commit). */
+  async knowledgeAssetFinalize(
+    contextGraphId: string,
+    name: string,
+    options?: { subGraphName?: string; authorAgentAddress?: string },
+  ): Promise<{ merkleRoot: string; eip712Digest: string }> {
+    return this.post(`/api/knowledge-assets/${encodeURIComponent(name)}/wm/finalize`, { contextGraphId, ...(options ?? {}) });
+  }
+
+  /** Discard the WM draft. */
+  async knowledgeAssetDiscard(contextGraphId: string, name: string, options?: { subGraphName?: string }): Promise<{ discarded: boolean }> {
+    return this.post(`/api/knowledge-assets/${encodeURIComponent(name)}/wm/discard`, { contextGraphId, ...(options ?? {}) });
+  }
+
+  /** Seed a fresh WM draft from the file's SWM/VM state (git checkout). */
+  async knowledgeAssetPullFrom(
+    contextGraphId: string,
+    name: string,
+    layer: 'swm' | 'vm',
+    options?: { subGraphName?: string; onConflict?: 'reject' | 'replace' },
+  ): Promise<Record<string, unknown>> {
+    return this.post(`/api/knowledge-assets/${encodeURIComponent(name)}/wm/pull-from`, { contextGraphId, layer, ...(options ?? {}) });
+  }
+
+  /** Advance the SWM pointer (WM → SWM; git push origin <branch>). */
+  async knowledgeAssetShare(
+    contextGraphId: string,
+    name: string,
+    options?: { subGraphName?: string; entities?: string[] | 'all' },
+  ): Promise<{ swmShared: boolean; promotedCount: number }> {
+    return this.post(`/api/knowledge-assets/${encodeURIComponent(name)}/swm/share`, { contextGraphId, ...(options ?? {}) });
+  }
+
+  /** Publish to VM (mint or update on chain; git push origin main). */
+  async knowledgeAssetPublish(
+    contextGraphId: string,
+    name: string,
+    options?: { subGraphName?: string; options?: Record<string, unknown> },
+  ): Promise<Record<string, unknown>> {
+    return this.post(`/api/knowledge-assets/${encodeURIComponent(name)}/vm/publish`, { contextGraphId, ...(options ?? {}) });
+  }
+
   async createAssertion(
     contextGraphId: string,
     name: string,

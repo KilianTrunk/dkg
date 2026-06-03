@@ -644,9 +644,13 @@ describe('DashboardDB — WAL reclaim', () => {
 
       walDb.prune();
 
+      // No competing readers in this test, so wal_checkpoint(TRUNCATE)
+      // must fully reclaim the file (busy = 0). Assert it is truncated to
+      // empty rather than merely "smaller" — a partial checkpoint that
+      // only shaved a few pages (the regression we want to catch) would
+      // still leave multiple MB here.
       const afterWal = statSync(walPath).size;
-      expect(afterWal).toBeLessThan(beforeWal);
-      expect(afterWal).toBeLessThanOrEqual(67108864);
+      expect(afterWal).toBe(0);
     } finally {
       walDb.close();
       rmSync(walDir, { recursive: true, force: true });

@@ -788,13 +788,27 @@ export class DashboardDB {
     // on the prune cadence (~6h) and immediately after the VACUUM above,
     // which rewrites the whole DB through the WAL and momentarily grows
     // it. Runs unconditionally — independent of the VACUUM gate — because
-    // an idle node still wants its -wal reclaimed. Best-effort: a
-    // concurrent reader can leave the checkpoint `busy` (no truncate),
-    // which is harmless and retried on the next prune.
+    // an idle node still wants its -wal reclaimed.
     try {
-      this.db.pragma('wal_checkpoint(TRUNCATE)');
+      // wal_checkpoint signals reader contention through its result row
+      // (`busy = 1`), NOT by throwing — so a busy checkpoint leaves the
+      // WAL un-truncated while looking like success. With better-sqlite3's
+      // single synchronous connection this should not happen, but surface
+      // it if it ever does so a silently-failing reclaim is observable
+      // rather than indistinguishable from a real one.
+      const [checkpoint] = this.db.pragma('wal_checkpoint(TRUNCATE)') as Array<{
+        busy: number;
+        log: number;
+        checkpointed: number;
+      }>;
+      if (checkpoint?.busy) {
+        console.warn(
+          `[DashboardDB] wal_checkpoint(TRUNCATE) busy — WAL not reclaimed this prune ` +
+            `(log=${checkpoint.log}, checkpointed=${checkpoint.checkpointed}); retried next prune`,
+        );
+      }
     } catch {
-      // Same rationale as the VACUUM skip above — never block prune.
+      // The pragma itself throwing is unexpected; never block prune.
     }
   }
 

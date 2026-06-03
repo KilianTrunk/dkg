@@ -1068,6 +1068,12 @@ export class PublishMethods extends DKGAgentBase {
     const v10ACKProvider = this.createV10ACKProvider(contextGraphId);
 
     const onChainId = await this.getContextGraphOnChainId(contextGraphId);
+    const directPublishEntityCount = canonicalPublishPayload(quads, privateQuads ?? []).manifestEntries.length;
+    if (directPublishEntityCount !== 1) {
+      throw new Error(
+        `V10 publish requires exactly one Knowledge Asset per transaction (got ${directPublishEntityCount})`,
+      );
+    }
 
     // RFC-001 §9.x — sign-at-creation. The publisher refuses on-chain
     // publishes without a `precomputedAttestation`, so the agent

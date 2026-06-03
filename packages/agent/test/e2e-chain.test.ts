@@ -362,10 +362,10 @@ describe('E2E: DKGAgent with real blockchain', () => {
   // -------------------------------------------------------------------------
   // Multi-entity publish — V10 greenfield rejects multi-root payloads.
   // The legacy "publishes multiple entities and queries them individually"
-  // case is gone: V10 enforces 1 KA per tx (the publisher manifest guard at
-  // dkg-publisher.ts:`requires exactly one Knowledge Asset per transaction`).
-  // This regression test pins the guard so a regression that quietly
-  // re-enables multi-root publishes cannot slip through.
+  // case is gone for direct agent.publish: use the SWM/finalization flow for
+  // durable multi-entity file publishes. This regression test pins the direct
+  // guard so a regression cannot quietly route bulk payloads through the
+  // synchronous publish path.
   // -------------------------------------------------------------------------
 
   it('rejects multi-root publish through agent.publish (V10 1-KA-per-tx guard)', async () => {

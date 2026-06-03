@@ -218,6 +218,30 @@ describe('listAssertions (WM) — URI parse + cg-scoped filter', () => {
     expect(countBody.sparql).toContain('COUNT');
   });
 
+  it('excludes the reserved meta sub-graph from the WM assertions list (Codex #944)', async () => {
+    // `<cg>/meta/assertion/…` graphs are profile / query-catalog drafts — UI
+    // configuration, not user knowledge — and must never reach the assertions
+    // table or the bulk-promote flow even though they carry a WM lifecycle
+    // marker. (The SPARQL also filters these daemon-side; this pins the
+    // parser-level defense.)
+    setBindings([
+      bRow('did:dkg:context-graph:cg-A/meta/assertion/0xabc/profile', 8),
+      bRow('did:dkg:context-graph:cg-A/assertion/0xabc/notes', 5),
+    ]);
+    const out = await listAssertions('cg-A', 'wm');
+    expect(out).toHaveLength(1);
+    expect(out[0].name).toBe('notes');
+  });
+
+  it('SPARQL excludes the meta namespace in both the list and count queries (Codex #944)', async () => {
+    setBindings([bRow('did:dkg:context-graph:cg-A/assertion/0xabc/notes', 5)]);
+    await listAssertions('cg-A', 'wm');
+    const [, listInit] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const [, countInit] = fetchMock.mock.calls[1] as [string, RequestInit];
+    expect(JSON.parse(String(listInit.body)).sparql).toContain('!CONTAINS(STR(?g), "/meta/")');
+    expect(JSON.parse(String(countInit.body)).sparql).toContain('!CONTAINS(STR(?g), "/meta/")');
+  });
+
   it('still lists WM assertions when the (best-effort) count query fails', async () => {
     // Codex #944 — the triple-count query feeds only the badge, so a count
     // failure must NOT drop the whole WM list and regress promote to "no

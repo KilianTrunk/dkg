@@ -824,12 +824,23 @@ export async function listAssertions(
   // promote flow back to "no assertions". Its rejection is swallowed to `null`
   // (rows then render with `tripleCount: undefined`); the membership query
   // stays authoritative and its rejection still propagates.
+  // Exclude the reserved `meta` namespace. Profile / query-catalog artifacts
+  // (prof:Profile, prof:SavedQuery, …) are published as WM-marked assertions
+  // under `<cg>/meta/assertion/<addr>/<name>`, so a bare `memoryLayer "WM"`
+  // join scoops them in alongside real user knowledge. Since this listing
+  // feeds the assertions table + bulk-promote, those UI-config drafts would
+  // otherwise be promotable into SWM. Mirror the meta-exclusion policy
+  // `useMemoryEntities.wmSparql` already enforces (`STR(?g) != "<cg>/meta"`,
+  // `!CONTAINS("/meta/")`, `!STRENDS("/_meta")`).
+  const metaFilter = `FILTER(STR(?g) != "${cgPrefix}meta" && !CONTAINS(STR(?g), "/meta/") && !STRENDS(STR(?g), "/_meta"))`;
   const listSparql = `SELECT ?g WHERE {
     GRAPH <${metaGraph}> { ?g <http://dkg.io/ontology/memoryLayer> "WM" }
+    ${metaFilter}
   }`;
   const countSparql = `SELECT ?g (COUNT(*) AS ?cnt) WHERE {
     GRAPH <${metaGraph}> { ?g <http://dkg.io/ontology/memoryLayer> "WM" }
     GRAPH ?g { ?s ?p ?o }
+    ${metaFilter}
   } GROUP BY ?g`;
   const [listData, countData] = await Promise.all([
     postQueryDeduped({ sparql: listSparql, contextGraphId, includeContextGraphPartitions: true }),
@@ -875,6 +886,12 @@ export async function listAssertions(
       continue;
     }
     if (!name) continue;
+    // Defense-in-depth for the meta-namespace exclusion above: the reserved
+    // `meta` sub-graph (`<cg>/meta/assertion/…` profile/query-catalog drafts)
+    // is UI configuration, not user knowledge, and must never reach the
+    // assertions table or the bulk-promote flow. The SPARQL `metaFilter`
+    // already drops these daemon-side; this guards the parser too.
+    if (subGraph === 'meta') continue;
     const cnt = countByGraph.get(g);
     result.push({ name, graphUri: g, tripleCount: cnt, subGraph });
   }

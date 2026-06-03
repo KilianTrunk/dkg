@@ -127,7 +127,12 @@ export function MemoryLayerView({ layer, contextGraphId, externalQuery, external
       //     would let SWM/VM triples bleed into the WM tab, so we gate `?g` on
       //     the `<cg>/_meta` `dkg:memoryLayer "WM"` lifecycle marker (the same
       //     authority `listWmAssertions` uses) and read only those graphs.
-      return `SELECT ?s ?p ?o WHERE { GRAPH <${metaGraph}> { ?g <http://dkg.io/ontology/memoryLayer> "WM" } GRAPH ?g { ?s ?p ?o } } LIMIT 1000`;
+      //  3. Exclude the reserved `meta` namespace (`<cg>/meta/assertion/…`
+      //     profile/query-catalog drafts are WM-marked but are UI config, not
+      //     user knowledge), mirroring `listWmAssertions` + the
+      //     `useMemoryEntities.wmSparql` meta-exclusion policy.
+      const cgPrefix = `did:dkg:context-graph:${contextGraphId}/`;
+      return `SELECT ?s ?p ?o WHERE { GRAPH <${metaGraph}> { ?g <http://dkg.io/ontology/memoryLayer> "WM" } GRAPH ?g { ?s ?p ?o } FILTER(STR(?g) != "${cgPrefix}meta" && !CONTAINS(STR(?g), "/meta/") && !STRENDS(STR(?g), "/_meta")) } LIMIT 1000`;
     }
     if (layer === 'vm') {
       return buildVerifiedMemorySearchQuery({

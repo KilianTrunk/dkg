@@ -10,7 +10,7 @@ import { defineSuite } from 'esbench';
 import { OxigraphStore } from '../packages/storage/src/adapters/oxigraph.ts';
 import { OxigraphWorkerStore } from '../packages/storage/src/adapters/oxigraph-worker.ts';
 import type { Quad, QueryResult } from '../packages/storage/src/triple-store.ts';
-import { GET_TOTAL_TRIPLES_SPARQL } from '../packages/cli/src/daemon/metrics-queries.ts';
+import { GET_TOTAL_TRIPLES_SPARQL, parseRdfInt } from '../packages/cli/src/daemon/metrics-queries.ts';
 import { benchAsyncWithHooks } from './support/esbench-case-hooks.ts';
 
 /**
@@ -89,9 +89,10 @@ function assertCountAtLeast(result: QueryResult, min: number, label: string): vo
   if (result.type !== 'bindings' || result.bindings.length === 0) {
     throw new Error(`${label} returned no count row — read path regressed`);
   }
-  // Count comes back as an RDF integer literal, e.g. `"1000"^^<…#integer>`.
-  const count = Number.parseInt(String(result.bindings[0]['c'] ?? '').replace(/^"/, ''), 10);
-  if (!Number.isFinite(count) || count < min) {
+  // Parse with the SAME helper the daemon's metrics collector uses, so the
+  // benchmark can't disagree with production on a given response shape.
+  const count = parseRdfInt(result.bindings[0]['c']);
+  if (count < min) {
     throw new Error(`${label} count ${count} below expected minimum ${min} — store under-populated or read path regressed`);
   }
 }

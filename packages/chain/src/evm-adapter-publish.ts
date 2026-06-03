@@ -702,12 +702,9 @@ export class PublishMethods extends EVMChainAdapterBase {
     // sizing for both V10 surfaces. The default `per-publish` policy
     // floors at 1n so metadata-only updates with `newTokenAmount === 0n`
     // still satisfy the contract's `transferFrom(..., 1n)` minimum.
-    await this.ensureV10ApproveTrac(
-      signer,
-      kav10Address,
-      newTokenAmount,
-      'approve V10 update TRAC',
-    );
+    // #953: the approve runs INSIDE the per-wallet serialized window below
+    // (it sends its own tx on `signer`), not here — see the buildSignedTx
+    // closure passed to `dispatchSerializedV10Write`.
 
     // P-1 review (Codex iter-5): same pattern as the publish path —
     // break the single contract call into populate / sign / hook /
@@ -723,33 +720,41 @@ export class PublishMethods extends EVMChainAdapterBase {
     // as exposed to a stale `TooLowAllowance` read on a load-balanced RPC, so
     // route both V10 write paths through the shared helper. Strictly
     // pre-broadcast — no on-chain side effect from the forced re-approve.
-    const { signedTx, txHash: preBroadcastTxHash } =
-      await this.populateAndSignV10WithAllowanceRecovery(
-        signer,
-        ka as Contract,
-        'update',
-        updateParams,
-        kav10Address,
-        newTokenAmount,
-        'approve V10 update TRAC (forced re-approve, #888)',
-      );
-    // Codex PR #241 iter-7: `await` so async WAL writes complete
-    // before broadcast (see publish above for the full rationale).
-    try {
-      await params.onBroadcast?.({ txHash: preBroadcastTxHash });
-    } catch (hookErr) {
-      throw new Error(
-        `chain:writeahead hook failed before update broadcast: ` +
-        `${hookErr instanceof Error ? hookErr.message : String(hookErr)}`,
-      );
-    }
-    const receipt = await this.sendSignedTransactionAndWait(signedTx, preBroadcastTxHash, 'V10 update');
-    if (!receipt) {
-      throw new Error(
-        `update broadcast succeeded (txHash=${preBroadcastTxHash}) but receipt was null ` +
-        `— the tx was likely replaced or dropped before confirmation`,
-      );
-    }
+    // #888 + #953: same shared dispatch as the publish path — populate+sign
+    // with one-shot allowance recovery, WAL checkpoint, broadcast, all
+    // serialized per operational wallet so concurrent same-wallet writes
+    // can't collide on the `pending` nonce.
+    const receipt = await this.dispatchSerializedV10Write(
+      signer,
+      'update',
+      params.onBroadcast,
+      async () => {
+        // #953: approve INSIDE the per-wallet lock (it sends its own tx on
+        // `signer`) so a concurrent same-wallet update/publish can't race on
+        // the approve nonce.
+        await this.ensureV10ApproveTrac(
+          signer,
+          kav10Address,
+          newTokenAmount,
+          'approve V10 update TRAC',
+        );
+        return this.populateAndSignV10WithAllowanceRecovery(
+          signer,
+          ka as Contract,
+          'update',
+          updateParams,
+          kav10Address,
+          newTokenAmount,
+          'approve V10 update TRAC (forced re-approve, #888)',
+        );
+      },
+      (preBroadcastTxHash) => {
+        throw new Error(
+          `update broadcast succeeded (txHash=${preBroadcastTxHash}) but receipt was null ` +
+          `— the tx was likely replaced or dropped before confirmation`,
+        );
+      },
+    );
 
     return {
       hash: receipt.hash,

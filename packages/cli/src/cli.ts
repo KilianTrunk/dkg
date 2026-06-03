@@ -7,6 +7,7 @@ import { spawn, execSync } from 'node:child_process';
 import { createReadStream } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { homedir } from 'node:os';
 import { readFile, writeFile, unlink, appendFile } from 'node:fs/promises';
 import { ethers } from 'ethers';
 import { resolveRpcUrls } from '@origintrail-official/dkg-chain';
@@ -26,7 +27,7 @@ import {
   apiPortPath,
   loadNetworkConfig, loadProjectConfig, resolveAutoUpdateConfig, resolveAutoUpdateSource, resolveChainConfig,
   releasesDir, activeSlot, swapSlot,
-  slotEntryPoint, isStandaloneInstall, repoDir, isDkgMonorepo,
+  slotEntryPoint, isStandaloneInstall, repoDir, isDkgMonorepo, classifyMonorepoInit, sharedHomeInitGate,
   resolveContextGraphs, resolveNetworkDefaultContextGraphs,
   readNodeRoleFromConfigSync,
   type AutoUpdateConfig,
@@ -598,35 +599,79 @@ program
     '--store-url <url>',
     'Pre-fill the SPARQL endpoint URL prompt for external backends.',
   )
+  .option(
+    '-y, --yes',
+    'Skip the confirmation prompt when running from a monorepo checkout into an existing ~/.dkg home (non-interactive opt-in to modifying it).',
+  )
   .action(async (opts: ActionOpts) => {
-    // OT-RFC-41 Bundle B1c: monorepo guard. `dkg init` from a
-    // contributor checkout is almost always a mistake — the
-    // monorepo dev workflow is `pnpm dev` against the local CLI,
-    // not a globally-installed config. Surface this loudly so
-    // contributors don't accidentally write an Edge-style
-    // ~/.dkg/config.json that then disagrees with the binary on
-    // their $PATH.
-    if (isDkgMonorepo()) {
-      console.error(
-        '\n[dkg init] Refusing to run from a DKG monorepo checkout.\n' +
-          '\n' +
-          '  Detected monorepo root: ' + (repoDir() ?? '(unknown)') + '\n' +
-          '\n' +
-          "  Monorepo dev workflow uses 'pnpm dev' against the local CLI build; ~/.dkg/config.json\n" +
-          "  is for npm-installed nodes (`npm install -g @origintrail-official/dkg`). Writing one\n" +
-          '  here would diverge from how the local CLI resolves its own working state.\n' +
-          '\n' +
-          '  If you really want to bootstrap a config for testing from this checkout, set\n' +
-          '  DKG_HOME to a scratch directory:\n' +
-          '\n' +
-          '    DKG_HOME=/tmp/dkg-test dkg init\n' +
-          '\n' +
-          '  RFC: https://github.com/OriginTrail/dkgv10-spec/blob/main/rfcs/OT-RFC-41-edge-node-npm-only-install-and-update.md\n' +
-          '\n',
-      );
-      process.exit(1);
+    // OT-RFC-41 follow-up (issue #960): `dkg init` runs normally from a monorepo
+    // checkout, exactly like an npm install — the only difference is the home
+    // directory. The CLI's home resolver (`dkgDir()` → `resolveDkgConfigHome`)
+    // routes a clone to `~/.dkg-dev` (kept separate from an npm install's
+    // `~/.dkg`), the SAME home the local dev daemon resolves. (PR #753 /
+    // Bundle B1c hard-refused all monorepo inits; that was over-strict.)
+    //
+    // The one risky case is `shared-npm-home`: a clone with no `DKG_HOME` where
+    // the resolver fell back to a pre-existing `~/.dkg` (which *might* be an
+    // npm-installed node). We must neither silently proceed (a missed warning
+    // would mutate that node's config) nor hard-block (config presence isn't
+    // proof of ownership, and a dev may target `~/.dkg` on purpose), so we
+    // require an explicit opt-in via `sharedHomeInitGate`: confirm interactively
+    // or pass `--yes`. See `classifyMonorepoInit` + `sharedHomeInitGate`.
+    switch (classifyMonorepoInit({
+      isMonorepo: isDkgMonorepo(),
+      dkgHomeEnv: process.env.DKG_HOME,
+      resolvedHome: dkgDir(),
+      npmHome: join(homedir(), '.dkg'),
+    })) {
+      case 'dev-home':
+        console.log(
+          `[dkg init] Monorepo checkout detected — writing dev config to ${dkgDir()} ` +
+            `(set DKG_HOME to override).`,
+        );
+        break;
+      case 'shared-npm-home': {
+        const home = dkgDir();
+        const gate = sharedHomeInitGate({
+          yes: opts.yes === true,
+          isTty: Boolean(process.stdin.isTTY),
+        });
+        if (gate === 'refuse') {
+          console.error(
+            `\n[dkg init] Refusing to modify the existing config home ${home} non-interactively.\n` +
+              `  A config already exists there and this is a monorepo checkout, so it may belong\n` +
+              `  to an npm-installed node. To proceed, choose one:\n` +
+              `    • re-run interactively and confirm at the prompt, or\n` +
+              `    • pass --yes to opt in explicitly, or\n` +
+              `    • keep this checkout isolated:  DKG_HOME=~/.dkg-dev dkg init\n`,
+          );
+          process.exit(1);
+        }
+        if (gate === 'prompt') {
+          const confirmRl = createInterface({ input: process.stdin, output: process.stdout });
+          const confirmed = await new Promise<boolean>(resolve => {
+            confirmRl.question(
+              `\n[dkg init] ⚠️  ${home} already contains a DKG config and this is a monorepo\n` +
+                `  checkout — it may belong to an npm-installed node. Continuing will read and\n` +
+                `  may OVERWRITE it. (Use DKG_HOME=~/.dkg-dev to keep this checkout isolated.)\n` +
+                `  Continue and modify ${home}? [y/N]: `,
+              answer => resolve(/^y(es)?$/i.test(answer.trim())),
+            );
+          }).finally(() => confirmRl.close());
+          if (!confirmed) {
+            console.error(`\n[dkg init] Aborted — ${home} left unchanged.\n`);
+            process.exit(1);
+          }
+        }
+        console.warn(
+          `[dkg init] Proceeding into existing ${home}` +
+            `${opts.yes === true ? ' (--yes)' : ' (confirmed)'}.`,
+        );
+        break;
+      }
+      default:
+        break;
     }
-
 
     await ensureDkgDir();
     const existing = await loadConfig();

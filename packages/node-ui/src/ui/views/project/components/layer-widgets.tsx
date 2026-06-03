@@ -1,0 +1,242 @@
+import React, { useMemo, useState, useCallback } from 'react';
+import type { ReactNode } from 'react';
+import { listAssertions, promoteAssertion, describePromoteError, publishSharedMemory, listSwmEntities } from '../../../api.js';
+import type { MemoryEntity } from '../../../hooks/useMemoryEntities.js';
+import { useProjectProfileContext } from '../../../hooks/useProjectProfile.js';
+import { LAYER_CONFIG, entityMeta, layerNoun } from '../helpers.js';
+import { EmptyState, StatStrip, toneForLayer } from '../../../components/ContextGraphPrimitives.js';
+
+// ─── Generative Widget Components ─────────────────────────────
+
+export function GenWidget({ title, agent, footnote, dismissed, onDismiss, children }: {
+  title: string;
+  agent?: string;
+  footnote?: string;
+  dismissed?: boolean;
+  onDismiss?: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className={`v10-gen-widget ${dismissed ? 'dissolved' : ''}`}>
+      <div className="v10-gen-widget-header">
+        <span className="v10-gen-widget-title">{title}</span>
+        <div className="v10-gen-widget-right">
+          {agent && (
+            <span className="v10-gen-widget-agent">
+              <span className="v10-gen-widget-agent-dot" />
+              {agent}
+            </span>
+          )}
+          {onDismiss && (
+            <button className="v10-gen-widget-dismiss" onClick={onDismiss}>✕</button>
+          )}
+        </div>
+      </div>
+      <div className="v10-gen-widget-body">{children}</div>
+      {footnote && <div className="v10-gen-widget-footnote">{footnote}</div>}
+    </div>
+  );
+}
+
+export function TypeBreakdownWidget({ entities }: { entities: MemoryEntity[] }) {
+  const profile = useProjectProfileContext();
+  const breakdown = useMemo(() => {
+    const counts = new Map<string, { icon: string; count: number }>();
+    for (const e of entities) {
+      const { icon, type } = entityMeta(e, profile);
+      const existing = counts.get(type);
+      if (existing) existing.count++;
+      else counts.set(type, { icon, count: 1 });
+    }
+    return [...counts.entries()].sort((a, b) => b[1].count - a[1].count);
+  }, [entities, profile]);
+
+  if (breakdown.length === 0) return null;
+
+  return (
+    <GenWidget title="Entity Types">
+      <StatStrip
+        compact
+        items={breakdown.map(([type, { icon, count }]) => ({
+          id: type,
+          label: `${icon} ${type}`,
+          value: count,
+        }))}
+      />
+    </GenWidget>
+  );
+}
+
+export function LayerStatsWidget({ entities, entityCount, triples, layer }: {
+  entities: MemoryEntity[];
+  entityCount: number;
+  triples: number;
+  layer: 'wm' | 'swm' | 'vm';
+}) {
+  const docCount = useMemo(
+    () => entities.filter(e => e.properties.has('http://dkg.io/ontology/sourceContentType')).length,
+    [entities]
+  );
+  const totalConns = useMemo(
+    () => entities.reduce((sum, e) => sum + e.connections.length, 0),
+    [entities]
+  );
+  const avgConns = entities.length > 0 ? (totalConns / entities.length).toFixed(1) : '0';
+  return (
+    <GenWidget title="Layer Stats">
+      <StatStrip
+        compact
+        layer={layer}
+        items={[
+          { id: 'entities', label: layerNoun(layer, entityCount), value: entityCount },
+          { id: 'triples', label: 'Triples', value: triples },
+          { id: 'connections', label: 'Connections', value: totalConns },
+          { id: 'avg', label: 'Avg. connections / entity', value: avgConns },
+          ...(docCount > 0 ? [{ id: 'documents', label: 'Documents', value: docCount }] : []),
+        ]}
+      />
+    </GenWidget>
+  );
+}
+
+function requireSinglePublishRoot(roots: string[]): string[] {
+  const uniqueRoots = [...new Set(roots.filter(Boolean))];
+  if (uniqueRoots.length !== 1) {
+    throw new Error('V10 publish requires exactly one root entity per request. Select one root and publish again.');
+  }
+  return uniqueRoots;
+}
+
+async function fetchSingleSwmRoot(contextGraphId: string): Promise<string[]> {
+  const roots = (await listSwmEntities(contextGraphId)).map((entity) => entity.uri);
+  return requireSinglePublishRoot(roots);
+}
+
+export function LayerActionsWidget({ layer, count, contextGraphId, entities, onComplete }: {
+  layer: 'wm' | 'swm';
+  count: number;
+  contextGraphId: string;
+  entities: MemoryEntity[];
+  onComplete: () => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const isWm = layer === 'wm';
+
+  const handleAction = useCallback(async () => {
+    setBusy(true);
+    setError(null);
+    setResult(null);
+    // Issue #864 (Codex review on #874) — track the in-flight
+    // assertion so mid-loop failures surface "<name>: …" instead of
+    // the generic "an assertion …".
+    let currentAssertion: string | null = null;
+    try {
+      if (isWm) {
+        const assertions = await listAssertions(contextGraphId, 'wm');
+        let promoted = 0;
+        let noopCount = 0;
+        for (const a of assertions) {
+          currentAssertion = a.name;
+          // PR #710 — thread `subGraph` so sub-graph-scoped assertions
+          // hit the correct daemon lookup key `(cg, name, subGraph)`.
+          const res = await promoteAssertion(contextGraphId, a.name, 'all', a.subGraph);
+          promoted += res.promotedCount;
+          if (res.promotedCount === 0) noopCount += 1;
+        }
+        // Issue #864 — flag the "nothing was actually moved" case so
+        // users on the bulk-promote widget aren't lied to by a
+        // "Promoted 0 triples" success toast.
+        if (promoted > 0) {
+          const tail = noopCount > 0 ? ` (${noopCount} had nothing to promote)` : '';
+          setResult(`Promoted ${promoted} triple${promoted !== 1 ? 's' : ''} to Shared Memory${tail}`);
+        } else {
+          setResult('No triples were promoted — every assertion was already in Shared Memory or its content is still being committed.');
+        }
+      } else {
+        const roots = requireSinglePublishRoot(entities.map((entity) => entity.uri));
+        await publishSharedMemory(contextGraphId, roots);
+        setResult('Published to Verifiable Memory');
+      }
+      onComplete?.();
+    } catch (err: any) {
+      const typed = describePromoteError(currentAssertion ?? 'an assertion', err);
+      setError(typed ? typed.message : (err?.message ?? 'Action failed'));
+    } finally {
+      setBusy(false);
+    }
+  }, [isWm, entities, contextGraphId, onComplete]);
+
+  if (count === 0) return null;
+  const color = isWm ? '#f59e0b' : '#22c55e';
+  const target = isWm ? 'Shared Working Memory' : 'Verifiable Memory';
+  const noun = layerNoun(layer, count).toLowerCase();
+
+  return (
+    <GenWidget title={isWm ? 'Promote' : 'Publish'} footnote={`Moves ${noun} from this layer to ${target}.`}>
+      <div className="v10-decision-context" style={{ marginBottom: 10 }}>
+        {count} {noun} in this layer can be {isWm ? 'promoted to Shared Working Memory for collaborative review' : 'published to Verifiable Memory on-chain'}.
+      </div>
+      {result && <div style={{ fontSize: 11, color: 'var(--text-success)', marginBottom: 8 }}>✓ {result}</div>}
+      {error && <div style={{ fontSize: 11, color: 'var(--text-danger)', marginBottom: 8 }}>✕ {error}</div>}
+      <div className="v10-decision-actions">
+        <button
+          className={isWm ? 'v10-decision-btn approve' : 'v10-decision-btn primary-cta publish-vm'}
+          style={isWm
+            ? { borderColor: `${color}50`, color: 'var(--text-warning)', background: `${color}15`, opacity: busy ? 0.5 : 1 }
+            : { opacity: busy ? 0.5 : 1 }}
+          disabled={busy}
+          onClick={handleAction}
+        >
+          {busy ? '...' : (isWm ? '✓ Promote All → Shared' : '◉ Publish to Verifiable Memory')}
+        </button>
+      </div>
+    </GenWidget>
+  );
+}
+
+// ─── Horizontal widget strip (stats + types + CTA) for the Entities tab ──
+
+export function LayerWidgetStrip({ layer, entities, entityCount, tripleCount, contextGraphId, onComplete }: {
+  layer: 'wm' | 'swm' | 'vm';
+  entities: MemoryEntity[];
+  entityCount: number;
+  tripleCount: number;
+  contextGraphId?: string;
+  onComplete?: () => void;
+}) {
+  if (entityCount === 0) {
+    return (
+      <div className="v10-layer-widgets-strip empty">
+        <EmptyState
+          compact
+          tone={toneForLayer(layer)}
+          icon={LAYER_CONFIG[layer].icon}
+          title={`No ${layerNoun(layer, 2).toLowerCase()} yet`}
+          description={
+            layer === 'wm'
+              ? 'Import data or chat with agents to populate Working Memory.'
+              : layer === 'swm'
+                ? 'Promote entities from Working Memory to share them with the team.'
+                : 'Publish entities from Shared Working Memory to verify them on-chain.'
+          }
+        />
+      </div>
+    );
+  }
+  return (
+    <div className="v10-layer-widgets-strip">
+      <div className="v10-layer-widgets-strip-stats">
+        <LayerStatsWidget entities={entities} entityCount={entityCount} triples={tripleCount} layer={layer} />
+        <TypeBreakdownWidget entities={entities} />
+      </div>
+      {(layer === 'wm' || layer === 'swm') && (
+        <div className="v10-layer-widgets-strip-action">
+          <LayerActionsWidget layer={layer} count={entityCount} entities={entities} contextGraphId={contextGraphId} onComplete={onComplete} />
+        </div>
+      )}
+    </div>
+  );
+}
+

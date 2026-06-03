@@ -20,6 +20,7 @@ import {
   Hub,
   KnowledgeAssetsLifecycle,
   DKGKnowledgeAssets,
+  ParametersStorage,
   Profile,
   PublishingConviction,
   StakingV10,
@@ -31,7 +32,11 @@ import {
   getDefaultPublishingNode,
   getDefaultReceivingNodes,
 } from './helpers/setup-helpers';
-import { buildPublishParams, DEFAULT_CHAIN_ID } from './helpers/v10-kc-helpers';
+import {
+  buildPublishParams,
+  buildUpdateParams,
+  DEFAULT_CHAIN_ID,
+} from './helpers/v10-kc-helpers';
 
 const COMMITTED_TRAC = ethers.parseEther('50000'); // 20% discount tier
 const EXPECTED_DISCOUNT_BPS = 2000n;
@@ -453,5 +458,302 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
     expect(
       await DKGKnowledgeAssets.getLatestKnowledgeAssetId(),
     ).to.equal(0n);
+  });
+
+  // --------------------------------------------------------------------------
+  // 4. Greenfield KA invariants (KC→KA rename / PR #815)
+  // --------------------------------------------------------------------------
+  //
+  // These guard the core economic + ownership invariants of the greenfield
+  // Knowledge Asset model that the KC→KA rename re-plumbed. Before this
+  // block the `KnowledgeAssetsLifecycle.publish` negatives (one-KA-per-tx,
+  // strict-positive token floor) and the owner-sealed update gate had no
+  // direct on-chain coverage — only happy-path publishes were exercised, so
+  // a regression that dropped a gate or renamed an error would have shipped
+  // green. Each test pins the EXACT custom error (and args) rather than a
+  // bare `to.be.reverted`, so a renamed/removed revert turns the lane red.
+
+  const buildBasePublishParams = async (
+    setup: Awaited<ReturnType<typeof setupRegisteredAgentPublish>>,
+    label: string,
+    overrides: Partial<Parameters<typeof buildPublishParams>[0]> = {},
+  ) =>
+    buildPublishParams({
+      chainId: DEFAULT_CHAIN_ID,
+      kav10Address: await KAV10.getAddress(),
+      receivingNodes: setup.receivingNodes,
+      publisherIdentityId: setup.publisherIdentityId,
+      receiverIdentityIds: setup.receiverIdentityIds,
+      author: setup.creator,
+      contextGraphId: setup.cgId,
+      merkleRoot: ethers.keccak256(ethers.toUtf8Bytes(label)),
+      knowledgeAssetsAmount: 1,
+      byteSize: 1000,
+      epochs: setup.epochs,
+      tokenAmount: ethers.parseEther('1000'),
+      isImmutable: false,
+      publishOperationId: `${label}-op`,
+      ...overrides,
+    });
+
+  it('greenfield: publish reverts InvalidKnowledgeAssetsAmount unless exactly one KA is minted per tx', async () => {
+    const setup = await setupRegisteredAgentPublish();
+    // The author attestation does NOT commit to knowledgeAssetsAmount, so the
+    // amount gate (`_executePublishCore`) is reached before the ACK signature
+    // check — flipping the count to anything but 1 must revert with the
+    // amount echoed back.
+    for (const amount of [0, 2, 5]) {
+      const p = await buildBasePublishParams(setup, `amount-gate-${amount}`, {
+        knowledgeAssetsAmount: amount,
+      });
+      await expect(KAV10.connect(setup.creator).publish(p))
+        .to.be.revertedWithCustomError(KAV10, 'InvalidKnowledgeAssetsAmount')
+        .withArgs(BigInt(amount));
+    }
+    // None of the reverted attempts minted a token.
+    expect(await DKGKnowledgeAssets.getLatestKnowledgeAssetId()).to.equal(0n);
+  });
+
+  it('greenfield: publish reverts InvalidTokenAmount(1,0) on a zero token amount (strict-positive floor)', async () => {
+    const setup = await setupRegisteredAgentPublish();
+    const p = await buildBasePublishParams(setup, 'token-floor', {
+      tokenAmount: 0n,
+    });
+    await expect(KAV10.connect(setup.creator).publish(p))
+      .to.be.revertedWithCustomError(KAV10, 'InvalidTokenAmount')
+      .withArgs(1, 0);
+    expect(await DKGKnowledgeAssets.getLatestKnowledgeAssetId()).to.equal(0n);
+  });
+
+  it('greenfield: a successful publish mints exactly one KA (id 1) to the author and binds it to the CG', async () => {
+    const setup = await setupRegisteredAgentPublish();
+    const p = await buildBasePublishParams(setup, 'greenfield-mint');
+    await (await KAV10.connect(setup.creator).publish(p)).wait();
+
+    // Exactly one KA, id starts at 1 (greenfield: kaId == tokenId == batchId).
+    const kaId = await DKGKnowledgeAssets.getLatestKnowledgeAssetId();
+    expect(kaId).to.equal(1n);
+    // Minted to the attesting author (not the relaying node / msg.sender path).
+    expect(await DKGKnowledgeAssets.ownerOf(kaId)).to.equal(
+      setup.creator.address,
+    );
+    // Atomic kaId → cgId binding written by `registerKnowledgeAsset`.
+    expect(await CGS.kaToContextGraph(kaId)).to.equal(setup.cgId);
+  });
+
+  it('greenfield: update is owner-sealed — a valid attestation from a non-owner reverts NotKnowledgeAssetOwner', async () => {
+    const setup = await setupRegisteredAgentPublish();
+    const p = await buildBasePublishParams(setup, 'owner-gate-publish');
+    await (await KAV10.connect(setup.creator).publish(p)).wait();
+    const kaId = await DKGKnowledgeAssets.getLatestKnowledgeAssetId();
+    expect(kaId).to.equal(1n);
+    expect(await DKGKnowledgeAssets.ownerOf(kaId)).to.equal(
+      setup.creator.address,
+    );
+
+    // A non-owner who correctly signs the EIP-712 update attestation over
+    // THEIR OWN address passes `_verifyUpdateAuthorAttestation` but must still
+    // be rejected by the ownerOf gate. `msg.sender` is the authorized CG
+    // publisher (creator) so the policy branch is not what trips — the owner
+    // mismatch is.
+    const nonOwner = accounts[8];
+    expect(nonOwner.address).to.not.equal(setup.creator.address);
+
+    const up = await buildUpdateParams({
+      chainId: DEFAULT_CHAIN_ID,
+      kav10Address: await KAV10.getAddress(),
+      receivingNodes: setup.receivingNodes,
+      publisherIdentityId: setup.publisherIdentityId,
+      receiverIdentityIds: setup.receiverIdentityIds,
+      contextGraphId: setup.cgId,
+      id: kaId,
+      preUpdateMerkleRootCount: 1n, // fresh KA from a single publish
+      newMerkleRoot: ethers.keccak256(ethers.toUtf8Bytes('owner-gate-update')),
+      newByteSize: 1000n,
+      newTokenAmount: ethers.parseEther('1'),
+      mintKnowledgeAssetsAmount: 0n,
+      knowledgeAssetsToBurn: [],
+      updateOperationId: 'owner-gate-update-op',
+      author: nonOwner,
+    });
+
+    await expect(KAV10.connect(setup.creator).update(up))
+      .to.be.revertedWithCustomError(KAV10, 'NotKnowledgeAssetOwner')
+      .withArgs(kaId, setup.creator.address, nonOwner.address);
+  });
+
+  // --------------------------------------------------------------------------
+  // 5. Protocol treasury fee split on the direct-spend path (v10.0.2)
+  // --------------------------------------------------------------------------
+  //
+  // `_addTokens` skims the protocol treasury fee out of the staker-bound
+  // TRAC on every paid publish/update/lifetime-extension. The split is a
+  // conservation invariant — `fee + net == gross`, the publisher pays the
+  // gross, nothing is minted or burned — yet it had NO test. A regression
+  // that double-charged the fee, paid it out of thin air, or skewed the
+  // split would have shipped green. These two tests pin BOTH branches of
+  // `_treasuryFee`: governance opted-in (recipient wired) and the SHIPPING
+  // default (recipient unset → fee dormant, full gross to stakers).
+  //
+  // Both force the DIRECT-SPEND branch by publishing with
+  // `epochs != lockDurationEpochs`, which fails PCA eligibility gate (3) so
+  // `_addTokens` runs against the publisher's own wallet (no time travel,
+  // the PCA stays live).
+
+  it('treasury: direct-spend publish skims the protocol fee — fee + staker-net == gross', async () => {
+    const setup = await setupRegisteredAgentPublish();
+
+    const Parameters =
+      await hre.ethers.getContract<ParametersStorage>('ParametersStorage');
+    const treasury = accounts[6];
+    const feeBps = 500n; // 5% — well under MAX_PROTOCOL_TREASURY_FEE (1000)
+    await Parameters.setProtocolTreasury(treasury.address);
+    await Parameters.setProtocolTreasuryFee(feeBps);
+    expect(await Parameters.protocolTreasury()).to.equal(treasury.address);
+
+    const tokenAmount = ethers.parseEther('1000');
+    const expectedFee = (tokenAmount * feeBps) / 10_000n; // 50 ether
+    const expectedNet = tokenAmount - expectedFee; // 950 ether
+
+    // Fund the publisher (msg.sender on direct-spend) for the gross + approve.
+    await Token.mint(setup.creator.address, tokenAmount);
+    await Token.connect(setup.creator).approve(
+      await KAV10.getAddress(),
+      tokenAmount,
+    );
+
+    const cssAddr = await ConvictionStakingStorage.getAddress();
+    const treasuryBefore = await Token.balanceOf(treasury.address);
+    const cssBefore = await Token.balanceOf(cssAddr);
+    const creatorBefore = await Token.balanceOf(setup.creator.address);
+
+    const p = await buildBasePublishParams(setup, 'treasury-split', {
+      epochs: setup.epochs + 1, // breaks the PCA discount-branch eligibility
+      tokenAmount,
+    });
+    await (await KAV10.connect(setup.creator).publish(p)).wait();
+
+    const feePaid = (await Token.balanceOf(treasury.address)) - treasuryBefore;
+    const netToStakers = (await Token.balanceOf(cssAddr)) - cssBefore;
+    const creatorSpent =
+      creatorBefore - (await Token.balanceOf(setup.creator.address));
+
+    expect(feePaid).to.equal(expectedFee);
+    expect(netToStakers).to.equal(expectedNet);
+    // Conservation: the fee is carved OUT of the gross (not added on top);
+    // the publisher pays exactly the gross and nothing is minted/burned.
+    expect(feePaid + netToStakers).to.equal(tokenAmount);
+    expect(creatorSpent).to.equal(tokenAmount);
+  });
+
+  it('treasury: with no recipient wired (shipping default) the FULL gross reaches stakers', async () => {
+    const setup = await setupRegisteredAgentPublish();
+
+    // Default deploy: protocolTreasury == address(0) with a NON-zero default
+    // bps. `_treasuryFee` must short-circuit to (0, address(0)) so the fee
+    // stays dormant and the entire gross flows to the staker pool. This is
+    // the path almost every mainnet publish takes today.
+    const Parameters =
+      await hre.ethers.getContract<ParametersStorage>('ParametersStorage');
+    expect(await Parameters.protocolTreasury()).to.equal(ethers.ZeroAddress);
+    expect(await Parameters.protocolTreasuryFee()).to.be.greaterThan(0n);
+
+    const tokenAmount = ethers.parseEther('1000');
+    await Token.mint(setup.creator.address, tokenAmount);
+    await Token.connect(setup.creator).approve(
+      await KAV10.getAddress(),
+      tokenAmount,
+    );
+
+    const cssAddr = await ConvictionStakingStorage.getAddress();
+    const cssBefore = await Token.balanceOf(cssAddr);
+
+    const p = await buildBasePublishParams(setup, 'treasury-dormant', {
+      epochs: setup.epochs + 1,
+      tokenAmount,
+    });
+    await (await KAV10.connect(setup.creator).publish(p)).wait();
+
+    expect((await Token.balanceOf(cssAddr)) - cssBefore).to.equal(tokenAmount);
+  });
+
+  // --------------------------------------------------------------------------
+  // 6. Update happy-path: kaId/owner stable, merkle-root history grows
+  // --------------------------------------------------------------------------
+  //
+  // The only update coverage before this was the owner-gate REVERT. The
+  // success path — a metadata-only update mutates the KA in place, never
+  // mints a new id, never changes the owner, and appends to the merkle-root
+  // chain — was untested. A regression that minted a fresh kaId on update,
+  // overwrote (rather than appended) the merkle root, or reassigned
+  // ownership would slip through. `newTokenAmount == current` keeps delta at
+  // zero so the update charges nothing (no PCA / approval plumbing needed).
+
+  it('update: metadata-only update keeps kaId + owner stable and appends to the merkle-root history', async () => {
+    const setup = await setupRegisteredAgentPublish();
+
+    const publishMerkleRoot = ethers.keccak256(
+      ethers.toUtf8Bytes('update-happy-publish'),
+    );
+    const tokenAmount = ethers.parseEther('1000');
+    const p = await buildBasePublishParams(setup, 'update-happy', {
+      merkleRoot: publishMerkleRoot,
+      tokenAmount,
+    });
+    await (await KAV10.connect(setup.creator).publish(p)).wait();
+
+    const kaId = await DKGKnowledgeAssets.getLatestKnowledgeAssetId();
+    expect(kaId).to.equal(1n);
+    expect(await DKGKnowledgeAssets.ownerOf(kaId)).to.equal(
+      setup.creator.address,
+    );
+    // Fresh KA: exactly one merkle root, equal to the publish root.
+    expect((await DKGKnowledgeAssets.getMerkleRoots(kaId)).length).to.equal(1);
+    expect(await DKGKnowledgeAssets.getLatestMerkleRoot(kaId)).to.equal(
+      publishMerkleRoot,
+    );
+
+    // Metadata-only update: SAME tokenAmount (delta 0 → no payment) + SAME
+    // byteSize; only the merkle root rolls forward. preUpdateMerkleRootCount
+    // = 1 pins the optimistic-concurrency version the ACK quorum signs over.
+    const newMerkleRoot = ethers.keccak256(
+      ethers.toUtf8Bytes('update-happy-v2'),
+    );
+    const up = await buildUpdateParams({
+      chainId: DEFAULT_CHAIN_ID,
+      kav10Address: await KAV10.getAddress(),
+      receivingNodes: setup.receivingNodes,
+      publisherIdentityId: setup.publisherIdentityId,
+      receiverIdentityIds: setup.receiverIdentityIds,
+      contextGraphId: setup.cgId,
+      id: kaId,
+      preUpdateMerkleRootCount: 1n,
+      newMerkleRoot,
+      newByteSize: 1000n,
+      newTokenAmount: tokenAmount, // delta 0 — metadata-only
+      mintKnowledgeAssetsAmount: 0n,
+      knowledgeAssetsToBurn: [],
+      updateOperationId: 'update-happy-op',
+      author: setup.creator, // KA owner signs the EIP-712 update attestation
+    });
+    await (await KAV10.connect(setup.creator).update(up)).wait();
+
+    // kaId stable: update mutates in place, never mints a new id.
+    expect(await DKGKnowledgeAssets.getLatestKnowledgeAssetId()).to.equal(kaId);
+    // Owner stable across the update.
+    expect(await DKGKnowledgeAssets.ownerOf(kaId)).to.equal(
+      setup.creator.address,
+    );
+    // Merkle-root history GREW by exactly one; the new root is appended last.
+    const roots = await DKGKnowledgeAssets.getMerkleRoots(kaId);
+    expect(roots.length).to.equal(2);
+    expect(roots[0].merkleRoot).to.equal(publishMerkleRoot);
+    expect(roots[1].merkleRoot).to.equal(newMerkleRoot);
+    expect(await DKGKnowledgeAssets.getLatestMerkleRoot(kaId)).to.equal(
+      newMerkleRoot,
+    );
+    // tokenAmount unchanged (delta 0).
+    const meta = await DKGKnowledgeAssets.getKnowledgeAssetMetadata(kaId);
+    expect(meta[6]).to.equal(tokenAmount);
   });
 });

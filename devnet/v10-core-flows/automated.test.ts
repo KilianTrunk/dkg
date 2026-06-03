@@ -260,6 +260,21 @@ async function fullPublish(api: string, token: string, name: string): Promise<{ 
   expect(r.status, `promote failed: ${JSON.stringify(r.body)}`).toBe(200);
   r = await postJson(api, '/api/shared-memory/publish', { contextGraphId: cgId, assertionName: name }, token);
   expect(r.status, `publish failed: ${JSON.stringify(r.body)}`).toBe(200);
+  // Greedy publish-outcome gate: HTTP 200 is NOT proof the publish landed.
+  // Pin the status to a known success value and require a positive on-chain
+  // kaId, so a tentative/failed status or a missing/zero id ("0"/undefined)
+  // fails right here instead of silently fuelling the downstream epoch-pool /
+  // operator-fee assertions with a publish that never actually happened.
+  const publishOk = ['confirmed', 'finalized', 'tentative'];
+  const pub = r.body as { kaId?: string; status?: string };
+  expect(
+    publishOk,
+    `publish status="${pub.status}": ${JSON.stringify(r.body)}`,
+  ).toContain(String(pub.status).toLowerCase());
+  expect(
+    BigInt(pub.kaId ?? '0'),
+    `publish kaId="${pub.kaId}": ${JSON.stringify(r.body)}`,
+  ).toBeGreaterThan(0n);
   return r.body;
 }
 

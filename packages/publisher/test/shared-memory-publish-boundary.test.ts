@@ -86,6 +86,46 @@ describe('publishFromSharedMemory single-root boundary', () => {
     expect(publishSpy).not.toHaveBeenCalled();
   });
 
+  it('scopes an explicit single-root selection to that root and excludes co-resident SWM roots', async () => {
+    // Regression guard for the "named publish bundled all SWM" bug
+    // (v10-stress FINDINGS Bug 1, fixed in 26c38350). When a caller does
+    // NOT drain shared memory between batches, two fully-formed payload roots
+    // coexist in SWM. `publishFromFinalizedAssertion` scopes the SWM CONSTRUCT
+    // to the seal's `rootEntities`; a regression back to `'all'` (or a leaky
+    // VALUES clause) would bundle root:two into root:one's KC, the publisher's
+    // merkle recompute would then disagree with the seal, and the publish would
+    // flip to `tentative kaId:"0"` for end users. The devnet suite's SWM-drain
+    // workaround hides exactly this, so pin it at the publisher seam instead.
+    const { publisher, store, publishSpy } = await makePublisher();
+    await store.insert([
+      q('urn:test:root:one'),
+      q('urn:test:root:one', 'http://schema.org/description', '"one-desc"'),
+      // A SECOND, unrelated payload root left behind in SWM.
+      q('urn:test:root:two'),
+      q('urn:test:root:two', 'http://schema.org/description', '"two-desc"'),
+      q('urn:test:root:two', WORKSPACE_OWNER_PREDICATE, '"peer-b"'),
+      q('urn:test:root:two', TRUST_LEVEL_PREDICATE, `"${TrustLevel.SelfAttested}"`),
+    ]);
+
+    await expect(
+      publisher.publishFromSharedMemory(CONTEXT_GRAPH, { rootEntities: ['urn:test:root:one'] }),
+    ).resolves.toMatchObject({ status: 'tentative' });
+
+    expect(publishSpy).toHaveBeenCalledTimes(1);
+    const publishArgs = publishSpy.mock.calls[0][0];
+    // GREEDY: assert the EXACT payload, not just a count. Every quad must
+    // belong to root:one and NONE may belong to the co-resident root:two.
+    // (CONSTRUCT order isn't guaranteed, so match set-wise, not positionally.)
+    expect(publishArgs.quads).toHaveLength(2);
+    expect(publishArgs.quads).toEqual(
+      expect.arrayContaining([
+        { subject: 'urn:test:root:one', predicate: 'http://schema.org/name', object: '"value"', graph: '' },
+        { subject: 'urn:test:root:one', predicate: 'http://schema.org/description', object: '"one-desc"', graph: '' },
+      ]),
+    );
+    expect(publishArgs.quads.every((qq) => qq.subject === 'urn:test:root:one')).toBe(true);
+  });
+
   it('throws before publish when explicit rootEntities resolve to multiple payload roots', async () => {
     const { publisher, store, publishSpy } = await makePublisher();
     await store.insert([

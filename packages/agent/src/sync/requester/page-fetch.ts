@@ -51,16 +51,18 @@ interface FetchSyncPagesParams {
   sinceBatchId?: string;
   parseAndFilter: (nquadsText: string, graphUri: string, contextGraphId: string) => Promise<{ quads: Quad[]; totalQuads: number }>;
   /**
-   * Per-attempt send hook. The substrate-backed implementation
-   * (`DKGAgent`'s adapter routing through `messenger.sendReliable`)
-   * receives a fresh `messageId` on EVERY retry attempt. Stable
-   * messageIds were explored on this PR (codex review #569
-   * follow-ups #1, #4, #5, #6, #7, #8) but every variant either
-   * defeated sender-side dedup OR enabled silent replay of stale
-   * cached responses past sync's app-layer freshness gate
-   * (`SYNC_AUTH_MAX_AGE_MS`). Fresh-per-attempt is the only design
-   * that holds under all timing scenarios — see jsdoc on
-   * `sendSyncRequest` for the full rationale.
+   * Per-attempt send hook. `DKGAgent`'s production adapter sends raw
+   * via `messenger.sendToPeer` (ProtocolRouter pass-through), not
+   * `messenger.sendReliable`, because sync is intentionally off the
+   * Universal Messenger substrate. `sendSyncRequest` still mints a
+   * fresh `messageId` per retry attempt for transport-surface
+   * stability and older test adapters that record it. Stable IDs were
+   * explored on this PR (codex review #569 follow-ups #1, #4, #5,
+   * #6, #7, #8) but every variant either defeated sender-side dedup OR
+   * enabled silent replay of stale cached responses past sync's
+   * app-layer freshness gate (`SYNC_AUTH_MAX_AGE_MS`). Fresh-per-
+   * attempt is the only design that holds under all timing scenarios —
+   * see jsdoc on `sendSyncRequest` for the full rationale.
    */
   send: (
     peerId: string,

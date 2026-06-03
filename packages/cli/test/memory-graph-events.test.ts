@@ -399,8 +399,13 @@ describe('daemon memory_graph_changed route emissions', () => {
 
   it('emits SWM and VM refresh events after confirmed selective publishes', async () => {
     const emitMemoryGraphChanged = vi.fn();
+    // Real publishes return a bigint kaId minted on-chain; the daemon
+    // stringifies it via String(result.kaId). Use a realistic positive
+    // bigint (not the old tautological 'kc-1' literal) so this test is
+    // GREEDY about the kaId contract: a confirmed publish must surface a
+    // positive decimal id, never "undefined" / "0" / a KC-era string.
     const publishFromSharedMemory = vi.fn().mockResolvedValue({
-      kaId: 'kc-1',
+      kaId: 42n,
       status: 'confirmed',
       kaManifest: [{ tokenId: 1n, rootEntity: 'urn:root' }],
       publicQuads: [
@@ -423,11 +428,13 @@ describe('daemon memory_graph_changed route emissions', () => {
     await handleMemoryRoutes(ctx);
 
     expect((ctx.res as unknown as { statusCode: number }).statusCode).toBe(200);
-    expect(responseBody(ctx)).toMatchObject({
-      kaId: 'kc-1',
+    const publishBody = responseBody(ctx);
+    expect(publishBody).toMatchObject({
+      kaId: '42',
       status: 'confirmed',
       kas: [{ tokenId: '1', rootEntity: 'urn:root' }],
     });
+    expect(publishBody.kaId).toMatch(/^[1-9]\d*$/);
     expect(emitMemoryGraphChanged).toHaveBeenCalledWith({
       contextGraphId: 'project-a',
       layers: ['swm', 'vm'],

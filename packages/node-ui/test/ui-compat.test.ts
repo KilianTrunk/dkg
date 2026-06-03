@@ -457,16 +457,21 @@ describe('memory layer custom query execution', () => {
     expect(memoryLayerView).toContain('<button className="v10-mlv-run-btn" onClick={runQuery}>');
   });
 
-  it('keeps the WM default query GRAPH variable at the top level (scoped-query guard, PR #749)', () => {
-    // Regression guard: the scoped local-query path rejects a GRAPH
-    // *variable* nested in UNION/OPTIONAL/a sub-group with "GRAPH
-    // variables must appear at the top level of scoped local queries".
-    // The WM default query must read named partitions via a top-level
-    // `GRAPH ?g { ?s ?p ?o } FILTER(STRSTARTS(...))` and must NOT wrap
-    // `GRAPH ?g` inside a UNION (the prior shape that broke the WM layer
-    // view + WM→SWM promote flow).
+  it('keeps the WM default query GRAPH variable top-level AND WM-scoped (scoped-query guard #749 + Codex #944)', () => {
+    // Two regressions pinned here:
+    //  1. The scoped local-query path rejects a GRAPH *variable* nested in
+    //     UNION/OPTIONAL/a sub-group ("GRAPH variables must appear at the top
+    //     level of scoped local queries"), so `GRAPH ?g` must never be wrapped
+    //     in a UNION/OPTIONAL (the prior shape that broke the WM layer view +
+    //     WM→SWM promote flow).
     expect(memoryLayerView).not.toMatch(/UNION\s*\{\s*GRAPH\s+\?/);
-    expect(memoryLayerView).toContain('GRAPH ?g { ?s ?p ?o } FILTER(STRSTARTS(STR(?g),');
+    expect(memoryLayerView).not.toMatch(/OPTIONAL\s*\{\s*GRAPH\s+\?/);
+    //  2. With `includeContextGraphPartitions` on, a bare prefix FILTER would
+    //     let SWM/VM partitions bleed into the WM tab. `?g` must be gated on
+    //     the `<cg>/_meta` `dkg:memoryLayer "WM"` marker and read via a
+    //     top-level `GRAPH ?g { ?s ?p ?o }`.
+    expect(memoryLayerView).toContain('<http://dkg.io/ontology/memoryLayer> "WM"');
+    expect(memoryLayerView).toContain('GRAPH ?g { ?s ?p ?o }');
   });
 });
 

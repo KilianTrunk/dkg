@@ -112,16 +112,22 @@ export function MemoryLayerView({ layer, contextGraphId, externalQuery, external
 
   const defaultSparql = useMemo(() => {
     if (layer === 'wm') {
-      const cgUri = `did:dkg:context-graph:${contextGraphId}`;
-      // GRAPH variable must stay at the top level of the WHERE block: the
-      // scoped local-query path (`constrainGraphVariablesToAllowedSet`,
-      // PR #749) rejects a `GRAPH ?g` nested inside `UNION`/`OPTIONAL`/a
-      // sub-group with "GRAPH variables must appear at the top level of
-      // scoped local queries". The dropped `{ ?s ?p ?o }` default-graph
-      // UNION branch was also an unscoped read — in V10 all context-graph
-      // content lives in named partitions, so the named-graph branch alone
-      // returns the WM triples.
-      return `SELECT ?s ?p ?o WHERE { GRAPH ?g { ?s ?p ?o } FILTER(STRSTARTS(STR(?g), "${cgUri}")) } LIMIT 1000`;
+      const metaGraph = `did:dkg:context-graph:${contextGraphId}/_meta`;
+      // Two constraints shape this query:
+      //  1. The GRAPH variable must stay at the TOP LEVEL of the WHERE block.
+      //     The scoped local-query path (`constrainGraphVariablesToAllowedSet`,
+      //     PR #749) rejects a `GRAPH ?g` nested inside `UNION`/`OPTIONAL`/a
+      //     sub-group ("GRAPH variables must appear at the top level of scoped
+      //     local queries"). Both GRAPH clauses below are WHERE-block siblings,
+      //     so `?g` stays top-level and the guard passes.
+      //  2. `?g` must be restricted to WM-marked partitions. The view runs with
+      //     `includeContextGraphPartitions: true` (see below), which widens the
+      //     allow-list to every same-CG partition — including `/_shared_memory`,
+      //     `/_verified_memory/*`, and metadata graphs. A bare prefix FILTER
+      //     would let SWM/VM triples bleed into the WM tab, so we gate `?g` on
+      //     the `<cg>/_meta` `dkg:memoryLayer "WM"` lifecycle marker (the same
+      //     authority `listWmAssertions` uses) and read only those graphs.
+      return `SELECT ?s ?p ?o WHERE { GRAPH <${metaGraph}> { ?g <http://dkg.io/ontology/memoryLayer> "WM" } GRAPH ?g { ?s ?p ?o } } LIMIT 1000`;
     }
     if (layer === 'vm') {
       return buildVerifiedMemorySearchQuery({

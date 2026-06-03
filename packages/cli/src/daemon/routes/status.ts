@@ -58,6 +58,7 @@ const execFileAsync = promisify(execFile);
 import { enrichEvmError, MockChainAdapter, resolveRpcUrls } from '@origintrail-official/dkg-chain';
 import { DKGAgent, loadOpWallets } from '@origintrail-official/dkg-agent';
 import { isExternalBackend } from '@origintrail-official/dkg-storage';
+import { resolveManagedOxigraphPort } from '../oxigraph-managed.js';
 import { computeNetworkId, createOperationContext, DKGEvent, Logger, PayloadTooLargeError, GET_VIEWS, TrustLevel, validateSubGraphName, validateAssertionName, validateContextGraphId, isSafeIri, assertSafeIri, sparqlIri, contextGraphSharedMemoryUri, contextGraphAssertionUri, contextGraphMetaUri } from '@origintrail-official/dkg-core';
 import { findReservedSubjectPrefix, isSkolemizedUri } from '@origintrail-official/dkg-publisher';
 import {
@@ -414,6 +415,12 @@ const STORE_QUADS_CACHE_TTL_MS = 30_000;
 let storeQuadsCache: { value: number | null; fetchedAt: number } | null = null;
 let storeQuadsInflight: Promise<number | null> | null = null;
 
+/** Drop cached quad counts (e.g. when the managed Oxigraph child exits). */
+export function invalidateExternalStoreQuadsCache(): void {
+  storeQuadsCache = null;
+  storeQuadsInflight = null;
+}
+
 async function getCachedExternalStoreQuads(
   agent: DKGAgent,
   now: number,
@@ -666,10 +673,26 @@ export async function handleStatusRoutes(ctx: RequestContext): Promise<void> {
               : null;
             return url;
           })()
-        : null,
-      storeQuads: isExternalBackend(config.store?.backend)
-        ? await getCachedExternalStoreQuads(agent, Date.now())
-        : null,
+        : config.store?.backend === 'oxigraph-server'
+          // Managed local server: report its loopback endpoint so `dkg status`
+          // renders the external-store health path (storeQuads/unreachable)
+          // instead of printing it like a quad-less local store.
+          ? (() => {
+              const opts = (config.store?.options ?? {}) as Record<string, unknown>;
+              const port = resolveManagedOxigraphPort(opts);
+              return `http://127.0.0.1:${port}/query`;
+            })()
+          : null,
+      // A managed `oxigraph-server` keeps `config.store.backend` as
+      // "oxigraph-server" (so it persists/labels correctly), but its quad
+      // count is still worth surfacing — it's the only store-health signal
+      // for that backend (getStoreBytes is null, there's no store.nq), and a
+      // failed query here is how operators see the managed server is down
+      // (e.g. after a failed revive) instead of it always looking healthy.
+      storeQuads:
+        isExternalBackend(config.store?.backend) || config.store?.backend === 'oxigraph-server'
+          ? await getCachedExternalStoreQuads(agent, Date.now())
+          : null,
       uptimeMs: Date.now() - startedAt,
       connectedPeers: uniquePeers.size,
       connections: {

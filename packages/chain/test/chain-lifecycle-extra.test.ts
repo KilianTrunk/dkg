@@ -377,8 +377,11 @@ describe('chain-lifecycle-extra — V10 lifecycle + adapter invariants', () => {
 
   describe('nextAuthorizedSigner: no-wallet-authorized path [CH-18]', () => {
     it('error message format is pinned (exposed to upstream callers that pattern-match on it)', () => {
+      // `nextAuthorizedSigner` lives in the EVMChainAdapterBase mixin base
+      // after the structural split of evm-adapter.ts; the error wording is
+      // unchanged, only its file moved.
       const src = readFileSync(
-        join(import.meta.dirname, '..', 'src', 'evm-adapter.ts'),
+        join(import.meta.dirname, '..', 'src', 'evm-adapter-base.ts'),
         'utf8',
       );
       // Pin the exact wording. If this changes, every caller in

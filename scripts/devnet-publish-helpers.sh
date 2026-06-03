@@ -256,6 +256,18 @@ devnet_publish_swm_all_roots() {
   probe_code=$(devnet_json_field "$probe" '.code')
 
   if [ "$probe_code" != "MULTI_ROOT_PUBLISH_NOT_ATOMIC" ]; then
+    # Not the multi-root sentinel. The only other response we may treat as a
+    # single-root publish is a genuinely successful one. Any other error
+    # (empty SWM, auto-register failure, malformed extra fields, …) must fail
+    # loudly here instead of being persisted as a successful single-root
+    # publish — otherwise the later verify steps run against a payload that
+    # was never published and a real publish regression passes as green.
+    local probe_status
+    probe_status=$(devnet_json_field "$probe" '.status')
+    if ! _devnet_publish_status_ok "$probe_status"; then
+      printf '%s' "$probe" >&2
+      return 1
+    fi
     local single_arr single_roots
     single_arr=$(printf '%s' "$probe" | node -e '
       let d=""; process.stdin.on("data",c=>d+=c);

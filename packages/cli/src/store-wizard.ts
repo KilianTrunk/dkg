@@ -77,8 +77,20 @@ export interface PromptStoreBackendResult {
    * DKG-owned namespaces) and scoped DELETE (mandatory on
    * shared / V6 / V8 instances).
    */
-  storeBlock: ExternalStoreBlock | null;
+  storeBlock: ExternalStoreBlock | LocalStoreBlock | null;
 }
+
+// An explicit embedded/local store block carried through verbatim on an
+// Enter-through re-init. `null` still means "no block — runtime default", but
+// when a node already pinned a local backend with custom `options` (e.g. the
+// `options.path` the oxigraph-worker adapter reads for its persistence file),
+// returning that block instead of `null` keeps re-init idempotent: cli init
+// writes `store: storeBlock ?? undefined`, so a `null` would clear the block
+// and relocate the store on the next boot.
+export type LocalStoreBlock = {
+  backend: 'oxigraph' | 'oxigraph-worker' | 'oxigraph-persistent';
+  options?: Record<string, unknown>;
+};
 
 export type ExternalStoreBlock =
   | {
@@ -222,6 +234,20 @@ export async function promptStoreBackend(
   }
 
   if (backendAnswer !== 'blazegraph' && backendAnswer !== 'sparql-http') {
+    // Embedded in-process worker. Preserve an existing *explicit* local store
+    // block verbatim so an Enter-through re-init is idempotent and never drops
+    // custom `options` (e.g. the worker's `options.path`) or relocates the
+    // store on the next boot. A genuine switch *to* the worker from an
+    // external/server backend, and a fresh / block-less init, both fall through
+    // to `null` (no block; runtime falls back to oxigraph-worker), which lets
+    // `dkg init` clear a previous blazegraph/oxigraph-server block as intended.
+    if (
+      existingBackend === 'oxigraph' ||
+      existingBackend === 'oxigraph-worker' ||
+      existingBackend === 'oxigraph-persistent'
+    ) {
+      return { storeBlock: { backend: existingBackend, options: opts.existingStore?.options } };
+    }
     return { storeBlock: null };
   }
   const backend = backendAnswer as 'blazegraph' | 'sparql-http';

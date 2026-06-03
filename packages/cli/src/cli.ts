@@ -842,7 +842,13 @@ program
     console.log(
       `  store:      ${
         storeBlock
-          ? `${storeBlock.backend} (${(storeBlock.options as { url: string }).url})`
+          // Only URL-backed backends (blazegraph/sparql-http) carry a `url`;
+          // oxigraph-server and a preserved local block don't, so guard the cast.
+          ? `${storeBlock.backend}${
+              (storeBlock.options as { url?: string } | undefined)?.url
+                ? ` (${(storeBlock.options as { url: string }).url})`
+                : ''
+            }`
           : 'oxigraph (local default)'
       }`,
     );

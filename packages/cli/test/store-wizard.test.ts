@@ -83,17 +83,20 @@ describe('promptStoreBackend', () => {
     expect(result.storeBlock).toBeNull();
   });
 
-  it('preserves an explicit embedded backend on Enter-through (no silent flip to oxigraph-server)', async () => {
+  it('preserves an explicit embedded backend verbatim on Enter-through (no flip, no option loss)', async () => {
     // Codex #946 — only a *block-less* config should fall through to the new
     // oxigraph-server default. A node that explicitly chose a local worker
-    // variant must keep it on a re-init Enter-through.
+    // variant must keep it on a re-init Enter-through, AND keep its custom
+    // `options` (e.g. the worker's `options.path`): returning `null` would let
+    // `dkg init` write `store: undefined` and relocate the store on next boot.
     for (const backend of ['oxigraph', 'oxigraph-worker', 'oxigraph-persistent'] as const) {
+      const existingStore = { backend, options: { path: '/custom/store' } };
       const result = await promptStoreBackend({
         ask: mockAsk(['']), // Enter
-        existingStore: { backend },
+        existingStore,
         log: () => {},
       });
-      expect(result.storeBlock).toBeNull();
+      expect(result.storeBlock).toEqual(existingStore);
     }
   });
 

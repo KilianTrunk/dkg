@@ -14,6 +14,7 @@ import {
   type ServerResponse,
 } from "node:http";
 import { createHash, randomUUID } from "node:crypto";
+import { GET_TOTAL_TRIPLES_SPARQL } from "./metrics-queries.js";
 import {
   appendFile,
   chmod,
@@ -1832,9 +1833,7 @@ export async function runDaemonInner(
     },
     getContextGraphCount: async () => (await agent.listContextGraphs()).length,
     getTotalTriples: async () => {
-      const r = await agent.query(
-        "SELECT (COUNT(*) AS ?c) WHERE { { ?s ?p ?o } UNION { GRAPH ?g { ?s ?p ?o } } }",
-      );
+      const r = await agent.query(GET_TOTAL_TRIPLES_SPARQL);
       return parseRdfInt(r?.bindings?.[0]?.c);
     },
     getTotalKCs: async () => {

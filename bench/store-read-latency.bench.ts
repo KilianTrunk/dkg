@@ -1,12 +1,16 @@
 import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { defineSuite } from 'esbench';
-import {
-  OxigraphStore,
-  OxigraphWorkerStore,
-  type Quad,
-  type QueryResult,
-} from '../packages/storage/src/index.ts';
+// Import the store classes + types from their SPECIFIC source modules rather
+// than the storage barrel: the barrel also re-exports GraphManager /
+// PrivateContentStore etc., which transitively import `@origintrail-official/
+// dkg-core` — pulling that into the benchmark and requiring `dkg-core/dist` on a
+// clean checkout. These adapter modules depend only on `oxigraph` + the local
+// triple-store types, so the bench needs nothing beyond the storage build.
+import { OxigraphStore } from '../packages/storage/src/adapters/oxigraph.ts';
+import { OxigraphWorkerStore } from '../packages/storage/src/adapters/oxigraph-worker.ts';
+import type { Quad, QueryResult } from '../packages/storage/src/triple-store.ts';
+import { GET_TOTAL_TRIPLES_SPARQL } from '../packages/cli/src/daemon/metrics-queries.ts';
 import { benchAsyncWithHooks } from './support/esbench-case-hooks.ts';
 
 /**
@@ -53,12 +57,11 @@ interface ReadStore {
 
 const GRAPH = 'http://bench.dkg/g/store-read';
 const READ_LIMIT1 = `SELECT ?s WHERE { GRAPH <${GRAPH}> { ?s ?p ?o } } LIMIT 1`;
-// Mirror the production `getTotalTriples` aggregate the 30s metrics collector
-// runs (`packages/cli/src/daemon/lifecycle.ts`) VERBATIM — default graph UNION
-// all named graphs — so the benchmark measures the real read shape rather than
-// a graph-scoped approximation. The synthetic data lives in a named graph, so
-// the `GRAPH ?g` branch carries the scan.
-const READ_TOTAL_TRIPLES = 'SELECT (COUNT(*) AS ?c) WHERE { { ?s ?p ?o } UNION { GRAPH ?g { ?s ?p ?o } } }';
+// The production `getTotalTriples` aggregate the 30s metrics collector runs —
+// default graph UNION all named graphs. Imported from cli as the single source
+// of truth so the benchmark can't silently drift from the real read path. The
+// synthetic data lives in a named graph, so the `GRAPH ?g` branch carries the scan.
+const READ_TOTAL_TRIPLES = GET_TOTAL_TRIPLES_SPARQL;
 
 // Bounded write churn: the background writer repeatedly inserts then deletes a
 // fixed batch in a region disjoint from the pre-populated base, so it generates

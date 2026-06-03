@@ -510,7 +510,7 @@ describe('daemon memory_graph_changed route emissions', () => {
     expect(publishFromSharedMemory.mock.calls[0][1]).toEqual({ rootEntities: [root] });
   });
 
-  it('rejects multi-root synchronous SWM publishes before any root is published', async () => {
+  it('publishes multi-root synchronous SWM selection as one KA (OT-RFC-44 / Design B)', async () => {
     const store = {
       query: vi.fn(async () => ({
         type: 'quads',
@@ -526,8 +526,13 @@ describe('daemon memory_graph_changed route emissions', () => {
         ],
       })),
     };
-    const publishFromSharedMemory = vi.fn();
-    const getContextGraphOnChainId = vi.fn().mockResolvedValue(null);
+    const publishFromSharedMemory = vi.fn().mockResolvedValue({
+      kaId: 'kc-1',
+      status: 'confirmed',
+      kaManifest: [{ tokenId: 1n, rootEntity: 'urn:root:a' }, { tokenId: 1n, rootEntity: 'urn:root:b' }],
+      publicQuads: [],
+    });
+    const getContextGraphOnChainId = vi.fn().mockResolvedValue('7');
     const registerContextGraph = vi.fn();
     const ctx = createContext('/api/shared-memory/publish', {
       contextGraphId: 'project-a',
@@ -544,14 +549,12 @@ describe('daemon memory_graph_changed route emissions', () => {
 
     await handleMemoryRoutes(ctx);
 
-    expect((ctx.res as unknown as { statusCode: number }).statusCode).toBe(409);
-    expect(getContextGraphOnChainId).not.toHaveBeenCalled();
-    expect(registerContextGraph).not.toHaveBeenCalled();
-    expect(publishFromSharedMemory).not.toHaveBeenCalled();
-    expect(responseBody(ctx)).toMatchObject({
-      code: 'MULTI_ROOT_PUBLISH_NOT_ATOMIC',
-      rootEntities: ['urn:root:a', 'urn:root:b'],
-    });
+    // OT-RFC-44 / Design B: a multi-root SWM selection publishes as ONE KA. The
+    // route no longer returns 409 MULTI_ROOT_PUBLISH_NOT_ATOMIC; it proceeds to
+    // publish both roots in a single atomic call.
+    expect((ctx.res as unknown as { statusCode: number }).statusCode).not.toBe(409);
+    expect(responseBody(ctx)).not.toMatchObject({ code: 'MULTI_ROOT_PUBLISH_NOT_ATOMIC' });
+    expect(publishFromSharedMemory).toHaveBeenCalledTimes(1);
   });
 
   it('keeps implicit same-graph publishes out of the remap path', async () => {

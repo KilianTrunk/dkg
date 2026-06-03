@@ -209,6 +209,117 @@ describe('E2E: ContextGraph publish with receiver signature collection', () => {
 });
 
 // ========================================================================
+// 1b. Design B canary (OT-RFC-44): a MULTI-ENTITY file publishes as ONE KA
+//     and is ACKed cross-node. This is the §11.2 canary: pre-Design-B the
+//     publisher's `kaCount !== 1` guard threw before the payload ever left
+//     node A, AND the receiver's `storage-ack` check refused any payload
+//     whose root-subject count != kaCount. So a multi-entity KA could never
+//     be ACKed by a separate node — exactly the silent cross-node failure in
+//     OT-RFC-43 §2.7. This test asserts it now succeeds end to end.
+// ========================================================================
+
+describe('E2E: Design B — multi-entity file publishes as one KA, ACKed cross-node (OT-RFC-44)', () => {
+  const chainA = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
+  let nodeA: DKGAgent;
+  let nodeB: DKGAgent;
+  let nodeC: DKGAgent;
+  const MCG = 'design-b-multi-entity-e2e';
+
+  afterAll(async () => {
+    try { await nodeA?.stop(); } catch {}
+    try { await nodeB?.stop(); } catch {}
+    try { await nodeC?.stop(); } catch {}
+  });
+
+  it('bootstraps 3 agents and a context graph', async () => {
+    nodeA = await DKGAgent.create({ name: 'DBMultiA', listenPort: 0, skills: [], chainAdapter: chainA, nodeRole: 'core' });
+    nodeB = await DKGAgent.create({ name: 'DBMultiB', listenPort: 0, skills: [], chainAdapter: createEVMAdapter(HARDHAT_KEYS.REC1_OP), nodeRole: 'core' });
+    nodeC = await DKGAgent.create({ name: 'DBMultiC', listenPort: 0, skills: [], chainAdapter: createEVMAdapter(HARDHAT_KEYS.REC2_OP), nodeRole: 'core' });
+
+    await nodeA.start();
+    await nodeB.start();
+    await nodeC.start();
+    await sleep(800);
+
+    const addrA = nodeA.multiaddrs.find(a => a.includes('/tcp/') && !a.includes('/p2p-circuit'))!;
+    await nodeB.connectTo(addrA);
+    await nodeC.connectTo(addrA);
+    await sleep(2000);
+
+    expect(nodeA.node.libp2p.getPeers().length).toBeGreaterThanOrEqual(2);
+
+    await nodeA.createContextGraph({ id: MCG, name: 'Design B Multi-Entity', description: '' });
+    await nodeA.registerContextGraph(MCG);
+    nodeA.subscribeToContextGraph(MCG);
+    nodeB.subscribeToContextGraph(MCG);
+    nodeC.subscribeToContextGraph(MCG);
+    await sleep(1500);
+  }, 20_000);
+
+  it('A shares a 3-entity file; B and C receive all three via GossipSub', async () => {
+    const quads = [
+      { subject: ENTITY_1, predicate: 'http://schema.org/name', object: '"Alice"', graph: '' },
+      { subject: ENTITY_2, predicate: 'http://schema.org/name', object: '"Bob"', graph: '' },
+      { subject: ENTITY_3, predicate: 'http://schema.org/name', object: '"Carol"', graph: '' },
+    ];
+    await nodeA.share(MCG, quads);
+
+    for (const node of [nodeB, nodeC]) {
+      const bindings = await pollUntil(
+        () => node.query(
+          `SELECT ?e ?name WHERE { ?e <http://schema.org/name> ?name FILTER(?e IN (<${ENTITY_1}>,<${ENTITY_2}>,<${ENTITY_3}>)) }`,
+          { contextGraphId: MCG, graphSuffix: '_shared_memory' },
+        ),
+        (b) => b.length >= 3,
+        15_000,
+      );
+      expect(bindings.length).toBe(3);
+    }
+  }, 25_000);
+
+  it('publishes all three entities as ONE KA with cross-node ACKs (THE CANARY)', async () => {
+    const result = await nodeA.publishFromSharedMemory(
+      MCG,
+      { rootEntities: [ENTITY_1, ENTITY_2, ENTITY_3] },
+    );
+
+    // Reaching 'confirmed' means: the multi-entity payload left node A (no
+    // kaCount!==1 guard), B and C verified + signed receiver ACKs over it (the
+    // storage-ack receiver accepted N>1 root subjects with kaCount=1), and the
+    // on-chain tx confirmed. All three were impossible pre-Design-B.
+    expect(result.status).toBe('confirmed');
+    expect(result.onChainResult).toBeDefined();
+    expect(result.onChainResult!.batchId).toBeGreaterThan(0n);
+
+    // One UAL + one batchId for the whole 3-entity file = ONE Knowledge Asset
+    // (Design B: 1 KA, N entities — not 3 KAs). The "one KA node with N
+    // dkg:rootEntity members" metadata shape is asserted directly in the
+    // publisher unit test (metadata.test.ts). Here we assert the end-to-end
+    // result is a single KA carrying all three entities.
+    expect(typeof result.ual).toBe('string');
+    const aData = await nodeA.query(
+      `SELECT ?e WHERE { ?e <http://schema.org/name> ?name FILTER(?e IN (<${ENTITY_1}>,<${ENTITY_2}>,<${ENTITY_3}>)) }`,
+      MCG,
+    );
+    expect(aData.bindings.length).toBe(3);
+  }, 30_000);
+
+  it('B and C receive finalization for all three entities (one KA)', async () => {
+    for (const node of [nodeB, nodeC]) {
+      const bindings = await pollUntil(
+        () => node.query(
+          `SELECT ?e ?name WHERE { ?e <http://schema.org/name> ?name FILTER(?e IN (<${ENTITY_1}>,<${ENTITY_2}>,<${ENTITY_3}>)) }`,
+          MCG,
+        ),
+        (b) => b.length >= 3,
+        20_000,
+      );
+      expect(bindings.length).toBe(3);
+    }
+  }, 30_000);
+});
+
+// ========================================================================
 // 2. Context Graph Publish — Two-Layer Signatures
 // ========================================================================
 

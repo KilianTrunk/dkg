@@ -888,14 +888,18 @@ export class StorageACKHandler {
       }
     }
 
-    // Recompute kaCount from verified quads. publicByteSize uses the claimed
-    // value because N-Quad serialization may differ between publisher and
-    // handler (different graph URIs). The merkle root already proves data
-    // integrity, so byte-size manipulation cannot change the actual content.
-    const verifiedRootSubjects = new Set(
-      swmQuads.map(q => q.subject).filter(s => !s.includes('/.well-known/genid/')),
-    );
-    const verifiedKACount = verifiedRootSubjects.size;
+    // OT-RFC-44 / Design B: a publish is exactly ONE Knowledge Asset whose
+    // member entities are the root subjects (any count). The KA count signed
+    // into the ACK digest is therefore ALWAYS 1 — it must match what the
+    // publisher submits on chain (`knowledgeAssetsAmount`, which the contract
+    // requires to be 1) and the digest the publisher/ACK-collector compute.
+    // Pre-Design-B this recomputed kaCount = rootSubjects.size (the ENTITY
+    // count); for a multi-entity KA that made the receiver sign a digest with
+    // kaCount=N while the publisher and contract used kaCount=1, so no ACK
+    // could ever validate — the silent cross-node failure in OT-RFC-43 §2.7.
+    // The data integrity that recompute was protecting is already guaranteed
+    // by the merkle-root check above (computeFlatKCRoot over the SWM quads).
+    const verifiedKACount = 1;
     const verifiedByteSize = typeof intent.publicByteSize === 'number'
       ? BigInt(intent.publicByteSize)
       : BigInt(Number(intent.publicByteSize));

@@ -217,7 +217,7 @@ describe('Publisher EVM E2E: DKGPublisher with real contracts', () => {
   // re-enables multi-root publishes can't slip through.
   // -------------------------------------------------------------------------
 
-  it('V10 CREATE: multi-root publish is rejected by the 1-KA-per-tx guard', async () => {
+  it('V10 CREATE: multi-entity publish mints ONE Knowledge Asset (OT-RFC-44 / Design B)', async () => {
     const entities = Array.from({ length: 5 }, (_, i) => `urn:evm-e2e:entity-${i}`);
     const quads: Quad[] = [];
     for (const entity of entities) {
@@ -225,9 +225,15 @@ describe('Publisher EVM E2E: DKGPublisher with real contracts', () => {
       quads.push(q(entity, 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type', 'http://schema.org/Thing'));
     }
 
-    await expect(
-      publisher.publish({ contextGraphId: CONTEXT_GRAPH, quads }),
-    ).rejects.toThrow(/exactly one Knowledge Asset per transaction \(got 5\)/);
+    // OT-RFC-44 / Design B: a 5-entity file mints exactly ONE KA whose member
+    // entities are all five — not five KAs, and no longer rejected.
+    const result = await publisher.publish({ contextGraphId: CONTEXT_GRAPH, quads });
+    expect(result.status).toBe('confirmed');
+    expect(result.kaId).toBeDefined();
+    const roots = new Set(result.kaManifest.map((m: any) => m.rootEntity));
+    expect(roots.size).toBe(5);
+    const tokenIds = new Set(result.kaManifest.map((m: any) => String(m.tokenId)));
+    expect(tokenIds.size).toBe(1);
   }, 30_000);
 
   // -------------------------------------------------------------------------

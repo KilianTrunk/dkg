@@ -7,7 +7,7 @@ import {
   generateEd25519Keypair,
 } from '@origintrail-official/dkg-core';
 import { OxigraphStore, type Quad } from '@origintrail-official/dkg-storage';
-import { DKGPublisher, MultiRootPublishNotAtomicError } from '../src/index.js';
+import { DKGPublisher } from '../src/index.js';
 import type { PublishResult } from '../src/publisher.js';
 
 const CONTEXT_GRAPH = 'publish-boundary';
@@ -44,7 +44,7 @@ async function makePublisher() {
   return { publisher, store, publishSpy };
 }
 
-describe('publishFromSharedMemory single-root boundary', () => {
+describe('publishFromSharedMemory multi-root selection (OT-RFC-44 / Design B: one KA, N entities)', () => {
   it('allows selection "all" when shared memory resolves to one payload root', async () => {
     const { publisher, store, publishSpy } = await makePublisher();
     await store.insert([
@@ -66,7 +66,7 @@ describe('publishFromSharedMemory single-root boundary', () => {
     ]);
   });
 
-  it('throws before publish when selection "all" resolves to multiple payload roots', async () => {
+  it('publishes ALL payload roots as one KA when selection "all" resolves to multiple roots (OT-RFC-44)', async () => {
     const { publisher, store, publishSpy } = await makePublisher();
     await store.insert([
       q('urn:test:root:one'),
@@ -75,15 +75,16 @@ describe('publishFromSharedMemory single-root boundary', () => {
       q('urn:test:root:two', TRUST_LEVEL_PREDICATE, `"${TrustLevel.SelfAttested}"`),
     ]);
 
-    const error = await publisher.publishFromSharedMemory(CONTEXT_GRAPH, 'all').catch((err) => err);
+    // OT-RFC-44 / Design B: multiple payload roots publish as ONE Knowledge
+    // Asset in a single transaction (formerly rejected as "not atomic"). The
+    // publish proceeds once and carries both roots' (trust/owner-filtered) quads.
+    await expect(publisher.publishFromSharedMemory(CONTEXT_GRAPH, 'all'))
+      .resolves.toMatchObject({ status: 'tentative' });
 
-    expect(error).toBeInstanceOf(MultiRootPublishNotAtomicError);
-    expect(error).toMatchObject({
-      code: 'MULTI_ROOT_PUBLISH_NOT_ATOMIC',
-      contextGraphId: CONTEXT_GRAPH,
-    });
-    expect([...error.rootEntities].sort()).toEqual(['urn:test:root:one', 'urn:test:root:two']);
-    expect(publishSpy).not.toHaveBeenCalled();
+    expect(publishSpy).toHaveBeenCalledTimes(1);
+    const subjects = new Set(publishSpy.mock.calls[0][0].quads.map((qq: any) => qq.subject));
+    expect(subjects.has('urn:test:root:one')).toBe(true);
+    expect(subjects.has('urn:test:root:two')).toBe(true);
   });
 
   it('scopes an explicit single-root selection to that root and excludes co-resident SWM roots', async () => {
@@ -126,23 +127,24 @@ describe('publishFromSharedMemory single-root boundary', () => {
     expect(publishArgs.quads.every((qq) => qq.subject === 'urn:test:root:one')).toBe(true);
   });
 
-  it('throws before publish when explicit rootEntities resolve to multiple payload roots', async () => {
+  it('publishes both explicit rootEntities as one KA when they resolve to multiple payload roots (OT-RFC-44)', async () => {
     const { publisher, store, publishSpy } = await makePublisher();
     await store.insert([
       q('urn:test:root:one'),
       q('urn:test:root:two'),
     ]);
 
-    const error = await publisher.publishFromSharedMemory(CONTEXT_GRAPH, {
-      rootEntities: ['urn:test:root:one', 'urn:test:root:two'],
-    }).catch((err) => err);
+    // OT-RFC-44 / Design B: an explicit multi-root selection publishes as ONE
+    // KA whose member entities are both roots — a single atomic transaction.
+    await expect(
+      publisher.publishFromSharedMemory(CONTEXT_GRAPH, {
+        rootEntities: ['urn:test:root:one', 'urn:test:root:two'],
+      }),
+    ).resolves.toMatchObject({ status: 'tentative' });
 
-    expect(error).toBeInstanceOf(MultiRootPublishNotAtomicError);
-    expect(error).toMatchObject({
-      code: 'MULTI_ROOT_PUBLISH_NOT_ATOMIC',
-      contextGraphId: CONTEXT_GRAPH,
-    });
-    expect([...error.rootEntities].sort()).toEqual(['urn:test:root:one', 'urn:test:root:two']);
-    expect(publishSpy).not.toHaveBeenCalled();
+    expect(publishSpy).toHaveBeenCalledTimes(1);
+    const subjects = new Set(publishSpy.mock.calls[0][0].quads.map((qq: any) => qq.subject));
+    expect(subjects.has('urn:test:root:one')).toBe(true);
+    expect(subjects.has('urn:test:root:two')).toBe(true);
   });
 });

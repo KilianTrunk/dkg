@@ -1219,10 +1219,13 @@ export class DKGPublisher implements Publisher {
     if (quads.length === 0) {
       throw new Error(`No quads in shared memory for context graph ${contextGraphId} matching selection`);
     }
+    // OT-RFC-44 / Design B: a shared-memory selection of N root entities
+    // publishes as ONE Knowledge Asset in a SINGLE transaction — which is
+    // exactly the atomicity the old MultiRootPublishNotAtomicError guard was
+    // protecting (V8/V9 mapped N roots -> N KAs -> N txs, hence "not atomic").
+    // With file=KA the multi-root publish IS atomic, so the guard is removed;
+    // `rootEntities` becomes the member-entity list of the one KA.
     const rootEntities = [...autoPartition(quads).keys()];
-    if (rootEntities.length > 1) {
-      throw new MultiRootPublishNotAtomicError(contextGraphId, rootEntities);
-    }
 
     const ctxGraphId = options?.publishContextGraphId;
     const chainCgId = options?.onChainContextGraphId ?? ctxGraphId;

@@ -456,6 +456,18 @@ describe('memory layer custom query execution', () => {
     expect(memoryLayerView).toContain("onKeyDown={(e) => { if (e.key === 'Enter') runQuery(); }}");
     expect(memoryLayerView).toContain('<button className="v10-mlv-run-btn" onClick={runQuery}>');
   });
+
+  it('keeps the WM default query GRAPH variable at the top level (scoped-query guard, PR #749)', () => {
+    // Regression guard: the scoped local-query path rejects a GRAPH
+    // *variable* nested in UNION/OPTIONAL/a sub-group with "GRAPH
+    // variables must appear at the top level of scoped local queries".
+    // The WM default query must read named partitions via a top-level
+    // `GRAPH ?g { ?s ?p ?o } FILTER(STRSTARTS(...))` and must NOT wrap
+    // `GRAPH ?g` inside a UNION (the prior shape that broke the WM layer
+    // view + WM→SWM promote flow).
+    expect(memoryLayerView).not.toMatch(/UNION\s*\{\s*GRAPH\s+\?/);
+    expect(memoryLayerView).toContain('GRAPH ?g { ?s ?p ?o } FILTER(STRSTARTS(STR(?g),');
+  });
 });
 
 /* ══════════════════════════════════════════

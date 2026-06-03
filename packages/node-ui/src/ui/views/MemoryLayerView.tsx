@@ -113,7 +113,15 @@ export function MemoryLayerView({ layer, contextGraphId, externalQuery, external
   const defaultSparql = useMemo(() => {
     if (layer === 'wm') {
       const cgUri = `did:dkg:context-graph:${contextGraphId}`;
-      return `SELECT ?s ?p ?o WHERE { { ?s ?p ?o } UNION { GRAPH ?g { ?s ?p ?o } FILTER(STRSTARTS(STR(?g), "${cgUri}")) } } LIMIT 1000`;
+      // GRAPH variable must stay at the top level of the WHERE block: the
+      // scoped local-query path (`constrainGraphVariablesToAllowedSet`,
+      // PR #749) rejects a `GRAPH ?g` nested inside `UNION`/`OPTIONAL`/a
+      // sub-group with "GRAPH variables must appear at the top level of
+      // scoped local queries". The dropped `{ ?s ?p ?o }` default-graph
+      // UNION branch was also an unscoped read — in V10 all context-graph
+      // content lives in named partitions, so the named-graph branch alone
+      // returns the WM triples.
+      return `SELECT ?s ?p ?o WHERE { GRAPH ?g { ?s ?p ?o } FILTER(STRSTARTS(STR(?g), "${cgUri}")) } LIMIT 1000`;
     }
     if (layer === 'vm') {
       return buildVerifiedMemorySearchQuery({

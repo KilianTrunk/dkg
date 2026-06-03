@@ -789,16 +789,41 @@ export async function listAssertions(
   // the data graph is genuinely empty (fresh create with no writes
   // yet), matching the prior listing semantics for that case.
   const metaGraph = `did:dkg:context-graph:${contextGraphId}/_meta`;
-  const sparql = `SELECT ?g (COUNT(?s) AS ?cnt) WHERE {
+  const cgPrefix = `did:dkg:context-graph:${contextGraphId}/`;
+  // Two scoped queries instead of a single `OPTIONAL { GRAPH ?g { … } }`.
+  // The OPTIONAL nested a GRAPH *variable* below the top level of the
+  // WHERE block, which the scoped local-query path
+  // (`constrainGraphVariablesToAllowedSet`, PR #749) rejects with
+  // "GRAPH variables must appear at the top level of scoped local
+  // queries". Split the concern:
+  //   • `listSparql`  — authoritative WM membership from the fixed
+  //     `_meta` graph (no GRAPH variable at all). Includes assertions
+  //     whose data partition is still empty (fresh create, no writes),
+  //     preserving the prior listing semantics the OPTIONAL existed for.
+  //   • `countSparql` — per-partition triple counts with the GRAPH
+  //     variable at the top level (guard-safe). In the UI
+  //     `includeContextGraphPartitions: true` expands the allow-list to
+  //     the assertion partitions so these counts populate.
+  // Counts are merged by graph URI; a WM graph with no count row simply
+  // renders without a triple badge (the badge is `!= null`-guarded).
+  const listSparql = `SELECT ?g WHERE {
     GRAPH <${metaGraph}> { ?g <http://dkg.io/ontology/memoryLayer> "WM" }
-    OPTIONAL { GRAPH ?g { ?s ?p ?o } }
+  }`;
+  const countSparql = `SELECT ?g (COUNT(*) AS ?cnt) WHERE {
+    GRAPH ?g { ?s ?p ?o } FILTER(STRSTARTS(STR(?g), "${cgPrefix}"))
   } GROUP BY ?g`;
-  const data = await postQueryDeduped({
-    sparql,
-    contextGraphId,
-    includeContextGraphPartitions: true,
-  });
-  const bindings: any[] = data?.result?.bindings ?? [];
+  const [listData, countData] = await Promise.all([
+    postQueryDeduped({ sparql: listSparql, contextGraphId, includeContextGraphPartitions: true }),
+    postQueryDeduped({ sparql: countSparql, contextGraphId, includeContextGraphPartitions: true }),
+  ]);
+  const bindings: any[] = listData?.result?.bindings ?? [];
+  const countByGraph = new Map<string, number>();
+  for (const b of (countData?.result?.bindings ?? [])) {
+    const g = typeof b.g === 'string' ? b.g : b.g?.value;
+    const cntRaw = typeof b.cnt === 'string' ? b.cnt : b.cnt?.value;
+    const cnt = cntRaw != null ? parseInt(cntRaw, 10) : NaN;
+    if (g && Number.isFinite(cnt)) countByGraph.set(g, cnt);
+  }
   // #706 fix — the prior `startsWith('did:dkg:context-graph:<cg>/assertion/')`
   // shape silently dropped sub-graph-scoped WM assertions, whose graph
   // URI is `did:dkg:context-graph:<cg>/<sg>/assertion/<agent>/<name>`
@@ -813,7 +838,6 @@ export async function listAssertions(
   // would silently miss otherwise. The cgId itself is treated as
   // opaque (it may contain `/assertion/` as a literal substring,
   // per `validateContextGraphId`).
-  const cgPrefix = `did:dkg:context-graph:${contextGraphId}/`;
   const result: AssertionInfo[] = [];
   for (const b of bindings) {
     const g = typeof b.g === 'string' ? b.g : b.g?.value;
@@ -831,8 +855,8 @@ export async function listAssertions(
       continue;
     }
     if (!name) continue;
-    const cnt = typeof b.cnt === 'string' ? parseInt(b.cnt, 10) : (b.cnt?.value ? parseInt(b.cnt.value, 10) : undefined);
-    result.push({ name, graphUri: g, tripleCount: Number.isFinite(cnt) ? cnt : undefined, subGraph });
+    const cnt = countByGraph.get(g);
+    result.push({ name, graphUri: g, tripleCount: cnt, subGraph });
   }
   return result;
 }

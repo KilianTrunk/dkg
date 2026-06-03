@@ -46,9 +46,16 @@ describe('listAssertions (WM) — URI parse + cg-scoped filter', () => {
   });
 
   function setBindings(bindings: unknown[]) {
-    fetchMock.mockResolvedValueOnce(
-      jsonResponse({ result: { bindings } }),
-    );
+    // `listAssertions(wm)` now issues two scoped queries in parallel
+    // (membership from `<cg>/_meta`, then a top-level `GRAPH ?g` triple
+    // count) instead of one OPTIONAL-nested query — the latter tripped
+    // the scoped-graph-variable guard (PR #749). Feed the same fixture
+    // rows to both: the membership query reads `?g`, the count query
+    // reads `?g` + `?cnt`, and the parser merges counts back by graph
+    // URI. Order matches the Promise.all array: call[0] = membership,
+    // call[1] = count.
+    fetchMock.mockResolvedValueOnce(jsonResponse({ result: { bindings } }));
+    fetchMock.mockResolvedValueOnce(jsonResponse({ result: { bindings } }));
   }
 
   it('parses root-bucket assertion: name extracted, subGraph undefined', async () => {
@@ -167,15 +174,20 @@ describe('listAssertions (WM) — URI parse + cg-scoped filter', () => {
       bRow('did:dkg:context-graph:cg-A/assertion/0xabc/notes', 5),
     ]);
     await listAssertions('cg-A', 'wm');
-    expect(fetchMock).toHaveBeenCalledOnce();
-    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-    expect(String(url)).toContain('/api/query');
-    const body = JSON.parse(String(init.body));
-    expect(body).toMatchObject({
-      contextGraphId: 'cg-A',
-      includeContextGraphPartitions: true,
-    });
-    expect(typeof body.sparql).toBe('string');
+    // Two scoped queries now: membership (call[0]) + triple count
+    // (call[1]). Both must keep the partition opt-in so `GRAPH ?g`
+    // expansion reaches the assertion data partitions.
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    for (const call of fetchMock.mock.calls) {
+      const [url, init] = call as [string, RequestInit];
+      expect(String(url)).toContain('/api/query');
+      const body = JSON.parse(String(init.body));
+      expect(body).toMatchObject({
+        contextGraphId: 'cg-A',
+        includeContextGraphPartitions: true,
+      });
+      expect(typeof body.sparql).toBe('string');
+    }
   });
 
   it('SPARQL gates WM membership on dkg:memoryLayer "WM" in <cg>/_meta (#898 Codex)', async () => {

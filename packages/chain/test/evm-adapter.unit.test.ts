@@ -3,6 +3,7 @@
  * revert decoding used across chain operations). No live RPC / Hardhat.
  */
 import { createServer, type Server } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { Interface, ethers } from 'ethers';
 import {
@@ -166,6 +167,46 @@ describe('EVMChainAdapter constructor / getters (no init)', () => {
     expect(a.getProvider()).toBeDefined();
     expect(typeof a.getProvider().getBlockNumber).toBe('function');
     expect(a.getReadProvider()).toBeDefined();
+  });
+
+  it('issues un-batched JSON-RPC requests (batchMaxCount=1) so a rate-limited read rejects on its own awaited promise — issue #939', async () => {
+    // With ethers' default batching, several concurrent reads coalesce into a
+    // single ARRAY-bodied HTTP request; a whole-batch rate-limit error then
+    // rejects on the un-awaited batch-drain promise → unhandled "could not
+    // coalesce error" rejection (~30k observed live). batchMaxCount:1 sends
+    // each read as its own single-object request, so the error attaches to the
+    // awaited promise and is caught by the gossip/finalization verifyOnChain
+    // try/catch. We assert the observable contract: no request body is an array.
+    const bodies: unknown[] = [];
+    const server = createServer((req, res) => {
+      let raw = '';
+      req.on('data', (chunk) => { raw += chunk; });
+      req.on('end', () => {
+        const parsed = JSON.parse(raw) as unknown;
+        bodies.push(parsed);
+        const reqs = Array.isArray(parsed) ? parsed : [parsed];
+        const results = reqs.map((r) => ({ jsonrpc: '2.0', id: (r as { id: number }).id, result: '0x1' }));
+        res.setHeader('content-type', 'application/json');
+        res.end(JSON.stringify(Array.isArray(parsed) ? results : results[0]));
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+    try {
+      const port = (server.address() as AddressInfo).port;
+      const a = new EVMChainAdapter(minimalConfig({ rpcUrl: `http://127.0.0.1:${port}` }));
+      const provider = a.getProvider();
+      // Three DIFFERENT concurrent read methods so ethers cannot in-flight-dedupe
+      // them; default batching would still fold them into one array request.
+      await Promise.all([
+        provider.getBlockNumber(),
+        provider.getBalance(ethers.ZeroAddress),
+        provider.getTransactionCount(ethers.ZeroAddress),
+      ]);
+      expect(bodies.length).toBeGreaterThanOrEqual(2);
+      expect(bodies.every((b) => !Array.isArray(b))).toBe(true);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
   });
 
   it('falls back to getContextGraph when ContextGraphStorage lacks getAccessPolicy', async () => {

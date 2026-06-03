@@ -878,8 +878,24 @@ export class EVMChainAdapter implements ChainAdapter {
     // retryable error within seconds instead of stalling reads (e.g. `init()`'s
     // Hub lookups) for minutes — which would otherwise make context-graph
     // register hang past its HTTP timeout rather than returning 503.
+    // Disable ethers' JSON-RPC request batching (default `batchMaxCount` = 100).
+    // Under RPC rate limiting a *batched* `eth_getLogs` response is a single
+    // JSON-RPC error covering the whole batch; ethers' coalesce path then
+    // rejects on the un-awaited batch-drain promise rather than the per-request
+    // promise the caller awaits, so the failure escapes as an UNHANDLED "could
+    // not coalesce error" rejection (~30k observed on a live node under a
+    // gossip/finalization on-chain-verification storm — see issue #939). With
+    // `batchMaxCount: 1` each read is its own request whose rejection attaches
+    // to the awaited promise and is caught by the caller's existing try/catch
+    // (gossip-publish-handler / finalization-handler `verifyOnChain`). Batching
+    // is a transport optimisation only — disabling it is semantically inert and
+    // does not change the number of `eth_getLogs` operations issued.
     this.providers = this.rpcUrls.map(
-      (url) => new JsonRpcProvider(boundedRetryFetchRequest(url), undefined, { cacheTimeout: -1, polling: true }),
+      (url) => new JsonRpcProvider(boundedRetryFetchRequest(url), undefined, {
+        cacheTimeout: -1,
+        polling: true,
+        batchMaxCount: 1,
+      }),
     );
     this.primaryProvider = this.providers[0];
     this.provider = this.providers.length === 1

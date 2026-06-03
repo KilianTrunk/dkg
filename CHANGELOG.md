@@ -6,7 +6,7 @@ All notable changes to the DKG V9 node are documented here. The format is based 
 
 ## [10.0.0-rc.14] - 2026-06-02
 
-**Off-chain runtime release.** No Solidity changes since rc.13 — the Base Sepolia (chainId 84532) deployment is **unchanged**, the `chainResetMarker` stays `v10-rc12-ka-rename-2026-06-01`, and **no contract redeploy is required**. Nodes upgrade in place; no local-state wipe. This release fixes the multi-GB `node-ui.db` bloat by taking the sync RPC off the Universal Messenger substrate, adds per-peer exponential backoff to the sync reconciler, and adds an **opt-in** daemon-managed local Oxigraph server backend (Release 2, phase 2a).
+**Off-chain runtime release.** No Solidity changes since rc.13 — the Base Sepolia (chainId 84532) deployment is **unchanged**, the `chainResetMarker` stays `v10-rc12-ka-rename-2026-06-01`, and **no contract redeploy is required**. Nodes upgrade in place; no local-state wipe. This release fixes the multi-GB `node-ui.db` bloat by taking the sync RPC off the Universal Messenger substrate, adds per-peer exponential backoff to the sync reconciler, adds an **opt-in** daemon-managed local Oxigraph server backend (Release 2, phase 2a), and stops `eth_getLogs` rate-limit failures from surfacing as unhandled process rejections under gossip/finalization verification storms.
 
 > **Wire-compatibility note (hard cutover):** the sync protocol ID is bumped `/dkg/10.0.1/sync` → `/dkg/10.0.2/sync`. An rc.14 node will **not** sync with an rc.13 (or earlier) node and vice versa — mixed-version peers cleanly skip each other (`waitForSyncProtocol`). Because sync is a self-healing eventual-consistency catch-up net (not a primary data path), the brief mixed-version window during a network rollout is **no-data-loss**: once both ends are on rc.14 the next reconnect/reconciler tick backfills.
 
@@ -27,6 +27,10 @@ All notable changes to the DKG V9 node are documented here. The format is based 
   - **Enable it**: set `"store": { "backend": "oxigraph-server" }` in `~/.dkg/config.json`, pass `--store oxigraph-server` to the setup commands, or type `oxigraph-server` at the `dkg init` store prompt. Default backend is **unchanged** (`oxigraph-worker`); switching backends starts on an empty store and requires `DKG_ACCEPT_STORE_RESET=1` on first switch.
   - **Security**: `oxigraph serve` has no native auth; the security boundary for the managed server is the loopback bind. The endpoint is never exposed off-host.
   - **Linux caveat**: the prebuilt Linux artifacts are glibc-only (`*_linux_gnu`); musl hosts (Alpine/distroless) must use a system-provided `oxigraph` or an external `sparql-http` endpoint.
+
+### Fixed — Chain RPC read path (`eth_getLogs` rate-limit storm)
+
+- **Disable ethers JSON-RPC request batching on the chain provider** (`packages/chain/src/evm-adapter.ts`, PR #940): under RPC rate limiting a *batched* `eth_getLogs` response is a single whole-batch JSON-RPC error, and ethers' coalesce path rejected on the un-awaited batch-drain promise — surfacing as ~30k unhandled `could not coalesce error` / `over rate limit` process rejections under a gossip/finalization on-chain-verification storm (issue #939). Constructing providers with `batchMaxCount: 1` makes each read its own awaited request whose rejection is caught by the existing `verifyOnChain` try/catch. Transport-only change; the number of `eth_getLogs` operations issued is unchanged.
 
 ## [10.0.0-rc.13] - 2026-06-02
 

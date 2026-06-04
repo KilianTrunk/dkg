@@ -235,6 +235,46 @@ function isChatTurnStoreNotFoundError(err: unknown): boolean {
   return lower.includes(CHAT_TURNS_ASSERTION_NAME);
 }
 
+/**
+ * Author attestation produced by an external signer. Mirrors the
+ * `packages/cli/src/api-client.ts` reference so the finalize/create KA flows
+ * can carry a pre-built EIP-712 attestation instead of signing on the daemon.
+ */
+export interface PreSignedAuthorAttestationPayload {
+  address: string;
+  signature: { r: string; vs: string };
+}
+
+/**
+ * VM-publish controls for the finalized-assertion publish path. Mirrors
+ * `KnowledgeAssetFinalizedPublishOptions` in `packages/cli/src/api-client.ts`
+ * verbatim so every first-party client exposes the same surface.
+ */
+export interface KnowledgeAssetFinalizedPublishOptions {
+  /**
+   * SDK-friendly spelling for the finalized publish cleanup flag. The
+   * knowledge-assets daemon route forwards `clearSharedMemoryAfter` to
+   * `publishFromFinalizedAssertion`, so the client translates before POST.
+   */
+  clearAfter?: boolean;
+  publishEpochs?: number;
+  publisherNodeIdentityIdOverride?: bigint;
+}
+
+/** Translate {@link KnowledgeAssetFinalizedPublishOptions} into the daemon body. */
+function finalizedPublishOptionsPayload(
+  options?: KnowledgeAssetFinalizedPublishOptions,
+): Record<string, unknown> | undefined {
+  if (!options) return undefined;
+  const payload: Record<string, unknown> = {};
+  if (options.clearAfter !== undefined) payload.clearSharedMemoryAfter = options.clearAfter;
+  if (options.publishEpochs !== undefined) payload.publishEpochs = options.publishEpochs;
+  if (options.publisherNodeIdentityIdOverride !== undefined) {
+    payload.publisherNodeIdentityIdOverride = options.publisherNodeIdentityIdOverride.toString();
+  }
+  return Object.keys(payload).length > 0 ? payload : undefined;
+}
+
 export class DkgDaemonClient {
   readonly baseUrl: string;
   private readonly timeoutMs: number;
@@ -1110,15 +1150,24 @@ export class DkgDaemonClient {
     opts?: {
       subGraphName?: string;
       quads?: Array<{ subject: string; predicate: string; object: string; graph: string }>;
+      authorAgentAddress?: string;
+      preSignedAuthorAttestation?: PreSignedAuthorAttestationPayload;
+      schemeVersion?: number;
       alsoShareSwm?: boolean;
-      alsoPublishVm?: boolean;
+      alsoPublishVm?: boolean | KnowledgeAssetFinalizedPublishOptions;
     },
   ): Promise<Record<string, unknown>> {
-    return this.post('/api/knowledge-assets', {
+    const payload: Record<string, unknown> = {
       contextGraphId: normalizeContextGraphId(contextGraphId),
       name,
       ...(opts ?? {}),
-    });
+    };
+    // Object form carries finalized-publish controls; translate to the daemon
+    // body shape (mirrors the cli ApiClient). `true` is left as-is.
+    if (opts?.alsoPublishVm && typeof opts.alsoPublishVm === 'object') {
+      payload.alsoPublishVm = finalizedPublishOptionsPayload(opts.alsoPublishVm) ?? {};
+    }
+    return this.post('/api/knowledge-assets', payload);
   }
 
   /** GET a KA's per-layer lifecycle state by name. */
@@ -1152,7 +1201,12 @@ export class DkgDaemonClient {
   async knowledgeAssetFinalize(
     contextGraphId: string,
     name: string,
-    opts?: { subGraphName?: string },
+    opts?: {
+      subGraphName?: string;
+      authorAgentAddress?: string;
+      preSignedAuthorAttestation?: PreSignedAuthorAttestationPayload;
+      schemeVersion?: number;
+    },
   ): Promise<{ merkleRoot: string; eip712Digest: string }> {
     return this.post(`/api/knowledge-assets/${encodeURIComponent(name)}/wm/finalize`, {
       contextGraphId: normalizeContextGraphId(contextGraphId),
@@ -1202,11 +1256,13 @@ export class DkgDaemonClient {
   async knowledgeAssetPublish(
     contextGraphId: string,
     name: string,
-    opts?: { subGraphName?: string },
+    opts?: { subGraphName?: string } & KnowledgeAssetFinalizedPublishOptions,
   ): Promise<Record<string, unknown>> {
+    const publishOptions = finalizedPublishOptionsPayload(opts);
     return this.post(`/api/knowledge-assets/${encodeURIComponent(name)}/vm/publish`, {
       contextGraphId: normalizeContextGraphId(contextGraphId),
-      ...(opts ?? {}),
+      ...(opts?.subGraphName ? { subGraphName: opts.subGraphName } : {}),
+      ...(publishOptions ? { options: publishOptions } : {}),
     });
   }
 }

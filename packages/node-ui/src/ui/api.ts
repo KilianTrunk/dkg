@@ -652,6 +652,47 @@ export interface KnowledgeAssetQuad {
 }
 
 /**
+ * Author attestation produced by an external signer. Mirrors the
+ * `packages/cli/src/api-client.ts` reference so finalize / create KA flows can
+ * carry a pre-built EIP-712 attestation instead of signing on the daemon.
+ */
+export interface PreSignedAuthorAttestationPayload {
+  address: string;
+  signature: { r: string; vs: string };
+}
+
+/**
+ * VM-publish controls for the finalized-assertion publish path. Mirrors
+ * `KnowledgeAssetFinalizedPublishOptions` in `packages/cli/src/api-client.ts`.
+ * `publisherNodeIdentityIdOverride` is widened to `string | number` (the browser
+ * `JSON.stringify` cannot serialize a bigint) on top of the cli's `bigint`.
+ */
+export interface KnowledgeAssetFinalizedPublishOptions {
+  /**
+   * SDK-friendly spelling for the finalized publish cleanup flag. The
+   * knowledge-assets daemon route forwards `clearSharedMemoryAfter` to
+   * `publishFromFinalizedAssertion`, so the client translates before POST.
+   */
+  clearAfter?: boolean;
+  publishEpochs?: number;
+  publisherNodeIdentityIdOverride?: bigint | string | number;
+}
+
+/** Translate {@link KnowledgeAssetFinalizedPublishOptions} into the daemon body. */
+const finalizedPublishOptionsPayload = (
+  options?: KnowledgeAssetFinalizedPublishOptions,
+): Record<string, unknown> | undefined => {
+  if (!options) return undefined;
+  const payload: Record<string, unknown> = {};
+  if (options.clearAfter !== undefined) payload.clearSharedMemoryAfter = options.clearAfter;
+  if (options.publishEpochs !== undefined) payload.publishEpochs = options.publishEpochs;
+  if (options.publisherNodeIdentityIdOverride !== undefined) {
+    payload.publisherNodeIdentityIdOverride = String(options.publisherNodeIdentityIdOverride);
+  }
+  return Object.keys(payload).length > 0 ? payload : undefined;
+};
+
+/**
  * Create a KA and open its WM draft. Pass `quads` to atomically write+finalize
  * in one call; `alsoShareSwm` / `alsoPublishVm` to advance layers in the same
  * request (best-effort tails — partial failures are reported via HTTP 207).
@@ -662,10 +703,21 @@ export const createKnowledgeAsset = (
   opts: {
     subGraphName?: string;
     quads?: KnowledgeAssetQuad[];
+    authorAgentAddress?: string;
+    preSignedAuthorAttestation?: PreSignedAuthorAttestationPayload;
+    schemeVersion?: number;
     alsoShareSwm?: boolean;
-    alsoPublishVm?: boolean;
+    alsoPublishVm?: boolean | KnowledgeAssetFinalizedPublishOptions;
   } = {},
-) => post<Record<string, unknown>>('/api/knowledge-assets', { contextGraphId, name, ...opts });
+) => {
+  const body: Record<string, unknown> = { contextGraphId, name, ...opts };
+  // Object form carries finalized-publish controls; translate to the daemon
+  // body shape (mirrors the cli ApiClient). `true`/`false` pass through.
+  if (opts.alsoPublishVm && typeof opts.alsoPublishVm === 'object') {
+    body.alsoPublishVm = finalizedPublishOptionsPayload(opts.alsoPublishVm) ?? {};
+  }
+  return post<Record<string, unknown>>('/api/knowledge-assets', body);
+};
 
 /** GET a KA's per-layer lifecycle state by name. */
 export const getKnowledgeAsset = (
@@ -698,7 +750,12 @@ export const knowledgeAssetWrite = (
 export const knowledgeAssetFinalize = (
   contextGraphId: string,
   name: string,
-  opts: { subGraphName?: string } = {},
+  opts: {
+    subGraphName?: string;
+    authorAgentAddress?: string;
+    preSignedAuthorAttestation?: PreSignedAuthorAttestationPayload;
+    schemeVersion?: number;
+  } = {},
 ) =>
   post<{ merkleRoot: string; eip712Digest: string }>(
     `/api/knowledge-assets/${encodeURIComponent(name)}/wm/finalize`,
@@ -743,12 +800,18 @@ export const knowledgeAssetShare = (
 export const knowledgeAssetPublish = (
   contextGraphId: string,
   name: string,
-  opts: { subGraphName?: string } = {},
-) =>
-  post<Record<string, unknown>>(
+  opts: { subGraphName?: string } & KnowledgeAssetFinalizedPublishOptions = {},
+) => {
+  const publishOptions = finalizedPublishOptionsPayload(opts);
+  return post<Record<string, unknown>>(
     `/api/knowledge-assets/${encodeURIComponent(name)}/vm/publish`,
-    { contextGraphId, ...opts },
+    {
+      contextGraphId,
+      ...(opts.subGraphName ? { subGraphName: opts.subGraphName } : {}),
+      ...(publishOptions ? { options: publishOptions } : {}),
+    },
   );
+};
 
 // --- Assertions (WM objects) ---
 

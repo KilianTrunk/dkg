@@ -68,6 +68,47 @@ function toContextGraphUri(contextGraphIdOrUri: string): string {
 }
 
 /**
+ * Author attestation produced by an external signer. Mirrors the
+ * `packages/cli/src/api-client.ts` reference so finalize / create KA flows can
+ * carry a pre-built EIP-712 attestation instead of signing on the daemon.
+ */
+export interface PreSignedAuthorAttestationPayload {
+  address: string;
+  signature: { r: string; vs: string };
+}
+
+/**
+ * VM-publish controls for the finalized-assertion publish path. Mirrors
+ * `KnowledgeAssetFinalizedPublishOptions` in `packages/cli/src/api-client.ts`.
+ * `publisherNodeIdentityIdOverride` is widened to accept `string | number`
+ * (JSON-RPC MCP callers cannot send a bigint) on top of the cli's `bigint`.
+ */
+export interface KnowledgeAssetFinalizedPublishOptions {
+  /**
+   * SDK-friendly spelling for the finalized publish cleanup flag. The
+   * knowledge-assets daemon route forwards `clearSharedMemoryAfter` to
+   * `publishFromFinalizedAssertion`, so the client translates before POST.
+   */
+  clearAfter?: boolean;
+  publishEpochs?: number;
+  publisherNodeIdentityIdOverride?: bigint | string | number;
+}
+
+/** Translate {@link KnowledgeAssetFinalizedPublishOptions} into the daemon body. */
+function finalizedPublishOptionsPayload(
+  options?: KnowledgeAssetFinalizedPublishOptions,
+): Record<string, unknown> | undefined {
+  if (!options) return undefined;
+  const payload: Record<string, unknown> = {};
+  if (options.clearAfter !== undefined) payload.clearSharedMemoryAfter = options.clearAfter;
+  if (options.publishEpochs !== undefined) payload.publishEpochs = options.publishEpochs;
+  if (options.publisherNodeIdentityIdOverride !== undefined) {
+    payload.publisherNodeIdentityIdOverride = String(options.publisherNodeIdentityIdOverride);
+  }
+  return Object.keys(payload).length > 0 ? payload : undefined;
+}
+
+/**
  * Per-peer diagnostic snapshot returned by `GET /api/peer-info`. Shape
  * mirrors the daemon-side `PeerDiagnostics` interface plus the legacy
  * flat fields kept for back-compat with pre-diagnostic callers (the
@@ -1032,8 +1073,11 @@ export class DkgClient {
     name: string;
     subGraphName?: string;
     quads?: Array<{ subject: string; predicate: string; object: string; graph: string }>;
+    authorAgentAddress?: string;
+    preSignedAuthorAttestation?: PreSignedAuthorAttestationPayload;
+    schemeVersion?: number;
     alsoShareSwm?: boolean;
-    alsoPublishVm?: boolean;
+    alsoPublishVm?: boolean | KnowledgeAssetFinalizedPublishOptions;
   }): Promise<Record<string, unknown>> {
     const body: Record<string, unknown> = {
       contextGraphId: normalizeContextGraphId(args.contextGraphId),
@@ -1041,8 +1085,20 @@ export class DkgClient {
     };
     if (args.subGraphName) body.subGraphName = args.subGraphName;
     if (args.quads) body.quads = args.quads;
+    if (args.authorAgentAddress) body.authorAgentAddress = args.authorAgentAddress;
+    if (args.preSignedAuthorAttestation) {
+      body.preSignedAuthorAttestation = args.preSignedAuthorAttestation;
+    }
+    if (args.schemeVersion !== undefined) body.schemeVersion = args.schemeVersion;
     if (args.alsoShareSwm !== undefined) body.alsoShareSwm = args.alsoShareSwm;
-    if (args.alsoPublishVm !== undefined) body.alsoPublishVm = args.alsoPublishVm;
+    if (args.alsoPublishVm !== undefined) {
+      // Object form carries finalized-publish controls; translate to the daemon
+      // body shape (mirrors the cli ApiClient). `true`/`false` pass through.
+      body.alsoPublishVm =
+        typeof args.alsoPublishVm === 'object'
+          ? (finalizedPublishOptionsPayload(args.alsoPublishVm) ?? {})
+          : args.alsoPublishVm;
+    }
     return this.request<Record<string, unknown>>('POST', '/api/knowledge-assets', body);
   }
 
@@ -1086,11 +1142,19 @@ export class DkgClient {
     contextGraphId: string;
     name: string;
     subGraphName?: string;
+    authorAgentAddress?: string;
+    preSignedAuthorAttestation?: PreSignedAuthorAttestationPayload;
+    schemeVersion?: number;
   }): Promise<{ merkleRoot: string; eip712Digest: string }> {
     const body: Record<string, unknown> = {
       contextGraphId: normalizeContextGraphId(args.contextGraphId),
     };
     if (args.subGraphName) body.subGraphName = args.subGraphName;
+    if (args.authorAgentAddress) body.authorAgentAddress = args.authorAgentAddress;
+    if (args.preSignedAuthorAttestation) {
+      body.preSignedAuthorAttestation = args.preSignedAuthorAttestation;
+    }
+    if (args.schemeVersion !== undefined) body.schemeVersion = args.schemeVersion;
     return this.request<{ merkleRoot: string; eip712Digest: string }>(
       'POST',
       `/api/knowledge-assets/${encodeURIComponent(args.name)}/wm/finalize`,
@@ -1160,11 +1224,13 @@ export class DkgClient {
     contextGraphId: string;
     name: string;
     subGraphName?: string;
-  }): Promise<Record<string, unknown>> {
+  } & KnowledgeAssetFinalizedPublishOptions): Promise<Record<string, unknown>> {
     const body: Record<string, unknown> = {
       contextGraphId: normalizeContextGraphId(args.contextGraphId),
     };
     if (args.subGraphName) body.subGraphName = args.subGraphName;
+    const publishOptions = finalizedPublishOptionsPayload(args);
+    if (publishOptions) body.options = publishOptions;
     return this.request<Record<string, unknown>>(
       'POST',
       `/api/knowledge-assets/${encodeURIComponent(args.name)}/vm/publish`,

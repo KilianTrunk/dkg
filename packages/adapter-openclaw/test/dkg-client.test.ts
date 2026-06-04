@@ -1126,5 +1126,61 @@ describe('DkgDaemonClient', () => {
       expect(url(0)).toBe('http://localhost:9200/api/knowledge-assets/f/swm/share');
       expect(url(1)).toBe('http://localhost:9200/api/knowledge-assets/f/vm/publish');
     });
+
+    it('knowledgeAssetPublish nests finalized-publish controls under `options`', async () => {
+      ok({ ual: 'did:dkg:x' });
+      await client.knowledgeAssetPublish('cg-1', 'f', {
+        subGraphName: 'sg',
+        clearAfter: true,
+        publishEpochs: 3,
+        publisherNodeIdentityIdOverride: 42n,
+      });
+      expect(url()).toBe('http://localhost:9200/api/knowledge-assets/f/vm/publish');
+      // `clearAfter` is the SDK spelling; the daemon expects `clearSharedMemoryAfter`.
+      // bigint overrides serialize as decimal strings (JSON has no bigint).
+      expect(body()).toMatchObject({
+        contextGraphId: 'cg-1',
+        subGraphName: 'sg',
+        options: {
+          clearSharedMemoryAfter: true,
+          publishEpochs: 3,
+          publisherNodeIdentityIdOverride: '42',
+        },
+      });
+    });
+
+    it('knowledgeAssetPublish omits `options` when no controls are passed', async () => {
+      ok({ ual: 'did:dkg:x' });
+      await client.knowledgeAssetPublish('cg-1', 'f', { subGraphName: 'sg' });
+      expect(body()).toEqual({ contextGraphId: 'cg-1', subGraphName: 'sg' });
+    });
+
+    it('knowledgeAssetFinalize forwards external-signer fields', async () => {
+      ok({ merkleRoot: '0xroot', eip712Digest: '0xdig' });
+      await client.knowledgeAssetFinalize('cg-1', 'f', {
+        authorAgentAddress: '0xauthor',
+        preSignedAuthorAttestation: { address: '0xauthor', signature: { r: '0xr', vs: '0xvs' } },
+        schemeVersion: 1,
+      });
+      expect(url()).toBe('http://localhost:9200/api/knowledge-assets/f/wm/finalize');
+      expect(body()).toMatchObject({
+        contextGraphId: 'cg-1',
+        authorAgentAddress: '0xauthor',
+        preSignedAuthorAttestation: { address: '0xauthor', signature: { r: '0xr', vs: '0xvs' } },
+        schemeVersion: 1,
+      });
+    });
+
+    it('createKnowledgeAsset translates an alsoPublishVm options object', async () => {
+      ok({ name: 'f' });
+      await client.createKnowledgeAsset('cg-1', 'f', {
+        alsoPublishVm: { clearAfter: true, publishEpochs: 2, publisherNodeIdentityIdOverride: 7n },
+      });
+      expect(body().alsoPublishVm).toEqual({
+        clearSharedMemoryAfter: true,
+        publishEpochs: 2,
+        publisherNodeIdentityIdOverride: '7',
+      });
+    });
   });
 });

@@ -166,6 +166,18 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
         bytes32 authorR;
         bytes32 authorVS;
         uint8   authorSchemeVersion;
+        // ── OT-RFC-43 Option 1 (variant 1a): caller-supplied deterministic id ──
+        /// @notice The packed KA id this publish claims:
+        ///         kaId = (uint160(authorAddress) << 96) | uint96(number),
+        ///         pre-allocated off-chain (the reserved UAL). KCS enforces
+        ///         `(reservedKaId >> 96) == authorAddress` at mint, so a wallet
+        ///         can only mint within its own namespace. REQUIRED — there is
+        ///         no auto-mint fallback under 1a; a value outside the author's
+        ///         namespace reverts `KaIdNamespaceMismatch`. Deliberately NOT
+        ///         added to the ACK digest: the namespace is enforced on-chain
+        ///         and choosing a different number within one's own namespace is
+        ///         harmless (OT-RFC-43; see PR description / R5 decision).
+        uint256 reservedKaId;
         // ── ACK quorum (unchanged) ──
         uint72[] identityIds;
         bytes32[] r;
@@ -648,6 +660,7 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
         kaId = kcs.createKnowledgeAsset(
             msg.sender,
             p.authorAddress,
+            p.reservedKaId,
             p.publishOperationId,
             p.merkleRoot,
             p.knowledgeAssetsAmount,

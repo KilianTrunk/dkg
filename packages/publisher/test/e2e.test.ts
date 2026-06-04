@@ -156,15 +156,18 @@ describe('End-to-end: Publish → Replicate → Query', () => {
       nquads: new TextEncoder().encode(nquads),
       contextGraphId: CONTEXT_GRAPH,
       kas: publishResult.kaManifest.map((m) => ({
-        tokenId: Number(m.tokenId),
+        // OT-RFC-43 Option-1: kaIds are packed ~256-bit values — never narrow
+        // through Number() (lossy float → idToProtoString emits exponential →
+        // receiver BigInt() throws). Pass the bigint id straight through.
+        tokenId: m.tokenId,
         rootEntity: m.rootEntity,
         privateMerkleRoot: m.privateMerkleRoot ?? new Uint8Array(0),
         privateTripleCount: m.privateTripleCount ?? 0,
       })),
       publisherIdentity: keypairA.publicKey,
       publisherAddress: onChain.publisherAddress,
-      startKAId: Number(onChain.startKAId),
-      endKAId: Number(onChain.endKAId),
+      startKAId: onChain.startKAId,
+      endKAId: onChain.endKAId,
       chainId: chainA.chainId,
       publisherSignatureR: new Uint8Array(0),
       publisherSignatureVs: new Uint8Array(0),

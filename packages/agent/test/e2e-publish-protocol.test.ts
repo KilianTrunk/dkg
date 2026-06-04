@@ -236,9 +236,9 @@ describe('E2E: Design B — multi-entity file publishes as one KA, ACKed cross-n
   });
 
   it('bootstraps 3 agents and a context graph', async () => {
-    nodeA = await DKGAgent.create({ name: 'DBMultiA', listenPort: 0, skills: [], chainAdapter: chainA, nodeRole: 'core' });
-    nodeB = await DKGAgent.create({ name: 'DBMultiB', listenPort: 0, skills: [], chainAdapter: createEVMAdapter(HARDHAT_KEYS.REC1_OP), nodeRole: 'core' });
-    nodeC = await DKGAgent.create({ name: 'DBMultiC', listenPort: 0, skills: [], chainAdapter: createEVMAdapter(HARDHAT_KEYS.REC2_OP), nodeRole: 'core' });
+    nodeA = await DKGAgent.create({ kaNumberAllocator: makeTestKaNumberAllocator(), name: 'DBMultiA', listenPort: 0, skills: [], chainAdapter: chainA, nodeRole: 'core' });
+    nodeB = await DKGAgent.create({ kaNumberAllocator: makeTestKaNumberAllocator(), name: 'DBMultiB', listenPort: 0, skills: [], chainAdapter: createEVMAdapter(HARDHAT_KEYS.REC1_OP), nodeRole: 'core' });
+    nodeC = await DKGAgent.create({ kaNumberAllocator: makeTestKaNumberAllocator(), name: 'DBMultiC', listenPort: 0, skills: [], chainAdapter: createEVMAdapter(HARDHAT_KEYS.REC2_OP), nodeRole: 'core' });
 
     await nodeA.start();
     await nodeB.start();

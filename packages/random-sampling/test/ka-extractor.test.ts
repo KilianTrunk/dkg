@@ -37,6 +37,7 @@ import {
 } from '../src/index.js';
 import {
   promoteUpdatedKaToPerCgId,
+  restateKaPartition,
   restateLabelGraphForUpdate,
   writeMaterializedVersion,
   readMaterializedVersion,
@@ -441,6 +442,33 @@ describe('promoteUpdatedKaToPerCgId — updated KA stays provable (GH #842)', ()
     return m;
   }
 
+  it('purges prior per-cgId data discovered through new-only dkg:entity rows', async () => {
+    const dataGraph = `${contextGraphDataUri(CG_NAME)}/context/${CG_ID.toString()}/data`;
+    const metaGraph = `${contextGraphDataUri(CG_NAME)}/context/${CG_ID.toString()}/_meta`;
+    await store.insert([
+      { subject: UAL, predicate: `${DKG}batchId`, object: `"${KA_ID}"^^<${XSD}integer>`, graph: metaGraph },
+      { subject: `${UAL}/1`, predicate: `${RDF}type`, object: `${DKG}KnowledgeAsset`, graph: metaGraph },
+      { subject: `${UAL}/1`, predicate: `${DKG}partOf`, object: UAL, graph: metaGraph },
+      { subject: `${UAL}/1`, predicate: `${DKG}entity`, object: 'urn:orig:new-only', graph: metaGraph },
+      { subject: 'urn:orig:new-only', predicate: 'urn:p:stale', object: '"stale"', graph: dataGraph },
+    ]);
+    const updateTriples = [{ subject: 'urn:upd:new-only', predicate: 'urn:p:fresh', object: '"fresh"' }];
+    const merkleRoot = new V10MerkleTree(
+      updateTriples.map((t) => hashTripleV10(t.subject, t.predicate, t.object)),
+    ).root;
+
+    const applied = await restateKaPartition({
+      store, dataGraph, metaGraph, ual: UAL, kaId: KA_ID,
+      merkleRoot, payloadByRoot: payloadMap(updateTriples),
+    });
+    expect(applied).toBe(true);
+
+    const stale = await store.query(
+      `ASK { GRAPH <${dataGraph}> { <urn:orig:new-only> ?p ?o } }`,
+    );
+    expect(stale.type === 'boolean' && stale.value).toBe(false);
+  });
+
   it('extracts ONLY the update payload (new root) — stale original roots are purged', async () => {
     // Original publish promotion: one root with three triples.
     await seedKC(store, {
@@ -781,6 +809,29 @@ describe('restateLabelGraphForUpdate — label graph full restatement (GH #842 �
       `ASK { GRAPH <${labelMeta}> { <${UAL}/1> <${DKG}authoredBy> "0xauthor" } }`,
     );
     expect(authRes.type === 'boolean' && authRes.value).toBe(true);
+  });
+
+  it('purges prior label data discovered through new-only dkg:entity rows', async () => {
+    await store.insert([
+      { subject: UAL, predicate: `${DKG}batchId`, object: `"${KA_ID}"^^<${XSD}integer>`, graph: labelMeta },
+      { subject: `${UAL}/1`, predicate: `${RDF}type`, object: `${DKG}KnowledgeAsset`, graph: labelMeta },
+      { subject: `${UAL}/1`, predicate: `${DKG}partOf`, object: UAL, graph: labelMeta },
+      { subject: `${UAL}/1`, predicate: `${DKG}entity`, object: 'urn:orig:entity-only', graph: labelMeta },
+      { subject: 'urn:orig:entity-only', predicate: 'urn:p:stale', object: '"stale"', graph: labelData },
+    ]);
+    const updateTriples = [{ subject: 'urn:new:entity-only', predicate: 'urn:p:fresh', object: '"fresh"' }];
+    const merkleRoot = new V10MerkleTree(
+      updateTriples.map((t) => hashTripleV10(t.subject, t.predicate, t.object)),
+    ).root;
+
+    const applied = await restateLabelGraphForUpdate({
+      store, dataGraph: labelData, metaGraph: labelMeta, ual: UAL,
+      merkleRoot, payloadByRoot: payloadMap(updateTriples),
+      version: { blockNumber: 201, txIndex: 0 },
+    });
+    expect(applied).toBe(true);
+
+    expect(await labelDataSubjects()).toEqual(['urn:new:entity-only']);
   });
 
   it('is guarded: an older-version label restatement is a no-op', async () => {

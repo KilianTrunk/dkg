@@ -768,7 +768,11 @@ async function _restateKaPartitionLocked(opts: {
   // 1. Discover prior roots so their now-stale data is purged (restatement).
   const rootsToPurge = new Set<string>(payloadByRoot.keys());
   const priorRes = await store.query(
-    `SELECT ?root WHERE { GRAPH <${metaGraph}> { ?ka <${DKG}partOf> <${ual}> ; <${DKG}rootEntity> ?root } }`,
+    `SELECT DISTINCT ?root WHERE { GRAPH <${metaGraph}> {
+       VALUES ?entityPred { <${DKG_ROOT_ENTITY_LEGACY}> <${DKG_ENTITY}> }
+       ?ka <${DKG}partOf> <${ual}> .
+       ?ka ?entityPred ?root .
+     } }`,
   );
   if (priorRes.type === 'bindings') {
     for (const row of priorRes.bindings) {
@@ -896,7 +900,11 @@ async function _restateLabelGraphForUpdateLocked(opts: {
   // 1. Resolve prior KA rows (ka↔root) from the label meta.
   const priorKaRows: { ka: string; root: string }[] = [];
   const priorRes = await store.query(
-    `SELECT ?ka ?root WHERE { GRAPH <${metaGraph}> { ?ka <${DKG}partOf> <${ual}> ; <${DKG}rootEntity> ?root } }`,
+    `SELECT DISTINCT ?ka ?root WHERE { GRAPH <${metaGraph}> {
+       VALUES ?entityPred { <${DKG_ROOT_ENTITY_LEGACY}> <${DKG_ENTITY}> }
+       ?ka <${DKG}partOf> <${ual}> .
+       ?ka ?entityPred ?root .
+     } }`,
   );
   if (priorRes.type === 'bindings') {
     for (const row of priorRes.bindings) {

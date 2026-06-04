@@ -11,6 +11,7 @@
  * 6. Edge node as context graph participant
  */
 import { describe, it, expect, afterAll, beforeAll } from 'vitest';
+import { makeTestKaNumberAllocator } from "./_helpers/ka-allocator.js";
 import { DKGAgent } from '../src/index.js';
 import { createEVMAdapter, getSharedContext, createProvider, takeSnapshot, revertSnapshot, HARDHAT_KEYS } from '../../chain/test/evm-test-context.js';
 import { mintTokens, setMinimumRequiredSignatures } from '../../chain/test/hardhat-harness.js';
@@ -72,6 +73,7 @@ describe('E2E: ContextGraph publish with receiver signature collection', () => {
 
   it('bootstraps 3 agents with shared chain and connects them', async () => {
     nodeA = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'ProtoA',
       listenPort: 0,
       skills: [],
@@ -79,6 +81,7 @@ describe('E2E: ContextGraph publish with receiver signature collection', () => {
       nodeRole: 'core',
     });
     nodeB = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'ProtoB',
       listenPort: 0,
       skills: [],
@@ -86,6 +89,7 @@ describe('E2E: ContextGraph publish with receiver signature collection', () => {
       nodeRole: 'core',
     });
     nodeC = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'ProtoC',
       listenPort: 0,
       skills: [],
@@ -226,6 +230,7 @@ describe('E2E: Context graph publish with receiver + participant signatures', ()
   it('bootstraps 2 agents, connects, creates context graph', async () => {
     const ctx = getSharedContext();
     nodeA = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'CtxProtoA',
       listenPort: 0,
       skills: [],
@@ -233,6 +238,7 @@ describe('E2E: Context graph publish with receiver + participant signatures', ()
       nodeRole: 'core',
     });
     nodeB = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'CtxProtoB',
       listenPort: 0,
       skills: [],
@@ -338,6 +344,7 @@ describe('E2E: Publish KC directly to context graph', () => {
 
   it('publishes KC via publishDirect from a lone core: no peer ACKs → tentative (RC11 / PR1)', async () => {
     nodeA = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'DirectCGA',
       listenPort: 0,
       skills: [],
@@ -400,6 +407,7 @@ describe('E2E: Publish rejected with insufficient receiver signatures', () => {
     // Single node, no peers to collect receiver signatures from
     const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
     nodeA = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'LonelyA',
       listenPort: 0,
       skills: [],
@@ -451,6 +459,7 @@ describe('E2E: Context graph registration rejected with insufficient participant
   it('context graph publish from a lone core: no peer ACKs → tentative (RC11 / PR1)', async () => {
     const ctx = getSharedContext();
     nodeA = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'ParticipantA',
       listenPort: 0,
       skills: [],
@@ -513,6 +522,7 @@ describe('E2E: Edge node participates in context graph governance', () => {
   it('edge node (identity, no stake) can sign as context graph participant', async () => {
     const ctx = getSharedContext();
     coreNode = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'CoreNode',
       listenPort: 0,
       skills: [],
@@ -526,6 +536,7 @@ describe('E2E: Edge node participates in context graph governance', () => {
      * Can participate in context graph governance.
      */
     edgeNode = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'EdgeNode',
       listenPort: 0,
       skills: [],

@@ -543,6 +543,8 @@ export class DKGAgent extends DKGAgentBase {
       sharedMemoryOwnedEntities: workspaceOwnedEntities,
       writeLocks,
       publicSnapshotStore,
+      // OT-RFC-43 Option 1 — deterministic packed reservedKaId minting.
+      kaAllocator: config.kaNumberAllocator,
     });
 
     try {

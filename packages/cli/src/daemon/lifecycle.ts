@@ -1176,17 +1176,17 @@ export async function runDaemonInner(
   // substrate stores) so the V20 `ka_numbers` table is opened and its
   // sequence is co-located with the rest of the node's persistent state.
   //
-  // TODO(T0 integration, deferred — overlaps Plan A): the actual
-  // publish-time `kaNumberAllocator.allocate(author)` call site is NOT
-  // wired here, nor is the startup reconciliation oracle that bumps each
-  // author floor + calls `markReconciled()`. Until that lands the
-  // allocator will (correctly) refuse to allocate per RFC §4.5
-  // cold-start refusal. This block only constructs the off-chain core.
+  // OT-RFC-43 Option 1: the publisher allocates a deterministic packed
+  // reservedKaId per V10 mint (DKGPublisher.ensureReservedKaId) and lazily
+  // reconciles each author's floor against the chain's highest minted number on
+  // first use (chain.getMaxKaNumberForAuthor), satisfying the RFC §4.5 cold-start
+  // guard. (A blocking startup reconciliation sweep + the ongoing
+  // KnowledgeAssetCreated poller→reconcile wiring remain a hardening follow-up.)
   const kaNumberStore = new SqliteKaNumberStore(dashDb);
   const kaNumberAllocator = new KaNumberAllocator(kaNumberStore);
-  void kaNumberAllocator; // wired at the deferred T0 integration
 
   const agent = await DKGAgent.create({
+    kaNumberAllocator,
     name: config.name,
     framework: "DKG",
     listenPort: config.listenPort,

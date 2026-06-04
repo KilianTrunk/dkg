@@ -64,6 +64,21 @@ export {
 
 const WORKSPACE_OWNER_PREDICATE = 'http://dkg.io/ontology/workspaceOwner';
 
+/**
+ * Minimal structural view of the OT-RFC-43 Option-1 KA-number allocator the
+ * publisher needs to mint deterministic packed ids. The concrete
+ * `KaNumberAllocator` (packages/agent) satisfies this; typing it structurally
+ * here avoids an agent→publisher dependency cycle.
+ */
+export interface KaIdAllocator {
+  /** Allocate the next packed kaId = (uint160(author)<<96)|number for `author`. */
+  allocate(author: string): { kaId: bigint; number: number };
+  /** Raise the per-author floor to `observedNumber + 1` (never lower) so the next allocate skips minted numbers. */
+  reconcile(author: string, observedNumber: number): void;
+  /** Satisfy the allocator's cold-start guard once reconciliation has run. */
+  markReconciled(): void;
+}
+
 export interface DKGPublisherConfig {
   store: TripleStore;
   chain: ChainAdapter;
@@ -95,6 +110,13 @@ export interface DKGPublisherConfig {
   workspaceSenderKeyEncryptor?: WorkspaceSenderKeyEncryptor;
   /** Optional out-of-Oxigraph store for immutable public SWM operation snapshots. */
   publicSnapshotStore?: WorkspacePublicSnapshotStore;
+  /**
+   * OT-RFC-43 Option 1 — when present, the publisher allocates a deterministic
+   * packed reservedKaId for each V10 mint (and reconciles the per-author floor
+   * against the chain on first use). Omit for mock/no-chain or pre-Option-1
+   * flows; the real EVM adapter then throws on the missing reservedKaId.
+   */
+  kaAllocator?: KaIdAllocator;
 }
 
 export interface WorkspaceSenderKeyEncryptInput {
@@ -363,10 +385,15 @@ export class DKGPublisher implements Publisher {
   private tentativeCounter = 0;
   readonly writeLocks: Map<string, Promise<void>>;
   private readonly publicSnapshotStore?: WorkspacePublicSnapshotStore;
+  /** OT-RFC-43 Option 1 — deterministic KA-id allocator (optional; see DKGPublisherConfig). */
+  private readonly kaAllocator?: KaIdAllocator;
+  /** Authors whose allocator floor has been reconciled against the chain this process. */
+  private readonly reconciledKaAuthors = new Set<string>();
 
   constructor(config: DKGPublisherConfig) {
     this.store = config.store;
     this.chain = config.chain;
+    this.kaAllocator = config.kaAllocator;
     this.eventBus = config.eventBus;
     this.keypair = config.keypair;
     this.publisherNodeIdentityId = config.publisherNodeIdentityId ?? 0n;
@@ -2487,6 +2514,11 @@ export class DKGPublisher implements Publisher {
           }
           onPhase?.('chain:writeahead', 'start');
         };
+        // OT-RFC-43 Option 1 — reserve the deterministic packed kaId for this
+        // author BEFORE the on-chain mint, so the UAL is known pre-tx and the
+        // contract _safeMints exactly this id. `undefined` when no allocator is
+        // configured (mock/no-chain); the real EVM adapter then throws.
+        const reservedKaId = await this.ensureReservedKaId(effectiveAuthorAddress);
         try {
           // OT-RFC-38 LU-11 / OT-RFC-39 — handshake hardening.
           // When the publisher ran the chunked emit path, the chain
@@ -2529,6 +2561,7 @@ export class DKGPublisher implements Publisher {
             publishOperationId,
             contextGraphId: v10CgId,
             publisherAddress: publisherSigner.address,
+            reservedKaId,
             merkleRoot: kcMerkleRoot,
             knowledgeAssetsAmount: kaCount,
             byteSize: effectiveByteSize,
@@ -2570,6 +2603,13 @@ export class DKGPublisher implements Publisher {
         onChainResult.tokenAmount = tokenAmount;
 
         const kaId = onChainResult.kaId ?? onChainResult.batchId;
+        if (reservedKaId !== undefined && kaId !== reservedKaId) {
+          throw new Error(
+            `OT-RFC-43 Option 1: on-chain mint returned kaId ${kaId} but the publisher reserved ` +
+            `${reservedKaId} — the contract must _safeMint the reserved id. Aborting to avoid a ` +
+            `UAL/chain split.`,
+          );
+        }
         const storageAddr =
           onChainResult.knowledgeAssetsContract
           ?? (this.chain.getDKGKnowledgeAssetsAddress
@@ -4369,6 +4409,45 @@ export class DKGPublisher implements Publisher {
       throw new Error('Cannot resolve KA UAL: DKGKnowledgeAssets address unavailable');
     }
     return `did:dkg:${this.chain.chainId}/${storageAddr.toLowerCase()}/${kaId.toString()}`;
+  }
+
+  /**
+   * OT-RFC-43 Option 1 — reserve the deterministic packed kaId for `author`'s
+   * next V10 mint, or return `undefined` when no allocator is configured
+   * (mock/no-chain/pre-Option-1 flows; the real EVM adapter then throws on the
+   * missing reservedKaId). On first use per author this process it reconciles
+   * the allocator's floor against the chain's highest minted number
+   * (`max(local, chainMax) + 1`) so a stale local DB never re-hands a burned
+   * `(author, number)` — that reconciliation also satisfies the allocator's
+   * cold-start guard so `allocate()` is permitted.
+   */
+  private async ensureReservedKaId(author: string): Promise<bigint | undefined> {
+    if (!this.kaAllocator) return undefined;
+    const key = author.toLowerCase();
+    if (!this.reconciledKaAuthors.has(key)) {
+      let chainMax = -1n;
+      if (this.chain.getMaxKaNumberForAuthor) {
+        try {
+          chainMax = await this.chain.getMaxKaNumberForAuthor(author);
+        } catch (err) {
+          // A flaky/incapable oracle must not silently let the allocator reuse a
+          // number; surface it so the operator notices rather than burning ids.
+          // (The contract's _safeMint revert remains the ultimate backstop.)
+          throw new Error(
+            `OT-RFC-43 Option 1: failed to reconcile KA-number floor for author ${author} ` +
+            `against chain: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      }
+      if (chainMax >= 0n) {
+        // chainMax is the highest minted number; reconcile() raises the floor to chainMax + 1.
+        this.kaAllocator.reconcile(author, Number(chainMax));
+      }
+      this.kaAllocator.markReconciled();
+      this.reconciledKaAuthors.add(key);
+    }
+    const { kaId } = this.kaAllocator.allocate(author);
+    return kaId;
   }
 
 }

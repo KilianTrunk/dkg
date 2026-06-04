@@ -2262,6 +2262,13 @@ describe('createKnowledgeAssets / updateKnowledgeCollectionV10 — approval sign
   }
 
   function makeV10PublishParams(publisherAddress?: string): any {
+    const authorAddress = publisherAddress ?? ethers.ZeroAddress;
+    // OT-RFC-43 Option-1 (variant 1a): the real `createKnowledgeAssets`
+    // entrypoint now requires a packed reservedKaId in the author's namespace
+    // and fails loud (pre-tx) otherwise. These approval-parity tests drive the
+    // real method (with the rest of the adapter stubbed), so supply a valid
+    // packed id = (uint160(author) << 96) | number for THIS test's author.
+    const reservedKaId = (BigInt(ethers.getAddress(authorAddress)) << 96n) | 1n;
     const params: any = {
       publishOperationId: ethers.hexlify(ethers.randomBytes(32)),
       contextGraphId: 7n,
@@ -2272,9 +2279,10 @@ describe('createKnowledgeAssets / updateKnowledgeCollectionV10 — approval sign
       tokenAmount: 0n,
       isImmutable: false,
       merkleLeafCount: 1,
+      reservedKaId,
       publisherNodeIdentityId: 0n,
       author: {
-        address: publisherAddress ?? ethers.ZeroAddress,
+        address: authorAddress,
         signature: { r: new Uint8Array(32), vs: new Uint8Array(32) },
         schemeVersion: 1,
       },

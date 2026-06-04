@@ -10,6 +10,7 @@
  * 7. Working memory view
  */
 import { describe, it, expect, afterEach, beforeAll, afterAll } from 'vitest';
+import { makeTestKaNumberAllocator } from "./_helpers/ka-allocator.js";
 import { DKGAgent } from '../src/index.js';
 import { createEVMAdapter, getSharedContext, createProvider, takeSnapshot, revertSnapshot, HARDHAT_KEYS } from '../../chain/test/evm-test-context.js';
 import { mintTokens } from '../../chain/test/hardhat-harness.js';
@@ -45,6 +46,7 @@ const ENTITY_BASE = 'urn:mem:entity';
 async function createAgent(name: string) {
   const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
   const agent = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
     name,
     listenPort: 0,
     chainAdapter: chain,
@@ -220,6 +222,7 @@ describe('WM → SWM gossip → VM (2 nodes)', () => {
   it('A drafts in WM → promotes to SWM → gossips to B → publishes → B finalizes', async () => {
     const sharedChain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
     const nodeA = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'LayersA',
       listenPort: 0,
       chainAdapter: sharedChain,
@@ -228,6 +231,7 @@ describe('WM → SWM gossip → VM (2 nodes)', () => {
     agents.push(nodeA);
 
     const nodeB = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'LayersB',
       listenPort: 0,
       chainAdapter: sharedChain,

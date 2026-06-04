@@ -27,6 +27,7 @@ import {
 } from '../../chain/test/hardhat-harness.js';
 import { buildSeal, buildUpdateSeal } from './_helpers/seal.js';
 import { makeHardhatReceiverACKProvider, makeHardhatUpdateACKProvider } from './_helpers/acks.js';
+import { makeTestKaAllocator } from './_helpers/ka-allocator.js';
 
 const HARDHAT_PORT = 8549;
 const ENTITY = 'urn:greenfield-e2e:asset';
@@ -96,6 +97,8 @@ describe('Greenfield KA update E2E (explicit owner seal)', () => {
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: BigInt(ctx.coreProfileId),
       publisherAddress: author.address,
+      // OT-RFC-43 Option-1: real EVM adapter requires a packed reservedKaId per mint.
+      kaAllocator: makeTestKaAllocator(),
     });
   }, 120_000);
 

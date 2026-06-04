@@ -15,7 +15,7 @@ import protobuf from 'protobufjs';
 const { Type, Field } = protobuf;
 
 export const KAManifestEntrySchema = new Type('KAManifestEntry')
-  .add(new Field('tokenId', 1, 'uint64'))
+  .add(new Field('tokenId', 1, 'string'))
   .add(new Field('rootEntity', 2, 'string'))
   .add(new Field('privateMerkleRoot', 3, 'bytes'))
   .add(new Field('privateTripleCount', 4, 'uint32'));
@@ -27,8 +27,8 @@ export const PublishRequestSchema = new Type('PublishRequest')
   .add(new Field('kas', 4, 'KAManifestEntry', 'repeated'))
   .add(new Field('publisherIdentity', 5, 'bytes'))
   .add(new Field('publisherAddress', 6, 'string'))
-  .add(new Field('startKAId', 7, 'uint64'))
-  .add(new Field('endKAId', 8, 'uint64'))
+  .add(new Field('startKAId', 7, 'string'))
+  .add(new Field('endKAId', 8, 'string'))
   .add(new Field('chainId', 9, 'string'))
   .add(new Field('publisherSignatureR', 10, 'bytes'))
   .add(new Field('publisherSignatureVs', 11, 'bytes'))
@@ -48,7 +48,7 @@ export const PublishAckSchema = new Type('PublishAck')
   .add(new Field('publicByteSize', 7, 'uint64'));
 
 export interface KAManifestEntryMsg {
-  tokenId: number | bigint | Long;
+  tokenId: string | number | bigint | Long;
   rootEntity: string;
   privateMerkleRoot: Uint8Array;
   privateTripleCount: number;
@@ -61,8 +61,8 @@ export interface PublishRequestMsg {
   kas: KAManifestEntryMsg[];
   publisherIdentity: Uint8Array;
   publisherAddress: string;
-  startKAId: number | bigint | Long;
-  endKAId: number | bigint | Long;
+  startKAId: string | number | bigint | Long;
+  endKAId: string | number | bigint | Long;
   chainId: string;
   publisherSignatureR: Uint8Array;
   publisherSignatureVs: Uint8Array;
@@ -89,27 +89,22 @@ export interface PublishAckMsg {
 
 type Long = { low: number; high: number; unsigned: boolean };
 
-const MAX_UINT64 = (1n << 64n) - 1n;
-
 /**
- * Convert a possibly-`bigint` uint64 wire value into the {low,high,unsigned}
- * Long shape protobufjs expects, without the precision loss of `Number()`.
- * Packed kaIds / uint64 ids routinely exceed 2^53, so callers MUST be able to
- * pass a raw `bigint` and have it round-trip losslessly (OT-RFC-43 §9 B4).
- *
- * Mirrors `finalization.ts`'s `bigIntToProtoSafe`, including the MAX_UINT64
- * RangeError guard, for parity across the two encoders.
+ * Convert a KA id (tokenId / startKAId / endKAId) into the decimal-string
+ * wire shape. KA ids are packed Option-1 values
+ * `(uint160(author) << 96) | number` (~256-bit), which do NOT fit a uint64
+ * gossip field — encoding them as a uint64 threw
+ * `RangeError: Value … exceeds uint64 range` in the old `bigIntToProtoSafe`
+ * path. Per OT-RFC-43 §9 the id wire type is a decimal string, so we accept
+ * string / number / bigint / protobuf Long and emit the canonical decimal
+ * string losslessly.
  */
-function bigIntToProtoSafe(val: number | bigint | Long): number | Long {
-  if (typeof val === 'bigint') {
-    if (val < 0n || val > MAX_UINT64) {
-      throw new RangeError(`Value ${val} exceeds uint64 range [0, 2^64-1]`);
-    }
-    const low = Number(val & 0xFFFFFFFFn);
-    const high = Number((val >> 32n) & 0xFFFFFFFFn);
-    return { low, high, unsigned: true };
-  }
-  return val as number | Long;
+function idToProtoString(val: string | number | bigint | Long): string {
+  if (typeof val === 'string') return val;
+  if (typeof val === 'bigint') return val.toString();
+  if (typeof val === 'number') return val.toString();
+  const lo = BigInt(val.low >>> 0); const hi = BigInt(val.high >>> 0);
+  return ((hi << 32n) | lo).toString();
 }
 
 export function encodePublishRequest(msg: PublishRequestMsg): Uint8Array {
@@ -118,10 +113,10 @@ export function encodePublishRequest(msg: PublishRequestMsg): Uint8Array {
       ...msg,
       kas: msg.kas.map((ka) => ({
         ...ka,
-        tokenId: bigIntToProtoSafe(ka.tokenId),
+        tokenId: idToProtoString(ka.tokenId),
       })),
-      startKAId: bigIntToProtoSafe(msg.startKAId),
-      endKAId: bigIntToProtoSafe(msg.endKAId),
+      startKAId: idToProtoString(msg.startKAId),
+      endKAId: idToProtoString(msg.endKAId),
       ...(msg.blockNumber !== undefined
         ? { blockNumber: msg.blockNumber }
         : {}),

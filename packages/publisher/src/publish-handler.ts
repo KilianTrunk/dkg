@@ -224,7 +224,7 @@ export class PublishHandler {
       assertNoUserAuthoredTrustLevelQuads(quads);
 
       const manifest = request.kas.map((ka) => ({
-        tokenId: BigInt(typeof ka.tokenId === 'number' ? ka.tokenId : 0),
+        tokenId: protoToBigInt(ka.tokenId),
         rootEntity: ka.rootEntity,
         privateTripleCount: ka.privateTripleCount,
       }));
@@ -612,7 +612,8 @@ function verifyUALConsistency(
   return errors;
 }
 
-function protoToBigInt(val: number | bigint | { low: number; high: number; unsigned: boolean }): bigint {
+function protoToBigInt(val: string | number | bigint | { low: number; high: number; unsigned: boolean }): bigint {
+  if (typeof val === 'string') return BigInt(val);
   if (typeof val === 'bigint') return val;
   if (typeof val === 'number') return BigInt(val);
   const lo = BigInt(val.low >>> 0);

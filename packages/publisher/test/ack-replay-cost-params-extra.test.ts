@@ -59,6 +59,13 @@ const MERKLE_ROOT = ethers.getBytes(
   ethers.keccak256(ethers.toUtf8Bytes('p3-ack-replay-root')),
 );
 
+// OT-RFC-43 Option-1: monotonic per-call KA number so each publish attempt
+// carries a unique packed reservedKaId (successful mints never replay an id).
+let _ackReplayKaNumber = 0;
+function nextAckReplayKaNumber(): number {
+  return _ackReplayKaNumber++;
+}
+
 // Sign an ACK over the SIGNED cost vector, then submit publishDirect
 // with a DIFFERENT cost vector. The on-chain digest reconstruction uses
 // the SUBMITTED tuple; ecrecover then yields the wrong address and the
@@ -105,6 +112,13 @@ async function submitWithCostMismatch(
     await signer.signTypedData(authorTyped.domain, authorTyped.types, authorTyped.message),
   );
 
+  // OT-RFC-43 Option-1 (variant 1a): the real adapter requires a packed
+  // reservedKaId = (uint160(author) << 96) | number in the author's namespace.
+  // Use a fresh per-call number so successful mints never collide on replay
+  // attempts (only the FIRST valid-cost publish actually mints; cost-mismatch
+  // publishes revert before _safeMint).
+  const reservedKaId = (BigInt(ethers.getAddress(signer.address)) << 96n) | BigInt(nextAckReplayKaNumber());
+
   const txParams: V10PublishParams = {
     publishOperationId: `op-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     contextGraphId: cgId,
@@ -115,6 +129,7 @@ async function submitWithCostMismatch(
     tokenAmount: tokenAmountSubmitted,
     merkleLeafCount: Number(MERKLE_LEAF_COUNT_SIGNED),
     isImmutable: false,
+    reservedKaId,
     publisherNodeIdentityId: identityId,
     author: {
       address: signer.address,

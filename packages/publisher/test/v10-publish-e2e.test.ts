@@ -295,6 +295,12 @@ describe('V10 Publish E2E', () => {
       await pubWallet.signTypedData(authorTyped.domain, authorTyped.types, authorTyped.message),
     );
 
+    // OT-RFC-43 Option-1 (variant 1a): the real adapter requires a packed
+    // reservedKaId = (uint160(author) << 96) | number in the author's namespace.
+    // This is a direct adapter call (no DKGPublisher allocator), so pack one
+    // explicitly for the CORE_OP author.
+    const reservedKaId = (BigInt(ethers.getAddress(pubWallet.address)) << 96n) | 1n;
+
     const result = await adapter.createKnowledgeAssets!({
       publishOperationId: 'v10-e2e-test',
       contextGraphId: chainCgId,
@@ -305,6 +311,7 @@ describe('V10 Publish E2E', () => {
       tokenAmount,
       isImmutable: false,
       merkleLeafCount: publishMerkleLeafCount,
+      reservedKaId,
       publisherNodeIdentityId: publisherIdentityId,
       author: {
         address: pubWallet.address,

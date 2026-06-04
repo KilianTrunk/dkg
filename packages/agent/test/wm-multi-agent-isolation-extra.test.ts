@@ -27,6 +27,7 @@
  * No mocks — real DKGAgent, real wallets, real Hardhat.
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { makeTestKaNumberAllocator } from "./_helpers/ka-allocator.js";
 import { ethers } from 'ethers';
 import { DKGAgent } from '../src/index.js';
 import { contextGraphAssertionUri } from '@origintrail-official/dkg-core';
@@ -58,6 +59,7 @@ beforeAll(async () => {
   );
 
   node = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
     name: 'WmIsolationNode',
     listenPort: 0,
     skills: [],

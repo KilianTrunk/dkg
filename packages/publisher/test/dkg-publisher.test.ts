@@ -14,6 +14,7 @@ import { createEVMAdapter, getSharedContext, createProvider, takeSnapshot, rever
 import { mintTokens } from '../../chain/test/hardhat-harness.js';
 import { buildSeal, buildUpdateSeal, wrapPublisherForTest } from './_helpers/seal.js';
 import { makeHardhatReceiverACKProvider } from './_helpers/acks.js';
+import { makeTestKaAllocator } from './_helpers/ka-allocator.js';
 import type { V10ACKProvider } from '../src/publisher.js';
 
 let CONTEXT_GRAPH: string;
@@ -120,6 +121,8 @@ describe('DKGPublisher', () => {
       keypair,
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
+      // OT-RFC-43 Option-1: real EVM adapter requires a packed reservedKaId per mint.
+      kaAllocator: makeTestKaAllocator(),
     });
     // RC11 / PR3: wrap so any direct `publisher.publishFromSharedMemory`
     // call (e.g. the Round 12 Bug 34 internal-promote test) also gets a

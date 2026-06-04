@@ -8,6 +8,7 @@
  * 3. Workspace cleanup after enshrine with clearSharedMemoryAfter flag.
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { makeTestKaNumberAllocator } from "./_helpers/ka-allocator.js";
 import { ChildProcess, spawn } from 'node:child_process';
 import { ethers, JsonRpcProvider, Wallet, Contract } from 'ethers';
 import { DKGAgent } from '../src/index.js';
@@ -225,6 +226,7 @@ describe('E2E: workspace-first publish with real blockchain', () => {
     if (skipSuite) { ctx.skip(); return; }
 
     const nodeA = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'FinChainA',
       listenPort: 0,
       nodeRole: 'core',
@@ -234,6 +236,7 @@ describe('E2E: workspace-first publish with real blockchain', () => {
     agents.push(nodeA);
 
     const nodeB = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'FinChainB',
       listenPort: 0,
       nodeRole: 'core',

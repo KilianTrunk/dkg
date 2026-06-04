@@ -9,6 +9,7 @@ import { createEVMAdapter, getSharedContext, createProvider, takeSnapshot, rever
 import { mintTokens } from '../../chain/test/hardhat-harness.js';
 import { buildSeal } from './_helpers/seal.js';
 import { hardhatACKProvider } from './_helpers/acks.js';
+import { makeTestKaAllocator } from './_helpers/ka-allocator.js';
 
 let CONTEXT_GRAPH = 'test-swm-cleanup';
 let WORKSPACE_GRAPH = `did:dkg:context-graph:${CONTEXT_GRAPH}/_shared_memory`;
@@ -94,6 +95,8 @@ describe('SWM subset publish cleanup', () => {
       keypair,
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
+      // OT-RFC-43 Option-1: real EVM adapter requires a packed reservedKaId per mint.
+      kaAllocator: makeTestKaAllocator(),
     });
     await seedContextGraphRegistration(store, CONTEXT_GRAPH);
   });

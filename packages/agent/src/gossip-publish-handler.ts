@@ -561,7 +561,8 @@ function protoToNumber(val: number | { low: number; high: number; unsigned: bool
   return ((val.high >>> 0) * 0x100000000) + (val.low >>> 0);
 }
 
-function protoToBigInt(val: number | bigint | { low: number; high: number; unsigned: boolean }): bigint {
+function protoToBigInt(val: string | number | bigint | { low: number; high: number; unsigned: boolean }): bigint {
+  if (typeof val === 'string') return BigInt(val);
   if (typeof val === 'bigint') return val;
   if (typeof val === 'number') return BigInt(val);
   return (BigInt(val.high >>> 0) << 32n) | BigInt(val.low >>> 0);

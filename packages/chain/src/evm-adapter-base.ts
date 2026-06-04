@@ -1145,6 +1145,37 @@ export class EVMChainAdapterBase {
     return this.contracts.knowledgeAssetStorage.target as string;
   }
 
+  /**
+   * OT-RFC-43 Option 1 — highest per-author KA `number` already minted on chain,
+   * or `-1n` if `author` never minted. Enumerates `KnowledgeAssetCreated(id,
+   * author, ...)` logs filtered by the indexed `author` topic and returns
+   * `max(id & ((1<<96)-1))`. Backs the allocator's cold-start reconciliation so
+   * a stale-local-DB / fresh device never re-hands a burned `(author, number)`.
+   */
+  async getMaxKaNumberForAuthor(author: string): Promise<bigint> {
+    const storage = this.contracts.knowledgeAssetStorage;
+    if (!storage) {
+      throw new Error('DKGKnowledgeAssets not deployed on this chain.');
+    }
+    const normalized = ethers.getAddress(author);
+    // KnowledgeAssetCreated(uint256 indexed id, address indexed author, ...):
+    // filter by the second indexed topic (author). fromBlock 0 — devnets are
+    // cheap; a production fromBlock = deployment block is a future optimization
+    // (there is no per-author counter view on-chain under variant 1a).
+    const filter = storage.filters.KnowledgeAssetCreated(null, normalized);
+    const logs = await storage.queryFilter(filter, 0);
+    const MASK = (1n << 96n) - 1n;
+    let max = -1n;
+    for (const log of logs) {
+      const args = (log as ethers.EventLog).args;
+      const rawId = args?.id ?? args?.[0];
+      if (rawId === undefined || rawId === null) continue;
+      const num = BigInt(rawId) & MASK;
+      if (num > max) max = num;
+    }
+    return max;
+  }
+
   async getKnowledgeAssetsLifecycleAddress(): Promise<string> {
     // PR3 / RC11: TTL-cached. KAV10 address only changes on a contract
     // redeploy + Hub-rotation event; 1h staleness is harmless and the
@@ -1276,6 +1307,27 @@ export class EVMChainAdapterBase {
     // same floor inside `computePublishACKDigest`, so the on-chain ACK
     // recovery hashes the same `tokenAmount` the contract receives.
     const flooredTokenAmount = floorPublishTokenAmount(params.tokenAmount);
+
+    // OT-RFC-43 Option 1 (variant 1a): the contract requires a packed
+    // reservedKaId = (uint160(author) << 96) | number and reverts
+    // KaIdNamespaceMismatch unless its high 160 bits equal the author. This code
+    // path hits the real contract, so the id MUST be present and in the author's
+    // namespace — fail loud here rather than as an opaque on-chain revert (and
+    // before spending gas).
+    if (params.reservedKaId === undefined) {
+      throw new Error(
+        'evm-adapter.createKnowledgeAssets: reservedKaId is required (OT-RFC-43 Option 1). ' +
+        'Wire the KA-number allocator into the publish path so a packed ' +
+        '(uint160(author)<<96)|number id is supplied.',
+      );
+    }
+    if ((params.reservedKaId >> 96n) !== BigInt(ethers.getAddress(params.author.address))) {
+      throw new Error(
+        `evm-adapter.createKnowledgeAssets: reservedKaId ${params.reservedKaId} is not in author ` +
+        `${params.author.address}'s namespace (high 160 bits must equal the author address); ` +
+        `the contract would revert KaIdNamespaceMismatch.`,
+      );
+    }
     const publishParamsStruct = {
       publishOperationId: params.publishOperationId,
       contextGraphId: params.contextGraphId,
@@ -1323,6 +1375,10 @@ export class EVMChainAdapterBase {
       authorR: ethers.hexlify(params.author.signature.r),
       authorVS: ethers.hexlify(params.author.signature.vs),
       authorSchemeVersion: params.author.schemeVersion,
+      // OT-RFC-43 Option 1 (variant 1a): packed (uint160(author)<<96)|number.
+      // MUST sit between authorSchemeVersion and identityIds to match the
+      // on-chain PublishParams struct slot order.
+      reservedKaId: params.reservedKaId,
       identityIds: params.ackSignatures.map((s) => s.identityId),
       r: params.ackSignatures.map((s) => ethers.hexlify(s.r)),
       vs: params.ackSignatures.map((s) => ethers.hexlify(s.vs)),

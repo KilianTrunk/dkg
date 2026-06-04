@@ -104,9 +104,12 @@ contract DKGKnowledgeAssets is INamed, IVersioned, HubDependent, ERC721, Guardia
     /// `publisher`/`merkleRoot`/`timestamp` from the wrong offsets.
     /// Layout-preserving fix: keep `MerkleRoot` at 3 slots and store
     /// the EIP-712-recovered author identity at
-    /// `merkleRootAuthors[kaId][rootIndex]`. `address(0)` means the
-    /// state change at `rootIndex` did not carry an attestation
-    /// (legacy V8/V9 mutations, V10.1 update path until vNext, etc).
+    /// `merkleRootAuthors[kaId][rootIndex]`. Both the publish AND the
+    /// update path persist a verified EIP-712 author here (OT-RFC-45
+    /// owner-only update). `address(0)` means the state change at
+    /// `rootIndex` did not carry an attestation — i.e. legacy V8/V9
+    /// mutations and admin paths (`setMerkleRoots` / `pushMerkleRoot`,
+    /// which zero the slot by design).
     /// Indexers SHOULD prefer the indexed `author` topic on
     /// `KnowledgeAssetCreated` / `KnowledgeAssetUpdated`
     /// events; this on-chain mapping is the canonical lookup for
@@ -240,10 +243,12 @@ contract DKGKnowledgeAssets is INamed, IVersioned, HubDependent, ERC721, Guardia
         return knowledgeAssets[id];
     }
 
-    /// @dev `author` is the verified author identity for this update or
-    ///      `address(0)` when the update path doesn't carry an attestation
-    ///      (current V10.1 update path emits zero; vNext will sign updates
-    ///      against the same EIP-712 envelope as publish).
+    /// @dev `author` is the verified author identity for this update. The
+    ///      V10.1 update path attests the author (EIP-712) and enforces
+    ///      owner-only in `KnowledgeAssetsLifecycle._executeUpdateCore`
+    ///      (OT-RFC-45), so callers on that path pass a non-zero, verified
+    ///      author. `address(0)` only on admin/legacy paths that carry no
+    ///      attestation.
     function updateKnowledgeAsset(
         address publisher,
         address author,
@@ -268,9 +273,10 @@ contract DKGKnowledgeAssets is INamed, IVersioned, HubDependent, ERC721, Guardia
         // Unconditional overwrite — this index may have been written by
         // a previous create/update and then popped via `popMerkleRoot`,
         // leaving the stale author in the parallel slot. Always write
-        // the current `author` (which is `address(0)` for the V10.1
-        // update path that doesn't yet sign updates) to make the
-        // canonical mapping monotonic with the merkleRoots array.
+        // the current `author` (the verified EIP-712 author the V10.1
+        // lifecycle update path supplies; `address(0)` only on admin/legacy
+        // paths) to make the canonical mapping monotonic with the
+        // merkleRoots array.
         merkleRootAuthors[id][kc.merkleRoots.length - 1] = author;
         kc.byteSize = byteSize;
         kc.tokenAmount = tokenAmount;
@@ -504,8 +510,9 @@ contract DKGKnowledgeAssets is INamed, IVersioned, HubDependent, ERC721, Guardia
 
     /// @notice Verified author identity for the latest merkle-root entry
     /// of `id`. Returns `address(0)` if the latest state change did not
-    /// carry an author attestation (legacy publish path or a pre-vNext
-    /// update). Used by `/api/get` and other off-chain readers as the
+    /// carry an author attestation (legacy/admin path only; both the publish
+    /// and the V10.1 update path now attest the author — OT-RFC-45). Used by
+    /// `/api/get` and other off-chain readers as the
     /// canonical "who authored this KC" lookup — chain wins over any
     /// off-chain `dkg:authoredBy` triple.
     function getLatestMerkleRootAuthor(uint256 id) external view returns (address) {

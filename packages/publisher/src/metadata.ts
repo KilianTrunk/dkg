@@ -1,6 +1,17 @@
 import type { Quad, TripleStore } from '@origintrail-official/dkg-storage';
 import { GraphManager } from '@origintrail-official/dkg-storage';
-import { validateSubGraphName, isSafeIri, assertionLifecycleUri, contextGraphAssertionUri, contextGraphDataUri, contextGraphMetaUri, MemoryLayer, ASSERTION_STATE_TO_LAYER } from '@origintrail-official/dkg-core';
+import {
+  validateSubGraphName,
+  isSafeIri,
+  assertionLifecycleUri,
+  contextGraphAssertionUri,
+  contextGraphDataUri,
+  contextGraphMetaUri,
+  MemoryLayer,
+  ASSERTION_STATE_TO_LAYER,
+  DKG_ENTITY,
+  DKG_ROOT_ENTITY_LEGACY,
+} from '@origintrail-official/dkg-core';
 import type { AssertionState } from '@origintrail-official/dkg-core';
 
 const RDF = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#';
@@ -15,11 +26,9 @@ const XSD = 'http://www.w3.org/2001/XMLSchema#';
 //   dkg:assertionRootEntity -> dkg:assertionEntity
 // Migration is dual-write + dual-read: every emitter writes BOTH names so a
 // mixed fleet (and pre-rename data) keeps resolving; readers accept either
-// (see ENTITY_PRED_ALT / isEntityPredicate in ./entity-predicate.js). The
+// (see ENTITY_PRED_ALT / isEntityPredicate in @origintrail-official/dkg-core). The
 // legacy predicate is dropped only in a later release, after all nodes
 // dual-read.
-const DKG_ENTITY = `${DKG}entity`;
-const DKG_ROOT_ENTITY_LEGACY = `${DKG}rootEntity`;
 /** Emit the entity-member predicate under BOTH the new and legacy names. */
 function entityMemberQuads(subject: string, entity: string, graph: string): Quad[] {
   return [
@@ -473,10 +482,7 @@ export function generateShareMetadata(
   }
 
   for (const rootEntity of meta.rootEntities) {
-    quads.push(
-      mq(subject, `${DKG}rootEntity`, rootEntity, swmMetaGraph),
-      mq(subject, `${DKG}entity`, rootEntity, swmMetaGraph), // OT-RFC-43 §10.1 dual-write
-    );
+    quads.push(...entityMemberQuads(subject, rootEntity, swmMetaGraph));
   }
 
   return quads;

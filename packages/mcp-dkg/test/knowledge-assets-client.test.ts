@@ -31,11 +31,11 @@ describe('DkgClient knowledge-assets — publish/finalize option serialization',
       subGraphName: 'sg',
       clearAfter: true,
       publishEpochs: 3,
-      publisherNodeIdentityIdOverride: 42n,
+      publisherNodeIdentityIdOverride: '42',
     });
     expect(calls[0].url).toContain('/api/knowledge-assets/f/vm/publish');
     // `clearAfter` is the SDK spelling; the daemon expects `clearSharedMemoryAfter`.
-    // bigint overrides serialize to decimal strings (JSON has no bigint).
+    // JSON-facing callers send the uint64 override as a decimal string.
     expect(calls[0].body).toMatchObject({
       contextGraphId: 'cg-1',
       subGraphName: 'sg',
@@ -51,6 +51,16 @@ describe('DkgClient knowledge-assets — publish/finalize option serialization',
     const { client, calls } = makeClient();
     await client.knowledgeAssetPublish({ contextGraphId: 'cg-1', name: 'f', subGraphName: 'sg' });
     expect(calls[0].body).toEqual({ contextGraphId: 'cg-1', subGraphName: 'sg' });
+  });
+
+  it('knowledgeAssetPublish rejects numeric publisher identity overrides before HTTP serialization', async () => {
+    const { client, calls } = makeClient();
+    await expect(client.knowledgeAssetPublish({
+      contextGraphId: 'cg-1',
+      name: 'f',
+      publisherNodeIdentityIdOverride: Number.MAX_SAFE_INTEGER + 1,
+    } as any)).rejects.toThrow(/decimal string/);
+    expect(calls).toHaveLength(0);
   });
 
   it('knowledgeAssetFinalize forwards external-signer fields', async () => {

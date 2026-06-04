@@ -128,6 +128,31 @@ describe('GitHub-shaped /api/knowledge-assets routes (OT-RFC-43 §10.5)', () => 
     expect(agent.assertion.finalize).toHaveBeenCalledOnce();
   });
 
+  it('POST /api/knowledge-assets forwards atomic finalize external-signer fields', async () => {
+    const agent = makeAssertionAgent();
+    const quads = [{ subject: 'ex:A', predicate: 'ex:p', object: '"x"', graph: '' }];
+    const preSignedAuthorAttestation = {
+      address: '0xauthor',
+      signature: { r: '0xr', vs: '0xvs' },
+    };
+    const ctx = ctxFor('POST', '/api/knowledge-assets', {
+      contextGraphId: 'cg',
+      name: 'f',
+      quads,
+      authorAgentAddress: '0xauthor',
+      preSignedAuthorAttestation,
+      schemeVersion: 1,
+    }, agent);
+    await handleKnowledgeAssetsRoutes(ctx);
+    expect(status(ctx)).toBe(201);
+    expect(agent.assertion.finalize).toHaveBeenCalledWith('cg', 'f', {
+      subGraphName: undefined,
+      authorAgentAddress: '0xauthor',
+      preSignedAuthorAttestation,
+      schemeVersion: 1,
+    });
+  });
+
   it('atomic create with also* tails returns 207 when a tail fails', async () => {
     const agent = makeAssertionAgent({
       assertion: { promote: vi.fn(async () => { throw new Error('CCL denied'); }) },

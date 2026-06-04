@@ -664,8 +664,8 @@ export interface PreSignedAuthorAttestationPayload {
 /**
  * VM-publish controls for the finalized-assertion publish path. Mirrors
  * `KnowledgeAssetFinalizedPublishOptions` in `packages/cli/src/api-client.ts`.
- * `publisherNodeIdentityIdOverride` is widened to `string | number` (the browser
- * `JSON.stringify` cannot serialize a bigint) on top of the cli's `bigint`.
+ * Browser callers must pass large node identity ids as decimal strings rather
+ * than JavaScript numbers, which can lose uint64 precision before serialization.
  */
 export interface KnowledgeAssetFinalizedPublishOptions {
   /**
@@ -675,7 +675,12 @@ export interface KnowledgeAssetFinalizedPublishOptions {
    */
   clearAfter?: boolean;
   publishEpochs?: number;
-  publisherNodeIdentityIdOverride?: bigint | string | number;
+  publisherNodeIdentityIdOverride?: string;
+}
+
+const publisherNodeIdentityOverridePayload = (value: unknown): string => {
+  if (typeof value === 'string') return value;
+  throw new Error('publisherNodeIdentityIdOverride must be passed as a decimal string');
 }
 
 /** Translate {@link KnowledgeAssetFinalizedPublishOptions} into the daemon body. */
@@ -686,8 +691,11 @@ const finalizedPublishOptionsPayload = (
   const payload: Record<string, unknown> = {};
   if (options.clearAfter !== undefined) payload.clearSharedMemoryAfter = options.clearAfter;
   if (options.publishEpochs !== undefined) payload.publishEpochs = options.publishEpochs;
-  if (options.publisherNodeIdentityIdOverride !== undefined) {
-    payload.publisherNodeIdentityIdOverride = String(options.publisherNodeIdentityIdOverride);
+  const publisherNodeIdentityIdOverride =
+    (options as Record<string, unknown>).publisherNodeIdentityIdOverride;
+  if (publisherNodeIdentityIdOverride !== undefined) {
+    payload.publisherNodeIdentityIdOverride =
+      publisherNodeIdentityOverridePayload(publisherNodeIdentityIdOverride);
   }
   return Object.keys(payload).length > 0 ? payload : undefined;
 };

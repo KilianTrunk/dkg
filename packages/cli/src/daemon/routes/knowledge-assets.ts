@@ -42,7 +42,17 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
   if (method === "POST" && path === PREFIX) {
     const parsed = safeParseJson(await readBody(req), res);
     if (!parsed) return;
-    const { contextGraphId, name, subGraphName, quads, authorAgentAddress, alsoShareSwm, alsoPublishVm } = parsed;
+    const {
+      contextGraphId,
+      name,
+      subGraphName,
+      quads,
+      authorAgentAddress,
+      preSignedAuthorAttestation,
+      schemeVersion,
+      alsoShareSwm,
+      alsoPublishVm,
+    } = parsed;
     if (!contextGraphId || !name) {
       return jsonResponse(res, 400, { error: 'Missing "contextGraphId" or "name"' });
     }
@@ -55,7 +65,12 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
       if (Array.isArray(quads) && quads.length > 0) {
         await agent.assertion.write(contextGraphId, name, quads, { subGraphName });
         result.written = quads.length;
-        const seal = await agent.assertion.finalize(contextGraphId, name, { subGraphName, authorAgentAddress });
+        const seal = await agent.assertion.finalize(contextGraphId, name, {
+          subGraphName,
+          authorAgentAddress,
+          preSignedAuthorAttestation,
+          schemeVersion,
+        });
         result.merkleRoot = hex(seal.merkleRoot);
         result.status = "wm-sealed";
       }

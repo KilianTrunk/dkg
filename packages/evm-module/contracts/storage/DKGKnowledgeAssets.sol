@@ -97,8 +97,8 @@ contract DKGKnowledgeAssets is INamed, IVersioned, HubDependent, ERC721, Guardia
     // this contract is freshly deployed OR upgraded in place (R3 — proxy-vs-
     // redeploy is unresolved; keeping the gap is safe under both). Do not
     // repurpose without resolving R3.
-    // slither-disable-next-line unused-state
-    uint256 private __deprecated_knowledgeAssetsCounter;
+    // slither-disable-next-line unused-state,constable-states
+    uint256 private _deprecatedKnowledgeAssetsCounter;
     uint256 private _totalMintedKnowledgeAssetsCounter;
     // V10 retired burn semantics — `burnKnowledgeAssetsTokens` is a
     // `pure` revert stub — so this counter is intentionally never

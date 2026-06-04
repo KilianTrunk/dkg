@@ -311,11 +311,11 @@ export class GossipPublishHandler {
 
         for (const [rootEntity, entityQuads] of partitioned) {
           const kaEntry = request.kas?.find((ka) => ka.rootEntity === rootEntity);
-          const tokenId = kaEntry ? protoToNumber(kaEntry.tokenId) : 0;
+          const tokenId = kaEntry ? protoToBigInt(kaEntry.tokenId) : 0n;
           kaMetadata.push({
             rootEntity,
             kcUal: request.ual,
-            tokenId: BigInt(tokenId),
+            tokenId,
             publicTripleCount: entityQuads.length,
             privateTripleCount: kaEntry?.privateTripleCount ?? 0,
             privateMerkleRoot: kaEntry?.privateMerkleRoot?.length

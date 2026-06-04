@@ -48,7 +48,7 @@ export const PublishAckSchema = new Type('PublishAck')
   .add(new Field('publicByteSize', 7, 'uint64'));
 
 export interface KAManifestEntryMsg {
-  tokenId: number | Long;
+  tokenId: number | bigint | Long;
   rootEntity: string;
   privateMerkleRoot: Uint8Array;
   privateTripleCount: number;
@@ -61,8 +61,8 @@ export interface PublishRequestMsg {
   kas: KAManifestEntryMsg[];
   publisherIdentity: Uint8Array;
   publisherAddress: string;
-  startKAId: number | Long;
-  endKAId: number | Long;
+  startKAId: number | bigint | Long;
+  endKAId: number | bigint | Long;
   chainId: string;
   publisherSignatureR: Uint8Array;
   publisherSignatureVs: Uint8Array;
@@ -89,9 +89,43 @@ export interface PublishAckMsg {
 
 type Long = { low: number; high: number; unsigned: boolean };
 
+const MAX_UINT64 = (1n << 64n) - 1n;
+
+/**
+ * Convert a possibly-`bigint` uint64 wire value into the {low,high,unsigned}
+ * Long shape protobufjs expects, without the precision loss of `Number()`.
+ * Packed kaIds / uint64 ids routinely exceed 2^53, so callers MUST be able to
+ * pass a raw `bigint` and have it round-trip losslessly (OT-RFC-43 §9 B4).
+ *
+ * Mirrors `finalization.ts`'s `bigIntToProtoSafe`, including the MAX_UINT64
+ * RangeError guard, for parity across the two encoders.
+ */
+function bigIntToProtoSafe(val: number | bigint | Long): number | Long {
+  if (typeof val === 'bigint') {
+    if (val < 0n || val > MAX_UINT64) {
+      throw new RangeError(`Value ${val} exceeds uint64 range [0, 2^64-1]`);
+    }
+    const low = Number(val & 0xFFFFFFFFn);
+    const high = Number((val >> 32n) & 0xFFFFFFFFn);
+    return { low, high, unsigned: true };
+  }
+  return val as number | Long;
+}
+
 export function encodePublishRequest(msg: PublishRequestMsg): Uint8Array {
   return PublishRequestSchema.encode(
-    PublishRequestSchema.create(msg),
+    PublishRequestSchema.create({
+      ...msg,
+      kas: msg.kas.map((ka) => ({
+        ...ka,
+        tokenId: bigIntToProtoSafe(ka.tokenId),
+      })),
+      startKAId: bigIntToProtoSafe(msg.startKAId),
+      endKAId: bigIntToProtoSafe(msg.endKAId),
+      ...(msg.blockNumber !== undefined
+        ? { blockNumber: msg.blockNumber }
+        : {}),
+    }),
   ).finish();
 }
 

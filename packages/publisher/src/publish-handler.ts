@@ -612,7 +612,8 @@ function verifyUALConsistency(
   return errors;
 }
 
-function protoToBigInt(val: number | { low: number; high: number; unsigned: boolean }): bigint {
+function protoToBigInt(val: number | bigint | { low: number; high: number; unsigned: boolean }): bigint {
+  if (typeof val === 'bigint') return val;
   if (typeof val === 'number') return BigInt(val);
   const lo = BigInt(val.low >>> 0);
   const hi = BigInt(val.high >>> 0);

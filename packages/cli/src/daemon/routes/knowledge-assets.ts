@@ -138,6 +138,23 @@ function resolveFinalizeOptions(
 // id encoder — the on-chain endEpoch is a uint40 but the publish API caps at uint32.
 const MAX_PUBLISH_EPOCHS = 0xffffffff;
 
+// PR #972 — classify a finalized-publish result into an HTTP status. On this
+// SYNCHRONOUS route a non-confirmed publish is a failure, not a normal in-flight
+// state ("no silent tentative downgrade"):
+//   confirmed, no contextGraphError → 200 (fully done)
+//   confirmed + contextGraphError   → 207 (partial: KA minted on-chain, context-graph binding failed)
+//   tentative | failed              → 502 (publish did not confirm)
+function classifyVmPublish(pub: unknown): { httpStatus: 200 | 207 | 502; reason?: string } {
+  const p = (pub ?? {}) as { status?: unknown; contextGraphError?: unknown };
+  const cgError = typeof p.contextGraphError === "string" && p.contextGraphError.length > 0 ? p.contextGraphError : undefined;
+  if (p.status === "confirmed" && !cgError) return { httpStatus: 200 };
+  if (p.status === "confirmed") return { httpStatus: 207, reason: cgError };
+  return {
+    httpStatus: 502,
+    reason: cgError ?? `VM publish did not confirm (status: ${typeof p.status === "string" ? p.status : "unknown"})`,
+  };
+}
+
 // Reject finalized-publish request shapes that don't make sense once the URL
 // name + seal already select the assertion and encode the author (PR #971).
 // The seal commits to the whole assertion content + author, so assertionName /
@@ -306,7 +323,16 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
           result.kaId = pub?.kaId;
           result.ual = pub?.ual;
           result.txHash = pub?.onChainResult?.txHash;
-          result.status = "vm-confirmed";
+          // PR #972: only a fully-confirmed publish is "vm-confirmed"; a partial
+          // (207) or non-confirmed (502) outcome is flagged as a tail error so
+          // the atomic response is a 207 rather than a misleading success.
+          const { httpStatus, reason } = classifyVmPublish(pub);
+          if (httpStatus === 200) {
+            result.status = "vm-confirmed";
+          } else {
+            result.status = httpStatus === 207 ? "vm-partial" : "vm-failed";
+            errors.push({ phase: "vm-publish", error: reason ?? "VM publish did not confirm" });
+          }
         } catch (e: any) {
           errors.push({ phase: "vm-publish", error: e?.message ?? String(e) });
         }
@@ -432,11 +458,14 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
       const opts = resolveFinalizedPublishOptions(ctx, parsed.options);
       if (opts === null) return;
       const pub: any = await agent.publishFromFinalizedAssertion(contextGraphId, name, { subGraphName, ...opts });
-      return jsonResponse(res, 200, {
+      const { httpStatus, reason } = classifyVmPublish(pub);
+      return jsonResponse(res, httpStatus, {
         kaId: pub?.kaId,
         status: pub?.status,
         ual: pub?.ual,
         txHash: pub?.onChainResult?.txHash,
+        ...(typeof pub?.contextGraphError === "string" ? { contextGraphError: pub.contextGraphError } : {}),
+        ...(reason ? { error: reason } : {}),
       });
     }
   } catch (e: any) {

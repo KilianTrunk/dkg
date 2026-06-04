@@ -12,9 +12,17 @@ import {
   generateAssertionCreatedMetadata,
   generateAssertionPromotedMetadata,
   generateAssertionPublishedMetadata,
+  generateAssertionUpdatedMetadata,
   generateAssertionDiscardedMetadata,
   assertionStateQuad,
   assertionLayerQuad,
+  deriveStatus,
+  assertionLayerPointerQuad,
+  stampLayerPointerSparql,
+  WM_CURRENT_ASSERTION_PRED,
+  SWM_CURRENT_ASSERTION_PRED,
+  VM_CURRENT_ASSERTION_PRED,
+  PROV_WAS_REVISION_OF,
   type KCMetadata,
   type KAMetadata,
   type OnChainProvenance,
@@ -889,5 +897,124 @@ describe('assertionLayerQuad', () => {
     expect(q.predicate).toBe(`${DKG}memoryLayer`);
     expect(q.object).toBe(`"${MemoryLayer.SharedWorkingMemory}"`);
     expect(q.graph).toBe(META_GRAPH);
+  });
+});
+
+// ── OT-RFC-43 A2 — per-layer pointers, deriveStatus, update provenance ──────
+
+describe('deriveStatus (OT-RFC-43 §10.5.4)', () => {
+  it('returns draft-open when no pointers/state', () => {
+    expect(deriveStatus({})).toBe('draft-open');
+  });
+  it('returns wm-sealed when only WM pointer is set (overall)', () => {
+    expect(deriveStatus({ wmCurrentAssertion: 'aa' })).toBe('wm-sealed');
+  });
+  it('returns swm-shared when SWM pointer set (overall)', () => {
+    expect(deriveStatus({ wmCurrentAssertion: 'aa', swmCurrentAssertion: 'aa' })).toBe('swm-shared');
+  });
+  it('returns vm-confirmed when VM pointer set (overall)', () => {
+    expect(deriveStatus({ wmCurrentAssertion: 'aa', swmCurrentAssertion: 'aa', vmCurrentAssertion: 'aa' })).toBe('vm-confirmed');
+  });
+  it('per-layer status reflects THAT layer (divergence observable)', () => {
+    // WM ahead of VM: WM has a newer merkle, VM still on the old one.
+    const p = { wmCurrentAssertion: 'bb', swmCurrentAssertion: 'aa', vmCurrentAssertion: 'aa' };
+    expect(deriveStatus(p, 'wm')).toBe('wm-sealed');
+    expect(deriveStatus(p, 'swm')).toBe('swm-shared');
+    expect(deriveStatus(p, 'vm')).toBe('vm-confirmed');
+  });
+  it('per-layer vm is draft-open when never confirmed', () => {
+    expect(deriveStatus({ wmCurrentAssertion: 'aa' }, 'vm')).toBe('draft-open');
+  });
+  it('honors state when pointers are absent (back-compat)', () => {
+    expect(deriveStatus({ state: 'promoted' })).toBe('swm-shared');
+    expect(deriveStatus({ state: 'published' })).toBe('vm-confirmed');
+  });
+});
+
+describe('assertionLayerPointerQuad / stampLayerPointerSparql', () => {
+  it('strips a 0x prefix from the merkle hex', () => {
+    const q = assertionLayerPointerQuad(LIFECYCLE_URI, WM_CURRENT_ASSERTION_PRED, '0xdeadbeef', META_GRAPH);
+    expect(q.subject).toBe(LIFECYCLE_URI);
+    expect(q.predicate).toBe(WM_CURRENT_ASSERTION_PRED);
+    expect(q.object).toBe('"deadbeef"');
+    expect(q.graph).toBe(META_GRAPH);
+  });
+  it('emits a DELETE/INSERT SPARQL for an idempotent re-stamp', () => {
+    const sparql = stampLayerPointerSparql(LIFECYCLE_URI, VM_CURRENT_ASSERTION_PRED, 'cafe', META_GRAPH);
+    expect(sparql).toContain('DELETE');
+    expect(sparql).toContain('INSERT');
+    expect(sparql).toContain(VM_CURRENT_ASSERTION_PRED);
+    expect(sparql).toContain('"cafe"');
+  });
+});
+
+describe('generateAssertionUpdatedMetadata (OT-RFC-43 A2 §4 provenance)', () => {
+  const baseMeta = {
+    contextGraphId: CONTEXT_GRAPH,
+    agentAddress: AGENT_ADDR,
+    assertionName: ASSERTION,
+    kcUal: 'did:dkg:31337/0xpub/77',
+    timestamp: new Date('2026-06-01T00:00:00Z'),
+    newMerkleHex: 'bbbb',
+    priorMerkleHex: 'aaaa',
+  };
+
+  it('re-stamps VM + WM pointers to the new merkle', () => {
+    const { insert } = generateAssertionUpdatedMetadata(baseMeta);
+    const vm = insert.find(q => q.subject === LIFECYCLE_URI && q.predicate === VM_CURRENT_ASSERTION_PRED);
+    const wm = insert.find(q => q.subject === LIFECYCLE_URI && q.predicate === WM_CURRENT_ASSERTION_PRED);
+    expect(vm?.object).toBe('"bbbb"');
+    expect(wm?.object).toBe('"bbbb"');
+  });
+  it('emits prov:wasRevisionOf linking the new lifecycle to the prior version', () => {
+    const { insert } = generateAssertionUpdatedMetadata(baseMeta);
+    const rev = insert.find(q => q.subject === LIFECYCLE_URI && q.predicate === PROV_WAS_REVISION_OF);
+    expect(rev).toBeDefined();
+    expect(rev!.object).toContain('aaaa');
+    // prior version subject is self-describing (vmCurrentAssertion = prior merkle)
+    const priorVm = insert.find(q => q.object === '"aaaa"' && q.predicate === VM_CURRENT_ASSERTION_PRED);
+    expect(priorVm).toBeDefined();
+  });
+  it('deletes the prior VM/WM pointer values so the re-stamp is unambiguous', () => {
+    const { delete: del } = generateAssertionUpdatedMetadata(baseMeta);
+    expect(del.find(q => q.predicate === VM_CURRENT_ASSERTION_PRED && q.object === '"aaaa"')).toBeDefined();
+    expect(del.find(q => q.predicate === WM_CURRENT_ASSERTION_PRED && q.object === '"aaaa"')).toBeDefined();
+  });
+});
+
+describe('generateAssertionPromotedMetadata / PublishedMetadata pointer stamping', () => {
+  it('stamps swmCurrentAssertion when merkleHex supplied at promote', () => {
+    const { insert } = generateAssertionPromotedMetadata({
+      contextGraphId: CONTEXT_GRAPH,
+      agentAddress: AGENT_ADDR,
+      assertionName: ASSERTION,
+      shareOperationId: 'op-1',
+      rootEntities: ['urn:e:1'],
+      timestamp: new Date('2026-06-01T00:00:00Z'),
+      merkleHex: 'feed',
+    });
+    expect(insert.find(q => q.predicate === SWM_CURRENT_ASSERTION_PRED && q.object === '"feed"')).toBeDefined();
+  });
+  it('stamps vmCurrentAssertion when merkleHex supplied at publish', () => {
+    const { insert } = generateAssertionPublishedMetadata({
+      contextGraphId: CONTEXT_GRAPH,
+      agentAddress: AGENT_ADDR,
+      assertionName: ASSERTION,
+      kcUal: 'did:dkg:31337/0xpub/9',
+      timestamp: new Date('2026-06-01T00:00:00Z'),
+      merkleHex: 'beef',
+    });
+    expect(insert.find(q => q.predicate === VM_CURRENT_ASSERTION_PRED && q.object === '"beef"')).toBeDefined();
+  });
+  it('omits the SWM pointer when merkleHex is absent (back-compat)', () => {
+    const { insert } = generateAssertionPromotedMetadata({
+      contextGraphId: CONTEXT_GRAPH,
+      agentAddress: AGENT_ADDR,
+      assertionName: ASSERTION,
+      shareOperationId: 'op-2',
+      rootEntities: ['urn:e:1'],
+      timestamp: new Date('2026-06-01T00:00:00Z'),
+    });
+    expect(insert.find(q => q.predicate === SWM_CURRENT_ASSERTION_PRED)).toBeUndefined();
   });
 });

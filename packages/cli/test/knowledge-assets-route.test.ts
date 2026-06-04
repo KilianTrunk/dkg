@@ -282,3 +282,116 @@ describe('GitHub-shaped /api/knowledge-assets routes (OT-RFC-43 §10.5)', () => 
     expect(ctx.res.writableEnded).toBe(false); // not handled here
   });
 });
+
+// ── OT-RFC-43 A2/B3 — per-layer status + (agent, number) / did:dkg addressing ──
+
+describe('OT-RFC-43 A2/B3 — per-layer status + kaId addressing', () => {
+  const AGENT_ADDR = `0x${'ab'.repeat(20)}`; // 0xabab...ab
+  // A descriptor with diverged pointers: WM ahead of SWM/VM.
+  const divergedDescriptor = {
+    contextGraphId: 'cg',
+    agentAddress: AGENT_ADDR,
+    name: 'notes',
+    state: 'published',
+    memoryLayer: 'VM',
+    assertionGraph: `did:dkg:context-graph:cg/assertion/${AGENT_ADDR}/notes`,
+    events: [],
+    wmCurrentAssertion: 'bbbb', // newer (WM ahead)
+    swmCurrentAssertion: 'aaaa',
+    vmCurrentAssertion: 'aaaa',
+    status: 'vm-confirmed',
+    kaNumber: '5',
+    reservedUal: `did:dkg:evm:31337/${AGENT_ADDR}/5`,
+  };
+
+  function makePointerAgent() {
+    const history = vi.fn(async () => divergedDescriptor);
+    const resolveByKaId = vi.fn(async () => divergedDescriptor);
+    return {
+      assertion: {
+        create: vi.fn(),
+        write: vi.fn(),
+        finalize: vi.fn(),
+        promote: vi.fn(),
+        discard: vi.fn(),
+        history,
+        resolveByKaId,
+        pullFrom: vi.fn(),
+      },
+      publishFromFinalizedAssertion: vi.fn(),
+    };
+  }
+
+  it('GET /:name returns the overall descriptor + 3 pointers + status', async () => {
+    const agent = makePointerAgent();
+    const ctx = ctxFor('GET', '/api/knowledge-assets/notes?contextGraphId=cg', undefined, agent);
+    await handleKnowledgeAssetsRoutes(ctx);
+    expect(status(ctx)).toBe(200);
+    expect(body(ctx)).toMatchObject({
+      name: 'notes',
+      status: 'vm-confirmed',
+      wmCurrentAssertion: 'bbbb',
+      swmCurrentAssertion: 'aaaa',
+      vmCurrentAssertion: 'aaaa',
+    });
+    expect(agent.assertion.history).toHaveBeenCalledOnce();
+    expect(agent.assertion.resolveByKaId).not.toHaveBeenCalled();
+  });
+
+  it('GET /:name/wm returns the WM layer pointer + wm-sealed status (divergence observable)', async () => {
+    const agent = makePointerAgent();
+    const ctx = ctxFor('GET', '/api/knowledge-assets/notes/wm?contextGraphId=cg', undefined, agent);
+    await handleKnowledgeAssetsRoutes(ctx);
+    expect(status(ctx)).toBe(200);
+    const b = body(ctx);
+    expect(b.layer).toBe('wm');
+    expect(b.currentAssertion).toBe('bbbb'); // WM's own pointer (newer)
+    expect(b.status).toBe('wm-sealed');
+  });
+
+  it('GET /:name/vm returns the VM layer pointer + vm-confirmed status', async () => {
+    const agent = makePointerAgent();
+    const ctx = ctxFor('GET', '/api/knowledge-assets/notes/vm?contextGraphId=cg', undefined, agent);
+    await handleKnowledgeAssetsRoutes(ctx);
+    expect(status(ctx)).toBe(200);
+    const b = body(ctx);
+    expect(b.layer).toBe('vm');
+    expect(b.currentAssertion).toBe('aaaa'); // VM still on the old merkle
+    expect(b.status).toBe('vm-confirmed');
+  });
+
+  it('B3: resolves a KA by (agent, number) — same descriptor as by name', async () => {
+    const agent = makePointerAgent();
+    const ident = `${AGENT_ADDR}:5`;
+    const ctx = ctxFor('GET', `/api/knowledge-assets/${encodeURIComponent(ident)}?contextGraphId=cg`, undefined, agent);
+    await handleKnowledgeAssetsRoutes(ctx);
+    expect(status(ctx)).toBe(200);
+    expect(body(ctx)).toMatchObject({ name: 'notes', status: 'vm-confirmed' });
+    // Routed through resolveByKaId with the packed kaId = (agent<<96)|5.
+    expect(agent.assertion.resolveByKaId).toHaveBeenCalledOnce();
+    const packed = (BigInt(AGENT_ADDR) << 96n) | 5n;
+    expect(agent.assertion.resolveByKaId.mock.calls[0][1]).toBe(packed);
+    expect(agent.assertion.history).not.toHaveBeenCalled();
+  });
+
+  it('B3: resolves a KA by did:dkg UAL — same descriptor', async () => {
+    const agent = makePointerAgent();
+    const packed = (BigInt(AGENT_ADDR) << 96n) | 5n;
+    const ual = `did:dkg:evm:31337/0xkaaddr/${packed.toString()}`;
+    const ctx = ctxFor('GET', `/api/knowledge-assets/${encodeURIComponent(ual)}?contextGraphId=cg`, undefined, agent);
+    await handleKnowledgeAssetsRoutes(ctx);
+    expect(status(ctx)).toBe(200);
+    expect(body(ctx)).toMatchObject({ name: 'notes', status: 'vm-confirmed' });
+    expect(agent.assertion.resolveByKaId).toHaveBeenCalledOnce();
+    expect(agent.assertion.resolveByKaId.mock.calls[0][1]).toBe(packed);
+  });
+
+  it('B3: a plain name still routes through history (current behavior)', async () => {
+    const agent = makePointerAgent();
+    const ctx = ctxFor('GET', '/api/knowledge-assets/plain-name?contextGraphId=cg', undefined, agent);
+    await handleKnowledgeAssetsRoutes(ctx);
+    expect(status(ctx)).toBe(200);
+    expect(agent.assertion.history).toHaveBeenCalledOnce();
+    expect(agent.assertion.resolveByKaId).not.toHaveBeenCalled();
+  });
+});

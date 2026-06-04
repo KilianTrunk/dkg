@@ -311,6 +311,16 @@ export interface PublishOptions {
     signature: { r: Uint8Array; vs: Uint8Array };
     schemeVersion: number;
   };
+  /**
+   * OT-RFC-43 A2 (decision 1) — precomputed packed kaId
+   * `(uint160(author) << 96) | number` reserved at `assertionFinalize`
+   * (ALLOCATE-AT-FINALIZE). When supplied, the publisher's `ensureReservedKaId`
+   * REUSES this id and SKIPS allocation, so a finalize→publish for one KA mints
+   * exactly the stamped id with no second allocation. Undefined for direct /
+   * mock publishes — the publisher then keeps its allocate-at-publish behavior
+   * (back-compat).
+   */
+  reservedKaId?: bigint;
 }
 
 export interface PublishResult {

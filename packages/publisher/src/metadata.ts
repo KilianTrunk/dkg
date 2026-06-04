@@ -1166,6 +1166,102 @@ export function subGraphWritersSparql(contextGraphId: string, subGraphName: stri
 //   - dkg:assertionGraph, dkg:assertionName — DKG identity
 //   - dkg:shareOperationId, dkg:kcUal, dkg:rootEntity — operation metadata
 
+// ── OT-RFC-43 A2 / B3 — per-layer pointers + KA identity on the lifecycle URN ──
+//
+// All of these are net-new (none existed before this RFC). They are stamped
+// on the SAME subject as dkg:state/dkg:memoryLayer — the lifecycle URN
+// (assertionLifecycleUri) — so an assertion's identity and per-layer position
+// are queryable from one stable subject across WM → SWM → VM.
+//
+//   dkg:wmCurrentAssertion  — merkle hex of the assertion currently sealed in WM
+//   dkg:swmCurrentAssertion — merkle hex of the assertion shared into SWM
+//   dkg:vmCurrentAssertion  — merkle hex of the assertion confirmed on-chain (VM)
+//   dkg:kaId                — the per-author KA NUMBER (low 96 bits), xsd:integer
+//   dkg:reservedUal         — did:dkg:<chainId>/<agentAddrLower>/<number>
+//   prov:wasRevisionOf      — links a new (updated) merkle to the prior one
+//
+// Divergence between the three pointers is the observable signal that a layer
+// is ahead of another (e.g. after wm/pull-from + a fresh finalize, WM is ahead
+// of VM; after an update mint, wmCurrentAssertion == vmCurrentAssertion again).
+export const WM_CURRENT_ASSERTION_PRED = `${DKG}wmCurrentAssertion`;
+export const SWM_CURRENT_ASSERTION_PRED = `${DKG}swmCurrentAssertion`;
+export const VM_CURRENT_ASSERTION_PRED = `${DKG}vmCurrentAssertion`;
+export const KA_ID_PRED = `${DKG}kaId`;
+export const RESERVED_UAL_PRED = `${DKG}reservedUal`;
+export const PROV_WAS_REVISION_OF = `${PROV}wasRevisionOf`;
+
+/** OT-RFC-43 §10.5.4 per-layer / overall KA status enum (string-stable). */
+export type KaStatus = 'draft-open' | 'wm-sealed' | 'swm-shared' | 'vm-confirmed';
+
+/**
+ * Minimal shape `deriveStatus` reads. Mirrors the pointer + state fields the
+ * `agent.assertion.history()` facade returns, so callers can pass a descriptor
+ * straight through.
+ */
+export interface StatusPointers {
+  state?: string;
+  wmCurrentAssertion?: string;
+  swmCurrentAssertion?: string;
+  vmCurrentAssertion?: string;
+}
+
+/**
+ * OT-RFC-43 §10.5.4 — derive the KA status from a descriptor's lifecycle
+ * state + per-layer pointers. When `layer` is supplied the status reflects
+ * THAT layer's position (so per-layer divergence is observable); otherwise it
+ * reflects the highest layer reached.
+ *
+ * The four returned strings are the SAME literals already used across the
+ * codebase (knowledge-assets.ts, api-client.test.ts): "draft-open" |
+ * "wm-sealed" | "swm-shared" | "vm-confirmed".
+ */
+export function deriveStatus(p: StatusPointers, layer?: 'wm' | 'swm' | 'vm'): KaStatus {
+  if (layer === 'vm') return p.vmCurrentAssertion ? 'vm-confirmed' : 'draft-open';
+  if (layer === 'swm') {
+    if (p.swmCurrentAssertion) return 'swm-shared';
+    if (p.vmCurrentAssertion) return 'vm-confirmed';
+    return 'draft-open';
+  }
+  if (layer === 'wm') return p.wmCurrentAssertion ? 'wm-sealed' : 'draft-open';
+  // Overall (no layer): highest layer reached.
+  if (p.vmCurrentAssertion || p.state === 'published' || p.state === 'finalized') return 'vm-confirmed';
+  if (p.swmCurrentAssertion || p.state === 'promoted') return 'swm-shared';
+  if (p.wmCurrentAssertion) return 'wm-sealed';
+  return 'draft-open';
+}
+
+/**
+ * Build a single per-layer pointer quad on the lifecycle URN. The value is the
+ * assertion's merkle root hex (no 0x prefix, matching the seal's hexBinary
+ * lexical space) so divergence comparisons are plain string equality.
+ */
+export function assertionLayerPointerQuad(
+  lifecycleUri: string,
+  pred: typeof WM_CURRENT_ASSERTION_PRED | typeof SWM_CURRENT_ASSERTION_PRED | typeof VM_CURRENT_ASSERTION_PRED,
+  merkleHex: string,
+  metaGraph: string,
+): Quad {
+  const bare = merkleHex.startsWith('0x') ? merkleHex.slice(2) : merkleHex;
+  return mq(lifecycleUri, pred, lit(bare), metaGraph);
+}
+
+/**
+ * DELETE/INSERT to (re)stamp a per-layer pointer on the lifecycle URN. Returns
+ * a SPARQL UPDATE string that drops any prior value for `pred` and sets the
+ * new merkle. Callers run it against the triple store directly.
+ */
+export function stampLayerPointerSparql(
+  lifecycleUri: string,
+  pred: typeof WM_CURRENT_ASSERTION_PRED | typeof SWM_CURRENT_ASSERTION_PRED | typeof VM_CURRENT_ASSERTION_PRED,
+  merkleHex: string,
+  metaGraph: string,
+): string {
+  const bare = merkleHex.startsWith('0x') ? merkleHex.slice(2) : merkleHex;
+  return `DELETE { GRAPH <${metaGraph}> { <${lifecycleUri}> <${pred}> ?old } }
+INSERT { GRAPH <${metaGraph}> { <${lifecycleUri}> <${pred}> ${lit(bare)} } }
+WHERE  { GRAPH <${metaGraph}> { OPTIONAL { <${lifecycleUri}> <${pred}> ?old } } }`;
+}
+
 let eventCounter = 0;
 function nextEventId(): string {
   return `${Date.now().toString(36)}-${(++eventCounter).toString(36)}`;
@@ -1222,6 +1318,13 @@ export interface AssertionPromotedMeta {
   shareOperationId: string;
   rootEntities: string[];
   timestamp: Date;
+  /**
+   * OT-RFC-43 A2 — the assertion's merkle root hex (no 0x), captured at the
+   * SWM-share boundary. Stamps `dkg:swmCurrentAssertion` on the lifecycle URN
+   * so the SWM pointer is observable and can diverge from WM/VM. Optional for
+   * back-compat with callers that don't have the seal merkle yet.
+   */
+  merkleHex?: string;
 }
 
 export function generateAssertionPromotedMetadata(meta: AssertionPromotedMeta): { insert: Quad[]; delete: Quad[] } {
@@ -1248,6 +1351,13 @@ export function generateAssertionPromotedMetadata(meta: AssertionPromotedMeta): 
     mq(eventUri, `${DKG}toLayer`, lit(MemoryLayer.SharedWorkingMemory), metaGraph),
     mq(eventUri, `${DKG}shareOperationId`, lit(meta.shareOperationId), metaGraph),
   ];
+  // OT-RFC-43 A2 — stamp the SWM pointer (swmCurrentAssertion). DELETE handled
+  // by the caller's stampLayerPointerSparql when restamping; here we INSERT the
+  // current merkle so generateAssertionPromotedMetadata callers that go through
+  // the insert/delete shape get the pointer too.
+  if (meta.merkleHex) {
+    ins.push(assertionLayerPointerQuad(subject, SWM_CURRENT_ASSERTION_PRED, meta.merkleHex, metaGraph));
+  }
   for (const entity of meta.rootEntities) {
     ins.push(...entityMemberQuads(eventUri, entity, metaGraph));
   }
@@ -1264,6 +1374,12 @@ export interface AssertionPublishedMeta {
   subGraphName?: string;
   kcUal: string;
   timestamp: Date;
+  /**
+   * OT-RFC-43 A2 — the assertion's merkle root hex (no 0x) confirmed on-chain.
+   * Stamps `dkg:vmCurrentAssertion` on the lifecycle URN. Optional for
+   * back-compat.
+   */
+  merkleHex?: string;
 }
 
 export function generateAssertionPublishedMetadata(meta: AssertionPublishedMeta): { insert: Quad[]; delete: Quad[] } {
@@ -1283,6 +1399,10 @@ export function generateAssertionPublishedMetadata(meta: AssertionPublishedMeta)
     mq(eventUri, `${DKG}toLayer`, lit(MemoryLayer.VerifiedMemory), metaGraph),
     mq(eventUri, `${DKG}kcUal`, meta.kcUal, metaGraph),
   ];
+  // OT-RFC-43 A2 — stamp the VM pointer (vmCurrentAssertion).
+  if (meta.merkleHex) {
+    ins.push(assertionLayerPointerQuad(subject, VM_CURRENT_ASSERTION_PRED, meta.merkleHex, metaGraph));
+  }
   if (meta.subGraphName) {
     ins.push(mq(subject, `${DKG}subGraphName`, lit(meta.subGraphName), metaGraph));
   }
@@ -1293,6 +1413,81 @@ export function generateAssertionPublishedMetadata(meta: AssertionPublishedMeta)
       assertionLayerQuad(subject, MemoryLayer.SharedWorkingMemory, metaGraph),
     ],
   };
+}
+
+export interface AssertionUpdatedMeta {
+  contextGraphId: string;
+  agentAddress: string;
+  assertionName: string;
+  subGraphName?: string;
+  kcUal: string;
+  timestamp: Date;
+  /** New merkle root hex (no 0x) of the updated assertion (the new VM/WM value). */
+  newMerkleHex: string;
+  /**
+   * Prior assertion's merkle root hex (no 0x), discoverable on the update path.
+   * Emitted as `<lifecycle> prov:wasRevisionOf <priorAssertionUri>` when set.
+   */
+  priorMerkleHex?: string;
+  /**
+   * Optional explicit prior-assertion URI. When omitted, a stable
+   * `<lifecycle>#assertion-<priorMerkleHex>` skolem is used so the revision
+   * chain is queryable without minting a separate assertion subject.
+   */
+  priorAssertionUri?: string;
+}
+
+/**
+ * OT-RFC-43 A2 §4 — provenance for an UPDATE (a second publish of the same
+ * lifecycle name). Mirrors `generateAssertionPublishedMetadata`'s insert/delete
+ * shape: it re-stamps `dkg:vmCurrentAssertion` (and `dkg:wmCurrentAssertion`,
+ * which converges back to VM after the update mint) to the NEW merkle and
+ * records `<lifecycle> prov:wasRevisionOf <prior>` so the version chain is
+ * walkable.
+ */
+export function generateAssertionUpdatedMetadata(meta: AssertionUpdatedMeta): { insert: Quad[]; delete: Quad[] } {
+  const metaGraph = `did:dkg:context-graph:${meta.contextGraphId}/_meta`;
+  const subject = assertionLifecycleUri(meta.contextGraphId, meta.agentAddress, meta.assertionName, meta.subGraphName);
+  const agentUri = agentDid(meta.agentAddress);
+  const eventUri = `${subject}/event/${nextEventId()}`;
+  const newBare = meta.newMerkleHex.startsWith('0x') ? meta.newMerkleHex.slice(2) : meta.newMerkleHex;
+
+  const ins: Quad[] = [
+    mq(subject, `${DKG}state`, lit('published'), metaGraph),
+    mq(subject, `${DKG}memoryLayer`, lit(MemoryLayer.VerifiedMemory), metaGraph),
+    mq(eventUri, `${RDF}type`, `${PROV}Activity`, metaGraph),
+    mq(eventUri, `${RDF}type`, `${DKG}AssertionUpdated`, metaGraph),
+    mq(eventUri, `${PROV}startedAtTime`, dateLit(meta.timestamp), metaGraph),
+    mq(eventUri, `${PROV}wasAssociatedWith`, agentUri, metaGraph),
+    mq(eventUri, `${PROV}used`, subject, metaGraph),
+    mq(eventUri, `${DKG}fromLayer`, lit(MemoryLayer.VerifiedMemory), metaGraph),
+    mq(eventUri, `${DKG}toLayer`, lit(MemoryLayer.VerifiedMemory), metaGraph),
+    mq(eventUri, `${DKG}kcUal`, meta.kcUal, metaGraph),
+    // New per-layer pointers — WM converges back to VM after the update mint.
+    assertionLayerPointerQuad(subject, VM_CURRENT_ASSERTION_PRED, newBare, metaGraph),
+    assertionLayerPointerQuad(subject, WM_CURRENT_ASSERTION_PRED, newBare, metaGraph),
+  ];
+
+  if (meta.priorMerkleHex) {
+    const priorBare = meta.priorMerkleHex.startsWith('0x') ? meta.priorMerkleHex.slice(2) : meta.priorMerkleHex;
+    const priorUri = meta.priorAssertionUri ?? `${subject}#assertion-${priorBare}`;
+    ins.push(mq(subject, PROV_WAS_REVISION_OF, priorUri, metaGraph));
+    // Make the prior version subject self-describing so the chain is walkable.
+    ins.push(mq(priorUri, `${RDF}type`, `${DKG}Assertion`, metaGraph));
+    ins.push(assertionLayerPointerQuad(priorUri, VM_CURRENT_ASSERTION_PRED, priorBare, metaGraph));
+  }
+  if (meta.subGraphName) {
+    ins.push(mq(subject, `${DKG}subGraphName`, lit(meta.subGraphName), metaGraph));
+  }
+
+  // DELETE the prior per-layer pointer values so the re-stamp is unambiguous.
+  const del: Quad[] = [];
+  if (meta.priorMerkleHex) {
+    const priorBare = meta.priorMerkleHex.startsWith('0x') ? meta.priorMerkleHex.slice(2) : meta.priorMerkleHex;
+    del.push(assertionLayerPointerQuad(subject, VM_CURRENT_ASSERTION_PRED, priorBare, metaGraph));
+    del.push(assertionLayerPointerQuad(subject, WM_CURRENT_ASSERTION_PRED, priorBare, metaGraph));
+  }
+  return { insert: ins, delete: del };
 }
 
 export interface AssertionDiscardedMeta {

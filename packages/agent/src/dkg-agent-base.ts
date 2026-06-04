@@ -494,6 +494,22 @@ export class DKGAgentBase {
   protected readonly swmHostModeHandlers = new Map<string, (topic: string, data: Uint8Array, from: string) => void>();
   /** Async lock for the host-mode reconciler so simultaneous calls don't double-subscribe. */
   protected hostModeReconcileInflight?: Promise<void>;
+  /**
+   * OT-RFC-43 A2 — the KA-number allocator, retained on the agent (also
+   * forwarded to the publisher as `kaAllocator`). Held here so
+   * `assertionFinalize` can ALLOCATE-AT-FINALIZE (single source of truth):
+   * it reconciles + allocates once at seal time, stamps the packed kaId on the
+   * lifecycle URN, and the publish path REUSES the stamped id instead of
+   * allocating a second time (eliminates double-allocation). `undefined` for
+   * mock/no-chain/pre-Option-1 flows.
+   */
+  readonly kaNumberAllocator?: import('./allocator.js').KaNumberAllocator;
+  /**
+   * Authors whose KA-number floor has already been reconciled against the
+   * chain this process (mirrors the publisher's `reconciledKaAuthors`). Lazy,
+   * once-per-author. Keyed by lowercased address.
+   */
+  protected readonly reconciledKaAuthors = new Set<string>();
   protected readonly log = new Logger('DKGAgent');
 
   /**
@@ -1119,6 +1135,9 @@ export class DKGAgentBase {
     this.publicSnapshotStore = publicSnapshotStore;
     this.eventBus = eventBus;
     this.chain = chain;
+    // OT-RFC-43 A2 — retain the allocator so finalize can allocate-at-finalize
+    // (the publisher gets the same instance as `kaAllocator`).
+    this.kaNumberAllocator = config.kaNumberAllocator;
     this.discovery = new DiscoveryClient(queryEngine);
     this.profileManager = new ProfileManager(publisher, store);
     this.publisher.setWorkspaceAgentRecipientResolver((input) => (this as unknown as DKGAgent).resolveWorkspaceRecipientsGated(input));

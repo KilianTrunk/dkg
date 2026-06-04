@@ -104,6 +104,10 @@ import {
   type PromoteJob, type PromoteListFilter,
   wrapAsRpcPreconditionIfApplicable,
   type PublishOptions, type PublishResult, type PhaseCallback, type KAMetadata, type CASCondition,
+  // OT-RFC-43 A2/B3 — per-layer pointers + derived status helper.
+  deriveStatus, type KaStatus,
+  WM_CURRENT_ASSERTION_PRED, SWM_CURRENT_ASSERTION_PRED, VM_CURRENT_ASSERTION_PRED,
+  KA_ID_PRED, RESERVED_UAL_PRED,
   type CollectedACK, type LiftAuthorityProof, type LiftTransitionType,
   type LiftRequest, type LiftRequestAuthorSeal,
   type WorkspaceAgentRecipient,
@@ -413,6 +417,29 @@ export type {
   CatchupSyncDiagnostics,
   DKGAgentConfig,
 };
+
+/**
+ * OT-RFC-43 A2 (decision 5) — the `agent.assertion.history()` return shape:
+ * the core `AssertionDescriptor` plus the three per-layer pointers, the
+ * §10.5.4 derived status, and the finalize-stamped KA identity. The pointers
+ * are merkle-root hex (bare, no 0x); divergence between them (e.g.
+ * `wmCurrentAssertion !== vmCurrentAssertion`) is the observable signal that a
+ * layer is ahead of another.
+ */
+export interface AssertionHistoryDescriptor extends AssertionDescriptor {
+  /** Merkle hex of the assertion currently sealed in WM (bare, no 0x). */
+  wmCurrentAssertion?: string;
+  /** Merkle hex of the assertion shared into SWM. */
+  swmCurrentAssertion?: string;
+  /** Merkle hex of the assertion confirmed on-chain (VM). */
+  vmCurrentAssertion?: string;
+  /** OT-RFC-43 §10.5.4 derived overall status. */
+  status: KaStatus;
+  /** The per-author KA NUMBER (low 96 bits) stamped at finalize, as a string. */
+  kaNumber?: string;
+  /** did:dkg:<chainId>/<agentAddrLower>/<number> reserved at finalize. */
+  reservedUal?: string;
+}
 
 /**
  * High-level facade that ties together all DKG agent capabilities:
@@ -1553,6 +1580,10 @@ export class DKGAgent extends DKGAgentBase {
             agent.log.warn(createOperationContext('share'), `Promote gossip failed (local SWM committed): ${err?.message ?? err}`);
           }
         }
+        // OT-RFC-43 A2 (decision 2) — stamp dkg:swmCurrentAssertion on the
+        // lifecycle URN so the SWM pointer is observable (and can diverge from
+        // WM/VM). Best-effort; never blocks the share result.
+        await agent._stampSwmPointer(contextGraphId, name, agentAddress, opts?.subGraphName);
         return { promotedCount };
       },
       async discard(contextGraphId: string, name: string, opts?: { subGraphName?: string }): Promise<void> {
@@ -1608,7 +1639,7 @@ export class DKGAgent extends DKGAgentBase {
         return agent.assertionFinalize(contextGraphId, name, agentAddress, opts);
       },
 
-      async history(contextGraphId: string, name: string, opts?: { agentAddress?: string; subGraphName?: string }): Promise<AssertionDescriptor | null> {
+      async history(contextGraphId: string, name: string, opts?: { agentAddress?: string; subGraphName?: string }): Promise<AssertionHistoryDescriptor | null> {
         const addr = opts?.agentAddress ?? agentAddress;
         const lifecycleUri = assertionLifecycleUri(contextGraphId, addr, name, opts?.subGraphName);
         const metaGraph = contextGraphMetaUri(contextGraphId);
@@ -1617,13 +1648,18 @@ export class DKGAgent extends DKGAgentBase {
 
         const strip = (v?: string) => v?.replace(/^"|"$/g, '').replace(/"\^\^<.*>$/, '') ?? undefined;
 
-        // Query assertion entity (current state + layer)
+        // Query assertion entity (current state + layer + OT-RFC-43 A2 pointers).
         const entityResult = await agent.store.query(
-          `SELECT ?state ?memoryLayer ?assertionGraph WHERE {
+          `SELECT ?state ?memoryLayer ?assertionGraph ?wm ?swm ?vm ?kaNum ?reservedUal WHERE {
             GRAPH <${metaGraph}> {
               <${lifecycleUri}> <${DKG_NS}state> ?state .
               OPTIONAL { <${lifecycleUri}> <${DKG_NS}memoryLayer> ?memoryLayer }
               OPTIONAL { <${lifecycleUri}> <${DKG_NS}assertionGraph> ?assertionGraph }
+              OPTIONAL { <${lifecycleUri}> <${WM_CURRENT_ASSERTION_PRED}> ?wm }
+              OPTIONAL { <${lifecycleUri}> <${SWM_CURRENT_ASSERTION_PRED}> ?swm }
+              OPTIONAL { <${lifecycleUri}> <${VM_CURRENT_ASSERTION_PRED}> ?vm }
+              OPTIONAL { <${lifecycleUri}> <${KA_ID_PRED}> ?kaNum }
+              OPTIONAL { <${lifecycleUri}> <${RESERVED_UAL_PRED}> ?reservedUal }
             }
           } LIMIT 1`,
         );
@@ -1633,6 +1669,11 @@ export class DKGAgent extends DKGAgentBase {
         const stateStr = strip(row['state']) as AssertionState;
         const layerStr = strip(row['memoryLayer']);
         const graphUri = row['assertionGraph'] ?? contextGraphAssertionUri(contextGraphId, addr, name);
+        const wmCurrentAssertion = strip(row['wm']);
+        const swmCurrentAssertion = strip(row['swm']);
+        const vmCurrentAssertion = strip(row['vm']);
+        const kaNumberStr = strip(row['kaNum']);
+        const reservedUal = strip(row['reservedUal']);
 
         // Query all prov:Activity events that acted on this assertion
         // (linked via prov:used or prov:generated)
@@ -1682,6 +1723,10 @@ export class DKGAgent extends DKGAgentBase {
           }
         }
 
+        // OT-RFC-43 A2 (decision 5) — derive the §10.5.4 status from the
+        // pointers + state and surface the three pointers so per-layer
+        // divergence (WM ahead of VM after pull-from, etc.) is observable.
+        const pointers = { state: stateStr, wmCurrentAssertion, swmCurrentAssertion, vmCurrentAssertion };
         return {
           contextGraphId,
           agentAddress: addr,
@@ -1690,7 +1735,63 @@ export class DKGAgent extends DKGAgentBase {
           memoryLayer: (layerStr as MemoryLayer) ?? null,
           assertionGraph: graphUri,
           events: [...eventMap.values()],
+          wmCurrentAssertion,
+          swmCurrentAssertion,
+          vmCurrentAssertion,
+          status: deriveStatus(pointers),
+          kaNumber: kaNumberStr,
+          reservedUal,
         };
+      },
+
+      /**
+       * OT-RFC-43 B3 — resolve a Knowledge Asset by its packed kaId back to a
+       * lifecycle descriptor. The B3 route classifier packs an incoming
+       * `(agent, number)` or `did:dkg` UAL into `kaId`; this unpacks the low
+       * 96 bits (the per-author NUMBER) and matches the `dkg:kaId` stamped on
+       * the lifecycle URN at finalize. Works pre-publish (the stamp exists
+       * post-finalize) AND post-publish. Returns the same descriptor shape as
+       * `history()`.
+       */
+      async resolveByKaId(
+        contextGraphId: string,
+        kaId: bigint,
+        opts?: { subGraphName?: string },
+      ): Promise<AssertionHistoryDescriptor | null> {
+        const metaGraph = contextGraphMetaUri(contextGraphId);
+        const DKG_NS = 'http://dkg.io/ontology/';
+        // number = kaId & ((1<<96)-1) — the per-author low-96-bit half.
+        const number = kaId & ((1n << 96n) - 1n);
+        const strip = (v?: string) => v?.replace(/^"|"$/g, '').replace(/"\^\^<.*>$/, '') ?? undefined;
+        // FILTER on the integer value so a typed literal ("N"^^xsd:integer)
+        // matches regardless of the store's lexical canonicalisation.
+        const res = await agent.store.query(
+          `SELECT ?lifecycle ?name ?assertionGraph WHERE {
+            GRAPH <${metaGraph}> {
+              ?lifecycle <${DKG_NS}kaId> ?n .
+              FILTER(?n = ${number})
+              OPTIONAL { ?lifecycle <${DKG_NS}assertionName> ?name }
+              OPTIONAL { ?lifecycle <${DKG_NS}assertionGraph> ?assertionGraph }
+            }
+          } LIMIT 1`,
+        );
+        if (res.type !== 'bindings' || res.bindings.length === 0) return null;
+        const b = res.bindings[0];
+        const resolvedName = strip(b['name']);
+        if (!resolvedName) return null;
+        // Derive the agent address from the assertion-graph URI, which has the
+        // clean shape did:dkg:context-graph:<cg>[/<sub>]/assertion/<agent>/<name>
+        // (robust to cg/name containing ':' unlike parsing the lifecycle URN).
+        const assertionGraph = b['assertionGraph'];
+        let resolvedAgent: string | undefined;
+        if (typeof assertionGraph === 'string') {
+          const m = assertionGraph.match(/\/assertion\/([^/]+)\/[^/]+$/);
+          if (m) resolvedAgent = m[1];
+        }
+        return this.history(contextGraphId, resolvedName, {
+          subGraphName: opts?.subGraphName,
+          ...(resolvedAgent ? { agentAddress: resolvedAgent } : {}),
+        });
       },
 
       // ── Async promote (RFC: docs/specs/SPEC_ASYNC_PROMOTE_QUEUE.md) ──

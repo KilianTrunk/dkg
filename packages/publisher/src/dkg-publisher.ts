@@ -1170,6 +1170,13 @@ export class DKGPublisher implements Publisher {
       encryptInlineChunked?: PublishOptions['encryptInlineChunked'];
       /** Per-publish on-chain lifetime override in epochs. */
       publishEpochs?: number;
+      /**
+       * OT-RFC-43 A2 (decision 1) — precomputed packed kaId stamped at
+       * finalize. When set, `ensureReservedKaId` REUSES it instead of
+       * allocating again (single-source allocate-at-finalize). Undefined keeps
+       * the existing allocate-at-publish behavior.
+       */
+      reservedKaId?: bigint;
     },
   ): Promise<PublishResult> {
     const ctx = options?.operationCtx ?? createOperationContext('publishFromSWM');
@@ -1294,6 +1301,8 @@ export class DKGPublisher implements Publisher {
       encryptInlinePayload: options?.encryptInlinePayload,
       encryptInlineChunked: options?.encryptInlineChunked,
       publishEpochs: options?.publishEpochs,
+      // OT-RFC-43 A2 — reuse the finalize-stamped kaId (no re-allocate).
+      reservedKaId: options?.reservedKaId,
       [INTERNAL_ORIGIN_TOKEN]: true,
     };
     const publishResult = await this.publish(internalPublishOptions);
@@ -2528,7 +2537,14 @@ export class DKGPublisher implements Publisher {
         // author BEFORE the on-chain mint, so the UAL is known pre-tx and the
         // contract _safeMints exactly this id. `undefined` when no allocator is
         // configured (mock/no-chain); the real EVM adapter then throws.
-        const reservedKaId = await this.ensureReservedKaId(effectiveAuthorAddress);
+        //
+        // OT-RFC-43 A2 (decision 1) — when the caller stamped a packed kaId at
+        // finalize (`options.reservedKaId`), REUSE it and skip allocation so a
+        // finalize→publish mints exactly the stamped id (no double-allocation).
+        const reservedKaId = await this.ensureReservedKaId(
+          effectiveAuthorAddress,
+          (options as PublishOptions).reservedKaId,
+        );
         try {
           // OT-RFC-38 LU-11 / OT-RFC-39 — handshake hardening.
           // When the publisher ran the chunked emit path, the chain
@@ -3979,8 +3995,39 @@ export class DKGPublisher implements Publisher {
     // so re-using the same assertion name doesn't leave orphaned triples.
     // This removes the assertion entity AND its prov:Activity event
     // sub-entities (whose URIs are prefixed with the lifecycle URI).
+    //
+    // OT-RFC-43 A2 — but PRESERVE the KA's persistent identity + per-layer
+    // pointers (dkg:kaId / dkg:reservedUal / dkg:{wm,swm,vm}CurrentAssertion /
+    // prov:wasRevisionOf). These represent the KA's stable on-chain identity
+    // and confirmed-layer state, NOT "stale draft data": re-opening a draft on
+    // a name that was previously published (pull-from / discard+recreate) must
+    // KEEP the minted kaId so the next publish routes to UPDATE (same id), not
+    // a fresh mint. Without this carry-over the clean-slate wipe would burn the
+    // KA's identity and double-allocate on every edit cycle.
+    const A2_DKG = 'http://dkg.io/ontology/';
+    const A2_PRESERVE_PREDS = new Set<string>([
+      `${A2_DKG}kaId`,
+      `${A2_DKG}reservedUal`,
+      `${A2_DKG}wmCurrentAssertion`,
+      `${A2_DKG}swmCurrentAssertion`,
+      `${A2_DKG}vmCurrentAssertion`,
+      'http://www.w3.org/ns/prov#wasRevisionOf',
+    ]);
     const lifecycleSubject = assertionLifecycleUri(contextGraphId, agentAddress, name, subGraphName);
     const metaGraph = contextGraphMetaUri(contextGraphId);
+    const preserved: Quad[] = [];
+    const preserveRes = await this.store.query(
+      `SELECT ?p ?o WHERE { GRAPH <${metaGraph}> { <${lifecycleSubject}> ?p ?o } }`,
+    );
+    if (preserveRes.type === 'bindings') {
+      for (const row of preserveRes.bindings) {
+        const p = row['p'];
+        const o = row['o'];
+        if (p && o != null && A2_PRESERVE_PREDS.has(p)) {
+          preserved.push({ subject: lifecycleSubject, predicate: p, object: o, graph: metaGraph });
+        }
+      }
+    }
     const staleEvents = await this.store.query(
       `SELECT DISTINCT ?s WHERE { GRAPH <${metaGraph}> { ?s ?p ?o . FILTER(STR(?s) = "${lifecycleSubject}" || STRSTARTS(STR(?s), "${lifecycleSubject}/")) } }`,
     );
@@ -3989,6 +4036,9 @@ export class DKGPublisher implements Publisher {
         const subj = row['s'];
         if (subj) await this.store.deleteByPattern({ graph: metaGraph, subject: subj });
       }
+    }
+    if (preserved.length > 0) {
+      await this.store.insert(preserved);
     }
 
     const lifecycleQuads = generateAssertionCreatedMetadata({
@@ -4521,8 +4571,15 @@ export class DKGPublisher implements Publisher {
    * (`max(local, chainMax) + 1`) so a stale local DB never re-hands a burned
    * `(author, number)` — that reconciliation also satisfies the allocator's
    * cold-start guard so `allocate()` is permitted.
+   *
+   * OT-RFC-43 A2 (decision 1) — when `precomputed` is supplied (a packed kaId
+   * the AGENT already reserved+stamped at `assertionFinalize`), REUSE it
+   * verbatim and SKIP allocation entirely. This makes finalize the single
+   * source of truth for the id and eliminates the double-allocation that would
+   * otherwise burn a second `(author, number)` on every finalize→publish.
    */
-  private async ensureReservedKaId(author: string): Promise<bigint | undefined> {
+  private async ensureReservedKaId(author: string, precomputed?: bigint): Promise<bigint | undefined> {
+    if (precomputed !== undefined) return precomputed;
     if (!this.kaAllocator) return undefined;
     const key = author.toLowerCase();
     if (!this.reconciledKaAuthors.has(key)) {

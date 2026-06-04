@@ -27,11 +27,63 @@
 import type { RequestContext } from "./context.js";
 import { jsonResponse, readBody, safeParseJson } from "../http-utils.js";
 import { validatePreSignedAuthorAttestation } from "./memory.js";
+import { deriveStatus } from "@origintrail-official/dkg-publisher";
 
 const PREFIX = "/api/knowledge-assets";
 
 function hex(bytes: Uint8Array): string {
   return "0x" + Buffer.from(bytes).toString("hex");
+}
+
+// OT-RFC-43 B3 — (agent, number) compact identifier: `0x<40hex>:<number>`.
+const AGENT_NUMBER_RE = /^0x[0-9a-fA-F]{40}:[0-9]+$/;
+
+/**
+ * OT-RFC-43 B3 — classify the leading path segment as a KA identifier:
+ *   (a) `did:dkg:.../<id>`        → the trailing `/<id>` is the packed kaId
+ *   (b) `0x<40hex>:<number>`      → (agent, number) → kaId = (agent<<96)|number
+ *   (c) anything else             → a plain assertion NAME (current behavior)
+ * Returns `{ kind: "kaId", kaId }` for (a)/(b) or `{ kind: "name" }` for (c).
+ */
+function classifyKaIdentifier(seg: string): { kind: "kaId"; kaId: bigint } | { kind: "name" } {
+  if (seg.startsWith("did:dkg:")) {
+    // The kaId is the last `/`-delimited segment of the UAL.
+    const idPart = seg.slice(seg.lastIndexOf("/") + 1);
+    if (/^[0-9]+$/.test(idPart)) {
+      try {
+        return { kind: "kaId", kaId: BigInt(idPart) };
+      } catch {
+        /* fall through to name */
+      }
+    }
+    return { kind: "name" };
+  }
+  if (AGENT_NUMBER_RE.test(seg)) {
+    const [agentHex, numberStr] = seg.split(":");
+    try {
+      const kaId = (BigInt(agentHex) << 96n) | BigInt(numberStr);
+      return { kind: "kaId", kaId };
+    } catch {
+      return { kind: "name" };
+    }
+  }
+  return { kind: "name" };
+}
+
+/**
+ * OT-RFC-43 §10.5.4 — derive a per-layer status from a history descriptor's
+ * pointers. Reuses the canonical `deriveStatus` helper.
+ */
+function layerStatus(hist: Record<string, unknown>, layer: "wm" | "swm" | "vm"): string {
+  return deriveStatus(
+    {
+      state: hist["state"] as string | undefined,
+      wmCurrentAssertion: hist["wmCurrentAssertion"] as string | undefined,
+      swmCurrentAssertion: hist["swmCurrentAssertion"] as string | undefined,
+      vmCurrentAssertion: hist["vmCurrentAssertion"] as string | undefined,
+    },
+    layer,
+  );
 }
 
 function resolveFinalizeOptions(
@@ -164,24 +216,48 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
   const layer = segs[1]; // wm | swm | vm | undefined
   const verb = segs[2];
 
-  // GET /api/knowledge-assets/:name — KA metadata / lifecycle state
+  // OT-RFC-43 B3 — classify the identifier once for the GET surface. For a
+  // kaId form (did:dkg UAL or `0x<addr>:<number>`) we resolve to the lifecycle
+  // descriptor via the agent resolver; for a plain name we use it directly.
+  // Returns the descriptor (or null) so both GET handlers share one read.
+  async function resolveDescriptor(cg: string, subGraphName?: string): Promise<Record<string, unknown> | null> {
+    const ident = classifyKaIdentifier(name);
+    if (ident.kind === "kaId") {
+      const hist = await (agent as any).assertion.resolveByKaId?.(cg, ident.kaId, { subGraphName });
+      return (hist as unknown as Record<string, unknown>) ?? null;
+    }
+    const hist = await agent.assertion.history(cg, name, { subGraphName });
+    return (hist as unknown as Record<string, unknown>) ?? null;
+  }
+
+  // GET /api/knowledge-assets/:identifier — KA metadata / lifecycle state.
+  // `:identifier` is a plain name OR a B3 kaId (did:dkg UAL / `0x<addr>:<n>`).
   if (method === "GET" && segs.length === 1) {
     const cg = url.searchParams.get("contextGraphId");
     if (!cg) return jsonResponse(res, 400, { error: 'Missing "contextGraphId" query param' });
     const subGraphName = url.searchParams.get("subGraphName") ?? undefined;
-    const hist = await agent.assertion.history(cg, name, { subGraphName });
+    const hist = await resolveDescriptor(cg, subGraphName);
     if (!hist) return jsonResponse(res, 404, { error: `No knowledge asset "${name}" in context graph "${cg}"` });
     return jsonResponse(res, 200, hist);
   }
 
-  // GET /api/knowledge-assets/:name/{wm,swm,vm} — per-layer status
+  // GET /api/knowledge-assets/:identifier/{wm,swm,vm} — per-layer status.
+  // Returns that layer's pointer + that layer's derived status so per-layer
+  // divergence (e.g. WM ahead of VM after wm/pull-from) is observable.
   if (method === "GET" && (layer === "wm" || layer === "swm" || layer === "vm") && !verb) {
     const cg = url.searchParams.get("contextGraphId");
     if (!cg) return jsonResponse(res, 400, { error: 'Missing "contextGraphId" query param' });
     const subGraphName = url.searchParams.get("subGraphName") ?? undefined;
-    const hist = await agent.assertion.history(cg, name, { subGraphName });
+    const hist = await resolveDescriptor(cg, subGraphName);
     if (!hist) return jsonResponse(res, 404, { error: `No knowledge asset "${name}"` });
-    return jsonResponse(res, 200, { layer, ...hist });
+    const pointerKey = `${layer}CurrentAssertion`;
+    return jsonResponse(res, 200, {
+      layer,
+      ...hist,
+      // This layer's own pointer + status (overrides the overall `status`).
+      currentAssertion: hist[pointerKey] ?? undefined,
+      status: layerStatus(hist, layer),
+    });
   }
 
   if (method !== "POST") return;

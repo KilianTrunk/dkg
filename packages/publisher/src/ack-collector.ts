@@ -1,15 +1,19 @@
 import {
   PROTOCOL_STORAGE_ACK,
   PROTOCOL_STORAGE_ACK_V2,
+  PROTOCOL_STORAGE_UPDATE_ACK,
   ACK_PROTOCOL_VERSION_V1_LU5,
   ACK_PROTOCOL_VERSION_V2_LU11,
   encodePublishIntent,
+  encodeUpdateIntent,
   decodeStorageACK,
   computePublishACKDigest,
+  computeUpdateACKDigest,
   isStorageACKDecline,
   isTransientStorageACKDeclineCode,
   isSubscriptionSource,
   type PublishIntentMsg,
+  type UpdateIntentMsg,
   type StorageACKMsg,
   type SubscriptionSource,
 } from '@origintrail-official/dkg-core';
@@ -334,6 +338,195 @@ export class ACKCollector {
       ciphertextCount,
       false,
     );
+
+    return this.runACKRound({
+      intentBytes,
+      ackProtocolId,
+      ackDigest,
+      merkleRoot,
+      contextGraphId,
+      corePeers,
+      requiredACKs: REQUIRED_ACKS,
+      log,
+    });
+  }
+
+  /**
+   * V10 UPDATE counterpart to {@link collect}. Mirrors it exactly — only
+   * the digest (`computeUpdateACKDigest`, 13 fields), the request proto
+   * (`UpdateIntent` over {@link PROTOCOL_STORAGE_UPDATE_ACK}), and the
+   * field set differ. Dials connected core peers, sends an
+   * `UpdateIntent`, recovers the signer against the UPDATE ACK digest,
+   * validates `ack.merkleRoot == newMerkleRoot`, dedups, and races the
+   * `requiredACKs(minSig)` quorum — all via the shared {@link runACKRound}.
+   *
+   * The caller MUST source `preUpdateMerkleRootCount` + `newTokenAmount`
+   * (+ `contextGraphId`, `mintAmount`, `burnTokenIds`) from the SAME
+   * place the chain adapter resolves them for the update tx, so the
+   * off-chain-signed digest is byte-identical to the on-chain verify
+   * (see `evm-adapter-publish.ts:getUpdateAckDigestFields`). `kaId` +
+   * `preUpdateMerkleRootCount` are trusted from the params (the on-chain
+   * tx reverts if wrong).
+   */
+  async collectUpdate(params: {
+    kaId: bigint;
+    /** TARGET on-chain numeric context graph id. */
+    contextGraphId: bigint;
+    /** Pre-update on-chain Merkle-roots array length for this KA. */
+    preUpdateMerkleRootCount: bigint;
+    newMerkleRoot: Uint8Array;
+    newByteSize: bigint;
+    /** Floored newTokenAmount the on-chain tx submits (digest re-floors identically). */
+    newTokenAmount: bigint;
+    mintAmount: bigint;
+    burnTokenIds: bigint[];
+    newMerkleLeafCount: number;
+    newCiphertextChunksRoot?: Uint8Array;
+    newCiphertextChunkCount?: number;
+    /** Numeric EVM chain id. Required by the H5 prefix in the UPDATE ACK digest. */
+    chainId: bigint;
+    /** Deployed `KnowledgeAssetsLifecycle` address. Required by the H5 prefix. */
+    kav10Address: string;
+    publisherPeerId: string;
+    requiredACKs?: number;
+    /** Source SWM graph id (defaults to the numeric contextGraphId). */
+    swmGraphId?: string;
+    subGraphName?: string;
+    /** Updated KC quads (N-Quads) so peers can recompute newMerkleRoot. */
+    stagingQuads?: Uint8Array;
+    isEncryptedPayload?: boolean;
+    ackProtocolVersion?: number;
+  }): Promise<ACKCollectionResult> {
+    const {
+      kaId, contextGraphId, preUpdateMerkleRootCount, newMerkleRoot,
+      newByteSize, newTokenAmount, mintAmount, burnTokenIds,
+      newMerkleLeafCount, chainId, kav10Address, publisherPeerId,
+    } = params;
+    const REQUIRED_ACKS = params.requiredACKs ?? DEFAULT_REQUIRED_ACKS;
+    const log = this.deps.log ?? (() => {});
+
+    if (newMerkleRoot.length !== 32) {
+      throw new Error(
+        `UPDATE ACK collection failed: newMerkleRoot must be 32 bytes, got ${newMerkleRoot.length}`,
+      );
+    }
+    if (!Number.isInteger(newMerkleLeafCount) || newMerkleLeafCount < 1) {
+      throw new Error(
+        `UPDATE ACK collection failed: newMerkleLeafCount must be a positive integer, got ${newMerkleLeafCount}`,
+      );
+    }
+
+    const contextGraphIdStr = contextGraphId.toString();
+    const ciphertextRoot = params.newCiphertextChunksRoot ?? new Uint8Array(32);
+    const ciphertextCount = BigInt(params.newCiphertextChunkCount ?? 0);
+
+    const p2pMsg: UpdateIntentMsg = {
+      kaId: kaId.toString(),
+      contextGraphId: contextGraphIdStr,
+      preUpdateMerkleRootCount: Number(preUpdateMerkleRootCount),
+      newMerkleRoot,
+      newByteSize: Number(newByteSize),
+      newTokenAmount: newTokenAmount.toString(),
+      mintAmount: Number(mintAmount),
+      burnTokenIds: burnTokenIds.map((id) => id.toString()),
+      newMerkleLeafCount,
+      newCiphertextChunksRoot: params.newCiphertextChunksRoot,
+      newCiphertextChunkCount: params.newCiphertextChunkCount,
+      publisherPeerId,
+      swmGraphId: params.swmGraphId && params.swmGraphId !== contextGraphIdStr
+        ? params.swmGraphId
+        : undefined,
+      subGraphName: params.subGraphName,
+      stagingQuads: params.stagingQuads,
+      isEncryptedPayload: params.isEncryptedPayload === true ? true : undefined,
+      ackProtocolVersion: params.ackProtocolVersion,
+    };
+    const intentBytes = encodeUpdateIntent(p2pMsg);
+
+    log(`[ACKCollector] Collecting UPDATE ACKs via direct P2P (kaId=${kaId}, newMerkleRoot=${ethers.hexlify(newMerkleRoot).slice(0, 18)}...)`);
+
+    const corePeers = this.deps.getConnectedCorePeers();
+    if (corePeers.length === 0) {
+      throw new QuorumUnmetError({
+        collected: 0,
+        required: REQUIRED_ACKS,
+        dialled: 0,
+        peerOutcomes: [],
+        legacyMessage: 'ACK collection failed: no connected core peers',
+      });
+    }
+    if (corePeers.length < REQUIRED_ACKS) {
+      throw new QuorumUnmetError({
+        collected: 0,
+        required: REQUIRED_ACKS,
+        dialled: corePeers.length,
+        peerOutcomes: corePeers.map((peerId) => ({ peerId, reason: 'pool_below_quorum' })),
+        legacyMessage:
+          `ACK collection failed: need ${REQUIRED_ACKS} ACKs but only ${corePeers.length} core peers connected — quorum impossible`,
+      });
+    }
+    log(`[ACKCollector] Requesting UPDATE ACKs from ${corePeers.length} core peers (need ${REQUIRED_ACKS})`);
+
+    // 13-field UPDATE ACK digest — byte-identical to what the peer signs
+    // and to `KnowledgeAssetsLifecycle._executeUpdateCore`. The token
+    // amount is floored INSIDE `computeUpdateACKDigest`, matching the
+    // on-chain submission.
+    const ackDigest = computeUpdateACKDigest(
+      chainId,
+      kav10Address,
+      contextGraphId,
+      kaId,
+      preUpdateMerkleRootCount,
+      newMerkleRoot,
+      newByteSize,
+      newTokenAmount,
+      mintAmount,
+      burnTokenIds,
+      BigInt(newMerkleLeafCount),
+      ciphertextRoot,
+      ciphertextCount,
+    );
+
+    return this.runACKRound({
+      intentBytes,
+      ackProtocolId: PROTOCOL_STORAGE_UPDATE_ACK,
+      ackDigest,
+      merkleRoot: newMerkleRoot,
+      contextGraphId,
+      corePeers,
+      requiredACKs: REQUIRED_ACKS,
+      log,
+    });
+  }
+
+  /**
+   * Shared quorum round used by both {@link collect} (PUBLISH) and
+   * {@link collectUpdate} (UPDATE). Given pre-encoded intent bytes, the
+   * ACK protocol id, and the precomputed ACK digest the peers are
+   * expected to have signed, this dials every connected core peer,
+   * recovers + validates each `StorageACK`, dedups by peer + identity,
+   * enforces the `requiredACKs` quorum race, and surfaces the typed
+   * `QuorumUnmetError` paths (impossible-pool / timeout / insufficient).
+   *
+   * Identical logic for publish and update — only the request bytes,
+   * protocol id, and digest differ, which is why both flows funnel
+   * through here so the consensus-critical quorum semantics never drift.
+   */
+  private async runACKRound(args: {
+    intentBytes: Uint8Array;
+    ackProtocolId: string;
+    ackDigest: Uint8Array;
+    merkleRoot: Uint8Array;
+    contextGraphId: bigint;
+    corePeers: string[];
+    requiredACKs: number;
+    log: (msg: string) => void;
+  }): Promise<ACKCollectionResult> {
+    const {
+      intentBytes, ackProtocolId, ackDigest,
+      merkleRoot, contextGraphId, corePeers, log,
+    } = args;
+    const REQUIRED_ACKS = args.requiredACKs;
 
     const collected: CollectedACK[] = [];
     const seenPeers = new Set<string>();

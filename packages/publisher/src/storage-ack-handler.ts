@@ -2,8 +2,10 @@ import type { TripleStore, Quad } from '@origintrail-official/dkg-storage';
 import type { EventBus, StorageACKDeclineCode, SubscriptionSource } from '@origintrail-official/dkg-core';
 import {
   decodePublishIntent,
+  decodeUpdateIntent,
   encodeStorageACK,
   computePublishACKDigest,
+  computeUpdateACKDigest,
   assertSafeIri,
   STORAGE_ACK_DECLINE_CODES,
   ACK_PROTOCOL_VERSION_V2_LU11,
@@ -1019,6 +1021,231 @@ export class StorageACKHandler {
     );
     return encodeStorageACK({
       merkleRoot,
+      coreNodeSignatureR: ethers.getBytes(signature.r),
+      coreNodeSignatureVS: ethers.getBytes(signature.yParityAndS),
+      contextGraphId: cgId,
+      nodeIdentityId: this.config.nodeIdentityId <= BigInt(Number.MAX_SAFE_INTEGER)
+        ? Number(this.config.nodeIdentityId)
+        : { low: Number(this.config.nodeIdentityId & 0xFFFFFFFFn), high: Number((this.config.nodeIdentityId >> 32n) & 0xFFFFFFFFn), unsigned: true },
+      ...(subscriptionSource ? { subscriptionSource } : {}),
+    });
+  };
+
+  /**
+   * Protocol stream handler for `/dkg/10.0.1/storage-update-ack`.
+   *
+   * Receives an `UpdateIntent`, recomputes the new flat-KC Merkle root
+   * from the request's `stagingQuads` (the same way the plaintext/SWM
+   * publish branch does via `computeFlatKCRoot`), verifies it equals the
+   * request's `newMerkleRoot`, then signs the 13-field UPDATE ACK digest
+   * (`computeUpdateACKDigest`) with the operational key (EIP-191) and
+   * returns a `StorageACK` whose `merkleRoot` carries `newMerkleRoot`.
+   *
+   * `kaId` + `preUpdateMerkleRootCount` are taken from the request and
+   * trusted (the publisher binds them; the on-chain update tx reverts if
+   * they're wrong — same trust model as `kaCount` on the encrypted
+   * publish path).
+   *
+   * Mirrors the publish `handler` above; only the digest, the request
+   * fields, and the protocol id differ.
+   */
+  updateHandler = async (data: Uint8Array, _peerId: PeerId): Promise<Uint8Array> => {
+    if (this.config.nodeRole !== 'core') {
+      throw new Error('Only core nodes can issue StorageACKs');
+    }
+
+    const intent = decodeUpdateIntent(data);
+    // `cgId` is the TARGET on-chain numeric id used by the UPDATE ACK
+    // digest and the update tx. `swmGraphId` (optional) is the SOURCE
+    // graph where the data lives in SWM. When absent, fall back to `cgId`.
+    const cgId = intent.contextGraphId;
+    const swmGraphId = intent.swmGraphId && intent.swmGraphId.length > 0
+      ? intent.swmGraphId
+      : cgId;
+    const subGraphName = intent.subGraphName && intent.subGraphName.length > 0
+      ? intent.subGraphName
+      : undefined;
+    const newMerkleRoot = intent.newMerkleRoot instanceof Uint8Array
+      ? intent.newMerkleRoot
+      : new Uint8Array(intent.newMerkleRoot);
+    if (newMerkleRoot.length !== 32) {
+      throw new Error(
+        `UpdateStorageACK: newMerkleRoot must be 32 bytes, got ${newMerkleRoot.length}`,
+      );
+    }
+
+    const swmGraphUri = this.config.contextGraphSharedMemoryUri(swmGraphId, subGraphName);
+
+    // Verify the new Merkle root the same way the publish path does:
+    // recompute over the updated quads and compare to the publisher's
+    // claim. For curated (encrypted) updates the core can't decrypt, so
+    // it trusts the claimed root (member post-decrypt verification + the
+    // on-chain revert are the integrity backstop) but still independently
+    // confirms the CG is curated before signing an opaque ACK.
+    if (intent.isEncryptedPayload === true) {
+      const swmGraphIdForCuration = intent.swmGraphId && intent.swmGraphId.length > 0
+        ? intent.swmGraphId
+        : undefined;
+      if (!this.config.isCgCurated) {
+        return this.encodeDecline(
+          cgId,
+          STORAGE_ACK_DECLINE_CODES.SIGNER_NOT_REGISTERED,
+          'UpdateIntent.isEncryptedPayload=true rejected: this core has no curation oracle wired and cannot verify the CG access policy',
+        );
+      }
+      const curationVerdict = await this.config.isCgCurated(cgId, swmGraphIdForCuration);
+      if (curationVerdict !== true) {
+        return this.encodeDecline(
+          cgId,
+          STORAGE_ACK_DECLINE_CODES.SIGNER_NOT_REGISTERED,
+          `UpdateIntent.isEncryptedPayload=true rejected for cg=${cgId}: local curation oracle reports ${curationVerdict === false ? 'PUBLIC (not curated)' : 'UNKNOWN'}; the encrypted-payload path is curated-only`,
+        );
+      }
+      // Encrypted updates trust the publisher's claimed newMerkleRoot —
+      // no recompute. Fall through to the digest sign below.
+    } else if (intent.stagingQuads && intent.stagingQuads.length > 0) {
+      const MAX_STAGING_BYTES = 4 * 1024 * 1024;
+      if (intent.stagingQuads.length > MAX_STAGING_BYTES) {
+        throw new Error(
+          `UpdateStorageACK: stagingQuads payload (${intent.stagingQuads.length} bytes) exceeds ` +
+          `${MAX_STAGING_BYTES} byte limit — rejecting request`,
+        );
+      }
+      const parsed = parseSimpleNQuads(new TextDecoder().decode(intent.stagingQuads));
+      if (parsed.length === 0) {
+        throw new Error('UpdateStorageACK: stagingQuads present but contained no parseable N-Quads');
+      }
+      const recomputedRoot = computeFlatKCRoot(parsed, []);
+      if (!bytesEqual(recomputedRoot, newMerkleRoot)) {
+        return this.encodeDecline(
+          cgId,
+          STORAGE_ACK_DECLINE_CODES.MERKLE_MISMATCH_IN_SWM,
+          `UpdateStorageACK: newMerkleRoot mismatch (inline quads): publisher=${ethers.hexlify(newMerkleRoot).slice(0, 18)}..., ` +
+          `computed=${ethers.hexlify(recomputedRoot).slice(0, 18)}... (${parsed.length} triples) — refusing to ACK`,
+        );
+      }
+    } else {
+      // Fallback: data should already be in SWM (publishFromSharedMemory
+      // remap / SWM-resolution path). Reuse the publish branch's SWM
+      // CONSTRUCT + recompute + typed-decline shape.
+      const swmQuads = await this.loadSWMQuads(swmGraphUri, []);
+      if (swmQuads.length === 0) {
+        return this.encodeDecline(
+          cgId,
+          STORAGE_ACK_DECLINE_CODES.NO_DATA_IN_SWM,
+          `UpdateStorageACK: no data found in SWM graph ${swmGraphUri}`,
+        );
+      }
+      const recomputedRoot = computeFlatKCRoot(swmQuads, []);
+      if (!bytesEqual(recomputedRoot, newMerkleRoot)) {
+        return this.encodeDecline(
+          cgId,
+          STORAGE_ACK_DECLINE_CODES.MERKLE_MISMATCH_IN_SWM,
+          `UpdateStorageACK: newMerkleRoot mismatch (SWM): publisher=${ethers.hexlify(newMerkleRoot).slice(0, 18)}..., ` +
+          `local=${ethers.hexlify(recomputedRoot).slice(0, 18)}... (${swmQuads.length} triples in SWM)`,
+        );
+      }
+    }
+
+    // Derive the bigint digest inputs. Fail loud on non-numeric / non-
+    // positive on-chain ids — the contract rejects `contextGraphId == 0`,
+    // so signing against it would just produce a signature it rejects.
+    let contextGraphIdBigInt: bigint;
+    try {
+      contextGraphIdBigInt = BigInt(cgId);
+    } catch {
+      throw new Error(
+        `UpdateStorageACK: V10 update requires a numeric on-chain context graph id; got '${cgId}'.`,
+      );
+    }
+    if (contextGraphIdBigInt <= 0n) {
+      throw new Error(
+        `UpdateStorageACK: V10 update requires a positive on-chain context graph id; got ${contextGraphIdBigInt}.`,
+      );
+    }
+    let kaIdBigInt: bigint;
+    try {
+      kaIdBigInt = BigInt(intent.kaId);
+    } catch {
+      throw new Error(`UpdateStorageACK: kaId must be a numeric decimal string; got '${intent.kaId}'.`);
+    }
+    const preUpdateMerkleRootCount = typeof intent.preUpdateMerkleRootCount === 'number'
+      ? BigInt(intent.preUpdateMerkleRootCount)
+      : BigInt(intent.preUpdateMerkleRootCount.low >>> 0)
+        | (BigInt(intent.preUpdateMerkleRootCount.high >>> 0) << 32n);
+    const newByteSize = typeof intent.newByteSize === 'number'
+      ? BigInt(intent.newByteSize)
+      : BigInt(intent.newByteSize.low >>> 0) | (BigInt(intent.newByteSize.high >>> 0) << 32n);
+    const newTokenAmount = intent.newTokenAmount && intent.newTokenAmount.length > 0
+      ? BigInt(intent.newTokenAmount)
+      : 0n;
+    const mintAmount = intent.mintAmount == null
+      ? 0n
+      : (typeof intent.mintAmount === 'number'
+          ? BigInt(intent.mintAmount)
+          : BigInt(intent.mintAmount.low >>> 0) | (BigInt(intent.mintAmount.high >>> 0) << 32n));
+    const burnTokenIds = (intent.burnTokenIds ?? []).map((id) => BigInt(id));
+    const newMerkleLeafCount = intent.newMerkleLeafCount == null ? 0 : Number(intent.newMerkleLeafCount);
+    if (!Number.isInteger(newMerkleLeafCount) || newMerkleLeafCount < 1) {
+      throw new Error(
+        `UpdateStorageACK: newMerkleLeafCount must be a positive integer; got ${newMerkleLeafCount}`,
+      );
+    }
+
+    // 13-field UPDATE ACK digest — byte-identical to
+    // `KnowledgeAssetsLifecycle._executeUpdateCore`. The token amount is
+    // floored INSIDE `computeUpdateACKDigest` (floorPublishTokenAmount),
+    // matching the on-chain submission, so the publisher and this signer
+    // bind the same `newTokenAmount` wire value.
+    const digest = computeUpdateACKDigest(
+      this.config.chainId,
+      this.config.kav10Address,
+      contextGraphIdBigInt,
+      kaIdBigInt,
+      preUpdateMerkleRootCount,
+      newMerkleRoot,
+      newByteSize,
+      newTokenAmount,
+      mintAmount,
+      burnTokenIds,
+      BigInt(newMerkleLeafCount),
+      ciphertextRootForAckDigest(intent.newCiphertextChunksRoot),
+      BigInt(intent.newCiphertextChunkCount ?? 0),
+    );
+
+    if (this.config.isSignerRegistered) {
+      let signerRegistered: boolean | undefined;
+      try {
+        signerRegistered = await this.config.isSignerRegistered();
+      } catch (err) {
+        try { await this.config.onSignerRegistrationLookupFailed?.(err); } catch { /* swallow */ }
+        throw new Error('UpdateStorageACK signer registration lookup failed; refusing to sign');
+      }
+      if (signerRegistered === false) {
+        try { await this.config.onSignerUnregistered?.(); } catch { /* swallow */ }
+        return this.encodeDecline(
+          cgId,
+          STORAGE_ACK_DECLINE_CODES.SIGNER_NOT_REGISTERED,
+          'UpdateStorageACK signer is not confirmed on-chain as an operational wallet',
+        );
+      }
+    }
+
+    const signature = ethers.Signature.from(
+      await this.config.signerWallet.signMessage(digest),
+    );
+    const MAX_UINT64 = (1n << 64n) - 1n;
+    if (this.config.nodeIdentityId > MAX_UINT64) {
+      throw new Error(
+        `nodeIdentityId ${this.config.nodeIdentityId} exceeds uint64 wire format`,
+      );
+    }
+    const subscriptionSource = this.config.getSubscriptionSourceForCg?.(
+      cgId,
+      swmGraphId !== cgId ? swmGraphId : undefined,
+    );
+    return encodeStorageACK({
+      merkleRoot: newMerkleRoot,
       coreNodeSignatureR: ethers.getBytes(signature.r),
       coreNodeSignatureVS: ethers.getBytes(signature.yParityAndS),
       contextGraphId: cgId,

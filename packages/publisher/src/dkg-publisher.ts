@@ -3117,18 +3117,80 @@ export class DKGPublisher implements Publisher {
       }
       onPhase?.('chain:writeahead', 'start');
     };
+    // CRITICAL CORRECTNESS INVARIANT (consensus): the digest fields the
+    // peers sign MUST be byte-identical to what the on-chain update tx
+    // carries + what the contract reads. We source the on-chain-resolved
+    // fields (contextGraphId, preUpdateMerkleRootCount, floored
+    // newTokenAmount, mintAmount, burnTokenIds) ONCE here via
+    // `chain.getUpdateAckDigestFields` — the SAME reads the adapter's
+    // `updateKnowledgeCollectionV10` performs — then (a) hand them to the
+    // ACK provider so peers sign exactly those, and (b) pin the tx to the
+    // resolved `newTokenAmount` via `boundNewTokenAmount` below. This
+    // closes the recompute-drift gap: no value is derived twice.
     let v10UpdateACKs: V10CoreNodeACK[] | undefined;
+    let boundUpdateTokenAmount: bigint | undefined;
     const v10UpdateACKProvider = options.v10UpdateACKProvider;
     if (v10UpdateACKProvider) {
       onPhase?.('collect_v10_update_acks', 'start');
       try {
-        v10UpdateACKs = await v10UpdateACKProvider(
+        const getFields = (this.chain as unknown as {
+          getUpdateAckDigestFields?: (p: {
+            kaId: bigint;
+            newByteSize: bigint;
+            userProvidedNewTokenAmount?: bigint;
+            mintAmount?: bigint;
+            burnTokenIds?: bigint[];
+          }) => Promise<{
+            contextGraphId: bigint;
+            preUpdateMerkleRootCount: bigint;
+            newTokenAmount: bigint;
+            mintAmount: bigint;
+            burnTokenIds: bigint[];
+          }>;
+        }).getUpdateAckDigestFields;
+        if (typeof getFields !== 'function') {
+          throw new Error(
+            'V10 update ACK collection requires chain.getUpdateAckDigestFields() so the off-chain-signed ' +
+            'digest matches the on-chain update tx. The adapter does not expose it.',
+          );
+        }
+        // Greenfield update: mintAmount=0, burnTokenIds=[]. These mirror
+        // the values the tx submits (see updateKnowledgeCollectionV10
+        // params below), keeping the signed digest and the tx aligned.
+        const digestFields = await getFields.call(this.chain, {
           kaId,
-          kcMerkleRoot,
-          contextGraphId,
-          updateByteSize,
-          kcMerkleLeafCount,
-        );
+          newByteSize: updateByteSize,
+          mintAmount: 0n,
+          burnTokenIds: [],
+        });
+        boundUpdateTokenAmount = digestFields.newTokenAmount;
+        v10UpdateACKs = await v10UpdateACKProvider({
+          kaId,
+          // Pass the on-chain-resolved numeric cgId (decimal string) — NOT
+          // the cleartext `contextGraphId` name — so the digest's TARGET id
+          // matches the tx + the contract read.
+          contextGraphId: digestFields.contextGraphId.toString(),
+          preUpdateMerkleRootCount: digestFields.preUpdateMerkleRootCount,
+          newMerkleRoot: kcMerkleRoot,
+          newByteSize: updateByteSize,
+          newTokenAmount: digestFields.newTokenAmount,
+          mintAmount: digestFields.mintAmount,
+          burnTokenIds: digestFields.burnTokenIds,
+          newMerkleLeafCount: kcMerkleLeafCount,
+          // Peers recompute newMerkleRoot from the updated quads. Send the
+          // same serialized public N-Quads the byte-size was computed over
+          // so the peer's `computeFlatKCRoot(parsed, [])` matches the
+          // publisher's. Only valid when there are NO private merkle roots
+          // mixed into `kcMerkleRoot` — otherwise the peer (which can't see
+          // the private roots) would recompute a different root and decline.
+          // In that case we omit stagingQuads and the peer falls back to
+          // verifying against its SWM copy (same limitation as the publish
+          // plaintext-inline path).
+          stagingQuads: updatePrivateRoots.length === 0
+            ? new TextEncoder().encode(updateNquadsStr)
+            : undefined,
+          swmGraphId: contextGraphId,
+        });
         this.log.info(
           ctx,
           `V10: Collected ${v10UpdateACKs.length} core node update ACKs`,
@@ -3147,6 +3209,14 @@ export class DKGPublisher implements Publisher {
             newByteSize: updateByteSize,
             newMerkleLeafCount: kcMerkleLeafCount,
             mintAmount: 0,
+            // Pin the tx's newTokenAmount to the floored value the ACK
+            // collector already had the peers sign (resolved via
+            // `getUpdateAckDigestFields`). Without this the adapter would
+            // recompute and could drift from the signed digest, making the
+            // collected ACK signatures fail the on-chain verify. Undefined
+            // when no provider ran (minSig=1 self-sign path) — the adapter
+            // then derives newTokenAmount itself as before.
+            boundNewTokenAmount: boundUpdateTokenAmount,
             publisherAddress,
             v10Origin: true,
             authorAddress: effectiveAuthorAddress,

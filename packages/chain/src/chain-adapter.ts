@@ -480,6 +480,15 @@ export interface V10UpdateKAParams {
   /** V10 flat-KC Merkle leaf count after update (sorted + deduped). */
   newMerkleLeafCount: number;
   newTokenAmount?: bigint;
+  /**
+   * When set, the tx submits THIS exact `newTokenAmount` instead of
+   * re-deriving it via `computeUpdateNewTokenAmount`. Used to pin the
+   * on-chain tx to the floored value that the off-chain ACK collector
+   * already signed (via `getUpdateAckDigestFields`), guaranteeing the
+   * collected peer signatures verify against the submitted tx with no
+   * recompute drift.
+   */
+  boundNewTokenAmount?: bigint;
   mintAmount?: number;
   burnTokenIds?: bigint[];
   /** When true, the caller asserts the KC was created via V10. Skips probing. */
@@ -1010,6 +1019,32 @@ export interface ChainAdapter {
    * with real chain attribution.
    */
   updateKnowledgeCollectionV10?(params: V10UpdateKAParams): Promise<TxResult>;
+
+  /**
+   * Resolve the on-chain-derived fields the V10 UPDATE ACK digest binds,
+   * so the off-chain ACK collector signs a digest byte-identical to what
+   * `updateKnowledgeCollectionV10` submits and the contract verifies.
+   *
+   * Reads `contextGraphId` (`kaToContextGraph`), `preUpdateMerkleRootCount`
+   * (`getMerkleRoots(kaId).length`), and the floored `newTokenAmount`
+   * (`computeUpdateNewTokenAmount` → `floorPublishTokenAmount`) exactly as
+   * the update tx does. Callers MUST pass the returned `newTokenAmount`
+   * back into `updateKnowledgeCollectionV10` as `boundNewTokenAmount` to
+   * pin the tx to the signed value with no recompute drift.
+   */
+  getUpdateAckDigestFields?(params: {
+    kaId: bigint;
+    newByteSize: bigint;
+    userProvidedNewTokenAmount?: bigint;
+    mintAmount?: bigint;
+    burnTokenIds?: bigint[];
+  }): Promise<{
+    contextGraphId: bigint;
+    preUpdateMerkleRootCount: bigint;
+    newTokenAmount: bigint;
+    mintAmount: bigint;
+    burnTokenIds: bigint[];
+  }>;
 
   /**
    * Whether this adapter supports V10 publish paths. Required — this is

@@ -179,6 +179,12 @@ export {
 } from './publish-intent.js';
 
 export {
+  type UpdateIntentMsg,
+  encodeUpdateIntent,
+  decodeUpdateIntent,
+} from './update-intent.js';
+
+export {
   CIPHERTEXT_CHUNK_PREDICATE,
   ciphertextChunkStoreGraph,
   ciphertextChunkStoreSubject,

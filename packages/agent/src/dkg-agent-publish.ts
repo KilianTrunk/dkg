@@ -1199,6 +1199,17 @@ export class PublishMethods extends DKGAgentBase {
         }`,
       );
     }
+    // V10 UPDATE StorageACK quorum. Wired here so BOTH update entry points
+    // reach it: the public `agent.update(...)` API and the A2 create-vs-
+    // update branch in `publishFromFinalizedAssertion` (which calls
+    // `this.update(...)`). The provider resolves the on-chain digest
+    // fields inside the publisher (via `chain.getUpdateAckDigestFields`)
+    // and collects core-node ACKs over `PROTOCOL_STORAGE_UPDATE_ACK`. The
+    // numeric on-chain cgId (`updateOnChainId`) is the ACK domain; we fall
+    // back to the cleartext `contextGraphId` only when the on-chain id
+    // could not be resolved (the provider re-resolves the digest cgId from
+    // the adapter regardless, so the digest TARGET stays chain-truth).
+    const v10UpdateACKProvider = this.createV10UpdateACKProvider(updateOnChainId ?? contextGraphId);
     const result = await this.publisher.update(kaId, {
       contextGraphId,
       quads,
@@ -1208,6 +1219,7 @@ export class PublishMethods extends DKGAgentBase {
       operationCtx: ctx,
       onPhase,
       precomputedUpdateAttestation: opts?.precomputedUpdateAttestation,
+      v10UpdateACKProvider,
     });
     this.log.info(ctx, `Update complete — status=${result.status}`);
 

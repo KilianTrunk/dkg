@@ -126,6 +126,22 @@ export const PROTOCOL_STORAGE_ACK = '/dkg/10.0.1/storage-ack';
 export const PROTOCOL_STORAGE_ACK_V2 = '/dkg/10.0.2/storage-ack';
 
 /**
+ * V10 UPDATE StorageACK protocol. Mirrors {@link PROTOCOL_STORAGE_ACK}
+ * but carries an `UpdateIntent` (not a `PublishIntent`) and binds the
+ * 13-field UPDATE ACK digest (see `computeUpdateACKDigest`) that
+ * `KnowledgeAssetsLifecycle._executeUpdateCore` verifies on-chain.
+ *
+ * The publish StorageACK protocol is publish-only (no op-type
+ * discriminator on the wire), so updates need a distinct protocol id
+ * rather than overloading the publish one. Pre-update cores simply
+ * never register this handler, so an UPDATE-aware publisher dialing a
+ * legacy core gets a libp2p "could not negotiate" error there (counted
+ * as a peer-unreachable failure against the quorum), exactly like the
+ * V2-vs-V1 graceful-fallback pattern.
+ */
+export const PROTOCOL_STORAGE_UPDATE_ACK = '/dkg/10.0.1/storage-update-ack';
+
+/**
  * OT-RFC-38 LU-11 / OT-RFC-39 — point-to-point sync verb for one
  * curated-CG ciphertext chunk identified by (cgId, batchId,
  * chunkIndex). Used by late-joining hosting cores (and any

@@ -108,7 +108,7 @@ import {
   deriveStatus, type KaStatus,
   WM_CURRENT_ASSERTION_PRED, SWM_CURRENT_ASSERTION_PRED, VM_CURRENT_ASSERTION_PRED,
   KA_ID_PRED, RESERVED_UAL_PRED,
-  type CollectedACK, type LiftAuthorityProof, type LiftTransitionType,
+  type CollectedACK, type V10CoreNodeACK, type LiftAuthorityProof, type LiftTransitionType,
   type LiftRequest, type LiftRequestAuthorSeal,
   type WorkspaceAgentRecipient,
   type WorkspaceAgentRecipientResolution,
@@ -1464,6 +1464,154 @@ export class DKGAgent extends DKGAgentBase {
         merkleLeafCount,
         isEncryptedPayload,
         chunkedCommitment,
+      });
+      return result.acks;
+    };
+  }
+
+  /**
+   * V10 UPDATE counterpart to {@link createV10ACKProvider}. Returns a
+   * closure the publisher calls (after it has sourced the on-chain digest
+   * fields via `chain.getUpdateAckDigestFields`) to collect core-node
+   * UPDATE StorageACKs over `PROTOCOL_STORAGE_UPDATE_ACK` via the shared
+   * {@link ACKCollector.collectUpdate}. Returns `undefined` when the
+   * adapter is not V10-capable (same guards as the publish provider), so
+   * the publisher leaves `v10UpdateACKs` undefined and the adapter falls
+   * back to self-signing on a minSig=1 network.
+   */
+  createV10UpdateACKProvider(_contextGraphId: string) {
+    if (!this.router || !this.gossip) return undefined;
+    if (typeof this.chain.isV10Ready !== 'function' || !this.chain.isV10Ready()) return undefined;
+    if (typeof this.chain.verifyACKIdentity !== 'function') return undefined;
+    if (typeof this.chain.getEvmChainId !== 'function') return undefined;
+    if (typeof this.chain.getKnowledgeAssetsLifecycleAddress !== 'function') return undefined;
+
+    const collector = new ACKCollector({
+      gossipPublish: async (topic: string, data: Uint8Array) => {
+        await this.gossip.publish(topic, data);
+      },
+      sendP2P: async (peerId: string, protocol: string, data: Uint8Array) => {
+        const sendResult = await this.messenger.sendReliable(peerId, protocol, data);
+        if (!sendResult.delivered) {
+          throw new Error(`substrate queued (transport): ${sendResult.error}`);
+        }
+        return sendResult.response;
+      },
+      getConnectedCorePeers: () => {
+        const peers = this.node.libp2p.getPeers();
+        const connected = peers.map(p => p.toString()).filter(id => id !== this.peerId);
+        if (this.knownCorePeerIds.size > 0) {
+          const filtered = connected.filter(id => this.knownCorePeerIds.has(id));
+          if (filtered.length > 0) return filtered;
+        }
+        return connected;
+      },
+      verifyIdentity: typeof this.chain.verifyACKIdentity === 'function'
+        ? async (recoveredAddress: string, claimedIdentityId: bigint) => {
+            try {
+              return await this.chain.verifyACKIdentity!(recoveredAddress, claimedIdentityId);
+            } catch {
+              return false;
+            }
+          }
+        : undefined,
+      verifyIdentityDetailed: typeof this.chain.verifyACKIdentityDetailed === 'function'
+        ? async (recoveredAddress: string, claimedIdentityId: bigint) => {
+            try {
+              return await this.chain.verifyACKIdentityDetailed!(recoveredAddress, claimedIdentityId);
+            } catch {
+              return { valid: false, reason: 'rpc-error' as const };
+            }
+          }
+        : undefined,
+      log: (msg: string) => {
+        const ctx = createOperationContext('update');
+        this.log.info(ctx, msg);
+      },
+    });
+
+    const chain = this.chain;
+
+    return async (params: {
+      kaId: bigint;
+      contextGraphId: string;
+      preUpdateMerkleRootCount: bigint;
+      newMerkleRoot: Uint8Array;
+      newByteSize: bigint;
+      newTokenAmount: bigint;
+      mintAmount: bigint;
+      burnTokenIds: bigint[];
+      newMerkleLeafCount: number;
+      newCiphertextChunksRoot?: Uint8Array;
+      newCiphertextChunkCount?: number;
+      stagingQuads?: Uint8Array;
+      swmGraphId?: string;
+      subGraphName?: string;
+    }): Promise<V10CoreNodeACK[]> => {
+      // The TARGET cgId for the digest is the on-chain numeric id the
+      // adapter resolved (`params.contextGraphId`). Reject non-numeric /
+      // non-positive ids the same way the publish provider does — the
+      // contract rejects `contextGraphId == 0`.
+      let cgIdBigInt: bigint;
+      try {
+        cgIdBigInt = BigInt(params.contextGraphId);
+      } catch {
+        throw new Error(
+          `V10 UPDATE ACK collection requires a numeric on-chain context graph id; got '${params.contextGraphId}'.`,
+        );
+      }
+      if (cgIdBigInt <= 0n) {
+        throw new Error(
+          `V10 UPDATE ACK collection requires a positive on-chain context graph id; got ${cgIdBigInt}.`,
+        );
+      }
+      if (!Number.isInteger(params.newMerkleLeafCount) || params.newMerkleLeafCount < 1) {
+        throw new Error(
+          `V10 UPDATE ACK collection requires a positive integer newMerkleLeafCount; got ${params.newMerkleLeafCount}.`,
+        );
+      }
+
+      let requiredACKs: number | undefined;
+      if (typeof chain.getMinimumRequiredSignatures === 'function') {
+        try {
+          requiredACKs = await chain.getMinimumRequiredSignatures();
+        } catch (err) {
+          throw wrapAsRpcPreconditionIfApplicable(err, 'getMinimumRequiredSignatures');
+        }
+      }
+
+      let chainIdBig: bigint;
+      try {
+        chainIdBig = await chain.getEvmChainId();
+      } catch (err) {
+        throw wrapAsRpcPreconditionIfApplicable(err, 'getEvmChainId');
+      }
+      let kav10Address: string;
+      try {
+        kav10Address = await chain.getKnowledgeAssetsLifecycleAddress();
+      } catch (err) {
+        throw wrapAsRpcPreconditionIfApplicable(err, 'getKnowledgeAssetsLifecycleAddress');
+      }
+
+      const result = await collector.collectUpdate({
+        kaId: params.kaId,
+        contextGraphId: cgIdBigInt,
+        preUpdateMerkleRootCount: params.preUpdateMerkleRootCount,
+        newMerkleRoot: params.newMerkleRoot,
+        newByteSize: params.newByteSize,
+        newTokenAmount: params.newTokenAmount,
+        mintAmount: params.mintAmount,
+        burnTokenIds: params.burnTokenIds,
+        newMerkleLeafCount: params.newMerkleLeafCount,
+        newCiphertextChunksRoot: params.newCiphertextChunksRoot,
+        newCiphertextChunkCount: params.newCiphertextChunkCount,
+        chainId: chainIdBig,
+        kav10Address,
+        publisherPeerId: this.peerId,
+        requiredACKs,
+        swmGraphId: params.swmGraphId,
+        subGraphName: params.subGraphName,
+        stagingQuads: params.stagingQuads,
       });
       return result.acks;
     };

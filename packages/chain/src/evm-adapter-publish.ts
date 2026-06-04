@@ -551,6 +551,69 @@ export class PublishMethods extends EVMChainAdapterBase {
     );
   }
 
+  /**
+   * Resolve the on-chain-derived fields the V10 UPDATE ACK digest binds.
+   *
+   * Reads `contextGraphId`, `preUpdateMerkleRootCount`, and the floored
+   * `newTokenAmount` EXACTLY as `updateKnowledgeCollectionV10` does, so the
+   * off-chain ACK collector signs a digest byte-identical to the on-chain
+   * verify. The returned `newTokenAmount` MUST be passed back into
+   * `updateKnowledgeCollectionV10` as `boundNewTokenAmount` to pin the tx
+   * to the signed value (no recompute drift). `mintAmount`/`burnTokenIds`
+   * are echoed back (greenfield defaults 0 / []) so the caller threads the
+   * SAME values into both the signed digest and the tx.
+   */
+  async getUpdateAckDigestFields(params: {
+    kaId: bigint;
+    newByteSize: bigint;
+    userProvidedNewTokenAmount?: bigint;
+    mintAmount?: bigint;
+    burnTokenIds?: bigint[];
+  }): Promise<{
+    contextGraphId: bigint;
+    preUpdateMerkleRootCount: bigint;
+    newTokenAmount: bigint;
+    mintAmount: bigint;
+    burnTokenIds: bigint[];
+  }> {
+    await this.init();
+
+    const kas = this.contracts.knowledgeAssetStorage;
+
+    let contextGraphId = 0n;
+    if (this.contracts.contextGraphStorage) {
+      try {
+        contextGraphId = BigInt(
+          await this.contracts.contextGraphStorage.kaToContextGraph(params.kaId),
+        );
+      } catch { /* use 0 */ }
+    }
+
+    let preUpdateMerkleRootCount = 0n;
+    if (kas) {
+      try {
+        const roots: unknown[] = await kas.getMerkleRoots(params.kaId);
+        preUpdateMerkleRootCount = BigInt(roots.length);
+      } catch { /* use 0 */ }
+    }
+
+    const currentTokenAmount = await this.resolveCurrentTokenAmount(params.kaId);
+    const newTokenAmount = await this.computeUpdateNewTokenAmount({
+      kaId: params.kaId,
+      newByteSize: params.newByteSize,
+      currentTokenAmount,
+      userProvidedNewTokenAmount: params.userProvidedNewTokenAmount,
+    });
+
+    return {
+      contextGraphId,
+      preUpdateMerkleRootCount,
+      newTokenAmount,
+      mintAmount: params.mintAmount ?? 0n,
+      burnTokenIds: params.burnTokenIds ?? [],
+    };
+  }
+
   async updateKnowledgeCollectionV10(params: V10UpdateKAParams): Promise<TxResult> {
     await this.init();
 
@@ -610,8 +673,11 @@ export class PublishMethods extends EVMChainAdapterBase {
     // `computeUpdateNewTokenAmount` (see r5 in #833) so the ACK digest and the
     // tx submission below bind the same wire value. Any caller passing a
     // `boundNewTokenAmount` for an ACK already-signed digest is honoured here
-    // to keep digest-bound updates byte-identical to what the signer saw.
-    const newTokenAmount = await this.computeUpdateNewTokenAmount({
+    // to keep digest-bound updates byte-identical to what the signer saw —
+    // this is the path the publisher uses (it pre-resolves the digest fields
+    // via `getUpdateAckDigestFields`, has peers sign that floored value, then
+    // pins the tx to it here so the collected ACK signatures verify on-chain).
+    const newTokenAmount = params.boundNewTokenAmount ?? await this.computeUpdateNewTokenAmount({
       kaId: params.kaId,
       newByteSize: params.newByteSize,
       currentTokenAmount,

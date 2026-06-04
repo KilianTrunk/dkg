@@ -36,6 +36,40 @@ const FINALIZE_ONLY_CREATE_FIELDS = [
   "schemeVersion",
 ] as const;
 
+/**
+ * Translate engine/publisher errors on the WM/SWM mutation verbs into the same
+ * HTTP status mapping the legacy `/api/assertion/*` routes use, so callers see
+ * 400 for their own mistakes (missing assertion, unsafe/reserved IRI) and 409
+ * for the "_meta says completed but the data graph is empty" case — instead of
+ * a blanket 500. NOT applied to vm/publish: on-chain/storage failures there can
+ * carry "Invalid"/"Unsafe" text and must stay 500 (parity with the legacy
+ * publish path, which never down-classified them).
+ */
+function respondAssertionError(res: RequestContext["res"], e: any): void {
+  if (e?.name === "AssertionNotPersistedError" || e?.code === "ASSERTION_NOT_PERSISTED") {
+    jsonResponse(res, 409, {
+      error: e.message,
+      code: "ASSERTION_NOT_PERSISTED",
+      contextGraphId: e.contextGraphId,
+      assertionGraph: e.assertionGraph,
+      expectedTripleCount: e.expectedTripleCount,
+    });
+    return;
+  }
+  const msg = e?.message ?? String(e);
+  if (
+    e?.name === "ReservedNamespaceError" ||
+    msg.includes("not found") ||
+    msg.includes("Invalid") ||
+    msg.includes("Unsafe") ||
+    msg.includes("reserved namespace")
+  ) {
+    jsonResponse(res, 400, { error: msg });
+    return;
+  }
+  jsonResponse(res, 500, { error: msg });
+}
+
 function hex(bytes: Uint8Array): string {
   return "0x" + Buffer.from(bytes).toString("hex");
 }
@@ -465,25 +499,37 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
     }
 
     // ── VM verb: publish (SWM/WM → VM; mint or update on chain) ──
+    // Publish keeps its own generic-500 catch: on-chain/storage/publisher
+    // failures can carry "Invalid"/"Unsafe" text and must NOT be down-classified
+    // to 400 (parity with the legacy publish path).
     if (layer === "vm" && verb === "publish") {
-      // Validate the request shape + normalize options BEFORE the publish (PR
-      // #971): this is a standalone request, so a 400 here mutates nothing.
-      if (!validateFinalizedAssertionPublishRequest(parsed, res)) return;
-      const opts = resolveFinalizedPublishOptions(ctx, parsed.options);
-      if (opts === null) return;
-      const pub: any = await agent.publishFromFinalizedAssertion(contextGraphId, name, { subGraphName, ...opts });
-      const { httpStatus, reason } = classifyVmPublish(pub);
-      return jsonResponse(res, httpStatus, {
-        kaId: pub?.kaId,
-        status: pub?.status,
-        ual: pub?.ual,
-        txHash: pub?.onChainResult?.txHash,
-        ...(typeof pub?.contextGraphError === "string" ? { contextGraphError: pub.contextGraphError } : {}),
-        ...(reason ? { error: reason } : {}),
-      });
+      // #988: publish keeps its OWN generic-500 catch (NOT the outer
+      // respondAssertionError) so on-chain/storage "Invalid"/"Unsafe" text isn't
+      // down-classified to 400. Inside it, run the #971 input validation +
+      // #972 outcome-status mapping (200/207/502).
+      try {
+        // Validate the request shape + normalize options BEFORE the publish (PR
+        // #971): this is a standalone request, so a 400 here mutates nothing.
+        if (!validateFinalizedAssertionPublishRequest(parsed, res)) return;
+        const opts = resolveFinalizedPublishOptions(ctx, parsed.options);
+        if (opts === null) return;
+        const pub: any = await agent.publishFromFinalizedAssertion(contextGraphId, name, { subGraphName, ...opts });
+        const { httpStatus, reason } = classifyVmPublish(pub);
+        return jsonResponse(res, httpStatus, {
+          kaId: pub?.kaId,
+          status: pub?.status,
+          ual: pub?.ual,
+          txHash: pub?.onChainResult?.txHash,
+          ...(typeof pub?.contextGraphError === "string" ? { contextGraphError: pub.contextGraphError } : {}),
+          ...(reason ? { error: reason } : {}),
+        });
+      } catch (e: any) {
+        return jsonResponse(res, 500, { error: e?.message ?? String(e) });
+      }
     }
   } catch (e: any) {
-    return jsonResponse(res, 500, { error: e?.message ?? String(e) });
+    // WM/SWM mutation verbs (write/finalize/discard/pull-from/share) only.
+    return respondAssertionError(res, e);
   }
 
   // Unmatched under the prefix — fall through to the daemon's 404.

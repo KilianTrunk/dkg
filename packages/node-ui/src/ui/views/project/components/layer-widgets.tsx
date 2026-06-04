@@ -99,18 +99,21 @@ export function LayerStatsWidget({ entities, entityCount, triples, layer }: {
   );
 }
 
-// OT-RFC-44 / Design B: a publish may include any number of root entities;
-// they become the member entities of ONE Knowledge Asset. (Previously this
-// forced exactly one root — the entity-count == KA-count conflation.)
+// Selection-based SWM publish is still single-root at the UI/daemon route.
+// Multi-root file lifecycles publish through finalized assertion/file paths
+// where the daemon can identify one lifecycle/assertion boundary.
 function collectPublishRoots(roots: string[]): string[] {
   const uniqueRoots = [...new Set(roots.filter(Boolean))];
   if (uniqueRoots.length < 1) {
-    throw new Error('Publish requires at least one root entity. Select one or more roots and publish again.');
+    throw new Error('Publish requires one root entity. Select a root and publish again.');
+  }
+  if (uniqueRoots.length > 1) {
+    throw new Error('Shared-memory publish currently requires exactly one root entity.');
   }
   return uniqueRoots;
 }
 
-async function fetchSwmPublishRoots(contextGraphId: string): Promise<string[]> {
+export async function fetchSwmPublishRoots(contextGraphId: string): Promise<string[]> {
   const roots = (await listSwmEntities(contextGraphId)).map((entity) => entity.uri);
   return collectPublishRoots(roots);
 }
@@ -242,4 +245,3 @@ export function LayerWidgetStrip({ layer, entities, entityCount, tripleCount, co
     </div>
   );
 }
-

@@ -1083,14 +1083,14 @@ export interface PublishResult {
 }
 
 /**
- * Publish a selection of SWM roots on-chain (SWM -> VM) as ONE Knowledge Asset.
- * OT-RFC-44 / Design B: a file may contain any number of entities; they become
- * the member entities of a single KA. The old "exactly one root entity" guard
- * conflated entity count with KA count and is removed.
+ * Publish one SWM root on-chain (SWM -> VM).
+ * Selection-based shared-memory publish is not atomic across independent roots
+ * yet, so the UI keeps the single-root guard until the daemon can identify one
+ * lifecycle/assertion for a multi-root request.
  */
 export const publishSharedMemory = (contextGraphId: string, rootEntities: string[]) => {
-  if (rootEntities.length < 1) {
-    throw new Error('Publish requires at least one root entity.');
+  if (rootEntities.length !== 1) {
+    throw new Error('Shared-memory publish currently requires exactly one root entity.');
   }
   return post<PublishResult>('/api/shared-memory/publish', {
     contextGraphId,

@@ -13,7 +13,7 @@ import type { SwmAttributionsResult } from '../../../hooks/useSwmAttributions.js
 import { LAYER_CONFIG, SOURCE_CONTENT_TYPE, MARKDOWN_FORM, SOURCE_FILE, DKG_SIZE, entityAuthorUri, entityMeta, layerNoun, useLayerTriples, entityTimestamp, formatRelativeTime, type LayerContentTab } from '../helpers.js';
 import { EmptyState, StatStrip, toneForLayer } from '../../../components/ContextGraphPrimitives.js';
 import { LayerGraphPanel } from './graph.js';
-import { LayerWidgetStrip } from './layer-widgets.js';
+import { LayerWidgetStrip, fetchSwmPublishRoots } from './layer-widgets.js';
 
 // ─── Enhanced Entity list (sorted by triple count, with type pill) ──────
 
@@ -716,4 +716,3 @@ export function DocumentsList({
 }
 
 // ─── Provenance Bar ──────────────────────────────────────────
-

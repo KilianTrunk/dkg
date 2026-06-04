@@ -1219,12 +1219,10 @@ export class DKGPublisher implements Publisher {
     if (quads.length === 0) {
       throw new Error(`No quads in shared memory for context graph ${contextGraphId} matching selection`);
     }
-    // OT-RFC-44 / Design B: a shared-memory selection of N root entities
-    // publishes as ONE Knowledge Asset in a SINGLE transaction — which is
-    // exactly the atomicity the old MultiRootPublishNotAtomicError guard was
-    // protecting (V8/V9 mapped N roots -> N KAs -> N txs, hence "not atomic").
-    // With file=KA the multi-root publish IS atomic, so the guard is removed;
-    // `rootEntities` becomes the member-entity list of the one KA.
+    // OT-RFC-44 / Design B: once the caller has selected one lifecycle/file,
+    // that payload may contain N root entities and still publish as ONE KA in a
+    // single transaction. Higher-level selection endpoints keep their
+    // unrelated-root guard until they can identify that one lifecycle boundary.
     const rootEntities = [...autoPartition(quads).keys()];
 
     const ctxGraphId = options?.publishContextGraphId;
@@ -1732,15 +1730,14 @@ export class DKGPublisher implements Publisher {
 
     onPhase?.('prepare:manifest', 'start');
     // OT-RFC-44 / Design B: one file/lifecycle = ONE Knowledge Asset, however
-    // many entities it contains. The consensus manifest keeps every member on
-    // tokenId 1, so the chain and ACK digest see one KA. Label metadata keeps
-    // stable per-root rows for the current update/private-access paths, which
-    // still resolve <ual>/1, <ual>/2, ... by root.
-    const KA_TOKEN_ID = 1n;
-    let metadataTokenId = 1n;
+    // many entities it contains. The on-chain KA count and ACK digest stay at
+    // one below, while these token IDs remain compatibility labels for
+    // per-root response/meta subjects (`<ual>/1`, `<ual>/2`, ...).
+    let compatibilityTokenId = 1n;
     for (const entry of canonical.manifestEntries) {
+      const tokenId = compatibilityTokenId++;
       manifestEntries.push({
-        tokenId: KA_TOKEN_ID,
+        tokenId,
         rootEntity: entry.rootEntity,
         privateMerkleRoot: entry.privateMerkleRoot,
         privateTripleCount: entry.privateTripleCount,
@@ -1749,7 +1746,7 @@ export class DKGPublisher implements Publisher {
       kaMetadata.push({
         rootEntity: entry.rootEntity,
         kcUal: '',
-        tokenId: metadataTokenId++,
+        tokenId,
         publicTripleCount: entry.publicTripleCount,
         privateTripleCount: entry.privateTripleCount,
         privateMerkleRoot: entry.privateMerkleRoot,

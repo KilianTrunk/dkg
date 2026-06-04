@@ -188,9 +188,10 @@ describe('DKGPublisher', () => {
     const roots = new Set(result.kaManifest.map((m: any) => m.rootEntity));
     expect(roots.has(ENTITY)).toBe(true);
     expect(roots.has(ENTITY2)).toBe(true);
-    // ...and they resolve to ONE KA (a single shared tokenId, one kaId).
+    // ...and they mint ONE on-chain KA, while keeping per-root compatibility
+    // token IDs for `${ual}/${tokenId}` response/meta consumers.
     const tokenIds = new Set(result.kaManifest.map((m: any) => String(m.tokenId)));
-    expect(tokenIds.size).toBe(1);
+    expect(tokenIds).toEqual(new Set(['1', '2']));
     expect(result.kaId).toBeDefined();
   });
 

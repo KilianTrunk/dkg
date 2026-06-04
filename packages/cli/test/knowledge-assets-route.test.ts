@@ -128,29 +128,49 @@ describe('GitHub-shaped /api/knowledge-assets routes (OT-RFC-43 §10.5)', () => 
     expect(agent.assertion.finalize).toHaveBeenCalledOnce();
   });
 
-  it('POST /api/knowledge-assets forwards atomic finalize external-signer fields', async () => {
+  it('POST /api/knowledge-assets validates and forwards atomic finalize external-signer fields', async () => {
     const agent = makeAssertionAgent();
     const quads = [{ subject: 'ex:A', predicate: 'ex:p', object: '"x"', graph: '' }];
+    const address = `0x${'11'.repeat(20)}`;
     const preSignedAuthorAttestation = {
-      address: '0xauthor',
-      signature: { r: '0xr', vs: '0xvs' },
+      address,
+      signature: { r: `0x${'22'.repeat(32)}`, vs: `0x${'33'.repeat(32)}` },
     };
     const ctx = ctxFor('POST', '/api/knowledge-assets', {
       contextGraphId: 'cg',
       name: 'f',
       quads,
-      authorAgentAddress: '0xauthor',
       preSignedAuthorAttestation,
       schemeVersion: 1,
     }, agent);
     await handleKnowledgeAssetsRoutes(ctx);
     expect(status(ctx)).toBe(201);
-    expect(agent.assertion.finalize).toHaveBeenCalledWith('cg', 'f', {
-      subGraphName: undefined,
-      authorAgentAddress: '0xauthor',
-      preSignedAuthorAttestation,
-      schemeVersion: 1,
-    });
+    const finalizeOpts = (agent.assertion.finalize as any).mock.calls[0][2];
+    expect(finalizeOpts.schemeVersion).toBe(1);
+    expect(finalizeOpts.authorAgentAddress).toBeUndefined();
+    expect(finalizeOpts.preSignedAuthorAttestation.address).toBe(address);
+    expect(finalizeOpts.preSignedAuthorAttestation.signature.r).toBeInstanceOf(Uint8Array);
+    expect(finalizeOpts.preSignedAuthorAttestation.signature.vs).toBeInstanceOf(Uint8Array);
+  });
+
+  it('POST /api/knowledge-assets rejects mutually exclusive atomic finalize authorship fields', async () => {
+    const agent = makeAssertionAgent();
+    const quads = [{ subject: 'ex:A', predicate: 'ex:p', object: '"x"', graph: '' }];
+    const ctx = ctxFor('POST', '/api/knowledge-assets', {
+      contextGraphId: 'cg',
+      name: 'f',
+      quads,
+      authorAgentAddress: `0x${'11'.repeat(20)}`,
+      preSignedAuthorAttestation: {
+        address: `0x${'22'.repeat(20)}`,
+        signature: { r: `0x${'22'.repeat(32)}`, vs: `0x${'33'.repeat(32)}` },
+      },
+    }, agent);
+    await handleKnowledgeAssetsRoutes(ctx);
+    expect(status(ctx)).toBe(400);
+    expect(body(ctx).error).toContain('mutually exclusive');
+    expect(agent.assertion.create).not.toHaveBeenCalled();
+    expect(agent.assertion.finalize).not.toHaveBeenCalled();
   });
 
   it('atomic create with also* tails returns 207 when a tail fails', async () => {
@@ -184,6 +204,21 @@ describe('GitHub-shaped /api/knowledge-assets routes (OT-RFC-43 §10.5)', () => 
     await handleKnowledgeAssetsRoutes(ctx);
     expect(status(ctx)).toBe(200);
     expect(body(ctx)).toMatchObject({ merkleRoot: '0xabcd', eip712Digest: '0xdig' });
+  });
+
+  it('POST .../:name/wm/finalize rejects malformed pre-signed attestations before finalize', async () => {
+    const agent = makeAssertionAgent();
+    const ctx = ctxFor('POST', '/api/knowledge-assets/f/wm/finalize', {
+      contextGraphId: 'cg',
+      preSignedAuthorAttestation: {
+        address: `0x${'11'.repeat(20)}`,
+        signature: { r: '0xnot-32-bytes', vs: `0x${'33'.repeat(32)}` },
+      },
+    }, agent);
+    await handleKnowledgeAssetsRoutes(ctx);
+    expect(status(ctx)).toBe(400);
+    expect(body(ctx).error).toContain('preSignedAuthorAttestation.signature.r');
+    expect(agent.assertion.finalize).not.toHaveBeenCalled();
   });
 
   it('POST .../:name/swm/share advances the SWM pointer (promote→share)', async () => {

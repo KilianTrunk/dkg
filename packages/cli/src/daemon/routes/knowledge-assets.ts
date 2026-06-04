@@ -26,11 +26,60 @@
 // routes, as an additional accepted identifier form.
 import type { RequestContext } from "./context.js";
 import { jsonResponse, readBody, safeParseJson } from "../http-utils.js";
+import { validatePreSignedAuthorAttestation } from "./memory.js";
 
 const PREFIX = "/api/knowledge-assets";
 
 function hex(bytes: Uint8Array): string {
   return "0x" + Buffer.from(bytes).toString("hex");
+}
+
+function resolveFinalizeOptions(
+  raw: Record<string, any>,
+  res: RequestContext["res"],
+): Record<string, unknown> | null {
+  const {
+    subGraphName,
+    authorAgentAddress,
+    preSignedAuthorAttestation,
+    schemeVersion,
+  } = raw;
+  if (authorAgentAddress != null && preSignedAuthorAttestation != null) {
+    jsonResponse(res, 400, {
+      error: '"authorAgentAddress" and "preSignedAuthorAttestation" are mutually exclusive',
+    });
+    return null;
+  }
+  if (
+    authorAgentAddress != null &&
+    (typeof authorAgentAddress !== "string" || !/^0x[0-9a-fA-F]{40}$/.test(authorAgentAddress))
+  ) {
+    jsonResponse(res, 400, {
+      error: '"authorAgentAddress" must be a 0x-prefixed 20-byte EVM address',
+    });
+    return null;
+  }
+  let resolvedPreSignedAttestation:
+    | { address: string; signature: { r: Uint8Array; vs: Uint8Array } }
+    | undefined;
+  if (preSignedAuthorAttestation != null) {
+    const validated = validatePreSignedAuthorAttestation(preSignedAuthorAttestation, res);
+    if (validated === undefined) return null;
+    resolvedPreSignedAttestation = validated;
+  }
+  if (
+    schemeVersion != null &&
+    (typeof schemeVersion !== "number" || !Number.isInteger(schemeVersion) || schemeVersion < 1)
+  ) {
+    jsonResponse(res, 400, { error: '"schemeVersion" must be a positive integer when supplied' });
+    return null;
+  }
+  return {
+    ...(subGraphName ? { subGraphName } : {}),
+    ...(typeof authorAgentAddress === "string" ? { authorAgentAddress } : {}),
+    ...(resolvedPreSignedAttestation ? { preSignedAuthorAttestation: resolvedPreSignedAttestation } : {}),
+    ...(schemeVersion != null ? { schemeVersion } : {}),
+  };
 }
 
 export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<void> {
@@ -56,21 +105,21 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
     if (!contextGraphId || !name) {
       return jsonResponse(res, 400, { error: 'Missing "contextGraphId" or "name"' });
     }
+    const shouldAutoFinalize = Array.isArray(quads) && quads.length > 0;
+    const finalizeOptions = shouldAutoFinalize
+      ? resolveFinalizeOptions({ subGraphName, authorAgentAddress, preSignedAuthorAttestation, schemeVersion }, res)
+      : {};
+    if (finalizeOptions === null) return;
     try {
       const assertionUri = await agent.assertion.create(contextGraphId, name, { subGraphName });
       const result: Record<string, unknown> = { name, assertionUri, status: "draft-open" };
 
       // autoFinalize: when quads are supplied, write + seal in the same call
       // (OT-RFC-43 §10.5.5). `also*` are opt-in layer transitions on top.
-      if (Array.isArray(quads) && quads.length > 0) {
+      if (shouldAutoFinalize) {
         await agent.assertion.write(contextGraphId, name, quads, { subGraphName });
         result.written = quads.length;
-        const seal = await agent.assertion.finalize(contextGraphId, name, {
-          subGraphName,
-          authorAgentAddress,
-          preSignedAuthorAttestation,
-          schemeVersion,
-        });
+        const seal = await agent.assertion.finalize(contextGraphId, name, finalizeOptions);
         result.merkleRoot = hex(seal.merkleRoot);
         result.status = "wm-sealed";
       }
@@ -152,12 +201,9 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
         return jsonResponse(res, 200, { written: parsed.quads.length });
       }
       if (verb === "finalize") {
-        const seal = await agent.assertion.finalize(contextGraphId, name, {
-          subGraphName,
-          authorAgentAddress: parsed.authorAgentAddress,
-          preSignedAuthorAttestation: parsed.preSignedAuthorAttestation,
-          schemeVersion: parsed.schemeVersion,
-        });
+        const finalizeOptions = resolveFinalizeOptions(parsed, res);
+        if (finalizeOptions === null) return;
+        const seal = await agent.assertion.finalize(contextGraphId, name, finalizeOptions);
         return jsonResponse(res, 200, { merkleRoot: hex(seal.merkleRoot), eip712Digest: seal.eip712Digest });
       }
       if (verb === "discard") {

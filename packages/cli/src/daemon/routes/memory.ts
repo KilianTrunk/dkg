@@ -59,7 +59,7 @@ const execFileAsync = promisify(execFile);
 import { enrichEvmError, MockChainAdapter } from '@origintrail-official/dkg-chain';
 import { DKGAgent, loadOpWallets } from '@origintrail-official/dkg-agent';
 import { computeNetworkId, createOperationContext, DKGEvent, Logger, PayloadTooLargeError, GET_VIEWS, TrustLevel, validateSubGraphName, validateAssertionName, validateContextGraphId, isSafeIri, assertSafeIri, assertSafeRdfTerm, sparqlIri, contextGraphSharedMemoryUri, contextGraphAssertionUri, contextGraphMetaUri, escapeDkgRdfLiteral, escapeSparqlLiteral } from '@origintrail-official/dkg-core';
-import { autoPartition, findReservedSubjectPrefix, isSkolemizedUri, type PublishOptions, type PublishResult } from '@origintrail-official/dkg-publisher';
+import { skolemizeByEntity, findReservedSubjectPrefix, isSkolemizedUri, type PublishOptions, type PublishResult } from '@origintrail-official/dkg-publisher';
 import type { Quad } from '@origintrail-official/dkg-storage';
 import {
   DashboardDB,
@@ -410,7 +410,7 @@ async function resolvePublishRootEntities(
   const quads: Quad[] = result.type === "quads"
     ? result.quads.filter((quad) => quad.predicate !== WORKSPACE_OWNER_PREDICATE)
     : [];
-  return [...autoPartition(quads).keys()];
+  return [...skolemizeByEntity(quads).keys()];
 }
 
 function publishResponsePayload(

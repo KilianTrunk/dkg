@@ -271,7 +271,7 @@ export interface PublishOptions {
    * The caller has already:
    *   1. Computed `expectedMerkleRoot` over the same quads it is
    *      now asking the publisher to publish (computed via
-   *      `computeFlatKCRoot` / `autoPartition` semantics).
+   *      `computeFlatKCRoot` / `skolemizeByEntity` semantics).
    *   2. Signed (or collected a signature for) the typed data
    *      `buildAuthorAttestationTypedData({ chainId, kav10Address,
    *      contextGraphId, merkleRoot: expectedMerkleRoot,
@@ -336,6 +336,8 @@ export interface PublishResult {
 export interface Publisher {
   publish(options: PublishOptions): Promise<PublishResult>;
   update(kaId: bigint, options: PublishOptions): Promise<PublishResult>;
+  skolemizeByEntity(quads: Quad[]): KAManifestEntry[];
+  /** @deprecated Use skolemizeByEntity. */
   autoPartition(quads: Quad[]): KAManifestEntry[];
   skolemize(rootEntity: string, quads: Quad[]): Quad[];
 }

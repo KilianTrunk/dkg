@@ -297,6 +297,11 @@ describe('UI API tests', () => {
       expect(body.clearAfter).toBe(false);
     });
 
+    it('publishSharedMemory keeps the UI-side single-root guard', async () => {
+      expect(() => publishSharedMemory('cg-1', ['urn:root:a', 'urn:root:b'])).toThrow(/exactly one root entity/i);
+      expect(requestLog.some(r => r.url.includes('/api/shared-memory/publish'))).toBe(false);
+    });
+
     it('listSwmEntities queries the shared-working-memory view', async () => {
       await listSwmEntities('cg-1');
       const call = requestLog.find(r => r.method === 'POST' && r.url.includes('/api/query'));

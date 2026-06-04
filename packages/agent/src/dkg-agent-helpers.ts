@@ -21,7 +21,7 @@
 import { ethers } from 'ethers';
 import { join } from 'node:path';
 import {
-  autoPartition,
+  skolemizeByEntity,
   FileWorkspacePublicSnapshotStore,
   type LiftRequestAuthorSeal,
   type SharedMemoryPublicSnapshotStorageConfig,
@@ -79,9 +79,9 @@ export function partitionPublishAsyncQuads(publicQuads: Quad[], privateQuads: Qu
   privateQuadsByRoot: Map<string, Quad[]>;
   roots: string[];
 } {
-  const privateByRoot = autoPartition(privateQuads);
+  const privateByRoot = skolemizeByEntity(privateQuads);
   let stagedPublicQuads = [...publicQuads];
-  let publicByRoot = autoPartition(stagedPublicQuads);
+  let publicByRoot = skolemizeByEntity(stagedPublicQuads);
 
   for (const rootEntity of privateByRoot.keys()) {
     if (!publicByRoot.has(rootEntity)) {
@@ -94,7 +94,7 @@ export function partitionPublishAsyncQuads(publicQuads: Quad[], privateQuads: Qu
     }
   }
 
-  publicByRoot = autoPartition(stagedPublicQuads);
+  publicByRoot = skolemizeByEntity(stagedPublicQuads);
   const roots = [...publicByRoot.keys()];
   if (roots.length === 0) {
     throw new InvalidContentError('Content produced no publishable root entities');

@@ -794,21 +794,37 @@ export class StorageACKHandler {
         throw new Error('stagingQuads present but contained no parseable N-Quads');
       }
 
-      // Validate kaCount matches the number of declared root entities.
-      // Exclude skolemized blank node children (/.well-known/genid/) from the count
-      // since those are internal sub-nodes of a single KA, not separate entities.
+      // OT-RFC-44 / Design B: a publish is exactly ONE Knowledge Asset whose
+      // member entities are the root subjects (any count). `kaCount` is the KA
+      // count (must be 1) — NOT the entity count. The pre-Design-B check
+      // `rootSubjects.size === intent.kaCount` conflated the two and made a
+      // receiving node REFUSE to ACK any multi-entity KA (the silent cross-node
+      // failure in OT-RFC-43 §2.7 / the §11.2 canary). Under Design B we assert
+      // only the KA-count invariant here; data integrity (that these quads are
+      // exactly what the publisher committed to) is guaranteed by the Merkle
+      // check below, not by counting subjects.
+      //
+      // We deliberately do NOT require a count bijection between `rootEntities`
+      // and the payload's root subjects. `rootEntities` is a *selection*, not a
+      // complete enumeration: in the SWM-fallback branch it is the entity filter
+      // passed to `loadSWMQuads`, so a caller may legitimately declare a subset
+      // of the subjects present. The per-entity presence loop below still pins
+      // the one direction that matters for a receiver — every entity the caller
+      // names must actually be in the payload (declared ⊆ actual).
       const uniqueSubjects = new Set(parsed.map(q => q.subject));
       const rootSubjects = new Set(
         [...uniqueSubjects].filter(s => !s.includes('/.well-known/genid/')),
       );
-      if (intent.kaCount > 0 && rootSubjects.size !== intent.kaCount) {
+      if (intent.kaCount !== 1) {
         throw new Error(
-          `kaCount mismatch: intent claims ${intent.kaCount} KAs but staging quads have ` +
-          `${rootSubjects.size} root entities (${uniqueSubjects.size} total subjects)`,
+          `Design B: a publish must declare exactly one Knowledge Asset (kaCount=1); got ${intent.kaCount}`,
         );
       }
 
-      // Validate rootEntities match actual root subjects in the payload
+      // Validate that every declared rootEntity is actually present in the
+      // payload (declared ⊆ actual). Skolemized blank-node children
+      // (/.well-known/genid/) are excluded from `rootSubjects` above — they are
+      // internal sub-nodes of a single entity, not separate root entities.
       if (intent.rootEntities && intent.rootEntities.length > 0) {
         for (const entity of intent.rootEntities) {
           if (!rootSubjects.has(entity)) {
@@ -874,14 +890,18 @@ export class StorageACKHandler {
       }
     }
 
-    // Recompute kaCount from verified quads. publicByteSize uses the claimed
-    // value because N-Quad serialization may differ between publisher and
-    // handler (different graph URIs). The merkle root already proves data
-    // integrity, so byte-size manipulation cannot change the actual content.
-    const verifiedRootSubjects = new Set(
-      swmQuads.map(q => q.subject).filter(s => !s.includes('/.well-known/genid/')),
-    );
-    const verifiedKACount = verifiedRootSubjects.size;
+    // OT-RFC-44 / Design B: a publish is exactly ONE Knowledge Asset whose
+    // member entities are the root subjects (any count). The KA count signed
+    // into the ACK digest is therefore ALWAYS 1 — it must match what the
+    // publisher submits on chain (`knowledgeAssetsAmount`, which the contract
+    // requires to be 1) and the digest the publisher/ACK-collector compute.
+    // Pre-Design-B this recomputed kaCount = rootSubjects.size (the ENTITY
+    // count); for a multi-entity KA that made the receiver sign a digest with
+    // kaCount=N while the publisher and contract used kaCount=1, so no ACK
+    // could ever validate — the silent cross-node failure in OT-RFC-43 §2.7.
+    // The data integrity that recompute was protecting is already guaranteed
+    // by the merkle-root check above (computeFlatKCRoot over the SWM quads).
+    const verifiedKACount = 1;
     const verifiedByteSize = typeof intent.publicByteSize === 'number'
       ? BigInt(intent.publicByteSize)
       : BigInt(Number(intent.publicByteSize));

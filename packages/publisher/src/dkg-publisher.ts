@@ -2,10 +2,10 @@ import type { Quad, TripleStore } from '@origintrail-official/dkg-storage';
 import type { ChainAdapter, OnChainPublishResult, AddBatchToContextGraphParams } from '@origintrail-official/dkg-chain';
 import { enrichEvmError } from '@origintrail-official/dkg-chain';
 import type { EventBus, OperationContext } from '@origintrail-official/dkg-core';
-import { DKGEvent, Logger, createOperationContext, sha256, encodeWorkspacePublishRequest, encodeEncryptedWorkspacePayload, encryptWorkspacePayload, contextGraphDataUri, contextGraphDataGraphUri, contextGraphMetaUri, contextGraphAssertionUri, assertionLifecycleUri, contextGraphSubGraphUri, contextGraphSubGraphMetaUri, SYSTEM_CONTEXT_GRAPHS, validateSubGraphName, isSafeIri, assertSafeIri, assertSafeRdfTerm, DKG_GOSSIP_MAX_MESSAGE_BYTES, type Ed25519Keypair, buildAuthorAttestationTypedData, buildUpdateAuthorAttestationTypedData, AUTHOR_SCHEME_VERSION_V1, TrustLevel, TRUST_LEVEL_PREDICATE, assertNoUserAuthoredTrustLevelQuads, buildTrustLevelQuads, isTrustLevelQuad } from '@origintrail-official/dkg-core';
+import { DKGEvent, Logger, createOperationContext, sha256, encodeWorkspacePublishRequest, encodeEncryptedWorkspacePayload, encryptWorkspacePayload, contextGraphDataUri, contextGraphDataGraphUri, contextGraphMetaUri, contextGraphAssertionUri, assertionLifecycleUri, contextGraphSubGraphUri, contextGraphSubGraphMetaUri, SYSTEM_CONTEXT_GRAPHS, validateSubGraphName, isSafeIri, assertSafeIri, assertSafeRdfTerm, DKG_GOSSIP_MAX_MESSAGE_BYTES, type Ed25519Keypair, buildAuthorAttestationTypedData, buildUpdateAuthorAttestationTypedData, AUTHOR_SCHEME_VERSION_V1, TrustLevel, TRUST_LEVEL_PREDICATE, assertNoUserAuthoredTrustLevelQuads, buildTrustLevelQuads, isTrustLevelQuad, DKG_ENTITY, DKG_ROOT_ENTITY_LEGACY, ENTITY_PRED_ALT } from '@origintrail-official/dkg-core';
 import { GraphManager, PrivateContentStore } from '@origintrail-official/dkg-storage';
 import { DEFAULT_PUBLISH_EPOCHS, MAX_PUBLISH_EPOCHS, type Publisher, type PublishOptions, type PublishResult, type KAManifestEntry, type PhaseCallback, type V10CoreNodeACK } from './publisher.js';
-import { autoPartition } from './auto-partition.js';
+import { skolemizeByEntity } from './auto-partition.js';
 import { canonicalPublishPayload } from './canonical-publish-payload.js';
 import { RESERVED_SUBJECT_PREFIXES, findReservedSubjectPrefix, isReservedSubject } from './reserved-subjects.js';
 import { skolemize } from './skolemize.js';
@@ -799,7 +799,7 @@ export class DKGPublisher implements Publisher {
 
     await this.graphManager.ensureContextGraph(contextGraphId);
 
-    const kaMap = autoPartition(quads);
+    const kaMap = skolemizeByEntity(quads);
     const manifestEntries: { rootEntity: string; privateMerkleRoot?: Uint8Array; privateTripleCount: number }[] = [];
     for (const [rootEntity, publicQuads] of kaMap) {
       const privRoot = undefined;
@@ -1219,10 +1219,11 @@ export class DKGPublisher implements Publisher {
     if (quads.length === 0) {
       throw new Error(`No quads in shared memory for context graph ${contextGraphId} matching selection`);
     }
-    const rootEntities = [...autoPartition(quads).keys()];
-    if (rootEntities.length > 1) {
-      throw new MultiRootPublishNotAtomicError(contextGraphId, rootEntities);
-    }
+    // OT-RFC-44 / Design B: once the caller has selected one lifecycle/file,
+    // that payload may contain N root entities and still publish as ONE KA in a
+    // single transaction. Higher-level selection endpoints keep their
+    // unrelated-root guard until they can identify that one lifecycle boundary.
+    const rootEntities = [...skolemizeByEntity(quads).keys()];
 
     const ctxGraphId = options?.publishContextGraphId;
     const chainCgId = options?.onChainContextGraphId ?? ctxGraphId;
@@ -1446,7 +1447,7 @@ export class DKGPublisher implements Publisher {
     if (publishResult.status === 'confirmed') {
       const swmMetaGraph = this.graphManager.sharedMemoryMetaUri(contextGraphId, options?.subGraphName);
       const swmOwnershipKey = options?.subGraphName ? `${contextGraphId}\0${options.subGraphName}` : contextGraphId;
-      const kaMap = autoPartition(quads);
+      const kaMap = skolemizeByEntity(quads);
       let ownerDeletedTotal = 0;
       for (const rootEntity of kaMap.keys()) {
         await this.store.deleteByPattern({ graph: swmGraph, subject: rootEntity });
@@ -1728,10 +1729,15 @@ export class DKGPublisher implements Publisher {
     const kaMetadata: KAMetadata[] = [];
 
     onPhase?.('prepare:manifest', 'start');
-    let tokenCounter = 1n;
+    // OT-RFC-44 / Design B: one file/lifecycle = ONE Knowledge Asset, however
+    // many entities it contains. The on-chain KA count and ACK digest stay at
+    // one below, while these token IDs remain compatibility labels for
+    // per-root response/meta subjects (`<ual>/1`, `<ual>/2`, ...).
+    let compatibilityTokenId = 1n;
     for (const entry of canonical.manifestEntries) {
+      const tokenId = compatibilityTokenId++;
       manifestEntries.push({
-        tokenId: tokenCounter,
+        tokenId,
         rootEntity: entry.rootEntity,
         privateMerkleRoot: entry.privateMerkleRoot,
         privateTripleCount: entry.privateTripleCount,
@@ -1740,13 +1746,11 @@ export class DKGPublisher implements Publisher {
       kaMetadata.push({
         rootEntity: entry.rootEntity,
         kcUal: '',
-        tokenId: tokenCounter,
+        tokenId,
         publicTripleCount: entry.publicTripleCount,
         privateTripleCount: entry.privateTripleCount,
         privateMerkleRoot: entry.privateMerkleRoot,
       });
-
-      tokenCounter++;
     }
 
     const allSkolemizedQuads = canonical.skolemizedPublicQuads;
@@ -1769,12 +1773,18 @@ export class DKGPublisher implements Publisher {
       throw new Error(`V10 merkleLeafCount exceeds uint32: ${kcMerkleLeafCount}`);
     }
     this.log.info(ctx, `Computed kcMerkleRoot (flat) over ${allSkolemizedQuads.length} triple hashes + ${privateRoots.length} private root(s), leafCount=${kcMerkleLeafCount}`);
-    const kaCount = manifestEntries.length;
-    if (chainV10Ready && kaCount !== 1) {
-      throw new Error(
-        `V10 greenfield publish requires exactly one Knowledge Asset per transaction (got ${kaCount})`,
-      );
+    // Design B: a publish mints exactly ONE KA regardless of entity count.
+    // `entityCount` is informational; `kaCount` is what goes on chain as
+    // `knowledgeAssetsAmount` (the contract requires == 1) and into the ACK
+    // digest. The old `kaCount = manifestEntries.length` + `kaCount !== 1`
+    // guard conflated entity count with KA count and blocked multi-entity
+    // files; that conflation is the bug OT-RFC-44 removes.
+    const entityCount = manifestEntries.length;
+    const kaCount = 1;
+    if (entityCount < 1) {
+      throw new Error('V10 publish requires at least one entity');
     }
+    this.log.info(ctx, `Design B: publishing 1 KA with ${entityCount} member entit${entityCount === 1 ? 'y' : 'ies'}`);
     onPhase?.('prepare:merkle', 'end');
 
     onPhase?.('prepare', 'end');
@@ -2582,7 +2592,6 @@ export class DKGPublisher implements Publisher {
 
         for (const km of kaMetadata) {
           km.kcUal = ual;
-          km.tokenId = kaId;
         }
         let confirmedQuads = generateConfirmedFullMetadata(
           {
@@ -2792,7 +2801,7 @@ export class DKGPublisher implements Publisher {
 
     onPhase?.('prepare', 'start');
     onPhase?.('prepare:partition', 'start');
-    const kaMap = autoPartition(quads);
+    const kaMap = skolemizeByEntity(quads);
     onPhase?.('prepare:partition', 'end');
 
     onPhase?.('prepare:manifest', 'start');
@@ -3252,13 +3261,21 @@ export class DKGPublisher implements Publisher {
     return this.publisherNodeIdentityId;
   }
 
-  autoPartition(quads: Quad[]): KAManifestEntry[] {
-    const kaMap = autoPartition(quads);
+  skolemizeByEntity(quads: Quad[]): KAManifestEntry[] {
+    const kaMap = skolemizeByEntity(quads);
     let tokenId = 1n;
     return [...kaMap.keys()].map((rootEntity) => ({
       tokenId: tokenId++,
       rootEntity,
     }));
+  }
+
+  /**
+   * @deprecated Use {@link skolemizeByEntity}. Kept as a one-release
+   * compatibility alias for callers that use the public instance method.
+   */
+  autoPartition(quads: Quad[]): KAManifestEntry[] {
+    return this.skolemizeByEntity(quads);
   }
 
   skolemize(rootEntity: string, quads: Quad[]): Quad[] {
@@ -3843,21 +3860,21 @@ export class DKGPublisher implements Publisher {
   }
 
   private async deleteMetaForRoot(metaGraph: string, rootEntity: string): Promise<void> {
-    const DKG = 'http://dkg.io/ontology/';
     const result = await this.store.query(
-      `SELECT ?op WHERE { GRAPH <${metaGraph}> { ?op <${DKG}rootEntity> <${rootEntity}> } }`,
+      `SELECT DISTINCT ?op WHERE { GRAPH <${metaGraph}> { ?op ${ENTITY_PRED_ALT} <${rootEntity}> } }`,
     );
     if (result.type !== 'bindings') return;
     for (const row of result.bindings) {
       const op = row['op'];
       if (!op) continue;
 
-      await this.store.delete([{
-        subject: op, predicate: `${DKG}rootEntity`, object: rootEntity, graph: metaGraph,
-      }]);
+      await this.store.delete([
+        { subject: op, predicate: DKG_ROOT_ENTITY_LEGACY, object: rootEntity, graph: metaGraph },
+        { subject: op, predicate: DKG_ENTITY, object: rootEntity, graph: metaGraph },
+      ]);
 
       const remaining = await this.store.query(
-        `SELECT (COUNT(*) AS ?c) WHERE { GRAPH <${metaGraph}> { <${op}> <${DKG}rootEntity> ?r } }`,
+        `SELECT (COUNT(DISTINCT ?r) AS ?c) WHERE { GRAPH <${metaGraph}> { <${op}> ${ENTITY_PRED_ALT} ?r } }`,
       );
       const rawCount = remaining.type === 'bindings' && remaining.bindings[0]?.['c'];
       const countVal = parseCountLiteral(rawCount);
@@ -4130,7 +4147,7 @@ export class DKGPublisher implements Publisher {
     // §10.2 linkage table) and the `<urn:dkg:extraction:<uuid>>`
     // ExtractionProvenance block (rows 9-13) are subordinate metadata
     // about the extraction RUN, not semantic knowledge about an Entity.
-    // Without this filter, `autoPartition` below would treat
+    // Without this filter, `skolemizeByEntity` below would treat
     // `<urn:dkg:file:keccak256:abc>` as a root entity and cross-assertion
     // ownership would contend when two different assertions reference
     // the same file content (same keccak256 → same URN → same
@@ -4152,7 +4169,7 @@ export class DKGPublisher implements Publisher {
     //
     // See `19_MARKDOWN_CONTENT_TYPE.md §10.2` for the normative rule
     // and Codex Bug 8 Round 4 reconciled ruling for the history (Round
-    // 3 tried blank-node subjects but an `autoPartition` audit showed
+    // 3 tried blank-node subjects but an `skolemizeByEntity` audit showed
     // they silently drop rows 9-13 on promote, which was worse).
     // Round 12 Bug 35: source the prefix list from `RESERVED_SUBJECT_PREFIXES`
     // instead of hardcoding the two literals inline. If the reserved
@@ -4187,7 +4204,7 @@ export class DKGPublisher implements Publisher {
     const operationId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 
     // Skolemize blank nodes so local SWM and gossip peers store identical data.
-    const kaMap = autoPartition(quadsToPromote);
+    const kaMap = skolemizeByEntity(quadsToPromote);
     if (kaMap.size === 0) {
       throw new Error(
         'Cannot promote assertion: no root entities found. ' +

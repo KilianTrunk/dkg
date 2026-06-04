@@ -102,7 +102,7 @@ import {
   ACKCollector, StorageACKHandler,
   VerifyCollector, VerifyProposalHandler, buildVerificationMetadata,
   resolveWorkspaceAgentRecipients,
-  computeTripleHashV10 as computeTripleHash, computeFlatKCRootV10 as computeFlatKCRoot, autoPartition, isReservedSubject, computePrivateRootV10 as computePrivateRoot,
+  computeTripleHashV10 as computeTripleHash, computeFlatKCRootV10 as computeFlatKCRoot, skolemizeByEntity, isReservedSubject, computePrivateRootV10 as computePrivateRoot,
   canonicalPublishPayload,
   resolveLiftWorkspaceSlice,
   validateLiftPublishPayload,
@@ -1521,7 +1521,7 @@ export class PublishMethods extends DKGAgentBase {
     //    `buildAssertionSealQuads` rejects unsafe roots at the seal
     //    boundary. This guard surfaces the same failure earlier
     //    with a more actionable message.
-    const kaMap = autoPartition(quads);
+    const kaMap = skolemizeByEntity(quads);
     const allRootEntities = [...kaMap.keys()];
     const unsafeRootEntities = allRootEntities.filter((r) => !isSafeIri(r));
     if (unsafeRootEntities.length > 0) {
@@ -1541,7 +1541,7 @@ export class PublishMethods extends DKGAgentBase {
     }
     const allSkolemizedQuads = [...kaMap.values()].flat();
     const merkleRoot = computeFlatKCRoot(allSkolemizedQuads, []);
-    // 3b. Capture rootEntities from the SAME `autoPartition` call that
+    // 3b. Capture rootEntities from the SAME `skolemizeByEntity` call that
     //     drives the merkle leaves. The seal binds these so
     //     `publishFromFinalizedAssertion` can scope its SWM CONSTRUCT
     //     instead of bundling everything currently sitting in shared
@@ -1550,7 +1550,7 @@ export class PublishMethods extends DKGAgentBase {
     const rootEntities = allRootEntities;
     if (rootEntities.length === 0) {
       throw new Error(
-        `Cannot finalize assertion <${assertionUri}>: autoPartition produced ` +
+        `Cannot finalize assertion <${assertionUri}>: skolemizeByEntity produced ` +
           `no root entities. The assertion has no quads; add at least one ` +
           `user-authored quad on a non-reserved subject before finalizing.`,
       );
@@ -1865,7 +1865,7 @@ export class PublishMethods extends DKGAgentBase {
       );
     }
 
-    const kaMap = autoPartition(quads);
+    const kaMap = skolemizeByEntity(quads);
     const allSkolemizedQuads = [...kaMap.values()].flat();
     // Mirror the publisher's per-rootEntity private partition + root
     // derivation (see `dkg-publisher.ts:1526-1570`). Each public root
@@ -2505,7 +2505,7 @@ export class PublishMethods extends DKGAgentBase {
     //    in shared memory into the same KC; the publisher's recompute
     //    would then disagree with the seal's `expectedMerkleRoot` and
     //    flip to `tentative kaId: "0"`. The seal's rootEntities were
-    //    captured at finalize time from the same `autoPartition` call
+    //    captured at finalize time from the same `skolemizeByEntity` call
     //    that drove the merkle leaves, so this selection deterministically
     //    yields the post-promote SWM slice the seal commits to.
     const result = await this.publishFromSharedMemory(

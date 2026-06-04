@@ -99,17 +99,23 @@ export function LayerStatsWidget({ entities, entityCount, triples, layer }: {
   );
 }
 
-function requireSinglePublishRoot(roots: string[]): string[] {
+// Selection-based SWM publish is still single-root at the UI/daemon route.
+// Multi-root file lifecycles publish through finalized assertion/file paths
+// where the daemon can identify one lifecycle/assertion boundary.
+function collectPublishRoots(roots: string[]): string[] {
   const uniqueRoots = [...new Set(roots.filter(Boolean))];
-  if (uniqueRoots.length !== 1) {
-    throw new Error('V10 publish requires exactly one root entity per request. Select one root and publish again.');
+  if (uniqueRoots.length < 1) {
+    throw new Error('Publish requires one root entity. Select a root and publish again.');
+  }
+  if (uniqueRoots.length > 1) {
+    throw new Error('Shared-memory publish currently requires exactly one root entity.');
   }
   return uniqueRoots;
 }
 
-async function fetchSingleSwmRoot(contextGraphId: string): Promise<string[]> {
+export async function fetchSwmPublishRoots(contextGraphId: string): Promise<string[]> {
   const roots = (await listSwmEntities(contextGraphId)).map((entity) => entity.uri);
-  return requireSinglePublishRoot(roots);
+  return collectPublishRoots(roots);
 }
 
 export function LayerActionsWidget({ layer, count, contextGraphId, entities, onComplete }: {
@@ -155,7 +161,7 @@ export function LayerActionsWidget({ layer, count, contextGraphId, entities, onC
           setResult('No triples were promoted — every assertion was already in Shared Memory or its content is still being committed.');
         }
       } else {
-        const roots = requireSinglePublishRoot(entities.map((entity) => entity.uri));
+        const roots = collectPublishRoots(entities.map((entity) => entity.uri));
         await publishSharedMemory(contextGraphId, roots);
         setResult('Published to Verifiable Memory');
       }
@@ -239,4 +245,3 @@ export function LayerWidgetStrip({ layer, entities, entityCount, tripleCount, co
     </div>
   );
 }
-

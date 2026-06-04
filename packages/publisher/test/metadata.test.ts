@@ -122,6 +122,48 @@ describe('generateKCMetadata', () => {
     expect(kaSubjects.size).toBe(2);
   });
 
+  it('Design B compatibility: one on-chain KA keeps per-root metadata rows', () => {
+    // One file = one on-chain KA, however many entities. Until update/private
+    // access aggregate multi-root KA metadata directly, label metadata remains
+    // one row per root at <UAL>/1, <UAL>/2, ... .
+    const kas = [
+      makeKA({ tokenId: 1n, rootEntity: 'did:dkg:entity:alice', publicTripleCount: 5 }),
+      makeKA({ tokenId: 2n, rootEntity: 'did:dkg:entity:bob', publicTripleCount: 3 }),
+      makeKA({ tokenId: 3n, rootEntity: 'did:dkg:entity:carol', publicTripleCount: 2 }),
+    ];
+    const quads = generateKCMetadata(makeMeta({ kaCount: 1 }), kas);
+    const kaSubjects = new Set(
+      quads.filter(q => q.predicate === RDF_TYPE && q.object === `${DKG}KnowledgeAsset`).map(q => q.subject),
+    );
+    expect(kaSubjects).toEqual(new Set([`${UAL}/1`, `${UAL}/2`, `${UAL}/3`]));
+
+    expect(quads.find(q => q.subject === `${UAL}/1` && q.predicate === `${DKG}rootEntity`)?.object)
+      .toBe('did:dkg:entity:alice');
+    expect(quads.find(q => q.subject === `${UAL}/2` && q.predicate === `${DKG}rootEntity`)?.object)
+      .toBe('did:dkg:entity:bob');
+    expect(quads.find(q => q.subject === `${UAL}/3` && q.predicate === `${DKG}rootEntity`)?.object)
+      .toBe('did:dkg:entity:carol');
+
+    const publicCounts = quads
+      .filter(q => q.predicate === `${DKG}publicTripleCount`)
+      .map(q => [q.subject, q.object]);
+    expect(publicCounts).toEqual([
+      [`${UAL}/1`, '"5"^^<http://www.w3.org/2001/XMLSchema#integer>'],
+      [`${UAL}/2`, '"3"^^<http://www.w3.org/2001/XMLSchema#integer>'],
+      [`${UAL}/3`, '"2"^^<http://www.w3.org/2001/XMLSchema#integer>'],
+    ]);
+
+    // OT-RFC-43 §10.1 dual-write: each per-root label ALSO carries the new
+    // dkg:entity predicate alongside the legacy dkg:rootEntity (readers still
+    // resolve via the legacy name until the reader migration lands).
+    expect(quads.find(q => q.subject === `${UAL}/1` && q.predicate === `${DKG}entity`)?.object)
+      .toBe('did:dkg:entity:alice');
+    expect(quads.find(q => q.subject === `${UAL}/2` && q.predicate === `${DKG}entity`)?.object)
+      .toBe('did:dkg:entity:bob');
+    expect(quads.find(q => q.subject === `${UAL}/3` && q.predicate === `${DKG}entity`)?.object)
+      .toBe('did:dkg:entity:carol');
+  });
+
   it('GH #748 fallback: attribution is the peer-ID literal when neither agentAddress nor authorAddress is supplied', () => {
     const quads = generateKCMetadata(makeMeta(), [makeKA()]);
     const attribution = quads.find(q => q.subject === UAL && q.predicate === `${PROV}wasAttributedTo`);

@@ -1266,10 +1266,15 @@ export interface PublishResult {
   blockNumber?: number;
 }
 
-/** Publish exactly one SWM root on-chain (SWM -> VM). */
+/**
+ * Publish one SWM root on-chain (SWM -> VM).
+ * Selection-based shared-memory publish is not atomic across independent roots
+ * yet, so the UI keeps the single-root guard until the daemon can identify one
+ * lifecycle/assertion for a multi-root request.
+ */
 export const publishSharedMemory = (contextGraphId: string, rootEntities: string[]) => {
   if (rootEntities.length !== 1) {
-    throw new Error('V10 publish requires exactly one root entity per request.');
+    throw new Error('Shared-memory publish currently requires exactly one root entity.');
   }
   return post<PublishResult>('/api/shared-memory/publish', {
     contextGraphId,

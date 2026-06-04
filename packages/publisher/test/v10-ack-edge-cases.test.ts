@@ -99,7 +99,10 @@ async function signACK(
   wallet: ethers.Wallet,
   contextGraphId: bigint,
   merkleRoot: Uint8Array,
-  kaCount: number = 2,
+  // Design B (OT-RFC-44): a publish is exactly ONE Knowledge Asset (kaCount=1)
+  // whose member entities are the root subjects (any count). The receiver signs
+  // verifiedKACount=1 into the ACK digest, so a valid ACK is always over 1.
+  kaCount: number = 1,
   byteSize: bigint = 500n,
   epochs: bigint = 1n,
   tokenAmount: bigint = 0n,
@@ -134,7 +137,7 @@ function buildCollectParams(overrides: Partial<Parameters<ACKCollector['collect'
     publisherPeerId: 'publisher-0',
     publicByteSize: 500n,
     isPrivate: false,
-    kaCount: 2,
+    kaCount: 1, // Design B: one KA, two member entities (urn:a, urn:b)
     rootEntities: ['urn:a', 'urn:b'],
     chainId: TEST_CHAIN_ID,
     kav10Address: TEST_KAV10_ADDR,
@@ -155,7 +158,7 @@ function buildSendP2P(opts: {
     const idx = parseInt(peerId.replace('peer-', ''), 10);
     const wallet = wallets[idx % wallets.length];
     const root = opts.merkleRootOverride ?? merkleRoot;
-    const { r, vs } = await signACK(wallet, testCGId, root, opts.kaCount ?? 2, opts.byteSize ?? 500n);
+    const { r, vs } = await signACK(wallet, testCGId, root, opts.kaCount ?? 1, opts.byteSize ?? 500n);
     const identityId = opts.identityMap?.[peerId] ?? (idx + 1);
     return encodeStorageACK({
       merkleRoot: root,
@@ -409,7 +412,7 @@ describe('ACKCollector deduplication', () => {
         callCounts.set(peerId, count);
         const idx = parseInt(peerId.replace('peer-', ''), 10);
         const wallet = coreWallets[idx];
-        const { r, vs } = await signACK(wallet, testCGId, merkleRoot, 2, 500n);
+        const { r, vs } = await signACK(wallet, testCGId, merkleRoot, 1, 500n);
         return encodeStorageACK({
           merkleRoot,
           coreNodeSignatureR: r,
@@ -489,7 +492,7 @@ describe('ACKCollector retry behavior', () => {
         }
         const idx = parseInt(peerId.replace('peer-', ''), 10);
         const wallet = coreWallets[idx];
-        const { r, vs } = await signACK(wallet, testCGId, merkleRoot, 2, 500n);
+        const { r, vs } = await signACK(wallet, testCGId, merkleRoot, 1, 500n);
         return encodeStorageACK({
           merkleRoot,
           coreNodeSignatureR: r,
@@ -519,7 +522,7 @@ describe('ACKCollector retry behavior', () => {
         if (failPeers.has(peerId)) throw new Error('unreachable');
         const idx = parseInt(peerId.replace('peer-', ''), 10);
         const wallet = coreWallets[idx];
-        const { r, vs } = await signACK(wallet, testCGId, merkleRoot, 2, 500n);
+        const { r, vs } = await signACK(wallet, testCGId, merkleRoot, 1, 500n);
         return encodeStorageACK({
           merkleRoot,
           coreNodeSignatureR: r,
@@ -607,7 +610,7 @@ describe('StorageACKHandler inline verification', () => {
       publisherPeerId: 'pub-0',
       publicByteSize: stagingBytes.length,
       isPrivate: false,
-      kaCount: 2,
+      kaCount: 1,
       merkleLeafCount: testMerkleLeafCount,
       rootEntities: ['urn:a', 'urn:b'],
       stagingQuads: stagingBytes,
@@ -633,7 +636,7 @@ describe('StorageACKHandler inline verification', () => {
       publisherPeerId: 'pub-0',
       publicByteSize: stagingBytes.length,
       isPrivate: false,
-      kaCount: 2,
+      kaCount: 1,
       merkleLeafCount: testMerkleLeafCount,
       rootEntities: ['urn:a'],
       stagingQuads: stagingBytes,
@@ -658,7 +661,7 @@ describe('StorageACKHandler inline verification', () => {
       publisherPeerId: 'pub-0',
       publicByteSize: 300,
       isPrivate: false,
-      kaCount: 2,
+      kaCount: 1,
       merkleLeafCount: testMerkleLeafCount,
       rootEntities: [],
     });
@@ -776,7 +779,7 @@ describe('StorageACKHandler inline verification', () => {
       publisherPeerId: 'pub-0',
       publicByteSize: 300,
       isPrivate: false,
-      kaCount: 2,
+      kaCount: 1,
       merkleLeafCount: testMerkleLeafCount,
       rootEntities: [],
       stagingQuads: new TextEncoder().encode(quadsToNQuads(testQuads)),
@@ -797,7 +800,7 @@ describe('StorageACKHandler inline verification', () => {
       publisherPeerId: 'pub-0',
       publicByteSize: 300,
       isPrivate: false,
-      kaCount: 2,
+      kaCount: 1,
       merkleLeafCount: testMerkleLeafCount,
       rootEntities: [],
       stagingQuads: new TextEncoder().encode(quadsToNQuads(testQuads)),
@@ -826,7 +829,7 @@ describe('StorageACKHandler inline verification', () => {
       publisherPeerId: 'pub-0',
       publicByteSize: 300,
       isPrivate: false,
-      kaCount: 2,
+      kaCount: 1,
       merkleLeafCount: testMerkleLeafCount,
       rootEntities: [],
       stagingQuads: new TextEncoder().encode(quadsToNQuads(testQuads)),
@@ -1022,7 +1025,7 @@ describe('StorageACKHandler signature format', () => {
       publisherPeerId: 'pub-0',
       publicByteSize: 300,
       isPrivate: false,
-      kaCount: 2,
+      kaCount: 1,
       merkleLeafCount: testMerkleLeafCount,
       rootEntities: [],
     });
@@ -1035,7 +1038,7 @@ describe('StorageACKHandler signature format', () => {
       TEST_KAV10_ADDR,
       testCGId,
       merkleRoot,
-      2n,
+      1n,
       300n,
       1n,
       0n,
@@ -1069,7 +1072,7 @@ describe('StorageACKHandler signature format', () => {
       publisherPeerId: 'pub-0',
       publicByteSize: stagingBytes.length,
       isPrivate: false,
-      kaCount: 2,
+      kaCount: 1,
       merkleLeafCount: testMerkleLeafCount,
       rootEntities: ['urn:a'],
       stagingQuads: stagingBytes,
@@ -1083,7 +1086,7 @@ describe('StorageACKHandler signature format', () => {
       TEST_KAV10_ADDR,
       testCGId,
       merkleRoot,
-      2n,
+      1n,
       BigInt(stagingBytes.length),
       1n,
       0n,
@@ -1117,7 +1120,7 @@ describe('StorageACKHandler signature format', () => {
       publisherPeerId: 'pub-0',
       publicByteSize: 300,
       isPrivate: false,
-      kaCount: 2,
+      kaCount: 1,
       merkleLeafCount: testMerkleLeafCount,
       rootEntities: [],
     });

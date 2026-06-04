@@ -1,7 +1,7 @@
 export * from './publisher.js';
 export { skolemize, isBlankNode, isSkolemizedUri, rootEntityFromSkolemized } from './skolemize.js';
 export { RESERVED_SUBJECT_PREFIXES, findReservedSubjectPrefix, isReservedSubject } from './reserved-subjects.js';
-export { autoPartition } from './auto-partition.js';
+export { skolemizeByEntity, autoPartition } from './auto-partition.js';
 export {
   canonicalPublishPayload,
   type CanonicalPublishPayload,

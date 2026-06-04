@@ -360,15 +360,13 @@ describe('E2E: DKGAgent with real blockchain', () => {
   }, 60_000);
 
   // -------------------------------------------------------------------------
-  // Multi-entity publish — V10 greenfield rejects multi-root payloads.
-  // The legacy "publishes multiple entities and queries them individually"
-  // case is gone: V10 enforces 1 KA per tx (the publisher manifest guard at
-  // dkg-publisher.ts:`requires exactly one Knowledge Asset per transaction`).
-  // This regression test pins the guard so a regression that quietly
-  // re-enables multi-root publishes cannot slip through.
+  // Multi-entity publish — OT-RFC-44 / Design B.
+  // Direct agent.publish now routes multi-root payloads as one KA with multiple
+  // member entities. The on-chain publish still uses knowledgeAssetsAmount=1;
+  // the manifest keeps per-root compatibility token IDs for UAL suffix callers.
   // -------------------------------------------------------------------------
 
-  it('rejects multi-root publish through agent.publish (V10 1-KA-per-tx guard)', async () => {
+  it('publishes multi-root payloads through agent.publish as one Knowledge Asset', async () => {
     const entities = ['urn:agent-e2e:entity-A', 'urn:agent-e2e:entity-B', 'urn:agent-e2e:entity-C'];
     const quads = entities.flatMap((e) => [
       {
@@ -385,9 +383,12 @@ describe('E2E: DKGAgent with real blockchain', () => {
       },
     ]);
 
-    await expect(agents[0].publish(CONTEXT_GRAPH_ID, quads)).rejects.toThrow(
-      /exactly one Knowledge Asset per transaction \(got 3\)/,
-    );
+    const result = await agents[0].publish(CONTEXT_GRAPH_ID, quads);
+
+    expect(result.status).toBe('confirmed');
+    expect(result.onChainResult).toBeDefined();
+    expect(new Set(result.kaManifest.map((m) => m.rootEntity))).toEqual(new Set(entities));
+    expect(new Set(result.kaManifest.map((m) => String(m.tokenId)))).toEqual(new Set(['1', '2', '3']));
   }, 30_000);
 
   // -------------------------------------------------------------------------

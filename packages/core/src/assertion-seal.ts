@@ -49,13 +49,24 @@ export const ASSERTION_SEAL_PREDICATES = {
    * time so that `publishFromFinalizedAssertion` can scope the SWM
    * SPARQL CONSTRUCT to exactly this assertion's quads instead of
    * bundling everything currently in shared memory. The set is
-   * derived from `autoPartition(filteredQuads).keys()` over the same
+   * derived from `skolemizeByEntity(filteredQuads).keys()` over the same
    * reserved-subject-filtered quads `assertionPromote` writes, so the
    * post-promote SWM lookup produces the same merkle leaves the seal
    * was signed over. IRI literal — emitted as `<rootEntity>` (object
    * IRI), not a string literal.
    */
   ASSERTION_ROOT_ENTITY: `${ONT}assertionRootEntity`,
+  /**
+   * OT-RFC-43 §10.1 — the honestly-named successor to ASSERTION_ROOT_ENTITY
+   * (these hold graph entities, not Merkle roots). Dual-WRITTEN alongside the
+   * legacy predicate during the rename migration; readers continue to read the
+   * legacy name (always present) until a later release switches the dual-read
+   * and drops the legacy write. Adding this `_meta` quad does NOT affect the
+   * seal's integrity: the assertion merkle is over the DATA quads and the
+   * EIP-712 author attestation signs a fixed struct (merkleRoot, author, chain
+   * binding) — not the entity-list quads.
+   */
+  ASSERTION_ENTITY: `${ONT}assertionEntity`,
 } as const;
 
 /**
@@ -135,16 +146,27 @@ export function buildAssertionSealQuads(args: {
     graph: args.metaGraph,
   });
 
-  const rootEntityQuads = args.rootEntities.map((root) => {
+  // OT-RFC-43 §10.1 — dual-write the entity list under BOTH the legacy
+  // dkg:assertionRootEntity and the new dkg:assertionEntity so a mixed fleet
+  // (and the dual-read follow-up) resolves either name.
+  const rootEntityQuads = args.rootEntities.flatMap((root) => {
     if (UNSAFE_IRI_CHARS.test(root) || root.length === 0) {
       throw new Error(`Unsafe rootEntity literal: ${root}`);
     }
-    return {
-      subject: args.assertionUri,
-      predicate: ASSERTION_SEAL_PREDICATES.ASSERTION_ROOT_ENTITY,
-      object: `<${root}>`,
-      graph: args.metaGraph,
-    };
+    return [
+      {
+        subject: args.assertionUri,
+        predicate: ASSERTION_SEAL_PREDICATES.ASSERTION_ROOT_ENTITY,
+        object: `<${root}>`,
+        graph: args.metaGraph,
+      },
+      {
+        subject: args.assertionUri,
+        predicate: ASSERTION_SEAL_PREDICATES.ASSERTION_ENTITY,
+        object: `<${root}>`,
+        graph: args.metaGraph,
+      },
+    ];
   });
 
   return [

@@ -84,6 +84,21 @@ describe('assertion seal rootEntities round-trip', () => {
       .toThrow(/non-empty/);
   });
 
+  it('dual-writes each entity under BOTH assertionRootEntity and assertionEntity (OT-RFC-43 §10.1)', () => {
+    const roots = ['urn:dkg:doc:foo', 'urn:dkg:doc:bar'];
+    const quads = buildAssertionSealQuads(makeBaseArgs(roots));
+    const legacy = quads
+      .filter((q) => q.predicate === ASSERTION_SEAL_PREDICATES.ASSERTION_ROOT_ENTITY)
+      .map((q) => q.object);
+    const renamed = quads
+      .filter((q) => q.predicate === ASSERTION_SEAL_PREDICATES.ASSERTION_ENTITY)
+      .map((q) => q.object);
+    expect(new Set(legacy)).toEqual(new Set(['<urn:dkg:doc:foo>', '<urn:dkg:doc:bar>']));
+    expect(new Set(renamed)).toEqual(new Set(legacy)); // same entities, new honest predicate
+    // parse still resolves via the legacy predicate during the dual-write window
+    expect(parseAssertionSealQuads(quads, ASSERTION_URI)!.rootEntities).toEqual(roots);
+  });
+
   it('parsing a seal without rootEntities throws (corrupt _meta)', () => {
     const quads = buildAssertionSealQuads(makeBaseArgs(['urn:dkg:doc:foo']));
     const stripped = quads.filter(

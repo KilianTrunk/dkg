@@ -41,7 +41,7 @@ const SUB_GRAPH_NAME = 'shipments-2025';
 const TARGET_CG_ID_STR = '987654321';
 const TARGET_CG_ID_BIGINT = 987654321n;
 
-const KA_COUNT = 2;
+const KA_COUNT = 1;
 const BYTE_SIZE = 300n;
 const EPOCHS = 1n;
 const TOKEN_AMOUNT = 1000n;

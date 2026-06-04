@@ -3,6 +3,8 @@ import { OxigraphStore, GraphManager } from '@origintrail-official/dkg-storage';
 import {
   encodeFinalizationMessage, type FinalizationMessageMsg, encodePublishRequest, createOperationContext,
   contextGraphWorkspaceGraphUri, contextGraphWorkspaceMetaGraphUri,
+  DKG_ENTITY,
+  DKG_ROOT_ENTITY_LEGACY,
 } from '@origintrail-official/dkg-core';
 import type { ChainAdapter } from '@origintrail-official/dkg-chain';
 import { computeFlatKCRootV10 } from '@origintrail-official/dkg-publisher';
@@ -99,6 +101,51 @@ describe('FinalizationHandler', () => {
 
     await handler.handleFinalizationMessage(garbage, CONTEXT_GRAPH);
     expect(insertCalled).toBe(false);
+  });
+
+  it('cleans SWM metadata with either entity predicate without deleting other roots', async () => {
+    const metaGraph = contextGraphWorkspaceMetaGraphUri(CONTEXT_GRAPH);
+    const opMixed = 'urn:dkg:share:test-contextGraph:mixed';
+    const opNewOnly = 'urn:dkg:share:test-contextGraph:new-only';
+    const rootA = 'urn:test:cleanup:a';
+    const rootB = 'urn:test:cleanup:b';
+    const rootC = 'urn:test:cleanup:c';
+
+    await store.insert([
+      { graph: metaGraph, subject: opMixed, predicate: DKG_ROOT_ENTITY_LEGACY, object: rootA },
+      { graph: metaGraph, subject: opMixed, predicate: DKG_ENTITY, object: rootA },
+      { graph: metaGraph, subject: opMixed, predicate: DKG_ENTITY, object: rootB },
+      { graph: metaGraph, subject: opNewOnly, predicate: DKG_ENTITY, object: rootC },
+      { graph: metaGraph, subject: opNewOnly, predicate: 'http://dkg.io/ontology/shareOperationId', object: '"new-only"' },
+    ]);
+
+    await (handler as any).deleteMetaForRoot(metaGraph, rootA);
+
+    const rootARemoved = await store.query(
+      `ASK { GRAPH <${metaGraph}> { <${opMixed}> ?p <${rootA}> } }`,
+    );
+    expect(rootARemoved.type).toBe('boolean');
+    if (rootARemoved.type === 'boolean') {
+      expect(rootARemoved.value).toBe(false);
+    }
+
+    const rootBPreserved = await store.query(
+      `ASK { GRAPH <${metaGraph}> { <${opMixed}> <${DKG_ENTITY}> <${rootB}> } }`,
+    );
+    expect(rootBPreserved.type).toBe('boolean');
+    if (rootBPreserved.type === 'boolean') {
+      expect(rootBPreserved.value).toBe(true);
+    }
+
+    await (handler as any).deleteMetaForRoot(metaGraph, rootC);
+
+    const opNewOnlyRemoved = await store.query(
+      `ASK { GRAPH <${metaGraph}> { <${opNewOnly}> ?p ?o } }`,
+    );
+    expect(opNewOnlyRemoved.type).toBe('boolean');
+    if (opNewOnlyRemoved.type === 'boolean') {
+      expect(opNewOnlyRemoved.value).toBe(false);
+    }
   });
 
   it('ignores messages with mismatched contextGraphId', async () => {

@@ -7,6 +7,9 @@ import {
   assertSafeIri, isSafeIri,
   type EventBus,
   type OperationContext,
+  DKG_ENTITY,
+  DKG_ROOT_ENTITY_LEGACY,
+  ENTITY_PRED_ALT,
 } from '@origintrail-official/dkg-core';
 import { GraphManager, type TripleStore, type Quad } from '@origintrail-official/dkg-storage';
 import { type ChainAdapter, type EventFilter } from '@origintrail-official/dkg-chain';
@@ -1212,9 +1215,8 @@ export class FinalizationHandler {
   }
 
   private async deleteMetaForRoot(metaGraph: string, rootEntity: string): Promise<void> {
-    const DKG = 'http://dkg.io/ontology/';
     const result = await this.store.query(
-      `SELECT ?op WHERE { GRAPH <${assertSafeIri(metaGraph)}> { ?op <${DKG}rootEntity> <${assertSafeIri(rootEntity)}> } }`,
+      `SELECT DISTINCT ?op WHERE { GRAPH <${assertSafeIri(metaGraph)}> { ?op ${ENTITY_PRED_ALT} <${assertSafeIri(rootEntity)}> } }`,
     );
     if (result.type !== 'bindings') return;
     for (const row of result.bindings) {
@@ -1223,11 +1225,11 @@ export class FinalizationHandler {
       // OT-RFC-43 §10.1 — dual-write migration: remove BOTH the legacy
       // dkg:rootEntity and the new dkg:entity for this op/entity pair.
       await this.store.delete([
-        { subject: op, predicate: `${DKG}rootEntity`, object: rootEntity, graph: metaGraph },
-        { subject: op, predicate: `${DKG}entity`, object: rootEntity, graph: metaGraph },
+        { subject: op, predicate: DKG_ROOT_ENTITY_LEGACY, object: rootEntity, graph: metaGraph },
+        { subject: op, predicate: DKG_ENTITY, object: rootEntity, graph: metaGraph },
       ]);
       const remaining = await this.store.query(
-        `SELECT (COUNT(*) AS ?c) WHERE { GRAPH <${assertSafeIri(metaGraph)}> { <${assertSafeIri(op)}> <${DKG}rootEntity> ?r } }`,
+        `SELECT (COUNT(DISTINCT ?r) AS ?c) WHERE { GRAPH <${assertSafeIri(metaGraph)}> { <${assertSafeIri(op)}> ${ENTITY_PRED_ALT} ?r } }`,
       );
       const rawCount = remaining.type === 'bindings' && remaining.bindings[0]?.['c'];
       const countVal = typeof rawCount === 'string'

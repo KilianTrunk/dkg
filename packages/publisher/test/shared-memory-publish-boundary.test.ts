@@ -5,13 +5,17 @@ import {
   TrustLevel,
   TypedEventBus,
   generateEd25519Keypair,
+  DKG_ENTITY,
+  DKG_ROOT_ENTITY_LEGACY,
 } from '@origintrail-official/dkg-core';
 import { OxigraphStore, type Quad } from '@origintrail-official/dkg-storage';
 import { DKGPublisher } from '../src/index.js';
 import type { PublishResult } from '../src/publisher.js';
 
 const CONTEXT_GRAPH = 'publish-boundary';
+const CONTEXT_GRAPH_URI = `did:dkg:context-graph:${CONTEXT_GRAPH}`;
 const SWM_GRAPH = `did:dkg:context-graph:${CONTEXT_GRAPH}/_shared_memory`;
+const SWM_META_GRAPH = `did:dkg:context-graph:${CONTEXT_GRAPH}/_shared_memory_meta`;
 const WORKSPACE_OWNER_PREDICATE = 'http://dkg.io/ontology/workspaceOwner';
 
 function q(subject: string, predicate = 'http://schema.org/name', object = '"value"', graph = SWM_GRAPH): Quad {
@@ -146,5 +150,46 @@ describe('publishFromSharedMemory multi-root selection (OT-RFC-44 / Design B: on
     const subjects = new Set(publishSpy.mock.calls[0][0].quads.map((qq: any) => qq.subject));
     expect(subjects.has('urn:test:root:one')).toBe(true);
     expect(subjects.has('urn:test:root:two')).toBe(true);
+  });
+});
+
+describe('shared-memory metadata cleanup during predicate rename', () => {
+  it('removes stale dkg:entity links when upserting one root from a multi-root share', async () => {
+    const { publisher, store } = await makePublisher();
+    const rootA = 'urn:test:cleanup:a';
+    const rootB = 'urn:test:cleanup:b';
+
+    await publisher.share(CONTEXT_GRAPH, [
+      q(rootA, 'http://schema.org/name', '"A"', CONTEXT_GRAPH_URI),
+      q(rootB, 'http://schema.org/name', '"B"', CONTEXT_GRAPH_URI),
+    ], { publisherPeerId: 'peer-a' });
+
+    await publisher.share(CONTEXT_GRAPH, [
+      q(rootA, 'http://schema.org/name', '"A updated"', CONTEXT_GRAPH_URI),
+    ], { publisherPeerId: 'peer-a' });
+
+    const rootAOps = await store.query(
+      `SELECT DISTINCT ?op WHERE { GRAPH <${SWM_META_GRAPH}> { ?op <${DKG_ENTITY}> <${rootA}> } }`,
+    );
+    expect(rootAOps.type).toBe('bindings');
+    if (rootAOps.type === 'bindings') {
+      expect(rootAOps.bindings).toHaveLength(1);
+    }
+
+    const rootBMeta = await store.query(
+      `ASK { GRAPH <${SWM_META_GRAPH}> { ?op <${DKG_ENTITY}> <${rootB}> } }`,
+    );
+    expect(rootBMeta.type).toBe('boolean');
+    if (rootBMeta.type === 'boolean') {
+      expect(rootBMeta.value).toBe(true);
+    }
+
+    const rootALegacyOps = await store.query(
+      `SELECT DISTINCT ?op WHERE { GRAPH <${SWM_META_GRAPH}> { ?op <${DKG_ROOT_ENTITY_LEGACY}> <${rootA}> } }`,
+    );
+    expect(rootALegacyOps.type).toBe('bindings');
+    if (rootALegacyOps.type === 'bindings') {
+      expect(rootALegacyOps.bindings).toHaveLength(1);
+    }
   });
 });

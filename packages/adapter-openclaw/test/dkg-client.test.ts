@@ -1083,4 +1083,48 @@ describe('DkgDaemonClient', () => {
     const token = client.getAuthToken();
     expect(token === undefined || typeof token === 'string').toBe(true);
   });
+
+  // ── OT-RFC-43 §10.5 — GitHub-shaped Knowledge Asset client ──────────────
+  describe('knowledge-assets surface', () => {
+    const ok = (body: unknown = {}) =>
+      fetchResponses.push(new Response(JSON.stringify(body), { status: 200 }));
+    const url = (i = 0) => String(fetchCalls[i][0]);
+    const body = (i = 0) => JSON.parse(String(fetchCalls[i][1]!.body));
+
+    it('createKnowledgeAsset POSTs to /api/knowledge-assets with normalized cg + name', async () => {
+      ok({ name: 'f' });
+      await client.createKnowledgeAsset('cg-1', 'f', {
+        quads: [{ subject: 's', predicate: 'p', object: 'o', graph: '' }],
+        alsoShareSwm: true,
+      });
+      expect(url()).toBe('http://localhost:9200/api/knowledge-assets');
+      expect(fetchCalls[0][1]!.method).toBe('POST');
+      expect(body()).toMatchObject({ contextGraphId: 'cg-1', name: 'f', alsoShareSwm: true });
+    });
+
+    it('knowledgeAssetWrite URL-encodes the name and POSTs to .../wm/write', async () => {
+      ok({ written: 2 });
+      await client.knowledgeAssetWrite('cg-1', 'meeting notes', [
+        { subject: 's', predicate: 'p', object: 'o', graph: '' },
+      ]);
+      expect(url()).toBe('http://localhost:9200/api/knowledge-assets/meeting%20notes/wm/write');
+      expect(body().quads).toHaveLength(1);
+    });
+
+    it('knowledgeAssetPullFrom sends layer + onConflict to .../wm/pull-from', async () => {
+      ok({ seeded: 3 });
+      await client.knowledgeAssetPullFrom('cg-1', 'f', 'swm', { onConflict: 'replace' });
+      expect(url()).toBe('http://localhost:9200/api/knowledge-assets/f/wm/pull-from');
+      expect(body()).toMatchObject({ layer: 'swm', onConflict: 'replace' });
+    });
+
+    it('share + publish target swm/share and vm/publish', async () => {
+      ok({ swmShared: true, promotedCount: 1 });
+      ok({ ual: 'did:dkg:x' });
+      await client.knowledgeAssetShare('cg-1', 'f');
+      await client.knowledgeAssetPublish('cg-1', 'f');
+      expect(url(0)).toBe('http://localhost:9200/api/knowledge-assets/f/swm/share');
+      expect(url(1)).toBe('http://localhost:9200/api/knowledge-assets/f/vm/publish');
+    });
+  });
 });

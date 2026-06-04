@@ -637,6 +637,119 @@ export const writeProfileQueryCatalog = (
     quads,
   });
 
+// --- Knowledge Assets (OT-RFC-43 §10.5 — GitHub-shaped KA surface) ---
+// Layer-explicit wrappers over the clean /api/knowledge-assets/... routes that
+// supersede the legacy assertion/* + shared-memory/* calls above during the v10
+// migration window. One file = one Knowledge Asset (Design B / OT-RFC-44): a KA
+// may carry any number of member entities. WM → SWM → VM maps to the git-shaped
+// verbs write → finalize → share → publish.
+
+export interface KnowledgeAssetQuad {
+  subject: string;
+  predicate: string;
+  object: string;
+  graph: string;
+}
+
+/**
+ * Create a KA and open its WM draft. Pass `quads` to atomically write+finalize
+ * in one call; `alsoShareSwm` / `alsoPublishVm` to advance layers in the same
+ * request (best-effort tails — partial failures are reported via HTTP 207).
+ */
+export const createKnowledgeAsset = (
+  contextGraphId: string,
+  name: string,
+  opts: {
+    subGraphName?: string;
+    quads?: KnowledgeAssetQuad[];
+    alsoShareSwm?: boolean;
+    alsoPublishVm?: boolean;
+  } = {},
+) => post<Record<string, unknown>>('/api/knowledge-assets', { contextGraphId, name, ...opts });
+
+/** GET a KA's per-layer lifecycle state by name. */
+export const getKnowledgeAsset = (
+  contextGraphId: string,
+  name: string,
+  subGraphName?: string,
+) => {
+  const qs = new URLSearchParams({
+    contextGraphId,
+    ...(subGraphName ? { subGraphName } : {}),
+  }).toString();
+  return get<Record<string, unknown>>(
+    `/api/knowledge-assets/${encodeURIComponent(name)}?${qs}`,
+  );
+};
+
+/** Append quads to the KA's WM draft (git add/edit). */
+export const knowledgeAssetWrite = (
+  contextGraphId: string,
+  name: string,
+  quads: KnowledgeAssetQuad[],
+  opts: { subGraphName?: string } = {},
+) =>
+  post<{ written: number }>(
+    `/api/knowledge-assets/${encodeURIComponent(name)}/wm/write`,
+    { contextGraphId, quads, ...opts },
+  );
+
+/** Seal the WM draft — computes the merkle root + signs the seal (git commit). */
+export const knowledgeAssetFinalize = (
+  contextGraphId: string,
+  name: string,
+  opts: { subGraphName?: string } = {},
+) =>
+  post<{ merkleRoot: string; eip712Digest: string }>(
+    `/api/knowledge-assets/${encodeURIComponent(name)}/wm/finalize`,
+    { contextGraphId, ...opts },
+  );
+
+/** Discard the open WM draft (git checkout -- .). */
+export const knowledgeAssetDiscard = (
+  contextGraphId: string,
+  name: string,
+  opts: { subGraphName?: string } = {},
+) =>
+  post<{ discarded: boolean }>(
+    `/api/knowledge-assets/${encodeURIComponent(name)}/wm/discard`,
+    { contextGraphId, ...opts },
+  );
+
+/** Seed a fresh WM draft from the file's current SWM/VM state (git checkout). */
+export const knowledgeAssetPullFrom = (
+  contextGraphId: string,
+  name: string,
+  layer: 'swm' | 'vm',
+  opts: { subGraphName?: string; onConflict?: 'reject' | 'replace' } = {},
+) =>
+  post<Record<string, unknown>>(
+    `/api/knowledge-assets/${encodeURIComponent(name)}/wm/pull-from`,
+    { contextGraphId, layer, ...opts },
+  );
+
+/** Advance the SWM pointer (WM → SWM; git push origin <branch>). */
+export const knowledgeAssetShare = (
+  contextGraphId: string,
+  name: string,
+  opts: { subGraphName?: string; entities?: string[] | 'all' } = {},
+) =>
+  post<{ swmShared: boolean; promotedCount: number }>(
+    `/api/knowledge-assets/${encodeURIComponent(name)}/swm/share`,
+    { contextGraphId, ...opts },
+  );
+
+/** Publish to VM — mint or update on chain (git push origin main). */
+export const knowledgeAssetPublish = (
+  contextGraphId: string,
+  name: string,
+  opts: { subGraphName?: string } = {},
+) =>
+  post<Record<string, unknown>>(
+    `/api/knowledge-assets/${encodeURIComponent(name)}/vm/publish`,
+    { contextGraphId, ...opts },
+  );
+
 // --- Assertions (WM objects) ---
 
 export interface AssertionInfo {

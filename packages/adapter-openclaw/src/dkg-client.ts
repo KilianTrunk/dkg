@@ -1096,6 +1096,119 @@ export class DkgDaemonClient {
     }
     return res.json() as Promise<T>;
   }
+
+  // ── OT-RFC-43 §10.5 — GitHub-shaped Knowledge Asset client ──────────────
+  // Layer-explicit wrappers over the clean /api/knowledge-assets/... surface.
+  // One file = one Knowledge Asset (Design B / OT-RFC-44), carrying any number
+  // of member entities. WM → SWM → VM via the git-shaped verbs write →
+  // finalize → share → publish.
+
+  /** Create a KA + open its WM draft. Pass `quads` to atomically write+finalize. */
+  async createKnowledgeAsset(
+    contextGraphId: string,
+    name: string,
+    opts?: {
+      subGraphName?: string;
+      quads?: Array<{ subject: string; predicate: string; object: string; graph: string }>;
+      alsoShareSwm?: boolean;
+      alsoPublishVm?: boolean;
+    },
+  ): Promise<Record<string, unknown>> {
+    return this.post('/api/knowledge-assets', {
+      contextGraphId: normalizeContextGraphId(contextGraphId),
+      name,
+      ...(opts ?? {}),
+    });
+  }
+
+  /** GET a KA's per-layer lifecycle state by name. */
+  async getKnowledgeAsset(
+    contextGraphId: string,
+    name: string,
+    opts?: { subGraphName?: string },
+  ): Promise<Record<string, unknown>> {
+    const qs = new URLSearchParams({
+      contextGraphId: normalizeContextGraphId(contextGraphId),
+      ...(opts?.subGraphName ? { subGraphName: opts.subGraphName } : {}),
+    }).toString();
+    return this.get(`/api/knowledge-assets/${encodeURIComponent(name)}?${qs}`);
+  }
+
+  /** Append quads to the KA's WM draft (git add/edit). */
+  async knowledgeAssetWrite(
+    contextGraphId: string,
+    name: string,
+    quads: Array<{ subject: string; predicate: string; object: string; graph: string }>,
+    opts?: { subGraphName?: string },
+  ): Promise<{ written: number }> {
+    return this.post(`/api/knowledge-assets/${encodeURIComponent(name)}/wm/write`, {
+      contextGraphId: normalizeContextGraphId(contextGraphId),
+      quads,
+      ...(opts ?? {}),
+    });
+  }
+
+  /** Seal the WM draft — computes the merkle root + signs the seal (git commit). */
+  async knowledgeAssetFinalize(
+    contextGraphId: string,
+    name: string,
+    opts?: { subGraphName?: string },
+  ): Promise<{ merkleRoot: string; eip712Digest: string }> {
+    return this.post(`/api/knowledge-assets/${encodeURIComponent(name)}/wm/finalize`, {
+      contextGraphId: normalizeContextGraphId(contextGraphId),
+      ...(opts ?? {}),
+    });
+  }
+
+  /** Discard the open WM draft (git checkout -- .). */
+  async knowledgeAssetDiscard(
+    contextGraphId: string,
+    name: string,
+    opts?: { subGraphName?: string },
+  ): Promise<{ discarded: boolean }> {
+    return this.post(`/api/knowledge-assets/${encodeURIComponent(name)}/wm/discard`, {
+      contextGraphId: normalizeContextGraphId(contextGraphId),
+      ...(opts ?? {}),
+    });
+  }
+
+  /** Seed a fresh WM draft from the file's current SWM/VM state (git checkout). */
+  async knowledgeAssetPullFrom(
+    contextGraphId: string,
+    name: string,
+    layer: 'swm' | 'vm',
+    opts?: { subGraphName?: string; onConflict?: 'reject' | 'replace' },
+  ): Promise<Record<string, unknown>> {
+    return this.post(`/api/knowledge-assets/${encodeURIComponent(name)}/wm/pull-from`, {
+      contextGraphId: normalizeContextGraphId(contextGraphId),
+      layer,
+      ...(opts ?? {}),
+    });
+  }
+
+  /** Advance the SWM pointer (WM → SWM; git push origin <branch>). */
+  async knowledgeAssetShare(
+    contextGraphId: string,
+    name: string,
+    opts?: { subGraphName?: string; entities?: string[] | 'all' },
+  ): Promise<{ swmShared: boolean; promotedCount: number }> {
+    return this.post(`/api/knowledge-assets/${encodeURIComponent(name)}/swm/share`, {
+      contextGraphId: normalizeContextGraphId(contextGraphId),
+      ...(opts ?? {}),
+    });
+  }
+
+  /** Publish to VM — mint or update on chain (git push origin main). */
+  async knowledgeAssetPublish(
+    contextGraphId: string,
+    name: string,
+    opts?: { subGraphName?: string },
+  ): Promise<Record<string, unknown>> {
+    return this.post(`/api/knowledge-assets/${encodeURIComponent(name)}/vm/publish`, {
+      contextGraphId: normalizeContextGraphId(contextGraphId),
+      ...(opts ?? {}),
+    });
+  }
 }
 
 function stripTrailingSlashes(value: string): string {

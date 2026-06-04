@@ -19,6 +19,7 @@
  * the agent; share() never submits a tx).
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { makeTestKaNumberAllocator } from "./_helpers/ka-allocator.js";
 import { ethers } from 'ethers';
 import { DKGAgent } from '../src/index.js';
 import { DKG_GOSSIP_MAX_MESSAGE_BYTES } from '@origintrail-official/dkg-core';
@@ -52,6 +53,7 @@ beforeAll(async () => {
     ethers.parseEther('1000000'),
   );
   nodeA = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
     name: 'SwmBoundaryA',
     listenPort: 0,
     skills: [],

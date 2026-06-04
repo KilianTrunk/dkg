@@ -25,7 +25,7 @@ export const KAUpdateManifestEntrySchema = new Type('KAUpdateManifestEntry')
 
 export const KAUpdateRequestSchema = new Type('KAUpdateRequest')
   .add(new Field('contextGraphId', 1, 'string'))
-  .add(new Field('batchId', 2, 'uint64'))
+  .add(new Field('batchId', 2, 'string'))
   .add(new Field('nquads', 3, 'bytes'))
   .add(new Field('manifest', 4, 'KAUpdateManifestEntry', 'repeated'))
   .add(new Field('publisherPeerId', 5, 'string'))
@@ -48,7 +48,7 @@ export interface KAUpdateManifestEntryMsg {
 /** Input type for encoding — accepts number, bigint, or protobuf Long. */
 export interface KAUpdateRequestMsg {
   contextGraphId: string;
-  batchId: number | bigint;
+  batchId: string | number | bigint;
   nquads: Uint8Array;
   manifest: KAUpdateManifestEntryMsg[];
   publisherPeerId: string;
@@ -61,7 +61,8 @@ export interface KAUpdateRequestMsg {
   operationId?: string;
 }
 
-function toBigInt(v: number | bigint | Long | unknown): bigint {
+function toBigInt(v: string | number | bigint | Long | unknown): bigint {
+  if (typeof v === 'string') return BigInt(v);
   if (typeof v === 'bigint') return v;
   if (typeof v === 'number') return BigInt(v);
   if (v && typeof v === 'object' && 'low' in v && 'high' in v) {
@@ -76,11 +77,26 @@ function toLong(v: number | bigint): { low: number; high: number; unsigned: bool
   return PbLong.fromNumber(v, true);
 }
 
+/**
+ * Convert a KA id (batchId) into the decimal-string wire shape. KA ids are
+ * packed Option-1 values `(uint160(author) << 96) | number` (~256-bit), which
+ * do NOT fit a uint64 gossip field. Per OT-RFC-43 §9 the id wire type is a
+ * decimal string, so we accept string / number / bigint / protobuf Long and
+ * emit the canonical decimal string losslessly.
+ */
+function idToProtoString(val: string | number | bigint | Long): string {
+  if (typeof val === 'string') return val;
+  if (typeof val === 'bigint') return val.toString();
+  if (typeof val === 'number') return val.toString();
+  const lo = BigInt(val.low >>> 0); const hi = BigInt(val.high >>> 0);
+  return ((hi << 32n) | lo).toString();
+}
+
 export function encodeKAUpdateRequest(msg: KAUpdateRequestMsg): Uint8Array {
   return KAUpdateRequestSchema.encode(
     KAUpdateRequestSchema.create({
       ...msg,
-      batchId: toLong(msg.batchId),
+      batchId: idToProtoString(msg.batchId),
       blockNumber: toLong(msg.blockNumber),
       timestampMs: toLong(msg.timestampMs),
     }),

@@ -8,6 +8,7 @@
  * 5. Sub-graph data doesn't leak to root CG queries
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { makeTestKaNumberAllocator } from "./_helpers/ka-allocator.js";
 import { DKGAgent } from '../src/index.js';
 import { createEVMAdapter, getSharedContext, createProvider, takeSnapshot, revertSnapshot, HARDHAT_KEYS } from '../../chain/test/evm-test-context.js';
 import { mintTokens } from '../../chain/test/hardhat-harness.js';
@@ -54,12 +55,14 @@ describe('Sub-graph gossip replication (2 nodes)', () => {
 
   beforeAll(async () => {
     nodeA = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'SubGossipA',
       listenPort: 0,
       chainAdapter: sharedChain,
       nodeRole: 'core',
     });
     nodeB = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'SubGossipB',
       listenPort: 0,
       chainAdapter: sharedChain,
@@ -194,6 +197,7 @@ describe('Multiple sub-graphs with concurrent writes (3 nodes)', () => {
     const nodes = await Promise.all(
       ['ConcA', 'ConcB', 'ConcC'].map(async (name) => {
         const agent = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
           name,
           listenPort: 0,
           chainAdapter: sharedChain,

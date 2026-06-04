@@ -410,6 +410,18 @@ export interface V10PublishParams {
   author: V10AuthorAttestation;
   ackSignatures: Array<{ identityId: bigint; r: Uint8Array; vs: Uint8Array }>;
   /**
+   * OT-RFC-43 Option 1 (variant 1a) — the deterministic packed KA id this
+   * publish claims: `kaId = (uint160(author.address) << 96) | uint96(number)`,
+   * pre-allocated off-chain by the KA-number allocator. The on-chain contract
+   * enforces `(reservedKaId >> 96) == author.address` at mint and `_safeMint`s
+   * exactly this id. REQUIRED by the variant-1a contract (a missing/zero value
+   * reverts `KaIdNamespaceMismatch`); optional here only so mock / no-chain
+   * adapters and pre-Option-1 callers compile — the real EVM adapter throws if
+   * it is absent. Maps to the on-chain struct slot between `authorSchemeVersion`
+   * and `identityIds`.
+   */
+  reservedKaId?: bigint;
+  /**
    * RFC-39 Phase A.5 — OPTIONAL Merkle root over `[keccak256(ct_i)]` in
    * `swmMessageIndex` order for this batch's ciphertext chunks. Required
    * by the contract to be `bytes32(0)` for public CGs; for curated CGs
@@ -884,6 +896,18 @@ export interface ChainAdapter {
    * direct-spend based on `agentToAccountId(msg.sender)`.
    */
   createKnowledgeAssets(params: V10PublishParams): Promise<OnChainPublishResult>;
+
+  /**
+   * OT-RFC-43 Option 1 — highest per-author KA `number` already minted on chain
+   * for `author`, or `-1n` if the author has never minted. Used by the allocator's
+   * cold-start reconciliation (`nextNumber = max(local, chainMax) + 1`) so a
+   * stale-local-DB / fresh device never re-hands a burned `(author, number)`.
+   * Derived by enumerating `KnowledgeAssetCreated(id, author, ...)` logs filtered
+   * by the indexed `author` topic and taking `max(id & ((1<<96)-1))`. Optional:
+   * adapters that cannot enumerate logs may omit it (the allocator then trusts
+   * its local store and relies on the contract's `_safeMint` revert as backstop).
+   */
+  getMaxKaNumberForAuthor?(author: string): Promise<bigint>;
 
   /** Deployed `DKGKnowledgeAssets` (or legacy `KnowledgeCollectionStorage`) address. */
   getDKGKnowledgeAssetsAddress?(): Promise<string>;

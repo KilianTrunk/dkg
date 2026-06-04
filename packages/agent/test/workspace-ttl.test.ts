@@ -3,6 +3,7 @@
  * up and not served to peers during sync.
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { makeTestKaNumberAllocator } from "./_helpers/ka-allocator.js";
 import { DKGAgent } from '../src/index.js';
 import { createEVMAdapter, getSharedContext, createProvider, takeSnapshot, revertSnapshot, HARDHAT_KEYS } from '../../chain/test/evm-test-context.js';
 import { mintTokens } from '../../chain/test/hardhat-harness.js';
@@ -37,6 +38,7 @@ describe('Workspace TTL', () => {
 
   it('stale workspace data is cleaned up while fresh data survives', async () => {
     node = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'TtlNode',
       listenPort: 0,
       chainAdapter: createEVMAdapter(HARDHAT_KEYS.CORE_OP),
@@ -96,6 +98,7 @@ describe('setSharedMemoryTtlMs timer lifecycle', () => {
 
   it('starts cleanup timer when TTL transitions from 0 to positive', async () => {
     node = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'TtlLifecycleNode',
       listenPort: 0,
       chainAdapter: createEVMAdapter(HARDHAT_KEYS.CORE_OP),

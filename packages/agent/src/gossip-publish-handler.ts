@@ -317,6 +317,11 @@ export class GossipPublishHandler {
           const entityQuads = partitioned.get(rootEntity);
           if (!entityQuads) continue;
           const kaEntry = request.kas?.find((ka) => ka.rootEntity === rootEntity);
+          // Integration (file=KA × Option-1): the per-entity tokenId is a local
+          // 1-based ordinal within the KC — the KC's packed Option-1 kaId lives
+          // in request.ual, not here, and this ordinal does not feed the
+          // consensus merkle root. Deterministically reconstruct the publisher
+          // manifest's ordinal rather than reading the (now string) wire tokenId.
           kaMetadata.push({
             rootEntity,
             kcUal: request.ual,
@@ -566,7 +571,8 @@ function protoToNumber(val: number | { low: number; high: number; unsigned: bool
   return ((val.high >>> 0) * 0x100000000) + (val.low >>> 0);
 }
 
-function protoToBigInt(val: number | bigint | { low: number; high: number; unsigned: boolean }): bigint {
+function protoToBigInt(val: string | number | bigint | { low: number; high: number; unsigned: boolean }): bigint {
+  if (typeof val === 'string') return BigInt(val);
   if (typeof val === 'bigint') return val;
   if (typeof val === 'number') return BigInt(val);
   return (BigInt(val.high >>> 0) << 32n) | BigInt(val.low >>> 0);

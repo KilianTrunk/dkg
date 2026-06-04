@@ -651,6 +651,11 @@
             "type": "uint8"
           },
           {
+            "internalType": "uint256",
+            "name": "reservedKaId",
+            "type": "uint256"
+          },
+          {
             "internalType": "uint72[]",
             "name": "identityIds",
             "type": "uint72[]"

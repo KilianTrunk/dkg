@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
+import { makeTestKaNumberAllocator } from "./_helpers/ka-allocator.js";
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -36,6 +37,7 @@ async function createTempDataDir(prefix: string): Promise<string> {
 async function createAgent(name: string, overrides: Partial<DKGAgentConfig> = {}) {
   const store = overrides.store ?? new OxigraphStore();
   const agent = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
     name,
     listenPort: 0,
     skills: [],

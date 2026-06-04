@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { makeTestKaNumberAllocator } from "./_helpers/ka-allocator.js";
 import { ethers, Wallet, Contract } from 'ethers';
 import { DKGAgent } from '../src/index.js';
 import { EVMChainAdapter } from '@origintrail-official/dkg-chain';
@@ -127,6 +128,7 @@ describe('E2E: DKGAgent with real blockchain', () => {
 
   it('creates agents with real EVMChainAdapter (no mocks)', async () => {
     const agentA = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'ChainNodeA',
       nodeRole: 'core',
       listenPort: 0,
@@ -136,6 +138,7 @@ describe('E2E: DKGAgent with real blockchain', () => {
     agents.push(agentA);
 
     const agentB = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'ChainNodeB',
       nodeRole: 'core',
       listenPort: 0,

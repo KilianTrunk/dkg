@@ -1,4 +1,5 @@
 import { describe, it, expect, afterEach, beforeAll, afterAll } from 'vitest';
+import { makeTestKaNumberAllocator } from "./_helpers/ka-allocator.js";
 import { DKGAgent, type ContextGraphSub } from '../src/index.js';
 import { OxigraphStore } from '@origintrail-official/dkg-storage';
 import { SYSTEM_CONTEXT_GRAPHS, DKG_ONTOLOGY, contextGraphDataGraphUri, contextGraphSharedMemoryUri, contextGraphMetaGraphUri } from '@origintrail-official/dkg-core';
@@ -25,6 +26,7 @@ async function createTestAgent(opts?: {
 }) {
   const store = opts?.store ?? new OxigraphStore();
   const agent = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
     name: 'ContextGraphTestAgent',
     listenPort: 0,
     listenHost: '127.0.0.1',

@@ -129,7 +129,18 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
     CGStorageContract = f.CGStorageContract;
     CGValueStorage = f.CGValueStorage;
     opSigner = accounts[19];
+    _kaIdCounter = 0n;
   });
+
+  // OT-RFC-43 Option 1 (1a): KA ids are caller-supplied, author-namespaced
+  // packed values `(uint160(author) << 96) | uint96(number)`. `createKC` seeds
+  // with `author == opSigner`, so allocate a fresh number per KC in opSigner's
+  // namespace. Reset per test so snapshot-reverted runs reallocate cleanly.
+  let _kaIdCounter = 0n;
+  const nextOpSignerKaId = (): bigint => {
+    _kaIdCounter += 1n;
+    return (BigInt(opSigner.address) << 96n) | _kaIdCounter;
+  };
 
   async function createCG(publishPolicy: number): Promise<bigint> {
     const owner = accounts[1].address;
@@ -194,6 +205,7 @@ describe('@unit RandomSampling — RFC-39 curated picker [Phase B enabled]', () 
     const createTx = await KCSContract.connect(opSigner).createKnowledgeAsset(
       opSigner.address,
       opSigner.address,
+      nextOpSignerKaId(), // OT-RFC-43 (1a): caller-supplied author-namespaced id
       'rfc39-curated-test-op',
       ethers.keccak256(
         ethers.toUtf8Bytes(

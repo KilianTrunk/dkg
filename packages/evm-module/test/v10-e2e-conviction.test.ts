@@ -29,7 +29,11 @@ import {
   getDefaultReceivingNodes,
   getDefaultKCCreator,
 } from './helpers/setup-helpers';
-import { buildPublishParams, DEFAULT_CHAIN_ID } from './helpers/v10-kc-helpers';
+import {
+  buildPublishParams,
+  packReservedKaId,
+  DEFAULT_CHAIN_ID,
+} from './helpers/v10-kc-helpers';
 
 const SCALE18 = 10n ** 18n;
 
@@ -321,6 +325,10 @@ describe('V10 E2E Conviction System', function () {
         (tokenAmount * (10_000n - expectedDiscountBps)) / 10_000n;
       const merkleRoot = ethers.keccak256(ethers.toUtf8Bytes('flow3-merkle'));
 
+      // OT-RFC-43 Option 1 (1a): author-namespaced packed id we expect to mint
+      // (high 160 bits == creator, the attested author / NFT recipient).
+      const reservedKaId = packReservedKaId(creator.address, 1);
+
       // ---- Step 5: Build V10 publish params (N26 + H5 + post-BLOCKER-1 ACK) ----
       const p = await buildPublishParams({
         chainId: DEFAULT_CHAIN_ID,
@@ -337,6 +345,7 @@ describe('V10 E2E Conviction System', function () {
         tokenAmount,
         isImmutable: false,
         publishOperationId: 'flow3-op',
+        reservedKaId,
       });
 
       // ---- Step 6: publish() (conviction path) ----
@@ -409,7 +418,9 @@ describe('V10 E2E Conviction System', function () {
       void kav10AddrLower;
 
       // ---- Step 7: KC registered in KCS; publisher of record is msg.sender ----
-      const kaId = 1n;
+      // OT-RFC-43 Option 1 (1a): the minted kaId equals the packed reservedKaId
+      // (author-namespaced; ids are no longer globally sequential 1,2,3,...).
+      const kaId = reservedKaId;
       const meta = await DKGKnowledgeAssets.getKnowledgeAssetMetadata(kaId);
       // meta[3] = byteSize, meta[4] = startEpoch, meta[5] = endEpoch, meta[6] = tokenAmount
       expect(meta[3]).to.equal(1000n);

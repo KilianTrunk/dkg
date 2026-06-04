@@ -12,6 +12,7 @@
  * 6. Persistent-store isolation with temp directories
  */
 import { describe, it, expect, afterEach, beforeAll, afterAll } from 'vitest';
+import { makeTestKaNumberAllocator } from "./_helpers/ka-allocator.js";
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -100,12 +101,14 @@ function sleep(ms: number) { return new Promise(r => setTimeout(r, ms)); }
 describe('Private triple confidentiality via GossipSub', () => {
   it('private triples published on A are NOT received by B through GossipSub', async () => {
     const agentA = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'PrivacyPublisher',
       listenPort: 0,
       skills: [],
       chainAdapter: createEVMAdapter(HARDHAT_KEYS.CORE_OP),
     });
     const agentB = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'PrivacyReceiver',
       listenPort: 0,
       skills: [],
@@ -183,6 +186,7 @@ describe('Private triple confidentiality via GossipSub', () => {
 describe('Remote query privacy', () => {
   it('cross-agent SPARQL query does not return private triples', async () => {
     const agentA = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'QueryPrivPublisher',
       listenPort: 0,
       skills: [],
@@ -190,6 +194,7 @@ describe('Remote query privacy', () => {
       queryAccess: { defaultPolicy: 'public' },
     });
     const agentB = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'QueryPrivRequester',
       listenPort: 0,
       skills: [],
@@ -324,6 +329,7 @@ describe('Access protocol denial', () => {
 describe('ContextGraph isolation', () => {
   it('data in one contextGraph is invisible to queries in another', async () => {
     const agent = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'IsolationBot',
       listenPort: 0,
       skills: [],
@@ -360,6 +366,7 @@ describe('ContextGraph isolation', () => {
 
   it('private triples in contextGraph A are not visible in contextGraph B queries', async () => {
     const agent = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'ParaPrivBot',
       listenPort: 0,
       skills: [],
@@ -497,6 +504,7 @@ describe('Persistent store isolation', () => {
     tempDirs.push(dirA, dirB);
 
     const agentA = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'PersistA',
       listenPort: 0,
       skills: [],
@@ -504,6 +512,7 @@ describe('Persistent store isolation', () => {
       dataDir: dirA,
     });
     const agentB = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'PersistB',
       listenPort: 0,
       skills: [],
@@ -542,12 +551,14 @@ describe('Persistent store isolation', () => {
 describe('Private triple confidentiality via sync protocol', () => {
   it('syncFromPeer does not transfer private triples', async () => {
     const agentA = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'SyncPublisher',
       listenPort: 0,
       skills: [],
       chainAdapter: createEVMAdapter(HARDHAT_KEYS.CORE_OP),
     });
     const agentB = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'SyncReceiver',
       listenPort: 0,
       skills: [],
@@ -624,6 +635,7 @@ describe('Private triple confidentiality via sync protocol', () => {
 describe('SPARQL injection prevention', () => {
   it('rejects SPARQL update disguised in various forms', async () => {
     const agent = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'InjectionBot',
       listenPort: 0,
       skills: [],

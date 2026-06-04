@@ -70,6 +70,19 @@ contract DKGKnowledgeAssets is INamed, IVersioned, HubDependent, ERC721, Guardia
         uint32 ciphertextChunkCount
     );
 
+    // --- OT-RFC-43 Option 1 (variant 1a) errors ---
+    /// @notice The supplied packed `kaId`'s high 160 bits (`kaId >> 96`) do not
+    ///         equal the attested author. A wallet may only mint KAs within its
+    ///         own namespace (OT-RFC-43 §4).
+    error KaIdNamespaceMismatch(uint256 kaId, address author);
+    /// @notice The supplied (author, number) packs to a `kaId` that is already
+    ///         minted — a re-used reservation. Never a silent clobber.
+    error KaIdAlreadyMinted(uint256 kaId);
+    /// @notice `getLatestKnowledgeAssetId` is deprecated under Option 1 — ids
+    ///         are packed (author<<96)|number and not globally sequential, so a
+    ///         single "latest id" is meaningless.
+    error GetLatestKnowledgeAssetIdDeprecated();
+
     string private constant _NAME = "DKGKnowledgeAssets";
     string private constant _VERSION = "2.0.0";
 
@@ -77,7 +90,15 @@ contract DKGKnowledgeAssets is INamed, IVersioned, HubDependent, ERC721, Guardia
 
     uint256 public immutable KNOWLEDGE_ASSET_BATCH_MAX_SIZE;
 
-    uint256 private _knowledgeAssetsCounter;
+    // OT-RFC-43 Option 1 (variant 1a): the global auto-increment id counter is
+    // retired — KA ids are now caller-supplied packed (author<<96)|number values
+    // minted in `createKnowledgeAsset`. This storage SLOT is retained (renamed,
+    // never written) so the layout of every field below is unchanged whether
+    // this contract is freshly deployed OR upgraded in place (R3 — proxy-vs-
+    // redeploy is unresolved; keeping the gap is safe under both). Do not
+    // repurpose without resolving R3.
+    // slither-disable-next-line unused-state
+    uint256 private __deprecated_knowledgeAssetsCounter;
     uint256 private _totalMintedKnowledgeAssetsCounter;
     // V10 retired burn semantics — `burnKnowledgeAssetsTokens` is a
     // `pure` revert stub — so this counter is intentionally never
@@ -104,9 +125,12 @@ contract DKGKnowledgeAssets is INamed, IVersioned, HubDependent, ERC721, Guardia
     /// `publisher`/`merkleRoot`/`timestamp` from the wrong offsets.
     /// Layout-preserving fix: keep `MerkleRoot` at 3 slots and store
     /// the EIP-712-recovered author identity at
-    /// `merkleRootAuthors[kaId][rootIndex]`. `address(0)` means the
-    /// state change at `rootIndex` did not carry an attestation
-    /// (legacy V8/V9 mutations, V10.1 update path until vNext, etc).
+    /// `merkleRootAuthors[kaId][rootIndex]`. Both the publish AND the
+    /// update path persist a verified EIP-712 author here (OT-RFC-45
+    /// owner-only update). `address(0)` means the state change at
+    /// `rootIndex` did not carry an attestation — i.e. legacy V8/V9
+    /// mutations and admin paths (`setMerkleRoots` / `pushMerkleRoot`,
+    /// which zero the slot by design).
     /// Indexers SHOULD prefer the indexed `author` topic on
     /// `KnowledgeAssetCreated` / `KnowledgeAssetUpdated`
     /// events; this on-chain mapping is the canonical lookup for
@@ -177,6 +201,7 @@ contract DKGKnowledgeAssets is INamed, IVersioned, HubDependent, ERC721, Guardia
     function createKnowledgeAsset(
         address publisher,
         address author,
+        uint256 kaId,
         string calldata publishOperationId,
         bytes32 merkleRoot,
         uint256 knowledgeAssetsAmount,
@@ -191,18 +216,53 @@ contract DKGKnowledgeAssets is INamed, IVersioned, HubDependent, ERC721, Guardia
             revert KnowledgeAssetLib.ExceededKnowledgeAssetBatchSize(0, 0, knowledgeAssetsAmount, 1);
         }
 
-        uint256 knowledgeAssetId = ++_knowledgeAssetsCounter;
+        // OT-RFC-43 Option 1 (variant 1a): the KA id is supplied by the caller
+        // (the off-chain allocator) as a deterministic packed value
+        // kaId = (uint160(author) << 96) | uint96(number). The high 160 bits
+        // MUST equal the attested author, so a wallet can only mint within its
+        // own namespace. Unforgeable: `author` is proven by the EIP-712
+        // attestation in `KnowledgeAssetsLifecycle._verifyAuthorAttestation`
+        // before this call. NB: the namespace binds to the attested AUTHOR
+        // (EIP-712 signer / initial NFT owner), a deliberate divergence from
+        // OT-RFC-43 §7's `msg.sender`/publisher diagram — the two coincide in
+        // the dominant self-publish case. The global `++_knowledgeAssetsCounter`
+        // is removed under 1a (packed-only; no post-tx canonical id).
+        if ((kaId >> 96) != uint256(uint160(author))) {
+            revert KaIdNamespaceMismatch(kaId, author);
+        }
+        // Fail fast on a re-used (author, number): the id must not already be
+        // minted. `_safeMint` below would also revert, but checking here keeps
+        // checks-effects-interactions ordering (no state mutation before the
+        // guard) and surfaces a precise error. `kaId` is guaranteed non-zero
+        // because `author != address(0)` (enforced upstream), so the `0`
+        // sentinel used by `getKnowledgeAssetId` / `isPartOfKnowledgeAsset` is
+        // never produced here.
+        if (_ownerOf(kaId) != address(0)) {
+            revert KaIdAlreadyMinted(kaId);
+        }
+        // Defense-in-depth (audit hardening): assert the KA struct slot is
+        // pristine, not merely unowned. `_ownerOf` proves the token was never
+        // minted, but `onlyContracts` setters (`setMerkleRoots` / `pushMerkleRoot`)
+        // could in principle pre-seed `knowledgeAssets[kaId]` for an unminted id,
+        // which would make the index-0 `merkleRootAuthors` write below land at the
+        // wrong index. Under the retired `++_knowledgeAssetsCounter` scheme a fresh
+        // id was structurally never-touched; with caller-supplied ids we assert it.
+        if (knowledgeAssets[kaId].merkleRoots.length != 0) {
+            revert KaIdAlreadyMinted(kaId);
+        }
+
+        uint256 knowledgeAssetId = kaId;
 
         KnowledgeAssetLib.KnowledgeAsset storage kc = knowledgeAssets[knowledgeAssetId];
 
         kc.merkleRoots.push(
             KnowledgeAssetLib.MerkleRoot(publisher, merkleRoot, block.timestamp)
         );
-        // Unconditional write to overwrite any value at this slot.
-        // For `createKnowledgeAsset` the kaId is freshly minted so
-        // the slot is guaranteed empty; the unconditional shape is kept
-        // for parity with `updateKnowledgeAsset` below, where the
-        // index can have been previously used (post-pop).
+        // First root of a fresh KA — index 0. `kaId` was just proven unminted
+        // above (and `_safeMint` re-enforces it), so this parallel slot is
+        // empty; the unconditional shape is kept for parity with
+        // `updateKnowledgeAsset` below, where the index can have been
+        // previously used (post-pop).
         merkleRootAuthors[knowledgeAssetId][kc.merkleRoots.length - 1] = author;
         kc.byteSize = byteSize;
         kc.startEpoch = startEpoch;
@@ -240,10 +300,12 @@ contract DKGKnowledgeAssets is INamed, IVersioned, HubDependent, ERC721, Guardia
         return knowledgeAssets[id];
     }
 
-    /// @dev `author` is the verified author identity for this update or
-    ///      `address(0)` when the update path doesn't carry an attestation
-    ///      (current V10.1 update path emits zero; vNext will sign updates
-    ///      against the same EIP-712 envelope as publish).
+    /// @dev `author` is the verified author identity for this update. The
+    ///      V10.1 update path attests the author (EIP-712) and enforces
+    ///      owner-only in `KnowledgeAssetsLifecycle._executeUpdateCore`
+    ///      (OT-RFC-45), so callers on that path pass a non-zero, verified
+    ///      author. `address(0)` only on admin/legacy paths that carry no
+    ///      attestation.
     function updateKnowledgeAsset(
         address publisher,
         address author,
@@ -268,9 +330,10 @@ contract DKGKnowledgeAssets is INamed, IVersioned, HubDependent, ERC721, Guardia
         // Unconditional overwrite — this index may have been written by
         // a previous create/update and then popped via `popMerkleRoot`,
         // leaving the stale author in the parallel slot. Always write
-        // the current `author` (which is `address(0)` for the V10.1
-        // update path that doesn't yet sign updates) to make the
-        // canonical mapping monotonic with the merkleRoots array.
+        // the current `author` (the verified EIP-712 author the V10.1
+        // lifecycle update path supplies; `address(0)` only on admin/legacy
+        // paths) to make the canonical mapping monotonic with the
+        // merkleRoots array.
         merkleRootAuthors[id][kc.merkleRoots.length - 1] = author;
         kc.byteSize = byteSize;
         kc.tokenAmount = tokenAmount;
@@ -504,8 +567,9 @@ contract DKGKnowledgeAssets is INamed, IVersioned, HubDependent, ERC721, Guardia
 
     /// @notice Verified author identity for the latest merkle-root entry
     /// of `id`. Returns `address(0)` if the latest state change did not
-    /// carry an author attestation (legacy publish path or a pre-vNext
-    /// update). Used by `/api/get` and other off-chain readers as the
+    /// carry an author attestation (legacy/admin path only; both the publish
+    /// and the V10.1 update path now attest the author — OT-RFC-45). Used by
+    /// `/api/get` and other off-chain readers as the
     /// canonical "who authored this KC" lookup — chain wins over any
     /// off-chain `dkg:authoredBy` triple.
     function getLatestMerkleRootAuthor(uint256 id) external view returns (address) {
@@ -611,8 +675,12 @@ contract DKGKnowledgeAssets is INamed, IVersioned, HubDependent, ERC721, Guardia
         emit KnowledgeAssetEndEpochUpdated(id, _endEpoch);
     }
 
-    function getLatestKnowledgeAssetId() external view returns (uint256) {
-        return _knowledgeAssetsCounter;
+    /// @notice DEPRECATED under OT-RFC-43 Option 1 (variant 1a). KA ids are
+    ///         packed (author<<96)|number values, not globally sequential, so a
+    ///         single "latest id" is meaningless. Always reverts — enumerate
+    ///         KAs via the `KnowledgeAssetCreated` event (or per-CG lists).
+    function getLatestKnowledgeAssetId() external pure returns (uint256) {
+        revert GetLatestKnowledgeAssetIdDeprecated();
     }
 
     function currentTotalSupply() external view returns (uint256) {

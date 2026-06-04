@@ -510,6 +510,8 @@ Identical for both options (the merkle/signature don't depend on how the id is a
 
 Data triples move out of the partition graph into the shared-memory graph (reserved subjects stay behind).
 
+> **"Reserved subjects stay behind" is itself under review** — see *Where import provenance belongs* below (this §7) and Open #11. Those subjects are arguably metadata that should live in `_meta` (outside the layers), not in the WM data partition at all; leaving them in WM is what forces the `share`-time reserved-prefix filter and produces the UI / dangling-reference symptoms documented there.
+
 GRAPH `…/_shared_memory` (the 3 `ex:` subjects, re-homed verbatim):
 
 ```
@@ -608,6 +610,35 @@ Same lifecycle URN and same `kaId` in both options (7 / 42); the contract pushes
 ```
 
 The UAL is unchanged; the KA is unchanged — only a new assertion (merkle state) is added to its history. That's the "file with versions" model.
+
+### Where import provenance belongs — `_meta`, not the layered data graph (open)
+
+The T1 / T3 listings above place the **import-provenance subjects** (`<urn:dkg:file:*> rdf:type dkg:File`, `<urn:dkg:extraction:*> rdf:type dkg:ExtractionProvenance`) in the WM **data partition**, and `share` then leaves them behind ("reserved subjects stay behind"). Implemented as described, this is the source of a recurring class of bugs and it sits awkwardly against the model this RFC otherwise advocates. Flagged here as an open design point (Open #11).
+
+**Observation (verified on a live node, `oxigraph-server` backend).** After a markdown import + `share`, the assertion's *knowledge* (the named root entity + its blank-node section children) correctly moves to `…/_shared_memory` and the lifecycle marker flips to SWM — but the assertion data graph retains exactly the `dkg:File` + `dkg:ExtractionProvenance` triples. Crucially, **`_meta` already carries the same provenance as literals on the lifecycle subject**: `dkg:sourceFileName`, `dkg:sourceFileHash`, `dkg:sourceContentType`, `dkg:extractionMethod`, `dkg:extractionStatus`, `dkg:structuralTripleCount`, `dkg:semanticTripleCount`. So the structured `dkg:File` / `dkg:ExtractionProvenance` nodes in the data partition are a **second, redundant representation** of facts already in `_meta` — but located *inside a memory layer* instead of outside it.
+
+**The principle.** Knowledge moves WM → SWM → VM; **metadata describing how that knowledge came to be should not live in any layer.** `_meta` is precisely the layer-independent home, and it is already where every other piece of assertion metadata lives (the seal, the `prov:` lifecycle events, the `dkg:memoryLayer` markers, and — already — the source/extraction literals above). Import provenance is the same *kind* of thing and belongs there too, not in the WM data graph.
+
+**Why the current placement is a smell, not just a preference.** Three downstream problems exist *only because* the provenance was written into the layer flow:
+
+- **The `share`-time reserved-prefix filter** (`isReservedSubject` in [`dkg-publisher.ts`](https://github.com/OriginTrail/dkg/blob/main/packages/publisher/src/dkg-publisher.ts)) exists solely to strip `urn:dkg:file:*` / `urn:dkg:extraction:*` back out of the data on the way to SWM. If the provenance were never in the data graph, the filter would be unnecessary.
+- **The node-UI counts these reserved subjects as promotable WM content**, so after "Promote/Share all" the WM layer still reports leftover triples ("N can be promoted" / "8 triples left") even though the daemon will never promote them — a persistent "did the share actually work?" confusion.
+- **A dangling cross-layer reference.** The document entity keeps its `dkg:sourceFile` / `dkg:markdownForm` edge when it moves to SWM (its *subject* is the entity, so the filter keeps it), but the `dkg:File` **body** it points at stays in WM. A collaborator pulling SWM gets a `sourceFile` link that dead-ends.
+
+Moving the provenance to `_meta` dissolves all three at the source, and makes Merkle-exclusion automatic — metadata that is never in the data graph can never leak into a KA's Merkle — rather than filter-dependent.
+
+**The unresolved tension with [OT-RFC-44](OT-RFC-44-file-equals-ka.md).** The same `urn:dkg:file:*` subject is treated three different ways across the runtime and these RFCs, and they are not reconciled:
+
+1. **Today's runtime** — an inert WM-data provenance node, filtered out of `share`.
+2. **This RFC, §7 T1/T3** — "reserved import-provenance" that *stays in the WM layer*.
+3. **OT-RFC-44** — a **File = Knowledge Asset**: a first-class, *publishable* thing.
+
+A plausible reconciliation is to **split the two concepts**:
+
+- **`ExtractionProvenance`** (how / when / by whom an assertion was produced) is unambiguously assertion metadata → `_meta`. It is never a KA.
+- **The File** (the source blob) is what RFC-44 wants to elevate to a KA — but if so it should be its *own* assertion with its *own* lifecycle, not a node squatting in another assertion's WM data graph. The document entity's `dkg:sourceFile` edge then becomes a proper inter-KA reference (the "forward references" of §4.6), not a dangling pointer.
+
+Either resolution is compatible with the rest of this RFC; the status quo — structured provenance nodes living in the layered data partition — is the one option that is not.
 
 ### What identifier exists at each step
 
@@ -1427,6 +1458,7 @@ Single-node tests will pass even when the model is wrong; the failure modes here
    - *Verb rename (`promote` → `share`):* decided (§10.6) and bundled into **Phase 1** alongside the §10.5 API model (the new routes use `share` from day one; §10.5.7, §11.0). Touches the API path (`/swm/promote` → `/swm/share`), side-effect-flag names (`autoPromoteSwm` / `alsoPromoteSwm` → `alsoShareSwm`, unified per §10.5.5), data predicates (`dkg:state "promoted"` → `dkg:state "shared"`, `dkg:AssertionPromoted` → `dkg:AssertionShared`), and the emitter function name (`generateAssertionPromotedMetadata` → `generateAssertionSharedMetadata`). Open: confirm the dual-read window length (one or two releases?) and whether `308 Permanent Redirect` from the legacy route is sufficient or also needs the body-flag aliasing on `vm/publish`.
 9. **Update authority — owner-only vs curator-delegated (live discrepancy) — now tracked as its own RFC ([OT-RFC-45](OT-RFC-45-update-authority-owner-only.md)).** Verified against `main`@`1ae3ffd7`: the `KnowledgeAssetsLifecycle` header (lines 71–84) documents a **two-branch** update gate — curated CGs (`publishPolicy==0`) delegate to `isAuthorizedPublisher` (curator + PCA inherit update rights); open CGs (`publishPolicy==1`) pin to the original publisher (`merkleRoots[0].publisher`). The live `_executeUpdateCore` (~1322–1327) does **neither** — it is a single unconditional **owner-only** check (`ownerOf(kaId) == attestedAuthor`, no `isAuthorizedPublisher` call, no policy branch). So *both* documented branches are wrong, not just the curated one. The publish path *does* implement the delegation machinery (`isAuthorizedPublisher` + PCA agents, verified), which is presumably why the header assumed update mirrored it. Recommendation (carried in RFC-45): ratify owner-only as canonical, fix the header, treat PCA-delegated update as a future opt-in flag. This gates the §8.7 team-update story and must be signed off before Phase 1 freezes the public surface. Ties into Open #3.
 10. **HTTP API phasing (§10.5 / §10.5.7) — recommendation now resolved, confirm:** the resource **model** (GitHub-shaped routes, three-resource model, `wm/pull-from`) ships in **Phase 1** (identity-agnostic, part of the v10.0 floor), and only the pre-known **`(agent, number)` addressing** waits for Option 1 in Phase 3 — added as an additional identifier form on the *same* routes, not a second route shape (§10.5.7). This avoids the "two identifier styles" trap while letting the clean surface ship in v10.0. Open: confirm this split (vs. the older "bundle all of §10.5 into Phase 3" position), and confirm dual-route + 308 redirects (preferred) over a hard cut.
+11. **Where import provenance lives (§7 *Where import provenance belongs*).** Should the structured `dkg:File` / `dkg:ExtractionProvenance` nodes move out of the WM data partition into `_meta` — where the equivalent `dkg:sourceFileName` / `dkg:sourceFileHash` / `dkg:extractionMethod` literals already sit (verified on a live node)? The current placement (provenance inside the layered data graph) is what forces the `share`-time `isReservedSubject` filter, makes the node-UI miscount reserved subjects as promotable WM content, and leaves a dangling cross-layer `dkg:sourceFile` reference from the promoted SWM entity into a WM-only file body. This decision ties into the crux for [OT-RFC-44](OT-RFC-44-file-equals-ka.md): **is a source file "metadata about an assertion" (→ `_meta`) or "a Knowledge Asset in its own right" (→ its own lifecycle)?** Recommendation: route `ExtractionProvenance` to `_meta` unconditionally (it is never a KA); decide the `File` node's home jointly with RFC-44 (own KA/lifecycle vs `_meta` blob descriptor), but in no case leave it as a node squatting in another assertion's WM data partition.
 
 ## 13. Out of scope
 

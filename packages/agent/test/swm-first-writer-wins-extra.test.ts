@@ -28,6 +28,7 @@
  * on a single publisher instance (which is the enforcement boundary).
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { makeTestKaNumberAllocator } from "./_helpers/ka-allocator.js";
 import { ethers } from 'ethers';
 import { DKGAgent } from '../src/index.js';
 import {
@@ -59,6 +60,7 @@ beforeAll(async () => {
     provider, hubAddress, HARDHAT_KEYS.DEPLOYER, coreOp.address, ethers.parseEther('1000000'),
   );
   node = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
     name: 'A3FirstWriter',
     listenPort: 0,
     skills: [],

@@ -1,4 +1,5 @@
 import { describe, it, expect, afterEach, beforeAll, afterAll } from 'vitest';
+import { makeTestKaNumberAllocator } from "./_helpers/ka-allocator.js";
 import { DKGAgent } from '../src/index.js';
 import { DKGNode } from '@origintrail-official/dkg-core';
 import { createEVMAdapter, getSharedContext, createProvider, takeSnapshot, revertSnapshot, HARDHAT_KEYS } from '../../chain/test/evm-test-context.js';
@@ -51,6 +52,7 @@ function sleep(ms: number) { return new Promise(r => setTimeout(r, ms)); }
 describe('Two-Agent E2E', () => {
   it('agents connect, publish profiles, discover each other via GossipSub', async () => {
     const agentA = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'AlphaBot',
       framework: 'OpenClaw',
       listenPort: 0,
@@ -65,6 +67,7 @@ describe('Two-Agent E2E', () => {
     await agentA.start();
 
     const agentB = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'BetaBot',
       framework: 'ElizaOS',
       listenPort: 0,
@@ -108,11 +111,13 @@ describe('Two-Agent E2E', () => {
 
   it('agents exchange chat messages', async () => {
     const agentA = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'ChatA', listenPort: 0, skills: [], chainAdapter: createEVMAdapter(HARDHAT_KEYS.CORE_OP),
     });
     agents.push(agentA);
 
     const agentB = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'ChatB', listenPort: 0, skills: [], chainAdapter: createEVMAdapter(HARDHAT_KEYS.CORE_OP),
     });
     agents.push(agentB);
@@ -143,6 +148,7 @@ describe('Two-Agent E2E', () => {
 
   it('chat to unknown peer fails gracefully', async () => {
     const agent = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'LonelyBot', listenPort: 0, skills: [], chainAdapter: createEVMAdapter(HARDHAT_KEYS.CORE_OP),
     });
     agents.push(agent);
@@ -155,6 +161,7 @@ describe('Two-Agent E2E', () => {
 
   it('agents publish and query knowledge in a custom contextGraph', async () => {
     const agentA = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'KnowledgeA', listenPort: 0, skills: [], chainAdapter: createEVMAdapter(HARDHAT_KEYS.CORE_OP),
     });
     agents.push(agentA);
@@ -197,6 +204,7 @@ describe('Relay E2E', () => {
     expect(relayAddr).toBeDefined();
 
     const agentA = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'RelayAgentA',
       listenPort: 0,
       skills: [],
@@ -206,6 +214,7 @@ describe('Relay E2E', () => {
     agents.push(agentA);
 
     const agentB = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'RelayAgentB',
       listenPort: 0,
       skills: [],
@@ -254,6 +263,7 @@ describe('Relay E2E', () => {
     // when dialProtocol triggers a peerStore.merge (on 0.0.0.0 the address
     // resolution includes multi-homed IPs that the CM doesn't auto-dial).
     const agentA = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'RelayAgentA',
       listenPort: 0,
       listenHost: '127.0.0.1',
@@ -264,6 +274,7 @@ describe('Relay E2E', () => {
     agents.push(agentA);
 
     const agentB = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'RelayAgentB',
       listenPort: 0,
       listenHost: '127.0.0.1',

@@ -1155,6 +1155,25 @@ export class MockChainAdapter implements ChainAdapter {
     return this.getKnowledgeAssetsLifecycleAddress();
   }
 
+  /**
+   * OT-RFC-43 Option 1 — highest per-author KA number minted in this mock, or
+   * -1n if none. Scans the in-memory collections (keyed by kaId; reservedKaId
+   * publishes store the packed id) and returns `max(kaId & ((1<<96)-1))` for
+   * the author. Mirrors the EVM adapter's KnowledgeAssetCreated-by-author scan.
+   */
+  async getMaxKaNumberForAuthor(author: string): Promise<bigint> {
+    const target = author.toLowerCase();
+    const MASK = (1n << 96n) - 1n;
+    let max = -1n;
+    for (const [kaId, c] of this.collections) {
+      if (c.authorAddress.toLowerCase() === target) {
+        const num = kaId & MASK;
+        if (num > max) max = num;
+      }
+    }
+    return max;
+  }
+
   async getEvmChainId(): Promise<bigint> {
     return 31337n;
   }
@@ -1218,7 +1237,11 @@ export class MockChainAdapter implements ChainAdapter {
         'Allow the address first to model explicit mock support for address-specific publishing.',
       );
     }
-    const kaId = this.nextBatchId++;
+    // OT-RFC-43 Option 1: honor a caller-supplied packed reservedKaId so a
+    // publisher test driven through the mock observes the deterministic id it
+    // reserved; fall back to the sequential mock id otherwise (the ~680 legacy
+    // fixtures that never set reservedKaId are unaffected).
+    const kaId = params.reservedKaId ?? this.nextBatchId++;
     this.collections.set(kaId, {
       merkleRoot: params.merkleRoot,
       kaCount: params.knowledgeAssetsAmount,

@@ -11,6 +11,7 @@
  * 8. Two-node replication: sub-graph publish replicates to peer
  */
 import { describe, it, expect, afterEach, beforeAll, afterAll } from 'vitest';
+import { makeTestKaNumberAllocator } from "./_helpers/ka-allocator.js";
 import { DKGAgent } from '../src/index.js';
 import { createEVMAdapter, getSharedContext, createProvider, takeSnapshot, revertSnapshot, HARDHAT_KEYS } from '../../chain/test/evm-test-context.js';
 import { mintTokens } from '../../chain/test/hardhat-harness.js';
@@ -46,6 +47,7 @@ function sleep(ms: number) { return new Promise(r => setTimeout(r, ms)); }
 describe('Sub-graph lifecycle (single agent)', () => {
   it('creates sub-graphs and lists them', async () => {
     const agent = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'SubGraphBot',
       listenPort: 0,
       skills: [],
@@ -74,6 +76,7 @@ describe('Sub-graph lifecycle (single agent)', () => {
 
   it('rejects invalid sub-graph names', async () => {
     const agent = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'ValidationBot',
       listenPort: 0,
       skills: [],
@@ -96,6 +99,7 @@ describe('Sub-graph lifecycle (single agent)', () => {
 
   it('rejects sub-graph on non-existent context graph', async () => {
     const agent = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'MissingCgBot',
       listenPort: 0,
       skills: [],
@@ -110,6 +114,7 @@ describe('Sub-graph lifecycle (single agent)', () => {
 
   it('removes a sub-graph', async () => {
     const agent = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'RemoveBot',
       listenPort: 0,
       skills: [],
@@ -137,6 +142,7 @@ describe('Sub-graph lifecycle (single agent)', () => {
 describe('Sub-graph publish + query (single agent)', () => {
   it('publishes to a sub-graph and queries it back', async () => {
     const agent = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'PubSubGraphBot',
       listenPort: 0,
       skills: [],
@@ -166,6 +172,7 @@ describe('Sub-graph publish + query (single agent)', () => {
 
   it('sub-graph data is isolated from root data graph', async () => {
     const agent = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'IsolationBot',
       listenPort: 0,
       skills: [],
@@ -208,6 +215,7 @@ describe('Sub-graph publish + query (single agent)', () => {
 
   it('different sub-graphs are isolated from each other', async () => {
     const agent = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'MultiSubBot',
       listenPort: 0,
       skills: [],
@@ -247,6 +255,7 @@ describe('Sub-graph publish + query (single agent)', () => {
 
   it('publishFromSharedMemory targets sub-graph', async () => {
     const agent = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'SWMSubBot',
       listenPort: 0,
       skills: [],
@@ -302,9 +311,11 @@ describe('Sub-graph publish + query (single agent)', () => {
 describe('Sub-graph replication (two agents)', () => {
   it('sub-graph publish on A replicates to B', async () => {
     const agentA = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'SubReplicaA', listenPort: 0, skills: [], chainAdapter: createEVMAdapter(HARDHAT_KEYS.CORE_OP),
     });
     const agentB = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'SubReplicaB', listenPort: 0, skills: [], chainAdapter: createEVMAdapter(HARDHAT_KEYS.CORE_OP),
     });
     agents.push(agentA, agentB);
@@ -360,6 +371,7 @@ describe('Sub-graph replication (two agents)', () => {
 describe('Sub-graph across memory layers (single agent)', () => {
   it('shares to sub-graph SWM and queries it back', async () => {
     const agent = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'SwmSubBot',
       listenPort: 0,
       skills: [],
@@ -394,6 +406,7 @@ describe('Sub-graph across memory layers (single agent)', () => {
 
   it('assertion.write accepts Quad[] input', async () => {
     const agent = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'QuadDraftBot',
       listenPort: 0,
       skills: [],
@@ -419,6 +432,7 @@ describe('Sub-graph across memory layers (single agent)', () => {
 
   it('assertion.write accepts JSON-LD input', async () => {
     const agent = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'JsonLdInputBot',
       listenPort: 0,
       skills: [],
@@ -447,6 +461,7 @@ describe('Sub-graph across memory layers (single agent)', () => {
 
   it('WM assertion with subGraphName → promote to sub-graph SWM', async () => {
     const agent = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'AssertionSubBot',
       listenPort: 0,
       skills: [],
@@ -500,6 +515,7 @@ describe('Sub-graph across memory layers (single agent)', () => {
 
   it('full pipeline: WM assertion → SWM → VM (sub-graph scoped)', async () => {
     const agent = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'PipelineBot',
       listenPort: 0,
       skills: [],
@@ -556,6 +572,7 @@ describe('Sub-graph across memory layers (single agent)', () => {
 
   it('sub-graph SWM data is isolated between sub-graphs', async () => {
     const agent = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'IsoSwmBot',
       listenPort: 0,
       skills: [],

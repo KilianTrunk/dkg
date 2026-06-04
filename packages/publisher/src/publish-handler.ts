@@ -21,7 +21,7 @@ import {
   getConfirmedStatusQuad,
   type KAMetadata,
 } from './metadata.js';
-import { autoPartition } from './auto-partition.js';
+import { skolemizeByEntity } from './auto-partition.js';
 import { PublishJournal, type JournalEntry } from './publish-journal.js';
 
 interface PendingPublish {
@@ -224,7 +224,7 @@ export class PublishHandler {
       assertNoUserAuthoredTrustLevelQuads(quads);
 
       const manifest = request.kas.map((ka) => ({
-        tokenId: BigInt(typeof ka.tokenId === 'number' ? ka.tokenId : 0),
+        tokenId: protoToBigInt(ka.tokenId),
         rootEntity: ka.rootEntity,
         privateTripleCount: ka.privateTripleCount,
       }));
@@ -242,7 +242,7 @@ export class PublishHandler {
         .map(ka => new Uint8Array(ka.privateMerkleRoot));
       const computedMerkleRoot = computeFlatKCRoot(quads, privateRoots);
 
-      const partitioned = autoPartition(quads);
+      const partitioned = skolemizeByEntity(quads);
 
       // ── UAL consistency ──
       const startKAId = protoToBigInt(request.startKAId);
@@ -286,7 +286,7 @@ export class PublishHandler {
       const kaMetadata: KAMetadata[] = manifest.map((m, i) => ({
         rootEntity: m.rootEntity,
         kcUal: request.ual,
-        tokenId: m.tokenId,
+        tokenId: BigInt(i + 1),
         publicTripleCount: (partitioned.get(m.rootEntity) ?? []).length,
         privateTripleCount: m.privateTripleCount ?? 0,
         privateMerkleRoot: request.kas[i].privateMerkleRoot?.length
@@ -299,7 +299,7 @@ export class PublishHandler {
           ual: request.ual,
           contextGraphId,
           merkleRoot: computedMerkleRoot,
-          kaCount: manifest.length,
+          kaCount: kaMetadata.length > 0 ? 1 : 0,
           publisherPeerId: fromPeerId,
           timestamp: new Date(),
         },
@@ -612,7 +612,9 @@ function verifyUALConsistency(
   return errors;
 }
 
-function protoToBigInt(val: number | { low: number; high: number; unsigned: boolean }): bigint {
+function protoToBigInt(val: string | number | bigint | { low: number; high: number; unsigned: boolean }): bigint {
+  if (typeof val === 'string') return BigInt(val);
+  if (typeof val === 'bigint') return val;
   if (typeof val === 'number') return BigInt(val);
   const lo = BigInt(val.low >>> 0);
   const hi = BigInt(val.high >>> 0);

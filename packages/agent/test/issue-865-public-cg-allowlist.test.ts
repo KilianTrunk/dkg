@@ -20,6 +20,7 @@
  * case the original code was written for).
  */
 import { describe, it, expect, afterEach } from 'vitest';
+import { makeTestKaNumberAllocator } from "./_helpers/ka-allocator.js";
 import { OxigraphStore } from '@origintrail-official/dkg-storage';
 import {
   DKG_ONTOLOGY,
@@ -39,6 +40,7 @@ const CONTEXT_GRAPH_URI = `did:dkg:context-graph:${CG_ID}`;
 async function makeAgent() {
   const store = new OxigraphStore();
   const agent = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
     name: 'Issue865Host',
     framework: 'DKG',
     listenPort: 0,

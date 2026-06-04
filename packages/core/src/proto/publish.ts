@@ -15,7 +15,7 @@ import protobuf from 'protobufjs';
 const { Type, Field } = protobuf;
 
 export const KAManifestEntrySchema = new Type('KAManifestEntry')
-  .add(new Field('tokenId', 1, 'uint64'))
+  .add(new Field('tokenId', 1, 'string'))
   .add(new Field('rootEntity', 2, 'string'))
   .add(new Field('privateMerkleRoot', 3, 'bytes'))
   .add(new Field('privateTripleCount', 4, 'uint32'));
@@ -27,8 +27,8 @@ export const PublishRequestSchema = new Type('PublishRequest')
   .add(new Field('kas', 4, 'KAManifestEntry', 'repeated'))
   .add(new Field('publisherIdentity', 5, 'bytes'))
   .add(new Field('publisherAddress', 6, 'string'))
-  .add(new Field('startKAId', 7, 'uint64'))
-  .add(new Field('endKAId', 8, 'uint64'))
+  .add(new Field('startKAId', 7, 'string'))
+  .add(new Field('endKAId', 8, 'string'))
   .add(new Field('chainId', 9, 'string'))
   .add(new Field('publisherSignatureR', 10, 'bytes'))
   .add(new Field('publisherSignatureVs', 11, 'bytes'))
@@ -48,7 +48,7 @@ export const PublishAckSchema = new Type('PublishAck')
   .add(new Field('publicByteSize', 7, 'uint64'));
 
 export interface KAManifestEntryMsg {
-  tokenId: number | Long;
+  tokenId: string | number | bigint | Long;
   rootEntity: string;
   privateMerkleRoot: Uint8Array;
   privateTripleCount: number;
@@ -61,8 +61,8 @@ export interface PublishRequestMsg {
   kas: KAManifestEntryMsg[];
   publisherIdentity: Uint8Array;
   publisherAddress: string;
-  startKAId: number | Long;
-  endKAId: number | Long;
+  startKAId: string | number | bigint | Long;
+  endKAId: string | number | bigint | Long;
   chainId: string;
   publisherSignatureR: Uint8Array;
   publisherSignatureVs: Uint8Array;
@@ -89,9 +89,38 @@ export interface PublishAckMsg {
 
 type Long = { low: number; high: number; unsigned: boolean };
 
+/**
+ * Convert a KA id (tokenId / startKAId / endKAId) into the decimal-string
+ * wire shape. KA ids are packed Option-1 values
+ * `(uint160(author) << 96) | number` (~256-bit), which do NOT fit a uint64
+ * gossip field — encoding them as a uint64 threw
+ * `RangeError: Value … exceeds uint64 range` in the old `bigIntToProtoSafe`
+ * path. Per OT-RFC-43 §9 the id wire type is a decimal string, so we accept
+ * string / number / bigint / protobuf Long and emit the canonical decimal
+ * string losslessly.
+ */
+function idToProtoString(val: string | number | bigint | Long): string {
+  if (typeof val === 'string') return val;
+  if (typeof val === 'bigint') return val.toString();
+  if (typeof val === 'number') return val.toString();
+  const lo = BigInt(val.low >>> 0); const hi = BigInt(val.high >>> 0);
+  return ((hi << 32n) | lo).toString();
+}
+
 export function encodePublishRequest(msg: PublishRequestMsg): Uint8Array {
   return PublishRequestSchema.encode(
-    PublishRequestSchema.create(msg),
+    PublishRequestSchema.create({
+      ...msg,
+      kas: msg.kas.map((ka) => ({
+        ...ka,
+        tokenId: idToProtoString(ka.tokenId),
+      })),
+      startKAId: idToProtoString(msg.startKAId),
+      endKAId: idToProtoString(msg.endKAId),
+      ...(msg.blockNumber !== undefined
+        ? { blockNumber: msg.blockNumber }
+        : {}),
+    }),
   ).finish();
 }
 

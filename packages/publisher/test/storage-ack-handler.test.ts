@@ -74,13 +74,16 @@ describe('StorageACKHandler', () => {
 
   it('returns valid StorageACK for matching data', async () => {
     const handler = await createHandler(swmQuads);
+    // OT-RFC-44 / Design B: two member entities = ONE Knowledge Asset, so the
+    // ACK digest signs kaCount=1 (the value the publisher submits on chain),
+    // not the entity count. rootEntities still lists both member entities.
     const intent = encodePublishIntent({
       merkleRoot,
       contextGraphId,
       publisherPeerId: 'publisher-0',
       publicByteSize: 300,
       isPrivate: false,
-      kaCount: 2,
+      kaCount: 1,
       rootEntities: ['urn:entity:1', 'urn:entity:2'],
       epochs: 1,
       tokenAmountStr: '1000',
@@ -101,7 +104,7 @@ describe('StorageACKHandler', () => {
       TEST_KAV10_ADDR,
       cgIdBigInt,
       merkleRoot,
-      2n,
+      1n,
       300n,
       1n,
       1000n,

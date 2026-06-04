@@ -39,7 +39,7 @@ import {
   TRUST_LEVEL_PREDICATE,
   buildTrustLevelQuads,
   isTrustLevelQuad,
-  buildAuthorAttestationTypedData, AUTHOR_SCHEME_VERSION_V1, type AuthorAttestationTypedData,
+  buildAuthorAttestationTypedData, buildUpdateAuthorAttestationTypedData, AUTHOR_SCHEME_VERSION_V1, type AuthorAttestationTypedData,
   buildAssertionSealQuads, buildAssertionPublishReceiptQuads,
   parseAssertionSealQuads, type AssertionSeal,
   WORKSPACE_AGENT_ENCRYPTION_KEY_ALGORITHM_X25519,
@@ -102,7 +102,7 @@ import {
   ACKCollector, StorageACKHandler,
   VerifyCollector, VerifyProposalHandler, buildVerificationMetadata,
   resolveWorkspaceAgentRecipients,
-  computeTripleHashV10 as computeTripleHash, computeFlatKCRootV10 as computeFlatKCRoot, autoPartition, isReservedSubject, computePrivateRootV10 as computePrivateRoot,
+  computeTripleHashV10 as computeTripleHash, computeFlatKCRootV10 as computeFlatKCRoot, skolemizeByEntity, isReservedSubject, computePrivateRootV10 as computePrivateRoot,
   canonicalPublishPayload,
   resolveLiftWorkspaceSlice,
   validateLiftPublishPayload,
@@ -115,6 +115,9 @@ import {
   type PromoteJob, type PromoteListFilter,
   wrapAsRpcPreconditionIfApplicable,
   type PublishOptions, type PublishResult, type PhaseCallback, type KAMetadata, type CASCondition,
+  // OT-RFC-43 A2 — per-layer pointer + KA-id predicates and stamp helpers.
+  KA_ID_PRED, RESERVED_UAL_PRED,
+  WM_CURRENT_ASSERTION_PRED, SWM_CURRENT_ASSERTION_PRED, VM_CURRENT_ASSERTION_PRED,
   type CollectedACK, type LiftAuthorityProof, type LiftTransitionType,
   type LiftRequest, type LiftRequestAuthorSeal,
   type WorkspaceAgentRecipient,
@@ -1196,6 +1199,17 @@ export class PublishMethods extends DKGAgentBase {
         }`,
       );
     }
+    // V10 UPDATE StorageACK quorum. Wired here so BOTH update entry points
+    // reach it: the public `agent.update(...)` API and the A2 create-vs-
+    // update branch in `publishFromFinalizedAssertion` (which calls
+    // `this.update(...)`). The provider resolves the on-chain digest
+    // fields inside the publisher (via `chain.getUpdateAckDigestFields`)
+    // and collects core-node ACKs over `PROTOCOL_STORAGE_UPDATE_ACK`. The
+    // numeric on-chain cgId (`updateOnChainId`) is the ACK domain; we fall
+    // back to the cleartext `contextGraphId` only when the on-chain id
+    // could not be resolved (the provider re-resolves the digest cgId from
+    // the adapter regardless, so the digest TARGET stays chain-truth).
+    const v10UpdateACKProvider = this.createV10UpdateACKProvider(updateOnChainId ?? contextGraphId);
     const result = await this.publisher.update(kaId, {
       contextGraphId,
       quads,
@@ -1205,6 +1219,7 @@ export class PublishMethods extends DKGAgentBase {
       operationCtx: ctx,
       onPhase,
       precomputedUpdateAttestation: opts?.precomputedUpdateAttestation,
+      v10UpdateACKProvider,
     });
     this.log.info(ctx, `Update complete — status=${result.status}`);
 
@@ -1521,7 +1536,7 @@ export class PublishMethods extends DKGAgentBase {
     //    `buildAssertionSealQuads` rejects unsafe roots at the seal
     //    boundary. This guard surfaces the same failure earlier
     //    with a more actionable message.
-    const kaMap = autoPartition(quads);
+    const kaMap = skolemizeByEntity(quads);
     const allRootEntities = [...kaMap.keys()];
     const unsafeRootEntities = allRootEntities.filter((r) => !isSafeIri(r));
     if (unsafeRootEntities.length > 0) {
@@ -1541,7 +1556,7 @@ export class PublishMethods extends DKGAgentBase {
     }
     const allSkolemizedQuads = [...kaMap.values()].flat();
     const merkleRoot = computeFlatKCRoot(allSkolemizedQuads, []);
-    // 3b. Capture rootEntities from the SAME `autoPartition` call that
+    // 3b. Capture rootEntities from the SAME `skolemizeByEntity` call that
     //     drives the merkle leaves. The seal binds these so
     //     `publishFromFinalizedAssertion` can scope its SWM CONSTRUCT
     //     instead of bundling everything currently sitting in shared
@@ -1550,7 +1565,7 @@ export class PublishMethods extends DKGAgentBase {
     const rootEntities = allRootEntities;
     if (rootEntities.length === 0) {
       throw new Error(
-        `Cannot finalize assertion <${assertionUri}>: autoPartition produced ` +
+        `Cannot finalize assertion <${assertionUri}>: skolemizeByEntity produced ` +
           `no root entities. The assertion has no quads; add at least one ` +
           `user-authored quad on a non-reserved subject before finalizing.`,
       );
@@ -1756,6 +1771,81 @@ export class PublishMethods extends DKGAgentBase {
       finalizedAtIso,
       rootEntities,
     });
+
+    // ── OT-RFC-43 A2 — ALLOCATE-AT-FINALIZE + per-layer WM pointer ──
+    //
+    // This is the SINGLE source of truth for the packed kaId (eliminates the
+    // double-allocation the publish path used to do). If an allocator is
+    // present we reconcile its per-author floor once (lazy, cached on the
+    // agent), allocate the next (author, number), and stamp on the LIFECYCLE
+    // URN (NOT the assertion-graph URI):
+    //   dkg:kaId          = number (xsd:integer)
+    //   dkg:reservedUal   = did:dkg:<chainId>/<agentAddrLower>/<number>
+    //   dkg:wmCurrentAssertion = the seal merkle hex (bare, no 0x)
+    // publishFromFinalizedAssertion then READS dkg:kaId off `_meta` and
+    // threads it down so the publisher REUSES it instead of allocating again.
+    //
+    // We persist the WM pointer + kaId stamp atomically with the seal.
+    const lifecycleUri = assertionLifecycleUri(contextGraphId, agentAddress, name, opts?.subGraphName);
+    const merkleHexBare = ethers.hexlify(merkleRoot).slice(2);
+
+    // Has this lifecycle ALREADY reserved a kaId? (An update to a name that
+    // was previously finalized + published — its kaId must stay STABLE across
+    // versions, so we MUST NOT allocate a fresh number and overwrite it.) The
+    // assertion-graph seal is cleared on discard+recreate, but the kaId stamp
+    // lives on the lifecycle URN and survives, so this is the reliable signal.
+    const xsdInteger = '<http://www.w3.org/2001/XMLSchema#integer>';
+    const existingKaIdRes = await this.store.query(
+      `SELECT ?n WHERE { GRAPH <${metaGraph}> { <${lifecycleUri}> <${KA_ID_PRED}> ?n } } LIMIT 1`,
+    );
+    const hasExistingKaId =
+      existingKaIdRes.type === 'bindings' && existingKaIdRes.bindings.length > 0;
+
+    // Re-stamp the WM pointer (idempotent: drop any prior value first so a
+    // re-finalize / update advances WM without accumulating stale pointers).
+    await this._stampPointer(lifecycleUri, WM_CURRENT_ASSERTION_PRED, merkleHexBare, metaGraph);
+
+    if (this.kaNumberAllocator && !hasExistingKaId) {
+      const author = authorAddress;
+      const key = author.toLowerCase();
+      if (!this.reconciledKaAuthors.has(key)) {
+        let chainMax = -1n;
+        if (typeof this.chain.getMaxKaNumberForAuthor === 'function') {
+          try {
+            chainMax = await this.chain.getMaxKaNumberForAuthor(author);
+          } catch (err) {
+            throw new Error(
+              `OT-RFC-43 A2: failed to reconcile KA-number floor for author ${author} at finalize: ` +
+                (err instanceof Error ? err.message : String(err)),
+            );
+          }
+        }
+        if (chainMax >= 0n) {
+          // Pass the bigint straight through (PR #976 F6) — `Number()` would lose precision past 2^53.
+          this.kaNumberAllocator.reconcile(author, chainMax);
+        }
+        this.kaNumberAllocator.markReconciled();
+        this.reconciledKaAuthors.add(key);
+      }
+      const { number } = this.kaNumberAllocator.allocate(author);
+      // chainId here is the EVM uint256 from getEvmChainId(); the reservedUal
+      // uses the adapter's canonical chainId string to match resolveKaUal's
+      // UAL shape (did:dkg:<chainId>/<addr>/<number>).
+      const reservedUal = `did:dkg:${this.chain.chainId}/${author.toLowerCase()}/${number}`;
+      sealQuads.push({
+        subject: lifecycleUri,
+        predicate: KA_ID_PRED,
+        object: `"${number}"^^${xsdInteger}`,
+        graph: metaGraph,
+      });
+      sealQuads.push({
+        subject: lifecycleUri,
+        predicate: RESERVED_UAL_PRED,
+        object: `"${reservedUal}"`,
+        graph: metaGraph,
+      });
+    }
+
     await this.store.insert(sealQuads);
 
     return {
@@ -1865,7 +1955,7 @@ export class PublishMethods extends DKGAgentBase {
       );
     }
 
-    const kaMap = autoPartition(quads);
+    const kaMap = skolemizeByEntity(quads);
     const allSkolemizedQuads = [...kaMap.values()].flat();
     // Mirror the publisher's per-rootEntity private partition + root
     // derivation (see `dkg-publisher.ts:1526-1570`). Each public root
@@ -2495,62 +2585,302 @@ export class PublishMethods extends DKGAgentBase {
       }
     }
 
-    // 3. Run the standard publishFromSharedMemory flow with the
-    //    pre-computed attestation. The publisher will sanity-check
-    //    that its own merkle re-derivation matches the seal.
+    // ── OT-RFC-43 A2 (decision 3) — CREATE-VS-UPDATE ROUTING ──
     //
-    //    Round 4 review §9 — scope the SWM CONSTRUCT to the seal's
-    //    `rootEntities` instead of `'all'`. With `'all'` a named
-    //    publish would bundle every other promoted assertion sitting
-    //    in shared memory into the same KC; the publisher's recompute
-    //    would then disagree with the seal's `expectedMerkleRoot` and
-    //    flip to `tentative kaId: "0"`. The seal's rootEntities were
-    //    captured at finalize time from the same `autoPartition` call
-    //    that drove the merkle leaves, so this selection deterministically
-    //    yields the post-promote SWM slice the seal commits to.
-    const result = await this.publishFromSharedMemory(
-      contextGraphId,
-      { rootEntities: seal.rootEntities },
-      {
-        operationCtx: opts?.operationCtx,
-        onPhase: opts?.onPhase,
-        subGraphName: opts?.subGraphName,
-        publisherNodeIdentityIdOverride: opts?.publisherNodeIdentityIdOverride,
-        publishEpochs: opts?.publishEpochs,
-        clearSharedMemoryAfter: opts?.clearSharedMemoryAfter,
-        // Wired through to the inner publisher.publish() via
-        // publishFromSharedMemory's `precomputedAttestation` option.
-        // Skips the publisher's signing entirely.
-        precomputedAttestation: {
-          expectedMerkleRoot: seal.merkleRoot,
-          authorAddress: seal.authorAddress,
-          signature: { r: seal.authorAttestationR, vs: seal.authorAttestationVS },
-          schemeVersion: seal.authorSchemeVersion,
-        },
-      },
+    // BEFORE minting, read the per-layer VM pointer + the stamped kaId off the
+    // LIFECYCLE URN. If dkg:vmCurrentAssertion is SET this name has already
+    // been confirmed on-chain → this is an UPDATE (publish the SAME name
+    // twice), so call the update path with the existing kaId instead of a
+    // fresh mint. Otherwise → MINT, reusing the finalize-stamped kaId.
+    //
+    // This is the LOCAL named-lifecycle path only; the gossip-receiver
+    // "Complexity C" path (resolveUalByBatchId / update-handler.ts) is
+    // untouched.
+    const lifecycleUri = assertionLifecycleUri(contextGraphId, agentAddress, name, opts?.subGraphName);
+    const xsdInt = 'http://www.w3.org/2001/XMLSchema#integer';
+    const pointerRes = await this.store.query(
+      `SELECT ?vm ?kaNum WHERE { GRAPH <${metaGraph}> {
+        OPTIONAL { <${lifecycleUri}> <${VM_CURRENT_ASSERTION_PRED}> ?vm }
+        OPTIONAL { <${lifecycleUri}> <${KA_ID_PRED}> ?kaNum }
+      } } LIMIT 1`,
     );
+    const stripLit = (v?: string) => v?.replace(/^"/, '').replace(/"(\^\^<[^>]+>)?$/, '');
+    const pointerRow = pointerRes.type === 'bindings' ? pointerRes.bindings[0] : undefined;
+    const vmCurrent = stripLit(pointerRow?.['vm']);
+    const stampedNumberStr = stripLit(pointerRow?.['kaNum']);
 
-    // 4. On confirmed publish, write receipt triples to _meta.
-    if (result.status === 'confirmed' && result.onChainResult) {
+    // Re-pack the stamped per-author NUMBER into the full packed kaId:
+    //   kaId = (uint160(author) << 96) | number   (matches KaNumberAllocator)
+    let packedKaId: bigint | undefined;
+    if (stampedNumberStr != null && stampedNumberStr !== '') {
       try {
-        const receiptQuads = buildAssertionPublishReceiptQuads({
-          assertionUri,
-          metaGraph,
-          txHash: result.onChainResult.txHash ?? '',
-          blockNumber: BigInt(result.onChainResult.blockNumber ?? 0),
-          kaId: result.onChainResult.batchId ?? 0n,
-        });
-        await this.store.insert(receiptQuads);
+        const authorBits = BigInt(ethers.getAddress(seal.authorAddress));
+        packedKaId = (authorBits << 96n) | BigInt(stampedNumberStr);
       } catch (err) {
         this.log.warn(
           opts?.operationCtx ?? createOperationContext('publishFromSWM'),
-          `Failed to write publish receipt for <${assertionUri}>: ` +
+          `Failed to re-pack stamped kaId number "${stampedNumberStr}" for <${lifecycleUri}>: ` +
+            (err instanceof Error ? err.message : String(err)),
+        );
+      }
+    }
+
+    const newMerkleHexBare = ethers.hexlify(seal.merkleRoot).slice(2);
+
+    let result: PublishResult;
+    if (vmCurrent && packedKaId !== undefined) {
+      // ── UPDATE PATH ──
+      // The name already has a confirmed VM version. Reuse its kaId and call
+      // the on-chain update primitive. The publisher's update path recomputes
+      // the merkle from the SWM-selected quads and requires a
+      // precomputedUpdateAttestation over (kaId, newMerkleRoot, author); we
+      // mint it here from the seal's merkle using the seal's author signer.
+      const updateQuads = await this._loadSelectedSWMQuads(
+        contextGraphId,
+        { rootEntities: seal.rootEntities },
+        opts?.subGraphName,
+      );
+      const updateAttestation = await this._buildPrecomputedUpdateAttestationForSeal(
+        packedKaId,
+        seal,
+      );
+      result = await this.update(
+        packedKaId,
+        contextGraphId,
+        updateQuads.map((q) => ({ ...q, graph: '' })),
+        [],
+        {
+          operationCtx: opts?.operationCtx,
+          onPhase: opts?.onPhase,
+          precomputedUpdateAttestation: updateAttestation,
+        },
+      );
+
+      // Stamp UPDATE provenance + re-stamp VM/WM pointers to the new merkle.
+      if (result.status === 'confirmed' || result.status === 'tentative') {
+        try {
+          const priorBare = vmCurrent.startsWith('0x') ? vmCurrent.slice(2) : vmCurrent;
+          const priorUri = `${lifecycleUri}#assertion-${priorBare}`;
+          // Re-point VM + WM to the new merkle (drop-then-set), then record the
+          // revision chain via prov:wasRevisionOf <prior>.
+          await this._stampPointer(lifecycleUri, VM_CURRENT_ASSERTION_PRED, newMerkleHexBare, metaGraph);
+          await this._stampPointer(lifecycleUri, WM_CURRENT_ASSERTION_PRED, newMerkleHexBare, metaGraph);
+          await this.store.insert([
+            { subject: lifecycleUri, predicate: 'http://www.w3.org/ns/prov#wasRevisionOf', object: priorUri, graph: metaGraph },
+            { subject: priorUri, predicate: VM_CURRENT_ASSERTION_PRED, object: `"${priorBare}"`, graph: metaGraph },
+          ]);
+        } catch (err) {
+          this.log.warn(
+            opts?.operationCtx ?? createOperationContext('publishFromSWM'),
+            `Failed to stamp update provenance for <${lifecycleUri}>: ` +
+              (err instanceof Error ? err.message : String(err)),
+          );
+        }
+      }
+    } else {
+      // ── MINT PATH ──
+      // Round 4 review §9 — scope the SWM CONSTRUCT to the seal's
+      // `rootEntities` instead of `'all'`. The seal's rootEntities were
+      // captured at finalize time so this selection deterministically yields
+      // the post-promote SWM slice the seal commits to.
+      //
+      // OT-RFC-43 A2 (decision 1) — REUSE the finalize-stamped kaId. We thread
+      // `reservedKaId: packedKaId` down so ensureReservedKaId short-circuits
+      // (no second allocation). When no allocator stamped one (mock/no-chain),
+      // packedKaId is undefined and the publisher keeps its existing behavior.
+      result = await this.publishFromSharedMemory(
+        contextGraphId,
+        { rootEntities: seal.rootEntities },
+        {
+          operationCtx: opts?.operationCtx,
+          onPhase: opts?.onPhase,
+          subGraphName: opts?.subGraphName,
+          publisherNodeIdentityIdOverride: opts?.publisherNodeIdentityIdOverride,
+          publishEpochs: opts?.publishEpochs,
+          clearSharedMemoryAfter: opts?.clearSharedMemoryAfter,
+          reservedKaId: packedKaId,
+          // Wired through to the inner publisher.publish() via
+          // publishFromSharedMemory's `precomputedAttestation` option.
+          // Skips the publisher's signing entirely.
+          precomputedAttestation: {
+            expectedMerkleRoot: seal.merkleRoot,
+            authorAddress: seal.authorAddress,
+            signature: { r: seal.authorAttestationR, vs: seal.authorAttestationVS },
+            schemeVersion: seal.authorSchemeVersion,
+          },
+        },
+      );
+
+      // On confirmed mint, stamp VM pointer + publish receipt on _meta.
+      if (result.status === 'confirmed' && result.onChainResult) {
+        try {
+          const receiptQuads = buildAssertionPublishReceiptQuads({
+            assertionUri,
+            metaGraph,
+            txHash: result.onChainResult.txHash ?? '',
+            blockNumber: BigInt(result.onChainResult.blockNumber ?? 0),
+            kaId: result.onChainResult.batchId ?? 0n,
+          });
+          await this.store.insert(receiptQuads);
+        } catch (err) {
+          this.log.warn(
+            opts?.operationCtx ?? createOperationContext('publishFromSWM'),
+            `Failed to write publish receipt for <${assertionUri}>: ` +
+              (err instanceof Error ? err.message : String(err)),
+          );
+        }
+      }
+    }
+
+    // OT-RFC-43 A2 (decision 2) — stamp the VM pointer on the lifecycle URN
+    // whenever the publish/update is confirmed. (For the mint path this is the
+    // first VM pointer; for the update path the DELETE/INSERT above already set
+    // it, and this idempotent re-stamp is a no-op.)
+    if (result.status === 'confirmed' || result.status === 'tentative') {
+      try {
+        await this._stampPointer(lifecycleUri, VM_CURRENT_ASSERTION_PRED, newMerkleHexBare, metaGraph);
+        // OT-RFC-44 Design B — the assertion now lives at Verifiable Memory, so
+        // make its lifecycle marker match the on-chain reality: flip
+        // dkg:memoryLayer -> "VM" and dkg:state -> "published". The VM record is
+        // thus equivalent to the WM/SWM ones, with the extra transaction metadata
+        // (dkg:vmCurrentAssertion + dkg:kaId + the on-chain UAL) layered on top.
+        // Promote stamps memoryLayer "SWM" on BOTH the lifecycle-URN and the
+        // data-graph-URI forms, so flip both — otherwise the published assertion
+        // lingers in the Shared-Memory layer (the dedicated published-metadata
+        // flip never fired: its trigger gate joins on dkg:rootEntity/dkg:agent
+        // predicates the lifecycle record does not carry).
+        const MEMORY_LAYER_PRED = 'http://dkg.io/ontology/memoryLayer';
+        const STATE_PRED = 'http://dkg.io/ontology/state';
+        for (const subj of [lifecycleUri, assertionUri]) {
+          await this.store.deleteByPattern({ subject: subj, predicate: MEMORY_LAYER_PRED, graph: metaGraph });
+          await this.store.insert([
+            { subject: subj, predicate: MEMORY_LAYER_PRED, object: `"${MemoryLayer.VerifiedMemory}"`, graph: metaGraph },
+          ]);
+        }
+        await this.store.deleteByPattern({ subject: lifecycleUri, predicate: STATE_PRED, graph: metaGraph });
+        await this.store.insert([
+          { subject: lifecycleUri, predicate: STATE_PRED, object: '"published"', graph: metaGraph },
+        ]);
+      } catch (err) {
+        this.log.warn(
+          opts?.operationCtx ?? createOperationContext('publishFromSWM'),
+          `Failed to stamp VM lifecycle marker for <${lifecycleUri}>: ` +
             (err instanceof Error ? err.message : String(err)),
         );
       }
     }
 
     return { ...result, assertionUri, seal };
+  }
+
+  /**
+   * OT-RFC-43 A2 — mint a `precomputedUpdateAttestation` over
+   * `UpdateAuthorAttestation(kaId, newMerkleRoot=seal.merkleRoot, author)` for
+   * the in-process update path. Signs with the SAME author the seal recorded:
+   * a custodial agent's local key when available, otherwise the publisher EOA
+   * (the finalize-time publisher fallback). Self-sovereign authors whose keys
+   * the daemon doesn't hold must use the explicit `/api/update` route with a
+   * pre-signed attestation.
+   */
+  async _buildPrecomputedUpdateAttestationForSeal(
+    this: DKGAgent,
+    kaId: bigint,
+    seal: AssertionSeal,
+  ): Promise<NonNullable<PublishOptions['precomputedUpdateAttestation']>> {
+    const typedData = buildUpdateAuthorAttestationTypedData({
+      chainId: seal.chainId,
+      kav10Address: seal.kav10Address,
+      kaId,
+      newMerkleRoot: seal.merkleRoot,
+      authorAddress: seal.authorAddress,
+      schemeVersion: seal.authorSchemeVersion,
+    });
+    const custodialKey = this.getCustodialAgentPrivateKey(seal.authorAddress);
+    let r: Uint8Array;
+    let vs: Uint8Array;
+    if (custodialKey) {
+      const wallet = new ethers.Wallet(custodialKey.startsWith('0x') ? custodialKey : '0x' + custodialKey);
+      const sigHex = await wallet.signTypedData(typedData.domain, typedData.types, typedData.message);
+      const sig = ethers.Signature.from(sigHex);
+      r = ethers.getBytes(sig.r);
+      vs = ethers.getBytes(sig.yParityAndS);
+    } else {
+      const fallbackAddress = await this.publisher.publisherFallbackAuthorAddress();
+      if (!fallbackAddress || fallbackAddress.toLowerCase() !== seal.authorAddress.toLowerCase()) {
+        throw new Error(
+          `publishFromFinalizedAssertion (update path): cannot re-sign UpdateAuthorAttestation for author ` +
+            `${seal.authorAddress} — no custodial key on file and it is not the publisher EOA. ` +
+            `Use the /api/update route with a pre-signed UpdateAuthorAttestation instead.`,
+        );
+      }
+      const compact = await this.publisher.signAuthorAttestationAsPublisher(typedData);
+      r = compact.r;
+      vs = compact.vs;
+    }
+    return {
+      expectedNewMerkleRoot: seal.merkleRoot,
+      authorAddress: seal.authorAddress,
+      signature: { r, vs },
+      schemeVersion: seal.authorSchemeVersion,
+    };
+  }
+
+  /**
+   * OT-RFC-43 A2 — idempotent per-layer pointer (re)stamp on the lifecycle URN.
+   * Drop-then-set the single value for `pred`. Uses `deleteByPattern` + `insert`
+   * (NOT a SPARQL UPDATE string) because the oxigraph storage adapter's
+   * `query()` rejects DELETE/INSERT — `stampLayerPointerSparql` is reserved for
+   * backends that accept UPDATE via query(). `merkleHex` is stored bare (no 0x).
+   */
+  async _stampPointer(
+    this: DKGAgent,
+    lifecycleUri: string,
+    pred: string,
+    merkleHex: string,
+    metaGraph: string,
+  ): Promise<void> {
+    const bare = merkleHex.startsWith('0x') ? merkleHex.slice(2) : merkleHex;
+    await this.store.deleteByPattern({ subject: lifecycleUri, predicate: pred, graph: metaGraph });
+    await this.store.insert([
+      { subject: lifecycleUri, predicate: pred, object: `"${bare}"`, graph: metaGraph },
+    ]);
+  }
+
+  /**
+   * OT-RFC-43 A2 (decision 2) — stamp `dkg:swmCurrentAssertion` on the
+   * lifecycle URN when an assertion is promoted/shared into SWM. The pointer
+   * value is the assertion's sealed merkle root hex (read from the seal on the
+   * assertion-graph URI). Best-effort: a missing seal (a non-finalized
+   * promote) leaves the SWM pointer unset, which `deriveStatus` reads as "not
+   * yet wm-sealed for SWM". Never throws — the SWM share itself already
+   * committed.
+   */
+  async _stampSwmPointer(
+    this: DKGAgent,
+    contextGraphId: string,
+    name: string,
+    agentAddress: string,
+    subGraphName?: string,
+  ): Promise<void> {
+    try {
+      const metaGraph = contextGraphMetaUri(contextGraphId);
+      const assertionUri = contextGraphAssertionUri(contextGraphId, agentAddress, name, subGraphName);
+      const lifecycleUri = assertionLifecycleUri(contextGraphId, agentAddress, name, subGraphName);
+      const metaResult = await this.store.query(
+        `CONSTRUCT { <${assertionUri}> ?p ?o } WHERE { GRAPH <${metaGraph}> { <${assertionUri}> ?p ?o } }`,
+      );
+      const metaQuads = metaResult.type === 'quads' ? metaResult.quads : [];
+      const seal = parseAssertionSealQuads(metaQuads, assertionUri);
+      if (!seal) return; // not finalized — nothing to point at
+      const merkleHexBare = ethers.hexlify(seal.merkleRoot).slice(2);
+      await this._stampPointer(lifecycleUri, SWM_CURRENT_ASSERTION_PRED, merkleHexBare, metaGraph);
+    } catch (err) {
+      this.log.warn(
+        createOperationContext('share'),
+        `Failed to stamp swmCurrentAssertion for "${name}" in "${contextGraphId}": ` +
+          (err instanceof Error ? err.message : String(err)),
+      );
+    }
   }
 
   /**
@@ -2590,6 +2920,15 @@ export class PublishMethods extends DKGAgentBase {
        */
       publisherNodeIdentityIdOverride?: bigint;
       publishEpochs?: number;
+      /**
+       * OT-RFC-43 A2 (decision 1) — precomputed packed kaId stamped at
+       * `assertionFinalize` (ALLOCATE-AT-FINALIZE). When set, the publisher's
+       * `ensureReservedKaId` REUSES it instead of allocating again, so a
+       * finalize→publish for one KA mints exactly the stamped id (no
+       * double-allocation). Undefined for direct/mock publishes — the
+       * publisher then keeps its existing allocate-at-publish behavior.
+       */
+      reservedKaId?: bigint;
       /**
        * RFC-001 §9.x — pre-computed attestation captured by
        * `agent.assertion.finalize()`. When the caller has already
@@ -2722,6 +3061,8 @@ export class PublishMethods extends DKGAgentBase {
       publisherNodeIdentityIdOverride: options?.publisherNodeIdentityIdOverride,
       publishEpochs: options?.publishEpochs,
       precomputedAttestation: resolvedSeal,
+      // OT-RFC-43 A2 — reuse the finalize-stamped packed kaId (no re-allocate).
+      reservedKaId: options?.reservedKaId,
       encryptInlinePayload,
       encryptInlineChunked,
     });

@@ -224,8 +224,17 @@ deploy_contracts() {
 
   echo "$hub_addr" > "$DEVNET_DIR/hardhat/hub_address"
 
-  # Lower minimumRequiredSignatures to 1 for devnet (default is 3, but the
-  # agent doesn't yet collect peer receiver signatures).
+  # Pin minimumRequiredSignatures to 3 — the protocol default / production value.
+  # ─────────────────────────────────────────────────────────────────────────
+  # NEVER lower this (e.g. to 1). The devnet MUST exercise the real 3-of-N
+  # StorageACK quorum so publish/consensus behaviour matches mainnet. A lower
+  # value silently hides quorum bugs and produces false "publishing works"
+  # signals. A publisher collects StorageACKs from its PEERS only (it does NOT
+  # sign its own quorum), so a VM publish needs `minimumRequiredSignatures`
+  # OTHER reachable core nodes — i.e. >= minSig + 1 core nodes total (>= 4 for
+  # minSig=3). Verified empirically: with only 3 core nodes a publish aborts
+  # with "need 3 ACKs but only 2 core peers connected — quorum impossible".
+  # DO NOT CHANGE THIS VALUE. ── important ──
   local ps_addr
   ps_addr=$(node -e "
     try{const d=JSON.parse(require('fs').readFileSync('$REPO_ROOT/packages/evm-module/deployments/localhost_contracts.json','utf8'));
@@ -239,8 +248,9 @@ deploy_contracts() {
         const provider = new ethers.JsonRpcProvider('http://127.0.0.1:$HARDHAT_PORT');
         const signer = await provider.getSigner(0);
         const ps = new ethers.Contract('$ps_addr', ['function setMinimumRequiredSignatures(uint256)'], signer);
-        await (await ps.setMinimumRequiredSignatures(1)).wait();
-        console.log('minimumRequiredSignatures set to 1');
+        // DO NOT CHANGE: must stay 3 (real 3-of-N quorum, matches mainnet).
+        await (await ps.setMinimumRequiredSignatures(3)).wait();
+        console.log('minimumRequiredSignatures set to 3');
       })();
     " 2>&1 | while read -r line; do log "$line"; done
   fi

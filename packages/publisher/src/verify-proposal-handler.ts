@@ -60,9 +60,9 @@ export class VerifyProposalHandler {
     }
 
     // Verify batch exists locally and merkle root matches
-    const batchId = typeof proposal.batchId === 'number'
-      ? BigInt(proposal.batchId)
-      : BigInt((proposal.batchId as any).low) | (BigInt((proposal.batchId as any).high) << 32n);
+    // batchId is a decimal string on the wire (OT-RFC-43 §9 256-bit id fix);
+    // tolerate legacy number / protobuf Long shapes for rolling upgrades.
+    const batchId = protoToBigInt(proposal.batchId);
 
     const localRoot = await this.deps.getBatchMerkleRoot(proposal.contextGraphId, batchId);
     if (!localRoot) {
@@ -105,4 +105,13 @@ export class VerifyProposalHandler {
     }
     return true;
   }
+}
+
+function protoToBigInt(
+  val: string | number | bigint | { low: number; high: number; unsigned: boolean },
+): bigint {
+  if (typeof val === 'string') return BigInt(val);
+  if (typeof val === 'bigint') return val;
+  if (typeof val === 'number') return BigInt(val);
+  return (BigInt(val.high >>> 0) << 32n) | BigInt(val.low >>> 0);
 }

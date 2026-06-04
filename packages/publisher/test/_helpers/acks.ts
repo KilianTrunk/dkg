@@ -162,12 +162,24 @@ export function makeHardhatUpdateACKProvider(
     identityId: BigInt(ctx.receiverIds[i]!),
     peerId: `in-memory-rec${i + 1}`,
   }));
-  return async (kaId, newMerkleRoot, _contextGraphIdStr, newByteSize, newMerkleLeafCount) => {
+  // New object-params signature (V10 UPDATE ACK collection). The publisher
+  // now sources ALL digest fields from `chain.getUpdateAckDigestFields`
+  // and hands them to the provider, so the in-memory signer binds the
+  // SAME `boundNewTokenAmount` the on-chain tx submits — no recompute
+  // drift. We still go through `chain.computeV10UpdateAckDigest` (passing
+  // `boundNewTokenAmount`) so the digest matches the on-chain verify
+  // byte-for-byte.
+  return async (params) => {
     const digest = await chain.computeV10UpdateAckDigest({
-      kaId,
-      newMerkleRoot,
-      newByteSize,
-      newMerkleLeafCount,
+      kaId: params.kaId,
+      newMerkleRoot: params.newMerkleRoot,
+      newByteSize: params.newByteSize,
+      newMerkleLeafCount: params.newMerkleLeafCount,
+      mintAmount: params.mintAmount,
+      burnTokenIds: params.burnTokenIds,
+      boundNewTokenAmount: params.newTokenAmount,
+      newCiphertextChunksRoot: params.newCiphertextChunksRoot,
+      newCiphertextChunkCount: params.newCiphertextChunkCount,
     });
     return Promise.all(
       wallets.map(async ({ wallet, identityId, peerId }) => {

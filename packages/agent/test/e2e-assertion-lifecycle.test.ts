@@ -12,6 +12,7 @@
  * 9. Two-node promote gossip — promoted data replicates via gossip
  */
 import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
+import { makeTestKaNumberAllocator } from "./_helpers/ka-allocator.js";
 import { DKGAgent } from '../src/index.js';
 import { createEVMAdapter, getSharedContext, createProvider, takeSnapshot, revertSnapshot, HARDHAT_KEYS } from '../../chain/test/evm-test-context.js';
 import { mintTokens } from '../../chain/test/hardhat-harness.js';
@@ -44,6 +45,7 @@ const CG_ID = 'assertion-e2e';
 
 async function createAgent(name: string) {
   const agent = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
     name,
     listenPort: 0,
     chainAdapter: createEVMAdapter(HARDHAT_KEYS.CORE_OP),
@@ -211,12 +213,14 @@ describe('Assertion lifecycle with sub-graphs', () => {
 describe('Assertion promote gossip (2 nodes)', () => {
   it('promoted data replicates to connected peer via gossip', async () => {
     const nodeA = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'PromoteGossipA',
       listenPort: 0,
       chainAdapter: createEVMAdapter(HARDHAT_KEYS.CORE_OP),
     });
     agents.push(nodeA);
     const nodeB = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'PromoteGossipB',
       listenPort: 0,
       chainAdapter: createEVMAdapter(HARDHAT_KEYS.CORE_OP),

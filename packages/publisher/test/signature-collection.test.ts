@@ -17,6 +17,7 @@ import { createEVMAdapter, getSharedContext, createProvider, takeSnapshot, rever
 import { mintTokens } from '../../chain/test/hardhat-harness.js';
 import { wrapPublisherForTest, buildSeal } from './_helpers/seal.js';
 import { makeHardhatReceiverACKProvider } from './_helpers/acks.js';
+import { makeTestKaAllocator } from './_helpers/ka-allocator.js';
 import type { V10ACKProvider } from '../src/publisher.js';
 
 let CONTEXT_GRAPH: string;
@@ -156,6 +157,7 @@ describe('Signature Collection Protocol', () => {
     eventBus = new TypedEventBus();
     const keypair = await generateEd25519Keypair();
     publisher = new DKGPublisher({
+      kaAllocator: makeTestKaAllocator(),
       store,
       chain,
       eventBus,
@@ -325,6 +327,7 @@ describe('Reordered Publish Flow (replicate-then-publish)', () => {
     eventBus = new TypedEventBus();
     const keypair = await generateEd25519Keypair();
     publisher = new DKGPublisher({
+      kaAllocator: makeTestKaAllocator(),
       store,
       chain,
       eventBus,
@@ -394,6 +397,7 @@ describe('Reordered Publish Flow (replicate-then-publish)', () => {
     // downgrade fails loudly here.
     const noAckPublisher = wrapPublisherForTest(
       new DKGPublisher({
+        kaAllocator: makeTestKaAllocator(),
         store,
         chain,
         eventBus,
@@ -453,6 +457,7 @@ describe('Reordered Publish Flow (replicate-then-publish)', () => {
     // downgrade on chain failure" actually guards.
     const failPublisher = wrapPublisherForTest(
       new DKGPublisher({
+        kaAllocator: makeTestKaAllocator(),
         store,
         chain: failChain,
         eventBus,
@@ -524,6 +529,7 @@ describe('Context Graph Enshrinement with Signatures', () => {
     eventBus = new TypedEventBus();
     const keypair = await generateEd25519Keypair();
     publisher = new DKGPublisher({
+      kaAllocator: makeTestKaAllocator(),
       store,
       chain,
       eventBus,
@@ -609,6 +615,7 @@ describe('PublishToContextGraph chain adapter method', () => {
     const eventBus = new TypedEventBus();
     const keypair = await generateEd25519Keypair();
     const _publisherRaw = new DKGPublisher({
+      kaAllocator: makeTestKaAllocator(),
       store,
       chain,
       eventBus,
@@ -668,6 +675,7 @@ describe('Regression: sorted and deduplicated participant signatures', () => {
     eventBus = new TypedEventBus();
     const keypair = await generateEd25519Keypair();
     publisher = new DKGPublisher({
+      kaAllocator: makeTestKaAllocator(),
       store,
       chain,
       eventBus,
@@ -777,6 +785,7 @@ describe('Regression: complete publish result fields', () => {
     const keypair = await generateEd25519Keypair();
     const wallet = new ethers.Wallet(HARDHAT_KEYS.CORE_OP);
     const _publisherRaw = new DKGPublisher({
+      kaAllocator: makeTestKaAllocator(),
       store,
       chain,
       eventBus,
@@ -839,6 +848,7 @@ describe('Regression: fail-fast when chain rejects', () => {
     const keypair = await generateEd25519Keypair();
 
     const _pubExtra1 = new DKGPublisher({
+      kaAllocator: makeTestKaAllocator(),
       store,
       chain,
       eventBus,
@@ -875,6 +885,7 @@ describe('Regression: fail-fast when chain rejects', () => {
     const keypair = await generateEd25519Keypair();
 
     const _pubExtra2 = new DKGPublisher({
+      kaAllocator: makeTestKaAllocator(),
       store,
       chain,
       eventBus,

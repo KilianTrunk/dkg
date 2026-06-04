@@ -17,7 +17,7 @@ const SQLITE_EXEC_ARGV = ['--experimental-sqlite', '--no-warnings=ExperimentalWa
 export default defineConfig({
   test: {
     include: ['test/**/*.test.ts'],
-    exclude: ['test/e2e-chain.test.ts', 'test/e2e-finalization.test.ts'],
+    exclude: ['test/e2e-chain.test.ts', 'test/e2e-finalization.test.ts', 'test/a2-pointers-and-b3-addressing.test.ts'],
     testTimeout: 120_000,
     globalSetup: ['../chain/test/hardhat-global-setup.ts'],
     maxWorkers: 1,

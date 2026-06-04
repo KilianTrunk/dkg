@@ -1,7 +1,7 @@
 import type { TripleStore, Quad } from '@origintrail-official/dkg-storage';
 import { GraphManager } from '@origintrail-official/dkg-storage';
 import type { EventBus } from '@origintrail-official/dkg-core';
-import { DKGEvent, Logger, createOperationContext, contextGraphDataUri, contextGraphMetaUri, DKG_ONTOLOGY, SYSTEM_CONTEXT_GRAPHS } from '@origintrail-official/dkg-core';
+import { DKGEvent, Logger, createOperationContext, contextGraphDataUri, contextGraphMetaUri, DKG_ONTOLOGY, SYSTEM_CONTEXT_GRAPHS, DKG_ENTITY, DKG_ROOT_ENTITY_LEGACY, ENTITY_PRED_ALT } from '@origintrail-official/dkg-core';
 import type { PhaseCallback } from './publisher.js';
 import {
   decodeGossipEnvelope,
@@ -1579,21 +1579,21 @@ export class SharedMemoryHandler {
    * preserving metadata for other roots written in the same operation.
    */
   private async deleteMetaForRoot(metaGraph: string, rootEntity: string): Promise<void> {
-    const DKG = 'http://dkg.io/ontology/';
     const result = await this.store.query(
-      `SELECT ?op WHERE { GRAPH <${metaGraph}> { ?op <${DKG}rootEntity> <${rootEntity}> } }`,
+      `SELECT DISTINCT ?op WHERE { GRAPH <${metaGraph}> { ?op ${ENTITY_PRED_ALT} <${rootEntity}> } }`,
     );
     if (result.type !== 'bindings') return;
     for (const row of result.bindings) {
       const op = row['op'];
       if (!op) continue;
 
-      await this.store.delete([{
-        subject: op, predicate: `${DKG}rootEntity`, object: rootEntity, graph: metaGraph,
-      }]);
+      await this.store.delete([
+        { subject: op, predicate: DKG_ROOT_ENTITY_LEGACY, object: rootEntity, graph: metaGraph },
+        { subject: op, predicate: DKG_ENTITY, object: rootEntity, graph: metaGraph },
+      ]);
 
       const remaining = await this.store.query(
-        `SELECT (COUNT(*) AS ?c) WHERE { GRAPH <${metaGraph}> { <${op}> <${DKG}rootEntity> ?r } }`,
+        `SELECT (COUNT(DISTINCT ?r) AS ?c) WHERE { GRAPH <${metaGraph}> { <${op}> ${ENTITY_PRED_ALT} ?r } }`,
       );
       const rawCount = remaining.type === 'bindings' && remaining.bindings[0]?.['c'];
       const countVal = parseCountLiteral(rawCount);

@@ -29,6 +29,7 @@ import { createEVMAdapter, getSharedContext, createProvider, takeSnapshot, rever
 import { mintTokens } from '../../chain/test/hardhat-harness.js';
 import { withSeal as _withSeal, withUpdateSeal as _withUpdateSeal } from './_helpers/seal.js';
 import { hardhatACKProvider } from './_helpers/acks.js';
+import { makeTestKaAllocator } from './_helpers/ka-allocator.js';
 
 let CONTEXT_GRAPH: string;
 let GRAPH: string;
@@ -107,6 +108,7 @@ describe('Publish lifecycle (aligned with diagram)', () => {
     const keypair = await generateEd25519Keypair();
 
     const publisher = new DKGPublisher({
+      kaAllocator: makeTestKaAllocator(),
       store, chain, eventBus: bus, keypair,
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
@@ -138,6 +140,7 @@ describe('Publish lifecycle (aligned with diagram)', () => {
     const keypair = await generateEd25519Keypair();
 
     const publisher = new DKGPublisher({
+      kaAllocator: makeTestKaAllocator(),
       store, chain, eventBus: bus, keypair,
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
@@ -175,6 +178,7 @@ describe('Publish lifecycle (aligned with diagram)', () => {
     const bus = new TypedEventBus();
     const keypair = await generateEd25519Keypair();
     const publisher = new DKGPublisher({
+      kaAllocator: makeTestKaAllocator(),
       store,
       chain,
       eventBus: bus,
@@ -221,6 +225,7 @@ describe('Publish lifecycle (aligned with diagram)', () => {
     const chain1 = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
     const keypair = await generateEd25519Keypair();
     const publisher1 = new DKGPublisher({
+      kaAllocator: makeTestKaAllocator(),
       store: store1,
       chain: chain1,
       eventBus: new TypedEventBus(),
@@ -236,6 +241,7 @@ describe('Publish lifecycle (aligned with diagram)', () => {
     const store2 = new OxigraphStore();
     const chain2 = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
     const publisher2 = new DKGPublisher({
+      kaAllocator: makeTestKaAllocator(),
       store: store2,
       chain: chain2,
       eventBus: new TypedEventBus(),
@@ -260,6 +266,7 @@ describe('Publish lifecycle (aligned with diagram)', () => {
     const keypair = await generateEd25519Keypair();
 
     const publisher = new DKGPublisher({
+      kaAllocator: makeTestKaAllocator(),
       store, chain, eventBus: bus, keypair,
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
@@ -324,6 +331,7 @@ describe('Publisher ↔ Receiver merkle consistency (regression)', () => {
     const keypair = await generateEd25519Keypair();
 
     const publisher = new DKGPublisher({
+      kaAllocator: makeTestKaAllocator(),
       store, chain, eventBus: bus, keypair,
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
@@ -372,6 +380,7 @@ describe('Publisher ↔ Receiver merkle consistency (regression)', () => {
     const keypair = await generateEd25519Keypair();
 
     const publisher = new DKGPublisher({
+      kaAllocator: makeTestKaAllocator(),
       store, chain, eventBus: bus, keypair,
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
@@ -402,6 +411,7 @@ describe('Publisher ↔ Receiver merkle consistency (regression)', () => {
     const keypair = await generateEd25519Keypair();
 
     const publisher = new DKGPublisher({
+      kaAllocator: makeTestKaAllocator(),
       store, chain, eventBus: bus, keypair,
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
@@ -664,6 +674,7 @@ describe('Tentative data and chain event confirmation', () => {
     const keypair = await generateEd25519Keypair();
     const publisherStore = new OxigraphStore();
     const publisher = new DKGPublisher({
+      kaAllocator: makeTestKaAllocator(),
       store: publisherStore,
       chain,
       eventBus: new TypedEventBus(),
@@ -697,8 +708,11 @@ describe('Tentative data and chain event confirmation', () => {
       kas: [{ tokenId: 1, rootEntity: 'did:dkg:agent:QmPolled', privateMerkleRoot: new Uint8Array(0), privateTripleCount: 0 }],
       publisherIdentity: new Uint8Array(32),
       publisherAddress: onChain.publisherAddress,
-      startKAId: Number(onChain.startKAId),
-      endKAId: Number(onChain.endKAId),
+      // OT-RFC-43 §9: KA ids are 256-bit packed values — pass the bigint
+      // straight through (the wire field is a decimal string; Number() would
+      // truncate a packed id to a lossy float).
+      startKAId: onChain.startKAId,
+      endKAId: onChain.endKAId,
       chainId: 'mock:31337',
       publisherSignatureR: new Uint8Array(0),
       publisherSignatureVs: new Uint8Array(0),
@@ -786,6 +800,7 @@ describe('Update flow', () => {
     const keypair = await generateEd25519Keypair();
 
     const publisher = new DKGPublisher({
+      kaAllocator: makeTestKaAllocator(),
       store, chain, eventBus: bus, keypair,
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
@@ -851,6 +866,7 @@ describe('Update flow', () => {
     const keypair = await generateEd25519Keypair();
 
     const publisher = new DKGPublisher({
+      kaAllocator: makeTestKaAllocator(),
       store, chain, eventBus: bus, keypair,
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
@@ -888,6 +904,7 @@ describe('Update flow', () => {
     const keypair = await generateEd25519Keypair();
 
     const publisher = new DKGPublisher({
+      kaAllocator: makeTestKaAllocator(),
       store, chain, eventBus: bus, keypair,
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
@@ -932,6 +949,7 @@ describe('Tentative publish UAL uniqueness', () => {
     const keypair = await generateEd25519Keypair();
 
     const publisher = new DKGPublisher({
+      kaAllocator: makeTestKaAllocator(),
       store, chain, eventBus: bus, keypair,
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
@@ -975,6 +993,7 @@ describe('Tentative publish UAL uniqueness', () => {
     const keypair = await generateEd25519Keypair();
 
     const publisher = new DKGPublisher({
+      kaAllocator: makeTestKaAllocator(),
       store, chain, eventBus: bus, keypair,
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
@@ -997,6 +1016,7 @@ describe('Tentative publish UAL uniqueness', () => {
     const keypair = await generateEd25519Keypair();
 
     const publisher = new DKGPublisher({
+      kaAllocator: makeTestKaAllocator(),
       store, chain, eventBus: bus, keypair,
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
@@ -1053,6 +1073,7 @@ describe('Tentative publish UAL uniqueness', () => {
     const keypair = await generateEd25519Keypair();
 
     const publisher = new DKGPublisher({
+      kaAllocator: makeTestKaAllocator(),
       store, chain, eventBus: bus, keypair,
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
@@ -1105,6 +1126,7 @@ describe('Tentative publish UAL uniqueness', () => {
     const keypair = await generateEd25519Keypair();
 
     const publisher = new DKGPublisher({
+      kaAllocator: makeTestKaAllocator(),
       store, chain, eventBus: bus, keypair,
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
@@ -1158,6 +1180,7 @@ describe('Tentative publish UAL uniqueness', () => {
     const keypair = await generateEd25519Keypair();
 
     const publisher = new DKGPublisher({
+      kaAllocator: makeTestKaAllocator(),
       store, chain, eventBus: bus, keypair,
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
@@ -1190,6 +1213,7 @@ describe('Tentative publish UAL uniqueness', () => {
     const keypair = await generateEd25519Keypair();
 
     const publisher = new DKGPublisher({
+      kaAllocator: makeTestKaAllocator(),
       store, chain, eventBus: bus, keypair,
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
@@ -1230,6 +1254,7 @@ describe('Tentative publish UAL uniqueness', () => {
     const keypair = await generateEd25519Keypair();
 
     const publisher = new DKGPublisher({
+      kaAllocator: makeTestKaAllocator(),
       store, chain, eventBus: bus, keypair,
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
@@ -1315,6 +1340,7 @@ describe('Tentative publish UAL uniqueness', () => {
     const realCoreId = BigInt(getSharedContext().coreProfileId);
 
     const publisher = new DKGPublisher({
+      kaAllocator: makeTestKaAllocator(),
       store, chain, eventBus: bus, keypair,
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: realCoreId,
@@ -1355,6 +1381,7 @@ describe('Tentative publish UAL uniqueness', () => {
     const keypair = await generateEd25519Keypair();
 
     const publisher = new DKGPublisher({
+      kaAllocator: makeTestKaAllocator(),
       store, chain, eventBus: bus, keypair,
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: 0n,
@@ -1385,6 +1412,7 @@ describe('Tentative publish UAL uniqueness', () => {
     const keypair = await generateEd25519Keypair();
 
     const publisher = new DKGPublisher({
+      kaAllocator: makeTestKaAllocator(),
       store, chain, eventBus: bus, keypair,
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: 0n,

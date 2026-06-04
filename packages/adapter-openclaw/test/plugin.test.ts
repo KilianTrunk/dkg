@@ -1172,7 +1172,7 @@ describe('DkgNodePlugin', () => {
         sub_graph_name: 'protocols',
       });
       const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-      expect(url).toBe('http://localhost:9200/api/assertion/notes/write');
+      expect(url).toBe('http://localhost:9200/api/knowledge-assets/notes/wm/write');
       const body = JSON.parse(init.body as string);
       expect(body.contextGraphId).toBe('ctx');
       expect(body.subGraphName).toBe('protocols');
@@ -1188,7 +1188,7 @@ describe('DkgNodePlugin', () => {
         sub_graph_name: 'protocols',
       });
       const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-      expect(url).toBe('http://localhost:9200/api/assertion/notes/promote');
+      expect(url).toBe('http://localhost:9200/api/knowledge-assets/notes/swm/share');
       expect(JSON.parse(init.body as string)).toEqual({
         contextGraphId: 'ctx',
         entities: ['urn:root-1', 'urn:root-2'],
@@ -1227,7 +1227,7 @@ describe('DkgNodePlugin', () => {
         sub_graph_name: 'scratch',
       });
       const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-      expect(url).toBe('http://localhost:9200/api/assertion/draft/discard');
+      expect(url).toBe('http://localhost:9200/api/knowledge-assets/draft/wm/discard');
       expect(JSON.parse(init.body as string)).toEqual({
         contextGraphId: 'ctx',
         subGraphName: 'scratch',
@@ -1258,6 +1258,7 @@ describe('DkgNodePlugin', () => {
       });
       const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
       const parsed = new URL(String(url));
+      // Read stays on the legacy assertion route to keep author scoping.
       expect(parsed.pathname).toBe('/api/assertion/notes/history');
       expect(parsed.searchParams.get('contextGraphId')).toBe('ctx');
       expect(parsed.searchParams.get('agentAddress')).toBe('0xabc');

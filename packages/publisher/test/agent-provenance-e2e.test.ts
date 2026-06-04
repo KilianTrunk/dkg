@@ -136,6 +136,8 @@ function makePublisher(opts: {
     keypair: undefined,
     publisherPrivateKey: opts.privateKey ?? HARDHAT_KEYS.CORE_OP,
     publisherNodeIdentityId: opts.daemonId ?? coreId,
+    // OT-RFC-43 Option-1: real EVM adapter requires a packed reservedKaId per mint.
+    kaAllocator: makeTestKaAllocator(),
   });
 }
 
@@ -184,6 +186,7 @@ function token() {
 // the file-scope `CONTEXT_GRAPH`).
 import { buildSeal as buildSealCore, publishSealed as publishSealedCore, updateSealed as updateSealedCore } from './_helpers/seal.js';
 import { hardhatACKProvider } from './_helpers/acks.js';
+import { makeTestKaAllocator } from './_helpers/ka-allocator.js';
 
 async function buildSeal(
   quads: Quad[],

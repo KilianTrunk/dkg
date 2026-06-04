@@ -283,6 +283,50 @@ export class FakeClient {
     };
   }
 
+  // ── KA lifecycle (v10) ──────────────────────────────────────────
+  // The WM/SWM mutation verbs (write / promote / discard) drive the
+  // /api/knowledge-assets/* surface; these mirror the legacy assertion methods
+  // onto the same in-memory `assertions` store so the round-trip tests still
+  // exercise real state. (create + history stay on the legacy client methods.)
+  async knowledgeAssetWrite(args: {
+    contextGraphId: string;
+    name: string;
+    quads: Array<{ subject: string; predicate: string; object: string; graph?: string }>;
+  }) {
+    if (this.overrides.knowledgeAssetWrite) return this.overrides.knowledgeAssetWrite.call(this, args);
+    const key = `${args.contextGraphId}::${args.name}`;
+    const cell = this.assertions.get(key);
+    if (!cell) throw new Error(`assertion not created: ${key}`);
+    if (cell.discarded) throw new Error(`assertion discarded: ${key}`);
+    cell.quads.push(...args.quads.map((q) => ({ subject: q.subject, predicate: q.predicate, object: q.object })));
+    return { written: args.quads.length };
+  }
+
+  async knowledgeAssetShare(args: {
+    contextGraphId: string;
+    name: string;
+    entities?: string[];
+  }) {
+    if (this.overrides.knowledgeAssetShare) return this.overrides.knowledgeAssetShare.call(this, args);
+    const key = `${args.contextGraphId}::${args.name}`;
+    const cell = this.assertions.get(key);
+    if (!cell) throw new Error(`assertion not created: ${key}`);
+    if (args.entities && args.entities.length > 0) {
+      for (const e of args.entities) cell.promotedRoots.add(e);
+    } else {
+      for (const q of cell.quads) cell.promotedRoots.add(q.subject);
+    }
+    return { swmShared: true, promotedCount: cell.promotedRoots.size };
+  }
+
+  async knowledgeAssetDiscard(args: { contextGraphId: string; name: string }) {
+    if (this.overrides.knowledgeAssetDiscard) return this.overrides.knowledgeAssetDiscard.call(this, args);
+    const key = `${args.contextGraphId}::${args.name}`;
+    const cell = this.assertions.get(key);
+    if (cell) cell.discarded = true;
+    return { discarded: true };
+  }
+
   async importAssertionFile(args: {
     contextGraphId: string;
     assertionName: string;

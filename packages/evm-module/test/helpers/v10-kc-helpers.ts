@@ -48,6 +48,42 @@ export const DEFAULT_CHAIN_ID = 31337n;
 
 export const AUTHOR_SCHEME_VERSION_V1 = 1;
 
+/**
+ * OT-RFC-43 Option 1 (variant 1a) — pack a deterministic, author-namespaced
+ * KA id. The high 160 bits MUST be the AUTHOR (the EIP-712 attestation signer
+ * / NFT mint recipient), NOT the publisher / msg.sender. The contract enforces
+ * `(reservedKaId >> 96) == uint160(authorAddress)` at mint, so a value built
+ * for the wrong author reverts `KaIdNamespaceMismatch`.
+ *
+ *   kaId = (uint160(authorAddress) << 96) | uint96(number)
+ */
+export function packReservedKaId(
+  authorAddress: string,
+  num: number | bigint,
+): bigint {
+  return (BigInt(ethers.getAddress(authorAddress)) << 96n) | BigInt(num);
+}
+
+/**
+ * Per-author monotonic counter for fresh `reservedKaId` numbers, so tests that
+ * publish several KAs (under the same or different authors) never collide on a
+ * `(author, number)` pair unless they deliberately reuse one. Keyed by the
+ * checksummed author address.
+ */
+const _reservedKaIdCounters = new Map<string, bigint>();
+
+/**
+ * Allocate a fresh, never-before-used packed `reservedKaId` for `authorAddress`.
+ * Numbers start at 1 and increment per author. Use `packReservedKaId` directly
+ * when a test must pin or deliberately reuse an exact number.
+ */
+export function nextReservedKaId(authorAddress: string): bigint {
+  const key = ethers.getAddress(authorAddress);
+  const next = (_reservedKaIdCounters.get(key) ?? 0n) + 1n;
+  _reservedKaIdCounters.set(key, next);
+  return packReservedKaId(key, next);
+}
+
 export type V10SigPack = {
   receiverRs: string[];
   receiverVSs: string[];
@@ -305,6 +341,16 @@ export async function buildPublishParams(args: {
   /** Allow injecting a pre-computed author signature (for negative-path tests). */
   authorSigOverride?: AuthorSig;
   /**
+   * OT-RFC-43 Option 1 (variant 1a): the packed KA id this publish claims:
+   *   reservedKaId = (uint160(author) << 96) | uint96(number)
+   * Defaults to a freshly-allocated, never-reused id in the author's namespace
+   * (`nextReservedKaId(author.address)`). Negative-path / collision tests pass
+   * an explicit value (e.g. a wrong-namespace id, or a deliberately reused
+   * `reservedKaId`). NB: deliberately NOT part of the ACK digest — the
+   * namespace is enforced on-chain, not signed over.
+   */
+  reservedKaId?: bigint;
+  /**
    * RFC-39 Phase A.5 curated-CG ciphertext commitment (optional).
    * Defaults to `bytes32(0)` + `0` — the explicit "no commitment" sentinel
    * the contract treats as: legal on public CGs (default behavior); legal
@@ -377,6 +423,10 @@ export async function buildPublishParams(args: {
     authorR: authorSig.authorR,
     authorVS: authorSig.authorVS,
     authorSchemeVersion: schemeVersion,
+    // OT-RFC-43 Option 1 (1a): author-namespaced packed id. Defaults to a
+    // fresh, unused number in the author's namespace; pinned/reused values
+    // come through `args.reservedKaId` for collision / negative tests.
+    reservedKaId: args.reservedKaId ?? nextReservedKaId(args.author.address),
     identityIds: args.receiverIdentityIds,
     r: sig.receiverRs,
     vs: sig.receiverVSs,

@@ -9,6 +9,7 @@
  * - Integration: real gossip flow through subscribeToContextGraph triggers verification
  */
 import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
+import { makeTestKaNumberAllocator } from "./_helpers/ka-allocator.js";
 import {
   encodePublishRequest,
   decodePublishRequest,
@@ -196,6 +197,7 @@ describe('I-002: Gossip ingestion should not trust self-reported on-chain status
   it('on-chain verification uses EVMChainAdapter listenForEvents to match events', async () => {
     const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
     const agent = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'EventVerifier',
       listenPort: 0,
       skills: [],
@@ -282,6 +284,7 @@ describe('I-002: Gossip ingestion should not trust self-reported on-chain status
   it('listenForEvents respects toBlock and filters by txHash in event data', async () => {
     const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
     const agent = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'EventFilter',
       listenPort: 0,
       skills: [],
@@ -380,6 +383,7 @@ describe('Integration: gossip ingestion verifies on-chain and promotes to confir
     const sharedChain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
 
     const agentA = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'GossipSender',
       listenPort: 0,
       skills: [],
@@ -387,6 +391,7 @@ describe('Integration: gossip ingestion verifies on-chain and promotes to confir
       nodeRole: 'core',
     });
     const agentB = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'GossipReceiver',
       listenPort: 0,
       skills: [],
@@ -434,6 +439,7 @@ describe('Integration: gossip ingestion verifies on-chain and promotes to confir
     const chainB = createEVMAdapter(HARDHAT_KEYS.REC1_OP);
 
     const agentA = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'TentSender',
       listenPort: 0,
       skills: [],
@@ -441,6 +447,7 @@ describe('Integration: gossip ingestion verifies on-chain and promotes to confir
       nodeRole: 'core',
     });
     const agentB = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'TentReceiver',
       listenPort: 0,
       skills: [],

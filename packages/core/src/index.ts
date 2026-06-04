@@ -113,6 +113,16 @@ export {
   DKG_ONTOLOGY,
   type GenesisQuad,
 } from './genesis.js';
+export {
+  DKG_ENTITY,
+  DKG_ROOT_ENTITY_LEGACY,
+  DKG_ASSERTION_ENTITY,
+  DKG_ASSERTION_ROOT_ENTITY_LEGACY,
+  ENTITY_PRED_ALT,
+  ASSERTION_ENTITY_PRED_ALT,
+  isEntityPredicate,
+  isAssertionEntityPredicate,
+} from './entity-predicate.js';
 export { withRetry, type RetryOptions } from './retry.js';
 export {
   RetryQueue,
@@ -126,6 +136,7 @@ export {
   type IdempotencyCheckResult,
   type ProtocolOutboxStore,
   type ProtocolOutboxEntry,
+  type KaNumberStore,
   RESPONSE_CACHE_BYTES,
   RESPONSE_GONE_MARKER,
 } from './messenger-types.js';

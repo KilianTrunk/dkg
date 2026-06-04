@@ -60,6 +60,7 @@ import {
 } from '../../chain/test/hardhat-harness.js';
 import { withSeal as _withSeal } from './_helpers/seal.js';
 import { hardhatACKProvider } from './_helpers/acks.js';
+import { makeTestKaAllocator } from './_helpers/ka-allocator.js';
 
 type WithProvider = { provider: ethers.JsonRpcProvider };
 
@@ -134,6 +135,8 @@ describe('Publish ordering & RPC spy — P-1 / P-6 / P-7', () => {
       keypair,
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
+      // OT-RFC-43 Option-1: real EVM adapter requires a packed reservedKaId per mint.
+      kaAllocator: makeTestKaAllocator(),
     });
   });
 

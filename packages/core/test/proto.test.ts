@@ -32,6 +32,10 @@ describe('Protobuf: PublishRequest round-trip', () => {
         },
       ],
       publisherIdentity: new Uint8Array(32),
+      // OT-RFC-43 §9: startKAId/endKAId are now required decimal-string id
+      // fields; encodePublishRequest stringifies them unconditionally.
+      startKAId: 1,
+      endKAId: 1,
     };
     const encoded = encodePublishRequest(original);
     expect(encoded).toBeInstanceOf(Uint8Array);

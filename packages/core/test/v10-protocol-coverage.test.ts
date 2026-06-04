@@ -147,9 +147,11 @@ describe('VerifyProposal proto — full-field round-trip [C-7]', () => {
     const vmId = typeof decoded.verifiedMemoryId === 'number'
       ? decoded.verifiedMemoryId
       : (decoded.verifiedMemoryId.high * 2 ** 32) + decoded.verifiedMemoryId.low;
-    const bId = typeof decoded.batchId === 'number'
-      ? decoded.batchId
-      : (decoded.batchId.high * 2 ** 32) + decoded.batchId.low;
+    // batchId is a KA id: the wire type is now the 256-bit-safe decimal
+    // string (OT-RFC-43 §9), not a uint64/Long. Assert the new contract and
+    // that the value still round-trips. (verifiedMemoryId stays uint64/Long.)
+    expect(typeof decoded.batchId).toBe('string');
+    const bId = Number(decoded.batchId);
     expect(vmId).toBe(7);
     expect(bId).toBe(42);
   });

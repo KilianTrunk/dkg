@@ -68,6 +68,107 @@ function toContextGraphUri(contextGraphIdOrUri: string): string {
 }
 
 /**
+ * Author attestation produced by an external signer. Mirrors the
+ * `packages/cli/src/api-client.ts` reference so finalize / create KA flows can
+ * carry a pre-built EIP-712 attestation instead of signing on the daemon.
+ */
+export interface PreSignedAuthorAttestationPayload {
+  address: string;
+  signature: { r: string; vs: string };
+}
+
+/**
+ * VM-publish controls for the finalized-assertion publish path. Mirrors
+ * `KnowledgeAssetFinalizedPublishOptions` in `packages/cli/src/api-client.ts`.
+ * MCP is JSON-facing, so large node identity ids must be passed as decimal
+ * strings rather than JavaScript numbers.
+ */
+export interface KnowledgeAssetFinalizedPublishOptions {
+  /**
+   * SDK-friendly spelling for the finalized publish cleanup flag. The
+   * knowledge-assets daemon route forwards `clearSharedMemoryAfter` to
+   * `publishFromFinalizedAssertion`, so the client translates before POST.
+   */
+  clearAfter?: boolean;
+  publishEpochs?: number;
+  publisherNodeIdentityIdOverride?: string;
+}
+
+const FINALIZED_PUBLISH_OPTION_KEYS = new Set([
+  'clearAfter',
+  'publishEpochs',
+  'publisherNodeIdentityIdOverride',
+]);
+
+function publisherNodeIdentityOverridePayload(value: unknown): string {
+  if (typeof value === 'string' && /^\d+$/.test(value)) return value;
+  throw new Error('publisherNodeIdentityIdOverride must be passed as a decimal string');
+}
+
+function assertExclusiveAuthorFields(args: {
+  authorAgentAddress?: string;
+  preSignedAuthorAttestation?: PreSignedAuthorAttestationPayload;
+}): void {
+  if (args.authorAgentAddress != null && args.preSignedAuthorAttestation != null) {
+    throw new Error('authorAgentAddress and preSignedAuthorAttestation are mutually exclusive');
+  }
+}
+
+function assertCreateFinalizeFieldsHaveQuads(args: {
+  quads?: unknown[];
+  authorAgentAddress?: string;
+  preSignedAuthorAttestation?: PreSignedAuthorAttestationPayload;
+  schemeVersion?: number;
+}): void {
+  const hasFinalizeOnlyField =
+    args.authorAgentAddress != null ||
+    args.preSignedAuthorAttestation != null ||
+    args.schemeVersion !== undefined;
+  if (hasFinalizeOnlyField && !(Array.isArray(args.quads) && args.quads.length > 0)) {
+    throw new Error('authorAgentAddress, preSignedAuthorAttestation, and schemeVersion require non-empty quads');
+  }
+}
+
+/** Translate {@link KnowledgeAssetFinalizedPublishOptions} into the daemon body. */
+function finalizedPublishOptionsPayload(
+  options?: KnowledgeAssetFinalizedPublishOptions,
+  allowedExtraKeys: readonly string[] = [],
+): Record<string, unknown> | undefined {
+  if (!options) return undefined;
+  const unsupportedKeys = Object.keys(options).filter(
+    (key) => !FINALIZED_PUBLISH_OPTION_KEYS.has(key) && !allowedExtraKeys.includes(key),
+  );
+  if (unsupportedKeys.length > 0) {
+    throw new Error(`Unsupported finalized publish option(s): ${unsupportedKeys.join(', ')}`);
+  }
+  const payload: Record<string, unknown> = {};
+  if (options.clearAfter !== undefined) payload.clearSharedMemoryAfter = options.clearAfter;
+  if (options.publishEpochs !== undefined) payload.publishEpochs = options.publishEpochs;
+  const publisherNodeIdentityIdOverride =
+    (options as Record<string, unknown>).publisherNodeIdentityIdOverride;
+  if (publisherNodeIdentityIdOverride !== undefined) {
+    payload.publisherNodeIdentityIdOverride =
+      publisherNodeIdentityOverridePayload(publisherNodeIdentityIdOverride);
+  }
+  return Object.keys(payload).length > 0 ? payload : undefined;
+}
+
+function createAlsoPublishVmPayload(
+  value: unknown,
+): boolean | Record<string, unknown> {
+  if (typeof value === 'boolean') return value;
+  if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
+    if (Object.keys(value).length === 0) return {};
+    const payload = finalizedPublishOptionsPayload(value as KnowledgeAssetFinalizedPublishOptions);
+    if (payload) return payload;
+    throw new Error(
+      'alsoPublishVm options object must include at least one supported option; use true to publish with defaults',
+    );
+  }
+  throw new Error('alsoPublishVm must be a boolean or publish-options object');
+}
+
+/**
  * Per-peer diagnostic snapshot returned by `GET /api/peer-info`. Shape
  * mirrors the daemon-side `PeerDiagnostics` interface plus the legacy
  * flat fields kept for back-compat with pre-diagnostic callers (the
@@ -1017,6 +1118,187 @@ export class DkgClient {
       }
       throw err;
     }
+  }
+
+  // ── OT-RFC-43 §10.5 — GitHub-shaped Knowledge Asset client ──────────────
+  // Layer-explicit wrappers over the clean /api/knowledge-assets/... surface.
+  // One file = one Knowledge Asset (Design B / OT-RFC-44), carrying any number
+  // of member entities. WM → SWM → VM via the git-shaped verbs write →
+  // finalize → share → publish. The legacy assertion/* + shared-memory/*
+  // methods above remain for back-compat during the v10 migration window.
+
+  /** Create a KA + open its WM draft. Pass `quads` to atomically write+finalize. */
+  async createKnowledgeAsset(args: {
+    contextGraphId: string;
+    name: string;
+    subGraphName?: string;
+    quads?: Array<{ subject: string; predicate: string; object: string; graph: string }>;
+    authorAgentAddress?: string;
+    preSignedAuthorAttestation?: PreSignedAuthorAttestationPayload;
+    schemeVersion?: number;
+    alsoShareSwm?: boolean;
+    alsoPublishVm?: boolean | KnowledgeAssetFinalizedPublishOptions;
+  }): Promise<Record<string, unknown>> {
+    assertExclusiveAuthorFields(args);
+    assertCreateFinalizeFieldsHaveQuads(args);
+    const body: Record<string, unknown> = {
+      contextGraphId: normalizeContextGraphId(args.contextGraphId),
+      name: args.name,
+    };
+    if (args.subGraphName) body.subGraphName = args.subGraphName;
+    if (args.quads) body.quads = args.quads;
+    if (args.authorAgentAddress) body.authorAgentAddress = args.authorAgentAddress;
+    if (args.preSignedAuthorAttestation) {
+      body.preSignedAuthorAttestation = args.preSignedAuthorAttestation;
+    }
+    if (args.schemeVersion !== undefined) body.schemeVersion = args.schemeVersion;
+    if (args.alsoShareSwm !== undefined) body.alsoShareSwm = args.alsoShareSwm;
+    if (args.alsoPublishVm !== undefined) {
+      // Object form carries finalized-publish controls; translate to the daemon
+      // body shape (mirrors the cli ApiClient). `true`/`false` pass through.
+      body.alsoPublishVm = createAlsoPublishVmPayload(args.alsoPublishVm);
+    }
+    return this.request<Record<string, unknown>>('POST', '/api/knowledge-assets', body);
+  }
+
+  /** GET a KA's per-layer lifecycle state by name. */
+  async getKnowledgeAsset(args: {
+    contextGraphId: string;
+    name: string;
+    subGraphName?: string;
+  }): Promise<Record<string, unknown>> {
+    const qs = new URLSearchParams({
+      contextGraphId: normalizeContextGraphId(args.contextGraphId),
+      ...(args.subGraphName ? { subGraphName: args.subGraphName } : {}),
+    }).toString();
+    return this.request<Record<string, unknown>>(
+      'GET',
+      `/api/knowledge-assets/${encodeURIComponent(args.name)}?${qs}`,
+    );
+  }
+
+  /** Append quads to the KA's WM draft (git add/edit). */
+  async knowledgeAssetWrite(args: {
+    contextGraphId: string;
+    name: string;
+    // `graph` is optional: the WM-write engine (agent.assertion.write) derives
+    // the draft's named graph when omitted — the legacy triples path relied on
+    // exactly this, so callers may pass bare subject/predicate/object.
+    quads: Array<{ subject: string; predicate: string; object: string; graph?: string }>;
+    subGraphName?: string;
+  }): Promise<{ written: number }> {
+    const body: Record<string, unknown> = {
+      contextGraphId: normalizeContextGraphId(args.contextGraphId),
+      quads: args.quads,
+    };
+    if (args.subGraphName) body.subGraphName = args.subGraphName;
+    return this.request<{ written: number }>(
+      'POST',
+      `/api/knowledge-assets/${encodeURIComponent(args.name)}/wm/write`,
+      body,
+    );
+  }
+
+  /** Seal the WM draft — computes the merkle root + signs the seal (git commit). */
+  async knowledgeAssetFinalize(args: {
+    contextGraphId: string;
+    name: string;
+    subGraphName?: string;
+    authorAgentAddress?: string;
+    preSignedAuthorAttestation?: PreSignedAuthorAttestationPayload;
+    schemeVersion?: number;
+  }): Promise<{ merkleRoot: string; eip712Digest: string }> {
+    assertExclusiveAuthorFields(args);
+    const body: Record<string, unknown> = {
+      contextGraphId: normalizeContextGraphId(args.contextGraphId),
+    };
+    if (args.subGraphName) body.subGraphName = args.subGraphName;
+    if (args.authorAgentAddress) body.authorAgentAddress = args.authorAgentAddress;
+    if (args.preSignedAuthorAttestation) {
+      body.preSignedAuthorAttestation = args.preSignedAuthorAttestation;
+    }
+    if (args.schemeVersion !== undefined) body.schemeVersion = args.schemeVersion;
+    return this.request<{ merkleRoot: string; eip712Digest: string }>(
+      'POST',
+      `/api/knowledge-assets/${encodeURIComponent(args.name)}/wm/finalize`,
+      body,
+    );
+  }
+
+  /** Discard the open WM draft (git checkout -- .). */
+  async knowledgeAssetDiscard(args: {
+    contextGraphId: string;
+    name: string;
+    subGraphName?: string;
+  }): Promise<{ discarded: boolean }> {
+    const body: Record<string, unknown> = {
+      contextGraphId: normalizeContextGraphId(args.contextGraphId),
+    };
+    if (args.subGraphName) body.subGraphName = args.subGraphName;
+    return this.request<{ discarded: boolean }>(
+      'POST',
+      `/api/knowledge-assets/${encodeURIComponent(args.name)}/wm/discard`,
+      body,
+    );
+  }
+
+  /** Seed a fresh WM draft from the file's current SWM/VM state (git checkout). */
+  async knowledgeAssetPullFrom(args: {
+    contextGraphId: string;
+    name: string;
+    layer: 'swm' | 'vm';
+    subGraphName?: string;
+    onConflict?: 'reject' | 'replace';
+  }): Promise<Record<string, unknown>> {
+    const body: Record<string, unknown> = {
+      contextGraphId: normalizeContextGraphId(args.contextGraphId),
+      layer: args.layer,
+    };
+    if (args.subGraphName) body.subGraphName = args.subGraphName;
+    if (args.onConflict) body.onConflict = args.onConflict;
+    return this.request<Record<string, unknown>>(
+      'POST',
+      `/api/knowledge-assets/${encodeURIComponent(args.name)}/wm/pull-from`,
+      body,
+    );
+  }
+
+  /** Advance the SWM pointer (WM → SWM; git push origin <branch>). */
+  async knowledgeAssetShare(args: {
+    contextGraphId: string;
+    name: string;
+    subGraphName?: string;
+    entities?: string[] | 'all';
+  }): Promise<{ swmShared: boolean; promotedCount: number }> {
+    const body: Record<string, unknown> = {
+      contextGraphId: normalizeContextGraphId(args.contextGraphId),
+    };
+    if (args.subGraphName) body.subGraphName = args.subGraphName;
+    if (args.entities !== undefined) body.entities = args.entities;
+    return this.request<{ swmShared: boolean; promotedCount: number }>(
+      'POST',
+      `/api/knowledge-assets/${encodeURIComponent(args.name)}/swm/share`,
+      body,
+    );
+  }
+
+  /** Publish to VM — mint or update on chain (git push origin main). */
+  async knowledgeAssetPublish(args: {
+    contextGraphId: string;
+    name: string;
+    subGraphName?: string;
+  } & KnowledgeAssetFinalizedPublishOptions): Promise<Record<string, unknown>> {
+    const body: Record<string, unknown> = {
+      contextGraphId: normalizeContextGraphId(args.contextGraphId),
+    };
+    if (args.subGraphName) body.subGraphName = args.subGraphName;
+    const publishOptions = finalizedPublishOptionsPayload(args, ['contextGraphId', 'name', 'subGraphName']);
+    if (publishOptions) body.options = publishOptions;
+    return this.request<Record<string, unknown>>(
+      'POST',
+      `/api/knowledge-assets/${encodeURIComponent(args.name)}/vm/publish`,
+      body,
+    );
   }
 }
 

@@ -35,6 +35,7 @@ import {
 import {
   buildPublishParams,
   buildUpdateParams,
+  packReservedKaId,
   DEFAULT_CHAIN_ID,
 } from './helpers/v10-kc-helpers';
 
@@ -337,6 +338,8 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
     const merkleRoot = ethers.keccak256(
       ethers.toUtf8Bytes('v10-pca-lifecycle'),
     );
+    // OT-RFC-43 Option 1 (1a): author-namespaced packed id we expect to mint.
+    const reservedKaId = packReservedKaId(creator.address, 1);
     const p = await buildPublishParams({
       chainId: DEFAULT_CHAIN_ID,
       kav10Address: await KAV10.getAddress(),
@@ -352,6 +355,7 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
       tokenAmount,
       isImmutable: false,
       publishOperationId: 'v10-pca-lifecycle-op',
+      reservedKaId,
     });
 
     const tx = await KAV10.connect(creator).publish(p);
@@ -388,8 +392,10 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
 
     // KC records the FULL tokenAmount; only the staker-pool distribution is
     // discounted — the on-chain proof the discount branch (not direct
-    // spend) executed.
-    const kaId = 1n;
+    // spend) executed. OT-RFC-43 Option 1 (1a): the minted kaId equals the
+    // packed reservedKaId we supplied (ids are no longer globally sequential).
+    const kaId = reservedKaId;
+    expect(await DKGKnowledgeAssets.ownerOf(kaId)).to.equal(creator.address);
     const meta =
       await DKGKnowledgeAssets.getKnowledgeAssetMetadata(kaId);
     expect(meta[6]).to.equal(tokenAmount);
@@ -455,9 +461,12 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
     ).to.be.revertedWithCustomError(KAV10, 'TooLowAllowance');
 
     // Atomic rollback: the expired publish minted no knowledge collection.
-    expect(
-      await DKGKnowledgeAssets.getLatestKnowledgeAssetId(),
-    ).to.equal(0n);
+    // OT-RFC-43 Option 1 (1a): `getLatestKnowledgeAssetId` is deprecated (it
+    // reverts), so we assert the reserved id was never minted — `ownerOf`
+    // reverts on a non-existent token.
+    await expect(
+      DKGKnowledgeAssets.ownerOf(p.reservedKaId),
+    ).to.be.revertedWithCustomError(DKGKnowledgeAssets, 'ERC721NonexistentToken');
   });
 
   // --------------------------------------------------------------------------
@@ -502,16 +511,27 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
     // amount gate (`_executePublishCore`) is reached before the ACK signature
     // check — flipping the count to anything but 1 must revert with the
     // amount echoed back.
+    const attemptedKaIds: bigint[] = [];
     for (const amount of [0, 2, 5]) {
       const p = await buildBasePublishParams(setup, `amount-gate-${amount}`, {
         knowledgeAssetsAmount: amount,
       });
+      attemptedKaIds.push(BigInt(p.reservedKaId));
       await expect(KAV10.connect(setup.creator).publish(p))
         .to.be.revertedWithCustomError(KAV10, 'InvalidKnowledgeAssetsAmount')
         .withArgs(BigInt(amount));
     }
-    // None of the reverted attempts minted a token.
-    expect(await DKGKnowledgeAssets.getLatestKnowledgeAssetId()).to.equal(0n);
+    // None of the reverted attempts minted a token. OT-RFC-43 Option 1 (1a):
+    // `getLatestKnowledgeAssetId` reverts (deprecated), so assert each
+    // reserved id is unminted (`ownerOf` reverts on a non-existent token).
+    for (const id of attemptedKaIds) {
+      await expect(
+        DKGKnowledgeAssets.ownerOf(id),
+      ).to.be.revertedWithCustomError(
+        DKGKnowledgeAssets,
+        'ERC721NonexistentToken',
+      );
+    }
   });
 
   it('greenfield: publish reverts InvalidTokenAmount(1,0) on a zero token amount (strict-positive floor)', async () => {
@@ -522,17 +542,24 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
     await expect(KAV10.connect(setup.creator).publish(p))
       .to.be.revertedWithCustomError(KAV10, 'InvalidTokenAmount')
       .withArgs(1, 0);
-    expect(await DKGKnowledgeAssets.getLatestKnowledgeAssetId()).to.equal(0n);
+    // OT-RFC-43 Option 1 (1a): nothing minted — the reserved id stays unowned.
+    await expect(
+      DKGKnowledgeAssets.ownerOf(p.reservedKaId),
+    ).to.be.revertedWithCustomError(
+      DKGKnowledgeAssets,
+      'ERC721NonexistentToken',
+    );
   });
 
-  it('greenfield: a successful publish mints exactly one KA (id 1) to the author and binds it to the CG', async () => {
+  it('greenfield: a successful publish mints exactly one KA (the packed reservedKaId) to the author and binds it to the CG', async () => {
     const setup = await setupRegisteredAgentPublish();
     const p = await buildBasePublishParams(setup, 'greenfield-mint');
     await (await KAV10.connect(setup.creator).publish(p)).wait();
 
-    // Exactly one KA, id starts at 1 (greenfield: kaId == tokenId == batchId).
-    const kaId = await DKGKnowledgeAssets.getLatestKnowledgeAssetId();
-    expect(kaId).to.equal(1n);
+    // OT-RFC-43 Option 1 (1a): the minted kaId equals the packed reservedKaId
+    // (author-namespaced; ids are no longer globally sequential).
+    const kaId = BigInt(p.reservedKaId);
+    expect(kaId >> 96n).to.equal(BigInt(setup.creator.address));
     // Minted to the attesting author (not the relaying node / msg.sender path).
     expect(await DKGKnowledgeAssets.ownerOf(kaId)).to.equal(
       setup.creator.address,
@@ -545,8 +572,8 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
     const setup = await setupRegisteredAgentPublish();
     const p = await buildBasePublishParams(setup, 'owner-gate-publish');
     await (await KAV10.connect(setup.creator).publish(p)).wait();
-    const kaId = await DKGKnowledgeAssets.getLatestKnowledgeAssetId();
-    expect(kaId).to.equal(1n);
+    // OT-RFC-43 Option 1 (1a): minted kaId == packed reservedKaId.
+    const kaId = BigInt(p.reservedKaId);
     expect(await DKGKnowledgeAssets.ownerOf(kaId)).to.equal(
       setup.creator.address,
     );
@@ -702,8 +729,8 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
     });
     await (await KAV10.connect(setup.creator).publish(p)).wait();
 
-    const kaId = await DKGKnowledgeAssets.getLatestKnowledgeAssetId();
-    expect(kaId).to.equal(1n);
+    // OT-RFC-43 Option 1 (1a): minted kaId == packed reservedKaId.
+    const kaId = BigInt(p.reservedKaId);
     expect(await DKGKnowledgeAssets.ownerOf(kaId)).to.equal(
       setup.creator.address,
     );
@@ -738,8 +765,11 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
     });
     await (await KAV10.connect(setup.creator).update(up)).wait();
 
-    // kaId stable: update mutates in place, never mints a new id.
-    expect(await DKGKnowledgeAssets.getLatestKnowledgeAssetId()).to.equal(kaId);
+    // kaId stable: update mutates in place, never mints a new id. OT-RFC-43
+    // Option 1 (1a): the KA is still owned at the SAME packed id (no new mint).
+    expect(await DKGKnowledgeAssets.ownerOf(kaId)).to.equal(
+      setup.creator.address,
+    );
     // Owner stable across the update.
     expect(await DKGKnowledgeAssets.ownerOf(kaId)).to.equal(
       setup.creator.address,
@@ -755,5 +785,231 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
     // tokenAmount unchanged (delta 0).
     const meta = await DKGKnowledgeAssets.getKnowledgeAssetMetadata(kaId);
     expect(meta[6]).to.equal(tokenAmount);
+  });
+
+  // --------------------------------------------------------------------------
+  // 7. OT-RFC-43 Option 1 (variant 1a) — caller-supplied, author-namespaced
+  //    KA ids (§B5). The KA id is now a deterministic packed value
+  //    `(uint160(author) << 96) | uint96(number)` chosen off-chain. KCS
+  //    enforces `(reservedKaId >> 96) == author` (the EIP-712 attestation
+  //    signer / NFT mint recipient, NOT msg.sender) so a wallet can only mint
+  //    in its own namespace; a re-used id reverts (no silent clobber); the old
+  //    global counter getter is deprecated; and ownership (OT-RFC-45) survives
+  //    NFT transfer under the new id scheme.
+  // --------------------------------------------------------------------------
+
+  // Direct-spend funding for a publisher that is NOT a registered agent:
+  // mint the gross + approve KAV10 so `_addTokens` can pull it.
+  const fundDirectSpend = async (
+    publisher: SignerWithAddress,
+    amount: bigint,
+  ) => {
+    await Token.mint(publisher.address, amount);
+    await Token.connect(publisher).approve(await KAV10.getAddress(), amount);
+  };
+
+  it('B5(a): publish with a valid packed reservedKaId mints kaId == reservedKaId and ownerOf == the attested AUTHOR (not msg.sender/publisher)', async () => {
+    const setup = await setupRegisteredAgentPublish();
+
+    // publisher (msg.sender) != author. The open CG authorizes any non-zero
+    // publisher; the publisher is NOT a registered agent + epochs is off the
+    // discount tier, so payment runs through the direct-spend branch against
+    // the publisher's own wallet. The author only signs the EIP-712
+    // attestation and is the ERC-721 mint recipient.
+    const publisher = accounts[10];
+    const author = accounts[11];
+    expect(publisher.address).to.not.equal(author.address);
+    expect(publisher.address).to.not.equal(setup.creator.address);
+
+    const tokenAmount = ethers.parseEther('1000');
+    const reservedKaId = packReservedKaId(author.address, 7);
+    await fundDirectSpend(publisher, tokenAmount);
+
+    const p = await buildBasePublishParams(setup, 'b5-a-author-namespaced', {
+      author, // EIP-712 attestation signer + NFT mint recipient
+      epochs: setup.epochs + 1, // off the PCA discount tier → direct-spend
+      tokenAmount,
+      reservedKaId,
+    });
+
+    await (await KAV10.connect(publisher).publish(p)).wait();
+
+    // The minted id is EXACTLY the supplied reservedKaId.
+    expect(BigInt(p.reservedKaId)).to.equal(reservedKaId);
+    // High 160 bits == the AUTHOR, not the publisher/msg.sender.
+    expect(reservedKaId >> 96n).to.equal(BigInt(author.address));
+    expect(reservedKaId >> 96n).to.not.equal(BigInt(publisher.address));
+    // NFT minted to the attested author (OT-RFC-43: namespace binds to author).
+    expect(await DKGKnowledgeAssets.ownerOf(reservedKaId)).to.equal(
+      author.address,
+    );
+  });
+
+  it('B5(b): a reservedKaId whose high bits != author reverts KaIdNamespaceMismatch', async () => {
+    const setup = await setupRegisteredAgentPublish();
+
+    // Pack the id in a DIFFERENT address's namespace than the attested author
+    // (setup.creator). The contract recomputes `kaId >> 96` and compares it to
+    // the attested author, so this is rejected before any mint.
+    const otherAddr = accounts[12];
+    expect(otherAddr.address).to.not.equal(setup.creator.address);
+    const wrongNamespaceId = packReservedKaId(otherAddr.address, 1);
+
+    const p = await buildBasePublishParams(setup, 'b5-b-wrong-namespace', {
+      reservedKaId: wrongNamespaceId,
+    });
+
+    await expect(KAV10.connect(setup.creator).publish(p))
+      .to.be.revertedWithCustomError(
+        DKGKnowledgeAssets,
+        'KaIdNamespaceMismatch',
+      )
+      .withArgs(wrongNamespaceId, setup.creator.address);
+
+    // Nothing minted under the foreign id.
+    await expect(
+      DKGKnowledgeAssets.ownerOf(wrongNamespaceId),
+    ).to.be.revertedWithCustomError(
+      DKGKnowledgeAssets,
+      'ERC721NonexistentToken',
+    );
+  });
+
+  it('B5(c): reusing the same (author, number) reverts KaIdAlreadyMinted on the second publish (no silent clobber)', async () => {
+    const setup = await setupRegisteredAgentPublish();
+
+    // First publish claims the packed id and mints it to the author.
+    const reservedKaId = packReservedKaId(setup.creator.address, 42);
+    const p1 = await buildBasePublishParams(setup, 'b5-c-first', {
+      reservedKaId,
+    });
+    await (await KAV10.connect(setup.creator).publish(p1)).wait();
+    expect(await DKGKnowledgeAssets.ownerOf(reservedKaId)).to.equal(
+      setup.creator.address,
+    );
+
+    // Second publish reuses the EXACT same reservedKaId (same author + number)
+    // with a fresh merkle root / operation id. The id is already minted, so it
+    // must revert — not silently overwrite the existing KA.
+    const p2 = await buildBasePublishParams(setup, 'b5-c-second', {
+      reservedKaId,
+    });
+    await expect(KAV10.connect(setup.creator).publish(p2))
+      .to.be.revertedWithCustomError(DKGKnowledgeAssets, 'KaIdAlreadyMinted')
+      .withArgs(reservedKaId);
+
+    // The original KA is untouched: still exactly one merkle root, the first.
+    const roots = await DKGKnowledgeAssets.getMerkleRoots(reservedKaId);
+    expect(roots.length).to.equal(1);
+    expect(roots[0].merkleRoot).to.equal(
+      ethers.keccak256(ethers.toUtf8Bytes('b5-c-first')),
+    );
+  });
+
+  it('B5(d): getLatestKnowledgeAssetId() is deprecated and always reverts GetLatestKnowledgeAssetIdDeprecated', async () => {
+    // The global sequential counter is gone under Option 1 — packed ids are
+    // not enumerable through a single "latest id". The getter must revert
+    // regardless of how many KAs exist (pure function: even on a clean state).
+    await expect(
+      DKGKnowledgeAssets.getLatestKnowledgeAssetId(),
+    ).to.be.revertedWithCustomError(
+      DKGKnowledgeAssets,
+      'GetLatestKnowledgeAssetIdDeprecated',
+    );
+
+    // Still reverts after a successful publish (the count changed, the getter
+    // did not come back).
+    const setup = await setupRegisteredAgentPublish();
+    const p = await buildBasePublishParams(setup, 'b5-d-deprecated');
+    await (await KAV10.connect(setup.creator).publish(p)).wait();
+    await expect(
+      DKGKnowledgeAssets.getLatestKnowledgeAssetId(),
+    ).to.be.revertedWithCustomError(
+      DKGKnowledgeAssets,
+      'GetLatestKnowledgeAssetIdDeprecated',
+    );
+  });
+
+  it('B5(e): update stays owner-only across an NFT transfer — old author reverts NotKnowledgeAssetOwner, new owner succeeds', async () => {
+    const setup = await setupRegisteredAgentPublish();
+
+    // Publish: author (setup.creator) owns the freshly minted KA NFT.
+    const publishRoot = ethers.keccak256(ethers.toUtf8Bytes('b5-e-publish'));
+    const tokenAmount = ethers.parseEther('1000');
+    const reservedKaId = packReservedKaId(setup.creator.address, 99);
+    const p = await buildBasePublishParams(setup, 'b5-e-publish', {
+      merkleRoot: publishRoot,
+      tokenAmount,
+      reservedKaId,
+    });
+    await (await KAV10.connect(setup.creator).publish(p)).wait();
+    const kaId = reservedKaId;
+    expect(await DKGKnowledgeAssets.ownerOf(kaId)).to.equal(
+      setup.creator.address,
+    );
+
+    // Transfer the KA NFT to a new owner. The kaId is unchanged (the packed id
+    // is the ERC-721 tokenId); only the owner moves.
+    const newOwner = accounts[13];
+    expect(newOwner.address).to.not.equal(setup.creator.address);
+    await DKGKnowledgeAssets.connect(setup.creator).transferFrom(
+      setup.creator.address,
+      newOwner.address,
+      kaId,
+    );
+    expect(await DKGKnowledgeAssets.ownerOf(kaId)).to.equal(newOwner.address);
+
+    // (1) An update attested by the OLD author (no longer the owner) reverts
+    //     NotKnowledgeAssetOwner — owner-only survives the NFT transfer.
+    const staleRoot = ethers.keccak256(ethers.toUtf8Bytes('b5-e-stale'));
+    const staleUpdate = await buildUpdateParams({
+      chainId: DEFAULT_CHAIN_ID,
+      kav10Address: await KAV10.getAddress(),
+      receivingNodes: setup.receivingNodes,
+      publisherIdentityId: setup.publisherIdentityId,
+      receiverIdentityIds: setup.receiverIdentityIds,
+      contextGraphId: setup.cgId,
+      id: kaId,
+      preUpdateMerkleRootCount: 1n,
+      newMerkleRoot: staleRoot,
+      newByteSize: 1000n,
+      newTokenAmount: tokenAmount, // delta 0 — metadata-only, no payment
+      mintKnowledgeAssetsAmount: 0n,
+      knowledgeAssetsToBurn: [],
+      updateOperationId: 'b5-e-stale-op',
+      author: setup.creator, // old author signs — now NOT the owner
+    });
+    await expect(KAV10.connect(setup.creator).update(staleUpdate))
+      .to.be.revertedWithCustomError(KAV10, 'NotKnowledgeAssetOwner')
+      .withArgs(kaId, newOwner.address, setup.creator.address);
+
+    // (2) An update attested by the NEW owner succeeds — the merkle-root
+    //     history grows and the new root is appended.
+    const newRoot = ethers.keccak256(ethers.toUtf8Bytes('b5-e-new'));
+    const newOwnerUpdate = await buildUpdateParams({
+      chainId: DEFAULT_CHAIN_ID,
+      kav10Address: await KAV10.getAddress(),
+      receivingNodes: setup.receivingNodes,
+      publisherIdentityId: setup.publisherIdentityId,
+      receiverIdentityIds: setup.receiverIdentityIds,
+      contextGraphId: setup.cgId,
+      id: kaId,
+      preUpdateMerkleRootCount: 1n,
+      newMerkleRoot: newRoot,
+      newByteSize: 1000n,
+      newTokenAmount: tokenAmount, // delta 0 — metadata-only, no payment
+      mintKnowledgeAssetsAmount: 0n,
+      knowledgeAssetsToBurn: [],
+      updateOperationId: 'b5-e-new-op',
+      author: newOwner, // new owner signs + owns → passes both gates
+    });
+    await (await KAV10.connect(newOwner).update(newOwnerUpdate)).wait();
+
+    // Owner unchanged by the update; merkle-root history grew by one.
+    expect(await DKGKnowledgeAssets.ownerOf(kaId)).to.equal(newOwner.address);
+    const roots = await DKGKnowledgeAssets.getMerkleRoots(kaId);
+    expect(roots.length).to.equal(2);
+    expect(roots[0].merkleRoot).to.equal(publishRoot);
+    expect(roots[1].merkleRoot).to.equal(newRoot);
   });
 });

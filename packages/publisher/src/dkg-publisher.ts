@@ -2,10 +2,10 @@ import type { Quad, TripleStore } from '@origintrail-official/dkg-storage';
 import type { ChainAdapter, OnChainPublishResult, AddBatchToContextGraphParams } from '@origintrail-official/dkg-chain';
 import { enrichEvmError } from '@origintrail-official/dkg-chain';
 import type { EventBus, OperationContext } from '@origintrail-official/dkg-core';
-import { DKGEvent, Logger, createOperationContext, sha256, encodeWorkspacePublishRequest, encodeEncryptedWorkspacePayload, encryptWorkspacePayload, contextGraphDataUri, contextGraphDataGraphUri, contextGraphMetaUri, contextGraphAssertionUri, assertionLifecycleUri, contextGraphSubGraphUri, contextGraphSubGraphMetaUri, SYSTEM_CONTEXT_GRAPHS, validateSubGraphName, isSafeIri, assertSafeIri, assertSafeRdfTerm, DKG_GOSSIP_MAX_MESSAGE_BYTES, type Ed25519Keypair, buildAuthorAttestationTypedData, buildUpdateAuthorAttestationTypedData, AUTHOR_SCHEME_VERSION_V1, TrustLevel, TRUST_LEVEL_PREDICATE, assertNoUserAuthoredTrustLevelQuads, buildTrustLevelQuads, isTrustLevelQuad } from '@origintrail-official/dkg-core';
+import { DKGEvent, Logger, createOperationContext, sha256, encodeWorkspacePublishRequest, encodeEncryptedWorkspacePayload, encryptWorkspacePayload, contextGraphDataUri, contextGraphDataGraphUri, contextGraphMetaUri, contextGraphAssertionUri, assertionLifecycleUri, contextGraphSubGraphUri, contextGraphSubGraphMetaUri, SYSTEM_CONTEXT_GRAPHS, validateSubGraphName, isSafeIri, assertSafeIri, assertSafeRdfTerm, DKG_GOSSIP_MAX_MESSAGE_BYTES, type Ed25519Keypair, buildAuthorAttestationTypedData, buildUpdateAuthorAttestationTypedData, AUTHOR_SCHEME_VERSION_V1, TrustLevel, TRUST_LEVEL_PREDICATE, assertNoUserAuthoredTrustLevelQuads, buildTrustLevelQuads, isTrustLevelQuad, DKG_ENTITY, DKG_ROOT_ENTITY_LEGACY, ENTITY_PRED_ALT, parseAssertionSealQuads } from '@origintrail-official/dkg-core';
 import { GraphManager, PrivateContentStore } from '@origintrail-official/dkg-storage';
 import { DEFAULT_PUBLISH_EPOCHS, MAX_PUBLISH_EPOCHS, type Publisher, type PublishOptions, type PublishResult, type KAManifestEntry, type PhaseCallback, type V10CoreNodeACK } from './publisher.js';
-import { autoPartition } from './auto-partition.js';
+import { skolemizeByEntity } from './auto-partition.js';
 import { canonicalPublishPayload } from './canonical-publish-payload.js';
 import { RESERVED_SUBJECT_PREFIXES, findReservedSubjectPrefix, isReservedSubject } from './reserved-subjects.js';
 import { skolemize } from './skolemize.js';
@@ -64,6 +64,23 @@ export {
 
 const WORKSPACE_OWNER_PREDICATE = 'http://dkg.io/ontology/workspaceOwner';
 
+/**
+ * Minimal structural view of the OT-RFC-43 Option-1 KA-number allocator the
+ * publisher needs to mint deterministic packed ids. The concrete
+ * `KaNumberAllocator` (packages/agent) satisfies this; typing it structurally
+ * here avoids an agent→publisher dependency cycle.
+ */
+export interface KaIdAllocator {
+  /** Allocate the next packed kaId = (uint160(author)<<96)|number for `author`. */
+  allocate(author: string): { kaId: bigint; number: bigint };
+  /** Raise the per-author floor to `observedNumber + 1` (never lower) so the next allocate skips minted numbers.
+   *  `observedNumber` is a `bigint` end-to-end (OT-RFC-43 Option-1, PR #976 F6) — the per-author number can
+   *  exceed 2^53, so `Number` would silently lose precision and let the allocator re-issue a minted id. */
+  reconcile(author: string, observedNumber: bigint): void;
+  /** Satisfy the allocator's cold-start guard once reconciliation has run. */
+  markReconciled(): void;
+}
+
 export interface DKGPublisherConfig {
   store: TripleStore;
   chain: ChainAdapter;
@@ -95,6 +112,13 @@ export interface DKGPublisherConfig {
   workspaceSenderKeyEncryptor?: WorkspaceSenderKeyEncryptor;
   /** Optional out-of-Oxigraph store for immutable public SWM operation snapshots. */
   publicSnapshotStore?: WorkspacePublicSnapshotStore;
+  /**
+   * OT-RFC-43 Option 1 — when present, the publisher allocates a deterministic
+   * packed reservedKaId for each V10 mint (and reconciles the per-author floor
+   * against the chain on first use). Omit for mock/no-chain or pre-Option-1
+   * flows; the real EVM adapter then throws on the missing reservedKaId.
+   */
+  kaAllocator?: KaIdAllocator;
 }
 
 export interface WorkspaceSenderKeyEncryptInput {
@@ -363,10 +387,15 @@ export class DKGPublisher implements Publisher {
   private tentativeCounter = 0;
   readonly writeLocks: Map<string, Promise<void>>;
   private readonly publicSnapshotStore?: WorkspacePublicSnapshotStore;
+  /** OT-RFC-43 Option 1 — deterministic KA-id allocator (optional; see DKGPublisherConfig). */
+  private readonly kaAllocator?: KaIdAllocator;
+  /** Authors whose allocator floor has been reconciled against the chain this process. */
+  private readonly reconciledKaAuthors = new Set<string>();
 
   constructor(config: DKGPublisherConfig) {
     this.store = config.store;
     this.chain = config.chain;
+    this.kaAllocator = config.kaAllocator;
     this.eventBus = config.eventBus;
     this.keypair = config.keypair;
     this.publisherNodeIdentityId = config.publisherNodeIdentityId ?? 0n;
@@ -799,7 +828,7 @@ export class DKGPublisher implements Publisher {
 
     await this.graphManager.ensureContextGraph(contextGraphId);
 
-    const kaMap = autoPartition(quads);
+    const kaMap = skolemizeByEntity(quads);
     const manifestEntries: { rootEntity: string; privateMerkleRoot?: Uint8Array; privateTripleCount: number }[] = [];
     for (const [rootEntity, publicQuads] of kaMap) {
       const privRoot = undefined;
@@ -1143,6 +1172,13 @@ export class DKGPublisher implements Publisher {
       encryptInlineChunked?: PublishOptions['encryptInlineChunked'];
       /** Per-publish on-chain lifetime override in epochs. */
       publishEpochs?: number;
+      /**
+       * OT-RFC-43 A2 (decision 1) — precomputed packed kaId stamped at
+       * finalize. When set, `ensureReservedKaId` REUSES it instead of
+       * allocating again (single-source allocate-at-finalize). Undefined keeps
+       * the existing allocate-at-publish behavior.
+       */
+      reservedKaId?: bigint;
     },
   ): Promise<PublishResult> {
     const ctx = options?.operationCtx ?? createOperationContext('publishFromSWM');
@@ -1219,10 +1255,11 @@ export class DKGPublisher implements Publisher {
     if (quads.length === 0) {
       throw new Error(`No quads in shared memory for context graph ${contextGraphId} matching selection`);
     }
-    const rootEntities = [...autoPartition(quads).keys()];
-    if (rootEntities.length > 1) {
-      throw new MultiRootPublishNotAtomicError(contextGraphId, rootEntities);
-    }
+    // OT-RFC-44 / Design B: once the caller has selected one lifecycle/file,
+    // that payload may contain N root entities and still publish as ONE KA in a
+    // single transaction. Higher-level selection endpoints keep their
+    // unrelated-root guard until they can identify that one lifecycle boundary.
+    const rootEntities = [...skolemizeByEntity(quads).keys()];
 
     const ctxGraphId = options?.publishContextGraphId;
     const chainCgId = options?.onChainContextGraphId ?? ctxGraphId;
@@ -1266,6 +1303,8 @@ export class DKGPublisher implements Publisher {
       encryptInlinePayload: options?.encryptInlinePayload,
       encryptInlineChunked: options?.encryptInlineChunked,
       publishEpochs: options?.publishEpochs,
+      // OT-RFC-43 A2 — reuse the finalize-stamped kaId (no re-allocate).
+      reservedKaId: options?.reservedKaId,
       [INTERNAL_ORIGIN_TOKEN]: true,
     };
     const publishResult = await this.publish(internalPublishOptions);
@@ -1446,7 +1485,7 @@ export class DKGPublisher implements Publisher {
     if (publishResult.status === 'confirmed') {
       const swmMetaGraph = this.graphManager.sharedMemoryMetaUri(contextGraphId, options?.subGraphName);
       const swmOwnershipKey = options?.subGraphName ? `${contextGraphId}\0${options.subGraphName}` : contextGraphId;
-      const kaMap = autoPartition(quads);
+      const kaMap = skolemizeByEntity(quads);
       let ownerDeletedTotal = 0;
       for (const rootEntity of kaMap.keys()) {
         await this.store.deleteByPattern({ graph: swmGraph, subject: rootEntity });
@@ -1728,10 +1767,15 @@ export class DKGPublisher implements Publisher {
     const kaMetadata: KAMetadata[] = [];
 
     onPhase?.('prepare:manifest', 'start');
-    let tokenCounter = 1n;
+    // OT-RFC-44 / Design B: one file/lifecycle = ONE Knowledge Asset, however
+    // many entities it contains. The on-chain KA count and ACK digest stay at
+    // one below, while these token IDs remain compatibility labels for
+    // per-root response/meta subjects (`<ual>/1`, `<ual>/2`, ...).
+    let compatibilityTokenId = 1n;
     for (const entry of canonical.manifestEntries) {
+      const tokenId = compatibilityTokenId++;
       manifestEntries.push({
-        tokenId: tokenCounter,
+        tokenId,
         rootEntity: entry.rootEntity,
         privateMerkleRoot: entry.privateMerkleRoot,
         privateTripleCount: entry.privateTripleCount,
@@ -1740,13 +1784,11 @@ export class DKGPublisher implements Publisher {
       kaMetadata.push({
         rootEntity: entry.rootEntity,
         kcUal: '',
-        tokenId: tokenCounter,
+        tokenId,
         publicTripleCount: entry.publicTripleCount,
         privateTripleCount: entry.privateTripleCount,
         privateMerkleRoot: entry.privateMerkleRoot,
       });
-
-      tokenCounter++;
     }
 
     const allSkolemizedQuads = canonical.skolemizedPublicQuads;
@@ -1769,12 +1811,18 @@ export class DKGPublisher implements Publisher {
       throw new Error(`V10 merkleLeafCount exceeds uint32: ${kcMerkleLeafCount}`);
     }
     this.log.info(ctx, `Computed kcMerkleRoot (flat) over ${allSkolemizedQuads.length} triple hashes + ${privateRoots.length} private root(s), leafCount=${kcMerkleLeafCount}`);
-    const kaCount = manifestEntries.length;
-    if (chainV10Ready && kaCount !== 1) {
-      throw new Error(
-        `V10 greenfield publish requires exactly one Knowledge Asset per transaction (got ${kaCount})`,
-      );
+    // Design B: a publish mints exactly ONE KA regardless of entity count.
+    // `entityCount` is informational; `kaCount` is what goes on chain as
+    // `knowledgeAssetsAmount` (the contract requires == 1) and into the ACK
+    // digest. The old `kaCount = manifestEntries.length` + `kaCount !== 1`
+    // guard conflated entity count with KA count and blocked multi-entity
+    // files; that conflation is the bug OT-RFC-44 removes.
+    const entityCount = manifestEntries.length;
+    const kaCount = 1;
+    if (entityCount < 1) {
+      throw new Error('V10 publish requires at least one entity');
     }
+    this.log.info(ctx, `Design B: publishing 1 KA with ${entityCount} member entit${entityCount === 1 ? 'y' : 'ies'}`);
     onPhase?.('prepare:merkle', 'end');
 
     onPhase?.('prepare', 'end');
@@ -2487,6 +2535,18 @@ export class DKGPublisher implements Publisher {
           }
           onPhase?.('chain:writeahead', 'start');
         };
+        // OT-RFC-43 Option 1 — reserve the deterministic packed kaId for this
+        // author BEFORE the on-chain mint, so the UAL is known pre-tx and the
+        // contract _safeMints exactly this id. `undefined` when no allocator is
+        // configured (mock/no-chain); the real EVM adapter then throws.
+        //
+        // OT-RFC-43 A2 (decision 1) — when the caller stamped a packed kaId at
+        // finalize (`options.reservedKaId`), REUSE it and skip allocation so a
+        // finalize→publish mints exactly the stamped id (no double-allocation).
+        const reservedKaId = await this.ensureReservedKaId(
+          effectiveAuthorAddress,
+          (options as PublishOptions).reservedKaId,
+        );
         try {
           // OT-RFC-38 LU-11 / OT-RFC-39 — handshake hardening.
           // When the publisher ran the chunked emit path, the chain
@@ -2529,6 +2589,7 @@ export class DKGPublisher implements Publisher {
             publishOperationId,
             contextGraphId: v10CgId,
             publisherAddress: publisherSigner.address,
+            reservedKaId,
             merkleRoot: kcMerkleRoot,
             knowledgeAssetsAmount: kaCount,
             byteSize: effectiveByteSize,
@@ -2570,6 +2631,13 @@ export class DKGPublisher implements Publisher {
         onChainResult.tokenAmount = tokenAmount;
 
         const kaId = onChainResult.kaId ?? onChainResult.batchId;
+        if (reservedKaId !== undefined && kaId !== reservedKaId) {
+          throw new Error(
+            `OT-RFC-43 Option 1: on-chain mint returned kaId ${kaId} but the publisher reserved ` +
+            `${reservedKaId} — the contract must _safeMint the reserved id. Aborting to avoid a ` +
+            `UAL/chain split.`,
+          );
+        }
         const storageAddr =
           onChainResult.knowledgeAssetsContract
           ?? (this.chain.getDKGKnowledgeAssetsAddress
@@ -2582,7 +2650,6 @@ export class DKGPublisher implements Publisher {
 
         for (const km of kaMetadata) {
           km.kcUal = ual;
-          km.tokenId = kaId;
         }
         let confirmedQuads = generateConfirmedFullMetadata(
           {
@@ -2792,7 +2859,7 @@ export class DKGPublisher implements Publisher {
 
     onPhase?.('prepare', 'start');
     onPhase?.('prepare:partition', 'start');
-    const kaMap = autoPartition(quads);
+    const kaMap = skolemizeByEntity(quads);
     onPhase?.('prepare:partition', 'end');
 
     onPhase?.('prepare:manifest', 'start');
@@ -3052,18 +3119,80 @@ export class DKGPublisher implements Publisher {
       }
       onPhase?.('chain:writeahead', 'start');
     };
+    // CRITICAL CORRECTNESS INVARIANT (consensus): the digest fields the
+    // peers sign MUST be byte-identical to what the on-chain update tx
+    // carries + what the contract reads. We source the on-chain-resolved
+    // fields (contextGraphId, preUpdateMerkleRootCount, floored
+    // newTokenAmount, mintAmount, burnTokenIds) ONCE here via
+    // `chain.getUpdateAckDigestFields` — the SAME reads the adapter's
+    // `updateKnowledgeCollectionV10` performs — then (a) hand them to the
+    // ACK provider so peers sign exactly those, and (b) pin the tx to the
+    // resolved `newTokenAmount` via `boundNewTokenAmount` below. This
+    // closes the recompute-drift gap: no value is derived twice.
     let v10UpdateACKs: V10CoreNodeACK[] | undefined;
+    let boundUpdateTokenAmount: bigint | undefined;
     const v10UpdateACKProvider = options.v10UpdateACKProvider;
     if (v10UpdateACKProvider) {
       onPhase?.('collect_v10_update_acks', 'start');
       try {
-        v10UpdateACKs = await v10UpdateACKProvider(
+        const getFields = (this.chain as unknown as {
+          getUpdateAckDigestFields?: (p: {
+            kaId: bigint;
+            newByteSize: bigint;
+            userProvidedNewTokenAmount?: bigint;
+            mintAmount?: bigint;
+            burnTokenIds?: bigint[];
+          }) => Promise<{
+            contextGraphId: bigint;
+            preUpdateMerkleRootCount: bigint;
+            newTokenAmount: bigint;
+            mintAmount: bigint;
+            burnTokenIds: bigint[];
+          }>;
+        }).getUpdateAckDigestFields;
+        if (typeof getFields !== 'function') {
+          throw new Error(
+            'V10 update ACK collection requires chain.getUpdateAckDigestFields() so the off-chain-signed ' +
+            'digest matches the on-chain update tx. The adapter does not expose it.',
+          );
+        }
+        // Greenfield update: mintAmount=0, burnTokenIds=[]. These mirror
+        // the values the tx submits (see updateKnowledgeCollectionV10
+        // params below), keeping the signed digest and the tx aligned.
+        const digestFields = await getFields.call(this.chain, {
           kaId,
-          kcMerkleRoot,
-          contextGraphId,
-          updateByteSize,
-          kcMerkleLeafCount,
-        );
+          newByteSize: updateByteSize,
+          mintAmount: 0n,
+          burnTokenIds: [],
+        });
+        boundUpdateTokenAmount = digestFields.newTokenAmount;
+        v10UpdateACKs = await v10UpdateACKProvider({
+          kaId,
+          // Pass the on-chain-resolved numeric cgId (decimal string) — NOT
+          // the cleartext `contextGraphId` name — so the digest's TARGET id
+          // matches the tx + the contract read.
+          contextGraphId: digestFields.contextGraphId.toString(),
+          preUpdateMerkleRootCount: digestFields.preUpdateMerkleRootCount,
+          newMerkleRoot: kcMerkleRoot,
+          newByteSize: updateByteSize,
+          newTokenAmount: digestFields.newTokenAmount,
+          mintAmount: digestFields.mintAmount,
+          burnTokenIds: digestFields.burnTokenIds,
+          newMerkleLeafCount: kcMerkleLeafCount,
+          // Peers recompute newMerkleRoot from the updated quads. Send the
+          // same serialized public N-Quads the byte-size was computed over
+          // so the peer's `computeFlatKCRoot(parsed, [])` matches the
+          // publisher's. Only valid when there are NO private merkle roots
+          // mixed into `kcMerkleRoot` — otherwise the peer (which can't see
+          // the private roots) would recompute a different root and decline.
+          // In that case we omit stagingQuads and the peer falls back to
+          // verifying against its SWM copy (same limitation as the publish
+          // plaintext-inline path).
+          stagingQuads: updatePrivateRoots.length === 0
+            ? new TextEncoder().encode(updateNquadsStr)
+            : undefined,
+          swmGraphId: contextGraphId,
+        });
         this.log.info(
           ctx,
           `V10: Collected ${v10UpdateACKs.length} core node update ACKs`,
@@ -3082,6 +3211,14 @@ export class DKGPublisher implements Publisher {
             newByteSize: updateByteSize,
             newMerkleLeafCount: kcMerkleLeafCount,
             mintAmount: 0,
+            // Pin the tx's newTokenAmount to the floored value the ACK
+            // collector already had the peers sign (resolved via
+            // `getUpdateAckDigestFields`). Without this the adapter would
+            // recompute and could drift from the signed digest, making the
+            // collected ACK signatures fail the on-chain verify. Undefined
+            // when no provider ran (minSig=1 self-sign path) — the adapter
+            // then derives newTokenAmount itself as before.
+            boundNewTokenAmount: boundUpdateTokenAmount,
             publisherAddress,
             v10Origin: true,
             authorAddress: effectiveAuthorAddress,
@@ -3252,13 +3389,21 @@ export class DKGPublisher implements Publisher {
     return this.publisherNodeIdentityId;
   }
 
-  autoPartition(quads: Quad[]): KAManifestEntry[] {
-    const kaMap = autoPartition(quads);
+  skolemizeByEntity(quads: Quad[]): KAManifestEntry[] {
+    const kaMap = skolemizeByEntity(quads);
     let tokenId = 1n;
     return [...kaMap.keys()].map((rootEntity) => ({
       tokenId: tokenId++,
       rootEntity,
     }));
+  }
+
+  /**
+   * @deprecated Use {@link skolemizeByEntity}. Kept as a one-release
+   * compatibility alias for callers that use the public instance method.
+   */
+  autoPartition(quads: Quad[]): KAManifestEntry[] {
+    return this.skolemizeByEntity(quads);
   }
 
   skolemize(rootEntity: string, quads: Quad[]): Quad[] {
@@ -3801,11 +3946,18 @@ export class DKGPublisher implements Publisher {
     const DKG = 'http://dkg.io/ontology/';
     const metaGraph = contextGraphMetaUri(contextGraphId);
     const result = await this.store.query(
-      `SELECT ?status ?count ?layer WHERE {
+      `SELECT ?status ?count ?layer ?urnLayer WHERE {
          GRAPH <${metaGraph}> {
            OPTIONAL { <${assertionGraph}> <${DKG}extractionStatus> ?status }
            OPTIONAL { <${assertionGraph}> <${DKG}structuralTripleCount> ?count }
            OPTIONAL { <${assertionGraph}> <${DKG}memoryLayer> ?layer }
+           # The memoryLayer marker is canonically on the lifecycle URN
+           # (assertionLifecycleUri), reachable via the dkg:assertionGraph
+           # back-link. File-imported assertions carry it ONLY there, not on
+           # the data-graph URI, so read it too — otherwise the "already
+           # promoted (SWM/VM) -> harmless no-op" check below cannot see their
+           # layer and a re-promote misfires AssertionNotPersistedError.
+           OPTIONAL { ?lc <${DKG}assertionGraph> <${assertionGraph}> ; <${DKG}memoryLayer> ?urnLayer }
          }
        } LIMIT 1`,
     );
@@ -3813,7 +3965,7 @@ export class DKGPublisher implements Publisher {
     const row = result.bindings[0];
     const statusRaw = row?.['status'];
     const countRaw = row?.['count'];
-    const layerRaw = row?.['layer'];
+    const layerRaw = row?.['layer'] ?? row?.['urnLayer'];
     // Codex review on #898 — the previous version raised
     // `AssertionNotPersistedError` whenever `extractionStatus="completed"`
     // + a positive `structuralTripleCount` were stamped, even after a
@@ -3843,21 +3995,21 @@ export class DKGPublisher implements Publisher {
   }
 
   private async deleteMetaForRoot(metaGraph: string, rootEntity: string): Promise<void> {
-    const DKG = 'http://dkg.io/ontology/';
     const result = await this.store.query(
-      `SELECT ?op WHERE { GRAPH <${metaGraph}> { ?op <${DKG}rootEntity> <${rootEntity}> } }`,
+      `SELECT DISTINCT ?op WHERE { GRAPH <${metaGraph}> { ?op ${ENTITY_PRED_ALT} <${rootEntity}> } }`,
     );
     if (result.type !== 'bindings') return;
     for (const row of result.bindings) {
       const op = row['op'];
       if (!op) continue;
 
-      await this.store.delete([{
-        subject: op, predicate: `${DKG}rootEntity`, object: rootEntity, graph: metaGraph,
-      }]);
+      await this.store.delete([
+        { subject: op, predicate: DKG_ROOT_ENTITY_LEGACY, object: rootEntity, graph: metaGraph },
+        { subject: op, predicate: DKG_ENTITY, object: rootEntity, graph: metaGraph },
+      ]);
 
       const remaining = await this.store.query(
-        `SELECT (COUNT(*) AS ?c) WHERE { GRAPH <${metaGraph}> { <${op}> <${DKG}rootEntity> ?r } }`,
+        `SELECT (COUNT(DISTINCT ?r) AS ?c) WHERE { GRAPH <${metaGraph}> { <${op}> ${ENTITY_PRED_ALT} ?r } }`,
       );
       const rawCount = remaining.type === 'bindings' && remaining.bindings[0]?.['c'];
       const countVal = parseCountLiteral(rawCount);
@@ -3922,8 +4074,39 @@ export class DKGPublisher implements Publisher {
     // so re-using the same assertion name doesn't leave orphaned triples.
     // This removes the assertion entity AND its prov:Activity event
     // sub-entities (whose URIs are prefixed with the lifecycle URI).
+    //
+    // OT-RFC-43 A2 — but PRESERVE the KA's persistent identity + per-layer
+    // pointers (dkg:kaId / dkg:reservedUal / dkg:{wm,swm,vm}CurrentAssertion /
+    // prov:wasRevisionOf). These represent the KA's stable on-chain identity
+    // and confirmed-layer state, NOT "stale draft data": re-opening a draft on
+    // a name that was previously published (pull-from / discard+recreate) must
+    // KEEP the minted kaId so the next publish routes to UPDATE (same id), not
+    // a fresh mint. Without this carry-over the clean-slate wipe would burn the
+    // KA's identity and double-allocate on every edit cycle.
+    const A2_DKG = 'http://dkg.io/ontology/';
+    const A2_PRESERVE_PREDS = new Set<string>([
+      `${A2_DKG}kaId`,
+      `${A2_DKG}reservedUal`,
+      `${A2_DKG}wmCurrentAssertion`,
+      `${A2_DKG}swmCurrentAssertion`,
+      `${A2_DKG}vmCurrentAssertion`,
+      'http://www.w3.org/ns/prov#wasRevisionOf',
+    ]);
     const lifecycleSubject = assertionLifecycleUri(contextGraphId, agentAddress, name, subGraphName);
     const metaGraph = contextGraphMetaUri(contextGraphId);
+    const preserved: Quad[] = [];
+    const preserveRes = await this.store.query(
+      `SELECT ?p ?o WHERE { GRAPH <${metaGraph}> { <${lifecycleSubject}> ?p ?o } }`,
+    );
+    if (preserveRes.type === 'bindings') {
+      for (const row of preserveRes.bindings) {
+        const p = row['p'];
+        const o = row['o'];
+        if (p && o != null && A2_PRESERVE_PREDS.has(p)) {
+          preserved.push({ subject: lifecycleSubject, predicate: p, object: o, graph: metaGraph });
+        }
+      }
+    }
     const staleEvents = await this.store.query(
       `SELECT DISTINCT ?s WHERE { GRAPH <${metaGraph}> { ?s ?p ?o . FILTER(STR(?s) = "${lifecycleSubject}" || STRSTARTS(STR(?s), "${lifecycleSubject}/")) } }`,
     );
@@ -3932,6 +4115,9 @@ export class DKGPublisher implements Publisher {
         const subj = row['s'];
         if (subj) await this.store.deleteByPattern({ graph: metaGraph, subject: subj });
       }
+    }
+    if (preserved.length > 0) {
+      await this.store.insert(preserved);
     }
 
     const lifecycleQuads = generateAssertionCreatedMetadata({
@@ -3983,6 +4169,116 @@ export class DKGPublisher implements Publisher {
       `CONSTRUCT { ?s ?p ?o } WHERE { GRAPH <${graphUri}> { ?s ?p ?o } }`,
     );
     return result.type === 'quads' ? result.quads : [];
+  }
+
+  /**
+   * OT-RFC-43 §10.5.3 — `wm/pull-from`: seed a fresh WM draft from this file's
+   * current SWM or VM state (the `git checkout origin/<branch>` equivalent).
+   *
+   * WM is the only writable surface; to edit content that already lives in SWM
+   * or VM you pull it into a new WM draft, edit, then re-share / re-publish.
+   * The file's entity set is read from the assertion seal (on the lifecycle
+   * URN); the source layer's quads for those entities (+ their skolemized
+   * children) are gathered and written into a fresh WM draft.
+   *
+   * `onConflict` applies only when the WM draft already holds content:
+   *   - 'reject' (default): throw `WM_DRAFT_CONFLICT` — the caller decides.
+   *   - 'replace': discard the open draft, then seed fresh (git force-checkout).
+   */
+  async assertionPullFrom(
+    contextGraphId: string,
+    name: string,
+    agentAddress: string,
+    sourceLayer: 'swm' | 'vm',
+    opts?: { subGraphName?: string; onConflict?: 'reject' | 'replace' },
+  ): Promise<{ seeded: number; fromLayer: 'swm' | 'vm'; entities: number }> {
+    const subGraphName = opts?.subGraphName;
+    // PR #972/a6740ac: ensure the (sub)graph is registered so a sub-scoped VM
+    // pull can resolve its data graph below (was a pure name-format validation).
+    await this.ensureSubGraphRegistered(contextGraphId, subGraphName);
+    const wmGraph = contextGraphAssertionUri(contextGraphId, agentAddress, name, subGraphName);
+    const metaGraph = contextGraphMetaUri(contextGraphId);
+    const sourceGraph = sourceLayer === 'swm'
+      ? this.graphManager.sharedMemoryUri(contextGraphId, subGraphName)
+      // PR #972/a6740ac: a sub-scoped VM pull reads the SUBGRAPH's data graph,
+      // not the root data graph (mirrors the SWM branch's subGraphName handling).
+      : subGraphName
+        ? this.graphManager.subGraphUri(contextGraphId, subGraphName)
+        : this.graphManager.dataGraphUri(contextGraphId);
+
+    // onConflict: refuse to clobber a dirty WM draft unless told to replace it.
+    // NB: the actual DROP happens only AFTER the source is validated non-empty
+    // (below) — PR #972/335e8d8: dropping first could destroy an open draft when
+    // the pull turns out to have no source quads.
+    const draftProbe = await this.store.query(`ASK { GRAPH <${wmGraph}> { ?s ?p ?o } }`);
+    const hasDraft = draftProbe.type === 'boolean' && draftProbe.value === true;
+    if (hasDraft && (opts?.onConflict ?? 'reject') === 'reject') {
+      throw Object.assign(
+        new Error(`A WM draft already exists for "${name}" in context graph "${contextGraphId}"; pass onConflict:"replace" to overwrite it.`),
+        { code: 'WM_DRAFT_CONFLICT' },
+      );
+    }
+
+    // Resolve the file's member entities from the SEAL. PR #972/335e8d8: the
+    // seal is stamped at finalize under the assertion-graph URI
+    // (`contextGraphAssertionUri`, i.e. wmGraph) in the meta graph — NOT under
+    // the lifecycle URN. The prior code read `assertionLifecycleUri`, a
+    // different subject, so the lookup found nothing and pull-from failed for
+    // EVERY finalized assertion.
+    const sealRes = await this.store.query(
+      `CONSTRUCT { <${wmGraph}> ?p ?o } WHERE { GRAPH <${metaGraph}> { <${wmGraph}> ?p ?o } }`,
+    );
+    const seal = parseAssertionSealQuads(sealRes.type === 'quads' ? sealRes.quads : [], wmGraph);
+    if (!seal) {
+      throw new Error(
+        `No sealed entity list for "${name}" in context graph "${contextGraphId}" — pull-from `
+        + `requires a finalized assertion (its seal records the member entities).`,
+      );
+    }
+    const entities = seal.rootEntities;
+    if (entities.length === 0) {
+      throw new Error(
+        `Sealed assertion "${name}" in context graph "${contextGraphId}" records no member entities; nothing to pull.`,
+      );
+    }
+
+    // Gather the source-layer quads scoped to the entity set + skolem children
+    // (same filter the publish gather / RS prover use), minus trust/ownership
+    // bookkeeping that never belongs in a working draft.
+    const values = entities.map((e) => `<${e}>`).join(' ');
+    const gather = await this.store.query(
+      `CONSTRUCT { ?s ?p ?o } WHERE { GRAPH <${sourceGraph}> {
+         VALUES ?root { ${values} }
+         ?s ?p ?o .
+         FILTER(?s = ?root || STRSTARTS(STR(?s), CONCAT(STR(?root), "/.well-known/genid/")))
+       } }`,
+    );
+    const gathered = gather.type === 'quads'
+      ? gather.quads.filter((q) => !isTrustLevelQuad(q) && q.predicate !== WORKSPACE_OWNER_PREDICATE)
+      : [];
+
+    // Validate the source has content BEFORE touching the draft (PR #972/335e8d8:
+    // a drop-before-validate could destroy an open WM draft when the source
+    // turned out empty — e.g. pulling from a layer the file was never shared to).
+    if (gathered.length === 0) {
+      throw Object.assign(
+        new Error(
+          `No ${sourceLayer.toUpperCase()} quads found for "${name}" in context graph "${contextGraphId}" `
+          + `using the assertion seal's ${entities.length} root entit${entities.length === 1 ? 'y' : 'ies'}; `
+          + `WM draft was not modified.`,
+        ),
+        { code: 'PULL_FROM_EMPTY_SOURCE' },
+      );
+    }
+
+    // Source validated — now (re)open a fresh WM draft (clears stale
+    // lifecycle/seal) and seed it.
+    if (hasDraft) {
+      await this.store.dropGraph(wmGraph); // 'replace' — git force-checkout, after source validation
+    }
+    await this.assertionCreate(contextGraphId, name, agentAddress, subGraphName);
+    await this.assertionWrite(contextGraphId, name, agentAddress, gathered, subGraphName);
+    return { seeded: gathered.length, fromLayer: sourceLayer, entities: entities.length };
   }
 
   async assertionPromote(
@@ -4046,7 +4342,7 @@ export class DKGPublisher implements Publisher {
     // §10.2 linkage table) and the `<urn:dkg:extraction:<uuid>>`
     // ExtractionProvenance block (rows 9-13) are subordinate metadata
     // about the extraction RUN, not semantic knowledge about an Entity.
-    // Without this filter, `autoPartition` below would treat
+    // Without this filter, `skolemizeByEntity` below would treat
     // `<urn:dkg:file:keccak256:abc>` as a root entity and cross-assertion
     // ownership would contend when two different assertions reference
     // the same file content (same keccak256 → same URN → same
@@ -4068,7 +4364,7 @@ export class DKGPublisher implements Publisher {
     //
     // See `19_MARKDOWN_CONTENT_TYPE.md §10.2` for the normative rule
     // and Codex Bug 8 Round 4 reconciled ruling for the history (Round
-    // 3 tried blank-node subjects but an `autoPartition` audit showed
+    // 3 tried blank-node subjects but an `skolemizeByEntity` audit showed
     // they silently drop rows 9-13 on promote, which was worse).
     // Round 12 Bug 35: source the prefix list from `RESERVED_SUBJECT_PREFIXES`
     // instead of hardcoding the two literals inline. If the reserved
@@ -4103,7 +4399,7 @@ export class DKGPublisher implements Publisher {
     const operationId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 
     // Skolemize blank nodes so local SWM and gossip peers store identical data.
-    const kaMap = autoPartition(quadsToPromote);
+    const kaMap = skolemizeByEntity(quadsToPromote);
     if (kaMap.size === 0) {
       throw new Error(
         'Cannot promote assertion: no root entities found. ' +
@@ -4369,6 +4665,53 @@ export class DKGPublisher implements Publisher {
       throw new Error('Cannot resolve KA UAL: DKGKnowledgeAssets address unavailable');
     }
     return `did:dkg:${this.chain.chainId}/${storageAddr.toLowerCase()}/${kaId.toString()}`;
+  }
+
+  /**
+   * OT-RFC-43 Option 1 — reserve the deterministic packed kaId for `author`'s
+   * next V10 mint, or return `undefined` when no allocator is configured
+   * (mock/no-chain/pre-Option-1 flows; the real EVM adapter then throws on the
+   * missing reservedKaId). On first use per author this process it reconciles
+   * the allocator's floor against the chain's highest minted number
+   * (`max(local, chainMax) + 1`) so a stale local DB never re-hands a burned
+   * `(author, number)` — that reconciliation also satisfies the allocator's
+   * cold-start guard so `allocate()` is permitted.
+   *
+   * OT-RFC-43 A2 (decision 1) — when `precomputed` is supplied (a packed kaId
+   * the AGENT already reserved+stamped at `assertionFinalize`), REUSE it
+   * verbatim and SKIP allocation entirely. This makes finalize the single
+   * source of truth for the id and eliminates the double-allocation that would
+   * otherwise burn a second `(author, number)` on every finalize→publish.
+   */
+  private async ensureReservedKaId(author: string, precomputed?: bigint): Promise<bigint | undefined> {
+    if (precomputed !== undefined) return precomputed;
+    if (!this.kaAllocator) return undefined;
+    const key = author.toLowerCase();
+    if (!this.reconciledKaAuthors.has(key)) {
+      let chainMax = -1n;
+      if (this.chain.getMaxKaNumberForAuthor) {
+        try {
+          chainMax = await this.chain.getMaxKaNumberForAuthor(author);
+        } catch (err) {
+          // A flaky/incapable oracle must not silently let the allocator reuse a
+          // number; surface it so the operator notices rather than burning ids.
+          // (The contract's _safeMint revert remains the ultimate backstop.)
+          throw new Error(
+            `OT-RFC-43 Option 1: failed to reconcile KA-number floor for author ${author} ` +
+            `against chain: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      }
+      if (chainMax >= 0n) {
+        // chainMax is the highest minted number; reconcile() raises the floor to chainMax + 1.
+        // Pass the bigint straight through (PR #976 F6) — `Number()` would lose precision past 2^53.
+        this.kaAllocator.reconcile(author, chainMax);
+      }
+      this.kaAllocator.markReconciled();
+      this.reconciledKaAuthors.add(key);
+    }
+    const { kaId } = this.kaAllocator.allocate(author);
+    return kaId;
   }
 
 }

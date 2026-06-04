@@ -95,8 +95,17 @@ export interface KnowledgeAssetFinalizedPublishOptions {
 }
 
 function publisherNodeIdentityOverridePayload(value: unknown): string {
-  if (typeof value === 'string') return value;
+  if (typeof value === 'string' && /^\d+$/.test(value)) return value;
   throw new Error('publisherNodeIdentityIdOverride must be passed as a decimal string');
+}
+
+function assertExclusiveAuthorFields(args: {
+  authorAgentAddress?: string;
+  preSignedAuthorAttestation?: PreSignedAuthorAttestationPayload;
+}): void {
+  if (args.authorAgentAddress != null && args.preSignedAuthorAttestation != null) {
+    throw new Error('authorAgentAddress and preSignedAuthorAttestation are mutually exclusive');
+  }
 }
 
 /** Translate {@link KnowledgeAssetFinalizedPublishOptions} into the daemon body. */
@@ -1087,6 +1096,7 @@ export class DkgClient {
     alsoShareSwm?: boolean;
     alsoPublishVm?: boolean | KnowledgeAssetFinalizedPublishOptions;
   }): Promise<Record<string, unknown>> {
+    assertExclusiveAuthorFields(args);
     const body: Record<string, unknown> = {
       contextGraphId: normalizeContextGraphId(args.contextGraphId),
       name: args.name,
@@ -1154,6 +1164,7 @@ export class DkgClient {
     preSignedAuthorAttestation?: PreSignedAuthorAttestationPayload;
     schemeVersion?: number;
   }): Promise<{ merkleRoot: string; eip712Digest: string }> {
+    assertExclusiveAuthorFields(args);
     const body: Record<string, unknown> = {
       contextGraphId: normalizeContextGraphId(args.contextGraphId),
     };

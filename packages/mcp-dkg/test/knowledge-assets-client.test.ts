@@ -63,22 +63,63 @@ describe('DkgClient knowledge-assets — publish/finalize option serialization',
     expect(calls).toHaveLength(0);
   });
 
-  it('knowledgeAssetFinalize forwards external-signer fields', async () => {
+  it('knowledgeAssetPublish rejects malformed decimal-string publisher identity overrides', async () => {
+    const { client, calls } = makeClient();
+    await expect(client.knowledgeAssetPublish({
+      contextGraphId: 'cg-1',
+      name: 'f',
+      publisherNodeIdentityIdOverride: 'abc',
+    })).rejects.toThrow(/decimal string/);
+    await expect(client.knowledgeAssetPublish({
+      contextGraphId: 'cg-1',
+      name: 'f',
+      publisherNodeIdentityIdOverride: '-1',
+    })).rejects.toThrow(/decimal string/);
+    expect(calls).toHaveLength(0);
+  });
+
+  it('knowledgeAssetFinalize forwards authorAgentAddress', async () => {
     const { client, calls } = makeClient();
     await client.knowledgeAssetFinalize({
       contextGraphId: 'cg-1',
       name: 'f',
       authorAgentAddress: '0xauthor',
-      preSignedAuthorAttestation: { address: '0xauthor', signature: { r: '0xr', vs: '0xvs' } },
       schemeVersion: 1,
     });
     expect(calls[0].url).toContain('/api/knowledge-assets/f/wm/finalize');
     expect(calls[0].body).toMatchObject({
       contextGraphId: 'cg-1',
       authorAgentAddress: '0xauthor',
-      preSignedAuthorAttestation: { address: '0xauthor', signature: { r: '0xr', vs: '0xvs' } },
       schemeVersion: 1,
     });
+  });
+
+  it('knowledgeAssetFinalize forwards preSignedAuthorAttestation', async () => {
+    const { client, calls } = makeClient();
+    const preSignedAuthorAttestation = { address: '0xauthor', signature: { r: '0xr', vs: '0xvs' } };
+    await client.knowledgeAssetFinalize({
+      contextGraphId: 'cg-1',
+      name: 'f',
+      preSignedAuthorAttestation,
+      schemeVersion: 1,
+    });
+    expect(calls[0].url).toContain('/api/knowledge-assets/f/wm/finalize');
+    expect(calls[0].body).toMatchObject({
+      contextGraphId: 'cg-1',
+      preSignedAuthorAttestation,
+      schemeVersion: 1,
+    });
+  });
+
+  it('knowledgeAssetFinalize rejects mutually exclusive authorship fields before HTTP serialization', async () => {
+    const { client, calls } = makeClient();
+    await expect(client.knowledgeAssetFinalize({
+      contextGraphId: 'cg-1',
+      name: 'f',
+      authorAgentAddress: '0xauthor',
+      preSignedAuthorAttestation: { address: '0xauthor', signature: { r: '0xr', vs: '0xvs' } },
+    })).rejects.toThrow(/mutually exclusive/);
+    expect(calls).toHaveLength(0);
   });
 
   it('createKnowledgeAsset translates an alsoPublishVm options object', async () => {

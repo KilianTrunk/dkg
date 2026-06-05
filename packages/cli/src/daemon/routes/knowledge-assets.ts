@@ -25,11 +25,61 @@
 // `(agent, number)` addressing is layered on by Option 1 later, on these same
 // routes, as an additional accepted identifier form.
 import type { RequestContext } from "./context.js";
-import { jsonResponse, readBody, safeParseJson } from "../http-utils.js";
+import {
+  jsonResponse,
+  readBody,
+  safeParseJson,
+  validateOptionalSubGraphName,
+  validateRequiredContextGraphId,
+  normalizeContextGraphIdOrUri,
+  resolveRequiredWriteContextGraphId,
+} from "../http-utils.js";
 import { validatePreSignedAuthorAttestation } from "./memory.js";
+import { recordAssertionActivity } from "../activity-notification.js";
 import { deriveStatus } from "@origintrail-official/dkg-publisher";
+import { validateAssertionName } from "@origintrail-official/dkg-core";
 
 const PREFIX = "/api/knowledge-assets";
+
+// Decode + validate a `:name` path segment (parity with the legacy routes,
+// which `safeDecodeURIComponent` then `validateAssertionName` every name). A
+// B3 kaId form (did:dkg UAL / `0x<addr>:<n>`) is exempt — it's validated by
+// `classifyKaIdentifier`. Returns the name, or null after writing a 400/error.
+function decodeAndValidateName(seg: string, res: RequestContext["res"]): string | null {
+  if (classifyKaIdentifier(seg).kind === "kaId") return seg;
+  const nameVal = validateAssertionName(seg);
+  if (!nameVal.valid) {
+    jsonResponse(res, 400, { error: `Invalid "name": ${nameVal.reason}` });
+    return null;
+  }
+  return seg;
+}
+
+// Best-effort assertion-activity row + notification SSE for a lifecycle event.
+// Never throws — activity tracking must not break a write/publish path.
+function recordActivityAndNotify(
+  ctx: RequestContext,
+  input: {
+    contextGraphId: string;
+    kind: "created" | "promoted" | "published";
+    actorAgentAddress: string;
+    subGraphName?: string;
+    tripleCount?: number;
+  },
+): void {
+  try {
+    recordAssertionActivity(ctx.dashDb, {
+      contextGraphId: input.contextGraphId,
+      kind: input.kind,
+      actorAgentAddress: input.actorAgentAddress,
+      subGraphName: input.subGraphName,
+      ...(typeof input.tripleCount === "number" ? { tripleCount: input.tripleCount } : {}),
+    });
+    ctx.emitNotification?.({ contextGraphId: input.contextGraphId, type: "assertion_activity" });
+  } catch {
+    /* activity/notification is advisory — never block the lifecycle op */
+  }
+}
 const FINALIZE_ONLY_CREATE_FIELDS = [
   "authorAgentAddress",
   "preSignedAuthorAttestation",
@@ -307,9 +357,18 @@ function resolveFinalizedPublishOptions(
 }
 
 export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<void> {
-  const { req, res, agent, path, url } = ctx;
+  const { req, res, agent, path, url, requestToken, requestAgentAddress, emitMemoryGraphChanged } = ctx;
   if (path !== PREFIX && !path.startsWith(`${PREFIX}/`)) return;
   const method = req.method ?? "GET";
+
+  // Parity with the legacy assertion routes: resolve/validate the write
+  // contextGraphId against the caller's known graphs before any mutation, so a
+  // bad/foreign id is a 400 here rather than an opaque 500 from the engine.
+  const writePreflightCallerAgentAddress = requestToken ? agent.resolveAgentByToken(requestToken) : undefined;
+  const writePreflightContextGraphOpts = {
+    callerAgentAddress: writePreflightCallerAgentAddress,
+    allowLocalExactFallback: !writePreflightCallerAgentAddress,
+  };
 
   // ── POST /api/knowledge-assets — create KA + open WM draft (atomic shortcut) ──
   if (method === "POST" && path === PREFIX) {
@@ -326,8 +385,32 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
       alsoShareSwm,
       alsoPublishVm,
     } = parsed;
-    if (!contextGraphId || !name) {
-      return jsonResponse(res, 400, { error: 'Missing "contextGraphId" or "name"' });
+    if (!name) {
+      return jsonResponse(res, 400, { error: 'Missing "name"' });
+    }
+    if (typeof name !== "string") {
+      return jsonResponse(res, 400, { error: '"name" must be a string' });
+    }
+    const nameVal = validateAssertionName(name);
+    if (!nameVal.valid) {
+      return jsonResponse(res, 400, { error: `Invalid "name": ${nameVal.reason}` });
+    }
+    if (!validateOptionalSubGraphName(subGraphName, res)) return;
+    // Parity: resolve/validate the contextGraphId before any mutation.
+    const resolvedContextGraphId = await resolveRequiredWriteContextGraphId(
+      agent,
+      contextGraphId,
+      res,
+      writePreflightContextGraphOpts,
+    );
+    if (!resolvedContextGraphId) return;
+    // Strict boolean validation for the opt-in tail flags (PR #971): a stray
+    // `"false"` string must NOT silently promote/publish.
+    if (alsoShareSwm !== undefined && typeof alsoShareSwm !== "boolean") {
+      return jsonResponse(res, 400, { error: '"alsoShareSwm" must be a boolean when supplied' });
+    }
+    if (alsoPublishVm !== undefined && typeof alsoPublishVm !== "boolean" && (typeof alsoPublishVm !== "object" || alsoPublishVm === null || Array.isArray(alsoPublishVm))) {
+      return jsonResponse(res, 400, { error: '"alsoPublishVm" must be a boolean or an options object when supplied' });
     }
     const shouldAutoFinalize = Array.isArray(quads) && quads.length > 0;
     if (!shouldAutoFinalize && hasFinalizeOnlyCreateFields(parsed)) {
@@ -339,35 +422,57 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
       ? resolveFinalizeOptions({ subGraphName, authorAgentAddress, preSignedAuthorAttestation, schemeVersion }, res)
       : {};
     if (finalizeOptions === null) return;
+    const resolvedAuthorAgentAddress =
+      typeof (finalizeOptions as Record<string, unknown>).authorAgentAddress === "string"
+        ? ((finalizeOptions as Record<string, unknown>).authorAgentAddress as string)
+        : undefined;
     try {
-      const assertionUri = await agent.assertion.create(contextGraphId, name, { subGraphName });
-      const result: Record<string, unknown> = { name, assertionUri, status: "draft-open" };
+      // `alreadyExists` parity (#988): the engine create is a non-destructive
+      // get-or-create, so detect prior existence up front (cheap descriptor
+      // read) and surface it for idempotent callers.
+      let alreadyExists = false;
+      try {
+        const prior = await agent.assertion.history(resolvedContextGraphId, name, { subGraphName });
+        alreadyExists = prior != null;
+      } catch {
+        /* treat a failed lookup as "does not exist yet" */
+      }
+      const assertionUri = await agent.assertion.create(resolvedContextGraphId, name, { subGraphName });
+      const result: Record<string, unknown> = { name, assertionUri, alreadyExists, status: "draft-open" };
+      emitMemoryGraphChanged?.({ contextGraphId: resolvedContextGraphId, layers: ["wm"], subGraphName, operation: "assertion_created", source: "api", counts: { triples: 0 } });
+      recordActivityAndNotify(ctx, { contextGraphId: resolvedContextGraphId, kind: "created", actorAgentAddress: resolvedAuthorAgentAddress ?? requestAgentAddress, subGraphName });
 
       // autoFinalize: when quads are supplied, write + seal in the same call
       // (OT-RFC-43 §10.5.5). `also*` are opt-in layer transitions on top.
       if (shouldAutoFinalize) {
-        await agent.assertion.write(contextGraphId, name, quads, { subGraphName });
+        await agent.assertion.write(resolvedContextGraphId, name, quads, { subGraphName });
         result.written = quads.length;
-        const seal = await agent.assertion.finalize(contextGraphId, name, finalizeOptions);
+        emitMemoryGraphChanged?.({ contextGraphId: resolvedContextGraphId, layers: ["wm"], subGraphName, operation: "assertion_written", source: "api", counts: { triples: quads.length } });
+        const seal = await agent.assertion.finalize(resolvedContextGraphId, name, finalizeOptions);
         result.merkleRoot = hex(seal.merkleRoot);
         result.status = "wm-sealed";
+        emitMemoryGraphChanged?.({ contextGraphId: resolvedContextGraphId, layers: ["wm"], subGraphName, operation: "assertion_finalized", source: "api" });
       }
 
       const errors: Array<{ phase: string; error: string }> = [];
-      if (alsoShareSwm) {
+      if (alsoShareSwm === true) {
         try {
-          const share = await agent.assertion.promote(contextGraphId, name, { subGraphName });
+          const share = await agent.assertion.promote(resolvedContextGraphId, name, { subGraphName });
           result.swmShared = true;
           result.promotedCount = share.promotedCount;
           result.status = "swm-shared";
+          if (share.promotedCount !== 0) {
+            emitMemoryGraphChanged?.({ contextGraphId: resolvedContextGraphId, layers: ["wm", "swm"], subGraphName, operation: "assertion_promoted", source: "api", counts: { triples: share.promotedCount } });
+            recordActivityAndNotify(ctx, { contextGraphId: resolvedContextGraphId, kind: "promoted", actorAgentAddress: resolvedAuthorAgentAddress ?? requestAgentAddress, subGraphName, tripleCount: share.promotedCount });
+          }
         } catch (e: any) {
           errors.push({ phase: "swm-share", error: e?.message ?? String(e) });
         }
       }
-      if (alsoPublishVm) {
+      if (alsoPublishVm === true || (typeof alsoPublishVm === "object" && alsoPublishVm !== null)) {
         try {
           const opts = typeof alsoPublishVm === "object" && alsoPublishVm ? alsoPublishVm : {};
-          const pub: any = await agent.publishFromFinalizedAssertion(contextGraphId, name, { subGraphName, ...opts });
+          const pub: any = await agent.publishFromFinalizedAssertion(resolvedContextGraphId, name, { subGraphName, ...opts });
           result.kaId = pub?.kaId;
           result.ual = pub?.ual;
           result.txHash = pub?.onChainResult?.txHash;
@@ -406,35 +511,66 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
   // kaId form (did:dkg UAL or `0x<addr>:<number>`) we resolve to the lifecycle
   // descriptor via the agent resolver; for a plain name we use it directly.
   // Returns the descriptor (or null) so both GET handlers share one read.
-  async function resolveDescriptor(cg: string, subGraphName?: string): Promise<Record<string, unknown> | null> {
+  async function resolveDescriptor(cg: string, subGraphName?: string, agentAddress?: string): Promise<Record<string, unknown> | null> {
     const ident = classifyKaIdentifier(name);
     if (ident.kind === "kaId") {
       const hist = await (agent as any).assertion.resolveByKaId?.(cg, ident.kaId, { subGraphName });
       return (hist as unknown as Record<string, unknown>) ?? null;
     }
-    const hist = await agent.assertion.history(cg, name, { subGraphName });
+    // `agentAddress` parity (#988): author-scoped read so a caller can inspect
+    // another agent's lifecycle record (the engine keys the lifecycle URI by
+    // author and defaults to the local agent when omitted).
+    const hist = await agent.assertion.history(cg, name, { subGraphName, ...(agentAddress ? { agentAddress } : {}) });
     return (hist as unknown as Record<string, unknown>) ?? null;
+  }
+
+  // Shared GET preflight: decode/validate the :identifier, require + normalize
+  // contextGraphId, validate subGraphName, extract optional agentAddress.
+  function readGetParams(): { cg: string; subGraphName?: string; agentAddress?: string } | null {
+    if (decodeAndValidateName(name, res) === null) return null;
+    const rawCg = url.searchParams.get("contextGraphId");
+    if (!validateRequiredContextGraphId(rawCg, res)) return null;
+    const subGraphName = url.searchParams.get("subGraphName") ?? undefined;
+    if (!validateOptionalSubGraphName(subGraphName, res)) return null;
+    const agentAddress = url.searchParams.get("agentAddress") ?? undefined;
+    if (agentAddress !== undefined && !/^0x[0-9a-fA-F]{40}$/.test(agentAddress)) {
+      jsonResponse(res, 400, { error: '"agentAddress" must be a 0x-prefixed 20-byte EVM address' });
+      return null;
+    }
+    return { cg: normalizeContextGraphIdOrUri(rawCg as string), subGraphName, agentAddress };
   }
 
   // GET /api/knowledge-assets/:identifier — KA metadata / lifecycle state.
   // `:identifier` is a plain name OR a B3 kaId (did:dkg UAL / `0x<addr>:<n>`).
   if (method === "GET" && segs.length === 1) {
-    const cg = url.searchParams.get("contextGraphId");
-    if (!cg) return jsonResponse(res, 400, { error: 'Missing "contextGraphId" query param' });
-    const subGraphName = url.searchParams.get("subGraphName") ?? undefined;
-    const hist = await resolveDescriptor(cg, subGraphName);
-    if (!hist) return jsonResponse(res, 404, { error: `No knowledge asset "${name}" in context graph "${cg}"` });
+    const p = readGetParams();
+    if (!p) return;
+    const hist = await resolveDescriptor(p.cg, p.subGraphName, p.agentAddress);
+    if (!hist) return jsonResponse(res, 404, { error: `No knowledge asset "${name}" in context graph "${p.cg}"` });
     return jsonResponse(res, 200, hist);
+  }
+
+  // GET /api/knowledge-assets/:identifier/wm/quads — dump the WM draft's quads.
+  // Parity with the legacy POST /api/assertion/:name/query (read, not SPARQL).
+  if (method === "GET" && layer === "wm" && verb === "quads") {
+    const p = readGetParams();
+    if (!p) return;
+    try {
+      const quads = await agent.assertion.query(p.cg, name, p.subGraphName ? { subGraphName: p.subGraphName } : undefined);
+      const sorted = [...quads].sort((l, r) => JSON.stringify(l).localeCompare(JSON.stringify(r)));
+      return jsonResponse(res, 200, { quads: sorted, count: sorted.length });
+    } catch (e: any) {
+      return respondAssertionError(res, e);
+    }
   }
 
   // GET /api/knowledge-assets/:identifier/{wm,swm,vm} — per-layer status.
   // Returns that layer's pointer + that layer's derived status so per-layer
   // divergence (e.g. WM ahead of VM after wm/pull-from) is observable.
   if (method === "GET" && (layer === "wm" || layer === "swm" || layer === "vm") && !verb) {
-    const cg = url.searchParams.get("contextGraphId");
-    if (!cg) return jsonResponse(res, 400, { error: 'Missing "contextGraphId" query param' });
-    const subGraphName = url.searchParams.get("subGraphName") ?? undefined;
-    const hist = await resolveDescriptor(cg, subGraphName);
+    const p = readGetParams();
+    if (!p) return;
+    const hist = await resolveDescriptor(p.cg, p.subGraphName, p.agentAddress);
     if (!hist) return jsonResponse(res, 404, { error: `No knowledge asset "${name}"` });
     const pointerKey = `${layer}CurrentAssertion`;
     return jsonResponse(res, 200, {
@@ -450,9 +586,17 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
 
   const parsed = safeParseJson(await readBody(req), res);
   if (!parsed) return;
-  const contextGraphId = parsed.contextGraphId;
+  if (decodeAndValidateName(name, res) === null) return;
   const subGraphName = parsed.subGraphName;
-  if (!contextGraphId) return jsonResponse(res, 400, { error: 'Missing "contextGraphId"' });
+  if (!validateOptionalSubGraphName(subGraphName, res)) return;
+  // Parity: resolve/validate the contextGraphId before any mutation verb.
+  const contextGraphId = await resolveRequiredWriteContextGraphId(
+    agent,
+    parsed.contextGraphId,
+    res,
+    writePreflightContextGraphOpts,
+  );
+  if (!contextGraphId) return;
 
   try {
     // ── WM verbs (the only writable layer) ──
@@ -460,16 +604,28 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
       if (verb === "write") {
         if (!Array.isArray(parsed.quads)) return jsonResponse(res, 400, { error: 'Missing "quads"' });
         await agent.assertion.write(contextGraphId, name, parsed.quads, { subGraphName });
+        emitMemoryGraphChanged?.({ contextGraphId, layers: ["wm"], subGraphName, operation: "assertion_written", source: "api", counts: { triples: parsed.quads.length } });
         return jsonResponse(res, 200, { written: parsed.quads.length });
       }
       if (verb === "finalize") {
         const finalizeOptions = resolveFinalizeOptions(parsed, res);
         if (finalizeOptions === null) return;
         const seal = await agent.assertion.finalize(contextGraphId, name, finalizeOptions);
-        return jsonResponse(res, 200, { merkleRoot: hex(seal.merkleRoot), eip712Digest: seal.eip712Digest });
+        emitMemoryGraphChanged?.({ contextGraphId, layers: ["wm"], subGraphName, operation: "assertion_finalized", source: "api" });
+        // Full seal payload (PR #971) — clients inspect the attestation.
+        return jsonResponse(res, 200, {
+          assertionUri: seal.assertionUri,
+          merkleRoot: hex(seal.merkleRoot),
+          authorAddress: seal.authorAddress,
+          schemeVersion: seal.schemeVersion,
+          chainId: seal.chainId?.toString?.(),
+          kav10Address: seal.kav10Address,
+          eip712Digest: seal.eip712Digest,
+        });
       }
       if (verb === "discard") {
         await agent.assertion.discard(contextGraphId, name, { subGraphName });
+        emitMemoryGraphChanged?.({ contextGraphId, layers: ["wm"], subGraphName, operation: "assertion_discarded", source: "api" });
         return jsonResponse(res, 200, { discarded: true });
       }
       if (verb === "pull-from") {
@@ -495,6 +651,10 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
     // ── SWM verb: share (WM → SWM; OT-RFC-43 §10.6 renames promote → share) ──
     if (layer === "swm" && verb === "share") {
       const share = await agent.assertion.promote(contextGraphId, name, { entities: parsed.entities, subGraphName });
+      if (share.promotedCount !== 0) {
+        emitMemoryGraphChanged?.({ contextGraphId, layers: ["wm", "swm"], subGraphName, operation: "assertion_promoted", source: "api", counts: { triples: share.promotedCount } });
+        recordActivityAndNotify(ctx, { contextGraphId, kind: "promoted", actorAgentAddress: requestAgentAddress, subGraphName, tripleCount: share.promotedCount });
+      }
       return jsonResponse(res, 200, { swmShared: true, promotedCount: share.promotedCount });
     }
 
@@ -515,11 +675,21 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
         if (opts === null) return;
         const pub: any = await agent.publishFromFinalizedAssertion(contextGraphId, name, { subGraphName, ...opts });
         const { httpStatus, reason } = classifyVmPublish(pub);
+        if (httpStatus === 200) {
+          // Activity attributed to the SEAL author (PR #971), not the requester.
+          recordActivityAndNotify(ctx, { contextGraphId, kind: "published", actorAgentAddress: pub?.seal?.authorAddress ?? pub?.authorAddress ?? requestAgentAddress, subGraphName });
+        }
+        // Full publish payload (PR #971) so clients can reconcile sealed↔minted.
         return jsonResponse(res, httpStatus, {
           kaId: pub?.kaId,
           status: pub?.status,
           ual: pub?.ual,
           txHash: pub?.onChainResult?.txHash,
+          ...(pub?.assertionUri !== undefined ? { assertionUri: pub.assertionUri } : {}),
+          ...(pub?.seal?.authorAddress ?? pub?.authorAddress ? { authorAddress: pub?.seal?.authorAddress ?? pub?.authorAddress } : {}),
+          ...(pub?.merkleRoot !== undefined ? { merkleRoot: pub.merkleRoot } : {}),
+          ...(Array.isArray(pub?.kas) ? { kas: pub.kas } : {}),
+          ...(pub?.onChainResult?.blockNumber !== undefined ? { blockNumber: pub.onChainResult.blockNumber } : {}),
           ...(typeof pub?.contextGraphError === "string" ? { contextGraphError: pub.contextGraphError } : {}),
           ...(reason ? { error: reason } : {}),
         });

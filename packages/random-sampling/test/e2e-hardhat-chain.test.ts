@@ -185,6 +185,14 @@ describe('Random Sampling E2E (Hardhat)', () => {
     const authorSig = ethers.Signature.from(
       await coreOpWallet.signTypedData(authorTyped.domain, authorTyped.types, authorTyped.message),
     );
+    // OT-RFC-43 Option 1 (variant 1a): the real adapter requires a packed
+    // reservedKaId = (uint160(author) << 96) | number. Mirror the publisher's
+    // allocator cold-start (DKGPublisher.ensureReservedKaId): read the author's
+    // highest minted number from chain (-1n on a fresh deploy) and reserve the
+    // next one. CORE_OP has minted nothing in this snapshot, so this is number 0.
+    const authorChainMax = await publisherAdapter.getMaxKaNumberForAuthor!(coreOpWallet.address);
+    const reservedKaId =
+      (BigInt(ethers.getAddress(coreOpWallet.address)) << 96n) | (authorChainMax + 1n);
     const publishResult = await publisherAdapter.createKnowledgeAssets!({
       publishOperationId: 'rs-e2e-publish',
       contextGraphId: cgId,
@@ -205,6 +213,7 @@ describe('Random Sampling E2E (Hardhat)', () => {
         schemeVersion: 1,
       },
       ackSignatures,
+      reservedKaId,
     });
     kaId = publishResult.batchId;
     if (kaId === 0n) {

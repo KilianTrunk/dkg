@@ -29,6 +29,7 @@ import {
   jsonResponse,
   readBody,
   safeParseJson,
+  validateEntities,
   validateOptionalSubGraphName,
   validateRequiredContextGraphId,
   normalizeContextGraphIdOrUri,
@@ -43,6 +44,17 @@ import {
   handleKaImportFile,
   handleKaExtractionStatus,
 } from "./knowledge-assets-import.js";
+import {
+  handleKaShareJobsList,
+  handleKaShareJobStatus,
+  handleKaShareJobCancel,
+  handleKaShareJobRecover,
+} from "./knowledge-assets-async-share.js";
+import {
+  decodePromoteJobId,
+  asyncPromoteUnavailable,
+} from "./shared-assertion-helpers.js";
+import { PromoteJobConflictError } from "@origintrail-official/dkg-publisher";
 import { deriveStatus } from "@origintrail-official/dkg-publisher";
 import { validateAssertionName } from "@origintrail-official/dkg-core";
 
@@ -379,6 +391,55 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
   if (method === "POST" && path === `${PREFIX}/import-artifact/read-markdown`) return handleKaImportArtifactReadMarkdown(ctx);
   if (method === "POST" && path === `${PREFIX}/semantic-enrichment/write`) return handleKaSemanticEnrichmentWrite(ctx);
 
+  // ── Async SWM-share jobs COLLECTION routes (faithful ports of the legacy
+  // `/api/assertion/promote-async*` queue routes) ──
+  //
+  // These start with `swm/share-jobs`, so `segs[0]` would be "swm" — the
+  // generic `:name` parsing below would mis-read it as an assertion name.
+  // Match them EARLY on the raw `path`, before any name logic. The per-name
+  // enqueue route (`:name/swm/share-async`) is NOT here — it has a real name
+  // segment and is handled in the SWM section alongside `swm/share`.
+  //
+  // The `/recover` suffix (#5) must be matched BEFORE the bare-`:jobId`
+  // patterns (#3/#4). jobIds are decoded via `decodePromoteJobId` on the
+  // url-encoded segment, exactly as the legacy routes did inline.
+  const SHARE_JOBS_PREFIX = `${PREFIX}/swm/share-jobs`;
+  if (path === SHARE_JOBS_PREFIX || path.startsWith(`${SHARE_JOBS_PREFIX}/`)) {
+    // GET /api/knowledge-assets/swm/share-jobs — list
+    if (method === "GET" && path === SHARE_JOBS_PREFIX) {
+      return handleKaShareJobsList(ctx);
+    }
+    // POST /api/knowledge-assets/swm/share-jobs/:jobId/recover — recover (#5)
+    if (
+      method === "POST" &&
+      path.startsWith(`${SHARE_JOBS_PREFIX}/`) &&
+      path.endsWith("/recover")
+    ) {
+      const jobId = decodePromoteJobId(
+        path.slice(`${SHARE_JOBS_PREFIX}/`.length, -"/recover".length),
+        res,
+      );
+      if (jobId === null) return;
+      return handleKaShareJobRecover(ctx, jobId);
+    }
+    // GET /api/knowledge-assets/swm/share-jobs/:jobId — status (#3)
+    if (
+      method === "GET" &&
+      path.startsWith(`${SHARE_JOBS_PREFIX}/`) &&
+      !path.endsWith("/recover")
+    ) {
+      const jobId = decodePromoteJobId(path.slice(`${SHARE_JOBS_PREFIX}/`.length), res);
+      if (jobId === null) return;
+      return handleKaShareJobStatus(ctx, jobId);
+    }
+    // DELETE /api/knowledge-assets/swm/share-jobs/:jobId — cancel (#4)
+    if (method === "DELETE" && path.startsWith(`${SHARE_JOBS_PREFIX}/`)) {
+      const jobId = decodePromoteJobId(path.slice(`${SHARE_JOBS_PREFIX}/`.length), res);
+      if (jobId === null) return;
+      return handleKaShareJobCancel(ctx, jobId);
+    }
+  }
+
   // Parity with the legacy assertion routes: resolve/validate the write
   // contextGraphId against the caller's known graphs before any mutation, so a
   // bad/foreign id is a 400 here rather than an opaque 500 from the engine.
@@ -697,6 +758,44 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
         recordActivityAndNotify(ctx, { contextGraphId, kind: "promoted", actorAgentAddress: requestAgentAddress, subGraphName, tripleCount: share.promotedCount });
       }
       return jsonResponse(res, 200, { swmShared: true, promotedCount: share.promotedCount });
+    }
+
+    // ── SWM verb: share-async (WM → SWM, enqueued) ──
+    // Faithful port of POST /api/assertion/:name/promote-async. The shared
+    // preflight above already decoded/validated `name`, parsed the JSON body,
+    // validated `subGraphName`, and resolved `contextGraphId` — so we reuse
+    // those here (parity with how `swm/share` reuses them). The worker-
+    // availability 503 guard, `validateEntities` 400, and the conflict/error
+    // mapping match the legacy handler exactly. Self-contained try/catch (like
+    // `vm/publish`) so the legacy enqueue error mapping is preserved verbatim
+    // and unmatched errors rethrow rather than falling through to the outer
+    // `respondAssertionError` catch.
+    if (layer === "swm" && verb === "share-async") {
+      if (asyncPromoteUnavailable(res)) return;
+      const entities = parsed.entities;
+      if (!validateEntities(entities, res)) return;
+      try {
+        const result = await agent.assertion.promoteAsync(contextGraphId, name, {
+          entities: entities ?? "all",
+          subGraphName,
+        });
+        return jsonResponse(res, 200, { jobId: result.jobId, state: "queued" });
+      } catch (err: any) {
+        if (err instanceof PromoteJobConflictError) {
+          return jsonResponse(res, 409, {
+            error: err.message,
+            existingJobId: err.existingJobId,
+          });
+        }
+        if (
+          err.message?.includes("required") ||
+          err.message?.includes("Invalid") ||
+          err.message?.includes("must be")
+        ) {
+          return jsonResponse(res, 400, { error: err.message });
+        }
+        throw err;
+      }
     }
 
     // ── VM verb: publish (SWM/WM → VM; mint or update on chain) ──

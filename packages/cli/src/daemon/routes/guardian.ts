@@ -8,6 +8,7 @@
 import {
   analyzeGuardianEvent,
   buildEndorsementQuads,
+  buildFalsePositiveQuads,
   buildFixPrompt,
   buildPrivateAuditQuads,
   buildPublicDependencyQuads,
@@ -40,6 +41,23 @@ import {
 
 const PRIVATE_AUDIT_GRAPH_ID = 'guardian-local-audit';
 const PUBLIC_VULN_GRAPH_ID = GUARDIAN_PUBLIC_THREAT_GRAPH_ID;
+const GUARDIAN_CRON_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
+
+// ─── In-memory graph pattern cache ───────────────────────────────────────────
+// Refreshed every 10 min by the background cron. The event route uses these
+// patterns to supplement the hardcoded baseline with anything the network
+// has published since startup.
+interface GraphPatternCache {
+  injectionPatterns: Array<{ pattern: string; severity: GuardianSeverity; identifier: string }>;
+  escalationShapes: Set<string>; // `toolName::argShape` signatures
+  lastRefreshed: number;
+}
+let _patternCache: GraphPatternCache = {
+  injectionPatterns: [],
+  escalationShapes: new Set(),
+  lastRefreshed: 0,
+};
+let _cronStarted = false;
 const OSV_BATCH_URL = 'https://api.osv.dev/v1/querybatch';
 const OSV_VULN_URL = 'https://api.osv.dev/v1/vulns/';
 const CISA_KEV_URL = 'https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json';
@@ -77,6 +95,13 @@ interface OsvRecord {
 
 export async function handleGuardianRoutes(ctx: RequestContext): Promise<void> {
   const { req, res, url, path, dashDb } = ctx;
+
+  // Lazy-start the background cron on first request — no daemon lifecycle changes needed.
+  if (!_cronStarted) {
+    _cronStarted = true;
+    void refreshGraphPatternCache(ctx).catch(() => {});
+    setInterval(() => { void refreshGraphPatternCache(ctx).catch(() => {}); }, GUARDIAN_CRON_INTERVAL_MS);
+  }
 
   if (req.method === 'POST' && path === '/api/guardian/events') {
     const body = await readBody(req, SMALL_BODY_BYTES);
@@ -214,20 +239,10 @@ export async function handleGuardianRoutes(ctx: RequestContext): Promise<void> {
         accessPolicy: 0,
         publishPolicy: 1,
       });
-      // Write a falsePositive signal triple — same pattern as endorsements
-      // but with a distinct predicate so consumers can distinguish signal type.
-      const threatUri = threatUriFor(identifier);
-      const fpUri = `urn:guardian:false-positive:${stableHash({
-        threat: identifier,
-        reporter: reporterAddress.toLowerCase(),
-      }, 24)}`;
-      const graph = `did:dkg:context-graph:${PUBLIC_VULN_GRAPH_ID}`;
-      const quads = [
-        { subject: fpUri, predicate: 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type', object: 'http://umanitek.ai/ontology/guardian/FalsePositiveReport', graph },
-        { subject: fpUri, predicate: 'http://umanitek.ai/ontology/guardian/reportsAs', object: threatUri, graph },
-        { subject: fpUri, predicate: 'http://umanitek.ai/ontology/guardian/reporter', object: `"${reporterAddress.toLowerCase()}"`, graph },
-        { subject: fpUri, predicate: 'http://schema.org/dateCreated', object: `"${new Date().toISOString()}"^^<http://www.w3.org/2001/XMLSchema#dateTime>`, graph },
-      ];
+      const quads = buildFalsePositiveQuads({
+        threatIdentifier: identifier,
+        reporterAddress,
+      }, PUBLIC_VULN_GRAPH_ID);
       await ctx.agent.share(PUBLIC_VULN_GRAPH_ID, quads, {
         callerAgentAddress: reporterAddress,
       });
@@ -255,7 +270,12 @@ export async function recordGuardianEvent(
   dependencyIntel: GuardianDependencyIntelRecord[];
 }> {
   const event = normalizeGuardianEvent(input);
-  const findings = analyzeGuardianEvent(event);
+  const localFindings = analyzeGuardianEvent(event);
+  // Graph-first: check cached threat patterns from the DKG before trusting
+  // only the hardcoded baseline — any threat published by any node on the
+  // network enriches detection for every subscriber.
+  const graphFindings = applyGraphPatterns(event);
+  const findings = dedupeGuardianFindings([...localFindings, ...graphFindings]);
   const stored = ctx.dashDb.upsertGuardianEvent(event);
   ctx.dashDb.upsertGuardianFindings(findings);
 
@@ -397,6 +417,156 @@ async function lookupCuratedDependencyThreat(
  *   - Lang-tagged literal:     `"hello"@en`           → `hello`
  *   - SPARQL-JSON object:      `{ value: "foo" }`     → `foo`
  */
+// ─── Cron: pull new threats from the public graph every 10 min ───────────────
+/**
+ * Refresh the in-memory graph pattern cache from the public threat CG.
+ * Runs once at startup (lazy, first request) and every 10 minutes thereafter.
+ * New threats published by ANY connected peer flow into local detection
+ * without a daemon restart — this is how the network improves every node.
+ */
+async function refreshGraphPatternCache(ctx: RequestContext): Promise<void> {
+  const sparql = `
+    PREFIX g: <http://umanitek.ai/ontology/guardian/>
+    PREFIX schema: <http://schema.org/>
+    SELECT ?identifier ?type ?pattern ?toolName ?argShape ?severity WHERE {
+      ?threat g:identifier ?identifier .
+      OPTIONAL { ?threat g:pattern ?pattern . }
+      OPTIONAL { ?threat g:toolName ?toolName . }
+      OPTIONAL { ?threat g:argShape ?argShape . }
+      OPTIONAL { ?threat g:severity ?severity . }
+    }
+    LIMIT 500
+  `;
+  try {
+    const result = await (ctx.agent as any).query(sparql, {
+      contextGraphId: PUBLIC_VULN_GRAPH_ID,
+      view: 'shared-working-memory',
+    });
+    const bindings = (result as any)?.bindings ?? [];
+    const injectionPatterns: GraphPatternCache['injectionPatterns'] = [];
+    const escalationShapes = new Set<string>();
+
+    for (const row of bindings) {
+      const identifier = extractLiteral(row.identifier) ?? '';
+      const severity = normalizeSeverity(extractLiteral(row.severity), 'high');
+
+      if (identifier.startsWith('injection:')) {
+        const pattern = extractLiteral(row.pattern);
+        if (pattern) injectionPatterns.push({ pattern, severity, identifier });
+      } else if (identifier.startsWith('escalation:')) {
+        const toolName = extractLiteral(row.toolName);
+        const argShape = extractLiteral(row.argShape);
+        if (toolName && argShape) escalationShapes.add(`${toolName.toLowerCase()}::${argShape}`);
+      }
+    }
+
+    _patternCache = { injectionPatterns, escalationShapes, lastRefreshed: Date.now() };
+    console.info(`[guardian-cron] cache refreshed: ${injectionPatterns.length} injection patterns, ${escalationShapes.size} escalation shapes`);
+  } catch (err) {
+    // Degrade gracefully — local hardcoded baseline still protects
+    console.debug('[guardian-cron] pattern cache refresh failed (non-fatal):', err);
+  }
+}
+
+/**
+ * Apply cached graph patterns to an event — supplements the hardcoded
+ * `analyzeGuardianEvent` baseline with anything the network has published.
+ */
+function applyGraphPatterns(
+  event: ReturnType<typeof normalizeGuardianEvent>,
+): GuardianFindingRecord[] {
+  const findings: GuardianFindingRecord[] = [];
+  if (_patternCache.injectionPatterns.length === 0 && _patternCache.escalationShapes.size === 0) {
+    return findings;
+  }
+
+  const now = Date.now();
+  const textSamples = [
+    event.summary,
+    ...Object.values(JSON.parse(event.raw_json)?.data ?? {} as Record<string, unknown>)
+      .filter((v): v is string => typeof v === 'string'),
+  ].join(' ');
+
+  // Injection: test each cached pattern against the event text
+  for (const { pattern, severity, identifier } of _patternCache.injectionPatterns) {
+    try {
+      const re = new RegExp(pattern, 'i');
+      if (re.test(textSamples)) {
+        findings.push({
+          id: `guardian-finding-graph-${stableHash({ eventId: event.id, identifier }, 24)}`,
+          event_id: event.id,
+          ts: now,
+          type: 'prompt_injection',
+          severity,
+          title: 'Prompt injection — matched graph pattern',
+          summary: `Graph threat ${identifier} matched. Pattern: ${pattern.slice(0, 120)}`,
+          recommendation: 'Treat the source content as untrusted. Review against the DKG threat graph.',
+          evidence_json: JSON.stringify({ identifier, pattern: pattern.slice(0, 200) }),
+          status: 'open',
+          public_safe: 0,
+          package_name: null,
+          package_version: null,
+          package_ecosystem: null,
+          advisory_id: null,
+          graph_scope: 'private',
+          created_at: now,
+          updated_at: now,
+        });
+      }
+    } catch {
+      // Malformed pattern in graph — skip
+    }
+  }
+
+  // Escalation: check tool calls for known dangerous shapes
+  const toolCalls: Array<{ toolName?: string; args?: Record<string, unknown> }> = (() => {
+    try { return JSON.parse(event.raw_json)?.data?.toolCalls ?? []; } catch { return []; }
+  })();
+  for (const tc of toolCalls) {
+    const toolName = tc.toolName?.toLowerCase() ?? '';
+    for (const shape of _patternCache.escalationShapes) {
+      const [shapeToolName] = shape.split('::');
+      if (toolName === shapeToolName) {
+        findings.push({
+          id: `guardian-finding-graph-${stableHash({ eventId: event.id, shape }, 24)}`,
+          event_id: event.id,
+          ts: now,
+          type: 'risky_shell',
+          severity: 'critical',
+          title: 'Dangerous tool call — matched graph escalation shape',
+          summary: `Tool call matched DKG escalation threat: ${shape}`,
+          recommendation: 'Review this tool call against the known dangerous shapes in the threat graph.',
+          evidence_json: JSON.stringify({ shape }),
+          status: 'open',
+          public_safe: 0,
+          package_name: null,
+          package_version: null,
+          package_ecosystem: null,
+          advisory_id: null,
+          graph_scope: 'private',
+          created_at: now,
+          updated_at: now,
+        });
+        break;
+      }
+    }
+  }
+
+  return findings;
+}
+
+/** Deduplicate findings by id — prevents the same finding from appearing twice
+ *  when both local baseline and graph patterns match the same event. */
+function dedupeGuardianFindings(findings: GuardianFindingRecord[]): GuardianFindingRecord[] {
+  const seen = new Set<string>();
+  return findings.filter((f) => {
+    if (seen.has(f.id)) return false;
+    seen.add(f.id);
+    return true;
+  });
+}
+
+// ─── SPARQL helpers ───────────────────────────────────────────────────────────
 function extractLiteral(value: unknown): string | null {
   if (typeof value === 'string') {
     if (value.startsWith('"')) {
@@ -860,7 +1030,7 @@ async function publishPublicNonDependencyThreats(
       id: 'guardian-public-threat-intel',
       scope: 'public',
       contextGraphId,
-      status: missingPublishIdentity ? 'skipped' : 'failed',
+      status: 'failed',
       error: message,
       details: {
         injectionPatterns: [...injectionPatterns].slice(0, 5),

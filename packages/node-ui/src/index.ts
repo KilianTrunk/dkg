@@ -33,6 +33,10 @@ export type {
 export {
   analyzeGuardianEvent,
   buildEndorsementQuads,
+  buildFalsePositiveQuads,
+  GUARDIAN_FALSE_POSITIVE_TYPE_IRI,
+  GUARDIAN_DISPUTES_PRED,
+  GUARDIAN_DISPUTE_REPORTER_PRED,
   buildFixPrompt,
   buildPrivateAuditQuads,
   buildPublicDependencyQuads,

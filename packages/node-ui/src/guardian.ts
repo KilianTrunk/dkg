@@ -484,6 +484,9 @@ export const GUARDIAN_OWASP_CATEGORY_PRED = `${GUARDIAN_ONTOLOGY}owaspCategory`;
 export const GUARDIAN_ENDORSES_PRED = `${GUARDIAN_ONTOLOGY}endorses`;
 export const GUARDIAN_ENDORSER_PRED = `${GUARDIAN_ONTOLOGY}endorser`;
 export const GUARDIAN_ENDORSEMENT_TYPE_IRI = `${GUARDIAN_ONTOLOGY}Endorsement`;
+export const GUARDIAN_DISPUTES_PRED = `${GUARDIAN_ONTOLOGY}disputes`;
+export const GUARDIAN_DISPUTE_REPORTER_PRED = `${GUARDIAN_ONTOLOGY}disputeReporter`;
+export const GUARDIAN_FALSE_POSITIVE_TYPE_IRI = `${GUARDIAN_ONTOLOGY}FalsePositive`;
 export const GUARDIAN_PUBLIC_THREAT_GRAPH_ID = 'guardian-vulnerability-intel';
 
 const RDF_TYPE = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type';
@@ -660,6 +663,32 @@ export function buildPublicEscalationThreatQuads(
 /** Stable URI for a Threat with the given identifier — used by lookup + endorse. */
 export function threatUriFor(identifier: string): string {
   return `urn:guardian:threat:${slug(identifier)}`;
+}
+
+/**
+ * Build FalsePositive quads — a reporter disputes a Threat, publishing a
+ * `g:FalsePositive` node to the public CG. Dispute counts can be queried via
+ * COUNT(DISTINCT ?reporter) WHERE { ?fp g:disputes ?threat } to surface
+ * community disagreement alongside endorsement counts.
+ */
+export function buildFalsePositiveQuads(args: {
+  threatIdentifier: string;
+  reporterAddress: string;
+  ts?: number;
+}, contextGraphId = GUARDIAN_PUBLIC_THREAT_GRAPH_ID): Array<{ subject: string; predicate: string; object: string; graph: string }> {
+  const graph = `did:dkg:context-graph:${contextGraphId}`;
+  const threatUri = threatUriFor(args.threatIdentifier);
+  const ts = args.ts ?? Date.now();
+  const fpUri = `urn:guardian:fp:${stableHash({
+    threat: args.threatIdentifier,
+    reporter: args.reporterAddress.toLowerCase(),
+  }, 24)}`;
+  return [
+    q(fpUri, RDF_TYPE, GUARDIAN_FALSE_POSITIVE_TYPE_IRI, graph),
+    q(fpUri, GUARDIAN_DISPUTES_PRED, threatUri, graph),
+    q(fpUri, GUARDIAN_DISPUTE_REPORTER_PRED, literal(args.reporterAddress.toLowerCase()), graph),
+    q(fpUri, 'http://schema.org/dateCreated', literalIso(ts), graph),
+  ];
 }
 
 /**

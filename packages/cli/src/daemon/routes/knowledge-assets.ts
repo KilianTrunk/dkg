@@ -40,6 +40,8 @@ import {
   handleKaImportArtifactResolve,
   handleKaImportArtifactReadMarkdown,
   handleKaSemanticEnrichmentWrite,
+  handleKaImportFile,
+  handleKaExtractionStatus,
 } from "./knowledge-assets-import.js";
 import { deriveStatus } from "@origintrail-official/dkg-publisher";
 import { validateAssertionName } from "@origintrail-official/dkg-core";
@@ -580,6 +582,15 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
     }
   }
 
+  // GET /api/knowledge-assets/:name/wm/extraction-status?contextGraphId=...&subGraphName=...
+  // Faithful port of the legacy GET /api/assertion/:name/extraction-status. The
+  // handler reads + validates the query params itself (parity with legacy), so
+  // here we only decode/validate the :name segment before delegating.
+  if (method === "GET" && layer === "wm" && verb === "extraction-status") {
+    if (decodeAndValidateName(name, res) === null) return;
+    return handleKaExtractionStatus(ctx, name);
+  }
+
   // GET /api/knowledge-assets/:identifier/{wm,swm,vm} — per-layer status.
   // Returns that layer's pointer + that layer's derived status so per-layer
   // divergence (e.g. WM ahead of VM after wm/pull-from) is observable.
@@ -599,6 +610,20 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
   }
 
   if (method !== "POST") return;
+
+  // POST /api/knowledge-assets/:name/wm/import-file — MULTIPART, not JSON.
+  // Faithful port of the legacy POST /api/assertion/:name/import-file. This MUST
+  // be matched BEFORE the `safeParseJson(await readBody(req))` JSON preflight
+  // below: the body is multipart/form-data and the handler reads it raw via
+  // `readBodyBuffer` + `parseMultipart`. Routing it through the JSON preflight
+  // would consume the request stream and 400 every upload. Only the :name
+  // segment is decoded/validated here (parity with the JSON verbs); the handler
+  // re-validates the name and resolves the contextGraphId from the multipart
+  // fields itself.
+  if (method === "POST" && layer === "wm" && verb === "import-file") {
+    if (decodeAndValidateName(name, res) === null) return;
+    return handleKaImportFile(ctx, name);
+  }
 
   const parsed = safeParseJson(await readBody(req), res);
   if (!parsed) return;

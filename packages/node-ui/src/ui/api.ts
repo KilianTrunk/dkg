@@ -1641,6 +1641,22 @@ export interface LocalAgentChatResponse {
   turnId?: string;
 }
 
+export interface LocalAgentChatFailurePersistenceOptions {
+  sessionId?: string;
+  correlationId?: string;
+  userMessage: string;
+  assistantReply?: string;
+  failureReason?: string;
+  profile?: string;
+  attachments?: LocalAgentChatAttachmentRef[];
+  contextGraphId?: string;
+}
+
+export interface LocalAgentChatFailurePersistenceResponse {
+  ok?: boolean;
+  turnId?: string;
+}
+
 export async function sendOpenClawLocalChat(
   text: string,
   opts?: LocalAgentChatRequestOptions,
@@ -2059,6 +2075,7 @@ export interface LocalAgentHistoryMessage {
   author: string;
   ts: string;
   turnId?: string;
+  persistStatus?: 'pending' | 'in_progress' | 'stored' | 'failed' | 'skipped';
   failureReason?: string | null;
   attachmentRefs?: LocalAgentChatAttachmentRef[];
   toolCalls?: Array<{ name: string; args: Record<string, unknown>; result: unknown }>;
@@ -2156,6 +2173,7 @@ async function fetchLocalAgentHistoryBySessionId(
         author: message.author,
         ts: message.ts,
         turnId: message.turnId,
+        persistStatus: message.persistStatus,
         failureReason: message.failureReason,
         attachmentRefs: message.attachmentRefs,
         toolCalls: message.toolCalls,
@@ -2553,6 +2571,34 @@ export async function fetchLocalAgentHistory(
   const sessionId = resolveLocalAgentHistorySessionId(id, opts.sessionId);
   if (!sessionId) return [];
   return fetchLocalAgentHistoryBySessionId(sessionId, limit);
+}
+
+async function persistHermesLocalChatFailure(
+  opts: LocalAgentChatFailurePersistenceOptions,
+): Promise<LocalAgentChatFailurePersistenceResponse> {
+  const sessionId = opts.sessionId?.trim();
+  if (!sessionId) throw new Error('Missing Hermes session id');
+  return post<LocalAgentChatFailurePersistenceResponse>('/api/hermes-channel/persist-turn', {
+    sessionId,
+    userMessage: opts.userMessage,
+    assistantReply: opts.assistantReply ?? '',
+    correlationId: opts.correlationId,
+    attachmentRefs: opts.attachments,
+    persistenceState: 'failed',
+    failureReason: opts.failureReason,
+    contextGraphId: opts.contextGraphId,
+    profile: opts.profile,
+    metadata: { source: 'node-ui-failed-turn' },
+  });
+}
+
+export async function persistLocalAgentChatFailure(
+  id: string,
+  opts: LocalAgentChatFailurePersistenceOptions,
+): Promise<LocalAgentChatFailurePersistenceResponse> {
+  const normalizedId = id.trim().toLowerCase();
+  if (normalizedId === 'hermes') return persistHermesLocalChatFailure(opts);
+  throw new Error(`${id} local chat persistence is not available yet.`);
 }
 
 export async function streamLocalAgentChat(

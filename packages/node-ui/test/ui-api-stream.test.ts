@@ -3,6 +3,7 @@ import { createServer, type Server } from 'node:http';
 import {
   fetchMemorySessionGraphDelta,
   importFile,
+  persistLocalAgentChatFailure,
   LocalAgentApiError,
   sendHermesLocalChat,
   streamHermesLocalChat,
@@ -492,5 +493,54 @@ describe('ui local-agent stream api', () => {
     } finally {
       globalThis.fetch = savedFetch;
     }
+  });
+
+  it('persists failed Hermes local-agent turns through the durable turn endpoint', async () => {
+    const fetchCalls: [string | URL | Request, RequestInit | undefined][] = [];
+    const savedFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      fetchCalls.push([url, init]);
+      return new Response(
+        JSON.stringify({ ok: true, turnId: 'corr-timeout' }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      );
+    }) as typeof globalThis.fetch;
+
+    try {
+      const result = await persistLocalAgentChatFailure('hermes', {
+        sessionId: 'hermes:dkg-ui:profile-dkg-smoke',
+        correlationId: 'corr-timeout',
+        userMessage: 'slow question',
+        failureReason: 'Hermes took too long to respond.',
+        profile: 'dkg-smoke',
+        contextGraphId: 'project-1',
+      });
+
+      expect(result.turnId).toBe('corr-timeout');
+      expect(String(fetchCalls[0]?.[0])).toBe('/api/hermes-channel/persist-turn');
+      const payload = JSON.parse(String(fetchCalls[0]?.[1]?.body));
+      expect(payload).toMatchObject({
+        sessionId: 'hermes:dkg-ui:profile-dkg-smoke',
+        userMessage: 'slow question',
+        assistantReply: '',
+        correlationId: 'corr-timeout',
+        persistenceState: 'failed',
+        failureReason: 'Hermes took too long to respond.',
+        profile: 'dkg-smoke',
+        contextGraphId: 'project-1',
+      });
+      expect(payload).not.toHaveProperty('turnId');
+    } finally {
+      globalThis.fetch = savedFetch;
+    }
+  });
+
+  it('requires an explicit Hermes session id when persisting failed turns', async () => {
+    await expect(persistLocalAgentChatFailure('hermes', {
+      correlationId: 'corr-timeout',
+      userMessage: 'slow question',
+      failureReason: 'Hermes took too long to respond.',
+      profile: 'dkg-smoke',
+    })).rejects.toThrow('Missing Hermes session id');
   });
 });

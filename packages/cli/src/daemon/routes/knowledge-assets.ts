@@ -36,6 +36,11 @@ import {
 } from "../http-utils.js";
 import { validatePreSignedAuthorAttestation } from "./memory.js";
 import { recordAssertionActivity } from "../activity-notification.js";
+import {
+  handleKaImportArtifactResolve,
+  handleKaImportArtifactReadMarkdown,
+  handleKaSemanticEnrichmentWrite,
+} from "./knowledge-assets-import.js";
 import { deriveStatus } from "@origintrail-official/dkg-publisher";
 import { validateAssertionName } from "@origintrail-official/dkg-core";
 
@@ -360,6 +365,17 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
   const { req, res, agent, path, url, requestToken, requestAgentAddress, emitMemoryGraphChanged } = ctx;
   if (path !== PREFIX && !path.startsWith(`${PREFIX}/`)) return;
   const method = req.method ?? "GET";
+
+  // ── Collection-level import-artifact + semantic-enrichment routes ──
+  // Keyed by `assertionUri` in the body (no `:name` segment). Ported from
+  // the legacy `/api/assertion/*` routes. Matched here, BEFORE the generic
+  // `segs` parsing below, so `import-artifact/resolve` isn't mis-split into
+  // name="import-artifact". The exact-match `POST /api/knowledge-assets`
+  // create handler (`path === PREFIX`) is unaffected — these paths all carry
+  // a trailing segment.
+  if (method === "POST" && path === `${PREFIX}/import-artifact/resolve`) return handleKaImportArtifactResolve(ctx);
+  if (method === "POST" && path === `${PREFIX}/import-artifact/read-markdown`) return handleKaImportArtifactReadMarkdown(ctx);
+  if (method === "POST" && path === `${PREFIX}/semantic-enrichment/write`) return handleKaSemanticEnrichmentWrite(ctx);
 
   // Parity with the legacy assertion routes: resolve/validate the write
   // contextGraphId against the caller's known graphs before any mutation, so a

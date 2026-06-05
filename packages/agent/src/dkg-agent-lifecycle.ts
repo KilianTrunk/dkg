@@ -233,6 +233,17 @@ import { reconcileContextGraph, ReconcileCoalescer, RecentUalSet, type ChainReco
 import { createCursorState, type CursorState } from './reconcile-cursor.js';
 // rc.9 PR-10: JoinApprovalRetryQueue removed — substrate outbox
 // (durable, SQLite-backed) replaces it. We keep a minimal local
+/**
+ * Default cap on how many persisted context-graph subscriptions are activated
+ * (gossip-subscribed + sync-tracked) on startup. A large backlog of stale
+ * subscriptions otherwise fans out store-touching gossip/sync work that
+ * starves authenticated store-backed routes (issue #997). Override via
+ * `DKGAgentConfig.maxRehydratedContextGraphSubscriptions` (0 disables).
+ */
+const DEFAULT_MAX_REHYDRATED_SUBSCRIPTIONS = 64;
+/** Yield to the event loop every N activations so concurrent store work can interleave. */
+const REHYDRATE_THROTTLE_BATCH = 8;
+
 // type alias so listPendingJoinApprovalRetries() retains its old
 // public shape while it stubs out to []. PR-12 rebuilds the operator
 // diagnostic surface on top of the substrate outbox and will return
@@ -3413,8 +3424,57 @@ export class LifecycleSyncMethods extends DKGAgentBase {
     if (!store) return;
     const ctx = createOperationContext('init');
     try {
-      const rows = await store.loadAll();
-      for (const row of rows) {
+      // System context graphs (AGENTS/ONTOLOGY) are auto-subscribed separately
+      // by start(); their persisted rows must NOT be rehydrated here too. Re-
+      // activating them is redundant, and counting them against the cap below
+      // would let them consume activation slots and leave USER subscriptions
+      // dormant. Exclude them from the rehydration set entirely.
+      const systemContextGraphs = new Set<string>(Object.values(SYSTEM_CONTEXT_GRAPHS) as string[]);
+      const rows = (await store.loadAll()).filter((r) => !systemContextGraphs.has(r.id));
+      // Cap how many subscriptions we ACTIVATE on boot. Activation
+      // (in-memory restore + sync-track + gossip subscribe + member persist)
+      // does store-touching work per row; a large stale backlog fans this out
+      // and starves authenticated store-backed routes (#997 — a node that had
+      // "Rehydrated 173" wedged every authenticated write/query while storeless
+      // /api/status stayed green). Rows beyond the cap stay PERSISTED but
+      // dormant — they re-activate on next explicit access, or an operator
+      // prunes them via `DELETE /api/context-graph/subscriptions`. Prioritise
+      // core-hosted, then subscribed, so the kept set is the most relevant.
+      // NOTE: a dormant (capped-out) row has no in-memory entry, so individual
+      // `POST /api/context-graph/unsubscribe` can't target it — the bulk DELETE
+      // above is the prune path for the stale backlog by design. (Follow-up:
+      // reconcile contextGraphMembershipStore for rows left dormant / cleared so
+      // a prior `active` local-node membership row doesn't linger.)
+      // Validate the cap: it's external config, so a fractional / negative /
+      // NaN value would otherwise do something surprising (0.5 → 1 row,
+      // -1/NaN → silently disables the cap). Accept only a non-negative integer
+      // (0 = "no cap"); fall back to the default otherwise.
+      const configuredCap = this.config.maxRehydratedContextGraphSubscriptions;
+      let cap = DEFAULT_MAX_REHYDRATED_SUBSCRIPTIONS;
+      if (configuredCap != null) {
+        if (Number.isInteger(configuredCap) && configuredCap >= 0) {
+          cap = configuredCap;
+        } else {
+          this.log.warn(
+            ctx,
+            `Ignoring invalid maxRehydratedContextGraphSubscriptions=${configuredCap} ` +
+              `(must be a non-negative integer); using default ${DEFAULT_MAX_REHYDRATED_SUBSCRIPTIONS}.`,
+          );
+        }
+      }
+      // coreHosted graphs MUST always be restored — their chain-driven
+      // reconcile / host-mode path depends on it — so EXEMPT them from the cap.
+      // The cap (a #997 anti-wedge measure) applies only to the non-hosted
+      // user-subscription backlog, which is what fans out and starves the store
+      // on boot. Prioritise subscribed rows within the capped set.
+      const hostedRows = rows.filter((r) => r.coreHosted);
+      const userRows = [...rows.filter((r) => !r.coreHosted)].sort(
+        (a, b) => (b.subscribed ? 1 : 0) - (a.subscribed ? 1 : 0),
+      );
+      const cappedUserRows = cap > 0 ? userRows.slice(0, cap) : userRows;
+      const toActivate = [...hostedRows, ...cappedUserRows];
+      for (let i = 0; i < toActivate.length; i++) {
+        const row = toActivate[i];
         this.setContextGraphSubscription(row.id, {
           name: row.name,
           subscribed: row.subscribed,
@@ -3426,8 +3486,6 @@ export class LifecycleSyncMethods extends DKGAgentBase {
           lastReconciledOrdinal: row.lastReconciledOrdinal,
           coreHosted: row.coreHosted,
         }, { persist: false });
-      }
-      for (const row of rows) {
         if (row.syncScoped) {
           this.trackSyncContextGraph(row.id);
         }
@@ -3435,13 +3493,143 @@ export class LifecycleSyncMethods extends DKGAgentBase {
           this.subscribeToContextGraph(row.id, { trackSyncScope: false, persist: false });
           this.persistLocalNodeMembership(row.id, 'rehydrated-subscription');
         }
+        // Throttle: yield so concurrent store-backed work (routes, sync) can
+        // interleave instead of being starved by a synchronous activation burst.
+        if ((i + 1) % REHYDRATE_THROTTLE_BATCH === 0) {
+          await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        }
       }
+      const skipped = userRows.length - cappedUserRows.length;
       if (rows.length > 0) {
-        this.log.info(ctx, `Rehydrated ${rows.length} persisted context-graph subscription(s)`);
+        this.log.info(
+          ctx,
+          `Rehydrated ${toActivate.length} of ${rows.length} persisted context-graph subscription(s)` +
+            (skipped > 0
+              ? ` (${skipped} non-hosted left dormant — over the ${cap} activation cap; ` +
+                `${hostedRows.length} hosted always restored)`
+              : ''),
+        );
+      }
+      if (skipped > 0) {
+        this.log.warn(
+          ctx,
+          `${skipped} context-graph subscription(s) left dormant to avoid store contention (#997). ` +
+            `Prune stale ones via 'DELETE /api/context-graph/subscriptions', or raise ` +
+            `maxRehydratedContextGraphSubscriptions.`,
+        );
       }
     } catch (err) {
       this.log.warn(ctx, `Failed to rehydrate persisted context-graph subscriptions: ${err instanceof Error ? err.message : String(err)}`);
     }
+  }
+
+  /**
+   * Operator recovery for #997: tear down every active in-memory subscription
+   * (gossip + sync scope) and wipe the persisted backlog, returning the number
+   * of persisted rows removed. Reachable via `DELETE /api/context-graph/
+   * subscriptions` so a node wedged by stale subscriptions can be reset without
+   * hand-editing the SQLite store. Best-effort per CG so one failure can't block
+   * the rest.
+   */
+  async clearContextGraphSubscriptions(this: DKGAgent): Promise<number> {
+    const store = this.config.contextGraphSubscriptionStore;
+    const ctx = createOperationContext('init');
+    // NEVER clear the system context graphs (AGENTS / ONTOLOGY): they are the
+    // network control plane — agent discovery + the shared ontology/CG registry
+    // — auto-subscribed at start() and always in sync scope. Tearing them down
+    // would silently deafen the node to system gossip until the next restart,
+    // the opposite of what this recovery endpoint is for. So we only ever clear
+    // USER context-graph subscriptions, live and persisted alike. (The store's
+    // system-unaware bulk delete is deliberately NOT used here.)
+    const systemContextGraphs = new Set<string>(Object.values(SYSTEM_CONTEXT_GRAPHS) as string[]);
+    // Clearable = a NON-system, NON-coreHosted user subscription. System CGs are
+    // the control plane (above). coreHosted graphs are legitimate hosted graphs
+    // that `unsubscribeFromContextGraph` deliberately keeps wired for host-mode /
+    // chain reconcile (so a teardown can't fully remove them anyway) and that the
+    // rehydration cap already exempts — clearing/counting them here would report a
+    // removal that didn't happen. The clear targets only the stale non-hosted
+    // backlog, the actual #997 wedge.
+    const isClearable = (id: string, coreHosted: boolean | undefined): boolean =>
+      !systemContextGraphs.has(id) && coreHosted !== true;
+
+    const activeUserIds = [...this.subscribedContextGraphs.entries()]
+      .filter(([id, s]) => isClearable(id, s?.coreHosted))
+      .map(([id]) => id);
+
+    // The full persisted clearable backlog (active + dormant rows left behind by
+    // the rehydration cap). Counted up front: `unsubscribeFromContextGraph`
+    // deletes each active row as a side effect, so a post-teardown count would
+    // miss them. Starts empty so a node with NO store reports 0 persisted rows
+    // removed (the active teardown is logged separately) rather than a phantom
+    // count of the in-memory subs.
+    let persistedUserIds: string[] = [];
+    if (store) {
+      try {
+        persistedUserIds = (await store.loadAll())
+          .filter((r) => isClearable(r.id, r.coreHosted))
+          .map((r) => r.id);
+      } catch (err) {
+        // Can't enumerate the persisted backlog → the dormant (capped-out) rows
+        // would survive and rehydrate after the next restart. Do NOT silently
+        // fall back to active-only and report success; surface the failure so the
+        // operator resolves the store error and retries. Thrown before any
+        // teardown, so nothing is changed.
+        throw new Error(
+          `clearContextGraphSubscriptions: failed to enumerate persisted subscriptions ` +
+            `(${err instanceof Error ? err.message : String(err)}); the backlog was NOT cleared. ` +
+            `Resolve the store error and retry.`,
+        );
+      }
+    }
+    const total = persistedUserIds.length;
+
+    // Tear down active in-memory USER subscriptions (gossip topics + sync scope),
+    // then REMOVE the registry entry. `unsubscribeFromContextGraph` only flips
+    // `subscribed` to false — it keeps the entry for the host-mode/reconcile path
+    // — but this recovery endpoint must leave NO trace of the cleared CGs, or
+    // read fallbacks would still see the IDs in `subscribedContextGraphs` even
+    // though the persisted rows are gone. (activeUserIds already excludes system
+    // + coreHosted CGs, so this only drops the cleared non-hosted user entries.)
+    for (const id of activeUserIds) {
+      try {
+        this.unsubscribeFromContextGraph(id);
+      } catch {
+        /* best-effort teardown */
+      }
+      this.subscribedContextGraphs.delete(id);
+    }
+
+    // Delete the persisted USER rows (active + dormant). Selective — never the
+    // system rows — so a custom store without a system-aware bulk delete is safe.
+    // Count ACTUAL deletions: a swallowed store.delete() failure must not be
+    // reported as cleared, or this recovery endpoint would answer 200 "all
+    // gone" while stale rows survive in the store.
+    let cleared = persistedUserIds.length;
+    let failed = 0;
+    if (store) {
+      cleared = 0;
+      for (const id of persistedUserIds) {
+        try {
+          await store.delete(id);
+          cleared++;
+        } catch (err) {
+          failed++;
+          this.log.warn(
+            ctx,
+            `clearContextGraphSubscriptions: failed to delete persisted subscription "${id}": ` +
+              (err instanceof Error ? err.message : String(err)),
+          );
+        }
+      }
+    }
+
+    this.log.info(
+      ctx,
+      `Cleared ${cleared} of ${total} persisted user context-graph subscription(s)` +
+        (failed > 0 ? ` (${failed} failed to delete — see warnings)` : '') +
+        `; tore down ${activeUserIds.length} active in-memory subscription(s); system context graphs preserved`,
+    );
+    return cleared;
   }
 
   async hasConfirmedMetaState(this: DKGAgent, contextGraphId: string): Promise<boolean> {

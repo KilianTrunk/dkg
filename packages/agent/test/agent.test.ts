@@ -4159,6 +4159,153 @@ describe('DKGAgent config — syncContextGraphs and queryAccess warning', () => 
     }
   });
 
+  it('caps subscription activation at maxRehydratedContextGraphSubscriptions, leaving the rest dormant (#997)', async () => {
+    const N = 10;
+    const cap = 3;
+    const rows = Array.from({ length: N }, (_, i) => ({
+      id: `cap-cg-${i}`,
+      name: `Cap CG ${i}`,
+      subscribed: true,
+      synced: false,
+      sharedMemorySynced: false,
+      metaSynced: false,
+      syncScoped: true,
+    }));
+    const subscriptionStore = {
+      loadAll: async () => rows,
+      save: async () => {},
+      delete: async () => {},
+    };
+    const agent = await DKGAgent.create({
+      name: 'CapRehydration',
+      listenHost: '127.0.0.1',
+      chainAdapter: createEVMAdapter(HARDHAT_KEYS.CORE_OP),
+      contextGraphSubscriptionStore: subscriptionStore,
+      maxRehydratedContextGraphSubscriptions: cap,
+    });
+    try {
+      await agent.start();
+      const subs = agent.getSubscribedContextGraphs();
+      // Only `cap` of the N persisted rows are activated; the rest stay
+      // persisted (loadAll still returns all N) but dormant in-memory.
+      const activated = rows.filter((r) => subs.get(r.id)?.subscribed === true).length;
+      expect(activated).toBe(cap);
+      const inSyncScope = ((agent as any).config.syncContextGraphs ?? []).filter(
+        (id: string) => id.startsWith('cap-cg-'),
+      ).length;
+      expect(inSyncScope).toBe(cap);
+    } finally {
+      await agent.stop().catch(() => {});
+    }
+  });
+
+  it('exempts coreHosted graphs from the rehydration cap so hosted graphs always restore (#997)', async () => {
+    const cap = 2;
+    const mkRow = (id: string, coreHosted: boolean) => ({
+      id, name: id, subscribed: true, synced: false,
+      sharedMemorySynced: false, metaSynced: false, syncScoped: true, coreHosted,
+    });
+    const hosted = Array.from({ length: 3 }, (_, i) => mkRow(`hosted-cg-${i}`, true));
+    const user = Array.from({ length: 5 }, (_, i) => mkRow(`user-cg-${i}`, false));
+    const rows = [...hosted, ...user];
+    const subscriptionStore = {
+      loadAll: async () => rows,
+      save: async () => {},
+      delete: async () => {},
+    };
+    const agent = await DKGAgent.create({
+      name: 'CapHostedExempt',
+      listenHost: '127.0.0.1',
+      chainAdapter: createEVMAdapter(HARDHAT_KEYS.CORE_OP),
+      contextGraphSubscriptionStore: subscriptionStore,
+      maxRehydratedContextGraphSubscriptions: cap,
+    });
+    try {
+      await agent.start();
+      const subs = agent.getSubscribedContextGraphs();
+      // ALL coreHosted graphs activate (exempt from the cap — host-mode /
+      // chain-reconcile depends on it); the non-hosted backlog stays capped.
+      const hostedActive = hosted.filter((r) => subs.get(r.id)?.subscribed === true).length;
+      const userActive = user.filter((r) => subs.get(r.id)?.subscribed === true).length;
+      expect(hostedActive).toBe(hosted.length); // all 3 hosted restored despite cap=2
+      expect(userActive).toBe(cap);              // user backlog capped at 2
+    } finally {
+      await agent.stop().catch(() => {});
+    }
+  });
+
+  it('clearContextGraphSubscriptions clears USER subscriptions but PRESERVES the system context graphs (#997)', async () => {
+    const persisted = new Map<string, any>();
+    for (let i = 0; i < 5; i++) {
+      persisted.set(`clear-cg-${i}`, {
+        id: `clear-cg-${i}`,
+        name: `Clear ${i}`,
+        subscribed: true,
+        synced: false,
+        syncScoped: true,
+      });
+    }
+    // A coreHosted graph: a LEGITIMATE hosted graph, not part of the stale
+    // backlog — the clear must preserve it (host-mode/reconcile depends on it),
+    // exactly like the rehydration cap exempts it.
+    persisted.set('hosted-cg', {
+      id: 'hosted-cg',
+      name: 'Hosted',
+      subscribed: true,
+      synced: false,
+      syncScoped: true,
+      coreHosted: true,
+    });
+    const subscriptionStore = {
+      loadAll: async () => [...persisted.values()],
+      save: async (r: any) => { persisted.set(r.id, { ...r }); },
+      delete: async (id: string) => { persisted.delete(id); },
+    };
+    const agent = await DKGAgent.create({
+      name: 'ClearSubscriptions',
+      listenHost: '127.0.0.1',
+      chainAdapter: createEVMAdapter(HARDHAT_KEYS.CORE_OP),
+      contextGraphSubscriptionStore: subscriptionStore,
+    });
+    const systemIds = Object.values(SYSTEM_CONTEXT_GRAPHS) as string[];
+    try {
+      await agent.start();
+      // start() rehydrates our 5 user CGs AND subscribes+persists the system CGs
+      // (agents/ontology — the network control plane).
+      expect([...persisted.keys()].filter((k) => k.startsWith('clear-cg-'))).toHaveLength(5);
+      expect(agent.getSubscribedContextGraphs().get('clear-cg-0')?.subscribed).toBe(true);
+      for (const sys of systemIds) {
+        expect(agent.getSubscribedContextGraphs().get(sys)?.subscribed).toBe(true);
+      }
+
+      const cleared = await agent.clearContextGraphSubscriptions();
+
+      // Exactly the 5 USER subscriptions are cleared — system CGs are never counted.
+      expect(cleared).toBe(5);
+      // No user row survives, live or persisted.
+      expect([...persisted.keys()].some((k) => k.startsWith('clear-cg-'))).toBe(false);
+      const userStillActive = ['clear-cg-0', 'clear-cg-1', 'clear-cg-2', 'clear-cg-3', 'clear-cg-4'].filter(
+        (id) => agent.getSubscribedContextGraphs().get(id)?.subscribed === true,
+      );
+      expect(userStillActive).toHaveLength(0);
+
+      // System context graphs are PRESERVED — live subscription intact AND the
+      // persisted row kept — so the node never loses control-plane gossip.
+      for (const sys of systemIds) {
+        expect(agent.getSubscribedContextGraphs().get(sys)?.subscribed).toBe(true);
+        expect(persisted.has(sys)).toBe(true);
+      }
+
+      // The coreHosted graph is PRESERVED too — NOT counted in `cleared`, still
+      // subscribed, and its persisted row kept (the clear exempts hosted graphs
+      // just like the rehydration cap, so host-mode/reconcile is never dropped).
+      expect(agent.getSubscribedContextGraphs().get('hosted-cg')?.subscribed).toBe(true);
+      expect(persisted.has('hosted-cg')).toBe(true);
+    } finally {
+      await agent.stop().catch(() => {});
+    }
+  });
+
   it('canonicalizes Ethereum agent membership principals before persistence', async () => {
     const persistedMembers = new Map<string, any>();
     const deletedMembers: string[] = [];

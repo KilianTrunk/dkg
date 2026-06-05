@@ -57,7 +57,7 @@ const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
 import { enrichEvmError, MockChainAdapter } from '@origintrail-official/dkg-chain';
 import { DKGAgent, loadOpWallets } from '@origintrail-official/dkg-agent';
-import { computeNetworkId, createOperationContext, DKGEvent, Logger, PayloadTooLargeError, GET_VIEWS, TrustLevel, validateSubGraphName, validateAssertionName, validateContextGraphId, isSafeIri, assertSafeIri, sparqlIri, contextGraphSharedMemoryUri, contextGraphAssertionUri, contextGraphMetaUri } from '@origintrail-official/dkg-core';
+import { computeNetworkId, createOperationContext, DKGEvent, Logger, PayloadTooLargeError, GET_VIEWS, TrustLevel, validateSubGraphName, validateAssertionName, validateContextGraphId, isSafeIri, assertSafeIri, sparqlIri, contextGraphSharedMemoryUri, contextGraphAssertionUri, contextGraphMetaUri, SYSTEM_CONTEXT_GRAPHS } from '@origintrail-official/dkg-core';
 import { findReservedSubjectPrefix, isSkolemizedUri } from '@origintrail-official/dkg-publisher';
 import {
   DashboardDB,
@@ -451,6 +451,15 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
     requestAgentAddress,
     emitMemoryGraphChanged,
   } = ctx;
+  // Operator gate for the node-wide subscription endpoints. When auth is ENABLED,
+  // require a node-level admin token — a recognised token (in validTokens) that
+  // resolves to no agent (agent-scoped tokens resolve to an address; a
+  // missing/unrecognised token isn't in validTokens). When auth is DISABLED the
+  // daemon runs admin maintenance routes tokenless (trusted local), so don't 403.
+  const authEnabled = config.auth?.enabled !== false;
+  const isNodeAdminCaller = (): boolean =>
+    !authEnabled ||
+    (!!requestToken && validTokens.has(requestToken) && !agent.resolveAgentByToken(requestToken));
   const writePreflightCallerAgentAddress = requestToken
     ? agent.resolveAgentByToken(requestToken)
     : undefined;
@@ -1643,6 +1652,60 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
       subscribed: sub?.subscribed === true,
       coreHosted: sub?.coreHosted === true,
     });
+  }
+
+  // GET /api/context-graph/subscriptions — list the node's ACTIVE in-memory
+  // context-graph subscriptions (diagnostics for #997: see how many are live).
+  // The total PERSISTED backlog is reported in the boot log ("Rehydrated X of
+  // Y"); anything beyond the activation cap is dormant until pruned below.
+  if (req.method === "GET" && path === "/api/context-graph/subscriptions") {
+    // Operator-only: this is a NODE-WIDE view, so an agent-scoped token would
+    // otherwise be able to enumerate OTHER agents' subscribed/private CG IDs.
+    if (!isNodeAdminCaller()) {
+      return jsonResponse(res, 403, {
+        error:
+          "GET /api/context-graph/subscriptions requires a node-level admin token " +
+          "(~/.dkg/auth.token); agent-scoped tokens cannot enumerate node-wide subscriptions.",
+      });
+    }
+    const systemContextGraphs = new Set<string>(Object.values(SYSTEM_CONTEXT_GRAPHS) as string[]);
+    const map = agent.getSubscribedContextGraphs?.();
+    const subscriptions = map
+      ? [...map.entries()]
+          // ACTIVE USER subscriptions only. Exclude (a) discoverable-only /
+          // unsubscribed registry entries (`subscribed: false`) and (b) the
+          // always-on AGENTS/ONTOLOGY system CGs — which the startup cap/log also
+          // exclude — so `count` and the payload match the rehydrated
+          // user-subscription total rather than running ≥2 higher.
+          .filter(([id, s]) => s?.subscribed === true && !systemContextGraphs.has(id))
+          .map(([id, s]) => ({
+            contextGraphId: id,
+            subscribed: true,
+            synced: s?.synced === true,
+            coreHosted: s?.coreHosted === true,
+          }))
+      : [];
+    return jsonResponse(res, 200, { count: subscriptions.length, subscriptions });
+  }
+
+  // DELETE /api/context-graph/subscriptions — operator recovery for #997: tear
+  // down every active subscription and wipe the persisted backlog so a node
+  // wedged by stale subscriptions can be reset without hand-editing the store.
+  // Non-destructive to VM/SWM data — only the local subscription bookkeeping is
+  // cleared; legitimate context graphs re-subscribe on next access.
+  if (req.method === "DELETE" && path === "/api/context-graph/subscriptions") {
+    // Destructive + node-wide: operator-only (node-admin token when auth is on;
+    // tokenless when auth is disabled). Prevents an agent-scoped token from
+    // wiping every user's subscription backlog.
+    if (!isNodeAdminCaller()) {
+      return jsonResponse(res, 403, {
+        error:
+          "DELETE /api/context-graph/subscriptions requires a node-level admin token " +
+          "(~/.dkg/auth.token); agent-scoped tokens cannot clear the node-wide subscription backlog.",
+      });
+    }
+    const cleared = await agent.clearContextGraphSubscriptions();
+    return jsonResponse(res, 200, { cleared });
   }
 
   // POST /api/context-graph/rename

@@ -59,7 +59,7 @@ import {
   MockChainAdapter,
   type ApprovalPolicy,
 } from '@origintrail-official/dkg-chain';
-import { DKGAgent, loadOpWallets } from '@origintrail-official/dkg-agent';
+import { DKGAgent, loadOpWallets, KaNumberAllocator } from '@origintrail-official/dkg-agent';
 import { isExternalBackend } from '@origintrail-official/dkg-storage';
 import { computeNetworkId, createOperationContext, DKGEvent, Logger, PayloadTooLargeError, GET_VIEWS, TrustLevel, validateSubGraphName, validateAssertionName, validateContextGraphId, isSafeIri, assertSafeIri, sparqlIri, contextGraphSharedMemoryUri, contextGraphAssertionUri, contextGraphMetaUri, DEFAULT_PROTOCOL_OUTBOX_BACKOFFS_MS, DEFAULT_PROTOCOL_OUTBOX_MAX_AGE_MS, pickNetworkTunables } from '@origintrail-official/dkg-core';
 import { findReservedSubjectPrefix, isSkolemizedUri } from '@origintrail-official/dkg-publisher';
@@ -73,6 +73,7 @@ import {
   LlmClient,
   SqliteMessageIdempotencyStore,
   SqliteProtocolOutboxStore,
+  SqliteKaNumberStore,
   type MetricsSource,
 } from "@origintrail-official/dkg-node-ui";
 import {
@@ -1169,7 +1170,23 @@ export async function runDaemonInner(
     },
   });
 
+  // OT-RFC-43 Option-1 deterministic KA identity (B2 allocator core).
+  // Durable per-author KA-number sequence backing the off-chain
+  // `KaNumberAllocator`. Constructed here (alongside the other durable
+  // substrate stores) so the V20 `ka_numbers` table is opened and its
+  // sequence is co-located with the rest of the node's persistent state.
+  //
+  // OT-RFC-43 Option 1: the publisher allocates a deterministic packed
+  // reservedKaId per V10 mint (DKGPublisher.ensureReservedKaId) and lazily
+  // reconciles each author's floor against the chain's highest minted number on
+  // first use (chain.getMaxKaNumberForAuthor), satisfying the RFC §4.5 cold-start
+  // guard. (A blocking startup reconciliation sweep + the ongoing
+  // KnowledgeAssetCreated poller→reconcile wiring remain a hardening follow-up.)
+  const kaNumberStore = new SqliteKaNumberStore(dashDb);
+  const kaNumberAllocator = new KaNumberAllocator(kaNumberStore);
+
   const agent = await DKGAgent.create({
+    kaNumberAllocator,
     name: config.name,
     framework: "DKG",
     listenPort: config.listenPort,

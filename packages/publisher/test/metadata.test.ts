@@ -12,9 +12,17 @@ import {
   generateAssertionCreatedMetadata,
   generateAssertionPromotedMetadata,
   generateAssertionPublishedMetadata,
+  generateAssertionUpdatedMetadata,
   generateAssertionDiscardedMetadata,
   assertionStateQuad,
   assertionLayerQuad,
+  deriveStatus,
+  assertionLayerPointerQuad,
+  stampLayerPointerSparql,
+  WM_CURRENT_ASSERTION_PRED,
+  SWM_CURRENT_ASSERTION_PRED,
+  VM_CURRENT_ASSERTION_PRED,
+  PROV_WAS_REVISION_OF,
   type KCMetadata,
   type KAMetadata,
   type OnChainProvenance,
@@ -119,7 +127,55 @@ describe('generateKCMetadata', () => {
     const kas = [makeKA({ tokenId: 1n }), makeKA({ tokenId: 2n, rootEntity: 'did:dkg:entity:bob' })];
     const quads = generateKCMetadata(makeMeta({ kaCount: 2 }), kas);
     const kaSubjects = new Set(quads.filter(q => q.predicate === RDF_TYPE && q.object === `${DKG}KnowledgeAsset`).map(q => q.subject));
-    expect(kaSubjects.size).toBe(2);
+    // PR #968: the bare UAL (aggregate node) is now typed too, alongside the 2 per-root rows.
+    expect(kaSubjects).toEqual(new Set([UAL, `${UAL}/1`, `${UAL}/2`]));
+  });
+
+  it('Design B: per-root rows + aggregate <ual> KnowledgeAsset node (PR #968)', () => {
+    // One file = one on-chain KA, however many entities. The bare <UAL> is now
+    // typed as the aggregate KnowledgeAsset (summed counts + every member
+    // tokenId/entity); per-root label rows at <UAL>/1, <UAL>/2, ... are
+    // retained for not-yet-migrated update/private-access consumers.
+    const kas = [
+      makeKA({ tokenId: 1n, rootEntity: 'did:dkg:entity:alice', publicTripleCount: 5 }),
+      makeKA({ tokenId: 2n, rootEntity: 'did:dkg:entity:bob', publicTripleCount: 3 }),
+      makeKA({ tokenId: 3n, rootEntity: 'did:dkg:entity:carol', publicTripleCount: 2 }),
+    ];
+    const quads = generateKCMetadata(makeMeta({ kaCount: 1 }), kas);
+
+    // dkg:KnowledgeAsset now types the bare UAL AND each per-root row.
+    const kaSubjects = new Set(
+      quads.filter(q => q.predicate === RDF_TYPE && q.object === `${DKG}KnowledgeAsset`).map(q => q.subject),
+    );
+    expect(kaSubjects).toEqual(new Set([UAL, `${UAL}/1`, `${UAL}/2`, `${UAL}/3`]));
+
+    // Per-root rows unchanged (legacy dkg:rootEntity + §10.1 dual-written dkg:entity).
+    expect(quads.find(q => q.subject === `${UAL}/1` && q.predicate === `${DKG}rootEntity`)?.object).toBe('did:dkg:entity:alice');
+    expect(quads.find(q => q.subject === `${UAL}/2` && q.predicate === `${DKG}rootEntity`)?.object).toBe('did:dkg:entity:bob');
+    expect(quads.find(q => q.subject === `${UAL}/3` && q.predicate === `${DKG}rootEntity`)?.object).toBe('did:dkg:entity:carol');
+    expect(quads.find(q => q.subject === `${UAL}/1` && q.predicate === `${DKG}entity`)?.object).toBe('did:dkg:entity:alice');
+    expect(quads.find(q => q.subject === `${UAL}/3` && q.predicate === `${DKG}entity`)?.object).toBe('did:dkg:entity:carol');
+
+    // Aggregate node on the bare UAL: summed public count (5+3+2=10) first, then per-root rows.
+    const publicCounts = quads
+      .filter(q => q.predicate === `${DKG}publicTripleCount`)
+      .map(q => [q.subject, q.object]);
+    expect(publicCounts).toEqual([
+      [UAL, '"10"^^<http://www.w3.org/2001/XMLSchema#integer>'],
+      [`${UAL}/1`, '"5"^^<http://www.w3.org/2001/XMLSchema#integer>'],
+      [`${UAL}/2`, '"3"^^<http://www.w3.org/2001/XMLSchema#integer>'],
+      [`${UAL}/3`, '"2"^^<http://www.w3.org/2001/XMLSchema#integer>'],
+    ]);
+    const intLit = (n: string) => `"${n}"^^<http://www.w3.org/2001/XMLSchema#integer>`;
+    expect(new Set(quads.filter(q => q.subject === UAL && q.predicate === `${DKG}tokenId`).map(q => q.object)))
+      .toEqual(new Set([intLit('1'), intLit('2'), intLit('3')]));
+    expect(new Set(quads.filter(q => q.subject === UAL && q.predicate === `${DKG}rootEntity`).map(q => q.object)))
+      .toEqual(new Set(['did:dkg:entity:alice', 'did:dkg:entity:bob', 'did:dkg:entity:carol']));
+    expect(new Set(quads.filter(q => q.subject === UAL && q.predicate === `${DKG}entity`).map(q => q.object)))
+      .toEqual(new Set(['did:dkg:entity:alice', 'did:dkg:entity:bob', 'did:dkg:entity:carol']));
+
+    // Deliberately NO `<UAL> partOf <UAL>` self-edge (would pollute `?x partOf <UAL>` member enumeration, incl. resolveKA).
+    expect(quads.find(q => q.subject === UAL && q.predicate === `${DKG}partOf` && q.object === UAL)).toBeUndefined();
   });
 
   it('GH #748 fallback: attribution is the peer-ID literal when neither agentAddress nor authorAddress is supplied', () => {
@@ -847,5 +903,124 @@ describe('assertionLayerQuad', () => {
     expect(q.predicate).toBe(`${DKG}memoryLayer`);
     expect(q.object).toBe(`"${MemoryLayer.SharedWorkingMemory}"`);
     expect(q.graph).toBe(META_GRAPH);
+  });
+});
+
+// ── OT-RFC-43 A2 — per-layer pointers, deriveStatus, update provenance ──────
+
+describe('deriveStatus (OT-RFC-43 §10.5.4)', () => {
+  it('returns draft-open when no pointers/state', () => {
+    expect(deriveStatus({})).toBe('draft-open');
+  });
+  it('returns wm-sealed when only WM pointer is set (overall)', () => {
+    expect(deriveStatus({ wmCurrentAssertion: 'aa' })).toBe('wm-sealed');
+  });
+  it('returns swm-shared when SWM pointer set (overall)', () => {
+    expect(deriveStatus({ wmCurrentAssertion: 'aa', swmCurrentAssertion: 'aa' })).toBe('swm-shared');
+  });
+  it('returns vm-confirmed when VM pointer set (overall)', () => {
+    expect(deriveStatus({ wmCurrentAssertion: 'aa', swmCurrentAssertion: 'aa', vmCurrentAssertion: 'aa' })).toBe('vm-confirmed');
+  });
+  it('per-layer status reflects THAT layer (divergence observable)', () => {
+    // WM ahead of VM: WM has a newer merkle, VM still on the old one.
+    const p = { wmCurrentAssertion: 'bb', swmCurrentAssertion: 'aa', vmCurrentAssertion: 'aa' };
+    expect(deriveStatus(p, 'wm')).toBe('wm-sealed');
+    expect(deriveStatus(p, 'swm')).toBe('swm-shared');
+    expect(deriveStatus(p, 'vm')).toBe('vm-confirmed');
+  });
+  it('per-layer vm is draft-open when never confirmed', () => {
+    expect(deriveStatus({ wmCurrentAssertion: 'aa' }, 'vm')).toBe('draft-open');
+  });
+  it('honors state when pointers are absent (back-compat)', () => {
+    expect(deriveStatus({ state: 'promoted' })).toBe('swm-shared');
+    expect(deriveStatus({ state: 'published' })).toBe('vm-confirmed');
+  });
+});
+
+describe('assertionLayerPointerQuad / stampLayerPointerSparql', () => {
+  it('strips a 0x prefix from the merkle hex', () => {
+    const q = assertionLayerPointerQuad(LIFECYCLE_URI, WM_CURRENT_ASSERTION_PRED, '0xdeadbeef', META_GRAPH);
+    expect(q.subject).toBe(LIFECYCLE_URI);
+    expect(q.predicate).toBe(WM_CURRENT_ASSERTION_PRED);
+    expect(q.object).toBe('"deadbeef"');
+    expect(q.graph).toBe(META_GRAPH);
+  });
+  it('emits a DELETE/INSERT SPARQL for an idempotent re-stamp', () => {
+    const sparql = stampLayerPointerSparql(LIFECYCLE_URI, VM_CURRENT_ASSERTION_PRED, 'cafe', META_GRAPH);
+    expect(sparql).toContain('DELETE');
+    expect(sparql).toContain('INSERT');
+    expect(sparql).toContain(VM_CURRENT_ASSERTION_PRED);
+    expect(sparql).toContain('"cafe"');
+  });
+});
+
+describe('generateAssertionUpdatedMetadata (OT-RFC-43 A2 §4 provenance)', () => {
+  const baseMeta = {
+    contextGraphId: CONTEXT_GRAPH,
+    agentAddress: AGENT_ADDR,
+    assertionName: ASSERTION,
+    kcUal: 'did:dkg:31337/0xpub/77',
+    timestamp: new Date('2026-06-01T00:00:00Z'),
+    newMerkleHex: 'bbbb',
+    priorMerkleHex: 'aaaa',
+  };
+
+  it('re-stamps VM + WM pointers to the new merkle', () => {
+    const { insert } = generateAssertionUpdatedMetadata(baseMeta);
+    const vm = insert.find(q => q.subject === LIFECYCLE_URI && q.predicate === VM_CURRENT_ASSERTION_PRED);
+    const wm = insert.find(q => q.subject === LIFECYCLE_URI && q.predicate === WM_CURRENT_ASSERTION_PRED);
+    expect(vm?.object).toBe('"bbbb"');
+    expect(wm?.object).toBe('"bbbb"');
+  });
+  it('emits prov:wasRevisionOf linking the new lifecycle to the prior version', () => {
+    const { insert } = generateAssertionUpdatedMetadata(baseMeta);
+    const rev = insert.find(q => q.subject === LIFECYCLE_URI && q.predicate === PROV_WAS_REVISION_OF);
+    expect(rev).toBeDefined();
+    expect(rev!.object).toContain('aaaa');
+    // prior version subject is self-describing (vmCurrentAssertion = prior merkle)
+    const priorVm = insert.find(q => q.object === '"aaaa"' && q.predicate === VM_CURRENT_ASSERTION_PRED);
+    expect(priorVm).toBeDefined();
+  });
+  it('deletes the prior VM/WM pointer values so the re-stamp is unambiguous', () => {
+    const { delete: del } = generateAssertionUpdatedMetadata(baseMeta);
+    expect(del.find(q => q.predicate === VM_CURRENT_ASSERTION_PRED && q.object === '"aaaa"')).toBeDefined();
+    expect(del.find(q => q.predicate === WM_CURRENT_ASSERTION_PRED && q.object === '"aaaa"')).toBeDefined();
+  });
+});
+
+describe('generateAssertionPromotedMetadata / PublishedMetadata pointer stamping', () => {
+  it('stamps swmCurrentAssertion when merkleHex supplied at promote', () => {
+    const { insert } = generateAssertionPromotedMetadata({
+      contextGraphId: CONTEXT_GRAPH,
+      agentAddress: AGENT_ADDR,
+      assertionName: ASSERTION,
+      shareOperationId: 'op-1',
+      rootEntities: ['urn:e:1'],
+      timestamp: new Date('2026-06-01T00:00:00Z'),
+      merkleHex: 'feed',
+    });
+    expect(insert.find(q => q.predicate === SWM_CURRENT_ASSERTION_PRED && q.object === '"feed"')).toBeDefined();
+  });
+  it('stamps vmCurrentAssertion when merkleHex supplied at publish', () => {
+    const { insert } = generateAssertionPublishedMetadata({
+      contextGraphId: CONTEXT_GRAPH,
+      agentAddress: AGENT_ADDR,
+      assertionName: ASSERTION,
+      kcUal: 'did:dkg:31337/0xpub/9',
+      timestamp: new Date('2026-06-01T00:00:00Z'),
+      merkleHex: 'beef',
+    });
+    expect(insert.find(q => q.predicate === VM_CURRENT_ASSERTION_PRED && q.object === '"beef"')).toBeDefined();
+  });
+  it('omits the SWM pointer when merkleHex is absent (back-compat)', () => {
+    const { insert } = generateAssertionPromotedMetadata({
+      contextGraphId: CONTEXT_GRAPH,
+      agentAddress: AGENT_ADDR,
+      assertionName: ASSERTION,
+      shareOperationId: 'op-2',
+      rootEntities: ['urn:e:1'],
+      timestamp: new Date('2026-06-01T00:00:00Z'),
+    });
+    expect(insert.find(q => q.predicate === SWM_CURRENT_ASSERTION_PRED)).toBeUndefined();
   });
 });

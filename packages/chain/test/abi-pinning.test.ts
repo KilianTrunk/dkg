@@ -137,7 +137,12 @@ const PINNED_DIGESTS: Record<string, string> = {
   // Greenfield rename (rc.12): logic + storage pair replaces the legacy names.
   KnowledgeAssetsLifecycle:     '45957310345c8cc8dd027ccf006bd0730e47510d72f8d14857de251788b10a52',
 
-  DKGKnowledgeAssets:           'c7c402825334252247d64a3ff4c13a4b757885bb8a1585974b5c01e14d5ac0f8',
+  // Re-pinned for OT-RFC-43 Option-1 (variant 1a, PR #975): deterministic
+  // author-namespaced KA identity. `createKnowledgeAsset` now takes an explicit
+  // caller-supplied `uint256 kaId` (the packed author-namespaced id), and two
+  // guard errors were added — `KaIdAlreadyMinted(uint256)` and
+  // `KaIdNamespaceMismatch(uint256,address)` — plus a deprecated accessor.
+  DKGKnowledgeAssets:           'da5e46f24dd410b30c90bad66060b9da240aa4b0426c24a1550b0e1b6168b5ea',
   // V8 `KnowledgeCollection` ABI was moved to `abi/archive/` in
   // `archive-non-v10-contracts`; the pin entry is intentionally dropped.
   // Updated for SPEC_CG_MEMORY_MODEL: per-CG hosting committees and

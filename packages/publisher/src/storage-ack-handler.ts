@@ -2,8 +2,10 @@ import type { TripleStore, Quad } from '@origintrail-official/dkg-storage';
 import type { EventBus, StorageACKDeclineCode, SubscriptionSource } from '@origintrail-official/dkg-core';
 import {
   decodePublishIntent,
+  decodeUpdateIntent,
   encodeStorageACK,
   computePublishACKDigest,
+  computeUpdateACKDigest,
   assertSafeIri,
   STORAGE_ACK_DECLINE_CODES,
   ACK_PROTOCOL_VERSION_V2_LU11,
@@ -794,21 +796,37 @@ export class StorageACKHandler {
         throw new Error('stagingQuads present but contained no parseable N-Quads');
       }
 
-      // Validate kaCount matches the number of declared root entities.
-      // Exclude skolemized blank node children (/.well-known/genid/) from the count
-      // since those are internal sub-nodes of a single KA, not separate entities.
+      // OT-RFC-44 / Design B: a publish is exactly ONE Knowledge Asset whose
+      // member entities are the root subjects (any count). `kaCount` is the KA
+      // count (must be 1) — NOT the entity count. The pre-Design-B check
+      // `rootSubjects.size === intent.kaCount` conflated the two and made a
+      // receiving node REFUSE to ACK any multi-entity KA (the silent cross-node
+      // failure in OT-RFC-43 §2.7 / the §11.2 canary). Under Design B we assert
+      // only the KA-count invariant here; data integrity (that these quads are
+      // exactly what the publisher committed to) is guaranteed by the Merkle
+      // check below, not by counting subjects.
+      //
+      // We deliberately do NOT require a count bijection between `rootEntities`
+      // and the payload's root subjects. `rootEntities` is a *selection*, not a
+      // complete enumeration: in the SWM-fallback branch it is the entity filter
+      // passed to `loadSWMQuads`, so a caller may legitimately declare a subset
+      // of the subjects present. The per-entity presence loop below still pins
+      // the one direction that matters for a receiver — every entity the caller
+      // names must actually be in the payload (declared ⊆ actual).
       const uniqueSubjects = new Set(parsed.map(q => q.subject));
       const rootSubjects = new Set(
         [...uniqueSubjects].filter(s => !s.includes('/.well-known/genid/')),
       );
-      if (intent.kaCount > 0 && rootSubjects.size !== intent.kaCount) {
+      if (intent.kaCount !== 1) {
         throw new Error(
-          `kaCount mismatch: intent claims ${intent.kaCount} KAs but staging quads have ` +
-          `${rootSubjects.size} root entities (${uniqueSubjects.size} total subjects)`,
+          `Design B: a publish must declare exactly one Knowledge Asset (kaCount=1); got ${intent.kaCount}`,
         );
       }
 
-      // Validate rootEntities match actual root subjects in the payload
+      // Validate that every declared rootEntity is actually present in the
+      // payload (declared ⊆ actual). Skolemized blank-node children
+      // (/.well-known/genid/) are excluded from `rootSubjects` above — they are
+      // internal sub-nodes of a single entity, not separate root entities.
       if (intent.rootEntities && intent.rootEntities.length > 0) {
         for (const entity of intent.rootEntities) {
           if (!rootSubjects.has(entity)) {
@@ -874,14 +892,18 @@ export class StorageACKHandler {
       }
     }
 
-    // Recompute kaCount from verified quads. publicByteSize uses the claimed
-    // value because N-Quad serialization may differ between publisher and
-    // handler (different graph URIs). The merkle root already proves data
-    // integrity, so byte-size manipulation cannot change the actual content.
-    const verifiedRootSubjects = new Set(
-      swmQuads.map(q => q.subject).filter(s => !s.includes('/.well-known/genid/')),
-    );
-    const verifiedKACount = verifiedRootSubjects.size;
+    // OT-RFC-44 / Design B: a publish is exactly ONE Knowledge Asset whose
+    // member entities are the root subjects (any count). The KA count signed
+    // into the ACK digest is therefore ALWAYS 1 — it must match what the
+    // publisher submits on chain (`knowledgeAssetsAmount`, which the contract
+    // requires to be 1) and the digest the publisher/ACK-collector compute.
+    // Pre-Design-B this recomputed kaCount = rootSubjects.size (the ENTITY
+    // count); for a multi-entity KA that made the receiver sign a digest with
+    // kaCount=N while the publisher and contract used kaCount=1, so no ACK
+    // could ever validate — the silent cross-node failure in OT-RFC-43 §2.7.
+    // The data integrity that recompute was protecting is already guaranteed
+    // by the merkle-root check above (computeFlatKCRoot over the SWM quads).
+    const verifiedKACount = 1;
     const verifiedByteSize = typeof intent.publicByteSize === 'number'
       ? BigInt(intent.publicByteSize)
       : BigInt(Number(intent.publicByteSize));
@@ -999,6 +1021,231 @@ export class StorageACKHandler {
     );
     return encodeStorageACK({
       merkleRoot,
+      coreNodeSignatureR: ethers.getBytes(signature.r),
+      coreNodeSignatureVS: ethers.getBytes(signature.yParityAndS),
+      contextGraphId: cgId,
+      nodeIdentityId: this.config.nodeIdentityId <= BigInt(Number.MAX_SAFE_INTEGER)
+        ? Number(this.config.nodeIdentityId)
+        : { low: Number(this.config.nodeIdentityId & 0xFFFFFFFFn), high: Number((this.config.nodeIdentityId >> 32n) & 0xFFFFFFFFn), unsigned: true },
+      ...(subscriptionSource ? { subscriptionSource } : {}),
+    });
+  };
+
+  /**
+   * Protocol stream handler for `/dkg/10.0.1/storage-update-ack`.
+   *
+   * Receives an `UpdateIntent`, recomputes the new flat-KC Merkle root
+   * from the request's `stagingQuads` (the same way the plaintext/SWM
+   * publish branch does via `computeFlatKCRoot`), verifies it equals the
+   * request's `newMerkleRoot`, then signs the 13-field UPDATE ACK digest
+   * (`computeUpdateACKDigest`) with the operational key (EIP-191) and
+   * returns a `StorageACK` whose `merkleRoot` carries `newMerkleRoot`.
+   *
+   * `kaId` + `preUpdateMerkleRootCount` are taken from the request and
+   * trusted (the publisher binds them; the on-chain update tx reverts if
+   * they're wrong — same trust model as `kaCount` on the encrypted
+   * publish path).
+   *
+   * Mirrors the publish `handler` above; only the digest, the request
+   * fields, and the protocol id differ.
+   */
+  updateHandler = async (data: Uint8Array, _peerId: PeerId): Promise<Uint8Array> => {
+    if (this.config.nodeRole !== 'core') {
+      throw new Error('Only core nodes can issue StorageACKs');
+    }
+
+    const intent = decodeUpdateIntent(data);
+    // `cgId` is the TARGET on-chain numeric id used by the UPDATE ACK
+    // digest and the update tx. `swmGraphId` (optional) is the SOURCE
+    // graph where the data lives in SWM. When absent, fall back to `cgId`.
+    const cgId = intent.contextGraphId;
+    const swmGraphId = intent.swmGraphId && intent.swmGraphId.length > 0
+      ? intent.swmGraphId
+      : cgId;
+    const subGraphName = intent.subGraphName && intent.subGraphName.length > 0
+      ? intent.subGraphName
+      : undefined;
+    const newMerkleRoot = intent.newMerkleRoot instanceof Uint8Array
+      ? intent.newMerkleRoot
+      : new Uint8Array(intent.newMerkleRoot);
+    if (newMerkleRoot.length !== 32) {
+      throw new Error(
+        `UpdateStorageACK: newMerkleRoot must be 32 bytes, got ${newMerkleRoot.length}`,
+      );
+    }
+
+    const swmGraphUri = this.config.contextGraphSharedMemoryUri(swmGraphId, subGraphName);
+
+    // Verify the new Merkle root the same way the publish path does:
+    // recompute over the updated quads and compare to the publisher's
+    // claim. For curated (encrypted) updates the core can't decrypt, so
+    // it trusts the claimed root (member post-decrypt verification + the
+    // on-chain revert are the integrity backstop) but still independently
+    // confirms the CG is curated before signing an opaque ACK.
+    if (intent.isEncryptedPayload === true) {
+      const swmGraphIdForCuration = intent.swmGraphId && intent.swmGraphId.length > 0
+        ? intent.swmGraphId
+        : undefined;
+      if (!this.config.isCgCurated) {
+        return this.encodeDecline(
+          cgId,
+          STORAGE_ACK_DECLINE_CODES.SIGNER_NOT_REGISTERED,
+          'UpdateIntent.isEncryptedPayload=true rejected: this core has no curation oracle wired and cannot verify the CG access policy',
+        );
+      }
+      const curationVerdict = await this.config.isCgCurated(cgId, swmGraphIdForCuration);
+      if (curationVerdict !== true) {
+        return this.encodeDecline(
+          cgId,
+          STORAGE_ACK_DECLINE_CODES.SIGNER_NOT_REGISTERED,
+          `UpdateIntent.isEncryptedPayload=true rejected for cg=${cgId}: local curation oracle reports ${curationVerdict === false ? 'PUBLIC (not curated)' : 'UNKNOWN'}; the encrypted-payload path is curated-only`,
+        );
+      }
+      // Encrypted updates trust the publisher's claimed newMerkleRoot —
+      // no recompute. Fall through to the digest sign below.
+    } else if (intent.stagingQuads && intent.stagingQuads.length > 0) {
+      const MAX_STAGING_BYTES = 4 * 1024 * 1024;
+      if (intent.stagingQuads.length > MAX_STAGING_BYTES) {
+        throw new Error(
+          `UpdateStorageACK: stagingQuads payload (${intent.stagingQuads.length} bytes) exceeds ` +
+          `${MAX_STAGING_BYTES} byte limit — rejecting request`,
+        );
+      }
+      const parsed = parseSimpleNQuads(new TextDecoder().decode(intent.stagingQuads));
+      if (parsed.length === 0) {
+        throw new Error('UpdateStorageACK: stagingQuads present but contained no parseable N-Quads');
+      }
+      const recomputedRoot = computeFlatKCRoot(parsed, []);
+      if (!bytesEqual(recomputedRoot, newMerkleRoot)) {
+        return this.encodeDecline(
+          cgId,
+          STORAGE_ACK_DECLINE_CODES.MERKLE_MISMATCH_IN_SWM,
+          `UpdateStorageACK: newMerkleRoot mismatch (inline quads): publisher=${ethers.hexlify(newMerkleRoot).slice(0, 18)}..., ` +
+          `computed=${ethers.hexlify(recomputedRoot).slice(0, 18)}... (${parsed.length} triples) — refusing to ACK`,
+        );
+      }
+    } else {
+      // Fallback: data should already be in SWM (publishFromSharedMemory
+      // remap / SWM-resolution path). Reuse the publish branch's SWM
+      // CONSTRUCT + recompute + typed-decline shape.
+      const swmQuads = await this.loadSWMQuads(swmGraphUri, []);
+      if (swmQuads.length === 0) {
+        return this.encodeDecline(
+          cgId,
+          STORAGE_ACK_DECLINE_CODES.NO_DATA_IN_SWM,
+          `UpdateStorageACK: no data found in SWM graph ${swmGraphUri}`,
+        );
+      }
+      const recomputedRoot = computeFlatKCRoot(swmQuads, []);
+      if (!bytesEqual(recomputedRoot, newMerkleRoot)) {
+        return this.encodeDecline(
+          cgId,
+          STORAGE_ACK_DECLINE_CODES.MERKLE_MISMATCH_IN_SWM,
+          `UpdateStorageACK: newMerkleRoot mismatch (SWM): publisher=${ethers.hexlify(newMerkleRoot).slice(0, 18)}..., ` +
+          `local=${ethers.hexlify(recomputedRoot).slice(0, 18)}... (${swmQuads.length} triples in SWM)`,
+        );
+      }
+    }
+
+    // Derive the bigint digest inputs. Fail loud on non-numeric / non-
+    // positive on-chain ids — the contract rejects `contextGraphId == 0`,
+    // so signing against it would just produce a signature it rejects.
+    let contextGraphIdBigInt: bigint;
+    try {
+      contextGraphIdBigInt = BigInt(cgId);
+    } catch {
+      throw new Error(
+        `UpdateStorageACK: V10 update requires a numeric on-chain context graph id; got '${cgId}'.`,
+      );
+    }
+    if (contextGraphIdBigInt <= 0n) {
+      throw new Error(
+        `UpdateStorageACK: V10 update requires a positive on-chain context graph id; got ${contextGraphIdBigInt}.`,
+      );
+    }
+    let kaIdBigInt: bigint;
+    try {
+      kaIdBigInt = BigInt(intent.kaId);
+    } catch {
+      throw new Error(`UpdateStorageACK: kaId must be a numeric decimal string; got '${intent.kaId}'.`);
+    }
+    const preUpdateMerkleRootCount = typeof intent.preUpdateMerkleRootCount === 'number'
+      ? BigInt(intent.preUpdateMerkleRootCount)
+      : BigInt(intent.preUpdateMerkleRootCount.low >>> 0)
+        | (BigInt(intent.preUpdateMerkleRootCount.high >>> 0) << 32n);
+    const newByteSize = typeof intent.newByteSize === 'number'
+      ? BigInt(intent.newByteSize)
+      : BigInt(intent.newByteSize.low >>> 0) | (BigInt(intent.newByteSize.high >>> 0) << 32n);
+    const newTokenAmount = intent.newTokenAmount && intent.newTokenAmount.length > 0
+      ? BigInt(intent.newTokenAmount)
+      : 0n;
+    const mintAmount = intent.mintAmount == null
+      ? 0n
+      : (typeof intent.mintAmount === 'number'
+          ? BigInt(intent.mintAmount)
+          : BigInt(intent.mintAmount.low >>> 0) | (BigInt(intent.mintAmount.high >>> 0) << 32n));
+    const burnTokenIds = (intent.burnTokenIds ?? []).map((id) => BigInt(id));
+    const newMerkleLeafCount = intent.newMerkleLeafCount == null ? 0 : Number(intent.newMerkleLeafCount);
+    if (!Number.isInteger(newMerkleLeafCount) || newMerkleLeafCount < 1) {
+      throw new Error(
+        `UpdateStorageACK: newMerkleLeafCount must be a positive integer; got ${newMerkleLeafCount}`,
+      );
+    }
+
+    // 13-field UPDATE ACK digest — byte-identical to
+    // `KnowledgeAssetsLifecycle._executeUpdateCore`. The token amount is
+    // floored INSIDE `computeUpdateACKDigest` (floorPublishTokenAmount),
+    // matching the on-chain submission, so the publisher and this signer
+    // bind the same `newTokenAmount` wire value.
+    const digest = computeUpdateACKDigest(
+      this.config.chainId,
+      this.config.kav10Address,
+      contextGraphIdBigInt,
+      kaIdBigInt,
+      preUpdateMerkleRootCount,
+      newMerkleRoot,
+      newByteSize,
+      newTokenAmount,
+      mintAmount,
+      burnTokenIds,
+      BigInt(newMerkleLeafCount),
+      ciphertextRootForAckDigest(intent.newCiphertextChunksRoot),
+      BigInt(intent.newCiphertextChunkCount ?? 0),
+    );
+
+    if (this.config.isSignerRegistered) {
+      let signerRegistered: boolean | undefined;
+      try {
+        signerRegistered = await this.config.isSignerRegistered();
+      } catch (err) {
+        try { await this.config.onSignerRegistrationLookupFailed?.(err); } catch { /* swallow */ }
+        throw new Error('UpdateStorageACK signer registration lookup failed; refusing to sign');
+      }
+      if (signerRegistered === false) {
+        try { await this.config.onSignerUnregistered?.(); } catch { /* swallow */ }
+        return this.encodeDecline(
+          cgId,
+          STORAGE_ACK_DECLINE_CODES.SIGNER_NOT_REGISTERED,
+          'UpdateStorageACK signer is not confirmed on-chain as an operational wallet',
+        );
+      }
+    }
+
+    const signature = ethers.Signature.from(
+      await this.config.signerWallet.signMessage(digest),
+    );
+    const MAX_UINT64 = (1n << 64n) - 1n;
+    if (this.config.nodeIdentityId > MAX_UINT64) {
+      throw new Error(
+        `nodeIdentityId ${this.config.nodeIdentityId} exceeds uint64 wire format`,
+      );
+    }
+    const subscriptionSource = this.config.getSubscriptionSourceForCg?.(
+      cgId,
+      swmGraphId !== cgId ? swmGraphId : undefined,
+    );
+    return encodeStorageACK({
+      merkleRoot: newMerkleRoot,
       coreNodeSignatureR: ethers.getBytes(signature.r),
       coreNodeSignatureVS: ethers.getBytes(signature.yParityAndS),
       contextGraphId: cgId,

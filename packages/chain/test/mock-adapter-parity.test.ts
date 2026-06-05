@@ -186,6 +186,16 @@ const MOCK_EXEMPT_FROM_EVM = new Set<string>([
   'computeV10UpdateAckDigest',
   'resolveCurrentTokenAmount',
   'computeUpdateNewTokenAmount',
+  // V10 UPDATE StorageACK: `getUpdateAckDigestFields` resolves the
+  // on-chain-derived digest fields (contextGraphId via kaToContextGraph,
+  // preUpdateMerkleRootCount via getMerkleRoots().length, floored
+  // newTokenAmount via computeUpdateNewTokenAmount) so the off-chain ACK
+  // collector signs a digest byte-identical to the on-chain verify. Same
+  // family as `computeV10UpdateAckDigest` above — it mirrors real on-chain
+  // reads the mock has no chain for, and the mock's
+  // `updateKnowledgeCollectionV10` accepts any ack without recovery, so
+  // there is no on-chain digest to reproduce here.
+  'getUpdateAckDigestFields',
 ]);
 
 const NO_CHAIN_EXEMPT_FROM_EVM = new Set<string>([

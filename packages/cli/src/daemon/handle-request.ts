@@ -322,6 +322,7 @@ import { handleMemoryRoutes } from './routes/memory.js';
 import { handlePublisherRoutes } from './routes/publisher.js';
 import { handleContextGraphRoutes } from './routes/context-graph.js';
 import { handleAssertionRoutes } from './routes/assertion.js';
+import { handleKnowledgeAssetsRoutes } from './routes/knowledge-assets.js';
 import { handleQueryRoutes } from './routes/query.js';
 import { handleLocalAgentsRoutes } from './routes/local-agents.js';
 import { handleGuardianRoutes } from './routes/guardian.js';
@@ -428,6 +429,9 @@ export async function handleRequest(
   if (res.writableEnded) return;
 
   await handleContextGraphRoutes(ctx);
+  if (res.writableEnded) return;
+
+  await handleKnowledgeAssetsRoutes(ctx);
   if (res.writableEnded) return;
 
   await handleAssertionRoutes(ctx);

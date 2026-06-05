@@ -9,7 +9,7 @@ import {
 import { GraphManager, type TripleStore, type Quad } from '@origintrail-official/dkg-storage';
 import { type ChainAdapter, type EventFilter } from '@origintrail-official/dkg-chain';
 import {
-  computeTripleHashV10 as computeTripleHash, computeFlatKCRootV10 as computeFlatKCRoot, autoPartition,
+  computeTripleHashV10 as computeTripleHash, computeFlatKCRootV10 as computeFlatKCRoot, skolemizeByEntity,
   generateTentativeMetadata, getTentativeStatusQuad, getConfirmedStatusQuad,
   validatePublishRequest, parseSimpleNQuads, generateSubGraphRegistration,
   type KAMetadata,
@@ -306,16 +306,26 @@ export class GossipPublishHandler {
           .map(ka => new Uint8Array(ka.privateMerkleRoot));
         const merkleRoot = computeFlatKCRoot(normalized, privateRoots);
 
-        const partitioned = autoPartition(normalized);
+        const partitioned = skolemizeByEntity(normalized);
         const kaMetadata: KAMetadata[] = [];
 
-        for (const [rootEntity, entityQuads] of partitioned) {
+        let metadataTokenId = 1n;
+        const metadataRootOrder = request.kas?.length
+          ? request.kas.map((ka) => ka.rootEntity)
+          : [...partitioned.keys()];
+        for (const rootEntity of metadataRootOrder) {
+          const entityQuads = partitioned.get(rootEntity);
+          if (!entityQuads) continue;
           const kaEntry = request.kas?.find((ka) => ka.rootEntity === rootEntity);
-          const tokenId = kaEntry ? protoToNumber(kaEntry.tokenId) : 0;
+          // Integration (file=KA × Option-1): the per-entity tokenId is a local
+          // 1-based ordinal within the KC — the KC's packed Option-1 kaId lives
+          // in request.ual, not here, and this ordinal does not feed the
+          // consensus merkle root. Deterministically reconstruct the publisher
+          // manifest's ordinal rather than reading the (now string) wire tokenId.
           kaMetadata.push({
             rootEntity,
             kcUal: request.ual,
-            tokenId: BigInt(tokenId),
+            tokenId: metadataTokenId++,
             publicTripleCount: entityQuads.length,
             privateTripleCount: kaEntry?.privateTripleCount ?? 0,
             privateMerkleRoot: kaEntry?.privateMerkleRoot?.length
@@ -327,7 +337,7 @@ export class GossipPublishHandler {
           ual: request.ual,
           contextGraphId: request.contextGraphId,
           merkleRoot,
-          kaCount: kaMetadata.length,
+          kaCount: kaMetadata.length > 0 ? 1 : 0,
           publisherPeerId: request.publisherAddress || 'unknown',
           timestamp: new Date(),
           subGraphName,
@@ -561,7 +571,8 @@ function protoToNumber(val: number | { low: number; high: number; unsigned: bool
   return ((val.high >>> 0) * 0x100000000) + (val.low >>> 0);
 }
 
-function protoToBigInt(val: number | bigint | { low: number; high: number; unsigned: boolean }): bigint {
+function protoToBigInt(val: string | number | bigint | { low: number; high: number; unsigned: boolean }): bigint {
+  if (typeof val === 'string') return BigInt(val);
   if (typeof val === 'bigint') return val;
   if (typeof val === 'number') return BigInt(val);
   return (BigInt(val.high >>> 0) << 32n) | BigInt(val.low >>> 0);

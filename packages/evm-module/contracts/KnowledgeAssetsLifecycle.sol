@@ -70,18 +70,23 @@ import {ECDSA} from "solady/src/utils/ECDSA.sol";
  *
  * Authorization:
  *   - publish: N17 closure — `isAuthorizedPublisher(msg.sender)` via facade.
- *   - update:  policy-branch gate in `_executeUpdateCore`. Curated CGs
- *              (`publishPolicy == 0`) delegate to
- *              `isAuthorizedPublisher(cgId, msg.sender)` via the facade so
- *              EOA / Safe curators and PCA agents inherit update rights
- *              automatically. Open CGs (`publishPolicy == 1`) have no curator
- *              authority to delegate to, so update auth pins to the ORIGINAL
- *              publisher (`merkleRoots[0].publisher`) — the paying principal
- *              recorded at publish time. Replaces the initial V10 ERC-1155
+ *   - update:  enforced in `_executeUpdateCore` as owner-only — the
+ *              EIP-712-attested author MUST equal `ownerOf(kaId)`, independent
+ *              of CG publish policy. There is no curator/PCA delegation on the
+ *              update path (delegation applies to publish only). To change who
+ *              may update a KA, transfer the NFT (an owner may be an EOA, a
+ *              Safe via EIP-1271 for N-of-M, or an EIP-7702-delegated EOA).
+ *              This supersedes the initial V10 ERC-1155
  *              `balanceOf(msg.sender, kcRange) > 0` gate (which was hijackable
  *              via ERC-1155Delta token transfers) and the V9
  *              `latestPublisher == msg.sender` gate (which gated on
- *              node-operator key, not the paying principal).
+ *              node-operator key). See OT-RFC-45 (owner-only update authority).
+ *
+ *              Key loss is a single point of failure: owner-only gives no
+ *              protocol-level recovery, so for any canonical / long-lived KA,
+ *              mint to a Safe (or recovery-enabled EIP-1271 account) from the
+ *              first publish — transferring the NFT cannot recover an
+ *              already-lost key (OT-RFC-45 §5.1).
  *
  * Byte-size ceiling (decision #4 closure): updates may GROW `newByteSize`
  * beyond the original value, as long as the new `tokenAmount` covers the new
@@ -102,7 +107,7 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
     // out of the staker-bound net). Patch-level on purpose — the EIP-712
     // author-attestation domain version (`_EIP712_VERSION_HASH`) MUST stay
     // pinned at "2.0.0" so previously signed attestations keep verifying.
-    string private constant _VERSION = "2.0.1";
+    string private constant _VERSION = "10.0.3";
 
     // --- V10 publish input (grouped to bypass the 16-arg stack limit) ---
 
@@ -161,6 +166,18 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
         bytes32 authorR;
         bytes32 authorVS;
         uint8   authorSchemeVersion;
+        // ── OT-RFC-43 Option 1 (variant 1a): caller-supplied deterministic id ──
+        /// @notice The packed KA id this publish claims:
+        ///         kaId = (uint160(authorAddress) << 96) | uint96(number),
+        ///         pre-allocated off-chain (the reserved UAL). KCS enforces
+        ///         `(reservedKaId >> 96) == authorAddress` at mint, so a wallet
+        ///         can only mint within its own namespace. REQUIRED — there is
+        ///         no auto-mint fallback under 1a; a value outside the author's
+        ///         namespace reverts `KaIdNamespaceMismatch`. Deliberately NOT
+        ///         added to the ACK digest: the namespace is enforced on-chain
+        ///         and choosing a different number within one's own namespace is
+        ///         harmless (OT-RFC-43; see PR description / R5 decision).
+        uint256 reservedKaId;
         // ── ACK quorum (unchanged) ──
         uint72[] identityIds;
         bytes32[] r;
@@ -178,9 +195,10 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
      *
      * RFC-001: per-update publisher signature (`publisherNodeR/VS`) is removed.
      * `publisherNodeIdentityId` is now a self-claimed attribution field — same
-     * semantics as in `PublishParams`. RFC-001 v1.1 will add the author
-     * attestation fields here too; for now the update path does not verify
-     * authorship on chain.
+     * semantics as in `PublishParams`. The author attestation fields below
+     * (`authorAddress` / `authorR` / `authorVS` / `authorSchemeVersion`) are
+     * verified on chain by `_verifyUpdateAuthorAttestation`, and the update is
+     * gated owner-only (`ownerOf(kaId) == authorAddress`) — OT-RFC-45.
      */
     struct UpdateParams {
         uint256 id;
@@ -625,13 +643,14 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
         DKGKnowledgeAssets kcs = knowledgeAssetsStorage;
         currentEpoch = uint40(chronos.getCurrentEpoch());
 
-        // Publisher of record + ERC-1155 KA token recipient = `msg.sender`
-        // (the paying agent). This address is stored as
-        // `merkleRoots[0].publisher` in KCS and serves as the update-auth
-        // pin for open CGs (which have no curator authority to delegate
-        // to). Passing the recovered node signer here would record the
-        // node operator wallet as the original publisher and break
-        // publish→update coherence for open-CG publishers.
+        // Publisher of record + gas/TRAC payer = `msg.sender` (the paying
+        // agent). This address is stored as `merkleRoots[0].publisher` in KCS
+        // as the publisher-of-record. It is NOT the KA owner (the NFT is
+        // `_safeMint`'d to `author` = `p.authorAddress`) and update authority
+        // is NOT pinned to it — updates are owner-only (`ownerOf(kaId)` ==
+        // attested author, OT-RFC-45). Passing the recovered node signer here
+        // would record the node operator wallet as the original publisher and
+        // break payer attribution.
         // `author` = `p.authorAddress`, the address verified by
         // `_verifyAuthorAttestation` above. The chain commits the recovered
         // identity into KCS's parallel `merkleRootAuthors[kaId][0]` map
@@ -641,6 +660,7 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
         kaId = kcs.createKnowledgeAsset(
             msg.sender,
             p.authorAddress,
+            p.reservedKaId,
             p.publishOperationId,
             p.merkleRoot,
             p.knowledgeAssetsAmount,
@@ -1102,16 +1122,13 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
      *         account (discounted path). Closes N16, N19 (local ceiling removal),
      *         and decision #4.
      *
-     * Authorization: policy-branch gate in `_executeUpdateCore`. Curated CGs
-     * delegate to the facade (`isAuthorizedPublisher`), which handles
-     * EOA/Safe direct-equality and PCA live-resolve + agent delegation so
-     * the authorized principal set tracks CG NFT transfers and PCA agent
-     * cycling without off-chain coordination. Open CGs pin auth to
-     * `merkleRoots[0].publisher` (the original paying principal at publish
-     * time), because open CGs have no curator to delegate to. Replaces the
-     * initial ERC-1155 `balanceOf` gate, which was unsound under
-     * ERC-1155Delta transferability: any downstream buyer of a single KA
-     * token inherited full update authority.
+     * Authorization: owner-only, enforced in `_executeUpdateCore` — the
+     * EIP-712-attested author MUST equal `ownerOf(kaId)`, independent of CG
+     * publish policy. There is no curator/PCA delegation on the update path
+     * (delegation applies to publish only); to change who may update, transfer
+     * the NFT. This supersedes the initial ERC-1155 `balanceOf` gate, which
+     * was unsound under ERC-1155Delta transferability: any downstream buyer of
+     * a single KA token inherited full update authority. See OT-RFC-45.
      *
      * Delta-only payment semantics (decision #4 interpretation): the caller
      * passes `newTokenAmount` as the NEW TOTAL `tokenAmount` for the KC. KAV10
@@ -1220,7 +1237,8 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
 
         // `minted` is intentionally discarded: the old N16 `balanceOf` auth
         // gate needed the KC's minted count to compute the token range, but
-        // the policy-branch auth gate below no longer touches token ranges.
+        // the owner-only auth gate below (`ownerOf(kaId)` == attested author,
+        // OT-RFC-45) does not touch token ranges.
         (
             uint256 preUpdateMerkleRootCount,
             ,
@@ -1272,9 +1290,10 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
         // attribution field with no per-update authentication. ACK quorum
         // continues to gate update validity.
         //
-        // RFC-001 v1.1 will add an author-attestation step here too,
-        // mirroring the publish path. For now the update path has no
-        // on-chain author verification.
+        // The update path verifies an EIP-712 author attestation below
+        // (`_verifyUpdateAuthorAttestation`) and enforces owner-only: the
+        // attested author MUST equal `ownerOf(kaId)` (OT-RFC-45). There is no
+        // curator/PCA delegation on the update path.
         //
         // ACK digest — covers EVERY mutable field the update can change so a
         // stale ACK can't be replayed with different byte size, different

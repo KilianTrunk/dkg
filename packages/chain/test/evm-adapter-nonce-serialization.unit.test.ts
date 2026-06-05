@@ -40,6 +40,13 @@ const fakeReceipt = (hash: string) =>
 // Minimal V10 publish params that survive `createKnowledgeAssets`'s struct
 // building so execution reaches the allowance-approve step.
 function minimalPublishParams(): any {
+  const author = '0x1111111111111111111111111111111111111111';
+  // OT-RFC-43 Option-1 (variant 1a): the real `createKnowledgeAssets`
+  // entrypoint requires a packed reservedKaId = (uint160(author) << 96) | number
+  // in the author's namespace and throws (pre-tx) otherwise. The #953 wiring
+  // test drives the real method, so supply a valid packed id so execution
+  // reaches the allowance-approve step under test.
+  const reservedKaId = (BigInt(ethers.getAddress(author)) << 96n) | 1n;
   return {
     publishOperationId: 'op-953-wiring',
     contextGraphId: 1n,
@@ -50,9 +57,10 @@ function minimalPublishParams(): any {
     tokenAmount: 1n,
     isImmutable: false,
     merkleLeafCount: 1,
+    reservedKaId,
     publisherNodeIdentityId: 1n,
     author: {
-      address: '0x1111111111111111111111111111111111111111',
+      address: author,
       signature: { r: new Uint8Array(32), vs: new Uint8Array(32) },
       schemeVersion: 1,
     },

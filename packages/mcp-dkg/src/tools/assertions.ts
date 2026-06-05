@@ -80,6 +80,11 @@ export function registerAssertionTools(
       const pid = resolveProject(projectId, config);
       if (!pid) return projectErr();
       try {
+        // Create stays on the legacy assertion route: it preserves the
+        // `{ assertionUri, alreadyExists }` contract (the KA create route is an
+        // idempotent get-or-create that can't report `alreadyExists`) and the
+        // route's name validation. Only the WM/SWM mutation verbs (write /
+        // promote / discard) move to the KA routes below.
         const result = await client.createAssertion({
           contextGraphId: pid,
           assertionName: name,
@@ -150,26 +155,25 @@ export function registerAssertionTools(
       const pid = resolveProject(projectId, config);
       if (!pid) return projectErr();
       try {
-        // Keep the input shape (subject/predicate/object/graph) — the daemon
-        // accepts the union shape used by both adapter-openclaw and mcp-dkg.
-        // Strip angle brackets from URIs to match the existing
-        // `client.writeAssertion` triples shape; the adapter does the same
-        // at the handler level.
+        // Append to the KA's WM draft. Strip angle brackets from URIs (the
+        // engine wants bare URIs) and carry `graph` through when supplied;
+        // omitted graph lets the WM-write engine derive the draft graph.
         const strip = (t: string): string =>
           t.startsWith('<') && t.endsWith('>') ? t.slice(1, -1) : t;
-        const triples = quads.map((q) => ({
+        const kaQuads = quads.map((q) => ({
           subject: strip(q.subject),
           predicate: strip(q.predicate),
           object: q.object,
+          ...(q.graph ? { graph: strip(q.graph) } : {}),
         }));
-        await client.writeAssertion({
+        const { written } = await client.knowledgeAssetWrite({
           contextGraphId: pid,
-          assertionName: name,
+          name,
           subGraphName,
-          triples,
+          quads: kaQuads,
         });
         return ok(
-          `Wrote ${triples.length} quad(s) to assertion '${name}' in '${pid}'.`,
+          `Wrote ${written} quad(s) to assertion '${name}' in '${pid}'.`,
         );
       } catch (e) {
         return errResult(`Failed to write assertion: ${formatError(e)}`);
@@ -210,17 +214,14 @@ export function registerAssertionTools(
         );
       }
       try {
-        await client.promoteAssertion({
+        // WM → SWM. The KA `swm/share` route is the same engine call
+        // (`agent.assertion.promote`) the legacy promote used; omit `entities`
+        // to share every root (the route's default), or pass a subset.
+        await client.knowledgeAssetShare({
           contextGraphId: pid,
-          assertionName: name,
+          name,
           subGraphName,
-          // The tool blocks empty-array from callers (validated above)
-          // because the schema's intent is unambiguous: omit means
-          // promote-all. The empty-array IS the daemon's "promote all"
-          // sentinel internally — `promoteAssertion` requires an array
-          // shape — but we hide that wire detail from the public surface
-          // so the API has one canonical "promote all" form (omit).
-          entities: entities ?? [],
+          entities: entities && entities.length > 0 ? entities : undefined,
         });
         const scope = entities && entities.length > 0
           ? `${entities.length} entit${entities.length === 1 ? 'y' : 'ies'}`
@@ -252,9 +253,9 @@ export function registerAssertionTools(
       const pid = resolveProject(projectId, config);
       if (!pid) return projectErr();
       try {
-        await client.discardAssertion({
+        await client.knowledgeAssetDiscard({
           contextGraphId: pid,
-          assertionName: name,
+          name,
           subGraphName,
         });
         return ok(`Discarded assertion '${name}' from project '${pid}'.`);
@@ -563,6 +564,10 @@ export function registerAssertionTools(
       const pid = resolveProject(projectId, config);
       if (!pid) return projectErr();
       try {
+        // Read stays on the legacy assertion route: the KA GET surface
+        // (getKnowledgeAsset) is keyed by (contextGraph, name) only and
+        // cannot resolve another author's history. Keep `agentAddress`
+        // author-scoping until the KA GET route accepts it.
         const result = await client.getAssertionHistory({
           contextGraphId: pid,
           assertionName: name,

@@ -24,7 +24,7 @@ const { Type, Field } = protobuf;
 export const VerifyProposalSchema = new Type('VerifyProposal')
   .add(new Field('proposalId', 1, 'bytes'))
   .add(new Field('verifiedMemoryId', 2, 'uint64'))
-  .add(new Field('batchId', 3, 'uint64'))
+  .add(new Field('batchId', 3, 'string'))
   .add(new Field('merkleRoot', 4, 'bytes'))
   .add(new Field('entities', 5, 'string', 'repeated'))
   .add(new Field('agentSignatureR', 6, 'bytes'))
@@ -43,7 +43,7 @@ type Long = { low: number; high: number; unsigned: boolean };
 export interface VerifyProposalMsg {
   proposalId: Uint8Array;
   verifiedMemoryId: number | Long;
-  batchId: number | Long;
+  batchId: string | number | bigint | Long;
   merkleRoot: Uint8Array;
   entities: string[];
   agentSignatureR: Uint8Array;
@@ -59,9 +59,27 @@ export interface VerifyApprovalMsg {
   approverAddress: string;
 }
 
+/**
+ * Convert a KA id (batchId) into the decimal-string wire shape. KA ids are
+ * packed Option-1 values `(uint160(author) << 96) | number` (~256-bit), which
+ * do NOT fit a uint64 gossip field. Per OT-RFC-43 §9 the id wire type is a
+ * decimal string, so we accept string / number / bigint / protobuf Long and
+ * emit the canonical decimal string losslessly.
+ */
+function idToProtoString(val: string | number | bigint | Long): string {
+  if (typeof val === 'string') return val;
+  if (typeof val === 'bigint') return val.toString();
+  if (typeof val === 'number') return val.toString();
+  const lo = BigInt(val.low >>> 0); const hi = BigInt(val.high >>> 0);
+  return ((hi << 32n) | lo).toString();
+}
+
 export function encodeVerifyProposal(msg: VerifyProposalMsg): Uint8Array {
   return VerifyProposalSchema.encode(
-    VerifyProposalSchema.create(msg),
+    VerifyProposalSchema.create({
+      ...msg,
+      batchId: idToProtoString(msg.batchId),
+    }),
   ).finish();
 }
 

@@ -253,7 +253,7 @@ describe('@unit RandomSampling', () => {
 
   describe('version()', () => {
     it('Should return correct version', async () => {
-      expect(await RandomSampling.version()).to.equal('10.0.2');
+      expect(await RandomSampling.version()).to.equal('10.0.3');
     });
   });
 
@@ -839,9 +839,19 @@ describe('@unit RandomSampling', () => {
      *  methods on storage contracts directly. */
     let opSigner: SignerWithAddress;
 
+    // OT-RFC-43 Option 1 (1a): KA ids are caller-supplied, author-namespaced
+    // packed values `(uint160(author) << 96) | uint96(number)`. `createKC`
+    // seeds with `author == opSigner`, so allocate a fresh number per KC in
+    // opSigner's namespace. Reset per test so snapshot-reverted runs realloc.
+    let _kaIdCounter: bigint;
     beforeEach(() => {
       opSigner = accounts[19];
+      _kaIdCounter = 0n;
     });
+    const nextOpSignerKaId = (): bigint => {
+      _kaIdCounter += 1n;
+      return (BigInt(opSigner.address) << 96n) | _kaIdCounter;
+    };
 
     /**
      * Create a Context Graph via the storage directly and return its id.
@@ -887,6 +897,7 @@ describe('@unit RandomSampling', () => {
       ).createKnowledgeAsset(
         opSigner.address, // publisher
         opSigner.address, // author — ERC-721 KA mint recipient (greenfield model)
+        nextOpSignerKaId(), // OT-RFC-43 (1a): caller-supplied author-namespaced id
         'phase-10-test-op',
         ethers.keccak256(
           ethers.toUtf8Bytes(

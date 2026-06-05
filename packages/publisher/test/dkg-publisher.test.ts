@@ -14,6 +14,7 @@ import { createEVMAdapter, getSharedContext, createProvider, takeSnapshot, rever
 import { mintTokens } from '../../chain/test/hardhat-harness.js';
 import { buildSeal, buildUpdateSeal, wrapPublisherForTest } from './_helpers/seal.js';
 import { makeHardhatReceiverACKProvider } from './_helpers/acks.js';
+import { makeTestKaAllocator } from './_helpers/ka-allocator.js';
 import type { V10ACKProvider } from '../src/publisher.js';
 
 let CONTEXT_GRAPH: string;
@@ -120,6 +121,8 @@ describe('DKGPublisher', () => {
       keypair,
       publisherPrivateKey: HARDHAT_KEYS.CORE_OP,
       publisherNodeIdentityId: BigInt(getSharedContext().coreProfileId),
+      // OT-RFC-43 Option-1: real EVM adapter requires a packed reservedKaId per mint.
+      kaAllocator: makeTestKaAllocator(),
     });
     // RC11 / PR3: wrap so any direct `publisher.publishFromSharedMemory`
     // call (e.g. the Round 12 Bug 34 internal-promote test) also gets a
@@ -169,19 +172,30 @@ describe('DKGPublisher', () => {
     expect(metaCount).toBeGreaterThan(0);
   });
 
-  it('rejects publishing multiple KAs in one KC (greenfield: one KA per tx)', async () => {
-    // Greenfield KA model (PR #815): a V10 on-chain publish must carry
-    // exactly one Knowledge Asset per transaction. Publishing two root
-    // entities (ENTITY + ENTITY2) in a single call is now rejected.
-    await expect(
-      publishWS({
-        contextGraphId: CONTEXT_GRAPH,
-        quads: [
-          q(ENTITY, 'http://schema.org/name', '"ImageBot"'),
-          q(ENTITY2, 'http://schema.org/name', '"TextBot"'),
-        ],
-      }),
-    ).rejects.toThrow(/exactly one Knowledge Asset per transaction/i);
+  it('publishes multiple entities in one KC as a SINGLE Knowledge Asset (OT-RFC-44 / Design B)', async () => {
+    // OT-RFC-44: one file = one Knowledge Asset, however many entities it
+    // contains. Publishing two root entities (ENTITY + ENTITY2) in a single
+    // call now SUCCEEDS as ONE KA whose member entities are both — superseding
+    // the pre-Design-B greenfield guard (PR #815) that rejected it as
+    // "exactly one Knowledge Asset per transaction".
+    const result = await publishWS({
+      contextGraphId: CONTEXT_GRAPH,
+      quads: [
+        q(ENTITY, 'http://schema.org/name', '"ImageBot"'),
+        q(ENTITY2, 'http://schema.org/name', '"TextBot"'),
+      ],
+    });
+
+    expect(result.status).toBe('confirmed');
+    // Both entities are members of the publish...
+    const roots = new Set(result.kaManifest.map((m: any) => m.rootEntity));
+    expect(roots.has(ENTITY)).toBe(true);
+    expect(roots.has(ENTITY2)).toBe(true);
+    // ...and they mint ONE on-chain KA, while keeping per-root compatibility
+    // token IDs for `${ual}/${tokenId}` response/meta consumers.
+    const tokenIds = new Set(result.kaManifest.map((m: any) => String(m.tokenId)));
+    expect(tokenIds).toEqual(new Set(['1', '2']));
+    expect(result.kaId).toBeDefined();
   });
 
   it('publishes with blank nodes (auto-skolemized)', async () => {

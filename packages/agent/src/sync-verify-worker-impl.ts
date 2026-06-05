@@ -1,5 +1,5 @@
 import { parentPort } from 'node:worker_threads';
-import { computeFlatKCRootV10 as computeFlatKCRoot, autoPartition } from '@origintrail-official/dkg-publisher';
+import { computeFlatKCRootV10 as computeFlatKCRoot, skolemizeByEntity } from '@origintrail-official/dkg-publisher';
 import type { Quad } from '@origintrail-official/dkg-storage';
 import type { SyncVerifyResult, SyncVerifyLogEntry, SyncParseResult, SharedMemoryProcessResult, DurableBatchProcessResult, SharedMemoryBatchProcessResult } from './sync-verify-worker.js';
 
@@ -91,7 +91,7 @@ function verifySyncedData(
     for (const kcUal of kcUals) overlappingKCs.add(kcUal);
   }
 
-  const partitioned = autoPartition(dataQuads);
+  const partitioned = skolemizeByEntity(dataQuads);
   const verifiedKcUals = new Set<string>();
   let rejected = 0;
 

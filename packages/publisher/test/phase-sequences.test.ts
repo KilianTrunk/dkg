@@ -22,6 +22,7 @@ import type { PhaseCallback } from '../src/publisher.js';
 import { createEVMAdapter, getSharedContext, createProvider, takeSnapshot, revertSnapshot, createTestContextGraph, HARDHAT_KEYS } from '../../chain/test/evm-test-context.js';
 import { mintTokens } from '../../chain/test/hardhat-harness.js';
 import { wrapPublisherForTest } from './_helpers/seal.js';
+import { makeTestKaAllocator } from './_helpers/ka-allocator.js';
 import { hardhatACKProvider } from './_helpers/acks.js';
 
 let CONTEXT_GRAPH: string;
@@ -34,7 +35,9 @@ function makeTestPublisher(
   testOpts: { withACKs?: boolean } = {},
 ): DKGPublisher {
   const withACKs = testOpts.withACKs !== false;
-  return wrapPublisherForTest(new DKGPublisher(opts), {
+  // OT-RFC-43 Option-1: wire a KA-number allocator so the real EVM adapter
+  // gets a packed reservedKaId per mint.
+  return wrapPublisherForTest(new DKGPublisher({ kaAllocator: makeTestKaAllocator(), ...opts }), {
     author: _author,
     ctx: { provider: _provider, kav10Address: _kav10Address },
     // RC11 / PR1: real 3-of-N ACK quorum (self-signed ACK fallback gone).

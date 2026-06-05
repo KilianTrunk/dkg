@@ -4,7 +4,7 @@
 // the same bytes the publisher submits.
 
 import type { Quad } from '@origintrail-official/dkg-storage';
-import { autoPartition } from './auto-partition.js';
+import { skolemizeByEntity } from './auto-partition.js';
 import { computeFlatKCRootV10, computePrivateRootV10 } from './merkle.js';
 
 export interface CanonicalManifestEntry {
@@ -25,7 +25,7 @@ export function canonicalPublishPayload(
   quads: Quad[],
   privateQuads: Quad[] = [],
 ): CanonicalPublishPayload {
-  const kaMap = autoPartition(quads);
+  const kaMap = skolemizeByEntity(quads);
 
   const manifestEntries: CanonicalManifestEntry[] = [];
   for (const [rootEntity, publicForRoot] of kaMap) {

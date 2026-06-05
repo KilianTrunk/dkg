@@ -108,16 +108,37 @@ export type V10ACKProvider = (
 /**
  * V10 update ACK provider: collects core node signatures over the update ACK
  * digest before `updateKnowledgeCollectionV10` is broadcast.
+ *
+ * The publisher passes ALL fields the 13-field UPDATE ACK digest binds so
+ * the off-chain-signed digest is byte-identical to the on-chain verify.
+ * The on-chain-resolved fields (`contextGraphId`, `preUpdateMerkleRootCount`,
+ * `newTokenAmount`, `mintAmount`, `burnTokenIds`) MUST be sourced from the
+ * SAME place the chain adapter resolves them for the update tx — the
+ * publisher reads them via `chain.getUpdateAckDigestFields(...)` and threads
+ * the resolved `newTokenAmount` straight into the update tx as
+ * `boundNewTokenAmount` so there is no recompute drift.
  */
-export type V10UpdateACKProvider = (
-  kaId: bigint,
-  newMerkleRoot: Uint8Array,
-  contextGraphId: string,
-  newByteSize: bigint,
-  newMerkleLeafCount: number,
-  newCiphertextChunksRoot?: Uint8Array,
-  newCiphertextChunkCount?: number,
-) => Promise<V10CoreNodeACK[]>;
+export type V10UpdateACKProvider = (params: {
+  kaId: bigint;
+  /** TARGET on-chain numeric context graph id (decimal string). */
+  contextGraphId: string;
+  /** Pre-update on-chain Merkle-roots array length for this KA. */
+  preUpdateMerkleRootCount: bigint;
+  newMerkleRoot: Uint8Array;
+  newByteSize: bigint;
+  /** Floored newTokenAmount the on-chain tx will submit (digest re-floors identically). */
+  newTokenAmount: bigint;
+  mintAmount: bigint;
+  burnTokenIds: bigint[];
+  newMerkleLeafCount: number;
+  newCiphertextChunksRoot?: Uint8Array;
+  newCiphertextChunkCount?: number;
+  /** Updated KC quads (N-Quads) so peers can recompute newMerkleRoot. */
+  stagingQuads?: Uint8Array;
+  /** Source SWM graph id (defaults to contextGraphId). */
+  swmGraphId?: string;
+  subGraphName?: string;
+}) => Promise<V10CoreNodeACK[]>;
 
 /**
  * Callback that collects participant signatures for context graph governance.
@@ -271,7 +292,7 @@ export interface PublishOptions {
    * The caller has already:
    *   1. Computed `expectedMerkleRoot` over the same quads it is
    *      now asking the publisher to publish (computed via
-   *      `computeFlatKCRoot` / `autoPartition` semantics).
+   *      `computeFlatKCRoot` / `skolemizeByEntity` semantics).
    *   2. Signed (or collected a signature for) the typed data
    *      `buildAuthorAttestationTypedData({ chainId, kav10Address,
    *      contextGraphId, merkleRoot: expectedMerkleRoot,
@@ -311,6 +332,16 @@ export interface PublishOptions {
     signature: { r: Uint8Array; vs: Uint8Array };
     schemeVersion: number;
   };
+  /**
+   * OT-RFC-43 A2 (decision 1) — precomputed packed kaId
+   * `(uint160(author) << 96) | number` reserved at `assertionFinalize`
+   * (ALLOCATE-AT-FINALIZE). When supplied, the publisher's `ensureReservedKaId`
+   * REUSES this id and SKIPS allocation, so a finalize→publish for one KA mints
+   * exactly the stamped id with no second allocation. Undefined for direct /
+   * mock publishes — the publisher then keeps its allocate-at-publish behavior
+   * (back-compat).
+   */
+  reservedKaId?: bigint;
 }
 
 export interface PublishResult {
@@ -336,6 +367,8 @@ export interface PublishResult {
 export interface Publisher {
   publish(options: PublishOptions): Promise<PublishResult>;
   update(kaId: bigint, options: PublishOptions): Promise<PublishResult>;
+  skolemizeByEntity(quads: Quad[]): KAManifestEntry[];
+  /** @deprecated Use skolemizeByEntity. */
   autoPartition(quads: Quad[]): KAManifestEntry[];
   skolemize(rootEntity: string, quads: Quad[]): Quad[];
 }

@@ -20,9 +20,9 @@ export const FinalizationMessageSchema = new Type('FinalizationMessage')
   .add(new Field('kcMerkleRoot', 3, 'bytes'))
   .add(new Field('txHash', 4, 'string'))
   .add(new Field('blockNumber', 5, 'uint64'))
-  .add(new Field('batchId', 6, 'uint64'))
-  .add(new Field('startKAId', 7, 'uint64'))
-  .add(new Field('endKAId', 8, 'uint64'))
+  .add(new Field('batchId', 6, 'string'))
+  .add(new Field('startKAId', 7, 'string'))
+  .add(new Field('endKAId', 8, 'string'))
   .add(new Field('publisherAddress', 9, 'string'))
   .add(new Field('rootEntities', 10, 'string', 'repeated'))
   .add(new Field('timestampMs', 11, 'uint64'))
@@ -98,9 +98,9 @@ export interface FinalizationMessageMsg {
   kcMerkleRoot: Uint8Array;
   txHash: string;
   blockNumber: number | bigint | Long;
-  batchId: number | bigint | Long;
-  startKAId: number | bigint | Long;
-  endKAId: number | bigint | Long;
+  batchId: string | number | bigint | Long;
+  startKAId: string | number | bigint | Long;
+  endKAId: string | number | bigint | Long;
   publisherAddress: string;
   rootEntities: string[];
   timestampMs: number | bigint | Long;
@@ -152,6 +152,12 @@ export interface FinalizationMessageMsg {
 
 const MAX_UINT64 = (1n << 64n) - 1n;
 
+/**
+ * Encode a true uint64 field (blockNumber / timestampMs) into the
+ * {low,high,unsigned} Long shape protobufjs expects, without the precision
+ * loss of `Number()`. These fields legitimately fit uint64, so the
+ * MAX_UINT64 RangeError guard is retained.
+ */
 function bigIntToProtoSafe(val: number | bigint | Long): number | Long {
   if (typeof val === 'bigint') {
     if (val < 0n || val > MAX_UINT64) {
@@ -162,6 +168,22 @@ function bigIntToProtoSafe(val: number | bigint | Long): number | Long {
     return { low, high, unsigned: true };
   }
   return val as number | Long;
+}
+
+/**
+ * Convert a KA id (batchId / startKAId / endKAId) into the decimal-string
+ * wire shape. KA ids are packed Option-1 values
+ * `(uint160(author) << 96) | number` (~256-bit), which do NOT fit a uint64
+ * gossip field. Per OT-RFC-43 §9 the id wire type is a decimal string, so we
+ * accept string / number / bigint / protobuf Long and emit the canonical
+ * decimal string losslessly.
+ */
+function idToProtoString(val: string | number | bigint | Long): string {
+  if (typeof val === 'string') return val;
+  if (typeof val === 'bigint') return val.toString();
+  if (typeof val === 'number') return val.toString();
+  const lo = BigInt(val.low >>> 0); const hi = BigInt(val.high >>> 0);
+  return ((hi << 32n) | lo).toString();
 }
 
 /**
@@ -210,9 +232,9 @@ export function encodeFinalizationMessage(msg: FinalizationMessageMsg): Uint8Arr
     FinalizationMessageSchema.create({
       ...rest,
       blockNumber: bigIntToProtoSafe(msg.blockNumber),
-      batchId: bigIntToProtoSafe(msg.batchId),
-      startKAId: bigIntToProtoSafe(msg.startKAId),
-      endKAId: bigIntToProtoSafe(msg.endKAId),
+      batchId: idToProtoString(msg.batchId),
+      startKAId: idToProtoString(msg.startKAId),
+      endKAId: idToProtoString(msg.endKAId),
       timestampMs: bigIntToProtoSafe(msg.timestampMs),
       keepRootCopyOnLabelTri: tristateFromBool(keepRootCopyOnLabel),
     }),

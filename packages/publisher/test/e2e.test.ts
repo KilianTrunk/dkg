@@ -26,6 +26,7 @@ import { parseSimpleNQuads } from '../src/publish-handler.js';
 import { createEVMAdapter, getSharedContext, createProvider, takeSnapshot, revertSnapshot, createTestContextGraph, HARDHAT_KEYS } from '../../chain/test/evm-test-context.js';
 import { mintTokens } from '../../chain/test/hardhat-harness.js';
 import { wrapPublisherForTest } from './_helpers/seal.js';
+import { makeTestKaAllocator } from './_helpers/ka-allocator.js';
 import { hardhatACKProvider } from './_helpers/acks.js';
 
 let CONTEXT_GRAPH = 'agent-skills';
@@ -34,7 +35,9 @@ let _provider: ethers.JsonRpcProvider;
 const _author = new ethers.Wallet(HARDHAT_KEYS.CORE_OP);
 
 function makeTestPublisher(opts: ConstructorParameters<typeof DKGPublisher>[0]): DKGPublisher {
-  return wrapPublisherForTest(new DKGPublisher(opts), {
+  // OT-RFC-43 Option-1: the real EVM adapter requires a packed reservedKaId
+  // per mint, which DKGPublisher only allocates when a kaAllocator is wired.
+  return wrapPublisherForTest(new DKGPublisher({ kaAllocator: makeTestKaAllocator(), ...opts }), {
     author: _author,
     ctx: { provider: _provider, kav10Address: _kav10Address },
     v10ACKProvider: hardhatACKProvider(_kav10Address),
@@ -153,15 +156,18 @@ describe('End-to-end: Publish → Replicate → Query', () => {
       nquads: new TextEncoder().encode(nquads),
       contextGraphId: CONTEXT_GRAPH,
       kas: publishResult.kaManifest.map((m) => ({
-        tokenId: Number(m.tokenId),
+        // OT-RFC-43 Option-1: kaIds are packed ~256-bit values — never narrow
+        // through Number() (lossy float → idToProtoString emits exponential →
+        // receiver BigInt() throws). Pass the bigint id straight through.
+        tokenId: m.tokenId,
         rootEntity: m.rootEntity,
         privateMerkleRoot: m.privateMerkleRoot ?? new Uint8Array(0),
         privateTripleCount: m.privateTripleCount ?? 0,
       })),
       publisherIdentity: keypairA.publicKey,
       publisherAddress: onChain.publisherAddress,
-      startKAId: Number(onChain.startKAId),
-      endKAId: Number(onChain.endKAId),
+      startKAId: onChain.startKAId,
+      endKAId: onChain.endKAId,
       chainId: chainA.chainId,
       publisherSignatureR: new Uint8Array(0),
       publisherSignatureVs: new Uint8Array(0),

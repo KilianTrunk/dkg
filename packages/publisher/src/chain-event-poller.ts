@@ -57,6 +57,15 @@ export type OnKARegisteredToContextGraph = (info: {
   blockNumber: number;
 }) => Promise<void>;
 
+/**
+ * Callback for `KnowledgeAssetCreated` events — OT-RFC-43 Option-1 allocator
+ * reconciliation. The storage contract emits `KnowledgeAssetCreated(kaId,
+ * author, …)` (see `packages/evm-module/contracts/storage/DKGKnowledgeAssets.sol`).
+ * `number` is the per-author ordinal extracted from the low 96 bits of `kaId`
+ * using full-precision bigint math.
+ */
+export type OnKnowledgeAssetCreated = (e: { kaId: bigint; author: string; number: bigint; txHash: string; txIndex: number; blockNumber: number }) => void | Promise<void>;
+
 /** Persistence interface for saving/loading the last processed block. */
 export interface CursorPersistence {
   load(): Promise<number | undefined>;
@@ -78,6 +87,8 @@ export interface ChainEventPollerConfig {
   onProfileEvent?: OnProfileEvent;
   /** Called when a KnowledgeAssetRegisteredToContextGraph event is detected (Phase B). */
   onKARegisteredToContextGraph?: OnKARegisteredToContextGraph;
+  /** Called when a KnowledgeAssetCreated event is detected (OT-RFC-43 Option-1 allocator reconciliation). */
+  onKnowledgeAssetCreated?: OnKnowledgeAssetCreated;
   /** Persistent cursor for surviving restarts. */
   cursorPersistence?: CursorPersistence;
 }
@@ -108,6 +119,7 @@ export class ChainEventPoller {
   private readonly onAllowListUpdated?: OnAllowListUpdated;
   private readonly onProfileEvent?: OnProfileEvent;
   private readonly onKARegisteredToContextGraph?: OnKARegisteredToContextGraph;
+  private readonly onKnowledgeAssetCreated?: OnKnowledgeAssetCreated;
   private readonly cursorPersistence?: CursorPersistence;
   private readonly log = new Logger('ChainEventPoller');
   private lastBlock = 0;
@@ -138,6 +150,7 @@ export class ChainEventPoller {
     this.onAllowListUpdated = config.onAllowListUpdated;
     this.onProfileEvent = config.onProfileEvent;
     this.onKARegisteredToContextGraph = config.onKARegisteredToContextGraph;
+    this.onKnowledgeAssetCreated = config.onKnowledgeAssetCreated;
     this.cursorPersistence = config.cursorPersistence;
   }
 
@@ -228,7 +241,8 @@ export class ChainEventPoller {
     const watchAllowList = !!this.onAllowListUpdated;
     const watchProfiles = !!this.onProfileEvent;
     const watchKARegistered = !!this.onKARegisteredToContextGraph;
-    if (!hasPending && !watchContextGraphs && !watchUpdates && !watchAllowList && !watchProfiles && !watchKARegistered) return;
+    const watchKACreated = !!this.onKnowledgeAssetCreated;
+    if (!hasPending && !watchContextGraphs && !watchUpdates && !watchAllowList && !watchProfiles && !watchKARegistered && !watchKACreated) return;
 
     const ctx = createOperationContext('publish');
 
@@ -240,13 +254,37 @@ export class ChainEventPoller {
     }
 
     // On first successful head fetch, seed cursor near the tip — but only
-    // when there are no pending publishes whose confirmations we might skip.
-    // Full-history context graph discovery is handled by discoverContextGraphsFromChain().
+    // when no subscriber depends on full chain history. The head-seed is
+    // a latency optimisation for the "watch for our own pending tx
+    // confirmation" use case: confirmations land at the tip, so scanning
+    // from `head - 500` is sufficient and avoids re-walking the chain on
+    // every cold start.
+    //
+    // Full-history context graph discovery is handled separately by
+    // `discoverContextGraphsFromChain()`.
+    //
+    // The OT-RFC-43 Option-1 allocator-reconciliation watcher
+    // (`onKnowledgeAssetCreated`) MUST observe every historical
+    // `KCCreated` event (codex PR #976 F9) — otherwise a fresh daemon
+    // would miss every author whose last mint was >500 blocks ago, the
+    // per-author floor would stay at 0, and a downstream
+    // `markReconciled()` would be unsound (the allocator would happily
+    // re-issue a number already minted on-chain). Treat this watcher
+    // exactly like `hasPending`: when wired AND there is no persisted
+    // cursor, refuse to seed near head and scan from block 0.
+    //
+    // Once a `cursorPersistence` round-trip lands (so `lastBlock > 0` on
+    // restart) the watcher resumes incrementally from that cursor like
+    // every other subscription — there is no extra cost beyond the
+    // first cold start.
     if (head != null && !this.headKnown) {
       this.headKnown = true;
-      if (this.lastBlock === 0 && !hasPending) {
+      const requiresFullHistory = hasPending || watchKACreated;
+      if (this.lastBlock === 0 && !requiresFullHistory) {
         this.lastBlock = Math.max(0, head - 500);
         this.log.info(ctx, `Seeded poller cursor near chain head: ${head} → scanning from ${this.lastBlock}`);
+      } else if (this.lastBlock === 0 && watchKACreated) {
+        this.log.info(ctx, `Allocator-reconciliation watcher wired and no persisted cursor → scanning from block 0 (codex PR #976 F9 backfill)`);
       }
     }
 
@@ -264,6 +302,19 @@ export class ChainEventPoller {
       eventTypes.push('ProfileUpdated');
     }
     if (watchKARegistered) eventTypes.push('KnowledgeAssetRegisteredToContextGraph');
+    // OT-RFC-43 Option-1 allocator reconciliation (codex PR #976 F5):
+    // The chain adapter's `listenForEvents()` decodes both the V10 greenfield
+    // `KnowledgeAssetCreated` event and the legacy V8/V9 batch-create event
+    // into a SINGLE normalized `{ type: 'KCCreated', data: { kaId, author, ... } }`
+    // surface (see packages/chain/src/evm-adapter-events.ts ~L119 and L193).
+    // A redundant `KnowledgeAssetCreated` subscription used to live here, but
+    // the adapter never yielded events with that type, so the dead branch
+    // below this loop never fired and allocator reconciliation never ran.
+    // Subscribe to `KCCreated` always (already implicit at the top of the
+    // list) and fan out to both `handleBatchCreated` AND `handleKACreated`
+    // inline below. When `onKnowledgeAssetCreated` is the ONLY subscriber
+    // wired (i.e. no PublishHandler pending state), still enter the poll
+    // loop — `watchKACreated` covers that case in the gating check above.
 
     const fromBlock = this.lastBlock + 1;
     const upperBound = head != null
@@ -283,6 +334,14 @@ export class ChainEventPoller {
       if (event.blockNumber > maxEventBlock) maxEventBlock = event.blockNumber;
       if (event.type === 'KCCreated') {
         await this.handleBatchCreated(event, ctx);
+        // OT-RFC-43 Option-1 allocator reconciliation (codex PR #976 F5).
+        // The adapter normalizes the greenfield `KnowledgeAssetCreated` event
+        // to `type: 'KCCreated'`, so there is no separate dispatch branch —
+        // we fan out off the same event here. `handleKACreated` is a no-op
+        // when `onKnowledgeAssetCreated` is not wired, when `kaId` is missing
+        // (legacy batch-create paths), or when `kaId` is zero (sentinel for
+        // `getKnowledgeAssetId`'s "not part of any KA" return — never minted).
+        await this.handleKACreated(event, ctx);
       } else if (event.type === 'NameClaimed' || event.type === 'ContextGraphCreated') {
         await this.handleContextGraphCreated(event, ctx);
       } else if (event.type === 'KnowledgeAssetUpdated') {
@@ -460,6 +519,40 @@ export class ChainEventPoller {
       });
     } catch (err) {
       this.log.warn(ctx, `onKARegisteredToContextGraph callback failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  private async handleKACreated(event: ChainEvent, ctx: OperationContext): Promise<void> {
+    if (!this.onKnowledgeAssetCreated) return;
+    const { data } = event;
+    const kaId = BigInt((data['kaId'] as string) ?? '0');
+    if (kaId === 0n) return;
+    const author = String(data['author'] ?? '').toLowerCase();
+    const txHash = String(data['txHash'] ?? '');
+    const rawTxIndex = data['txIndex'];
+    const txIndex = typeof rawTxIndex === 'number' && Number.isFinite(rawTxIndex) && rawTxIndex >= 0
+      ? rawTxIndex
+      : 0;
+    // OT-RFC-43 Option-1 — the per-author ordinal lives in the low 96 bits of
+    // the kaId. Use full-precision bigint math; never coerce through Number()
+    // (the value can exceed Number.MAX_SAFE_INTEGER and silently lose digits).
+    const number = kaId & ((1n << 96n) - 1n);
+
+    this.log.info(ctx,
+      `Chain event: KnowledgeAssetCreated block=${event.blockNumber} kaId=${kaId} author=${author.slice(0, 10)}… number=${number}`,
+    );
+
+    try {
+      await this.onKnowledgeAssetCreated({
+        kaId,
+        author,
+        number,
+        txHash,
+        txIndex,
+        blockNumber: event.blockNumber,
+      });
+    } catch (err) {
+      this.log.warn(ctx, `onKnowledgeAssetCreated callback failed: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 }

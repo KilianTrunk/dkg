@@ -515,3 +515,166 @@ describe('ApiClient', () => {
     });
   });
 });
+
+describe('ApiClient — GitHub-shaped knowledge-assets SDK (OT-RFC-43 §10.5)', () => {
+  const originalFetch = globalThis.fetch;
+  let client: ApiClient;
+  const base = `http://127.0.0.1:${PORT}`;
+  beforeEach(() => { client = new ApiClient(PORT, 'test-token'); });
+  afterEach(() => { globalThis.fetch = originalFetch; });
+
+  function track(body: unknown = { ok: true }) {
+    const { fetch, calls } = createTrackingFetch({ ok: true, status: 200, body });
+    globalThis.fetch = fetch;
+    return calls;
+  }
+
+  it('createKnowledgeAsset POSTs to /api/knowledge-assets', async () => {
+    const calls = track({ name: 'f', status: 'wm-sealed' });
+    await client.createKnowledgeAsset('cg', 'f', { quads: [{ subject: 's', predicate: 'p', object: 'o', graph: '' }], alsoShareSwm: true });
+    expect(calls[0].url).toBe(`${base}/api/knowledge-assets`);
+    expect(calls[0].opts.method).toBe('POST');
+    const sent = JSON.parse(calls[0].opts.body as string);
+    expect(sent).toMatchObject({ contextGraphId: 'cg', name: 'f', alsoShareSwm: true });
+    expect(sent.quads).toHaveLength(1);
+  });
+
+  it('createKnowledgeAsset normalizes finalized publish and author seal options', async () => {
+    const calls = track({ name: 'f', status: 'vm-confirmed' });
+    const preSignedAuthorAttestation = {
+      address: '0x1111111111111111111111111111111111111111',
+      signature: { r: `0x${'22'.repeat(32)}`, vs: `0x${'33'.repeat(32)}` },
+    };
+    await client.createKnowledgeAsset('cg', 'f', {
+      quads: [{ subject: 's', predicate: 'p', object: 'o', graph: '' }],
+      preSignedAuthorAttestation,
+      schemeVersion: 2,
+      alsoPublishVm: {
+        clearAfter: false,
+        publishEpochs: 9,
+        publisherNodeIdentityIdOverride: 7n,
+      },
+    });
+    const sent = JSON.parse(calls[0].opts.body as string);
+    expect(sent).toMatchObject({
+      contextGraphId: 'cg',
+      name: 'f',
+      preSignedAuthorAttestation,
+      schemeVersion: 2,
+      alsoPublishVm: {
+        clearSharedMemoryAfter: false,
+        publishEpochs: 9,
+        publisherNodeIdentityIdOverride: '7',
+      },
+    });
+    expect(sent.alsoPublishVm).not.toHaveProperty('epochs');
+    expect(sent.alsoPublishVm).not.toHaveProperty('tokenAmount');
+  });
+
+  it('createKnowledgeAsset treats empty alsoPublishVm options as default publish', async () => {
+    const calls = track({ name: 'f', status: 'vm-confirmed' });
+    await client.createKnowledgeAsset('cg', 'f', { alsoPublishVm: {} });
+    const sent = JSON.parse(calls[0].opts.body as string);
+    expect(sent.alsoPublishVm).toEqual({});
+  });
+
+  it('createKnowledgeAsset rejects unsupported alsoPublishVm options before HTTP serialization', async () => {
+    const calls = track({ ok: true });
+    await expect(client.createKnowledgeAsset('cg', 'f', {
+      alsoPublishVm: { publishEpoch: 3 },
+    } as any)).rejects.toThrow('Unsupported finalized publish option(s): publishEpoch');
+    expect(calls).toHaveLength(0);
+  });
+
+  it('createKnowledgeAsset rejects array alsoPublishVm before HTTP serialization', async () => {
+    const calls = track({ ok: true });
+    await expect(client.createKnowledgeAsset('cg', 'f', {
+      alsoPublishVm: [],
+    } as any)).rejects.toThrow('alsoPublishVm must be a boolean or publish-options object');
+    expect(calls).toHaveLength(0);
+  });
+
+  it('knowledgeAssetWrite POSTs to .../:name/wm/write (name URL-encoded)', async () => {
+    const calls = track({ written: 1 });
+    await client.knowledgeAssetWrite('cg', 'meeting notes', [{ subject: 's', predicate: 'p', object: 'o', graph: '' }]);
+    expect(calls[0].url).toBe(`${base}/api/knowledge-assets/meeting%20notes/wm/write`);
+    expect(JSON.parse(calls[0].opts.body as string)).toMatchObject({ contextGraphId: 'cg' });
+  });
+
+  it('knowledgeAssetFinalize sends pre-signed author attestation and scheme version', async () => {
+    const calls = track({ merkleRoot: '0xabc', eip712Digest: '0xdig' });
+    const preSignedAuthorAttestation = {
+      address: '0x1111111111111111111111111111111111111111',
+      signature: { r: `0x${'22'.repeat(32)}`, vs: `0x${'33'.repeat(32)}` },
+    };
+    await client.knowledgeAssetFinalize('cg', 'f', {
+      preSignedAuthorAttestation,
+      schemeVersion: 2,
+    });
+    expect(calls[0].url).toBe(`${base}/api/knowledge-assets/f/wm/finalize`);
+    expect(JSON.parse(calls[0].opts.body as string)).toMatchObject({
+      contextGraphId: 'cg',
+      preSignedAuthorAttestation,
+      schemeVersion: 2,
+    });
+  });
+
+  it('knowledgeAssetFinalize rejects self-sign + external-signer conflict before HTTP serialization', async () => {
+    const calls = track({ merkleRoot: '0xabc', eip712Digest: '0xdig' });
+    await expect(
+      client.knowledgeAssetFinalize('cg', 'f', {
+        authorAgentAddress: '0x1111111111111111111111111111111111111111',
+        preSignedAuthorAttestation: {
+          address: '0x2222222222222222222222222222222222222222',
+          signature: { r: `0x${'22'.repeat(32)}`, vs: `0x${'33'.repeat(32)}` },
+        },
+      }),
+    ).rejects.toThrow('authorAgentAddress and preSignedAuthorAttestation are mutually exclusive');
+    expect(calls).toHaveLength(0);
+  });
+
+  it('knowledgeAssetShare → swm/share, knowledgeAssetPublish → vm/publish', async () => {
+    let calls = track({ swmShared: true, promotedCount: 2 });
+    await client.knowledgeAssetShare('cg', 'f');
+    expect(calls[0].url).toBe(`${base}/api/knowledge-assets/f/swm/share`);
+
+    calls = track({ kaId: '7', status: 'confirmed' });
+    await client.knowledgeAssetPublish('cg', 'f', {
+      subGraphName: 'notes',
+      clearAfter: true,
+      publishEpochs: 12,
+      publisherNodeIdentityIdOverride: 123n,
+    });
+    expect(calls[0].url).toBe(`${base}/api/knowledge-assets/f/vm/publish`);
+    expect(JSON.parse(calls[0].opts.body as string)).toMatchObject({
+      contextGraphId: 'cg',
+      subGraphName: 'notes',
+      options: {
+        clearSharedMemoryAfter: true,
+        publishEpochs: 12,
+        publisherNodeIdentityIdOverride: '123',
+      },
+    });
+  });
+
+  it('knowledgeAssetPublish rejects unsupported option keys before HTTP serialization', async () => {
+    const calls = track({ ok: true });
+    await expect(client.knowledgeAssetPublish('cg', 'f', {
+      publishEpoch: 3,
+    } as any)).rejects.toThrow('Unsupported finalized publish option(s): publishEpoch');
+    expect(calls).toHaveLength(0);
+  });
+
+  it('knowledgeAssetPullFrom sends layer + onConflict', async () => {
+    const calls = track({ wmDraft: 'open' });
+    await client.knowledgeAssetPullFrom('cg', 'f', 'vm', { onConflict: 'replace' });
+    expect(calls[0].url).toBe(`${base}/api/knowledge-assets/f/wm/pull-from`);
+    expect(JSON.parse(calls[0].opts.body as string)).toMatchObject({ contextGraphId: 'cg', layer: 'vm', onConflict: 'replace' });
+  });
+
+  it('getKnowledgeAsset GETs .../:name?contextGraphId=', async () => {
+    const calls = track({ state: 'created' });
+    await client.getKnowledgeAsset('cg', 'f');
+    expect(calls[0].url).toBe(`${base}/api/knowledge-assets/f?contextGraphId=cg`);
+  });
+});

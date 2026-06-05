@@ -40,6 +40,7 @@ import type { SkillHandler } from './messaging.js';
 import type { CclFactResolutionMode } from './ccl-fact-resolution.js';
 import type { JsonLdContent } from './dkg-agent-utils.js';
 import type { SwmHostModeStoreLimits } from './swm/host-mode-store.js';
+import type { KaNumberAllocator } from './allocator.js';
 import type { SyncPhase } from './sync/auth/request-build.js';
 
 // ── File-local structural types ─────────────────────────────────────
@@ -772,6 +773,13 @@ export interface DKGAgentConfig {
   syncSharedMemoryOnConnect?: boolean;
   /** Node deployment tier: 'core' (cloud, relay) or 'edge' (personal, behind NAT). Default: 'edge'. */
   nodeRole?: 'core' | 'edge';
+  /**
+   * OT-RFC-43 Option 1 — durable per-author KA-number allocator. When provided,
+   * the publisher mints deterministic packed reservedKaIds (and reconciles the
+   * per-author floor against the chain). Constructed in the daemon lifecycle on
+   * the shared dashboard DB; omit for in-process tests / pre-Option-1 flows.
+   */
+  kaNumberAllocator?: KaNumberAllocator;
   /**
    * Core Node relay-server capacity tuning. Forwarded straight into
    * `DKGNodeConfig.relayServerCapacity` — sets the maximum number of

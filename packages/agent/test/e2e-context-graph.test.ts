@@ -11,6 +11,7 @@
  * allowing B to verify A's publish transaction during finalization.
  */
 import { describe, it, expect, afterAll, beforeAll } from 'vitest';
+import { makeTestKaNumberAllocator } from "./_helpers/ka-allocator.js";
 import { DKGAgent } from '../src/index.js';
 import { createEVMAdapter, getSharedContext, createProvider, takeSnapshot, revertSnapshot, HARDHAT_KEYS } from '../../chain/test/evm-test-context.js';
 import { mintTokens } from '../../chain/test/hardhat-harness.js';
@@ -47,6 +48,7 @@ describe('E2E: context graph publish + finalization (shared chain)', () => {
 
   it('bootstraps two agents with shared chain, connects, subscribes', async () => {
     nodeA = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'CtxA',
       listenPort: 0,
       skills: [],
@@ -54,6 +56,7 @@ describe('E2E: context graph publish + finalization (shared chain)', () => {
       nodeRole: 'core',
     });
     nodeB = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'CtxB',
       listenPort: 0,
       skills: [],

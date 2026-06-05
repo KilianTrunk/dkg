@@ -27,6 +27,7 @@ import { createEVMAdapter, getSharedContext, createProvider, takeSnapshot, rever
 import { mintTokens } from '../../chain/test/hardhat-harness.js';
 import { wrapPublisherForTest, buildSeal } from './_helpers/seal.js';
 import { makeHardhatReceiverACKProvider } from './_helpers/acks.js';
+import { makeTestKaAllocator } from './_helpers/ka-allocator.js';
 import type { V10ACKProvider } from '../src/publisher.js';
 
 // RC11 / PR1: in-memory 3-of-N ACK provider that signs the V10 ACK
@@ -154,6 +155,7 @@ describe('Workspace: share', () => {
     const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
     const keypair = await generateEd25519Keypair();
     publisher = new DKGPublisher({
+      kaAllocator: makeTestKaAllocator(),
       store,
       chain,
       eventBus: new TypedEventBus(),
@@ -296,6 +298,7 @@ describe('Workspace: publishFromSharedMemory', () => {
     chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
     const keypair = await generateEd25519Keypair();
     publisher = new DKGPublisher({
+      kaAllocator: makeTestKaAllocator(),
       store,
       chain,
       eventBus: new TypedEventBus(),
@@ -496,6 +499,7 @@ describe('Workspace: ownership persistence and reconstruction', () => {
     const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
     const keypair = await generateEd25519Keypair();
     publisher = new DKGPublisher({
+      kaAllocator: makeTestKaAllocator(),
       store,
       chain,
       eventBus: new TypedEventBus(),
@@ -544,6 +548,7 @@ describe('Workspace: ownership persistence and reconstruction', () => {
     const keypair = await generateEd25519Keypair();
     const freshOwned = new Map<string, Map<string, string>>();
     const freshPublisher = new DKGPublisher({
+      kaAllocator: makeTestKaAllocator(),
       store,
       chain,
       eventBus: new TypedEventBus(),
@@ -1918,6 +1923,7 @@ describe('Workspace: conditionalShare (CAS)', () => {
     const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
     const keypair = await generateEd25519Keypair();
     publisher = new DKGPublisher({
+      kaAllocator: makeTestKaAllocator(),
       store,
       chain,
       eventBus: new TypedEventBus(),

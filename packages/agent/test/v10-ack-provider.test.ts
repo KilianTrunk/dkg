@@ -1,4 +1,5 @@
 import { afterEach, beforeAll, afterAll, describe, expect, it } from 'vitest';
+import { makeTestKaNumberAllocator } from "./_helpers/ka-allocator.js";
 import { DKGAgent } from '../src/index.js';
 import { NoChainAdapter, type ChainAdapter } from '@origintrail-official/dkg-chain';
 import { OxigraphStore } from '@origintrail-official/dkg-storage';
@@ -23,6 +24,7 @@ afterAll(async () => {
 async function createAgent(chainAdapter: ChainAdapter, operationalKeys?: string[]) {
   const store = new OxigraphStore();
   const agent = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
     name: 'AckProviderTestAgent',
     listenPort: 0,
     listenHost: '127.0.0.1',

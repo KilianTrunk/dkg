@@ -10,6 +10,7 @@
  * encrypted chat to validate the circuit-relay path separately.
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { makeTestKaNumberAllocator } from "./_helpers/ka-allocator.js";
 import { DKGAgent } from '../src/index.js';
 import { DKGNode } from '@origintrail-official/dkg-core';
 import { createEVMAdapter, getSharedContext, createProvider, takeSnapshot, revertSnapshot, HARDHAT_KEYS } from '../../chain/test/evm-test-context.js';
@@ -67,6 +68,7 @@ describe('Network E2E (3 nodes + relay)', () => {
     expect(relayAddr).toBeDefined();
 
     nodeA = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'NodeA',
       framework: 'OpenClaw',
       listenPort: 0,
@@ -80,6 +82,7 @@ describe('Network E2E (3 nodes + relay)', () => {
     });
 
     nodeB = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'NodeB',
       framework: 'ElizaOS',
       listenPort: 0,
@@ -97,6 +100,7 @@ describe('Network E2E (3 nodes + relay)', () => {
     });
 
     nodeC = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'NodeC',
       framework: 'DKG',
       listenPort: 0,

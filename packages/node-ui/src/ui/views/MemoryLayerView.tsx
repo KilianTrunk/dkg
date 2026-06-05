@@ -634,10 +634,8 @@ function PublishPanel({ contextGraphId, onPublished }: { contextGraphId: string;
 
   const handlePublishSelected = useCallback(async () => {
     if (selected.size === 0) return;
-    if (selected.size > 1) {
-      setError('V10 publish requires exactly one root entity per request. Select one root and publish again.');
-      return;
-    }
+    // OT-RFC-44 / Design B: the full selection publishes as ONE Knowledge Asset
+    // whose member entities are the selected roots (any count). No single-root guard.
     setPublishing(true);
     setPublishResult(null);
     setError(null);
@@ -656,10 +654,8 @@ function PublishPanel({ contextGraphId, onPublished }: { contextGraphId: string;
   }, [selected, contextGraphId, refresh, onPublished]);
 
   const handlePublishAll = useCallback(async () => {
-    if (allUris.length !== 1) {
-      setError('V10 publish requires exactly one root entity per request. Select one root and publish again.');
-      return;
-    }
+    if (allUris.length < 1) return;
+    // OT-RFC-44 / Design B: publish all roots as ONE Knowledge Asset (any count).
     setPublishing(true);
     setPublishResult(null);
     setError(null);

@@ -28,6 +28,7 @@
  * No mocks — real `FinalizationHandler`, real store, real `DKGAgent`.
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { makeTestKaNumberAllocator } from "./_helpers/ka-allocator.js";
 import { ethers } from 'ethers';
 import { OxigraphStore } from '@origintrail-official/dkg-storage';
 import { createOperationContext } from '@origintrail-official/dkg-core';
@@ -59,6 +60,7 @@ beforeAll(async () => {
   );
   const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
   nodeA = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
     name: 'A4Promoter',
     listenPort: 0,
     skills: [],

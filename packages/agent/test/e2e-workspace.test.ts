@@ -3,6 +3,7 @@
  * query workspace → publishFromSharedMemory → query data graph.
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { makeTestKaNumberAllocator } from "./_helpers/ka-allocator.js";
 import { DKGAgent } from '../src/index.js';
 import { createEVMAdapter, getSharedContext, createProvider, takeSnapshot, revertSnapshot, HARDHAT_KEYS } from '../../chain/test/evm-test-context.js';
 import { mintTokens } from '../../chain/test/hardhat-harness.js';
@@ -42,12 +43,14 @@ describe('Workspace E2E (2 nodes)', () => {
 
   it('bootstraps two agent nodes and connects them', async () => {
     nodeA = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'WorkspaceA',
       listenPort: 0,
       chainAdapter: createEVMAdapter(HARDHAT_KEYS.CORE_OP),
       nodeRole: 'core',
     });
     nodeB = await DKGAgent.create({
+      kaNumberAllocator: makeTestKaNumberAllocator(),
       name: 'WorkspaceB',
       listenPort: 0,
       chainAdapter: createEVMAdapter(HARDHAT_KEYS.CORE_OP),

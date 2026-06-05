@@ -39,8 +39,11 @@ describe('encodeFinalizationMessage uint64 bounds', () => {
   });
 
   it('throws RangeError when any uint64 field overflows', () => {
+    // batchId is now the 256-bit-safe decimal-string KA-id wire (OT-RFC-43 §9),
+    // so it can never uint64-overflow. blockNumber is still a genuine uint64
+    // field guarded by bigIntToProtoSafe — keep the overflow coverage there.
     expect(() =>
-      encodeFinalizationMessage(minimalFinalization({ batchId: MAX_UINT64 + 1n }) as any),
+      encodeFinalizationMessage(minimalFinalization({ blockNumber: MAX_UINT64 + 1n }) as any),
     ).toThrow(RangeError);
     expect(() =>
       encodeFinalizationMessage(minimalFinalization({ timestampMs: -1n }) as any),

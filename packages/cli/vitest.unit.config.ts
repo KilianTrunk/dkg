@@ -64,7 +64,7 @@ export default defineConfig({
           'test/notifications-route.test.ts',
           // Local-agent bridge routes are mocked HTTP/runtime tests; include
           // timeout attribution regressions in the fast unit lane too.
-          'test/daemon-openclaw.test.ts',
+          'test/daemon-openclaw.part-*.test.ts',
           'test/daemon-hermes.test.ts',
         ],
     testTimeout: runsDaemonHttpBehavior ? 120_000 : 60_000,

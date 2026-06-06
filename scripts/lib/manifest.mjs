@@ -85,7 +85,7 @@ export function importUri(importId) {
  * and get a valid IRI back. But the daemon's `validateAssertionName`
  * (`packages/core/src/constants.ts`) rejects `/`, whitespace, and other
  * IRI-unsafe characters from assertion names — so the SAME `importId` would
- * crash `/api/assertion/create` with a 400 if we passed it through verbatim.
+ * crash `/api/knowledge-assets` (create) with a 400 if we passed it through verbatim.
  *
  * This helper:
  *   - replaces any character outside `[A-Za-z0-9._-]` with `-`
@@ -464,13 +464,13 @@ export async function createImportManifest({
   const assertion = assertionName ?? defaultManifestAssertionName(importId);
   let createdFresh = true;
   try {
-    await client.request('POST', '/api/assertion/create', {
+    await client.request('POST', '/api/knowledge-assets', {
       contextGraphId: cgId,
       name: assertion,
       subGraphName,
     });
   } catch (err) {
-    // `/api/assertion/create` is intentionally idempotent on the daemon
+    // `/api/knowledge-assets` (create) is intentionally idempotent on the daemon
     // side. A retry after a transient failure, or a second process resuming
     // the same import, may find the manifest assertion already staged. Treat
     // that as success and continue with the additive write/promote below so

@@ -96,9 +96,9 @@ received via gossip.
 
 ```bash
 curl -X POST $BASE_URL/api/context-graph/create -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{"id":"my-project","name":"My Project"}'
-curl -X POST $BASE_URL/api/assertion/create -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{"contextGraphId":"my-project","name":"notes"}'
-curl -X POST $BASE_URL/api/assertion/notes/write -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{"contextGraphId":"my-project","quads":[{"subject":"https://example.org/alice","predicate":"https://schema.org/name","object":"\"Alice\"","graph":""}]}'
-curl -X POST $BASE_URL/api/assertion/notes/promote -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{"contextGraphId":"my-project","entities":"all"}'
+curl -X POST $BASE_URL/api/knowledge-assets -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{"contextGraphId":"my-project","name":"notes"}'
+curl -X POST $BASE_URL/api/knowledge-assets/notes/wm/write -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{"contextGraphId":"my-project","quads":[{"subject":"https://example.org/alice","predicate":"https://schema.org/name","object":"\"Alice\"","graph":""}]}'
+curl -X POST $BASE_URL/api/knowledge-assets/notes/swm/share -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{"contextGraphId":"my-project","entities":"all"}'
 curl -X POST $BASE_URL/api/shared-memory/publish -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{"contextGraphId":"my-project"}'
 curl -X POST $BASE_URL/api/query -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{"sparql":"SELECT * WHERE { ?s ?p ?o } LIMIT 10","contextGraphId":"my-project","view":"working-memory","agentAddress":"YOUR_PEER_ID"}'
 ```
@@ -164,16 +164,16 @@ Drop to HTTP when the operation isn't in the table — participant self-service 
 | `dkg_join_request_list` | `GET /api/context-graph/{id}/join-requests` | List pending join requests for a context graph |
 | `dkg_join_request_approve` | `POST /api/context-graph/{id}/approve-join` | Approve a pending join request by agent address |
 | `dkg_join_request_reject` | `POST /api/context-graph/{id}/reject-join` | Reject a pending join request by agent address |
-| `dkg_assertion_create` | `POST /api/assertion/create` | Start a WM assertion |
-| `dkg_assertion_write` | `POST /api/assertion/{name}/write` | Append triples to a WM assertion |
-| `dkg_assertion_promote` | `POST /api/assertion/{name}/promote` | Move a WM assertion's triples to SWM |
-| `dkg_assertion_discard` | `POST /api/assertion/{name}/discard` | Drop a WM assertion |
-| `dkg_assertion_import_file` | `POST /api/assertion/{name}/import-file` | Multipart upload a document + extract triples |
-| `dkg_assertion_query` | `POST /api/assertion/{name}/query` | Dump every quad in a single assertion (not SPARQL) |
-| `dkg_assertion_history` | `GET /api/assertion/{name}/history` | Read an assertion's lifecycle descriptor |
-| `dkg_import_artifact_read_markdown` | `POST /api/assertion/import-artifact/read-markdown` | Safely read Markdown for a completed imported attachment by content-addressed hash |
-| `dkg_import_artifact_resolve` | `POST /api/assertion/import-artifact/resolve` | Optional metadata re-check for completed imported attachments |
-| `dkg_semantic_enrichment_write` | `POST /api/assertion/semantic-enrichment/write` | Append model-derived semantic triples and provenance to the imported assertion |
+| `dkg_assertion_create` | `POST /api/knowledge-assets` | Start a WM assertion |
+| `dkg_assertion_write` | `POST /api/knowledge-assets/{name}/wm/write` | Append triples to a WM assertion |
+| `dkg_assertion_promote` | `POST /api/knowledge-assets/{name}/swm/share` | Move a WM assertion's triples to SWM |
+| `dkg_assertion_discard` | `POST /api/knowledge-assets/{name}/wm/discard` | Drop a WM assertion |
+| `dkg_assertion_import_file` | `POST /api/knowledge-assets/{name}/wm/import-file` | Multipart upload a document + extract triples |
+| `dkg_assertion_query` | `GET /api/knowledge-assets/{name}/wm/quads` | Dump every quad in a single assertion (not SPARQL) |
+| `dkg_assertion_history` | `GET /api/knowledge-assets/{name}` | Read an assertion's lifecycle descriptor |
+| `dkg_import_artifact_read_markdown` | `POST /api/knowledge-assets/import-artifact/read-markdown` | Safely read Markdown for a completed imported attachment by content-addressed hash |
+| `dkg_import_artifact_resolve` | `POST /api/knowledge-assets/import-artifact/resolve` | Optional metadata re-check for completed imported attachments |
+| `dkg_semantic_enrichment_write` | `POST /api/knowledge-assets/semantic-enrichment/write` | Append model-derived semantic triples and provenance to the imported assertion |
 | `dkg_publish` | `POST /api/shared-memory/write` + `POST /api/shared-memory/publish` | **Two-call helper**: first writes supplied quads to SWM via `/write`, then publishes all SWM → VM (TRAC). Calling only the `/publish` route skips the write — if dropping to raw HTTP, use both calls in order |
 | `dkg_shared_memory_publish` | `POST /api/shared-memory/publish` | **Canonical finalizer** after `dkg_assertion_promote`: publish SWM → VM, no fresh quads |
 | `dkg_share` | `POST /api/shared-memory/write` | Directly write concise team-visible knowledge to SWM without staging a WM assertion. Prefer the WM assertion → promote flow for durable/canonical work. Both Hermes and OpenClaw expose the same tool schema (required `content` and `context_graph_id`, optional `sub_graph_name`), so MCP-discovered call signatures are portable. The OpenClaw implementation additionally validates content as non-whitespace, mints a unique subject per share (returned in the response), and N-Triples-quotes content; Hermes is currently looser on those points — the parallel hardening is tracked in OriginTrail/dkg#414. |
@@ -190,7 +190,7 @@ Drop to HTTP when the operation isn't in the table — participant self-service 
 
 P2P tools fail gracefully when the peer is offline. `dkg_publish` (fresh quads + write + publish, two HTTP calls) and `dkg_shared_memory_publish` (publish existing SWM, one HTTP call) differ in intent: use the two-call helper for "I have quads, publish now"; use the canonical finalizer as step 4 of the stepwise write → promote → publish flow. `dkg_share` is a direct SWM convenience helper for quick team-visible notes, not a replacement for assertion lifecycle tracking.
 
-**Bulk imports (>5,000 quads in one logical operation):** the per-call `dkg_assertion_*` loop IS the chunked-write API; there is no `/api/import/bulk`. Keep `/api/assertion/<name>/write` payloads under the 10 MB body cap, keep `/api/assertion/<name>/promote` payloads under the 256 KB body cap, and remember that promotion can still fail at the 10 MB gossip-message cap even when the HTTP body is small. For multi-part imports, write a resumable manifest in the `meta` sub-graph (`scripts/lib/manifest.mjs` is the canonical helper), promote import roots in size-aware batches, and halve/retry on 413 rather than restarting the whole import. The expanded contract — chunking budgets, manifest pattern, HTTP 413 recipes, async-promote queue (`/api/assertion/<name>/promote-async`) — is served at `GET /.well-known/skill-importer.md` (the daemon's second canonical skill endpoint, same auth-public + ETag-cacheable shape as `/.well-known/skill.md`). Source checkouts also have the same file at `packages/cli/skills/dkg-importer/SKILL.md`.
+**Bulk imports (>5,000 quads in one logical operation):** the per-call `dkg_assertion_*` loop IS the chunked-write API; there is no `/api/import/bulk`. Keep `/api/knowledge-assets/<name>/wm/write` payloads under the 10 MB body cap, keep `/api/knowledge-assets/<name>/swm/share` payloads under the 256 KB body cap, and remember that promotion can still fail at the 10 MB gossip-message cap even when the HTTP body is small. For multi-part imports, write a resumable manifest in the `meta` sub-graph (`scripts/lib/manifest.mjs` is the canonical helper), promote import roots in size-aware batches, and halve/retry on 413 rather than restarting the whole import. The expanded contract — chunking budgets, manifest pattern, HTTP 413 recipes, async-promote queue (`/api/knowledge-assets/<name>/swm/share-async`) — is served at `GET /.well-known/skill-importer.md` (the daemon's second canonical skill endpoint, same auth-public + ETag-cacheable shape as `/.well-known/skill.md`). Source checkouts also have the same file at `packages/cli/skills/dkg-importer/SKILL.md`.
 
 ### HTTP-only operations (no tool wrapper)
 
@@ -213,22 +213,21 @@ writable only by your peer ID, never gossiped. Use them to stage knowledge
 before promoting it to SWM (team) or through to VM (chain-anchored).
 **This is where you write first.**
 
-- `POST /api/assertion/create` — create a named private assertion
+- `POST /api/knowledge-assets` — create a named private assertion
   Body: `{ "contextGraphId": "...", "name": "...", "subGraphName"?: "..." }`
-- `POST /api/assertion/{name}/write` — write triples to an assertion
+- `POST /api/knowledge-assets/{name}/wm/write` — write triples to an assertion
   Body: `{ "contextGraphId": "...", "quads": [...], "subGraphName"?: "..." }`
-- `POST /api/assertion/{name}/query` — read assertion contents as quads
-  Body: `{ "contextGraphId": "...", "subGraphName"?: "..." }`
-- `POST /api/assertion/{name}/promote` — promote assertion triples to SWM (synchronous; returns once SWM insert + gossip complete)
+- `GET /api/knowledge-assets/{name}/wm/quads?contextGraphId=...&subGraphName=...` — read assertion contents as quads
+- `POST /api/knowledge-assets/{name}/swm/share` — promote assertion triples to SWM (synchronous; returns once SWM insert + gossip complete)
   Body: `{ "contextGraphId": "...", "entities"?: [...] | "all", "subGraphName"?: "..." }`
-- `POST /api/assertion/{name}/promote-async` — enqueue the same promote for an in-daemon worker to handle in the background. Returns `202 { jobId, state: "queued" }` immediately. Use this for bulk importers where waiting for the synchronous round-trip is the bottleneck (the Graphify import RFC `docs/specs/SPEC_ASYNC_PROMOTE_QUEUE.md` explains the motivation). See §8 "Async promote queue" for the inspection routes.
-- `POST /api/assertion/{name}/discard` — drop the assertion graph
+- `POST /api/knowledge-assets/{name}/swm/share-async` — enqueue the same promote for an in-daemon worker to handle in the background. Returns `202 { jobId, state: "queued" }` immediately. Use this for bulk importers where waiting for the synchronous round-trip is the bottleneck (the Graphify import RFC `docs/specs/SPEC_ASYNC_PROMOTE_QUEUE.md` explains the motivation). See §8 "Async promote queue" for the inspection routes.
+- `POST /api/knowledge-assets/{name}/wm/discard` — drop the assertion graph
   Body: `{ "contextGraphId": "...", "subGraphName"?: "..." }`
-- `POST /api/assertion/{name}/import-file` — import a document (multipart/form-data) — see §7
-- `GET /api/assertion/{name}/extraction-status?contextGraphId=...` — poll the status of an import-file extraction job
-- `GET /api/assertion/{name}/history?contextGraphId=...&agentAddress=...&subGraphName=...` — read the assertion's lifecycle descriptor (created → promoted → published → finalized | discarded) from the CG's `_meta` graph. Returns `{ state, timestamps, operationIds, rootEntities, kcUalRefs }` or 404 if no lifecycle record exists.
+- `POST /api/knowledge-assets/{name}/wm/import-file` — import a document (multipart/form-data) — see §7
+- `GET /api/knowledge-assets/{name}/wm/extraction-status?contextGraphId=...` — poll the status of an import-file extraction job
+- `GET /api/knowledge-assets/{name}?contextGraphId=...&agentAddress=...&subGraphName=...` — read the assertion's lifecycle descriptor (created → promoted → published → finalized | discarded) from the CG's `_meta` graph. Returns `{ state, timestamps, operationIds, rootEntities, kcUalRefs }` or 404 if no lifecycle record exists.
 
-> **Lifecycle provenance.** Every assertion carries a durable `dkg:Assertion` lifecycle record in the CG's `_meta` graph, updated as a side effect of `/create`, `/write`, `/promote`, `/discard`, and publish. The assertion data moves WM→SWM→VM on promotion — the lifecycle record is an independent audit trail you can read without touching the data itself.
+> **Lifecycle provenance.** Every assertion carries a durable `dkg:Assertion` lifecycle record in the CG's `_meta` graph, updated as a side effect of create, `/wm/write`, `/swm/share`, `/wm/discard`, and publish. The assertion data moves WM→SWM→VM on promotion — the lifecycle record is an independent audit trail you can read without touching the data itself.
 
 > If `subGraphName` is provided but the sub-graph is not registered in the CG's
 > `_meta` graph, all assertion operations throw
@@ -237,7 +236,7 @@ before promoting it to SWM (team) or through to VM (chain-anchored).
 
 ### Shared Working Memory (SWM) — Team-visible
 
-SWM is for knowledge you've promoted from WM and want peers to see. Data arrives here via `POST /api/assertion/{name}/promote` (from WM) or via direct SWM writes (escape hatch for team-visible data that doesn't need a WM staging step).
+SWM is for knowledge you've promoted from WM and want peers to see. Data arrives here via `POST /api/knowledge-assets/{name}/swm/share` (from WM) or via direct SWM writes (escape hatch for team-visible data that doesn't need a WM staging step).
 
 > **Visibility.** SWM gossips to peers in the context graph's allowlist.
 > For a **curated** CG (the default — see §6), only listed agents/peers
@@ -397,9 +396,9 @@ feed entity-list UI surfaces.
 
 Respect these when producing writes — they're enforced at the node and produce errors rather than silent truncation.
 
-- **Reorganizing assertions.** There is no rename-assertion or move-between-sub-graphs endpoint. To reorganize, create a new assertion (with `subGraphName?` for a different partition), copy the triples over via `/write`, then `/discard` the original. A new assertion starts a fresh lifecycle record in `_meta`.
+- **Reorganizing assertions.** There is no rename-assertion or move-between-sub-graphs endpoint. To reorganize, create a new assertion (with `subGraphName?` for a different partition), copy the triples over via `/wm/write`, then `/wm/discard` the original. A new assertion starts a fresh lifecycle record in `_meta`.
 - **Reserved subject IRIs.** Subjects matching `urn:dkg:file:*` or `urn:dkg:extraction:*` are reserved for internal file/extraction metadata and are rejected at write time. Use a different subject IRI.
-- **SWM gossip size cap (10 MB).** A single promote or SWM write must fit in one 10 MB gossip message. Split larger assertions by root entity before promoting — use the `entities` parameter on `/promote` to promote subsets.
+- **SWM gossip size cap (10 MB).** A single promote or SWM write must fit in one 10 MB gossip message. Split larger assertions by root entity before promoting — use the `entities` parameter on `/swm/share` to promote subsets.
 - **SWM entity ownership (first-writer-wins).** The first peer to write a root entity in SWM becomes its owner; other peers' promotes or writes against that same root entity are rejected with an ownership error. Partition work by agent-owned root entities to avoid conflicts.
 - **Blank nodes are auto-skolemized.** Any `_:b0`-style blank nodes you submit are deterministically rewritten to UUID-backed URIs before storage, so IDs stay stable across sync and on-chain anchoring. Prefer explicit IRIs in production data.
 
@@ -527,7 +526,7 @@ A **sub-graph** is a named partition inside a context graph. Use them to organiz
 - `POST /api/sub-graph/create` — register a new sub-graph. Body: `{ contextGraphId, subGraphName }`.
 - `GET /api/sub-graph/list?contextGraphId=...` — list all sub-graphs registered in a CG.
 
-To put an assertion in a sub-graph, pass `subGraphName` on `/api/assertion/create`, `/write`, `/query`, `/promote`, `/discard`, `/import-file`, `/history`, and on `/api/query` when scoping queries.
+To put an assertion in a sub-graph, pass `subGraphName` on `/api/knowledge-assets` (create), `/wm/write`, `/wm/quads`, `/swm/share`, `/wm/discard`, `/wm/import-file`, the `GET /api/knowledge-assets/{name}` descriptor, and on `/api/query` when scoping queries.
 
 ### Participants and join flow
 
@@ -549,9 +548,9 @@ Upload a document (PDF, DOCX, HTML, CSV, Markdown, etc.) and let the node
 extract RDF triples into a WM assertion. Non-Markdown formats may pass through a
 registered converter first; Markdown is parsed directly for frontmatter,
 wikilinks, hashtags, Dataview inline fields, and headings. Extracted triples land
-through the same path as `POST /api/assertion/{name}/write`.
+through the same path as `POST /api/knowledge-assets/{name}/wm/write`.
 
-`POST /api/assertion/{name}/import-file` uses multipart form data:
+`POST /api/knowledge-assets/{name}/wm/import-file` uses multipart form data:
 
 | Field | Required | Description |
 |---|---|---|
@@ -562,8 +561,8 @@ through the same path as `POST /api/assertion/{name}/write`.
 | `subGraphName` | no | Target sub-graph, already registered |
 
 ```bash
-curl -X POST $BASE_URL/api/assertion/climate-report/import-file -H "Authorization: Bearer $TOKEN" -F "file=@climate-2026.md;type=text/markdown" -F "contextGraphId=research"
-curl $BASE_URL/api/assertion/climate-report/extraction-status?contextGraphId=research -H "Authorization: Bearer $TOKEN"
+curl -X POST $BASE_URL/api/knowledge-assets/climate-report/wm/import-file -H "Authorization: Bearer $TOKEN" -F "file=@climate-2026.md;type=text/markdown" -F "contextGraphId=research"
+curl $BASE_URL/api/knowledge-assets/climate-report/wm/extraction-status?contextGraphId=research -H "Authorization: Bearer $TOKEN"
 ```
 
 Import responses include `assertionUri`, `fileHash`, `detectedContentType`, and
@@ -572,7 +571,7 @@ an `extraction` object with `status` (`in_progress`, `completed`, `skipped`, or
 `mdIntermediateHash`, `error`, `startedAt`, and `completedAt`. A failed write is
 atomic; do not treat a non-zero `tripleCount` on `failed` as partial-write
 evidence. `skipped` usually means no converter was available, so the file was
-stored but no triples were written. `GET /api/assertion/{name}/extraction-status?contextGraphId=...`
+stored but no triples were written. `GET /api/knowledge-assets/{name}/wm/extraction-status?contextGraphId=...`
 returns `404` if no import-file record exists or the tracker was TTL-pruned.
 
 ### Imported attachment semantic enrichment
@@ -661,17 +660,17 @@ Use the job queue for bulk or long-running publishes, publishes that must surviv
 
 ### Async promote queue (WM → SWM)
 
-Sibling to the publisher queue, but for the WM→SWM transition that a synchronous `POST /api/assertion/{name}/promote` would otherwise perform inline. Use it when the importer is producing assertions faster than the daemon can promote them (bulk Graphify imports, EPCIS batch loads, etc.); the synchronous route stays available for small interactive cases.
+Sibling to the publisher queue, but for the WM→SWM transition that a synchronous `POST /api/knowledge-assets/{name}/swm/share` would otherwise perform inline. Use it when the importer is producing assertions faster than the daemon can promote them (bulk Graphify imports, EPCIS batch loads, etc.); the synchronous route stays available for small interactive cases.
 
 The worker runs in-daemon and is **on by default**. Disable per node with `config.promoteQueue.enabled: false`; tune throughput with `workerConcurrency` (default 4), `pollIntervalMs` (default 100), `heartbeatIntervalMs` (default 60_000), `shutdownTimeoutMs` (default 30_000).
 
 | Method | Route | Purpose |
 |---|---|---|
-| `POST` | `/api/assertion/{name}/promote-async` | Enqueue a promote. Body: `{ contextGraphId, entities?: [...] \| "all", subGraphName? }`. Returns `202 { jobId, state: "queued", enqueuedAt }`. Returns `409 { existingJobId }` if there is already an active job for the same `(contextGraphId, subGraphName, name)`. |
-| `GET`  | `/api/assertion/promote-async` | List jobs. Query: `state=queued,running,failed_retrying,succeeded,failed` (comma-separated), `contextGraphId=...`, `limit=N`. Returns `{ jobs: [...] }`. |
-| `GET`  | `/api/assertion/promote-async/{jobId}` | Read one job (`state`, `attempt.count`, `commitMarker`, `result`, `attempt.lastError` with `classification: transient\|cap_exceeded\|fatal`). |
-| `DELETE` | `/api/assertion/promote-async/{jobId}` | Cancel a `queued` / `failed_retrying` job. `409` if the job is `running` (let the lease expire). |
-| `POST` | `/api/assertion/promote-async/{jobId}/recover` | Re-queue a `failed` job after the operator has fixed whatever was wrong (subdivided an over-large entity set, restarted an upstream, etc.). |
+| `POST` | `/api/knowledge-assets/{name}/swm/share-async` | Enqueue a promote. Body: `{ contextGraphId, entities?: [...] \| "all", subGraphName? }`. Returns `202 { jobId, state: "queued", enqueuedAt }`. Returns `409 { existingJobId }` if there is already an active job for the same `(contextGraphId, subGraphName, name)`. |
+| `GET`  | `/api/knowledge-assets/swm/share-jobs` | List jobs. Query: `state=queued,running,failed_retrying,succeeded,failed` (comma-separated), `contextGraphId=...`, `limit=N`. Returns `{ jobs: [...] }`. |
+| `GET`  | `/api/knowledge-assets/swm/share-jobs/{jobId}` | Read one job (`state`, `attempt.count`, `commitMarker`, `result`, `attempt.lastError` with `classification: transient\|cap_exceeded\|fatal`). |
+| `DELETE` | `/api/knowledge-assets/swm/share-jobs/{jobId}` | Cancel a `queued` / `failed_retrying` job. `409` if the job is `running` (let the lease expire). |
+| `POST` | `/api/knowledge-assets/swm/share-jobs/{jobId}/recover` | Re-queue a `failed` job after the operator has fixed whatever was wrong (subdivided an over-large entity set, restarted an upstream, etc.). |
 
 Failure classifications you'll see in `attempt.lastError.classification`:
 
@@ -679,7 +678,7 @@ Failure classifications you'll see in `attempt.lastError.classification`:
 |---|---|---|---|
 | `transient` | yes (until `maxRetries=5` reached) | `fetch failed` / `ECONNRESET` / `timeout` | Wait — the worker will pick it up after backoff. |
 | `cap_exceeded` | no | `Promoted assertion too large for gossip` (10 MB) or `Request body too large` (256 KB) | Re-enqueue with a smaller `entities` slice — the queue can't subdivide on its own. |
-| `fatal` | no | Bad request, missing assertion, etc. | Inspect the error message, fix the cause, then `POST /api/assertion/promote-async/{jobId}/recover`. |
+| `fatal` | no | Bad request, missing assertion, etc. | Inspect the error message, fix the cause, then `POST /api/knowledge-assets/swm/share-jobs/{jobId}/recover`. |
 
 ### TRAC auto-approve policy (V10 publish + update)
 
@@ -730,9 +729,9 @@ This entire surface was empirically driven by [PR #720](https://github.com/Origi
 **Write → Promote → Publish (the canonical flow):**
 
 1. Create a context graph / project (`POST /api/context-graph/create`)
-2. Create a WM assertion (`POST /api/assertion/create`)
-3. Write triples to Working Memory (`POST /api/assertion/{name}/write`)
-4. When ready to share with peers: promote to SWM (`POST /api/assertion/{name}/promote`)
+2. Create a WM assertion (`POST /api/knowledge-assets`)
+3. Write triples to Working Memory (`POST /api/knowledge-assets/{name}/wm/write`)
+4. When ready to share with peers: promote to SWM (`POST /api/knowledge-assets/{name}/swm/share`)
 5. When ready to publish permanently: publish to VM (`POST /api/shared-memory/publish`)
 
 **Private project for me alone (the default):**
@@ -752,8 +751,8 @@ This entire surface was empirically driven by [PR #720](https://github.com/Origi
 
 **Import a file into a project:**
 
-1. `POST /api/assertion/{name}/import-file` with the document + `contextGraphId`
-2. Poll `GET /api/assertion/{name}/extraction-status?contextGraphId=...` if needed
+1. `POST /api/knowledge-assets/{name}/wm/import-file` with the document + `contextGraphId`
+2. Poll `GET /api/knowledge-assets/{name}/wm/extraction-status?contextGraphId=...` if needed
 3. Promote the assertion to SWM when extraction is complete
 
 **Query across layers:**
@@ -777,4 +776,4 @@ curl -X POST $BASE_URL/api/query \
   }'
 ```
 
-Then call `GET /api/assertion/{name}/history?contextGraphId=...&agentAddress=...` for the full event history of a single assertion.
+Then call `GET /api/knowledge-assets/{name}?contextGraphId=...&agentAddress=...` for the full event history of a single assertion.

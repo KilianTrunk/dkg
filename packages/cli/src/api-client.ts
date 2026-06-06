@@ -531,7 +531,7 @@ export class ApiClient {
   /**
    * Create an assertion in WM, optionally writing quads + finalizing +
    * promoting in the same call. Maps directly to the extended
-   * `POST /api/assertion/create` body.
+   * `POST /api/knowledge-assets` body.
    *
    * RFC-001 §9.x — the assertion lifecycle is the canonical entry
    * point for staging content for VM publish. Callers that previously
@@ -663,7 +663,7 @@ export class ApiClient {
     };
     promotedCount?: number;
   }> {
-    return this.post('/api/assertion/create', {
+    return this.post('/api/knowledge-assets', {
       contextGraphId,
       name,
       ...(options?.subGraphName ? { subGraphName: options.subGraphName } : {}),
@@ -684,7 +684,7 @@ export class ApiClient {
 
   /**
    * Append quads to an existing WM assertion. Wraps
-   * `POST /api/assertion/:name/write`. Used by batched ingest paths
+   * `POST /api/knowledge-assets/:name/wm/write`. Used by batched ingest paths
    * (e.g. `dkg index`) that materialize a single named assertion
    * across many round-trips before finalize.
    */
@@ -694,7 +694,7 @@ export class ApiClient {
     quads: Array<{ subject: string; predicate: string; object: string; graph: string }>,
     options?: { subGraphName?: string },
   ): Promise<{ written: number }> {
-    return this.post(`/api/assertion/${encodeURIComponent(name)}/write`, {
+    return this.post(`/api/knowledge-assets/${encodeURIComponent(name)}/wm/write`, {
       contextGraphId,
       quads,
       ...(options?.subGraphName ? { subGraphName: options.subGraphName } : {}),
@@ -726,7 +726,7 @@ export class ApiClient {
     eip712Digest: string;
   }> {
     return this.post(
-      `/api/assertion/${encodeURIComponent(name)}/finalize`,
+      `/api/knowledge-assets/${encodeURIComponent(name)}/wm/finalize`,
       {
         contextGraphId,
         ...(options?.subGraphName ? { subGraphName: options.subGraphName } : {}),
@@ -1595,7 +1595,7 @@ export class ApiClient {
     if (request.ontologyRef) form.append('ontologyRef', request.ontologyRef);
     if (request.subGraphName) form.append('subGraphName', request.subGraphName);
 
-    return this.postForm(`/api/assertion/${encodeURIComponent(name)}/import-file`, form);
+    return this.postForm(`/api/knowledge-assets/${encodeURIComponent(name)}/wm/import-file`, form);
   }
 
   async assertionExtractionStatus(name: string, contextGraphId: string, subGraphName?: string): Promise<{
@@ -1610,7 +1610,7 @@ export class ApiClient {
     const params = new URLSearchParams({ contextGraphId });
     if (subGraphName) params.set('subGraphName', subGraphName);
     return this.get(
-      `/api/assertion/${encodeURIComponent(name)}/extraction-status?${params.toString()}`,
+      `/api/knowledge-assets/${encodeURIComponent(name)}/wm/extraction-status?${params.toString()}`,
     );
   }
 
@@ -1620,13 +1620,14 @@ export class ApiClient {
     subGraphName?: string;
   }): Promise<{
     promoted?: boolean;
+    swmShared?: boolean;
     promotedCount?: number;
     contextGraphId?: string;
     count?: number;
     sharedMemoryGraph?: string;
     rootEntities?: string[];
   }> {
-    return this.post(`/api/assertion/${encodeURIComponent(name)}/promote`, request);
+    return this.post(`/api/knowledge-assets/${encodeURIComponent(name)}/swm/share`, request);
   }
 
   async queryAssertion(name: string, request: {
@@ -1636,7 +1637,9 @@ export class ApiClient {
     quads: Array<{ subject: string; predicate: string; object: string; graph: string }>;
     count: number;
   }> {
-    return this.post(`/api/assertion/${encodeURIComponent(name)}/query`, request);
+    const params = new URLSearchParams({ contextGraphId: request.contextGraphId });
+    if (request.subGraphName) params.set('subGraphName', request.subGraphName);
+    return this.get(`/api/knowledge-assets/${encodeURIComponent(name)}/wm/quads?${params.toString()}`);
   }
 
   async publishCclPolicy(request: {

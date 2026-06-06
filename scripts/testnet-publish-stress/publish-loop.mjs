@@ -6,7 +6,7 @@
  * KC via the daemon's HTTP API.
  *
  * Lifecycle per partition (2 HTTP calls + an unknown wait for chain confirm):
- *   1. POST /api/assertion/create        { name, contextGraphId, quads,
+ *   1. POST /api/knowledge-assets        { name, contextGraphId, quads,
  *                                          finalize: true, promote: true }
  *      Combined create+write+finalize+promote (one round-trip, agent does
  *      the work in-process).
@@ -279,7 +279,7 @@ async function publishOnePartition(partition, partitionIdx, attempt = 0) {
   // 1. Combined create + write + finalize + promote. The route requires
   //    `finalize: true` to allow `promote: true`, and `quads` to be present
   //    to allow `finalize: true` — exactly the bundle we want.
-  const createRes = await apiCall('POST', '/api/assertion/create', {
+  const createRes = await apiCall('POST', '/api/knowledge-assets', {
     name,
     contextGraphId: CFG.cgId,
     quads,

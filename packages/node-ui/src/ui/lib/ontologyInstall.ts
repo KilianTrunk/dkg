@@ -2,8 +2,8 @@
  * Install one of the bundled starter ontologies (or a custom one) into a
  * newly-created context graph's `meta` sub-graph as the `project-ontology`
  * assertion. Mirrors `scripts/import-ontology.mjs` but runs entirely in
- * the browser via the canonical /api/assertion/<name>/write + /promote
- * endpoints — no new daemon code needed.
+ * the browser via the canonical /api/knowledge-assets/<name>/wm/write +
+ * /swm/share endpoints — no new daemon code needed.
  *
  * Each starter ships as a pair of static text files:
  *   - ontology.ttl    — formal Turtle/OWL document (source of truth)
@@ -158,7 +158,7 @@ function buildOntologyTriples(
  * Install a starter ontology into the given context graph. Idempotent —
  * re-running with the same starter replaces the assertion.
  *
- * IMPORTANT: `/api/assertion/:name/write` is **append-only**, not
+ * IMPORTANT: `/api/knowledge-assets/:name/wm/write` is **append-only**, not
  * destructive-replace, despite how the old docstring read. Re-running
  * `installOntology` without the `discard` call below would accumulate
  * stale `schema:text`, `dcterms:created`, etc. on the same `project-ontology`
@@ -192,7 +192,7 @@ export async function installOntology(
     starter.guide,
   );
 
-  await post('/api/assertion/project-ontology/discard', {
+  await post('/api/knowledge-assets/project-ontology/wm/discard', {
     contextGraphId,
     subGraphName: 'meta',
   }).catch((err) => {
@@ -200,7 +200,7 @@ export async function installOntology(
     if (!/404|not found/i.test(msg)) throw err;
   });
 
-  await post('/api/assertion/project-ontology/write', {
+  await post('/api/knowledge-assets/project-ontology/wm/write', {
     contextGraphId,
     subGraphName: 'meta',
     quads,
@@ -208,7 +208,7 @@ export async function installOntology(
 
   // Auto-promote so other subscribed nodes (and their agents) see it.
   try {
-    await post('/api/assertion/project-ontology/promote', {
+    await post('/api/knowledge-assets/project-ontology/swm/share', {
       contextGraphId,
       subGraphName: 'meta',
       entities: [ontologyUri, guideUri],

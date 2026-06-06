@@ -349,7 +349,7 @@ When the daemon is running, it exposes a local HTTP API (default: `http://localh
 - `GET /api/status`, `GET /api/info` — node status and health
 - `POST /api/agent/register`, `GET /api/agent/identity` — agent identity
 - `POST /api/context-graph/create`, `/register`, `/invite`, `GET /api/context-graph/list` — context graph management
-- `POST /api/assertion/create`, `/{name}/write`, `/{name}/promote`, `/{name}/discard`, `/{name}/import-file`, `GET /api/assertion/{name}/history` — Working Memory assertions
+- `POST /api/knowledge-assets`, `/{name}/wm/write`, `/{name}/swm/share`, `/{name}/wm/discard`, `/{name}/wm/import-file`, `GET /api/knowledge-assets/{name}` — Working Memory assertions
 - `POST /api/shared-memory/write`, `/publish` — Shared Working Memory and publishing to Verified Memory
 - `POST /api/query`, `POST /api/query-remote` — SPARQL querying
 - `POST /api/endorse`, `POST /api/verify`, `POST /api/update` — Verified Memory trust operations

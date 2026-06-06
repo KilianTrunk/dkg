@@ -12,7 +12,7 @@ The adapter is a thin bridge into the DKG node. It does not run its own DKG node
 - exposes DKG agent-network tools to the OpenClaw runtime
 - funds the generated admin wallet plus operational wallets via the testnet faucet on first setup (skippable with `--no-fund`; failures are non-fatal and log manual `curl` instructions)
 
-Memory writes are not exposed as an adapter tool. The agent persists memory through direct daemon routes listed in `packages/cli/skills/dkg-node/SKILL.md` §5 (`POST /api/assertion/create` on first use of a fresh project CG, then `POST /api/assertion/:name/write` for each write). The daemon serves the skill document at `GET /.well-known/skill.md`, so the agent sees it on startup and calls the routes directly.
+Memory writes are not exposed as an adapter tool. The agent persists memory through direct daemon routes listed in `packages/cli/skills/dkg-node/SKILL.md` §5 (`POST /api/knowledge-assets` on first use of a fresh project CG, then `POST /api/knowledge-assets/:name/wm/write` for each write). The daemon serves the skill document at `GET /.well-known/skill.md`, so the agent sees it on startup and calls the routes directly.
 
 ## What It Does Not Do Anymore
 
@@ -83,7 +83,7 @@ Environment override: `OPENCLAW_STATE_DIR` overrides the adapter state root at r
 
 **Disconnect semantics.** The node UI's "Disconnect" button removes `plugins.entries.adapter-openclaw` entirely from `~/.openclaw/openclaw.json` (including any customized `config` values) AND removes `$WORKSPACE_DIR/skills/dkg-node/SKILL.md` (the canonical DKG node skill installed by setup). Other skills under `skills/` and sibling files under `skills/dkg-node/` are untouched. If you had set a non-default `daemonUrl` (for example via `dkg openclaw setup --port 9300` or a remote daemon URL), re-run `dkg openclaw setup --port <N>` after Reconnect to restore it — Reconnect also re-installs the skill document. Default-port users see no visible difference across a Disconnect/Reconnect cycle aside from the brief absence of the skill file.
 
-Memory flows exclusively through `api.registerMemoryCapability` for slot-backed recall reads (handled by `DkgMemorySearchManager`, which fans out four parallel SPARQL queries — one against `agent-context` / `chat-turns` in working memory plus three against the resolved project CG's `memory` assertion with `view: 'working-memory'`, `'shared-working-memory'`, and `'verified-memory'` — and ranks the merged results with a trust-weighted score) and through the daemon routes documented in `packages/cli/skills/dkg-node/SKILL.md` for writes (`POST /api/assertion/create` on the first write to a fresh project CG, then `POST /api/assertion/:name/write` for each write after that).
+Memory flows exclusively through `api.registerMemoryCapability` for slot-backed recall reads (handled by `DkgMemorySearchManager`, which fans out four parallel SPARQL queries — one against `agent-context` / `chat-turns` in working memory plus three against the resolved project CG's `memory` assertion with `view: 'working-memory'`, `'shared-working-memory'`, and `'verified-memory'` — and ranks the merged results with a trust-weighted score) and through the daemon routes documented in `packages/cli/skills/dkg-node/SKILL.md` for writes (`POST /api/knowledge-assets` on the first write to a fresh project CG, then `POST /api/knowledge-assets/:name/wm/write` for each write after that).
 
 ## Notes
 

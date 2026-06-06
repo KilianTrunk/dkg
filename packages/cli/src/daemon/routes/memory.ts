@@ -1460,7 +1460,7 @@ WHERE {
   // `agent.publishFromSharedMemory` for the inline-seal logic.
   //
   // For seal-from-creation provenance, use the named-assertion
-  // lifecycle instead: POST /api/assertion/create with `quads,
+  // lifecycle instead: POST /api/knowledge-assets with `quads,
   // finalize: true, promote: true` followed by
   // POST /api/shared-memory/publish with `assertionName`.
   if (req.method === "POST" && path === "/api/shared-memory/write") {
@@ -1535,7 +1535,7 @@ WHERE {
   // Two operating modes (mutually exclusive):
   //
   //   1. `assertionName` body field — finalized-assertion fork. The seal
-  //      lives in `_meta` (written by /api/assertion/:name/finalize).
+  //      lives in `_meta` (written by /api/knowledge-assets/:name/wm/finalize).
   //      The agent reads it, threads it as `precomputedAttestation`,
   //      and the publisher forwards verbatim. No re-sign, no re-hash.
   //
@@ -1666,7 +1666,7 @@ WHERE {
     // RFC-001 §9.x Phase 5 — finalized-assertion fork.
     //
     // When the body carries `assertionName`, the assertion was sealed at
-    // a previous /api/assertion/:name/finalize step and the seal lives
+    // a previous /api/knowledge-assets/:name/wm/finalize step and the seal lives
     // in `_meta`. The agent route reads the seal, validates chain
     // identity, threads the seal as `precomputedAttestation`, and the
     // publisher forwards it verbatim — no re-sign, no re-hash. Other

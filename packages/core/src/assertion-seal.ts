@@ -24,7 +24,7 @@
 const ONT = 'http://dkg.io/ontology/';
 
 /**
- * Predicates written by `/api/assertion/:name/finalize` (sealed at
+ * Predicates written by `/api/knowledge-assets/:name/wm/finalize` (sealed at
  * the moment the agent commits the assertion's content to a chain).
  */
 export const ASSERTION_SEAL_PREDICATES = {

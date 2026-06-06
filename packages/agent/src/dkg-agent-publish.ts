@@ -1486,7 +1486,7 @@ export class PublishMethods extends DKGAgentBase {
     if (rawQuads.length === 0) {
       throw new Error(
         `Cannot finalize assertion <${assertionUri}>: it has no quads. ` +
-          `Write at least one quad with /api/assertion/${name}/write before finalizing.`,
+          `Write at least one quad with /api/knowledge-assets/${name}/wm/write before finalizing.`,
       );
     }
 
@@ -2555,7 +2555,7 @@ export class PublishMethods extends DKGAgentBase {
     if (!seal) {
       throw new Error(
         `publishFromFinalizedAssertion: assertion <${assertionUri}> is not finalized. ` +
-          `Call /api/assertion/${name}/finalize before publishing.`,
+          `Call /api/knowledge-assets/${name}/wm/finalize before publishing.`,
       );
     }
 

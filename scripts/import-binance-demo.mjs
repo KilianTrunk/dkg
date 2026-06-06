@@ -177,7 +177,7 @@ async function main() {
     const batch = triples.slice(i, i + BATCH);
     await api(
       'POST',
-      `/api/assertion/${encodeURIComponent(ASSERTION)}/write`,
+      `/api/knowledge-assets/${encodeURIComponent(ASSERTION)}/wm/write`,
       { contextGraphId: cgId, quads: batch },
     );
     written += batch.length;

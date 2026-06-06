@@ -162,7 +162,7 @@ program
             // Create-or-append: the daemon's create endpoint is
             // idempotent on `(cg, name)`, so we lazily create on the
             // first batch (no quads body) and append on subsequent
-            // batches via `/api/assertion/:name/write`.
+            // batches via `/api/knowledge-assets/:name/wm/write`.
             await client.createAssertion(targetContextGraph, indexAssertionName);
             return client.appendToAssertion(
               targetContextGraph,

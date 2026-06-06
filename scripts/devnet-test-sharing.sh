@@ -201,16 +201,16 @@ IMPORT1=$(curl -sS --max-time 30 --connect-timeout 5 \
   -H "Authorization: Bearer $AUTH" \
   -F "file=@${TMPMD};type=text/markdown" \
   -F "contextGraphId=$CG_ID" \
-  "http://127.0.0.1:9201/api/assertion/doc-alpha/import-file" 2>&1)
+  "http://127.0.0.1:9201/api/knowledge-assets/doc-alpha/wm/import-file" 2>&1)
 rm -f "$TMPMD"
 IMPORT1_URI=$(json_get "$IMPORT1" assertionUri)
 IMPORT1_CT=$(json_get "$IMPORT1" extraction.tripleCount)
 [[ "$IMPORT1_URI" != "__NONE__" ]] && ok "Imported doc-alpha ($IMPORT1_CT triples)" || fail "Import failed: ${IMPORT1:0:200}"
 
 echo "--- 1c: Create a second WM assertion via API ---"
-c -X POST "http://127.0.0.1:9201/api/assertion/create" \
+c -X POST "http://127.0.0.1:9201/api/knowledge-assets" \
   -d "{\"contextGraphId\":\"$CG_ID\",\"name\":\"draft-beta\"}" > /dev/null
-c -X POST "http://127.0.0.1:9201/api/assertion/draft-beta/write" \
+c -X POST "http://127.0.0.1:9201/api/knowledge-assets/draft-beta/wm/write" \
   -d "{\"contextGraphId\":\"$CG_ID\",\"quads\":[
     $(ql 'urn:sharing:beta1' 'http://schema.org/name' 'Beta Entity'),
     $(q 'urn:sharing:beta1' 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type' 'http://schema.org/Thing'),
@@ -221,8 +221,7 @@ ok "Created draft-beta assertion with 4 quads"
 
 echo "--- 1d: Verify Node 1 has WM data locally ---"
 sleep 1
-N1_ASSERT_CT=$(c -X POST "http://127.0.0.1:9201/api/assertion/draft-beta/query" \
-  -d "{\"contextGraphId\":\"$CG_ID\"}" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(len(d.get("quads",d.get("result",[]))))' 2>/dev/null)
+N1_ASSERT_CT=$(c "http://127.0.0.1:9201/api/knowledge-assets/draft-beta/wm/quads?contextGraphId=$CG_ID" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(len(d.get("quads",d.get("result",[]))))' 2>/dev/null)
 [[ "$N1_ASSERT_CT" -ge 4 ]] && ok "Node 1 has $N1_ASSERT_CT quads in WM" || fail "Node 1 WM assertion empty ($N1_ASSERT_CT)"
 
 N1_GRAPHS=$(c -X POST "http://127.0.0.1:9201/api/query" \
@@ -329,7 +328,7 @@ echo "=== SECTION 4: Promote to SWM — Data Should Now Sync ==="
 echo ""
 
 echo "--- 4a: Promote draft-beta assertion to SWM on Node 1 ---"
-PROMOTE1=$(c -X POST "http://127.0.0.1:9201/api/assertion/draft-beta/promote" \
+PROMOTE1=$(c -X POST "http://127.0.0.1:9201/api/knowledge-assets/draft-beta/swm/share" \
   -d "{\"contextGraphId\":\"$CG_ID\"}")
 PROMOTE1_CT=$(json_get "$PROMOTE1" promotedCount)
 [[ "$PROMOTE1_CT" != "__NONE__" && "$PROMOTE1_CT" != "0" ]] && ok "draft-beta promoted ($PROMOTE1_CT quads)" || fail "Promote failed: $PROMOTE1"
@@ -455,9 +454,9 @@ echo "=== SECTION 6: Multi-Participant WM Isolation ==="
 echo ""
 
 echo "--- 6a: Node 2 creates its own WM assertion in the shared project ---"
-c -X POST "http://127.0.0.1:9202/api/assertion/create" \
+c -X POST "http://127.0.0.1:9202/api/knowledge-assets" \
   -d "{\"contextGraphId\":\"$CG_ID\",\"name\":\"n2-private-draft\"}" > /dev/null
-c -X POST "http://127.0.0.1:9202/api/assertion/n2-private-draft/write" \
+c -X POST "http://127.0.0.1:9202/api/knowledge-assets/n2-private-draft/wm/write" \
   -d "{\"contextGraphId\":\"$CG_ID\",\"quads\":[
     $(ql 'urn:sharing:n2secret' 'http://schema.org/name' 'Node2 Secret Data'),
     $(q 'urn:sharing:n2secret' 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type' 'http://schema.org/Thing')
@@ -466,8 +465,7 @@ ok "Node 2 created private WM assertion"
 
 echo "--- 6b: Node 2 can query its own WM data ---"
 sleep 1
-N2_OWN=$(c -X POST "http://127.0.0.1:9202/api/assertion/n2-private-draft/query" \
-  -d "{\"contextGraphId\":\"$CG_ID\"}")
+N2_OWN=$(c "http://127.0.0.1:9202/api/knowledge-assets/n2-private-draft/wm/quads?contextGraphId=$CG_ID")
 N2_OWN_CT=$(echo "$N2_OWN" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(len(d.get("quads",d.get("result",[]))))' 2>/dev/null || echo "0")
 [[ "$N2_OWN_CT" -ge 2 ]] && ok "Node 2 sees its own WM data ($N2_OWN_CT quads)" || fail "Node 2 can't see own WM data"
 
@@ -485,7 +483,7 @@ N4_N2S_CT=$(safe_bindings_count "$N4_N2SECRET")
 check "Node 4 cannot see Node 2's WM data" "$N4_N2S_CT" "0"
 
 echo "--- 6e: Node 2 promotes its assertion — should gossip to all ---"
-PROMOTE_N2=$(c -X POST "http://127.0.0.1:9202/api/assertion/n2-private-draft/promote" \
+PROMOTE_N2=$(c -X POST "http://127.0.0.1:9202/api/knowledge-assets/n2-private-draft/swm/share" \
   -d "{\"contextGraphId\":\"$CG_ID\"}")
 PROMOTE_N2_CT=$(json_get "$PROMOTE_N2" promotedCount)
 [[ "$PROMOTE_N2_CT" != "__NONE__" && "$PROMOTE_N2_CT" != "0" ]] && ok "Node 2 promoted ($PROMOTE_N2_CT quads)" || fail "Node 2 promote failed"
@@ -532,7 +530,7 @@ echo "=== SECTION 8: Second Promotion — Incremental Sync ==="
 echo ""
 
 echo "--- 8a: Promote doc-alpha from WM to SWM on Node 1 ---"
-PROMOTE_DOC=$(c -X POST "http://127.0.0.1:9201/api/assertion/doc-alpha/promote" \
+PROMOTE_DOC=$(c -X POST "http://127.0.0.1:9201/api/knowledge-assets/doc-alpha/swm/share" \
   -d "{\"contextGraphId\":\"$CG_ID\"}")
 PROMOTE_DOC_CT=$(json_get "$PROMOTE_DOC" promotedCount)
 if [[ "$PROMOTE_DOC_CT" != "__NONE__" && "$PROMOTE_DOC_CT" != "0" && "$PROMOTE_DOC_CT" != "__ERR__" ]]; then
@@ -632,9 +630,9 @@ echo "=== SECTION 10: New WM After Promotion — Still Private ==="
 echo ""
 
 echo "--- 10a: Create a new WM assertion on Node 1 (post-promotion) ---"
-c -X POST "http://127.0.0.1:9201/api/assertion/create" \
+c -X POST "http://127.0.0.1:9201/api/knowledge-assets" \
   -d "{\"contextGraphId\":\"$CG_ID\",\"name\":\"post-promo-draft\"}" > /dev/null
-c -X POST "http://127.0.0.1:9201/api/assertion/post-promo-draft/write" \
+c -X POST "http://127.0.0.1:9201/api/knowledge-assets/post-promo-draft/wm/write" \
   -d "{\"contextGraphId\":\"$CG_ID\",\"quads\":[
     $(ql 'urn:sharing:postpromo' 'http://schema.org/name' 'Post-Promotion Secret'),
     $(q 'urn:sharing:postpromo' 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type' 'http://schema.org/Thing')
@@ -685,9 +683,9 @@ for port_label in "9201:Node1(creator)" "9202:Node2(invited)" "9204:Node4(late)"
 done
 
 # Cleanup
-c -X POST "http://127.0.0.1:9201/api/assertion/post-promo-draft/discard" \
+c -X POST "http://127.0.0.1:9201/api/knowledge-assets/post-promo-draft/wm/discard" \
   -d "{\"contextGraphId\":\"$CG_ID\"}" > /dev/null 2>&1
-c -X POST "http://127.0.0.1:9202/api/assertion/n2-private-draft/discard" \
+c -X POST "http://127.0.0.1:9202/api/knowledge-assets/n2-private-draft/wm/discard" \
   -d "{\"contextGraphId\":\"$CG_ID\"}" > /dev/null 2>&1
 
 #------------------------------------------------------------
@@ -729,9 +727,9 @@ CREATE2_OK=$(json_get "$CREATE2" created)
 check "Second private project created" "$CREATE2_OK" "$CG2_ID"
 
 echo "--- 13b: Import WM data on Node 1 ---"
-c -X POST "http://127.0.0.1:9201/api/assertion/create" \
+c -X POST "http://127.0.0.1:9201/api/knowledge-assets" \
   -d "{\"contextGraphId\":\"$CG2_ID\",\"name\":\"wm-secret\"}" > /dev/null
-c -X POST "http://127.0.0.1:9201/api/assertion/wm-secret/write" \
+c -X POST "http://127.0.0.1:9201/api/knowledge-assets/wm-secret/wm/write" \
   -d "{\"contextGraphId\":\"$CG2_ID\",\"quads\":[
     $(ql 'urn:join-flow:secret1' 'http://schema.org/name' 'Secret Data'),
     $(q 'urn:join-flow:secret1' 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type' 'http://schema.org/Thing')
@@ -880,7 +878,7 @@ N3_CG2_CT=$(safe_bindings_count "$N3_CG2")
 check "Node 3 has 0 graphs for join-flow project" "$N3_CG2_CT" "0"
 
 # Cleanup
-c -X POST "http://127.0.0.1:9201/api/assertion/wm-secret/discard" \
+c -X POST "http://127.0.0.1:9201/api/knowledge-assets/wm-secret/wm/discard" \
   -d "{\"contextGraphId\":\"$CG2_ID\"}" > /dev/null 2>&1
 
 #------------------------------------------------------------
@@ -906,7 +904,7 @@ IMPORT_PROMO=$(curl -sS --max-time 30 --connect-timeout 5 \
   -H "Authorization: Bearer $AUTH" \
   -F "file=@${TMPMD2};type=text/markdown" \
   -F "contextGraphId=$CG3_ID" \
-  "http://127.0.0.1:9201/api/assertion/promo-doc/import-file" 2>&1)
+  "http://127.0.0.1:9201/api/knowledge-assets/promo-doc/wm/import-file" 2>&1)
 rm -f "$TMPMD2"
 IMPORT_PROMO_URI=$(json_get "$IMPORT_PROMO" assertionUri)
 [[ "$IMPORT_PROMO_URI" != "__NONE__" && "$IMPORT_PROMO_URI" != "__ERR__" ]] \
@@ -920,7 +918,7 @@ echo "$IMPORT_PROMO_URI" | grep -qi "$N1_ADDR" \
 
 echo "--- 14d: Promote import-file assertion to SWM ---"
 sleep 1
-PROMO_RESULT=$(c -X POST "http://127.0.0.1:9201/api/assertion/promo-doc/promote" \
+PROMO_RESULT=$(c -X POST "http://127.0.0.1:9201/api/knowledge-assets/promo-doc/swm/share" \
   -d "{\"contextGraphId\":\"$CG3_ID\"}")
 PROMO_CT=$(json_get "$PROMO_RESULT" promotedCount)
 [[ "$PROMO_CT" != "__NONE__" && "$PROMO_CT" != "0" && "$PROMO_CT" != "__ERR__" ]] \
@@ -935,14 +933,14 @@ PROMO_SWM_CT=$(count_integer "$N1_PROMO_SWM")
 [[ "$PROMO_SWM_CT" -ge 1 ]] && ok "Promoted data visible in SWM ($PROMO_SWM_CT entities)" || fail "SWM empty after promote ($PROMO_SWM_CT)"
 
 echo "--- 14f: Also create + write + promote an API assertion (same project) ---"
-c -X POST "http://127.0.0.1:9201/api/assertion/create" \
+c -X POST "http://127.0.0.1:9201/api/knowledge-assets" \
   -d "{\"contextGraphId\":\"$CG3_ID\",\"name\":\"api-draft\"}" > /dev/null
-c -X POST "http://127.0.0.1:9201/api/assertion/api-draft/write" \
+c -X POST "http://127.0.0.1:9201/api/knowledge-assets/api-draft/wm/write" \
   -d "{\"contextGraphId\":\"$CG3_ID\",\"quads\":[
     $(ql 'urn:promote-test:api1' 'http://schema.org/name' 'API Written Entity'),
     $(q 'urn:promote-test:api1' 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type' 'http://schema.org/Thing')
   ]}" > /dev/null
-PROMO_API=$(c -X POST "http://127.0.0.1:9201/api/assertion/api-draft/promote" \
+PROMO_API=$(c -X POST "http://127.0.0.1:9201/api/knowledge-assets/api-draft/swm/share" \
   -d "{\"contextGraphId\":\"$CG3_ID\"}")
 PROMO_API_CT=$(json_get "$PROMO_API" promotedCount)
 [[ "$PROMO_API_CT" != "__NONE__" && "$PROMO_API_CT" != "0" ]] \
@@ -953,15 +951,15 @@ echo "--- 14g: Promote on node 2 also works (different wallet) ---"
 CG4_ID="promote-n2-$(date +%s)"
 c -X POST "http://127.0.0.1:9202/api/context-graph/create" \
   -d "{\"id\":\"$CG4_ID\",\"name\":\"Node2 Promote Test\"}" > /dev/null
-c -X POST "http://127.0.0.1:9202/api/assertion/create" \
+c -X POST "http://127.0.0.1:9202/api/knowledge-assets" \
   -d "{\"contextGraphId\":\"$CG4_ID\",\"name\":\"n2-draft\"}" > /dev/null
-c -X POST "http://127.0.0.1:9202/api/assertion/n2-draft/write" \
+c -X POST "http://127.0.0.1:9202/api/knowledge-assets/n2-draft/wm/write" \
   -d "{\"contextGraphId\":\"$CG4_ID\",\"quads\":[
     $(ql 'urn:promote-n2:item' 'http://schema.org/name' 'Node2 Entity'),
     $(q 'urn:promote-n2:item' 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type' 'http://schema.org/Thing')
   ]}" > /dev/null
 sleep 1
-PROMO_N2=$(c -X POST "http://127.0.0.1:9202/api/assertion/n2-draft/promote" \
+PROMO_N2=$(c -X POST "http://127.0.0.1:9202/api/knowledge-assets/n2-draft/swm/share" \
   -d "{\"contextGraphId\":\"$CG4_ID\"}")
 PROMO_N2_CT=$(json_get "$PROMO_N2" promotedCount)
 [[ "$PROMO_N2_CT" != "__NONE__" && "$PROMO_N2_CT" != "0" ]] \
@@ -1182,11 +1180,11 @@ done
 [[ "$VM_STILL_CT" -ge 1 ]] && ok "VM data persists after SWM clear ($VM_STILL_CT entities)" || fail "VM data lost after SWM clear"
 
 # Cleanup
-c -X POST "http://127.0.0.1:9201/api/assertion/promo-doc/discard" \
+c -X POST "http://127.0.0.1:9201/api/knowledge-assets/promo-doc/wm/discard" \
   -d "{\"contextGraphId\":\"$CG3_ID\"}" > /dev/null 2>&1
-c -X POST "http://127.0.0.1:9201/api/assertion/api-draft/discard" \
+c -X POST "http://127.0.0.1:9201/api/knowledge-assets/api-draft/wm/discard" \
   -d "{\"contextGraphId\":\"$CG3_ID\"}" > /dev/null 2>&1
-c -X POST "http://127.0.0.1:9202/api/assertion/n2-draft/discard" \
+c -X POST "http://127.0.0.1:9202/api/knowledge-assets/n2-draft/wm/discard" \
   -d "{\"contextGraphId\":\"$CG4_ID\"}" > /dev/null 2>&1
 
 #------------------------------------------------------------

@@ -12,7 +12,7 @@
  *     upstream `MemoryPluginCapability` via `api.registerMemoryCapability`.
  *     No adapter-side write tool: memory writes flow through daemon HTTP
  *     routes documented in `packages/cli/skills/dkg-node/SKILL.md`
- *     (`POST /api/assertion/create` + `POST /api/assertion/:name/write`),
+ *     (`POST /api/knowledge-assets` + `POST /api/knowledge-assets/:name/wm/write`),
  *     which the agent reads from `GET /.well-known/skill.md` on startup.
  */
 import {

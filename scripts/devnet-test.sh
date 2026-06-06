@@ -789,7 +789,7 @@ echo ""
 ASSERT_CG="devnet-test"
 
 echo "--- 14a: Create an assertion ---"
-ASSERT_CREATE=$(c -X POST "http://127.0.0.1:9201/api/assertion/create" -d "{
+ASSERT_CREATE=$(c -X POST "http://127.0.0.1:9201/api/knowledge-assets" -d "{
   \"contextGraphId\":\"$ASSERT_CG\",
   \"name\":\"devnet-draft\"
 }")
@@ -798,7 +798,7 @@ echo "  Assertion URI: $ASSERT_URI"
 [[ "$ASSERT_URI" != "__NONE__" && "$ASSERT_URI" != "__ERR__" ]] && ok "Assertion created: $ASSERT_URI" || fail "Assertion create failed: $ASSERT_CREATE"
 
 echo "--- 14b: Write triples to the assertion ---"
-ASSERT_WRITE=$(c -X POST "http://127.0.0.1:9201/api/assertion/devnet-draft/write" -d "{
+ASSERT_WRITE=$(c -X POST "http://127.0.0.1:9201/api/knowledge-assets/devnet-draft/wm/write" -d "{
   \"contextGraphId\":\"$ASSERT_CG\",
   \"quads\":[
     $(ql 'urn:devnet:assert:entity1' 'http://schema.org/name' 'Assertion Entity'),
@@ -809,9 +809,7 @@ echo "  Write response: $(echo "$ASSERT_WRITE" | head -c 200)"
 echo "$ASSERT_WRITE" | grep -qi "error" && fail "Assertion write failed: $ASSERT_WRITE" || ok "Assertion write OK"
 
 echo "--- 14c: Query the assertion ---"
-ASSERT_QUERY=$(c -X POST "http://127.0.0.1:9201/api/assertion/devnet-draft/query" -d "{
-  \"contextGraphId\":\"$ASSERT_CG\"
-}")
+ASSERT_QUERY=$(c "http://127.0.0.1:9201/api/knowledge-assets/devnet-draft/wm/quads?contextGraphId=$ASSERT_CG")
 ASSERT_Q_CT=$(safe_quads_count "$ASSERT_QUERY")
 if [[ "$ASSERT_Q_CT" == "PARSE_ERR" ]]; then
   fail "Assertion query returned unparseable response: ${ASSERT_QUERY:0:200}"
@@ -821,7 +819,7 @@ else
 fi
 
 echo "--- 14d: Promote the assertion to SWM ---"
-ASSERT_PROMOTE=$(c -X POST "http://127.0.0.1:9201/api/assertion/devnet-draft/promote" -d "{
+ASSERT_PROMOTE=$(c -X POST "http://127.0.0.1:9201/api/knowledge-assets/devnet-draft/swm/share" -d "{
   \"contextGraphId\":\"$ASSERT_CG\"
 }")
 PROMOTED_CT=$(json_get "$ASSERT_PROMOTE" promotedCount)
@@ -843,12 +841,12 @@ else
 fi
 
 echo "--- 14f: Create and immediately discard another assertion ---"
-c -X POST "http://127.0.0.1:9201/api/assertion/create" -d "{\"contextGraphId\":\"$ASSERT_CG\",\"name\":\"discard-me\"}" > /dev/null
-c -X POST "http://127.0.0.1:9201/api/assertion/discard-me/write" -d "{
+c -X POST "http://127.0.0.1:9201/api/knowledge-assets" -d "{\"contextGraphId\":\"$ASSERT_CG\",\"name\":\"discard-me\"}" > /dev/null
+c -X POST "http://127.0.0.1:9201/api/knowledge-assets/discard-me/wm/write" -d "{
   \"contextGraphId\":\"$ASSERT_CG\",
   \"quads\":[$(ql 'urn:devnet:assert:discard' 'http://schema.org/name' 'Discard Me')]
 }" > /dev/null
-DISCARD_RESP=$(c -X POST "http://127.0.0.1:9201/api/assertion/discard-me/discard" -d "{\"contextGraphId\":\"$ASSERT_CG\"}")
+DISCARD_RESP=$(c -X POST "http://127.0.0.1:9201/api/knowledge-assets/discard-me/wm/discard" -d "{\"contextGraphId\":\"$ASSERT_CG\"}")
 echo "$DISCARD_RESP" | grep -qi "error" && fail "Discard failed: $DISCARD_RESP" || ok "Assertion discard OK"
 
 echo "--- 14g: Promoted assertion gossips to other nodes ---"
@@ -927,12 +925,12 @@ echo "  Sub-graph create: $(echo "$SG_CREATE" | head -c 200)"
 echo "$SG_CREATE" | grep -qi "error" && warn "Sub-graph create: $SG_CREATE" || ok "Sub-graph 'test-assertions' created"
 
 echo "--- 16b: Write assertion to sub-graph ---"
-c -X POST "http://127.0.0.1:9201/api/assertion/create" -d "{
+c -X POST "http://127.0.0.1:9201/api/knowledge-assets" -d "{
   \"contextGraphId\":\"$CONTEXT_GRAPH\",
   \"name\":\"sg-draft\",
   \"subGraphName\":\"test-assertions\"
 }" > /dev/null
-SG_AW=$(c -X POST "http://127.0.0.1:9201/api/assertion/sg-draft/write" -d "{
+SG_AW=$(c -X POST "http://127.0.0.1:9201/api/knowledge-assets/sg-draft/wm/write" -d "{
   \"contextGraphId\":\"$CONTEXT_GRAPH\",
   \"subGraphName\":\"test-assertions\",
   \"quads\":[$(ql 'urn:sg:assert:item1' 'http://schema.org/name' 'Sub-graph Assertion')]
@@ -940,7 +938,7 @@ SG_AW=$(c -X POST "http://127.0.0.1:9201/api/assertion/sg-draft/write" -d "{
 echo "$SG_AW" | grep -qi "error" && fail "Sub-graph assertion write failed: $SG_AW" || ok "Sub-graph assertion write OK"
 
 echo "--- 16c: Promote sub-graph assertion ---"
-SG_PROMOTE=$(c -X POST "http://127.0.0.1:9201/api/assertion/sg-draft/promote" -d "{
+SG_PROMOTE=$(c -X POST "http://127.0.0.1:9201/api/knowledge-assets/sg-draft/swm/share" -d "{
   \"contextGraphId\":\"$CONTEXT_GRAPH\",
   \"subGraphName\":\"test-assertions\"
 }")
@@ -1083,13 +1081,13 @@ fi
 echo "--- 19c: Working memory assertion visible only locally ---"
 WM_NAME="wm-view-test-$(date +%s)"
 WM_SUBJECT="urn:wm-view:${WM_NAME}"
-c -X POST "http://127.0.0.1:9201/api/assertion/create" -d "{\"contextGraphId\":\"$CONTEXT_GRAPH\",\"name\":\"$WM_NAME\"}" > /dev/null
-c -X POST "http://127.0.0.1:9201/api/assertion/$WM_NAME/write" -d "{
+c -X POST "http://127.0.0.1:9201/api/knowledge-assets" -d "{\"contextGraphId\":\"$CONTEXT_GRAPH\",\"name\":\"$WM_NAME\"}" > /dev/null
+c -X POST "http://127.0.0.1:9201/api/knowledge-assets/$WM_NAME/wm/write" -d "{
   \"contextGraphId\":\"$CONTEXT_GRAPH\",
   \"quads\":[$(ql "$WM_SUBJECT" 'http://schema.org/name' 'WM Only Data')]
 }" > /dev/null
 
-WM_LOCAL=$(c -X POST "http://127.0.0.1:9201/api/assertion/$WM_NAME/query" -d "{\"contextGraphId\":\"$CONTEXT_GRAPH\"}")
+WM_LOCAL=$(c "http://127.0.0.1:9201/api/knowledge-assets/$WM_NAME/wm/quads?contextGraphId=$CONTEXT_GRAPH")
 WM_LOCAL_CT=$(safe_quads_count "$WM_LOCAL")
 if [[ "$WM_LOCAL_CT" == "PARSE_ERR" ]]; then
   fail "WM assertion query returned unparseable response: ${WM_LOCAL:0:200}"
@@ -1129,7 +1127,7 @@ else
   fail "WM data leaked to Node2 ($WM_REMOTE_CT)"
 fi
 
-c -X POST "http://127.0.0.1:9201/api/assertion/$WM_NAME/discard" -d "{\"contextGraphId\":\"$CONTEXT_GRAPH\"}" > /dev/null 2>&1
+c -X POST "http://127.0.0.1:9201/api/knowledge-assets/$WM_NAME/wm/discard" -d "{\"contextGraphId\":\"$CONTEXT_GRAPH\"}" > /dev/null 2>&1
 
 #------------------------------------------------------------
 echo ""
@@ -1180,7 +1178,7 @@ echo ""
 
 IMPORT_NAME="import-extract-$(date +%s)"
 echo "--- 21a: Create assertion for import ---"
-c -X POST "http://127.0.0.1:9201/api/assertion/create" -d "{\"contextGraphId\":\"$CONTEXT_GRAPH\",\"name\":\"$IMPORT_NAME\"}" > /dev/null
+c -X POST "http://127.0.0.1:9201/api/knowledge-assets" -d "{\"contextGraphId\":\"$CONTEXT_GRAPH\",\"name\":\"$IMPORT_NAME\"}" > /dev/null
 
 echo "--- 21b: Import markdown file ---"
 # P2-3: honor $TMPDIR for CI runners with non-/tmp tmp roots.
@@ -1206,7 +1204,7 @@ IMPORT_RESP=$(curl -sS --max-time "$DEVNET_CURL_TIMEOUT" --connect-timeout "$DEV
   -H "Authorization: Bearer $AUTH" \
   -F "file=@${TMPMD};type=text/markdown" \
   -F "contextGraphId=$CONTEXT_GRAPH" \
-  "http://127.0.0.1:9201/api/assertion/${IMPORT_NAME}/import-file" 2>&1)
+  "http://127.0.0.1:9201/api/knowledge-assets/${IMPORT_NAME}/wm/import-file" 2>&1)
 rm -f "$TMPMD"
 IMPORT_URI=$(json_get "$IMPORT_RESP" assertionUri)
 IMPORT_HASH=$(json_get "$IMPORT_RESP" fileHash)
@@ -1222,13 +1220,13 @@ else
 fi
 
 echo "--- 21c: Check extraction status endpoint ---"
-EXTRACT_ST=$(c "http://127.0.0.1:9201/api/assertion/${IMPORT_NAME}/extraction-status?contextGraphId=$CONTEXT_GRAPH")
+EXTRACT_ST=$(c "http://127.0.0.1:9201/api/knowledge-assets/${IMPORT_NAME}/wm/extraction-status?contextGraphId=$CONTEXT_GRAPH")
 EXT_STATUS=$(json_get "$EXTRACT_ST" status)
 echo "  Extraction status: $EXT_STATUS"
 [[ "$EXT_STATUS" == "completed" ]] && ok "Extraction status endpoint reports completed" || warn "Extraction status: $EXT_STATUS (${EXTRACT_ST:0:200})"
 
 echo "--- 21d: Query imported assertion ---"
-IMPORT_Q=$(c -X POST "http://127.0.0.1:9201/api/assertion/${IMPORT_NAME}/query" -d "{\"contextGraphId\":\"$CONTEXT_GRAPH\"}")
+IMPORT_Q=$(c "http://127.0.0.1:9201/api/knowledge-assets/${IMPORT_NAME}/wm/quads?contextGraphId=$CONTEXT_GRAPH")
 IMPORT_Q_CT=$(safe_quads_count "$IMPORT_Q")
 if [[ "$IMPORT_Q_CT" == "PARSE_ERR" ]]; then
   fail "Imported assertion query returned unparseable response: ${IMPORT_Q:0:200}"
@@ -1239,7 +1237,7 @@ else
 fi
 
 echo "--- 21e: Promote imported assertion to SWM ---"
-IMPORT_PROMOTE=$(c -X POST "http://127.0.0.1:9201/api/assertion/${IMPORT_NAME}/promote" -d "{\"contextGraphId\":\"$CONTEXT_GRAPH\"}")
+IMPORT_PROMOTE=$(c -X POST "http://127.0.0.1:9201/api/knowledge-assets/${IMPORT_NAME}/swm/share" -d "{\"contextGraphId\":\"$CONTEXT_GRAPH\"}")
 IMPORT_PC=$(json_get "$IMPORT_PROMOTE" promotedCount)
 echo "  Promoted count: $IMPORT_PC"
 # P1-10: also exclude __ERR__ (and keep the 0 guard) so parse failures don't
@@ -1344,7 +1342,7 @@ echo "--- 21i: Unsupported content type gracefully degrades (§6.5) ---"
 # extraction.status="skipped", tripleCount=0, no linkage triples written.
 # Required by 05_PROTOCOL_EXTENSIONS.md §6.5 but previously uncovered.
 PNG_NAME="import-degrade-$(date +%s)"
-c -X POST "http://127.0.0.1:9201/api/assertion/create" -d "{\"contextGraphId\":\"$CONTEXT_GRAPH\",\"name\":\"$PNG_NAME\"}" > /dev/null
+c -X POST "http://127.0.0.1:9201/api/knowledge-assets" -d "{\"contextGraphId\":\"$CONTEXT_GRAPH\",\"name\":\"$PNG_NAME\"}" > /dev/null
 TMPPNG=$(mktemp "$DEVNET_TMPDIR/devnet-png-XXXXXX.png")
 # 8-byte PNG magic header — enough to look like a real image to the server
 # while keeping the test body small. No converter is registered for image/png
@@ -1354,7 +1352,7 @@ PNG_RESP=$(curl -sS --max-time "$DEVNET_CURL_TIMEOUT" --connect-timeout "$DEVNET
   -H "Authorization: Bearer $AUTH" \
   -F "file=@${TMPPNG};type=image/png" \
   -F "contextGraphId=$CONTEXT_GRAPH" \
-  "http://127.0.0.1:9201/api/assertion/${PNG_NAME}/import-file" 2>&1)
+  "http://127.0.0.1:9201/api/knowledge-assets/${PNG_NAME}/wm/import-file" 2>&1)
 rm -f "$TMPPNG"
 PNG_STATUS=$(json_get "$PNG_RESP" extraction.status)
 PNG_PIPELINE=$(json_get "$PNG_RESP" extraction.pipelineUsed)
@@ -1374,7 +1372,7 @@ else
   fail "§6.5 graceful degrade failed: status=$PNG_STATUS pipeline=$PNG_PIPELINE count=$PNG_COUNT (${PNG_RESP:0:200})"
 fi
 # Clean up the degraded assertion so it doesn't pollute later tests.
-c -X POST "http://127.0.0.1:9201/api/assertion/$PNG_NAME/discard" -d "{\"contextGraphId\":\"$CONTEXT_GRAPH\"}" > /dev/null 2>&1
+c -X POST "http://127.0.0.1:9201/api/knowledge-assets/$PNG_NAME/wm/discard" -d "{\"contextGraphId\":\"$CONTEXT_GRAPH\"}" > /dev/null 2>&1
 
 #------------------------------------------------------------
 echo ""
@@ -1534,7 +1532,7 @@ fi
 echo "--- 23c: Create assertion with empty name ---"
 # P0-3: capture HTTP status — a 500 with body `{"error":"internal"}` used
 # to silently pass the substring check. Require a 4xx AND an error token.
-http_post_capture "http://127.0.0.1:9201/api/assertion/create" \
+http_post_capture "http://127.0.0.1:9201/api/knowledge-assets" \
   "{\"contextGraphId\":\"$CONTEXT_GRAPH\",\"name\":\"\"}" \
   EMPTY_NAME EMPTY_CODE
 if [[ "$EMPTY_CODE" =~ ^4 ]] && echo "$EMPTY_NAME" | grep -qiE 'error|invalid'; then
@@ -1545,9 +1543,9 @@ fi
 
 echo "--- 23d: Duplicate assertion name reuses same URI ---"
 DUP_NAME="dup-test-$(date +%s)"
-DUP_FIRST=$(c -X POST "http://127.0.0.1:9201/api/assertion/create" -d "{\"contextGraphId\":\"$CONTEXT_GRAPH\",\"name\":\"$DUP_NAME\"}")
+DUP_FIRST=$(c -X POST "http://127.0.0.1:9201/api/knowledge-assets" -d "{\"contextGraphId\":\"$CONTEXT_GRAPH\",\"name\":\"$DUP_NAME\"}")
 DUP_URI1=$(json_get "$DUP_FIRST" assertionUri)
-DUP_SECOND=$(c -X POST "http://127.0.0.1:9201/api/assertion/create" -d "{\"contextGraphId\":\"$CONTEXT_GRAPH\",\"name\":\"$DUP_NAME\"}")
+DUP_SECOND=$(c -X POST "http://127.0.0.1:9201/api/knowledge-assets" -d "{\"contextGraphId\":\"$CONTEXT_GRAPH\",\"name\":\"$DUP_NAME\"}")
 DUP_URI2=$(json_get "$DUP_SECOND" assertionUri)
 if echo "$DUP_SECOND" | grep -qi "error\|exists\|already\|duplicate"; then
   ok "Duplicate assertion name rejected"
@@ -1556,10 +1554,10 @@ elif [[ "$DUP_URI1" == "$DUP_URI2" ]]; then
 else
   warn "Duplicate assertion name created different URI (URI1=$DUP_URI1, URI2=$DUP_URI2)"
 fi
-c -X POST "http://127.0.0.1:9201/api/assertion/$DUP_NAME/discard" -d "{\"contextGraphId\":\"$CONTEXT_GRAPH\"}" > /dev/null 2>&1
+c -X POST "http://127.0.0.1:9201/api/knowledge-assets/$DUP_NAME/wm/discard" -d "{\"contextGraphId\":\"$CONTEXT_GRAPH\"}" > /dev/null 2>&1
 
 echo "--- 23e: Promote nonexistent assertion ---"
-GHOST_PROMOTE=$(c -X POST "http://127.0.0.1:9201/api/assertion/does-not-exist-$(date +%s)/promote" -d "{\"contextGraphId\":\"$CONTEXT_GRAPH\"}")
+GHOST_PROMOTE=$(c -X POST "http://127.0.0.1:9201/api/knowledge-assets/does-not-exist-$(date +%s)/swm/share" -d "{\"contextGraphId\":\"$CONTEXT_GRAPH\"}")
 GHOST_PC=$(json_get "$GHOST_PROMOTE" promotedCount)
 if echo "$GHOST_PROMOTE" | grep -qi "error\|not found\|not exist"; then
   ok "Promote nonexistent assertion rejected with error"
@@ -1571,13 +1569,13 @@ fi
 
 echo "--- 23f: Double discard ---"
 DD_NAME="discard-twice-$(date +%s)"
-c -X POST "http://127.0.0.1:9201/api/assertion/create" -d "{\"contextGraphId\":\"$CONTEXT_GRAPH\",\"name\":\"$DD_NAME\"}" > /dev/null
-c -X POST "http://127.0.0.1:9201/api/assertion/$DD_NAME/write" -d "{
+c -X POST "http://127.0.0.1:9201/api/knowledge-assets" -d "{\"contextGraphId\":\"$CONTEXT_GRAPH\",\"name\":\"$DD_NAME\"}" > /dev/null
+c -X POST "http://127.0.0.1:9201/api/knowledge-assets/$DD_NAME/wm/write" -d "{
   \"contextGraphId\":\"$CONTEXT_GRAPH\",
   \"quads\":[$(ql 'urn:dd:test' 'http://schema.org/name' 'Double Discard')]
 }" > /dev/null
-c -X POST "http://127.0.0.1:9201/api/assertion/$DD_NAME/discard" -d "{\"contextGraphId\":\"$CONTEXT_GRAPH\"}" > /dev/null
-DD_SECOND=$(c -X POST "http://127.0.0.1:9201/api/assertion/$DD_NAME/discard" -d "{\"contextGraphId\":\"$CONTEXT_GRAPH\"}")
+c -X POST "http://127.0.0.1:9201/api/knowledge-assets/$DD_NAME/wm/discard" -d "{\"contextGraphId\":\"$CONTEXT_GRAPH\"}" > /dev/null
+DD_SECOND=$(c -X POST "http://127.0.0.1:9201/api/knowledge-assets/$DD_NAME/wm/discard" -d "{\"contextGraphId\":\"$CONTEXT_GRAPH\"}")
 if echo "$DD_SECOND" | grep -qi "error\|not found\|not exist\|already"; then
   ok "Double discard rejected with error"
 else
@@ -2723,9 +2721,9 @@ except Exception:
 
     echo "--- 31d: N1 publishes data into the CG (so N2 has something to sync after approval) ---"
     INV_ASSERTION_NAME="widget-info-$(date +%s)"
-    c -X POST "http://127.0.0.1:$N1_PORT/api/assertion/create" \
+    c -X POST "http://127.0.0.1:$N1_PORT/api/knowledge-assets" \
       -d "{\"contextGraphId\":\"$INVITE_CG_ID\",\"name\":\"$INV_ASSERTION_NAME\"}" >/dev/null
-    INV_WRITE_RESP=$(c -X POST "http://127.0.0.1:$N1_PORT/api/assertion/$INV_ASSERTION_NAME/write" \
+    INV_WRITE_RESP=$(c -X POST "http://127.0.0.1:$N1_PORT/api/knowledge-assets/$INV_ASSERTION_NAME/wm/write" \
       -d "{\"contextGraphId\":\"$INVITE_CG_ID\",\"quads\":[{\"subject\":\"did:example:widget\",\"predicate\":\"http://www.w3.org/2000/01/rdf-schema#label\",\"object\":\"\\\"Widget\\\"\"},{\"subject\":\"did:example:widget\",\"predicate\":\"http://schema.org/price\",\"object\":\"\\\"42\\\"\"}]}")
     INV_WRITTEN=$(json_get "$INV_WRITE_RESP" written)
     if [[ "$INV_WRITTEN" == "2" ]]; then

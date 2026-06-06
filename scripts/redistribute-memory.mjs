@@ -18,7 +18,7 @@
  * 3. Pick entities to move up using a deterministic lexicographic sort
  *    (so reruns bucket identically) and a greedy fill:
  *        - VM first  → publish via /api/shared-memory/publish
- *        - SWM next  → promote via /api/assertion/:name/promote
+ *        - SWM next  → promote via /api/knowledge-assets/:name/swm/share
  *        - remainder stays WM
  * 4. Batch promotes/publishes (default 40 entities per call) so we stay
  *    comfortably under the 512 KB gossip envelope.

@@ -33,7 +33,7 @@ import {
   type V10PublishParams,
 } from '@origintrail-official/dkg-chain';
 import { buildAuthorAttestationTypedData } from '@origintrail-official/dkg-core';
-import { handleAssertionRoutes } from '../src/daemon/routes/assertion.js';
+import { handleKcChainMetadataRoutes } from '../src/daemon/routes/kc-chain-metadata.js';
 import type { RequestContext } from '../src/daemon/routes/context.js';
 
 const TEST_KAV10_ADDR = '0x000000000000000000000000000000000000c10a';
@@ -203,7 +203,7 @@ describe('GET /api/kc/:id/author E2E round-trip', () => {
       kcIdPath: kaId.toString(),
       agent: createAgentShim({ withChain: true, chain }),
     });
-    await handleAssertionRoutes(ctx);
+    await handleKcChainMetadataRoutes(ctx);
 
     expect(ctx.res.statusCode).toBe(200);
     expect(responseBody(ctx)).toEqual({
@@ -231,7 +231,7 @@ describe('GET /api/kc/:id/author E2E round-trip', () => {
       kcIdPath: kaId.toString(),
       agent: createAgentShim({ withChain: true, chain }),
     });
-    await handleAssertionRoutes(ctx);
+    await handleKcChainMetadataRoutes(ctx);
 
     expect(ctx.res.statusCode).toBe(200);
     expect(responseBody(ctx)).toEqual({
@@ -247,7 +247,7 @@ describe('GET /api/kc/:id/author E2E round-trip', () => {
       kcIdPath: '999999',
       agent: createAgentShim({ withChain: true, chain }),
     });
-    await handleAssertionRoutes(ctx);
+    await handleKcChainMetadataRoutes(ctx);
     expect(ctx.res.statusCode).toBe(404);
     expect(responseBody(ctx)).toMatchObject({
       error: expect.stringContaining('Unknown kaId'),
@@ -259,7 +259,7 @@ describe('GET /api/kc/:id/author E2E round-trip', () => {
       kcIdPath: '1',
       agent: createAgentShim({ withChain: false }),
     });
-    await handleAssertionRoutes(ctx);
+    await handleKcChainMetadataRoutes(ctx);
     expect(ctx.res.statusCode).toBe(503);
     expect(responseBody(ctx)).toMatchObject({
       error: expect.stringContaining('Chain adapter does not expose'),
@@ -272,7 +272,7 @@ describe('GET /api/kc/:id/author E2E round-trip', () => {
       kcIdPath: 'not-a-number',
       agent: createAgentShim({ withChain: true, chain }),
     });
-    await handleAssertionRoutes(ctx);
+    await handleKcChainMetadataRoutes(ctx);
     expect(ctx.res.statusCode).toBe(400);
     expect(responseBody(ctx)).toMatchObject({
       error: expect.stringContaining('Invalid kaId'),

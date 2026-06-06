@@ -250,13 +250,14 @@ async function fullPublish(api: string, token: string, name: string): Promise<{ 
     { subject, predicate: 'http://schema.org/name', object: `"${name}"`, graph: '' },
     { subject, predicate: 'http://schema.org/value', object: '"epoch-pool fuel"', graph: '' },
   ];
-  let r = await postJson(api, '/api/assertion/create', { contextGraphId: cgId, name }, token);
-  expect(r.status, `create failed: ${JSON.stringify(r.body)}`).toBe(200);
-  r = await postJson(api, `/api/assertion/${name}/write`, { contextGraphId: cgId, quads }, token);
+  let r = await postJson(api, '/api/knowledge-assets', { contextGraphId: cgId, name }, token);
+  // KA create returns 201 (resource created) vs the legacy route's 200.
+  expect(r.status, `create failed: ${JSON.stringify(r.body)}`).toBe(201);
+  r = await postJson(api, `/api/knowledge-assets/${name}/wm/write`, { contextGraphId: cgId, quads }, token);
   expect(r.status, `write failed: ${JSON.stringify(r.body)}`).toBe(200);
-  r = await postJson(api, `/api/assertion/${name}/finalize`, { contextGraphId: cgId }, token);
+  r = await postJson(api, `/api/knowledge-assets/${name}/wm/finalize`, { contextGraphId: cgId }, token);
   expect(r.status, `finalize failed: ${JSON.stringify(r.body)}`).toBe(200);
-  r = await postJson(api, `/api/assertion/${name}/promote`, { contextGraphId: cgId }, token);
+  r = await postJson(api, `/api/knowledge-assets/${name}/swm/share`, { contextGraphId: cgId }, token);
   expect(r.status, `promote failed: ${JSON.stringify(r.body)}`).toBe(200);
   r = await postJson(api, '/api/shared-memory/publish', { contextGraphId: cgId, assertionName: name }, token);
   expect(r.status, `publish failed: ${JSON.stringify(r.body)}`).toBe(200);
@@ -357,26 +358,29 @@ describe('1. chained sign-at-creation assertion lifecycle', () => {
     );
     await sleep(500); // SSE warm-up
 
-    let r = await postJson(NODE1_API, '/api/assertion/create', { contextGraphId: CONTEXT_GRAPH, name: assertionName }, state.node1Token);
-    expect(r.status, `create: ${JSON.stringify(r.body)}`).toBe(200);
+    let r = await postJson(NODE1_API, '/api/knowledge-assets', { contextGraphId: CONTEXT_GRAPH, name: assertionName }, state.node1Token);
+    // KA create returns 201 (resource created) vs the legacy route's 200.
+    expect(r.status, `create: ${JSON.stringify(r.body)}`).toBe(201);
     expect(r.body.assertionUri).toContain(assertionName);
 
     const quads = [
       { subject: 'urn:test:lifecycle:s1', predicate: 'http://schema.org/name', object: '"Sign-at-creation lifecycle test"', graph: '' },
       { subject: 'urn:test:lifecycle:s2', predicate: 'http://schema.org/sameAs', object: 'urn:test:lifecycle:s1', graph: '' },
     ];
-    r = await postJson(NODE1_API, `/api/assertion/${assertionName}/write`, { contextGraphId: CONTEXT_GRAPH, quads }, state.node1Token);
+    r = await postJson(NODE1_API, `/api/knowledge-assets/${assertionName}/wm/write`, { contextGraphId: CONTEXT_GRAPH, quads }, state.node1Token);
     expect(r.status, `write: ${JSON.stringify(r.body)}`).toBe(200);
     expect(r.body.written).toBe(2);
 
-    r = await postJson(NODE1_API, `/api/assertion/${assertionName}/finalize`, { contextGraphId: CONTEXT_GRAPH }, state.node1Token);
+    r = await postJson(NODE1_API, `/api/knowledge-assets/${assertionName}/wm/finalize`, { contextGraphId: CONTEXT_GRAPH }, state.node1Token);
     expect(r.status, `finalize: ${JSON.stringify(r.body)}`).toBe(200);
+    // wm/finalize returns the full seal payload (PR #971): merkleRoot, eip712Digest, schemeVersion, etc.
     expect(r.body.merkleRoot).toMatch(/^0x[0-9a-f]{64}$/);
     expect(r.body.eip712Digest).toMatch(/^0x[0-9a-f]{64}$/);
     expect(r.body.schemeVersion).toBe(1);
 
-    r = await postJson(NODE1_API, `/api/assertion/${assertionName}/promote`, { contextGraphId: CONTEXT_GRAPH }, state.node1Token);
+    r = await postJson(NODE1_API, `/api/knowledge-assets/${assertionName}/swm/share`, { contextGraphId: CONTEXT_GRAPH }, state.node1Token);
     expect(r.status, `promote: ${JSON.stringify(r.body)}`).toBe(200);
+    // swm/share returns { swmShared, promotedCount }.
     expect(r.body.promotedCount).toBe(2);
 
     await sleep(1500); // let trailing events arrive
@@ -397,8 +401,9 @@ describe('2. failed publish does not leak triples into verified-memory (RC11 / P
     const subject = `urn:test:edge:rc11:${Date.now().toString(36)}`;
     const witnessLiteral = `"PR2 failed-publish witness ${Date.now().toString(36)}"`;
 
-    let r = await postJson(NODE5_API, '/api/assertion/create', { contextGraphId: CONTEXT_GRAPH, name: assertionName }, state.node5Token);
-    expect(r.status, `edge create: ${JSON.stringify(r.body)}`).toBe(200);
+    let r = await postJson(NODE5_API, '/api/knowledge-assets', { contextGraphId: CONTEXT_GRAPH, name: assertionName }, state.node5Token);
+    // KA create returns 201 (resource created) vs the legacy route's 200.
+    expect(r.status, `edge create: ${JSON.stringify(r.body)}`).toBe(201);
 
     // The witness literal is unique per run so the verified-memory query
     // below can isolate THIS publish's quads from any bootstrap data
@@ -407,11 +412,11 @@ describe('2. failed publish does not leak triples into verified-memory (RC11 / P
       { subject, predicate: 'http://schema.org/name', object: witnessLiteral, graph: '' },
       { subject, predicate: 'http://schema.org/author', object: '"edge-node-5"', graph: '' },
     ];
-    r = await postJson(NODE5_API, `/api/assertion/${assertionName}/write`, { contextGraphId: CONTEXT_GRAPH, quads }, state.node5Token);
+    r = await postJson(NODE5_API, `/api/knowledge-assets/${assertionName}/wm/write`, { contextGraphId: CONTEXT_GRAPH, quads }, state.node5Token);
     expect(r.status).toBe(200);
-    r = await postJson(NODE5_API, `/api/assertion/${assertionName}/finalize`, { contextGraphId: CONTEXT_GRAPH }, state.node5Token);
+    r = await postJson(NODE5_API, `/api/knowledge-assets/${assertionName}/wm/finalize`, { contextGraphId: CONTEXT_GRAPH }, state.node5Token);
     expect(r.status).toBe(200);
-    r = await postJson(NODE5_API, `/api/assertion/${assertionName}/promote`, { contextGraphId: CONTEXT_GRAPH }, state.node5Token);
+    r = await postJson(NODE5_API, `/api/knowledge-assets/${assertionName}/swm/share`, { contextGraphId: CONTEXT_GRAPH }, state.node5Token);
     expect(r.status).toBe(200);
 
     // Post-RFC-38 an edge node (identityId=0) may still reach `confirmed`

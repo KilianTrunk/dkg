@@ -20,7 +20,7 @@ restart and without fragmenting the graph against parallel producers**.
 
 ## 1. The chunking contract (read first)
 
-The daemon's `/api/assertion/<name>/{create,write,promote}` loop **is** the
+The daemon's `/api/knowledge-assets` create + `/api/knowledge-assets/<name>/{wm/write,swm/share}` loop **is** the
 chunked-write API. There is no `/api/import/bulk` and there will not be one
 (see [ADR 0002](../../../../docs/adr/0002-importer-chunking-contract.md) for
 the rejected-alternative analysis). To push a large graph you call the loop
@@ -28,8 +28,8 @@ many times, with each call staying under fixed budgets.
 
 | Constant | Value | Where it lands |
 |---|---|---|
-| `CHUNK` | **5,000 quads** | Per `POST /api/assertion/<name>/write` call |
-| `ROOT_CHUNK` | **1,000 URIs** | Per `POST /api/assertion/<name>/promote` `entities` array |
+| `CHUNK` | **5,000 quads** | Per `POST /api/knowledge-assets/<name>/wm/write` call |
+| `ROOT_CHUNK` | **1,000 URIs** | Per `POST /api/knowledge-assets/<name>/swm/share` `entities` array |
 | Max concurrent writes within one assertion | **1** (sequential) | The daemon does not parallelise intra-assertion writes; the manifest in §3 tracks per-assertion state anyway |
 | Max concurrent assertions | **4** | Safe across assertions; keeps memory bounded for laptop-class nodes |
 
@@ -46,11 +46,11 @@ above, with the verbatim error text the daemon emits. The cap source lives in
 
 | Endpoint | Cap | Constant | Trigger | Error response |
 |---|---|---|---|---|
-| `POST /api/assertion/<name>/write` | **10 MB** request body | `MAX_BODY_BYTES` | N-Quads payload too large | `HTTP 413` "Request body too large (>10485760 bytes)" |
-| `POST /api/assertion/<name>/promote` | **256 KB** request body | `SMALL_BODY_BYTES` | `entities` array too long (~4,000+ URIs at 60-char average) | `HTTP 413` "Request body too large (>262144 bytes)" |
-| `POST /api/assertion/<name>/promote` | **10 MB** gossip message | hard-coded in gossipsub publish | Promoted assertion's N-Quads serialisation exceeds 10 MB | `HTTP 500` "Promoted assertion too large for gossip (XXXX KB, limit 10 MB). Promote fewer entities per call." |
+| `POST /api/knowledge-assets/<name>/wm/write` | **10 MB** request body | `MAX_BODY_BYTES` | N-Quads payload too large | `HTTP 413` "Request body too large (>10485760 bytes)" |
+| `POST /api/knowledge-assets/<name>/swm/share` | **256 KB** request body | `SMALL_BODY_BYTES` | `entities` array too long (~4,000+ URIs at 60-char average) | `HTTP 413` "Request body too large (>262144 bytes)" |
+| `POST /api/knowledge-assets/<name>/swm/share` | **10 MB** gossip message | hard-coded in gossipsub publish | Promoted assertion's N-Quads serialisation exceeds 10 MB | `HTTP 500` "Promoted assertion too large for gossip (XXXX KB, limit 10 MB). Promote fewer entities per call." |
 
-The two `/promote` caps are independent: the 256 KB body cap is on the
+The two `/swm/share` caps are independent: the 256 KB body cap is on the
 **request** you send (URI count × URI length); the 10 MB gossip cap is on the
 **assertion** that ends up in SWM (triples × N-Quads length). It is possible
 to hit the gossip cap with a single-URI `entities` array, if the assertion
@@ -59,7 +59,7 @@ because it asks the daemon to gossip every root in one message; for any
 assertion above ~30k triples, expect to split.
 
 In practice this means a robust importer needs **two independent halve-and-
-retry paths on `/promote`**: one for 413 (shrink the `entities` array) and
+retry paths on `/swm/share`**: one for 413 (shrink the `entities` array) and
 one for 500 (shrink the per-root scope or switch from `"all"` to explicit
 batches of N ≤ 1000 root URIs). See [§5 Error handling](#5-error-handling)
 for the recipes.
@@ -75,9 +75,9 @@ For each logical slice of triples (one slice ≈ one source artefact: one file,
 one PR, one document, one record group):
 
 ```
-POST /api/assertion/create   { name, subGraphName, contextGraphId }
-POST /api/assertion/<name>/write   { quads: [...] }   ── one or more times
-POST /api/assertion/<name>/promote { entities: [...] }
+POST /api/knowledge-assets   { name, subGraphName, contextGraphId }
+POST /api/knowledge-assets/<name>/wm/write   { quads: [...] }   ── one or more times
+POST /api/knowledge-assets/<name>/swm/share { entities: [...] }
 ```
 
 Reference implementation — see [`scripts/lib/dkg-daemon.mjs`](../../../../scripts/lib/dkg-daemon.mjs)
@@ -96,7 +96,7 @@ await client.ensureSubGraph(client.cgId, 'code');
 
 async function ensureAssertion(client, body) {
   try {
-    await client.request('POST', '/api/assertion/create', body);
+    await client.request('POST', '/api/knowledge-assets', body);
   } catch (err) {
     if (err.status === 400 && /already exists/i.test(JSON.stringify(err.body ?? err.message))) {
       return;
@@ -147,7 +147,7 @@ CHUNK = 5000
 ROOT_CHUNK = 1000
 
 def ensure_assertion(cg, name, sg):
-    res = requests.post(f'{BASE}/assertion/create',
+    res = requests.post(f'{BASE}/knowledge-assets',
                         headers=H, json={'contextGraphId': cg, 'name': name, 'subGraphName': sg})
     if res.status_code == 400 and 'already exists' in res.text.lower():
         return
@@ -156,11 +156,11 @@ def ensure_assertion(cg, name, sg):
 def write_assertion(cg, name, sg, triples, entities):
     ensure_assertion(cg, name, sg)
     for i in range(0, len(triples), CHUNK):
-        requests.post(f'{BASE}/assertion/{name}/write',
+        requests.post(f'{BASE}/knowledge-assets/{name}/wm/write',
                       headers=H, json={'contextGraphId': cg, 'subGraphName': sg,
                                         'quads': triples[i:i+CHUNK]}).raise_for_status()
     for i in range(0, len(entities), ROOT_CHUNK):
-        requests.post(f'{BASE}/assertion/{name}/promote',
+        requests.post(f'{BASE}/knowledge-assets/{name}/swm/share',
                       headers=H, json={'contextGraphId': cg, 'subGraphName': sg,
                                         'entities': entities[i:i+ROOT_CHUNK]}).raise_for_status()
 ```
@@ -266,7 +266,7 @@ rather than redeclaring class/property IRIs.
 
 ## 5. Error handling
 
-### HTTP 413 on `/write` (`MAX_BODY_BYTES` = 10 MB)
+### HTTP 413 on `/wm/write` (`MAX_BODY_BYTES` = 10 MB)
 
 You exceeded the request-body cap with too many N-Quads. Halve and retry:
 
@@ -281,13 +281,13 @@ try {
 }
 ```
 
-If you hit 413 frequently on `/write`, check `/api/status` for the daemon's
+If you hit 413 frequently on `/wm/write`, check `/api/status` for the daemon's
 current `importLimits` and tune your `CHUNK` constant down. Don't paper over
 it by bumping retries.
 
-### HTTP 413 on `/promote` (`SMALL_BODY_BYTES` = 256 KB)
+### HTTP 413 on `/swm/share` (`SMALL_BODY_BYTES` = 256 KB)
 
-This is a **different** 413 from the `/write` one: the promote route uses a
+This is a **different** 413 from the `/wm/write` one: the share route uses a
 smaller body limit because its requests should be small (just root URIs).
 You hit it by sending too many URIs in `entities` — roughly 4,000+ URIs at
 typical lengths. Recovery is to shrink the `entities` array, not the
@@ -298,7 +298,7 @@ async function promoteRoots(assertion, roots, batchSize = 1000) {
   for (let i = 0; i < roots.length; i += batchSize) {
     const batch = roots.slice(i, i + batchSize);
     try {
-      await client.request('POST', `/api/assertion/${assertion}/promote`, {
+      await client.request('POST', `/api/knowledge-assets/${assertion}/swm/share`, {
         contextGraphId: client.cgId, subGraphName, entities: batch,
       });
     } catch (err) {
@@ -311,7 +311,7 @@ async function promoteRoots(assertion, roots, batchSize = 1000) {
 }
 ```
 
-### HTTP 500 on `/promote` with "too large for gossip"
+### HTTP 500 on `/swm/share` with "too large for gossip"
 
 The assertion you're promoting serialises to more than 10 MB of N-Quads.
 This is independent of how many root URIs you pass — even
@@ -346,7 +346,7 @@ async function promoteAllInBatches(assertion, allRoots) {
 
 If both 413 and 500-gossip fire on the same import, you need both recovery
 loops — they're orthogonal. **As of PR #4 the daemon ships an
-in-process async promote queue** (`POST /api/assertion/<name>/promote-async`)
+in-process async promote queue** (`POST /api/knowledge-assets/<name>/swm/share-async`)
 that removes both failure modes by promoting one classifying-and-retrying
 job at a time in the background. See [§6 Async promote queue](#6-async-promote-queue)
 for the new contract — for a fresh importer, prefer the async path and skip
@@ -362,9 +362,9 @@ to confirm who the daemon thinks you are.
 ### Connection errors / 5xx
 
 Standard retry with exponential backoff. The daemon does not implement
-idempotency tokens. `assertion/write` is safe to retry with the same payload
-(duplicate triples are deduped server-side), and retrying `assertion/promote`
-is safe too. Raw `POST /api/assertion/create` returns HTTP 400 when the
+idempotency tokens. `wm/write` is safe to retry with the same payload
+(duplicate triples are deduped server-side), and retrying `swm/share`
+is safe too. Raw `POST /api/knowledge-assets` (create) returns HTTP 400 when the
 assertion already exists; higher-level helpers can normalize that into
 idempotent success by treating an `already exists` response as reuse.
 
@@ -375,10 +375,10 @@ characterises the bug fixed in OriginTrail/dkg#636-639). On resume,
 `loadImportManifest` gives you the "where was I?" answer; if a particular
 assertion's WM state is partial, you can either:
 
-- **Retry the assertion** — treat `assertion/create` "already exists" as reuse
-  (or call a helper that does), then re-run `assertion/write` to re-assert the
+- **Retry the assertion** — treat `POST /api/knowledge-assets` (create) "already exists" as reuse
+  (or call a helper that does), then re-run `wm/write` to re-assert the
   same triples without duplication.
-- **Discard the partial assertion** with `POST /api/assertion/<name>/discard`
+- **Discard the partial assertion** with `POST /api/knowledge-assets/<name>/wm/discard`
   and start over from your last `done` partition.
 
 ### HTTP 400 on finalize/publish with `Rule 4: rootEntity ... already exists`
@@ -476,7 +476,7 @@ at the importer level, before any quads reach the daemon.
 ## 6. Async promote queue
 
 As of PR #4 in the async-promote-queue series the daemon ships an in-process
-queue that converts the synchronous `POST /api/assertion/<name>/promote`
+queue that converts the synchronous `POST /api/knowledge-assets/<name>/swm/share`
 round-trip into a fire-and-forget enqueue. For bulk imports — where the
 synchronous promote round-trip is the bottleneck — this is the recommended
 path. See [`docs/specs/SPEC_ASYNC_PROMOTE_QUEUE.md`](../../../../docs/specs/SPEC_ASYNC_PROMOTE_QUEUE.md)
@@ -485,7 +485,7 @@ in-daemon worker configuration.
 
 ### Why use it
 
-The synchronous `/promote` route blocks on SWM insert + gossip publish. For a
+The synchronous `/swm/share` route blocks on SWM insert + gossip publish. For a
 multi-thousand-partition import that's the single biggest source of wall-clock
 time: tens of minutes spent in the 413 / 500-gossip halve-and-retry recipes in
 [§5](#5-error-handling). The async route returns `HTTP 202 { jobId, state:
@@ -500,11 +500,11 @@ loop.
 
 | Method | Route | Purpose |
 |---|---|---|
-| `POST` | `/api/assertion/<name>/promote-async` | Enqueue. Body: `{ contextGraphId, entities?: [...] \| "all", subGraphName? }`. Returns `202 { jobId, state: "queued", enqueuedAt }`. Returns `409 { existingJobId }` if there is already an active job for the same `(contextGraphId, subGraphName, name)`. |
-| `GET`  | `/api/assertion/promote-async` | List jobs. Query: `state=queued,running,failed_retrying,succeeded,failed` (comma-separated), `contextGraphId=...`, `limit=N`. Returns `{ jobs: [...] }`. |
-| `GET`  | `/api/assertion/promote-async/<jobId>` | Read one job: `state`, `attempt.count`, `commitMarker`, `result`, `attempt.lastError` with `classification: transient\|cap_exceeded\|fatal`. |
-| `DELETE` | `/api/assertion/promote-async/<jobId>` | Cancel a `queued` / `failed_retrying` job. `409` if the job is `running` (let the lease expire). |
-| `POST` | `/api/assertion/promote-async/<jobId>/recover` | Re-queue a `failed` job after fixing whatever was wrong (subdivide an over-large entity set, restart an upstream, etc.). |
+| `POST` | `/api/knowledge-assets/<name>/swm/share-async` | Enqueue. Body: `{ contextGraphId, entities?: [...] \| "all", subGraphName? }`. Returns `202 { jobId, state: "queued", enqueuedAt }`. Returns `409 { existingJobId }` if there is already an active job for the same `(contextGraphId, subGraphName, name)`. |
+| `GET`  | `/api/knowledge-assets/swm/share-jobs` | List jobs. Query: `state=queued,running,failed_retrying,succeeded,failed` (comma-separated), `contextGraphId=...`, `limit=N`. Returns `{ jobs: [...] }`. |
+| `GET`  | `/api/knowledge-assets/swm/share-jobs/<jobId>` | Read one job: `state`, `attempt.count`, `commitMarker`, `result`, `attempt.lastError` with `classification: transient\|cap_exceeded\|fatal`. |
+| `DELETE` | `/api/knowledge-assets/swm/share-jobs/<jobId>` | Cancel a `queued` / `failed_retrying` job. `409` if the job is `running` (let the lease expire). |
+| `POST` | `/api/knowledge-assets/swm/share-jobs/<jobId>/recover` | Re-queue a `failed` job after fixing whatever was wrong (subdivide an over-large entity set, restart an upstream, etc.). |
 
 ### The async write loop
 
@@ -516,7 +516,7 @@ for (const part of partitions) {
   await markPartitionStatus({ client, importId, partitionKey: part.key, status: 'in_progress', subGraphName: 'meta' });
 
   // CREATE + WRITE — unchanged from §2.
-  await client.request('POST', '/api/assertion/create', { name: part.assertion, subGraphName: part.subGraphName, contextGraphId: client.cgId });
+  await client.request('POST', '/api/knowledge-assets', { name: part.assertion, subGraphName: part.subGraphName, contextGraphId: client.cgId });
   for (const slice of chunks(part.quads, 5000)) {
     await client.writeAssertion({ contextGraphId: client.cgId, assertionName: part.assertion, subGraphName: part.subGraphName, triples: slice });
   }
@@ -524,7 +524,7 @@ for (const part of partitions) {
   // PROMOTE — async path. Returns immediately; the worker takes over.
   const { jobId } = await client.request(
     'POST',
-    `/api/assertion/${encodeURIComponent(part.assertion)}/promote-async`,
+    `/api/knowledge-assets/${encodeURIComponent(part.assertion)}/swm/share-async`,
     { contextGraphId: client.cgId, subGraphName: part.subGraphName, entities: part.roots },
   );
 
@@ -536,7 +536,7 @@ for (const part of partitions) {
 
 `trackAsyncPromote` can either:
 
-- **Poll** `GET /api/assertion/promote-async/<jobId>` on a backoff until
+- **Poll** `GET /api/knowledge-assets/swm/share-jobs/<jobId>` on a backoff until
   `state === "succeeded"` (call `markPartitionStatus(..., 'done')` then) or
   `state === "failed"` (recover or escalate per §6 below). Use a 250-1000ms
   interval — the worker polls the queue at ~100ms by default.
@@ -547,20 +547,20 @@ for (const part of partitions) {
 ### Failure classification (`attempt.lastError.classification`)
 
 The worker classifies every failure into one of three buckets. Read it from
-`GET /api/assertion/promote-async/<jobId>`:
+`GET /api/knowledge-assets/swm/share-jobs/<jobId>`:
 
 | Classification | Retry? | Typical cause | Importer action |
 |---|---|---|---|
 | `transient` | yes (until `maxRetries=5` reached) | `fetch failed` / `ECONNRESET` / `timeout` | Wait — the worker auto-retries with backoff. No-op for the importer until the job leaves `failed_retrying`. |
 | `cap_exceeded` | no | `Promoted assertion too large for gossip` (10 MB) or `Request body too large` (256 KB) | Re-enqueue with a smaller `entities` slice (the queue can't subdivide on its own — that's a future enhancement). Same halve-and-retry shape as the synchronous recipe, just applied at the queue layer. |
-| `fatal` | no | Bad request, missing assertion, etc. | Inspect the error message, fix the cause, then `POST /api/assertion/promote-async/<jobId>/recover` to re-queue. |
+| `fatal` | no | Bad request, missing assertion, etc. | Inspect the error message, fix the cause, then `POST /api/knowledge-assets/swm/share-jobs/<jobId>/recover` to re-queue. |
 
 Note that `cap_exceeded` jobs reach `state: "failed"`, not `failed_retrying`,
 because retrying the same payload would just hit the cap again. The importer
 is on the hook for subdivision — see [§5](#5-error-handling) for the same
 halve-and-retry recipe, except you re-enqueue rather than retry inline.
 
-### Migration from synchronous `/promote`
+### Migration from synchronous `/swm/share`
 
 The synchronous route is **not** deprecated. Use it when:
 
@@ -569,7 +569,7 @@ The synchronous route is **not** deprecated. Use it when:
 - Your client doesn't want to track job IDs or implement polling.
 - You explicitly need the SWM-insert-and-gossip-complete signal in-band.
 
-Otherwise, prefer `/promote-async`. The contract is identical (same body
+Otherwise, prefer `/swm/share-async`. The contract is identical (same body
 shape, same chunking budgets, same per-root semantics) — the only difference
 is **when** the SWM insert lands.
 
@@ -580,11 +580,11 @@ A running import can be inspected without interrupting it:
 ```bash
 # Everything still queued for this context graph
 curl -H "Authorization: Bearer $DKG_TOKEN" \
-  "http://localhost:9200/api/assertion/promote-async?contextGraphId=$CG_ID&state=queued,running"
+  "http://localhost:9200/api/knowledge-assets/swm/share-jobs?contextGraphId=$CG_ID&state=queued,running"
 
 # Anything that failed and is waiting on operator action
 curl -H "Authorization: Bearer $DKG_TOKEN" \
-  "http://localhost:9200/api/assertion/promote-async?state=failed&contextGraphId=$CG_ID"
+  "http://localhost:9200/api/knowledge-assets/swm/share-jobs?state=failed&contextGraphId=$CG_ID"
 ```
 
 This is the queue-level view; per-partition state still lives in the
@@ -595,7 +595,7 @@ promote job is queued / running.
 
 ## 7. Anti-patterns (don't do this)
 
-- **Don't push a million-quad payload in one `/write` call.** It will hit 413
+- **Don't push a million-quad payload in one `/wm/write` call.** It will hit 413
   and you'll learn the chunk size the slow way.
 - **Don't invent a new URI namespace for nodes that already exist** — fork the
   schema and merge later with `owl:sameAs` ([ADR 0003 §Reconciliation](../../../../docs/adr/0003-code-graph-ontology-convergence.md#reconciliation))
@@ -612,7 +612,7 @@ promote job is queued / running.
   just inflates memory pressure without throughput gain.
 - **Don't call `/api/shared-memory/publish` mid-import.** That's the SWM → VM
   on-chain transition (costs TRAC, human-gated). It is **not** the
-  `assertion/promote` step. Confusing the two is the most common
+  `/swm/share` (WM → SWM promote) step. Confusing the two is the most common
   "where did my money go?" mistake.
 - **Don't publish multiple KAs with overlapping subject URIs in the same CG.**
   The contract enforces "one root per KA per CG" (Rule 4) — if your raw data
@@ -632,9 +632,9 @@ promote job is queued / running.
 2. createImportManifest({ client, importId, partitions, subGraphName: 'meta' })
 3. For each partition (≤ 4 concurrent):
    a. markPartitionStatus(..., 'in_progress')
-   b. POST /api/assertion/create   { name, subGraphName, contextGraphId }
-   c. POST /api/assertion/<name>/write   { quads }      // chunks of ≤ 5000
-   d. POST /api/assertion/<name>/promote { entities }   // chunks of ≤ 1000 URIs
+   b. POST /api/knowledge-assets   { name, subGraphName, contextGraphId }
+   c. POST /api/knowledge-assets/<name>/wm/write   { quads }      // chunks of ≤ 5000
+   d. POST /api/knowledge-assets/<name>/swm/share { entities }   // chunks of ≤ 1000 URIs
    e. markPartitionStatus(..., 'done')
 4. On 413: halve chunk + retry.
 5. On crash: loadImportManifest → pendingPartitions → resume from step 3.
@@ -648,12 +648,12 @@ promote job is queued / running.
 2. createImportManifest({ client, importId, partitions, subGraphName: 'meta' })
 3. For each partition (≤ 4 concurrent):
    a. markPartitionStatus(..., 'in_progress')
-   b. POST /api/assertion/create   { name, subGraphName, contextGraphId }
-   c. POST /api/assertion/<name>/write   { quads }      // chunks of ≤ 5000
-   d. POST /api/assertion/<name>/promote-async { entities }   // returns 202 { jobId }
+   b. POST /api/knowledge-assets   { name, subGraphName, contextGraphId }
+   c. POST /api/knowledge-assets/<name>/wm/write   { quads }      // chunks of ≤ 5000
+   d. POST /api/knowledge-assets/<name>/swm/share-async { entities }   // returns 202 { jobId }
    e. Persist jobId; do NOT mark partition done yet.
 4. Reconciliation pass: for each in-flight jobId,
-     GET /api/assertion/promote-async/<jobId> until state ∈ {succeeded, failed}.
+     GET /api/knowledge-assets/swm/share-jobs/<jobId> until state ∈ {succeeded, failed}.
      - succeeded → markPartitionStatus(..., 'done')
      - failed + classification=cap_exceeded → subdivide entities + re-enqueue
      - failed + classification=fatal → fix root cause + POST .../recover

@@ -324,19 +324,20 @@ async function main() {
         },
       ];
       const createRes = await fetch(
-        `http://127.0.0.1:${core.apiPort}/api/assertion/create`,
+        `http://127.0.0.1:${core.apiPort}/api/knowledge-assets`,
         {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
             Authorization: `Bearer ${agent.authToken}`,
           },
+          // KA create auto-finalizes when `quads` are supplied; `alsoShareSwm`
+          // is the WM→SWM transition that the legacy `promote: true` flag did.
           body: JSON.stringify({
             name,
             contextGraphId: CONTEXT_GRAPH,
             quads,
-            finalize: true,
-            promote: true,
+            alsoShareSwm: true,
           }),
         },
       );

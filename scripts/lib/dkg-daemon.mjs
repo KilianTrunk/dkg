@@ -269,7 +269,7 @@ export class DkgClient {
       }));
       await this.request(
         'POST',
-        `/api/assertion/${encodeURIComponent(assertionName)}/write`,
+        `/api/knowledge-assets/${encodeURIComponent(assertionName)}/wm/write`,
         {
           contextGraphId,
           quads: batch,
@@ -286,7 +286,7 @@ export class DkgClient {
   async promote({ contextGraphId, assertionName, entities = 'all', subGraphName }) {
     return this.request(
       'POST',
-      `/api/assertion/${encodeURIComponent(assertionName)}/promote`,
+      `/api/knowledge-assets/${encodeURIComponent(assertionName)}/swm/share`,
       { contextGraphId, entities, ...(subGraphName ? { subGraphName } : {}) },
     );
   }

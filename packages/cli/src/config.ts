@@ -490,7 +490,7 @@ export interface DkgConfig {
   /**
    * Async promote queue worker (WM → SWM). Unlike `publisher` which is
    * opt-in, the promote worker is **on by default** — without it, jobs
-   * enqueued via `POST /api/assertion/{name}/promote-async` sit in
+   * enqueued via `POST /api/knowledge-assets/{name}/swm/share-async` sit in
    * `queued` forever. Set `enabled: false` to disable when running a
    * read-only / forensic node where you don't want the worker mutating
    * SWM. See `docs/specs/SPEC_ASYNC_PROMOTE_QUEUE.md` and the

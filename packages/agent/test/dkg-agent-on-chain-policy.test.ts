@@ -8,7 +8,7 @@
  * registration. For a CG still in the local-only `unregistered`
  * state those triples reflect the creator's intent, not an on-chain
  * commitment — but the daemon's import-artifact read relaxation
- * (`/api/assertion/import-artifact/{resolve,read-markdown}`) treats
+ * (`/api/knowledge-assets/import-artifact/{resolve,read-markdown}`) treats
  * a `{accessPolicy:0, publishPolicy:1}` answer as authoritative.
  * The combination meant the owner-guard could be bypassed on a CG
  * the curator hadn't actually committed to making public yet.

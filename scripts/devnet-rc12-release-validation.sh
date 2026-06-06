@@ -865,7 +865,7 @@ fi
 
 # ── Section A2: canonical assertion lifecycle smoke ─────────────────────────
 # The bulk publish path above uses /api/shared-memory/write directly. The
-# canonical RFC-001 §9.x path is /api/assertion/create with finalize+promote
+# canonical RFC-001 §9.x path is /api/knowledge-assets (create) with finalize+promote
 # (create → write → finalize → promote in one shot), then publish to VM. A
 # regression in assertion finalize/promote could still let the SWM-write path
 # pass, so we exercise the canonical path end-to-end with one KA and gate the
@@ -888,7 +888,7 @@ quads = [
 print(json.dumps({"contextGraphId": cg, "name": name, "quads": quads, "finalize": True, "promote": True}))
 PY
 )
-  ac=$(post "$A2_PORT" /api/assertion/create -d "$A2_BODY")
+  ac=$(post "$A2_PORT" /api/knowledge-assets -d "$A2_BODY")
   ac_uri=$(echo "$ac" | pyf "d.get('assertionUri','')")
   ac_seal_ok=$(echo "$ac" | pyf "1 if (d.get('seal') or {}).get('merkleRoot') else 0")
   ac_promoted=$(echo "$ac" | pyf "d.get('promotedCount',0)")

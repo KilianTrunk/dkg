@@ -993,8 +993,9 @@ describe('V10 chain — stress + scenario validation', () => {
     console.log(`phase 2: WM-only batch (${wmOnly} assertions on core1)...`);
     for (let i = 0; i < wmOnly; i++) {
       const name = `wm-only-${runTag}-${i}`;
+      // KA create auto-finalizes (seals to WM) when `quads` are supplied.
       const r = await fetch(
-        `http://127.0.0.1:${core1.apiPort}/api/assertion/create`,
+        `http://127.0.0.1:${core1.apiPort}/api/knowledge-assets`,
         {
           method: 'POST',
           headers: {
@@ -1005,7 +1006,6 @@ describe('V10 chain — stress + scenario validation', () => {
             name,
             contextGraphId: CONTEXT_GRAPH,
             quads: buildQuads(name),
-            finalize: true,
           }),
         },
       );
@@ -1045,8 +1045,10 @@ describe('V10 chain — stress + scenario validation', () => {
     console.log(`phase 2: VM custodial (mode B) batch (${vmCustodial} assertions via core2)...`);
     for (let i = 0; i < vmCustodial; i++) {
       const name = `vm-custodial-${runTag}-${i}`;
+      // KA create auto-finalizes when `quads` are supplied; `alsoShareSwm`
+      // performs the WM→SWM transition (legacy `promote: true`).
       const createRes = await fetch(
-        `http://127.0.0.1:${core2.apiPort}/api/assertion/create`,
+        `http://127.0.0.1:${core2.apiPort}/api/knowledge-assets`,
         {
           method: 'POST',
           headers: {
@@ -1057,8 +1059,7 @@ describe('V10 chain — stress + scenario validation', () => {
             name,
             contextGraphId: CONTEXT_GRAPH,
             quads: buildQuads(name),
-            finalize: true,
-            promote: true,
+            alsoShareSwm: true,
           }),
         },
       );
@@ -1211,8 +1212,10 @@ describe('V10 chain — stress + scenario validation', () => {
     console.log(`phase 2: WM→SWM batch (${wmSwm} assertions on core1)...`);
     for (let i = 0; i < wmSwm; i++) {
       const name = `wm-swm-${runTag}-${i}`;
+      // KA create auto-finalizes when `quads` are supplied; `alsoShareSwm`
+      // performs the WM→SWM transition (legacy `promote: true`).
       const r = await fetch(
-        `http://127.0.0.1:${core1.apiPort}/api/assertion/create`,
+        `http://127.0.0.1:${core1.apiPort}/api/knowledge-assets`,
         {
           method: 'POST',
           headers: {
@@ -1223,8 +1226,7 @@ describe('V10 chain — stress + scenario validation', () => {
             name,
             contextGraphId: CONTEXT_GRAPH,
             quads: buildQuads(name),
-            finalize: true,
-            promote: true,
+            alsoShareSwm: true,
           }),
         },
       );
@@ -1293,7 +1295,7 @@ describe('V10 chain — stress + scenario validation', () => {
       `\`publishFromFinalizedAssertion\` (\`packages/agent/src/dkg-agent.ts:4383\`) calls ` +
         `\`publishFromSharedMemory(contextGraphId, 'all', ...)\` with the literal selection \`'all'\`. ` +
         `It does NOT filter SWM content to the named assertion's quads. ` +
-        `Reproduction: promote N assertions (\`POST /api/assertion/create { ..., finalize: true, promote: true }\` × N) ` +
+        `Reproduction: promote N assertions (\`POST /api/knowledge-assets { ..., quads, alsoShareSwm: true }\` × N) ` +
         `then publish ONE of them by name (\`POST /api/shared-memory/publish { assertionName }\`). ` +
         `The publish bundles all N assertions' quads into one KC and the response status is \`tentative\` ` +
         `with \`kaId: "0"\` (sentinel), because the merkle root the publisher derives over the actual ` +

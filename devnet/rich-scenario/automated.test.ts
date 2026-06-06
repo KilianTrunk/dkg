@@ -310,15 +310,16 @@ async function assertionCreate(
   ts: number,
 ): Promise<string> {
   const { quads, rootSubject } = buildQuads(cgId, name, ts);
-  const res = await apiFetch(node, '/api/assertion/create', {
+  // KA create auto-finalizes when `quads` are supplied; `alsoShareSwm` is the
+  // WM→SWM transition that the legacy `promote: true` flag performed.
+  const res = await apiFetch(node, '/api/knowledge-assets', {
     method: 'POST',
     bearer: agentToken,
     body: JSON.stringify({
       name,
       contextGraphId: cgId,
       quads,
-      finalize: true,
-      ...(promote ? { promote: true } : {}),
+      ...(promote ? { alsoShareSwm: true } : {}),
     }),
   });
   if (!res.ok) {
@@ -701,14 +702,14 @@ describe('Devnet rich scenario (~10 min)', () => {
     for (let i = 0; i < WM_COUNT; i++) {
       const name = `bulk-wm-${run.stamp}-${i}`;
       const { quads } = buildBulkQuads(name, batchTs + i);
-      const res = await apiFetch(core1, '/api/assertion/create', {
+      // KA create auto-finalizes (seals to WM) when `quads` are supplied.
+      const res = await apiFetch(core1, '/api/knowledge-assets', {
         method: 'POST',
         bearer: token,
         body: JSON.stringify({
           name,
           contextGraphId: BULK_CG,
           quads,
-          finalize: true,
         }),
       });
       if (!res.ok) {
@@ -721,15 +722,16 @@ describe('Devnet rich scenario (~10 min)', () => {
     for (let i = 0; i < SWM_COUNT; i++) {
       const name = `bulk-swm-${run.stamp}-${i}`;
       const { quads } = buildBulkQuads(name, batchTs + 100 + i);
-      const res = await apiFetch(core1, '/api/assertion/create', {
+      // KA create auto-finalizes when `quads` are supplied; `alsoShareSwm`
+      // performs the WM→SWM transition (legacy `promote: true`).
+      const res = await apiFetch(core1, '/api/knowledge-assets', {
         method: 'POST',
         bearer: token,
         body: JSON.stringify({
           name,
           contextGraphId: BULK_CG,
           quads,
-          finalize: true,
-          promote: true,
+          alsoShareSwm: true,
         }),
       });
       if (!res.ok) {
@@ -742,15 +744,16 @@ describe('Devnet rich scenario (~10 min)', () => {
     for (let i = 0; i < VM_COUNT; i++) {
       const name = `bulk-vm-${run.stamp}-${i}`;
       const { quads, rootSubject } = buildBulkQuads(name, batchTs + 200 + i);
-      const createRes = await apiFetch(core1, '/api/assertion/create', {
+      // KA create auto-finalizes + `alsoShareSwm` promotes to SWM; the
+      // separate /api/shared-memory/publish below lifts SWM→VM.
+      const createRes = await apiFetch(core1, '/api/knowledge-assets', {
         method: 'POST',
         bearer: token,
         body: JSON.stringify({
           name,
           contextGraphId: BULK_CG,
           quads,
-          finalize: true,
-          promote: true,
+          alsoShareSwm: true,
         }),
       });
       if (!createRes.ok) {

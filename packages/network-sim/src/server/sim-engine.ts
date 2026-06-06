@@ -254,14 +254,14 @@ async function execPublish(
     };
   });
 
-  // RFC-001 §9.x — route through the assertion lifecycle (sign at
-  // creation): the daemon's `/api/assertion/create` endpoint accepts a
+  // RFC-001 §9.x — route through the knowledge-asset lifecycle (sign at
+  // creation): the daemon's `/api/knowledge-assets` endpoint accepts a
   // `quads + finalize: true + promote: true` shape that folds the
   // create→write→finalize→promote chain into a single round-trip.
   // The publish call then forwards the seal verbatim.
   const assertionName = `netsim-publish-${Date.now()}-${rndId()}`;
   try {
-    const createRes = await fetch(`http://127.0.0.1:${node.port}/api/assertion/create`, {
+    const createRes = await fetch(`http://127.0.0.1:${node.port}/api/knowledge-assets`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...authHeaders(node) },
       body: JSON.stringify({

@@ -233,7 +233,7 @@ ok "CG created on A: $(echo "$create_resp" | jq_field uri)"
 
 # -------------------------------------------------------------------------
 hr "Step 2 — Node A writes some WM data into 'widget-info' assertion"
-apiA POST /api/assertion/create "{\"contextGraphId\":\"$CG_ID\",\"name\":\"widget-info\"}" > /dev/null
+apiA POST /api/knowledge-assets "{\"contextGraphId\":\"$CG_ID\",\"name\":\"widget-info\"}" > /dev/null
 
 write_body=$(CG="$CG_ID" python3 <<'PY'
 import json, os
@@ -246,7 +246,7 @@ print(json.dumps({
 }))
 PY
 )
-write_resp=$(apiA POST "/api/assertion/widget-info/write" "$write_body")
+write_resp=$(apiA POST "/api/knowledge-assets/widget-info/wm/write" "$write_body")
 written=$(echo "$write_resp" | jq_field written)
 [ -n "$written" ] && [ "$written" != "0" ] || fail "write failed: $write_resp"
 ok "wrote $written quads into WM"
@@ -323,7 +323,7 @@ meta_count=$(count_integer_query "$N_B_API" "$N_B_TOKEN" "$CG_ID" "" \
 
 # -------------------------------------------------------------------------
 hr "Step 8 — Node A promotes WM → SWM, expect Node B to receive (encryption check)"
-promote_resp=$(apiA POST "/api/assertion/widget-info/promote" "{\"contextGraphId\":\"$CG_ID\"}")
+promote_resp=$(apiA POST "/api/knowledge-assets/widget-info/swm/share" "{\"contextGraphId\":\"$CG_ID\"}")
 promoted_ct=$(echo "$promote_resp" | jq_field promotedCount)
 [ -n "$promoted_ct" ] && [ "$promoted_ct" != "0" ] && [ "$promoted_ct" != "<parse-error" ] \
   || fail "promote failed: $promote_resp"

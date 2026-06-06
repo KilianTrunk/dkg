@@ -1353,7 +1353,7 @@ describe('A-1 — /api/query enforces working-memory isolation across agent toke
       // defaultAgentAddress, so this lands in default ("A")'s WM
       // namespace.
       const assertionName = 'a1-probe-' + Math.random().toString(36).slice(2, 8);
-      const createAssertionRes = await fetch(urlFor(d, '/api/assertion/create'), {
+      const createAssertionRes = await fetch(urlFor(d, '/api/knowledge-assets'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...authHeaders(d) },
         body: JSON.stringify({ contextGraphId: cgId, name: assertionName }),
@@ -1362,7 +1362,7 @@ describe('A-1 — /api/query enforces working-memory isolation across agent toke
 
       const seedSubject = 'urn:a1-seed:probe-' + Math.random().toString(36).slice(2, 8);
       const writeRes = await fetch(
-        urlFor(d, `/api/assertion/${encodeURIComponent(assertionName)}/write`),
+        urlFor(d, `/api/knowledge-assets/${encodeURIComponent(assertionName)}/wm/write`),
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', ...authHeaders(d) },
@@ -1518,7 +1518,7 @@ describe('A-1 — /api/query enforces working-memory isolation across agent toke
       // Seed one WM triple under the default agent so an unrestricted
       // query would return bindings if access control didn't apply.
       const assertionName = 'a1-denyshape-' + Math.random().toString(36).slice(2, 8);
-      const createAssertionRes = await fetch(urlFor(d, '/api/assertion/create'), {
+      const createAssertionRes = await fetch(urlFor(d, '/api/knowledge-assets'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...authHeaders(d) },
         body: JSON.stringify({ contextGraphId: cgId, name: assertionName }),
@@ -1526,7 +1526,7 @@ describe('A-1 — /api/query enforces working-memory isolation across agent toke
       expect([200, 201]).toContain(createAssertionRes.status);
       const seedSubject = 'urn:a1-denyshape:seed-' + Math.random().toString(36).slice(2, 8);
       const writeRes = await fetch(
-        urlFor(d, `/api/assertion/${encodeURIComponent(assertionName)}/write`),
+        urlFor(d, `/api/knowledge-assets/${encodeURIComponent(assertionName)}/wm/write`),
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', ...authHeaders(d) },

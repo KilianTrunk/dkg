@@ -30,7 +30,7 @@ describe.sequential('assertion CLI smoke', () => {
     await writeFile(join(dkgHome, 'sample.pdf'), Buffer.from('%PDF-1.4\nfake-pdf\n', 'utf-8'));
 
     server = createServer(async (req, res) => {
-      if (req.method === 'POST' && req.url === '/api/assertion/paper/import-file') {
+      if (req.method === 'POST' && req.url === '/api/knowledge-assets/paper/wm/import-file') {
         lastImportContentType = String(req.headers['content-type'] ?? '');
         const chunks: Buffer[] = [];
         for await (const chunk of req) {
@@ -52,7 +52,7 @@ describe.sequential('assertion CLI smoke', () => {
         return;
       }
 
-      if (req.method === 'GET' && req.url === '/api/assertion/paper/extraction-status?contextGraphId=research') {
+      if (req.method === 'GET' && req.url === '/api/knowledge-assets/paper/wm/extraction-status?contextGraphId=research') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
           assertionUri: 'did:dkg:context-graph:research/assertion/0xAgent/paper',
@@ -65,7 +65,7 @@ describe.sequential('assertion CLI smoke', () => {
         return;
       }
 
-      if (req.method === 'GET' && req.url === '/api/assertion/paper/extraction-status?contextGraphId=research&subGraphName=lab') {
+      if (req.method === 'GET' && req.url === '/api/knowledge-assets/paper/wm/extraction-status?contextGraphId=research&subGraphName=lab') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
           assertionUri: 'did:dkg:context-graph:research/sub-graph/lab/assertion/0xAgent/paper',
@@ -78,19 +78,19 @@ describe.sequential('assertion CLI smoke', () => {
         return;
       }
 
-      if (req.method === 'POST' && req.url === '/api/assertion/paper/promote') {
+      if (req.method === 'POST' && req.url === '/api/knowledge-assets/paper/swm/share') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
-          promoted: true,
+          swmShared: true,
+          promotedCount: 14,
           contextGraphId: 'research',
-          count: 14,
           sharedMemoryGraph: 'did:dkg:context-graph:research/shared-memory',
           rootEntities: ['urn:company:acme'],
         }));
         return;
       }
 
-      if (req.method === 'POST' && req.url === '/api/assertion/paper/query') {
+      if (req.method === 'GET' && req.url === '/api/knowledge-assets/paper/wm/quads?contextGraphId=research') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
           count: 2,

@@ -888,12 +888,12 @@ describe('dkg_publish SWM-first flow', () => {
     expect(parsed.quadsPublished).toBe(1);
 
     // V10 assertion lifecycle: the publish flow now creates a finalized
-    // assertion (`/api/assertion/create` with `finalize: true`) and then
+    // assertion (`/api/knowledge-assets` with `finalize: true`) and then
     // promotes it via `/api/shared-memory/publish`. The legacy
     // `/api/shared-memory/write` route was removed in Phase B-1.
     expect(ft.calls).toHaveLength(2);
     const createUrl = ft.calls[0][0] as string;
-    expect(createUrl).toContain('/api/assertion/create');
+    expect(createUrl).toContain('/api/knowledge-assets');
     const pubUrl = ft.calls[1][0] as string;
     expect(pubUrl).toContain('/api/shared-memory/publish');
   });

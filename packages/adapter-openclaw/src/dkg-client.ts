@@ -522,7 +522,7 @@ export class DkgDaemonClient {
     const cgId = normalizeContextGraphId(contextGraphId);
     try {
       const response = await this.post<{ assertionUri: string }>(
-        '/api/assertion/create',
+        '/api/knowledge-assets',
         { contextGraphId: cgId, name, subGraphName: opts?.subGraphName },
       );
       return { assertionUri: response.assertionUri, alreadyExists: false };
@@ -547,7 +547,7 @@ export class DkgDaemonClient {
     quads: Array<{ subject: string; predicate: string; object: string; graph?: string }>,
     opts?: { subGraphName?: string },
   ): Promise<{ written: number }> {
-    return this.post(`/api/assertion/${encodeURIComponent(name)}/write`, {
+    return this.post(`/api/knowledge-assets/${encodeURIComponent(name)}/wm/write`, {
       contextGraphId: normalizeContextGraphId(contextGraphId),
       quads,
       subGraphName: opts?.subGraphName,
@@ -564,7 +564,7 @@ export class DkgDaemonClient {
     name: string,
     opts?: { entities?: string[] | 'all'; subGraphName?: string },
   ): Promise<Record<string, unknown>> {
-    return this.post(`/api/assertion/${encodeURIComponent(name)}/promote`, {
+    return this.post(`/api/knowledge-assets/${encodeURIComponent(name)}/swm/share`, {
       contextGraphId: normalizeContextGraphId(contextGraphId),
       entities: opts?.entities,
       subGraphName: opts?.subGraphName,
@@ -581,7 +581,7 @@ export class DkgDaemonClient {
     name: string,
     opts?: { subGraphName?: string },
   ): Promise<{ discarded: boolean }> {
-    return this.post(`/api/assertion/${encodeURIComponent(name)}/discard`, {
+    return this.post(`/api/knowledge-assets/${encodeURIComponent(name)}/wm/discard`, {
       contextGraphId: normalizeContextGraphId(contextGraphId),
       subGraphName: opts?.subGraphName,
     });
@@ -598,10 +598,13 @@ export class DkgDaemonClient {
     name: string,
     opts?: { subGraphName?: string },
   ): Promise<{ quads: unknown[]; count: number }> {
-    return this.post(`/api/assertion/${encodeURIComponent(name)}/query`, {
+    const params = new URLSearchParams({
       contextGraphId: normalizeContextGraphId(contextGraphId),
-      subGraphName: opts?.subGraphName,
     });
+    if (opts?.subGraphName) params.set('subGraphName', opts.subGraphName);
+    return this.get(
+      `/api/knowledge-assets/${encodeURIComponent(name)}/wm/quads?${params.toString()}`,
+    );
   }
 
   /**
@@ -612,7 +615,7 @@ export class DkgDaemonClient {
   async resolveImportArtifact(
     request: ImportedArtifactRequest,
   ): Promise<{ artifact: ImportedArtifactResolution }> {
-    return this.post('/api/assertion/import-artifact/resolve', normalizeContextGraphRequest(request));
+    return this.post('/api/knowledge-assets/import-artifact/resolve', normalizeContextGraphRequest(request));
   }
 
   /**
@@ -629,7 +632,7 @@ export class DkgDaemonClient {
     bytes: number;
     markdown: string;
   }> {
-    return this.post('/api/assertion/import-artifact/read-markdown', normalizeContextGraphRequest(request));
+    return this.post('/api/knowledge-assets/import-artifact/read-markdown', normalizeContextGraphRequest(request));
   }
 
   /**
@@ -639,7 +642,7 @@ export class DkgDaemonClient {
   async writeSemanticEnrichment(
     request: SemanticEnrichmentWriteRequest,
   ): Promise<Record<string, unknown>> {
-    return this.post('/api/assertion/semantic-enrichment/write', normalizeContextGraphRequest(request));
+    return this.post('/api/knowledge-assets/semantic-enrichment/write', normalizeContextGraphRequest(request));
   }
 
   /**
@@ -656,7 +659,7 @@ export class DkgDaemonClient {
     if (opts?.agentAddress) params.set('agentAddress', opts.agentAddress);
     if (opts?.subGraphName) params.set('subGraphName', opts.subGraphName);
     return this.get(
-      `/api/assertion/${encodeURIComponent(name)}/history?${params.toString()}`,
+      `/api/knowledge-assets/${encodeURIComponent(name)}?${params.toString()}`,
     );
   }
 
@@ -692,7 +695,7 @@ export class DkgDaemonClient {
     if (opts?.subGraphName) form.append('subGraphName', opts.subGraphName);
 
     const res = await fetch(
-      `${this.baseUrl}/api/assertion/${encodeURIComponent(name)}/import-file`,
+      `${this.baseUrl}/api/knowledge-assets/${encodeURIComponent(name)}/wm/import-file`,
       {
         method: 'POST',
         headers: { Accept: 'application/json', ...this.authHeaders() },
@@ -703,7 +706,7 @@ export class DkgDaemonClient {
     if (!res.ok) {
       const text = await res.text().catch(() => '');
       throw new Error(
-        `DKG daemon /api/assertion/${name}/import-file responded ${res.status}: ${text}`,
+        `DKG daemon /api/knowledge-assets/${name}/wm/import-file responded ${res.status}: ${text}`,
       );
     }
     return res.json() as Promise<Record<string, unknown>>;
@@ -1018,7 +1021,7 @@ export class DkgDaemonClient {
       object: q.object,
       graph: q.graph || toContextGraphUri(cgId),
     }));
-    const created: any = await this.post('/api/assertion/create', {
+    const created: any = await this.post('/api/knowledge-assets', {
       contextGraphId: cgId,
       name: assertionName,
       quads: quadsWithGraph,

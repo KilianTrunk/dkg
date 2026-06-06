@@ -137,7 +137,7 @@ sharedMemoryCmd
       // RFC-001 §9.x — the legacy `shared-memory write` was a
       // free-form append into SWM. The new lifecycle requires a named
       // assertion. We create lazily on the first batch (no quads),
-      // then append batches via /api/assertion/:name/write.
+      // then append batches via /api/knowledge-assets/:name/wm/write.
       await client.createAssertion(targetContextGraph, assertionName, {
         ...(subGraphOption ? { subGraphName: subGraphOption } : {}),
       });

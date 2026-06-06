@@ -220,8 +220,8 @@ function makeMockClient({
     async request(method, path, body) {
       calls.push(`${method} ${path}`);
       requests.push({ method, path, body });
-      if (state.createAlreadyExists && method === 'POST' && path === '/api/assertion/create') {
-        const err = new Error('POST /api/assertion/create -> 409: {"error":"already exists"}');
+      if (state.createAlreadyExists && method === 'POST' && path === '/api/knowledge-assets') {
+        const err = new Error('POST /api/knowledge-assets -> 409: {"error":"already exists"}');
         err.status = 409;
         err.body = { error: 'already exists' };
         throw err;
@@ -236,7 +236,7 @@ function makeMockClient({
       const { entities } = payload;
       const bodyBytes = Buffer.byteLength(JSON.stringify(payload), 'utf8');
       if (bodyBytes > state.promoteBodyLimitBytes) {
-        const err = new Error(`POST /api/assertion/promote -> 413: body too large (${bodyBytes})`);
+        const err = new Error(`POST /api/knowledge-assets/:name/swm/share -> 413: body too large (${bodyBytes})`);
         err.status = 413;
         throw err;
       }
@@ -410,7 +410,7 @@ test('createImportManifest reuses an existing manifest assertion idempotently', 
     state.partitions.map((p) => [p.key, p.status]),
     [['src/bar.ts', 'pending'], ['src/foo.ts', 'pending']],
   );
-  assert.ok(client._state.calls.includes('POST /api/assertion/create'));
+  assert.ok(client._state.calls.includes('POST /api/knowledge-assets'));
   assert.ok(client._state.calls.some((c) => c.startsWith('write:')));
   assert.ok(client._state.calls.some((c) => c.startsWith('promote:')));
 });
@@ -777,7 +777,7 @@ test('createImportManifest uses sanitized default name for unsafe importIds', as
     subGraphName: 'meta',
   });
   const createRequests = client._state.requests.filter((r) => (
-    r.method === 'POST' && r.path === '/api/assertion/create'
+    r.method === 'POST' && r.path === '/api/knowledge-assets'
   ));
   assert.equal(createRequests.length, 1);
   assert.equal(

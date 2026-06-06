@@ -56,7 +56,7 @@ import {
 } from "./shared-assertion-helpers.js";
 import { PromoteJobConflictError } from "@origintrail-official/dkg-publisher";
 import { deriveStatus } from "@origintrail-official/dkg-publisher";
-import { validateAssertionName } from "@origintrail-official/dkg-core";
+import { validateAssertionName, contextGraphAssertionUri } from "@origintrail-official/dkg-core";
 
 const PREFIX = "/api/knowledge-assets";
 
@@ -727,6 +727,9 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
       }
       if (verb === "discard") {
         await agent.assertion.discard(contextGraphId, name, { subGraphName });
+        // Parity with legacy discard: evict any cached extraction-status record
+        // for this assertion so a re-import doesn't see a stale "completed".
+        ctx.extractionStatus.delete(contextGraphAssertionUri(contextGraphId, requestAgentAddress, name, subGraphName));
         emitMemoryGraphChanged?.({ contextGraphId, layers: ["wm"], subGraphName, operation: "assertion_discarded", source: "api" });
         return jsonResponse(res, 200, { discarded: true });
       }

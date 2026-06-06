@@ -1,7 +1,7 @@
 /**
  * Daemon lifecycle wiring for async promote.
  *
- * The route tests prove `/promote-async` enqueues jobs. The worker tests
+ * The route tests prove `/swm/share-async` enqueues jobs. The worker tests
  * prove the supervisor can drain a queue. This file pins the seam
  * `runDaemonInner()` uses after the API is listening: a job enqueued
  * through the HTTP route is drained by the daemon lifecycle worker, and
@@ -17,7 +17,7 @@ import {
   type PromoteJob,
   type PromoteListFilter,
 } from '@origintrail-official/dkg-publisher';
-import { handleAssertionRoutes } from '../src/daemon/routes/assertion.js';
+import { handleKnowledgeAssetsRoutes } from '../src/daemon/routes/knowledge-assets.js';
 import { daemonState, startPromoteWorkerDaemonLifecycle, type PromoteWorkerDaemonLifecycle } from '../src/daemon.js';
 
 describe('promote-async daemon lifecycle wiring', () => {
@@ -88,6 +88,7 @@ describe('promote-async daemon lifecycle wiring', () => {
       async contextGraphExists(contextGraphId: string) {
         return ['graphify', 'cg'].includes(contextGraphId);
       },
+      resolveAgentByToken: () => undefined,
       assertion: {
         async promoteAsync(
           contextGraphId: string,
@@ -125,7 +126,7 @@ describe('promote-async daemon lifecycle wiring', () => {
     server = createServer(async (req, res) => {
       const url = new URL(req.url ?? '/', 'http://127.0.0.1');
       try {
-        await handleAssertionRoutes({
+        await handleKnowledgeAssetsRoutes({
           req,
           res,
           agent,
@@ -133,7 +134,7 @@ describe('promote-async daemon lifecycle wiring', () => {
           publisherRuntime: null,
           config: {},
           startedAt: Date.now(),
-          dashDb: {},
+          dashDb: { insertNotification: () => 1 },
           opWallets: {},
           network: {},
           tracker: {},
@@ -156,6 +157,7 @@ describe('promote-async daemon lifecycle wiring', () => {
           requestToken: undefined,
           requestAgentAddress: 'did:dkg:agent:test',
           emitMemoryGraphChanged: () => {},
+          emitNotification: () => {},
         } as any);
         if (!res.writableEnded) {
           res.statusCode = 404;
@@ -198,7 +200,7 @@ describe('promote-async daemon lifecycle wiring', () => {
     await startRoutes(agent);
 
     daemonState.promoteWorkerAvailable = true;
-    const enqueued = await post('/api/assertion/daemon-lifecycle/promote-async', {
+    const enqueued = await post('/api/knowledge-assets/daemon-lifecycle/swm/share-async', {
       contextGraphId: 'graphify',
       subGraphName: 'code',
       entities: ['urn:dkg:entity:a'],

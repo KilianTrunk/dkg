@@ -1,5 +1,5 @@
 /**
- * Integration tests for the POST /api/assertion/:name/import-file orchestration.
+ * Integration tests for the POST /api/knowledge-assets/:name/wm/import-file orchestration.
  *
  * These tests exercise the full Phase 1 → Phase 2 → assertion.write pipeline
  * without spinning up a full DKGAgent (which needs libp2p + chain). Instead

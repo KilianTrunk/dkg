@@ -37,7 +37,7 @@ test.describe('Publishing lifecycle (devnet)', () => {
     requireDevnetPrecondition(test, !cg, 'No context graphs on devnet');
 
     const stamp = Date.now();
-    const res = await devnetApiFetch('/api/assertion/create', {
+    const res = await devnetApiFetch('/api/knowledge-assets', {
       method: 'POST',
       body: JSON.stringify({
         contextGraphId: cg.id,

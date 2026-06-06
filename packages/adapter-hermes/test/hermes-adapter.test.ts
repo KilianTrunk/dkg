@@ -2148,22 +2148,20 @@ client_spec.loader.exec_module(client_module)
 
 client = client_module.DKGClient("http://127.0.0.1:9200")
 client_calls = []
-def post(path, data=None):
-    client_calls.append((path, data or {}))
+def get(path):
+    client_calls.append(path)
     return {"quads": []}
-client._post = post
+client._get = get
+# query_assertion now dumps the full WM assertion graph via
+# GET /api/knowledge-assets/{name}/wm/quads. The legacy POST
+# /api/assertion/{name}/query route (which forwarded sparql) is gone; the
+# sparql argument is accepted for API compatibility but never sent.
 client.query_assertion("hermes", "cg:test", "SELECT ?s ?p ?o WHERE { ?s ?p ?o }")
 assert client_calls == [
-    (
-        "/api/assertion/hermes/query",
-        {
-            "contextGraphId": "cg:test",
-            "sparql": "SELECT ?s ?p ?o WHERE { ?s ?p ?o }",
-        },
-    )
+    "/api/knowledge-assets/hermes/wm/quads?contextGraphId=cg%3Atest",
 ], client_calls
 client.query_assertion("hermes", "cg:test")
-assert client_calls[-1] == ("/api/assertion/hermes/query", {"contextGraphId": "cg:test"}), client_calls
+assert client_calls[-1] == "/api/knowledge-assets/hermes/wm/quads?contextGraphId=cg%3Atest", client_calls
 
 spec = importlib.util.spec_from_file_location(
     "plugins.memory.dkg",
@@ -2484,12 +2482,12 @@ assert calls == [
     ("POST", "/api/context-graph/create", {"id": "team", "name": "Team", "description": "shared", "accessPolicy": 1, "allowedAgents": [_VALID_ADDR_A, _VALID_ADDR_B]}),
     ("POST", "/api/context-graph/create", {"id": "openexplicit", "name": "OpenExplicit", "description": "x", "accessPolicy": 0}),
     ("POST", "/api/context-graph/subscribe", {"contextGraphId": "cg:test", "includeSharedMemory": True}),
-    ("POST", "/api/assertion/a%20b/write", {"contextGraphId": "cg:test", "quads": [{"subject": "urn:s", "predicate": "urn:p", "object": '"o"'}], "subGraphName": "sub"}),
-    ("POST", "/api/assertion/import-artifact/resolve", {"contextGraphId": "cg:test", "assertionUri": "did:dkg:context-graph:cg:test/assertion/agent/imported", "fileHash": "sha256:" + "a" * 64, "subGraphName": "sub"}),
-    ("POST", "/api/assertion/import-artifact/read-markdown", {"contextGraphId": "cg:test", "assertionUri": "did:dkg:context-graph:cg:test/assertion/agent/imported", "maxBytes": 4096}),
-    ("POST", "/api/assertion/semantic-enrichment/write", {"contextGraphId": "cg:test", "semanticQuads": [{"subject": "urn:doc:1", "predicate": "http://schema.org/about", "object": '"Topic"'}], "assertionUri": "did:dkg:context-graph:cg:test/assertion/agent/imported", "generationMethod": "test-model", "agentIdentity": "did:dkg:agent:test", "generatedAt": "2026-05-11T00:00:00.000Z"}),
-    ("POST", "/api/assertion/a%20b/discard", {"contextGraphId": "cg:test"}),
-    ("GET", "/api/assertion/a%20b/history?contextGraphId=cg%3Atest&agentAddress=agent&subGraphName=sub", {}),
+    ("POST", "/api/knowledge-assets/a%20b/wm/write", {"contextGraphId": "cg:test", "quads": [{"subject": "urn:s", "predicate": "urn:p", "object": '"o"'}], "subGraphName": "sub"}),
+    ("POST", "/api/knowledge-assets/import-artifact/resolve", {"contextGraphId": "cg:test", "assertionUri": "did:dkg:context-graph:cg:test/assertion/agent/imported", "fileHash": "sha256:" + "a" * 64, "subGraphName": "sub"}),
+    ("POST", "/api/knowledge-assets/import-artifact/read-markdown", {"contextGraphId": "cg:test", "assertionUri": "did:dkg:context-graph:cg:test/assertion/agent/imported", "maxBytes": 4096}),
+    ("POST", "/api/knowledge-assets/semantic-enrichment/write", {"contextGraphId": "cg:test", "semanticQuads": [{"subject": "urn:doc:1", "predicate": "http://schema.org/about", "object": '"Topic"'}], "assertionUri": "did:dkg:context-graph:cg:test/assertion/agent/imported", "generationMethod": "test-model", "agentIdentity": "did:dkg:agent:test", "generatedAt": "2026-05-11T00:00:00.000Z"}),
+    ("POST", "/api/knowledge-assets/a%20b/wm/discard", {"contextGraphId": "cg:test"}),
+    ("GET", "/api/knowledge-assets/a%20b?contextGraphId=cg%3Atest&agentAddress=agent&subGraphName=sub", {}),
     ("POST", "/api/sub-graph/create", {"contextGraphId": "cg:test", "subGraphName": "notes"}),
     ("GET", "/api/sub-graph/list?contextGraphId=cg%3Atest", {}),
     ("POST", "/api/context-graph/invite", {"contextGraphId": "cg:test", "peerId": "peer"}),
@@ -3422,7 +3420,7 @@ result = client.import_assertion_file("assertion name", "cg:test", str(safe_file
 assert result == {"success": True}, result
 assert len(calls) == 1, calls
 call = calls[0]
-assert call["url"].endswith("/api/assertion/assertion%20name/import-file"), call
+assert call["url"].endswith("/api/knowledge-assets/assertion%20name/wm/import-file"), call
 assert call["data"] == {"contextGraphId": "cg:test", "subGraphName": "sub"}, call
 assert call["headers"] == {"Accept": "application/json", "Authorization": "Bearer secret-token"}, call
 file_tuple = call["files"]["file"]

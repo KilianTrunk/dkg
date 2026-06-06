@@ -10,7 +10,7 @@ import {
 } from '@origintrail-official/dkg-core';
 import { FileStore } from '../src/file-store.js';
 import type { ExtractionStatusRecord } from '../src/extraction-status.js';
-import { handleAssertionRoutes } from '../src/daemon/routes/assertion.js';
+import { handleKnowledgeAssetsRoutes } from '../src/daemon/routes/knowledge-assets.js';
 
 const DKG = 'http://dkg.io/ontology/';
 const PROV = 'http://www.w3.org/ns/prov#';
@@ -47,7 +47,7 @@ describe('import artifact daemon routes', () => {
     server = createServer(async (req, res) => {
       const url = new URL(req.url ?? '/', 'http://127.0.0.1');
       try {
-        await handleAssertionRoutes({
+        await handleKnowledgeAssetsRoutes({
           req,
           res,
           agent: args.agent,
@@ -101,6 +101,11 @@ describe('import artifact daemon routes', () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     });
+    return { status: res.status, body: await res.json() };
+  }
+
+  async function get(path: string) {
+    const res = await fetch(`${baseUrl}${path}`);
     return { status: res.status, body: await res.json() };
   }
 
@@ -296,7 +301,7 @@ describe('import artifact daemon routes', () => {
     });
     await startRoutes({ agent });
 
-    const resolved = await post('/api/assertion/import-artifact/resolve', {
+    const resolved = await post('/api/knowledge-assets/import-artifact/resolve', {
       contextGraphId,
       assertionUri,
       assertionName,
@@ -315,7 +320,7 @@ describe('import artifact daemon routes', () => {
       extractionStatus: 'completed',
     });
 
-    const read = await post('/api/assertion/import-artifact/read-markdown', {
+    const read = await post('/api/knowledge-assets/import-artifact/read-markdown', {
       contextGraphId,
       assertionUri,
       maxBytes: 1024,
@@ -346,7 +351,7 @@ describe('import artifact daemon routes', () => {
     });
     await startRoutes({ agent });
 
-    const resolved = await post('/api/assertion/import-artifact/resolve', {
+    const resolved = await post('/api/knowledge-assets/import-artifact/resolve', {
       contextGraphId,
       assertionUri: legacyAssertionUri,
       assertionName,
@@ -361,14 +366,14 @@ describe('import artifact daemon routes', () => {
       markdownHash: entry.keccak256,
     });
 
-    const read = await post('/api/assertion/import-artifact/read-markdown', {
+    const read = await post('/api/knowledge-assets/import-artifact/read-markdown', {
       contextGraphId,
       assertionUri: legacyAssertionUri,
     });
     expect(read.status).toBe(200);
     expect(read.body.markdown).toBe('# Legacy Imported\n');
 
-    const enriched = await post('/api/assertion/semantic-enrichment/write', {
+    const enriched = await post('/api/knowledge-assets/semantic-enrichment/write', {
       contextGraphId,
       assertionUri: legacyAssertionUri,
       semanticQuads: [
@@ -405,7 +410,7 @@ describe('import artifact daemon routes', () => {
     });
     await startRoutes({ agent });
 
-    const result = await post('/api/assertion/import-artifact/resolve', {
+    const result = await post('/api/knowledge-assets/import-artifact/resolve', {
       contextGraphId,
       assertionUri,
     });
@@ -438,7 +443,7 @@ describe('import artifact daemon routes', () => {
       });
       await startRoutes({ agent });
 
-      const result = await post('/api/assertion/import-artifact/resolve', {
+      const result = await post('/api/knowledge-assets/import-artifact/resolve', {
         contextGraphId,
         assertionUri,
       });
@@ -477,7 +482,7 @@ describe('import artifact daemon routes', () => {
     ]]);
     await startRoutes({ agent, extractionStatus });
 
-    const resolved = await post('/api/assertion/import-artifact/resolve', {
+    const resolved = await post('/api/knowledge-assets/import-artifact/resolve', {
       contextGraphId,
       assertionUri,
       fileHash: entry.keccak256,
@@ -485,7 +490,7 @@ describe('import artifact daemon routes', () => {
     expect(resolved.status).toBe(403);
     expect(resolved.body.error).toMatch(/owned by the requesting agent/);
 
-    const read = await post('/api/assertion/import-artifact/read-markdown', {
+    const read = await post('/api/knowledge-assets/import-artifact/read-markdown', {
       contextGraphId,
       assertionUri,
       maxBytes: 1024,
@@ -518,7 +523,7 @@ describe('import artifact daemon routes', () => {
     });
     await startRoutes({ agent });
 
-    const resolved = await post('/api/assertion/import-artifact/resolve', {
+    const resolved = await post('/api/knowledge-assets/import-artifact/resolve', {
       contextGraphId,
       assertionUri,
       fileHash: entry.keccak256,
@@ -532,7 +537,7 @@ describe('import artifact daemon routes', () => {
       ownerGuardRelaxed: true,
     });
 
-    const read = await post('/api/assertion/import-artifact/read-markdown', {
+    const read = await post('/api/knowledge-assets/import-artifact/read-markdown', {
       contextGraphId,
       assertionUri,
       maxBytes: 1024,
@@ -564,14 +569,14 @@ describe('import artifact daemon routes', () => {
     });
     await startRoutes({ agent });
 
-    const resolved = await post('/api/assertion/import-artifact/resolve', {
+    const resolved = await post('/api/knowledge-assets/import-artifact/resolve', {
       contextGraphId,
       assertionUri,
     });
     expect(resolved.status).toBe(200);
     expect(resolved.body.artifact.ownerGuardRelaxed).toBe(true);
 
-    const read = await post('/api/assertion/import-artifact/read-markdown', {
+    const read = await post('/api/knowledge-assets/import-artifact/read-markdown', {
       contextGraphId,
       assertionUri,
       maxBytes: 1024,
@@ -603,7 +608,7 @@ describe('import artifact daemon routes', () => {
     });
     await startRoutes({ agent });
 
-    const resolved = await post('/api/assertion/import-artifact/resolve', {
+    const resolved = await post('/api/knowledge-assets/import-artifact/resolve', {
       contextGraphId,
       assertionUri,
     });
@@ -617,7 +622,7 @@ describe('import artifact daemon routes', () => {
       ownerGuardRelaxed: true,
     });
 
-    const read = await post('/api/assertion/import-artifact/read-markdown', {
+    const read = await post('/api/knowledge-assets/import-artifact/read-markdown', {
       contextGraphId,
       assertionUri,
       maxBytes: 1024,
@@ -647,7 +652,7 @@ describe('import artifact daemon routes', () => {
     });
     await startRoutes({ agent });
 
-    const resolved = await post('/api/assertion/import-artifact/resolve', {
+    const resolved = await post('/api/knowledge-assets/import-artifact/resolve', {
       contextGraphId,
       assertionUri,
     });
@@ -672,7 +677,7 @@ describe('import artifact daemon routes', () => {
     });
     await startRoutes({ agent });
 
-    const resolved = await post('/api/assertion/import-artifact/resolve', {
+    const resolved = await post('/api/knowledge-assets/import-artifact/resolve', {
       contextGraphId,
       assertionUri,
     });
@@ -702,7 +707,7 @@ describe('import artifact daemon routes', () => {
     });
     await startRoutes({ agent });
 
-    const enriched = await post('/api/assertion/semantic-enrichment/write', {
+    const enriched = await post('/api/knowledge-assets/semantic-enrichment/write', {
       contextGraphId,
       assertionUri,
       semanticQuads: [
@@ -748,7 +753,7 @@ describe('import artifact daemon routes', () => {
     });
     await startRoutes({ agent });
 
-    const resolved = await post('/api/assertion/import-artifact/resolve', {
+    const resolved = await post('/api/knowledge-assets/import-artifact/resolve', {
       contextGraphId,
       assertionUri: legacyAssertionUri,
     });
@@ -764,7 +769,7 @@ describe('import artifact daemon routes', () => {
     // `!parsedAssertion.legacy`) so `ownerGuardRelaxed` is absent.
     expect(resolved.body.artifact.ownerGuardRelaxed).toBeUndefined();
 
-    const read = await post('/api/assertion/import-artifact/read-markdown', {
+    const read = await post('/api/knowledge-assets/import-artifact/read-markdown', {
       contextGraphId,
       assertionUri: legacyAssertionUri,
     });
@@ -817,7 +822,7 @@ describe('import artifact daemon routes', () => {
 
     await startRoutes({ agent });
 
-    const read = await post('/api/assertion/import-artifact/read-markdown', {
+    const read = await post('/api/knowledge-assets/import-artifact/read-markdown', {
       contextGraphId,
       assertionUri: legacyAssertionUri,
       maxBytes: 1024,
@@ -868,7 +873,7 @@ describe('import artifact daemon routes', () => {
     });
     await startRoutes({ agent });
 
-    const resolved = await post('/api/assertion/import-artifact/resolve', {
+    const resolved = await post('/api/knowledge-assets/import-artifact/resolve', {
       contextGraphId,
       assertionUri,
     });
@@ -894,7 +899,7 @@ describe('import artifact daemon routes', () => {
     });
     await startRoutes({ agent });
 
-    const result = await post('/api/assertion/import-artifact/resolve', {
+    const result = await post('/api/knowledge-assets/import-artifact/resolve', {
       contextGraphId,
       assertionName,
     });
@@ -920,7 +925,7 @@ describe('import artifact daemon routes', () => {
     });
     await startRoutes({ agent, events });
 
-    const result = await post('/api/assertion/semantic-enrichment/write', {
+    const result = await post('/api/knowledge-assets/semantic-enrichment/write', {
       contextGraphId,
       assertionUri,
       semanticQuads: [
@@ -995,7 +1000,7 @@ describe('import artifact daemon routes', () => {
     ]]);
     await startRoutes({ agent, extractionStatus });
 
-    const result = await post('/api/assertion/semantic-enrichment/write', {
+    const result = await post('/api/knowledge-assets/semantic-enrichment/write', {
       contextGraphId,
       assertionUri,
       semanticQuads: [
@@ -1024,7 +1029,7 @@ describe('import artifact daemon routes', () => {
     });
     await startRoutes({ agent });
 
-    const result = await post('/api/assertion/semantic-enrichment/write', {
+    const result = await post('/api/knowledge-assets/semantic-enrichment/write', {
       contextGraphId,
       assertionUri,
       semanticQuads: [
@@ -1056,7 +1061,7 @@ describe('import artifact daemon routes', () => {
     });
     await startRoutes({ agent });
 
-    const result = await post('/api/assertion/semantic-enrichment/write', {
+    const result = await post('/api/knowledge-assets/semantic-enrichment/write', {
       contextGraphId,
       assertionUri,
       semanticQuads: [
@@ -1095,7 +1100,7 @@ describe('import artifact daemon routes', () => {
     });
     await startRoutes({ agent });
 
-    const result = await post('/api/assertion/semantic-enrichment/write', {
+    const result = await post('/api/knowledge-assets/semantic-enrichment/write', {
       contextGraphId,
       assertionUri,
       semanticQuads: [
@@ -1132,7 +1137,7 @@ describe('import artifact daemon routes', () => {
     });
     await startRoutes({ agent, events });
 
-    const result = await post('/api/assertion/semantic-enrichment/write', {
+    const result = await post('/api/knowledge-assets/semantic-enrichment/write', {
       contextGraphId,
       assertionUri,
       semanticQuads: [
@@ -1163,7 +1168,7 @@ describe('import artifact daemon routes', () => {
     });
     await startRoutes({ agent });
 
-    const result = await post('/api/assertion/semantic-enrichment/write', {
+    const result = await post('/api/knowledge-assets/semantic-enrichment/write', {
       contextGraphId,
       assertionUri,
       name: assertionName,
@@ -1192,7 +1197,7 @@ describe('import artifact daemon routes', () => {
     });
     await startRoutes({ agent });
 
-    const result = await post('/api/assertion/semantic-enrichment/write', {
+    const result = await post('/api/knowledge-assets/semantic-enrichment/write', {
       contextGraphId,
       assertionUri,
       semanticQuads: [
@@ -1225,7 +1230,7 @@ describe('import artifact daemon routes', () => {
     });
     await startRoutes({ agent });
 
-    const result = await post('/api/assertion/semantic-enrichment/write', {
+    const result = await post('/api/knowledge-assets/semantic-enrichment/write', {
       contextGraphId,
       assertionUri,
       semanticAssertionName: 'semantic-imported-md',
@@ -1254,7 +1259,7 @@ describe('import artifact daemon routes', () => {
     });
     await startRoutes({ agent });
 
-    const result = await post('/api/assertion/import-artifact/resolve', {
+    const result = await post('/api/knowledge-assets/import-artifact/resolve', {
       contextGraphId,
       assertionUri,
     });
@@ -1278,7 +1283,7 @@ describe('import artifact daemon routes', () => {
     });
     await startRoutes({ agent });
 
-    const result = await post('/api/assertion/import-artifact/resolve', {
+    const result = await post('/api/knowledge-assets/import-artifact/resolve', {
       contextGraphId,
       assertionUri,
     });
@@ -1305,7 +1310,7 @@ describe('import artifact daemon routes', () => {
     });
     await startRoutes({ agent });
 
-    const result = await post('/api/assertion/import-artifact/resolve', {
+    const result = await post('/api/knowledge-assets/import-artifact/resolve', {
       contextGraphId,
       assertionUri,
     });
@@ -1347,7 +1352,7 @@ describe('import artifact daemon routes', () => {
     ]);
     await startRoutes({ agent, extractionStatus });
 
-    const result = await post('/api/assertion/import-artifact/resolve', {
+    const result = await post('/api/knowledge-assets/import-artifact/resolve', {
       contextGraphId,
       assertionUri,
     });
@@ -1387,7 +1392,7 @@ describe('import artifact daemon routes', () => {
     ]);
     await startRoutes({ agent, extractionStatus });
 
-    const result = await post('/api/assertion/import-artifact/resolve', {
+    const result = await post('/api/knowledge-assets/import-artifact/resolve', {
       contextGraphId,
       assertionUri,
     });
@@ -1425,16 +1430,16 @@ describe('import artifact daemon routes', () => {
     ]);
     await startRoutes({ agent, extractionStatus });
 
-    const skipped = await post('/api/assertion/import-artifact/resolve', {
+    const skipped = await post('/api/knowledge-assets/import-artifact/resolve', {
       contextGraphId,
       assertionUri,
     });
     expect(skipped.status).toBe(409);
     expect(skipped.body.error).toMatch(/not a completed extraction/);
 
-    const query = await post(`/api/assertion/${encodeURIComponent(assertionName)}/query`, {
-      contextGraphId,
-    });
+    const query = await get(
+      `/api/knowledge-assets/${encodeURIComponent(assertionName)}/wm/quads?contextGraphId=${encodeURIComponent(contextGraphId)}`,
+    );
     expect(query.status).toBe(200);
     expect(query.body.quads).toEqual([
       { subject: 'urn:a', predicate: 'urn:p', object: '"A"' },

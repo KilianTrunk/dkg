@@ -1105,8 +1105,8 @@ export class DKGPublisher implements Publisher {
 
     for (const cond of options.conditions) {
       const ask = cond.expectedValue === null
-        ? `ASK { GRAPH ?g { <${cond.subject}> <${cond.predicate}> ?o } FILTER((STRSTARTS(STR(?g), "${swmGraph}/") || STR(?g) = "${swmGraph}")) }`
-        : `ASK { GRAPH ?g { <${cond.subject}> <${cond.predicate}> ${cond.expectedValue} } FILTER((STRSTARTS(STR(?g), "${swmGraph}/") || STR(?g) = "${swmGraph}")) }`;
+        ? `ASK { GRAPH ?g { <${cond.subject}> <${cond.predicate}> ?o } FILTER(((STRSTARTS(STR(?g), "${swmGraph}/") && !STRSTARTS(STR(?g), "${swmGraph}/staging/")) || STR(?g) = "${swmGraph}")) }`
+        : `ASK { GRAPH ?g { <${cond.subject}> <${cond.predicate}> ${cond.expectedValue} } FILTER(((STRSTARTS(STR(?g), "${swmGraph}/") && !STRSTARTS(STR(?g), "${swmGraph}/staging/")) || STR(?g) = "${swmGraph}")) }`;
       const result = await this.store.query(ask);
 
       if (result.type !== 'boolean') {
@@ -1115,7 +1115,7 @@ export class DKGPublisher implements Publisher {
 
       const shouldExist = cond.expectedValue !== null;
       if (result.value !== shouldExist) {
-        const sel = `SELECT ?o WHERE { GRAPH ?g { <${cond.subject}> <${cond.predicate}> ?o } FILTER((STRSTARTS(STR(?g), "${swmGraph}/") || STR(?g) = "${swmGraph}")) } LIMIT 1`;
+        const sel = `SELECT ?o WHERE { GRAPH ?g { <${cond.subject}> <${cond.predicate}> ?o } FILTER(((STRSTARTS(STR(?g), "${swmGraph}/") && !STRSTARTS(STR(?g), "${swmGraph}/staging/")) || STR(?g) = "${swmGraph}")) } LIMIT 1`;
         const cur = await this.store.query(sel);
         const actual = cur.type === 'bindings' && cur.bindings.length > 0 ? cur.bindings[0].o ?? null : null;
         throw new StaleWriteError(cond, actual);
@@ -1230,7 +1230,7 @@ export class DKGPublisher implements Publisher {
 
     let sparql: string;
     if (selection === 'all') {
-      sparql = `CONSTRUCT { ?s ?p ?o } WHERE { GRAPH ?g { ?s ?p ?o } FILTER((STRSTARTS(STR(?g), "${swmGraph}/") || STR(?g) = "${swmGraph}")) }`;
+      sparql = `CONSTRUCT { ?s ?p ?o } WHERE { GRAPH ?g { ?s ?p ?o } FILTER(((STRSTARTS(STR(?g), "${swmGraph}/") && !STRSTARTS(STR(?g), "${swmGraph}/staging/")) || STR(?g) = "${swmGraph}")) }`;
     } else {
       const roots = [...new Set(
         selection.rootEntities
@@ -1255,7 +1255,7 @@ export class DKGPublisher implements Publisher {
             || STRSTARTS(STR(?s), CONCAT(STR(?root), "/.well-known/genid/"))
           )
         }
-        FILTER((STRSTARTS(STR(?g), "${swmGraph}/") || STR(?g) = "${swmGraph}"))
+        FILTER(((STRSTARTS(STR(?g), "${swmGraph}/") && !STRSTARTS(STR(?g), "${swmGraph}/staging/")) || STR(?g) = "${swmGraph}"))
       }`;
     }
 
@@ -4351,7 +4351,7 @@ export class DKGPublisher implements Publisher {
     const values = entities.map((e) => `<${e}>`).join(' ');
     // Per-KA SWM: when pulling from SWM the source spans the per-KA prefix, not one bucket.
     const sourcePattern = sourceLayer === 'swm'
-      ? `GRAPH ?g { VALUES ?root { ${values} } ?s ?p ?o . FILTER(?s = ?root || STRSTARTS(STR(?s), CONCAT(STR(?root), "/.well-known/genid/"))) } FILTER(STRSTARTS(STR(?g), "${sourceGraph}/") || STR(?g) = "${sourceGraph}")`
+      ? `GRAPH ?g { VALUES ?root { ${values} } ?s ?p ?o . FILTER(?s = ?root || STRSTARTS(STR(?s), CONCAT(STR(?root), "/.well-known/genid/"))) } FILTER((STRSTARTS(STR(?g), "${sourceGraph}/") && !STRSTARTS(STR(?g), "${sourceGraph}/staging/")) || STR(?g) = "${sourceGraph}")`
       : `GRAPH <${sourceGraph}> { VALUES ?root { ${values} } ?s ?p ?o . FILTER(?s = ?root || STRSTARTS(STR(?s), CONCAT(STR(?root), "/.well-known/genid/"))) }`;
     const gather = await this.store.query(
       `CONSTRUCT { ?s ?p ?o } WHERE { ${sourcePattern} }`,

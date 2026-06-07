@@ -91,10 +91,10 @@ export function resolveViewGraphs(
       };
     }
     case 'shared-working-memory':
-      // Uniform layout: SWM is per-KA `…/_shared_memory/{addr}/{number}`; read the prefix
-      // (mirrors WM), not the single bucket.
+      // Uniform layout: SWM is per-KA `…/_shared_memory/{addr}/{number}` (the prefix);
+      // the bare bucket is kept as a read-both fallback (empty in the pure per-KA flow).
       return {
-        graphs: [],
+        graphs: [contextGraphSharedMemoryUri(contextGraphId)],
         graphPrefixes: [`did:dkg:context-graph:${contextGraphId}/_shared_memory/`],
       };
     case 'verified-memory': {

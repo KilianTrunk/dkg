@@ -831,7 +831,7 @@ describe('[Q-5] Context Oracle proof params → correct graph targets', () => {
 
   it('shared-working-memory targets exactly the SWM graph (nothing else)', () => {
     const res = resolveViewGraphs('shared-working-memory', CG);
-    expect(res.graphs).toEqual([]);
+    expect(res.graphs).toEqual([contextGraphSharedMemoryUri(CG)]);
     expect(res.graphPrefixes).toEqual([`did:dkg:context-graph:${CG}/_shared_memory/`]);
   });
 

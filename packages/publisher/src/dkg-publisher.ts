@@ -1505,12 +1505,17 @@ export class DKGPublisher implements Publisher {
       const swmOwnershipKey = options?.subGraphName ? `${contextGraphId}\0${options.subGraphName}` : contextGraphId;
       const kaMap = skolemizeByEntity(quads);
       let ownerDeletedTotal = 0;
+      // Uniform layout: published data lives in per-KA …/_shared_memory/{addr}/{number}
+      // graphs, so the cleanup must span all of them (+ the legacy bucket).
+      const swmGraphsForClear = await this.swmGraphsUnder(swmGraph);
       for (const rootEntity of kaMap.keys()) {
-        await this.store.deleteByPattern({ graph: swmGraph, subject: rootEntity });
-        await this.store.deleteBySubjectPrefix(swmGraph, rootEntity + '/.well-known/genid/');
-        await this.store.deleteByPattern({
-          graph: swmGraph, subject: rootEntity, predicate: WORKSPACE_OWNER_PREDICATE,
-        });
+        for (const g of swmGraphsForClear) {
+          await this.store.deleteByPattern({ graph: g, subject: rootEntity });
+          await this.store.deleteBySubjectPrefix(g, rootEntity + '/.well-known/genid/');
+          await this.store.deleteByPattern({
+            graph: g, subject: rootEntity, predicate: WORKSPACE_OWNER_PREDICATE,
+          });
+        }
         const ownerDeleted = await this.store.deleteByPattern({
           graph: swmMetaGraph, subject: rootEntity, predicate: WORKSPACE_OWNER_PREDICATE,
         });
@@ -1524,7 +1529,10 @@ export class DKGPublisher implements Publisher {
       // If clearSharedMemoryAfter is explicitly true, also clear any remaining unpublished content.
       // Default is false: unpublished entities stay in SWM for future publishes.
       if (options?.clearSharedMemoryAfter === true) {
-        const remainingCount = await this.store.deleteByPattern({ graph: swmGraph });
+        let remainingCount = 0;
+        for (const g of await this.swmGraphsUnder(swmGraph)) {
+          remainingCount += await this.store.deleteByPattern({ graph: g });
+        }
         const remainingMetaCount = await this.store.deleteByPattern({ graph: swmMetaGraph });
         if (remainingCount > 0 || remainingMetaCount > 0) {
           this.log.info(ctx, `Cleared remaining SWM content: ${remainingCount} triples, ${remainingMetaCount} meta`);
@@ -4116,6 +4124,17 @@ export class DKGPublisher implements Publisher {
   /** SWM graph URI from an explicit `{author, number}` (receiver-side / freshly-allocated generic share). */
   private swmGraphUriFor(contextGraphId: string, agentAddress: string, kaNumber: bigint, subGraphName?: string): string {
     return contextGraphLayerUri(contextGraphId, MemoryLayer.SharedWorkingMemory, agentAddress, kaNumber, subGraphName);
+  }
+
+  /**
+   * Every SWM graph under a bucket: the bare bucket PLUS the per-KA
+   * `…/_shared_memory/{addr}/{number}` graphs. SWM deletes/cleanup must
+   * span all of them under the uniform layout (the `_shared_memory_meta`
+   * graph is intentionally excluded — it is not under the `/` prefix).
+   */
+  private async swmGraphsUnder(bucketGraph: string): Promise<string[]> {
+    const all = await this.store.listGraphs();
+    return all.filter((g) => g === bucketGraph || g.startsWith(`${bucketGraph}/`));
   }
 
   async assertionCreate(

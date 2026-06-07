@@ -188,13 +188,17 @@ export class PublishHandler {
     try {
       const swmGraph = this.graphManager.sharedMemoryUri(pending.contextGraphId);
       const swmMetaGraph = this.graphManager.sharedMemoryMetaUri(pending.contextGraphId);
+      // Uniform layout: span the per-KA …/_shared_memory/{addr}/{number} graphs + the bucket.
+      const swmGraphs = (await this.store.listGraphs()).filter(g => g === swmGraph || g.startsWith(`${swmGraph}/`));
       const rootEntities = new Set(pending.dataQuads.map(q => q.subject));
       for (const rootEntity of rootEntities) {
-        await this.store.deleteByPattern({ graph: swmGraph, subject: rootEntity });
-        await this.store.deleteBySubjectPrefix(swmGraph, rootEntity + '/.well-known/genid/');
-        await this.store.deleteByPattern({
-          graph: swmGraph, subject: rootEntity, predicate: 'http://dkg.io/ontology/workspaceOwner',
-        });
+        for (const g of swmGraphs) {
+          await this.store.deleteByPattern({ graph: g, subject: rootEntity });
+          await this.store.deleteBySubjectPrefix(g, rootEntity + '/.well-known/genid/');
+          await this.store.deleteByPattern({
+            graph: g, subject: rootEntity, predicate: 'http://dkg.io/ontology/workspaceOwner',
+          });
+        }
         await this.store.deleteByPattern({
           graph: swmMetaGraph, subject: rootEntity, predicate: 'http://dkg.io/ontology/workspaceOwner',
         });

@@ -211,10 +211,14 @@ export class DKGQueryEngine implements QueryEngine {
         ? contextGraphSubGraphUri(effectiveContextGraphId, options.subGraphName)
         : contextGraphDataUri(effectiveContextGraphId);
       const sharedMemoryGraph = contextGraphSharedMemoryUri(effectiveContextGraphId, options?.subGraphName);
+      // Per-KA SWM: when a route targets SWM, expand the allow-set with the discovered
+      // …/_shared_memory/{addr}/{number} graphs so GRAPH-variable scans bind them.
+      const swmRouted = (options?.includeSharedMemory ?? options?.includeWorkspace) || options?.graphSuffix === '_shared_memory';
+      const swmPerKaGraphs = swmRouted ? await this.discoverGraphsByPrefix(`${sharedMemoryGraph}/`) : [];
       const allowedGraphs = options?.includeSharedMemory ?? options?.includeWorkspace
-        ? [dataGraph, sharedMemoryGraph]
+        ? [dataGraph, sharedMemoryGraph, ...swmPerKaGraphs]
         : options?.graphSuffix === '_shared_memory'
-          ? [sharedMemoryGraph]
+          ? [sharedMemoryGraph, ...swmPerKaGraphs]
           : [dataGraph];
       // Authenticated callers that scope a query to a `contextGraphId`
       // already have read access to that CG; refusing them visibility
@@ -326,13 +330,22 @@ export class DKGQueryEngine implements QueryEngine {
       const sharedMemoryGraph = contextGraphSharedMemoryUri(effectiveContextGraphId, options?.subGraphName);
       if (options?.includeSharedMemory ?? options?.includeWorkspace) {
         const dataSparql = wrapWithGraph(sparql, dataGraph);
-        const sharedMemorySparql = wrapWithGraph(sparql, sharedMemoryGraph);
+        // Per-KA SWM: union the discovered …/_shared_memory/{addr}/{number} graphs.
+        const swmGraphs = await this.discoverGraphsByPrefix(`${sharedMemoryGraph}/`);
+        const sharedMemorySparql = swmGraphs.length > 0
+          ? (wrapWithGraphUnion(sparql, swmGraphs) ?? wrapWithGraph(sparql, sharedMemoryGraph))
+          : wrapWithGraph(sparql, sharedMemoryGraph);
         const dataResult = await this.store.query(dataSparql);
         const smResult = await this.store.query(sharedMemorySparql);
         return mergeSharedMemoryAndDataResults(dataResult, smResult);
       }
       if (options?.graphSuffix === '_shared_memory') {
-        effectiveSparql = wrapWithGraph(sparql, sharedMemoryGraph);
+        // Uniform layout: SWM is per-KA …/_shared_memory/{addr}/{number}. Discover the
+        // per-KA graphs under the prefix and union them (the legacy bucket is now empty).
+        const swmGraphs = await this.discoverGraphsByPrefix(`${sharedMemoryGraph}/`);
+        effectiveSparql = swmGraphs.length > 0
+          ? (wrapWithGraphUnion(sparql, swmGraphs) ?? wrapWithGraph(sparql, sharedMemoryGraph))
+          : wrapWithGraph(sparql, sharedMemoryGraph);
       } else {
         effectiveSparql = wrapWithGraph(sparql, dataGraph);
       }

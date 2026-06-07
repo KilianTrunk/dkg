@@ -2465,7 +2465,7 @@ export class PublishMethods extends DKGAgentBase {
     const swmGraph = contextGraphSharedMemoryUri(contextGraphId, subGraphName);
     let sparql: string;
     if (selection === 'all') {
-      sparql = `CONSTRUCT { ?s ?p ?o } WHERE { GRAPH <${swmGraph}> { ?s ?p ?o } }`;
+      sparql = `CONSTRUCT { ?s ?p ?o } WHERE { GRAPH ?g { ?s ?p ?o } FILTER(STRSTARTS(STR(?g), "${swmGraph}/") || STR(?g) = "${swmGraph}") }`;
     } else {
       // Round 4 review §10 — mirror the `isSafeIri` filter that
       // `DKGPublisher.publishFromSharedMemory` applies before its own
@@ -2494,7 +2494,7 @@ export class PublishMethods extends DKGAgentBase {
       }
       const values = roots.map((r) => `<${r}>`).join(' ');
       sparql = `CONSTRUCT { ?s ?p ?o } WHERE {
-        GRAPH <${swmGraph}> {
+        GRAPH ?g {
           VALUES ?root { ${values} }
           ?s ?p ?o .
           FILTER(
@@ -2502,6 +2502,7 @@ export class PublishMethods extends DKGAgentBase {
             || STRSTARTS(STR(?s), CONCAT(STR(?root), "/.well-known/genid/"))
           )
         }
+        FILTER(STRSTARTS(STR(?g), "${swmGraph}/") || STR(?g) = "${swmGraph}")
       }`;
     }
     const result = await this.store.query(sparql);

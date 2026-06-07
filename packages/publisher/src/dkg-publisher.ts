@@ -870,7 +870,16 @@ export class DKGPublisher implements Publisher {
     }
 
     const shareOperationId = `swm-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-    const swmGraph = this.graphManager.sharedMemoryUri(contextGraphId, options.subGraphName);
+    // Uniform layout: each generic share is a per-KA unit — mint a number for the sender
+    // and write to …/_shared_memory/{sender}/{number}. Falls back to the legacy bucket
+    // only when there's no valid EVM sender / allocator.
+    const shareKaId = (options.senderAgentAddress && /^0x[a-fA-F0-9]{40}$/.test(options.senderAgentAddress))
+      ? await this.ensureReservedKaId(options.senderAgentAddress)
+      : undefined;
+    const shareKaNumber = shareKaId !== undefined ? (shareKaId & ((1n << 96n) - 1n)) : undefined;
+    const swmGraph = (shareKaNumber !== undefined && options.senderAgentAddress)
+      ? this.swmGraphUriFor(contextGraphId, options.senderAgentAddress, shareKaNumber, options.subGraphName)
+      : this.graphManager.sharedMemoryUri(contextGraphId, options.subGraphName);
     const swmMetaGraph = this.graphManager.sharedMemoryMetaUri(contextGraphId, options.subGraphName);
 
     // Pre-encode gossip message and enforce size limit BEFORE any
@@ -906,6 +915,8 @@ export class DKGPublisher implements Publisher {
       operationId: ctx.operationId,
       casConditions,
       subGraphName: options.subGraphName,
+      agentAddress: options.senderAgentAddress,
+      kaNumber: shareKaNumber !== undefined ? String(shareKaNumber) : undefined,
     });
     const message = await this.encodeWorkspaceGossipPayload(
       contextGraphId,
@@ -1100,8 +1111,8 @@ export class DKGPublisher implements Publisher {
 
     for (const cond of options.conditions) {
       const ask = cond.expectedValue === null
-        ? `ASK { GRAPH <${swmGraph}> { <${cond.subject}> <${cond.predicate}> ?o } }`
-        : `ASK { GRAPH <${swmGraph}> { <${cond.subject}> <${cond.predicate}> ${cond.expectedValue} } }`;
+        ? `ASK { GRAPH ?g { <${cond.subject}> <${cond.predicate}> ?o } FILTER((STRSTARTS(STR(?g), "${swmGraph}/") || STR(?g) = "${swmGraph}")) }`
+        : `ASK { GRAPH ?g { <${cond.subject}> <${cond.predicate}> ${cond.expectedValue} } FILTER((STRSTARTS(STR(?g), "${swmGraph}/") || STR(?g) = "${swmGraph}")) }`;
       const result = await this.store.query(ask);
 
       if (result.type !== 'boolean') {
@@ -1110,7 +1121,7 @@ export class DKGPublisher implements Publisher {
 
       const shouldExist = cond.expectedValue !== null;
       if (result.value !== shouldExist) {
-        const sel = `SELECT ?o WHERE { GRAPH <${swmGraph}> { <${cond.subject}> <${cond.predicate}> ?o } } LIMIT 1`;
+        const sel = `SELECT ?o WHERE { GRAPH ?g { <${cond.subject}> <${cond.predicate}> ?o } FILTER((STRSTARTS(STR(?g), "${swmGraph}/") || STR(?g) = "${swmGraph}")) } LIMIT 1`;
         const cur = await this.store.query(sel);
         const actual = cur.type === 'bindings' && cur.bindings.length > 0 ? cur.bindings[0].o ?? null : null;
         throw new StaleWriteError(cond, actual);
@@ -1225,7 +1236,7 @@ export class DKGPublisher implements Publisher {
 
     let sparql: string;
     if (selection === 'all') {
-      sparql = `CONSTRUCT { ?s ?p ?o } WHERE { GRAPH <${swmGraph}> { ?s ?p ?o } }`;
+      sparql = `CONSTRUCT { ?s ?p ?o } WHERE { GRAPH ?g { ?s ?p ?o } FILTER((STRSTARTS(STR(?g), "${swmGraph}/") || STR(?g) = "${swmGraph}")) }`;
     } else {
       const roots = [...new Set(
         selection.rootEntities
@@ -1242,7 +1253,7 @@ export class DKGPublisher implements Publisher {
       }
       const values = roots.map((r) => `<${r}>`).join(' ');
       sparql = `CONSTRUCT { ?s ?p ?o } WHERE {
-        GRAPH <${swmGraph}> {
+        GRAPH ?g {
           VALUES ?root { ${values} }
           ?s ?p ?o .
           FILTER(
@@ -1250,6 +1261,7 @@ export class DKGPublisher implements Publisher {
             || STRSTARTS(STR(?s), CONCAT(STR(?root), "/.well-known/genid/"))
           )
         }
+        FILTER((STRSTARTS(STR(?g), "${swmGraph}/") || STR(?g) = "${swmGraph}"))
       }`;
     }
 
@@ -4324,12 +4336,12 @@ export class DKGPublisher implements Publisher {
     // (same filter the publish gather / RS prover use), minus trust/ownership
     // bookkeeping that never belongs in a working draft.
     const values = entities.map((e) => `<${e}>`).join(' ');
+    // Per-KA SWM: when pulling from SWM the source spans the per-KA prefix, not one bucket.
+    const sourcePattern = sourceLayer === 'swm'
+      ? `GRAPH ?g { VALUES ?root { ${values} } ?s ?p ?o . FILTER(?s = ?root || STRSTARTS(STR(?s), CONCAT(STR(?root), "/.well-known/genid/"))) } FILTER(STRSTARTS(STR(?g), "${sourceGraph}/") || STR(?g) = "${sourceGraph}")`
+      : `GRAPH <${sourceGraph}> { VALUES ?root { ${values} } ?s ?p ?o . FILTER(?s = ?root || STRSTARTS(STR(?s), CONCAT(STR(?root), "/.well-known/genid/"))) }`;
     const gather = await this.store.query(
-      `CONSTRUCT { ?s ?p ?o } WHERE { GRAPH <${sourceGraph}> {
-         VALUES ?root { ${values} }
-         ?s ?p ?o .
-         FILTER(?s = ?root || STRSTARTS(STR(?s), CONCAT(STR(?root), "/.well-known/genid/")))
-       } }`,
+      `CONSTRUCT { ?s ?p ?o } WHERE { ${sourcePattern} }`,
     );
     const gathered = gather.type === 'quads'
       ? gather.quads.filter((q) => !isTrustLevelQuad(q) && q.predicate !== WORKSPACE_OWNER_PREDICATE)

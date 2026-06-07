@@ -888,7 +888,7 @@ describe('DKGQueryEngine', () => {
     const rootAssertionGraph = `${GRAPH}/assertion/0xAgent/root-draft`;
     const rootVerifiedGraph = `${GRAPH}/_verified_memory/vm-1`;
     const subGraph = `${GRAPH}/code`;
-    const subGraphSharedMemoryGraph = `${GRAPH}/code/_shared_memory`;
+    const subGraphSharedMemoryGraph = `${GRAPH}/code/_shared_memory/0xAgent/2`;
 
     await store.insert([
       ...subGraphRegistration('code'),
@@ -911,11 +911,11 @@ describe('DKGQueryEngine', () => {
   });
 
   it('keeps includeSharedMemory GRAPH-variable scans on data plus SWM without partition opt-in', async () => {
-    const rootSharedMemoryGraph = `${GRAPH}/_shared_memory`;
+    const rootSharedMemoryGraph = `${GRAPH}/_shared_memory/0xAgent/1`;
     const rootAssertionGraph = `${GRAPH}/assertion/0xAgent/root-draft`;
     const rootVerifiedGraph = `${GRAPH}/_verified_memory/vm-1`;
     const subGraph = `${GRAPH}/code`;
-    const subGraphSharedMemoryGraph = `${GRAPH}/code/_shared_memory`;
+    const subGraphSharedMemoryGraph = `${GRAPH}/code/_shared_memory/0xAgent/2`;
 
     await store.insert([
       ...subGraphRegistration('code'),
@@ -941,17 +941,17 @@ describe('DKGQueryEngine', () => {
 
   it('allows scoped GRAPH variable count scans across registered same-CG content partitions', async () => {
     const rootAssertionGraph = `${GRAPH}/_working_memory/0xAgent/1`;
-    const rootSharedMemoryGraph = `${GRAPH}/_shared_memory`;
+    const rootSharedMemoryGraph = `${GRAPH}/_shared_memory/0xAgent/1`;
     const rootVerifiedGraph = `${GRAPH}/_verified_memory/vm-1`;
     const rootVerifiedStagingGraph = `${GRAPH}/_verified_memory/staging/vm-1`;
     const subGraph = `${GRAPH}/code`;
     const subGraphAssertionGraph = `${GRAPH}/code/_working_memory/0xAgent/2`;
-    const subGraphSharedMemoryGraph = `${GRAPH}/code/_shared_memory`;
+    const subGraphSharedMemoryGraph = `${GRAPH}/code/_shared_memory/0xAgent/2`;
     const subGraphVerifiedGraph = `${GRAPH}/code/_verified_memory/vm-1`;
     const subGraphVerifiedStagingGraph = `${GRAPH}/code/_verified_memory/staging/vm-1`;
     const subGraphMeta = `${GRAPH}/code/_meta`;
     const subGraphPrivate = `${GRAPH}/code/_private`;
-    const otherGraph = 'did:dkg:context-graph:other-agent-registry/code/_shared_memory';
+    const otherGraph = 'did:dkg:context-graph:other-agent-registry/code/_shared_memory/0xOther/1';
 
     await store.insert([
       ...subGraphRegistration('code'),
@@ -1000,10 +1000,10 @@ describe('DKGQueryEngine', () => {
   });
 
   it('memoizes same-CG partition discovery across concurrent count scans', async () => {
-    const rootSharedMemoryGraph = `${GRAPH}/_shared_memory`;
+    const rootSharedMemoryGraph = `${GRAPH}/_shared_memory/0xAgent/1`;
     const rootVerifiedGraph = `${GRAPH}/_verified_memory/vm-1`;
     const subGraph = `${GRAPH}/code`;
-    const subGraphSharedMemoryGraph = `${GRAPH}/code/_shared_memory`;
+    const subGraphSharedMemoryGraph = `${GRAPH}/code/_shared_memory/0xAgent/2`;
 
     await store.insert([
       ...subGraphRegistration('code'),

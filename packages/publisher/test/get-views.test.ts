@@ -39,9 +39,9 @@ describe('resolveViewGraphs', () => {
   describe('shared-working-memory', () => {
     it('maps to _shared_memory graph', () => {
       const res = resolveViewGraphs('shared-working-memory', CG);
-      expect(res.graphs).toEqual([contextGraphSharedMemoryUri(CG)]);
-      expect(res.graphs[0]).toBe(`did:dkg:context-graph:${CG}/_shared_memory`);
-      expect(res.graphPrefixes).toHaveLength(0);
+      expect(res.graphs).toEqual([]);
+      expect(res.graphPrefixes[0]).toBe(`did:dkg:context-graph:${CG}/_shared_memory/`);
+      expect(res.graphPrefixes).toHaveLength(1);
     });
   });
 

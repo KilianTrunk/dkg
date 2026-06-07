@@ -144,7 +144,7 @@ export function registerSyncHandler(params: RegisterSyncHandlerParams): void {
           GRAPH <${cgMetaGraph}> {
             ?sg <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://dkg.io/ontology/SubGraph> .
             ?sg <http://schema.org/name> ?subGraphName .
-            FILTER(STR(?g) = CONCAT("${cgPrefix}/", STR(?subGraphName), "${suffix}"))
+            FILTER(${forMeta ? `STR(?g) = CONCAT("${cgPrefix}/", STR(?subGraphName), "${suffix}")` : `STRSTARTS(STR(?g), CONCAT("${cgPrefix}/", STR(?subGraphName), "${suffix}", "/"))`})
           }
           FILTER NOT EXISTS {
             GRAPH ?childMetaGraph {
@@ -224,7 +224,7 @@ export function registerSyncHandler(params: RegisterSyncHandlerParams): void {
         // pairs `?gMeta = ?g + "_meta"` to scope op→entity matching to
         // a single sub-graph; the registration check is what rejects
         // nested-CG SWM that shares the URI prefix.
-        const dataBoundaryFilter = `STR(?g) = "${rootSwm}" || ${registeredSubGraphSwmFilter(false)}`;
+        const dataBoundaryFilter = `STRSTARTS(STR(?g), "${rootSwm}/") || ${registeredSubGraphSwmFilter(false)}`;
         const wsQuery = cutoff != null
           ? `SELECT DISTINCT ?s ?p ?o ?g WHERE {
   GRAPH ?gMeta {

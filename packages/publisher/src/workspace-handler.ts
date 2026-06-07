@@ -1,7 +1,7 @@
 import type { TripleStore, Quad } from '@origintrail-official/dkg-storage';
 import { GraphManager } from '@origintrail-official/dkg-storage';
 import type { EventBus } from '@origintrail-official/dkg-core';
-import { DKGEvent, Logger, createOperationContext, contextGraphDataUri, contextGraphMetaUri, DKG_ONTOLOGY, SYSTEM_CONTEXT_GRAPHS, DKG_ENTITY, DKG_ROOT_ENTITY_LEGACY, ENTITY_PRED_ALT } from '@origintrail-official/dkg-core';
+import { DKGEvent, Logger, createOperationContext, contextGraphDataUri, contextGraphMetaUri, contextGraphLayerUri, MemoryLayer, DKG_ONTOLOGY, SYSTEM_CONTEXT_GRAPHS, DKG_ENTITY, DKG_ROOT_ENTITY_LEGACY, ENTITY_PRED_ALT } from '@origintrail-official/dkg-core';
 import type { PhaseCallback } from './publisher.js';
 import {
   decodeGossipEnvelope,
@@ -900,7 +900,7 @@ export class SharedMemoryHandler {
       if (request.operationId) {
         ctx = createOperationContext('share', request.operationId);
       }
-      const { nquads, manifest, publisherPeerId, timestampMs, casConditions, subGraphName } = request;
+      const { nquads, manifest, publisherPeerId, timestampMs, casConditions, subGraphName, agentAddress: kaAuthorAddress, kaNumber } = request;
       const shareOperationId = request.shareOperationId?.trim();
       const sgLabel = subGraphName ? `/${subGraphName}` : '';
       this.log.info(ctx, `SWM write from ${fromPeerId} for context graph ${contextGraphId}${sgLabel} op=${shareOperationId}`);
@@ -982,7 +982,11 @@ export class SharedMemoryHandler {
         privateTripleCount: m.privateTripleCount ?? 0,
       }));
 
-      const swmGraph = this.graphManager.sharedMemoryUri(contextGraphId, subGraphName);
+      // Uniform layout: write the gossiped KA into its per-KA SWM graph
+      // …/_shared_memory/{author}/{number} (carried on the wire); else legacy bucket.
+      const swmGraph = (kaAuthorAddress && kaNumber)
+        ? contextGraphLayerUri(contextGraphId, MemoryLayer.SharedWorkingMemory, kaAuthorAddress, kaNumber, subGraphName)
+        : this.graphManager.sharedMemoryUri(contextGraphId, subGraphName);
       const swmMetaGraph = this.graphManager.sharedMemoryMetaUri(contextGraphId, subGraphName);
 
       const swmOwnershipKey = subGraphName ? `${contextGraphId}\0${subGraphName}` : contextGraphId;

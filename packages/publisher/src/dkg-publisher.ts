@@ -4164,6 +4164,16 @@ export class DKGPublisher implements Publisher {
       if (m) kaNumber = BigInt(m[1]);
     } else if (opts?.allocateKaNumber) {
       ({ number: kaNumber, reservedUal } = await opts.allocateKaNumber());
+    } else if (this.kaAllocator && /^0x[a-fA-F0-9]{40}$/.test(agentAddress)) {
+      // Direct (non-agent-wrapper) callers still get a number from the SHARED allocator
+      // (same instance the agent wrapper uses — no double-mint), so the per-KA graph is
+      // the ONE layout. Without this, a direct create would fall back to a name-keyed
+      // graph the indexed `_working_memory/{addr}/` read can never find.
+      const kaId = await this.ensureReservedKaId(agentAddress);
+      if (kaId !== undefined) {
+        kaNumber = kaId & ((1n << 96n) - 1n);
+        reservedUal = `did:dkg:${this.chain.chainId}/${agentAddress.toLowerCase()}/${kaNumber}`;
+      }
     }
 
     // Uniform layout: WM data lives in the per-KA graph keyed by {number} once the KA
@@ -4617,11 +4627,13 @@ export class DKGPublisher implements Publisher {
     await this.store.insert(shareTransition);
 
     // Update assertion lifecycle record in _meta: created → promoted
+    const promotedKaNumber = await this.resolveKaNumber(contextGraphId, agentAddress, name, opts?.subGraphName);
     const promoted = generateAssertionPromotedMetadata({
       contextGraphId,
       agentAddress,
       assertionName: name,
       subGraphName: opts?.subGraphName,
+      kaNumber: promotedKaNumber ?? undefined,
       shareOperationId: operationId,
       rootEntities: effectiveRoots,
       timestamp: new Date(),

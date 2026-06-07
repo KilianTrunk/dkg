@@ -475,7 +475,7 @@ describe('Sub-graph across memory layers (single agent)', () => {
 
     // Create assertion in sub-graph WM
     const assertionUri = await agent.assertion.create('sg-wm-layer', 'arch-review', { subGraphName: 'decisions' });
-    expect(assertionUri).toContain('/decisions/assertion/');
+    expect(assertionUri).toContain('/decisions/_working_memory/');
 
     // Write to assertion
     await agent.assertion.write('sg-wm-layer', 'arch-review', [

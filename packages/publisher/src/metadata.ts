@@ -6,6 +6,7 @@ import {
   assertionLifecycleUri,
   contextGraphAssertionUri,
   contextGraphSharedMemoryUri,
+  contextGraphLayerUri,
   contextGraphDataUri,
   contextGraphMetaUri,
   MemoryLayer,
@@ -1318,7 +1319,12 @@ export interface AssertionCreatedMeta {
 export function generateAssertionCreatedMetadata(meta: AssertionCreatedMeta): Quad[] {
   const metaGraph = `did:dkg:context-graph:${meta.contextGraphId}/_meta`;
   const subject = assertionLifecycleUri(meta.contextGraphId, meta.agentAddress, meta.assertionName, meta.subGraphName);
-  const graphUri = contextGraphAssertionUri(meta.contextGraphId, meta.agentAddress, meta.assertionName, meta.subGraphName);
+  // Uniform layout: the assertionGraph pointer must name the SAME per-KA WM graph the
+  // data is written to (else _meta-driven discovery/promote follows an empty name-keyed
+  // graph). Number-keyed once the KA has an identity (D1), else legacy name-keyed.
+  const graphUri = meta.kaNumber !== undefined
+    ? contextGraphLayerUri(meta.contextGraphId, MemoryLayer.WorkingMemory, meta.agentAddress, meta.kaNumber, meta.subGraphName)
+    : contextGraphAssertionUri(meta.contextGraphId, meta.agentAddress, meta.assertionName, meta.subGraphName);
   const agentUri = agentDid(meta.agentAddress);
   const eventUri = `${subject}/event/${nextEventId()}`;
 
@@ -1367,6 +1373,8 @@ export interface AssertionPromotedMeta {
   agentAddress: string;
   assertionName: string;
   subGraphName?: string;
+  /** D1 — KA number, so the WM-delete targets the per-KA _working_memory/{addr}/{number} graph. */
+  kaNumber?: bigint | number | string;
   shareOperationId: string;
   rootEntities: string[];
   timestamp: Date;
@@ -1389,7 +1397,9 @@ export function generateAssertionPromotedMetadata(meta: AssertionPromotedMeta): 
   // re-point to the SWM-layer graph so the _meta index locates SWM data correctly.
   // rc.17a: the shared bucket (contextGraphSharedMemoryUri); rc.17b flips this target
   // to the per-KA SWM graph. Without this re-stamp the index follows a stale WM pointer.
-  const wmGraphUri = contextGraphAssertionUri(meta.contextGraphId, meta.agentAddress, meta.assertionName, meta.subGraphName);
+  const wmGraphUri = meta.kaNumber !== undefined
+    ? contextGraphLayerUri(meta.contextGraphId, MemoryLayer.WorkingMemory, meta.agentAddress, meta.kaNumber, meta.subGraphName)
+    : contextGraphAssertionUri(meta.contextGraphId, meta.agentAddress, meta.assertionName, meta.subGraphName);
   const swmGraphUri = contextGraphSharedMemoryUri(meta.contextGraphId, meta.subGraphName);
 
   const del = [

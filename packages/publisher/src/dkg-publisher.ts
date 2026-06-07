@@ -4093,6 +4093,19 @@ export class DKGPublisher implements Publisher {
       : contextGraphAssertionUri(contextGraphId, agentAddress, name, subGraphName);
   }
 
+  /** A promoted KA's SWM graph URI: per-KA `…/_shared_memory/{addr}/{number}` (resolved from the assertion), else the legacy bucket. */
+  private async swmGraphUri(contextGraphId: string, agentAddress: string, name: string, subGraphName?: string): Promise<string> {
+    const num = await this.resolveKaNumber(contextGraphId, agentAddress, name, subGraphName);
+    return num !== null
+      ? contextGraphLayerUri(contextGraphId, MemoryLayer.SharedWorkingMemory, agentAddress, num, subGraphName)
+      : this.graphManager.sharedMemoryUri(contextGraphId, subGraphName);
+  }
+
+  /** SWM graph URI from an explicit `{author, number}` (receiver-side / freshly-allocated generic share). */
+  private swmGraphUriFor(contextGraphId: string, agentAddress: string, kaNumber: bigint, subGraphName?: string): string {
+    return contextGraphLayerUri(contextGraphId, MemoryLayer.SharedWorkingMemory, agentAddress, kaNumber, subGraphName);
+  }
+
   async assertionCreate(
     contextGraphId: string,
     name: string,
@@ -4354,7 +4367,7 @@ export class DKGPublisher implements Publisher {
   ): Promise<{ promotedCount: number; gossipMessage?: Uint8Array }> {
     await this.ensureSubGraphRegistered(contextGraphId, opts?.subGraphName);
     const graphUri = await this.wmGraphUri(contextGraphId, agentAddress, name, opts?.subGraphName);
-    const swmGraphUri = this.graphManager.sharedMemoryUri(contextGraphId, opts?.subGraphName);
+    const swmGraphUri = await this.swmGraphUri(contextGraphId, agentAddress, name, opts?.subGraphName);
 
     const result = await this.store.query(
       `CONSTRUCT { ?s ?p ?o } WHERE { GRAPH <${graphUri}> { ?s ?p ?o } }`,
@@ -4502,6 +4515,7 @@ export class DKGPublisher implements Publisher {
         privateTripleCount: 0,
       }));
       const timestampMs = Date.now();
+      const promoteKaNumber = await this.resolveKaNumber(contextGraphId, agentAddress, name, opts?.subGraphName);
       const encoded = encodeWorkspacePublishRequest({
         contextGraphId: contextGraphId,
         nquads: new TextEncoder().encode(nquadsStr),
@@ -4511,6 +4525,8 @@ export class DKGPublisher implements Publisher {
         timestampMs,
         operationId,
         subGraphName: opts.subGraphName,
+        agentAddress,
+        kaNumber: promoteKaNumber !== null ? String(promoteKaNumber) : undefined,
       });
 
       // Wrap the plaintext publish-request in the encrypted envelope

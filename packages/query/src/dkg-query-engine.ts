@@ -91,9 +91,11 @@ export function resolveViewGraphs(
       };
     }
     case 'shared-working-memory':
+      // Uniform layout: SWM is per-KA `…/_shared_memory/{addr}/{number}`; read the prefix
+      // (mirrors WM), not the single bucket.
       return {
-        graphs: [contextGraphSharedMemoryUri(contextGraphId)],
-        graphPrefixes: [],
+        graphs: [],
+        graphPrefixes: [`did:dkg:context-graph:${contextGraphId}/_shared_memory/`],
       };
     case 'verified-memory': {
       // `minTrust` is a verified-memory concept. The earlier iterations ran the
@@ -806,7 +808,7 @@ function isScopedContentGraph(
   }
 
   if (!subGraphName) {
-    if (tail === '_shared_memory') return true;
+    if (tail.startsWith('_shared_memory/')) return true;
     if (tail.startsWith('_verified_memory/')) return !isMetadataGraphTail(tail);
     if (tail.startsWith('_working_memory/')) return registeredAssertionGraphs.has(graph);
   }
@@ -820,7 +822,7 @@ function isScopedContentGraph(
   }
 
   if (!remaining) return true;
-  if (remaining === '_shared_memory') return true;
+  if (remaining.startsWith('_shared_memory/')) return true;
   if (remaining.startsWith('_verified_memory/')) return !isMetadataGraphTail(remaining);
   if (remaining.startsWith('_working_memory/')) return registeredAssertionGraphs.has(graph);
   return false;

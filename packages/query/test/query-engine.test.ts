@@ -940,12 +940,12 @@ describe('DKGQueryEngine', () => {
   });
 
   it('allows scoped GRAPH variable count scans across registered same-CG content partitions', async () => {
-    const rootAssertionGraph = `${GRAPH}/assertion/0xAgent/root-draft`;
+    const rootAssertionGraph = `${GRAPH}/_working_memory/0xAgent/1`;
     const rootSharedMemoryGraph = `${GRAPH}/_shared_memory`;
     const rootVerifiedGraph = `${GRAPH}/_verified_memory/vm-1`;
     const rootVerifiedStagingGraph = `${GRAPH}/_verified_memory/staging/vm-1`;
     const subGraph = `${GRAPH}/code`;
-    const subGraphAssertionGraph = `${GRAPH}/code/assertion/0xAgent/code-draft`;
+    const subGraphAssertionGraph = `${GRAPH}/code/_working_memory/0xAgent/2`;
     const subGraphSharedMemoryGraph = `${GRAPH}/code/_shared_memory`;
     const subGraphVerifiedGraph = `${GRAPH}/code/_verified_memory/vm-1`;
     const subGraphVerifiedStagingGraph = `${GRAPH}/code/_verified_memory/staging/vm-1`;

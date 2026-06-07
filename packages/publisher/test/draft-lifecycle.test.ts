@@ -8,6 +8,8 @@ import {
   contextGraphAssertionUri,
   contextGraphMetaUri,
   contextGraphSharedMemoryUri,
+  contextGraphLayerUri,
+  MemoryLayer,
   assertionLifecycleUri,
 } from '@origintrail-official/dkg-core';
 import { DKGPublisher, AssertionNotPersistedError } from '../src/index.js';
@@ -112,6 +114,28 @@ describe('Working Memory Assertion Lifecycle', () => {
     if (kaId.type === 'bindings') {
       expect(kaId.bindings.map((r) => r['n'])).toEqual(['"42"^^<http://www.w3.org/2001/XMLSchema#integer>']);
     }
+  });
+
+  it('WM flip: a numbered KA stores + reads WM data in the per-KA _working_memory graph', async () => {
+    const name = 'wm-numbered';
+    await publisher.assertionCreate(CG_ID, name, AGENT, undefined, {
+      allocateKaNumber: async () => ({ number: 42n, reservedUal: `did:dkg:31337/${AGENT.toLowerCase()}/42` }),
+    });
+    await publisher.assertionWrite(CG_ID, name, AGENT, [
+      { subject: 'urn:test:entity:x', predicate: 'http://schema.org/name', object: '"X"' },
+    ]);
+    // data must live in the per-KA WM graph keyed by {number}, NOT the legacy name-keyed graph
+    const wmGraph = contextGraphLayerUri(CG_ID, MemoryLayer.WorkingMemory, AGENT, 42n);
+    const res = await store.query(`SELECT ?o WHERE { GRAPH <${wmGraph}> { <urn:test:entity:x> <http://schema.org/name> ?o } }`);
+    expect(res.type).toBe('bindings');
+    if (res.type === 'bindings') expect(res.bindings.map((r) => r['o'])).toEqual(['"X"']);
+    // the legacy name-keyed graph must be empty (no data leaked to the old layout)
+    const legacy = contextGraphAssertionUri(CG_ID, AGENT, name);
+    const legacyRes = await store.query(`SELECT ?o WHERE { GRAPH <${legacy}> { <urn:test:entity:x> ?p ?o } }`);
+    if (legacyRes.type === 'bindings') expect(legacyRes.bindings).toHaveLength(0);
+    // assertionQuery (which resolves the number internally) returns the data
+    const q = await publisher.assertionQuery(CG_ID, name, AGENT);
+    expect(q.length).toBeGreaterThan(0);
   });
 
   it('write inserts triples into the assertion graph', async () => {

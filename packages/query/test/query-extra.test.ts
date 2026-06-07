@@ -49,6 +49,8 @@ import {
   contextGraphDataUri,
   contextGraphVerifiedMemoryUri,
   contextGraphAssertionUri,
+  contextGraphLayerUri,
+  MemoryLayer,
   contextGraphSharedMemoryUri,
   TrustLevel,
 } from '@origintrail-official/dkg-core';
@@ -610,7 +612,7 @@ describe('[Q-3] resolveViewGraphs + DKGQueryEngine route working-memory', () => 
     const res = resolveViewGraphs('working-memory', CG, { agentAddress: AGENT });
     expect(res.graphs).toEqual([]);
     expect(res.graphPrefixes).toEqual([
-      `did:dkg:context-graph:${CG}/assertion/${AGENT}/`,
+      `did:dkg:context-graph:${CG}/_working_memory/${AGENT}/`,
     ]);
   });
 
@@ -619,9 +621,9 @@ describe('[Q-3] resolveViewGraphs + DKGQueryEngine route working-memory', () => 
     const engine = new DKGQueryEngine(store);
     const OTHER_AGENT = '0xDeAd000000000000000000000000000000000002';
 
-    const mine = contextGraphAssertionUri(CG, AGENT, 'todo');
-    const mineOther = contextGraphAssertionUri(CG, AGENT, 'note');
-    const theirs = contextGraphAssertionUri(CG, OTHER_AGENT, 'leak');
+    const mine = contextGraphLayerUri(CG, MemoryLayer.WorkingMemory, AGENT, 1n);
+    const mineOther = contextGraphLayerUri(CG, MemoryLayer.WorkingMemory, AGENT, 2n);
+    const theirs = contextGraphLayerUri(CG, MemoryLayer.WorkingMemory, OTHER_AGENT, 1n);
 
     await store.insert([
       quad('urn:a:1', 'http://schema.org/name', '"MyTodo"', mine),
@@ -701,8 +703,8 @@ describe('DKGQueryEngine view routing constrains GRAPH variables', () => {
     const otherAgent = '0xDeAd000000000000000000000000000000000002';
 
     await store.insert([
-      quad('urn:view:mine', 'http://schema.org/name', '"Mine"', contextGraphAssertionUri(CG, agent, 'mine')),
-      quad('urn:view:theirs', 'http://schema.org/name', '"Theirs"', contextGraphAssertionUri(CG, otherAgent, 'theirs')),
+      quad('urn:view:mine', 'http://schema.org/name', '"Mine"', contextGraphLayerUri(CG, MemoryLayer.WorkingMemory, agent, 1n)),
+      quad('urn:view:theirs', 'http://schema.org/name', '"Theirs"', contextGraphLayerUri(CG, MemoryLayer.WorkingMemory, otherAgent, 1n)),
     ]);
 
     const result = await engine.query(

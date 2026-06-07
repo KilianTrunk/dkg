@@ -2,7 +2,7 @@ import type { TripleStore, Quad, QueryResult as StoreQueryResult } from '@origin
 import { GraphManager } from '@origintrail-official/dkg-storage';
 import type { QueryResult, QueryOptions, QueryEngine } from './query-engine.js';
 import {
-  contextGraphDataUri, contextGraphSharedMemoryUri, contextGraphVerifiedMemoryUri, contextGraphAssertionUri,
+  contextGraphDataUri, contextGraphSharedMemoryUri, contextGraphVerifiedMemoryUri, contextGraphAssertionUri, contextGraphLayerUri, MemoryLayer,
   contextGraphSubGraphUri, contextGraphMetaUri, contextGraphSharedMemoryMetaUri,
   contextGraphSubGraphMetaUri, contextGraphPrivateUri, contextGraphSubGraphPrivateUri,
   assertSafeIri, escapeSparqlLiteral, validateSubGraphName,
@@ -56,6 +56,8 @@ export function resolveViewGraphs(
     agentAddress?: string;
     verifiedGraph?: string;
     assertionName?: string;
+    /** Resolved KA number for single-graph by-name reads under the uniform layout. */
+    kaNumber?: bigint;
     /** Spec §12/§14 trust-gradient filter. Enforced after graph resolution. */
     minTrust?: TrustLevel;
   },
@@ -71,15 +73,21 @@ export function resolveViewGraphs(
       if (!opts?.agentAddress) {
         throw new Error('agentAddress is required for the working-memory view');
       }
+      // Uniform layout: WM data is in `…/_working_memory/{addr}/{number}`. A by-name read
+      // STAYS a single-graph read (no sibling-assertion leak); the caller resolves
+      // name→number and passes opts.kaNumber. Until then it falls back to the legacy
+      // name-keyed graph (TODO: wire the _meta name→number lookup at the query caller).
       if (opts.assertionName) {
         return {
-          graphs: [contextGraphAssertionUri(contextGraphId, opts.agentAddress, opts.assertionName)],
+          graphs: [opts.kaNumber !== undefined
+            ? contextGraphLayerUri(contextGraphId, MemoryLayer.WorkingMemory, opts.agentAddress, opts.kaNumber)
+            : contextGraphAssertionUri(contextGraphId, opts.agentAddress, opts.assertionName)],
           graphPrefixes: [],
         };
       }
       return {
         graphs: [],
-        graphPrefixes: [`did:dkg:context-graph:${contextGraphId}/assertion/${opts.agentAddress}/`],
+        graphPrefixes: [`did:dkg:context-graph:${contextGraphId}/_working_memory/${opts.agentAddress}/`],
       };
     }
     case 'shared-working-memory':
@@ -800,7 +808,7 @@ function isScopedContentGraph(
   if (!subGraphName) {
     if (tail === '_shared_memory') return true;
     if (tail.startsWith('_verified_memory/')) return !isMetadataGraphTail(tail);
-    if (tail.startsWith('assertion/')) return registeredAssertionGraphs.has(graph);
+    if (tail.startsWith('_working_memory/')) return registeredAssertionGraphs.has(graph);
   }
 
   const slash = tail.indexOf('/');
@@ -814,7 +822,7 @@ function isScopedContentGraph(
   if (!remaining) return true;
   if (remaining === '_shared_memory') return true;
   if (remaining.startsWith('_verified_memory/')) return !isMetadataGraphTail(remaining);
-  if (remaining.startsWith('assertion/')) return registeredAssertionGraphs.has(graph);
+  if (remaining.startsWith('_working_memory/')) return registeredAssertionGraphs.has(graph);
   return false;
 }
 

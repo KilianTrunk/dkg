@@ -21,7 +21,7 @@ describe('resolveViewGraphs', () => {
       const res = resolveViewGraphs('working-memory', CG, { agentAddress: AGENT });
       expect(res.graphs).toHaveLength(0);
       expect(res.graphPrefixes).toHaveLength(1);
-      expect(res.graphPrefixes[0]).toBe(`did:dkg:context-graph:${CG}/assertion/${AGENT}/`);
+      expect(res.graphPrefixes[0]).toBe(`did:dkg:context-graph:${CG}/_working_memory/${AGENT}/`);
     });
 
     it('includes the agent address in the graph URI prefix', () => {

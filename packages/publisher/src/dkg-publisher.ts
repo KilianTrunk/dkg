@@ -2,7 +2,7 @@ import type { Quad, TripleStore } from '@origintrail-official/dkg-storage';
 import type { ChainAdapter, OnChainPublishResult, AddBatchToContextGraphParams } from '@origintrail-official/dkg-chain';
 import { enrichEvmError } from '@origintrail-official/dkg-chain';
 import type { EventBus, OperationContext } from '@origintrail-official/dkg-core';
-import { DKGEvent, Logger, createOperationContext, sha256, encodeWorkspacePublishRequest, encodeEncryptedWorkspacePayload, encryptWorkspacePayload, contextGraphDataUri, contextGraphDataGraphUri, contextGraphMetaUri, contextGraphAssertionUri, assertionLifecycleUri, contextGraphSubGraphUri, contextGraphSubGraphMetaUri, SYSTEM_CONTEXT_GRAPHS, validateSubGraphName, isSafeIri, assertSafeIri, assertSafeRdfTerm, DKG_GOSSIP_MAX_MESSAGE_BYTES, SwmGossipPayloadTooLargeError, type Ed25519Keypair, buildAuthorAttestationTypedData, buildUpdateAuthorAttestationTypedData, AUTHOR_SCHEME_VERSION_V1, TrustLevel, TRUST_LEVEL_PREDICATE, assertNoUserAuthoredTrustLevelQuads, buildTrustLevelQuads, isTrustLevelQuad, DKG_ENTITY, DKG_ROOT_ENTITY_LEGACY, ENTITY_PRED_ALT, parseAssertionSealQuads } from '@origintrail-official/dkg-core';
+import { DKGEvent, Logger, createOperationContext, sha256, encodeWorkspacePublishRequest, encodeEncryptedWorkspacePayload, encryptWorkspacePayload, contextGraphDataUri, contextGraphDataGraphUri, contextGraphMetaUri, contextGraphAssertionUri, contextGraphLayerUri, MemoryLayer, assertionLifecycleUri, contextGraphSubGraphUri, contextGraphSubGraphMetaUri, SYSTEM_CONTEXT_GRAPHS, validateSubGraphName, isSafeIri, assertSafeIri, assertSafeRdfTerm, DKG_GOSSIP_MAX_MESSAGE_BYTES, SwmGossipPayloadTooLargeError, type Ed25519Keypair, buildAuthorAttestationTypedData, buildUpdateAuthorAttestationTypedData, AUTHOR_SCHEME_VERSION_V1, TrustLevel, TRUST_LEVEL_PREDICATE, assertNoUserAuthoredTrustLevelQuads, buildTrustLevelQuads, isTrustLevelQuad, DKG_ENTITY, DKG_ROOT_ENTITY_LEGACY, ENTITY_PRED_ALT, parseAssertionSealQuads } from '@origintrail-official/dkg-core';
 import { GraphManager, PrivateContentStore } from '@origintrail-official/dkg-storage';
 import { DEFAULT_PUBLISH_EPOCHS, MAX_PUBLISH_EPOCHS, type Publisher, type PublishOptions, type PublishResult, type KAManifestEntry, type PhaseCallback, type V10CoreNodeACK } from './publisher.js';
 import { skolemizeByEntity } from './auto-partition.js';
@@ -4071,6 +4071,28 @@ export class DKGPublisher implements Publisher {
     this.privateStore.clearCache(ownershipKey);
   }
 
+  /** Read a KA's allocated number (dkg:kaId) off its lifecycle URN, or null if not yet minted. */
+  private async resolveKaNumber(contextGraphId: string, agentAddress: string, name: string, subGraphName?: string): Promise<bigint | null> {
+    const urn = assertionLifecycleUri(contextGraphId, agentAddress, name, subGraphName);
+    const metaGraph = contextGraphMetaUri(contextGraphId);
+    const res = await this.store.query(
+      `SELECT ?n WHERE { GRAPH <${metaGraph}> { <${urn}> <http://dkg.io/ontology/kaId> ?n } } LIMIT 1`,
+    );
+    if (res.type === 'bindings' && res.bindings.length > 0) {
+      const m = res.bindings[0]['n']?.match(/(\d+)/);
+      if (m) return BigInt(m[1]);
+    }
+    return null;
+  }
+
+  /** A KA's WM graph URI: the per-KA `…/_working_memory/{addr}/{number}` once minted (D1), else legacy name-keyed. */
+  private async wmGraphUri(contextGraphId: string, agentAddress: string, name: string, subGraphName?: string): Promise<string> {
+    const num = await this.resolveKaNumber(contextGraphId, agentAddress, name, subGraphName);
+    return num !== null
+      ? contextGraphLayerUri(contextGraphId, MemoryLayer.WorkingMemory, agentAddress, num, subGraphName)
+      : contextGraphAssertionUri(contextGraphId, agentAddress, name, subGraphName);
+  }
+
   async assertionCreate(
     contextGraphId: string,
     name: string,
@@ -4079,8 +4101,6 @@ export class DKGPublisher implements Publisher {
     opts?: { allocateKaNumber?: () => Promise<{ number: bigint; reservedUal: string }> },
   ): Promise<string> {
     await this.ensureSubGraphRegistered(contextGraphId, subGraphName);
-    const graphUri = contextGraphAssertionUri(contextGraphId, agentAddress, name, subGraphName);
-    await this.store.createGraph(graphUri);
 
     // Clear any stale lifecycle data from a previous create/discard cycle
     // so re-using the same assertion name doesn't leave orphaned triples.
@@ -4139,9 +4159,19 @@ export class DKGPublisher implements Publisher {
     const hasPreservedKaId = preserved.some((q) => q.predicate === `${A2_DKG}kaId`);
     let kaNumber: bigint | undefined;
     let reservedUal: string | undefined;
-    if (!hasPreservedKaId && opts?.allocateKaNumber) {
+    if (hasPreservedKaId) {
+      const m = preserved.find((q) => q.predicate === `${A2_DKG}kaId`)?.object?.match(/(\d+)/);
+      if (m) kaNumber = BigInt(m[1]);
+    } else if (opts?.allocateKaNumber) {
       ({ number: kaNumber, reservedUal } = await opts.allocateKaNumber());
     }
+
+    // Uniform layout: WM data lives in the per-KA graph keyed by {number} once the KA
+    // has an identity (D1). Now that the number is known, build + create that graph.
+    const graphUri = kaNumber !== undefined
+      ? contextGraphLayerUri(contextGraphId, MemoryLayer.WorkingMemory, agentAddress, kaNumber, subGraphName)
+      : contextGraphAssertionUri(contextGraphId, agentAddress, name, subGraphName);
+    await this.store.createGraph(graphUri);
 
     const lifecycleQuads = generateAssertionCreatedMetadata({
       contextGraphId,
@@ -4172,7 +4202,7 @@ export class DKGPublisher implements Publisher {
     subGraphName?: string,
   ): Promise<void> {
     await this.ensureSubGraphRegistered(contextGraphId, subGraphName);
-    const graphUri = contextGraphAssertionUri(contextGraphId, agentAddress, name, subGraphName);
+    const graphUri = await this.wmGraphUri(contextGraphId, agentAddress, name, subGraphName);
     const quads = input.map((t) => ({
       subject: t.subject, predicate: t.predicate, object: t.object, graph: graphUri,
     }));
@@ -4189,7 +4219,7 @@ export class DKGPublisher implements Publisher {
     subGraphName?: string,
   ): Promise<Quad[]> {
     DKGPublisher.validateOptionalSubGraph(subGraphName);
-    const graphUri = contextGraphAssertionUri(contextGraphId, agentAddress, name, subGraphName);
+    const graphUri = await this.wmGraphUri(contextGraphId, agentAddress, name, subGraphName);
     const result = await this.store.query(
       `CONSTRUCT { ?s ?p ?o } WHERE { GRAPH <${graphUri}> { ?s ?p ?o } }`,
     );
@@ -4221,7 +4251,7 @@ export class DKGPublisher implements Publisher {
     // PR #972/a6740ac: ensure the (sub)graph is registered so a sub-scoped VM
     // pull can resolve its data graph below (was a pure name-format validation).
     await this.ensureSubGraphRegistered(contextGraphId, subGraphName);
-    const wmGraph = contextGraphAssertionUri(contextGraphId, agentAddress, name, subGraphName);
+    const wmGraph = await this.wmGraphUri(contextGraphId, agentAddress, name, subGraphName);
     const metaGraph = contextGraphMetaUri(contextGraphId);
     const sourceGraph = sourceLayer === 'swm'
       ? this.graphManager.sharedMemoryUri(contextGraphId, subGraphName)
@@ -4313,7 +4343,7 @@ export class DKGPublisher implements Publisher {
     opts?: { entities?: string[] | 'all'; subGraphName?: string; publisherPeerId?: string; senderAgentAddress?: string },
   ): Promise<{ promotedCount: number; gossipMessage?: Uint8Array }> {
     await this.ensureSubGraphRegistered(contextGraphId, opts?.subGraphName);
-    const graphUri = contextGraphAssertionUri(contextGraphId, agentAddress, name, opts?.subGraphName);
+    const graphUri = await this.wmGraphUri(contextGraphId, agentAddress, name, opts?.subGraphName);
     const swmGraphUri = this.graphManager.sharedMemoryUri(contextGraphId, opts?.subGraphName);
 
     const result = await this.store.query(
@@ -4646,7 +4676,7 @@ export class DKGPublisher implements Publisher {
 
   async assertionDiscard(contextGraphId: string, name: string, agentAddress: string, subGraphName?: string): Promise<void> {
     DKGPublisher.validateOptionalSubGraph(subGraphName);
-    const graphUri = contextGraphAssertionUri(contextGraphId, agentAddress, name, subGraphName);
+    const graphUri = await this.wmGraphUri(contextGraphId, agentAddress, name, subGraphName);
     // Drop the assertion data graph AND clean up any `_meta` rows keyed
     // by this assertion's UAL in the CG root `_meta` graph. Without this
     // second step, `<assertionUal> dkg:sourceFileHash ?h` and friends

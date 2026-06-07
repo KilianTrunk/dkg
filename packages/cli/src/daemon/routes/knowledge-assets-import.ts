@@ -1161,7 +1161,7 @@ export async function handleKaImportFile(ctx: RequestContext, name: string): Pro
     // we need here. Sub-graph registration is already validated by
     // `assertion.create`, so bypassing `assertion.write` doesn't skip any
     // safety checks.
-    const assertionGraph = contextGraphAssertionUri(
+    let assertionGraph = contextGraphAssertionUri(
       contextGraphId!,
       requestAgentAddress,
       assertionName,
@@ -1189,7 +1189,7 @@ export async function handleKaImportFile(ctx: RequestContext, name: string): Pro
     // (rdf:type, dkg:contentHash, dkg:size) remain on `<fileUri>` —
     // those are safe because they're derived purely from the blob bytes.
     // See `19_MARKDOWN_CONTENT_TYPE.md §10.2`.
-    const dataGraphQuads = [
+    let dataGraphQuads = [
       ...triples.map((t) => ({ ...t, graph: assertionGraph })),
       ...sourceFileLinkage.map((t) => ({ ...t, graph: assertionGraph })),
       // Row 2 — daemon-owned. Describes the ORIGINAL upload blob (row 1's
@@ -1394,6 +1394,21 @@ export async function handleKaImportFile(ctx: RequestContext, name: string): Pro
           return respondWithFailedExtraction(500, message, triples.length);
         }
       }
+
+      // rc.17 uniform per-KA WM: `assertionCreate` above minted the KA number and
+      // registered the canonical `…/_working_memory/{addr}/{number}` graph (plus the
+      // `_meta` `dkg:assertionGraph` pointer at it). The import data + provenance were
+      // built BEFORE the number existed, pinned to the legacy name-keyed
+      // `…/assertion/{addr}/{name}` graph — which the working-memory view (it reads ONLY
+      // the `_working_memory/{addr}/` prefix) can never surface, so imports showed nothing
+      // in WM. Re-pin them to the resolved WM graph so they're visible + match the registry.
+      assertionGraph = await agent.publisher.wmGraphUri(
+        contextGraphId!,
+        requestAgentAddress,
+        assertionName,
+        subGraphName,
+      );
+      dataGraphQuads = dataGraphQuads.map((q) => ({ ...q, graph: assertionGraph }));
 
       // ── Snapshot BOTH graphs for Bugs 11 + 15 rollback ──
       //

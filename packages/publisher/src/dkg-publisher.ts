@@ -4123,7 +4123,7 @@ export class DKGPublisher implements Publisher {
   }
 
   /** A KA's WM graph URI: the per-KA `…/_working_memory/{addr}/{number}` once minted (D1), else legacy name-keyed. */
-  private async wmGraphUri(contextGraphId: string, agentAddress: string, name: string, subGraphName?: string): Promise<string> {
+  async wmGraphUri(contextGraphId: string, agentAddress: string, name: string, subGraphName?: string): Promise<string> {
     const num = await this.resolveKaNumber(contextGraphId, agentAddress, name, subGraphName);
     return num !== null
       ? contextGraphLayerUri(contextGraphId, MemoryLayer.WorkingMemory, agentAddress, num, subGraphName)

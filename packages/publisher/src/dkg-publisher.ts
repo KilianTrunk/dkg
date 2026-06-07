@@ -2709,14 +2709,22 @@ export class DKGPublisher implements Publisher {
         // visible to /api/query. Order matters: data quads BEFORE
         // confirmedQuads + stampTrustLevel below so the trust stamp's
         // subject set actually matches existing rows.
-        this.log.info(ctx, `Storing ${normalizedQuads.length} triples in local store (post-confirmation)`);
-        await this.store.insert(normalizedQuads);
+        // Uniform layout: published data lands in the per-KA verified-memory graph
+        // …/_verified_memory/{author}/{number} (author+number unpacked from the minted
+        // kaId), not the monolithic root data graph. The default query reads the
+        // /_verified_memory/ prefix (read-both with root).
+        const vmNumber = kaId & ((1n << 96n) - 1n);
+        const vmAuthor = '0x' + (kaId >> 96n).toString(16).padStart(40, '0');
+        const vmGraph = contextGraphLayerUri(contextGraphId, MemoryLayer.VerifiedMemory, vmAuthor, vmNumber, options.subGraphName);
+        const vmQuads = normalizedQuads.map((q) => ({ ...q, graph: vmGraph }));
+        this.log.info(ctx, `Storing ${vmQuads.length} triples in ${vmGraph} (post-confirmation)`);
+        await this.store.insert(vmQuads);
         await this.store.insert(confirmedQuads);
         await stampTrustLevel(
           this.store,
-          dataGraph,
+          vmGraph,
           collectTrustSubjectsForRoots(
-            normalizedQuads,
+            vmQuads,
             manifestEntries.map((entry) => entry.rootEntity),
           ),
           TrustLevel.SelfAttested,

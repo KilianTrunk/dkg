@@ -215,11 +215,15 @@ export class DKGQueryEngine implements QueryEngine {
       // …/_shared_memory/{addr}/{number} graphs so GRAPH-variable scans bind them.
       const swmRouted = (options?.includeSharedMemory ?? options?.includeWorkspace) || options?.graphSuffix === '_shared_memory';
       const swmPerKaGraphs = swmRouted ? await this.discoverGraphsByPrefix(`${sharedMemoryGraph}/`) : [];
+      // Per-KA VM: published data is in …/_verified_memory/{addr}/{number}; bind those too
+      // for GRAPH-variable scans on any route that reads the data graph.
+      const dataRouted = options?.graphSuffix !== '_shared_memory';
+      const vmPerKaGraphs = dataRouted ? await this.discoverGraphsByPrefix(`${dataGraph}/_verified_memory/`) : [];
       const allowedGraphs = options?.includeSharedMemory ?? options?.includeWorkspace
-        ? [dataGraph, sharedMemoryGraph, ...swmPerKaGraphs]
+        ? [dataGraph, ...vmPerKaGraphs, sharedMemoryGraph, ...swmPerKaGraphs]
         : options?.graphSuffix === '_shared_memory'
           ? [sharedMemoryGraph, ...swmPerKaGraphs]
-          : [dataGraph];
+          : [dataGraph, ...vmPerKaGraphs];
       // Authenticated callers that scope a query to a `contextGraphId`
       // already have read access to that CG; refusing them visibility
       // into the same CG's metadata graphs breaks every legitimate
@@ -329,7 +333,11 @@ export class DKGQueryEngine implements QueryEngine {
         : contextGraphDataUri(effectiveContextGraphId);
       const sharedMemoryGraph = contextGraphSharedMemoryUri(effectiveContextGraphId, options?.subGraphName);
       if (options?.includeSharedMemory ?? options?.includeWorkspace) {
-        const dataSparql = wrapWithGraph(sparql, dataGraph);
+        // Per-KA VM: read-both the published per-KA …/_verified_memory/{addr}/{number} + root.
+        const vmGraphsInc = await this.discoverGraphsByPrefix(`${dataGraph}/_verified_memory/`);
+        const dataSparql = vmGraphsInc.length > 0
+          ? (wrapWithGraphUnion(sparql, [dataGraph, ...vmGraphsInc]) ?? wrapWithGraph(sparql, dataGraph))
+          : wrapWithGraph(sparql, dataGraph);
         // Per-KA SWM: union the discovered …/_shared_memory/{addr}/{number} graphs.
         const swmGraphs = await this.discoverGraphsByPrefix(`${sharedMemoryGraph}/`);
         const sharedMemorySparql = swmGraphs.length > 0
@@ -347,7 +355,11 @@ export class DKGQueryEngine implements QueryEngine {
           ? (wrapWithGraphUnion(sparql, swmGraphs) ?? wrapWithGraph(sparql, sharedMemoryGraph))
           : wrapWithGraph(sparql, sharedMemoryGraph);
       } else {
-        effectiveSparql = wrapWithGraph(sparql, dataGraph);
+        // Per-KA VM: read-both the published per-KA …/_verified_memory/{addr}/{number} + root.
+        const vmGraphs = await this.discoverGraphsByPrefix(`${dataGraph}/_verified_memory/`);
+        effectiveSparql = vmGraphs.length > 0
+          ? (wrapWithGraphUnion(sparql, [dataGraph, ...vmGraphs]) ?? wrapWithGraph(sparql, dataGraph))
+          : wrapWithGraph(sparql, dataGraph);
       }
     }
 

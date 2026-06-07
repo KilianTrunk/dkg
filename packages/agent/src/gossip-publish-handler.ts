@@ -249,7 +249,7 @@ export class GossipPublishHandler {
           this.log.warn(ctx, `Gossip structural validation rejected publish ${request.ual}: no valid root entities`);
           return;
         }
-        const sparql = `SELECT DISTINCT ?s WHERE { GRAPH <${dataGraph}> { ?s ?p ?o } VALUES ?s { ${rootEntities.map(e => `<${e}>`).join(' ')} } }`;
+        const sparql = `SELECT DISTINCT ?s WHERE { GRAPH ?g { ?s ?p ?o } VALUES ?s { ${rootEntities.map(e => `<${e}>`).join(' ')} } FILTER(STRSTARTS(STR(?g), "${dataGraph}/_verified_memory/") || STR(?g) = "${dataGraph}") }`;
         const result = await this.store.query(sparql);
         const existingEntities = new Set<string>(
           result.type === 'bindings' ? result.bindings.map(b => b['s']).filter(Boolean) : [],

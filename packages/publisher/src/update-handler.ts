@@ -2,7 +2,7 @@ import type { TripleStore, Quad } from '@origintrail-official/dkg-storage';
 import { GraphManager } from '@origintrail-official/dkg-storage';
 import type { EventBus } from '@origintrail-official/dkg-core';
 import type { ChainAdapter, KAUpdateVerification } from '@origintrail-official/dkg-chain';
-import { Logger, createOperationContext, DKGEvent, sparqlInt, contextGraphMetaUri } from '@origintrail-official/dkg-core';
+import { Logger, createOperationContext, DKGEvent, sparqlInt, contextGraphMetaUri, contextGraphLayerUri, MemoryLayer } from '@origintrail-official/dkg-core';
 import { decodeKAUpdateRequest } from '@origintrail-official/dkg-core';
 import { parseSimpleNQuads } from './publish-handler.js';
 import { skolemizeByEntity } from './auto-partition.js';
@@ -164,7 +164,16 @@ export class UpdateHandler {
       // root's privateMerkleRoot in the same order the publisher used to build
       // the KC root, so we just forward them.
       await this.graphManager.ensureContextGraph(contextGraphId);
-      const dataGraph = this.graphManager.dataGraphUri(contextGraphId);
+      // Uniform layout: a KA update replaces the published data in the SAME per-KA
+      // verified-memory graph the original publish wrote (…/_verified_memory/{author}/{number}),
+      // keyed by the on-chain batchId (= the packed kaId). restate/delete/write all target it.
+      const vmBatch = BigInt(batchId);
+      const dataGraph = contextGraphLayerUri(
+        contextGraphId,
+        MemoryLayer.VerifiedMemory,
+        '0x' + (vmBatch >> 96n).toString(16).padStart(40, '0'),
+        vmBatch & ((1n << 96n) - 1n),
+      );
       const nquadsStr = new TextDecoder().decode(nquads);
       const quads = parseSimpleNQuads(nquadsStr);
 

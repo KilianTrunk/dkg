@@ -216,12 +216,20 @@ describe('SWM subset publish cleanup', () => {
     ];
     await publisher.share(CONTEXT_GRAPH, allQuads, { publisherPeerId: 'peer1' });
 
-    await publisher.publishFromSharedMemory(CONTEXT_GRAPH, 'all', {
+    const result = await publisher.publishFromSharedMemory(CONTEXT_GRAPH, 'all', {
       precomputedAttestation: await sealForAll(allQuads),
       v10ACKProvider: hardhatACKProvider(_kav10Address),
     });
 
-    const subjects = await subjectsInGraph(store, DATA_GRAPH);
+    // rc.17 uniform per-KA layout: a confirmed publish writes the KA's public
+    // quads into the PER-KA verified-memory graph
+    // `did:dkg:context-graph:{cg}/_verified_memory/{author}/{number}` (author +
+    // number unpacked from the minted kaId), NOT the monolithic root data graph.
+    // Assert the published subject lands in the graph it actually lives in.
+    const vmNumber = result.kaId & ((1n << 96n) - 1n);
+    const vmAuthor = `0x${(result.kaId >> 96n).toString(16).padStart(40, '0')}`;
+    const vmGraph = `${DATA_GRAPH}/_verified_memory/${vmAuthor}/${vmNumber}`;
+    const subjects = await subjectsInGraph(store, vmGraph);
     expect(subjects.has(entity)).toBe(true);
   });
 

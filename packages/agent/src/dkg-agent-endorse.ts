@@ -796,7 +796,7 @@ export class EndorseVerifyMethods extends DKGAgentBase {
       .map(e => `(STR(?s) = ${sparqlString(e)} || STRSTARTS(STR(?s), ${sparqlString(e + '/.well-known/genid/')}))`)
       .join(' || ');
     const result = await this.store.query(
-      `SELECT ?s ?p ?o WHERE { GRAPH <${dataGraph}> { ?s ?p ?o . FILTER(${filterClauses}) } }`,
+      `SELECT ?s ?p ?o WHERE { GRAPH ?g { ?s ?p ?o . FILTER(${filterClauses}) } FILTER(STRSTARTS(STR(?g), "${dataGraph}/_verified_memory/") || STR(?g) = "${dataGraph}") }`,
     );
     if (result.type !== 'bindings') return;
 

@@ -2883,7 +2883,17 @@ export class DKGPublisher implements Publisher {
       localOnlyUpdate ? this.localTentativePublisherAddress() : undefined
     );
     this.log.info(ctx, `Updating kaId=${kaId} with ${quads.length} triples`);
-    const dataGraph = this.graphManager.dataGraphUri(contextGraphId);
+    // Uniform layout: a KA update replaces published data in the SAME per-KA
+    // verified-memory graph publish() wrote (…/_verified_memory/{author}/{number}),
+    // keyed by kaId. restateLabelGraphForUpdate purges the old roots there + writes the new
+    // (matches the receiver-side update-handler.ts). Without this the update lands in root
+    // while stale data lingers in the per-KA graph, and read-both returns both.
+    const dataGraph = contextGraphLayerUri(
+      contextGraphId,
+      MemoryLayer.VerifiedMemory,
+      '0x' + (kaId >> 96n).toString(16).padStart(40, '0'),
+      kaId & ((1n << 96n) - 1n),
+    );
 
     onPhase?.('prepare', 'start');
     onPhase?.('prepare:partition', 'start');

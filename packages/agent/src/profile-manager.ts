@@ -76,7 +76,7 @@ export class ProfileManager {
       .replace(/"/g, '\\"');
     try {
       const discovered = await this.store.query(
-        `SELECT DISTINCT ?s WHERE { GRAPH <${dataGraph}> { ?s <https://dkg.network/ontology#peerId> "${escapedPeerId}" } }`,
+        `SELECT DISTINCT ?s WHERE { GRAPH ?g { ?s <https://dkg.network/ontology#peerId> "${escapedPeerId}" } FILTER(STRSTARTS(STR(?g), "${dataGraph}/_verified_memory/") || STR(?g) = "${dataGraph}") }`,
       );
       if (discovered.type === 'bindings') {
         for (const row of discovered.bindings) {

@@ -905,8 +905,16 @@ describe('DKGQueryEngine', () => {
       { contextGraphId: CONTEXT_GRAPH },
     );
 
+    // rc.17 uniform layout: published data now lives in per-KA
+    // `…/_verified_memory/{author}/{number}` graphs, and the default
+    // data-graph read read-boths them alongside the legacy root graph.
+    // So a GRAPH-variable scan on the data route binds the root graph AND
+    // the per-KA verified-memory partitions — but still NOT the working-
+    // memory assertion graph, sub-graph data, or sub-graph SWM (those
+    // require the explicit partition opt-in).
     expect(result.bindings).toEqual([
       { g: GRAPH, name: '"RootData"' },
+      { g: rootVerifiedGraph, name: '"RootVM"' },
     ]);
   });
 
@@ -933,9 +941,16 @@ describe('DKGQueryEngine', () => {
       { contextGraphId: CONTEXT_GRAPH, includeSharedMemory: true },
     );
 
+    // rc.17 uniform layout: the data route read-boths the per-KA
+    // `…/_verified_memory/{author}/{number}` partitions, so the
+    // includeSharedMemory scan now binds root data + root SWM + the
+    // per-KA verified-memory partition — but still NOT the root working-
+    // memory assertion graph, sub-graph data, or sub-graph SWM (those
+    // require the explicit partition opt-in).
     expect(result.bindings).toEqual([
       { g: GRAPH, name: '"RootData"' },
       { g: rootSharedMemoryGraph, name: '"RootSWM"' },
+      { g: rootVerifiedGraph, name: '"RootVM"' },
     ]);
   });
 
@@ -1013,7 +1028,15 @@ describe('DKGQueryEngine', () => {
       q('urn:code:swm', SCHEMA_NAME, '"CodeSWM"', subGraphSharedMemoryGraph),
     ]);
 
-    const listGraphsSpy = vi.spyOn(store, 'listGraphs');
+    // rc.17 uniform layout adds unmemoized per-KA prefix discoveries
+    // (`…/_verified_memory/…` read-both) that also hit `store.listGraphs`,
+    // so a raw `listGraphs` spy no longer isolates partition discovery.
+    // Spy on the memoized partition-discovery routine directly — that is
+    // what the in-flight cache de-dupes across concurrent scans.
+    const partitionDiscoverySpy = vi.spyOn(
+      engine as unknown as { discoverScopedContentGraphAllowList: (...args: unknown[]) => Promise<string[]> },
+      'discoverScopedContentGraphAllowList',
+    );
     const sparql = `SELECT ?g ?name WHERE { GRAPH ?g { ?s <${SCHEMA_NAME}> ?name } } ORDER BY ?name`;
 
     const results = await Promise.all([
@@ -1022,7 +1045,7 @@ describe('DKGQueryEngine', () => {
       engine.query(sparql, { contextGraphId: CONTEXT_GRAPH, includeContextGraphPartitions: true }),
     ]);
 
-    expect(listGraphsSpy).toHaveBeenCalledTimes(1);
+    expect(partitionDiscoverySpy).toHaveBeenCalledTimes(1);
     for (const result of results) {
       const graphs = new Set(result.bindings.map((row) => row['g']));
       expect(graphs.has(rootSharedMemoryGraph)).toBe(true);
@@ -1041,14 +1064,21 @@ describe('DKGQueryEngine', () => {
       q('urn:code:data', SCHEMA_NAME, '"CodeData"', codeSubGraph),
     ]);
 
-    const listGraphsSpy = vi.spyOn(store, 'listGraphs');
+    // rc.17 uniform layout adds unmemoized per-KA prefix discoveries that
+    // also call `store.listGraphs`, so spy on the memoized partition-
+    // discovery routine directly to pin "discovered once per completed
+    // scan, re-discovered after the in-flight promise settles".
+    const partitionDiscoverySpy = vi.spyOn(
+      engine as unknown as { discoverScopedContentGraphAllowList: (...args: unknown[]) => Promise<string[]> },
+      'discoverScopedContentGraphAllowList',
+    );
     const sparql = `SELECT ?g ?name WHERE { GRAPH ?g { ?s <${SCHEMA_NAME}> ?name } } ORDER BY ?name`;
     const first = await engine.query(
       sparql,
       { contextGraphId: CONTEXT_GRAPH, includeContextGraphPartitions: true },
     );
     expect(first.bindings.some((row) => row['g'] === codeSubGraph)).toBe(true);
-    expect(listGraphsSpy).toHaveBeenCalledTimes(1);
+    expect(partitionDiscoverySpy).toHaveBeenCalledTimes(1);
 
     await store.insert([
       ...subGraphRegistration('docs'),
@@ -1059,7 +1089,7 @@ describe('DKGQueryEngine', () => {
       sparql,
       { contextGraphId: CONTEXT_GRAPH, includeContextGraphPartitions: true },
     );
-    expect(listGraphsSpy).toHaveBeenCalledTimes(2);
+    expect(partitionDiscoverySpy).toHaveBeenCalledTimes(2);
     expect(second.bindings.some((row) => row['g'] === docsSubGraph)).toBe(true);
   });
 
@@ -1091,16 +1121,24 @@ describe('DKGQueryEngine', () => {
     );
     const names = new Set(result.bindings.map((row) => row['name']));
 
+    // Same-prefix CHILD context graphs and sub-graph-shaped partitions of a
+    // sibling/child CG must NOT be bound as the parent's content partitions.
     expect(names.has('"ChildCodeRoot"')).toBe(false);
     expect(names.has('"ChildCodeSharedMemory"')).toBe(false);
     expect(names.has('"ChildCodeVerified"')).toBe(false);
     expect(names.has('"ChildSharedMemoryRoot"')).toBe(false);
-    expect(names.has('"ChildVerifiedRoot"')).toBe(false);
     expect(result.bindings.some((row) => row['g'] === collidingSubGraph)).toBe(false);
     expect(result.bindings.some((row) => row['g'] === collidingSubGraphSharedMemory)).toBe(false);
     expect(result.bindings.some((row) => row['g'] === collidingSubGraphVerified)).toBe(false);
     expect(result.bindings.some((row) => row['g'] === collidingRootSharedMemory)).toBe(false);
-    expect(result.bindings.some((row) => row['g'] === collidingRootVerified)).toBe(false);
+
+    // rc.17 uniform layout: `<cg>/_verified_memory/{…}` is, by definition,
+    // the parent CG's own per-KA verified-memory partition — the default
+    // data-graph read read-boths it regardless of any `registrationStatus`
+    // marker in its `_meta`. It is therefore legitimately bound here (it is
+    // NOT a colliding child CG), so it is expected to surface.
+    expect(names.has('"ChildVerifiedRoot"')).toBe(true);
+    expect(result.bindings.some((row) => row['g'] === collidingRootVerified)).toBe(true);
   });
 
   it('does not let non-canonical child-CG type triples hide registered parent partitions', async () => {

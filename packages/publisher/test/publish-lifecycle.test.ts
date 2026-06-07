@@ -43,6 +43,19 @@ function q(s: string, p: string, o: string, g = GRAPH): Quad {
   return { subject: s, predicate: p, object: o, graph: g };
 }
 
+// rc.17 uniform per-KA layout: a confirmed publish (and a subsequent
+// KA update, which DELETE+REWRITEs the same graph) writes the KA's
+// public quads into a PER-KA verified-memory named graph
+// `did:dkg:context-graph:{cg}/_verified_memory/{author}/{number}`, where
+// author+number are unpacked from the on-chain kaId (= the update's
+// batchId) — NOT the monolithic root data graph. Compute that graph from
+// a result's kaId so tests assert against the graph the data lives in.
+function verifiedMemoryGraph(kaId: bigint): string {
+  const number = kaId & ((1n << 96n) - 1n);
+  const author = '0x' + (kaId >> 96n).toString(16).padStart(40, '0');
+  return `did:dkg:context-graph:${CONTEXT_GRAPH}/_verified_memory/${author}/${number}`;
+}
+
 // Phase C made the publisher require a precomputedAttestation for
 // every on-chain broadcast. `pubS(p, args)` mints a seal so existing
 // tests stay structurally identical.
@@ -793,7 +806,7 @@ describe('Update flow', () => {
     await revertSnapshot(_fileSnapshot);
   });
 
-  it('updates existing KC with new triples and new merkle root', async () => {
+  it('updates existing KC with new triples and new merkle root (publisher.update now writes per-KA VM — verify read-both returns exactly the updated row)', async () => {
     const store = new OxigraphStore();
     const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
     const bus = new TypedEventBus();
@@ -819,8 +832,14 @@ describe('Update flow', () => {
     expect(publishResult.status).toBe('confirmed');
     const kaId = publishResult.kaId;
 
+    // rc.17 per-KA layout: the confirmed publish wrote the original quads
+    // into the per-KA verified-memory graph (computed from kaId), and the
+    // KA update DELETE+REWRITEs that SAME graph (its batchId === kaId).
+    // Assert read-both against that graph, not the monolithic root data graph.
+    const vmGraph = verifiedMemoryGraph(kaId);
+
     const before = await store.query(
-      `SELECT ?name WHERE { GRAPH <${GRAPH}> { <${ENTITY}> <http://schema.org/name> ?name } }`,
+      `SELECT ?name WHERE { GRAPH <${vmGraph}> { <${ENTITY}> <http://schema.org/name> ?name } }`,
     );
     expect(before.type).toBe('bindings');
     if (before.type === 'bindings') {
@@ -843,7 +862,7 @@ describe('Update flow', () => {
       .not.toBe(Buffer.from(publishResult.merkleRoot).toString('hex'));
 
     const after = await store.query(
-      `SELECT ?name WHERE { GRAPH <${GRAPH}> { <${ENTITY}> <http://schema.org/name> ?name } }`,
+      `SELECT ?name WHERE { GRAPH <${vmGraph}> { <${ENTITY}> <http://schema.org/name> ?name } }`,
     );
     expect(after.type).toBe('bindings');
     if (after.type === 'bindings') {

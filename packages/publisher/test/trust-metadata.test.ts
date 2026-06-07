@@ -107,9 +107,16 @@ describe('publisher trust metadata', () => {
     });
 
     expect(result.status).toBe('confirmed');
+    // rc.17 uniform per-KA layout: a confirmed publish stamps TrustLevel on the
+    // per-KA verified-memory graph …/_verified_memory/{author}/{number}, NOT the
+    // legacy monolithic root data graph. author+number are unpacked from the
+    // minted kaId returned in the publish result.
+    const vmNumber = result.kaId & ((1n << 96n) - 1n);
+    const vmAuthor = `0x${(result.kaId >> 96n).toString(16).padStart(40, '0')}`;
+    const vmGraph = `did:dkg:context-graph:${contextGraphId}/_verified_memory/${vmAuthor}/${vmNumber}`;
     const trust = await store.query(
       `SELECT ?subject ?level WHERE {
-        GRAPH <did:dkg:context-graph:${contextGraphId}> {
+        GRAPH <${vmGraph}> {
           VALUES ?subject {
             <urn:trust:published-root>
             <urn:trust:published-root/.well-known/genid/child>

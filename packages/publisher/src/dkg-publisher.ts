@@ -1433,7 +1433,12 @@ export class DKGPublisher implements Publisher {
           publishResult.publicQuads &&
           publishResult.publicQuads.length > 0
         ) {
-          const storedQuads = publishResult.publicQuads.map(q => ({ ...q, graph: defaultDataGraph }));
+          // Uniform layout: the confirmed publish wrote the public quads to the per-KA
+          // verified-memory graph (…/_verified_memory/{author}/{number}); copy from there to the
+          // per-cgId graph, and (REMAP flow) delete from there so the data ends up ONLY in per-cgId.
+          const remapKaId = publishResult.onChainResult!.kaId ?? publishResult.onChainResult!.batchId;
+          const remapVmGraph = contextGraphLayerUri(contextGraphId, MemoryLayer.VerifiedMemory, '0x' + (remapKaId >> 96n).toString(16).padStart(40, '0'), remapKaId & ((1n << 96n) - 1n));
+          const storedQuads = publishResult.publicQuads.map(q => ({ ...q, graph: remapVmGraph }));
           await this.store.insert(storedQuads.map(q => ({ ...q, graph: ctxDataGraph })));
           const trustSubjects = collectTrustSubjectsForRoots(
             storedQuads,
@@ -1449,7 +1454,7 @@ export class DKGPublisher implements Publisher {
             await this.store.delete(storedQuads);
             for (const subject of trustSubjects) {
               await this.store.deleteByPattern({
-                graph: defaultDataGraph,
+                graph: remapVmGraph,
                 subject,
                 predicate: TRUST_LEVEL_PREDICATE,
               });

@@ -885,12 +885,12 @@ quads = [
     {"subject": root, "predicate": RDF, "object": "http://schema.org/Dataset", "graph": ""},
     {"subject": root, "predicate": "http://schema.org/name", "object": '"rc12 assertion lifecycle smoke"', "graph": ""},
 ]
-print(json.dumps({"contextGraphId": cg, "name": name, "quads": quads, "finalize": True, "promote": True}))
+print(json.dumps({"contextGraphId": cg, "name": name, "quads": quads, "finalize": True, "alsoShareSwm": True}))
 PY
 )
   ac=$(post "$A2_PORT" /api/knowledge-assets -d "$A2_BODY")
   ac_uri=$(echo "$ac" | pyf "d.get('assertionUri','')")
-  ac_seal_ok=$(echo "$ac" | pyf "1 if (d.get('seal') or {}).get('merkleRoot') else 0")
+  ac_seal_ok=$(echo "$ac" | pyf "1 if d.get('merkleRoot') else 0")
   ac_promoted=$(echo "$ac" | pyf "d.get('promotedCount',0)")
   if [ -n "$ac_uri" ] && [ "$ac_seal_ok" = "1" ] && [ "${ac_promoted:-0}" -gt 0 ] 2>/dev/null; then
     pass A2 assertion-create-finalize-promote "assertion=$ac_uri sealed and promoted (promoted=$ac_promoted)"

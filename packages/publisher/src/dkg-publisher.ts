@@ -870,16 +870,12 @@ export class DKGPublisher implements Publisher {
     }
 
     const shareOperationId = `swm-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-    // Uniform layout: each generic share is a per-KA unit — mint a number for the sender
-    // and write to …/_shared_memory/{sender}/{number}. Falls back to the legacy bucket
-    // only when there's no valid EVM sender / allocator.
-    const shareKaId = (options.senderAgentAddress && /^0x[a-fA-F0-9]{40}$/.test(options.senderAgentAddress))
-      ? await this.ensureReservedKaId(options.senderAgentAddress)
-      : undefined;
-    const shareKaNumber = shareKaId !== undefined ? (shareKaId & ((1n << 96n) - 1n)) : undefined;
-    const swmGraph = (shareKaNumber !== undefined && options.senderAgentAddress)
-      ? this.swmGraphUriFor(contextGraphId, options.senderAgentAddress, shareKaNumber, options.subGraphName)
-      : this.graphManager.sharedMemoryUri(contextGraphId, options.subGraphName);
+    // Generic share (dkg_shared_memory_publish) is raw shared data, NOT a lifecycle KA:
+    // it has no created/promoted identity to key a per-KA graph, and minting one here
+    // collides with the publish-from-SWM kaId reservation (0-KA publishes). It stays in
+    // the bucket; the per-KA …/_shared_memory/{addr}/{number} layout is produced by
+    // promote (a real KA lifecycle). read-both reads cover both shapes.
+    const swmGraph = this.graphManager.sharedMemoryUri(contextGraphId, options.subGraphName);
     const swmMetaGraph = this.graphManager.sharedMemoryMetaUri(contextGraphId, options.subGraphName);
 
     // Pre-encode gossip message and enforce size limit BEFORE any
@@ -915,8 +911,6 @@ export class DKGPublisher implements Publisher {
       operationId: ctx.operationId,
       casConditions,
       subGraphName: options.subGraphName,
-      agentAddress: options.senderAgentAddress,
-      kaNumber: shareKaNumber !== undefined ? String(shareKaNumber) : undefined,
     });
     const message = await this.encodeWorkspaceGossipPayload(
       contextGraphId,

@@ -721,21 +721,25 @@ export async function fetchAssertionUals(contextGraphId: string): Promise<Record
 // re-signs.
 export const publishTriples = async (contextGraphId: string, quads: any[]) => {
   const assertionName = `ui-publish-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  const created = await post<{ assertionUri: string; seal?: Record<string, unknown> }>(
+  const created = await post<{ assertionUri: string; merkleRoot?: string; promotedCount?: number }>(
     '/api/knowledge-assets',
     {
       contextGraphId,
       name: assertionName,
       quads,
       finalize: true,
-      promote: true,
+      // rc.17 KA-routes-unification: the SWM-promote flag is `alsoShareSwm`
+      // (the old `promote` is ignored → the asset never reaches SWM and the
+      // follow-up /api/shared-memory/publish finds nothing to publish).
+      alsoShareSwm: true,
     },
   );
   const published = await post<any>('/api/shared-memory/publish', {
     contextGraphId,
     assertionName,
   });
-  return { ...published, assertionUri: created.assertionUri, ...(created.seal ? { seal: created.seal } : {}) };
+  // rc.17 create returns `merkleRoot` at top level (not nested `seal`).
+  return { ...published, assertionUri: created.assertionUri, ...(created.merkleRoot ? { merkleRoot: created.merkleRoot } : {}) };
 };
 
 export const writeSharedMemory = (
@@ -1190,9 +1194,15 @@ export async function listAssertions(
     GRAPH <${metaGraph}> { ?g <http://dkg.io/ontology/memoryLayer> "WM" }
     ${metaFilter}
   }`;
+  // rc.17 per-KA WM: the data graph is …/_working_memory/{addr}/{number} (number-keyed),
+  // but the surviving list row is the lifecycle URN (name-keyed). Count the URN's data
+  // graph via its dkg:assertionGraph pointer and key by the URN too — else
+  // countByGraph.get(urn) is undefined and the triple-count badge is lost for every WM KA.
   const countSparql = `SELECT ?g (COUNT(*) AS ?cnt) WHERE {
     GRAPH <${metaGraph}> { ?g <http://dkg.io/ontology/memoryLayer> "WM" }
-    GRAPH ?g { ?s ?p ?o }
+    OPTIONAL { GRAPH <${metaGraph}> { ?g <http://dkg.io/ontology/assertionGraph> ?dg } }
+    BIND(COALESCE(?dg, ?g) AS ?countGraph)
+    GRAPH ?countGraph { ?s ?p ?o }
     ${metaFilter}
   } GROUP BY ?g`;
   const [listData, countData] = await Promise.all([
@@ -1460,7 +1470,10 @@ export async function listSwmEntities(contextGraphId: string): Promise<SwmRootEn
   const sparql = `SELECT ?s (COUNT(?p) AS ?cnt) WHERE {
     GRAPH ?g {
       ?s ?p ?o .
-      FILTER(STR(?g) = "${swmGraph}")
+      FILTER(
+        (STR(?g) = "${swmGraph}" || STRSTARTS(STR(?g), "${swmGraph}/")) &&
+        !STRSTARTS(STR(?g), "${swmGraph}/staging/")
+      )
       FILTER(?p != <http://dkg.io/ontology/workspaceOwner>)
     }
   } GROUP BY ?s ORDER BY DESC(?cnt)`;

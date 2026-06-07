@@ -240,7 +240,7 @@ function wmSparql(cgId: string) {
     GRAPH ?g { ?s ?p ?o }
     FILTER(
       STRSTARTS(STR(?g), "${cgUri}/") &&
-      CONTAINS(STR(?g), "/assertion/") &&
+      (CONTAINS(STR(?g), "/assertion/") || CONTAINS(STR(?g), "/_working_memory/")) &&
       STR(?g) != "${cgUri}/meta" &&
       !CONTAINS(STR(?g), "/meta/") &&
       !STRENDS(STR(?g), "/_meta")
@@ -265,9 +265,10 @@ function swmSparql(cgId: string) {
     GRAPH ?g { ?s ?p ?o }
     FILTER(
       STRSTARTS(STR(?g), "${cgUri}") &&
-      STRENDS(STR(?g), "/_shared_memory") &&
+      (STRENDS(STR(?g), "/_shared_memory") || CONTAINS(STR(?g), "/_shared_memory/")) &&
       STR(?g) != "${cgUri}/meta/_shared_memory" &&
       !CONTAINS(STR(?g), "/meta/") &&
+      !CONTAINS(STR(?g), "/_shared_memory/staging/") &&
       ?p != <http://dkg.io/ontology/workspaceOwner>
     )
   } LIMIT ${SWM_LIMIT}`;

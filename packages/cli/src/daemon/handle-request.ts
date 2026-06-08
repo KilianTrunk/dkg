@@ -323,6 +323,7 @@ import { handlePublisherRoutes } from './routes/publisher.js';
 import { handleContextGraphRoutes } from './routes/context-graph.js';
 import { handleKnowledgeAssetsRoutes } from './routes/knowledge-assets.js';
 import { handleKcChainMetadataRoutes } from './routes/kc-chain-metadata.js';
+import { handleFileServingRoutes } from './routes/file-serving.js';
 import { handleQueryRoutes } from './routes/query.js';
 import { handleLocalAgentsRoutes } from './routes/local-agents.js';
 import { handleEpcisRoutes } from './routes/epcis.js';
@@ -434,6 +435,9 @@ export async function handleRequest(
   if (res.writableEnded) return;
 
   await handleKcChainMetadataRoutes(ctx);
+  if (res.writableEnded) return;
+
+  await handleFileServingRoutes(ctx);
   if (res.writableEnded) return;
 
   await handleQueryRoutes(ctx);

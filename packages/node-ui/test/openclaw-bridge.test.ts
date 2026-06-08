@@ -170,8 +170,13 @@ describe('OpenClaw daemon endpoints', () => {
       discardStart,
       daemonSrc.indexOf('verb === "pull-from"', discardStart),
     );
-    expect(discardBlock).toContain('const assertionUri = contextGraphAssertionUri(');
-    expect(discardBlock).toContain('extractionStatus.delete(assertionUri);');
+    // The eviction must be keyed by the assertion's content-addressed URI
+    // (so a same-name re-import re-extracts). The unified KA handler inlines
+    // it as `extractionStatus.delete(contextGraphAssertionUri(...))` rather
+    // than the legacy two-statement form — assert the guarantee, not the
+    // exact variable shape.
+    expect(discardBlock).toContain('extractionStatus.delete(');
+    expect(discardBlock).toContain('contextGraphAssertionUri(');
   });
 
   it('chat-openclaw persists outbound messages', () => {

@@ -284,22 +284,25 @@ describe('V10 Publish E2E', () => {
     expect(ackSignatures).toHaveLength(3);
 
     const pubWallet = new ethers.Wallet(HARDHAT_KEYS.CORE_OP);
+    // OT-RFC-43 Option-1 (variant 1a): the real adapter requires a packed
+    // reservedKaId = (uint160(author) << 96) | number in the author's namespace.
+    // This is a direct adapter call (no DKGPublisher allocator), so pack one
+    // explicitly for the CORE_OP author.
+    // §F2 — the AuthorAttestation digest now binds reservedKaId, so it must be
+    // allocated BEFORE the author signs over the typed data.
+    const reservedKaId = (BigInt(ethers.getAddress(pubWallet.address)) << 96n) | 1n;
+
     const authorTyped = buildAuthorAttestationTypedData({
       chainId: TEST_CHAIN_ID,
       kav10Address: realKAV10Addr,
       contextGraphId: chainCgId,
       merkleRoot,
       authorAddress: pubWallet.address,
+      reservedKaId,
     });
     const authorSig = ethers.Signature.from(
       await pubWallet.signTypedData(authorTyped.domain, authorTyped.types, authorTyped.message),
     );
-
-    // OT-RFC-43 Option-1 (variant 1a): the real adapter requires a packed
-    // reservedKaId = (uint160(author) << 96) | number in the author's namespace.
-    // This is a direct adapter call (no DKGPublisher allocator), so pack one
-    // explicitly for the CORE_OP author.
-    const reservedKaId = (BigInt(ethers.getAddress(pubWallet.address)) << 96n) | 1n;
 
     const result = await adapter.createKnowledgeAssets!({
       publishOperationId: 'v10-e2e-test',

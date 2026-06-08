@@ -909,19 +909,21 @@ export class PublishMethods extends DKGAgentBase {
         : undefined,
     } as const;
 
-    // Seal-build: caller-callback errors propagate; daemon-internal misses degrade to sealless (sync `_publish` parity).
+    // OT-RFC-43 §F2 — the async-lift author seal cannot yet bind the non-zero
+    // reservedKaId the on-chain mint now requires; async reservedKaId allocation is
+    // DEFERRED to rc.18. Rather than build the old 0n-placeholder seal (which the
+    // on-chain mint rejects with KaIdNamespaceMismatch), leave the async lift
+    // SEALLESS when the caller didn't supply its own attestation. EPCIS/Kafka and
+    // other direct async-capture writers keep working — WM/SWM is unaffected; only
+    // the on-chain VM anchor is deferred (a sealless lift simply has no
+    // AuthorAttestation to mint with until rc.18 wires async allocation, exactly
+    // like the existing non-V10 "enqueues without a seal" path). A caller-supplied
+    // preSignedAuthorAttestation is honored (it carries its own valid attestation).
     let seal: LiftRequestAuthorSeal | undefined;
     if (opts?.preSignedAuthorAttestation) {
       seal = preSignedAttestationToLiftSeal(opts.preSignedAuthorAttestation);
-    } else if (opts?.authorSignTypedData !== undefined) {
-      seal = await this.buildAsyncLiftSeal(liftRequestDraft, opts?.authorAgentAddress, opts.authorSignTypedData);
-    } else {
-      try {
-        seal = await this.buildAsyncLiftSeal(liftRequestDraft, opts?.authorAgentAddress, undefined);
-      } catch (err) {
-        this.log.warn(ctx, `Async seal mint failed; on-chain publish will fall back to tentative: ${err instanceof Error ? err.message : String(err)}`);
-      }
     }
+    // else: sealless — no async-lift seal built (§F2 async binding deferred to rc.18).
 
     const asyncPublisher = new TripleStoreAsyncLiftPublisher(this.store, {
       publicSnapshotStore: this.publicSnapshotStore,
@@ -959,6 +961,11 @@ export class PublishMethods extends DKGAgentBase {
     authorAgentAddress?: string,
     authorSignTypedData?: (typedData: AuthorAttestationTypedData) => Promise<{ r: Uint8Array; vs: Uint8Array }>,
   ): Promise<LiftRequestAuthorSeal | undefined> {
+    // OT-RFC-43 §F2 — async share is deferred to the next release (the async-lift
+    // seal does not yet allocate/bind the reservedKaId the digest now requires).
+    // This method is UNREACHABLE in this release: the swm/share-async route is
+    // hard-gated (501), so no async-lift seal is ever built or persisted. The 0n
+    // reservedKaId placeholder below only satisfies the now-required digest field.
     if (this.chain.isV10Ready?.() !== true) return undefined;
     if (typeof this.chain.getEvmChainId !== 'function') return undefined;
     if (typeof this.chain.getKnowledgeAssetsLifecycleAddress !== 'function') return undefined;
@@ -1022,12 +1029,19 @@ export class PublishMethods extends DKGAgentBase {
       authorAddress = fallback;
     }
 
+    // OT-RFC-43 §F2 — async-lift reservedKaId binding is DEFERRED to rc.18. The
+    // async share path is gated at the `swm/share-async` route (returns
+    // rc.17-unavailable) plus a runtime guard in `publishAsync`, so this code is
+    // unreachable in rc.17; the 0n placeholder only satisfies the now-required
+    // digest field. rc.18 allocates the number here and persists it on the
+    // LiftRequestAuthorSeal so the deferred-broadcast digest matches.
     const typedData = buildAuthorAttestationTypedData({
       chainId,
       kav10Address,
       contextGraphId: BigInt(onChainId),
       merkleRoot: canonical.kcMerkleRoot,
       authorAddress,
+      reservedKaId: 0n,
       schemeVersion: AUTHOR_SCHEME_VERSION_V1,
     });
 
@@ -1606,13 +1620,28 @@ export class PublishMethods extends DKGAgentBase {
             `breaks the author signature and is rejected.`,
         );
       }
-      // Seal exists and matches — return the existing record.
+      // Seal exists and matches — return the existing record. The rebuilt digest
+      // must bind the SAME reservedKaId the original signature committed to
+      // (§F2): prefer the value persisted on the seal; for a seal that predates
+      // the binding, repack from the lifecycle-URN kaId stamp.
+      let reReservedKaId = existingSeal.reservedKaId;
+      if (reReservedKaId === undefined) {
+        const reKaIdRes = await this.store.query(
+          `SELECT ?n WHERE { GRAPH <${metaGraph}> { <${assertionLifecycleUri(contextGraphId, agentAddress, name, opts?.subGraphName)}> <${KA_ID_PRED}> ?n } } LIMIT 1`,
+        );
+        const reNum =
+          reKaIdRes.type === 'bindings' && reKaIdRes.bindings[0]?.['n'] !== undefined
+            ? BigInt(String(reKaIdRes.bindings[0]['n']).replace(/^"/, '').replace(/"(\^\^<[^>]+>)?$/, '').trim())
+            : 0n;
+        reReservedKaId = (BigInt(ethers.getAddress(existingSeal.authorAddress)) << 96n) | reNum;
+      }
       const typedData = buildAuthorAttestationTypedData({
         chainId: existingSeal.chainId,
         kav10Address: existingSeal.kav10Address,
         contextGraphId: await this.requireOnChainContextGraphId(contextGraphId),
         merkleRoot: existingSeal.merkleRoot,
         authorAddress: existingSeal.authorAddress,
+        reservedKaId: reReservedKaId,
         schemeVersion: existingSeal.authorSchemeVersion,
       });
       return {
@@ -1689,13 +1718,156 @@ export class PublishMethods extends DKGAgentBase {
       authorAddress = fallbackAddress;
     }
 
-    // 8. Build EIP-712 typed data.
+    // ── OT-RFC-43 §F2 — resolve the reserved kaId BEFORE signing ──
+    // The AuthorAttestation digest now binds reservedKaId, so the packed id must
+    // be known before buildAuthorAttestationTypedData. This is the SINGLE
+    // allocation point (publishFromFinalizedAssertion REUSES it). Rules:
+    //   • preSigned author → honour the slot they signed over (no allocation);
+    //   • update of a previously-stamped name → reuse the stable existing number;
+    //   • fresh create with an allocator → reconcile-once then allocate ONE number;
+    //   • no allocator → 0n (non-Option-1; the on-chain namespace check rejects).
+    const lifecycleUri = assertionLifecycleUri(contextGraphId, agentAddress, name, opts?.subGraphName);
+    const xsdInteger = '<http://www.w3.org/2001/XMLSchema#integer>';
+    const existingKaIdRes = await this.store.query(
+      `SELECT ?n WHERE { GRAPH <${metaGraph}> { <${lifecycleUri}> <${KA_ID_PRED}> ?n } } LIMIT 1`,
+    );
+    const hasExistingKaId =
+      existingKaIdRes.type === 'bindings' && existingKaIdRes.bindings.length > 0;
+    const packReservedKaId = (addr: string, num: bigint): bigint =>
+      (BigInt(ethers.getAddress(addr)) << 96n) | num;
+    const parseStampedNumber = (raw: unknown): bigint =>
+      BigInt(String(raw).replace(/^"/, '').replace(/"(\^\^<[^>]+>)?$/, '').trim());
+    let reservedKaId: bigint;
+    // freshNumber is set ONLY when a NEW number must be stamped on the lifecycle
+    // URN (fresh create, or a preSigned author whose slot isn't yet stamped).
+    let freshNumber: bigint | undefined;
+    if (preSigned) {
+      if (hasExistingKaId) {
+        // The lifecycle already owns a stable slot. A re-finalize / update must
+        // commit to THAT id, not whatever the caller signed over — otherwise the
+        // persisted seal + on-chain mint (publishFromFinalizedAssertion reuses the
+        // stamped `dkg:kaId`) would name a different KA than `_meta` points at.
+        // The signature binds reservedKaId (§F2), so a caller who signed a
+        // different number is rejected rather than silently re-slotted.
+        const stampedKaId = packReservedKaId(
+          authorAddress,
+          parseStampedNumber(existingKaIdRes.bindings[0]['n']),
+        );
+        if (preSigned.reservedKaId !== stampedKaId) {
+          throw new Error(
+            `assertionFinalize: preSignedAuthorAttestation reservedKaId mismatch — ` +
+              `caller signed over ${preSigned.reservedKaId} but lifecycle "${name}" is already ` +
+              `stamped at kaId ${stampedKaId}. A re-finalize/update must attest the existing ` +
+              `stable slot (OT-RFC-43 §F2).`,
+          );
+        }
+        reservedKaId = stampedKaId;
+        freshNumber = undefined;
+      } else {
+        // Fresh slot: the caller-signed id MUST live in the author's own
+        // namespace (high 160 bits == author). Otherwise we'd persist a local
+        // seal + `_meta` for an id the on-chain mint later rejects with
+        // KaIdNamespaceMismatch — sealed locally, unpublishable. Reject here.
+        if ((preSigned.reservedKaId >> 96n) !== BigInt(ethers.getAddress(authorAddress))) {
+          throw new Error(
+            `assertionFinalize: preSignedAuthorAttestation reservedKaId namespace mismatch — ` +
+              `id ${preSigned.reservedKaId} is not in author ${ethers.getAddress(authorAddress)}'s ` +
+              `namespace. The packed kaId must be (uint160(author) << 96) | number (OT-RFC-43 §F2).`,
+          );
+        }
+        reservedKaId = preSigned.reservedKaId;
+        freshNumber = reservedKaId & ((1n << 96n) - 1n);
+      }
+    } else if (hasExistingKaId) {
+      // The lifecycle already owns a stable slot. The stamped `dkg:kaId` number
+      // was allocated in the ORIGINAL author's namespace — its packed id is
+      // (uint160(originalAuthor) << 96) | number, recorded authoritatively in the
+      // co-stamped `dkg:reservedUal` (did:dkg:<chainId>/<authorAddrLower>/<number>).
+      // Repacking the SAME number with a CHANGED authorAddress would name a
+      // different KA than `_meta`/the lifecycle points at, and the on-chain mint
+      // (publishFromFinalizedAssertion reuses the stamped `dkg:kaId`) would reject
+      // it with KaIdNamespaceMismatch — sealed locally, unpublishable. Preserve the
+      // original author bits and reject author changes on an already-stamped name
+      // (OT-RFC-43 §F2).
+      const stampedNumber = parseStampedNumber(existingKaIdRes.bindings[0]['n']);
+      const reservedUalRes = await this.store.query(
+        `SELECT ?u WHERE { GRAPH <${metaGraph}> { <${lifecycleUri}> <${RESERVED_UAL_PRED}> ?u } } LIMIT 1`,
+      );
+      const stampedReservedUal =
+        reservedUalRes.type === 'bindings' && reservedUalRes.bindings[0]?.['u'] !== undefined
+          ? String(reservedUalRes.bindings[0]['u']).replace(/^"/, '').replace(/"(\^\^<[^>]+>)?$/, '').trim()
+          : undefined;
+      // did:dkg:<chainId>/<addrLower>/<number> — the second path segment is the
+      // original author. A pre-binding seal may lack `dkg:reservedUal`; only then
+      // do we fall back to the current author (no recorded original to preserve).
+      const originalAuthor = stampedReservedUal?.split('/')[1];
+      if (originalAuthor !== undefined) {
+        if (ethers.getAddress(originalAuthor) !== ethers.getAddress(authorAddress)) {
+          throw new Error(
+            `assertionFinalize: cannot change authorship of already-stamped lifecycle "${name}" — ` +
+              `the stable kaId number ${stampedNumber} was reserved in author ` +
+              `${ethers.getAddress(originalAuthor)}'s namespace, but this finalize attributes the ` +
+              `assertion to ${ethers.getAddress(authorAddress)}. Repacking the number under a new ` +
+              `author would target a different KA than the lifecycle (and on-chain mint) points at ` +
+              `and be rejected on mint with KaIdNamespaceMismatch. Discard and re-create under the ` +
+              `new author to allocate a fresh slot, or finalize as the original author (OT-RFC-43 §F2).`,
+          );
+        }
+        // Author unchanged — pack with the preserved original author bits.
+        reservedKaId = packReservedKaId(originalAuthor, stampedNumber);
+      } else {
+        reservedKaId = packReservedKaId(authorAddress, stampedNumber);
+      }
+    } else if (this.kaNumberAllocator) {
+      const key = authorAddress.toLowerCase();
+      if (!this.reconciledKaAuthors.has(key)) {
+        let chainMax = -1n;
+        if (typeof this.chain.getMaxKaNumberForAuthor === 'function') {
+          try {
+            chainMax = await this.chain.getMaxKaNumberForAuthor(authorAddress);
+          } catch (err) {
+            throw new Error(
+              `OT-RFC-43 A2: failed to reconcile KA-number floor for author ${authorAddress} at finalize: ` +
+                (err instanceof Error ? err.message : String(err)),
+            );
+          }
+        }
+        if (chainMax >= 0n) {
+          // Pass the bigint straight through (PR #976 F6) — `Number()` would lose precision past 2^53.
+          this.kaNumberAllocator.reconcile(authorAddress, chainMax);
+        }
+        this.kaNumberAllocator.markReconciled();
+        this.reconciledKaAuthors.add(key);
+      }
+      freshNumber = BigInt(this.kaNumberAllocator.allocate(authorAddress).number);
+      reservedKaId = packReservedKaId(authorAddress, freshNumber);
+    } else {
+      // OT-RFC-43 §F2 — no pre-signed slot, no previously-stamped kaId, and no
+      // kaNumberAllocator configured on this daemon. We cannot mint a valid
+      // reserved kaId: the packed id must be (uint160(author) << 96) | number,
+      // so a 0n placeholder is NOT in author ${authorAddress}'s namespace and the
+      // on-chain mint rejects it with KaIdNamespaceMismatch — the seal would be
+      // signed and persisted but permanently unpublishable. Fail fast rather than
+      // bind an unusable placeholder into the AuthorAttestation digest.
+      throw new Error(
+        `assertionFinalize: cannot reserve a kaId for author ${authorAddress} — ` +
+          `no preSignedAuthorAttestation (which would carry its own slot) and no ` +
+          `kaNumberAllocator is configured on this daemon (OT-RFC-43 §F2). The packed ` +
+          `kaId must be (uint160(author) << 96) | number; a 0n placeholder is rejected ` +
+          `on-chain (KaIdNamespaceMismatch), leaving the seal unpublishable. Configure a ` +
+          `KaNumberAllocator on the agent (daemon lifecycle) or supply a ` +
+          `preSignedAuthorAttestation whose reservedKaId lives in the author's namespace.`,
+      );
+    }
+
+    // 8. Build EIP-712 typed data (binds reservedKaId — OT-RFC-43 §F2).
     const typedData = buildAuthorAttestationTypedData({
       chainId,
       kav10Address,
       contextGraphId: onChainCgId,
       merkleRoot,
       authorAddress,
+      reservedKaId,
       schemeVersion,
     });
     const eip712Digest = ethers.TypedDataEncoder.hash(
@@ -1769,74 +1941,35 @@ export class PublishMethods extends DKGAgentBase {
       authorSchemeVersion: schemeVersion,
       chainId,
       kav10Address,
+      reservedKaId,
       finalizedAtIso,
       rootEntities,
     });
 
-    // ── OT-RFC-43 A2 — ALLOCATE-AT-FINALIZE + per-layer WM pointer ──
-    //
-    // This is the SINGLE source of truth for the packed kaId (eliminates the
-    // double-allocation the publish path used to do). If an allocator is
-    // present we reconcile its per-author floor once (lazy, cached on the
-    // agent), allocate the next (author, number), and stamp on the LIFECYCLE
-    // URN (NOT the assertion-graph URI):
+    // ── OT-RFC-43 A2 — stamp the per-author kaId + reservedUal + WM pointer ──
+    // The number was resolved/allocated ABOVE (single allocation, before the
+    // EIP-712 sign — OT-RFC-43 §F2). Here we only PERSIST it:
     //   dkg:kaId          = number (xsd:integer)
     //   dkg:reservedUal   = did:dkg:<chainId>/<agentAddrLower>/<number>
     //   dkg:wmCurrentAssertion = the seal merkle hex (bare, no 0x)
-    // publishFromFinalizedAssertion then READS dkg:kaId off `_meta` and
-    // threads it down so the publisher REUSES it instead of allocating again.
-    //
-    // We persist the WM pointer + kaId stamp atomically with the seal.
-    const lifecycleUri = assertionLifecycleUri(contextGraphId, agentAddress, name, opts?.subGraphName);
+    // publishFromFinalizedAssertion READS dkg:kaId off `_meta` and threads it
+    // down so the publisher REUSES it. freshNumber is set only for a fresh create
+    // (or a not-yet-stamped preSigned slot); an update of a previously-stamped
+    // name keeps its STABLE kaId — no re-stamp.
     const merkleHexBare = ethers.hexlify(merkleRoot).slice(2);
-
-    // Has this lifecycle ALREADY reserved a kaId? (An update to a name that
-    // was previously finalized + published — its kaId must stay STABLE across
-    // versions, so we MUST NOT allocate a fresh number and overwrite it.) The
-    // assertion-graph seal is cleared on discard+recreate, but the kaId stamp
-    // lives on the lifecycle URN and survives, so this is the reliable signal.
-    const xsdInteger = '<http://www.w3.org/2001/XMLSchema#integer>';
-    const existingKaIdRes = await this.store.query(
-      `SELECT ?n WHERE { GRAPH <${metaGraph}> { <${lifecycleUri}> <${KA_ID_PRED}> ?n } } LIMIT 1`,
-    );
-    const hasExistingKaId =
-      existingKaIdRes.type === 'bindings' && existingKaIdRes.bindings.length > 0;
-
     // Re-stamp the WM pointer (idempotent: drop any prior value first so a
     // re-finalize / update advances WM without accumulating stale pointers).
     await this._stampPointer(lifecycleUri, WM_CURRENT_ASSERTION_PRED, merkleHexBare, metaGraph);
 
-    if (this.kaNumberAllocator && !hasExistingKaId) {
-      const author = authorAddress;
-      const key = author.toLowerCase();
-      if (!this.reconciledKaAuthors.has(key)) {
-        let chainMax = -1n;
-        if (typeof this.chain.getMaxKaNumberForAuthor === 'function') {
-          try {
-            chainMax = await this.chain.getMaxKaNumberForAuthor(author);
-          } catch (err) {
-            throw new Error(
-              `OT-RFC-43 A2: failed to reconcile KA-number floor for author ${author} at finalize: ` +
-                (err instanceof Error ? err.message : String(err)),
-            );
-          }
-        }
-        if (chainMax >= 0n) {
-          // Pass the bigint straight through (PR #976 F6) — `Number()` would lose precision past 2^53.
-          this.kaNumberAllocator.reconcile(author, chainMax);
-        }
-        this.kaNumberAllocator.markReconciled();
-        this.reconciledKaAuthors.add(key);
-      }
-      const { number } = this.kaNumberAllocator.allocate(author);
+    if (freshNumber !== undefined) {
       // chainId here is the EVM uint256 from getEvmChainId(); the reservedUal
       // uses the adapter's canonical chainId string to match resolveKaUal's
       // UAL shape (did:dkg:<chainId>/<addr>/<number>).
-      const reservedUal = `did:dkg:${this.chain.chainId}/${author.toLowerCase()}/${number}`;
+      const reservedUal = `did:dkg:${this.chain.chainId}/${authorAddress.toLowerCase()}/${freshNumber}`;
       sealQuads.push({
         subject: lifecycleUri,
         predicate: KA_ID_PRED,
-        object: `"${number}"^^${xsdInteger}`,
+        object: `"${freshNumber}"^^${xsdInteger}`,
         graph: metaGraph,
       });
       sealQuads.push({
@@ -2026,12 +2159,67 @@ export class PublishMethods extends DKGAgentBase {
       authorAddress = fallbackAddress;
     }
 
+    // OT-RFC-43 §F2 — allocate the reserved kaId for this ephemeral selection
+    // publish and bind it into the signed digest; the publisher mints with this
+    // exact id (it travels on the returned precomputedAttestation). preSigned
+    // authors supply their own slot; with no allocator we fall to 0n (the on-chain
+    // namespace check then rejects).
+    let selReservedKaId: bigint;
+    if (preSigned) {
+      // Same namespace guard as assertionFinalize: the caller-signed id must be
+      // in the author's own namespace, or the publisher mints an id the chain
+      // rejects (KaIdNamespaceMismatch) after the seal is already built.
+      if ((preSigned.reservedKaId >> 96n) !== BigInt(ethers.getAddress(authorAddress))) {
+        throw new Error(
+          `Selection-based VM publish: preSignedAuthorAttestation reservedKaId namespace mismatch — ` +
+            `id ${preSigned.reservedKaId} is not in author ${ethers.getAddress(authorAddress)}'s ` +
+            `namespace (packed kaId must be (uint160(author) << 96) | number, OT-RFC-43 §F2).`,
+        );
+      }
+      selReservedKaId = preSigned.reservedKaId;
+    } else if (this.kaNumberAllocator) {
+      const selKey = authorAddress.toLowerCase();
+      if (!this.reconciledKaAuthors.has(selKey)) {
+        let selChainMax = -1n;
+        if (typeof this.chain.getMaxKaNumberForAuthor === 'function') {
+          try {
+            selChainMax = await this.chain.getMaxKaNumberForAuthor(authorAddress);
+          } catch (err) {
+            throw new Error(
+              `OT-RFC-43 §F2: failed to reconcile KA-number floor for author ${authorAddress} (selection publish): ` +
+                (err instanceof Error ? err.message : String(err)),
+            );
+          }
+        }
+        if (selChainMax >= 0n) this.kaNumberAllocator.reconcile(authorAddress, selChainMax);
+        this.kaNumberAllocator.markReconciled();
+        this.reconciledKaAuthors.add(selKey);
+      }
+      selReservedKaId =
+        (BigInt(ethers.getAddress(authorAddress)) << 96n) |
+        BigInt(this.kaNumberAllocator.allocate(authorAddress).number);
+    } else {
+      // §F2 — same as the finalize path's no-allocator branch: with no preSigned
+      // slot and no kaNumberAllocator we cannot reserve a kaId in the author's
+      // namespace, and a 0n placeholder is rejected on-chain (KaIdNamespaceMismatch).
+      // This selection publish is on-chain-bound (the seal is signed + minted, never
+      // persisted), so fail fast rather than sign an id the mint will reject.
+      throw new Error(
+        `_buildPrecomputedAttestationForSelection: cannot reserve a kaId for author ` +
+          `${authorAddress} — no preSignedAuthorAttestation and no kaNumberAllocator ` +
+          `configured (OT-RFC-43 §F2). The packed kaId must be (uint160(author) << 96) | ` +
+          `number; a 0n placeholder is rejected on-chain. Configure a KaNumberAllocator ` +
+          `or supply a preSignedAuthorAttestation whose reservedKaId is in the author's namespace.`,
+      );
+    }
+
     const typedData = buildAuthorAttestationTypedData({
       chainId,
       kav10Address,
       contextGraphId: onChainCgId,
       merkleRoot,
       authorAddress,
+      reservedKaId: selReservedKaId,
       schemeVersion,
     });
     const eip712Digest = ethers.TypedDataEncoder.hash(
@@ -2089,6 +2277,7 @@ export class PublishMethods extends DKGAgentBase {
       authorAddress,
       signature: { r, vs },
       schemeVersion,
+      reservedKaId: selReservedKaId,
     };
   }
 
@@ -2690,6 +2879,33 @@ export class PublishMethods extends DKGAgentBase {
       // `reservedKaId: packedKaId` down so ensureReservedKaId short-circuits
       // (no second allocation). When no allocator stamped one (mock/no-chain),
       // packedKaId is undefined and the publisher keeps its existing behavior.
+      // §F2 / OT-RFC-43 A2 — recover the packed id the seal's signature
+      // committed to: prefer the persisted seal.reservedKaId, else the
+      // lifecycle-URN kaId re-packed above. Both are undefined only for a
+      // legacy seal that predates the §F2 binding AND was never stamped with a
+      // lifecycle kaId.
+      const recoveredReservedKaId = seal.reservedKaId ?? packedKaId;
+      // FAIL FAST when this is an on-chain-capable daemon: the mint below will
+      // submit `precomputedAttestation` on-chain and a 0n placeholder packs to
+      // an id outside the author's namespace → guaranteed KaIdNamespaceMismatch
+      // revert. Require re-finalization instead of signing/persisting an
+      // unusable id. The same chain-capability probe gates the seal/chain
+      // cross-check above, so on mock/no-chain runs (no V10 adapter) packedKaId
+      // is legitimately undefined, the publish never goes on-chain, and the
+      // historical 0n placeholder is harmless — keep it there.
+      const onChainCapable =
+        typeof this.chain.getEvmChainId === 'function' &&
+        typeof this.chain.getKnowledgeAssetsLifecycleAddress === 'function';
+      if (recoveredReservedKaId === undefined && onChainCapable) {
+        throw new Error(
+          `publishFromFinalizedAssertion: cannot recover the §F2 reservedKaId for ` +
+            `<${assertionUri}> — the seal has neither a persisted reservedKaId nor a ` +
+            `stamped lifecycle kaId (legacy pre-OT-RFC-43-§F2 finalize). Minting with a ` +
+            `0n placeholder id would revert on-chain with KaIdNamespaceMismatch. ` +
+            `Re-finalize the assertion (POST /api/knowledge-assets/${name}/wm/finalize) ` +
+            `so the AuthorAttestation binds a valid packed kaId before publishing.`,
+        );
+      }
       result = await this.publishFromSharedMemory(
         contextGraphId,
         { rootEntities: seal.rootEntities },
@@ -2700,7 +2916,7 @@ export class PublishMethods extends DKGAgentBase {
           publisherNodeIdentityIdOverride: opts?.publisherNodeIdentityIdOverride,
           publishEpochs: opts?.publishEpochs,
           clearSharedMemoryAfter: opts?.clearSharedMemoryAfter,
-          reservedKaId: packedKaId,
+          reservedKaId: recoveredReservedKaId,
           // Wired through to the inner publisher.publish() via
           // publishFromSharedMemory's `precomputedAttestation` option.
           // Skips the publisher's signing entirely.
@@ -2709,6 +2925,11 @@ export class PublishMethods extends DKGAgentBase {
             authorAddress: seal.authorAddress,
             signature: { r: seal.authorAttestationR, vs: seal.authorAttestationVS },
             schemeVersion: seal.authorSchemeVersion,
+            // §F2 — the exact packed id the seal's signature committed to. The
+            // throw above guarantees this is defined whenever the publish is
+            // going on-chain; the `?? 0n` only survives for mock/no-chain runs
+            // where it is never submitted.
+            reservedKaId: recoveredReservedKaId ?? 0n,
           },
         },
       );

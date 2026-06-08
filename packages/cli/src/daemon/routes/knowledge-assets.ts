@@ -252,7 +252,7 @@ function resolveFinalizeOptions(
     return null;
   }
   let resolvedPreSignedAttestation:
-    | { address: string; signature: { r: Uint8Array; vs: Uint8Array } }
+    | { address: string; reservedKaId: bigint; signature: { r: Uint8Array; vs: Uint8Array } }
     | undefined;
   if (preSignedAuthorAttestation != null) {
     const validated = validatePreSignedAuthorAttestation(preSignedAuthorAttestation, res);

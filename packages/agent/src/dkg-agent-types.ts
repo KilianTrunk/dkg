@@ -61,6 +61,13 @@ import type { SyncPhase } from './sync/auth/request-build.js';
  */
 export type PreSignedAuthorAttestation = {
   address: string;
+  /**
+   * OT-RFC-43 §F2 — the packed reservedKaId the self-sovereign author signed the
+   * AuthorAttestation over `(uint160(address)<<96)|uint96(number)`. Required: the
+   * digest now binds it, so the daemon must honour the author's reserved slot
+   * rather than re-allocating, or the recovered signer won't match.
+   */
+  reservedKaId: bigint;
   signature: { r: Uint8Array; vs: Uint8Array };
 };
 

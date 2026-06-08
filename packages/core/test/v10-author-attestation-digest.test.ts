@@ -34,17 +34,20 @@ const KAV10_ADDRESS = '0x0000000000000000000000000000000000000042';
 const CG_ID = 1337n;
 const MERKLE_ROOT = new Uint8Array(32).fill(0xaa);
 const AUTHOR_ADDRESS = '0x70997970C51812dc3A010C7d01b50e0d17dc79C8';
+// §F2 — the packed reservedKaId now bound into the AuthorAttestation digest:
+// (uint160(author) << 96) | uint96(number). Number = 1 for this fixture.
+const RESERVED_KA_ID = (BigInt(AUTHOR_ADDRESS) << 96n) | 1n;
 
 // Golden hex reference — precomputed offline with `ethers.TypedDataEncoder`
 // against the exact KnowledgeAssetsLifecycle EIP-712 layout. If this drifts,
 // the off-chain typed-data builder no longer matches the on-chain
 // `_hashAuthorAttestation` and every publish will fail signature recovery.
 const AUTHOR_ATTESTATION_DIGEST_GOLDEN =
-  '0x8b43a996c02f5bf79077213758e1504b1b62a4d8802d32a6710b5049d16fb54c';
+  '0x394ec593cc6229f572337a94d78f4acb0a25b108be9b47605ef70cc932340442';
 const AUTHOR_ATTESTATION_DOMAIN_SEPARATOR_GOLDEN =
   '0x8d1039bf11fed6d60879b8382f853f0a36eccb90a660d676560daa3165e5fa84';
 const AUTHOR_ATTESTATION_STRUCT_HASH_GOLDEN =
-  '0xb72293311c0783593beea12f1d87bbb8ed1899ee1d55d439271a650c01446896';
+  '0xb06242ba37947c8fb709c8ee6cd195878330baea353c25c542df53448edd0f0c';
 
 // ── Tiny abi-encode helpers (32-byte left-padded big-endian) ─────────────
 //
@@ -124,7 +127,7 @@ const EIP712_DOMAIN_TYPEHASH = keccak256(
 );
 const AUTHOR_ATTESTATION_TYPEHASH = keccak256(
   utf8(
-    'AuthorAttestation(uint256 contextGraphId,bytes32 merkleRoot,address authorAddress,uint8 schemeVersion)',
+    'AuthorAttestation(uint256 contextGraphId,bytes32 merkleRoot,address authorAddress,uint8 schemeVersion,uint256 reservedKaId)',
   ),
 );
 
@@ -135,6 +138,7 @@ function manualHashAuthorAttestation(args: {
   merkleRootHex: string;
   authorAddress: string;
   schemeVersion: number;
+  reservedKaId: bigint;
 }): { digest: Uint8Array; domainSeparator: Uint8Array; structHash: Uint8Array } {
   const nameHash = keccak256(utf8(AUTHOR_ATTESTATION_DOMAIN_NAME));
   const versionHash = keccak256(utf8(AUTHOR_ATTESTATION_DOMAIN_VERSION));
@@ -156,6 +160,7 @@ function manualHashAuthorAttestation(args: {
       bytes32ToWord(args.merkleRootHex),
       addressToWord(args.authorAddress),
       uint8ToWord(args.schemeVersion),
+      uint256ToWord(args.reservedKaId),
     ),
   );
 
@@ -185,6 +190,7 @@ function digestForFixture(args: {
   contextGraphId: bigint;
   merkleRoot: Uint8Array;
   authorAddress: string;
+  reservedKaId: bigint;
   schemeVersion?: number;
 }): { digest: string; domainSeparator: string; structHash: string } {
   const payload = buildAuthorAttestationTypedData(args);
@@ -197,6 +203,7 @@ function digestForFixture(args: {
     merkleRootHex: payload.message.merkleRoot,
     authorAddress: payload.message.authorAddress,
     schemeVersion: payload.message.schemeVersion,
+    reservedKaId: payload.message.reservedKaId,
   });
   return {
     digest: toHex(out.digest),
@@ -213,6 +220,7 @@ describe('buildAuthorAttestationTypedData (RFC-001 §3 reference vector)', () =>
       contextGraphId: CG_ID,
       merkleRoot: MERKLE_ROOT,
       authorAddress: AUTHOR_ADDRESS,
+      reservedKaId: RESERVED_KA_ID,
     });
     expect(out.digest).toBe(AUTHOR_ATTESTATION_DIGEST_GOLDEN);
     expect(out.domainSeparator).toBe(AUTHOR_ATTESTATION_DOMAIN_SEPARATOR_GOLDEN);
@@ -233,6 +241,7 @@ describe('buildAuthorAttestationTypedData (RFC-001 §3 reference vector)', () =>
       contextGraphId: CG_ID,
       merkleRoot: MERKLE_ROOT,
       authorAddress: AUTHOR_ADDRESS,
+      reservedKaId: RESERVED_KA_ID,
     });
     expect(payload.domain.name).toBe(AUTHOR_ATTESTATION_DOMAIN_NAME);
     expect(payload.domain.version).toBe(AUTHOR_ATTESTATION_DOMAIN_VERSION);
@@ -242,8 +251,10 @@ describe('buildAuthorAttestationTypedData (RFC-001 §3 reference vector)', () =>
       { name: 'merkleRoot', type: 'bytes32' },
       { name: 'authorAddress', type: 'address' },
       { name: 'schemeVersion', type: 'uint8' },
+      { name: 'reservedKaId', type: 'uint256' },
     ]);
     expect(payload.message.schemeVersion).toBe(AUTHOR_SCHEME_VERSION_V1);
+    expect(payload.message.reservedKaId).toBe(RESERVED_KA_ID);
   });
 
   it('is deterministic for identical inputs', () => {
@@ -253,6 +264,7 @@ describe('buildAuthorAttestationTypedData (RFC-001 §3 reference vector)', () =>
       contextGraphId: CG_ID,
       merkleRoot: MERKLE_ROOT,
       authorAddress: AUTHOR_ADDRESS,
+      reservedKaId: RESERVED_KA_ID,
     }).digest;
     const b = digestForFixture({
       chainId: CHAIN_ID,
@@ -260,6 +272,7 @@ describe('buildAuthorAttestationTypedData (RFC-001 §3 reference vector)', () =>
       contextGraphId: CG_ID,
       merkleRoot: MERKLE_ROOT,
       authorAddress: AUTHOR_ADDRESS,
+      reservedKaId: RESERVED_KA_ID,
     }).digest;
     expect(a).toBe(b);
   });
@@ -271,6 +284,7 @@ describe('buildAuthorAttestationTypedData (RFC-001 §3 reference vector)', () =>
       contextGraphId: CG_ID,
       merkleRoot: MERKLE_ROOT,
       authorAddress: AUTHOR_ADDRESS,
+      reservedKaId: RESERVED_KA_ID,
     }).digest;
     const b = digestForFixture({
       chainId: CHAIN_ID + 1n,
@@ -278,6 +292,7 @@ describe('buildAuthorAttestationTypedData (RFC-001 §3 reference vector)', () =>
       contextGraphId: CG_ID,
       merkleRoot: MERKLE_ROOT,
       authorAddress: AUTHOR_ADDRESS,
+      reservedKaId: RESERVED_KA_ID,
     }).digest;
     expect(a).not.toBe(b);
   });
@@ -289,6 +304,7 @@ describe('buildAuthorAttestationTypedData (RFC-001 §3 reference vector)', () =>
       contextGraphId: CG_ID,
       merkleRoot: MERKLE_ROOT,
       authorAddress: AUTHOR_ADDRESS,
+      reservedKaId: RESERVED_KA_ID,
     }).digest;
     const b = digestForFixture({
       chainId: CHAIN_ID,
@@ -296,6 +312,7 @@ describe('buildAuthorAttestationTypedData (RFC-001 §3 reference vector)', () =>
       contextGraphId: CG_ID,
       merkleRoot: MERKLE_ROOT,
       authorAddress: AUTHOR_ADDRESS,
+      reservedKaId: RESERVED_KA_ID,
     }).digest;
     expect(a).not.toBe(b);
   });
@@ -307,6 +324,7 @@ describe('buildAuthorAttestationTypedData (RFC-001 §3 reference vector)', () =>
       contextGraphId: CG_ID,
       merkleRoot: MERKLE_ROOT,
       authorAddress: AUTHOR_ADDRESS,
+      reservedKaId: RESERVED_KA_ID,
     }).digest;
     const b = digestForFixture({
       chainId: CHAIN_ID,
@@ -314,6 +332,7 @@ describe('buildAuthorAttestationTypedData (RFC-001 §3 reference vector)', () =>
       contextGraphId: CG_ID + 1n,
       merkleRoot: MERKLE_ROOT,
       authorAddress: AUTHOR_ADDRESS,
+      reservedKaId: RESERVED_KA_ID,
     }).digest;
     expect(a).not.toBe(b);
   });
@@ -325,6 +344,7 @@ describe('buildAuthorAttestationTypedData (RFC-001 §3 reference vector)', () =>
       contextGraphId: CG_ID,
       merkleRoot: MERKLE_ROOT,
       authorAddress: AUTHOR_ADDRESS,
+      reservedKaId: RESERVED_KA_ID,
     }).digest;
     const altRoot = new Uint8Array(32).fill(0xbb);
     const b = digestForFixture({
@@ -333,6 +353,7 @@ describe('buildAuthorAttestationTypedData (RFC-001 §3 reference vector)', () =>
       contextGraphId: CG_ID,
       merkleRoot: altRoot,
       authorAddress: AUTHOR_ADDRESS,
+      reservedKaId: RESERVED_KA_ID,
     }).digest;
     expect(a).not.toBe(b);
   });
@@ -344,6 +365,7 @@ describe('buildAuthorAttestationTypedData (RFC-001 §3 reference vector)', () =>
       contextGraphId: CG_ID,
       merkleRoot: MERKLE_ROOT,
       authorAddress: AUTHOR_ADDRESS,
+      reservedKaId: RESERVED_KA_ID,
     }).digest;
     const b = digestForFixture({
       chainId: CHAIN_ID,
@@ -351,6 +373,7 @@ describe('buildAuthorAttestationTypedData (RFC-001 §3 reference vector)', () =>
       contextGraphId: CG_ID,
       merkleRoot: MERKLE_ROOT,
       authorAddress: '0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC',
+      reservedKaId: RESERVED_KA_ID,
     }).digest;
     expect(a).not.toBe(b);
   });
@@ -362,6 +385,7 @@ describe('buildAuthorAttestationTypedData (RFC-001 §3 reference vector)', () =>
       contextGraphId: CG_ID,
       merkleRoot: MERKLE_ROOT,
       authorAddress: AUTHOR_ADDRESS,
+      reservedKaId: RESERVED_KA_ID,
       schemeVersion: 1,
     }).digest;
     const b = digestForFixture({
@@ -370,6 +394,7 @@ describe('buildAuthorAttestationTypedData (RFC-001 §3 reference vector)', () =>
       contextGraphId: CG_ID,
       merkleRoot: MERKLE_ROOT,
       authorAddress: AUTHOR_ADDRESS,
+      reservedKaId: RESERVED_KA_ID,
       schemeVersion: 2,
     }).digest;
     expect(a).not.toBe(b);
@@ -383,6 +408,7 @@ describe('buildAuthorAttestationTypedData (RFC-001 §3 reference vector)', () =>
         contextGraphId: CG_ID,
         merkleRoot: new Uint8Array(16),
         authorAddress: AUTHOR_ADDRESS,
+        reservedKaId: RESERVED_KA_ID,
       }),
     ).toThrow(/merkleRoot/);
   });

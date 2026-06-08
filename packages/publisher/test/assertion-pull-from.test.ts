@@ -59,6 +59,11 @@ function sealEntities(entities: string[]): Quad[] {
     authorSchemeVersion: 1,
     chainId: 31337n,
     kav10Address: AGENT,
+    // §F2 — the seal now carries the packed reservedKaId
+    // (uint160(author) << 96 | number). This test only consumes the seal's
+    // rootEntities for scoping, so number=1 is sufficient. AGENT is already a
+    // 20-byte hex literal, so BigInt() packs it without ethers.
+    reservedKaId: (BigInt(AGENT) << 96n) | 1n,
     finalizedAtIso: '2026-01-01T00:00:00.000Z',
     rootEntities: entities,
   }) as Quad[];

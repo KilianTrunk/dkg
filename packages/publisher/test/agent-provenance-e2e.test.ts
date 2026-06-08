@@ -714,6 +714,10 @@ describe('Diagram 11 — Phase 5 precomputedAttestation (sign-at-creation)', () 
     const merkleRoot = computeFlatKCRootV10(allQuads, []);
 
     const chainIdNum = await provider.getNetwork().then((n) => n.chainId);
+    // §F2 — the AuthorAttestation digest now binds the packed reservedKaId, and
+    // the publisher mints exactly the id carried on the seal. `author` is a
+    // fresh random wallet here so number=1 never collides.
+    const reservedKaId = (BigInt(ethers.getAddress(author.address)) << 96n) | 1n;
     const td = buildAuthorAttestationTypedData({
       chainId: BigInt(chainIdNum),
       kav10Address,
@@ -721,6 +725,7 @@ describe('Diagram 11 — Phase 5 precomputedAttestation (sign-at-creation)', () 
       merkleRoot,
       authorAddress: author.address,
       schemeVersion: AUTHOR_SCHEME_VERSION_V1,
+      reservedKaId,
     });
     const sig = ethers.Signature.from(
       await author.signTypedData(td.domain, td.types, td.message),
@@ -740,6 +745,7 @@ describe('Diagram 11 — Phase 5 precomputedAttestation (sign-at-creation)', () 
           vs: ethers.getBytes(sig.yParityAndS),
         },
         schemeVersion: AUTHOR_SCHEME_VERSION_V1,
+        reservedKaId,
       },
       v10ACKProvider: hardhatACKProvider(kav10Address),
     });
@@ -768,6 +774,8 @@ describe('Diagram 11 — Phase 5 precomputedAttestation (sign-at-creation)', () 
     // root the publisher will derive from `quads`.
     const fakeRoot = ethers.getBytes('0x' + '22'.repeat(32));
     const chainIdNum = await provider.getNetwork().then((n) => n.chainId);
+    // §F2 — bind the packed reservedKaId in the digest (fresh author → number=1).
+    const reservedKaId = (BigInt(ethers.getAddress(author.address)) << 96n) | 1n;
     const td = buildAuthorAttestationTypedData({
       chainId: BigInt(chainIdNum),
       kav10Address,
@@ -775,6 +783,7 @@ describe('Diagram 11 — Phase 5 precomputedAttestation (sign-at-creation)', () 
       merkleRoot: fakeRoot,
       authorAddress: author.address,
       schemeVersion: AUTHOR_SCHEME_VERSION_V1,
+      reservedKaId,
     });
     const sig = ethers.Signature.from(
       await author.signTypedData(td.domain, td.types, td.message),
@@ -799,6 +808,7 @@ describe('Diagram 11 — Phase 5 precomputedAttestation (sign-at-creation)', () 
             vs: ethers.getBytes(sig.yParityAndS),
           },
           schemeVersion: AUTHOR_SCHEME_VERSION_V1,
+          reservedKaId,
         },
         v10ACKProvider: hardhatACKProvider(kav10Address),
       }),
@@ -843,6 +853,8 @@ describe('Diagram 11 — Phase 5 precomputedAttestation (sign-at-creation)', () 
     const { computeFlatKCRootV10 } = await import('../src/index.js');
     const expectedRoot = computeFlatKCRootV10(quads, []);
     const chainIdNum = await provider.getNetwork().then((n) => n.chainId);
+    // §F2 — bind the packed reservedKaId in the digest (fresh author → number=1).
+    const reservedKaId = (BigInt(ethers.getAddress(author.address)) << 96n) | 1n;
     const td = buildAuthorAttestationTypedData({
       chainId: BigInt(chainIdNum),
       kav10Address,
@@ -850,6 +862,7 @@ describe('Diagram 11 — Phase 5 precomputedAttestation (sign-at-creation)', () 
       merkleRoot: expectedRoot,
       authorAddress: author.address,
       schemeVersion: AUTHOR_SCHEME_VERSION_V1,
+      reservedKaId,
     });
     // Sign with a DIFFERENT EOA — under the EOA branch this would throw
     // `precomputedAttestation signer mismatch`.
@@ -875,6 +888,7 @@ describe('Diagram 11 — Phase 5 precomputedAttestation (sign-at-creation)', () 
             vs: ethers.getBytes(sig.yParityAndS),
           },
           schemeVersion: AUTHOR_SCHEME_VERSION_V1,
+          reservedKaId,
         },
         v10ACKProvider: hardhatACKProvider(kav10Address),
       });

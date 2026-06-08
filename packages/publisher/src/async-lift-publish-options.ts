@@ -151,6 +151,7 @@ function liftSealToPrecomputedAttestation(seal: NonNullable<LiftRequest['seal']>
   authorAddress: string;
   signature: { r: Uint8Array; vs: Uint8Array };
   schemeVersion: number;
+  reservedKaId: bigint;
 } {
   return {
     expectedMerkleRoot: decodeSealField('merkleRoot', seal.merkleRoot, 32),
@@ -160,6 +161,10 @@ function liftSealToPrecomputedAttestation(seal: NonNullable<LiftRequest['seal']>
       vs: decodeSealField('signature.vs', seal.signature.vs, 32),
     },
     schemeVersion: seal.schemeVersion,
+    // OT-RFC-43 §F2 — async-lift reservedKaId binding is DEFERRED to rc.18; this
+    // mapping is on the gated async-share path (unreachable in rc.17). rc.18 will
+    // persist reservedKaId on the LiftRequestAuthorSeal and read it here.
+    reservedKaId: 0n,
   };
 }
 

@@ -2392,6 +2392,7 @@ export class DKGPublisher implements Publisher {
           contextGraphId: v10CgId,
           merkleRoot: kcMerkleRoot,
           authorAddress: effectiveAuthorAddress,
+          reservedKaId: options.precomputedAttestation.reservedKaId,
           schemeVersion: effectiveSchemeVersion,
         });
         {
@@ -2494,6 +2495,7 @@ export class DKGPublisher implements Publisher {
           contextGraphId: v10CgId,
           merkleRoot: kcMerkleRoot,
           authorAddress: effectiveAuthorAddress,
+          reservedKaId: options.precomputedAttestation.reservedKaId,
           schemeVersion: effectiveSchemeVersion,
         });
         const authorSig: ethers.Signature = ethers.Signature.from({
@@ -2570,7 +2572,10 @@ export class DKGPublisher implements Publisher {
         // finalize→publish mints exactly the stamped id (no double-allocation).
         const reservedKaId = await this.ensureReservedKaId(
           effectiveAuthorAddress,
-          (options as PublishOptions).reservedKaId,
+          // §F2 — mint EXACTLY the id the agent signed: the finalize path threads it
+          // as options.reservedKaId; the ephemeral selection path carries it on the
+          // precomputedAttestation (the agent is the single allocation point).
+          (options as PublishOptions).reservedKaId ?? options.precomputedAttestation?.reservedKaId,
         );
         try {
           // OT-RFC-38 LU-11 / OT-RFC-39 — handshake hardening.

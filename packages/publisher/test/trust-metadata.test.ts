@@ -38,6 +38,10 @@ async function buildSeal(
   author: ethers.Wallet,
 ) {
   const canonical = canonicalPublishPayload(quads, []);
+  // §F2 — the digest binds the packed reservedKaId and the mock mints exactly
+  // it; the test unpacks {author,number} from the returned kaId. A fresh
+  // random `author` per test means number=1 never collides.
+  const reservedKaId = (BigInt(ethers.getAddress(author.address)) << 96n) | 1n;
   const typed = buildAuthorAttestationTypedData({
     chainId: await chain.getEvmChainId(),
     kav10Address: await chain.getKnowledgeAssetsLifecycleAddress(),
@@ -45,6 +49,7 @@ async function buildSeal(
     merkleRoot: canonical.kcMerkleRoot,
     authorAddress: author.address,
     schemeVersion: AUTHOR_SCHEME_VERSION_V1,
+    reservedKaId,
   });
   const sig = ethers.Signature.from(await author.signTypedData(
     typed.domain,
@@ -59,6 +64,7 @@ async function buildSeal(
       vs: ethers.getBytes(sig.yParityAndS),
     },
     schemeVersion: AUTHOR_SCHEME_VERSION_V1,
+    reservedKaId,
   };
 }
 

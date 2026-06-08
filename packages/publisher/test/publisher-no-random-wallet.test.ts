@@ -245,8 +245,12 @@ class AsyncAddressSigningChain implements ChainAdapter {
     if (params.publisherAddress?.toLowerCase() !== this.wallet.address.toLowerCase()) {
       throw new Error('publisher did not await async signer address');
     }
+    // §F2 — echo the packed reservedKaId the publisher signed over so the
+    // mint matches the reservation (the real contract _safeMints exactly it);
+    // returning a fixed `1n` would trip the publisher's UAL/chain-split guard.
+    const kaId = params.reservedKaId ?? 1n;
     return {
-      batchId: 1n,
+      batchId: kaId,
       startKAId: 101n,
       endKAId: 101n,
       txHash: `0x${'78'.repeat(32)}`,

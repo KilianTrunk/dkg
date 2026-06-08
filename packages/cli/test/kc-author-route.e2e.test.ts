@@ -140,12 +140,16 @@ async function publishWithSignedAttestation(args: {
   merkleRoot: Uint8Array;
 }): Promise<bigint> {
   const chainId = BigInt(await args.chain.getEvmChainId());
+  // §F2 — the AuthorAttestation digest binds the packed reservedKaId, and the
+  // mock mints exactly it (kaId === reservedKaId). Allocate number 1 for this author.
+  const reservedKaId = (BigInt(ethers.getAddress(args.signer.address)) << 96n) | 1n;
   const typedData = buildAuthorAttestationTypedData({
     chainId,
     kav10Address: TEST_KAV10_ADDR,
     contextGraphId: args.contextGraphId,
     merkleRoot: args.merkleRoot,
     authorAddress: args.signer.address,
+    reservedKaId,
   });
   const sigHex = await args.signer.signTypedData(
     typedData.domain as ethers.TypedDataDomain,
@@ -158,6 +162,7 @@ async function publishWithSignedAttestation(args: {
     contextGraphId: args.contextGraphId,
     publisherAddress: args.signer.address,
     merkleRoot: args.merkleRoot,
+    reservedKaId,
     knowledgeAssetsAmount: 1,
     byteSize: 100n,
     epochs: 1,

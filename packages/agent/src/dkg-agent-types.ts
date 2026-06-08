@@ -145,6 +145,8 @@ export interface SyncRequestEnvelope {
   includeSharedMemory: boolean;
   phase?: SyncPhase;
   snapshotRef?: string;
+  authPurpose?: string;
+  authSelector?: string;
   targetPeerId?: string;
   requesterPeerId?: string;
   requestId?: string;
@@ -173,6 +175,15 @@ export interface SyncRequestEnvelope {
    * the duplicate `SyncRequestEnvelope` in `sync/auth/request-build.ts`.
    */
   recovery?: boolean;
+}
+
+export type AssertionArtifactKind = 'source' | 'markdown' | 'original';
+
+export interface ImportedArtifactByteStore {
+  stat(hash: string): Promise<{ size: number } | null>;
+  readRange(hash: string, offset: number, length: number): Promise<Uint8Array | Buffer | null>;
+  has?(hash: string): Promise<boolean>;
+  get?(hash: string): Promise<Uint8Array | Buffer | null>;
 }
 
 // ── Public error classes ────────────────────────────────────────────
@@ -861,6 +872,7 @@ export interface DKGAgentConfig {
   largeLiteralStorage?: LargeLiteralStorageConfig;
   /** Out-of-Oxigraph immutable public SWM operation snapshots. Defaults on when dataDir is set. */
   sharedMemoryPublicSnapshotStorage?: SharedMemoryPublicSnapshotStorageConfig;
+  importedArtifactByteStore?: ImportedArtifactByteStore;
   /** When false, peer-connect sync skips SWM catch-up and relies on gossip for new SWM writes. */
   syncSharedMemoryOnConnect?: boolean;
   /**

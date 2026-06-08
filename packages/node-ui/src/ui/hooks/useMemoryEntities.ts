@@ -290,6 +290,7 @@ function vmSparql(cgId: string) {
     FILTER(
       STRSTARTS(STR(?g), "${cgUri}") &&
       !CONTAINS(STR(?g), "/assertion/") &&
+      !CONTAINS(STR(?g), "/_working_memory") &&
       !CONTAINS(STR(?g), "/_shared_memory") &&
       !CONTAINS(STR(?g), "_verified_memory_meta") &&
       !STRENDS(STR(?g), "/_meta") &&

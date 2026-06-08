@@ -279,6 +279,7 @@ describe('GitHub-shaped /api/knowledge-assets routes (OT-RFC-43 §10.5)', () => 
     const address = `0x${'11'.repeat(20)}`;
     const preSignedAuthorAttestation = {
       address,
+      reservedKaId: ((BigInt(address) << 96n) | 1n).toString(),
       signature: { r: `0x${'22'.repeat(32)}`, vs: `0x${'33'.repeat(32)}` },
     };
     const ctx = ctxFor('POST', '/api/knowledge-assets', {
@@ -294,6 +295,7 @@ describe('GitHub-shaped /api/knowledge-assets routes (OT-RFC-43 §10.5)', () => 
     expect(finalizeOpts.schemeVersion).toBe(1);
     expect(finalizeOpts.authorAgentAddress).toBeUndefined();
     expect(finalizeOpts.preSignedAuthorAttestation.address).toBe(address);
+    expect(finalizeOpts.preSignedAuthorAttestation.reservedKaId).toBe((BigInt(address) << 96n) | 1n);
     expect(finalizeOpts.preSignedAuthorAttestation.signature.r).toBeInstanceOf(Uint8Array);
     expect(finalizeOpts.preSignedAuthorAttestation.signature.vs).toBeInstanceOf(Uint8Array);
   });
@@ -308,6 +310,7 @@ describe('GitHub-shaped /api/knowledge-assets routes (OT-RFC-43 §10.5)', () => 
       authorAgentAddress: `0x${'11'.repeat(20)}`,
       preSignedAuthorAttestation: {
         address: `0x${'22'.repeat(20)}`,
+        reservedKaId: ((BigInt(`0x${'22'.repeat(20)}`) << 96n) | 1n).toString(),
         signature: { r: `0x${'22'.repeat(32)}`, vs: `0x${'33'.repeat(32)}` },
       },
     }, agent);
@@ -385,6 +388,21 @@ describe('GitHub-shaped /api/knowledge-assets routes (OT-RFC-43 §10.5)', () => 
     await handleKnowledgeAssetsRoutes(ctx);
     expect(status(ctx)).toBe(400);
     expect(body(ctx).error).toContain('preSignedAuthorAttestation.signature.r');
+    expect(agent.assertion.finalize).not.toHaveBeenCalled();
+  });
+
+  it('POST .../:name/wm/finalize rejects a pre-signed attestation missing reservedKaId (§F2)', async () => {
+    const agent = makeAssertionAgent();
+    const ctx = ctxFor('POST', '/api/knowledge-assets/f/wm/finalize', {
+      contextGraphId: 'cg',
+      preSignedAuthorAttestation: {
+        address: `0x${'11'.repeat(20)}`,
+        signature: { r: `0x${'22'.repeat(32)}`, vs: `0x${'33'.repeat(32)}` },
+      },
+    }, agent);
+    await handleKnowledgeAssetsRoutes(ctx);
+    expect(status(ctx)).toBe(400);
+    expect(body(ctx).error).toContain('preSignedAuthorAttestation.reservedKaId');
     expect(agent.assertion.finalize).not.toHaveBeenCalled();
   });
 

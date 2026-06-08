@@ -10,6 +10,13 @@ export type QueryResult =
 
 export interface PreSignedAuthorAttestationPayload {
   address: string;
+  /**
+   * OT-RFC-43 §F2 — the packed reservedKaId the author signed the
+   * AuthorAttestation over, as a decimal string (uint256-safe over JSON).
+   * Required: the digest binds it, so the daemon honours the author's
+   * reserved slot rather than re-allocating.
+   */
+  reservedKaId: string;
   signature: { r: string; vs: string };
 }
 

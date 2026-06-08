@@ -1180,9 +1180,9 @@ describe('DkgDaemonClient', () => {
 
     it('knowledgeAssetFinalize forwards preSignedAuthorAttestation', async () => {
       ok({ merkleRoot: '0xroot', eip712Digest: '0xdig' });
-      const preSignedAuthorAttestation = { address: '0xauthor', signature: { r: '0xr', vs: '0xvs' } };
+      const preSignedAuthorAttestation = { address: '0xauthor', reservedKaId: '1', signature: { r: '0xr', vs: '0xvs' } };
       await client.knowledgeAssetFinalize('cg-1', 'f', {
-        preSignedAuthorAttestation: { address: '0xauthor', signature: { r: '0xr', vs: '0xvs' } },
+        preSignedAuthorAttestation: { address: '0xauthor', reservedKaId: '1', signature: { r: '0xr', vs: '0xvs' } },
         schemeVersion: 1,
       });
       expect(url()).toBe('http://localhost:9200/api/knowledge-assets/f/wm/finalize');
@@ -1196,7 +1196,7 @@ describe('DkgDaemonClient', () => {
     it('knowledgeAssetFinalize rejects mutually exclusive authorship fields before HTTP serialization', async () => {
       await expect(client.knowledgeAssetFinalize('cg-1', 'f', {
         authorAgentAddress: '0xauthor',
-        preSignedAuthorAttestation: { address: '0xauthor', signature: { r: '0xr', vs: '0xvs' } },
+        preSignedAuthorAttestation: { address: '0xauthor', reservedKaId: '1', signature: { r: '0xr', vs: '0xvs' } },
       })).rejects.toThrow('authorAgentAddress and preSignedAuthorAttestation are mutually exclusive');
       expect(fetchCalls).toHaveLength(0);
     });
@@ -1204,7 +1204,7 @@ describe('DkgDaemonClient', () => {
     it('createKnowledgeAsset rejects mutually exclusive authorship fields before HTTP serialization', async () => {
       await expect(client.createKnowledgeAsset('cg-1', 'f', {
         authorAgentAddress: '0xauthor',
-        preSignedAuthorAttestation: { address: '0xauthor', signature: { r: '0xr', vs: '0xvs' } },
+        preSignedAuthorAttestation: { address: '0xauthor', reservedKaId: '1', signature: { r: '0xr', vs: '0xvs' } },
       })).rejects.toThrow('authorAgentAddress and preSignedAuthorAttestation are mutually exclusive');
       expect(fetchCalls).toHaveLength(0);
     });

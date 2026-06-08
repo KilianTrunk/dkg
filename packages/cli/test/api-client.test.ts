@@ -543,6 +543,7 @@ describe('ApiClient — GitHub-shaped knowledge-assets SDK (OT-RFC-43 §10.5)', 
     const calls = track({ name: 'f', status: 'vm-confirmed' });
     const preSignedAuthorAttestation = {
       address: '0x1111111111111111111111111111111111111111',
+      reservedKaId: ((BigInt('0x1111111111111111111111111111111111111111') << 96n) | 1n).toString(),
       signature: { r: `0x${'22'.repeat(32)}`, vs: `0x${'33'.repeat(32)}` },
     };
     await client.createKnowledgeAsset('cg', 'f', {
@@ -605,6 +606,7 @@ describe('ApiClient — GitHub-shaped knowledge-assets SDK (OT-RFC-43 §10.5)', 
     const calls = track({ merkleRoot: '0xabc', eip712Digest: '0xdig' });
     const preSignedAuthorAttestation = {
       address: '0x1111111111111111111111111111111111111111',
+      reservedKaId: ((BigInt('0x1111111111111111111111111111111111111111') << 96n) | 1n).toString(),
       signature: { r: `0x${'22'.repeat(32)}`, vs: `0x${'33'.repeat(32)}` },
     };
     await client.knowledgeAssetFinalize('cg', 'f', {
@@ -626,6 +628,7 @@ describe('ApiClient — GitHub-shaped knowledge-assets SDK (OT-RFC-43 §10.5)', 
         authorAgentAddress: '0x1111111111111111111111111111111111111111',
         preSignedAuthorAttestation: {
           address: '0x2222222222222222222222222222222222222222',
+          reservedKaId: '1',
           signature: { r: `0x${'22'.repeat(32)}`, vs: `0x${'33'.repeat(32)}` },
         },
       }),

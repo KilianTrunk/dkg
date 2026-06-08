@@ -347,6 +347,10 @@ import type { RequestContext } from './context.js';
  */
 type PreSignedAuthorAttestation = {
   address: string;
+  // OT-RFC-43 §F2 — the packed reservedKaId the author signed over. Required so
+  // the daemon honours the author's reserved slot (the digest binds it) rather
+  // than re-allocating; threaded into agent.assertion.finalize.
+  reservedKaId: bigint;
   signature: { r: Uint8Array; vs: Uint8Array };
 };
 
@@ -476,7 +480,29 @@ export function validatePreSignedAuthorAttestation(
     });
     return undefined;
   }
-  return { address, signature: { r, vs } };
+  // OT-RFC-43 §F2 — the AuthorAttestation digest binds the packed reservedKaId,
+  // so the caller MUST forward the exact id they signed over. It travels as a
+  // decimal string (uint256-safe over JSON); accept an integer number too.
+  const reservedKaId = decodeReservedKaId(obj.reservedKaId);
+  if (reservedKaId === undefined) {
+    jsonResponse(res, 400, {
+      error: '"preSignedAuthorAttestation.reservedKaId" must be the packed KA id the author signed over, as a non-negative decimal string (OT-RFC-43 §F2)',
+    });
+    return undefined;
+  }
+  return { address, reservedKaId, signature: { r, vs } };
+}
+
+const MAX_UINT256 = (1n << 256n) - 1n;
+function decodeReservedKaId(val: unknown): bigint | undefined {
+  let s: string;
+  if (typeof val === 'string') s = val.trim();
+  else if (typeof val === 'number' && Number.isInteger(val) && val >= 0) s = String(val);
+  else return undefined;
+  if (!/^[0-9]+$/.test(s)) return undefined;
+  const n = BigInt(s);
+  if (n < 0n || n > MAX_UINT256) return undefined;
+  return n;
 }
 
 export async function handleMemoryRoutes(ctx: RequestContext): Promise<void> {

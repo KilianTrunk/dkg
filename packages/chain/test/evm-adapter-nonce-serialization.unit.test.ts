@@ -226,6 +226,29 @@ describe('dispatchSerializedV10Write — per-wallet nonce serialization (#953)',
     expect((a as any).ensureV10ApproveTrac).toHaveBeenCalledTimes(1);
   });
 
+  it('publishToContextGraph (V9→V10 mirror) throws BEFORE any on-chain side effect (Option-1 §F2)', async () => {
+    // The legacy mirror is unsupported under Option-1. The guard must fire before
+    // acquiring a signer / approving TRAC / sending the publish tx — otherwise a
+    // throw after the send leaves a partially-applied publish on-chain.
+    const a = new EVMChainAdapter(minimalConfig());
+    (a as any).initialized = true;
+    (a as any).contracts = {
+      knowledgeAssets: { getAddress: async () => '0x0000000000000000000000000000000000000009' },
+      knowledgeAssetsStorage: {},
+      token: {},
+    };
+    // Any side effect would have to go through one of these first.
+    const signerSpy = vi.fn(async () => {
+      throw new Error('SIGNER_ACQUIRED_BEFORE_GUARD');
+    });
+    (a as any).nextAuthorizedSigner = signerSpy;
+
+    await expect(a.publishToContextGraph(minimalPublishParams())).rejects.toThrow(
+      'not supported under OT-RFC-43 Option-1',
+    );
+    expect(signerSpy).not.toHaveBeenCalled();
+  });
+
   it('fails closed when the WAL onBroadcast hook throws — never broadcasts', async () => {
     const a = new EVMChainAdapter(minimalConfig());
     const signer = new ethers.Wallet(DEPLOYER_PK);

@@ -241,6 +241,23 @@ export class ContextGraphMethods extends EVMChainAdapterBase {
       throw new Error('KnowledgeAssetsStorage contract not deployed (required for log parsing).');
     }
 
+    // V9→V10 mirror — NOT SUPPORTED under OT-RFC-43 Option-1 / §F2. A V10
+    // Knowledge Asset id is author-namespaced and the AuthorAttestation digest
+    // binds the reserved packed kaId; this legacy mirror has no allocator and no
+    // reserved id to sign over, so it cannot synthesize a mintable attestation
+    // (the on-chain createKnowledgeAssets rejects a namespace-mismatched id).
+    // Publish through the V10 lifecycle (finalize → swm/share → vm/publish).
+    //
+    // This guard MUST run before ANY on-chain side effect (the TRAC approve and
+    // the legacy `ka.publishToContextGraph` tx below): throwing after the send
+    // would leave a partially-applied publish on-chain and invite duplicate
+    // publishes on caller retry.
+    throw new Error(
+      'publishToContextGraph (V9→V10 mirror) is not supported under OT-RFC-43 Option-1: ' +
+        'publish through the V10 lifecycle (finalize → swm/share → vm/publish), which allocates ' +
+        'and binds the per-author reservedKaId into the author attestation.',
+    );
+
     const signer = await this.nextAuthorizedSigner(params.contextGraphId);
     const receiverIdentityIds = params.receiverSignatures.map((s) => s.identityId);
     const receiverRs = params.receiverSignatures.map((s) => ethers.hexlify(s.r));
@@ -249,11 +266,15 @@ export class ContextGraphMethods extends EVMChainAdapterBase {
     const participantRs = params.participantSignatures.map((s) => ethers.hexlify(s.r));
     const participantVSs = params.participantSignatures.map((s) => ethers.hexlify(s.vs));
 
-    const ka = this.contracts.knowledgeAssets.connect(signer) as any;
-    const kaAddress = await this.contracts.knowledgeAssets.getAddress();
+    // Non-null assertions: the guards above (and the unsupported-mirror throw)
+    // make this block unreachable, so TS no longer carries the `knowledgeAssets`/
+    // `token` presence narrowing here. Kept for type-completeness until the
+    // mirror is removed.
+    const ka = this.contracts.knowledgeAssets!.connect(signer) as any;
+    const kaAddress = await this.contracts.knowledgeAssets!.getAddress();
 
     if (this.contracts.token && params.tokenAmount > 0n) {
-      const token = this.contracts.token.connect(signer) as Contract;
+      const token = this.contracts.token!.connect(signer) as Contract;
       const currentAllowance: bigint = await token.allowance(signer.address, kaAddress);
       if (currentAllowance < params.tokenAmount) {
         await this.sendContractTransaction(
@@ -309,18 +330,8 @@ export class ContextGraphMethods extends EVMChainAdapterBase {
       );
     }
 
-    // V9→V10 mirror — NOT SUPPORTED under OT-RFC-43 Option-1 / §F2. A V10
-    // Knowledge Asset id is author-namespaced and the AuthorAttestation digest
-    // binds the reserved packed kaId; this legacy mirror has no allocator and no
-    // reserved id to sign over, so it cannot synthesize a mintable attestation
-    // (the on-chain createKnowledgeAssets rejects a namespace-mismatched id).
-    // Publish through the V10 lifecycle (finalize → swm/share → vm/publish).
-    throw new Error(
-      'publishToContextGraph (V9→V10 mirror) is not supported under OT-RFC-43 Option-1: ' +
-        'publish through the V10 lifecycle (finalize → swm/share → vm/publish), which allocates ' +
-        'and binds the per-author reservedKaId into the author attestation.',
-    );
-    // Unreachable below (kept for type-completeness until the mirror is removed).
+    // Unreachable below (kept for type-completeness until the mirror is removed);
+    // the unsupported-mirror guard above throws before any on-chain side effect.
     const v10ChainId = (await this.provider.getNetwork()).chainId;
     const v10KavAddress = await this.contracts.knowledgeAssetsLifecycle!.getAddress();
     const authorTypedData = buildAuthorAttestationTypedData({

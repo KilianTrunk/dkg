@@ -1739,8 +1739,31 @@ export class PublishMethods extends DKGAgentBase {
     // URN (fresh create, or a preSigned author whose slot isn't yet stamped).
     let freshNumber: bigint | undefined;
     if (preSigned) {
-      reservedKaId = preSigned.reservedKaId;
-      freshNumber = hasExistingKaId ? undefined : reservedKaId & ((1n << 96n) - 1n);
+      if (hasExistingKaId) {
+        // The lifecycle already owns a stable slot. A re-finalize / update must
+        // commit to THAT id, not whatever the caller signed over — otherwise the
+        // persisted seal + on-chain mint (publishFromFinalizedAssertion reuses the
+        // stamped `dkg:kaId`) would name a different KA than `_meta` points at.
+        // The signature binds reservedKaId (§F2), so a caller who signed a
+        // different number is rejected rather than silently re-slotted.
+        const stampedKaId = packReservedKaId(
+          authorAddress,
+          parseStampedNumber(existingKaIdRes.bindings[0]['n']),
+        );
+        if (preSigned.reservedKaId !== stampedKaId) {
+          throw new Error(
+            `assertionFinalize: preSignedAuthorAttestation reservedKaId mismatch — ` +
+              `caller signed over ${preSigned.reservedKaId} but lifecycle "${name}" is already ` +
+              `stamped at kaId ${stampedKaId}. A re-finalize/update must attest the existing ` +
+              `stable slot (OT-RFC-43 §F2).`,
+          );
+        }
+        reservedKaId = stampedKaId;
+        freshNumber = undefined;
+      } else {
+        reservedKaId = preSigned.reservedKaId;
+        freshNumber = reservedKaId & ((1n << 96n) - 1n);
+      }
     } else if (hasExistingKaId) {
       reservedKaId = packReservedKaId(authorAddress, parseStampedNumber(existingKaIdRes.bindings[0]['n']));
     } else if (this.kaNumberAllocator) {

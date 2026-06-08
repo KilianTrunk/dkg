@@ -74,6 +74,12 @@ function toContextGraphUri(contextGraphIdOrUri: string): string {
  */
 export interface PreSignedAuthorAttestationPayload {
   address: string;
+  /**
+   * OT-RFC-43 §F2 — the packed reservedKaId the author signed the
+   * AuthorAttestation over, as a decimal string (uint256-safe over JSON).
+   * Required: the daemon binds it into the digest and honours the reserved slot.
+   */
+  reservedKaId: string;
   signature: { r: string; vs: string };
 }
 

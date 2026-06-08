@@ -40,6 +40,8 @@ function makeBaseArgs(rootEntities: string[]) {
     authorSchemeVersion: 1,
     chainId: 31337n,
     kav10Address: '0x666D0c3da3dBc946D5128D06115bb4eed4595580',
+    // §F2 — the packed reservedKaId now persisted on the seal.
+    reservedKaId: (BigInt('0x70997970C51812dc3A010C7d01b50e0d17dc79C8') << 96n) | 1n,
     finalizedAtIso: '2026-05-10T00:00:00.000Z',
     rootEntities,
   };

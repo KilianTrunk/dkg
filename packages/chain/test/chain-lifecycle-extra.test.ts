@@ -116,14 +116,24 @@ async function publishOneKCV10(opts: {
 
   const coreOp = new Wallet(HARDHAT_KEYS.CORE_OP, provider);
 
+  // OT-RFC-43 Option-1 (variant 1a): the real adapter + contract require a
+  // packed reservedKaId in the author's namespace. Use the caller-provided id
+  // when given (deterministic-mint / replay tests), otherwise allocate a fresh
+  // per-author number for CORE_OP. Computed BEFORE the author attestation
+  // because the §F2 author digest now binds reservedKaId as its 5th field.
+  const reservedKaId = opts.reservedKaId ?? packReservedKaId(coreOp.address, nextKaNumber(coreOp.address));
+
   // RFC-001 §3 author attestation. EIP-712 typed data over
-  // (cgId, merkleRoot, authorAddress, schemeVersion=1) bound to KAV10.
+  // (cgId, merkleRoot, authorAddress, schemeVersion=1, reservedKaId) bound to
+  // KAV10. §F2: reservedKaId is the 5th bound field and must equal the value
+  // placed in PublishParams or on-chain recovery reverts InvalidAuthorSignature.
   const authorTyped = buildAuthorAttestationTypedData({
     chainId: evmChainId,
     kav10Address,
     contextGraphId,
     merkleRoot,
     authorAddress: coreOp.address,
+    reservedKaId,
   });
   const authorRaw = ethers.Signature.from(
     await coreOp.signTypedData(authorTyped.domain, authorTyped.types, authorTyped.message),
@@ -141,12 +151,6 @@ async function publishOneKCV10(opts: {
     [evmChainId, kav10Address, contextGraphId, ethers.hexlify(merkleRoot), kaCount, byteSize, epochs, tokenAmount, merkleLeafCount, ethers.ZeroHash, 0, 0],
   ));
   const ackRaw = ethers.Signature.from(await coreOp.signMessage(ackDigest));
-
-  // OT-RFC-43 Option-1 (variant 1a): the real adapter + contract require a
-  // packed reservedKaId in the author's namespace. Use the caller-provided id
-  // when given (deterministic-mint / replay tests), otherwise allocate a fresh
-  // per-author number for CORE_OP.
-  const reservedKaId = opts.reservedKaId ?? packReservedKaId(coreOp.address, nextKaNumber(coreOp.address));
 
   const result = await adapter.createKnowledgeAssets!({
     publishOperationId: ethers.hexlify(ethers.randomBytes(32)),

@@ -14,7 +14,7 @@ export {
   LayerActionsWidget, LayerWidgetStrip,
 } from './components/layer-widgets.js';
 export {
-  EntityList, LayerContent, VerifiedMemoryHeroBanner,
+  EntityList, LayerContent, VerifiableMemoryHeroBanner,
   AssertionsList, LayerDetailView, DocumentsList,
 } from './components/entities.js';
 export { ContextGraphQueryView } from './components/query.js';

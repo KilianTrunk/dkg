@@ -415,7 +415,7 @@ describe('useMemoryEntities hook', () => {
   });
 
   it('queries WM, SWM, and VM in parallel', () => {
-    // Hook was refactored from `view: 'shared-working-memory' | 'verified-memory'`
+    // Hook was refactored from `view: 'shared-working-memory' | 'verifiable-memory'`
     // to per-layer SPARQL builders that walk the named-graph space directly
     // (see the rationale comment in useMemoryEntities.ts) so per-sub-graph
     // SWM/VM partitions are covered and each triple carries its source `?g`.

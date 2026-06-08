@@ -844,9 +844,9 @@ for l in sys.stdin:
 if [ -n "$SROOT" ]; then
   sn=$(echo "$SROOT"|awk '{print $1}'); sc=$(echo "$SROOT"|awk '{print $2}'); sr=$(echo "$SROOT"|awk '{print $3}')
   sp="${NODE_PORT[$((sn-1))]}"
-  vm=$(post_long "$sp" /api/query -d "{\"sparql\":\"SELECT ?p WHERE { GRAPH ?g { <$sr> ?p ?o } FILTER(CONTAINS(STR(?g),\\\"$sc\\\")) } LIMIT 1\",\"contextGraphId\":\"$sc\",\"view\":\"verified-memory\"}")
+  vm=$(post_long "$sp" /api/query -d "{\"sparql\":\"SELECT ?p WHERE { GRAPH ?g { <$sr> ?p ?o } FILTER(CONTAINS(STR(?g),\\\"$sc\\\")) } LIMIT 1\",\"contextGraphId\":\"$sc\",\"view\":\"verifiable-memory\"}")
   vmb=$(echo "$vm" | pyf "len(d.get('result',{}).get('bindings',[]))")
-  [ "${vmb:-0}" -gt 0 ] && pass A vm-view "published KA visible in verified-memory view" || warn A vm-view "KA not in VM view yet (got $vm | first 120: ${vm:0:120})"
+  [ "${vmb:-0}" -gt 0 ] && pass A vm-view "published KA visible in verifiable-memory view" || warn A vm-view "KA not in VM view yet (got $vm | first 120: ${vm:0:120})"
   # peer replication: query another node
   pn=$(( sn % NUM_NODES + 1 )); pp="${NODE_PORT[$((pn-1))]}"
   found=0

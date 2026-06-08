@@ -226,12 +226,12 @@ export function contextGraphSharedMemoryMetaUri(contextGraphId: string, subGraph
   return `did:dkg:context-graph:${contextGraphId}/_shared_memory_meta`;
 }
 
-export function contextGraphVerifiedMemoryUri(contextGraphId: string, verifiedMemoryId: string): string {
-  return `did:dkg:context-graph:${contextGraphId}/_verified_memory/${verifiedMemoryId}`;
+export function contextGraphVerifiableMemoryUri(contextGraphId: string, verifiableMemoryId: string): string {
+  return `did:dkg:context-graph:${contextGraphId}/_verifiable_memory/${verifiableMemoryId}`;
 }
 
-export function contextGraphVerifiedMemoryMetaUri(contextGraphId: string, verifiedMemoryId: string): string {
-  return `did:dkg:context-graph:${contextGraphId}/_verified_memory/${verifiedMemoryId}/_meta`;
+export function contextGraphVerifiableMemoryMetaUri(contextGraphId: string, verifiableMemoryId: string): string {
+  return `did:dkg:context-graph:${contextGraphId}/_verifiable_memory/${verifiableMemoryId}/_meta`;
 }
 
 export function contextGraphAssertionUri(contextGraphId: string, agentAddress: string, name: string, subGraphName?: string): string {

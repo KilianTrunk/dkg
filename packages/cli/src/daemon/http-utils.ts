@@ -1169,7 +1169,7 @@ export function classifyClientError(
   | null {
   const sanitized = sanitizeRevertMessage(msg);
   if (
-    /\b(not found|does not exist|no such|unknown (policy|contextGraph|context.?graph|peer|verified.?memory)|peer is not connected|cannot resolve|no addresses)\b/i.test(
+    /\b(not found|does not exist|no such|unknown (policy|contextGraph|context.?graph|peer|verifiable.?memory)|peer is not connected|cannot resolve|no addresses)\b/i.test(
       msg,
     )
   ) {
@@ -1194,7 +1194,7 @@ export function classifyClientError(
     return { status: 504, sanitized };
   }
   if (
-    /\b(invalid (peer|peerId|multihash|base|batchId|verifiedMemoryId|contextGraphId|policyUri|contextGraphId)|could not parse|parse (peer|peerId)|peer (id|ID) (is not valid|invalid)|malformed|bad request|incorrect length)\b/i.test(
+    /\b(invalid (peer|peerId|multihash|base|batchId|verifiableMemoryId|contextGraphId|policyUri|contextGraphId)|could not parse|parse (peer|peerId)|peer (id|ID) (is not valid|invalid)|malformed|bad request|incorrect length)\b/i.test(
       msg,
     )
   ) {

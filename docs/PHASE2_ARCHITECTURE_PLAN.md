@@ -85,7 +85,7 @@ packages/cli/src/
 │   │   ├── local-agent-integrations.ts # /api/local-agent-integrations*,
 │   │   │                            #   /api/integrations, /api/register-adapter,
 │   │   │                            #   /api/openclaw-agents
-│   │   ├── verify.ts                # /api/verify (verified-memory single-KA verify),
+│   │   ├── verify.ts                # /api/verify (verifiable-memory single-KA verify),
 │   │   │                            #   /api/endorse
 │   │   ├── ccl.ts                   # /api/ccl/eval, /api/ccl/policy/*,
 │   │   │                            #   /api/ccl/results

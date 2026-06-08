@@ -50,15 +50,15 @@ function q(s: string, p: string, o: string, g = GRAPH): Quad {
 }
 
 // rc.17 uniform per-KA layout: a confirmed publish writes the KA's public
-// quads + SelfAttested trust stamp into a PER-KA verified-memory named graph
-// `did:dkg:context-graph:{cg}/_verified_memory/{author}/{number}`, where
+// quads + SelfAttested trust stamp into a PER-KA verifiable-memory named graph
+// `did:dkg:context-graph:{cg}/_verifiable_memory/{author}/{number}`, where
 // author+number are unpacked from the on-chain kaId — NOT the monolithic root
 // data graph. Compute that graph from a publish result's kaId so tests can
 // assert against the graph the data actually lives in.
-function verifiedMemoryGraph(kaId: bigint): string {
+function verifiableMemoryGraph(kaId: bigint): string {
   const number = kaId & ((1n << 96n) - 1n);
   const author = '0x' + (kaId >> 96n).toString(16).padStart(40, '0');
-  return `did:dkg:context-graph:${CONTEXT_GRAPH}/_verified_memory/${author}/${number}`;
+  return `did:dkg:context-graph:${CONTEXT_GRAPH}/_verifiable_memory/${author}/${number}`;
 }
 
 describe('DKGPublisher', () => {
@@ -166,9 +166,9 @@ describe('DKGPublisher', () => {
     expect(result.status).toBe('confirmed');
 
     // rc.17 per-KA layout: the 2 published data quads + the 1 SelfAttested
-    // trust stamp now live in the per-KA verified-memory graph, not the root
+    // trust stamp now live in the per-KA verifiable-memory graph, not the root
     // data graph. Assert the same 3-quad count against that graph.
-    const vmGraph = verifiedMemoryGraph(result.kaId);
+    const vmGraph = verifiableMemoryGraph(result.kaId);
     const count = await store.countQuads(vmGraph);
     expect(count).toBe(3);
     const trust = await store.query(
@@ -228,8 +228,8 @@ describe('DKGPublisher', () => {
     expect(result.status).toBe('confirmed');
 
     // rc.17 per-KA layout: published quads (skolemized blank nodes included)
-    // land in the per-KA verified-memory graph, not the root data graph.
-    const vmGraph = verifiedMemoryGraph(result.kaId);
+    // land in the per-KA verifiable-memory graph, not the root data graph.
+    const vmGraph = verifiableMemoryGraph(result.kaId);
     const queryResult = await store.query(
       `SELECT ?s WHERE { GRAPH <${vmGraph}> { ?s ?p ?o } }`,
     );
@@ -293,10 +293,10 @@ describe('DKGPublisher', () => {
     expect(updated.status).toBe('confirmed');
 
     // rc.17 per-KA layout: a KA update DELETE+REWRITEs the per-KA
-    // verified-memory graph (computed from the update's batchId, which equals
+    // verifiable-memory graph (computed from the update's batchId, which equals
     // the original publish's kaId), not the monolithic root data graph. Assert
     // the post-update name against that per-KA graph.
-    const vmGraph = verifiedMemoryGraph(initial.kaId);
+    const vmGraph = verifiableMemoryGraph(initial.kaId);
     const result = await store.query(
       `SELECT ?name WHERE { GRAPH <${vmGraph}> { <${ENTITY}> <http://schema.org/name> ?name } }`,
     );

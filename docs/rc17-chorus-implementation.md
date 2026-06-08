@@ -38,7 +38,7 @@
 ### SUBSTRATE-2 — re-stamp `dkg:assertionGraph` on promote + publish  *(M)*  ← the read-flip's true hard gate
 - Today `dkg:assertionGraph` is stamped **once at create** (`metadata.ts:1328`, → the WM graph) and never re-stamped: `generateAssertionPromotedMetadata` (1365-1403) flips only state+memoryLayer; `generateAssertionPublishedMetadata` (1420-1451) flips to VM + `vmCurrentAssertion` but no `assertionGraph`.
 - **Promote:** in `generateAssertionPromotedMetadata`, `delete` the old `assertionGraph` (WM) quad and `insert` the layer-correct SWM graph (`contextGraphSharedMemoryUri(cg, sub)` in rc.17a; the per-KA SWM URI in rc.17b).
-- **Publish:** in `generateAssertionPublishedMetadata`, same — `insert` the VM graph. **Caveat:** the VM graph is `_verified_memory/{vmId}` and `vmId` is **not** in `AssertionPublishedMeta` (it's a separate on-chain counter, `dkg-agent-endorse.ts:644`). Thread the VM graph URI (or `vmId`) into `AssertionPublishedMeta`, computed at the endorse call site.
+- **Publish:** in `generateAssertionPublishedMetadata`, same — `insert` the VM graph. **Caveat:** the VM graph is `_verifiable_memory/{vmId}` and `vmId` is **not** in `AssertionPublishedMeta` (it's a separate on-chain counter, `dkg-agent-endorse.ts:644`). Thread the VM graph URI (or `vmId`) into `AssertionPublishedMeta`, computed at the endorse call site.
 - Backfill the **missing VM `assertionGraph` pointer** for existing VM KAs (one-shot migration step).
 - **Tests:** lifecycle unit test asserting `assertionGraph` re-points WM→SWM→VM across promote/publish; the explicit seam regression — promote that flips `memoryLayer` MUST also re-stamp `assertionGraph` (the #1 silent-bug surface).
 
@@ -64,9 +64,9 @@
 ## Wave 3 — rc.17b (uniform naming + query model + SWM per-KA; ONE flagged unit)
 
 ### D3a — flip the 3 URI builders  *(L)*
-`constants.ts`: → `did:dkg:context-graph:{cg}[/{sub}]/{_layer}/{addr}/{number}`, `{_layer} ∈ _working_memory|_shared_memory|_verified_memory`.
+`constants.ts`: → `did:dkg:context-graph:{cg}[/{sub}]/{_layer}/{addr}/{number}`, `{_layer} ∈ _working_memory|_shared_memory|_verifiable_memory`.
 - `contextGraphAssertionUri` (WM, 235-238): `assertion/{addr}/{name}` → `_working_memory/{addr}/{number}`.
-- `contextGraphVerifiedMemoryUri` (VM, 227-229): `_verified_memory/{vmId}` → `_verified_memory/{addr}/{number}` + **gain `subGraphName` arg**.
+- `contextGraphVerifiableMemoryUri` (VM, 227-229): `_verifiable_memory/{vmId}` → `_verifiable_memory/{addr}/{number}` + **gain `subGraphName` arg**.
 - `contextGraphSharedMemoryUri` (SWM, 217-220): bucket → `_shared_memory/{addr}/{number}`.
 - Thread `{addr,number}` through `graph-manager.ts` (38-56) facade + **~25 direct callers** (publisher/query/agent/import/memory).
 
@@ -80,7 +80,7 @@ Re-point the SWM responder enumeration (`sync-handler.ts:131-194` + `registeredS
 CG content reads use `VALUES ?g {…} GRAPH ?g {}` (the existing `wrapWithGraph` bound path) sourced from the SUBSTRATE-3 index — **never a prefix-FILTER**. Replace the textual N-way `wrapWithGraphUnion` fan-out (`:452`) with the variable-graph+`VALUES` pattern. Denormalize hot aggregates into `_meta`; wire the per-subgraph Canon escape (§16.10/§17.6) for the analytics/traversal-heavy subgraph. (See `docs/rfcs/OT-RFC-46` query-model section.)
 
 ### D3d — off-chain data migration (consensus-safe)  *(L)*  — `dependsOn: D1, SUBSTRATE-3, D3a`
-WM `…/assertion/{addr}/{name}` → `…/_working_memory/{addr}/{number}` (needs `name→number` from D1); VM `…/_verified_memory/{vmId}` → `…/_verified_memory/{addr}/{number}` (**`vmId` is a separate on-chain counter — non-trivial remap + `assertionGraph` backfill; highest-stakes row**); SWM bucket-split into N per-KA graphs keyed by owning KA. **Dual-read window** during cutover (req. #1).
+WM `…/assertion/{addr}/{name}` → `…/_working_memory/{addr}/{number}` (needs `name→number` from D1); VM `…/_verifiable_memory/{vmId}` → `…/_verifiable_memory/{addr}/{number}` (**`vmId` is a separate on-chain counter — non-trivial remap + `assertionGraph` backfill; highest-stakes row**); SWM bucket-split into N per-KA graphs keyed by owning KA. **Dual-read window** during cutover (req. #1).
 
 ## Wave 4 — rc.18 (unchanged)
 Option-1 contracts **#975 #1019** (DRAFT, chain-gated); the per-subgraph Canon bucket for the traversal-heavy subgraph (§17.6) if needed.

@@ -203,10 +203,10 @@ export type MemorySource = 'memory' | 'sessions';
  * retrieval layers produced a hit:
  *   - `agent-context-wm`: agent-context graph, working-memory view
  *   - `agent-context-swm`: agent-context graph, shared-working-memory view
- *   - `agent-context-vm`: agent-context graph, verified-memory view
+ *   - `agent-context-vm`: agent-context graph, verifiable-memory view
  *   - `project-wm`: user-selected project graph, working-memory view
  *   - `project-swm`: user-selected project graph, shared-working-memory view
- *   - `project-vm`: user-selected project graph, verified-memory view
+ *   - `project-vm`: user-selected project graph, verifiable-memory view
  *
  * Note the rename from the earlier `chat-turns-wm` layer: the slot-backed
  * fan-out no longer pins on the `chat-turns` assertion, so the layer

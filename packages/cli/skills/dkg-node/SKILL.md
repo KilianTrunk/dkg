@@ -1,6 +1,6 @@
 ---
 name: dkg-node
-description: The DKG V10 Node is your primary memory system. This skill teaches you to operate your node's three-layer verifiable memory — write and retrieve private drafts in Working Memory, share with peers in Shared Working Memory, and publish permanently to Verified Memory on-chain.
+description: The DKG V10 Node is your primary memory system. This skill teaches you to operate your node's three-layer verifiable memory — write and retrieve private drafts in Working Memory, share with peers in Shared Working Memory, and publish permanently to Verifiable Memory on-chain.
 ---
 
 # DKG V10 Node Skill
@@ -78,7 +78,7 @@ This node provides a three-layer **verifiable memory system** for AI agents:
 |-------|-------|------|-------------|-------------|
 | **Working Memory (WM)** | Private to you | Free | Self-attested | Local, survives restarts |
 | **Shared Working Memory (SWM)** | Visible to team | Free | Self-attested (gossip replicated) | TTL-bounded |
-| **Verified Memory (VM)** | Permanent, on-chain | TRAC tokens | Self-attested → endorsed → consensus-verified | Permanent |
+| **Verifiable Memory (VM)** | Permanent, on-chain | TRAC tokens | Self-attested → endorsed → consensus-verified | Permanent |
 
 **What you can do:** create knowledge assertions, import files (PDF, DOCX, Markdown),
 share knowledge with peers, publish to the blockchain, endorse others' knowledge,
@@ -179,7 +179,7 @@ Drop to HTTP when the operation isn't in the table — participant self-service 
 | `dkg_share` | `POST /api/shared-memory/write` | Directly write concise team-visible knowledge to SWM without staging a WM assertion. Prefer the WM assertion → promote flow for durable/canonical work. Both Hermes and OpenClaw expose the same tool schema (required `content` and `context_graph_id`, optional `sub_graph_name`), so MCP-discovered call signatures are portable. The OpenClaw implementation additionally validates content as non-whitespace, mints a unique subject per share (returned in the response), and N-Triples-quotes content; Hermes is currently looser on those points — the parallel hardening is tracked in OriginTrail/dkg#414. |
 | `dkg_sub_graph_create` | `POST /api/sub-graph/create` | Register a sub-graph inside a CG |
 | `dkg_sub_graph_list` | `GET /api/sub-graph/list` | List sub-graphs in a CG |
-| `dkg_query` | `POST /api/query` | Read-only SPARQL across assertions in a CG. Pass `view` (`working-memory` / `shared-working-memory` / `verified-memory`) to pick the layer — when `view` is set, `context_graph_id` is required; for WM reads, optional `agent_address` targets another agent's WM (defaults to this node). Omit `view` for a legacy cross-graph data-path query. |
+| `dkg_query` | `POST /api/query` | Read-only SPARQL across assertions in a CG. Pass `view` (`working-memory` / `shared-working-memory` / `verifiable-memory`) to pick the layer — when `view` is set, `context_graph_id` is required; for WM reads, optional `agent_address` targets another agent's WM (defaults to this node). Omit `view` for a legacy cross-graph data-path query. |
 | `dkg_query_catalog_list` | `POST /api/profile/query-catalog/read` | List saved SPARQL queries declared in the project profile query catalog |
 | `dkg_query_catalog_run` | `POST /api/profile/query-catalog/read` + `POST /api/query` | Run a saved catalog query by slug or exact display name |
 | `dkg_query_catalog_save` | `POST /api/profile/query-catalog/write` | Save a read-only SPARQL query into the project profile query catalog |
@@ -246,15 +246,15 @@ SWM is for knowledge you've promoted from WM and want peers to see. Data arrives
 
 - `POST /api/shared-memory/write` — write triples directly to SWM (gossip-replicated). Body: `{ contextGraphId, quads, subGraphName? }`. Use the WM → promote path for most workflows; direct SWM writes are for bulk team data that skips the private draft stage.
 - `POST /api/shared-memory/conditional-write` — compare-and-swap write. Body: `{ contextGraphId, quads, conditions: [...], subGraphName? }`. Each condition is `{ subject: IRI, predicate: IRI, expectedValue: string | null }`; `null` means "must not exist", a string must match the current object after N-Triples serialization. Any mismatch throws `StaleWriteError` and leaves SWM unchanged. `conditions` must be non-empty — use `/api/shared-memory/write` for unconditional writes.
-- `POST /api/shared-memory/publish` — promote SWM triples to Verified Memory (costs TRAC)
+- `POST /api/shared-memory/publish` — promote SWM triples to Verifiable Memory (costs TRAC)
 
-### Verified Memory (VM) — Permanent, on-chain
+### Verifiable Memory (VM) — Permanent, on-chain
 
 > **All VM publishing goes through SWM.** The HTTP API exposes no direct
 > WM → VM route — always promote to SWM first, then publish from there.
 > The on-chain transaction is a finality signal that seals data peers already hold.
 
-- `POST /api/shared-memory/publish` — promote SWM data to Verified Memory (costs TRAC)
+- `POST /api/shared-memory/publish` — promote SWM data to Verifiable Memory (costs TRAC)
 - `POST /api/update` — update an existing Knowledge Asset (reads new data from SWM)
 - `POST /api/endorse` — endorse a Knowledge Asset ("I vouch for this")
 - `POST /api/verify` — propose or approve M-of-N consensus verification
@@ -278,7 +278,7 @@ The `memory_search` tool is the recommended entry point for free-text memory rec
 - `POST /api/query` — SPARQL query. Body parameters:
   - `sparql` (required) — the query string
   - `contextGraphId` — scope query to one CG (recommended)
-  - `view` — `working-memory` | `shared-working-memory` | `verified-memory`
+  - `view` — `working-memory` | `shared-working-memory` | `verifiable-memory`
   - `agentAddress` — required when `view: "working-memory"` (WM is per-agent)
   - `assertionName` — scope to a specific WM assertion graph
   - `subGraphName` — scope to a specific sub-graph
@@ -428,7 +428,7 @@ Context Graphs are scoped knowledge domains with configurable access and governa
 > context graph instead. Pass `allowed_agents: ["0x..."]` to invite
 > collaborators atomically with creation, or use
 > `dkg_participant_add` to invite them later. Working Memory is
-> per-agent regardless of CG visibility. Verified Memory anchors
+> per-agent regardless of CG visibility. Verifiable Memory anchors
 > are public on-chain — but the underlying private quads stay local
 > on the publishing node and are gated to allowed peers.
 
@@ -509,7 +509,7 @@ Implications:
   > `accessPolicy`, the daemon resolves to public/discoverable. The tool
   > is the recommended surface for agent workflows; raw HTTP is for
   > programmatic clients that want explicit control.
-- `POST /api/context-graph/register` — register a previously-created local CG on-chain (two-phase creation). Body: `{ id, accessPolicy?, publishPolicy? }`, where `accessPolicy` controls public/private discovery and `publishPolicy` controls open/curated publishing. Use this to promote a free CG to an on-chain identity before publishing to Verified Memory. `revealOnChain` is deprecated and ignored on the V10 ContextGraphs path.
+- `POST /api/context-graph/register` — register a previously-created local CG on-chain (two-phase creation). Body: `{ id, accessPolicy?, publishPolicy? }`, where `accessPolicy` controls public/private discovery and `publishPolicy` controls open/curated publishing. Use this to promote a free CG to an on-chain identity before publishing to Verifiable Memory. `revealOnChain` is deprecated and ignored on the V10 ContextGraphs path.
 - `POST /api/context-graph/rename` — rename a CG (human-readable name only; the ID is immutable). Body: `{ contextGraphId, name }`.
 - `POST /api/context-graph/subscribe` — subscribe to a context graph
 - `GET /api/context-graph/list` — list known context graphs; tool wrappers default to the caller's created/joined graphs and can expose all known graphs with `scope: "all"`
@@ -759,7 +759,7 @@ This entire surface was empirically driven by [PR #720](https://github.com/Origi
 
 - Working memory: `{"sparql": "...", "view": "working-memory", "agentAddress": "...", "contextGraphId": "..."}`
 - Shared memory: `{"sparql": "...", "contextGraphId": "...", "view": "shared-working-memory"}`
-- Verified memory: `{"sparql": "...", "contextGraphId": "...", "view": "verified-memory"}`
+- Verifiable memory: `{"sparql": "...", "contextGraphId": "...", "view": "verifiable-memory"}`
 
 **List and inspect your assertions:**
 

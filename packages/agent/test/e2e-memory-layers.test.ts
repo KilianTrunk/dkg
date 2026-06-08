@@ -2,7 +2,7 @@
  * E2E tests for the DKG V10 memory layer progression:
  *
  * 1. Working Memory → SWM: assertion promote moves data to shared memory
- * 2. SWM → Verified Memory: publishFromSharedMemory anchors on-chain
+ * 2. SWM → Verifiable Memory: publishFromSharedMemory anchors on-chain
  * 3. Full pipeline: WM → promote → SWM gossip → publishFromSharedMemory → VM
  * 4. Memory layer isolation: data in one layer doesn't leak to another
  * 5. Two-node flow: A promotes to SWM → gossip to B → A publishes → B finalizes
@@ -173,7 +173,7 @@ describe('Memory layer isolation (single agent)', () => {
 });
 
 describe('WM → SWM → VM pipeline (single agent)', () => {
-  it('promotes assertion to SWM, then publishes SWM to verified memory', async () => {
+  it('promotes assertion to SWM, then publishes SWM to verifiable memory', async () => {
     const agent = await createAgent('PipelineBot');
     await agent.createContextGraph({ id: CG_ID, name: 'Pipeline E2E' });
     await agent.registerContextGraph(CG_ID);
@@ -199,7 +199,7 @@ describe('WM → SWM → VM pipeline (single agent)', () => {
     expect(swmResult.bindings.length).toBe(1);
     expect(swmResult.bindings[0]?.['name']).toBe('"Pipeline Entity"');
 
-    // Step 3: Publish from SWM to verified memory
+    // Step 3: Publish from SWM to verifiable memory
     const pubResult = await agent.publishFromSharedMemory(CG_ID, 'all');
     expect(pubResult.status).toBe('confirmed');
     expect(pubResult.ual).toBeDefined();

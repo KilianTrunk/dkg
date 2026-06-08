@@ -1220,7 +1220,7 @@ export class DKGPublisher implements Publisher {
         if (!hasOnChainId) {
           throw new Error(
             `Context graph "${contextGraphId}" is not registered on-chain. ` +
-            `Run 'dkg context-graph register ${contextGraphId}' first to enable Verified Memory publishing.`,
+            `Run 'dkg context-graph register ${contextGraphId}' first to enable Verifiable Memory publishing.`,
           );
         }
       }
@@ -1434,10 +1434,10 @@ export class DKGPublisher implements Publisher {
           publishResult.publicQuads.length > 0
         ) {
           // Uniform layout: the confirmed publish wrote the public quads to the per-KA
-          // verified-memory graph (…/_verified_memory/{author}/{number}); copy from there to the
+          // verifiable-memory graph (…/_verifiable_memory/{author}/{number}); copy from there to the
           // per-cgId graph, and (REMAP flow) delete from there so the data ends up ONLY in per-cgId.
           const remapKaId = publishResult.onChainResult!.kaId ?? publishResult.onChainResult!.batchId;
-          const remapVmGraph = contextGraphLayerUri(contextGraphId, MemoryLayer.VerifiedMemory, '0x' + (remapKaId >> 96n).toString(16).padStart(40, '0'), remapKaId & ((1n << 96n) - 1n));
+          const remapVmGraph = contextGraphLayerUri(contextGraphId, MemoryLayer.VerifiableMemory, '0x' + (remapKaId >> 96n).toString(16).padStart(40, '0'), remapKaId & ((1n << 96n) - 1n));
           const storedQuads = publishResult.publicQuads.map(q => ({ ...q, graph: remapVmGraph }));
           await this.store.insert(storedQuads.map(q => ({ ...q, graph: ctxDataGraph })));
           const trustSubjects = collectTrustSubjectsForRoots(
@@ -1862,7 +1862,7 @@ export class DKGPublisher implements Publisher {
     // confirm against — NoChainAdapter / non-V10 / no on-chain CG id).
     // Inserting pre-chain caused the "tentative VM" leak where
     // /api/query would surface quads from a publish that the chain
-    // later rejected as if they were verified memory. See the chain
+    // later rejected as if they were verifiable memory. See the chain
     // success branch + the `publisherContextGraphId/chainV10Ready`
     // skip branches below — each writes `normalizedQuads` exactly once,
     // never on the chain-failure catch path.
@@ -2249,7 +2249,7 @@ export class DKGPublisher implements Publisher {
       }
       // RC11 / PR3: write the KC + KA metadata + tentative status quad
       // alongside the public quads so downstream consumers
-      // (`access-handler`, `assertion-history`, the `verified-memory`
+      // (`access-handler`, `assertion-history`, the `verifiable-memory`
       // view) can still locate this publish by its tentative UAL.
       // Pre-PR2 this was the responsibility of the chain-failure
       // catch block via `generateTentativeMetadata`. PR2 deleted that
@@ -2268,7 +2268,7 @@ export class DKGPublisher implements Publisher {
       //   1. `authorAddress` / `publishOperationId` — emits the
       //      `dkg:Publication` + `dkg:authoredBy` quads that RFC-001 §3.5
       //      requires for tentative publishes so downstream consumers
-      //      (`access-handler`, `assertion-history`, the verified-memory
+      //      (`access-handler`, `assertion-history`, the verifiable-memory
       //      view) can still attribute the publish locally before any
       //      chain confirmation. The on-chain `KnowledgeBatch.authorAddress`
       //      is canonical only once the publish confirms; until then this
@@ -2719,13 +2719,13 @@ export class DKGPublisher implements Publisher {
         // visible to /api/query. Order matters: data quads BEFORE
         // confirmedQuads + stampTrustLevel below so the trust stamp's
         // subject set actually matches existing rows.
-        // Uniform layout: published data lands in the per-KA verified-memory graph
-        // …/_verified_memory/{author}/{number} (author+number unpacked from the minted
+        // Uniform layout: published data lands in the per-KA verifiable-memory graph
+        // …/_verifiable_memory/{author}/{number} (author+number unpacked from the minted
         // kaId), not the monolithic root data graph. The default query reads the
-        // /_verified_memory/ prefix (read-both with root).
+        // /_verifiable_memory/ prefix (read-both with root).
         const vmNumber = kaId & ((1n << 96n) - 1n);
         const vmAuthor = '0x' + (kaId >> 96n).toString(16).padStart(40, '0');
-        const vmGraph = contextGraphLayerUri(contextGraphId, MemoryLayer.VerifiedMemory, vmAuthor, vmNumber, options.subGraphName);
+        const vmGraph = contextGraphLayerUri(contextGraphId, MemoryLayer.VerifiableMemory, vmAuthor, vmNumber, options.subGraphName);
         const vmQuads = normalizedQuads.map((q) => ({ ...q, graph: vmGraph }));
         this.log.info(ctx, `Storing ${vmQuads.length} triples in ${vmGraph} (post-confirmation)`);
         await this.store.insert(vmQuads);
@@ -2778,7 +2778,7 @@ export class DKGPublisher implements Publisher {
         // write. Pre-PR2 this branch swallowed the error and fell
         // through to `generateTentativeMetadata` + a `store.insert` of
         // the (potentially never-confirmed) quads, which surfaced
-        // through /api/query as if they were real verified memory.
+        // through /api/query as if they were real verifiable memory.
         // The data-graph insert now lives exclusively inside the
         // success branch above and the two non-chain skip branches —
         // a failed on-chain publish therefore writes NOTHING to the
@@ -2894,13 +2894,13 @@ export class DKGPublisher implements Publisher {
     );
     this.log.info(ctx, `Updating kaId=${kaId} with ${quads.length} triples`);
     // Uniform layout: a KA update replaces published data in the SAME per-KA
-    // verified-memory graph publish() wrote (…/_verified_memory/{author}/{number}),
+    // verifiable-memory graph publish() wrote (…/_verifiable_memory/{author}/{number}),
     // keyed by kaId. restateLabelGraphForUpdate purges the old roots there + writes the new
     // (matches the receiver-side update-handler.ts). Without this the update lands in root
     // while stale data lingers in the per-KA graph, and read-both returns both.
     const dataGraph = contextGraphLayerUri(
       contextGraphId,
-      MemoryLayer.VerifiedMemory,
+      MemoryLayer.VerifiableMemory,
       '0x' + (kaId >> 96n).toString(16).padStart(40, '0'),
       kaId & ((1n << 96n) - 1n),
     );

@@ -333,12 +333,12 @@ describe('Workspace: publishFromSharedMemory', () => {
     expect(result.kaManifest[0].rootEntity).toBe(ENTITY);
 
     // rc.17 uniform per-KA layout: a confirmed publish writes the KA's public
-    // quads into the per-KA verified-memory graph …/_verified_memory/{author}/{number}
+    // quads into the per-KA verifiable-memory graph …/_verifiable_memory/{author}/{number}
     // (author+number unpacked from the minted kaId), NOT the legacy monolithic
     // root data graph.
     const vmNumber = result.kaId & ((1n << 96n) - 1n);
     const vmAuthor = `0x${(result.kaId >> 96n).toString(16).padStart(40, '0')}`;
-    const vmGraph = `did:dkg:context-graph:${CONTEXT_GRAPH}/_verified_memory/${vmAuthor}/${vmNumber}`;
+    const vmGraph = `did:dkg:context-graph:${CONTEXT_GRAPH}/_verifiable_memory/${vmAuthor}/${vmNumber}`;
     const dataResult = await store.query(
       `SELECT ?o WHERE { GRAPH <${vmGraph}> { <${ENTITY}> <http://schema.org/name> ?o } }`,
     );
@@ -376,12 +376,12 @@ describe('Workspace: publishFromSharedMemory', () => {
     expect(result.kaManifest[0].rootEntity).toBe(entity1);
 
     // rc.17 uniform per-KA layout: the selected entity is published into the
-    // per-KA verified-memory graph …/_verified_memory/{author}/{number}
+    // per-KA verifiable-memory graph …/_verifiable_memory/{author}/{number}
     // (author+number unpacked from the minted kaId), NOT the legacy monolithic
     // root data graph.
     const vmNumber = result.kaId & ((1n << 96n) - 1n);
     const vmAuthor = `0x${(result.kaId >> 96n).toString(16).padStart(40, '0')}`;
-    const vmGraph = `did:dkg:context-graph:${CONTEXT_GRAPH}/_verified_memory/${vmAuthor}/${vmNumber}`;
+    const vmGraph = `did:dkg:context-graph:${CONTEXT_GRAPH}/_verifiable_memory/${vmAuthor}/${vmNumber}`;
     const oneInData = await store.query(
       `ASK { GRAPH <${vmGraph}> { <${entity1}> <http://schema.org/name> ?o } }`,
     );

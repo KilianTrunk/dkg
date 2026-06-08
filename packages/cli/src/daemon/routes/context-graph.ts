@@ -692,7 +692,7 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
         registered: resolvedContextGraphId,
         onChainId: result.onChainId,
         ...(result.txHash ? { txHash: result.txHash } : {}),
-        hint: 'Context graph registered on-chain. You can now publish SWM to Verified Memory.',
+        hint: 'Context graph registered on-chain. You can now publish SWM to Verifiable Memory.',
       });
     } catch (err: any) {
       const msg = err?.message ?? '';

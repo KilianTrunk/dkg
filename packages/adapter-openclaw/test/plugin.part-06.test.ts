@@ -433,7 +433,7 @@ describe("DkgNodePlugin", () => {
     // Description advertises all three layers.
     expect(queryProps.view.description).toContain('working-memory');
     expect(queryProps.view.description).toContain('shared-working-memory');
-    expect(queryProps.view.description).toContain('verified-memory');
+    expect(queryProps.view.description).toContain('verifiable-memory');
     // agent_address is exposed as an optional tool param for WM targeting.
     expect(queryProps.agent_address.type).toBe('string');
     expect(queryProps.agent_address.description).toMatch(/working-memory/i);

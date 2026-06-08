@@ -19,7 +19,7 @@ export function baseConfig(overrides: Partial<BenchmarkConfig> = {}): BenchmarkC
     authorityProofRef: 'proof:benchmark-local',
     pollIntervalMs: 1,
     asyncSuccessStatuses: ['finalized'],
-    getView: 'verified-memory',
+    getView: 'verifiable-memory',
     ...overrides,
   };
 }

@@ -87,7 +87,7 @@ describe('trust endpoint input validation', () => {
   it('/api/verify rejects unsafe contextGraphId before agent.verify', async () => {
     const result = await callTrustRoute('/api/verify', {
       contextGraphId: 'cg> } INSERT DATA { ?s ?p ?o } #',
-      verifiedMemoryId: '1',
+      verifiableMemoryId: '1',
       batchId: '1',
     });
 
@@ -121,7 +121,7 @@ describe('trust endpoint input validation', () => {
   it('/api/verify rejects oversized timeoutMs before agent.verify', async () => {
     const result = await callTrustRoute('/api/verify', {
       contextGraphId: 'cg-safe',
-      verifiedMemoryId: '1',
+      verifiableMemoryId: '1',
       batchId: '1',
       timeoutMs: VERIFY_COLLECTION_TIMEOUT_MAX_MS + 1,
     });

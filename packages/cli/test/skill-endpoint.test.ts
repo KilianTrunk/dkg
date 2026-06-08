@@ -83,7 +83,7 @@ describe('SKILL.md file', () => {
   it('documents the three memory layers', () => {
     expect(skillContent).toContain('Working Memory (WM)');
     expect(skillContent).toContain('Shared Working Memory (SWM)');
-    expect(skillContent).toContain('Verified Memory (VM)');
+    expect(skillContent).toContain('Verifiable Memory (VM)');
   });
 
   it('includes key available API endpoints', () => {

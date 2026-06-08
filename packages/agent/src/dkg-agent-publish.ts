@@ -18,7 +18,7 @@ import {
   contextGraphPublishTopic, contextGraphWorkspaceTopic, contextGraphAppTopic, contextGraphUpdateTopic, contextGraphFinalizationTopic,
   contextGraphDataGraphUri, contextGraphMetaGraphUri, contextGraphWorkspaceGraphUri, contextGraphWorkspaceMetaGraphUri,
   contextGraphSharedMemoryUri,
-  contextGraphVerifiedMemoryUri, contextGraphVerifiedMemoryMetaUri,
+  contextGraphVerifiableMemoryUri, contextGraphVerifiableMemoryMetaUri,
   contextGraphDataUri, contextGraphMetaUri, assertionLifecycleUri, contextGraphAssertionUri,
   contextGraphLayerUri,
   deriveCuratorDidFromCgId,
@@ -2805,7 +2805,7 @@ export class PublishMethods extends DKGAgentBase {
 
   /**
    * RFC-001 §9.x — publish a previously-finalized assertion to the
-   * verified-memory chain.
+   * verifiable-memory chain.
    *
    * Reads the seal from `_meta`, plumbs the seal's
    * `(merkleRoot, authorAddress, signature, schemeVersion)` into the
@@ -3081,7 +3081,7 @@ export class PublishMethods extends DKGAgentBase {
         for (const subj of [lifecycleUri, assertionUri]) {
           await this.store.deleteByPattern({ subject: subj, predicate: MEMORY_LAYER_PRED, graph: metaGraph });
           await this.store.insert([
-            { subject: subj, predicate: MEMORY_LAYER_PRED, object: `"${MemoryLayer.VerifiedMemory}"`, graph: metaGraph },
+            { subject: subj, predicate: MEMORY_LAYER_PRED, object: `"${MemoryLayer.VerifiableMemory}"`, graph: metaGraph },
           ]);
         }
         await this.store.deleteByPattern({ subject: lifecycleUri, predicate: STATE_PRED, graph: metaGraph });

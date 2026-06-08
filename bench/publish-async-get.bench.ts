@@ -49,7 +49,7 @@ export default defineSuite({
         const response = await readClient.query(
           getSparql(payload.rootEntity),
           config.contextGraphId,
-          { view: 'verified-memory' },
+          { view: 'verifiable-memory' },
         );
         validateQueryContainsMarker(response.result, payload.marker);
       },
@@ -204,7 +204,7 @@ function createConfig(payloadSize: PayloadSizeLabel): BenchmarkConfig {
     authorityProofRef: 'proof:benchmark-local',
     pollIntervalMs: 1000,
     asyncSuccessStatuses: ['finalized'],
-    getView: 'verified-memory',
+    getView: 'verifiable-memory',
   };
 }
 

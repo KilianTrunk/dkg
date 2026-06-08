@@ -26,7 +26,7 @@ describe('MemoryLayer enum', () => {
   it('abbreviations match spec', () => {
     expect(MemoryLayer.WorkingMemory).toBe('WM');
     expect(MemoryLayer.SharedWorkingMemory).toBe('SWM');
-    expect(MemoryLayer.VerifiedMemory).toBe('VM');
+    expect(MemoryLayer.VerifiableMemory).toBe('VM');
   });
 });
 
@@ -52,15 +52,15 @@ describe('isValidTransition', () => {
   });
 
   it('SWM → VM is valid', () => {
-    expect(isValidTransition(MemoryLayer.SharedWorkingMemory, MemoryLayer.VerifiedMemory)).toBe(true);
+    expect(isValidTransition(MemoryLayer.SharedWorkingMemory, MemoryLayer.VerifiableMemory)).toBe(true);
   });
 
   it('WM → VM is invalid (skip not allowed)', () => {
-    expect(isValidTransition(MemoryLayer.WorkingMemory, MemoryLayer.VerifiedMemory)).toBe(false);
+    expect(isValidTransition(MemoryLayer.WorkingMemory, MemoryLayer.VerifiableMemory)).toBe(false);
   });
 
   it('VM → WM is invalid (no backward transitions)', () => {
-    expect(isValidTransition(MemoryLayer.VerifiedMemory, MemoryLayer.WorkingMemory)).toBe(false);
+    expect(isValidTransition(MemoryLayer.VerifiableMemory, MemoryLayer.WorkingMemory)).toBe(false);
   });
 
   it('SWM → WM is invalid (no backward transitions)', () => {
@@ -77,7 +77,7 @@ describe('isValidTransition', () => {
 describe('VALID_TRANSITIONS map', () => {
   it('has entries for 2 source layers (VM has no outgoing)', () => {
     expect(VALID_TRANSITIONS.size).toBe(2);
-    expect(VALID_TRANSITIONS.has(MemoryLayer.VerifiedMemory)).toBe(false);
+    expect(VALID_TRANSITIONS.has(MemoryLayer.VerifiableMemory)).toBe(false);
   });
 });
 
@@ -95,7 +95,7 @@ describe('GetView type', () => {
   it('GET_VIEWS contains all 3 views in trust order', () => {
     expect(GET_VIEWS).toHaveLength(3);
     const expected: GetView[] = [
-      'working-memory', 'shared-working-memory', 'verified-memory',
+      'working-memory', 'shared-working-memory', 'verifiable-memory',
     ];
     expect([...GET_VIEWS]).toEqual(expected);
   });

@@ -203,13 +203,13 @@ program
       const timeoutMs = parseOptionalVerifyTimeoutOption(opts.timeout);
       const result = await client.verify({
         contextGraphId: opts.contextGraph,
-        verifiedMemoryId: opts.verifiedGraph,
+        verifiableMemoryId: opts.verifiedGraph,
         batchId,
         timeoutMs,
         requiredSignatures: opts.requiredSignatures ? Number(opts.requiredSignatures) : undefined,
       });
       if (result.status === 'verified' || result.txHash) {
-        console.log(`Verified batch ${batchId} → _verified_memory/${result.verifiedMemoryId}`);
+        console.log(`Verified batch ${batchId} → _verifiable_memory/${result.verifiableMemoryId}`);
         console.log(`  TX: ${result.txHash}`);
         console.log(`  Block: ${result.blockNumber}`);
       } else if (result.status === 'partial') {

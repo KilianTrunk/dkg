@@ -23,7 +23,7 @@ const { Type, Field } = protobuf;
 
 export const VerifyProposalSchema = new Type('VerifyProposal')
   .add(new Field('proposalId', 1, 'bytes'))
-  .add(new Field('verifiedMemoryId', 2, 'uint64'))
+  .add(new Field('verifiableMemoryId', 2, 'uint64'))
   .add(new Field('batchId', 3, 'string'))
   .add(new Field('merkleRoot', 4, 'bytes'))
   .add(new Field('entities', 5, 'string', 'repeated'))
@@ -42,7 +42,7 @@ type Long = { low: number; high: number; unsigned: boolean };
 
 export interface VerifyProposalMsg {
   proposalId: Uint8Array;
-  verifiedMemoryId: number | Long;
+  verifiableMemoryId: number | Long;
   batchId: string | number | bigint | Long;
   merkleRoot: Uint8Array;
   entities: string[];

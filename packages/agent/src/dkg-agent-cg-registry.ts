@@ -18,7 +18,7 @@ import {
   contextGraphPublishTopic, contextGraphWorkspaceTopic, contextGraphAppTopic, contextGraphUpdateTopic, contextGraphFinalizationTopic,
   contextGraphDataGraphUri, contextGraphMetaGraphUri, contextGraphWorkspaceGraphUri, contextGraphWorkspaceMetaGraphUri,
   contextGraphSharedMemoryUri,
-  contextGraphVerifiedMemoryUri, contextGraphVerifiedMemoryMetaUri,
+  contextGraphVerifiableMemoryUri, contextGraphVerifiableMemoryMetaUri,
   contextGraphDataUri, contextGraphMetaUri, assertionLifecycleUri, contextGraphAssertionUri,
   deriveCuratorDidFromCgId,
   MemoryLayer,
@@ -1024,7 +1024,7 @@ export class ContextGraphRegistryMethods extends DKGAgentBase {
     const target = `<${targetUalOrRoot}>`;
     const namespaces = ['http://dkg.io/ontology/', 'https://dkg.network/ontology#'];
     const existsPatterns = [
-      `GRAPH ?vmg { ${target} ?p ?o } FILTER(STRSTARTS(STR(?vmg), "${dataGraph}/_verified_memory/") || STR(?vmg) = "${dataGraph}") BIND(${target} AS ?hit)`,
+      `GRAPH ?vmg { ${target} ?p ?o } FILTER(STRSTARTS(STR(?vmg), "${dataGraph}/_verifiable_memory/") || STR(?vmg) = "${dataGraph}") BIND(${target} AS ?hit)`,
       `GRAPH <${metaGraph}> { ${target} ?p ?o } BIND(${target} AS ?hit)`,
       ...namespaces.flatMap((ns) => [
         `GRAPH <${metaGraph}> { ?ka <${ns}rootEntity> ${target} } BIND(${target} AS ?hit)`,

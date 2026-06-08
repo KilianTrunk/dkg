@@ -1911,7 +1911,7 @@ WHERE {
               return jsonResponse(res, 400, {
                 error:
                   `Context graph "${resolvedContextGraphId}" has no pending shared-memory writes — `
-                  + `nothing to publish to Verified Memory. Stage entities into SWM first, then retry publish.`,
+                  + `nothing to publish to Verifiable Memory. Stage entities into SWM first, then retry publish.`,
               });
             }
           }

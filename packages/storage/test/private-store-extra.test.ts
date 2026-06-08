@@ -9,7 +9,7 @@
  *          reach this store; local triple-store rows stay queryable.
  *
  *   ST-3  Named-graph isolation using REAL V10 URIs
- *          (contextGraphSharedMemoryUri / contextGraphVerifiedMemoryUri /
+ *          (contextGraphSharedMemoryUri / contextGraphVerifiableMemoryUri /
  *          contextGraphPrivateUri). Axiom 5 of the spec.
  *
  *   ST-4  Dual-graph leak — a SPARQL query scoped to the public data graph
@@ -34,7 +34,7 @@ import {
   contextGraphDataUri,
   contextGraphPrivateUri,
   contextGraphSharedMemoryUri,
-  contextGraphVerifiedMemoryUri,
+  contextGraphVerifiableMemoryUri,
 } from '@origintrail-official/dkg-core';
 
 const CONTEXT_GRAPH = 'agent-registry';
@@ -594,9 +594,9 @@ describe('Named-graph isolation — real V10 URIs [ST-3]', () => {
     return { subject: s, predicate: p, object: `"${obj}"`, graph };
   }
 
-  it('shared-memory insert is invisible to verified-memory SELECT', async () => {
+  it('shared-memory insert is invisible to verifiable-memory SELECT', async () => {
     const shared = contextGraphSharedMemoryUri(CONTEXT_GRAPH);
-    const verified = contextGraphVerifiedMemoryUri(CONTEXT_GRAPH, 'vm-1');
+    const verified = contextGraphVerifiableMemoryUri(CONTEXT_GRAPH, 'vm-1');
 
     await store.insert([quadIn(shared, 'shared-only')]);
 
@@ -624,7 +624,7 @@ describe('Named-graph isolation — real V10 URIs [ST-3]', () => {
 
   it('distinct values in three V10 named graphs remain distinct after SELECT', async () => {
     const shared = contextGraphSharedMemoryUri(CONTEXT_GRAPH);
-    const verified = contextGraphVerifiedMemoryUri(CONTEXT_GRAPH, 'vm-1');
+    const verified = contextGraphVerifiableMemoryUri(CONTEXT_GRAPH, 'vm-1');
     const priv = contextGraphPrivateUri(CONTEXT_GRAPH);
 
     await store.insert([

@@ -191,9 +191,9 @@ export function LayerContent({
   const config = LAYER_CONFIG[layer];
   const itemsLabel = layerNoun(layer, 2);
   const vmLayerStatus = memory.layerStatus?.vm ?? (memory.loading ? 'loading' : memory.error ? 'error' : 'ok');
-  const isInitialVerifiedMemoryLoad = layer === 'vm' && vmLayerStatus === 'loading' && entities.length === 0;
-  const isVerifiedMemoryUnavailable = layer === 'vm' && vmLayerStatus === 'error' && entities.length === 0;
-  const isEmptyVerifiedMemory = layer === 'vm' && vmLayerStatus === 'ok' && entities.length === 0;
+  const isInitialVerifiableMemoryLoad = layer === 'vm' && vmLayerStatus === 'loading' && entities.length === 0;
+  const isVerifiableMemoryUnavailable = layer === 'vm' && vmLayerStatus === 'error' && entities.length === 0;
+  const isEmptyVerifiableMemory = layer === 'vm' && vmLayerStatus === 'ok' && entities.length === 0;
   const entityCount = memory.counts[layer];
 
   const handleTab = (tab: LayerContentTab) => (e: React.MouseEvent) => {
@@ -226,14 +226,14 @@ export function LayerContent({
 
       {activeTab === 'items' && (
         <div className="v10-layer-expand-body entities-tab" data-cg-scroll-key={`layer:${layer}:items`}>
-          {layer === 'vm' && !isInitialVerifiedMemoryLoad && !isVerifiedMemoryUnavailable && (
-            <VerifiedMemoryHeroBanner
+          {layer === 'vm' && !isInitialVerifiableMemoryLoad && !isVerifiableMemoryUnavailable && (
+            <VerifiableMemoryHeroBanner
               entities={entities}
               tripleCount={tripleCount}
               contextGraphId={contextGraphId}
             />
           )}
-          {isInitialVerifiedMemoryLoad ? (
+          {isInitialVerifiableMemoryLoad ? (
             <div className="v10-layer-widgets-strip empty">
               <EmptyState
                 compact
@@ -243,7 +243,7 @@ export function LayerContent({
                 description="Knowledge Assets are being read from the verified layer."
               />
             </div>
-          ) : isVerifiedMemoryUnavailable ? (
+          ) : isVerifiableMemoryUnavailable ? (
             <div className="v10-layer-widgets-strip empty">
               <EmptyState
                 compact
@@ -253,7 +253,7 @@ export function LayerContent({
                 description="This node could not read the verified layer right now."
               />
             </div>
-          ) : !isEmptyVerifiedMemory && (
+          ) : !isEmptyVerifiableMemory && (
             <>
               <LayerWidgetStrip
                 layer={layer}
@@ -316,7 +316,7 @@ export function LayerContent({
 // Sits at the top of the VM tab's "Knowledge Assets" view. Pulls together
 // the DKG "secret sauce" into a compact visual: anchoring, consensus,
 // agent identity — the verifiability elements that justify the VM's cost.
-export function VerifiedMemoryHeroBanner({ entities, tripleCount, contextGraphId }: {
+export function VerifiableMemoryHeroBanner({ entities, tripleCount, contextGraphId }: {
   entities: MemoryEntity[];
   tripleCount: number;
   contextGraphId: string;

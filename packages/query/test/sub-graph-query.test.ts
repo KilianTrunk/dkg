@@ -89,7 +89,7 @@ describe('sub-graph query scoping', () => {
   it('rejects subGraphName combined with view-based routing', async () => {
     await expect(engine.query(
       'SELECT ?s ?sig WHERE { ?s <http://ex.org/signature> ?sig }',
-      { contextGraphId: CG_ID, view: 'verified-memory', subGraphName: 'code' },
+      { contextGraphId: CG_ID, view: 'verifiable-memory', subGraphName: 'code' },
     )).rejects.toThrow('subGraphName cannot be combined with view-based routing');
   });
 });

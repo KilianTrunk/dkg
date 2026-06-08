@@ -10,7 +10,7 @@ End-to-end devnet gate for the chain-driven VM reconciliation effort
 | **F** | Every node serves `/api/replication/{summary,per-cg,timeline,cursors,events}` backed by the V19 `replication_events` table. |
 | **B + E** | A public publish drives the reconciler: a core's per-CG contiguous watermark advances past 0, telemetry is persisted, and `daemon.log` carries the `chain-promote` grep surface. |
 | **D (recording)** | A core that signs a StorageACK for a public CG marks it `coreHosted` (cursor inspector Role = `host`), persisted. |
-| **D (fill-the-gap)** | A core taken **offline during a publish** learns the missed KA from chain on restart and fills its own gap — observed as a `core-fill` replication event and/or the missed triple landing in that core's verified-memory. |
+| **D (fill-the-gap)** | A core taken **offline during a publish** learns the missed KA from chain on restart and fills its own gap — observed as a `core-fill` replication event and/or the missed triple landing in that core's verifiable-memory. |
 | **C** | The additive, unsigned `sinceBatchId` hint does not regress normal catch-up sync. (Its responder/envelope behaviour is unit-pinned in `packages/agent/test/sync-{responder,envelope}-cursor.test.ts`; it has no active production caller yet, so it isn't independently triggerable on devnet.) |
 
 ## Run

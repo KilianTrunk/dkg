@@ -214,7 +214,7 @@ function ReplicationTab() {
       <div className="filters" style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', marginBottom: 16 }}>
         <PeriodSelect value={period} onChange={setPeriod} />
         <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-          Chain-anchored publishes reconciled into Verified Memory. Auto-refreshes every 5s.
+          Chain-anchored publishes reconciled into Verifiable Memory. Auto-refreshes every 5s.
         </span>
       </div>
 

@@ -705,12 +705,12 @@ describe('daemon memory_graph_changed route emissions', () => {
     expect(publishFromSharedMemory).not.toHaveBeenCalled();
   });
 
-  it('emits VM refresh events after verified-memory verification', async () => {
+  it('emits VM refresh events after verifiable-memory verification', async () => {
     const emitMemoryGraphChanged = vi.fn();
     const verify = vi.fn().mockResolvedValue({ verified: true, status: 'verified' });
     const ctx = createContext('/api/verify', {
       contextGraphId: 'project-a',
-      verifiedMemoryId: 'vm-1',
+      verifiableMemoryId: 'vm-1',
       batchId: '42',
     }, {
       agent: { verify } as unknown as RequestContext['agent'],
@@ -723,7 +723,7 @@ describe('daemon memory_graph_changed route emissions', () => {
     expect(responseBody(ctx)).toMatchObject({ verified: true, batchId: '42' });
     expect(verify).toHaveBeenCalledWith({
       contextGraphId: 'project-a',
-      verifiedMemoryId: 'vm-1',
+      verifiableMemoryId: 'vm-1',
       batchId: 42n,
       timeoutMs: undefined,
       requiredSignatures: undefined,
@@ -731,7 +731,7 @@ describe('daemon memory_graph_changed route emissions', () => {
     expect(emitMemoryGraphChanged).toHaveBeenCalledWith({
       contextGraphId: 'project-a',
       layers: ['vm'],
-      operation: 'verified_memory_updated',
+      operation: 'verifiable_memory_updated',
       source: 'api',
     });
   });
@@ -739,14 +739,14 @@ describe('daemon memory_graph_changed route emissions', () => {
   it('returns 409 and emits WM refresh events for partial verification metadata', async () => {
     const emitMemoryGraphChanged = vi.fn();
     const verify = vi.fn().mockResolvedValue({
-      verifiedMemoryId: 'vm-1',
+      verifiableMemoryId: 'vm-1',
       signers: ['0x0000000000000000000000000000000000000001'],
       status: 'partial',
       trustLevel: 2,
     });
     const ctx = createContext('/api/verify', {
       contextGraphId: 'project-a',
-      verifiedMemoryId: 'vm-1',
+      verifiableMemoryId: 'vm-1',
       batchId: '42',
     }, {
       agent: { verify } as unknown as RequestContext['agent'],
@@ -759,7 +759,7 @@ describe('daemon memory_graph_changed route emissions', () => {
     expect(responseBody(ctx)).toMatchObject({
       batchId: '42',
       status: 'partial',
-      verifiedMemoryId: 'vm-1',
+      verifiableMemoryId: 'vm-1',
       error: expect.stringContaining('partial trust metadata'),
     });
     expect(emitMemoryGraphChanged).toHaveBeenCalledWith({
@@ -773,14 +773,14 @@ describe('daemon memory_graph_changed route emissions', () => {
   it('returns 409 for no-quorum verification without claiming a VM write', async () => {
     const emitMemoryGraphChanged = vi.fn();
     const verify = vi.fn().mockResolvedValue({
-      verifiedMemoryId: 'vm-1',
+      verifiableMemoryId: 'vm-1',
       signers: [],
       status: 'no_quorum',
       trustLevel: 0,
     });
     const ctx = createContext('/api/verify', {
       contextGraphId: 'project-a',
-      verifiedMemoryId: 'vm-1',
+      verifiableMemoryId: 'vm-1',
       batchId: '42',
     }, {
       agent: { verify } as unknown as RequestContext['agent'],
@@ -793,8 +793,8 @@ describe('daemon memory_graph_changed route emissions', () => {
     expect(responseBody(ctx)).toMatchObject({
       batchId: '42',
       status: 'no_quorum',
-      verifiedMemoryId: 'vm-1',
-      error: expect.stringContaining('no verified memory was written'),
+      verifiableMemoryId: 'vm-1',
+      error: expect.stringContaining('no verifiable memory was written'),
     });
     expect(emitMemoryGraphChanged).toHaveBeenCalledWith({
       contextGraphId: 'project-a',

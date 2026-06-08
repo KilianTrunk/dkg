@@ -132,7 +132,7 @@ describe('Context Graph IA and Overview', () => {
     ]);
     expect(container.textContent).not.toContain('Graph Overview');
     expect(container.textContent).not.toContain('Shared Memory4');
-    // The legacy "Verified Memory" leak guard is moot post-#4 vocab
+    // The legacy "Verifiable Memory" leak guard is moot post-#4 vocab
     // sweep — "Verifiable Memory" is now the canonical full-form
     // layer-switcher label and is intentionally rendered.
 

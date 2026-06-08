@@ -1630,7 +1630,7 @@ export class DashboardDB {
     for (const p of periods) {
       const cutoff = now - p.ms;
       // "Publishes to VM": only publishes that actually spent TRAC
-      // on-chain (Verified Memory commits) are counted, so the publish
+      // on-chain (Verifiable Memory commits) are counted, so the publish
       // count and the TRAC total are consistent. Free SWM/local/testnet
       // publishes record trac_cost = 0 and are intentionally excluded.
       const row = this.db.prepare(`

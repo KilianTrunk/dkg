@@ -45,15 +45,15 @@ function q(s: string, p: string, o: string, g = GRAPH): Quad {
 
 // rc.17 uniform per-KA layout: a confirmed publish (and a subsequent
 // KA update, which DELETE+REWRITEs the same graph) writes the KA's
-// public quads into a PER-KA verified-memory named graph
-// `did:dkg:context-graph:{cg}/_verified_memory/{author}/{number}`, where
+// public quads into a PER-KA verifiable-memory named graph
+// `did:dkg:context-graph:{cg}/_verifiable_memory/{author}/{number}`, where
 // author+number are unpacked from the on-chain kaId (= the update's
 // batchId) — NOT the monolithic root data graph. Compute that graph from
 // a result's kaId so tests assert against the graph the data lives in.
-function verifiedMemoryGraph(kaId: bigint): string {
+function verifiableMemoryGraph(kaId: bigint): string {
   const number = kaId & ((1n << 96n) - 1n);
   const author = '0x' + (kaId >> 96n).toString(16).padStart(40, '0');
-  return `did:dkg:context-graph:${CONTEXT_GRAPH}/_verified_memory/${author}/${number}`;
+  return `did:dkg:context-graph:${CONTEXT_GRAPH}/_verifiable_memory/${author}/${number}`;
 }
 
 // Phase C made the publisher require a precomputedAttestation for
@@ -833,10 +833,10 @@ describe('Update flow', () => {
     const kaId = publishResult.kaId;
 
     // rc.17 per-KA layout: the confirmed publish wrote the original quads
-    // into the per-KA verified-memory graph (computed from kaId), and the
+    // into the per-KA verifiable-memory graph (computed from kaId), and the
     // KA update DELETE+REWRITEs that SAME graph (its batchId === kaId).
     // Assert read-both against that graph, not the monolithic root data graph.
-    const vmGraph = verifiedMemoryGraph(kaId);
+    const vmGraph = verifiableMemoryGraph(kaId);
 
     const before = await store.query(
       `SELECT ?name WHERE { GRAPH <${vmGraph}> { <${ENTITY}> <http://schema.org/name> ?name } }`,

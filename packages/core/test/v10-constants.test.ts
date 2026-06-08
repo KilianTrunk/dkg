@@ -28,8 +28,8 @@ import {
   contextGraphPrivateUri,
   contextGraphSharedMemoryUri,
   contextGraphSharedMemoryMetaUri,
-  contextGraphVerifiedMemoryUri,
-  contextGraphVerifiedMemoryMetaUri,
+  contextGraphVerifiableMemoryUri,
+  contextGraphVerifiableMemoryMetaUri,
   contextGraphAssertionUri,
   contextGraphLayerUri,
   contextGraphRulesUri,
@@ -147,12 +147,12 @@ describe('V10 named graph URIs', () => {
     expect(contextGraphSharedMemoryMetaUri(id)).toBe('did:dkg:context-graph:42/_shared_memory_meta');
   });
 
-  it('verified memory URI', () => {
-    expect(contextGraphVerifiedMemoryUri(id, '7')).toBe('did:dkg:context-graph:42/_verified_memory/7');
+  it('verifiable memory URI', () => {
+    expect(contextGraphVerifiableMemoryUri(id, '7')).toBe('did:dkg:context-graph:42/_verifiable_memory/7');
   });
 
-  it('verified memory meta URI', () => {
-    expect(contextGraphVerifiedMemoryMetaUri(id, '7')).toBe('did:dkg:context-graph:42/_verified_memory/7/_meta');
+  it('verifiable memory meta URI', () => {
+    expect(contextGraphVerifiableMemoryMetaUri(id, '7')).toBe('did:dkg:context-graph:42/_verifiable_memory/7/_meta');
   });
 
   it('assertion URI', () => {
@@ -164,14 +164,14 @@ describe('V10 named graph URIs', () => {
       .toBe('did:dkg:context-graph:42/_working_memory/0xAbc/7');
     expect(contextGraphLayerUri(id, MemoryLayer.SharedWorkingMemory, '0xAbc', 7))
       .toBe('did:dkg:context-graph:42/_shared_memory/0xAbc/7');
-    expect(contextGraphLayerUri(id, MemoryLayer.VerifiedMemory, '0xAbc', 7))
-      .toBe('did:dkg:context-graph:42/_verified_memory/0xAbc/7');
+    expect(contextGraphLayerUri(id, MemoryLayer.VerifiableMemory, '0xAbc', 7))
+      .toBe('did:dkg:context-graph:42/_verifiable_memory/0xAbc/7');
   });
 
   it('uniform per-KA layer URI: same {addr}/{number} suffix across the lifecycle', () => {
     const wm = contextGraphLayerUri(id, MemoryLayer.WorkingMemory, '0xAbc', 7);
     const swm = contextGraphLayerUri(id, MemoryLayer.SharedWorkingMemory, '0xAbc', 7);
-    const vm = contextGraphLayerUri(id, MemoryLayer.VerifiedMemory, '0xAbc', 7);
+    const vm = contextGraphLayerUri(id, MemoryLayer.VerifiableMemory, '0xAbc', 7);
     const suffix = (u: string) => u.split('/').slice(-2).join('/');
     expect(suffix(wm)).toBe('0xAbc/7');
     expect(suffix(swm)).toBe('0xAbc/7');
@@ -179,8 +179,8 @@ describe('V10 named graph URIs', () => {
   });
 
   it('uniform per-KA layer URI: sub-graph scoping is uniform across layers', () => {
-    expect(contextGraphLayerUri(id, MemoryLayer.VerifiedMemory, '0xAbc', 7, 'game-state'))
-      .toBe('did:dkg:context-graph:42/game-state/_verified_memory/0xAbc/7');
+    expect(contextGraphLayerUri(id, MemoryLayer.VerifiableMemory, '0xAbc', 7, 'game-state'))
+      .toBe('did:dkg:context-graph:42/game-state/_verifiable_memory/0xAbc/7');
   });
 
   it('rules URI', () => {

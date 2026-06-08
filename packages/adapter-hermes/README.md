@@ -259,7 +259,7 @@ provenance before forwarding them to Hermes.
   daemon-authenticated so the active Hermes provider can persist completed
   turns even when UI chat registration is unavailable.
 - Direct publish tools are model-callable by default to match the node skill
-  surface. Publishing Verified Memory is permanent and may cost TRAC; operators
+  surface. Publishing Verifiable Memory is permanent and may cost TRAC; operators
   can hide direct publish exposure with `DKG_ALLOW_DIRECT_PUBLISH=false`.
 - Context-graph admin mutation tools are enabled by default for collaboration;
   operators can hide them with `DKG_ALLOW_CONTEXT_GRAPH_ADMIN_TOOLS=false`.

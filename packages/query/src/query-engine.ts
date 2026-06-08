@@ -39,7 +39,7 @@ export interface QueryOptions {
   view?: GetView;
   /** Agent address — required when view is 'working-memory' to resolve assertion graphs. */
   agentAddress?: string;
-  /** Specific verified graph name — used with view='verified-memory' to target a single verified graph. */
+  /** Specific verified graph name — used with view='verifiable-memory' to target a single verified graph. */
   verifiedGraph?: string;
   /** Specific assertion name — used with view='working-memory' to target a single assertion graph. */
   assertionName?: string;
@@ -57,10 +57,10 @@ export interface QueryOptions {
    */
   excludeGraphPrefixes?: string[];
   /**
-   * Per-subject trust floor for `verified-memory`. Values above
+   * Per-subject trust floor for `verifiable-memory`. Values above
    * `SelfAttested` require every matched subject to carry an explicit
    * `http://dkg.io/ontology/trustLevel` literal at or above `minTrust`.
-   * The root graph and `/_verified_memory/*` graphs remain candidates;
+   * The root graph and `/_verifiable_memory/*` graphs remain candidates;
    * trust is not inferred from graph scope. Ignored on other views.
    */
   minTrust?: TrustLevel;

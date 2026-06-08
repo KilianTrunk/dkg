@@ -91,7 +91,7 @@ const wmNow  = await countLayer('CONTAINS(STR(?g), "/assertion/")');
 const swmNow = await countLayer('STRENDS(STR(?g), "/_shared_memory")');
 const vmNow  = await countLayer(
   '!CONTAINS(STR(?g), "/assertion/") && !CONTAINS(STR(?g), "_shared_memory") ' +
-  '&& !CONTAINS(STR(?g), "_verified_memory") && !CONTAINS(STR(?g), "/_meta") ' +
+  '&& !CONTAINS(STR(?g), "_verifiable_memory") && !CONTAINS(STR(?g), "/_meta") ' +
   '&& !CONTAINS(STR(?g), "/_private") && !CONTAINS(STR(?g), "/_rules")',
 );
 const total = wmNow + swmNow + vmNow;
@@ -349,7 +349,7 @@ const wmAfter  = await countLayer('CONTAINS(STR(?g), "/assertion/")');
 const swmAfter = await countLayer('STRENDS(STR(?g), "/_shared_memory")');
 const vmAfter  = await countLayer(
   '!CONTAINS(STR(?g), "/assertion/") && !CONTAINS(STR(?g), "_shared_memory") ' +
-  '&& !CONTAINS(STR(?g), "_verified_memory") && !CONTAINS(STR(?g), "/_meta") ' +
+  '&& !CONTAINS(STR(?g), "_verifiable_memory") && !CONTAINS(STR(?g), "/_meta") ' +
   '&& !CONTAINS(STR(?g), "/_private") && !CONTAINS(STR(?g), "/_rules")',
 );
 const totAfter = wmAfter + swmAfter + vmAfter;

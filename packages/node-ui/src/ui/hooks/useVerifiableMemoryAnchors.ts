@@ -1,5 +1,5 @@
 /**
- * useVerifiedMemoryAnchors — pulls Verified-Memory provenance out of the
+ * useVerifiableMemoryAnchors — pulls Verifiable-Memory provenance out of the
  * daemon's `_shared_memory_meta` graphs and projects it as a small set of
  * "decoration" RDF triples that can be merged into the existing VM graph
  * visualisation.
@@ -59,7 +59,7 @@ export interface PublishAnchor {
   subGraph?: string;   // sub-graph slug (from the graph URI)
 }
 
-export interface VerifiedMemoryAnchorsResult {
+export interface VerifiableMemoryAnchorsResult {
   /** Every anchor we know about. Useful for legends / ledgers. */
   anchors: PublishAnchor[];
   /** Synthetic triples to merge into the RdfGraph input, already filtered
@@ -217,10 +217,10 @@ function buildDecorationTriples(
   return out;
 }
 
-export function useVerifiedMemoryAnchors(
+export function useVerifiableMemoryAnchors(
   contextGraphId: string | undefined,
   visibleEntityUris?: Set<string> | Iterable<string>,
-): VerifiedMemoryAnchorsResult {
+): VerifiableMemoryAnchorsResult {
   const [anchors, setAnchors] = useState<PublishAnchor[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);

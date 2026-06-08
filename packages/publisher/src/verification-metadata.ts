@@ -7,11 +7,11 @@ const XSD_INTEGER = 'http://www.w3.org/2001/XMLSchema#integer';
 
 /**
  * Build metadata quads for a completed verification.
- * Written to _verified_memory/{verifiedMemoryId}/_meta graph.
+ * Written to _verifiable_memory/{verifiableMemoryId}/_meta graph.
  */
 export function buildVerificationMetadata(params: {
   contextGraphId: string;
-  verifiedMemoryId: string;
+  verifiableMemoryId: string;
   batchId: bigint;
   txHash: string;
   blockNumber: number;
@@ -19,13 +19,13 @@ export function buildVerificationMetadata(params: {
   verifiedAt: Date;
   graph: string;
 }): Quad[] {
-  const { contextGraphId, verifiedMemoryId, batchId, txHash, blockNumber, signers, verifiedAt, graph } = params;
-  const verificationUri = `did:dkg:verification:${contextGraphId}:${verifiedMemoryId}:${batchId}`;
+  const { contextGraphId, verifiableMemoryId, batchId, txHash, blockNumber, signers, verifiedAt, graph } = params;
+  const verificationUri = `did:dkg:verification:${contextGraphId}:${verifiableMemoryId}:${batchId}`;
 
   const quads: Quad[] = [
     { subject: verificationUri, predicate: RDF_TYPE, object: `${DKG}Verification`, graph },
     { subject: verificationUri, predicate: `${DKG}contextGraphId`, object: `"${contextGraphId}"`, graph },
-    { subject: verificationUri, predicate: `${DKG}verifiedMemoryId`, object: `"${verifiedMemoryId}"`, graph },
+    { subject: verificationUri, predicate: `${DKG}verifiableMemoryId`, object: `"${verifiableMemoryId}"`, graph },
     { subject: verificationUri, predicate: `${DKG}batchId`, object: `"${batchId}"^^<${XSD_INTEGER}>`, graph },
     { subject: verificationUri, predicate: `${DKG}transactionHash`, object: `"${txHash}"`, graph },
     { subject: verificationUri, predicate: `${DKG}blockNumber`, object: `"${blockNumber}"^^<${XSD_INTEGER}>`, graph },

@@ -203,7 +203,7 @@ console.log('\n──── VM seed: SWM -> VM (publish, best-effort) ───�
 const vmDecisions = [
   Decisions.uri.decision('unified-layer-content'),
   Decisions.uri.decision('project-profile-in-meta-subgraph'),
-  Decisions.uri.decision('verified-memory-hero-view'),
+  Decisions.uri.decision('verifiable-memory-hero-view'),
   Decisions.uri.decision('ast-code-ontology'),
   Decisions.uri.decision('subgraphs-as-first-class'),
 ];

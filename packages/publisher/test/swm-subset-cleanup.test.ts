@@ -222,13 +222,13 @@ describe('SWM subset publish cleanup', () => {
     });
 
     // rc.17 uniform per-KA layout: a confirmed publish writes the KA's public
-    // quads into the PER-KA verified-memory graph
-    // `did:dkg:context-graph:{cg}/_verified_memory/{author}/{number}` (author +
+    // quads into the PER-KA verifiable-memory graph
+    // `did:dkg:context-graph:{cg}/_verifiable_memory/{author}/{number}` (author +
     // number unpacked from the minted kaId), NOT the monolithic root data graph.
     // Assert the published subject lands in the graph it actually lives in.
     const vmNumber = result.kaId & ((1n << 96n) - 1n);
     const vmAuthor = `0x${(result.kaId >> 96n).toString(16).padStart(40, '0')}`;
-    const vmGraph = `${DATA_GRAPH}/_verified_memory/${vmAuthor}/${vmNumber}`;
+    const vmGraph = `${DATA_GRAPH}/_verifiable_memory/${vmAuthor}/${vmNumber}`;
     const subjects = await subjectsInGraph(store, vmGraph);
     expect(subjects.has(entity)).toBe(true);
   });

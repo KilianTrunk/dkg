@@ -1844,6 +1844,14 @@ export async function runDaemonInner(
       }
     },
     getContextGraphCount: async () => (await agent.listContextGraphs()).length,
+    // The count getters below each issue a data-proportional full-scan COUNT,
+    // but the only caller is the 30 s metrics tick (metricsSource is consumed
+    // solely by MetricsCollector — no on-demand /api/status path), so each tick
+    // already re-reads the store fresh and there is nothing concurrent to
+    // coalesce. They are intentionally left uncached so a snapshot never serves
+    // a stale count and can't mask a store outage. The one heavy metrics read,
+    // getContextGraphCount, is relieved at the chokepoint by R6-A's listGraphs
+    // cache; these COUNTs are cheap (~0.015 CPU-s/tick on a 75k-triple store).
     getTotalTriples: async () => {
       const r = await agent.query(GET_TOTAL_TRIPLES_SPARQL);
       return parseRdfInt(r?.bindings?.[0]?.c);
@@ -1918,7 +1926,7 @@ export async function runDaemonInner(
     dkgDir(),
   );
   metricsCollector.start();
-  log("Metrics collector started (2min interval)");
+  log("Metrics collector started (30s interval)");
 
   // --- Telemetry: syslog log streaming (opt-in) ---
   const networkKey = network?.networkName?.toLowerCase().includes("testnet")

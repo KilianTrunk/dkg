@@ -958,6 +958,11 @@ export class PublishMethods extends DKGAgentBase {
     authorAgentAddress?: string,
     authorSignTypedData?: (typedData: AuthorAttestationTypedData) => Promise<{ r: Uint8Array; vs: Uint8Array }>,
   ): Promise<LiftRequestAuthorSeal | undefined> {
+    // OT-RFC-43 §F2 — async share is deferred to the next release (the async-lift
+    // seal does not yet allocate/bind the reservedKaId the digest now requires).
+    // This method is UNREACHABLE in this release: the swm/share-async route is
+    // hard-gated (501), so no async-lift seal is ever built or persisted. The 0n
+    // reservedKaId placeholder below only satisfies the now-required digest field.
     if (this.chain.isV10Ready?.() !== true) return undefined;
     if (typeof this.chain.getEvmChainId !== 'function') return undefined;
     if (typeof this.chain.getKnowledgeAssetsLifecycleAddress !== 'function') return undefined;
@@ -1021,12 +1026,19 @@ export class PublishMethods extends DKGAgentBase {
       authorAddress = fallback;
     }
 
+    // OT-RFC-43 §F2 — async-lift reservedKaId binding is DEFERRED to rc.18. The
+    // async share path is gated at the `swm/share-async` route (returns
+    // rc.17-unavailable) plus a runtime guard in `publishAsync`, so this code is
+    // unreachable in rc.17; the 0n placeholder only satisfies the now-required
+    // digest field. rc.18 allocates the number here and persists it on the
+    // LiftRequestAuthorSeal so the deferred-broadcast digest matches.
     const typedData = buildAuthorAttestationTypedData({
       chainId,
       kav10Address,
       contextGraphId: BigInt(onChainId),
       merkleRoot: canonical.kcMerkleRoot,
       authorAddress,
+      reservedKaId: 0n,
       schemeVersion: AUTHOR_SCHEME_VERSION_V1,
     });
 
@@ -1605,13 +1617,28 @@ export class PublishMethods extends DKGAgentBase {
             `breaks the author signature and is rejected.`,
         );
       }
-      // Seal exists and matches — return the existing record.
+      // Seal exists and matches — return the existing record. The rebuilt digest
+      // must bind the SAME reservedKaId the original signature committed to
+      // (§F2): prefer the value persisted on the seal; for a seal that predates
+      // the binding, repack from the lifecycle-URN kaId stamp.
+      let reReservedKaId = existingSeal.reservedKaId;
+      if (reReservedKaId === undefined) {
+        const reKaIdRes = await this.store.query(
+          `SELECT ?n WHERE { GRAPH <${metaGraph}> { <${assertionLifecycleUri(contextGraphId, agentAddress, name, opts?.subGraphName)}> <${KA_ID_PRED}> ?n } } LIMIT 1`,
+        );
+        const reNum =
+          reKaIdRes.type === 'bindings' && reKaIdRes.bindings[0]?.['n'] !== undefined
+            ? BigInt(String(reKaIdRes.bindings[0]['n']).replace(/^"/, '').replace(/"(\^\^<[^>]+>)?$/, '').trim())
+            : 0n;
+        reReservedKaId = (BigInt(ethers.getAddress(existingSeal.authorAddress)) << 96n) | reNum;
+      }
       const typedData = buildAuthorAttestationTypedData({
         chainId: existingSeal.chainId,
         kav10Address: existingSeal.kav10Address,
         contextGraphId: await this.requireOnChainContextGraphId(contextGraphId),
         merkleRoot: existingSeal.merkleRoot,
         authorAddress: existingSeal.authorAddress,
+        reservedKaId: reReservedKaId,
         schemeVersion: existingSeal.authorSchemeVersion,
       });
       return {
@@ -1688,13 +1715,69 @@ export class PublishMethods extends DKGAgentBase {
       authorAddress = fallbackAddress;
     }
 
-    // 8. Build EIP-712 typed data.
+    // ── OT-RFC-43 §F2 — resolve the reserved kaId BEFORE signing ──
+    // The AuthorAttestation digest now binds reservedKaId, so the packed id must
+    // be known before buildAuthorAttestationTypedData. This is the SINGLE
+    // allocation point (publishFromFinalizedAssertion REUSES it). Rules:
+    //   • preSigned author → honour the slot they signed over (no allocation);
+    //   • update of a previously-stamped name → reuse the stable existing number;
+    //   • fresh create with an allocator → reconcile-once then allocate ONE number;
+    //   • no allocator → 0n (non-Option-1; the on-chain namespace check rejects).
+    const lifecycleUri = assertionLifecycleUri(contextGraphId, agentAddress, name, opts?.subGraphName);
+    const xsdInteger = '<http://www.w3.org/2001/XMLSchema#integer>';
+    const existingKaIdRes = await this.store.query(
+      `SELECT ?n WHERE { GRAPH <${metaGraph}> { <${lifecycleUri}> <${KA_ID_PRED}> ?n } } LIMIT 1`,
+    );
+    const hasExistingKaId =
+      existingKaIdRes.type === 'bindings' && existingKaIdRes.bindings.length > 0;
+    const packReservedKaId = (addr: string, num: bigint): bigint =>
+      (BigInt(ethers.getAddress(addr)) << 96n) | num;
+    const parseStampedNumber = (raw: unknown): bigint =>
+      BigInt(String(raw).replace(/^"/, '').replace(/"(\^\^<[^>]+>)?$/, '').trim());
+    let reservedKaId: bigint;
+    // freshNumber is set ONLY when a NEW number must be stamped on the lifecycle
+    // URN (fresh create, or a preSigned author whose slot isn't yet stamped).
+    let freshNumber: bigint | undefined;
+    if (preSigned) {
+      reservedKaId = preSigned.reservedKaId;
+      freshNumber = hasExistingKaId ? undefined : reservedKaId & ((1n << 96n) - 1n);
+    } else if (hasExistingKaId) {
+      reservedKaId = packReservedKaId(authorAddress, parseStampedNumber(existingKaIdRes.bindings[0]['n']));
+    } else if (this.kaNumberAllocator) {
+      const key = authorAddress.toLowerCase();
+      if (!this.reconciledKaAuthors.has(key)) {
+        let chainMax = -1n;
+        if (typeof this.chain.getMaxKaNumberForAuthor === 'function') {
+          try {
+            chainMax = await this.chain.getMaxKaNumberForAuthor(authorAddress);
+          } catch (err) {
+            throw new Error(
+              `OT-RFC-43 A2: failed to reconcile KA-number floor for author ${authorAddress} at finalize: ` +
+                (err instanceof Error ? err.message : String(err)),
+            );
+          }
+        }
+        if (chainMax >= 0n) {
+          // Pass the bigint straight through (PR #976 F6) — `Number()` would lose precision past 2^53.
+          this.kaNumberAllocator.reconcile(authorAddress, chainMax);
+        }
+        this.kaNumberAllocator.markReconciled();
+        this.reconciledKaAuthors.add(key);
+      }
+      freshNumber = BigInt(this.kaNumberAllocator.allocate(authorAddress).number);
+      reservedKaId = packReservedKaId(authorAddress, freshNumber);
+    } else {
+      reservedKaId = 0n;
+    }
+
+    // 8. Build EIP-712 typed data (binds reservedKaId — OT-RFC-43 §F2).
     const typedData = buildAuthorAttestationTypedData({
       chainId,
       kav10Address,
       contextGraphId: onChainCgId,
       merkleRoot,
       authorAddress,
+      reservedKaId,
       schemeVersion,
     });
     const eip712Digest = ethers.TypedDataEncoder.hash(
@@ -1768,74 +1851,35 @@ export class PublishMethods extends DKGAgentBase {
       authorSchemeVersion: schemeVersion,
       chainId,
       kav10Address,
+      reservedKaId,
       finalizedAtIso,
       rootEntities,
     });
 
-    // ── OT-RFC-43 A2 — ALLOCATE-AT-FINALIZE + per-layer WM pointer ──
-    //
-    // This is the SINGLE source of truth for the packed kaId (eliminates the
-    // double-allocation the publish path used to do). If an allocator is
-    // present we reconcile its per-author floor once (lazy, cached on the
-    // agent), allocate the next (author, number), and stamp on the LIFECYCLE
-    // URN (NOT the assertion-graph URI):
+    // ── OT-RFC-43 A2 — stamp the per-author kaId + reservedUal + WM pointer ──
+    // The number was resolved/allocated ABOVE (single allocation, before the
+    // EIP-712 sign — OT-RFC-43 §F2). Here we only PERSIST it:
     //   dkg:kaId          = number (xsd:integer)
     //   dkg:reservedUal   = did:dkg:<chainId>/<agentAddrLower>/<number>
     //   dkg:wmCurrentAssertion = the seal merkle hex (bare, no 0x)
-    // publishFromFinalizedAssertion then READS dkg:kaId off `_meta` and
-    // threads it down so the publisher REUSES it instead of allocating again.
-    //
-    // We persist the WM pointer + kaId stamp atomically with the seal.
-    const lifecycleUri = assertionLifecycleUri(contextGraphId, agentAddress, name, opts?.subGraphName);
+    // publishFromFinalizedAssertion READS dkg:kaId off `_meta` and threads it
+    // down so the publisher REUSES it. freshNumber is set only for a fresh create
+    // (or a not-yet-stamped preSigned slot); an update of a previously-stamped
+    // name keeps its STABLE kaId — no re-stamp.
     const merkleHexBare = ethers.hexlify(merkleRoot).slice(2);
-
-    // Has this lifecycle ALREADY reserved a kaId? (An update to a name that
-    // was previously finalized + published — its kaId must stay STABLE across
-    // versions, so we MUST NOT allocate a fresh number and overwrite it.) The
-    // assertion-graph seal is cleared on discard+recreate, but the kaId stamp
-    // lives on the lifecycle URN and survives, so this is the reliable signal.
-    const xsdInteger = '<http://www.w3.org/2001/XMLSchema#integer>';
-    const existingKaIdRes = await this.store.query(
-      `SELECT ?n WHERE { GRAPH <${metaGraph}> { <${lifecycleUri}> <${KA_ID_PRED}> ?n } } LIMIT 1`,
-    );
-    const hasExistingKaId =
-      existingKaIdRes.type === 'bindings' && existingKaIdRes.bindings.length > 0;
-
     // Re-stamp the WM pointer (idempotent: drop any prior value first so a
     // re-finalize / update advances WM without accumulating stale pointers).
     await this._stampPointer(lifecycleUri, WM_CURRENT_ASSERTION_PRED, merkleHexBare, metaGraph);
 
-    if (this.kaNumberAllocator && !hasExistingKaId) {
-      const author = authorAddress;
-      const key = author.toLowerCase();
-      if (!this.reconciledKaAuthors.has(key)) {
-        let chainMax = -1n;
-        if (typeof this.chain.getMaxKaNumberForAuthor === 'function') {
-          try {
-            chainMax = await this.chain.getMaxKaNumberForAuthor(author);
-          } catch (err) {
-            throw new Error(
-              `OT-RFC-43 A2: failed to reconcile KA-number floor for author ${author} at finalize: ` +
-                (err instanceof Error ? err.message : String(err)),
-            );
-          }
-        }
-        if (chainMax >= 0n) {
-          // Pass the bigint straight through (PR #976 F6) — `Number()` would lose precision past 2^53.
-          this.kaNumberAllocator.reconcile(author, chainMax);
-        }
-        this.kaNumberAllocator.markReconciled();
-        this.reconciledKaAuthors.add(key);
-      }
-      const { number } = this.kaNumberAllocator.allocate(author);
+    if (freshNumber !== undefined) {
       // chainId here is the EVM uint256 from getEvmChainId(); the reservedUal
       // uses the adapter's canonical chainId string to match resolveKaUal's
       // UAL shape (did:dkg:<chainId>/<addr>/<number>).
-      const reservedUal = `did:dkg:${this.chain.chainId}/${author.toLowerCase()}/${number}`;
+      const reservedUal = `did:dkg:${this.chain.chainId}/${authorAddress.toLowerCase()}/${freshNumber}`;
       sealQuads.push({
         subject: lifecycleUri,
         predicate: KA_ID_PRED,
-        object: `"${number}"^^${xsdInteger}`,
+        object: `"${freshNumber}"^^${xsdInteger}`,
         graph: metaGraph,
       });
       sealQuads.push({
@@ -2025,12 +2069,46 @@ export class PublishMethods extends DKGAgentBase {
       authorAddress = fallbackAddress;
     }
 
+    // OT-RFC-43 §F2 — allocate the reserved kaId for this ephemeral selection
+    // publish and bind it into the signed digest; the publisher mints with this
+    // exact id (it travels on the returned precomputedAttestation). preSigned
+    // authors supply their own slot; with no allocator we fall to 0n (the on-chain
+    // namespace check then rejects).
+    let selReservedKaId: bigint;
+    if (preSigned) {
+      selReservedKaId = preSigned.reservedKaId;
+    } else if (this.kaNumberAllocator) {
+      const selKey = authorAddress.toLowerCase();
+      if (!this.reconciledKaAuthors.has(selKey)) {
+        let selChainMax = -1n;
+        if (typeof this.chain.getMaxKaNumberForAuthor === 'function') {
+          try {
+            selChainMax = await this.chain.getMaxKaNumberForAuthor(authorAddress);
+          } catch (err) {
+            throw new Error(
+              `OT-RFC-43 §F2: failed to reconcile KA-number floor for author ${authorAddress} (selection publish): ` +
+                (err instanceof Error ? err.message : String(err)),
+            );
+          }
+        }
+        if (selChainMax >= 0n) this.kaNumberAllocator.reconcile(authorAddress, selChainMax);
+        this.kaNumberAllocator.markReconciled();
+        this.reconciledKaAuthors.add(selKey);
+      }
+      selReservedKaId =
+        (BigInt(ethers.getAddress(authorAddress)) << 96n) |
+        BigInt(this.kaNumberAllocator.allocate(authorAddress).number);
+    } else {
+      selReservedKaId = 0n;
+    }
+
     const typedData = buildAuthorAttestationTypedData({
       chainId,
       kav10Address,
       contextGraphId: onChainCgId,
       merkleRoot,
       authorAddress,
+      reservedKaId: selReservedKaId,
       schemeVersion,
     });
     const eip712Digest = ethers.TypedDataEncoder.hash(
@@ -2088,6 +2166,7 @@ export class PublishMethods extends DKGAgentBase {
       authorAddress,
       signature: { r, vs },
       schemeVersion,
+      reservedKaId: selReservedKaId,
     };
   }
 
@@ -2699,7 +2778,7 @@ export class PublishMethods extends DKGAgentBase {
           publisherNodeIdentityIdOverride: opts?.publisherNodeIdentityIdOverride,
           publishEpochs: opts?.publishEpochs,
           clearSharedMemoryAfter: opts?.clearSharedMemoryAfter,
-          reservedKaId: packedKaId,
+          reservedKaId: seal.reservedKaId ?? packedKaId,
           // Wired through to the inner publisher.publish() via
           // publishFromSharedMemory's `precomputedAttestation` option.
           // Skips the publisher's signing entirely.
@@ -2708,6 +2787,9 @@ export class PublishMethods extends DKGAgentBase {
             authorAddress: seal.authorAddress,
             signature: { r: seal.authorAttestationR, vs: seal.authorAttestationVS },
             schemeVersion: seal.authorSchemeVersion,
+            // §F2 — the exact packed id the seal's signature committed to (prefer
+            // the persisted value; repacked URN kaId for legacy seals).
+            reservedKaId: seal.reservedKaId ?? packedKaId ?? 0n,
           },
         },
       );

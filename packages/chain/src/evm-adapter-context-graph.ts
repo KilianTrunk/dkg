@@ -309,10 +309,18 @@ export class ContextGraphMethods extends EVMChainAdapterBase {
       );
     }
 
-    // V9→V10 mirror: synthesize an RFC-001 author attestation using the
-    // V9 publish signer as the author of record. The signer is the same
-    // wallet that signed the V9 publisher digest above, so attribution
-    // stays consistent across the legacy/canonical pair.
+    // V9→V10 mirror — NOT SUPPORTED under OT-RFC-43 Option-1 / §F2. A V10
+    // Knowledge Asset id is author-namespaced and the AuthorAttestation digest
+    // binds the reserved packed kaId; this legacy mirror has no allocator and no
+    // reserved id to sign over, so it cannot synthesize a mintable attestation
+    // (the on-chain createKnowledgeAssets rejects a namespace-mismatched id).
+    // Publish through the V10 lifecycle (finalize → swm/share → vm/publish).
+    throw new Error(
+      'publishToContextGraph (V9→V10 mirror) is not supported under OT-RFC-43 Option-1: ' +
+        'publish through the V10 lifecycle (finalize → swm/share → vm/publish), which allocates ' +
+        'and binds the per-author reservedKaId into the author attestation.',
+    );
+    // Unreachable below (kept for type-completeness until the mirror is removed).
     const v10ChainId = (await this.provider.getNetwork()).chainId;
     const v10KavAddress = await this.contracts.knowledgeAssetsLifecycle!.getAddress();
     const authorTypedData = buildAuthorAttestationTypedData({
@@ -321,6 +329,7 @@ export class ContextGraphMethods extends EVMChainAdapterBase {
       contextGraphId: params.contextGraphId,
       merkleRoot: params.merkleRoot,
       authorAddress: signer.address,
+      reservedKaId: 0n,
     });
     const authorSig = ethers.Signature.from(
       await signer.signTypedData(

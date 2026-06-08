@@ -52,6 +52,17 @@ import {
 // `validateAssertionName`); we re-validate the name here so this standalone
 // handler matches the legacy contract byte-for-byte regardless of entry point.
 export async function handleKaShareAsyncEnqueue(ctx: RequestContext, name: string): Promise<void> {
+  // OT-RFC-43 §F2 — async share is DISABLED in this release: the AuthorAttestation
+  // digest now binds reservedKaId, and the async-lift seal does not yet allocate /
+  // persist it (deferred to the next release). Synchronous swm/share is fully
+  // supported; this gate guarantees no async-lift seal is ever persisted. Remove
+  // it when the async-lift wiring lands.
+  return jsonResponse(ctx.res, 501, {
+    error:
+      'Async share (swm/share-async) is not available in this release — use the synchronous ' +
+      'POST /api/knowledge-assets/:name/swm/share instead. (OT-RFC-43 §F2: async reservedKaId ' +
+      'binding is deferred to the next release.)',
+  });
   const { req, res, agent, requestToken } = ctx;
   const writePreflightCallerAgentAddress = requestToken
     ? agent.resolveAgentByToken(requestToken)

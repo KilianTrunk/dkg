@@ -319,6 +319,13 @@ export interface PublishOptions {
     authorAddress: string;
     signature: { r: Uint8Array; vs: Uint8Array };
     schemeVersion: number;
+    /**
+     * OT-RFC-43 §F2 — the packed reservedKaId the agent signed the
+     * AuthorAttestation over. The publisher REBUILDS the digest with this exact
+     * value to verify the seal, and mints with it, so the on-chain id matches
+     * the recovered signature. The agent is the single allocation point.
+     */
+    reservedKaId: bigint;
   };
   /**
    * RFC-001 greenfield — owner seal for on-chain `update`, produced before

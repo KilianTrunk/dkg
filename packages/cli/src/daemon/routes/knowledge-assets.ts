@@ -493,9 +493,15 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
       authorAgentAddress,
       preSignedAuthorAttestation,
       schemeVersion,
-      alsoShareSwm,
       alsoPublishVm,
     } = parsed;
+    // OT-RFC-43 migration alias: the legacy one-shot publish shape posts
+    // `promote: true` (ApiClient.publishAssertion, MCP publishQuads, OpenClaw
+    // publish, and network-sim still send { quads, finalize: true, promote: true }).
+    // Honor it as `alsoShareSwm` so those calls still promote WM→SWM — otherwise
+    // they seal WM but never promote, and a follow-up VM publish runs against an
+    // empty SWM and fails. An explicit `alsoShareSwm` wins when both are supplied.
+    const alsoShareSwm = parsed.alsoShareSwm ?? parsed.promote;
     if (!name) {
       return jsonResponse(res, 400, { error: 'Missing "name"' });
     }
@@ -674,8 +680,19 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
   if (method === "GET" && layer === "wm" && verb === "quads") {
     const p = readGetParams();
     if (!p) return;
+    // B3: ONLY a did:dkg / 0x<agent>:<number> kaId alias needs resolving to the
+    // lifecycle name before querying — otherwise the raw alias is passed as the
+    // assertion name and misses the real WM graph (parity with the sibling GETs).
+    // A plain name is queried directly (unchanged), so reads of a name-keyed WM
+    // draft still work even when no lifecycle descriptor exists yet.
+    let resolvedName = name;
+    if (classifyKaIdentifier(name).kind === "kaId") {
+      const hist = await resolveDescriptor(p.cg, p.subGraphName, p.agentAddress);
+      if (!hist) return jsonResponse(res, 404, { error: `No knowledge asset "${name}" in context graph "${p.cg}"` });
+      if (typeof hist.name === "string") resolvedName = hist.name;
+    }
     try {
-      const quads = await agent.assertion.query(p.cg, name, p.subGraphName ? { subGraphName: p.subGraphName } : undefined);
+      const quads = await agent.assertion.query(p.cg, resolvedName, p.subGraphName ? { subGraphName: p.subGraphName } : undefined);
       const sorted = [...quads].sort((l, r) => JSON.stringify(l).localeCompare(JSON.stringify(r)));
       return jsonResponse(res, 200, { quads: sorted, count: sorted.length });
     } catch (e: any) {

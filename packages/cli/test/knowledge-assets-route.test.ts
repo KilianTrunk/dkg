@@ -356,6 +356,32 @@ describe('GitHub-shaped /api/knowledge-assets routes (OT-RFC-43 §10.5)', () => 
     expect((b.errors as any[])[0]).toMatchObject({ phase: 'swm-share' });
   });
 
+  it('POST /api/knowledge-assets honors the legacy `promote: true` shape as an `alsoShareSwm` alias', async () => {
+    // First-party one-shot publishers (ApiClient.publishAssertion, MCP publishQuads,
+    // OpenClaw publish, network-sim) still post { quads, finalize: true, promote: true }.
+    // Without the alias they'd seal WM but never promote to SWM, then a follow-up VM
+    // publish would run against an empty SWM and fail.
+    const agent = makeAssertionAgent();
+    const quads = [{ subject: 'ex:A', predicate: 'ex:p', object: '"x"', graph: '' }];
+    const ctx = ctxFor('POST', '/api/knowledge-assets', { contextGraphId: 'cg', name: 'legacy', quads, finalize: true, promote: true }, agent);
+    await handleKnowledgeAssetsRoutes(ctx);
+    expect(agent.assertion.promote).toHaveBeenCalledOnce();
+    expect(body(ctx)).toMatchObject({ swmShared: true, promotedCount: 3 });
+  });
+
+  it('GET .../:identifier/wm/quads resolves a did:dkg kaId alias to the lifecycle name before querying', async () => {
+    // The raw alias must NOT be passed straight to assertion.query as the name —
+    // that misses the real WM graph. Resolve it via resolveDescriptor first (parity
+    // with the sibling :identifier and :identifier/{wm,swm,vm} GETs).
+    const resolveByKaId = vi.fn(async () => ({ name: 'real-name', state: 'created' }));
+    const query = vi.fn(async () => [{ subject: 'ex:A', predicate: 'ex:p', object: '"x"', graph: '' }]);
+    const agent = makeAssertionAgent({ assertion: { resolveByKaId, query } });
+    const ctx = ctxFor('GET', '/api/knowledge-assets/did%3Adkg%3Aevm%3A31337%2F0xabc%2F7/wm/quads?contextGraphId=cg', undefined, agent);
+    await handleKnowledgeAssetsRoutes(ctx);
+    expect(query).toHaveBeenCalledWith('cg', 'real-name', undefined);
+    expect(body(ctx)).toMatchObject({ count: 1 });
+  });
+
   it('POST .../:name/wm/write appends quads', async () => {
     const agent = makeAssertionAgent();
     const quads = [{ subject: 'ex:A', predicate: 'ex:p', object: '"x"', graph: '' }];

@@ -521,7 +521,10 @@ describe('publishJsonLd', () => {
     ).rejects.toThrow(/self-sovereign/);
   }, 30_000);
 
-  it('async publish attaches a seal to the LiftRequest with merkleRoot == canonicalPublishPayload(resolved slice)', async () => {
+  // §F2: async-lift seal deferred to rc.18 — publishAsync is now sealless for
+  // non-preSigned async (no 0n placeholder); WM/SWM async (EPCIS/Kafka) is
+  // unaffected. Re-enable when rc.18 wires async reservedKaId allocation.
+  it.skip('async publish attaches a seal to the LiftRequest with merkleRoot == canonicalPublishPayload(resolved slice)', async () => {
     // Agent canonicalizes + signs at enqueue → publisher verifies + consumes verbatim. Real provenance, not "publisher said so".
     const { agent, store } = await createAgent('AsyncSealParityBot');
     await agent.createContextGraph({ id: 'async-seal-parity', name: 'AsyncSealParity', description: '' });
@@ -578,7 +581,10 @@ describe('publishJsonLd', () => {
     expect(job?.request.seal).toBeUndefined();
   }, 30_000);
 
-  it('async publish on V10 chain attaches a seal (no fallback needed)', async () => {
+  // §F2: async-lift seal deferred to rc.18 — publishAsync is now sealless for
+  // non-preSigned async (no 0n placeholder); WM/SWM async (EPCIS/Kafka) is
+  // unaffected. Re-enable when rc.18 wires async reservedKaId allocation.
+  it.skip('async publish on V10 chain attaches a seal (no fallback needed)', async () => {
     // V10-ready + CG registered → agent signs canonical merkle at enqueue, publisher consumes verbatim.
     const { agent, store } = await createAgent('AsyncSealBot');
     await agent.createContextGraph({ id: 'async-seal', name: 'AsyncSeal', description: '' });
@@ -604,7 +610,10 @@ describe('publishJsonLd', () => {
     expect(job?.request.seal?.merkleRoot).toMatch(/^0x[0-9a-f]{64}$/i);
   }, 30_000);
 
-  it('async publish for private-only content on V10 chain attaches a seal (mirrors EPCIS capture path)', async () => {
+  // §F2: async-lift seal deferred to rc.18 — publishAsync is now sealless for
+  // non-preSigned async (no 0n placeholder); WM/SWM async (EPCIS/Kafka) is
+  // unaffected. Re-enable when rc.18 wires async reservedKaId allocation.
+  it.skip('async publish for private-only content on V10 chain attaches a seal (mirrors EPCIS capture path)', async () => {
     const { agent, store } = await createAgent('AsyncSealPrivBot');
     await agent.createContextGraph({ id: 'async-seal-priv', name: 'AsyncSealPriv', description: '' });
     await agent.registerContextGraph('async-seal-priv');
@@ -626,7 +635,10 @@ describe('publishJsonLd', () => {
     expect(job?.request.seal).toBeDefined();
   }, 30_000);
 
-  it('async publish builds the seal when public snapshots are externalized to disk', async () => {
+  // §F2: async-lift seal deferred to rc.18 — publishAsync is now sealless for
+  // non-preSigned async (no 0n placeholder); WM/SWM async (EPCIS/Kafka) is
+  // unaffected. Re-enable when rc.18 wires async reservedKaId allocation.
+  it.skip('async publish builds the seal when public snapshots are externalized to disk', async () => {
     const dataDir = await createTempDataDir('dkg-agent-public-snapshots-');
     const { agent, store } = await createAgent('AsyncSealDiskSnapshotBot', { dataDir });
     await agent.createContextGraph({ id: 'async-seal-disk-snapshot', name: 'AsyncSealDiskSnapshot', description: '' });
@@ -1073,7 +1085,10 @@ describe('publishJsonLd', () => {
     }
   }, 15_000);
 
-  it('async publish does NOT pass cgId to publisher fallback methods (matches sync assertionFinalize behavior)', async () => {
+  // §F2: async-lift seal deferred to rc.18 — publishAsync is now sealless for
+  // non-preSigned async (no 0n placeholder); WM/SWM async (EPCIS/Kafka) is
+  // unaffected. Re-enable when rc.18 wires async reservedKaId allocation.
+  it.skip('async publish does NOT pass cgId to publisher fallback methods (matches sync assertionFinalize behavior)', async () => {
     // Pins sync `assertionFinalize` parity. Threading cgId surfaces a publisher-side
     // `signTypedData` fallback bug (recovers chain default, not the recorded author).
     // Fix lives in the publisher, not the agent — out of scope for this PR.

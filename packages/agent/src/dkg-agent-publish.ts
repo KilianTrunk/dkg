@@ -1761,6 +1761,17 @@ export class PublishMethods extends DKGAgentBase {
         reservedKaId = stampedKaId;
         freshNumber = undefined;
       } else {
+        // Fresh slot: the caller-signed id MUST live in the author's own
+        // namespace (high 160 bits == author). Otherwise we'd persist a local
+        // seal + `_meta` for an id the on-chain mint later rejects with
+        // KaIdNamespaceMismatch — sealed locally, unpublishable. Reject here.
+        if ((preSigned.reservedKaId >> 96n) !== BigInt(ethers.getAddress(authorAddress))) {
+          throw new Error(
+            `assertionFinalize: preSignedAuthorAttestation reservedKaId namespace mismatch — ` +
+              `id ${preSigned.reservedKaId} is not in author ${ethers.getAddress(authorAddress)}'s ` +
+              `namespace. The packed kaId must be (uint160(author) << 96) | number (OT-RFC-43 §F2).`,
+          );
+        }
         reservedKaId = preSigned.reservedKaId;
         freshNumber = reservedKaId & ((1n << 96n) - 1n);
       }
@@ -2099,6 +2110,16 @@ export class PublishMethods extends DKGAgentBase {
     // namespace check then rejects).
     let selReservedKaId: bigint;
     if (preSigned) {
+      // Same namespace guard as assertionFinalize: the caller-signed id must be
+      // in the author's own namespace, or the publisher mints an id the chain
+      // rejects (KaIdNamespaceMismatch) after the seal is already built.
+      if ((preSigned.reservedKaId >> 96n) !== BigInt(ethers.getAddress(authorAddress))) {
+        throw new Error(
+          `Selection-based VM publish: preSignedAuthorAttestation reservedKaId namespace mismatch — ` +
+            `id ${preSigned.reservedKaId} is not in author ${ethers.getAddress(authorAddress)}'s ` +
+            `namespace (packed kaId must be (uint160(author) << 96) | number, OT-RFC-43 §F2).`,
+        );
+      }
       selReservedKaId = preSigned.reservedKaId;
     } else if (this.kaNumberAllocator) {
       const selKey = authorAddress.toLowerCase();

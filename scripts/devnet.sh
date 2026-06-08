@@ -593,11 +593,18 @@ start_node() {
     const cfgPath = process.env.NODE_DIR + '/config.json';
     const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
     if (process.env.RELAY_ARG) cfg.relay = process.env.RELAY_ARG;
-    const n = Number(process.env.NODE_NUM), cores = Number(process.env.NUM_CORE_NODES);
-    // core: earlier cores (mesh forms bidirectionally); edge: all cores (spoke).
-    const hi = (n <= cores) ? (n - 1) : cores;
+    const n = Number(process.env.NODE_NUM);
+    // Bootstrap targets are the CORE nodes among 1..n-1, read from each node's
+    // authoritative nodeRole — NOT the ordinal 'first NUM_CORE_NODES are cores',
+    // since cmd_addnode can spawn a core beyond NUM_CORE_NODES (via
+    // DEVNET_NODE_ROLE_OVERRIDE). A core thus meshes with every earlier core; an
+    // edge spokes to every earlier core. Connections are bidirectional, so a
+    // later-added core dials the earlier cores and joins the mesh.
     const peers = [];
-    for (let c = 1; c <= hi; c++) {
+    for (let c = 1; c < n; c++) {
+      let cRole = 'edge';
+      try { cRole = JSON.parse(fs.readFileSync(dir + '/node' + c + '/config.json', 'utf8')).nodeRole || 'edge'; } catch {}
+      if (cRole !== 'core') continue;
       try { const m = fs.readFileSync(dir + '/node' + c + '/multiaddr', 'utf8').trim(); if (m) peers.push(m); } catch {}
     }
     if (peers.length) cfg.bootstrapPeers = peers;
@@ -671,9 +678,19 @@ start_node() {
     local libp2p_port=$((LIBP2P_PORT_BASE + node_num - 1))
     echo "/ip4/127.0.0.1/tcp/${libp2p_port}/p2p/${peer_id}" > "$DEVNET_DIR/node${node_num}/multiaddr"
     log "Node $node_num multiaddr saved: /ip4/127.0.0.1/tcp/${libp2p_port}/p2p/${peer_id}"
-  elif [ "$node_num" -eq 1 ]; then
-    log "ERROR: Could not extract relay multiaddr for node 1 — aborting devnet start"
-    return 1
+  else
+    # A CORE that fails to publish its multiaddr is silently dropped from every
+    # later core's bootstrapPeers, degrading the mesh back to the gossip-only
+    # quorum path this topology exists to avoid — so abort on ANY core (not just
+    # node 1). Edges stay best-effort: a missing edge multiaddr just means it
+    # isn't a direct-dial target, and it still works via the relay + gossip.
+    local node_role="edge"
+    node_role=$(node -e "try{process.stdout.write(JSON.parse(require('fs').readFileSync('$node_dir/config.json','utf8')).nodeRole||'edge')}catch{process.stdout.write('edge')}" 2>/dev/null || echo edge)
+    if [ "$node_role" = "core" ]; then
+      log "ERROR: Could not extract multiaddr for CORE node $node_num — later cores would silently omit it from the direct mesh (gossip-only quorum). Aborting devnet start."
+      return 1
+    fi
+    log "WARNING: Could not extract multiaddr for edge node $node_num — not a direct-dial target (still reachable via gossip)."
   fi
 }
 

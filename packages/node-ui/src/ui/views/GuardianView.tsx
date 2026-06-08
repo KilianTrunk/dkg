@@ -197,6 +197,15 @@ type GuardianThreat = {
   severity: GuardianSeverity;
   type: string;
 };
+type ProtectedAgentDetail = {
+  key: string;
+  framework: string;
+  name: string;
+  events: number;
+  lastSeenAt: number;
+  recentEvents: GuardianEvent[];
+  findings: GuardianFinding[];
+};
 
 function severityClass(severity: string): string {
   return `guardian-severity-${severity || 'info'}`;
@@ -286,6 +295,18 @@ function eventInstanceLabel(event: GuardianEvent): string {
   return typeof instance === 'string' && instance.trim()
     ? displayText(instance, 120)
     : displayText(event.source_agent, 120);
+}
+
+function agentKey(framework: string, name: string): string {
+  return `${framework || 'unknown'}:${name || framework || 'unknown'}`;
+}
+
+function agentStatus(agent: Pick<ProtectedAgentDetail, 'events' | 'lastSeenAt'>): 'active' | 'seen' | 'stale' | 'offline' {
+  if (agent.events <= 0) return 'offline';
+  const age = Date.now() - agent.lastSeenAt;
+  if (age < 120_000) return 'active';
+  if (age < 86_400_000) return 'seen';
+  return 'stale';
 }
 
 function commandFromEvent(event: GuardianEvent): string {
@@ -378,6 +399,35 @@ function findingAction(finding: GuardianFinding, event?: GuardianEvent): string 
   const path = displayText(evidence.path, 300);
   if (path) return path;
   return event ? (promptFromEvent(event) || displayText(event.summary, 300)) : '';
+}
+
+function eventAction(event: GuardianEvent): { label: string; value: string } | null {
+  const command = commandFromEvent(event);
+  if (command) return { label: 'Command', value: command };
+  const prompt = promptFromEvent(event);
+  if (prompt) return { label: 'Prompt / context', value: prompt };
+  const output = resultOutputFromEvent(event);
+  if (output) return { label: 'Result', value: output };
+  const summary = displayText(event.summary, 420);
+  return summary ? { label: 'Summary', value: summary } : null;
+}
+
+function statusLabel(status: ReturnType<typeof agentStatus>): string {
+  if (status === 'active') return 'active now';
+  if (status === 'seen') return 'recent';
+  if (status === 'stale') return 'stale';
+  return 'not connected';
+}
+
+function topAgentFindingSeverity(agent: ProtectedAgentDetail): GuardianSeverity | null {
+  return topFindingSeverity(agent.findings);
+}
+
+function agentRiskLabel(agent: ProtectedAgentDetail): string {
+  const severity = topAgentFindingSeverity(agent);
+  if (severity) return `${severity} findings`;
+  if (agent.events > 0) return 'no open findings';
+  return 'waiting for telemetry';
 }
 
 function publishDisplay(status: GuardianDependencyIntel['publish_status'] | GuardianGraphSync['status'], error?: string | null) {
@@ -544,6 +594,215 @@ function DependencyRow({ intel }: { intel: GuardianDependencyIntel }) {
   );
 }
 
+function ProtectedAgentsModal({
+  agents,
+  onClose,
+}: {
+  agents: ProtectedAgentDetail[];
+  onClose: () => void;
+}) {
+  const sortedAgents = useMemo(() => [...agents].sort((a, b) => {
+    const statusWeight = (agent: ProtectedAgentDetail) => {
+      const status = agentStatus(agent);
+      if (status === 'active') return 3;
+      if (status === 'seen') return 2;
+      if (status === 'stale') return 1;
+      return 0;
+    };
+    const statusDelta = statusWeight(b) - statusWeight(a);
+    if (statusDelta !== 0) return statusDelta;
+    const severityDelta = severityRank(topAgentFindingSeverity(b) ?? 'info') - severityRank(topAgentFindingSeverity(a) ?? 'info');
+    if (severityDelta !== 0) return severityDelta;
+    return b.lastSeenAt - a.lastSeenAt || a.name.localeCompare(b.name);
+  }), [agents]);
+  const [selectedKey, setSelectedKey] = useState<string | null>(sortedAgents[0]?.key ?? null);
+  const selectedAgent = sortedAgents.find((agent) => agent.key === selectedKey) ?? sortedAgents[0];
+  const recentAgents = sortedAgents.filter((agent) => {
+    const status = agentStatus(agent);
+    return status === 'active' || status === 'seen';
+  });
+  const historicalAgents = sortedAgents.filter((agent) => {
+    const status = agentStatus(agent);
+    return status === 'stale' || status === 'offline';
+  });
+  const activeCount = sortedAgents.filter((agent) => agentStatus(agent) === 'active').length;
+  const recentCount = recentAgents.length;
+  const openFindingCount = sortedAgents.reduce((total, agent) => total + agent.findings.length, 0);
+  const lastEventAt = sortedAgents.reduce((last, agent) => Math.max(last, agent.lastSeenAt || 0), 0);
+  const selectedEvents = selectedAgent
+    ? [...selectedAgent.recentEvents].sort((a, b) => b.ts - a.ts).slice(0, 8)
+    : [];
+  const selectedFindings = selectedAgent
+    ? [...selectedAgent.findings].sort((a, b) => b.ts - a.ts).slice(0, 6)
+    : [];
+  const renderAgentButton = (agent: ProtectedAgentDetail) => {
+    const status = agentStatus(agent);
+    const severity = topAgentFindingSeverity(agent);
+    return (
+      <button
+        key={agent.key}
+        type="button"
+        className={`guardian-agent-picker-row${selectedAgent?.key === agent.key ? ' selected' : ''}`}
+        onClick={() => setSelectedKey(agent.key)}
+      >
+        <div className="guardian-agent-icon"><Bot size={16} /></div>
+        <div className="guardian-agent-picker-main">
+          <span>{agent.name}</span>
+          <small>{agent.framework} - {agent.events} logged actions - {timeAgo(agent.lastSeenAt)}</small>
+        </div>
+        <div className="guardian-agent-picker-badges">
+          {severity ? <span className={`guardian-pill ${severityClass(severity)}`}>{severity}</span> : null}
+          <em className={`guardian-agent-state ${status}`}>{statusLabel(status)}</em>
+        </div>
+      </button>
+    );
+  };
+  return (
+    <div className="guardian-modal-backdrop" role="presentation" onClick={onClose}>
+      <div
+        className="guardian-modal guardian-agent-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Protected agents"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="guardian-modal-head">
+          <div>
+            <h2>Protected Agents</h2>
+            <p>See which local agents Guardian is observing, what they did, and which actions created findings.</p>
+          </div>
+          <button className="guardian-icon-button" type="button" onClick={onClose} aria-label="Close"><X size={15} /></button>
+        </div>
+        <div className="guardian-agent-summary-strip">
+          <div>
+            <span>Recent agents</span>
+            <strong>{recentCount}</strong>
+          </div>
+          <div>
+            <span>Active now</span>
+            <strong>{activeCount}</strong>
+          </div>
+          <div>
+            <span>Open findings</span>
+            <strong>{openFindingCount}</strong>
+          </div>
+          <div>
+            <span>Last telemetry</span>
+            <strong>{timeAgo(lastEventAt)}</strong>
+          </div>
+        </div>
+        <div className="guardian-agent-modal-body">
+          <aside className="guardian-agent-picker" aria-label="Observed agents">
+            <div className="guardian-agent-picker-head">
+              <span>Observed Agents</span>
+              <em>{recentCount} recent / {historicalAgents.length} historical</em>
+            </div>
+            <div className="guardian-agent-picker-section">Recent telemetry</div>
+            {recentAgents.length > 0 ? recentAgents.map(renderAgentButton) : <div className="guardian-agent-picker-empty">No recent agent telemetry in the last 24 hours.</div>}
+            <div className="guardian-agent-picker-section">Historical profiles</div>
+            {historicalAgents.length > 0 ? historicalAgents.map(renderAgentButton) : <div className="guardian-agent-picker-empty">No historical profiles yet.</div>}
+          </aside>
+
+          <section className="guardian-agent-inspector">
+            {selectedAgent ? (
+              <>
+                <div className="guardian-agent-inspector-head">
+                  <div>
+                    <h3>{selectedAgent.name}</h3>
+                    <p>{selectedAgent.framework} agent profile - {agentRiskLabel(selectedAgent)}</p>
+                  </div>
+                  <span className={`guardian-agent-state ${agentStatus(selectedAgent)}`}>{statusLabel(agentStatus(selectedAgent))}</span>
+                </div>
+
+                <div className="guardian-agent-detail-metrics">
+                  <div>
+                    <span>Logged actions</span>
+                    <strong>{selectedAgent.events}</strong>
+                  </div>
+                  <div>
+                    <span>Open findings</span>
+                    <strong>{selectedAgent.findings.length}</strong>
+                  </div>
+                  <div>
+                    <span>Last seen</span>
+                    <strong>{timeAgo(selectedAgent.lastSeenAt)}</strong>
+                  </div>
+                </div>
+
+                <div className="guardian-agent-section">
+                  <div className="guardian-agent-section-title">What This Agent Did</div>
+                  {selectedEvents.length === 0 ? (
+                    <div className="guardian-agent-empty">No events received for this agent yet.</div>
+                  ) : (
+                    <div className="guardian-agent-action-list">
+                      {selectedEvents.map((event) => {
+                        const action = eventAction(event);
+                        const findingSeverity = topFindingSeverity(selectedFindings.filter((finding) => finding.event_id === event.id));
+                        const effectiveSeverity = findingSeverity ?? event.severity;
+                        return (
+                          <div key={event.id} className="guardian-agent-action-row">
+                            <div className={`guardian-severity-dot ${severityClass(effectiveSeverity)}`} />
+                            <div className="guardian-agent-action-main">
+                              <div className="guardian-agent-action-title">
+                                <span>{event.title}</span>
+                                <div className="guardian-agent-action-tags">
+                                  <em>{eventKind(event)}</em>
+                                  <span className={`guardian-pill ${severityClass(effectiveSeverity)}`}>{effectiveSeverity}</span>
+                                </div>
+                              </div>
+                              <div className="guardian-row-meta">
+                                <span>{event.tool_name || event.event_type}</span>
+                                <span>{eventInstanceLabel(event)}</span>
+                                <span>{timeAgo(event.ts)}</span>
+                              </div>
+                              {action && (
+                                <div className="guardian-agent-action-evidence">
+                                  <span>{action.label}</span>
+                                  <pre>{displayText(action.value, 700)}</pre>
+                                </div>
+                              )}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+
+                <div className="guardian-agent-section">
+                  <div className="guardian-agent-section-title">Why Guardian Flagged It</div>
+                  {selectedFindings.length === 0 ? (
+                    <div className="guardian-agent-empty guardian-agent-empty-good">No open findings for this agent.</div>
+                  ) : (
+                    <div className="guardian-agent-finding-list">
+                      {selectedFindings.map((finding) => {
+                        const event = finding.event_id ? selectedEvents.find((candidate) => candidate.id === finding.event_id) : undefined;
+                        return (
+                        <div key={finding.id} className="guardian-agent-finding-row">
+                          <span className={`guardian-pill ${severityClass(finding.severity)}`}>{finding.severity}</span>
+                          <div>
+                            <strong>{finding.title}</strong>
+                            <p>{displayText(finding.summary, 360)}</p>
+                            {event ? <small>{eventKind(event)} - {timeAgo(finding.ts)}</small> : <small>{timeAgo(finding.ts)}</small>}
+                            <div className="guardian-agent-remediation">{displayText(finding.recommendation, 360)}</div>
+                          </div>
+                        </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              </>
+            ) : (
+              <div className="guardian-agent-empty">No supported agents found yet.</div>
+            )}
+          </section>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function PromptModal({
   prompt,
   onClose,
@@ -605,6 +864,7 @@ export function GuardianView() {
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [fixPrompt, setFixPrompt] = useState<string | null>(null);
+  const [protectedAgentsOpen, setProtectedAgentsOpen] = useState(false);
   const [auditBusy, setAuditBusy] = useState(false);
   const [dependencyAuditMessage, setDependencyAuditMessage] = useState<string | null>(null);
 
@@ -694,18 +954,6 @@ export function GuardianView() {
     return () => clearInterval(iv);
   }, [load]);
 
-  const protectedAgents = useMemo(() => {
-    const seen = new Map<string, { framework: string; name: string; events: number; lastSeenAt: number }>();
-    for (const agent of summary?.agents ?? []) seen.set(agent.framework, agent);
-    for (const framework of ['hermes', 'openclaw']) {
-      if (!seen.has(framework)) seen.set(framework, { framework, name: framework, events: 0, lastSeenAt: 0 });
-    }
-    return [...seen.values()].sort((a, b) => {
-      const idx = (v: string) => (v === 'hermes' ? 0 : v === 'openclaw' ? 1 : 2);
-      return idx(a.framework) - idx(b.framework) || b.lastSeenAt - a.lastSeenAt;
-    });
-  }, [summary?.agents]);
-
   const topSeverity = useMemo(() => {
     const by = summary?.bySeverity;
     if (!by) return 'info';
@@ -717,6 +965,62 @@ export function GuardianView() {
     for (const event of events) map.set(event.id, event);
     return map;
   }, [events]);
+
+  const protectedAgents = useMemo<ProtectedAgentDetail[]>(() => {
+    const groups = new Map<string, ProtectedAgentDetail>();
+    const ensureAgent = (framework: string, name: string): ProtectedAgentDetail => {
+      const normalizedFramework = framework || 'unknown';
+      const normalizedName = name || normalizedFramework;
+      const key = agentKey(normalizedFramework, normalizedName);
+      const existing = groups.get(key);
+      if (existing) return existing;
+      const created: ProtectedAgentDetail = {
+        key,
+        framework: normalizedFramework,
+        name: normalizedName,
+        events: 0,
+        lastSeenAt: 0,
+        recentEvents: [],
+        findings: [],
+      };
+      groups.set(key, created);
+      return created;
+    };
+
+    for (const agent of summary?.agents ?? []) {
+      const detail = ensureAgent(agent.framework, agent.name || agent.framework);
+      detail.events = Math.max(detail.events, agent.events);
+      detail.lastSeenAt = Math.max(detail.lastSeenAt, agent.lastSeenAt || 0);
+    }
+
+    for (const event of events) {
+      const name = event.source_agent || event.agent_framework;
+      const detail = ensureAgent(event.agent_framework, name);
+      detail.recentEvents.push(event);
+      detail.events = Math.max(detail.events, detail.recentEvents.length);
+      detail.lastSeenAt = Math.max(detail.lastSeenAt, event.ts || event.updated_at || 0);
+    }
+
+    for (const finding of findings) {
+      if (!finding.event_id) continue;
+      const event = eventById.get(finding.event_id);
+      if (!event) continue;
+      const name = event.source_agent || event.agent_framework;
+      ensureAgent(event.agent_framework, name).findings.push(finding);
+    }
+
+    for (const framework of ['hermes', 'openclaw']) {
+      const hasFramework = [...groups.values()].some((agent) => agent.framework === framework);
+      if (!hasFramework) ensureAgent(framework, framework);
+    }
+
+    return [...groups.values()].sort((a, b) => {
+      const idx = (v: string) => (v === 'hermes' ? 0 : v === 'openclaw' ? 1 : 2);
+      return idx(a.framework) - idx(b.framework) || b.lastSeenAt - a.lastSeenAt || a.name.localeCompare(b.name);
+    });
+  }, [eventById, events, findings, summary?.agents]);
+
+  const connectedAgentCount = protectedAgents.filter((agent) => agent.events > 0).length;
 
   const openGraph = useCallback((graph: GuardianGraphSync) => {
     const graphId = graph.context_graph_id;
@@ -759,6 +1063,10 @@ export function GuardianView() {
         <div className="guardian-actions">
           <button type="button" className="guardian-button" onClick={() => load(true)} disabled={refreshing}>
             <RefreshCw size={15} className={refreshing ? 'guardian-spin' : ''} /> Refresh
+          </button>
+          <button type="button" className="guardian-button" onClick={() => setProtectedAgentsOpen(true)}>
+            <Bot size={15} /> Protected Agents
+            <span className="guardian-button-count">{connectedAgentCount}/{protectedAgents.length}</span>
           </button>
           <button
             type="button"
@@ -936,28 +1244,6 @@ export function GuardianView() {
           )}
         </div>
 
-        <div className="guardian-panel guardian-panel-agents">
-          <div className="guardian-panel-head">
-            <h2>Protected Agents</h2>
-          </div>
-          <div className="guardian-agent-list">
-            {protectedAgents.map((agent) => (
-              <div key={agent.framework} className="guardian-agent-row">
-                <div className="guardian-agent-icon"><Bot size={16} /></div>
-                <div>
-                  <div className="guardian-agent-name">
-                    <span>{agent.framework}</span>
-                    <em className={`guardian-agent-state ${agent.events > 0 ? (Date.now() - agent.lastSeenAt < 120_000 ? 'active' : 'seen') : 'offline'}`}>
-                      {agent.events > 0 ? (Date.now() - agent.lastSeenAt < 120_000 ? 'active' : 'seen') : 'not connected'}
-                    </em>
-                  </div>
-                  <small>{agent.events} events - {timeAgo(agent.lastSeenAt)}</small>
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
-
         <div className="guardian-panel guardian-panel-graphs">
           <div className="guardian-panel-head">
             <h2>Graphs</h2>
@@ -1005,6 +1291,7 @@ export function GuardianView() {
         </div>
       </section>
 
+      {protectedAgentsOpen && <ProtectedAgentsModal agents={protectedAgents} onClose={() => setProtectedAgentsOpen(false)} />}
       {fixPrompt && <PromptModal prompt={fixPrompt} onClose={() => setFixPrompt(null)} />}
     </div>
   );

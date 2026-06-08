@@ -60,7 +60,7 @@ describe("DkgNodePlugin", () => {
         sub_graph_name: 'protocols',
       });
       const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-      expect(url).toBe('http://localhost:9200/api/assertion/create');
+      expect(url).toBe('http://localhost:9200/api/knowledge-assets');
       expect(JSON.parse(init.body as string)).toEqual({
         contextGraphId: 'ctx',
         name: 'chat-turns',
@@ -78,7 +78,7 @@ describe("DkgNodePlugin", () => {
         sub_graph_name: 'protocols',
       });
       const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-      expect(url).toBe('http://localhost:9200/api/assertion/import-artifact/resolve');
+      expect(url).toBe('http://localhost:9200/api/knowledge-assets/import-artifact/resolve');
       expect(JSON.parse(init.body as string)).toEqual({
         contextGraphId: 'ctx',
         assertionUri: 'did:dkg:context-graph:ctx/assertion/peer/imported',
@@ -96,7 +96,7 @@ describe("DkgNodePlugin", () => {
         max_bytes: 4096,
       });
       const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-      expect(url).toBe('http://localhost:9200/api/assertion/import-artifact/read-markdown');
+      expect(url).toBe('http://localhost:9200/api/knowledge-assets/import-artifact/read-markdown');
       expect(JSON.parse(init.body as string)).toEqual({
         contextGraphId: 'ctx',
         assertionUri: 'did:dkg:context-graph:ctx/assertion/peer/imported',
@@ -140,7 +140,7 @@ describe("DkgNodePlugin", () => {
         generated_at: '2026-05-11T00:00:00.000Z',
       });
       const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-      expect(url).toBe('http://localhost:9200/api/assertion/semantic-enrichment/write');
+      expect(url).toBe('http://localhost:9200/api/knowledge-assets/semantic-enrichment/write');
       const body = JSON.parse(init.body as string);
       expect(body).toEqual({
         contextGraphId: 'ctx',
@@ -385,7 +385,7 @@ describe("DkgNodePlugin", () => {
     });
 
 
-    it('dkg_assertion_query forwards snake_case → camelCase body (no sparql)', async () => {
+    it('dkg_assertion_query forwards snake_case → camelCase query params (GET wm/quads, no sparql)', async () => {
       const { fetchMock, byName } = setupPluginWithFetch({ quads: [], count: 0 });
       await byName.get('dkg_assertion_query')!.execute('tc', {
         context_graph_id: 'ctx',
@@ -393,10 +393,15 @@ describe("DkgNodePlugin", () => {
         sub_graph_name: 'protocols',
       });
       const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-      expect(url).toBe('http://localhost:9200/api/assertion/notes/query');
-      const body = JSON.parse(init.body as string);
-      expect(body).toEqual({ contextGraphId: 'ctx', subGraphName: 'protocols' });
-      expect(body).not.toHaveProperty('sparql');
+      // rc.17 KA-routes-unification: ad-hoc assertion reads moved to the unified
+      // GET /api/knowledge-assets/{name}/wm/quads, with args as camelCase query
+      // params (was POST /api/assertion/{name}/query with a JSON body).
+      const parsed = new URL(String(url));
+      expect(parsed.pathname).toBe('/api/knowledge-assets/notes/wm/quads');
+      expect(parsed.searchParams.get('contextGraphId')).toBe('ctx');
+      expect(parsed.searchParams.get('subGraphName')).toBe('protocols');
+      expect(parsed.searchParams.has('sparql')).toBe(false);
+      expect(init.body).toBeUndefined();
     });
 
 
@@ -410,8 +415,9 @@ describe("DkgNodePlugin", () => {
       });
       const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
       const parsed = new URL(String(url));
-      // Read stays on the legacy assertion route to keep author scoping.
-      expect(parsed.pathname).toBe('/api/assertion/notes/history');
+      // rc.17 KA-routes-unification: history reads moved to the unified KA route;
+      // author scoping is preserved via the agentAddress query param.
+      expect(parsed.pathname).toBe('/api/knowledge-assets/notes');
       expect(parsed.searchParams.get('contextGraphId')).toBe('ctx');
       expect(parsed.searchParams.get('agentAddress')).toBe('0xabc');
       expect(parsed.searchParams.get('subGraphName')).toBe('protocols');
@@ -436,7 +442,7 @@ describe("DkgNodePlugin", () => {
         sub_graph_name: 'protocols',
       });
       const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-      expect(url).toBe('http://localhost:9200/api/assertion/notes/import-file');
+      expect(url).toBe('http://localhost:9200/api/knowledge-assets/notes/wm/import-file');
       expect(init.method).toBe('POST');
       const form = init.body as FormData;
       expect(form).toBeInstanceOf(FormData);

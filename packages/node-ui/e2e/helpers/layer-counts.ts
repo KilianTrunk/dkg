@@ -109,34 +109,33 @@ export async function findWmAssertion(
   nameSubstring: string,
   nodeNum = 1,
 ): Promise<WmAssertion> {
-  const cgPrefix = `did:dkg:context-graph:${contextGraphId}/`;
-  const sparql = `SELECT DISTINCT ?g WHERE {
-    GRAPH ?g { ?s ?p ?o }
-    FILTER(STRSTARTS(STR(?g), "${cgPrefix}")
-      && CONTAINS(STR(?g), "/assertion/")
-      && CONTAINS(STR(?g), "${nameSubstring}")
-      && !CONTAINS(STR(?g), "/meta/assertion/"))
+  // rc.17 per-KA WM data graphs are number-keyed (…/_working_memory/{addr}/{number}), so the
+  // assertion NAME no longer appears in the data-graph URI. Resolve through the lifecycle URN
+  // (urn:dkg:assertion:…:{name}, which DOES carry the name) and its dkg:assertionGraph pointer
+  // to the per-KA data graph. (Legacy name-keyed …/assertion/{addr}/{name} graphs still resolve
+  // — their URN carries the same pointer.)
+  const metaGraph = `did:dkg:context-graph:${contextGraphId}/_meta`;
+  const sparql = `SELECT ?urn ?dg WHERE {
+    GRAPH <${metaGraph}> {
+      ?urn <http://dkg.io/ontology/memoryLayer> "WM" ;
+           <http://dkg.io/ontology/assertionGraph> ?dg .
+      FILTER(CONTAINS(STR(?urn), "${nameSubstring}"))
+    }
   }`;
-  // Sort by the assertion-NAME segment (the last path component), NOT the full
-  // graph URI. URIs are `.../assertion/<agent>/<name>`, so a raw string sort
-  // orders by the <agent> segment first and could pick an older assertion from
-  // a DIFFERENT agent on a shared devnet — the rest of the spec would then read
-  // counts/markers from the wrong graph. The trailing name is the stable
-  // per-import key (and the only field that varies for this test's own imports).
-  const assertionNameOf = (uri: string) => uri.split('/').pop() ?? uri;
-  const graphs = bindingValues(await runQuery(contextGraphId, sparql, nodeNum), 'g').sort(
-    (a, b) => {
-      const an = assertionNameOf(a);
-      const bn = assertionNameOf(b);
-      return an < bn ? -1 : an > bn ? 1 : 0;
-    },
-  );
-  const dataGraphUri = graphs[graphs.length - 1];
-  if (!dataGraphUri) {
-    throw new Error(`findWmAssertion: no assertion data graph contains "${nameSubstring}" in CG ${contextGraphId}`);
+  const json = await runQuery(contextGraphId, sparql, nodeNum);
+  // Assertion names are timestamp-suffixed → lexical max of the URN is newest.
+  const rows = ((json?.result?.bindings ?? json?.results?.bindings ?? []) as any[])
+    .map((b) => ({
+      urn: (typeof b.urn === 'string' ? b.urn : b.urn?.value) as string | undefined,
+      dg: (typeof b.dg === 'string' ? b.dg : b.dg?.value) as string | undefined,
+    }))
+    .filter((r): r is { urn: string; dg: string } => !!r.urn && !!r.dg)
+    .sort((a, b) => (a.urn < b.urn ? -1 : a.urn > b.urn ? 1 : 0));
+  const pick = rows[rows.length - 1];
+  if (!pick) {
+    throw new Error(`findWmAssertion: no WM assertion URN contains "${nameSubstring}" in CG ${contextGraphId}`);
   }
-  const name = dataGraphUri.split('/').pop() ?? dataGraphUri;
-  return { name, dataGraphUri, markerUri: deriveMarkerUri(dataGraphUri) };
+  return { name: pick.urn.split(':').pop() ?? pick.urn, dataGraphUri: pick.dg, markerUri: pick.urn };
 }
 
 /**

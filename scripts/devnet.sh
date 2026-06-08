@@ -1033,9 +1033,21 @@ cmd_start() {
         // awaits costs one extra eth_call per tx, which is negligible
         // for a 6-node devnet bootstrap.
         const sendWithFreshNonce = async (txFactory) => {
-          const freshNonce = await provider.getTransactionCount(opSigner.address, 'pending');
-          const tx = await txFactory(freshNonce);
-          return tx.wait();
+          // Retry on the daemon racing our nonce (it shares this op wallet and may
+          // submit between our 'pending' read and our send) or a transient revert:
+          // re-read 'pending' and resend, backing off, before giving up.
+          let lastErr;
+          for (let attempt = 0; attempt < 4; attempt++) {
+            try {
+              const freshNonce = await provider.getTransactionCount(opSigner.address, 'pending');
+              const tx = await txFactory(freshNonce);
+              return await tx.wait();
+            } catch (e) {
+              lastErr = e;
+              await new Promise(r => setTimeout(r, 800 + attempt * 600));
+            }
+          }
+          throw lastErr;
         };
         // Codex round 4 on PR #368: skip createConviction if the daemon
         // already opened a position. PR 366 wired EVMChainAdapter.ensureProfile()
@@ -1105,6 +1117,24 @@ cmd_start() {
         } catch (e) { console.log('Ask failed for node ' + (i+1) + ': ' + e.message); }
       }
       console.log('Staked 50k TRAC for ' + staked + '/' + coreCount + ' core node(s), ask set for ' + asked + '/' + coreCount);
+      // The daemon's own ensureProfile stake can land AFTER this loop (it shares the
+      // op wallet; our probe raced it, then our createConviction reverted as a duplicate
+      // 0x7000ca77). Re-probe all core identities (poll up to ~30s) before the FATAL gate
+      // so a daemon-side stake that won the race still counts and we don't abort the boot
+      // (and skip CG registration) over a timing artifact.
+      if (staked < coreCount) {
+        for (let poll = 0; poll < 15 && staked < coreCount; poll++) {
+          await new Promise(r => setTimeout(r, 2000));
+          let restaked = 0;
+          for (const i of coreIdxs) {
+            const idId2 = nodeIds[i] || await identity.getIdentityId(opSigners[i].address);
+            if (idId2 === 0n) continue;
+            try { if ((await css.getNodeStakeV10(idId2)) > 0n) restaked++; } catch (_) {}
+          }
+          staked = restaked;
+        }
+        console.log('Re-probed core stakes after settle: ' + staked + '/' + coreCount);
+      }
       // Defense-in-depth: a partial-stake bootstrap (probe failure +
       // skip, or createConviction revert + skip) currently logs
       // 'staked X/Y' and continues. Operators may miss the count

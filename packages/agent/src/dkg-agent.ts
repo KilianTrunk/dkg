@@ -1666,7 +1666,7 @@ export class DKGAgent extends DKGAgentBase {
     const agent = this;
     const agentAddress = this.defaultAgentAddress ?? this.peerId;
     return {
-      async create(contextGraphId: string, name: string, opts?: { subGraphName?: string }): Promise<string> {
+      async create(contextGraphId: string, name: string, opts?: { subGraphName?: string; agentAddress?: string }): Promise<string> {
         // D1 (identity-at-create): mint the KA number/UAL at create so the UAL is the
         // KA's identity from the first write. assertionCreate only allocates when the
         // draft has no preserved kaId (the re-open guard lives there), so passing the
@@ -1677,11 +1677,16 @@ export class DKGAgent extends DKGAgentBase {
         // (`ethers.getAddress` throws). A peerId-author draft falls back to the legacy
         // name-keyed WM graph instead of hard-failing create. Mirrors the publisher's
         // own self-allocation guard.
-        const isEvmAuthor = /^0x[a-fA-F0-9]{40}$/.test(agentAddress);
+        // Allow an explicit author (the daemon's import-file route acts for the request's
+        // agent) so the kaNumber mints for the RIGHT address and data lands in that agent's
+        // per-KA …/_working_memory/{addr}/{number} graph (not the default agent's, and not
+        // the legacy name-keyed fallback used when no number is minted).
+        const author = opts?.agentAddress ?? agentAddress;
+        const isEvmAuthor = /^0x[a-fA-F0-9]{40}$/.test(author);
         const allocateKaNumber = agent.kaNumberAllocator && isEvmAuthor
-          ? () => reconcileAndAllocateKaNumber(agent.kaNumberAllocator!, agent.chain, agent.reconciledKaAuthors, agentAddress)
+          ? () => reconcileAndAllocateKaNumber(agent.kaNumberAllocator!, agent.chain, agent.reconciledKaAuthors, author)
           : undefined;
-        return agent.publisher.assertionCreate(contextGraphId, name, agentAddress, opts?.subGraphName, { allocateKaNumber });
+        return agent.publisher.assertionCreate(contextGraphId, name, author, opts?.subGraphName, { allocateKaNumber });
       },
 
       /**

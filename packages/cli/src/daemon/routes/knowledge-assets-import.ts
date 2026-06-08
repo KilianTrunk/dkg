@@ -833,11 +833,13 @@ export async function handleKaImportFile(ctx: RequestContext, name: string): Pro
       }
 
       try {
-        await agent.publisher.assertionCreate(
+        // Use the allocating create (mints the kaNumber for requestAgentAddress) so the
+        // subsequent wmGraphUri resolves the per-KA …/_working_memory/{addr}/{number} graph
+        // instead of falling back to the legacy name-keyed graph the WM view can't read.
+        await agent.assertion.create(
           contextGraphId!,
           assertionName,
-          requestAgentAddress,
-          subGraphName,
+          { subGraphName, agentAddress: requestAgentAddress },
         );
       } catch (err: any) {
         const message = err?.message ?? String(err);
@@ -1370,11 +1372,13 @@ export async function handleKaImportFile(ctx: RequestContext, name: string): Pro
       // registration check, so bypassing `assertion.write` below doesn't
       // skip that safety gate.
       try {
-        await agent.publisher.assertionCreate(
+        // Use the allocating create (mints the kaNumber for requestAgentAddress) so the
+        // subsequent wmGraphUri resolves the per-KA …/_working_memory/{addr}/{number} graph
+        // instead of falling back to the legacy name-keyed graph the WM view can't read.
+        await agent.assertion.create(
           contextGraphId!,
           assertionName,
-          requestAgentAddress,
-          subGraphName,
+          { subGraphName, agentAddress: requestAgentAddress },
         );
       } catch (err: any) {
         const message = err?.message ?? String(err);

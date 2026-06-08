@@ -170,6 +170,14 @@ function makeAssertionAgent(over: Record<string, any> = {}) {
   const publisher = {
     assertionCreate: vi.fn(async () => undefined),
     assertionWrite: vi.fn(async () => undefined),
+    // rc.17 per-KA WM: the import-file handler re-pins data to the resolved
+    // working-memory graph via this public publisher method. Mirror the real
+    // publisher's …/_working_memory/{addr}/{number} shape so the handler can
+    // remap the data-graph quads before store.insert.
+    wmGraphUri: vi.fn(
+      async (cg: string, agentAddress: string, _name: string, sub?: string) =>
+        `did:dkg:context-graph:${cg}${sub ? `/${sub}` : ''}/_working_memory/${agentAddress}/1`,
+    ),
     ...(publisherOver ?? {}),
   };
   const store = {

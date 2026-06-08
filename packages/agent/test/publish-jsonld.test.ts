@@ -102,8 +102,13 @@ describe('publishJsonLd', () => {
     });
     expect(result.status).toBe('confirmed');
 
+    // rc.17 uniform layout: a confirmed publish lands the public payload in the
+    // per-KA …/_verified_memory/{author}/{number} graph, not the legacy root
+    // data graph. Read-both (root OR the _verified_memory/ prefix, excluding the
+    // transient staging graphs) mirrors the production verified-memory read path.
     const publicResult = await store.query(
-      `ASK { GRAPH <did:dkg:context-graph:bare-priv> { ?s ?p ?o } }`,
+      `ASK { GRAPH ?g { ?s ?p ?o }
+        FILTER((STRSTARTS(STR(?g), "did:dkg:context-graph:bare-priv/_verified_memory/") && !CONTAINS(STR(?g), "/staging/")) || STR(?g) = "did:dkg:context-graph:bare-priv") }`,
     );
     expect(publicResult.type).toBe('boolean');
     if (publicResult.type === 'boolean') {
@@ -126,8 +131,12 @@ describe('publishJsonLd', () => {
     });
     expect(result.status).toBe('confirmed');
 
+    // rc.17 uniform layout: confirmed public quads land in the per-KA
+    // …/_verified_memory/{author}/{number} graph. Read-both (root OR the
+    // _verified_memory/ prefix, minus staging) matches the production read path.
     const askResult = await store.query(
-      `ASK { GRAPH <did:dkg:context-graph:pub-env> { <http://example.org/Bob> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://schema.org/Person> } }`,
+      `ASK { GRAPH ?g { <http://example.org/Bob> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://schema.org/Person> }
+        FILTER((STRSTARTS(STR(?g), "did:dkg:context-graph:pub-env/_verified_memory/") && !CONTAINS(STR(?g), "/staging/")) || STR(?g) = "did:dkg:context-graph:pub-env") }`,
     );
     expect(askResult.type).toBe('boolean');
     if (askResult.type === 'boolean') {
@@ -184,8 +193,12 @@ describe('publishJsonLd', () => {
     });
     expect(result.status).toBe('confirmed');
 
+    // rc.17 uniform layout: the synthetic public anchor is published into the
+    // per-KA …/_verified_memory/{author}/{number} graph. Read-both (root OR the
+    // _verified_memory/ prefix, minus staging) matches the production read path.
     const anchorResult = await store.query(
-      `ASK { GRAPH <did:dkg:context-graph:priv-only> { ?s ?p ?o } }`,
+      `ASK { GRAPH ?g { ?s ?p ?o }
+        FILTER((STRSTARTS(STR(?g), "did:dkg:context-graph:priv-only/_verified_memory/") && !CONTAINS(STR(?g), "/staging/")) || STR(?g) = "did:dkg:context-graph:priv-only") }`,
     );
     expect(anchorResult.type).toBe('boolean');
     if (anchorResult.type === 'boolean') expect(anchorResult.value).toBe(true);

@@ -16,6 +16,9 @@ import {
   agentFromPeerId,
   truncateId,
 } from '../hooks/useVerifiedEntityIdentity.js';
+import { useEntityOnChainReceipt } from '../hooks/useEntityOnChainReceipt.js';
+import { useFetch } from '../hooks.js';
+import { fetchStatus } from '../api.js';
 import { AgentChip } from './AgentChip.js';
 
 export interface VerifiedIdentityBannerProps {
@@ -32,11 +35,20 @@ export const VerifiedIdentityBanner: React.FC<VerifiedIdentityBannerProps> = ({
 }) => {
   const agents = useAgentsContext();
   const identity = useVerifiedEntityIdentity(contextGraphId, entityUri, enabled);
+  // Real on-chain receipt (UAL / tx hash / block / KA id). Layers on top of the
+  // identity block above, which still supplies owner / publisher attribution.
+  const receipt = useEntityOnChainReceipt(contextGraphId, entityUri, enabled);
+  const { data: statusData } = useFetch(fetchStatus, [], 60_000);
+  const explorerUrl = (statusData as any)?.blockExplorerUrl as string | undefined;
+  // Prefer the genuine did:dkg UAL once we have it; the identity hook's `ual`
+  // is the synthetic WorkspaceOperation URI used as a stand-in.
+  const onChainUal = receipt.ual ?? identity.ual;
+  const onChain = receipt.status === 'verified';
 
   if (!enabled || identity.loading) return null;
   // If we don't have *anything* useful to show, bail — the Provenance
   // Trail still renders below.
-  if (!identity.ual && !identity.owner && !identity.publishedAt) return null;
+  if (!identity.ual && !identity.owner && !identity.publishedAt && !onChain) return null;
 
   const publishedAt = identity.publishedAt ? formatWhen(identity.publishedAt) : null;
   const publisherAgentUri = identity.publisherPeerId && agents
@@ -60,17 +72,62 @@ export const VerifiedIdentityBanner: React.FC<VerifiedIdentityBannerProps> = ({
         <span className="v10-vm-identity-badge">VERIFIED</span>
       </div>
 
-      {identity.ual && (
+      {onChainUal && (
         <div className="v10-vm-identity-row">
           <span className="v10-vm-identity-lbl">UAL</span>
-          <span className="v10-vm-identity-val mono" title={identity.ual}>
-            {identity.ual}
+          <span className="v10-vm-identity-val mono" title={onChainUal}>
+            {onChainUal}
           </span>
           <button
             type="button"
             className="v10-vm-identity-copy"
-            onClick={() => copy(identity.ual!)}
+            onClick={() => copy(onChainUal)}
             title="Copy UAL"
+          >⎘</button>
+        </div>
+      )}
+
+      {onChain && receipt.txHash && (
+        <div className="v10-vm-identity-row">
+          <span className="v10-vm-identity-lbl">Tx</span>
+          {explorerUrl ? (
+            <a
+              className="v10-vm-identity-val mono"
+              href={`${explorerUrl}/tx/${receipt.txHash}`}
+              target="_blank"
+              rel="noopener noreferrer"
+              title={receipt.txHash}
+            >
+              {truncateId(receipt.txHash, 10, 8)} ↗
+            </a>
+          ) : (
+            <span className="v10-vm-identity-val mono" title={receipt.txHash}>
+              {truncateId(receipt.txHash, 10, 8)}
+            </span>
+          )}
+          <button
+            type="button"
+            className="v10-vm-identity-copy"
+            onClick={() => copy(receipt.txHash!)}
+            title="Copy transaction hash"
+          >⎘</button>
+          {receipt.blockNumber && (
+            <span className="v10-vm-identity-opid mono">· block {receipt.blockNumber}</span>
+          )}
+        </div>
+      )}
+
+      {onChain && receipt.kaId && (
+        <div className="v10-vm-identity-row">
+          <span className="v10-vm-identity-lbl">KA id</span>
+          <span className="v10-vm-identity-val mono" title={receipt.kaId}>
+            {truncateId(receipt.kaId, 8, 8)}
+          </span>
+          <button
+            type="button"
+            className="v10-vm-identity-copy"
+            onClick={() => copy(receipt.kaId!)}
+            title="Copy KA id"
           >⎘</button>
         </div>
       )}

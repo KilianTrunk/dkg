@@ -16,6 +16,12 @@ import { createEVMAdapter, getSharedContext, createProvider, takeSnapshot, rever
 import { mintTokens } from '../../chain/test/hardhat-harness.js';
 import { ethers } from 'ethers';
 import { installHardhatACKProvider } from './_helpers/v10-acks.js';
+import {
+  assertionLifecycleUri,
+  contextGraphMetaUri,
+  contextGraphLayerUri,
+  MemoryLayer,
+} from '@origintrail-official/dkg-core';
 
 const agents: DKGAgent[] = [];
 
@@ -59,6 +65,43 @@ async function createAgent(name: string) {
 }
 
 describe('Memory layer isolation (single agent)', () => {
+  it('resolveByKaId recovers a non-default lifecycle author from the KA record', async () => {
+    const agent = await createAgent('ForeignAuthorResolverBot');
+    const metaGraph = contextGraphMetaUri(CG_ID);
+    const DKG = 'http://dkg.io/ontology/';
+    const XSD_INT = 'http://www.w3.org/2001/XMLSchema#integer';
+    const foreignAuthor = ethers.getAddress('0x00000000000000000000000000000000000000aa');
+    const defaultAuthor = agent.defaultAgentAddress ?? agent.peerId;
+    const name = 'foreign-author-ka';
+    const decoyName = 'default-author-decoy';
+    const kaNumber = 987654n;
+    const packedKaId = (BigInt(foreignAuthor) << 96n) | kaNumber;
+    const lifecycleUri = assertionLifecycleUri(CG_ID, foreignAuthor, name);
+    const decoyLifecycleUri = assertionLifecycleUri(CG_ID, defaultAuthor, decoyName);
+    const vmGraph = contextGraphLayerUri(CG_ID, MemoryLayer.VerifiedMemory, foreignAuthor.toLowerCase(), kaNumber);
+
+    await (agent as any).store.insert([
+      { subject: decoyLifecycleUri, predicate: `${DKG}kaId`, object: `"${kaNumber}"^^<${XSD_INT}>`, graph: metaGraph },
+      { subject: decoyLifecycleUri, predicate: `${DKG}assertionName`, object: `"${decoyName}"`, graph: metaGraph },
+      { subject: decoyLifecycleUri, predicate: `${DKG}state`, object: '"published"', graph: metaGraph },
+      { subject: decoyLifecycleUri, predicate: `${DKG}memoryLayer`, object: `"${MemoryLayer.VerifiedMemory}"`, graph: metaGraph },
+      { subject: lifecycleUri, predicate: `${DKG}kaId`, object: `"${kaNumber}"^^<${XSD_INT}>`, graph: metaGraph },
+      { subject: lifecycleUri, predicate: `${DKG}assertionName`, object: `"${name}"`, graph: metaGraph },
+      { subject: lifecycleUri, predicate: `${DKG}state`, object: '"published"', graph: metaGraph },
+      { subject: lifecycleUri, predicate: `${DKG}memoryLayer`, object: `"${MemoryLayer.VerifiedMemory}"`, graph: metaGraph },
+      { subject: lifecycleUri, predicate: `${DKG}assertionGraph`, object: vmGraph, graph: metaGraph },
+      { subject: lifecycleUri, predicate: 'http://www.w3.org/ns/prov#wasAttributedTo', object: `did:dkg:agent:${foreignAuthor.toLowerCase()}`, graph: metaGraph },
+    ]);
+
+    const desc = await (agent as any).assertion.resolveByKaId(CG_ID, packedKaId);
+
+    expect(desc).toBeTruthy();
+    expect(desc.agentAddress).toBe(foreignAuthor);
+    expect(desc.agentAddress.toLowerCase()).not.toBe(defaultAuthor.toLowerCase());
+    expect(desc.name).toBe(name);
+    expect(desc.memoryLayer).toBe(MemoryLayer.VerifiedMemory);
+  });
+
   it('WM data is not visible in SWM or default data graph', async () => {
     const agent = await createAgent('IsolationBot');
     await agent.createContextGraph({ id: CG_ID, name: 'Memory Layers E2E' });
@@ -195,7 +238,43 @@ describe('WM → SWM → VM pipeline (single agent)', () => {
     expect(pub.status).toBe('confirmed');
     expect(pub.ual).toBeDefined();
     expect(pub.seal).toBeDefined();
-  }, 20_000);
+
+    // RC.17 Bug #1 regression (SUBSTRATE-2): a confirmed publish must re-point
+    // dkg:assertionGraph in _meta at the per-KA verified-memory graph it just
+    // wrote (…/_verified_memory/{author}/{number}). promote() leaves the pointer
+    // on the SWM bucket, which the post-confirm SWM cleanup then EMPTIES — so
+    // without the re-stamp the _meta index follows a stale pointer to an empty
+    // graph and descriptor reads return no triples. The publish derives the VM
+    // graph from the minted kaId, so we re-derive it the same way and assert the
+    // pointer AND the data agree.
+    const ASSERTION_GRAPH_PRED = 'http://dkg.io/ontology/assertionGraph';
+    const author = agent.defaultAgentAddress ?? agent.peerId;
+    const lifecycleUri = assertionLifecycleUri(CG_ID, author, 'auto-final');
+    const metaGraph = contextGraphMetaUri(CG_ID);
+    const kaId = BigInt(pub.kaId!);
+    const expectedVmGraph = contextGraphLayerUri(
+      CG_ID,
+      MemoryLayer.VerifiedMemory,
+      '0x' + (kaId >> 96n).toString(16).padStart(40, '0'),
+      kaId & ((1n << 96n) - 1n),
+    );
+    const ptrRes = await (agent as any).store.query(
+      `SELECT ?o WHERE { GRAPH <${metaGraph}> { <${lifecycleUri}> <${ASSERTION_GRAPH_PRED}> ?o } } LIMIT 1`,
+    );
+    expect(ptrRes.type).toBe('bindings');
+    expect(ptrRes.bindings.length).toBe(1);
+    const assertionGraphPtr = String(ptrRes.bindings[0]['o'])
+      .replace(/^"/, '')
+      .replace(/"(\^\^<[^>]+>)?$/, '');
+    expect(assertionGraphPtr).toBe(expectedVmGraph);
+    // …and the pointed-at graph actually holds the published triple (no stale
+    // pointer at an emptied SWM bucket).
+    const vmData = await (agent as any).store.query(
+      `SELECT ?o WHERE { GRAPH <${expectedVmGraph}> { <${ENTITY_BASE}:auto> <http://schema.org/name> ?o } }`,
+    );
+    expect(vmData.type).toBe('bindings');
+    expect(vmData.bindings.length).toBeGreaterThan(0);
+  }, 30_000);
 
   it('selective promote does NOT auto-finalize (avoids the seal-all vs promote-subset merkleRoot mismatch)', async () => {
     // Regression for the #1004 review: auto-finalize seals the WHOLE assertion

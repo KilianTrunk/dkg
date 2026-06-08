@@ -64,8 +64,8 @@ const PREFIX = "/api/knowledge-assets";
 
 // Decode + validate a `:name` path segment (parity with the legacy routes,
 // which `safeDecodeURIComponent` then `validateAssertionName` every name). A
-// B3 kaId form (did:dkg UAL / `0x<addr>:<n>`) is exempt — it's validated by
-// `classifyKaIdentifier`. Returns the name, or null after writing a 400/error.
+// B3 read identifier is exempt — it's validated by `classifyKaIdentifier`.
+// Returns the name, or null after writing a 400/error.
 function decodeAndValidateName(seg: string, res: RequestContext["res"]): string | null {
   if (classifyKaIdentifier(seg).kind === "kaId") return seg;
   const nameVal = validateAssertionName(seg);
@@ -149,17 +149,22 @@ function hex(bytes: Uint8Array): string {
   return "0x" + Buffer.from(bytes).toString("hex");
 }
 
-// OT-RFC-43 B3 — (agent, number) compact identifier: `0x<40hex>:<number>`.
-const AGENT_NUMBER_RE = /^0x[0-9a-fA-F]{40}:[0-9]+$/;
-
 /**
  * OT-RFC-43 B3 — classify the leading path segment as a KA identifier:
  *   (a) `did:dkg:.../<id>`        → the trailing `/<id>` is the packed kaId
- *   (b) `0x<40hex>:<number>`      → (agent, number) → kaId = (agent<<96)|number
+ *   (b) `0x<agent>:<number>`      → (agent, number), but only on read paths
  *   (c) anything else             → a plain assertion NAME (current behavior)
- * Returns `{ kind: "kaId", kaId }` for (a)/(b) or `{ kind: "name" }` for (c).
+ * The compact form stays enabled for GET/read compatibility. Create/mutation
+ * call sites pass `includeCompact: false` so historically-valid literal names
+ * like `0xabc...:7` remain creatable and mutable.
  */
-function classifyKaIdentifier(seg: string): { kind: "kaId"; kaId: bigint } | { kind: "name" } {
+const AGENT_NUMBER_RE = /^0x[0-9a-fA-F]{40}:[0-9]+$/;
+
+function classifyKaIdentifier(
+  seg: string,
+  opts: { includeCompact?: boolean } = {},
+): { kind: "kaId"; kaId: bigint } | { kind: "name" } {
+  const includeCompact = opts.includeCompact ?? true;
   if (seg.startsWith("did:dkg:")) {
     // The kaId is the last `/`-delimited segment of the UAL.
     const idPart = seg.slice(seg.lastIndexOf("/") + 1);
@@ -172,7 +177,7 @@ function classifyKaIdentifier(seg: string): { kind: "kaId"; kaId: bigint } | { k
     }
     return { kind: "name" };
   }
-  if (AGENT_NUMBER_RE.test(seg)) {
+  if (includeCompact && AGENT_NUMBER_RE.test(seg)) {
     const [agentHex, numberStr] = seg.split(":");
     try {
       const kaId = (BigInt(agentHex) << 96n) | BigInt(numberStr);
@@ -182,6 +187,27 @@ function classifyKaIdentifier(seg: string): { kind: "kaId"; kaId: bigint } | { k
     }
   }
   return { kind: "name" };
+}
+
+function rejectKaIdMutationIdentifier(seg: string, res: RequestContext["res"]): boolean {
+  if (classifyKaIdentifier(seg, { includeCompact: false }).kind !== "kaId") return false;
+  jsonResponse(res, 400, {
+    code: "KA_ID_MUTATION_UNSUPPORTED",
+    error:
+      "B3 did:dkg KA identifiers are only supported on GET /api/knowledge-assets routes. " +
+      "Mutation routes must use the lifecycle assertion name.",
+  });
+  return true;
+}
+
+function rejectReservedKaIdentifierName(name: string, res: RequestContext["res"]): boolean {
+  if (classifyKaIdentifier(name, { includeCompact: false }).kind !== "kaId") return false;
+  jsonResponse(res, 400, {
+    code: "KA_IDENTIFIER_RESERVED",
+    error:
+      "B3 did:dkg KA identifiers are reserved for KA addressing and cannot be used as lifecycle assertion names.",
+  });
+  return true;
 }
 
 /**
@@ -476,6 +502,7 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
     if (typeof name !== "string") {
       return jsonResponse(res, 400, { error: '"name" must be a string' });
     }
+    if (rejectReservedKaIdentifierName(name, res)) return;
     const nameVal = validateAssertionName(name);
     if (!nameVal.valid) {
       return jsonResponse(res, 400, { error: `Invalid "name": ${nameVal.reason}` });
@@ -599,6 +626,13 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
   async function resolveDescriptor(cg: string, subGraphName?: string, agentAddress?: string): Promise<Record<string, unknown> | null> {
     const ident = classifyKaIdentifier(name);
     if (ident.kind === "kaId") {
+      // Compact `0x<agent>:<number>` is both a B3 read alias and a historically
+      // valid literal assertion name. Preserve literal-name semantics first:
+      // if such a lifecycle exists, return it; otherwise fall back to B3.
+      if (AGENT_NUMBER_RE.test(name)) {
+        const literalHist = await agent.assertion.history(cg, name, { agentAddress, subGraphName });
+        if (literalHist) return literalHist as unknown as Record<string, unknown>;
+      }
       const hist = await (agent as any).assertion.resolveByKaId?.(cg, ident.kaId, { subGraphName });
       return (hist as unknown as Record<string, unknown>) ?? null;
     }
@@ -677,6 +711,7 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
   }
 
   if (method !== "POST") return;
+  if (rejectKaIdMutationIdentifier(name, res)) return;
 
   // POST /api/knowledge-assets/:name/wm/import-file — MULTIPART, not JSON.
   // Faithful port of the legacy POST /api/assertion/:name/import-file. This MUST
@@ -711,6 +746,23 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
     if (layer === "wm") {
       if (verb === "write") {
         if (!Array.isArray(parsed.quads)) return jsonResponse(res, 400, { error: 'Missing "quads"' });
+        // A bare write to a name that was never created used to fall through to
+        // the legacy `/assertion/{addr}/{name}` graph and produce a KA that is
+        // permanently 404 in the descriptor API (no `_meta` lifecycle record,
+        // no per-KA `_working_memory` layout). Ensure the KA exists first so the
+        // proper per-KA layout is in place before the first append.
+        //
+        // create() is NOT a no-op get-or-create: assertionCreate() clears and
+        // rebuilds the lifecycle record (resetting state/memoryLayer, dropping
+        // the prov event history and any seal/finalize metadata, preserving only
+        // the KA identity + layer pointers). Calling it on every write would
+        // corrupt an in-progress draft and — if the following write() throws —
+        // leave that wipe behind. So gate it on an active-draft existence check:
+        // brand-new or discarded names get created; existing drafts stay append-only.
+        const existing = await agent.assertion.history(contextGraphId, name, { subGraphName });
+        if (!existing || existing.state === "discarded") {
+          await agent.assertion.create(contextGraphId, name, { subGraphName });
+        }
         await agent.assertion.write(contextGraphId, name, parsed.quads, { subGraphName });
         emitMemoryGraphChanged?.({ contextGraphId, layers: ["wm"], subGraphName, operation: "assertion_written", source: "api", counts: { triples: parsed.quads.length } });
         return jsonResponse(res, 200, { written: parsed.quads.length });
@@ -836,14 +888,27 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
           txHash: pub?.onChainResult?.txHash,
           ...(pub?.assertionUri !== undefined ? { assertionUri: pub.assertionUri } : {}),
           ...(pub?.seal?.authorAddress ?? pub?.authorAddress ? { authorAddress: pub?.seal?.authorAddress ?? pub?.authorAddress } : {}),
-          ...(pub?.merkleRoot !== undefined ? { merkleRoot: pub.merkleRoot } : {}),
+          ...(pub?.merkleRoot !== undefined
+            ? { merkleRoot: typeof pub.merkleRoot === "string" ? pub.merkleRoot : hex(pub.merkleRoot) }
+            : {}),
           ...(Array.isArray(pub?.kas) ? { kas: pub.kas } : {}),
           ...(pub?.onChainResult?.blockNumber !== undefined ? { blockNumber: pub.onChainResult.blockNumber } : {}),
           ...(typeof pub?.contextGraphError === "string" ? { contextGraphError: pub.contextGraphError } : {}),
           ...(reason ? { error: reason } : {}),
         });
       } catch (e: any) {
-        return jsonResponse(res, 500, { error: e?.message ?? String(e) });
+        const msg = e?.message ?? String(e);
+        // A vm/publish on a KA that hasn't been finalized, or hasn't been
+        // shared to SWM, is a caller precondition error (4xx), not a
+        // server/on-chain failure (5xx). Both messages below are thrown by the
+        // engine BEFORE any chain interaction, so down-classifying them to 409
+        // is safe. Everything else (on-chain reverts, storage, "Invalid"/
+        // "Unsafe" publisher text) keeps the generic 500 — the #988 parity
+        // contract that publish must NOT down-classify on-chain errors.
+        if (/is not finalized/.test(msg) || /No quads in shared memory/.test(msg)) {
+          return jsonResponse(res, 409, { code: "VM_PUBLISH_PRECONDITION", error: msg });
+        }
+        return jsonResponse(res, 500, { error: msg });
       }
     }
   } catch (e: any) {

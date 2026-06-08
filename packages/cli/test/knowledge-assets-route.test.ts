@@ -243,6 +243,26 @@ describe('GitHub-shaped /api/knowledge-assets routes (OT-RFC-43 §10.5)', () => 
     expect(body(ctx)).toMatchObject({ name: 'dup', alreadyExists: true });
   });
 
+  it('POST /api/knowledge-assets keeps compact 0x<agent>:<number> as a literal name', async () => {
+    const agent = makeAssertionAgent();
+    const name = `0x${'ab'.repeat(20)}:5`;
+    const ctx = ctxFor('POST', '/api/knowledge-assets', { contextGraphId: 'cg', name }, agent);
+    await handleKnowledgeAssetsRoutes(ctx);
+    expect(status(ctx)).toBe(201);
+    expect(body(ctx)).toMatchObject({ name });
+    expect(agent.assertion.create).toHaveBeenCalledWith('cg', name, { subGraphName: undefined });
+  });
+
+  it('POST /api/knowledge-assets reserves did:dkg UAL identifiers as names', async () => {
+    const agent = makeAssertionAgent();
+    const name = 'did:dkg:evm:31337/0xkaaddr/123';
+    const ctx = ctxFor('POST', '/api/knowledge-assets', { contextGraphId: 'cg', name }, agent);
+    await handleKnowledgeAssetsRoutes(ctx);
+    expect(status(ctx)).toBe(400);
+    expect(body(ctx)).toMatchObject({ code: 'KA_IDENTIFIER_RESERVED' });
+    expect(agent.assertion.create).not.toHaveBeenCalled();
+  });
+
   it('POST /api/knowledge-assets rejects finalize-only fields without auto-finalize quads', async () => {
     for (const payload of [
       { authorAgentAddress: `0x${'11'.repeat(20)}` },
@@ -343,6 +363,58 @@ describe('GitHub-shaped /api/knowledge-assets routes (OT-RFC-43 §10.5)', () => 
     expect(agent.assertion.write).toHaveBeenCalledWith('cg', 'f', quads, { subGraphName: undefined });
   });
 
+  it('POST .../:name/wm/write creates a MISSING KA before the first append', async () => {
+    // RC.17 lifecycle bug: a bare wm/write to a name that was never created
+    // used to skip create() and fall through to the legacy name-keyed graph,
+    // yielding a KA that is permanently 404 in the descriptor API (no _meta
+    // lifecycle record, no per-KA layout). The route now calls create() first,
+    // BEFORE the write, so a brand-new KA always has the proper layout.
+    const agent = makeAssertionAgent({ assertion: { history: vi.fn(async () => null) } });
+    const quads = [{ subject: 'ex:A', predicate: 'ex:p', object: '"x"', graph: '' }];
+    const ctx = ctxFor('POST', '/api/knowledge-assets/f/wm/write', { contextGraphId: 'cg', quads }, agent);
+    await handleKnowledgeAssetsRoutes(ctx);
+    expect(status(ctx)).toBe(200);
+    expect(agent.assertion.create).toHaveBeenCalledWith('cg', 'f', { subGraphName: undefined });
+    // Ordering matters: create() must run before write() or the first append
+    // still lands in the wrong graph.
+    const createOrder = (agent.assertion.create as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
+    const writeOrder = (agent.assertion.write as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
+    expect(createOrder).toBeLessThan(writeOrder);
+  });
+
+  it('POST .../:name/wm/write does NOT re-create an EXISTING KA (append-only)', async () => {
+    // Codex RC.17 follow-up: assertion.create() is NOT a no-op get-or-create —
+    // assertionCreate() clears + rebuilds the lifecycle record (resetting
+    // state/memoryLayer, dropping the prov event history and seal/finalize
+    // metadata, preserving only the KA identity). So a write to a KA that
+    // already exists must skip create() entirely and stay append-only, or every
+    // append would corrupt an in-progress (or finalized) draft. The default
+    // history() mock returns a descriptor (the KA exists).
+    const agent = makeAssertionAgent();
+    const quads = [{ subject: 'ex:A', predicate: 'ex:p', object: '"x"', graph: '' }];
+    const ctx = ctxFor('POST', '/api/knowledge-assets/f/wm/write', { contextGraphId: 'cg', quads }, agent);
+    await handleKnowledgeAssetsRoutes(ctx);
+    expect(status(ctx)).toBe(200);
+    expect(agent.assertion.history).toHaveBeenCalledWith('cg', 'f', { subGraphName: undefined });
+    expect(agent.assertion.create).not.toHaveBeenCalled();
+    expect(agent.assertion.write).toHaveBeenCalledWith('cg', 'f', quads, { subGraphName: undefined });
+  });
+
+  it('POST .../:name/wm/write re-creates a DISCARDED KA before appending', async () => {
+    // A discarded lifecycle record is not an active draft. Treat it like
+    // missing so the first write after discard rebuilds state/memoryLayer and
+    // the event history before appending to the per-KA graph.
+    const agent = makeAssertionAgent({ assertion: { history: vi.fn(async () => ({ state: 'discarded' })) } });
+    const quads = [{ subject: 'ex:A', predicate: 'ex:p', object: '"x"', graph: '' }];
+    const ctx = ctxFor('POST', '/api/knowledge-assets/f/wm/write', { contextGraphId: 'cg', quads }, agent);
+    await handleKnowledgeAssetsRoutes(ctx);
+    expect(status(ctx)).toBe(200);
+    expect(agent.assertion.create).toHaveBeenCalledWith('cg', 'f', { subGraphName: undefined });
+    const createOrder = (agent.assertion.create as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
+    const writeOrder = (agent.assertion.write as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
+    expect(createOrder).toBeLessThan(writeOrder);
+  });
+
   it('POST .../:name/wm/finalize seals the draft (full seal payload)', async () => {
     // PR #971: finalize returns the whole seal payload (assertionUri /
     // authorAddress / chainId / kav10Address) so clients can inspect the attestation.
@@ -410,6 +482,42 @@ describe('GitHub-shaped /api/knowledge-assets routes (OT-RFC-43 §10.5)', () => 
     expect(status(ctx)).toBe(200);
     expect(body(ctx)).toMatchObject({ status: 'confirmed', ual: 'did:dkg:hardhat:31337/0xabc/7', txHash: '0xtx' });
     expect(agent.publishFromFinalizedAssertion).toHaveBeenCalledOnce();
+  });
+
+  it('POST .../:name/vm/publish hex-encodes a Uint8Array merkleRoot (parity with wm/finalize)', async () => {
+    // RC.17 bug: vm/publish echoed the raw publisher merkleRoot, which is a
+    // Uint8Array byte-map, so the JSON came back as {"0":171,"1":205,...}
+    // instead of the "0xabcd" hex string wm/finalize returns. The route now
+    // hex-encodes it when it isn't already a string, so the two surfaces agree.
+    const agent = makeAssertionAgent({
+      publishFromFinalizedAssertion: vi.fn(async () => ({
+        kaId: 7n,
+        status: 'confirmed',
+        ual: 'did:dkg:hardhat:31337/0xabc/7',
+        onChainResult: { txHash: '0xtx' },
+        merkleRoot: new Uint8Array([0xab, 0xcd]),
+      })),
+    });
+    const ctx = ctxFor('POST', '/api/knowledge-assets/f/vm/publish', { contextGraphId: 'cg' }, agent);
+    await handleKnowledgeAssetsRoutes(ctx);
+    expect(status(ctx)).toBe(200);
+    expect(body(ctx).merkleRoot).toBe('0xabcd');
+  });
+
+  it('POST .../:name/vm/publish leaves an already-hex merkleRoot untouched', async () => {
+    const agent = makeAssertionAgent({
+      publishFromFinalizedAssertion: vi.fn(async () => ({
+        kaId: 7n,
+        status: 'confirmed',
+        ual: 'did:dkg:hardhat:31337/0xabc/7',
+        onChainResult: { txHash: '0xtx' },
+        merkleRoot: '0xdeadbeef',
+      })),
+    });
+    const ctx = ctxFor('POST', '/api/knowledge-assets/f/vm/publish', { contextGraphId: 'cg' }, agent);
+    await handleKnowledgeAssetsRoutes(ctx);
+    expect(status(ctx)).toBe(200);
+    expect(body(ctx).merkleRoot).toBe('0xdeadbeef');
   });
 
   // PR #972: vm/publish HTTP status reflects the actual publish outcome.
@@ -1024,8 +1132,8 @@ describe('OT-RFC-43 A2/B3 — per-layer status + kaId addressing', () => {
     reservedUal: `did:dkg:evm:31337/${AGENT_ADDR}/5`,
   };
 
-  function makePointerAgent() {
-    const history = vi.fn(async () => divergedDescriptor);
+  function makePointerAgent(opts: { historyResult?: any } = {}) {
+    const history = vi.fn(async () => ('historyResult' in opts ? opts.historyResult : divergedDescriptor));
     const resolveByKaId = vi.fn(async () => divergedDescriptor);
     return {
       ...contextGraphMocks(),
@@ -1081,18 +1189,28 @@ describe('OT-RFC-43 A2/B3 — per-layer status + kaId addressing', () => {
     expect(b.status).toBe('vm-confirmed');
   });
 
-  it('B3: resolves a KA by (agent, number) — same descriptor as by name', async () => {
+  it('B3: compact (agent, number) on GET prefers an existing literal name', async () => {
     const agent = makePointerAgent();
     const ident = `${AGENT_ADDR}:5`;
     const ctx = ctxFor('GET', `/api/knowledge-assets/${encodeURIComponent(ident)}?contextGraphId=cg`, undefined, agent);
     await handleKnowledgeAssetsRoutes(ctx);
     expect(status(ctx)).toBe(200);
     expect(body(ctx)).toMatchObject({ name: 'notes', status: 'vm-confirmed' });
-    // Routed through resolveByKaId with the packed kaId = (agent<<96)|5.
+    expect(agent.assertion.history).toHaveBeenCalledWith('cg', ident, { agentAddress: undefined, subGraphName: undefined });
+    expect(agent.assertion.resolveByKaId).not.toHaveBeenCalled();
+  });
+
+  it('B3: compact (agent, number) falls back to kaId resolution when no literal name exists', async () => {
+    const agent = makePointerAgent({ historyResult: null });
+    const ident = `${AGENT_ADDR}:5`;
+    const ctx = ctxFor('GET', `/api/knowledge-assets/${encodeURIComponent(ident)}?contextGraphId=cg`, undefined, agent);
+    await handleKnowledgeAssetsRoutes(ctx);
+    expect(status(ctx)).toBe(200);
+    expect(body(ctx)).toMatchObject({ name: 'notes', status: 'vm-confirmed' });
     expect(agent.assertion.resolveByKaId).toHaveBeenCalledOnce();
     const packed = (BigInt(AGENT_ADDR) << 96n) | 5n;
     expect(agent.assertion.resolveByKaId.mock.calls[0][1]).toBe(packed);
-    expect(agent.assertion.history).not.toHaveBeenCalled();
+    expect(agent.assertion.history).toHaveBeenCalledOnce();
   });
 
   it('B3: resolves a KA by did:dkg UAL — same descriptor', async () => {
@@ -1114,6 +1232,38 @@ describe('OT-RFC-43 A2/B3 — per-layer status + kaId addressing', () => {
     expect(status(ctx)).toBe(200);
     expect(agent.assertion.history).toHaveBeenCalledOnce();
     expect(agent.assertion.resolveByKaId).not.toHaveBeenCalled();
+  });
+
+  it('B3: mutation routes keep compact 0x<agent>:<number> as a literal draft name', async () => {
+    const agent = makeAssertionAgent();
+    const ident = `${AGENT_ADDR}:5`;
+    const ctx = ctxFor('POST', `/api/knowledge-assets/${encodeURIComponent(ident)}/wm/write`, {
+      contextGraphId: 'cg',
+      quads: [{ subject: 's', predicate: 'p', object: '"o"' }],
+    }, agent);
+
+    await handleKnowledgeAssetsRoutes(ctx);
+
+    expect(status(ctx)).toBe(200);
+    expect(body(ctx)).toMatchObject({ written: 1 });
+    expect(agent.assertion.history).toHaveBeenCalledWith('cg', ident, { subGraphName: undefined });
+    expect(agent.assertion.create).not.toHaveBeenCalled();
+    expect(agent.assertion.write).toHaveBeenCalledWith('cg', ident, [{ subject: 's', predicate: 'p', object: '"o"' }], { subGraphName: undefined });
+  });
+
+  it('B3: mutation routes reject did:dkg UAL identifiers too', async () => {
+    const agent = makeAssertionAgent();
+    const packed = (BigInt(AGENT_ADDR) << 96n) | 5n;
+    const ual = `did:dkg:evm:31337/0xkaaddr/${packed.toString()}`;
+    const ctx = ctxFor('POST', `/api/knowledge-assets/${encodeURIComponent(ual)}/vm/publish`, {
+      contextGraphId: 'cg',
+    }, agent);
+
+    await handleKnowledgeAssetsRoutes(ctx);
+
+    expect(status(ctx)).toBe(400);
+    expect(body(ctx)).toMatchObject({ code: 'KA_ID_MUTATION_UNSUPPORTED' });
+    expect(agent.publishFromFinalizedAssertion).not.toHaveBeenCalled();
   });
 
   // Parity with the legacy /api/assertion/* routes: on the WM/SWM mutation
@@ -1168,6 +1318,31 @@ describe('OT-RFC-43 A2/B3 — per-layer status + kaId addressing', () => {
       const ctx = ctxFor('POST', '/api/knowledge-assets/f/vm/publish', { contextGraphId: 'cg' }, agent);
       await handleKnowledgeAssetsRoutes(ctx);
       expect(status(ctx)).toBe(500);
+    });
+
+    // RC.17 bug: a vm/publish on a KA that hasn't been finalized — or hasn't
+    // been shared to SWM — is a caller precondition error, but the route used
+    // to return a blanket 500. Both messages are thrown by the engine BEFORE
+    // any chain interaction, so they down-classify to 409 without violating
+    // the #988 "don't down-classify on-chain errors" contract above.
+    it('maps a not-finalized vm/publish to 409 (caller precondition)', async () => {
+      const agent = makeAssertionAgent({
+        publishFromFinalizedAssertion: vi.fn(async () => { throw new Error('Assertion <urn:x> is not finalized'); }),
+      });
+      const ctx = ctxFor('POST', '/api/knowledge-assets/f/vm/publish', { contextGraphId: 'cg' }, agent);
+      await handleKnowledgeAssetsRoutes(ctx);
+      expect(status(ctx)).toBe(409);
+      expect(body(ctx)).toMatchObject({ code: 'VM_PUBLISH_PRECONDITION' });
+    });
+
+    it('maps a publish-without-share vm/publish to 409 (caller precondition)', async () => {
+      const agent = makeAssertionAgent({
+        publishFromFinalizedAssertion: vi.fn(async () => { throw new Error('No quads in shared memory for context graph cg matching selection'); }),
+      });
+      const ctx = ctxFor('POST', '/api/knowledge-assets/f/vm/publish', { contextGraphId: 'cg' }, agent);
+      await handleKnowledgeAssetsRoutes(ctx);
+      expect(status(ctx)).toBe(409);
+      expect(body(ctx)).toMatchObject({ code: 'VM_PUBLISH_PRECONDITION' });
     });
   });
 });

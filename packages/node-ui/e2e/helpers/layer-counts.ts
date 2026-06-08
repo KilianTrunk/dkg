@@ -172,9 +172,14 @@ export async function countRootInSharedMemory(
 ): Promise<number> {
   const swmGraph = `did:dkg:context-graph:${contextGraphId}/_shared_memory`;
   const genidPrefix = `${rootUri}/.well-known/genid/`;
+  // rc.17 per-KA SWM: promoted content lands in …/_shared_memory/{addr}/{number}
+  // (number-keyed), not only the legacy …/_shared_memory bucket. Read BOTH (bucket
+  // OR per-KA prefix), excluding the staging sub-tree — mirrors the UI's
+  // listSwmEntities read-both.
   const sparql = `SELECT (COUNT(*) AS ?c) WHERE {
     GRAPH ?g { ?s ?p ?o }
-    FILTER(STR(?g) = "${swmGraph}"
+    FILTER((STR(?g) = "${swmGraph}" || STRSTARTS(STR(?g), "${swmGraph}/"))
+      && !STRSTARTS(STR(?g), "${swmGraph}/staging/")
       && (STR(?s) = "${rootUri}" || STRSTARTS(STR(?s), "${genidPrefix}")))
   }`;
   return parseCount(await runQuery(contextGraphId, sparql, nodeNum));
@@ -198,6 +203,7 @@ export async function countRootInVmScope(
     FILTER(
       STRSTARTS(STR(?g), "${cgUri}") &&
       !CONTAINS(STR(?g), "/assertion/") &&
+      !CONTAINS(STR(?g), "/_working_memory") &&
       !CONTAINS(STR(?g), "/_shared_memory") &&
       !CONTAINS(STR(?g), "/_meta") &&
       !CONTAINS(STR(?g), "/meta")

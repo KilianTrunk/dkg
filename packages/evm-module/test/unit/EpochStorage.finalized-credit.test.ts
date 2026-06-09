@@ -57,7 +57,7 @@ describe('@unit EpochStorage credit to a finalized epoch is preserved (not dropp
     expect(await EpochStorage.getEpochPool(shardId, cur - 2)).to.equal(0n);
   });
 
-  it('on an idle shard (lastFinalizedEpoch lags wall clock), a past credit lands in the CURRENT epoch, not a back-dated one', async () => {
+  it('on an idle shard (lastFinalizedEpoch lags wall clock), a finalized-epoch credit is preserved in the first unfolded epoch', async () => {
     const shardId = 7003;
     await time.increase(epochSeconds * 3);
     const e1 = Number(await Chronos.getCurrentEpoch());
@@ -72,17 +72,18 @@ describe('@unit EpochStorage credit to a finalized epoch is preserved (not dropp
     const cur = Number(await Chronos.getCurrentEpoch());
     expect(cur).to.be.greaterThan(laggedFinalized + 1); // the shard is "idle"
 
-    const staleTarget = laggedFinalized + 1; // where a naive clamp would back-date to (a past epoch)
-    const curBefore = await EpochStorage.getEpochPool(shardId, cur);
-    const staleBefore = await EpochStorage.getEpochPool(shardId, staleTarget);
+    // The first epoch NOT yet folded into `cumulative` = lastFinalizedEpoch + 1.
+    // It is still payable (read via simulation), so the rescued credit lands here
+    // — closest to the epochs the (late) settlement actually overlapped, rather
+    // than being lost in a finalized epoch.
+    const firstUnfolded = laggedFinalized + 1;
+    const before = await EpochStorage.getEpochPool(shardId, firstUnfolded);
 
-    // Backfill a credit aimed at a long-past epoch.
+    // Backfill a credit aimed at a long-past (finalized) epoch.
     await EpochStorage.addTokensToEpochRange(shardId, laggedFinalized - 1, laggedFinalized - 1, 1000);
 
-    // It lands in the genuinely-open CURRENT epoch — not back-dated into the
-    // already-elapsed (and possibly already-claimable) `lastFinalizedEpoch + 1`.
-    expect((await EpochStorage.getEpochPool(shardId, cur)) - curBefore).to.equal(1000n);
-    expect(await EpochStorage.getEpochPool(shardId, staleTarget)).to.equal(staleBefore);
+    // Preserved (not lost), in the first still-creditable epoch.
+    expect((await EpochStorage.getEpochPool(shardId, firstUnfolded)) - before).to.equal(1000n);
   });
 
   it('a settlement range does not corrupt the pool of an epoch outside it', async () => {

@@ -161,10 +161,14 @@ function liftSealToPrecomputedAttestation(seal: NonNullable<LiftRequest['seal']>
       vs: decodeSealField('signature.vs', seal.signature.vs, 32),
     },
     schemeVersion: seal.schemeVersion,
-    // OT-RFC-43 §F2 — async-lift reservedKaId binding is DEFERRED to rc.18; this
-    // mapping is on the gated async-share path (unreachable in rc.17). rc.18 will
-    // persist reservedKaId on the LiftRequestAuthorSeal and read it here.
-    reservedKaId: 0n,
+    // OT-RFC-43 §F2 — read the packed reservedKaId the author signed into the
+    // digest at enqueue and thread it to `precomputedAttestation.reservedKaId`.
+    // The publisher's `ensureReservedKaId` reuses this verbatim (it never
+    // re-allocates when a precomputed id is present), so the on-chain mint
+    // `_safeMint`s exactly the id the seal was signed over. A seal persisted
+    // before §F2 async binding has no `reservedKaId` → `0n` (the legacy
+    // behaviour: such a seal is namespace-mismatched and the mint rejects it).
+    reservedKaId: BigInt(seal.reservedKaId ?? 0n),
   };
 }
 

@@ -24,6 +24,19 @@ export interface LiftRequestAuthorSeal {
   readonly authorAddress: LiftJobHex;
   readonly signature: { readonly r: LiftJobHex; readonly vs: LiftJobHex };
   readonly schemeVersion: number;
+  /**
+   * OT-RFC-43 §F2 — the packed reservedKaId `(uint160(author) << 96) | number`
+   * the author signed into the AuthorAttestation digest at enqueue. The on-chain
+   * mint MUST `_safeMint` exactly this id (the publisher threads it through
+   * `precomputedAttestation.reservedKaId` → `ensureReservedKaId`, which reuses it
+   * verbatim rather than re-allocating). Stringified bigint so it survives the
+   * lift queue's JSON persistence and the full 256-bit packed value (never a JS
+   * `number`). Optional for backward-compat with seals persisted before §F2
+   * async binding landed; a missing value is read back as `0n` (the legacy
+   * sealless/0n behaviour — the on-chain mint then rejects it, which is exactly
+   * why those seals were never minted).
+   */
+  readonly reservedKaId?: LiftJobBigInt;
 }
 
 export interface LiftRequest {

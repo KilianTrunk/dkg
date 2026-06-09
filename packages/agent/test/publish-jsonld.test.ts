@@ -342,11 +342,10 @@ describe('publishJsonLd', () => {
     if (privatePayload.type === 'boolean') expect(privatePayload.value).toBe(false);
   }, 15000);
 
-  // deferred to rc.18 (§F2 async reservedKaId binding): the async-lift seal does
-  // not yet allocate/bind a packed reservedKaId, so the on-chain mint reverts
-  // KaIdNamespaceMismatch on the 0n placeholder. Re-enable when rc.18 wires the
-  // async-lift binding (swm/share-async is 501-gated in rc.17).
-  it.skip('E2E: async publish with custodial authorAgentAddress lands on-chain with KC.author == that agent', async () => {
+  // OT-RFC-43 §F2 — the async-lift seal now allocates + binds the per-author
+  // reservedKaId, so the on-chain mint accepts it (no KaIdNamespaceMismatch) and
+  // KC.author resolves to the custodial agent rather than the publisher EOA.
+  it('E2E: async publish with custodial authorAgentAddress lands on-chain with KC.author == that agent', async () => {
     // Caller-attested authorship: daemon-custodial agent signs at enqueue → publisher consumes verbatim → KC.author == agent (NOT publisher).
     const { agent, store } = await createAgent('AsyncSealE2EBot');
     await agent.createContextGraph({ id: 'async-seal-e2e', name: 'AsyncSealE2E', description: '' });
@@ -407,10 +406,9 @@ describe('publishJsonLd', () => {
     expect(onChainAuthor.toLowerCase()).not.toBe(publisherAddress.toLowerCase());
   }, 60_000);
 
-  // deferred to rc.18 (§F2 async reservedKaId binding): the async-lift seal signs
-  // over a 0n reservedKaId placeholder, and recovery rebuilds the digest with the
-  // now-required 5th field. Re-enable when rc.18 binds the async reservedKaId.
-  it.skip('async publish with authorAgentAddress binds the seal to that agent (NOT the publisher\'s wallet)', async () => {
+  // OT-RFC-43 §F2 — the async-lift seal binds a per-author reservedKaId; recovery
+  // rebuilds the digest with that 5th field (read off the persisted seal).
+  it('async publish with authorAgentAddress binds the seal to that agent (NOT the publisher\'s wallet)', async () => {
     // Architectural payoff: KC.author is the registered agent, not the publisher's EOA. No private key in the API call.
     const { agent, store } = await createAgent('AsyncSealDistinctAuthorBot');
     await agent.createContextGraph({ id: 'async-seal-distinct', name: 'AsyncSealDistinct', description: '' });
@@ -446,6 +444,10 @@ describe('publishJsonLd', () => {
     expect(seal?.authorAddress.toLowerCase()).not.toBe(
       new ethers.Wallet(HARDHAT_KEYS.CORE_OP).address.toLowerCase(),
     );
+    // §F2 — the packed reservedKaId must live in the attested author's namespace.
+    expect(seal?.reservedKaId).toBeDefined();
+    const reservedKaId = BigInt(seal!.reservedKaId!);
+    expect(reservedKaId >> 96n).toBe(BigInt(ethers.getAddress(tenant.agentAddress)));
 
     // The signature must recover to the registered agent's address —
     // confirms the daemon's custodial key for THIS agent was the one
@@ -464,6 +466,7 @@ describe('publishJsonLd', () => {
       contextGraphId: BigInt(onChainId),
       merkleRoot: merkleRootBytes,
       authorAddress: seal!.authorAddress,
+      reservedKaId,
       schemeVersion: seal!.schemeVersion,
     });
     const recoveredFromSeal = ethers.recoverAddress(
@@ -521,10 +524,9 @@ describe('publishJsonLd', () => {
     ).rejects.toThrow(/self-sovereign/);
   }, 30_000);
 
-  // §F2: async-lift seal deferred to rc.18 — publishAsync is now sealless for
-  // non-preSigned async (no 0n placeholder); WM/SWM async (EPCIS/Kafka) is
-  // unaffected. Re-enable when rc.18 wires async reservedKaId allocation.
-  it.skip('async publish attaches a seal to the LiftRequest with merkleRoot == canonicalPublishPayload(resolved slice)', async () => {
+  // OT-RFC-43 §F2 — the async-lift seal is built at enqueue (agent canonicalizes +
+  // signs over the resolved slice's merkle + the allocated reservedKaId).
+  it('async publish attaches a seal to the LiftRequest with merkleRoot == canonicalPublishPayload(resolved slice)', async () => {
     // Agent canonicalizes + signs at enqueue → publisher verifies + consumes verbatim. Real provenance, not "publisher said so".
     const { agent, store } = await createAgent('AsyncSealParityBot');
     await agent.createContextGraph({ id: 'async-seal-parity', name: 'AsyncSealParity', description: '' });
@@ -553,6 +555,12 @@ describe('publishJsonLd', () => {
     expect(seal?.signature.r).toMatch(/^0x[0-9a-f]{64}$/i);
     expect(seal?.signature.vs).toMatch(/^0x[0-9a-f]{64}$/i);
     expect(seal?.schemeVersion).toBe(1);
+    // §F2 — the seal carries the packed reservedKaId (stringified bigint) in the
+    // signing author's namespace; the publisher mints exactly this id.
+    expect(seal?.reservedKaId).toMatch(/^\d+$/);
+    expect(BigInt(seal!.reservedKaId!) >> 96n).toBe(
+      BigInt(ethers.getAddress(seal!.authorAddress)),
+    );
   }, 30_000);
 
   it('async publish on a non-V10 chain enqueues without a seal (no on-chain publish to seal for)', async () => {
@@ -581,10 +589,79 @@ describe('publishJsonLd', () => {
     expect(job?.request.seal).toBeUndefined();
   }, 30_000);
 
-  // §F2: async-lift seal deferred to rc.18 — publishAsync is now sealless for
-  // non-preSigned async (no 0n placeholder); WM/SWM async (EPCIS/Kafka) is
-  // unaffected. Re-enable when rc.18 wires async reservedKaId allocation.
-  it.skip('async publish on V10 chain attaches a seal (no fallback needed)', async () => {
+  // OT-RFC-43 §F2 — backstop: the WM/SWM write is committed BEFORE seal-building and
+  // publishAsync has no outer rollback, so an unexpected throw inside buildAsyncLiftSeal
+  // (transient store read, slice/validation race, signer failure) must degrade to a
+  // SEALLESS lift — never orphan the staged capture or swallow the captureID.
+  it('async publish degrades to sealless (no orphaned write) when seal-building throws', async () => {
+    const { agent, store } = await createAgent('AsyncSealThrowBot');
+    await agent.createContextGraph({ id: 'async-seal-throw', name: 'AsyncSealThrow', description: '' });
+    await agent.registerContextGraph('async-seal-throw');
+
+    // Force the seal pipeline to throw, simulating a transient failure after the
+    // (already-committed) workspace write.
+    (agent as unknown as { buildAsyncLiftSeal: () => Promise<undefined> }).buildAsyncLiftSeal =
+      async () => {
+        throw new Error('simulated transient seal-build failure');
+      };
+
+    const { captureID } = await agent.publishAsync(
+      'did:dkg:context-graph:async-seal-throw',
+      {
+        public: {
+          '@context': 'http://schema.org/',
+          '@id': 'http://example.org/ThrowEntity',
+          '@type': 'Thing',
+          'name': 'Throw',
+        },
+      },
+      { localOnly: true },
+    );
+    // The capture was still enqueued (NOT orphaned) and returned a usable captureID.
+    expect(captureID).toBeTruthy();
+
+    const asyncPublisher = new TripleStoreAsyncLiftPublisher(store);
+    const job = await asyncPublisher.getStatus(captureID);
+    expect(job).not.toBeNull();
+    // Sealless: the lift carries no seal, so the publisher stages WM/SWM without an
+    // on-chain VM anchor (exactly the prior always-sealless async behaviour).
+    expect(job?.request.seal).toBeUndefined();
+  }, 30_000);
+
+  // OT-RFC-43 §F2 — the sealless backstop is ONLY for the implicit machine-capture
+  // path. An EXPLICIT authorship request (custodial authorAgentAddress / self-sovereign
+  // callback) that fails to seal must surface — silently enqueuing an unauthored job
+  // and reporting success would hide that the requested attestation never happened.
+  it('async publish re-throws (does not silently go sealless) when an EXPLICIT author seal-build fails', async () => {
+    const { agent } = await createAgent('AsyncSealExplicitThrowBot');
+    await agent.createContextGraph({ id: 'async-seal-explicit-throw', name: 'AsyncSealExplicitThrow', description: '' });
+    await agent.registerContextGraph('async-seal-explicit-throw');
+    const tenant = await agent.registerAgent('ExplicitTenant');
+
+    (agent as unknown as { buildAsyncLiftSeal: () => Promise<undefined> }).buildAsyncLiftSeal =
+      async () => {
+        throw new Error('simulated signer failure');
+      };
+
+    await expect(
+      agent.publishAsync(
+        'did:dkg:context-graph:async-seal-explicit-throw',
+        {
+          public: {
+            '@context': 'http://schema.org/',
+            '@id': 'http://example.org/ExplicitThrow',
+            '@type': 'Thing',
+            'name': 'ExplicitThrow',
+          },
+        },
+        { localOnly: true, authorAgentAddress: tenant.agentAddress },
+      ),
+    ).rejects.toThrow(/simulated signer failure/);
+  }, 30_000);
+
+  // OT-RFC-43 §F2 — V10-ready + on-chain CG ⇒ the agent signs the canonical merkle
+  // (with the allocated reservedKaId) at enqueue; the publisher consumes it verbatim.
+  it('async publish on V10 chain attaches a seal (no fallback needed)', async () => {
     // V10-ready + CG registered → agent signs canonical merkle at enqueue, publisher consumes verbatim.
     const { agent, store } = await createAgent('AsyncSealBot');
     await agent.createContextGraph({ id: 'async-seal', name: 'AsyncSeal', description: '' });
@@ -610,10 +687,9 @@ describe('publishJsonLd', () => {
     expect(job?.request.seal?.merkleRoot).toMatch(/^0x[0-9a-f]{64}$/i);
   }, 30_000);
 
-  // §F2: async-lift seal deferred to rc.18 — publishAsync is now sealless for
-  // non-preSigned async (no 0n placeholder); WM/SWM async (EPCIS/Kafka) is
-  // unaffected. Re-enable when rc.18 wires async reservedKaId allocation.
-  it.skip('async publish for private-only content on V10 chain attaches a seal (mirrors EPCIS capture path)', async () => {
+  // OT-RFC-43 §F2 — the EPCIS/Kafka capture shape (private-only) earns a seal too:
+  // the merkle covers the private root, and a reservedKaId is allocated + bound.
+  it('async publish for private-only content on V10 chain attaches a seal (mirrors EPCIS capture path)', async () => {
     const { agent, store } = await createAgent('AsyncSealPrivBot');
     await agent.createContextGraph({ id: 'async-seal-priv', name: 'AsyncSealPriv', description: '' });
     await agent.registerContextGraph('async-seal-priv');
@@ -635,10 +711,9 @@ describe('publishJsonLd', () => {
     expect(job?.request.seal).toBeDefined();
   }, 30_000);
 
-  // §F2: async-lift seal deferred to rc.18 — publishAsync is now sealless for
-  // non-preSigned async (no 0n placeholder); WM/SWM async (EPCIS/Kafka) is
-  // unaffected. Re-enable when rc.18 wires async reservedKaId allocation.
-  it.skip('async publish builds the seal when public snapshots are externalized to disk', async () => {
+  // OT-RFC-43 §F2 — disk-externalized public snapshots still resolve into the seal's
+  // merkle at enqueue, so the seal (with its reservedKaId) is built as usual.
+  it('async publish builds the seal when public snapshots are externalized to disk', async () => {
     const dataDir = await createTempDataDir('dkg-agent-public-snapshots-');
     const { agent, store } = await createAgent('AsyncSealDiskSnapshotBot', { dataDir });
     await agent.createContextGraph({ id: 'async-seal-disk-snapshot', name: 'AsyncSealDiskSnapshot', description: '' });
@@ -684,9 +759,13 @@ describe('publishJsonLd', () => {
 
     // Arbitrary bytes — this test is passthrough wiring, not seal validity.
     const expectedMerkleRoot = new Uint8Array(32).fill(0xab);
-    const customAuthor = '0xAaaAAaaaAaaaaaAAAaAaaaaaAAAaaaaAaAaAAaaA';
+    // Valid EIP-55 address (publishAsync getAddress-validates the attested author).
+    const customAuthor = ethers.getAddress('0x' + 'ab'.repeat(20));
     const sigR = new Uint8Array(32).fill(0xbb);
     const sigVs = new Uint8Array(32).fill(0xcc);
+    // §F2 — the pre-signed packed id MUST live in `customAuthor`'s namespace
+    // (high 160 bits == author); publishAsync rejects it otherwise.
+    const presignedReservedKaId = (BigInt(customAuthor) << 96n) | 7n;
 
     const { captureID } = await agent.publishAsync(
       'did:dkg:context-graph:async-seal-presigned',
@@ -705,6 +784,7 @@ describe('publishJsonLd', () => {
           authorAddress: customAuthor,
           signature: { r: sigR, vs: sigVs },
           schemeVersion: 1,
+          reservedKaId: presignedReservedKaId,
         },
       },
     );
@@ -718,6 +798,8 @@ describe('publishJsonLd', () => {
     expect(seal?.signature.r).toBe('0x' + 'bb'.repeat(32));
     expect(seal?.signature.vs).toBe('0x' + 'cc'.repeat(32));
     expect(seal?.schemeVersion).toBe(1);
+    // §F2 — the attested reservedKaId is threaded byte-for-byte onto the seal.
+    expect(seal?.reservedKaId).toBe(`${presignedReservedKaId}`);
   }, 30_000);
 
   it('async publish rejects preSignedAuthorAttestation + authorAgentAddress as mutually exclusive', async () => {
@@ -756,10 +838,9 @@ describe('publishJsonLd', () => {
     ).rejects.toThrow(/mutually exclusive/);
   }, 15_000);
 
-  // deferred to rc.18 (§F2 async reservedKaId binding): the async-lift seal signs
-  // over a 0n reservedKaId placeholder, and recovery rebuilds the digest with the
-  // now-required 5th field. Re-enable when rc.18 binds the async reservedKaId.
-  it.skip('async publish supports authorSignTypedData callback for self-sovereign signing (sync parity)', async () => {
+  // OT-RFC-43 §F2 — the callback receives typed data that already binds the
+  // allocated reservedKaId; recovery rebuilds the digest with that 5th field.
+  it('async publish supports authorSignTypedData callback for self-sovereign signing (sync parity)', async () => {
     // Self-sovereign agents (caller holds key off-node) sign via callback. Daemon prepares typed data, caller signs.
     const { agent, store } = await createAgent('AsyncSealCallbackBot');
     await agent.createContextGraph({ id: 'async-seal-callback', name: 'AsyncSealCallback', description: '' });
@@ -771,7 +852,7 @@ describe('publishJsonLd', () => {
     const selfSov = await agent.registerAgent('SelfSovAuthor', { publicKey: publicKeyCompressed });
     expect(selfSov.agentAddress.toLowerCase()).toBe(externallyHeld.address.toLowerCase());
 
-    let typedDataReceived: { domain: unknown; types: unknown; message: { authorAddress: string; merkleRoot: string } } | null = null;
+    let typedDataReceived: { domain: unknown; types: unknown; message: { authorAddress: string; merkleRoot: string; reservedKaId: bigint } } | null = null;
     const { captureID } = await agent.publishAsync(
       'did:dkg:context-graph:async-seal-callback',
       {
@@ -810,6 +891,12 @@ describe('publishJsonLd', () => {
     const seal = job?.request.seal;
     expect(seal).toBeDefined();
     expect(seal?.authorAddress.toLowerCase()).toBe(selfSov.agentAddress.toLowerCase());
+    // §F2 — reservedKaId is allocated in the self-sovereign author's namespace and
+    // bound into the digest the callback signed.
+    expect(seal?.reservedKaId).toBeDefined();
+    const reservedKaId = BigInt(seal!.reservedKaId!);
+    expect(reservedKaId >> 96n).toBe(BigInt(ethers.getAddress(selfSov.agentAddress)));
+    expect(BigInt(typedDataReceived!.message.reservedKaId)).toBe(reservedKaId);
 
     // Recovered signer must match the self-sovereign EOA, not the publisher.
     const onChainId = (await agent.getContextGraphOnChainId('async-seal-callback')) as string;
@@ -825,6 +912,7 @@ describe('publishJsonLd', () => {
       contextGraphId: BigInt(onChainId),
       merkleRoot: ethers.getBytes(seal!.merkleRoot),
       authorAddress: seal!.authorAddress,
+      reservedKaId,
       schemeVersion: seal!.schemeVersion,
     });
     const recovered = ethers.recoverAddress(
@@ -868,11 +956,9 @@ describe('publishJsonLd', () => {
     ).rejects.toThrow(/authorSignTypedData requires authorAgentAddress/);
   }, 15_000);
 
-  // deferred to rc.18 (§F2 async reservedKaId binding): the async-lift seal does
-  // not yet allocate/bind a packed reservedKaId, so the on-chain mint reverts
-  // KaIdNamespaceMismatch on the 0n placeholder. Re-enable when rc.18 wires the
-  // async-lift binding (swm/share-async is 501-gated in rc.17).
-  it.skip('E2E: async publish via authorSignTypedData callback lands on-chain with KC.author == self-sovereign agent', async () => {
+  // OT-RFC-43 §F2 — the self-sovereign callback signs over the bound reservedKaId,
+  // so the publisher mints exactly that id and KC.author == the self-sovereign agent.
+  it('E2E: async publish via authorSignTypedData callback lands on-chain with KC.author == self-sovereign agent', async () => {
     // Self-sovereign callback path E2E: caller signs off-node, publisher consumes verbatim, KC.author == self-sov agent.
     const { agent, store } = await createAgent('AsyncCallbackE2EBot');
     await agent.createContextGraph({ id: 'async-cb-e2e', name: 'AsyncCBE2E', description: '' });
@@ -1085,10 +1171,9 @@ describe('publishJsonLd', () => {
     }
   }, 15_000);
 
-  // §F2: async-lift seal deferred to rc.18 — publishAsync is now sealless for
-  // non-preSigned async (no 0n placeholder); WM/SWM async (EPCIS/Kafka) is
-  // unaffected. Re-enable when rc.18 wires async reservedKaId allocation.
-  it.skip('async publish does NOT pass cgId to publisher fallback methods (matches sync assertionFinalize behavior)', async () => {
+  // OT-RFC-43 §F2 — the async-lift seal's publisher-fallback signer path mirrors
+  // sync `assertionFinalize`: both fallback + sign are called WITHOUT a cgId.
+  it('async publish does NOT pass cgId to publisher fallback methods (matches sync assertionFinalize behavior)', async () => {
     // Pins sync `assertionFinalize` parity. Threading cgId surfaces a publisher-side
     // `signTypedData` fallback bug (recovers chain default, not the recorded author).
     // Fix lives in the publisher, not the agent — out of scope for this PR.

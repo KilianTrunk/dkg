@@ -628,6 +628,37 @@ describe('publishJsonLd', () => {
     expect(job?.request.seal).toBeUndefined();
   }, 30_000);
 
+  // OT-RFC-43 §F2 — the sealless backstop is ONLY for the implicit machine-capture
+  // path. An EXPLICIT authorship request (custodial authorAgentAddress / self-sovereign
+  // callback) that fails to seal must surface — silently enqueuing an unauthored job
+  // and reporting success would hide that the requested attestation never happened.
+  it('async publish re-throws (does not silently go sealless) when an EXPLICIT author seal-build fails', async () => {
+    const { agent } = await createAgent('AsyncSealExplicitThrowBot');
+    await agent.createContextGraph({ id: 'async-seal-explicit-throw', name: 'AsyncSealExplicitThrow', description: '' });
+    await agent.registerContextGraph('async-seal-explicit-throw');
+    const tenant = await agent.registerAgent('ExplicitTenant');
+
+    (agent as unknown as { buildAsyncLiftSeal: () => Promise<undefined> }).buildAsyncLiftSeal =
+      async () => {
+        throw new Error('simulated signer failure');
+      };
+
+    await expect(
+      agent.publishAsync(
+        'did:dkg:context-graph:async-seal-explicit-throw',
+        {
+          public: {
+            '@context': 'http://schema.org/',
+            '@id': 'http://example.org/ExplicitThrow',
+            '@type': 'Thing',
+            'name': 'ExplicitThrow',
+          },
+        },
+        { localOnly: true, authorAgentAddress: tenant.agentAddress },
+      ),
+    ).rejects.toThrow(/simulated signer failure/);
+  }, 30_000);
+
   // OT-RFC-43 §F2 — V10-ready + on-chain CG ⇒ the agent signs the canonical merkle
   // (with the allocated reservedKaId) at enqueue; the publisher consumes it verbatim.
   it('async publish on V10 chain attaches a seal (no fallback needed)', async () => {

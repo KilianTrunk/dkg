@@ -827,6 +827,15 @@ export class PublishMethods extends DKGAgentBase {
       // KaIdNamespaceMismatch). Validate here, BEFORE workspace staging, so a bad
       // attestation never leaves an orphan WM write.
       const preSigned = opts.preSignedAuthorAttestation;
+      // Presence/type guard first — an untyped (JS / older-client) caller that omits
+      // the new field would otherwise hit `undefined >> 96n` and surface a cryptic
+      // "cannot mix BigInt" TypeError instead of this stable contract error.
+      if (typeof preSigned.reservedKaId !== 'bigint') {
+        throw new Error(
+          'publishAsync: preSignedAuthorAttestation.reservedKaId is required and must be a bigint — ' +
+            'the packed (uint160(author) << 96) | number the author signed into the digest (OT-RFC-43 §F2).',
+        );
+      }
       if ((preSigned.reservedKaId >> 96n) !== BigInt(ethers.getAddress(preSigned.authorAddress))) {
         throw new Error(
           `publishAsync: preSignedAuthorAttestation reservedKaId namespace mismatch — ` +
@@ -941,17 +950,23 @@ export class PublishMethods extends DKGAgentBase {
     if (opts?.preSignedAuthorAttestation) {
       seal = preSignedAttestationToLiftSeal(opts.preSignedAuthorAttestation);
     } else {
-      // The WM/SWM write above is already committed and there is no outer rollback,
-      // so seal-building MUST NOT throw out of publishAsync — that would orphan the
-      // staged capture and return no captureID. `buildAsyncLiftSeal` already
-      // degrades to `undefined` (sealless) for the expected non-mintable conditions
-      // (non-V10 / off-chain CG / noop / no allocator / no signer) and for an
-      // allocate failure; this catch is the backstop for any *unexpected* throw in
-      // its resolve → validate → subtract → canonicalize → sign pipeline (a
-      // transient store read, a slice/validation inconsistency from a concurrent
-      // finalize, a signer rejection). On any such error the capture stays in
-      // WM/SWM and simply forgoes its on-chain VM anchor — identical to the prior
-      // (always-sealless) async behaviour, never an orphaned write.
+      // `buildAsyncLiftSeal` degrades to `undefined` (sealless) for the expected
+      // non-mintable conditions (non-V10 / off-chain CG / noop / no allocator / no
+      // signer) and for an allocate failure. A *thrown* error is different and is
+      // handled by caller intent:
+      //   • IMPLICIT machine-capture path (no explicit author → publisher-fallback
+      //     signer; the EPCIS/Kafka shape): the WM/SWM write above is already
+      //     committed with no outer rollback, and the caller asked for a best-effort
+      //     capture, not a specific author's attestation. Degrade to a SEALLESS lift
+      //     (WM/SWM kept, on-chain anchor skipped) rather than orphan the staged
+      //     write — identical to the prior always-sealless async behaviour.
+      //   • EXPLICIT authorship request (custodial authorAgentAddress or a
+      //     self-sovereign authorSignTypedData callback): the caller specifically
+      //     asked for THAT author's attestation. Silently enqueuing an unauthored
+      //     sealless job and returning a captureID would report success without the
+      //     attestation ever being produced — so surface the failure instead.
+      const explicitAuthorshipRequested =
+        opts?.authorAgentAddress != null || opts?.authorSignTypedData != null;
       try {
         seal = await this.buildAsyncLiftSeal(
           liftRequestDraft,
@@ -959,6 +974,7 @@ export class PublishMethods extends DKGAgentBase {
           opts?.authorSignTypedData,
         );
       } catch (err) {
+        if (explicitAuthorshipRequested) throw err;
         this.log.warn(
           ctx,
           `Async-lift seal build failed; lift stays sealless (WM/SWM committed, ` +

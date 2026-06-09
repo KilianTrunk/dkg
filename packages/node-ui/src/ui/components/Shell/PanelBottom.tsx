@@ -3,7 +3,7 @@ import { useLayoutStore, maxBottomHeight } from '../../stores/layout.js';
 import { api } from '../../api-wrapper.js';
 import { formatTime, formatDuration, shortId } from '../../hooks.js';
 
-const BOTTOM_TABS = ['Node Log', 'Transactions', 'Gossip'] as const;
+const BOTTOM_TABS = ['Node Log', 'Transactions'] as const;
 type BottomTab = typeof BOTTOM_TABS[number];
 
 // ── Icons ────────────────────────────────────────────────────────────────────
@@ -264,71 +264,6 @@ function TransactionsContent() {
   );
 }
 
-// ── Gossip ────────────────────────────────────────────────────────────────────
-// Shows only raw libp2p / ProtocolRouter / GossipSub lines — NOT structured
-// DKGAgent operation logs (those live in Node Log and Operations).
-// Once OTEL is live this tab will be backed by a dedicated trace/metric stream.
-
-// Structured DKGAgent lines start with: "YYYY-MM-DD HH:MM:SS <optype> <uuid>"
-const STRUCTURED_LOG_RE = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \w+ [0-9a-f-]{36}/;
-
-function isLibp2pLine(line: string): boolean {
-  const s = stripAnsi(line);
-  if (STRUCTURED_LOG_RE.test(s)) return false; // skip DKGAgent structured lines
-  if (/Connection (opened|closed):/i.test(s)) return true;
-  if (/\[ProtocolRouter\]/i.test(s)) return true;
-  if (/Circuit reservation/i.test(s)) return true;
-  if (/Node is remotely-dialable/i.test(s)) return true;
-  if (/gossipsub|pubsub/i.test(s)) return true;
-  if (/FinalizationHandler/i.test(s)) return true;
-  if (/swm-ack|swm-share|swm-update/i.test(s)) return true;
-  return false;
-}
-
-function GossipContent() {
-  const [lines, setLines] = useState<string[]>([]);
-  const [filter, setFilter] = useState('');
-
-  const load = useCallback(() => {
-    api.fetchNodeLog({ lines: 500 })
-      .then(({ lines: l }: any) => setLines((l ?? []).map(stripAnsi).filter(isLibp2pLine)))
-      .catch(() => {});
-  }, []);
-
-  useEffect(() => { load(); const iv = setInterval(load, 5_000); return () => clearInterval(iv); }, [load]);
-
-  const visible = filter ? lines.filter(l => l.toLowerCase().includes(filter.toLowerCase())) : lines;
-  const gossipLastLine = visible.length > 0 ? visible[visible.length - 1] : '';
-  const scrollRef = useAutoScroll(gossipLastLine);
-
-  return (
-    <div className="v10-log-container">
-      <div className="v10-log-toolbar">
-        <input
-          id="dkg-gossip-log-filter"
-          name="dkg-gossip-log-filter"
-          type="text"
-          placeholder="Filter libp2p / gossip events..."
-          className="v10-log-filter"
-          value={filter}
-          onChange={(e) => setFilter(e.target.value)}
-          aria-label="Filter gossip log lines"
-        />
-      </div>
-      <div className="v10-log-output" ref={scrollRef}>
-        {visible.map((line, i) => (
-          <div key={i} className="v10-log-line" style={{ color: 'var(--text-secondary)' }}>{line}</div>
-        ))}
-        {visible.length === 0 && (
-          <div className="v10-log-line" style={{ color: 'var(--text-tertiary)' }}>
-            No libp2p / gossip events in log tail
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
 // ── Panel ─────────────────────────────────────────────────────────────────────
 
 export function PanelBottom() {
@@ -424,7 +359,6 @@ export function PanelBottom() {
         <div className="v10-bottom-content">
           {activeTab === 'Node Log' && <NodeLogContent />}
           {activeTab === 'Transactions' && <TransactionsContent />}
-          {activeTab === 'Gossip' && <GossipContent />}
         </div>
       )}
     </div>

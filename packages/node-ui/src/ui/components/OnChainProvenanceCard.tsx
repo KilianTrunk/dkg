@@ -4,8 +4,8 @@
  *
  * Mounted as a CHILD of `<RdfGraph>` (the dkg-graph-viz React wrapper), so it
  * reads the clicked node straight from the viz context via `useRdfGraph()` —
- * no screen-coordinate plumbing required. It floats in the graph's bottom-right
- * corner (next to / above the library's `NodePanel`) and shows:
+ * no screen-coordinate plumbing required. It floats in the graph's bottom-left
+ * corner (clear of the library's `NodePanel`, which sits bottom-right) and shows:
  *
  *   • UAL (did:dkg:…), transaction hash (+ block-explorer link), block number,
  *     packed KA id, and author — for entities anchored in Verifiable Memory.
@@ -14,7 +14,7 @@
  * Data comes from `useEntityOnChainReceipt`, which reads the publish receipt
  * the daemon persists at publish time (read-only over /api/query).
  */
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { useRdfGraph } from '@origintrail-official/dkg-graph-viz/react';
 import { useEntityOnChainReceipt } from '../hooks/useEntityOnChainReceipt.js';
 import { truncateId } from '../hooks/useVerifiedEntityIdentity.js';
@@ -39,12 +39,16 @@ export const OnChainProvenanceCard: React.FC<OnChainProvenanceCardProps> = ({
   explorerUrl,
 }) => {
   const { selectedNode } = useRdfGraph();
-  // Local dismissal keyed by node id: the × hides the card until a *different*
-  // node is clicked (the viz owns `selectedNode`; clicking empty space clears
-  // it). Re-selecting the same node after dismissing re-opens it.
+  // Local dismissal: the × hides the card for the CURRENT selection only. Any
+  // change of selection (to another node, or cleared to null) resets it via the
+  // effect below, so selecting a node away and back always re-opens its card —
+  // the dismissal never sticks past the selection it was made for.
   const [dismissedId, setDismissedId] = useState<string | null>(null);
 
   const nodeId = selectedNode?.id ?? null;
+  useEffect(() => {
+    setDismissedId(null);
+  }, [nodeId]);
   const open = Boolean(nodeId) && nodeId !== dismissedId;
   const receipt = useEntityOnChainReceipt(contextGraphId, nodeId, open);
 
@@ -160,10 +164,10 @@ export const OnChainProvenanceCard: React.FC<OnChainProvenanceCardProps> = ({
             </div>
           )}
 
-          {receipt.publishedAt && (
+          {receipt.finalizedAt && (
             <div className="v10-vm-identity-row">
-              <span className="v10-vm-identity-lbl">Published</span>
-              <span className="v10-vm-identity-val">{formatWhen(receipt.publishedAt)}</span>
+              <span className="v10-vm-identity-lbl">Finalized</span>
+              <span className="v10-vm-identity-val">{formatWhen(receipt.finalizedAt)}</span>
             </div>
           )}
         </div>

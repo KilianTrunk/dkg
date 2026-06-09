@@ -7,30 +7,41 @@
  * blockchain receipt the publisher persists at publish time:
  *
  *   • `buildAssertionPublishReceiptQuads` (packages/core/src/assertion-seal.ts)
- *     writes, keyed by the assertion URI, into the context-graph `_meta` graph:
- *        <assertion>  dkg:publishedAtTx     "0x…"            (real tx hash)
- *        <assertion>  dkg:publishedAtBlock  "N"^^xsd:integer
- *        <assertion>  dkg:publishedAtKaId   "<packed>"^^xsd:integer
- *   • the lifecycle URN carries  dkg:reservedUal  "did:dkg:evm:<chain>/<addr>/<n>"
- *     — the deterministic Option-1 UAL.
+ *     writes, keyed by the FULL assertion URI, into the context-graph `_meta`:
+ *        <assertionUri>  dkg:publishedAtTx        "0x…"            (real tx hash)
+ *        <assertionUri>  dkg:publishedAtBlock     "N"^^xsd:integer
+ *        <assertionUri>  dkg:publishedAtKaId      "<packed>"^^xsd:integer
+ *        <assertionUri>  dkg:assertionFinalizedAt "…"^^xsd:dateTime
+ *   • the assertion lifecycle URN, in the SAME `_meta` graph, carries:
+ *        <lifecycle>  dkg:rootEntity  <assertionUri> ;
+ *                     dkg:reservedUal "did:dkg:evm:<chain>/<addr>/<n>" .
  *
- * The clicked node is an *entity*, but the receipt is keyed by the *KA*
- * (assertion / {addr}/{name}). The bridge is the `ShareTransition` record in
- * `_shared_memory_meta` (packages/publisher/src/metadata.ts), which links each
- * member entity to its assertion source:
+ * The clicked node is an *entity*, not the KA. The bridge is the
+ * `ShareTransition` record in `_shared_memory_meta`
+ * (packages/publisher/src/metadata.ts), which links each member entity to its
+ * assertion source:
  *
  *     <urn:dkg:share:{opId}>  dkg:entities  <entity> ;
  *                             dkg:source    "assertion/{addr}/{name}" ;
  *                             dkg:agent     did:dkg:agent:{addr} ;
  *                             dkg:timestamp "…"^^xsd:dateTime .
  *
- * So the resolution is two SPARQL hops:
- *   1. entity → ShareTransition → (addr, name, agent, timestamp)
- *   2. (addr, name) → `_meta` → (reservedUal, txHash, block, kaId)
+ * Resolution (two SPARQL hops):
+ *   1. entity → ShareTransition → (addr, name, agent).
+ *   2. (addr, name) + the clicked entity → `_meta`. Because the same
+ *      `(addr, name)` can exist in BOTH a root partition and a sub-graph
+ *      partition, we do not trust `(addr, name)` alone: we additionally require
+ *      the receipt's assertion URI to be a PREFIX of the clicked entity (every
+ *      member entity — the root and its skolem/genid descendants — is
+ *      namespaced under its assertion URI), preferring prefix / longest
+ *      matches, so the EXACT assertion the entity belongs to wins rather than
+ *      an arbitrary same-named one. reservedUal is read by joining the
+ *      lifecycle URN on `dkg:rootEntity = <assertionUri>` (no URN guessing).
  *
  * Status semantics:
  *   • 'verified'  — a real on-chain receipt (tx hash) was found.
  *   • 'offchain'  — the entity is known to WM/SWM but has no VM receipt yet.
+ *   • 'error'     — a query failed (kept DISTINCT from 'offchain').
  *   • 'idle'      — no entity / disabled.
  *
  * Everything is read-only over `/api/query`; nothing is written.
@@ -54,8 +65,13 @@ export interface EntityOnChainReceipt {
   kaId: string | null;
   /** 0x author address (parsed from the assertion source). */
   author: string | null;
-  /** ISO publish timestamp. */
-  publishedAt: string | null;
+  /**
+   * ISO assertion-finalize timestamp from the publish receipt
+   * (`dkg:assertionFinalizedAt`). This is the assertion's finalize time — NOT
+   * the WM→SWM promote time (the `ShareTransition` timestamp), which we
+   * deliberately do not surface as a publish/finalize time.
+   */
+  finalizedAt: string | null;
   /** did:dkg:agent:… that fired the publish. */
   agent: string | null;
   error?: string;
@@ -68,7 +84,7 @@ const EMPTY: EntityOnChainReceipt = {
   blockNumber: null,
   kaId: null,
   author: null,
-  publishedAt: null,
+  finalizedAt: null,
   agent: null,
 };
 
@@ -103,11 +119,13 @@ function sparqlStr(value: string): string {
     .replace(/\r/g, '\\r');
 }
 
-/** Escape a value for safe embedding inside a `<…>` SPARQL IRI. */
+/**
+ * Validate a value for embedding inside a `<…>` SPARQL IRI ref. Returns the
+ * value unchanged when safe, or '' when it contains characters that would
+ * break out of the IRI ref — in which case the caller treats resolution as
+ * impossible rather than building a malformed (or injectable) query.
+ */
 function sparqlIri(value: string): string {
-  // Disallow the characters that would break out of an IRI ref. If any are
-  // present we treat the resolution as impossible rather than build a
-  // malformed query.
   return /[<>"{}|\\^`\s]/.test(value) ? '' : value;
 }
 
@@ -116,6 +134,7 @@ function sparqlIri(value: string): string {
  * Cross-subgraph `GRAPH ?g` over `_shared_memory_meta`, so we deliberately do
  * NOT pass contextGraphId (mirrors `useVerifiedMemoryAnchors`: passing it
  * constrains `GRAPH ?g` to CG-direct graphs and drops the share records).
+ * `entityIri` MUST already be validated via `sparqlIri`.
  */
 function buildShareQuery(cgId: string, entityIri: string): string {
   return `PREFIX dkg: <${DKG}>
@@ -135,28 +154,32 @@ SELECT ?source ?agent ?ts WHERE {
 }
 
 /**
- * Step 2: (addr, name) → `_meta` → reservedUal + on-chain receipt.
- * Fixed `GRAPH <…/_meta>` so we DO pass contextGraphId (mirrors
- * `fetchAssertionUals`). The receipt is keyed by the assertion URI; we match
- * it by `STRENDS(… "/assertion/{addr}/{name}")` so a sub-graph-qualified
- * assertion URI still resolves. reservedUal/kaId sit on the lifecycle URN.
+ * Step 2: resolve the EXACT on-chain receipt for the assertion the clicked
+ * entity belongs to.
+ *
+ * The receipt is keyed by the full assertion URI. Since `(addr, name)` is NOT
+ * unique across partitions, we constrain the match three ways: the assertion
+ * URI must (a) end with `/assertion/{addr}/{name}` and (b) be a prefix of the
+ * clicked entity URI, and we (c) order prefix-matches first then longest-first
+ * so the most specific (correct) assertion wins under `LIMIT 1`. reservedUal is
+ * joined off the lifecycle URN via `dkg:rootEntity`, avoiding any reconstructed
+ * `urn:dkg:assertion:…` key.
  */
-function buildReceiptQuery(cgId: string, addr: string, name: string): string {
+function buildReceiptQuery(cgId: string, entityIri: string, addr: string, name: string): string {
   const metaGraph = `did:dkg:context-graph:${cgId}/_meta`;
-  const lifecycleUri = `urn:dkg:assertion:${cgId}:${addr}:${name}`;
   const suffix = `/assertion/${addr}/${name}`;
+  const entityLit = sparqlStr(entityIri);
   return `PREFIX dkg: <${DKG}>
-SELECT ?ual ?tx ?block ?kaId WHERE {
+SELECT ?ual ?tx ?block ?kaId ?finalizedAt WHERE {
   GRAPH <${metaGraph}> {
-    OPTIONAL { <${lifecycleUri}> dkg:reservedUal ?ual . }
-    OPTIONAL {
-      ?asrt dkg:publishedAtTx ?tx ;
-            dkg:publishedAtBlock ?block ;
-            dkg:publishedAtKaId ?kaId .
-      FILTER(STRENDS(STR(?asrt), "${sparqlStr(suffix)}"))
-    }
+    ?asrt dkg:publishedAtTx ?tx ;
+          dkg:publishedAtBlock ?block ;
+          dkg:publishedAtKaId ?kaId .
+    FILTER(STRENDS(STR(?asrt), "${sparqlStr(suffix)}"))
+    OPTIONAL { ?asrt dkg:assertionFinalizedAt ?finalizedAt . }
+    OPTIONAL { ?lc dkg:rootEntity ?asrt ; dkg:reservedUal ?ual . }
   }
-} LIMIT 1`;
+} ORDER BY DESC(STRSTARTS("${entityLit}", STR(?asrt))) DESC(STRLEN(STR(?asrt))) LIMIT 1`;
 }
 
 /** `assertion/{addr}/{name}` → { addr, name }. */
@@ -184,8 +207,17 @@ export function useEntityOnChainReceipt(
 
     (async () => {
       try {
+        const safeEntity = sparqlIri(entityUri);
+        if (!safeEntity) {
+          // Entity id is not embeddable as a SPARQL IRI ref — can't resolve.
+          setState({ ...EMPTY, status: 'offchain' });
+          return;
+        }
+
         // ── Hop 1: find the entity's assertion via ShareTransition ──
-        const shareRes = await executeQuery(buildShareQuery(contextGraphId, entityUri)).catch(() => null);
+        // NOTE: query rejections propagate to the outer catch → 'error' state,
+        // kept distinct from a clean "no rows" → 'offchain'.
+        const shareRes = await executeQuery(buildShareQuery(contextGraphId, safeEntity));
         if (version !== versionRef.current) return;
 
         const shareRow = ((shareRes as any)?.result?.bindings ?? [])[0];
@@ -197,20 +229,19 @@ export function useEntityOnChainReceipt(
         const source = bv(shareRow.source);
         const parsed = parseSource(source);
         const agent = shareRow.agent ? unwrapIri(bv(shareRow.agent)) : null;
-        const publishedAt = shareRow.ts ? bv(shareRow.ts) : null;
         const addr = parsed?.addr ?? null;
 
         if (!parsed || !sparqlIri(parsed.addr) || !sparqlStr(parsed.name)) {
           // Resolved a share but can't safely build the receipt query.
-          setState({ ...EMPTY, status: 'offchain', author: addr, agent, publishedAt });
+          setState({ ...EMPTY, status: 'offchain', author: addr, agent });
           return;
         }
 
-        // ── Hop 2: pull the real on-chain receipt from `_meta` ──
+        // ── Hop 2: pull the EXACT on-chain receipt from `_meta` ──
         const receiptRes = await executeQuery(
-          buildReceiptQuery(contextGraphId, parsed.addr, parsed.name),
+          buildReceiptQuery(contextGraphId, safeEntity, parsed.addr, parsed.name),
           contextGraphId,
-        ).catch(() => null);
+        );
         if (version !== versionRef.current) return;
 
         const receiptRow = ((receiptRes as any)?.result?.bindings ?? [])[0];
@@ -218,6 +249,7 @@ export function useEntityOnChainReceipt(
         const txHash = receiptRow?.tx ? bv(receiptRow.tx) : null;
         const blockNumber = receiptRow?.block ? bv(receiptRow.block) : null;
         const kaId = receiptRow?.kaId ? bv(receiptRow.kaId) : null;
+        const finalizedAt = receiptRow?.finalizedAt ? bv(receiptRow.finalizedAt) : null;
 
         setState({
           status: txHash ? 'verified' : 'offchain',
@@ -226,7 +258,7 @@ export function useEntityOnChainReceipt(
           blockNumber: blockNumber || null,
           kaId: kaId || null,
           author: addr,
-          publishedAt,
+          finalizedAt: finalizedAt || null,
           agent,
         });
       } catch (err: any) {

@@ -152,6 +152,25 @@ contract EpochStorage is INamed, IVersioned, HubDependent {
         uint256 endEpoch,
         uint96 tokenAmount
     ) external onlyContracts {
+        // SECURITY FIX: a credit whose startEpoch is already finalized is
+        // otherwise lost forever. `_finalizeEpochsUpTo` only folds `diff` for
+        // `(lastFinalizedEpoch, currentEpoch-1]` and never revisits a finalized
+        // epoch, so `diff[startEpoch] += p` at `startEpoch <= lastFinalizedEpoch`
+        // is never folded into `cumulative` (the tokens vanish — stranded in the
+        // contract with no payable pool entry) and the paired
+        // `diff[endEpoch+1] -= p` later under-credits an unrelated future epoch.
+        // Clamp the range forward to the first still-open epoch so the tokens are
+        // preserved and land in a payable epoch instead of being dropped. (Callers
+        // such as PublishingConviction settle elapsed billing windows lazily, so a
+        // past startEpoch is normal — clamp, don't revert.)
+        uint256 firstOpenEpoch = lastFinalizedEpoch[shardId] + 1;
+        if (startEpoch < firstOpenEpoch) {
+            startEpoch = firstOpenEpoch;
+            if (endEpoch < startEpoch) {
+                endEpoch = startEpoch;
+            }
+        }
+
         uint256 numEpochs = endEpoch - startEpoch + 1;
 
         uint96 totalTokens = tokenAmount + accumulatedRemainder[shardId];

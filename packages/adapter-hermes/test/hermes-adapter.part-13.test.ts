@@ -106,7 +106,7 @@ result = client.import_assertion_file("assertion name", "cg:test", str(safe_file
 assert result == {"success": True}, result
 assert len(calls) == 1, calls
 call = calls[0]
-assert call["url"].endswith("/api/assertion/assertion%20name/import-file"), call
+assert call["url"].endswith("/api/knowledge-assets/assertion%20name/wm/import-file"), call
 assert call["data"] == {"contextGraphId": "cg:test", "subGraphName": "sub"}, call
 assert call["headers"] == {"Accept": "application/json", "Authorization": "Bearer secret-token"}, call
 file_tuple = call["files"]["file"]

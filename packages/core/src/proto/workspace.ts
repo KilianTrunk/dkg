@@ -37,6 +37,9 @@ export const WorkspacePublishRequestSchema = new Type('WorkspacePublishRequest')
   .add(new Field('operationId', 7, 'string'))
   .add(new Field('casConditions', 8, 'WorkspaceCASCondition', 'repeated'))
   .add(new Field('subGraphName', 9, 'string'))
+  // OT-RFC-46 — per-KA SWM identity: receivers/sync target …/_shared_memory/{addr}/{number}
+  .add(new Field('agentAddress', 10, 'string'))
+  .add(new Field('kaNumber', 11, 'string'))
   .add(WorkspaceManifestEntrySchema)
   .add(WorkspaceCASConditionSchema);
 
@@ -68,6 +71,10 @@ export interface WorkspacePublishRequestMsg {
   casConditions?: WorkspaceCASConditionMsg[];
   /** Sub-graph within the context graph. Receivers store in sub-graph SWM if set. */
   subGraphName?: string;
+  /** OT-RFC-46 — the KA's author address; receivers target the per-KA SWM graph. */
+  agentAddress?: string;
+  /** OT-RFC-46 — the KA number (bigint as string); the per-KA SWM graph key. */
+  kaNumber?: string;
 }
 
 export function encodeWorkspacePublishRequest(msg: WorkspacePublishRequestMsg): Uint8Array {

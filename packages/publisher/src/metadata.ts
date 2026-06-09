@@ -5,6 +5,8 @@ import {
   isSafeIri,
   assertionLifecycleUri,
   contextGraphAssertionUri,
+  contextGraphSharedMemoryUri,
+  contextGraphLayerUri,
   contextGraphDataUri,
   contextGraphMetaUri,
   MemoryLayer,
@@ -1308,12 +1310,21 @@ export interface AssertionCreatedMeta {
   assertionName: string;
   subGraphName?: string;
   timestamp: Date;
+  /** D1 (identity-at-create) — per-author KA number minted at create. */
+  kaNumber?: string | number | bigint;
+  /** D1 (identity-at-create) — reserved UAL `did:dkg:{chain}/{addr}/{number}`. */
+  reservedUal?: string;
 }
 
 export function generateAssertionCreatedMetadata(meta: AssertionCreatedMeta): Quad[] {
   const metaGraph = `did:dkg:context-graph:${meta.contextGraphId}/_meta`;
   const subject = assertionLifecycleUri(meta.contextGraphId, meta.agentAddress, meta.assertionName, meta.subGraphName);
-  const graphUri = contextGraphAssertionUri(meta.contextGraphId, meta.agentAddress, meta.assertionName, meta.subGraphName);
+  // Uniform layout: the assertionGraph pointer must name the SAME per-KA WM graph the
+  // data is written to (else _meta-driven discovery/promote follows an empty name-keyed
+  // graph). Number-keyed once the KA has an identity (D1), else legacy name-keyed.
+  const graphUri = meta.kaNumber !== undefined
+    ? contextGraphLayerUri(meta.contextGraphId, MemoryLayer.WorkingMemory, meta.agentAddress, meta.kaNumber, meta.subGraphName)
+    : contextGraphAssertionUri(meta.contextGraphId, meta.agentAddress, meta.assertionName, meta.subGraphName);
   const agentUri = agentDid(meta.agentAddress);
   const eventUri = `${subject}/event/${nextEventId()}`;
 
@@ -1338,6 +1349,18 @@ export function generateAssertionCreatedMetadata(meta: AssertionCreatedMeta): Qu
     mq(eventUri, `${DKG}toLayer`, lit(MemoryLayer.WorkingMemory), metaGraph),
   ];
 
+  // D1 (identity-at-create): stamp the KA number + reserved UAL on the lifecycle URN
+  // so the UAL is the KA's identity from the first write — the per-KA graph name
+  // {addr}/{number} and the _meta row key both derive from it. Finalize's
+  // hasExistingKaId guard then finds this stamp and skips re-allocation. Consensus-
+  // neutral: the seal commits content+author, never the kaId.
+  if (meta.kaNumber !== undefined) {
+    quads.push(mq(subject, KA_ID_PRED, intLit(BigInt(meta.kaNumber)), metaGraph));
+  }
+  if (meta.reservedUal) {
+    quads.push(mq(subject, RESERVED_UAL_PRED, lit(meta.reservedUal), metaGraph));
+  }
+
   if (meta.subGraphName) {
     quads.push(mq(subject, `${DKG}subGraphName`, lit(meta.subGraphName), metaGraph));
   }
@@ -1350,6 +1373,8 @@ export interface AssertionPromotedMeta {
   agentAddress: string;
   assertionName: string;
   subGraphName?: string;
+  /** D1 — KA number, so the WM-delete targets the per-KA _working_memory/{addr}/{number} graph. */
+  kaNumber?: bigint | number | string;
   shareOperationId: string;
   rootEntities: string[];
   timestamp: Date;
@@ -1367,15 +1392,28 @@ export function generateAssertionPromotedMetadata(meta: AssertionPromotedMeta): 
   const subject = assertionLifecycleUri(meta.contextGraphId, meta.agentAddress, meta.assertionName, meta.subGraphName);
   const agentUri = agentDid(meta.agentAddress);
   const eventUri = `${subject}/event/${nextEventId()}`;
+  // SUBSTRATE-2: the layer-aware assertionGraph re-stamp. At create the pointer names
+  // the WM graph (metadata.ts generateAssertionCreatedMetadata); on promote it must
+  // re-point to the SWM-layer graph so the _meta index locates SWM data correctly.
+  // rc.17a: the shared bucket (contextGraphSharedMemoryUri); rc.17b flips this target
+  // to the per-KA SWM graph. Without this re-stamp the index follows a stale WM pointer.
+  const wmGraphUri = meta.kaNumber !== undefined
+    ? contextGraphLayerUri(meta.contextGraphId, MemoryLayer.WorkingMemory, meta.agentAddress, meta.kaNumber, meta.subGraphName)
+    : contextGraphAssertionUri(meta.contextGraphId, meta.agentAddress, meta.assertionName, meta.subGraphName);
+  const swmGraphUri = meta.kaNumber !== undefined
+    ? contextGraphLayerUri(meta.contextGraphId, MemoryLayer.SharedWorkingMemory, meta.agentAddress, meta.kaNumber, meta.subGraphName)
+    : contextGraphSharedMemoryUri(meta.contextGraphId, meta.subGraphName);
 
   const del = [
     assertionStateQuad(subject, 'created', metaGraph),
     assertionLayerQuad(subject, MemoryLayer.WorkingMemory, metaGraph),
+    mq(subject, `${DKG}assertionGraph`, wmGraphUri, metaGraph),
   ];
   const ins: Quad[] = [
     // Update assertion entity (mutable fields)
     mq(subject, `${DKG}state`, lit('promoted'), metaGraph),
     mq(subject, `${DKG}memoryLayer`, lit(MemoryLayer.SharedWorkingMemory), metaGraph),
+    mq(subject, `${DKG}assertionGraph`, swmGraphUri, metaGraph),
     // Event entity (prov:Activity + DKG layer transition)
     mq(eventUri, `${RDF}type`, `${PROV}Activity`, metaGraph),
     mq(eventUri, `${RDF}type`, `${DKG}AssertionPromoted`, metaGraph),
@@ -1394,7 +1432,14 @@ export function generateAssertionPromotedMetadata(meta: AssertionPromotedMeta): 
     ins.push(assertionLayerPointerQuad(subject, SWM_CURRENT_ASSERTION_PRED, meta.merkleHex, metaGraph));
   }
   for (const entity of meta.rootEntities) {
+    // membership on the event node (provenance of this promote)
     ins.push(...entityMemberQuads(eventUri, entity, metaGraph));
+    // SUBSTRATE-1: membership on the STABLE lifecycle URN, so the _meta index can
+    // resolve "which KAs contain member-entity X" by binding dkg:entity on the URN
+    // instead of walking per-event nodes. (Member entities are first known once the
+    // KA is sealed; promote is the first lifecycle event that carries them. The
+    // create-and-seal path (D2) should stamp the same rows on the URN.)
+    ins.push(...entityMemberQuads(subject, entity, metaGraph));
   }
   if (meta.subGraphName) {
     ins.push(mq(subject, `${DKG}subGraphName`, lit(meta.subGraphName), metaGraph));
@@ -1424,14 +1469,14 @@ export function generateAssertionPublishedMetadata(meta: AssertionPublishedMeta)
   const eventUri = `${subject}/event/${nextEventId()}`;
   const ins: Quad[] = [
     mq(subject, `${DKG}state`, lit('published'), metaGraph),
-    mq(subject, `${DKG}memoryLayer`, lit(MemoryLayer.VerifiedMemory), metaGraph),
+    mq(subject, `${DKG}memoryLayer`, lit(MemoryLayer.VerifiableMemory), metaGraph),
     mq(eventUri, `${RDF}type`, `${PROV}Activity`, metaGraph),
     mq(eventUri, `${RDF}type`, `${DKG}AssertionPublished`, metaGraph),
     mq(eventUri, `${PROV}startedAtTime`, dateLit(meta.timestamp), metaGraph),
     mq(eventUri, `${PROV}wasAssociatedWith`, agentUri, metaGraph),
     mq(eventUri, `${PROV}used`, subject, metaGraph),
     mq(eventUri, `${DKG}fromLayer`, lit(MemoryLayer.SharedWorkingMemory), metaGraph),
-    mq(eventUri, `${DKG}toLayer`, lit(MemoryLayer.VerifiedMemory), metaGraph),
+    mq(eventUri, `${DKG}toLayer`, lit(MemoryLayer.VerifiableMemory), metaGraph),
     mq(eventUri, `${DKG}kcUal`, meta.kcUal, metaGraph),
   ];
   // OT-RFC-43 A2 — stamp the VM pointer (vmCurrentAssertion).
@@ -1489,14 +1534,14 @@ export function generateAssertionUpdatedMetadata(meta: AssertionUpdatedMeta): { 
 
   const ins: Quad[] = [
     mq(subject, `${DKG}state`, lit('published'), metaGraph),
-    mq(subject, `${DKG}memoryLayer`, lit(MemoryLayer.VerifiedMemory), metaGraph),
+    mq(subject, `${DKG}memoryLayer`, lit(MemoryLayer.VerifiableMemory), metaGraph),
     mq(eventUri, `${RDF}type`, `${PROV}Activity`, metaGraph),
     mq(eventUri, `${RDF}type`, `${DKG}AssertionUpdated`, metaGraph),
     mq(eventUri, `${PROV}startedAtTime`, dateLit(meta.timestamp), metaGraph),
     mq(eventUri, `${PROV}wasAssociatedWith`, agentUri, metaGraph),
     mq(eventUri, `${PROV}used`, subject, metaGraph),
-    mq(eventUri, `${DKG}fromLayer`, lit(MemoryLayer.VerifiedMemory), metaGraph),
-    mq(eventUri, `${DKG}toLayer`, lit(MemoryLayer.VerifiedMemory), metaGraph),
+    mq(eventUri, `${DKG}fromLayer`, lit(MemoryLayer.VerifiableMemory), metaGraph),
+    mq(eventUri, `${DKG}toLayer`, lit(MemoryLayer.VerifiableMemory), metaGraph),
     mq(eventUri, `${DKG}kcUal`, meta.kcUal, metaGraph),
     // New per-layer pointers — WM converges back to VM after the update mint.
     assertionLayerPointerQuad(subject, VM_CURRENT_ASSERTION_PRED, newBare, metaGraph),

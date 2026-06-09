@@ -16,7 +16,7 @@ import {
   contextGraphPublishTopic, contextGraphWorkspaceTopic, contextGraphAppTopic, contextGraphUpdateTopic, contextGraphFinalizationTopic,
   contextGraphDataGraphUri, contextGraphMetaGraphUri, contextGraphWorkspaceGraphUri, contextGraphWorkspaceMetaGraphUri,
   contextGraphSharedMemoryUri,
-  contextGraphVerifiedMemoryUri, contextGraphVerifiedMemoryMetaUri,
+  contextGraphVerifiableMemoryUri, contextGraphVerifiableMemoryMetaUri,
   contextGraphDataUri, contextGraphMetaUri, assertionLifecycleUri, contextGraphAssertionUri,
   deriveCuratorDidFromCgId,
   MemoryLayer,
@@ -425,7 +425,7 @@ export class QueryMethods extends DKGAgentBase {
        */
       callerAgentAddress?: string;
       /**
-       * Minimum trust level for the verified-memory view (spec §14).
+       * Minimum trust level for the verifiable-memory view (spec §14).
        * Values above `SelfAttested` require explicit writer-side
        * `dkg:trustLevel` metadata. Ignored for other views.
        */

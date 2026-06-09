@@ -13,7 +13,7 @@
  * so only the leading quote is stripped, leaving `42"^^<…#integer>` on screen.
  * The same buggy pattern is in the Triples-tab object column
  * (`views/project/components.tsx:3705`). The correct, datatype-aware strip
- * already exists in sibling hooks (useVerifiedMemoryAnchors / useSwmAttributions
+ * already exists in sibling hooks (useVerifiableMemoryAnchors / useSwmAttributions
  * / useAssertionLifecycleEvents): `.replace(/^"/, '').replace(/"(\^\^<[^>]*>)?$/, '')`.
  *
  * This test is deterministic and uses NO mocks: it publishes a real WM entity

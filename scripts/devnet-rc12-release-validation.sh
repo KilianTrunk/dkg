@@ -844,9 +844,9 @@ for l in sys.stdin:
 if [ -n "$SROOT" ]; then
   sn=$(echo "$SROOT"|awk '{print $1}'); sc=$(echo "$SROOT"|awk '{print $2}'); sr=$(echo "$SROOT"|awk '{print $3}')
   sp="${NODE_PORT[$((sn-1))]}"
-  vm=$(post_long "$sp" /api/query -d "{\"sparql\":\"SELECT ?p WHERE { GRAPH ?g { <$sr> ?p ?o } FILTER(CONTAINS(STR(?g),\\\"$sc\\\")) } LIMIT 1\",\"contextGraphId\":\"$sc\",\"view\":\"verified-memory\"}")
+  vm=$(post_long "$sp" /api/query -d "{\"sparql\":\"SELECT ?p WHERE { GRAPH ?g { <$sr> ?p ?o } FILTER(CONTAINS(STR(?g),\\\"$sc\\\")) } LIMIT 1\",\"contextGraphId\":\"$sc\",\"view\":\"verifiable-memory\"}")
   vmb=$(echo "$vm" | pyf "len(d.get('result',{}).get('bindings',[]))")
-  [ "${vmb:-0}" -gt 0 ] && pass A vm-view "published KA visible in verified-memory view" || warn A vm-view "KA not in VM view yet (got $vm | first 120: ${vm:0:120})"
+  [ "${vmb:-0}" -gt 0 ] && pass A vm-view "published KA visible in verifiable-memory view" || warn A vm-view "KA not in VM view yet (got $vm | first 120: ${vm:0:120})"
   # peer replication: query another node
   pn=$(( sn % NUM_NODES + 1 )); pp="${NODE_PORT[$((pn-1))]}"
   found=0
@@ -865,7 +865,7 @@ fi
 
 # ── Section A2: canonical assertion lifecycle smoke ─────────────────────────
 # The bulk publish path above uses /api/shared-memory/write directly. The
-# canonical RFC-001 §9.x path is /api/assertion/create with finalize+promote
+# canonical RFC-001 §9.x path is /api/knowledge-assets (create) with finalize+promote
 # (create → write → finalize → promote in one shot), then publish to VM. A
 # regression in assertion finalize/promote could still let the SWM-write path
 # pass, so we exercise the canonical path end-to-end with one KA and gate the
@@ -885,12 +885,12 @@ quads = [
     {"subject": root, "predicate": RDF, "object": "http://schema.org/Dataset", "graph": ""},
     {"subject": root, "predicate": "http://schema.org/name", "object": '"rc12 assertion lifecycle smoke"', "graph": ""},
 ]
-print(json.dumps({"contextGraphId": cg, "name": name, "quads": quads, "finalize": True, "promote": True}))
+print(json.dumps({"contextGraphId": cg, "name": name, "quads": quads, "finalize": True, "alsoShareSwm": True}))
 PY
 )
-  ac=$(post "$A2_PORT" /api/assertion/create -d "$A2_BODY")
+  ac=$(post "$A2_PORT" /api/knowledge-assets -d "$A2_BODY")
   ac_uri=$(echo "$ac" | pyf "d.get('assertionUri','')")
-  ac_seal_ok=$(echo "$ac" | pyf "1 if (d.get('seal') or {}).get('merkleRoot') else 0")
+  ac_seal_ok=$(echo "$ac" | pyf "1 if d.get('merkleRoot') else 0")
   ac_promoted=$(echo "$ac" | pyf "d.get('promotedCount',0)")
   if [ -n "$ac_uri" ] && [ "$ac_seal_ok" = "1" ] && [ "${ac_promoted:-0}" -gt 0 ] 2>/dev/null; then
     pass A2 assertion-create-finalize-promote "assertion=$ac_uri sealed and promoted (promoted=$ac_promoted)"

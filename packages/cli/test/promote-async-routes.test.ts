@@ -1,16 +1,23 @@
 /**
- * Async-promote queue HTTP routes.
+ * Async SWM-share queue HTTP routes (the KA-unified successors of the
+ * legacy async-promote queue routes).
  *
- * Five new routes added by PR #2 of the async-promote-queue series:
+ * Five routes, migrated from `/api/assertion/promote-async*` to the
+ * GitHub-shaped `/api/knowledge-assets/.../swm/share*` surface:
  *
- *   POST   /api/assertion/:name/promote-async
- *   GET    /api/assertion/promote-async
- *   GET    /api/assertion/promote-async/:jobId
- *   DELETE /api/assertion/promote-async/:jobId
- *   POST   /api/assertion/promote-async/:jobId/recover
+ *   POST   /api/knowledge-assets/:name/swm/share-async
+ *        ↔ POST   /api/assertion/:name/promote-async
+ *   GET    /api/knowledge-assets/swm/share-jobs
+ *        ↔ GET    /api/assertion/promote-async
+ *   GET    /api/knowledge-assets/swm/share-jobs/:jobId
+ *        ↔ GET    /api/assertion/promote-async/:jobId
+ *   DELETE /api/knowledge-assets/swm/share-jobs/:jobId
+ *        ↔ DELETE /api/assertion/promote-async/:jobId
+ *   POST   /api/knowledge-assets/swm/share-jobs/:jobId/recover
+ *        ↔ POST   /api/assertion/promote-async/:jobId/recover
  *
- * Pattern mirrors `import-artifact-routes.test.ts`: spin up a real HTTP
- * server with `handleAssertionRoutes`, hand it a minimal mock agent
+ * Pattern mirrors `knowledge-assets-route.test.ts`: spin up a real HTTP
+ * server with `handleKnowledgeAssetsRoutes`, hand it a minimal mock agent
  * whose `assertion` subsurface delegates to a real
  * `TripleStoreAsyncPromoteQueue` backed by `OxigraphStore`. This means
  * we test the wire contract AND the queue invariants end-to-end without
@@ -26,10 +33,10 @@ import {
   type PromoteJob,
   type PromoteListFilter,
 } from '@origintrail-official/dkg-publisher';
-import { handleAssertionRoutes } from '../src/daemon/routes/assertion.js';
+import { handleKnowledgeAssetsRoutes } from '../src/daemon/routes/knowledge-assets.js';
 import { daemonState } from '../src/daemon/state.js';
 
-describe('promote-async daemon routes', () => {
+describe('async SWM-share queue daemon routes', () => {
   let server: Server | undefined;
   let baseUrl: string;
   let now: number;
@@ -77,6 +84,7 @@ describe('promote-async daemon routes', () => {
       async contextGraphExists(contextGraphId: string) {
         return ['cg', 'cg-1', 'cg-2', 'graphify', 'team-graph'].includes(contextGraphId);
       },
+      resolveAgentByToken: () => undefined,
       assertion: {
         async promoteAsync(
           contextGraphId: string,
@@ -111,7 +119,7 @@ describe('promote-async daemon routes', () => {
     server = createServer(async (req, res) => {
       const url = new URL(req.url ?? '/', 'http://127.0.0.1');
       try {
-        await handleAssertionRoutes({
+        await handleKnowledgeAssetsRoutes({
           req,
           res,
           agent,
@@ -119,7 +127,7 @@ describe('promote-async daemon routes', () => {
           publisherRuntime: null,
           config: {},
           startedAt: Date.now(),
-          dashDb: {},
+          dashDb: { insertNotification: () => 1 },
           opWallets: {},
           network: {},
           tracker: {},
@@ -142,6 +150,7 @@ describe('promote-async daemon routes', () => {
           requestToken: undefined,
           requestAgentAddress: 'did:dkg:agent:test',
           emitMemoryGraphChanged: () => {},
+          emitNotification: () => {},
         } as any);
         if (!res.writableEnded) {
           res.statusCode = 404;
@@ -189,11 +198,11 @@ describe('promote-async daemon routes', () => {
   // exactly the "silent black hole" the reviewer flagged.
   // ---------------------------------------------------------------------------
 
-  it('POST /:name/promote-async returns 503 when the worker is unavailable', async () => {
+  it('POST /:name/swm/share-async returns 503 when the worker is unavailable', async () => {
     daemonState.promoteWorkerAvailable = false;
     daemonState.promoteWorkerUnavailableReason = null;
     await startRoutes(makeAgent());
-    const r = await post('/api/assertion/x/promote-async', {
+    const r = await post('/api/knowledge-assets/x/swm/share-async', {
       contextGraphId: 'cg',
       entities: 'all',
     });
@@ -201,40 +210,40 @@ describe('promote-async daemon routes', () => {
     expect(r.body.error).toMatch(/async-promote worker is not available/i);
   });
 
-  it('POST /:name/promote-async surfaces the unavailability reason when set', async () => {
+  it('POST /:name/swm/share-async surfaces the unavailability reason when set', async () => {
     daemonState.promoteWorkerAvailable = false;
     daemonState.promoteWorkerUnavailableReason = 'supervisor crashed during recoverOnStartup';
     await startRoutes(makeAgent());
-    const r = await post('/api/assertion/x/promote-async', { contextGraphId: 'cg' });
+    const r = await post('/api/knowledge-assets/x/swm/share-async', { contextGraphId: 'cg' });
     expect(r.status).toBe(503);
     expect(r.body.error).toContain('supervisor crashed during recoverOnStartup');
   });
 
-  it('GET /promote-async returns 503 when the worker is unavailable', async () => {
+  it('GET /swm/share-jobs returns 503 when the worker is unavailable', async () => {
     daemonState.promoteWorkerAvailable = false;
     daemonState.promoteWorkerUnavailableReason = null;
     await startRoutes(makeAgent());
-    const r = await get('/api/assertion/promote-async');
+    const r = await get('/api/knowledge-assets/swm/share-jobs');
     expect(r.status).toBe(503);
     expect(r.body.error).toMatch(/async-promote worker is not available/i);
   });
 
-  it('GET /promote-async/:jobId returns 503 when the worker is unavailable', async () => {
+  it('GET /swm/share-jobs/:jobId returns 503 when the worker is unavailable', async () => {
     daemonState.promoteWorkerAvailable = false;
     daemonState.promoteWorkerUnavailableReason = null;
     await startRoutes(makeAgent());
-    const r = await get('/api/assertion/promote-async/anything');
+    const r = await get('/api/knowledge-assets/swm/share-jobs/anything');
     expect(r.status).toBe(503);
     expect(r.body.error).toMatch(/async-promote worker is not available/i);
   });
 
   // ---------------------------------------------------------------------------
-  // POST /api/assertion/:name/promote-async
+  // POST /api/knowledge-assets/:name/swm/share-async
   // ---------------------------------------------------------------------------
 
-  it('POST /:name/promote-async returns 200 with jobId on success', async () => {
+  it('POST /:name/swm/share-async returns 200 with jobId on success', async () => {
     await startRoutes(makeAgent());
-    const r = await post('/api/assertion/my-assertion/promote-async', {
+    const r = await post('/api/knowledge-assets/my-assertion/swm/share-async', {
       contextGraphId: 'graphify',
       subGraphName: 'code',
       entities: 'all',
@@ -245,11 +254,11 @@ describe('promote-async daemon routes', () => {
     expect(r.body.enqueuedAt).toBeUndefined();
   });
 
-  it('POST /:name/promote-async returns 503 when the worker is unavailable', async () => {
+  it('POST /:name/swm/share-async returns 503 when the worker is unavailable', async () => {
     await startRoutes(makeAgent());
     daemonState.promoteWorkerAvailable = false;
     daemonState.promoteWorkerUnavailableReason = 'recoverOnStartup failed';
-    const r = await post('/api/assertion/my-assertion/promote-async', {
+    const r = await post('/api/knowledge-assets/my-assertion/swm/share-async', {
       contextGraphId: 'graphify',
       entities: 'all',
     });
@@ -257,15 +266,15 @@ describe('promote-async daemon routes', () => {
     expect(r.body.error).toContain('recoverOnStartup failed');
   });
 
-  it('POST /:name/promote-async returns 409 with existingJobId on duplicate enqueue', async () => {
+  it('POST /:name/swm/share-async returns 409 with existingJobId on duplicate enqueue', async () => {
     await startRoutes(makeAgent());
-    const first = await post('/api/assertion/dup/promote-async', {
+    const first = await post('/api/knowledge-assets/dup/swm/share-async', {
       contextGraphId: 'cg',
       subGraphName: 'sub',
       entities: 'all',
     });
     expect(first.status).toBe(200);
-    const second = await post('/api/assertion/dup/promote-async', {
+    const second = await post('/api/knowledge-assets/dup/swm/share-async', {
       contextGraphId: 'cg',
       subGraphName: 'sub',
       entities: 'all',
@@ -275,11 +284,11 @@ describe('promote-async daemon routes', () => {
     expect(second.body.error).toMatch(/already active/i);
   });
 
-  it('POST /:name/promote-async returns 503 when the worker is disabled', async () => {
+  it('POST /:name/swm/share-async returns 503 when the worker is disabled', async () => {
     daemonState.promoteWorkerAvailable = false;
     daemonState.promoteWorkerUnavailableReason = 'disabled via config.promoteQueue.enabled=false';
     await startRoutes(makeAgent());
-    const r = await post('/api/assertion/my-assertion/promote-async', {
+    const r = await post('/api/knowledge-assets/my-assertion/swm/share-async', {
       contextGraphId: 'graphify',
       entities: 'all',
     });
@@ -288,25 +297,26 @@ describe('promote-async daemon routes', () => {
     expect(await queue.getStats()).toMatchObject({ queued: 0 });
   });
 
-  it('POST /:name/promote-async returns 400 on missing contextGraphId', async () => {
+  it('POST /:name/swm/share-async returns 400 on missing contextGraphId', async () => {
     await startRoutes(makeAgent());
-    const r = await post('/api/assertion/x/promote-async', { entities: 'all' });
+    const r = await post('/api/knowledge-assets/x/swm/share-async', { entities: 'all' });
     expect(r.status).toBe(400);
     expect(r.body.error).toMatch(/contextGraphId/);
   });
 
-  it('POST /:name/promote-async returns 400 on invalid assertion name', async () => {
+  it('POST /:name/swm/share-async returns 400 on invalid assertion name', async () => {
     await startRoutes(makeAgent());
-    const r = await post('/api/assertion/..%2Fbad/promote-async', {
+    const r = await post('/api/knowledge-assets/..%2Fbad/swm/share-async', {
       contextGraphId: 'cg',
     });
     expect(r.status).toBe(400);
-    expect(r.body.error).toMatch(/Invalid assertion name/);
+    // The KA per-name dispatch validates the decoded :name segment up front.
+    expect(r.body.error).toMatch(/Invalid "name"/);
   });
 
-  it('POST /:name/promote-async accepts an explicit entities list', async () => {
+  it('POST /:name/swm/share-async accepts an explicit entities list', async () => {
     await startRoutes(makeAgent());
-    const r = await post('/api/assertion/list/promote-async', {
+    const r = await post('/api/knowledge-assets/list/swm/share-async', {
       contextGraphId: 'cg',
       entities: ['urn:dkg:entity:a', 'urn:dkg:entity:b'],
     });
@@ -316,17 +326,17 @@ describe('promote-async daemon routes', () => {
   });
 
   // ---------------------------------------------------------------------------
-  // GET /api/assertion/promote-async/:jobId
+  // GET /api/knowledge-assets/swm/share-jobs/:jobId
   // ---------------------------------------------------------------------------
 
-  it('GET /promote-async/:jobId returns the documented wire schema (RFC §3.2)', async () => {
+  it('GET /swm/share-jobs/:jobId returns the documented wire schema (RFC §3.2)', async () => {
     await startRoutes(makeAgent());
-    const enq = await post('/api/assertion/single/promote-async', {
+    const enq = await post('/api/knowledge-assets/single/swm/share-async', {
       contextGraphId: 'cg',
       subGraphName: 'sg',
       entities: 'all',
     });
-    const r = await get(`/api/assertion/promote-async/${enq.body.jobId}`);
+    const r = await get(`/api/knowledge-assets/swm/share-jobs/${enq.body.jobId}`);
     expect(r.status).toBe(200);
     expect(r.body.jobId).toBe(enq.body.jobId);
     expect(r.body.state).toBe('queued');
@@ -343,16 +353,16 @@ describe('promote-async daemon routes', () => {
     expect(typeof r.body.updatedAt).toBe('string');
   });
 
-  it('GET /promote-async/:jobId never leaks the internal queue shape (claimToken, request, attempt, commitMarker)', async () => {
+  it('GET /swm/share-jobs/:jobId never leaks the internal queue shape (claimToken, request, attempt, commitMarker)', async () => {
     await startRoutes(makeAgent());
-    const enq = await post('/api/assertion/internals/promote-async', {
+    const enq = await post('/api/knowledge-assets/internals/swm/share-async', {
       contextGraphId: 'cg',
       entities: 'all',
     });
     // Force the job into `running` so the queue assigns a lease + claim
     // token; the wire shape must still hide both.
     await queue.claimNext('test-worker');
-    const r = await get(`/api/assertion/promote-async/${enq.body.jobId}`);
+    const r = await get(`/api/knowledge-assets/swm/share-jobs/${enq.body.jobId}`);
     expect(r.status).toBe(200);
     expect(r.body.state).toBe('running');
     expect(r.body).not.toHaveProperty('request');
@@ -363,171 +373,171 @@ describe('promote-async daemon routes', () => {
     expect(JSON.stringify(r.body)).not.toContain('workerId');
   });
 
-  it('GET /promote-async/:jobId returns 404 for unknown job', async () => {
+  it('GET /swm/share-jobs/:jobId returns 404 for unknown job', async () => {
     await startRoutes(makeAgent());
-    const r = await get('/api/assertion/promote-async/non-existent');
+    const r = await get('/api/knowledge-assets/swm/share-jobs/non-existent');
     expect(r.status).toBe(404);
     expect(r.body.error).toMatch(/not found/i);
   });
 
-  it('GET /promote-async/:jobId rejects unsafe path values before queue lookup', async () => {
+  it('GET /swm/share-jobs/:jobId rejects unsafe path values before queue lookup', async () => {
     await startRoutes(makeAgent());
-    const r = await get('/api/assertion/promote-async/job%3Ebad');
+    const r = await get('/api/knowledge-assets/swm/share-jobs/job%3Ebad');
     expect(r.status).toBe(400);
     expect(r.body.error).toMatch(/Invalid promote jobId/);
   });
 
   // ---------------------------------------------------------------------------
-  // GET /api/assertion/promote-async (list)
+  // GET /api/knowledge-assets/swm/share-jobs (list)
   // ---------------------------------------------------------------------------
 
-  it('GET /promote-async lists all jobs', async () => {
+  it('GET /swm/share-jobs lists all jobs', async () => {
     await startRoutes(makeAgent());
-    await post('/api/assertion/a/promote-async', { contextGraphId: 'cg-1' });
-    await post('/api/assertion/b/promote-async', { contextGraphId: 'cg-2' });
-    await post('/api/assertion/c/promote-async', { contextGraphId: 'cg-1' });
+    await post('/api/knowledge-assets/a/swm/share-async', { contextGraphId: 'cg-1' });
+    await post('/api/knowledge-assets/b/swm/share-async', { contextGraphId: 'cg-2' });
+    await post('/api/knowledge-assets/c/swm/share-async', { contextGraphId: 'cg-1' });
 
-    const r = await get('/api/assertion/promote-async');
+    const r = await get('/api/knowledge-assets/swm/share-jobs');
     expect(r.status).toBe(200);
     expect(r.body.jobs).toHaveLength(3);
   });
 
-  it('GET /promote-async?contextGraphId=cg scopes by CG', async () => {
+  it('GET /swm/share-jobs?contextGraphId=cg scopes by CG', async () => {
     await startRoutes(makeAgent());
-    await post('/api/assertion/a/promote-async', { contextGraphId: 'cg-1' });
-    await post('/api/assertion/b/promote-async', { contextGraphId: 'cg-2' });
-    await post('/api/assertion/c/promote-async', { contextGraphId: 'cg-1' });
+    await post('/api/knowledge-assets/a/swm/share-async', { contextGraphId: 'cg-1' });
+    await post('/api/knowledge-assets/b/swm/share-async', { contextGraphId: 'cg-2' });
+    await post('/api/knowledge-assets/c/swm/share-async', { contextGraphId: 'cg-1' });
 
-    const r = await get('/api/assertion/promote-async?contextGraphId=cg-1');
+    const r = await get('/api/knowledge-assets/swm/share-jobs?contextGraphId=cg-1');
     expect(r.status).toBe(200);
     expect(r.body.jobs).toHaveLength(2);
     expect(r.body.jobs.every((j: { contextGraphId: string }) => j.contextGraphId === 'cg-1')).toBe(true);
   });
 
-  it('GET /promote-async?state=queued filters by state', async () => {
+  it('GET /swm/share-jobs?state=queued filters by state', async () => {
     await startRoutes(makeAgent());
-    const a = await post('/api/assertion/a/promote-async', { contextGraphId: 'cg' });
-    const b = await post('/api/assertion/b/promote-async', { contextGraphId: 'cg' });
-    await del(`/api/assertion/promote-async/${a.body.jobId}`);
+    const a = await post('/api/knowledge-assets/a/swm/share-async', { contextGraphId: 'cg' });
+    const b = await post('/api/knowledge-assets/b/swm/share-async', { contextGraphId: 'cg' });
+    await del(`/api/knowledge-assets/swm/share-jobs/${a.body.jobId}`);
 
-    const queued = await get('/api/assertion/promote-async?state=queued');
+    const queued = await get('/api/knowledge-assets/swm/share-jobs?state=queued');
     expect(queued.body.jobs).toHaveLength(1);
     expect(queued.body.jobs[0].jobId).toBe(b.body.jobId);
 
-    const failed = await get('/api/assertion/promote-async?state=failed');
+    const failed = await get('/api/knowledge-assets/swm/share-jobs?state=failed');
     expect(failed.body.jobs).toHaveLength(1);
     expect(failed.body.jobs[0].jobId).toBe(a.body.jobId);
   });
 
-  it('GET /promote-async?state=garbage returns 400', async () => {
+  it('GET /swm/share-jobs?state=garbage returns 400', async () => {
     await startRoutes(makeAgent());
-    const r = await get('/api/assertion/promote-async?state=garbage');
+    const r = await get('/api/knowledge-assets/swm/share-jobs?state=garbage');
     expect(r.status).toBe(400);
     expect(r.body.error).toMatch(/Invalid state filter/);
   });
 
-  it('GET /promote-async?state=queued,garbage rejects the whole filter', async () => {
+  it('GET /swm/share-jobs?state=queued,garbage rejects the whole filter', async () => {
     await startRoutes(makeAgent());
-    const r = await get('/api/assertion/promote-async?state=queued,garbage');
+    const r = await get('/api/knowledge-assets/swm/share-jobs?state=queued,garbage');
     expect(r.status).toBe(400);
     expect(r.body.error).toMatch(/Invalid state filter/);
   });
 
-  it('GET /promote-async?limit=abc returns 400', async () => {
+  it('GET /swm/share-jobs?limit=abc returns 400', async () => {
     await startRoutes(makeAgent());
-    const r = await get('/api/assertion/promote-async?limit=abc');
+    const r = await get('/api/knowledge-assets/swm/share-jobs?limit=abc');
     expect(r.status).toBe(400);
     expect(r.body.error).toMatch(/positive integer/);
   });
 
-  it('GET /promote-async?limit=10foo returns 400 instead of coercing', async () => {
+  it('GET /swm/share-jobs?limit=10foo returns 400 instead of coercing', async () => {
     await startRoutes(makeAgent());
-    const r = await get('/api/assertion/promote-async?limit=10foo');
+    const r = await get('/api/knowledge-assets/swm/share-jobs?limit=10foo');
     expect(r.status).toBe(400);
     expect(r.body.error).toMatch(/positive integer/);
   });
 
   // ---------------------------------------------------------------------------
-  // DELETE /api/assertion/promote-async/:jobId
+  // DELETE /api/knowledge-assets/swm/share-jobs/:jobId
   // ---------------------------------------------------------------------------
 
-  it('DELETE /promote-async/:jobId cancels a queued job', async () => {
+  it('DELETE /swm/share-jobs/:jobId cancels a queued job', async () => {
     await startRoutes(makeAgent());
-    const enq = await post('/api/assertion/cancel-me/promote-async', { contextGraphId: 'cg' });
-    const r = await del(`/api/assertion/promote-async/${enq.body.jobId}`);
+    const enq = await post('/api/knowledge-assets/cancel-me/swm/share-async', { contextGraphId: 'cg' });
+    const r = await del(`/api/knowledge-assets/swm/share-jobs/${enq.body.jobId}`);
     expect(r.status).toBe(200);
     expect(r.body.state).toBe('failed');
     const job = await queue.getStatus(enq.body.jobId);
     expect(job?.reason).toBe('cancelled');
   });
 
-  it('DELETE /promote-async/:jobId returns 409 for running job', async () => {
+  it('DELETE /swm/share-jobs/:jobId returns 409 for running job', async () => {
     await startRoutes(makeAgent());
-    const enq = await post('/api/assertion/running/promote-async', { contextGraphId: 'cg' });
+    const enq = await post('/api/knowledge-assets/running/swm/share-async', { contextGraphId: 'cg' });
     await queue.claimNext('test-worker');
-    const r = await del(`/api/assertion/promote-async/${enq.body.jobId}`);
+    const r = await del(`/api/knowledge-assets/swm/share-jobs/${enq.body.jobId}`);
     expect(r.status).toBe(409);
     expect(r.body.error).toMatch(/Cannot cancel.*running/);
   });
 
-  it('DELETE /promote-async/:jobId returns 404 for unknown job', async () => {
+  it('DELETE /swm/share-jobs/:jobId returns 404 for unknown job', async () => {
     await startRoutes(makeAgent());
-    const r = await del('/api/assertion/promote-async/non-existent');
+    const r = await del('/api/knowledge-assets/swm/share-jobs/non-existent');
     expect(r.status).toBe(404);
   });
 
-  it('DELETE /promote-async/:jobId rejects unsafe path values before queue lookup', async () => {
+  it('DELETE /swm/share-jobs/:jobId rejects unsafe path values before queue lookup', async () => {
     await startRoutes(makeAgent());
-    const r = await del('/api/assertion/promote-async/job%20bad');
+    const r = await del('/api/knowledge-assets/swm/share-jobs/job%20bad');
     expect(r.status).toBe(400);
     expect(r.body.error).toMatch(/Invalid promote jobId/);
   });
 
   // ---------------------------------------------------------------------------
-  // POST /api/assertion/promote-async/:jobId/recover
+  // POST /api/knowledge-assets/swm/share-jobs/:jobId/recover
   // ---------------------------------------------------------------------------
 
-  it('POST /promote-async/:jobId/recover requeues a failed job', async () => {
+  it('POST /swm/share-jobs/:jobId/recover requeues a failed job', async () => {
     await startRoutes(makeAgent());
-    const enq = await post('/api/assertion/recoverable/promote-async', { contextGraphId: 'cg' });
-    await del(`/api/assertion/promote-async/${enq.body.jobId}`);
+    const enq = await post('/api/knowledge-assets/recoverable/swm/share-async', { contextGraphId: 'cg' });
+    await del(`/api/knowledge-assets/swm/share-jobs/${enq.body.jobId}`);
     expect((await queue.getStatus(enq.body.jobId))?.state).toBe('failed');
 
-    const r = await post(`/api/assertion/promote-async/${enq.body.jobId}/recover`, {});
+    const r = await post(`/api/knowledge-assets/swm/share-jobs/${enq.body.jobId}/recover`, {});
     expect(r.status).toBe(200);
     expect(r.body.state).toBe('queued');
   });
 
-  it('POST /promote-async/:jobId/recover returns 409 for non-failed job', async () => {
+  it('POST /swm/share-jobs/:jobId/recover returns 409 for non-failed job', async () => {
     await startRoutes(makeAgent());
-    const enq = await post('/api/assertion/queued/promote-async', { contextGraphId: 'cg' });
-    const r = await post(`/api/assertion/promote-async/${enq.body.jobId}/recover`, {});
+    const enq = await post('/api/knowledge-assets/queued/swm/share-async', { contextGraphId: 'cg' });
+    const r = await post(`/api/knowledge-assets/swm/share-jobs/${enq.body.jobId}/recover`, {});
     expect(r.status).toBe(409);
     expect(r.body.error).toMatch(/Cannot recover/);
   });
 
-  it('POST /promote-async/:jobId/recover returns 404 for unknown job', async () => {
+  it('POST /swm/share-jobs/:jobId/recover returns 404 for unknown job', async () => {
     await startRoutes(makeAgent());
-    const r = await post('/api/assertion/promote-async/non-existent/recover', {});
+    const r = await post('/api/knowledge-assets/swm/share-jobs/non-existent/recover', {});
     expect(r.status).toBe(404);
   });
 
-  it('POST /promote-async/:jobId/recover rejects unsafe path values before queue lookup', async () => {
+  it('POST /swm/share-jobs/:jobId/recover rejects unsafe path values before queue lookup', async () => {
     await startRoutes(makeAgent());
-    const r = await post('/api/assertion/promote-async/job%3Ebad/recover', {});
+    const r = await post('/api/knowledge-assets/swm/share-jobs/job%3Ebad/recover', {});
     expect(r.status).toBe(400);
     expect(r.body.error).toMatch(/Invalid promote jobId/);
   });
 
   // ---------------------------------------------------------------------------
-  // Routing precedence — the list route (`/promote-async`) must not be
-  // claimed by the per-job route (`/promote-async/:jobId`).
+  // Routing precedence — the list route (`/swm/share-jobs`) must not be
+  // claimed by the per-job route (`/swm/share-jobs/:jobId`).
   // ---------------------------------------------------------------------------
 
-  it('GET /promote-async (no jobId) hits the list route, not the per-job route', async () => {
+  it('GET /swm/share-jobs (no jobId) hits the list route, not the per-job route', async () => {
     await startRoutes(makeAgent());
-    await post('/api/assertion/x/promote-async', { contextGraphId: 'cg' });
-    const r = await get('/api/assertion/promote-async');
+    await post('/api/knowledge-assets/x/swm/share-async', { contextGraphId: 'cg' });
+    const r = await get('/api/knowledge-assets/swm/share-jobs');
     expect(r.status).toBe(200);
     expect(Array.isArray(r.body.jobs)).toBe(true);
   });

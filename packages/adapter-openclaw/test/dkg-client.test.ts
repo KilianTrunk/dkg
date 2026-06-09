@@ -374,7 +374,7 @@ describe('DkgDaemonClient', () => {
   // Working Memory assertion lifecycle
   // ---------------------------------------------------------------------------
 
-  it('createAssertion should POST to /api/assertion/create', async () => {
+  it('createAssertion should POST to /api/knowledge-assets', async () => {
     const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
       new Response(JSON.stringify({ assertionUri: 'urn:test:assertion:1' }), { status: 200 }),
     );
@@ -382,7 +382,7 @@ describe('DkgDaemonClient', () => {
     const result = await client.createAssertion('agent-context', 'chat-turns');
 
     const [url, opts] = fetchSpy.mock.calls[0];
-    expect(url).toBe('http://localhost:9200/api/assertion/create');
+    expect(url).toBe('http://localhost:9200/api/knowledge-assets');
     expect(opts?.method).toBe('POST');
     const body = JSON.parse(opts?.body as string);
     expect(body.contextGraphId).toBe('agent-context');
@@ -419,7 +419,7 @@ describe('DkgDaemonClient', () => {
     expect(body.subGraphName).toBe('protocols');
   });
 
-  it('writeAssertion should POST to /api/assertion/:name/write with URL-encoded name', async () => {
+  it('writeAssertion should POST to /api/knowledge-assets/:name/wm/write with URL-encoded name', async () => {
     const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
       new Response(JSON.stringify({ written: 3 }), { status: 200 }),
     );
@@ -432,7 +432,7 @@ describe('DkgDaemonClient', () => {
     const result = await client.writeAssertion('agent-context', 'chat-turns', quads);
 
     const [url, opts] = fetchSpy.mock.calls[0];
-    expect(url).toBe('http://localhost:9200/api/assertion/chat-turns/write');
+    expect(url).toBe('http://localhost:9200/api/knowledge-assets/chat-turns/wm/write');
     expect(opts?.method).toBe('POST');
     const body = JSON.parse(opts?.body as string);
     expect(body.contextGraphId).toBe('agent-context');
@@ -460,8 +460,8 @@ describe('DkgDaemonClient', () => {
   // destructure, plus URL-encodes the assertion name.
   // ---------------------------------------------------------------------------
 
-  it('promoteAssertion hits /api/assertion/:name/promote with camelCase body', async () => {
-    fetchResponses.push(new Response(JSON.stringify({ promoted: 1 }), { status: 200 }));
+  it('promoteAssertion hits /api/knowledge-assets/:name/swm/share with camelCase body', async () => {
+    fetchResponses.push(new Response(JSON.stringify({ swmShared: true, promotedCount: 1 }), { status: 200 }));
 
     await client.promoteAssertion('ctx', 'chat-turns', {
       entities: ['urn:a', 'urn:b'],
@@ -469,7 +469,7 @@ describe('DkgDaemonClient', () => {
     });
 
     const [url, opts] = fetchCalls[0];
-    expect(url).toBe('http://localhost:9200/api/assertion/chat-turns/promote');
+    expect(url).toBe('http://localhost:9200/api/knowledge-assets/chat-turns/swm/share');
     expect(opts?.method).toBe('POST');
     const body = JSON.parse(opts?.body as string);
     expect(body).toEqual({
@@ -482,32 +482,34 @@ describe('DkgDaemonClient', () => {
   it('promoteAssertion URL-encodes assertion names containing slashes or spaces', async () => {
     fetchResponses.push(new Response(JSON.stringify({}), { status: 200 }));
     await client.promoteAssertion('ctx', 'weird name/with slash');
-    expect(String(fetchCalls[0][0])).toBe('http://localhost:9200/api/assertion/weird%20name%2Fwith%20slash/promote');
+    expect(String(fetchCalls[0][0])).toBe('http://localhost:9200/api/knowledge-assets/weird%20name%2Fwith%20slash/swm/share');
   });
 
-  it('discardAssertion hits /api/assertion/:name/discard with camelCase body', async () => {
+  it('discardAssertion hits /api/knowledge-assets/:name/wm/discard with camelCase body', async () => {
     fetchResponses.push(new Response(JSON.stringify({ discarded: true }), { status: 200 }));
 
     await client.discardAssertion('ctx', 'draft', { subGraphName: 'scratch' });
 
     const [url, opts] = fetchCalls[0];
-    expect(url).toBe('http://localhost:9200/api/assertion/draft/discard');
+    expect(url).toBe('http://localhost:9200/api/knowledge-assets/draft/wm/discard');
     expect(opts?.method).toBe('POST');
     const body = JSON.parse(opts?.body as string);
     expect(body).toEqual({ contextGraphId: 'ctx', subGraphName: 'scratch' });
   });
 
-  it('queryAssertion hits /api/assertion/:name/query as POST with { contextGraphId, subGraphName } only', async () => {
+  it('queryAssertion hits /api/knowledge-assets/:name/wm/quads as GET with { contextGraphId, subGraphName } query params', async () => {
     fetchResponses.push(new Response(JSON.stringify({ quads: [], count: 0 }), { status: 200 }));
 
     await client.queryAssertion('ctx', 'chat-turns', { subGraphName: 'protocols' });
 
     const [url, opts] = fetchCalls[0];
-    expect(url).toBe('http://localhost:9200/api/assertion/chat-turns/query');
-    expect(opts?.method).toBe('POST');
-    const body = JSON.parse(opts?.body as string);
-    expect(body).toEqual({ contextGraphId: 'ctx', subGraphName: 'protocols' });
-    expect(body).not.toHaveProperty('sparql');
+    expect(opts?.method ?? 'GET').toBe('GET');
+    const parsed = new URL(String(url));
+    expect(parsed.pathname).toBe('/api/knowledge-assets/chat-turns/wm/quads');
+    expect(parsed.searchParams.get('contextGraphId')).toBe('ctx');
+    expect(parsed.searchParams.get('subGraphName')).toBe('protocols');
+    expect(parsed.searchParams.get('sparql')).toBeNull();
+    expect(opts?.body).toBeUndefined();
   });
 
   it('resolveImportArtifact POSTs the completed ref to the resolver route', async () => {
@@ -521,7 +523,7 @@ describe('DkgDaemonClient', () => {
     });
 
     const [url, opts] = fetchCalls[0];
-    expect(url).toBe('http://localhost:9200/api/assertion/import-artifact/resolve');
+    expect(url).toBe('http://localhost:9200/api/knowledge-assets/import-artifact/resolve');
     expect(opts?.method).toBe('POST');
     expect(JSON.parse(opts?.body as string)).toEqual({
       contextGraphId: 'ctx',
@@ -541,7 +543,7 @@ describe('DkgDaemonClient', () => {
     });
 
     const [url, opts] = fetchCalls[0];
-    expect(url).toBe('http://localhost:9200/api/assertion/import-artifact/read-markdown');
+    expect(url).toBe('http://localhost:9200/api/knowledge-assets/import-artifact/read-markdown');
     expect(opts?.method).toBe('POST');
     expect(JSON.parse(opts?.body as string)).toEqual({
       contextGraphId: 'ctx',
@@ -565,7 +567,7 @@ describe('DkgDaemonClient', () => {
     });
 
     const [url, opts] = fetchCalls[0];
-    expect(url).toBe('http://localhost:9200/api/assertion/semantic-enrichment/write');
+    expect(url).toBe('http://localhost:9200/api/knowledge-assets/semantic-enrichment/write');
     expect(opts?.method).toBe('POST');
     const body = JSON.parse(opts?.body as string);
     expect(body).toEqual({
@@ -584,7 +586,7 @@ describe('DkgDaemonClient', () => {
     expect(body).not.toHaveProperty('publish');
   });
 
-  it('getAssertionHistory hits /api/assertion/:name/history as GET with camelCase query params', async () => {
+  it('getAssertionHistory hits /api/knowledge-assets/:name as GET with camelCase query params', async () => {
     fetchResponses.push(new Response(JSON.stringify({ createdAt: 't' }), { status: 200 }));
 
     await client.getAssertionHistory('ctx', 'chat-turns', {
@@ -595,14 +597,14 @@ describe('DkgDaemonClient', () => {
     const [url, opts] = fetchCalls[0];
     expect(opts?.method ?? 'GET').toBe('GET');
     const parsed = new URL(String(url));
-    expect(parsed.pathname).toBe('/api/assertion/chat-turns/history');
+    expect(parsed.pathname).toBe('/api/knowledge-assets/chat-turns');
     expect(parsed.searchParams.get('contextGraphId')).toBe('ctx');
     expect(parsed.searchParams.get('agentAddress')).toBe('0xabc');
     expect(parsed.searchParams.get('subGraphName')).toBe('protocols');
     expect(opts?.body).toBeUndefined();
   });
 
-  it('importAssertionFile hits /api/assertion/:name/import-file as POST multipart with camelCase form fields', async () => {
+  it('importAssertionFile hits /api/knowledge-assets/:name/wm/import-file as POST multipart with camelCase form fields', async () => {
     fetchResponses.push(new Response(JSON.stringify({ assertionUri: 'urn:x' }), { status: 200 }));
 
     const buf = new Uint8Array([1, 2, 3, 4]);
@@ -613,7 +615,7 @@ describe('DkgDaemonClient', () => {
     });
 
     const [url, opts] = fetchCalls[0];
-    expect(url).toBe('http://localhost:9200/api/assertion/notes/import-file');
+    expect(url).toBe('http://localhost:9200/api/knowledge-assets/notes/wm/import-file');
     expect(opts?.method).toBe('POST');
     // `body` must be a FormData — Node's fetch sets the multipart boundary automatically.
     expect(opts?.body).toBeInstanceOf(FormData);
@@ -844,7 +846,7 @@ describe('DkgDaemonClient', () => {
 
   it('publish should create an assertion then publish it from SWM', async () => {
     // V10 assertion lifecycle (Phase B-1/B-2): the openclaw client now
-    // routes through `/api/assertion/create` (which writes the quads to
+    // routes through `/api/knowledge-assets` (which writes the quads to
     // SWM and finalizes the EIP-712 seal in one daemon hop) followed by
     // `/api/shared-memory/publish` to lift the assertion to VM. The
     // legacy `/api/shared-memory/write` route is gone.
@@ -859,7 +861,7 @@ describe('DkgDaemonClient', () => {
 
     expect(fetchCalls).toHaveLength(2);
     const [createUrl, createOpts] = fetchCalls[0];
-    expect(createUrl).toBe('http://localhost:9200/api/assertion/create');
+    expect(createUrl).toBe('http://localhost:9200/api/knowledge-assets');
     expect(createOpts?.method).toBe('POST');
     const createBody = JSON.parse(createOpts?.body as string);
     expect(createBody.contextGraphId).toBe('testing');
@@ -1178,9 +1180,9 @@ describe('DkgDaemonClient', () => {
 
     it('knowledgeAssetFinalize forwards preSignedAuthorAttestation', async () => {
       ok({ merkleRoot: '0xroot', eip712Digest: '0xdig' });
-      const preSignedAuthorAttestation = { address: '0xauthor', signature: { r: '0xr', vs: '0xvs' } };
+      const preSignedAuthorAttestation = { address: '0xauthor', reservedKaId: '1', signature: { r: '0xr', vs: '0xvs' } };
       await client.knowledgeAssetFinalize('cg-1', 'f', {
-        preSignedAuthorAttestation: { address: '0xauthor', signature: { r: '0xr', vs: '0xvs' } },
+        preSignedAuthorAttestation: { address: '0xauthor', reservedKaId: '1', signature: { r: '0xr', vs: '0xvs' } },
         schemeVersion: 1,
       });
       expect(url()).toBe('http://localhost:9200/api/knowledge-assets/f/wm/finalize');
@@ -1194,7 +1196,7 @@ describe('DkgDaemonClient', () => {
     it('knowledgeAssetFinalize rejects mutually exclusive authorship fields before HTTP serialization', async () => {
       await expect(client.knowledgeAssetFinalize('cg-1', 'f', {
         authorAgentAddress: '0xauthor',
-        preSignedAuthorAttestation: { address: '0xauthor', signature: { r: '0xr', vs: '0xvs' } },
+        preSignedAuthorAttestation: { address: '0xauthor', reservedKaId: '1', signature: { r: '0xr', vs: '0xvs' } },
       })).rejects.toThrow('authorAgentAddress and preSignedAuthorAttestation are mutually exclusive');
       expect(fetchCalls).toHaveLength(0);
     });
@@ -1202,7 +1204,7 @@ describe('DkgDaemonClient', () => {
     it('createKnowledgeAsset rejects mutually exclusive authorship fields before HTTP serialization', async () => {
       await expect(client.createKnowledgeAsset('cg-1', 'f', {
         authorAgentAddress: '0xauthor',
-        preSignedAuthorAttestation: { address: '0xauthor', signature: { r: '0xr', vs: '0xvs' } },
+        preSignedAuthorAttestation: { address: '0xauthor', reservedKaId: '1', signature: { r: '0xr', vs: '0xvs' } },
       })).rejects.toThrow('authorAgentAddress and preSignedAuthorAttestation are mutually exclusive');
       expect(fetchCalls).toHaveLength(0);
     });

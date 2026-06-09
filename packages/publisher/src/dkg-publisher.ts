@@ -2,7 +2,7 @@ import type { Quad, TripleStore } from '@origintrail-official/dkg-storage';
 import type { ChainAdapter, OnChainPublishResult, AddBatchToContextGraphParams } from '@origintrail-official/dkg-chain';
 import { enrichEvmError } from '@origintrail-official/dkg-chain';
 import type { EventBus, OperationContext } from '@origintrail-official/dkg-core';
-import { DKGEvent, Logger, createOperationContext, sha256, encodeWorkspacePublishRequest, encodeEncryptedWorkspacePayload, encryptWorkspacePayload, contextGraphDataUri, contextGraphDataGraphUri, contextGraphMetaUri, contextGraphAssertionUri, assertionLifecycleUri, contextGraphSubGraphUri, contextGraphSubGraphMetaUri, SYSTEM_CONTEXT_GRAPHS, validateSubGraphName, isSafeIri, assertSafeIri, assertSafeRdfTerm, DKG_GOSSIP_MAX_MESSAGE_BYTES, SwmGossipPayloadTooLargeError, type Ed25519Keypair, buildAuthorAttestationTypedData, buildUpdateAuthorAttestationTypedData, AUTHOR_SCHEME_VERSION_V1, TrustLevel, TRUST_LEVEL_PREDICATE, assertNoUserAuthoredTrustLevelQuads, buildTrustLevelQuads, isTrustLevelQuad, DKG_ENTITY, DKG_ROOT_ENTITY_LEGACY, ENTITY_PRED_ALT, parseAssertionSealQuads } from '@origintrail-official/dkg-core';
+import { DKGEvent, Logger, createOperationContext, sha256, encodeWorkspacePublishRequest, encodeEncryptedWorkspacePayload, encryptWorkspacePayload, contextGraphDataUri, contextGraphDataGraphUri, contextGraphMetaUri, contextGraphAssertionUri, contextGraphLayerUri, MemoryLayer, assertionLifecycleUri, contextGraphSubGraphUri, contextGraphSubGraphMetaUri, SYSTEM_CONTEXT_GRAPHS, validateSubGraphName, isSafeIri, assertSafeIri, assertSafeRdfTerm, DKG_GOSSIP_MAX_MESSAGE_BYTES, SwmGossipPayloadTooLargeError, type Ed25519Keypair, buildAuthorAttestationTypedData, buildUpdateAuthorAttestationTypedData, AUTHOR_SCHEME_VERSION_V1, TrustLevel, TRUST_LEVEL_PREDICATE, assertNoUserAuthoredTrustLevelQuads, buildTrustLevelQuads, isTrustLevelQuad, DKG_ENTITY, DKG_ROOT_ENTITY_LEGACY, ENTITY_PRED_ALT, parseAssertionSealQuads } from '@origintrail-official/dkg-core';
 import { GraphManager, PrivateContentStore } from '@origintrail-official/dkg-storage';
 import { DEFAULT_PUBLISH_EPOCHS, MAX_PUBLISH_EPOCHS, type Publisher, type PublishOptions, type PublishResult, type KAManifestEntry, type PhaseCallback, type V10CoreNodeACK } from './publisher.js';
 import { skolemizeByEntity } from './auto-partition.js';
@@ -870,6 +870,11 @@ export class DKGPublisher implements Publisher {
     }
 
     const shareOperationId = `swm-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+    // Generic share (dkg_shared_memory_publish) is raw shared data, NOT a lifecycle KA:
+    // it has no created/promoted identity to key a per-KA graph, and minting one here
+    // collides with the publish-from-SWM kaId reservation (0-KA publishes). It stays in
+    // the bucket; the per-KA …/_shared_memory/{addr}/{number} layout is produced by
+    // promote (a real KA lifecycle). read-both reads cover both shapes.
     const swmGraph = this.graphManager.sharedMemoryUri(contextGraphId, options.subGraphName);
     const swmMetaGraph = this.graphManager.sharedMemoryMetaUri(contextGraphId, options.subGraphName);
 
@@ -1100,8 +1105,8 @@ export class DKGPublisher implements Publisher {
 
     for (const cond of options.conditions) {
       const ask = cond.expectedValue === null
-        ? `ASK { GRAPH <${swmGraph}> { <${cond.subject}> <${cond.predicate}> ?o } }`
-        : `ASK { GRAPH <${swmGraph}> { <${cond.subject}> <${cond.predicate}> ${cond.expectedValue} } }`;
+        ? `ASK { GRAPH ?g { <${cond.subject}> <${cond.predicate}> ?o } FILTER(((STRSTARTS(STR(?g), "${swmGraph}/") && !STRSTARTS(STR(?g), "${swmGraph}/staging/")) || STR(?g) = "${swmGraph}")) }`
+        : `ASK { GRAPH ?g { <${cond.subject}> <${cond.predicate}> ${cond.expectedValue} } FILTER(((STRSTARTS(STR(?g), "${swmGraph}/") && !STRSTARTS(STR(?g), "${swmGraph}/staging/")) || STR(?g) = "${swmGraph}")) }`;
       const result = await this.store.query(ask);
 
       if (result.type !== 'boolean') {
@@ -1110,7 +1115,7 @@ export class DKGPublisher implements Publisher {
 
       const shouldExist = cond.expectedValue !== null;
       if (result.value !== shouldExist) {
-        const sel = `SELECT ?o WHERE { GRAPH <${swmGraph}> { <${cond.subject}> <${cond.predicate}> ?o } } LIMIT 1`;
+        const sel = `SELECT ?o WHERE { GRAPH ?g { <${cond.subject}> <${cond.predicate}> ?o } FILTER(((STRSTARTS(STR(?g), "${swmGraph}/") && !STRSTARTS(STR(?g), "${swmGraph}/staging/")) || STR(?g) = "${swmGraph}")) } LIMIT 1`;
         const cur = await this.store.query(sel);
         const actual = cur.type === 'bindings' && cur.bindings.length > 0 ? cur.bindings[0].o ?? null : null;
         throw new StaleWriteError(cond, actual);
@@ -1215,7 +1220,7 @@ export class DKGPublisher implements Publisher {
         if (!hasOnChainId) {
           throw new Error(
             `Context graph "${contextGraphId}" is not registered on-chain. ` +
-            `Run 'dkg context-graph register ${contextGraphId}' first to enable Verified Memory publishing.`,
+            `Run 'dkg context-graph register ${contextGraphId}' first to enable Verifiable Memory publishing.`,
           );
         }
       }
@@ -1225,7 +1230,7 @@ export class DKGPublisher implements Publisher {
 
     let sparql: string;
     if (selection === 'all') {
-      sparql = `CONSTRUCT { ?s ?p ?o } WHERE { GRAPH <${swmGraph}> { ?s ?p ?o } }`;
+      sparql = `CONSTRUCT { ?s ?p ?o } WHERE { GRAPH ?g { ?s ?p ?o } FILTER(((STRSTARTS(STR(?g), "${swmGraph}/") && !STRSTARTS(STR(?g), "${swmGraph}/staging/")) || STR(?g) = "${swmGraph}")) }`;
     } else {
       const roots = [...new Set(
         selection.rootEntities
@@ -1242,7 +1247,7 @@ export class DKGPublisher implements Publisher {
       }
       const values = roots.map((r) => `<${r}>`).join(' ');
       sparql = `CONSTRUCT { ?s ?p ?o } WHERE {
-        GRAPH <${swmGraph}> {
+        GRAPH ?g {
           VALUES ?root { ${values} }
           ?s ?p ?o .
           FILTER(
@@ -1250,6 +1255,7 @@ export class DKGPublisher implements Publisher {
             || STRSTARTS(STR(?s), CONCAT(STR(?root), "/.well-known/genid/"))
           )
         }
+        FILTER(((STRSTARTS(STR(?g), "${swmGraph}/") && !STRSTARTS(STR(?g), "${swmGraph}/staging/")) || STR(?g) = "${swmGraph}"))
       }`;
     }
 
@@ -1427,7 +1433,12 @@ export class DKGPublisher implements Publisher {
           publishResult.publicQuads &&
           publishResult.publicQuads.length > 0
         ) {
-          const storedQuads = publishResult.publicQuads.map(q => ({ ...q, graph: defaultDataGraph }));
+          // Uniform layout: the confirmed publish wrote the public quads to the per-KA
+          // verifiable-memory graph (…/_verifiable_memory/{author}/{number}); copy from there to the
+          // per-cgId graph, and (REMAP flow) delete from there so the data ends up ONLY in per-cgId.
+          const remapKaId = publishResult.onChainResult!.kaId ?? publishResult.onChainResult!.batchId;
+          const remapVmGraph = contextGraphLayerUri(contextGraphId, MemoryLayer.VerifiableMemory, '0x' + (remapKaId >> 96n).toString(16).padStart(40, '0'), remapKaId & ((1n << 96n) - 1n));
+          const storedQuads = publishResult.publicQuads.map(q => ({ ...q, graph: remapVmGraph }));
           await this.store.insert(storedQuads.map(q => ({ ...q, graph: ctxDataGraph })));
           const trustSubjects = collectTrustSubjectsForRoots(
             storedQuads,
@@ -1443,7 +1454,7 @@ export class DKGPublisher implements Publisher {
             await this.store.delete(storedQuads);
             for (const subject of trustSubjects) {
               await this.store.deleteByPattern({
-                graph: defaultDataGraph,
+                graph: remapVmGraph,
                 subject,
                 predicate: TRUST_LEVEL_PREDICATE,
               });
@@ -1493,12 +1504,17 @@ export class DKGPublisher implements Publisher {
       const swmOwnershipKey = options?.subGraphName ? `${contextGraphId}\0${options.subGraphName}` : contextGraphId;
       const kaMap = skolemizeByEntity(quads);
       let ownerDeletedTotal = 0;
+      // Uniform layout: published data lives in per-KA …/_shared_memory/{addr}/{number}
+      // graphs, so the cleanup must span all of them (+ the legacy bucket).
+      const swmGraphsForClear = await this.swmGraphsUnder(swmGraph);
       for (const rootEntity of kaMap.keys()) {
-        await this.store.deleteByPattern({ graph: swmGraph, subject: rootEntity });
-        await this.store.deleteBySubjectPrefix(swmGraph, rootEntity + '/.well-known/genid/');
-        await this.store.deleteByPattern({
-          graph: swmGraph, subject: rootEntity, predicate: WORKSPACE_OWNER_PREDICATE,
-        });
+        for (const g of swmGraphsForClear) {
+          await this.store.deleteByPattern({ graph: g, subject: rootEntity });
+          await this.store.deleteBySubjectPrefix(g, rootEntity + '/.well-known/genid/');
+          await this.store.deleteByPattern({
+            graph: g, subject: rootEntity, predicate: WORKSPACE_OWNER_PREDICATE,
+          });
+        }
         const ownerDeleted = await this.store.deleteByPattern({
           graph: swmMetaGraph, subject: rootEntity, predicate: WORKSPACE_OWNER_PREDICATE,
         });
@@ -1512,7 +1528,10 @@ export class DKGPublisher implements Publisher {
       // If clearSharedMemoryAfter is explicitly true, also clear any remaining unpublished content.
       // Default is false: unpublished entities stay in SWM for future publishes.
       if (options?.clearSharedMemoryAfter === true) {
-        const remainingCount = await this.store.deleteByPattern({ graph: swmGraph });
+        let remainingCount = 0;
+        for (const g of await this.swmGraphsUnder(swmGraph)) {
+          remainingCount += await this.store.deleteByPattern({ graph: g });
+        }
         const remainingMetaCount = await this.store.deleteByPattern({ graph: swmMetaGraph });
         if (remainingCount > 0 || remainingMetaCount > 0) {
           this.log.info(ctx, `Cleared remaining SWM content: ${remainingCount} triples, ${remainingMetaCount} meta`);
@@ -1843,7 +1862,7 @@ export class DKGPublisher implements Publisher {
     // confirm against — NoChainAdapter / non-V10 / no on-chain CG id).
     // Inserting pre-chain caused the "tentative VM" leak where
     // /api/query would surface quads from a publish that the chain
-    // later rejected as if they were verified memory. See the chain
+    // later rejected as if they were verifiable memory. See the chain
     // success branch + the `publisherContextGraphId/chainV10Ready`
     // skip branches below — each writes `normalizedQuads` exactly once,
     // never on the chain-failure catch path.
@@ -2230,7 +2249,7 @@ export class DKGPublisher implements Publisher {
       }
       // RC11 / PR3: write the KC + KA metadata + tentative status quad
       // alongside the public quads so downstream consumers
-      // (`access-handler`, `assertion-history`, the `verified-memory`
+      // (`access-handler`, `assertion-history`, the `verifiable-memory`
       // view) can still locate this publish by its tentative UAL.
       // Pre-PR2 this was the responsibility of the chain-failure
       // catch block via `generateTentativeMetadata`. PR2 deleted that
@@ -2249,7 +2268,7 @@ export class DKGPublisher implements Publisher {
       //   1. `authorAddress` / `publishOperationId` — emits the
       //      `dkg:Publication` + `dkg:authoredBy` quads that RFC-001 §3.5
       //      requires for tentative publishes so downstream consumers
-      //      (`access-handler`, `assertion-history`, the verified-memory
+      //      (`access-handler`, `assertion-history`, the verifiable-memory
       //      view) can still attribute the publish locally before any
       //      chain confirmation. The on-chain `KnowledgeBatch.authorAddress`
       //      is canonical only once the publish confirms; until then this
@@ -2373,6 +2392,7 @@ export class DKGPublisher implements Publisher {
           contextGraphId: v10CgId,
           merkleRoot: kcMerkleRoot,
           authorAddress: effectiveAuthorAddress,
+          reservedKaId: options.precomputedAttestation.reservedKaId,
           schemeVersion: effectiveSchemeVersion,
         });
         {
@@ -2475,6 +2495,7 @@ export class DKGPublisher implements Publisher {
           contextGraphId: v10CgId,
           merkleRoot: kcMerkleRoot,
           authorAddress: effectiveAuthorAddress,
+          reservedKaId: options.precomputedAttestation.reservedKaId,
           schemeVersion: effectiveSchemeVersion,
         });
         const authorSig: ethers.Signature = ethers.Signature.from({
@@ -2551,7 +2572,10 @@ export class DKGPublisher implements Publisher {
         // finalize→publish mints exactly the stamped id (no double-allocation).
         const reservedKaId = await this.ensureReservedKaId(
           effectiveAuthorAddress,
-          (options as PublishOptions).reservedKaId,
+          // §F2 — mint EXACTLY the id the agent signed: the finalize path threads it
+          // as options.reservedKaId; the ephemeral selection path carries it on the
+          // precomputedAttestation (the agent is the single allocation point).
+          (options as PublishOptions).reservedKaId ?? options.precomputedAttestation?.reservedKaId,
         );
         try {
           // OT-RFC-38 LU-11 / OT-RFC-39 — handshake hardening.
@@ -2695,14 +2719,22 @@ export class DKGPublisher implements Publisher {
         // visible to /api/query. Order matters: data quads BEFORE
         // confirmedQuads + stampTrustLevel below so the trust stamp's
         // subject set actually matches existing rows.
-        this.log.info(ctx, `Storing ${normalizedQuads.length} triples in local store (post-confirmation)`);
-        await this.store.insert(normalizedQuads);
+        // Uniform layout: published data lands in the per-KA verifiable-memory graph
+        // …/_verifiable_memory/{author}/{number} (author+number unpacked from the minted
+        // kaId), not the monolithic root data graph. The default query reads the
+        // /_verifiable_memory/ prefix (read-both with root).
+        const vmNumber = kaId & ((1n << 96n) - 1n);
+        const vmAuthor = '0x' + (kaId >> 96n).toString(16).padStart(40, '0');
+        const vmGraph = contextGraphLayerUri(contextGraphId, MemoryLayer.VerifiableMemory, vmAuthor, vmNumber, options.subGraphName);
+        const vmQuads = normalizedQuads.map((q) => ({ ...q, graph: vmGraph }));
+        this.log.info(ctx, `Storing ${vmQuads.length} triples in ${vmGraph} (post-confirmation)`);
+        await this.store.insert(vmQuads);
         await this.store.insert(confirmedQuads);
         await stampTrustLevel(
           this.store,
-          dataGraph,
+          vmGraph,
           collectTrustSubjectsForRoots(
-            normalizedQuads,
+            vmQuads,
             manifestEntries.map((entry) => entry.rootEntity),
           ),
           TrustLevel.SelfAttested,
@@ -2746,7 +2778,7 @@ export class DKGPublisher implements Publisher {
         // write. Pre-PR2 this branch swallowed the error and fell
         // through to `generateTentativeMetadata` + a `store.insert` of
         // the (potentially never-confirmed) quads, which surfaced
-        // through /api/query as if they were real verified memory.
+        // through /api/query as if they were real verifiable memory.
         // The data-graph insert now lives exclusively inside the
         // success branch above and the two non-chain skip branches —
         // a failed on-chain publish therefore writes NOTHING to the
@@ -2861,7 +2893,17 @@ export class DKGPublisher implements Publisher {
       localOnlyUpdate ? this.localTentativePublisherAddress() : undefined
     );
     this.log.info(ctx, `Updating kaId=${kaId} with ${quads.length} triples`);
-    const dataGraph = this.graphManager.dataGraphUri(contextGraphId);
+    // Uniform layout: a KA update replaces published data in the SAME per-KA
+    // verifiable-memory graph publish() wrote (…/_verifiable_memory/{author}/{number}),
+    // keyed by kaId. restateLabelGraphForUpdate purges the old roots there + writes the new
+    // (matches the receiver-side update-handler.ts). Without this the update lands in root
+    // while stale data lingers in the per-KA graph, and read-both returns both.
+    const dataGraph = contextGraphLayerUri(
+      contextGraphId,
+      MemoryLayer.VerifiableMemory,
+      '0x' + (kaId >> 96n).toString(16).padStart(40, '0'),
+      kaId & ((1n << 96n) - 1n),
+    );
 
     onPhase?.('prepare', 'start');
     onPhase?.('prepare:partition', 'start');
@@ -4071,10 +4113,60 @@ export class DKGPublisher implements Publisher {
     this.privateStore.clearCache(ownershipKey);
   }
 
-  async assertionCreate(contextGraphId: string, name: string, agentAddress: string, subGraphName?: string): Promise<string> {
+  /** Read a KA's allocated number (dkg:kaId) off its lifecycle URN, or null if not yet minted. */
+  private async resolveKaNumber(contextGraphId: string, agentAddress: string, name: string, subGraphName?: string): Promise<bigint | null> {
+    const urn = assertionLifecycleUri(contextGraphId, agentAddress, name, subGraphName);
+    const metaGraph = contextGraphMetaUri(contextGraphId);
+    const res = await this.store.query(
+      `SELECT ?n WHERE { GRAPH <${metaGraph}> { <${urn}> <http://dkg.io/ontology/kaId> ?n } } LIMIT 1`,
+    );
+    if (res.type === 'bindings' && res.bindings.length > 0) {
+      const m = res.bindings[0]['n']?.match(/(\d+)/);
+      if (m) return BigInt(m[1]);
+    }
+    return null;
+  }
+
+  /** A KA's WM graph URI: the per-KA `…/_working_memory/{addr}/{number}` once minted (D1), else legacy name-keyed. */
+  async wmGraphUri(contextGraphId: string, agentAddress: string, name: string, subGraphName?: string): Promise<string> {
+    const num = await this.resolveKaNumber(contextGraphId, agentAddress, name, subGraphName);
+    return num !== null
+      ? contextGraphLayerUri(contextGraphId, MemoryLayer.WorkingMemory, agentAddress, num, subGraphName)
+      : contextGraphAssertionUri(contextGraphId, agentAddress, name, subGraphName);
+  }
+
+  /** A promoted KA's SWM graph URI: per-KA `…/_shared_memory/{addr}/{number}` (resolved from the assertion), else the legacy bucket. */
+  private async swmGraphUri(contextGraphId: string, agentAddress: string, name: string, subGraphName?: string): Promise<string> {
+    const num = await this.resolveKaNumber(contextGraphId, agentAddress, name, subGraphName);
+    return num !== null
+      ? contextGraphLayerUri(contextGraphId, MemoryLayer.SharedWorkingMemory, agentAddress, num, subGraphName)
+      : this.graphManager.sharedMemoryUri(contextGraphId, subGraphName);
+  }
+
+  /** SWM graph URI from an explicit `{author, number}` (receiver-side / freshly-allocated generic share). */
+  private swmGraphUriFor(contextGraphId: string, agentAddress: string, kaNumber: bigint, subGraphName?: string): string {
+    return contextGraphLayerUri(contextGraphId, MemoryLayer.SharedWorkingMemory, agentAddress, kaNumber, subGraphName);
+  }
+
+  /**
+   * Every SWM graph under a bucket: the bare bucket PLUS the per-KA
+   * `…/_shared_memory/{addr}/{number}` graphs. SWM deletes/cleanup must
+   * span all of them under the uniform layout (the `_shared_memory_meta`
+   * graph is intentionally excluded — it is not under the `/` prefix).
+   */
+  private async swmGraphsUnder(bucketGraph: string): Promise<string[]> {
+    const all = await this.store.listGraphs();
+    return all.filter((g) => g === bucketGraph || g.startsWith(`${bucketGraph}/`));
+  }
+
+  async assertionCreate(
+    contextGraphId: string,
+    name: string,
+    agentAddress: string,
+    subGraphName?: string,
+    opts?: { allocateKaNumber?: () => Promise<{ number: bigint; reservedUal: string }> },
+  ): Promise<string> {
     await this.ensureSubGraphRegistered(contextGraphId, subGraphName);
-    const graphUri = contextGraphAssertionUri(contextGraphId, agentAddress, name, subGraphName);
-    await this.store.createGraph(graphUri);
 
     // Clear any stale lifecycle data from a previous create/discard cycle
     // so re-using the same assertion name doesn't leave orphaned triples.
@@ -4126,12 +4218,45 @@ export class DKGPublisher implements Publisher {
       await this.store.insert(preserved);
     }
 
+    // D1 (identity-at-create): mint the KA number now, UNLESS the draft already
+    // carries a persistent identity. The A2 preserve step above re-inserts a prior
+    // kaId on discard+recreate / pull-from, so reuse it and never double-allocate
+    // (this is the re-open guard the create-time allocation needs).
+    const hasPreservedKaId = preserved.some((q) => q.predicate === `${A2_DKG}kaId`);
+    let kaNumber: bigint | undefined;
+    let reservedUal: string | undefined;
+    if (hasPreservedKaId) {
+      const m = preserved.find((q) => q.predicate === `${A2_DKG}kaId`)?.object?.match(/(\d+)/);
+      if (m) kaNumber = BigInt(m[1]);
+    } else if (opts?.allocateKaNumber) {
+      ({ number: kaNumber, reservedUal } = await opts.allocateKaNumber());
+    } else if (this.kaAllocator && /^0x[a-fA-F0-9]{40}$/.test(agentAddress)) {
+      // Direct (non-agent-wrapper) callers still get a number from the SHARED allocator
+      // (same instance the agent wrapper uses — no double-mint), so the per-KA graph is
+      // the ONE layout. Without this, a direct create would fall back to a name-keyed
+      // graph the indexed `_working_memory/{addr}/` read can never find.
+      const kaId = await this.ensureReservedKaId(agentAddress);
+      if (kaId !== undefined) {
+        kaNumber = kaId & ((1n << 96n) - 1n);
+        reservedUal = `did:dkg:${this.chain.chainId}/${agentAddress.toLowerCase()}/${kaNumber}`;
+      }
+    }
+
+    // Uniform layout: WM data lives in the per-KA graph keyed by {number} once the KA
+    // has an identity (D1). Now that the number is known, build + create that graph.
+    const graphUri = kaNumber !== undefined
+      ? contextGraphLayerUri(contextGraphId, MemoryLayer.WorkingMemory, agentAddress, kaNumber, subGraphName)
+      : contextGraphAssertionUri(contextGraphId, agentAddress, name, subGraphName);
+    await this.store.createGraph(graphUri);
+
     const lifecycleQuads = generateAssertionCreatedMetadata({
       contextGraphId,
       agentAddress,
       assertionName: name,
       subGraphName,
       timestamp: new Date(),
+      kaNumber,
+      reservedUal,
     });
     await this.store.insert(lifecycleQuads);
 
@@ -4153,7 +4278,7 @@ export class DKGPublisher implements Publisher {
     subGraphName?: string,
   ): Promise<void> {
     await this.ensureSubGraphRegistered(contextGraphId, subGraphName);
-    const graphUri = contextGraphAssertionUri(contextGraphId, agentAddress, name, subGraphName);
+    const graphUri = await this.wmGraphUri(contextGraphId, agentAddress, name, subGraphName);
     const quads = input.map((t) => ({
       subject: t.subject, predicate: t.predicate, object: t.object, graph: graphUri,
     }));
@@ -4170,7 +4295,7 @@ export class DKGPublisher implements Publisher {
     subGraphName?: string,
   ): Promise<Quad[]> {
     DKGPublisher.validateOptionalSubGraph(subGraphName);
-    const graphUri = contextGraphAssertionUri(contextGraphId, agentAddress, name, subGraphName);
+    const graphUri = await this.wmGraphUri(contextGraphId, agentAddress, name, subGraphName);
     const result = await this.store.query(
       `CONSTRUCT { ?s ?p ?o } WHERE { GRAPH <${graphUri}> { ?s ?p ?o } }`,
     );
@@ -4202,7 +4327,7 @@ export class DKGPublisher implements Publisher {
     // PR #972/a6740ac: ensure the (sub)graph is registered so a sub-scoped VM
     // pull can resolve its data graph below (was a pure name-format validation).
     await this.ensureSubGraphRegistered(contextGraphId, subGraphName);
-    const wmGraph = contextGraphAssertionUri(contextGraphId, agentAddress, name, subGraphName);
+    const wmGraph = await this.wmGraphUri(contextGraphId, agentAddress, name, subGraphName);
     const metaGraph = contextGraphMetaUri(contextGraphId);
     const sourceGraph = sourceLayer === 'swm'
       ? this.graphManager.sharedMemoryUri(contextGraphId, subGraphName)
@@ -4252,12 +4377,12 @@ export class DKGPublisher implements Publisher {
     // (same filter the publish gather / RS prover use), minus trust/ownership
     // bookkeeping that never belongs in a working draft.
     const values = entities.map((e) => `<${e}>`).join(' ');
+    // Per-KA SWM: when pulling from SWM the source spans the per-KA prefix, not one bucket.
+    const sourcePattern = sourceLayer === 'swm'
+      ? `GRAPH ?g { VALUES ?root { ${values} } ?s ?p ?o . FILTER(?s = ?root || STRSTARTS(STR(?s), CONCAT(STR(?root), "/.well-known/genid/"))) } FILTER((STRSTARTS(STR(?g), "${sourceGraph}/") && !STRSTARTS(STR(?g), "${sourceGraph}/staging/")) || STR(?g) = "${sourceGraph}")`
+      : `GRAPH <${sourceGraph}> { VALUES ?root { ${values} } ?s ?p ?o . FILTER(?s = ?root || STRSTARTS(STR(?s), CONCAT(STR(?root), "/.well-known/genid/"))) }`;
     const gather = await this.store.query(
-      `CONSTRUCT { ?s ?p ?o } WHERE { GRAPH <${sourceGraph}> {
-         VALUES ?root { ${values} }
-         ?s ?p ?o .
-         FILTER(?s = ?root || STRSTARTS(STR(?s), CONCAT(STR(?root), "/.well-known/genid/")))
-       } }`,
+      `CONSTRUCT { ?s ?p ?o } WHERE { ${sourcePattern} }`,
     );
     const gathered = gather.type === 'quads'
       ? gather.quads.filter((q) => !isTrustLevelQuad(q) && q.predicate !== WORKSPACE_OWNER_PREDICATE)
@@ -4294,8 +4419,8 @@ export class DKGPublisher implements Publisher {
     opts?: { entities?: string[] | 'all'; subGraphName?: string; publisherPeerId?: string; senderAgentAddress?: string },
   ): Promise<{ promotedCount: number; gossipMessage?: Uint8Array }> {
     await this.ensureSubGraphRegistered(contextGraphId, opts?.subGraphName);
-    const graphUri = contextGraphAssertionUri(contextGraphId, agentAddress, name, opts?.subGraphName);
-    const swmGraphUri = this.graphManager.sharedMemoryUri(contextGraphId, opts?.subGraphName);
+    const graphUri = await this.wmGraphUri(contextGraphId, agentAddress, name, opts?.subGraphName);
+    const swmGraphUri = await this.swmGraphUri(contextGraphId, agentAddress, name, opts?.subGraphName);
 
     const result = await this.store.query(
       `CONSTRUCT { ?s ?p ?o } WHERE { GRAPH <${graphUri}> { ?s ?p ?o } }`,
@@ -4443,6 +4568,7 @@ export class DKGPublisher implements Publisher {
         privateTripleCount: 0,
       }));
       const timestampMs = Date.now();
+      const promoteKaNumber = await this.resolveKaNumber(contextGraphId, agentAddress, name, opts?.subGraphName);
       const encoded = encodeWorkspacePublishRequest({
         contextGraphId: contextGraphId,
         nquads: new TextEncoder().encode(nquadsStr),
@@ -4452,6 +4578,8 @@ export class DKGPublisher implements Publisher {
         timestampMs,
         operationId,
         subGraphName: opts.subGraphName,
+        agentAddress,
+        kaNumber: promoteKaNumber !== null ? String(promoteKaNumber) : undefined,
       });
 
       // Wrap the plaintext publish-request in the encrypted envelope
@@ -4490,21 +4618,22 @@ export class DKGPublisher implements Publisher {
       gossipMessage = wrapped;
     }
 
-    // Rule 4: reject roots owned by a different peer before any mutations.
+    // OT-RFC-46 §17.4 / rc.17 D6 — workspaceOwner is now an ADVISORY hint, not a
+    // hard exclusivity gate: a foreign co-claim is no longer REJECTED (the Rule-4
+    // throw is removed). While SWM is still a shared bucket (pre rc.17b per-KA
+    // conversion) we SKIP foreign-owned roots so a co-claim cannot clobber the
+    // owner's quads in the shared graph; once SWM is per-KA (each peer owns its own
+    // graph) this skip is dropped entirely and overlap is fully allowed.
     const skippedRoots = new Set<string>();
     for (const root of rootEntities) {
       const owner = swmOwners.get(root);
       if (!owner) continue;
-      if (opts?.publisherPeerId) {
-        if (owner !== opts.publisherPeerId) {
-          throw new Error(
-            `Cannot promote entity <${root}>: owned by peer ${owner}, not by caller ${opts.publisherPeerId}.`,
-          );
-        }
-      } else {
-        this.log.warn(createOperationContext('share'), `Skipping entity <${root}>: owned by peer ${owner} in SWM but no publisherPeerId provided to verify ownership.`);
-        skippedRoots.add(root);
-      }
+      if (opts?.publisherPeerId && owner === opts.publisherPeerId) continue; // self-owned — proceed
+      this.log.warn(
+        createOperationContext('share'),
+        `Skipping entity <${root}>: owned by peer ${owner} in SWM (advisory ownership; co-claim not rejected). caller=${opts?.publisherPeerId ?? '(none)'}`,
+      );
+      skippedRoots.add(root);
     }
 
     // Filter out skipped roots so subsequent mutations don't touch foreign-owned data.
@@ -4567,11 +4696,13 @@ export class DKGPublisher implements Publisher {
     await this.store.insert(shareTransition);
 
     // Update assertion lifecycle record in _meta: created → promoted
+    const promotedKaNumber = await this.resolveKaNumber(contextGraphId, agentAddress, name, opts?.subGraphName);
     const promoted = generateAssertionPromotedMetadata({
       contextGraphId,
       agentAddress,
       assertionName: name,
       subGraphName: opts?.subGraphName,
+      kaNumber: promotedKaNumber ?? undefined,
       shareOperationId: operationId,
       rootEntities: effectiveRoots,
       timestamp: new Date(),
@@ -4626,7 +4757,7 @@ export class DKGPublisher implements Publisher {
 
   async assertionDiscard(contextGraphId: string, name: string, agentAddress: string, subGraphName?: string): Promise<void> {
     DKGPublisher.validateOptionalSubGraph(subGraphName);
-    const graphUri = contextGraphAssertionUri(contextGraphId, agentAddress, name, subGraphName);
+    const graphUri = await this.wmGraphUri(contextGraphId, agentAddress, name, subGraphName);
     // Drop the assertion data graph AND clean up any `_meta` rows keyed
     // by this assertion's UAL in the CG root `_meta` graph. Without this
     // second step, `<assertionUal> dkg:sourceFileHash ?h` and friends

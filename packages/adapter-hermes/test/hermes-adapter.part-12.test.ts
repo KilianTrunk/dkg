@@ -189,10 +189,10 @@ assert all("_rank" not in hit for hit in result["hits"]), result
 assert provider._client.calls == [
     ("agent-context", {"view": "working-memory", "agent_address": "0xAgent"}),
     ("agent-context", {"view": "shared-working-memory", "agent_address": None}),
-    ("agent-context", {"view": "verified-memory", "agent_address": None}),
+    ("agent-context", {"view": "verifiable-memory", "agent_address": None}),
     ("project-cg", {"view": "working-memory", "agent_address": "0xAgent"}),
     ("project-cg", {"view": "shared-working-memory", "agent_address": None}),
-    ("project-cg", {"view": "verified-memory", "agent_address": None}),
+    ("project-cg", {"view": "verifiable-memory", "agent_address": None}),
 ], provider._client.calls
 `;
     const result = spawnSync('python', ['-B', '-c', script], {

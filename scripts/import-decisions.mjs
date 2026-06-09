@@ -86,7 +86,7 @@ const DECISION_AUTHOR = {
   'ast-code-ontology':                 'claude-code-branarakic',
   'project-profile-in-meta-subgraph':  'claude-code-branarakic',
   'live-genui-over-static-templates':  'claude-code-branarakic',
-  'verified-memory-hero-view':         'claude-code-branarakic',
+  'verifiable-memory-hero-view':         'claude-code-branarakic',
   'subgraphs-as-first-class':          'claude-code-branarakic',
   // Cross-package integration work — claude-code-bojan leads here:
   'chat-assertion-owner-alignment':    'claude-code-bojan',
@@ -231,8 +231,8 @@ const DECISIONS = [
     proposedBy: 'branarakic',
   },
   {
-    slug: 'verified-memory-hero-view',
-    title: 'Treat Verified Memory as the hero layer with rich provenance UI',
+    slug: 'verifiable-memory-hero-view',
+    title: 'Treat Verifiable Memory as the hero layer with rich provenance UI',
     status: 'accepted',
     date: '2026-04-16',
     context:
@@ -412,7 +412,7 @@ const DECISIONS = [
     status: 'proposed',
     date: '2026-04-17',
     context:
-      'Right now anything can be promoted to Verified Memory. If VM is the layer other agents trust without ' +
+      'Right now anything can be promoted to Verifiable Memory. If VM is the layer other agents trust without ' +
       'recomputation, we need protocol-level guarantees about shape and completeness of the promoted data.',
     outcome:
       'Define SHACL shape files per ontology (code, github, decisions, tasks, profile); run them in the daemon ' +

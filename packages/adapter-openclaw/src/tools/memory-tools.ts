@@ -12,7 +12,7 @@ import type { DkgToolHost } from './tool-host.js';
 
 export function buildMemoryTools(ctx: DkgToolHost): OpenClawTool[] {
   return [
-    // ── Shared Working Memory → Verified Memory publish (canonical step 4) ─
+    // ── Shared Working Memory → Verifiable Memory publish (canonical step 4) ─
     {
       name: 'dkg_shared_memory_publish',
       description:
@@ -56,7 +56,7 @@ export function buildMemoryTools(ctx: DkgToolHost): OpenClawTool[] {
         'Direct Shared Working Memory write — gossip-replicate a concise free-text fact ' +
         'to the team. Lightweight alternative to the canonical dkg_assertion_create → ' +
         'dkg_assertion_write → dkg_assertion_promote flow; use the canonical flow when the ' +
-        'data needs to be staged, retracted, or promoted to Verified Memory.',
+        'data needs to be staged, retracted, or promoted to Verifiable Memory.',
       parameters: {
         type: 'object',
         properties: {
@@ -81,7 +81,7 @@ export function buildMemoryTools(ctx: DkgToolHost): OpenClawTool[] {
       name: 'memory_search',
       description:
         'Search your DKG-backed memory across all trust tiers (Working Memory drafts, ' +
-        'Shared Working Memory, and on-chain Verified Memory) in both your agent-context ' +
+        'Shared Working Memory, and on-chain Verifiable Memory) in both your agent-context ' +
         'graph and the currently-selected project context graph. Returns the top-N most ' +
         'relevant memory snippets with trust-weighted ranking (VM > SWM > WM). Prefer this ' +
         'over dkg_query for free-text recall; use dkg_query only when you need precise ' +

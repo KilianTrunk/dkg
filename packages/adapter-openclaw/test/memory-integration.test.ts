@@ -124,7 +124,7 @@ describe('Memory integration round-trip (issue #199 Phase 1 + Phase 2)', () => {
         .map((c) => c[1].view);
       expect(agentContextViews).toContain('working-memory');
       expect(agentContextViews).toContain('shared-working-memory');
-      expect(agentContextViews).toContain('verified-memory');
+      expect(agentContextViews).toContain('verifiable-memory');
     });
 
     it('memory_search finds the tatooine memory that Phase 1 wrote (round-trip alignment)', async () => {
@@ -170,7 +170,7 @@ describe('Memory integration round-trip (issue #199 Phase 1 + Phase 2)', () => {
         (c) => c[1].contextGraphId === 'agent-context',
       );
       const views = agentContextCalls.map((c) => c[1].view).sort();
-      expect(views).toEqual(['shared-working-memory', 'verified-memory', 'working-memory']);
+      expect(views).toEqual(['shared-working-memory', 'verifiable-memory', 'working-memory']);
     });
 
     it('memory_search sends agentAddress on WM reads (required by A-1 isolation at query boundary)', async () => {

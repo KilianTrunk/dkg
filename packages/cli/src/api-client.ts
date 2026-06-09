@@ -10,6 +10,13 @@ export type QueryResult =
 
 export interface PreSignedAuthorAttestationPayload {
   address: string;
+  /**
+   * OT-RFC-43 §F2 — the packed reservedKaId the author signed the
+   * AuthorAttestation over, as a decimal string (uint256-safe over JSON).
+   * Required: the digest binds it, so the daemon honours the author's
+   * reserved slot rather than re-allocating.
+   */
+  reservedKaId: string;
   signature: { r: string; vs: string };
 }
 
@@ -490,7 +497,7 @@ export class ApiClient {
 
   /**
    * Selection-based publish — publishes one selected SWM rootEntity to
-   * verified memory. Passing `"all"` is accepted only when the source
+   * verifiable memory. Passing `"all"` is accepted only when the source
    * SWM currently resolves to a single publishable root. The agent mints the
    * AuthorAttestation seal inline at the selection boundary using
    * the calling agent's bearer-token identity / explicit
@@ -531,7 +538,7 @@ export class ApiClient {
   /**
    * Create an assertion in WM, optionally writing quads + finalizing +
    * promoting in the same call. Maps directly to the extended
-   * `POST /api/assertion/create` body.
+   * `POST /api/knowledge-assets` body.
    *
    * RFC-001 §9.x — the assertion lifecycle is the canonical entry
    * point for staging content for VM publish. Callers that previously
@@ -663,7 +670,7 @@ export class ApiClient {
     };
     promotedCount?: number;
   }> {
-    return this.post('/api/assertion/create', {
+    return this.post('/api/knowledge-assets', {
       contextGraphId,
       name,
       ...(options?.subGraphName ? { subGraphName: options.subGraphName } : {}),
@@ -684,7 +691,7 @@ export class ApiClient {
 
   /**
    * Append quads to an existing WM assertion. Wraps
-   * `POST /api/assertion/:name/write`. Used by batched ingest paths
+   * `POST /api/knowledge-assets/:name/wm/write`. Used by batched ingest paths
    * (e.g. `dkg index`) that materialize a single named assertion
    * across many round-trips before finalize.
    */
@@ -694,7 +701,7 @@ export class ApiClient {
     quads: Array<{ subject: string; predicate: string; object: string; graph: string }>,
     options?: { subGraphName?: string },
   ): Promise<{ written: number }> {
-    return this.post(`/api/assertion/${encodeURIComponent(name)}/write`, {
+    return this.post(`/api/knowledge-assets/${encodeURIComponent(name)}/wm/write`, {
       contextGraphId,
       quads,
       ...(options?.subGraphName ? { subGraphName: options.subGraphName } : {}),
@@ -726,7 +733,7 @@ export class ApiClient {
     eip712Digest: string;
   }> {
     return this.post(
-      `/api/assertion/${encodeURIComponent(name)}/finalize`,
+      `/api/knowledge-assets/${encodeURIComponent(name)}/wm/finalize`,
       {
         contextGraphId,
         ...(options?.subGraphName ? { subGraphName: options.subGraphName } : {}),
@@ -744,7 +751,7 @@ export class ApiClient {
   }
 
   /**
-   * Publish a previously-finalized assertion to the verified-memory
+   * Publish a previously-finalized assertion to the verifiable-memory
    * chain. The seal in `_meta` (written by `finalizeAssertion`)
    * supplies the AuthorAttestation; the publisher forwards it
    * verbatim and never re-signs.
@@ -1080,7 +1087,7 @@ export class ApiClient {
    * memory-layer routing (`view`, `graphSuffix`, `verifiedGraph`,
    * `subGraphName`, `includeSharedMemory`, `includeContextGraphPartitions`,
    * `agentAddress`, `assertionName`), and P-13's `minTrust` (only meaningful
-   * on `view: "verified-memory"`; ignored elsewhere). `contextGraphId` stays
+   * on `view: "verifiable-memory"`; ignored elsewhere). `contextGraphId` stays
    * in the 2nd positional slot for backwards compatibility.
    */
   async query(
@@ -1090,7 +1097,7 @@ export class ApiClient {
       graphSuffix?: string;
       includeSharedMemory?: boolean;
       includeContextGraphPartitions?: boolean;
-      view?: 'working-memory' | 'shared-working-memory' | 'verified-memory';
+      view?: 'working-memory' | 'shared-working-memory' | 'verifiable-memory';
       agentAddress?: string;
       assertionName?: string;
       subGraphName?: string;
@@ -1535,14 +1542,14 @@ export class ApiClient {
 
   async verify(request: {
     contextGraphId: string;
-    verifiedMemoryId: string;
+    verifiableMemoryId: string;
     batchId: string;
     timeoutMs?: number;
     requiredSignatures?: number;
   }): Promise<{
     txHash?: string;
     blockNumber?: number;
-    verifiedMemoryId: string;
+    verifiableMemoryId: string;
     signers: string[];
     status?: 'verified' | 'partial' | 'no_quorum';
     trustLevel?: number;
@@ -1595,7 +1602,7 @@ export class ApiClient {
     if (request.ontologyRef) form.append('ontologyRef', request.ontologyRef);
     if (request.subGraphName) form.append('subGraphName', request.subGraphName);
 
-    return this.postForm(`/api/assertion/${encodeURIComponent(name)}/import-file`, form);
+    return this.postForm(`/api/knowledge-assets/${encodeURIComponent(name)}/wm/import-file`, form);
   }
 
   async assertionExtractionStatus(name: string, contextGraphId: string, subGraphName?: string): Promise<{
@@ -1610,7 +1617,7 @@ export class ApiClient {
     const params = new URLSearchParams({ contextGraphId });
     if (subGraphName) params.set('subGraphName', subGraphName);
     return this.get(
-      `/api/assertion/${encodeURIComponent(name)}/extraction-status?${params.toString()}`,
+      `/api/knowledge-assets/${encodeURIComponent(name)}/wm/extraction-status?${params.toString()}`,
     );
   }
 
@@ -1620,13 +1627,14 @@ export class ApiClient {
     subGraphName?: string;
   }): Promise<{
     promoted?: boolean;
+    swmShared?: boolean;
     promotedCount?: number;
     contextGraphId?: string;
     count?: number;
     sharedMemoryGraph?: string;
     rootEntities?: string[];
   }> {
-    return this.post(`/api/assertion/${encodeURIComponent(name)}/promote`, request);
+    return this.post(`/api/knowledge-assets/${encodeURIComponent(name)}/swm/share`, request);
   }
 
   async queryAssertion(name: string, request: {
@@ -1636,7 +1644,9 @@ export class ApiClient {
     quads: Array<{ subject: string; predicate: string; object: string; graph: string }>;
     count: number;
   }> {
-    return this.post(`/api/assertion/${encodeURIComponent(name)}/query`, request);
+    const params = new URLSearchParams({ contextGraphId: request.contextGraphId });
+    if (request.subGraphName) params.set('subGraphName', request.subGraphName);
+    return this.get(`/api/knowledge-assets/${encodeURIComponent(name)}/wm/quads?${params.toString()}`);
   }
 
   async publishCclPolicy(request: {

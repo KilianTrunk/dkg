@@ -34,7 +34,7 @@ import {
   type AssertionPublishedMeta,
   type AssertionDiscardedMeta,
 } from '../src/metadata.js';
-import { assertionLifecycleUri, contextGraphAssertionUri, MemoryLayer } from '@origintrail-official/dkg-core';
+import { assertionLifecycleUri, contextGraphAssertionUri, contextGraphSharedMemoryUri, MemoryLayer } from '@origintrail-official/dkg-core';
 
 const RDF_TYPE = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type';
 const DKG = 'http://dkg.io/ontology/';
@@ -683,6 +683,21 @@ describe('generateAssertionCreatedMetadata', () => {
     expect(graphQuad!.object).toBe(ASSERTION_GRAPH);
   });
 
+  it('D1: stamps kaId + reservedUal on the URN when the number is minted at create', () => {
+    const ual = `did:dkg:31337/${AGENT_ADDR}/7`;
+    const quads = generateAssertionCreatedMetadata({ ...meta, kaNumber: 7, reservedUal: ual });
+    const kaId = quads.find(q => q.subject === LIFECYCLE_URI && q.predicate === `${DKG}kaId`);
+    expect(kaId!.object).toBe('"7"^^<http://www.w3.org/2001/XMLSchema#integer>');
+    const ru = quads.find(q => q.subject === LIFECYCLE_URI && q.predicate === `${DKG}reservedUal`);
+    expect(ru!.object).toBe(`"${ual}"`);
+  });
+
+  it('D1: omits kaId/reservedUal when not minted (no-op for callers that have not adopted create-time allocation)', () => {
+    const quads = generateAssertionCreatedMetadata(meta);
+    expect(quads.find(q => q.predicate === `${DKG}kaId`)).toBeUndefined();
+    expect(quads.find(q => q.predicate === `${DKG}reservedUal`)).toBeUndefined();
+  });
+
   it('event entity is dual-typed prov:Activity + dkg:AssertionCreated', () => {
     const quads = generateAssertionCreatedMetadata(meta);
     const eventUri = findEventUri(quads);
@@ -752,6 +767,42 @@ describe('generateAssertionPromotedMetadata', () => {
     expect(del.find(q => q.predicate === `${DKG}memoryLayer`)!.object).toBe(`"${MemoryLayer.WorkingMemory}"`);
   });
 
+  it('SUBSTRATE-2: re-stamps dkg:assertionGraph from the WM graph to the SWM graph on promote', () => {
+    const { insert, delete: del } = generateAssertionPromotedMetadata(meta);
+    const wmGraph = contextGraphAssertionUri(CONTEXT_GRAPH, AGENT_ADDR, ASSERTION);
+    const swmGraph = contextGraphSharedMemoryUri(CONTEXT_GRAPH);
+    // the stale WM-layer pointer is deleted
+    expect(del).toContainEqual(expect.objectContaining({
+      subject: LIFECYCLE_URI, predicate: `${DKG}assertionGraph`, object: wmGraph, graph: META_GRAPH,
+    }));
+    // the layer-correct SWM pointer is inserted
+    expect(insert).toContainEqual(expect.objectContaining({
+      subject: LIFECYCLE_URI, predicate: `${DKG}assertionGraph`, object: swmGraph, graph: META_GRAPH,
+    }));
+    // exactly one assertionGraph value is written (no duplicate/stale pointer)
+    expect(insert.filter(q => q.predicate === `${DKG}assertionGraph`)).toHaveLength(1);
+  });
+
+  it('SUBSTRATE-2: re-stamps to the sub-graph-scoped SWM graph when scoped', () => {
+    const swmScoped = contextGraphSharedMemoryUri(CONTEXT_GRAPH, 'players');
+    const { insert } = generateAssertionPromotedMetadata({ ...meta, subGraphName: 'players' });
+    expect(insert.find(q => q.predicate === `${DKG}assertionGraph`)!.object).toBe(swmScoped);
+  });
+
+  it('SUBSTRATE-1: stamps member-entity membership (dkg:entity + legacy dkg:rootEntity) on the lifecycle URN', () => {
+    const { insert } = generateAssertionPromotedMetadata(meta);
+    for (const entity of meta.rootEntities) {
+      // the new membership predicate on the stable URN (what the _meta index binds)
+      expect(insert).toContainEqual(expect.objectContaining({
+        subject: LIFECYCLE_URI, predicate: `${DKG}entity`, object: entity, graph: META_GRAPH,
+      }));
+      // dual-write: the legacy predicate is also on the URN (OT-RFC-43 §10.1)
+      expect(insert).toContainEqual(expect.objectContaining({
+        subject: LIFECYCLE_URI, predicate: `${DKG}rootEntity`, object: entity, graph: META_GRAPH,
+      }));
+    }
+  });
+
   it('event is prov:Activity + dkg:AssertionPromoted with prov:used', () => {
     const { insert } = generateAssertionPromotedMetadata(meta);
     const eventUri = findEventUriFromInsert(insert);
@@ -814,7 +865,7 @@ describe('generateAssertionPublishedMetadata', () => {
     const { insert, delete: del } = generateAssertionPublishedMetadata(meta);
     expect(insert.find(q => q.subject === LIFECYCLE_URI && q.predicate === `${DKG}state`)!.object).toBe('"published"');
     expect(del.find(q => q.predicate === `${DKG}state`)!.object).toBe('"promoted"');
-    expect(insert.find(q => q.subject === LIFECYCLE_URI && q.predicate === `${DKG}memoryLayer`)!.object).toBe(`"${MemoryLayer.VerifiedMemory}"`);
+    expect(insert.find(q => q.subject === LIFECYCLE_URI && q.predicate === `${DKG}memoryLayer`)!.object).toBe(`"${MemoryLayer.VerifiableMemory}"`);
     expect(del.find(q => q.predicate === `${DKG}memoryLayer`)!.object).toBe(`"${MemoryLayer.SharedWorkingMemory}"`);
   });
 

@@ -110,7 +110,7 @@ export function formatRecalledMemoryBlock(
       .replace(/"/g, '&quot;')
       .replace(/'/g, '&#39;');
   // Snippets fetched from SWM/VM may have been authored by other peers
-  // (Shared Working Memory and Verified Memory are cross-agent surfaces).
+  // (Shared Working Memory and Verifiable Memory are cross-agent surfaces).
   // HTML-escaping prevents tag breakout, but does NOT defend against
   // prompt-injection text inside the snippet itself ("ignore previous
   // instructions", fake tool-call directives, persuasive impersonation,

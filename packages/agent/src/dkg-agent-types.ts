@@ -61,6 +61,13 @@ import type { SyncPhase } from './sync/auth/request-build.js';
  */
 export type PreSignedAuthorAttestation = {
   address: string;
+  /**
+   * OT-RFC-43 §F2 — the packed reservedKaId the self-sovereign author signed the
+   * AuthorAttestation over `(uint160(address)<<96)|uint96(number)`. Required: the
+   * digest now binds it, so the daemon must honour the author's reserved slot
+   * rather than re-allocating, or the recovered signer won't match.
+   */
+  reservedKaId: bigint;
   signature: { r: Uint8Array; vs: Uint8Array };
 };
 
@@ -292,6 +299,13 @@ export interface PublishAsyncOpts extends PublishOpts {
     authorAddress: string;
     signature: { r: Uint8Array; vs: Uint8Array };
     schemeVersion: number;
+    /**
+     * OT-RFC-43 §F2 — the packed reservedKaId `(uint160(author) << 96) | number`
+     * the caller signed into the AuthorAttestation digest. Bound into the async
+     * lift seal so the deferred-broadcast mint reuses the exact attested id (the
+     * digest commits to it, so it cannot be re-derived server-side).
+     */
+    reservedKaId: bigint;
   };
   /** Caller signs typed-data built by the daemon. Requires `authorAgentAddress`. */
   authorSignTypedData?: (typedData: AuthorAttestationTypedData) => Promise<{ r: Uint8Array; vs: Uint8Array }>;

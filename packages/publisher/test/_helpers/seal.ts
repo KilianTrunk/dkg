@@ -57,6 +57,15 @@ export interface PrecomputedUpdateAttestation {
   schemeVersion: number;
 }
 
+// §F2 — per-author monotonic KA-number for test seals (unique within a chain).
+const _sealNumberByAuthor = new Map<string, bigint>();
+function nextSealNumber(author: string): bigint {
+  const k = author.toLowerCase();
+  const n = (_sealNumberByAuthor.get(k) ?? 0n) + 1n;
+  _sealNumberByAuthor.set(k, n);
+  return n;
+}
+
 /**
  * Build a `precomputedAttestation` payload for `quads` (+ optional
  * `privateQuads`) signed by `author`. The returned object is shaped to
@@ -84,12 +93,18 @@ export async function buildSeal(
   const merkleRoot = computeFlatKCRootV10(allPublic, privateRoots);
 
   const chainIdNum = await ctx.provider.getNetwork().then((n) => n.chainId);
+  // §F2 — the AuthorAttestation digest now binds the packed reservedKaId; the
+  // publisher mints with it (carried on the precomputedAttestation). Allocate a
+  // per-author monotonic number so repeated seals on one chain don't collide.
+  const reservedKaId =
+    (BigInt(ethers.getAddress(author.address)) << 96n) | nextSealNumber(author.address);
   const td = buildAuthorAttestationTypedData({
     chainId: BigInt(chainIdNum),
     kav10Address: ctx.kav10Address,
     contextGraphId: BigInt(contextGraphId),
     merkleRoot,
     authorAddress: author.address,
+    reservedKaId,
   });
   const sigHex = await author.signTypedData(td.domain, td.types, td.message);
   const sig = ethers.Signature.from(sigHex);
@@ -101,6 +116,7 @@ export async function buildSeal(
       vs: ethers.getBytes(sig.yParityAndS),
     },
     schemeVersion: AUTHOR_SCHEME_VERSION_V1,
+    reservedKaId,
   };
 }
 

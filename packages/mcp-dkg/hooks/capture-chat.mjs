@@ -35,9 +35,9 @@
  *    is logged to /tmp/dkg-capture.log and we still exit 0 with `{}`
  *    on stdout.
  * 2. CANONICAL DKG OPS. Writes go through the existing
- *    `POST /api/assertion/<name>/write` (JSON triples) and promotes
- *    through `POST /api/assertion/<name>/promote`, matching every
- *    other seeding script in the repo.
+ *    `POST /api/knowledge-assets/<name>/wm/write` (JSON triples) and
+ *    promotes through `POST /api/knowledge-assets/<name>/swm/share`,
+ *    matching every other seeding script in the repo.
  * 3. NO PROMPT INJECTION. Per the V10 retirement of sugared writes
  *    (#18) and the dropped agent-instruction protocol (#21), this hook
  *    no longer returns `additionalContext` / per-turn reminders. Agents
@@ -411,7 +411,7 @@ async function postJson(api, route, token, body) {
  * turn can be promoted/discarded independently.
  */
 async function writeTriples(cfg, triples, assertionName = cfg.assertion) {
-  return postJson(cfg.api, `/api/assertion/${encodeURIComponent(assertionName)}/write`, cfg.token, {
+  return postJson(cfg.api, `/api/knowledge-assets/${encodeURIComponent(assertionName)}/wm/write`, cfg.token, {
     contextGraphId: cfg.project,
     subGraphName: cfg.subGraph,
     quads: triples,
@@ -419,7 +419,7 @@ async function writeTriples(cfg, triples, assertionName = cfg.assertion) {
 }
 
 async function promoteEntities(cfg, entities, assertionName = cfg.assertion) {
-  return postJson(cfg.api, `/api/assertion/${encodeURIComponent(assertionName)}/promote`, cfg.token, {
+  return postJson(cfg.api, `/api/knowledge-assets/${encodeURIComponent(assertionName)}/swm/share`, cfg.token, {
     contextGraphId: cfg.project,
     subGraphName: cfg.subGraph,
     entities,

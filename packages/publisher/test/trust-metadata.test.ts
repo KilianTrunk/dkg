@@ -38,6 +38,10 @@ async function buildSeal(
   author: ethers.Wallet,
 ) {
   const canonical = canonicalPublishPayload(quads, []);
+  // §F2 — the digest binds the packed reservedKaId and the mock mints exactly
+  // it; the test unpacks {author,number} from the returned kaId. A fresh
+  // random `author` per test means number=1 never collides.
+  const reservedKaId = (BigInt(ethers.getAddress(author.address)) << 96n) | 1n;
   const typed = buildAuthorAttestationTypedData({
     chainId: await chain.getEvmChainId(),
     kav10Address: await chain.getKnowledgeAssetsLifecycleAddress(),
@@ -45,6 +49,7 @@ async function buildSeal(
     merkleRoot: canonical.kcMerkleRoot,
     authorAddress: author.address,
     schemeVersion: AUTHOR_SCHEME_VERSION_V1,
+    reservedKaId,
   });
   const sig = ethers.Signature.from(await author.signTypedData(
     typed.domain,
@@ -59,6 +64,7 @@ async function buildSeal(
       vs: ethers.getBytes(sig.yParityAndS),
     },
     schemeVersion: AUTHOR_SCHEME_VERSION_V1,
+    reservedKaId,
   };
 }
 
@@ -107,9 +113,16 @@ describe('publisher trust metadata', () => {
     });
 
     expect(result.status).toBe('confirmed');
+    // rc.17 uniform per-KA layout: a confirmed publish stamps TrustLevel on the
+    // per-KA verifiable-memory graph …/_verifiable_memory/{author}/{number}, NOT the
+    // legacy monolithic root data graph. author+number are unpacked from the
+    // minted kaId returned in the publish result.
+    const vmNumber = result.kaId & ((1n << 96n) - 1n);
+    const vmAuthor = `0x${(result.kaId >> 96n).toString(16).padStart(40, '0')}`;
+    const vmGraph = `did:dkg:context-graph:${contextGraphId}/_verifiable_memory/${vmAuthor}/${vmNumber}`;
     const trust = await store.query(
       `SELECT ?subject ?level WHERE {
-        GRAPH <did:dkg:context-graph:${contextGraphId}> {
+        GRAPH <${vmGraph}> {
           VALUES ?subject {
             <urn:trust:published-root>
             <urn:trust:published-root/.well-known/genid/child>

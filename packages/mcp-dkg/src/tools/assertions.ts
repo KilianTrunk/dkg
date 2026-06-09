@@ -80,11 +80,11 @@ export function registerAssertionTools(
       const pid = resolveProject(projectId, config);
       if (!pid) return projectErr();
       try {
-        // Create stays on the legacy assertion route: it preserves the
-        // `{ assertionUri, alreadyExists }` contract (the KA create route is an
-        // idempotent get-or-create that can't report `alreadyExists`) and the
-        // route's name validation. Only the WM/SWM mutation verbs (write /
-        // promote / discard) move to the KA routes below.
+        // Create now hits the KA route (`POST /api/knowledge-assets`),
+        // which is an idempotent get-or-create that reports `alreadyExists`
+        // in its response body alongside the back-compat `assertionUri`.
+        // `client.createAssertion` reads that flag (with a legacy
+        // error-string fallback) so this contract is unchanged.
         const result = await client.createAssertion({
           contextGraphId: pid,
           assertionName: name,
@@ -304,7 +304,7 @@ export function registerAssertionTools(
 
   // ── dkg_assertion_import_file ───────────────────────────────────
   // Wave-2 P1 add (audit §7 item 4). Wraps
-  // `POST /api/assertion/{name}/import-file` (multipart/form-data) —
+  // `POST /api/knowledge-assets/{name}/wm/import-file` (multipart/form-data) —
   // the daemon's extraction pipeline turns markdown / PDF / DOCX /
   // etc. into RDF triples and writes them into the assertion's graph.
   server.registerTool(
@@ -539,7 +539,7 @@ export function registerAssertionTools(
 
   // ── dkg_assertion_history ───────────────────────────────────────
   // Wave-2 P3 add (audit §7 item 12). Wraps
-  // `GET /api/assertion/{name}/history` — lifecycle introspection.
+  // `GET /api/knowledge-assets/{name}` — lifecycle introspection.
   server.registerTool(
     'dkg_assertion_history',
     {
@@ -564,10 +564,9 @@ export function registerAssertionTools(
       const pid = resolveProject(projectId, config);
       if (!pid) return projectErr();
       try {
-        // Read stays on the legacy assertion route: the KA GET surface
-        // (getKnowledgeAsset) is keyed by (contextGraph, name) only and
-        // cannot resolve another author's history. Keep `agentAddress`
-        // author-scoping until the KA GET route accepts it.
+        // Read hits the KA descriptor route (`GET /api/knowledge-assets/{name}`),
+        // which accepts `contextGraphId`, `subGraphName`, and `agentAddress`
+        // as query params — so author-scoped history lookups still work.
         const result = await client.getAssertionHistory({
           contextGraphId: pid,
           assertionName: name,

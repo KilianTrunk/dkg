@@ -37,8 +37,13 @@ class OperationalKeyOnlyPublishChainAdapter implements ChainAdapter {
     if (params.publisherAddress.toLowerCase() !== this.wallet.address.toLowerCase()) {
       throw new Error('publisher did not use the adapter operational key fallback');
     }
+    // OT-RFC-43 Option 1: the contract _safeMints the reserved id, so echo
+    // params.reservedKaId as the minted kaId (publisher asserts mintedKaId ===
+    // reservedKaId). Fall back to the legacy fixed id when none was reserved.
+    const kaId = params.reservedKaId ?? 1n;
     return {
-      batchId: 1n,
+      batchId: kaId,
+      kaId,
       startKAId: 101n,
       endKAId: 101n,
       txHash: `0x${'34'.repeat(32)}`,
@@ -78,8 +83,13 @@ class ExternalOperationalKeyPublishChainAdapter implements ChainAdapter {
     if (params.publisherAddress.toLowerCase() !== this.expectedPublisherAddress.toLowerCase()) {
       throw new Error('publisher did not use chainConfig.operationalKeys fallback');
     }
+    // OT-RFC-43 Option 1: the contract _safeMints the reserved id, so echo
+    // params.reservedKaId as the minted kaId (publisher asserts mintedKaId ===
+    // reservedKaId). Fall back to the legacy fixed id when none was reserved.
+    const kaId = params.reservedKaId ?? 1n;
     return {
-      batchId: 1n,
+      batchId: kaId,
+      kaId,
       startKAId: 101n,
       endKAId: 101n,
       txHash: `0x${'56'.repeat(32)}`,

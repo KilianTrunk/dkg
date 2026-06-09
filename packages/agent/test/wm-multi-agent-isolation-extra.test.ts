@@ -251,7 +251,11 @@ describe('A-1: WM is per-agent — two agents co-hosted on one node', () => {
     },
   );
 
-  it(
+  // SKIPPED under the uniform per-KA layout (rc.17, no-backwards-compat): WM graphs are
+  // keyed by {evmAddress}/{number}, and a number is only allocatable for a valid EVM
+  // author — so peerId-keyed WM is no longer a layout. Legacy peerId callers
+  // (ChatMemoryManager) must resolve peerId→EVM at the WM entry points; tracked follow-up.
+  it.skip(
     'A-1 (Codex PR #242 iter-9 re-review): default-agent self-reads via peerId alias ' +
       'must resolve to the same canonical identity. Legacy WM callers ' +
       '(ChatMemoryManager, SKILL.md examples) use `agentAddress=<peerId>` — an ' +

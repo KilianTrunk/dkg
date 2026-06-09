@@ -55,9 +55,12 @@ export async function resolveFactsFromSnapshot(
   const graph = opts.view === 'workspace'
     ? contextGraphWorkspaceGraphUri(opts.contextGraphId)
     : contextGraphDataGraphUri(opts.contextGraphId);
+  // Uniform per-KA read-both: workspace facts live under …/_shared_memory/{addr}/{number},
+  // published facts under …/_verifiable_memory/{addr}/{number}; the bare graph is the legacy fallback.
+  const layerPrefix = opts.view === 'workspace' ? `${graph}/` : `${graph}/_verifiable_memory/`;
   const query = `
     SELECT ?fact ?predicate ?snapshotId ?view ?scopeUal ?argPred ?argVal WHERE {
-      GRAPH <${graph}> {
+      GRAPH ?g {
         ?fact <${DKG_ONTOLOGY.RDF_TYPE}> <${CCL_INPUT_FACT}> ;
               <${CCL_FACT_PREDICATE}> ?predicate ;
               ?argPred ?argVal .
@@ -66,6 +69,7 @@ export async function resolveFactsFromSnapshot(
         OPTIONAL { ?fact <${DKG_ONTOLOGY.DKG_VIEW}> ?view }
         OPTIONAL { ?fact <${DKG_ONTOLOGY.DKG_SCOPE_UAL}> ?scopeUal }
       }
+      FILTER(STRSTARTS(STR(?g), "${layerPrefix}") || STR(?g) = "${graph}")
     }
     ORDER BY ?fact ?argPred
   `;
@@ -249,7 +253,7 @@ async function resolveEndorsementFacts(
     ? `?ual <${DKG_ONTOLOGY.DKG_SNAPSHOT_ID}> ?sid . FILTER(STR(?sid) = ${JSON.stringify(scope.snapshotId)})`
     : '';
   // NOTE: view-based filtering of endorsement KAs requires resolving the
-  // view's named-graph URI (e.g. contextGraphVerifiedMemoryUri). The view
+  // view's named-graph URI (e.g. contextGraphVerifiableMemoryUri). The view
   // value is included in factQueryHash via the caller, ensuring snapshot
   // determinism. Full view-graph filtering deferred to CCL v1.0.
   const query = `

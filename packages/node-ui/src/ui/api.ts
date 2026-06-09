@@ -619,7 +619,7 @@ export async function importFile(
   if (opts?.ontologyRef) form.append('ontologyRef', opts.ontologyRef);
   if (opts?.subGraphName) form.append('subGraphName', opts.subGraphName);
 
-  const res = await fetch(`${BASE}/api/assertion/${encodeURIComponent(assertionName)}/import-file`, {
+  const res = await fetch(`${BASE}/api/knowledge-assets/${encodeURIComponent(assertionName)}/wm/import-file`, {
     method: 'POST',
     headers: authHeaders(),
     body: form,
@@ -721,21 +721,25 @@ export async function fetchAssertionUals(contextGraphId: string): Promise<Record
 // re-signs.
 export const publishTriples = async (contextGraphId: string, quads: any[]) => {
   const assertionName = `ui-publish-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  const created = await post<{ assertionUri: string; seal?: Record<string, unknown> }>(
-    '/api/assertion/create',
+  const created = await post<{ assertionUri: string; merkleRoot?: string; promotedCount?: number }>(
+    '/api/knowledge-assets',
     {
       contextGraphId,
       name: assertionName,
       quads,
       finalize: true,
-      promote: true,
+      // rc.17 KA-routes-unification: the SWM-promote flag is `alsoShareSwm`
+      // (the old `promote` is ignored → the asset never reaches SWM and the
+      // follow-up /api/shared-memory/publish finds nothing to publish).
+      alsoShareSwm: true,
     },
   );
   const published = await post<any>('/api/shared-memory/publish', {
     contextGraphId,
     assertionName,
   });
-  return { ...published, assertionUri: created.assertionUri, ...(created.seal ? { seal: created.seal } : {}) };
+  // rc.17 create returns `merkleRoot` at top level (not nested `seal`).
+  return { ...published, assertionUri: created.assertionUri, ...(created.merkleRoot ? { merkleRoot: created.merkleRoot } : {}) };
 };
 
 export const writeSharedMemory = (
@@ -1190,9 +1194,26 @@ export async function listAssertions(
     GRAPH <${metaGraph}> { ?g <http://dkg.io/ontology/memoryLayer> "WM" }
     ${metaFilter}
   }`;
+  // rc.17 per-KA WM: the data graph is …/_working_memory/{addr}/{number} (number-keyed),
+  // but the surviving list row is the lifecycle URN (name-keyed). Count the URN's data
+  // graph via its dkg:assertionGraph pointer and key by the URN too — else
+  // countByGraph.get(urn) is undefined and the triple-count badge is lost for every WM KA.
+  //
+  // The pointer (`dkg:assertionGraph`) is stamped ONLY on the lifecycle-URN
+  // subject form (`urn:dkg:assertion:…`), never on the data-graph-URI form, so
+  // a straight INNER join `?g assertionGraph ?dg . GRAPH ?dg { … }` yields exactly
+  // one count row per WM KA, already keyed by the URN that the parser keeps below.
+  // (The earlier `OPTIONAL { GRAPH <_meta> { … } } BIND(COALESCE(…)) GRAPH ?countGraph`
+  // shape was rejected 400 "expected OPTIONAL" by the node's SPARQL engine — the
+  // whole count query failed and every WM KA lost its triple badge.) A freshly
+  // created WM KA with no data graph yet simply produces no count row and renders
+  // without a badge — the badge is `!= null`-guarded, matching prior semantics.
   const countSparql = `SELECT ?g (COUNT(*) AS ?cnt) WHERE {
-    GRAPH <${metaGraph}> { ?g <http://dkg.io/ontology/memoryLayer> "WM" }
-    GRAPH ?g { ?s ?p ?o }
+    GRAPH <${metaGraph}> {
+      ?g <http://dkg.io/ontology/memoryLayer> "WM" ;
+         <http://dkg.io/ontology/assertionGraph> ?dg
+    }
+    GRAPH ?dg { ?s ?p ?o }
     ${metaFilter}
   } GROUP BY ?g`;
   const [listData, countData] = await Promise.all([
@@ -1205,7 +1226,14 @@ export async function listAssertions(
   for (const b of (countData?.result?.bindings ?? [])) {
     const g = typeof b.g === 'string' ? b.g : b.g?.value;
     const cntRaw = typeof b.cnt === 'string' ? b.cnt : b.cnt?.value;
-    const cnt = cntRaw != null ? parseInt(cntRaw, 10) : NaN;
+    // The aggregate comes back as a typed RDF literal whose lexical form can be
+    // wrapped: `"21"^^<http://www.w3.org/2001/XMLSchema#integer>`. A bare
+    // `parseInt('"21"^^…')` reads the leading quote and yields NaN, which the
+    // `isFinite` guard then drops — losing the badge even when the query
+    // succeeds. Pull the leading digits past an optional quote, mirroring
+    // `listSwmEntities`' `^"?(\d+)` handling of the same value shape.
+    const cntMatch = typeof cntRaw === 'string' ? cntRaw.match(/^"?(\d+)/) : null;
+    const cnt = cntMatch ? parseInt(cntMatch[1], 10) : NaN;
     if (g && Number.isFinite(cnt)) countByGraph.set(g, cnt);
   }
   // #706 fix — the prior `startsWith('did:dkg:context-graph:<cg>/assertion/')`
@@ -1306,7 +1334,7 @@ export const promoteAssertion = (
   subGraphName?: string,
 ) =>
   post<{ promotedCount: number }>(
-    `/api/assertion/${encodeURIComponent(assertionName)}/promote`,
+    `/api/knowledge-assets/${encodeURIComponent(assertionName)}/swm/share`,
     { contextGraphId, entities, ...(subGraphName ? { subGraphName } : {}) },
   );
 
@@ -1419,7 +1447,7 @@ export const fetchExtractionStatus = (
   const params = new URLSearchParams({ contextGraphId });
   if (subGraphName) params.set('subGraphName', subGraphName);
   return get<ExtractionStatus>(
-    `/api/assertion/${encodeURIComponent(assertionName)}/extraction-status?${params}`,
+    `/api/knowledge-assets/${encodeURIComponent(assertionName)}/wm/extraction-status?${params}`,
   );
 };
 
@@ -1460,7 +1488,10 @@ export async function listSwmEntities(contextGraphId: string): Promise<SwmRootEn
   const sparql = `SELECT ?s (COUNT(?p) AS ?cnt) WHERE {
     GRAPH ?g {
       ?s ?p ?o .
-      FILTER(STR(?g) = "${swmGraph}")
+      FILTER(
+        (STR(?g) = "${swmGraph}" || STRSTARTS(STR(?g), "${swmGraph}/")) &&
+        !STRSTARTS(STR(?g), "${swmGraph}/staging/")
+      )
       FILTER(?p != <http://dkg.io/ontology/workspaceOwner>)
     }
   } GROUP BY ?s ORDER BY DESC(?cnt)`;

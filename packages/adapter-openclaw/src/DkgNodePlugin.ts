@@ -12,7 +12,7 @@
  *     upstream `MemoryPluginCapability` via `api.registerMemoryCapability`.
  *     No adapter-side write tool: memory writes flow through daemon HTTP
  *     routes documented in `packages/cli/skills/dkg-node/SKILL.md`
- *     (`POST /api/assertion/create` + `POST /api/assertion/:name/write`),
+ *     (`POST /api/knowledge-assets` + `POST /api/knowledge-assets/:name/wm/write`),
  *     which the agent reads from `GET /.well-known/skill.md` on startup.
  */
 import {
@@ -2715,7 +2715,7 @@ export class DkgNodePlugin {
         return this.error('"quads" must be a non-empty array of {subject, predicate, object} objects.');
       }
 
-      const result = await this.publisher.publishVerifiedMemory({ contextGraphId, quads: rawQuads });
+      const result = await this.publisher.publishVerifiableMemory({ contextGraphId, quads: rawQuads });
       return this.json({ kaId: result.kaId, kaCount: result.kas?.length ?? 0, quadsPublished: rawQuads.length });
     } catch (err: any) {
       return this.daemonError(err);
@@ -2738,7 +2738,7 @@ export class DkgNodePlugin {
       // both graphs and merges), while `false` used the legacy data-graph
       // path alone. `view: "shared-working-memory"` reads ONLY SWM and
       // would drop data-graph-only triples for `true` callers; `view:
-      // "verified-memory"` has different semantics entirely. Surface the
+      // "verifiable-memory"` has different semantics entirely. Surface the
       // break explicitly rather than pretending a clean migration exists.
       if (args.include_shared_memory !== undefined) {
         return this.error(
@@ -2746,7 +2746,7 @@ export class DkgNodePlugin {
             'for the legacy union-semantics: `true` previously queried the data graph ∪ SWM ' +
             '(no single `view` reproduces this union). Closest-intent replacements: omit `view` ' +
             'for the legacy data-graph path, or `view: "shared-working-memory"` for SWM-only, or ' +
-            '`view: "verified-memory"` for on-chain data. If you need the original union exactly, ' +
+            '`view: "verifiable-memory"` for on-chain data. If you need the original union exactly, ' +
             'call POST /api/query directly with `includeSharedMemory: true`.',
         );
       }

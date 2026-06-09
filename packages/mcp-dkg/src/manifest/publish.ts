@@ -3,7 +3,7 @@
  *
  * Composes a `dkg:ProjectManifest` + its template entities for a
  * project and writes them all into the project's `meta` sub-graph
- * via the canonical /api/assertion/<name>/write+promote path. After
+ * via the canonical /api/knowledge-assets/<name>/wm/write + swm/share path. After
  * this returns, any node subscribed to the CG can read the manifest
  * via gossip and use it to onboard new agents.
  *

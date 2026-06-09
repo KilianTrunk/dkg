@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { ServerResponse } from 'node:http';
 import { Readable } from 'node:stream';
-import { handleAssertionRoutes } from '../src/daemon/routes/assertion.js';
+import { handleKnowledgeAssetsRoutes } from '../src/daemon/routes/knowledge-assets.js';
 import type { RequestContext } from '../src/daemon/routes/context.js';
 import { handleMemoryRoutes } from '../src/daemon/routes/memory.js';
 import { handleQueryRoutes } from '../src/daemon/routes/query.js';
@@ -143,19 +143,19 @@ describe('daemon memory_graph_changed route emissions', () => {
     expect(emitMemoryGraphChanged.mock.calls[0][0]).not.toHaveProperty('content');
   });
 
-  it('emits an assertion_created refresh on standalone /api/assertion/create', async () => {
+  it('emits an assertion_created refresh on POST /api/knowledge-assets (create)', async () => {
     // Pins the contract that every standalone lifecycle route fires its own
-    // memory_graph_changed SSE. The chained /create handler emits all four
+    // memory_graph_changed SSE. The chained create handler emits all four
     // (created/written/finalized/promoted) inside one call, but a client that
     // composes the chain by hand (e.g. staking-ui, or any external integrator
-    // calling create → write → finalize → promote in four separate POSTs) sees
+    // calling create → write → finalize → share in four separate POSTs) sees
     // events ONLY if each standalone route emits independently. A regression
     // where one of the four routes silently dropped its emit (we caught
     // exactly this in /finalize during PR #436 devnet validation) would break
     // any UI watching the graph state machine.
     const emitMemoryGraphChanged = vi.fn();
     const create = vi.fn().mockResolvedValue('did:dkg:context-graph:project-a/assertion/0x0/draft');
-    const ctx = createContext('/api/assertion/create', {
+    const ctx = createContext('/api/knowledge-assets', {
       contextGraphId: 'project-a',
       name: 'draft',
       subGraphName: 'notes',
@@ -164,10 +164,10 @@ describe('daemon memory_graph_changed route emissions', () => {
       emitMemoryGraphChanged,
     });
 
-    await handleAssertionRoutes(ctx);
+    await handleKnowledgeAssetsRoutes(ctx);
 
-    expect((ctx.res as unknown as { statusCode: number }).statusCode).toBe(200);
-    expect(responseBody(ctx)).toMatchObject({ assertionUri: expect.stringContaining('draft') });
+    expect((ctx.res as unknown as { statusCode: number }).statusCode).toBe(201);
+    expect(responseBody(ctx)).toMatchObject({ name: 'draft', status: 'draft-open', assertionUri: expect.stringContaining('draft') });
     expect(emitMemoryGraphChanged).toHaveBeenCalledWith({
       contextGraphId: 'project-a',
       layers: ['wm'],
@@ -178,14 +178,14 @@ describe('daemon memory_graph_changed route emissions', () => {
     });
   });
 
-  it('emits an assertion_finalized refresh on standalone /api/assertion/:name/finalize', async () => {
+  it('emits an assertion_finalized refresh on POST /api/knowledge-assets/:name/wm/finalize', async () => {
     // Regression test for the bug found during PR #436 devnet validation:
-    // the chained /create handler emitted memory_graph_changed for the
-    // finalize step, but the standalone /api/assertion/:name/finalize route
-    // returned the EIP-712 seal without emitting. A staking-ui or external
-    // tool composing the lifecycle by hand would silently miss the
-    // 'assertion_finalized' state transition. Fixed by mirroring the chained
-    // handler's emit pattern in the standalone route.
+    // the chained create handler emitted memory_graph_changed for the
+    // finalize step, but the standalone finalize route returned the EIP-712
+    // seal without emitting. A staking-ui or external tool composing the
+    // lifecycle by hand would silently miss the 'assertion_finalized' state
+    // transition. Fixed by mirroring the chained handler's emit pattern in
+    // the standalone route.
     const emitMemoryGraphChanged = vi.fn();
     const finalize = vi.fn().mockResolvedValue({
       assertionUri: 'did:dkg:context-graph:project-a/assertion/0x0/draft',
@@ -196,7 +196,7 @@ describe('daemon memory_graph_changed route emissions', () => {
       kav10Address: '0x0000000000000000000000000000000000000001',
       eip712Digest: '0x0000000000000000000000000000000000000000000000000000000000000000',
     });
-    const ctx = createContext('/api/assertion/draft/finalize', {
+    const ctx = createContext('/api/knowledge-assets/draft/wm/finalize', {
       contextGraphId: 'project-a',
       subGraphName: 'notes',
     }, {
@@ -204,7 +204,7 @@ describe('daemon memory_graph_changed route emissions', () => {
       emitMemoryGraphChanged,
     });
 
-    await handleAssertionRoutes(ctx);
+    await handleKnowledgeAssetsRoutes(ctx);
 
     expect((ctx.res as unknown as { statusCode: number }).statusCode).toBe(200);
     expect(responseBody(ctx)).toMatchObject({
@@ -223,20 +223,28 @@ describe('daemon memory_graph_changed route emissions', () => {
 
   it('emits WM refresh events after assertion writes', async () => {
     const emitMemoryGraphChanged = vi.fn();
+    // RC.17: wm/write creates a MISSING KA before the first append (so a bare
+    // write lands in the proper per-KA layout, not the legacy name-keyed graph),
+    // gated on a missing-only existence check — history() returns null here
+    // because this is a brand-new draft, so create() must fire before write().
+    const create = vi.fn().mockResolvedValue('urn:dkg:assertion:project-a:agent:draft');
     const write = vi.fn().mockResolvedValue(undefined);
-    const ctx = createContext('/api/assertion/draft/write', {
+    const history = vi.fn().mockResolvedValue(null);
+    const ctx = createContext('/api/knowledge-assets/draft/wm/write', {
       contextGraphId: 'project-a',
       subGraphName: 'notes',
       quads: [{ subject: 'urn:s', predicate: 'urn:p', object: 'urn:o' }],
     }, {
-      agent: { assertion: { write } } as unknown as RequestContext['agent'],
+      agent: { assertion: { create, write, history }, resolveAgentByToken: () => undefined } as unknown as RequestContext['agent'],
       emitMemoryGraphChanged,
     });
 
-    await handleAssertionRoutes(ctx);
+    await handleKnowledgeAssetsRoutes(ctx);
 
     expect((ctx.res as unknown as { statusCode: number }).statusCode).toBe(200);
     expect(responseBody(ctx)).toMatchObject({ written: 1 });
+    // create() must run before write() so the first append uses the per-KA layout.
+    expect(create.mock.invocationCallOrder[0]).toBeLessThan(write.mock.invocationCallOrder[0]);
     expect(emitMemoryGraphChanged).toHaveBeenCalledWith({
       contextGraphId: 'project-a',
       layers: ['wm'],
@@ -247,22 +255,22 @@ describe('daemon memory_graph_changed route emissions', () => {
     });
   });
 
-  it('emits WM and SWM refresh events after assertion promotion', async () => {
+  it('emits WM and SWM refresh events after assertion sharing (swm/share)', async () => {
     const emitMemoryGraphChanged = vi.fn();
     const promote = vi.fn().mockResolvedValue({ promotedCount: 2 });
-    const ctx = createContext('/api/assertion/draft/promote', {
+    const ctx = createContext('/api/knowledge-assets/draft/swm/share', {
       contextGraphId: 'project-a',
       subGraphName: 'notes',
       entities: ['urn:root'],
     }, {
-      agent: { assertion: { promote } } as unknown as RequestContext['agent'],
+      agent: { assertion: { promote }, resolveAgentByToken: () => undefined } as unknown as RequestContext['agent'],
       emitMemoryGraphChanged,
     });
 
-    await handleAssertionRoutes(ctx);
+    await handleKnowledgeAssetsRoutes(ctx);
 
     expect((ctx.res as unknown as { statusCode: number }).statusCode).toBe(200);
-    expect(responseBody(ctx)).toMatchObject({ promotedCount: 2 });
+    expect(responseBody(ctx)).toMatchObject({ swmShared: true, promotedCount: 2 });
     expect(promote).toHaveBeenCalledWith('project-a', 'draft', {
       entities: ['urn:root'],
       subGraphName: 'notes',
@@ -697,12 +705,12 @@ describe('daemon memory_graph_changed route emissions', () => {
     expect(publishFromSharedMemory).not.toHaveBeenCalled();
   });
 
-  it('emits VM refresh events after verified-memory verification', async () => {
+  it('emits VM refresh events after verifiable-memory verification', async () => {
     const emitMemoryGraphChanged = vi.fn();
     const verify = vi.fn().mockResolvedValue({ verified: true, status: 'verified' });
     const ctx = createContext('/api/verify', {
       contextGraphId: 'project-a',
-      verifiedMemoryId: 'vm-1',
+      verifiableMemoryId: 'vm-1',
       batchId: '42',
     }, {
       agent: { verify } as unknown as RequestContext['agent'],
@@ -715,7 +723,7 @@ describe('daemon memory_graph_changed route emissions', () => {
     expect(responseBody(ctx)).toMatchObject({ verified: true, batchId: '42' });
     expect(verify).toHaveBeenCalledWith({
       contextGraphId: 'project-a',
-      verifiedMemoryId: 'vm-1',
+      verifiableMemoryId: 'vm-1',
       batchId: 42n,
       timeoutMs: undefined,
       requiredSignatures: undefined,
@@ -723,7 +731,7 @@ describe('daemon memory_graph_changed route emissions', () => {
     expect(emitMemoryGraphChanged).toHaveBeenCalledWith({
       contextGraphId: 'project-a',
       layers: ['vm'],
-      operation: 'verified_memory_updated',
+      operation: 'verifiable_memory_updated',
       source: 'api',
     });
   });
@@ -731,14 +739,14 @@ describe('daemon memory_graph_changed route emissions', () => {
   it('returns 409 and emits WM refresh events for partial verification metadata', async () => {
     const emitMemoryGraphChanged = vi.fn();
     const verify = vi.fn().mockResolvedValue({
-      verifiedMemoryId: 'vm-1',
+      verifiableMemoryId: 'vm-1',
       signers: ['0x0000000000000000000000000000000000000001'],
       status: 'partial',
       trustLevel: 2,
     });
     const ctx = createContext('/api/verify', {
       contextGraphId: 'project-a',
-      verifiedMemoryId: 'vm-1',
+      verifiableMemoryId: 'vm-1',
       batchId: '42',
     }, {
       agent: { verify } as unknown as RequestContext['agent'],
@@ -751,7 +759,7 @@ describe('daemon memory_graph_changed route emissions', () => {
     expect(responseBody(ctx)).toMatchObject({
       batchId: '42',
       status: 'partial',
-      verifiedMemoryId: 'vm-1',
+      verifiableMemoryId: 'vm-1',
       error: expect.stringContaining('partial trust metadata'),
     });
     expect(emitMemoryGraphChanged).toHaveBeenCalledWith({
@@ -765,14 +773,14 @@ describe('daemon memory_graph_changed route emissions', () => {
   it('returns 409 for no-quorum verification without claiming a VM write', async () => {
     const emitMemoryGraphChanged = vi.fn();
     const verify = vi.fn().mockResolvedValue({
-      verifiedMemoryId: 'vm-1',
+      verifiableMemoryId: 'vm-1',
       signers: [],
       status: 'no_quorum',
       trustLevel: 0,
     });
     const ctx = createContext('/api/verify', {
       contextGraphId: 'project-a',
-      verifiedMemoryId: 'vm-1',
+      verifiableMemoryId: 'vm-1',
       batchId: '42',
     }, {
       agent: { verify } as unknown as RequestContext['agent'],
@@ -785,8 +793,8 @@ describe('daemon memory_graph_changed route emissions', () => {
     expect(responseBody(ctx)).toMatchObject({
       batchId: '42',
       status: 'no_quorum',
-      verifiedMemoryId: 'vm-1',
-      error: expect.stringContaining('no verified memory was written'),
+      verifiableMemoryId: 'vm-1',
+      error: expect.stringContaining('no verifiable memory was written'),
     });
     expect(emitMemoryGraphChanged).toHaveBeenCalledWith({
       contextGraphId: 'project-a',

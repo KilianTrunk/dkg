@@ -65,7 +65,7 @@ export function registerSetupTools(
   // agent that "just creates a CG" starts in the most-locked-down
   // state; opening it up later is explicit. Sharing controls who can
   // read (off-chain peers) and Contribution controls who can publish
-  // to Verified Memory.
+  // to Verifiable Memory.
   server.registerTool(
     'dkg_context_graph_create',
     {
@@ -83,7 +83,7 @@ export function registerSetupTools(
         'URI to assertion, sub-graph, publish, and other write tools. ' +
         'Defaults to safe `sharing="invite-only"` + `contribution="curators-only"`; ' +
         'switch to `"open"` to make the CG publicly discoverable or to allow ' +
-        'anyone to publish to Verified Memory respectively.',
+        'anyone to publish to Verifiable Memory respectively.',
       inputSchema: {
         name: z.string().min(1).describe('Human-readable name (e.g. "My Research Context Graph")'),
         description: z.string().optional().describe('Optional description of the CG\'s purpose'),
@@ -108,7 +108,7 @@ export function registerSetupTools(
           .optional()
           .default('curators-only')
           .describe(
-            '"open" = any agent may publish to Verified Memory. ' +
+            '"open" = any agent may publish to Verifiable Memory. ' +
               '"curators-only" = only the curator may publish (default). ' +
               'Maps to on-chain publishPolicy.',
           ),

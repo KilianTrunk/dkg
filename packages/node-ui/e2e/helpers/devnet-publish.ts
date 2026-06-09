@@ -218,7 +218,7 @@ export async function createWmAssertion(opts: {
   subGraphName?: string;
   nodeNum?: number;
 }): Promise<{ ok: boolean; status: number; body: string }> {
-  const res = await devnetApiFetch('/api/assertion/create', {
+  const res = await devnetApiFetch('/api/knowledge-assets', {
     method: 'POST',
     nodeNum: opts.nodeNum ?? 1,
     body: JSON.stringify({
@@ -226,7 +226,9 @@ export async function createWmAssertion(opts: {
       name: opts.name,
       quads: opts.quads,
       finalize: true,
-      promote: opts.promote ?? false,
+      // rc.17 KA-routes-unification: the inline SWM-promote flag is `alsoShareSwm`
+      // (the old `promote` is silently ignored → the assertion never reaches SWM).
+      alsoShareSwm: opts.promote ?? false,
       ...(opts.subGraphName ? { subGraphName: opts.subGraphName } : {}),
     }),
   });
@@ -239,7 +241,7 @@ export async function promoteAssertion(opts: {
   nodeNum?: number;
 }): Promise<Response> {
   const encoded = encodeURIComponent(opts.assertionName);
-  return devnetApiFetch(`/api/assertion/${encoded}/promote`, {
+  return devnetApiFetch(`/api/knowledge-assets/${encoded}/swm/share`, {
     method: 'POST',
     nodeNum: opts.nodeNum ?? 1,
     body: JSON.stringify({

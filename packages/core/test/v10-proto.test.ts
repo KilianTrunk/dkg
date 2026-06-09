@@ -39,7 +39,7 @@ function randomBytes(n: number): Uint8Array {
 describe('VerifyProposalMsg', () => {
   const proposal: VerifyProposalMsg = {
     proposalId: randomBytes(16),
-    verifiedMemoryId: 7,
+    verifiableMemoryId: 7,
     batchId: 42,
     merkleRoot: randomBytes(32),
     entities: ['http://example.org/alice', 'http://example.org/bob'],
@@ -63,12 +63,12 @@ describe('VerifyProposalMsg', () => {
     expect(new Uint8Array(decoded.agentSignatureR)).toEqual(proposal.agentSignatureR);
     expect(new Uint8Array(decoded.agentSignatureVS)).toEqual(proposal.agentSignatureVS);
     // The title claims "all fields"; the previous assertion set silently
-    // skipped verifiedMemoryId and batchId, so a wire-tag drift or
+    // skipped verifiableMemoryId and batchId, so a wire-tag drift or
     // field-drop on those two ints would land green. Pin them here so
     // the round-trip guarantee matches the name.
     // protobufjs decodes uint64 fields as a Long object; normalise
     // before comparing against the plain JS-number input values.
-    expect(Number(decoded.verifiedMemoryId)).toBe(proposal.verifiedMemoryId);
+    expect(Number(decoded.verifiableMemoryId)).toBe(proposal.verifiableMemoryId);
     expect(Number(decoded.batchId)).toBe(proposal.batchId);
   });
 
@@ -331,7 +331,7 @@ describe('binary compatibility', () => {
   it('messages with empty optional fields encode gracefully', () => {
     const proposal: VerifyProposalMsg = {
       proposalId: new Uint8Array(0),
-      verifiedMemoryId: 0,
+      verifiableMemoryId: 0,
       batchId: 0,
       merkleRoot: new Uint8Array(0),
       entities: [],

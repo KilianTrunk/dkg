@@ -143,7 +143,7 @@ async function loadAuthoritativeQuadKeys(
     `CONSTRUCT {
       ?s ?p ?o
     } WHERE {
-      GRAPH <${graph}> {
+      GRAPH ?g {
         VALUES ?rootValue { ${values} }
         ?s ?p ?o .
         FILTER(
@@ -151,6 +151,9 @@ async function loadAuthoritativeQuadKeys(
           || STRSTARTS(STR(?s), CONCAT(?rootValue, "/.well-known/genid/"))
         )
       }
+      # Per-KA VM read-both: authoritative published data lives in
+      # …/_verifiable_memory/{author}/{number}; the root is the legacy fallback.
+      FILTER(STRSTARTS(STR(?g), "${graph}/_verifiable_memory/") || STR(?g) = "${graph}")
     }`,
   );
 

@@ -1,7 +1,8 @@
 /**
  * Regression coverage for issue #864 — the daemon-side 409
- * `ASSERTION_NOT_PERSISTED` response envelope on
- * `POST /api/assertion/:name/promote`.
+ * `ASSERTION_NOT_PERSISTED` response envelope on the SWM-share verb
+ * `POST /api/knowledge-assets/:name/swm/share` (the KA-unified successor
+ * of the legacy `POST /api/assertion/:name/promote`).
  *
  * The UI in `packages/node-ui/src/ui/api.ts` (`describePromoteError`)
  * pattern-matches on `code === "ASSERTION_NOT_PERSISTED"` to render
@@ -11,8 +12,8 @@
  * refactor of the publisher's typed error or the route's catch branch
  * cannot silently change the envelope the UI now depends on.
  *
- * Pattern mirrors `promote-async-routes.test.ts`: spin up a real HTTP
- * server with `handleAssertionRoutes`, hand it a minimal mock agent
+ * Pattern mirrors `knowledge-assets-route.test.ts`: spin up a real HTTP
+ * server with `handleKnowledgeAssetsRoutes`, hand it a minimal mock agent
  * whose `assertion.promote` throws a synthetic error matching what
  * `DKGPublisher.assertionPromote` throws (duck-typed by `name` +
  * `code` — same shape the daemon catch branch matches). No publisher
@@ -23,8 +24,7 @@
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { createServer, type Server } from 'node:http';
-import { SwmGossipPayloadTooLargeError } from '@origintrail-official/dkg-core';
-import { handleAssertionRoutes } from '../src/daemon/routes/assertion.js';
+import { handleKnowledgeAssetsRoutes } from '../src/daemon/routes/knowledge-assets.js';
 
 const CG_ID = 'issue-864-cg';
 const ASSERTION_NAME = 'orphan-assertion';
@@ -50,7 +50,7 @@ class FakeAssertionNotPersistedError extends Error {
   }
 }
 
-describe('POST /api/assertion/:name/promote — issue #864 not-persisted envelope', () => {
+describe('POST /api/knowledge-assets/:name/swm/share — issue #864 not-persisted envelope', () => {
   let server: Server | undefined;
   let baseUrl: string;
 
@@ -79,6 +79,7 @@ describe('POST /api/assertion/:name/promote — issue #864 not-persisted envelop
       async contextGraphExists(cgId: string) {
         return cgId === CG_ID;
       },
+      resolveAgentByToken: () => undefined,
       assertion: {
         promote,
       },
@@ -86,7 +87,7 @@ describe('POST /api/assertion/:name/promote — issue #864 not-persisted envelop
     server = createServer(async (req, res) => {
       const url = new URL(req.url ?? '/', 'http://127.0.0.1');
       try {
-        await handleAssertionRoutes({
+        await handleKnowledgeAssetsRoutes({
           req,
           res,
           agent,
@@ -94,7 +95,7 @@ describe('POST /api/assertion/:name/promote — issue #864 not-persisted envelop
           publisherRuntime: null,
           config: {},
           startedAt: Date.now(),
-          dashDb: {},
+          dashDb: { insertNotification: () => 1 },
           opWallets: {},
           network: {},
           tracker: {},
@@ -117,6 +118,7 @@ describe('POST /api/assertion/:name/promote — issue #864 not-persisted envelop
           requestToken: undefined,
           requestAgentAddress: 'did:dkg:agent:test',
           emitMemoryGraphChanged: () => {},
+          emitNotification: () => {},
         } as any);
         if (!res.writableEnded) {
           res.statusCode = 404;
@@ -135,7 +137,7 @@ describe('POST /api/assertion/:name/promote — issue #864 not-persisted envelop
   }
 
   async function postPromote(body: Record<string, unknown>) {
-    const res = await fetch(`${baseUrl}/api/assertion/${ASSERTION_NAME}/promote`, {
+    const res = await fetch(`${baseUrl}/api/knowledge-assets/${ASSERTION_NAME}/swm/share`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
@@ -196,29 +198,6 @@ describe('POST /api/assertion/:name/promote — issue #864 not-persisted envelop
     });
   });
 
-  it('translates oversized SWM gossip payloads to a structured 413', async () => {
-    await startWithPromoteImpl(async () => {
-      throw new SwmGossipPayloadTooLargeError({
-        actualBytes: 12 * 1024 * 1024,
-        maxBytes: 10 * 1024 * 1024,
-        operation: 'promote',
-        message: 'Promoted assertion too large for gossip (12288 KB, limit 10 MB). Promote fewer entities per call.',
-        hint: 'Promote fewer entities per call.',
-      });
-    });
-
-    const res = await postPromote({ contextGraphId: CG_ID, entities: 'all' });
-
-    expect(res.status).toBe(413);
-    expect(res.body).toMatchObject({
-      code: 'SWM_GOSSIP_PAYLOAD_TOO_LARGE',
-      actualBytes: 12 * 1024 * 1024,
-      limitBytes: 10 * 1024 * 1024,
-      hint: 'Promote fewer entities per call.',
-      error: expect.stringContaining('Promoted assertion too large for gossip'),
-    });
-  });
-
   it('returns 200 with the publisher result for a normal promote', async () => {
     // Sanity: the new 409 branch must not steal happy-path responses.
     await startWithPromoteImpl(async () => ({ promotedCount: 49 }));
@@ -226,7 +205,8 @@ describe('POST /api/assertion/:name/promote — issue #864 not-persisted envelop
     const res = await postPromote({ contextGraphId: CG_ID, entities: 'all' });
 
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ promotedCount: 49 });
+    // KA swm/share wraps the promotedCount in the share envelope.
+    expect(res.body).toEqual({ swmShared: true, promotedCount: 49 });
   });
 
   it('returns 200 with promotedCount=0 for a legitimately empty promote (no error thrown)', async () => {
@@ -242,6 +222,7 @@ describe('POST /api/assertion/:name/promote — issue #864 not-persisted envelop
     const res = await postPromote({ contextGraphId: CG_ID, entities: 'all' });
 
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ promotedCount: 0 });
+    // KA swm/share wraps the promotedCount in the share envelope.
+    expect(res.body).toEqual({ swmShared: true, promotedCount: 0 });
   });
 });

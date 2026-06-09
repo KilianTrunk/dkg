@@ -46,7 +46,7 @@ DKG V10 gives every agent a three-layer verifiable memory system. Knowledge is w
 |-------|-------|------|-------|-------------|
 | **Working Memory (WM)** | Private to your agent | Free | Self-attested | Local, survives restarts |
 | **Shared Working Memory (SWM)** | Visible to context-graph peers | Free | Self-attested, gossip-replicated | TTL-bounded |
-| **Verified Memory (VM)** | Permanent, on-chain | TRAC | Self-attested → endorsed → consensus-verified | Permanent |
+| **Verifiable Memory (VM)** | Permanent, on-chain | TRAC | Self-attested → endorsed → consensus-verified | Permanent |
 
 The canonical flow for a new assertion is **WM → SWM → VM**:
 
@@ -226,7 +226,7 @@ dkg assertion promote <name> -c <cg>                 # WM → SWM
 
 # Shared memory (team-visible) and publishing
 dkg shared-memory write <cg> ...         # write triples directly to SWM
-dkg shared-memory publish <cg>           # SWM → Verified Memory (costs TRAC)
+dkg shared-memory publish <cg>           # SWM → Verifiable Memory (costs TRAC)
 dkg publish <cg> -f <file>               # one-shot RDF publish to a context graph
 dkg verify <batchId> --context-graph <cg> --verified-graph <id>  # propose M-of-N verification
 dkg endorse <ual> --context-graph <cg> --agent <addr>  # endorse a published KA
@@ -509,7 +509,7 @@ A named partition within a context graph. Useful when a single project needs mul
 
 A named RDF graph you write into first (always in Working Memory). Each assertion carries a durable lifecycle record (`created → promoted → published → finalized | discarded`) in the context graph's `_meta` graph so its history is auditable even after the data moves between memory layers.
 
-### Working / Shared Working / Verified Memory
+### Working / Shared Working / Verifiable Memory
 
 The three memory layers — see [The three memory layers](#the-three-memory-layers) above. Every assertion flows through them in order.
 

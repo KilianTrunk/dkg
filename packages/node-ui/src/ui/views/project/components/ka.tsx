@@ -229,7 +229,7 @@ export function VerifyOnDkgButton({
       {result && resultKind === 'publish' && isPublishResult(result) && (() => {
         // OT-RFC-38 §1.1 — a publish without a TX hash never made it to chain.
         // Treat that as failure, not success, so the curator knows the data
-        // is NOT in Verified Memory.
+        // is NOT in Verifiable Memory.
         const confirmed = result.status === 'confirmed' && !!result.txHash;
         return (
           <div className={confirmed ? 'v10-ka-verify-ok' : 'v10-ka-verify-err'}>

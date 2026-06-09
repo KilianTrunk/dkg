@@ -575,15 +575,41 @@ start_node() {
     relay_arg=$(cat "$DEVNET_DIR/node1/multiaddr")
   fi
 
-  # Update config with relay address if available
-  if [ -n "$relay_arg" ]; then
-    node -e "
-      const fs = require('fs');
-      const cfg = JSON.parse(fs.readFileSync('$node_dir/config.json','utf8'));
-      cfg.relay = '$relay_arg';
-      fs.writeFileSync('$node_dir/config.json', JSON.stringify(cfg, null, 2));
-    "
-  fi
+  # Core mesh (default topology): a CORE node directly dials every EARLIER core
+  # via `bootstrapPeers`, instead of every node hubbing through node 1. libp2p
+  # connections are bidirectional and `identify` exchanges listen addresses, so
+  # "dial all earlier cores" yields an all-core direct mesh once the last core is
+  # up. That keeps every core directly DIALABLE for SWM substrate fan-out (the
+  # StorageACK responders), so VM-publish quorum is delivered reliably point-to-
+  # point instead of riding best-effort gossip (which raced and dropped quorum on
+  # the all-hub-through-node-1 topology). EDGE nodes dial ALL cores — a scalable
+  # hub-and-spoke spoke (O(cores) connections per edge, never edge<->edge) — so
+  # an edge can still publish and reach quorum; edges never mesh with each other.
+  # Node 1 (first core) dials no one and meshes via inbound dials from the rest.
+  DEVNET_DIR="$DEVNET_DIR" NODE_DIR="$node_dir" NODE_NUM="$node_num" \
+  NUM_CORE_NODES="$NUM_CORE_NODES" RELAY_ARG="$relay_arg" node -e "
+    const fs = require('fs');
+    const dir = process.env.DEVNET_DIR;
+    const cfgPath = process.env.NODE_DIR + '/config.json';
+    const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+    if (process.env.RELAY_ARG) cfg.relay = process.env.RELAY_ARG;
+    const n = Number(process.env.NODE_NUM);
+    // Bootstrap targets are the CORE nodes among 1..n-1, read from each node's
+    // authoritative nodeRole — NOT the ordinal 'first NUM_CORE_NODES are cores',
+    // since cmd_addnode can spawn a core beyond NUM_CORE_NODES (via
+    // DEVNET_NODE_ROLE_OVERRIDE). A core thus meshes with every earlier core; an
+    // edge spokes to every earlier core. Connections are bidirectional, so a
+    // later-added core dials the earlier cores and joins the mesh.
+    const peers = [];
+    for (let c = 1; c < n; c++) {
+      let cRole = 'edge';
+      try { cRole = JSON.parse(fs.readFileSync(dir + '/node' + c + '/config.json', 'utf8')).nodeRole || 'edge'; } catch {}
+      if (cRole !== 'core') continue;
+      try { const m = fs.readFileSync(dir + '/node' + c + '/multiaddr', 'utf8').trim(); if (m) peers.push(m); } catch {}
+    }
+    if (peers.length) cfg.bootstrapPeers = peers;
+    fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2));
+  "
 
   # Remove any stale daemon.pid so the CLI doesn't think it's already running
   rm -f "$node_dir/daemon.pid"
@@ -628,31 +654,43 @@ start_node() {
     log "WARNING: Node $node_num not ready after ${max_wait}s (check $node_dir/daemon.log)"
   fi
 
-  # For node 1 (relay), save its multiaddr so other nodes can connect.
-  # Retry a few times even if initial wait timed out — node may still be booting.
-  if [ "$node_num" -eq 1 ]; then
-    local peer_id=""
-    for attempt in $(seq 1 10); do
-      local peer_info
-      peer_info=$(curl -sf "${auth_args[@]}" "http://127.0.0.1:$api_port/api/status" 2>/dev/null || echo "{}")
-      peer_id=$(echo "$peer_info" | node -e "
-        let d=''; process.stdin.on('data',c=>d+=c);
-        process.stdin.on('end',()=>{
-          try{const j=JSON.parse(d);console.log(j.peerId||'')}catch{console.log('')}
-        })
-      " 2>/dev/null || echo "")
-      [ -n "$peer_id" ] && break
-      sleep 3
-    done
+  # Save THIS node's multiaddr so (a) node 1 serves as the universal relay and
+  # (b) later cores/edges can directly dial it to form the core mesh + spokes
+  # (see the bootstrapPeers block above). Node 1's multiaddr is REQUIRED (every
+  # node bootstraps off it; failure aborts); the rest are best-effort — a missing
+  # one only means that node isn't a direct-dial target, it still works via the
+  # relay + gossip. Retry a few times even if the initial wait timed out.
+  local peer_id=""
+  for attempt in $(seq 1 10); do
+    local peer_info
+    peer_info=$(curl -sf "${auth_args[@]}" "http://127.0.0.1:$api_port/api/status" 2>/dev/null || echo "{}")
+    peer_id=$(echo "$peer_info" | node -e "
+      let d=''; process.stdin.on('data',c=>d+=c);
+      process.stdin.on('end',()=>{
+        try{const j=JSON.parse(d);console.log(j.peerId||'')}catch{console.log('')}
+      })
+    " 2>/dev/null || echo "")
+    [ -n "$peer_id" ] && break
+    sleep 3
+  done
 
-    if [ -n "$peer_id" ]; then
-      local libp2p_port=$((LIBP2P_PORT_BASE))
-      echo "/ip4/127.0.0.1/tcp/${libp2p_port}/p2p/${peer_id}" > "$DEVNET_DIR/node1/multiaddr"
-      log "Relay multiaddr saved: /ip4/127.0.0.1/tcp/${libp2p_port}/p2p/${peer_id}"
-    else
-      log "ERROR: Could not extract relay multiaddr for node 1 — aborting devnet start"
+  if [ -n "$peer_id" ]; then
+    local libp2p_port=$((LIBP2P_PORT_BASE + node_num - 1))
+    echo "/ip4/127.0.0.1/tcp/${libp2p_port}/p2p/${peer_id}" > "$DEVNET_DIR/node${node_num}/multiaddr"
+    log "Node $node_num multiaddr saved: /ip4/127.0.0.1/tcp/${libp2p_port}/p2p/${peer_id}"
+  else
+    # A CORE that fails to publish its multiaddr is silently dropped from every
+    # later core's bootstrapPeers, degrading the mesh back to the gossip-only
+    # quorum path this topology exists to avoid — so abort on ANY core (not just
+    # node 1). Edges stay best-effort: a missing edge multiaddr just means it
+    # isn't a direct-dial target, and it still works via the relay + gossip.
+    local node_role="edge"
+    node_role=$(node -e "try{process.stdout.write(JSON.parse(require('fs').readFileSync('$node_dir/config.json','utf8')).nodeRole||'edge')}catch{process.stdout.write('edge')}" 2>/dev/null || echo edge)
+    if [ "$node_role" = "core" ]; then
+      log "ERROR: Could not extract multiaddr for CORE node $node_num — later cores would silently omit it from the direct mesh (gossip-only quorum). Aborting devnet start."
       return 1
     fi
+    log "WARNING: Could not extract multiaddr for edge node $node_num — not a direct-dial target (still reachable via gossip)."
   fi
 }
 
@@ -1033,9 +1071,21 @@ cmd_start() {
         // awaits costs one extra eth_call per tx, which is negligible
         // for a 6-node devnet bootstrap.
         const sendWithFreshNonce = async (txFactory) => {
-          const freshNonce = await provider.getTransactionCount(opSigner.address, 'pending');
-          const tx = await txFactory(freshNonce);
-          return tx.wait();
+          // Retry on the daemon racing our nonce (it shares this op wallet and may
+          // submit between our 'pending' read and our send) or a transient revert:
+          // re-read 'pending' and resend, backing off, before giving up.
+          let lastErr;
+          for (let attempt = 0; attempt < 4; attempt++) {
+            try {
+              const freshNonce = await provider.getTransactionCount(opSigner.address, 'pending');
+              const tx = await txFactory(freshNonce);
+              return await tx.wait();
+            } catch (e) {
+              lastErr = e;
+              await new Promise(r => setTimeout(r, 800 + attempt * 600));
+            }
+          }
+          throw lastErr;
         };
         // Codex round 4 on PR #368: skip createConviction if the daemon
         // already opened a position. PR 366 wired EVMChainAdapter.ensureProfile()
@@ -1105,6 +1155,24 @@ cmd_start() {
         } catch (e) { console.log('Ask failed for node ' + (i+1) + ': ' + e.message); }
       }
       console.log('Staked 50k TRAC for ' + staked + '/' + coreCount + ' core node(s), ask set for ' + asked + '/' + coreCount);
+      // The daemon's own ensureProfile stake can land AFTER this loop (it shares the
+      // op wallet; our probe raced it, then our createConviction reverted as a duplicate
+      // 0x7000ca77). Re-probe all core identities (poll up to ~30s) before the FATAL gate
+      // so a daemon-side stake that won the race still counts and we don't abort the boot
+      // (and skip CG registration) over a timing artifact.
+      if (staked < coreCount) {
+        for (let poll = 0; poll < 15 && staked < coreCount; poll++) {
+          await new Promise(r => setTimeout(r, 2000));
+          let restaked = 0;
+          for (const i of coreIdxs) {
+            const idId2 = nodeIds[i] || await identity.getIdentityId(opSigners[i].address);
+            if (idId2 === 0n) continue;
+            try { if ((await css.getNodeStakeV10(idId2)) > 0n) restaked++; } catch (_) {}
+          }
+          staked = restaked;
+        }
+        console.log('Re-probed core stakes after settle: ' + staked + '/' + coreCount);
+      }
       // Defense-in-depth: a partial-stake bootstrap (probe failure +
       // skip, or createConviction revert + skip) currently logs
       // 'staked X/Y' and continues. Operators may miss the count

@@ -242,6 +242,12 @@ function isChatTurnStoreNotFoundError(err: unknown): boolean {
  */
 export interface PreSignedAuthorAttestationPayload {
   address: string;
+  /**
+   * OT-RFC-43 §F2 — the packed reservedKaId the author signed the
+   * AuthorAttestation over, as a decimal string (uint256-safe over JSON).
+   * Required: the daemon binds it into the digest and honours the reserved slot.
+   */
+  reservedKaId: string;
   signature: { r: string; vs: string };
 }
 
@@ -400,7 +406,7 @@ export class DkgDaemonClient {
 
   /**
    * Run a SPARQL query against the daemon. Forwards the full V10 field set
-   * the `/api/query` route accepts — `view` (`'working-memory' | 'shared-working-memory' | 'verified-memory'`),
+   * the `/api/query` route accepts — `view` (`'working-memory' | 'shared-working-memory' | 'verifiable-memory'`),
    * `agentAddress` (required for WM reads), `assertionName` (scopes WM reads
    * to a single per-agent assertion), `subGraphName`, `verifiedGraph`,
    * `graphSuffix`, `includeSharedMemory`.
@@ -411,14 +417,14 @@ export class DkgDaemonClient {
       contextGraphId?: string;
       graphSuffix?: string;
       includeSharedMemory?: boolean;
-      view?: 'working-memory' | 'shared-working-memory' | 'verified-memory';
+      view?: 'working-memory' | 'shared-working-memory' | 'verifiable-memory';
       agentAddress?: string;
       assertionName?: string;
       subGraphName?: string;
       verifiedGraph?: string;
       /**
        * P-13: minimum trust level. Only meaningful for
-       * `view: "verified-memory"`; ignored (silently) on WM/SWM views.
+       * `view: "verifiable-memory"`; ignored (silently) on WM/SWM views.
        *
        * The daemon implements only `SelfAttested` / `Endorsed` today —
        * higher tiers (Q-1 follow-up) are rejected with HTTP 400, so the
@@ -522,7 +528,7 @@ export class DkgDaemonClient {
     const cgId = normalizeContextGraphId(contextGraphId);
     try {
       const response = await this.post<{ assertionUri: string }>(
-        '/api/assertion/create',
+        '/api/knowledge-assets',
         { contextGraphId: cgId, name, subGraphName: opts?.subGraphName },
       );
       return { assertionUri: response.assertionUri, alreadyExists: false };
@@ -547,7 +553,7 @@ export class DkgDaemonClient {
     quads: Array<{ subject: string; predicate: string; object: string; graph?: string }>,
     opts?: { subGraphName?: string },
   ): Promise<{ written: number }> {
-    return this.post(`/api/assertion/${encodeURIComponent(name)}/write`, {
+    return this.post(`/api/knowledge-assets/${encodeURIComponent(name)}/wm/write`, {
       contextGraphId: normalizeContextGraphId(contextGraphId),
       quads,
       subGraphName: opts?.subGraphName,
@@ -564,7 +570,7 @@ export class DkgDaemonClient {
     name: string,
     opts?: { entities?: string[] | 'all'; subGraphName?: string },
   ): Promise<Record<string, unknown>> {
-    return this.post(`/api/assertion/${encodeURIComponent(name)}/promote`, {
+    return this.post(`/api/knowledge-assets/${encodeURIComponent(name)}/swm/share`, {
       contextGraphId: normalizeContextGraphId(contextGraphId),
       entities: opts?.entities,
       subGraphName: opts?.subGraphName,
@@ -581,7 +587,7 @@ export class DkgDaemonClient {
     name: string,
     opts?: { subGraphName?: string },
   ): Promise<{ discarded: boolean }> {
-    return this.post(`/api/assertion/${encodeURIComponent(name)}/discard`, {
+    return this.post(`/api/knowledge-assets/${encodeURIComponent(name)}/wm/discard`, {
       contextGraphId: normalizeContextGraphId(contextGraphId),
       subGraphName: opts?.subGraphName,
     });
@@ -598,10 +604,13 @@ export class DkgDaemonClient {
     name: string,
     opts?: { subGraphName?: string },
   ): Promise<{ quads: unknown[]; count: number }> {
-    return this.post(`/api/assertion/${encodeURIComponent(name)}/query`, {
+    const params = new URLSearchParams({
       contextGraphId: normalizeContextGraphId(contextGraphId),
-      subGraphName: opts?.subGraphName,
     });
+    if (opts?.subGraphName) params.set('subGraphName', opts.subGraphName);
+    return this.get(
+      `/api/knowledge-assets/${encodeURIComponent(name)}/wm/quads?${params.toString()}`,
+    );
   }
 
   /**
@@ -612,7 +621,7 @@ export class DkgDaemonClient {
   async resolveImportArtifact(
     request: ImportedArtifactRequest,
   ): Promise<{ artifact: ImportedArtifactResolution }> {
-    return this.post('/api/assertion/import-artifact/resolve', normalizeContextGraphRequest(request));
+    return this.post('/api/knowledge-assets/import-artifact/resolve', normalizeContextGraphRequest(request));
   }
 
   /**
@@ -629,7 +638,7 @@ export class DkgDaemonClient {
     bytes: number;
     markdown: string;
   }> {
-    return this.post('/api/assertion/import-artifact/read-markdown', normalizeContextGraphRequest(request));
+    return this.post('/api/knowledge-assets/import-artifact/read-markdown', normalizeContextGraphRequest(request));
   }
 
   /**
@@ -639,7 +648,7 @@ export class DkgDaemonClient {
   async writeSemanticEnrichment(
     request: SemanticEnrichmentWriteRequest,
   ): Promise<Record<string, unknown>> {
-    return this.post('/api/assertion/semantic-enrichment/write', normalizeContextGraphRequest(request));
+    return this.post('/api/knowledge-assets/semantic-enrichment/write', normalizeContextGraphRequest(request));
   }
 
   /**
@@ -656,7 +665,7 @@ export class DkgDaemonClient {
     if (opts?.agentAddress) params.set('agentAddress', opts.agentAddress);
     if (opts?.subGraphName) params.set('subGraphName', opts.subGraphName);
     return this.get(
-      `/api/assertion/${encodeURIComponent(name)}/history?${params.toString()}`,
+      `/api/knowledge-assets/${encodeURIComponent(name)}?${params.toString()}`,
     );
   }
 
@@ -692,7 +701,7 @@ export class DkgDaemonClient {
     if (opts?.subGraphName) form.append('subGraphName', opts.subGraphName);
 
     const res = await fetch(
-      `${this.baseUrl}/api/assertion/${encodeURIComponent(name)}/import-file`,
+      `${this.baseUrl}/api/knowledge-assets/${encodeURIComponent(name)}/wm/import-file`,
       {
         method: 'POST',
         headers: { Accept: 'application/json', ...this.authHeaders() },
@@ -703,7 +712,7 @@ export class DkgDaemonClient {
     if (!res.ok) {
       const text = await res.text().catch(() => '');
       throw new Error(
-        `DKG daemon /api/assertion/${name}/import-file responded ${res.status}: ${text}`,
+        `DKG daemon /api/knowledge-assets/${name}/wm/import-file responded ${res.status}: ${text}`,
       );
     }
     return res.json() as Promise<Record<string, unknown>>;
@@ -1018,7 +1027,7 @@ export class DkgDaemonClient {
       object: q.object,
       graph: q.graph || toContextGraphUri(cgId),
     }));
-    const created: any = await this.post('/api/assertion/create', {
+    const created: any = await this.post('/api/knowledge-assets', {
       contextGraphId: cgId,
       name: assertionName,
       quads: quadsWithGraph,
@@ -1038,7 +1047,7 @@ export class DkgDaemonClient {
 
   /**
    * Final canonical-flow step: publish a single root from a context graph's
-   * Shared Working Memory to Verified Memory (on-chain). The daemon route
+   * Shared Working Memory to Verifiable Memory (on-chain). The daemon route
    * accepts `selection` as either the literal `"all"` or an array of root entity
    * URIs, but V10 synchronous publish only proceeds when that selection resolves
    * to exactly one publishable root.

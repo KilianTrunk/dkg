@@ -1258,7 +1258,9 @@ export class StorageACKHandler {
   private async loadSWMQuads(graphUri: string, rootEntities: string[]): Promise<Quad[]> {
     assertSafeIri(graphUri);
     if (rootEntities.length === 0) {
-      const sparql = `CONSTRUCT { ?s ?p ?o } WHERE { GRAPH <${graphUri}> { ?s ?p ?o } }`;
+      // read-both: per-KA …/_shared_memory/{addr}/{number} graphs (promote) + the legacy
+      // bucket; exclude the transient /staging/ graphs (they would corrupt the recompute).
+      const sparql = `CONSTRUCT { ?s ?p ?o } WHERE { GRAPH ?g { ?s ?p ?o } FILTER((STRSTARTS(STR(?g), "${graphUri}/") && !STRSTARTS(STR(?g), "${graphUri}/staging/")) || STR(?g) = "${graphUri}") }`;
       const result = await this.store.query(sparql);
       return result.type === 'quads' ? result.quads : [];
     }
@@ -1267,7 +1269,7 @@ export class StorageACKHandler {
     for (const entity of rootEntities) {
       assertSafeIri(entity);
       const genidPrefix = `${entity}/.well-known/genid/`;
-      const sparql = `CONSTRUCT { ?s ?p ?o } WHERE { GRAPH <${graphUri}> { ?s ?p ?o . FILTER(?s = <${entity}> || STRSTARTS(STR(?s), "${genidPrefix}")) } }`;
+      const sparql = `CONSTRUCT { ?s ?p ?o } WHERE { GRAPH ?g { ?s ?p ?o . FILTER(?s = <${entity}> || STRSTARTS(STR(?s), "${genidPrefix}")) } FILTER((STRSTARTS(STR(?g), "${graphUri}/") && !STRSTARTS(STR(?g), "${graphUri}/staging/")) || STR(?g) = "${graphUri}") }`;
       const result = await this.store.query(sparql);
       if (result.type === 'quads') {
         allQuads.push(...result.quads);

@@ -7,7 +7,7 @@
  *                prove that "enough" approvals succeed; they do NOT
  *                assert the negative direction that ONE voter (the
  *                proposer, with no remote approvals) MUST NOT be able
- *                to promote a VerifiedMemory batch past trust level 1.
+ *                to promote a VerifiableMemory batch past trust level 1.
  *                Spec §10.1 is unambiguous: requiredSignatures >= 2
  *                requires at least (N-1) remote approvals on top of
  *                the proposer signature.
@@ -88,7 +88,7 @@ describe('P-8: VerifyCollector rejects single-voter promotion (requiredSignature
       collector.collect({
         contextGraphId: CG,
         contextGraphIdOnChain: CG_ON_CHAIN,
-        verifiedMemoryId: VERIFIED_ID,
+        verifiableMemoryId: VERIFIED_ID,
         batchId: BATCH_ID,
         merkleRoot,
         entities: ['urn:test:p8:entity'],
@@ -114,7 +114,7 @@ describe('P-8: VerifyCollector rejects single-voter promotion (requiredSignature
       collector.collect({
         contextGraphId: CG,
         contextGraphIdOnChain: CG_ON_CHAIN,
-        verifiedMemoryId: VERIFIED_ID,
+        verifiableMemoryId: VERIFIED_ID,
         batchId: BATCH_ID,
         merkleRoot,
         entities: ['urn:test:p8:entity'],
@@ -144,7 +144,7 @@ describe('P-8: VerifyCollector rejects single-voter promotion (requiredSignature
       collector.collect({
         contextGraphId: CG,
         contextGraphIdOnChain: CG_ON_CHAIN,
-        verifiedMemoryId: VERIFIED_ID,
+        verifiableMemoryId: VERIFIED_ID,
         batchId: BATCH_ID,
         merkleRoot,
         entities: ['urn:test:p8:entity'],
@@ -181,7 +181,7 @@ describe('P-8: VerifyCollector rejects single-voter promotion (requiredSignature
     const result = await collector.collect({
       contextGraphId: CG,
       contextGraphIdOnChain: CG_ON_CHAIN,
-      verifiedMemoryId: VERIFIED_ID,
+      verifiableMemoryId: VERIFIED_ID,
       batchId: BATCH_ID,
       merkleRoot,
       entities: ['urn:test:p8:entity'],

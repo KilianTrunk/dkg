@@ -16,7 +16,7 @@ export function buildQueryTools(ctx: DkgToolHost): OpenClawTool[] {
       name: 'dkg_publish',
       description:
         'One-shot write + publish helper: writes the supplied quads to Shared Working Memory, then publishes ' +
-        'all SWM in the CG to Verified Memory (on-chain) and clears SWM. For the canonical stepwise flow ' +
+        'all SWM in the CG to Verifiable Memory (on-chain) and clears SWM. For the canonical stepwise flow ' +
         '(write → promote → publish) use `dkg_assertion_create/write/promote` followed by ' +
         '`dkg_shared_memory_publish`.',
       parameters: {
@@ -49,7 +49,7 @@ export function buildQueryTools(ctx: DkgToolHost): OpenClawTool[] {
       description:
         'Read-only SPARQL query against the local triple store. Pass `view` to pick which memory ' +
         'layer to read: `working-memory` (WM — per-agent), `shared-working-memory` (SWM — gossip-' +
-        'replicated), or `verified-memory` (VM — on-chain anchored); when `view` is supplied, ' +
+        'replicated), or `verifiable-memory` (VM — on-chain anchored); when `view` is supplied, ' +
         '`context_graph_id` is also required. For WM reads, `agent_address` selects whose WM to ' +
         'read; prefer the injected `current_agent_address` from turn context when present. If a WM ' +
         'read looks unexpectedly empty, retry alternate identity forms before concluding there is no ' +
@@ -73,7 +73,7 @@ export function buildQueryTools(ctx: DkgToolHost): OpenClawTool[] {
             description:
               'Memory layer to read. Accepted values: `working-memory` (per-agent WM; uses ' +
               '`agent_address` or falls back to this node\'s agent address), `shared-working-memory` ' +
-              '(provisional, gossip-replicated), or `verified-memory` (on-chain anchored). Omit to ' +
+              '(provisional, gossip-replicated), or `verifiable-memory` (on-chain anchored). Omit to ' +
               'use the legacy cross-graph data-path routing (not layer-scoped). Validation is ' +
               'handler-side (not a JSON-schema enum) so strict-schema hosts still surface the ' +
               'tailored migration guidance on invalid values.',

@@ -7,18 +7,34 @@
  * Memory layers (ordered by trust/permanence):
  *   WM  → Working Memory: local agent assertions, not shared
  *   SWM → Shared Working Memory: published to peers, not anchored
- *   VM  → Verified Memory: anchored on-chain and M-of-N verified
+ *   VM  → Verifiable Memory: anchored on-chain and M-of-N verified
  */
 
 export enum MemoryLayer {
   WorkingMemory = 'WM',
   SharedWorkingMemory = 'SWM',
-  VerifiedMemory = 'VM',
+  VerifiableMemory = 'VM',
 }
 
 /**
- * Trust levels for Verified Memory triples, ordered by ascending trust.
- * Used with `minTrust` on verified-memory queries to filter results.
+ * The named-graph slug for each memory layer (OT-RFC-46 uniform Chorus layout).
+ * Every layer's per-KA graph is `…/{slug}/{addr}/{number}` — the layer is just a
+ * parameter, so one builder / one read path serves WM, SWM, and VM alike.
+ */
+export function memoryLayerSlug(layer: MemoryLayer): string {
+  switch (layer) {
+    case MemoryLayer.WorkingMemory:
+      return '_working_memory';
+    case MemoryLayer.SharedWorkingMemory:
+      return '_shared_memory';
+    case MemoryLayer.VerifiableMemory:
+      return '_verifiable_memory';
+  }
+}
+
+/**
+ * Trust levels for Verifiable Memory triples, ordered by ascending trust.
+ * Used with `minTrust` on verifiable-memory queries to filter results.
  */
 export enum TrustLevel {
   SelfAttested = 0,
@@ -65,8 +81,8 @@ export const VALID_ASSERTION_TRANSITIONS: ReadonlyMap<AssertionState, readonly A
 export const ASSERTION_STATE_TO_LAYER: ReadonlyMap<AssertionState, MemoryLayer | null> = new Map([
   ['created', MemoryLayer.WorkingMemory],
   ['promoted', MemoryLayer.SharedWorkingMemory],
-  ['published', MemoryLayer.VerifiedMemory],
-  ['finalized', MemoryLayer.VerifiedMemory],
+  ['published', MemoryLayer.VerifiableMemory],
+  ['finalized', MemoryLayer.VerifiableMemory],
   ['discarded', null],
 ]);
 
@@ -150,12 +166,12 @@ export interface Publication {
  *
  *   working-memory        → WM  (agent's own assertion graphs, local-only)
  *   shared-working-memory → SWM (provisional, gossip-replicated)
- *   verified-memory       → VM  (on-chain anchored, M-of-N quorum verified)
+ *   verifiable-memory       → VM  (on-chain anchored, M-of-N quorum verified)
  */
 export type GetView =
   | 'working-memory'
   | 'shared-working-memory'
-  | 'verified-memory';
+  | 'verifiable-memory';
 
 /** @deprecated Legacy V9 views removed in V10. Listed here for migration error messages. */
 export const REMOVED_VIEWS: readonly string[] = ['long-term-memory', 'authoritative'] as const;
@@ -166,7 +182,7 @@ export const REMOVED_VIEWS: readonly string[] = ['long-term-memory', 'authoritat
  */
 export const VALID_TRANSITIONS: ReadonlyMap<MemoryLayer, readonly MemoryLayer[]> = new Map([
   [MemoryLayer.WorkingMemory, [MemoryLayer.SharedWorkingMemory] as const],
-  [MemoryLayer.SharedWorkingMemory, [MemoryLayer.VerifiedMemory] as const],
+  [MemoryLayer.SharedWorkingMemory, [MemoryLayer.VerifiableMemory] as const],
 ]);
 
 export function isValidTransition(from: MemoryLayer, to: MemoryLayer): boolean {
@@ -184,5 +200,5 @@ export const PUBLICATION_STATES: readonly PublicationState[] = [
  * All three GET views, ordered by trust level (ascending).
  */
 export const GET_VIEWS: readonly GetView[] = [
-  'working-memory', 'shared-working-memory', 'verified-memory',
+  'working-memory', 'shared-working-memory', 'verifiable-memory',
 ] as const;

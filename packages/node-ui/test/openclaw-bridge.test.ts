@@ -159,12 +159,24 @@ describe('OpenClaw daemon endpoints', () => {
   });
 
   it('discarding an imported assertion evicts its cached extraction status', () => {
+    // KA migration: the legacy `// POST /api/assertion/:name/discard` handler
+    // (routes/assertion.ts, deleted) evicted the daemon's in-memory
+    // extraction-status cache. The unified KA route handles discard via the
+    // `verb === "discard"` dispatch in routes/knowledge-assets.ts. Slice that
+    // block (between the discard and pull-from verb branches) and assert the
+    // same eviction guarantee is carried through.
+    const discardStart = daemonSrc.indexOf('verb === "discard"');
     const discardBlock = daemonSrc.slice(
-      daemonSrc.indexOf("// POST /api/assertion/:name/discard"),
-      daemonSrc.indexOf("// POST /api/assertion/:name/import-file"),
+      discardStart,
+      daemonSrc.indexOf('verb === "pull-from"', discardStart),
     );
-    expect(discardBlock).toContain('const assertionUri = contextGraphAssertionUri(');
-    expect(discardBlock).toContain('extractionStatus.delete(assertionUri);');
+    // The eviction must be keyed by the assertion's content-addressed URI
+    // (so a same-name re-import re-extracts). The unified KA handler inlines
+    // it as `extractionStatus.delete(contextGraphAssertionUri(...))` rather
+    // than the legacy two-statement form — assert the guarantee, not the
+    // exact variable shape.
+    expect(discardBlock).toContain('extractionStatus.delete(');
+    expect(discardBlock).toContain('contextGraphAssertionUri(');
   });
 
   it('chat-openclaw persists outbound messages', () => {

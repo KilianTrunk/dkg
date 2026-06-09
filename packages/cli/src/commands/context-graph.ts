@@ -174,7 +174,7 @@ contextGraphCmd
       if (opts.invite?.length) {
         console.log(`  Invited ${(opts.invite as string[]).length} peer(s) via allowlist (legacy).`);
       }
-      console.log(`  Run 'dkg context-graph register ${id}' to register on-chain (unlocks Verified Memory).`);
+      console.log(`  Run 'dkg context-graph register ${id}' to register on-chain (unlocks Verifiable Memory).`);
 
       if (opts.save) {
         const config = await loadConfig();
@@ -194,7 +194,7 @@ contextGraphCmd
 
 contextGraphCmd
   .command('register <id>')
-  .description('Register an existing context graph on-chain (unlocks Verified Memory, requires TRAC)')
+  .description('Register an existing context graph on-chain (unlocks Verifiable Memory, requires TRAC)')
   .option('--reveal', 'Deprecated: V10 ContextGraphs registration does not reveal cleartext metadata on-chain')
   .option('--access-policy <n>', 'Access policy: 0 = public/discoverable, 1 = private/curated', parseInt)
   .option('--publish-policy <n>', 'Publish policy: 0 = curated, 1 = open', parseInt)
@@ -220,7 +220,7 @@ contextGraphCmd
       if (pcaAccountId) {
         console.log(`  PCA account id: ${pcaAccountId}`);
       }
-      console.log(`  ${result.hint ?? 'You can now publish SWM to Verified Memory.'}`);
+      console.log(`  ${result.hint ?? 'You can now publish SWM to Verifiable Memory.'}`);
     } catch (err) {
       console.error(toErrorMessage(err));
       process.exit(1);

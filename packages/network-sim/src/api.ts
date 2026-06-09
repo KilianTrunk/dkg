@@ -74,8 +74,8 @@ export async function publishKA(
       'attestation over the public quads.',
     );
   }
-  // RFC-001 §9.x — route through the new assertion lifecycle (sign at
-  // creation): create an auto-named assertion with the supplied quads,
+  // RFC-001 §9.x — route through the knowledge-asset lifecycle (sign at
+  // creation): create an auto-named knowledge asset with the supplied quads,
   // finalize (computes the merkle root and signs the AuthorAttestation
   // stored in `_meta`), promote into SWM, then publish via the
   // `assertionName` shape so the publisher forwards the seal verbatim.
@@ -87,7 +87,7 @@ export async function publishKA(
     graph: q.graph ?? `did:dkg:context-graph:${contextGraphId}`,
   }));
   const created = await post<{ assertionUri: string; seal?: Record<string, unknown> }>(
-    `${nodeBase(nodeId)}/api/assertion/create`,
+    `${nodeBase(nodeId)}/api/knowledge-assets`,
     {
       contextGraphId,
       name: assertionName,

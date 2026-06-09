@@ -251,7 +251,7 @@ DKG_QUERY_SCHEMA = {
     "name": "dkg_query",
     "description": (
         "Query the DKG knowledge graph using SPARQL. Pass view to select "
-        "Working Memory, Shared Working Memory, or Verified Memory."
+        "Working Memory, Shared Working Memory, or Verifiable Memory."
     ),
     "parameters": {
         "type": "object",
@@ -271,7 +271,7 @@ DKG_QUERY_SCHEMA = {
             "view": {
                 "type": "string",
                 "description": (
-                    "Optional layer: working-memory, shared-working-memory, or verified-memory. "
+                    "Optional layer: working-memory, shared-working-memory, or verifiable-memory. "
                     "When supplied, context_graph_id is required."
                 ),
             },
@@ -318,7 +318,7 @@ DKG_PUBLISH_SCHEMA = {
     "name": "dkg_publish",
     "description": (
         "One-shot write + publish helper: write supplied quads to Shared Working Memory, "
-        "then publish SWM to Verified Memory. Chain-anchored, permanent, costs TRAC. "
+        "then publish SWM to Verifiable Memory. Chain-anchored, permanent, costs TRAC. "
         "Object values starting with http://, https://, urn:, or did: are treated as "
         "URIs. Everything else becomes a string literal automatically.\n"
         "Always call dkg_wallet_balances first to verify sufficient TRAC."
@@ -494,7 +494,7 @@ DKG_CREATE_CONTEXT_GRAPH_SCHEMA = {
     "description": (
         "Create a new Context Graph — a bounded knowledge space for a project "
         "or team. Context Graphs organize knowledge into Working Memory, "
-        "Shared Memory, and Verified Memory layers. Use dkg_status first to "
+        "Shared Memory, and Verifiable Memory layers. Use dkg_status first to "
         "check if the Context Graph already exists. "
         "Defaults to a curated/private context graph — the creator is "
         "auto-included in the allowlist and can immediately write to working "
@@ -750,7 +750,7 @@ DKG_ASSERTION_HISTORY_SCHEMA = {
 DKG_SHARED_MEMORY_PUBLISH_SCHEMA = {
     "name": "dkg_shared_memory_publish",
     "description": (
-        "Publish existing Shared Working Memory to Verified Memory. "
+        "Publish existing Shared Working Memory to Verifiable Memory. "
         "Use after dkg_assertion_promote in the canonical write → promote → publish flow."
     ),
     "parameters": {
@@ -796,7 +796,7 @@ MEMORY_SEARCH_SCHEMA = {
     "name": "memory_search",
     "description": (
         "Search DKG-backed memory by free text across Working Memory, Shared Working Memory, "
-        "and Verified Memory. Prefer this over dkg_query for recall."
+        "and Verifiable Memory. Prefer this over dkg_query for recall."
     ),
     "parameters": {
         "type": "object",
@@ -1004,7 +1004,7 @@ class DKGMemoryProvider(MemoryProvider):
             return (
                 "DKG memory is connected but empty. Use dkg_memory to store facts, "
                 "memory_search or dkg_query to search, and dkg_share to share with team. "
-                "Verified Memory publish and context-graph collaboration tools are available."
+                "Verifiable Memory publish and context-graph collaboration tools are available."
             )
 
         memory_facts = [f for f in facts if f.get("target") == "memory"]
@@ -1029,9 +1029,9 @@ class DKGMemoryProvider(MemoryProvider):
             )
 
         publish_guidance = (
-            "  dkg_shared_memory_publish / dkg_publish — Verified Memory publish flows\n"
+            "  dkg_shared_memory_publish / dkg_publish — Verifiable Memory publish flows\n"
             if self._direct_publish_allowed()
-            else "  Verified Memory publish tools are disabled by operator policy; ask before chain publish\n"
+            else "  Verifiable Memory publish tools are disabled by operator policy; ask before chain publish\n"
         )
         admin_guidance = (
             "  dkg_context_graph_invite / dkg_participant_* / dkg_join_request_* — Manage project access\n"
@@ -1071,7 +1071,7 @@ class DKGMemoryProvider(MemoryProvider):
             "  dkg_status — Node health, peers, context graphs\n"
             "\n"
             "TRUST FLOW: Working Memory (local, free) → SHARE → Shared Memory "
-            "(team, free) → PUBLISH → Verified Memory (chain, TRAC cost, permanent).\n"
+            "(team, free) → PUBLISH → Verifiable Memory (chain, TRAC cost, permanent).\n"
             "Knowledge gains trust as it moves through layers. Only publish when "
             "findings are verified and ready for permanent record.\n"
             "\n"
@@ -1080,7 +1080,7 @@ class DKGMemoryProvider(MemoryProvider):
             "Memory gossip. The creator is auto-included; invite collaborators "
             "with dkg_participant_add or pass allowed_agents at creation. Use "
             "public:true to opt into a discoverable/open context graph. Working "
-            "Memory is per-agent regardless of visibility. Verified Memory "
+            "Memory is per-agent regardless of visibility. Verifiable Memory "
             "anchors are public on-chain; the underlying private quads stay "
             "local on the publishing node."
         )
@@ -1388,8 +1388,8 @@ class DKGMemoryProvider(MemoryProvider):
             return tool_error('"context_graph" is not a supported parameter on dkg_query. Use "context_graph_id".')
         cg = _first_text(args, "context_graph_id") or self._context_graph
         view = _first_text(args, "view")
-        if view and view not in ("working-memory", "shared-working-memory", "verified-memory"):
-            return tool_error('"view" must be one of: working-memory, shared-working-memory, verified-memory.')
+        if view and view not in ("working-memory", "shared-working-memory", "verifiable-memory"):
+            return tool_error('"view" must be one of: working-memory, shared-working-memory, verifiable-memory.')
         if view and not _first_text(args, "context_graph_id"):
             return tool_error(f'"view: {view}" requires "context_graph_id".')
         if view and _first_text(args, "sub_graph_name"):
@@ -1446,7 +1446,7 @@ class DKGMemoryProvider(MemoryProvider):
             for view, weight in (
                 ("working-memory", 1.0),
                 ("shared-working-memory", 1.15),
-                ("verified-memory", 1.3),
+                ("verifiable-memory", 1.3),
             ):
                 if view == "working-memory" and not agent_address:
                     continue
@@ -2567,7 +2567,7 @@ def _memory_search_layer(context_graph_id: str, view: str) -> str:
     suffix = {
         "working-memory": "wm",
         "shared-working-memory": "swm",
-        "verified-memory": "vm",
+        "verifiable-memory": "vm",
     }.get(view, "wm")
     prefix = "agent-context" if context_graph_id == "agent-context" else "project"
     return f"{prefix}-{suffix}"

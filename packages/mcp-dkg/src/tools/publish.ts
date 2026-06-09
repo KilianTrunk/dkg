@@ -6,7 +6,7 @@
  *
  *   - `dkg_publish` — "I have fresh quads, publish them now" one-shot.
  *     Two-call helper: writes the quads to SWM, then publishes the
- *     entire SWM to Verified Memory and clears SWM.
+ *     entire SWM to Verifiable Memory and clears SWM.
  *
  *   - `dkg_shared_memory_publish` — canonical Step 5 finalizer for the
  *     stepwise flow (`assertion_create + write + promote` then this).
@@ -116,7 +116,7 @@ export function registerPublishTools(
       description:
         '"I have fresh quads, write+publish now." Two-call helper: ' +
         'writes the supplied quads to Shared Working Memory, then ' +
-        'publishes the entire SWM in the CG to Verified Memory ' +
+        'publishes the entire SWM in the CG to Verifiable Memory ' +
         '(on-chain) and clears SWM. For the canonical step-wise flow ' +
         '(write → promote → publish) use `dkg_assertion_create / write ' +
         '/ promote` followed by `dkg_shared_memory_publish` — that ' +
@@ -194,7 +194,7 @@ export function registerPublishTools(
       description:
         'Canonical step-4 finalizer for "publish existing SWM" (one HTTP ' +
         'call). Publishes all Shared Working Memory in a context graph to ' +
-        'Verified Memory (on-chain) and clears SWM. Use after ' +
+        'Verifiable Memory (on-chain) and clears SWM. Use after ' +
         '`dkg_assertion_promote` to finalize promoted data. Pass ' +
         '`rootEntities` to publish only specific roots (subset publishes ' +
         'default to NOT clearing SWM, so other unpublished roots are not ' +
@@ -293,7 +293,7 @@ export function registerPublishTools(
         // requested. Both are read-only echoes; no warning prose.
         const chainId = await resolveChainId(client);
         const summary = [
-          `Published ${cgId}'s SWM to Verified Memory.`,
+          `Published ${cgId}'s SWM to Verifiable Memory.`,
           roots ? `Roots: ${roots.length}` : 'Selection: all',
           kaId ? `KC: ${kaId}` : null,
           kas?.length ? `KAs: ${kas.length}` : null,

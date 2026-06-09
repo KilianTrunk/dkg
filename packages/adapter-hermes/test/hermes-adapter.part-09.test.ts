@@ -262,22 +262,20 @@ client_spec.loader.exec_module(client_module)
 
 client = client_module.DKGClient("http://127.0.0.1:9200")
 client_calls = []
-def post(path, data=None):
-    client_calls.append((path, data or {}))
+def get(path):
+    client_calls.append((path, {}))
     return {"quads": []}
-client._post = post
+client._get = get
+# KA migration: query_assertion now GETs the assertion-scoped WM quad dump
+# (/api/knowledge-assets/{name}/wm/quads) instead of POSTing to the legacy
+# /api/assertion/{name}/query. The endpoint returns the full assertion graph;
+# the sparql arg is accepted for API compatibility but no longer sent on the wire.
 client.query_assertion("hermes", "cg:test", "SELECT ?s ?p ?o WHERE { ?s ?p ?o }")
 assert client_calls == [
-    (
-        "/api/assertion/hermes/query",
-        {
-            "contextGraphId": "cg:test",
-            "sparql": "SELECT ?s ?p ?o WHERE { ?s ?p ?o }",
-        },
-    )
+    ("/api/knowledge-assets/hermes/wm/quads?contextGraphId=cg%3Atest", {}),
 ], client_calls
 client.query_assertion("hermes", "cg:test")
-assert client_calls[-1] == ("/api/assertion/hermes/query", {"contextGraphId": "cg:test"}), client_calls
+assert client_calls[-1] == ("/api/knowledge-assets/hermes/wm/quads?contextGraphId=cg%3Atest", {}), client_calls
 
 spec = importlib.util.spec_from_file_location(
     "plugins.memory.dkg",

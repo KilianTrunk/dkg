@@ -237,8 +237,9 @@ export class QueryHandler {
       return errorResponse(opId, 'ERROR', 'Invalid request: missing rdfType');
     }
 
-    const dataGraph = contextGraphDataUri(contextGraphId);
-    const sparql = `SELECT DISTINCT ?entity WHERE { GRAPH <${assertSafeIri(dataGraph)}> { ?entity a <${assertSafeIri(rdfType)}> } } LIMIT ${limit}`;
+    const dataGraph = assertSafeIri(contextGraphDataUri(contextGraphId));
+    // Per-KA VM read-both: published data lives in …/_verifiable_memory/{addr}/{number} + (legacy) root.
+    const sparql = `SELECT DISTINCT ?entity WHERE { GRAPH ?g { ?entity a <${assertSafeIri(rdfType)}> } FILTER(STRSTARTS(STR(?g), "${dataGraph}/_verifiable_memory/") || STR(?g) = "${dataGraph}") } LIMIT ${limit}`;
 
     const result = await this.queryEngine.query(sparql);
     const entityUris = result.bindings.map(b => b['entity']);
@@ -261,8 +262,9 @@ export class QueryHandler {
       return errorResponse(opId, 'ERROR', 'Invalid request: missing entityUri');
     }
 
-    const dataGraph = contextGraphDataUri(contextGraphId);
-    const sparql = `SELECT ?p ?o WHERE { GRAPH <${assertSafeIri(dataGraph)}> { <${assertSafeIri(entityUri)}> ?p ?o } }`;
+    const dataGraph = assertSafeIri(contextGraphDataUri(contextGraphId));
+    // Per-KA VM read-both: published data lives in …/_verifiable_memory/{addr}/{number} + (legacy) root.
+    const sparql = `SELECT ?p ?o WHERE { GRAPH ?g { <${assertSafeIri(entityUri)}> ?p ?o } FILTER(STRSTARTS(STR(?g), "${dataGraph}/_verifiable_memory/") || STR(?g) = "${dataGraph}") }`;
     const result = await this.queryEngine.query(sparql);
 
     const ntriples = result.bindings

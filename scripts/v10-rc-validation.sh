@@ -12,7 +12,7 @@
 #   - publish:    POST /api/shared-memory/write  +  POST /api/shared-memory/publish
 #   - update/private quads: POST /api/update     (legacy is intentionally retained)
 #   - SWM:        POST /api/shared-memory/{write,publish}
-#   - assertion:  POST /api/assertion/{create,/<name>/write,/<name>/query,/<name>/promote}
+#   - knowledge-assets: POST /api/knowledge-assets (create), POST /api/knowledge-assets/<name>/wm/write, GET /api/knowledge-assets/<name>/wm/quads (query), POST /api/knowledge-assets/<name>/swm/share (promote)
 #   - CAS:        POST /api/shared-memory/conditional-write  (conditions REQUIRED non-empty)
 #   - chat:       POST /api/chat { to, text }
 #   - identity:   GET  /api/identity      (replaces deprecated /api/profile)
@@ -379,7 +379,7 @@ section "7. WORKING MEMORY ASSERTIONS"
 ASSERT_NAME="research-notes-$RUN_TAG"
 
 echo "--- 7a: Create assertion ---"
-WM_CREATE=$(post 9201 /api/assertion/create -H "Content-Type: application/json" -d "{
+WM_CREATE=$(post 9201 /api/knowledge-assets -H "Content-Type: application/json" -d "{
   \"contextGraphId\": \"$CG\",
   \"name\": \"$ASSERT_NAME\"
 }")
@@ -393,7 +393,7 @@ fi
 FINDING_URI="urn:v10:finding-$RUN_TAG"
 
 echo "--- 7b: Write to assertion ---"
-WM_WRITE=$(post 9201 "/api/assertion/$ASSERT_NAME/write" -H "Content-Type: application/json" -d "{
+WM_WRITE=$(post 9201 "/api/knowledge-assets/$ASSERT_NAME/wm/write" -H "Content-Type: application/json" -d "{
   \"contextGraphId\": \"$CG\",
   \"quads\": [
     $(q "$FINDING_URI" "http://www.w3.org/1999/02/22-rdf-syntax-ns#type" "http://schema.org/ScholarlyArticle"),
@@ -409,9 +409,7 @@ else
 fi
 
 echo "--- 7c: Query assertion ---"
-WM_QUERY=$(post 9201 "/api/assertion/$ASSERT_NAME/query" -H "Content-Type: application/json" -d "{
-  \"contextGraphId\": \"$CG\"
-}")
+WM_QUERY=$(api "http://127.0.0.1:9201/api/knowledge-assets/$ASSERT_NAME/wm/quads?contextGraphId=$CG")
 WM_COUNT=$(echo "$WM_QUERY" | pyfield "(len(d) if isinstance(d,list) else d.get('count', len(d.get('quads',[]))))")
 [ -z "$WM_COUNT" ] && WM_COUNT=0
 if [ "$WM_COUNT" != "0" ]; then
@@ -436,7 +434,7 @@ fi
 # ────────────────────────────────────────────────────────────────────────────
 section "8. PROMOTE WM → SWM"
 
-WM_PROMOTE=$(post 9201 "/api/assertion/$ASSERT_NAME/promote" -H "Content-Type: application/json" -d "{
+WM_PROMOTE=$(post 9201 "/api/knowledge-assets/$ASSERT_NAME/swm/share" -H "Content-Type: application/json" -d "{
   \"contextGraphId\": \"$CG\"
 }")
 PROMOTE_COUNT=$(echo "$WM_PROMOTE" | pyfield "d.get('promotedCount', d.get('triplesPromoted','?'))")
@@ -528,17 +526,17 @@ fi
 # ────────────────────────────────────────────────────────────────────────────
 section "11. QUERY VIEWS"
 
-echo "--- 11a: Query with view=verified-memory ---"
+echo "--- 11a: Query with view=verifiable-memory ---"
 VM_Q=$(post 9201 /api/query -H "Content-Type: application/json" -d "{
   \"sparql\": \"SELECT ?name WHERE { <$ALICE_URI> <http://schema.org/name> ?name }\",
   \"contextGraphId\": \"$CG\",
-  \"view\": \"verified-memory\"
+  \"view\": \"verifiable-memory\"
 }")
 VM_FOUND=$(echo "$VM_Q" | pyfield "(lambda b: (b[0].get('name') if b else 'EMPTY'))(d.get('result',{}).get('bindings',[]))")
 if echo "$VM_FOUND" | grep -q "Alice"; then
-  ok "Verified-memory view: Alice data found"
+  ok "Verifiable-memory view: Alice data found"
 else
-  fail "Verified-memory view: Alice data missing (got: $VM_FOUND)"
+  fail "Verifiable-memory view: Alice data missing (got: $VM_FOUND)"
 fi
 
 echo "--- 11b: Query with view=shared-working-memory ---"

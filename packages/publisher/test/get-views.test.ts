@@ -3,7 +3,7 @@ import {
   type GetView,
   GET_VIEWS,
   contextGraphSharedMemoryUri,
-  contextGraphVerifiedMemoryUri,
+  contextGraphVerifiableMemoryUri,
   contextGraphAssertionUri,
 } from '@origintrail-official/dkg-core';
 import { resolveViewGraphs, type ViewResolution } from '@origintrail-official/dkg-query';
@@ -21,7 +21,7 @@ describe('resolveViewGraphs', () => {
       const res = resolveViewGraphs('working-memory', CG, { agentAddress: AGENT });
       expect(res.graphs).toHaveLength(0);
       expect(res.graphPrefixes).toHaveLength(1);
-      expect(res.graphPrefixes[0]).toBe(`did:dkg:context-graph:${CG}/assertion/${AGENT}/`);
+      expect(res.graphPrefixes[0]).toBe(`did:dkg:context-graph:${CG}/_working_memory/${AGENT}/`);
     });
 
     it('includes the agent address in the graph URI prefix', () => {
@@ -40,17 +40,17 @@ describe('resolveViewGraphs', () => {
     it('maps to _shared_memory graph', () => {
       const res = resolveViewGraphs('shared-working-memory', CG);
       expect(res.graphs).toEqual([contextGraphSharedMemoryUri(CG)]);
-      expect(res.graphs[0]).toBe(`did:dkg:context-graph:${CG}/_shared_memory`);
-      expect(res.graphPrefixes).toHaveLength(0);
+      expect(res.graphPrefixes[0]).toBe(`did:dkg:context-graph:${CG}/_shared_memory/`);
+      expect(res.graphPrefixes).toHaveLength(1);
     });
   });
 
-  describe('verified-memory', () => {
-    it('unions the root content graph + `_verified_memory/` prefix when no specific verifiedGraph is given (RC11 / PR-A: Codex #671)', () => {
-      const res = resolveViewGraphs('verified-memory', CG);
+  describe('verifiable-memory', () => {
+    it('unions the root content graph + `_verifiable_memory/` prefix when no specific verifiedGraph is given (RC11 / PR-A: Codex #671)', () => {
+      const res = resolveViewGraphs('verifiable-memory', CG);
       // RC11 / PR-A (Codex review fix on #671, comment 3302058969):
       // re-includes the root content graph `did:dkg:context-graph:{id}`
-      // alongside the `_verified_memory/*` post-`verify` named graphs.
+      // alongside the `_verifiable_memory/*` post-`verify` named graphs.
       // The tentative-VM leak the PR2 first cut was guarding against is
       // now plugged at the publisher (root-graph insert deferred to the
       // chain-success branch in `DKGPublisher.publish`), so re-unioning
@@ -59,13 +59,13 @@ describe('resolveViewGraphs', () => {
       // memory-search) see confirmed data immediately, without needing
       // a separate `verify` step.
       expect(res.graphs).toEqual([`did:dkg:context-graph:${CG}`]);
-      expect(res.graphPrefixes).toEqual([`did:dkg:context-graph:${CG}/_verified_memory/`]);
+      expect(res.graphPrefixes).toEqual([`did:dkg:context-graph:${CG}/_verifiable_memory/`]);
     });
 
     it('returns an exact URI when verifiedGraph is specified', () => {
-      const res = resolveViewGraphs('verified-memory', CG, { verifiedGraph: 'team-decisions' });
-      expect(res.graphs).toEqual([contextGraphVerifiedMemoryUri(CG, 'team-decisions')]);
-      expect(res.graphs[0]).toBe(`did:dkg:context-graph:${CG}/_verified_memory/team-decisions`);
+      const res = resolveViewGraphs('verifiable-memory', CG, { verifiedGraph: 'team-decisions' });
+      expect(res.graphs).toEqual([contextGraphVerifiableMemoryUri(CG, 'team-decisions')]);
+      expect(res.graphs[0]).toBe(`did:dkg:context-graph:${CG}/_verifiable_memory/team-decisions`);
       expect(res.graphPrefixes).toHaveLength(0);
     });
   });
@@ -93,7 +93,7 @@ describe('resolveViewGraphs', () => {
       expect([...GET_VIEWS]).toEqual([
         'working-memory',
         'shared-working-memory',
-        'verified-memory',
+        'verifiable-memory',
       ]);
     });
 

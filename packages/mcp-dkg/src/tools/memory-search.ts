@@ -98,7 +98,7 @@ function toAgentPeerId(agentAddress: string): string {
 interface LayerPlan {
   layer: MemoryLayer;
   contextGraphId: string;
-  view: 'working-memory' | 'shared-working-memory' | 'verified-memory';
+  view: 'working-memory' | 'shared-working-memory' | 'verifiable-memory';
 }
 
 /**
@@ -259,13 +259,13 @@ LIMIT ${cap}`;
       const plans: LayerPlan[] = [
         { layer: 'agent-context-wm', contextGraphId: AGENT_CONTEXT_GRAPH, view: 'working-memory' },
         { layer: 'agent-context-swm', contextGraphId: AGENT_CONTEXT_GRAPH, view: 'shared-working-memory' },
-        { layer: 'agent-context-vm', contextGraphId: AGENT_CONTEXT_GRAPH, view: 'verified-memory' },
+        { layer: 'agent-context-vm', contextGraphId: AGENT_CONTEXT_GRAPH, view: 'verifiable-memory' },
       ];
       if (projectId) {
         plans.push(
           { layer: 'project-wm', contextGraphId: projectId, view: 'working-memory' },
           { layer: 'project-swm', contextGraphId: projectId, view: 'shared-working-memory' },
-          { layer: 'project-vm', contextGraphId: projectId, view: 'verified-memory' },
+          { layer: 'project-vm', contextGraphId: projectId, view: 'verifiable-memory' },
         );
       }
       const searchedLayers: MemoryLayer[] = plans.map((p) => p.layer);

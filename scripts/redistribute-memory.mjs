@@ -18,7 +18,7 @@
  * 3. Pick entities to move up using a deterministic lexicographic sort
  *    (so reruns bucket identically) and a greedy fill:
  *        - VM first  → publish via /api/shared-memory/publish
- *        - SWM next  → promote via /api/assertion/:name/promote
+ *        - SWM next  → promote via /api/knowledge-assets/:name/swm/share
  *        - remainder stays WM
  * 4. Batch promotes/publishes (default 40 entities per call) so we stay
  *    comfortably under the 512 KB gossip envelope.
@@ -91,7 +91,7 @@ const wmNow  = await countLayer('CONTAINS(STR(?g), "/assertion/")');
 const swmNow = await countLayer('STRENDS(STR(?g), "/_shared_memory")');
 const vmNow  = await countLayer(
   '!CONTAINS(STR(?g), "/assertion/") && !CONTAINS(STR(?g), "_shared_memory") ' +
-  '&& !CONTAINS(STR(?g), "_verified_memory") && !CONTAINS(STR(?g), "/_meta") ' +
+  '&& !CONTAINS(STR(?g), "_verifiable_memory") && !CONTAINS(STR(?g), "/_meta") ' +
   '&& !CONTAINS(STR(?g), "/_private") && !CONTAINS(STR(?g), "/_rules")',
 );
 const total = wmNow + swmNow + vmNow;
@@ -349,7 +349,7 @@ const wmAfter  = await countLayer('CONTAINS(STR(?g), "/assertion/")');
 const swmAfter = await countLayer('STRENDS(STR(?g), "/_shared_memory")');
 const vmAfter  = await countLayer(
   '!CONTAINS(STR(?g), "/assertion/") && !CONTAINS(STR(?g), "_shared_memory") ' +
-  '&& !CONTAINS(STR(?g), "_verified_memory") && !CONTAINS(STR(?g), "/_meta") ' +
+  '&& !CONTAINS(STR(?g), "_verifiable_memory") && !CONTAINS(STR(?g), "/_meta") ' +
   '&& !CONTAINS(STR(?g), "/_private") && !CONTAINS(STR(?g), "/_rules")',
 );
 const totAfter = wmAfter + swmAfter + vmAfter;

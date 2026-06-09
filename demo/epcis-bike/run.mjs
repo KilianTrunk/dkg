@@ -830,7 +830,7 @@ async function phase0() {
     exit: regOk ? 0 : reg.exit,
   }, {
     preamble:
-      'On-chain registration is what unlocks Verified Memory: it asks the `ContextGraphs` contract to mint a numeric ID for this CG. The publisher needs that ID for V10 `publishDirect` — without it every lift fails with "got 0". This step costs a small amount of TRAC and produces a tx hash. Runs even in `--skip-cg-create` mode so an unregistered CG fails fast here rather than at capture time.',
+      'On-chain registration is what unlocks Verifiable Memory: it asks the `ContextGraphs` contract to mint a numeric ID for this CG. The publisher needs that ID for V10 `publishDirect` — without it every lift fails with "got 0". This step costs a small amount of TRAC and produces a tx hash. Runs even in `--skip-cg-create` mode so an unregistered CG fails fast here rather than at capture time.',
     interpretation: regAlready
       ? `CG ${CG_ID} already registered on-chain — reusing.`
       : regOk

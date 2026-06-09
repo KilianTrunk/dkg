@@ -1,5 +1,5 @@
 /**
- * useVerifiedMemoryAnchors — pulls Verified-Memory provenance out of the
+ * useVerifiableMemoryAnchors — pulls Verifiable-Memory provenance out of the
  * daemon's `_shared_memory_meta` graphs and projects it as a small set of
  * "decoration" RDF triples that can be merged into the existing VM graph
  * visualisation.
@@ -59,7 +59,7 @@ export interface PublishAnchor {
   subGraph?: string;   // sub-graph slug (from the graph URI)
 }
 
-export interface VerifiedMemoryAnchorsResult {
+export interface VerifiableMemoryAnchorsResult {
   /** Every anchor we know about. Useful for legends / ledgers. */
   anchors: PublishAnchor[];
   /** Synthetic triples to merge into the RdfGraph input, already filtered
@@ -111,7 +111,15 @@ function agentLabel(agentId: string): string {
 /** Build the SPARQL that enumerates every publish-batch WorkspaceOperation
  *  across every sub-graph's `_shared_memory_meta`. */
 function buildAnchorsQuery(cgId: string): string {
-  const cgUri = `did:dkg:context-graph:${cgId}`;
+  // Trailing slash makes this an EXACT CG prefix: every partition graph is
+  // `did:dkg:context-graph:<cg>/[<sg>/]_shared_memory_meta`, so "<cgUri>/"
+  // matches all of this CG's partitions while excluding sibling CGs whose id
+  // merely shares the prefix (cg-1 must not capture cg-10 / cg-1-foo). Same
+  // known limitation as useSwmAttributions.buildAttributionsQuery: a
+  // path-extending child CG `<cg>/<x>` (CG ids may contain "/") would still
+  // prefix-match; the authoritative fix is the deferred server-side sub-graph
+  // SWM routing (A2/A4).
+  const cgPrefix = `did:dkg:context-graph:${cgId}/`;
   return `PREFIX dkg: <http://dkg.io/ontology/>
 PREFIX prov: <http://www.w3.org/ns/prov#>
 SELECT ?op ?root ?agent ?publishedAt ?g WHERE {
@@ -122,7 +130,7 @@ SELECT ?op ?root ?agent ?publishedAt ?g WHERE {
         prov:wasAttributedTo ?agent .
   }
   FILTER(
-    STRSTARTS(STR(?g), "${cgUri}") &&
+    STRSTARTS(STR(?g), "${cgPrefix}") &&
     CONTAINS(STR(?g), "_shared_memory_meta")
   )
 } ORDER BY ?publishedAt LIMIT 2000`;
@@ -209,10 +217,10 @@ function buildDecorationTriples(
   return out;
 }
 
-export function useVerifiedMemoryAnchors(
+export function useVerifiableMemoryAnchors(
   contextGraphId: string | undefined,
   visibleEntityUris?: Set<string> | Iterable<string>,
-): VerifiedMemoryAnchorsResult {
+): VerifiableMemoryAnchorsResult {
   const [anchors, setAnchors] = useState<PublishAnchor[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -234,8 +242,13 @@ export function useVerifiedMemoryAnchors(
           method: 'POST',
           headers: { 'Content-Type': 'application/json', ...authHeaders() },
           body: JSON.stringify({
+            // Do NOT send contextGraphId here. buildAnchorsQuery already scopes to
+            // the CG via its exact STRSTARTS(?g, "<cgUri>/") and enumerates EVERY sub-graph's
+            // <cg>/<sg>/_shared_memory_meta partition. Passing contextGraphId makes
+            // the engine constrain GRAPH ?g to CG-direct graphs only, dropping
+            // per-sub-graph anchors/attribution (same bug class as B2). See
+            // dkg-query-engine.ts graph-variable allow-list.
             sparql: buildAnchorsQuery(contextGraphId),
-            contextGraphId,
           }),
         });
         if (!res.ok) throw new Error(`SPARQL query failed: ${res.status}`);

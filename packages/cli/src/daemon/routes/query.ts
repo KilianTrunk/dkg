@@ -454,7 +454,7 @@ export async function handleQueryRoutes(ctx: RequestContext): Promise<void> {
       });
     }
     // PR #239 Codex iter-7: gate minTrust normalization/validation behind
-    // view === 'verified-memory'. Upstream `resolveViewGraphs()` already
+    // view === 'verifiable-memory'. Upstream `resolveViewGraphs()` already
     // ignores `minTrust` outside VM, so the HTTP layer must match that —
     // otherwise a reused options object like
     //   { view: "working-memory", minTrust: 99 }
@@ -462,7 +462,7 @@ export async function handleQueryRoutes(ctx: RequestContext): Promise<void> {
     // Keep view === undefined NOT rejecting either: resolveViewGraphs
     // treats "no view" as implicit working-memory semantics.
     let minTrust: number | undefined;
-    if (view === 'verified-memory' && rawMinTrust !== undefined && rawMinTrust !== null) {
+    if (view === 'verifiable-memory' && rawMinTrust !== undefined && rawMinTrust !== null) {
       if (typeof rawMinTrust === 'number' && Number.isInteger(rawMinTrust) && rawMinTrust >= 0 && rawMinTrust <= 3) {
         minTrust = rawMinTrust;
       } else if (typeof rawMinTrust === 'string') {
@@ -938,19 +938,19 @@ export async function handleQueryRoutes(ctx: RequestContext): Promise<void> {
     const body = await readBody(req, SMALL_BODY_BYTES);
     const {
       contextGraphId,
-      verifiedMemoryId,
+      verifiableMemoryId,
       batchId,
       timeoutMs,
       requiredSignatures,
     } = JSON.parse(body);
     if (!validateRequiredContextGraphId(contextGraphId, res)) return;
-    if (!verifiedMemoryId || !batchId) {
+    if (!verifiableMemoryId || !batchId) {
       return jsonResponse(res, 400, {
-        error: "Missing verifiedMemoryId or batchId",
+        error: "Missing verifiableMemoryId or batchId",
       });
     }
-    if (typeof verifiedMemoryId !== 'string') {
-      return jsonResponse(res, 400, { error: '"verifiedMemoryId" must be a string' });
+    if (typeof verifiableMemoryId !== 'string') {
+      return jsonResponse(res, 400, { error: '"verifiableMemoryId" must be a string' });
     }
     const parsedSigs = parseRequiredSignatures(requiredSignatures);
     if ("error" in parsedSigs) {
@@ -978,7 +978,7 @@ export async function handleQueryRoutes(ctx: RequestContext): Promise<void> {
     try {
       const result = await agent.verify({
         contextGraphId,
-        verifiedMemoryId,
+        verifiableMemoryId,
         batchId: parsedBatchId,
         timeoutMs: parsedTimeout.value,
         requiredSignatures: validatedRequiredSigs,
@@ -987,7 +987,7 @@ export async function handleQueryRoutes(ctx: RequestContext): Promise<void> {
         emitMemoryGraphChanged?.({
           contextGraphId,
           layers: ["vm"],
-          operation: "verified_memory_updated",
+          operation: "verifiable_memory_updated",
           source: "api",
         });
       } else if (result.status === "partial" || result.status === "no_quorum") {
@@ -1007,7 +1007,7 @@ export async function handleQueryRoutes(ctx: RequestContext): Promise<void> {
         error:
           result.status === "partial"
             ? "Verification quorum was not reached; partial trust metadata was written without a chain transaction"
-            : "Verification quorum was not reached; no verified memory was written",
+            : "Verification quorum was not reached; no verifiable memory was written",
       });
     } catch (err) {
       // CLI-9 dup #158 #159: a non-existent (cgId, vmId, batchId)

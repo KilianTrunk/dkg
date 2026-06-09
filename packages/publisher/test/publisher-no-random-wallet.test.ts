@@ -90,6 +90,18 @@ async function sealForWallet(
 const TEST_KEY = '0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d';
 const TEST_KEY_ALT = '0x5de4111a56f4c24611d9ed4d5318a7e03f9b9a9d73f3a5f3f6324a2a0e6fbb36';
 
+// rc.17 uniform per-KA layout: a confirmed publish (and any later update)
+// stores the KA's public quads in the PER-KA verifiable-memory graph
+// `…/_verifiable_memory/{author}/{number}`, where `author` + `number` are
+// unpacked from the KA's on-chain id by the same bit math the publisher uses
+// (`dkg-publisher.ts`). The update's batchId === the original kaId, so the
+// graph an update targets is derived from the kaId passed to `update()`.
+function perKaVerifiableMemoryGraph(contextGraphId: string, kaId: bigint): string {
+  const number = kaId & ((1n << 96n) - 1n);
+  const author = '0x' + (kaId >> 96n).toString(16).padStart(40, '0');
+  return `did:dkg:context-graph:${contextGraphId}/_verifiable_memory/${author}/${number}`;
+}
+
 // Greenfield (PR #815): on-chain updates require an owner seal
 // (`precomputedUpdateAttestation`). The adapter-managed update tests below
 // assert publisher *attribution* resolution, not seal ceremony, so this
@@ -233,8 +245,12 @@ class AsyncAddressSigningChain implements ChainAdapter {
     if (params.publisherAddress?.toLowerCase() !== this.wallet.address.toLowerCase()) {
       throw new Error('publisher did not await async signer address');
     }
+    // §F2 — echo the packed reservedKaId the publisher signed over so the
+    // mint matches the reservation (the real contract _safeMints exactly it);
+    // returning a fixed `1n` would trip the publisher's UAL/chain-split guard.
+    const kaId = params.reservedKaId ?? 1n;
     return {
-      batchId: 1n,
+      batchId: kaId,
       startKAId: 101n,
       endKAId: 101n,
       txHash: `0x${'78'.repeat(32)}`,
@@ -1291,9 +1307,14 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
     expect(updated.onChainResult).toBeUndefined();
     await expectUalEmbedsStorageAddress(updated.ual, chain, 13);
 
+    // rc.17 uniform per-KA layout: the update rewrites the KA's data into the
+    // per-KA verifiable-memory graph (…/_verifiable_memory/{author}/{number}, keyed
+    // by kaId), not the monolithic root data graph. Assert the post-update data
+    // in that per-KA graph (author/number unpacked from kaId 13n).
+    const vmGraph = perKaVerifiableMemoryGraph('1', 13n);
     const stored = await store.query(`
       SELECT ?p ?o WHERE {
-        GRAPH <did:dkg:context-graph:1> {
+        GRAPH <${vmGraph}> {
           <urn:test:adapter-managed-update-local-attribution> ?p ?o .
         }
       }
@@ -1328,9 +1349,14 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
     expect(updated.onChainResult).toBeUndefined();
     await expectUalEmbedsStorageAddress(updated.ual, chain, 12);
 
+    // rc.17 uniform per-KA layout: the update rewrites the KA's data into the
+    // per-KA verifiable-memory graph (…/_verifiable_memory/{author}/{number}, keyed
+    // by kaId), not the monolithic root data graph. Assert the post-update data
+    // in that per-KA graph (author/number unpacked from kaId 12n).
+    const vmGraph = perKaVerifiableMemoryGraph('1', 12n);
     const stored = await store.query(`
       SELECT ?p ?o WHERE {
-        GRAPH <did:dkg:context-graph:1> {
+        GRAPH <${vmGraph}> {
           <urn:test:adapter-managed-update-without-address> ?p ?o .
         }
       }

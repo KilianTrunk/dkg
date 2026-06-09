@@ -106,7 +106,7 @@ describe('DkgClient knowledge-assets — publish/finalize option serialization',
 
   it('knowledgeAssetFinalize forwards preSignedAuthorAttestation', async () => {
     const { client, calls } = makeClient();
-    const preSignedAuthorAttestation = { address: '0xauthor', signature: { r: '0xr', vs: '0xvs' } };
+    const preSignedAuthorAttestation = { address: '0xauthor', reservedKaId: '1', signature: { r: '0xr', vs: '0xvs' } };
     await client.knowledgeAssetFinalize({
       contextGraphId: 'cg-1',
       name: 'f',
@@ -127,7 +127,7 @@ describe('DkgClient knowledge-assets — publish/finalize option serialization',
       contextGraphId: 'cg-1',
       name: 'f',
       authorAgentAddress: '0xauthor',
-      preSignedAuthorAttestation: { address: '0xauthor', signature: { r: '0xr', vs: '0xvs' } },
+      preSignedAuthorAttestation: { address: '0xauthor', reservedKaId: '1', signature: { r: '0xr', vs: '0xvs' } },
     })).rejects.toThrow(/mutually exclusive/);
     expect(calls).toHaveLength(0);
   });

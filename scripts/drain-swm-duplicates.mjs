@@ -91,7 +91,7 @@ const wm = await countLayer('CONTAINS(STR(?g), "/assertion/")');
 const swm = await countLayer('STRENDS(STR(?g), "/_shared_memory")');
 const vm = await countLayer(
   '!CONTAINS(STR(?g), "/assertion/") && !CONTAINS(STR(?g), "_shared_memory") ' +
-  '&& !CONTAINS(STR(?g), "_verified_memory") && !CONTAINS(STR(?g), "/_meta") ' +
+  '&& !CONTAINS(STR(?g), "_verifiable_memory") && !CONTAINS(STR(?g), "/_meta") ' +
   '&& !CONTAINS(STR(?g), "/_private") && !CONTAINS(STR(?g), "/_rules")',
 );
 const tot = wm + swm + vm;

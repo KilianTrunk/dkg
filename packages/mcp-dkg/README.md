@@ -187,7 +187,7 @@ Two distinct surfaces (both documented in `SKILL.md §4a`):
 
 | Tool | When to use |
 |---|---|
-| `dkg_publish` | "I have fresh quads, publish them now." Two-call helper: writes the supplied quads to SWM, then publishes the entire SWM in the CG to Verified Memory and clears SWM. Skip the WM staging area. |
+| `dkg_publish` | "I have fresh quads, publish them now." Two-call helper: writes the supplied quads to SWM, then publishes the entire SWM in the CG to Verifiable Memory and clears SWM. Skip the WM staging area. |
 | `dkg_shared_memory_publish` | Canonical step-4 finalizer for the stepwise flow (`assertion_create + write + promote` → this). Publishes existing SWM (filterable by `rootEntities`), clears SWM. Pass `registerIfNeeded: true` to upgrade a local-only CG to on-chain registration in the same call (may spend gas/TRAC). |
 
 Both ship ungated — no `agent.canPublishToVm` flag — to mirror the OpenClaw adapter exactly.
@@ -197,7 +197,7 @@ Both ship ungated — no `agent.canPublishToVm` flag — to mirror the OpenClaw 
 | Tool | What it does |
 |---|---|
 | `dkg_memory_search` | Trust-weighted free-text recall across WM/SWM/VM in the agent-context graph (and an optional project graph). Higher-trust layers (VM > SWM > WM) collapse lower-trust hits for the same entity URI. Each hit surfaces `contextGraphId`, `layer`, and `trustWeight`. Use this for "ask my memory anything" recall. |
-| `dkg_query` | Execute SPARQL SELECT / ASK / CONSTRUCT against a context graph. Known prefixes are auto-prepended. Scope with `view`: `"working-memory"` (default), `"shared-working-memory"`, or `"verified-memory"`. Set `includeSharedMemory: true` alongside `view: "working-memory"` to query WM ∪ SWM in one call. |
+| `dkg_query` | Execute SPARQL SELECT / ASK / CONSTRUCT against a context graph. Known prefixes are auto-prepended. Scope with `view`: `"working-memory"` (default), `"shared-working-memory"`, or `"verifiable-memory"`. Set `includeSharedMemory: true` alongside `view: "working-memory"` to query WM ∪ SWM in one call. |
 
 ## The canonical round-trip
 
@@ -217,7 +217,7 @@ The `view` argument (on `dkg_query`) and the `layer` argument (on `dkg_get_entit
 
 - `working-memory` — private to this node's agents (default for most reads)
 - `shared-working-memory` — gossiped to every participant on the CG; trust-weighted above WM in `dkg_memory_search`
-- `verified-memory` — on-chain anchored; responses include UAL + publisher info; highest trust weight
+- `verifiable-memory` — on-chain anchored; responses include UAL + publisher info; highest trust weight
 
 A separate `includeSharedMemory: boolean` axis (on `dkg_query` and `dkg_subscribe`) layers SWM on top of the requested view; `view: "working-memory"` + `includeSharedMemory: true` matches what the Node UI's default reader shows.
 

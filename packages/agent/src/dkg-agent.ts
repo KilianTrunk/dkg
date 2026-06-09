@@ -7,7 +7,7 @@ import {
   contextGraphPublishTopic, contextGraphWorkspaceTopic, contextGraphAppTopic, contextGraphUpdateTopic, contextGraphFinalizationTopic,
   contextGraphDataGraphUri, contextGraphMetaGraphUri, contextGraphWorkspaceGraphUri, contextGraphWorkspaceMetaGraphUri,
   contextGraphSharedMemoryUri,
-  contextGraphVerifiedMemoryUri, contextGraphVerifiedMemoryMetaUri,
+  contextGraphVerifiableMemoryUri, contextGraphVerifiableMemoryMetaUri,
   contextGraphDataUri, contextGraphMetaUri, assertionLifecycleUri, contextGraphAssertionUri,
   deriveCuratorDidFromCgId,
   MemoryLayer,
@@ -371,6 +371,7 @@ import {
   deserializePendingSenderKeyEntry,
 } from './dkg-agent-swm-state.js';
 import { DKGAgentBase } from './dkg-agent-base.js';
+import { reconcileAndAllocateKaNumber } from './allocator.js';
 import { applyMixins } from './dkg-agent-apply-mixins.js';
 import { OwnershipMethods } from './dkg-agent-ownership.js';
 import { ContextGraphResolveMethods } from './dkg-agent-cg-resolve.js';
@@ -1665,8 +1666,27 @@ export class DKGAgent extends DKGAgentBase {
     const agent = this;
     const agentAddress = this.defaultAgentAddress ?? this.peerId;
     return {
-      async create(contextGraphId: string, name: string, opts?: { subGraphName?: string }): Promise<string> {
-        return agent.publisher.assertionCreate(contextGraphId, name, agentAddress, opts?.subGraphName);
+      async create(contextGraphId: string, name: string, opts?: { subGraphName?: string; agentAddress?: string }): Promise<string> {
+        // D1 (identity-at-create): mint the KA number/UAL at create so the UAL is the
+        // KA's identity from the first write. assertionCreate only allocates when the
+        // draft has no preserved kaId (the re-open guard lives there), so passing the
+        // callback is safe — re-opens reuse the preserved identity.
+        //
+        // Gate on a valid 0x EVM author: when no default agent is registered,
+        // `agentAddress` falls back to the libp2p peerId, which the allocator rejects
+        // (`ethers.getAddress` throws). A peerId-author draft falls back to the legacy
+        // name-keyed WM graph instead of hard-failing create. Mirrors the publisher's
+        // own self-allocation guard.
+        // Allow an explicit author (the daemon's import-file route acts for the request's
+        // agent) so the kaNumber mints for the RIGHT address and data lands in that agent's
+        // per-KA …/_working_memory/{addr}/{number} graph (not the default agent's, and not
+        // the legacy name-keyed fallback used when no number is minted).
+        const author = opts?.agentAddress ?? agentAddress;
+        const isEvmAuthor = /^0x[a-fA-F0-9]{40}$/.test(author);
+        const allocateKaNumber = agent.kaNumberAllocator && isEvmAuthor
+          ? () => reconcileAndAllocateKaNumber(agent.kaNumberAllocator!, agent.chain, agent.reconciledKaAuthors, author)
+          : undefined;
+        return agent.publisher.assertionCreate(contextGraphId, name, author, opts?.subGraphName, { allocateKaNumber });
       },
 
       /**
@@ -1963,32 +1983,66 @@ export class DKGAgent extends DKGAgentBase {
         const DKG_NS = 'http://dkg.io/ontology/';
         // number = kaId & ((1<<96)-1) — the per-author low-96-bit half.
         const number = kaId & ((1n << 96n) - 1n);
+        const expectedAuthor = '0x' + (kaId >> 96n).toString(16).padStart(40, '0');
         const strip = (v?: string) => v?.replace(/^"|"$/g, '').replace(/"\^\^<.*>$/, '') ?? undefined;
         // FILTER on the integer value so a typed literal ("N"^^xsd:integer)
         // matches regardless of the store's lexical canonicalisation.
+        const PROV_NS = 'http://www.w3.org/ns/prov#';
         const res = await agent.store.query(
-          `SELECT ?lifecycle ?name ?assertionGraph WHERE {
+          `SELECT ?lifecycle ?name ?author WHERE {
             GRAPH <${metaGraph}> {
               ?lifecycle <${DKG_NS}kaId> ?n .
               FILTER(?n = ${number})
               OPTIONAL { ?lifecycle <${DKG_NS}assertionName> ?name }
-              OPTIONAL { ?lifecycle <${DKG_NS}assertionGraph> ?assertionGraph }
+              OPTIONAL { ?lifecycle <${PROV_NS}wasAttributedTo> ?author }
             }
-          } LIMIT 1`,
+          }`,
         );
         if (res.type !== 'bindings' || res.bindings.length === 0) return null;
-        const b = res.bindings[0];
-        const resolvedName = strip(b['name']);
-        if (!resolvedName) return null;
-        // Derive the agent address from the assertion-graph URI, which has the
-        // clean shape did:dkg:context-graph:<cg>[/<sub>]/assertion/<agent>/<name>
-        // (robust to cg/name containing ':' unlike parsing the lifecycle URN).
-        const assertionGraph = b['assertionGraph'];
+
+        let resolvedName: string | undefined;
         let resolvedAgent: string | undefined;
-        if (typeof assertionGraph === 'string') {
-          const m = assertionGraph.match(/\/assertion\/([^/]+)\/[^/]+$/);
-          if (m) resolvedAgent = m[1];
+        for (const b of res.bindings) {
+          const candidateName = strip(b['name']);
+          if (!candidateName) continue;
+          // Recover the author in the EXACT case stored on the lifecycle URN so the
+          // history() rebuild (which re-derives urn:dkg:assertion:{cg}[:{sub}]:{author}:{name})
+          // matches. We do NOT parse dkg:assertionGraph for this: for any KA that
+          // has a kaId (the only kind resolveByKaId matches) the pointer is the
+          // layer-keyed form (…/_working_memory|_shared_…|_verifiable_memory/{author}/{number}),
+          // never the legacy /assertion/{agent}/{name} shape, and the VM re-stamp
+          // lowercases the address (derived from the packed kaId bits) — so a
+          // pointer parse would hand history() a case-mismatched author that fails
+          // to resolve published assets authored by anyone but the default agent.
+          // Slice the author out of the matched lifecycle URN instead, bounding the
+          // cut with the already-known cg / sub / name (robust to ':' in cg/name).
+          let candidateAgent: string | undefined;
+          const lifecycleUrn = b['lifecycle'];
+          if (typeof lifecycleUrn === 'string') {
+            const sub = opts?.subGraphName;
+            const prefix = `urn:dkg:assertion:${contextGraphId}:${sub ? `${sub}:` : ''}`;
+            const suffix = `:${candidateName}`;
+            if (lifecycleUrn.startsWith(prefix) && lifecycleUrn.endsWith(suffix)) {
+              const mid = lifecycleUrn.slice(prefix.length, lifecycleUrn.length - suffix.length);
+              if (mid && !mid.includes(':')) candidateAgent = mid;
+            }
+          }
+          // Fallback: the prov:wasAttributedTo author DID (did:dkg:agent:<author>)
+          // for any record whose URN bounds we couldn't pin down.
+          if (!candidateAgent) {
+            const author = b['author'];
+            if (typeof author === 'string') {
+              const am = author.match(/^did:dkg:agent:(.+)$/);
+              if (am) candidateAgent = am[1];
+            }
+          }
+          if (candidateAgent?.toLowerCase() === expectedAuthor.toLowerCase()) {
+            resolvedName = candidateName;
+            resolvedAgent = candidateAgent;
+            break;
+          }
         }
+        if (!resolvedName || !resolvedAgent) return null;
         return this.history(contextGraphId, resolvedName, {
           subGraphName: opts?.subGraphName,
           ...(resolvedAgent ? { agentAddress: resolvedAgent } : {}),

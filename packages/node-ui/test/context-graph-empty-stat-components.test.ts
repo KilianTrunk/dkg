@@ -31,7 +31,7 @@ const {
 const {
   AssertionsList,
   LayerGraphPanel,
-  VerifiedMemoryHeroBanner,
+  VerifiableMemoryHeroBanner,
 } = await import('../src/ui/views/project/components.js');
 
 const {
@@ -475,7 +475,7 @@ describe('Context Graph shared empty/stat patterns', () => {
           contextGraphId: 'cg-test',
         }),
         React.createElement('div', { className: 'v10-layer-expand-body entities-tab' },
-          React.createElement(VerifiedMemoryHeroBanner, {
+          React.createElement(VerifiableMemoryHeroBanner, {
             entities: [],
             tripleCount: 0,
             contextGraphId: 'cg-test',

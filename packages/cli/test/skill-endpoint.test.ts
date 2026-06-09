@@ -83,7 +83,7 @@ describe('SKILL.md file', () => {
   it('documents the three memory layers', () => {
     expect(skillContent).toContain('Working Memory (WM)');
     expect(skillContent).toContain('Shared Working Memory (SWM)');
-    expect(skillContent).toContain('Verified Memory (VM)');
+    expect(skillContent).toContain('Verifiable Memory (VM)');
   });
 
   it('includes key available API endpoints', () => {
@@ -103,14 +103,14 @@ describe('SKILL.md file', () => {
     expect(skillContent).toContain('*(planned)*');
   });
 
-  it('documents the now-shipped assertion API surface', () => {
-    expect(skillContent).toContain('/api/assertion/create');
-    expect(skillContent).toContain('/api/assertion/{name}/write');
-    expect(skillContent).toContain('/api/assertion/{name}/query');
-    expect(skillContent).toContain('/api/assertion/{name}/promote');
-    expect(skillContent).toContain('/api/assertion/{name}/discard');
-    expect(skillContent).toContain('/api/assertion/{name}/import-file');
-    expect(skillContent).toContain('/api/assertion/{name}/extraction-status');
+  it('documents the now-shipped knowledge-asset API surface', () => {
+    expect(skillContent).toContain('/api/knowledge-assets');
+    expect(skillContent).toContain('/api/knowledge-assets/{name}/wm/write');
+    expect(skillContent).toContain('/api/knowledge-assets/{name}/wm/quads');
+    expect(skillContent).toContain('/api/knowledge-assets/{name}/swm/share');
+    expect(skillContent).toContain('/api/knowledge-assets/{name}/wm/discard');
+    expect(skillContent).toContain('/api/knowledge-assets/{name}/wm/import-file');
+    expect(skillContent).toContain('/api/knowledge-assets/{name}/wm/extraction-status');
   });
 
   it('documents imported attachment semantic enrichment as same-assertion append', () => {

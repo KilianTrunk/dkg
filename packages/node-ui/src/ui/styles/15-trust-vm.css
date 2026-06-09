@@ -152,7 +152,7 @@
   background: rgba(255,255,255,0.06);
 }
 
-/* ── Verified Memory Hero Banner ── */
+/* ── Verifiable Memory Hero Banner ── */
 .v10-vm-hero {
   --v10-vm-accent: #86efac;
   --v10-vm-accent-strong: var(--layer-verified);
@@ -325,7 +325,7 @@ body.light .v10-vm-hero {
 }
 
 /* ── VM graph legend (floating overlay) ──
-   Pinned to the top-right of the Verified Memory graph, this panel is the
+   Pinned to the top-right of the Verifiable Memory graph, this panel is the
    in-graph key for the two synthetic node glyphs (anchor ◉, agent identity
    ◈) we inject to make provenance legible. It's also a lightweight ledger:
    it reports the total anchor count, distinct signers, and latest publish

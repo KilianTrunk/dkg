@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createServer, type Server } from 'node:http';
-import { handleAssertionRoutes } from '../src/daemon/routes/assertion.js';
+import { handleKnowledgeAssetsRoutes } from '../src/daemon/routes/knowledge-assets.js';
 import { handleContextGraphRoutes } from '../src/daemon/routes/context-graph.js';
 import { handleMemoryRoutes } from '../src/daemon/routes/memory.js';
 import { daemonState } from '../src/daemon/state.js';
@@ -41,6 +41,9 @@ describe('context graph write-path validation', () => {
     const create = vi.fn(async (contextGraphId: string, name: string) =>
       `did:dkg:context-graph:${contextGraphId}/assertion/${CALLER}/${name}`);
     const write = vi.fn(async () => undefined);
+    // wm/write gates create() on a missing-only existence check; null = the
+    // 'draft' KA these tests write to doesn't exist yet, so create() fires.
+    const history = vi.fn(async () => null);
     const promote = vi.fn(async () => ({ promotedCount: 1 }));
     const promoteAsync = vi.fn(async () => ({ jobId: 'job-1' }));
     const discard = vi.fn(async () => undefined);
@@ -86,6 +89,7 @@ describe('context graph write-path validation', () => {
       assertion: {
         create,
         write,
+        history,
         promote,
         promoteAsync,
         discard,
@@ -120,6 +124,7 @@ describe('context graph write-path validation', () => {
       calls: {
         create,
         write,
+        history,
         promote,
         promoteAsync,
         discard,
@@ -193,7 +198,7 @@ describe('context graph write-path validation', () => {
       } as any;
 
       try {
-        await handleAssertionRoutes(ctx);
+        await handleKnowledgeAssetsRoutes(ctx);
         if (!res.writableEnded) await handleMemoryRoutes(ctx);
         if (!res.writableEnded) await handleContextGraphRoutes(ctx);
         if (!res.writableEnded) {
@@ -232,13 +237,13 @@ describe('context graph write-path validation', () => {
     const agent = makeAgent();
     await startRoutes(agent);
 
-    const result = await post('/api/assertion/create', {
+    const result = await post('/api/knowledge-assets', {
       contextGraphId: CANONICAL_CG,
       name: 'draft',
     });
 
-    expect(result.status).toBe(200);
-    expect(agent.calls.create).toHaveBeenCalledWith(CANONICAL_CG, 'draft', undefined);
+    expect(result.status).toBe(201);
+    expect(agent.calls.create).toHaveBeenCalledWith(CANONICAL_CG, 'draft', { subGraphName: undefined });
   });
 
   it('sub-graph list opts into same-CG partition counts', async () => {
@@ -285,7 +290,7 @@ describe('context graph write-path validation', () => {
     const agent = makeAgent();
     await startRoutes(agent);
 
-    const result = await post('/api/assertion/draft/write', {
+    const result = await post('/api/knowledge-assets/draft/wm/write', {
       contextGraphId: CANONICAL_URI,
       quads: [{ subject: 'urn:s', predicate: 'urn:p', object: 'urn:o' }],
     });
@@ -295,7 +300,7 @@ describe('context graph write-path validation', () => {
       CANONICAL_CG,
       'draft',
       [{ subject: 'urn:s', predicate: 'urn:p', object: 'urn:o' }],
-      undefined,
+      { subGraphName: undefined },
     );
   });
 
@@ -313,7 +318,7 @@ describe('context graph write-path validation', () => {
     ]);
     await startRoutes(agent);
 
-    const result = await post('/api/assertion/draft/write', {
+    const result = await post('/api/knowledge-assets/draft/wm/write', {
       contextGraphId: BARE_URI,
       quads: [{ subject: 'urn:s', predicate: 'urn:p', object: 'urn:o' }],
     });
@@ -323,7 +328,7 @@ describe('context graph write-path validation', () => {
       BARE_CG,
       'draft',
       [{ subject: 'urn:s', predicate: 'urn:p', object: 'urn:o' }],
-      undefined,
+      { subGraphName: undefined },
     );
   });
 
@@ -334,7 +339,7 @@ describe('context graph write-path validation', () => {
     ]);
     await startRoutes(agent);
 
-    const result = await post('/api/assertion/draft/write', {
+    const result = await post('/api/knowledge-assets/draft/wm/write', {
       contextGraphId: BARE_URI,
       quads: [{ subject: 'urn:s', predicate: 'urn:p', object: 'urn:o' }],
     });
@@ -361,22 +366,22 @@ describe('context graph write-path validation', () => {
     ]);
     await startRoutes(agent);
 
-    const result = await post('/api/assertion/create', {
+    const result = await post('/api/knowledge-assets', {
       contextGraphId: BARE_CG,
       name: 'draft',
     });
 
-    expect(result.status).toBe(200);
-    expect(agent.calls.create).toHaveBeenCalledWith(BARE_CG, 'draft', undefined);
+    expect(result.status).toBe(201);
+    expect(agent.calls.create).toHaveBeenCalledWith(BARE_CG, 'draft', { subGraphName: undefined });
   });
 
   it('normalizes full context graph DIDs on assertion read helpers', async () => {
     const agent = makeAgent();
     await startRoutes(agent);
 
-    const result = await post('/api/assertion/draft/query', {
-      contextGraphId: CANONICAL_URI,
-    });
+    const result = await get(
+      `/api/knowledge-assets/draft/wm/quads?contextGraphId=${encodeURIComponent(CANONICAL_URI)}`,
+    );
 
     expect(result.status).toBe(200);
     expect(agent.calls.query).toHaveBeenCalledWith(CANONICAL_CG, 'draft', undefined);
@@ -389,7 +394,7 @@ describe('context graph write-path validation', () => {
     ]);
     await startRoutes(agent);
 
-    const result = await post('/api/assertion/create', {
+    const result = await post('/api/knowledge-assets', {
       contextGraphId: 'tuesday-cg',
       name: 'draft',
     });
@@ -415,7 +420,7 @@ describe('context graph write-path validation', () => {
     ]);
     await startRoutes(agent);
 
-    const result = await post('/api/assertion/create', {
+    const result = await post('/api/knowledge-assets', {
       contextGraphId: 'definition-only-cg',
       name: 'draft',
     });
@@ -439,15 +444,15 @@ describe('context graph write-path validation', () => {
     ]);
     await startRoutes(agent);
 
-    const result = await post('/api/assertion/create', {
+    const result = await post('/api/knowledge-assets', {
       contextGraphId: 'fresh-local-cg',
       name: 'draft',
     });
 
-    expect(result.status).toBe(200);
+    expect(result.status).toBe(201);
     expect(agent.contextGraphHasLocalContent).toHaveBeenCalledWith('fresh-local-cg');
     expect(agent.contextGraphExists).toHaveBeenCalledWith('fresh-local-cg');
-    expect(agent.calls.create).toHaveBeenCalledWith('fresh-local-cg', 'draft', undefined);
+    expect(agent.calls.create).toHaveBeenCalledWith('fresh-local-cg', 'draft', { subGraphName: undefined });
   });
 
   it('accepts exact visible context graphs with local content even when not subscribed', async () => {
@@ -464,13 +469,13 @@ describe('context graph write-path validation', () => {
     ]);
     await startRoutes(agent);
 
-    const result = await post('/api/assertion/create', {
+    const result = await post('/api/knowledge-assets', {
       contextGraphId: 'local-content-cg',
       name: 'draft',
     });
 
-    expect(result.status).toBe(200);
-    expect(agent.calls.create).toHaveBeenCalledWith('local-content-cg', 'draft', undefined);
+    expect(result.status).toBe(201);
+    expect(agent.calls.create).toHaveBeenCalledWith('local-content-cg', 'draft', { subGraphName: undefined });
   });
 
   it('does not pass legacy peer ids as callerAgentAddress when listing write targets', async () => {
@@ -483,14 +488,14 @@ describe('context graph write-path validation', () => {
     }]);
     await startRoutes(agent, '12D3KooWLegacyPeer');
 
-    const result = await post('/api/assertion/create', {
+    const result = await post('/api/knowledge-assets', {
       contextGraphId: 'legacy-cg',
       name: 'draft',
     });
 
-    expect(result.status).toBe(200);
+    expect(result.status).toBe(201);
     expect(agent.listContextGraphs).toHaveBeenCalledWith();
-    expect(agent.calls.create).toHaveBeenCalledWith('legacy-cg', 'draft', undefined);
+    expect(agent.calls.create).toHaveBeenCalledWith('legacy-cg', 'draft', { subGraphName: undefined });
   });
 
   it('does not fall back to the default agent when listing write targets without an explicit caller', async () => {
@@ -504,15 +509,15 @@ describe('context graph write-path validation', () => {
     agent.getDefaultAgentAddress.mockReturnValue(CALLER);
     await startRoutes(agent, CALLER);
 
-    const result = await post('/api/assertion/create', {
+    const result = await post('/api/knowledge-assets', {
       contextGraphId: 'admin-cg',
       name: 'draft',
     });
 
-    expect(result.status).toBe(200);
+    expect(result.status).toBe(201);
     expect(agent.getDefaultAgentAddress).not.toHaveBeenCalled();
     expect(agent.listContextGraphs).toHaveBeenCalledWith();
-    expect(agent.calls.create).toHaveBeenCalledWith('admin-cg', 'draft', undefined);
+    expect(agent.calls.create).toHaveBeenCalledWith('admin-cg', 'draft', { subGraphName: undefined });
   });
 
   it('does not scope write-target listing for node-level tokens that resolve to no agent', async () => {
@@ -526,15 +531,15 @@ describe('context graph write-path validation', () => {
     agent.resolveAgentByToken.mockReturnValue(undefined);
     await startRoutes(agent, CALLER, 'node-token');
 
-    const result = await post('/api/assertion/create', {
+    const result = await post('/api/knowledge-assets', {
       contextGraphId: 'node-token-cg',
       name: 'draft',
     });
 
-    expect(result.status).toBe(200);
+    expect(result.status).toBe(201);
     expect(agent.resolveAgentByToken).toHaveBeenCalledWith('node-token');
     expect(agent.listContextGraphs).toHaveBeenCalledWith();
-    expect(agent.calls.create).toHaveBeenCalledWith('node-token-cg', 'draft', undefined);
+    expect(agent.calls.create).toHaveBeenCalledWith('node-token-cg', 'draft', { subGraphName: undefined });
   });
 
   it('scopes write-target listing when an explicit agent token resolves to an EVM address', async () => {
@@ -548,15 +553,15 @@ describe('context graph write-path validation', () => {
     agent.resolveAgentByToken.mockReturnValue(CALLER);
     await startRoutes(agent, CALLER, 'agent-token');
 
-    const result = await post('/api/assertion/create', {
+    const result = await post('/api/knowledge-assets', {
       contextGraphId: 'agent-scoped-cg',
       name: 'draft',
     });
 
-    expect(result.status).toBe(200);
+    expect(result.status).toBe(201);
     expect(agent.resolveAgentByToken).toHaveBeenCalledWith('agent-token');
     expect(agent.listContextGraphs).toHaveBeenCalledWith({ callerAgentAddress: CALLER });
-    expect(agent.calls.create).toHaveBeenCalledWith('agent-scoped-cg', 'draft', undefined);
+    expect(agent.calls.create).toHaveBeenCalledWith('agent-scoped-cg', 'draft', { subGraphName: undefined });
   });
 
   it('accepts an exact bare context graph with local content when a curated suffix also exists', async () => {
@@ -573,21 +578,21 @@ describe('context graph write-path validation', () => {
     ]);
     await startRoutes(agent);
 
-    const result = await post('/api/assertion/create', {
+    const result = await post('/api/knowledge-assets', {
       contextGraphId: BARE_CG,
       name: 'draft',
     });
 
-    expect(result.status).toBe(200);
+    expect(result.status).toBe(201);
     expect(agent.contextGraphHasLocalContent).toHaveBeenCalledWith(BARE_CG);
-    expect(agent.calls.create).toHaveBeenCalledWith(BARE_CG, 'draft', undefined);
+    expect(agent.calls.create).toHaveBeenCalledWith(BARE_CG, 'draft', { subGraphName: undefined });
   });
 
   it('rejects unknown assertion write targets before mutation', async () => {
     const agent = makeAgent();
     await startRoutes(agent);
 
-    const result = await post('/api/assertion/draft/write', {
+    const result = await post('/api/knowledge-assets/draft/wm/write', {
       contextGraphId: 'missing-cg',
       quads: [{ subject: 'urn:s', predicate: 'urn:p', object: 'urn:o' }],
     });
@@ -602,16 +607,16 @@ describe('context graph write-path validation', () => {
     agent.contextGraphExists.mockResolvedValueOnce(true);
     await startRoutes(agent, CALLER, 'node-token');
 
-    const result = await post('/api/assertion/create', {
+    const result = await post('/api/knowledge-assets', {
       contextGraphId: 'private-local-cg',
       name: 'draft',
     });
 
-    expect(result.status).toBe(200);
+    expect(result.status).toBe(201);
     expect(agent.resolveAgentByToken).toHaveBeenCalledWith('node-token');
     expect(agent.listContextGraphs).toHaveBeenCalledWith();
     expect(agent.contextGraphExists).toHaveBeenCalledWith('private-local-cg');
-    expect(agent.calls.create).toHaveBeenCalledWith('private-local-cg', 'draft', undefined);
+    expect(agent.calls.create).toHaveBeenCalledWith('private-local-cg', 'draft', { subGraphName: undefined });
   });
 
   it('does not accept context graphs hidden from an explicit caller-visible list through an existence fallback', async () => {

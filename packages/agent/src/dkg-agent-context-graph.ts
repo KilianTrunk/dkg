@@ -16,7 +16,7 @@ import {
   contextGraphPublishTopic, contextGraphWorkspaceTopic, contextGraphAppTopic, contextGraphUpdateTopic, contextGraphFinalizationTopic,
   contextGraphDataGraphUri, contextGraphMetaGraphUri, contextGraphWorkspaceGraphUri, contextGraphWorkspaceMetaGraphUri,
   contextGraphSharedMemoryUri,
-  contextGraphVerifiedMemoryUri, contextGraphVerifiedMemoryMetaUri,
+  contextGraphVerifiableMemoryUri, contextGraphVerifiableMemoryMetaUri,
   contextGraphDataUri, contextGraphMetaUri, assertionLifecycleUri, contextGraphAssertionUri,
   deriveCuratorDidFromCgId,
   MemoryLayer,
@@ -733,7 +733,7 @@ export class ContextGraphMethods extends DKGAgentBase {
     // the moment its definition triples land in the store; it can be
     // shared with peers over gossip (SWM writes/reads work across the
     // subscriber set), joined, sub-graphed, and queried without ever
-    // touching chain state. Verified Memory is the value-add layer that
+    // touching chain state. Verifiable Memory is the value-add layer that
     // requires chain registration, and earlier revisions silently minted
     // a `ContextGraphs.createContextGraph` tx from inside this method
     // whenever the adapter supported it. That broke the "free CG"
@@ -823,7 +823,7 @@ export class ContextGraphMethods extends DKGAgentBase {
 
   /**
    * Register an existing context graph on-chain. This is the explicit upgrade
-   * step that unlocks Verified Memory, chain-based discovery, and economic
+   * step that unlocks Verifiable Memory, chain-based discovery, and economic
    * participation. Requires a funded wallet with TRAC.
    */
   async registerContextGraph(this: DKGAgent, id: string, opts?: {

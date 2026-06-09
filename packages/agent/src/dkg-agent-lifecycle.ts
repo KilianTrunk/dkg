@@ -17,7 +17,7 @@ import {
   contextGraphPublishTopic, contextGraphWorkspaceTopic, contextGraphAppTopic, contextGraphUpdateTopic, contextGraphFinalizationTopic,
   contextGraphDataGraphUri, contextGraphMetaGraphUri, contextGraphWorkspaceGraphUri, contextGraphWorkspaceMetaGraphUri,
   contextGraphSharedMemoryUri,
-  contextGraphVerifiedMemoryUri, contextGraphVerifiedMemoryMetaUri,
+  contextGraphVerifiableMemoryUri, contextGraphVerifiableMemoryMetaUri,
   contextGraphDataUri, contextGraphMetaUri, assertionLifecycleUri, contextGraphAssertionUri,
   deriveCuratorDidFromCgId,
   MemoryLayer,
@@ -3799,13 +3799,17 @@ export class LifecycleSyncMethods extends DKGAgentBase {
             }
           }
 
+          // Uniform layout: span the per-KA …/_shared_memory/{addr}/{number} graphs + bucket.
+          const wsGraphs = (await this.store.listGraphs()).filter(g => g === wsGraph || g.startsWith(`${wsGraph}/`));
           for (const re of rootEntities) {
-            // Exact root only; then skolemized descendants only (prefix would over-delete e.g. urn:foo vs urn:foobar)
-            const exactDeleted = await this.store.deleteByPattern({ graph: wsGraph, subject: re });
-            graphDeleted += exactDeleted;
-            const childPrefix = `${re}/.well-known/genid/`;
-            const childDeleted = await this.store.deleteBySubjectPrefix(wsGraph, childPrefix);
-            graphDeleted += childDeleted;
+            for (const g of wsGraphs) {
+              // Exact root only; then skolemized descendants only (prefix would over-delete e.g. urn:foo vs urn:foobar)
+              const exactDeleted = await this.store.deleteByPattern({ graph: g, subject: re });
+              graphDeleted += exactDeleted;
+              const childPrefix = `${re}/.well-known/genid/`;
+              const childDeleted = await this.store.deleteBySubjectPrefix(g, childPrefix);
+              graphDeleted += childDeleted;
+            }
           }
 
           // Exact subject delete for this operation's metadata (prefix would match opUri that are prefixes of others, e.g. ...:ws-123 vs ...:ws-1234)

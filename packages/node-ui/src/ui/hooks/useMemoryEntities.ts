@@ -203,7 +203,7 @@ function deriveEntityLabel(entity: MemoryEntity): string {
 //                     did:dkg:context-graph:<cg>/_shared_memory     (default)
 //   VM  (committed) : did:dkg:context-graph:<cg>/<sg>              (per-sg)
 //                     did:dkg:context-graph:<cg>                   (root)
-//                     did:dkg:context-graph:<cg>/_verified_memory/*
+//                     did:dkg:context-graph:<cg>/_verifiable_memory/*
 //
 // Key insight: in V10 the plain `<cg>/<sg>` graph IS the committed
 // (chain-attested) view of a sub-graph — that's where
@@ -240,7 +240,7 @@ function wmSparql(cgId: string) {
     GRAPH ?g { ?s ?p ?o }
     FILTER(
       STRSTARTS(STR(?g), "${cgUri}/") &&
-      CONTAINS(STR(?g), "/assertion/") &&
+      (CONTAINS(STR(?g), "/assertion/") || CONTAINS(STR(?g), "/_working_memory/")) &&
       STR(?g) != "${cgUri}/meta" &&
       !CONTAINS(STR(?g), "/meta/") &&
       !STRENDS(STR(?g), "/_meta")
@@ -265,9 +265,10 @@ function swmSparql(cgId: string) {
     GRAPH ?g { ?s ?p ?o }
     FILTER(
       STRSTARTS(STR(?g), "${cgUri}") &&
-      STRENDS(STR(?g), "/_shared_memory") &&
+      (STRENDS(STR(?g), "/_shared_memory") || CONTAINS(STR(?g), "/_shared_memory/")) &&
       STR(?g) != "${cgUri}/meta/_shared_memory" &&
       !CONTAINS(STR(?g), "/meta/") &&
+      !CONTAINS(STR(?g), "/_shared_memory/staging/") &&
       ?p != <http://dkg.io/ontology/workspaceOwner>
     )
   } LIMIT ${SWM_LIMIT}`;
@@ -278,19 +279,20 @@ function vmSparql(cgId: string) {
   // VM covers three named-graph shapes:
   //   • Root content graph       `<cgUri>`        — finalised VM
   //   • Per-sub-graph data graph `<cgUri>/<sg>`   — post-publish VM view
-  //   • Per-sub-graph VM bucket  `<cgUri>/<sg>/_verified_memory(/*)`
+  //   • Per-sub-graph VM bucket  `<cgUri>/<sg>/_verifiable_memory(/*)`
   // We exclude:
   //   • `_shared_memory*`        — belongs to SWM
   //   • `assertion/*`            — belongs to WM
-  //   • `_meta`, `/meta`, `/meta/*`, `_private`, `_rules`, any `_verified_memory_meta`
+  //   • `_meta`, `/meta`, `/meta/*`, `_private`, `_rules`, any `_verifiable_memory_meta`
   //     — bookkeeping graphs, not user data.
   return `SELECT ?s ?p ?o ?g WHERE {
     GRAPH ?g { ?s ?p ?o }
     FILTER(
       STRSTARTS(STR(?g), "${cgUri}") &&
       !CONTAINS(STR(?g), "/assertion/") &&
+      !CONTAINS(STR(?g), "/_working_memory") &&
       !CONTAINS(STR(?g), "/_shared_memory") &&
-      !CONTAINS(STR(?g), "_verified_memory_meta") &&
+      !CONTAINS(STR(?g), "_verifiable_memory_meta") &&
       !STRENDS(STR(?g), "/_meta") &&
       STR(?g) != "${cgUri}/meta" &&
       !CONTAINS(STR(?g), "/meta/") &&

@@ -1,4 +1,4 @@
-import React, { useMemo, useState, useCallback } from 'react';
+import React, { useMemo, useState, useCallback, useEffect } from 'react';
 import type { ReactNode } from 'react';
 import { listAssertions, promoteAssertion, describePromoteError, ensureContextGraphOnChain, knowledgeAssetFinalize, knowledgeAssetPublish } from '../../../api.js';
 import type { MemoryEntity } from '../../../hooks/useMemoryEntities.js';
@@ -100,17 +100,26 @@ export function LayerStatsWidget({ entities, entityCount, triples, layer }: {
 }
 
 
-export function LayerActionsWidget({ layer, count, contextGraphId, onComplete }: {
+export function LayerActionsWidget({ layer, count, contextGraphId, onComplete, onResult }: {
   layer: 'wm' | 'swm';
   count: number;
   contextGraphId: string;
   entities: MemoryEntity[];
   onComplete: () => void;
+  /** Lift the latest outcome to the parent strip so it survives this widget
+   * unmounting when the promoted/published layer empties (entityCount → 0). */
+  onResult?: (r: { ok: boolean; text: string } | null) => void;
 }) {
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const isWm = layer === 'wm';
+  // Mirror the outcome up to the strip; it persists past this widget's unmount.
+  useEffect(() => {
+    if (result) onResult?.({ ok: true, text: result });
+    else if (error) onResult?.({ ok: false, text: error });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [result, error]);
 
   const handleAction = useCallback(async () => {
     setBusy(true);
@@ -231,9 +240,22 @@ export function LayerWidgetStrip({ layer, entities, entityCount, tripleCount, co
   contextGraphId?: string;
   onComplete?: () => void;
 }) {
+  // Latest promote/publish outcome, lifted from LayerActionsWidget so the "✓ Promoted
+  // N triples" feedback survives that widget unmounting the instant the acted-on layer
+  // empties (entityCount → 0) and the strip swaps to the empty state.
+  const [lastAction, setLastAction] = useState<{ ok: boolean; text: string } | null>(null);
+  const actionResult = lastAction && (
+    <div
+      data-testid="layer-action-result"
+      style={{ fontSize: 11, color: lastAction.ok ? 'var(--text-success)' : 'var(--text-danger)', marginBottom: 8 }}
+    >
+      {lastAction.ok ? '✓' : '✕'} {lastAction.text}
+    </div>
+  );
   if (entityCount === 0) {
     return (
       <div className="v10-layer-widgets-strip empty">
+        {actionResult}
         <EmptyState
           compact
           tone={toneForLayer(layer)}
@@ -258,7 +280,7 @@ export function LayerWidgetStrip({ layer, entities, entityCount, tripleCount, co
       </div>
       {(layer === 'wm' || layer === 'swm') && (
         <div className="v10-layer-widgets-strip-action">
-          <LayerActionsWidget layer={layer} count={entityCount} entities={entities} contextGraphId={contextGraphId} onComplete={onComplete} />
+          <LayerActionsWidget layer={layer} count={entityCount} entities={entities} contextGraphId={contextGraphId} onComplete={onComplete} onResult={setLastAction} />
         </div>
       )}
     </div>

@@ -1104,14 +1104,14 @@ describe('CLI-8 — CONSTRUCT/SELECT access control', () => {
 // ---------------------------------------------------------------------------
 
 describe('CLI-9 — /api/verify & /api/ccl error-code mapping', () => {
-  it('/api/verify on a non-existent verifiedMemoryId returns 4xx (ideally 404), NOT 500 (PROD-BUG)', async () => {
+  it('/api/verify on a non-existent verifiableMemoryId returns 4xx (ideally 404), NOT 500 (PROD-BUG)', async () => {
     const d = daemon!;
     const res = await fetch(urlFor(d, '/api/verify'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...authHeaders(d) },
       body: JSON.stringify({
         contextGraphId: 'does-not-exist-cg',
-        verifiedMemoryId: 'does-not-exist-vm',
+        verifiableMemoryId: 'does-not-exist-vm',
         batchId: '9999999999',
       }),
     });
@@ -1150,7 +1150,7 @@ describe('CLI-9 — /api/verify & /api/ccl error-code mapping', () => {
       headers: { 'Content-Type': 'application/json', ...authHeaders(d) },
       body: JSON.stringify({
         contextGraphId: 'x',
-        verifiedMemoryId: 'y',
+        verifiableMemoryId: 'y',
         batchId: 'not-an-int',
       }),
     });
@@ -1353,7 +1353,7 @@ describe('A-1 — /api/query enforces working-memory isolation across agent toke
       // defaultAgentAddress, so this lands in default ("A")'s WM
       // namespace.
       const assertionName = 'a1-probe-' + Math.random().toString(36).slice(2, 8);
-      const createAssertionRes = await fetch(urlFor(d, '/api/assertion/create'), {
+      const createAssertionRes = await fetch(urlFor(d, '/api/knowledge-assets'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...authHeaders(d) },
         body: JSON.stringify({ contextGraphId: cgId, name: assertionName }),
@@ -1362,7 +1362,7 @@ describe('A-1 — /api/query enforces working-memory isolation across agent toke
 
       const seedSubject = 'urn:a1-seed:probe-' + Math.random().toString(36).slice(2, 8);
       const writeRes = await fetch(
-        urlFor(d, `/api/assertion/${encodeURIComponent(assertionName)}/write`),
+        urlFor(d, `/api/knowledge-assets/${encodeURIComponent(assertionName)}/wm/write`),
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', ...authHeaders(d) },
@@ -1518,7 +1518,7 @@ describe('A-1 — /api/query enforces working-memory isolation across agent toke
       // Seed one WM triple under the default agent so an unrestricted
       // query would return bindings if access control didn't apply.
       const assertionName = 'a1-denyshape-' + Math.random().toString(36).slice(2, 8);
-      const createAssertionRes = await fetch(urlFor(d, '/api/assertion/create'), {
+      const createAssertionRes = await fetch(urlFor(d, '/api/knowledge-assets'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...authHeaders(d) },
         body: JSON.stringify({ contextGraphId: cgId, name: assertionName }),
@@ -1526,7 +1526,7 @@ describe('A-1 — /api/query enforces working-memory isolation across agent toke
       expect([200, 201]).toContain(createAssertionRes.status);
       const seedSubject = 'urn:a1-denyshape:seed-' + Math.random().toString(36).slice(2, 8);
       const writeRes = await fetch(
-        urlFor(d, `/api/assertion/${encodeURIComponent(assertionName)}/write`),
+        urlFor(d, `/api/knowledge-assets/${encodeURIComponent(assertionName)}/wm/write`),
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', ...authHeaders(d) },

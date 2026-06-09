@@ -74,6 +74,12 @@ function toContextGraphUri(contextGraphIdOrUri: string): string {
  */
 export interface PreSignedAuthorAttestationPayload {
   address: string;
+  /**
+   * OT-RFC-43 §F2 — the packed reservedKaId the author signed the
+   * AuthorAttestation over, as a decimal string (uint256-safe over JSON).
+   * Required: the daemon binds it into the digest and honours the reserved slot.
+   */
+  reservedKaId: string;
   signature: { r: string; vs: string };
 }
 
@@ -362,15 +368,15 @@ export class DkgClient {
    *   view=undefined, graphSuffix=undefined  — WM (default, private)
    *   graphSuffix="_shared_memory"           — SWM
    *   graphSuffix="_shared_memory_meta"      — SWM metadata (UAL, owner, publisher)
-   *   view="verified-memory"                 — VM (on-chain verified)
+   *   view="verifiable-memory"                 — VM (on-chain verified)
    *   includeSharedMemory=true               — WM ∪ SWM (UI default)
    *
    * `verifiedGraph` is a STRING naming a specific verified graph inside
-   * VM; it narrows a `view: "verified-memory"` query to one graph. It is
+   * VM; it narrows a `view: "verifiable-memory"` query to one graph. It is
    * NOT a boolean toggle — passing `verifiedGraph: true` silently failed
    * to route to VM because the query engine expects a graph name, not a
    * flag. Clients that want "give me VM" should pass `view:
-   * "verified-memory"` (and optionally `verifiedGraph: "<graphName>"`).
+   * "verifiable-memory"` (and optionally `verifiedGraph: "<graphName>"`).
    */
   async query(args: {
     sparql: string;
@@ -378,7 +384,7 @@ export class DkgClient {
     subGraphName?: string;
     graphSuffix?: '_shared_memory' | '_shared_memory_meta';
     includeSharedMemory?: boolean;
-    view?: 'working-memory' | 'shared-working-memory' | 'verified-memory';
+    view?: 'working-memory' | 'shared-working-memory' | 'verifiable-memory';
     verifiedGraph?: string;
     assertionName?: string;
     /**
@@ -391,7 +397,7 @@ export class DkgClient {
     agentAddress?: string;
     /**
      * P-13: minimum trust level to admit into results. Only meaningful for
-     * `view: "verified-memory"`; silently ignored on WM/SWM views.
+     * `view: "verifiable-memory"`; silently ignored on WM/SWM views.
      *
      * The daemon currently implements only `SelfAttested` (0) and
      * `Endorsed` (1) — the higher tiers are tracked by Q-1 (per-graph
@@ -610,7 +616,7 @@ export class DkgClient {
     if (args.subGraphName) body.subGraphName = args.subGraphName;
     await this.request(
       'POST',
-      `/api/assertion/${encodeURIComponent(args.assertionName)}/write`,
+      `/api/knowledge-assets/${encodeURIComponent(args.assertionName)}/wm/write`,
       body,
     );
   }
@@ -636,7 +642,7 @@ export class DkgClient {
     if (args.subGraphName) body.subGraphName = args.subGraphName;
     await this.request(
       'POST',
-      `/api/assertion/${encodeURIComponent(args.assertionName)}/discard`,
+      `/api/knowledge-assets/${encodeURIComponent(args.assertionName)}/wm/discard`,
       body,
     );
   }
@@ -655,7 +661,7 @@ export class DkgClient {
     if (args.subGraphName) body.subGraphName = args.subGraphName;
     await this.request(
       'POST',
-      `/api/assertion/${encodeURIComponent(args.assertionName)}/promote`,
+      `/api/knowledge-assets/${encodeURIComponent(args.assertionName)}/swm/share`,
       body,
     );
   }
@@ -677,12 +683,23 @@ export class DkgClient {
     };
     if (args.subGraphName) body.subGraphName = args.subGraphName;
     try {
-      const response = await this.request<{ assertionUri: string }>(
+      // KA create (`POST /api/knowledge-assets`) is a get-or-create that
+      // reports `alreadyExists` in the response body, alongside the
+      // back-compat `assertionUri`. Prefer the typed flag; keep the
+      // legacy error-string fallback in case an older daemon 4xx's on a
+      // duplicate name instead.
+      const response = await this.request<{
+        assertionUri?: string;
+        alreadyExists?: boolean;
+      }>(
         'POST',
-        '/api/assertion/create',
+        '/api/knowledge-assets',
         body,
       );
-      return { assertionUri: response.assertionUri, alreadyExists: false };
+      return {
+        assertionUri: response.assertionUri ?? null,
+        alreadyExists: response.alreadyExists === true,
+      };
     } catch (err) {
       if (err instanceof DkgHttpError && /already exists/.test(String(err.message))) {
         return { assertionUri: null, alreadyExists: true };
@@ -701,14 +718,17 @@ export class DkgClient {
     assertionName: string;
     subGraphName?: string;
   }): Promise<{ quads: unknown[]; count: number }> {
-    const body: Record<string, unknown> = {
+    // KA dump moved from POST-with-body to GET-with-querystring
+    // (`GET /api/knowledge-assets/:name/wm/quads`). The `{contextGraphId,
+    // subGraphName?}` body becomes query params; response `{quads,count}`
+    // is unchanged.
+    const params = new URLSearchParams({
       contextGraphId: normalizeContextGraphId(args.contextGraphId),
-    };
-    if (args.subGraphName) body.subGraphName = args.subGraphName;
+    });
+    if (args.subGraphName) params.set('subGraphName', args.subGraphName);
     return this.request(
-      'POST',
-      `/api/assertion/${encodeURIComponent(args.assertionName)}/query`,
-      body,
+      'GET',
+      `/api/knowledge-assets/${encodeURIComponent(args.assertionName)}/wm/quads?${params.toString()}`,
     );
   }
 
@@ -727,7 +747,7 @@ export class DkgClient {
     if (args.assertionName) body.assertionName = args.assertionName;
     if (args.fileHash) body.fileHash = args.fileHash;
     if (args.subGraphName) body.subGraphName = args.subGraphName;
-    return this.request('POST', '/api/assertion/import-artifact/resolve', body);
+    return this.request('POST', '/api/knowledge-assets/import-artifact/resolve', body);
   }
 
   /** Read Markdown for a completed import via content-addressed daemon storage. */
@@ -747,7 +767,7 @@ export class DkgClient {
     if (args.fileHash) body.fileHash = args.fileHash;
     if (args.subGraphName) body.subGraphName = args.subGraphName;
     if (args.maxBytes != null) body.maxBytes = args.maxBytes;
-    return this.request('POST', '/api/assertion/import-artifact/read-markdown', body);
+    return this.request('POST', '/api/knowledge-assets/import-artifact/read-markdown', body);
   }
 
   /** Append model-derived semantic triples to the completed imported assertion. */
@@ -773,7 +793,7 @@ export class DkgClient {
     if (args.generationMethod) body.generationMethod = args.generationMethod;
     if (args.agentIdentity) body.agentIdentity = args.agentIdentity;
     if (args.generatedAt) body.generatedAt = args.generatedAt;
-    return this.request('POST', '/api/assertion/semantic-enrichment/write', body);
+    return this.request('POST', '/api/knowledge-assets/semantic-enrichment/write', body);
   }
 
   /**
@@ -792,7 +812,7 @@ export class DkgClient {
     if (args.subGraphName) params.set('subGraphName', args.subGraphName);
     return this.request(
       'GET',
-      `/api/assertion/${encodeURIComponent(args.assertionName)}/history?${params.toString()}`,
+      `/api/knowledge-assets/${encodeURIComponent(args.assertionName)}?${params.toString()}`,
     );
   }
 
@@ -833,7 +853,7 @@ export class DkgClient {
     const headers: Record<string, string> = { Accept: 'application/json' };
     if (this.token) headers.Authorization = `Bearer ${this.token}`;
     const res = await this.fetcher(
-      `${this.api}/api/assertion/${encodeURIComponent(args.assertionName)}/import-file`,
+      `${this.api}/api/knowledge-assets/${encodeURIComponent(args.assertionName)}/wm/import-file`,
       {
         method: 'POST',
         headers,
@@ -847,7 +867,7 @@ export class DkgClient {
       throw new DkgHttpError(
         res.status,
         parsed,
-        `POST /api/assertion/${args.assertionName}/import-file → ${res.status}: ${text}`,
+        `POST /api/knowledge-assets/${args.assertionName}/wm/import-file → ${res.status}: ${text}`,
       );
     }
     return res.json() as Promise<Record<string, unknown>>;
@@ -994,7 +1014,7 @@ export class DkgClient {
 
   /**
    * Final canonical-flow step: publish a single root from a context graph's
-   * Shared Working Memory to Verified Memory (on-chain). The daemon route
+   * Shared Working Memory to Verifiable Memory (on-chain). The daemon route
    * accepts `selection` as either the literal `"all"` or an array of root
    * entity URIs, but V10 synchronous publish only proceeds when that
    * selection resolves to exactly one publishable root.
@@ -1026,7 +1046,7 @@ export class DkgClient {
    * auto-generated name, write the supplied quads, finalize (which
    * computes the merkle root and signs the EIP-712 AuthorAttestation
    * stored in `_meta`), promote into SWM, then publish to the
-   * verified-memory chain. The publisher forwards the seal verbatim
+   * verifiable-memory chain. The publisher forwards the seal verbatim
    * and never re-signs.
    *
    * For step-wise control (long-running stage, late finalize, etc.)
@@ -1049,7 +1069,7 @@ export class DkgClient {
     }));
     const created = await this.request<{ assertionUri?: string; seal?: Record<string, unknown> }>(
       'POST',
-      '/api/assertion/create',
+      '/api/knowledge-assets',
       {
         contextGraphId: cgId,
         name: assertionName,
@@ -1124,8 +1144,10 @@ export class DkgClient {
   // Layer-explicit wrappers over the clean /api/knowledge-assets/... surface.
   // One file = one Knowledge Asset (Design B / OT-RFC-44), carrying any number
   // of member entities. WM → SWM → VM via the git-shaped verbs write →
-  // finalize → share → publish. The legacy assertion/* + shared-memory/*
-  // methods above remain for back-compat during the v10 migration window.
+  // finalize → share → publish. The assertion-named methods above now
+  // target this same /api/knowledge-assets/... surface (the legacy
+  // /api/assertion/* routes are retired); only the shared-memory/* methods
+  // remain on their own routes.
 
   /** Create a KA + open its WM draft. Pass `quads` to atomically write+finalize. */
   async createKnowledgeAsset(args: {

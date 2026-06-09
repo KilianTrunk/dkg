@@ -4,7 +4,7 @@ import type {
 } from '../../packages/cli/src/benchmark/publish-get/types.ts';
 
 type Quad = BenchmarkPayload['quads'][number];
-type MemoryView = 'working-memory' | 'shared-working-memory' | 'verified-memory';
+type MemoryView = 'working-memory' | 'shared-working-memory' | 'verifiable-memory';
 
 interface MemoryRecord {
   contextGraphId: string;
@@ -26,7 +26,7 @@ interface PublisherJob {
 export class LayeredDkgBenchmarkClient implements BenchmarkClient {
   readonly workingMemory = new Map<string, MemoryRecord>();
   readonly sharedWorkingMemory = new Map<string, MemoryRecord>();
-  readonly verifiedMemory = new Map<string, MemoryRecord>();
+  readonly verifiableMemory = new Map<string, MemoryRecord>();
   readonly publisherJobs = new Map<string, PublisherJob>();
 
   private shareSequence = 0;
@@ -40,7 +40,7 @@ export class LayeredDkgBenchmarkClient implements BenchmarkClient {
       memoryLayers: {
         workingMemory: this.workingMemory.size,
         sharedWorkingMemory: this.sharedWorkingMemory.size,
-        verifiedMemory: this.verifiedMemory.size,
+        verifiableMemory: this.verifiableMemory.size,
       },
       publisherJobs: this.publisherJobs.size,
     };
@@ -49,7 +49,7 @@ export class LayeredDkgBenchmarkClient implements BenchmarkClient {
   clear(): void {
     this.workingMemory.clear();
     this.sharedWorkingMemory.clear();
-    this.verifiedMemory.clear();
+    this.verifiableMemory.clear();
     this.publisherJobs.clear();
   }
 
@@ -144,7 +144,7 @@ export class LayeredDkgBenchmarkClient implements BenchmarkClient {
     opts?: { view?: MemoryView },
   ) {
     const rootEntity = rootFromSparql(sparql);
-    const view = opts?.view ?? 'verified-memory';
+    const view = opts?.view ?? 'verifiable-memory';
     const record = this.layer(view).get(rootEntity);
 
     return {
@@ -161,13 +161,13 @@ export class LayeredDkgBenchmarkClient implements BenchmarkClient {
     if (staged.contextGraphId !== contextGraphId) {
       throw new Error(`Root ${rootEntity} belongs to ${staged.contextGraphId}, not ${contextGraphId}`);
     }
-    this.verifiedMemory.set(rootEntity, { ...staged, kaId });
+    this.verifiableMemory.set(rootEntity, { ...staged, kaId });
   }
 
   private layer(view: MemoryView): Map<string, MemoryRecord> {
     if (view === 'working-memory') return this.workingMemory;
     if (view === 'shared-working-memory') return this.sharedWorkingMemory;
-    return this.verifiedMemory;
+    return this.verifiableMemory;
   }
 }
 

@@ -245,7 +245,7 @@ modes auto-renewal can't recover from:
 | `dkg send <name> <msg>` | Encrypted direct message to a peer |
 | `dkg chat <name>` | Interactive chat with a peer |
 | `dkg context-graph create <id>` | Create a local context graph (project) |
-| `dkg context-graph register <id>` | Register an existing CG on-chain (unlocks Verified Memory) |
+| `dkg context-graph register <id>` | Register an existing CG on-chain (unlocks Verifiable Memory) |
 | `dkg context-graph list` | List subscribed context graphs |
 | `dkg context-graph invite <id> <peer>` | Invite a peer to a curated CG |
 | `dkg context-graph subscribe <id>` | Subscribe to a CG without creating it |
@@ -253,7 +253,7 @@ modes auto-renewal can't recover from:
 | `dkg assertion promote <name> -c <cg>` | Promote a WM assertion to Shared Working Memory |
 | `dkg assertion query <name> -c <cg>` | Read assertion quads from WM |
 | `dkg shared-memory write <cg>` | Write triples directly to Shared Working Memory |
-| `dkg shared-memory publish <cg>` | Publish from SWM to Verified Memory (costs TRAC) |
+| `dkg shared-memory publish <cg>` | Publish from SWM to Verifiable Memory (costs TRAC) |
 | `dkg publish <cg>` | One-shot RDF publish to a context graph |
 | `dkg verify <batchId>` | Propose M-of-N verification for a published batch |
 | `dkg endorse <ual>` | Endorse a published Knowledge Asset |
@@ -349,10 +349,10 @@ When the daemon is running, it exposes a local HTTP API (default: `http://localh
 - `GET /api/status`, `GET /api/info` — node status and health
 - `POST /api/agent/register`, `GET /api/agent/identity` — agent identity
 - `POST /api/context-graph/create`, `/register`, `/invite`, `GET /api/context-graph/list` — context graph management
-- `POST /api/assertion/create`, `/{name}/write`, `/{name}/promote`, `/{name}/discard`, `/{name}/import-file`, `GET /api/assertion/{name}/history` — Working Memory assertions
-- `POST /api/shared-memory/write`, `/publish` — Shared Working Memory and publishing to Verified Memory
+- `POST /api/knowledge-assets`, `/{name}/wm/write`, `/{name}/swm/share`, `/{name}/wm/discard`, `/{name}/wm/import-file`, `GET /api/knowledge-assets/{name}` — Working Memory assertions
+- `POST /api/shared-memory/write`, `/publish` — Shared Working Memory and publishing to Verifiable Memory
 - `POST /api/query`, `POST /api/query-remote` — SPARQL querying
-- `POST /api/endorse`, `POST /api/verify`, `POST /api/update` — Verified Memory trust operations
+- `POST /api/endorse`, `POST /api/verify`, `POST /api/update` — Verifiable Memory trust operations
 - `GET /api/peers`, `GET /api/connections`, `GET /api/agents` — network introspection
 - `GET /api/wallets/balances`, `GET /api/chain/rpc-health` — wallet and chain health
 - `GET /api/events` — Server-Sent Events stream for real-time notifications

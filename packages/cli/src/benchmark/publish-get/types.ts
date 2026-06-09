@@ -11,7 +11,7 @@ export type BenchmarkOperation = (typeof OPERATIONS)[number];
 
 export type OutputFormat = 'json' | 'ndjson';
 export type FixtureName = 'generated' | 'minimal';
-export type GetView = 'working-memory' | 'shared-working-memory' | 'verified-memory';
+export type GetView = 'working-memory' | 'shared-working-memory' | 'verifiable-memory';
 
 export interface BenchmarkConfig {
   contextGraphId: string;

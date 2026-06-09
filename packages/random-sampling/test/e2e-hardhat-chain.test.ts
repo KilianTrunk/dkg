@@ -175,24 +175,28 @@ describe('Random Sampling E2E (Hardhat)', () => {
         };
       }),
     );
+    // OT-RFC-43 Option 1 (variant 1a): the real adapter requires a packed
+    // reservedKaId = (uint160(author) << 96) | number. Mirror the publisher's
+    // allocator cold-start (DKGPublisher.ensureReservedKaId): read the author's
+    // highest minted number from chain (-1n on a fresh deploy) and reserve the
+    // next one. CORE_OP has minted nothing in this snapshot, so this is number 0.
+    // §F2 — the AuthorAttestation digest binds reservedKaId as its 5th field, so it
+    // must be reserved BEFORE the typed data is built and signed (otherwise the
+    // EIP-712 message's reservedKaId is null and ethers throws at encodeData).
+    const authorChainMax = await publisherAdapter.getMaxKaNumberForAuthor!(coreOpWallet.address);
+    const reservedKaId =
+      (BigInt(ethers.getAddress(coreOpWallet.address)) << 96n) | (authorChainMax + 1n);
     const authorTyped = buildAuthorAttestationTypedData({
       chainId: TEST_CHAIN_ID,
       kav10Address,
       contextGraphId: cgId,
       merkleRoot,
       authorAddress: coreOpWallet.address,
+      reservedKaId,
     });
     const authorSig = ethers.Signature.from(
       await coreOpWallet.signTypedData(authorTyped.domain, authorTyped.types, authorTyped.message),
     );
-    // OT-RFC-43 Option 1 (variant 1a): the real adapter requires a packed
-    // reservedKaId = (uint160(author) << 96) | number. Mirror the publisher's
-    // allocator cold-start (DKGPublisher.ensureReservedKaId): read the author's
-    // highest minted number from chain (-1n on a fresh deploy) and reserve the
-    // next one. CORE_OP has minted nothing in this snapshot, so this is number 0.
-    const authorChainMax = await publisherAdapter.getMaxKaNumberForAuthor!(coreOpWallet.address);
-    const reservedKaId =
-      (BigInt(ethers.getAddress(coreOpWallet.address)) << 96n) | (authorChainMax + 1n);
     const publishResult = await publisherAdapter.createKnowledgeAssets!({
       publishOperationId: 'rs-e2e-publish',
       contextGraphId: cgId,

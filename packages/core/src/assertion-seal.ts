@@ -24,7 +24,7 @@
 const ONT = 'http://dkg.io/ontology/';
 
 /**
- * Predicates written by `/api/assertion/:name/finalize` (sealed at
+ * Predicates written by `/api/knowledge-assets/:name/wm/finalize` (sealed at
  * the moment the agent commits the assertion's content to a chain).
  */
 export const ASSERTION_SEAL_PREDICATES = {
@@ -42,6 +42,14 @@ export const ASSERTION_SEAL_PREDICATES = {
   ASSERTED_AT_CHAIN_ID: `${ONT}assertedAtChainId`,
   /** `KnowledgeAssetsV10` deployment address the sig commits to (string literal, checksummed). */
   ASSERTED_AT_KAV10_ADDRESS: `${ONT}assertedAtKav10Address`,
+  /**
+   * OT-RFC-43 §F2 — the packed reservedKaId `(uint160(author)<<96)|uint96(number)`
+   * bound into the EIP-712 AuthorAttestation digest. Persisted so the idempotent
+   * re-finalize rebuild and the publish/mint reuse the SAME id the signature
+   * committed to (xsd:integer; the 256-bit value rides as an arbitrary-precision
+   * integer literal).
+   */
+  RESERVED_KA_ID: `${ONT}reservedKaId`,
   /** Daemon-clock dateTime when the seal was written (xsd:dateTime). */
   ASSERTION_FINALIZED_AT: `${ONT}assertionFinalizedAt`,
   /**
@@ -111,6 +119,8 @@ export function buildAssertionSealQuads(args: {
   authorSchemeVersion: number;
   chainId: bigint;
   kav10Address: string;
+  /** OT-RFC-43 §F2 — the packed id bound into the AuthorAttestation digest. */
+  reservedKaId: bigint;
   finalizedAtIso: string;
   /**
    * Root entities the seal commits to (one per emitted quad). Required
@@ -187,6 +197,10 @@ export function buildAssertionSealQuads(args: {
       JSON.stringify(args.kav10Address),
     ),
     quad(
+      ASSERTION_SEAL_PREDICATES.RESERVED_KA_ID,
+      `"${args.reservedKaId.toString()}"^^${xsdInteger}`,
+    ),
+    quad(
       ASSERTION_SEAL_PREDICATES.ASSERTION_FINALIZED_AT,
       `"${args.finalizedAtIso}"^^${xsdDateTime}`,
     ),
@@ -247,6 +261,12 @@ export interface AssertionSeal {
   authorSchemeVersion: number;
   chainId: bigint;
   kav10Address: string;
+  /**
+   * OT-RFC-43 §F2 — the packed id the AuthorAttestation digest bound. Optional:
+   * absent on seals that predate the binding; consumers fall back to the
+   * lifecycle-URN kaId when undefined.
+   */
+  reservedKaId?: bigint;
   finalizedAtIso: string;
   /**
    * Root entities the seal commits to. Set at finalize time, used at
@@ -340,6 +360,11 @@ export function parseAssertionSealQuads(
     kav10Address: stringLiteralToValue(
       seen.get(ASSERTION_SEAL_PREDICATES.ASSERTED_AT_KAV10_ADDRESS)!,
     ),
+    // OT-RFC-43 §F2 — optional on read: present on seals finalized after the
+    // binding landed; consumers fall back to the lifecycle-URN kaId when absent.
+    reservedKaId: seen.has(ASSERTION_SEAL_PREDICATES.RESERVED_KA_ID)
+      ? integerLiteralToValue(seen.get(ASSERTION_SEAL_PREDICATES.RESERVED_KA_ID)!)
+      : undefined,
     finalizedAtIso: dateTimeLiteralToValue(
       seen.get(ASSERTION_SEAL_PREDICATES.ASSERTION_FINALIZED_AT)!,
     ),

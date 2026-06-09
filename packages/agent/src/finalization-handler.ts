@@ -1205,7 +1205,7 @@ export class FinalizationHandler {
       contextGraphId,
       layers: ['swm', 'vm'],
       subGraphName,
-      operation: 'verified_memory_finalized',
+      operation: 'verifiable_memory_finalized',
       source: 'finalization',
       counts: {
         roots: rootEntities.length,

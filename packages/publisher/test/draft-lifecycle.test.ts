@@ -8,6 +8,8 @@ import {
   contextGraphAssertionUri,
   contextGraphMetaUri,
   contextGraphSharedMemoryUri,
+  contextGraphLayerUri,
+  MemoryLayer,
   assertionLifecycleUri,
 } from '@origintrail-official/dkg-core';
 import { DKGPublisher, AssertionNotPersistedError } from '../src/index.js';
@@ -69,6 +71,71 @@ describe('Working Memory Assertion Lifecycle', () => {
   it('create returns the correct assertion graph URI', async () => {
     const uri = await publisher.assertionCreate(CG_ID, ASSERTION_NAME, AGENT);
     expect(uri).toBe(contextGraphAssertionUri(CG_ID, AGENT, ASSERTION_NAME));
+  });
+
+  it('D1: create stamps kaId + reservedUal on the URN when given an allocate callback', async () => {
+    const name = 'd1-mint';
+    const ual = `did:dkg:31337/${AGENT.toLowerCase()}/42`;
+    await publisher.assertionCreate(CG_ID, name, AGENT, undefined, {
+      allocateKaNumber: async () => ({ number: 42n, reservedUal: ual }),
+    });
+    const metaGraph = contextGraphMetaUri(CG_ID);
+    const urn = assertionLifecycleUri(CG_ID, AGENT, name);
+    const kaId = await store.query(`SELECT ?n WHERE { GRAPH <${metaGraph}> { <${urn}> <http://dkg.io/ontology/kaId> ?n } }`);
+    expect(kaId.type).toBe('bindings');
+    if (kaId.type === 'bindings') {
+      expect(kaId.bindings.map((r) => r['n'])).toEqual(['"42"^^<http://www.w3.org/2001/XMLSchema#integer>']);
+    }
+    const ru = await store.query(`SELECT ?u WHERE { GRAPH <${metaGraph}> { <${urn}> <http://dkg.io/ontology/reservedUal> ?u } }`);
+    if (ru.type === 'bindings') {
+      expect(ru.bindings.map((r) => r['u'])).toEqual([`"${ual}"`]);
+    }
+  });
+
+  it('D1: re-create does NOT re-allocate — the preserved kaId is reused (re-open guard)', async () => {
+    const name = 'd1-reopen';
+    const ual42 = `did:dkg:31337/${AGENT.toLowerCase()}/42`;
+    await publisher.assertionCreate(CG_ID, name, AGENT, undefined, {
+      allocateKaNumber: async () => ({ number: 42n, reservedUal: ual42 }),
+    });
+    // Re-create with a callback that WOULD allocate a different number — it must NOT be invoked,
+    // because the draft already carries a preserved kaId (the re-open guard lives in assertionCreate).
+    let called = false;
+    await publisher.assertionCreate(CG_ID, name, AGENT, undefined, {
+      allocateKaNumber: async () => {
+        called = true;
+        return { number: 99n, reservedUal: `did:dkg:31337/${AGENT.toLowerCase()}/99` };
+      },
+    });
+    expect(called).toBe(false);
+    const metaGraph = contextGraphMetaUri(CG_ID);
+    const urn = assertionLifecycleUri(CG_ID, AGENT, name);
+    const kaId = await store.query(`SELECT ?n WHERE { GRAPH <${metaGraph}> { <${urn}> <http://dkg.io/ontology/kaId> ?n } }`);
+    if (kaId.type === 'bindings') {
+      expect(kaId.bindings.map((r) => r['n'])).toEqual(['"42"^^<http://www.w3.org/2001/XMLSchema#integer>']);
+    }
+  });
+
+  it('WM flip: a numbered KA stores + reads WM data in the per-KA _working_memory graph', async () => {
+    const name = 'wm-numbered';
+    await publisher.assertionCreate(CG_ID, name, AGENT, undefined, {
+      allocateKaNumber: async () => ({ number: 42n, reservedUal: `did:dkg:31337/${AGENT.toLowerCase()}/42` }),
+    });
+    await publisher.assertionWrite(CG_ID, name, AGENT, [
+      { subject: 'urn:test:entity:x', predicate: 'http://schema.org/name', object: '"X"' },
+    ]);
+    // data must live in the per-KA WM graph keyed by {number}, NOT the legacy name-keyed graph
+    const wmGraph = contextGraphLayerUri(CG_ID, MemoryLayer.WorkingMemory, AGENT, 42n);
+    const res = await store.query(`SELECT ?o WHERE { GRAPH <${wmGraph}> { <urn:test:entity:x> <http://schema.org/name> ?o } }`);
+    expect(res.type).toBe('bindings');
+    if (res.type === 'bindings') expect(res.bindings.map((r) => r['o'])).toEqual(['"X"']);
+    // the legacy name-keyed graph must be empty (no data leaked to the old layout)
+    const legacy = contextGraphAssertionUri(CG_ID, AGENT, name);
+    const legacyRes = await store.query(`SELECT ?o WHERE { GRAPH <${legacy}> { <urn:test:entity:x> ?p ?o } }`);
+    if (legacyRes.type === 'bindings') expect(legacyRes.bindings).toHaveLength(0);
+    // assertionQuery (which resolves the number internally) returns the data
+    const q = await publisher.assertionQuery(CG_ID, name, AGENT);
+    expect(q.length).toBeGreaterThan(0);
   });
 
   it('write inserts triples into the assertion graph', async () => {
@@ -249,7 +316,7 @@ describe('Working Memory Assertion Lifecycle', () => {
     expect(result.promotedCount).toBe(0);
   });
 
-  it('durable SWM ownership blocks cross-author promote after publisher restart with empty map', async () => {
+  it('durable SWM ownership skips (advisory) cross-author promote after publisher restart with empty map', async () => {
     const root = 'urn:test:entity:restart-owned';
     const firstAssertion = 'restart-owner-a';
     const secondAssertion = 'restart-owner-b';
@@ -285,11 +352,18 @@ describe('Working Memory Assertion Lifecycle', () => {
       { subject: root, predicate: 'http://schema.org/name', object: '"Overwritten"' },
     ]);
 
-    await expect(
-      restartedPublisher.assertionPromote(CG_ID, secondAssertion, AGENT_B, { publisherPeerId: PEER_B }),
-    ).rejects.toThrow(
-      `Cannot promote entity <${root}>: owned by peer ${PEER}, not by caller ${PEER_B}.`,
+    // OT-RFC-46 §17.4 / rc.17 D6: a cross-author promote is no longer REJECTED — the
+    // foreign-owned root is skipped (workspaceOwner is now advisory, not a hard gate).
+    // Under the still-bucket SWM the skip preserves the owner's data (no clobber); the
+    // assertions below confirm SWM content and ownership are unchanged. Once SWM is
+    // per-KA (rc.17b) the co-claim coexists in its own graph instead of being skipped.
+    const promoteResult = await restartedPublisher.assertionPromote(
+      CG_ID,
+      secondAssertion,
+      AGENT_B,
+      { publisherPeerId: PEER_B },
     );
+    expect(promoteResult.promotedCount).toBe(0);
 
     const remaining = await restartedPublisher.assertionQuery(CG_ID, secondAssertion, AGENT_B);
     expect(remaining).toHaveLength(1);

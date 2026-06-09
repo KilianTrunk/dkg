@@ -8,7 +8,7 @@
  * project context graph is resolved — one `POST /api/query` to
  * `agent-context` (`assertionName: 'chat-turns'`, `view: 'working-memory'`)
  * plus three against the resolved project CG's `'memory'` assertion with
- * `view: 'working-memory' | 'shared-working-memory' | 'verified-memory'`.
+ * `view: 'working-memory' | 'shared-working-memory' | 'verifiable-memory'`.
  * See `DkgMemorySearchManager.search` for trust-weighted ranking and
  * cross-layer dedup.
  *
@@ -65,7 +65,7 @@ export const PROJECT_MEMORY_ASSERTION = 'memory';
 function buildDkgMemoryPromptSections(): string[] {
   return [
     'DKG memory rules:',
-    '- To inspect whether a project has data, check all three layers explicitly: `working-memory`, `shared-working-memory`, and `verified-memory`.',
+    '- To inspect whether a project has data, check all three layers explicitly: `working-memory`, `shared-working-memory`, and `verifiable-memory`.',
     '- If the user asks to share a private project with a friend, prefer the full join UX: generate an invite code first, then add the friend to the allowlist when you have their agent address.',
     '- If you have both a peer ID and an agent address for a private-project share, do both automatically: return the invite code and add the participant.',
     '- If you only have an agent address, explain that allowlisting is not the full UI join flow and ask for the peer ID if the user wants a paste-into-Join invite code.',
@@ -261,7 +261,7 @@ export class DkgMemorySearchManager implements MemorySearchManager {
     // any other assertions the agent may have written memories into.
     // SWM and VM views don't have assertion-level sub-graphing, so
     // omitting `assertionName` is a no-op on those — the scope is
-    // already the whole shared-memory / verified-memory graph for
+    // already the whole shared-memory / verifiable-memory graph for
     // the CG.
     //
     // Each layer carries a trust weight that multiplies the keyword-
@@ -281,7 +281,7 @@ export class DkgMemorySearchManager implements MemorySearchManager {
       source: MemorySource;
       trustWeight: number;
       contextGraphId: string;
-      view: 'working-memory' | 'shared-working-memory' | 'verified-memory';
+      view: 'working-memory' | 'shared-working-memory' | 'verifiable-memory';
       sparql: string;
     }
     const plans: LayerPlan[] = [
@@ -306,7 +306,7 @@ export class DkgMemorySearchManager implements MemorySearchManager {
         source: 'sessions',
         trustWeight: 1.3,
         contextGraphId: AGENT_CONTEXT_GRAPH,
-        view: 'verified-memory',
+        view: 'verifiable-memory',
         sparql: permissiveSparql,
       },
     ];
@@ -333,7 +333,7 @@ export class DkgMemorySearchManager implements MemorySearchManager {
           source: 'memory',
           trustWeight: 1.3,
           contextGraphId: projectContextGraphId,
-          view: 'verified-memory',
+          view: 'verifiable-memory',
           sparql: permissiveSparql,
         },
       );
@@ -386,13 +386,13 @@ export class DkgMemorySearchManager implements MemorySearchManager {
 
     // Dedup by (contextGraphId, uri), keeping the highest-trust layer
     // when the same memory URI surfaces through multiple views (a
-    // verified memory that is still in the WM draft buffer is the
+    // verifiable memory that is still in the WM draft buffer is the
     // canonical example — it would otherwise occupy two result slots
     // with near-identical snippets). A VM hit collapses an SWM or WM
     // hit for the same URI; SWM collapses a WM hit. The weighted
     // `score * trustWeight` from the surviving layer is what ranks.
     // Trust tier is based on the view, not the context graph — a
-    // verified-memory hit in agent-context ties with a verified-memory
+    // verifiable-memory hit in agent-context ties with a verifiable-memory
     // hit in the project CG.
     const trustOrder: Record<MemoryLayer, number> = {
       'agent-context-vm': 3,

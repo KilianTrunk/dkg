@@ -102,12 +102,15 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
     // storage slot at the end of the inheritance chain; KAV10 owns its
     // slots below the inherited chain and V10 deploys are redeploy +
     // reinit, so no storage-layout migration is required.
+    // 10.0.3 → 10.0.4: curated publishes and paid legacy curated updates
+    // must carry a ciphertext commitment before entering value-weighted
+    // random-sampling state.
     // 2.0.0 → 2.0.1 (PATCH): protocol treasury fee skimmed inside
     // `_addTokens` (publisher pays the same gross amount; the fee is taken
     // out of the staker-bound net). Patch-level on purpose — the EIP-712
     // author-attestation domain version (`_EIP712_VERSION_HASH`) MUST stay
     // pinned at "2.0.0" so previously signed attestations keep verifying.
-    string private constant _VERSION = "10.0.3";
+    string private constant _VERSION = "10.0.4";
 
     // --- V10 publish input (grouped to bypass the 16-arg stack limit) ---
 
@@ -138,17 +141,16 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
         /// @notice V10 flat-KC Merkle leaf count (sorted + deduped), must match
         ///         off-chain `V10MerkleTree` built from the same publish payload.
         uint32 merkleLeafCount;
-        // ── RFC-39 Phase A.5: curated-CG ciphertext commitment (OPTIONAL) ──
+        // ── RFC-39 Phase A.5: curated-CG ciphertext commitment ──
         /// @notice RFC-39: Merkle root over `[keccak256(ct_i)]` in
         ///         `swmMessageIndex` order for this publish batch's ciphertext
         ///         chunks (one chunk per SWM message — LU-11 Option B).
         ///         MUST be `bytes32(0)` for public CGs (rejected with
         ///         `PublicCGCannotHaveCiphertextCommitment`). For curated CGs,
-        ///         MAY be `bytes32(0)` (legacy/transitional path — picker
-        ///         skips that KC in the curated draw) OR non-zero AND paired
-        ///         with a non-zero `ciphertextChunkCount` (full commitment —
-        ///         KC participates in the curated draw). Partial commitments
-        ///         (one zero, one non-zero) revert with
+        ///         MUST be non-zero AND paired with a non-zero
+        ///         `ciphertextChunkCount`; otherwise the publish reverts with
+        ///         `CuratedCGRequiresCiphertextCommitment`. Partial
+        ///         commitments (one zero, one non-zero) revert with
         ///         `IncompleteCiphertextCommitment`.
         bytes32 ciphertextChunksRoot;
         /// @notice RFC-39: number of ciphertext chunks in this batch (==
@@ -219,9 +221,10 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
         // left their commitment frozen to the initial publish and the
         // random-sampling challenge surface would point at stale
         // ciphertext after the first update. Same zero-or-paired
-        // contract as `PublishParams` (zero on metadata-only or
-        // public-CG updates; both non-zero on curated commitment
-        // rotation). Appended at the END of the struct so the
+        // contract as `PublishParams`: zero for public-CG updates or
+        // metadata-only legacy curated KCs without prior commitment;
+        // both non-zero for curated commitment rotation or paid
+        // legacy-curated growth. Appended at the END of the struct so the
         // positional ABI for pre-existing 12-field callers stays
         // intact — they encode the same prefix and ABI decoder
         // zero-fills the trailing pair (Codex PR #630 R1 #1 on
@@ -271,6 +274,12 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
     ///      leaking into a public publish would silently bloat storage and
     ///      mislead off-chain indexers about which KCs are sampleable).
     error PublicCGCannotHaveCiphertextCommitment(uint256 contextGraphId);
+
+    /// @dev A curated-CG publish or paid update attempted to introduce
+    ///      sampling value without a full ciphertext commitment. Curated KCs
+    ///      without commitments are unchallengeable by design, so KAV10 must
+    ///      not let them enter the value-weighted challenge surface.
+    error CuratedCGRequiresCiphertextCommitment(uint256 contextGraphId);
 
     /// @dev RFC-39 Phase A.5: a curated-CG publish carried a partial ciphertext
     ///      commitment (root without count, or vice versa). The two are
@@ -606,31 +615,32 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
         // KC.
         //
         // Semantics:
-        //   - Public CG  + any non-zero ciphertext field → revert
+        //   - Public CG + any non-zero ciphertext field → revert
         //     (catches client bugs; curated-only payload leaking to public).
-        //   - Curated CG + both fields zero                → no commitment
-        //     persisted; picker treats the KC as "skip in curated draw"
-        //     (legacy / pre-LU-11 publishes — forward-only adoption per
-        //     RFC-39 §6.4, Q4).
-        //   - Curated CG + both fields non-zero            → commitment
+        //   - Curated CG + both fields non-zero → commitment
         //     persisted; KC participates in curated draw.
-        //   - Curated CG + exactly one field zero          → revert
+        //   - Curated CG + both fields zero → revert
+        //     (unchallengeable encrypted KC must not enter value-weighted
+        //     sampling state).
+        //   - Curated CG + exactly one field zero → revert
         //     (partial commitment would zero-divide the picker or verify
         //     against the empty-tree zero).
         //
         // The cached `_hasCiphertextCommitment` carries the populate decision
         // forward to the post-create persistence call below — avoids a
-        // second `getIsCurated` read and the two zero-checks that already
-        // gated this branch.
+        // second pair of zero-checks that already gated this branch.
+        bool _isCurated = contextGraphStorage.getIsCurated(p.contextGraphId);
         bool _hasCiphertextCommitment =
             p.ciphertextChunksRoot != bytes32(0) || p.ciphertextChunkCount != 0;
-        if (_hasCiphertextCommitment) {
-            if (!contextGraphStorage.getIsCurated(p.contextGraphId)) {
-                revert PublicCGCannotHaveCiphertextCommitment(p.contextGraphId);
+        if (_isCurated) {
+            if (!_hasCiphertextCommitment) {
+                revert CuratedCGRequiresCiphertextCommitment(p.contextGraphId);
             }
             if (p.ciphertextChunksRoot == bytes32(0) || p.ciphertextChunkCount == 0) {
                 revert IncompleteCiphertextCommitment();
             }
+        } else if (_hasCiphertextCommitment) {
+            revert PublicCGCannotHaveCiphertextCommitment(p.contextGraphId);
         }
 
         // H7: SafeCast guards the uint96 cast in _validateTokenAmount.
@@ -1456,9 +1466,13 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
         //     unprovable. Once a KC has been committed, every
         //     subsequent update MUST rotate the commitment in lockstep
         //     with the plaintext one.
-        //   - Curated CG + KC has no prior commitment + zero pair → no-op
-        //     (legacy / pre-LU-11 path; picker still skips this KC in
-        //     the curated draw until the first commitment lands).
+        //   - Curated CG + KC has no prior commitment + zero pair + delta 0
+        //     → no-op (legacy / pre-LU-11 metadata maintenance; picker still
+        //     skips this KC in the curated draw until the first commitment
+        //     lands).
+        //   - Curated CG + KC has no prior commitment + zero pair + delta > 0
+        //     → revert. Value growth would otherwise add weight for a KC that
+        //     cannot satisfy a ciphertext proof when sampled.
         //   - Curated CG + both fields non-zero → commitment rotated
         //     (or set for the first time).
         //   - Curated CG + exactly one field zero → revert
@@ -1479,10 +1493,11 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
                 // KC was previously committed; a zero-pair update would
                 // strand the stale commitment.
                 revert IncompleteCiphertextCommitment();
+            } else if (deltaTokenAmount > 0) {
+                revert CuratedCGRequiresCiphertextCommitment(contextGraphId);
             }
             // else: legacy / pre-LU-11 curated KC, no commitment yet —
-            // zero-pair update is permitted (mirrors the publish
-            // legacy-path behaviour).
+            // zero-pair metadata-only update is permitted.
         } else if (_hasNewCiphertextCommitment) {
             revert PublicCGCannotHaveCiphertextCommitment(contextGraphId);
         }

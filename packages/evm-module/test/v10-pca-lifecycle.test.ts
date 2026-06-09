@@ -121,6 +121,7 @@ async function deployFixture(): Promise<Fixture> {
 describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function () {
   let accounts: SignerWithAddress[];
   let Token: Token;
+  let HubContract: Hub;
   let Chronos: Chronos;
   let ProfileContract: Profile;
   let ConvictionStakingStorage: ConvictionStakingStorage;
@@ -138,6 +139,7 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
     hre.helpers.resetDeploymentsJson();
     ({
       accounts,
+      Hub: HubContract,
       Token,
       Chronos,
       Profile: ProfileContract,
@@ -314,6 +316,25 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
       publisherIdentityId,
       receiverIdentityIds,
     };
+  };
+
+  const createCuratedContextGraphFor = async (
+    creator: SignerWithAddress,
+  ): Promise<bigint> => {
+    await CGFacade.connect(creator).createContextGraph(
+      [],
+      0,
+      1,
+      0,
+      creator.address,
+      0,
+      ethers.ZeroHash,
+    );
+    const cgId = await CGS.getLatestContextGraphId();
+    expect(await CGS.getIsCurated(cgId)).to.equal(true);
+    expect(await CGFacade.isAuthorizedPublisher(cgId, creator.address)).to.be
+      .true;
+    return cgId;
   };
 
   // --------------------------------------------------------------------------
@@ -549,6 +570,114 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
       DKGKnowledgeAssets,
       'ERC721NonexistentToken',
     );
+  });
+
+  it('greenfield: curated publish requires a ciphertext commitment before value enters sampling', async () => {
+    const setup = await setupRegisteredAgentPublish();
+    const curatedCgId = await createCuratedContextGraphFor(setup.creator);
+    const p = await buildBasePublishParams(setup, 'curated-missing-ct', {
+      contextGraphId: curatedCgId,
+    });
+
+    await expect(KAV10.connect(setup.creator).publish(p))
+      .to.be.revertedWithCustomError(
+        KAV10,
+        'CuratedCGRequiresCiphertextCommitment',
+      )
+      .withArgs(curatedCgId);
+
+    await expect(
+      DKGKnowledgeAssets.ownerOf(p.reservedKaId),
+    ).to.be.revertedWithCustomError(
+      DKGKnowledgeAssets,
+      'ERC721NonexistentToken',
+    );
+  });
+
+  it('greenfield: curated publish with a full ciphertext commitment persists the sampling proof anchor', async () => {
+    const setup = await setupRegisteredAgentPublish();
+    const curatedCgId = await createCuratedContextGraphFor(setup.creator);
+    const ciphertextChunksRoot = ethers.keccak256(
+      ethers.toUtf8Bytes('curated-publish-ct-root'),
+    );
+    const ciphertextChunkCount = 3n;
+    const p = await buildBasePublishParams(setup, 'curated-with-ct', {
+      contextGraphId: curatedCgId,
+      ciphertextChunksRoot,
+      ciphertextChunkCount,
+    });
+
+    await (await KAV10.connect(setup.creator).publish(p)).wait();
+
+    const kaId = BigInt(p.reservedKaId);
+    expect(await CGS.kaToContextGraph(kaId)).to.equal(curatedCgId);
+    expect(await DKGKnowledgeAssets.getLatestCiphertextChunksRoot(kaId)).to
+      .equal(ciphertextChunksRoot);
+    expect(await DKGKnowledgeAssets.getCiphertextChunkCount(kaId)).to.equal(
+      ciphertextChunkCount,
+    );
+  });
+
+  it('update: paid legacy curated top-up requires the first ciphertext commitment', async () => {
+    const setup = await setupRegisteredAgentPublish();
+    const curatedCgId = await createCuratedContextGraphFor(setup.creator);
+    const storageOperator = accounts[19];
+    await HubContract.setContractAddress(
+      'TestStorageOperator',
+      storageOperator.address,
+    );
+
+    const currentEpoch = await Chronos.getCurrentEpoch();
+    const endEpoch = currentEpoch + BigInt(setup.epochs);
+    const initialTokenAmount = ethers.parseEther('1000');
+    const kaId = packReservedKaId(setup.creator.address, 777);
+    await DKGKnowledgeAssets.connect(storageOperator).createKnowledgeAsset(
+      storageOperator.address,
+      setup.creator.address,
+      kaId,
+      'legacy-curated-uncommitted-op',
+      ethers.keccak256(ethers.toUtf8Bytes('legacy-curated-uncommitted')),
+      1,
+      1000,
+      currentEpoch,
+      endEpoch,
+      initialTokenAmount,
+      false,
+      1,
+    );
+    await CGS.connect(storageOperator).registerKnowledgeAssetToContextGraph(
+      curatedCgId,
+      kaId,
+    );
+    expect(await DKGKnowledgeAssets.getLatestCiphertextChunksRoot(kaId)).to
+      .equal(ethers.ZeroHash);
+
+    const up = await buildUpdateParams({
+      chainId: DEFAULT_CHAIN_ID,
+      kav10Address: await KAV10.getAddress(),
+      receivingNodes: setup.receivingNodes,
+      publisherIdentityId: setup.publisherIdentityId,
+      receiverIdentityIds: setup.receiverIdentityIds,
+      contextGraphId: curatedCgId,
+      id: kaId,
+      preUpdateMerkleRootCount: 1n,
+      newMerkleRoot: ethers.keccak256(
+        ethers.toUtf8Bytes('legacy-curated-paid-top-up'),
+      ),
+      newByteSize: 1000n,
+      newTokenAmount: initialTokenAmount + ethers.parseEther('1'),
+      mintKnowledgeAssetsAmount: 0n,
+      knowledgeAssetsToBurn: [],
+      updateOperationId: 'legacy-curated-paid-top-up-op',
+      author: setup.creator,
+    });
+
+    await expect(KAV10.connect(setup.creator).update(up))
+      .to.be.revertedWithCustomError(
+        KAV10,
+        'CuratedCGRequiresCiphertextCommitment',
+      )
+      .withArgs(curatedCgId);
   });
 
   it('greenfield: a successful publish mints exactly one KA (the packed reservedKaId) to the author and binds it to the CG', async () => {

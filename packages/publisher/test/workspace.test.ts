@@ -122,7 +122,10 @@ async function encryptWorkspaceMessage(
 }
 
 beforeAll(async () => {
-  const cgId = await createTestContextGraph();
+  // Public CG (accessPolicy 0): these tests publish PLAINTEXT to exercise
+  // workspace/SWM/lifecycle mechanics, not curated/ciphertext semantics, so a
+  // curated CG would now revert (#1072 CuratedCGRequiresCiphertextCommitment).
+  const cgId = await createTestContextGraph(undefined, undefined, 0);
   CONTEXT_GRAPH = String(cgId);
   DATA_GRAPH = `did:dkg:context-graph:${CONTEXT_GRAPH}`;
   WORKSPACE_GRAPH = `did:dkg:context-graph:${CONTEXT_GRAPH}/_shared_memory`;

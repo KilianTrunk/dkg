@@ -87,11 +87,17 @@ export async function revertToBase(): Promise<void> {
 export async function createTestContextGraph(
   chain?: EVMChainAdapter,
   _identityId?: bigint,
+  accessPolicy: number = 1,
 ): Promise<bigint> {
   const adapter = chain ?? createEVMAdapter(HARDHAT_KEYS.CORE_OP);
+  // Default stays curated (accessPolicy 1 / publishPolicy 0) so existing
+  // curated call-sites are unchanged. Callers exercising plaintext lifecycle
+  // mechanics pass accessPolicy 0 to get the fully-public pairing
+  // (accessPolicy 0 / publishPolicy 1) — otherwise a plaintext publish to a
+  // curated CG now reverts with CuratedCGRequiresCiphertextCommitment.
   const result = await adapter.createOnChainContextGraph({
-    accessPolicy: 1,
-    publishPolicy: 0,
+    accessPolicy,
+    publishPolicy: accessPolicy === 0 ? 1 : 0,
   });
   if (!result.success || result.contextGraphId === 0n) {
     throw new Error(`Failed to create on-chain context graph: ${JSON.stringify(result)}`);

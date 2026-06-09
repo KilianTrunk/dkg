@@ -29,6 +29,11 @@ export class GossipSubManager {
         msg.data instanceof Uint8Array ? msg.data : new Uint8Array(0);
       const from = 'from' in msg ? String(msg.from) : 'unknown';
 
+      // F5: surface inbound application gossip on the node log so the UI's
+      // Gossip tab (which tails log lines matching /gossipsub|pubsub/i) shows
+      // real activity instead of an empty pane. One concise line per message.
+      console.log(`[GossipSub] recv ${data.length}B on "${topic}" from ${from.slice(-8)}`);
+
       this.eventBus.emit(DKGEvent.GOSSIP_MESSAGE, { topic, data, from });
 
       const handlers = this.topicHandlers.get(topic);
@@ -46,11 +51,15 @@ export class GossipSubManager {
 
   subscribe(topic: string): void {
     this.node.libp2p.services.pubsub.subscribe(topic);
+    // F5: log topic membership churn so the Gossip tab shows the node
+    // joining/leaving pubsub topics, not just message traffic.
+    console.log(`[GossipSub] subscribe "${topic}"`);
   }
 
   unsubscribe(topic: string): void {
     this.node.libp2p.services.pubsub.unsubscribe(topic);
     this.topicHandlers.delete(topic);
+    console.log(`[GossipSub] unsubscribe "${topic}"`);
   }
 
   async publish(topic: string, data: Uint8Array): Promise<void> {
@@ -64,6 +73,9 @@ export class GossipSubManager {
         },
       },
     );
+    // F5: log successful outbound publishes (after retry settles) so local
+    // gossip sends are visible in the Gossip tab alongside inbound traffic.
+    console.log(`[GossipSub] sent ${data.length}B to "${topic}"`);
   }
 
   onMessage(topic: string, handler: GossipMessageHandler): void {

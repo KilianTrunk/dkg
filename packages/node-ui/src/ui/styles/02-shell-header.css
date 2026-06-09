@@ -446,3 +446,33 @@ button.v10-notif-row:hover { background: var(--bg-hover); }
 }
 .v10-resize-handle-v:hover,
 .v10-resize-handle-v.active { background: var(--accent-green); height: 3px; }
+
+/* ── Responsive: narrow / split-screen viewports (F8) ──
+   The shell is a fixed three-column desktop layout (left tree · center ·
+   right panel) whose side-panel widths are inline-styled from the layout
+   store, so at narrow widths the center could be squeezed to nothing and
+   the header controls could clip. These rules are purely presentational —
+   no behavioural or store changes — and only engage below desktop widths:
+     · ≤ 860px  collapse the side rails so the center gets the full width
+     · ≤ 600px  let the header scroll horizontally instead of clipping */
+@media (max-width: 860px) {
+  .v10-app-body > .v10-panel-left,
+  .v10-app-body > .v10-panel-right {
+    display: none !important;
+  }
+  .v10-app-body > .v10-resize-handle-h {
+    display: none !important;
+  }
+  .v10-center-region {
+    flex: 1 1 100% !important;
+    min-width: 0;
+  }
+}
+@media (max-width: 600px) {
+  .v10-header {
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-width: none;
+  }
+  .v10-header::-webkit-scrollbar { display: none; }
+}

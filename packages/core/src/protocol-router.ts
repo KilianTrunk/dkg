@@ -380,7 +380,14 @@ export class ProtocolRouter {
           }
           return;
         }
-        console.error(`[ProtocolRouter] handler error on ${protocolId} from ${connection.remotePeer.toString().slice(-8)}:`, err instanceof Error ? err.message : err);
+        // F3: peer closed/reset the stream before the response was written —
+        // routine churn, not a fault. Downgrade to a quiet warn (no "error"
+        // token) so it doesn't spam the node log as a red error line.
+        if (isBenignStreamClosure(err)) {
+          console.warn(`[ProtocolRouter] stream closed by peer before response on ${protocolId} from ${connection.remotePeer.toString().slice(-8)}`);
+        } else {
+          console.error(`[ProtocolRouter] handler error on ${protocolId} from ${connection.remotePeer.toString().slice(-8)}:`, err instanceof Error ? err.message : err);
+        }
         try {
           stream.abort(new Error('handler error'));
         } catch {
@@ -1316,6 +1323,28 @@ function asAbortError(reason: unknown): Error {
   const err = new Error(typeof reason === 'string' ? reason : 'aborted');
   (err as Error & { name: string }).name = 'AbortError';
   return err;
+}
+
+// F3: a peer that closes/resets its side of a stream before we finish
+// writing the response surfaces in the inbound handler as a stream-lifecycle
+// error (e.g. "Cannot write to a stream that is closed"), not a real handler
+// fault. These are routine during peer churn and shouldn't be logged as red
+// errors. Recognise the benign cases so the handler can downgrade them.
+function isBenignStreamClosure(err: unknown): boolean {
+  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+  if (!msg) return false;
+  return (
+    msg.includes('stream that is closed') ||
+    msg.includes('stream is closed') ||
+    msg.includes('stream closed') ||
+    msg.includes('stream reset') ||
+    msg.includes('stream ended') ||
+    msg.includes('stream aborted') ||
+    msg.includes('writable end') ||
+    msg.includes('write after end') ||
+    msg.includes('muxer is closed') ||
+    msg.includes('connection closed')
+  );
 }
 
 async function readAll(

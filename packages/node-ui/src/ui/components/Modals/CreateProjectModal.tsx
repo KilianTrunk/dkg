@@ -58,7 +58,11 @@ export function CreateProjectModal({ open, onClose }: CreateProjectModalProps) {
   // Agent-identity load state drives the Retry affordance + the Create
   // button copy; added on v10-rc alongside the private-CG fix so the
   // modal degrades gracefully when /api/agent/current 401s during boot.
-  const [identityLoading, setIdentityLoading] = useState(false);
+  // Start in the loading state: the modal always kicks off an identity
+  // fetch on open (see effect below), and the fetch is dispatched from an
+  // effect that runs AFTER the first paint. Seeding `true` avoids a single
+  // frame where the button would otherwise read "Agent unavailable". (F4)
+  const [identityLoading, setIdentityLoading] = useState(true);
   const [identityError, setIdentityError] = useState(false);
 
   const { setContextGraphs, contextGraphs, setActiveProject } = useProjectsStore();
@@ -572,7 +576,15 @@ export function CreateProjectModal({ open, onClose }: CreateProjectModalProps) {
             onClick={handleCreate}
             disabled={!name.trim() || !!validateCgName(name) || creating || !agentAddress || identityLoading}
           >
-            {creating ? progress || 'Creating…' : identityLoading ? 'Loading agent…' : !agentAddress ? 'Agent unavailable' : 'Create Context Graph'}
+            {creating
+              ? progress || 'Creating…'
+              : !agentAddress
+                // Only call the agent "unavailable" once the identity load
+                // has actually failed. Before that (initial open + in-flight
+                // fetch) the address is simply not resolved yet, so show a
+                // loading state instead of flashing an error label. (F4)
+                ? (identityError ? 'Agent unavailable' : 'Loading agent…')
+                : 'Create Context Graph'}
           </button>
         </div>
       </div>

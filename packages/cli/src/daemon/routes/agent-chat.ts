@@ -1037,6 +1037,15 @@ export async function handleAgentChatRoutes(ctx: RequestContext): Promise<void> 
       });
     } catch (err) {
       tracker.fail(ctx, err);
+      // F1: a missing/invalid off-band update attestation
+      // (`precomputedUpdateAttestation`) is a caller precondition failure,
+      // not a server fault. The publisher throws a plain Error for it; map
+      // those to 422 (Unprocessable Entity) so the API surfaces a proper 4xx
+      // instead of letting it bubble to the generic 500 handler.
+      const message = err instanceof Error ? err.message : String(err);
+      if (message.includes('precomputedUpdateAttestation')) {
+        return jsonResponse(res, 422, { error: message });
+      }
       throw err;
     }
   }

@@ -133,8 +133,11 @@ function NodeLogContent() {
 }
 
 // ── Transactions ──────────────────────────────────────────────────────────────
-// Shows operations that reached the `chain` phase, giving a real-time view of
-// on-chain activity. Covers all op types that can submit a tx.
+// Real-time view of publish / update / verify activity. On-chain operations
+// show their transaction hash; local-first operations (the default on a node
+// that hasn't opted into on-chain registration) have no tx and are tagged
+// "local" so a publish is always visible here instead of silently vanishing
+// because it never reached the `chain` phase (F2).
 // Replaces with OTEL-sourced chain events once the telemetry stack is live.
 
 const TX_OP_TYPES = new Set(['publish', 'publishFromSWM', 'update', 'ka-update', 'verify', 'reconstruct']);
@@ -157,10 +160,10 @@ function TransactionsContent() {
     const names = [...TX_OP_TYPES].join(',');
     api.fetchOperationsWithPhases({ limit: '100', from, names })
       .then((data: any) => {
-        const filtered = (data?.operations ?? []).filter((op: any) =>
-          op.tx_hash || (op.phases ?? []).some((p: any) => p.phase === 'chain')
-        );
-        setOps(filtered);
+        // The `names` param already scopes the result to tx-capable op types.
+        // Don't drop the ones that never reached the `chain` phase — those are
+        // local-first publishes/updates the operator still wants to see. (F2)
+        setOps(data?.operations ?? []);
       })
       .catch(() => {});
   }, []);
@@ -174,7 +177,7 @@ function TransactionsContent() {
   if (ops.length === 0) {
     return (
       <div style={{ padding: '20px 16px', color: 'var(--text-tertiary)', fontSize: 12 }}>
-        No on-chain transactions in the last 6 hours.
+        No publish, update, or verify activity in the last 6 hours.
       </div>
     );
   }
@@ -223,7 +226,9 @@ function TransactionsContent() {
                     {op.started_at ? formatTime(op.started_at) : '—'}
                   </td>
                   <td style={{ padding: '7px 12px', fontFamily: 'var(--font-mono)', color: 'var(--text-tertiary)', maxWidth: 140, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                    {txHash ? `${txHash.slice(0, 10)}…` : '—'}
+                    {txHash
+                      ? `${txHash.slice(0, 10)}…`
+                      : <span style={{ fontFamily: 'var(--font-sans)', fontStyle: 'italic', color: 'var(--text-tertiary)' }}>local</span>}
                   </td>
                 </tr>
                 {isExp && (

@@ -135,7 +135,13 @@ const PINNED_DIGESTS: Record<string, string> = {
   // rotates the commitment.
 
   // Greenfield rename (rc.12): logic + storage pair replaces the legacy names.
-  KnowledgeAssetsLifecycle:     '45957310345c8cc8dd027ccf006bd0730e47510d72f8d14857de251788b10a52',
+  // Updated PR #1072 (RFC-39): the chain-local ABI now declares the new
+  // `CuratedCGRequiresCiphertextCommitment(uint256)` error. evm-adapter-abi
+  // resolves this contract from packages/chain/abi/ first (the evm-module copy
+  // is only a fallback), so the error had to be added here for chain-side revert
+  // decoding to name it instead of "unknown custom error". Digest now matches
+  // the evm-module ABI surface.
+  KnowledgeAssetsLifecycle:     'e9c457c5208f0a2da42ec9ced785e1241da4c1a1c6e4ef05d28828b9022ad5d1',
 
   // Re-pinned for OT-RFC-43 Option-1 (variant 1a, PR #975): deterministic
   // author-namespaced KA identity. `createKnowledgeAsset` now takes an explicit

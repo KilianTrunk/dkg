@@ -88,16 +88,19 @@ export async function createTestContextGraph(
   chain?: EVMChainAdapter,
   _identityId?: bigint,
   accessPolicy: number = 1,
+  publishPolicy: number = accessPolicy === 0 ? 1 : 0,
 ): Promise<bigint> {
   const adapter = chain ?? createEVMAdapter(HARDHAT_KEYS.CORE_OP);
-  // Default stays curated (accessPolicy 1 / publishPolicy 0) so existing
-  // curated call-sites are unchanged. Callers exercising plaintext lifecycle
-  // mechanics pass accessPolicy 0 to get the fully-public pairing
-  // (accessPolicy 0 / publishPolicy 1) — otherwise a plaintext publish to a
-  // curated CG now reverts with CuratedCGRequiresCiphertextCommitment.
+  // accessPolicy and publishPolicy are independent on-chain. Defaults keep
+  // curated (accessPolicy 1 / publishPolicy 0) so existing curated call-sites
+  // are unchanged; accessPolicy 0 defaults to the fully-public pairing
+  // (publishPolicy 1) so a plaintext publish doesn't hit
+  // CuratedCGRequiresCiphertextCommitment. publishPolicy is an explicit
+  // override so other valid modes (e.g. accessPolicy 0 / publishPolicy 0)
+  // remain reachable through this shared helper.
   const result = await adapter.createOnChainContextGraph({
     accessPolicy,
-    publishPolicy: accessPolicy === 0 ? 1 : 0,
+    publishPolicy,
   });
   if (!result.success || result.contextGraphId === 0n) {
     throw new Error(`Failed to create on-chain context graph: ${JSON.stringify(result)}`);

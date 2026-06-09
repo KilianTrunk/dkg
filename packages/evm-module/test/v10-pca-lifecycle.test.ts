@@ -680,6 +680,140 @@ describe('@integration V10 PCA lifecycle (DKGPublishingConvictionNFT)', function
       .withArgs(curatedCgId);
   });
 
+  it('update: paid legacy curated top-up succeeds when it supplies the first ciphertext commitment', async () => {
+    const setup = await setupRegisteredAgentPublish();
+    const curatedCgId = await createCuratedContextGraphFor(setup.creator);
+    const storageOperator = accounts[19];
+    await HubContract.setContractAddress(
+      'TestStorageOperator',
+      storageOperator.address,
+    );
+
+    const currentEpoch = await Chronos.getCurrentEpoch();
+    const endEpoch = currentEpoch + BigInt(setup.epochs);
+    const initialTokenAmount = ethers.parseEther('1000');
+    const kaId = packReservedKaId(setup.creator.address, 778);
+    await DKGKnowledgeAssets.connect(storageOperator).createKnowledgeAsset(
+      storageOperator.address,
+      setup.creator.address,
+      kaId,
+      'legacy-curated-first-commit-op',
+      ethers.keccak256(ethers.toUtf8Bytes('legacy-curated-first-commit')),
+      1,
+      1000,
+      currentEpoch,
+      endEpoch,
+      initialTokenAmount,
+      false,
+      1,
+    );
+    await CGS.connect(storageOperator).registerKnowledgeAssetToContextGraph(
+      curatedCgId,
+      kaId,
+    );
+    expect(await DKGKnowledgeAssets.getLatestCiphertextChunksRoot(kaId)).to
+      .equal(ethers.ZeroHash);
+
+    const firstCommitmentRoot = ethers.keccak256(
+      ethers.toUtf8Bytes('legacy-curated-first-commit-root'),
+    );
+    const firstCommitmentCount = 4n;
+    const up = await buildUpdateParams({
+      chainId: DEFAULT_CHAIN_ID,
+      kav10Address: await KAV10.getAddress(),
+      receivingNodes: setup.receivingNodes,
+      publisherIdentityId: setup.publisherIdentityId,
+      receiverIdentityIds: setup.receiverIdentityIds,
+      contextGraphId: curatedCgId,
+      id: kaId,
+      preUpdateMerkleRootCount: 1n,
+      newMerkleRoot: ethers.keccak256(
+        ethers.toUtf8Bytes('legacy-curated-paid-top-up-committed'),
+      ),
+      newByteSize: 1000n,
+      newTokenAmount: initialTokenAmount + ethers.parseEther('1'),
+      mintKnowledgeAssetsAmount: 0n,
+      knowledgeAssetsToBurn: [],
+      updateOperationId: 'legacy-curated-first-commit-op',
+      author: setup.creator,
+      newCiphertextChunksRoot: firstCommitmentRoot,
+      newCiphertextChunkCount: firstCommitmentCount,
+    });
+
+    await (await KAV10.connect(setup.creator).update(up)).wait();
+
+    // The paid top-up supplied the first commitment, so the legacy KA can now
+    // enter value-weighted sampling — the commitment anchor is persisted.
+    expect(await DKGKnowledgeAssets.getLatestCiphertextChunksRoot(kaId)).to
+      .equal(firstCommitmentRoot);
+    expect(await DKGKnowledgeAssets.getCiphertextChunkCount(kaId)).to.equal(
+      firstCommitmentCount,
+    );
+  });
+
+  it('update: metadata-only maintenance of a legacy uncommitted curated KA stays allowed without a commitment', async () => {
+    const setup = await setupRegisteredAgentPublish();
+    const curatedCgId = await createCuratedContextGraphFor(setup.creator);
+    const storageOperator = accounts[19];
+    await HubContract.setContractAddress(
+      'TestStorageOperator',
+      storageOperator.address,
+    );
+
+    const currentEpoch = await Chronos.getCurrentEpoch();
+    const endEpoch = currentEpoch + BigInt(setup.epochs);
+    const initialTokenAmount = ethers.parseEther('1000');
+    const kaId = packReservedKaId(setup.creator.address, 779);
+    await DKGKnowledgeAssets.connect(storageOperator).createKnowledgeAsset(
+      storageOperator.address,
+      setup.creator.address,
+      kaId,
+      'legacy-curated-metadata-only-op',
+      ethers.keccak256(ethers.toUtf8Bytes('legacy-curated-metadata-only')),
+      1,
+      1000,
+      currentEpoch,
+      endEpoch,
+      initialTokenAmount,
+      false,
+      1,
+    );
+    await CGS.connect(storageOperator).registerKnowledgeAssetToContextGraph(
+      curatedCgId,
+      kaId,
+    );
+
+    // No paid top-up (newTokenAmount unchanged) and no ciphertext pair: this is
+    // metadata-only maintenance, which stays allowed for legacy uncommitted
+    // curated KAs — the commitment gate only guards value-adding (paid) updates.
+    const up = await buildUpdateParams({
+      chainId: DEFAULT_CHAIN_ID,
+      kav10Address: await KAV10.getAddress(),
+      receivingNodes: setup.receivingNodes,
+      publisherIdentityId: setup.publisherIdentityId,
+      receiverIdentityIds: setup.receiverIdentityIds,
+      contextGraphId: curatedCgId,
+      id: kaId,
+      preUpdateMerkleRootCount: 1n,
+      newMerkleRoot: ethers.keccak256(
+        ethers.toUtf8Bytes('legacy-curated-metadata-only-update'),
+      ),
+      newByteSize: 1000n,
+      newTokenAmount: initialTokenAmount,
+      mintKnowledgeAssetsAmount: 0n,
+      knowledgeAssetsToBurn: [],
+      updateOperationId: 'legacy-curated-metadata-only-op',
+      author: setup.creator,
+    });
+
+    await (await KAV10.connect(setup.creator).update(up)).wait();
+
+    // Still uncommitted and that is fine — metadata maintenance does not force
+    // a commitment on a legacy curated KA.
+    expect(await DKGKnowledgeAssets.getLatestCiphertextChunksRoot(kaId)).to
+      .equal(ethers.ZeroHash);
+  });
+
   it('greenfield: a successful publish mints exactly one KA (the packed reservedKaId) to the author and binds it to the CG', async () => {
     const setup = await setupRegisteredAgentPublish();
     const p = await buildBasePublishParams(setup, 'greenfield-mint');

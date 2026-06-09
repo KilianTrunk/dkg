@@ -163,4 +163,45 @@ describe('POST /api/update — kaId response contract (KC→KA)', () => {
     expect(JSON.parse(res.body).error).toMatch(/Invalid "kaId"/);
     expect(update).not.toHaveBeenCalled();
   });
+
+  it('maps a missing precomputedUpdateAttestation precondition to 422, not 500', async () => {
+    // An on-chain update requires an off-band UpdateAuthorAttestation seal;
+    // when it's absent the publisher throws a plain Error mentioning
+    // `precomputedUpdateAttestation`. That is a CALLER precondition failure,
+    // so the route must surface a 422 (Unprocessable Entity) rather than let
+    // it bubble to the generic 500 handler. This pins the 4xx contract so a
+    // future publisher message tweak can't silently regress it back to 500.
+    const update = vi.fn(async () => {
+      throw new Error(
+        'Update rejected: on-chain update requires precomputedUpdateAttestation. ' +
+        'Sign UpdateAuthorAttestation(kaId, newMerkleRoot, authorAddress) off-band and pass the seal in this call.',
+      );
+    });
+    const { res, done } = runUpdate(
+      { kaId: '7', contextGraphId: 'project-a', quads: QUADS },
+      { update },
+    );
+    await done;
+    expect(res.statusCode).toBe(422);
+    expect(JSON.parse(res.body).error).toMatch(/precomputedUpdateAttestation/);
+    // The agent WAS invoked (this is a runtime precondition, not an
+    // input-validation reject like the 400 cases above).
+    expect(update).toHaveBeenCalledTimes(1);
+  });
+
+  it('still propagates a genuine update fault as a non-4xx failure (not masked as 422)', async () => {
+    // Only the attestation precondition maps to 422. An unrelated runtime
+    // fault must NOT be downgraded — it should propagate (the generic 500
+    // handler owns it), so the 422 mapping can't accidentally swallow real
+    // server errors.
+    const update = vi.fn(async () => {
+      throw new Error('boom: blazegraph unreachable');
+    });
+    const { res, done } = runUpdate(
+      { kaId: '7', contextGraphId: 'project-a', quads: QUADS },
+      { update },
+    );
+    await expect(done).rejects.toThrow(/blazegraph unreachable/);
+    expect(res.statusCode).not.toBe(422);
+  });
 });

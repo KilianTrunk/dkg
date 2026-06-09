@@ -1326,10 +1326,18 @@ function asAbortError(reason: unknown): Error {
 }
 
 // F3: a peer that closes/resets its side of a stream before we finish
-// writing the response surfaces in the inbound handler as a stream-lifecycle
-// error (e.g. "Cannot write to a stream that is closed"), not a real handler
-// fault. These are routine during peer churn and shouldn't be logged as red
-// errors. Recognise the benign cases so the handler can downgrade them.
+// writing the response surfaces in the inbound handler as a stream-write
+// lifecycle error (e.g. "Cannot write to a stream that is closed"), not a
+// real handler fault. These are routine during peer churn and shouldn't be
+// logged as red errors. Recognise the benign cases so the handler can
+// downgrade them.
+//
+// Match ONLY stream-write / stream-lifecycle signals. We deliberately do
+// NOT match broad connection- or muxer-level text ("connection closed",
+// "muxer is closed"): a genuine handler bug can throw an error that merely
+// mentions a closed connection, and swallowing those would hide real faults
+// (Codex). Keep the matcher to the narrow set of phrases that specifically
+// denote writing to / reacting on an already-closed or reset stream.
 function isBenignStreamClosure(err: unknown): boolean {
   const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
   if (!msg) return false;
@@ -1341,9 +1349,7 @@ function isBenignStreamClosure(err: unknown): boolean {
     msg.includes('stream ended') ||
     msg.includes('stream aborted') ||
     msg.includes('writable end') ||
-    msg.includes('write after end') ||
-    msg.includes('muxer is closed') ||
-    msg.includes('connection closed')
+    msg.includes('write after end')
   );
 }
 

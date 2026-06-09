@@ -228,7 +228,14 @@ function TransactionsContent() {
                   <td style={{ padding: '7px 12px', fontFamily: 'var(--font-mono)', color: 'var(--text-tertiary)', maxWidth: 140, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                     {txHash
                       ? `${txHash.slice(0, 10)}…`
-                      : <span style={{ fontFamily: 'var(--font-sans)', fontStyle: 'italic', color: 'var(--text-tertiary)' }}>local</span>}
+                      // Only a SUCCESSFULLY-completed op with no chain phase is a
+                      // genuine local-first run worth the "local" tag. A no-tx op
+                      // that failed or is still in flight before reaching `chain`
+                      // must NOT read as a successful local run — show "—" so the
+                      // Status column stays the source of truth for those (Codex).
+                      : op.status === 'success'
+                        ? <span style={{ fontFamily: 'var(--font-sans)', fontStyle: 'italic', color: 'var(--text-tertiary)' }}>local</span>
+                        : '—'}
                   </td>
                 </tr>
                 {isExp && (

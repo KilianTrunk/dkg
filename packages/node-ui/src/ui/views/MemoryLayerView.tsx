@@ -1,6 +1,6 @@
 import React, { useState, useMemo, useCallback, lazy, Suspense } from 'react';
 import { useFetch } from '../hooks.js';
-import { executeQuery, listAssertions, promoteAssertion, publishSharedMemory, listSwmEntities, describePromoteResult, describePromoteError, type AssertionInfo, type PublishResult, type SwmRootEntity } from '../api.js';
+import { executeQuery, fetchStatus, listAssertions, promoteAssertion, publishSharedMemory, listSwmEntities, describePromoteResult, describePromoteError, type AssertionInfo, type PublishResult, type SwmRootEntity } from '../api.js';
 import { FilePreviewModal } from '../components/Modals/FilePreviewModal.js';
 import { useMemoryGraphEvents } from '../hooks/useNodeEvents.js';
 import { memoryGraphLabels } from '../lib/memoryLabels.js';
@@ -11,6 +11,11 @@ const RdfGraph = lazy(() =>
 );
 const NodePanel = lazy(() =>
   import('@origintrail-official/dkg-graph-viz/react').then(m => ({ default: m.NodePanel }))
+);
+// Lazy — the card imports `useRdfGraph` from the viz package; deferring it
+// keeps the graph renderer out of the main bundle (matches RdfGraph/NodePanel).
+const OnChainProvenanceCard = lazy(() =>
+  import('../components/OnChainProvenanceCard.js').then(m => ({ default: m.OnChainProvenanceCard }))
 );
 
 type MemoryLayer = 'wm' | 'swm' | 'vm';
@@ -169,6 +174,11 @@ export function MemoryLayerView({ layer, contextGraphId, externalQuery, external
     0
   );
   useMemoryGraphEvents(contextGraphId, refresh, { layers: [layer] });
+
+  // Block-explorer base URL for the on-chain provenance card's tx/address
+  // links. Polled slowly; absent in no-chain / mock mode (links degrade out).
+  const { data: statusData } = useFetch(fetchStatus, [], 30_000);
+  const explorerUrl = (statusData as any)?.blockExplorerUrl as string | undefined;
 
   const runQuery = useCallback(() => {
     const next = draftQuery.trim();
@@ -406,6 +416,11 @@ export function MemoryLayerView({ layer, contextGraphId, externalQuery, external
                 showProperties
                 showMetadata={false}
                 maxValueLength={150}
+              />
+              <OnChainProvenanceCard
+                contextGraphId={contextGraphId}
+                layer={layer}
+                explorerUrl={explorerUrl}
               />
             </RdfGraph>
           </Suspense>

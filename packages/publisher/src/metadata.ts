@@ -1469,14 +1469,14 @@ export function generateAssertionPublishedMetadata(meta: AssertionPublishedMeta)
   const eventUri = `${subject}/event/${nextEventId()}`;
   const ins: Quad[] = [
     mq(subject, `${DKG}state`, lit('published'), metaGraph),
-    mq(subject, `${DKG}memoryLayer`, lit(MemoryLayer.VerifiedMemory), metaGraph),
+    mq(subject, `${DKG}memoryLayer`, lit(MemoryLayer.VerifiableMemory), metaGraph),
     mq(eventUri, `${RDF}type`, `${PROV}Activity`, metaGraph),
     mq(eventUri, `${RDF}type`, `${DKG}AssertionPublished`, metaGraph),
     mq(eventUri, `${PROV}startedAtTime`, dateLit(meta.timestamp), metaGraph),
     mq(eventUri, `${PROV}wasAssociatedWith`, agentUri, metaGraph),
     mq(eventUri, `${PROV}used`, subject, metaGraph),
     mq(eventUri, `${DKG}fromLayer`, lit(MemoryLayer.SharedWorkingMemory), metaGraph),
-    mq(eventUri, `${DKG}toLayer`, lit(MemoryLayer.VerifiedMemory), metaGraph),
+    mq(eventUri, `${DKG}toLayer`, lit(MemoryLayer.VerifiableMemory), metaGraph),
     mq(eventUri, `${DKG}kcUal`, meta.kcUal, metaGraph),
   ];
   // OT-RFC-43 A2 — stamp the VM pointer (vmCurrentAssertion).
@@ -1534,14 +1534,14 @@ export function generateAssertionUpdatedMetadata(meta: AssertionUpdatedMeta): { 
 
   const ins: Quad[] = [
     mq(subject, `${DKG}state`, lit('published'), metaGraph),
-    mq(subject, `${DKG}memoryLayer`, lit(MemoryLayer.VerifiedMemory), metaGraph),
+    mq(subject, `${DKG}memoryLayer`, lit(MemoryLayer.VerifiableMemory), metaGraph),
     mq(eventUri, `${RDF}type`, `${PROV}Activity`, metaGraph),
     mq(eventUri, `${RDF}type`, `${DKG}AssertionUpdated`, metaGraph),
     mq(eventUri, `${PROV}startedAtTime`, dateLit(meta.timestamp), metaGraph),
     mq(eventUri, `${PROV}wasAssociatedWith`, agentUri, metaGraph),
     mq(eventUri, `${PROV}used`, subject, metaGraph),
-    mq(eventUri, `${DKG}fromLayer`, lit(MemoryLayer.VerifiedMemory), metaGraph),
-    mq(eventUri, `${DKG}toLayer`, lit(MemoryLayer.VerifiedMemory), metaGraph),
+    mq(eventUri, `${DKG}fromLayer`, lit(MemoryLayer.VerifiableMemory), metaGraph),
+    mq(eventUri, `${DKG}toLayer`, lit(MemoryLayer.VerifiableMemory), metaGraph),
     mq(eventUri, `${DKG}kcUal`, meta.kcUal, metaGraph),
     // New per-layer pointers — WM converges back to VM after the update mint.
     assertionLayerPointerQuad(subject, VM_CURRENT_ASSERTION_PRED, newBare, metaGraph),

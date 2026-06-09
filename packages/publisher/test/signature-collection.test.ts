@@ -834,7 +834,7 @@ describe('Regression: fail-fast when chain rejects', () => {
     // unconfirmed quads were written to the root data graph as if
     // they had landed on-chain. That silent downgrade was the
     // tentative-VM defect the dzudza incident exposed: failed
-    // publishes appeared in `verified-memory` queries as confirmed
+    // publishes appeared in `verifiable-memory` queries as confirmed
     // data, and the daemon log only ever said "On-chain tx failed".
     //
     // Post-PR2 the catch path re-throws the underlying chain error
@@ -877,7 +877,7 @@ describe('Regression: fail-fast when chain rejects', () => {
     // root data graph is only ever populated by a confirmed publish
     // (or one of the two intentional non-chain skip branches —
     // missing CG id / non-V10 adapter). A failed on-chain publish
-    // must leave the local store untouched so the `verified-memory`
+    // must leave the local store untouched so the `verifiable-memory`
     // view in `dkg-query-engine.ts` cannot surface ghost rows.
     const store = new OxigraphStore();
     const chain = createEVMAdapter(HARDHAT_KEYS.EXTRA2);

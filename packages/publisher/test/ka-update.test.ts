@@ -45,15 +45,15 @@ function q(s: string, p: string, o: string, g = ''): Quad {
 /**
  * rc.17 uniform per-KA layout: a confirmed publish (and any subsequent update,
  * which targets batchId === the original kaId) writes/replaces a KA's public
- * quads in the PER-KA verified-memory graph
- *   did:dkg:context-graph:{cg}/_verified_memory/{author}/{number}
+ * quads in the PER-KA verifiable-memory graph
+ *   did:dkg:context-graph:{cg}/_verifiable_memory/{author}/{number}
  * where author = kaId >> 96 and number = kaId & (2^96 - 1). Assertions that
  * checked the monolithic root data graph must now read this per-KA graph.
  */
 function vmGraphFor(contextGraphId: string, kaId: bigint): string {
   return contextGraphLayerUri(
     contextGraphId,
-    MemoryLayer.VerifiedMemory,
+    MemoryLayer.VerifiableMemory,
     '0x' + (kaId >> 96n).toString(16).padStart(40, '0'),
     kaId & ((1n << 96n) - 1n),
   );
@@ -239,7 +239,7 @@ describe('UpdateHandler', () => {
 
     await handler.handle(message, '12D3KooWPeerA');
 
-    // rc.17: the update replaces data in the per-KA verified-memory graph
+    // rc.17: the update replaces data in the per-KA verifiable-memory graph
     // (keyed by batchId === original.kaId), not the monolithic root graph.
     const vmGraph = vmGraphFor(CONTEXT_GRAPH, original.kaId);
     const nameResult = await store.query(
@@ -431,7 +431,7 @@ describe('UpdateHandler', () => {
     await handler.handle(message, '12D3KooWAttacker');
 
     // The rejected gossip must not change the local data; publisher.update()
-    // already wrote "Updated" into the per-KA verified-memory graph.
+    // already wrote "Updated" into the per-KA verifiable-memory graph.
     const vmGraph = vmGraphFor(CONTEXT_GRAPH, original.kaId);
     const nameResult = await store.query(
       `SELECT ?o WHERE { GRAPH <${vmGraph}> { <${ENTITY_A}> <http://schema.org/name> ?o } }`,
@@ -470,7 +470,7 @@ describe('UpdateHandler', () => {
 
     await handler.handle(message, '12D3KooWPeerA');
 
-    // The tampered gossip must be rejected; the per-KA verified-memory graph
+    // The tampered gossip must be rejected; the per-KA verifiable-memory graph
     // still holds the legit update written by publisher.update().
     const vmGraph = vmGraphFor(CONTEXT_GRAPH, original.kaId);
     const nameResult = await store.query(
@@ -517,7 +517,7 @@ describe('UpdateHandler', () => {
     await handler.handle(message, '12D3KooWPeerA');
 
     // The whole update is rejected (unauthenticated root), so the injected
-    // entity must not appear in the KA's per-KA verified-memory graph.
+    // entity must not appear in the KA's per-KA verifiable-memory graph.
     const vmGraph = vmGraphFor(CONTEXT_GRAPH, original.kaId);
     const injectedResult = await store.query(
       `ASK { GRAPH <${vmGraph}> { <urn:test:injected> <http://schema.org/name> ?o } }`,
@@ -558,7 +558,7 @@ describe('UpdateHandler', () => {
 
     await handler.handle(msg1, '12D3KooWPeerA');
 
-    // rc.17: updates land in the per-KA verified-memory graph (keyed by
+    // rc.17: updates land in the per-KA verifiable-memory graph (keyed by
     // batchId === original.kaId), not the monolithic root graph.
     const vmGraph = vmGraphFor(CONTEXT_GRAPH, original.kaId);
     // Verify update1 was applied
@@ -647,7 +647,7 @@ describe('UpdateHandler', () => {
     });
     await handler.handle(msg1, '12D3KooWPeerA');
 
-    // The stale (lower-block) update is rejected; the per-KA verified-memory
+    // The stale (lower-block) update is rejected; the per-KA verifiable-memory
     // graph still holds Update 2.
     const vmGraph = vmGraphFor(CONTEXT_GRAPH, original.kaId);
     const nameResult = await store.query(
@@ -688,7 +688,7 @@ describe('UpdateHandler', () => {
     // Replay same message — should be rejected (same block height)
     await handler.handle(message, '12D3KooWPeerA');
 
-    // Replay rejected: per-KA verified-memory graph holds a single "Updated".
+    // Replay rejected: per-KA verifiable-memory graph holds a single "Updated".
     const vmGraph = vmGraphFor(CONTEXT_GRAPH, original.kaId);
     const nameResult = await store.query(
       `SELECT ?o WHERE { GRAPH <${vmGraph}> { <${ENTITY_A}> <http://schema.org/name> ?o } }`,
@@ -733,7 +733,7 @@ describe('UpdateHandler', () => {
       quads: [q(ENTITY_A, 'http://schema.org/name', '"Updated"')],
     });
 
-    // rc.17: publisher.update() replaces triples in the per-KA verified-memory
+    // rc.17: publisher.update() replaces triples in the per-KA verifiable-memory
     // graph (keyed by batchId === original.kaId), not the monolithic root graph.
     const vmGraph = vmGraphFor(CONTEXT_GRAPH, original.kaId);
     const nameResult = await store.query(
@@ -790,7 +790,7 @@ describe('UpdateHandler', () => {
     await handler.handle(message, '12D3KooWPeerA');
 
     // Both entities belong to the same KA, so both land in that KA's per-KA
-    // verified-memory graph (keyed by batchId === original.kaId).
+    // verifiable-memory graph (keyed by batchId === original.kaId).
     const vmGraph = vmGraphFor(CONTEXT_GRAPH, original.kaId);
     for (const [entity, expected] of [[ENTITY_A, 'A-updated'], [ENTITY_B, 'B-updated']] as const) {
       const result = await store.query(

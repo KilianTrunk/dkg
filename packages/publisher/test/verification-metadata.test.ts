@@ -5,16 +5,16 @@ describe('buildVerificationMetadata', () => {
   it('produces verification metadata quads', () => {
     const quads = buildVerificationMetadata({
       contextGraphId: 'ml-research',
-      verifiedMemoryId: 'team-decisions',
+      verifiableMemoryId: 'team-decisions',
       batchId: 42n,
       txHash: '0xabc123',
       blockNumber: 19876543,
       signers: ['0xAlice', '0xBob', '0xCharlie'],
       verifiedAt: new Date('2026-04-01T12:00:00Z'),
-      graph: 'did:dkg:context-graph:ml-research/_verified_memory/team-decisions/_meta',
+      graph: 'did:dkg:context-graph:ml-research/_verifiable_memory/team-decisions/_meta',
     });
 
-    // Should have: type, contextGraphId, verifiedMemoryId, batchId, txHash, blockNumber, verifiedAt, signerCount, + 3 signedBy
+    // Should have: type, contextGraphId, verifiableMemoryId, batchId, txHash, blockNumber, verifiedAt, signerCount, + 3 signedBy
     expect(quads).toHaveLength(11);
 
     const typeQuad = quads.find(q => q.predicate.endsWith('#type'));
@@ -28,14 +28,14 @@ describe('buildVerificationMetadata', () => {
 
     // All quads use the provided graph
     for (const q of quads) {
-      expect(q.graph).toBe('did:dkg:context-graph:ml-research/_verified_memory/team-decisions/_meta');
+      expect(q.graph).toBe('did:dkg:context-graph:ml-research/_verifiable_memory/team-decisions/_meta');
     }
   });
 
   it('formats agent addresses as DIDs when not already DID format', () => {
     const quads = buildVerificationMetadata({
       contextGraphId: 'test',
-      verifiedMemoryId: 'vm1',
+      verifiableMemoryId: 'vm1',
       batchId: 1n,
       txHash: '0x1',
       blockNumber: 1,
@@ -51,7 +51,7 @@ describe('buildVerificationMetadata', () => {
   it('preserves DID format when already provided', () => {
     const quads = buildVerificationMetadata({
       contextGraphId: 'test',
-      verifiedMemoryId: 'vm1',
+      verifiableMemoryId: 'vm1',
       batchId: 1n,
       txHash: '0x1',
       blockNumber: 1,

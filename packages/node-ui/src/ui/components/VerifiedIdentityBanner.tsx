@@ -1,5 +1,5 @@
 /**
- * Prominent on-chain identity block for a Verified Memory entity.
+ * Prominent on-chain identity block for a Verifiable Memory entity.
  * Surfaces the three things a curator needs to confirm an anchored
  * KA: its UAL, who owns it, and when it was published (plus who
  * actually fired the publish). Rendered above the Provenance Trail

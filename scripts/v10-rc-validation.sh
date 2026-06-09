@@ -526,17 +526,17 @@ fi
 # ────────────────────────────────────────────────────────────────────────────
 section "11. QUERY VIEWS"
 
-echo "--- 11a: Query with view=verified-memory ---"
+echo "--- 11a: Query with view=verifiable-memory ---"
 VM_Q=$(post 9201 /api/query -H "Content-Type: application/json" -d "{
   \"sparql\": \"SELECT ?name WHERE { <$ALICE_URI> <http://schema.org/name> ?name }\",
   \"contextGraphId\": \"$CG\",
-  \"view\": \"verified-memory\"
+  \"view\": \"verifiable-memory\"
 }")
 VM_FOUND=$(echo "$VM_Q" | pyfield "(lambda b: (b[0].get('name') if b else 'EMPTY'))(d.get('result',{}).get('bindings',[]))")
 if echo "$VM_FOUND" | grep -q "Alice"; then
-  ok "Verified-memory view: Alice data found"
+  ok "Verifiable-memory view: Alice data found"
 else
-  fail "Verified-memory view: Alice data missing (got: $VM_FOUND)"
+  fail "Verifiable-memory view: Alice data missing (got: $VM_FOUND)"
 fi
 
 echo "--- 11b: Query with view=shared-working-memory ---"

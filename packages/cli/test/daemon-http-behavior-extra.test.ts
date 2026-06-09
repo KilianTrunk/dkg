@@ -1104,14 +1104,14 @@ describe('CLI-8 — CONSTRUCT/SELECT access control', () => {
 // ---------------------------------------------------------------------------
 
 describe('CLI-9 — /api/verify & /api/ccl error-code mapping', () => {
-  it('/api/verify on a non-existent verifiedMemoryId returns 4xx (ideally 404), NOT 500 (PROD-BUG)', async () => {
+  it('/api/verify on a non-existent verifiableMemoryId returns 4xx (ideally 404), NOT 500 (PROD-BUG)', async () => {
     const d = daemon!;
     const res = await fetch(urlFor(d, '/api/verify'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...authHeaders(d) },
       body: JSON.stringify({
         contextGraphId: 'does-not-exist-cg',
-        verifiedMemoryId: 'does-not-exist-vm',
+        verifiableMemoryId: 'does-not-exist-vm',
         batchId: '9999999999',
       }),
     });
@@ -1150,7 +1150,7 @@ describe('CLI-9 — /api/verify & /api/ccl error-code mapping', () => {
       headers: { 'Content-Type': 'application/json', ...authHeaders(d) },
       body: JSON.stringify({
         contextGraphId: 'x',
-        verifiedMemoryId: 'y',
+        verifiableMemoryId: 'y',
         batchId: 'not-an-int',
       }),
     });

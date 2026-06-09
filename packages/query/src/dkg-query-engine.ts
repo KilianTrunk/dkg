@@ -2,7 +2,7 @@ import type { TripleStore, Quad, QueryResult as StoreQueryResult } from '@origin
 import { GraphManager } from '@origintrail-official/dkg-storage';
 import type { QueryResult, QueryOptions, QueryEngine } from './query-engine.js';
 import {
-  contextGraphDataUri, contextGraphSharedMemoryUri, contextGraphVerifiedMemoryUri, contextGraphAssertionUri, contextGraphLayerUri, MemoryLayer,
+  contextGraphDataUri, contextGraphSharedMemoryUri, contextGraphVerifiableMemoryUri, contextGraphAssertionUri, contextGraphLayerUri, MemoryLayer,
   contextGraphSubGraphUri, contextGraphMetaUri, contextGraphSharedMemoryMetaUri, assertionLifecycleUri,
   contextGraphSubGraphMetaUri, contextGraphPrivateUri, contextGraphSubGraphPrivateUri,
   assertSafeIri, escapeSparqlLiteral, validateSubGraphName,
@@ -27,7 +27,7 @@ export interface ViewResolution {
   /**
    * Graph URI prefixes — the engine discovers all named graphs matching
    * each prefix and unions the results. Used for working-memory (multiple
-   * assertions) and verified-memory (multiple quorum graphs).
+   * assertions) and verifiable-memory (multiple quorum graphs).
    */
   graphPrefixes: string[];
 }
@@ -45,8 +45,8 @@ export class ScopedQueryViolationError extends Error {
  *
  * Spec reference: §12 GET — Declared State Views.
  *
- * Trust-level semantics for `verified-memory`: graph scope is not a trust
- * signal. The root graph and `/_verified_memory/*` graphs are candidates;
+ * Trust-level semantics for `verifiable-memory`: graph scope is not a trust
+ * signal. The root graph and `/_verifiable_memory/*` graphs are candidates;
  * `minTrust` is enforced by explicit writer-side `dkg:trustLevel` metadata.
  */
 export function resolveViewGraphs(
@@ -64,7 +64,7 @@ export function resolveViewGraphs(
 ): ViewResolution {
   if (REMOVED_VIEWS.includes(view as string)) {
     throw new Error(
-      `View '${view}' was removed in V10. Use 'verified-memory' for on-chain anchored data. ` +
+      `View '${view}' was removed in V10. Use 'verifiable-memory' for on-chain anchored data. ` +
       `See migration guide for details.`,
     );
   }
@@ -97,14 +97,14 @@ export function resolveViewGraphs(
         graphs: [contextGraphSharedMemoryUri(contextGraphId)],
         graphPrefixes: [`did:dkg:context-graph:${contextGraphId}/_shared_memory/`],
       };
-    case 'verified-memory': {
-      // `minTrust` is a verified-memory concept. The earlier iterations ran the
+    case 'verifiable-memory': {
+      // `minTrust` is a verifiable-memory concept. The earlier iterations ran the
       // numeric/enum validation at the top of `resolveViewGraphs`,
       // but that meant a caller who passes a generic options object
       // (e.g. `{ agentAddress, minTrust }`) across views would get
       // a 400 on `working-memory`/`shared-working-memory` too,
       // where the option is documented as ignored. Keep the
-      // validation here so only verified-memory consumers see it.
+      // validation here so only verifiable-memory consumers see it.
       if (opts?.minTrust !== undefined) {
         const mt: unknown = opts.minTrust;
         const validLevels = [
@@ -127,18 +127,18 @@ export function resolveViewGraphs(
 
       if (opts?.verifiedGraph) {
         return {
-          graphs: [contextGraphVerifiedMemoryUri(contextGraphId, opts.verifiedGraph)],
+          graphs: [contextGraphVerifiableMemoryUri(contextGraphId, opts.verifiedGraph)],
           graphPrefixes: [],
         };
       }
       // RC11 / PR-A (Codex review fix on #671, comment 3302058969):
       // re-include the root content graph
-      // `did:dkg:context-graph:{id}` alongside the `_verified_memory/*`
+      // `did:dkg:context-graph:{id}` alongside the `_verifiable_memory/*`
       // post-`verify` named graphs.
       //
       // The PR2 first cut dropped the root from VM to plug the
       // "tentative VM" leak (failed publishes used to leave triples in
-      // the root graph and surfaced via `view: 'verified-memory'`).
+      // the root graph and surfaced via `view: 'verifiable-memory'`).
       // That leak is now fixed at the publisher: the root-graph
       // `store.insert(normalizedQuads)` was moved INSIDE the
       // chain-success branch of `DKGPublisher.publish` (see
@@ -154,18 +154,18 @@ export function resolveViewGraphs(
       //
       // Dropping the root graph here was a behavioural break for
       // existing callers (memory-search flows, the daemon's
-      // `/api/query?view=verified-memory` route after
+      // `/api/query?view=verifiable-memory` route after
       // `/api/shared-memory/publish`): a successful publish would
       // silently disappear from VM until a separate `verify()` wrote
-      // into `_verified_memory/{vmId}`. Restoring the root graph keeps
+      // into `_verifiable_memory/{vmId}`. Restoring the root graph keeps
       // confirmed publisher-side data immediately queryable via VM
-      // while `_verified_memory/*` remains the source of truth for
+      // while `_verifiable_memory/*` remains the source of truth for
       // cross-node consensus-verified data (still stamped with
       // `dkg:trustLevel` ConsensusVerified by
-      // `DKGAgent.promoteToVerifiedMemory`).
+      // `DKGAgent.promoteToVerifiableMemory`).
       return {
         graphs: [`did:dkg:context-graph:${contextGraphId}`],
-        graphPrefixes: [`did:dkg:context-graph:${contextGraphId}/_verified_memory/`],
+        graphPrefixes: [`did:dkg:context-graph:${contextGraphId}/_verifiable_memory/`],
       };
     }
   }
@@ -215,10 +215,10 @@ export class DKGQueryEngine implements QueryEngine {
       // …/_shared_memory/{addr}/{number} graphs so GRAPH-variable scans bind them.
       const swmRouted = (options?.includeSharedMemory ?? options?.includeWorkspace) || options?.graphSuffix === '_shared_memory';
       const swmPerKaGraphs = swmRouted ? await this.discoverGraphsByPrefix(`${sharedMemoryGraph}/`) : [];
-      // Per-KA VM: published data is in …/_verified_memory/{addr}/{number}; bind those too
+      // Per-KA VM: published data is in …/_verifiable_memory/{addr}/{number}; bind those too
       // for GRAPH-variable scans on any route that reads the data graph.
       const dataRouted = options?.graphSuffix !== '_shared_memory';
-      const vmPerKaGraphs = dataRouted ? await this.discoverGraphsByPrefix(`${dataGraph}/_verified_memory/`) : [];
+      const vmPerKaGraphs = dataRouted ? await this.discoverGraphsByPrefix(`${dataGraph}/_verifiable_memory/`) : [];
       const allowedGraphs = options?.includeSharedMemory ?? options?.includeWorkspace
         ? [dataGraph, ...vmPerKaGraphs, sharedMemoryGraph, ...swmPerKaGraphs]
         : options?.graphSuffix === '_shared_memory'
@@ -333,8 +333,8 @@ export class DKGQueryEngine implements QueryEngine {
         : contextGraphDataUri(effectiveContextGraphId);
       const sharedMemoryGraph = contextGraphSharedMemoryUri(effectiveContextGraphId, options?.subGraphName);
       if (options?.includeSharedMemory ?? options?.includeWorkspace) {
-        // Per-KA VM: read-both the published per-KA …/_verified_memory/{addr}/{number} + root.
-        const vmGraphsInc = await this.discoverGraphsByPrefix(`${dataGraph}/_verified_memory/`);
+        // Per-KA VM: read-both the published per-KA …/_verifiable_memory/{addr}/{number} + root.
+        const vmGraphsInc = await this.discoverGraphsByPrefix(`${dataGraph}/_verifiable_memory/`);
         const dataSparql = vmGraphsInc.length > 0
           ? (wrapWithGraphUnion(sparql, [dataGraph, ...vmGraphsInc]) ?? wrapWithGraph(sparql, dataGraph))
           : wrapWithGraph(sparql, dataGraph);
@@ -355,8 +355,8 @@ export class DKGQueryEngine implements QueryEngine {
           ? (wrapWithGraphUnion(sparql, swmGraphs) ?? wrapWithGraph(sparql, sharedMemoryGraph))
           : wrapWithGraph(sparql, sharedMemoryGraph);
       } else {
-        // Per-KA VM: read-both the published per-KA …/_verified_memory/{addr}/{number} + root.
-        const vmGraphs = await this.discoverGraphsByPrefix(`${dataGraph}/_verified_memory/`);
+        // Per-KA VM: read-both the published per-KA …/_verifiable_memory/{addr}/{number} + root.
+        const vmGraphs = await this.discoverGraphsByPrefix(`${dataGraph}/_verifiable_memory/`);
         effectiveSparql = vmGraphs.length > 0
           ? (wrapWithGraphUnion(sparql, [dataGraph, ...vmGraphs]) ?? wrapWithGraph(sparql, dataGraph))
           : wrapWithGraph(sparql, dataGraph);
@@ -433,9 +433,9 @@ export class DKGQueryEngine implements QueryEngine {
     }
 
     if (allGraphs.length === 0) {
-      // PR #239 / r17-2: a zero-graph resolution (e.g. a `verified-memory`
+      // PR #239 / r17-2: a zero-graph resolution (e.g. a `verifiable-memory`
       // query with `minTrust=Endorsed` on a context graph that has not
-      // been populated with any `/_verified_memory/*` sub-graphs yet) must
+      // been populated with any `/_verifiable_memory/*` sub-graphs yet) must
       // still respect the requested query form. Returning `{ bindings: [] }`
       // for an ASK would look like a SELECT result and break clients that
       // rely on ASK's boolean binding; CONSTRUCT/DESCRIBE must carry
@@ -446,7 +446,7 @@ export class DKGQueryEngine implements QueryEngine {
     assertExplicitGraphIrisAllowed(sparql, allGraphs);
     sparql = constrainGraphVariablesToAllowedSet(sparql, allGraphs);
 
-    // Spec §14 trust-gradient filter — only enforced on verified-memory
+    // Spec §14 trust-gradient filter — only enforced on verifiable-memory
     // where on-chain-anchored trust metadata is expected to live.
     // When `minTrust` (or legacy `_minTrust`) is set, rewrite the query so
     // every subject matched by the user's pattern MUST carry an explicit
@@ -467,7 +467,7 @@ export class DKGQueryEngine implements QueryEngine {
     // `SelfAttested` (0) is the floor and means no trust filter is needed.
     // Endorsed and above require explicit writer-side trust metadata.
     if (
-      view === 'verified-memory' &&
+      view === 'verifiable-memory' &&
       effectiveMinTrust !== undefined &&
       effectiveMinTrust > TrustLevel.SelfAttested
     ) {
@@ -872,7 +872,7 @@ function isScopedContentGraph(
 
   if (!subGraphName) {
     if (tail.startsWith('_shared_memory/')) return true;
-    if (tail.startsWith('_verified_memory/')) return !isMetadataGraphTail(tail);
+    if (tail.startsWith('_verifiable_memory/')) return !isMetadataGraphTail(tail);
     if (tail.startsWith('_working_memory/')) return registeredAssertionGraphs.has(graph);
   }
 
@@ -886,7 +886,7 @@ function isScopedContentGraph(
 
   if (!remaining) return true;
   if (remaining.startsWith('_shared_memory/')) return true;
-  if (remaining.startsWith('_verified_memory/')) return !isMetadataGraphTail(remaining);
+  if (remaining.startsWith('_verifiable_memory/')) return !isMetadataGraphTail(remaining);
   if (remaining.startsWith('_working_memory/')) return registeredAssertionGraphs.has(graph);
   return false;
 }
@@ -920,7 +920,7 @@ function isKnownChildContextGraphPartition(graph: string, knownChildContextGraph
 }
 
 function isStagingGraphTail(tail: string): boolean {
-  return tail.startsWith('_verified_memory/staging/') || tail.includes('/_verified_memory/staging/');
+  return tail.startsWith('_verifiable_memory/staging/') || tail.includes('/_verifiable_memory/staging/');
 }
 
 function stripSparqlLiteralValue(value: string | undefined): string {
@@ -1952,7 +1952,7 @@ function nextSignificantBraceAfter(sparql: string, startIdx: number): number {
  * `wrapWithGraphUnion`, `injectMinTrustFilter`) all matched only
  * `WHERE\s*\{`, so any of those legitimate shorthand forms left the
  * query untouched (no GRAPH wrapping, no trust filter injection) and —
- * on a `verified-memory` view whose data lives in a named sub-graph —
+ * on a `verifiable-memory` view whose data lives in a named sub-graph —
  * silently returned `[]` instead of executing against the right graph.
  *
  * Strategy:

@@ -579,7 +579,7 @@ class DKGClient:
     def publish(self, context_graph_id: str, selection: Any = "all",
                 clear_after: bool = True,
                 sub_graph_name: Optional[str] = None) -> Dict[str, Any]:
-        """POST /api/shared-memory/publish — publish SWM to Verified Memory (costs TRAC)."""
+        """POST /api/shared-memory/publish — publish SWM to Verifiable Memory (costs TRAC)."""
         payload: Dict[str, Any] = {
             "contextGraphId": _normalize_context_graph_id(context_graph_id),
             "selection": selection,

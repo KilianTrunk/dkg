@@ -56,11 +56,11 @@ describe("DkgNodePlugin", () => {
       await byName.get('dkg_query')!.execute('tc', {
         sparql: 'SELECT * WHERE { ?s ?p ?o } LIMIT 1',
         context_graph_id: 'my-cg',
-        view: 'verified-memory',
+        view: 'verifiable-memory',
       });
       expect(fetchMock).toHaveBeenCalledTimes(1);
       const body = JSON.parse(fetchMock.mock.calls[0][1]?.body as string);
-      expect(body.view).toBe('verified-memory');
+      expect(body.view).toBe('verifiable-memory');
       expect(body.contextGraphId).toBe('my-cg');
       expect(body).not.toHaveProperty('includeSharedMemory');
     });

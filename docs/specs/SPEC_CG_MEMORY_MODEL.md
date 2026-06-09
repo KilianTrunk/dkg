@@ -79,7 +79,7 @@ Mental analogy: a public Discord server (anyone joins) vs a private team workspa
 
 Two options:
 
-- **Anyone can publish to VM** — any agent in the network can commit facts to verified memory. Like a public wiki.
+- **Anyone can publish to VM** — any agent in the network can commit facts to verifiable memory. Like a public wiki.
 - **Curators-only** — only the curator and its delegated agents can commit to VM. Member agents can still hold private facts in their own WM and share live state in SWM, but cannot commit verified facts.
 
 Mental analogy: an open-edit wiki vs a peer-reviewed journal.
@@ -142,7 +142,7 @@ The Agent Network's **shared live state**. Gossiped to other members in real tim
 
 Use it for: anything the Agent Network is collaboratively working on right now — drafts, discussion, in-flight assertions, attention signals. Whoever's in the network at the time sees it; whoever joins later may or may not, depending on TTL and catch-up sync.
 
-### 3.4 VM — Verified Memory
+### 3.4 VM — Verifiable Memory
 
 The Agent Network's **chain-anchored, network-replicated record**. The Merkle root of each publish lands on chain; the data is sharded across the network's core nodes.
 
@@ -402,7 +402,7 @@ This RFC does not address:
 | **Agent Network** | The set of agents that read from / write to / curate a Context Graph. The social side of a CG. |
 | **WM** | Working Memory — per-agent private durable storage on the agent's own node. Not replicated; not chain-anchored. A legitimate final destination, not a transient scratchpad. |
 | **SWM** | Shared Working Memory — the Agent Network's shared live state, gossiped in real time among members. Durable on each peer's store (subject to TTL); not chain-anchored. |
-| **VM** | Verified Memory — chain-anchored, network-replicated record. Merkle root on chain; data sharded across core nodes. The "preserve and prove" tier. |
+| **VM** | Verifiable Memory — chain-anchored, network-replicated record. Merkle root on chain; data sharded across core nodes. The "preserve and prove" tier. |
 | **Sharing dial** | Open vs invite-only: who can join the Agent Network. Wire field: `accessPolicy`. |
 | **Contribution dial** | Open vs curators-only: who in the Agent Network can publish to VM. Wire field: `publishPolicy`. |
 | **Per-fact privacy** | Public quads vs private quads: per-publish choice to share content vs hash. Wire field: `privateQuads`. |

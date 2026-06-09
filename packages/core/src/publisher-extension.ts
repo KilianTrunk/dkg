@@ -115,7 +115,7 @@ export interface SharedMemoryWriteRequest {
   subGraphName?: string;
 }
 
-export interface VerifiedMemoryPublishRequest {
+export interface VerifiableMemoryPublishRequest {
   contextGraphId: string;
   quads: DkgPublisherExtensionQuadInput[];
   privateQuads?: DkgPublisherExtensionQuadInput[];
@@ -189,8 +189,8 @@ export class DkgPublisherExtension {
     );
   }
 
-  async publishVerifiedMemory(
-    request: VerifiedMemoryPublishRequest,
+  async publishVerifiableMemory(
+    request: VerifiableMemoryPublishRequest,
   ): ReturnType<DkgPublisherExtensionTransport['publish']> {
     return this.transport.publish(
       request.contextGraphId,

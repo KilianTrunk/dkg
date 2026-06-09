@@ -379,13 +379,13 @@ echo "  status=$PUB1_ST kaId=$PUB1_KC tx=$PUB1_TX block=$PUB1_BN KAs=$PUB1_KAS"
 [[ "$PUB1_KAS" == "2" ]] && ok "Published 2 KAs (both selected roots)" || fail "Expected 2 KAs, got $PUB1_KAS"
 
 echo ""
-echo "--- 3b: Query Verified Memory for published city root entities on publisher ---"
+echo "--- 3b: Query Verifiable Memory for published city root entities on publisher ---"
 LTM_CT=0
 for i in $(seq 1 15); do
   LTM_Q=$(c -X POST "http://127.0.0.1:9201/api/query" -d "{
     \"sparql\":\"SELECT ?s ?name WHERE { VALUES ?s { <http://example.org/entity/city1> <http://example.org/entity/city2> } ?s <http://schema.org/name> ?name } LIMIT 10\",
     \"contextGraphId\":\"$CONTEXT_GRAPH\",
-    \"view\":\"verified-memory\"
+    \"view\":\"verifiable-memory\"
   }")
   LTM_CT=$(echo "$LTM_Q" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('result',{}).get('bindings',[])))" 2>/dev/null)
   [ "$LTM_CT" -ge 2 ] && break
@@ -400,7 +400,7 @@ for p in "${NODE_PORTS[@]}"; do
   R=$(c -X POST "http://127.0.0.1:$p/api/query" -d "{
     \"sparql\":\"SELECT ?s ?name WHERE { VALUES ?s { <http://example.org/entity/city1> <http://example.org/entity/city2> } ?s <http://schema.org/name> ?name } LIMIT 10\",
     \"contextGraphId\":\"$CONTEXT_GRAPH\",
-    \"view\":\"verified-memory\"
+    \"view\":\"verifiable-memory\"
   }")
   ct=$(echo "$R" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('result',{}).get('bindings',[])))" 2>/dev/null)
   [[ "$ct" -ge 2 ]] && ok "Node $p has $ct published city roots in VM" || warn "Node $p has $ct published city roots in VM (finalization pending?)"
@@ -412,7 +412,7 @@ echo "=== SECTION 4: Multi-node SWM contribution + open-CG VM publish ==="
 echo ""
 # Devnet bootstrap CGs are intentionally registered as open
 # (ContextGraphs publishPolicy=1). Any node may contribute to SWM and any
-# chain-capable node may promote selected SWM data to Verified Memory. Curated
+# chain-capable node may promote selected SWM data to Verifiable Memory. Curated
 # publish-authority rejection is covered by private/curated sharing tests.
 
 echo "--- 4a: Node2 (core) shares a Product triple-set to SWM ---"
@@ -504,7 +504,7 @@ for p in "${NODE_PORTS[@]}"; do
     R=$(c -X POST "http://127.0.0.1:$p/api/query" -d "{
       \"sparql\":\"ASK { <http://example.org/entity/$entity> <http://schema.org/name> ?name }\",
       \"contextGraphId\":\"$CONTEXT_GRAPH\",
-      \"view\":\"verified-memory\"
+      \"view\":\"verifiable-memory\"
     }")
     found=$(echo "$R" | python3 -c "import sys,json; b=json.load(sys.stdin).get('result',{}).get('bindings',[]); print('yes' if b and b[0].get('result','')=='true' else 'no')" 2>/dev/null)
     [[ "$found" == "yes" ]] && ok "Node $p has $entity" || warn "Node $p missing $entity (finalization pending?)"
@@ -719,7 +719,7 @@ for p in "${NODE_PORTS[@]}"; do
   R=$(c -X POST "http://127.0.0.1:$p/api/query" -d "{
     \"sparql\":\"SELECT (COUNT(DISTINCT ?s) AS ?c) WHERE { ?s a ?type . FILTER(CONTAINS(STR(?s),'example.org')) }\",
     \"contextGraphId\":\"$CONTEXT_GRAPH\",
-    \"view\":\"verified-memory\"
+    \"view\":\"verifiable-memory\"
   }")
   ct=$(echo "$R" | python3 -c "
 import sys,json,re
@@ -1035,19 +1035,19 @@ echo ""
 echo "=== SECTION 19: Memory Layer View Queries ==="
 echo ""
 
-echo "--- 19a: Verified memory view ---"
+echo "--- 19a: Verifiable memory view ---"
 VM_VIEW=$(c -X POST "http://127.0.0.1:9201/api/query" -d "{
   \"sparql\":\"SELECT ?name WHERE { <http://example.org/entity/city1> <http://schema.org/name> ?name }\",
   \"contextGraphId\":\"$CONTEXT_GRAPH\",
-  \"view\":\"verified-memory\"
+  \"view\":\"verifiable-memory\"
 }")
 VM_CT=$(safe_bindings_count "$VM_VIEW")
 if [[ "$VM_CT" == "PARSE_ERR" ]]; then
-  fail "Verified memory view returned unparseable response: ${VM_VIEW:0:200}"
+  fail "Verifiable memory view returned unparseable response: ${VM_VIEW:0:200}"
 elif [[ "$VM_CT" -ge 1 ]]; then
-  ok "Verified memory view returns published data"
+  ok "Verifiable memory view returns published data"
 else
-  warn "Verified memory view empty ($VM_CT) — VM finalization may be pending"
+  warn "Verifiable memory view empty ($VM_CT) — VM finalization may be pending"
 fi
 
 echo "--- 19b: Shared memory view ---"
@@ -1097,19 +1097,19 @@ else
   fail "WM assertion not visible locally"
 fi
 
-echo "--- 19d: WM data NOT in verified memory ---"
+echo "--- 19d: WM data NOT in verifiable memory ---"
 WM_IN_VM=$(c -X POST "http://127.0.0.1:9201/api/query" -d "{
   \"sparql\":\"SELECT ?name WHERE { <$WM_SUBJECT> <http://schema.org/name> ?name }\",
   \"contextGraphId\":\"$CONTEXT_GRAPH\",
-  \"view\":\"verified-memory\"
+  \"view\":\"verifiable-memory\"
 }")
 WM_IN_VM_CT=$(safe_bindings_count "$WM_IN_VM")
 if [[ "$WM_IN_VM_CT" == "PARSE_ERR" ]]; then
   fail "WM/VM isolation query returned unparseable response: ${WM_IN_VM:0:200}"
 elif [[ "$WM_IN_VM_CT" -eq 0 ]]; then
-  ok "WM data correctly absent from verified memory"
+  ok "WM data correctly absent from verifiable memory"
 else
-  fail "WM data leaked into verified memory ($WM_IN_VM_CT)"
+  fail "WM data leaked into verifiable memory ($WM_IN_VM_CT)"
 fi
 
 echo "--- 19e: WM data NOT visible on Node2 (including SWM) ---"
@@ -1197,7 +1197,7 @@ The Decentralized Knowledge Graph enables verifiable knowledge sharing.
 
 - Sub-graphs for scoped data organization
 - Async publisher queue for reliable chain anchoring
-- Memory layers: Working Memory, Shared Memory, Verified Memory
+- Memory layers: Working Memory, Shared Memory, Verifiable Memory
 MDEOF
 
 IMPORT_RESP=$(curl -sS --max-time "$DEVNET_CURL_TIMEOUT" --connect-timeout "$DEVNET_CURL_CONNECT_TIMEOUT" \
@@ -1765,7 +1765,7 @@ echo "--- 25a: VM query returns published data (§16.1 root content graph) ---"
 VM_REG=$(c -X POST "http://127.0.0.1:9201/api/query" -d "{
   \"sparql\":\"SELECT ?s ?name WHERE { ?s <http://schema.org/name> ?name } LIMIT 5\",
   \"contextGraphId\":\"$CONTEXT_GRAPH\",
-  \"view\":\"verified-memory\"
+  \"view\":\"verifiable-memory\"
 }")
 VM_REG_CT=$(safe_bindings_count "$VM_REG")
 if [[ "$VM_REG_CT" == "PARSE_ERR" ]]; then
@@ -1773,7 +1773,7 @@ if [[ "$VM_REG_CT" == "PARSE_ERR" ]]; then
 elif [[ "$VM_REG_CT" -ge 1 ]]; then
   ok "VM view returns $VM_REG_CT bindings from root content graph (§16.1)"
 else
-  fail "VM view returns 0 bindings — root content graph not included in verified-memory view"
+  fail "VM view returns 0 bindings — root content graph not included in verifiable-memory view"
 fi
 
 echo "--- 25b: ABI error decoding — UPDATE to non-existent KC returns decoded error ---"

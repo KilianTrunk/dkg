@@ -185,7 +185,7 @@
   color: var(--text-primary);
 }
 
-/* ── Verified Memory on-chain identity banner (KA detail, right pane) ── */
+/* ── Verifiable Memory on-chain identity banner (KA detail, right pane) ── */
 .v10-vm-identity {
   margin-bottom: 16px;
   padding: 12px 14px;

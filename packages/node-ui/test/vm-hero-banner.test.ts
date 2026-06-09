@@ -3,7 +3,7 @@
 import React, { act } from 'react';
 import { createRoot } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { LayerContent, VerifiedMemoryHeroBanner } from '../src/ui/views/project/components.js';
+import { LayerContent, VerifiableMemoryHeroBanner } from '../src/ui/views/project/components.js';
 import type { MemoryEntity } from '../src/ui/hooks/useMemoryEntities.js';
 
 function memoryEntity(uri: string, types: string[]): MemoryEntity {
@@ -29,7 +29,7 @@ async function renderVmHero(props: {
   const root = createRoot(container);
 
   await act(async () => {
-    root.render(React.createElement(VerifiedMemoryHeroBanner, props));
+    root.render(React.createElement(VerifiableMemoryHeroBanner, props));
   });
 
   return {
@@ -66,7 +66,7 @@ async function renderLayerContent(props: React.ComponentProps<typeof LayerConten
   };
 }
 
-describe('VerifiedMemoryHeroBanner', () => {
+describe('VerifiableMemoryHeroBanner', () => {
   beforeEach(() => {
     (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
     document.body.innerHTML = '';

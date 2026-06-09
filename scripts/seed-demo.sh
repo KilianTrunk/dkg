@@ -42,10 +42,10 @@ post /api/shared-memory/write "{
 
     {\"subject\":\"urn:concept:swm\",\"predicate\":\"http://www.w3.org/1999/02/22-rdf-syntax-ns#type\",\"object\":\"http://schema.org/DefinedTerm\",\"graph\":\"\"},
     {\"subject\":\"urn:concept:swm\",\"predicate\":\"http://schema.org/name\",\"object\":\"\\\"Shared Working Memory (SWM)\\\"\",\"graph\":\"\"},
-    {\"subject\":\"urn:concept:swm\",\"predicate\":\"http://schema.org/description\",\"object\":\"\\\"Collaborative knowledge shared with project peers via gossipsub. Tentative facts that can be promoted to Verified Memory.\\\"\",\"graph\":\"\"},
+    {\"subject\":\"urn:concept:swm\",\"predicate\":\"http://schema.org/description\",\"object\":\"\\\"Collaborative knowledge shared with project peers via gossipsub. Tentative facts that can be promoted to Verifiable Memory.\\\"\",\"graph\":\"\"},
 
     {\"subject\":\"urn:concept:vm\",\"predicate\":\"http://www.w3.org/1999/02/22-rdf-syntax-ns#type\",\"object\":\"http://schema.org/DefinedTerm\",\"graph\":\"\"},
-    {\"subject\":\"urn:concept:vm\",\"predicate\":\"http://schema.org/name\",\"object\":\"\\\"Verified Memory (VM)\\\"\",\"graph\":\"\"},
+    {\"subject\":\"urn:concept:vm\",\"predicate\":\"http://schema.org/name\",\"object\":\"\\\"Verifiable Memory (VM)\\\"\",\"graph\":\"\"},
     {\"subject\":\"urn:concept:vm\",\"predicate\":\"http://schema.org/description\",\"object\":\"\\\"On-chain, immutable knowledge. Published via the PUBLISH protocol with merkle root commitment. Publicly verifiable.\\\"\",\"graph\":\"\"},
 
     {\"subject\":\"urn:concept:sqlite-vec\",\"predicate\":\"http://www.w3.org/1999/02/22-rdf-syntax-ns#type\",\"object\":\"http://schema.org/SoftwareSourceCode\",\"graph\":\"\"},

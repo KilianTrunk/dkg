@@ -265,7 +265,7 @@ describe('E2E: workspace-first publish with real blockchain', () => {
 
     await nodeA.createContextGraph({ id: CONTEXT_GRAPH, name: 'Finalization Chain Test', description: '' });
     await nodeA.registerContextGraph(CONTEXT_GRAPH);
-    // V10 Verified Memory publish requires explicit on-chain registration.
+    // V10 Verifiable Memory publish requires explicit on-chain registration.
     // B only needs to join the gossip topic; A is already subscribed via create().
     nodeB.subscribeToContextGraph(CONTEXT_GRAPH);
     await sleep(1000);

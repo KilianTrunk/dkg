@@ -3,7 +3,7 @@
  *
  * Audit finding covered:
  *
- *   P-13 (MEDIUM) — Spec §12 GET declares that the `verified-memory`
+ *   P-13 (MEDIUM) — Spec §12 GET declares that the `verifiable-memory`
  *                   view MUST honor `minTrust` so a caller requesting
  *                   `TrustLevel.ConsensusVerified` does NOT see triples
  *                   that only reached `TrustLevel.SelfAttested`. The
@@ -12,13 +12,13 @@
  *                   was declared on the query-engine `QueryOptions`
  *                   type, but the resolver silently ignored it.
  *
- * Fix: `resolveViewGraphs` keeps the root data graph and verified-memory
+ * Fix: `resolveViewGraphs` keeps the root data graph and verifiable-memory
  * graphs as candidates. `DKGQueryEngine` then enforces `minTrust` with
  * writer-side `dkg:trustLevel` metadata instead of graph-scope inference.
  *
  * RC11 / PR-A (Codex review fix on #671): the root content graph
  * `did:dkg:context-graph:{id}` is unioned into VM alongside the
- * `_verified_memory/*` prefix — the PR2 first cut dropped it but that
+ * `_verifiable_memory/*` prefix — the PR2 first cut dropped it but that
  * broke `/api/shared-memory/publish` → immediate VM query for existing
  * callers. The tentative-VM leak that change was guarding against is
  * now plugged at the publisher (root-graph insert deferred to the
@@ -31,30 +31,30 @@ import { resolveViewGraphs, type ViewResolution } from '@origintrail-official/dk
 const CG = '42';
 const VM_QUORUM_A = '0xa0a0a0';
 
-describe('P-13: resolveViewGraphs handles minTrust for verified-memory', () => {
-  it('default verified-memory resolution unions root context-graph + _verified_memory/ prefix (RC11 / PR-A: Codex #671)', () => {
-    const res: ViewResolution = resolveViewGraphs('verified-memory', CG);
+describe('P-13: resolveViewGraphs handles minTrust for verifiable-memory', () => {
+  it('default verifiable-memory resolution unions root context-graph + _verifiable_memory/ prefix (RC11 / PR-A: Codex #671)', () => {
+    const res: ViewResolution = resolveViewGraphs('verifiable-memory', CG);
     // RC11 / PR-A (Codex review fix on #671): the root context-graph
-    // is re-included alongside the `_verified_memory/*` prefix so a
+    // is re-included alongside the `_verifiable_memory/*` prefix so a
     // successful publish is immediately observable via VM. The
     // tentative-VM leak the PR2 first cut was guarding against is now
     // plugged at the publisher (root-graph insert deferred to the
     // chain-success branch).
     expect(res.graphs).toEqual([`did:dkg:context-graph:${CG}`]);
-    expect(res.graphPrefixes).toContain(`did:dkg:context-graph:${CG}/_verified_memory/`);
+    expect(res.graphPrefixes).toContain(`did:dkg:context-graph:${CG}/_verifiable_memory/`);
   });
 
   it('a specific verifiedGraph narrows to a single named graph (no prefix scan)', () => {
-    const res = resolveViewGraphs('verified-memory', CG, { verifiedGraph: VM_QUORUM_A });
+    const res = resolveViewGraphs('verifiable-memory', CG, { verifiedGraph: VM_QUORUM_A });
     expect(res.graphs).toEqual([
-      `did:dkg:context-graph:${CG}/_verified_memory/${VM_QUORUM_A}`,
+      `did:dkg:context-graph:${CG}/_verifiable_memory/${VM_QUORUM_A}`,
     ]);
     expect(res.graphPrefixes).toEqual([]);
   });
 
   it('minTrust=SelfAttested (or omitted) matches the default resolution (RC11 / PR-A)', () => {
-    const omitted = resolveViewGraphs('verified-memory', CG);
-    const explicit = resolveViewGraphs('verified-memory', CG, {
+    const omitted = resolveViewGraphs('verifiable-memory', CG);
+    const explicit = resolveViewGraphs('verifiable-memory', CG, {
       minTrust: TrustLevel.SelfAttested,
     });
     expect(omitted.graphs).toEqual([`did:dkg:context-graph:${CG}`]);
@@ -65,7 +65,7 @@ describe('P-13: resolveViewGraphs handles minTrust for verified-memory', () => {
   it(
     'minTrust=Endorsed keeps the same graph candidates (trust enforced by writer-side metadata) (RC11 / PR-A)',
     () => {
-      const res = resolveViewGraphs('verified-memory', CG, {
+      const res = resolveViewGraphs('verifiable-memory', CG, {
         minTrust: TrustLevel.Endorsed,
       });
       // Graph candidates are identical across trust floors — the floor
@@ -73,7 +73,7 @@ describe('P-13: resolveViewGraphs handles minTrust for verified-memory', () => {
       // writer-side `dkg:trustLevel` quads.
       expect(res.graphs).toEqual([`did:dkg:context-graph:${CG}`]);
       expect(res.graphPrefixes).toEqual([
-        `did:dkg:context-graph:${CG}/_verified_memory/`,
+        `did:dkg:context-graph:${CG}/_verifiable_memory/`,
       ]);
     },
   );
@@ -81,16 +81,16 @@ describe('P-13: resolveViewGraphs handles minTrust for verified-memory', () => {
   it(
     'minTrust > Endorsed keeps the same graph candidates for trust-tag filtering (RC11 / PR-A)',
     () => {
-      const partially = resolveViewGraphs('verified-memory', CG, {
+      const partially = resolveViewGraphs('verifiable-memory', CG, {
         minTrust: TrustLevel.PartiallyVerified,
       });
-      const consensus = resolveViewGraphs('verified-memory', CG, {
+      const consensus = resolveViewGraphs('verifiable-memory', CG, {
         minTrust: TrustLevel.ConsensusVerified,
       });
       for (const res of [partially, consensus]) {
         expect(res.graphs).toEqual([`did:dkg:context-graph:${CG}`]);
         expect(res.graphPrefixes).toEqual([
-          `did:dkg:context-graph:${CG}/_verified_memory/`,
+          `did:dkg:context-graph:${CG}/_verifiable_memory/`,
         ]);
       }
     },
@@ -99,12 +99,12 @@ describe('P-13: resolveViewGraphs handles minTrust for verified-memory', () => {
   it(
     'verifiedGraph + minTrust=SelfAttested is allowed — minTrust is a no-op at SelfAttested',
     () => {
-      const res = resolveViewGraphs('verified-memory', CG, {
+      const res = resolveViewGraphs('verifiable-memory', CG, {
         verifiedGraph: VM_QUORUM_A,
         minTrust: TrustLevel.SelfAttested,
       });
       expect(res.graphs).toEqual([
-        `did:dkg:context-graph:${CG}/_verified_memory/${VM_QUORUM_A}`,
+        `did:dkg:context-graph:${CG}/_verifiable_memory/${VM_QUORUM_A}`,
       ]);
       expect(res.graphPrefixes).toEqual([]);
     },
@@ -118,12 +118,12 @@ describe('P-13: resolveViewGraphs handles minTrust for verified-memory', () => {
         TrustLevel.PartiallyVerified,
         TrustLevel.ConsensusVerified,
       ]) {
-        const res = resolveViewGraphs('verified-memory', CG, {
+        const res = resolveViewGraphs('verifiable-memory', CG, {
           verifiedGraph: VM_QUORUM_A,
           minTrust,
         });
         expect(res.graphs).toEqual([
-          `did:dkg:context-graph:${CG}/_verified_memory/${VM_QUORUM_A}`,
+          `did:dkg:context-graph:${CG}/_verifiable_memory/${VM_QUORUM_A}`,
         ]);
         expect(res.graphPrefixes).toEqual([]);
       }
@@ -152,7 +152,7 @@ describe('P-13: resolveViewGraphs handles minTrust for verified-memory', () => {
       ];
       for (const mt of bad) {
         expect(() =>
-          resolveViewGraphs('verified-memory', CG, { minTrust: mt as TrustLevel }),
+          resolveViewGraphs('verifiable-memory', CG, { minTrust: mt as TrustLevel }),
         ).toThrow(/Invalid minTrust/);
       }
       // Every valid TrustLevel (SelfAttested..ConsensusVerified) must
@@ -165,7 +165,7 @@ describe('P-13: resolveViewGraphs handles minTrust for verified-memory', () => {
         TrustLevel.ConsensusVerified,
       ]) {
         expect(() =>
-          resolveViewGraphs('verified-memory', CG, { minTrust: mt }),
+          resolveViewGraphs('verifiable-memory', CG, { minTrust: mt }),
         ).not.toThrow();
       }
     },
@@ -182,11 +182,11 @@ describe('P-13: resolveViewGraphs handles minTrust for verified-memory', () => {
       // engine-level normalisation `options.minTrust ?? options._minTrust`
       // MUST forward the legacy form through.
       //
-      // We probe with an untagged verified-memory sub-graph quad. If
+      // We probe with an untagged verifiable-memory sub-graph quad. If
       // `_minTrust` is silently dropped, the row remains visible; if it
       // is honoured, the trust metadata filter removes it.
       //
-      // The probe quad is placed in a `_verified_memory/*` sub-graph
+      // The probe quad is placed in a `_verifiable_memory/*` sub-graph
       // so the trust filter is exercised on writer-side metadata, not
       // graph-scope. (RC11 / PR-A re-includes the root graph in VM —
       // see top-of-file commentary — but that's orthogonal: this test
@@ -195,7 +195,7 @@ describe('P-13: resolveViewGraphs handles minTrust for verified-memory', () => {
       const { OxigraphStore } = await import('@origintrail-official/dkg-storage');
       const { DKGQueryEngine } = await import('@origintrail-official/dkg-query');
       const store = new OxigraphStore();
-      const probeGraph = `did:dkg:context-graph:${CG}/_verified_memory/${VM_QUORUM_A}`;
+      const probeGraph = `did:dkg:context-graph:${CG}/_verifiable_memory/${VM_QUORUM_A}`;
       await store.insert([
         {
           subject: 'urn:probe',
@@ -212,7 +212,7 @@ describe('P-13: resolveViewGraphs handles minTrust for verified-memory', () => {
       // untagged probe quad is no longer visible.
       const aliased = await engine.query(probeSparql, {
         contextGraphId: CG,
-        view: 'verified-memory',
+        view: 'verifiable-memory',
         _minTrust: TrustLevel.Endorsed,
       });
       expect(aliased.bindings).toEqual([]);
@@ -223,7 +223,7 @@ describe('P-13: resolveViewGraphs handles minTrust for verified-memory', () => {
       // broken.
       const unconstrained = await engine.query(probeSparql, {
         contextGraphId: CG,
-        view: 'verified-memory',
+        view: 'verifiable-memory',
       });
       expect(unconstrained.bindings.length).toBeGreaterThan(0);
 
@@ -233,7 +233,7 @@ describe('P-13: resolveViewGraphs handles minTrust for verified-memory', () => {
       // explicit field" bug.
       const precedence = await engine.query(probeSparql, {
         contextGraphId: CG,
-        view: 'verified-memory',
+        view: 'verifiable-memory',
         minTrust: TrustLevel.SelfAttested,
         _minTrust: TrustLevel.Endorsed,
       });
@@ -248,14 +248,14 @@ describe('P-13: resolveViewGraphs handles minTrust for verified-memory', () => {
       'engine side of the contract — if the engine stops honouring either name ' +
       'the agent layer cannot mask it.)',
     async () => {
-      // RC11 / PR2: the probe quad lives in a `_verified_memory/*`
+      // RC11 / PR2: the probe quad lives in a `_verifiable_memory/*`
       // sub-graph (root graph is no longer in VM). The test still
       // proves the engine-side trust filter rejects untagged quads
       // even when the agent layer has already normalised the alias.
       const { OxigraphStore } = await import('@origintrail-official/dkg-storage');
       const { DKGQueryEngine } = await import('@origintrail-official/dkg-query');
       const store = new OxigraphStore();
-      const probeGraph = `did:dkg:context-graph:${CG}/_verified_memory/${VM_QUORUM_A}`;
+      const probeGraph = `did:dkg:context-graph:${CG}/_verifiable_memory/${VM_QUORUM_A}`;
       await store.insert([
         {
           subject: 'urn:probe-engine-side',
@@ -275,7 +275,7 @@ describe('P-13: resolveViewGraphs handles minTrust for verified-memory', () => {
         'SELECT ?s WHERE { ?s ?p ?o }',
         {
           contextGraphId: CG,
-          view: 'verified-memory',
+          view: 'verifiable-memory',
           minTrust: TrustLevel.PartiallyVerified,
         },
       );
@@ -295,7 +295,7 @@ describe('P-13: resolveViewGraphs handles minTrust for verified-memory', () => {
       const engine = new DKGQueryEngine(store);
 
       // A bogus minTrust value (99) must NOT trip the guard on these
-      // views — it's a verified-memory-only concept.
+      // views — it's a verifiable-memory-only concept.
       await expect(
         engine.query('SELECT ?s WHERE { ?s ?p ?o }', {
           contextGraphId: CG,
@@ -313,11 +313,11 @@ describe('P-13: resolveViewGraphs handles minTrust for verified-memory', () => {
         }),
       ).resolves.toBeDefined();
 
-      // …but it MUST still fail closed on verified-memory:
+      // …but it MUST still fail closed on verifiable-memory:
       await expect(
         engine.query('SELECT ?s WHERE { ?s ?p ?o }', {
           contextGraphId: CG,
-          view: 'verified-memory',
+          view: 'verifiable-memory',
           minTrust: 99 as unknown as TrustLevel,
         }),
       ).rejects.toThrow(/Invalid minTrust/);
@@ -335,7 +335,7 @@ describe('P-13: resolveViewGraphs handles minTrust for verified-memory', () => {
       await expect(
         engine.query('SELECT ?s WHERE { ?s ?p ?o }', {
           contextGraphId: CG,
-          view: 'verified-memory',
+          view: 'verifiable-memory',
           verifiedGraph: 'some-quorum',
           minTrust: TrustLevel.Endorsed,
         }),
@@ -344,7 +344,7 @@ describe('P-13: resolveViewGraphs handles minTrust for verified-memory', () => {
       await expect(
         engine.query('SELECT ?s WHERE { ?s ?p ?o }', {
           contextGraphId: CG,
-          view: 'verified-memory',
+          view: 'verifiable-memory',
           verifiedGraph: 'some-quorum',
           minTrust: TrustLevel.PartiallyVerified,
         }),
@@ -355,7 +355,7 @@ describe('P-13: resolveViewGraphs handles minTrust for verified-memory', () => {
   it(
     'empty trust-filtered results respect query form',
     async () => {
-      // A `verified-memory` query with `minTrust=Endorsed` and no matching
+      // A `verifiable-memory` query with `minTrust=Endorsed` and no matching
       // trust metadata must still return a shape that matches its query form:
       //   - SELECT  → { bindings: [] }
       //   - ASK     → { bindings: [{ result: 'false' }] }
@@ -367,28 +367,28 @@ describe('P-13: resolveViewGraphs handles minTrust for verified-memory', () => {
 
       const select = await engine.query('SELECT ?s WHERE { ?s ?p ?o }', {
         contextGraphId: CG,
-        view: 'verified-memory',
+        view: 'verifiable-memory',
         minTrust: TrustLevel.Endorsed,
       });
       expect(select).toEqual({ bindings: [] });
 
       const ask = await engine.query('ASK { ?s ?p ?o }', {
         contextGraphId: CG,
-        view: 'verified-memory',
+        view: 'verifiable-memory',
         minTrust: TrustLevel.Endorsed,
       });
       expect(ask).toEqual({ bindings: [{ result: 'false' }] });
 
       const construct = await engine.query(
         'CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }',
-        { contextGraphId: CG, view: 'verified-memory', minTrust: TrustLevel.Endorsed },
+        { contextGraphId: CG, view: 'verifiable-memory', minTrust: TrustLevel.Endorsed },
       );
       expect(construct.bindings).toEqual([]);
       expect(construct.quads).toEqual([]);
 
       const describe = await engine.query('DESCRIBE ?s WHERE { ?s ?p ?o }', {
         contextGraphId: CG,
-        view: 'verified-memory',
+        view: 'verifiable-memory',
         minTrust: TrustLevel.Endorsed,
       });
       expect(describe.bindings).toEqual([]);

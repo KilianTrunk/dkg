@@ -46,11 +46,11 @@ function q(s: string, p: string, o: string, g = ''): Quad {
 }
 
 /**
- * rc.17 uniform per-KA layout: published / verified-memory data no longer lives
+ * rc.17 uniform per-KA layout: published / verifiable-memory data no longer lives
  * in the monolithic root data graph (`did:dkg:context-graph:{cg}`) — each KA's
- * public quads land in its own `…/_verified_memory/{author}/{number}` graph.
+ * public quads land in its own `…/_verifiable_memory/{author}/{number}` graph.
  *
- * This is the engine's DEFAULT read: union the per-KA `_verified_memory/` graphs
+ * This is the engine's DEFAULT read: union the per-KA `_verifiable_memory/` graphs
  * with the legacy root data graph (read-both), exactly as the query engine /
  * async-lift-subtraction do. Tests use it instead of pinning `GRAPH <rootData>`,
  * which is now empty for published data.
@@ -59,7 +59,7 @@ function selectObjectsViaDefaultRead(store: OxigraphStore, dataGraph: string, su
   return store.query(
     `SELECT ?o WHERE {
       GRAPH ?g { <${subject}> <http://schema.org/name> ?o }
-      FILTER(STRSTARTS(STR(?g), "${dataGraph}/_verified_memory/") || STR(?g) = "${dataGraph}")
+      FILTER(STRSTARTS(STR(?g), "${dataGraph}/_verifiable_memory/") || STR(?g) = "${dataGraph}")
     }`,
   );
 }
@@ -272,7 +272,7 @@ describe('Prefix deletion safety', () => {
       await handler.handle(gossipMsg, '12D3KooWPeer');
 
       // rc.17: foobar was published as its own KA, so it lives in its per-KA
-      // _verified_memory graph (not the root data graph). Read via the engine's
+      // _verifiable_memory graph (not the root data graph). Read via the engine's
       // default read — the foo KA update must NOT have deleted it.
       const foobarResult = await selectObjectsViaDefaultRead(store, DATA_GRAPH, 'urn:x:foobar');
       expect(foobarResult.type).toBe('bindings');
@@ -418,7 +418,7 @@ describe('chainId=none validation', () => {
 
     await handler.handle(msg, '12D3KooWPeer');
 
-    // rc.17: the UpdateHandler applies gossip into the per-KA _verified_memory
+    // rc.17: the UpdateHandler applies gossip into the per-KA _verifiable_memory
     // graph keyed by batchId, not the root data graph. Read via the default read.
     const result = await selectObjectsViaDefaultRead(store, dataGraph, 'urn:new:entity');
     expect(result.type).toBe('bindings');
@@ -621,7 +621,7 @@ describe('Same-block ordering', () => {
       '12D3KooWPeer',
     );
 
-    // rc.17: the update rewrites the KA's per-KA _verified_memory graph (keyed by
+    // rc.17: the update rewrites the KA's per-KA _verifiable_memory graph (keyed by
     // batchId = original.kaId), not the root data graph. Read via the engine's
     // default read — the later update (block 2) must have won.
     const result = await selectObjectsViaDefaultRead(store, DATA_GRAPH, 'urn:same:block');
@@ -672,7 +672,7 @@ describe('Same-block ordering', () => {
     await handler.handle(msg, '12D3KooWPeer');
     await handler.handle(msg, '12D3KooWPeer'); // replay — same (block, txIndex) → rejected
 
-    // rc.17: the applied update lands in the KA's per-KA _verified_memory graph
+    // rc.17: the applied update lands in the KA's per-KA _verifiable_memory graph
     // (keyed by batchId = original.kaId). Read via the engine's default read —
     // the single applied "Updated" value must be present exactly once.
     const result = await selectObjectsViaDefaultRead(store, DATA_GRAPH, 'urn:replay');
@@ -717,7 +717,7 @@ describe('publisher.update() atomicity', () => {
     expect(failedUpdate.status).toBe('failed');
 
     // Original data must be untouched. rc.17: the published KA lives in its
-    // per-KA _verified_memory graph; read via the engine's default read.
+    // per-KA _verifiable_memory graph; read via the engine's default read.
     const nameResult = await selectObjectsViaDefaultRead(store, DATA_GRAPH, 'urn:atomic');
     expect(nameResult.type).toBe('bindings');
     if (nameResult.type === 'bindings') {
@@ -1010,7 +1010,7 @@ describe('Same-block txIndex ordering', () => {
     await handler.handle(msg1, '12D3KooWPeer');
 
     // Should still have update2's data (later update wins). rc.17: the update
-    // rewrites the KA's per-KA _verified_memory graph (keyed by batchId =
+    // rewrites the KA's per-KA _verifiable_memory graph (keyed by batchId =
     // original.kaId), not the root data graph — read via the engine's default read.
     const result = await selectObjectsViaDefaultRead(store, DATA_GRAPH, 'urn:txidx');
     expect(result.type).toBe('bindings');
@@ -1069,7 +1069,7 @@ describe('lookupBatchContextGraph typed-literal SPARQL', () => {
     await handler.handle(msg, '12D3KooWPeer');
 
     // rc.17: the update (binding discovered via SPARQL lookup) rewrites the KA's
-    // per-KA _verified_memory graph (keyed by batchId = original.kaId), not the
+    // per-KA _verifiable_memory graph (keyed by batchId = original.kaId), not the
     // root data graph — read via the engine's default read.
     const result = await selectObjectsViaDefaultRead(store, DATA_GRAPH, 'urn:typed-lit');
     expect(result.type).toBe('bindings');

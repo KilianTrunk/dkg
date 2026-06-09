@@ -152,8 +152,8 @@ async function loadAuthoritativeQuadKeys(
         )
       }
       # Per-KA VM read-both: authoritative published data lives in
-      # …/_verified_memory/{author}/{number}; the root is the legacy fallback.
-      FILTER(STRSTARTS(STR(?g), "${graph}/_verified_memory/") || STR(?g) = "${graph}")
+      # …/_verifiable_memory/{author}/{number}; the root is the legacy fallback.
+      FILTER(STRSTARTS(STR(?g), "${graph}/_verifiable_memory/") || STR(?g) = "${graph}")
     }`,
   );
 

@@ -141,11 +141,11 @@ describe('DKGQueryEngine', () => {
   // and SELECT with solution-set modifiers (LIMIT/ORDER BY/DISTINCT/
   // aggregates can't be reconstructed from per-graph slices).
   //
-  // The `verified-memory` view resolves to TWO graphs — the root
-  // `<cg>` graph plus every `<cg>/_verified_memory/*` sub-graph — so
+  // The `verifiable-memory` view resolves to TWO graphs — the root
+  // `<cg>` graph plus every `<cg>/_verifiable_memory/*` sub-graph — so
   // seeding one VM sub-graph reaches the multi-graph fallback path.
   describe('#789 multi-graph inner-UNION fallback is form-aware', () => {
-    const VM_SUB = `${GRAPH}/_verified_memory/vm1`;
+    const VM_SUB = `${GRAPH}/_verifiable_memory/vm1`;
     const E1 = 'urn:vm:e1';
     const E2 = 'urn:vm:e2';
 
@@ -163,7 +163,7 @@ describe('DKGQueryEngine', () => {
         `CONSTRUCT { ?s <urn:out> ?v } WHERE {
            { ?s <http://ex.org/p1> ?v } UNION { ?s <http://ex.org/p2> ?v }
          }`,
-        { contextGraphId: CONTEXT_GRAPH, view: 'verified-memory' },
+        { contextGraphId: CONTEXT_GRAPH, view: 'verifiable-memory' },
       );
       expect(result.quads).toBeDefined();
       const subjects = (result.quads ?? []).map((qd) => qd.subject).sort();
@@ -175,7 +175,7 @@ describe('DKGQueryEngine', () => {
         `ASK {
            { ?s <http://ex.org/p1> ?v } UNION { ?s <http://ex.org/p2> ?v }
          }`,
-        { contextGraphId: CONTEXT_GRAPH, view: 'verified-memory' },
+        { contextGraphId: CONTEXT_GRAPH, view: 'verifiable-memory' },
       );
       expect(result.bindings).toEqual([{ result: 'true' }]);
     });
@@ -185,7 +185,7 @@ describe('DKGQueryEngine', () => {
         `ASK {
            { ?s <http://ex.org/nope1> ?v } UNION { ?s <http://ex.org/nope2> ?v }
          }`,
-        { contextGraphId: CONTEXT_GRAPH, view: 'verified-memory' },
+        { contextGraphId: CONTEXT_GRAPH, view: 'verifiable-memory' },
       );
       expect(result.bindings).toEqual([{ result: 'false' }]);
     });
@@ -195,7 +195,7 @@ describe('DKGQueryEngine', () => {
         `SELECT ?s ?v WHERE {
            { ?s <http://ex.org/p1> ?v } UNION { ?s <http://ex.org/p2> ?v }
          }`,
-        { contextGraphId: CONTEXT_GRAPH, view: 'verified-memory' },
+        { contextGraphId: CONTEXT_GRAPH, view: 'verifiable-memory' },
       );
       const subjects = result.bindings.map((b) => b['s']).sort();
       expect(subjects).toEqual([E1, E2]);
@@ -207,7 +207,7 @@ describe('DKGQueryEngine', () => {
           `SELECT ?s ?v WHERE {
              { ?s <http://ex.org/p1> ?v } UNION { ?s <http://ex.org/p2> ?v }
            } ORDER BY ?v`,
-          { contextGraphId: CONTEXT_GRAPH, view: 'verified-memory' },
+          { contextGraphId: CONTEXT_GRAPH, view: 'verifiable-memory' },
         ),
       ).rejects.toThrow(/cannot be evaluated across graphs/i);
     });
@@ -218,7 +218,7 @@ describe('DKGQueryEngine', () => {
           `SELECT ?s ?v WHERE {
              { ?s <http://ex.org/p1> ?v } UNION { ?s <http://ex.org/p2> ?v }
            } LIMIT 1`,
-          { contextGraphId: CONTEXT_GRAPH, view: 'verified-memory' },
+          { contextGraphId: CONTEXT_GRAPH, view: 'verifiable-memory' },
         ),
       ).rejects.toThrow(/cannot be evaluated across graphs/i);
     });
@@ -322,11 +322,11 @@ describe('DKGQueryEngine', () => {
     ).rejects.toThrow('SPARQL rejected');
   });
 
-  it('view=verified-memory includes the root content graph (RC11 / PR-A: Codex #671)', async () => {
+  it('view=verifiable-memory includes the root content graph (RC11 / PR-A: Codex #671)', async () => {
     // RC11 / PR-A (Codex review fix on #671, comment 3302058969):
-    // re-includes the root context-graph alongside `_verified_memory/*`
+    // re-includes the root context-graph alongside `_verifiable_memory/*`
     // so a successful `/api/shared-memory/publish` is immediately
-    // observable via `view: 'verified-memory'` (the pre-PR2 behaviour
+    // observable via `view: 'verifiable-memory'` (the pre-PR2 behaviour
     // existing callers, including memory-search, rely on). The
     // tentative-VM leak that PR2 was meant to plug is now fixed at the
     // publisher (root-graph insert deferred to the chain-success
@@ -334,31 +334,31 @@ describe('DKGQueryEngine', () => {
     // rationale.
     const result = await engine.query(
       'SELECT ?name WHERE { ?s <http://schema.org/name> ?name }',
-      { contextGraphId: CONTEXT_GRAPH, view: 'verified-memory' },
+      { contextGraphId: CONTEXT_GRAPH, view: 'verifiable-memory' },
     );
     const names = result.bindings.map(r => r['name']);
     expect(names).toContain('"ImageBot"');
   });
 
-  it('view=verified-memory unions root content graph + _verified_memory/ sub-graphs (RC11 / PR-A)', async () => {
-    const vmGraph = `did:dkg:context-graph:${CONTEXT_GRAPH}/_verified_memory/quorum-1`;
+  it('view=verifiable-memory unions root content graph + _verifiable_memory/ sub-graphs (RC11 / PR-A)', async () => {
+    const vmGraph = `did:dkg:context-graph:${CONTEXT_GRAPH}/_verifiable_memory/quorum-1`;
     await store.insert([
       q('urn:vm:entity:1', 'http://schema.org/name', '"Quorum Verified"', vmGraph),
     ]);
     const result = await engine.query(
       'SELECT ?name WHERE { ?s <http://schema.org/name> ?name }',
-      { contextGraphId: CONTEXT_GRAPH, view: 'verified-memory' },
+      { contextGraphId: CONTEXT_GRAPH, view: 'verifiable-memory' },
     );
     const names = result.bindings.map(r => r['name']);
     // Both the publisher's confirmed root-graph data AND post-`verify`
-    // `_verified_memory/*` data must surface — VM is the union of both
+    // `_verifiable_memory/*` data must surface — VM is the union of both
     // (Codex #671 review fix).
     expect(names).toContain('"ImageBot"');
     expect(names).toContain('"Quorum Verified"');
   });
 
-  it('view=verified-memory constrains compact GRAPH variables without duplicating multi-graph rows', async () => {
-    const vmGraph = `did:dkg:context-graph:${CONTEXT_GRAPH}/_verified_memory/quorum-1`;
+  it('view=verifiable-memory constrains compact GRAPH variables without duplicating multi-graph rows', async () => {
+    const vmGraph = `did:dkg:context-graph:${CONTEXT_GRAPH}/_verifiable_memory/quorum-1`;
     await store.insert([
       q('urn:vm:entity:1', 'http://schema.org/name', '"Quorum Verified"', vmGraph),
       q('urn:other:entity', 'http://schema.org/name', '"OtherGraph"', 'did:dkg:context-graph:other-agent-registry'),
@@ -366,7 +366,7 @@ describe('DKGQueryEngine', () => {
 
     const result = await engine.query(
       'SELECT ?g ?name WHERE { GRAPH?g { ?s <http://schema.org/name> ?name } } ORDER BY ?name',
-      { contextGraphId: CONTEXT_GRAPH, view: 'verified-memory' },
+      { contextGraphId: CONTEXT_GRAPH, view: 'verifiable-memory' },
     );
 
     expect(result.bindings).toEqual([
@@ -375,15 +375,15 @@ describe('DKGQueryEngine', () => {
     ]);
   });
 
-  it('view=verified-memory honors compact explicit GRAPH IRIs without duplicating multi-graph rows', async () => {
-    const vmGraph = `did:dkg:context-graph:${CONTEXT_GRAPH}/_verified_memory/quorum-1`;
+  it('view=verifiable-memory honors compact explicit GRAPH IRIs without duplicating multi-graph rows', async () => {
+    const vmGraph = `did:dkg:context-graph:${CONTEXT_GRAPH}/_verifiable_memory/quorum-1`;
     await store.insert([
       q('urn:vm:entity:1', 'http://schema.org/name', '"Quorum Verified"', vmGraph),
     ]);
 
     const result = await engine.query(
       `SELECT ?name WHERE { GRAPH<${vmGraph}> { ?s <http://schema.org/name> ?name } }`,
-      { contextGraphId: CONTEXT_GRAPH, view: 'verified-memory' },
+      { contextGraphId: CONTEXT_GRAPH, view: 'verifiable-memory' },
     );
 
     expect(result.bindings).toEqual([
@@ -391,27 +391,27 @@ describe('DKGQueryEngine', () => {
     ]);
   });
 
-  it('view=verified-memory with verifiedGraph scopes to that graph only', async () => {
-    const vmGraph = `did:dkg:context-graph:${CONTEXT_GRAPH}/_verified_memory/team-a`;
+  it('view=verifiable-memory with verifiedGraph scopes to that graph only', async () => {
+    const vmGraph = `did:dkg:context-graph:${CONTEXT_GRAPH}/_verifiable_memory/team-a`;
     await store.insert([
       q('urn:vm:scoped:1', 'http://schema.org/name', '"Scoped Data"', vmGraph),
     ]);
     const result = await engine.query(
       'SELECT ?name WHERE { ?s <http://schema.org/name> ?name }',
-      { contextGraphId: CONTEXT_GRAPH, view: 'verified-memory', verifiedGraph: 'team-a' },
+      { contextGraphId: CONTEXT_GRAPH, view: 'verifiable-memory', verifiedGraph: 'team-a' },
     );
     expect(result.bindings).toHaveLength(1);
     expect(result.bindings[0]['name']).toBe('"Scoped Data"');
   });
 
-  it('view=verified-memory excludes _meta and staging graphs', async () => {
+  it('view=verifiable-memory excludes _meta and staging graphs', async () => {
     await store.insert([
-      q('urn:vm:meta', 'http://schema.org/name', '"Meta Only"', `did:dkg:context-graph:${CONTEXT_GRAPH}/_verified_memory/q1/_meta`),
-      q('urn:vm:staging', 'http://schema.org/name', '"Staging Only"', `did:dkg:context-graph:${CONTEXT_GRAPH}/_verified_memory/staging/draft`),
+      q('urn:vm:meta', 'http://schema.org/name', '"Meta Only"', `did:dkg:context-graph:${CONTEXT_GRAPH}/_verifiable_memory/q1/_meta`),
+      q('urn:vm:staging', 'http://schema.org/name', '"Staging Only"', `did:dkg:context-graph:${CONTEXT_GRAPH}/_verifiable_memory/staging/draft`),
     ]);
     const result = await engine.query(
       'SELECT ?name WHERE { ?s <http://schema.org/name> ?name }',
-      { contextGraphId: CONTEXT_GRAPH, view: 'verified-memory' },
+      { contextGraphId: CONTEXT_GRAPH, view: 'verifiable-memory' },
     );
     const names = result.bindings.map(r => r['name']);
     expect(names).not.toContain('"Meta Only"');
@@ -428,7 +428,7 @@ describe('DKGQueryEngine', () => {
 
   it('view requires contextGraphId', async () => {
     await expect(
-      engine.query('SELECT ?s WHERE { ?s ?p ?o }', { view: 'verified-memory' }),
+      engine.query('SELECT ?s WHERE { ?s ?p ?o }', { view: 'verifiable-memory' }),
     ).rejects.toThrow('requires a contextGraphId');
   });
 
@@ -674,7 +674,7 @@ describe('DKGQueryEngine', () => {
   });
 
   it('GRAPH ?g binds to same-CG _meta on default-routed scoped queries (UI hook regression coverage)', async () => {
-    // Codex r2 on #776: `useSwmAttributions`, `useVerifiedMemoryAnchors`
+    // Codex r2 on #776: `useSwmAttributions`, `useVerifiableMemoryAnchors`
     // and `useVerifiedEntityIdentity` all bind `GRAPH ?g` over
     // CG-scoped metadata. Widening `constrainGraphVariablesToAllowedSet`
     // to the same set as the explicit-IRI allow set restores the
@@ -886,7 +886,7 @@ describe('DKGQueryEngine', () => {
 
   it('keeps legacy GRAPH-variable scans on the selected data graph without partition opt-in', async () => {
     const rootAssertionGraph = `${GRAPH}/assertion/0xAgent/root-draft`;
-    const rootVerifiedGraph = `${GRAPH}/_verified_memory/vm-1`;
+    const rootVerifiedGraph = `${GRAPH}/_verifiable_memory/vm-1`;
     const subGraph = `${GRAPH}/code`;
     const subGraphSharedMemoryGraph = `${GRAPH}/code/_shared_memory/0xAgent/2`;
 
@@ -906,10 +906,10 @@ describe('DKGQueryEngine', () => {
     );
 
     // rc.17 uniform layout: published data now lives in per-KA
-    // `…/_verified_memory/{author}/{number}` graphs, and the default
+    // `…/_verifiable_memory/{author}/{number}` graphs, and the default
     // data-graph read read-boths them alongside the legacy root graph.
     // So a GRAPH-variable scan on the data route binds the root graph AND
-    // the per-KA verified-memory partitions — but still NOT the working-
+    // the per-KA verifiable-memory partitions — but still NOT the working-
     // memory assertion graph, sub-graph data, or sub-graph SWM (those
     // require the explicit partition opt-in).
     expect(result.bindings).toEqual([
@@ -921,7 +921,7 @@ describe('DKGQueryEngine', () => {
   it('keeps includeSharedMemory GRAPH-variable scans on data plus SWM without partition opt-in', async () => {
     const rootSharedMemoryGraph = `${GRAPH}/_shared_memory/0xAgent/1`;
     const rootAssertionGraph = `${GRAPH}/assertion/0xAgent/root-draft`;
-    const rootVerifiedGraph = `${GRAPH}/_verified_memory/vm-1`;
+    const rootVerifiedGraph = `${GRAPH}/_verifiable_memory/vm-1`;
     const subGraph = `${GRAPH}/code`;
     const subGraphSharedMemoryGraph = `${GRAPH}/code/_shared_memory/0xAgent/2`;
 
@@ -942,9 +942,9 @@ describe('DKGQueryEngine', () => {
     );
 
     // rc.17 uniform layout: the data route read-boths the per-KA
-    // `…/_verified_memory/{author}/{number}` partitions, so the
+    // `…/_verifiable_memory/{author}/{number}` partitions, so the
     // includeSharedMemory scan now binds root data + root SWM + the
-    // per-KA verified-memory partition — but still NOT the root working-
+    // per-KA verifiable-memory partition — but still NOT the root working-
     // memory assertion graph, sub-graph data, or sub-graph SWM (those
     // require the explicit partition opt-in).
     expect(result.bindings).toEqual([
@@ -957,13 +957,13 @@ describe('DKGQueryEngine', () => {
   it('allows scoped GRAPH variable count scans across registered same-CG content partitions', async () => {
     const rootAssertionGraph = `${GRAPH}/_working_memory/0xAgent/1`;
     const rootSharedMemoryGraph = `${GRAPH}/_shared_memory/0xAgent/1`;
-    const rootVerifiedGraph = `${GRAPH}/_verified_memory/vm-1`;
-    const rootVerifiedStagingGraph = `${GRAPH}/_verified_memory/staging/vm-1`;
+    const rootVerifiedGraph = `${GRAPH}/_verifiable_memory/vm-1`;
+    const rootVerifiedStagingGraph = `${GRAPH}/_verifiable_memory/staging/vm-1`;
     const subGraph = `${GRAPH}/code`;
     const subGraphAssertionGraph = `${GRAPH}/code/_working_memory/0xAgent/2`;
     const subGraphSharedMemoryGraph = `${GRAPH}/code/_shared_memory/0xAgent/2`;
-    const subGraphVerifiedGraph = `${GRAPH}/code/_verified_memory/vm-1`;
-    const subGraphVerifiedStagingGraph = `${GRAPH}/code/_verified_memory/staging/vm-1`;
+    const subGraphVerifiedGraph = `${GRAPH}/code/_verifiable_memory/vm-1`;
+    const subGraphVerifiedStagingGraph = `${GRAPH}/code/_verifiable_memory/staging/vm-1`;
     const subGraphMeta = `${GRAPH}/code/_meta`;
     const subGraphPrivate = `${GRAPH}/code/_private`;
     const otherGraph = 'did:dkg:context-graph:other-agent-registry/code/_shared_memory/0xOther/1';
@@ -1016,7 +1016,7 @@ describe('DKGQueryEngine', () => {
 
   it('memoizes same-CG partition discovery across concurrent count scans', async () => {
     const rootSharedMemoryGraph = `${GRAPH}/_shared_memory/0xAgent/1`;
-    const rootVerifiedGraph = `${GRAPH}/_verified_memory/vm-1`;
+    const rootVerifiedGraph = `${GRAPH}/_verifiable_memory/vm-1`;
     const subGraph = `${GRAPH}/code`;
     const subGraphSharedMemoryGraph = `${GRAPH}/code/_shared_memory/0xAgent/2`;
 
@@ -1029,7 +1029,7 @@ describe('DKGQueryEngine', () => {
     ]);
 
     // rc.17 uniform layout adds unmemoized per-KA prefix discoveries
-    // (`…/_verified_memory/…` read-both) that also hit `store.listGraphs`,
+    // (`…/_verifiable_memory/…` read-both) that also hit `store.listGraphs`,
     // so a raw `listGraphs` spy no longer isolates partition discovery.
     // Spy on the memoized partition-discovery routine directly — that is
     // what the in-flight cache de-dupes across concurrent scans.
@@ -1096,11 +1096,11 @@ describe('DKGQueryEngine', () => {
   it('does not bind same-prefix child context graphs as parent content partitions', async () => {
     const collidingSubGraph = `${GRAPH}/code`;
     const collidingSubGraphSharedMemory = `${collidingSubGraph}/_shared_memory`;
-    const collidingSubGraphVerified = `${collidingSubGraph}/_verified_memory/vm-1`;
+    const collidingSubGraphVerified = `${collidingSubGraph}/_verifiable_memory/vm-1`;
     const collidingSubGraphMeta = `${collidingSubGraph}/_meta`;
     const collidingRootSharedMemory = `${GRAPH}/_shared_memory`;
     const collidingRootSharedMemoryMeta = `${collidingRootSharedMemory}/_meta`;
-    const collidingRootVerified = `${GRAPH}/_verified_memory/vm-1`;
+    const collidingRootVerified = `${GRAPH}/_verifiable_memory/vm-1`;
     const collidingRootVerifiedMeta = `${collidingRootVerified}/_meta`;
 
     await store.insert([
@@ -1132,8 +1132,8 @@ describe('DKGQueryEngine', () => {
     expect(result.bindings.some((row) => row['g'] === collidingSubGraphVerified)).toBe(false);
     expect(result.bindings.some((row) => row['g'] === collidingRootSharedMemory)).toBe(false);
 
-    // rc.17 uniform layout: `<cg>/_verified_memory/{…}` is, by definition,
-    // the parent CG's own per-KA verified-memory partition — the default
+    // rc.17 uniform layout: `<cg>/_verifiable_memory/{…}` is, by definition,
+    // the parent CG's own per-KA verifiable-memory partition — the default
     // data-graph read read-boths it regardless of any `registrationStatus`
     // marker in its `_meta`. It is therefore legitimately bound here (it is
     // NOT a colliding child CG), so it is expected to surface.

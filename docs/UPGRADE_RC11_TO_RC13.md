@@ -111,7 +111,7 @@ So: treat this as "do the entire rc.12 migration, then pick up the rc.13 nicetie
 | 7 | Profile | `Profile.recreateProfile` drops `initialOperatorFee` arg | Operator recovery scripts | rc.12 |
 | 8 | Chain | Base Sepolia full contract redeploy; first-boot state wipe | Operators; chain readers caching addresses | rc.12 |
 | 9 | Behaviour | Default publish lifetime is now **12 epochs** when none is specified | Publishers not setting an explicit lifetime | **rc.13** |
-| 10 | Sync | Core-preferred sync + chain-driven verified-memory reconciliation | Operators (re-sync behaviour) | **rc.13** |
+| 10 | Sync | Core-preferred sync + chain-driven verifiable-memory reconciliation | Operators (re-sync behaviour) | **rc.13** |
 
 Rows 1–8 are the rc.12 work. Rows 9–10 are the rc.13 deltas. The rest of this doc is the concrete migration.
 
@@ -247,9 +247,9 @@ Additive unless flagged. If you're already on rc.12, this section *is* your upgr
 
 Publishes that don't specify a lifetime now default to **12 epochs** instead of the previous default. If you relied on the old implicit lifetime, set the lifetime explicitly or budget for 12 epochs of TRAC.
 
-### 7.2 Core-preferred sync + chain-driven verified-memory reconciliation
+### 7.2 Core-preferred sync + chain-driven verifiable-memory reconciliation
 
-The sync path now prefers Core peers and reconciles verified-memory against on-chain state, including host-mode catch-up. Operator-visible as healthier catch-up; no action required.
+The sync path now prefers Core peers and reconciles verifiable-memory against on-chain state, including host-mode catch-up. Operator-visible as healthier catch-up; no action required.
 
 ### 7.3 Kafka route-plugin MVP (`@origintrail-official/kafka-plugin`)
 

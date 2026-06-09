@@ -18,7 +18,7 @@ import {
   contextGraphPublishTopic, contextGraphWorkspaceTopic, contextGraphAppTopic, contextGraphUpdateTopic, contextGraphFinalizationTopic,
   contextGraphDataGraphUri, contextGraphMetaGraphUri, contextGraphWorkspaceGraphUri, contextGraphWorkspaceMetaGraphUri,
   contextGraphSharedMemoryUri,
-  contextGraphVerifiedMemoryUri, contextGraphVerifiedMemoryMetaUri,
+  contextGraphVerifiableMemoryUri, contextGraphVerifiableMemoryMetaUri,
   contextGraphDataUri, contextGraphMetaUri, assertionLifecycleUri, contextGraphAssertionUri,
   contextGraphLayerUri,
   deriveCuratorDidFromCgId,
@@ -2805,7 +2805,7 @@ export class PublishMethods extends DKGAgentBase {
 
   /**
    * RFC-001 §9.x — publish a previously-finalized assertion to the
-   * verified-memory chain.
+   * verifiable-memory chain.
    *
    * Reads the seal from `_meta`, plumbs the seal's
    * `(merkleRoot, authorAddress, signature, schemeVersion)` into the
@@ -3081,22 +3081,22 @@ export class PublishMethods extends DKGAgentBase {
         for (const subj of [lifecycleUri, assertionUri]) {
           await this.store.deleteByPattern({ subject: subj, predicate: MEMORY_LAYER_PRED, graph: metaGraph });
           await this.store.insert([
-            { subject: subj, predicate: MEMORY_LAYER_PRED, object: `"${MemoryLayer.VerifiedMemory}"`, graph: metaGraph },
+            { subject: subj, predicate: MEMORY_LAYER_PRED, object: `"${MemoryLayer.VerifiableMemory}"`, graph: metaGraph },
           ]);
         }
         await this.store.deleteByPattern({ subject: lifecycleUri, predicate: STATE_PRED, graph: metaGraph });
         await this.store.insert([
           { subject: lifecycleUri, predicate: STATE_PRED, object: '"published"', graph: metaGraph },
         ]);
-        // SUBSTRATE-2 — re-point dkg:assertionGraph to the per-KA verified-
+        // SUBSTRATE-2 — re-point dkg:assertionGraph to the per-KA verifiable-
         // memory graph this publish actually wrote
-        // (…/_verified_memory/{author}/{number}). promote() left the pointer on
+        // (…/_verifiable_memory/{author}/{number}). promote() left the pointer on
         // the SWM graph, which the post-confirm SWM cleanup then empties — so
         // without this re-stamp the _meta index follows a stale pointer to an
         // empty graph instead of the live VM data. Mirrors the wm→swm re-stamp
         // in generateAssertionPromotedMetadata, for the swm→vm transition. The
         // graph URI is derived from the minted kaId exactly as the data write
-        // (publishFromSharedMemory at dkg-publisher.ts: VerifiedMemory layer,
+        // (publishFromSharedMemory at dkg-publisher.ts: VerifiableMemory layer,
         // {kaId>>96}, {kaId & 2^96-1}, subGraphName) derives it, so the pointer
         // and the data always name the same graph.
         //
@@ -3108,7 +3108,7 @@ export class PublishMethods extends DKGAgentBase {
         if (result.status === 'confirmed' && result.onChainResult) {
           const ASSERTION_GRAPH_PRED = 'http://dkg.io/ontology/assertionGraph';
           // Derive the VM graph URI from the packed KA id (author<<96 | number)
-          // that named the …/_verified_memory/{author}/{number} graph. Prefer
+          // that named the …/_verifiable_memory/{author}/{number} graph. Prefer
           // the finalize-reserved id we threaded down as `reservedKaId`, then an
           // explicit on-chain `kaId` if the adapter reports one. Only fall back
           // to `result.kaId` for legacy/no-chain shapes. Do NOT use
@@ -3119,7 +3119,7 @@ export class PublishMethods extends DKGAgentBase {
             const vmKaIdBig = BigInt(vmKaId);
             const vmAuthor = '0x' + (vmKaIdBig >> 96n).toString(16).padStart(40, '0');
             const vmNumber = vmKaIdBig & ((1n << 96n) - 1n);
-            const vmGraph = contextGraphLayerUri(contextGraphId, MemoryLayer.VerifiedMemory, vmAuthor, vmNumber, opts?.subGraphName);
+            const vmGraph = contextGraphLayerUri(contextGraphId, MemoryLayer.VerifiableMemory, vmAuthor, vmNumber, opts?.subGraphName);
             await this.store.deleteByPattern({ subject: lifecycleUri, predicate: ASSERTION_GRAPH_PRED, graph: metaGraph });
             await this.store.insert([
               { subject: lifecycleUri, predicate: ASSERTION_GRAPH_PRED, object: vmGraph, graph: metaGraph },

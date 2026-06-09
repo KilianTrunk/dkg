@@ -119,11 +119,11 @@ describe('DkgPublisherExtension', () => {
     ]);
   });
 
-  it('publishes fresh quads and existing shared memory into verified memory', async () => {
+  it('publishes fresh quads and existing shared memory into verifiable memory', async () => {
     const transport = createTransport();
     const publisher = createDkgPublisherExtension(transport);
 
-    await publisher.publishVerifiedMemory({
+    await publisher.publishVerifiableMemory({
       contextGraphId: 'cg',
       quads: [{ subject: 'did:dkg:e:1', predicate: 'http://schema.org/name', object: 'Alpha' }],
     });

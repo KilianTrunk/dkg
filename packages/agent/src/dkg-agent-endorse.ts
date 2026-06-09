@@ -2,7 +2,7 @@
 
 /**
  * Endorsement / verification subsystem extracted from dkg-agent.ts as a mixin
- * holder: endorse(), verify(), verified-memory promotion, batch trust-level
+ * holder: endorse(), verify(), verifiable-memory promotion, batch trust-level
  * stamping and batch chain-provenance resolution. 1:1 move; methods take
  * `this: DKGAgent` so cross-calls resolve against the composed class.
  */
@@ -16,7 +16,7 @@ import {
   contextGraphPublishTopic, contextGraphWorkspaceTopic, contextGraphAppTopic, contextGraphUpdateTopic, contextGraphFinalizationTopic,
   contextGraphDataGraphUri, contextGraphMetaGraphUri, contextGraphWorkspaceGraphUri, contextGraphWorkspaceMetaGraphUri,
   contextGraphSharedMemoryUri,
-  contextGraphVerifiedMemoryUri, contextGraphVerifiedMemoryMetaUri,
+  contextGraphVerifiableMemoryUri, contextGraphVerifiableMemoryMetaUri,
   contextGraphDataUri, contextGraphMetaUri, assertionLifecycleUri, contextGraphAssertionUri,
   deriveCuratorDidFromCgId,
   MemoryLayer,
@@ -433,18 +433,18 @@ export class EndorseVerifyMethods extends DKGAgentBase {
 
   /**
    * Propose verification for a published batch: collect M-of-N approvals,
-   * anchor on-chain, and promote triples to Verified Memory.
+   * anchor on-chain, and promote triples to Verifiable Memory.
    */
   async verify(this: DKGAgent, opts: {
     contextGraphId: string;
-    verifiedMemoryId: string;
+    verifiableMemoryId: string;
     batchId: bigint;
     requiredSignatures?: number;
     timeoutMs?: number;
   }): Promise<{
     txHash?: string;
     blockNumber?: number;
-    verifiedMemoryId: string;
+    verifiableMemoryId: string;
     signers: string[];
     status: 'verified' | 'partial' | 'no_quorum';
     trustLevel: TrustLevel;
@@ -641,9 +641,9 @@ export class EndorseVerifyMethods extends DKGAgentBase {
     const result = await collector.collect({
       contextGraphId: opts.contextGraphId,
       contextGraphIdOnChain,
-      verifiedMemoryId: (() => {
-        try { return BigInt(opts.verifiedMemoryId); }
-        catch { throw new Error(`verifiedMemoryId must be a numeric string, got: "${opts.verifiedMemoryId}"`); }
+      verifiableMemoryId: (() => {
+        try { return BigInt(opts.verifiableMemoryId); }
+        catch { throw new Error(`verifiableMemoryId must be a numeric string, got: "${opts.verifiableMemoryId}"`); }
       })(),
       batchId: opts.batchId,
       merkleRoot,
@@ -696,7 +696,7 @@ export class EndorseVerifyMethods extends DKGAgentBase {
           `stamped trustLevel=${trustLevel} without chain tx`,
       );
       return {
-        verifiedMemoryId: opts.verifiedMemoryId,
+        verifiableMemoryId: opts.verifiableMemoryId,
         signers: resolvedSignerAddresses,
         status,
         trustLevel,
@@ -732,22 +732,22 @@ export class EndorseVerifyMethods extends DKGAgentBase {
       });
     }
 
-    // 8. Promote triples to Verified Memory (only include signers actually sent on-chain)
-    await this.promoteToVerifiedMemory(
+    // 8. Promote triples to Verifiable Memory (only include signers actually sent on-chain)
+    await this.promoteToVerifiableMemory(
       opts.contextGraphId,
-      opts.verifiedMemoryId,
+      opts.verifiableMemoryId,
       opts.batchId,
       txResult.hash,
       txResult.blockNumber,
       resolvedSignerAddresses,
     );
 
-    this.log.info(ctx, `Verified batch ${opts.batchId} → _verified_memory/${opts.verifiedMemoryId} (tx=${txResult.hash.slice(0, 16)}...)`);
+    this.log.info(ctx, `Verified batch ${opts.batchId} → _verifiable_memory/${opts.verifiableMemoryId} (tx=${txResult.hash.slice(0, 16)}...)`);
 
     return {
       txHash: txResult.hash,
       blockNumber: txResult.blockNumber,
-      verifiedMemoryId: opts.verifiedMemoryId,
+      verifiableMemoryId: opts.verifiableMemoryId,
       signers: resolvedSignerAddresses,
       status: 'verified',
       trustLevel: TrustLevel.ConsensusVerified,
@@ -773,9 +773,9 @@ export class EndorseVerifyMethods extends DKGAgentBase {
     }
   }
 
-  async promoteToVerifiedMemory(this: DKGAgent,
+  async promoteToVerifiableMemory(this: DKGAgent,
     contextGraphId: string,
-    verifiedMemoryId: string,
+    verifiableMemoryId: string,
     batchId: bigint,
     txHash: string,
     blockNumber: number,
@@ -796,11 +796,11 @@ export class EndorseVerifyMethods extends DKGAgentBase {
       .map(e => `(STR(?s) = ${sparqlString(e)} || STRSTARTS(STR(?s), ${sparqlString(e + '/.well-known/genid/')}))`)
       .join(' || ');
     const result = await this.store.query(
-      `SELECT ?s ?p ?o WHERE { GRAPH ?g { ?s ?p ?o . FILTER(${filterClauses}) } FILTER(STRSTARTS(STR(?g), "${dataGraph}/_verified_memory/") || STR(?g) = "${dataGraph}") }`,
+      `SELECT ?s ?p ?o WHERE { GRAPH ?g { ?s ?p ?o . FILTER(${filterClauses}) } FILTER(STRSTARTS(STR(?g), "${dataGraph}/_verifiable_memory/") || STR(?g) = "${dataGraph}") }`,
     );
     if (result.type !== 'bindings') return;
 
-    const vmGraph = assertSafeIri(contextGraphVerifiedMemoryUri(contextGraphId, verifiedMemoryId));
+    const vmGraph = assertSafeIri(contextGraphVerifiableMemoryUri(contextGraphId, verifiableMemoryId));
     const vmQuads: Quad[] = (result.bindings as Record<string, string>[])
       .filter(row => !isTrustLevelQuad({ predicate: row.p }))
       .map(row => ({
@@ -819,10 +819,10 @@ export class EndorseVerifyMethods extends DKGAgentBase {
     );
 
     // Write verification metadata
-    const vmMetaGraph = contextGraphVerifiedMemoryMetaUri(contextGraphId, verifiedMemoryId);
+    const vmMetaGraph = contextGraphVerifiableMemoryMetaUri(contextGraphId, verifiableMemoryId);
     const metaQuads = buildVerificationMetadata({
       contextGraphId,
-      verifiedMemoryId,
+      verifiableMemoryId,
       batchId,
       txHash,
       blockNumber,

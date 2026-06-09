@@ -238,8 +238,8 @@ export class QueryHandler {
     }
 
     const dataGraph = assertSafeIri(contextGraphDataUri(contextGraphId));
-    // Per-KA VM read-both: published data lives in …/_verified_memory/{addr}/{number} + (legacy) root.
-    const sparql = `SELECT DISTINCT ?entity WHERE { GRAPH ?g { ?entity a <${assertSafeIri(rdfType)}> } FILTER(STRSTARTS(STR(?g), "${dataGraph}/_verified_memory/") || STR(?g) = "${dataGraph}") } LIMIT ${limit}`;
+    // Per-KA VM read-both: published data lives in …/_verifiable_memory/{addr}/{number} + (legacy) root.
+    const sparql = `SELECT DISTINCT ?entity WHERE { GRAPH ?g { ?entity a <${assertSafeIri(rdfType)}> } FILTER(STRSTARTS(STR(?g), "${dataGraph}/_verifiable_memory/") || STR(?g) = "${dataGraph}") } LIMIT ${limit}`;
 
     const result = await this.queryEngine.query(sparql);
     const entityUris = result.bindings.map(b => b['entity']);
@@ -263,8 +263,8 @@ export class QueryHandler {
     }
 
     const dataGraph = assertSafeIri(contextGraphDataUri(contextGraphId));
-    // Per-KA VM read-both: published data lives in …/_verified_memory/{addr}/{number} + (legacy) root.
-    const sparql = `SELECT ?p ?o WHERE { GRAPH ?g { <${assertSafeIri(entityUri)}> ?p ?o } FILTER(STRSTARTS(STR(?g), "${dataGraph}/_verified_memory/") || STR(?g) = "${dataGraph}") }`;
+    // Per-KA VM read-both: published data lives in …/_verifiable_memory/{addr}/{number} + (legacy) root.
+    const sparql = `SELECT ?p ?o WHERE { GRAPH ?g { <${assertSafeIri(entityUri)}> ?p ?o } FILTER(STRSTARTS(STR(?g), "${dataGraph}/_verifiable_memory/") || STR(?g) = "${dataGraph}") }`;
     const result = await this.queryEngine.query(sparql);
 
     const ntriples = result.bindings

@@ -580,10 +580,10 @@ GRAPH `…/_meta` - one KC node + **one** KA node (from `generateKCMetadata`, no
 <UAL> dkg:chainId "evm:31337" .
 # lifecycle event (generateAssertionPublishedMetadata): delete shared/SWM, then:
 <lifecycle> dkg:state "published" .
-<lifecycle> dkg:memoryLayer "VerifiedMemory" .
+<lifecycle> dkg:memoryLayer "VerifiableMemory" .
 <lifecycle/event/3> rdf:type prov:Activity , dkg:AssertionPublished .
 <lifecycle/event/3> dkg:kcUal <UAL> .
-<lifecycle/event/3> dkg:fromLayer "SharedWorkingMemory" ; dkg:toLayer "VerifiedMemory" .
+<lifecycle/event/3> dkg:fromLayer "SharedWorkingMemory" ; dkg:toLayer "VerifiableMemory" .
 <lifecycle> dkg:currentAssertion "9f86d0…" .          # NEW: points at the live merkle state
 ```
 

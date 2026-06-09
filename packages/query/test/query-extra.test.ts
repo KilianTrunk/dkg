@@ -3,7 +3,7 @@
  *
  * Findings covered (see .test-audit/
  *
- *   Q-1  `QueryOptions.minTrust` on `verified-memory` view is enforced
+ *   Q-1  `QueryOptions.minTrust` on `verifiable-memory` view is enforced
  *        with writer-side `dkg:trustLevel` metadata, not graph-scope trust
  *        alone. Tests insert mixed-trust quads and assert the engine only
  *        returns entities that meet the requested trust floor.
@@ -47,7 +47,7 @@ import {
 } from '@origintrail-official/dkg-storage';
 import {
   contextGraphDataUri,
-  contextGraphVerifiedMemoryUri,
+  contextGraphVerifiableMemoryUri,
   contextGraphAssertionUri,
   contextGraphLayerUri,
   MemoryLayer,
@@ -72,14 +72,14 @@ function quad(s: string, p: string, o: string, g: string): Quad {
 describe('[Q-1] DKGQueryEngine minTrust uses writer-side trust metadata', () => {
   // All trust floors above SelfAttested require explicit writer-side
   // trust metadata. Untagged production data fails closed for these queries.
-  it('filters out sub-threshold trust quads WITHIN a verified-memory sub-graph at ConsensusVerified (Q-1)', async () => {
+  it('filters out sub-threshold trust quads WITHIN a verifiable-memory sub-graph at ConsensusVerified (Q-1)', async () => {
     const store = new OxigraphStore();
     const engine = new DKGQueryEngine(store);
 
-    // All quads live in a single /_verified_memory/* sub-graph so graph-
+    // All quads live in a single /_verifiable_memory/* sub-graph so graph-
     // scope filtering cannot distinguish them. Only a per-triple filter
     // can drop the low-trust quad.
-    const mixedGraph = contextGraphVerifiedMemoryUri(CG, 'mixed-trust-sub-graph');
+    const mixedGraph = contextGraphVerifiableMemoryUri(CG, 'mixed-trust-sub-graph');
     const rootGraph = contextGraphDataUri(CG);
 
     await store.insert([
@@ -95,7 +95,7 @@ describe('[Q-1] DKGQueryEngine minTrust uses writer-side trust metadata', () => 
       'SELECT ?name WHERE { ?s <http://schema.org/name> ?name }',
       {
         contextGraphId: CG,
-        view: 'verified-memory',
+        view: 'verifiable-memory',
         minTrust: TrustLevel.ConsensusVerified,
       },
     );
@@ -110,16 +110,16 @@ describe('[Q-1] DKGQueryEngine minTrust uses writer-side trust metadata', () => 
     const store = new OxigraphStore();
     const engine = new DKGQueryEngine(store);
 
-    // RC11 / PR2: VM view sources only `_verified_memory/*` named
+    // RC11 / PR2: VM view sources only `_verifiable_memory/*` named
     // graphs now (root data graph is no longer aliased into VM). The
     // assertion this test was originally pinning — "trust is decided
     // by writer-side `dkg:trustLevel` metadata, NOT by which graph
     // the quad lives in" — is preserved by placing the tagged datum
-    // into a different verified-memory sub-graph than the untagged
+    // into a different verifiable-memory sub-graph than the untagged
     // quorum, so the test still proves graph-scope alone doesn't
     // grant trust.
-    const untaggedQuorumGraph = contextGraphVerifiedMemoryUri(CG, 'no-trust-metadata-quorum');
-    const taggedQuorumGraph = contextGraphVerifiedMemoryUri(CG, 'endorsed-trust-tagged');
+    const untaggedQuorumGraph = contextGraphVerifiableMemoryUri(CG, 'no-trust-metadata-quorum');
+    const taggedQuorumGraph = contextGraphVerifiableMemoryUri(CG, 'endorsed-trust-tagged');
 
     await store.insert([
       quad('urn:prod1', 'http://schema.org/name', '"Production1"', untaggedQuorumGraph),
@@ -132,7 +132,7 @@ describe('[Q-1] DKGQueryEngine minTrust uses writer-side trust metadata', () => 
       'SELECT ?name WHERE { ?s <http://schema.org/name> ?name }',
       {
         contextGraphId: CG,
-        view: 'verified-memory',
+        view: 'verifiable-memory',
         minTrust: TrustLevel.Endorsed,
       },
     );
@@ -150,7 +150,7 @@ describe('[Q-1] DKGQueryEngine minTrust uses writer-side trust metadata', () => 
     const store = new OxigraphStore();
     const engine = new DKGQueryEngine(store);
 
-    const subGraph = contextGraphVerifiedMemoryUri(CG, 'no-trust-metadata-quorum');
+    const subGraph = contextGraphVerifiableMemoryUri(CG, 'no-trust-metadata-quorum');
     await store.insert([
       quad('urn:prod1', 'http://schema.org/name', '"Production1"', subGraph),
     ]);
@@ -159,7 +159,7 @@ describe('[Q-1] DKGQueryEngine minTrust uses writer-side trust metadata', () => 
       'SELECT ?name WHERE { ?s <http://schema.org/name> ?name }',
       {
         contextGraphId: CG,
-        view: 'verified-memory',
+        view: 'verifiable-memory',
         minTrust: TrustLevel.ConsensusVerified,
       },
     );
@@ -177,7 +177,7 @@ describe('[Q-1] DKGQueryEngine minTrust uses writer-side trust metadata', () => 
   it('honors _minTrust on CONCRETE-SUBJECT queries (exact-entity lookup)', async () => {
     const store = new OxigraphStore();
     const engine = new DKGQueryEngine(store);
-    const consensusGraph = contextGraphVerifiedMemoryUri(CG, 'consensus-verified');
+    const consensusGraph = contextGraphVerifiableMemoryUri(CG, 'consensus-verified');
     await store.insert([
       quad('urn:e1', 'http://schema.org/name', '"Alice"', consensusGraph),
       quad('urn:e1', 'http://dkg.io/ontology/trustLevel', `"${TrustLevel.ConsensusVerified}"`, consensusGraph),
@@ -186,7 +186,7 @@ describe('[Q-1] DKGQueryEngine minTrust uses writer-side trust metadata', () => 
     // Exact-entity lookup MUST succeed when the entity meets the threshold.
     const ok = await engine.query(
       'SELECT ?n WHERE { <urn:e1> <http://schema.org/name> ?n }',
-      { contextGraphId: CG, view: 'verified-memory', _minTrust: TrustLevel.ConsensusVerified },
+      { contextGraphId: CG, view: 'verifiable-memory', _minTrust: TrustLevel.ConsensusVerified },
     );
     expect(ok.bindings.map((b) => b['n'])).toEqual(['"Alice"']);
   });
@@ -194,7 +194,7 @@ describe('[Q-1] DKGQueryEngine minTrust uses writer-side trust metadata', () => 
   it('fails CLOSED on a concrete-subject lookup whose entity is BELOW the trust threshold', async () => {
     const store = new OxigraphStore();
     const engine = new DKGQueryEngine(store);
-    const selfAttestedGraph = contextGraphVerifiedMemoryUri(CG, 'self-attested');
+    const selfAttestedGraph = contextGraphVerifiableMemoryUri(CG, 'self-attested');
     await store.insert([
       quad('urn:low', 'http://schema.org/name', '"Bob"', selfAttestedGraph),
       quad('urn:low', 'http://dkg.io/ontology/trustLevel', `"${TrustLevel.SelfAttested}"`, selfAttestedGraph),
@@ -202,7 +202,7 @@ describe('[Q-1] DKGQueryEngine minTrust uses writer-side trust metadata', () => 
 
     const result = await engine.query(
       'SELECT ?n WHERE { <urn:low> <http://schema.org/name> ?n }',
-      { contextGraphId: CG, view: 'verified-memory', _minTrust: TrustLevel.ConsensusVerified },
+      { contextGraphId: CG, view: 'verifiable-memory', _minTrust: TrustLevel.ConsensusVerified },
     );
     // Below threshold → empty (the trust filter eliminates the row).
     expect(result.bindings).toEqual([]);
@@ -211,14 +211,14 @@ describe('[Q-1] DKGQueryEngine minTrust uses writer-side trust metadata', () => 
   it('fails CLOSED on a concrete-subject lookup whose entity has NO trust metadata at all', async () => {
     const store = new OxigraphStore();
     const engine = new DKGQueryEngine(store);
-    const verifiedGraph = contextGraphVerifiedMemoryUri(CG, 'consensus-verified');
+    const verifiedGraph = contextGraphVerifiableMemoryUri(CG, 'consensus-verified');
     await store.insert([
       quad('urn:bare', 'http://schema.org/name', '"Ghost"', verifiedGraph),
       // deliberately NO trustLevel quad for <urn:bare>
     ]);
     const result = await engine.query(
       'SELECT ?n WHERE { <urn:bare> <http://schema.org/name> ?n }',
-      { contextGraphId: CG, view: 'verified-memory', _minTrust: TrustLevel.ConsensusVerified },
+      { contextGraphId: CG, view: 'verifiable-memory', _minTrust: TrustLevel.ConsensusVerified },
     );
     expect(result.bindings).toEqual([]);
   });
@@ -231,7 +231,7 @@ describe('[Q-1] DKGQueryEngine minTrust uses writer-side trust metadata', () => 
   it('honors _minTrust when the BGP contains a fragment IRI (rdf:type, xsd, rdfs)', async () => {
     const store = new OxigraphStore();
     const engine = new DKGQueryEngine(store);
-    const consensusGraph = contextGraphVerifiedMemoryUri(CG, 'consensus-verified');
+    const consensusGraph = contextGraphVerifiableMemoryUri(CG, 'consensus-verified');
     await store.insert([
       quad('urn:frag', 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type', 'http://schema.org/Person', consensusGraph),
       quad('urn:frag', 'http://dkg.io/ontology/trustLevel', `"${TrustLevel.ConsensusVerified}"`, consensusGraph),
@@ -239,7 +239,7 @@ describe('[Q-1] DKGQueryEngine minTrust uses writer-side trust metadata', () => 
 
     const result = await engine.query(
       'SELECT ?t WHERE { <urn:frag> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?t }',
-      { contextGraphId: CG, view: 'verified-memory', _minTrust: TrustLevel.ConsensusVerified },
+      { contextGraphId: CG, view: 'verifiable-memory', _minTrust: TrustLevel.ConsensusVerified },
     );
     expect(result.bindings.map((b) => b['t'])).toEqual(['http://schema.org/Person']);
   });
@@ -247,7 +247,7 @@ describe('[Q-1] DKGQueryEngine minTrust uses writer-side trust metadata', () => 
   it('still strips real line comments containing a fake terminator (`# … .`)', async () => {
     const store = new OxigraphStore();
     const engine = new DKGQueryEngine(store);
-    const consensus = contextGraphVerifiedMemoryUri(CG, 'consensus-verified');
+    const consensus = contextGraphVerifiableMemoryUri(CG, 'consensus-verified');
     await store.insert([
       quad('urn:cmt', 'http://schema.org/name', '"ok"', consensus),
       quad('urn:cmt', 'http://dkg.io/ontology/trustLevel', `"${TrustLevel.ConsensusVerified}"`, consensus),
@@ -258,7 +258,7 @@ describe('[Q-1] DKGQueryEngine minTrust uses writer-side trust metadata', () => 
       '}',
     ].join('\n');
     const result = await engine.query(sparql, {
-      contextGraphId: CG, view: 'verified-memory', _minTrust: TrustLevel.ConsensusVerified,
+      contextGraphId: CG, view: 'verifiable-memory', _minTrust: TrustLevel.ConsensusVerified,
     });
     expect(result.bindings.map((b) => b['n'])).toEqual(['"ok"']);
   });
@@ -273,14 +273,14 @@ describe('[Q-1] DKGQueryEngine minTrust uses writer-side trust metadata', () => 
   it('honors _minTrust when a triple-object literal contains a dot followed by whitespace ("hello. world")', async () => {
     const store = new OxigraphStore();
     const engine = new DKGQueryEngine(store);
-    const consensus = contextGraphVerifiedMemoryUri(CG, 'consensus-verified');
+    const consensus = contextGraphVerifiableMemoryUri(CG, 'consensus-verified');
     await store.insert([
       quad('urn:msg', 'http://schema.org/text', '"hello. world"', consensus),
       quad('urn:msg', 'http://dkg.io/ontology/trustLevel', `"${TrustLevel.ConsensusVerified}"`, consensus),
     ]);
     const result = await engine.query(
       'SELECT ?t WHERE { <urn:msg> <http://schema.org/text> ?t }',
-      { contextGraphId: CG, view: 'verified-memory', _minTrust: TrustLevel.ConsensusVerified },
+      { contextGraphId: CG, view: 'verifiable-memory', _minTrust: TrustLevel.ConsensusVerified },
     );
     expect(result.bindings.map((b) => b['t'])).toEqual(['"hello. world"']);
   });
@@ -292,7 +292,7 @@ describe('[Q-1] DKGQueryEngine minTrust uses writer-side trust metadata', () => 
     // [] instead of the join result.
     const store = new OxigraphStore();
     const engine = new DKGQueryEngine(store);
-    const consensus = contextGraphVerifiedMemoryUri(CG, 'consensus-verified');
+    const consensus = contextGraphVerifiableMemoryUri(CG, 'consensus-verified');
     await store.insert([
       quad('urn:m', 'http://schema.org/text', '"ack. ok"', consensus),
       quad('urn:m', 'http://dkg.io/ontology/trustLevel', `"${TrustLevel.ConsensusVerified}"`, consensus),
@@ -300,7 +300,7 @@ describe('[Q-1] DKGQueryEngine minTrust uses writer-side trust metadata', () => 
     ]);
     const result = await engine.query(
       'SELECT ?a WHERE { <urn:m> <http://schema.org/text> "ack. ok" . <urn:m> <http://schema.org/author> ?a }',
-      { contextGraphId: CG, view: 'verified-memory', _minTrust: TrustLevel.ConsensusVerified },
+      { contextGraphId: CG, view: 'verifiable-memory', _minTrust: TrustLevel.ConsensusVerified },
     );
     expect(result.bindings.map((b) => b['a'])).toEqual(['"alice"']);
   });
@@ -308,7 +308,7 @@ describe('[Q-1] DKGQueryEngine minTrust uses writer-side trust metadata', () => 
   it('honors _minTrust on MIXED concrete + variable subjects in a single BGP', async () => {
     const store = new OxigraphStore();
     const engine = new DKGQueryEngine(store);
-    const consensus = contextGraphVerifiedMemoryUri(CG, 'consensus-verified');
+    const consensus = contextGraphVerifiableMemoryUri(CG, 'consensus-verified');
     await store.insert([
       quad('urn:p', 'http://dkg.io/ontology/trustLevel', `"${TrustLevel.ConsensusVerified}"`, consensus),
       quad('urn:q', 'http://dkg.io/ontology/trustLevel', `"${TrustLevel.ConsensusVerified}"`, consensus),
@@ -317,7 +317,7 @@ describe('[Q-1] DKGQueryEngine minTrust uses writer-side trust metadata', () => 
     ]);
     const result = await engine.query(
       'SELECT ?name WHERE { <urn:p> <http://schema.org/relatedTo> ?t . ?t <http://schema.org/name> ?name }',
-      { contextGraphId: CG, view: 'verified-memory', _minTrust: TrustLevel.ConsensusVerified },
+      { contextGraphId: CG, view: 'verifiable-memory', _minTrust: TrustLevel.ConsensusVerified },
     );
     expect(result.bindings.map((b) => b['name'])).toEqual(['"q-name"']);
   });
@@ -333,7 +333,7 @@ describe('[Q-1] DKGQueryEngine minTrust uses writer-side trust metadata', () => 
   it('honors _minTrust when the subject is a prefixed name (PNAME_LN)', async () => {
     const store = new OxigraphStore();
     const engine = new DKGQueryEngine(store);
-    const consensus = contextGraphVerifiedMemoryUri(CG, 'consensus-verified');
+    const consensus = contextGraphVerifiableMemoryUri(CG, 'consensus-verified');
     await store.insert([
       quad('urn:item', 'http://dkg.io/ontology/trustLevel', `"${TrustLevel.ConsensusVerified}"`, consensus),
       quad('urn:item', 'http://example.org/name', '"Alice"', consensus),
@@ -345,7 +345,7 @@ describe('[Q-1] DKGQueryEngine minTrust uses writer-side trust metadata', () => 
     ].join('\n');
     const result = await engine.query(
       sparql,
-      { contextGraphId: CG, view: 'verified-memory', _minTrust: TrustLevel.ConsensusVerified },
+      { contextGraphId: CG, view: 'verifiable-memory', _minTrust: TrustLevel.ConsensusVerified },
     );
     expect(result.bindings.map((b) => b['n'])).toEqual(['"Alice"']);
   });
@@ -353,7 +353,7 @@ describe('[Q-1] DKGQueryEngine minTrust uses writer-side trust metadata', () => 
   it('filters out below-threshold results for prefixed-name subjects', async () => {
     const store = new OxigraphStore();
     const engine = new DKGQueryEngine(store);
-    const consensus = contextGraphVerifiedMemoryUri(CG, 'consensus-verified');
+    const consensus = contextGraphVerifiableMemoryUri(CG, 'consensus-verified');
     await store.insert([
       quad('urn:low', 'http://dkg.io/ontology/trustLevel', `"${TrustLevel.SelfAttested}"`, consensus),
       quad('urn:low', 'http://example.org/name', '"Bob"', consensus),
@@ -367,7 +367,7 @@ describe('[Q-1] DKGQueryEngine minTrust uses writer-side trust metadata', () => 
     ].join('\n');
     const result = await engine.query(
       sparql,
-      { contextGraphId: CG, view: 'verified-memory', _minTrust: TrustLevel.ConsensusVerified },
+      { contextGraphId: CG, view: 'verifiable-memory', _minTrust: TrustLevel.ConsensusVerified },
     );
     expect(result.bindings).toEqual([]);
   });
@@ -375,7 +375,7 @@ describe('[Q-1] DKGQueryEngine minTrust uses writer-side trust metadata', () => 
   it('honors _minTrust on mixed prefixed + variable subjects (multi-triple BGP)', async () => {
     const store = new OxigraphStore();
     const engine = new DKGQueryEngine(store);
-    const consensus = contextGraphVerifiedMemoryUri(CG, 'consensus-verified');
+    const consensus = contextGraphVerifiableMemoryUri(CG, 'consensus-verified');
     await store.insert([
       quad('urn:p', 'http://dkg.io/ontology/trustLevel', `"${TrustLevel.ConsensusVerified}"`, consensus),
       quad('urn:q', 'http://dkg.io/ontology/trustLevel', `"${TrustLevel.ConsensusVerified}"`, consensus),
@@ -388,7 +388,7 @@ describe('[Q-1] DKGQueryEngine minTrust uses writer-side trust metadata', () => 
     ].join('\n');
     const result = await engine.query(
       sparql,
-      { contextGraphId: CG, view: 'verified-memory', _minTrust: TrustLevel.ConsensusVerified },
+      { contextGraphId: CG, view: 'verifiable-memory', _minTrust: TrustLevel.ConsensusVerified },
     );
     expect(result.bindings.map((b) => b['name'])).toEqual(['"q-name"']);
   });
@@ -407,7 +407,7 @@ describe('[Q-1] DKGQueryEngine minTrust uses writer-side trust metadata', () => 
   it('honors _minTrust on a leading VALUES ?s { … } clause', async () => {
     const store = new OxigraphStore();
     const engine = new DKGQueryEngine(store);
-    const consensus = contextGraphVerifiedMemoryUri(CG, 'consensus-verified');
+    const consensus = contextGraphVerifiableMemoryUri(CG, 'consensus-verified');
     await store.insert([
       quad('urn:a', 'http://dkg.io/ontology/trustLevel', `"${TrustLevel.ConsensusVerified}"`, consensus),
       quad('urn:b', 'http://dkg.io/ontology/trustLevel', `"${TrustLevel.ConsensusVerified}"`, consensus),
@@ -423,7 +423,7 @@ describe('[Q-1] DKGQueryEngine minTrust uses writer-side trust metadata', () => 
     ].join('\n');
     const result = await engine.query(
       sparql,
-      { contextGraphId: CG, view: 'verified-memory', _minTrust: TrustLevel.ConsensusVerified },
+      { contextGraphId: CG, view: 'verifiable-memory', _minTrust: TrustLevel.ConsensusVerified },
     );
     expect(result.bindings.map((b) => b['l'])).toEqual(['"A"', '"B"']);
   });
@@ -431,7 +431,7 @@ describe('[Q-1] DKGQueryEngine minTrust uses writer-side trust metadata', () => 
   it('filters VALUES-bound subjects that fall below _minTrust', async () => {
     const store = new OxigraphStore();
     const engine = new DKGQueryEngine(store);
-    const consensus = contextGraphVerifiedMemoryUri(CG, 'consensus-verified');
+    const consensus = contextGraphVerifiableMemoryUri(CG, 'consensus-verified');
     await store.insert([
       quad('urn:hi', 'http://dkg.io/ontology/trustLevel', `"${TrustLevel.ConsensusVerified}"`, consensus),
       quad('urn:lo', 'http://dkg.io/ontology/trustLevel', `"${TrustLevel.SelfAttested}"`, consensus),
@@ -446,7 +446,7 @@ describe('[Q-1] DKGQueryEngine minTrust uses writer-side trust metadata', () => 
     ].join('\n');
     const result = await engine.query(
       sparql,
-      { contextGraphId: CG, view: 'verified-memory', _minTrust: TrustLevel.ConsensusVerified },
+      { contextGraphId: CG, view: 'verifiable-memory', _minTrust: TrustLevel.ConsensusVerified },
     );
     // `urn:lo` is SelfAttested — it must be filtered out, not silently
     // returned because the rewriter bailed on VALUES.
@@ -469,7 +469,7 @@ describe('[Q-1] DKGQueryEngine minTrust uses writer-side trust metadata', () => 
   it('honors _minTrust on a BGP whose top-level statements include a FILTER', async () => {
     const store = new OxigraphStore();
     const engine = new DKGQueryEngine(store);
-    const consensus = contextGraphVerifiedMemoryUri(CG, 'consensus-verified');
+    const consensus = contextGraphVerifiableMemoryUri(CG, 'consensus-verified');
     await store.insert([
       quad('urn:doc1', 'http://dkg.io/ontology/trustLevel', `"${TrustLevel.ConsensusVerified}"`, consensus),
       quad('urn:doc2', 'http://dkg.io/ontology/trustLevel', `"${TrustLevel.ConsensusVerified}"`, consensus),
@@ -484,7 +484,7 @@ describe('[Q-1] DKGQueryEngine minTrust uses writer-side trust metadata', () => 
     ].join('\n');
     const result = await engine.query(
       sparql,
-      { contextGraphId: CG, view: 'verified-memory', _minTrust: TrustLevel.ConsensusVerified },
+      { contextGraphId: CG, view: 'verifiable-memory', _minTrust: TrustLevel.ConsensusVerified },
     );
     // Only doc2 has score > 10. Pre-fix this would have returned [] —
     // not because the data didn't match but because the rewriter
@@ -495,7 +495,7 @@ describe('[Q-1] DKGQueryEngine minTrust uses writer-side trust metadata', () => 
   it('honors _minTrust on a BGP whose top-level statements include a BIND', async () => {
     const store = new OxigraphStore();
     const engine = new DKGQueryEngine(store);
-    const consensus = contextGraphVerifiedMemoryUri(CG, 'consensus-verified');
+    const consensus = contextGraphVerifiableMemoryUri(CG, 'consensus-verified');
     await store.insert([
       quad('urn:x', 'http://dkg.io/ontology/trustLevel', `"${TrustLevel.ConsensusVerified}"`, consensus),
       quad('urn:x', 'http://schema.org/title', '"Hello"', consensus),
@@ -508,7 +508,7 @@ describe('[Q-1] DKGQueryEngine minTrust uses writer-side trust metadata', () => 
     ].join('\n');
     const result = await engine.query(
       sparql,
-      { contextGraphId: CG, view: 'verified-memory', _minTrust: TrustLevel.ConsensusVerified },
+      { contextGraphId: CG, view: 'verifiable-memory', _minTrust: TrustLevel.ConsensusVerified },
     );
     expect(result.bindings.map((b) => b['upper'])).toEqual(['"HELLO"']);
   });
@@ -521,7 +521,7 @@ describe('[Q-1] DKGQueryEngine minTrust uses writer-side trust metadata', () => 
     // letting FILTER short-circuit the rewriter.
     const store = new OxigraphStore();
     const engine = new DKGQueryEngine(store);
-    const consensus = contextGraphVerifiedMemoryUri(CG, 'consensus-verified');
+    const consensus = contextGraphVerifiableMemoryUri(CG, 'consensus-verified');
     await store.insert([
       quad('urn:lo', 'http://dkg.io/ontology/trustLevel', `"${TrustLevel.SelfAttested}"`, consensus),
       quad('urn:lo', 'http://schema.org/score', '"99"^^<http://www.w3.org/2001/XMLSchema#integer>', consensus),
@@ -534,7 +534,7 @@ describe('[Q-1] DKGQueryEngine minTrust uses writer-side trust metadata', () => 
     ].join('\n');
     const result = await engine.query(
       sparql,
-      { contextGraphId: CG, view: 'verified-memory', _minTrust: TrustLevel.ConsensusVerified },
+      { contextGraphId: CG, view: 'verifiable-memory', _minTrust: TrustLevel.ConsensusVerified },
     );
     expect(result.bindings).toEqual([]);
   });
@@ -695,7 +695,7 @@ describe('[Q-3] resolveViewGraphs + DKGQueryEngine route working-memory', () => 
 // View routing constrains caller GRAPH variables to the selected View
 // ─────────────────────────────────────────────────────────────────────────────
 describe('DKGQueryEngine view routing constrains GRAPH variables', () => {
-  it('verified-memory with GRAPH ?g does not read SWM-only data', async () => {
+  it('verifiable-memory with GRAPH ?g does not read SWM-only data', async () => {
     const store = new OxigraphStore();
     const engine = new DKGQueryEngine(store);
 
@@ -705,7 +705,7 @@ describe('DKGQueryEngine view routing constrains GRAPH variables', () => {
 
     const result = await engine.query(
       'SELECT ?g ?name WHERE { GRAPH ?g { ?s <http://schema.org/name> ?name } }',
-      { contextGraphId: CG, view: 'verified-memory' },
+      { contextGraphId: CG, view: 'verifiable-memory' },
     );
 
     expect(result.bindings).toEqual([]);
@@ -716,7 +716,7 @@ describe('DKGQueryEngine view routing constrains GRAPH variables', () => {
     const engine = new DKGQueryEngine(store);
 
     await store.insert([
-      quad('urn:view:verified-only', 'http://schema.org/name', '"VerifiedOnly"', contextGraphVerifiedMemoryUri(CG, 'published')),
+      quad('urn:view:verified-only', 'http://schema.org/name', '"VerifiedOnly"', contextGraphVerifiableMemoryUri(CG, 'published')),
     ]);
 
     const result = await engine.query(
@@ -746,10 +746,10 @@ describe('DKGQueryEngine view routing constrains GRAPH variables', () => {
     expect(result.bindings.map((b) => b['name'])).toEqual(['"Mine"']);
   });
 
-  it('verified-memory minTrust with GRAPH ?g fails closed instead of returning trusted data', async () => {
+  it('verifiable-memory minTrust with GRAPH ?g fails closed instead of returning trusted data', async () => {
     const store = new OxigraphStore();
     const engine = new DKGQueryEngine(store);
-    const graph = contextGraphVerifiedMemoryUri(CG, 'trusted-graph-pattern');
+    const graph = contextGraphVerifiableMemoryUri(CG, 'trusted-graph-pattern');
 
     await store.insert([
       quad('urn:view:trusted', 'http://schema.org/name', '"Trusted"', graph),
@@ -758,7 +758,7 @@ describe('DKGQueryEngine view routing constrains GRAPH variables', () => {
 
     const result = await engine.query(
       'SELECT ?g ?name WHERE { GRAPH ?g { ?s <http://schema.org/name> ?name } }',
-      { contextGraphId: CG, view: 'verified-memory', minTrust: TrustLevel.Endorsed },
+      { contextGraphId: CG, view: 'verifiable-memory', minTrust: TrustLevel.Endorsed },
     );
 
     expect(result.bindings).toEqual([]);
@@ -842,14 +842,14 @@ describe('[Q-4] QueryHandler executeSparql hits the timeout path', () => {
 describe('[Q-5] Context Oracle proof params → correct graph targets', () => {
   const AGENT = '0xFeedFace0000000000000000000000000000BEEF';
 
-  it('verified-memory + verifiedGraph points at exactly one _verified_memory/<id> URI', () => {
-    const res = resolveViewGraphs('verified-memory', CG, { verifiedGraph: 'quorum-7' });
-    expect(res.graphs).toEqual([contextGraphVerifiedMemoryUri(CG, 'quorum-7')]);
+  it('verifiable-memory + verifiedGraph points at exactly one _verifiable_memory/<id> URI', () => {
+    const res = resolveViewGraphs('verifiable-memory', CG, { verifiedGraph: 'quorum-7' });
+    expect(res.graphs).toEqual([contextGraphVerifiableMemoryUri(CG, 'quorum-7')]);
     expect(res.graphPrefixes).toEqual([]);
   });
 
-  it('verified-memory without verifiedGraph unions root content graph + `_verified_memory/` prefix (RC11 / PR-A: Codex #671)', () => {
-    const res = resolveViewGraphs('verified-memory', CG, {});
+  it('verifiable-memory without verifiedGraph unions root content graph + `_verifiable_memory/` prefix (RC11 / PR-A: Codex #671)', () => {
+    const res = resolveViewGraphs('verifiable-memory', CG, {});
     // RC11 / PR-A (Codex review fix on #671, comment 3302058969):
     // the root content graph is re-included so a successful publish
     // shows up in VM immediately (memory-search flows depend on this).
@@ -857,7 +857,7 @@ describe('[Q-5] Context Oracle proof params → correct graph targets', () => {
     // now plugged at the publisher (root-graph insert deferred to the
     // chain-success branch in `DKGPublisher.publish`).
     expect(res.graphs).toEqual([`did:dkg:context-graph:${CG}`]);
-    expect(res.graphPrefixes).toEqual([`did:dkg:context-graph:${CG}/_verified_memory/`]);
+    expect(res.graphPrefixes).toEqual([`did:dkg:context-graph:${CG}/_verifiable_memory/`]);
   });
 
   it('shared-working-memory targets exactly the SWM graph (nothing else)', () => {
@@ -1012,7 +1012,7 @@ describe('[Q-1] minTrust handles SPARQL 1.1 shorthand WHERE forms', () => {
   it('rewrites a SELECT shorthand (no WHERE keyword) when minTrust > Endorsed', async () => {
     const store = new OxigraphStore();
     const engine = new DKGQueryEngine(store);
-    const consensusGraph = contextGraphVerifiedMemoryUri(CG, 'consensus-verified');
+    const consensusGraph = contextGraphVerifiableMemoryUri(CG, 'consensus-verified');
     await store.insert([
       quad('urn:e1', 'http://schema.org/name', '"Alice"', consensusGraph),
       quad('urn:e1', 'http://dkg.io/ontology/trustLevel', `"${TrustLevel.ConsensusVerified}"`, consensusGraph),
@@ -1020,7 +1020,7 @@ describe('[Q-1] minTrust handles SPARQL 1.1 shorthand WHERE forms', () => {
 
     const result = await engine.query(
       'SELECT ?n { <urn:e1> <http://schema.org/name> ?n }',
-      { contextGraphId: CG, view: 'verified-memory', minTrust: TrustLevel.ConsensusVerified },
+      { contextGraphId: CG, view: 'verifiable-memory', minTrust: TrustLevel.ConsensusVerified },
     );
     expect(result.bindings.map((b) => b['n'])).toEqual(['"Alice"']);
   });
@@ -1028,7 +1028,7 @@ describe('[Q-1] minTrust handles SPARQL 1.1 shorthand WHERE forms', () => {
   it('rewrites an ASK shorthand (no WHERE keyword) when minTrust > Endorsed', async () => {
     const store = new OxigraphStore();
     const engine = new DKGQueryEngine(store);
-    const consensusGraph = contextGraphVerifiedMemoryUri(CG, 'consensus-verified');
+    const consensusGraph = contextGraphVerifiableMemoryUri(CG, 'consensus-verified');
     await store.insert([
       quad('urn:e1', 'http://schema.org/name', '"Alice"', consensusGraph),
       quad('urn:e1', 'http://dkg.io/ontology/trustLevel', `"${TrustLevel.ConsensusVerified}"`, consensusGraph),
@@ -1036,7 +1036,7 @@ describe('[Q-1] minTrust handles SPARQL 1.1 shorthand WHERE forms', () => {
 
     const result = await engine.query(
       'ASK { <urn:e1> <http://schema.org/name> ?n }',
-      { contextGraphId: CG, view: 'verified-memory', minTrust: TrustLevel.ConsensusVerified },
+      { contextGraphId: CG, view: 'verifiable-memory', minTrust: TrustLevel.ConsensusVerified },
     );
     expect(result.bindings.length).toBeGreaterThan(0);
     const first = result.bindings[0];
@@ -1046,7 +1046,7 @@ describe('[Q-1] minTrust handles SPARQL 1.1 shorthand WHERE forms', () => {
   it('fails CLOSED on a SELECT shorthand whose entity is below the trust threshold', async () => {
     const store = new OxigraphStore();
     const engine = new DKGQueryEngine(store);
-    const selfAttestedGraph = contextGraphVerifiedMemoryUri(CG, 'self-attested');
+    const selfAttestedGraph = contextGraphVerifiableMemoryUri(CG, 'self-attested');
     await store.insert([
       quad('urn:low', 'http://schema.org/name', '"Bob"', selfAttestedGraph),
       quad('urn:low', 'http://dkg.io/ontology/trustLevel', `"${TrustLevel.SelfAttested}"`, selfAttestedGraph),
@@ -1054,7 +1054,7 @@ describe('[Q-1] minTrust handles SPARQL 1.1 shorthand WHERE forms', () => {
 
     const result = await engine.query(
       'SELECT ?n { <urn:low> <http://schema.org/name> ?n }',
-      { contextGraphId: CG, view: 'verified-memory', minTrust: TrustLevel.ConsensusVerified },
+      { contextGraphId: CG, view: 'verifiable-memory', minTrust: TrustLevel.ConsensusVerified },
     );
     // Below threshold → empty (proves the rewriter ran and the FILTER
     // is enforced; without the shorthand fix this would also be empty
@@ -1077,7 +1077,7 @@ describe('[Q-1] findWhereBraceStart distinguishes IRI from comparison operator',
   it('honors minTrust on a SELECT whose FILTER uses `<` as less-than (no IRI swallowing)', async () => {
     const store = new OxigraphStore();
     const engine = new DKGQueryEngine(store);
-    const consensusGraph = contextGraphVerifiedMemoryUri(CG, 'consensus-verified');
+    const consensusGraph = contextGraphVerifiableMemoryUri(CG, 'consensus-verified');
     await store.insert([
       quad('urn:e1', 'http://schema.org/age', '"21"^^<http://www.w3.org/2001/XMLSchema#integer>', consensusGraph),
       quad('urn:e1', 'http://dkg.io/ontology/trustLevel', `"${TrustLevel.ConsensusVerified}"`, consensusGraph),
@@ -1089,7 +1089,7 @@ describe('[Q-1] findWhereBraceStart distinguishes IRI from comparison operator',
     // succeeds and the binding is returned.
     const result = await engine.query(
       'SELECT ?n WHERE { <urn:e1> <http://schema.org/age> ?n . FILTER(?n < 100) }',
-      { contextGraphId: CG, view: 'verified-memory', minTrust: TrustLevel.ConsensusVerified },
+      { contextGraphId: CG, view: 'verifiable-memory', minTrust: TrustLevel.ConsensusVerified },
     );
     expect(result.bindings.length).toBe(1);
     // Object literal includes the typed-literal serialisation; just
@@ -1100,7 +1100,7 @@ describe('[Q-1] findWhereBraceStart distinguishes IRI from comparison operator',
   it('honors minTrust on a SHORTHAND SELECT whose FILTER uses `<=` as comparison', async () => {
     const store = new OxigraphStore();
     const engine = new DKGQueryEngine(store);
-    const consensusGraph = contextGraphVerifiedMemoryUri(CG, 'consensus-verified');
+    const consensusGraph = contextGraphVerifiableMemoryUri(CG, 'consensus-verified');
     await store.insert([
       quad('urn:e1', 'http://schema.org/age', '"21"^^<http://www.w3.org/2001/XMLSchema#integer>', consensusGraph),
       quad('urn:e1', 'http://dkg.io/ontology/trustLevel', `"${TrustLevel.ConsensusVerified}"`, consensusGraph),
@@ -1112,7 +1112,7 @@ describe('[Q-1] findWhereBraceStart distinguishes IRI from comparison operator',
     // disambiguator recognises `<=` and skips past the operator.
     const result = await engine.query(
       'SELECT ?n { <urn:e1> <http://schema.org/age> ?n . FILTER(?n <= 100) }',
-      { contextGraphId: CG, view: 'verified-memory', minTrust: TrustLevel.ConsensusVerified },
+      { contextGraphId: CG, view: 'verifiable-memory', minTrust: TrustLevel.ConsensusVerified },
     );
     expect(result.bindings.length).toBe(1);
   });
@@ -1131,7 +1131,7 @@ describe('[Q-1] findWhereBraceStart distinguishes IRI from comparison operator',
   it('honors minTrust on a SHORTHAND SELECT with COMPACT `?n<10&&?m>5` comparison (no whitespace)', async () => {
     const store = new OxigraphStore();
     const engine = new DKGQueryEngine(store);
-    const consensusGraph = contextGraphVerifiedMemoryUri(CG, 'consensus-verified');
+    const consensusGraph = contextGraphVerifiableMemoryUri(CG, 'consensus-verified');
     await store.insert([
       quad('urn:e1', 'http://schema.org/age', '"21"^^<http://www.w3.org/2001/XMLSchema#integer>', consensusGraph),
       quad('urn:e1', 'http://schema.org/score', '"50"^^<http://www.w3.org/2001/XMLSchema#integer>', consensusGraph),
@@ -1144,7 +1144,7 @@ describe('[Q-1] findWhereBraceStart distinguishes IRI from comparison operator',
     // -1 → graph wrap / minTrust filter silently no-op'd → empty.
     const result = await engine.query(
       'SELECT ?n ?m { <urn:e1> <http://schema.org/age> ?n . <urn:e1> <http://schema.org/score> ?m . FILTER(?n<100&&?m>5) }',
-      { contextGraphId: CG, view: 'verified-memory', minTrust: TrustLevel.ConsensusVerified },
+      { contextGraphId: CG, view: 'verifiable-memory', minTrust: TrustLevel.ConsensusVerified },
     );
     expect(result.bindings.length).toBe(1);
   });
@@ -1152,7 +1152,7 @@ describe('[Q-1] findWhereBraceStart distinguishes IRI from comparison operator',
   it('honors minTrust on `?n < (10 + 5)` — sub-expression with `<(` next-byte', async () => {
     const store = new OxigraphStore();
     const engine = new DKGQueryEngine(store);
-    const consensusGraph = contextGraphVerifiedMemoryUri(CG, 'consensus-verified');
+    const consensusGraph = contextGraphVerifiableMemoryUri(CG, 'consensus-verified');
     await store.insert([
       quad('urn:e1', 'http://schema.org/age', '"21"^^<http://www.w3.org/2001/XMLSchema#integer>', consensusGraph),
       quad('urn:e1', 'http://dkg.io/ontology/trustLevel', `"${TrustLevel.ConsensusVerified}"`, consensusGraph),
@@ -1164,7 +1164,7 @@ describe('[Q-1] findWhereBraceStart distinguishes IRI from comparison operator',
     // IRI byte and treats this as a comparison, advancing one byte.
     const result = await engine.query(
       'SELECT ?n { <urn:e1> <http://schema.org/age> ?n . FILTER(?n<(10+50)) }',
-      { contextGraphId: CG, view: 'verified-memory', minTrust: TrustLevel.ConsensusVerified },
+      { contextGraphId: CG, view: 'verifiable-memory', minTrust: TrustLevel.ConsensusVerified },
     );
     expect(result.bindings.length).toBe(1);
   });
@@ -1172,7 +1172,7 @@ describe('[Q-1] findWhereBraceStart distinguishes IRI from comparison operator',
   it('honors minTrust on `?n<-1` — negative numeric comparison (next-byte `-`)', async () => {
     const store = new OxigraphStore();
     const engine = new DKGQueryEngine(store);
-    const consensusGraph = contextGraphVerifiedMemoryUri(CG, 'consensus-verified');
+    const consensusGraph = contextGraphVerifiableMemoryUri(CG, 'consensus-verified');
     await store.insert([
       quad('urn:e1', 'http://schema.org/age', '"21"^^<http://www.w3.org/2001/XMLSchema#integer>', consensusGraph),
       quad('urn:e1', 'http://dkg.io/ontology/trustLevel', `"${TrustLevel.ConsensusVerified}"`, consensusGraph),
@@ -1186,13 +1186,13 @@ describe('[Q-1] findWhereBraceStart distinguishes IRI from comparison operator',
     // returns a row, proving the engine actually executed both.
     const noMatch = await engine.query(
       'SELECT ?n { <urn:e1> <http://schema.org/age> ?n . FILTER(?n<-1) }',
-      { contextGraphId: CG, view: 'verified-memory', minTrust: TrustLevel.ConsensusVerified },
+      { contextGraphId: CG, view: 'verifiable-memory', minTrust: TrustLevel.ConsensusVerified },
     );
     expect(noMatch.bindings).toEqual([]);
 
     const match = await engine.query(
       'SELECT ?n { <urn:e1> <http://schema.org/age> ?n . FILTER(?n>-1) }',
-      { contextGraphId: CG, view: 'verified-memory', minTrust: TrustLevel.ConsensusVerified },
+      { contextGraphId: CG, view: 'verifiable-memory', minTrust: TrustLevel.ConsensusVerified },
     );
     expect(match.bindings.length).toBe(1);
   });
@@ -1200,7 +1200,7 @@ describe('[Q-1] findWhereBraceStart distinguishes IRI from comparison operator',
   it('still recognises real IRIs that begin with `#`, `_`, `/`, or `.` (allow-list whitelisted starts)', async () => {
     const store = new OxigraphStore();
     const engine = new DKGQueryEngine(store);
-    const consensusGraph = contextGraphVerifiedMemoryUri(CG, 'consensus-verified');
+    const consensusGraph = contextGraphVerifiableMemoryUri(CG, 'consensus-verified');
     // Use a real (absolute) IRI for the subject — relative IRI
     // resolution depends on a base IRI which the engine does not
     // configure here. The point of this test is that the SCANNER
@@ -1219,7 +1219,7 @@ describe('[Q-1] findWhereBraceStart distinguishes IRI from comparison operator',
     // ALPHA-leading IRIs).
     const result = await engine.query(
       'SELECT ?n { <urn:e1> <http://schema.org/name> ?n }',
-      { contextGraphId: CG, view: 'verified-memory', minTrust: TrustLevel.ConsensusVerified },
+      { contextGraphId: CG, view: 'verifiable-memory', minTrust: TrustLevel.ConsensusVerified },
     );
     expect(result.bindings.map((b) => b['n'])).toEqual(['"Alice"']);
   });
@@ -1237,7 +1237,7 @@ describe('[Q-1] minTrust survives literals/comments containing braces or keyword
   it('honors minTrust when a triple-object literal contains `{` and `}` (JSON payload)', async () => {
     const store = new OxigraphStore();
     const engine = new DKGQueryEngine(store);
-    const consensusGraph = contextGraphVerifiedMemoryUri(CG, 'consensus-verified');
+    const consensusGraph = contextGraphVerifiableMemoryUri(CG, 'consensus-verified');
     await store.insert([
       quad('urn:e1', 'http://schema.org/text', '"{\\"key\\": 1}"', consensusGraph),
       quad('urn:e1', 'http://dkg.io/ontology/trustLevel', `"${TrustLevel.ConsensusVerified}"`, consensusGraph),
@@ -1247,7 +1247,7 @@ describe('[Q-1] minTrust survives literals/comments containing braces or keyword
     // and `injectMinTrustFilter` returned null → empty result.
     const result = await engine.query(
       'SELECT ?t WHERE { <urn:e1> <http://schema.org/text> ?t . FILTER(STR(?t) = "{\\"key\\": 1}") }',
-      { contextGraphId: CG, view: 'verified-memory', minTrust: TrustLevel.ConsensusVerified },
+      { contextGraphId: CG, view: 'verifiable-memory', minTrust: TrustLevel.ConsensusVerified },
     );
     expect(result.bindings.length).toBe(1);
   });
@@ -1255,7 +1255,7 @@ describe('[Q-1] minTrust survives literals/comments containing braces or keyword
   it('honors minTrust when a `# …` comment contains a sensitive keyword like OPTIONAL or SELECT', async () => {
     const store = new OxigraphStore();
     const engine = new DKGQueryEngine(store);
-    const consensusGraph = contextGraphVerifiedMemoryUri(CG, 'consensus-verified');
+    const consensusGraph = contextGraphVerifiableMemoryUri(CG, 'consensus-verified');
     await store.insert([
       quad('urn:e1', 'http://schema.org/name', '"Alice"', consensusGraph),
       quad('urn:e1', 'http://dkg.io/ontology/trustLevel', `"${TrustLevel.ConsensusVerified}"`, consensusGraph),
@@ -1273,7 +1273,7 @@ describe('[Q-1] minTrust survives literals/comments containing braces or keyword
     ].join('\n');
     const result = await engine.query(sparql, {
       contextGraphId: CG,
-      view: 'verified-memory',
+      view: 'verifiable-memory',
       minTrust: TrustLevel.ConsensusVerified,
     });
     expect(result.bindings.map((b) => b['n'])).toEqual(['"Alice"']);
@@ -1282,7 +1282,7 @@ describe('[Q-1] minTrust survives literals/comments containing braces or keyword
   it('still bails (returns empty) on a REAL OPTIONAL { … } block in code', async () => {
     const store = new OxigraphStore();
     const engine = new DKGQueryEngine(store);
-    const consensusGraph = contextGraphVerifiedMemoryUri(CG, 'consensus-verified');
+    const consensusGraph = contextGraphVerifiableMemoryUri(CG, 'consensus-verified');
     await store.insert([
       quad('urn:e1', 'http://schema.org/name', '"Alice"', consensusGraph),
       quad('urn:e1', 'http://dkg.io/ontology/trustLevel', `"${TrustLevel.ConsensusVerified}"`, consensusGraph),
@@ -1293,7 +1293,7 @@ describe('[Q-1] minTrust survives literals/comments containing braces or keyword
     // subject scanner still cannot reason about them.
     const result = await engine.query(
       'SELECT ?n WHERE { <urn:e1> <http://schema.org/name> ?n . OPTIONAL { ?n <http://schema.org/x> ?z } }',
-      { contextGraphId: CG, view: 'verified-memory', minTrust: TrustLevel.ConsensusVerified },
+      { contextGraphId: CG, view: 'verifiable-memory', minTrust: TrustLevel.ConsensusVerified },
     );
     expect(result.bindings).toEqual([]);
   });
@@ -1320,7 +1320,7 @@ describe('[Q-1] minTrust + view wrapping survive UNBALANCED literal braces (bot 
   it('honors minTrust when a string literal contains a SOLITARY unbalanced `{` (no closing `}`)', async () => {
     const store = new OxigraphStore();
     const engine = new DKGQueryEngine(store);
-    const consensusGraph = contextGraphVerifiedMemoryUri(CG, 'consensus-verified');
+    const consensusGraph = contextGraphVerifiableMemoryUri(CG, 'consensus-verified');
     await store.insert([
       quad('urn:e1', 'http://schema.org/text', '"open-brace {"', consensusGraph),
       quad('urn:e1', 'http://dkg.io/ontology/trustLevel', `"${TrustLevel.ConsensusVerified}"`, consensusGraph),
@@ -1333,7 +1333,7 @@ describe('[Q-1] minTrust + view wrapping survive UNBALANCED literal braces (bot 
     // either malformed SPARQL or fail-closed empty bindings.
     const result = await engine.query(
       'SELECT ?t WHERE { <urn:e1> <http://schema.org/text> ?t . FILTER(STR(?t) = "open-brace {") }',
-      { contextGraphId: CG, view: 'verified-memory', minTrust: TrustLevel.ConsensusVerified },
+      { contextGraphId: CG, view: 'verifiable-memory', minTrust: TrustLevel.ConsensusVerified },
     );
     expect(result.bindings.length).toBe(1);
   });
@@ -1341,7 +1341,7 @@ describe('[Q-1] minTrust + view wrapping survive UNBALANCED literal braces (bot 
   it('honors minTrust when a string literal contains a SOLITARY unbalanced `}` (no opening `{`)', async () => {
     const store = new OxigraphStore();
     const engine = new DKGQueryEngine(store);
-    const consensusGraph = contextGraphVerifiedMemoryUri(CG, 'consensus-verified');
+    const consensusGraph = contextGraphVerifiableMemoryUri(CG, 'consensus-verified');
     await store.insert([
       quad('urn:e1', 'http://schema.org/text', '"close-brace }"', consensusGraph),
       quad('urn:e1', 'http://dkg.io/ontology/trustLevel', `"${TrustLevel.ConsensusVerified}"`, consensusGraph),
@@ -1352,7 +1352,7 @@ describe('[Q-1] minTrust + view wrapping survive UNBALANCED literal braces (bot 
     // immediately after the FILTER opener, truncating the query.
     const result = await engine.query(
       'SELECT ?t WHERE { <urn:e1> <http://schema.org/text> ?t . FILTER(STR(?t) = "close-brace }") }',
-      { contextGraphId: CG, view: 'verified-memory', minTrust: TrustLevel.ConsensusVerified },
+      { contextGraphId: CG, view: 'verifiable-memory', minTrust: TrustLevel.ConsensusVerified },
     );
     expect(result.bindings.length).toBe(1);
   });
@@ -1360,7 +1360,7 @@ describe('[Q-1] minTrust + view wrapping survive UNBALANCED literal braces (bot 
   it('honors minTrust when a `# …` line comment contains an unbalanced `{` or `}`', async () => {
     const store = new OxigraphStore();
     const engine = new DKGQueryEngine(store);
-    const consensusGraph = contextGraphVerifiedMemoryUri(CG, 'consensus-verified');
+    const consensusGraph = contextGraphVerifiableMemoryUri(CG, 'consensus-verified');
     await store.insert([
       quad('urn:e1', 'http://schema.org/name', '"Alice"', consensusGraph),
       quad('urn:e1', 'http://dkg.io/ontology/trustLevel', `"${TrustLevel.ConsensusVerified}"`, consensusGraph),
@@ -1378,7 +1378,7 @@ describe('[Q-1] minTrust + view wrapping survive UNBALANCED literal braces (bot 
     ].join('\n');
     const result = await engine.query(sparql, {
       contextGraphId: CG,
-      view: 'verified-memory',
+      view: 'verifiable-memory',
       minTrust: TrustLevel.ConsensusVerified,
     });
     expect(result.bindings.map((b) => b['n'])).toEqual(['"Alice"']);
@@ -1387,7 +1387,7 @@ describe('[Q-1] minTrust + view wrapping survive UNBALANCED literal braces (bot 
   it('still bails (empty) on a real OPTIONAL after the literal-aware brace counter — no semantic regression', async () => {
     const store = new OxigraphStore();
     const engine = new DKGQueryEngine(store);
-    const consensusGraph = contextGraphVerifiedMemoryUri(CG, 'consensus-verified');
+    const consensusGraph = contextGraphVerifiableMemoryUri(CG, 'consensus-verified');
     await store.insert([
       quad('urn:e1', 'http://schema.org/name', '"Alice"', consensusGraph),
       quad('urn:e1', 'http://dkg.io/ontology/trustLevel', `"${TrustLevel.ConsensusVerified}"`, consensusGraph),
@@ -1399,7 +1399,7 @@ describe('[Q-1] minTrust + view wrapping survive UNBALANCED literal braces (bot 
     // closing brace, not whether the content is allowed.
     const result = await engine.query(
       'SELECT ?n WHERE { <urn:e1> <http://schema.org/name> ?n . OPTIONAL { ?n <http://schema.org/x> ?z } # has "}" comment\n }',
-      { contextGraphId: CG, view: 'verified-memory', minTrust: TrustLevel.ConsensusVerified },
+      { contextGraphId: CG, view: 'verifiable-memory', minTrust: TrustLevel.ConsensusVerified },
     );
     expect(result.bindings).toEqual([]);
   });
@@ -1419,7 +1419,7 @@ describe('[Q-1] minTrust + view wrapping survive UNBALANCED literal braces (bot 
   it('minTrust honors a triple-double-quoted (`"""…"""`) literal containing `{`/`}`/`#`/`.`', async () => {
     const store = new OxigraphStore();
     const engine = new DKGQueryEngine(store);
-    const consensusGraph = contextGraphVerifiedMemoryUri(CG, 'consensus-verified');
+    const consensusGraph = contextGraphVerifiableMemoryUri(CG, 'consensus-verified');
     // Insert a payload whose literal contains every structural char
     // that the pre-fix scanners misclassified.
     const payload = '{"k": 1} # not a comment . not a triple terminator';
@@ -1440,7 +1440,7 @@ describe('[Q-1] minTrust + view wrapping survive UNBALANCED literal braces (bot 
       `FILTER(STR(?t) = """${payload}""") }`;
     const result = await engine.query(sparql, {
       contextGraphId: CG,
-      view: 'verified-memory',
+      view: 'verifiable-memory',
       minTrust: TrustLevel.ConsensusVerified,
     });
     expect(result.bindings.length).toBe(1);
@@ -1449,7 +1449,7 @@ describe('[Q-1] minTrust + view wrapping survive UNBALANCED literal braces (bot 
   it('minTrust honors a triple-single-quoted (`\'\'\'…\'\'\'`) literal containing structural chars', async () => {
     const store = new OxigraphStore();
     const engine = new DKGQueryEngine(store);
-    const consensusGraph = contextGraphVerifiedMemoryUri(CG, 'consensus-verified');
+    const consensusGraph = contextGraphVerifiableMemoryUri(CG, 'consensus-verified');
     const payload = "}{ # not a comment .";
     await store.insert([
       quad('urn:e1', 'http://schema.org/text', `"${payload}"`, consensusGraph),
@@ -1461,7 +1461,7 @@ describe('[Q-1] minTrust + view wrapping survive UNBALANCED literal braces (bot 
       `FILTER(STR(?t) = '''${payload}''') }`;
     const result = await engine.query(sparql, {
       contextGraphId: CG,
-      view: 'verified-memory',
+      view: 'verifiable-memory',
       minTrust: TrustLevel.ConsensusVerified,
     });
     expect(result.bindings.length).toBe(1);
@@ -1473,7 +1473,7 @@ describe('[Q-1] minTrust + view wrapping survive UNBALANCED literal braces (bot 
     // triple-double-quoted literal must not be misread as the close.
     const store = new OxigraphStore();
     const engine = new DKGQueryEngine(store);
-    const consensusGraph = contextGraphVerifiedMemoryUri(CG, 'consensus-verified');
+    const consensusGraph = contextGraphVerifiableMemoryUri(CG, 'consensus-verified');
     // Payload contains a SINGLE `"` inside the triple-quoted literal.
     const payload = 'a "lone quote inside" b { } #';
     // Escape `\` first so we don't double-escape the slashes we introduce
@@ -1491,7 +1491,7 @@ describe('[Q-1] minTrust + view wrapping survive UNBALANCED literal braces (bot 
       `FILTER(STR(?t) = """${payload}""") }`;
     const result = await engine.query(sparql, {
       contextGraphId: CG,
-      view: 'verified-memory',
+      view: 'verifiable-memory',
       minTrust: TrustLevel.ConsensusVerified,
     });
     expect(result.bindings.length).toBe(1);
@@ -1529,12 +1529,12 @@ describe('[Q-1] minTrust + view wrapping survive UNBALANCED literal braces (bot 
   });
 
   it('wrapWithGraph (default-graph filter) survives unbalanced braces inside string literals', async () => {
-    // verified-memory route triggers wrapWithGraph to scope to the
+    // verifiable-memory route triggers wrapWithGraph to scope to the
     // sub-graph URI. If the brace counter mis-locates the WHERE end,
     // the wrapped query is malformed and the engine returns empty.
     const store = new OxigraphStore();
     const engine = new DKGQueryEngine(store);
-    const consensusGraph = contextGraphVerifiedMemoryUri(CG, 'consensus-verified');
+    const consensusGraph = contextGraphVerifiableMemoryUri(CG, 'consensus-verified');
     await store.insert([
       quad('urn:e1', 'http://schema.org/text', '"unbalanced } trailing"', consensusGraph),
       quad('urn:e1', 'http://dkg.io/ontology/trustLevel', `"${TrustLevel.ConsensusVerified}"`, consensusGraph),
@@ -1544,7 +1544,7 @@ describe('[Q-1] minTrust + view wrapping survive UNBALANCED literal braces (bot 
     // injectMinTrustFilter does not. Pin wrapWithGraph specifically.
     const result = await engine.query(
       'SELECT ?t WHERE { <urn:e1> <http://schema.org/text> ?t . FILTER(CONTAINS(STR(?t), "unbalanced }")) }',
-      { contextGraphId: CG, view: 'verified-memory' },
+      { contextGraphId: CG, view: 'verifiable-memory' },
     );
     expect(result.bindings.length).toBe(1);
   });
@@ -1568,7 +1568,7 @@ describe('[Q-1] minTrust + view wrapping survive UNBALANCED literal braces (bot 
   it('minTrust honors a SELECT whose PROJECTION ALIAS literal contains "WHERE {"', async () => {
     const store = new OxigraphStore();
     const engine = new DKGQueryEngine(store);
-    const consensusGraph = contextGraphVerifiedMemoryUri(CG, 'consensus-verified');
+    const consensusGraph = contextGraphVerifiableMemoryUri(CG, 'consensus-verified');
     await store.insert([
       quad('urn:e1', 'http://schema.org/name', '"Alice"', consensusGraph),
       quad('urn:e1', 'http://dkg.io/ontology/trustLevel', `"${TrustLevel.ConsensusVerified}"`, consensusGraph),
@@ -1582,7 +1582,7 @@ describe('[Q-1] minTrust + view wrapping survive UNBALANCED literal braces (bot 
     // the genuine top-level WHERE.
     const result = await engine.query(
       'SELECT (STR("WHERE {") AS ?fake) ?n WHERE { <urn:e1> <http://schema.org/name> ?n }',
-      { contextGraphId: CG, view: 'verified-memory', minTrust: TrustLevel.ConsensusVerified },
+      { contextGraphId: CG, view: 'verifiable-memory', minTrust: TrustLevel.ConsensusVerified },
     );
     expect(result.bindings.length).toBe(1);
     expect(result.bindings[0]['n']).toBe('"Alice"');
@@ -1592,7 +1592,7 @@ describe('[Q-1] minTrust + view wrapping survive UNBALANCED literal braces (bot 
   it('minTrust honors a query whose `# …` COMMENT precedes the real WHERE and contains "WHERE {"', async () => {
     const store = new OxigraphStore();
     const engine = new DKGQueryEngine(store);
-    const consensusGraph = contextGraphVerifiedMemoryUri(CG, 'consensus-verified');
+    const consensusGraph = contextGraphVerifiableMemoryUri(CG, 'consensus-verified');
     await store.insert([
       quad('urn:e1', 'http://schema.org/name', '"Alice"', consensusGraph),
       quad('urn:e1', 'http://dkg.io/ontology/trustLevel', `"${TrustLevel.ConsensusVerified}"`, consensusGraph),
@@ -1608,7 +1608,7 @@ describe('[Q-1] minTrust + view wrapping survive UNBALANCED literal braces (bot 
       'WHERE { <urn:e1> <http://schema.org/name> ?n }',
     ].join('\n');
     const result = await engine.query(sparql, {
-      contextGraphId: CG, view: 'verified-memory', minTrust: TrustLevel.ConsensusVerified,
+      contextGraphId: CG, view: 'verifiable-memory', minTrust: TrustLevel.ConsensusVerified,
     });
     expect(result.bindings.length).toBe(1);
     expect(result.bindings[0]['n']).toBe('"Alice"');
@@ -1617,7 +1617,7 @@ describe('[Q-1] minTrust + view wrapping survive UNBALANCED literal braces (bot 
   it('minTrust honors a query whose IRI fragment contains the bytes "WHERE"', async () => {
     const store = new OxigraphStore();
     const engine = new DKGQueryEngine(store);
-    const consensusGraph = contextGraphVerifiedMemoryUri(CG, 'consensus-verified');
+    const consensusGraph = contextGraphVerifiableMemoryUri(CG, 'consensus-verified');
     // Insert a quad whose predicate IRI contains the literal bytes
     // "WHERE" (and an embedded `{`/`}` shape via fragment encoding).
     // The token-aware locator must NOT mistake the IRI's `WHERE`
@@ -1629,7 +1629,7 @@ describe('[Q-1] minTrust + view wrapping survive UNBALANCED literal braces (bot 
 
     const result = await engine.query(
       'SELECT ?n WHERE { <urn:e1> <http://schema.org/WHEREabouts> ?n }',
-      { contextGraphId: CG, view: 'verified-memory', minTrust: TrustLevel.ConsensusVerified },
+      { contextGraphId: CG, view: 'verifiable-memory', minTrust: TrustLevel.ConsensusVerified },
     );
     expect(result.bindings.length).toBe(1);
     expect(result.bindings[0]['n']).toBe('"Sofia"');
@@ -1638,7 +1638,7 @@ describe('[Q-1] minTrust + view wrapping survive UNBALANCED literal braces (bot 
   it('triple-quoted (`"""…"""`) literal containing "WHERE {" does NOT confuse the locator', async () => {
     const store = new OxigraphStore();
     const engine = new DKGQueryEngine(store);
-    const consensusGraph = contextGraphVerifiedMemoryUri(CG, 'consensus-verified');
+    const consensusGraph = contextGraphVerifiableMemoryUri(CG, 'consensus-verified');
     const decoy = 'decoy SELECT ?x WHERE { ... } more';
     await store.insert([
       quad('urn:e1', 'http://schema.org/text', `"${decoy}"`, consensusGraph),
@@ -1653,7 +1653,7 @@ describe('[Q-1] minTrust + view wrapping survive UNBALANCED literal braces (bot 
       'SELECT ?t WHERE { <urn:e1> <http://schema.org/text> ?t . ' +
       `FILTER(STR(?t) = """${decoy}""") }`;
     const result = await engine.query(sparql, {
-      contextGraphId: CG, view: 'verified-memory', minTrust: TrustLevel.ConsensusVerified,
+      contextGraphId: CG, view: 'verifiable-memory', minTrust: TrustLevel.ConsensusVerified,
     });
     expect(result.bindings.length).toBe(1);
   });
@@ -1661,7 +1661,7 @@ describe('[Q-1] minTrust + view wrapping survive UNBALANCED literal braces (bot 
   it('word-boundary check — `WHEREVER` / `aWHERE` identifiers MUST NOT match (no false-positive keyword promotion)', async () => {
     const store = new OxigraphStore();
     const engine = new DKGQueryEngine(store);
-    const consensusGraph = contextGraphVerifiedMemoryUri(CG, 'consensus-verified');
+    const consensusGraph = contextGraphVerifiableMemoryUri(CG, 'consensus-verified');
     await store.insert([
       quad('urn:e1', 'http://schema.org/name', '"Alice"', consensusGraph),
       quad('urn:e1', 'http://dkg.io/ontology/trustLevel', `"${TrustLevel.ConsensusVerified}"`, consensusGraph),
@@ -1680,7 +1680,7 @@ describe('[Q-1] minTrust + view wrapping survive UNBALANCED literal braces (bot 
     const sparql =
       'SELECT (?n AS ?WHEREVER) WHERE { <urn:e1> <http://schema.org/name> ?n }';
     const result = await engine.query(sparql, {
-      contextGraphId: CG, view: 'verified-memory', minTrust: TrustLevel.ConsensusVerified,
+      contextGraphId: CG, view: 'verifiable-memory', minTrust: TrustLevel.ConsensusVerified,
     });
     expect(result.bindings.length).toBe(1);
     // The aliased projection variable is `WHEREVER` — pin it so a

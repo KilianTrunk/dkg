@@ -394,7 +394,7 @@ for label in "Node A" "Node B"; do
   if [ "$label" = "Node A" ]; then url="$N_A_API"; token="$N_A_TOKEN"; else url="$N_B_API"; token="$N_B_TOKEN"; fi
   vm_ok=false
   for i in $(seq 1 "$VM_SYNC_TIMEOUT"); do
-    vm_ct=$(count_integer_query "$url" "$token" "$CG_ID" "verified-memory" \
+    vm_ct=$(count_integer_query "$url" "$token" "$CG_ID" "verifiable-memory" \
       "SELECT (COUNT(*) AS ?cnt) WHERE { ?s ?p ?o }")
     if [ "$vm_ct" -ge 1 ] 2>/dev/null; then
       vm_ok=true

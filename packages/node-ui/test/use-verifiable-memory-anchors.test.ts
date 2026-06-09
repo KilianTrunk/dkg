@@ -3,7 +3,7 @@
 import React, { act } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
-import { useVerifiedMemoryAnchors } from '../src/ui/hooks/useVerifiedMemoryAnchors.js';
+import { useVerifiableMemoryAnchors } from '../src/ui/hooks/useVerifiableMemoryAnchors.js';
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -12,7 +12,7 @@ import { useVerifiedMemoryAnchors } from '../src/ui/hooks/useVerifiedMemoryAncho
 // <cg>/<sg>/_shared_memory_meta partition, so the fetch MUST NOT also send
 // contextGraphId — that makes the daemon constrain GRAPH ?g to CG-direct
 // graphs only, dropping per-sub-graph anchors/attribution.
-describe('useVerifiedMemoryAnchors — POST body scoping', () => {
+describe('useVerifiableMemoryAnchors — POST body scoping', () => {
   let root: Root;
   let container: HTMLDivElement;
   let originalFetch: typeof globalThis.fetch | undefined;
@@ -37,7 +37,7 @@ describe('useVerifiedMemoryAnchors — POST body scoping', () => {
 
   it('omits contextGraphId from the /api/query POST body so all sub-graph partitions are reached', async () => {
     function Probe({ id }: { id: string }) {
-      useVerifiedMemoryAnchors(id);
+      useVerifiableMemoryAnchors(id);
       return null;
     }
     await act(async () => {

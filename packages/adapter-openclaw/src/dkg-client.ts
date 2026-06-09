@@ -406,7 +406,7 @@ export class DkgDaemonClient {
 
   /**
    * Run a SPARQL query against the daemon. Forwards the full V10 field set
-   * the `/api/query` route accepts — `view` (`'working-memory' | 'shared-working-memory' | 'verified-memory'`),
+   * the `/api/query` route accepts — `view` (`'working-memory' | 'shared-working-memory' | 'verifiable-memory'`),
    * `agentAddress` (required for WM reads), `assertionName` (scopes WM reads
    * to a single per-agent assertion), `subGraphName`, `verifiedGraph`,
    * `graphSuffix`, `includeSharedMemory`.
@@ -417,14 +417,14 @@ export class DkgDaemonClient {
       contextGraphId?: string;
       graphSuffix?: string;
       includeSharedMemory?: boolean;
-      view?: 'working-memory' | 'shared-working-memory' | 'verified-memory';
+      view?: 'working-memory' | 'shared-working-memory' | 'verifiable-memory';
       agentAddress?: string;
       assertionName?: string;
       subGraphName?: string;
       verifiedGraph?: string;
       /**
        * P-13: minimum trust level. Only meaningful for
-       * `view: "verified-memory"`; ignored (silently) on WM/SWM views.
+       * `view: "verifiable-memory"`; ignored (silently) on WM/SWM views.
        *
        * The daemon implements only `SelfAttested` / `Endorsed` today —
        * higher tiers (Q-1 follow-up) are rejected with HTTP 400, so the
@@ -1047,7 +1047,7 @@ export class DkgDaemonClient {
 
   /**
    * Final canonical-flow step: publish a single root from a context graph's
-   * Shared Working Memory to Verified Memory (on-chain). The daemon route
+   * Shared Working Memory to Verifiable Memory (on-chain). The daemon route
    * accepts `selection` as either the literal `"all"` or an array of root entity
    * URIs, but V10 synchronous publish only proceeds when that selection resolves
    * to exactly one publishable root.

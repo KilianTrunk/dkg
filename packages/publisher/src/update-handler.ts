@@ -165,12 +165,12 @@ export class UpdateHandler {
       // the KC root, so we just forward them.
       await this.graphManager.ensureContextGraph(contextGraphId);
       // Uniform layout: a KA update replaces the published data in the SAME per-KA
-      // verified-memory graph the original publish wrote (…/_verified_memory/{author}/{number}),
+      // verifiable-memory graph the original publish wrote (…/_verifiable_memory/{author}/{number}),
       // keyed by the on-chain batchId (= the packed kaId). restate/delete/write all target it.
       const vmBatch = BigInt(batchId);
       const dataGraph = contextGraphLayerUri(
         contextGraphId,
-        MemoryLayer.VerifiedMemory,
+        MemoryLayer.VerifiableMemory,
         '0x' + (vmBatch >> 96n).toString(16).padStart(40, '0'),
         vmBatch & ((1n << 96n) - 1n),
       );

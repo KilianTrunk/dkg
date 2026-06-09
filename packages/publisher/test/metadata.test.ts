@@ -865,7 +865,7 @@ describe('generateAssertionPublishedMetadata', () => {
     const { insert, delete: del } = generateAssertionPublishedMetadata(meta);
     expect(insert.find(q => q.subject === LIFECYCLE_URI && q.predicate === `${DKG}state`)!.object).toBe('"published"');
     expect(del.find(q => q.predicate === `${DKG}state`)!.object).toBe('"promoted"');
-    expect(insert.find(q => q.subject === LIFECYCLE_URI && q.predicate === `${DKG}memoryLayer`)!.object).toBe(`"${MemoryLayer.VerifiedMemory}"`);
+    expect(insert.find(q => q.subject === LIFECYCLE_URI && q.predicate === `${DKG}memoryLayer`)!.object).toBe(`"${MemoryLayer.VerifiableMemory}"`);
     expect(del.find(q => q.predicate === `${DKG}memoryLayer`)!.object).toBe(`"${MemoryLayer.SharedWorkingMemory}"`);
   });
 

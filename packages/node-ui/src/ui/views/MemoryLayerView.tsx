@@ -123,7 +123,7 @@ export function MemoryLayerView({ layer, contextGraphId, externalQuery, external
       //  2. `?g` must be restricted to WM-marked partitions. The view runs with
       //     `includeContextGraphPartitions: true` (see below), which widens the
       //     allow-list to every same-CG partition — including `/_shared_memory`,
-      //     `/_verified_memory/*`, and metadata graphs. A bare prefix FILTER
+      //     `/_verifiable_memory/*`, and metadata graphs. A bare prefix FILTER
       //     would let SWM/VM triples bleed into the WM tab, so we gate `?g` on
       //     the `<cg>/_meta` `dkg:memoryLayer "WM"` lifecycle marker (the same
       //     authority `listWmAssertions` uses) and read only those graphs.
@@ -135,7 +135,7 @@ export function MemoryLayerView({ layer, contextGraphId, externalQuery, external
       return `SELECT ?s ?p ?o WHERE { GRAPH <${metaGraph}> { ?g <http://dkg.io/ontology/memoryLayer> "WM" } GRAPH ?g { ?s ?p ?o } FILTER(!CONTAINS(STR(?g), "/meta/assertion/")) } LIMIT 1000`;
     }
     if (layer === 'vm') {
-      return buildVerifiedMemorySearchQuery({
+      return buildVerifiableMemorySearchQuery({
         query: appliedSearch,
         field: appliedField,
         limit: appliedLimit,
@@ -148,7 +148,7 @@ export function MemoryLayerView({ layer, contextGraphId, externalQuery, external
 
   const graphSuffix = layer === 'swm' ? '_shared_memory' as const : undefined;
   const includeShared = layer === 'swm';
-  const queryView = layer === 'vm' ? 'verified-memory' as const : undefined;
+  const queryView = layer === 'vm' ? 'verifiable-memory' as const : undefined;
   // WM content lives in the CG's assertion partitions, which sit outside the
   // daemon's static `GRAPH ?g` allow-list. Without this opt-in the WM view's
   // `GRAPH ?g { ?s ?p ?o }` enumeration resolves against only
@@ -748,13 +748,13 @@ function PublishPanel({ contextGraphId, onPublished }: { contextGraphId: string;
           <div className={`v10-publish-result-card ${confirmed ? 'success' : 'error'}`}>
             <div className="v10-publish-result-title">
               {confirmed
-                ? 'Published to Verified Memory'
-                : 'NOT published to Verified Memory'}
+                ? 'Published to Verifiable Memory'
+                : 'NOT published to Verifiable Memory'}
             </div>
             {!confirmed && (
               <div className="v10-publish-result-details" style={{ marginBottom: 6 }}>
                 The data was prepared and stored locally as <code>{publishResult.status}</code>,
-                but the on-chain transaction did not land. Verified Memory requires a confirmed
+                but the on-chain transaction did not land. Verifiable Memory requires a confirmed
                 <code> KCCreated </code> event. Check the node logs for the cause (typically a
                 missing publisher wallet, an unfunded signer, or a chain adapter that isn&apos;t V10-ready).
               </div>
@@ -807,7 +807,7 @@ function shorten(uri?: string): string {
   return cut >= 0 ? uri.slice(cut + 1) : uri;
 }
 
-function buildVerifiedMemorySearchQuery(opts: {
+function buildVerifiableMemorySearchQuery(opts: {
   query: string;
   field: 'any' | 'subject' | 'predicate' | 'object';
   limit: number;

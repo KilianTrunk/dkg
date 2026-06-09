@@ -168,7 +168,7 @@ export function registerReadTools(
   // The two-axis schema migration (audit §7 item 5):
   //   - Old single `layer: 'wm' | 'swm' | 'union' | 'vm'` enum
   //   - New separate axes:
-  //       view: 'working-memory' | 'shared-working-memory' | 'verified-memory'
+  //       view: 'working-memory' | 'shared-working-memory' | 'verifiable-memory'
   //       includeSharedMemory?: boolean   (orthogonal — combines with view)
   //   - The legacy `'union'` mode (`view: 'working-memory'` ∪ SWM)
   //     was an enum-conflation of two orthogonal axes; callers
@@ -187,7 +187,7 @@ export function registerReadTools(
         'DKG context graph. Known prefixes are auto-prepended so you can ' +
         'just write `SELECT ?d WHERE { ?d a decisions:Decision }`. Scope ' +
         'with `view` — "working-memory" (default, private), ' +
-        '"shared-working-memory" (team), or "verified-memory" (on-chain). ' +
+        '"shared-working-memory" (team), or "verifiable-memory" (on-chain). ' +
         '`contextGraphId` and `view` are authoritative: local `GRAPH ?g` ' +
         'patterns are constrained to that resolved graph set. ' +
         'Set `includeSharedMemory: true` alongside `view: "working-memory"` ' +
@@ -200,9 +200,9 @@ export function registerReadTools(
           .describe(`${EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION} Defaults to .dkg/config.yaml.`),
         subGraphName: z.string().optional().describe('Limit the query to a single sub-graph'),
         view: z
-          .enum(['working-memory', 'shared-working-memory', 'verified-memory'])
+          .enum(['working-memory', 'shared-working-memory', 'verifiable-memory'])
           .optional()
-          .describe('Memory tier: working-memory (default, private), shared-working-memory (team), verified-memory (on-chain).'),
+          .describe('Memory tier: working-memory (default, private), shared-working-memory (team), verifiable-memory (on-chain).'),
         includeSharedMemory: z
           .boolean()
           .optional()
@@ -249,13 +249,13 @@ export function registerReadTools(
           .optional()
           .describe(`${EXISTING_CONTEXT_GRAPH_ID_DESCRIPTION} Defaults to .dkg/config.yaml.`),
         view: z
-          .enum(['working-memory', 'shared-working-memory', 'verified-memory'])
+          .enum(['working-memory', 'shared-working-memory', 'verifiable-memory'])
           .optional()
           .describe(
             'Memory tier (explicit selection is STRICT — pick one tier only): ' +
               '"working-memory" (private WM only — pair with includeSharedMemory: true to add SWM), ' +
               '"shared-working-memory" (team SWM only), ' +
-              '"verified-memory" (on-chain VM only). ' +
+              '"verifiable-memory" (on-chain VM only). ' +
               'Omit `view` to get the WM ∪ SWM default (the V9-era `layer: "union"` shape).',
           ),
         includeSharedMemory: z
@@ -270,13 +270,13 @@ export function registerReadTools(
       // Default behaviour mirrors the historical `layer: 'union'` default:
       // when neither `view` nor `includeSharedMemory` is set, return WM∪SWM
       // (the shape callers learned via the V9 surface). Explicit
-      // `view: 'verified-memory'` routes to VM; explicit
+      // `view: 'verifiable-memory'` routes to VM; explicit
       // `view: 'shared-working-memory'` routes to SWM only;
       // `view: 'working-memory'` (without `includeSharedMemory: true`)
       // returns WM only.
       const scope =
-        view === 'verified-memory'
-          ? { view: 'verified-memory' as const }
+        view === 'verifiable-memory'
+          ? { view: 'verifiable-memory' as const }
           : view === 'shared-working-memory'
           ? { graphSuffix: '_shared_memory' as const }
           : view === 'working-memory'
@@ -306,7 +306,7 @@ SELECT DISTINCT ?s ?p WHERE { ?s ?p <${uri}> } LIMIT 50`,
         const inc = incoming.bindings ?? [];
         if (!out.length && !inc.length) {
           const scopeLabel =
-            view === 'verified-memory' ? 'verified-memory' :
+            view === 'verifiable-memory' ? 'verifiable-memory' :
             view === 'shared-working-memory' ? 'shared-working-memory' :
             view === 'working-memory'
               ? (includeSharedMemory === true ? 'working-memory∪swm' : 'working-memory')
@@ -356,13 +356,13 @@ SELECT DISTINCT ?s ?p WHERE { ?s ?p <${uri}> } LIMIT 50`,
         agentUri: z.string().optional().describe('Only items attributed to this agent'),
         sinceIso: z.string().optional().describe('Earliest timestamp, ISO-8601'),
         view: z
-          .enum(['working-memory', 'shared-working-memory', 'verified-memory'])
+          .enum(['working-memory', 'shared-working-memory', 'verifiable-memory'])
           .optional()
           .describe(
             'Memory tier (explicit selection is STRICT — pick one tier only): ' +
               '"working-memory" (private WM only — pair with includeSharedMemory: true to add SWM), ' +
               '"shared-working-memory" (team SWM only), ' +
-              '"verified-memory" (on-chain VM only). ' +
+              '"verifiable-memory" (on-chain VM only). ' +
               'Omit `view` to get the WM ∪ SWM default (the V9-era `layer: "union"` shape).',
           ),
         includeSharedMemory: z
@@ -379,8 +379,8 @@ SELECT DISTINCT ?s ?p WHERE { ?s ?p <${uri}> } LIMIT 50`,
       // `view` nor `includeSharedMemory` is supplied. Explicit values
       // route to the requested tier (see dkg_get_entity for the parallel).
       const scope =
-        view === 'verified-memory'
-          ? { view: 'verified-memory' as const }
+        view === 'verifiable-memory'
+          ? { view: 'verifiable-memory' as const }
           : view === 'shared-working-memory'
           ? { graphSuffix: '_shared_memory' as const }
           : view === 'working-memory'

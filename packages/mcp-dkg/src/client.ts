@@ -368,15 +368,15 @@ export class DkgClient {
    *   view=undefined, graphSuffix=undefined  — WM (default, private)
    *   graphSuffix="_shared_memory"           — SWM
    *   graphSuffix="_shared_memory_meta"      — SWM metadata (UAL, owner, publisher)
-   *   view="verified-memory"                 — VM (on-chain verified)
+   *   view="verifiable-memory"                 — VM (on-chain verified)
    *   includeSharedMemory=true               — WM ∪ SWM (UI default)
    *
    * `verifiedGraph` is a STRING naming a specific verified graph inside
-   * VM; it narrows a `view: "verified-memory"` query to one graph. It is
+   * VM; it narrows a `view: "verifiable-memory"` query to one graph. It is
    * NOT a boolean toggle — passing `verifiedGraph: true` silently failed
    * to route to VM because the query engine expects a graph name, not a
    * flag. Clients that want "give me VM" should pass `view:
-   * "verified-memory"` (and optionally `verifiedGraph: "<graphName>"`).
+   * "verifiable-memory"` (and optionally `verifiedGraph: "<graphName>"`).
    */
   async query(args: {
     sparql: string;
@@ -384,7 +384,7 @@ export class DkgClient {
     subGraphName?: string;
     graphSuffix?: '_shared_memory' | '_shared_memory_meta';
     includeSharedMemory?: boolean;
-    view?: 'working-memory' | 'shared-working-memory' | 'verified-memory';
+    view?: 'working-memory' | 'shared-working-memory' | 'verifiable-memory';
     verifiedGraph?: string;
     assertionName?: string;
     /**
@@ -397,7 +397,7 @@ export class DkgClient {
     agentAddress?: string;
     /**
      * P-13: minimum trust level to admit into results. Only meaningful for
-     * `view: "verified-memory"`; silently ignored on WM/SWM views.
+     * `view: "verifiable-memory"`; silently ignored on WM/SWM views.
      *
      * The daemon currently implements only `SelfAttested` (0) and
      * `Endorsed` (1) — the higher tiers are tracked by Q-1 (per-graph
@@ -1014,7 +1014,7 @@ export class DkgClient {
 
   /**
    * Final canonical-flow step: publish a single root from a context graph's
-   * Shared Working Memory to Verified Memory (on-chain). The daemon route
+   * Shared Working Memory to Verifiable Memory (on-chain). The daemon route
    * accepts `selection` as either the literal `"all"` or an array of root
    * entity URIs, but V10 synchronous publish only proceeds when that
    * selection resolves to exactly one publishable root.
@@ -1046,7 +1046,7 @@ export class DkgClient {
    * auto-generated name, write the supplied quads, finalize (which
    * computes the merkle root and signs the EIP-712 AuthorAttestation
    * stored in `_meta`), promote into SWM, then publish to the
-   * verified-memory chain. The publisher forwards the seal verbatim
+   * verifiable-memory chain. The publisher forwards the seal verbatim
    * and never re-signs.
    *
    * For step-wise control (long-running stage, late finalize, etc.)

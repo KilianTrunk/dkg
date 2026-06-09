@@ -11,7 +11,7 @@ export interface MemoryToolContext {
       contextGraphId?: string;
       graphSuffix?: '_shared_memory';
       includeSharedMemory?: boolean;
-      view?: 'working-memory' | 'shared-working-memory' | 'verified-memory';
+      view?: 'working-memory' | 'shared-working-memory' | 'verifiable-memory';
       agentAddress?: string;
       assertionName?: string;
       subGraphName?: string;

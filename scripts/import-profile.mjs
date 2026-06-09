@@ -242,7 +242,7 @@ const views = [
   {
     slug: 'verified-provenance',
     name: 'Verified Provenance',
-    description: 'Verified-memory entities with their agent signers and on-chain anchors.',
+    description: 'Verifiable-memory entities with their agent signers and on-chain anchors.',
     includeTypes: [], // layer-based filter
     emphasizePredicates: [],
     nodeSize: 'degree',

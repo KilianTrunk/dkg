@@ -45,7 +45,7 @@ describe('dkg_memory_search — multi-layer fan-out + trust-tier dedup', () => {
   });
 
   it('fan-out covers 6 layers when projectId is supplied', async () => {
-    client.memoryFixtures.set('proj-x::verified-memory', [
+    client.memoryFixtures.set('proj-x::verifiable-memory', [
       { uri: { value: 'urn:doc:vm' }, text: { value: 'highly verified content about tree-sitter parsers' } },
     ]);
     const result = await server.call('dkg_memory_search', { query: 'tree-sitter parsers', projectId: 'proj-x' });
@@ -63,7 +63,7 @@ describe('dkg_memory_search — multi-layer fan-out + trust-tier dedup', () => {
     client.memoryFixtures.set('agent-context::shared-working-memory', [
       { uri: { value: 'urn:dec:1' }, text: { value: text } },
     ]);
-    client.memoryFixtures.set('agent-context::verified-memory', [
+    client.memoryFixtures.set('agent-context::verifiable-memory', [
       { uri: { value: 'urn:dec:1' }, text: { value: text } },
     ]);
 

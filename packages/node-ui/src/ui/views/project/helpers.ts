@@ -10,7 +10,7 @@ import {
 import {
   VIZ_ANCHOR_TYPE, VIZ_AGENT_TYPE,
   VIZ_PRED_ANCHORED_IN, VIZ_PRED_SIGNED_BY, VIZ_PRED_CONSENSUS,
-} from '../../hooks/useVerifiedMemoryAnchors.js';
+} from '../../hooks/useVerifiableMemoryAnchors.js';
 import { memoryGraphLabels } from '../../lib/memoryLabels.js';
 
 export type LayerView = 'overview' | 'graph-overview' | 'query' | 'wm' | 'swm' | 'vm';

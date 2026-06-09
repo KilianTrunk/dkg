@@ -21,7 +21,7 @@
  *   Phase D (fill-the-gap, headline) — a core taken OFFLINE during a publish
  *             learns the missed KA from chain on restart and fills its own gap
  *             (observable as a `core-fill` replication event and/or the missed
- *             triple landing in that core's verified-memory).
+ *             triple landing in that core's verifiable-memory).
  *
  *   Phase C — the `sinceBatchId` delta-sync hint is an additive, unsigned,
  *             backward-compatible protocol field with no active production
@@ -505,9 +505,9 @@ describe('Phase D — Cores host public CGs and fill their own gaps', () => {
 
     // 4. The victim must fill its gap FROM CHAIN after restart. Because it was
     //    made pure host-only (subscribed=0, core_hosted=1) above, the missed KA
-    //    can ONLY reach its verified-memory via the Phase D host-fill path — a
+    //    can ONLY reach its verifiable-memory via the Phase D host-fill path — a
     //    subscriber reconcile could not have produced it. We require BOTH:
-    //      (i)  the missed triple is in the victim's verified-memory, AND
+    //      (i)  the missed triple is in the victim's verifiable-memory, AND
     //      (ii) chain-path evidence that the reconciler delivered THIS specific
     //           KA after restart — a `fetch`/`promote`/`core-fill` replication
     //           event for this ka id, or a `chain-promote action=…` daemon.log
@@ -524,7 +524,7 @@ describe('Phase D — Cores host public CGs and fill their own gaps', () => {
         const vm = await postJson(victimNode, '/api/query', {
           sparql: `ASK { <${pub.subject}> <https://schema.org/name> ?o }`,
           contextGraphId: CONTEXT_GRAPH,
-          view: 'verified-memory',
+          view: 'verifiable-memory',
         });
         if (!(vm.status === 200 && askIsTrue(vm.body))) return null; // headline proof first
 

@@ -695,13 +695,13 @@ echo ""
 
 echo "--- 12a: wmSparql default graph should not return system triples on participant ---"
 N2_DEFAULT=$(c -X POST "http://127.0.0.1:9202/api/query" \
-  -d "{\"sparql\":\"SELECT (COUNT(*) AS ?cnt) WHERE { GRAPH ?g { ?s ?p ?o } FILTER(STRSTARTS(STR(?g), \\\"did:dkg:context-graph:$CG_ID/\\\") && !STRENDS(STR(?g), \\\"/_meta\\\") && !CONTAINS(STR(?g), \\\"/_private\\\") && !CONTAINS(STR(?g), \\\"/_shared_memory\\\") && !CONTAINS(STR(?g), \\\"/_verified_memory\\\") && !CONTAINS(STR(?g), \\\"/_rules\\\")) }\",\"contextGraphId\":\"$CG_ID\"}")
+  -d "{\"sparql\":\"SELECT (COUNT(*) AS ?cnt) WHERE { GRAPH ?g { ?s ?p ?o } FILTER(STRSTARTS(STR(?g), \\\"did:dkg:context-graph:$CG_ID/\\\") && !STRENDS(STR(?g), \\\"/_meta\\\") && !CONTAINS(STR(?g), \\\"/_private\\\") && !CONTAINS(STR(?g), \\\"/_shared_memory\\\") && !CONTAINS(STR(?g), \\\"/_verifiable_memory\\\") && !CONTAINS(STR(?g), \\\"/_rules\\\")) }\",\"contextGraphId\":\"$CG_ID\"}")
 N2_DEF_CT=$(count_integer "$N2_DEFAULT")
 check "Node 2 WM named-graph-only query returns 0 non-SWM triples" "$N2_DEF_CT" "0"
 
 echo "--- 12b: Non-participant wmSparql returns 0 triples (no system leak) ---"
 N3_DEFAULT=$(c -X POST "http://127.0.0.1:9203/api/query" \
-  -d "{\"sparql\":\"SELECT (COUNT(*) AS ?cnt) WHERE { GRAPH ?g { ?s ?p ?o } FILTER(STRSTARTS(STR(?g), \\\"did:dkg:context-graph:$CG_ID/\\\") && !STRENDS(STR(?g), \\\"/_meta\\\") && !CONTAINS(STR(?g), \\\"/_private\\\") && !CONTAINS(STR(?g), \\\"/_shared_memory\\\") && !CONTAINS(STR(?g), \\\"/_verified_memory\\\") && !CONTAINS(STR(?g), \\\"/_rules\\\")) }\",\"contextGraphId\":\"$CG_ID\"}")
+  -d "{\"sparql\":\"SELECT (COUNT(*) AS ?cnt) WHERE { GRAPH ?g { ?s ?p ?o } FILTER(STRSTARTS(STR(?g), \\\"did:dkg:context-graph:$CG_ID/\\\") && !STRENDS(STR(?g), \\\"/_meta\\\") && !CONTAINS(STR(?g), \\\"/_private\\\") && !CONTAINS(STR(?g), \\\"/_shared_memory\\\") && !CONTAINS(STR(?g), \\\"/_verifiable_memory\\\") && !CONTAINS(STR(?g), \\\"/_rules\\\")) }\",\"contextGraphId\":\"$CG_ID\"}")
 N3_DEF_CT=$(count_integer "$N3_DEFAULT")
 check "Node 3 (excluded) WM named-graph-only query returns 0" "$N3_DEF_CT" "0"
 
@@ -968,7 +968,7 @@ PROMO_N2_CT=$(json_get "$PROMO_N2" promotedCount)
 
 #------------------------------------------------------------
 echo ""
-echo "=== SECTION 15: Publish SWM → Verified Memory (VM) ==="
+echo "=== SECTION 15: Publish SWM → Verifiable Memory (VM) ==="
 echo ""
 
 echo "--- 15pre: Register promote-test project on-chain ---"
@@ -1012,13 +1012,13 @@ fi
 echo "--- 15b: Verify VM data on Node 1 ---"
 sleep 3
 N1_VM=$(c -X POST "http://127.0.0.1:9201/api/query" \
-  -d "{\"sparql\":\"SELECT (COUNT(*) AS ?cnt) WHERE { ?s ?p ?o }\",\"contextGraphId\":\"$CG3_ID\",\"view\":\"verified-memory\"}")
+  -d "{\"sparql\":\"SELECT (COUNT(*) AS ?cnt) WHERE { ?s ?p ?o }\",\"contextGraphId\":\"$CG3_ID\",\"view\":\"verifiable-memory\"}")
 N1_VM_CT=$(count_integer "$N1_VM")
 [[ "$N1_VM_CT" -ge 1 ]] && ok "Node 1 has $N1_VM_CT entities in VM" || warn "Node 1 VM query is empty immediately after publish"
 
 echo "--- 15c: Verify specific entities in VM ---"
 N1_VM_API=$(c -X POST "http://127.0.0.1:9201/api/query" \
-  -d "{\"sparql\":\"SELECT ?name WHERE { <urn:promote-test:api1> <http://schema.org/name> ?name }\",\"contextGraphId\":\"$CG3_ID\",\"view\":\"verified-memory\"}")
+  -d "{\"sparql\":\"SELECT ?name WHERE { <urn:promote-test:api1> <http://schema.org/name> ?name }\",\"contextGraphId\":\"$CG3_ID\",\"view\":\"verifiable-memory\"}")
 N1_VM_API_CT=$(safe_bindings_count "$N1_VM_API")
 [[ "$N1_VM_API_CT" -ge 1 ]] && ok "API entity visible in VM" || warn "API entity not in VM ($N1_VM_API_CT) — may not have been in SWM"
 
@@ -1028,7 +1028,7 @@ echo "--- 15d: VM data syncs to Node 2 ---"
 N2_VM_SYNCED=false
 for i in $(seq 1 20); do
   N2_VM=$(c -X POST "http://127.0.0.1:9202/api/query" \
-    -d "{\"sparql\":\"SELECT (COUNT(*) AS ?cnt) WHERE { ?s ?p ?o }\",\"contextGraphId\":\"$CG3_ID\",\"view\":\"verified-memory\"}")
+    -d "{\"sparql\":\"SELECT (COUNT(*) AS ?cnt) WHERE { ?s ?p ?o }\",\"contextGraphId\":\"$CG3_ID\",\"view\":\"verifiable-memory\"}")
   N2_VM_CT=$(count_integer "$N2_VM")
   if [[ "$N2_VM_CT" -ge 1 ]]; then
     N2_VM_SYNCED=true
@@ -1043,7 +1043,7 @@ echo "--- 15e: Node 3 also has VM data (VM is public/on-chain) ---"
 N3_VM_SYNCED=false
 for i in $(seq 1 20); do
   N3_VM=$(c -X POST "http://127.0.0.1:9203/api/query" \
-    -d "{\"sparql\":\"SELECT (COUNT(*) AS ?cnt) WHERE { ?s ?p ?o }\",\"contextGraphId\":\"$CG3_ID\",\"view\":\"verified-memory\"}")
+    -d "{\"sparql\":\"SELECT (COUNT(*) AS ?cnt) WHERE { ?s ?p ?o }\",\"contextGraphId\":\"$CG3_ID\",\"view\":\"verifiable-memory\"}")
   N3_VM_CT=$(count_integer "$N3_VM")
   if [[ "$N3_VM_CT" -ge 1 ]]; then
     N3_VM_SYNCED=true
@@ -1104,7 +1104,7 @@ echo "--- 16b: Node 2 (participant) sees VM data ---"
 N2_CG1_VM_OK=false
 for i in $(seq 1 20); do
   N2_CG1_VM=$(c -X POST "http://127.0.0.1:9202/api/query" \
-    -d "{\"sparql\":\"SELECT (COUNT(*) AS ?cnt) WHERE { ?s ?p ?o }\",\"contextGraphId\":\"$CG_ID\",\"view\":\"verified-memory\"}")
+    -d "{\"sparql\":\"SELECT (COUNT(*) AS ?cnt) WHERE { ?s ?p ?o }\",\"contextGraphId\":\"$CG_ID\",\"view\":\"verifiable-memory\"}")
   N2_CG1_VM_CT=$(count_integer "$N2_CG1_VM")
   if [[ "$N2_CG1_VM_CT" -ge 1 ]]; then
     N2_CG1_VM_OK=true
@@ -1119,7 +1119,7 @@ echo "--- 16c: Node 4 (late joiner) sees VM data ---"
 N4_CG1_VM_OK=false
 for i in $(seq 1 20); do
   N4_CG1_VM=$(c -X POST "http://127.0.0.1:9204/api/query" \
-    -d "{\"sparql\":\"SELECT (COUNT(*) AS ?cnt) WHERE { ?s ?p ?o }\",\"contextGraphId\":\"$CG_ID\",\"view\":\"verified-memory\"}")
+    -d "{\"sparql\":\"SELECT (COUNT(*) AS ?cnt) WHERE { ?s ?p ?o }\",\"contextGraphId\":\"$CG_ID\",\"view\":\"verifiable-memory\"}")
   N4_CG1_VM_CT=$(count_integer "$N4_CG1_VM")
   if [[ "$N4_CG1_VM_CT" -ge 1 ]]; then
     N4_CG1_VM_OK=true
@@ -1134,7 +1134,7 @@ echo "--- 16d: Node 3 (excluded from private CG) still gets VM (on-chain is publ
 N3_CG1_VM_OK=false
 for i in $(seq 1 20); do
   N3_CG1_VM=$(c -X POST "http://127.0.0.1:9203/api/query" \
-    -d "{\"sparql\":\"SELECT (COUNT(*) AS ?cnt) WHERE { ?s ?p ?o }\",\"contextGraphId\":\"$CG_ID\",\"view\":\"verified-memory\"}")
+    -d "{\"sparql\":\"SELECT (COUNT(*) AS ?cnt) WHERE { ?s ?p ?o }\",\"contextGraphId\":\"$CG_ID\",\"view\":\"verifiable-memory\"}")
   N3_CG1_VM_CT=$(count_integer "$N3_CG1_VM")
   if [[ "$N3_CG1_VM_CT" -ge 1 ]]; then
     N3_CG1_VM_OK=true
@@ -1172,7 +1172,7 @@ echo "--- 16g: VM still has data even after SWM cleared ---"
 VM_STILL_CT=0
 for _ in $(seq 1 30); do
   N1_VM_STILL=$(c -X POST "http://127.0.0.1:9201/api/query" \
-    -d "{\"sparql\":\"SELECT (COUNT(*) AS ?cnt) WHERE { ?s ?p ?o }\",\"contextGraphId\":\"$CG3_ID\",\"view\":\"verified-memory\"}")
+    -d "{\"sparql\":\"SELECT (COUNT(*) AS ?cnt) WHERE { ?s ?p ?o }\",\"contextGraphId\":\"$CG3_ID\",\"view\":\"verifiable-memory\"}")
   VM_STILL_CT=$(count_integer "$N1_VM_STILL")
   [ "$VM_STILL_CT" -ge 1 ] && break
   sleep 1

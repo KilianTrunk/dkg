@@ -59,7 +59,7 @@ describe('DKGAgent.query forwards `_minTrust` alias (PR #239 iter-6)', () => {
     const agent = makeStubAgent((o) => { seen = o; });
     await agent.query('SELECT ?s WHERE { ?s ?p ?o }', {
       contextGraphId: 'cg-1',
-      view: 'verified-memory',
+      view: 'verifiable-memory',
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       _minTrust: TrustLevel.Endorsed,
     } as any);
@@ -71,7 +71,7 @@ describe('DKGAgent.query forwards `_minTrust` alias (PR #239 iter-6)', () => {
     const agent = makeStubAgent((o) => { seen = o; });
     await agent.query('SELECT ?s WHERE { ?s ?p ?o }', {
       contextGraphId: 'cg-1',
-      view: 'verified-memory',
+      view: 'verifiable-memory',
       minTrust: TrustLevel.Endorsed,
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       _minTrust: TrustLevel.ConsensusVerified,
@@ -84,7 +84,7 @@ describe('DKGAgent.query forwards `_minTrust` alias (PR #239 iter-6)', () => {
     const agent = makeStubAgent((o) => { seen = o; });
     await agent.query('SELECT ?s WHERE { ?s ?p ?o }', {
       contextGraphId: 'cg-1',
-      view: 'verified-memory',
+      view: 'verifiable-memory',
     });
     expect(seen?.minTrust).toBeUndefined();
   });

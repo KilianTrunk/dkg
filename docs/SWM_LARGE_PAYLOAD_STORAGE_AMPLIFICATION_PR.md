@@ -623,7 +623,7 @@ bench/results/swm-large-payload-5gib.json
 - Default externalization is enabled for persistent local Oxigraph/worker
   stores when `dataDir` is available.
 - Explicit stores supplied by callers are respected.
-- Normal data graphs, Verified Memory, private encrypted staging, and file
+- Normal data graphs, Verifiable Memory, private encrypted staging, and file
   import blobs are not changed by this wrapper.
 - Garbage collection for orphaned blob files is intentionally out of scope for
   this first pass.

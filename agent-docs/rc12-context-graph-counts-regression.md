@@ -75,7 +75,7 @@ The injected graph-variable constraint leaves the UI queries with no matching ro
 - [x] Add targeted query-engine regression coverage for the exact Node UI `GRAPH ?g` query shape against populated WM, SWM, and VM named graphs.
 - [x] Patch `packages/query/src/dkg-query-engine.ts` so self-scoped same-context-graph `GRAPH ?g` scans used by the UI are not clamped to only the root/static graph allow-list.
 - [x] Preserve explicit cross-context-graph rejection for direct `GRAPH <other-cg>` scoped queries.
-- [x] Preserve view-based routing behavior for `working-memory`, `shared-working-memory`, and `verified-memory`.
+- [x] Preserve view-based routing behavior for `working-memory`, `shared-working-memory`, and `verifiable-memory`.
 - [x] Run focused query tests first, then targeted Node UI count tests if the query fix is isolated.
 - [x] GitHub review follow-up: gate same-CG partition enumeration behind explicit `includeContextGraphPartitions` opt-in, and use it only from UI/subgraph count surfaces.
 - [x] GitHub review follow-up: restrict child context graph discovery to canonical candidate `/_meta` facts so arbitrary user triples cannot poison the parent count allow-list.
@@ -98,10 +98,10 @@ Implementation note: explicit `GRAPH <...>` targets still use the static route-s
 Completed with the local `.codex` review prompt and schema against `pr-diff.patch`.
 
 - Round 1 found two valid blockers:
-  - `_verified_memory/staging/*` graphs were admitted by the widened `GRAPH ?g` allow-list.
+  - `_verifiable_memory/staging/*` graphs were admitted by the widened `GRAPH ?g` allow-list.
   - same-prefix child context graph roots could be misclassified as parent subgraph partitions.
 - Round 2 found one valid blocker:
-  - once a child context graph root was known, its child partitions such as `_shared_memory` and `_verified_memory/*` still needed to be excluded.
+  - once a child context graph root was known, its child partitions such as `_shared_memory` and `_verifiable_memory/*` still needed to be excluded.
 - Round 3 returned `{"comments":[]}`.
 
 All valid findings were addressed with regression coverage before push.

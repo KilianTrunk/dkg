@@ -164,7 +164,7 @@ async function analyzeGetFlow(config: BenchmarkConfig, payloadSize: PayloadSizeL
       createPayload(config, `analysis-get-${payloadSize}`, 1, 'sync', false)
     ));
     await traceSharedMemoryWrite(trace, client, config, payload);
-    await traceAsync(trace, 'setup', 'publishFromSharedMemory', ['promoteSharedRoot'], 'Finalize staged shared-memory content into verified memory for the read path.', () => (
+    await traceAsync(trace, 'setup', 'publishFromSharedMemory', ['promoteSharedRoot'], 'Finalize staged shared-memory content into verifiable memory for the read path.', () => (
       client.publishFromSharedMemory(config.contextGraphId, { rootEntities: [payload.rootEntity] }, false)
     ), { rootEntity: payload.rootEntity });
     const sparql = traceSync(trace, 'measured', 'getSparql', [], 'Build the read query for the published root entity.', () => getSparql(payload.rootEntity));
@@ -185,7 +185,7 @@ async function analyzeSyncPublishFlow(config: BenchmarkConfig, payloadSize: Payl
       createPayload(config, `analysis-sync-${payloadSize}`, 1, 'sync', false)
     ));
     await traceSharedMemoryWrite(trace, client, config, payload);
-    await traceAsync(trace, 'measured', 'publishFromSharedMemory', ['promoteSharedRoot'], 'Synchronously finalize staged shared-memory content into verified memory.', () => (
+    await traceAsync(trace, 'measured', 'publishFromSharedMemory', ['promoteSharedRoot'], 'Synchronously finalize staged shared-memory content into verifiable memory.', () => (
       client.publishFromSharedMemory(config.contextGraphId, { rootEntities: [payload.rootEntity] }, false)
     ), { rootEntity: payload.rootEntity });
     traceSync(trace, 'cleanup', 'clear', ['Map.clear'], 'Clear all in-memory layers after the representative run.', () => client.clear());
@@ -369,7 +369,7 @@ function createConfig(payloadSize: PayloadSizeLabel): BenchmarkConfig {
     authorityProofRef: 'proof:benchmark-local',
     pollIntervalMs: 1000,
     asyncSuccessStatuses: ['finalized'],
-    getView: 'verified-memory',
+    getView: 'verifiable-memory',
   };
 }
 

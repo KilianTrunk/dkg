@@ -18,13 +18,13 @@
  *      +promote+publish from an edge daemon (no on-chain identity) so the
  *      publisher's chain-submit branch necessarily fails. Asserts the
  *      INVERSE of the old "tentative VM" contract: the publish reports
- *      failure to the caller AND `/api/query?view=verified-memory` returns
+ *      failure to the caller AND `/api/query?view=verifiable-memory` returns
  *      zero rows for the just-published triples. Pre-RC11 a failed publish
  *      silently wrote its quads into the root data graph and the VM view
  *      aliased that graph into VM, so an external app would observe
  *      "verified" data that the chain had never anchored. PR2 deletes
  *      `generateTentativeMetadata` from the on-chain catch and limits VM
- *      to `_verified_memory/*` graphs; this test pins both halves.
+ *      to `_verifiable_memory/*` graphs; this test pins both halves.
  *
  *   3. NFT staking withdraw — `DKGStakingConvictionNFT.withdraw(tokenId)`
  *      on an unlocked tier-0 position. Verifies: TRAC delta to staker EOA
@@ -340,7 +340,7 @@ describe('1. chained sign-at-creation assertion lifecycle', () => {
   it('all 4 standalone routes (create/write/finalize/promote) emit memory_graph_changed in order', async () => {
     const assertionName = `core-flows-lifecycle-${Date.now().toString(36)}`;
     // Only the four standalone-route lifecycle operations are under test.
-    // A core also emits `verified_memory_finalized` whenever it promotes a
+    // A core also emits `verifiable_memory_finalized` whenever it promotes a
     // peer-published KA to VM — including via the periodic chain-reconcile
     // sweep, which can fire mid-test for unrelated bootstrap KAs in this same
     // CG. Those are correct background events but pollute a CG-only filter, so
@@ -395,8 +395,8 @@ describe('1. chained sign-at-creation assertion lifecycle', () => {
 });
 
 // ─────────────────── 2. Failed-publish honesty (RC11 / PR2) ───────────────────
-describe('2. failed publish does not leak triples into verified-memory (RC11 / PR2)', () => {
-  it('edge-node publish fails AND /api/query?view=verified-memory returns zero rows for its triples', async () => {
+describe('2. failed publish does not leak triples into verifiable-memory (RC11 / PR2)', () => {
+  it('edge-node publish fails AND /api/query?view=verifiable-memory returns zero rows for its triples', async () => {
     const assertionName = `core-flows-edge-${Date.now().toString(36)}`;
     const subject = `urn:test:edge:rc11:${Date.now().toString(36)}`;
     const witnessLiteral = `"PR2 failed-publish witness ${Date.now().toString(36)}"`;
@@ -405,7 +405,7 @@ describe('2. failed publish does not leak triples into verified-memory (RC11 / P
     // KA create returns 201 (resource created) vs the legacy route's 200.
     expect(r.status, `edge create: ${JSON.stringify(r.body)}`).toBe(201);
 
-    // The witness literal is unique per run so the verified-memory query
+    // The witness literal is unique per run so the verifiable-memory query
     // below can isolate THIS publish's quads from any bootstrap data
     // sitting in the same context graph.
     const quads = [
@@ -429,12 +429,12 @@ describe('2. failed publish does not leak triples into verified-memory (RC11 / P
     expect(
       r.body?.status,
       `edge publish returned status='tentative' — pre-PR2 silent downgrade ` +
-      `(would re-enable verified-memory leak via tentative graph aliasing)`,
+      `(would re-enable verifiable-memory leak via tentative graph aliasing)`,
     ).not.toBe('tentative');
 
     // CORE ASSERTION (RC11 / PR2): regardless of on-chain outcome, the
     // edge publish's triples MUST NOT appear in the
-    // verified-memory view on ANY node. Poll node1 (a core) over a few
+    // verifiable-memory view on ANY node. Poll node1 (a core) over a few
     // seconds so any in-flight gossip from the edge has time to land
     // in the wrong graph — a leak that materialises 1-2s after the
     // publish call returns would be missed by a single immediate
@@ -455,7 +455,7 @@ describe('2. failed publish does not leak triples into verified-memory (RC11 / P
           sparql:
             `SELECT ?o WHERE { <${subject}> <http://schema.org/name> ?o . FILTER(?o = ${witnessLiteral}) }`,
           contextGraphId: CONTEXT_GRAPH,
-          view: 'verified-memory',
+          view: 'verifiable-memory',
         },
         state.node1Token,
       );
@@ -472,11 +472,11 @@ describe('2. failed publish does not leak triples into verified-memory (RC11 / P
     expect(
       leakSeen,
       `PR2 invariant violated: edge publish leaked ${lastVmBindings.length} row(s) into ` +
-      `view=verified-memory for ${subject} after up to ` +
+      `view=verifiable-memory for ${subject} after up to ` +
       `${VM_POLL_ATTEMPTS * VM_POLL_INTERVAL_MS}ms of polling — the on-chain catch is still ` +
       `writing tentative quads to a graph that the VM view aliases. ` +
       `Re-check dkg-publisher.ts catch block and dkg-query-engine.ts ` +
-      `verified-memory branch.`,
+      `verifiable-memory branch.`,
     ).toBe(false);
   }, 90_000);
 });

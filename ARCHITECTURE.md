@@ -253,7 +253,7 @@ sequenceDiagram
   participant Client as Layered DKG Client
   participant WM as Working Memory
   participant SWM as Shared Working Memory
-  participant VM as Verified Memory
+  participant VM as Verifiable Memory
   participant Jobs as Publisher Jobs
   participant Reports as HTML Reporters
 
@@ -268,7 +268,7 @@ sequenceDiagram
       Client->>WM: write payload
       Client->>SWM: lift payload
       Client->>VM: finalize sync publish
-      Suite->>Client: query verified-memory marker
+      Suite->>Client: query verifiable-memory marker
       Client-->>Suite: binding with marker
     else synchronous publish with finalization
       Client->>WM: write payload
@@ -478,7 +478,7 @@ class AsyncPublisher {
 }
 class WorkingMemory
 class SharedWorkingMemory
-class VerifiedMemory
+class VerifiableMemory
 
 CLI --> SourceWorkerRunner : invokes
 SourceWorkerRunner --> SourceWorkerConfig : loads
@@ -508,7 +508,7 @@ SharedMemoryHandler --> SharedWorkingMemory : stores accepted writes
 PrivateContentStore --> WorkingMemory : stages async private lift payloads
 PrivateContentStore --> StorageAdapters : writes plaintext private RDF terms
 AsyncPublisher --> SharedWorkingMemory : reads source data
-AsyncPublisher --> VerifiedMemory : publishes
+AsyncPublisher --> VerifiableMemory : publishes
 ```
 
 ## Shared Memory Gossip Authentication

@@ -232,7 +232,7 @@ describe("DkgNodePlugin", () => {
       const text = result.content[0].text;
       expect(text).toContain('working-memory');
       expect(text).toContain('shared-working-memory');
-      expect(text).toContain('verified-memory');
+      expect(text).toContain('verifiable-memory');
     });
 
 
@@ -378,7 +378,7 @@ describe("DkgNodePlugin", () => {
       expect(text).toContain('view');
       expect(text).toContain('working-memory');
       expect(text).toContain('shared-working-memory');
-      expect(text).toContain('verified-memory');
+      expect(text).toContain('verifiable-memory');
     });
 
 

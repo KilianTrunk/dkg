@@ -497,7 +497,7 @@ export class ApiClient {
 
   /**
    * Selection-based publish — publishes one selected SWM rootEntity to
-   * verified memory. Passing `"all"` is accepted only when the source
+   * verifiable memory. Passing `"all"` is accepted only when the source
    * SWM currently resolves to a single publishable root. The agent mints the
    * AuthorAttestation seal inline at the selection boundary using
    * the calling agent's bearer-token identity / explicit
@@ -751,7 +751,7 @@ export class ApiClient {
   }
 
   /**
-   * Publish a previously-finalized assertion to the verified-memory
+   * Publish a previously-finalized assertion to the verifiable-memory
    * chain. The seal in `_meta` (written by `finalizeAssertion`)
    * supplies the AuthorAttestation; the publisher forwards it
    * verbatim and never re-signs.
@@ -1087,7 +1087,7 @@ export class ApiClient {
    * memory-layer routing (`view`, `graphSuffix`, `verifiedGraph`,
    * `subGraphName`, `includeSharedMemory`, `includeContextGraphPartitions`,
    * `agentAddress`, `assertionName`), and P-13's `minTrust` (only meaningful
-   * on `view: "verified-memory"`; ignored elsewhere). `contextGraphId` stays
+   * on `view: "verifiable-memory"`; ignored elsewhere). `contextGraphId` stays
    * in the 2nd positional slot for backwards compatibility.
    */
   async query(
@@ -1097,7 +1097,7 @@ export class ApiClient {
       graphSuffix?: string;
       includeSharedMemory?: boolean;
       includeContextGraphPartitions?: boolean;
-      view?: 'working-memory' | 'shared-working-memory' | 'verified-memory';
+      view?: 'working-memory' | 'shared-working-memory' | 'verifiable-memory';
       agentAddress?: string;
       assertionName?: string;
       subGraphName?: string;
@@ -1542,14 +1542,14 @@ export class ApiClient {
 
   async verify(request: {
     contextGraphId: string;
-    verifiedMemoryId: string;
+    verifiableMemoryId: string;
     batchId: string;
     timeoutMs?: number;
     requiredSignatures?: number;
   }): Promise<{
     txHash?: string;
     blockNumber?: number;
-    verifiedMemoryId: string;
+    verifiableMemoryId: string;
     signers: string[];
     status?: 'verified' | 'partial' | 'no_quorum';
     trustLevel?: number;

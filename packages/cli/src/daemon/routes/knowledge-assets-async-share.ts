@@ -51,24 +51,13 @@ import {
 // up front, exactly as the legacy route did via `safeDecodeURIComponent` +
 // `validateAssertionName`); we re-validate the name here so this standalone
 // handler matches the legacy contract byte-for-byte regardless of entry point.
-// OT-RFC-43 §F2 — async share (swm/share-async) is deferred to the next release:
-// the AuthorAttestation digest now binds reservedKaId and the async-lift seal does
-// not yet allocate/persist it. The enqueue handler hard-returns 501 so no async-lift
-// seal is ever persisted. Kept as a function (not a literal) so the handler body
-// below stays type-reachable; flip it to true when the async-lift wiring lands.
-function asyncShareAvailable(): boolean {
-  return false;
-}
-
+// OT-RFC-43 §F2 — async share is AVAILABLE: the async-lift seal now allocates and
+// binds the per-author reservedKaId (see agent `buildAsyncLiftSeal`), so the
+// enqueue → worker → sync `assertion.promote` → `assertionFinalize` path produces a
+// mintable Option-1 seal. (The live dispatch in `knowledge-assets.ts` already
+// serves swm/share-async inline; this standalone faithful-port handler is kept in
+// lockstep so either entry point behaves identically.)
 export async function handleKaShareAsyncEnqueue(ctx: RequestContext, name: string): Promise<void> {
-  if (!asyncShareAvailable()) {
-    return jsonResponse(ctx.res, 501, {
-      error:
-        'Async share (swm/share-async) is not available in this release — use the synchronous ' +
-        'POST /api/knowledge-assets/:name/swm/share instead. (OT-RFC-43 §F2: async reservedKaId ' +
-        'binding is deferred to the next release.)',
-    });
-  }
   const { req, res, agent, requestToken } = ctx;
   const writePreflightCallerAgentAddress = requestToken
     ? agent.resolveAgentByToken(requestToken)

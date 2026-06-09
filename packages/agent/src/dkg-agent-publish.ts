@@ -371,6 +371,7 @@ import {
   isLocalOxigraphConfig,
   sliceIntoCiphertextChunks,
 } from './dkg-agent-helpers.js';
+import { reconcileAndAllocateKaNumber } from './allocator.js';
 import {
   swmSenderStateKey,
   swmReceiverStateKey,
@@ -820,6 +821,19 @@ export class PublishMethods extends DKGAgentBase {
       if (opts?.authorSignTypedData !== undefined) {
         throw new Error('publishAsync: preSignedAuthorAttestation and authorSignTypedData are mutually exclusive');
       }
+      // OT-RFC-43 §F2 — the attested packed id MUST live in the signing author's own
+      // namespace (high 160 bits == author); otherwise the seal is locally valid but
+      // unminted (the contract rejects a namespace-mismatched id with
+      // KaIdNamespaceMismatch). Validate here, BEFORE workspace staging, so a bad
+      // attestation never leaves an orphan WM write.
+      const preSigned = opts.preSignedAuthorAttestation;
+      if ((preSigned.reservedKaId >> 96n) !== BigInt(ethers.getAddress(preSigned.authorAddress))) {
+        throw new Error(
+          `publishAsync: preSignedAuthorAttestation reservedKaId namespace mismatch — ` +
+            `id ${preSigned.reservedKaId} is not in author ${ethers.getAddress(preSigned.authorAddress)}'s ` +
+            `namespace. The packed kaId must be (uint160(author) << 96) | number (OT-RFC-43 §F2).`,
+        );
+      }
     }
     if (opts?.authorSignTypedData !== undefined && opts?.authorAgentAddress === undefined) {
       throw new Error('publishAsync: authorSignTypedData requires authorAgentAddress');
@@ -909,21 +923,50 @@ export class PublishMethods extends DKGAgentBase {
         : undefined,
     } as const;
 
-    // OT-RFC-43 §F2 — the async-lift author seal cannot yet bind the non-zero
-    // reservedKaId the on-chain mint now requires; async reservedKaId allocation is
-    // DEFERRED to rc.18. Rather than build the old 0n-placeholder seal (which the
-    // on-chain mint rejects with KaIdNamespaceMismatch), leave the async lift
-    // SEALLESS when the caller didn't supply its own attestation. EPCIS/Kafka and
-    // other direct async-capture writers keep working — WM/SWM is unaffected; only
-    // the on-chain VM anchor is deferred (a sealless lift simply has no
-    // AuthorAttestation to mint with until rc.18 wires async allocation, exactly
-    // like the existing non-V10 "enqueues without a seal" path). A caller-supplied
-    // preSignedAuthorAttestation is honored (it carries its own valid attestation).
+    // OT-RFC-43 §F2 — bind the per-author reservedKaId into the async-lift seal so
+    // EPCIS/Kafka and other direct async-capture writers earn a real on-chain VM
+    // anchor (not just WM/SWM). Two sources:
+    //   • a caller-supplied preSignedAuthorAttestation carries its own attestation
+    //     and the slot it signed over — honour it, persisting its reservedKaId
+    //     (after a namespace sanity check so we never store a seal the mint would
+    //     reject with KaIdNamespaceMismatch);
+    //   • otherwise build the seal here via `buildAsyncLiftSeal`, which
+    //     allocates-before-signing in the resolved author's namespace.
+    // `buildAsyncLiftSeal` returns undefined (⇒ sealless lift, WM/SWM unaffected,
+    // on-chain anchor simply skipped) on non-V10 chains, off-chain CGs, noops, or
+    // when no allocator/author is available — preserving the prior graceful path.
+    // (A caller-supplied preSignedAuthorAttestation was namespace-checked up front,
+    // before workspace staging, so it can be threaded onto the seal as-is here.)
     let seal: LiftRequestAuthorSeal | undefined;
     if (opts?.preSignedAuthorAttestation) {
       seal = preSignedAttestationToLiftSeal(opts.preSignedAuthorAttestation);
+    } else {
+      // The WM/SWM write above is already committed and there is no outer rollback,
+      // so seal-building MUST NOT throw out of publishAsync — that would orphan the
+      // staged capture and return no captureID. `buildAsyncLiftSeal` already
+      // degrades to `undefined` (sealless) for the expected non-mintable conditions
+      // (non-V10 / off-chain CG / noop / no allocator / no signer) and for an
+      // allocate failure; this catch is the backstop for any *unexpected* throw in
+      // its resolve → validate → subtract → canonicalize → sign pipeline (a
+      // transient store read, a slice/validation inconsistency from a concurrent
+      // finalize, a signer rejection). On any such error the capture stays in
+      // WM/SWM and simply forgoes its on-chain VM anchor — identical to the prior
+      // (always-sealless) async behaviour, never an orphaned write.
+      try {
+        seal = await this.buildAsyncLiftSeal(
+          liftRequestDraft,
+          opts?.authorAgentAddress,
+          opts?.authorSignTypedData,
+        );
+      } catch (err) {
+        this.log.warn(
+          ctx,
+          `Async-lift seal build failed; lift stays sealless (WM/SWM committed, ` +
+            `on-chain VM anchor deferred): ${err instanceof Error ? err.message : String(err)}`,
+        );
+        seal = undefined;
+      }
     }
-    // else: sealless — no async-lift seal built (§F2 async binding deferred to rc.18).
 
     const asyncPublisher = new TripleStoreAsyncLiftPublisher(this.store, {
       publicSnapshotStore: this.publicSnapshotStore,
@@ -961,11 +1004,16 @@ export class PublishMethods extends DKGAgentBase {
     authorAgentAddress?: string,
     authorSignTypedData?: (typedData: AuthorAttestationTypedData) => Promise<{ r: Uint8Array; vs: Uint8Array }>,
   ): Promise<LiftRequestAuthorSeal | undefined> {
-    // OT-RFC-43 §F2 — async share is deferred to the next release (the async-lift
-    // seal does not yet allocate/bind the reservedKaId the digest now requires).
-    // This method is UNREACHABLE in this release: the swm/share-async route is
-    // hard-gated (501), so no async-lift seal is ever built or persisted. The 0n
-    // reservedKaId placeholder below only satisfies the now-required digest field.
+    // OT-RFC-43 §F2 — build the EIP-712 AuthorAttestation seal for an async lift,
+    // ALLOCATING the packed reservedKaId before signing so the digest binds the
+    // exact id the on-chain mint will `_safeMint` (the publisher reuses it via
+    // `precomputedAttestation.reservedKaId`, never re-allocating). Returns
+    // `undefined` — leaving the lift sealless (WM/SWM only, no on-chain VM
+    // anchor) — whenever a valid Option-1 id can't be produced: a non-V10 chain,
+    // a context graph that isn't on-chain yet, a full-overlap noop, no resolvable
+    // author/signer, or no configured allocator. EPCIS/Kafka and other direct
+    // async-capture writers go through here; the graceful-sealless fallback keeps
+    // them publishing on non-V10 / off-chain deployments exactly as before.
     if (this.chain.isV10Ready?.() !== true) return undefined;
     if (typeof this.chain.getEvmChainId !== 'function') return undefined;
     if (typeof this.chain.getKnowledgeAssetsLifecycleAddress !== 'function') return undefined;
@@ -993,6 +1041,17 @@ export class PublishMethods extends DKGAgentBase {
     });
 
     // Strip already-finalized quads (no-op for non-CREATE). Matches publisher.
+    // KNOWN EDGE (OT-RFC-43 §F2 follow-up): the merkle below is computed over this
+    // subtracted slice and frozen into the seal, but the publisher RE-subtracts
+    // against live confirmed state at processNext. If an overlapping public quad
+    // under the same root is *confirmed* in the enqueue→process gap (only possible
+    // for a pure-public CREATE re-capture of a caller-stable root), the merkles
+    // diverge and the publisher's seal-integrity preflight fails the lift terminally
+    // (confirmation_mismatch) BEFORE any chain submit — no consensus impact, WM/SWM
+    // data persists, the capture just loses its on-chain anchor and leaks one
+    // (gap-tolerated) reservedKaId. Fresh-IRI captures never overlap, and private
+    // captures take the tentative path without reaching the preflight, so this is a
+    // rare corner; a re-seal-at-processNext robustness pass is a tracked follow-up.
     const subtracted = await subtractFinalizedExactQuads({
       store: this.store,
       graphManager,
@@ -1029,19 +1088,46 @@ export class PublishMethods extends DKGAgentBase {
       authorAddress = fallback;
     }
 
-    // OT-RFC-43 §F2 — async-lift reservedKaId binding is DEFERRED to rc.18. The
-    // async share path is gated at the `swm/share-async` route (returns
-    // rc.17-unavailable) plus a runtime guard in `publishAsync`, so this code is
-    // unreachable in rc.17; the 0n placeholder only satisfies the now-required
-    // digest field. rc.18 allocates the number here and persists it on the
-    // LiftRequestAuthorSeal so the deferred-broadcast digest matches.
+    // OT-RFC-43 §F2 — ALLOCATE-BEFORE-SIGN. The AuthorAttestation digest binds the
+    // packed reservedKaId, so resolve it before buildAuthorAttestationTypedData.
+    // Async captures are FRESH KAs (no lifecycle name, no stable slot to reuse), so
+    // this is always a fresh allocation in the resolved author's namespace, via the
+    // SAME reconcile-once-then-allocate helper as create/finalize — keeping the
+    // off-chain number sequence single-sourced (the agent is the sole allocation
+    // point; the publisher reuses this id verbatim). Allocation happens AFTER the
+    // full-overlap noop short-circuit above, so a noop lift never burns a number.
+    // No allocator (mock / non-Option-1 daemon) ⇒ sealless fallback rather than a
+    // 0n placeholder the mint would reject. A reconcile/allocate failure (e.g. a
+    // flaky chain oracle) also falls back to sealless + a warning: the capture
+    // still lands in WM/SWM and the on-chain anchor is simply not minted, instead
+    // of rejecting the whole publishAsync and orphaning the staged write.
+    if (!this.kaNumberAllocator) return undefined;
+    let reservedKaId: bigint;
+    try {
+      const { number } = await reconcileAndAllocateKaNumber(
+        this.kaNumberAllocator,
+        this.chain,
+        this.reconciledKaAuthors,
+        authorAddress,
+      );
+      reservedKaId = (BigInt(ethers.getAddress(authorAddress)) << 96n) | number;
+    } catch (err) {
+      this.log.warn(
+        createOperationContext('publish'),
+        `Async-lift seal allocation failed for author ${authorAddress}; lift stays sealless ` +
+          `(WM/SWM committed, on-chain VM anchor deferred): ` +
+          (err instanceof Error ? err.message : String(err)),
+      );
+      return undefined;
+    }
+
     const typedData = buildAuthorAttestationTypedData({
       chainId,
       kav10Address,
       contextGraphId: BigInt(onChainId),
       merkleRoot: canonical.kcMerkleRoot,
       authorAddress,
-      reservedKaId: 0n,
+      reservedKaId,
       schemeVersion: AUTHOR_SCHEME_VERSION_V1,
     });
 
@@ -1061,6 +1147,8 @@ export class PublishMethods extends DKGAgentBase {
         vs: ethers.hexlify(vs) as `0x${string}`,
       },
       schemeVersion: AUTHOR_SCHEME_VERSION_V1,
+      // Persist the signed packed id so the deferred-broadcast mint reuses it.
+      reservedKaId: `${reservedKaId}` as `${bigint}`,
     };
   }
 

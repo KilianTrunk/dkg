@@ -126,6 +126,11 @@ export function preSignedAttestationToLiftSeal(input: {
   authorAddress: string;
   signature: { r: Uint8Array; vs: Uint8Array };
   schemeVersion: number;
+  // OT-RFC-43 §F2 — the packed reservedKaId the caller signed into the digest.
+  // Carried onto the persisted seal so the deferred-broadcast mint reuses the
+  // exact id the author attested. A pre-§F2 caller that omits it persists no
+  // reservedKaId, falling back to the legacy 0n read (and the mint's rejection).
+  reservedKaId?: bigint;
 }): LiftRequestAuthorSeal {
   return {
     merkleRoot: ethers.hexlify(input.expectedMerkleRoot) as `0x${string}`,
@@ -135,6 +140,9 @@ export function preSignedAttestationToLiftSeal(input: {
       vs: ethers.hexlify(input.signature.vs) as `0x${string}`,
     },
     schemeVersion: input.schemeVersion,
+    ...(input.reservedKaId !== undefined
+      ? { reservedKaId: `${input.reservedKaId}` as `${bigint}` }
+      : {}),
   };
 }
 

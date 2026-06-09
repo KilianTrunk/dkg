@@ -319,6 +319,9 @@ describe('mapLiftRequestToPublishOptions', () => {
           authorAddress: customAuthor,
           signature: { r: sigR, vs: sigVs },
           schemeVersion: 1,
+          // §F2 — packed (uint160(author) << 96) | number, persisted as a
+          // stringified bigint, must round-trip into precomputedAttestation.
+          reservedKaId: `${(BigInt(customAuthor) << 96n) | 42n}` as `${bigint}`,
         },
       },
       resolved: {
@@ -334,6 +337,35 @@ describe('mapLiftRequestToPublishOptions', () => {
     expect(seal.expectedMerkleRoot).toEqual(new Uint8Array(32).fill(0xaa));
     expect(seal.signature.r).toEqual(new Uint8Array(32).fill(0xbb));
     expect(seal.signature.vs).toEqual(new Uint8Array(32).fill(0xcc));
+    // §F2 — the publisher mints exactly this id (ensureReservedKaId reuses it).
+    expect(seal.reservedKaId).toBe((BigInt(customAuthor) << 96n) | 42n);
+  });
+
+  it('reads reservedKaId as 0n for a legacy seal persisted before §F2 binding', () => {
+    // Backward-compat: a lift job enqueued before async reservedKaId binding has
+    // no `reservedKaId` field. The mapper must read it as 0n (the legacy
+    // namespace-mismatched value the on-chain mint rejects) rather than throwing
+    // on `BigInt(undefined)`.
+    const merkleRootHex = ('0x' + 'aa'.repeat(32)) as `0x${string}`;
+    const options = mapLiftRequestToPublishOptions({
+      ...baseInput(),
+      request: {
+        ...baseInput().request,
+        seal: {
+          merkleRoot: merkleRootHex,
+          authorAddress: '0xAaaAAaaaAaaaaaAAAaAaaaaaAAAaaaaAaAaAAaaA' as `0x${string}`,
+          signature: {
+            r: ('0x' + 'bb'.repeat(32)) as `0x${string}`,
+            vs: ('0x' + 'cc'.repeat(32)) as `0x${string}`,
+          },
+          schemeVersion: 1,
+          // no reservedKaId — pre-§F2 seal shape
+        },
+      },
+      resolved: { ...baseInput().resolved, publisherPeerId: '12D3KooWPublisher' },
+    });
+
+    expect(options.precomputedAttestation?.reservedKaId).toBe(0n);
   });
 
   it('rejects malformed hex in seal.merkleRoot instead of silently zeroing bytes', () => {

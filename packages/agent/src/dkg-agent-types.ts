@@ -299,6 +299,13 @@ export interface PublishAsyncOpts extends PublishOpts {
     authorAddress: string;
     signature: { r: Uint8Array; vs: Uint8Array };
     schemeVersion: number;
+    /**
+     * OT-RFC-43 §F2 — the packed reservedKaId `(uint160(author) << 96) | number`
+     * the caller signed into the AuthorAttestation digest. Bound into the async
+     * lift seal so the deferred-broadcast mint reuses the exact attested id (the
+     * digest commits to it, so it cannot be re-derived server-side).
+     */
+    reservedKaId: bigint;
   };
   /** Caller signs typed-data built by the daemon. Requires `authorAgentAddress`. */
   authorSignTypedData?: (typedData: AuthorAttestationTypedData) => Promise<{ r: Uint8Array; vs: Uint8Array }>;

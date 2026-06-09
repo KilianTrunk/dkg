@@ -3,7 +3,7 @@ import { useLayoutStore, maxBottomHeight } from '../../stores/layout.js';
 import { api } from '../../api-wrapper.js';
 import { formatTime, formatDuration, shortId } from '../../hooks.js';
 
-const BOTTOM_TABS = ['Node Log', 'Transactions', 'Gossip'] as const;
+const BOTTOM_TABS = ['Node Log', 'Transactions'] as const;
 type BottomTab = typeof BOTTOM_TABS[number];
 
 // ── Icons ────────────────────────────────────────────────────────────────────
@@ -133,8 +133,11 @@ function NodeLogContent() {
 }
 
 // ── Transactions ──────────────────────────────────────────────────────────────
-// Shows operations that reached the `chain` phase, giving a real-time view of
-// on-chain activity. Covers all op types that can submit a tx.
+// Real-time view of publish / update / verify activity. On-chain operations
+// show their transaction hash; local-first operations (the default on a node
+// that hasn't opted into on-chain registration) have no tx and are tagged
+// "local" so a publish is always visible here instead of silently vanishing
+// because it never reached the `chain` phase (F2).
 // Replaces with OTEL-sourced chain events once the telemetry stack is live.
 
 const TX_OP_TYPES = new Set(['publish', 'publishFromSWM', 'update', 'ka-update', 'verify', 'reconstruct']);
@@ -157,10 +160,10 @@ function TransactionsContent() {
     const names = [...TX_OP_TYPES].join(',');
     api.fetchOperationsWithPhases({ limit: '100', from, names })
       .then((data: any) => {
-        const filtered = (data?.operations ?? []).filter((op: any) =>
-          op.tx_hash || (op.phases ?? []).some((p: any) => p.phase === 'chain')
-        );
-        setOps(filtered);
+        // The `names` param already scopes the result to tx-capable op types.
+        // Don't drop the ones that never reached the `chain` phase — those are
+        // local-first publishes/updates the operator still wants to see. (F2)
+        setOps(data?.operations ?? []);
       })
       .catch(() => {});
   }, []);
@@ -174,7 +177,7 @@ function TransactionsContent() {
   if (ops.length === 0) {
     return (
       <div style={{ padding: '20px 16px', color: 'var(--text-tertiary)', fontSize: 12 }}>
-        No on-chain transactions in the last 6 hours.
+        No publish, update, or verify activity in the last 6 hours.
       </div>
     );
   }
@@ -223,7 +226,16 @@ function TransactionsContent() {
                     {op.started_at ? formatTime(op.started_at) : '—'}
                   </td>
                   <td style={{ padding: '7px 12px', fontFamily: 'var(--font-mono)', color: 'var(--text-tertiary)', maxWidth: 140, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                    {txHash ? `${txHash.slice(0, 10)}…` : '—'}
+                    {txHash
+                      ? `${txHash.slice(0, 10)}…`
+                      // Only a SUCCESSFULLY-completed op with no chain phase is a
+                      // genuine local-first run worth the "local" tag. A no-tx op
+                      // that failed or is still in flight before reaching `chain`
+                      // must NOT read as a successful local run — show "—" so the
+                      // Status column stays the source of truth for those (Codex).
+                      : op.status === 'success'
+                        ? <span style={{ fontFamily: 'var(--font-sans)', fontStyle: 'italic', color: 'var(--text-tertiary)' }}>local</span>
+                        : '—'}
                   </td>
                 </tr>
                 {isExp && (
@@ -255,71 +267,6 @@ function TransactionsContent() {
           })}
         </tbody>
       </table>
-    </div>
-  );
-}
-
-// ── Gossip ────────────────────────────────────────────────────────────────────
-// Shows only raw libp2p / ProtocolRouter / GossipSub lines — NOT structured
-// DKGAgent operation logs (those live in Node Log and Operations).
-// Once OTEL is live this tab will be backed by a dedicated trace/metric stream.
-
-// Structured DKGAgent lines start with: "YYYY-MM-DD HH:MM:SS <optype> <uuid>"
-const STRUCTURED_LOG_RE = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \w+ [0-9a-f-]{36}/;
-
-function isLibp2pLine(line: string): boolean {
-  const s = stripAnsi(line);
-  if (STRUCTURED_LOG_RE.test(s)) return false; // skip DKGAgent structured lines
-  if (/Connection (opened|closed):/i.test(s)) return true;
-  if (/\[ProtocolRouter\]/i.test(s)) return true;
-  if (/Circuit reservation/i.test(s)) return true;
-  if (/Node is remotely-dialable/i.test(s)) return true;
-  if (/gossipsub|pubsub/i.test(s)) return true;
-  if (/FinalizationHandler/i.test(s)) return true;
-  if (/swm-ack|swm-share|swm-update/i.test(s)) return true;
-  return false;
-}
-
-function GossipContent() {
-  const [lines, setLines] = useState<string[]>([]);
-  const [filter, setFilter] = useState('');
-
-  const load = useCallback(() => {
-    api.fetchNodeLog({ lines: 500 })
-      .then(({ lines: l }: any) => setLines((l ?? []).map(stripAnsi).filter(isLibp2pLine)))
-      .catch(() => {});
-  }, []);
-
-  useEffect(() => { load(); const iv = setInterval(load, 5_000); return () => clearInterval(iv); }, [load]);
-
-  const visible = filter ? lines.filter(l => l.toLowerCase().includes(filter.toLowerCase())) : lines;
-  const gossipLastLine = visible.length > 0 ? visible[visible.length - 1] : '';
-  const scrollRef = useAutoScroll(gossipLastLine);
-
-  return (
-    <div className="v10-log-container">
-      <div className="v10-log-toolbar">
-        <input
-          id="dkg-gossip-log-filter"
-          name="dkg-gossip-log-filter"
-          type="text"
-          placeholder="Filter libp2p / gossip events..."
-          className="v10-log-filter"
-          value={filter}
-          onChange={(e) => setFilter(e.target.value)}
-          aria-label="Filter gossip log lines"
-        />
-      </div>
-      <div className="v10-log-output" ref={scrollRef}>
-        {visible.map((line, i) => (
-          <div key={i} className="v10-log-line" style={{ color: 'var(--text-secondary)' }}>{line}</div>
-        ))}
-        {visible.length === 0 && (
-          <div className="v10-log-line" style={{ color: 'var(--text-tertiary)' }}>
-            No libp2p / gossip events in log tail
-          </div>
-        )}
-      </div>
     </div>
   );
 }
@@ -419,7 +366,6 @@ export function PanelBottom() {
         <div className="v10-bottom-content">
           {activeTab === 'Node Log' && <NodeLogContent />}
           {activeTab === 'Transactions' && <TransactionsContent />}
-          {activeTab === 'Gossip' && <GossipContent />}
         </div>
       )}
     </div>

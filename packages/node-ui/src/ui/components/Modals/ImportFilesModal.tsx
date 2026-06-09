@@ -149,6 +149,7 @@ export function ImportFilesModal({ open, onClose, contextGraphId, contextGraphNa
 
   const totalTriples = results.reduce((sum, r) => sum + (r.triplesWritten ?? 0), 0);
   const successCount = results.filter(r => r.status === 'success').length;
+  const skippedCount = results.filter(r => r.status === 'skipped').length;
   const errorCount = results.filter(r => r.status === 'error').length;
 
   return (
@@ -282,12 +283,24 @@ export function ImportFilesModal({ open, onClose, contextGraphId, contextGraphNa
               >
                 {errorCount === 0 ? (
                   <>
-                    Successfully imported {successCount} file{successCount !== 1 ? 's' : ''}.
-                    {totalTriples > 0 && <> Extracted <strong>{totalTriples.toLocaleString()}</strong> triples into working memory.</>}
+                    {successCount > 0 && (
+                      <>
+                        Successfully imported {successCount} file{successCount !== 1 ? 's' : ''}.
+                        {totalTriples > 0 && <> Extracted <strong>{totalTriples.toLocaleString()}</strong> triples into working memory.</>}
+                      </>
+                    )}
+                    {skippedCount > 0 && (
+                      <>
+                        {successCount > 0 ? ' ' : ''}
+                        Stored {skippedCount} file{skippedCount !== 1 ? 's' : ''} as source — no structured knowledge was extracted yet (extraction for these file types is coming soon).
+                      </>
+                    )}
                   </>
                 ) : (
                   <>
-                    {successCount} file{successCount !== 1 ? 's' : ''} imported, {errorCount} failed.
+                    {successCount} file{successCount !== 1 ? 's' : ''} imported
+                    {skippedCount > 0 && <>, {skippedCount} stored without extraction</>}
+                    , {errorCount} failed.
                     {totalTriples > 0 && <> {totalTriples.toLocaleString()} triples extracted.</>}
                   </>
                 )}

@@ -446,3 +446,54 @@ button.v10-notif-row:hover { background: var(--bg-hover); }
 }
 .v10-resize-handle-v:hover,
 .v10-resize-handle-v.active { background: var(--accent-green); height: 3px; }
+
+/* ── Responsive: narrow / split-screen viewports (F8) ──
+   The shell is a fixed three-column desktop layout (left tree · center ·
+   right panel) whose side-panel widths are inline-styled from the layout
+   store, so at narrow widths the center could be squeezed to nothing and
+   the header controls could clip. These rules are purely presentational —
+   no behavioural or store changes — and only engage below desktop widths.
+
+   IMPORTANT: App.tsx conditionally renders each side panel from layout
+   state (`leftCollapsed` / `rightCollapsed`) and the header's "Toggle
+   sidebar" / "Toggle agent panel" buttons flip that state. So we must NOT
+   force the panels to `display:none` here — that would mount-but-hide them,
+   making those toggles dead and locking the operator out of the sidebar /
+   agent panel entirely on narrow screens (Codex). Instead, when a panel
+   IS open we lift it out of the flex flow and float it over the center as
+   a drawer: the center reclaims the full width, while the panel stays fully
+   reachable (and dismissable) via its existing toggle.
+     · ≤ 860px  float the side rails as overlay drawers; center goes full-width
+     · ≤ 600px  let the header scroll horizontally instead of clipping */
+@media (max-width: 860px) {
+  .v10-app-body { position: relative; }
+  .v10-app-body > .v10-panel-left,
+  .v10-app-body > .v10-panel-right {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    z-index: 40;
+    box-shadow: 0 0 24px rgba(0, 0, 0, 0.35);
+  }
+  .v10-app-body > .v10-panel-left { left: 0; }
+  .v10-app-body > .v10-panel-right { right: 0; }
+  /* The drag-to-resize handles are pointless at this width and, with the
+     panels floated, would otherwise sit in the flow as orphan slivers.
+     Hiding the handle does not remove access to anything — the panel is
+     still toggled from the header. */
+  .v10-app-body > .v10-resize-handle-h {
+    display: none !important;
+  }
+  .v10-center-region {
+    flex: 1 1 100% !important;
+    min-width: 0;
+  }
+}
+@media (max-width: 600px) {
+  .v10-header {
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-width: none;
+  }
+  .v10-header::-webkit-scrollbar { display: none; }
+}

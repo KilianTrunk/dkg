@@ -380,7 +380,14 @@ export class ProtocolRouter {
           }
           return;
         }
-        console.error(`[ProtocolRouter] handler error on ${protocolId} from ${connection.remotePeer.toString().slice(-8)}:`, err instanceof Error ? err.message : err);
+        // F3: peer closed/reset the stream before the response was written —
+        // routine churn, not a fault. Downgrade to a quiet warn (no "error"
+        // token) so it doesn't spam the node log as a red error line.
+        if (isBenignStreamClosure(err)) {
+          console.warn(`[ProtocolRouter] stream closed by peer before response on ${protocolId} from ${connection.remotePeer.toString().slice(-8)}`);
+        } else {
+          console.error(`[ProtocolRouter] handler error on ${protocolId} from ${connection.remotePeer.toString().slice(-8)}:`, err instanceof Error ? err.message : err);
+        }
         try {
           stream.abort(new Error('handler error'));
         } catch {
@@ -1316,6 +1323,34 @@ function asAbortError(reason: unknown): Error {
   const err = new Error(typeof reason === 'string' ? reason : 'aborted');
   (err as Error & { name: string }).name = 'AbortError';
   return err;
+}
+
+// F3: a peer that closes/resets its side of a stream before we finish
+// writing the response surfaces in the inbound handler as a stream-write
+// lifecycle error (e.g. "Cannot write to a stream that is closed"), not a
+// real handler fault. These are routine during peer churn and shouldn't be
+// logged as red errors. Recognise the benign cases so the handler can
+// downgrade them.
+//
+// Match ONLY stream-write / stream-lifecycle signals. We deliberately do
+// NOT match broad connection- or muxer-level text ("connection closed",
+// "muxer is closed"): a genuine handler bug can throw an error that merely
+// mentions a closed connection, and swallowing those would hide real faults
+// (Codex). Keep the matcher to the narrow set of phrases that specifically
+// denote writing to / reacting on an already-closed or reset stream.
+function isBenignStreamClosure(err: unknown): boolean {
+  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+  if (!msg) return false;
+  return (
+    msg.includes('stream that is closed') ||
+    msg.includes('stream is closed') ||
+    msg.includes('stream closed') ||
+    msg.includes('stream reset') ||
+    msg.includes('stream ended') ||
+    msg.includes('stream aborted') ||
+    msg.includes('writable end') ||
+    msg.includes('write after end')
+  );
 }
 
 async function readAll(

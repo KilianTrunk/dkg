@@ -57,6 +57,34 @@ describe('@unit EpochStorage credit to a finalized epoch is preserved (not dropp
     expect(await EpochStorage.getEpochPool(shardId, cur - 2)).to.equal(0n);
   });
 
+  it('on an idle shard (lastFinalizedEpoch lags wall clock), a past credit lands in the CURRENT epoch, not a back-dated one', async () => {
+    const shardId = 7003;
+    await time.increase(epochSeconds * 3);
+    const e1 = Number(await Chronos.getCurrentEpoch());
+
+    // Touch the shard once → lastFinalizedEpoch = e1-1, then leave it IDLE.
+    await EpochStorage.addTokensToEpochRange(shardId, e1, e1, 1);
+    const laggedFinalized = Number(await EpochStorage.lastFinalizedEpoch(shardId)); // e1-1
+    expect(laggedFinalized).to.equal(e1 - 1);
+
+    // Wall clock advances well past lastFinalizedEpoch without any shard activity.
+    await time.increase(epochSeconds * 5);
+    const cur = Number(await Chronos.getCurrentEpoch());
+    expect(cur).to.be.greaterThan(laggedFinalized + 1); // the shard is "idle"
+
+    const staleTarget = laggedFinalized + 1; // where a naive clamp would back-date to (a past epoch)
+    const curBefore = await EpochStorage.getEpochPool(shardId, cur);
+    const staleBefore = await EpochStorage.getEpochPool(shardId, staleTarget);
+
+    // Backfill a credit aimed at a long-past epoch.
+    await EpochStorage.addTokensToEpochRange(shardId, laggedFinalized - 1, laggedFinalized - 1, 1000);
+
+    // It lands in the genuinely-open CURRENT epoch — not back-dated into the
+    // already-elapsed (and possibly already-claimable) `lastFinalizedEpoch + 1`.
+    expect((await EpochStorage.getEpochPool(shardId, cur)) - curBefore).to.equal(1000n);
+    expect(await EpochStorage.getEpochPool(shardId, staleTarget)).to.equal(staleBefore);
+  });
+
   it('a settlement range does not corrupt the pool of an epoch outside it', async () => {
     const shardId = 7002;
     await time.increase(epochSeconds * 5);

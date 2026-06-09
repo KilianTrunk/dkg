@@ -152,6 +152,7 @@ contract EpochStorage is INamed, IVersioned, HubDependent {
         uint256 endEpoch,
         uint96 tokenAmount
     ) external onlyContracts {
+        uint256 currentEpoch = chronos.getCurrentEpoch();
         // SECURITY FIX: a credit whose startEpoch is already finalized is
         // otherwise lost forever. `_finalizeEpochsUpTo` only folds `diff` for
         // `(lastFinalizedEpoch, currentEpoch-1]` and never revisits a finalized
@@ -159,11 +160,20 @@ contract EpochStorage is INamed, IVersioned, HubDependent {
         // is never folded into `cumulative` (the tokens vanish — stranded in the
         // contract with no payable pool entry) and the paired
         // `diff[endEpoch+1] -= p` later under-credits an unrelated future epoch.
-        // Clamp the range forward to the first still-open epoch so the tokens are
-        // preserved and land in a payable epoch instead of being dropped. (Callers
-        // such as PublishingConviction settle elapsed billing windows lazily, so a
-        // past startEpoch is normal — clamp, don't revert.)
+        // Clamp the range forward to the first still-OPEN epoch so the tokens are
+        // preserved and land in a payable epoch. The first open epoch is
+        // max(lastFinalizedEpoch + 1, currentEpoch): `lastFinalizedEpoch + 1`
+        // excludes epochs already folded into `cumulative`, and `currentEpoch`
+        // excludes past-but-not-yet-finalized epochs that an IDLE shard has not
+        // closed yet (where `lastFinalizedEpoch` lags wall clock) — without it a
+        // delayed settlement would back-date tokens into an already-elapsed,
+        // claimable epoch. Callers like PublishingConviction settle elapsed
+        // billing windows lazily, so a past startEpoch is normal — clamp,
+        // don't revert.
         uint256 firstOpenEpoch = lastFinalizedEpoch[shardId] + 1;
+        if (firstOpenEpoch < currentEpoch) {
+            firstOpenEpoch = currentEpoch;
+        }
         if (startEpoch < firstOpenEpoch) {
             startEpoch = firstOpenEpoch;
             if (endEpoch < startEpoch) {
@@ -184,7 +194,6 @@ contract EpochStorage is INamed, IVersioned, HubDependent {
         diff[shardId][startEpoch] += tokensPerEpoch;
         diff[shardId][endEpoch + 1] -= tokensPerEpoch;
 
-        uint256 currentEpoch = chronos.getCurrentEpoch();
         if (currentEpoch > 1) {
             _finalizeEpochsUpTo(shardId, currentEpoch - 1);
         }

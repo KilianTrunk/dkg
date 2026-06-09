@@ -2009,7 +2009,7 @@ export class DKGAgent extends DKGAgentBase {
           // history() rebuild (which re-derives urn:dkg:assertion:{cg}[:{sub}]:{author}:{name})
           // matches. We do NOT parse dkg:assertionGraph for this: for any KA that
           // has a kaId (the only kind resolveByKaId matches) the pointer is the
-          // layer-keyed form (…/_working_memory|_shared_…|_verified_memory/{author}/{number}),
+          // layer-keyed form (…/_working_memory|_shared_…|_verifiable_memory/{author}/{number}),
           // never the legacy /assertion/{agent}/{name} shape, and the VM re-stamp
           // lowercases the address (derived from the packed kaId bits) — so a
           // pointer parse would hand history() a case-mismatched author that fails

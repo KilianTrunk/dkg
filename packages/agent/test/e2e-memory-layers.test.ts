@@ -78,17 +78,17 @@ describe('Memory layer isolation (single agent)', () => {
     const packedKaId = (BigInt(foreignAuthor) << 96n) | kaNumber;
     const lifecycleUri = assertionLifecycleUri(CG_ID, foreignAuthor, name);
     const decoyLifecycleUri = assertionLifecycleUri(CG_ID, defaultAuthor, decoyName);
-    const vmGraph = contextGraphLayerUri(CG_ID, MemoryLayer.VerifiedMemory, foreignAuthor.toLowerCase(), kaNumber);
+    const vmGraph = contextGraphLayerUri(CG_ID, MemoryLayer.VerifiableMemory, foreignAuthor.toLowerCase(), kaNumber);
 
     await (agent as any).store.insert([
       { subject: decoyLifecycleUri, predicate: `${DKG}kaId`, object: `"${kaNumber}"^^<${XSD_INT}>`, graph: metaGraph },
       { subject: decoyLifecycleUri, predicate: `${DKG}assertionName`, object: `"${decoyName}"`, graph: metaGraph },
       { subject: decoyLifecycleUri, predicate: `${DKG}state`, object: '"published"', graph: metaGraph },
-      { subject: decoyLifecycleUri, predicate: `${DKG}memoryLayer`, object: `"${MemoryLayer.VerifiedMemory}"`, graph: metaGraph },
+      { subject: decoyLifecycleUri, predicate: `${DKG}memoryLayer`, object: `"${MemoryLayer.VerifiableMemory}"`, graph: metaGraph },
       { subject: lifecycleUri, predicate: `${DKG}kaId`, object: `"${kaNumber}"^^<${XSD_INT}>`, graph: metaGraph },
       { subject: lifecycleUri, predicate: `${DKG}assertionName`, object: `"${name}"`, graph: metaGraph },
       { subject: lifecycleUri, predicate: `${DKG}state`, object: '"published"', graph: metaGraph },
-      { subject: lifecycleUri, predicate: `${DKG}memoryLayer`, object: `"${MemoryLayer.VerifiedMemory}"`, graph: metaGraph },
+      { subject: lifecycleUri, predicate: `${DKG}memoryLayer`, object: `"${MemoryLayer.VerifiableMemory}"`, graph: metaGraph },
       { subject: lifecycleUri, predicate: `${DKG}assertionGraph`, object: vmGraph, graph: metaGraph },
       { subject: lifecycleUri, predicate: 'http://www.w3.org/ns/prov#wasAttributedTo', object: `did:dkg:agent:${foreignAuthor.toLowerCase()}`, graph: metaGraph },
     ]);
@@ -99,7 +99,7 @@ describe('Memory layer isolation (single agent)', () => {
     expect(desc.agentAddress).toBe(foreignAuthor);
     expect(desc.agentAddress.toLowerCase()).not.toBe(defaultAuthor.toLowerCase());
     expect(desc.name).toBe(name);
-    expect(desc.memoryLayer).toBe(MemoryLayer.VerifiedMemory);
+    expect(desc.memoryLayer).toBe(MemoryLayer.VerifiableMemory);
   });
 
   it('WM data is not visible in SWM or default data graph', async () => {
@@ -240,8 +240,8 @@ describe('WM → SWM → VM pipeline (single agent)', () => {
     expect(pub.seal).toBeDefined();
 
     // RC.17 Bug #1 regression (SUBSTRATE-2): a confirmed publish must re-point
-    // dkg:assertionGraph in _meta at the per-KA verified-memory graph it just
-    // wrote (…/_verified_memory/{author}/{number}). promote() leaves the pointer
+    // dkg:assertionGraph in _meta at the per-KA verifiable-memory graph it just
+    // wrote (…/_verifiable_memory/{author}/{number}). promote() leaves the pointer
     // on the SWM bucket, which the post-confirm SWM cleanup then EMPTIES — so
     // without the re-stamp the _meta index follows a stale pointer to an empty
     // graph and descriptor reads return no triples. The publish derives the VM
@@ -254,7 +254,7 @@ describe('WM → SWM → VM pipeline (single agent)', () => {
     const kaId = BigInt(pub.kaId!);
     const expectedVmGraph = contextGraphLayerUri(
       CG_ID,
-      MemoryLayer.VerifiedMemory,
+      MemoryLayer.VerifiableMemory,
       '0x' + (kaId >> 96n).toString(16).padStart(40, '0'),
       kaId & ((1n << 96n) - 1n),
     );

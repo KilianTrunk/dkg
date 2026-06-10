@@ -25,7 +25,7 @@
             "gitCommitHash": "bcfa930d57b90106f9cc95a7f8fe1cd330cd9feb",
             "deploymentBlock": 42265715,
             "deploymentTimestamp": 1780299720090,
-            "deployed": true
+            "deployed": false
         },
         "WhitelistStorage": {
             "evmAddress": "0x0a3020BA9BF8E853c306dFE4d3C8AB0449d99c99",
@@ -88,7 +88,7 @@
             "gitCommitHash": "bcfa930d57b90106f9cc95a7f8fe1cd330cd9feb",
             "deploymentBlock": 42265734,
             "deploymentTimestamp": 1780299758505,
-            "deployed": true
+            "deployed": false
         },
         "PaymasterManager": {
             "evmAddress": "0x073aFC5cDf6e81d2Ccfb66d39E1F1224B39b8F15",
@@ -124,7 +124,7 @@
             "gitCommitHash": "bcfa930d57b90106f9cc95a7f8fe1cd330cd9feb",
             "deploymentBlock": 42265746,
             "deploymentTimestamp": 1780299782398,
-            "deployed": true
+            "deployed": false
         },
         "Ask": {
             "evmAddress": "0x3BDF5293DB9D65Bde8A74706530E206bC74eFE77",
@@ -196,7 +196,7 @@
             "gitCommitHash": "778d6b8e01adeba357824d19893f8c28c10e6305",
             "deploymentBlock": 42413915,
             "deploymentTimestamp": 1780596121051,
-            "deployed": true
+            "deployed": false
         },
         "KnowledgeAssetsStorage": {
             "evmAddress": "0x45E0e14c695681c8c93d6A489a314ea1EC28ba59",
@@ -232,7 +232,7 @@
             "gitCommitHash": "bcfa930d57b90106f9cc95a7f8fe1cd330cd9feb",
             "deploymentBlock": 42265743,
             "deploymentTimestamp": 1780299777585,
-            "deployed": true
+            "deployed": false
         },
         "ContextGraphStorage": {
             "evmAddress": "0x9B70896bd3Fc116e413199A198206d0dA8Cd6602",
@@ -295,7 +295,7 @@
             "gitCommitHash": "bcfa930d57b90106f9cc95a7f8fe1cd330cd9feb",
             "deploymentBlock": 42265778,
             "deploymentTimestamp": 1780299846566,
-            "deployed": true
+            "deployed": false
         },
         "DKGStakingConvictionNFT": {
             "evmAddress": "0x44DC019876ce9CF961186Fc4657f71f6786e705C",
@@ -331,7 +331,7 @@
             "gitCommitHash": "778d6b8e01adeba357824d19893f8c28c10e6305",
             "deploymentBlock": 42413912,
             "deploymentTimestamp": 1780596115673,
-            "deployed": true
+            "deployed": false
         },
         "KnowledgeAssetsLifecycle": {
             "evmAddress": "0x63Aa3D0D305e66fB9797802A0E0a00CDD0e5224b",
@@ -340,7 +340,7 @@
             "gitCommitHash": "778d6b8e01adeba357824d19893f8c28c10e6305",
             "deploymentBlock": 42413918,
             "deploymentTimestamp": 1780596126512,
-            "deployed": true
+            "deployed": false
         },
         "V8MigrationEligibility": {
             "evmAddress": "0xF00FA3d29a2d45Fce44324C67C7Eb9C645F3DA1C",

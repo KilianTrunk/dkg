@@ -797,6 +797,21 @@ export interface ChainAdapter {
    */
   getConvictionAccountLockDurationEpochs?(accountId: bigint): Promise<number>;
 
+  /**
+   * Whether the PCA `accountId` can cover the DISCOUNTED cost of a publish
+   * whose undiscounted base cost is `baseCost`, right now (discount tier
+   * applied, compared against the account's remaining current-window
+   * allowance + top-up buffer; `false` when expired/exhausted/missing).
+   *
+   * The publisher SDK gates the `publishEpochs → lockDurationEpochs`
+   * coercion on this, so a registered-but-unfundable agent (a consent-free
+   * squat, or any account short for this specific publish) keeps the
+   * caller's requested lifetime instead of snapping to the PCA lock and
+   * direct-spending at that lifetime/full price. Adapters that omit this
+   * method preserve the legacy unconditional coercion.
+   */
+  convictionAccountCanCover?(accountId: bigint, baseCost: bigint): Promise<boolean>;
+
   // ----- V10 Publishing Conviction NFT write+read surface -----
   // Wraps `DKGPublishingConvictionNFT`. Optional; owner-gated writes
   // MUST surface the owner revert (→ 403), never swallow it.

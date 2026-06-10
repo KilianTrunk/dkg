@@ -1990,6 +1990,13 @@ export class DKGPublisher implements Publisher {
     // `lockDurationEpochs` when one is found AND the caller did not
     // explicitly override the publish lifetime. Wallets without a PCA
     // (direct-spend branch) use the ordinary default lifetime.
+    // LU-5: pricing follows the byteSize that gets signed into the V10
+    // digest. For curated (encrypted-inline) publishes that's the
+    // ciphertext byte count; for public publishes it stays as plaintext
+    // bytes. Single source of truth so ACK pricing == chain tx pricing.
+    // Resolved BEFORE the PCA coercion below so the fundability probe can
+    // price the prospective lock-lifetime publish.
+    const effectiveByteSize = useEncryptedInline ? stagingByteSize : publicByteSize;
     let publishEpochs = explicitPublishEpochs ?? DEFAULT_PUBLISH_EPOCHS;
     if (
       explicitPublishEpochs === undefined &&
@@ -2003,11 +2010,56 @@ export class DKGPublisher implements Publisher {
         if (accountId > 0n) {
           const lockEpochs = await this.chain.getConvictionAccountLockDurationEpochs(accountId);
           if (lockEpochs > 0) {
-            publishEpochs = lockEpochs;
-            this.log.info(
-              ctx,
-              `PCA-funded publish detected (signer=${publisherSigner.address}, accountId=${accountId}) — coercing publishEpochs to lockDurationEpochs=${lockEpochs}`,
-            );
+            // Only snap the lifetime to the PCA lock if the account can
+            // actually cover THIS publish's discounted cost right now. Agent
+            // registration is consent-free (RFC-001 §3.6), so a third party
+            // can squat this signer against an underfunded PCA; since the
+            // contract's conviction branch now falls through to direct spend
+            // instead of reverting, coercing an unfundable account would
+            // publish at the PCA-lock lifetime AND full price rather than the
+            // caller's default. Price the prospective lock-lifetime publish
+            // (the exact base cost the coerced tx would carry) and ask the
+            // chain whether the PCA covers its discounted cost — a coarse
+            // "balance > 0" gate is not enough, since a nonzero-but-short
+            // account (or a few-wei squat) would still be coerced and then
+            // fall through to full-price direct spend. Adapters without the
+            // probe keep the legacy unconditional coercion.
+            let canFundDiscount = true;
+            if (typeof this.chain.convictionAccountCanCover === 'function') {
+              // The coverage probe is only meaningful against the REAL
+              // publish price. If we cannot price the prospective
+              // lock-lifetime publish — adapter lacks the quote, or the
+              // quote call reverts — treat the publish as "funding
+              // unverifiable" and do NOT coerce. Falling back to the
+              // protocol minimum (`lockEpochs` wei) would let a partial or
+              // squatted PCA pass the probe against that lower bound and
+              // then fall through to full-price direct spend at the wrong
+              // lifetime — the exact regression this gate exists to prevent.
+              if (typeof this.chain.getRequiredPublishTokenAmount !== 'function') {
+                canFundDiscount = false;
+              } else {
+                try {
+                  const quoted = await this.chain.getRequiredPublishTokenAmount(effectiveByteSize, lockEpochs);
+                  // Mirror the min-clamp applied to the real tx below.
+                  const prospectiveBaseCost = quoted > BigInt(lockEpochs) ? quoted : BigInt(lockEpochs);
+                  canFundDiscount = await this.chain.convictionAccountCanCover(accountId, prospectiveBaseCost);
+                } catch {
+                  canFundDiscount = false;
+                }
+              }
+            }
+            if (canFundDiscount) {
+              publishEpochs = lockEpochs;
+              this.log.info(
+                ctx,
+                `PCA-funded publish detected (signer=${publisherSigner.address}, accountId=${accountId}) — coercing publishEpochs to lockDurationEpochs=${lockEpochs}`,
+              );
+            } else {
+              this.log.info(
+                ctx,
+                `Signer ${publisherSigner.address} is a registered PCA agent (accountId=${accountId}) but funding for this publish's discounted cost could not be confirmed — NOT coercing publishEpochs; publishing at requested lifetime=${publishEpochs} via direct spend`,
+              );
+            }
           }
         }
       } catch (err) {
@@ -2026,11 +2078,6 @@ export class DKGPublisher implements Publisher {
         );
       }
     }
-    // LU-5: pricing follows the byteSize that gets signed into the V10
-    // digest. For curated (encrypted-inline) publishes that's the
-    // ciphertext byte count; for public publishes it stays as plaintext
-    // bytes. Single source of truth so ACK pricing == chain tx pricing.
-    const effectiveByteSize = useEncryptedInline ? stagingByteSize : publicByteSize;
     let precomputedTokenAmount = canAttemptOnChainPublish ? BigInt(publishEpochs) : 0n;
     if (canAttemptOnChainPublish && typeof this.chain.getRequiredPublishTokenAmount === 'function') {
       try {

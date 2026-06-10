@@ -3,31 +3,35 @@
 // =============================================================================
 //
 // Agent registration on a publishing-conviction account (PCA) is
-// permissionless and requires NO consent from the agent (RFC-001 §3.6). The
-// publish/update entrypoints auto-route a registered agent into the discount
-// branch based only on (registered, not-expired, epoch-match) — NOT on whether
-// the account can actually fund the cost.
+// permissionless and requires NO consent from the agent (RFC-001 §3.6).
+// `registerAgent` only checks that the caller owns the PCA being registered
+// against — the `agent` address is an arbitrary value the caller types in,
+// and `agentToAccountId` is a single GLOBAL reverse map. So any unprivileged
+// party can:
 //
-// Pre-fix, an attacker could:
-//   1. createAccount(1 wei)            -> active PCA, baseAllowance = 1/12 = 0
-//   2. registerAgent(accountId, victim) (no consent needed)
-// and any victim publish with `epochs == lockDurationEpochs` (or any paid
-// victim update) would route into `coverPublishingCost`, hit
-// `InsufficientAllowance`, and REVERT — bricking the victim's paid publishes
-// and updates indefinitely. The victim cannot self-deregister and cannot
-// register their own address (the global reverse map is taken).
+//   1. createAccount(1 wei)             -> active PCA, baseAllowance = 1/12 = 0
+//   2. registerAgent(theirAccountId, victim)   (no victim consent needed)
+//
+// and thereby point `agentToAccountId[victim]` at their own deliberately
+// underfunded account. Pre-fix, the victim's publish (with
+// `epochs == lockDurationEpochs`) and EVERY paid update routed into
+// `coverPublishingCost`, hit `InsufficientAllowance`, and REVERTED — a
+// near-permanent brick for ~1 wei + gas. The victim cannot self-deregister
+// (owner-gated) nor re-route the global slot.
 //
 // The fix makes the conviction branch FALL THROUGH to direct spend on the
 // PCA-side payment errors (`InsufficientAllowance` / `AccountExpired`) instead
-// of reverting — so a consent-free registration can never block a publisher;
+// of reverting, so a consent-free registration can never block a publisher;
 // it just loses the (non-existent) discount and the victim pays full price.
 //
-// This suite proves: with the attacker's underfunded registration in place and
-// the conviction gate ACTIVE (epochs == lockDurationEpochs), the victim's
-// publish still succeeds via direct spend (victim's own TRAC moves, KC minted).
+// Coverage in this suite:
+//   - publish()  under an attacker-registered, underfunded PCA  -> direct spend
+//   - update()   under an attacker-registered, underfunded PCA  -> direct spend
+//   - publish()  under an attacker-registered, EXPIRED PCA      -> direct spend
+//   - the fall-through is not a free pass (unfunded victim still reverts)
 
 import { SignerWithAddress } from '@nomicfoundation/hardhat-ethers/signers';
-import { loadFixture } from '@nomicfoundation/hardhat-network-helpers';
+import { loadFixture, time } from '@nomicfoundation/hardhat-network-helpers';
 import { expect } from 'chai';
 import { ethers } from 'ethers';
 import hre from 'hardhat';
@@ -54,12 +58,12 @@ import {
 } from './helpers/setup-helpers';
 import {
   buildPublishParams,
+  buildUpdateParams,
   packReservedKaId,
   DEFAULT_CHAIN_ID,
 } from './helpers/v10-kc-helpers';
 
 const MIN_STAKE = ethers.parseEther('50000');
-const STAKER_SHARD_ID = 1n;
 
 type Fixture = {
   accounts: SignerWithAddress[];
@@ -171,31 +175,8 @@ describe('@integration V10 PCA — consent-free agent DoS (audit fix)', function
     await StakingNFT.connect(staker).createConviction(identityId, amount, 1);
   };
 
-  const sumActiveSink = (
-    logs: readonly { address: string; topics: readonly string[]; data: string }[],
-    epochStorageAddr: string,
-  ): bigint => {
-    let sum = 0n;
-    for (const log of logs) {
-      if (log.address.toLowerCase() !== epochStorageAddr) continue;
-      try {
-        const parsed = EpochStorageContract.interface.parseLog({
-          topics: [...log.topics],
-          data: log.data,
-        });
-        if (parsed?.name === 'TokensAddedToEpochRange') {
-          expect(BigInt(parsed.args.shardId)).to.equal(STAKER_SHARD_ID);
-          sum += BigInt(parsed.args.tokenAmount);
-        }
-      } catch {
-        // not our event
-      }
-    }
-    return sum;
-  };
-
-  it('attacker-registered, underfunded PCA no longer bricks a victim publish (falls through to direct spend)', async () => {
-    // ---- Nodes (V10-staked for the ACK signer gate) ----
+  // Publisher + 3 receiver profiles, all V10-staked above the ACK signer gate.
+  const standUpNodes = async () => {
     const publishingNode = getDefaultPublishingNode(accounts);
     const receivingNodes = getDefaultReceivingNodes(accounts);
     const { identityId: publisherIdentityId } = await createProfile(
@@ -213,29 +194,29 @@ describe('@integration V10 PCA — consent-free agent DoS (audit fix)', function
         MIN_STAKE,
       );
     }
+    return { receivingNodes, publisherIdentityId, receiverIdentityIds };
+  };
 
-    // ---- Attack: 1-wei PCA, register the victim as a paying agent ----
-    const attacker = accounts[8];
-    const victim = getDefaultKCCreator(accounts); // accounts[9]
-
+  // Attacker mints a 1-wei PCA (baseAllowance = 1/lockDurationEpochs = 0) and
+  // registers the victim as a paying agent — no victim consent involved.
+  const attackerSquats = async (
+    attacker: SignerWithAddress,
+    victim: SignerWithAddress,
+  ) => {
     await Token.mint(attacker.address, 1n);
     await Token.connect(attacker).approve(await NFT.getAddress(), 1n);
     await NFT.connect(attacker).createAccount(1n);
-    const attackerAccountId = await NFT.totalSupply();
+    const accountId = await NFT.totalSupply();
+    await NFT.connect(attacker).registerAgent(accountId, victim.address);
+    expect(await NFT.agentToAccountId(victim.address)).to.equal(accountId);
+    const lockDurationEpochs = Number((await NFT.accounts(accountId))[5]);
+    return { accountId, lockDurationEpochs };
+  };
 
-    await NFT.connect(attacker).registerAgent(attackerAccountId, victim.address);
-    // The victim is now globally routed to the attacker's underfunded account.
-    expect(await NFT.agentToAccountId(victim.address)).to.equal(
-      attackerAccountId,
-    );
-
-    // The conviction branch is ACTIVE for this publish: the account is fresh
-    // (not expired) and we publish with epochs == lockDurationEpochs. So the
-    // publish MUST enter `coverPublishingCost` and rely on the fall-through.
-    const lockDurationEpochs = Number((await NFT.accounts(attackerAccountId))[5]);
-
-    // ---- Victim's own context graph (open publish policy) ----
-    await CGFacade.connect(victim).createContextGraph(
+  // Open-publish-policy context graph owned by `owner` (authorizes any
+  // non-zero publisher, including the victim).
+  const openContextGraphFor = async (owner: SignerWithAddress) => {
+    await CGFacade.connect(owner).createContextGraph(
       [],
       0,
       0,
@@ -245,128 +226,261 @@ describe('@integration V10 PCA — consent-free agent DoS (audit fix)', function
       ethers.ZeroHash,
     );
     const cgId = await CGS.getLatestContextGraphId();
-    expect(await CGFacade.isAuthorizedPublisher(cgId, victim.address)).to.be
-      .true;
+    expect(await CGFacade.isAuthorizedPublisher(cgId, owner.address)).to.be.true;
+    return cgId;
+  };
 
-    // ---- Victim funds a DIRECT spend (full price) — what they fall back to ----
+  // Fund + execute a victim-authored publish that pays via DIRECT spend.
+  const victimPublish = async (args: {
+    victim: SignerWithAddress;
+    cgId: bigint;
+    epochs: number;
+    tokenAmount: bigint;
+    kaNumber: number;
+    nodes: Awaited<ReturnType<typeof standUpNodes>>;
+    opId: string;
+  }) => {
+    await Token.mint(args.victim.address, args.tokenAmount);
+    await Token.connect(args.victim).approve(
+      await KAV10.getAddress(),
+      args.tokenAmount,
+    );
+    const reservedKaId = packReservedKaId(args.victim.address, args.kaNumber);
+    const p = await buildPublishParams({
+      chainId: DEFAULT_CHAIN_ID,
+      kav10Address: await KAV10.getAddress(),
+      receivingNodes: args.nodes.receivingNodes,
+      publisherIdentityId: args.nodes.publisherIdentityId,
+      receiverIdentityIds: args.nodes.receiverIdentityIds,
+      author: args.victim,
+      contextGraphId: args.cgId,
+      merkleRoot: ethers.keccak256(ethers.toUtf8Bytes(args.opId)),
+      knowledgeAssetsAmount: 1,
+      byteSize: 1000,
+      epochs: args.epochs,
+      tokenAmount: args.tokenAmount,
+      isImmutable: false,
+      publishOperationId: args.opId,
+      reservedKaId,
+    });
+    await (await KAV10.connect(args.victim).publish(p)).wait();
+    return reservedKaId;
+  };
+
+  // --------------------------------------------------------------------------
+  // publish() fall-through under an underfunded squatted PCA
+  // --------------------------------------------------------------------------
+  it('publish: attacker-registered underfunded PCA no longer bricks the victim (falls through to direct spend)', async () => {
+    const nodes = await standUpNodes();
+    const attacker = accounts[8];
+    const victim = getDefaultKCCreator(accounts); // accounts[9]
+
+    const { accountId, lockDurationEpochs } = await attackerSquats(
+      attacker,
+      victim,
+    );
+    const cgId = await openContextGraphFor(victim);
+
+    // epochs == lockDurationEpochs ⇒ conviction gate ACTIVE ⇒ the publish MUST
+    // enter coverPublishingCost and rely on the fall-through (not skip the gate).
     const tokenAmount = ethers.parseEther('1000');
     await Token.mint(victim.address, tokenAmount);
     await Token.connect(victim).approve(await KAV10.getAddress(), tokenAmount);
 
-    const currentEpoch = await Chronos.getCurrentEpoch();
-    const merkleRoot = ethers.keccak256(ethers.toUtf8Bytes('pca-dos-regression'));
     const reservedKaId = packReservedKaId(victim.address, 1);
     const p = await buildPublishParams({
       chainId: DEFAULT_CHAIN_ID,
       kav10Address: await KAV10.getAddress(),
-      receivingNodes,
-      publisherIdentityId,
-      receiverIdentityIds,
+      receivingNodes: nodes.receivingNodes,
+      publisherIdentityId: nodes.publisherIdentityId,
+      receiverIdentityIds: nodes.receiverIdentityIds,
       author: victim,
       contextGraphId: cgId,
-      merkleRoot,
+      merkleRoot: ethers.keccak256(ethers.toUtf8Bytes('pca-dos-publish')),
       knowledgeAssetsAmount: 1,
       byteSize: 1000,
       epochs: lockDurationEpochs,
       tokenAmount,
       isImmutable: false,
-      publishOperationId: 'pca-dos-op',
+      publishOperationId: 'pca-dos-publish-op',
       reservedKaId,
     });
 
-    const victimBalBefore = await Token.balanceOf(victim.address);
+    const balBefore = await Token.balanceOf(victim.address);
+    const tx = await KAV10.connect(victim).publish(p); // pre-fix: reverts
+    expect((await tx.wait())!.status).to.equal(1);
 
-    // Pre-fix this reverted InsufficientAllowance and minted no KC.
-    const tx = await KAV10.connect(victim).publish(p);
-    const receipt = await tx.wait();
-    expect(receipt!.status).to.equal(1);
-
-    // Proof it took the DIRECT-spend fall-through, not the discount branch:
-    // the victim's own TRAC funded the staker pool (conviction branch would
-    // have drawn from the PCA escrow and left the victim's balance intact —
-    // and could not have succeeded anyway since the PCA holds 1 wei).
-    const epochStorageAddr = (
-      await EpochStorageContract.getAddress()
-    ).toLowerCase();
-    const activeSinkSum = sumActiveSink(receipt!.logs, epochStorageAddr);
-    const victimSpent = victimBalBefore - (await Token.balanceOf(victim.address));
-
-    expect(victimSpent).to.equal(tokenAmount);
-    // Net-of-treasury distribution funded the pool; it can be ≤ tokenAmount but
-    // must be non-zero and cannot exceed what the victim actually paid.
-    expect(activeSinkSum).to.be.greaterThan(0n);
-    expect(activeSinkSum).to.be.lessThanOrEqual(tokenAmount);
-
-    // KC actually minted to the victim/author.
+    // Direct-spend proof: the victim's OWN TRAC funded the publish (a discount
+    // branch would have drawn from the PCA escrow — and couldn't succeed on a
+    // 1-wei account anyway).
+    expect(balBefore - (await Token.balanceOf(victim.address))).to.equal(
+      tokenAmount,
+    );
     expect(await DKGKnowledgeAssets.ownerOf(reservedKaId)).to.equal(
       victim.address,
     );
-    const meta = await DKGKnowledgeAssets.getKnowledgeAssetMetadata(reservedKaId);
-    expect(meta[6]).to.equal(tokenAmount);
-
-    // The malicious association is still present (consent-free registration is
-    // not retroactively removed) but it is now harmless — the victim published.
-    expect(await NFT.agentToAccountId(victim.address)).to.equal(
-      attackerAccountId,
-    );
+    // Squat survives (consent-free registration is not auto-removed) but is now
+    // harmless — the victim published.
+    expect(await NFT.agentToAccountId(victim.address)).to.equal(accountId);
   });
 
-  it('unexpected (non-payment) reverts from the conviction branch still propagate', async () => {
-    // Sanity guard for the selector filter: a victim with NO TRAC and NO
-    // approval who falls through to direct spend must still revert
-    // (TooLowAllowance / TooLowBalance) rather than silently succeeding — the
-    // fall-through is not a free pass, it just removes the PCA-side brick.
-    const publishingNode = getDefaultPublishingNode(accounts);
-    const receivingNodes = getDefaultReceivingNodes(accounts);
-    const { identityId: publisherIdentityId } = await createProfile(
-      ProfileContract,
-      publishingNode,
-    );
-    const receiverProfiles = await createProfiles(ProfileContract, receivingNodes);
-    const receiverIdentityIds = receiverProfiles.map((p) => p.identityId);
-
-    await stakeV10(publishingNode.operational, publisherIdentityId, MIN_STAKE);
-    for (let i = 0; i < receivingNodes.length; i++) {
-      await stakeV10(
-        receivingNodes[i].operational,
-        receiverProfiles[i].identityId,
-        MIN_STAKE,
-      );
-    }
-
+  // --------------------------------------------------------------------------
+  // update() fall-through under an underfunded squatted PCA
+  // --------------------------------------------------------------------------
+  //
+  // The update gate has NO epoch-match escape (`remainingEpochs <=
+  // lockDurationEpochs`), so EVERY paid update on a squatted address routed
+  // into coverPublishingCost pre-fix. This pins the update() branch.
+  it('update: attacker-registered underfunded PCA no longer bricks a paid victim update', async () => {
+    const nodes = await standUpNodes();
     const attacker = accounts[8];
     const victim = getDefaultKCCreator(accounts);
+
+    const cgId = await openContextGraphFor(victim);
+    const initialTokenAmount = ethers.parseEther('1000');
+
+    // Create the attacker's 1-wei PCA but DON'T register the victim yet, so the
+    // victim's initial publish is an ordinary direct spend. We read the global
+    // lock duration off this account so the publish/update epoch counts keep
+    // the conviction gate active once the victim IS registered.
     await Token.mint(attacker.address, 1n);
     await Token.connect(attacker).approve(await NFT.getAddress(), 1n);
     await NFT.connect(attacker).createAccount(1n);
     const attackerAccountId = await NFT.totalSupply();
-    await NFT.connect(attacker).registerAgent(attackerAccountId, victim.address);
-    const lockDurationEpochs = Number((await NFT.accounts(attackerAccountId))[5]);
+    const lockEpochs = Number((await NFT.accounts(attackerAccountId))[5]);
 
-    await CGFacade.connect(victim).createContextGraph(
-      [],
-      0,
-      0,
-      1,
-      ethers.ZeroAddress,
-      0,
-      ethers.ZeroHash,
+    const kaId = await victimPublish({
+      victim,
+      cgId,
+      epochs: lockEpochs,
+      tokenAmount: initialTokenAmount,
+      kaNumber: 5,
+      nodes,
+      opId: 'pca-dos-update-base',
+    });
+
+    // Now spring the trap: register the victim against the 1-wei PCA.
+    await NFT.connect(attacker).registerAgent(attackerAccountId, victim.address);
+    expect(await NFT.agentToAccountId(victim.address)).to.equal(
+      attackerAccountId,
     );
-    const cgId = await CGS.getLatestContextGraphId();
+
+    // A paid update (grow tokenAmount). remainingEpochs == lockEpochs ⇒ gate
+    // ACTIVE ⇒ enters coverPublishingCost and relies on the fall-through.
+    const delta = ethers.parseEther('250');
+    const newTokenAmount = initialTokenAmount + delta;
+    await Token.mint(victim.address, delta);
+    await Token.connect(victim).approve(await KAV10.getAddress(), delta);
+
+    const up = await buildUpdateParams({
+      chainId: DEFAULT_CHAIN_ID,
+      kav10Address: await KAV10.getAddress(),
+      receivingNodes: nodes.receivingNodes,
+      publisherIdentityId: nodes.publisherIdentityId,
+      receiverIdentityIds: nodes.receiverIdentityIds,
+      contextGraphId: cgId,
+      id: kaId,
+      preUpdateMerkleRootCount: 1n,
+      newMerkleRoot: ethers.keccak256(ethers.toUtf8Bytes('pca-dos-update-new')),
+      newByteSize: 1000n,
+      newTokenAmount,
+      mintKnowledgeAssetsAmount: 0n,
+      knowledgeAssetsToBurn: [],
+      updateOperationId: 'pca-dos-update-op',
+      author: victim,
+    });
+
+    const balBefore = await Token.balanceOf(victim.address);
+    const tx = await KAV10.connect(victim).update(up); // pre-fix: reverts
+    expect((await tx.wait())!.status).to.equal(1);
+
+    // The delta was paid from the victim's OWN TRAC (direct-spend fall-through).
+    expect(balBefore - (await Token.balanceOf(victim.address))).to.equal(delta);
+    const meta = await DKGKnowledgeAssets.getKnowledgeAssetMetadata(kaId);
+    expect(meta[6]).to.equal(newTokenAmount);
+  });
+
+  // --------------------------------------------------------------------------
+  // expired squatted PCA: publish still falls through (gate-level)
+  // --------------------------------------------------------------------------
+  //
+  // The `AccountExpired` catch arm in `_coverViaConvictionOrFallThrough` is
+  // defensive: the gate already drops the conviction branch once
+  // `block.timestamp >= expiresAtTimestamp` (the SAME field
+  // `coverPublishingCost` checks), so an expired squat falls through BEFORE
+  // the external call. This test pins that partner protection — an expired
+  // squatted registration must not brick the victim either.
+  it('publish: expired squatted PCA falls through at the gate (expiry can never brick the victim)', async () => {
+    const nodes = await standUpNodes();
+    const attacker = accounts[8];
+    const victim = getDefaultKCCreator(accounts);
+
+    const { lockDurationEpochs } = await attackerSquats(attacker, victim);
+    const cgId = await openContextGraphFor(victim);
+
+    // Advance past the PCA's expiry (lockDurationEpochs + 1 to clear the
+    // expiry window plus chain-epoch drift).
+    const epochLength = await Chronos.epochLength();
+    await time.increase(Number(epochLength) * (lockDurationEpochs + 1));
 
     const tokenAmount = ethers.parseEther('1000');
-    // NOTE: victim is intentionally NOT funded / NOT approved here.
-    const merkleRoot = ethers.keccak256(ethers.toUtf8Bytes('pca-dos-nofund'));
-    const reservedKaId = packReservedKaId(victim.address, 1);
+    await Token.mint(victim.address, tokenAmount);
+    await Token.connect(victim).approve(await KAV10.getAddress(), tokenAmount);
+
+    const reservedKaId = packReservedKaId(victim.address, 9);
     const p = await buildPublishParams({
       chainId: DEFAULT_CHAIN_ID,
       kav10Address: await KAV10.getAddress(),
-      receivingNodes,
-      publisherIdentityId,
-      receiverIdentityIds,
+      receivingNodes: nodes.receivingNodes,
+      publisherIdentityId: nodes.publisherIdentityId,
+      receiverIdentityIds: nodes.receiverIdentityIds,
       author: victim,
       contextGraphId: cgId,
-      merkleRoot,
+      merkleRoot: ethers.keccak256(ethers.toUtf8Bytes('pca-dos-expired')),
+      knowledgeAssetsAmount: 1,
+      byteSize: 1000,
+      epochs: lockDurationEpochs,
+      tokenAmount,
+      isImmutable: false,
+      publishOperationId: 'pca-dos-expired-op',
+      reservedKaId,
+    });
+
+    const balBefore = await Token.balanceOf(victim.address);
+    expect((await (await KAV10.connect(victim).publish(p)).wait())!.status).to.equal(
+      1,
+    );
+    expect(balBefore - (await Token.balanceOf(victim.address))).to.equal(
+      tokenAmount,
+    );
+    expect(await DKGKnowledgeAssets.ownerOf(reservedKaId)).to.equal(
+      victim.address,
+    );
+  });
+
+  // --------------------------------------------------------------------------
+  // the fall-through is not a free pass
+  // --------------------------------------------------------------------------
+  it('publish: fall-through still reverts for an unfunded victim (not a free publish)', async () => {
+    const nodes = await standUpNodes();
+    const attacker = accounts[8];
+    const victim = getDefaultKCCreator(accounts);
+
+    const { lockDurationEpochs } = await attackerSquats(attacker, victim);
+    const cgId = await openContextGraphFor(victim);
+
+    const tokenAmount = ethers.parseEther('1000');
+    // Victim intentionally NOT funded / NOT approved.
+    const reservedKaId = packReservedKaId(victim.address, 13);
+    const p = await buildPublishParams({
+      chainId: DEFAULT_CHAIN_ID,
+      kav10Address: await KAV10.getAddress(),
+      receivingNodes: nodes.receivingNodes,
+      publisherIdentityId: nodes.publisherIdentityId,
+      receiverIdentityIds: nodes.receiverIdentityIds,
+      author: victim,
+      contextGraphId: cgId,
+      merkleRoot: ethers.keccak256(ethers.toUtf8Bytes('pca-dos-nofund')),
       knowledgeAssetsAmount: 1,
       byteSize: 1000,
       epochs: lockDurationEpochs,
@@ -376,9 +490,6 @@ describe('@integration V10 PCA — consent-free agent DoS (audit fix)', function
       reservedKaId,
     });
 
-    // Falls through to direct spend, which reverts on the missing allowance —
-    // the publisher pays via direct spend or not at all; it is never bricked
-    // by the PCA, but it also isn't handed a free publish.
     await expect(KAV10.connect(victim).publish(p)).to.be.revertedWithCustomError(
       KAV10,
       'TooLowAllowance',

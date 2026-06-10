@@ -21,6 +21,7 @@ import {INamed} from "./interfaces/INamed.sol";
 import {IVersioned} from "./interfaces/IVersioned.sol";
 import {IInitializable} from "./interfaces/IInitializable.sol";
 import {IDKGPublishingConvictionNFT} from "./interfaces/IDKGPublishingConvictionNFT.sol";
+import {IPublishingConvictionErrors} from "./interfaces/IPublishingConvictionErrors.sol";
 import {ContractStatus} from "./abstract/ContractStatus.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC1271} from "@openzeppelin/contracts/interfaces/IERC1271.sol";
@@ -364,20 +365,6 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
     ///      successful signature check. `bytes4(keccak256("isValidSignature(bytes32,bytes)"))`.
     bytes4 private constant _ERC1271_MAGIC_VALUE = 0x1626ba7e;
 
-    /// @dev Selectors of the PaymentConviction-side errors that mean "this
-    ///      account cannot fund the publish via the discount branch right
-    ///      now". On these (and ONLY these) the publish/update falls through
-    ///      to direct spend instead of bricking — see the version changelog
-    ///      and {_coverViaConvictionOrFallThrough}. Any other revert from
-    ///      `coverPublishingCost` is a genuine fault and bubbles up.
-    ///      Signatures mirror `PublishingConviction`:
-    ///        InsufficientAllowance(uint256 accountId, uint40 epoch, uint96 required, uint96 available)
-    ///        AccountExpired(uint256 accountId, uint40 expiresAtEpoch)
-    bytes4 private constant _PCA_INSUFFICIENT_ALLOWANCE_SELECTOR =
-        bytes4(keccak256("InsufficientAllowance(uint256,uint40,uint96,uint96)"));
-    bytes4 private constant _PCA_ACCOUNT_EXPIRED_SELECTOR =
-        bytes4(keccak256("AccountExpired(uint256,uint40)"));
-
     // --- Update-specific errors (V10 Phase 8 Task 2) ---
 
     /// @dev Update would reduce the KC's `tokenAmount` below its current
@@ -593,9 +580,13 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
                     selector := mload(add(reason, 0x20))
                 }
             }
+            // Selectors come from {IPublishingConvictionErrors} — the SAME
+            // declarations `PublishingConviction` reverts with — so the
+            // compiler keeps the catch side and the revert side in lock-step;
+            // a signature change there breaks this file too.
             if (
-                selector == _PCA_INSUFFICIENT_ALLOWANCE_SELECTOR ||
-                selector == _PCA_ACCOUNT_EXPIRED_SELECTOR
+                selector == IPublishingConvictionErrors.InsufficientAllowance.selector ||
+                selector == IPublishingConvictionErrors.AccountExpired.selector
             ) {
                 // Expected "cannot pay via conviction" — fall through.
                 return false;

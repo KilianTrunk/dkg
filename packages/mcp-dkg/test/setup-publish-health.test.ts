@@ -61,7 +61,7 @@ describe('setup tools — context graph + sub-graph + subscribe', () => {
   // F2: surface the daemon's already-exists signal so callers can
   // distinguish "newly created" from "already existed" without doing
   // an extra dkg_list_context_graphs round-trip. Mirrors
-  // dkg_assertion_create's idempotency surfacing.
+  // dkg_knowledge_asset_create's idempotency surfacing.
   it('first create reports "Created"; second create with same id reports "already exists"', async () => {
     const r1 = await server.call('dkg_context_graph_create', { name: 'My Project' });
     expect(r1.isError).toBeFalsy();
@@ -155,6 +155,19 @@ describe('publish tools — write+publish helper + canonical SWM finalizer', () 
     expect(server.tools.has('dkg_shared_memory_publish')).toBe(true);
   });
 
+  // CONTRACT §0 invariant 2 (parity with PR1's OpenClaw query-tools guard): the
+  // dkg_publish one-shot quad element schema must NOT advertise a per-quad
+  // `graph` — the daemon pins quads to the per-KA WM graph and overrides any
+  // client value. (`.element.shape` is zod's stable object-shape introspection.)
+  it('dkg_publish schema exposes no per-quad graph field (subject/predicate/object only)', () => {
+    const schema = server.get('dkg_publish').config.inputSchema!;
+    const quadShape = (schema.quads as unknown as { element: { shape: Record<string, unknown> } }).element.shape;
+    expect(quadShape).toHaveProperty('subject');
+    expect(quadShape).toHaveProperty('predicate');
+    expect(quadShape).toHaveProperty('object');
+    expect(quadShape).not.toHaveProperty('graph');
+  });
+
   it('documents canonical context graph ids for publish tools', () => {
     for (const name of ['dkg_publish', 'dkg_shared_memory_publish']) {
       const contextGraphId = server.get(name).config.inputSchema?.contextGraphId;
@@ -188,7 +201,13 @@ describe('publish tools — write+publish helper + canonical SWM finalizer', () 
     });
 
     expect(bodies[0].contextGraphId).toBe('0xabc/my-cg');
-    expect(bodies[0].quads[0].graph).toBe(fullDid);
+    // CONTRACT §0 invariant 2 / §1 Stage1 (OpenClaw parity): the create/write
+    // body drops the per-quad `graph` (daemon-pinned) and the unread
+    // `finalize:true`; `promote:true` stays (read as the alsoShareSwm alias).
+    expect(bodies[0].quads[0]).not.toHaveProperty('graph');
+    expect(bodies[0].finalize).toBeUndefined();
+    expect(bodies[0].promote).toBe(true);
+    expect(bodies[0].quads[0]).toEqual({ subject: 'urn:s', predicate: 'urn:p', object: 'urn:o' });
     expect(bodies[1].contextGraphId).toBe('0xabc/my-cg');
   });
 
@@ -343,6 +362,108 @@ describe('publish tools — write+publish helper + canonical SWM finalizer', () 
     expect(result.content[0].text).toMatch(/Failed to register context graph: rpc unreachable/);
   });
 
+  // ── CONTRACT §G — registerIfNeeded on the one-shot dkg_publish ────────────
+  it('dkg_publish runs registerContextGraph first when registerIfNeeded: true', async () => {
+    const localClient = new FakeClient();
+    let registered = false;
+    localClient.registerContextGraph = (async () => {
+      registered = true;
+      return { registered: 'cg', onChainId: 'chain:cg', txHash: '0xreg', alreadyRegistered: false };
+    }) as never;
+    const localServer = new FakeServer();
+    registerPublishTools(localServer.asMcpServer(), localClient.asDkgClient(), makeConfig());
+
+    const result = await localServer.call('dkg_publish', {
+      contextGraphId: 'cg',
+      quads: [{ subject: 'urn:s:1', predicate: 'urn:p:type', object: 'urn:Note' }],
+      registerIfNeeded: true,
+      accessPolicy: 1,
+    });
+    expect(result.isError).toBeFalsy();
+    expect(registered).toBe(true);
+    expect(result.content[0].text).toMatch(/Registered context graph 'cg' on-chain/);
+  });
+
+  it('dkg_publish tolerates an already-registered CG and still publishes (no double-mint claim)', async () => {
+    const localClient = new FakeClient({
+      registerContextGraph: async () => ({ registered: 'cg', alreadyRegistered: true }) as any,
+    });
+    const localServer = new FakeServer();
+    registerPublishTools(localServer.asMcpServer(), localClient.asDkgClient(), makeConfig());
+
+    const result = await localServer.call('dkg_publish', {
+      contextGraphId: 'cg',
+      quads: [{ subject: 'urn:s:1', predicate: 'urn:p:type', object: 'urn:Note' }],
+      registerIfNeeded: true,
+    });
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).not.toMatch(/Registered context graph/);
+  });
+
+  it('dkg_publish surfaces a register HARD failure and does NOT publish', async () => {
+    let published = false;
+    const localClient = new FakeClient({
+      registerContextGraph: async () => { throw new Error('rpc unreachable'); },
+      publishQuads: async () => { published = true; return { kaId: 'kc-x', kas: [] }; },
+    });
+    const localServer = new FakeServer();
+    registerPublishTools(localServer.asMcpServer(), localClient.asDkgClient(), makeConfig());
+
+    const result = await localServer.call('dkg_publish', {
+      contextGraphId: 'cg',
+      quads: [{ subject: 'urn:s:1', predicate: 'urn:p:type', object: 'urn:Note' }],
+      registerIfNeeded: true,
+    });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toMatch(/Failed to register context graph: rpc unreachable/);
+    expect(published).toBe(false); // publish NOT attempted
+  });
+
+  // ── FIX S — accessPolicy requires registerIfNeeded ────────────────────────
+  it('dkg_publish rejects accessPolicy without registerIfNeeded (FIX S)', async () => {
+    const result = await server.call('dkg_publish', {
+      contextGraphId: 'cg',
+      quads: [{ subject: 'urn:s:1', predicate: 'urn:p:type', object: 'urn:Note' }],
+      accessPolicy: 1, // valid 0|1 but no registerIfNeeded
+    });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toMatch(/accessPolicy.*requires.*registerIfNeeded/i);
+  });
+
+  it('dkg_shared_memory_publish rejects accessPolicy without registerIfNeeded (FIX S)', async () => {
+    const result = await server.call('dkg_shared_memory_publish', {
+      contextGraphId: 'cg',
+      accessPolicy: 1,
+    });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toMatch(/accessPolicy.*requires.*registerIfNeeded/i);
+  });
+
+  it('dkg_shared_memory_publish registerIfNeeded description states the auto-register reality (FIX V)', () => {
+    const registerIfNeeded = server.get('dkg_shared_memory_publish').config.inputSchema?.registerIfNeeded;
+    // The CG-wide selection publish AUTO-registers an unregistered CG at gas/TRAC
+    // cost regardless of registerIfNeeded (memory.ts:1928); the flag only sets the
+    // registration's accessPolicy. The description must not imply it gates whether
+    // registration happens.
+    expect(registerIfNeeded?.description).toMatch(/does NOT gate whether registration happens/i);
+    expect(registerIfNeeded?.description).toMatch(/AUTO-register/i);
+    expect(registerIfNeeded?.description).toContain('gas/TRAC');
+  });
+
+  it('FIX X: dkg_publish carries the explicit-register publishPolicy caveat, dkg_shared_memory_publish does NOT', () => {
+    // The explicit-register route uses the daemon's DEFAULT publishPolicy and does
+    // not preserve a stored custom publishPolicy (daemon-side rehydration = dkg#1085).
+    // The caveat belongs on dkg_publish (explicit register) but NOT on the safe
+    // rehydrating auto-register path of dkg_shared_memory_publish.
+    const pubDesc = server.get('dkg_publish').config.inputSchema?.registerIfNeeded?.description as string;
+    expect(pubDesc).toContain('DEFAULT publishPolicy');
+    expect(pubDesc).toContain('OriginTrail/dkg#1085');
+
+    const sharedDesc = server.get('dkg_shared_memory_publish').config.inputSchema?.registerIfNeeded?.description as string;
+    expect(sharedDesc).not.toContain('DEFAULT publishPolicy');
+    expect(sharedDesc).not.toContain('dkg#1085');
+  });
+
   // F3+F13 (qa-review-round-1 F3 + qa-review-round-2 F13): chain
   // provenance echoed on publish responses so callers can verify
   // post-hoc which chain the publish landed on. User explicit:
@@ -357,6 +478,48 @@ describe('publish tools — write+publish helper + canonical SWM finalizer', () 
     });
     expect(result.isError).toBeFalsy();
     expect(result.content[0].text).toMatch(/Chain: base-sepolia/);
+  });
+
+  // ── FIX E — dkg_publish 207 contextGraphError → PARTIAL warning ───────────
+  it('dkg_publish surfaces a 207 partial (minted on-chain, CG bind failed) as a WARNING', async () => {
+    const localClient = new FakeClient({
+      publishQuads: async () => ({
+        kaId: 'kc-z',
+        ual: 'did:dkg:1/0xauthor/9',
+        status: 'confirmed',
+        contextGraphError: 'context-graph binding timed out',
+      }),
+    });
+    const localServer = new FakeServer();
+    registerPublishTools(localServer.asMcpServer(), localClient.asDkgClient(), makeConfig());
+
+    const result = await localServer.call('dkg_publish', {
+      contextGraphId: 'cg',
+      quads: [{ subject: 'urn:s:1', predicate: 'urn:p:type', object: 'urn:Note' }],
+    });
+    expect(result.content[0].text).toMatch(/PARTIAL/);
+    expect(result.content[0].text).toContain('context-graph binding timed out');
+    expect(result.content[0].text).toContain('kc-z');                 // kaId kept
+    expect(result.content[0].text).toContain('did:dkg:1/0xauthor/9'); // UAL kept
+    // FIX I: do NOT advise re-running dkg_publish (mints a duplicate) — surface to operator.
+    expect(result.content[0].text).toMatch(/do not re-run dkg_publish/i);
+    expect(result.content[0].text).toMatch(/operator/i);
+  });
+
+  it('dkg_publish reports plain success on a 200 publish (no contextGraphError)', async () => {
+    const localClient = new FakeClient({
+      publishQuads: async () => ({ kaId: 'kc-ok', ual: 'did:dkg:1/0xauthor/10', kas: [], txHash: '0xok' }),
+    });
+    const localServer = new FakeServer();
+    registerPublishTools(localServer.asMcpServer(), localClient.asDkgClient(), makeConfig());
+
+    const result = await localServer.call('dkg_publish', {
+      contextGraphId: 'cg',
+      quads: [{ subject: 'urn:s:1', predicate: 'urn:p:type', object: 'urn:Note' }],
+    });
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toMatch(/Published 1 quad/);
+    expect(result.content[0].text).not.toMatch(/PARTIAL/);
   });
 
   it('F3+F13: dkg_shared_memory_publish success summary echoes the configured chainId', async () => {

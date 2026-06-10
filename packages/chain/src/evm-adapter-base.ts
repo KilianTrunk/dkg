@@ -1234,6 +1234,13 @@ export class EVMChainAdapterBase {
    *      reconciling from empty logs.
    */
   async getMaxKaNumberForAuthor(author: string): Promise<bigint> {
+    // Re-resolve contract handles first. The Hub-rotation listener flips
+    // `initialized` to false but leaves the old bindings in place, so without
+    // this a long-lived adapter keeps querying the PRE-rotation
+    // DKGKnowledgeAssets after the 10.0.4 redeploy this getter exists for.
+    // Mirrors every other contract-reading method (e.g.
+    // getKnowledgeAssetsLifecycleAddress).
+    await this.init();
     const storage = this.contracts.knowledgeAssetStorage;
     if (!storage) {
       throw new Error('DKGKnowledgeAssets not deployed on this chain.');

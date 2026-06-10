@@ -47,6 +47,11 @@ function makeAdapter(storage: any, head = 0) {
   const a = new EVMChainAdapter(minimalConfig());
   storage.target ??= '0x2222222222222222222222222222222222222222';
   (a as any).contracts = { knowledgeAssetStorage: storage };
+  // getMaxKaNumberForAuthor now `await this.init()`s first (re-resolve handles
+  // on Hub rotation). Mark initialized so init() short-circuits and the injected
+  // mock handle is used; the post-rotation test below exercises the
+  // initialized=false re-resolution path explicitly.
+  (a as any).initialized = true;
   (a as any).provider = {
     getBlockNumber: vi.fn(async () => head),
     getCode: vi.fn(async () => '0x6000'),
@@ -187,6 +192,40 @@ describe('EVMChainAdapter.getMaxKaNumberForAuthor — view + bounded fallback (#
       makeAdapter(storage, 100).getMaxKaNumberForAuthor(AUTHOR),
     ).rejects.toThrow('Paused');
     expect(queryFilter).not.toHaveBeenCalled();
+  });
+
+  it('re-resolves the DKGKnowledgeAssets handle after a Hub rotation rather than querying the stale pre-rotation contract (#1082 review)', async () => {
+    // Long-lived adapter after the 10.0.4 redeploy: the rotation listener has
+    // set `initialized = false` but the cached binding still points at the OLD
+    // contract. The getter must `await this.init()` to re-resolve before
+    // reading, or it answers from the pre-rotation DKGKnowledgeAssets.
+    const mkStorage = (n: bigint) => ({
+      getMaxKaNumberForAuthor: viewMock(async () => n),
+      filters: { KnowledgeAssetCreated: vi.fn(() => 'F') },
+      queryFilter: vi.fn(),
+      target: '0x2222222222222222222222222222222222222222',
+    });
+    const stale = mkStorage(99n);
+    const fresh = mkStorage(7n);
+
+    const a = new EVMChainAdapter(minimalConfig());
+    (a as any).contracts = { knowledgeAssetStorage: stale };
+    (a as any).initialized = false; // post-rotation: handles need re-resolving
+    (a as any).provider = {
+      getBlockNumber: vi.fn(async () => 0),
+      getCode: vi.fn(async () => '0x6000'),
+    };
+    // What the real init() does on a re-init: swap in the fresh binding.
+    const init = vi.fn(async () => {
+      (a as any).contracts.knowledgeAssetStorage = fresh;
+      (a as any).initialized = true;
+    });
+    (a as any).init = init;
+
+    expect(await a.getMaxKaNumberForAuthor(AUTHOR)).toBe(7n); // FRESH, not stale 99n
+    expect(init).toHaveBeenCalledTimes(1);
+    expect(fresh.getMaxKaNumberForAuthor.staticCall).toHaveBeenCalledTimes(1);
+    expect(stale.getMaxKaNumberForAuthor.staticCall).not.toHaveBeenCalled();
   });
 
   it('rethrows malformed BAD_DATA instead of treating every decode failure as an absent view', async () => {

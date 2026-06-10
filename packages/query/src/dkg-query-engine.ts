@@ -54,6 +54,8 @@ export function resolveViewGraphs(
   contextGraphId: string,
   opts?: {
     agentAddress?: string;
+    /** Same-identity WM namespace aliases — see QueryOptions.agentAddressAliases. */
+    agentAddressAliases?: string[];
     verifiedGraph?: string;
     assertionName?: string;
     /** Resolved KA number for single-graph by-name reads under the uniform layout. */
@@ -85,9 +87,23 @@ export function resolveViewGraphs(
           graphPrefixes: [],
         };
       }
+      // PR #1107 review (🟡): span the primary address AND every
+      // same-identity alias so a node default agent's legacy peerId-keyed
+      // drafts and rc.17+ wallet-keyed drafts are both visible from one
+      // unscoped WM read. Dedupe case-insensitively — graph URIs embed the
+      // address verbatim, so the prefix must use the caller's original form.
+      const seen = new Set<string>([opts.agentAddress.toLowerCase()]);
+      const addresses = [opts.agentAddress];
+      for (const alias of opts.agentAddressAliases ?? []) {
+        if (!alias || seen.has(alias.toLowerCase())) continue;
+        seen.add(alias.toLowerCase());
+        addresses.push(alias);
+      }
       return {
         graphs: [],
-        graphPrefixes: [`did:dkg:context-graph:${contextGraphId}/_working_memory/${opts.agentAddress}/`],
+        graphPrefixes: addresses.map(
+          (addr) => `did:dkg:context-graph:${contextGraphId}/_working_memory/${addr}/`,
+        ),
       };
     }
     case 'shared-working-memory':
@@ -417,6 +433,7 @@ export class DKGQueryEngine implements QueryEngine {
 
     const resolution = resolveViewGraphs(view, contextGraphId, {
       agentAddress: options.agentAddress,
+      agentAddressAliases: options.agentAddressAliases,
       verifiedGraph: options.verifiedGraph,
       assertionName: options.assertionName,
       kaNumber,

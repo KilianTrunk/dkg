@@ -66,33 +66,46 @@ export class ConvictionMethods extends EVMChainAdapterBase {
   }
 
   /**
-   * Currently-spendable allowance (current-window base remaining + top-up
-   * buffer) for `accountId`, in TRAC wei. `0n` once the account is expired,
-   * has exhausted this window with no buffer, or was never meaningfully
-   * funded.
+   * Whether the PCA `accountId` can cover the DISCOUNTED cost of a publish
+   * whose undiscounted (base) cost is `baseCost`, right now.
    *
-   * Mirrors the exact quantity `PublishingConviction.coverPublishingCost`
-   * checks before reverting `InsufficientAllowance`
-   * (`getRemainingAllowance` already folds in the top-up buffer and returns
-   * 0 outside the account's active lifetime). The publisher SDK uses this to
-   * gate the `publishEpochs → lockDurationEpochs` coercion: a registered
-   * agent on an UNFUNDABLE account (e.g. a third party squatted this signer
-   * against a 1-wei PCA — agent registration is consent-free, RFC-001 §3.6)
-   * would otherwise snap the lifetime to the PCA lock and, post the
-   * conviction fall-through fix, direct-spend at that lifetime/full price
-   * instead of the caller's intended default. Gating on `> 0n` keeps the
-   * discount path for genuinely funded accounts while leaving everyone else
-   * at their requested lifetime.
+   * Mirrors `PublishingConviction.coverPublishingCost` exactly so the SDK's
+   * pre-flight matches the on-chain decision: apply the account's discount
+   * tier (`discountedCost = baseCost * (BPS_DENOMINATOR - discountBps) /
+   * BPS_DENOMINATOR`, with the contract's post-discount 1-wei floor), then
+   * compare against `getRemainingAllowance(accountId, currentEpoch)` — which
+   * already folds in the top-up buffer and returns 0 once the account is
+   * expired or has exhausted the current window.
    *
-   * Returns `0n` when the NFT is not deployed, the id is non-positive, or
-   * the chain call reverts — callers treat the unknown case as "cannot
-   * fund", which fails safe to "do not coerce".
+   * The publisher SDK gates the `publishEpochs → lockDurationEpochs`
+   * coercion on this: agent registration is consent-free (RFC-001 §3.6) and
+   * the contract's conviction branch now falls through to direct spend
+   * instead of reverting, so coercing an account that can't actually fund
+   * THIS publish would direct-spend at the PCA-lock lifetime AND full price
+   * instead of the caller's default. A coarse "balance > 0" check is not
+   * enough — a nonzero-but-insufficient account (or a squat funded with a
+   * few wei so its base allowance rounds up to ≥1) would still slip through;
+   * gating on real coverage of the pending cost closes that.
+   *
+   * Returns `false` when the NFT is not deployed, the id is non-positive,
+   * the account is missing, or the chain call reverts — callers treat the
+   * unknown case as "cannot fund", which fails safe to "do not coerce".
+   * `baseCost <= 0` is treated as trivially coverable.
    */
-  async getConvictionAccountSpendableAllowance(accountId: bigint): Promise<bigint> {
+  async convictionAccountCanCover(accountId: bigint, baseCost: bigint): Promise<boolean> {
     await this.init();
-    if (!this.contracts.dkgPublishingConvictionNFT) return 0n;
-    if (accountId <= 0n) return 0n;
+    if (!this.contracts.dkgPublishingConvictionNFT) return false;
+    if (accountId <= 0n) return false;
+    if (baseCost <= 0n) return true;
     try {
+      const info = await this.getPublishingConvictionAccountInfo(accountId);
+      if (!info) return false;
+      // Mirror PublishingConviction's discount math + post-discount floor.
+      const BPS_DENOMINATOR = 10_000n;
+      const discountBps = BigInt(info.discountBps);
+      let discountedCost = (baseCost * (BPS_DENOMINATOR - discountBps)) / BPS_DENOMINATOR;
+      if (discountedCost === 0n && baseCost > 0n) discountedCost = 1n;
+
       if (!this.contracts.chronos) {
         this.contracts.chronos = await this.resolveContract('Chronos');
       }
@@ -101,9 +114,9 @@ export class ConvictionMethods extends EVMChainAdapterBase {
         accountId,
         currentEpoch,
       );
-      return BigInt(remaining);
+      return BigInt(remaining) >= discountedCost;
     } catch (err: any) {
-      if (err?.code === 'CALL_EXCEPTION') return 0n;
+      if (err?.code === 'CALL_EXCEPTION') return false;
       throw err;
     }
   }

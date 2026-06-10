@@ -991,7 +991,7 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
     // the contract's conviction branch now falls through to direct spend
     // (instead of reverting), an unconditional coercion would publish at the
     // PCA-lock lifetime AND full price. The SDK must instead detect the
-    // account can't fund a discount (spendable allowance 0) and keep the
+    // account can't cover this publish's discounted cost and keep the
     // caller's requested/default lifetime.
     const wallet = new ethers.Wallet(TEST_KEY);
     const chain = new EpochCapturingChain(wallet);
@@ -999,7 +999,7 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
     // 1-wei commit → baseEpochAllowance = 1 / lockDurationEpochs = 0 → unfundable.
     const { accountId } = await chain.createPublishingConvictionAccount(1n);
     await chain.registerPublishingConvictionAgent(accountId, wallet.address);
-    expect(await chain.getConvictionAccountSpendableAllowance(accountId)).toBe(0n);
+    expect(await chain.convictionAccountCanCover(accountId, 1n)).toBe(false);
 
     const publisher = await makeEpochPublisher(chain, wallet);
     const ack: AckEpochCapture = {};
@@ -1016,6 +1016,39 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
     expect(ack.tokenAmount).toBe(BigInt(DEFAULT_PUBLISH_EPOCHS));
     expect(chain.capturedCreateParams?.epochs).toBe(DEFAULT_PUBLISH_EPOCHS);
     expect(chain.capturedCreateParams?.tokenAmount).toBe(BigInt(DEFAULT_PUBLISH_EPOCHS));
+  });
+
+  it('does NOT coerce when a nonzero-but-insufficient PCA cannot cover this publish (Codex follow-up)', async () => {
+    // The earlier `spendable > 0` gate let a partially-funded (or few-wei
+    // squat) account slip through: it would coerce to the lock lifetime and
+    // then fall through to full-price direct spend anyway. The cost-aware
+    // gate must reject an account whose remaining allowance is > 0 but
+    // smaller than THIS publish's discounted cost.
+    const wallet = new ethers.Wallet(TEST_KEY);
+    const chain = new EpochCapturingChain(wallet);
+    chain.pcaLockDurationEpochs = 24;
+    // committedTRAC = 24 wei → baseEpochAllowance = 24/24 = 1 wei (nonzero!),
+    // discountBps = 0 (below the lowest tier) → can cover a 1-wei cost but
+    // nothing larger. The real publish costs far more than 1 wei.
+    const { accountId } = await chain.createPublishingConvictionAccount(24n);
+    await chain.registerPublishingConvictionAgent(accountId, wallet.address);
+    // Nonzero floor, but cannot cover a realistic publish cost.
+    expect(await chain.convictionAccountCanCover(accountId, 1n)).toBe(true);
+    expect(await chain.convictionAccountCanCover(accountId, ethers.parseEther('1'))).toBe(false);
+
+    const publisher = await makeEpochPublisher(chain, wallet);
+    const ack: AckEpochCapture = {};
+
+    const result = await publisher.publish({
+      contextGraphId: '1',
+      quads: epochTestQuads('pca-underfunded-no-coercion'),
+      v10ACKProvider: captureACKInputs(ack),
+    });
+
+    expect(result.status).toBe('confirmed');
+    // Cost at lock lifetime (24) exceeds the 1-wei allowance → no coercion.
+    expect(ack.epochs).toBe(DEFAULT_PUBLISH_EPOCHS);
+    expect(chain.capturedCreateParams?.epochs).toBe(DEFAULT_PUBLISH_EPOCHS);
   });
 
   it('initializes V10 readiness before resolving adapter-backed signer addresses', async () => {

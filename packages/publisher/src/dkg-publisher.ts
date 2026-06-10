@@ -1990,6 +1990,13 @@ export class DKGPublisher implements Publisher {
     // `lockDurationEpochs` when one is found AND the caller did not
     // explicitly override the publish lifetime. Wallets without a PCA
     // (direct-spend branch) use the ordinary default lifetime.
+    // LU-5: pricing follows the byteSize that gets signed into the V10
+    // digest. For curated (encrypted-inline) publishes that's the
+    // ciphertext byte count; for public publishes it stays as plaintext
+    // bytes. Single source of truth so ACK pricing == chain tx pricing.
+    // Resolved BEFORE the PCA coercion below so the fundability probe can
+    // price the prospective lock-lifetime publish.
+    const effectiveByteSize = useEncryptedInline ? stagingByteSize : publicByteSize;
     let publishEpochs = explicitPublishEpochs ?? DEFAULT_PUBLISH_EPOCHS;
     if (
       explicitPublishEpochs === undefined &&
@@ -2001,36 +2008,48 @@ export class DKGPublisher implements Publisher {
       try {
         const accountId = await this.chain.getConvictionAgentAccountId(publisherSigner.address);
         if (accountId > 0n) {
-          // Only snap the lifetime to the PCA lock if the account can
-          // actually fund a discounted publish right now. Agent
-          // registration is consent-free (RFC-001 §3.6), so a third party
-          // can squat this signer against a deliberately-underfunded PCA;
-          // since the contract's conviction branch now falls through to
-          // direct spend instead of reverting, an unconditional coercion
-          // would publish at the PCA-lock lifetime AND full price rather
-          // than the caller's intended default. Gating on spendable
-          // allowance keeps the discount path for genuinely funded accounts
-          // while leaving squatted/exhausted/expired ones at the requested
-          // lifetime. Adapters without the probe keep the legacy coercion.
-          let canFundDiscount = true;
-          if (typeof this.chain.getConvictionAccountSpendableAllowance === 'function') {
-            const spendable = await this.chain.getConvictionAccountSpendableAllowance(accountId);
-            canFundDiscount = spendable > 0n;
-          }
-          if (canFundDiscount) {
-            const lockEpochs = await this.chain.getConvictionAccountLockDurationEpochs(accountId);
-            if (lockEpochs > 0) {
+          const lockEpochs = await this.chain.getConvictionAccountLockDurationEpochs(accountId);
+          if (lockEpochs > 0) {
+            // Only snap the lifetime to the PCA lock if the account can
+            // actually cover THIS publish's discounted cost right now. Agent
+            // registration is consent-free (RFC-001 §3.6), so a third party
+            // can squat this signer against an underfunded PCA; since the
+            // contract's conviction branch now falls through to direct spend
+            // instead of reverting, coercing an unfundable account would
+            // publish at the PCA-lock lifetime AND full price rather than the
+            // caller's default. Price the prospective lock-lifetime publish
+            // (the exact base cost the coerced tx would carry) and ask the
+            // chain whether the PCA covers its discounted cost — a coarse
+            // "balance > 0" gate is not enough, since a nonzero-but-short
+            // account (or a few-wei squat) would still be coerced and then
+            // fall through to full-price direct spend. Adapters without the
+            // probe keep the legacy unconditional coercion.
+            let canFundDiscount = true;
+            if (typeof this.chain.convictionAccountCanCover === 'function') {
+              let prospectiveBaseCost = BigInt(lockEpochs);
+              if (typeof this.chain.getRequiredPublishTokenAmount === 'function') {
+                try {
+                  const quoted = await this.chain.getRequiredPublishTokenAmount(effectiveByteSize, lockEpochs);
+                  // Mirror the min-clamp applied to the real tx below.
+                  prospectiveBaseCost = quoted > BigInt(lockEpochs) ? quoted : BigInt(lockEpochs);
+                } catch {
+                  // Keep the conservative per-epoch minimum on a quote hiccup.
+                }
+              }
+              canFundDiscount = await this.chain.convictionAccountCanCover(accountId, prospectiveBaseCost);
+            }
+            if (canFundDiscount) {
               publishEpochs = lockEpochs;
               this.log.info(
                 ctx,
                 `PCA-funded publish detected (signer=${publisherSigner.address}, accountId=${accountId}) — coercing publishEpochs to lockDurationEpochs=${lockEpochs}`,
               );
+            } else {
+              this.log.info(
+                ctx,
+                `Signer ${publisherSigner.address} is a registered PCA agent (accountId=${accountId}) but the account cannot cover this publish's discounted cost — NOT coercing publishEpochs; publishing at requested lifetime=${publishEpochs} via direct spend`,
+              );
             }
-          } else {
-            this.log.info(
-              ctx,
-              `Signer ${publisherSigner.address} is a registered PCA agent (accountId=${accountId}) but the account has no spendable allowance — NOT coercing publishEpochs; publishing at requested lifetime=${publishEpochs} via direct spend`,
-            );
           }
         }
       } catch (err) {
@@ -2049,11 +2068,6 @@ export class DKGPublisher implements Publisher {
         );
       }
     }
-    // LU-5: pricing follows the byteSize that gets signed into the V10
-    // digest. For curated (encrypted-inline) publishes that's the
-    // ciphertext byte count; for public publishes it stays as plaintext
-    // bytes. Single source of truth so ACK pricing == chain tx pricing.
-    const effectiveByteSize = useEncryptedInline ? stagingByteSize : publicByteSize;
     let precomputedTokenAmount = canAttemptOnChainPublish ? BigInt(publishEpochs) : 0n;
     if (canAttemptOnChainPublish && typeof this.chain.getRequiredPublishTokenAmount === 'function') {
       try {

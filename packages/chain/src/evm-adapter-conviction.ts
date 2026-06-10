@@ -70,12 +70,13 @@ export class ConvictionMethods extends EVMChainAdapterBase {
    * whose undiscounted (base) cost is `baseCost`, right now.
    *
    * Mirrors `PublishingConviction.coverPublishingCost` exactly so the SDK's
-   * pre-flight matches the on-chain decision: apply the account's discount
-   * tier (`discountedCost = baseCost * (BPS_DENOMINATOR - discountBps) /
-   * BPS_DENOMINATOR`, with the contract's post-discount 1-wei floor), then
-   * compare against `getRemainingAllowance(accountId, currentEpoch)` — which
-   * already folds in the top-up buffer and returns 0 once the account is
-   * expired or has exhausted the current window.
+   * pre-flight matches the on-chain decision: reject once the account is past
+   * its (TIMESTAMP-based) `expiresAtTimestamp`, then apply the account's
+   * discount tier (`discountedCost = baseCost * (BPS_DENOMINATOR -
+   * discountBps) / BPS_DENOMINATOR`, with the contract's post-discount 1-wei
+   * floor), then compare against `getRemainingAllowance(accountId,
+   * currentEpoch)` — which folds in the top-up buffer and the current-window
+   * spend.
    *
    * The publisher SDK gates the `publishEpochs → lockDurationEpochs`
    * coercion on this: agent registration is consent-free (RFC-001 §3.6) and
@@ -100,6 +101,20 @@ export class ConvictionMethods extends EVMChainAdapterBase {
     try {
       const info = await this.getPublishingConvictionAccountInfo(accountId);
       if (!info) return false;
+
+      // Expiry is TIMESTAMP-based on-chain: `coverPublishingCost` reverts
+      // `AccountExpired` on `block.timestamp >= expiresAtTimestamp`. The
+      // epoch-based `getRemainingAllowance` below still reports allowance
+      // during the tail of the expiry epoch (for mid-epoch-created accounts
+      // `expiresAtEpoch` rounds up past `expiresAtTimestamp`), so check the
+      // wall clock first to mirror the contract exactly — otherwise the SDK
+      // would coerce, then fall through to full-price direct spend.
+      if (info.expiresAtTimestamp > 0) {
+        const latestBlock = await this.provider.getBlock('latest');
+        const nowTs = latestBlock ? Number(latestBlock.timestamp) : Math.floor(Date.now() / 1000);
+        if (nowTs >= info.expiresAtTimestamp) return false;
+      }
+
       // Mirror PublishingConviction's discount math + post-discount floor.
       const BPS_DENOMINATOR = 10_000n;
       const discountBps = BigInt(info.discountBps);

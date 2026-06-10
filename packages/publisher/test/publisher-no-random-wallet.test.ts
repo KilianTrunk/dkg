@@ -1051,6 +1051,40 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
     expect(chain.capturedCreateParams?.epochs).toBe(DEFAULT_PUBLISH_EPOCHS);
   });
 
+  it('does NOT coerce when the publish cannot be priced (unverifiable funding)', async () => {
+    // Codex follow-up: if the prospective publish cost cannot be quoted, the
+    // coverage probe has no real price to check against. Falling back to the
+    // protocol minimum (lockEpochs wei) would let an underfunded/squatted PCA
+    // pass against that lower bound and coerce, then fall through to
+    // full-price direct spend. An unpriceable publish must be treated as
+    // "funding unverifiable" → keep the caller's requested lifetime.
+    const wallet = new ethers.Wallet(TEST_KEY);
+    const chain = new EpochCapturingChain(wallet);
+    chain.pcaLockDurationEpochs = 24;
+    // Fully funded — coercion WOULD fire if the gate fell back to the minimum.
+    const { accountId } = await chain.createPublishingConvictionAccount(ethers.parseEther('10000'));
+    await chain.registerPublishingConvictionAgent(accountId, wallet.address);
+    // Pricing oracle is down for this publish.
+    (chain as unknown as { getRequiredPublishTokenAmount: () => Promise<bigint> }).getRequiredPublishTokenAmount =
+      async () => {
+        throw new Error('pricing oracle unavailable');
+      };
+
+    const publisher = await makeEpochPublisher(chain, wallet);
+    const ack: AckEpochCapture = {};
+
+    const result = await publisher.publish({
+      contextGraphId: '1',
+      quads: epochTestQuads('pca-unpriceable-no-coercion'),
+      v10ACKProvider: captureACKInputs(ack),
+    });
+
+    expect(result.status).toBe('confirmed');
+    // Funded, but unpriceable → no coercion; caller's default lifetime stands.
+    expect(ack.epochs).toBe(DEFAULT_PUBLISH_EPOCHS);
+    expect(chain.capturedCreateParams?.epochs).toBe(DEFAULT_PUBLISH_EPOCHS);
+  });
+
   it('initializes V10 readiness before resolving adapter-backed signer addresses', async () => {
     const keypair = await generateEd25519Keypair();
     const wallet = new ethers.Wallet(TEST_KEY);

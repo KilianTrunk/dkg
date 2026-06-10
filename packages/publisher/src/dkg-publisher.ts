@@ -2026,17 +2026,27 @@ export class DKGPublisher implements Publisher {
             // probe keep the legacy unconditional coercion.
             let canFundDiscount = true;
             if (typeof this.chain.convictionAccountCanCover === 'function') {
-              let prospectiveBaseCost = BigInt(lockEpochs);
-              if (typeof this.chain.getRequiredPublishTokenAmount === 'function') {
+              // The coverage probe is only meaningful against the REAL
+              // publish price. If we cannot price the prospective
+              // lock-lifetime publish — adapter lacks the quote, or the
+              // quote call reverts — treat the publish as "funding
+              // unverifiable" and do NOT coerce. Falling back to the
+              // protocol minimum (`lockEpochs` wei) would let a partial or
+              // squatted PCA pass the probe against that lower bound and
+              // then fall through to full-price direct spend at the wrong
+              // lifetime — the exact regression this gate exists to prevent.
+              if (typeof this.chain.getRequiredPublishTokenAmount !== 'function') {
+                canFundDiscount = false;
+              } else {
                 try {
                   const quoted = await this.chain.getRequiredPublishTokenAmount(effectiveByteSize, lockEpochs);
                   // Mirror the min-clamp applied to the real tx below.
-                  prospectiveBaseCost = quoted > BigInt(lockEpochs) ? quoted : BigInt(lockEpochs);
+                  const prospectiveBaseCost = quoted > BigInt(lockEpochs) ? quoted : BigInt(lockEpochs);
+                  canFundDiscount = await this.chain.convictionAccountCanCover(accountId, prospectiveBaseCost);
                 } catch {
-                  // Keep the conservative per-epoch minimum on a quote hiccup.
+                  canFundDiscount = false;
                 }
               }
-              canFundDiscount = await this.chain.convictionAccountCanCover(accountId, prospectiveBaseCost);
             }
             if (canFundDiscount) {
               publishEpochs = lockEpochs;
@@ -2047,7 +2057,7 @@ export class DKGPublisher implements Publisher {
             } else {
               this.log.info(
                 ctx,
-                `Signer ${publisherSigner.address} is a registered PCA agent (accountId=${accountId}) but the account cannot cover this publish's discounted cost — NOT coercing publishEpochs; publishing at requested lifetime=${publishEpochs} via direct spend`,
+                `Signer ${publisherSigner.address} is a registered PCA agent (accountId=${accountId}) but funding for this publish's discounted cost could not be confirmed — NOT coercing publishEpochs; publishing at requested lifetime=${publishEpochs} via direct spend`,
               );
             }
           }

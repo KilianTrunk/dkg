@@ -985,6 +985,39 @@ describe('DKGPublisher: no random publisher wallet without explicit key', () => 
     expect(chain.capturedCreateParams?.tokenAmount).toBe(5n);
   });
 
+  it('does NOT coerce the lifetime when the signer is registered against an unfundable PCA (consent-free squat)', async () => {
+    // Audit regression: agent registration is consent-free (RFC-001 §3.6),
+    // so a third party can register this signer against a 1-wei PCA. Since
+    // the contract's conviction branch now falls through to direct spend
+    // (instead of reverting), an unconditional coercion would publish at the
+    // PCA-lock lifetime AND full price. The SDK must instead detect the
+    // account can't fund a discount (spendable allowance 0) and keep the
+    // caller's requested/default lifetime.
+    const wallet = new ethers.Wallet(TEST_KEY);
+    const chain = new EpochCapturingChain(wallet);
+    chain.pcaLockDurationEpochs = 24; // would be the coerced lifetime if it fired
+    // 1-wei commit → baseEpochAllowance = 1 / lockDurationEpochs = 0 → unfundable.
+    const { accountId } = await chain.createPublishingConvictionAccount(1n);
+    await chain.registerPublishingConvictionAgent(accountId, wallet.address);
+    expect(await chain.getConvictionAccountSpendableAllowance(accountId)).toBe(0n);
+
+    const publisher = await makeEpochPublisher(chain, wallet);
+    const ack: AckEpochCapture = {};
+
+    const result = await publisher.publish({
+      contextGraphId: '1',
+      quads: epochTestQuads('pca-squat-no-coercion'),
+      v10ACKProvider: captureACKInputs(ack),
+    });
+
+    expect(result.status).toBe('confirmed');
+    // Lifetime stays at the default — NOT snapped to the PCA lock (24).
+    expect(ack.epochs).toBe(DEFAULT_PUBLISH_EPOCHS);
+    expect(ack.tokenAmount).toBe(BigInt(DEFAULT_PUBLISH_EPOCHS));
+    expect(chain.capturedCreateParams?.epochs).toBe(DEFAULT_PUBLISH_EPOCHS);
+    expect(chain.capturedCreateParams?.tokenAmount).toBe(BigInt(DEFAULT_PUBLISH_EPOCHS));
+  });
+
   it('initializes V10 readiness before resolving adapter-backed signer addresses', async () => {
     const keypair = await generateEd25519Keypair();
     const wallet = new ethers.Wallet(TEST_KEY);

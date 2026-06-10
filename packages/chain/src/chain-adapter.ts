@@ -797,6 +797,21 @@ export interface ChainAdapter {
    */
   getConvictionAccountLockDurationEpochs?(accountId: bigint): Promise<number>;
 
+  /**
+   * Currently-spendable allowance (current-window base remaining + top-up
+   * buffer), in TRAC wei, for the PCA `accountId`. `0n` once the account is
+   * expired, has exhausted this window with no buffer, or was never
+   * meaningfully funded.
+   *
+   * The publisher SDK gates the `publishEpochs → lockDurationEpochs`
+   * coercion on this being `> 0n`, so a registered-but-unfundable agent
+   * (e.g. a consent-free squat against a 1-wei PCA) keeps the caller's
+   * requested lifetime instead of snapping to the PCA lock and
+   * direct-spending at that lifetime/full price. Adapters that omit this
+   * method preserve the legacy unconditional coercion.
+   */
+  getConvictionAccountSpendableAllowance?(accountId: bigint): Promise<bigint>;
+
   // ----- V10 Publishing Conviction NFT write+read surface -----
   // Wraps `DKGPublishingConvictionNFT`. Optional; owner-gated writes
   // MUST surface the owner revert (→ 403), never swallow it.

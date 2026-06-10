@@ -656,6 +656,21 @@ export class MockChainAdapter implements ChainAdapter {
   }
 
   /**
+   * Mock parity for the publisher SDK's fundability gate: per-epoch base
+   * allowance (`committedTRAC / lockDurationEpochs`, matching the contract's
+   * integer division — so a 1-wei squat floors to 0) plus the top-up
+   * buffer. The mock doesn't track per-window publish spend, so this is the
+   * account's nominal current capacity, which is all the SDK gate needs to
+   * tell a funded account from a squatted/empty one.
+   */
+  async getConvictionAccountSpendableAllowance(accountId: bigint): Promise<bigint> {
+    const acct = this.convictionAccounts.get(accountId);
+    if (!acct || acct.lockDurationEpochs <= 0) return 0n;
+    const baseEpochAllowance = acct.committedTRAC / BigInt(acct.lockDurationEpochs);
+    return baseEpochAllowance + acct.topUpBuffer;
+  }
+
+  /**
    * Mock owner-lookup for the daemon's curated-CG registration
    * preflight (`local curator == ownerOf(pcaAccountId)`).
    */

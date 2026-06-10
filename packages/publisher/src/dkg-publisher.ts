@@ -2001,12 +2001,35 @@ export class DKGPublisher implements Publisher {
       try {
         const accountId = await this.chain.getConvictionAgentAccountId(publisherSigner.address);
         if (accountId > 0n) {
-          const lockEpochs = await this.chain.getConvictionAccountLockDurationEpochs(accountId);
-          if (lockEpochs > 0) {
-            publishEpochs = lockEpochs;
+          // Only snap the lifetime to the PCA lock if the account can
+          // actually fund a discounted publish right now. Agent
+          // registration is consent-free (RFC-001 §3.6), so a third party
+          // can squat this signer against a deliberately-underfunded PCA;
+          // since the contract's conviction branch now falls through to
+          // direct spend instead of reverting, an unconditional coercion
+          // would publish at the PCA-lock lifetime AND full price rather
+          // than the caller's intended default. Gating on spendable
+          // allowance keeps the discount path for genuinely funded accounts
+          // while leaving squatted/exhausted/expired ones at the requested
+          // lifetime. Adapters without the probe keep the legacy coercion.
+          let canFundDiscount = true;
+          if (typeof this.chain.getConvictionAccountSpendableAllowance === 'function') {
+            const spendable = await this.chain.getConvictionAccountSpendableAllowance(accountId);
+            canFundDiscount = spendable > 0n;
+          }
+          if (canFundDiscount) {
+            const lockEpochs = await this.chain.getConvictionAccountLockDurationEpochs(accountId);
+            if (lockEpochs > 0) {
+              publishEpochs = lockEpochs;
+              this.log.info(
+                ctx,
+                `PCA-funded publish detected (signer=${publisherSigner.address}, accountId=${accountId}) — coercing publishEpochs to lockDurationEpochs=${lockEpochs}`,
+              );
+            }
+          } else {
             this.log.info(
               ctx,
-              `PCA-funded publish detected (signer=${publisherSigner.address}, accountId=${accountId}) — coercing publishEpochs to lockDurationEpochs=${lockEpochs}`,
+              `Signer ${publisherSigner.address} is a registered PCA agent (accountId=${accountId}) but the account has no spendable allowance — NOT coercing publishEpochs; publishing at requested lifetime=${publishEpochs} via direct spend`,
             );
           }
         }

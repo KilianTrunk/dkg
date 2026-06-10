@@ -65,6 +65,49 @@ export class ConvictionMethods extends EVMChainAdapterBase {
     }
   }
 
+  /**
+   * Currently-spendable allowance (current-window base remaining + top-up
+   * buffer) for `accountId`, in TRAC wei. `0n` once the account is expired,
+   * has exhausted this window with no buffer, or was never meaningfully
+   * funded.
+   *
+   * Mirrors the exact quantity `PublishingConviction.coverPublishingCost`
+   * checks before reverting `InsufficientAllowance`
+   * (`getRemainingAllowance` already folds in the top-up buffer and returns
+   * 0 outside the account's active lifetime). The publisher SDK uses this to
+   * gate the `publishEpochs → lockDurationEpochs` coercion: a registered
+   * agent on an UNFUNDABLE account (e.g. a third party squatted this signer
+   * against a 1-wei PCA — agent registration is consent-free, RFC-001 §3.6)
+   * would otherwise snap the lifetime to the PCA lock and, post the
+   * conviction fall-through fix, direct-spend at that lifetime/full price
+   * instead of the caller's intended default. Gating on `> 0n` keeps the
+   * discount path for genuinely funded accounts while leaving everyone else
+   * at their requested lifetime.
+   *
+   * Returns `0n` when the NFT is not deployed, the id is non-positive, or
+   * the chain call reverts — callers treat the unknown case as "cannot
+   * fund", which fails safe to "do not coerce".
+   */
+  async getConvictionAccountSpendableAllowance(accountId: bigint): Promise<bigint> {
+    await this.init();
+    if (!this.contracts.dkgPublishingConvictionNFT) return 0n;
+    if (accountId <= 0n) return 0n;
+    try {
+      if (!this.contracts.chronos) {
+        this.contracts.chronos = await this.resolveContract('Chronos');
+      }
+      const currentEpoch: bigint = BigInt(await this.contracts.chronos.getCurrentEpoch());
+      const remaining: bigint = await this.contracts.dkgPublishingConvictionNFT.getRemainingAllowance(
+        accountId,
+        currentEpoch,
+      );
+      return BigInt(remaining);
+    } catch (err: any) {
+      if (err?.code === 'CALL_EXCEPTION') return 0n;
+      throw err;
+    }
+  }
+
   async getPublishingConvictionAccountOwner(accountId: bigint): Promise<string> {
     await this.init();
     const nft = await this.resolveContract('DKGPublishingConvictionNFT');

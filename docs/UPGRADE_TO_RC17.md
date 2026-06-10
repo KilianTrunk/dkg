@@ -15,7 +15,9 @@ keeps its old data in the *old* layout while writing all new data in the
 
 **Bottom line:** to land rc.17 cleanly you do a **one-time local store wipe**
 when you take the upgrade. The chain is untouched; your wallet/identity and
-on-chain assets are preserved. Only local, re-derivable RDF state is dropped.
+on-chain assets are preserved, and Verifiable Memory re-syncs. **One exception:**
+local Working/Shared Memory you authored but never published is *not*
+re-derivable — if you have any, export it first (**§5**) before you wipe.
 
 > **New operators:** there is nothing to migrate — just install rc.17 fresh
 > (see §4.1) and skip the rest.
@@ -88,11 +90,14 @@ and no layout migration, so the upgrade requires a one-time local store
 wipe to land clean.
 
 Do this, in order:
-1. Confirm the node is affected and record state: run `dkg status` (record
-   `version` + `storeBackend`). A node that auto-updated in place to rc.17 over
-   pre-rc.17 data is affected (see §0); a fresh rc.17 install is not.
+1. Confirm the node is affected and record state:
+   `curl -s :9200/api/status | jq '{version, storeBackend}'` (`dkg status`
+   shows the store but not the version). A node that auto-updated in place to
+   rc.17 over pre-rc.17 data is affected (see §0); a fresh rc.17 install is not.
 2. `dkg stop`.
-3. Update to rc.17 (`dkg update`, or reinstall — see §4).
+3. Update to rc.17, pinned: `dkg update 10.0.0-rc.17` (or
+   `npm install -g @origintrail-official/dkg@10.0.0-rc.17`). A bare `dkg update`
+   is not deterministic — `autoUpdate.allowPrerelease: false` nodes may skip it.
 4. Wipe the LOCAL store for the detected backend (see §4.2). Do NOT touch
    the keystore (wallets.json/agent-key*), auth.token, or config.json.
 5. `dkg start`.
@@ -142,7 +147,7 @@ That's it — a fresh node is already on the new layout.
 **Step 0 — detect your store backend** (the wipe differs per backend):
 
 ```bash
-dkg status | grep -E 'version|storeBackend'   # or: curl -s :9200/api/status | jq '{version,storeBackend}'
+curl -s :9200/api/status | jq '{version, storeBackend}'   # `dkg status` shows the store but not the version
 ```
 
 **Step 1 — stop + update:**
@@ -170,8 +175,9 @@ find "$NODE_DATA_DIR" -maxdepth 1 -name 'publish-journal.*' -delete 2>/dev/null
 
 Then clear the RDF store itself:
 
-- **`oxigraph` (default, embedded):** nothing more to do — the store lived in
-  `store.nq`, already removed above.
+- **`oxigraph-worker` (the default — what `/api/status` reports when there is
+  no `store` block in `config.json`), plus `oxigraph` / `oxigraph-persistent`:**
+  nothing more to do — these persist to `store.nq`, already removed above.
 
 - **`oxigraph-server` (DKG-managed local server):** the data is a local
   RocksDB at `$NODE_DATA_DIR/oxigraph-data`, **not** `store.nq`. With the
@@ -216,14 +222,22 @@ If you have local Working/Shared Memory you authored and have **not**
 published to Verifiable Memory, export it before wiping:
 
 ```bash
-# oxigraph-server (managed) or sparql-http/blazegraph — dump via SPARQL
-# (for sparql-http/blazegraph, swap in your own query endpoint URL):
-curl -s -G http://127.0.0.1:7878/query \
-  --data-urlencode 'query=CONSTRUCT { ?s ?p ?o } WHERE { GRAPH ?g { ?s ?p ?o } }' \
-  -H 'Accept: application/n-quads' > ~/dkg-prewipe-backup.nq
+# IMPORTANT: a SPARQL `CONSTRUCT { ?s ?p ?o }` FLATTENS every named graph into
+# the default graph — it loses the WM/SWM/VM graph URIs and is NOT a usable
+# backup. Use a dataset-level N-Quads export per backend:
 
-# embedded oxigraph — the store IS the file, so just copy it:
+# oxigraph-worker / oxigraph (default, embedded): the store IS already an
+# N-Quads file — just copy it:
 cp "${DKG_HOME:-$HOME/.dkg}/store.nq" ~/dkg-prewipe-backup.nq
+
+# oxigraph-server (managed): dump the whole dataset via the /store endpoint —
+# this preserves graph names (note `/store`, NOT `/query`):
+curl -s 'http://127.0.0.1:7878/store' -H 'Accept: application/n-quads' \
+  > ~/dkg-prewipe-backup.nq
+
+# sparql-http / blazegraph: use the backend's native dataset export — the SPARQL
+# Graph Store Protocol (GET each graph) or the server's dump endpoint. A
+# CONSTRUCT will drop the graph names.
 ```
 
 Anything already in Verifiable Memory does **not** need backing up — it

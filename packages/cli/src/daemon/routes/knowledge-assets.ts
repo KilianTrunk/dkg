@@ -490,6 +490,7 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
       name,
       subGraphName,
       quads,
+      finalize,
       authorAgentAddress,
       preSignedAuthorAttestation,
       schemeVersion,
@@ -530,13 +531,33 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
     if (alsoPublishVm !== undefined && typeof alsoPublishVm !== "boolean" && (typeof alsoPublishVm !== "object" || alsoPublishVm === null || Array.isArray(alsoPublishVm))) {
       return jsonResponse(res, 400, { error: '"alsoPublishVm" must be a boolean or an options object when supplied' });
     }
-    const shouldAutoFinalize = Array.isArray(quads) && quads.length > 0;
-    if (!shouldAutoFinalize && hasFinalizeOnlyCreateFields(parsed)) {
+    // Strict boolean for `finalize` (parity with the also* flags above): a
+    // stray `"false"` string must not silently flip sealing behavior.
+    if (finalize !== undefined && typeof finalize !== "boolean") {
+      return jsonResponse(res, 400, { error: '"finalize" must be a boolean when supplied' });
+    }
+    const alsoPublishVmRequested =
+      alsoPublishVm === true || (typeof alsoPublishVm === "object" && alsoPublishVm !== null);
+    if (finalize === false && (alsoShareSwm === true || alsoPublishVmRequested)) {
       return jsonResponse(res, 400, {
-        error: '"authorAgentAddress", "preSignedAuthorAttestation", and "schemeVersion" require non-empty "quads"',
+        error: '"finalize": false cannot be combined with "alsoShareSwm"/"alsoPublishVm" — sharing/publishing require a sealed assertion',
       });
     }
-    const finalizeOptions = shouldAutoFinalize
+    // Quads are WRITTEN whenever supplied; the draft is also SEALED only when
+    // `finalize` is not explicitly false. Default-true preserves the one-shot
+    // `{ quads, finalize:true }` shape. An explicit `finalize:false` keeps an
+    // editable WM draft that never touches the chain — the only lifecycle
+    // available to local-only / on-chain-unregistered CGs (finalize binds the
+    // author attestation and reserves the on-chain identity, so it requires the
+    // CG to be registered). OT-RFC-43 §10.5.5.
+    const hasQuads = Array.isArray(quads) && quads.length > 0;
+    const shouldFinalize = hasQuads && finalize !== false;
+    if (!shouldFinalize && hasFinalizeOnlyCreateFields(parsed)) {
+      return jsonResponse(res, 400, {
+        error: '"authorAgentAddress", "preSignedAuthorAttestation", and "schemeVersion" require non-empty "quads" with finalize !== false',
+      });
+    }
+    const finalizeOptions = shouldFinalize
       ? resolveFinalizeOptions({ subGraphName, authorAgentAddress, preSignedAuthorAttestation, schemeVersion }, res)
       : {};
     if (finalizeOptions === null) return;
@@ -560,12 +581,15 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
       emitMemoryGraphChanged?.({ contextGraphId: resolvedContextGraphId, layers: ["wm"], subGraphName, operation: "assertion_created", source: "api", counts: { triples: 0 } });
       recordActivityAndNotify(ctx, { contextGraphId: resolvedContextGraphId, kind: "created", actorAgentAddress: resolvedAuthorAgentAddress ?? requestAgentAddress, subGraphName });
 
-      // autoFinalize: when quads are supplied, write + seal in the same call
-      // (OT-RFC-43 §10.5.5). `also*` are opt-in layer transitions on top.
-      if (shouldAutoFinalize) {
+      // Write quads whenever supplied; SEAL only when finalize !== false. An
+      // explicit finalize:false leaves an editable WM draft and never touches
+      // the chain (OT-RFC-43 §10.5.5). `also*` are opt-in transitions on top.
+      if (hasQuads) {
         await agent.assertion.write(resolvedContextGraphId, name, quads, { subGraphName });
         result.written = quads.length;
         emitMemoryGraphChanged?.({ contextGraphId: resolvedContextGraphId, layers: ["wm"], subGraphName, operation: "assertion_written", source: "api", counts: { triples: quads.length } });
+      }
+      if (shouldFinalize) {
         const seal = await agent.assertion.finalize(resolvedContextGraphId, name, finalizeOptions);
         result.merkleRoot = hex(seal.merkleRoot);
         result.status = "wm-sealed";

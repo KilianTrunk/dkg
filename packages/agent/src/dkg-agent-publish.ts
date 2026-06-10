@@ -120,6 +120,7 @@ import {
   // OT-RFC-43 A2 — per-layer pointer + KA-id predicates and stamp helpers.
   KA_ID_PRED, RESERVED_UAL_PRED,
   WM_CURRENT_ASSERTION_PRED, SWM_CURRENT_ASSERTION_PRED, VM_CURRENT_ASSERTION_PRED,
+  generateAssertionPublishedMetadata,
   type CollectedACK, type LiftAuthorityProof, type LiftTransitionType,
   type LiftRequest, type LiftRequestAuthorSeal,
   type WorkspaceAgentRecipient,
@@ -1720,9 +1721,10 @@ export class PublishMethods extends DKGAgentBase {
         throw new Error(
           `assertionFinalize: assertion <${assertionUri}> is already finalized with a ` +
             `different merkleRoot (existing=${ethers.hexlify(existingSeal.merkleRoot)}, ` +
-            `current=${ethers.hexlify(merkleRoot)}). Discard and re-create the assertion if ` +
-            `you intended to change its content; in-place mutation of a finalized assertion ` +
-            `breaks the author signature and is rejected.`,
+            `current=${ethers.hexlify(merkleRoot)}). In-place mutation of a finalized assertion ` +
+            `breaks the author signature and is rejected. To edit already-shared/published ` +
+            `content, start a sanctioned edit loop with POST /api/knowledge-assets/{name}/wm/pull-from ` +
+            `(which re-opens a fresh draft and clears the stale seal), or discard and re-create the assertion.`,
         );
       }
       // Seal exists and matches — return the existing record. The rebuilt digest
@@ -2881,6 +2883,60 @@ export class PublishMethods extends DKGAgentBase {
       }
     }
 
+    // ── #1097 — auto-promote a sealed-but-unstaged assertion ──
+    //
+    // The documented one-shot flow (SKILL.md §4a / dkg_publish) is
+    // `POST /api/knowledge-assets {quads}` → `POST /api/shared-memory/publish
+    // {assertionName}`. The create call seals the draft in WM but does NOT
+    // stage it in SWM, and this publish path reads its payload from SWM — so
+    // following the docs verbatim failed with "No quads in shared memory".
+    // The memory model requires data to pass through SWM on its way to VM,
+    // and the seal already commits to the exact content, so when the sealed
+    // roots are absent from SWM we promote the finalized WM draft here
+    // instead of failing. (No-op when the caller already promoted.)
+    {
+      const promoteCtx = opts?.operationCtx ?? createOperationContext('publishFromSWM');
+      const stagedProbe = await this._loadSelectedSWMQuads(
+        contextGraphId,
+        { rootEntities: seal.rootEntities },
+        opts?.subGraphName,
+      );
+      if (stagedProbe.length === 0) {
+        this.log.info(
+          promoteCtx,
+          `publishFromFinalizedAssertion: sealed assertion "${name}" has no staged SWM copy — auto-promoting the finalized WM draft before publish (#1097)`,
+        );
+        try {
+          const gossipSigner = await this.resolveWorkspaceGossipSigningAgent(contextGraphId);
+          const { promotedCount, gossipMessage } = await this.publisher.assertionPromote(
+            contextGraphId, name, agentAddress,
+            {
+              subGraphName: opts?.subGraphName,
+              publisherPeerId: this.node.peerId.toString(),
+              senderAgentAddress: gossipSigner?.agentAddress,
+            },
+          );
+          if (gossipMessage) {
+            try {
+              await this.publishWorkspaceGossip(contextGraphId, gossipMessage, promoteCtx, gossipSigner);
+            } catch (err: any) {
+              this.log.warn(promoteCtx, `Auto-promote gossip failed (local SWM committed): ${err?.message ?? err}`);
+            }
+          }
+          if (promotedCount > 0) {
+            await this._stampSwmPointer(contextGraphId, name, agentAddress, opts?.subGraphName);
+          }
+        } catch (err: any) {
+          // Leave the original failure mode to surface downstream — the
+          // publish below still throws the actionable SWM-empty error.
+          this.log.warn(
+            promoteCtx,
+            `publishFromFinalizedAssertion: auto-promote of "${name}" failed: ${err?.message ?? err}`,
+          );
+        }
+      }
+    }
+
     // ── OT-RFC-43 A2 (decision 3) — CREATE-VS-UPDATE ROUTING ──
     //
     // BEFORE minting, read the per-layer VM pointer + the stamped kaId off the
@@ -2951,6 +3007,28 @@ export class PublishMethods extends DKGAgentBase {
           precomputedUpdateAttestation: updateAttestation,
         },
       );
+
+      // #1099: the update primitive (`publisher.update`) has no SWM-drain of
+      // its own — only the mint path's `publishFromSharedMemory` cleans SWM
+      // after chain confirmation. Without this, every edit-loop update left
+      // the re-shared SWM copy in place forever (locally AND on every replica
+      // that mirrored the share), so SWM and VM permanently disagreed.
+      if (result.status === 'confirmed') {
+        try {
+          await this.publisher.clearPublishedSwmRoots(
+            contextGraphId,
+            seal.rootEntities,
+            opts?.subGraphName,
+            opts?.operationCtx ?? createOperationContext('publishFromSWM'),
+          );
+        } catch (err) {
+          this.log.warn(
+            opts?.operationCtx ?? createOperationContext('publishFromSWM'),
+            `Failed to clear SWM after confirmed update of <${lifecycleUri}>: ` +
+              (err instanceof Error ? err.message : String(err)),
+          );
+        }
+      }
 
       // Stamp UPDATE provenance + re-stamp VM/WM pointers to the new merkle.
       if (result.status === 'confirmed' || result.status === 'tentative') {
@@ -3089,6 +3167,46 @@ export class PublishMethods extends DKGAgentBase {
         await this.store.insert([
           { subject: lifecycleUri, predicate: STATE_PRED, object: '"published"', graph: metaGraph },
         ]);
+        // #1095: record the `published` lifecycle EVENT, not just the state
+        // flip. The events[] audit trail previously stopped at `promoted`
+        // because this path stamped raw state/layer quads without ever
+        // minting the prov:Activity event entity (the dedicated
+        // published-metadata flip in publishFromSharedMemory never fires
+        // for the named-lifecycle path — its trigger joins on
+        // dkg:rootEntity/dkg:agent rows the lifecycle record doesn't carry).
+        if (result.ual) {
+          try {
+            const publishedMeta = generateAssertionPublishedMetadata({
+              contextGraphId,
+              agentAddress,
+              assertionName: name,
+              subGraphName: opts?.subGraphName,
+              kcUal: result.ual,
+              timestamp: new Date(),
+              merkleHex: newMerkleHexBare,
+            });
+            await this.store.delete(publishedMeta.delete);
+            await this.store.insert(publishedMeta.insert);
+            // #1104: reconcile the KA's dual identity. `dkg:reservedUal`
+            // (chain/author/kaNumber, stamped at finalize) and the published
+            // UAL (chain/contract/tokenId, returned by vm/publish) are both
+            // permanent — but the descriptor previously only ever reported
+            // the reserved one, leaving the published UAL unrecorded.
+            // Stamp it on the lifecycle URN (drop-then-set, so updates
+            // re-point to the latest published UAL).
+            const PUBLISHED_UAL_PRED = 'http://dkg.io/ontology/publishedUal';
+            await this.store.deleteByPattern({ subject: lifecycleUri, predicate: PUBLISHED_UAL_PRED, graph: metaGraph });
+            await this.store.insert([
+              { subject: lifecycleUri, predicate: PUBLISHED_UAL_PRED, object: `"${result.ual}"`, graph: metaGraph },
+            ]);
+          } catch (err) {
+            this.log.warn(
+              opts?.operationCtx ?? createOperationContext('publishFromSWM'),
+              `Failed to record published lifecycle event for <${lifecycleUri}>: ` +
+                (err instanceof Error ? err.message : String(err)),
+            );
+          }
+        }
         // SUBSTRATE-2 — re-point dkg:assertionGraph to the per-KA verifiable-
         // memory graph this publish actually wrote
         // (…/_verifiable_memory/{author}/{number}). promote() left the pointer on

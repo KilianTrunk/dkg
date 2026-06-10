@@ -47,6 +47,7 @@ export {
 } from './workspace-agent-recipients.js';
 export {
   ACKCollector,
+  DEFAULT_REQUIRED_ACKS,
   type ACKCollectorDeps,
   type CollectedACK,
   type ACKCollectionResult,

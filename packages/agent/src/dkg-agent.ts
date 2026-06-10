@@ -115,6 +115,7 @@ import {
   type WorkspaceAgentRecipientResolverInput,
   type WorkspaceSenderKeyEncryptInput,
   type SharedMemoryPublicSnapshotStorageConfig, type WorkspacePublicSnapshotStore,
+  DEFAULT_REQUIRED_ACKS,
 } from '@origintrail-official/dkg-publisher';
 import { ethers } from 'ethers';
 import { join } from 'node:path';
@@ -440,6 +441,13 @@ export interface AssertionHistoryDescriptor extends AssertionDescriptor {
   kaNumber?: string;
   /** did:dkg:<chainId>/<agentAddrLower>/<number> reserved at finalize. */
   reservedUal?: string;
+  /**
+   * #1104 — did:dkg:<chainId>/<kasContract>/<packed kaId> recorded at the
+   * first confirmed vm/publish (re-stamped on updates). This is the on-chain
+   * resolvable UAL; `reservedUal` remains the author-namespace identity
+   * minted at finalize. Both are permanent; this field is the link.
+   */
+  publishedUal?: string;
 }
 
 /**
@@ -1272,6 +1280,32 @@ export class DKGAgent extends DKGAgentBase {
   }
 
   /**
+   * Candidate peer pool for ACK collection (#1093).
+   *
+   * `knownCorePeerIds` is populated from identify-time protocol lists in
+   * `runSyncOnConnect`, but identify races `connection:open` — so the set
+   * routinely contains only a SUBSET of the actually-connected core nodes
+   * (the rest were read before their protocol list was populated and were
+   * never re-classified). The old behaviour returned that subset as soon
+   * as it was non-empty, which permanently capped the ACK pool below
+   * quorum (`pool_below_quorum`) and bricked publishing on core nodes.
+   *
+   * Fix: only trust the confirmed-core subset when it can actually
+   * satisfy the default quorum. Below that, return confirmed cores FIRST
+   * followed by every other connected peer — edge nodes fail fast at
+   * protocol negotiation (no handler registered), so over-asking is
+   * cheap, while under-asking is fatal.
+   */
+  private getACKCandidatePeers(): string[] {
+    const peers = this.node.libp2p.getPeers();
+    const connected = peers.map(p => p.toString()).filter(id => id !== this.peerId);
+    const confirmedCore = connected.filter(id => this.knownCorePeerIds.has(id));
+    if (confirmedCore.length >= DEFAULT_REQUIRED_ACKS) return confirmedCore;
+    const rest = connected.filter(id => !this.knownCorePeerIds.has(id));
+    return [...confirmedCore, ...rest];
+  }
+
+  /**
    * Create a V10 ACK provider callback for the publisher.
    * Uses ACKCollector to broadcast PublishIntent and collect StorageACKs
    * via direct P2P from connected core nodes. The required number of ACKs
@@ -1311,20 +1345,7 @@ export class DKGAgent extends DKGAgentBase {
         }
         return sendResult.response;
       },
-      getConnectedCorePeers: () => {
-        const peers = this.node.libp2p.getPeers();
-        const connected = peers.map(p => p.toString()).filter(id => id !== this.peerId);
-        // Prefer peers confirmed as core nodes (advertise StorageACK protocol).
-        if (this.knownCorePeerIds.size > 0) {
-          const filtered = connected.filter(id => this.knownCorePeerIds.has(id));
-          if (filtered.length > 0) return filtered;
-        }
-        // Fallback: return all connected peers during early startup before
-        // protocol discovery completes. Since only core nodes register the
-        // StorageACK handler, requests to edge nodes fail at protocol
-        // negotiation (fast, no error logs on the remote side).
-        return connected;
-      },
+      getConnectedCorePeers: () => this.getACKCandidatePeers(),
       verifyIdentity: typeof this.chain.verifyACKIdentity === 'function'
         ? async (recoveredAddress: string, claimedIdentityId: bigint) => {
             try {
@@ -1498,15 +1519,7 @@ export class DKGAgent extends DKGAgentBase {
         }
         return sendResult.response;
       },
-      getConnectedCorePeers: () => {
-        const peers = this.node.libp2p.getPeers();
-        const connected = peers.map(p => p.toString()).filter(id => id !== this.peerId);
-        if (this.knownCorePeerIds.size > 0) {
-          const filtered = connected.filter(id => this.knownCorePeerIds.has(id));
-          if (filtered.length > 0) return filtered;
-        }
-        return connected;
-      },
+      getConnectedCorePeers: () => this.getACKCandidatePeers(),
       verifyIdentity: typeof this.chain.verifyACKIdentity === 'function'
         ? async (recoveredAddress: string, claimedIdentityId: bigint) => {
             try {
@@ -1871,7 +1884,7 @@ export class DKGAgent extends DKGAgentBase {
 
         // Query assertion entity (current state + layer + OT-RFC-43 A2 pointers).
         const entityResult = await agent.store.query(
-          `SELECT ?state ?memoryLayer ?assertionGraph ?wm ?swm ?vm ?kaNum ?reservedUal WHERE {
+          `SELECT ?state ?memoryLayer ?assertionGraph ?wm ?swm ?vm ?kaNum ?reservedUal ?publishedUal WHERE {
             GRAPH <${metaGraph}> {
               <${lifecycleUri}> <${DKG_NS}state> ?state .
               OPTIONAL { <${lifecycleUri}> <${DKG_NS}memoryLayer> ?memoryLayer }
@@ -1881,6 +1894,7 @@ export class DKGAgent extends DKGAgentBase {
               OPTIONAL { <${lifecycleUri}> <${VM_CURRENT_ASSERTION_PRED}> ?vm }
               OPTIONAL { <${lifecycleUri}> <${KA_ID_PRED}> ?kaNum }
               OPTIONAL { <${lifecycleUri}> <${RESERVED_UAL_PRED}> ?reservedUal }
+              OPTIONAL { <${lifecycleUri}> <${DKG_NS}publishedUal> ?publishedUal }
             }
           } LIMIT 1`,
         );
@@ -1895,6 +1909,7 @@ export class DKGAgent extends DKGAgentBase {
         const vmCurrentAssertion = strip(row['vm']);
         const kaNumberStr = strip(row['kaNum']);
         const reservedUal = strip(row['reservedUal']);
+        const publishedUal = strip(row['publishedUal']);
 
         // Query all prov:Activity events that acted on this assertion
         // (linked via prov:used or prov:generated)
@@ -1962,6 +1977,7 @@ export class DKGAgent extends DKGAgentBase {
           status: deriveStatus(pointers),
           kaNumber: kaNumberStr,
           reservedUal,
+          publishedUal,
         };
       },
 

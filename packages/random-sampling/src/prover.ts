@@ -180,6 +180,17 @@ export class RandomSamplingProver {
   private readonly ciphertextChunkBackfill?: CiphertextChunkBackfillFn;
   private readonly canonicalCgIdForChunkStore?: (cgId: bigint) => string | null;
   private inflight: Promise<TickOutcome> | null = null;
+  /**
+   * #1098: WARN-dedup for `rs.tick.kc-not-synced`. The prover re-ticks
+   * every few seconds, and an unsynced KC is *expected* to stay unsynced
+   * for a while (replication in flight) — without dedup the same WARN
+   * line floods the log hundreds of times per proof period. Key is
+   * `<periodStart>:<cgId>:<kaId>`; the first miss per period logs at
+   * WARN, repeats log at INFO with a running `repeats` counter so
+   * operators retain a heartbeat without the noise. A new proof period
+   * naturally re-arms the WARN.
+   */
+  private readonly kcNotSyncedWarned = new Map<string, number>();
 
   constructor(deps: RandomSamplingProverDeps) {
     this.chain = deps.chain;
@@ -190,6 +201,35 @@ export class RandomSamplingProver {
     this.log = deps.log ?? noopLog;
     this.ciphertextChunkBackfill = deps.ciphertextChunkBackfill;
     this.canonicalCgIdForChunkStore = deps.canonicalCgIdForChunkStore;
+  }
+
+  /** #1098: log kc-not-synced at WARN once per (period, cg, ka), INFO after. */
+  private logKcNotSynced(
+    periodKey: { periodStartBlock: bigint },
+    cgId: bigint,
+    kaId: bigint,
+    fields: Record<string, unknown>,
+  ): void {
+    const key = `${periodKey.periodStartBlock}:${cgId}:${kaId}`;
+    const repeats = this.kcNotSyncedWarned.get(key) ?? 0;
+    this.kcNotSyncedWarned.set(key, repeats + 1);
+    // Drop stale entries from previous periods so the map can't grow
+    // unboundedly across a long-lived process.
+    if (this.kcNotSyncedWarned.size > 512) {
+      const prefix = `${periodKey.periodStartBlock}:`;
+      for (const k of this.kcNotSyncedWarned.keys()) {
+        if (!k.startsWith(prefix)) this.kcNotSyncedWarned.delete(k);
+      }
+    }
+    const payload = {
+      kaId: kaId.toString(),
+      cgId: cgId.toString(),
+      periodStart: periodKey.periodStartBlock.toString(),
+      ...fields,
+      ...(repeats > 0 ? { repeats } : {}),
+    };
+    if (repeats === 0) this.log.warn('rs.tick.kc-not-synced', payload);
+    else this.log.info('rs.tick.kc-not-synced', payload);
   }
 
   /** Single-flight tick. Concurrent callers await the same result. */
@@ -512,10 +552,7 @@ export class RandomSamplingProver {
             // find legitimate replication failures (vs. unwired-hook
             // misses, which read as `backfillAttempted=false`).
             const backfillAttempted = attempt > 0;
-            this.log.warn('rs.tick.kc-not-synced', {
-              kaId: kaId.toString(),
-              cgId: cgId.toString(),
-              periodStart: periodKey.periodStartBlock.toString(),
+            this.logKcNotSynced(periodKey, cgId, kaId, {
               err: err.name,
               missingCount: err.missingChunkIndexes.length,
               expectedCount: err.expectedCount,
@@ -565,10 +602,7 @@ export class RandomSamplingProver {
         leaves = extracted.leaves;
       } catch (err) {
         if (err instanceof KCNotFoundError || err instanceof KCDataMissingError) {
-          this.log.warn('rs.tick.kc-not-synced', {
-            kaId: kaId.toString(),
-            cgId: cgId.toString(),
-            periodStart: periodKey.periodStartBlock.toString(),
+          this.logKcNotSynced(periodKey, cgId, kaId, {
             err: (err as Error).name,
           });
           await this.wal.append(

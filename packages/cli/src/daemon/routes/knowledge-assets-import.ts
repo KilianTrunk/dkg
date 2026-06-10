@@ -54,7 +54,7 @@ import {
   normalizeMarkdownReadLimit,
 } from "./shared-assertion-helpers.js";
 import { parseBoundary, parseMultipart, MultipartParseError } from "../../http/multipart.js";
-import { normalizeDetectedContentType } from "../manifest.js";
+import { normalizeDetectedContentType, inferContentTypeFromFilename } from "../manifest.js";
 import { extractFromMarkdown } from "../../extraction/index.js";
 import {
   type ExtractionStatusRecord,
@@ -362,9 +362,18 @@ export async function handleKaImportFile(ctx: RequestContext, name: string): Pro
   contextGraphId = resolvedContextGraphId;
   if (!validateOptionalSubGraphName(subGraphName, res)) return;
 
-  const detectedContentType = normalizeDetectedContentType(
+  // #1101: precedence is explicit `contentType` field > multipart part
+  // Content-Type header > filename-extension fallback. The fallback only
+  // engages when the first two resolve to application/octet-stream (curl
+  // and many HTTP clients send octet-stream for .md files), so a caller
+  // who deliberately uploads an opaque blob is unaffected.
+  let detectedContentType = normalizeDetectedContentType(
     contentTypeOverride ?? filePart.contentType,
   );
+  if (detectedContentType === "application/octet-stream") {
+    const inferred = inferContentTypeFromFilename(filePart.filename);
+    if (inferred) detectedContentType = inferred;
+  }
 
   if (subGraphName) {
     try {
@@ -1035,6 +1044,7 @@ export async function handleKaImportFile(ctx: RequestContext, name: string): Pro
         status: "skipped",
         tripleCount: 0,
         pipelineUsed: null,
+        skipReason: `no extraction pipeline registered for content type "${detectedContentType}" — the file was stored as a blob; pass an explicit contentType form field (e.g. text/markdown) or upload with a recognized file extension to enable extraction`,
       });
     }
 

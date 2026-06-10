@@ -621,7 +621,14 @@ export class QueryMethods extends DKGAgentBase {
       includeContextGraphPartitions: opts.includeContextGraphPartitions,
       includePrivate: opts.includePrivate,
       view: opts.view,
-      agentAddress: agentAddressStr ?? (opts.view === 'working-memory' ? this.peerId : undefined),
+      // #1106 (3): an UNAUTHENTICATED / admin caller omitting `agentAddress`
+      // on a working-memory read previously fell back to the bare peerId
+      // namespace — but rc.17 WM data is keyed by the agent's EVM wallet, so
+      // "query my node's WM" silently returned 0 rows. Default to the node's
+      // primary agent wallet when configured; the peerId remains the fallback
+      // for nodes without a default agent (it is also the documented legacy
+      // namespace). The authenticated-caller default above is unchanged.
+      agentAddress: agentAddressStr ?? (opts.view === 'working-memory' ? (this.defaultAgentAddress ?? this.peerId) : undefined),
       verifiedGraph: opts.verifiedGraph,
       assertionName: opts.assertionName,
       subGraphName: opts.subGraphName,

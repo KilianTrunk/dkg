@@ -190,6 +190,40 @@ describe('DkgClient knowledge-assets — publish/finalize option serialization',
     expect(calls[0].body.alsoPublishVm).toEqual({});
   });
 
+  it('createKnowledgeAsset forwards finalize:false for a draft-only write', async () => {
+    const { client, calls } = makeClient();
+    await client.createKnowledgeAsset({
+      contextGraphId: 'cg-1',
+      name: 'f',
+      finalize: false,
+      quads: [{ subject: 's', predicate: 'p', object: 'o', graph: 'urn:g' }],
+    });
+    expect(calls[0].url).toContain('/api/knowledge-assets');
+    expect(calls[0].body).toMatchObject({ contextGraphId: 'cg-1', name: 'f', finalize: false });
+  });
+
+  it('createKnowledgeAsset omits finalize when unspecified (server default seals)', async () => {
+    const { client, calls } = makeClient();
+    await client.createKnowledgeAsset({
+      contextGraphId: 'cg-1',
+      name: 'f',
+      quads: [{ subject: 's', predicate: 'p', object: 'o', graph: 'urn:g' }],
+    });
+    expect(calls[0].body).not.toHaveProperty('finalize');
+  });
+
+  it('createKnowledgeAsset rejects finalize-only fields when finalize:false (parity with daemon)', async () => {
+    const { client, calls } = makeClient();
+    await expect(client.createKnowledgeAsset({
+      contextGraphId: 'cg-1',
+      name: 'f',
+      authorAgentAddress: '0xauthor',
+      finalize: false,
+      quads: [{ subject: 's', predicate: 'p', object: 'o', graph: 'urn:g' }],
+    })).rejects.toThrow(/require non-empty quads and finalize !== false/);
+    expect(calls).toHaveLength(0);
+  });
+
   it('createKnowledgeAsset rejects unknown alsoPublishVm option objects', async () => {
     const { client, calls } = makeClient();
     await expect(client.createKnowledgeAsset({

@@ -1112,6 +1112,33 @@ describe('DkgDaemonClient', () => {
       expect(body()).toMatchObject({ contextGraphId: 'cg-1', name: 'f', alsoShareSwm: true });
     });
 
+    it('createKnowledgeAsset forwards finalize:false for a draft-only write', async () => {
+      ok({ name: 'f', written: 1, status: 'draft-open' });
+      await client.createKnowledgeAsset('cg-1', 'f', {
+        finalize: false,
+        quads: [{ subject: 's', predicate: 'p', object: 'o', graph: '' }],
+      });
+      expect(url()).toBe('http://localhost:9200/api/knowledge-assets');
+      expect(body()).toMatchObject({ contextGraphId: 'cg-1', name: 'f', finalize: false });
+    });
+
+    it('createKnowledgeAsset omits finalize when unspecified (server default seals)', async () => {
+      ok({ name: 'f', status: 'wm-sealed' });
+      await client.createKnowledgeAsset('cg-1', 'f', {
+        quads: [{ subject: 's', predicate: 'p', object: 'o', graph: '' }],
+      });
+      expect(body()).not.toHaveProperty('finalize');
+    });
+
+    it('createKnowledgeAsset rejects finalize-only fields when finalize:false (parity with daemon)', async () => {
+      await expect(client.createKnowledgeAsset('cg-1', 'f', {
+        authorAgentAddress: '0xauthor',
+        finalize: false,
+        quads: [{ subject: 's', predicate: 'p', object: 'o', graph: '' }],
+      })).rejects.toThrow(/require non-empty quads and finalize !== false/);
+      expect(fetchCalls).toHaveLength(0);
+    });
+
     it('knowledgeAssetWrite URL-encodes the name and POSTs to .../wm/write', async () => {
       ok({ written: 2 });
       await client.knowledgeAssetWrite('cg-1', 'meeting notes', [

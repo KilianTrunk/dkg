@@ -536,13 +536,6 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
     if (finalize !== undefined && typeof finalize !== "boolean") {
       return jsonResponse(res, 400, { error: '"finalize" must be a boolean when supplied' });
     }
-    const alsoPublishVmRequested =
-      alsoPublishVm === true || (typeof alsoPublishVm === "object" && alsoPublishVm !== null);
-    if (finalize === false && (alsoShareSwm === true || alsoPublishVmRequested)) {
-      return jsonResponse(res, 400, {
-        error: '"finalize": false cannot be combined with "alsoShareSwm"/"alsoPublishVm" — sharing/publishing require a sealed assertion',
-      });
-    }
     // Quads are WRITTEN whenever supplied; the draft is also SEALED only when
     // `finalize` is not explicitly false. Default-true preserves the one-shot
     // `{ quads, finalize:true }` shape. An explicit `finalize:false` keeps an
@@ -552,6 +545,18 @@ export async function handleKnowledgeAssetsRoutes(ctx: RequestContext): Promise<
     // CG to be registered). OT-RFC-43 §10.5.5.
     const hasQuads = Array.isArray(quads) && quads.length > 0;
     const shouldFinalize = hasQuads && finalize !== false;
+    // alsoShareSwm/alsoPublishVm advance a SEALED assertion to SWM/VM, so they
+    // require this request to finalize. Reject upfront — before any create/write
+    // mutation — whenever it won't (no quads, or finalize:false); otherwise the
+    // create lands a durable draft the tail can't share/publish, turning a
+    // request-shape error into orphaned state.
+    const alsoPublishVmRequested =
+      alsoPublishVm === true || (typeof alsoPublishVm === "object" && alsoPublishVm !== null);
+    if (!shouldFinalize && (alsoShareSwm === true || alsoPublishVmRequested)) {
+      return jsonResponse(res, 400, {
+        error: '"alsoShareSwm"/"alsoPublishVm" require a finalized assertion (non-empty "quads" and "finalize" !== false)',
+      });
+    }
     if (!shouldFinalize && hasFinalizeOnlyCreateFields(parsed)) {
       return jsonResponse(res, 400, {
         error: '"authorAgentAddress", "preSignedAuthorAttestation", and "schemeVersion" require non-empty "quads" with finalize !== false',

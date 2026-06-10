@@ -244,7 +244,27 @@ describe('daemon memory_graph_changed route emissions', () => {
     await handleKnowledgeAssetsRoutes(ctx);
 
     expect((ctx.res as unknown as { statusCode: number }).statusCode).toBe(400);
-    expect(responseBody(ctx).error).toMatch(/finalize.*false cannot be combined/);
+    expect(responseBody(ctx).error).toMatch(/require a finalized assertion/);
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it('rejects alsoShareSwm with no quads (nothing to seal) before any mutation', async () => {
+    // The tail share/publish needs a SEALED assertion; with no quads the create
+    // never finalizes, so a naive run would land a durable empty draft and fail
+    // late. Reject the request-shape error upfront instead of orphaning state.
+    const create = vi.fn();
+    const ctx = createContext('/api/knowledge-assets', {
+      contextGraphId: 'project-a',
+      name: 'draft',
+      alsoShareSwm: true,
+    }, {
+      agent: { assertion: { create }, resolveAgentByToken: () => undefined } as unknown as RequestContext['agent'],
+    });
+
+    await handleKnowledgeAssetsRoutes(ctx);
+
+    expect((ctx.res as unknown as { statusCode: number }).statusCode).toBe(400);
+    expect(responseBody(ctx).error).toMatch(/require a finalized assertion/);
     expect(create).not.toHaveBeenCalled();
   });
 

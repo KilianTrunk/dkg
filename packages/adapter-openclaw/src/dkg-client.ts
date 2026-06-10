@@ -280,6 +280,7 @@ function assertExclusiveAuthorFields(args: {
 
 function assertCreateFinalizeFieldsHaveQuads(args: {
   quads?: unknown[];
+  finalize?: boolean;
   authorAgentAddress?: string;
   preSignedAuthorAttestation?: PreSignedAuthorAttestationPayload;
   schemeVersion?: number;
@@ -288,8 +289,11 @@ function assertCreateFinalizeFieldsHaveQuads(args: {
     args.authorAgentAddress != null ||
     args.preSignedAuthorAttestation != null ||
     args.schemeVersion !== undefined;
-  if (hasFinalizeOnlyField && !(Array.isArray(args.quads) && args.quads.length > 0)) {
-    throw new Error('authorAgentAddress, preSignedAuthorAttestation, and schemeVersion require non-empty quads');
+  // These fields only take effect at finalize, so they require both non-empty
+  // quads AND finalize !== false — mirrors the daemon create-route guard.
+  const willFinalize = Array.isArray(args.quads) && args.quads.length > 0 && args.finalize !== false;
+  if (hasFinalizeOnlyField && !willFinalize) {
+    throw new Error('authorAgentAddress, preSignedAuthorAttestation, and schemeVersion require non-empty quads and finalize !== false');
   }
 }
 
@@ -1274,6 +1278,13 @@ export class DkgDaemonClient {
     opts?: {
       subGraphName?: string;
       quads?: Array<{ subject: string; predicate: string; object: string; graph: string }>;
+      /**
+       * Seal the draft after writing `quads` (default true). `false` keeps an
+       * editable WM draft that never touches the chain — the only lifecycle
+       * available to local-only / on-chain-unregistered CGs. Cannot be combined
+       * with `alsoShareSwm`/`alsoPublishVm` (those require a sealed assertion).
+       */
+      finalize?: boolean;
       authorAgentAddress?: string;
       preSignedAuthorAttestation?: PreSignedAuthorAttestationPayload;
       schemeVersion?: number;

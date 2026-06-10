@@ -105,12 +105,23 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
     // 10.0.3 → 10.0.4: curated publishes and paid legacy curated updates
     // must carry a ciphertext commitment before entering value-weighted
     // random-sampling state.
+    // 10.0.4 → 10.0.5: audit fix — the conviction (PCA discount) branch in
+    // `publish`/`update` now FALLS THROUGH to direct spend instead of
+    // reverting when `coverPublishingCost` fails for a payment reason
+    // (`InsufficientAllowance` / `AccountExpired`). Agent registration is
+    // permissionless and requires no consent (RFC-001 §3.6), so a hard
+    // revert on the conviction branch let anyone register a victim against
+    // a deliberately-underfunded account and brick that victim's paid
+    // publishes/updates indefinitely. This extends the existing
+    // "stale registration MUST NOT brick the publisher" intent (already
+    // applied to the expired / epoch-mismatch gate) to the
+    // underfunded-active case.
     // 2.0.0 → 2.0.1 (PATCH): protocol treasury fee skimmed inside
     // `_addTokens` (publisher pays the same gross amount; the fee is taken
     // out of the staker-bound net). Patch-level on purpose — the EIP-712
     // author-attestation domain version (`_EIP712_VERSION_HASH`) MUST stay
     // pinned at "2.0.0" so previously signed attestations keep verifying.
-    string private constant _VERSION = "10.0.4";
+    string private constant _VERSION = "10.0.5";
 
     // --- V10 publish input (grouped to bypass the 16-arg stack limit) ---
 
@@ -353,6 +364,20 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
     ///      successful signature check. `bytes4(keccak256("isValidSignature(bytes32,bytes)"))`.
     bytes4 private constant _ERC1271_MAGIC_VALUE = 0x1626ba7e;
 
+    /// @dev Selectors of the PaymentConviction-side errors that mean "this
+    ///      account cannot fund the publish via the discount branch right
+    ///      now". On these (and ONLY these) the publish/update falls through
+    ///      to direct spend instead of bricking — see the version changelog
+    ///      and {_coverViaConvictionOrFallThrough}. Any other revert from
+    ///      `coverPublishingCost` is a genuine fault and bubbles up.
+    ///      Signatures mirror `PublishingConviction`:
+    ///        InsufficientAllowance(uint256 accountId, uint40 epoch, uint96 required, uint96 available)
+    ///        AccountExpired(uint256 accountId, uint40 expiresAtEpoch)
+    bytes4 private constant _PCA_INSUFFICIENT_ALLOWANCE_SELECTOR =
+        bytes4(keccak256("InsufficientAllowance(uint256,uint40,uint96,uint96)"));
+    bytes4 private constant _PCA_ACCOUNT_EXPIRED_SELECTOR =
+        bytes4(keccak256("AccountExpired(uint256,uint40)"));
+
     // --- Update-specific errors (V10 Phase 8 Task 2) ---
 
     /// @dev Update would reduce the KC's `tokenAmount` below its current
@@ -504,20 +529,20 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
                 p.epochs == uint256(lockDurationEpochs);
         }
 
+        // Discount branch when eligible; otherwise (or on a PCA-side payment
+        // failure) direct spend. The conviction attempt MUST NOT brick the
+        // publisher — agent registration is permissionless and consent-free,
+        // so an underfunded account a third party registered us against falls
+        // through here instead of reverting. See {_coverViaConvictionOrFallThrough}.
         if (useConviction) {
-            // Discount branch. The NFT auto-resolves the paying account
-            // from `agentToAccountId[msg.sender]`, deducts the discounted
-            // cost, distributes it across the KC's epoch range (active
-            // sink), and lazily settles any elapsed billing windows
-            // (passive sink). KAv10 MUST NOT call `_distributeTokens`
-            // here — the NFT is the funding agent on this branch.
-            publishingConvictionNFT.coverPublishingCost(
-                msg.sender,
+            useConviction = _coverViaConvictionOrFallThrough(
                 p.tokenAmount,
                 currentEpoch,
                 uint40(p.epochs)
             );
-        } else {
+        }
+
+        if (!useConviction) {
             // Direct-spend branch. `transferFrom(msg.sender, CSS, fullCost)`
             // + epoch-range distribution. The named core (if non-zero) still
             // earns publishing-factor credit through `_executePublishCore`'s
@@ -528,6 +553,59 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
         }
 
         return kaId;
+    }
+
+    /**
+     * @dev Attempt to fund a publish/update via the caller's conviction
+     *      account (PCA discount branch). Returns `true` if the cost was
+     *      covered via conviction, `false` if the caller should fall through
+     *      to direct spend.
+     *
+     *      Audit fix: agent registration is permissionless and requires no
+     *      consent from the agent (RFC-001 §3.6). A hard revert here let an
+     *      attacker register a victim against a deliberately-underfunded
+     *      account and brick that victim's paid publishes/updates. We
+     *      therefore swallow ONLY the PCA-side "cannot pay" errors
+     *      (`InsufficientAllowance`, `AccountExpired`) and fall through to
+     *      direct spend — mirroring the gate's existing
+     *      "stale registration MUST NOT brick the publisher" intent. Any
+     *      other revert is a genuine fault and is re-thrown unchanged so we
+     *      never mask real bugs or silently downgrade on unexpected state.
+     *
+     *      `coverPublishingCost` is an external call to the NFT contract, so
+     *      a revert rolls back all of its state writes atomically — the
+     *      fall-through starts from clean state with no partial PCA effects.
+     */
+    function _coverViaConvictionOrFallThrough(
+        uint96 baseCost,
+        uint40 kcStartEpoch,
+        uint40 kcEpochs
+    ) internal returns (bool covered) {
+        try publishingConvictionNFT.coverPublishingCost(msg.sender, baseCost, kcStartEpoch, kcEpochs) returns (
+            uint96
+        ) {
+            return true;
+        } catch (bytes memory reason) {
+            bytes4 selector;
+            if (reason.length >= 4) {
+                // solhint-disable-next-line no-inline-assembly
+                assembly {
+                    selector := mload(add(reason, 0x20))
+                }
+            }
+            if (
+                selector == _PCA_INSUFFICIENT_ALLOWANCE_SELECTOR ||
+                selector == _PCA_ACCOUNT_EXPIRED_SELECTOR
+            ) {
+                // Expected "cannot pay via conviction" — fall through.
+                return false;
+            }
+            // Unexpected fault — bubble up verbatim.
+            // solhint-disable-next-line no-inline-assembly
+            assembly {
+                revert(add(reason, 0x20), mload(reason))
+            }
+        }
     }
 
     // ========================================================================
@@ -1199,19 +1277,19 @@ contract KnowledgeAssetsLifecycle is INamed, IVersioned, ContractStatus, IInitia
                 remainingEpochs <= uint40(lockDurationEpochs);
         }
 
+        // Discount branch when eligible; otherwise (or on a PCA-side payment
+        // failure) direct spend. As in `publish`, the conviction attempt MUST
+        // NOT brick the updater — a consent-free agent registration on an
+        // underfunded account falls through here rather than reverting.
         if (useConviction) {
-            // Discount branch — delta funds the KC's REMAINING epoch range
-            // `[currentEpoch, currentEpoch + remainingEpochs - 1]` via the
-            // active sink. The active sink may extend past the conviction
-            // account's `expiresAtEpoch` (harmless — the staker pool just
-            // gets funded normally for those epochs).
-            publishingConvictionNFT.coverPublishingCost(
-                msg.sender,
+            useConviction = _coverViaConvictionOrFallThrough(
                 deltaTokenAmount,
                 currentEpoch,
                 remainingEpochs
             );
-        } else {
+        }
+
+        if (!useConviction) {
             uint96 netDeltaTokenAmount = _addTokens(deltaTokenAmount);
             _distributeTokens(netDeltaTokenAmount, uint256(remainingEpochs), currentEpoch);
         }

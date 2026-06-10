@@ -69,6 +69,45 @@ const BOUND_CONTRACT_INVALIDATORS = new Map<string, (adapter: EVMChainAdapterBas
   ['Chronos',                    (a) => { (a as any).contracts.chronos = undefined; }],
 ]);
 
+const KA_HIGH_WATER_VIEW_SIGNATURE = 'getMaxKaNumberForAuthor(address)';
+
+/**
+ * Upper bound on the pre-10.0.4 KnowledgeAssetCreated fallback scan, in
+ * 2,000-block eth_getLogs pages. The scan is anchored at the contract's deploy
+ * block (not genesis) and runs ONCE per author per node lifetime (cached), so a
+ * few hundred pages is fine; this cap only trips for a genuinely old pre-10.0.4
+ * deployment on a small-range-cap RPC, where we fail loud with guidance instead
+ * of silently issuing thousands of sequential calls. The default fallback
+ * window is a conservative 2,000 blocks (the smallest common eth_getLogs cap);
+ * at that size the budget covers ~3M blocks of contract lifetime. Operators on
+ * an RPC that serves larger eth_getLogs ranges can widen the window via the
+ * `kaHighWaterScanPageSize` config to cover an older pre-10.0.4 deployment in
+ * fewer pages; the canonical fix remains deploying DKGKnowledgeAssets >= 10.0.4
+ * (which removes the scan via the O(1) view). This is the coverage boundary.
+ */
+const KA_HIGH_WATER_MAX_SCAN_PAGES = 1_500;
+
+/** Default pre-10.0.4 fallback eth_getLogs window — the smallest common cap. */
+const KA_HIGH_WATER_DEFAULT_PAGE_SIZE = 2_000;
+
+/**
+ * True for the UNAMBIGUOUS "the deployed DKGKnowledgeAssets has no
+ * `getMaxKaNumberForAuthor` selector" error shapes — the cases where we can pick
+ * the pre-10.0.4 log-scan fallback without any extra RPC call:
+ *   - `BAD_DATA` "could not decode result data" with an EMPTY `value="0x"`
+ *     payload (the provider returned nothing for the int256). A non-empty
+ *     `value="0x…"` is a malformed/garbage decode and is rethrown. This
+ *     classifier is only reached from the single `getMaxKaNumberForAuthor` view
+ *     call, so a contract-name match in the message is not required (ethers
+ *     versions vary on whether they include it).
+ *   - an explicit "function selector"/"selector not recognized" message.
+ *
+ * The CALL_EXCEPTION / "missing revert data" shape that some RPCs (e.g. Base
+ * Sepolia) return for an absent selector is AMBIGUOUS with a genuine bare
+ * revert, so it is handled by `isKaHighWaterBareRevert` + a deployed-bytecode
+ * selector probe (`kaHighWaterViewSelectorInCode`) — see
+ * `getMaxKaNumberForAuthor`.
+ */
 function isKaHighWaterViewUnavailable(err: unknown): boolean {
   if (err instanceof Error) enrichEvmError(err);
   const code = errorCode(err);
@@ -76,11 +115,61 @@ function isKaHighWaterViewUnavailable(err: unknown): boolean {
 
   if (code === 'BAD_DATA') {
     return msg.includes('could not decode result data')
-      && msg.includes('value="0x"')
-      && msg.includes('getmaxkanumberforauthor');
+      && msg.includes('value="0x"');
   }
   return msg.includes('function selector')
     || msg.includes('selector not recognized');
+}
+
+/**
+ * True for a CALL_EXCEPTION that carries NO revert payload (ethers v6:
+ * `reason=null`, `data=null`, message "missing revert data"). A deployed
+ * contract that lacks the called selector and has no fallback reverts exactly
+ * this way — but so does a genuine bare `revert()` from a function that DOES
+ * exist — so this shape is only treated as "view absent" once
+ * `kaHighWaterViewSelectorInCode` confirms the selector is genuinely missing
+ * from the deployed bytecode. A revert that carries a reason/data (e.g.
+ * `execution reverted: Paused`) is NOT a bare revert and is rethrown.
+ */
+function isKaHighWaterBareRevert(err: unknown): boolean {
+  if (errorCode(err) !== 'CALL_EXCEPTION') return false;
+  const e = err as { data?: unknown; reason?: unknown };
+  const hasRevertPayload =
+    (e.data != null && e.data !== '0x') ||
+    (typeof e.reason === 'string' && e.reason.length > 0);
+  if (hasRevertPayload) return false;
+  return errorMessage(err).toLowerCase().includes('missing revert data');
+}
+
+/**
+ * True iff the `getMaxKaNumberForAuthor(address)` selector appears as a
+ * `PUSH4 <selector>` dispatcher entry in `code` (the resolved contract's
+ * deployed runtime bytecode). A Solidity function dispatcher compares
+ * `msg.sig` against each external selector via `PUSH4 <selector>` (opcode
+ * `0x63`), so we match `63<selector>` rather than the bare 4 selector bytes —
+ * a plain substring match would false-POSITIVE on the same 4 bytes appearing
+ * inside an unrelated constant or the metadata blob, making a pre-10.0.4
+ * contract look like it implements the view and wrongly rethrowing the
+ * bare-revert path. Absence of the PUSH4 entry reliably signals the view is
+ * not deployed (the pre-10.0.4 case) — for a DIRECT deployment. DKGKnowledgeAssets
+ * is resolved straight from the Hub (not behind a proxy), so this probe sees the
+ * real dispatcher; if it were ever proxied, the implementation's selectors would
+ * not appear in the proxy bytecode (a proxying change MUST revisit this probe).
+ * The selector is derived from the contract interface so it tracks the
+ * signature; if it can't be derived we return false (treat as absent → fall
+ * back, which is safe: the scan yields the correct high-water either way).
+ */
+function kaHighWaterViewSelectorInCode(storage: Contract, code: string): boolean {
+  let selector: string | undefined;
+  try {
+    selector = storage.interface.getFunction(KA_HIGH_WATER_VIEW_SIGNATURE)?.selector;
+  } catch {
+    selector = undefined;
+  }
+  if (!selector) return false;
+  // `63` = PUSH4 opcode; the 4 selector bytes must follow it to count as a real
+  // dispatcher entry (not a coincidental byte run elsewhere in the bytecode).
+  return code.toLowerCase().includes(`63${selector.toLowerCase().slice(2)}`);
 }
 
 async function contractAddress(contract: Contract): Promise<string> {
@@ -266,6 +355,22 @@ export class EVMChainAdapterBase {
   protected cachedMinRequiredSignatures: { value: number; cachedAt: number } | undefined;
 
   /**
+   * Cached deploy block of the resolved DKGKnowledgeAssets storage contract,
+   * keyed by address. Anchors the pre-10.0.4 KnowledgeAssetCreated fallback scan
+   * at the contract's birth instead of genesis (a from-0 scan is ~21k eth_getLogs
+   * calls under Base Sepolia's 2,000-block cap — #1080 redux). A contract's
+   * deploy block is immutable, so this needs no TTL.
+   */
+  protected cachedKaStorageDeployBlock: { value: number; address: string } | undefined;
+
+  /**
+   * eth_getLogs block-window for the pre-10.0.4 getMaxKaNumberForAuthor fallback
+   * scan (config `kaHighWaterScanPageSize`, default 2,000 — the smallest common
+   * provider cap). See KA_HIGH_WATER_DEFAULT_PAGE_SIZE.
+   */
+  protected readonly kaHighWaterScanPageSize: number;
+
+  /**
    * Reset the PR3 publish-preflight cache. Public so daemon code that
    * knows about an external chain reconfiguration (e.g. a hot-reload
    * of `chainRpcUrl` or a deliberate governance-vote test fixture)
@@ -276,6 +381,7 @@ export class EVMChainAdapterBase {
     this.cachedChainId = undefined;
     this.cachedKav10Address = undefined;
     this.cachedMinRequiredSignatures = undefined;
+    this.cachedKaStorageDeployBlock = undefined;
   }
 
   protected static preflightCacheFresh(
@@ -288,6 +394,10 @@ export class EVMChainAdapterBase {
 
   constructor(config: EVMAdapterConfig) {
     this.rpcUrls = resolveRpcUrls(config.rpcUrl, config.rpcUrls);
+    this.kaHighWaterScanPageSize =
+      typeof config.kaHighWaterScanPageSize === 'number' && config.kaHighWaterScanPageSize > 0
+        ? Math.floor(config.kaHighWaterScanPageSize)
+        : KA_HIGH_WATER_DEFAULT_PAGE_SIZE;
     // BUG-022 root-cause fix: force ethers' `PollingEventSubscriber`
     // (eth_getLogs over a sliding block window) instead of the default
     // `FilterIdEventSubscriber` (eth_newFilter + eth_getFilterChanges).
@@ -1224,14 +1334,22 @@ export class EVMChainAdapterBase {
    *   1. `DKGKnowledgeAssets >= 10.0.4` exposes the O(1)
    *      `getMaxKaNumberForAuthor(address) -> int256` view — a single `eth_call`.
    *   2. Pre-10.0.4 deployments do not have that selector, so they fall back to
-   *      a paginated `KnowledgeAssetCreated(id, author)` scan. The previous
-   *      `queryFilter(filter, 0)` scanned `[0, latest]` in one RPC call and hit
-   *      provider block-range caps (#1080); this legacy path uses small bounded
-   *      windows instead. Transient RPC failures are rethrown, not hidden by a
-   *      historical crawl on the same provider. Empty selector-call responses
-   *      only reach the fallback after confirming bytecode exists at the
-   *      resolved storage address, so a bad Hub address fails loudly instead of
-   *      reconciling from empty logs.
+   *      a paginated `KnowledgeAssetCreated(id, author)` scan ANCHORED at the
+   *      contract's deploy block. The original `queryFilter(filter, 0)` scanned
+   *      `[0, latest]` in one RPC call and hit provider block-range caps (#1080);
+   *      a naive from-genesis paginated scan is ~21k calls under a 2,000-block
+   *      cap (e.g. Base Sepolia), so we start at the deploy block instead.
+   *
+   * An absent selector surfaces in two provider-dependent shapes: `BAD_DATA`
+   * (empty `value="0x"`) on some RPCs, or `CALL_EXCEPTION` / "missing revert
+   * data" on others (Base Sepolia). The former is unambiguous; the latter is
+   * ambiguous with a genuine bare revert, so we only fall back for it once a
+   * deployed-bytecode probe confirms the selector is genuinely missing —
+   * otherwise the view exists and reverted for real, and we rethrow. Transient
+   * RPC failures and decoded reverts are always rethrown, never hidden behind a
+   * historical crawl. Empty selector-call responses only reach the scan after
+   * confirming bytecode exists at the resolved storage address, so a bad Hub
+   * address fails loudly instead of reconciling from empty logs.
    */
   async getMaxKaNumberForAuthor(author: string): Promise<bigint> {
     // Re-resolve contract handles first. The Hub-rotation listener flips
@@ -1247,14 +1365,29 @@ export class EVMChainAdapterBase {
     }
     const normalized = ethers.getAddress(author);
 
+    // A CALL_EXCEPTION/"missing revert data" from the view is ambiguous between
+    // "pre-10.0.4 contract lacks the selector" (→ scan) and "the view exists and
+    // bare-reverted" (→ rethrow). Defer that decision until the deployed
+    // bytecode is fetched below.
+    let bareRevert: unknown;
     const getMax = (storage as any).getMaxKaNumberForAuthor;
     if (typeof getMax?.staticCall === 'function') {
       try {
         const max = await getMax.staticCall(normalized);
         return BigInt(max);
       } catch (err) {
-        if (!isKaHighWaterViewUnavailable(err)) {
-          throw err;
+        // Ordering invariant: isKaHighWaterViewUnavailable runs first and calls
+        // enrichEvmError(err), which only rewrites a message carrying decodable
+        // `data=0x…` + the literal "unknown custom error" — neither present on a
+        // bare "missing revert data" (data=null) error — so it leaves the shape
+        // isKaHighWaterBareRevert keys on untouched. Preserve that if
+        // enrichEvmError's rewrite rules change.
+        if (isKaHighWaterViewUnavailable(err)) {
+          // Unambiguous absent-view shape → fall through to the bounded scan.
+        } else if (isKaHighWaterBareRevert(err)) {
+          bareRevert = err; // confirm against the deployed bytecode below
+        } else {
+          throw err; // transient RPC / decoded revert → never crawl
         }
       }
     }
@@ -1265,12 +1398,34 @@ export class EVMChainAdapterBase {
       throw new Error(`DKGKnowledgeAssets resolved to ${storageAddress}, but no contract code is deployed there.`);
     }
 
-    const filter = storage.filters.KnowledgeAssetCreated(null, normalized);
+    // A bare revert is only "view absent" when the selector is genuinely missing
+    // from the deployed bytecode; if it IS present the view exists and the
+    // revert was real, so rethrow rather than mask it behind a log crawl.
+    if (bareRevert !== undefined && kaHighWaterViewSelectorInCode(storage, code)) {
+      throw bareRevert;
+    }
+
     const head = await this.provider.getBlockNumber();
-    const pageSize = 2_000; // <= the smallest common eth_getLogs block-range cap
+    const fromBlock = await this.resolveKaStorageDeployBlock(storageAddress, head);
+    const pageSize = this.kaHighWaterScanPageSize; // configurable eth_getLogs window (default 2,000)
+    const pages = Math.ceil((head - fromBlock + 1) / pageSize);
+    if (pages > KA_HIGH_WATER_MAX_SCAN_PAGES) {
+      throw new Error(
+        `getMaxKaNumberForAuthor: the pre-10.0.4 KnowledgeAssetCreated fallback ` +
+          `would need ${pages} eth_getLogs calls over blocks [${fromBlock}, ${head}] at a ` +
+          `${pageSize}-block window (budget ${KA_HIGH_WATER_MAX_SCAN_PAGES} pages). The deployed ` +
+          `DKGKnowledgeAssets (${storageAddress}) lacks the O(1) getMaxKaNumberForAuthor view. ` +
+          `Remediations: use an archive RPC that serves historical eth_getCode so the scan ` +
+          `anchors at the deploy block${fromBlock === 0 ? ' (it fell back to genesis here)' : ''}; ` +
+          `raise kaHighWaterScanPageSize if your RPC serves larger eth_getLogs ranges; or deploy ` +
+          `DKGKnowledgeAssets >= 10.0.4 to remove the scan entirely (a single eth_call).`,
+      );
+    }
+
+    const filter = storage.filters.KnowledgeAssetCreated(null, normalized);
     const mask = (1n << 96n) - 1n;
     let max = -1n;
-    for (let lo = 0; lo <= head; lo += pageSize) {
+    for (let lo = fromBlock; lo <= head; lo += pageSize) {
       const hi = Math.min(lo + pageSize - 1, head);
       const logs = await storage.queryFilter(filter, lo, hi);
       for (const log of logs) {
@@ -1282,6 +1437,76 @@ export class EVMChainAdapterBase {
       }
     }
     return max;
+  }
+
+  /**
+   * Binary-search the earliest block at which `address` has deployed bytecode —
+   * the contract's deploy block — so the pre-10.0.4 KnowledgeAssetCreated
+   * fallback starts at the contract's birth instead of genesis. Cached
+   * (immutable per address). The caller has already confirmed code exists at
+   * `head`.
+   *
+   * If historical `eth_getCode` is unavailable (a pruned/non-archive RPC, after
+   * the per-probe retries in `getContractCodeAtBlock`), we DEGRADE to block 0
+   * rather than either:
+   *   (a) hard-failing — pruned nodes can still serve the paginated
+   *       `queryFilter` scan, so a recent deployment on a short-history chain
+   *       still works (bounded by the page budget); or
+   *   (b) anchoring ABOVE the true deploy block (the old `catch => no code`
+   *       shape) — which would under-report the per-author high-water and
+   *       re-hand a burned `(author, number)`.
+   * Block 0 is the safe lower bound (`<= deploy`), so the scan never MISSES an
+   * event; it only costs more pages, which the budget guard bounds. The degraded
+   * `0` is NOT cached (a later call may reach an archive RPC and pin the real
+   * deploy block).
+   */
+  protected async resolveKaStorageDeployBlock(address: string, head: number): Promise<number> {
+    if (this.cachedKaStorageDeployBlock?.address === address) {
+      return this.cachedKaStorageDeployBlock.value;
+    }
+    let lo = 0;
+    let hi = head;
+    try {
+      while (lo < hi) {
+        const mid = lo + Math.floor((hi - lo) / 2);
+        const codeAtMid = await this.getContractCodeAtBlock(address, mid);
+        if (codeAtMid !== '0x') hi = mid;
+        else lo = mid + 1;
+      }
+    } catch {
+      // Historical eth_getCode unavailable → degrade to the safe genesis lower
+      // bound (never anchors above deploy); not cached.
+      return 0;
+    }
+    this.cachedKaStorageDeployBlock = { address, value: lo };
+    return lo;
+  }
+
+  /**
+   * `eth_getCode(address, block)` normalised to `'0x'` when there is genuinely
+   * no code, with a small retry so a transient RPC blip during the one-shot
+   * deploy-block binary search is not misread as "no code" (which would anchor
+   * the scan too high). A persistent failure THROWS rather than returning '0x';
+   * `resolveKaStorageDeployBlock` catches that and degrades to a genesis-anchored
+   * scan, so a historical-state-less RPC still works without ever anchoring
+   * above the true deploy block.
+   */
+  private async getContractCodeAtBlock(address: string, block: number): Promise<string> {
+    let lastErr: unknown;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        const code = await this.provider.getCode(address, block);
+        return code && code !== '0x' ? code : '0x';
+      } catch (err) {
+        lastErr = err;
+      }
+    }
+    throw new Error(
+      `getMaxKaNumberForAuthor: historical eth_getCode for ${address} at block ${block} ` +
+        `failed after 3 attempts (${lastErr instanceof Error ? lastErr.message : String(lastErr)}); ` +
+        `cannot resolve the DKGKnowledgeAssets deploy block to anchor the pre-10.0.4 fallback ` +
+        `scan. Use an archive RPC that serves historical state, or deploy DKGKnowledgeAssets >= 10.0.4.`,
+    );
   }
 
   async getKnowledgeAssetsLifecycleAddress(): Promise<string> {

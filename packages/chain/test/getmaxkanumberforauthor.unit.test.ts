@@ -247,20 +247,244 @@ describe('EVMChainAdapter.getMaxKaNumberForAuthor — view + bounded fallback (#
     expect(queryFilter).not.toHaveBeenCalled();
   });
 
-  it('rethrows generic missing-revert-data errors instead of hiding call failures behind a scan', async () => {
-    const err: any = new Error('missing revert data');
+  // #1080 follow-up: a pre-10.0.4 deployment that lacks the selector reverts with
+  // CALL_EXCEPTION / "missing revert data" on RPCs like Base Sepolia (no BAD_DATA
+  // shape). That is the user-observed failure: it MUST fall back to the scan, not
+  // rethrow — but only once the deployed bytecode confirms the selector is absent.
+  const VIEW_SELECTOR = '0xe9ed840f'; // getMaxKaNumberForAuthor(address)
+  const ifaceWithSelector = { getFunction: () => ({ selector: VIEW_SELECTOR }) };
+
+  it('falls back when a pre-10.0.4 deployment reverts with missing-revert-data and the selector is ABSENT from bytecode', async () => {
+    const err: any = new Error(
+      'missing revert data (action="call", data=null, reason=null, code=CALL_EXCEPTION, version=6.16.0)',
+    );
     err.code = 'CALL_EXCEPTION';
-    const queryFilter = vi.fn(async () => [{ args: { id: pack(9n) } }]);
-    const storage = {
+    err.data = null;
+    err.reason = null;
+    const queryFilter = vi.fn(async () => [{ args: { id: pack(4n) } }]);
+    const storage: any = {
+      interface: ifaceWithSelector,
       getMaxKaNumberForAuthor: viewMock(async () => {
         throw err;
       }),
       filters: { KnowledgeAssetCreated: vi.fn(() => 'F') },
       queryFilter,
     };
-    await expect(
-      makeAdapter(storage, 100).getMaxKaNumberForAuthor(AUTHOR),
-    ).rejects.toThrow('missing revert data');
+    const a = makeAdapter(storage, 1_500);
+    (a as any).provider.getCode = vi.fn(async () => '0x6000'); // code, but no selector
+
+    expect(await a.getMaxKaNumberForAuthor(AUTHOR)).toBe(4n);
+    expect(queryFilter).toHaveBeenCalledWith('F', 0, 1500);
+  });
+
+  it('rethrows missing-revert-data when the view selector IS present in the deployed bytecode (genuine bare revert)', async () => {
+    const err: any = new Error('missing revert data');
+    err.code = 'CALL_EXCEPTION';
+    err.data = null;
+    err.reason = null;
+    const queryFilter = vi.fn(async () => [{ args: { id: pack(9n) } }]);
+    const storage: any = {
+      interface: ifaceWithSelector,
+      getMaxKaNumberForAuthor: viewMock(async () => {
+        throw err;
+      }),
+      filters: { KnowledgeAssetCreated: vi.fn(() => 'F') },
+      queryFilter,
+    };
+    const a = makeAdapter(storage, 100);
+    (a as any).provider.getCode = vi.fn(async () => `0x600063${VIEW_SELECTOR.slice(2)}6001`); // PUSH4 <selector> dispatcher entry
+
+    await expect(a.getMaxKaNumberForAuthor(AUTHOR)).rejects.toThrow('missing revert data');
     expect(queryFilter).not.toHaveBeenCalled();
+  });
+
+  it('treats a coincidental selector byte-run (no PUSH4 prefix) as absent and falls back, not rethrow', async () => {
+    const err: any = new Error('missing revert data');
+    err.code = 'CALL_EXCEPTION';
+    err.data = null;
+    err.reason = null;
+    const queryFilter = vi.fn(async () => [{ args: { id: pack(5n) } }]);
+    const storage: any = {
+      interface: ifaceWithSelector,
+      getMaxKaNumberForAuthor: viewMock(async () => {
+        throw err;
+      }),
+      filters: { KnowledgeAssetCreated: vi.fn(() => 'F') },
+      queryFilter,
+    };
+    const a = makeAdapter(storage, 1_000);
+    // selector bytes present in a constant/metadata blob, but NOT as a `63<selector>` dispatcher entry
+    (a as any).provider.getCode = vi.fn(async () => `0x60ff${VIEW_SELECTOR.slice(2)}00`);
+    expect(await a.getMaxKaNumberForAuthor(AUTHOR)).toBe(5n); // view is genuinely absent → scan
+    expect(queryFilter).toHaveBeenCalled();
+  });
+
+  it('anchors the fallback scan at the contract deploy block, not genesis (#1080 — avoids a 2,000-cap full-history crawl)', async () => {
+    const head = 42_650_000;
+    const deployBlock = 42_410_000; // ~240k blocks of lifetime => ~120 pages, not ~21k
+    const queryFilter = vi.fn(async () => []);
+    const storage: any = {
+      filters: { KnowledgeAssetCreated: vi.fn(() => 'F') },
+      queryFilter,
+    };
+    const a = makeAdapter(storage, head); // no view fn => straight to fallback
+    // historical getCode: '0x' before deploy, code at/after deploy
+    (a as any).provider.getCode = vi.fn(async (_addr: string, block?: number) =>
+      block === undefined || block >= deployBlock ? '0x6000' : '0x',
+    );
+
+    expect(await a.getMaxKaNumberForAuthor(AUTHOR)).toBe(-1n);
+    const firstLo = (queryFilter.mock.calls[0] as unknown as [unknown, number, number])[1];
+    const lastHi = (queryFilter.mock.calls.at(-1) as unknown as [unknown, number, number])[2];
+    expect(firstLo).toBe(deployBlock); // anchored, NOT 0
+    expect(lastHi).toBe(head);
+    // ~120 pages over the contract's lifetime, far below a from-genesis ~21k.
+    expect(queryFilter.mock.calls.length).toBe(Math.ceil((head - deployBlock + 1) / 2000));
+    expect(queryFilter.mock.calls.length).toBeLessThan(200);
+  });
+
+  it('fails loudly (no storm) when the anchored fallback would exceed the eth_getLogs page budget', async () => {
+    const head = 80_000_000;
+    const queryFilter = vi.fn(async () => []);
+    const storage: any = {
+      filters: { KnowledgeAssetCreated: vi.fn(() => 'F') },
+      queryFilter,
+    };
+    const a = makeAdapter(storage, head);
+    (a as any).provider.getCode = vi.fn(async (_addr: string, block?: number) =>
+      block === undefined || block >= 0 ? '0x6000' : '0x',
+    ); // deploys at genesis => ~40k pages, over the cap
+
+    await expect(a.getMaxKaNumberForAuthor(AUTHOR)).rejects.toThrow(/eth_getLogs calls|deploy DKGKnowledgeAssets >= 10\.0\.4/);
+    expect(queryFilter).not.toHaveBeenCalled();
+  });
+
+  // Pin the hasRevertPayload early-return in isKaHighWaterBareRevert: a
+  // CALL_EXCEPTION whose message contains "missing revert data" but which
+  // carries a reason/data is a GENUINE revert from an existing view and must
+  // rethrow, not fall back — even though its message matches the bare shape.
+  it('rethrows a CALL_EXCEPTION that says missing-revert-data but carries a reason (genuine revert)', async () => {
+    const err: any = new Error('missing revert data: execution reverted');
+    err.code = 'CALL_EXCEPTION';
+    err.data = null;
+    err.reason = 'Paused';
+    const queryFilter = vi.fn(async () => [{ args: { id: pack(9n) } }]);
+    const storage: any = {
+      interface: ifaceWithSelector,
+      getMaxKaNumberForAuthor: viewMock(async () => {
+        throw err;
+      }),
+      filters: { KnowledgeAssetCreated: vi.fn(() => 'F') },
+      queryFilter,
+    };
+    const a = makeAdapter(storage, 100);
+    (a as any).provider.getCode = vi.fn(async () => '0x6000'); // selector absent — must STILL rethrow
+    // hasRevertPayload trips on the `reason` even though the message matches the
+    // bare shape and the selector is absent → rethrown (the original error), not scanned.
+    await expect(a.getMaxKaNumberForAuthor(AUTHOR)).rejects.toThrow('missing revert data');
+    expect(queryFilter).not.toHaveBeenCalled();
+  });
+
+  it('rethrows a CALL_EXCEPTION that says missing-revert-data but carries revert data (genuine revert)', async () => {
+    const err: any = new Error('missing revert data');
+    err.code = 'CALL_EXCEPTION';
+    err.data = '0x08c379a0000000000000000000000000000000000000000000000000000000000000'; // Error(string) selector
+    err.reason = null;
+    const queryFilter = vi.fn(async () => [{ args: { id: pack(9n) } }]);
+    const storage: any = {
+      interface: ifaceWithSelector,
+      getMaxKaNumberForAuthor: viewMock(async () => {
+        throw err;
+      }),
+      filters: { KnowledgeAssetCreated: vi.fn(() => 'F') },
+      queryFilter,
+    };
+    const a = makeAdapter(storage, 100);
+    (a as any).provider.getCode = vi.fn(async () => '0x6000');
+    await expect(a.getMaxKaNumberForAuthor(AUTHOR)).rejects.toThrow('missing revert data');
+    expect(queryFilter).not.toHaveBeenCalled();
+  });
+
+  it('binary-searches the deploy block once and reuses the cached value on later calls', async () => {
+    const head = 100_000;
+    const deployBlock = 90_000;
+    const queryFilter = vi.fn(async () => []);
+    const storage: any = { filters: { KnowledgeAssetCreated: vi.fn(() => 'F') }, queryFilter };
+    const a = makeAdapter(storage, head);
+    const getCode = vi.fn(async (_addr: string, block?: number) =>
+      block === undefined || block >= deployBlock ? '0x6000' : '0x',
+    );
+    (a as any).provider.getCode = getCode;
+
+    await a.getMaxKaNumberForAuthor(AUTHOR);
+    const searchCalls1 = getCode.mock.calls.filter((c) => c.length === 2).length;
+    expect(searchCalls1).toBeGreaterThan(0); // first call binary-searches
+    expect((a as any).cachedKaStorageDeployBlock).toEqual({ address: storage.target, value: deployBlock });
+
+    getCode.mockClear();
+    await a.getMaxKaNumberForAuthor(AUTHOR);
+    expect(getCode.mock.calls.filter((c) => c.length === 2).length).toBe(0); // cache hit: no second search
+  });
+
+  it('falls back (not rethrow) on a bare revert when the view selector cannot be derived from the interface', async () => {
+    const err: any = new Error('missing revert data');
+    err.code = 'CALL_EXCEPTION';
+    err.data = null;
+    err.reason = null;
+    const queryFilter = vi.fn(async () => [{ args: { id: pack(2n) } }]);
+    const storage: any = {
+      interface: {
+        getFunction: () => {
+          throw new Error('no matching fragment');
+        },
+      },
+      getMaxKaNumberForAuthor: viewMock(async () => {
+        throw err;
+      }),
+      filters: { KnowledgeAssetCreated: vi.fn(() => 'F') },
+      queryFilter,
+    };
+    const a = makeAdapter(storage, 1_000);
+    (a as any).provider.getCode = vi.fn(async () => '0x6000');
+    expect(await a.getMaxKaNumberForAuthor(AUTHOR)).toBe(2n); // un-derivable selector => treat as absent => scan
+    expect(queryFilter).toHaveBeenCalled();
+  });
+
+  it('degrades to a genesis-anchored scan (not a hard fail) when historical getCode is unavailable, never anchoring above deploy', async () => {
+    const head = 100_000; // short chain: from-0 is within budget (51 pages)
+    const queryFilter = vi.fn(async () => []);
+    const storage: any = { filters: { KnowledgeAssetCreated: vi.fn(() => 'F') }, queryFilter };
+    const a = makeAdapter(storage, head);
+    // latest getCode (1 arg) confirms code; historical getCode (2 args) throws (pruned/non-archive RPC)
+    (a as any).provider.getCode = vi.fn(async (_addr: string, block?: number) => {
+      if (block !== undefined) throw new Error('missing trie node (pruned node)');
+      return '0x6000';
+    });
+
+    expect(await a.getMaxKaNumberForAuthor(AUTHOR)).toBe(-1n); // still scans — pruned RPCs serve queryFilter
+    expect((queryFilter.mock.calls[0] as unknown as [unknown, number, number])[1]).toBe(0); // genesis (safe lower bound, never above deploy)
+    expect((a as any).cachedKaStorageDeployBlock).toBeUndefined(); // degraded anchor not cached
+  });
+
+  it('uses the configurable kaHighWaterScanPageSize window for the fallback scan', async () => {
+    const head = 30_000;
+    const queryFilter = vi.fn(async () => []);
+    const storage: any = {
+      target: '0x2222222222222222222222222222222222222222',
+      filters: { KnowledgeAssetCreated: vi.fn(() => 'F') },
+      queryFilter,
+    };
+    const a = new EVMChainAdapter(minimalConfig({ kaHighWaterScanPageSize: 10_000 }));
+    (a as any).contracts = { knowledgeAssetStorage: storage };
+    (a as any).initialized = true;
+    (a as any).provider = {
+      getBlockNumber: vi.fn(async () => head),
+      getCode: vi.fn(async () => '0x6000'),
+    };
+
+    expect(await a.getMaxKaNumberForAuthor(AUTHOR)).toBe(-1n);
+    // 10,000-block window (not the 2,000 default): first page is [0, 9999], 4 pages total over 30k blocks.
+    expect((queryFilter.mock.calls[0] as unknown as [unknown, number, number])[2]).toBe(9_999);
+    expect(queryFilter.mock.calls.length).toBe(Math.ceil((head + 1) / 10_000));
   });
 });

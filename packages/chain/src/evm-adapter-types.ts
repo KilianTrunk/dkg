@@ -42,6 +42,15 @@ export interface EVMAdapterBaseConfig {
    * mode semantics.
    */
   approvalPolicy?: ApprovalPolicy;
+  /**
+   * eth_getLogs block-window (in blocks) for the pre-10.0.4
+   * `getMaxKaNumberForAuthor` `KnowledgeAssetCreated` fallback scan. Defaults to
+   * 2,000 — the smallest common provider range cap (e.g. Base Sepolia). Raise it
+   * on an RPC that serves larger `eth_getLogs` ranges so the bounded fallback
+   * covers an older pre-10.0.4 deployment in fewer calls. Values `<= 0` use the
+   * default. Irrelevant for >= 10.0.4 deployments (the O(1) view is used).
+   */
+  kaHighWaterScanPageSize?: number;
 }
 
 export interface EVMAdapterConfig extends EVMAdapterBaseConfig {

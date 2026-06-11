@@ -558,6 +558,27 @@ describe('resolveChainConfig (field-level merge)', () => {
     )?.tokenAddress).toBe(operatorTokenAddress);
   });
 
+  it('merges approvalPolicy with operator override precedence', () => {
+    const networkApprovalPolicy = {
+      mode: 'unlimited' as const,
+    };
+    const operatorApprovalPolicy = {
+      mode: 'replenishing' as const,
+      targetAllowance: '1000000000000000000',
+      refillBelowFraction: 0.5,
+    };
+
+    expect(resolveChainConfig(
+      {},
+      { chain: { ...fullNetworkChain, approvalPolicy: networkApprovalPolicy } },
+    )?.approvalPolicy).toEqual(networkApprovalPolicy);
+
+    expect(resolveChainConfig(
+      { chain: { approvalPolicy: operatorApprovalPolicy } },
+      { chain: { ...fullNetworkChain, approvalPolicy: networkApprovalPolicy } },
+    )?.approvalPolicy).toEqual(operatorApprovalPolicy);
+  });
+
   it('returns a partial block when only config supplies fields (no network)', () => {
     const merged = resolveChainConfig(
       { chain: { rpcUrl: 'https://standalone.example/rpc' } },

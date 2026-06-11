@@ -819,6 +819,22 @@ export function _resetProjectConfigCache(): void {
   _projectConfig = null;
 }
 
+function isPlainConfigObject(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
+
+function requireApprovalPolicyConfig(
+  policy: ApprovalPolicyConfig | undefined,
+): ApprovalPolicyConfig | undefined {
+  if (policy === undefined) return undefined;
+  if (!isPlainConfigObject(policy)) {
+    throw new Error(`chain.approvalPolicy must be an object (got: ${JSON.stringify(policy)})`);
+  }
+  return policy;
+}
+
 /**
  * Field-level merge of the effective auto-update configuration.
  *
@@ -948,8 +964,10 @@ export function resolveChainConfig(
   if (tokenAddress !== undefined) merged.tokenAddress = tokenAddress;
   const chainId = cfg?.chainId ?? net?.chainId;
   if (chainId !== undefined) merged.chainId = chainId;
-  const approvalPolicy = cfg?.approvalPolicy !== undefined || net?.approvalPolicy !== undefined
-    ? { ...net?.approvalPolicy, ...cfg?.approvalPolicy }
+  const cfgApprovalPolicy = requireApprovalPolicyConfig(cfg?.approvalPolicy);
+  const netApprovalPolicy = requireApprovalPolicyConfig(net?.approvalPolicy);
+  const approvalPolicy = cfgApprovalPolicy !== undefined || netApprovalPolicy !== undefined
+    ? { ...netApprovalPolicy, ...cfgApprovalPolicy }
     : undefined;
   if (approvalPolicy !== undefined) merged.approvalPolicy = approvalPolicy;
   if (cfg?.mockIdentityId !== undefined) merged.mockIdentityId = cfg.mockIdentityId;

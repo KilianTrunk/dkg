@@ -595,6 +595,28 @@ describe('resolveChainConfig (field-level merge)', () => {
     });
   });
 
+  it('rejects non-object approvalPolicy values before merging', () => {
+    const networkApprovalPolicy = {
+      mode: 'replenishing' as const,
+      targetAllowance: '1000000000000000000',
+    };
+
+    expect(() => resolveChainConfig(
+      { chain: { approvalPolicy: 'unlimited' as any } },
+      { chain: { ...fullNetworkChain, approvalPolicy: networkApprovalPolicy } },
+    )).toThrow(/chain\.approvalPolicy must be an object/);
+
+    expect(() => resolveChainConfig(
+      { chain: { approvalPolicy: [] as any } },
+      { chain: fullNetworkChain },
+    )).toThrow(/chain\.approvalPolicy must be an object/);
+
+    expect(() => resolveChainConfig(
+      {},
+      { chain: { ...fullNetworkChain, approvalPolicy: [] as any } },
+    )).toThrow(/chain\.approvalPolicy must be an object/);
+  });
+
   it('returns a partial block when only config supplies fields (no network)', () => {
     const merged = resolveChainConfig(
       { chain: { rpcUrl: 'https://standalone.example/rpc' } },

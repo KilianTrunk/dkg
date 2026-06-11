@@ -88,7 +88,8 @@ curl -s -o /dev/null -w 'api/query latency: %{time_total}s\n' -X POST :9200/api/
 >
 > **It can recur.** The in-place update happened because auto-update has
 > prereleases enabled. To opt out of automatic RC updates, set
-> `autoUpdate.allowPrerelease: false` in `~/.dkg/config.json` — your node then
+> `autoUpdate.allowPrerelease: false` in your node config (`~/.dkg/config.json`,
+> or `config.yaml` on YAML installs) — your node then
 > stays on its current build until you update manually and run this guide
 > deliberately (stable releases still auto-update). Watch **#builders** for a
 > heads-up on each off-chain-breaking RC.
@@ -136,7 +137,7 @@ Do this, in order:
 4. Before wiping: if any un-published local WM exists, run the §5 export first —
    the wipe is irreversible. Then wipe the LOCAL store for the detected backend
    (see §4.2). Do NOT touch the keystore (wallets.json/agent-key*), auth.token,
-   or config.json.
+   or your config (config.json/config.yaml).
 5. `dkg start`.
 6. Verify: `dkg doctor`, `/api/status` shows version 10.0.0-rc.17 **and answers
    in <100ms** (not seconds — slow = the store wipe didn't take), and a
@@ -164,7 +165,8 @@ Wiping is safe because **everything dropped is re-derivable**:
 
 - **Verifiable Memory** re-syncs from chain + peers after restart.
 - Your **on-chain identity, stake, and KAs are on Base Sepolia** — untouched.
-- The wipe preserves your **wallet keystore, `auth.token`, and `config.json`**.
+- The wipe preserves your **wallet keystore, `auth.token`, and config
+(`config.json` / `config.yaml`)**.
 
 The only thing genuinely lost is **local Working/Shared Memory you authored
 but never published to Verifiable Memory.** If you have un-published local WM
@@ -215,7 +217,7 @@ rm -f \
   "$NODE_DATA_DIR/store.nq.tmp" \
   "$NODE_DATA_DIR/random-sampling.wal" \
   "$NODE_DATA_DIR/.network-state.json"
-# if you set `randomSampling.walPath` in config.json, the WAL can live OUTSIDE
+# if you set `randomSampling.walPath` in your config, the WAL can live OUTSIDE
 # ~/.dkg — delete that file too.
 # publish journals via `find` so it's glob-safe — a bare `publish-journal.*`
 # aborts the whole command under zsh's nomatch when no journals exist:
@@ -229,11 +231,12 @@ Then clear the RDF store itself:
   nothing more to do — these persist to `store.nq`, already removed above.
 
 - **`oxigraph-server` (DKG-managed local server):** the data is a local
-  RocksDB at `$NODE_DATA_DIR/oxigraph-data`, **not** `store.nq`. With the
-  daemon stopped, drop the RocksDB directory:
+  RocksDB at `$NODE_DATA_DIR/oxigraph-data` — **or wherever `store.options.location`
+  points, if you set it in config** — **not** `store.nq`. With the daemon
+  stopped, drop that RocksDB directory:
 
   ```bash
-  rm -rf "$NODE_DATA_DIR/oxigraph-data"
+  rm -rf "$NODE_DATA_DIR/oxigraph-data"   # or your configured store.options.location
   ```
 
   (If you run oxigraph-server *independently* of the daemon and want to keep it
@@ -291,8 +294,10 @@ at the RPC.
 The **public** Base Sepolia endpoints (`https://sepolia.base.org` and free
 community RPCs) rate-limit aggressively and routinely trip all three. Use a
 **dedicated** Base Sepolia RPC (Alchemy / Infura / QuickNode, or your own node).
-Set it in `~/.dkg/config.json` under `chain` — `rpcUrl` is the primary; `rpcUrls`
-is an ordered fallback list:
+Set it in your node config — `~/.dkg/config.json`, **or `config.yaml` if that's
+what your node already uses** (don't create `config.json` on a YAML node — it
+shadows the YAML) — under `chain`; `rpcUrl` is the primary, `rpcUrls` an ordered
+fallback list:
 
 ```jsonc
 "chain": {
@@ -351,7 +356,7 @@ re-syncs from chain/peers.
 |---|---|
 | Wallet keystore (`wallets.json` / `agent-key*` / `agent-keystore.json`) — same key, same identity | Local RDF store (all pre-rc.17 quads) |
 | `auth.token` (local API token) | `publish-journal.*`, `random-sampling.wal` |
-| `config.json` (your preferences, incl. `store.backend`) | `.network-state.json` (re-derived on boot) |
+| `config.json` / `config.yaml` (your preferences, incl. `store.backend`) | `.network-state.json` (re-derived on boot) |
 | On-chain identity, stake, published KAs (Base Sepolia) | Un-published local WM/SWM (back up first if needed) |
 
 ---
@@ -400,13 +405,13 @@ This manual wipe is the **interim** operator path. The clean, fleet-wide
 options are either of:
 
 1. **Bump `chainResetMarker`** in `network/testnet.json` on the rc.17
-   release. Phase C of [`TESTNET_RESET.md`](TESTNET_RESET.md) then fires the
+   release. Phase C of [`TESTNET_RESET.md`](archive/internal/TESTNET_RESET.md) then fires the
    existing auto-wipe on every node at upgrade (including `DROP ALL` on
    managed `oxigraph-server`), and operators do nothing. Caveat: the marker
    semantically tracks *chain* resets; reusing it for an off-chain layout
    break is a slight abuse but mechanically correct.
 2. **Ship the planned per-KA layout migration** (the "D3d / chorusLayout"
-   step described in `docs/rc17-chorus-implementation.md`) so existing
+   step described in `docs/archive/internal/rc17-chorus-implementation.md`) so existing
    stores are re-homed in place with no wipe.
 
 Until one of those lands and is documented in `CHANGELOG.md` under an
@@ -416,8 +421,8 @@ Until one of those lands and is documented in `CHANGELOG.md` under an
 
 ## 9. Where to get help
 
-- **Per-KA memory-model design:** [`docs/rc17-chorus-implementation.md`](rc17-chorus-implementation.md).
-- **Reset mechanics (auto-wipe / chainResetMarker):** [`docs/TESTNET_RESET.md`](TESTNET_RESET.md).
-- **API route rename:** [`docs/migrations/assertion-to-knowledge-assets.md`](migrations/assertion-to-knowledge-assets.md).
-- **Prior breaking upgrade (for format reference):** [`docs/UPGRADE_RC11_TO_RC12.md`](UPGRADE_RC11_TO_RC12.md).
+- **Per-KA memory-model design:** [`docs/archive/internal/rc17-chorus-implementation.md`](archive/internal/rc17-chorus-implementation.md).
+- **Reset mechanics (auto-wipe / chainResetMarker):** [`docs/archive/internal/TESTNET_RESET.md`](archive/internal/TESTNET_RESET.md).
+- **API route rename:** [`docs/archive/internal/migrations/assertion-to-knowledge-assets.md`](archive/internal/migrations/assertion-to-knowledge-assets.md).
+- **Prior breaking upgrade (for format reference):** [`docs/archive/internal/UPGRADE_RC11_TO_RC12.md`](archive/internal/UPGRADE_RC11_TO_RC12.md).
 - **Discord** #builders / open an issue on [`OriginTrail/dkg`](https://github.com/OriginTrail/dkg/issues) tagged `rc.17-upgrade`.

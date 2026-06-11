@@ -131,6 +131,8 @@ export interface NetworkConfig {
     hubAddress: string;
     tokenAddress?: string;
     chainId: string;
+    /** Network-level default for operator-facing V10 TRAC approval sizing. */
+    approvalPolicy?: ApprovalPolicyConfig;
   };
   faucet?: {
     url: string;

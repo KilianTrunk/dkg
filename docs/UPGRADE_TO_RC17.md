@@ -227,15 +227,16 @@ find "$NODE_DATA_DIR" -maxdepth 1 -name 'publish-journal.*' -delete 2>/dev/null
 Then clear the RDF store itself:
 
 - **`oxigraph-worker` (the default — what `/api/status` reports when there's no
-  `store` block in your config) and `oxigraph-persistent`:** these persist the
-  whole store to one N-Quads file at **`store.options.path`** — default
-  `$NODE_DATA_DIR/store.nq`, already removed above. If you set a custom
+  `store` block in your config):** persists to `store.options.path`, **default
+  `$NODE_DATA_DIR/store.nq`** — already removed above. If you set a custom
   `store.options.path`, remove *that* file (and its `.tmp`) instead.
 
-- **`oxigraph` (in-memory):** ephemeral unless you configured a
-  `store.options.path`. With no path there's nothing on disk to wipe (the data is
-  gone once the daemon stops) and nothing to back up in §5; with a path, remove
-  that file as for the persistent backends above.
+- **`oxigraph-persistent`:** persists to the `store.options.path` you configured,
+  which **may not be `store.nq`**. Remove (or, for §5, copy) **that** file and its
+  `.tmp` — don't assume `store.nq`.
+
+- **`oxigraph` (in-memory):** ephemeral — nothing on disk to wipe or back up,
+  unless you set a `store.options.path` (then treat it like `oxigraph-persistent`).
 
 - **`oxigraph-server` (DKG-managed local server):** the data is a local
   RocksDB at `$NODE_DATA_DIR/oxigraph-data` — **or wherever `store.options.location`
@@ -249,6 +250,8 @@ Then clear the RDF store itself:
   (If you run oxigraph-server *independently* of the daemon and want to keep it
   up, issue a SPARQL `DROP ALL` against its update endpoint instead —
   `curl -s -X POST http://127.0.0.1:7878/update --data-urlencode 'update=DROP ALL'`.
+  Port `7878` is the default — substitute your `store.options.port` if you moved
+  it (same for the `:7878` `/store` backup in §5; or read it from `/api/status`).
   After `dkg stop` the DKG-managed server is down, so just use the `rm -rf` path
   above. `DROP ALL` is safe only because this namespace is DKG-owned — **never**
   run it against a shared `sparql-http`/`blazegraph` endpoint; use the scoped
@@ -319,7 +322,7 @@ and the warnings stop:
 
 ```bash
 time curl -s :9200/api/status >/dev/null                            # well under 1s
-tail -300 ~/.dkg/daemon.log | grep -c 'unconfirmed context graph'   # should trend to 0
+tail -300 "${DKG_HOME:-$HOME/.dkg}/daemon.log" | grep -c 'unconfirmed context graph'   # should trend to 0
 ```
 
 > Edge nodes need a reliable RPC to publish; **core/host nodes need it too** — a
@@ -344,7 +347,8 @@ cp "${DKG_HOME:-$HOME/.dkg}/store.nq" ~/dkg-prewipe-backup.nq   # or your store.
 # (in-memory `oxigraph` with no store.options.path keeps nothing on disk — no backup needed.)
 
 # oxigraph-server (managed): dump the whole dataset via the /store endpoint —
-# this preserves graph names (note `/store`, NOT `/query`):
+# this preserves graph names (note `/store`, NOT `/query`). Port 7878 is the
+# default — substitute your store.options.port if you changed it:
 curl -s 'http://127.0.0.1:7878/store' -H 'Accept: application/n-quads' \
   > ~/dkg-prewipe-backup.nq
 

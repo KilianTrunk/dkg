@@ -53,7 +53,23 @@ export function mapPublishResultToLiftJobSuccess(params: {
   }
 
   if (!onChain) {
+    // GH #1013 — a private publish that failed to reach its chain-registered CG
+    // (no collectable ACKs) must NOT be reported as `finalized` with a
+    // provisional UAL. Fail honestly so callers can tell "stored locally, not on
+    // chain" from a real on-chain finalization. (Reaching chain for private CGs
+    // is the #1121 encryption work.) The data is still staged locally under the
+    // provisional UAL, surfaced in the error for debugging/recovery.
+    if (publishResult.status === 'tentative' && publishResult.localChainSkipReason === 'private-no-acks') {
+      throw new Error(
+        `Async publish to a chain-registered context graph could not reach Verifiable Memory: ` +
+        `private payload had no collectable storage ACKs (peers cannot see private data). ` +
+        `Data is staged locally under provisional UAL ${publishResult.ual} but is NOT on chain. ` +
+        `See GH #1013 (honesty) and GH #1121 (encrypted private async publish).`,
+      );
+    }
     if (publishResult.status === 'tentative') {
+      // Honest local finalization: there is genuinely no chain to reach
+      // (`no-chain` skip reason, or a legacy/no-chain-adapter node).
       return {
         status: 'finalized',
         finalization: {

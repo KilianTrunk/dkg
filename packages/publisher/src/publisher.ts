@@ -359,6 +359,19 @@ export interface PublishResult {
   kaManifest: KAManifestEntry[];
   status: 'tentative' | 'confirmed' | 'failed';
   onChainResult?: OnChainPublishResult;
+  /**
+   * GH #1013 — when a publish lands `tentative` (local-only), WHY it skipped
+   * chain submission:
+   *   - `no-chain`        — no on-chain CG id / chain not V10-ready: local is the
+   *                         only possible outcome (an honest local finalization).
+   *   - `private-no-acks` — the CG IS chain-registered but a private payload
+   *                         couldn't collect storage ACKs, so it never reached the
+   *                         chain it should have. The async lift must NOT report
+   *                         this as `finalized` with a provisional UAL (#1013) —
+   *                         the real fix for reaching chain here is #1121.
+   * Undefined on confirmed publishes and pre-#1013 results.
+   */
+  localChainSkipReason?: 'no-chain' | 'private-no-acks';
   /** Public quads that were stored (used for broadcast — never includes private triples). */
   publicQuads?: Quad[];
   /** Set when KC is confirmed on-chain but context-graph registration failed. */

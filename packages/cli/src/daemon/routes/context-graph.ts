@@ -984,10 +984,18 @@ export async function handleContextGraphRoutes(ctx: RequestContext): Promise<voi
   if (req.method === "GET" && joinRequestsMatch) {
     const contextGraphId = decodeURIComponent(joinRequestsMatch[1]);
     try {
-      const requests = await agent.listPendingJoinRequests(contextGraphId);
+      // GH #757 — pass the caller so the agent can enforce curator-only access.
+      const requests = await agent.listPendingJoinRequests(contextGraphId, requestAgentAddress);
       return jsonResponse(res, 200, { contextGraphId, requests });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
+      // GH #757 — map the curator/creator owner-check failure to 403 (reusing
+      // the shared classifier that already handles "Only the context graph
+      // curator …"); everything else stays a 400.
+      const classified = classifyRegisterContextGraphError(err);
+      if (classified && classified.status === 403) {
+        return jsonResponse(res, 403, classified.body ?? { error: msg });
+      }
       return jsonResponse(res, 400, { error: msg });
     }
   }

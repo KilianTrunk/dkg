@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { OxigraphStore, type Quad } from '@origintrail-official/dkg-storage';
+import { contextGraphLayerUri, MemoryLayer } from '@origintrail-official/dkg-core';
 import { DKGQueryEngine } from '../src/dkg-query-engine.js';
 
 const CG_ID = 'dkg-v10-dev';
@@ -86,10 +87,46 @@ describe('sub-graph query scoping', () => {
     expect(result.bindings).toHaveLength(0);
   });
 
-  it('rejects subGraphName combined with view-based routing', async () => {
-    await expect(engine.query(
-      'SELECT ?s ?sig WHERE { ?s <http://ex.org/signature> ?sig }',
-      { contextGraphId: CG_ID, view: 'verifiable-memory', subGraphName: 'code' },
-    )).rejects.toThrow('subGraphName cannot be combined with view-based routing');
+  // GH #184 / #675 — view-based routing now scopes to / includes sub-graphs.
+  describe('GH #184 / #675 — sub-graph scoping under view-based routing', () => {
+    const ADDR = '0x1111111111111111111111111111111111111111';
+    const NAME = 'http://schema.org/name';
+    const ROOT_ENTITY = 'https://example.org/root-entity';
+    const SUB_ENTITY = 'https://example.org/subgraph-entity';
+    const ROOT_WM = contextGraphLayerUri(CG_ID, MemoryLayer.WorkingMemory, ADDR, 1);
+    const SUB_WM = contextGraphLayerUri(CG_ID, MemoryLayer.WorkingMemory, ADDR, 2, 'code');
+    const META = `did:dkg:context-graph:${CG_ID}/_meta`;
+    const SUBGRAPH_URN = `urn:dkg:subgraph:${CG_ID}:code`;
+
+    beforeEach(async () => {
+      await store.insert([
+        { subject: ROOT_ENTITY, predicate: NAME, object: '"RootEntity"', graph: ROOT_WM },
+        { subject: SUB_ENTITY, predicate: NAME, object: '"SubGraphEntity"', graph: SUB_WM },
+        // Register the `code` sub-graph in `_meta` (the authoritative registry
+        // the engine fans out over for #675).
+        { subject: SUBGRAPH_URN, predicate: 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type', object: 'http://dkg.io/ontology/SubGraph', graph: META },
+        { subject: SUBGRAPH_URN, predicate: 'http://schema.org/name', object: '"code"', graph: META },
+      ]);
+    });
+
+    it('#675: WM view (no subGraphName) includes BOTH root and sub-graph data', async () => {
+      const result = await engine.query(
+        `SELECT ?s ?o WHERE { ?s <${NAME}> ?o }`,
+        { contextGraphId: CG_ID, view: 'working-memory', agentAddress: ADDR },
+      );
+      const subjects = result.bindings.map((b) => b['s']);
+      expect(subjects).toContain(ROOT_ENTITY);
+      expect(subjects).toContain(SUB_ENTITY);
+    });
+
+    it('#184: WM view + subGraphName scopes to the sub-graph (no throw)', async () => {
+      const result = await engine.query(
+        `SELECT ?s ?o WHERE { ?s <${NAME}> ?o }`,
+        { contextGraphId: CG_ID, view: 'working-memory', agentAddress: ADDR, subGraphName: 'code' },
+      );
+      const subjects = result.bindings.map((b) => b['s']);
+      expect(subjects).toContain(SUB_ENTITY);
+      expect(subjects).not.toContain(ROOT_ENTITY);
+    });
   });
 });

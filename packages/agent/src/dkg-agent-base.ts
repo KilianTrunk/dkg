@@ -135,7 +135,7 @@ import { DKGAgentWallet, type AgentWallet } from './agent-wallet.js';
 
 import { ProfileManager } from './profile-manager.js';
 import { DiscoveryClient, type SkillSearchOptions, type DiscoveredAgent, type DiscoveredOffering } from './discovery.js';
-import { MessageHandler, type SkillHandler, type SkillRequest, type SkillResponse, type ChatHandler, type ChatAclCheck } from './messaging.js';
+import { MessageHandler, type SkillHandler, type SkillRequest, type SkillResponse, type ChatHandler, type ChatAclCheck, type SkillAclCheck } from './messaging.js';
 import { ed25519ToX25519Private, ed25519ToX25519Public } from './encryption.js';
 import { AGENT_REGISTRY_CONTEXT_GRAPH, canonicalAgentDidSubject, collectPublishableMultiaddrs, type AgentProfileConfig } from './profile.js';
 import {
@@ -1110,6 +1110,8 @@ export class DKGAgentBase {
   /** Pending chat handler/ACL captured before the messenger is wired (moved here during the mixin split). */
   protected _pendingChatHandler: ChatHandler | null = null;
   protected _pendingChatAcl: ChatAclCheck | null = null;
+  /** GH #462 — pending skill ACL captured before the messenger is wired. */
+  protected _pendingSkillAcl: SkillAclCheck | null = null;
 
   protected constructor(
     config: DKGAgentConfig,

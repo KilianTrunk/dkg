@@ -60,6 +60,12 @@ export function resolveViewGraphs(
     kaNumber?: bigint;
     /** Spec §12/§14 trust-gradient filter. Enforced after graph resolution. */
     minTrust?: TrustLevel;
+    /**
+     * GH #184 — when set, the view is scoped to this registered sub-graph: the
+     * uniform layout stores sub-graph layer data at `…/{sub}/{slug}/…`, so the
+     * per-layer prefixes below gain the `/{sub}` segment.
+     */
+    subGraphName?: string;
   },
 ): ViewResolution {
   if (REMOVED_VIEWS.includes(view as string)) {
@@ -68,6 +74,8 @@ export function resolveViewGraphs(
       `See migration guide for details.`,
     );
   }
+  // GH #184 — sub-graph segment threaded into every per-layer prefix/graph.
+  const sg = opts?.subGraphName ? `/${opts.subGraphName}` : '';
   switch (view) {
     case 'working-memory': {
       if (!opts?.agentAddress) {
@@ -87,15 +95,15 @@ export function resolveViewGraphs(
       }
       return {
         graphs: [],
-        graphPrefixes: [`did:dkg:context-graph:${contextGraphId}/_working_memory/${opts.agentAddress}/`],
+        graphPrefixes: [`did:dkg:context-graph:${contextGraphId}${sg}/_working_memory/${opts.agentAddress}/`],
       };
     }
     case 'shared-working-memory':
       // Uniform layout: SWM is per-KA `…/_shared_memory/{addr}/{number}` (the prefix);
       // the bare bucket is kept as a read-both fallback (empty in the pure per-KA flow).
       return {
-        graphs: [contextGraphSharedMemoryUri(contextGraphId)],
-        graphPrefixes: [`did:dkg:context-graph:${contextGraphId}/_shared_memory/`],
+        graphs: [contextGraphSharedMemoryUri(contextGraphId, opts?.subGraphName)],
+        graphPrefixes: [`did:dkg:context-graph:${contextGraphId}${sg}/_shared_memory/`],
       };
     case 'verifiable-memory': {
       // `minTrust` is a verifiable-memory concept. The earlier iterations ran the
@@ -164,8 +172,10 @@ export function resolveViewGraphs(
       // `dkg:trustLevel` ConsensusVerified by
       // `DKGAgent.promoteToVerifiableMemory`).
       return {
-        graphs: [`did:dkg:context-graph:${contextGraphId}`],
-        graphPrefixes: [`did:dkg:context-graph:${contextGraphId}/_verifiable_memory/`],
+        // The root content graph carries no sub-graph segment; when scoped to a
+        // sub-graph, the per-KA `…/{sub}/_verifiable_memory/*` prefix is the source.
+        graphs: opts?.subGraphName ? [] : [`did:dkg:context-graph:${contextGraphId}`],
+        graphPrefixes: [`did:dkg:context-graph:${contextGraphId}${sg}/_verifiable_memory/`],
       };
     }
   }
@@ -315,11 +325,12 @@ export class DKGQueryEngine implements QueryEngine {
           `view '${options.view}' requires a contextGraphId to scope the query`,
         );
       }
+      // GH #184 — `subGraphName` + `view` is now supported: the view scopes to
+      // the named sub-graph's per-layer partitions (handled in queryWithView /
+      // resolveViewGraphs). Validate the name shape before routing.
       if (options.subGraphName) {
-        throw new Error(
-          `subGraphName cannot be combined with view-based routing (view='${options.view}'). ` +
-          'Sub-graph scoping within views is deferred to V10.x.',
-        );
+        const v = validateSubGraphName(options.subGraphName);
+        if (!v.valid) throw new Error(v.reason);
       }
       return this.queryWithView(sparql, options.view, effectiveContextGraphId, options);
     }
@@ -420,6 +431,8 @@ export class DKGQueryEngine implements QueryEngine {
       verifiedGraph: options.verifiedGraph,
       assertionName: options.assertionName,
       kaNumber,
+      // GH #184 — scope the view to a named sub-graph when requested.
+      subGraphName: options.subGraphName,
       // Back-compat: accept the legacy `_minTrust` underscore form for a
       // deprecation window. See QueryOptions._minTrust.
       minTrust: options.minTrust ?? options._minTrust,
@@ -431,6 +444,31 @@ export class DKGQueryEngine implements QueryEngine {
       const discovered = await this.discoverGraphsByPrefix(prefix);
       allGraphs.push(...discovered);
     }
+
+    // GH #675 — a view read WITHOUT an explicit subGraphName must also include
+    // data that lives in registered sub-graphs. The uniform layout stores those
+    // at `…/{sub}/{slug}/…`, which the context-graph-root prefix never matches,
+    // so they were silently excluded. Fan out across registered sub-graphs and
+    // add each one's per-layer partitions. (A by-name WM read is already pinned
+    // to a single graph, so skip the fan-out there.)
+    if (!options.subGraphName && !(view === 'working-memory' && options.assertionName)) {
+      const subNames = await this.discoverRegisteredSubGraphNames(contextGraphId);
+      for (const sub of subNames) {
+        const subResolution = resolveViewGraphs(view, contextGraphId, {
+          agentAddress: options.agentAddress,
+          subGraphName: sub,
+        });
+        allGraphs.push(...subResolution.graphs);
+        for (const prefix of subResolution.graphPrefixes) {
+          allGraphs.push(...(await this.discoverGraphsByPrefix(prefix)));
+        }
+      }
+    }
+
+    // De-dup so a sub-graph never gets unioned twice.
+    const dedupedGraphs = [...new Set(allGraphs)];
+    allGraphs.length = 0;
+    allGraphs.push(...dedupedGraphs);
 
     if (allGraphs.length === 0) {
       // PR #239 / r17-2: a zero-graph resolution (e.g. a `verifiable-memory`

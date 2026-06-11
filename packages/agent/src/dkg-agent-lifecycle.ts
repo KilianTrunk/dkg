@@ -1521,6 +1521,12 @@ export class LifecycleSyncMethods extends DKGAgentBase {
       this._pendingChatAcl = null;
     }
 
+    // GH #462 — wire up pending skill ACL (set via `agent.setSkillAcl(...)`).
+    if (this._pendingSkillAcl) {
+      this.messageHandler.setSkillAcl(this._pendingSkillAcl);
+      this._pendingSkillAcl = null;
+    }
+
     // Register skill handlers
     if (this.config.skills) {
       for (const skill of this.config.skills) {

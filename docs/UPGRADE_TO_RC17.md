@@ -28,25 +28,58 @@ re-derivable — if you have any, export it first (**§5**) before you wipe.
 
 If your node **auto-updated** from rc.16 (or any pre-rc.17 build) to rc.17, it
 is now running rc.17 code over old-layout data — the split-brain state above.
-This hit essentially every node that had auto-update enabled. **Confirm in 30
-seconds:**
+This hit essentially every node that had auto-update enabled.
+
+> **Most visible symptom — node sluggish, queries hang.** Beyond the stale-data
+> visibility bugs in §1, the oversized old-layout store makes the daemon
+> unresponsive: `/api/query` and `/dkg/10.0.2/sync` take seconds or time out, and
+> **publishing fails on validation timeouts** before it ever reaches the network.
+> On the **`oxigraph-server`** backend this shows up starkly as the separate
+> `oxigraph-server` process pegging CPU (200–360%+ even when idle, on the rc.17
+> nodes we observed on that backend); on the **default `oxigraph-worker`**
+> (in-process worker thread, no separate process) the same bloat instead surfaces
+> as daemon-process CPU and worker-thread query hangs — `/api/status` can look
+> green while `/api/query` stalls. The one-time wipe in §4.2 fixes it — on one
+> oxigraph-server node, CPU dropped ~360% → ~3% and `/api/status` latency 5.6s →
+> 5ms the instant it restarted on a fresh store (magnitude depends on backend +
+> store size). This hits **every** rc.17 node that auto-updated, **including
+> core/host nodes** — if your fleet's cores auto-updated, wipe them too.
+>
+> Note: a clean/fresh node can *also* fail to publish for an unrelated reason — a
+> slow chain RPC. If publishing still fails after the wipe, see **§4.3**.
+
+**Confirm in 30 seconds:**
 
 ```bash
-# A) On rc.17, but the store still holds a large pre-upgrade quad count?
-curl -s :9200/api/status | jq '{version, storeQuads}'
-#    version 10.0.0-rc.17 + tens/hundreds of thousands of quads = strong signal
+# A) Backend + size. NOTE: storeQuads is non-null ONLY on oxigraph-server /
+#    blazegraph / sparql-http. On the DEFAULT oxigraph-worker it is always null —
+#    use the store.nq file size instead.
+curl -s :9200/api/status | jq '{version, storeBackend, storeQuads}'
+ls -lh "${DKG_HOME:-$HOME/.dkg}/store.nq" 2>/dev/null   # oxigraph-worker: a multi-MB/GB file = bloated old-layout store
+#    rc.17 + a large store.nq (or, on oxigraph-server, storeQuads in the 100k+) = strong signal
 
-# B) Definitive — do OLD /assertion/ graphs still exist? Query your store's
-#    SPARQL endpoint (oxigraph-server default shown; adjust host/port for your
-#    backend):
-curl -s -G http://127.0.0.1:7878/query -H 'Accept: text/csv' \
-  --data-urlencode 'query=SELECT (COUNT(DISTINCT ?g) AS ?n) WHERE { GRAPH ?g { ?s ?p ?o } FILTER(CONTAINS(STR(?g),"/assertion/")) }'
+# B) Definitive — do OLD /assertion/ graphs still exist? Route through the daemon
+#    so it works on EVERY backend (incl. the default oxigraph-worker):
+curl -s -X POST :9200/api/query \
+  -H "Authorization: Bearer $(cat "${DKG_HOME:-$HOME/.dkg}/auth.token")" \
+  -H 'Content-Type: application/json' \
+  -d '{"sparql":"SELECT (COUNT(DISTINCT ?g) AS ?n) WHERE { GRAPH ?g { ?s ?p ?o } FILTER(CONTAINS(STR(?g),\"/assertion/\")) }"}'
+#    (oxigraph-server only, optional: hit http://127.0.0.1:7878/query directly.)
+
+# C) Symptom check — sluggish node? (only oxigraph-server runs a SEPARATE process)
+ps aux | grep '[o]xigraph' | awk '{print $3"% CPU"}'   # oxigraph-server: 200%+ when idle = affected
+curl -s -o /dev/null -w 'api/query latency: %{time_total}s\n' -X POST :9200/api/query \
+  -H "Authorization: Bearer $(cat "${DKG_HOME:-$HOME/.dkg}/auth.token")" \
+  -H 'Content-Type: application/json' -d '{"sparql":"ASK {}"}'   # >1s = degraded (works on all backends)
 ```
 
-- **Count > 0 — or you simply auto-updated in place (didn't fresh-install
-  rc.17):** you're affected → do the one-time wipe in **§4.2**. Wallet,
-  identity, and on-chain assets are safe.
-- **Count = 0 and you fresh-installed rc.17:** already clean — nothing to do.
+- **If you auto-updated in place (didn't fresh-install rc.17), you are affected** —
+  do the one-time wipe in **§4.2**, regardless of what the counts say. Wallet,
+  identity, and on-chain assets are safe. (A non-zero `/assertion/` count from B
+  confirms it; a connection-refused on `:7878` just means you're on the embedded
+  worker backend — **not** that you're clean.)
+- **Only if you fresh-installed rc.17** (and the B count is 0): already clean —
+  nothing to do.
 
 > **Why your node didn't self-heal:** rc.17 is an *off-chain* breaking change,
 > so it does **not** bump `chainResetMarker` — the daemon's automatic
@@ -72,6 +105,8 @@ curl -s -G http://127.0.0.1:7878/query -H 'Accept: text/csv' \
 | 4 | Failure mode | Node boots fine; no crash | Pre-rc.17 KAs may be **invisible / not served / not synced** under the new layout |
 | 5 | HTTP API | `/api/assertion/*` → `/api/knowledge-assets/*` | Update any monitoring / scripts that hit the old route |
 | 6 | Chain / wire | No contract redeploy; sync protocol unchanged (`/dkg/10.0.2/sync`) | No on-chain action; no fund/identity loss |
+| 7 | RPC endpoint | A slow / public RPC (e.g. `sepolia.base.org`) rate-limits chain reads & writes | `unconfirmed context graph` warnings, publish access-policy **"unknown"**, `register`/publish tx timeouts — use a dedicated RPC (**§4.3**) |
+| 8 | Known bug #1124 | Publishing to a **public** CG (access-policy 0) fails at ACK quorum with `NO_DATA_IN_SWM` | NOT the upgrade and NOT the RPC — use **private** CGs (access-policy 1) until fixed; **don't re-wipe** chasing it (see §7) |
 
 If you upgrade in place **without** the wipe, the node will run, but expect
 stale-data visibility bugs. The clean path below avoids all of that.
@@ -98,14 +133,21 @@ Do this, in order:
 3. Update to rc.17, pinned: `dkg update 10.0.0-rc.17` (or
    `npm install -g @origintrail-official/dkg@10.0.0-rc.17`). A bare `dkg update`
    is not deterministic — `autoUpdate.allowPrerelease: false` nodes may skip it.
-4. Wipe the LOCAL store for the detected backend (see §4.2). Do NOT touch
-   the keystore (wallets.json/agent-key*), auth.token, or config.json.
+4. Before wiping: if any un-published local WM exists, run the §5 export first —
+   the wipe is irreversible. Then wipe the LOCAL store for the detected backend
+   (see §4.2). Do NOT touch the keystore (wallets.json/agent-key*), auth.token,
+   or config.json.
 5. `dkg start`.
-6. Verify: `dkg doctor`, `/api/status` shows version 10.0.0-rc.17, and a
+6. Verify: `dkg doctor`, `/api/status` shows version 10.0.0-rc.17 **and answers
+   in <100ms** (not seconds — slow = the store wipe didn't take), and a
    spot-check query returns post-upgrade data. Confirm logs show no
    leftover pre-rc.17 graph URIs being gossiped/dropped.
+7. Check the RPC: if logs repeat `unauthorized or unconfirmed context graph`
+   or publishes fail with access-policy "unknown", the chain RPC is too slow —
+   set a dedicated `chain.rpcUrl` (see §4.3) and restart. This is independent of
+   the wipe.
 
-Report the backend you wiped and the verification output.
+Report the backend you wiped, the RPC you use, and the verification output.
 ```
 
 ---
@@ -160,6 +202,11 @@ dkg update 10.0.0-rc.17     # or: npm install -g @origintrail-official/dkg@10.0.
 **Step 2 — wipe the local store for your backend.** In all cases also remove
 the file-side state so journals/WAL/marker can't reference stale data:
 
+> **STOP — irreversible.** If you authored local Working/Shared Memory you never
+> published to Verifiable Memory, export it **now** (**§5**). This step destroys
+> it, and §5 cannot be run afterward. Everything else (VM, identity, on-chain
+> assets) is safe.
+
 ```bash
 NODE_DATA_DIR="${DKG_HOME:-$HOME/.dkg}"
 # fixed-name file-side state
@@ -168,6 +215,8 @@ rm -f \
   "$NODE_DATA_DIR/store.nq.tmp" \
   "$NODE_DATA_DIR/random-sampling.wal" \
   "$NODE_DATA_DIR/.network-state.json"
+# if you set `randomSampling.walPath` in config.json, the WAL can live OUTSIDE
+# ~/.dkg — delete that file too.
 # publish journals via `find` so it's glob-safe — a bare `publish-journal.*`
 # aborts the whole command under zsh's nomatch when no journals exist:
 find "$NODE_DATA_DIR" -maxdepth 1 -name 'publish-journal.*' -delete 2>/dev/null
@@ -187,9 +236,13 @@ Then clear the RDF store itself:
   rm -rf "$NODE_DATA_DIR/oxigraph-data"
   ```
 
-  (Equivalent if you prefer to keep the server running: issue a SPARQL
-  `DROP ALL` against its update endpoint —
-  `curl -s -X POST http://127.0.0.1:7878/update --data-urlencode 'update=DROP ALL'`.)
+  (If you run oxigraph-server *independently* of the daemon and want to keep it
+  up, issue a SPARQL `DROP ALL` against its update endpoint instead —
+  `curl -s -X POST http://127.0.0.1:7878/update --data-urlencode 'update=DROP ALL'`.
+  After `dkg stop` the DKG-managed server is down, so just use the `rm -rf` path
+  above. `DROP ALL` is safe only because this namespace is DKG-owned — **never**
+  run it against a shared `sparql-http`/`blazegraph` endpoint; use the scoped
+  `DELETE` shown below.)
 
 - **`sparql-http` / `blazegraph` (operator-provided endpoint):** the daemon
   shares this instance, so clear only the V10 graphs (don't nuke unrelated
@@ -211,8 +264,55 @@ dkg doctor
 curl -s :9200/api/status | jq '{version, storeBackend, storeQuads}'
 ```
 
-Expect `version: "10.0.0-rc.17"` and a `storeQuads` count that starts low and
-grows as VM re-syncs.
+Expect `version: "10.0.0-rc.17"`. On **oxigraph-server / external** backends
+`storeQuads` starts low and climbs as VM re-syncs; on the **default
+oxigraph-worker** `storeQuads` is always `null` — instead confirm the §0-B
+`/assertion/` count has dropped to 0.
+
+### 4.3 Use a reliable RPC endpoint (or sync + publish silently stall)
+
+Separate from the store wipe, the **most common reason a *clean* rc.17 node
+"works but can't publish"** is a slow chain RPC. rc.17 will only host or sync a
+CG's Shared Memory once it has **confirmed that CG from chain state** — the
+on-chain `ContextGraphCreated` event seeds the node's local meta/policy cache —
+and it reads the **live on-chain access policy** before choosing an encrypted vs
+plaintext payload. A slow RPC leaves CGs unconfirmed and the access policy
+unreadable, so hosting stops and publishes fail — with no obvious error pointing
+at the RPC.
+
+**Tell-tale signs your RPC is too slow:**
+
+- Logs repeat `Skipping SWM sync for unauthorized or unconfirmed context graph "…"`.
+- Publishing (UI/agent) fails with access-policy **"unknown"** — the on-chain
+  access policy couldn't be read in time.
+- `dkg context-graph register` or a publish tx fails with
+  `… transaction signing via RPC #1 timed out after 10000ms`.
+
+The **public** Base Sepolia endpoints (`https://sepolia.base.org` and free
+community RPCs) rate-limit aggressively and routinely trip all three. Use a
+**dedicated** Base Sepolia RPC (Alchemy / Infura / QuickNode, or your own node).
+Set it in `~/.dkg/config.json` under `chain` — `rpcUrl` is the primary; `rpcUrls`
+is an ordered fallback list:
+
+```jsonc
+"chain": {
+  "chainId": "base:84532",
+  "rpcUrl":  "https://<your-dedicated-base-sepolia-rpc>",
+  "rpcUrls": ["https://<backup-1>"]
+}
+```
+
+Restart after changing it (`dkg stop && dkg start`), then confirm reads are fast
+and the warnings stop:
+
+```bash
+time curl -s :9200/api/status >/dev/null                            # well under 1s
+tail -300 ~/.dkg/daemon.log | grep -c 'unconfirmed context graph'   # should trend to 0
+```
+
+> Edge nodes need a reliable RPC to publish; **core/host nodes need it too** — a
+> core on a slow RPC marks CGs unconfirmed and won't host their Shared Memory,
+> which silently starves every publisher that depends on it for ACK quorum.
 
 ---
 
@@ -267,6 +367,30 @@ re-syncs from chain/peers.
       (`SELECT (COUNT(DISTINCT ?g) AS ?n) WHERE { GRAPH ?g { ?s ?p ?o } FILTER(CONTAINS(STR(?g),"/assertion/")) }` returns 0).
 - [ ] Daemon logs show no repeated "validation failed / dropping" churn from
       stale gossiped entries.
+- [ ] **`oxigraph-server` CPU is back to idle** (single digits, not 200%+) and
+      `/api/status` answers in <100ms — i.e. the wipe actually relieved the store:
+      `ps aux | grep '[o]xigraph'` · `curl -s -o /dev/null -w '%{time_total}s\n' :9200/api/status`.
+- [ ] No `unauthorized or unconfirmed context graph` warnings in recent logs
+      (if present → RPC too slow, see **§4.3**).
+- [ ] *(Optional, costs a little gas + TRAC)* **publish smoke test** — prove you
+      can actually write to Verifiable Memory end-to-end:
+
+      ```bash
+      dkg context-graph create upgrade-smoke --access-policy 1   # private/curated; prints the full <cgId>
+      dkg context-graph register <cgId>                          # on-chain confirm — do NOT re-pass --access-policy
+      dkg shared-memory write   <cgId> --name t1 -s https://example.org/e/1 -p https://schema.org/name -o '"ok"'
+      dkg shared-memory publish <cgId> --name t1                 # expect: Status: confirmed
+      ```
+      Use the **full `<cgId>`** that `create` prints (it prefixes the slug with
+      your agent address) in all four commands; re-passing `--access-policy` to
+      `register` trips a deliberate mismatch guard — it inherits the create policy.
+
+> **Smoke-test with a _private_ CG (`--access-policy 1`).** Publishing to a
+> **public** CG (`--access-policy 0`) currently fails at ACK quorum with
+> `NO_DATA_IN_SWM` — a known rc.17 bug
+> ([OriginTrail/dkg#1124](https://github.com/OriginTrail/dkg/issues/1124)),
+> **not** an upgrade problem. Don't re-wipe chasing it — use private CGs until
+> the fix lands.
 
 ---
 

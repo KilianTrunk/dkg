@@ -226,9 +226,16 @@ find "$NODE_DATA_DIR" -maxdepth 1 -name 'publish-journal.*' -delete 2>/dev/null
 
 Then clear the RDF store itself:
 
-- **`oxigraph-worker` (the default — what `/api/status` reports when there is
-  no `store` block in `config.json`), plus `oxigraph` / `oxigraph-persistent`:**
-  nothing more to do — these persist to `store.nq`, already removed above.
+- **`oxigraph-worker` (the default — what `/api/status` reports when there's no
+  `store` block in your config) and `oxigraph-persistent`:** these persist the
+  whole store to one N-Quads file at **`store.options.path`** — default
+  `$NODE_DATA_DIR/store.nq`, already removed above. If you set a custom
+  `store.options.path`, remove *that* file (and its `.tmp`) instead.
+
+- **`oxigraph` (in-memory):** ephemeral unless you configured a
+  `store.options.path`. With no path there's nothing on disk to wipe (the data is
+  gone once the daemon stops) and nothing to back up in §5; with a path, remove
+  that file as for the persistent backends above.
 
 - **`oxigraph-server` (DKG-managed local server):** the data is a local
   RocksDB at `$NODE_DATA_DIR/oxigraph-data` — **or wherever `store.options.location`
@@ -331,9 +338,10 @@ published to Verifiable Memory, export it before wiping:
 # the default graph — it loses the WM/SWM/VM graph URIs and is NOT a usable
 # backup. Use a dataset-level N-Quads export per backend:
 
-# oxigraph-worker / oxigraph (default, embedded): the store IS already an
-# N-Quads file — just copy it:
-cp "${DKG_HOME:-$HOME/.dkg}/store.nq" ~/dkg-prewipe-backup.nq
+# oxigraph-worker / oxigraph-persistent (embedded): the store IS already an
+# N-Quads file at store.options.path (default store.nq) — just copy it:
+cp "${DKG_HOME:-$HOME/.dkg}/store.nq" ~/dkg-prewipe-backup.nq   # or your store.options.path
+# (in-memory `oxigraph` with no store.options.path keeps nothing on disk — no backup needed.)
 
 # oxigraph-server (managed): dump the whole dataset via the /store endpoint —
 # this preserves graph names (note `/store`, NOT `/query`):

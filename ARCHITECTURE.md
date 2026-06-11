@@ -374,13 +374,14 @@ Mock mode is the exception: an operator `chain.type = "mock"` short-circuits the
 merge and strips inherited EVM endpoint fields so no daemon consumer can
 accidentally open a real JSON-RPC provider while a `MockChainAdapter` is wired.
 
-`chain.approvalPolicy` belongs to the operator-facing chain config. It must be
-preserved by the same resolution boundary so `packages/cli/src/daemon/lifecycle.ts`
-can convert it with `resolveApprovalPolicy()` and pass the runtime
-`ApprovalPolicy` into `DKGAgent.chainConfig`; the agent then forwards it to
-`EVMChainAdapter`, where allowance sizing is applied. `resolveApprovalPolicy()`
-is the only conversion point from YAML/JSON string numerics to runtime `bigint`
-fields.
+`chain.approvalPolicy` belongs to the operator-facing chain config. The policy
+block is also field-merged, so an operator can override one policy field while
+inheriting the rest from network config. The resolved policy then flows to
+`packages/cli/src/daemon/lifecycle.ts`, which converts it with
+`resolveApprovalPolicy()` and passes the runtime `ApprovalPolicy` into
+`DKGAgent.chainConfig`; the agent then forwards it to `EVMChainAdapter`, where
+allowance sizing is applied. `resolveApprovalPolicy()` is the only conversion
+point from YAML/JSON string numerics to runtime `bigint` fields.
 
 ```mermaid
 sequenceDiagram

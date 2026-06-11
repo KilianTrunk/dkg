@@ -579,6 +579,22 @@ describe('resolveChainConfig (field-level merge)', () => {
     )?.approvalPolicy).toEqual(operatorApprovalPolicy);
   });
 
+  it('merges partial approvalPolicy operator overrides over network defaults', () => {
+    const networkApprovalPolicy = {
+      mode: 'replenishing' as const,
+      targetAllowance: '1000000000000000000',
+      refillBelowFraction: 0.1,
+    };
+
+    expect(resolveChainConfig(
+      { chain: { approvalPolicy: { refillBelowFraction: 0.5 } } },
+      { chain: { ...fullNetworkChain, approvalPolicy: networkApprovalPolicy } },
+    )?.approvalPolicy).toEqual({
+      ...networkApprovalPolicy,
+      refillBelowFraction: 0.5,
+    });
+  });
+
   it('returns a partial block when only config supplies fields (no network)', () => {
     const merged = resolveChainConfig(
       { chain: { rpcUrl: 'https://standalone.example/rpc' } },

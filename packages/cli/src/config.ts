@@ -948,7 +948,9 @@ export function resolveChainConfig(
   if (tokenAddress !== undefined) merged.tokenAddress = tokenAddress;
   const chainId = cfg?.chainId ?? net?.chainId;
   if (chainId !== undefined) merged.chainId = chainId;
-  const approvalPolicy = cfg?.approvalPolicy ?? net?.approvalPolicy;
+  const approvalPolicy = cfg?.approvalPolicy !== undefined || net?.approvalPolicy !== undefined
+    ? { ...net?.approvalPolicy, ...cfg?.approvalPolicy }
+    : undefined;
   if (approvalPolicy !== undefined) merged.approvalPolicy = approvalPolicy;
   if (cfg?.mockIdentityId !== undefined) merged.mockIdentityId = cfg.mockIdentityId;
   return merged;

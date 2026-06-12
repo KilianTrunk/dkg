@@ -3,7 +3,7 @@
  *
  * `planManagedOxigraph` / `resolveManagedOxigraphPort` (pure) are tested
  * directly. `startManagedOxigraph` previously had the binary-fetch and
- * server-spawn MODULES vi.mock'd — the orchestration was never actually
+ * server-spawn MODULES replaced by vitest module mocks — the orchestration was never actually
  * proven. It now runs FOR REAL, end to end: the pinned Oxigraph binary is
  * really downloaded (sha256-verified, into a STABLE tmp cache so the ~10MB
  * fetch happens once per machine — exactly what production does on a node's

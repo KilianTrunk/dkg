@@ -81,15 +81,18 @@ export function resolveViewGraphs(
       if (!opts?.agentAddress) {
         throw new Error('agentAddress is required for the working-memory view');
       }
-      // Uniform layout: WM data is in `…/_working_memory/{addr}/{number}`. A by-name read
-      // STAYS a single-graph read (no sibling-assertion leak); the caller resolves
-      // name→number and passes opts.kaNumber. Until then it falls back to the legacy
-      // name-keyed graph (TODO: wire the _meta name→number lookup at the query caller).
+      // Uniform layout: WM data is in `…[/{sub}]/_working_memory/{addr}/{number}`. A
+      // by-name read STAYS a single-graph read (no sibling-assertion leak); the caller
+      // resolves name→number and passes opts.kaNumber, falling back to the legacy
+      // name-keyed graph. Both single-graph URIs mirror the writer
+      // (`DKGPublisher.wmGraphUri`), including the sub-graph segment — without it a
+      // `subGraphName` + `assertionName` read targets the ROOT assertion graph and
+      // misses sub-graph assertions (Codex review on PR #1132).
       if (opts.assertionName) {
         return {
           graphs: [opts.kaNumber !== undefined
-            ? contextGraphLayerUri(contextGraphId, MemoryLayer.WorkingMemory, opts.agentAddress, opts.kaNumber)
-            : contextGraphAssertionUri(contextGraphId, opts.agentAddress, opts.assertionName)],
+            ? contextGraphLayerUri(contextGraphId, MemoryLayer.WorkingMemory, opts.agentAddress, opts.kaNumber, opts.subGraphName)
+            : contextGraphAssertionUri(contextGraphId, opts.agentAddress, opts.assertionName, opts.subGraphName)],
           graphPrefixes: [],
         };
       }
@@ -423,6 +426,7 @@ export class DKGQueryEngine implements QueryEngine {
         contextGraphId,
         options.agentAddress,
         options.assertionName,
+        options.subGraphName,
       );
     }
 
@@ -618,8 +622,13 @@ export class DKGQueryEngine implements QueryEngine {
     contextGraphId: string,
     agentAddress: string,
     assertionName: string,
+    subGraphName?: string,
   ): Promise<bigint | undefined> {
-    const urn = assertionLifecycleUri(contextGraphId, agentAddress, assertionName);
+    // Mirror the writer (`assertionFinalize`): the `dkg:kaId` stamp lives in the
+    // ROOT `_meta` graph, but keyed by the SUB-GRAPH-AWARE lifecycle URN
+    // (`urn:dkg:assertion:{cg}:{sub}:{addr}:{name}`). Omitting the sub-graph
+    // segment here made every sub-graph by-name lookup miss (Codex on PR #1132).
+    const urn = assertionLifecycleUri(contextGraphId, agentAddress, assertionName, subGraphName);
     const metaGraph = contextGraphMetaUri(contextGraphId);
     const res = await this.store.query(
       `SELECT ?n WHERE { GRAPH <${metaGraph}> { <${urn}> <http://dkg.io/ontology/kaId> ?n } } LIMIT 1`,

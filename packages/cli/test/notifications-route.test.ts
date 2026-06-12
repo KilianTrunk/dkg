@@ -52,7 +52,9 @@ describe('GET/POST /api/notifications (scoped daemon route, A4)', () => {
         { id: CG_JOINED, uri: '', name: 'Joined CG', curator: `did:dkg:agent:${OTHER}`, callerInvolved: true, isSystem: false },
         { id: CG_FOREIGN, uri: '', name: 'Foreign CG', curator: `did:dkg:agent:${OTHER}`, callerInvolved: false, isSystem: false },
       ]),
-      listPendingJoinRequests: vi.fn(async (cgId: string) =>
+      // GH #757 made this curator-gated; the route MUST pass the token-verified
+      // caller (2nd arg) or a non-default curator's reads fail the owner check.
+      listPendingJoinRequests: vi.fn(async (cgId: string, _callerAgentAddress?: string) =>
         (opts.pending?.[cgId] ?? []).map((addr) => ({ agentAddress: addr, signature: 's', timestamp: 1, status: 'pending' })),
       ),
     };
@@ -171,6 +173,21 @@ describe('GET/POST /api/notifications (scoped daemon route, A4)', () => {
     expect(joins[0].meta.agentAddress).toBe(REQUESTER);
     // join_request counts toward the badge.
     expect(body.badgeCount).toBe(1);
+  });
+
+  it('passes the token-verified caller to listPendingJoinRequests (GH #757 curator gate — non-default curator must not lose pending joins)', async () => {
+    joinRequestRow(CG_CURATED, REQUESTER);
+    // The node default agent is someone ELSE — the caller is a non-default
+    // curator agent. Pre-#757-threading, the gate fell back to the default
+    // agent and the pending read silently failed.
+    const agent = makeAgent({ pending: { [CG_CURATED]: [REQUESTER] }, defaultAgent: OTHER });
+    await startRoute(agent);
+    const { body } = await getNotifs();
+
+    expect(agent.listPendingJoinRequests).toHaveBeenCalledWith(CG_CURATED, CALLER);
+    const joins = body.notifications.filter((n: any) => n.type === 'join_request');
+    expect(joins).toHaveLength(1);
+    expect(joins[0].meta.agentAddress).toBe(REQUESTER);
   });
 
   it('POST /read resolves a digestKey to underlying rows AND accepts numeric ids together', async () => {

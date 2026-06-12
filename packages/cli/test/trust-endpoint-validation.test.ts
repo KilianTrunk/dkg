@@ -3,7 +3,7 @@
  * NO mocks.
  *
  * The retired version called `handleQueryRoutes` with a hand-built ctx whose
- * `agent.verify`/`agent.endorse` were `vi.fn()` tripwires that threw "should
+ * `agent.verify`/`agent.endorse` were vitest-mock tripwires that threw "should
  * not be reached", asserting the route rejected unsafe input BEFORE the agent.
  * The tripwire only proves "not reached" against a fake agent — it can't notice
  * if the real route stopped validating and started 500-ing or actually

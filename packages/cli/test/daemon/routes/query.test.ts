@@ -2,8 +2,8 @@
  * /api/query route error-mapping contract — REAL daemon, NO mocks.
  *
  * The retired version of this file fed `handleQueryRoutes` a hand-built
- * `RequestContext` whose `agent.query` was a `vi.fn().mockRejectedValue(new
- * Error('error at 1:27: …'))`. That pinned the route's error→HTTP-status
+ * `RequestContext` whose `agent.query` was a vitest mock that rejected with a
+ * hand-typed `Error('error at 1:27: …')`. That pinned the route's error→HTTP-status
  * classification against a HAND-TYPED error string — if the real query engine
  * changed the shape of its parse/scope errors, the route could start
  * misclassifying them (500 instead of 400) and the mock test would stay green.

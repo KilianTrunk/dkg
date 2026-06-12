@@ -1,0 +1,179 @@
+/**
+ * Shared real-daemon test harness (NO mocks).
+ *
+ * Spins a real built CLI daemon (`packages/cli/dist/cli.js daemon-worker`) in
+ * edge role, wired against the SHARED HARDHAT NODE that the cli vitest config's
+ * global setup boots (`packages/chain/test/hardhat-global-setup.ts`, port 9548).
+ * There is NO mock chain adapter and NO fake daemon context — every request
+ * below is a true HTTP round-trip against the production route handlers running
+ * inside a real daemon process. This is the harness route/behaviour tests use
+ * instead of hand-building a `RequestContext` with `vi.fn()` agent stubs (which
+ * return canned data and silently drift from the real daemon).
+ *
+ * Edge role is deliberate: these are HTTP-layer tests, so the daemon must not
+ * register on-chain ACK/storage handlers (whose absence would time out
+ * `DKGAgent.start()`). Edge is a real production node mode — it skips profile
+ * registration and just dials core nodes for publishes.
+ *
+ * Mirrors the inline harness in `daemon-http-behavior-extra.test.ts`; extracted
+ * here so the de-mocked route suites share one spinner.
+ */
+import { spawn, type ChildProcess } from 'node:child_process';
+import { mkdtemp, writeFile, rm, readFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { tmpdir } from 'node:os';
+import { ethers } from 'ethers';
+import { getSharedContext, HARDHAT_KEYS } from '../../../chain/test/evm-test-context.js';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const CLI_ENTRY = join(__dirname, '..', '..', 'dist', 'cli.js');
+
+export const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+export interface LiveDaemon {
+  home: string;
+  apiPort: number;
+  listenPort: number;
+  child: ChildProcess;
+  token: string | null;
+  /** `http://127.0.0.1:<apiPort>` */
+  base: string;
+  exitCode?: number | null;
+}
+
+// Spread ports across runs so a crashed prior run's lingering socket can't
+// collide. The cli package runs vitest single-worker, so within-run collisions
+// aren't a concern; this only guards cross-run reuse.
+let portCounter = 0;
+function uniquePort(base: number): number {
+  return base + ((portCounter++ * 7) % 900);
+}
+
+export interface StartDaemonOpts {
+  authEnabled?: boolean;
+  /** Extra keys merged into config.json (e.g. preset contextGraphs). */
+  extraConfig?: Record<string, unknown>;
+  readyTimeoutMs?: number;
+}
+
+/** Boot a real edge daemon against the shared Hardhat node and wait for readiness. */
+export async function startLiveDaemon(opts: StartDaemonOpts = {}): Promise<LiveDaemon> {
+  if (!existsSync(CLI_ENTRY)) {
+    throw new Error(
+      `CLI not built at ${CLI_ENTRY}. Run "pnpm --filter @origintrail-official/dkg build" first.`,
+    );
+  }
+  const authEnabled = opts.authEnabled ?? true;
+  const home = await mkdtemp(join(tmpdir(), 'dkg-live-daemon-'));
+  const apiPort = uniquePort(21000);
+  const listenPort = uniquePort(21900);
+  const { rpcUrl, hubAddress } = getSharedContext();
+
+  await writeFile(
+    join(home, 'config.json'),
+    JSON.stringify({
+      name: 'live-daemon-test',
+      apiPort,
+      listenPort,
+      apiHost: '127.0.0.1',
+      nodeRole: 'edge',
+      relay: 'none',
+      auth: { enabled: authEnabled },
+      store: { backend: 'oxigraph-worker', options: { path: join(home, 'store.nq') } },
+      chain: { type: 'evm', rpcUrl, hubAddress, chainId: 'evm:31337' },
+      contextGraphs: [],
+      ...(opts.extraConfig ?? {}),
+    }),
+  );
+
+  // Seed the op wallet with the harness CORE_OP key so the daemon boots with a
+  // deterministic signer instead of auto-generating one.
+  const coreOp = new ethers.Wallet(HARDHAT_KEYS.CORE_OP);
+  await writeFile(
+    join(home, 'wallets.json'),
+    JSON.stringify({ wallets: [{ address: coreOp.address, privateKey: coreOp.privateKey }] }, null, 2) + '\n',
+    { mode: 0o600 },
+  );
+
+  const child = spawn('node', [CLI_ENTRY, 'daemon-worker'], {
+    env: {
+      ...process.env,
+      DKG_HOME: home,
+      DKG_API_PORT: String(apiPort),
+      DKG_NO_BLUE_GREEN: '1',
+      DKG_DISABLE_TELEMETRY: '1',
+    },
+    stdio: 'ignore',
+  });
+
+  const daemon: LiveDaemon = {
+    home,
+    apiPort,
+    listenPort,
+    child,
+    token: null,
+    base: `http://127.0.0.1:${apiPort}`,
+  };
+  child.once('exit', (code) => {
+    daemon.exitCode = code;
+  });
+
+  const deadlineLoops = Math.ceil((opts.readyTimeoutMs ?? 45_000) / 500);
+  for (let i = 0; i < deadlineLoops; i++) {
+    if (child.exitCode !== null) throw new Error(`Daemon exited early with code ${child.exitCode}`);
+    try {
+      const res = await fetch(`${daemon.base}/api/status`);
+      if (res.ok) break;
+    } catch {
+      /* not ready yet */
+    }
+    await sleep(500);
+    if (i === deadlineLoops - 1) throw new Error('Daemon did not become ready in time');
+  }
+
+  if (authEnabled) {
+    const raw = await readFile(join(home, 'auth.token'), 'utf-8');
+    daemon.token =
+      raw.split('\n').map((l) => l.trim()).find((l) => l.length > 0 && !l.startsWith('#')) ?? null;
+    if (!daemon.token) throw new Error('auth enabled but no token written');
+  }
+  return daemon;
+}
+
+/** SIGTERM the daemon, escalate to SIGKILL, and wipe its home dir. */
+export async function stopLiveDaemon(daemon: LiveDaemon | undefined): Promise<void> {
+  if (!daemon) return;
+  daemon.child.kill('SIGTERM');
+  await sleep(1200);
+  if (daemon.child.exitCode === null) daemon.child.kill('SIGKILL');
+  await rm(daemon.home, { recursive: true, force: true }).catch(() => {});
+}
+
+export function authHeaders(daemon: LiveDaemon, extra: Record<string, string> = {}): Record<string, string> {
+  return {
+    'Content-Type': 'application/json',
+    ...(daemon.token ? { Authorization: `Bearer ${daemon.token}` } : {}),
+    ...extra,
+  };
+}
+
+/** POST JSON to a daemon route, returning {status, body} (body parsed if JSON). */
+export async function postJson(
+  daemon: LiveDaemon,
+  path: string,
+  payload: unknown,
+): Promise<{ status: number; body: any }> {
+  const res = await fetch(`${daemon.base}${path}`, {
+    method: 'POST',
+    headers: authHeaders(daemon),
+    body: JSON.stringify(payload),
+  });
+  const text = await res.text();
+  try {
+    return { status: res.status, body: JSON.parse(text) };
+  } catch {
+    return { status: res.status, body: text };
+  }
+}

@@ -173,12 +173,38 @@ export class AccessHandler {
   }
 
   private async lookupKAMeta(kaUal: string): Promise<KAMeta | null> {
+    const direct = await this.queryKAMeta(kaUal);
+    if (direct) return direct;
+    // Read-both (RFC ka-metadata-trim P3.1): older requesters address private
+    // content by the legacy token row `<ual>/<n>`; the collapsed shape keys
+    // everything on the bare UAL. Strip a numeric suffix and retry once so
+    // old-client requests keep resolving against new-shape stores.
+    const legacyToken = /^(.+)\/\d+$/.exec(kaUal);
+    if (legacyToken && legacyToken[1]) {
+      return this.queryKAMeta(legacyToken[1]);
+    }
+    return null;
+  }
+
+  private async queryKAMeta(kaUal: string): Promise<KAMeta | null> {
     const safeUal = assertSafeIri(kaUal);
+    // Read-both (RFC ka-metadata-trim P3.1): the collapsed shape has NO
+    // `<ual>/<n>` token row — the UAL subject itself carries the entity pair
+    // and `dkg:contextGraph`, so `?kc` binds to the UAL. The `partOf` branch
+    // keeps legacy `<ual>/<n>` lookups (old clients / old-shape replica rows)
+    // resolving.
     const result = await this.store.query(
       `SELECT ?rootEntity ?contextGraph ?kc ?privateMerkleRoot ?privateTripleCount ?accessPolicy ?publisherPeerId ?attributedTo ?sgName WHERE {
         GRAPH ?g {
-          <${safeUal}> <${DKG_NS}rootEntity> ?rootEntity .
-          <${safeUal}> <${DKG_NS}partOf> ?kc .
+          {
+            <${safeUal}> <${DKG_NS}rootEntity> ?rootEntity .
+            <${safeUal}> <${DKG_NS}partOf> ?kc .
+          }
+          UNION
+          {
+            <${safeUal}> <${DKG_NS}rootEntity> ?rootEntity .
+            BIND(<${safeUal}> AS ?kc)
+          }
           ?kc <${DKG_NS}contextGraph> ?contextGraph .
           OPTIONAL { <${safeUal}> <${DKG_NS}privateMerkleRoot> ?privateMerkleRoot }
           OPTIONAL { <${safeUal}> <${DKG_NS}privateTripleCount> ?privateTripleCount }
@@ -189,7 +215,7 @@ export class AccessHandler {
           BIND(CONCAT(STR(?contextGraph), '/_meta') AS ?expectedMetaGraph)
           FILTER(STR(?g) = ?expectedMetaGraph)
         }
-      } LIMIT 1`,
+      }`,
     );
 
     if (result.type !== 'bindings' || result.bindings.length === 0) {
@@ -202,8 +228,28 @@ export class AccessHandler {
     const contextGraphId = contextGraphUri.replace('did:dkg:context-graph:', '');
     const kcUal = row['kc'];
 
+    // Adversarial review F3 — multi-root pairing hazard on the collapsed
+    // shape (RFC ka-metadata-trim P3.1): ALL member `dkg:rootEntity` rows and
+    // ALL per-root `dkg:privateMerkleRoot` rows now sit on the same UAL
+    // subject, with no token row tying root N to private root N. The two
+    // independent patterns above cross-product, so the former `LIMIT 1` could
+    // pair member root A with private root B — the handler would then attest
+    // root B's merkle root over root A's served triples. When more than one
+    // member root OR more than one private root is on the subject, ignore the
+    // meta `privateMerkleRoot` entirely; `handleAccess` falls back to
+    // `computePrivateRoot(privateQuads)` over the actually-served triples, so
+    // the attestation always matches what is sent. Single-root KAs (and
+    // legacy `<ual>/<n>` token rows, inherently 1:1) keep the cheap meta read.
+    const distinctRoots = new Set(
+      result.bindings.map((b) => b['rootEntity']).filter(Boolean),
+    );
+    const distinctPrivRoots = new Set(
+      result.bindings.map((b) => b['privateMerkleRoot']).filter(Boolean),
+    );
+    const ambiguousPrivatePairing = distinctRoots.size > 1 || distinctPrivRoots.size > 1;
+
     let privateMerkleRoot: Uint8Array | undefined;
-    const rawRoot = row['privateMerkleRoot'];
+    const rawRoot = ambiguousPrivatePairing ? undefined : row['privateMerkleRoot'];
     if (rawRoot) {
       const hex = stripLiteral(rawRoot).replace(/^0x/, '');
       if (hex.length > 0) {

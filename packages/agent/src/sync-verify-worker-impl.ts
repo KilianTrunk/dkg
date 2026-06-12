@@ -59,6 +59,9 @@ function verifySyncedData(
     if (q.predicate === `${DKG_NS}merkleRoot`) kcMerkleRoots.set(q.subject, stripLiteral(q.object));
   }
 
+  // TODO(rfc-ka-trim) P3.1: collapsed-shape rows (rootEntity on the UAL, no
+  // partOf) build no kaToKc entry and take the "accept on trust" path —
+  // see the note in dkg-agent-utils.ts verifySyncedData.
   const kaToKc = new Map<string, string>();
   const kaRootEntity = new Map<string, string>();
   for (const q of metaQuads) {

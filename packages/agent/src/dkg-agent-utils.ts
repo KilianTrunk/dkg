@@ -247,7 +247,14 @@ export function verifySyncedData(
     }
   }
 
-  // Find KA → KC relationships and root entities
+  // Find KA → KC relationships and root entities.
+  // TODO(rfc-ka-trim) P3.1: collapsed-shape rows carry `dkg:rootEntity`
+  // directly on the UAL subject with NO `dkg:partOf`, so they build no
+  // kaToKc entry and take the existing "no KA info — accept on trust"
+  // path below (graceful, not wrong: RS/on-chain verification still
+  // applies). Wiring a self-mapping needs kaRootEntity to become a
+  // multi-map first — single-value lookup would mis-verify multi-root
+  // collapsed KAs and REJECT good sync data.
   const kaToKc = new Map<string, string>();
   const kaRootEntity = new Map<string, string>();
 

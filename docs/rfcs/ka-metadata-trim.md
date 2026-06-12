@@ -1,6 +1,6 @@
 # RFC: Per-KA metadata trim + indexed graph addressing
 
-**Status:** Proposed — Phases 0–1 (and approved easy Phase-2 items) implemented in the accompanying PR; aggressive options are explicit decision points below.
+**Status:** Proposed — Phases 0–1, **all of Phase 2**, and Phase-3 items 1/3/4 + the minimal-shape partition implemented in the accompanying PR; Phase-3 item 2 (lifecycle-URN merge) is deferred with a worked plan (see below).
 **Motivation:** scalability. Publishing **one 1-triple KA leaves ~134 resident quads** in the local store (live-measured, rc.17, Base Sepolia). ~97% is publish bookkeeping, ~30 quads are repeated copies of five values. Combined with hot-path SPARQL that scans graph names, this is the mechanism behind the rc.17 idle-node CPU saturation (`oxigraph-server` at 200–360%): store volume feeds RocksDB compaction *and* makes every recurring full-store reconciler query more expensive. The storage adapter itself documents the second half: *"the `SELECT DISTINCT ?g` quad-store scan — **the dominant idle-node CPU cost**"* (`packages/storage/src/adapters/sparql-http.ts:336`).
 
 ## Ground truth (live dump, KA #122, `megagiga` CG)
@@ -27,12 +27,11 @@ Method: every predicate audited for **writers and readers** (grep over `packages
 - The orphaned history `OPTIONAL { … dkg:kcUal … }` read (`packages/agent/src/dkg-agent.ts:1914`).
 - The dangling `authoredBy` blank node in the partition copy (no outgoing triples in any graph).
 
-### Phase 1: zero-reader drops (implemented) — ≈ −24 quads/KA
+### Phase 1: zero-reader drops (implemented) — ≈ −23 quads/KA
 
 | Dropped triple | Was written at | Why safe |
 |---|---|---|
 | `dkg:kaCount` | metadata.ts:138 | zero readers; wire/chain carries its own count. Post-rc.17 one publish = 1 KA, so it is also a constant `1` — a KC-era remnant |
-| `dkg:publishedAt` (KC row) | metadata.ts:161-166 | zero readers in `_meta` (the consumed `publishedAt` is the SWM-meta WorkspaceOperation row) |
 | `dkg:blockTimestamp` | metadata.ts:332-337 | zero readers |
 | `dkg:publisherAddress` | metadata.ts:338 | zero readers (code uses on-chain/UAL-derived address) |
 | `dkg:chainId` | metadata.ts:340 | zero readers (code reads `this.chain.chainId`) |
@@ -43,31 +42,33 @@ Method: every predicate audited for **writers and readers** (grep over `packages
 | lifecycle URN: `a prov:Entity`, `a dkg:Assertion`, `dkg:contextGraph`, `prov:wasGeneratedBy` (4) | metadata.ts:1333-1337 | readers: none (the type row's sole reader was the Phase-0 dead gate; history joins event-side `prov:generated/used`) |
 | `dkg:blockNumber` | metadata.ts:331 | sole reader is an `OPTIONAL` clause (endorse provenance, dkg-agent-endorse.ts:893) — binds nothing, degrades gracefully; derivable from `transactionHash` via RPC on demand |
 
+**Correction (adversarial review F1):** `dkg:publishedAt` (KC row, metadata.ts) was originally in this table but is **KEEP**, not DROP — the reader audit missed the kafka-plugin discovery queries (`packages/kafka-plugin/src/discovery.ts` `buildListQuery`/`buildCountQuery`/`buildSingleByUalQuery`), which join `?ual dkg:publishedAt ?receivedAt` and order the KA list by it. The write stays on the KC/UAL row (+1 quad vs. the original Phase-1 estimate).
+
 The `context/{id}/_meta` partition copy is a CONSTRUCT-copy of the KC/token rows, so it **shrinks automatically** by every quad dropped above.
 
-### Phase 2: dedupe with small reader migrations (this PR implements the ⊕ items)
+### Phase 2: dedupe with small reader migrations (implemented in full)
 
 | Item | Saves | Migration |
 |---|---|---|
-| ⊕ `rdf:type dkg:KnowledgeCollection` + aggregate `dkg:KnowledgeAsset` type rows | −2 | rewrite the two status counters (`packages/cli/src/daemon/lifecycle.ts:1861,1867`) to count `dkg:status` / `dkg:partOf` subjects |
-| `entity`+`rootEntity` dual pairs on 5 subjects → **one `rootEntity` on the token row** | −8 | dual-read shim already exists (`packages/core/src/entity-predicate.ts:39`); seal pair stays (signed material) |
-| `wm/swm/vmCurrentAssertion` written only on divergence (same hash ×3 when no draft) | −2 | history + idempotency readers `COALESCE` to `vm` |
-| `fromLayer`/`toLayer` on events (100% determined by event class) | −4 | derive in the history query (`dkg-agent.ts:1911-1912`) |
-| `prov:wasAssociatedWith` on events | −2 | make node-ui feed pattern OPTIONAL; agent recoverable from URN `wasAttributedTo` |
-| partition copy → documented minimal shape (`restateKaPartition`, metadata.ts:843-874) | −21 | RS prover needs only `partOf` + `rootEntity` + `batchId` (+`privateMerkleRoot`) — ka-extractor.ts:184-202 |
-| `publishedAtKaId` (third copy of the on-chain id) | −1 | node-ui receipt reads the UAL-row id instead |
-| `publicSnapshotRef` (byte-identical to `publicQuadsDigest`) | −1 | collapse to one field |
-| orphan WM `memoryLayer` marker cleanup at VM flip | −1 | add delete to the imperative flip |
+| `rdf:type dkg:KnowledgeCollection` + aggregate `dkg:KnowledgeAsset` type rows | −2 | rewrote the two status counters (`packages/cli/src/daemon/lifecycle.ts`) to count `dkg:status` / member subjects |
+| `entity`+`rootEntity` dual pairs on 5 subjects → **one `rootEntity`** (the §10.1 rename is cancelled for the member list; honest name waits for the next ontology bump) | −8 | dual-read shim retained (`packages/core/src/entity-predicate.ts:39`) — replicas hold dual-written rows; seal pair stays (signed material); the promote EVENT no longer carries the member list at all — history/feed readers fall back to the stable lifecycle-subject stamp (read-both) |
+| `wm/swm/vmCurrentAssertion` written only on divergence from `vm` (same hash ×3 when no draft) | −2 | `vm` always written; history reader `COALESCE`s missing `wm`/`swm` → `vm` (`agent.assertion.history()`); the create-vs-update idempotency gate reads only `vm`; convergent stamps now DELETE the stale row (`_stampPointerIfDivergedFromVm`) |
+| `fromLayer`/`toLayer` on events (100% determined by event class) | −4 | OPTIONAL in the history query, derived in TS from the event class (Created ⇒ none→WM, Promoted ⇒ WM→SWM, Updated ⇒ VM→VM, Discarded ⇒ WM→none); old-store rows still read |
+| `prov:wasAssociatedWith` on events | −2 | node-ui feed pattern OPTIONAL with `COALESCE` to the subject's `prov:wasAttributedTo` (same agent DID, stamped at create) |
+| partition copy → documented minimal shape (`restateKaPartition`) | −21 | RS prover needs only `rootEntity` + `batchId` (+`privateMerkleRoot`) — ka-extractor read-both |
+| `publishedAtKaId` (third copy of the on-chain id) | −1 | receipt builder (`buildAssertionPublishReceiptQuads`) no longer emits it; node-ui receipt hook reads the UAL-subject `dkg:batchId` (read-both: legacy receipt rows win) |
+| `publicSnapshotRef` (byte-identical to `publicQuadsDigest` — `putSnapshot` returns `ref === digest`) | −1 | collapsed: store-backed rows are "digest + no `publicSnapshotGraph`"; compact resolution + SWM snapshot sync read-both |
+| orphan WM `memoryLayer` marker at VM flip | −0 (corrected by review F4) | the imperative flip (dkg-agent-publish.ts) UPDATES the per-KA WM-graph marker in place to `"VM"` instead of deleting it — `assertAssertionDataPersisted` reads it as the stale-re-promote no-op witness (Codex #898), so the row must survive; the misleading orphan `"SWM"` value is gone either way |
 
 **Identity columns after dedupe:** the UAL-row on-chain id is the *queryable index* (rename `dkg:batchId` → `dkg:onChainId` only at the next deliberate ontology bump); the seal's `reservedKaId` survives untouched — it is OT-RFC-43 §F2 **author-signed material**, not a redundant copy.
 
-### Phase 3: aggressive options (decision points — NOT in this PR)
+### Phase 3: aggressive options (items 1, 3, 4 and the minimal-shape partition implemented; item 2 deferred)
 
-1. **Collapse `UAL` + `UAL/1` into one node** (−7, kills `dkg:partOf`). Justified iff "1 publish = 1 KA = 1 UAL" is a post-rc.17 invariant. Requires migrating ~6 readers (resolveKA, access-handler, RS prover, endorse, cg-registry, sync) from the token row to the single node, plus a read-both window for stores written by older nodes.
-2. **Merge the lifecycle URN into the seal subject** (−5): one assertion = one node. Touches sync replication scope and history.
-3. **PROV events behind `metadata.provenanceEvents` config** (−17 when off): "lite mode" for high-throughput publishers / core nodes; history API returns empty for disabled ranges.
-4. **Drop ShareTransition** (−5): migrate the node-ui on-chain-receipt hop (`useEntityOnChainReceipt.ts:141-147`).
-5. **Partition copy → zero locally** (−7 beyond minimal shape): RS prover reads `_meta` on the publisher node; sync ships the minimal shape to replicas only.
+1. **Collapse `UAL` + `UAL/1` into one node** (−7, kills `dkg:partOf`) — **implemented**. Justified by the post-rc.17 invariant "1 publish = 1 KA = 1 UAL". Writers collapsed (`generateKCMetadata`, `restateKaPartition`, `restateLabelGraphForUpdate`); readers migrated read-both (UAL-subject ‖ legacy `<ual>/<n>`+`partOf`): resolveKA, access-handler (incl. a `<ual>/<n>`→bare-UAL fallback for old clients), RS prover, sync delta filter, daemon KA counter, update prior-roots, async-lift subtraction, EPCIS UAL annotation, kafka-plugin discovery (list/count/single — also the reason `dkg:publishedAt` is KEEP, see the Phase-1 correction); endorse + cg-registry already matched both shapes.
+2. **Merge the lifecycle URN into the seal subject** (−5): one assertion = one node. Touches sync replication scope and history. **Deferred** — implementation audit surfaced (a) subject collision between subject-scoped lifecycle wipes and the author-signed seal/receipt rows, and (b) exact-subject kaId/reservedUal reads that risk identity double-allocation on upgraded stores. See `TODO(rfc-ka-trim)` at `assertionLifecycleUri` (packages/core/src/constants.ts) for the worked migration plan.
+3. **PROV events behind `metadata.provenanceEvents` config** (−17 when off) — **implemented**: "lite mode" for high-throughput publishers / core nodes; default `true`; seal/state/identity rows always written; history API returns `events: []` for disabled ranges.
+4. **Drop ShareTransition** (−5) — **implemented**: the node-ui on-chain-receipt hook now resolves straight off the seal-subject receipt rows in `_meta` (read-both: legacy two-hop ShareTransition fallback retained for old stores).
+5. **Partition copy → zero locally** (−7 beyond minimal shape): NOT taken. Instead the Phase-2 row landed: same-graph publishes write only the documented **minimal shape** into the per-cgId partition (collapsed entity pair + `batchId` + `merkleRoot` (+`privateMerkleRoot`) + `materializedVersion`); REMAP publishes keep the wholesale move (the partition is their only meta home). RS prover + backfill route are read-both.
 
 **Quad budget:** 134 → ~99 (Phase 1) → ~75 (Phase 2) → **~45–50 (Phase 3), ~40 in lite mode**. No consensus (merkle/seal/status), resolution (rootEntity/contextGraph/kaId/reservedUal), access (accessPolicy/publisherPeerId/wasAttributedTo), sync (memoryLayer/assertionGraph/prov:generated), or trust (trustLevel) path is touched in any phase.
 
@@ -110,3 +111,7 @@ The graph-per-KA design itself is sound (a named graph is just the 4th term of a
 ## Verification approach
 
 Per-predicate reader audit (multi-agent, grep both URI forms over all packages) + live-store census cross-check (e.g. `rdf:type` counts: `AssertionPublished` = 0 confirmed the dead writer). The PR includes: writer-side removals, the named reader migrations, updated test fixtures, and a regression grep proving no dropped predicate retains a reader.
+
+## Invariant exception
+
+The PR-wide invariant is "every migrated reader reads both old+new shapes; no write removal may strand a reader". One write removal is **sanctioned despite having had a live reader at removal time**: the P3.1 collapse stops minting `dkg:partOf` (the `<ual>/<n> dkg:partOf <ual>` token edge). The kafka-plugin discovery queries still joined it when the writer was dropped — caught by the adversarial review (F1) and fixed by making all three discovery queries read-both (legacy `partOf` join UNION collapsed UAL-subject match), like every other migrated `partOf` reader. The removal stands because (a) all known readers are now read-both over both shapes (old-shape rows persist in pre-upgrade stores and replica-synced rows), and (b) the related `dkg:publishedAt` KC-row write — F1's other half — was restored outright rather than excepted (it is a KEEP, see the Phase-1 correction). No other write removal with a surviving reader is sanctioned.

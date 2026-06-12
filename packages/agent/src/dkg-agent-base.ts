@@ -935,6 +935,14 @@ export class DKGAgentBase {
   protected readonly onChainParticipantAgentsCache = new Map<string, string[]>();
   protected readonly peerHealth = new Map<string, PeerHealth>();
   protected readonly knownCorePeerIds = new Set<string>();
+  /**
+   * Last chain-reported ACK quorum (ParametersStorage
+   * minimumRequiredSignatures), refreshed by the V10 ACK provider before
+   * each collect. `getACKCandidatePeers` uses it so the confirmed-core
+   * shortcut tracks the REAL runtime quorum instead of the hard-coded
+   * default (Codex review on PR #1107).
+   */
+  protected lastKnownRequiredACKs?: number;
   protected readonly syncingPeers = new Set<string>();
   protected readonly seenPrivateSyncRequestIds = new Map<string, number>();
   protected readonly metaRefreshTimestamps = new Map<string, number>();

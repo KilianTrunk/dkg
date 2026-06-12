@@ -1291,16 +1291,28 @@ export class DKGAgent extends DKGAgentBase {
    * quorum (`pool_below_quorum`) and bricked publishing on core nodes.
    *
    * Fix: only trust the confirmed-core subset when it can actually
-   * satisfy the default quorum. Below that, return confirmed cores FIRST
+   * satisfy the quorum. Below that, return confirmed cores FIRST
    * followed by every other connected peer — edge nodes fail fast at
    * protocol negotiation (no handler registered), so over-asking is
    * cheap, while under-asking is fatal.
+   *
+   * Codex review (PR #1107): the quorum threshold here must track the
+   * CHAIN's runtime `requiredACKs` (ParametersStorage
+   * minimumRequiredSignatures), not the hard-coded default — on networks
+   * configured above 3 signatures, a 3-strong confirmed-core subset is
+   * still below quorum and returning only it re-introduces
+   * `pool_below_quorum`. The V10 ACK provider refreshes
+   * `lastKnownRequiredACKs` from chain BEFORE each collect() (the
+   * collector's getConnectedCorePeers callback runs after), so this sync
+   * read sees the current value; the default only covers the first call
+   * on chains without the getter.
    */
   private getACKCandidatePeers(): string[] {
     const peers = this.node.libp2p.getPeers();
     const connected = peers.map(p => p.toString()).filter(id => id !== this.peerId);
     const confirmedCore = connected.filter(id => this.knownCorePeerIds.has(id));
-    if (confirmedCore.length >= DEFAULT_REQUIRED_ACKS) return confirmedCore;
+    const quorum = this.lastKnownRequiredACKs ?? DEFAULT_REQUIRED_ACKS;
+    if (confirmedCore.length >= quorum) return confirmedCore;
     const rest = connected.filter(id => !this.knownCorePeerIds.has(id));
     return [...confirmedCore, ...rest];
   }
@@ -1448,6 +1460,12 @@ export class DKGAgent extends DKGAgentBase {
           throw wrapAsRpcPreconditionIfApplicable(err, 'getMinimumRequiredSignatures');
         }
       }
+      // Codex review (PR #1107): cache the runtime quorum BEFORE collect() so
+      // getACKCandidatePeers' confirmed-core shortcut tracks the chain's real
+      // requiredACKs instead of the hard-coded default.
+      if (typeof requiredACKs === 'number' && requiredACKs > 0) {
+        this.lastKnownRequiredACKs = requiredACKs;
+      }
 
       // H5 prefix inputs — both come from the chain adapter so that
       // publisher-side digest construction matches what core-node handlers
@@ -1592,6 +1610,12 @@ export class DKGAgent extends DKGAgentBase {
         } catch (err) {
           throw wrapAsRpcPreconditionIfApplicable(err, 'getMinimumRequiredSignatures');
         }
+      }
+      // Codex review (PR #1107): cache the runtime quorum BEFORE collect() so
+      // getACKCandidatePeers' confirmed-core shortcut tracks the chain's real
+      // requiredACKs instead of the hard-coded default.
+      if (typeof requiredACKs === 'number' && requiredACKs > 0) {
+        this.lastKnownRequiredACKs = requiredACKs;
       }
 
       let chainIdBig: bigint;

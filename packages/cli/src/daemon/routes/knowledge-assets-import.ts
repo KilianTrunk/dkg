@@ -365,12 +365,20 @@ export async function handleKaImportFile(ctx: RequestContext, name: string): Pro
   // #1101: precedence is explicit `contentType` field > multipart part
   // Content-Type header > filename-extension fallback. The fallback only
   // engages when the first two resolve to application/octet-stream (curl
-  // and many HTTP clients send octet-stream for .md files), so a caller
-  // who deliberately uploads an opaque blob is unaffected.
+  // and many HTTP clients send octet-stream for .md files) AND the caller
+  // did not say octet-stream EXPLICITLY: an explicit
+  // `contentType=application/octet-stream` form field is the documented
+  // "store as opaque blob" escape hatch, so inferring `notes.md` back to
+  // text/markdown there would override a deliberate choice (Codex review
+  // on PR #1107). Only the implicit default (no override, generic or
+  // absent part header) is eligible for filename inference.
   let detectedContentType = normalizeDetectedContentType(
     contentTypeOverride ?? filePart.contentType,
   );
-  if (detectedContentType === "application/octet-stream") {
+  const explicitOctetStream =
+    contentTypeOverride !== undefined &&
+    normalizeDetectedContentType(contentTypeOverride) === "application/octet-stream";
+  if (detectedContentType === "application/octet-stream" && !explicitOctetStream) {
     const inferred = inferContentTypeFromFilename(filePart.filename);
     if (inferred) detectedContentType = inferred;
   }

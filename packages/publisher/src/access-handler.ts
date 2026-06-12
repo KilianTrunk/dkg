@@ -16,6 +16,14 @@ export type AccessPolicy = 'public' | 'ownerOnly' | 'allowList';
 
 interface KAMeta {
   rootEntity: string;
+  /**
+   * ALL distinct member roots bound by the meta query (binding order).
+   * On the collapsed multi-root shape (RFC ka-metadata-trim P3.1) a bare-UAL
+   * request cannot name a member, so the handler scans these for the first
+   * root that actually has a private bag instead of denying on an
+   * engine-arbitrary first binding (Codex review "multi-root-access").
+   */
+  rootEntities: string[];
   contextGraphId: string;
   subGraphName?: string;
   privateMerkleRoot?: Uint8Array;
@@ -72,9 +80,27 @@ export class AccessHandler {
         return this.deny('Access denied: invalid access policy metadata');
       }
 
-      const hasPrivate =
-        this.privateStore.hasPrivateTriples(meta.contextGraphId, meta.rootEntity, meta.subGraphName) ||
-        (await this.privateStore.hasPrivateTriplesInStore(meta.contextGraphId, meta.rootEntity, meta.subGraphName));
+      // Codex review "multi-root-access" hardening: on the collapsed
+      // multi-root shape, SPARQL binding order is unspecified — the first
+      // bound root may have no private bag even though another member does
+      // (bags are stored strictly per root). Serve the FIRST member root
+      // that actually has a bag; the ambiguous-pairing guard below already
+      // forces the attested privateMerkleRoot to be recomputed over the
+      // served triples, so the attestation always matches what is sent.
+      // Single-root KAs (and legacy `<ual>/<n>` requests, inherently 1:1)
+      // are unchanged.
+      let servedRootEntity = meta.rootEntity;
+      let hasPrivate = false;
+      for (const root of meta.rootEntities) {
+        if (
+          this.privateStore.hasPrivateTriples(meta.contextGraphId, root, meta.subGraphName) ||
+          (await this.privateStore.hasPrivateTriplesInStore(meta.contextGraphId, root, meta.subGraphName))
+        ) {
+          servedRootEntity = root;
+          hasPrivate = true;
+          break;
+        }
+      }
 
       if (!hasPrivate) {
         return this.deny('No private triples available for this KA');
@@ -133,7 +159,7 @@ export class AccessHandler {
 
       const privateQuads = await this.privateStore.getPrivateTriples(
         meta.contextGraphId,
-        meta.rootEntity,
+        servedRootEntity,
         meta.subGraphName,
       );
 
@@ -298,6 +324,7 @@ export class AccessHandler {
 
     return {
       rootEntity,
+      rootEntities: [...distinctRoots],
       contextGraphId,
       subGraphName,
       privateMerkleRoot,

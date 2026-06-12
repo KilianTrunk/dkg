@@ -197,6 +197,30 @@ export function generateKCMetadata(
       seenPrivRoots.add(hex);
       quads.push(mq(meta.ual, `${DKG}privateMerkleRoot`, lit(hex), metaGraph));
     }
+    // Codex review "multi-root-access": the collapsed shape cannot tie member
+    // root N to private bag N — every rootEntity/privateMerkleRoot row shares
+    // the bare UAL subject, so the AccessHandler could only pick an
+    // engine-arbitrary root (denying or silently mis-serving multi-root
+    // private KAs). For MULTI-root publishes, ADDITIONALLY re-emit the
+    // pre-trim per-token pairing rows (`<ual>/<tokenId>` + rootEntity/partOf/
+    // privateTripleCount/privateMerkleRoot — the 75c53a2ed shape minus the
+    // Phase-1/2 zero-reader rows). Single-root publishes — the measured,
+    // dominant case — keep the full collapse.
+    if (memberRoots.length > 1) {
+      for (const ka of kaEntries) {
+        const kaUri = `${meta.ual}/${ka.tokenId}`;
+        quads.push(
+          ...entityMemberQuads(kaUri, ka.rootEntity, metaGraph),
+          mq(kaUri, `${DKG}partOf`, meta.ual, metaGraph),
+        );
+        if (ka.privateTripleCount > 0) {
+          quads.push(mq(kaUri, `${DKG}privateTripleCount`, intLit(ka.privateTripleCount), metaGraph));
+        }
+        if (ka.privateMerkleRoot) {
+          quads.push(mq(kaUri, `${DKG}privateMerkleRoot`, lit(toHex(ka.privateMerkleRoot)), metaGraph));
+        }
+      }
+    }
   }
 
   return quads;
@@ -717,13 +741,30 @@ async function _restateKaPartitionLocked(opts: {
   //    RFC ka-metadata-trim P3.1): no `<ual>/<n>` token subjects, no
   //    `dkg:partOf`. Member entities are an unordered set on the UAL; private
   //    merkle roots are an unordered leaf set (V10MerkleTree sorts + dedupes).
+  //    Codex review "multi-root-access": MULTI-root payloads additionally
+  //    re-emit the legacy `<ual>/<n>` token rows (insertion = manifest order,
+  //    matching the pre-trim tokenIdx mint) so the root↔privateMerkleRoot
+  //    pairing stays recoverable; single-root keeps the full collapse.
   const metaQuads: Quad[] = [];
+  const partitionMultiRoot = payloadByRoot.size > 1;
+  let partitionTokenIdx = 1;
   for (const root of payloadByRoot.keys()) {
     metaQuads.push(...entityMemberQuads(ual, root, metaGraph));
     const privRoot = privateRootByRoot?.get(root);
     if (privRoot && privRoot.length > 0) {
       metaQuads.push(mq(ual, `${DKG}privateMerkleRoot`, lit(toHex(privRoot)), metaGraph));
     }
+    if (partitionMultiRoot) {
+      const kaUri = `${ual}/${partitionTokenIdx}`;
+      metaQuads.push(
+        ...entityMemberQuads(kaUri, root, metaGraph),
+        mq(kaUri, `${DKG}partOf`, ual, metaGraph),
+      );
+      if (privRoot && privRoot.length > 0) {
+        metaQuads.push(mq(kaUri, `${DKG}privateMerkleRoot`, lit(toHex(privRoot)), metaGraph));
+      }
+    }
+    partitionTokenIdx++;
   }
   if (metaQuads.length > 0) await store.insert(metaQuads);
 
@@ -850,12 +891,30 @@ async function _restateLabelGraphForUpdateLocked(opts: {
   for (const pred of [DKG_ROOT_ENTITY_LEGACY, DKG_ENTITY, `${DKG}privateMerkleRoot`]) {
     await store.deleteByPattern({ graph: metaGraph, subject: ual, predicate: pred });
   }
+  // Codex review "multi-root-access": MULTI-root updates additionally
+  // re-emit the legacy `<ual>/<n>` token rows (manifest order, matching the
+  // pre-trim mint) so the AccessHandler keeps an unambiguous
+  // root↔privateMerkleRoot pairing — this label `_meta` is exactly what
+  // `queryKAMeta` resolves `<ual>/<n>` requests against. Single-root keeps
+  // the full collapse.
   const metaQuads: Quad[] = [];
-  for (const root of newRoots) {
+  const labelMultiRoot = newRoots.length > 1;
+  for (let i = 0; i < newRoots.length; i++) {
+    const root = newRoots[i];
     metaQuads.push(...entityMemberQuads(ual, root, metaGraph));
     const privRoot = privateRootByRoot?.get(root);
     if (privRoot && privRoot.length > 0) {
       metaQuads.push(mq(ual, `${DKG}privateMerkleRoot`, lit(toHex(privRoot)), metaGraph));
+    }
+    if (labelMultiRoot) {
+      const kaUri = `${ual}/${i + 1}`;
+      metaQuads.push(
+        ...entityMemberQuads(kaUri, root, metaGraph),
+        mq(kaUri, `${DKG}partOf`, ual, metaGraph),
+      );
+      if (privRoot && privRoot.length > 0) {
+        metaQuads.push(mq(kaUri, `${DKG}privateMerkleRoot`, lit(toHex(privRoot)), metaGraph));
+      }
     }
   }
   if (metaQuads.length > 0) await store.insert(metaQuads);
@@ -1199,9 +1258,19 @@ export function generateAssertionCreatedMetadata(meta: AssertionCreatedMeta, opt
   const quads: Quad[] = [
     // Assertion entity (DKG identity). RFC ka-metadata-trim Phase 1: the
     // `a prov:Entity` / `a dkg:Assertion` type rows, `dkg:contextGraph` and
-    // `prov:wasGeneratedBy` were dropped (zero readers — history joins the
-    // event-side `prov:generated`/`prov:used`). Old-store rows synced from
-    // older nodes may still carry them.
+    // `prov:wasGeneratedBy` were dropped — history joins the event-side
+    // `prov:generated`/`prov:used`. Old-store rows synced from older nodes
+    // may still carry them.
+    // "Zero readers" correction (Codex review "graph-viz", F1-style): one
+    // client-side reader DOES generically match `prov:wasGeneratedBy` —
+    // graph-viz's provenance-resolver (provenance-resolver.ts) populates
+    // ProvenanceInfo.generatedBy from any loaded node. The drop still
+    // strands nothing: (a) `_meta` lifecycle rows are not fed to the viz in
+    // any node-ui flow (data-layer SPARQL only); (b) generatedBy/
+    // generatedByName have no renderer anywhere in the repo; (c) the
+    // resolver's live feed is content-layer `prov:wasGeneratedBy` writers
+    // (semantic enrichment, agent profiles, user data) untouched by the
+    // trim. See docs/rfcs/ka-metadata-trim.md Phase 1.
     mq(subject, `${PROV}wasAttributedTo`, agentUri, metaGraph),
     mq(subject, `${DKG}assertionName`, lit(meta.assertionName), metaGraph),
     mq(subject, `${DKG}assertionGraph`, graphUri, metaGraph),

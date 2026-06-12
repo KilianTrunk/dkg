@@ -125,32 +125,42 @@ describe('generateKCMetadata', () => {
     expect(withPrivate.some(q => q.predicate === `${DKG}privateMerkleRoot`)).toBe(true);
   });
 
-  it('handles multiple member-entity rows under one KA (collapsed onto the UAL subject)', () => {
+  it('handles multiple member-entity rows under one KA (collapsed onto the UAL subject + pairing token rows)', () => {
     const kas = [makeKA({ tokenId: 1n }), makeKA({ tokenId: 2n, rootEntity: 'did:dkg:entity:bob' })];
     const quads = generateKCMetadata(makeMeta(), kas);
     // RFC ka-metadata-trim P3.1: every member entity lives on the UAL
-    // subject; no `<ual>/<n>` token subjects, no partOf.
-    expect(quads.find(q => q.predicate === `${DKG}partOf`)).toBeUndefined();
+    // subject …
     expect(new Set(quads.filter(q => q.subject === UAL && q.predicate === `${DKG}rootEntity`).map(q => q.object)))
       .toEqual(new Set(['did:dkg:entity:alice', 'did:dkg:entity:bob']));
+    // … and (Codex review "multi-root-access": the collapse is CONDITIONAL)
+    // multi-root publishes additionally re-emit the `<ual>/<tokenId>` pairing
+    // rows so private access can tie member root N to private bag N.
+    expect(quads).toContainEqual(
+      { subject: `${UAL}/1`, predicate: `${DKG}rootEntity`, object: 'did:dkg:entity:alice', graph: META_GRAPH },
+    );
+    expect(quads).toContainEqual(
+      { subject: `${UAL}/2`, predicate: `${DKG}rootEntity`, object: 'did:dkg:entity:bob', graph: META_GRAPH },
+    );
+    expect(quads).toContainEqual(
+      { subject: `${UAL}/2`, predicate: `${DKG}partOf`, object: UAL, graph: META_GRAPH },
+    );
   });
 
-  it('Design B + P3.1: the bare <ual> IS the KA — member entities, counts and private roots on one node', () => {
+  it('Design B + P3.1: the bare <ual> IS the KA — member entities, counts and private roots on one node (+ pairing token rows when multi-root)', () => {
     // One file = one on-chain KA, however many entities. RFC ka-metadata-trim
     // P3.1 collapsed the legacy `<UAL>/1, <UAL>/2, …` per-root label rows into
     // the UAL subject (post-rc.17 invariant: 1 publish = 1 KA = 1 UAL).
     // Readers are read-both — old-shape token rows still arrive via sync from
-    // older nodes.
+    // older nodes. Codex review "multi-root-access": MULTI-root publishes
+    // additionally re-emit the `<ual>/<tokenId>` pairing rows (the collapsed
+    // rows cannot tie member root N to private bag N); single-root publishes
+    // keep the full collapse (see the P3.1 test above).
     const kas = [
       makeKA({ tokenId: 1n, rootEntity: 'did:dkg:entity:alice', publicTripleCount: 5, privateTripleCount: 2, privateMerkleRoot: new Uint8Array([1, 2]) }),
       makeKA({ tokenId: 2n, rootEntity: 'did:dkg:entity:bob', publicTripleCount: 3, privateTripleCount: 1, privateMerkleRoot: new Uint8Array([3, 4]) }),
       makeKA({ tokenId: 3n, rootEntity: 'did:dkg:entity:carol', publicTripleCount: 2 }),
     ];
     const quads = generateKCMetadata(makeMeta(), kas);
-
-    // No `<ual>/<n>` token subjects, no partOf anywhere.
-    expect(quads.find(q => q.subject.startsWith(`${UAL}/`))).toBeUndefined();
-    expect(quads.find(q => q.predicate === `${DKG}partOf`)).toBeUndefined();
 
     // The UAL subject carries every member entity (single `dkg:rootEntity`
     // row — RFC ka-metadata-trim Phase 2 collapsed the §10.1 dual-write) …
@@ -164,7 +174,21 @@ describe('generateKCMetadata', () => {
     expect(new Set(quads.filter(q => q.subject === UAL && q.predicate === `${DKG}privateMerkleRoot`).map(q => q.object)))
       .toEqual(new Set(['"0102"', '"0304"']));
 
-    // RFC ka-metadata-trim: no publicTripleCount / tokenId / rdf:type anywhere.
+    // Multi-root: per-token pairing rows tie root N to private root N.
+    expect(quads).toContainEqual(
+      { subject: `${UAL}/1`, predicate: `${DKG}privateMerkleRoot`, object: '"0102"', graph: META_GRAPH },
+    );
+    expect(quads).toContainEqual(
+      { subject: `${UAL}/2`, predicate: `${DKG}privateMerkleRoot`, object: '"0304"', graph: META_GRAPH },
+    );
+    expect(quads).toContainEqual(
+      { subject: `${UAL}/3`, predicate: `${DKG}rootEntity`, object: 'did:dkg:entity:carol', graph: META_GRAPH },
+    );
+    // Token 3 (carol) has no private bag — no pairing row for it.
+    expect(quads.find(q => q.subject === `${UAL}/3` && q.predicate === `${DKG}privateMerkleRoot`)).toBeUndefined();
+
+    // RFC ka-metadata-trim: no publicTripleCount / tokenId / rdf:type anywhere
+    // (those stay dropped — the re-emit covers only the pairing rows).
     expect(quads.find(q => q.predicate === `${DKG}publicTripleCount`)).toBeUndefined();
     expect(quads.find(q => q.predicate === `${DKG}tokenId`)).toBeUndefined();
     expect(quads.find(q => q.predicate === RDF_TYPE)).toBeUndefined();

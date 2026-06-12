@@ -1513,6 +1513,12 @@ export class DKGPublisher implements Publisher {
           ];
           const seenPartitionRoots = new Set<string>();
           const seenPartitionPrivRoots = new Set<string>();
+          // Codex review "multi-root-access" (restateKaPartition parity):
+          // MULTI-root publishes additionally re-emit the legacy
+          // `<ual>/<tokenId>` token rows so the root↔privateMerkleRoot
+          // pairing stays recoverable; single-root keeps the full collapse.
+          const partitionMultiRoot =
+            new Set(publishResult.kaManifest.map((ka) => ka.rootEntity)).size > 1;
           for (const ka of publishResult.kaManifest) {
             if (!seenPartitionRoots.has(ka.rootEntity)) {
               seenPartitionRoots.add(ka.rootEntity);
@@ -1528,6 +1534,16 @@ export class DKGPublisher implements Publisher {
               if (!seenPartitionPrivRoots.has(privHex)) {
                 seenPartitionPrivRoots.add(privHex);
                 minimalMeta.push({ subject: ual, predicate: `${DKG_ONT}privateMerkleRoot`, object: `"${privHex}"`, graph: ctxMetaGraph });
+              }
+            }
+            if (partitionMultiRoot) {
+              const kaUri = `${ual}/${ka.tokenId}`;
+              minimalMeta.push(
+                { subject: kaUri, predicate: DKG_ROOT_ENTITY_LEGACY, object: ka.rootEntity, graph: ctxMetaGraph },
+                { subject: kaUri, predicate: `${DKG_ONT}partOf`, object: ual, graph: ctxMetaGraph },
+              );
+              if (ka.privateMerkleRoot && ka.privateMerkleRoot.length > 0) {
+                minimalMeta.push({ subject: kaUri, predicate: `${DKG_ONT}privateMerkleRoot`, object: `"${toHex(ka.privateMerkleRoot)}"`, graph: ctxMetaGraph });
               }
             }
           }

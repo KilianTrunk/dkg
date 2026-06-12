@@ -15,8 +15,16 @@
  *      writing it; the packed id is read off the UAL subject's `dkg:batchId`
  *      row instead, read-both with old-store receipt rows.)
  *   • the assertion lifecycle URN, in the SAME `_meta` graph, carries:
- *        <lifecycle>  dkg:rootEntity  <assertionUri> ;
- *                     dkg:reservedUal "did:dkg:evm:<chain>/<addr>/<n>" .
+ *        <lifecycle>  dkg:rootEntity  <memberEntity> ;   (one row per member —
+ *                     the objects are the seal's MEMBER ENTITIES, never the
+ *                     assertion URI itself)
+ *        <lifecycle>  dkg:reservedUal "did:dkg:evm:<chain>/<addr>/<n>" ;
+ *                     prov:wasAttributedTo <did:dkg:agent:0x…> .
+ *     The lifecycle URN is pinned to the assertion URI structurally:
+ *     lifecycle = urn:dkg:assertion:{cg}[:{sub}]:{addr}:{name} while the
+ *     assertion URI ends with /assertion/{addr}/{name} (constants.ts), and
+ *     names cannot contain "/" — so replacing "/"→":" in the assertion-URI
+ *     tail yields the URN tail unambiguously.
  *
  * The clicked node is an *entity*, not the KA.
  *
@@ -138,22 +146,27 @@ function sparqlIri(value: string): string {
  *     `dkg:assertionEntity` (§10.1 rename), plus the assertion-URI prefix
  *     match for namespaced member entities;
  *   - `reservedUal` / attribution: from the seal subject itself (new shape —
- *     the lifecycle record is merged onto it, P3.2) OR from a separate
- *     lifecycle URN row joined on `dkg:rootEntity` (old stores).
+ *     once the P3.2 lifecycle merge lands) OR from the separate lifecycle
+ *     URN (current + old stores). Codex review "node-ui-receipt": the URN
+ *     never carries `dkg:rootEntity <assertionUri>` — its rootEntity rows
+ *     stamp MEMBER entities — so the lifecycle join goes through the CLICKED
+ *     entity and is pinned to ?asrt by the structural (addr,name)
+ *     correspondence (URN tail `:{addr}:{name}` ⟷ URI tail
+ *     `/assertion/{addr}/{name}`, names cannot contain "/").
  * `entityIri` MUST already be validated via `sparqlIri`.
  */
-function buildSealReceiptQuery(cgId: string, entityIri: string): string {
+export function buildSealReceiptQuery(cgId: string, entityIri: string): string {
   const metaGraph = `did:dkg:context-graph:${cgId}/_meta`;
   const entityLit = sparqlStr(entityIri);
   // RFC ka-metadata-trim Phase 2 — `dkg:publishedAtKaId` is no longer
   // written (it was the third copy of the on-chain id). Read-both: prefer
   // the legacy receipt row when present (old stores), else resolve the id
   // off the UAL subject's `dkg:batchId` row — the UAL node is the
-  // reservedUal IRI, reachable from the seal subject (or the legacy
-  // lifecycle URN) via `dkg:reservedUal`.
+  // reservedUal IRI, reachable from the seal subject (or the lifecycle
+  // URN) via `dkg:reservedUal`.
   return `PREFIX dkg: <${DKG}>
 PREFIX prov: <http://www.w3.org/ns/prov#>
-SELECT ?asrt ?tx ?block ?kaId ?batchId ?finalizedAt ?ual ?ualSelf ?agentSelf WHERE {
+SELECT ?asrt ?tx ?block ?kaId ?batchId ?finalizedAt ?ual ?agentLc ?ualSelf ?agentSelf WHERE {
   GRAPH <${metaGraph}> {
     ?asrt dkg:publishedAtTx ?tx ;
           dkg:publishedAtBlock ?block .
@@ -164,7 +177,12 @@ SELECT ?asrt ?tx ?block ?kaId ?batchId ?finalizedAt ?ual ?ualSelf ?agentSelf WHE
     )
     OPTIONAL { ?asrt dkg:publishedAtKaId ?kaId . }
     OPTIONAL { ?asrt dkg:assertionFinalizedAt ?finalizedAt . }
-    OPTIONAL { ?lc dkg:rootEntity ?asrt ; dkg:reservedUal ?ual . }
+    OPTIONAL {
+      ?lc dkg:rootEntity <${entityIri}> ;
+          dkg:reservedUal ?ual .
+      FILTER(STRENDS(STR(?lc), CONCAT(":", REPLACE(STRAFTER(STR(?asrt), "/assertion/"), "/", ":"))))
+      OPTIONAL { ?lc prov:wasAttributedTo ?agentLc . }
+    }
     OPTIONAL { ?asrt dkg:reservedUal ?ualSelf . }
     OPTIONAL { ?asrt prov:wasAttributedTo ?agentSelf . }
     BIND(IRI(COALESCE(?ualSelf, ?ual)) AS ?ualNode)
@@ -215,10 +233,12 @@ SELECT ?source ?agent ?ts WHERE {
  * URI must (a) end with `/assertion/{addr}/{name}` and (b) be a prefix of the
  * clicked entity URI, and we (c) order prefix-matches first then longest-first
  * so the most specific (correct) assertion wins under `LIMIT 1`. reservedUal is
- * joined off the lifecycle URN via `dkg:rootEntity`, avoiding any reconstructed
- * `urn:dkg:assertion:…` key.
+ * joined off the lifecycle URN via its member-entity `dkg:rootEntity` stamp on
+ * the clicked entity, pinned to `(addr, name)` by the URN tail (the URN never
+ * carries the assertion URI as a rootEntity object — Codex review
+ * "node-ui-receipt").
  */
-function buildReceiptQuery(cgId: string, entityIri: string, addr: string, name: string): string {
+export function buildReceiptQuery(cgId: string, entityIri: string, addr: string, name: string): string {
   const metaGraph = `did:dkg:context-graph:${cgId}/_meta`;
   const suffix = `/assertion/${addr}/${name}`;
   const entityLit = sparqlStr(entityIri);
@@ -230,7 +250,11 @@ SELECT ?ual ?tx ?block ?kaId ?finalizedAt WHERE {
     OPTIONAL { ?asrt dkg:publishedAtKaId ?kaId . }
     FILTER(STRENDS(STR(?asrt), "${sparqlStr(suffix)}"))
     OPTIONAL { ?asrt dkg:assertionFinalizedAt ?finalizedAt . }
-    OPTIONAL { ?lc dkg:rootEntity ?asrt ; dkg:reservedUal ?ual . }
+    OPTIONAL {
+      ?lc dkg:rootEntity <${entityIri}> ;
+          dkg:reservedUal ?ual .
+      FILTER(STRENDS(STR(?lc), "${sparqlStr(`:${addr}:${name}`)}"))
+    }
   }
 } ORDER BY DESC(STRSTARTS("${entityLit}", STR(?asrt))) DESC(STRLEN(STR(?asrt))) LIMIT 1`;
 }
@@ -281,9 +305,11 @@ export function useEntityOnChainReceipt(
           const parsedAsrt = parseAssertionUri(asrt);
           const author = parsedAsrt?.addr ?? null;
           // Prefer the new-shape (seal-subject) attribution/UAL rows; fall
-          // back to the legacy lifecycle-URN join, then derive the agent DID
+          // back to the lifecycle-URN attribution, then derive the agent DID
           // from the parsed author address.
-          const agentRaw = sealRow.agentSelf ? unwrapIri(bv(sealRow.agentSelf)) : '';
+          const agentRaw =
+            (sealRow.agentSelf ? unwrapIri(bv(sealRow.agentSelf)) : '') ||
+            (sealRow.agentLc ? unwrapIri(bv(sealRow.agentLc)) : '');
           const agent = agentRaw || (author ? `did:dkg:agent:${author.toLowerCase()}` : null);
           const ual = (sealRow.ualSelf ? bv(sealRow.ualSelf) : '') || (sealRow.ual ? bv(sealRow.ual) : '');
           // Read-both (RFC ka-metadata-trim Phase 2): legacy

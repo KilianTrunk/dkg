@@ -47,6 +47,7 @@ interface SyncSendParams {
   remotePeerId: string;
   timeoutMs: number;
   retryAttempts: number;
+  signal?: AbortSignal;
   contextGraphId: string;
   offset: number;
   /**
@@ -67,7 +68,14 @@ interface SyncSendParams {
     data: Uint8Array,
     timeoutMs: number,
     messageId: string,
+    signal?: AbortSignal,
   ) => Promise<Uint8Array>;
+  /**
+   * Optional per-attempt response validator. Throwing here keeps the attempt
+   * inside `withRetry`, which lets sync-level retry sentinels share the same
+   * bounded backoff path as transport failures.
+   */
+  validateResponse?: (responseBytes: Uint8Array) => void | Promise<void>;
   protocolId: string;
   onRetry: (attempt: number, delay: number, err: unknown) => void;
 }
@@ -75,14 +83,46 @@ interface SyncSendParams {
 export async function sendSyncRequest(params: SyncSendParams): Promise<Uint8Array> {
   return withRetry(
     async () => {
+      throwIfAborted(params.signal);
       const requestBytes = await params.requestFactory();
+      throwIfAborted(params.signal);
       const messageId = randomUUID();
-      return params.send(params.remotePeerId, params.protocolId, requestBytes, params.timeoutMs, messageId);
+      const responseBytes = await params.send(
+        params.remotePeerId,
+        params.protocolId,
+        requestBytes,
+        params.timeoutMs,
+        messageId,
+        params.signal,
+      );
+      throwIfAborted(params.signal);
+      await params.validateResponse?.(responseBytes);
+      throwIfAborted(params.signal);
+      return responseBytes;
     },
     {
       maxAttempts: params.retryAttempts,
       baseDelayMs: 1000,
+      signal: params.signal,
+      isRetryable: () => params.signal?.aborted !== true,
       onRetry: params.onRetry,
     },
   );
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) throw asAbortError(signal.reason);
+}
+
+function asAbortError(reason: unknown): Error {
+  if (reason instanceof Error) {
+    if (reason.name === 'AbortError') return reason;
+    const err = new Error(reason.message || 'aborted');
+    err.name = 'AbortError';
+    (err as Error & { cause?: unknown }).cause = reason;
+    return err;
+  }
+  const err = new Error(typeof reason === 'string' ? reason : 'aborted');
+  err.name = 'AbortError';
+  return err;
 }

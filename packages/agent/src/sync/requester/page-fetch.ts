@@ -74,6 +74,7 @@ interface FetchSyncPagesParams {
   syncPageRetryAttempts: number;
   syncPageSize: number;
   syncDeniedResponse: string;
+  signal?: AbortSignal;
   /**
    * Additional response-body sentinels that also mean "ACL denied". Exists so
    * this requester keeps recognising the legacy `#DKG-SYNC-ACCESS-DENIED`
@@ -117,10 +118,41 @@ interface FetchSyncPagesParams {
     data: Uint8Array,
     timeoutMs: number,
     messageId: string,
+    signal?: AbortSignal,
   ) => Promise<Uint8Array>;
   logWarn: (ctx: OperationContext, message: string) => void;
   logInfo: (ctx: OperationContext, message: string) => void;
   logDebug: (ctx: OperationContext, message: string) => void;
+}
+
+function decodeSyncResponse(responseBytes: Uint8Array): string {
+  return new TextDecoder().decode(responseBytes).trim();
+}
+
+// Compatibility-only: current responders must not emit this body on the
+// unchanged sync protocol, but requesters may still meet A2 pre-fix peers
+// during local/integration rolling tests. Treat it as retryable, not EOF.
+const LEGACY_SYNC_BUSY_RESPONSE = '__DKG_SYNC_BUSY__';
+
+function makeLegacySyncBusyError(remotePeerId: string, contextGraphId: string, phase: SyncPhase): Error {
+  return new Error(`Legacy sync responder busy at ${remotePeerId} for "${contextGraphId}" (${phase})`);
+}
+
+function asAbortError(reason: unknown): Error {
+  if (reason instanceof Error) {
+    if (reason.name === 'AbortError') return reason;
+    const err = new Error(reason.message || 'aborted');
+    err.name = 'AbortError';
+    (err as Error & { cause?: unknown }).cause = reason;
+    return err;
+  }
+  const err = new Error(typeof reason === 'string' ? reason : 'aborted');
+  err.name = 'AbortError';
+  return err;
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) throw asAbortError(signal.reason);
 }
 
 export async function fetchSyncPages(params: FetchSyncPagesParams): Promise<SyncPageResult> {
@@ -138,6 +170,7 @@ export async function fetchSyncPages(params: FetchSyncPagesParams): Promise<Sync
     syncPageRetryAttempts,
     syncPageSize,
     syncDeniedResponse,
+    signal,
     extraDeniedResponses,
     debugSyncProgress,
     protocolSync,
@@ -152,6 +185,7 @@ export async function fetchSyncPages(params: FetchSyncPagesParams): Promise<Sync
   } = params;
 
   const allQuads: Quad[] = [];
+  throwIfAborted(signal);
   const checkpointKey = getSyncCheckpointKey(remotePeerId, contextGraphId, includeSharedMemory, phase, snapshotRef, sinceBatchId);
   let offset = checkpointStore.get(checkpointKey) ?? 0;
   const usesPageSession = usesResponderSession(includeSharedMemory, phase);
@@ -178,6 +212,7 @@ export async function fetchSyncPages(params: FetchSyncPagesParams): Promise<Sync
 
   try {
     while (true) {
+      throwIfAborted(signal);
       if (Date.now() > deadline) {
         timedOut = true;
         break;
@@ -195,6 +230,7 @@ export async function fetchSyncPages(params: FetchSyncPagesParams): Promise<Sync
         remotePeerId,
         timeoutMs,
         retryAttempts: syncPageRetryAttempts,
+        signal,
         contextGraphId,
         offset,
         protocolId: protocolSync,
@@ -205,16 +241,27 @@ export async function fetchSyncPages(params: FetchSyncPagesParams): Promise<Sync
         // fresh-messageId-per-attempt is generated inside
         // `sendSyncRequest`. See `sendSyncRequest`'s jsdoc for the
         // full rationale (codex review on #569 follow-ups #1, #4-#8).
-        requestFactory: () => buildSyncRequest(contextGraphId, curOffset, syncPageSize, includeSharedMemory, remotePeerId, phase, snapshotRef, sinceBatchId, syncSessionId),
+        requestFactory: async () => {
+          throwIfAborted(signal);
+          const request = await buildSyncRequest(contextGraphId, curOffset, syncPageSize, includeSharedMemory, remotePeerId, phase, snapshotRef, sinceBatchId, syncSessionId);
+          throwIfAborted(signal);
+          return request;
+        },
         send,
+        validateResponse: (responseBytes) => {
+          if (decodeSyncResponse(responseBytes) === LEGACY_SYNC_BUSY_RESPONSE) {
+            throw makeLegacySyncBusyError(remotePeerId, contextGraphId, phase);
+          }
+        },
         onRetry: (attempt, delay, err) => {
           logWarn(ctx, `Sync page retry ${attempt}/${syncPageRetryAttempts} for offset ${offset} (delay ${Math.round(delay)}ms): ${err instanceof Error ? err.message : String(err)}`);
         },
       });
       const transportDurationMs = Date.now() - transportStartedAt;
+      throwIfAborted(signal);
 
       const decodeStartedAt = Date.now();
-      const nquadsText = new TextDecoder().decode(responseBytes).trim();
+      const nquadsText = decodeSyncResponse(responseBytes);
       const decodeDurationMs = Date.now() - decodeStartedAt;
       bytesReceived += responseBytes.byteLength;
       if (
@@ -229,6 +276,7 @@ export async function fetchSyncPages(params: FetchSyncPagesParams): Promise<Sync
 
       const parseStartedAt = Date.now();
       const parsed = await parseAndFilter(nquadsText, graphUri, contextGraphId);
+      throwIfAborted(signal);
       const parseDurationMs = Date.now() - parseStartedAt;
 
       const stepDurationMs = transportDurationMs + decodeDurationMs + parseDurationMs;

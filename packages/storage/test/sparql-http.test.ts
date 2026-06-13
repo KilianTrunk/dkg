@@ -118,6 +118,59 @@ describe('SparqlHttpStore (test server)', () => {
     }
   });
 
+  it('composes caller abort signals into SELECT and CONSTRUCT fetches', async () => {
+    const originalFetch = globalThis.fetch;
+    const seenSignals: AbortSignal[] = [];
+    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+      if (init?.signal instanceof AbortSignal) seenSignals.push(init.signal);
+      const accept = String((init?.headers as Record<string, string> | undefined)?.Accept ?? '');
+      if (accept.includes('n-quads')) {
+        return new Response('', { status: 200 });
+      }
+      return new Response(JSON.stringify({
+        head: { vars: [] },
+        results: { bindings: [] },
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/sparql-results+json' },
+      });
+    }) as typeof fetch;
+    try {
+      const signalController = new AbortController();
+      const signalStore = new SparqlHttpStore({ queryEndpoint: 'http://example.test/query', timeout: 30_000 });
+
+      await signalStore.query('SELECT ?s WHERE { ?s ?p ?o }', { signal: signalController.signal });
+      await signalStore.query('CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }', { signal: signalController.signal });
+
+      expect(seenSignals).toHaveLength(2);
+      expect(seenSignals.every((signal) => !signal.aborted)).toBe(true);
+      signalController.abort(new Error('caller aborted'));
+      expect(seenSignals.every((signal) => signal.aborted)).toBe(true);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('rejects in-flight queries when the caller aborts', async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) =>
+      new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true });
+      })) as typeof fetch;
+    try {
+      const signalController = new AbortController();
+      const signalStore = new SparqlHttpStore({ queryEndpoint: 'http://example.test/query', timeout: 30_000 });
+      const query = signalStore.query('SELECT ?s WHERE { ?s ?p ?o }', { signal: signalController.signal });
+
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      signalController.abort(new Error('caller aborted'));
+
+      await expect(query).rejects.toThrow(/caller aborted/);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   it('query ASK returns boolean', async () => {
     const result = await store.query('ASK { GRAPH <http://ex.org/g> { ?s ?p ?o } }');
     expect(result.type).toBe('boolean');
@@ -295,6 +348,32 @@ describe('SparqlHttpStore (test server)', () => {
       expect(b).toContain('http://ex.org/g1');
       expect(c).toContain('http://ex.org/g1');
       expect(listGraphsHits).toBe(1); // all three shared one in-flight scan
+    });
+
+    it('lets aborted callers detach without cancelling the shared managed scan', async () => {
+      listGraphsHits = 0;
+      let release!: () => void;
+      listGraphsGate = new Promise<void>((r) => { release = r; });
+      const delay = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+      const store = managedStore();
+      const firstController = new AbortController();
+      try {
+        const first = store.listGraphs({ signal: firstController.signal });
+        await delay(30);
+        expect(listGraphsHits).toBe(1);
+
+        firstController.abort(new Error('first caller left'));
+        await expect(first).rejects.toThrow(/first caller left/);
+
+        const second = store.listGraphs();
+        await delay(30);
+        expect(listGraphsHits).toBe(1);
+
+        release();
+        await expect(second).resolves.toContain('http://ex.org/g1');
+      } finally {
+        listGraphsGate = null;
+      }
     });
 
     it('a write during an in-flight scan forces the next caller to re-scan, not join stale work', async () => {

@@ -380,6 +380,23 @@ import {
 import { DKGAgentBase } from './dkg-agent-base.js';
 import type { DKGAgent } from './dkg-agent.js';
 
+function syncAuthAbortError(reason: unknown): Error {
+  if (reason instanceof Error) {
+    if (reason.name === 'AbortError') return reason;
+    const err = new Error(reason.message || 'aborted');
+    err.name = 'AbortError';
+    (err as Error & { cause?: unknown }).cause = reason;
+    return err;
+  }
+  const err = new Error(typeof reason === 'string' ? reason : 'aborted');
+  err.name = 'AbortError';
+  return err;
+}
+
+function throwIfSyncAuthAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) throw syncAuthAbortError(signal.reason);
+}
+
 export class ContextGraphResolveMethods extends DKGAgentBase {
   /**
    * Check whether a context graph exists in local storage. Definition triples in
@@ -681,8 +698,15 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
     );
   }
 
-  public async authorizeSyncRequest(this: DKGAgent, request: SyncRequestEnvelope, remotePeerId: string): Promise<boolean> {
-    const isPrivate = await this.isPrivateContextGraph(request.contextGraphId);
+  public async authorizeSyncRequest(
+    this: DKGAgent,
+    request: SyncRequestEnvelope,
+    remotePeerId: string,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<boolean> {
+    throwIfSyncAuthAborted(options.signal);
+    const isPrivate = await this.isPrivateContextGraph(request.contextGraphId, { signal: options.signal });
+    throwIfSyncAuthAborted(options.signal);
     if (!isPrivate) {
       return true;
     }
@@ -695,13 +719,24 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
       syncAuthMaxAgeMs: SYNC_AUTH_MAX_AGE_MS,
       seenRequestIds: this.seenPrivateSyncRequestIds,
       computeSyncDigest: this.computeSyncDigest.bind(this),
-      verifyIdentity: typeof verifyIdentity === 'function' ? verifyIdentity.bind(this.chain) : undefined,
-      getParticipants: (contextGraphId) => this.getPrivateContextGraphParticipants(contextGraphId),
-      getAllowedPeers: (contextGraphId) => this.getContextGraphAllowedPeers(contextGraphId),
-      getAgentGateAddresses: (contextGraphId) => this.getContextGraphAgentGateAddresses(contextGraphId),
-      getAllowedDelegateePeers: (contextGraphId) => this.getContextGraphAllowedDelegateePeers(contextGraphId),
-      getAllowedDelegateeKeys: (contextGraphId) => this.getContextGraphAllowedDelegateeKeys(contextGraphId),
-      refreshMetaFromCurator: (contextGraphId) => this.refreshMetaFromCurator(contextGraphId),
+      verifyIdentity: typeof verifyIdentity === 'function'
+        ? async (recoveredAddress, claimedIdentityId, lookupOptions) => {
+            // Chain/RPC verifiers are not actually abortable in ethers. Do not
+            // race them against request aborts: that would free responder
+            // capacity while the RPC keeps running in the background.
+            throwIfSyncAuthAborted(lookupOptions?.signal);
+            const valid = await verifyIdentity.call(this.chain, recoveredAddress, claimedIdentityId);
+            throwIfSyncAuthAborted(lookupOptions?.signal);
+            return valid;
+          }
+        : undefined,
+      getParticipants: (contextGraphId, lookupOptions) => this.getPrivateContextGraphParticipants(contextGraphId, lookupOptions),
+      getAllowedPeers: (contextGraphId, lookupOptions) => this.getContextGraphAllowedPeers(contextGraphId, lookupOptions),
+      getAgentGateAddresses: (contextGraphId, lookupOptions) => this.getContextGraphAgentGateAddresses(contextGraphId, lookupOptions),
+      getAllowedDelegateePeers: (contextGraphId, lookupOptions) => this.getContextGraphAllowedDelegateePeers(contextGraphId, lookupOptions),
+      getAllowedDelegateeKeys: (contextGraphId, lookupOptions) => this.getContextGraphAllowedDelegateeKeys(contextGraphId, lookupOptions),
+      refreshMetaFromCurator: (contextGraphId, lookupOptions) => this.refreshMetaFromCurator(contextGraphId, lookupOptions),
+      signal: options.signal,
       logWarn: (ctx, message) => this.log.warn(ctx, message),
       logInfo: (ctx, message) => this.log.info(ctx, message),
     });
@@ -1046,6 +1081,7 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
    */
   async getExplicitAccessPolicy(this: DKGAgent,
     contextGraphId: string,
+    options: { signal?: AbortSignal } = {},
   ): Promise<'public' | 'private' | null> {
     if ((Object.values(SYSTEM_CONTEXT_GRAPHS) as string[]).includes(contextGraphId)) {
       return null;
@@ -1065,6 +1101,7 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
           }
         }
       } LIMIT 1`,
+      { signal: options.signal },
     );
     if (result.type !== 'bindings' || result.bindings.length === 0) return null;
     const policyValue = result.bindings[0]?.['policy'];
@@ -1130,7 +1167,10 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
     );
   }
 
-  async isPrivateContextGraph(this: DKGAgent, contextGraphId: string): Promise<boolean> {
+  async isPrivateContextGraph(this: DKGAgent,
+    contextGraphId: string,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<boolean> {
     if ((Object.values(SYSTEM_CONTEXT_GRAPHS) as string[]).includes(contextGraphId)) {
       return false;
     }
@@ -1158,7 +1198,7 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
     // Codex review on #873 — policy lookup now delegated to the
     // shared `getExplicitAccessPolicy()` helper so this routing
     // function and the invite-path warning helper can never drift.
-    const policy = await this.getExplicitAccessPolicy(contextGraphId);
+    const policy = await this.getExplicitAccessPolicy(contextGraphId, { signal: options.signal });
     if (policy === 'private') return true;
     if (policy === 'public') return false;
     // policy === null falls through to the legacy heuristic below.
@@ -1181,6 +1221,7 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
           { <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_ALLOWED_PEER}> ?peer }
         }
       }`,
+      { signal: options.signal },
     );
     if (allowlistResult.type === 'boolean' && allowlistResult.value === true) {
       return true;
@@ -1189,7 +1230,11 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
     return false;
   }
 
-  async getPrivateContextGraphParticipants(this: DKGAgent, contextGraphId: string): Promise<string[] | null> {
+  async getPrivateContextGraphParticipants(
+    this: DKGAgent,
+    contextGraphId: string,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<string[] | null> {
     const merged: string[] = [];
     const seen = new Set<string>();
     const add = (value: string | undefined) => {
@@ -1218,6 +1263,7 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
           { <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_PARTICIPANT_AGENT}> ?agent }
         }
       }`,
+      { signal: options.signal },
     );
     if (agentResult.type === 'bindings') {
       for (const row of agentResult.bindings) {
@@ -1233,6 +1279,7 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
           <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_PARTICIPANT_IDENTITY_ID}> ?identityId
         }
       }`,
+      { signal: options.signal },
     );
     if (metaResult.type === 'bindings') {
       for (const row of metaResult.bindings) {
@@ -1254,7 +1301,11 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
    * newly added participants. Rate-limited to avoid abuse.
    * Returns true if meta was refreshed, false if skipped or failed.
    */
-  public async resolveCuratorPeerId(this: DKGAgent, contextGraphId: string): Promise<string | undefined> {
+  public async resolveCuratorPeerId(
+    this: DKGAgent,
+    contextGraphId: string,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<string | undefined> {
     const cgMetaGraph = contextGraphMetaGraphUri(contextGraphId);
     const contextGraphUri = contextGraphDataGraphUri(contextGraphId);
 
@@ -1264,6 +1315,7 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
           <${contextGraphUri}> <${DKG_ONTOLOGY.DKG_CURATOR}> ?curator
         }
       } LIMIT 1`,
+      { signal: options.signal },
     );
     if (curatorResult.type !== 'bindings' || curatorResult.bindings.length === 0) {
       return undefined;
@@ -1300,6 +1352,7 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
             }
           }
         } LIMIT 1`,
+        { signal: options.signal },
       );
       if (creatorResult.type === 'bindings' && creatorResult.bindings.length > 0) {
         const creatorDid = (creatorResult.bindings[0] as Record<string, string>)['creator'] ?? '';
@@ -1316,7 +1369,9 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
       // share the same wallet address, but better than failing outright)
       if (!resolved) {
         try {
+          throwIfSyncAuthAborted(options.signal);
           const agents = await this.discovery.findAgents();
+          throwIfSyncAuthAborted(options.signal);
           const match = agents.find(
             (a) => a.agentAddress?.toLowerCase() === curatorIdentifier.toLowerCase(),
           );
@@ -1324,7 +1379,10 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
             curatorPeerId = match.peerId;
             resolved = true;
           }
-        } catch { /* registry unavailable */ }
+        } catch {
+          throwIfSyncAuthAborted(options.signal);
+          /* registry unavailable */
+        }
       }
 
       if (!resolved) return undefined;
@@ -1333,7 +1391,12 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
     return curatorPeerId;
   }
 
-  async refreshMetaFromCurator(this: DKGAgent, contextGraphId: string): Promise<boolean> {
+  async refreshMetaFromCurator(
+    this: DKGAgent,
+    contextGraphId: string,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<boolean> {
+    throwIfSyncAuthAborted(options.signal);
     const now = Date.now();
     const lastRefresh = this.metaRefreshTimestamps.get(contextGraphId) ?? 0;
     if (now - lastRefresh < META_REFRESH_COOLDOWN_MS) {
@@ -1342,7 +1405,8 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
 
     const ctx = createOperationContext('sync');
     const cgMetaGraph = contextGraphMetaGraphUri(contextGraphId);
-    const curatorPeerId = await this.resolveCuratorPeerId(contextGraphId);
+    const curatorPeerId = await this.resolveCuratorPeerId(contextGraphId, options);
+    throwIfSyncAuthAborted(options.signal);
     if (!curatorPeerId) {
       return false;
     }
@@ -1362,23 +1426,28 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
         const pid = peerIdFromString(curatorPeerId);
 
         try {
-          await this.node.libp2p.dial(pid);
+          await this.node.libp2p.dial(pid, { signal: options.signal });
+          throwIfSyncAuthAborted(options.signal);
           connections = this.node.libp2p.getConnections();
           isConnected = connections.some((c) => c.remotePeer.toString() === curatorPeerId);
         } catch { /* direct dial failed, try relay */ }
 
         if (!isConnected) {
+          throwIfSyncAuthAborted(options.signal);
           const agent = await this.discovery.findAgentByPeerId(curatorPeerId);
+          throwIfSyncAuthAborted(options.signal);
           if (agent?.relayAddress) {
             const { multiaddr } = await import('@multiformats/multiaddr');
             const circuitAddr = multiaddr(`${agent.relayAddress}/p2p-circuit/p2p/${curatorPeerId}`);
             await this.node.libp2p.peerStore.merge(pid, { multiaddrs: [circuitAddr] });
-            await this.node.libp2p.dial(pid);
+            await this.node.libp2p.dial(pid, { signal: options.signal });
+            throwIfSyncAuthAborted(options.signal);
             connections = this.node.libp2p.getConnections();
             isConnected = connections.some((c) => c.remotePeer.toString() === curatorPeerId);
           }
         }
       } catch (err) {
+        throwIfSyncAuthAborted(options.signal);
         this.log.warn(ctx, `Failed to dial curator ${curatorPeerId.slice(-8)} for meta refresh: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
@@ -1389,7 +1458,19 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
 
     try {
       const deadline = Date.now() + 10_000;
-      const metaResult = await this.fetchSyncPages(ctx, curatorPeerId, contextGraphId, false, 'meta', cgMetaGraph, deadline);
+      const metaResult = await this.fetchSyncPages(
+        ctx,
+        curatorPeerId,
+        contextGraphId,
+        false,
+        'meta',
+        cgMetaGraph,
+        deadline,
+        undefined,
+        undefined,
+        options.signal,
+      );
+      throwIfSyncAuthAborted(options.signal);
       if (metaResult.quads.length > 0) {
         await this.store.insert(metaResult.quads);
         this.syncCheckpoints.delete(metaResult.checkpointKey);
@@ -1399,6 +1480,7 @@ export class ContextGraphResolveMethods extends DKGAgentBase {
       this.syncCheckpoints.delete(metaResult.checkpointKey);
       return false;
     } catch (err) {
+      throwIfSyncAuthAborted(options.signal);
       this.log.warn(ctx, `Meta refresh for "${contextGraphId}" failed: ${err instanceof Error ? err.message : String(err)}`);
       return false;
     } finally {

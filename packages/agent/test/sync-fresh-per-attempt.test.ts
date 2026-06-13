@@ -28,6 +28,7 @@ const REMOTE_PEER_ID = '12D3KooWSmU3owJvB9sFw8uApDgKrv2VBMecsGGvgAc4Gq6hB57M';
 const CG_ID = 'urn:test:cg';
 const GRAPH_URI = `urn:test:cg/graph`;
 const PROTOCOL_ID = '/dkg/10.0.2/sync';
+const LEGACY_SYNC_BUSY_RESPONSE = '__DKG_SYNC_BUSY__';
 
 function noopLog(): void {}
 function makeCtx(): OperationContext {
@@ -925,5 +926,246 @@ describe('fetchSyncPages: fresh envelope + fresh messageId per retry attempt', (
     // failure should not bypass to a send).
     expect(buildCalls).toBe(3);
     expect(sendCalls).toBe(1);
+  });
+
+  it('retries responder overload transport failures before parsing a page', async () => {
+    const warnings: string[] = [];
+    let sendCalls = 0;
+
+    await runFetchWithFakeTimers(
+      fetchSyncPages({
+        ctx: makeCtx(),
+        remotePeerId: REMOTE_PEER_ID,
+        contextGraphId: CG_ID,
+        includeSharedMemory: false,
+        phase: 'data',
+        graphUri: GRAPH_URI,
+        deadline: Date.now() + 60_000,
+        syncPageTimeoutMs: 5_000,
+        syncRouterAttempts: 1,
+        syncPageRetryAttempts: 3,
+        syncPageSize: 100,
+        syncDeniedResponse: '#DENIED',
+        debugSyncProgress: false,
+        protocolSync: PROTOCOL_ID,
+        checkpointStore: {
+          get: () => 0,
+          set: () => {},
+          delete: () => {},
+        },
+        buildSyncRequest: async () => new TextEncoder().encode('request'),
+        parseAndFilter: singleQuadParser,
+        send: async () => {
+          sendCalls++;
+          if (sendCalls === 1) throw new Error('sync responder queue full');
+          return new TextEncoder().encode('one-quad-line');
+        },
+        logWarn: (_ctx, message) => { warnings.push(message); },
+        logInfo: noopLog,
+        logDebug: noopLog,
+      }),
+    );
+
+    expect(sendCalls).toBe(2);
+    expect(warnings.some((message) => message.includes('sync responder queue full'))).toBe(true);
+  });
+
+  it('retries legacy responder busy bodies before parsing a page', async () => {
+    const warnings: string[] = [];
+    let sendCalls = 0;
+
+    await runFetchWithFakeTimers(
+      fetchSyncPages({
+        ctx: makeCtx(),
+        remotePeerId: REMOTE_PEER_ID,
+        contextGraphId: CG_ID,
+        includeSharedMemory: false,
+        phase: 'data',
+        graphUri: GRAPH_URI,
+        deadline: Date.now() + 60_000,
+        syncPageTimeoutMs: 5_000,
+        syncRouterAttempts: 1,
+        syncPageRetryAttempts: 3,
+        syncPageSize: 100,
+        syncDeniedResponse: '#DENIED',
+        debugSyncProgress: false,
+        protocolSync: PROTOCOL_ID,
+        checkpointStore: {
+          get: () => 0,
+          set: () => {},
+          delete: () => {},
+        },
+        buildSyncRequest: async () => new TextEncoder().encode('request'),
+        parseAndFilter: singleQuadParser,
+        send: async () => {
+          sendCalls++;
+          return new TextEncoder().encode(sendCalls === 1 ? LEGACY_SYNC_BUSY_RESPONSE : 'one-quad-line');
+        },
+        logWarn: (_ctx, message) => { warnings.push(message); },
+        logInfo: noopLog,
+        logDebug: noopLog,
+      }),
+    );
+
+    expect(sendCalls).toBe(2);
+    expect(warnings.some((message) => message.includes('Legacy sync responder busy'))).toBe(true);
+  });
+
+  it('retries transport AbortErrors while the caller signal is still live', async () => {
+    const warnings: string[] = [];
+    const controller = new AbortController();
+    let sendCalls = 0;
+
+    await runFetchWithFakeTimers(
+      fetchSyncPages({
+        ctx: makeCtx(),
+        remotePeerId: REMOTE_PEER_ID,
+        contextGraphId: CG_ID,
+        includeSharedMemory: false,
+        phase: 'data',
+        graphUri: GRAPH_URI,
+        deadline: Date.now() + 60_000,
+        syncPageTimeoutMs: 5_000,
+        syncRouterAttempts: 1,
+        syncPageRetryAttempts: 3,
+        syncPageSize: 100,
+        syncDeniedResponse: '#DENIED',
+        signal: controller.signal,
+        debugSyncProgress: false,
+        protocolSync: PROTOCOL_ID,
+        checkpointStore: {
+          get: () => 0,
+          set: () => {},
+          delete: () => {},
+        },
+        buildSyncRequest: async () => new TextEncoder().encode('request'),
+        parseAndFilter: singleQuadParser,
+        send: async () => {
+          sendCalls++;
+          if (sendCalls === 1) {
+            const err = new Error('remote stream aborted');
+            err.name = 'AbortError';
+            throw err;
+          }
+          return new TextEncoder().encode('one-quad-line');
+        },
+        logWarn: (_ctx, message) => { warnings.push(message); },
+        logInfo: noopLog,
+        logDebug: noopLog,
+      }),
+    );
+
+    expect(controller.signal.aborted).toBe(false);
+    expect(sendCalls).toBe(2);
+    expect(warnings.some((message) => message.includes('remote stream aborted'))).toBe(true);
+  });
+
+  it('passes caller abort signal to sync transport and does not retry aborts', async () => {
+    const controller = new AbortController();
+    let releaseSendStarted: () => void = () => {};
+    const sendStarted = new Promise<void>((resolve) => {
+      releaseSendStarted = resolve;
+    });
+    let observedSignal: AbortSignal | undefined;
+    let sendCalls = 0;
+    let retryWarnings = 0;
+
+    const fetchPromise = fetchSyncPages({
+      ctx: makeCtx(),
+      remotePeerId: REMOTE_PEER_ID,
+      contextGraphId: CG_ID,
+      includeSharedMemory: false,
+      phase: 'meta',
+      graphUri: GRAPH_URI,
+      deadline: Date.now() + 60_000,
+      syncPageTimeoutMs: 10_000,
+      syncRouterAttempts: 1,
+      syncPageRetryAttempts: 3,
+      syncPageSize: 100,
+      syncDeniedResponse: '#DENIED',
+      signal: controller.signal,
+      debugSyncProgress: false,
+      protocolSync: PROTOCOL_ID,
+      checkpointStore: {
+        get: () => 0,
+        set: () => {},
+        delete: () => {},
+      },
+      buildSyncRequest: async () => new TextEncoder().encode('request'),
+      parseAndFilter: singleQuadParser,
+      send: async (_peerId, _protocolId, _data, _timeoutMs, _messageId, signal) => {
+        sendCalls++;
+        observedSignal = signal;
+        releaseSendStarted();
+        return new Promise<Uint8Array>((_resolve, reject) => {
+          if (signal?.aborted) {
+            reject(signal.reason);
+            return;
+          }
+          signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
+        });
+      },
+      logWarn: () => { retryWarnings++; },
+      logInfo: noopLog,
+      logDebug: noopLog,
+    });
+
+    await sendStarted;
+    const abortReason = new Error('request closed');
+    abortReason.name = 'AbortError';
+    controller.abort(abortReason);
+
+    await expect(fetchPromise).rejects.toThrow('request closed');
+    expect(observedSignal).toBe(controller.signal);
+    expect(sendCalls).toBe(1);
+    expect(retryWarnings).toBe(0);
+  });
+
+  it('rejects pre-aborted DOMException signals without mutating the reason', async () => {
+    const controller = new AbortController();
+    let buildCalls = 0;
+    let sendCalls = 0;
+
+    controller.abort();
+
+    await expect(
+      fetchSyncPages({
+        ctx: makeCtx(),
+        remotePeerId: REMOTE_PEER_ID,
+        contextGraphId: CG_ID,
+        includeSharedMemory: false,
+        phase: 'data',
+        graphUri: GRAPH_URI,
+        deadline: Date.now() + 60_000,
+        syncPageTimeoutMs: 5_000,
+        syncRouterAttempts: 1,
+        syncPageRetryAttempts: 1,
+        syncPageSize: 100,
+        syncDeniedResponse: '#DENIED',
+        signal: controller.signal,
+        debugSyncProgress: false,
+        protocolSync: PROTOCOL_ID,
+        checkpointStore: {
+          get: () => 0,
+          set: () => {},
+          delete: () => {},
+        },
+        buildSyncRequest: async () => {
+          buildCalls++;
+          return new TextEncoder().encode('request');
+        },
+        parseAndFilter: singleQuadParser,
+        send: async () => {
+          sendCalls++;
+          return new TextEncoder().encode('');
+        },
+        logWarn: noopLog,
+        logInfo: noopLog,
+        logDebug: noopLog,
+      }),
+    ).rejects.toMatchObject({ name: 'AbortError' });
+
+    expect(buildCalls).toBe(0);
+    expect(sendCalls).toBe(0);
   });
 });

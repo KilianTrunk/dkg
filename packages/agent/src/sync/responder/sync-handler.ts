@@ -356,14 +356,26 @@ export function registerSyncHandler(params: RegisterSyncHandlerParams): void {
         // xsd:integer(STR(...)) so an untyped literal isn't silently skipped by
         // a typed `>` comparison (which would resend stale rows or, in the
         // NOT-EXISTS arm, hide eligible ones).
+        // Read-both (RFC ka-metadata-trim P3.1): the collapsed KA shape has
+        // `dkg:rootEntity` + `dkg:batchId` directly on the UAL subject (no
+        // `<ual>/<n>` + `dkg:partOf` token rows); legacy-shape rows still use
+        // the token-row form. The third branch resolves collapsed rows; on
+        // old-shape stores it ALSO matches (the aggregate UAL row carried
+        // both predicates) — harmless inside EXISTS/NOT-EXISTS semantics.
         const batchIdOfSubject = (sfx: string): string => `
                 GRAPH ?mg${sfx} {
                   ${metaGraphScope('?mg' + sfx)}
-                  ?ka${sfx} <${DKG_NS}partOf> ?ual${sfx} ; <${DKG_NS}rootEntity> ?re${sfx} .
-                  FILTER(?re${sfx} = ?s || STRSTARTS(STR(?s), CONCAT(STR(?re${sfx}), "/.well-known/genid/")))
-                  { ?ual${sfx} <${DKG_NS}batchId> ?bid${sfx} }
+                  {
+                    ?ka${sfx} <${DKG_NS}partOf> ?ual${sfx} ; <${DKG_NS}rootEntity> ?re${sfx} .
+                    { ?ual${sfx} <${DKG_NS}batchId> ?bid${sfx} }
+                    UNION
+                    { ?ka${sfx} <${DKG_NS}batchId> ?bid${sfx} }
+                  }
                   UNION
-                  { ?ka${sfx} <${DKG_NS}batchId> ?bid${sfx} }
+                  {
+                    ?ualc${sfx} <${DKG_NS}rootEntity> ?re${sfx} ; <${DKG_NS}batchId> ?bid${sfx} .
+                  }
+                  FILTER(?re${sfx} = ?s || STRSTARTS(STR(?s), CONCAT(STR(?re${sfx}), "/.well-known/genid/")))
                 }`;
         const deltaFilter = sinceBatchId != null
           ? `

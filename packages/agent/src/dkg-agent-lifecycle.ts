@@ -398,6 +398,8 @@ import type { DKGAgent } from './dkg-agent.js';
 export class LifecycleSyncMethods extends DKGAgentBase {
   async start(this: DKGAgent): Promise<void> {
     if (this.started) return;
+    this.coreHostRecordingGeneration += 1;
+    this.coreHostRecordingsClosed = false;
     const ctx = createOperationContext('connect');
     this.log.info(ctx, `Starting DKG node`);
 
@@ -1104,7 +1106,7 @@ export class LifecycleSyncMethods extends DKGAgentBase {
                 // hosts the CG so the chain-driven VM reconciler fills its gaps
                 // across restarts. Best-effort + public-CG-gated inside the
                 // helper; never blocks or affects the (sync) provenance return.
-                void this.recordCoreHostedPublicCg(cgId, swmGraphId);
+                this.trackCoreHostRecording(() => this.recordCoreHostedPublicCg(cgId, swmGraphId));
                 const wireFromCgId = cgId ? this.gossipWireIdFor(cgId) : undefined;
                 const wireFromSwmGraphId = swmGraphId && swmGraphId !== cgId
                   ? this.gossipWireIdFor(swmGraphId)
@@ -2602,10 +2604,12 @@ export class LifecycleSyncMethods extends DKGAgentBase {
       unpin: (peerId, ctx) => this.unpinWarmCore(peerId, ctx),
       dial: (peerId, ctx) => this.dialWarmCore(peerId, ctx),
       previouslyWarmed: this.warmedCores,
+      previouslyFailedUnpins: this.warmCoreFailedUnpins,
       log: (ctx, msg) => this.log.info(ctx, msg),
     });
     // Carry the pinned set into the next tick so stale Cores get unpinned.
     this.warmedCores = result.warmed;
+    this.warmCoreFailedUnpins = result.failedUnpins;
   }
 
   /**
@@ -2665,6 +2669,7 @@ export class LifecycleSyncMethods extends DKGAgentBase {
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       this.log.info(ctx, `warm-core: unpin ${shortPeer} failed: ${message}`);
+      throw err;
     }
   }
 
@@ -2978,9 +2983,14 @@ export class LifecycleSyncMethods extends DKGAgentBase {
    */
   async syncContextGraphFromConnectedPeers(this: DKGAgent,
     contextGraphId: string,
-    options?: { includeSharedMemory?: boolean },
+    options?: { includeSharedMemory?: boolean; maxPeers?: number; peerRotationKey?: string },
   ): Promise<{
+    /** Ordered connected peers before optional maxPeers windowing. */
     connectedPeers: number;
+    /** Ordered connected peers before optional maxPeers windowing. */
+    totalPeers: number;
+    /** Peers selected and evaluated after optional maxPeers windowing. */
+    selectedPeers: number;
     syncCapablePeers: number;
     peersTried: number;
     /**
@@ -3025,27 +3035,124 @@ export class LifecycleSyncMethods extends DKGAgentBase {
 
     await this.primeCatchupConnections();
 
-    const peers = this.selectCatchupPeers(
+    const orderedPeers = this.selectCatchupPeers(
       [...new Map(
         this.node.libp2p.getConnections().map((conn) => [conn.remotePeer.toString(), conn.remotePeer]),
       ).values()],
       preferredPeerId,
       isPrivateContextGraph,
     );
-    const coreCount = peers.filter((p) => this.knownCorePeerIds.has(p.toString())).length;
+    const peerPriorityRanks = new Map<string, number>();
+    for (const peer of orderedPeers) {
+      const peerId = peer.toString();
+      const rank = peerId === preferredPeerId ? 2 : this.knownCorePeerIds.has(peerId) ? 1 : 0;
+      if (rank > 0) peerPriorityRanks.set(peerId, rank);
+    }
+    const peers = this.selectCatchupPeerWindow(orderedPeers, { ...options, peerPriorityRanks });
+    const coreCount = orderedPeers.filter((p) => this.knownCorePeerIds.has(p.toString())).length;
     this.log.info(
       ctx,
-      `catchup peer order for "${contextGraphId}": preferred=${preferredPeerId ?? 'none'} cores=${coreCount} total=${peers.length}`,
+      `catchup peer order for "${contextGraphId}": preferred=${preferredPeerId ?? 'none'} cores=${coreCount} total=${orderedPeers.length} selected=${peers.length}`,
     );
-    return this.runCatchupOverPeers(contextGraphId, includeSharedMemory, peers);
+    return this.runCatchupOverPeers(contextGraphId, includeSharedMemory, peers, {
+      totalPeers: orderedPeers.length,
+    });
+  }
+
+  selectCatchupPeerWindow(this: DKGAgent,
+    peers: Array<{ toString(): string }>,
+    options?: { maxPeers?: number; peerRotationKey?: string; peerPriorityRanks?: ReadonlyMap<string, number> },
+  ): Array<{ toString(): string }> {
+    const maxPeers = options?.maxPeers;
+    if (maxPeers === undefined || !Number.isInteger(maxPeers) || maxPeers <= 0) {
+      return peers;
+    }
+
+    let start = 0;
+    const rotationKey = options?.peerRotationKey;
+    const currentPriorityRank = (peerId: string): number => options?.peerPriorityRanks?.get(peerId) ?? 0;
+    const rememberRotation = (peerIds: string[], selectedCount: number): void => {
+      if (!rotationKey) return;
+      if (peerIds.length === 0) {
+        this.vmReconcileCatchupPeerCursor.delete(rotationKey);
+        this.vmReconcileCatchupPeerOrder.delete(rotationKey);
+        return;
+      }
+      const nextCursor = start + selectedCount;
+      const selectedAll = selectedCount >= peerIds.length;
+      this.vmReconcileCatchupPeerCursor.delete(rotationKey);
+      this.vmReconcileCatchupPeerCursor.set(rotationKey, nextCursor);
+      this.vmReconcileCatchupPeerOrder.delete(rotationKey);
+      this.vmReconcileCatchupPeerOrder.set(rotationKey, {
+        orderedPeers: peerIds,
+        nextPeerId: selectedAll ? undefined : peerIds[nextCursor % peerIds.length],
+        priorityRanks: Object.fromEntries(
+          peerIds
+            .map((peerId) => [peerId, currentPriorityRank(peerId)] as const)
+            .filter(([, rank]) => rank > 0),
+        ),
+      });
+    };
+
+    if (peers.length <= maxPeers) {
+      if (rotationKey) {
+        this.pruneVmReconcileState();
+        rememberRotation(peers.map((peer) => peer.toString()), peers.length);
+      }
+      return peers;
+    }
+
+    if (rotationKey) {
+      this.pruneVmReconcileState();
+      const peerIds = peers.map((peer) => peer.toString());
+      const previousOrder = this.vmReconcileCatchupPeerOrder.get(rotationKey);
+      const nextPeerId = previousOrder?.nextPeerId;
+      const previousPriorityRank = (peerId: string): number => previousOrder?.priorityRanks?.[peerId] ?? 0;
+      const gainedPriority = (peerId: string): boolean => currentPriorityRank(peerId) > previousPriorityRank(peerId);
+      if (nextPeerId) {
+        const nextPeerIndex = peerIds.indexOf(nextPeerId);
+        if (nextPeerIndex >= 0) {
+          const previousPeers = new Set(previousOrder.orderedPeers);
+          const firstInvalidatingPeerIndex = peerIds
+            .slice(0, nextPeerIndex)
+            .findIndex((peerId) => (!previousPeers.has(peerId) && currentPriorityRank(peerId) > 0) || gainedPriority(peerId));
+          start = firstInvalidatingPeerIndex >= 0 ? firstInvalidatingPeerIndex : nextPeerIndex;
+        } else {
+          const previousPeers = new Set(previousOrder.orderedPeers);
+          const firstInvalidatingPeerIndex = peerIds.findIndex((peerId) =>
+            (!previousPeers.has(peerId) && currentPriorityRank(peerId) > 0) || gainedPriority(peerId),
+          );
+          start = firstInvalidatingPeerIndex >= 0
+            ? firstInvalidatingPeerIndex
+            : (this.vmReconcileCatchupPeerCursor.get(rotationKey) ?? 0) % peers.length;
+        }
+      } else {
+        const previousPeers = new Set(previousOrder?.orderedPeers ?? []);
+        const firstInvalidatingPeerIndex = peerIds.findIndex((peerId) =>
+          !previousPeers.has(peerId) || gainedPriority(peerId),
+        );
+        start = firstInvalidatingPeerIndex >= 0
+          ? firstInvalidatingPeerIndex
+          : (this.vmReconcileCatchupPeerCursor.get(rotationKey) ?? 0) % peers.length;
+      }
+      rememberRotation(peerIds, maxPeers);
+    }
+
+    return [...peers.slice(start), ...peers.slice(0, start)].slice(0, maxPeers);
   }
 
   async runCatchupOverPeers(this: DKGAgent,
     contextGraphId: string,
     includeSharedMemory: boolean,
     peers: Array<{ toString(): string }>,
+    stats?: { totalPeers?: number },
   ): Promise<{
+    /** Ordered connected peers before optional caller windowing. */
     connectedPeers: number;
+    /** Ordered connected peers before optional caller windowing. */
+    totalPeers: number;
+    /** Peers selected and evaluated after optional caller windowing. */
+    selectedPeers: number;
     syncCapablePeers: number;
     peersTried: number;
     peersResponded: number;
@@ -3280,7 +3387,9 @@ export class LifecycleSyncMethods extends DKGAgentBase {
     }
 
     return {
-      connectedPeers: peers.length,
+      connectedPeers: stats?.totalPeers ?? peers.length,
+      totalPeers: stats?.totalPeers ?? peers.length,
+      selectedPeers: peers.length,
       syncCapablePeers,
       peersTried,
       peersResponded,
@@ -3440,6 +3549,9 @@ export class LifecycleSyncMethods extends DKGAgentBase {
     options?: { persist?: boolean },
   ): ContextGraphSub {
     this.subscribedContextGraphs.set(contextGraphId, next);
+    if (!next.subscribed && !next.coreHosted) {
+      this.clearVmReconcileStateForContextGraph(contextGraphId);
+    }
     if (options?.persist !== false) {
       this.persistContextGraphSubscription(contextGraphId);
       if (next.subscribed) {
@@ -3737,6 +3849,7 @@ export class LifecycleSyncMethods extends DKGAgentBase {
       } catch {
         /* best-effort teardown */
       }
+      this.forceClearVmReconcileStateForContextGraph(id);
       this.subscribedContextGraphs.delete(id);
     }
 

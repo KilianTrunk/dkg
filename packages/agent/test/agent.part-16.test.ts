@@ -662,6 +662,259 @@ describe('DKGAgent config — syncContextGraphs and queryAccess warning', () => 
       }
     });
 
+    it('can limit VM reconcile catchup to one ordered peer and rotate on later attempts', async () => {
+      const agent = await DKGAgent.create({
+        name: 'RuntimeCatchupSinglePeerRotation',
+        listenHost: '127.0.0.1',
+        chainAdapter: createEVMAdapter(HARDHAT_KEYS.CORE_OP),
+      });
+
+      try {
+        await agent.start();
+        agent.subscribeToContextGraph('runtime-contextGraph');
+        (agent as any).preferredSyncPeers.set('runtime-contextGraph', 'peer-preferred');
+        (agent as any).knownCorePeerIds.add('peer-core');
+
+        const peerEdge = { toString: () => 'peer-edge' };
+        const peerCore = { toString: () => 'peer-core' };
+        const peerPreferred = { toString: () => 'peer-preferred' };
+        vi.spyOn(agent.node.libp2p, 'getConnections').mockReturnValue([
+          { remotePeer: peerEdge } as any,
+          { remotePeer: peerCore } as any,
+          { remotePeer: peerPreferred } as any,
+        ]);
+        vi.spyOn((agent as any).discovery, 'findAgents').mockResolvedValue([]);
+        vi.spyOn(agent as any, 'ensurePeerConnected').mockResolvedValue(undefined);
+        vi.spyOn(agent as any, 'waitForSyncProtocol').mockResolvedValue(true);
+
+        const triedPeers: string[] = [];
+        vi.spyOn(agent as any, 'syncFromPeerDetailed').mockImplementation(async (...args: unknown[]) => {
+          triedPeers.push(String(args[0]));
+          return {
+            insertedTriples: 0,
+            fetchedMetaTriples: 0,
+            fetchedDataTriples: 0,
+            insertedMetaTriples: 0,
+            insertedDataTriples: 0,
+            bytesReceived: 0,
+            resumedPhases: 0,
+            emptyResponses: 1,
+            metaOnlyResponses: 0,
+            dataRejectedMissingMeta: 0,
+            rejectedKcs: 0,
+            failedPeers: 0,
+            deniedPhases: 0,
+          };
+        });
+
+        const firstResult = await agent.syncContextGraphFromConnectedPeers('runtime-contextGraph', {
+          maxPeers: 1,
+          peerRotationKey: 'runtime-contextGraph',
+        });
+        await agent.syncContextGraphFromConnectedPeers('runtime-contextGraph', {
+          maxPeers: 1,
+          peerRotationKey: 'runtime-contextGraph',
+        });
+        await agent.syncContextGraphFromConnectedPeers('runtime-contextGraph', {
+          maxPeers: 1,
+          peerRotationKey: 'runtime-contextGraph',
+        });
+
+        expect(firstResult.connectedPeers).toBe(3);
+        expect(firstResult.totalPeers).toBe(3);
+        expect(firstResult.selectedPeers).toBe(1);
+        expect(firstResult.syncCapablePeers).toBe(1);
+        expect(firstResult.peersTried).toBe(1);
+        expect(triedPeers).toEqual(['peer-preferred', 'peer-core', 'peer-edge']);
+      } finally {
+        await agent.stop().catch(() => {});
+      }
+    });
+
+    it('reports full connectedPeers while selectedPeers tracks the catchup window', async () => {
+      const agent = await DKGAgent.create({
+        name: 'RuntimeCatchupSelectedPeerCounts',
+        listenHost: '127.0.0.1',
+        chainAdapter: new MockChainAdapter(),
+      });
+
+      try {
+        await agent.start();
+        agent.subscribeToContextGraph('runtime-contextGraph');
+
+        const peerNoProtocol = { toString: () => 'peer-no-protocol' };
+        const peerUnselected = { toString: () => 'peer-unselected' };
+        vi.spyOn(agent.node.libp2p, 'getConnections').mockReturnValue([
+          { remotePeer: peerNoProtocol } as any,
+          { remotePeer: peerUnselected } as any,
+        ]);
+        vi.spyOn((agent as any).discovery, 'findAgents').mockResolvedValue([]);
+        vi.spyOn(agent as any, 'waitForSyncProtocol').mockResolvedValue(false);
+        const syncFromPeerDetailed = vi.spyOn(agent as any, 'syncFromPeerDetailed');
+
+        const result = await agent.syncContextGraphFromConnectedPeers('runtime-contextGraph', {
+          maxPeers: 1,
+          peerRotationKey: 'runtime-contextGraph',
+        });
+
+        expect(result.connectedPeers).toBe(2);
+        expect(result.selectedPeers).toBe(1);
+        expect(result.totalPeers).toBe(2);
+        expect(result.syncCapablePeers).toBe(0);
+        expect(result.peersTried).toBe(0);
+        expect(result.diagnostics.noProtocolPeers).toBe(1);
+        expect(syncFromPeerDetailed).not.toHaveBeenCalled();
+      } finally {
+        await agent.stop().catch(() => {});
+      }
+    });
+
+    it('keeps VM reconcile catchup rotation anchored by peer id across connection order churn', async () => {
+      const agent = await DKGAgent.create({
+        name: 'RuntimeCatchupRotationOrderChurn',
+        chainAdapter: new MockChainAdapter(),
+      });
+      const peer = (peerId: string) => ({ toString: () => peerId });
+      const select = (peerIds: string[]) => (agent as any)
+        .selectCatchupPeerWindow(peerIds.map(peer), {
+          maxPeers: 1,
+          peerRotationKey: 'runtime-contextGraph',
+        })
+        .map((selected: { toString(): string }) => selected.toString());
+
+      try {
+        expect(select(['peer-a', 'peer-b', 'peer-c'])).toEqual(['peer-a']);
+        expect(select(['peer-c', 'peer-a', 'peer-b'])).toEqual(['peer-b']);
+        expect(select(['peer-a', 'peer-c', 'peer-b'])).toEqual(['peer-c']);
+        expect((agent as any).vmReconcileCatchupPeerOrder.size).toBe(1);
+      } finally {
+        await agent.stop().catch(() => {});
+      }
+    });
+
+    it('seeds VM reconcile catchup rotation when all current peers fit the window', async () => {
+      const agent = await DKGAgent.create({
+        name: 'RuntimeCatchupRotationSinglePeerSeed',
+        chainAdapter: new MockChainAdapter(),
+      });
+      const peer = (peerId: string) => ({ toString: () => peerId });
+      const select = (peerIds: string[], peerRotationKey = 'runtime-contextGraph') => (agent as any)
+        .selectCatchupPeerWindow(peerIds.map(peer), {
+          maxPeers: 1,
+          peerRotationKey,
+        })
+        .map((selected: { toString(): string }) => selected.toString());
+
+      try {
+        expect(select(['peer-a'])).toEqual(['peer-a']);
+        expect(select(['peer-a', 'peer-b'])).toEqual(['peer-b']);
+        expect(select(['peer-a', 'peer-b'])).toEqual(['peer-a']);
+        expect(select(['peer-b'], 'runtime-contextGraph-prepend')).toEqual(['peer-b']);
+        expect(select(['peer-a', 'peer-b'], 'runtime-contextGraph-prepend')).toEqual(['peer-a']);
+      } finally {
+        await agent.stop().catch(() => {});
+      }
+    });
+
+    it('resets VM reconcile catchup rotation when an existing peer gains priority before the cursor', async () => {
+      const agent = await DKGAgent.create({
+        name: 'RuntimeCatchupRotationPriorityGain',
+        chainAdapter: new MockChainAdapter(),
+      });
+      const peer = (peerId: string) => ({ toString: () => peerId });
+      const select = (peerIds: string[], priorityRanks: Record<string, number> = {}, peerRotationKey = 'runtime-contextGraph') => (agent as any)
+        .selectCatchupPeerWindow(peerIds.map(peer), {
+          maxPeers: 1,
+          peerRotationKey,
+          peerPriorityRanks: new Map(Object.entries(priorityRanks)),
+        })
+        .map((selected: { toString(): string }) => selected.toString());
+
+      try {
+        expect(select(['peer-a', 'peer-b', 'peer-c'])).toEqual(['peer-a']);
+        expect(select(['peer-a', 'peer-b', 'peer-c'], { 'peer-a': 1 })).toEqual(['peer-a']);
+        expect(select(['peer-c', 'peer-a', 'peer-b'], { 'peer-c': 2 })).toEqual(['peer-c']);
+        expect(select(
+          ['peer-preferred', 'peer-edge', 'peer-reclassified'],
+          { 'peer-preferred': 2 },
+          'runtime-contextGraph-masked-core',
+        )).toEqual(['peer-preferred']);
+        expect(select(
+          ['peer-preferred', 'peer-reclassified', 'peer-edge'],
+          { 'peer-preferred': 2, 'peer-reclassified': 1 },
+          'runtime-contextGraph-masked-core',
+        )).toEqual(['peer-reclassified']);
+      } finally {
+        await agent.stop().catch(() => {});
+      }
+    });
+
+    it('resets VM reconcile catchup rotation when a core peer joins before the cursor', async () => {
+      const agent = await DKGAgent.create({
+        name: 'RuntimeCatchupRotationCoreJoin',
+        listenHost: '127.0.0.1',
+        chainAdapter: createEVMAdapter(HARDHAT_KEYS.CORE_OP),
+      });
+
+      try {
+        await agent.start();
+        agent.subscribeToContextGraph('runtime-contextGraph');
+
+        const peerEdgeA = { toString: () => 'peer-edge-a' };
+        const peerEdgeB = { toString: () => 'peer-edge-b' };
+        const peerCore = { toString: () => 'peer-core-new' };
+        let connections = [
+          { remotePeer: peerEdgeA } as any,
+          { remotePeer: peerEdgeB } as any,
+        ];
+        vi.spyOn(agent.node.libp2p, 'getConnections').mockImplementation(() => connections);
+        vi.spyOn((agent as any).discovery, 'findAgents').mockResolvedValue([]);
+        vi.spyOn(agent as any, 'ensurePeerConnected').mockResolvedValue(undefined);
+        vi.spyOn(agent as any, 'waitForSyncProtocol').mockResolvedValue(true);
+
+        const triedPeers: string[] = [];
+        vi.spyOn(agent as any, 'syncFromPeerDetailed').mockImplementation(async (...args: unknown[]) => {
+          triedPeers.push(String(args[0]));
+          return {
+            insertedTriples: 0,
+            fetchedMetaTriples: 0,
+            fetchedDataTriples: 0,
+            insertedMetaTriples: 0,
+            insertedDataTriples: 0,
+            bytesReceived: 0,
+            resumedPhases: 0,
+            emptyResponses: 1,
+            metaOnlyResponses: 0,
+            dataRejectedMissingMeta: 0,
+            rejectedKcs: 0,
+            failedPeers: 0,
+            deniedPhases: 0,
+          };
+        });
+
+        await agent.syncContextGraphFromConnectedPeers('runtime-contextGraph', {
+          maxPeers: 1,
+          peerRotationKey: 'runtime-contextGraph',
+        });
+
+        (agent as any).knownCorePeerIds.add('peer-core-new');
+        connections = [
+          { remotePeer: peerEdgeA } as any,
+          { remotePeer: peerCore } as any,
+          { remotePeer: peerEdgeB } as any,
+        ];
+
+        await agent.syncContextGraphFromConnectedPeers('runtime-contextGraph', {
+          maxPeers: 1,
+          peerRotationKey: 'runtime-contextGraph',
+        });
+
+        expect(triedPeers).toEqual(['peer-edge-a', 'peer-core-new']);
+      } finally {
+        await agent.stop().catch(() => {});
+      }
+    });
+
 
     // "allocates a fresh sync deadline per context graph" removed: the
     // test mocks `fetchSyncPages` with a signature that the current

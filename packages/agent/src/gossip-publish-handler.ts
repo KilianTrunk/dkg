@@ -15,6 +15,7 @@ import {
   type KAMetadata,
 } from '@origintrail-official/dkg-publisher';
 import { ethers } from 'ethers';
+import type { ContextGraphSub } from './dkg-agent-types.js';
 
 export type GossipPhaseCallback = (phase: string, status: 'start' | 'end') => void;
 
@@ -22,6 +23,7 @@ export interface GossipPublishHandlerCallbacks {
   contextGraphExists: (id: string) => Promise<boolean>;
   getContextGraphOwner: (id: string) => Promise<string | null>;
   subscribeToContextGraph: (id: string, options?: { trackSyncScope?: boolean; persist?: boolean }) => void;
+  setContextGraphSubscription?: (id: string, next: ContextGraphSub, options?: { persist?: boolean }) => void;
   /**
    * Same semantics as `DKGAgent#hasConfirmedMetaState`: returns true when the
    * local store already has a trustworthy public announcement for this CG
@@ -39,23 +41,50 @@ export interface GossipPublishHandlerCallbacks {
   onPhase?: GossipPhaseCallback;
 }
 
+export interface GossipPublishHandlerOptions {
+  /**
+   * Agent-backed handlers require the invalidating subscription setter so
+   * gossip state changes keep listContextGraphs cache and durable subscription
+   * bookkeeping coherent. Standalone/legacy handlers can omit the callback and
+   * keep the historical in-memory map fallback.
+   */
+  requireContextGraphSubscriptionSetter?: boolean;
+}
+
 export class GossipPublishHandler {
   private readonly store: TripleStore;
   private readonly chain: ChainAdapter | undefined;
-  private readonly subscribedContextGraphs: Map<string, any>;
+  private readonly subscribedContextGraphs: Map<string, ContextGraphSub>;
   private readonly callbacks: GossipPublishHandlerCallbacks;
   private readonly log = new Logger('GossipPublishHandler');
 
   constructor(
     store: TripleStore,
     chain: ChainAdapter | undefined,
-    subscribedContextGraphs: Map<string, any>,
+    subscribedContextGraphs: Map<string, ContextGraphSub>,
     callbacks: GossipPublishHandlerCallbacks,
+    options: GossipPublishHandlerOptions = {},
   ) {
+    if (options.requireContextGraphSubscriptionSetter && !callbacks.setContextGraphSubscription) {
+      throw new Error('GossipPublishHandler requires setContextGraphSubscription for agent-backed subscription state');
+    }
     this.store = store;
     this.chain = chain;
     this.subscribedContextGraphs = subscribedContextGraphs;
     this.callbacks = callbacks;
+  }
+
+  private setContextGraphSubscription(
+    id: string,
+    next: ContextGraphSub,
+    options?: { persist?: boolean },
+  ): void {
+    const setter = this.callbacks.setContextGraphSubscription;
+    if (setter) {
+      setter(id, next, options);
+      return;
+    }
+    this.subscribedContextGraphs.set(id, next);
   }
 
   async handlePublishMessage(data: Uint8Array, contextGraphId: string, onPhase?: GossipPhaseCallback, fromPeerId?: string): Promise<void> {
@@ -166,7 +195,7 @@ export class GossipPublishHandler {
               q.subject === `${contextGraphPrefix}${newId}` && q.predicate === DKG_ONTOLOGY.SCHEMA_NAME,
             );
             const name = nameQuad ? stripLiteral(nameQuad.object) : newId;
-            this.subscribedContextGraphs.set(newId, {
+            const next = {
               name,
               subscribed: true,
               // `synced: false` — we just got the definition triple via
@@ -177,7 +206,8 @@ export class GossipPublishHandler {
               synced: false,
               metaSynced: false,
               onChainId: this.subscribedContextGraphs.get(newId)?.onChainId,
-            });
+            };
+            this.setContextGraphSubscription(newId, next, { persist: false });
             this.callbacks.subscribeToContextGraph(newId, { trackSyncScope: true });
             this.log.info(ctx, `Discovered context graph "${name}" (${newId}) via gossip — auto-subscribed (sync-enabled)`);
           }
@@ -210,7 +240,7 @@ export class GossipPublishHandler {
         // confirmable from the local store (system contextGraph, populated
         // `_meta`, or `<cg> rdf:type dkg:ContextGraph` in ontology — the same
         // check Viktor introduced in `hasConfirmedMetaState`). If yes,
-        // flip the flag in place and proceed; if no, keep the strict
+        // update the flag through the agent subscription setter and proceed; if no, keep the strict
         // deny behavior so curated CGs without a synced allowlist can't
         // leak through.
         if (allowedPeers === null
@@ -222,8 +252,7 @@ export class GossipPublishHandler {
               ? await this.callbacks.hasConfirmedMetaState(request.contextGraphId)
               : false;
             if (confirmed) {
-              sub.metaSynced = true;
-              this.callbacks.persistContextGraphSubscription?.(request.contextGraphId);
+              this.setContextGraphSubscription(request.contextGraphId, { ...sub, metaSynced: true });
             } else {
               this.log.warn(ctx, `Gossip publish deferred: context graph "${request.contextGraphId}" _meta not yet synced — defaulting to deny`);
               return;

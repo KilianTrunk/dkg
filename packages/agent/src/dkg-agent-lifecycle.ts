@@ -1355,17 +1355,18 @@ export class LifecycleSyncMethods extends DKGAgentBase {
             // would no-op on this without a pre-existing record, so
             // upsert a minimal stub first.
             if (!this.subscribedContextGraphs.has(hashLower)) {
-              this.subscribedContextGraphs.set(hashLower, {
+              this.setContextGraphSubscription(hashLower, {
                 subscribed: false,
                 synced: false,
                 onChainId: contextGraphId,
                 onChainHash: hashLower,
                 pendingMeta: true,
-              });
+              }, { persist: false });
             } else {
-              const existing = this.subscribedContextGraphs.get(hashLower)!;
-              this.bindSubscriptionOnChainId(hashLower, existing, contextGraphId);
-              existing.onChainHash = hashLower;
+              const next = { ...this.subscribedContextGraphs.get(hashLower)! };
+              this.bindSubscriptionOnChainId(hashLower, next, contextGraphId);
+              next.onChainHash = hashLower;
+              this.setContextGraphSubscription(hashLower, next, { persist: false });
             }
             this.recordCgWireId(hashLower, hashLower);
 
@@ -2798,7 +2799,7 @@ export class LifecycleSyncMethods extends DKGAgentBase {
       fetchSyncPages: this.fetchSyncPages.bind(this),
       sinceBatchIdFor,
       processDurableBatchInWorker: this.processDurableBatchInWorker.bind(this),
-      storeInsert: (quads) => this.store.insert(quads),
+      storeInsert: (quads) => this.insertSyncedQuadsAndInvalidateListCache(quads),
       deleteCheckpoint: (key) => this.syncCheckpoints.delete(key),
       setCheckpoint: (key, offset) => this.syncCheckpoints.set(key, offset),
       logInfo: (opCtx, message) => this.log.info(opCtx, message),
@@ -2954,7 +2955,7 @@ export class LifecycleSyncMethods extends DKGAgentBase {
         const graphManager = new GraphManager(this.store);
         await graphManager.ensureContextGraph(contextGraphId);
       },
-      storeInsert: (quads) => this.store.insert(quads),
+      storeInsert: (quads) => this.insertSyncedQuadsAndInvalidateListCache(quads),
       publicSnapshotStore: this.publicSnapshotStore,
       deleteCheckpoint: (key) => this.syncCheckpoints.delete(key),
       setCheckpoint: (key, offset) => this.syncCheckpoints.set(key, offset),
@@ -3528,15 +3529,19 @@ export class LifecycleSyncMethods extends DKGAgentBase {
       if (!sub) continue;
       if (await this.hasConfirmedMetaState(contextGraphId)) {
         if (sub.metaSynced !== true) {
-          sub.metaSynced = true;
-          this.persistContextGraphSubscription(contextGraphId);
+          this.setContextGraphSubscription(contextGraphId, { ...sub, metaSynced: true });
         }
         if (sub.pendingMeta) {
           // Meta arrived; the freshly-joined "waiting for sync" state
           // (set by the join-approved handler) no longer applies — the
           // CG will now surface via the normal `_meta` branch in
           // `listContextGraphs`.
-          sub.pendingMeta = false;
+          const current = this.subscribedContextGraphs.get(contextGraphId) ?? sub;
+          this.setContextGraphSubscription(contextGraphId, {
+            ...current,
+            metaSynced: true,
+            pendingMeta: false,
+          });
         }
         this.queueSharedMemoryGossipSubscription(contextGraphId);
       }
@@ -3548,6 +3553,7 @@ export class LifecycleSyncMethods extends DKGAgentBase {
     next: ContextGraphSub,
     options?: { persist?: boolean },
   ): ContextGraphSub {
+    this.invalidateListContextGraphsCache();
     this.subscribedContextGraphs.set(contextGraphId, next);
     if (!next.subscribed && !next.coreHosted) {
       this.clearVmReconcileStateForContextGraph(contextGraphId);
@@ -3569,11 +3575,18 @@ export class LifecycleSyncMethods extends DKGAgentBase {
     this.setContextGraphSubscription(contextGraphId, { ...existing, ...patch });
   }
 
+  deleteContextGraphSubscription(this: DKGAgent, contextGraphId: string): boolean {
+    this.invalidateListContextGraphsCache();
+    this.forceClearVmReconcileStateForContextGraph(contextGraphId);
+    return this.subscribedContextGraphs.delete(contextGraphId);
+  }
+
   persistContextGraphSubscriptionState(this: DKGAgent, contextGraphId: string): void {
     this.persistContextGraphSubscription(contextGraphId);
   }
 
   persistContextGraphSubscription(this: DKGAgent, contextGraphId: string): void {
+    this.invalidateListContextGraphsCache();
     const store = this.config.contextGraphSubscriptionStore;
     if (!store) return;
     const sub = this.subscribedContextGraphs.get(contextGraphId);
@@ -3849,8 +3862,7 @@ export class LifecycleSyncMethods extends DKGAgentBase {
       } catch {
         /* best-effort teardown */
       }
-      this.forceClearVmReconcileStateForContextGraph(id);
-      this.subscribedContextGraphs.delete(id);
+      this.deleteContextGraphSubscription(id);
     }
 
     // Delete the persisted USER rows (active + dormant). Selective — never the

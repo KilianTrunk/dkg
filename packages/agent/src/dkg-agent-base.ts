@@ -10,6 +10,7 @@
  * be declared; external construction still goes through `DKGAgent.create`.
  */
 import { createHash, randomUUID } from 'node:crypto';
+import { performance } from 'node:perf_hooks';
 import {
   DKGNode, ProtocolRouter, GossipSubManager, TypedEventBus, DKGEvent,
   LibP2PNetwork, PeerResolver, StubNetworkStateRegistry,
@@ -94,7 +95,7 @@ import {
   SUBSCRIPTION_SOURCES,
   pickNetworkTunables,
 } from '@origintrail-official/dkg-core';
-import { GraphManager, PrivateContentStore, createTripleStore, type TripleStore, type TripleStoreConfig, type Quad, type LargeLiteralStorageConfig } from '@origintrail-official/dkg-storage';
+import { GraphManager, PrivateContentStore, createTripleStore, isExternalBackend, type TripleStore, type TripleStoreConfig, type Quad, type LargeLiteralStorageConfig } from '@origintrail-official/dkg-storage';
 import { EVMChainAdapter, NoChainAdapter, enrichEvmError, buildKnowledgeAssetUal, type EVMAdapterConfig, type ChainAdapter, type CreateContextGraphParams, type CreateOnChainContextGraphParams, type CreateOnChainContextGraphResult, type TxResult, type V10PublishingConvictionAccountInfo } from '@origintrail-official/dkg-chain';
 import {
   DKGPublisher, PublishHandler, SharedMemoryHandler, UpdateHandler, ChainEventPoller, AccessHandler, AccessClient,
@@ -380,6 +381,91 @@ import {
   deserializePendingSenderKeyEntry,
 } from './dkg-agent-swm-state.js';
 import type { DKGAgent } from './dkg-agent.js';
+
+function readNonNegativeNumberEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === '') return fallback;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) ? Math.max(0, parsed) : fallback;
+}
+
+function isSparqlUpdateStatement(sparql: string): boolean {
+  const withoutPrologue = sparql.replace(
+    /^\s*(?:(?:PREFIX\s+[\w-]*:\s*<[^>]+>|BASE\s+<[^>]+>)\s*)*/i,
+    '',
+  );
+  return /^(?:WITH\s+<[^>]+>\s*)?(?:INSERT|DELETE|DROP|CLEAR|CREATE|LOAD|COPY|MOVE|ADD)\b/i.test(withoutPrologue);
+}
+
+export function createListContextGraphsCacheInvalidatingStore(
+  innerStore: TripleStore,
+  invalidate: () => void,
+): TripleStore {
+  const invalidateAfterMutation = async <T>(work: () => Promise<T>, changed: (result: T) => boolean): Promise<T> => {
+    const result = await work();
+    if (changed(result)) invalidate();
+    return result;
+  };
+  const wrapper: TripleStore & { readonly innerStore: TripleStore } = {
+    innerStore,
+    get queryCancellation() {
+      return innerStore.queryCancellation;
+    },
+    insert(quads) {
+      return invalidateAfterMutation(
+        () => innerStore.insert(quads),
+        () => quads.length > 0,
+      );
+    },
+    delete(quads) {
+      return invalidateAfterMutation(
+        () => innerStore.delete(quads),
+        () => quads.length > 0,
+      );
+    },
+    deleteByPattern(pattern) {
+      return invalidateAfterMutation(
+        () => innerStore.deleteByPattern(pattern),
+        removed => removed > 0,
+      );
+    },
+    query(sparql, options) {
+      return invalidateAfterMutation(
+        () => innerStore.query(sparql, options),
+        () => isSparqlUpdateStatement(sparql),
+      );
+    },
+    hasGraph(graphUri) {
+      return innerStore.hasGraph(graphUri);
+    },
+    createGraph(graphUri) {
+      return innerStore.createGraph(graphUri);
+    },
+    dropGraph(graphUri) {
+      return invalidateAfterMutation(
+        () => innerStore.dropGraph(graphUri),
+        () => true,
+      );
+    },
+    listGraphs(options) {
+      return innerStore.listGraphs(options);
+    },
+    deleteBySubjectPrefix(graphUri, prefix) {
+      return invalidateAfterMutation(
+        () => innerStore.deleteBySubjectPrefix(graphUri, prefix),
+        removed => removed > 0,
+      );
+    },
+    countQuads(graphUri) {
+      return innerStore.countQuads(graphUri);
+    },
+    flush: innerStore.flush ? () => innerStore.flush!() : undefined,
+    close() {
+      return innerStore.close();
+    },
+  };
+  return wrapper;
+}
 
 export class DKGAgentBase {
   readonly wallet: AgentWallet;
@@ -691,6 +777,17 @@ export class DKGAgentBase {
   static readonly VM_RECONCILE_CONFIRMATION_DEPTH =
     Number(process.env['DKG_VM_RECONCILE_CONFIRMATION_DEPTH']) || 5;
 
+  static readonly LIST_CONTEXT_GRAPHS_CACHE_TTL_MS =
+    readNonNegativeNumberEnv('DKG_LIST_CONTEXT_GRAPHS_CACHE_TTL_MS', 5_000);
+  static readonly LIST_CONTEXT_GRAPHS_CACHE_MAX =
+    Math.max(1, Number(process.env['DKG_LIST_CONTEXT_GRAPHS_CACHE_MAX']) || 32);
+  static readonly LIST_CONTEXT_GRAPHS_ROW_BUDGET_MS =
+    Math.max(1, Number(process.env['DKG_LIST_CONTEXT_GRAPHS_ROW_BUDGET_MS']) || 200);
+  static readonly LIST_CONTEXT_GRAPHS_SCAN_BUDGET_MS =
+    Math.max(1, Number(process.env['DKG_LIST_CONTEXT_GRAPHS_SCAN_BUDGET_MS']) || 5_000);
+  static readonly LIST_CONTEXT_GRAPHS_AUTH_BUDGET_MS =
+    Math.max(1, Number(process.env['DKG_LIST_CONTEXT_GRAPHS_AUTH_BUDGET_MS']) || 5_000);
+
   protected messageHandler: MessageHandler | null = null;
   protected chainPoller: ChainEventPoller | null = null;
   protected swmCleanupTimer: ReturnType<typeof setInterval> | null = null;
@@ -764,6 +861,36 @@ export class DKGAgentBase {
   protected readonly config: DKGAgentConfig;
   protected started = false;
   protected readonly subscribedContextGraphs = new Map<string, ContextGraphSub>();
+  protected readonly listContextGraphsCache = new Map<string, {
+    expiresAt: number;
+    rows: Array<Record<string, unknown>>;
+  }>();
+  protected readonly listContextGraphsInFlight = new Map<string, Promise<Array<Record<string, unknown>>>>();
+  protected listContextGraphsCacheGeneration = 0;
+  protected listContextGraphsCacheNow(): number {
+    return performance.now();
+  }
+
+  protected listContextGraphsCacheAllowed(): boolean {
+    if (this.config.store) {
+      return false;
+    }
+    const storeConfig = this.config.storeConfig;
+    if (!storeConfig) return true;
+    if (isExternalBackend(storeConfig.backend)) return storeConfig.options?.managedByDkg === true;
+    return isLocalOxigraphConfig(storeConfig);
+  }
+
+  protected invalidateListContextGraphsCache(): void {
+    this.listContextGraphsCacheGeneration += 1;
+    this.listContextGraphsCache.clear();
+    this.listContextGraphsInFlight.clear();
+  }
+
+  protected async insertSyncedQuadsAndInvalidateListCache(quads: Quad[]): Promise<void> {
+    await this.store.insert(quads);
+    if (quads.length > 0) this.invalidateListContextGraphsCache();
+  }
   protected readonly gossipRegistered = new Set<string>();
   protected readonly sharedMemoryGossipRegistered = new Set<string>();
   protected readonly seenOnChainIds = new Set<string>();

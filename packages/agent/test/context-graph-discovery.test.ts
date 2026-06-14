@@ -2,7 +2,7 @@ import { describe, it, expect, afterEach, beforeAll, afterAll, vi } from 'vitest
 import { makeTestKaNumberAllocator } from "./_helpers/ka-allocator.js";
 import { DKGAgent, type ContextGraphSub, type ContextGraphSubscriptionStore } from '../src/index.js';
 import { OxigraphStore } from '@origintrail-official/dkg-storage';
-import { SYSTEM_CONTEXT_GRAPHS, DKG_ONTOLOGY, contextGraphDataGraphUri, contextGraphSharedMemoryUri, contextGraphMetaGraphUri } from '@origintrail-official/dkg-core';
+import { SYSTEM_CONTEXT_GRAPHS, DKG_ONTOLOGY, contextGraphDataGraphUri, contextGraphSharedMemoryUri, contextGraphMetaGraphUri, Logger } from '@origintrail-official/dkg-core';
 import { type ChainAdapter, type ContextGraphOnChain } from '@origintrail-official/dkg-chain';
 import { createEVMAdapter, getSharedContext, createProvider, takeSnapshot, revertSnapshot, HARDHAT_KEYS } from '../../chain/test/evm-test-context.js';
 import { mintTokens } from '../../chain/test/hardhat-harness.js';
@@ -697,6 +697,138 @@ describe('discoverContextGraphsFromChain', () => {
 
     const discovered = await agent.discoverContextGraphsFromChain();
     expect(discovered).toBe(0);
+  }, 15000);
+
+  it('keeps full chain discovery as the default and makes incremental opt-in', async () => {
+    const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
+    const calls: unknown[] = [];
+    (chain as any).listContextGraphsFromChain = async (_fromBlock?: number, options?: unknown) => {
+      calls.push(options);
+      return [];
+    };
+
+    const result = await createTestAgent({ chainAdapter: chain });
+    agent = result.agent;
+    await agent.start();
+
+    expect(await agent.discoverContextGraphsFromChain()).toBe(0);
+    expect(await agent.discoverContextGraphsFromChain({ incremental: true })).toBe(0);
+    expect(await agent.discoverContextGraphsFromChain({ seedIncrementalWatermark: true })).toBe(0);
+
+    expect(calls).toEqual([undefined, { incremental: true }, { seedIncrementalWatermark: true }]);
+  }, 15000);
+
+  it('warns once for repeated chain scan failures and logs recovery', async () => {
+    const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
+    let fail = true;
+    (chain as any).listContextGraphsFromChain = async () => {
+      if (fail) throw new Error('range too wide [0, 1999]');
+      return [];
+    };
+    const entries: Array<{ level: string; message: string }> = [];
+    Logger.setSink((entry) => entries.push({ level: entry.level, message: entry.message }));
+    try {
+      const result = await createTestAgent({ chainAdapter: chain });
+      agent = result.agent;
+      await agent.start();
+
+      expect(await agent.discoverContextGraphsFromChain()).toBe(0);
+      expect(await agent.discoverContextGraphsFromChain()).toBe(0);
+      fail = false;
+      expect(await agent.discoverContextGraphsFromChain()).toBe(0);
+    } finally {
+      Logger.setSink(null);
+    }
+
+    const warnings = entries.filter((entry) =>
+      entry.level === 'warn' && entry.message.includes('Chain context graph scan failed'),
+    );
+    expect(warnings).toHaveLength(1);
+    expect(entries.some((entry) =>
+      entry.level === 'info' && entry.message.includes('Chain context graph scan recovered after 2 failed attempt(s)'),
+    )).toBe(true);
+  }, 15000);
+
+  it('can surface chain scan failures for daemon seed retries without changing the default contract', async () => {
+    const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
+    const failure = new Error('seed scan failed');
+    (chain as any).listContextGraphsFromChain = async () => {
+      throw failure;
+    };
+
+    const result = await createTestAgent({ chainAdapter: chain });
+    agent = result.agent;
+    await agent.start();
+
+    expect(await agent.discoverContextGraphsFromChain()).toBe(0);
+    await expect(
+      agent.discoverContextGraphsFromChain({
+        seedIncrementalWatermark: true,
+        throwOnChainScanFailure: true,
+      }),
+    ).rejects.toThrow('seed scan failed');
+  }, 15000);
+
+  it('processes partial chain scan prefixes without marking the scan recovered', async () => {
+    const chain = createEVMAdapter(HARDHAT_KEYS.CORE_OP);
+    let calls = 0;
+    (chain as any).listContextGraphsFromChain = async () => {
+      calls += 1;
+      const stopped = calls === 1 ? 1_999 : 3_999;
+      const failedFrom = calls === 1 ? 2_000 : 4_000;
+      const failedTo = calls === 1 ? 3_999 : 5_999;
+      const err = new Error(
+        `partial ContextGraphNameRegistry scan stopped after block ${stopped}; ` +
+          `failed page [${failedFrom}, ${failedTo}]: range too wide`,
+      ) as Error & {
+        partialResults: ContextGraphOnChain[];
+        scannedToBlock: number;
+        failedFromBlock: number;
+        failedToBlock: number;
+      };
+      err.name = 'ContextGraphChainScanPartialError';
+      err.partialResults = [
+        {
+          contextGraphId: '0xfeedbeef00000000000000000000000000000000000000000000000000000001',
+          name: 'partial-revealed',
+          creator: '0x1234',
+          accessPolicy: 0,
+          blockNumber: 100,
+          metadataRevealed: true,
+        },
+      ];
+      err.scannedToBlock = stopped;
+      err.failedFromBlock = failedFrom;
+      err.failedToBlock = failedTo;
+      throw err;
+    };
+    const entries: Array<{ level: string; message: string }> = [];
+    Logger.setSink((entry) => entries.push({ level: entry.level, message: entry.message }));
+    try {
+      const result = await createTestAgent({ chainAdapter: chain });
+      agent = result.agent;
+      await agent.start();
+
+      await expect(agent.discoverContextGraphsFromChain({
+        incremental: true,
+        throwOnChainScanFailure: true,
+      })).rejects.toThrow('partial ContextGraphNameRegistry scan');
+      expect(await agent.discoverContextGraphsFromChain({ incremental: true })).toBe(0);
+    } finally {
+      Logger.setSink(null);
+    }
+
+    const entry = agent!.getSubscribedContextGraphs().get('partial-revealed');
+    expect(entry).toBeDefined();
+    expect(entry!.onChainId).toBe('0xfeedbeef00000000000000000000000000000000000000000000000000000001');
+    expect((agent as any).chainContextGraphScanFailure?.count).toBe(2);
+    const warnings = entries.filter((entry) =>
+      entry.level === 'warn' && entry.message.includes('Chain context graph scan failed'),
+    );
+    expect(warnings).toHaveLength(1);
+    expect(entries.some((entry) =>
+      entry.level === 'info' && entry.message.includes('Chain context graph scan recovered'),
+    )).toBe(false);
   }, 15000);
 });
 

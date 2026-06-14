@@ -582,6 +582,26 @@ export function mergePreferredRelays(input: {
   };
 }
 
+export function shouldUseIncrementalChainDiscoveryScan(input: {
+  run: number;
+  watermarkSeeded: boolean;
+  fullScanEvery: number;
+}): boolean {
+  return (
+    input.watermarkSeeded &&
+    input.run !== 0 &&
+    input.run % input.fullScanEvery !== 0
+  );
+}
+
+export function chainDiscoveryScanOptions(incremental: boolean):
+  | { incremental: true }
+  | { seedIncrementalWatermark: true; throwOnChainScanFailure: true } {
+  return incremental
+    ? { incremental: true }
+    : { seedIncrementalWatermark: true, throwOnChainScanFailure: true };
+}
+
 export interface PromoteWorkerDaemonLifecycle {
   waitForStartup(): Promise<void>;
   stop(reason?: string | null): Promise<void>;
@@ -1243,6 +1263,7 @@ export async function runDaemonInner(
       operationalKeys: opWallets.wallets.map((w) => w.privateKey),
       chainId: chainBase.chainId,
       approvalPolicy: resolveApprovalPolicy(chainBase.approvalPolicy) as ApprovalPolicy | undefined,
+      cgRegistryScanPageSize: chainBase.cgRegistryScanPageSize,
     } : undefined,
     sharedMemoryTtlMs: resolveSharedMemoryTtlMs(config),
     // RFC ka-metadata-trim P3.3 — lifecycle PROV event writes (default true).
@@ -1729,24 +1750,27 @@ export async function runDaemonInner(
   // Run an initial chain scan for context graphs we might not know about,
   // then repeat every 30 minutes as a fallback discovery mechanism.
   const CHAIN_SCAN_INTERVAL_MS = 30 * 60 * 1000;
-  setTimeout(async () => {
+  const CHAIN_FULL_SCAN_EVERY = 48; // about once per day at the 30-minute cadence
+  let chainScanRuns = 0;
+  const runChainDiscoveryScan = async () => {
     try {
-      const found = await agent.discoverContextGraphsFromChain();
+      const run = chainScanRuns++;
+      const incremental = shouldUseIncrementalChainDiscoveryScan({
+        run,
+        watermarkSeeded: await agent.hasContextGraphRegistryScanWatermark(),
+        fullScanEvery: CHAIN_FULL_SCAN_EVERY,
+      });
+      const found = await agent.discoverContextGraphsFromChain(
+        chainDiscoveryScanOptions(incremental),
+      );
       if (found > 0)
         log(`Chain scan: discovered ${found} new context graph(s)`);
     } catch {
       /* non-critical */
     }
-  }, 15_000);
-  const chainScanTimer = setInterval(async () => {
-    try {
-      const found = await agent.discoverContextGraphsFromChain();
-      if (found > 0)
-        log(`Chain scan: discovered ${found} new context graph(s)`);
-    } catch {
-      /* non-critical */
-    }
-  }, CHAIN_SCAN_INTERVAL_MS);
+  };
+  setTimeout(runChainDiscoveryScan, 15_000);
+  const chainScanTimer = setInterval(runChainDiscoveryScan, CHAIN_SCAN_INTERVAL_MS);
   if (chainScanTimer.unref) chainScanTimer.unref();
 
   // Periodic peer health ping (every 2 minutes)

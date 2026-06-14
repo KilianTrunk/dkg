@@ -14,7 +14,16 @@ import {
   type ServerResponse,
 } from "node:http";
 import { createHash, randomUUID } from "node:crypto";
-import { GET_TOTAL_TRIPLES_SPARQL, parseRdfInt } from "./metrics-queries.js";
+import {
+  buildContextGraphDeclarationsSparql,
+  contextGraphIdsFromDeclarationBindings,
+  contextGraphIdsFromLocalRootMetaGraphs,
+  contextGraphIdsFromMetricSubscriptionCandidates,
+  countContextGraphsFromGraphUris,
+  GET_TOTAL_TRIPLES_SPARQL,
+  parseRdfInt,
+  shadowContextGraphIdsFromMetricSubscriptionCandidates,
+} from "./metrics-queries.js";
 import {
   appendFile,
   chmod,
@@ -1848,15 +1857,48 @@ export async function runDaemonInner(
         return 0;
       }
     },
-    getContextGraphCount: async () => (await agent.listContextGraphs()).length,
+    getContextGraphCount: async () => {
+      const graphUris = await agent.store.listGraphs();
+      const knownContextGraphIds = new Set<string>();
+      const subscribedContextGraphs = agent.getSubscribedContextGraphs();
+      const shadowContextGraphIds = new Set(
+        shadowContextGraphIdsFromMetricSubscriptionCandidates(subscribedContextGraphs.entries()),
+      );
+      for (const contextGraphId of contextGraphIdsFromMetricSubscriptionCandidates(
+        subscribedContextGraphs.entries(),
+      )) {
+        knownContextGraphIds.add(contextGraphId);
+      }
+      for (const contextGraphId of contextGraphIdsFromLocalRootMetaGraphs(
+        graphUris,
+        subscribedContextGraphs.keys(),
+      )) {
+        if (!shadowContextGraphIds.has(contextGraphId)) knownContextGraphIds.add(contextGraphId);
+      }
+      const declarationQuery = buildContextGraphDeclarationsSparql(graphUris, knownContextGraphIds);
+      const declarationResult = declarationQuery
+        ? await agent.store.query(declarationQuery)
+        : null;
+      if (declarationResult?.type === "bindings") {
+        for (const contextGraphId of contextGraphIdsFromDeclarationBindings(
+          declarationResult.bindings as Record<string, string>[],
+        )) {
+          if (!shadowContextGraphIds.has(contextGraphId)) knownContextGraphIds.add(contextGraphId);
+        }
+      }
+      return countContextGraphsFromGraphUris(graphUris, knownContextGraphIds, shadowContextGraphIds);
+    },
     // The count getters below each issue a data-proportional full-scan COUNT,
     // but the only caller is the 30 s metrics tick (metricsSource is consumed
     // solely by MetricsCollector — no on-demand /api/status path), so each tick
     // already re-reads the store fresh and there is nothing concurrent to
     // coalesce. They are intentionally left uncached so a snapshot never serves
-    // a stale count and can't mask a store outage. The one heavy metrics read,
-    // getContextGraphCount, is relieved at the chokepoint by R6-A's listGraphs
-    // cache; these COUNTs are cheap (~0.015 CPU-s/tick on a 75k-triple store).
+    // a stale count and can't mask a store outage. The context-graph count
+    // avoids the composite context-graph listing enrichment path. It uses the
+    // cached store graph inventory plus backed subscription/declaration evidence,
+    // then dedupes local layer graphs. It intentionally includes private CG graphs
+    // that are backed by local subscription/declaration state.
+    // These COUNTs are cheap (~0.015 CPU-s/tick on a 75k-triple store).
     getTotalTriples: async () => {
       const r = await agent.query(GET_TOTAL_TRIPLES_SPARQL);
       return parseRdfInt(r?.bindings?.[0]?.c);
